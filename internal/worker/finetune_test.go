@@ -14,12 +14,13 @@ import (
 )
 
 type fineTuneControlFake struct {
-	mu        sync.Mutex
-	cancelled bool
-	updates   []map[string]any
-	critical  []map[string]any
-	events    []map[string]any
-	updateErr error
+	mu          sync.Mutex
+	cancelled   bool
+	updates     []map[string]any
+	critical    []map[string]any
+	events      []map[string]any
+	updateErr   error
+	terminalErr error
 }
 
 func (c *fineTuneControlFake) Cancelled(context.Context, string) (bool, error) {
@@ -32,6 +33,9 @@ func (c *fineTuneControlFake) Update(_ context.Context, _ string, fields map[str
 	defer c.mu.Unlock()
 	if c.updateErr != nil {
 		return c.updateErr
+	}
+	if fields["status"] == "cancelled" && c.terminalErr != nil {
+		return c.terminalErr
 	}
 	c.updates = append(c.updates, fields)
 	return nil
@@ -80,7 +84,7 @@ func fineTuneFixture(t *testing.T) (FineTuneConfig, *Job, *fineTuneControlFake, 
 	}
 	control := &fineTuneControlFake{}
 	reservation := &fineTuneReservationFake{}
-	cfg := FineTuneConfig{NodeID: "1297", WorkspaceDir: workspace, OutputRoot: filepath.Join(t.TempDir(), "adapters"), CacheDir: filepath.Join(t.TempDir(), "cache"), Control: control, Reservation: reservation}
+	cfg := FineTuneConfig{NodeID: "1297", WorkspaceDir: workspace, OutputRoot: filepath.Join(t.TempDir(), "adapters"), SafetyDir: filepath.Join(t.TempDir(), "safety"), CacheDir: filepath.Join(t.TempDir(), "cache"), Control: control, Reservation: reservation}
 	job := &Job{ID: "job-1", Type: JobTypeFineTuneStart, SourceQueue: "jobs:v1:shell:org_o:node:1297", Payload: map[string]any{
 		"node_id": "1297", "dataset_node_id": "1297", "dataset_node_path": "train.jsonl", "model": "Qwen/Qwen3-0.6B", "method": "qlora",
 		"hyperparameters": map[string]any{"epochs": 2, "learning_rate": 0.0002, "batch_size": 4, "lora_r": 16, "lora_alpha": 32, "lora_dropout": 0.05, "max_seq_length": 2048},
@@ -180,7 +184,9 @@ func TestFineTuneDemandKillsRunAndRestoresBeforeReturning(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("training never started")
 	}
-	h.YieldToDemand()
+	if err := h.YieldToDemand(); err != nil {
+		t.Fatalf("confirmed preemption did not admit demand: %v", err)
+	}
 	select {
 	case <-stopped:
 	default:

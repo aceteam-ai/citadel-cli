@@ -122,6 +122,7 @@ type FineTuneConfig struct {
 	NodeID       string
 	WorkspaceDir string
 	OutputRoot   string
+	SafetyDir    string
 	CacheDir     string
 	Image        string
 	Control      FineTuneControl
@@ -135,6 +136,7 @@ type FineTuneHandler struct {
 	activeCancel context.CancelFunc
 	activeJob    string
 	activeDone   chan struct{}
+	pending      map[string]chan struct{}
 	demanded     bool
 }
 
@@ -142,27 +144,72 @@ func NewFineTuneHandler(cfg FineTuneConfig) *FineTuneHandler { return &FineTuneH
 func (h *FineTuneHandler) CanHandle(t string) bool           { return t == JobTypeFineTuneStart }
 
 // YieldToDemand is called by the fetch loop before interactive or inference
-// work is admitted. It kills the active training container; reservation release
-// then restores serving modules before this job reports cancellation.
-func (h *FineTuneHandler) YieldToDemand() {
-	h.mu.Lock()
-	done := h.activeDone
-	if h.activeCancel != nil {
-		h.demanded = true
-		h.activeCancel()
+// work is admitted. A durable hold stays in place until termination, restore,
+// and terminal status are confirmed. A failed check must refuse admission.
+func (h *FineTuneHandler) YieldToDemand() error {
+	for {
+		h.mu.Lock()
+		var pending <-chan struct{}
+		for _, ready := range h.pending {
+			pending = ready
+			break
+		}
+		done := h.activeDone
+		if h.activeCancel != nil {
+			h.demanded = true
+			h.activeCancel()
+		}
+		h.mu.Unlock()
+		if pending != nil {
+			<-pending
+			continue
+		}
+		if done != nil {
+			<-done
+			continue
+		}
+		return h.ensureSafeForDemand()
 	}
+}
+
+// A fine-tune admitted to the serialized lane may not have entered Execute
+// when the next demand is fetched. Registering it before spawning the lane
+// goroutine closes that admission race. ClearPendingFineTune also covers a job
+// that is Nacked while queued during shutdown.
+func (h *FineTuneHandler) MarkPendingFineTune(jobID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pending == nil {
+		h.pending = make(map[string]chan struct{})
+	}
+	if _, exists := h.pending[jobID]; !exists {
+		h.pending[jobID] = make(chan struct{})
+	}
+}
+
+func (h *FineTuneHandler) ClearPendingFineTune(jobID string) {
+	h.mu.Lock()
+	h.clearPendingLocked(jobID)
 	h.mu.Unlock()
-	if done != nil {
-		<-done
+}
+
+func (h *FineTuneHandler) clearPendingLocked(jobID string) {
+	if pending, exists := h.pending[jobID]; exists {
+		delete(h.pending, jobID)
+		close(pending)
 	}
 }
 
 func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	if job != nil {
+		defer h.ClearPendingFineTune(job.ID)
+	}
+	holdArmed, safeCleanup := false, false
 	terminalFailure := func(err error, honorCancellation bool) (*JobResult, error) {
 		if h.cfg.Control != nil && job != nil {
 			if honorCancellation {
 				if cancelled, checkErr := h.cfg.Control.Cancelled(context.Background(), job.ID); checkErr == nil && cancelled {
-					return h.cancelled(context.Background(), job.ID, stream, "cancelled")
+					return h.cancelled(context.Background(), job.ID, stream, "cancelled", holdArmed && safeCleanup)
 				}
 			}
 			errorText := err.Error()
@@ -172,6 +219,10 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 			fields := map[string]any{"status": "failed", "error": errorText, "finished_at": time.Now().UTC().Format(time.RFC3339)}
 			if persistErr := h.persistTerminal(job.ID, fields, !honorCancellation); persistErr != nil {
 				err = errors.Join(err, fmt.Errorf("FINETUNE_START: canonical failure status update failed: %w", persistErr))
+			} else if holdArmed && safeCleanup {
+				if clearErr := h.clearSafetyHold(job.ID); clearErr != nil {
+					err = errors.Join(err, fmt.Errorf("FINETUNE_START: safety hold removal failed: %w", clearErr))
+				}
 			}
 		}
 		return &JobResult{Status: JobStatusTerminalFailure, Error: err}, nil
@@ -202,7 +253,7 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 	if cancelled, err := h.cfg.Control.Cancelled(ctx, job.ID); err != nil {
 		return fail(err)
 	} else if cancelled {
-		return h.cancelled(ctx, job.ID, stream, "cancelled before start")
+		return h.cancelled(ctx, job.ID, stream, "cancelled before start", false)
 	}
 	if err := h.cfg.Control.Update(ctx, job.ID, map[string]any{"status": "running", "started_at": time.Now().UTC().Format(time.RFC3339)}); err != nil {
 		return fail(err)
@@ -211,6 +262,7 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 	h.mu.Lock()
 	h.activeCancel, h.activeJob, h.demanded = cancel, job.ID, false
 	h.activeDone = make(chan struct{})
+	h.clearPendingLocked(job.ID)
 	h.mu.Unlock()
 	defer func() {
 		cancel()
@@ -221,6 +273,10 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 		h.activeDone = nil
 		h.mu.Unlock()
 	}()
+	if err := h.armSafetyHold(job.ID); err != nil {
+		return failCritical(fmt.Errorf("FINETUNE_START: cannot reserve durable safety hold: %w", err))
+	}
+	holdArmed = true
 	// Reserve may partially stop services before failing. Always release by the
 	// durable job tag, including on reserve errors and process failures.
 	evicted, reserveErr := h.cfg.Reservation.Reserve(trainCtx, job.ID)
@@ -233,13 +289,15 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 		if err := release(); err != nil {
 			return failCritical(errors.Join(reserveErr, fmt.Errorf("FINETUNE_START: restore after reservation failure: %w", err)))
 		}
+		safeCleanup = true
 		return fail(reserveErr)
 	}
 	if trainCtx.Err() != nil {
 		if err := release(); err != nil {
 			return failCritical(fmt.Errorf("FINETUNE_START: restore after preemption: %w", err))
 		}
-		return h.cancelled(context.Background(), job.ID, stream, "preempted by demand")
+		safeCleanup = true
+		return h.cancelled(context.Background(), job.ID, stream, "preempted by demand", true)
 	}
 	stopPoll := make(chan struct{})
 	go func() {
@@ -297,6 +355,7 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 	if releaseErr != nil {
 		return failCritical(fmt.Errorf("FINETUNE_START: restore %v: %w", evicted, releaseErr))
 	}
+	safeCleanup = true
 	h.mu.Lock()
 	demanded := h.demanded
 	h.mu.Unlock()
@@ -305,10 +364,10 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 		if demanded {
 			reason = "preempted by interactive or inference demand"
 		}
-		return h.cancelled(context.Background(), job.ID, stream, reason)
+		return h.cancelled(context.Background(), job.ID, stream, reason, true)
 	}
 	if cancelled, err := h.cfg.Control.Cancelled(context.Background(), job.ID); err == nil && cancelled {
-		return h.cancelled(context.Background(), job.ID, stream, "cancelled")
+		return h.cancelled(context.Background(), job.ID, stream, "cancelled", true)
 	} else if err != nil {
 		return fail(err)
 	}
@@ -319,13 +378,21 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 	if err := h.cfg.Control.Update(context.Background(), job.ID, state); err != nil {
 		return fail(err)
 	}
+	if err := h.clearSafetyHold(job.ID); err != nil {
+		return &JobResult{Status: JobStatusTerminalFailure, Error: fmt.Errorf("FINETUNE_START: safety hold removal failed: %w", err)}, nil
+	}
 	return &JobResult{Status: JobStatusSuccess, Output: state}, nil
 }
 
-func (h *FineTuneHandler) cancelled(ctx context.Context, id string, stream StreamWriter, reason string) (*JobResult, error) {
+func (h *FineTuneHandler) cancelled(ctx context.Context, id string, stream StreamWriter, reason string, clearHold bool) (*JobResult, error) {
 	fields := map[string]any{"status": "cancelled", "finished_at": time.Now().UTC().Format(time.RFC3339)}
 	if err := h.persistTerminal(id, fields, false); err != nil {
 		return &JobResult{Status: JobStatusTerminalFailure, Error: fmt.Errorf("FINETUNE_START: cancellation cleanup finished but canonical status update failed: %w", err)}, nil
+	}
+	if clearHold {
+		if err := h.clearSafetyHold(id); err != nil {
+			return &JobResult{Status: JobStatusTerminalFailure, Error: fmt.Errorf("FINETUNE_START: safety hold removal failed: %w", err)}, nil
+		}
 	}
 	if stream != nil {
 		_ = stream.WriteCancelled(reason)
