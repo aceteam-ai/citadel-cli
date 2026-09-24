@@ -111,6 +111,7 @@ pub fn run() {
             node::approve_device,
             node::local_status,
             node::service_status,
+            node::reconcile_desktop_helper,
             node::service_action,
             node::diagnostics,
             node::init_this_computer,

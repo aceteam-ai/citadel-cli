@@ -7,7 +7,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
@@ -77,6 +79,24 @@ var svcStatusCmd = &cobra.Command{
 	RunE:  runSvcStatus,
 }
 
+// Called by the desktop shell on startup. It never enrolls a node or adopts
+// an unrelated service; the result is deliberately safe to display in UI.
+var svcReconcileDesktopCmd = &cobra.Command{
+	Use:    "reconcile-desktop",
+	Hidden: true,
+	RunE: func(_ *cobra.Command, _ []string) error {
+		status, err := service.ReconcileBundledDesktopHelper()
+		if err != nil {
+			// Errors may contain local paths or command output. Only the fixed
+			// status code crosses the sidecar/UI boundary.
+			fmt.Fprintln(os.Stderr, "Citadel desktop service reconciliation needs attention")
+		}
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			Status service.DesktopReconcileStatus `json:"status"`
+		}{Status: status})
+	},
+}
+
 // --- Top-level aliases ---
 
 var installServiceCmd = &cobra.Command{
@@ -107,6 +127,7 @@ func init() {
 	svcCmd.AddCommand(svcStartCmd)
 	svcCmd.AddCommand(svcStopCmd)
 	svcCmd.AddCommand(svcStatusCmd)
+	svcCmd.AddCommand(svcReconcileDesktopCmd)
 
 	// Top-level aliases.
 	rootCmd.AddCommand(installServiceCmd)

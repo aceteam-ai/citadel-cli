@@ -341,6 +341,19 @@ function render(): void {
 }
 
 void refresh().catch((error) => { state.notice = errorMessage(error); render(); });
+// Reconcile the installed user LaunchAgent once per app start. It never
+// re-enrolls a node and ignores services not installed by the desktop app.
+void invoke<{ status: string }>("reconcile_desktop_helper").then((result) => {
+  if (result.status === "restart_failed") {
+    state.notice = "Citadel updated its node helper, but the service could not restart. Try Service > Start or open Diagnostics.";
+  } else if (result.status === "stage_failed" || result.status === "inspect_failed") {
+    state.notice = "Citadel could not prepare the node service. Open Diagnostics for help.";
+  }
+  render();
+}).catch(() => {
+  state.notice = "Citadel could not check the node service. Open Diagnostics for help.";
+  render();
+});
 setInterval(() => { if (state.auth.signed_in && !state.busy) void refresh().catch(() => {}); }, 30_000);
 
 void listen<{ view: AuthView | null; error: string | null }>("citadel:auth", (event) => {

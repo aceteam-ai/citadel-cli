@@ -23,34 +23,41 @@ func bundledDesktopHelper(path string) bool {
 // location. launchd refers to this copy, so ejecting a DMG, moving the app, or
 // App Translocation cannot invalidate its ProgramArguments.
 func installDesktopHelper(source, home string) (string, error) {
+	path, _, err := materializeDesktopHelper(source, home)
+	return path, err
+}
+
+// materializeDesktopHelper reports whether it had to create the content-addressed
+// copy. A missing copy at an already-current launchd path requires a reload.
+func materializeDesktopHelper(source, home string) (string, bool, error) {
 	if !bundledDesktopHelper(source) {
-		return "", fmt.Errorf("not a bundled desktop helper")
+		return "", false, fmt.Errorf("not a bundled desktop helper")
 	}
 	input, err := os.Open(source)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer input.Close()
 	info, err := input.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return "", fmt.Errorf("desktop helper must be a regular file")
+		return "", false, fmt.Errorf("desktop helper must be a regular file")
 	}
 	base := filepath.Join(home, "Library", "Application Support", "ai.aceteam.citadel", "helpers")
 	if err := os.MkdirAll(base, 0o700); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := os.Chmod(base, 0o700); err != nil {
-		return "", err
+		return "", false, err
 	}
 	tmp, err := os.MkdirTemp(base, ".staging-")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer os.RemoveAll(tmp)
 	staged := filepath.Join(tmp, "citadel")
 	output, err := os.OpenFile(staged, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	hash := sha256.New()
 	_, copyErr := io.Copy(io.MultiWriter(output, hash), input)
@@ -62,36 +69,65 @@ func installDesktopHelper(source, home string) (string, error) {
 	}
 	closeErr := output.Close()
 	if copyErr != nil {
-		return "", copyErr
+		return "", false, copyErr
 	}
 	if closeErr != nil {
-		return "", closeErr
+		return "", false, closeErr
 	}
 	version := hex.EncodeToString(hash.Sum(nil))
 	targetDir := filepath.Join(base, version)
 	target := filepath.Join(targetDir, "citadel")
-	if existingInfo, err := os.Lstat(target); err == nil {
-		if !existingInfo.Mode().IsRegular() {
-			return "", fmt.Errorf("installed desktop helper is not a regular file")
+	if _, err := os.Lstat(target); err == nil {
+		if err := verifyDesktopHelper(target, version); err != nil {
+			return "", false, err
 		}
-		existing, err := os.Open(target)
-		if err != nil {
-			return "", err
-		}
-		defer existing.Close()
-		other := sha256.New()
-		if _, err := io.Copy(other, existing); err != nil || !strings.EqualFold(hex.EncodeToString(other.Sum(nil)), version) {
-			return "", fmt.Errorf("installed desktop helper differs from bundled version")
-		}
-		if err := os.Chmod(target, 0o700); err != nil {
-			return "", err
-		}
-		return target, nil
+		return target, false, nil
 	} else if !os.IsNotExist(err) {
-		return "", err
+		return "", false, err
+	}
+	if dirInfo, err := os.Lstat(targetDir); err == nil {
+		if !dirInfo.IsDir() {
+			return "", false, fmt.Errorf("installed desktop helper directory is invalid")
+		}
+		if err := os.Chmod(targetDir, 0o700); err != nil {
+			return "", false, err
+		}
+		// The version directory may survive while its binary was removed.
+		// Link the fully written staging file into it without replacing a file
+		// created by another app instance in the meantime.
+		if err := os.Link(staged, target); err != nil {
+			if verifyErr := verifyDesktopHelper(target, version); verifyErr != nil {
+				return "", false, err
+			}
+		}
+		return target, true, nil
+	} else if !os.IsNotExist(err) {
+		return "", false, err
 	}
 	if err := os.Rename(tmp, targetDir); err != nil {
-		return "", err
+		if verifyErr := verifyDesktopHelper(target, version); verifyErr != nil {
+			return "", false, err
+		}
 	}
-	return target, nil
+	return target, true, nil
+}
+
+func verifyDesktopHelper(path, version string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("installed desktop helper is not a regular file")
+	}
+	input, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, input); err != nil || hex.EncodeToString(hash.Sum(nil)) != version {
+		return fmt.Errorf("installed desktop helper differs from bundled version")
+	}
+	return os.Chmod(path, 0o700)
 }

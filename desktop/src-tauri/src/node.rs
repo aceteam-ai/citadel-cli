@@ -97,6 +97,15 @@ pub async fn service_status(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub async fn reconcile_desktop_helper(app: AppHandle) -> Result<Value, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(json!({ "status": "unsupported" }));
+    }
+    let text = output(&app, &["service", "reconcile-desktop"]).await?;
+    serde_json::from_str(&text).map_err(|_| "Citadel returned invalid service status".to_string())
+}
+
+#[tauri::command]
 pub async fn service_action(app: AppHandle, action: String) -> Result<(), String> {
     if action != "start" && action != "stop" {
         return Err("Unsupported node action".to_string());
