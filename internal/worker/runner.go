@@ -368,10 +368,8 @@ runLoop:
 				continue
 			}
 			if yieldsFineTune(job.Type) {
-				for _, handler := range r.handlers {
-					if yielder, ok := handler.(interface{ YieldToDemand() }); ok {
-						yielder.YieldToDemand()
-					}
+				if !r.yieldFineTuneForDemand(ctx, job, stream) {
+					continue
 				}
 			}
 
@@ -442,6 +440,31 @@ runLoop:
 
 	r.log("info", "Worker shutdown complete")
 	return nil
+}
+
+// A claimed demand job must never enter any execution lane until every active
+// fine-tune handler confirms that its trainer and reservation are gone. A
+// failed preemption is a terminal refusal, not a speculative admission.
+func (r *Runner) yieldFineTuneForDemand(ctx context.Context, job *Job, stream StreamWriter) bool {
+	for _, handler := range r.handlers {
+		yielder, ok := handler.(interface{ YieldToDemand() error })
+		if !ok {
+			continue
+		}
+		if err := yielder.YieldToDemand(); err != nil {
+			r.log("error", "Refusing job %s: fine-tune preemption unconfirmed: %v", job.ID, err)
+			if stream != nil {
+				if writeErr := stream.WriteError(err, false); writeErr != nil {
+					r.log("warning", "Failed to publish demand refusal for job %s: %v", job.ID, writeErr)
+				}
+			}
+			if failErr := r.source.Fail(ctx, job, err, map[string]any{"fine_tune_preemption_unconfirmed": true}); failErr != nil {
+				r.log("error", "Failed to record demand refusal for job %s: %v", job.ID, failErr)
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func yieldsFineTune(t string) bool {
@@ -649,10 +672,26 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 		r.source.Nack(ctx, job, errLaneSaturated)
 		return
 	}
+	if job.Type == JobTypeFineTuneStart {
+		for _, handler := range r.handlers {
+			if pending, ok := handler.(interface{ MarkPendingFineTune(string) }); ok {
+				pending.MarkPendingFineTune(job.ID)
+			}
+		}
+	}
 	r.enterJob()
 	wg.Add(1)
 	go func(j *Job, s StreamWriter, st time.Time) {
 		defer wg.Done()
+		if j.Type == JobTypeFineTuneStart {
+			defer func() {
+				for _, handler := range r.handlers {
+					if pending, ok := handler.(interface{ ClearPendingFineTune(string) }); ok {
+						pending.ClearPendingFineTune(j.ID)
+					}
+				}
+			}()
+		}
 		jobOK := false
 		defer func() {
 			r.exitJob(jobOK)

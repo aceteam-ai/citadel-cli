@@ -176,6 +176,7 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		runner.RegisterHandler(worker.NewFineTuneHandler(worker.FineTuneConfig{
 			NodeID: runner.NodeID(), WorkspaceDir: opts.WorkspaceDir,
 			OutputRoot:  filepath.Join(opts.ConfigDir, "finetune", "adapters"),
+			SafetyDir:   filepath.Join(opts.ConfigDir, "finetune", "safety"),
 			CacheDir:    filepath.Join(opts.ConfigDir, "finetune", "cache"),
 			Image:       "citadel-finetune:local",
 			Control:     control,
