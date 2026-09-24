@@ -230,3 +230,51 @@ var allKnownJobTypes = []string{
 	JobTypeInstanceDestroy,
 	JobTypeInstanceStatus,
 }
+
+// gatedJobTypeReasons names, for a job type this build knows about (it is in
+// allKnownJobTypes) but that CreateLegacyHandlersWithOpts (handler_adapter.go)
+// registers only conditionally, the runtime condition that must be satisfied
+// for this node to serve it. It exists so failUnsupportedJobType (runner.go)
+// can tell an operator "this node's files permission is disabled" instead of
+// "update the node" -- the two have completely different remedies, and
+// conflating them sent operators chasing a binary update for what was really a
+// permission toggle (aceteam#9962).
+//
+// Keep this in sync with the registration gates in handler_adapter.go:
+//   - files: FILE_READ/READ_BYTES/WRITE/WRITE_BYTES/EDIT/LIST/SEARCH/INDEX/
+//     SEMANTIC_SEARCH register only when WorkspaceDir != "" and !FilesDisabled.
+//     FilesDisabled tracks the node's `files` permission, default-DENY on a
+//     fresh node (aceteam#6524).
+//   - desktop: FILE_SCREENSHOT/VNC_SCREENSHOT/VNC_TYPE/VNC_KEYS/VNC_ACTIONS
+//     register only when !DesktopDisabled. DesktopDisabled tracks the node's
+//     `desktop` permission, also default-DENY.
+//   - config dir: SERVICE_START/SERVICE_STOP/SERVICE_STATUS register only when
+//     ConfigDir != "" (a resolved citadel.yaml manifest directory).
+//   - workspace: MEETING_JOIN registers only when WorkspaceDir != "" and the
+//     node's meeting capability is enabled (config.LoadMeeting(...).MeetingEnabled,
+//     default-on).
+//
+// A type absent from this map but also absent from a node's registered
+// handlers is either genuinely unsupported by this build (not in
+// allKnownJobTypes at all) or unconditionally registered and thus never
+// reaches failUnsupportedJobType in a gated state.
+var gatedJobTypeReasons = map[string]string{
+	JobTypeFileRead:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileReadBytes:      "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileWrite:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileWriteBytes:     "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileEdit:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileList:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileSearch:         "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileIndex:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileSemanticSearch: "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileScreenshot:     "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeVNCScreenshot:      "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeVNCType:            "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeVNCKeys:            "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeVNCActions:         "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeServiceStart:       "this node has no citadel.yaml manifest / config directory configured",
+	JobTypeServiceStop:        "this node has no citadel.yaml manifest / config directory configured",
+	JobTypeServiceStatus:      "this node has no citadel.yaml manifest / config directory configured",
+	JobTypeMeetingJoin:        "this node has no workspace directory configured, or its meeting capability is toggled off",
+}
