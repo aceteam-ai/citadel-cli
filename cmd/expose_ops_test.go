@@ -26,10 +26,15 @@ func setupExposeOpsTest(t *testing.T) *gateway.Server {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
+	originalMeshIP := exposeMeshIP
+	exposeMeshIP = func() string { return "" }
 
 	gw := gateway.NewServer(gateway.Config{})
 	setProvisionedServiceGateway(gw, 8443, true, "", 8080)
-	t.Cleanup(func() { setProvisionedServiceGateway(nil, 0, false, "", 0) })
+	t.Cleanup(func() {
+		exposeMeshIP = originalMeshIP
+		setProvisionedServiceGateway(nil, 0, false, "", 0)
+	})
 	return gw
 }
 

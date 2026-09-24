@@ -97,13 +97,14 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 			// Delegates to the same live adapter the EXPOSE_SET job uses, so the
 			// CLI/MCP path and the job path cannot drift.
 			return liveExposeOps{}.Expose(ctx, worker.ExposeRequest{
-				Name:       spec.Name,
-				Port:       spec.Port,
-				Path:       spec.Path,
-				Visibility: spec.Visibility,
-				TTLSeconds: spec.TTLSeconds,
-				Creator:    spec.Creator,
-				Epoch:      spec.Epoch,
+				Name:          spec.Name,
+				Port:          spec.Port,
+				ForwardTarget: spec.ForwardTarget,
+				Path:          spec.Path,
+				Visibility:    spec.Visibility,
+				TTLSeconds:    spec.TTLSeconds,
+				Creator:       spec.Creator,
+				Epoch:         spec.Epoch,
 			})
 		},
 		Unexpose: func(name string) (any, error) {

@@ -54,6 +54,23 @@ func (f *fakeExposeOps) List(_ context.Context) (*ExposeListResult, error) {
 
 const exposePerNodeQueue = "jobs:v1:shell:org_test:node:1314"
 
+func TestExposeSetPlatformRequiresPortAndPassesTarget(t *testing.T) {
+	if _, err := parseExposeRequest(map[string]any{"name": "web", "path": "site", "visibility": "platform"}); err == nil {
+		t.Fatal("platform directory was accepted")
+	}
+	if _, err := parseExposeRequest(map[string]any{"name": "web", "port": 80, "visibility": "org", "forward_target": "127.0.0.1:8080"}); err == nil {
+		t.Fatal("target override was accepted for a gateway route")
+	}
+	ops := &fakeExposeOps{}
+	h := NewExposeSetHandler(ExposeSetConfig{Ops: ops})
+	res, _ := h.Execute(context.Background(), newExposeJob(exposePerNodeQueue, map[string]any{
+		"name": "web", "port": 80, "visibility": "platform", "forward_target": "127.0.0.1:8080", "allowed_logins": []string{"attacker"},
+	}), nil)
+	if res.Status != JobStatusSuccess || !ops.called || ops.got.ForwardTarget != "127.0.0.1:8080" {
+		t.Fatalf("platform request: %+v, %+v", res, ops.got)
+	}
+}
+
 func newExposeJob(queue string, payload map[string]any) *Job {
 	return &Job{ID: "j1", Type: JobTypeExposeSet, SourceQueue: queue, Payload: payload}
 }
