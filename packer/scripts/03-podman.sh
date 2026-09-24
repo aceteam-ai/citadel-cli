@@ -10,6 +10,9 @@ if apt-cache show passt >/dev/null 2>&1; then
 fi
 id citadel >/dev/null 2>&1 || useradd --create-home --shell /bin/bash citadel
 test "$(getent passwd citadel | cut -d: -f6)" = /home/citadel
+for group in $(id -nG citadel); do
+    case "$group" in sudo|wheel|docker) echo "ERROR: dedicated citadel user has privileged $group membership" >&2; exit 1 ;; esac
+done
 ensure_subid() {
     local file="$1" type="$2" start
     if awk -F: '$1=="citadel" && $3>=65536 {found=1} END {exit !found}' "$file"; then return; fi
@@ -31,19 +34,49 @@ UNIT
 systemctl daemon-reload
 loginctl enable-linger citadel
 citadel_uid=$(id -u citadel)
-systemctl start "user@${citadel_uid}.service"
+verify_user_manager() {
+    local controller controllers group gid pid groups
+    controllers=$(<"/sys/fs/cgroup/user.slice/user-${citadel_uid}.slice/user@${citadel_uid}.service/cgroup.controllers")
+    for controller in cpu memory pids; do
+        [[ " ${controllers} " == *" ${controller} "* ]] || { echo "ERROR: Missing delegated ${controller} controller" >&2; exit 1; }
+    done
+    if [ "$#" -eq 0 ]; then return; fi
+    pid=$(systemctl show "user@${citadel_uid}.service" -p MainPID --value)
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { echo 'ERROR: No active user manager PID' >&2; exit 1; }
+    groups=$(sed -n 's/^Groups:[[:space:]]*//p' "/proc/${pid}/status")
+    for group in "$@"; do
+        gid=$(getent group "$group" | cut -d: -f3)
+        [[ " ${groups} " == *" ${gid} "* ]] || { echo "ERROR: Active manager missing $group group" >&2; exit 1; }
+    done
+}
+systemctl restart "user@${citadel_uid}.service"
+verify_user_manager
 runuser -u citadel -- env HOME=/home/citadel XDG_RUNTIME_DIR="/run/user/${citadel_uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${citadel_uid}/bus" systemctl --user enable --now podman.socket
 runuser -u citadel -- env HOME=/home/citadel XDG_RUNTIME_DIR="/run/user/${citadel_uid}" podman info >/dev/null
 
 # The driver loads only on the cloned VM's first boot; firstboot generates CDI.
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |
-    gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list |
-    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-    > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-apt-get update -y
-apt-get install -y --no-install-recommends nvidia-container-toolkit
+is_jetson=false
+if [ -s /etc/nv_tegra_release ] || grep -qiE 'jetson|tegra' /proc/device-tree/model /sys/firmware/devicetree/base/model 2>/dev/null; then
+    is_jetson=true
+fi
+if [ "$is_jetson" = true ]; then
+    command -v nvidia-ctk >/dev/null || { echo 'ERROR: Jetson needs its JetPack-matched nvidia-ctk toolkit' >&2; exit 1; }
+elif [ "$(uname -m)" != aarch64 ] && [ "$(uname -m)" != arm64 ]; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |
+        gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list |
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+        > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    apt-get update -y
+    apt-get install -y --no-install-recommends nvidia-container-toolkit
+fi
+if command -v nvidia-ctk >/dev/null; then
+for group in video render; do
+    getent group "$group" >/dev/null || { echo "ERROR: Required GPU group $group is missing" >&2; exit 1; }
+done
 usermod -aG video,render citadel
+systemctl restart "user@${citadel_uid}.service"
+verify_user_manager video render
 cat > /etc/udev/rules.d/70-citadel-nvidia.rules <<'RULE'
 KERNEL=="nvidia[0-9]*", GROUP="video", MODE="0660"
 KERNEL=="nvidiactl", GROUP="video", MODE="0660"
@@ -51,21 +84,36 @@ KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
 KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
 RULE
 udevadm control --reload-rules
+install -d -m 755 /usr/local/libexec /etc/cdi
+cat > /usr/local/libexec/citadel-nvidia-cdi-refresh <<'SCRIPT'
+#!/bin/sh
+set -eu
+for attempt in $(seq 1 30); do
+    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+       nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
+        exit 0
+    fi
+    sleep 2
+done
+echo 'NVIDIA CDI devices unavailable after readiness retries' >&2
+exit 1
+SCRIPT
+chmod 755 /usr/local/libexec/citadel-nvidia-cdi-refresh
 cat > /etc/systemd/system/citadel-nvidia-cdi.service <<'UNIT'
 [Unit]
 Description=Refresh Citadel NVIDIA CDI devices after driver initialization
 After=systemd-udev-settle.service
-ConditionPathExists=/dev/nvidiactl
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+ExecStart=/usr/local/libexec/citadel-nvidia-cdi-refresh
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 systemctl enable citadel-nvidia-cdi.service
+fi
 podman --version
 apt-get clean
 rm -rf /var/lib/apt/lists/*

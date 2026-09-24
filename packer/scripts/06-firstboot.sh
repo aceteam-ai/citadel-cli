@@ -104,13 +104,14 @@ as_citadel() {
 }
 as_citadel systemctl --user enable --now podman.socket
 as_citadel podman info >/dev/null
-if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
+if command -v nvidia-ctk >/dev/null 2>&1; then
     install -d -m 755 /etc/cdi
-    nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-    nvidia-ctk cdi list
-    log "NVIDIA CDI spec generated."
-else
-    log "NVIDIA driver not active; GPU CDI generation remains pending."
+    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+       nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
+        log "NVIDIA CDI devices verified."
+    else
+        log "NVIDIA CDI pending; boot refresh service retries driver readiness."
+    fi
 fi
 as_citadel systemctl --user daemon-reload
 as_citadel systemctl --user enable --now citadel-worker.service

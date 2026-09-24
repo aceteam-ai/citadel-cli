@@ -82,6 +82,9 @@ echo "==> Citadel CLI installed: $(${INSTALL_DIR}/${BINARY_NAME} version)"
 # Add citadel user to log-reading groups so journalctl returns entries
 # ---------------------------------------------------------------------------
 
+for group in systemd-journal adm; do
+    getent group "$group" >/dev/null || { echo "ERROR: Required log-reader group $group is missing" >&2; exit 1; }
+done
 usermod -aG systemd-journal,adm citadel
 
 # ---------------------------------------------------------------------------

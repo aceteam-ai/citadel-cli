@@ -49,7 +49,7 @@ variable "cpus" {
 
 variable "ssh_username" {
   type        = string
-  default     = "citadel"
+  default     = "citadel-build"
   description = "SSH username configured via cloud-init"
 }
 
