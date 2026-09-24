@@ -172,50 +172,12 @@ func knownServiceNames(manifest *CitadelManifest) []string {
 
 // runSingleService adds a service to the manifest (if needed) and starts it.
 func runSingleService(serviceName string) {
-	// Find or create manifest first: the manifest is the source of truth for
-	// module-installed services, and it must be created on a fresh node so a
-	// valid embedded service can be started on first run.
-	manifest, configDir, err := findOrCreateManifest()
+	configDir, err := localServiceConfigDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to initialize configuration: %v\n", err)
+		fmt.Fprintf(os.Stderr, "❌ Failed to resolve configuration: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Validate service name against both the embedded catalog and the manifest
-	// (which tracks module-installed services).
-	if !serviceIsKnown(serviceName, manifest) {
-		fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
-		fmt.Printf("Available services: %s\n", strings.Join(knownServiceNames(manifest), ", "))
-		os.Exit(1)
-	}
-
-	// Ensure compose file exists
-	if err := ensureComposeFile(configDir, serviceName); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to create compose file: %v\n", err)
-		os.Exit(1)
-	}
-
-	// GPU device reservations are stripped for non-Linux hosts by startService,
-	// which writes the CPU-only variant to a TEMP file rather than mutating the
-	// materialized compose in place. Mutating it here would permanently diverge
-	// the on-disk file from the embedded template, causing the version-change
-	// re-materialization sweep to mis-flag it as operator-edited on macOS (#426).
-	composePath := filepath.Join(configDir, "services", serviceName+".yml")
-
-	// Add to manifest if not present
-	if !hasService(manifest, serviceName) {
-		if err := addServiceToManifest(configDir, serviceName); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to update manifest: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("✅ Added '%s' to manifest\n", serviceName)
-	}
-
-	// An explicit `citadel run <service>` clears the durable stopped marker
-	// (mirrors liveModuleOps.Start, #528) so the service starts on the next boot
-	// again. Cleared FIRST so a transiently-failed start still records the
-	// operator's run intent. Best-effort: the service is in the manifest by now.
-	if err := startRunService(configDir, serviceName, composePath, startService); err != nil {
+	if err := runSingleServiceApply(configDir, serviceName, startService); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to start service '%s': %v\n", serviceName, err)
 		os.Exit(1)
 	}
@@ -227,17 +189,48 @@ func runSingleService(serviceName string) {
 	}
 }
 
+// Admission covers the initial bootstrap, embedded compose materialization,
+// registration, desired-status write, and actual start. The old split path
+// wrote the first three before checking an active fine-tune hold.
+func runSingleServiceApply(configDir, serviceName string, startFn func(string, string) error) error {
+	return withLocalServiceStartGuard(configDir, serviceName, func() error {
+		manifest, _, err := findOrCreateManifest()
+		if err != nil {
+			return fmt.Errorf("initialize configuration: %w", err)
+		}
+		if !serviceIsKnown(serviceName, manifest) {
+			return fmt.Errorf("unknown service %q (available: %s)", serviceName, strings.Join(knownServiceNames(manifest), ", "))
+		}
+		if err := ensureComposeFile(configDir, serviceName); err != nil {
+			return fmt.Errorf("create compose file: %w", err)
+		}
+		composePath := filepath.Join(configDir, "services", serviceName+".yml")
+		if !hasService(manifest, serviceName) {
+			if err := addServiceToManifest(configDir, serviceName); err != nil {
+				return fmt.Errorf("register service: %w", err)
+			}
+			fmt.Printf("✅ Added '%s' to manifest\n", serviceName)
+		}
+		return startRunServiceUnchecked(configDir, serviceName, composePath, startFn)
+	})
+}
+
 // startRunService keeps `citadel run <name>`'s explicit start intent and
 // compose-up in the same fine-tune reservation critical section. The start
 // function is injectable so a denied held tag is tested without Docker.
 func startRunService(configDir, serviceName, composePath string, startFn func(string, string) error) error {
 	return withLocalServiceStartGuard(configDir, serviceName, func() error {
-		if err := setServiceDesiredStatus(configDir, serviceName, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "⚠️  Could not clear stopped marker for %s: %v\n", serviceName, err)
-		}
-		fmt.Printf("--- 🚀 Starting service: %s ---\n", serviceName)
-		return startFn(serviceName, composePath)
+		return startRunServiceUnchecked(configDir, serviceName, composePath, startFn)
 	})
+}
+
+// Caller already owns reservation.lock (runSingleServiceApply or the guard).
+func startRunServiceUnchecked(configDir, serviceName, composePath string, startFn func(string, string) error) error {
+	if err := setServiceDesiredStatus(configDir, serviceName, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  Could not clear stopped marker for %s: %v\n", serviceName, err)
+	}
+	fmt.Printf("--- 🚀 Starting service: %s ---\n", serviceName)
+	return startFn(serviceName, composePath)
 }
 
 // restartAllServices restarts all services defined in the manifest.

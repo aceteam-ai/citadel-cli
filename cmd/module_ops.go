@@ -147,14 +147,18 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 		return fmt.Errorf("resolve %q: %w", m.Source, err)
 	}
 
-	nodeManifest, configDir, err := findOrCreateManifest()
+	configDir, err := localServiceConfigDir()
 	if err != nil {
-		return fmt.Errorf("initialize node config: %w", err)
+		return fmt.Errorf("resolve node config: %w", err)
 	}
 	// The pull loop can call Install without passing through Runner's demand
 	// preemption. Guard the ENTIRE update transaction: uninstall would erase
 	// the held service's reservation tag before the final start check.
-	return withLocalServiceStartGuard(configDir, manifest.Name, func() error {
+	return withIncomingServiceStartGuard(configDir, manifest.Name, composeSrc, manifest.Requires.GPU || manifest.Requires.VRAMMinGB > 0, func() error {
+		nodeManifest, _, err := findOrCreateManifest()
+		if err != nil {
+			return fmt.Errorf("initialize node config: %w", err)
+		}
 		servicesDir := filepath.Join(configDir, "services")
 
 		trusted := catalog.IsTrusted(src)
