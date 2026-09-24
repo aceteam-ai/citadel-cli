@@ -4,6 +4,7 @@ package jobs
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,12 @@ const defaultMaxWriteBytes int64 = 50 * 1024 * 1024
 // the Redis wire intact, which the text FILE_WRITE path cannot guarantee.
 type FileWriteBytesHandler struct {
 	WorkspaceDir string
+	// Disabled keeps the operation registered but refuses before accessing the
+	// workspace when no live permission source is configured.
+	Disabled bool
+	// Enabled reads the current node Files permission. When present it takes
+	// precedence over the startup Disabled value.
+	Enabled func() bool
 }
 
 // NewFileWriteBytesHandler creates a handler rooted at workspace.
@@ -44,6 +51,10 @@ func NewFileWriteBytesHandler(workspace string) *FileWriteBytesHandler {
 //   - path:          validated absolute path written.
 //   - bytes_written: decoded byte length actually written.
 func (h *FileWriteBytesHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	if (h.Enabled != nil && !h.Enabled()) || (h.Enabled == nil && h.Disabled) {
+		return nil, errors.New(`{"reason":"files_disabled","message":"Node Files permission required for binary file writes. Enable Files in the AceTeam control center or use citadel_set_files_permission with enabled=true and confirm=true, then restart the Citadel worker. If Files is already enabled, restart the worker to apply it."}`)
+	}
+
 	path, ok := job.Payload["path"]
 	if !ok || path == "" {
 		return nil, fmt.Errorf("job payload missing 'path' field")
