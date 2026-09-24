@@ -913,14 +913,14 @@ func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream Strea
 		r.publishWorkerControlRefusal(ctx, stream, "ack_failed", "worker restart queue acknowledgment failed")
 		return false
 	}
-	var commit, cancel func()
+	var commit func()
 	if accepted {
 		if !ok {
 			r.publishWorkerControlRefusal(ctx, stream, "schedule_failed", "worker restart scheduler is unavailable")
 			return false
 		}
 		var err error
-		commit, cancel, err = control.PrepareAfterAck(job)
+		commit, _, err = control.PrepareAfterAck(job)
 		if err != nil {
 			r.log("error", "WORKER_CONTROL %s restart preparation failed: %v", job.ID, err)
 			if abortErr := control.Abort(job); abortErr != nil {
@@ -932,12 +932,13 @@ func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream Strea
 		}
 	}
 	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(result.Output) }); err != nil {
-		r.log("error", "WORKER_CONTROL %s result publish failed: %v", job.ID, err)
+		r.log("error", "WORKER_CONTROL %s result publish failed with uncertain delivery: %v", job.ID, err)
 		if accepted {
-			cancel()
-			if abortErr := control.Abort(job); abortErr != nil {
-				r.log("error", "WORKER_CONTROL %s abort failed: %v", job.ID, abortErr)
-			}
+			// A failed publish call may still have delivered the accepted event.
+			// Once publication has been attempted, cancelling the exit would
+			// leave that caller with accepted=true but no restart. Keep the
+			// prepared restart; an unseen result remains unconfirmed upstream.
+			commit()
 		}
 		return false
 	}

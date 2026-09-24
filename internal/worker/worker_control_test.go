@@ -179,18 +179,47 @@ func TestWorkerControlSchedulingFailureDoesNotAcceptOrTombstone(t *testing.T) {
 	}
 }
 
-func TestWorkerControlPublishFailureCancelsPreparedRestart(t *testing.T) {
+func TestWorkerControlPublishFailureKeepsPreparedRestart(t *testing.T) {
 	count, cancelled := 0, 0
 	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: func() (func(), func(), error) { return func() { count++ }, func() { cancelled++ }, nil }})
 	job := controlJob("publish-failed")
 	_, result, ok := runControl(t, h, job, errors.New("publish unavailable"), nil, nil)
-	if ok || result != nil || count != 0 || cancelled != 1 {
+	if ok || result != nil || count != 1 || cancelled != 0 {
 		t.Fatalf("result=%v ok=%v restarts=%d cancelled=%d", result, ok, count, cancelled)
 	}
 	if fired, err := h.marker(job.ID, "fired"); err != nil {
 		t.Fatal(err)
-	} else if _, err := os.Stat(fired); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("fired marker survived publish failure: %v", err)
+	} else if _, err := os.Stat(fired); err != nil {
+		t.Fatalf("fired marker missing after uncertain publish: %v", err)
+	}
+}
+
+type uncertainControlWriter struct {
+	controlWriter
+}
+
+func (w *uncertainControlWriter) WriteEnd(result map[string]any) error {
+	*w.events = append(*w.events, "result")
+	w.result = result // Simulate a publish that reached the coordinator before its response was lost.
+	return errors.New("publish response lost")
+}
+
+func TestWorkerControlDeliveredAcceptanceStillRestartsWhenPublishReportsError(t *testing.T) {
+	events := []string{}
+	restarted := 0
+	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { restarted++ })})
+	source := &controlSource{MockJobSource: NewMockJobSource("redis", nil), events: &events}
+	writer := &uncertainControlWriter{controlWriter: controlWriter{events: &events}}
+	runner := NewRunner(source, []JobHandler{h}, RunnerConfig{NodeID: "758", State: NewWorkerState()})
+	oldAttempts, oldBackoff := streamWriteRetryAttempts, streamWriteRetryBackoff
+	streamWriteRetryAttempts, streamWriteRetryBackoff = 1, []time.Duration{0}
+	defer func() { streamWriteRetryAttempts, streamWriteRetryBackoff = oldAttempts, oldBackoff }()
+	job := controlJob("delivered-before-error")
+	if runner.executeJob(context.Background(), job, writer, time.Now(), false, 0) {
+		t.Fatal("uncertain publication must not report a clean worker result")
+	}
+	if writer.result["accepted"] != true || restarted != 1 || !reflect.DeepEqual(events, []string{"ack", "result"}) {
+		t.Fatalf("events=%v result=%v restarts=%d", events, writer.result, restarted)
 	}
 }
 
