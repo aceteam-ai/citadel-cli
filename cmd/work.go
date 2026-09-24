@@ -1567,6 +1567,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			PairingDisplay:  pairingDisplayFn,
 			CacheReport:     cacheReportFn,
 			JobTypes:        jobTypesFn,
+			// The status process may run as a different user than an interactive
+			// invoker. Advertise the same machine-level policy the worker enforces.
+			PermissionsProvider: loadNodePermissions,
 		})
 	}
 
@@ -1886,6 +1889,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				PairingDisplay:  pairingDisplayFn,
 				CacheReport:     cacheReportFn,
 				JobTypes:        jobTypesFn,
+				PermissionsProvider: loadNodePermissions,
 			})
 		}
 
