@@ -683,6 +683,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		// reservation reconcile above is: this can mutate citadel.yaml and
 		// start a container, so a second concurrent process racing it could
 		// double-start a service or race the completion marker write.
+		// A fine-tune hold can make reservation reconcile fail above; this
+		// call still reaches runDefaultServeReconcile, whose own shared
+		// reservation-lock/hold gate defers before any probe or once-marker
+		// mutation until verified trainer cleanup clears that hold.
 		// Deliberately NOT run from `citadel init` -- see default_serve.go's
 		// package doc for why this belongs at `citadel work` startup.
 		if workerLockHeld {

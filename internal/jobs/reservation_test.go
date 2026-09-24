@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -96,6 +97,63 @@ func newReservationTestHandlerWithManifest(t *testing.T, manifestYAML string, st
 	h.stopServiceFn = exec.stop
 	h.startServiceFn = exec.start
 	return h, exec
+}
+
+func TestHeldGuardInspectsCustomComposeAndCatalogGPURequirements(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	h, _ := newReservationTestHandlerWithManifest(t, `services:
+  - name: custom-gpu
+    type: docker
+    compose_file: services/custom-gpu.yml
+  - name: custom-catalog
+    type: docker
+    compose_file: services/custom-catalog.yml
+  - name: custom-cpu
+    type: docker
+    compose_file: services/custom-cpu.yml
+`, fullGPUStatus())
+	servicesDir := filepath.Join(h.ConfigDir, "services")
+	if err := os.MkdirAll(servicesDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, compose := range map[string]string{
+		"custom-gpu":     "services:\n  custom-gpu:\n    image: example/gpu\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - capabilities: [gpu]\n",
+		"custom-catalog": "services:\n  custom-catalog:\n    image: example/catalog\n",
+		"custom-cpu":     "services:\n  custom-cpu:\n    image: example/cpu\n",
+	} {
+		if err := os.WriteFile(filepath.Join(servicesDir, name+".yml"), []byte(compose), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	catalogDir := filepath.Join(catalog.GetCatalogPath(), "services", "custom-catalog")
+	if err := os.MkdirAll(catalogDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(catalogDir, "service.yaml"), []byte("name: custom-catalog\nrequires:\n  gpu: true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(finetunesafety.Dir(h.ConfigDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(h.ConfigDir), []byte("train-job"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"custom-gpu", "custom-catalog"} {
+		called := false
+		if err := h.WithHeldServiceGuard(name, func() error { called = true; return nil }); err == nil || called {
+			t.Fatalf("%s admitted under hold: called=%t err=%v", name, called, err)
+		}
+	}
+	called := false
+	if err := h.WithHeldServiceGuard("custom-cpu", func() error { called = true; return nil }); err != nil || !called {
+		t.Fatalf("custom CPU wrongly blocked: called=%t err=%v", called, err)
+	}
+	if err := os.WriteFile(filepath.Join(servicesDir, "custom-cpu.yml"), []byte("services: [malformed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.WithHeldServiceGuard("custom-cpu", func() error { t.Fatal("malformed compose admitted"); return nil }); err == nil {
+		t.Fatal("malformed compose did not fail closed")
+	}
 }
 
 // nativeReservationTestManifestYAML mirrors reservationTestManifestYAML but

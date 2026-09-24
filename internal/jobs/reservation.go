@@ -2,12 +2,17 @@
 package jobs
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 )
 
 // Package-level doc for the job-scoped GPU reservation primitive
@@ -93,9 +98,9 @@ func (h *ServiceHandler) WithHeldServiceGuard(name string, start func() error) e
 
 // A stop may still proceed for an untagged serving module; it only needs to
 // preserve a tag it would otherwise erase. Start operations additionally
-// block the two candidate services even when they were already stopped and
+// block any GPU/model-serving service even when it was already stopped and
 // therefore had no eviction tag.
-func (h *ServiceHandler) withHeldServiceGuard(name string, blockFineTuneCandidates bool, mutation func() error) error {
+func (h *ServiceHandler) withHeldServiceGuard(name string, blockGPUDemand bool, mutation func() error) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("local service start: name is required")
 	}
@@ -105,9 +110,6 @@ func (h *ServiceHandler) withHeldServiceGuard(name string, blockFineTuneCandidat
 			return fmt.Errorf("local service start %s: %w", name, err)
 		}
 		if held {
-			if blockFineTuneCandidates && finetunesafety.CouldEvict(name) {
-				return fmt.Errorf("local service start %s: service is reserved by active fine-tune job; verified cleanup required", name)
-			}
 			manifest, err := h.loadManifest()
 			if err != nil {
 				return fmt.Errorf("local service start %s: cannot inspect held reservation: %w", name, err)
@@ -117,9 +119,76 @@ func (h *ServiceHandler) withHeldServiceGuard(name string, blockFineTuneCandidat
 					return fmt.Errorf("local service start %s: service is reserved by active fine-tune job; verified cleanup required", name)
 				}
 			}
+			if blockGPUDemand {
+				gpu, inspectErr := h.serviceMayDemandGPU(name, manifest)
+				if inspectErr != nil {
+					return fmt.Errorf("local service start %s: cannot prove service is non-GPU while fine-tune is active: %w", name, inspectErr)
+				}
+				if gpu {
+					return fmt.Errorf("local service start %s: service is reserved by active fine-tune job; verified cleanup required", name)
+				}
+			}
 		}
 		return mutation()
 	})
+}
+
+// serviceMayDemandGPU classifies NEW starts, not just services fine-tune would
+// evict. A previously stopped serving engine is untagged, yet starting it
+// during training would still overlap the trainer. Check the canonical engine
+// budget and both embedded/on-disk compose GPU declarations. Catalog requires
+// metadata catches catalog-only modules. Unknown custom services with no
+// inspectable compose or catalog metadata fail closed under an active hold.
+func (h *ServiceHandler) serviceMayDemandGPU(name string, manifest *serviceManifest) (bool, error) {
+	if finetunesafety.CouldEvict(name) || status.EngineVRAMEstimateMB(name) > 0 {
+		return true, nil
+	}
+	inspected := false
+	if embedded, ok := embeddedservices.ServiceMap[name]; ok {
+		gpu, err := catalog.ComposeDeclaresGPU(embedded)
+		if err != nil {
+			return false, fmt.Errorf("embedded compose: %w", err)
+		}
+		inspected = true
+		if gpu {
+			return true, nil
+		}
+	}
+	for _, service := range manifest.Services {
+		if service.Name != name || service.ComposeFile == "" {
+			continue
+		}
+		path := service.ComposeFile
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(h.ConfigDir, path)
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return false, fmt.Errorf("read compose %s: %w", path, err)
+		}
+		gpu, err := catalog.ComposeDeclaresGPU(string(contents))
+		if err != nil {
+			return false, fmt.Errorf("parse compose %s: %w", path, err)
+		}
+		inspected = true
+		if gpu {
+			return true, nil
+		}
+		break
+	}
+	definition, err := catalog.LoadServiceManifest(name)
+	if err == nil {
+		inspected = true
+		if definition.Requires.GPU || definition.Requires.VRAMMinGB > 0 {
+			return true, nil
+		}
+	} else if !errors.Is(err, catalog.ErrServiceNotFound) && !inspected {
+		return false, fmt.Errorf("inspect catalog metadata: %w", err)
+	}
+	if !inspected {
+		return false, fmt.Errorf("no inspectable GPU declaration for %q", name)
+	}
+	return false, nil
 }
 
 // Reserve evicts non-pinned services to free requiredVRAMBytes of VRAM on
