@@ -83,7 +83,12 @@ func runServiceExclusive(serviceName string) {
 	jobID := jobs.ExclusiveReservationJobID(serviceName)
 
 	fmt.Printf("--- 🔒 Reserving the GPU exclusively for '%s' ---\n", serviceName)
-	res, err := startExclusiveForCLI(handler, jctx, jobID, serviceName, exclusiveVRAMGB)
+	var res *jobs.Reservation
+	err = withCanonicalNodePointerLock(configDir, func(nodeDirSource) error {
+		var startErr error
+		res, startErr = startExclusiveForCLI(handler, jctx, jobID, serviceName, exclusiveVRAMGB)
+		return startErr
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to reserve and start '%s': %v\n", serviceName, err)
 		if res != nil && len(res.Evicted) > 0 {
@@ -123,7 +128,12 @@ func waitForExclusiveReleaseSignal(handler *jobs.ServiceHandler, jctx jobs.JobCo
 	<-ctx.Done()
 
 	fmt.Println("\n--- 🔓 Releasing GPU reservation ---")
-	restored, err := handler.Release(jctx, jobID)
+	var restored []string
+	err := withCanonicalNodePointerLock(handler.ConfigDir, func(nodeDirSource) error {
+		var releaseErr error
+		restored, releaseErr = handler.Release(jctx, jobID)
+		return releaseErr
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  Some services could not be restored: %v\n", err)
 		fmt.Fprintf(os.Stderr, "   Run 'citadel module reservations release %s' to retry, or 'citadel module reservations list' to inspect.\n", jobID)

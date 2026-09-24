@@ -253,6 +253,14 @@ func ensureNodeScaffold(nodeConfigDir, nodeName string) error {
 // config dir, plus the merge-preserving global node_config_dir pointer.
 // Idempotent.
 func ensureNodeScaffoldAt(nodeConfigDir, nodeName, globalConfigFile string) error {
+	return withNodePointerLock(globalConfigFile, func() error {
+		return ensureNodeScaffoldLockedAt(nodeConfigDir, nodeName, globalConfigFile)
+	})
+}
+
+// The global pointer lock spans scaffold creation and pointer publication so
+// an in-flight local GPU start cannot observe a partially retargeted node.
+func ensureNodeScaffoldLockedAt(nodeConfigDir, nodeName, globalConfigFile string) error {
 	if nodeConfigDir == "" {
 		return fmt.Errorf("no node config dir resolved")
 	}
@@ -288,5 +296,5 @@ func ensureNodeScaffoldAt(nodeConfigDir, nodeName, globalConfigFile string) erro
 		}
 	}
 
-	return writeGlobalConfigFile(globalConfigFile, nodeConfigDir)
+	return writeGlobalConfigFileLocked(globalConfigFile, nodeConfigDir)
 }

@@ -210,6 +210,21 @@ func readManifestFromDir(configDir string) (*CitadelManifest, string, error) {
 	return &manifest, configDir, nil
 }
 
+// readManifestAt is for transactions that already captured and locked their
+// node directory. It must not consult the mutable global pointer again.
+func readManifestAt(configDir string) (*CitadelManifest, error) {
+	path := filepath.Join(configDir, "citadel.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest %s: %w", path, err)
+	}
+	var manifest CitadelManifest
+	if err := yaml.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("parse manifest %s: %w", path, err)
+	}
+	return &manifest, nil
+}
+
 type nodeDirSource uint8
 
 const (
@@ -273,10 +288,33 @@ func resolveNodeConfigDirReadOnly() (string, nodeDirSource, error) {
 // probe), not a new permanent default for every future un-overridden
 // invocation on this machine.
 func findOrCreateManifest() (*CitadelManifest, string, error) {
-	configDir, source, err := resolveNodeConfigDirReadOnly()
-	if err != nil {
-		return nil, "", err
+	// Explicit overrides do not read or write the machine-global pointer.
+	if resolveNodeDirOverride() != "" {
+		configDir, source, err := resolveNodeConfigDirReadOnly()
+		if err != nil {
+			return nil, "", err
+		}
+		return findOrCreateManifestLockedAt(configDir, source)
 	}
+	var manifest *CitadelManifest
+	var configDir string
+	err := withNodePointerLock(filepath.Join(platform.ConfigDir(), "config.yaml"), func() error {
+		var source nodeDirSource
+		var resolveErr error
+		configDir, source, resolveErr = resolveNodeConfigDirReadOnly()
+		if resolveErr != nil {
+			return resolveErr
+		}
+		manifest, _, resolveErr = findOrCreateManifestLockedAt(configDir, source)
+		return resolveErr
+	})
+	return manifest, configDir, err
+}
+
+// The caller holds the global pointer lock when source is not an override.
+// All manifest and compose paths are derived from the captured directory,
+// never from a second lookup that could silently target a different node.
+func findOrCreateManifestLockedAt(configDir string, source nodeDirSource) (*CitadelManifest, string, error) {
 	servicesDir := filepath.Join(configDir, "services")
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
 	if data, readErr := os.ReadFile(manifestPath); readErr == nil {
@@ -285,7 +323,7 @@ func findOrCreateManifest() (*CitadelManifest, string, error) {
 			return nil, "", fmt.Errorf("parse manifest %s: %w", manifestPath, parseErr)
 		}
 		if source == nodeDirDefault {
-			if err := writeGlobalConfig(configDir); err != nil {
+			if err := writeGlobalConfigFileLocked(filepath.Join(platform.ConfigDir(), "config.yaml"), configDir); err != nil {
 				return nil, "", err
 			}
 		}
@@ -329,7 +367,7 @@ func findOrCreateManifest() (*CitadelManifest, string, error) {
 	// Only point the machine-wide global config at this dir when there is no
 	// override active -- see the function doc comment above.
 	if source == nodeDirDefault {
-		if err := writeGlobalConfig(configDir); err != nil {
+		if err := writeGlobalConfigFileLocked(filepath.Join(platform.ConfigDir(), "config.yaml"), configDir); err != nil {
 			return nil, "", err
 		}
 	}
@@ -366,6 +404,14 @@ func writeGlobalConfig(nodeConfigDir string) error {
 // clearDeviceFieldsPreservingNodeConfigDir. It merges node_config_dir into any
 // existing config map rather than overwriting the file.
 func writeGlobalConfigFile(globalConfigFile, nodeConfigDir string) error {
+	return withNodePointerLock(globalConfigFile, func() error {
+		return writeGlobalConfigFileLocked(globalConfigFile, nodeConfigDir)
+	})
+}
+
+// Caller already holds the global pointer lock. Keep this private so pointer
+// writers outside a captured node transaction cannot bypass serialization.
+func writeGlobalConfigFileLocked(globalConfigFile, nodeConfigDir string) error {
 	globalConfigDir := filepath.Dir(globalConfigFile)
 	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
 		return fmt.Errorf("failed to create global config directory %s: %w", globalConfigDir, err)
@@ -417,7 +463,7 @@ func addServiceToManifestWithTags(configDir, serviceName string, nodeTags []stri
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
 
 	// Read existing manifest
-	manifest, _, err := findAndReadManifest()
+	manifest, err := readManifestAt(configDir)
 	if err != nil {
 		return fmt.Errorf("failed to read manifest: %w", err)
 	}
@@ -463,7 +509,7 @@ func addServiceToManifestWithTags(configDir, serviceName string, nodeTags []stri
 // unchanged and returns nil, so a re-run of an uninstall converges cleanly.
 func removeServiceFromManifest(configDir, serviceName string) error {
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
-	manifest, _, err := findAndReadManifest()
+	manifest, err := readManifestAt(configDir)
 	if err != nil {
 		return fmt.Errorf("failed to read manifest: %w", err)
 	}
@@ -516,7 +562,7 @@ func stripTags(tags, remove []string) []string {
 // service is not present so a caller does not silently no-op on a typo'd name.
 func setServiceDesiredStatus(configDir, serviceName, status string) error {
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
-	manifest, _, err := findAndReadManifest()
+	manifest, err := readManifestAt(configDir)
 	if err != nil {
 		return fmt.Errorf("failed to read manifest: %w", err)
 	}

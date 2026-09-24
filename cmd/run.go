@@ -193,26 +193,32 @@ func runSingleService(serviceName string) {
 // registration, desired-status write, and actual start. The old split path
 // wrote the first three before checking an active fine-tune hold.
 func runSingleServiceApply(configDir, serviceName string, startFn func(string, string) error) error {
-	return withLocalServiceStartGuard(configDir, serviceName, func() error {
-		manifest, _, err := findOrCreateManifest()
-		if err != nil {
-			return fmt.Errorf("initialize configuration: %w", err)
-		}
-		if !serviceIsKnown(serviceName, manifest) {
-			return fmt.Errorf("unknown service %q (available: %s)", serviceName, strings.Join(knownServiceNames(manifest), ", "))
-		}
-		if err := ensureComposeFile(configDir, serviceName); err != nil {
-			return fmt.Errorf("create compose file: %w", err)
-		}
-		composePath := filepath.Join(configDir, "services", serviceName+".yml")
-		if !hasService(manifest, serviceName) {
-			if err := addServiceToManifest(configDir, serviceName); err != nil {
-				return fmt.Errorf("register service: %w", err)
-			}
-			fmt.Printf("✅ Added '%s' to manifest\n", serviceName)
-		}
-		return startRunServiceUnchecked(configDir, serviceName, composePath, startFn)
+	return withLocalServiceStartGuardSource(configDir, serviceName, func(source nodeDirSource) error {
+		return runSingleServiceApplyLocked(configDir, source, serviceName, startFn)
 	})
+}
+
+// Caller holds the global pointer lock followed by this node's reservation
+// lock. Every read and write stays on the captured node directory.
+func runSingleServiceApplyLocked(configDir string, source nodeDirSource, serviceName string, startFn func(string, string) error) error {
+	manifest, _, err := findOrCreateManifestLockedAt(configDir, source)
+	if err != nil {
+		return fmt.Errorf("initialize configuration: %w", err)
+	}
+	if !serviceIsKnown(serviceName, manifest) {
+		return fmt.Errorf("unknown service %q (available: %s)", serviceName, strings.Join(knownServiceNames(manifest), ", "))
+	}
+	if err := ensureComposeFile(configDir, serviceName); err != nil {
+		return fmt.Errorf("create compose file: %w", err)
+	}
+	composePath := filepath.Join(configDir, "services", serviceName+".yml")
+	if !hasService(manifest, serviceName) {
+		if err := addServiceToManifest(configDir, serviceName); err != nil {
+			return fmt.Errorf("register service: %w", err)
+		}
+		fmt.Printf("✅ Added '%s' to manifest\n", serviceName)
+	}
+	return startRunServiceUnchecked(configDir, serviceName, composePath, startFn)
 }
 
 // startRunService keeps `citadel run <name>`'s explicit start intent and

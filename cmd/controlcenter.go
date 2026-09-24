@@ -1857,8 +1857,8 @@ func ccAddService(name string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get config directory: %w", err)
 	}
-	return withLocalServiceStartGuard(configDir, name, func() error {
-		if _, _, err := findOrCreateManifest(); err != nil {
+	return withLocalServiceStartGuardSource(configDir, name, func(source nodeDirSource) error {
+		if _, _, err := findOrCreateManifestLockedAt(configDir, source); err != nil {
 			return err
 		}
 		if err := ensureComposeFile(configDir, name); err != nil {

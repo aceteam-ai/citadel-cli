@@ -734,7 +734,12 @@ func getSavedHostname() string {
 func saveHostnameToConfig(hostname string) error {
 	globalConfigDir := platform.ConfigDir()
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+	return withNodePointerLock(globalConfigFile, func() error {
+		return saveHostnameToConfigLocked(hostname, globalConfigDir, globalConfigFile)
+	})
+}
 
+func saveHostnameToConfigLocked(hostname, globalConfigDir, globalConfigFile string) error {
 	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
@@ -785,13 +790,18 @@ func saveOriginalHostnameToConfig(hostname string) error {
 	if hostname == "" {
 		return nil
 	}
+	globalConfigDir := platform.ConfigDir()
+	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+	return withNodePointerLock(globalConfigFile, func() error {
+		return saveOriginalHostnameToConfigLocked(hostname, globalConfigDir, globalConfigFile)
+	})
+}
+
+func saveOriginalHostnameToConfigLocked(hostname, globalConfigDir, globalConfigFile string) error {
 	if existing := getOriginalHostname(); existing != "" {
 		// Already recorded; never overwrite the genuine original.
 		return nil
 	}
-
-	globalConfigDir := platform.ConfigDir()
-	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
 
 	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
@@ -999,6 +1009,13 @@ func clearLegacyDeviceConfig() {
 // core of clearLegacyDeviceConfig, split out so a test can pass a temp-dir
 // path directly instead of needing platform.ConfigDir() to resolve there.
 func clearDeviceFieldsPreservingNodeConfigDir(globalConfigFile string) {
+	_ = withNodePointerLock(globalConfigFile, func() error {
+		clearDeviceFieldsPreservingNodeConfigDirLocked(globalConfigFile)
+		return nil
+	})
+}
+
+func clearDeviceFieldsPreservingNodeConfigDirLocked(globalConfigFile string) {
 	// Read existing config to preserve node_config_dir
 	data, err := os.ReadFile(globalConfigFile)
 	if err != nil {

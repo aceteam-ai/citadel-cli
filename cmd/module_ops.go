@@ -154,8 +154,8 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 	// The pull loop can call Install without passing through Runner's demand
 	// preemption. Guard the ENTIRE update transaction: uninstall would erase
 	// the held service's reservation tag before the final start check.
-	return withIncomingServiceStartGuard(configDir, manifest.Name, composeSrc, manifest.Requires.GPU || manifest.Requires.VRAMMinGB > 0, func() error {
-		nodeManifest, _, err := findOrCreateManifest()
+	return withIncomingServiceStartGuardSource(configDir, manifest.Name, composeSrc, manifest.Requires.GPU || manifest.Requires.VRAMMinGB > 0, func(source nodeDirSource) error {
+		nodeManifest, _, err := findOrCreateManifestLockedAt(configDir, source)
 		if err != nil {
 			return fmt.Errorf("initialize node config: %w", err)
 		}
@@ -204,7 +204,7 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 		if hasService(nodeManifest, manifest.Name) {
 			installConfig = catalog.CarryGeneratedConfig(manifest, servicesDir, m.Config)
 			o.log("MODULE_SET: %q already installed; updating in place", manifest.Name)
-			if err := o.uninstallUnlocked(ctx, manifest.Name); err != nil {
+			if err := o.uninstallUnlocked(ctx, configDir, manifest.Name); err != nil {
 				return fmt.Errorf("update %q: uninstall existing: %w", manifest.Name, err)
 			}
 		}
@@ -258,13 +258,13 @@ func (o *liveModuleOps) Uninstall(ctx context.Context, name string) error {
 	// Prevent an independent pull uninstall from erasing the held tag that
 	// both the worker cleanup and all local start guards rely upon.
 	return withLocalServiceStartGuard(configDir, name, func() error {
-		return o.uninstallUnlocked(ctx, name)
+		return o.uninstallUnlocked(ctx, configDir, name)
 	})
 }
 
 // Caller must hold the fine-tune reservation lock (Install or Uninstall).
-func (o *liveModuleOps) uninstallUnlocked(ctx context.Context, name string) error {
-	manifest, configDir, err := findAndReadManifest()
+func (o *liveModuleOps) uninstallUnlocked(ctx context.Context, configDir, name string) error {
+	manifest, err := readManifestAt(configDir)
 	if err != nil {
 		// No manifest => nothing is installed => idempotent no-op.
 		o.log("MODULE_SET: uninstall %q: no manifest, treating as no-op", name)
@@ -543,7 +543,7 @@ func (o *liveModuleOps) removeServiceFiles(configDir, name string) {
 // composePathFor returns the absolute compose path for a manifest service, or ""
 // if the service is not in the manifest or has no compose file.
 func (o *liveModuleOps) composePathFor(configDir, name string) string {
-	manifest, _, err := findAndReadManifest()
+	manifest, err := readManifestAt(configDir)
 	if err != nil {
 		return ""
 	}
