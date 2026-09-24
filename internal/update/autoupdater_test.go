@@ -305,3 +305,53 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 		t.Fatal("Run did not return after context cancel")
 	}
 }
+
+type blockingUpdateChecker struct {
+	started   chan struct{}
+	release   chan struct{}
+	downloads atomic.Int32
+}
+
+func (c *blockingUpdateChecker) CheckForUpdate() (*Release, error) {
+	close(c.started)
+	<-c.release
+	return &Release{TagName: "v9.9.9"}, nil
+}
+
+func (c *blockingUpdateChecker) DownloadAndVerify(*Release, string) error {
+	c.downloads.Add(1)
+	return nil
+}
+
+func TestRun_CancelDuringCheckDoesNotDownloadOrApply(t *testing.T) {
+	checker := &blockingUpdateChecker{started: make(chan struct{}), release: make(chan struct{})}
+	ticks := make(chan time.Time)
+	var applied atomic.Bool
+	u := NewAutoUpdater(AutoUpdaterConfig{
+		Checker: checker, Ticks: ticks,
+		Apply: func(string) error { applied.Store(true); return nil },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { u.Run(ctx); close(done) }()
+	select {
+	case ticks <- time.Now():
+	case <-time.After(time.Second):
+		t.Fatal("updater did not receive tick")
+	}
+	select {
+	case <-checker.started:
+	case <-time.After(time.Second):
+		t.Fatal("checker did not start")
+	}
+	cancel()
+	close(checker.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("updater did not stop")
+	}
+	if checker.downloads.Load() != 0 || applied.Load() {
+		t.Fatal("cancelled updater downloaded or applied a release")
+	}
+}

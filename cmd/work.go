@@ -2707,28 +2707,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// complete immutable set, never a partial capability advertisement.
 	startStatusPublisherAfterRunner(&nodeRunner, runner, startStatusPublisher)
 
-	// Start the periodic auto-updater. The goroutine always runs; whether it
-	// actually checks/installs on a given tick is decided per-tick by
-	// resolveAutoUpdateEnabled() so the switch can be flipped on a *running*
-	// agent — `citadel update enable/disable` (or the web UI, which dispatches
-	// those same commands) writes the persisted state and the next tick honors
-	// it without a restart. When enabled and a newer version is found, it drains
-	// in-flight jobs before atomically swapping the binary and restarting.
-	if interval, err := update.ParseInterval(resolveAutoUpdateInterval()); err != nil {
-		fmt.Fprintf(os.Stderr, "   - Warning: %v; auto-update disabled\n", err)
-	} else {
-		updater := update.NewAutoUpdater(update.AutoUpdaterConfig{
-			Checker:    update.NewClientWithTimeout(Version, 30*time.Second),
-			Interval:   interval,
-			Enabled:    resolveAutoUpdateEnabled,
-			ActiveJobs: runner.ActiveJobs,
-			BeginDrain: runner.BeginDrain,
-			Log: func(format string, args ...any) {
-				fmt.Printf("   - "+format+"\n", args...)
-			},
-		})
-		go updater.Run(ctx)
-	}
+	// No single-instance lock means another worker may own the node; only the
+	// lock holder may run an automatic binary swap.
+	startWorkerAutoUpdater(ctx, workerLockHeld, workAutoUpdatePolicyInputs(), runner, workAutoUpdateLog, autoUpdateRuntime{})
 
 	// Start the self-heal liveness monitor (issue #548). It is the backstop for a
 	// consumption-wedged worker that the per-job watchdog can't catch (a wedge
@@ -3637,45 +3618,6 @@ func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
 		return fmt.Sprintf("citadel-%s", hostname)
 	}
 	return "citadel-workers"
-}
-
-// resolveAutoUpdateEnabled reports whether the periodic auto-updater should act
-// on the current tick. Priority: --auto-update flag > CITADEL_AUTO_UPDATE env
-// (explicit on/off) > the persisted `citadel update enable/disable` state.
-// Disabled by default. Evaluated every tick so the web UI (which dispatches
-// `citadel update enable/disable` to the node) can toggle a running agent.
-func resolveAutoUpdateEnabled() bool {
-	// The opt-out (--no-auto-update / CITADEL_NO_AUTO_UPDATE) and a dev build
-	// both veto auto-INSTALL, ahead of any enable signal: a safety/"don't touch
-	// my binary" signal must win over --auto-update / CITADEL_AUTO_UPDATE.
-	// Explicit `citadel update` remains the escape hatch for a dev binary.
-	if !autoUpdateAllowed() {
-		return false
-	}
-	if workAutoUpdate {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_AUTO_UPDATE"))) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	}
-	state, err := update.LoadState()
-	if err != nil || state == nil {
-		return false
-	}
-	return state.AutoUpdate
-}
-
-// resolveAutoUpdateInterval returns the configured auto-update interval string.
-// Priority: --auto-update-interval flag > CITADEL_AUTO_UPDATE_INTERVAL env.
-// Empty means use the default (1h).
-func resolveAutoUpdateInterval() string {
-	if workAutoUpdateInterval != "" {
-		return workAutoUpdateInterval
-	}
-	return os.Getenv("CITADEL_AUTO_UPDATE_INTERVAL")
 }
 
 // DeviceConfig holds device authentication configuration from the global config file.

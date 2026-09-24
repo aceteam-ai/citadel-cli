@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,8 +39,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
-	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
-	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
@@ -227,12 +223,6 @@ func runControlCenter() {
 			fmt.Fprintln(os.Stderr, "Citadel control center is already running in another terminal.")
 		}
 		fmt.Fprintln(os.Stderr, "Switch to that terminal to use it, or run `citadel attach --shell` for a shell on this node.")
-		return
-	}
-
-	// Auto-update on startup
-	if updated := ccAutoUpdate(); updated {
-		// Binary was updated, restart
 		return
 	}
 
@@ -2509,99 +2499,15 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// a control-center-only node.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
 	startStatusPublisherAfterRunner(&ccNodeRunner, runner, startHeartbeatPublisher)
+	// This branch alone owns job consumption; monitor-only mode returned above.
+	// The fully initialized runner supplies drain/idle signals for safe updates.
+	startWorkerAutoUpdater(ctx, !workerHeld, autoUpdatePolicyInputs{}, runner,
+		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) }, autoUpdateRuntime{})
 
 	activity("success", "Worker started, listening for jobs...")
 
 	// Run the worker (blocks until context is cancelled)
 	return runner.Run(ctx)
-}
-
-// ccAutoUpdate checks for updates and auto-updates if available.
-// Returns true if the binary was updated (caller should restart).
-func ccAutoUpdate() bool {
-	// Never auto-install when the user opted out (--no-auto-update /
-	// CITADEL_NO_AUTO_UPDATE) or when this is a locally-built dev binary: a
-	// hand-copied dev/test binary must not silently replace itself with a
-	// release before it can be exercised. Explicit `citadel update` still works.
-	if !autoUpdateAllowed() {
-		return false
-	}
-
-	// Check for updates
-	spinner := whimsy.NewSimpleSpinner([]string{"Checking for updates..."})
-	spinner.Start()
-
-	client := update.NewClient(Version)
-	release, err := client.CheckForUpdate()
-	if err != nil {
-		spinner.StopWithWarning(fmt.Sprintf("Update check failed: %v", err))
-		return false
-	}
-
-	if release == nil {
-		spinner.StopWithSuccess(fmt.Sprintf("Running latest version (%s)", Version))
-		return false
-	}
-
-	spinner.StopWithSuccess(fmt.Sprintf("Update available: %s → %s", Version, release.TagName))
-
-	// Download update
-	dlSpinner := whimsy.NewSimpleSpinner([]string{"Downloading update..."})
-	dlSpinner.Start()
-
-	pendingPath := update.GetPendingBinaryPath()
-	if err := client.DownloadAndVerify(release, pendingPath); err != nil {
-		dlSpinner.StopWithError(fmt.Sprintf("Download failed: %v", err))
-		return false
-	}
-
-	dlSpinner.StopWithSuccess("Downloaded and verified")
-
-	// Install update
-	installSpinner := whimsy.NewSimpleSpinner([]string{"Installing update..."})
-	installSpinner.Start()
-
-	if err := update.ApplyUpdate(pendingPath); err != nil {
-		installSpinner.StopWithError(fmt.Sprintf("Install failed: %v", err))
-		return false
-	}
-
-	// Update state
-	state, _ := update.LoadState()
-	update.RecordUpdate(state, Version, release.TagName)
-	update.UpdateLastCheck(state)
-	_ = update.SaveState(state)
-
-	installSpinner.StopWithSuccess(fmt.Sprintf("Updated to %s, restarting...", release.TagName))
-
-	// Small delay to show the message
-	time.Sleep(500 * time.Millisecond)
-
-	// Restart the binary
-	execPath, err := os.Executable()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
-		fmt.Println("Please restart citadel manually.")
-		return true
-	}
-
-	if runtime.GOOS == "windows" {
-		// Windows doesn't support syscall.Exec; start a new process and exit
-		cmd := exec.Command(execPath, os.Args[1:]...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		_ = cmd.Start()
-		os.Exit(0)
-	}
-
-	// Unix: replace the current process in-place
-	if err := syscall.Exec(execPath, os.Args, os.Environ()); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to restart: %v\n", err)
-		fmt.Println("Please restart citadel manually.")
-	}
-
-	return true
 }
 
 // buildProxmoxConfig checks for saved Proxmox configuration or auto-detects
