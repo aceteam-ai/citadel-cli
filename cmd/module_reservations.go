@@ -156,7 +156,7 @@ func runModuleReservationsRelease(ctx context.Context, jobID string) error {
 	}
 
 	jctx := jobs.JobContext{LogFn: func(_ string, msg string) { fmt.Println(msg) }}
-	restored, err := handler.Release(jctx, jobID)
+	restored, err := releaseManualReservation(handler, jctx, jobID)
 	if err != nil {
 		return fmt.Errorf("release %q: %w", jobID, err)
 	}
@@ -166,4 +166,10 @@ func runModuleReservationsRelease(ctx context.Context, jobID string) error {
 	}
 	fmt.Printf("✅ Restored: %s\n", strings.Join(restored, ", "))
 	return nil
+}
+
+func releaseManualReservation(handler *jobs.ServiceHandler, ctx jobs.JobContext, jobID string) ([]string, error) {
+	return withCapturedNodeRestore(handler.ConfigDir, func() ([]string, error) {
+		return handler.Release(ctx, jobID)
+	})
 }

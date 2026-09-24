@@ -89,6 +89,28 @@ func withNodePointerLock(globalConfigFile string, fn func() error) error {
 	return finetunesafety.WithExclusive(globalConfigFile+".pointer-safety", fn)
 }
 
+// Restoration can launch a GPU service. The node pointer must remain pinned
+// from the captured-dir check through the handler's own reservation lock,
+// service restarts, and durable marker updates.
+func withCapturedNodeRestore(configDir string, restore func() ([]string, error)) ([]string, error) {
+	var restored []string
+	err := withCanonicalNodePointerLock(configDir, func(nodeDirSource) error {
+		var restoreErr error
+		restored, restoreErr = restore()
+		return restoreErr
+	})
+	return restored, err
+}
+
+func reconcileStartupReservations(handler *jobs.ServiceHandler, ctx jobs.JobContext, workerLockHeld bool) ([]string, error) {
+	if !workerLockHeld {
+		return nil, fmt.Errorf("reservation reconcile requires the worker lock")
+	}
+	return withCapturedNodeRestore(handler.ConfigDir, func() ([]string, error) {
+		return handler.ReconcileOrphanedReservations(ctx, workerLockHeld)
+	})
+}
+
 func assertCanonicalNodeDir(configDir string) (nodeDirSource, error) {
 	current, source, err := resolveNodeConfigDirReadOnly()
 	if err != nil {
