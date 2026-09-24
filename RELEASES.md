@@ -2618,3 +2618,72 @@ Auto-generated log of every release.
   - fix: apply shell permission changes live (#1086)
 
 
+---
+
+## v2.167.0 — 2026-09-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 4 |
+| Lines added | +190 |
+
+**Changes:**
+
+  - fix(transcribe): size node timeout from audio duration (#1105)
+  - fix: report resolved node config directory (#1103)
+
+
+---
+
+## v2.168.0 — 2026-09-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 9 |
+| Lines added | +1042 |
+
+**Changes:**
+
+  - feat: ingress session-isolation, authz fail-closed, route-freshness bound (#1100)
+
+
+---
+
+## v2.169.0 — 2026-09-23
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 12 |
+| Lines added | +581 |
+
+**Changes:**
+
+  - fix: persist and honor nexus URL node-side (#1110)
+
+
+---
+
+## v2.170.0 — 2026-09-24
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 109 |
+| Lines added | +5366 |
+
+**Changes:**
+
+  - fix: remove internal issue references from CLI and TUI copy (#1135)
+  - Distinguish permission-gated job types from genuinely unsupported ones (#1130)
+  - feat: dispatch bare citadel by enrollment tier (#1116) (#1126)
+  - feat(runtime): harden rootless podman gpu and limits (#1114)
+  - [CRAM] Pre-pull trusted app runtime images (#1113)
+  - feat: add platform mesh exposure (#1108)
+  - feat: adopt and persist external vLLM on owner node (#1102) (#1104)
+  - feat: publish live dispatchable node capabilities (#1087)
+  - feat(whatsapp): honor WHATSAPP_PROVISION force=true to upgrade a stuck bridge (#1124)
+
+

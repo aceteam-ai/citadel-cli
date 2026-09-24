@@ -20,7 +20,7 @@ import (
 
 var egressRelayCmd = &cobra.Command{
 	Use:   "egress-relay",
-	Short: "Manage the on-node SOCKS5 egress relay (citadel #787)",
+	Short: "Manage the on-node SOCKS5 egress relay",
 	Long: `The egress relay lets ANOTHER citadel node on the AceTeam Network tunnel
 outbound traffic through THIS node's own network egress -- the server-side
 counterpart to 'citadel socks' (which dials OUT through a node from this
@@ -30,7 +30,7 @@ verified mesh peer: there is no token or passcode fallback.
 Changes here take effect on the next 'citadel work' start (the relay listener
 is started once at worker startup, not re-evaluated live). To run a node as a
 PURE egress relay -- no worker, no Redis job source -- use 'citadel egress-relay
-serve' instead (citadel #1033).`,
+serve' instead.`,
 }
 
 var egressRelayStatusCmd = &cobra.Command{

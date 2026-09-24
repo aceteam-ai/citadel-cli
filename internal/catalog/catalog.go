@@ -30,8 +30,19 @@ const (
 
 // Registry is the top-level index of available services (registry.yaml).
 type Registry struct {
-	Version  int             `yaml:"version"`
-	Services []RegistryEntry `yaml:"services"`
+	Version       int             `yaml:"version"`
+	RuntimeImages []RuntimeImage  `yaml:"runtime_images,omitempty"`
+	Services      []RegistryEntry `yaml:"services"`
+}
+
+// RuntimeImage is a first-party hosted-app runtime published by AceTeam. These
+// entries are accepted only from the built-in default catalog. Community
+// sources cannot extend or replace this trusted pre-pull list.
+type RuntimeImage struct {
+	Name           string   `yaml:"name"`
+	Image          string   `yaml:"image"`
+	DiscoveryAlias string   `yaml:"discovery_alias,omitempty"`
+	Architectures  []string `yaml:"architectures"`
 }
 
 // RegistryEntry is a summary of a single service in the registry index.
@@ -389,6 +400,7 @@ func LoadRegistry() (*Registry, error) {
 	}
 
 	var regs []sourceRegistry
+	var runtimeImages []RuntimeImage
 	anyAvailable := false
 	for _, src := range sources {
 		if !dirIsAvailable(src.Path) {
@@ -404,13 +416,62 @@ func LoadRegistry() (*Registry, error) {
 			continue
 		}
 		regs = append(regs, sourceRegistry{Source: src.Name, Services: reg.Services})
+		if src.Default {
+			trusted, validationErr := validateRuntimeImages(reg.RuntimeImages)
+			if validationErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: ignoring invalid trusted runtime images: %v\n", validationErr)
+			} else {
+				runtimeImages = trusted
+			}
+		}
 	}
 
 	if !anyAvailable {
 		return nil, fmt.Errorf("catalog not found. Run 'citadel service catalog update' first")
 	}
 
-	return &Registry{Version: 1, Services: mergeRegistries(regs)}, nil
+	return &Registry{Version: 1, RuntimeImages: runtimeImages, Services: mergeRegistries(regs)}, nil
+}
+
+var runtimeImagePattern = regexp.MustCompile(`^ghcr\.io/aceteam-ai/aceteam-app-([a-z0-9]+(?:-[a-z0-9]+)*)@sha256:[0-9a-f]{64}$`)
+var runtimeDiscoveryAliasPattern = regexp.MustCompile(`^ghcr\.io/aceteam-ai/aceteam-app-([a-z0-9]+(?:-[a-z0-9]+)*):stable$`)
+
+// validateRuntimeImages copies and validates trusted default-catalog entries.
+// Keeping this boundary in the loader prevents any command from accidentally
+// treating a community-provided registry image as first-party.
+func validateRuntimeImages(images []RuntimeImage) ([]RuntimeImage, error) {
+	seenNames := make(map[string]bool, len(images))
+	out := make([]RuntimeImage, 0, len(images))
+	for _, image := range images {
+		matches := runtimeImagePattern.FindStringSubmatch(image.Image)
+		if image.Name == "" || len(matches) != 2 || matches[1] != image.Name {
+			return nil, fmt.Errorf("runtime image %q must match ghcr.io/aceteam-ai/aceteam-app-<name>@sha256:<64 hex digest>", image.Name)
+		}
+		aliasMatches := runtimeDiscoveryAliasPattern.FindStringSubmatch(image.DiscoveryAlias)
+		if len(aliasMatches) != 2 || aliasMatches[1] != image.Name {
+			return nil, fmt.Errorf("runtime image %q discovery alias must be its first-party stable tag", image.Name)
+		}
+		if seenNames[image.Name] {
+			return nil, fmt.Errorf("duplicate runtime image name %q", image.Name)
+		}
+		seenNames[image.Name] = true
+		if len(image.Architectures) == 0 {
+			return nil, fmt.Errorf("runtime image %q must declare at least one architecture", image.Name)
+		}
+		seenArchitectures := make(map[string]bool, len(image.Architectures))
+		for _, architecture := range image.Architectures {
+			if architecture != "amd64" && architecture != "arm64" {
+				return nil, fmt.Errorf("runtime image %q has unsupported architecture %q", image.Name, architecture)
+			}
+			if seenArchitectures[architecture] {
+				return nil, fmt.Errorf("runtime image %q repeats architecture %q", image.Name, architecture)
+			}
+			seenArchitectures[architecture] = true
+		}
+		image.Architectures = append([]string(nil), image.Architectures...)
+		out = append(out, image)
+	}
+	return out, nil
 }
 
 // loadRegistryFromPath reads the registry.yaml index from a single source's

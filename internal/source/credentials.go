@@ -252,5 +252,5 @@ type ControlPlaneProvider struct{}
 // public source.
 func (ControlPlaneProvider) CredentialFor(Descriptor) (Credential, error) {
 	return NoCredential, fmt.Errorf(
-		"control-plane-provisioned credentials are not implemented yet (deferred to aceteam-ai/aceteam#4273)")
+		"control-plane-provisioned credentials are not implemented yet")
 }

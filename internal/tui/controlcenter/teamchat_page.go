@@ -645,8 +645,7 @@ func (p *TeamChatPage) showAuthGuidance(detail string) {
 	b.WriteString(" [yellow]Team Chat needs an AceTeam API key.[white]\n\n")
 	if source == "device" {
 		b.WriteString(" This node's device token cannot access Team Chat yet\n")
-		b.WriteString(" (its API scope is limited to fabric endpoints — see\n")
-		b.WriteString(" citadel-cli#495 for the backend follow-up).\n\n")
+		b.WriteString(" (its API scope is limited to fabric endpoints).\n\n")
 	}
 	b.WriteString(" To connect:\n")
 	fmt.Fprintf(&b, "   1. Generate a key at [green]%s/settings/api-keys[white]\n", tview.Escape(base))

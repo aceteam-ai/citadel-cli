@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"strings"
 )
 
@@ -39,6 +40,9 @@ type ExposeRequest struct {
 	// Port is the service's loopback host port (e.g. 5000 for Frigate). Mutually
 	// exclusive with Path.
 	Port int `json:"port"`
+	// ForwardTarget overrides the local TCP destination for platform visibility.
+	// It never changes the mesh listener port or peer authorization.
+	ForwardTarget string `json:"forward_target,omitempty"`
 	// Path is a workspace-relative or absolute directory to serve as a
 	// read-only, auto-indexed static file share instead of proxying to a port.
 	// Mutually exclusive with Port. Confinement to the node workspace (and, per
@@ -150,7 +154,7 @@ func (h *ExposeSetHandler) CanHandle(jobType string) bool {
 
 // validVisibilities is the accepted visibility set (mirrors gateway.Visibility;
 // kept local to avoid a worker->gateway dependency).
-var validVisibilities = map[string]bool{"private": true, "org": true, "link": true}
+var validVisibilities = map[string]bool{"private": true, "org": true, "link": true, "platform": true}
 
 // Execute programs the gateway to expose one local service. See the package doc
 // for the privilege gate.
@@ -215,6 +219,7 @@ func parseExposeRequest(payload map[string]any) (ExposeRequest, error) {
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.Path = strings.TrimSpace(req.Path)
+	req.ForwardTarget = strings.TrimSpace(req.ForwardTarget)
 	req.Visibility = strings.ToLower(strings.TrimSpace(req.Visibility))
 	if req.Name == "" {
 		return req, fmt.Errorf("expose request is missing a name")
@@ -230,7 +235,22 @@ func parseExposeRequest(payload map[string]any) (ExposeRequest, error) {
 		return req, fmt.Errorf("expose request requires either a port or a path")
 	}
 	if !validVisibilities[req.Visibility] {
-		return req, fmt.Errorf("unknown visibility %q (want private|org|link)", req.Visibility)
+		return req, fmt.Errorf("unknown visibility %q (want private|org|link|platform)", req.Visibility)
+	}
+	if req.Visibility == "platform" && !hasPort {
+		return req, fmt.Errorf("platform visibility requires a port")
+	}
+	if req.ForwardTarget != "" && req.Visibility != "platform" {
+		return req, fmt.Errorf("forward_target requires platform visibility")
+	}
+	if req.Port > 65535 {
+		return req, fmt.Errorf("port must be at most 65535")
+	}
+	if req.ForwardTarget != "" {
+		target, err := netip.ParseAddrPort(req.ForwardTarget)
+		if err != nil || target.Port() == 0 || !(target.Addr().IsLoopback() || target.Addr().IsPrivate()) {
+			return req, fmt.Errorf("forward_target must be a loopback or private IP:port")
+		}
 	}
 	if req.Epoch <= 0 {
 		req.Epoch = 1

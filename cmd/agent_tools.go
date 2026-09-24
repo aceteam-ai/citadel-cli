@@ -31,6 +31,11 @@ import (
 // without touching this host's real ~/citadel-node/update/state.json.
 var loadUpdateState = update.LoadState
 
+// getAgentNodeConfigDir is a seam over network.GetNodeConfigDir. The agent
+// config endpoint must report the same machine-convergent directory the worker
+// uses, rather than reconstructing a path from the invoking user's HOME.
+var getAgentNodeConfigDir = network.GetNodeConfigDir
+
 // agentProviderDeps carries everything buildAgentProviders needs from runWork.
 type agentProviderDeps struct {
 	state           *worker.WorkerState
@@ -92,13 +97,14 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 			// Delegates to the same live adapter the EXPOSE_SET job uses, so the
 			// CLI/MCP path and the job path cannot drift.
 			return liveExposeOps{}.Expose(ctx, worker.ExposeRequest{
-				Name:       spec.Name,
-				Port:       spec.Port,
-				Path:       spec.Path,
-				Visibility: spec.Visibility,
-				TTLSeconds: spec.TTLSeconds,
-				Creator:    spec.Creator,
-				Epoch:      spec.Epoch,
+				Name:          spec.Name,
+				Port:          spec.Port,
+				ForwardTarget: spec.ForwardTarget,
+				Path:          spec.Path,
+				Visibility:    spec.Visibility,
+				TTLSeconds:    spec.TTLSeconds,
+				Creator:       spec.Creator,
+				Epoch:         spec.Epoch,
 			})
 		},
 		Unexpose: func(name string) (any, error) {
@@ -403,7 +409,7 @@ func agentDoctor(snap worker.WorkerSnapshot) map[string]any {
 	// it.
 	netOK := snap.HeadscaleNodeID != ""
 	add("headscale_node_id_resolved", netOK, valueOrEmpty(snap.HeadscaleNodeID,
-		"unresolved — this node declines every target_node-addressed job (citadel-cli#654), so node-targeted work times out instead of running here"))
+		"unresolved — this node declines every target_node-addressed job, so node-targeted work times out instead of running here"))
 
 	// 2. Org id known
 	orgOK := snap.OrgID != ""
@@ -443,7 +449,7 @@ func agentDoctor(snap worker.WorkerSnapshot) map[string]any {
 	diagnosis := "Node looks healthy for per-node job routing."
 	switch {
 	case !netOK:
-		diagnosis = "Headscale node ID is unresolved, so the per-node shell stream was never subscribed AND this node declines every target_node-addressed job (citadel-cli#654 — it cannot prove a job is meant for it, and claiming one would run a peer's work here). Node-targeted jobs (terminal_exec, code_*, file reads) aimed at this node therefore time out rather than executing. Try /agent/resubscribe, or restart the worker once the VPN is fully connected."
+		diagnosis = "Headscale node ID is unresolved, so the per-node shell stream was never subscribed AND this node declines every target_node-addressed job (it cannot prove a job is meant for it, and claiming one would run a peer's work here). Node-targeted jobs (terminal_exec, code_*, file reads) aimed at this node therefore time out rather than executing. Try /agent/resubscribe, or restart the worker once the VPN is fully connected."
 	case !orgOK:
 		diagnosis = "Org ID is unknown, so the per-node shell stream was skipped. Re-run 'citadel init' to repopulate device config."
 	case !perNodeOK:
@@ -451,7 +457,7 @@ func agentDoctor(snap worker.WorkerSnapshot) map[string]any {
 	case !snap.Consuming:
 		diagnosis = "The worker has not completed a poll recently — the consume loop may be stuck. Check logs and consider /agent/worker-restart."
 	case !consumeOK:
-		diagnosis = fmt.Sprintf("The consume requests are being rejected (HTTP %d). This is the #3924-class failure: the worker is alive but the backend rejects its consume calls. Inspect last_consume_error and the backend.", snap.LastConsumeStatus)
+		diagnosis = fmt.Sprintf("The consume requests are being rejected (HTTP %d). The worker is alive but the backend rejects its consume calls. Inspect last_consume_error and the backend.", snap.LastConsumeStatus)
 	}
 
 	return map[string]any{
@@ -483,7 +489,7 @@ func agentConfig(nodeName, baseURL, orgID string, queues []string) map[string]an
 		"node_name":       nodeName,
 		"api_base_url":    baseURL,
 		"org_id":          orgID,
-		"node_config_dir": filepath.Join(home, ".citadel-node"),
+		"node_config_dir": getAgentNodeConfigDir(),
 		"log_dir":         filepath.Join(home, ".citadel-cli", "logs"),
 		"queues":          queues,
 		"version":         Version,

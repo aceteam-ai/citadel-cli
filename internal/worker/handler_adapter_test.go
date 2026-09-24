@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
+	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -282,9 +284,8 @@ func TestLegacyHandlerAdapterImplementsJobHandler(t *testing.T) {
 	var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 }
 
-// TestCreateLegacyHandlers_ShellDisabled verifies that ShellDisabled still
-// registers a SHELL_COMMAND handler (so the node returns the "disabled" refusal
-// rather than "unsupported job type"), but that handler refuses execution.
+// TestCreateLegacyHandlers_ShellDisabled verifies disabled shell is not
+// registered or advertised, because it cannot dispatch an execution.
 func TestCreateLegacyHandlers_ShellDisabled(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{ShellDisabled: true})
 
@@ -296,26 +297,9 @@ func TestCreateLegacyHandlers_ShellDisabled(t *testing.T) {
 		}
 	}
 	if shell == nil {
-		t.Fatal("SHELL_COMMAND handler must remain registered even when disabled")
+		return
 	}
-
-	job := &Job{
-		ID:      "job-shell-disabled",
-		Type:    JobTypeShellCommand,
-		Payload: map[string]any{"command": "echo should-not-run"},
-	}
-	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
-	if err == nil {
-		t.Fatal("disabled SHELL_COMMAND handler should return an error")
-	}
-	if reason := shellRefusalReason(t, err); reason != jobs.ReasonShellDisabled {
-		t.Errorf("reason = %q, want %q", reason, jobs.ReasonShellDisabled)
-	}
-	// The adapter surfaces failures via the returned error; result should not
-	// report success.
-	if result != nil && result.Status == JobStatusSuccess {
-		t.Error("disabled shell handler must not report success")
-	}
+	t.Fatal("disabled SHELL_COMMAND handler must not be registered")
 }
 
 func TestCreateLegacyHandlers_ShellEnabledIsLive(t *testing.T) {
@@ -327,10 +311,10 @@ func TestCreateLegacyHandlers_ShellEnabledIsLive(t *testing.T) {
 		ShellVerifyPasscode: func(pin string) bool { return pin == "2468" },
 	})
 
-	var shell JobHandler
+	var shell *LegacyHandlerAdapter
 	for _, h := range handlers {
-		if h.CanHandle(JobTypeShellCommand) {
-			shell = h
+		if adapter, ok := h.(*LegacyHandlerAdapter); ok && adapter.jobType == JobTypeShellCommand {
+			shell = adapter
 			break
 		}
 	}
@@ -338,18 +322,98 @@ func TestCreateLegacyHandlers_ShellEnabledIsLive(t *testing.T) {
 		t.Fatal("SHELL_COMMAND handler must remain registered")
 	}
 
+	if shell.CanHandle(JobTypeShellCommand) {
+		t.Fatal("live-disabled shell must not be advertised")
+	}
 	job := &Job{ID: "job-live-shell", Type: JobTypeShellCommand, Payload: map[string]any{"command": "echo live", "passcode": "2468"}}
 	if _, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{}); err == nil {
 		t.Fatal("live-disabled shell should refuse")
 	}
 
 	enabled = true
+	if !shell.CanHandle(JobTypeShellCommand) {
+		t.Fatal("live-enabled shell must be advertised")
+	}
 	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
 	if err != nil {
 		t.Fatalf("live enable should apply without rebuilding handlers: %v", err)
 	}
 	if result == nil || result.Status != JobStatusSuccess {
 		t.Fatalf("result = %+v, want success", result)
+	}
+}
+
+func TestApplyDeviceConfigUpdatesLiveExecutionAndCapabilities(t *testing.T) {
+	dir := t.TempDir()
+	load := func() *citadelconfig.Permissions { return citadelconfig.LoadPermissions(dir) }
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		WorkspaceDir:    dir,
+		ConfigDir:       dir,
+		PermissionsDir:  dir,
+		ShellDisabled:   true,
+		ShellEnabled:    func() bool { return load().Shell },
+		DesktopDisabled: true,
+		DesktopEnabled:  func() bool { return load().Desktop },
+		FilesDisabled:   true,
+		FilesEnabled:    func() bool { return load().Files },
+	})
+	runner := NewRunner(nil, handlers, RunnerConfig{})
+
+	var apply, fileRead *LegacyHandlerAdapter
+	for _, h := range handlers {
+		a, ok := h.(*LegacyHandlerAdapter)
+		if !ok {
+			continue
+		}
+		switch a.jobType {
+		case JobTypeApplyDeviceConfig:
+			apply = a
+		case JobTypeFileRead:
+			fileRead = a
+		}
+	}
+	if apply == nil || fileRead == nil {
+		t.Fatal("expected config and gated file handlers to be registered")
+	}
+	if runner.CanHandle(JobTypeShellCommand) || runner.CanHandle(JobTypeFileRead) {
+		t.Fatal("default-deny permissions must not be advertised")
+	}
+
+	applyConfig := func(shell, files bool) {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{"shellEnabled": shell, "filesEnabled": files})
+		if err != nil {
+			t.Fatal(err)
+		}
+		job := &Job{ID: "config", Type: JobTypeApplyDeviceConfig, Payload: map[string]any{"config": string(payload)}}
+		if _, err := apply.Execute(context.Background(), job, &NoOpStreamWriter{}); err != nil {
+			t.Fatalf("APPLY_DEVICE_CONFIG: %v", err)
+		}
+	}
+
+	applyConfig(true, true)
+	if !runner.CanHandle(JobTypeShellCommand) || !runner.CanHandle(JobTypeFileRead) {
+		t.Fatalf("enabled permissions missing from capabilities: %v", runner.SupportedJobTypes())
+	}
+
+	applyConfig(false, false)
+	if runner.CanHandle(JobTypeShellCommand) || runner.CanHandle(JobTypeFileRead) {
+		t.Fatalf("revoked permissions remain advertised: %v", runner.SupportedJobTypes())
+	}
+	_, err := fileRead.Execute(context.Background(), &Job{ID: "read", Type: JobTypeFileRead}, &NoOpStreamWriter{})
+	if err == nil || !strings.Contains(err.Error(), "disabled by current node permissions") {
+		t.Fatalf("revoked file execution did not fail closed: %v", err)
+	}
+}
+
+func TestCreateLegacyHandlersNativeWindowsOmitsShell(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		GOOS:         "windows",
+		ShellEnabled: func() bool { return true },
+	})
+	runner := NewRunner(nil, handlers, RunnerConfig{})
+	if runner.CanHandle(JobTypeShellCommand) {
+		t.Fatal("native Windows must not advertise the /bin/sh SHELL_COMMAND handler")
 	}
 }
 

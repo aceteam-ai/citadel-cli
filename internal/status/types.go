@@ -444,6 +444,13 @@ type NodeCapabilities struct {
 	// cut. Omitted on legacy builds, which the backend treats as "unknown".
 	AvailableServices []string `json:"available_services,omitempty"`
 
+	// JobTypes is the exact sorted set of job types the live worker has
+	// registered on this node. It reflects build version, platform, configured
+	// workspace/manifest, and permission gates instead of making the control
+	// plane infer support from a coarse version threshold. Omitted until the
+	// runner is fully constructed, and on legacy builds.
+	JobTypes []string `json:"job_types,omitempty"`
+
 	// Real node capability flags (citadel-cli#324). Console = shell/SSH
 	// available, Desktop = VNC reachable, Files = node-files filesystem access,
 	// GPU = GPU present / inference-capable.

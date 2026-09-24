@@ -16,8 +16,12 @@ import (
 func TestNodeJobHandlersCoverPrivilegedTypes(t *testing.T) {
 	opts := nodeJobHandlerOpts{
 		WorkspaceDir: t.TempDir(),
-		WorkflowExec: workflow.NewExecutor(workflow.ExecutorConfig{}),
-		HandlerLog:   func(string, ...any) {},
+		// A fresh node has no persisted shell opt-in, so the production callers
+		// pass ShellDisabled=true. Keep this fixture aligned with that default-deny
+		// configuration rather than relying on nodeJobHandlerOpts' zero value.
+		ShellDisabled: true,
+		WorkflowExec:  workflow.NewExecutor(workflow.ExecutorConfig{}),
+		HandlerLog:    func(string, ...any) {},
 	}
 
 	// Build the base set and register the privileged handlers exactly as both
@@ -33,13 +37,67 @@ func TestNodeJobHandlersCoverPrivilegedTypes(t *testing.T) {
 		}
 	}
 
-	// Sanity: the base legacy shell handler and the workflow handler are also present
-	// so this remains the FULL set, not a privileged-only subset.
-	if !runner.CanHandle(worker.JobTypeShellCommand) {
-		t.Errorf("node-job handler set missing SHELL_COMMAND")
+	// Shell is default-deny, so this unconfigured node must not advertise a
+	// handler which will refuse every command.
+	if runner.CanHandle(worker.JobTypeShellCommand) {
+		t.Errorf("unconfigured node must not advertise SHELL_COMMAND")
 	}
 	if !runner.CanHandle("WORKFLOW_RUN") {
 		t.Errorf("node-job handler set missing WORKFLOW_RUN")
+	}
+}
+
+// TestNodeJobHandlersAdvertiseReadOnlyInspectionWithShellDisabled pins the
+// recovery posture from aceteam#9962: disabling remote shell must not remove
+// separately-authorized, cross-platform read-only inspection handlers.
+func TestNodeJobHandlersAdvertiseReadOnlyInspectionWithShellDisabled(t *testing.T) {
+	opts := nodeJobHandlerOpts{
+		WorkspaceDir:  t.TempDir(),
+		ConfigDir:     t.TempDir(),
+		ShellDisabled: true,
+		WorkflowExec:  workflow.NewExecutor(workflow.ExecutorConfig{}),
+		HandlerLog:    func(string, ...any) {},
+	}
+	handlers, _ := buildNodeJobHandlers(opts)
+	runner := worker.NewRunner(nil, handlers, worker.RunnerConfig{})
+	registerPrivilegedNodeJobHandlers(runner, opts)
+
+	supported := make(map[string]bool)
+	for _, jobType := range runner.SupportedJobTypes() {
+		supported[jobType] = true
+	}
+	for _, jobType := range []string{
+		worker.JobTypeFileRead,
+		worker.JobTypeFileList,
+		worker.JobTypeFileSearch,
+		worker.JobTypeServiceStatus,
+	} {
+		if !supported[jobType] {
+			t.Errorf("read-only inspection type %q missing with shell disabled", jobType)
+		}
+	}
+	if supported[worker.JobTypeShellCommand] {
+		t.Fatal("disabled SHELL_COMMAND must not be advertised")
+	}
+}
+
+func TestNodeJobHandlersExcludeOffPlatformIOSAndUnconfiguredInstances(t *testing.T) {
+	opts := nodeJobHandlerOpts{
+		WorkspaceDir: t.TempDir(), ConfigDir: t.TempDir(), ShellDisabled: true,
+		WorkflowExec: workflow.NewExecutor(workflow.ExecutorConfig{}), HandlerLog: func(string, ...any) {},
+	}
+	handlers, _ := buildNodeJobHandlers(opts)
+	runner := worker.NewRunner(nil, handlers, worker.RunnerConfig{})
+	registerPrivilegedNodeJobHandlers(runner, opts)
+	if runner.CanHandle(worker.JobTypeInstanceProvision) {
+		t.Fatal("INSTANCE_* must not be advertised without enabled Proxmox configuration")
+	}
+
+	// Exercise the platform gate without depending on the OS that runs tests.
+	legacy := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{GOOS: "linux"})
+	iosRunner := worker.NewRunner(nil, legacy, worker.RunnerConfig{})
+	if iosRunner.CanHandle(worker.JobTypeIOSBuild) {
+		t.Fatal("IOS_BUILD must not be advertised off macOS")
 	}
 }
 

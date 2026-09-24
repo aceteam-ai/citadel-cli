@@ -468,6 +468,82 @@ func TestRunnerUnsupportedJobTypeFailsTerminally(t *testing.T) {
 	}
 }
 
+// TestRunnerUnsupportedJobTypeDistinguishesGatedFromUnknown pins aceteam#9962's
+// fix: a job type this build knows about but did not register this run because
+// of a runtime gate (e.g. FILE_READ with the node's files permission off) gets
+// a message naming the actual gate, never the generic "(update the node)" text
+// -- which is reserved for a type genuinely absent from allKnownJobTypes.
+func TestRunnerUnsupportedJobTypeDistinguishesGatedFromUnknown(t *testing.T) {
+	jobs := []*Job{
+		// FILE_READ: known to the build (in allKnownJobTypes) and present in
+		// gatedJobTypeReasons, but no FILE_READ handler is registered below --
+		// exactly the "files permission disabled" shape from the issue.
+		{ID: "job-gated", Type: JobTypeFileRead, Payload: map[string]any{}},
+		// A type this build has never heard of at all.
+		{ID: "job-unknown", Type: "TOTALLY_MADE_UP_JOB_TYPE", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handlers := []JobHandler{NewMockJobHandler(JobTypeShellCommand, false)}
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.165.0"}
+
+	runner := NewRunner(source, handlers, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	failed := source.FailedJobs()
+	data := source.FailedData()
+	if len(failed) != 2 || len(data) != 2 {
+		t.Fatalf("Failed jobs = %d, data = %d, want 2 each", len(failed), len(data))
+	}
+
+	byType := make(map[string]map[string]any)
+	for i, job := range failed {
+		byType[job.Type] = data[i]
+	}
+
+	gated := byType[JobTypeFileRead]
+	if gated == nil {
+		t.Fatalf("no failure recorded for %s", JobTypeFileRead)
+	}
+	if gated["known_to_build"] != true {
+		t.Errorf("FILE_READ known_to_build = %v, want true", gated["known_to_build"])
+	}
+	reason, _ := gated["unregistered_reason"].(string)
+	if reason == "" || !strings.Contains(reason, "files") {
+		t.Errorf("FILE_READ unregistered_reason = %q, want it to name the files permission", reason)
+	}
+
+	unknown := byType["TOTALLY_MADE_UP_JOB_TYPE"]
+	if unknown == nil {
+		t.Fatalf("no failure recorded for TOTALLY_MADE_UP_JOB_TYPE")
+	}
+	if _, present := unknown["known_to_build"]; present {
+		t.Errorf("unknown type must not carry known_to_build, got %v", unknown["known_to_build"])
+	}
+	if _, present := unknown["unregistered_reason"]; present {
+		t.Errorf("unknown type must not carry unregistered_reason, got %v", unknown["unregistered_reason"])
+	}
+}
+
+// TestGatedJobTypeReasonsAreAllKnownToBuild ensures every job type named in
+// gatedJobTypeReasons is one this build genuinely knows about (it appears in
+// allKnownJobTypes) -- a gate reason for a type outside that list could never
+// be reached by failUnsupportedJobType's branch, silently rotting the message.
+func TestGatedJobTypeReasonsAreAllKnownToBuild(t *testing.T) {
+	known := make(map[string]bool, len(allKnownJobTypes))
+	for _, jt := range allKnownJobTypes {
+		known[jt] = true
+	}
+	for jt := range gatedJobTypeReasons {
+		if !known[jt] {
+			t.Errorf("gatedJobTypeReasons contains %q, which is not in allKnownJobTypes", jt)
+		}
+	}
+}
+
 // TestRunnerUnsupportedJobTypePublishesTerminalError verifies that the
 // unsupported-type path publishes a non-recoverable terminal error event
 // through the stream writer. The streaming dispatch path waits on this event;
@@ -862,7 +938,7 @@ func TestRunnerSupportedJobTypesReflectsRegistration(t *testing.T) {
 	}
 	runner := NewRunner(source, handlers, RunnerConfig{WorkerID: "test"})
 
-	got := runner.supportedJobTypes()
+	got := runner.SupportedJobTypes()
 	want := map[string]bool{JobTypeCobrowse: true, JobTypeShellCommand: true}
 	if len(got) != len(want) {
 		t.Fatalf("supportedJobTypes() = %v, want %d entries", got, len(want))

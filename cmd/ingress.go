@@ -165,6 +165,16 @@ func resolveIngressOptions(_ context.Context) (ingressOptions, error) {
 			}
 		}
 	}
+	// A poll interval at or above half the route max-age lets the map expire
+	// between polls: at RouteMaxAge/2 the ingress gets at least two poll attempts
+	// inside the freshness window, so a single failed poll cannot dark it. Refuse
+	// loudly rather than ship a config-dependent silent outage. (poll <= 0 falls
+	// through to the Client's own 10s default, which is well under the bound.)
+	if poll > 0 && poll >= ingress.RouteMaxAge/2 {
+		return ingressOptions{}, fmt.Errorf(
+			"ingress: poll interval %s is too large; it must be < %s (half the %s route max-age) so the route map is refreshed before it expires",
+			poll, ingress.RouteMaxAge/2, ingress.RouteMaxAge)
+	}
 
 	cert, err := resolveIngressCertProvider(appsDomain)
 	if err != nil {
@@ -332,7 +342,11 @@ func ingressServe(
 		Proxy:       proxy,
 		Cert:        opts.cert,
 		IsConnected: opts.isConnected,
-		RoutesReady: opts.routes.FetchedOnce,
+		// Fresh (not FetchedOnce) so the health check goes 503 once route data is
+		// stale, pulling a dark ingress from rotation rather than reporting green
+		// while every request 503s. Fresh subsumes FetchedOnce (a never-fetched
+		// map is not fresh).
+		RoutesReady: opts.routes.Fresh,
 		Logf:        opts.logf,
 	})
 

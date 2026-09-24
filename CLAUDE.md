@@ -299,6 +299,11 @@ Handlers in `internal/jobs/` implement specific job types (shell commands, model
 
 **Capability-Based Queue Routing**: Nodes auto-detect hardware (GPUs via `nvidia-smi`, engines via `docker ps`) and generate tags (e.g., `gpu:rtx3090`, `engine:vllm`). Tags map to Redis Streams queues (`jobs:v1:tag:gpu:rtx3090`) via `capabilities.TagQueueName()`. Capabilities can also be declared manually in the `capabilities:` section of `citadel.yaml`, which takes precedence over auto-detection.
 
+**Job-Type Capability Contract**: `worker.Runner.SupportedJobTypes` is the
+authority for the live handler set after platform, configuration, and permission
+gates. `cmd/work.go` publishes that set as `capabilities.job_types` through the
+status collector; do not infer handler availability from a version threshold.
+
 **Node Installer**: `install.sh` is a standalone script served at `get.aceteam.ai/citadel` that provisions a fresh Ubuntu machine end-to-end (NVIDIA drivers, Docker, citadel binary, systemd service, vLLM pre-pull). `uninstall.sh` reverses it. The Packer template (`packer/`) bakes the same stack into a qcow2 VM image for Proxmox-based fleet deployment.
 
 ### Key Packages
@@ -1493,10 +1498,38 @@ went on to report `already_linked` success on the stale image. `startBridgeStack
 best-effort (a node without `docker login` still serves its cached image) but
 never silent: `whatsapp.ProvisionDeps.BridgeImageID` samples the RUNNING
 CONTAINER's image before and after the deploy, and `ProvisionResult` carries
-`Upgraded` + both IDs + `ImagePullError`. The `status` string deliberately still
-has only two values (`provisioned` / `already_linked`): the aceteam backend
-branches on `status == "already_linked"` by equality, so upgrade information is
-additive, never a new status. `TestStartBridgeStackPullsBeforeUp` pins the argv.
+`Upgraded` + both IDs + `ImagePullError`. On the ORDINARY (non-force) provision
+path the `status` string keeps its two original values (`provisioned` /
+`already_linked`) — the aceteam backend branches on `status == "already_linked"`
+by equality, so the #718 image-change signal is additive (`Upgraded` + the two
+IDs), never a new status. `TestStartBridgeStackPullsBeforeUp` pins the argv.
+
+**The FORCE upgrade path (#1124, aceteam#10220) is the one case that emits the
+third value `status: "upgraded"`.** A `WHATSAPP_PROVISION` payload with `force:
+"true"` (a truthy STRING, as the aceteam PR #10226 sends it —
+`payload["force"]="true"`, omitted entirely on the default path so an older
+Citadel sees an unchanged payload) routes `whatsapp.Provision` through the new
+`ProvisionDeps.ForceRecreateCompose` edge INSTEAD of `DeployCompose`. That edge
+(`forceRecreateBridgeStack`/`bridgeComposeForceRecreateUp`, `cmd/whatsapp.go`)
+re-pulls the resolved bridge tag then `up -d --no-deps --force-recreate bridge` —
+never `down`, never `-v`, never `--remove-orphans`, so the Postgres auth-state
+volume (the Baileys session) is preserved with no re-QR. It deliberately BYPASSES
+the #624 D5 delegation short-circuit (which pulls/recreates nothing on a
+module-managed node — the exact reason a stuck bridge had no self-service
+upgrade), and REFUSES rather than clones when the bridge is not already deployed
+(`!whatsapp.IsDeployed`), keeping force git-credential-free on a D5 node. Two
+force-only rules, both load-bearing: `--no-deps` is REQUIRED (compose v2 cascades
+`--force-recreate` to the dependency set, so without it the Postgres sidecar is
+recreated too), and the force pull is FATAL (unlike `startBridgeStack`'s
+best-effort pull) — a force-recreate onto the same stale image after a failed
+pull would report an upgrade that never happened. `ProvisionResult.Forced` (set
+by `Provision` when the force edge ran) is what the handler maps to
+`status="upgraded"`, gated on `AlreadyLinked` (a forced recreate of a NOT-linked
+bridge stays `provisioned` with its QR). `TestForceRecreateBridgeStackPullsThenForceRecreatesBridgeOnly`
++ `TestForceRecreateBridgeStackPullFailureIsFatal` pin the argv/fatal-pull;
+`TestProvisionForceRoutesThroughForceRecreateCompose` pins the routing;
+`TestWhatsAppProvisionForceUpgrade` pins `status="upgraded"`. Default path
+(force absent) is byte-identical.
 
 ### Canonical per-engine cache paths (citadel #682 P0/P1, #906, model-cache ownership design)
 
@@ -3594,8 +3627,10 @@ then `docker compose pull` transcribe to get the per-segment signals AND the
 existed — uncertain-language). The low-speech-coverage check needs the new
 `duration` field, so it too only activates post-rebuild (fail-open without it).
 
-### Docker Runtime Requirements
-vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
+### Container Runtime GPU and Limit Requirements
+
+Docker retains the legacy NVIDIA runtime configured in
+`/etc/docker/daemon.json`:
 ```json
 {
   "default-runtime": "nvidia",
@@ -3607,7 +3642,24 @@ vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json
   }
 }
 ```
-The `init` command configures this automatically.
+The current `init` command configures that Docker path automatically.
+
+Rootless Podman does not use Docker's `default-runtime` setting. At launch,
+Citadel rewrites Compose GPU requests (`deploy` reservations, `gpus:`, and
+`runtime: nvidia`) into NVIDIA CDI devices such as
+`nvidia.com/gpu=all`; `ContainerRuntime.GPUArgs` performs the equivalent
+translation for direct engine runs. The host must have an NVIDIA CDI spec and
+GPU device nodes readable by the Citadel user. `citadel doctor` verifies this
+with a one-line CUDA-container probe on Linux GPU nodes.
+
+CPU, memory, and PID limits under rootless Podman require cgroup v2 controller
+delegation to the user's systemd service. A start that declares one of those
+limits fails closed when its required controller is not delegated, and
+`citadel doctor` reports the complete delegated-controller list. Cache-index
+scans and disk-pressure GC account for Podman's rootless graph root at
+`$XDG_DATA_HOME/containers/storage` (or
+`~/.local/share/containers/storage`) rather than assuming Docker's
+`/var/lib/docker`.
 
 ### Authentication Patterns
 Two auth flows supported:

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -22,6 +23,8 @@ import (
 // instance (citadel#428). A package var (not a plain function call) so tests
 // can substitute a mock server's base URL.
 var vllmInferenceBaseURL = vllmBaseURL
+
+var vllmLocalClient = &http.Client{Timeout: 65 * time.Second, Transport: &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 type VLLMInferenceHandler struct{}
 
@@ -40,7 +43,11 @@ func (h *VLLMInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 	ctx.Log("info", "     - [Job %s] vLLM service is ready. Running inference on model '%s'", job.ID, model)
 
 	// --- INFERENCE LOGIC ---
-	vllmCompletionsURL := vllmInferenceBaseURL() + "/v1/completions"
+	baseURL := vllmInferenceBaseURL()
+	if baseURL == "" {
+		return nil, fmt.Errorf("vllm is explicitly detached")
+	}
+	vllmCompletionsURL := baseURL + "/v1/completions"
 	requestPayload := map[string]interface{}{
 		"model":       model,
 		"prompt":      prompt,
@@ -49,7 +56,7 @@ func (h *VLLMInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 	}
 	reqBody, _ := json.Marshal(requestPayload)
 
-	resp, httpErr := http.Post(vllmCompletionsURL, "application/json", bytes.NewBuffer(reqBody))
+	resp, httpErr := vllmLocalClient.Post(vllmCompletionsURL, "application/json", bytes.NewBuffer(reqBody))
 	if httpErr != nil {
 		return nil, fmt.Errorf("failed to connect to vllm service: %w", httpErr)
 	}
@@ -72,13 +79,17 @@ func (h *VLLMInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 }
 
 func (h *VLLMInferenceHandler) waitForVLLMReady() error {
-	vllmHealthURL := vllmInferenceBaseURL() + "/health"
+	baseURL := vllmInferenceBaseURL()
+	if baseURL == "" {
+		return fmt.Errorf("vllm is explicitly detached")
+	}
+	vllmHealthURL := baseURL + "/health"
 	maxWait := 60 * time.Second
 	pollInterval := 1 * time.Second
 	startTime := time.Now()
 
 	for time.Since(startTime) < maxWait {
-		resp, httpErr := http.Get(vllmHealthURL)
+		resp, httpErr := vllmLocalClient.Get(vllmHealthURL)
 		if httpErr == nil && resp.StatusCode == http.StatusOK {
 			resp.Body.Close()
 			return nil // Service is ready

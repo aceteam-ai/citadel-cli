@@ -82,8 +82,7 @@ var meshChatCmd = &cobra.Command{
 sends a single OpenAI chat-completion request to that node's engine over the
 mesh, printing the assistant's reply.
 
-This is a minimal, non-interactive surface (the interactive REPL is Phase 1,
-#575). Selection rules:
+This is a minimal, non-interactive surface. Selection rules:
   - If --model uniquely identifies one served model, --node is optional.
   - If a model is served on multiple nodes, use --node (hostname or IP) to pick.
   - If a node serves exactly one model, --model is optional.
@@ -93,7 +92,7 @@ target node to expose a chat endpoint on the mesh. On embedded-tsnet nodes the
 engine's host port is NOT reachable over the mesh (only ports citadel binds a VPN
 listener for answer), and no node gateway yet proxies /v1/chat/completions to the
 local engine, so this command currently fails with connection-refused against
-such nodes. Adding the node-side gateway chat route is tracked in #581.`,
+such nodes.`,
 	Example: `  # Chat with a uniquely-named model anywhere on the mesh
   citadel mesh chat --model Qwen/Qwen2.5-7B "Explain WireGuard in one line"
 

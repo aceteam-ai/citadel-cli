@@ -27,7 +27,7 @@ var sshCmd = &cobra.Command{
 This command is an alias of 'citadel connect <peer>' (see
 'citadel connect --help'): a bare peer target routes through the exact same
 logic on both commands, so 'citadel ssh <node>' and 'citadel connect <node>'
-behave identically (issue #754).
+behave identically.
 
 PEER IDENTIFICATION:
   You can specify the peer in multiple ways:

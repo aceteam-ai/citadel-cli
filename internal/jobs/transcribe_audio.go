@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -41,8 +43,8 @@ const transcribeReadyTimeout = 120 * time.Second
 // fetch" once the gateway times out first.
 const transcribeUnreachableTimeout = 8 * time.Second
 
-// The transcribe request timeout is sized PER REQUEST from the audio file's
-// byte length rather than a single fixed cap. A fixed 30-minute cap was too
+// The transcribe request timeout is sized PER REQUEST from the audio's real
+// duration where possible. A fixed 30-minute cap was too
 // short in the field: a real 43-minute meeting recorded an ~83 MB WAV whose
 // end-of-call batch transcription ran past 30 minutes on CPU whisper and the
 // client aborted mid-request ("Client.Timeout exceeded while awaiting
@@ -50,10 +52,10 @@ const transcribeUnreachableTimeout = 8 * time.Second
 // (there is no streaming/offset API), so the client must tolerate a budget
 // proportional to the audio's real duration.
 //
-// Sizing by bytes also makes the rolling/windowed passes cheap for free: those
-// transcribe only a short trailing clip (small file -> short budget), while the
-// end-of-call batch pass over the full recording (large file -> long budget)
-// gets the headroom it needs. Both flow through the same handler.
+// Duration is essential for compressed recordings: a 38-minute Opus file can
+// be only a few MB, for which the old PCM byte estimate provided only minutes
+// of budget. ffprobe is deliberately best-effort and tightly bounded; when it
+// cannot provide a sane duration we retain the established PCM byte estimate.
 const (
 	// transcribeBytesPerSecond estimates recorded audio duration from a WAV
 	// file's size. The meeting recorder captures mono 16 kHz signed-16-bit PCM
@@ -90,6 +92,10 @@ const (
 	// govern total wait; this just stops one poll from hanging if the sidecar
 	// accepts the connection but never answers.
 	transcribeHealthTimeout = 10 * time.Second
+
+	// transcribeDurationProbeTimeout stops malformed containers or a stuck
+	// ffprobe binary from delaying a job before the sidecar request begins.
+	transcribeDurationProbeTimeout = 2 * time.Second
 )
 
 // TranscribeAudioHandler handles TRANSCRIBE_AUDIO jobs node-locally.
@@ -117,6 +123,8 @@ type TranscribeAudioHandler struct {
 	// collectStatusFn overrides collectStatusForDiagnosis for tests; nil uses
 	// a real status.NewCollector collection rooted at ConfigDir.
 	collectStatusFn collectStatusFn
+	// probeAudioDurationFn is a hermetic-test seam. Nil invokes ffprobe.
+	probeAudioDurationFn func(string) (time.Duration, error)
 }
 
 // collectStatusForDiagnosis returns live node status for citadel#891's
@@ -185,6 +193,57 @@ func transcribeTimeoutForAudioBytes(sizeBytes int64) time.Duration {
 	return budget
 }
 
+// transcribeTimeoutForAudioDuration turns a trusted container duration into a
+// bounded sidecar budget. The cap applies only to media-derived input; an
+// explicit worker job deadline remains authoritative (see requestTimeout).
+func transcribeTimeoutForAudioDuration(duration time.Duration) time.Duration {
+	if duration <= 0 {
+		return transcribeMaxRequestTimeout
+	}
+	if duration > time.Duration(math.MaxInt64/transcribeSecondsPerAudioSecond) {
+		return transcribeMaxRequestTimeout
+	}
+	budget := duration * transcribeSecondsPerAudioSecond
+	if budget < transcribeMinRequestTimeout {
+		return transcribeMinRequestTimeout
+	}
+	if budget > transcribeMaxRequestTimeout {
+		return transcribeMaxRequestTimeout
+	}
+	return budget
+}
+
+// probeAudioDuration invokes ffprobe with a fixed argv (not a shell) and a
+// short deadline. It reads a single numeric format duration, rejecting NaN,
+// infinity, zero, and values that cannot fit time.Duration. Callers treat any
+// failure as a signal to use the conservative existing byte fallback.
+func probeAudioDuration(path string) (time.Duration, error) {
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe unavailable: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), transcribeDurationProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, ffprobe,
+		"-v", "error", "-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1", "--", path).Output()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe duration: %w", err)
+	}
+	seconds, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 || seconds > float64(math.MaxInt64)/float64(time.Second) {
+		return 0, fmt.Errorf("invalid ffprobe duration %q", strings.TrimSpace(string(out)))
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
+}
+
+func (h *TranscribeAudioHandler) audioDuration(path string) (time.Duration, error) {
+	if h.probeAudioDurationFn != nil {
+		return h.probeAudioDurationFn(path)
+	}
+	return probeAudioDuration(path)
+}
+
 // requestTimeout sizes the transcribe request budget from the file at
 // validatedPath. On stat failure it returns the generous ceiling rather than a
 // small default: under-timing is precisely the failure mode being fixed, and a
@@ -195,11 +254,28 @@ func transcribeTimeoutForAudioBytes(sizeBytes int64) time.Duration {
 // per-model factor + one-time load allowance on top for the larger, slower
 // on-demand models (citadel#1045).
 func (h *TranscribeAudioHandler) requestTimeout(validatedPath string) time.Duration {
+	if duration, err := h.audioDuration(validatedPath); err == nil {
+		return transcribeTimeoutForAudioDuration(duration)
+	}
 	info, err := os.Stat(validatedPath)
 	if err != nil {
 		return transcribeMaxRequestTimeout
 	}
 	return transcribeTimeoutForAudioBytes(info.Size())
+}
+
+// requestTimeoutWithJobBudget prevents this handler's own deadline from being
+// shorter than the worker's already-authorized execution window. The worker
+// context is still the parent, so shutdown/cancellation always wins; this only
+// removes the accidental earlier client-side cutoff. No job deadline means the
+// bounded media-derived budget remains in force.
+func requestTimeoutWithJobBudget(ctx context.Context, mediaBudget time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > mediaBudget {
+			return remaining
+		}
+	}
+	return mediaBudget
 }
 
 // Model-aware request budget (citadel#1045). The base sizing above assumes
@@ -242,7 +318,10 @@ var (
 // behavior; a larger model scales the budget and adds a load allowance, clamped
 // to [min, max]. Pure and table-testable.
 func transcribeTimeoutFor(sizeBytes int64, modelSize string) time.Duration {
-	base := transcribeTimeoutForAudioBytes(sizeBytes)
+	return transcribeTimeoutFromBase(transcribeTimeoutForAudioBytes(sizeBytes), modelSize)
+}
+
+func transcribeTimeoutFromBase(base time.Duration, modelSize string) time.Duration {
 	factor := transcribeModelTimeoutFactors[modelSize]
 	if factor < 1 {
 		factor = 1
@@ -262,11 +341,21 @@ func transcribeTimeoutFor(sizeBytes int64, modelSize string) time.Duration {
 // falls back to the model-aware ceiling, same fail-generous direction as
 // requestTimeout.
 func (h *TranscribeAudioHandler) requestTimeoutForModel(validatedPath, modelSize string) time.Duration {
+	if duration, err := h.audioDuration(validatedPath); err == nil {
+		return transcribeTimeoutForDuration(duration, modelSize)
+	}
 	info, err := os.Stat(validatedPath)
 	if err != nil {
 		return transcribeTimeoutFor(0, modelSize)
 	}
 	return transcribeTimeoutFor(info.Size(), modelSize)
+}
+
+// transcribeTimeoutForDuration applies the existing selected-model factor to a
+// duration-derived base budget. Kept separate from the byte fallback so a
+// compressed input can never silently be treated as PCM.
+func transcribeTimeoutForDuration(duration time.Duration, modelSize string) time.Duration {
+	return transcribeTimeoutFromBase(transcribeTimeoutForAudioDuration(duration), modelSize)
 }
 
 // allowedWhisperModelSizes whitelists the model_size values accepted from the
@@ -449,8 +538,8 @@ func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	// on-demand model's first-request load+decode — is not cut off mid-flight.
 	// The context governs the entire request including the body read below, so
 	// cancel only after Execute is done with the response.
-	reqTimeout := h.requestTimeoutForModel(validated, modelSize)
-	reqCtx, cancel := context.WithTimeout(context.Background(), reqTimeout)
+	reqTimeout := requestTimeoutWithJobBudget(ctx.Context(), h.requestTimeoutForModel(validated, modelSize))
+	reqCtx, cancel := context.WithTimeout(ctx.Context(), reqTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, h.serviceURL()+"/transcribe", bytes.NewBuffer(reqBody))

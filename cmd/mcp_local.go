@@ -731,7 +731,7 @@ func newModelExclusivityTools(deps localMCPDeps) []localMCPTool {
 		Name: "local_model_deploy",
 		Description: "Pull (if needed) and start a model on THIS node's own engine. Optionally bounds " +
 			"VRAM via vram_mb, which may durably stop OTHER non-pinned services to fit " +
-			"(citadel-cli#577's ordinary preemption -- NOT a reservation: nothing is automatically " +
+			"(ordinary preemption -- NOT a reservation: nothing is automatically " +
 			"restored later). For a reservation that restores evicted peers when you're done, use " +
 			"local_run_exclusive instead. LOCAL authority: runs on this node for the node owner, no " +
 			"AceTeam platform round-trip, no node:modules scope required.",
@@ -1087,7 +1087,7 @@ func captureStdout(fn func() error) (out string, err error) {
 func newEgressRelayTools(deps localMCPDeps) []localMCPTool {
 	status := localMCPTool{
 		Name: "local_egress_relay_status",
-		Description: "Show THIS node's on-node SOCKS5 egress relay configuration (citadel #787): " +
+		Description: "Show THIS node's on-node SOCKS5 egress relay configuration: " +
 			"whether the relay is enabled, and whether it allows an authorized peer to CONNECT into " +
 			"this node's own LAN/mesh (allow_lan). The relay lets ANOTHER citadel node tunnel outbound " +
 			"traffic through this node; it is off by default and, even when on, only serves a same-org " +
@@ -1103,7 +1103,7 @@ func newEgressRelayTools(deps localMCPDeps) []localMCPTool {
 
 	set := localMCPTool{
 		Name: "local_egress_relay_set",
-		Description: "Set THIS node's on-node SOCKS5 egress relay configuration (citadel #787). Both " +
+		Description: "Set THIS node's on-node SOCKS5 egress relay configuration. Both " +
 			"fields are optional pointers -- omit a field to leave its current persisted value " +
 			"untouched. Takes effect on the next 'citadel work' start, not immediately (the relay " +
 			"listener is started once at worker startup). LOCAL authority: runs on this node for the " +

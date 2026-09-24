@@ -146,6 +146,88 @@ func TestStartBridgeStackUpFailureIsFatal(t *testing.T) {
 	}
 }
 
+// TestForceRecreateBridgeStackPullsThenForceRecreatesBridgeOnly is the #1124
+// contract: a force upgrade re-pulls, then `up -d --no-deps --force-recreate` the
+// BRIDGE service ONLY, and must NEVER `down`, pass `-v`, or `--remove-orphans`
+// (all of which would risk the Postgres auth-state volume / the WhatsApp session).
+func TestForceRecreateBridgeStackPullsThenForceRecreatesBridgeOnly(t *testing.T) {
+	calls := recordCompose(t, nil)
+	report := &deployReport{}
+
+	if err := forceRecreateBridgeStack(context.Background(), "services", "/n/wa.yml", "/n/wa.env", report); err != nil {
+		t.Fatalf("forceRecreateBridgeStack() error = %v", err)
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("compose invocations = %d (%v), want 2 (pull then force-recreate up)", len(*calls), *calls)
+	}
+	pull, up := (*calls)[0], (*calls)[1]
+	if composeSubcommand(pull) != "pull" {
+		t.Errorf("first invocation = %v, want the image pull FIRST (a recreate without a pull cannot upgrade)", pull)
+	}
+	if pull[len(pull)-1] != "bridge" {
+		t.Errorf("pull argv = %v, want it scoped to the bridge service (never --include-deps, which would refresh Postgres)", pull)
+	}
+	if composeSubcommand(up) != "up" {
+		t.Errorf("second invocation = %v, want the up", up)
+	}
+	hasForce, hasNoDeps := false, false
+	for _, a := range up {
+		switch a {
+		case "--force-recreate":
+			hasForce = true
+		case "--no-deps":
+			hasNoDeps = true
+		case "down":
+			t.Fatalf("force upgrade must NEVER `down`: %v", up)
+		case "-v", "--volumes":
+			t.Fatalf("force upgrade must NEVER pass -v/--volumes (the auth-state volume): %v", up)
+		case "--remove-orphans":
+			t.Fatalf("force upgrade must NEVER pass --remove-orphans (the shared `services` project): %v", up)
+		}
+	}
+	if !hasForce {
+		t.Errorf("up argv = %v, want --force-recreate (a plain up is the #718 floating-tag no-op)", up)
+	}
+	if !hasNoDeps {
+		t.Errorf("up argv = %v, want --no-deps so the Postgres sidecar is not recreated (compose v2 cascades --force-recreate to deps)", up)
+	}
+	if up[len(up)-1] != "bridge" {
+		t.Errorf("up argv = %v, want it scoped to the bridge service ONLY", up)
+	}
+	// Belt-and-suspenders across every recorded call: nothing may be a `down`.
+	for _, c := range *calls {
+		if composeSubcommand(c) == "down" {
+			t.Fatalf("no compose invocation may be `down` in a force upgrade: %v", c)
+		}
+	}
+}
+
+// TestForceRecreateBridgeStackPullFailureIsFatal: unlike startBridgeStack, the
+// force path's pull is FATAL. A force-recreate onto the SAME stale image after a
+// failed pull would report status=upgraded for an upgrade that never happened (the
+// #718 false-green), so no up must be issued.
+func TestForceRecreateBridgeStackPullFailureIsFatal(t *testing.T) {
+	calls := recordCompose(t, map[string]error{"pull": errors.New("exit status 1")})
+	report := &deployReport{}
+
+	err := forceRecreateBridgeStack(context.Background(), "services", "/n/wa.yml", "/n/wa.env", report)
+	if err == nil {
+		t.Fatal("forceRecreateBridgeStack() error = nil, want a pull failure to be FATAL on the force path")
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("compose invocations = %d (%v), want ONLY the pull (no up after a failed force pull)", len(*calls), *calls)
+	}
+	if composeSubcommand((*calls)[0]) != "pull" {
+		t.Errorf("the single invocation = %v, want the pull", (*calls)[0])
+	}
+	if !strings.Contains(err.Error(), "docker login") {
+		t.Errorf("error = %q, want it to keep the registry-reachability / docker login hint", err)
+	}
+	if report.PullError() == "" {
+		t.Error("PullError = \"\", want the failure recorded")
+	}
+}
+
 // TestBridgeComposeEnvIgnoresOrphans: the bridge shares the `services` compose
 // project with every other module on the node, so compose reports those siblings
 // as orphans on every up. Naming the `bridge` service does not suppress that

@@ -361,6 +361,7 @@ func defaultDiskUsedPercent(path string) (float64, bool) {
 type cacheGCDeps struct {
 	CacheRoot              string
 	DiskPath               string
+	DiskPaths              []string
 	HighPercent            float64
 	LowPercent             float64
 	MinAge                 time.Duration
@@ -392,7 +393,7 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 	now := deps.Now()
 	result := cacheGCRunResult{RanAt: now}
 
-	percent, ok := deps.DiskUsedPercent(deps.DiskPath)
+	pressurePath, percent, ok := highestDiskPressure(deps.DiskPath, deps.DiskPaths, deps.DiskUsedPercent)
 	if !ok {
 		// Fail closed: an unreadable free-space signal must never be
 		// guessed at (design doc §10, the same rule #828's disk preflight
@@ -447,7 +448,7 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 	anyDeleteFailure := false
 	anyBecameResident := false
 	for _, e := range plan.Candidates {
-		p, ok := deps.DiskUsedPercent(deps.DiskPath)
+		p, ok := deps.DiskUsedPercent(pressurePath)
 		if !ok {
 			result.SkipReason = "unknown_disk_usage"
 			break
@@ -572,6 +573,33 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 	return result
 }
 
+func highestDiskPressure(defaultPath string, paths []string, usedPercent func(string) (float64, bool)) (string, float64, bool) {
+	if len(paths) == 0 {
+		paths = []string{defaultPath}
+	}
+	seen := map[string]bool{}
+	var selected string
+	var highest float64
+	for _, path := range paths {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if path == "." || seen[path] {
+			continue
+		}
+		seen[path] = true
+		percent, ok := usedPercent(path)
+		if !ok {
+			return "", 0, false
+		}
+		if selected == "" || percent > highest {
+			selected, highest = path, percent
+		}
+	}
+	if selected == "" {
+		return "", 0, false
+	}
+	return selected, highest, true
+}
+
 // formatRecencyOrUnknown renders an entry's effective recency (LastUsed if
 // known, else PulledAt) for a log line, or "unknown" for a defensive
 // both-zero entry (should not occur for a well-formed record).
@@ -602,6 +630,7 @@ type CacheGCReconciler struct {
 	minAge       time.Duration
 	cacheRoot    string
 	diskPath     string
+	diskPaths    []string
 	logf         func(level, format string, args ...any)
 
 	// inFlight is the single-flight guard (the #858 captureStdout "refuse
@@ -635,13 +664,22 @@ func NewCacheGCReconciler(pinnedModels []string, logf func(level, format string,
 	if logf == nil {
 		logf = func(string, string, ...any) {}
 	}
+	runtime := catalog.SelectContainerRuntime()
+	diskPath := resmon.HostDiskPath()
+	diskPaths := []string{diskPath}
+	for _, root := range cacheindex.RuntimeStorageRoots(runtime.EngineBin) {
+		if info, err := os.Stat(root); err == nil && info.IsDir() {
+			diskPaths = append(diskPaths, root)
+		}
+	}
 	return &CacheGCReconciler{
 		pinnedModels: pinned,
 		highPercent:  high,
 		lowPercent:   low,
 		minAge:       cacheGCMinAge(),
 		cacheRoot:    cacheindex.DefaultCacheRoot(),
-		diskPath:     resmon.HostDiskPath(),
+		diskPath:     diskPath,
+		diskPaths:    diskPaths,
 		logf:         logf,
 	}
 }
@@ -673,6 +711,7 @@ func (r *CacheGCReconciler) deps() cacheGCDeps {
 	return cacheGCDeps{
 		CacheRoot:              r.cacheRoot,
 		DiskPath:               r.diskPath,
+		DiskPaths:              r.diskPaths,
 		HighPercent:            r.highPercent,
 		LowPercent:             r.lowPercent,
 		MinAge:                 r.minAge,

@@ -429,7 +429,7 @@ func runControlCenter() {
 							freshCtx, freshCancel := context.WithTimeout(ctx, 15*time.Second)
 							config := network.ServerConfig{
 								Hostname:   hostname,
-								ControlURL: nexusURL,
+								ControlURL: network.ResolveControlURL(),
 								AuthKey:    freshKey,
 							}
 							if _, connectErr := network.Connect(freshCtx, config); connectErr == nil {
@@ -1945,6 +1945,11 @@ func ccConnectWithAuthkey(authkey string) error {
 	}
 
 	_, err := network.Connect(ctx, config)
+	if err == nil {
+		// Persist the control URL enrolled against (citadel-cli#1110) so later
+		// reconnects target this control plane, not the compiled-in default.
+		persistNexusURLBestEffort(nexusURL)
+	}
 	return err
 }
 
@@ -2252,11 +2257,24 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		activity("warning", "Per-node shell stream skipped (node ID unavailable); node-targeted jobs fall back to the shared stream")
 	}
 
+	// The control-center heartbeat starts before entering runner.Run, but must
+	// not publish until the full handler set (including privileged handlers) is
+	// installed. The collector reads through this pointer on every heartbeat.
+	var ccNodeRunner atomic.Pointer[worker.Runner]
+	var startHeartbeatPublisher func()
+
 	// Create status collector for heartbeat
 	collector := status.NewCollector(status.CollectorConfig{
 		NodeName:  nodeName,
 		ConfigDir: "",
 		Services:  nil,
+		JobTypes: func() []string {
+			runner := ccNodeRunner.Load()
+			if runner == nil {
+				return nil
+			}
+			return runner.SupportedJobTypes()
+		},
 	})
 
 	// Start heartbeat publisher if we have API mode
@@ -2286,13 +2304,13 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 				// Periodically report the node's ActualState (installed-module
 				// set + per-module health) to the control plane (#353,
 				// report-only v1). Same device-authed client, same opt-out gate
-				// as activity telemetry; node_id is the Headscale hostname so
+				// as activity telemetry; node_id is the canonical Headscale ID so
 				// the server can re-derive org and ignore any payload org claim.
 				if emitter := nodestate.New(nodestate.Config{
 					Poster:    apiSource.Client(),
 					Inspector: nodestate.DockerInspector(),
 					ConfigDir: platform.ConfigDir(),
-					NodeID:    nodeName,
+					NodeID:    headscaleNodeID,
 					Version:   Version,
 				}); emitter != nil {
 					go emitter.Run(ctx)
@@ -2349,34 +2367,36 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 						go pulseStats.Run(ctx)
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
-					go func() {
-						activity("info", "Heartbeat publishing started")
-
-						// Update TUI heartbeat indicator periodically
-						heartbeatTicker := time.NewTicker(30 * time.Second)
-						defer heartbeatTicker.Stop()
-
+					startHeartbeatPublisher = func() {
 						go func() {
-							// Initial heartbeat indicator
-							if ccHeartbeatFn != nil {
-								ccHeartbeatFn(true)
-							}
-							for {
-								select {
-								case <-ctx.Done():
-									return
-								case <-heartbeatTicker.C:
-									if ccHeartbeatFn != nil {
-										ccHeartbeatFn(true)
+							activity("info", "Heartbeat publishing started")
+
+							// Update TUI heartbeat indicator periodically
+							heartbeatTicker := time.NewTicker(30 * time.Second)
+							defer heartbeatTicker.Stop()
+
+							go func() {
+								// Initial heartbeat indicator
+								if ccHeartbeatFn != nil {
+									ccHeartbeatFn(true)
+								}
+								for {
+									select {
+									case <-ctx.Done():
+										return
+									case <-heartbeatTicker.C:
+										if ccHeartbeatFn != nil {
+											ccHeartbeatFn(true)
+										}
 									}
 								}
+							}()
+
+							if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
+								activity("warning", fmt.Sprintf("Heartbeat error: %v", err))
 							}
 						}()
-
-						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
-							activity("warning", fmt.Sprintf("Heartbeat error: %v", err))
-						}
-					}()
+					}
 				}
 			}
 		}
@@ -2431,6 +2451,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ccPinnedServices = manifestPinnedServices(m)
 	}
 	nodeJobOpts := nodeJobHandlerOpts{
+		OrgID:                     nodeJobOrgID(),
 		LogFn:                     activity,
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 ccConfigDir,
@@ -2441,10 +2462,13 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ShellHasPasscode:          nodeHasPasscode,
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !ccPerms.Desktop,
+		DesktopEnabled:            nodeDesktopEnabled,
 		FilesDisabled:             !ccPerms.Files,
+		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              ccWfExec,
 		HandlerLog:                func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
 		PinnedServices:            ccPinnedServices,
+		InstanceEnabled:           instanceProvisioningEnabled(ccConfigDir),
 	}
 	// Swap manager (if any) is discarded here: this collector does not wire
 	// WorkerLiveness/PinnedServices/ModelHotswap either (a pre-existing gap —
@@ -2483,6 +2507,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// on the live runner, shared with runWork. This closes the "no handler" hazard for
 	// a control-center-only node.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	startStatusPublisherAfterRunner(&ccNodeRunner, runner, startHeartbeatPublisher)
 
 	activity("success", "Worker started, listening for jobs...")
 

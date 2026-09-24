@@ -86,3 +86,36 @@ func TestCommandContext_CarriesCancellation(t *testing.T) {
 		t.Fatal("ComposeCommandContext with a cancelled ctx: Start() = nil, want a cancellation error")
 	}
 }
+
+func TestGPUArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		rt   ContainerRuntime
+		spec string
+		want []string
+	}{
+		{"docker legacy syntax", ContainerRuntime{EngineBin: "docker"}, "device=2,3", []string{"--gpus", "device=2,3"}},
+		{"podman all CDI", ContainerRuntime{EngineBin: "podman"}, "all", []string{"--device", "nvidia.com/gpu=all"}},
+		{"podman explicit CDI", ContainerRuntime{EngineBin: "podman"}, "device=2,3", []string{"--device", "nvidia.com/gpu=2", "--device", "nvidia.com/gpu=3"}},
+		{"podman count CDI", ContainerRuntime{EngineBin: "podman"}, "2", []string{"--device", "nvidia.com/gpu=0", "--device", "nvidia.com/gpu=1"}},
+		{"empty", ContainerRuntime{EngineBin: "podman"}, "", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.rt.GPUArgs(tt.spec)
+			if err != nil {
+				t.Fatalf("GPUArgs(%q): %v", tt.spec, err)
+			}
+			if argsOf(got) != argsOf(tt.want) {
+				t.Fatalf("GPUArgs(%q) = %v, want %v", tt.spec, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGPUArgsPodmanRejectsAmbiguousSelector(t *testing.T) {
+	_, err := (ContainerRuntime{EngineBin: "podman"}).GPUArgs("device=0;--privileged")
+	if err == nil {
+		t.Fatal("GPUArgs() error = nil, want unsupported-selector error")
+	}
+}

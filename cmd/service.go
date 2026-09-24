@@ -14,6 +14,8 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -145,6 +147,9 @@ func prepareCacheDirectories() error {
 
 // startService starts a docker-based service using docker compose.
 func startService(serviceName, composeFilePath string) error {
+	if err := refuseManagedVLLMStart(serviceName); err != nil {
+		return err
+	}
 	if composeFilePath == "" {
 		return fmt.Errorf("service %s has no compose_file defined", serviceName)
 	}
@@ -212,7 +217,7 @@ func startService(serviceName, composeFilePath string) error {
 			func() bool { return managedContainerRunningForStart(rt.EngineBin, containerName) },
 			status.OpenAICompatServing,
 		); adopt {
-			fmt.Printf("   ✅ %s; not launching a citadel container (aceteam-ai/citadel-cli#1081)\n", msg)
+			fmt.Printf("   ✅ %s; not launching a citadel container\n", msg)
 			return nil
 		}
 	}
@@ -262,7 +267,7 @@ func startService(serviceName, composeFilePath string) error {
 				// (loop guard), a live wildcard binding, and the
 				// CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE opt-out.
 				if shouldRecreateForEngineBindDrift(rt.EngineBin, serviceName, containerName, composeFilePath, bindEnv) {
-					fmt.Printf("   ♻️  Container %s is published on all interfaces; recreating to apply the loopback bind (aceteam-ai/citadel-cli#1030)...\n", containerName)
+					fmt.Printf("   ♻️  Container %s is published on all interfaces; recreating to apply the loopback bind...\n", containerName)
 					forceRecreateForBindDrift = true
 					// Fall through to the compose-up below with --force-recreate.
 				} else {
@@ -302,7 +307,28 @@ func startService(serviceName, composeFilePath string) error {
 	}
 
 	// Start the service (container either doesn't exist or was just removed)
+	sandboxOverridePath := sandboxOverridePathFor(composeFilePath)
+	requiredControllers, limitsErr := compose.RequiredLimitControllersFromFiles(composeFilePath, sandboxOverridePath)
+	if limitsErr != nil {
+		return fmt.Errorf("cannot inspect %s resource limits: %w", serviceName, limitsErr)
+	}
+	if limitsErr := rt.PreflightLimitControllers(requiredControllers...); limitsErr != nil {
+		return fmt.Errorf("cannot start %s: %w", serviceName, limitsErr)
+	}
+
+	// Podman consumes NVIDIA devices through CDI rather than Docker's --gpus /
+	// deploy reservation vocabulary. Rewrite a private temporary copy and leave
+	// the installed compose source untouched.
 	actualComposePath := composeFilePath
+	if rt.EngineBin == "podman" {
+		var cleanup func()
+		var rewriteErr error
+		actualComposePath, cleanup, rewriteErr = compose.MaterializePodmanGPUCompose(composeFilePath)
+		if rewriteErr != nil {
+			return fmt.Errorf("cannot translate %s GPU reservation for Podman: %w", serviceName, rewriteErr)
+		}
+		defer cleanup()
+	}
 
 	// On non-Linux platforms, strip GPU device reservations from compose file
 	if !platform.IsLinux() {
@@ -348,6 +374,31 @@ func startService(serviceName, composeFilePath string) error {
 	output, err := composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
+	}
+	return nil
+}
+
+func refuseManagedVLLMStart(serviceName string) error {
+	if composeProjectOverride() != "" {
+		return nil
+	}
+	return refuseManagedVLLMWhileExternal(serviceName, network.GetNodeConfigDir())
+}
+
+// refuseManagedVLLMWhileExternal keeps the explicit ownership record
+// authoritative across every managed start path (boot, local CLI, and desired
+// state). A detached record is an intentional tombstone, not permission to
+// launch a competing Citadel-managed container.
+func refuseManagedVLLMWhileExternal(serviceName, configDir string) error {
+	if serviceName != "vllm" {
+		return nil
+	}
+	c, err := externalengine.LoadPersisted(configDir)
+	if err != nil {
+		return fmt.Errorf("cannot inspect external vllm ownership: %w", err)
+	}
+	if c != nil {
+		return fmt.Errorf("cannot start managed vllm: external %s ownership record exists", c.Mode)
 	}
 	return nil
 }

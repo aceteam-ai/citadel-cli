@@ -13,7 +13,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
-	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
@@ -88,16 +87,7 @@ var rootCmd = &cobra.Command{
 Just run 'citadel' — it handles login, network connection, and launches the
 control center. All other subcommands are for scripting and advanced use.`,
 	Version: Version,
-	Run: func(cmd *cobra.Command, args []string) {
-		// Default behavior: launch control center if TTY, otherwise show help.
-		// Headless/background operation is provided by 'citadel work' (run under
-		// systemd or another supervisor); there is deliberately no --daemon flag.
-		if tui.IsTTY() {
-			runControlCenter()
-		} else {
-			cmd.Help()
-		}
-	},
+	Run:     runBareCitadel,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr FIRST,
@@ -120,7 +110,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 		if recovered, err := update.RecoverInterruptedSwap(); err != nil {
 			Debug("interrupted update recovery check failed: %v", err)
 		} else if recovered {
-			Log("recovered from an interrupted update (citadel#926)")
+			Log("recovered from an interrupted update")
 		}
 
 		// --runtime overrides container-runtime auto-detection (#636). Export it
@@ -180,19 +170,23 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 		Log("command: %s", fullCmd)
 
-		// Check for updates (skip for update/version/help commands)
+		// Check for updates (skip for update/version/help commands). A bare
+		// non-interactive invocation has a stable one-line status contract; a
+		// cached update banner before that line would corrupt pipes and scripts.
 		cmdName := cmd.Name()
 		parentName := ""
 		if cmd.Parent() != nil {
 			parentName = cmd.Parent().Name()
 		}
-		skipUpdateCheck := cmdName == "update" || parentName == "update" ||
+		bareNonInteractive := cmdName == "citadel" && len(args) == 0 && !bareInvocationIsInteractive()
+		skipUpdateCheck := bareNonInteractive ||
+			cmdName == "update" || parentName == "update" ||
 			cmdName == "version" || cmdName == "help" ||
 			autoUpdateOptedOut()
 
 		// Detect if we're about to launch TUI control center
 		// In this case, suppress stdout printing and defer to TUI activity log
-		isTUIContext := cmdName == "citadel" && len(args) == 0 && tui.IsTTY()
+		isTUIContext := cmdName == "citadel" && len(args) == 0 && bareInvocationIsInteractive()
 
 		// MCP uses stdout as transport -- suppress update print to stdout.
 		if cmdName == "mcp" {
@@ -200,10 +194,16 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 
 		if !skipUpdateCheck {
-			checkForUpdateOnStartup(isTUIContext)
+			checkForUpdateOnStartupFn(isTUIContext)
 		}
 	},
 }
+
+// checkForUpdateOnStartupFn lets the root invocation path be tested without
+// reading or writing the real update cache. Production always uses the real
+// checker; tests replace it only to prove a bare status invocation suppresses
+// the checker before it could print a cached banner.
+var checkForUpdateOnStartupFn = checkForUpdateOnStartup
 
 // autoUpdateOptedOut reports whether the user has opted out of automatic update
 // checks/installs for this invocation, via the --no-auto-update persistent flag

@@ -48,6 +48,13 @@ just run 'citadel enroll' and scan.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		nexus.DebugFunc = Debug
 
+		// Refuse an explicit --nexus that differs from the control plane this
+		// node is already enrolled against (citadel-cli#1110).
+		if err := refuseNexusFlagMismatch(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+
 		// Already connected? Tell the user instead of re-enrolling silently.
 		if network.IsGlobalConnected() {
 			nodeName, _ := getNodeName()

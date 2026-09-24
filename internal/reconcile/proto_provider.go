@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/protocol"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
@@ -119,6 +120,7 @@ func (p *ProtoProvider) Report(ctx context.Context, actual ActualState) error {
 			whatsapp.AttachBridgeModule(pb, m)
 		}
 	}
+	externalengine.AttachObservedModule(ctx, pb)
 	body, err := proto.Marshal(pb)
 	if err != nil {
 		return fmt.Errorf("encode actual-state: %w", err)

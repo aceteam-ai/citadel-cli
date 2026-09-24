@@ -17,6 +17,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
@@ -401,6 +402,15 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		}
 
 	case "docker":
+		if svc.Name == "vllm" {
+			external, loadErr := externalengine.LoadPersisted(h.ConfigDir)
+			if loadErr != nil {
+				return nil, fmt.Errorf("cannot inspect external vllm ownership: %w", loadErr)
+			}
+			if external != nil {
+				return nil, fmt.Errorf("cannot start managed vllm: external %s ownership record exists", external.Mode)
+			}
+		}
 		// Adopt an already-running EXTERNAL OpenAI-compat engine instead of
 		// launching a competing container (aceteam-ai/citadel-cli#1081/#1084,
 		// RM-01). Checked FIRST, before persisting a model or touching compose:
@@ -470,6 +480,35 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// so this is byte-identical to the prior hardcoded path; on a podman node
 		// it drives podman consistently. Mirrors cmd/service.go's startService.
 		rt := catalog.SelectContainerRuntime()
+		sandboxOverridePath := catalog.ExistingSandboxOverride(filepath.Dir(composePath),
+			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath))))
+		requiredControllers, limitsErr := compose.RequiredLimitControllersFromFiles(composePath, sandboxOverridePath)
+		if limitsErr != nil {
+			return nil, fmt.Errorf("cannot inspect %s resource limits: %w", svc.Name, limitsErr)
+		}
+		// Resource isolation may materialize a memory limit later in this start.
+		// Include it in the preflight now so a rootless Podman node fails before
+		// VRAM preemption or any compose mutation.
+		if resourceIsolationEnabled() {
+			if baseContent, readErr := os.ReadFile(composePath); readErr == nil {
+				if gpu, parseErr := catalog.ComposeDeclaresGPU(string(baseContent)); parseErr == nil && gpu {
+					requiredControllers = append(requiredControllers, "memory")
+				}
+			}
+		}
+		if limitsErr := rt.PreflightLimitControllers(requiredControllers...); limitsErr != nil {
+			return nil, fmt.Errorf("cannot start %s: %w", svc.Name, limitsErr)
+		}
+		actualComposePath := composePath
+		cleanupPodmanCompose := func() {}
+		if rt.EngineBin == "podman" {
+			var rewriteErr error
+			actualComposePath, cleanupPodmanCompose, rewriteErr = compose.MaterializePodmanGPUCompose(composePath)
+			if rewriteErr != nil {
+				return nil, fmt.Errorf("cannot translate %s GPU reservation for Podman: %w", svc.Name, rewriteErr)
+			}
+		}
+		defer cleanupPodmanCompose()
 		// ramOverridePath is the citadel#831 per-service RAM ceiling override
 		// (empty when resource isolation is off, the target isn't GPU, or the
 		// target is already running -- see applyRAMIsolation and the gate
@@ -508,10 +547,9 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// override would otherwise be bypassed by this start site.
 		// Args are the compose args WITHOUT the leading "compose": rt.ComposeCommand
 		// supplies the correct front-end prefix (docker/podman) below.
-		composeArgs := []string{"-f", composePath}
-		if override := catalog.ExistingSandboxOverride(filepath.Dir(composePath),
-			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))); override != "" {
-			composeArgs = append(composeArgs, "-f", override)
+		composeArgs := []string{"-f", actualComposePath}
+		if sandboxOverridePath != "" {
+			composeArgs = append(composeArgs, "-f", sandboxOverridePath)
 		}
 		// citadel#831 RAM ceiling override (empty when not applicable — see the
 		// ramOverridePath assignment above and applyRAMIsolation).
@@ -2003,7 +2041,7 @@ func (h *ServiceHandler) maybeAdoptExternalEngine(ctx JobContext, svc manifestSe
 	if len(models) > 0 {
 		msg = fmt.Sprintf("%s serving %s", msg, strings.Join(models, ", "))
 	}
-	ctx.Log("info", "     - Adopted external %s already serving on :%d; not launching a citadel container (aceteam-ai/citadel-cli#1081)", svc.Name, port)
+	ctx.Log("info", "     - Adopted external %s already serving on :%d; not launching a citadel container", svc.Name, port)
 	out, err := json.Marshal(serviceResult{
 		Name:     svc.Name,
 		Running:  true,

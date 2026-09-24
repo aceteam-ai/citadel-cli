@@ -3,10 +3,13 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 
@@ -98,6 +101,15 @@ var catalogListSourcesCmd = &cobra.Command{
 	RunE:  runCatalogListSources,
 }
 
+var catalogPrePullRuntimesDryRun bool
+
+var catalogPrePullRuntimesCmd = &cobra.Command{
+	Use:   "pre-pull-runtimes",
+	Short: "Cache trusted hosted-app runtime images on this node",
+	Args:  cobra.NoArgs,
+	RunE:  runCatalogPrePullRuntimes,
+}
+
 func init() {
 	svcCmd.AddCommand(catalogCmd)
 	catalogCmd.AddCommand(catalogUpdateCmd)
@@ -108,6 +120,7 @@ func init() {
 	catalogCmd.AddCommand(catalogAddCmd)
 	catalogCmd.AddCommand(catalogRemoveCmd)
 	catalogCmd.AddCommand(catalogListSourcesCmd)
+	catalogCmd.AddCommand(catalogPrePullRuntimesCmd)
 
 	catalogInstallCmd.Flags().StringArrayVar(&catalogInstallConfigFlags, "set", nil,
 		"Set a config value (e.g. --set MODEL=Qwen/Qwen3-8B)")
@@ -115,6 +128,90 @@ func init() {
 		"Allow a community-source service whose compose requests privileged/root-equivalent access")
 	catalogAddCmd.Flags().StringVar(&catalogAddName, "name", "",
 		"Name for the source (defaults to the repository name)")
+	catalogPrePullRuntimesCmd.Flags().BoolVar(&catalogPrePullRuntimesDryRun, "dry-run", false,
+		"Print trusted image references without contacting the registry")
+}
+
+func runCatalogPrePullRuntimes(cmd *cobra.Command, args []string) error {
+	reg, err := catalog.LoadRegistry()
+	if err != nil {
+		return err
+	}
+
+	out := cmd.OutOrStdout()
+	errOut := cmd.ErrOrStderr()
+	pull := func(ctx context.Context, image string) error {
+		runtime := catalog.SelectContainerRuntime()
+		pullCmd := runtime.ImagePull(ctx, image)
+		pullCmd.Stdout = out
+		pullCmd.Stderr = errOut
+		return pullCmd.Run()
+	}
+
+	return prePullRuntimeImages(
+		cmd.Context(), reg.RuntimeImages, runtime.GOARCH, catalogPrePullRuntimesDryRun, out, pull,
+	)
+}
+
+func prePullRuntimeImages(
+	ctx context.Context,
+	images []catalog.RuntimeImage,
+	hostArchitecture string,
+	dryRun bool,
+	out io.Writer,
+	pull func(context.Context, string) error,
+) error {
+	if len(images) == 0 {
+		return fmt.Errorf("trusted catalog has no app runtime images")
+	}
+	if err := preflightRuntimeImageArchitectures(images, hostArchitecture); err != nil {
+		return err
+	}
+
+	for _, runtimeImage := range images {
+		if dryRun {
+			fmt.Fprintf(out, "Would pull %s runtime: %s\n", runtimeImage.Name, runtimeImage.Image)
+			continue
+		}
+		fmt.Fprintf(out, "Pulling %s runtime: %s\n", runtimeImage.Name, runtimeImage.Image)
+		if err := pull(ctx, runtimeImage.Image); err != nil {
+			return fmt.Errorf("pull %s runtime image %s: %w", runtimeImage.Name, runtimeImage.Image, err)
+		}
+	}
+
+	if !dryRun {
+		fmt.Fprintln(out, "App runtime images cached successfully.")
+	}
+	return nil
+}
+
+// preflightRuntimeImageArchitectures checks the complete trusted set before a
+// pull is attempted. A mixed compatible/incompatible catalog therefore fails
+// atomically instead of partially warming the node cache.
+func preflightRuntimeImageArchitectures(
+	images []catalog.RuntimeImage, hostArchitecture string,
+) error {
+	var unsupported []string
+	for _, runtimeImage := range images {
+		supported := false
+		for _, architecture := range runtimeImage.Architectures {
+			if architecture == hostArchitecture {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			unsupported = append(unsupported, runtimeImage.Name)
+		}
+	}
+	if len(unsupported) > 0 {
+		return fmt.Errorf(
+			"host architecture %q is unsupported by trusted app runtimes: %s",
+			hostArchitecture,
+			strings.Join(unsupported, ", "),
+		)
+	}
+	return nil
 }
 
 // runCatalogList prints all catalog services in a table with install status.

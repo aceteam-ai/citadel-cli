@@ -34,6 +34,13 @@ Use --authkey for non-interactive authentication (ideal for automation).`,
   # Override the node name
   citadel login --authkey tskey-auth-xxx --node-name my-gpu-server`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Refuse an explicit --nexus that differs from the control plane this
+		// node is already enrolled against (citadel-cli#1110).
+		if err := refuseNexusFlagMismatch(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+
 		// Non-interactive mode when authkey is provided
 		if loginAuthkey != "" {
 			runNonInteractiveLogin()
@@ -97,6 +104,10 @@ func runNonInteractiveLogin() {
 		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
 		os.Exit(1)
 	}
+
+	// Persist the control URL we enrolled against (citadel-cli#1110) so later
+	// reconnects target this control plane, not the compiled-in default.
+	persistNexusURLBestEffort(nexusURL)
 
 	ip, _ := srv.GetIPv4()
 	spinner.StopWithSuccess(fmt.Sprintf("Connected as '%s'", nodeName))
@@ -261,6 +272,10 @@ func runInteractiveLogin() {
 		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
 		os.Exit(1)
 	}
+
+	// Persist the control URL we enrolled against (citadel-cli#1110) so later
+	// reconnects target this control plane, not the compiled-in default.
+	persistNexusURLBestEffort(nexusURL)
 
 	ip, _ := srv.GetIPv4()
 	spinner.StopWithSuccess(fmt.Sprintf("Connected as '%s'", nodeName))

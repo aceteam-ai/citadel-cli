@@ -210,6 +210,12 @@ func (r *Runner) Drain() {
 	atomic.StoreInt32(&r.draining, 1)
 }
 
+// Resume reopens consumption when a planned self-reexec could not run.
+func (r *Runner) Resume() { atomic.StoreInt32(&r.draining, 0) }
+
+// NodeID is the local identity used by the runner's target filter.
+func (r *Runner) NodeID() string { return r.config.NodeID }
+
 // isDraining reports whether Drain has been called.
 func (r *Runner) isDraining() bool {
 	return atomic.LoadInt32(&r.draining) == 1
@@ -567,7 +573,7 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	if targetNode, ok := job.Payload["target_node"].(string); ok && targetNode != "" && targetNode != r.config.NodeID {
 		if r.config.NodeID == "" {
 			r.log("warning", "Declining job %s: addressed to target_node=%s but this node's Headscale ID is unresolved, "+
-				"so it cannot claim addressed work (citadel-cli#654)", job.ID, targetNode)
+				"so it cannot claim addressed work", job.ID, targetNode)
 		} else {
 			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
 		}
@@ -1012,25 +1018,48 @@ func willRetry(job *Job) bool {
 // orphan recovery, re-failing forever.
 //
 // Instead we (1) publish a structured error event immediately so the backend
-// surfaces an actionable "node <ver> doesn't support <TYPE> -- update the node"
-// message, and (2) Fail the job (failed status + ACK) so the unsupported
-// message is removed from the pending list rather than retried indefinitely.
+// surfaces an actionable message, and (2) Fail the job (failed status + ACK)
+// so the unsupported message is removed from the pending list rather than
+// retried indefinitely.
+//
+// The error text distinguishes two causes that used to collapse into one
+// misleading "(update the node)" message (aceteam#9962): a type this build
+// genuinely does not know (allKnownJobTypes) really does need an update, but
+// a type in gatedJobTypeReasons is known to the build and simply not
+// registered this run -- typically a default-DENY permission (files/desktop)
+// or a missing config directory. Telling an operator to "update the node" for
+// the second case sends them chasing a binary upgrade that fixes nothing; the
+// real fix is a permission toggle or provisioning step named in the message.
 func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime time.Time) {
 	agentVersion := r.agentVersion
 	if agentVersion == "" {
 		agentVersion = "unknown"
 	}
-	err := fmt.Errorf(
-		"unsupported job type %q: node %s has no handler for it (update the node)",
-		job.Type, agentVersion,
-	)
+
+	var err error
+	gateReason, gated := gatedJobTypeReasons[job.Type]
+	if gated {
+		err = fmt.Errorf(
+			"job type %q is supported by this node's build but not currently registered: %s",
+			job.Type, gateReason,
+		)
+	} else {
+		err = fmt.Errorf(
+			"unsupported job type %q: node %s has no handler for it (update the node)",
+			job.Type, agentVersion,
+		)
+	}
 	r.log("error", "Unsupported job type: %v", err)
 
 	data := map[string]any{
 		"unsupported_job_type": true,
 		"job_type":             job.Type,
 		"agent_version":        agentVersion,
-		"supported_types":      r.supportedJobTypes(),
+		"supported_types":      r.SupportedJobTypes(),
+	}
+	if gated {
+		data["known_to_build"] = true
+		data["unregistered_reason"] = gateReason
 	}
 
 	r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
@@ -1054,10 +1083,10 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 	}
 }
 
-// supportedJobTypes returns the sorted set of job types this node's registered
-// handlers can process. It is included in the unsupported-type failure so the
-// backend (and operators) can see exactly what the node build supports.
-func (r *Runner) supportedJobTypes() []string {
+// SupportedJobTypes returns the sorted set of job types this node's registered
+// handlers can process. It is the canonical live capability set used by both
+// unsupported-type failures and heartbeat advertisement.
+func (r *Runner) SupportedJobTypes() []string {
 	seen := make(map[string]struct{})
 	for _, jt := range allKnownJobTypes {
 		for _, h := range r.handlers {

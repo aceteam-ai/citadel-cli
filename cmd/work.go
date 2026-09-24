@@ -716,7 +716,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	// (Store.ReconcileScan's staleness cleanup); running it from a second
 	// concurrent process could delete entries a sibling process just wrote.
 	if workerLockHeld {
-		scanOpts := cacheindex.ScanOptions{LegacyHFHubDir: jobs.LegacyHFHubDirForScan()}
+		rt := catalog.SelectContainerRuntime()
+		scanOpts := cacheindex.ScanOptions{
+			LegacyHFHubDir:      jobs.LegacyHFHubDirForScan(),
+			RuntimeStorageRoots: cacheindex.RuntimeStorageRoots(rt.EngineBin),
+		}
 		if err := jobs.CacheIndexStore().ReconcileScan(cacheindex.DefaultCacheRoot(), scanOpts); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: cache index backfill scan: %v\n", err)
 		}
@@ -1496,6 +1500,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		return laneActivityFrom(rn.LaneSnapshots())
 	}
 
+	jobTypesFn := func() []string {
+		rn := nodeRunner.Load()
+		if rn == nil {
+			return nil
+		}
+		return rn.SupportedJobTypes()
+	}
 	// Pairing-display capability probe for the heartbeat (citadel-cli#659
 	// P0): can this node render a platform-pushed node:exec pairing code
 	// right now? Independent of the pairingdisplay.Manager singleton's
@@ -1555,6 +1566,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			LaneActivity:    laneActivityFn,
 			PairingDisplay:  pairingDisplayFn,
 			CacheReport:     cacheReportFn,
+			JobTypes:        jobTypesFn,
 		})
 	}
 
@@ -1715,7 +1727,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					serverCfg.ControlServerCert = &ctrlCert
 					serverCfg.ControlPort = controlPort
 					controlPortForVPN = controlPort
-					fmt.Printf("   - Coordinator mTLS control listener enabled on :%d for mutating endpoints (#5028)\n", controlPort)
+					fmt.Printf("   - Coordinator mTLS control listener enabled on :%d for mutating endpoints\n", controlPort)
 				}
 			}
 		}
@@ -1851,6 +1863,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "   - ⚠️ SSH sync enabled but no API key configured")
 	}
 
+	// Construct the status publisher now, but start it only after the runner has
+	// every handler registered below. Start publishes immediately, so starting
+	// here used to emit a capabilities-less initial heartbeat.
+	var startStatusPublisher func()
 	// Start status publisher if enabled
 	if workRedisStatus {
 		// Create collector if not already created
@@ -1869,6 +1885,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				LaneActivity:    laneActivityFn,
 				PairingDisplay:  pairingDisplayFn,
 				CacheReport:     cacheReportFn,
+				JobTypes:        jobTypesFn,
 			})
 		}
 
@@ -1938,7 +1955,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				// to the control plane (#353, report-only v1). Headless `citadel
 				// work` is the production node entrypoint, so it must report too
 				// — not just the TUI. Same device-authed client and opt-out gate
-				// as activity telemetry; node_id is the Headscale hostname. The
+				// as activity telemetry; node_id is the canonical Headscale ID. The
 				// bridge row is exempt from that opt-out gate — see
 				// nodestate.Emitter.reportOnce's doc comment.
 				if emitter := nodestate.New(nodestate.Config{
@@ -1946,7 +1963,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					Inspector:       nodestate.DockerInspector(),
 					BridgeEndpoints: bridgeEndpoints,
 					ConfigDir:       platform.ConfigDir(),
-					NodeID:          nodeName,
+					NodeID:          headscaleNodeID,
 					Version:         Version,
 				}); emitter != nil {
 					go emitter.Run(ctx)
@@ -2058,12 +2075,14 @@ func runWork(cmd *cobra.Command, args []string) {
 					if pulseStats != nil {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
-					go func() {
-						fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
-						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
-							fmt.Fprintf(os.Stderr, "   - ⚠️ API status publisher error: %v\n", err)
-						}
-					}()
+					startStatusPublisher = func() {
+						go func() {
+							fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
+							if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
+								fmt.Fprintf(os.Stderr, "   - ⚠️ API status publisher error: %v\n", err)
+							}
+						}()
+					}
 				}
 			}
 		} else if workRedisURL != "" {
@@ -2108,15 +2127,17 @@ func runWork(cmd *cobra.Command, args []string) {
 				if pulseStats != nil {
 					redisPublisher.SetStatsProvider(pulseStats.Latest)
 				}
-				go func() {
-					fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
-					if deviceCode != "" {
-						fmt.Printf("   - Device code: %s (for config lookup)\n", deviceCode[:8]+"...")
-					}
-					if err := redisPublisher.Start(ctx); err != nil && err != context.Canceled {
-						fmt.Fprintf(os.Stderr, "   - ⚠️ Redis status publisher error: %v\n", err)
-					}
-				}()
+				startStatusPublisher = func() {
+					go func() {
+						fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
+						if deviceCode != "" {
+							fmt.Printf("   - Device code: %s (for config lookup)\n", deviceCode[:8]+"...")
+						}
+						if err := redisPublisher.Start(ctx); err != nil && err != context.Canceled {
+							fmt.Fprintf(os.Stderr, "   - ⚠️ Redis status publisher error: %v\n", err)
+						}
+					}()
+				}
 			}
 
 			// Start config queue consumer for device configuration jobs
@@ -2544,7 +2565,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 		fmt.Printf("     /workflow/...             -> %s (workflow API)\n", statusAddr)
 		fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
-		fmt.Printf("     /v1/chat/completions     -> local engine by model (#581)\n")
+		fmt.Printf("     /v1/chat/completions     -> local engine by model\n")
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 		for _, e := range provisionedEntries {
@@ -2592,6 +2613,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// only worker on the node.
 	workPerms := workAppliedPermissions
 	nodeJobOpts := nodeJobHandlerOpts{
+		OrgID:                     nodeJobOrgID(),
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
 		PermissionsDir:            nodePermissionsDir(),
@@ -2601,10 +2623,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		ShellHasPasscode:          nodeHasPasscode,
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !workPerms.Desktop,
+		DesktopEnabled:            nodeDesktopEnabled,
 		FilesDisabled:             !workPerms.Files,
+		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              wfExec,
 		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
 		PinnedServices:            manifestPinnedServices(workManifest),
+		InstanceEnabled:           instanceProvisioningEnabled(workConfigDir),
 	}
 	handlers, swapMgr := buildNodeJobHandlers(nodeJobOpts)
 	// Published via atomic.Store, not a plain assignment: status-publisher
@@ -2661,7 +2686,6 @@ func runWork(cmd *cobra.Command, args []string) {
 	// already-started status-publisher goroutines) can read its lane activity.
 	// Atomic Store paired with the atomic Load in that closure — see the
 	// nodeRunner declaration above for why a plain var would race (citadel-cli#908).
-	nodeRunner.Store(runner)
 
 	// Add stream writer factory if available
 	if streamFactory != nil {
@@ -2675,6 +2699,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Shared with the control-center TUI via registerPrivilegedNodeJobHandlers so a
 	// control-center-only node handles the same privileged set.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	// Publish only after every handler is registered so heartbeats expose one
+	// complete immutable set, never a partial capability advertisement.
+	startStatusPublisherAfterRunner(&nodeRunner, runner, startStatusPublisher)
 
 	// Start the periodic auto-updater. The goroutine always runs; whether it
 	// actually checks/installs on a given tick is decided per-tick by
@@ -2714,6 +2741,16 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	}
+}
+
+// startStatusPublisherAfterRunner establishes the startup ordering contract:
+// the publisher's synchronous initial heartbeat can only run after the runner
+// (and therefore its complete dispatchable job-type set) is visible.
+func startStatusPublisherAfterRunner(nodeRunner *atomic.Pointer[worker.Runner], runner *worker.Runner, start func()) {
+	nodeRunner.Store(runner)
+	if start != nil {
+		start()
 	}
 }
 
@@ -3658,6 +3695,14 @@ type DeviceConfig struct {
 	// today -- see docs/design-node-identity-receipts.md §2 and
 	// cmd/whoami.go's NodeIdentity.PlatformNodeID, which reads this field.
 	FabricNodeID string `yaml:"fabric_node_id"`
+	// NexusURL is the nexus/control URL this node enrolled against
+	// (citadel-cli#1110). Written by saveNexusURLToConfig at every enroll site;
+	// read-side convenience here. The reconnect paths deliberately resolve it
+	// via network.ResolveControlURL (which reads the same config.yaml directly),
+	// NOT via this field, so an authkey-only node whose config has no device
+	// token (getDeviceConfigFromFile returns nil) still reconnects to the right
+	// control plane.
+	NexusURL string `yaml:"nexus_url"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from the
