@@ -1,9 +1,6 @@
 package cmd
 
 import (
-	"os"
-	"path/filepath"
-
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
@@ -28,15 +25,6 @@ func withLocalServiceMutationLock(configDir string, mutate func() error) error {
 // Resolve the node dir without creating a bootstrap manifest. A fresh run/add
 // must acquire reservation.lock before findOrCreateManifest writes anything.
 func localServiceConfigDir() (string, error) {
-	if _, dir, err := findAndReadManifest(); err == nil {
-		return dir, nil
-	}
-	if override := resolveNodeDirOverride(); override != "" {
-		return override, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, "citadel-node"), nil
+	dir, _, err := resolveNodeConfigDirReadOnly()
+	return dir, err
 }
