@@ -1,0 +1,45 @@
+name: Citadel desktop macOS
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-macos.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build macOS app
+    runs-on: [self-hosted, macOS, ios-builder]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend packages
+        working-directory: desktop
+        run: npm ci
+      - name: Build frontend
+        working-directory: desktop
+        run: npm run build
+      - name: Stage Go helper
+        working-directory: desktop
+        run: ./scripts/stage-sidecar.sh
+      - name: Rust tests
+        working-directory: desktop/src-tauri
+        run: cargo test --locked
+      - name: Build unsigned app bundle
+        working-directory: desktop
+        run: npm run tauri -- build --bundles app
