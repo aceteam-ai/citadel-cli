@@ -229,8 +229,8 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 func warnIdentityChurn(hostname string) {
 	Log("IDENTITY CHURN: reusing persisted identity failed; re-registering '%s' as a NEW node "+
 		"(new fabric id + new mesh IP + new device key). Likely cause: ephemeral Headscale "+
-		"registration removed the node while offline. Durable fix: non-ephemeral registration "+
-		"(aceteam #4583 / backend #4584). One-time migration: re-run 'citadel init' so this node "+
+		"registration removed the node while offline. Durable fix: non-ephemeral registration. "+
+		"One-time migration: re-run 'citadel init' so this node "+
 		"re-registers with a persistent key.", hostname)
 	fmt.Fprintln(os.Stderr, "   - WARNING: node identity is being reset (new node id, new IP, new device key).")
 	fmt.Fprintln(os.Stderr, "     Cause: the persisted identity could not be re-authorized (likely an ephemeral")

@@ -301,7 +301,7 @@ func renderIdentity(w io.Writer, id NodeIdentity) {
 	if id.PlatformNodeID != "" {
 		fmt.Fprintf(w, "  %s %s\n", labelColor.Sprint("AceTeam platform node ID:"), id.PlatformNodeID)
 	} else {
-		fmt.Fprintf(w, "  %s %s\n", labelColor.Sprint("AceTeam platform node ID:"), faintColor.Sprint("not available locally (not yet echoed by the backend, see aceteam #8139)"))
+		fmt.Fprintf(w, "  %s %s\n", labelColor.Sprint("AceTeam platform node ID:"), faintColor.Sprint("not available locally (not yet echoed by the backend)"))
 	}
 	connStr := badColor.Sprint("offline")
 	if id.Connected {
@@ -376,8 +376,7 @@ script can read a node's identity with a single file read instead of
 re-deriving it every time.
 
 Note: there is currently no numeric AceTeam fabric/platform node ID available
-locally -- only the mesh (Headscale) node ID can be resolved from this host.
-See aceteam #8139.`,
+locally -- only the mesh (Headscale) node ID can be resolved from this host.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		id := gatherIdentity(cmd.Context())
 

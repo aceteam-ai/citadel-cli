@@ -108,13 +108,13 @@ var sources = map[string]Source{
 		URL:    "",
 		SHA256: "",
 		Format: formatTarGz,
-		Note:   "org-built static tmux (libevent+ncurses) for linux/amd64 not yet published; gated until a CI artifact + verified SHA-256 exists (see #304)",
+		Note:   "org-built static tmux (libevent+ncurses) for linux/amd64 not yet published; gated until a CI artifact + verified SHA-256 exists",
 	},
 	platformKey("linux", "arm64"): {
 		URL:    "",
 		SHA256: "",
 		Format: formatTarGz,
-		Note:   "org-built static tmux for linux/arm64 not yet published; gated until a CI artifact + verified SHA-256 exists (see #304)",
+		Note:   "org-built static tmux for linux/arm64 not yet published; gated until a CI artifact + verified SHA-256 exists",
 	},
 	platformKey("darwin", "amd64"): {
 		URL:    "",

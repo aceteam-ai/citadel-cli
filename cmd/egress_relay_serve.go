@@ -37,8 +37,7 @@ var egressRelayServeCmd = &cobra.Command{
 starts the same SOCKS5 egress-relay listener 'citadel work --egress-relay'
 starts, and stays up until Ctrl-C -- with NO Redis job source and NO worker
 loop. This is for a headless node behind a restrictive firewall that should be
-an egress exit for other same-org nodes without also being a full job worker
-(citadel #1033).
+an egress exit for other same-org nodes without also being a full job worker.
 
 Unlike the 'citadel work' auto-start path, this command force-enables the relay
 (running it IS the intent), so it does NOT consult the 'egress-relay enable'

@@ -1113,7 +1113,7 @@ func warnIfLegacyHFCacheExists(ctx JobContext, jobID string) {
 		return
 	}
 	dir := filepath.Dir(legacyHub)
-	ctx.Log("info", "     - [Job %s] found a pre-existing HuggingFace cache at %s (predates citadel #682's fix) — "+
+	ctx.Log("info", "     - [Job %s] found a pre-existing HuggingFace cache at %s — "+
 		"this pull writes to %s instead; the old directory is not touched and can be removed manually to reclaim space",
 		jobID, dir, hfCacheBaseDir())
 }

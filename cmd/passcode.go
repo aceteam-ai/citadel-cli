@@ -24,7 +24,7 @@ import (
 var passcodeCmd = &cobra.Command{
 	Use:   "passcode",
 	Short: "Manage the node passcode that gates Console/Desktop/Files/Shell access",
-	Long: `The node passcode (aceteam#6524) gates the sensitive remote-access surfaces
+	Long: `The node passcode gates the sensitive remote-access surfaces
 (Console/terminal, Desktop/VNC/screen, Files, and Shell/SHELL_COMMAND) once an
 operator has enabled them. Enabling a surface is not enough by itself: without
 a passcode set, that surface fails closed (access denied) even though it is
@@ -38,7 +38,7 @@ var passcodeSetCmd = &cobra.Command{
 	Use:   "set",
 	Short: "Set or change the node passcode",
 	Long: `Sets the per-node passcode that gates Console/Desktop/Files/Shell remote
-access (aceteam#6524). This is what a client (e.g. 'citadel connect') must present,
+access. This is what a client (e.g. 'citadel connect') must present,
 in addition to a valid token or verified mesh-peer identity, before an
 enabled sensitive surface will actually respond.
 

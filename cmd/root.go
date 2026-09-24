@@ -110,7 +110,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 		if recovered, err := update.RecoverInterruptedSwap(); err != nil {
 			Debug("interrupted update recovery check failed: %v", err)
 		} else if recovered {
-			Log("recovered from an interrupted update (citadel#926)")
+			Log("recovered from an interrupted update")
 		}
 
 		// --runtime overrides container-runtime auto-detection (#636). Export it

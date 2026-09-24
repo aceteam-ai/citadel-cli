@@ -124,7 +124,7 @@ func (r *InferenceQueueReconciler) Reconcile(ctx context.Context) {
 			return // leave subscribed=false so the next tick retries everything
 		}
 		if r.Log != nil {
-			r.Log("inference-queue reconcile: engine now serving; subscribed to %s (issue #612)", q)
+			r.Log("inference-queue reconcile: engine now serving; subscribed to %s", q)
 		}
 	}
 

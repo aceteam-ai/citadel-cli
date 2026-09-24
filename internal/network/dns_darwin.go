@@ -60,7 +60,7 @@ func (c *splitDNSConfigurator) SetDNS(cfg dns.OSConfig) error {
 	if len(cfg.MatchDomains) == 0 && len(cfg.Nameservers) > 0 {
 		if matches := c.tailnetSearchDomains(cfg); len(matches) > 0 {
 			logf("dns: macOS global-resolver config has no MatchDomains; "+
-				"scoping to tailnet domains %v so /etc/resolver can express it (#676)", matches)
+				"scoping to tailnet domains %v so /etc/resolver can express it", matches)
 			cfg.MatchDomains = matches
 		} else {
 			// Leave cfg untouched rather than guessing. Behaviour is then

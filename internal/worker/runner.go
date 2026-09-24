@@ -573,7 +573,7 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	if targetNode, ok := job.Payload["target_node"].(string); ok && targetNode != "" && targetNode != r.config.NodeID {
 		if r.config.NodeID == "" {
 			r.log("warning", "Declining job %s: addressed to target_node=%s but this node's Headscale ID is unresolved, "+
-				"so it cannot claim addressed work (citadel-cli#654)", job.ID, targetNode)
+				"so it cannot claim addressed work", job.ID, targetNode)
 		} else {
 			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
 		}
