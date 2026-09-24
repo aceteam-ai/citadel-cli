@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 )
 
@@ -63,7 +64,8 @@ type ModuleSetConfig struct {
 	// The live adapter is wired in cmd (it needs cmd-level catalog/manifest edges
 	// the worker package cannot import); a nil Ops makes Execute fail with a clear
 	// error rather than panic.
-	Ops reconcile.ModuleOps
+	Ops      reconcile.ModuleOps
+	External *ExternalModuleConfig
 
 	// Log reports progress. Nil is a no-op.
 	Log func(format string, args ...any)
@@ -91,6 +93,9 @@ func (h *ModuleSetHandler) CanHandle(jobType string) bool {
 // reconcile engine. See the package doc for the privilege gate and the
 // single-module-scoped-actual trick.
 func (h *ModuleSetHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	if status, _ := job.Payload["desired_status"].(string); status == "adopt_external" || status == "detach_external" {
+		return h.executeExternal(ctx, job), nil
+	}
 	// Privilege gate: MODULE_SET must arrive on the per-node stream, not the
 	// shared org pool -- installing/uninstalling a compose stack on the user's
 	// node is privileged and node-targeted. Fail closed.
@@ -118,6 +123,19 @@ func (h *ModuleSetHandler) Execute(ctx context.Context, job *Job, stream StreamW
 	case "", string(reconcile.StatusRunning), string(reconcile.StatusStopped), statusAbsent:
 	default:
 		return h.failure(fmt.Errorf("MODULE_SET: unknown desired_status %q (want running|stopped|absent)", m.DesiredStatus)), nil
+	}
+	if h.cfg.External != nil && (m.Source == "vllm" || m.Key() == "vllm") {
+		// Serialize the ownership check through the managed reconciliation so an
+		// adopt cannot race between this read and the managed side effects.
+		h.cfg.External.mu.Lock()
+		defer h.cfg.External.mu.Unlock()
+		external, err := externalengine.LoadPersisted(h.cfg.External.Dir)
+		if err != nil {
+			return h.failure(fmt.Errorf("MODULE_SET: inspect external vllm ownership: %w", err)), nil
+		}
+		if external != nil {
+			return h.failure(fmt.Errorf("MODULE_SET: external vllm ownership record exists; managed action refused")), nil
+		}
 	}
 
 	h.cfg.Log("MODULE_SET: source=%q desired_status=%q", m.Source, statusRaw)

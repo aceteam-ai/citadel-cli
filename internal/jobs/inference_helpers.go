@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -22,7 +23,7 @@ import (
 // (citadel-cli#1076), so this honors a per-node host-port override. Used by
 // meeting_summary.go.
 func vllmBaseURL() string {
-	return fmt.Sprintf("http://localhost:%d", services.VLLMHostPort)
+	return externalengine.VLLMBaseURL()
 }
 
 // bonsaiBaseURL returns the host-local base URL for the bonsai engine using the

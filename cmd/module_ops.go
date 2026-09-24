@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
@@ -117,6 +118,11 @@ func newLiveModuleOps(log func(format string, args ...any)) *liveModuleOps {
 // stopped). An already-installed module is updated in place via uninstall-then-
 // install so its host ports free and its compose is replaced cleanly.
 func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignment) error {
+	if m.Source == "vllm" || m.Key() == "vllm" {
+		if err := refuseManagedVLLMWhileExternal("vllm", network.GetNodeConfigDir()); err != nil {
+			return err
+		}
+	}
 	src, err := catalog.ParseSource(m.Source)
 	if err != nil {
 		return fmt.Errorf("parse source %q: %w", m.Source, err)

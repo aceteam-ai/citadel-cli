@@ -17,6 +17,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
@@ -401,6 +402,15 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		}
 
 	case "docker":
+		if svc.Name == "vllm" {
+			external, loadErr := externalengine.LoadPersisted(h.ConfigDir)
+			if loadErr != nil {
+				return nil, fmt.Errorf("cannot inspect external vllm ownership: %w", loadErr)
+			}
+			if external != nil {
+				return nil, fmt.Errorf("cannot start managed vllm: external %s ownership record exists", external.Mode)
+			}
+		}
 		// Adopt an already-running EXTERNAL OpenAI-compat engine instead of
 		// launching a competing container (aceteam-ai/citadel-cli#1081/#1084,
 		// RM-01). Checked FIRST, before persisting a model or touching compose:

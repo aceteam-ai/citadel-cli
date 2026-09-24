@@ -2,9 +2,53 @@ package cmd
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 )
+
+func TestRefuseManagedVLLMWhileExternal(t *testing.T) {
+	if err := refuseManagedVLLMWhileExternal("ollama", t.TempDir()); err != nil {
+		t.Fatalf("non-vllm: %v", err)
+	}
+	if err := refuseManagedVLLMWhileExternal("vllm", t.TempDir()); err != nil {
+		t.Fatalf("no record: %v", err)
+	}
+	for _, mode := range []string{"adopted", "detached"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			c, err := externalengine.Validate(externalengine.Config{Version: 1, Mode: mode, Endpoint: externalengine.Endpoint{Host: "127.0.0.1", Port: 58000}, Model: "vendor/model", Revision: "1", RequestID: "00000000-0000-4000-8000-000000000001", NodeID: "12"}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := externalengine.Save(dir, c); err != nil {
+				t.Fatal(err)
+			}
+			if err := refuseManagedVLLMWhileExternal("vllm", dir); err == nil || !strings.Contains(err.Error(), mode) {
+				t.Fatalf("refusal = %v", err)
+			}
+		})
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(externalengine.Path(dir), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := refuseManagedVLLMWhileExternal("vllm", dir); err == nil {
+		t.Fatal("corrupt ownership record did not fail closed")
+	}
+}
+
+func TestRefuseManagedVLLMStartSkipsMachineRecordForIsolatedNodeDir(t *testing.T) {
+	t.Setenv("CITADEL_NODE_DIR", t.TempDir())
+	if composeProjectOverride() == "" {
+		t.Fatal("test did not activate isolated node-dir semantics")
+	}
+	if err := refuseManagedVLLMStart("vllm"); err != nil {
+		t.Fatalf("isolated target consulted machine-global ownership: %v", err)
+	}
+}
 
 // TestMaybeAdoptExternalEngineOnStart pins the aceteam-ai/citadel-cli#1081
 // boot-time / `citadel run` adoption decision (startService's skip-launch gate),

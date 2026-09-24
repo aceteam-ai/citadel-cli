@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
@@ -274,6 +276,34 @@ func TestServiceStart_AdoptShortCircuitsBeforeLaunch(t *testing.T) {
 	if !res.Running || !strings.Contains(res.Message, "adopted external vllm") {
 		t.Fatalf("expected an adopted result, got %+v", res)
 	}
+}
+
+func TestServiceStartRefusesManagedVLLMUnderPersistedOwnership(t *testing.T) {
+	svc := manifestService{Name: "vllm", Type: "docker"}
+	for _, mode := range []string{"adopted", "detached"} {
+		t.Run(mode, func(t *testing.T) {
+			h := NewServiceHandler(t.TempDir())
+			c, err := externalengine.Validate(externalengine.Config{Version: 1, Mode: mode, Endpoint: externalengine.Endpoint{Host: "127.0.0.1", Port: 58000}, Model: "vendor/model", Revision: "1", RequestID: "00000000-0000-4000-8000-000000000001", NodeID: "12"}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := externalengine.Save(h.ConfigDir, c); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.serviceStart(testCtx(), svc, "", 0, 0, trustRemoteCodeUnspecified); err == nil || !strings.Contains(err.Error(), mode) {
+				t.Fatalf("refusal = %v", err)
+			}
+		})
+	}
+	t.Run("corrupt record fails closed", func(t *testing.T) {
+		h := NewServiceHandler(t.TempDir())
+		if err := os.WriteFile(externalengine.Path(h.ConfigDir), []byte("{"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.serviceStart(testCtx(), svc, "", 0, 0, trustRemoteCodeUnspecified); err == nil {
+			t.Fatal("corrupt ownership record did not fail closed")
+		}
+	})
 }
 
 // TestServiceStart_NoAdoptFallsThroughToLaunch is the negative wiring: with the
