@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 )
 
 type fineTuneControlFake struct {
@@ -210,6 +212,58 @@ func TestFineTuneCancelKeyKillsRunAndRestores(t *testing.T) {
 	}
 	if reservation.release != 1 {
 		t.Fatalf("restore=%d", reservation.release)
+	}
+}
+
+func TestFineTuneRemovalFailureKeepsReservationAndNeverReportsCancelled(t *testing.T) {
+	cfg, job, control, reservation := fineTuneFixture(t)
+	engine := filepath.Join(t.TempDir(), "fake-engine")
+	script := "#!/bin/sh\ncase \"$1\" in\nrun) exec sleep 30 ;;\nrm) exit 42 ;;\nps) printf 'citadel-finetune-job-1\\n' ;;\nesac\n"
+	if err := os.WriteFile(engine, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Run = func(ctx context.Context, spec FineTuneSpec, progress func(map[string]any) error) error {
+		cancelledCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+		defer cancel()
+		return runFineTuneContainerWithRuntime(cancelledCtx, spec, "fake-image", cfg.CacheDir,
+			catalog.ContainerRuntime{EngineBin: engine}, progress)
+	}
+	// Mark the job cancelled when the fake child returns. The pre-start check
+	// must first be allowed through so the removal path is actually exercised.
+	originalRun := cfg.Run
+	cfg.Run = func(ctx context.Context, spec FineTuneSpec, progress func(map[string]any) error) error {
+		err := originalRun(ctx, spec, progress)
+		control.mu.Lock()
+		control.cancelled = true
+		control.mu.Unlock()
+		return err
+	}
+	stream := &MockStreamWriter{}
+	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, stream)
+	if res.Status != JobStatusTerminalFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "termination unconfirmed") {
+		t.Fatalf("result=%+v", res)
+	}
+	if reservation.release != 0 || stream.cancelled {
+		t.Fatalf("unsafe restore=%d cancelled=%v", reservation.release, stream.cancelled)
+	}
+}
+
+func TestFineTuneRestoreFailureUnderUserCancelIsReported(t *testing.T) {
+	cfg, job, control, reservation := fineTuneFixture(t)
+	reservation.releaseErr = errors.New("restore failed")
+	cfg.Run = func(context.Context, FineTuneSpec, func(map[string]any) error) error {
+		control.mu.Lock()
+		control.cancelled = true
+		control.mu.Unlock()
+		return context.Canceled
+	}
+	stream := &MockStreamWriter{}
+	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, stream)
+	if res.Status != JobStatusTerminalFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "restore failed") {
+		t.Fatalf("result=%+v", res)
+	}
+	if reservation.release != 1 || stream.cancelled {
+		t.Fatalf("restore attempts=%d cancelled=%v", reservation.release, stream.cancelled)
 	}
 }
 
