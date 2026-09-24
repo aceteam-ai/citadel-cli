@@ -3,25 +3,37 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update -y
-apt-get install -y --no-install-recommends podman podman-compose uidmap fuse-overlayfs crun slirp4netns dbus-user-session
-if apt-cache show passt >/dev/null 2>&1; then
-    apt-get install -y --no-install-recommends passt
-fi
+worker_marker_dir_safe() {
+    local dir="$1" owner="$2" mode
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    [ "$(stat -c %u "$dir")" = "$owner" ] || return 1
+    mode=$(stat -c %a "$dir") || return 1
+    [ "$((8#$mode & 8#22))" -eq 0 ]
+}
+worker_marker_safe() {
+    local marker="$1" uid="$2" owner="$3"
+    worker_marker_dir_safe "$(dirname "$marker")" "$owner" || return 1
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    [ "$(stat -c %u "$marker")" = "$owner" ] &&
+        [ "$(stat -c %a "$marker")" = 600 ] &&
+        [ "$(<"$marker")" = "$uid" ]
+}
+# End independently testable marker-boundary functions.
 if id citadel >/dev/null 2>&1; then
-    marker=/etc/citadel/rootless-worker-user
-    [ -f "$marker" ] && [ ! -L "$marker" ] &&
-        [ "$(stat -c %u "$marker")" = 0 ] && [ "$(stat -c %a "$marker")" = 600 ] &&
-        [ "$(<"$marker")" = "$(id -u citadel)" ] || {
+    worker_marker_safe /etc/citadel/rootless-worker-user "$(id -u citadel)" 0 || {
             echo 'ERROR: Refusing pre-existing citadel account without trusted provenance' >&2; exit 1;
         }
 else
+    if [ -e /etc/citadel ] || [ -L /etc/citadel ]; then
+        worker_marker_dir_safe /etc/citadel 0 || { echo 'ERROR: Worker marker directory is unsafe' >&2; exit 1; }
+    else
+        install -d -m 755 /etc/citadel
+    fi
     useradd --create-home --shell /bin/bash citadel
-    install -d -m 755 /etc/citadel
-    [ -d /etc/citadel ] && [ ! -L /etc/citadel ] && [ "$(stat -c %u /etc/citadel)" = 0 ] || {
+    worker_marker_dir_safe /etc/citadel 0 || {
         echo 'ERROR: Worker marker directory is unsafe' >&2; exit 1;
     }
-    ( set -C; id -u citadel > /etc/citadel/rootless-worker-user )
+    ( umask 077; set -C; id -u citadel > /etc/citadel/rootless-worker-user )
     chmod 600 /etc/citadel/rootless-worker-user
 fi
 test "$(getent passwd citadel | cut -d: -f6)" = /home/citadel
@@ -37,6 +49,11 @@ if command -v sudo >/dev/null 2>&1; then
         *"not allowed to run sudo"*|*"may not run sudo"*) ;;
         *) echo 'ERROR: Cannot prove citadel account has no sudo grants' >&2; exit 1 ;;
     esac
+fi
+apt-get update -y
+apt-get install -y --no-install-recommends podman podman-compose uidmap fuse-overlayfs crun slirp4netns dbus-user-session
+if apt-cache show passt >/dev/null 2>&1; then
+    apt-get install -y --no-install-recommends passt
 fi
 ensure_subid() {
     local file="$1" type="$2" start
@@ -115,7 +132,6 @@ KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
 KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
 RULE
 udevadm control --reload-rules
-fi
 install -d -m 755 /usr/local/libexec /etc/cdi
 cat > /usr/local/libexec/citadel-nvidia-cdi-refresh <<'SCRIPT'
 #!/bin/sh
@@ -154,6 +170,7 @@ WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 systemctl enable citadel-nvidia-cdi.service
+fi
 fi
 podman --version
 apt-get clean
