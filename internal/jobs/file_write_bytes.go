@@ -17,6 +17,10 @@ import (
 // the FILE_READ_BYTES read cap. Used when the payload omits 'max_bytes'.
 const defaultMaxWriteBytes int64 = 50 * 1024 * 1024
 
+// ErrFilesDisabled is a terminal permission refusal. An operator can enable
+// Files and submit a new upload; automatic replay must not retry a refused job.
+var ErrFilesDisabled = errors.New(`{"reason":"files_disabled","message":"Node Files permission required for binary file writes. Enable Files in the AceTeam control center or use citadel_set_files_permission with enabled=true and confirm=true, then retry the upload. If the worker still reports Files disabled, restart it."}`)
+
 // FileWriteBytesHandler handles FILE_WRITE_BYTES jobs.
 //
 // Unlike FILE_WRITE (which writes the payload string verbatim and is therefore
@@ -52,7 +56,7 @@ func NewFileWriteBytesHandler(workspace string) *FileWriteBytesHandler {
 //   - bytes_written: decoded byte length actually written.
 func (h *FileWriteBytesHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	if (h.Enabled != nil && !h.Enabled()) || (h.Enabled == nil && h.Disabled) {
-		return nil, errors.New(`{"reason":"files_disabled","message":"Node Files permission required for binary file writes. Enable Files in the AceTeam control center or use citadel_set_files_permission with enabled=true and confirm=true, then restart the Citadel worker. If Files is already enabled, restart the worker to apply it."}`)
+		return nil, ErrFilesDisabled
 	}
 
 	path, ok := job.Payload["path"]

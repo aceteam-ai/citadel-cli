@@ -559,6 +559,14 @@ whenever it believes a retry is coming), a truly-failed or
 transient-fail-then-abandoned job in direct-Redis mode produced ZERO
 terminal stream events, permanently.
 
+A disabled Files permission is different from a transient handler failure.
+`jobs.ErrFilesDisabled` survives the legacy handler adapter;
+`Runner.executeJob` publishes it immediately and calls `source.Fail` (failed
+status plus ACK), even when the delivery metadata permits another attempt.
+`TestRunnerFilesDisabledPublishesTerminalErrorWithoutRetry` pins this boundary.
+The handler checks the live Files policy, but a refused job is terminal. After
+enabling Files, the caller submits a new upload.
+
 `Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
 a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before
 the normal blocking read. A successful claim increments the Redis-native
