@@ -18,7 +18,6 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app"],
     "externalBin": ["binaries/citadel"]
   },
   "plugins": {

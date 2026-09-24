@@ -12,7 +12,7 @@ Install the Go toolchain from `go.mod`, Rust, Node, Xcode command line tools, an
 cd desktop
 npm ci
 ./scripts/stage-sidecar.sh
-npm run tauri build
+npm run tauri -- build --bundles app --no-sign
 ```
 
 The stage script builds the Go helper into `src-tauri/binaries/citadel-<target-triple>` as required by Tauri's `externalBin`. The artifact stays ignored by Git. For Intel macOS, pass `x86_64-apple-darwin` to the script and to `tauri build -- --target`.
