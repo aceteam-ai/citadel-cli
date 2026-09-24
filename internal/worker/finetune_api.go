@@ -30,11 +30,24 @@ func (c *apiFineTuneControl) Cancelled(ctx context.Context, jobID string) (bool,
 }
 
 func (c *apiFineTuneControl) Update(ctx context.Context, jobID string, fields map[string]any) error {
+	return c.update(ctx, jobID, fields, false)
+}
+
+func (c *apiFineTuneControl) FailCritical(ctx context.Context, jobID string, fields map[string]any) error {
+	return c.update(ctx, jobID, fields, true)
+}
+
+func (c *apiFineTuneControl) update(ctx context.Context, jobID string, fields map[string]any, critical bool) error {
 	client, err := c.client()
 	if err != nil {
 		return err
 	}
-	if err = client.FineTuneUpdate(ctx, jobID, fields); err == nil {
+	if critical {
+		err = client.FineTuneFailCritical(ctx, jobID, fields)
+	} else {
+		err = client.FineTuneUpdate(ctx, jobID, fields)
+	}
+	if err == nil {
 		return nil
 	}
 	// A lost HTTP response is ambiguous: the backend may already have applied
@@ -68,6 +81,15 @@ func fineTuneStateConfirms(state redisapi.FineTuneState, fields map[string]any) 
 		n, ok := fineTuneNumber(value)
 		if !ok || state.CurrentLoss == nil || *state.CurrentLoss != n {
 			return false
+		}
+	}
+	for key, actual := range map[string]*string{
+		"error": state.Error, "finished_at": state.FinishedAt, "adapter_path": state.AdapterPath,
+	} {
+		if value, ok := fields[key]; ok {
+			if actual == nil || *actual != value {
+				return false
+			}
 		}
 	}
 	return len(fields) > 0

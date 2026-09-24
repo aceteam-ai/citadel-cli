@@ -84,3 +84,45 @@ func TestAPIFineTuneControlFailsClosedWhenScopedEndpointMissing(t *testing.T) {
 		t.Fatalf("expected scoped 404, got %v", err)
 	}
 }
+
+func TestAPIFineTuneCriticalFailureRequiresMatchingAmbiguousReadback(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	actualError := "container termination unconfirmed"
+	finishedAt := "2026-09-24T19:30:00Z"
+	state := redisapi.FineTuneState{Status: "cancelling", Cancelled: true}
+	commit := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(state)
+		case http.MethodPost:
+			var body struct {
+				Fields          map[string]any `json:"fields"`
+				CriticalFailure bool           `json:"critical_failure"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode: %v", err)
+			}
+			if !body.CriticalFailure || body.Fields["status"] != "failed" {
+				t.Errorf("critical failure contract missing: %+v", body)
+			}
+			if commit {
+				state.Status, state.Error, state.FinishedAt = "failed", &actualError, &finishedAt
+			}
+			http.Error(w, "response lost after commit", http.StatusGatewayTimeout)
+		}
+	}))
+	defer server.Close()
+	source := NewAPISource(APISourceConfig{BaseURL: server.URL, Token: "device-token"})
+	source.client = redisapi.NewClient(redisapi.ClientConfig{BaseURL: server.URL, Token: "device-token"})
+	control := NewAPIFineTuneControl(source)
+	fields := map[string]any{"status": "failed", "error": actualError, "finished_at": finishedAt}
+	if err := control.FailCritical(context.Background(), id, fields); err != nil {
+		t.Fatalf("committed critical failure not confirmed: %v", err)
+	}
+	commit = false
+	state.Error = new(string)
+	if err := control.FailCritical(context.Background(), id, fields); err == nil {
+		t.Fatal("mismatched failure details falsely confirmed")
+	}
+}
