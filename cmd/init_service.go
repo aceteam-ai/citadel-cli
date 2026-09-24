@@ -131,6 +131,11 @@ func maybeFinishLinuxNodeSetup(choice nexus.NetworkChoice, nodeName string) {
 	}
 
 	// Part 2: start/enable the worker (or name the next command when non-root).
+	// A root --provision invocation from a normal account installs that
+	// account's lingered user unit, matching its rootless Podman socket.
+	if finishProvisionedLinuxUserWorker() {
+		return
+	}
 	applyLinuxWorkerSetup(decideLinuxWorkerSetup(platform.IsRoot(), service.InstalledManagedUnit))
 }
 

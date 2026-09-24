@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/install
 
 This single command:
 - Installs NVIDIA drivers (if a GPU is present)
-- Installs Docker CE and the NVIDIA Container Toolkit
+- Installs rootless Podman and NVIDIA CDI on fresh Linux nodes
 - Downloads the latest `citadel` binary
 - Creates a systemd service (`citadel-worker`)
 - Pre-pulls the vLLM Docker image

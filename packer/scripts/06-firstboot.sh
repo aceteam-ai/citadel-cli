@@ -5,7 +5,7 @@
 #   1. Reads the authkey from /etc/citadel/authkey (injected by deploy script)
 #   2. Runs "citadel init --authkey <key>" to join the network
 #   3. Copies the generated manifest to /etc/citadel/ for the worker service
-#   4. Enables and starts citadel-worker.service
+#   4. Generates GPU CDI and starts the rootless user worker
 #   5. Disables itself so it never runs again
 set -euo pipefail
 
@@ -48,7 +48,7 @@ if [ -z "${AUTHKEY}" ]; then
     log "WARNING: No authkey found at ${AUTHKEY_FILE}."
     log "The node cannot join the network automatically."
     log "To initialize manually, run: citadel init --authkey <your-key>"
-    log "Then: sudo systemctl enable --now citadel-worker.service"
+    log "Then: sudo -u citadel systemctl --user enable --now citadel-worker.service"
     # Don't fail -- the VM is still usable, just needs manual init
     systemctl disable citadel-firstboot.service
     exit 0
@@ -81,23 +81,40 @@ fi
 CITADEL_HOME="/home/citadel"
 if [ -f "${CITADEL_HOME}/citadel-node/citadel.yaml" ]; then
     cp "${CITADEL_HOME}/citadel-node/citadel.yaml" "${MANIFEST_DIR}/citadel.yaml"
-    chown citadel:docker "${MANIFEST_DIR}/citadel.yaml"
+    chown citadel:citadel "${MANIFEST_DIR}/citadel.yaml"
     log "Manifest copied to ${MANIFEST_DIR}/citadel.yaml"
 elif [ -f "${CITADEL_HOME}/citadel.yaml" ]; then
     cp "${CITADEL_HOME}/citadel.yaml" "${MANIFEST_DIR}/citadel.yaml"
-    chown citadel:docker "${MANIFEST_DIR}/citadel.yaml"
+    chown citadel:citadel "${MANIFEST_DIR}/citadel.yaml"
     log "Manifest copied to ${MANIFEST_DIR}/citadel.yaml"
 else
-    log "WARNING: No manifest found after init. Worker may not start."
+    log "ERROR: No manifest found after init. Keeping the authkey for a retry."
+    exit 1
 fi
 
 # -----------------------------------------------------------------------
 # 4. Enable and start the worker
 # -----------------------------------------------------------------------
-log "Enabling and starting citadel-worker.service..."
-systemctl enable citadel-worker.service
-systemctl start citadel-worker.service
-log "citadel-worker.service started."
+log "Preparing rootless Podman and starting the Citadel user worker..."
+citadel_uid=$(id -u citadel)
+loginctl enable-linger citadel
+systemctl start "user@${citadel_uid}.service"
+as_citadel() {
+    runuser -u citadel -- env HOME=/home/citadel XDG_RUNTIME_DIR="/run/user/${citadel_uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${citadel_uid}/bus" "$@"
+}
+as_citadel systemctl --user enable --now podman.socket
+as_citadel podman info >/dev/null
+if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
+    install -d -m 755 /etc/cdi
+    nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+    nvidia-ctk cdi list
+    log "NVIDIA CDI spec generated."
+else
+    log "NVIDIA driver not active; GPU CDI generation remains pending."
+fi
+as_citadel systemctl --user daemon-reload
+as_citadel systemctl --user enable --now citadel-worker.service
+log "Citadel user worker started."
 
 # -----------------------------------------------------------------------
 # 5. Clean up authkey and disable this service
@@ -118,9 +135,8 @@ chmod 755 /opt/citadel/firstboot.sh
 cat > /etc/systemd/system/citadel-firstboot.service << 'UNIT'
 [Unit]
 Description=Citadel First-Boot Initialization
-After=network-online.target cloud-init.target docker.service
+After=network-online.target cloud-init.target
 Wants=network-online.target
-Requires=docker.service
 
 # Only run if the authkey file exists or if the manifest hasn't been created yet
 ConditionPathExists=!/etc/citadel/.firstboot-done

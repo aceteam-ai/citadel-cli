@@ -130,9 +130,9 @@ build {
     execute_command = "chmod +x {{ .Path }}; sudo {{ .Vars }} {{ .Path }}"
   }
 
-  # Docker CE + NVIDIA container toolkit
+  # Rootless Podman + NVIDIA CDI tooling
   provisioner "shell" {
-    script          = "${path.root}/scripts/03-docker.sh"
+    script          = "${path.root}/scripts/03-podman.sh"
     execute_command = "chmod +x {{ .Path }}; sudo {{ .Vars }} {{ .Path }}"
     environment_vars = [
       "BUILD_USER=${var.ssh_username}"
@@ -145,7 +145,7 @@ build {
     execute_command = "chmod +x {{ .Path }}; sudo {{ .Vars }} {{ .Path }}"
   }
 
-  # Pre-pull vLLM Docker image
+  # Pre-pull inference and trusted app runtime images for the Citadel user
   provisioner "shell" {
     script          = "${path.root}/scripts/05-vllm.sh"
     execute_command = "chmod +x {{ .Path }}; sudo {{ .Vars }} {{ .Path }}"

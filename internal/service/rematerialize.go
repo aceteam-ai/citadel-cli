@@ -85,6 +85,7 @@ func candidateManagedUnits() []managedUnitCandidate {
 	cands := []managedUnitCandidate{
 		{filepath.Join("/etc/systemd/system", "citadel-worker.service"), false},
 		{filepath.Join("/etc/systemd/system", ServiceName+".service"), false},
+		{filepath.Join("/etc/systemd/user", "citadel-worker.service"), true},
 	}
 	if p, err := unitFilePath(true); err == nil {
 		cands = append(cands, managedUnitCandidate{p, true})
