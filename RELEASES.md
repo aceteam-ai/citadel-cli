@@ -2664,3 +2664,26 @@ Auto-generated log of every release.
   - fix: persist and honor nexus URL node-side (#1110)
 
 
+---
+
+## v2.170.0 — 2026-09-24
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 109 |
+| Lines added | +5366 |
+
+**Changes:**
+
+  - fix: remove internal issue references from CLI and TUI copy (#1135)
+  - Distinguish permission-gated job types from genuinely unsupported ones (#1130)
+  - feat: dispatch bare citadel by enrollment tier (#1116) (#1126)
+  - feat(runtime): harden rootless podman gpu and limits (#1114)
+  - [CRAM] Pre-pull trusted app runtime images (#1113)
+  - feat: add platform mesh exposure (#1108)
+  - feat: adopt and persist external vLLM on owner node (#1102) (#1104)
+  - feat: publish live dispatchable node capabilities (#1087)
+  - feat(whatsapp): honor WHATSAPP_PROVISION force=true to upgrade a stuck bridge (#1124)
+
+
