@@ -80,6 +80,10 @@ func runNonInteractiveLogin() {
 	if err := saveHostnameToConfig(nodeName); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save hostname: %v\n", err)
 	}
+	if err := clearLoginNodeUID(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: could not clear prior login serving identity.")
+		os.Exit(1)
+	}
 
 	// Try to reclaim stale node with the same hostname
 	if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
@@ -201,12 +205,6 @@ func runInteractiveLogin() {
 			fmt.Fprintf(os.Stderr, "⚠️  Identity enrollment rejected: %v\n", bErr)
 		} else {
 			servingNodeUID = outcome.NodeUID
-			if servingNodeUID != "" {
-				if err := saveLoginNodeUID(servingNodeUID); err != nil {
-					fmt.Fprintln(os.Stderr, "⚠️  Identity enrollment could not save serving identity.")
-					servingNodeUID = ""
-				}
-			}
 			if outcome.Persisted {
 				fmt.Println("   Identity certificate stored.")
 			}
@@ -230,6 +228,18 @@ func runInteractiveLogin() {
 	// hostname and is kept separate from the serving identity below.
 	if err := saveHostnameToConfig(nodeName); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save hostname: %v\n", err)
+	}
+	// Reconcile the machine-wide serving name before registration. A valid CSR
+	// bundle selects node-{uid}; an authkey, legacy no-bundle, or rejected
+	// bundle selects the display hostname and clears any prior enrollment UID.
+	if servingNodeUID != "" {
+		if err := saveLoginNodeUID(servingNodeUID); err != nil {
+			fmt.Fprintln(os.Stderr, "Error: could not save login serving identity.")
+			os.Exit(1)
+		}
+	} else if err := clearLoginNodeUID(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error: could not clear prior login serving identity.")
+		os.Exit(1)
 	}
 
 	// A CSR-enrolled login registers under the deterministic "node-<uid>"

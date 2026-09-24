@@ -90,6 +90,11 @@ func selfSignedLeafPEM(t *testing.T, key *ecdsa.PrivateKey, serial int64) string
 
 // testLoginChain mirrors the issuer's leaf || intermediate || root contract.
 func testLoginChain(t *testing.T, leafKey *ecdsa.PrivateKey, serial int64) (string, string) {
+	now := time.Now()
+	return testLoginChainWithLeafValidity(t, leafKey, serial, now.Add(-time.Hour), now.Add(time.Hour))
+}
+
+func testLoginChainWithLeafValidity(t *testing.T, leafKey *ecdsa.PrivateKey, serial int64, leafNotBefore, leafNotAfter time.Time) (string, string) {
 	t.Helper()
 	rootKey, intermediateKey := newKey(t), newKey(t)
 	now := time.Now()
@@ -114,7 +119,7 @@ func testLoginChain(t *testing.T, leafKey *ecdsa.PrivateKey, serial int64) (stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaf := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "uid-abc"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}
+	leaf := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "uid-abc"}, NotBefore: leafNotBefore, NotAfter: leafNotAfter}
 	nodeURI, err := url.Parse("aceteam:node:uid-abc")
 	if err != nil {
 		t.Fatal(err)
@@ -499,6 +504,95 @@ func TestLoginNodeUIDIgnoresIncompleteStoredChain(t *testing.T) {
 	}
 	if got := getWorkHostname(); got != "display-name" {
 		t.Fatalf("incomplete chain hostname = %q", got)
+	}
+}
+
+func TestClearLoginNodeUID_PreventsStaleServingName(t *testing.T) {
+	dir := t.TempDir()
+	originalDir, originalStore, originalWorkName := nodeConfigDirFn, loginIdentityStore, workNodeName
+	nodeConfigDirFn = func() string { return dir }
+	loginIdentityStore = func() *nodeidentity.Store { return nodeidentity.New(filepath.Join(dir, "identity")) }
+	workNodeName = "display-name"
+	t.Cleanup(func() {
+		nodeConfigDirFn, loginIdentityStore, workNodeName = originalDir, originalStore, originalWorkName
+	})
+	store := loginIdentityStore()
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, chain := testLoginChain(t, key, 1)
+	if _, err := persistLoginIdentityBundle(store, &key.PublicKey, leaf, chain, "uid-abc"); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("hostname: display-name\ndevice_api_token: preserved\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveLoginNodeUID("uid-abc"); err != nil {
+		t.Fatal(err)
+	}
+	if got := getWorkHostname(); got != "node-uid-abc" {
+		t.Fatalf("initial serving hostname = %q", got)
+	}
+	// An authkey, legacy no-bundle, or rejected-bundle login uses the display
+	// hostname even though the prior certificate is still valid on disk.
+	if err := clearLoginNodeUID(); err != nil {
+		t.Fatal(err)
+	}
+	if got := getWorkHostname(); got != "display-name" {
+		t.Fatalf("stale serving hostname after fallback = %q", got)
+	}
+	if got := logoutServingNodeName("display-name"); got != "display-name" {
+		t.Fatalf("stale logout target after fallback = %q", got)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]interface{}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := cfg["login_node_uid"]; present {
+		t.Fatal("login_node_uid survived display-name registration")
+	}
+	if cfg["device_api_token"] != "preserved" || cfg["hostname"] != "display-name" {
+		t.Fatalf("other config fields changed: %v", cfg)
+	}
+}
+
+func TestLoginNodeUIDIgnoresLeafOutsideValidityWindow(t *testing.T) {
+	dir := t.TempDir()
+	originalDir, originalStore, originalWorkName := nodeConfigDirFn, loginIdentityStore, workNodeName
+	nodeConfigDirFn = func() string { return dir }
+	loginIdentityStore = func() *nodeidentity.Store { return nodeidentity.New(filepath.Join(dir, "identity")) }
+	workNodeName = "display-name"
+	t.Cleanup(func() {
+		nodeConfigDirFn, loginIdentityStore, workNodeName = originalDir, originalStore, originalWorkName
+	})
+	store := loginIdentityStore()
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for name, window := range map[string][2]time.Time{
+		"expired":       {now.Add(-3 * time.Hour), now.Add(-2 * time.Hour)},
+		"not_yet_valid": {now.Add(2 * time.Hour), now.Add(3 * time.Hour)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			leaf, chain := testLoginChainWithLeafValidity(t, key, 1, window[0], window[1])
+			if err := store.StoreLeaf(leaf, chain); err != nil {
+				t.Fatal(err)
+			}
+			if err := saveLoginNodeUID("uid-abc"); err != nil {
+				t.Fatal(err)
+			}
+			if got := getWorkHostname(); got != "display-name" {
+				t.Fatalf("invalid leaf selected serving hostname %q", got)
+			}
+		})
 	}
 }
 

@@ -249,13 +249,23 @@ func validateChainPEM(leafPEM, data string) error {
 // saveLoginNodeUID records login enrollment independently of device-mode's
 // device.json. The shared config is machine-convergent across login and work.
 func saveLoginNodeUID(nodeUID string) error {
-	if !nodeUIDPattern.MatchString(nodeUID) {
+	if nodeUID == "" {
+		return fmt.Errorf("invalid login node id")
+	}
+	return persistLoginNodeUID(nodeUID)
+}
+
+// clearLoginNodeUID prevents a later authkey or unenrolled device login from
+// reconnecting under the serving name of a previous CSR-enrolled login.
+func clearLoginNodeUID() error {
+	return persistLoginNodeUID("")
+}
+
+func persistLoginNodeUID(nodeUID string) error {
+	if nodeUID != "" && !nodeUIDPattern.MatchString(nodeUID) {
 		return fmt.Errorf("invalid login node id")
 	}
 	path := filepath.Join(nodeConfigDirFn(), "config.yaml")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	config := map[string]interface{}{}
 	if data, err := os.ReadFile(path); err == nil {
 		if err := yaml.Unmarshal(data, &config); err != nil {
@@ -263,11 +273,23 @@ func saveLoginNodeUID(nodeUID string) error {
 		}
 	} else if !os.IsNotExist(err) {
 		return err
+	} else if nodeUID == "" {
+		return nil
 	}
 	if config == nil {
 		config = map[string]interface{}{}
 	}
-	config["login_node_uid"] = nodeUID
+	if nodeUID == "" {
+		if _, present := config["login_node_uid"]; !present {
+			return nil
+		}
+		delete(config, "login_node_uid")
+	} else {
+		config["login_node_uid"] = nodeUID
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	data, err := yaml.Marshal(config)
 	if err != nil {
 		return err
@@ -298,7 +320,7 @@ func loadLoginNodeUID() string {
 		return ""
 	}
 	leaf, err := os.ReadFile(store.LeafPath())
-	if err != nil || leafBoundToKey(string(leaf), pub) != nil || leafBoundToUID(string(leaf), config.LoginNodeUID) != nil {
+	if err != nil || leafBoundToKey(string(leaf), pub) != nil || leafBoundToUID(string(leaf), config.LoginNodeUID) != nil || leafValidNow(string(leaf)) != nil {
 		return ""
 	}
 	chain, err := os.ReadFile(store.CAChainPath())
