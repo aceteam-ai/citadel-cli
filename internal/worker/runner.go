@@ -1018,18 +1018,37 @@ func willRetry(job *Job) bool {
 // orphan recovery, re-failing forever.
 //
 // Instead we (1) publish a structured error event immediately so the backend
-// surfaces an actionable "node <ver> doesn't support <TYPE> -- update the node"
-// message, and (2) Fail the job (failed status + ACK) so the unsupported
-// message is removed from the pending list rather than retried indefinitely.
+// surfaces an actionable message, and (2) Fail the job (failed status + ACK)
+// so the unsupported message is removed from the pending list rather than
+// retried indefinitely.
+//
+// The error text distinguishes two causes that used to collapse into one
+// misleading "(update the node)" message (aceteam#9962): a type this build
+// genuinely does not know (allKnownJobTypes) really does need an update, but
+// a type in gatedJobTypeReasons is known to the build and simply not
+// registered this run -- typically a default-DENY permission (files/desktop)
+// or a missing config directory. Telling an operator to "update the node" for
+// the second case sends them chasing a binary upgrade that fixes nothing; the
+// real fix is a permission toggle or provisioning step named in the message.
 func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime time.Time) {
 	agentVersion := r.agentVersion
 	if agentVersion == "" {
 		agentVersion = "unknown"
 	}
-	err := fmt.Errorf(
-		"unsupported job type %q: node %s has no handler for it (update the node)",
-		job.Type, agentVersion,
-	)
+
+	var err error
+	gateReason, gated := gatedJobTypeReasons[job.Type]
+	if gated {
+		err = fmt.Errorf(
+			"job type %q is supported by this node's build but not currently registered: %s",
+			job.Type, gateReason,
+		)
+	} else {
+		err = fmt.Errorf(
+			"unsupported job type %q: node %s has no handler for it (update the node)",
+			job.Type, agentVersion,
+		)
+	}
 	r.log("error", "Unsupported job type: %v", err)
 
 	data := map[string]any{
@@ -1037,6 +1056,10 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 		"job_type":             job.Type,
 		"agent_version":        agentVersion,
 		"supported_types":      r.SupportedJobTypes(),
+	}
+	if gated {
+		data["known_to_build"] = true
+		data["unregistered_reason"] = gateReason
 	}
 
 	r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
