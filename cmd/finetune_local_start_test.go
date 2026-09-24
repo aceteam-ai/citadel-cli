@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
@@ -19,6 +20,12 @@ func heldFineTuneModuleFixture(t *testing.T) string {
 		{Name: "unlimited-ocr", Type: "docker", ComposeFile: filepath.Join("services", "unlimited-ocr.yml"), DesiredStatus: "stopped", EvictedByJob: "train-job"},
 		{Name: "paw-compile", Type: "docker", ComposeFile: filepath.Join("services", "paw-compile.yml"), DesiredStatus: "stopped"},
 	})
+	if err := os.MkdirAll(filepath.Join(configDir, "services"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "services", "paw-compile.yml"), []byte("services:\n  paw-compile:\n    image: example/paw-compile\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(finetunesafety.Dir(configDir), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +117,64 @@ func TestFineTuneHoldBlocksCandidateThatWasAlreadyStopped(t *testing.T) {
 		return nil
 	}); err == nil || started {
 		t.Fatalf("already-stopped fine-tune candidate start = (started %v, err %v)", started, err)
+	}
+}
+
+func TestFineTuneHoldBlocksAllUntaggedGPUStartsButAllowsCPU(t *testing.T) {
+	configDir := heldFineTuneModuleFixture(t)
+	for _, name := range []string{"vllm", "sglang", "llamacpp", "bonsai", "diffusers", "omnivoice"} {
+		t.Run(name, func(t *testing.T) {
+			called := false
+			err := withLocalServiceStartGuard(configDir, name, func() error { called = true; return nil })
+			if err == nil || called {
+				t.Fatalf("untagged GPU start: called=%t err=%v", called, err)
+			}
+		})
+	}
+	called := false
+	if err := withLocalServiceStartGuard(configDir, "paw-compile", func() error { called = true; return nil }); err != nil || !called {
+		t.Fatalf("CPU service start: called=%t err=%v", called, err)
+	}
+}
+
+func TestFineTuneHoldArmCannotInterleaveWithUntaggedGPUStart(t *testing.T) {
+	configDir := writeManifestWithServices(t, []Service{{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}})
+	entered := make(chan struct{})
+	finish := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- withLocalServiceStartGuard(configDir, "vllm", func() error {
+			close(entered)
+			<-finish
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("start callback not reached")
+	}
+	if err := finetunesafety.WithExclusive(finetunesafety.Dir(configDir), func() error {
+		return os.WriteFile(finetunesafety.Path(configDir), []byte("train-job"), 0600)
+	}); err == nil {
+		t.Fatal("fine-tune hold armed while GPU start in progress")
+	}
+	close(finish)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("start did not complete")
+	}
+	if err := finetunesafety.WithExclusive(finetunesafety.Dir(configDir), func() error {
+		return os.WriteFile(finetunesafety.Path(configDir), []byte("train-job"), 0600)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := withLocalServiceStartGuard(configDir, "vllm", func() error { t.Fatal("GPU callback reached under hold"); return nil }); err == nil {
+		t.Fatal("GPU start admitted after hold")
 	}
 }
 

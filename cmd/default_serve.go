@@ -37,6 +37,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -205,6 +206,9 @@ func resolveLargestGPUTotalVRAMMB() (mb int, found bool) {
 // behind function values, so the decision logic (runDefaultServeReconcile)
 // is unit-testable without a real GPU, docker daemon, or ollama binary.
 type defaultServeDeps struct {
+	// Production uses the same config dir as its ServiceHandler's fine-tune
+	// hold; tests can leave this empty to use nodeConfigDir.
+	safetyConfigDir       string
 	largestGPUTotalVRAMMB func() (mb int, found bool)
 	// executeServiceStart synthesizes the exact steps a platform
 	// SERVICE_START {service, model} dispatch performs: materialize the
@@ -223,8 +227,15 @@ type defaultServeDeps struct {
 // (reservationHandler), so no second ServiceHandler is created.
 func realDefaultServeDeps(handler *jobs.ServiceHandler) defaultServeDeps {
 	return defaultServeDeps{
+		safetyConfigDir:       handler.ConfigDir,
 		largestGPUTotalVRAMMB: resolveLargestGPUTotalVRAMMB,
 		executeServiceStart: func(engine, model string) error {
+			// Also refuse a direct invocation of this production callback while
+			// held. In the normal reconcile, the outer reservation lock makes
+			// this check and Execute one indivisible admission.
+			if err := finetunesafety.RequireAbsent(handler.ConfigDir); err != nil {
+				return err
+			}
 			payload := map[string]string{"service": engine}
 			if model != "" {
 				payload["model"] = model
@@ -249,6 +260,27 @@ func runDefaultServeReconcile(manifest *CitadelManifest, nodeConfigDir string, d
 		// subsequent boot.
 		return
 	}
+	safetyConfigDir := deps.safetyConfigDir
+	if safetyConfigDir == "" {
+		safetyConfigDir = nodeConfigDir
+	}
+	// Cover the entire once-marker/status/manifest/start transaction. A hold
+	// already present is a pure deferral (not a once-ever failed attempt), and
+	// a hold cannot be armed after the check but before SERVICE_START.
+	if err := finetunesafety.WithExclusive(finetunesafety.Dir(safetyConfigDir), func() error {
+		if err := finetunesafety.RequireAbsent(safetyConfigDir); err != nil {
+			return err
+		}
+		runDefaultServeReconcileUnlocked(manifest, nodeConfigDir, deps)
+		return nil
+	}); err != nil {
+		deps.log("default-serve: deferred while fine-tune reservation is active: %v", err)
+	}
+}
+
+// Caller owns reservation.lock and has checked active.hold. Keep the marker
+// and service-start steps in this same critical section.
+func runDefaultServeReconcileUnlocked(manifest *CitadelManifest, nodeConfigDir string, deps defaultServeDeps) {
 	if _, ok := loadDefaultServeMarker(nodeConfigDir); ok {
 		deps.log("default-serve: already attempted on this node (see %s); skipping", filepath.Join(nodeConfigDir, defaultServeMarkerFile))
 		return
