@@ -26,6 +26,8 @@ SERVICE_NAME="citadel-worker"
 SERVICE_USER="citadel"
 SERVICE_HOME="/home/${SERVICE_USER}"
 SERVICE_FILE="/etc/systemd/user/${SERVICE_NAME}.service"
+SERVICE_USER_MARKER="/etc/citadel/rootless-worker-user"
+ALREADY_READY=false
 
 # ---------------------------------------------------------------------------
 # Color helpers (only for terminal, plain text for log)
@@ -116,6 +118,17 @@ preflight() {
     # Must be root
     if [ "$(id -u)" -ne 0 ]; then
         die "This installer must be run as root. Try: curl -fsSL https://get.aceteam.ai/citadel | sudo -E CITADEL_AUTHKEY=xxx bash"
+    fi
+
+    # A healthy serving worker is a read-only no-op. An unsafe account or a
+    # running but unhealthy worker needs an explicit drained repair, before
+    # package, log, enrollment, or unit changes.
+    if id "$SERVICE_USER" >/dev/null 2>&1; then
+        verify_service_account
+        if existing_rootless_worker; then
+            ALREADY_READY=true
+            return 0
+        fi
     fi
 
     # Ensure HOME is /root so network state, config, and systemd service all agree
@@ -270,6 +283,74 @@ as_service_user() {
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" "$@"
 }
 
+verify_service_account() {
+    local uid group sudo_listing marker_owner marker_mode marker_dir_owner marker_dir_mode
+    uid=$(id -u "$SERVICE_USER") || die "Cannot inspect dedicated worker UID"
+    [ "$uid" -ne 0 ] || die "Dedicated worker must not be root"
+    [ "$(getent passwd "$SERVICE_USER" | cut -d: -f6)" = "$SERVICE_HOME" ] || die "Dedicated worker has an unexpected home"
+    [ -d /etc/citadel ] && [ ! -L /etc/citadel ] || die "Worker marker directory is unsafe"
+    marker_dir_owner=$(stat -c %u /etc/citadel) || die "Cannot inspect worker marker directory"
+    marker_dir_mode=$(stat -c %a /etc/citadel) || die "Cannot inspect worker marker directory"
+    [ "$marker_dir_owner" = 0 ] && [ "$((8#$marker_dir_mode & 8#22))" -eq 0 ] || die "Worker marker directory is writable by non-root"
+    [ -f "$SERVICE_USER_MARKER" ] && [ ! -L "$SERVICE_USER_MARKER" ] || die "Dedicated worker has no trusted provisioning marker"
+    marker_owner=$(stat -c %u "$SERVICE_USER_MARKER") || die "Cannot inspect worker marker ownership"
+    marker_mode=$(stat -c %a "$SERVICE_USER_MARKER") || die "Cannot inspect worker marker mode"
+    [ "$marker_owner" = 0 ] && [ "$marker_mode" = 600 ] &&
+        [ "$(<"$SERVICE_USER_MARKER")" = "$uid" ] || die "Dedicated worker provisioning marker is invalid"
+    for group in $(id -nG "$SERVICE_USER"); do
+        case "$group" in sudo|wheel|docker) die "Dedicated ${SERVICE_USER} user has privileged ${group} membership" ;; esac
+    done
+    [ ! -e "/etc/sudoers.d/99-citadel-${SERVICE_USER}" ] || die "Dedicated worker has a legacy sudo grant"
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo_listing=$(runuser -u "$SERVICE_USER" -- env LC_ALL=C sudo -n -l 2>&1); then
+            die "Dedicated worker has effective sudo privileges"
+        fi
+        case "${sudo_listing,,}" in
+            *"may run the following commands"*|*"nopasswd:"*) die "Dedicated worker has effective sudo privileges" ;;
+            *"not allowed to run sudo"*|*"may not run sudo"*) ;;
+            *) die "Cannot prove dedicated worker has no sudo privileges: ${sudo_listing}" ;;
+        esac
+    fi
+}
+
+host_gpu_present() {
+    if is_jetson; then return 0; fi
+    if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then return 0; fi
+    [ -d /proc/driver/nvidia/gpus ] && [ "$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)" -gt 0 ]
+}
+
+existing_rootless_worker() {
+    local uid state active=0 unit manifest_owner
+    uid=$(id -u "$SERVICE_USER") || die "Cannot inspect dedicated worker UID"
+    state=$(systemctl show "user@${uid}.service" -p ActiveState --value) || die "Cannot inspect dedicated user manager"
+    [ "$state" = active ] || return 1
+    as_service_user systemctl --user show-environment >/dev/null || die "Cannot inspect dedicated user bus"
+    for unit in "$SERVICE_NAME" citadel.service; do
+        if as_service_user systemctl --user is-active --quiet "$unit"; then
+            active=$((active+1))
+        fi
+    done
+    [ "$active" -gt 0 ] || return 1
+    [ "$active" -eq 1 ] || die "Multiple Citadel workers are active; drain before provisioning"
+    [ -s "${SERVICE_HOME}/citadel-node/citadel.yaml" ] &&
+        [ ! -L "${SERVICE_HOME}/citadel-node/citadel.yaml" ] || die "Active worker manifest is missing or unsafe"
+    manifest_owner=$(stat -c %u "${SERVICE_HOME}/citadel-node/citadel.yaml") || die "Cannot inspect active worker manifest"
+    [ "$manifest_owner" = "$uid" ] || die "Active worker manifest is not owned by ${SERVICE_USER}"
+    if [ -e "${CONFIG_DIR}/state-dir" ] || [ -L "${CONFIG_DIR}/state-dir" ]; then
+        [ -f "${CONFIG_DIR}/state-dir" ] && [ ! -L "${CONFIG_DIR}/state-dir" ] &&
+            [ "$(<"${CONFIG_DIR}/state-dir")" = "${SERVICE_HOME}/citadel-node" ] ||
+            die "Active worker state pointer does not resolve to the dedicated account; drain before repair"
+    fi
+    if host_gpu_present; then
+        verify_user_manager "$uid" video render
+    else
+        verify_user_manager "$uid"
+    fi
+    as_service_user systemctl --user is-active --quiet podman.socket || die "Active worker has no rootless Podman socket"
+    as_service_user podman info >/dev/null || die "Active worker cannot use rootless Podman"
+    return 0
+}
+
 require_service_groups() {
     local group
     for group in "$@"; do
@@ -333,18 +414,12 @@ install_podman() {
     fi
     if ! id "$SERVICE_USER" >/dev/null 2>&1; then
         useradd --create-home --shell /bin/bash "$SERVICE_USER" || die "Could not create ${SERVICE_USER} user"
+        install -d -m 755 /etc/citadel
+        [ -d /etc/citadel ] && [ ! -L /etc/citadel ] && [ "$(stat -c %u /etc/citadel)" = 0 ] || die "Worker marker directory is unsafe"
+        ( set -C; id -u "$SERVICE_USER" > "$SERVICE_USER_MARKER" ) || die "Could not record dedicated worker provenance"
+        chmod 600 "$SERVICE_USER_MARKER"
     fi
-    [ "$(getent passwd "$SERVICE_USER" | cut -d: -f6)" = "$SERVICE_HOME" ] || die "${SERVICE_USER} must have home ${SERVICE_HOME}"
-    local group
-    for group in $(id -nG "$SERVICE_USER"); do
-        case "$group" in sudo|wheel|docker) die "Dedicated ${SERVICE_USER} user has privileged ${group} membership" ;; esac
-    done
-    if [ -e "/etc/sudoers.d/99-citadel-${SERVICE_USER}" ]; then
-        die "Dedicated ${SERVICE_USER} user has a legacy passwordless sudo grant; remove it before provisioning"
-    fi
-    if runuser -u "$SERVICE_USER" -- sudo -n true >/dev/null 2>&1; then
-        die "Dedicated ${SERVICE_USER} user has passwordless sudo; remove that grant before provisioning"
-    fi
+    verify_service_account
     ensure_subid_range /etc/subuid uid
     ensure_subid_range /etc/subgid gid
 
@@ -687,8 +762,7 @@ start_worker() {
     step "Starting Citadel worker"
 
     if as_service_user systemctl --user is-active --quiet "$SERVICE_NAME"; then
-        as_service_user systemctl --user restart "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || die "Could not restart worker"
-        ok "Worker restarted"
+        die "Worker became active during provisioning; drain before an explicit update"
     else
         as_service_user systemctl --user start "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || die "Could not start worker"
         ok "Worker started"
@@ -771,6 +845,10 @@ print_summary() {
 # ---------------------------------------------------------------------------
 main() {
     preflight || exit 1
+    if $ALREADY_READY; then
+        printf 'Citadel rootless worker is healthy; provisioning is already complete.\n' >&2
+        return 0
+    fi
     resolve_authkey
     detect_gpu
     install_nvidia_drivers

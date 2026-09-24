@@ -104,7 +104,28 @@ as_citadel() {
 }
 as_citadel systemctl --user enable --now podman.socket
 as_citadel podman info >/dev/null
-if command -v nvidia-ctk >/dev/null 2>&1; then
+has_nvidia_hardware() {
+    if [ -s /etc/nv_tegra_release ]; then return 0; fi
+    if grep -qiE 'jetson|tegra' /proc/device-tree/model /sys/firmware/devicetree/base/model 2>/dev/null; then return 0; fi
+    if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then return 0; fi
+    [ -d /proc/driver/nvidia/gpus ] && [ "$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)" -gt 0 ]
+}
+if has_nvidia_hardware; then
+    command -v nvidia-ctk >/dev/null 2>&1 || { log "ERROR: GPU present but NVIDIA CDI toolkit is missing."; exit 1; }
+    getent group video >/dev/null && getent group render >/dev/null || { log "ERROR: GPU access groups are missing."; exit 1; }
+    usermod -aG video,render citadel
+    # The image build may have had no passthrough GPU. Refresh the user
+    # manager now, before first enabling its worker, so it inherits GPU groups.
+    systemctl restart "user@${citadel_uid}.service"
+    as_citadel systemctl --user enable --now podman.socket
+    install -d -m 755 /etc/udev/rules.d
+    cat > /etc/udev/rules.d/70-citadel-nvidia.rules <<'RULE'
+KERNEL=="nvidia[0-9]*", GROUP="video", MODE="0660"
+KERNEL=="nvidiactl", GROUP="video", MODE="0660"
+KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
+KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
+RULE
+    udevadm control --reload-rules
     install -d -m 755 /etc/cdi
     if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
        nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then

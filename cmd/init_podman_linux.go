@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 const podmanDelegateUnit = "[Service]\nDelegate=cpu memory pids\n"
+const podmanUserMarker = "/etc/citadel/rootless-worker-user"
 
 const nvidiaCDIRefreshScript = `#!/bin/sh
 set -eu
@@ -82,12 +84,19 @@ func rejectLegacySystemWorkerAt(paths []string, lstat func(string) (os.FileInfo,
 	return nil
 }
 
-func prepareLinuxPodmanProvision() error {
+// prepareLinuxPodmanProvision returns true when an already-running, healthy
+// managed worker needs no provisioning. In that case init must return before
+// enrollment, config generation, package changes, or a worker restart.
+func prepareLinuxPodmanProvision() (bool, error) {
 	if err := rejectLegacySystemWorkerAt(legacySystemWorkerUnits, os.Lstat); err != nil {
-		return err
+		return false, err
 	}
 	if !platform.IsRoot() {
-		return nil // existing privilege diagnostic runs next
+		return false, nil // existing privilege diagnostic runs next
+	}
+	ready, err := classifyExistingPodmanWorker(user.Lookup, verifyDedicatedPodmanUser, existingRootlessWorker)
+	if err != nil || ready {
+		return ready, err
 	}
 	// All state resolvers in the enrollment flow must see the worker's home,
 	// not the human sudo caller's or root's home. Refuse a pre-existing foreign
@@ -96,33 +105,108 @@ func prepareLinuxPodmanProvision() error {
 	want := filepath.Join(root, "citadel-node")
 	if got := network.GetNodeConfigDir(); got != want {
 		if entries, err := os.ReadDir(got); err == nil && len(entries) > 0 {
-			return fmt.Errorf("existing node state at %s requires explicit E5 migration before provisioning %s", got, want)
+			return false, fmt.Errorf("existing node state at %s requires explicit E5 migration before provisioning %s", got, want)
 		} else if err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("inspect existing node state %s: %w", got, err)
+			return false, fmt.Errorf("inspect existing node state %s: %w", got, err)
 		}
 	}
 	if err := ensureDedicatedPodmanUser(); err != nil {
-		return err
+		return false, err
 	}
 	if err := os.Setenv("SUDO_USER", podmanServiceUser); err != nil {
-		return err
+		return false, err
 	}
-	return os.Setenv("HOME", root)
+	return false, os.Setenv("HOME", root)
+}
+
+func classifyExistingPodmanWorker(
+	lookup func(string) (*user.User, error),
+	verify func(*user.User) error,
+	active func(*user.User) (bool, error),
+) (bool, error) {
+	owner, err := lookup(podmanServiceUser)
+	if _, unknown := err.(user.UnknownUserError); unknown {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup dedicated worker user: %w", err)
+	}
+	if err := verify(owner); err != nil {
+		return false, err
+	}
+	return active(owner)
 }
 
 func ensureDedicatedPodmanUser() error {
 	owner, err := user.Lookup(podmanServiceUser)
+	created := false
 	if err != nil {
+		if _, unknown := err.(user.UnknownUserError); !unknown {
+			return fmt.Errorf("lookup dedicated worker user: %w", err)
+		}
 		if err := provisionCommand("useradd", "--create-home", "--shell", "/bin/bash", podmanServiceUser); err != nil {
 			return err
 		}
+		created = true
 		owner, err = user.Lookup(podmanServiceUser)
 	}
 	if err != nil {
 		return fmt.Errorf("lookup dedicated worker user: %w", err)
 	}
+	if created {
+		if err := os.MkdirAll(filepath.Dir(podmanUserMarker), 0755); err != nil {
+			return err
+		}
+		if err := verifyPodmanMarkerDir(); err != nil {
+			return err
+		}
+		marker, err := os.OpenFile(podmanUserMarker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return fmt.Errorf("create dedicated worker provenance marker: %w", err)
+		}
+		_, writeErr := marker.WriteString(owner.Uid + "\n")
+		closeErr := marker.Close()
+		if writeErr != nil || closeErr != nil {
+			return fmt.Errorf("record dedicated worker provenance: %v %v", writeErr, closeErr)
+		}
+	}
+	return verifyDedicatedPodmanUser(owner)
+}
+
+func verifyPodmanMarkerDir() error {
+	info, err := os.Lstat(filepath.Dir(podmanUserMarker))
+	if err != nil {
+		return fmt.Errorf("inspect dedicated worker marker directory: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || stat.Uid != 0 || info.Mode().Perm()&0022 != 0 {
+		return fmt.Errorf("dedicated worker marker directory must be root-owned and not writable by non-root users")
+	}
+	return nil
+}
+
+func validPodmanUserMarker(data []byte, mode os.FileMode, ownerUID uint32, expectedUID string) bool {
+	return mode.IsRegular() && mode.Perm() == 0600 && ownerUID == 0 && string(data) == expectedUID+"\n"
+}
+
+func verifyDedicatedPodmanUser(owner *user.User) error {
 	if owner.Uid == "0" || owner.HomeDir != "/home/citadel" {
 		return fmt.Errorf("dedicated %s account must be unprivileged with home /home/citadel", podmanServiceUser)
+	}
+	if err := verifyPodmanMarkerDir(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(podmanUserMarker)
+	if err != nil {
+		return fmt.Errorf("dedicated %s account has no trusted provisioning marker: %w", podmanServiceUser, err)
+	}
+	marker, err := os.ReadFile(podmanUserMarker)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !validPodmanUserMarker(marker, info.Mode(), stat.Uid, owner.Uid) {
+		return fmt.Errorf("dedicated %s account has invalid provisioning marker", podmanServiceUser)
 	}
 	groups, err := exec.Command("id", "-nG", podmanServiceUser).Output()
 	if err != nil {
@@ -138,10 +222,86 @@ func ensureDedicatedPodmanUser() error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	if err := exec.Command("runuser", "-u", podmanServiceUser, "--", "sudo", "-n", "true").Run(); err == nil {
-		return fmt.Errorf("dedicated %s account has passwordless sudo; remove that grant before provisioning", podmanServiceUser)
+	if _, err := exec.LookPath("sudo"); err == nil {
+		out, listErr := exec.Command("runuser", "-u", podmanServiceUser, "--", "env", "LC_ALL=C", "sudo", "-n", "-l").CombinedOutput()
+		if !sudoListDeniesAll(string(out), listErr) {
+			return fmt.Errorf("cannot prove dedicated %s account has no effective sudo grants: %s", podmanServiceUser, strings.TrimSpace(string(out)))
+		}
+	} else if !isExecutableNotFound(err) {
+		return fmt.Errorf("inspect sudo availability: %w", err)
 	}
 	return nil
+}
+
+func sudoListDeniesAll(output string, err error) bool {
+	if err == nil {
+		return false // even a scoped command grant defeats the worker boundary
+	}
+	denial := strings.ToLower(strings.TrimSpace(output))
+	if strings.Contains(denial, "may run the following commands") || strings.Contains(denial, "nopasswd:") {
+		return false
+	}
+	return strings.Contains(denial, "not allowed to run sudo") || strings.Contains(denial, "may not run sudo")
+}
+
+func isExecutableNotFound(err error) bool {
+	execErr, ok := err.(*exec.Error)
+	return ok && execErr.Err == exec.ErrNotFound
+}
+
+func existingRootlessWorker(owner *user.User) (bool, error) {
+	uid := owner.Uid
+	manager, err := exec.Command("systemctl", "show", "user@"+uid+".service", "-p", "ActiveState", "--value").Output()
+	if err != nil {
+		return false, fmt.Errorf("inspect dedicated user manager before provisioning: %w", err)
+	}
+	if strings.TrimSpace(string(manager)) != "active" {
+		return false, nil
+	}
+	// A successful bus read separates inactive units from an inaccessible user
+	// manager. Failing open here could restart a serving worker.
+	if err := runAsPodmanUser(podmanServiceUser, uid, owner.HomeDir, "systemctl", "--user", "show-environment"); err != nil {
+		return false, fmt.Errorf("inspect dedicated user manager bus: %w", err)
+	}
+	active := 0
+	for _, unit := range []string{"citadel-worker.service", "citadel.service"} {
+		if err := runAsPodmanUser(podmanServiceUser, uid, owner.HomeDir, "systemctl", "--user", "is-active", "--quiet", unit); err == nil {
+			active++
+		}
+	}
+	if active == 0 {
+		return false, nil
+	}
+	if active != 1 {
+		return false, fmt.Errorf("multiple dedicated Citadel user workers are active; drain before provisioning")
+	}
+	if got := network.GetNodeConfigDir(); got != filepath.Join(owner.HomeDir, "citadel-node") {
+		return false, fmt.Errorf("active worker state resolves to %s; drain and reconcile before provisioning", got)
+	}
+	manifest := filepath.Join(owner.HomeDir, "citadel-node", "citadel.yaml")
+	info, err := os.Lstat(manifest)
+	if err != nil {
+		return false, fmt.Errorf("inspect active worker manifest: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || strconv.FormatUint(uint64(stat.Uid), 10) != uid || info.Size() == 0 {
+		return false, fmt.Errorf("active worker manifest is not a nonempty file owned by %s", podmanServiceUser)
+	}
+	if err := requirePodmanDelegation(uid); err != nil {
+		return false, err
+	}
+	if hasNvidiaHardwareLinux() {
+		if err := requireManagerGroups(uid, []string{"video", "render"}); err != nil {
+			return false, err
+		}
+	}
+	if err := runAsPodmanUser(podmanServiceUser, uid, owner.HomeDir, "systemctl", "--user", "is-active", "--quiet", "podman.socket"); err != nil {
+		return false, fmt.Errorf("active worker has no rootless Podman socket: %w", err)
+	}
+	if err := runAsPodmanUser(podmanServiceUser, uid, owner.HomeDir, "podman", "info"); err != nil {
+		return false, fmt.Errorf("active worker cannot use rootless Podman: %w", err)
+	}
+	return true, nil
 }
 
 func ownProvisionedLinuxState(nodeDir string) error {

@@ -209,3 +209,155 @@ func TestProvisionDoesNotGrantWorkerSudoOrUseInvokingOwner(t *testing.T) {
 		t.Fatal("Packer deploy must not add docker group")
 	}
 }
+
+func TestEffectiveSudoAuditRejectsScopedGrant(t *testing.T) {
+	for _, tc := range []struct {
+		name, output string
+		err          error
+		wantDenied   bool
+	}{
+		{"no-grants", "Sorry, user citadel may not run sudo on node.\n", &exec.ExitError{}, true},
+		{"scoped-nopasswd", "User citadel may run the following commands:\n (root) NOPASSWD: /usr/bin/systemctl\n", nil, false},
+		{"scoped-password", "User citadel may run the following commands:\n (root) /usr/bin/systemctl\n", nil, false},
+		{"mixed-denial-and-grant", "User citadel may not run sudo normally\nUser citadel may run the following commands: NOPASSWD: /bin/systemctl", &exec.ExitError{}, false},
+		{"audit-unavailable", "sudo: a password is required\n", &exec.ExitError{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sudoListDeniesAll(tc.output, tc.err); got != tc.wantDenied {
+				t.Fatalf("sudoListDeniesAll=%v, want %v", got, tc.wantDenied)
+			}
+		})
+	}
+	if !validPodmanUserMarker([]byte("1001\n"), 0600, 0, "1001") {
+		t.Fatal("managed root-owned marker rejected")
+	}
+	for _, marker := range []struct {
+		data []byte
+		mode os.FileMode
+		uid  uint32
+	}{
+		{[]byte("1001\n"), 0644, 0},
+		{[]byte("1001\n"), 0600, 1001},
+		{[]byte("1002\n"), 0600, 0},
+		{[]byte("1001\n"), os.ModeSymlink | 0600, 0},
+	} {
+		if validPodmanUserMarker(marker.data, marker.mode, marker.uid, "1001") {
+			t.Fatalf("unsafe marker accepted: %+v", marker)
+		}
+	}
+}
+
+func TestHealthyWorkerRerunStopsBeforeMutations(t *testing.T) {
+	// Exercise the entry gate twice against the same fixtures. A first pass
+	// reaches provisioning; once the worker is healthy, the second pass must
+	// preserve the config bytes and worker PID without invoking any mutator.
+	root := t.TempDir()
+	manifest := filepath.Join(root, "citadel.yaml")
+	pidFile := filepath.Join(root, "worker.pid")
+	if err := os.WriteFile(manifest, []byte("node: first-pass\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidFile, []byte("4172\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mutations := 0
+	ownerExists := false
+	lookup := func(string) (*user.User, error) {
+		if !ownerExists {
+			return nil, user.UnknownUserError("citadel")
+		}
+		return &user.User{Username: "citadel", Uid: "1001", HomeDir: root}, nil
+	}
+	verify := func(*user.User) error { return nil }
+	active := func(*user.User) (bool, error) {
+		pid, err := os.ReadFile(pidFile)
+		return string(pid) == "4172\n", err
+	}
+	ready, err := classifyExistingPodmanWorker(lookup, verify, active)
+	if err != nil || ready {
+		t.Fatalf("first pass readiness=%v, err=%v", ready, err)
+	}
+	mutations++ // the first pass provisions the dedicated account and worker
+	ownerExists = true
+	// The production entrypoint returns immediately on ready, before the
+	// first mutating call. Pin its ordering as well as the fixture state.
+	source, err := os.ReadFile("init.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := string(source)
+	if guard, mutate := strings.Index(entry, "if ready {"), strings.Index(entry, "ensureNodeIdentity(authServiceURL)"); guard < 0 || mutate < 0 || guard > mutate {
+		t.Fatal("healthy-worker return moved after identity mutation")
+	}
+	beforeManifest, _ := os.ReadFile(manifest)
+	beforePID, _ := os.ReadFile(pidFile)
+	ready, err = classifyExistingPodmanWorker(lookup, verify, active)
+	if err != nil || !ready {
+		t.Fatalf("second pass readiness=%v, err=%v", ready, err)
+	}
+	afterManifest, _ := os.ReadFile(manifest)
+	afterPID, _ := os.ReadFile(pidFile)
+	if mutations != 1 || string(beforeManifest) != string(afterManifest) || string(beforePID) != string(afterPID) {
+		t.Fatal("healthy rerun mutated config, worker PID, or provisioning count")
+	}
+}
+
+func TestInstallerHealthyRerunSkipsLogAndMutators(t *testing.T) {
+	source, err := os.ReadFile("../install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	logPath := filepath.Join(root, "install.log")
+	configPath := filepath.Join(root, "citadel.yaml")
+	pidPath := filepath.Join(root, "worker.pid")
+	mutationPath := filepath.Join(root, "mutation")
+	script := strings.Replace(string(source), `LOG_FILE="/var/log/citadel-install.log"`, `LOG_FILE="`+logPath+`"`, 1)
+	script = strings.Replace(script, "main \"$@\"", "", 1)
+	script += `
+original_preflight=$(declare -f preflight)
+preflight() { ALREADY_READY=false; }
+for step in resolve_authkey detect_gpu install_nvidia_drivers install_podman install_nvidia_toolkit install_node_tools install_citadel_binary prepull_vllm prepull_app_runtimes print_summary log; do
+    eval "$step() { :; }"
+done
+setup_citadel() { printf 'node: original\n' > "` + configPath + `"; }
+setup_systemd_service() { :; }
+start_worker() { printf '4172\n' > "` + pidPath + `"; printf 'first-pass\n' >> "` + mutationPath + `"; }
+main
+eval "$original_preflight"
+id() { if [ "$1" = -u ]; then echo 0; else return 0; fi; }
+verify_service_account() { :; }
+existing_rootless_worker() { return 0; }
+main
+`
+	out, err := exec.Command("bash", "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("healthy installer rerun failed: %v: %s", err, out)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("healthy rerun created log: %v", err)
+	}
+	mutations, err := os.ReadFile(mutationPath)
+	if err != nil || string(mutations) != "first-pass\n" {
+		t.Fatalf("healthy rerun invoked mutator: %v: %q", err, mutations)
+	}
+	config, _ := os.ReadFile(configPath)
+	pid, _ := os.ReadFile(pidPath)
+	if string(config) != "node: original\n" || string(pid) != "4172\n" {
+		t.Fatal("healthy installer rerun changed config or worker PID")
+	}
+}
+
+func TestPackerToolkitOnlyCPUArm64SkipsGPUSetup(t *testing.T) {
+	source, err := os.ReadFile("../packer/scripts/03-podman.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(source)
+	if !strings.Contains(code, "if has_nvidia_hardware; then\nfor group in video render") {
+		t.Fatal("Packer GPU groups are not gated by hardware")
+	}
+	if !strings.Contains(code, "if ! has_nvidia_hardware; then\n    exit 0") {
+		t.Fatal("CDI boot helper does not skip CPU-only nodes")
+	}
+}
