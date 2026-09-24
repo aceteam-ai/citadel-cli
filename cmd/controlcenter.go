@@ -1658,35 +1658,37 @@ func ccStartService(name string) error {
 			// fails transiently. Best-effort: the service is in the manifest (we
 			// just found it), so a failure here is unexpected but must not block
 			// the start.
-			_ = setServiceDesiredStatus(configDir, name, "")
-			// Transitional (#528): drop any container still under the legacy
-			// "citadel-<name>" project so the no-`-p` up below does not conflict
-			// on the pinned container_name.
-			removeLegacyCitadelProject(name)
-			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			// Include the least-privilege sandbox override when present so a
-			// TUI-installed untrusted module also starts hardened here (the
-			// override would otherwise be bypassed by this start site).
-			// No -p: the default compose project (dir basename, "services") is the
-			// standardized convention shared with the boot/run/stop/job paths and
-			// the no-`-p` status reads (#528).
-			composeArgs := composeFileArgs(fullComposePath, fullComposePath)
-			composeArgs = append(composeArgs, "up", "-d")
-			// Warn (never refuse) when an embedded engine will be published on
-			// all interfaces (aceteam-ai/citadel-cli#1023) so a TUI-started
-			// `bind: all` (or ollama's default) engine isn't silently exposed.
-			if w := serviceBindExposureWarning(service, configDir); w != "" {
-				clilog.Writef("warning", "%s", w)
-			}
-			// composeCommand injects the citadel-owned host ports so the
-			// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
-			// start button dies for llamacpp/vllm/extraction/diffusers on
-			// v2.57.0 (#426). composeEnvForService additionally supplies the
-			// #1023 CITADEL_<SVC>_BIND entry so a `bind: all` engine started
-			// from the TUI is not silently reverted to loopback.
-			ccCmd := composeCommandFor(rt, composeArgs...)
-			ccCmd.Env = composeEnvForService(name)
-			return ccCmd.Run()
+			return withLocalServiceStartGuard(configDir, name, func() error {
+				_ = setServiceDesiredStatus(configDir, name, "")
+				// Transitional (#528): drop any container still under the legacy
+				// "citadel-<name>" project so the no-`-p` up below does not conflict
+				// on the pinned container_name.
+				removeLegacyCitadelProject(name)
+				fullComposePath := filepath.Join(configDir, service.ComposeFile)
+				// Include the least-privilege sandbox override when present so a
+				// TUI-installed untrusted module also starts hardened here (the
+				// override would otherwise be bypassed by this start site).
+				// No -p: the default compose project (dir basename, "services") is the
+				// standardized convention shared with the boot/run/stop/job paths and
+				// the no-`-p` status reads (#528).
+				composeArgs := composeFileArgs(fullComposePath, fullComposePath)
+				composeArgs = append(composeArgs, "up", "-d")
+				// Warn (never refuse) when an embedded engine will be published on
+				// all interfaces (aceteam-ai/citadel-cli#1023) so a TUI-started
+				// `bind: all` (or ollama's default) engine isn't silently exposed.
+				if w := serviceBindExposureWarning(service, configDir); w != "" {
+					clilog.Writef("warning", "%s", w)
+				}
+				// composeCommand injects the citadel-owned host ports so the
+				// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
+				// start button dies for llamacpp/vllm/extraction/diffusers on
+				// v2.57.0 (#426). composeEnvForService additionally supplies the
+				// #1023 CITADEL_<SVC>_BIND entry so a `bind: all` engine started
+				// from the TUI is not silently reverted to loopback.
+				ccCmd := composeCommandFor(rt, composeArgs...)
+				ccCmd.Env = composeEnvForService(name)
+				return ccCmd.Run()
+			})
 		}
 	}
 
@@ -1747,27 +1749,29 @@ func ccRestartService(name string) error {
 			}
 			// A restart expresses "keep this running": clear any durable stopped
 			// marker so the service also starts on the next boot. Best-effort.
-			_ = setServiceDesiredStatus(configDir, name, "")
-			// Transitional (#528): a container still under the legacy
-			// "citadel-<name>" project is invisible to a no-`-p` `compose restart`
-			// (silent no-op) AND conflicts with a no-`-p` up on the pinned
-			// container_name. Remove it, then converge with `up -d
-			// --force-recreate`, which restarts a default-project container and
-			// (re)creates one when the legacy container was just removed --
-			// `restart` alone would no-op in that case.
-			removeLegacyCitadelProject(name)
-			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			// Warn (never refuse) on all-interfaces exposure, and inject the
-			// #1023 CITADEL_<SVC>_BIND entry (via composeEnvForService) so a
-			// restarted `bind: all` engine keeps its chosen interface instead of
-			// being silently reverted to loopback.
-			if w := serviceBindExposureWarning(service, configDir); w != "" {
-				clilog.Writef("warning", "%s", w)
-			}
-			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "up", "-d", "--force-recreate")
-			cmd := composeCommandFor(rt, restartArgs...)
-			cmd.Env = composeEnvForService(name)
-			return cmd.Run()
+			return withLocalServiceStartGuard(configDir, name, func() error {
+				_ = setServiceDesiredStatus(configDir, name, "")
+				// Transitional (#528): a container still under the legacy
+				// "citadel-<name>" project is invisible to a no-`-p` `compose restart`
+				// (silent no-op) AND conflicts with a no-`-p` up on the pinned
+				// container_name. Remove it, then converge with `up -d
+				// --force-recreate`, which restarts a default-project container and
+				// (re)creates one when the legacy container was just removed --
+				// `restart` alone would no-op in that case.
+				removeLegacyCitadelProject(name)
+				fullComposePath := filepath.Join(configDir, service.ComposeFile)
+				// Warn (never refuse) on all-interfaces exposure, and inject the
+				// #1023 CITADEL_<SVC>_BIND entry (via composeEnvForService) so a
+				// restarted `bind: all` engine keeps its chosen interface instead of
+				// being silently reverted to loopback.
+				if w := serviceBindExposureWarning(service, configDir); w != "" {
+					clilog.Writef("warning", "%s", w)
+				}
+				restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "up", "-d", "--force-recreate")
+				cmd := composeCommandFor(rt, restartArgs...)
+				cmd.Env = composeEnvForService(name)
+				return cmd.Run()
+			})
 		}
 	}
 

@@ -13,6 +13,16 @@ import (
 const HoldFile = "active.hold"
 const lockFile = "reservation.lock"
 
+const OCRService = "unlimited-ocr"
+const OllamaService = "ollama"
+
+// CouldEvict names the two serving modules fine-tune may stop. Even if one
+// was not running (and therefore has no job tag), a local start while training
+// is active would defeat the exclusive-mode window.
+func CouldEvict(name string) bool {
+	return name == OCRService || name == OllamaService
+}
+
 func Dir(configDir string) string {
 	return filepath.Join(configDir, "finetune", "safety")
 }
@@ -75,4 +85,29 @@ func RequireOwned(configDir, jobID string) error {
 		return errors.New("fine-tune safety hold belongs to another job")
 	}
 	return nil
+}
+
+// HeldJobID returns the active fine-tune owner. A malformed or unreadable
+// hold fails closed because callers cannot safely distinguish a held tag.
+func HeldJobID(configDir string) (string, bool, error) {
+	path := Path(configDir)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("cannot check fine-tune safety hold: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", false, errors.New("fine-tune safety hold is not a regular file")
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, fmt.Errorf("cannot read fine-tune safety hold: %w", err)
+	}
+	id := strings.TrimSpace(string(contents))
+	if id == "" || len(id) > 80 || strings.ContainsAny(id, "\r\n\t ") {
+		return "", false, errors.New("fine-tune safety hold has an invalid job id")
+	}
+	return id, true, nil
 }

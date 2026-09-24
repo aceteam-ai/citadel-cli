@@ -1,11 +1,151 @@
 package jobs
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
+
+func TestStartExclusiveWithModelHoldAndRollback(t *testing.T) {
+	fixture := `services:
+  - name: target
+    type: docker
+    compose_file: ./services/target.yml
+    desired_status: stopped
+  - name: peer
+    type: docker
+    compose_file: ./services/peer.yml
+`
+	newHandler := func(t *testing.T) (*ServiceHandler, *fakeReservationExec) {
+		t.Helper()
+		return newReservationTestHandlerWithManifest(t, fixture, fullGPUStatus(svcInfo("peer", true, 2)))
+	}
+	t.Run("hold before admission refuses without eviction", func(t *testing.T) {
+		h, exec := newHandler(t)
+		if err := os.MkdirAll(finetunesafety.Dir(h.ConfigDir), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(finetunesafety.Path(h.ConfigDir), []byte("finetune-job"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		h.startWithModelFn = func(JobContext, string, string, uint64) ([]byte, error) { t.Fatal("start reached"); return nil, nil }
+		res, _, err := h.StartExclusiveWithModel(testCtx(), "exclusive:target", "target", "", 0, false)
+		if err == nil || res != nil || len(exec.stopped) != 0 {
+			t.Fatalf("hold allowed exclusive start: res=%v err=%v stops=%v", res, err, exec.stopped)
+		}
+	})
+	t.Run("failed start restores only new reservation and prior status", func(t *testing.T) {
+		h, exec := newHandler(t)
+		h.startWithModelFn = func(JobContext, string, string, uint64) ([]byte, error) { return nil, errors.New("start refused") }
+		res, _, err := h.StartExclusiveWithModel(testCtx(), "exclusive:target", "target", "", 0, false)
+		if err == nil || res != nil {
+			t.Fatalf("failed start res=%v err=%v", res, err)
+		}
+		if !equalStrings(exec.stopped, []string{"peer", "target"}) || !equalStrings(exec.started, []string{"peer"}) {
+			t.Fatalf("rollback execution: stopped=%v started=%v", exec.stopped, exec.started)
+		}
+		m := readManifestMap(t, h.ConfigDir)
+		if entry := manifestServiceEntry(t, m, "peer"); entry["evicted_by_job"] != nil {
+			t.Fatalf("peer tag remained: %v", entry)
+		}
+		if entry := manifestServiceEntry(t, m, "target"); entry["desired_status"] != "stopped" {
+			t.Fatalf("target prior status lost: %v", entry)
+		}
+	})
+	t.Run("target stop failure holds evicted peers", func(t *testing.T) {
+		h, exec := newHandler(t)
+		exec.failStop = map[string]bool{"target": true}
+		h.startWithModelFn = func(JobContext, string, string, uint64) ([]byte, error) { return nil, errors.New("partial start") }
+		res, _, err := h.StartExclusiveWithModel(testCtx(), "exclusive:target", "target", "", 0, false)
+		if res == nil || err == nil || !strings.Contains(err.Error(), "target cleanup failed") || len(exec.started) != 0 {
+			t.Fatalf("unsafe rollback: res=%v err=%v started=%v", res, err, exec.started)
+		}
+		m := readManifestMap(t, h.ConfigDir)
+		if entry := manifestServiceEntry(t, m, "peer"); entry["evicted_by_job"] != "exclusive:target" {
+			t.Fatalf("reservation tag lost: %v", entry)
+		}
+	})
+	t.Run("preexisting same job tag never released", func(t *testing.T) {
+		h, exec := newHandler(t)
+		if err := h.setEvictedMarkersInManifestFile("peer", "exclusive:target", ""); err != nil {
+			t.Fatal(err)
+		}
+		res, _, err := h.StartExclusiveWithModel(testCtx(), "exclusive:target", "target", "", 0, false)
+		if err == nil || res != nil || len(exec.started) != 0 || len(exec.stopped) != 0 {
+			t.Fatalf("existing reservation changed: res=%v err=%v exec=%+v", res, err, exec)
+		}
+		m := readManifestMap(t, h.ConfigDir)
+		if entry := manifestServiceEntry(t, m, "peer"); entry["evicted_by_job"] != "exclusive:target" {
+			t.Fatalf("preexisting tag lost: %v", entry)
+		}
+	})
+	t.Run("failed rollback remains visible", func(t *testing.T) {
+		h, exec := newHandler(t)
+		exec.failStart = map[string]bool{"peer": true}
+		h.startWithModelFn = func(JobContext, string, string, uint64) ([]byte, error) { return nil, errors.New("start refused") }
+		res, _, err := h.StartExclusiveWithModel(testCtx(), "exclusive:target", "target", "", 0, false)
+		if err == nil || res == nil || !strings.Contains(err.Error(), "rollback failed") {
+			t.Fatalf("rollback failure hidden: res=%v err=%v", res, err)
+		}
+		m := readManifestMap(t, h.ConfigDir)
+		if entry := manifestServiceEntry(t, m, "peer"); entry["evicted_by_job"] != "exclusive:target" {
+			t.Fatalf("failed rollback erased tag: %v", entry)
+		}
+	})
+}
+
+func TestStartExclusiveWithModelSerializesHoldCreationAcrossEvictionAndStart(t *testing.T) {
+	h, exec := newReservationTestHandlerWithManifest(t, `services:
+  - name: target
+    type: docker
+    compose_file: ./services/target.yml
+  - name: peer
+    type: docker
+    compose_file: ./services/peer.yml
+`, fullGPUStatus(svcInfo("peer", true, 2)))
+	entered := make(chan struct{})
+	finish := make(chan struct{})
+	h.startWithModelFn = func(JobContext, string, string, uint64) ([]byte, error) {
+		close(entered)
+		<-finish
+		return []byte(`{"running":true}`), nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := h.StartExclusiveWithModel(testCtx(), "exclusive:target", "target", "", 0, false)
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("start not reached")
+	}
+	if !equalStrings(exec.stopped, []string{"peer"}) {
+		t.Fatalf("peer not evicted before start: %v", exec.stopped)
+	}
+	// Another process cannot create the hold between eviction and admission.
+	lockErr := finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		return os.WriteFile(filepath.Join(finetunesafety.Dir(h.ConfigDir), finetunesafety.HoldFile), []byte("finetune-job"), 0600)
+	})
+	if lockErr == nil {
+		t.Fatal("fine-tune hold was created during exclusive start")
+	}
+	close(finish)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("exclusive start hung")
+	}
+}
 
 func TestExclusiveReservationJobIDDeterministic(t *testing.T) {
 	if got := ExclusiveReservationJobID("bonsai"); got != "exclusive:bonsai" {

@@ -294,6 +294,13 @@ func pruneUnreferenced() error {
 // composeUpDetached starts/recreates a service's container non-interactively. It
 // is intentionally minimal (no prompts) so `module update` is scriptable.
 func composeUpDetached(name, composePath string) error {
+	configDir := filepath.Dir(filepath.Dir(composePath))
+	return withLocalServiceStartGuard(configDir, name, func() error {
+		return composeUpDetachedUnchecked(name, composePath)
+	})
+}
+
+func composeUpDetachedUnchecked(name, composePath string) error {
 	if _, err := os.Stat(composePath); err != nil {
 		return fmt.Errorf("compose file not found: %s", composePath)
 	}

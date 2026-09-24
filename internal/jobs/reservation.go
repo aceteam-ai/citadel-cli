@@ -81,6 +81,47 @@ type ReservationSummary struct {
 	EvictedServices []string
 }
 
+// WithHeldServiceGuard guards a local service start or a mutation that could
+// erase a held reservation tag. A service tagged by the active fine-tune job
+// must remain stopped and tagged until verified cleanup; unrelated services
+// retain their existing behavior. The filesystem lock also prevents a
+// fine-tune reservation from tagging the service mid-start. Remote
+// SERVICE_START jobs use their existing Runner demand-yield path.
+func (h *ServiceHandler) WithHeldServiceGuard(name string, start func() error) error {
+	return h.withHeldServiceGuard(name, true, start)
+}
+
+// A stop may still proceed for an untagged serving module; it only needs to
+// preserve a tag it would otherwise erase. Start operations additionally
+// block the two candidate services even when they were already stopped and
+// therefore had no eviction tag.
+func (h *ServiceHandler) withHeldServiceGuard(name string, blockFineTuneCandidates bool, mutation func() error) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("local service start: name is required")
+	}
+	return finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		holdJob, held, err := finetunesafety.HeldJobID(h.ConfigDir)
+		if err != nil {
+			return fmt.Errorf("local service start %s: %w", name, err)
+		}
+		if held {
+			if blockFineTuneCandidates && finetunesafety.CouldEvict(name) {
+				return fmt.Errorf("local service start %s: service is reserved by active fine-tune job; verified cleanup required", name)
+			}
+			manifest, err := h.loadManifest()
+			if err != nil {
+				return fmt.Errorf("local service start %s: cannot inspect held reservation: %w", name, err)
+			}
+			for _, service := range manifest.Services {
+				if service.Name == name && service.EvictedByJob == holdJob {
+					return fmt.Errorf("local service start %s: service is reserved by active fine-tune job; verified cleanup required", name)
+				}
+			}
+		}
+		return mutation()
+	})
+}
+
 // Reserve evicts non-pinned services to free requiredVRAMBytes of VRAM on
 // behalf of jobID, durably tagging every service it stops with
 // evicted_by_job=jobID so Release(jobID) (or a crash-recovery reconcile) can

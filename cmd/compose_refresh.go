@@ -100,6 +100,17 @@ func recreateOnUpgradeEnabled() bool {
 // container is not running or already publishes the wanted port, it is left
 // untouched (recreated=false).
 func enginePortRecreator(service, composePath string, wantHostPort int) (bool, error) {
+	configDir := filepath.Dir(filepath.Dir(composePath))
+	var recreated bool
+	err := withLocalServiceStartGuard(configDir, service, func() error {
+		var recreateErr error
+		recreated, recreateErr = enginePortRecreatorUnchecked(service, composePath, wantHostPort)
+		return recreateErr
+	})
+	return recreated, err
+}
+
+func enginePortRecreatorUnchecked(service, composePath string, wantHostPort int) (bool, error) {
 	rt := catalog.SelectContainerRuntime()
 	// citadel#860: this sweep only ever runs from citadel work's boot path
 	// (refreshManagedComposeFiles, cmd/work.go), which refuses --node-dir/

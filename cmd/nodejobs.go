@@ -264,7 +264,15 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 type fineTuneServiceReservation struct{ service *jobs.ServiceHandler }
 
 func (r *fineTuneServiceReservation) Reserve(ctx context.Context, jobID string) ([]string, error) {
-	res, err := r.service.ReserveNamed(jobs.JobContext{Ctx: ctx}, jobID, []string{"unlimited-ocr", "ollama"})
+	var res *jobs.Reservation
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(r.service.ConfigDir), func() error {
+		if err := finetunesafety.RequireOwned(r.service.ConfigDir, jobID); err != nil {
+			return err
+		}
+		var reserveErr error
+		res, reserveErr = r.service.ReserveNamed(jobs.JobContext{Ctx: ctx}, jobID, []string{finetunesafety.OCRService, finetunesafety.OllamaService})
+		return reserveErr
+	})
 	if res == nil {
 		return nil, err
 	}

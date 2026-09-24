@@ -37,6 +37,18 @@ var (
 	exclusiveVRAMGB float64
 )
 
+type exclusiveServiceStarter interface {
+	StartExclusiveWithModel(jobs.JobContext, string, string, string, uint64, bool) (*jobs.Reservation, []byte, error)
+}
+
+// Keep CLI admission behind the same one-call transaction as local MCP. The
+// interface permits a hermetic routing test without invoking Docker or a GPU.
+func startExclusiveForCLI(starter exclusiveServiceStarter, ctx jobs.JobContext, jobID, serviceName string, vramGB float64) (*jobs.Reservation, error) {
+	budget := uint64(vramGB * 1024 * 1024 * 1024)
+	res, _, err := starter.StartExclusiveWithModel(ctx, jobID, serviceName, "", budget, vramGB > 0)
+	return res, err
+}
+
 func init() {
 	runCmd.Flags().BoolVar(&exclusiveRun, "exclusive", false,
 		"Reserve the GPU exclusively for this service: durably evict every other non-pinned "+
@@ -71,18 +83,12 @@ func runServiceExclusive(serviceName string) {
 	jobID := jobs.ExclusiveReservationJobID(serviceName)
 
 	fmt.Printf("--- 🔒 Reserving the GPU exclusively for '%s' ---\n", serviceName)
-	var res *jobs.Reservation
-	if exclusiveVRAMGB > 0 {
-		budget := uint64(exclusiveVRAMGB * 1024 * 1024 * 1024)
-		res, err = handler.Reserve(jctx, jobID, budget)
-	} else {
-		res, err = handler.ReserveExclusive(jctx, jobID, serviceName)
-	}
+	res, err := startExclusiveForCLI(handler, jctx, jobID, serviceName, exclusiveVRAMGB)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to reserve GPU for '%s': %v\n", serviceName, err)
+		fmt.Fprintf(os.Stderr, "❌ Failed to reserve and start '%s': %v\n", serviceName, err)
 		if res != nil && len(res.Evicted) > 0 {
-			fmt.Fprintf(os.Stderr, "   Some services were already evicted before the failure: %s\n", strings.Join(res.Evicted, ", "))
-			fmt.Fprintf(os.Stderr, "   Run 'citadel module reservations release %s' to restore them.\n", jobID)
+			fmt.Fprintf(os.Stderr, "   Rollback was incomplete for: %s\n", strings.Join(res.Evicted, ", "))
+			fmt.Fprintf(os.Stderr, "   Inspect 'citadel module reservations list' before retrying release %s.\n", jobID)
 		}
 		os.Exit(1)
 	}
@@ -95,21 +101,6 @@ func runServiceExclusive(serviceName string) {
 	}
 	fmt.Printf("   - %s\n", res.Reason)
 
-	// An explicit exclusive run clears the durable stopped marker (mirrors
-	// runSingleService's identical behavior for a plain `citadel run`) so the
-	// service also starts on the next boot.
-	if err := setServiceDesiredStatus(configDir, serviceName, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️  Could not clear stopped marker for %s: %v\n", serviceName, err)
-	}
-
-	fmt.Printf("--- 🚀 Starting '%s' ---\n", serviceName)
-	if _, startErr := handler.StartServiceWithModel(jctx, serviceName, "", 0); startErr != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to start '%s': %v\n", serviceName, startErr)
-		fmt.Fprintln(os.Stderr, "   The GPU reservation is still held (evicted peers are NOT restored automatically on a")
-		fmt.Fprintf(os.Stderr, "   failed start). Run 'citadel module reservations release %s' to restore them, or fix the\n", jobID)
-		fmt.Fprintln(os.Stderr, "   problem and retry.")
-		os.Exit(1)
-	}
 	fmt.Printf("✅ '%s' is running with exclusive GPU access.\n", serviceName)
 	fmt.Printf("   Reservation ID: %s\n", jobID)
 

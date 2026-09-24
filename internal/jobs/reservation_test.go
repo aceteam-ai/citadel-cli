@@ -700,6 +700,12 @@ services:
 		if restored, err := h.ReleaseAfterVerifiedFineTuneTermination(testCtx(), "wrong-job"); err == nil || len(restored) != 0 {
 			t.Fatalf("verified release for wrong job = (%v, %v), want refusal", restored, err)
 		}
+		if _, err := h.Execute(testCtx(), &nexus.Job{ID: "stop-job", Type: "SERVICE_STOP", Payload: map[string]string{"service": "unlimited-ocr"}}); err == nil {
+			t.Fatal("remote SERVICE_STOP erased an active fine-tune reservation tag")
+		}
+		if err := h.StartServiceByName("unlimited-ocr"); err == nil {
+			t.Fatal("direct service start bypassed active fine-tune reservation tag")
+		}
 		if len(exec.started) != 0 {
 			t.Fatalf("started services while trainer hold remains: %v", exec.started)
 		}
