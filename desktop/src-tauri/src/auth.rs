@@ -266,6 +266,9 @@ pub fn code_from_callback(raw: &str) -> Result<String, String> {
     let url = Url::parse(raw).map_err(|_| "Invalid sign-in callback".to_string())?;
     if url.scheme() != "citadel"
         || url.host_str() != Some("auth")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
         || url.path() != "/callback"
         || url.fragment().is_some()
     {
@@ -307,6 +310,8 @@ mod tests {
         for bad in [
             "https://auth/callback?code=abc",
             "citadel://auth.evil/callback?code=abc",
+            "citadel://auth:444/callback?code=abc",
+            "citadel://evil@auth/callback?code=abc",
             "citadel://auth/other?code=abc",
             "citadel://auth/callback?code=abc&code=def",
             "citadel://auth/callback?code=abc&next=https://evil.example",
