@@ -252,6 +252,14 @@ type LegacyHFCache struct {
 	SizeBytes int64 `json:"size_bytes"`
 }
 
+// RuntimeStorageScan records a container graph root measured alongside model
+// caches. In particular, this makes rootless Podman's per-user graph visible
+// to cache accounting instead of assuming Docker's system root.
+type RuntimeStorageScan struct {
+	Path          string `json:"path"`
+	MeasuredBytes int64  `json:"measured_bytes"`
+}
+
 // Meta is the index's scan metadata (citadel #682 P3, design doc §9.3):
 // everything ReconcileScan records about ITS OWN most recent pass, as
 // opposed to the per-artifact Entry records. Zero value (ScannedAt.IsZero(),
@@ -273,6 +281,9 @@ type Meta struct {
 	// LegacyHF is non-nil only when the last scan's ScanOptions.LegacyHFHubDir
 	// probe found a real legacy duplicate cache.
 	LegacyHF *LegacyHFCache
+	// RuntimeStorage contains the graph roots that existed and were measured
+	// during the last scan.
+	RuntimeStorage []RuntimeStorageScan
 }
 
 // fileFormat is the top-level on-disk shape. ScannedAt/Dirs/LegacyHF are
@@ -284,11 +295,12 @@ type Meta struct {
 // pattern so a malformed scanned_at degrades that ONE field to "unknown"
 // rather than the whole top-level unmarshal failing.
 type fileFormat struct {
-	Version   int            `json:"version"`
-	Entries   []Entry        `json:"entries"`
-	ScannedAt string         `json:"scanned_at,omitempty"`
-	Dirs      []DirScan      `json:"dirs,omitempty"`
-	LegacyHF  *LegacyHFCache `json:"legacy_hf_cache,omitempty"`
+	Version        int                  `json:"version"`
+	Entries        []Entry              `json:"entries"`
+	ScannedAt      string               `json:"scanned_at,omitempty"`
+	Dirs           []DirScan            `json:"dirs,omitempty"`
+	LegacyHF       *LegacyHFCache       `json:"legacy_hf_cache,omitempty"`
+	RuntimeStorage []RuntimeStorageScan `json:"runtime_storage,omitempty"`
 }
 
 // entryKey builds the (cache_dir, model) primary key. NUL-joined so a
@@ -315,10 +327,10 @@ func (ix *Index) snapshot() *Index {
 	for k, v := range ix.entries {
 		out.entries[k] = v
 	}
-	// meta's slices (Dirs) are never mutated in place by ReconcileScan (it
-	// always assigns a fresh slice -- see buildDirScans), so sharing them
-	// with the snapshot is safe under Index's "never mutated after
-	// construction" contract.
+	// meta's slices (Dirs and RuntimeStorage) are never mutated in place by
+	// ReconcileScan (it always assigns fresh slices), so sharing them with the
+	// snapshot is safe under Index's "never mutated after construction"
+	// contract.
 	out.meta = ix.meta
 	return out
 }
@@ -365,11 +377,12 @@ func Load(path string) (*Index, error) {
 	// array. A single json.Unmarshal into []Entry would fail the whole
 	// slice on the first bad element.
 	var raw struct {
-		Version   int               `json:"version"`
-		Entries   []json.RawMessage `json:"entries"`
-		ScannedAt string            `json:"scanned_at,omitempty"`
-		Dirs      []DirScan         `json:"dirs,omitempty"`
-		LegacyHF  *LegacyHFCache    `json:"legacy_hf_cache,omitempty"`
+		Version        int                  `json:"version"`
+		Entries        []json.RawMessage    `json:"entries"`
+		ScannedAt      string               `json:"scanned_at,omitempty"`
+		Dirs           []DirScan            `json:"dirs,omitempty"`
+		LegacyHF       *LegacyHFCache       `json:"legacy_hf_cache,omitempty"`
+		RuntimeStorage []RuntimeStorageScan `json:"runtime_storage,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return idx, err
@@ -392,6 +405,7 @@ func Load(path string) (*Index, error) {
 	// whole load, mirroring entryJSON's per-field leniency.
 	idx.meta.Dirs = raw.Dirs
 	idx.meta.LegacyHF = raw.LegacyHF
+	idx.meta.RuntimeStorage = raw.RuntimeStorage
 	if raw.ScannedAt != "" {
 		if t, err := time.Parse(time.RFC3339, raw.ScannedAt); err == nil {
 			idx.meta.ScannedAt = t
@@ -424,7 +438,7 @@ func writeIndexFile(path string, idx *Index) error {
 		return entries[i].Model < entries[j].Model
 	})
 
-	ff := fileFormat{Version: FormatVersion, Entries: entries, Dirs: idx.meta.Dirs, LegacyHF: idx.meta.LegacyHF}
+	ff := fileFormat{Version: FormatVersion, Entries: entries, Dirs: idx.meta.Dirs, LegacyHF: idx.meta.LegacyHF, RuntimeStorage: idx.meta.RuntimeStorage}
 	if !idx.meta.ScannedAt.IsZero() {
 		ff.ScannedAt = idx.meta.ScannedAt.UTC().Format(time.RFC3339)
 	}

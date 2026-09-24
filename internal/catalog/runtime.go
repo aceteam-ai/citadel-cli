@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // RuntimeOverrideEnv is the environment variable that forces a container
@@ -69,6 +72,92 @@ func (rt ContainerRuntime) ComposeArgs(args ...string) []string {
 	out := make([]string, 0, len(rt.ComposePrefix)+len(args))
 	out = append(out, rt.ComposePrefix...)
 	return append(out, args...)
+}
+
+// GPUArgs translates a Docker-compatible GPU request into engine-specific run
+// arguments. Docker retains its --gpus syntax. Podman consumes NVIDIA CDI
+// device names and therefore receives one --device argument per selector.
+// Unsupported or ambiguous Podman requests fail closed instead of starting a
+// container without the requested GPU isolation.
+func (rt ContainerRuntime) GPUArgs(spec string) ([]string, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, nil
+	}
+	if rt.engineBin() != "podman" {
+		return []string{"--gpus", spec}, nil
+	}
+
+	selectors, err := podmanGPUSelectors(spec)
+	if err != nil {
+		return nil, err
+	}
+	args := make([]string, 0, len(selectors)*2)
+	for _, selector := range selectors {
+		args = append(args, "--device", "nvidia.com/gpu="+selector)
+	}
+	return args, nil
+}
+
+// PreflightLimitControllers refuses a rootless Podman launch when the caller
+// requested limits that the systemd user service cannot actually enforce.
+// Docker and rootful runtimes retain their existing behavior.
+func (rt ContainerRuntime) PreflightLimitControllers(required ...string) error {
+	if rt.engineBin() != "podman" || !rt.Rootless || len(required) == 0 {
+		return nil
+	}
+	health := platform.CheckRootlessCgroupDelegation(required)
+	if health.OK {
+		return nil
+	}
+	if health.Hint != "" {
+		return fmt.Errorf("%s (%s)", health.String(), health.Hint)
+	}
+	return fmt.Errorf("%s", health.String())
+}
+
+func podmanGPUSelectors(spec string) ([]string, error) {
+	selectorSpec := strings.TrimSpace(spec)
+	if strings.HasPrefix(selectorSpec, "device=") {
+		selectorSpec = strings.TrimSpace(strings.TrimPrefix(selectorSpec, "device="))
+	}
+	if count, err := strconv.Atoi(selectorSpec); err == nil {
+		if count <= 0 {
+			return nil, fmt.Errorf("GPU count must be positive")
+		}
+		selectors := make([]string, count)
+		for i := range selectors {
+			selectors[i] = strconv.Itoa(i)
+		}
+		return selectors, nil
+	}
+
+	parts := strings.Split(selectorSpec, ",")
+	selectors := make([]string, 0, len(parts))
+	for _, part := range parts {
+		selector := strings.TrimSpace(part)
+		if !validGPUSelector(selector) {
+			return nil, fmt.Errorf("unsupported Podman GPU selector %q", spec)
+		}
+		selectors = append(selectors, selector)
+	}
+	if len(selectors) == 0 {
+		return nil, fmt.Errorf("GPU selector is empty")
+	}
+	return selectors, nil
+}
+
+func validGPUSelector(selector string) bool {
+	if selector == "" {
+		return false
+	}
+	for _, r := range selector {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._:-", r) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // engineBin returns the engine CLI binary for a plain sub-command, defaulting to

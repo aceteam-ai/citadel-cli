@@ -2,12 +2,74 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
+
+func TestRunPodmanGPUProbe(t *testing.T) {
+	var gotBinary string
+	var gotArgs []string
+	health := runPodmanGPUProbe(
+		catalog.ContainerRuntime{EngineBin: "podman", Rootless: true},
+		func(string) (string, error) { return "/usr/bin/nvidia-smi", nil },
+		func(_ context.Context, binary string, args ...string) ([]byte, error) {
+			gotBinary, gotArgs = binary, append([]string(nil), args...)
+			return []byte("GPU 0: Test GPU"), nil
+		},
+	)
+	if !health.Applicable || !health.OK {
+		t.Fatalf("health = %+v, want applicable and OK", health)
+	}
+	want := []string{"run", "--rm", "--pull=never", "--device", "nvidia.com/gpu=all", "--security-opt=label=disable", doctorCUDAProbeImage, "nvidia-smi", "-L"}
+	if gotBinary != "podman" || !reflect.DeepEqual(gotArgs, want) {
+		t.Fatalf("command = %s %v, want podman %v", gotBinary, gotArgs, want)
+	}
+}
+
+func TestRunPodmanGPUProbeFailureAndNotApplicable(t *testing.T) {
+	failed := runPodmanGPUProbe(
+		catalog.ContainerRuntime{EngineBin: "podman", Rootless: true},
+		func(string) (string, error) { return "/usr/bin/nvidia-smi", nil },
+		func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("CDI device unavailable"), errors.New("exit 125")
+		},
+	)
+	if !failed.Applicable || failed.OK || !strings.Contains(failed.Message, "CDI device unavailable") {
+		t.Fatalf("failed health = %+v", failed)
+	}
+
+	none := runPodmanGPUProbe(
+		catalog.ContainerRuntime{EngineBin: "podman", Rootless: true},
+		func(string) (string, error) { return "", errors.New("missing") },
+		func(context.Context, string, ...string) ([]byte, error) {
+			t.Fatal("runner called without host GPU")
+			return nil, nil
+		},
+	)
+	if none.Applicable || none.OK {
+		t.Fatalf("no-GPU health = %+v, want not applicable", none)
+	}
+}
+
+func TestDoctorReportOKIncludesPodmanSafetyChecks(t *testing.T) {
+	base := doctorReport{dockerHealth: platform.DockerHealth{OK: true}, doctor: healthyDoctorPayload()}
+	base.cgroupHealth = platform.CgroupDelegationHealth{Applicable: true, OK: false, Missing: []string{"memory"}}
+	if base.ok() {
+		t.Fatal("missing cgroup delegation must fail doctor")
+	}
+	base.cgroupHealth.OK = true
+	base.gpuHealth = gpuProbeHealth{Applicable: true, OK: false, Message: "CDI failed"}
+	if base.ok() {
+		t.Fatal("failed CDI probe must fail doctor")
+	}
+}
 
 // healthyDoctorPayload builds an agentDoctor-shaped payload for a fully
 // healthy job-routing state, mirroring the map shape agentDoctor
