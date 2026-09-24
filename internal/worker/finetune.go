@@ -157,15 +157,19 @@ func (h *FineTuneHandler) YieldToDemand() {
 }
 
 func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
-	fail := func(err error) (*JobResult, error) {
+	terminalFailure := func(err error, honorCancellation bool) (*JobResult, error) {
 		if h.cfg.Control != nil && job != nil {
-			if cancelled, checkErr := h.cfg.Control.Cancelled(context.Background(), job.ID); checkErr == nil && cancelled {
-				return h.cancelled(context.Background(), job.ID, stream, "cancelled")
+			if honorCancellation {
+				if cancelled, checkErr := h.cfg.Control.Cancelled(context.Background(), job.ID); checkErr == nil && cancelled {
+					return h.cancelled(context.Background(), job.ID, stream, "cancelled")
+				}
 			}
 			_ = h.cfg.Control.Update(context.Background(), job.ID, map[string]any{"status": "failed", "error": err.Error(), "finished_at": time.Now().UTC().Format(time.RFC3339)})
 		}
 		return &JobResult{Status: JobStatusTerminalFailure, Error: err}, nil
 	}
+	fail := func(err error) (*JobResult, error) { return terminalFailure(err, true) }
+	failCritical := func(err error) (*JobResult, error) { return terminalFailure(err, false) }
 	if !isPerNodeStream(job.SourceQueue) {
 		return fail(errors.New("FINETUNE_START requires a per-node queue"))
 	}
@@ -218,11 +222,14 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 		return h.cfg.Reservation.Release(releaseCtx, job.ID)
 	}
 	if reserveErr != nil {
-		return fail(errors.Join(reserveErr, release()))
+		if err := release(); err != nil {
+			return failCritical(errors.Join(reserveErr, fmt.Errorf("FINETUNE_START: restore after reservation failure: %w", err)))
+		}
+		return fail(reserveErr)
 	}
 	if trainCtx.Err() != nil {
 		if err := release(); err != nil {
-			return fail(err)
+			return failCritical(fmt.Errorf("FINETUNE_START: restore after preemption: %w", err))
 		}
 		return h.cancelled(context.Background(), job.ID, stream, "preempted by demand")
 	}
@@ -272,9 +279,15 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 	wasCancelled := trainCtx.Err() != nil
 	close(stopPoll)
 	cancel()
+	var terminationErr *fineTuneTerminationError
+	if errors.As(runErr, &terminationErr) {
+		// The container may still own GPU memory. Keep the durable reservation
+		// tag and serving modules stopped; never claim cancellation succeeded.
+		return failCritical(runErr)
+	}
 	releaseErr := release()
 	if releaseErr != nil {
-		return fail(fmt.Errorf("FINETUNE_START: restore %v: %w", evicted, releaseErr))
+		return failCritical(fmt.Errorf("FINETUNE_START: restore %v: %w", evicted, releaseErr))
 	}
 	h.mu.Lock()
 	demanded := h.demanded
@@ -311,7 +324,17 @@ func (h *FineTuneHandler) cancelled(ctx context.Context, id string, stream Strea
 }
 
 func runFineTuneContainer(ctx context.Context, spec FineTuneSpec, image, cacheDir string, progress func(map[string]any) error) error {
-	runtime := catalog.SelectContainerRuntime()
+	return runFineTuneContainerWithRuntime(ctx, spec, image, cacheDir, catalog.SelectContainerRuntime(), progress)
+}
+
+type fineTuneTerminationError struct{ cause error }
+
+func (e *fineTuneTerminationError) Error() string {
+	return "FINETUNE_START: training container termination unconfirmed: " + e.cause.Error()
+}
+func (e *fineTuneTerminationError) Unwrap() error { return e.cause }
+
+func runFineTuneContainerWithRuntime(ctx context.Context, spec FineTuneSpec, image, cacheDir string, runtime catalog.ContainerRuntime, progress func(map[string]any) error) error {
 	args, err := fineTuneEngineArgs(spec, image, cacheDir, runtime)
 	if err != nil {
 		return err
@@ -349,12 +372,13 @@ func runFineTuneContainer(ctx context.Context, spec FineTuneSpec, image, cacheDi
 	if progressErr != nil {
 		_ = cmd.Process.Kill()
 	}
-	if ctx.Err() != nil || progressErr != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		_ = runtime.EngineCommandContext(cleanupCtx, "rm", "-f", name).Run()
-		cancel()
-	}
 	waitErr := cmd.Wait()
+	// Even a successful engine CLI exit is not enough to prove the container
+	// stopped. Force removal, then query the runtime's running-container list.
+	// A failed rm is harmless only when that independent query proves absence.
+	if err := stopFineTuneContainer(runtime, name); err != nil {
+		return &fineTuneTerminationError{cause: errors.Join(waitErr, progressErr, err)}
+	}
 	if progressErr != nil {
 		return progressErr
 	}
@@ -362,6 +386,25 @@ func runFineTuneContainer(ctx context.Context, spec FineTuneSpec, image, cacheDi
 		return err
 	}
 	return waitErr
+}
+
+func stopFineTuneContainer(runtime catalog.ContainerRuntime, name string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	removeOutput, removeErr := runtime.EngineCommandContext(cleanupCtx, "rm", "-f", name).CombinedOutput()
+	// `ps` lists running containers only. Compare exact names instead of using
+	// engine-specific filter regex semantics; Docker and Podman both support
+	// this format. Failure to query is not evidence that the child has stopped.
+	runningOutput, inspectErr := runtime.EngineCommandContext(cleanupCtx, "ps", "--format", "{{.Names}}").Output()
+	if inspectErr != nil {
+		return fmt.Errorf("force remove error=%v (%s); verify running containers: %w", removeErr, strings.TrimSpace(string(removeOutput)), inspectErr)
+	}
+	for _, runningName := range strings.Fields(string(runningOutput)) {
+		if runningName == name {
+			return fmt.Errorf("container %s is still running after force removal: %v (%s)", name, removeErr, strings.TrimSpace(string(removeOutput)))
+		}
+	}
+	return nil
 }
 
 func fineTuneDockerArgs(spec FineTuneSpec, image, cacheDir string) ([]string, error) {
