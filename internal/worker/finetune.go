@@ -109,6 +109,7 @@ func parseFineTune(job *Job, workspace, outputRoot string) (FineTuneSpec, error)
 type FineTuneControl interface {
 	Cancelled(context.Context, string) (bool, error)
 	Update(context.Context, string, map[string]any) error
+	FailCritical(context.Context, string, map[string]any) error
 	Progress(context.Context, string, map[string]any) error
 }
 
@@ -164,7 +165,14 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 					return h.cancelled(context.Background(), job.ID, stream, "cancelled")
 				}
 			}
-			_ = h.cfg.Control.Update(context.Background(), job.ID, map[string]any{"status": "failed", "error": err.Error(), "finished_at": time.Now().UTC().Format(time.RFC3339)})
+			errorText := err.Error()
+			if len(errorText) > 2000 {
+				errorText = strings.ToValidUTF8(errorText[:2000], "") + " (truncated)"
+			}
+			fields := map[string]any{"status": "failed", "error": errorText, "finished_at": time.Now().UTC().Format(time.RFC3339)}
+			if persistErr := h.persistTerminal(job.ID, fields, !honorCancellation); persistErr != nil {
+				err = errors.Join(err, fmt.Errorf("FINETUNE_START: canonical failure status update failed: %w", persistErr))
+			}
 		}
 		return &JobResult{Status: JobStatusTerminalFailure, Error: err}, nil
 	}
@@ -305,7 +313,6 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 		return fail(err)
 	}
 	if runErr != nil {
-		_ = h.cfg.Control.Update(context.Background(), job.ID, map[string]any{"status": "failed", "error": runErr.Error(), "finished_at": time.Now().UTC().Format(time.RFC3339)})
 		return fail(runErr)
 	}
 	state := map[string]any{"status": "succeeded", "adapter_path": spec.OutputDir, "progress_percent": 100, "finished_at": time.Now().UTC().Format(time.RFC3339)}
@@ -316,11 +323,37 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 }
 
 func (h *FineTuneHandler) cancelled(ctx context.Context, id string, stream StreamWriter, reason string) (*JobResult, error) {
-	_ = h.cfg.Control.Update(ctx, id, map[string]any{"status": "cancelled", "finished_at": time.Now().UTC().Format(time.RFC3339)})
+	fields := map[string]any{"status": "cancelled", "finished_at": time.Now().UTC().Format(time.RFC3339)}
+	if err := h.persistTerminal(id, fields, false); err != nil {
+		return &JobResult{Status: JobStatusTerminalFailure, Error: fmt.Errorf("FINETUNE_START: cancellation cleanup finished but canonical status update failed: %w", err)}, nil
+	}
 	if stream != nil {
 		_ = stream.WriteCancelled(reason)
 	}
 	return &JobResult{Status: JobStatusCancelled, Output: map[string]any{"status": "cancelled", "reason": reason}}, nil
+}
+
+// Terminal writes are idempotent in both control implementations. A short
+// bounded retry handles transient status transport failures without rerunning
+// training or claiming cancellation before the canonical hash confirms it.
+func (h *FineTuneHandler) persistTerminal(id string, fields map[string]any, critical bool) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if critical {
+			err = h.cfg.Control.FailCritical(ctx, id, fields)
+		} else {
+			err = h.cfg.Control.Update(ctx, id, fields)
+		}
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if attempt < 2 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	return err
 }
 
 func runFineTuneContainer(ctx context.Context, spec FineTuneSpec, image, cacheDir string, progress func(map[string]any) error) error {

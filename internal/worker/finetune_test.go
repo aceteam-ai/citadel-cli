@@ -17,7 +17,9 @@ type fineTuneControlFake struct {
 	mu        sync.Mutex
 	cancelled bool
 	updates   []map[string]any
+	critical  []map[string]any
 	events    []map[string]any
+	updateErr error
 }
 
 func (c *fineTuneControlFake) Cancelled(context.Context, string) (bool, error) {
@@ -28,6 +30,19 @@ func (c *fineTuneControlFake) Cancelled(context.Context, string) (bool, error) {
 func (c *fineTuneControlFake) Update(_ context.Context, _ string, fields map[string]any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.updateErr != nil {
+		return c.updateErr
+	}
+	c.updates = append(c.updates, fields)
+	return nil
+}
+func (c *fineTuneControlFake) FailCritical(_ context.Context, _ string, fields map[string]any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.updateErr != nil {
+		return c.updateErr
+	}
+	c.critical = append(c.critical, fields)
 	c.updates = append(c.updates, fields)
 	return nil
 }
@@ -246,6 +261,9 @@ func TestFineTuneRemovalFailureKeepsReservationAndNeverReportsCancelled(t *testi
 	if reservation.release != 0 || stream.cancelled {
 		t.Fatalf("unsafe restore=%d cancelled=%v", reservation.release, stream.cancelled)
 	}
+	if len(control.critical) != 1 || control.critical[0]["status"] != "failed" {
+		t.Fatalf("critical failure not persisted: %#v", control.critical)
+	}
 }
 
 func TestFineTuneRestoreFailureUnderUserCancelIsReported(t *testing.T) {
@@ -264,6 +282,23 @@ func TestFineTuneRestoreFailureUnderUserCancelIsReported(t *testing.T) {
 	}
 	if reservation.release != 1 || stream.cancelled {
 		t.Fatalf("restore attempts=%d cancelled=%v", reservation.release, stream.cancelled)
+	}
+	if len(control.critical) != 1 || control.critical[0]["status"] != "failed" {
+		t.Fatalf("restore failure not persisted: %#v", control.critical)
+	}
+}
+
+func TestFineTuneCancellationUpdateFailureDoesNotClaimCancelled(t *testing.T) {
+	cfg, job, control, reservation := fineTuneFixture(t)
+	stream := &MockStreamWriter{}
+	control.cancelled = true
+	control.updateErr = errors.New("status store unavailable")
+	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, stream)
+	if res.Status != JobStatusTerminalFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "canonical status update failed") {
+		t.Fatalf("result=%+v", res)
+	}
+	if stream.cancelled || reservation.reserve != 0 {
+		t.Fatalf("claimed cancellation before persistence: stream=%v reserve=%d", stream.cancelled, reservation.reserve)
 	}
 }
 

@@ -13,25 +13,30 @@ var ErrFineTuneCancelled = errors.New("fine-tune job cancelled")
 const fineTuneCancelledLua = `
 local key = KEYS[1]
 if redis.call('HGET', key, 'org_id') ~= ARGV[1] or redis.call('HGET', key, 'node_id') ~= ARGV[2] then return -1 end
-if redis.call('HGET', key, 'status') == 'cancelled' or redis.call('EXISTS', KEYS[2]) == 1 then return 1 end
+local status = redis.call('HGET', key, 'status')
+if status == 'cancelling' or status == 'cancelled' then return 1 end
+if status ~= 'succeeded' and status ~= 'failed' and redis.call('EXISTS', KEYS[2]) == 1 then return 1 end
 return 0`
 
 const fineTuneUpdateLua = `
 local key = KEYS[1]
 if redis.call('HGET', key, 'org_id') ~= ARGV[1] or redis.call('HGET', key, 'node_id') ~= ARGV[2] then return -1 end
 local status = redis.call('HGET', key, 'status')
-if (status == 'cancelled' or redis.call('EXISTS', KEYS[2]) == 1) and ARGV[3] ~= 'cancelled' then return -2 end
+local critical = ARGV[4] == '1'
+if critical and ARGV[3] ~= 'failed' then return -3 end
 if status == 'succeeded' or status == 'failed' or status == 'cancelled' then
   if ARGV[3] ~= status then return -3 end
-  for i=4,#ARGV,2 do
+  for i=5,#ARGV,2 do
     if redis.call('HGET', key, ARGV[i]) ~= ARGV[i+1] then return -3 end
   end
   return 1
 end
+if (status == 'cancelling' or redis.call('EXISTS', KEYS[2]) == 1) and
+   ARGV[3] ~= 'cancelled' and not (ARGV[3] == 'failed' and critical) then return -2 end
 if ARGV[3] == 'running' and status ~= 'queued' and status ~= 'pending' and status ~= 'running' then return -3 end
-if ARGV[3] == 'succeeded' and status ~= 'running' and status ~= 'succeeded' then return -3 end
+if ARGV[3] == 'succeeded' and status ~= 'running' then return -3 end
 if ARGV[3] == '' and status ~= 'running' then return -3 end
-for i=4,#ARGV,2 do redis.call('HSET', key, ARGV[i], ARGV[i+1]) end
+for i=5,#ARGV,2 do redis.call('HSET', key, ARGV[i], ARGV[i+1]) end
 return 1`
 
 // FineTuneCancelled checks the platform's canonical cancellation state. Both
@@ -53,12 +58,30 @@ func (c *Client) FineTuneCancelled(ctx context.Context, jobID, orgID, nodeID str
 // FineTuneUpdate writes only the platform's existing state fields, preserving
 // its 31-day TTL and refusing to resurrect a terminal job.
 func (c *Client) FineTuneUpdate(ctx context.Context, jobID, orgID, nodeID string, fields map[string]any) error {
+	return c.fineTuneUpdate(ctx, jobID, orgID, nodeID, fields, false)
+}
+
+// FineTuneFailCritical is the only update permitted after a cancellation
+// request besides worker-confirmed cancellation. It is reserved for cleanup
+// failures that must remain visible instead of falsely claiming cancellation.
+func (c *Client) FineTuneFailCritical(ctx context.Context, jobID, orgID, nodeID string, fields map[string]any) error {
+	if fields["status"] != "failed" || fields["error"] == nil || fields["finished_at"] == nil {
+		return errors.New("critical fine-tune failure requires status, error and finish time")
+	}
+	return c.fineTuneUpdate(ctx, jobID, orgID, nodeID, fields, true)
+}
+
+func (c *Client) fineTuneUpdate(ctx context.Context, jobID, orgID, nodeID string, fields map[string]any, critical bool) error {
 	if !fineTuneKeyID.MatchString(jobID) || orgID == "" || nodeID == "" {
 		return errors.New("invalid fine-tune identity")
 	}
 	allowed := map[string]bool{"status": true, "started_at": true, "finished_at": true, "progress_percent": true, "current_epoch": true, "current_loss": true, "eta_seconds": true, "error": true, "adapter_path": true}
 	status, _ := fields["status"].(string)
-	args := []any{orgID, nodeID, status}
+	criticalArg := "0"
+	if critical {
+		criticalArg = "1"
+	}
+	args := []any{orgID, nodeID, status, criticalArg}
 	for key, value := range fields {
 		if !allowed[key] {
 			return fmt.Errorf("unsupported fine-tune state field %q", key)

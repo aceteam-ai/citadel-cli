@@ -14,6 +14,9 @@ type FineTuneState struct {
 	CurrentEpoch    int      `json:"current_epoch"`
 	CurrentLoss     *float64 `json:"current_loss"`
 	Cancelled       bool     `json:"cancelled"`
+	Error           *string  `json:"error"`
+	FinishedAt      *string  `json:"finished_at"`
+	AdapterPath     *string  `json:"adapter_path"`
 }
 
 func (c *Client) FineTuneState(ctx context.Context, jobID string) (FineTuneState, error) {
@@ -23,8 +26,23 @@ func (c *Client) FineTuneState(ctx context.Context, jobID string) (FineTuneState
 }
 
 func (c *Client) FineTuneUpdate(ctx context.Context, jobID string, fields map[string]any) error {
+	return c.fineTuneUpdate(ctx, jobID, fields, false)
+}
+
+func (c *Client) FineTuneFailCritical(ctx context.Context, jobID string, fields map[string]any) error {
+	if fields["status"] != "failed" || fields["error"] == nil || fields["finished_at"] == nil {
+		return fmt.Errorf("critical fine-tune failure requires status, error and finish time")
+	}
+	return c.fineTuneUpdate(ctx, jobID, fields, true)
+}
+
+func (c *Client) fineTuneUpdate(ctx context.Context, jobID string, fields map[string]any, critical bool) error {
 	if len(fields) == 0 {
 		return fmt.Errorf("fine-tune update has no fields")
 	}
-	return c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/finetune/"+jobID, map[string]any{"fields": fields}, nil)
+	body := map[string]any{"fields": fields}
+	if critical {
+		body["critical_failure"] = true
+	}
+	return c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/finetune/"+jobID, body, nil)
 }
