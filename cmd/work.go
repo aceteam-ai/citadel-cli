@@ -2613,6 +2613,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// only worker on the node.
 	workPerms := workAppliedPermissions
 	nodeJobOpts := nodeJobHandlerOpts{
+		Source:                    source,
 		OrgID:                     nodeJobOrgID(),
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,

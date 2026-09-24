@@ -184,6 +184,59 @@ func (h *ServiceHandler) Reserve(ctx JobContext, jobID string, requiredVRAMBytes
 	return res, nil
 }
 
+// ReserveNamed durably stops only the named, running services for a job. Fine
+// tuning uses this instead of whole-card exclusivity: the approved window
+// permits stopping unlimited-ocr and ollama, while paw-compile may keep serving.
+// A partial reservation is returned with an error and must still be released.
+func (h *ServiceHandler) ReserveNamed(ctx JobContext, jobID string, names []string) (*Reservation, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil, fmt.Errorf("reserve named: job id is required")
+	}
+	res := &Reservation{JobID: jobID}
+	st, err := h.collectNodeStatus()
+	if err != nil {
+		return nil, fmt.Errorf("reserve named %s: collect status: %w", jobID, err)
+	}
+	manifest, err := h.loadManifest()
+	if err != nil {
+		return nil, fmt.Errorf("reserve named %s: load manifest: %w", jobID, err)
+	}
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
+	}
+	prior := make(map[string]string, len(manifest.Services))
+	for _, svc := range manifest.Services {
+		prior[svc.Name] = svc.DesiredStatus
+	}
+	var stop []string
+	for _, candidate := range buildPreemptCandidates(st, "", manifest.pinnedSet()) {
+		if !wanted[candidate.Name] {
+			continue
+		}
+		if candidate.Pinned {
+			return res, fmt.Errorf("reserve named %s: required service %s is pinned", jobID, candidate.Name)
+		}
+		stop = append(stop, candidate.Name)
+	}
+	sort.Strings(stop)
+	for _, name := range stop {
+		if err := h.setEvictedMarkersInManifestFile(name, jobID, prior[name]); err != nil {
+			return res, fmt.Errorf("reserve named %s: tag %s: %w", jobID, name, err)
+		}
+		if err := h.setDesiredStatusInManifestFile(name, "stopped"); err != nil {
+			return res, fmt.Errorf("reserve named %s: mark %s stopped: %w", jobID, name, err)
+		}
+		if err := h.stopByName(name); err != nil {
+			return res, fmt.Errorf("reserve named %s: stop %s: %w", jobID, name, err)
+		}
+		res.Evicted = append(res.Evicted, name)
+		ctx.Log("info", "     - [reserve %s] stopped %s for fine tuning", jobID, name)
+	}
+	return res, nil
+}
+
 // Release restores every service tagged evicted_by_job==jobID: restarts each
 // one, then restores EvictedPriorStatus (rather than unconditionally clearing
 // desired_status — see that field's doc), THEN clears the reservation tag —

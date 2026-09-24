@@ -85,6 +85,7 @@ var unboundedJobTypes = map[string]struct{}{
 	JobTypeDownloadModel:     {},
 	JobTypeOllamaPull:        {},
 	JobTypeModelCachePull:    {},
+	JobTypeFineTuneStart:     {},
 	JobTypeServiceStart:      {},
 	JobTypeIOSBuild:          {},
 	JobTypeAndroidBuild:      {},
@@ -144,6 +145,7 @@ var unboundedJobTypes = map[string]struct{}{
 var serializedLaneJobTypes = func() map[string]struct{} {
 	m := map[string]struct{}{
 		JobTypeModuleSet:         {},
+		JobTypeFineTuneStart:     {},
 		JobTypeServiceStop:       {},
 		JobTypeApplyDeviceConfig: {},
 		JobTypeModelCacheEvict:   {},

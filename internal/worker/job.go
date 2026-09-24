@@ -90,7 +90,9 @@ const (
 	JobStatusFailure JobStatus = "failure"
 
 	// JobStatusRetry indicates the job should be retried
-	JobStatusRetry JobStatus = "retry"
+	JobStatusRetry           JobStatus = "retry"
+	JobStatusCancelled       JobStatus = "cancelled"
+	JobStatusTerminalFailure JobStatus = "terminal_failure"
 )
 
 // Common job types used across sources.
@@ -146,6 +148,7 @@ const (
 	JobTypeResourceSnapshot   = "RESOURCE_SNAPSHOT"    // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
 	JobTypeInstanceMessage    = "INSTANCE_MESSAGE"     // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
 	JobTypeModuleSet          = "MODULE_SET"           // Set the desired state of a single module on this node (interim, aceteam#5280)
+	JobTypeFineTuneStart      = "FINETUNE_START"       // Train a node-local adapter on the pinned GPU node
 	JobTypeExposeSet          = "EXPOSE_SET"           // Expose a local service on the gateway with private/org/link visibility (issue #598)
 	JobTypeExposeList         = "EXPOSE_LIST"          // Read back this node's durable exposure inventory (issue #944)
 	JobTypeUnexpose           = "UNEXPOSE"             // Remotely revoke a gateway exposure (issue #944)
@@ -217,6 +220,7 @@ var allKnownJobTypes = []string{
 	JobTypeResourceSnapshot,
 	JobTypeInstanceMessage,
 	JobTypeModuleSet,
+	JobTypeFineTuneStart,
 	JobTypeExposeSet,
 	JobTypeExposeList,
 	JobTypeUnexpose,

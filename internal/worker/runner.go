@@ -367,6 +367,13 @@ runLoop:
 			if !proceed {
 				continue
 			}
+			if yieldsFineTune(job.Type) {
+				for _, handler := range r.handlers {
+					if yielder, ok := handler.(interface{ YieldToDemand() }); ok {
+						yielder.YieldToDemand()
+					}
+				}
+			}
 
 			// EXECUTE dispatch. The fetch loop NEVER blocks on execution: it
 			// either admits onto a bounded lane (and loops back to source.Next
@@ -435,6 +442,19 @@ runLoop:
 
 	r.log("info", "Worker shutdown complete")
 	return nil
+}
+
+func yieldsFineTune(t string) bool {
+	if needsGPUSlot(t) {
+		return true
+	}
+	switch t {
+	case JobTypeShellCommand, JobTypeTmuxSession, JobTypeCobrowse, JobTypeCobrowseSession,
+		JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions, JobTypeServiceStart,
+		JobTypeModuleSet, JobTypeExtraction, JobTypeTranscribeAudio, JobTypeMediaGenerate:
+		return true
+	}
+	return false
 }
 
 // newStreamWriter builds the per-job stream writer, falling back to a no-op
@@ -798,6 +818,21 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
+	if result != nil && result.Status == JobStatusCancelled {
+		r.recordJob(buildUsageRecord(job, "cancelled", startTime, endTime, result, nil))
+		r.source.Ack(ctx, job)
+		return false
+	}
+	if result != nil && result.Status == JobStatusTerminalFailure {
+		actualErr := result.Error
+		if actualErr == nil {
+			actualErr = errors.New("terminal job failure")
+		}
+		r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
+		_ = stream.WriteError(actualErr, false)
+		_ = r.source.Fail(ctx, job, actualErr, map[string]any{"terminal_failure": true})
+		return false
+	}
 
 	if err != nil || (result != nil && result.Status == JobStatusFailure) {
 		actualErr := err
