@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/update"
+	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 )
 
 // autoUpdatePolicyInputs contains only flags belonging to the active command.
@@ -54,14 +55,20 @@ type autoUpdateWorker interface {
 	BeginDrain() (release func())
 }
 
+type autoUpdateRunner interface {
+	autoUpdateWorker
+	Run(context.Context) error
+}
+
 // autoUpdateRuntime is an injection seam for tests. Production uses the
 // AutoUpdater's existing checksum, apply, restart, and Homebrew defaults.
 type autoUpdateRuntime struct {
-	checker   update.ReleaseChecker
-	ticks     <-chan time.Time
-	apply     func(string) error
-	restart   func() error
-	afterTick func()
+	checker     update.ReleaseChecker
+	ticks       <-chan time.Time
+	apply       func(string) error
+	restart     func() error
+	afterTick   func()
+	afterCancel func()
 }
 
 // startWorkerAutoUpdater may be called only after a worker is fully initialized.
@@ -98,6 +105,29 @@ func startWorkerAutoUpdater(ctx context.Context, ownsWorker bool, inputs autoUpd
 		updater.Run(ctx)
 	}()
 	return done
+}
+
+// runWorkerWithAutoUpdater binds the updater to the actual runner lifetime,
+// which may end without the parent context being cancelled (for example on a
+// connect error). The updater is stopped and joined before ownership is freed
+// or the caller may start a replacement worker. A nil owner runs without an
+// updater, as with work --no-single-instance.
+func runWorkerWithAutoUpdater(ctx context.Context, owner *worklock.Lock, inputs autoUpdatePolicyInputs, runner autoUpdateRunner, logf func(string, ...any), runtime autoUpdateRuntime) error {
+	if owner != nil {
+		defer owner.Release()
+	}
+	updaterCtx, cancelUpdater := context.WithCancel(ctx)
+	done := startWorkerAutoUpdater(updaterCtx, owner != nil, inputs, runner, logf, runtime)
+	defer func() {
+		cancelUpdater()
+		if runtime.afterCancel != nil {
+			runtime.afterCancel()
+		}
+		if done != nil {
+			<-done
+		}
+	}()
+	return runner.Run(ctx)
 }
 
 func workAutoUpdateLog(format string, args ...any) {

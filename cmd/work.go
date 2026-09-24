@@ -390,6 +390,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// prerequisite") — both cases where a second live worker cannot be ruled
 	// out, so reconciling here would risk a destructive false-positive restore.
 	workerLockHeld := false
+	var workerLock *worklock.Lock
 	if !workNoSingleInstance {
 		lock, lockErr := worklock.Acquire(network.GetStateDir(), Version, Log)
 		if lockErr != nil {
@@ -436,6 +437,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		} else {
 			Log("acquired single-instance worker lock (%s)", lock.Path())
 			defer lock.Release()
+			workerLock = lock
 			workerLockHeld = true
 		}
 	}
@@ -2707,10 +2709,6 @@ func runWork(cmd *cobra.Command, args []string) {
 	// complete immutable set, never a partial capability advertisement.
 	startStatusPublisherAfterRunner(&nodeRunner, runner, startStatusPublisher)
 
-	// No single-instance lock means another worker may own the node; only the
-	// lock holder may run an automatic binary swap.
-	startWorkerAutoUpdater(ctx, workerLockHeld, workAutoUpdatePolicyInputs(), runner, workAutoUpdateLog, autoUpdateRuntime{})
-
 	// Start the self-heal liveness monitor (issue #548). It is the backstop for a
 	// consumption-wedged worker that the per-job watchdog can't catch (a wedge
 	// outside a handler, or a build with the watchdog disabled): it watches the
@@ -2721,7 +2719,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Run the worker
-	if err := runner.Run(ctx); err != nil {
+	if err := runWorkerWithAutoUpdater(ctx, workerLock, workAutoUpdatePolicyInputs(), runner, workAutoUpdateLog, autoUpdateRuntime{}); err != nil {
 		if err != context.Canceled {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)

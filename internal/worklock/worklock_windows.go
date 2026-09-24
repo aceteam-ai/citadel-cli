@@ -68,8 +68,8 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 
 // IsHeld reports whether a live citadel worker currently holds the single-instance
 // lock for the node keyed to stateDir, WITHOUT acquiring, reclaiming, or otherwise
-// disturbing it. It is the read-only counterpart to Acquire (see the Unix build for
-// the full contract): a non-blocking exclusive LockFileEx probe on a separate handle
+// disturbing it. It is the read-only counterpart to Acquire, not ownership
+// authority (see the Unix build for the full contract): a non-blocking exclusive LockFileEx probe on a separate handle
 // detects contention, the probe is unlocked immediately, and only a live citadel
 // holder PID is reported as held. A missing/stale/reused lock reports not held.
 func IsHeld(stateDir string) (held bool, holderPID int) {
