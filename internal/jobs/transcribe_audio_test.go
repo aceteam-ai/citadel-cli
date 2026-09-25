@@ -793,6 +793,28 @@ func TestApplyTranscribeOptions_NoNewParamsByteIdentical(t *testing.T) {
 	}
 }
 
+func TestApplyTranscribeOptions_WordTimestampsOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "true", want: true},
+		{value: "false", want: false},
+	} {
+		req := map[string]any{"audio_path": "clip.wav"}
+		if err := applyTranscribeOptions(req, map[string]string{"word_timestamps": tc.value}); err != nil {
+			t.Fatal(err)
+		}
+		_, present := req["word_timestamps"]
+		if present != tc.want {
+			t.Errorf("word_timestamps=%s: key presence=%v, want %v", tc.value, present, tc.want)
+		}
+	}
+	if err := applyTranscribeOptions(map[string]any{}, map[string]string{"word_timestamps": "perhaps"}); err == nil {
+		t.Fatal("expected invalid word_timestamps to fail before dispatch")
+	}
+}
+
 // TestApplyTranscribeOptions_NewParamsForwarded checks every new param is
 // validated and copied onto the request with the right type.
 func TestApplyTranscribeOptions_NewParamsForwarded(t *testing.T) {

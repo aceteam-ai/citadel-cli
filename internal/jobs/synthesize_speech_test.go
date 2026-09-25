@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -343,6 +344,63 @@ func TestSynthesizeSpeech_SpeedAndInstructionsForwarded(t *testing.T) {
 	}
 	if gotBody["instructions"] != "warm, gentle, slightly slower pace" {
 		t.Errorf("forwarded instructions = %v", gotBody["instructions"])
+	}
+}
+
+func TestSynthesizeSpeech_CaptionedOptIn(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		if r.URL.Path == "/info" {
+			_, _ = w.Write([]byte(`{"model_license":"Apache-2.0"}`))
+			return
+		}
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"audio_base64":"YXVkaW8=","words":[{"word":"hello","start":0.1,"end":0.5}]}`))
+	}))
+	defer srv.Close()
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"kokoro": srv.URL}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID: "captioned", Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hello", "speed": "1.5", "word_timestamps": "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/audio/speech/captioned" || gotBody["speed"] != 1.5 {
+		t.Fatalf("captioned request path/body = %q, %#v", gotPath, gotBody)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["content"] != "YXVkaW8=" || len(result["words"].([]any)) != 1 {
+		t.Fatalf("captioned envelope = %#v", result)
+	}
+}
+
+func TestSynthesizeSpeech_CaptionedUnsupportedServiceFailsClearly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"kokoro": srv.URL}}
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID: "old-service", Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hello", "word_timestamps": "true"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support word timestamps") {
+		t.Fatalf("expected upgrade hint, got %v", err)
 	}
 }
 
