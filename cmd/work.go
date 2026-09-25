@@ -34,6 +34,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -353,6 +354,21 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "  silently split the two. Unset the override to run 'citadel work'; --node-dir")
 		fmt.Fprintln(os.Stderr, "  IS supported by 'citadel module stop|start|restart', 'citadel run', and 'citadel stop'.")
 		os.Exit(1)
+	}
+	// S2: a mesh-only enrollment is a durable presence session, not an
+	// uninitialized worker. This branch exits before any service, job-source,
+	// queue, or Runner construction. A persisted explicit mode survives later
+	// credential changes; malformed state fails closed.
+	sessionConfig, sessionErr := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), hasDeviceConfigured())
+	if sessionErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: node session config: %v\n", sessionErr)
+		return
+	}
+	if sessionConfig.Mode == nodesession.Presence {
+		if err := runPresence(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1155,6 +1171,17 @@ func runWork(cmd *cobra.Command, args []string) {
 		Log("network connected")
 	} else {
 		Log("network not configured (no saved state)")
+	}
+	// Publish S2 session status/stop only from the process that owns the
+	// single-instance worker lock. The machine-wide TUN socket belongs to
+	// ipnserver and must never be replaced by this controller.
+	if workerLockHeld && connected && network.Global() != nil && network.Global().Mode() == network.ModeUserspace {
+		stopSessionControl, err := startNodeSessionControl(nodesession.Worker, cancel)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot publish node session control: %v\n", err)
+			return
+		}
+		defer stopSessionControl()
 	}
 
 	// Get node name and Headscale node ID from network status

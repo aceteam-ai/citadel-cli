@@ -45,8 +45,15 @@ const (
 // the one that puts a kernel interface and a userspace endpoint on the same
 // identity — is prevented, in ConnectMachineWide.
 func SelectBackend(stateDir string) (BackendMode, error) {
-	if localAPIReachable(LocalAPISocketPath(stateDir)) {
+	kind, err := probeLocalControlEndpoint(stateDir)
+	if err != nil {
+		return "", err
+	}
+	if kind == "tun" {
 		return ModeAttached, nil
+	}
+	if kind == "unknown" {
+		return "", fmt.Errorf("unrecognized live local control endpoint; refusing to start a second mesh backend")
 	}
 	return ModeUserspace, nil
 }

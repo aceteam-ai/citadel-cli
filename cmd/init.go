@@ -18,6 +18,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
+	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
@@ -1794,6 +1795,11 @@ func connectToNetwork(nodeName, authKey string) error {
 	// the URL actually used to connect (nexusURL), guaranteeing persisted ==
 	// connected.
 	persistNexusURLBestEffort(nexusURL)
+	// The first successful enroll fixes the durable session mode. Authkey-only
+	// nodes are presence-only; device-authorized nodes default to workers.
+	if _, err := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), hasDeviceConfigured()); err != nil {
+		return fmt.Errorf("persist node session mode: %w", err)
+	}
 
 	ip, _ := srv.GetIPv4()
 	if ip != "" {

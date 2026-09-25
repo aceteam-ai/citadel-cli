@@ -9,6 +9,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
 	"github.com/spf13/cobra"
 )
@@ -108,6 +109,9 @@ func runNonInteractiveLogin() {
 	// Persist the control URL we enrolled against (citadel-cli#1110) so later
 	// reconnects target this control plane, not the compiled-in default.
 	persistNexusURLBestEffort(nexusURL)
+	if _, err := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), false); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not persist session mode: %v\n", err)
+	}
 
 	ip, _ := srv.GetIPv4()
 	spinner.StopWithSuccess(fmt.Sprintf("Connected as '%s'", nodeName))
@@ -219,6 +223,9 @@ func runInteractiveLogin() {
 	// Persist the control URL we enrolled against (citadel-cli#1110) so later
 	// reconnects target this control plane, not the compiled-in default.
 	persistNexusURLBestEffort(nexusURL)
+	if _, err := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), choice == nexus.NetChoiceDevice); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not persist session mode: %v\n", err)
+	}
 
 	ip, _ := srv.GetIPv4()
 	spinner.StopWithSuccess(fmt.Sprintf("Connected as '%s'", nodeName))
