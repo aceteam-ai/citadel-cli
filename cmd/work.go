@@ -359,7 +359,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// uninitialized worker. This branch exits before any service, job-source,
 	// queue, or Runner construction. A persisted explicit mode survives later
 	// credential changes; malformed state fails closed.
-	sessionConfig, sessionErr := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), hasDeviceConfigured())
+	sessionConfig, sessionErr := loadWorkSessionConfig(network.GetNodeConfigDir(), network.HasState(), hasDeviceConfigured())
 	if sessionErr != nil {
 		fmt.Fprintf(os.Stderr, "Error: node session config: %v\n", sessionErr)
 		return
@@ -2769,6 +2769,17 @@ func runWork(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 	}
+}
+
+// loadWorkSessionConfig must not create a mode before enrollment has produced
+// mesh state. Otherwise an exploratory `citadel work` writes the authkey-only
+// presence default and a later device-auth enrollment cannot choose worker.
+// An existing explicit mode is still respected once the node is enrolled.
+func loadWorkSessionConfig(nodeConfigDir string, hasMeshState, hasDeviceCredentials bool) (nodesession.Config, error) {
+	if !hasMeshState {
+		return nodesession.Config{}, errors.New("node is not enrolled; run 'citadel enroll' or 'citadel login --authkey' first")
+	}
+	return nodesession.LoadOrInitialize(nodeConfigDir, hasDeviceCredentials)
 }
 
 // startStatusPublisherAfterRunner establishes the startup ordering contract:

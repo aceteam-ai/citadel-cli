@@ -62,6 +62,40 @@ func TestPresenceLoopHoldsMeshWithoutJobSubscriptionUntilStopped(t *testing.T) {
 	}
 }
 
+func TestUnenrolledWorkDoesNotFixLaterDeviceAuthModeToPresence(t *testing.T) {
+	dir := t.TempDir()
+	// An exploratory work command on an unenrolled machine must fail without
+	// writing the authkey-only default to session.yaml.
+	if _, err := loadWorkSessionConfig(dir, false, false); err == nil {
+		t.Fatal("unenrolled work unexpectedly started")
+	}
+	if _, err := os.Stat(nodesession.Path(dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unenrolled work left a durable session mode: %v", err)
+	}
+
+	// The successful device-auth enroll path initializes the same file. The
+	// next work invocation must pass the presence gate and enter the existing
+	// worker startup path, where its job source and Runner are constructed.
+	enrolled, err := nodesession.LoadOrInitialize(dir, true)
+	if err != nil || enrolled.Mode != nodesession.Worker {
+		t.Fatalf("device-auth enrollment mode = %+v, %v; want worker", enrolled, err)
+	}
+	startup, err := loadWorkSessionConfig(dir, true, true)
+	if err != nil || startup.Mode != nodesession.Worker {
+		t.Fatalf("subsequent work startup mode = %+v, %v; want worker", startup, err)
+	}
+
+	// A saved explicit choice still wins if credentials or enrollment tier
+	// later change; the work command must never silently switch it.
+	if err := nodesession.Save(dir, nodesession.Config{Mode: nodesession.Presence}); err != nil {
+		t.Fatal(err)
+	}
+	startup, err = loadWorkSessionConfig(dir, true, true)
+	if err != nil || startup.Mode != nodesession.Presence {
+		t.Fatalf("explicit presence mode = %+v, %v; want presence", startup, err)
+	}
+}
+
 func TestNodeSessionStatusAndExplicitStopOnSharedLocalAPI(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fixed global named pipe cannot be isolated in parallel tests")
