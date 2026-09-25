@@ -278,7 +278,7 @@ func TestResolveJobTimeout(t *testing.T) {
 	})
 
 	t.Run("unbounded types get no fallback cap (must not kill model pulls)", func(t *testing.T) {
-		for _, jt := range []string{JobTypeModelCachePull, JobTypeDownloadModel, JobTypeOllamaPull, JobTypeServiceStart, JobTypeAndroidBuild, JobTypeInstanceProvision} {
+		for _, jt := range []string{JobTypeModelCachePull, JobTypeFineTuneStart, JobTypeDownloadModel, JobTypeOllamaPull, JobTypeServiceStart, JobTypeAndroidBuild, JobTypeInstanceProvision} {
 			if _, ok := r.resolveJobTimeout(&Job{Type: jt}); ok {
 				t.Errorf("%s got a fallback cap; want unbounded (ok=false)", jt)
 			}

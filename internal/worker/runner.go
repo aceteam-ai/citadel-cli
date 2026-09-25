@@ -367,6 +367,11 @@ runLoop:
 			if !proceed {
 				continue
 			}
+			if yieldsFineTune(job.Type) {
+				if !r.yieldFineTuneForDemand(ctx, job, stream) {
+					continue
+				}
+			}
 
 			// EXECUTE dispatch. The fetch loop NEVER blocks on execution: it
 			// either admits onto a bounded lane (and loops back to source.Next
@@ -435,6 +440,44 @@ runLoop:
 
 	r.log("info", "Worker shutdown complete")
 	return nil
+}
+
+// A claimed demand job must never enter any execution lane until every active
+// fine-tune handler confirms that its trainer and reservation are gone. A
+// failed preemption is a terminal refusal, not a speculative admission.
+func (r *Runner) yieldFineTuneForDemand(ctx context.Context, job *Job, stream StreamWriter) bool {
+	for _, handler := range r.handlers {
+		yielder, ok := handler.(interface{ YieldToDemand() error })
+		if !ok {
+			continue
+		}
+		if err := yielder.YieldToDemand(); err != nil {
+			r.log("error", "Refusing job %s: fine-tune preemption unconfirmed: %v", job.ID, err)
+			if stream != nil {
+				if writeErr := stream.WriteError(err, false); writeErr != nil {
+					r.log("warning", "Failed to publish demand refusal for job %s: %v", job.ID, writeErr)
+				}
+			}
+			if failErr := r.source.Fail(ctx, job, err, map[string]any{"fine_tune_preemption_unconfirmed": true}); failErr != nil {
+				r.log("error", "Failed to record demand refusal for job %s: %v", job.ID, failErr)
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func yieldsFineTune(t string) bool {
+	if needsGPUSlot(t) {
+		return true
+	}
+	switch t {
+	case JobTypeShellCommand, JobTypeTmuxSession, JobTypeCobrowse, JobTypeCobrowseSession,
+		JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions, JobTypeServiceStart,
+		JobTypeModuleSet, JobTypeExtraction, JobTypeTranscribeAudio, JobTypeMediaGenerate:
+		return true
+	}
+	return false
 }
 
 // newStreamWriter builds the per-job stream writer, falling back to a no-op
@@ -629,10 +672,26 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 		r.source.Nack(ctx, job, errLaneSaturated)
 		return
 	}
+	if job.Type == JobTypeFineTuneStart {
+		for _, handler := range r.handlers {
+			if pending, ok := handler.(interface{ MarkPendingFineTune(string) }); ok {
+				pending.MarkPendingFineTune(job.ID)
+			}
+		}
+	}
 	r.enterJob()
 	wg.Add(1)
 	go func(j *Job, s StreamWriter, st time.Time) {
 		defer wg.Done()
+		if j.Type == JobTypeFineTuneStart {
+			defer func() {
+				for _, handler := range r.handlers {
+					if pending, ok := handler.(interface{ ClearPendingFineTune(string) }); ok {
+						pending.ClearPendingFineTune(j.ID)
+					}
+				}
+			}()
+		}
 		jobOK := false
 		defer func() {
 			r.exitJob(jobOK)
@@ -798,6 +857,21 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
+	if result != nil && result.Status == JobStatusCancelled {
+		r.recordJob(buildUsageRecord(job, "cancelled", startTime, endTime, result, nil))
+		r.source.Ack(ctx, job)
+		return false
+	}
+	if result != nil && result.Status == JobStatusTerminalFailure {
+		actualErr := result.Error
+		if actualErr == nil {
+			actualErr = errors.New("terminal job failure")
+		}
+		r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
+		_ = stream.WriteError(actualErr, false)
+		_ = r.source.Fail(ctx, job, actualErr, map[string]any{"terminal_failure": true})
+		return false
+	}
 
 	if err != nil || (result != nil && result.Status == JobStatusFailure) {
 		actualErr := err

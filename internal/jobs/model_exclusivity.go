@@ -21,19 +21,17 @@
 // after acquiring internal/worklock, before its consume loop starts -- so a
 // CLI/MCP process that dies mid-exclusive-run does not strand evicted
 // services forever; the NEXT `citadel work` boot on this node restores them.
-// But reservation.go's own doc comment (ReconcileOrphanedReservations, see
-// "IMPORTANT" paragraph) names EXACTLY this shape as the hazard it warns
-// about: "any tag found here is orphaned" is only true when nothing else is
-// still using the reservation, and neither this CLI/MCP process NOR the
-// control-center TUI's consume loop holds worklock. A `citadel work` that
+// But "any tag found here is orphaned" is only true when nothing else is
+// still using the reservation, and this standalone CLI/MCP process does not
+// hold worklock (the control-center TUI's consume loop does). A `citadel work` that
 // boots WHILE an exclusive run/deploy from this file is still legitimately
 // in progress will conclude the tag is orphaned and restart the evicted
 // peers out from under it. This is a real, live race on any node that might
 // also run `citadel work` (or the control-center) concurrently with a
 // standalone exclusive run -- not merely a latent one closed off by this
 // design. Closing it needs owner identity on the marker (pid + start time,
-// mirroring worklock's own stale-lock classification) or making every
-// job-consuming path acquire worklock; both are deferred, tracked follow-up
+// mirroring worklock's own stale-lock classification) or making these local
+// reservation callers acquire worklock; both are deferred, tracked follow-up
 // work, not solved here. `citadel module reservations release <jobID>`
 // (cmd/module_reservations.go) is the operator escape hatch if this race (or
 // any other stuck reservation) needs a manual out.
@@ -41,12 +39,99 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 )
+
+// StartExclusiveWithModel serializes the entire local exclusive admission:
+// no fine-tune hold can appear after eviction but before service start or
+// rollback. A failed reserve/start restores only this transaction's job tag
+// after target cleanup succeeds; otherwise the reservation remains visible
+// through the returned reservation and error. Model download belongs before
+// this call, not during the GPU hold.
+func (h *ServiceHandler) StartExclusiveWithModel(ctx JobContext, jobID, serviceName, model string, requiredVRAMBytes uint64, budgeted bool) (*Reservation, []byte, error) {
+	var reservation *Reservation
+	var output []byte
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		if err := finetunesafety.RequireAbsent(h.ConfigDir); err != nil {
+			return fmt.Errorf("exclusive start %s: %w", serviceName, err)
+		}
+		// A deterministic local job ID may already own tags from an earlier
+		// invocation. Never roll those back as though this call created them.
+		active, err := h.ActiveReservations()
+		if err != nil {
+			return err
+		}
+		if len(active) != 0 {
+			return fmt.Errorf("exclusive start %s: existing reservation must be released first", serviceName)
+		}
+		manifest, err := h.loadManifest()
+		if err != nil {
+			return err
+		}
+		priorStatus := ""
+		targetInManifest := false
+		for _, service := range manifest.Services {
+			if service.Name == serviceName {
+				priorStatus = service.DesiredStatus
+				targetInManifest = true
+				break
+			}
+		}
+		var reserveErr error
+		startAttempted := false
+		if budgeted {
+			reservation, reserveErr = h.Reserve(ctx, jobID, requiredVRAMBytes)
+		} else {
+			reservation, reserveErr = h.ReserveExclusive(ctx, jobID, serviceName)
+		}
+		if reserveErr == nil && targetInManifest {
+			reserveErr = h.setDesiredStatusInManifestFile(serviceName, "")
+		}
+		if reserveErr == nil {
+			start := h.startServiceWithModel
+			if h.startWithModelFn != nil {
+				start = h.startWithModelFn
+			}
+			startAttempted = true
+			output, reserveErr = start(ctx, serviceName, model, 0)
+		}
+		if reserveErr == nil {
+			return nil
+		}
+		if reservation != nil {
+			// A failed start can leave a partially running target. Stop it
+			// before restarting evicted peers; if that cannot be confirmed,
+			// retain the tags rather than overlap GPU demand.
+			mayRelease := true
+			if startAttempted {
+				if stopErr := h.stopByName(serviceName); stopErr != nil {
+					reserveErr = errors.Join(reserveErr, fmt.Errorf("exclusive target cleanup failed; reservation held: %w", stopErr))
+					mayRelease = false
+				}
+			}
+			if mayRelease {
+				if _, rollbackErr := h.releaseReservation(ctx, jobID); rollbackErr != nil {
+					reserveErr = errors.Join(reserveErr, fmt.Errorf("exclusive reservation rollback failed: %w", rollbackErr))
+				} else {
+					reservation = nil // no active reservation survives a successful rollback
+				}
+			}
+		}
+		if targetInManifest {
+			if restoreErr := h.setDesiredStatusInManifestFile(serviceName, priorStatus); restoreErr != nil {
+				reserveErr = errors.Join(reserveErr, fmt.Errorf("exclusive target status rollback failed: %w", restoreErr))
+			}
+		}
+		return reserveErr
+	})
+	return reservation, output, err
+}
 
 // ExclusiveReservationJobID returns the deterministic reservation job id for
 // an exclusive run/deploy of the given service
@@ -220,6 +305,16 @@ func (h *ServiceHandler) HasActiveReservation(jobID string) (bool, error) {
 // that case is deliberate, not an oversight: preemptForVRAM would otherwise
 // redundantly re-run the same decision against an already-cleared node).
 func (h *ServiceHandler) StartServiceWithModel(ctx JobContext, name, model string, requiredVRAMBytes uint64) ([]byte, error) {
+	var result []byte
+	err := h.WithHeldServiceGuard(name, func() error {
+		var startErr error
+		result, startErr = h.startServiceWithModel(ctx, name, model, requiredVRAMBytes)
+		return startErr
+	})
+	return result, err
+}
+
+func (h *ServiceHandler) startServiceWithModel(ctx JobContext, name, model string, requiredVRAMBytes uint64) ([]byte, error) {
 	manifest, err := h.loadManifest()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load manifest: %w", err)

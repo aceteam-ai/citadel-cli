@@ -158,6 +158,50 @@ func TestLocalRunExclusiveDefaultEvictsEverythingThenStarts(t *testing.T) {
 	}
 }
 
+func TestLocalRunExclusiveAtomicTransactionAndRollbackResult(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		args      string
+		budget    uint64
+		budgeted  bool
+		remaining []string
+		wantErr   string
+	}{
+		{"exclusive success", `{"model":"m","engine":"bonsai"}`, 0, false, nil, ""},
+		{"bounded success", `{"model":"m","engine":"bonsai","vram_mb":1024}`, 1024 * 1024 * 1024, true, nil, ""},
+		{"rolled back", `{"model":"m","engine":"bonsai"}`, 0, false, nil, "start failed"},
+		{"partial rollback", `{"model":"m","engine":"bonsai"}`, 0, false, []string{"ollama"}, "rollback is incomplete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := 0
+			deps := localMCPDeps{reservations: localReservationOps{
+				runExclusive: func(jobID, service, model string, budget uint64, budgeted bool) ([]string, string, string, error) {
+					called++
+					if jobID != "exclusive:bonsai" || service != "bonsai" || model != "m" || budget != tc.budget || budgeted != tc.budgeted {
+						t.Fatalf("transaction arguments: %q %q %q %d %t", jobID, service, model, budget, budgeted)
+					}
+					if tc.wantErr != "" {
+						return tc.remaining, "", "", errors.New("start failed")
+					}
+					return []string{"ollama"}, "exclusive", `{"running":true}`, nil
+				},
+				deploy:           func(string, string, string, uint64) (string, error) { t.Fatal("split deploy reached"); return "", nil },
+				reserveExclusive: func(string, string) ([]string, string, error) { t.Fatal("split reserve reached"); return nil, "", nil },
+			}}
+			_, err := localRunExclusiveCall(deps, json.RawMessage(tc.args))
+			if called != 1 {
+				t.Fatalf("transaction calls=%d, want one", called)
+			}
+			if tc.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("err=%v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestLocalRunExclusiveWithVRAMUsesBoundedReserve(t *testing.T) {
 	var usedExclusive, usedBudget bool
 	var gotBudget uint64

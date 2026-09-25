@@ -91,6 +91,9 @@ type liveModuleOps struct {
 	startFn     func(name, composePath string) error
 	composeDown func(composePath string, remove bool) error
 	isRunning   func(name string) bool
+	// resolveSource allows hermetic update tests to reach the reservation guard
+	// without catalog network/cache or a live container runtime.
+	resolveSource func(catalog.Source) (*catalog.ServiceManifest, string, *catalog.ResolvedModule, error)
 	// composeServiceRunning reports whether the given compose SERVICE is up in the
 	// given compose PROJECT (citadel#624 sub-collision 3). It is the health signal
 	// for a module that declared health_check.compose_service -- one whose real
@@ -135,98 +138,111 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 	// module and (on retry) leave it uninstalled. See the update-in-place teardown
 	// below, which is keyed on the RESOLVED manifest.Name (stable across
 	// source-ref/basename differences) and runs only after resolve+verify succeed.
-	manifest, composeSrc, resolved, err := resolveModuleForTUI(src)
+	resolve := o.resolveSource
+	if resolve == nil {
+		resolve = resolveModuleForTUI
+	}
+	manifest, composeSrc, resolved, err := resolve(src)
 	if err != nil {
 		return fmt.Errorf("resolve %q: %w", m.Source, err)
 	}
 
-	nodeManifest, configDir, err := findOrCreateManifest()
+	configDir, err := localServiceConfigDir()
 	if err != nil {
-		return fmt.Errorf("initialize node config: %w", err)
+		return fmt.Errorf("resolve node config: %w", err)
 	}
-	servicesDir := filepath.Join(configDir, "services")
-
-	trusted := catalog.IsTrusted(src)
-	untrusted := !trusted
-	// Catalog (Tier-0) sources are first-party and exempt from the privilege gate
-	// (they have no --allow-privileged flag), matching the CLI/TUI catalog path.
-	// External sources keep the hard gate: a Critical compose is REFUSED here
-	// (this is a remote, non-interactive apply -- there is no operator to
-	// --allow-privileged, so a privileged external module fails with a clear
-	// error rather than silently running with host-root access).
-	allowPrivileged := src.Kind == catalog.KindCatalog
-
-	// Signature gate (shared core): verify a verified-publisher signature by
-	// digest before install; a no-op for sources with no signature requirement.
-	var lockImages []catalog.LockImage
-	if resolved != nil {
-		lockImages = catalog.BuildLockImages(resolved.Images)
-	}
-	verifyResult, err := catalog.VerifyModule(src, lockImages)
-	if err != nil {
-		return fmt.Errorf("verify %q: %w", manifest.Name, err)
-	}
-	if verifyResult.Verified {
-		lockImages = markLockImagesVerified(lockImages)
-	}
-
-	// Update-in-place: reconcile drives ActionUpdate (source/config drift) through
-	// Install. If the RESOLVED module name is already installed, uninstall it now
-	// -- AFTER the fallible resolve+verify -- so the fresh install does not trip
-	// the port-conflict / already-in-manifest guards. Keying on the resolved
-	// manifest.Name (not a source basename) makes this correct even when the
-	// service name differs from the source basename or changes across refs.
-	// Residual (interim, acceptable): if this Uninstall succeeds but the
-	// InstallFromManifest below then fails, the module is left down until the
-	// job retries and reinstalls it.
-	// Node-generated secrets must survive the teardown below: Uninstall deletes
-	// <name>.env, so without carrying them forward here the re-install would mint
-	// a NEW value on every re-assignment -- and compose would then recreate only
-	// the container whose env changed, leaving its consumer running with the old
-	// credential in memory. Read BEFORE the uninstall; anything the assignment
-	// supplies still wins, so an explicit rotation is still possible.
-	installConfig := m.Config
-	if hasService(nodeManifest, manifest.Name) {
-		installConfig = catalog.CarryGeneratedConfig(manifest, servicesDir, m.Config)
-		o.log("MODULE_SET: %q already installed; updating in place", manifest.Name)
-		if err := o.Uninstall(ctx, manifest.Name); err != nil {
-			return fmt.Errorf("update %q: uninstall existing: %w", manifest.Name, err)
+	// The pull loop can call Install without passing through Runner's demand
+	// preemption. Guard the ENTIRE update transaction: uninstall would erase
+	// the held service's reservation tag before the final start check.
+	return withIncomingServiceStartGuardSource(configDir, manifest.Name, composeSrc, manifest.Requires.GPU || manifest.Requires.VRAMMinGB > 0, func(source nodeDirSource) error {
+		nodeManifest, _, err := findOrCreateManifestLockedAt(configDir, source)
+		if err != nil {
+			return fmt.Errorf("initialize node config: %w", err)
 		}
-	}
+		servicesDir := filepath.Join(configDir, "services")
 
-	// Non-interactive install: installConfig supplies the overrides; a missing
-	// REQUIRED config var is a returned error (never a stdin prompt on a headless
-	// node).
-	result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, installConfig, false, allowPrivileged, untrusted, false)
-	if err != nil {
-		return fmt.Errorf("install %q: %w", manifest.Name, err)
-	}
+		trusted := catalog.IsTrusted(src)
+		untrusted := !trusted
+		// Catalog (Tier-0) sources are first-party and exempt from the privilege gate
+		// (they have no --allow-privileged flag), matching the CLI/TUI catalog path.
+		// External sources keep the hard gate: a Critical compose is REFUSED here
+		// (this is a remote, non-interactive apply -- there is no operator to
+		// --allow-privileged, so a privileged external module fails with a clear
+		// error rather than silently running with host-root access).
+		allowPrivileged := src.Kind == catalog.KindCatalog
 
-	// Register in the manifest (merging the module's declared routing tags).
-	if err := addServiceToManifestWithTags(configDir, result.Name, manifest.NodeTags); err != nil {
-		return fmt.Errorf("register %q in manifest: %w", result.Name, err)
-	}
+		// Signature gate (shared core): verify a verified-publisher signature by
+		// digest before install; a no-op for sources with no signature requirement.
+		var lockImages []catalog.LockImage
+		if resolved != nil {
+			lockImages = catalog.BuildLockImages(resolved.Images)
+		}
+		verifyResult, err := catalog.VerifyModule(src, lockImages)
+		if err != nil {
+			return fmt.Errorf("verify %q: %w", manifest.Name, err)
+		}
+		if verifyResult.Verified {
+			lockImages = markLockImagesVerified(lockImages)
+		}
 
-	// Record provenance so a re-run does not see spurious drift. CRITICAL: store
-	// the REQUESTED source form (src.Raw) and the config, so ListInstalled reports
-	// the same canonical Source + Config the desired assignment carries and the
-	// engine converges to a no-op on the next pass. This is the desired-state
-	// install path, so the entry is STAMPED ManagedByDesiredState (citadel#624
-	// D1) -- making it, and only it, eligible for a later drift-uninstall. The
-	// manifest's health_check.compose_service (if any) is carried so ListInstalled
-	// resolves this module's health correctly (sub-collision 3).
-	o.recordLock(src, resolved, result, lockImages, m.Config, manifest.HealthCheck.ComposeService)
+		// Update-in-place: reconcile drives ActionUpdate (source/config drift) through
+		// Install. If the RESOLVED module name is already installed, uninstall it now
+		// -- AFTER the fallible resolve+verify -- so the fresh install does not trip
+		// the port-conflict / already-in-manifest guards. Keying on the resolved
+		// manifest.Name (not a source basename) makes this correct even when the
+		// service name differs from the source basename or changes across refs.
+		// Residual (interim, acceptable): if this Uninstall succeeds but the
+		// InstallFromManifest below then fails, the module is left down until the
+		// job retries and reinstalls it.
+		// Node-generated secrets must survive the teardown below: Uninstall deletes
+		// <name>.env, so without carrying them forward here the re-install would mint
+		// a NEW value on every re-assignment -- and compose would then recreate only
+		// the container whose env changed, leaving its consumer running with the old
+		// credential in memory. Read BEFORE the uninstall; anything the assignment
+		// supplies still wins, so an explicit rotation is still possible.
+		installConfig := m.Config
+		if hasService(nodeManifest, manifest.Name) {
+			installConfig = catalog.CarryGeneratedConfig(manifest, servicesDir, m.Config)
+			o.log("MODULE_SET: %q already installed; updating in place", manifest.Name)
+			if err := o.uninstallUnlocked(ctx, configDir, manifest.Name); err != nil {
+				return fmt.Errorf("update %q: uninstall existing: %w", manifest.Name, err)
+			}
+		}
 
-	// A fresh install/update is RUNNING: clear any stale stopped marker, then
-	// compose up. (The engine will follow with Stop if desired is stopped.)
-	if err := setServiceDesiredStatus(configDir, result.Name, ""); err != nil {
-		o.log("MODULE_SET: could not clear stopped marker for %q: %v", result.Name, err)
-	}
-	composePath := filepath.Join(servicesDir, result.Name+".yml")
-	if err := o.startFn(result.Name, composePath); err != nil {
-		return fmt.Errorf("start %q: %w", result.Name, err)
-	}
-	return nil
+		// Non-interactive install: installConfig supplies the overrides; a missing
+		// REQUIRED config var is a returned error (never a stdin prompt on a headless
+		// node).
+		result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, installConfig, false, allowPrivileged, untrusted, false)
+		if err != nil {
+			return fmt.Errorf("install %q: %w", manifest.Name, err)
+		}
+
+		// Register in the manifest (merging the module's declared routing tags).
+		if err := addServiceToManifestWithTags(configDir, result.Name, manifest.NodeTags); err != nil {
+			return fmt.Errorf("register %q in manifest: %w", result.Name, err)
+		}
+
+		// Record provenance so a re-run does not see spurious drift. CRITICAL: store
+		// the REQUESTED source form (src.Raw) and the config, so ListInstalled reports
+		// the same canonical Source + Config the desired assignment carries and the
+		// engine converges to a no-op on the next pass. This is the desired-state
+		// install path, so the entry is STAMPED ManagedByDesiredState (citadel#624
+		// D1) -- making it, and only it, eligible for a later drift-uninstall. The
+		// manifest's health_check.compose_service (if any) is carried so ListInstalled
+		// resolves this module's health correctly (sub-collision 3).
+		o.recordLock(src, resolved, result, lockImages, m.Config, manifest.HealthCheck.ComposeService)
+
+		// A fresh install/update is RUNNING: clear any stale stopped marker, then
+		// compose up. (The engine will follow with Stop if desired is stopped.)
+		if err := setServiceDesiredStatus(configDir, result.Name, ""); err != nil {
+			o.log("MODULE_SET: could not clear stopped marker for %q: %v", result.Name, err)
+		}
+		composePath := filepath.Join(servicesDir, result.Name+".yml")
+		if err := o.startFn(result.Name, composePath); err != nil {
+			return fmt.Errorf("start %q: %w", result.Name, err)
+		}
+		return nil
+	})
 }
 
 // Uninstall removes an installed module by name: compose down + drop it from the
@@ -234,7 +250,21 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 // is the NET-NEW uninstall primitive (no imperative uninstall existed before).
 // Idempotent: uninstalling a module that is not installed is a no-op success.
 func (o *liveModuleOps) Uninstall(ctx context.Context, name string) error {
-	manifest, configDir, err := findAndReadManifest()
+	_, configDir, err := findAndReadManifest()
+	if err != nil {
+		o.log("MODULE_SET: uninstall %q: no manifest, treating as no-op", name)
+		return nil
+	}
+	// Prevent an independent pull uninstall from erasing the held tag that
+	// both the worker cleanup and all local start guards rely upon.
+	return withLocalServiceStartGuard(configDir, name, func() error {
+		return o.uninstallUnlocked(ctx, configDir, name)
+	})
+}
+
+// Caller must hold the fine-tune reservation lock (Install or Uninstall).
+func (o *liveModuleOps) uninstallUnlocked(ctx context.Context, configDir, name string) error {
+	manifest, err := readManifestAt(configDir)
 	if err != nil {
 		// No manifest => nothing is installed => idempotent no-op.
 		o.log("MODULE_SET: uninstall %q: no manifest, treating as no-op", name)
@@ -289,14 +319,16 @@ func (o *liveModuleOps) Start(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("read manifest: %w", err)
 	}
-	if err := setServiceDesiredStatus(configDir, name, ""); err != nil {
-		return err
-	}
-	composePath := o.composePathFor(configDir, name)
-	if composePath == "" {
-		return fmt.Errorf("start %q: no compose file in manifest", name)
-	}
-	return o.startFn(name, composePath)
+	return withLocalServiceStartGuard(configDir, name, func() error {
+		if err := setServiceDesiredStatus(configDir, name, ""); err != nil {
+			return err
+		}
+		composePath := o.composePathFor(configDir, name)
+		if composePath == "" {
+			return fmt.Errorf("start %q: no compose file in manifest", name)
+		}
+		return o.startFn(name, composePath)
+	})
 }
 
 // Stop brings an already-installed module down WITHOUT uninstalling it, and marks
@@ -511,7 +543,7 @@ func (o *liveModuleOps) removeServiceFiles(configDir, name string) {
 // composePathFor returns the absolute compose path for a manifest service, or ""
 // if the service is not in the manifest or has no compose file.
 func (o *liveModuleOps) composePathFor(configDir, name string) string {
-	manifest, _, err := findAndReadManifest()
+	manifest, err := readManifestAt(configDir)
 	if err != nil {
 		return ""
 	}

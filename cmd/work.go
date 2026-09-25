@@ -644,9 +644,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	if workConfigDir != "" {
 		// Restore anything still tagged evicted_by_job from a previous process
 		// invocation that crashed or was killed before releasing it (#832's
-		// crash-safety leg). Gated on workerLockHeld -- see that variable's doc
-		// and ReconcileOrphanedReservations' doc for why this is a hard
-		// precondition, not a convenience default.
+		// crash-safety leg). Gated on workerLockHeld -- now also held by the
+		// control-center TUI's job consumer -- and by the durable fine-tune
+		// safety hold check inside ReconcileOrphanedReservations. A trainer
+		// container may outlive its worker process, so a free worklock alone
+		// does not prove its reservation is orphaned.
 		//
 		// NOTE: this does NOT run before startManagedServices' async goroutine
 		// (started above, in the default: branch of the switch a few dozen
@@ -662,7 +664,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// ordering guarantee if you touch this again.
 		if workerLockHeld {
 			reconcileCtx := jobs.JobContext{LogFn: func(_ string, msg string) { Log("%s", msg) }}
-			if restored, err := reservationHandler.ReconcileOrphanedReservations(reconcileCtx, workerLockHeld); err != nil {
+			if restored, err := reconcileStartupReservations(reservationHandler, reconcileCtx, workerLockHeld); err != nil {
 				fmt.Fprintf(os.Stderr, "   - Warning: reservation reconcile: %v\n", err)
 			} else if len(restored) > 0 {
 				fmt.Printf("   - Restored %d service(s) from an orphaned GPU reservation: %s\n", len(restored), strings.Join(restored, ", "))
@@ -681,6 +683,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		// reservation reconcile above is: this can mutate citadel.yaml and
 		// start a container, so a second concurrent process racing it could
 		// double-start a service or race the completion marker write.
+		// A fine-tune hold can make reservation reconcile fail above; this
+		// call still reaches runDefaultServeReconcile, whose own shared
+		// reservation-lock/hold gate defers before any probe or once-marker
+		// mutation until verified trainer cleanup clears that hold.
 		// Deliberately NOT run from `citadel init` -- see default_serve.go's
 		// package doc for why this belongs at `citadel work` startup.
 		if workerLockHeld {
@@ -2613,6 +2619,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// only worker on the node.
 	workPerms := workAppliedPermissions
 	nodeJobOpts := nodeJobHandlerOpts{
+		Source:                    source,
 		OrgID:                     nodeJobOrgID(),
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
@@ -2825,7 +2832,9 @@ func startManagedServices(ctx context.Context) []startedService {
 
 		if serviceType == internalServices.ServiceTypeNative {
 			fmt.Printf("   - Starting %s (native)...\n", service.Name)
-			if err := startNativeService(service.Name, configDir); err != nil {
+			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
+				return startNativeService(service.Name, configDir)
+			}); err != nil {
 				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
 				continue
 			}
@@ -2838,7 +2847,9 @@ func startManagedServices(ctx context.Context) []startedService {
 				continue
 			}
 			fmt.Printf("   - Starting %s...\n", service.Name)
-			if err := startService(service.Name, fullComposePath); err != nil {
+			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
+				return startService(service.Name, fullComposePath)
+			}); err != nil {
 				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
 				continue
 			}
