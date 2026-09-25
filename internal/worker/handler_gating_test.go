@@ -161,3 +161,42 @@ func TestEnabledNode_BinaryWriteStillWritesBytes(t *testing.T) {
 	}
 	t.Fatal("enabled FILE_WRITE_BYTES handler missing")
 }
+
+func TestBinaryWriteFollowsLiveFilesPermission(t *testing.T) {
+	workspace := t.TempDir()
+	enabled := false
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		WorkspaceDir:  workspace,
+		FilesDisabled: true,
+		FilesEnabled:  func() bool { return enabled },
+	})
+	var write JobHandler
+	for _, handler := range handlers {
+		if handler.CanHandle(JobTypeFileWriteBytes) {
+			write = handler
+			break
+		}
+	}
+	if write == nil {
+		t.Fatal("binary write must remain routable so it can report a permission refusal")
+	}
+	job := &Job{ID: "live-write", Type: JobTypeFileWriteBytes, Payload: map[string]any{"path": "live.bin", "content": "YWJj"}}
+	if _, err := write.Execute(context.Background(), job, &NoOpStreamWriter{}); err == nil || !strings.Contains(err.Error(), `"reason":"files_disabled"`) {
+		t.Fatalf("disabled Files policy must refuse the write: %v", err)
+	}
+	enabled = true
+	if _, err := write.Execute(context.Background(), job, &NoOpStreamWriter{}); err != nil {
+		t.Fatalf("enabling Files should permit the next upload without rebuilding handlers: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(workspace, "live.bin")); err != nil || string(data) != "abc" {
+		t.Fatalf("enabled upload wrote %q: %v", data, err)
+	}
+	enabled = false
+	job.Payload["path"] = "revoked.bin"
+	if _, err := write.Execute(context.Background(), job, &NoOpStreamWriter{}); err == nil || !strings.Contains(err.Error(), `"reason":"files_disabled"`) {
+		t.Fatalf("revoked Files policy must refuse the next upload: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "revoked.bin")); !os.IsNotExist(err) {
+		t.Fatalf("revoked upload touched the workspace: %v", err)
+	}
+}
