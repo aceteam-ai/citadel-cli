@@ -6,13 +6,18 @@ package network
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
+	"tailscale.com/client/local"
 	"tailscale.com/safesocket"
 )
 
@@ -45,8 +50,21 @@ func listenLocalAPI(path string) (net.Listener, error) {
 			return nil, err
 		}
 	}
-
+	// Keep the original machine-wide TUN listener and its Windows pipe ACL.
+	// Unprivileged citadel clients must still be able to attach to that API.
 	ln, err := safesocket.Listen(path)
+	return secureLocalAPIListener(path, ln, err)
+}
+
+// listenLocalAPIWithoutCleanup preserves the endpoint ownership decision made
+// by the session caller. Its platform implementation must never unlink a
+// newly-live endpoint or broaden the Windows named-pipe ACL.
+func listenLocalAPIWithoutCleanup(path string) (net.Listener, error) {
+	ln, err := listenSessionControlEndpoint(path)
+	return secureLocalAPIListener(path, ln, err)
+}
+
+func secureLocalAPIListener(path string, ln net.Listener, err error) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", path, err)
 	}
@@ -103,17 +121,173 @@ func localAPIReachable(path string) bool {
 		if _, err := os.Stat(path); err != nil {
 			return false
 		}
+	} else {
+		// The Tailscale client uses safesocket's startup retry on a missing
+		// pipe. A direct probe preserves the fast absence path on Windows.
+		ctx, cancel := context.WithTimeout(context.Background(), localAPIDialTimeout)
+		conn, err := dialLocalControlRaw(ctx, path)
+		cancel()
+		if err != nil {
+			return false
+		}
+		conn.Close()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), localAPIDialTimeout)
 	defer cancel()
 
-	conn, err := safesocket.ConnectContext(ctx, path)
-	if err != nil {
-		return false
+	// A userspace node session now publishes its control API on this SAME
+	// safesocket path. A successful dial alone does not prove that it is the
+	// machine-wide TUN localapi: attaching tsnet to a session controller would
+	// misclassify the backend and strand the mesh. Require the real Tailscale
+	// status wire response, not merely an open socket.
+	lc := &local.Client{Socket: path, UseSocketOnly: true}
+	_, err := lc.StatusWithoutPeers(ctx)
+	return err == nil
+}
+
+// ListenSessionControl publishes the userspace session on the existing
+// citadel-owned LocalAPISocketPath. It refuses ANY live listener, including
+// machine-wide TUN or an unknown service, before stale-socket cleanup runs.
+// Machine-wide TUN remains a separate expert mode, not a session host.
+func ListenSessionControl(stateDir string) (net.Listener, error) {
+	path := LocalAPISocketPath(stateDir)
+	if runtime.GOOS == "windows" {
+		// Named pipes are not filesystem entries. Only FILE_NOT_FOUND proves
+		// absence; busy, permission-denied, and timeout are ambiguous/live and
+		// must not be replaced with another pipe instance.
+		ctx, cancel := context.WithTimeout(context.Background(), localAPIDialTimeout)
+		defer cancel()
+		conn, err := dialLocalControlRaw(ctx, path)
+		if err == nil {
+			conn.Close()
+			return nil, fmt.Errorf("local control pipe %s is already live", path)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("local control pipe %s may be live; refusing to replace it: %w", path, err)
+		}
+		return listenLocalAPIWithoutCleanup(path)
 	}
-	conn.Close()
-	return true
+	fi, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return listenLocalAPIWithoutCleanup(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return nil, fmt.Errorf("local control endpoint %s is not a socket; refusing to replace it", path)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), localAPIDialTimeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
+	if err == nil {
+		conn.Close()
+		return nil, fmt.Errorf("local control endpoint %s is already live; refusing to replace it", path)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("local control endpoint %s may be live; refusing to replace it: %w", path, err)
+	}
+	// The stale inode must still be the one we probed before unlinking it.
+	// The mesh holder lock excludes another Citadel TUN owner from racing in.
+	current, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return listenLocalAPIWithoutCleanup(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(fi, current) {
+		return nil, fmt.Errorf("local control endpoint %s changed during stale recovery; refusing to replace it", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return nil, err
+	}
+	return listenLocalAPIWithoutCleanup(path)
+}
+
+// CloseSessionControl closes only the endpoint this session owned. A surviving
+// Unix socket is safely handled as stale on the next start; unlinking by path
+// here could remove a new listener that won a shutdown/startup race.
+func CloseSessionControl(ln net.Listener, stateDir string) {
+	if ln == nil {
+		return
+	}
+	_ = ln.Close()
+}
+
+// SessionControlRequest is the client for the session verbs, over the SAME
+// safesocket path. It never falls back to an unauthenticated TCP endpoint.
+func SessionControlRequest(ctx context.Context, stateDir, method, route string) (*http.Response, error) {
+	path := LocalAPISocketPath(stateDir)
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return dialLocalControlRaw(ctx, path)
+	}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	req, err := http.NewRequestWithContext(ctx, method, "http://citadel.local"+route, nil)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
+// probeLocalControlEndpoint distinguishes the two protocols sharing the one
+// citadel safesocket path. An unknown but reachable listener fails closed:
+// neither a worker nor machine-wide TUN may assume it owns that endpoint.
+func probeLocalControlEndpoint(stateDir string) (string, error) {
+	path := LocalAPISocketPath(stateDir)
+	if runtime.GOOS == "windows" {
+		// An absent pipe must return promptly, even in a just-started client.
+		// safesocket.ConnectContext retries missing paths for two seconds.
+		ctx, cancel := context.WithTimeout(context.Background(), localAPIDialTimeout)
+		defer cancel()
+		conn, err := dialLocalControlRaw(ctx, path)
+		if errors.Is(err, os.ErrNotExist) {
+			return "none", nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("cannot probe local control pipe %s: %w", path, err)
+		}
+		conn.Close()
+	} else {
+		fi, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return "none", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&os.ModeSocket == 0 {
+			return "none", nil // legacy stale regular file; listener refuses it later
+		}
+	}
+	if localAPIReachable(path) {
+		return "tun", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), localAPIDialTimeout)
+	defer cancel()
+	if resp, err := SessionControlRequest(ctx, stateDir, http.MethodGet, "/citadel/session/v1/status"); err == nil {
+		var status struct {
+			Mode string `json:"mode"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&status)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK && decodeErr == nil && (status.Mode == "presence" || status.Mode == "worker") {
+			return "session", nil
+		}
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), localAPIDialTimeout)
+	defer cancel2()
+	conn, err := dialLocalControlRaw(ctx2, path)
+	if err == nil {
+		conn.Close()
+		return "unknown", nil
+	}
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+		return "none", nil
+	}
+	return "", fmt.Errorf("cannot identify local control endpoint %s: %w", path, err)
 }
 
 // localAPIDialTimeout bounds the probe above. Generous for a local socket

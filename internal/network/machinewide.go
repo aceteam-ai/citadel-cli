@@ -55,8 +55,15 @@ func ConnectMachineWide(ctx context.Context, config ServerConfig, elevated bool)
 
 	// A machine-wide backend is already up: nothing to do, and starting a
 	// second one would fight the first for the interface and the node key.
-	if localAPIReachable(LocalAPISocketPath(stateDir)) {
+	kind, err := probeLocalControlEndpoint(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	if kind == "tun" {
 		return nil, fmt.Errorf("machine-wide mode is already running on this host (use 'citadel down' to stop it)")
+	}
+	if kind != "none" {
+		return nil, fmt.Errorf("local control endpoint is owned by %s; refusing machine-wide mode", kind)
 	}
 
 	if err := checkNoUserspaceHolders(stateDir); err != nil {

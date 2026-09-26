@@ -34,6 +34,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -336,6 +337,18 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// workSessionMode is the session mode `citadel work` (and the citadel-worker
+// systemd unit) runs as. It is a CONSTANT Worker, never derived from the
+// persisted session.yaml mode. The persisted Presence mode is only the
+// bare-`citadel` dispatch default (cmd/bare_dispatch.go); deriving work's mode
+// from it would make a stock authkey node -- whose `citadel init --authkey`
+// persists Presence -- come up presence-only under a unit literally named
+// citadel-worker and serve zero jobs, with no non-destructive escape hatch
+// (Presence persists until `citadel logout` + re-enroll, which drops the mesh
+// identity). Enrollment (`citadel init`) owns session.yaml; `citadel work`
+// never reads or initializes it.
+const workSessionMode = nodesession.Worker
+
 func runWork(cmd *cobra.Command, args []string) {
 	// citadel#853: --node-dir/CITADEL_NODE_DIR redirects manifest resolution
 	// but NOT the module lockfile (catalog.LockfilePath, still hardcoded to
@@ -354,6 +367,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "  IS supported by 'citadel module stop|start|restart', 'citadel run', and 'citadel stop'.")
 		os.Exit(1)
 	}
+	// `citadel work` ALWAYS runs as a worker regardless of the persisted session
+	// mode: it never reads or initializes session.yaml here, and never branches
+	// to runPresence. Presence is only the bare-`citadel` dispatch default
+	// (cmd/bare_dispatch.go). See the workSessionMode const above for why.
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1157,6 +1174,24 @@ func runWork(cmd *cobra.Command, args []string) {
 		Log("network connected")
 	} else {
 		Log("network not configured (no saved state)")
+	}
+	// Publish S2 session status/stop only from the process that owns the
+	// single-instance worker lock. The machine-wide TUN socket belongs to
+	// ipnserver and must never be replaced by this controller.
+	if workerLockHeld && connected && network.Global() != nil && network.Global().Mode() == network.ModeUserspace {
+		// Best-effort, matching the egress-relay auto-start precedent ("a failed
+		// optional listener must never fail the worker"). Node session control is
+		// an observability/control convenience, not a job-serving requirement. A
+		// bare `return` here would exit 0 from this void RunE, which systemd
+		// Restart=on-failure does NOT restart -- so a failure to bind the
+		// auxiliary control socket (realistically EACCES on a root-owned state
+		// dir) would silently and permanently stop an otherwise-healthy worker.
+		if stopSessionControl, err := startNodeSessionControl(workSessionMode, cancel); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: node session control unavailable (continuing without it): %v\n", err)
+			Log("node session control unavailable (continuing without it): %v", err)
+		} else {
+			defer stopSessionControl()
+		}
 	}
 
 	// Get node name and Headscale node ID from network status
@@ -3164,6 +3199,9 @@ func nodeWakeChannel(nodeID string) string {
 // getWorkHostname returns the hostname to use for VPN reconnection.
 // Prefers the --node-name flag, then CITADEL_NODE_NAME env, then OS hostname.
 func getWorkHostname() string {
+	if uid := loadLoginNodeUID(); uid != "" {
+		return servingIdentityHostname(uid, "")
+	}
 	if workNodeName != "" {
 		return workNodeName
 	}

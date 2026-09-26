@@ -26,6 +26,18 @@ type DeviceAuthResult struct {
 // When no TTY is available (e.g. SSH without -t, CI, pipes), the device code
 // and URL are printed as plain text and the flow polls without bubbletea.
 func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult, error) {
+	return runDeviceAuthFlowWithCSR(authServiceURL, forceNew, "")
+}
+
+// runDeviceAuthFlowWithCSR is runDeviceAuthFlow plus an optional PEM CSR
+// (citadel-cli#1062). Only interactive device-grant `citadel login` passes a
+// non-empty csrPEM; every other caller (init/enroll/control-center) goes through
+// runDeviceAuthFlow, which delegates here with "" — a byte-identical legacy flow.
+//
+// The csrPEM is bound into ONE poll closure BEFORE the TTY branch, so the SAME
+// CSR is sent on every retry regardless of which UI path (bubbletea vs plain)
+// runs. The CSR is never printed or logged.
+func runDeviceAuthFlowWithCSR(authServiceURL string, forceNew bool, csrPEM string) (*DeviceAuthResult, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
 
 	// Start the flow and get device code
@@ -33,6 +45,12 @@ func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult,
 	resp, err := client.StartFlow(opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start device authorization: %w", err)
+	}
+
+	// Single poll closure shared by both UI paths, capturing the one CSR so it
+	// cannot diverge between the TTY and non-TTY branches.
+	poll := func() (*nexus.TokenResponse, error) {
+		return client.PollForTokenWithCSR(resp.DeviceCode, resp.Interval, csrPEM)
 	}
 
 	// Non-TTY path: print plain text and poll without bubbletea
@@ -49,7 +67,7 @@ func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult,
 		fmt.Println()
 		fmt.Println("Waiting for authorization...")
 
-		token, err := client.PollForToken(resp.DeviceCode, resp.Interval)
+		token, err := poll()
 		if err != nil {
 			return nil, fmt.Errorf("device authorization failed: %w", err)
 		}
@@ -72,7 +90,7 @@ func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult,
 
 	go func() {
 		defer close(doneChan)
-		token, err := client.PollForToken(resp.DeviceCode, resp.Interval)
+		token, err := poll()
 		if err != nil {
 			errChan <- err
 			ui.UpdateStatus(program, "error:"+err.Error())

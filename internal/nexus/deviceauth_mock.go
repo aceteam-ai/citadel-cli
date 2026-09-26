@@ -3,6 +3,8 @@ package nexus
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -17,6 +19,29 @@ type MockDeviceAuthServer struct {
 	lastHostname      string
 	lastMachineID     string
 	lastForceNew      bool
+	// Token-request capture (citadel-cli#1062): every /token request body is
+	// recorded raw so a test can assert csr_pem presence/absence and the same
+	// CSR across retries without decoding assumptions.
+	tokenBodies []string
+	tokenCSRs   []string
+	// Optional CSR-enrollment bundle echoed back on the success response. Empty
+	// by default so existing tests see a byte-identical success TokenResponse.
+	bundleLeaf    string
+	bundleChain   string
+	bundleNodeUID string
+	// Optional certificate-enrollment failure (citadel-cli#1062): when set, any
+	// /token request that CARRIES a csr_pem is rejected with this status and
+	// {"error": code}; a request WITHOUT a csr_pem is unaffected, so a client
+	// that drops its CSR and retries still reaches the normal pending/success
+	// logic. Zero status ⇒ disabled.
+	csrFailStatus int
+	csrFailCode   string
+	// Optional machine_id-keyed node_uid minting (citadel-cli#1062): when set,
+	// the success response's node_uid is minted once per StartFlow machine_id
+	// and reused for the same machine_id, mirroring the backend's re-enrollment
+	// identity reuse so a test can prove a second login keeps the same uid.
+	enrollByMachineID bool
+	machineNodeUIDs   map[string]string
 }
 
 // StartMockDeviceAuthServer creates and starts a mock device authorization server
@@ -73,12 +98,40 @@ func (m *MockDeviceAuthServer) handleToken(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Capture the raw request body and any CSR before responding.
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var parsed TokenRequest
+	_ = json.Unmarshal(raw, &parsed)
+
 	m.pollMutex.Lock()
 	m.pollCount++
 	currentCount := m.pollCount
+	m.tokenBodies = append(m.tokenBodies, string(raw))
+	m.tokenCSRs = append(m.tokenCSRs, parsed.CSRPem)
+	bundleLeaf, bundleChain, bundleUID := m.bundleLeaf, m.bundleChain, m.bundleNodeUID
+	csrFailStatus, csrFailCode := m.csrFailStatus, m.csrFailCode
+	// Resolve a machine_id-keyed node_uid for the success response when enabled.
+	if m.enrollByMachineID && parsed.CSRPem != "" {
+		if m.machineNodeUIDs == nil {
+			m.machineNodeUIDs = map[string]string{}
+		}
+		uid, ok := m.machineNodeUIDs[m.lastMachineID]
+		if !ok {
+			uid = fmt.Sprintf("uid-%d", len(m.machineNodeUIDs)+1)
+			m.machineNodeUIDs[m.lastMachineID] = uid
+		}
+		bundleLeaf, bundleChain, bundleUID = "LEAF", "CHAIN", uid
+	}
 	m.pollMutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
+
+	// Certificate-enrollment failure: reject only CSR-bearing polls.
+	if csrFailStatus != 0 && parsed.CSRPem != "" {
+		w.WriteHeader(csrFailStatus)
+		json.NewEncoder(w).Encode(TokenError{ErrorCode: csrFailCode})
+		return
+	}
 
 	if currentCount < m.pollsUntilSuccess {
 		// Return authorization_pending
@@ -88,13 +141,59 @@ func (m *MockDeviceAuthServer) handleToken(w http.ResponseWriter, r *http.Reques
 			ErrorDescription: "User has not yet authorized the device",
 		})
 	} else {
-		// Return success with authkey
+		// Return success with authkey (plus a CSR-enrollment bundle when the
+		// test configured one via SetEnrollmentBundle).
 		json.NewEncoder(w).Encode(TokenResponse{
 			Authkey:   "tskey-auth-mock-key-123456789",
 			ExpiresIn: 3600,
 			NexusURL:  "https://nexus.aceteam.ai",
+			LeafPem:   bundleLeaf,
+			ChainPem:  bundleChain,
+			NodeUID:   bundleUID,
 		})
 	}
+}
+
+// SetEnrollmentBundle configures the leaf/chain/node_uid the mock echoes on the
+// success response (citadel-cli#1062). Default empty ⇒ no bundle (legacy shape).
+func (m *MockDeviceAuthServer) SetEnrollmentBundle(leafPEM, chainPEM, nodeUID string) {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	m.bundleLeaf, m.bundleChain, m.bundleNodeUID = leafPEM, chainPEM, nodeUID
+}
+
+// FailCSREnrollment makes every CSR-bearing /token request fail with the given
+// HTTP status and {"error": code} body (citadel-cli#1062). A no-CSR request is
+// unaffected, so a client that drops its CSR and retries still completes.
+func (m *MockDeviceAuthServer) FailCSREnrollment(status int, code string) {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	m.csrFailStatus, m.csrFailCode = status, code
+}
+
+// EnrollByMachineID makes the success response mint a node_uid once per
+// StartFlow machine_id and reuse it for the same machine_id (citadel-cli#1062),
+// mirroring the backend's re-enrollment identity reuse so a test can prove a
+// second login of the same machine keeps the same uid.
+func (m *MockDeviceAuthServer) EnrollByMachineID() {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	m.enrollByMachineID = true
+}
+
+// TokenRequestBodies returns the raw JSON bodies of every /token request seen.
+func (m *MockDeviceAuthServer) TokenRequestBodies() []string {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	return append([]string(nil), m.tokenBodies...)
+}
+
+// TokenRequestCSRs returns the csr_pem value from every /token request seen
+// (empty string for a request that carried none).
+func (m *MockDeviceAuthServer) TokenRequestCSRs() []string {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	return append([]string(nil), m.tokenCSRs...)
 }
 
 // URL returns the base URL of the mock server

@@ -10,6 +10,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/spf13/cobra"
 )
 
@@ -76,6 +77,13 @@ func runLogout(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Error logging out: %v\n", err)
 		os.Exit(1)
 	}
+	if !logoutKeepRegistration {
+		// A later enrollment is a new identity and must receive its own
+		// authkey/device-auth default, not inherit this account's mode.
+		if err := os.Remove(nodesession.Path(network.GetNodeConfigDir())); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: could not clear prior session mode: %v\n", err)
+		}
+	}
 
 	fmt.Println("✅ Successfully disconnected from the AceTeam Network.")
 	if logoutKeepRegistration {
@@ -103,6 +111,10 @@ func deregisterFromBackend(ctx context.Context) {
 			nodeName = status.Hostname
 		}
 	}
+	// A CSR-enrolled login serves as node-{uid}. The manifest keeps the
+	// display name, so an offline logout must resolve the signed serving
+	// identity before asking the backend to deregister that exact node.
+	nodeName = logoutServingNodeName(nodeName)
 
 	// Skip if we have no identity information
 	if nodeName == "" {
@@ -132,6 +144,10 @@ func deregisterFromBackend(ctx context.Context) {
 	} else {
 		fmt.Println("   - Deregistered from coordination server")
 	}
+}
+
+func logoutServingNodeName(fallback string) string {
+	return servingIdentityHostname(loadLoginNodeUID(), fallback)
 }
 
 func init() {
