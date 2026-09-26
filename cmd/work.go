@@ -337,6 +337,18 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// workSessionMode is the session mode `citadel work` (and the citadel-worker
+// systemd unit) runs as. It is a CONSTANT Worker, never derived from the
+// persisted session.yaml mode. The persisted Presence mode is only the
+// bare-`citadel` dispatch default (cmd/bare_dispatch.go); deriving work's mode
+// from it would make a stock authkey node -- whose `citadel init --authkey`
+// persists Presence -- come up presence-only under a unit literally named
+// citadel-worker and serve zero jobs, with no non-destructive escape hatch
+// (Presence persists until `citadel logout` + re-enroll, which drops the mesh
+// identity). Enrollment (`citadel init`) owns session.yaml; `citadel work`
+// never reads or initializes it.
+const workSessionMode = nodesession.Worker
+
 func runWork(cmd *cobra.Command, args []string) {
 	// citadel#853: --node-dir/CITADEL_NODE_DIR redirects manifest resolution
 	// but NOT the module lockfile (catalog.LockfilePath, still hardcoded to
@@ -355,21 +367,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "  IS supported by 'citadel module stop|start|restart', 'citadel run', and 'citadel stop'.")
 		os.Exit(1)
 	}
-	// S2: a mesh-only enrollment is a durable presence session, not an
-	// uninitialized worker. This branch exits before any service, job-source,
-	// queue, or Runner construction. A persisted explicit mode survives later
-	// credential changes; malformed state fails closed.
-	sessionConfig, sessionErr := loadWorkSessionConfig(network.GetNodeConfigDir(), network.HasState(), hasDeviceConfigured())
-	if sessionErr != nil {
-		fmt.Fprintf(os.Stderr, "Error: node session config: %v\n", sessionErr)
-		return
-	}
-	if sessionConfig.Mode == nodesession.Presence {
-		if err := runPresence(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		}
-		return
-	}
+	// `citadel work` ALWAYS runs as a worker regardless of the persisted session
+	// mode: it never reads or initializes session.yaml here, and never branches
+	// to runPresence. Presence is only the bare-`citadel` dispatch default
+	// (cmd/bare_dispatch.go). See the workSessionMode const above for why.
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1176,12 +1177,19 @@ func runWork(cmd *cobra.Command, args []string) {
 	// single-instance worker lock. The machine-wide TUN socket belongs to
 	// ipnserver and must never be replaced by this controller.
 	if workerLockHeld && connected && network.Global() != nil && network.Global().Mode() == network.ModeUserspace {
-		stopSessionControl, err := startNodeSessionControl(nodesession.Worker, cancel)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: cannot publish node session control: %v\n", err)
-			return
+		// Best-effort, matching the egress-relay auto-start precedent ("a failed
+		// optional listener must never fail the worker"). Node session control is
+		// an observability/control convenience, not a job-serving requirement. A
+		// bare `return` here would exit 0 from this void RunE, which systemd
+		// Restart=on-failure does NOT restart -- so a failure to bind the
+		// auxiliary control socket (realistically EACCES on a root-owned state
+		// dir) would silently and permanently stop an otherwise-healthy worker.
+		if stopSessionControl, err := startNodeSessionControl(workSessionMode, cancel); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: node session control unavailable (continuing without it): %v\n", err)
+			Log("node session control unavailable (continuing without it): %v", err)
+		} else {
+			defer stopSessionControl()
 		}
-		defer stopSessionControl()
 	}
 
 	// Get node name and Headscale node ID from network status
@@ -2769,17 +2777,6 @@ func runWork(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 	}
-}
-
-// loadWorkSessionConfig must not create a mode before enrollment has produced
-// mesh state. Otherwise an exploratory `citadel work` writes the authkey-only
-// presence default and a later device-auth enrollment cannot choose worker.
-// An existing explicit mode is still respected once the node is enrolled.
-func loadWorkSessionConfig(nodeConfigDir string, hasMeshState, hasDeviceCredentials bool) (nodesession.Config, error) {
-	if !hasMeshState {
-		return nodesession.Config{}, errors.New("node is not enrolled; run 'citadel enroll' or 'citadel login --authkey' first")
-	}
-	return nodesession.LoadOrInitialize(nodeConfigDir, hasDeviceCredentials)
 }
 
 // startStatusPublisherAfterRunner establishes the startup ordering contract:

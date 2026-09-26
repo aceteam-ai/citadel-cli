@@ -125,11 +125,16 @@ func presenceLoop(ctx context.Context, hasState func() bool, verify func(context
 	if !connected {
 		return errors.New("node mesh did not connect; try 'citadel reconnect'")
 	}
-	stopControl, err := serveControl()
-	if err != nil {
-		return err
+	// Best-effort, matching the egress-relay auto-start precedent ("a failed
+	// optional listener must never fail the worker"). The local session-control
+	// socket is an observability/control convenience; presence's real job is to
+	// hold the mesh connection. A bind failure (realistically EACCES on a
+	// root-owned state dir) must not abort the presence session.
+	if stopControl, err := serveControl(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: node session control unavailable (continuing without it): %v\n", err)
+	} else {
+		defer stopControl()
 	}
-	defer stopControl()
 	fmt.Println("Citadel presence online (no job subscription). Use 'citadel session stop' to stop it.")
 	<-ctx.Done()
 	return nil

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,37 +63,75 @@ func TestPresenceLoopHoldsMeshWithoutJobSubscriptionUntilStopped(t *testing.T) {
 	}
 }
 
-func TestUnenrolledWorkDoesNotFixLaterDeviceAuthModeToPresence(t *testing.T) {
-	dir := t.TempDir()
-	// An exploratory work command on an unenrolled machine must fail without
-	// writing the authkey-only default to session.yaml.
-	if _, err := loadWorkSessionConfig(dir, false, false); err == nil {
-		t.Fatal("unenrolled work unexpectedly started")
-	}
-	if _, err := os.Stat(nodesession.Path(dir)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unenrolled work left a durable session mode: %v", err)
-	}
-
-	// The successful device-auth enroll path initializes the same file. The
-	// next work invocation must pass the presence gate and enter the existing
-	// worker startup path, where its job source and Runner are constructed.
-	enrolled, err := nodesession.LoadOrInitialize(dir, true)
-	if err != nil || enrolled.Mode != nodesession.Worker {
-		t.Fatalf("device-auth enrollment mode = %+v, %v; want worker", enrolled, err)
-	}
-	startup, err := loadWorkSessionConfig(dir, true, true)
-	if err != nil || startup.Mode != nodesession.Worker {
-		t.Fatalf("subsequent work startup mode = %+v, %v; want worker", startup, err)
+func TestWorkForcesWorkerRegardlessOfPersistedPresenceMode(t *testing.T) {
+	// citadel work (and the citadel-worker systemd unit) serves jobs regardless
+	// of the persisted session mode: its mode is the workSessionMode constant,
+	// never derived from session.yaml. This assertion documents the bare-path /
+	// work-path divergence on identical persisted state; it is not by itself a
+	// proof about runWork (a compile-time const), which the source pins below
+	// cover.
+	if workSessionMode != nodesession.Worker {
+		t.Fatalf("citadel work session mode = %q; want worker", workSessionMode)
 	}
 
-	// A saved explicit choice still wins if credentials or enrollment tier
-	// later change; the work command must never silently switch it.
-	if err := nodesession.Save(dir, nodesession.Config{Mode: nodesession.Presence}); err != nil {
+	// The reviewer's regression sequence: a stock authkey `citadel work` (whose
+	// enrollment persisted Presence) used to read session.yaml, re-persist the
+	// Presence default, and dispatch to runPresence, so a node whose systemd unit
+	// is literally named citadel-worker came up presence-only and served zero
+	// jobs. runWork must now do NEITHER: it must not initialize session.yaml
+	// (enrollment owns that file) and must not branch to presence. runWork is not
+	// unit-testable, so pin it at the source level -- this fails on exactly the
+	// edit that reintroduces the branch.
+	work, err := os.ReadFile("work.go")
+	if err != nil {
 		t.Fatal(err)
 	}
-	startup, err = loadWorkSessionConfig(dir, true, true)
-	if err != nil || startup.Mode != nodesession.Presence {
-		t.Fatalf("explicit presence mode = %+v, %v; want presence", startup, err)
+	if bytes.Contains(work, []byte("runPresence(")) {
+		t.Fatal("cmd/work.go dispatches to runPresence; citadel work must always run as a worker")
+	}
+	if bytes.Contains(work, []byte("LoadOrInitialize(")) {
+		t.Fatal("cmd/work.go initializes session.yaml; enrollment (citadel init) owns that file, not citadel work")
+	}
+
+	// The persisted Presence mode is not orphaned: the bare-`citadel` dispatch
+	// path still reads it and still routes to presence. That divergence on
+	// identical persisted state is the whole point.
+	bare, err := os.ReadFile("bare_dispatch.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(bare, []byte("LoadOrInitialize(")) || !bytes.Contains(bare, []byte("runPresence(")) {
+		t.Fatal("cmd/bare_dispatch.go must still read the persisted mode and route to presence")
+	}
+}
+
+func TestPresenceLoopSurvivesSessionControlFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- presenceLoop(ctx,
+			func() bool { return true },
+			func(context.Context) (bool, error) { return true, nil },
+			// A failed control listener (realistically EACCES on a root-owned
+			// state dir) is best-effort: presence must keep holding the mesh
+			// connection, never abort.
+			func() (func(), error) { return nil, errors.New("bind: permission denied") },
+		)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("presence exited on a session-control bind failure: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("presence returned error after clean stop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("presence did not stop after cancel")
 	}
 }
 
