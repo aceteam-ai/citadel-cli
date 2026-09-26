@@ -544,6 +544,50 @@ func TestGatedJobTypeReasonsAreAllKnownToBuild(t *testing.T) {
 	}
 }
 
+// TestRunnerFileWriteBytesUnsupportedReasonNamesWorkspaceNotPermission pins
+// citadel-cli#1150: after #1112, FILE_WRITE_BYTES registers whenever a
+// workspace is configured and refuses structurally at execute time when Files
+// is disabled, so the ONLY case that reaches failUnsupportedJobType is a node
+// with NO workspace. Its gate reason must name the workspace and must NOT
+// point at the files permission (a permission toggle cannot help a
+// no-workspace node -- registration needs WorkspaceDir != "" regardless).
+func TestRunnerFileWriteBytesUnsupportedReasonNamesWorkspaceNotPermission(t *testing.T) {
+	// FILE_WRITE_BYTES is known to the build and in gatedJobTypeReasons, but no
+	// handler is registered below -- the no-workspace shape from the issue.
+	jobs := []*Job{
+		{ID: "job-write-bytes", Type: JobTypeFileWriteBytes, Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handlers := []JobHandler{NewMockJobHandler(JobTypeShellCommand, false)}
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.171.0"}
+
+	runner := NewRunner(source, handlers, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	failed := source.FailedJobs()
+	data := source.FailedData()
+	if len(failed) != 1 || len(data) != 1 {
+		t.Fatalf("Failed jobs = %d, data = %d, want 1 each", len(failed), len(data))
+	}
+	if failed[0].Type != JobTypeFileWriteBytes {
+		t.Fatalf("failed job type = %q, want %q", failed[0].Type, JobTypeFileWriteBytes)
+	}
+	if data[0]["known_to_build"] != true {
+		t.Errorf("FILE_WRITE_BYTES known_to_build = %v, want true", data[0]["known_to_build"])
+	}
+	reason, _ := data[0]["unregistered_reason"].(string)
+	if !strings.Contains(reason, "workspace") {
+		t.Errorf("FILE_WRITE_BYTES unregistered_reason = %q, want it to name the workspace", reason)
+	}
+	if strings.Contains(reason, "files") || strings.Contains(reason, "citadel_set_worker_permission") {
+		t.Errorf("FILE_WRITE_BYTES unregistered_reason = %q, must NOT point at the files permission", reason)
+	}
+}
+
 // TestRunnerUnsupportedJobTypePublishesTerminalError verifies that the
 // unsupported-type path publishes a non-recoverable terminal error event
 // through the stream writer. The streaming dispatch path waits on this event;
