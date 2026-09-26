@@ -1,5 +1,6 @@
 // Package worklock provides a single-instance guard for the Citadel worker
-// (`citadel work`), keyed to a node's state directory.
+// (`citadel work` or the control-center's owned worker), keyed to a node's
+// state directory.
 //
 // Why this exists (issues #443 / #435): a stale duplicate worker running beside
 // the systemd-managed one is the amplifier behind the node-identity churn
@@ -10,8 +11,8 @@
 //   - race on the same tsnet state directory, which can trigger a re-register
 //     under a NEW fabric id + new mesh IP (the churn).
 //
-// The guard makes a second `citadel work` for the same node STRUCTURALLY unable
-// to start: the first holder takes an exclusive OS advisory lock on a lock file
+// The guard makes a second job-consuming worker for the same node STRUCTURALLY
+// unable to start: the first holder takes an exclusive OS advisory lock on a lock file
 // inside the node's config dir, and any second invocation is refused with a clear
 // message naming the holding PID. The lock is keyed to the resolved state dir, so
 // every invocation on the same box (root service, sudo interactive, distinct

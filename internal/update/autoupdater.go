@@ -1,8 +1,8 @@
 // internal/update/autoupdater.go
 // Opt-in periodic self-update for the long-lived Citadel agent.
 //
-// The AutoUpdater runs as a background goroutine launched by `citadel work`
-// when enabled. On each tick it checks GitHub Releases for a newer version,
+// The AutoUpdater runs as a background goroutine launched by a worker owner.
+// Enabled is checked on every tick before it checks GitHub Releases,
 // and if one is found it downloads + checksum-verifies the binary, waits for
 // an idle moment (no in-flight jobs), atomically swaps the running binary, and
 // restarts the process so the new node-side capabilities take effect.
@@ -11,8 +11,8 @@
 //   - Reuses the existing Client (CheckForUpdate / DownloadAndVerify) and
 //     ApplyUpdate / Rollback machinery so the release-asset naming and checksum
 //     contract is preserved.
-//   - This is a separate opt-in from the notify-only State.AutoUpdate gate used
-//     by root.go: auto-INSTALL must be explicitly enabled and defaults off.
+//   - The owning command supplies an effective, default-off install policy;
+//     the notify-only startup check does not decide whether this loop installs.
 //   - Fail-safe: any error is reported via the logger and never panics or kills
 //     the agent. In-flight jobs are always drained before the swap.
 package update
@@ -53,6 +53,10 @@ type AutoUpdaterConfig struct {
 	// Interval between checks. Values below MinAutoUpdateInterval are clamped
 	// up to the floor. Zero uses DefaultAutoUpdateInterval.
 	Interval time.Duration
+
+	// AfterTick is called after a tick has been processed, including a disabled
+	// tick. It is an optional synchronization hook for tests.
+	AfterTick func()
 
 	// Enabled is consulted at the start of every tick. When it returns false the
 	// updater skips that cycle entirely (no release check, no swap), so the
@@ -169,24 +173,32 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticks:
-			// Re-check the toggle every tick so it can be flipped on a running
-			// agent without a restart.
-			if a.cfg.Enabled != nil && !a.cfg.Enabled() {
-				continue
+			if ctx.Err() != nil {
+				return
 			}
-			// runOnce never panics; guard anyway so a bug here can never take
-			// down the agent.
 			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						a.cfg.Log("auto-update: recovered from panic: %v", r)
+				if a.cfg.AfterTick != nil {
+					defer a.cfg.AfterTick()
+				}
+				// Re-check the toggle every tick so it can be flipped on a running
+				// agent without a restart.
+				if a.cfg.Enabled != nil && !a.cfg.Enabled() {
+					return
+				}
+				// runOnce never panics; guard anyway so a bug here can never take
+				// down the agent.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							a.cfg.Log("auto-update: recovered from panic: %v", r)
+						}
+					}()
+					if restarted := a.runOnce(ctx); restarted {
+						// RestartProcess only returns on failure; if it somehow
+						// returns success we still keep the loop alive.
+						a.cfg.Log("auto-update: restart requested")
 					}
 				}()
-				if restarted := a.runOnce(ctx); restarted {
-					// RestartProcess only returns on failure; if it somehow
-					// returns success we still keep the loop alive.
-					a.cfg.Log("auto-update: restart requested")
-				}
 			}()
 		}
 	}
@@ -197,6 +209,9 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 // replaced and not return). On any error it logs and returns false so the next
 // tick retries.
 func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
+	if ctx.Err() != nil {
+		return false
+	}
 	release, err := a.cfg.Checker.CheckForUpdate()
 	if err != nil {
 		a.cfg.Log("auto-update: check failed: %v", err)
@@ -204,6 +219,9 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	}
 	if release == nil {
 		a.cfg.Log("auto-update: up to date")
+		return false
+	}
+	if ctx.Err() != nil {
 		return false
 	}
 
@@ -222,6 +240,9 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	// and does not require an idle node.
 	if err := a.cfg.Checker.DownloadAndVerify(release, a.cfg.PendingPath); err != nil {
 		a.cfg.Log("auto-update: download/verify failed: %v", err)
+		return false
+	}
+	if ctx.Err() != nil {
 		return false
 	}
 	a.cfg.Log("auto-update: downloaded and verified %s", release.TagName)

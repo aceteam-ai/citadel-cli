@@ -2356,21 +2356,14 @@ left over from a previous process invocation that exited before releasing it.
 The only correct call site is `cmd/work.go`'s `runWork`, immediately after a
 successful `worklock.Acquire`, before the job consume loop starts.
 
-`internal/worklock` guards `citadel work` against a SECOND `citadel work` — it
-does NOT guard against the control-center TUI's own worker path. When no
-dedicated `citadel work` holds the lock (`workerHeld == false` in
-`cmd/controlcenter.go`), the control center runs its own consume loop off the
-SAME `buildNodeJobHandlers` handler set **without ever calling
-`worklock.Acquire`**. Reservation reconcile is wired only in `runWork` today,
-so this is currently latent (nothing calls `Reserve` yet) — but a future
-caller (e.g. #8248) wiring `Reserve`/`Release` into a handler reachable from
-the control-center path reopens exactly the hazard `holdsWorkerLock` exists to
-close, via the other door: a CC-held reservation, then a later `citadel work`
-legitimately `Acquire`s (nobody holds the lock) and its startup reconcile
-destructively restarts a service the still-live CC job is using.
-`ReconcileOrphanedReservations`' doc comment states this gap and the two ways
-to close it (make the CC path `Acquire` too, or add owner identity — pid +
-start time — to the marker) in detail; read it before wiring such a caller.
+`internal/worklock` now guards both `citadel work` and the control-center TUI's
+owned worker path. `cmd/controlcenter.go:acquireControlCenterWorkerLock` takes
+the same lock before worker initialization; contention makes the TUI
+monitor-only, and other lock errors refuse a job consumer. The lock stays held
+until `runWorkerWithAutoUpdater` has cancelled and awaited the updater after
+`Runner.Run` returns. Reservation reconcile is still wired only in `runWork`,
+so a future control-center reservation caller must decide whether to reconcile
+on its own startup; it must not assume the lock alone performs that restore.
 
 **Reserve's fit-check divergence from #577 is deliberate.** `preemptForVRAM`
 skips the check (logs and proceeds un-preempted) when free VRAM can't be
@@ -2412,7 +2405,7 @@ job then still finds it and rewrites its `desired_status` (though not its
 running state — the start-side helpers already short-circuit on
 already-running, so this is a manifest-only side effect, not a second start).
 Latent and low-severity today (no caller reserves anything yet), documented
-alongside the CC/worklock gap above rather than fixed, for the same reason:
+alongside the other local-start limitations above rather than fixed, for the same reason:
 narrow, deliberate scope for the primitive PR.
 
 ### Model exclusivity: `run --exclusive` + local MCP deploy/evict (aceteam#8248/#8249, citadel#851's first caller)
