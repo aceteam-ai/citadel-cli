@@ -114,6 +114,7 @@ func TestPollForTokenWithCSR_DropsCSROnEnrollmentFailure(t *testing.T) {
 		{"rate_limited_429", http.StatusTooManyRequests, "certificate_enrollment_rate_limited"},
 		{"conflict_409", http.StatusConflict, "certificate_enrollment_failed"},
 		{"failed_400", http.StatusBadRequest, "certificate_enrollment_failed"},
+		{"unsupported_kind_400", http.StatusBadRequest, "unsupported_device_kind"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
