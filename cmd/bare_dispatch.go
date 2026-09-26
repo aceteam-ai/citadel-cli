@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -130,5 +131,16 @@ func runExistingGuidedEnroll() {
 // create a worker, authenticate, or mint credentials: those are S2/S3 work.
 func runEnrolledSessionDispatchStub(tier enrollmentTier, controlURL string) {
 	Debug("bare dispatcher selected %s session via persisted control URL %s", tier, controlURL)
+	cfg, err := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), tier == enrollmentPlatform)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: node session config: %v\n", err)
+		return
+	}
+	if cfg.Mode == nodesession.Presence {
+		if err := runPresence(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+		return
+	}
 	runControlCenter()
 }

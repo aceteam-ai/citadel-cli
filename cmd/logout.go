@@ -10,6 +10,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/spf13/cobra"
 )
 
@@ -75,6 +76,13 @@ func runLogout(cmd *cobra.Command, args []string) {
 	if err := network.Logout(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error logging out: %v\n", err)
 		os.Exit(1)
+	}
+	if !logoutKeepRegistration {
+		// A later enrollment is a new identity and must receive its own
+		// authkey/device-auth default, not inherit this account's mode.
+		if err := os.Remove(nodesession.Path(network.GetNodeConfigDir())); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: could not clear prior session mode: %v\n", err)
+		}
 	}
 
 	fmt.Println("✅ Successfully disconnected from the AceTeam Network.")
