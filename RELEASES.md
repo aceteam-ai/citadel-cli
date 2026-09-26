@@ -2723,3 +2723,20 @@ Auto-generated log of every release.
   - fix: correct stale FILE_WRITE_BYTES gated-reason after #1112 (#1150)
 
 
+---
+
+## v2.173.0 — 2026-09-26
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 28 |
+| Lines added | +2961 |
+
+**Changes:**
+
+  - feat(transcribe): opt-in word timestamps in transcription (#1155)
+  - feat: persist node presence and share session control (#1143)
+  - feat: enroll existing identity key through device-auth CSR poll (#1098)
+
+
