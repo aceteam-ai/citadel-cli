@@ -80,9 +80,12 @@ func runNonInteractiveLogin() {
 	if err := saveHostnameToConfig(nodeName); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save hostname: %v\n", err)
 	}
+	// Best-effort, matching the sibling saveHostnameToConfig above: a corrupt or
+	// unwritable config.yaml must not hard-fail an --authkey login that would
+	// otherwise succeed. A stale login_node_uid only affects the CSR-login
+	// serving name, which the authkey path does not use.
 	if err := clearLoginNodeUID(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error: could not clear prior login serving identity.")
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Warning: could not clear prior login serving identity: %v\n", err)
 	}
 
 	// Try to reclaim stale node with the same hostname
