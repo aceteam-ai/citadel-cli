@@ -123,6 +123,7 @@ class TranscribeRequest(BaseModel):
     language: str | None = None
     # BASIC speaker labelling when True.
     diarize: bool = False
+    word_timestamps: bool = False
 
     # citadel#1045 tuning params, all optional. Absent = today's behavior.
     model_size: str | None = None
@@ -205,6 +206,28 @@ def _label_speakers(segments: list[dict]) -> list[dict]:
     return segments
 
 
+def _format_segment(segment, include_words: bool) -> dict:
+    formatted = {
+        "start": round(segment.start, 3),
+        "end": round(segment.end, 3),
+        "text": segment.text.strip(),
+        "no_speech_prob": round(segment.no_speech_prob, 4),
+        "avg_logprob": round(segment.avg_logprob, 4),
+        "compression_ratio": round(segment.compression_ratio, 4),
+    }
+    if include_words:
+        formatted["words"] = [
+            {
+                "word": word.word.strip(),
+                "start": round(word.start, 3),
+                "end": round(word.end, 3),
+                "probability": round(word.probability, 4),
+            }
+            for word in (segment.words or [])
+        ]
+    return formatted
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model": WHISPER_MODEL}
@@ -222,6 +245,8 @@ def transcribe(req: TranscribeRequest):
             path = denoised_tmp
 
         kwargs: dict = {"beam_size": 5, "language": req.language}
+        if req.word_timestamps:
+            kwargs["word_timestamps"] = True
         if req.vad_filter is not None:
             kwargs["vad_filter"] = req.vad_filter
         if req.no_speech_threshold is not None:
@@ -236,20 +261,7 @@ def transcribe(req: TranscribeRequest):
 
         segments_iter, info = model.transcribe(path, **kwargs)
 
-        segments = [
-            {
-                "start": round(s.start, 3),
-                "end": round(s.end, 3),
-                "text": s.text.strip(),
-                # citadel#1045: expose the per-segment probability signals the
-                # Go guard reasons over. faster-whisper computes these for every
-                # segment regardless of tuning params.
-                "no_speech_prob": round(s.no_speech_prob, 4),
-                "avg_logprob": round(s.avg_logprob, 4),
-                "compression_ratio": round(s.compression_ratio, 4),
-            }
-            for s in segments_iter
-        ]
+        segments = [_format_segment(s, req.word_timestamps) for s in segments_iter]
     finally:
         if denoised_tmp is not None:
             try:
