@@ -1567,6 +1567,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			PairingDisplay:  pairingDisplayFn,
 			CacheReport:     cacheReportFn,
 			JobTypes:        jobTypesFn,
+			// The status process may run as a different user than an interactive
+			// invoker. Advertise the same machine-level policy the worker enforces.
+			PermissionsProvider: loadNodePermissions,
 		})
 	}
 
@@ -1872,20 +1875,21 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Create collector if not already created
 		if collector == nil {
 			collector = status.NewCollector(status.CollectorConfig{
-				NodeName:        nodeName,
-				ConfigDir:       hotswapConfigDir(workConfigDir),
-				Services:        nil,
-				Capabilities:    statusCaps,
-				WorkerLiveness:  workerLivenessFn,
-				SwapStats:       swapStatsFn,
-				ReconcileHealth: reconcileHealthFn,
-				PinnedServices:  manifestPinnedServices(workManifest),
-				ModelHotswap:    status.ModelHotswapEnabled(),
-				Reservations:    reservationsFn,
-				LaneActivity:    laneActivityFn,
-				PairingDisplay:  pairingDisplayFn,
-				CacheReport:     cacheReportFn,
-				JobTypes:        jobTypesFn,
+				NodeName:            nodeName,
+				ConfigDir:           hotswapConfigDir(workConfigDir),
+				Services:            nil,
+				Capabilities:        statusCaps,
+				WorkerLiveness:      workerLivenessFn,
+				SwapStats:           swapStatsFn,
+				ReconcileHealth:     reconcileHealthFn,
+				PinnedServices:      manifestPinnedServices(workManifest),
+				ModelHotswap:        status.ModelHotswapEnabled(),
+				Reservations:        reservationsFn,
+				LaneActivity:        laneActivityFn,
+				PairingDisplay:      pairingDisplayFn,
+				CacheReport:         cacheReportFn,
+				JobTypes:            jobTypesFn,
+				PermissionsProvider: loadNodePermissions,
 			})
 		}
 
