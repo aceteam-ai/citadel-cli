@@ -53,6 +53,40 @@ func TestRunDeviceAuthFlowWithCSR_ThreadsCSRThroughPoll(t *testing.T) {
 	}
 }
 
+// TestLoginFlow_SecondLoginKeepsSameNodeUID proves the node-uid stability the
+// backend's re-enrollment reuse depends on (citadel-cli#1062, aceteam#9576):
+// login's StartFlow sends a stable machine_id, so a machine_id-keyed backend
+// resolves the SAME node_uid on a second login rather than minting a fresh uuid4
+// that would demote the verified node. The mock mints a node_uid once per
+// StartFlow machine_id and reuses it, mirroring the backend's identity reuse.
+func TestLoginFlow_SecondLoginKeepsSameNodeUID(t *testing.T) {
+	mock := nexus.StartMockDeviceAuthServer(1) // immediate success
+	defer mock.Close()
+	mock.EnrollByMachineID()
+
+	first, err := runDeviceAuthFlowWithCSR(mock.URL(), false, testLoginCSR)
+	if err != nil {
+		t.Fatalf("first login: %v", err)
+	}
+	// A missing machine_id would make both logins mint a fresh uid on the real
+	// backend; assert it is actually sent so the test cannot false-pass on "".
+	if mock.GetLastMachineID() == "" {
+		t.Fatal("login StartFlow sent no machine_id; the backend cannot resolve a stable node_uid")
+	}
+
+	second, err := runDeviceAuthFlowWithCSR(mock.URL(), false, testLoginCSR)
+	if err != nil {
+		t.Fatalf("second login: %v", err)
+	}
+
+	if first.Token.NodeUID == "" || second.Token.NodeUID == "" {
+		t.Fatalf("expected a non-empty node_uid on both logins, got %q and %q", first.Token.NodeUID, second.Token.NodeUID)
+	}
+	if first.Token.NodeUID != second.Token.NodeUID {
+		t.Fatalf("second login node_uid = %q, want %q; a fresh uid demotes a verified node", second.Token.NodeUID, first.Token.NodeUID)
+	}
+}
+
 // TestRunDeviceAuthFlow_LegacyNoCSRInBody pins that the legacy entry point sends
 // NO csr_pem (init/enroll/control-center byte-compat).
 func TestRunDeviceAuthFlow_LegacyNoCSRInBody(t *testing.T) {
