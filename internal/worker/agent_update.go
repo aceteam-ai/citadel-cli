@@ -229,6 +229,14 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 		return h.failure(fmt.Errorf(
 			"AGENT_UPDATE refused: must be dispatched to the per-node stream, got source queue %q", job.SourceQueue)), nil
 	}
+	if update.CurrentBinaryIsDesktopManaged() {
+		return h.success(map[string]any{
+			"updated":     false,
+			"reason":      "desktop-managed; update the Citadel app",
+			"old_version": h.cfg.Version,
+			"new_version": h.cfg.Version,
+		}), nil
+	}
 
 	target := payloadString(job.Payload, "target_version")
 	h.cfg.Log("AGENT_UPDATE: checking for release (target=%q, current=%s)", target, h.cfg.Version)

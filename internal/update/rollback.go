@@ -63,6 +63,9 @@ func ApplyUpdate(newBinaryPath string) error {
 	if IsHomebrewManagedPath(currentPath, runtime.GOOS) {
 		return ErrHomebrewManaged
 	}
+	if IsDesktopManagedPath(currentPath, runtime.GOOS) {
+		return ErrDesktopManaged
+	}
 
 	// 1. Backup current binary
 	if err := BackupCurrent(); err != nil {
@@ -121,6 +124,9 @@ func Rollback() error {
 	// older, pre-guard binary.
 	if IsHomebrewManagedPath(currentPath, runtime.GOOS) {
 		return ErrHomebrewManaged
+	}
+	if IsDesktopManagedPath(currentPath, runtime.GOOS) {
+		return ErrDesktopManaged
 	}
 
 	// Restore previous binary

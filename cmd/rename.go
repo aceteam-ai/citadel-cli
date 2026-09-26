@@ -132,7 +132,7 @@ func reconnectWithNewName(newName string) error {
 	// the persisted control plane rather than the --nexus flag default
 	// (citadel-cli#1110, founder decision D7).
 	config := network.ServerConfig{
-		Hostname:   newName,
+		Hostname:   servingIdentityHostname(loadLoginNodeUID(), newName),
 		ControlURL: network.ResolveControlURL(),
 		StateDir:   network.GetStateDir(),
 	}

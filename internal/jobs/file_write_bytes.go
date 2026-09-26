@@ -4,6 +4,7 @@ package jobs
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,10 @@ import (
 // the FILE_READ_BYTES read cap. Used when the payload omits 'max_bytes'.
 const defaultMaxWriteBytes int64 = 50 * 1024 * 1024
 
+// ErrFilesDisabled is a terminal permission refusal. An operator can enable
+// Files and submit a new upload; automatic replay must not retry a refused job.
+var ErrFilesDisabled = errors.New(`{"reason":"files_disabled","message":"Node Files permission required for binary file writes. Enable Files in the AceTeam control center or use citadel_set_files_permission with enabled=true and confirm=true, then retry the upload. If the worker still reports Files disabled, restart it."}`)
+
 // FileWriteBytesHandler handles FILE_WRITE_BYTES jobs.
 //
 // Unlike FILE_WRITE (which writes the payload string verbatim and is therefore
@@ -26,6 +31,12 @@ const defaultMaxWriteBytes int64 = 50 * 1024 * 1024
 // the Redis wire intact, which the text FILE_WRITE path cannot guarantee.
 type FileWriteBytesHandler struct {
 	WorkspaceDir string
+	// Disabled keeps the operation registered but refuses before accessing the
+	// workspace when no live permission source is configured.
+	Disabled bool
+	// Enabled reads the current node Files permission. When present it takes
+	// precedence over the startup Disabled value.
+	Enabled func() bool
 }
 
 // NewFileWriteBytesHandler creates a handler rooted at workspace.
@@ -44,6 +55,10 @@ func NewFileWriteBytesHandler(workspace string) *FileWriteBytesHandler {
 //   - path:          validated absolute path written.
 //   - bytes_written: decoded byte length actually written.
 func (h *FileWriteBytesHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	if (h.Enabled != nil && !h.Enabled()) || (h.Enabled == nil && h.Disabled) {
+		return nil, ErrFilesDisabled
+	}
+
 	path, ok := job.Payload["path"]
 	if !ok || path == "" {
 		return nil, fmt.Errorf("job payload missing 'path' field")

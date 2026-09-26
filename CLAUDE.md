@@ -559,6 +559,14 @@ whenever it believes a retry is coming), a truly-failed or
 transient-fail-then-abandoned job in direct-Redis mode produced ZERO
 terminal stream events, permanently.
 
+A disabled Files permission is different from a transient handler failure.
+`jobs.ErrFilesDisabled` survives the legacy handler adapter;
+`Runner.executeJob` publishes it immediately and calls `source.Fail` (failed
+status plus ACK), even when the delivery metadata permits another attempt.
+`TestRunnerFilesDisabledPublishesTerminalErrorWithoutRetry` pins this boundary.
+The handler checks the live Files policy, but a refused job is terminal. After
+enabling Files, the caller submits a new upload.
+
 `Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
 a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before
 the normal blocking read. A successful claim increments the Redis-native
@@ -1488,6 +1496,32 @@ requested model the external engine doesn't serve is logged as a mismatch and ad
 anyway (launching would collide on the port). No feature flag — adoption only fires
 when something is genuinely serving OpenAI-compat on the resolved port.
 
+**The NATIVE analogue: a host-systemd-managed native engine is reported, not
+falsely stopped (citadel-cli#1144).** The stock ollama install runs as a host
+`ollama.service` (`User=ollama`, `Restart=always`), which citadel did not start
+and cannot stop (EPERM / relaunched in 3s). `services.classifyExternalSupervisor`
+(`internal/services/external_supervisor.go`, pure core over two cgroup strings;
+the `/proc` read is Linux-only, `_linux.go`/`_other.go`) OWNS the rule: a native
+engine's live process is externally managed when its LEAF-owning systemd unit is a
+`*.service` OTHER than this process's own (`/proc/<pid>/cgroup` vs
+`/proc/self/cgroup`). The self-comparison is load-bearing — a citadel-STARTED
+engine is a child in citadel's own unit, so from inside `citadel work` it matches
+self and is NOT external; the leaf-owning rule (stop at the first `.service` OR
+`.scope` walking up) is what keeps a graphical-terminal `.scope` from being
+misattributed to `user@<uid>.service`. `StopNativeService`
+(`native_stop.go`) returns the `ErrNativeExternallyManaged{Unit}` sentinel on its
+no-pidfile fall-through BEFORE `stopMatchingProcesses` signals anything (the
+citadel-owned verified-pidfile path is unchanged); both stop call sites —
+`serviceStop`'s native branch (SERVICE_STOP) and `stopSingleService`'s new native
+branch (`citadel stop`, previously compose-only and thus a false success) — map it
+to `services.ExternallyManagedGuidance` (a clear no-op, `running:true`, "run
+`systemctl stop <unit>`"), never a doomed kill. **Known gap:** a native engine
+`citadel work` started as a child, stopped from a SEPARATE shell `citadel stop`,
+is reported external (pointing at `citadel-worker.service`) because the pidfile
+lives under invoker-scoped `ConfigDir()/run` and is invisible cross-context — an
+honest "this CLI can't stop it" rather than the prior silent false success.
+launchd/SCM detection is a documented follow-up (Linux-only today).
+
 ### WhatsApp bridge deploys must pull (#718)
 
 The bridge compose pins a FLOATING tag, so `docker compose up -d` alone can never
@@ -2322,21 +2356,14 @@ left over from a previous process invocation that exited before releasing it.
 The only correct call site is `cmd/work.go`'s `runWork`, immediately after a
 successful `worklock.Acquire`, before the job consume loop starts.
 
-`internal/worklock` guards `citadel work` against a SECOND `citadel work` — it
-does NOT guard against the control-center TUI's own worker path. When no
-dedicated `citadel work` holds the lock (`workerHeld == false` in
-`cmd/controlcenter.go`), the control center runs its own consume loop off the
-SAME `buildNodeJobHandlers` handler set **without ever calling
-`worklock.Acquire`**. Reservation reconcile is wired only in `runWork` today,
-so this is currently latent (nothing calls `Reserve` yet) — but a future
-caller (e.g. #8248) wiring `Reserve`/`Release` into a handler reachable from
-the control-center path reopens exactly the hazard `holdsWorkerLock` exists to
-close, via the other door: a CC-held reservation, then a later `citadel work`
-legitimately `Acquire`s (nobody holds the lock) and its startup reconcile
-destructively restarts a service the still-live CC job is using.
-`ReconcileOrphanedReservations`' doc comment states this gap and the two ways
-to close it (make the CC path `Acquire` too, or add owner identity — pid +
-start time — to the marker) in detail; read it before wiring such a caller.
+`internal/worklock` now guards both `citadel work` and the control-center TUI's
+owned worker path. `cmd/controlcenter.go:acquireControlCenterWorkerLock` takes
+the same lock before worker initialization; contention makes the TUI
+monitor-only, and other lock errors refuse a job consumer. The lock stays held
+until `runWorkerWithAutoUpdater` has cancelled and awaited the updater after
+`Runner.Run` returns. Reservation reconcile is still wired only in `runWork`,
+so a future control-center reservation caller must decide whether to reconcile
+on its own startup; it must not assume the lock alone performs that restore.
 
 **Reserve's fit-check divergence from #577 is deliberate.** `preemptForVRAM`
 skips the check (logs and proceeds un-preempted) when free VRAM can't be
@@ -2378,7 +2405,7 @@ job then still finds it and rewrites its `desired_status` (though not its
 running state — the start-side helpers already short-circuit on
 already-running, so this is a manifest-only side effect, not a second start).
 Latent and low-severity today (no caller reserves anything yet), documented
-alongside the CC/worklock gap above rather than fixed, for the same reason:
+alongside the other local-start limitations above rather than fixed, for the same reason:
 narrow, deliberate scope for the primitive PR.
 
 ### Model exclusivity: `run --exclusive` + local MCP deploy/evict (aceteam#8248/#8249, citadel#851's first caller)
@@ -3409,6 +3436,23 @@ and `syscall.Exec`-restart themselves. `cmd/update.go`'s `installUpdate()`
 process — swapping the on-disk binary there does nothing to the already-running
 managed worker, which keeps executing the pre-swap code indefinitely
 (citadel#454's split-brain incident).
+
+**Updater drain ownership (citadel-cli#1133):** `Runner.Drain()` is permanent
+for shutdown and remote `AGENT_UPDATE`. The periodic updater instead calls
+`Runner.BeginDrain()` through `cmd/work.go` and owns the returned release
+function. `AutoUpdater.runOnce` releases that scope after idle timeout,
+cancellation, apply failure, or restart failure; on a successful restart it
+keeps the scope until process replacement. Runner serializes drain acquisition
+with claim processing and cancels an in-progress source poll before a drain
+call returns, so no new claim begins while the updater owns its scope. A
+separate permanent drain or another scope remains effective when one scope
+is released. `Runner.ActiveJobs()` also counts the gap between claim and
+dispatch, plus a job returned by a poll cancelled at drain acquisition. The
+updater cannot observe false idle while it owns a source-claimed job. The
+control-center worker has no periodic updater; its shared remote-update
+handler keeps the permanent drain. External-engine `MODULE_SET` also owns a
+separate `BeginDrain()` scope: its failed re-exec path releases only that
+scope after rollback, rather than clearing a concurrent permanent drain.
 
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
 stub on `!linux`) is the authority for "is a managed citadel service running

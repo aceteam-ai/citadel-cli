@@ -24,8 +24,7 @@ type ExternalModuleConfig struct {
 	Restore            func(string, *externalengine.Config) error
 	Probe              func(context.Context, externalengine.Endpoint, string) error
 	Snapshot           func() error
-	Drain              func()
-	Resume             func()
+	BeginDrain         func() (release func())
 	ActiveJobs         func() int
 	Restart            func() error
 	IdleTimeout        time.Duration
@@ -162,9 +161,9 @@ func (h *ModuleSetHandler) executeExternal(ctx context.Context, job *Job) *JobRe
 	if err := cfg.Save(cfg.Dir, candidate); err != nil {
 		return h.retry(fmt.Errorf("persist external engine config: %w", err))
 	}
-	if cfg.Drain != nil && cfg.ActiveJobs != nil && cfg.Resume != nil && cfg.Restart != nil {
-		cfg.Drain()
-		go cfg.restartAfterAck(candidate.Revision, previous)
+	if cfg.BeginDrain != nil && cfg.ActiveJobs != nil && cfg.Restart != nil {
+		releaseDrain := cfg.BeginDrain()
+		go cfg.restartAfterAck(candidate.Revision, previous, releaseDrain)
 	}
 	return &JobResult{Status: JobStatusSuccess, Output: map[string]any{
 		"status": "applied_pending_reload", "revision": candidate.Revision, "config_ref": candidate.ConfigRef,
@@ -172,13 +171,15 @@ func (h *ModuleSetHandler) executeExternal(ctx context.Context, job *Job) *JobRe
 	}}
 }
 
-func (cfg *ExternalModuleConfig) restartAfterAck(revision string, previous *externalengine.Config) {
+func (cfg *ExternalModuleConfig) restartAfterAck(revision string, previous *externalengine.Config, releaseDrain func()) {
 	deadline := time.Now().Add(cfg.IdleTimeout)
 	for cfg.ActiveJobs() != 0 {
 		if time.Now().After(deadline) {
 			cfg.Log("external engine revision %s pending reload: drain timed out", revision)
 			cfg.rollbackAfterFailedRestart(revision, previous)
-			cfg.Resume()
+			if releaseDrain != nil {
+				releaseDrain()
+			}
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -186,7 +187,9 @@ func (cfg *ExternalModuleConfig) restartAfterAck(revision string, previous *exte
 	if err := cfg.Restart(); err != nil {
 		cfg.Log("external engine revision %s pending reload: reexec failed: %v", revision, err)
 		cfg.rollbackAfterFailedRestart(revision, previous)
-		cfg.Resume()
+		if releaseDrain != nil {
+			releaseDrain()
+		}
 	}
 }
 

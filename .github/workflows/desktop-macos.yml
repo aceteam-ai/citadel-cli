@@ -1,0 +1,120 @@
+name: Citadel desktop macOS
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-macos.yml"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Same-repository pull request number reviewed for native build"
+        required: true
+        type: number
+      head_sha:
+        description: "Exact 40-character pull request head SHA reviewed for native build"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-macos-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Build frontend
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build
+
+  review-head:
+    name: Verify reviewed native build head
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      - id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          head_repository="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.head.repo.full_name')"
+          actual_sha="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha')"
+          test "$head_repository" = "$REPOSITORY"
+          test "$actual_sha" = "$HEAD_SHA"
+          echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+  native:
+    name: Reviewed unsigned macOS app
+    needs: review-head
+    if: github.event_name == 'workflow_dispatch'
+    environment: desktop-macos-native
+    runs-on: [self-hosted, macOS, ios-builder]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.review-head.outputs.sha }}
+          persist-credentials: false
+      - name: Check exact checkout and signing isolation
+        env:
+          EXPECTED_SHA: ${{ needs.review-head.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          identities="$(security find-identity -v -p codesigning)"
+          if grep -Eq '[1-9][0-9]* valid identities found' <<< "$identities"; then
+            echo 'Native CI runner must not expose code-signing identities' >&2
+            exit 1
+          fi
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Use pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Install frontend packages
+        working-directory: desktop
+        run: npm ci
+      - name: Build frontend
+        working-directory: desktop
+        run: npm run build
+      - name: Stage Go helper
+        working-directory: desktop
+        run: ./scripts/stage-sidecar.sh
+      - name: Rust tests
+        working-directory: desktop/src-tauri
+        run: cargo test --locked
+      - name: Build unsigned app bundle
+        working-directory: desktop
+        run: npm run tauri -- build --bundles app --no-sign --ci
