@@ -2706,3 +2706,20 @@ Auto-generated log of every release.
   - fix: report externally-managed native engines instead of a false stop (#1144)
 
 
+---
+
+## v2.172.0 — 2026-09-26
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 67 |
+| Lines added | +10742 |
+
+**Changes:**
+
+  - feat(desktop): macOS Citadel Tauri node app shell (#1140)
+  - feat: acknowledge targeted WORKER_CONTROL restarts (#1129)
+  - fix: correct stale FILE_WRITE_BYTES gated-reason after #1112 (#1150)
+
+
