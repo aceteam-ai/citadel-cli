@@ -211,6 +211,9 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 //     default sees no change (citadel-cli#603's omit-if-empty rule).
 //   - instructions:       optional free-text voice design, forwarded verbatim;
 //     omitted entirely when absent. kokoro ignores it; omnivoice honors it.
+//   - word_timestamps:    optional boolean; true calls Kokoro's captioned
+//     endpoint and adds word start/end seconds to the envelope. Absent/false
+//     preserves the raw-audio route and envelope.
 //
 // Response JSON (this handler DEFINES the envelope; nothing on the aceteam side
 // parses it yet; the fabric may also call the endpoint directly):
@@ -230,6 +233,7 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 //	    "cache_key":        "<sha256>",
 //	    "cache_hit":        false
 //	  }
+//	  "words": [{"word":"hello","start":0.1,"end":0.5}] // opt-in only
 //	}
 func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	text := job.Payload["text"]
@@ -267,6 +271,17 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 	if format == "" {
 		format = backendDef.format
 	}
+	wordTimestamps := false
+	if value := job.Payload["word_timestamps"]; value != "" {
+		enabled, parseErr := strconv.ParseBool(value)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid word_timestamps %q: must be true or false", value)
+		}
+		wordTimestamps = enabled
+	}
+	if wordTimestamps && backend != defaultSynthesizeBackend {
+		return nil, fmt.Errorf("word timestamps are only supported by the kokoro backend")
+	}
 
 	ctx.Log("info", "     - [Job %s] Waiting for TTS service (%s) to become ready...", job.ID, backend)
 	if err := h.waitForReady(serviceURL); err != nil {
@@ -291,7 +306,6 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 	if instructions := job.Payload["instructions"]; instructions != "" {
 		requestPayload["instructions"] = instructions
 	}
-
 	reqBody, err := json.Marshal(requestPayload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -300,7 +314,11 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 	reqCtx, cancel := context.WithTimeout(context.Background(), synthesizeRequestTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, serviceURL+"/v1/audio/speech", bytes.NewBuffer(reqBody))
+	endpoint := "/v1/audio/speech"
+	if wordTimestamps {
+		endpoint = "/v1/audio/speech/captioned"
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, serviceURL+endpoint, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to build synthesis request: %w", err)
 	}
@@ -312,10 +330,30 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 	}
 	defer resp.Body.Close()
 
-	audio, _ := io.ReadAll(resp.Body)
+	responseBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		// On error the body is a JSON error, not audio; surface it verbatim.
-		return audio, fmt.Errorf("TTS API returned non-200 status: %s", resp.Status)
+		if wordTimestamps && resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("Kokoro service does not support word timestamps; update its image")
+		}
+		return responseBody, fmt.Errorf("TTS API returned non-200 status: %s", resp.Status)
+	}
+	audio := responseBody
+	var words []map[string]any
+	if wordTimestamps {
+		var captioned struct {
+			AudioBase64 string           `json:"audio_base64"`
+			Words       []map[string]any `json:"words"`
+		}
+		if err := json.Unmarshal(responseBody, &captioned); err != nil || captioned.AudioBase64 == "" || len(captioned.Words) == 0 {
+			return nil, fmt.Errorf("Kokoro service returned an invalid captioned speech response")
+		}
+		var err error
+		audio, err = base64.StdEncoding.DecodeString(captioned.AudioBase64)
+		if err != nil || len(audio) == 0 {
+			return nil, fmt.Errorf("Kokoro service returned invalid captioned audio")
+		}
+		words = captioned.Words
 	}
 
 	// Best-effort: learn this backend's model_license from its own /info so the
@@ -331,6 +369,9 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 		"voice":    voice,
 		"backend":  backend,
 		"receipt":  synthesizeReceiptFromHeaders(resp.Header),
+	}
+	if wordTimestamps {
+		result["words"] = words
 	}
 	return json.Marshal(result)
 }
