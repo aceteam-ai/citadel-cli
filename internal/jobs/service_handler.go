@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -632,6 +633,14 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 	return json.Marshal(result)
 }
 
+// Native-stop seams so serviceStop's native branch is testable without a real
+// process or /proc read (this dev box runs a live node). Default to the real
+// package functions.
+var (
+	isNativeServiceRunningFn = services.IsNativeServiceRunning
+	stopNativeServiceFn      = services.StopNativeService
+)
+
 func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byte, error) {
 	kind := h.resolveKind(svc)
 	var err error
@@ -643,13 +652,25 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 		// holding VRAM, and stop must kill it. Using the serving probe here would
 		// report "not running" and leave it alive forever -- the one place where
 		// the loose predicate is the correct one.
-		if !services.IsNativeServiceRunning(svc.Name) {
+		if !isNativeServiceRunningFn(svc.Name) {
 			return json.Marshal(serviceResult{
 				Name: svc.Name, Running: false, Kind: kind,
 				Action: "stop", Message: svc.Name + " is not running",
 			})
 		}
-		err = services.StopNativeService(svc.Name)
+		err = stopNativeServiceFn(svc.Name)
+		// A native engine owned by a host systemd unit (the stock ollama.service
+		// case, #1144) is externally managed -- citadel did not start it and
+		// cannot stop it. Mirror the #1084 adopted-docker posture: a clear no-op
+		// (running:true, guidance) instead of a doomed kill reported as failure.
+		var extMgd *services.ErrNativeExternallyManaged
+		if errors.As(err, &extMgd) {
+			return json.Marshal(serviceResult{
+				Name: svc.Name, Running: true, Kind: kind,
+				Action:  "stop",
+				Message: services.ExternallyManagedGuidance(svc.Name, extMgd.Unit),
+			})
+		}
 
 	case "docker":
 		// #1084: an ADOPTED external engine (serving on this adoptable port but

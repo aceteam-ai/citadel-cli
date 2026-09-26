@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
 )
@@ -182,6 +184,13 @@ func stopSingleService(serviceName string) {
 	if err != nil {
 		// If no manifest, try to stop by container name directly
 		fmt.Printf("--- 🛑 Stopping service: %s ---\n", serviceName)
+		// A native engine (e.g. a host-managed ollama) must NOT fall into the
+		// container path, which no-ops for a native process and prints a false
+		// success (#1144). Resolve the kind by auto-detection here.
+		if determineServiceType(Service{Name: serviceName}) == internalServices.ServiceTypeNative {
+			stopNativeAndReport(serviceName)
+			return
+		}
 		if err := stopServiceByContainer(serviceName); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)
@@ -191,15 +200,40 @@ func stopSingleService(serviceName string) {
 	}
 
 	// Find service in manifest
-	var composePath string
+	var composePath, svcType string
+	foundInManifest := false
 	for _, s := range manifest.Services {
 		if s.Name == serviceName {
 			composePath = filepath.Join(configDir, s.ComposeFile)
+			svcType = s.Type
+			foundInManifest = true
 			break
 		}
 	}
 
 	fmt.Printf("--- 🛑 Stopping service: %s ---\n", serviceName)
+
+	// Native branch (#1144): a native engine's compose file is empty, so the
+	// compose path below would run `docker compose down` against the config dir
+	// (a no-op with no container) and print a false success. Route native
+	// services through the process-based stop, which reports a host-systemd-owned
+	// engine as guidance (ErrNativeExternallyManaged) rather than a false stop.
+	// Honor an explicit manifest `type`; otherwise auto-detect.
+	if determineServiceType(Service{Name: serviceName, Type: svcType}) == internalServices.ServiceTypeNative {
+		// Record durable stopped intent first, exactly as the compose path does
+		// (mirrors liveModuleOps.Stop, #528), but only for a service actually in
+		// the manifest -- so a citadel-managed native engine stays stopped across
+		// a `citadel work` restart / reboot. Harmless for a host-managed engine
+		// (citadel never starts it either way); skipped when not in the manifest,
+		// matching the container fallback which sets no marker.
+		if foundInManifest {
+			if err := setServiceDesiredStatus(configDir, serviceName, "stopped"); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Could not record stopped state for %s: %v\n", serviceName, err)
+			}
+		}
+		stopNativeAndReport(serviceName)
+		return
+	}
 
 	if composePath != "" {
 		// Mark durably stopped FIRST (mirrors liveModuleOps.Stop, #528): the stop
@@ -227,6 +261,45 @@ func stopSingleService(serviceName string) {
 	}
 
 	fmt.Printf("✅ Service '%s' stopped.\n", serviceName)
+}
+
+// stopNativeServiceFn is the CLI-side seam over services.StopNativeService so
+// stopNativeAndReport is exercisable without a live process or /proc read.
+var stopNativeServiceFn = internalServices.StopNativeService
+
+// stopNativeAndReport runs the native-engine stop for `citadel stop` and prints
+// the operator-facing result. A host-systemd-owned engine (#1144) yields
+// guidance, not the compose path's false success.
+func stopNativeAndReport(serviceName string) {
+	// Deliberately the PROCESS check, not the serving probe (#649/#677): a wedged
+	// engine that answers nothing is still a live process citadel should stop.
+	if !internalServices.IsNativeServiceRunning(serviceName) {
+		fmt.Printf("✅ Service '%s' is not running.\n", serviceName)
+		return
+	}
+	line, _, failed := nativeStopOutcome(serviceName, stopNativeServiceFn(serviceName))
+	if failed {
+		fmt.Fprintln(os.Stderr, line)
+		os.Exit(1)
+	}
+	fmt.Println(line)
+}
+
+// nativeStopOutcome maps a StopNativeService result to the CLI's operator-facing
+// line. Pure and seam-free so it is unit-testable without a live process,
+// manifest, or /proc read: a nil error is a real stop, an
+// ErrNativeExternallyManaged is honest guidance (not a failure, not a false
+// success), and any other error is a failure.
+func nativeStopOutcome(serviceName string, err error) (line string, stopped bool, failed bool) {
+	var extMgd *internalServices.ErrNativeExternallyManaged
+	switch {
+	case err == nil:
+		return fmt.Sprintf("✅ Service '%s' stopped.", serviceName), true, false
+	case errors.As(err, &extMgd):
+		return internalServices.ExternallyManagedGuidance(serviceName, extMgd.Unit), false, false
+	default:
+		return fmt.Sprintf("❌ Failed to stop service '%s': %v", serviceName, err), false, true
+	}
 }
 
 // stopComposeArgs builds the FULL compose args for `... down`, including the
