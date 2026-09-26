@@ -669,7 +669,7 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// streams (aceteam#6889) remove most of the blast radius, but it still falls
 	// back to the shared stream during a mixed-version rollout, where this pin is
 	// the only thing routing the job.
-	if targetNode, ok := job.Payload["target_node"].(string); ok && targetNode != "" && targetNode != r.config.NodeID {
+	if targetNode, ok := job.Payload["target_node"].(string); job.Type != JobTypeWorkerControl && ok && targetNode != "" && targetNode != r.config.NodeID {
 		if r.config.NodeID == "" {
 			r.log("warning", "Declining job %s: addressed to target_node=%s but this node's Headscale ID is unresolved, "+
 				"so it cannot claim addressed work", job.ID, targetNode)
@@ -993,8 +993,89 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		result = r.attachLatencyMetrics(result, queueWaitMs, startTime, execStart, endTime)
 	}
 	r.log("success", "Job %s completed (%v)", job.ID, duration)
+	if job.Type == JobTypeWorkerControl {
+		return r.finishWorkerControl(ctx, job, stream, handler, result, startTime, endTime)
+	}
 	r.finishSuccess(ctx, job, stream, result, startTime, endTime)
 	return true
+}
+
+// finishWorkerControl ACKs before reporting acceptance. Scheduling is prepared
+// behind a gate before the accepted event, and the gate opens only after that
+// event has been published. Thus neither an ACK nor scheduling failure can
+// produce an accepted result or initiate a restart.
+func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream StreamWriter, handler JobHandler, result *JobResult, startTime, endTime time.Time) bool {
+	if result == nil {
+		r.source.Nack(ctx, job, errors.New("WORKER_CONTROL returned no result"))
+		return false
+	}
+	accepted, _ := result.Output["accepted"].(bool)
+	control, ok := handler.(interface {
+		PrepareAfterAck(*Job) (func(), func(), error)
+		Abort(*Job) error
+	})
+	if err := r.source.Ack(ctx, job); err != nil {
+		r.log("error", "WORKER_CONTROL %s queue ack failed: %v", job.ID, err)
+		if accepted && ok {
+			if abortErr := control.Abort(job); abortErr != nil {
+				r.log("error", "WORKER_CONTROL %s abort failed: %v", job.ID, abortErr)
+				return false
+			}
+		}
+		r.publishWorkerControlRefusal(ctx, stream, "ack_failed", "worker restart queue acknowledgment failed")
+		return false
+	}
+	var commit func()
+	if accepted {
+		if !ok {
+			r.publishWorkerControlRefusal(ctx, stream, "schedule_failed", "worker restart scheduler is unavailable")
+			return false
+		}
+		var err error
+		commit, _, err = control.PrepareAfterAck(job)
+		if err != nil {
+			r.log("error", "WORKER_CONTROL %s restart preparation failed: %v", job.ID, err)
+			if abortErr := control.Abort(job); abortErr != nil {
+				r.log("error", "WORKER_CONTROL %s abort failed: %v", job.ID, abortErr)
+				return false
+			}
+			r.publishWorkerControlRefusal(ctx, stream, "schedule_failed", "worker restart could not be scheduled")
+			return false
+		}
+	}
+	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(result.Output) }); err != nil {
+		r.log("error", "WORKER_CONTROL %s result publish failed with uncertain delivery: %v", job.ID, err)
+		if accepted {
+			// A failed publish call may still have delivered the accepted event.
+			// Once publication has been attempted, cancelling the exit would
+			// leave that caller with accepted=true but no restart. Keep the
+			// prepared restart; an unseen result remains unconfirmed upstream.
+			commit()
+		}
+		return false
+	}
+	if accepted {
+		// Acceptance is already visible to the caller. Release the prepared
+		// restart gate before optional usage accounting, which may block or
+		// panic and must not strand an accepted restart.
+		commit()
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				r.log("error", "WORKER_CONTROL %s optional usage accounting panicked: %v", job.ID, recovered)
+			}
+		}()
+		r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
+	}()
+	return true
+}
+
+func (r *Runner) publishWorkerControlRefusal(ctx context.Context, stream StreamWriter, code, message string) {
+	output := map[string]any{"action": "restart", "accepted": false, "restarting": false, "code": code, "message": message}
+	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(output) }); err != nil {
+		r.log("error", "WORKER_CONTROL refusal publish failed: %v", err)
+	}
 }
 
 // finishSuccess is the ONE implementation of the success terminal tail: usage

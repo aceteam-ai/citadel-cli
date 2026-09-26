@@ -19,6 +19,8 @@ import (
 type nodeJobHandlerOpts struct {
 	// OrgID is the organization chosen for this worker's per-node queue.
 	OrgID string
+	// NodeID is the exact Headscale node identifier used for control jobs.
+	NodeID string
 	// WorkspaceDir is the sandbox root for file-operation handlers.
 	WorkspaceDir string
 	// ConfigDir is the citadel.yaml manifest directory (enables service handlers).
@@ -157,6 +159,16 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 // They are registered after the runner exists so AGENT_UPDATE can borrow the
 // runner's Drain/ActiveJobs to drain in-flight work before a self-restart.
 func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandlerOpts) {
+	runner.RegisterHandler(worker.NewWorkerControlHandler(worker.WorkerControlConfig{
+		OrgID:    opts.OrgID,
+		NodeID:   opts.NodeID,
+		StateDir: opts.PermissionsDir,
+		Managed:  managedByServiceManager,
+		Schedule: func() (func(), func(), error) {
+			return worker.PrepareWorkerRestart(func() { processExiter(1) })
+		},
+		Log: opts.HandlerLog,
+	}))
 	// AGENT_UPDATE (aceteam#4427): remote agent update + restart for this node.
 	runner.RegisterHandler(worker.NewAgentUpdateHandler(worker.AgentUpdateConfig{
 		Version:    Version,
