@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
@@ -36,7 +37,7 @@ var (
 	initProvision          bool
 	initRelogin            bool
 	initNewDevice          bool // Force fresh registration, ignoring existing machine mapping
-	userAddedToDockerGroup bool // Track if we added user to docker group in this run
+	userAddedToDockerGroup bool // Legacy non-Linux Docker provisioning
 )
 
 // fixStatePermissionsFn is network.FixStatePermissions, indirected through a
@@ -56,6 +57,8 @@ var fixStatePermissionsFn = network.FixStatePermissions
 // this machine's real citadel-node/config.yaml.
 var nodeConfigDirFn = network.GetNodeConfigDir
 
+const podmanServiceUser = "citadel"
+
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Provisions a fresh server to become a Citadel Node",
@@ -65,12 +68,12 @@ the node to the AceTeam Network.
 By default, citadel init only joins the network (no sudo required). Services
 can be configured via the AceTeam web management page.
 
-Use --provision for full provisioning including Docker installation, NVIDIA toolkit,
+Use --provision for full provisioning including rootless Podman on Linux, NVIDIA toolkit,
 and system user configuration (requires sudo).`,
 	Example: `  # Default: join network only (no sudo required)
   citadel init
 
-  # Full provisioning with Docker and NVIDIA toolkit (requires sudo)
+  # Full Linux provisioning with rootless Podman and NVIDIA CDI (requires sudo)
   sudo citadel init --provision
 
   # Full provisioning with specific service
@@ -82,6 +85,19 @@ and system user configuration (requires sudo).`,
   # Full provisioning with verbose output (for debugging)
   sudo citadel init --provision --verbose`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// E5 owns migration of existing system workers. This read-only gate must
+		// precede identity, auth, network and configuration writes.
+		if initProvision && platform.IsLinux() {
+			ready, err := prepareLinuxPodmanProvision()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				os.Exit(1)
+			}
+			if ready {
+				fmt.Println("✅ Existing rootless Citadel worker is healthy; provisioning is already complete.")
+				return
+			}
+		}
 		// Root is only required for full provisioning (--provision flag)
 		// Default mode only joins the network using embedded tsnet (no root required)
 		if initProvision && !isRoot() {
@@ -407,6 +423,9 @@ and system user configuration (requires sudo).`,
 		}
 
 		originalUser := platform.GetSudoUser()
+		if platform.IsLinux() {
+			originalUser = podmanServiceUser
+		}
 		if originalUser == "" {
 			fmt.Fprintln(os.Stderr, "❌ Could not determine the original user from $SUDO_USER.")
 			os.Exit(1)
@@ -425,6 +444,12 @@ and system user configuration (requires sudo).`,
 			fmt.Fprintf(os.Stderr, "❌ Failed to create global system configuration: %v\n", err)
 			os.Exit(1)
 		}
+		if platform.IsLinux() {
+			if err := ownProvisionedLinuxState(configDir); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Could not hand node state to the dedicated worker: %v\n", err)
+				os.Exit(1)
+			}
+		}
 
 		// --- 2. Provision System ---
 		if !initVerbose {
@@ -440,29 +465,44 @@ and system user configuration (requires sudo).`,
 		}
 
 		// Build provision steps based on selected service
-		// If service is "none", skip Docker-related steps
+		// If service is "none", skip container-runtime steps.
 		provisionSteps := []struct {
 			name     string
 			checkCmd string
 			run      func() error
 		}{}
 
-		// Docker and related steps are only needed for containerized services
+		// Container runtime and GPU tooling are only needed for services.
 		if selectedService != "none" {
-			provisionSteps = append(provisionSteps,
-				struct {
+			if platform.IsLinux() {
+				provisionSteps = append(provisionSteps,
+					struct {
+						name     string
+						checkCmd string
+						run      func() error
+					}{"System User", "", setupUser},
+					struct {
+						name     string
+						checkCmd string
+						run      func() error
+					}{"Rootless Podman", "", installRootlessPodmanLinux},
+				)
+			} else {
+				provisionSteps = append(provisionSteps,
+					struct {
+						name     string
+						checkCmd string
+						run      func() error
+					}{"Docker", "docker", installDocker},
+				)
+			}
+			if !platform.IsLinux() {
+				provisionSteps = append(provisionSteps, struct {
 					name     string
 					checkCmd string
 					run      func() error
-				}{"Docker", "docker", installDocker},
-			)
-			provisionSteps = append(provisionSteps,
-				struct {
-					name     string
-					checkCmd string
-					run      func() error
-				}{"System User", "", setupUser},
-			)
+				}{"System User", "", setupUser})
+			}
 			provisionSteps = append(provisionSteps,
 				struct {
 					name     string
@@ -470,13 +510,15 @@ and system user configuration (requires sudo).`,
 					run      func() error
 				}{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
 			)
-			provisionSteps = append(provisionSteps,
-				struct {
-					name     string
-					checkCmd string
-					run      func() error
-				}{"Configure Docker for NVIDIA", "", configureNvidiaDocker},
-			)
+			if platform.IsLinux() {
+				provisionSteps = append(provisionSteps,
+					struct {
+						name     string
+						checkCmd string
+						run      func() error
+					}{"NVIDIA CDI", "", configureNvidiaCDILinux},
+				)
+			}
 		}
 
 		// Note: Network connectivity is now handled via embedded tsnet library
@@ -510,12 +552,12 @@ and system user configuration (requires sudo).`,
 
 		// Clarify what was skipped
 		if selectedService == "none" {
-			fmt.Println("   ℹ️  Docker installation was skipped (service=none).")
+			fmt.Println("   ℹ️  Container runtime installation was skipped (service=none).")
 		}
 
 		// --- 3. Final Handoff ---
-		// Only show Docker permissions warning if we actually added the user to the group
-		if userAddedToDockerGroup && originalUser != "" && originalUser != "root" {
+		// Legacy non-Linux Docker installations may still require a new session.
+		if !platform.IsLinux() && userAddedToDockerGroup && originalUser != "" && originalUser != "root" {
 			fmt.Println("\n⚠️  IMPORTANT: For Docker permissions to apply, you must log out and log back in,")
 			fmt.Printf("   or start a new login shell with: exec su -l %s\n", originalUser)
 		}
@@ -1487,15 +1529,26 @@ func runCommand(name string, args ...string) error {
 // runAsUser executes a command as a specific user in a cross-platform way
 // On Linux/macOS: uses sudo -H -u <user> sh -c <command>
 // On Windows: runs directly (already running as Administrator)
-func runAsUser(user string, cmdString string) *exec.Cmd {
+func runAsUser(username string, cmdString string) *exec.Cmd {
 	if platform.IsWindows() {
 		// On Windows, run directly with cmd.exe
 		// The user is already running as Administrator
 		// Use cmd /c to execute the command string (supports && syntax)
 		return exec.Command("cmd", "/c", cmdString)
 	}
-	// On Linux/macOS, use sudo to run as the original user
-	return exec.Command("sudo", "-H", "-u", user, "sh", "-c", cmdString)
+	// The rootless Podman socket lives in the owner's user manager, so the
+	// commands run during Linux provisioning need that runtime directory too.
+	if platform.IsLinux() {
+		if owner, err := user.Lookup(username); err == nil {
+			return exec.Command("sudo", "-H", "-u", username, "env",
+				"-u", "SUDO_USER", "-u", "SUDO_UID", "-u", "SUDO_GID",
+				"XDG_RUNTIME_DIR=/run/user/"+owner.Uid,
+				"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/"+owner.Uid+"/bus",
+				"sh", "-c", cmdString)
+		}
+	}
+	// On macOS, use sudo to run as the original user.
+	return exec.Command("sudo", "-H", "-u", username, "sh", "-c", cmdString)
 }
 
 func ensureCoreDependencies() error {
@@ -1623,6 +1676,9 @@ func installDocker() error {
 }
 
 func setupUser() error {
+	if platform.IsLinux() {
+		return ensureDedicatedPodmanUser()
+	}
 	originalUser := platform.GetSudoUser()
 	if originalUser == "" || originalUser == "root" {
 		if initVerbose {
@@ -1645,42 +1701,8 @@ func setupUser() error {
 			return fmt.Errorf("failed to create user %s: %w", originalUser, err)
 		}
 
-		// On Linux, add to sudo group
-		if platform.IsLinux() {
-			if err := userMgr.AddUserToGroup(originalUser, "sudo"); err != nil {
-				if initVerbose {
-					fmt.Printf("     - Warning: Could not add user to sudo group: %v\n", err)
-				}
-			}
-		}
 	} else if initVerbose {
 		fmt.Printf("     - User '%s' already exists.\n", originalUser)
-	}
-
-	// Ensure user is in docker group (Linux only - Docker Desktop on macOS doesn't use a docker group)
-	if platform.IsLinux() {
-		if initVerbose {
-			fmt.Printf("     - Ensuring user '%s' is in the 'docker' group...\n", originalUser)
-		}
-		if !userMgr.IsUserInGroup(originalUser, "docker") {
-			if err := userMgr.AddUserToGroup(originalUser, "docker"); err != nil {
-				return fmt.Errorf("failed to add user to docker group: %w", err)
-			}
-			// Track that we added the user to docker group in this run
-			userAddedToDockerGroup = true
-		}
-	}
-
-	// Grant passwordless sudo (Linux only - on macOS/Windows, this is handled differently)
-	if platform.IsLinux() {
-		if initVerbose {
-			fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
-		}
-		sudoersFileContent := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", originalUser)
-		err := os.WriteFile(fmt.Sprintf("/etc/sudoers.d/99-citadel-%s", originalUser), []byte(sudoersFileContent), 0440)
-		if err != nil {
-			return fmt.Errorf("failed to configure passwordless sudo: %w", err)
-		}
 	}
 
 	return nil
@@ -1693,6 +1715,15 @@ func installNvidiaToolkit() error {
 			fmt.Println("     - Skipping NVIDIA Container Toolkit (not required on macOS/Windows).")
 		}
 		return nil
+	}
+	if !hasNvidiaHardwareLinux() {
+		return nil
+	}
+	if isJetsonLinux() {
+		if isCommandAvailable("nvidia-ctk") {
+			return nil
+		}
+		return fmt.Errorf("Jetson/L4T toolkit is missing nvidia-ctk; install the JetPack-matched toolkit, not the generic upstream package")
 	}
 
 	if initVerbose {
@@ -1895,7 +1926,7 @@ func init() {
 	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
 	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")
 	initCmd.Flags().BoolVar(&initVerbose, "verbose", false, "Show detailed output during provisioning")
-	initCmd.Flags().BoolVar(&initProvision, "provision", false, "Full provisioning with Docker, NVIDIA toolkit, and services (requires sudo)")
+	initCmd.Flags().BoolVar(&initProvision, "provision", false, "Full provisioning with rootless Podman on Linux, NVIDIA toolkit, and services (requires sudo)")
 	initCmd.Flags().BoolVar(&initRelogin, "relogin", false, "Force re-authentication while preserving IP address")
 	initCmd.Flags().BoolVar(&initNewDevice, "new-device", false, "Force fresh registration, ignoring existing machine mapping")
 	// Deprecated: --network-only is now the default behavior

@@ -2,8 +2,9 @@
 #
 # Citadel Node Uninstaller
 #
-# Removes the Citadel worker service, binary, and configuration.
-# Does NOT uninstall NVIDIA drivers or Docker.
+# Removes the Citadel worker (rootless user worker or legacy system worker),
+# the dedicated citadel user, binary, and configuration.
+# Does NOT uninstall NVIDIA drivers, Podman, or Docker.
 #
 # Usage:
 #   sudo bash uninstall.sh
@@ -14,7 +15,15 @@ BINARY_NAME="citadel"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/citadel"
 SERVICE_NAME="citadel-worker"
+# Legacy Docker-era system unit (old installer).
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+# Rootless installer artifacts.
+USER_SERVICE_FILE="/etc/systemd/user/${SERVICE_NAME}.service"
+DELEGATE_DROPIN="/etc/systemd/system/user@.service.d/50-citadel-delegate.conf"
+CDI_UNIT="/etc/systemd/system/citadel-nvidia-cdi.service"
+CDI_SCRIPT="/usr/local/libexec/citadel-nvidia-cdi-refresh"
+UDEV_RULE="/etc/udev/rules.d/70-citadel-nvidia.rules"
+WORKER_MARKER="${CONFIG_DIR}/rootless-worker-user"
 NODE_DIR="/root/citadel-node"
 LOG_FILE="/var/log/citadel-install.log"
 
@@ -51,6 +60,29 @@ err() {
     fi
 }
 
+# Run a command as the dedicated citadel user against its rootless user bus.
+as_citadel_user() {
+    local uid
+    uid=$(id -u citadel) || return 1
+    runuser -u citadel -- env -u SUDO_USER -u SUDO_UID -u SUDO_GID \
+        HOME=/home/citadel XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" "$@"
+}
+
+# The citadel account is safe to delete only when Citadel's trusted provenance
+# marker proves the installer created it (a root-owned regular file whose
+# content is the account's own UID). A pre-existing human "citadel" account has
+# no such marker and must never be removed.
+rootless_worker_marker_valid() {
+    local uid content
+    id citadel >/dev/null 2>&1 || return 1
+    uid=$(id -u citadel) || return 1
+    [ -f "$WORKER_MARKER" ] && [ ! -L "$WORKER_MARKER" ] || return 1
+    [ "$(stat -c %u "$WORKER_MARKER" 2>/dev/null)" = "0" ] || return 1
+    content=$(tr -d '[:space:]' < "$WORKER_MARKER" 2>/dev/null)
+    [ "$content" = "$uid" ]
+}
+
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
@@ -63,34 +95,81 @@ echo ""
 msg "Citadel Node Uninstaller"
 echo ""
 
+# Decide up front whether the citadel account is ours to remove -- BEFORE the
+# config dir (which holds the marker) is deleted below.
+MARKER_VALID=false
+if rootless_worker_marker_valid; then
+    MARKER_VALID=true
+fi
+
 # ---------------------------------------------------------------------------
-# Stop and disable systemd service
+# Stop the rootless user worker (dedicated citadel account)
 # ---------------------------------------------------------------------------
-if systemctl list-unit-files "${SERVICE_NAME}.service" &>/dev/null && \
-   systemctl list-unit-files "${SERVICE_NAME}.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
-    msg "Stopping ${SERVICE_NAME} service..."
+if $MARKER_VALID; then
+    citadel_uid=$(id -u citadel)
+    msg "Stopping rootless citadel worker..."
+    as_citadel_user systemctl --user disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+    as_citadel_user systemctl --user disable --now citadel.service 2>/dev/null || true
+    if [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+        as_citadel_user "${INSTALL_DIR}/${BINARY_NAME}" logout 2>/dev/null || true
+    fi
+    # Clear rootless container storage so its fuse mounts don't block userdel -r.
+    as_citadel_user systemctl --user disable --now podman.socket 2>/dev/null || true
+    as_citadel_user podman system reset -f 2>/dev/null || true
+    loginctl disable-linger citadel 2>/dev/null || true
+    systemctl stop "user@${citadel_uid}.service" 2>/dev/null || true
+    msg "Rootless worker stopped"
+fi
+
+# ---------------------------------------------------------------------------
+# Stop and remove the legacy system worker (old Docker-era installer)
+# ---------------------------------------------------------------------------
+if systemctl list-unit-files "${SERVICE_NAME}.service" 2>/dev/null | grep -q "$SERVICE_NAME"; then
+    msg "Stopping ${SERVICE_NAME} system service..."
     systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-    msg "Service stopped and disabled"
-else
-    msg "Service ${SERVICE_NAME} not found (already removed)"
 fi
-
-# ---------------------------------------------------------------------------
-# Remove systemd unit file
-# ---------------------------------------------------------------------------
 if [ -f "$SERVICE_FILE" ]; then
     rm -f "$SERVICE_FILE"
-    systemctl daemon-reload
     msg "Removed ${SERVICE_FILE}"
-else
-    msg "Unit file already removed"
 fi
 
 # ---------------------------------------------------------------------------
-# Disconnect from AceTeam Network
+# Remove the rootless user unit and GPU provisioning artifacts
 # ---------------------------------------------------------------------------
-if [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+if [ -f "$USER_SERVICE_FILE" ]; then
+    rm -f "$USER_SERVICE_FILE"
+    msg "Removed ${USER_SERVICE_FILE}"
+fi
+
+if [ -f "$CDI_UNIT" ]; then
+    systemctl disable citadel-nvidia-cdi.service 2>/dev/null || true
+    rm -f "$CDI_UNIT"
+    msg "Removed ${CDI_UNIT}"
+fi
+if [ -f "$CDI_SCRIPT" ]; then
+    rm -f "$CDI_SCRIPT"
+    msg "Removed ${CDI_SCRIPT}"
+fi
+
+if [ -f "$UDEV_RULE" ]; then
+    rm -f "$UDEV_RULE"
+    udevadm control --reload-rules 2>/dev/null || true
+    msg "Removed ${UDEV_RULE}"
+fi
+
+if [ -f "$DELEGATE_DROPIN" ]; then
+    rm -f "$DELEGATE_DROPIN"
+    rmdir --ignore-fail-on-non-empty /etc/systemd/system/user@.service.d 2>/dev/null || true
+    msg "Removed ${DELEGATE_DROPIN}"
+fi
+
+systemctl daemon-reload 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Disconnect a legacy root-owned install from AceTeam Network
+# ---------------------------------------------------------------------------
+if ! $MARKER_VALID && [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
     msg "Disconnecting from AceTeam Network..."
     "${INSTALL_DIR}/${BINARY_NAME}" logout 2>/dev/null || true
 fi
@@ -106,7 +185,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Remove config directory
+# Remove the dedicated citadel user (only when it is provably Citadel's)
+# ---------------------------------------------------------------------------
+if $MARKER_VALID; then
+    if userdel -r citadel 2>/dev/null; then
+        msg "Removed dedicated citadel worker user and its home"
+    else
+        warn "Could not fully remove the citadel user (active processes or mounts); remove it manually: sudo userdel -r citadel"
+    fi
+    # userdel prunes /etc/subuid and /etc/subgid on modern shadow-utils; strip
+    # any residual citadel ranges explicitly so the subordinate IDs are gone.
+    sed -i '/^citadel:/d' /etc/subuid /etc/subgid 2>/dev/null || true
+elif id citadel >/dev/null 2>&1; then
+    warn "A 'citadel' user exists without Citadel's trusted provisioning marker; leaving the account untouched."
+fi
+
+# ---------------------------------------------------------------------------
+# Remove config directory (holds the marker, so this runs after the check)
 # ---------------------------------------------------------------------------
 if [ -d "$CONFIG_DIR" ]; then
     rm -rf "$CONFIG_DIR"
@@ -159,6 +254,6 @@ msg "Citadel has been removed from this machine."
 echo ""
 echo "  Not removed (by design):" >&2
 echo "    - NVIDIA drivers" >&2
-echo "    - Docker CE" >&2
-echo "    - Docker images (run 'docker rmi vllm/vllm-openai:latest' to remove)" >&2
+echo "    - Podman / Docker" >&2
+echo "    - Container images (as citadel: 'podman rmi vllm/vllm-openai:latest')" >&2
 echo "" >&2

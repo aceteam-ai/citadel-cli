@@ -39,6 +39,7 @@ func TestGenerateUnitFile_UserMode(t *testing.T) {
 		{"output", "StandardOutput=journal+console"},
 		{"error", "StandardError=journal+console"},
 		{"network", "After=network-online.target"},
+		{"rootless socket", "Wants=network-online.target podman.socket"},
 	}
 
 	for _, c := range checks {
