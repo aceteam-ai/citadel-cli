@@ -55,6 +55,28 @@ apt-get install -y --no-install-recommends podman podman-compose uidmap fuse-ove
 if apt-cache show passt >/dev/null 2>&1; then
     apt-get install -y --no-install-recommends passt
 fi
+# Citadel OS images bake the NVIDIA CDI toolkit and target GPU fleet nodes, so
+# rootless CDI GPU injection (nvidia.com/gpu=all) must work: it needs Podman
+# >= 4.1. Ubuntu 22.04 ships 3.4.4 (passes `podman info` but cannot inject CDI
+# rootless); Ubuntu 24.04 ships 4.9+. Parse the actual version and refuse the
+# build rather than shipping an image that fails at first GPU container start.
+podman_meets_cdi_floor() {
+    local ver major minor
+    ver=$(podman --version 2>/dev/null | awk '{print $3}')
+    [ -n "$ver" ] || return 1
+    major=${ver%%.*}
+    minor=${ver#"${major}."}
+    minor=${minor%%.*}
+    case "$major" in ''|*[!0-9]*) return 1 ;; esac
+    case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
+    [ "$major" -gt 4 ] && return 0
+    [ "$major" -eq 4 ] && [ "$minor" -ge 1 ] && return 0
+    return 1
+}
+if ! podman_meets_cdi_floor; then
+    echo "ERROR: Citadel OS images need Podman >= 4.1 for rootless CDI GPU injection (nvidia.com/gpu), but this build has Podman $(podman --version 2>/dev/null | awk '{print $3}' || echo unknown). Build on Ubuntu 24.04 (Podman 4.9+)." >&2
+    exit 1
+fi
 ensure_subid() {
     local file="$1" type="$2" start
     if awk -F: '$1=="citadel" && $3>=65536 {found=1} END {exit !found}' "$file"; then return; fi
