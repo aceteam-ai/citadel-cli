@@ -401,6 +401,15 @@ func applyTranscribeOptions(req map[string]any, payload map[string]string) error
 	if diarize, ok := payload["diarize"]; ok && diarize == "true" {
 		req["diarize"] = true
 	}
+	if value := payload["word_timestamps"]; value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid word_timestamps %q: must be true or false", value)
+		}
+		if enabled {
+			req["word_timestamps"] = true
+		}
+	}
 
 	if v, ok := payload["model_size"]; ok && v != "" {
 		if !isAllowedModelSize(v) {
@@ -452,6 +461,8 @@ func applyTranscribeOptions(req map[string]any, payload map[string]string) error
 //   - model_size: optional faster-whisper model (tiny|base|small|medium|
 //     large-v3|...); empty = the sidecar's configured default. Loaded on demand.
 //   - denoise:    optional "true"/"false"; ffmpeg afftdn denoise preprocessing.
+//   - word_timestamps: optional "true"/"false"; include faster-whisper word
+//     start/end seconds and probability inside each segment when true.
 //   - vad_filter, no_speech_threshold, compression_ratio_threshold,
 //     logprob_threshold, condition_on_previous_text: optional faster-whisper
 //     decoding tuning, passed through to the sidecar.

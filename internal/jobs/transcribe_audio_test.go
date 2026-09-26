@@ -793,6 +793,102 @@ func TestApplyTranscribeOptions_NoNewParamsByteIdentical(t *testing.T) {
 	}
 }
 
+func TestApplyTranscribeOptions_WordTimestampsOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "true", want: true},
+		{value: "false", want: false},
+	} {
+		req := map[string]any{"audio_path": "clip.wav"}
+		if err := applyTranscribeOptions(req, map[string]string{"word_timestamps": tc.value}); err != nil {
+			t.Fatal(err)
+		}
+		actual, present := req["word_timestamps"]
+		if present != tc.want {
+			t.Errorf("word_timestamps=%s: key presence=%v, want %v", tc.value, present, tc.want)
+		}
+		if tc.want && actual != true {
+			t.Errorf("word_timestamps=true: value=%#v, want bool true", actual)
+		}
+	}
+	req := map[string]any{"audio_path": "clip.wav"}
+	if err := applyTranscribeOptions(req, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := req["word_timestamps"]; present {
+		t.Fatal("absent word_timestamps must not be forwarded")
+	}
+	if err := applyTranscribeOptions(map[string]any{}, map[string]string{"word_timestamps": "perhaps"}); err == nil {
+		t.Fatal("expected invalid word_timestamps to fail before dispatch")
+	}
+}
+
+func TestTranscribeAudio_WordTimestampsWireContract(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "clip.wav"), []byte("fakeaudio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var gotReq map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/transcribe" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"text":"hello","language":"en","segments":[{"start":0,"end":1,"text":"hello","words":[{"word":"hello","start":0.1,"end":0.9,"probability":0.95}]}]}`))
+	}))
+	defer srv.Close()
+	h := NewTranscribeAudioHandler(dir)
+	h.ServiceURL = srv.URL
+
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "absent"},
+		{name: "false", value: "false"},
+		{name: "true", value: "true", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotReq = nil
+			payload := map[string]string{"audio_path": "clip.wav"}
+			if tc.value != "" {
+				payload["word_timestamps"] = tc.value
+			}
+			out, err := h.Execute(JobContext{}, &nexus.Job{
+				ID: "word-timestamps-" + tc.name, Type: "TRANSCRIBE_AUDIO", Payload: payload,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			value, present := gotReq["word_timestamps"]
+			if present != tc.want || (tc.want && value != true) {
+				t.Errorf("sidecar word_timestamps = %#v, present=%v, want true=%v", value, present, tc.want)
+			}
+			var result map[string]any
+			if err := json.Unmarshal(out, &result); err != nil {
+				t.Fatal(err)
+			}
+			segments := result["segments"].([]any)
+			words := segments[0].(map[string]any)["words"].([]any)
+			word := words[0].(map[string]any)
+			if word["word"] != "hello" || word["start"] != 0.1 || word["end"] != 0.9 {
+				t.Errorf("nested words changed by handler: %#v", words)
+			}
+		})
+	}
+}
+
 // TestApplyTranscribeOptions_NewParamsForwarded checks every new param is
 // validated and copied onto the request with the right type.
 func TestApplyTranscribeOptions_NewParamsForwarded(t *testing.T) {
