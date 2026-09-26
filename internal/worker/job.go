@@ -243,10 +243,16 @@ var allKnownJobTypes = []string{
 // permission toggle (aceteam#9962).
 //
 // Keep this in sync with the registration gates in handler_adapter.go:
-//   - files: FILE_READ/READ_BYTES/WRITE/WRITE_BYTES/EDIT/LIST/SEARCH/INDEX/
+//   - files: FILE_READ/READ_BYTES/WRITE/EDIT/LIST/SEARCH/INDEX/
 //     SEMANTIC_SEARCH register only when WorkspaceDir != "" and !FilesDisabled.
 //     FilesDisabled tracks the node's `files` permission, default-DENY on a
 //     fresh node (aceteam#6524).
+//   - FILE_WRITE_BYTES registers whenever WorkspaceDir != "" (NOT gated on
+//     !FilesDisabled): when Files is disabled it stays registered and refuses
+//     with a structured `files_disabled` error at execute time (#1112). So the
+//     ONLY way it reaches failUnsupportedJobType is a node with no workspace
+//     configured -- which is why its gate reason names the workspace, not the
+//     files permission (a permission toggle cannot help there).
 //   - desktop: FILE_SCREENSHOT/VNC_SCREENSHOT/VNC_TYPE/VNC_KEYS/VNC_ACTIONS
 //     register only when !DesktopDisabled. DesktopDisabled tracks the node's
 //     `desktop` permission, also default-DENY.
@@ -264,7 +270,7 @@ var gatedJobTypeReasons = map[string]string{
 	JobTypeFileRead:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileReadBytes:      "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileWrite:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileWriteBytes:     "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileWriteBytes:     "this node has no workspace directory configured",
 	JobTypeFileEdit:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileList:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileSearch:         "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",

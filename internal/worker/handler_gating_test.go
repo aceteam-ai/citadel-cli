@@ -1,6 +1,13 @@
 package worker
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // anyHandles reports whether the built handler set registers a handler for the
 // given job type.
@@ -15,8 +22,8 @@ func anyHandles(handlers []JobHandler, jobType string) bool {
 
 // TestFreshNode_RefusesSensitiveJobs is the aceteam#6524 teeth: a fresh node
 // (sensitive surfaces default-DENY, wired as DesktopDisabled/FilesDisabled) must
-// NOT register the screen/VNC or file-browse handlers, so those fabric jobs are
-// refused ("unsupported job type") rather than silently executed.
+// refuse screen/VNC and file-browse jobs. Binary writes stay registered only
+// to return an actionable permission refusal without touching the workspace.
 func TestFreshNode_RefusesSensitiveJobs(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
 		WorkspaceDir:    t.TempDir(), // a workspace IS configured...
@@ -36,7 +43,7 @@ func TestFreshNode_RefusesSensitiveJobs(t *testing.T) {
 
 	fileJobs := []string{
 		JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileWrite,
-		JobTypeFileWriteBytes, JobTypeFileEdit, JobTypeFileList,
+		JobTypeFileEdit, JobTypeFileList,
 		JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch,
 	}
 	for _, jt := range fileJobs {
@@ -86,5 +93,110 @@ func TestEnabledNode_RegistersSensitiveHandlers(t *testing.T) {
 	}
 	if !anyHandles(handlers, JobTypeFileRead) {
 		t.Error("enabled node should register FILE_READ")
+	}
+}
+
+func TestFilesDisabled_BinaryWriteReturnsPermissionRefusal(t *testing.T) {
+	workspace := t.TempDir()
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		WorkspaceDir:  workspace,
+		FilesDisabled: true,
+	})
+	for _, handler := range handlers {
+		if !handler.CanHandle(JobTypeFileWriteBytes) {
+			continue
+		}
+		result, err := handler.Execute(context.Background(), &Job{
+			ID:      "denied-write",
+			Type:    JobTypeFileWriteBytes,
+			Payload: map[string]any{"path": "blocked.bin", "content": "YWJj"},
+		}, &NoOpStreamWriter{})
+		if err == nil || result == nil || result.Status != JobStatusFailure {
+			t.Fatalf("disabled binary write must fail: result=%+v err=%v", result, err)
+		}
+		var refusal struct {
+			Reason  string `json:"reason"`
+			Message string `json:"message"`
+		}
+		if decodeErr := json.Unmarshal([]byte(err.Error()), &refusal); decodeErr != nil {
+			t.Fatalf("refusal must be machine-readable: %v", decodeErr)
+		}
+		if refusal.Reason != "files_disabled" || !strings.Contains(refusal.Message, "Files permission required") || !strings.Contains(refusal.Message, "citadel_set_files_permission") || !strings.Contains(refusal.Message, "restart") {
+			t.Fatalf("missing permission diagnosis or recovery: %+v", refusal)
+		}
+		if _, statErr := os.Stat(filepath.Join(workspace, "blocked.bin")); !os.IsNotExist(statErr) {
+			t.Fatalf("refused write touched the workspace: %v", statErr)
+		}
+		return
+	}
+	t.Fatal("FILE_WRITE_BYTES must remain registered to report the permission refusal")
+}
+
+func TestBinaryWriteWithoutWorkspaceRemainsUnsupported(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{FilesDisabled: true})
+	if anyHandles(handlers, JobTypeFileWriteBytes) {
+		t.Fatal("a missing workspace must not be misreported as a permission refusal")
+	}
+}
+
+func TestEnabledNode_BinaryWriteStillWritesBytes(t *testing.T) {
+	workspace := t.TempDir()
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{WorkspaceDir: workspace})
+	for _, handler := range handlers {
+		if !handler.CanHandle(JobTypeFileWriteBytes) {
+			continue
+		}
+		result, err := handler.Execute(context.Background(), &Job{
+			ID: "enabled-write", Type: JobTypeFileWriteBytes,
+			Payload: map[string]any{"path": "allowed.bin", "content": "YWJj"},
+		}, &NoOpStreamWriter{})
+		if err != nil || result == nil || result.Status != JobStatusSuccess {
+			t.Fatalf("enabled binary write failed: result=%+v err=%v", result, err)
+		}
+		data, err := os.ReadFile(filepath.Join(workspace, "allowed.bin"))
+		if err != nil || string(data) != "abc" {
+			t.Fatalf("written bytes=%q err=%v", data, err)
+		}
+		return
+	}
+	t.Fatal("enabled FILE_WRITE_BYTES handler missing")
+}
+
+func TestBinaryWriteFollowsLiveFilesPermission(t *testing.T) {
+	workspace := t.TempDir()
+	enabled := false
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		WorkspaceDir:  workspace,
+		FilesDisabled: true,
+		FilesEnabled:  func() bool { return enabled },
+	})
+	var write JobHandler
+	for _, handler := range handlers {
+		if handler.CanHandle(JobTypeFileWriteBytes) {
+			write = handler
+			break
+		}
+	}
+	if write == nil {
+		t.Fatal("binary write must remain routable so it can report a permission refusal")
+	}
+	job := &Job{ID: "live-write", Type: JobTypeFileWriteBytes, Payload: map[string]any{"path": "live.bin", "content": "YWJj"}}
+	if _, err := write.Execute(context.Background(), job, &NoOpStreamWriter{}); err == nil || !strings.Contains(err.Error(), `"reason":"files_disabled"`) {
+		t.Fatalf("disabled Files policy must refuse the write: %v", err)
+	}
+	enabled = true
+	if _, err := write.Execute(context.Background(), job, &NoOpStreamWriter{}); err != nil {
+		t.Fatalf("enabling Files should permit the next upload without rebuilding handlers: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(workspace, "live.bin")); err != nil || string(data) != "abc" {
+		t.Fatalf("enabled upload wrote %q: %v", data, err)
+	}
+	enabled = false
+	job.Payload["path"] = "revoked.bin"
+	if _, err := write.Execute(context.Background(), job, &NoOpStreamWriter{}); err == nil || !strings.Contains(err.Error(), `"reason":"files_disabled"`) {
+		t.Fatalf("revoked Files policy must refuse the next upload: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "revoked.bin")); !os.IsNotExist(err) {
+		t.Fatalf("revoked upload touched the workspace: %v", err)
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 )
 
 // TestPopulateCapabilityFlagsAlwaysSetsAll verifies that every capability flag
@@ -13,7 +15,7 @@ import (
 // values rather than omitting keys (citadel-cli#324, plus h264 in #338).
 func TestPopulateCapabilityFlagsAlwaysSetsAll(t *testing.T) {
 	caps := &NodeCapabilities{}
-	populateCapabilityFlags(caps, 0)
+	populateCapabilityFlags(caps, 0, config.DefaultPermissions())
 
 	if caps.Console == nil {
 		t.Error("Console flag should be populated, got nil")
@@ -32,29 +34,20 @@ func TestPopulateCapabilityFlagsAlwaysSetsAll(t *testing.T) {
 	}
 }
 
-// writeDesktopPerm points ConfigDir at a temp HOME carrying a permissions.yaml
-// with the given desktop value, and returns nothing (the env is restored by
-// t.Setenv). The config.yaml marker makes the root code path of resolveConfigDir
-// also resolve here. Used to exercise the aceteam#6524 gate deterministically.
-func writeDesktopPerm(t *testing.T, desktopEnabled bool) {
+// writeDesktopPerm writes a node-owned permissions.yaml with the given desktop
+// value and returns a provider for it. Capability collection must get this
+// provider from production wiring rather than resolving the invoker's HOME.
+func writeDesktopPerm(t *testing.T, desktopEnabled bool) func() *config.Permissions {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	t.Setenv("SUDO_USER", "")
-	cfgDir := filepath.Join(dir, ".citadel-cli")
-	if err := os.MkdirAll(cfgDir, 0755); err != nil {
-		t.Fatalf("mkdir cfg: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte("node:\n  name: t\n"), 0600); err != nil {
-		t.Fatalf("write marker: %v", err)
-	}
 	perms := "desktop: false\n"
 	if desktopEnabled {
 		perms = "desktop: true\n"
 	}
-	if err := os.WriteFile(filepath.Join(cfgDir, "permissions.yaml"), []byte(perms), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "permissions.yaml"), []byte(perms), 0600); err != nil {
 		t.Fatalf("write perms: %v", err)
 	}
+	return func() *config.Permissions { return config.LoadPermissions(dir) }
 }
 
 // TestCapabilityFlagsDesktopDerivedFromVNCPort verifies the desktop flag under
@@ -66,22 +59,63 @@ func writeDesktopPerm(t *testing.T, desktopEnabled bool) {
 // landmine).
 func TestCapabilityFlagsDesktopDerivedFromVNCPort(t *testing.T) {
 	t.Run("enabled: vnc port advertises desktop", func(t *testing.T) {
-		writeDesktopPerm(t, true)
+		permissions := writeDesktopPerm(t, true)
 		caps := &NodeCapabilities{}
-		populateCapabilityFlags(caps, 5900)
+		populateCapabilityFlags(caps, 5900, permissions())
 		if caps.Desktop == nil || !*caps.Desktop {
 			t.Errorf("Desktop should be true when vncPort > 0 AND desktop is enabled, got %v", caps.Desktop)
 		}
 	})
 
 	t.Run("disabled: vnc port does NOT advertise desktop", func(t *testing.T) {
-		writeDesktopPerm(t, false)
+		permissions := writeDesktopPerm(t, false)
 		caps := &NodeCapabilities{}
-		populateCapabilityFlags(caps, 5900)
+		populateCapabilityFlags(caps, 5900, permissions())
 		if caps.Desktop == nil || *caps.Desktop {
 			t.Errorf("Desktop must stay false when desktop is disabled, even with vncPort > 0, got %v", caps.Desktop)
 		}
 	})
+}
+
+// TestCollectorUsesAuthoritativePermissionsProvider proves the status package
+// does not resolve an invoker's ConfigDir. A system worker can run with a node
+// directory distinct from the interactive user's HOME; its next heartbeat must
+// advertise the policy in the node directory. Temp paths make that distinction
+// explicit without reading any machine configuration.
+func TestCollectorUsesAuthoritativePermissionsProvider(t *testing.T) {
+	invokerDir := t.TempDir()
+	nodeDir := t.TempDir()
+	t.Setenv("HOME", invokerDir)
+	t.Setenv("SUDO_USER", "")
+
+	invoker := config.DefaultPermissions()
+	invoker.Desktop = false
+	if err := config.SavePermissions(filepath.Join(invokerDir, ".citadel-cli"), invoker); err != nil {
+		t.Fatalf("save invoker permissions: %v", err)
+	}
+	node := config.DefaultPermissions()
+	node.Desktop = true
+	if err := config.SavePermissions(nodeDir, node); err != nil {
+		t.Fatalf("save node permissions: %v", err)
+	}
+
+	collector := NewCollector(CollectorConfig{
+		PermissionsProvider: func() *config.Permissions { return config.LoadPermissions(nodeDir) },
+	})
+	caps := &NodeCapabilities{}
+	populateCapabilityFlags(caps, 5900, collector.capabilityPermissions())
+	if caps.Desktop == nil || !*caps.Desktop {
+		t.Fatalf("desktop = %v, want true from node policy rather than invoker policy", caps.Desktop)
+	}
+
+	node.Desktop = false
+	if err := config.SavePermissions(nodeDir, node); err != nil {
+		t.Fatalf("update node permissions: %v", err)
+	}
+	populateCapabilityFlags(caps, 5900, collector.capabilityPermissions())
+	if caps.Desktop == nil || *caps.Desktop {
+		t.Fatalf("desktop = %v, want false after node policy update", caps.Desktop)
+	}
 }
 
 // TestCapabilityFlagsJSONContract verifies the wire format matches the backend

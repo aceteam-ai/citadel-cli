@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,8 +39,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
-	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
-	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
@@ -227,12 +223,6 @@ func runControlCenter() {
 			fmt.Fprintln(os.Stderr, "Citadel control center is already running in another terminal.")
 		}
 		fmt.Fprintln(os.Stderr, "Switch to that terminal to use it, or run `citadel attach --shell` for a shell on this node.")
-		return
-	}
-
-	// Auto-update on startup
-	if updated := ccAutoUpdate(); updated {
-		// Binary was updated, restart
 		return
 	}
 
@@ -2033,6 +2023,21 @@ func ccStopWorker() error {
 	return nil
 }
 
+// acquireControlCenterWorkerLock takes the same worker lock as `citadel work`.
+// Contention means monitor-only mode; other errors cannot safely establish an
+// owner and therefore fail closed instead of starting a second consumer.
+func acquireControlCenterWorkerLock(stateDir string, logf func(string, ...any)) (*worklock.Lock, bool, int, error) {
+	lock, err := worklock.Acquire(stateDir, Version, logf)
+	if err == nil {
+		return lock, false, 0, nil
+	}
+	var running *worklock.ErrAlreadyRunning
+	if errors.As(err, &running) {
+		return nil, true, running.PID, nil
+	}
+	return nil, false, 0, fmt.Errorf("cannot acquire worker ownership: %w", err)
+}
+
 // runTUIWorker runs the worker for the TUI (simplified version of runWork)
 func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error {
 	activity := func(level, msg string) {
@@ -2062,8 +2067,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
 
-	// Detect a dedicated `citadel work` worker already serving this node. If one
-	// holds the single-instance lock (issues #443/#435/#455), the control center
+	// Acquire the same single-instance lock as `citadel work`. If a dedicated
+	// worker already holds it (issues #443/#435/#455), the control center
 	// MUST NOT compete for this node's jobs: two consumers in the same consumer
 	// group split the per-node stream non-deterministically, so node-targeted
 	// privileged jobs (WHATSAPP_PROVISION, AGENT_UPDATE) were randomly grabbed by
@@ -2072,23 +2077,25 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// is present the control center stays a read-only monitor (heartbeat/telemetry
 	// only) and lets the real worker own all job consumption.
 	//
-	// Detection is a one-shot at TUI-worker startup: the systemd worker is normally
-	// already running before the TUI opens. If a worker starts or stops later the
-	// mode is not re-evaluated until the TUI worker restarts, but that residual is
-	// benign — the "no handler" hazard is removed unconditionally by the shared
-	// handler set below (both modes register WHATSAPP_PROVISION / AGENT_UPDATE), so a
-	// transient double-consumer only reproduces the pre-existing split, never a job
-	// failure. A worker that later dies is systemd-restarted (re-taking the lock).
-	workerHeld, workerPID := worklock.IsHeld(network.GetStateDir())
+	// Hold this lease through runner and updater shutdown, so a later work
+	// invocation cannot become a second consumer or automatic installer.
+	ccWorkerLock, workerHeld, workerPID, err := acquireControlCenterWorkerLock(network.GetStateDir(),
+		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) })
+	if err != nil {
+		return err
+	}
+	if ccWorkerLock != nil {
+		defer ccWorkerLock.Release() // early construction failures also free it
+	}
 	if workerHeld {
 		activity("info", fmt.Sprintf("Dedicated worker detected (PID %d); control center runs in monitor-only mode (no job consumption)", workerPID))
 	}
 	// Feeds ccWorkerOwnsConsumption / controlcenter.WorkerCallbacks.OwnsConsumption
 	// (issue #658): this process only ever reaches its own consume loop below
-	// when !workerHeld, so that's also the right moment to record it as the
+	// when it owns the lock, so that's also the right moment to record it as the
 	// node's job-consuming worker for the detach-on-quit decision.
 	ccWorkerMu.Lock()
-	ccWorkerConsuming = !workerHeld
+	ccWorkerConsuming = ccWorkerLock != nil
 	ccWorkerMu.Unlock()
 
 	// Determine job source mode
@@ -2265,9 +2272,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create status collector for heartbeat
 	collector := status.NewCollector(status.CollectorConfig{
-		NodeName:  nodeName,
-		ConfigDir: "",
-		Services:  nil,
+		NodeName:            nodeName,
+		ConfigDir:           "",
+		Services:            nil,
+		PermissionsProvider: loadNodePermissions,
 		JobTypes: func() []string {
 			runner := ccNodeRunner.Load()
 			if runner == nil {
@@ -2412,15 +2420,15 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		return ctx.Err()
 	}
 
-	// No dedicated worker on this node: the control center IS the only worker, so it
+	// This control center holds the worker lock, so it
 	// must handle the FULL node-job set (legacy + workflow + AGENT_UPDATE +
 	// WHATSAPP_PROVISION), not a subset. Build handlers via the shared helper so the
 	// registered set matches `citadel work` exactly and WHATSAPP_PROVISION /
 	// AGENT_UPDATE never fail with "no handler" in a control-center-only run.
 
 	// Pairing-display manager (citadel #659 P0), mirroring runWork's wiring:
-	// this process is now the sole job consumer for this node (workerHeld is
-	// false, or we returned above), so it is the right place to reconcile any
+	// this process holds the worker lock (or we returned above), so it is the
+	// right place to reconcile any
 	// stale code left by a previous crashed process before job consumption
 	// starts, and to clear on graceful shutdown. Safe/idempotent to Configure
 	// again even if a dedicated `citadel work` also configured its own
@@ -2509,99 +2517,13 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// a control-center-only node.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
 	startStatusPublisherAfterRunner(&ccNodeRunner, runner, startHeartbeatPublisher)
-
 	activity("success", "Worker started, listening for jobs...")
 
-	// Run the worker (blocks until context is cancelled)
-	return runner.Run(ctx)
-}
-
-// ccAutoUpdate checks for updates and auto-updates if available.
-// Returns true if the binary was updated (caller should restart).
-func ccAutoUpdate() bool {
-	// Never auto-install when the user opted out (--no-auto-update /
-	// CITADEL_NO_AUTO_UPDATE) or when this is a locally-built dev binary: a
-	// hand-copied dev/test binary must not silently replace itself with a
-	// release before it can be exercised. Explicit `citadel update` still works.
-	if !autoUpdateAllowed() {
-		return false
-	}
-
-	// Check for updates
-	spinner := whimsy.NewSimpleSpinner([]string{"Checking for updates..."})
-	spinner.Start()
-
-	client := update.NewClient(Version)
-	release, err := client.CheckForUpdate()
-	if err != nil {
-		spinner.StopWithWarning(fmt.Sprintf("Update check failed: %v", err))
-		return false
-	}
-
-	if release == nil {
-		spinner.StopWithSuccess(fmt.Sprintf("Running latest version (%s)", Version))
-		return false
-	}
-
-	spinner.StopWithSuccess(fmt.Sprintf("Update available: %s → %s", Version, release.TagName))
-
-	// Download update
-	dlSpinner := whimsy.NewSimpleSpinner([]string{"Downloading update..."})
-	dlSpinner.Start()
-
-	pendingPath := update.GetPendingBinaryPath()
-	if err := client.DownloadAndVerify(release, pendingPath); err != nil {
-		dlSpinner.StopWithError(fmt.Sprintf("Download failed: %v", err))
-		return false
-	}
-
-	dlSpinner.StopWithSuccess("Downloaded and verified")
-
-	// Install update
-	installSpinner := whimsy.NewSimpleSpinner([]string{"Installing update..."})
-	installSpinner.Start()
-
-	if err := update.ApplyUpdate(pendingPath); err != nil {
-		installSpinner.StopWithError(fmt.Sprintf("Install failed: %v", err))
-		return false
-	}
-
-	// Update state
-	state, _ := update.LoadState()
-	update.RecordUpdate(state, Version, release.TagName)
-	update.UpdateLastCheck(state)
-	_ = update.SaveState(state)
-
-	installSpinner.StopWithSuccess(fmt.Sprintf("Updated to %s, restarting...", release.TagName))
-
-	// Small delay to show the message
-	time.Sleep(500 * time.Millisecond)
-
-	// Restart the binary
-	execPath, err := os.Executable()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
-		fmt.Println("Please restart citadel manually.")
-		return true
-	}
-
-	if runtime.GOOS == "windows" {
-		// Windows doesn't support syscall.Exec; start a new process and exit
-		cmd := exec.Command(execPath, os.Args[1:]...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		_ = cmd.Start()
-		os.Exit(0)
-	}
-
-	// Unix: replace the current process in-place
-	if err := syscall.Exec(execPath, os.Args, os.Environ()); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to restart: %v\n", err)
-		fmt.Println("Please restart citadel manually.")
-	}
-
-	return true
+	// Monitor-only mode returned above. The fully initialized runner supplies
+	// drain/idle signals; its return also stops the updater before the lock is
+	// released, even when no explicit stop cancelled the parent context.
+	return runWorkerWithAutoUpdater(ctx, ccWorkerLock, autoUpdatePolicyInputs{}, runner,
+		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) }, autoUpdateRuntime{})
 }
 
 // buildProxmoxConfig checks for saved Proxmox configuration or auto-detects

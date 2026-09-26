@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
@@ -50,11 +51,20 @@ type Runner struct {
 	state *WorkerState
 
 	// Lifecycle observability for safe self-update.
-	// activeJobs counts jobs currently executing in a handler.
-	// draining, when set, stops the run loop from fetching new jobs so
-	// in-flight work can finish before the process is replaced/restarted.
-	activeJobs int64
-	draining   int32
+	// activeJobs counts admitted jobs, including lane and semaphore waiters.
+	// A permanent drain and independently owned temporary drains both stop
+	// pickup. The mutex makes acquiring and releasing scopes atomic with the
+	// consume loop's drain checks.
+	activeJobs     int64
+	drainMu        sync.Mutex
+	permanentDrain bool
+	drainScopes    int
+	pollCancel     context.CancelFunc
+	pollDone       chan struct{}
+	pendingJob     *Job
+	// A claim remains in-flight until enterJob accounts for its admission or
+	// a saturated lane has Nacked it. This closes the claim-to-dispatch idle gap.
+	dispatchingJobs int
 }
 
 // RunnerConfig holds configuration for the runner.
@@ -196,29 +206,62 @@ func (r *Runner) recordJob(record usage.UsageRecord) {
 	}
 }
 
-// ActiveJobs returns the number of jobs currently executing in a handler.
-// It is safe to call concurrently and is used by the auto-updater to find an
-// idle moment before swapping the binary.
+// ActiveJobs includes jobs claimed but not yet dispatched, as well as jobs
+// admitted for execution. It is safe to call concurrently and is used by the
+// auto-updater to find an idle moment before swapping the binary.
 func (r *Runner) ActiveJobs() int {
-	return int(atomic.LoadInt64(&r.activeJobs))
+	r.drainMu.Lock()
+	defer r.drainMu.Unlock()
+	active := int(atomic.LoadInt64(&r.activeJobs)) + r.dispatchingJobs
+	if r.pendingJob != nil {
+		active++
+	}
+	return active
 }
 
-// Drain signals the run loop to stop fetching new jobs. In-flight jobs are
-// allowed to finish. This is used by the auto-updater so that no new work is
-// picked up once an update has been downloaded and is ready to apply.
+// Drain permanently stops fetching new jobs. In-flight jobs may finish.
+// Shutdown and remote updates use this fail-closed drain.
 func (r *Runner) Drain() {
-	atomic.StoreInt32(&r.draining, 1)
+	r.drainMu.Lock()
+	r.permanentDrain = true
+	cancel, done := r.pollCancel, r.pollDone
+	r.drainMu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
 }
-
-// Resume reopens consumption when a planned self-reexec could not run.
-func (r *Runner) Resume() { atomic.StoreInt32(&r.draining, 0) }
 
 // NodeID is the local identity used by the runner's target filter.
 func (r *Runner) NodeID() string { return r.config.NodeID }
 
-// isDraining reports whether Drain has been called.
+// BeginDrain stops fetching jobs until its returned release function is called.
+// Each scope owns only its own pause; release is safe to call more than once.
+// A permanent Drain always takes precedence over released scopes.
+func (r *Runner) BeginDrain() func() {
+	r.drainMu.Lock()
+	r.drainScopes++
+	cancel, done := r.pollCancel, r.pollDone
+	r.drainMu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.drainMu.Lock()
+			r.drainScopes--
+			r.drainMu.Unlock()
+		})
+	}
+}
+
+// isDraining reports whether any drain remains active.
 func (r *Runner) isDraining() bool {
-	return atomic.LoadInt32(&r.draining) == 1
+	r.drainMu.Lock()
+	defer r.drainMu.Unlock()
+	return r.permanentDrain || r.drainScopes != 0
 }
 
 // IsDraining is the exported view of isDraining, used by the self-heal monitor
@@ -239,6 +282,12 @@ func (r *Runner) WithStreamWriterFactory(factory func(job *Job) StreamWriter) *R
 // This method blocks until the context is cancelled or a signal is received.
 // When MaxConcurrency > 1, jobs are processed concurrently via a goroutine pool.
 func (r *Runner) Run(ctx context.Context) error {
+	defer func() {
+		r.Drain()
+		r.drainMu.Lock()
+		r.pendingJob = nil
+		r.drainMu.Unlock()
+	}()
 	// Setup signal handling
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -309,16 +358,46 @@ runLoop:
 				continue
 			}
 
-			// Fetch next job
-			job, err := r.source.Next(ctx)
-			// Record the poll cycle for introspection regardless of outcome,
-			// so the status path can report "last successful poll time" and
-			// whether the worker is actively consuming (issue #236).
-			r.state.RecordPoll()
-			r.recordConsumeStatus(err)
+			// A poll already in progress when a drain begins may still return a
+			// job. Hold it locally until this worker may claim work again.
+			r.drainMu.Lock()
+			job := r.pendingJob
+			r.drainMu.Unlock()
+			var err error
+			var pollCtx context.Context
+			if job == nil {
+				var cancelPoll context.CancelFunc
+				pollCtx, cancelPoll = context.WithCancel(ctx)
+				r.drainMu.Lock()
+				if r.permanentDrain || r.drainScopes != 0 {
+					r.drainMu.Unlock()
+					cancelPoll()
+					continue
+				}
+				r.pollCancel = cancelPoll
+				r.pollDone = make(chan struct{})
+				r.drainMu.Unlock()
+				job, err = r.source.Next(pollCtx)
+				cancelPoll()
+				r.drainMu.Lock()
+				if err == nil {
+					r.pendingJob = job
+				}
+				close(r.pollDone)
+				r.pollDone = nil
+				r.pollCancel = nil
+				r.drainMu.Unlock()
+				// A pending job below was already polled; count only actual
+				// source calls in the worker's consume metrics.
+				r.state.RecordPoll()
+				r.recordConsumeStatus(err)
+			}
 			if err != nil {
 				if ctx.Err() != nil {
 					break runLoop // Context cancelled
+				}
+				if pollCtx != nil && pollCtx.Err() != nil && r.isDraining() {
+					continue // intentional drain interrupted the source poll
 				}
 				consecutiveFetchErrs++
 				if level, ok := fetchErrLogLevel(consecutiveFetchErrs, sustainedFetchErrThreshold, sustainedFetchErrRepeat); ok {
@@ -363,7 +442,24 @@ runLoop:
 			// (citadel-cli#908 §2a). A non-proceed result (foreign target, or
 			// cancelled) is fully handled inside claimJob (Ack/terminal), so the
 			// loop just moves on.
+			r.drainMu.Lock()
+			if ctx.Err() != nil {
+				r.drainMu.Unlock()
+				break runLoop
+			}
+			if r.permanentDrain || r.drainScopes != 0 {
+				r.drainMu.Unlock()
+				continue
+			}
+			// Claim and drain acquisition share this lock: once BeginDrain
+			// returns, no subsequent claim can begin until its release.
+			r.dispatchingJobs++
+			r.pendingJob = nil
 			proceed, stream, startTime := r.claimJob(ctx, job)
+			if !proceed {
+				r.dispatchingJobs--
+			}
+			r.drainMu.Unlock()
 			if !proceed {
 				continue
 			}
@@ -528,7 +624,10 @@ var errLaneSaturated = errors.New("execution lane saturated; retry")
 // its counters never move and InFlight can always return to 0.
 func (r *Runner) enterJob() {
 	r.state.RecordJobReceived()
+	r.drainMu.Lock()
 	atomic.AddInt64(&r.activeJobs, 1)
+	r.dispatchingJobs--
+	r.drainMu.Unlock()
 }
 
 // exitJob is enterJob's terminal counterpart: it releases the activeJobs slot
@@ -627,6 +726,9 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 		// called, so no counter is left dangling.
 		r.log("warning", "%s lane saturated (job %s, type %s); nacking for redelivery", l.name, job.ID, job.Type)
 		r.source.Nack(ctx, job, errLaneSaturated)
+		r.drainMu.Lock()
+		r.dispatchingJobs--
+		r.drainMu.Unlock()
 		return
 	}
 	r.enterJob()
@@ -813,8 +915,8 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// another full budget (and, in sequential mode, block every other job
 		// again). Fail (record failed + ACK -> DLQ) instead so a hung job is
 		// removed from the pending list rather than retried into a repeated
-		// wedge (issue #548). Every other failure keeps the existing Nack/retry
-		// semantics.
+		// wedge (issue #548). Apart from Files permission refusals below, other
+		// failures keep the existing Nack/retry semantics.
 		// Accepted tradeoff on abandon: like the orphaned handler goroutine, any
 		// GPU slot this job holds is released when executeJob returns (the
 		// deferred gpuTracker.Release), so a still-running orphan and the next job
@@ -828,6 +930,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// (which would slowly exhaust GPU capacity across repeated abandons).
 		var deadlineErr *deadlineExceededError
 		isDeadlineExceeded := errors.As(actualErr, &deadlineErr)
+		// Files permission is captured when handlers are built. A refusal is
+		// terminal even on the first delivery: retries cannot enable Files.
+		isFilesDisabled := errors.Is(actualErr, jobs.ErrFilesDisabled)
 
 		// Exactly one terminal event per job id (issue #826). A generic failure
 		// that will be retried (Nack path, another attempt still within budget)
@@ -842,7 +947,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// publishes, so a job that exhausts its retries still reports failure
 		// exactly once. Mirrors the reasoning #822/#559 already applied to the
 		// JobStatusRetry and no-GPU-slot Nack paths below/above.
-		if isDeadlineExceeded || !willRetry(job) {
+		if isDeadlineExceeded || isFilesDisabled || !willRetry(job) {
 			if werr := stream.WriteError(actualErr, false); werr != nil {
 				r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
 			}
@@ -854,6 +959,13 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 				"deadline_seconds":   deadlineErr.timeout.Seconds(),
 				"abandoned_by_agent": true,
 			})
+			return false
+		}
+
+		if isFilesDisabled {
+			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "files_disabled"}); ferr != nil {
+				r.log("warning", "Failed to ack Files-disabled job %s: %v", job.ID, ferr)
+			}
 			return false
 		}
 

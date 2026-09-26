@@ -35,20 +35,21 @@ func TestResolveAutoUpdateEnabled(t *testing.T) {
 		version  string // "" means a real release tag (v2.45.0)
 		noAuto   bool   // --no-auto-update flag
 		noAutoEn string // CITADEL_NO_AUTO_UPDATE env
-		expected bool
+		workWant bool
+		ccWant   bool
 	}{
-		{name: "default off when nothing set", expected: false},
-		{name: "persisted state enables", state: boolPtr(true), expected: true},
-		{name: "persisted state disables", state: boolPtr(false), expected: false},
-		{name: "env true overrides disabled state", env: "true", state: boolPtr(false), expected: true},
-		{name: "env off overrides enabled state", env: "off", state: boolPtr(true), expected: false},
-		{name: "flag wins over env and state", flag: true, env: "off", state: boolPtr(false), expected: true},
+		{name: "default off when nothing set"},
+		{name: "persisted state enables", state: boolPtr(true), workWant: true, ccWant: true},
+		{name: "persisted state disables", state: boolPtr(false)},
+		{name: "env true overrides disabled state", env: "true", state: boolPtr(false), workWant: true, ccWant: true},
+		{name: "env off overrides enabled state", env: "off", state: boolPtr(true)},
+		{name: "work flag wins over env and state, not valid for control center", flag: true, env: "off", state: boolPtr(false), workWant: true},
 		// #473: a dev binary never auto-installs, even with an enable signal.
-		{name: "dev binary vetoes auto-update flag", flag: true, version: "dev", expected: false},
-		{name: "dev binary vetoes enabled state", state: boolPtr(true), version: "dev", expected: false},
+		{name: "dev binary vetoes auto-update flag", flag: true, version: "dev"},
+		{name: "dev binary vetoes enabled state", state: boolPtr(true), version: "dev"},
 		// #473: opt-out (flag / env) wins over every enable signal.
-		{name: "no-auto-update flag vetoes auto-update flag", flag: true, noAuto: true, expected: false},
-		{name: "CITADEL_NO_AUTO_UPDATE env vetoes enabled state", state: boolPtr(true), noAutoEn: "1", expected: false},
+		{name: "no-auto-update flag vetoes auto-update flag", flag: true, noAuto: true},
+		{name: "CITADEL_NO_AUTO_UPDATE env vetoes enabled state", state: boolPtr(true), noAutoEn: "1"},
 	}
 
 	for _, tc := range cases {
@@ -66,8 +67,11 @@ func TestResolveAutoUpdateEnabled(t *testing.T) {
 			if tc.state != nil {
 				writeState(t, *tc.state)
 			}
-			if got := resolveAutoUpdateEnabled(); got != tc.expected {
-				t.Errorf("resolveAutoUpdateEnabled() = %v, want %v", got, tc.expected)
+			if got := resolveAutoUpdateEnabled(workAutoUpdatePolicyInputs()); got != tc.workWant {
+				t.Errorf("work policy = %v, want %v", got, tc.workWant)
+			}
+			if got := resolveAutoUpdateEnabled(autoUpdatePolicyInputs{}); got != tc.ccWant {
+				t.Errorf("control-center policy = %v, want %v", got, tc.ccWant)
 			}
 		})
 	}

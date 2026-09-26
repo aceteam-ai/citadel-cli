@@ -2687,3 +2687,22 @@ Auto-generated log of every release.
   - feat(whatsapp): honor WHATSAPP_PROVISION force=true to upgrade a stuck bridge (#1124)
 
 
+---
+
+## v2.171.0 — 2026-09-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 38 |
+| Lines added | +2306 |
+
+**Changes:**
+
+  - fix(update): unify worker-owned auto-update policy (#1137)
+  - fix: release aborted updater drain scopes (#1136)
+  - fix: distinguish disabled Files permission from missing binary-write support (#1112)
+  - fix: use node permission policy for capability status (#1139)
+  - fix: report externally-managed native engines instead of a false stop (#1144)
+
+
