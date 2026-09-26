@@ -112,10 +112,10 @@ func TestRunOnce_DownloadError_NoApply(t *testing.T) {
 	applied := false
 	drained := false
 	u := NewAutoUpdater(AutoUpdaterConfig{
-		Checker: &fakeChecker{release: &Release{TagName: "v9.9.9"}, downloadErr: errors.New("checksum mismatch")},
-		Apply:   func(string) error { applied = true; return nil },
-		Restart: func() error { return nil },
-		Drain:   func() { drained = true },
+		Checker:    &fakeChecker{release: &Release{TagName: "v9.9.9"}, downloadErr: errors.New("checksum mismatch")},
+		Apply:      func(string) error { applied = true; return nil },
+		Restart:    func() error { return nil },
+		BeginDrain: func() func() { drained = true; return func() {} },
 	})
 	if u.runOnce(context.Background()) {
 		t.Error("runOnce should return false on download error")
@@ -142,7 +142,7 @@ func TestRunOnce_HomebrewManaged_SkipsBeforeDownload(t *testing.T) {
 		HomebrewManaged: func() bool { return true },
 		Apply:           func(string) error { applied = true; return nil },
 		Restart:         func() error { return nil },
-		Drain:           func() { drained = true },
+		BeginDrain:      func() func() { drained = true; return func() {} },
 	})
 	if u.runOnce(context.Background()) {
 		t.Error("runOnce should return false (no restart) when Homebrew-managed")
@@ -164,10 +164,11 @@ func TestRunOnce_HappyPath_DrainsAppliesRestarts(t *testing.T) {
 	add := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
 
 	drained := false
+	released := false
 	u := NewAutoUpdater(AutoUpdaterConfig{
 		Checker:    &fakeChecker{release: &Release{TagName: "v9.9.9"}},
 		ActiveJobs: func() int { return 0 }, // idle immediately
-		Drain:      func() { drained = true; add("drain") },
+		BeginDrain: func() func() { drained = true; add("drain"); return func() { released = true } },
 		Apply:      func(string) error { add("apply"); return nil },
 		Restart:    func() error { add("restart"); return nil },
 	})
@@ -177,6 +178,9 @@ func TestRunOnce_HappyPath_DrainsAppliesRestarts(t *testing.T) {
 	}
 	if !drained {
 		t.Error("expected drain to be called")
+	}
+	if released {
+		t.Error("successful restart must retain the drain until process replacement")
 	}
 	want := []string{"drain", "apply", "restart"}
 	if len(order) != len(want) {
@@ -200,12 +204,13 @@ func TestRunOnce_DrainsBeforeApply_WaitsForIdle(t *testing.T) {
 		IdlePollInterval: time.Millisecond,
 		IdleTimeout:      2 * time.Second,
 		ActiveJobs:       func() int { return int(atomic.LoadInt32(&active)) },
-		Drain: func() {
+		BeginDrain: func() func() {
 			// Simulate the in-flight job finishing shortly after drain.
 			go func() {
 				time.Sleep(20 * time.Millisecond)
 				atomic.StoreInt32(&active, 0)
 			}()
+			return func() {}
 		},
 		Apply: func(string) error {
 			if atomic.LoadInt32(&active) != 0 {
@@ -231,7 +236,7 @@ func TestRunOnce_IdleTimeout_DefersUpdate(t *testing.T) {
 		IdlePollInterval: time.Millisecond,
 		IdleTimeout:      30 * time.Millisecond,
 		ActiveJobs:       func() int { return 1 }, // never idle
-		Drain:            func() {},
+		BeginDrain:       func() func() { return func() {} },
 		Apply:            func(string) error { applied = true; return nil },
 		Restart:          func() error { return nil },
 	})
@@ -248,7 +253,7 @@ func TestRunOnce_ApplyError_NoRestart(t *testing.T) {
 	u := NewAutoUpdater(AutoUpdaterConfig{
 		Checker:    &fakeChecker{release: &Release{TagName: "v9.9.9"}},
 		ActiveJobs: func() int { return 0 },
-		Drain:      func() {},
+		BeginDrain: func() func() { return func() {} },
 		Apply:      func(string) error { return errors.New("swap failed") },
 		Restart:    func() error { restarted = true; return nil },
 	})
@@ -257,6 +262,31 @@ func TestRunOnce_ApplyError_NoRestart(t *testing.T) {
 	}
 	if restarted {
 		t.Error("must not restart when apply fails")
+	}
+}
+
+func TestRunOnce_CancellationAfterApplyKeepsStagedVersionWithoutRestart(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	released := false
+	restarted := false
+	u := NewAutoUpdater(AutoUpdaterConfig{
+		Checker:    &fakeChecker{release: &Release{TagName: "v9.9.9"}},
+		ActiveJobs: func() int { return 0 },
+		BeginDrain: func() func() { return func() { released = true } },
+		Apply:      func(string) error { cancel(); return nil },
+		Restart:    func() error { restarted = true; return nil },
+	})
+	if u.runOnce(ctx) || restarted || !released {
+		t.Fatalf("cancelled attempt: restarted=%v released=%v", restarted, released)
+	}
+	state, err := LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.CurrentVersion != "v9.9.9" {
+		t.Fatalf("applied version lost after cancellation: %+v", state)
 	}
 }
 
