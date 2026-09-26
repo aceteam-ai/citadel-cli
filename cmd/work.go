@@ -3164,6 +3164,9 @@ func nodeWakeChannel(nodeID string) string {
 // getWorkHostname returns the hostname to use for VPN reconnection.
 // Prefers the --node-name flag, then CITADEL_NODE_NAME env, then OS hostname.
 func getWorkHostname() string {
+	if uid := loadLoginNodeUID(); uid != "" {
+		return servingIdentityHostname(uid, "")
+	}
 	if workNodeName != "" {
 		return workNodeName
 	}
