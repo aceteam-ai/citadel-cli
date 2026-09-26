@@ -2265,9 +2265,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create status collector for heartbeat
 	collector := status.NewCollector(status.CollectorConfig{
-		NodeName:  nodeName,
-		ConfigDir: "",
-		Services:  nil,
+		NodeName:            nodeName,
+		ConfigDir:           "",
+		Services:            nil,
+		PermissionsProvider: loadNodePermissions,
 		JobTypes: func() []string {
 			runner := ccNodeRunner.Load()
 			if runner == nil {

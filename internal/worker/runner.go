@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
@@ -914,8 +915,8 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// another full budget (and, in sequential mode, block every other job
 		// again). Fail (record failed + ACK -> DLQ) instead so a hung job is
 		// removed from the pending list rather than retried into a repeated
-		// wedge (issue #548). Every other failure keeps the existing Nack/retry
-		// semantics.
+		// wedge (issue #548). Apart from Files permission refusals below, other
+		// failures keep the existing Nack/retry semantics.
 		// Accepted tradeoff on abandon: like the orphaned handler goroutine, any
 		// GPU slot this job holds is released when executeJob returns (the
 		// deferred gpuTracker.Release), so a still-running orphan and the next job
@@ -929,6 +930,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// (which would slowly exhaust GPU capacity across repeated abandons).
 		var deadlineErr *deadlineExceededError
 		isDeadlineExceeded := errors.As(actualErr, &deadlineErr)
+		// Files permission is captured when handlers are built. A refusal is
+		// terminal even on the first delivery: retries cannot enable Files.
+		isFilesDisabled := errors.Is(actualErr, jobs.ErrFilesDisabled)
 
 		// Exactly one terminal event per job id (issue #826). A generic failure
 		// that will be retried (Nack path, another attempt still within budget)
@@ -943,7 +947,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// publishes, so a job that exhausts its retries still reports failure
 		// exactly once. Mirrors the reasoning #822/#559 already applied to the
 		// JobStatusRetry and no-GPU-slot Nack paths below/above.
-		if isDeadlineExceeded || !willRetry(job) {
+		if isDeadlineExceeded || isFilesDisabled || !willRetry(job) {
 			if werr := stream.WriteError(actualErr, false); werr != nil {
 				r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
 			}
@@ -955,6 +959,13 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 				"deadline_seconds":   deadlineErr.timeout.Seconds(),
 				"abandoned_by_agent": true,
 			})
+			return false
+		}
+
+		if isFilesDisabled {
+			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "files_disabled"}); ferr != nil {
+				r.log("warning", "Failed to ack Files-disabled job %s: %v", job.ID, ferr)
+			}
 			return false
 		}
 

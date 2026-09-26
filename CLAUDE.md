@@ -559,6 +559,14 @@ whenever it believes a retry is coming), a truly-failed or
 transient-fail-then-abandoned job in direct-Redis mode produced ZERO
 terminal stream events, permanently.
 
+A disabled Files permission is different from a transient handler failure.
+`jobs.ErrFilesDisabled` survives the legacy handler adapter;
+`Runner.executeJob` publishes it immediately and calls `source.Fail` (failed
+status plus ACK), even when the delivery metadata permits another attempt.
+`TestRunnerFilesDisabledPublishesTerminalErrorWithoutRetry` pins this boundary.
+The handler checks the live Files policy, but a refused job is terminal. After
+enabling Files, the caller submits a new upload.
+
 `Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
 a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before
 the normal blocking read. A successful claim increments the Redis-native
@@ -1487,6 +1495,32 @@ NOT stop advertising — the #1076 advertise path never reads `desired_status`; 
 requested model the external engine doesn't serve is logged as a mismatch and adopted
 anyway (launching would collide on the port). No feature flag — adoption only fires
 when something is genuinely serving OpenAI-compat on the resolved port.
+
+**The NATIVE analogue: a host-systemd-managed native engine is reported, not
+falsely stopped (citadel-cli#1144).** The stock ollama install runs as a host
+`ollama.service` (`User=ollama`, `Restart=always`), which citadel did not start
+and cannot stop (EPERM / relaunched in 3s). `services.classifyExternalSupervisor`
+(`internal/services/external_supervisor.go`, pure core over two cgroup strings;
+the `/proc` read is Linux-only, `_linux.go`/`_other.go`) OWNS the rule: a native
+engine's live process is externally managed when its LEAF-owning systemd unit is a
+`*.service` OTHER than this process's own (`/proc/<pid>/cgroup` vs
+`/proc/self/cgroup`). The self-comparison is load-bearing — a citadel-STARTED
+engine is a child in citadel's own unit, so from inside `citadel work` it matches
+self and is NOT external; the leaf-owning rule (stop at the first `.service` OR
+`.scope` walking up) is what keeps a graphical-terminal `.scope` from being
+misattributed to `user@<uid>.service`. `StopNativeService`
+(`native_stop.go`) returns the `ErrNativeExternallyManaged{Unit}` sentinel on its
+no-pidfile fall-through BEFORE `stopMatchingProcesses` signals anything (the
+citadel-owned verified-pidfile path is unchanged); both stop call sites —
+`serviceStop`'s native branch (SERVICE_STOP) and `stopSingleService`'s new native
+branch (`citadel stop`, previously compose-only and thus a false success) — map it
+to `services.ExternallyManagedGuidance` (a clear no-op, `running:true`, "run
+`systemctl stop <unit>`"), never a doomed kill. **Known gap:** a native engine
+`citadel work` started as a child, stopped from a SEPARATE shell `citadel stop`,
+is reported external (pointing at `citadel-worker.service`) because the pidfile
+lives under invoker-scoped `ConfigDir()/run` and is invisible cross-context — an
+honest "this CLI can't stop it" rather than the prior silent false success.
+launchd/SCM detection is a documented follow-up (Linux-only today).
 
 ### WhatsApp bridge deploys must pull (#718)
 
