@@ -409,6 +409,80 @@ func TestPersistLoginIdentityBundle_ExistingMismatchedLeafRefused(t *testing.T) 
 	}
 }
 
+// TestPersistLoginIdentityBundle_RenewsExpiredLeaf: when the existing leaf is
+// bound to our key AND uid but is EXPIRED, a freshly issued valid leaf for the
+// same uid is a RENEWAL and must be stored, not refused. Without this a node
+// whose backend leaf TTL elapsed could never renew through login and would stay
+// unverified until node.crt was deleted by hand (citadel-cli#1062, BLOCK-2).
+func TestPersistLoginIdentityBundle_RenewsExpiredLeaf(t *testing.T) {
+	dir := t.TempDir()
+	originalDir, originalStore, originalWorkName := nodeConfigDirFn, loginIdentityStore, workNodeName
+	nodeConfigDirFn = func() string { return dir }
+	loginIdentityStore = func() *nodeidentity.Store { return nodeidentity.New(filepath.Join(dir, "identity")) }
+	workNodeName = "display-name"
+	t.Cleanup(func() {
+		nodeConfigDirFn, loginIdentityStore, workNodeName = originalDir, originalStore, originalWorkName
+	})
+
+	store := loginIdentityStore()
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed an EXPIRED leaf (bound to our key + uid-abc) and its chain, as a node
+	// whose backend leaf TTL has elapsed would have on disk.
+	now := time.Now()
+	expiredLeaf, expiredChain := testLoginChainWithLeafValidity(t, key, 1, now.Add(-3*time.Hour), now.Add(-2*time.Hour))
+	if err := store.StoreLeaf(expiredLeaf, expiredChain); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh, valid leaf for the SAME uid arrives on re-login: renew, not refuse.
+	newLeaf, newChain := testLoginChain(t, key, 2)
+	out, err := persistLoginIdentityBundle(store, &key.PublicKey, newLeaf, newChain, "uid-abc")
+	if err != nil {
+		t.Fatalf("expected renewal, got error: %v", err)
+	}
+	if !out.Persisted {
+		t.Error("renewal must report a new write (Persisted=true)")
+	}
+	if out.NodeUID != "uid-abc" {
+		t.Errorf("NodeUID = %q, want uid-abc", out.NodeUID)
+	}
+
+	// Both the leaf AND the chain on disk must be the renewed ones (StoreLeaf
+	// writes the TrimSpace'd forms persistLoginIdentityBundle normalizes). A
+	// renewed leaf beside a stale chain fails validateChainPEM and silently
+	// demotes the node to its display hostname on the next reconnect.
+	gotLeaf, err := os.ReadFile(store.LeafPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotLeaf) == strings.TrimSpace(expiredLeaf) {
+		t.Fatal("expired leaf was not replaced with the renewed leaf")
+	}
+	if string(gotLeaf) != strings.TrimSpace(newLeaf) {
+		t.Fatal("on-disk leaf is not the renewed leaf")
+	}
+	gotChain, err := os.ReadFile(store.CAChainPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotChain) != strings.TrimSpace(newChain) {
+		t.Fatal("stale chain was not replaced with the renewed chain")
+	}
+
+	// User-visible acceptance: the renewed node serves under node-<uid>, not its
+	// display hostname.
+	if err := saveLoginNodeUID(out.NodeUID); err != nil {
+		t.Fatal(err)
+	}
+	if got := getWorkHostname(); got != "node-uid-abc" {
+		t.Fatalf("post-renewal serving hostname = %q, want node-uid-abc", got)
+	}
+}
+
 // TestServingIdentityHostname: node-{uid} when enrolled (and NOT the display
 // hostname, the verifier-rejection case), display hostname otherwise, and
 // deterministic across calls (re-login idempotence of the serving name).

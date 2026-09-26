@@ -136,10 +136,9 @@ func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicK
 		return loginBundleOutcome{}, fmt.Errorf("identity bundle chain: %w", err)
 	}
 
-	// Never overwrite an existing cert. If it is bound to our key it is
-	// known-good — the re-login idempotence case: leave it untouched and still
-	// apply the serving identity. If it is NOT bound to our key it is stale or
-	// foreign; refuse rather than silently keep serving with a mismatched
+	// An existing cert is normally never overwritten. If it is bound to our key
+	// AND uid it is this node's own certificate; if it is NOT, it is stale or
+	// foreign and we refuse rather than silently keep serving with a mismatched
 	// identity (and do NOT return the NodeUID, which would imply enrollment).
 	if store.HasLeaf() {
 		existing, rErr := os.ReadFile(store.LeafPath())
@@ -152,9 +151,23 @@ func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicK
 		if err := leafBoundToUID(string(existing), nodeUID); err != nil {
 			return loginBundleOutcome{}, fmt.Errorf("existing identity certificate has a different node id; refusing to proceed")
 		}
+		// Same key + same uid means this is our own cert. If it is outside its
+		// validity window (an EXPIRED leaf once the backend's leaf TTL elapses),
+		// the freshly issued, already-validated bundle above is a RENEWAL: store
+		// it. Without this a node whose leaf expired could never renew through
+		// login and would stay unverified until node.crt was deleted by hand.
+		if leafValidNow(string(existing)) != nil {
+			if err := store.StoreLeaf(leafPEM, chainPEM); err != nil {
+				return loginBundleOutcome{}, fmt.Errorf("store renewed identity certificate: %w", err)
+			}
+			return loginBundleOutcome{NodeUID: nodeUID, Persisted: true}, nil
+		}
+		// The existing leaf is still valid: idempotent re-login. Leave it
+		// untouched, but still require its on-disk chain to be complete so the
+		// serving identity resolves cleanly on the next reconnect.
 		chain, cErr := os.ReadFile(store.CAChainPath())
-		if cErr != nil || validateChainPEM(string(existing), string(chain)) != nil || leafValidNow(string(existing)) != nil {
-			return loginBundleOutcome{}, fmt.Errorf("existing identity certificate is incomplete or expired; refusing to proceed")
+		if cErr != nil || validateChainPEM(string(existing), string(chain)) != nil {
+			return loginBundleOutcome{}, fmt.Errorf("existing identity certificate chain is incomplete; refusing to proceed")
 		}
 		return loginBundleOutcome{NodeUID: nodeUID}, nil
 	}
