@@ -279,7 +279,18 @@ func TestExternalRestartWaitsForAckAndResumesAfterFailure(t *testing.T) {
 	drained := false
 	resumed := make(chan struct{})
 	restarted := make(chan struct{})
-	cfg := &ExternalModuleConfig{NodeID: "12", OrgID: "org1", Dir: dir, Ops: ops, Snapshot: func() error { return nil }, Probe: func(context.Context, externalengine.Endpoint, string) error { return nil }, Drain: func() { drained = true }, Resume: func() { close(resumed) }, ActiveJobs: func() int { return int(active.Load()) }, Restart: func() error { close(restarted); return errors.New("reexec failed") }, IdleTimeout: time.Second}
+	cfg := &ExternalModuleConfig{
+		NodeID: "12", OrgID: "org1", Dir: dir, Ops: ops,
+		Snapshot: func() error { return nil },
+		Probe:    func(context.Context, externalengine.Endpoint, string) error { return nil },
+		BeginDrain: func() func() {
+			drained = true
+			return func() { close(resumed) }
+		},
+		ActiveJobs:  func() int { return int(active.Load()) },
+		Restart:     func() error { close(restarted); return errors.New("reexec failed") },
+		IdleTimeout: time.Second,
+	}
 	h := NewModuleSetHandler(ModuleSetConfig{Ops: ops, External: cfg})
 	r, _ := h.Execute(context.Background(), externalJob("adopt_external", "1", "one"), nil)
 	if r.Status != JobStatusSuccess || !drained {

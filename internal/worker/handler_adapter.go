@@ -178,8 +178,9 @@ type LegacyHandlerOpts struct {
 	// APPLY_DEVICE_CONFIG changes take effect without restarting the worker.
 	DesktopEnabled func() bool
 	// FilesDisabled, when true, SKIPS registration of the file browse/host job
-	// handlers (FILE_READ/READ_BYTES/WRITE/WRITE_BYTES/EDIT/LIST/SEARCH/INDEX/
-	// SEMANTIC_SEARCH). A fresh node has `files` default-DENY (aceteam#6524).
+	// handlers (FILE_READ/READ_BYTES/WRITE/EDIT/LIST/SEARCH/INDEX/
+	// SEMANTIC_SEARCH). FILE_WRITE_BYTES stays registered in a refusing state
+	// so uploads report the missing permission. A fresh node has Files disabled.
 	// Note this gates ONLY the file-browser surface: TRANSCRIBE_AUDIO and
 	// MEETING_JOIN share the workspace but belong to the default-ON meeting
 	// capability and are NOT gated here. Wired from the persisted `files`
@@ -327,6 +328,13 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 
 	// Register file-operation handlers when a workspace is configured.
 	if opts.WorkspaceDir != "" {
+		writeBytesHandler := jobs.NewFileWriteBytesHandler(opts.WorkspaceDir)
+		writeBytesHandler.Disabled = opts.FilesDisabled
+		writeBytesHandler.Enabled = opts.FilesEnabled
+		handlers = append(handlers,
+			NewLegacyHandlerAdapter(JobTypeFileWriteBytes, writeBytesHandler),
+		)
+
 		// File browse/host handlers — the node-filesystem surface. Default-DENY
 		// (aceteam#6524): registered ONLY when the operator has opted the node's
 		// `files` permission in. A fresh node does not register them, so a
@@ -361,7 +369,6 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 				newGatedLegacyHandlerAdapter(JobTypeFileRead, readHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir), gate),
-				newGatedLegacyHandlerAdapter(JobTypeFileWriteBytes, jobs.NewFileWriteBytesHandler(opts.WorkspaceDir), gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir), gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileList, listHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileSearch, searchHandler, gate),

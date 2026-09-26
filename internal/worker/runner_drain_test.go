@@ -16,6 +16,25 @@ type blockingHandler struct {
 	once    sync.Once
 }
 
+// latePollSource models a source that returns a job at the same instant its
+// poll context is cancelled. The job is already source-claimed at that point.
+type latePollSource struct {
+	*MockJobSource
+	started  chan struct{}
+	returned bool
+}
+
+func (s *latePollSource) Next(ctx context.Context) (*Job, error) {
+	if !s.returned {
+		close(s.started)
+		<-ctx.Done()
+		s.returned = true
+		return &Job{ID: "late", Type: "BLOCK", Payload: map[string]any{}}, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func newBlockingHandler(jobType string) *blockingHandler {
 	return &blockingHandler{
 		jobType: jobType,
@@ -91,5 +110,60 @@ func TestRunnerActiveJobsAndDrain(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("runner did not shut down")
+	}
+}
+
+func TestRunnerDrainScopesRespectOwners(t *testing.T) {
+	runner := NewRunner(NewMockJobSource("test", nil), nil, RunnerConfig{})
+	first := runner.BeginDrain()
+	second := runner.BeginDrain()
+	first()
+	first() // release is idempotent
+	if !runner.IsDraining() {
+		t.Fatal("first release cleared the second scope")
+	}
+	runner.Drain()
+	second()
+	if !runner.IsDraining() {
+		t.Fatal("releasing scopes cleared permanent shutdown drain")
+	}
+}
+
+func TestRunnerDrainCountsJobReturnedByCancelledPoll(t *testing.T) {
+	source := &latePollSource{MockJobSource: NewMockJobSource("test", nil), started: make(chan struct{})}
+	handler := newBlockingHandler("BLOCK")
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{
+		WorkerID: "w", ActivityFn: func(string, string) {},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = runner.Run(ctx); close(done) }()
+	select {
+	case <-source.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("source poll did not start")
+	}
+	release := runner.BeginDrain()
+	if got := runner.ActiveJobs(); got != 1 {
+		t.Fatalf("source-claimed job awaiting release: ActiveJobs=%d, want 1", got)
+	}
+	select {
+	case <-handler.started:
+		t.Fatal("job started while drain scope was held")
+	default:
+	}
+	release()
+	select {
+	case <-handler.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending job did not resume after release")
+	}
+	close(handler.release)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not stop")
 	}
 }

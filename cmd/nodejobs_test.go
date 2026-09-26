@@ -15,6 +15,8 @@ import (
 // "node vX has no handler", the exact bug this change removes.
 func TestNodeJobHandlersCoverPrivilegedTypes(t *testing.T) {
 	opts := nodeJobHandlerOpts{
+		OrgID:        "example",
+		NodeID:       "758",
 		WorkspaceDir: t.TempDir(),
 		// A fresh node has no persisted shell opt-in, so the production callers
 		// pass ShellDisabled=true. Keep this fixture aligned with that default-deny
@@ -30,8 +32,8 @@ func TestNodeJobHandlersCoverPrivilegedTypes(t *testing.T) {
 	runner := worker.NewRunner(nil, handlers, worker.RunnerConfig{})
 	registerPrivilegedNodeJobHandlers(runner, opts)
 
-	// The two node-targeted privileged types must be dispatchable.
-	for _, jt := range []string{worker.JobTypeWhatsAppProvision, worker.JobTypeAgentUpdate} {
+	// The node-targeted privileged types must be dispatchable in both workers.
+	for _, jt := range []string{worker.JobTypeWhatsAppProvision, worker.JobTypeAgentUpdate, worker.JobTypeWorkerControl} {
 		if !runner.CanHandle(jt) {
 			t.Errorf("node-job handler set does not cover %q; a control-center-only worker would fail it with 'no handler'", jt)
 		}

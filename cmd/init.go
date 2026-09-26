@@ -102,8 +102,8 @@ and system user configuration (requires sudo).`,
 		// Wire up debug logging for nexus package
 		nexus.DebugFunc = Debug
 
-		Debug("auth-service: %s", authServiceURL)
-		Debug("nexus: %s", nexusURL)
+		Debug("auth-service configured")
+		Debug("nexus configured")
 		Debug("config dir: %s", platform.ConfigDir())
 
 		// Refuse an explicit --nexus that differs from the control plane this
@@ -179,7 +179,7 @@ and system user configuration (requires sudo).`,
 
 		if choice == nexus.NetChoiceDevice {
 			// Preflight: verify API is reachable before starting interactive auth
-			Debug("checking API reachability at %s...", authServiceURL)
+			Debug("checking API reachability...")
 			if err := nexus.CheckAPIReachable(authServiceURL); err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Cannot reach AceTeam API: %v\n", err)
 				fmt.Fprintln(os.Stderr, "\nTroubleshooting:")
@@ -205,11 +205,11 @@ and system user configuration (requires sudo).`,
 			}
 
 			Debug("device auth successful")
-			Debug("token response - authkey: %s...", deviceAuthResult.Token.Authkey[:min(20, len(deviceAuthResult.Token.Authkey))])
-			Debug("token response - redis_url: %s", deviceAuthResult.Token.RedisURL)
-			Debug("token response - device_api_token: %s", maskToken(deviceAuthResult.Token.DeviceAPIToken))
-			Debug("token response - api_base_url: %s", deviceAuthResult.Token.APIBaseURL)
-			Debug("token response - nexus_url: %s", deviceAuthResult.Token.NexusURL)
+			Debug("token response - authkey present: %t", deviceAuthResult.Token.Authkey != "")
+			Debug("token response - redis_url present: %t", deviceAuthResult.Token.RedisURL != "")
+			Debug("token response - device_api_token present: %t", deviceAuthResult.Token.DeviceAPIToken != "")
+			Debug("token response - api_base_url present: %t", deviceAuthResult.Token.APIBaseURL != "")
+			Debug("token response - nexus_url present: %t", deviceAuthResult.Token.NexusURL != "")
 			Debug("token response - org_id: %s", deviceAuthResult.Token.OrgID)
 
 			// Save device API token if provided (preferred secure mode)

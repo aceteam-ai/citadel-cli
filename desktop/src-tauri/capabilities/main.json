@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Citadel node cockpit",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

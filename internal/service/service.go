@@ -98,10 +98,25 @@ func DefaultConfig() (ServiceConfig, error) {
 	if runtime.GOOS == "darwin" {
 		exePath, _ = update.StableDarwinExecPath(exePath)
 	}
+	args := []string{"work"}
+	if runtime.GOOS == "darwin" && bundledDesktopHelper(exePath) {
+		if os.Geteuid() == 0 {
+			return ServiceConfig{}, fmt.Errorf("desktop helper service must be installed as the signed-in user")
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ServiceConfig{}, err
+		}
+		exePath, err = installDesktopHelper(exePath, home)
+		if err != nil {
+			return ServiceConfig{}, fmt.Errorf("failed to install desktop helper: %w", err)
+		}
+		args = []string{"--no-auto-update", "work"}
+	}
 
 	cfg := ServiceConfig{
 		ExecPath:    exePath,
-		Args:        []string{"work"},
+		Args:        args,
 		Description: DefaultDescription,
 		UserMode:    runtime.GOOS != "windows", // default to user mode on Unix
 	}

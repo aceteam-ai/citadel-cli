@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 )
 
 // TestAdvertisement_DisabledSurfacesNotAdvertised is the White Whale fix
@@ -13,34 +15,21 @@ import (
 // live terminal/screen/file browser for a freshly joined node. GPU is not gated.
 func TestAdvertisement_DisabledSurfacesNotAdvertised(t *testing.T) {
 	dir := t.TempDir()
-	// Point ConfigDir and the workspace resolver at the temp HOME. The config.yaml
-	// marker makes the root code path of resolveConfigDir also resolve here.
-	t.Setenv("HOME", dir)
-	t.Setenv("SUDO_USER", "")
-	t.Setenv("CITADEL_WORKSPACE", "")
-	cfgDir := filepath.Join(dir, ".citadel-cli")
-	if err := os.MkdirAll(cfgDir, 0755); err != nil {
-		t.Fatalf("mkdir cfg: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte("node:\n  name: t\n"), 0600); err != nil {
-		t.Fatalf("write config marker: %v", err)
-	}
+	workspace := filepath.Join(dir, "workspace")
+	t.Setenv("CITADEL_WORKSPACE", workspace)
 	// Make the files hardware-signal TRUE by creating the workspace, so the gate
 	// (not the absence of a workspace) is what suppresses the files flag.
-	if err := os.MkdirAll(filepath.Join(dir, "citadel-node", "workspace"), 0755); err != nil {
+	if err := os.MkdirAll(workspace, 0755); err != nil {
 		t.Fatalf("mkdir workspace: %v", err)
 	}
-
-	// permissions.yaml with the sensitive surfaces DISABLED.
-	perms := []byte("console: false\ndesktop: false\nfiles: false\nservices: true\n")
-	if err := os.WriteFile(filepath.Join(cfgDir, "permissions.yaml"), perms, 0600); err != nil {
-		t.Fatalf("write perms: %v", err)
-	}
+	// Use an injected node policy; the hardware probes below are independent of
+	// the invoker's configuration directory.
+	perms := config.DefaultPermissions()
 
 	caps := &NodeCapabilities{}
 	// vncPort > 0 would otherwise make desktop capable; pass a live port to prove
 	// the permission gate — not the absence of hardware — is what suppresses it.
-	populateCapabilityFlags(caps, 5901)
+	populateCapabilityFlags(caps, 5901, perms)
 
 	if caps.Console == nil || *caps.Console {
 		t.Errorf("console must not advertise while disabled, got %v", caps.Console)
@@ -58,26 +47,15 @@ func TestAdvertisement_DisabledSurfacesNotAdvertised(t *testing.T) {
 // true. (Files is the deterministic one — its hardware signal is a dir stat.)
 func TestAdvertisement_EnabledFilesAdvertised(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	t.Setenv("SUDO_USER", "")
-	t.Setenv("CITADEL_WORKSPACE", "")
-	cfgDir := filepath.Join(dir, ".citadel-cli")
-	if err := os.MkdirAll(cfgDir, 0755); err != nil {
-		t.Fatalf("mkdir cfg: %v", err)
+	t.Setenv("CITADEL_WORKSPACE", filepath.Join(dir, "workspace"))
+	if err := os.MkdirAll(filepath.Join(dir, "workspace"), 0755); err != nil {
+		t.Fatalf("mkdir configured workspace: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte("node:\n  name: t\n"), 0600); err != nil {
-		t.Fatalf("write config marker: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, "citadel-node", "workspace"), 0755); err != nil {
-		t.Fatalf("mkdir workspace: %v", err)
-	}
-	perms := []byte("files: true\n")
-	if err := os.WriteFile(filepath.Join(cfgDir, "permissions.yaml"), perms, 0600); err != nil {
-		t.Fatalf("write perms: %v", err)
-	}
+	perms := config.DefaultPermissions()
+	perms.Files = true
 
 	caps := &NodeCapabilities{}
-	populateCapabilityFlags(caps, 0)
+	populateCapabilityFlags(caps, 0, perms)
 
 	if caps.Files == nil || !*caps.Files {
 		t.Errorf("files should advertise when enabled with a workspace present, got %v", caps.Files)
