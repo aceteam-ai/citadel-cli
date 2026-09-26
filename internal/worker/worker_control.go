@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -75,13 +74,13 @@ func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, _ StreamWrit
 		}
 	}
 	if timeout, exists := job.Payload["timeout_ms"]; exists {
-		value, ok := timeout.(string)
-		if !ok {
-			return h.reject("invalid_payload", "WORKER_CONTROL timeout_ms must be a positive integer string")
-		}
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || parsed <= 0 {
-			return h.reject("invalid_payload", "WORKER_CONTROL timeout_ms must be a positive integer string")
+		// Redis payloads reach the worker via json.Unmarshal, so a numeric
+		// timeout_ms arrives as float64, not a string. Accept the same set of
+		// shapes the rest of the worker does (coerceToInt64: float/int/json.Number/
+		// string) so a JSON-number budget is not rejected as invalid.
+		parsed, ok := coerceToInt64(timeout)
+		if !ok || parsed <= 0 {
+			return h.reject("invalid_payload", "WORKER_CONTROL timeout_ms must be a positive integer")
 		}
 	}
 	if ray, exists := job.Payload["rayId"]; exists {

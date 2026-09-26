@@ -303,3 +303,36 @@ func TestWorkerControlPanickingAccountingCannotPreventAcceptedRestart(t *testing
 		t.Fatalf("restart gate=%v events=%v result=%v", restarted, events, writer.result)
 	}
 }
+
+// Redis delivers a JSON-number timeout_ms as float64 (the natural backend
+// shape), not a string. A numeric budget must be accepted, not rejected as
+// invalid; the string fixtures above never exercise this.
+func TestWorkerControlAcceptsNumericTimeoutMs(t *testing.T) {
+	events := []string{}
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { events = append(events, "restart") })})
+	job := controlJob("numeric-timeout")
+	job.Payload["timeout_ms"] = float64(25000)
+	got, result, ok := runControl(t, h, job, nil, nil, &events)
+	if !ok || result["accepted"] != true || result["restarting"] != true || !reflect.DeepEqual(got, []string{"ack", "result", "restart"}) {
+		t.Fatalf("numeric timeout_ms must be accepted: events=%v result=%v ok=%v", got, result, ok)
+	}
+}
+
+// An unmanaged worker must refuse the restart cleanly, before writing any
+// tombstone or scheduling an exit, so the node stays alive and a later managed
+// retry of the same job id is not misread as a duplicate. This is the
+// never-exit-into-a-dead-node invariant; it had no direct coverage.
+func TestWorkerControlUnmanagedWorkerRefusesWithoutSchedulingOrTombstone(t *testing.T) {
+	stateDir := t.TempDir()
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: stateDir, Managed: func() bool { return false }, Schedule: testSchedule(func() { t.Fatal("unmanaged worker must never schedule a restart") })})
+	job := controlJob("unmanaged")
+	events, result, ok := runControl(t, h, job, nil, nil, nil)
+	if !ok || result["accepted"] != false || result["restarting"] != false || result["code"] != "unmanaged_worker" {
+		t.Fatalf("unmanaged worker must refuse: events=%v result=%v ok=%v", events, result, ok)
+	}
+	if reserved, err := h.marker(job.ID, "reserved"); err != nil {
+		t.Fatal(err)
+	} else if _, statErr := os.Stat(reserved); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("unmanaged refusal must not write a reserved marker: %v", statErr)
+	}
+}
