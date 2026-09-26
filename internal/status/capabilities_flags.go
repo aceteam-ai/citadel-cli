@@ -59,10 +59,17 @@ func detectStaticCaps() {
 // PermissionState block (permissionsToHeartbeat), so the web can still render an
 // "enable + set passcode" call to action from that signal. GPU/H264 are
 // hardware-only and never gated (inference must advertise regardless).
-func populateCapabilityFlags(caps *NodeCapabilities, vncPort int) {
+func populateCapabilityFlags(caps *NodeCapabilities, vncPort int, perms *config.Permissions) {
 	detectStaticCaps()
 
-	perms := config.LoadPermissions(platform.ConfigDir())
+	// Status must be supplied the node's authoritative policy by its caller.
+	// Resolving platform.ConfigDir here would make this depend on the user that
+	// happened to invoke the process rather than on the node the worker serves.
+	// Keep sensitive surfaces default-deny if a legacy caller has not supplied a
+	// provider yet.
+	if perms == nil {
+		perms = config.DefaultPermissions()
+	}
 
 	console := cachedConsole && perms.Console
 	gpu := cachedGPU

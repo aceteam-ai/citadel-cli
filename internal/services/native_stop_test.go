@@ -2,6 +2,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -476,4 +477,61 @@ func TestDefaultProcessCmdlineIdentifiesThisProcess(t *testing.T) {
 			t.Errorf("pid %d reported as live", unlikely)
 		}
 	}
+}
+
+// withExternalSupervisorStub swaps the /proc-backed externalSupervisorUnit for a
+// fake for the duration of a test, so the external-managed branch is driven with
+// no real /proc read (this dev box runs a live node whose real ollama.service
+// would otherwise be in scope).
+func withExternalSupervisorStub(t *testing.T, fn func(pid int) (string, bool)) {
+	t.Helper()
+	orig := externalSupervisorUnit
+	externalSupervisorUnit = fn
+	t.Cleanup(func() { externalSupervisorUnit = orig })
+}
+
+// TestStopNativeServiceReportsExternallyManagedEngine is #1144: when the engine
+// process is owned by a host systemd unit citadel did not start, StopNativeService
+// reports ErrNativeExternallyManaged and NEVER signals it (a doomed kill against a
+// different user / Restart=always unit would just lose the race and report a false
+// success). There is no pidfile (registerTestEngine isolates an empty run dir), so
+// the external check is reached on the fall-through path.
+func TestStopNativeServiceReportsExternallyManagedEngine(t *testing.T) {
+	bin := uniqueBinaryName(t)
+	name := registerTestEngine(t, NativeService{Name: bin, Binary: bin, Port: 1})
+
+	engine := spawnFake(t, bin, "serve")
+	withExternalSupervisorStub(t, func(pid int) (string, bool) {
+		if pid == engine.pid {
+			return "ollama.service", true
+		}
+		return "", false
+	})
+
+	err := StopNativeService(name)
+	var extMgd *ErrNativeExternallyManaged
+	if !errors.As(err, &extMgd) {
+		t.Fatalf("StopNativeService = %v; want *ErrNativeExternallyManaged", err)
+	}
+	if extMgd.Unit != "ollama.service" {
+		t.Errorf("Unit = %q, want %q", extMgd.Unit, "ollama.service")
+	}
+	assertSurvived(t, engine, "an externally-managed engine")
+}
+
+// TestStopNativeServiceExternalCheckDoesNotBlockLegitKill pins that the external
+// check never blocks the fallback kill of an engine that is NOT externally
+// managed (a hand-run binary, or one under citadel's own unit): the mirror of the
+// test above, with the stub reporting not-external.
+func TestStopNativeServiceExternalCheckDoesNotBlockLegitKill(t *testing.T) {
+	bin := uniqueBinaryName(t)
+	name := registerTestEngine(t, NativeService{Name: bin, Binary: bin, Port: 1})
+
+	engine := spawnFake(t, bin, "serve")
+	withExternalSupervisorStub(t, func(pid int) (string, bool) { return "", false })
+
+	if err := StopNativeService(name); err != nil {
+		t.Fatalf("StopNativeService: %v", err)
+	}
+	assertExited(t, engine, "a non-externally-managed engine")
 }

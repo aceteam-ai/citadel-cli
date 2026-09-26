@@ -315,6 +315,45 @@ func stopVerifiedPID(pid int, service NativeService) error {
 	return nil
 }
 
+// ErrNativeExternallyManaged reports that the live process serving a native
+// engine is owned by a host systemd unit that is NOT citadel's own -- so citadel
+// did not start it and will not (and, being a different user / Restart=always
+// unit, generally cannot) stop it. The stop call sites report Unit-based
+// guidance instead of signalling a doomed kill. Unit is the owning *.service.
+type ErrNativeExternallyManaged struct {
+	Unit string
+}
+
+func (e *ErrNativeExternallyManaged) Error() string {
+	return fmt.Sprintf("native engine is managed outside citadel by host systemd unit %s", e.Unit)
+}
+
+// matchingProcessExternallyManaged reports whether a live process matching this
+// service is owned by a systemd *.service unit other than citadel's own -- i.e.
+// an engine citadel did not start. It returns the owning unit for the guidance
+// message. Reuses the SAME enumeration and executable-name matching as
+// stopMatchingProcesses (never a command-line substring, #696), so it can only
+// flag the actual engine process, not a `journalctl -u ollama` lookalike.
+func matchingProcessExternallyManaged(service NativeService) (string, bool) {
+	entries, err := listProcesses()
+	if err != nil {
+		return "", false
+	}
+	self := os.Getpid()
+	for _, entry := range entries {
+		if entry.pid <= 1 || entry.pid == self {
+			continue
+		}
+		if !processMatchesService(service, entry.cmdline) {
+			continue
+		}
+		if unit, external := externalSupervisorUnit(entry.pid); external {
+			return unit, true
+		}
+	}
+	return "", false
+}
+
 // stopMatchingProcesses is the fallback for an engine citadel did not start.
 // Finding nothing is success: "already stopped" is the desired end state, which
 // also preserves the old behaviour of treating pkill's "no process found" as OK.
@@ -367,6 +406,15 @@ func StopNativeService(serviceName string) error {
 		// belongs to something unrelated. Either way the pidfile is stale: drop
 		// it and fall through to the name match. Never signal an unverified PID.
 		_ = os.Remove(nativePidFilePath(serviceName))
+	}
+
+	// No citadel pidfile owns the live process. Before signalling anything, check
+	// whether the matching process is owned by a host systemd unit other than
+	// citadel's own (the stock ollama.service case, #1144). If so, citadel cannot
+	// stop it -- report it so the caller can guide the operator instead of losing
+	// an EPERM/Restart=always race and reporting a false success.
+	if unit, external := matchingProcessExternallyManaged(service); external {
+		return &ErrNativeExternallyManaged{Unit: unit}
 	}
 
 	return stopMatchingProcesses(service)
