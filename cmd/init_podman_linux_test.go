@@ -349,6 +349,39 @@ main
 	}
 }
 
+func TestInstallerPodmanVersionFloorGate(t *testing.T) {
+	source, err := os.ReadFile("../install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drop the entrypoint so the script only defines functions when sourced.
+	script := strings.Replace(string(source), "main \"$@\"", "", 1)
+	for _, tc := range []struct {
+		version string
+		wantOK  bool
+	}{
+		{"3.4.4", false}, // Ubuntu 22.04 ships this; rootless CDI needs >= 4.1
+		{"4.0.3", false}, // major 4 but minor < 1
+		{"4.1.0", true},  // exact floor
+		{"4.9.3", true},  // Ubuntu 24.04
+		{"5.2.0", true},
+		{"", false}, // podman missing / unparseable
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			root := t.TempDir()
+			fake := filepath.Join(root, "podman")
+			if err := os.WriteFile(fake, []byte("#!/bin/sh\nprintf 'podman version "+tc.version+"\\n'\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-c", script+"\npodman_meets_cdi_floor\n")
+			cmd.Env = append(os.Environ(), "PATH="+root+":"+os.Getenv("PATH"))
+			if err := cmd.Run(); (err == nil) != tc.wantOK {
+				t.Fatalf("podman_meets_cdi_floor for %q success=%v, want %v", tc.version, err == nil, tc.wantOK)
+			}
+		})
+	}
+}
+
 func TestPackerToolkitOnlyCPUArm64SkipsGPUSetup(t *testing.T) {
 	source, err := os.ReadFile("../packer/scripts/03-podman.sh")
 	if err != nil {

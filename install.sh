@@ -105,6 +105,33 @@ ok() {
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
+# resolve_node_config_dir mirrors network.GetNodeConfigDir()'s resolution
+# priority for a root caller: the machine-global state pointer, then a global
+# config.yaml node_config_dir (machine-wide, then SUDO_USER-local), then the
+# owner-consistent home fallback. Read-only; used by preflight to refuse a
+# populated foreign node dir before any host change (the Go path's guard in
+# prepareLinuxPodmanProvision).
+resolve_node_config_dir() {
+    local pointer="${CONFIG_DIR}/state-dir" val cfg sudo_home=""
+    if [ -f "$pointer" ] && [ ! -L "$pointer" ]; then
+        val=$(tr -d '[:space:]' < "$pointer" 2>/dev/null)
+        [ -n "$val" ] && { printf '%s\n' "$val"; return 0; }
+    fi
+    if [ -n "${SUDO_USER:-}" ]; then
+        sudo_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    fi
+    for cfg in "${CONFIG_DIR}/config.yaml" "${sudo_home:+${sudo_home}/.citadel-cli/config.yaml}"; do
+        [ -n "$cfg" ] && [ -f "$cfg" ] || continue
+        val=$(sed -n 's/^node_config_dir:[[:space:]]*//p' "$cfg" 2>/dev/null | head -1 | tr -d "\"' ")
+        [ -n "$val" ] && { printf '%s\n' "$val"; return 0; }
+    done
+    if [ -n "$sudo_home" ]; then
+        printf '%s/citadel-node\n' "$sudo_home"
+    else
+        printf '%s/citadel-node\n' "${HOME:-/root}"
+    fi
+}
+
 preflight() {
     # Read-only E5 migration guard: do not even create a log or alter HOME on
     # an existing system worker. Both historical managed unit names count.
@@ -129,6 +156,25 @@ preflight() {
             ALREADY_READY=true
             return 0
         fi
+    fi
+
+    # A Jetson/L4T box needs its JetPack-matched nvidia-ctk; the generic upstream
+    # toolkit does not fit. Fail here, before any package or host change, rather
+    # than mid-install (moved out of install_nvidia_toolkit).
+    if is_jetson && ! command -v nvidia-ctk >/dev/null 2>&1; then
+        printf 'ERROR: Jetson/L4T needs its JetPack-matched NVIDIA toolkit (nvidia-ctk) installed before provisioning; refusing the generic upstream package. Install it, then re-run.\n' >&2
+        return 1
+    fi
+
+    # Mirror prepareLinuxPodmanProvision's populated-foreign-state refusal
+    # (init_podman_linux.go): if the node config dir a citadel process resolves
+    # on this box is NOT the dedicated worker's dir and already holds state,
+    # refuse rather than diverge or clobber. Read-only, before any change.
+    local resolved_node_dir want_node_dir="${SERVICE_HOME}/citadel-node"
+    resolved_node_dir=$(resolve_node_config_dir)
+    if [ "$resolved_node_dir" != "$want_node_dir" ] && [ -d "$resolved_node_dir" ] && [ -n "$(ls -A "$resolved_node_dir" 2>/dev/null)" ]; then
+        printf 'ERROR: Existing node state at %s requires explicit E5 migration before provisioning %s; fresh installer made no changes.\n' "$resolved_node_dir" "$want_node_dir" >&2
+        return 1
     fi
 
     # Ensure HOME is /root so network state, config, and systemd service all agree
@@ -404,6 +450,25 @@ ensure_subid_range() {
     fi
 }
 
+# Rootless CDI GPU injection (nvidia.com/gpu=all) needs Podman >= 4.1. Ubuntu
+# 22.04 ships 3.4.4, which passes `podman info` but cannot inject CDI devices
+# rootless, so a GPU node would pass every check and then fail at first GPU
+# container start. Parse the actual version and gate rather than trusting the OS
+# or `podman info`.
+podman_meets_cdi_floor() {
+    local ver major minor
+    ver=$(podman --version 2>/dev/null | awk '{print $3}')
+    [ -n "$ver" ] || return 1
+    major=${ver%%.*}
+    minor=${ver#"${major}."}
+    minor=${minor%%.*}
+    case "$major" in ''|*[!0-9]*) return 1 ;; esac
+    case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
+    [ "$major" -gt 4 ] && return 0
+    [ "$major" -eq 4 ] && [ "$minor" -ge 1 ] && return 0
+    return 1
+}
+
 install_podman() {
     step "Installing rootless Podman"
     apt-get update -qq >> "$LOG_FILE" 2>&1 || die "apt-get update failed"
@@ -411,6 +476,12 @@ install_podman() {
     # Ubuntu 22.04 can use slirp4netns when passt/pasta is unavailable.
     if apt-cache show passt >/dev/null 2>&1; then
         apt-get install -y -qq passt >> "$LOG_FILE" 2>&1 || die "passt installation failed"
+    fi
+    # GPU nodes need Podman >= 4.1 for rootless CDI. Gate before creating the
+    # dedicated user, subordinate IDs, delegation, or linger, so a refused GPU
+    # node has only packages installed. CPU-only nodes provision on 3.4.4.
+    if $HAS_GPU && ! podman_meets_cdi_floor; then
+        die "GPU node needs Podman >= 4.1 for rootless CDI GPU injection (nvidia.com/gpu), but this system has Podman $(podman --version 2>/dev/null | awk '{print $3}' || echo unknown). Ubuntu 22.04 ships 3.4.4; provision GPU nodes on Ubuntu 24.04 (Podman 4.9+) or install Podman >= 4.1 manually, then re-run."
     fi
     if ! id "$SERVICE_USER" >/dev/null 2>&1; then
         useradd --create-home --shell /bin/bash "$SERVICE_USER" || die "Could not create ${SERVICE_USER} user"
@@ -643,10 +714,37 @@ install_citadel_binary() {
 # ---------------------------------------------------------------------------
 # Create config directory and run citadel init
 # ---------------------------------------------------------------------------
+# The dedicated worker enrolls as the non-root citadel user, which never writes
+# the machine-global node-dir pointer. Without it a root caller (sudo citadel
+# status/whoami, or a later sudo citadel init --provision) resolves via
+# owner-home and diverges from the worker's /home/citadel/citadel-node. Write
+# both convergence sources as root so every context on this box agrees:
+#   - state-dir  : network.GetStateDir()'s highest-priority pointer (also the
+#                  file existing_rootless_worker validates on a healthy rerun).
+#   - config.yaml: node_config_dir, which findAndReadManifest reads (status/
+#                  whoami manifest resolution). Merged, never clobbering keys.
+write_machine_state_pointer() {
+    local node_dir="${SERVICE_HOME}/citadel-node" cfg="${CONFIG_DIR}/config.yaml"
+    install -d -m 755 "$CONFIG_DIR"
+    printf '%s\n' "$node_dir" > "${CONFIG_DIR}/state-dir"
+    chmod 644 "${CONFIG_DIR}/state-dir"
+    if [ -f "$cfg" ] && grep -q '^node_config_dir:' "$cfg"; then
+        sed -i "s#^node_config_dir:.*#node_config_dir: ${node_dir}#" "$cfg"
+    else
+        printf 'node_config_dir: %s\n' "$node_dir" >> "$cfg"
+    fi
+    chmod 600 "$cfg"
+}
+
 setup_citadel() {
     step "Configuring Citadel node"
 
     mkdir -p "$CONFIG_DIR"
+
+    # Converge every invocation context on the dedicated worker's node dir
+    # before any early return, so an already-enrolled pre-fix node still gets
+    # the pointer on a re-run.
+    write_machine_state_pointer
 
     # Skip init if already connected (idempotent)
     if as_service_user "${INSTALL_DIR}/${BINARY_NAME}" status --json 2>/dev/null | grep -q '"connected":true' 2>/dev/null; then
