@@ -1,6 +1,7 @@
 package nexus
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -96,6 +97,71 @@ func TestTokenResponse_ParsesEnrollmentBundle(t *testing.T) {
 	}
 	if token.LeafPem != "LEAF" || token.ChainPem != "CHAIN" || token.NodeUID != "uid-123" {
 		t.Errorf("bundle = (%q,%q,%q), want (LEAF,CHAIN,uid-123)", token.LeafPem, token.ChainPem, token.NodeUID)
+	}
+}
+
+// TestPollForTokenWithCSR_DropsCSROnEnrollmentFailure proves the citadel-cli#1062
+// availability fix: a certificate-enrollment failure on a CSR-bearing poll does
+// NOT abort login. The CSR is dropped and polling continues, so the next no-CSR
+// poll delivers the authkey (the node stays honestly unverified).
+func TestPollForTokenWithCSR_DropsCSROnEnrollmentFailure(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		code   string
+	}{
+		{"unavailable_503", http.StatusServiceUnavailable, "certificate_enrollment_unavailable"},
+		{"rate_limited_429", http.StatusTooManyRequests, "certificate_enrollment_rate_limited"},
+		{"conflict_409", http.StatusConflict, "certificate_enrollment_failed"},
+		{"failed_400", http.StatusBadRequest, "certificate_enrollment_failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := StartMockDeviceAuthServer(1)
+			defer mock.Close()
+			mock.FailCSREnrollment(tc.status, tc.code)
+			client := NewDeviceAuthClient(mock.URL())
+
+			token, err := client.PollForTokenWithCSR("dev-code", 0 /* fast */, testCSRPEM)
+			if err != nil {
+				t.Fatalf("PollForTokenWithCSR aborted on a CA-enrollment failure: %v", err)
+			}
+			if token.Authkey == "" {
+				t.Fatal("expected an authkey after dropping the CSR")
+			}
+
+			csrs := mock.TokenRequestCSRs()
+			if len(csrs) < 2 {
+				t.Fatalf("expected at least 2 polls (CSR fails, no-CSR succeeds), got %d", len(csrs))
+			}
+			if csrs[0] != testCSRPEM {
+				t.Errorf("first poll csr_pem = %q, want the submitted CSR", csrs[0])
+			}
+			if csrs[len(csrs)-1] != "" {
+				t.Errorf("final (successful) poll csr_pem = %q, want none (CSR dropped)", csrs[len(csrs)-1])
+			}
+		})
+	}
+}
+
+// TestPollForTokenWithCSR_TerminalErrorsStillAbort proves the drop-and-continue
+// is scoped to the certificate-enrollment codes: a standard RFC 8628 terminal
+// code, and any other unrecognized code, still abort rather than silently
+// polling on without the CSR.
+func TestPollForTokenWithCSR_TerminalErrorsStillAbort(t *testing.T) {
+	for _, code := range []string{"access_denied", "expired_token", "some_future_code"} {
+		t.Run(code, func(t *testing.T) {
+			mock := StartMockDeviceAuthServer(1)
+			defer mock.Close()
+			// A 400 body carrying the code exercises the RFC 8628 parse path.
+			mock.FailCSREnrollment(http.StatusBadRequest, code)
+			client := NewDeviceAuthClient(mock.URL())
+
+			token, err := client.PollForTokenWithCSR("dev-code", 0, testCSRPEM)
+			if err == nil {
+				t.Fatalf("expected abort on %q, got token %+v", code, token)
+			}
+		})
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -296,9 +297,16 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 	timeout := 10 * time.Minute // Match backend expiration
 	startTime := time.Now()
 
+	// csr may be dropped mid-flight. A certificate-enrollment failure on a
+	// CSR-bearing poll (citadel-cli#1062) must NOT abort login: the device grant
+	// is still approved, so we clear the CSR and keep polling, and the next
+	// no-CSR poll delivers the authkey. The node stays honestly unverified
+	// instead of failing to log in over a transient CA hiccup or rate limit.
+	csr := csrPEM
+
 	for time.Since(startTime) < timeout {
-		// Make token request (same CSR on every retry).
-		token, err := c.CheckTokenWithCSR(deviceCode, csrPEM)
+		// Make token request (same CSR on every retry, until it is dropped).
+		token, err := c.CheckTokenWithCSR(deviceCode, csr)
 
 		// Success case
 		if token != nil && token.Authkey != "" {
@@ -325,6 +333,13 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 			case "access_denied":
 				return nil, fmt.Errorf("authorization denied by user")
 			default:
+				// Not a standard RFC 8628 code. If it is a certificate
+				// enrollment failure and we still carry a CSR, drop the CSR and
+				// keep polling (citadel-cli#1062) rather than abort login.
+				if csr != "" && isCertificateEnrollmentCode(tokenErr.ErrorCode) {
+					csr = ""
+					break
+				}
 				return nil, fmt.Errorf("authentication error: %s", tokenErr.ErrorDescription)
 			}
 		}
@@ -334,6 +349,35 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 	}
 
 	return nil, fmt.Errorf("authentication timeout after 10 minutes")
+}
+
+// certificateEnrollmentErrorCodes are the error codes the device-auth
+// certificate-enrollment path (citadel-cli#1062, companion to aceteam#9576)
+// returns when leaf issuance fails but the device grant itself is still valid.
+// They are reachable only on a CSR-bearing poll. Encountering one means "drop
+// the CSR and keep polling": a subsequent no-CSR poll still delivers the
+// authkey, so login proceeds with the node honestly unverified.
+var certificateEnrollmentErrorCodes = map[string]bool{
+	"certificate_enrollment_unavailable":  true,
+	"certificate_enrollment_rate_limited": true,
+	"certificate_enrollment_failed":       true,
+	"unsupported_device_kind":             true,
+}
+
+// isCertificateEnrollmentCode reports whether code is one of the
+// certificate-enrollment failure codes above (never a standard RFC 8628 code).
+func isCertificateEnrollmentCode(code string) bool {
+	return certificateEnrollmentErrorCodes[code]
+}
+
+// decodeErrorCode best-effort decodes an {"error": "<code>"} body and returns
+// the code, or "" when the body is not that shape.
+func decodeErrorCode(r io.Reader) string {
+	var e TokenError
+	if json.NewDecoder(r).Decode(&e) != nil {
+		return ""
+	}
+	return e.ErrorCode
 }
 
 // CheckToken makes a single request to the /token endpoint.
@@ -390,6 +434,16 @@ func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenR
 			return nil, fmt.Errorf("failed to parse error response: %w", err)
 		}
 		return nil, &tokenErr
+	}
+
+	// The certificate-enrollment path (citadel-cli#1062, reachable only when a
+	// CSR was submitted) returns {"error": "<code>"} with 409/429/503 when leaf
+	// issuance fails while the device grant is still valid. Surface a recognized
+	// enrollment code as a *TokenError so PollForTokenWithCSR can drop the CSR
+	// and keep polling. Any other body keeps the legacy generic error, so the
+	// no-CSR paths are byte-for-byte unchanged.
+	if code := decodeErrorCode(resp.Body); isCertificateEnrollmentCode(code) {
+		return nil, &TokenError{ErrorCode: code}
 	}
 
 	// Other HTTP errors
