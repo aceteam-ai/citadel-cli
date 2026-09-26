@@ -54,10 +54,11 @@ func runServices(_ *cobra.Command, _ []string) error {
 	}
 
 	collector := status.NewCollector(status.CollectorConfig{
-		NodeName:       nodeName,
-		ConfigDir:      "",
-		Services:       nil,
-		PinnedServices: pinned,
+		NodeName:            nodeName,
+		ConfigDir:           "",
+		Services:            nil,
+		PinnedServices:      pinned,
+		PermissionsProvider: loadNodePermissions,
 	})
 	nodeStatus, err := collector.Collect()
 	if err != nil {

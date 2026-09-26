@@ -9,6 +9,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -41,6 +42,7 @@ type Collector struct {
 	pairingDisplay  func() *PairingDisplayCapability // live pairing-display capability probe (citadel #659), optional
 	cacheReport     func() *CacheReport              // live cache-index attribution (citadel #682 P3), optional
 	jobTypes        func() []string                  // live registered worker job types (aceteam #9962), optional
+	permissions     func() *config.Permissions       // authoritative node permission policy, optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -111,6 +113,11 @@ type CollectorConfig struct {
 	// capability-aware dispatch. nil or an empty result leaves job_types omitted
 	// until the live runner is fully registered.
 	JobTypes func() []string
+	// PermissionsProvider returns the authoritative node permission policy for
+	// capability advertisement. It is deliberately a provider, rather than a
+	// ConfigDir resolved inside status: a worker may run as root while a status
+	// caller has a different HOME. Nil preserves the secure default-deny posture.
+	PermissionsProvider func() *config.Permissions
 }
 
 // NewCollector creates a new status collector.
@@ -136,7 +143,22 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		pairingDisplay:  cfg.PairingDisplay,
 		cacheReport:     cfg.CacheReport,
 		jobTypes:        cfg.JobTypes,
+		permissions:     cfg.PermissionsProvider,
 	}
+}
+
+// capabilityPermissions gets the node policy at collection time so a persisted
+// policy change is reflected by the next heartbeat without consulting the
+// invoker-scoped platform config directory. A missing or nil provider fails
+// closed for Console/Desktop/Files via DefaultPermissions.
+func (c *Collector) capabilityPermissions() *config.Permissions {
+	if c.permissions == nil {
+		return config.DefaultPermissions()
+	}
+	if perms := c.permissions(); perms != nil {
+		return perms
+	}
+	return config.DefaultPermissions()
 }
 
 // nodeRoutedIdle returns the IdleState derived from locally-recorded
@@ -450,7 +472,7 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	if status.Capabilities == nil {
 		status.Capabilities = &NodeCapabilities{}
 	}
-	populateCapabilityFlags(status.Capabilities, status.VNCPort)
+	populateCapabilityFlags(status.Capabilities, status.VNCPort, c.capabilityPermissions())
 
 	// Advertise the serving services this build can deploy (embedded ServiceMap
 	// keys) so the fabric can schedule engine-specific deploys only to capable

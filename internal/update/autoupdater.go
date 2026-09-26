@@ -1,8 +1,8 @@
 // internal/update/autoupdater.go
 // Opt-in periodic self-update for the long-lived Citadel agent.
 //
-// The AutoUpdater runs as a background goroutine launched by `citadel work`
-// when enabled. On each tick it checks GitHub Releases for a newer version,
+// The AutoUpdater runs as a background goroutine launched by a worker owner.
+// Enabled is checked on every tick before it checks GitHub Releases,
 // and if one is found it downloads + checksum-verifies the binary, waits for
 // an idle moment (no in-flight jobs), atomically swaps the running binary, and
 // restarts the process so the new node-side capabilities take effect.
@@ -11,8 +11,8 @@
 //   - Reuses the existing Client (CheckForUpdate / DownloadAndVerify) and
 //     ApplyUpdate / Rollback machinery so the release-asset naming and checksum
 //     contract is preserved.
-//   - This is a separate opt-in from the notify-only State.AutoUpdate gate used
-//     by root.go: auto-INSTALL must be explicitly enabled and defaults off.
+//   - The owning command supplies an effective, default-off install policy;
+//     the notify-only startup check does not decide whether this loop installs.
 //   - Fail-safe: any error is reported via the logger and never panics or kills
 //     the agent. In-flight jobs are always drained before the swap.
 package update
@@ -54,6 +54,10 @@ type AutoUpdaterConfig struct {
 	// up to the floor. Zero uses DefaultAutoUpdateInterval.
 	Interval time.Duration
 
+	// AfterTick is called after a tick has been processed, including a disabled
+	// tick. It is an optional synchronization hook for tests.
+	AfterTick func()
+
 	// Enabled is consulted at the start of every tick. When it returns false the
 	// updater skips that cycle entirely (no release check, no swap), so the
 	// switch can be flipped on a *running* agent — e.g. `citadel update
@@ -66,9 +70,10 @@ type AutoUpdaterConfig struct {
 	// always considered idle (best-effort).
 	ActiveJobs func() int
 
-	// Drain, if set, is called once an update is downloaded and verified to
-	// stop the runner from fetching new jobs while we wait for idle.
-	Drain func()
+	// BeginDrain, if set, pauses new job pickup after download and verification.
+	// Its release function must undo only this attempt's pause. The updater
+	// releases it on every abort and retains it through a successful restart.
+	BeginDrain func() (release func())
 
 	// IdlePollInterval is how often to re-check ActiveJobs while waiting for
 	// the node to drain. Zero uses a sensible default (2s).
@@ -79,6 +84,12 @@ type AutoUpdaterConfig struct {
 	// sensible default (10m). A long-running job should never block the agent
 	// from making progress on real work.
 	IdleTimeout time.Duration
+
+	// Ticks, IdleTicks, and Now allow deterministic scheduling in tests. Nil
+	// channels use real tickers; nil Now uses the wall clock.
+	Ticks     <-chan time.Time
+	IdleTicks <-chan time.Time
+	Now       func() time.Time
 
 	// Apply replaces the running binary with the verified pending binary.
 	// Defaults to ApplyUpdate. Overridable for testing.
@@ -124,6 +135,9 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 10 * time.Minute
 	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 	if cfg.Apply == nil {
 		cfg.Apply = ApplyUpdate
 	}
@@ -147,32 +161,44 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 // next tick so the agent keeps running regardless.
 func (a *AutoUpdater) Run(ctx context.Context) {
 	a.cfg.Log("auto-update: monitoring (interval %s)", a.cfg.Interval)
-	ticker := time.NewTicker(a.cfg.Interval)
-	defer ticker.Stop()
+	ticks := a.cfg.Ticks
+	if ticks == nil {
+		ticker := time.NewTicker(a.cfg.Interval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			// Re-check the toggle every tick so it can be flipped on a running
-			// agent without a restart.
-			if a.cfg.Enabled != nil && !a.cfg.Enabled() {
-				continue
+		case <-ticks:
+			if ctx.Err() != nil {
+				return
 			}
-			// runOnce never panics; guard anyway so a bug here can never take
-			// down the agent.
 			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						a.cfg.Log("auto-update: recovered from panic: %v", r)
+				if a.cfg.AfterTick != nil {
+					defer a.cfg.AfterTick()
+				}
+				// Re-check the toggle every tick so it can be flipped on a running
+				// agent without a restart.
+				if a.cfg.Enabled != nil && !a.cfg.Enabled() {
+					return
+				}
+				// runOnce never panics; guard anyway so a bug here can never take
+				// down the agent.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							a.cfg.Log("auto-update: recovered from panic: %v", r)
+						}
+					}()
+					if restarted := a.runOnce(ctx); restarted {
+						// RestartProcess only returns on failure; if it somehow
+						// returns success we still keep the loop alive.
+						a.cfg.Log("auto-update: restart requested")
 					}
 				}()
-				if restarted := a.runOnce(ctx); restarted {
-					// RestartProcess only returns on failure; if it somehow
-					// returns success we still keep the loop alive.
-					a.cfg.Log("auto-update: restart requested")
-				}
 			}()
 		}
 	}
@@ -187,6 +213,9 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 		a.cfg.Log("auto-update: desktop helper is updated with the app")
 		return false
 	}
+	if ctx.Err() != nil {
+		return false
+	}
 	release, err := a.cfg.Checker.CheckForUpdate()
 	if err != nil {
 		a.cfg.Log("auto-update: check failed: %v", err)
@@ -194,6 +223,9 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	}
 	if release == nil {
 		a.cfg.Log("auto-update: up to date")
+		return false
+	}
+	if ctx.Err() != nil {
 		return false
 	}
 
@@ -214,17 +246,31 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 		a.cfg.Log("auto-update: download/verify failed: %v", err)
 		return false
 	}
+	if ctx.Err() != nil {
+		return false
+	}
 	a.cfg.Log("auto-update: downloaded and verified %s", release.TagName)
 
 	// Stop fetching new jobs, then wait for in-flight jobs to finish. Draining
 	// BEFORE observing idle closes the race where a new job is picked up
 	// between the idle check and the binary swap.
-	if a.cfg.Drain != nil {
-		a.cfg.Drain()
+	if a.cfg.BeginDrain != nil {
+		releaseDrain := a.cfg.BeginDrain()
+		if releaseDrain != nil {
+			defer func() {
+				if !restarted {
+					releaseDrain()
+				}
+			}()
+		}
 	}
 
 	if err := a.waitForIdle(ctx); err != nil {
 		a.cfg.Log("auto-update: %v; deferring to next cycle", err)
+		return false
+	}
+	if ctx.Err() != nil {
+		a.cfg.Log("auto-update: context cancelled before apply")
 		return false
 	}
 
@@ -243,6 +289,10 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 		UpdateLastCheck(state)
 		_ = SaveState(state)
 	}
+	if ctx.Err() != nil {
+		a.cfg.Log("auto-update: context cancelled after apply (new binary will load on next start)")
+		return false
+	}
 
 	if err := a.cfg.Restart(); err != nil {
 		// If restart fails the new binary is already in place; the supervisor
@@ -260,22 +310,29 @@ func (a *AutoUpdater) waitForIdle(ctx context.Context) error {
 	if a.cfg.ActiveJobs == nil {
 		return nil
 	}
-	deadline := time.Now().Add(a.cfg.IdleTimeout)
-	ticker := time.NewTicker(a.cfg.IdlePollInterval)
-	defer ticker.Stop()
+	deadline := a.cfg.Now().Add(a.cfg.IdleTimeout)
+	ticks := a.cfg.IdleTicks
+	if ticks == nil {
+		ticker := time.NewTicker(a.cfg.IdlePollInterval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
 
 	for {
+		if ctx.Err() != nil {
+			return fmt.Errorf("context cancelled while draining in-flight jobs")
+		}
 		if a.cfg.ActiveJobs() == 0 {
 			return nil
 		}
-		if time.Now().After(deadline) {
+		if !a.cfg.Now().Before(deadline) {
 			return fmt.Errorf("timed out after %s waiting for %d in-flight job(s) to finish",
 				a.cfg.IdleTimeout, a.cfg.ActiveJobs())
 		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("context cancelled while draining in-flight jobs")
-		case <-ticker.C:
+		case <-ticks:
 		}
 	}
 }

@@ -93,9 +93,9 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 
 // IsHeld reports whether a live citadel worker currently holds the single-instance
 // lock for the node keyed to stateDir, WITHOUT acquiring, reclaiming, or otherwise
-// disturbing it. It is the read-only counterpart to Acquire, used by the control
-// center to detect a running `citadel work` before deciding whether to run its own
-// embedded job worker (issue: control-center competes for per-node-stream jobs).
+// disturbing it. It is the read-only counterpart to Acquire, used by
+// discover-and-attach/status paths. A process deciding to own jobs must call
+// Acquire and hold the returned lock, not rely on this snapshot.
 //
 // Detection mirrors Acquire's refuse-vs-reclaim logic but never mutates the lock:
 //   - A non-blocking exclusive flock probe on a SEPARATE fd tests contention. The
@@ -107,8 +107,7 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 //     unrelated program reports NOT held (holderPID 0) — the same conditions under
 //     which Acquire would reclaim rather than refuse.
 //
-// A false "not held" only degrades to the pre-fix behavior (the control center may
-// run its own worker); it never steals or breaks the real worker's lock.
+// A false "not held" is not ownership authority; Acquire remains the hard guard.
 func IsHeld(stateDir string) (held bool, holderPID int) {
 	path := LockPathForStateDir(stateDir)
 

@@ -30,12 +30,10 @@ import (
 // is orphaned" is only true because a citadel node runs (at most) one active
 // job-consuming worker at a time. ReconcileOrphanedReservations therefore
 // takes an explicit holdsWorkerLock bool instead of assuming its caller
-// checked — see that function's doc for the exact contract, INCLUDING a
-// currently-latent gap: internal/worklock only guards `citadel work` against
-// a second `citadel work`, not against the control-center TUI's own worker
-// path (cmd/controlcenter.go), which consumes jobs off the same handler set
-// WITHOUT ever acquiring that lock. Read that doc fully before wiring any
-// caller (e.g. #8248) into a handler reachable from the control-center path.
+// checked — see that function's doc for the exact contract. The control-center
+// worker now holds the same lock while it consumes jobs, but reconcile is still
+// wired only in `citadel work`; a future control-center reservation caller
+// must decide how to restore orphaned tags on its own startup.
 
 // Reservation is the result of a job-scoped GPU VRAM hold (citadel-cli#832).
 type Reservation struct {
@@ -287,29 +285,14 @@ func (h *ServiceHandler) Release(ctx JobContext, jobID string) ([]string, error)
 // runWork, immediately after a successful worklock.Acquire, before the job
 // consume loop starts.
 //
-// IMPORTANT — this parameter guards only ONE of the two ways a second
-// job-consuming process can exist for a node. worklock guards `citadel work`
-// vs a SECOND `citadel work`: a genuinely live holder makes Acquire fail, so a
-// second invocation either exits (attach/no-op) or refuses, and never reaches
-// this function with holdsWorkerLock==true while another citadel-work process
-// is also live. It does NOT cover the control-center TUI's OWN worker path:
-// when no dedicated `citadel work` holds the lock (workerHeld==false in
-// cmd/controlcenter.go), the control center runs its own consume loop off the
-// SAME buildNodeJobHandlers handler set — WITHOUT ever calling
-// worklock.Acquire. If a future caller (e.g. #8248) wires Reserve/Release into
-// a handler reachable from that path, a control-center reservation and a
-// LATER `citadel work` startup (which legitimately Acquires — nobody is
-// holding it) collide exactly the way this parameter is meant to prevent: the
-// new worker's reconcile would see the tag, conclude "orphaned", and
-// destructively restart a service the still-live control-center job is
-// actively using. holdsWorkerLock does not detect this case; it is a
-// documented, currently-latent gap (nothing calls Reserve yet). A future
-// caller reachable from the control-center path MUST NOT rely on this
-// parameter alone — either make the control center's own worker path
-// Acquire the lock too, or extend the marker with owner identity (pid +
-// start time, classified the way worklock.decideStaleLock already classifies
-// a stale lock's recorded PID) so reconcile can tell "orphaned" from "owned by
-// a still-live sibling process" without assuming single-process exclusivity.
+// The control-center TUI's owned worker now acquires the SAME worklock before
+// consuming jobs; monitor-only mode does not consume. A later `citadel work`
+// cannot acquire and reconcile while that control-center worker is live. The
+// remaining asymmetry is startup restoration: only `citadel work` calls this
+// function today. A future Reserve/Release caller in the control-center worker
+// must decide whether and when to call it after taking the lock, before jobs
+// can create new reservations. Local CLI/MCP reservation calls do not hold this
+// worker lock and remain a separate ownership consideration.
 //
 // Idempotent: a service already restored (tag cleared) is not visited again,
 // so calling this twice restores nothing the second time — see Release.
