@@ -802,10 +802,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
 	if deviceConfig != nil {
-		Debug("config loaded: device_api_token=%q, api_base_url=%q, redis_url=%q",
-			maskToken(deviceConfig.DeviceAPIToken),
-			deviceConfig.APIBaseURL,
-			deviceConfig.RedisURL)
+		Debug("config loaded: device_api_token present=%t, api_base_url present=%t, redis_url present=%t",
+			deviceConfig.DeviceAPIToken != "",
+			deviceConfig.APIBaseURL != "",
+			deviceConfig.RedisURL != "")
 	} else {
 		Debug("config file not found or empty")
 	}
@@ -1020,7 +1020,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Fprintln(os.Stderr, "WARNING: Direct Redis mode is for debugging only. Run 'citadel init' for production use.")
 		}
 		Debug("using direct Redis mode")
-		Debug("Redis URL: %s", workRedisURL)
+		Debug("Redis URL configured")
 
 		// Resolve queue names: explicit --queue takes priority, otherwise use capabilities
 		var queueNames []string

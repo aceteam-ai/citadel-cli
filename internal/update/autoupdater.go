@@ -209,6 +209,10 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 // replaced and not return). On any error it logs and returns false so the next
 // tick retries.
 func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
+	if CurrentBinaryIsDesktopManaged() {
+		a.cfg.Log("auto-update: desktop helper is updated with the app")
+		return false
+	}
 	if ctx.Err() != nil {
 		return false
 	}

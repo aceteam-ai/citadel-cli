@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -69,8 +70,29 @@ func ensureFileLocked() {
 	if d == "" {
 		return
 	}
-	if err := os.MkdirAll(d, 0o755); err != nil {
+	if err := os.MkdirAll(d, 0o700); err != nil {
 		return
+	}
+	// Older releases created this directory and its logs world-readable.
+	// Restrict the directory first, then migrate regular dated log files.
+	if err := os.Chmod(d, 0o700); err != nil {
+		return
+	}
+	entries, err := os.ReadDir(d)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "citadel-") || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if err := os.Chmod(filepath.Join(d, entry.Name()), 0o600); err != nil {
+			return
+		}
 	}
 
 	if file != nil {
@@ -79,8 +101,18 @@ func ensureFileLocked() {
 	}
 
 	name := fileNameFor(nowFn())
-	f, err := os.OpenFile(filepath.Join(d, name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	path := filepath.Join(d, name)
+	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+		return
+	} else if err != nil && !os.IsNotExist(err) {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
+		return
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
 		return
 	}
 	file = f
