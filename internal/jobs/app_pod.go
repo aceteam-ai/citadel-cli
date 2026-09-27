@@ -136,7 +136,7 @@ func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, erro
 		return nil, err
 	}
 	if in.ContainerPort < 1024 || in.ContainerPort > 65535 {
-		return nil, fmt.Errorf("container_port %d out of range (1025-65535)", in.ContainerPort)
+		return nil, fmt.Errorf("container_port %d out of range (1024-65535)", in.ContainerPort)
 	}
 	if hostPort < 1 || hostPort > 65535 {
 		return nil, fmt.Errorf("host_port %d out of range", hostPort)

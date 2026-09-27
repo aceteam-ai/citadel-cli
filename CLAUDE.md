@@ -1223,6 +1223,22 @@ Load-bearing details a future edit must preserve:
   parsers); `worker.parseExposeRequest`/`parseUnexposeRequest` and the
   `/agent/expose` control path (`cmd/agent_tools.go`) refuse the prefix, so an
   operator can neither shadow nor tear down an app route.
+- **APP_DESTROY route teardown is gateway-independent, and the allocator
+  reserves durable `app-` routes** (`teardownAppRoute` / `exposedAppRoutePorts`,
+  `cmd/app_ops.go`, citadel-cli#1157). `teardownAppRoute` ALWAYS calls
+  `liveExposeOps.Unexpose` (no `getProvisionedServiceGateway` guard): with a live
+  gateway that drops both the live route AND the durable exposure record, but
+  `Unexpose` NEEDS a running gateway. Its "no in-process gateway" error is the
+  deliberate UNEXPOSE-job retry signal (`internal/worker/unexpose.go`
+  `isNoGatewayErr`), so it must NOT be changed to swallow it; a pod destroyed
+  while the worker is gateway-off therefore deletes the durable record directly
+  (`config.DeleteExposure` under `exposeOpsMu`) as the backstop, or the route
+  re-exposes on the next restart onto a host port a later deploy could reuse.
+  Separately, `Deploy`'s allocator folds `exposedAppRoutePorts` into its in-use
+  predicate, so a host port still claimed by ANY durable `app-` record (a live
+  pod's route, or one that outlived its pruned container) is never handed to a
+  new pod. Reusing it would place two app routes on one upstream under different
+  visibility policies, letting a visitor authorized for one reach the other.
 - **`APP_DEPLOY` is in `unboundedJobTypes`** (`internal/worker/deadline.go`):
   the image pull is opaque-long (no watchdog cap), and unbounded membership
   ALSO puts it on the serialized (exec-1) lane, which is what makes

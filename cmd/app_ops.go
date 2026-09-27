@@ -29,6 +29,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
@@ -84,8 +85,13 @@ func (liveAppOps) Deploy(ctx context.Context, req worker.AppDeployRequest) (*wor
 	hostPort, reused := runner.ExistingHostPort(ctx, req.ShortCode)
 	if !reused {
 		used := runner.UsedAppPorts(ctx)
+		// Fold in every host port still claimed by a durable app- exposure
+		// record so a port owned by ANY live or durable hosted-app route is
+		// never reallocated (see exposedAppRoutePorts). Cheap map lookups
+		// precede the loopback dial.
+		appRoutePorts := exposedAppRoutePorts(platform.ConfigDir())
 		alloc, err := services.AllocateAppPodPort(func(p int) bool {
-			return used[p] || localPortListening(p)
+			return used[p] || appRoutePorts[p] || localPortListening(p)
 		})
 		if err != nil {
 			return nil, err
@@ -199,21 +205,78 @@ func (liveAppOps) Logs(ctx context.Context, shortCode string, tail int) (*worker
 }
 
 // Destroy tears the gateway route down FIRST (route dark before teardown), then
-// removes the pod and its volumes. Unexpose is idempotent, so a route that was
-// never wired is a harmless no-op.
+// removes the pod and its volumes.
 func (liveAppOps) Destroy(ctx context.Context, shortCode string) (*worker.AppLifecycleResult, error) {
-	if getProvisionedServiceGateway() != nil {
-		if _, err := (liveExposeOps{}).Unexpose(ctx, gateway.AppExposePrefix+shortCode); err != nil {
-			// A failed route teardown is not fatal to the destroy: the pod is what
-			// holds resources, and the durable exposure record is cleaned up on the
-			// next Unexpose/restart. Log and proceed.
-			Log("app %q: gateway route teardown failed (continuing with pod removal): %v", shortCode, err)
-		}
-	}
+	teardownAppRoute(ctx, shortCode)
 	if err := appPodRunner().Destroy(ctx, shortCode); err != nil {
 		return nil, err
 	}
 	return &worker.AppLifecycleResult{Name: gateway.AppExposePrefix + shortCode, ShortCode: shortCode, State: "destroyed"}, nil
+}
+
+// teardownAppRoute revokes a hosted-app pod's gateway route on APP_DESTROY. It
+// ALWAYS attempts Unexpose (no getProvisionedServiceGateway guard): with a live
+// gateway, Unexpose drops both the live route AND the durable exposure record.
+// Without one, Unexpose can only report "no in-process gateway" and tears
+// nothing down -- and that error is deliberately the UNEXPOSE-job retry signal
+// (internal/worker/unexpose.go isNoGatewayErr), so Unexpose must keep returning
+// it and must NOT be changed to swallow it. So the durable record is deleted
+// directly here as the gateway-independent backstop.
+//
+// A hosted-app route must not outlive its pod. If it does, it re-exposes on the
+// next --gateway restart onto a host port a later deploy could reuse, putting
+// two app routes on one upstream under different visibility policies (the
+// cross-visibility bypass this guards). This is the half that closes Trigger 2:
+// an APP_DESTROY that runs while the worker is gateway-off. (Trigger 1, where no
+// Destroy is ever called, is closed by the allocator awareness in
+// exposedAppRoutePorts.)
+//
+// Both steps are best-effort and idempotent; a teardown failure is logged,
+// never fatal to the destroy (the pod is what holds resources).
+func teardownAppRoute(ctx context.Context, shortCode string) {
+	routeName := gateway.AppExposePrefix + shortCode
+	if _, err := (liveExposeOps{}).Unexpose(ctx, routeName); err != nil {
+		Log("app %q: gateway route teardown reported %v; removing durable exposure record directly", shortCode, err)
+		// exposures.json is an unlocked load-modify-write shared with
+		// liveExposeOps; take exposeOpsMu around the backstop delete to preserve
+		// the single-writer invariant (issue #944 design doc §5.4). Unexpose has
+		// already returned and released the mutex, so this does not nest.
+		exposeOpsMu.Lock()
+		_, derr := config.DeleteExposure(platform.ConfigDir(), routeName)
+		exposeOpsMu.Unlock()
+		if derr != nil {
+			Log("app %q: durable exposure record removal failed (it may re-expose on the next gateway restart): %v", shortCode, derr)
+		}
+	}
+}
+
+// exposedAppRoutePorts returns the set of host ports currently claimed by a
+// durable app-<short_code> exposure record. Deploy folds these into the port
+// allocator's in-use predicate so a host port still owned by ANY hosted-app
+// route -- a live pod's route, OR a durable record that outlived its pod (a
+// stopped-then-pruned container, or an APP_DESTROY that ran while the gateway
+// was off) -- is never handed to a new pod. Reusing it would put two app routes
+// on one upstream, each under its own visibility policy, letting a visitor
+// authorized for one reach the other (the cross-visibility bypass this guards;
+// this is the half that closes Trigger 1, where no Destroy is ever called).
+//
+// The durable exposure store (config.LoadExposures) is the source of truth --
+// the same store Expose/Unexpose/restore program -- NOT a re-scan of live
+// containers, since a pruned-but-still-routed pod is exactly the case that must
+// still reserve its port. Path-only (directory-share) records carry Port 0 and
+// are ignored.
+func exposedAppRoutePorts(configDir string) map[int]bool {
+	ports := map[int]bool{}
+	recs, err := config.LoadExposures(configDir)
+	if err != nil {
+		return ports
+	}
+	for _, r := range recs {
+		if r.Port > 0 && gateway.IsAppExposeName(r.Name) {
+			ports[r.Port] = true
+		}
+	}
+	return ports
 }
 
 // signAppDeployReceipt builds the signed AEP v2 app_deploy receipt when
