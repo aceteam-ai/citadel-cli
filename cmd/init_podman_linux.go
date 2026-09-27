@@ -538,7 +538,15 @@ func configureNvidiaCDILinux() error {
 		return nil
 	}
 	if _, err := exec.LookPath("nvidia-ctk"); err != nil {
-		return fmt.Errorf("NVIDIA GPU present but nvidia-ctk unavailable: %w", err)
+		// NVIDIA hardware is present but the container toolkit is unavailable
+		// (a GPU box with no drivers installed, or the preceding NVIDIA
+		// Container Toolkit provision step warned and continued). GPU CDI
+		// cannot be wired without nvidia-ctk, so skip it and provision the node
+		// CPU-only rather than aborting the whole rootless-podman provision --
+		// a CPU workload never asked for a GPU. Mirrors the best-effort posture
+		// the NVIDIA Container Toolkit step already uses in cmd/init.go.
+		fmt.Fprintln(os.Stderr, "⚠️  NVIDIA GPU detected but nvidia-ctk is unavailable; skipping GPU CDI setup (provisioning CPU-only). Install NVIDIA drivers + the container toolkit and re-run to enable GPU containers.")
+		return nil
 	}
 	name, uid, home, err := podmanProvisionUser()
 	if err != nil {
