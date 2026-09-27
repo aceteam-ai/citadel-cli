@@ -73,6 +73,22 @@ func ExposeRoutePath(name string) string {
 	return ExposeRoutePrefix + name
 }
 
+// AppExposePrefix is the reserved exposure-name prefix for hosted-app pod
+// routes (aceteam-ai/citadel-cli#9672, CRAM slice A1). The app runner mints
+// "app-<short_code>" gateway routes through the SAME liveExposeOps funnel an
+// operator's own exposures use, so the operator-facing expose/unexpose verbs
+// refuse this prefix (worker.parseExposeRequest / parseUnexposeRequest and the
+// /agent/expose control path). An operator can therefore neither shadow nor
+// tear down an app route, and the app runner is the only path that can create
+// one.
+const AppExposePrefix = "app-"
+
+// IsAppExposeName reports whether name is in the reserved hosted-app exposure
+// namespace (AppExposePrefix).
+func IsAppExposeName(name string) bool {
+	return strings.HasPrefix(name, AppExposePrefix)
+}
+
 // Visibility is the access level of an exposed service. It mirrors the pages
 // model exactly (private/org/link).
 type Visibility string

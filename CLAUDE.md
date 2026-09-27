@@ -1178,6 +1178,101 @@ WebSocket.
 Deliberately out of scope (tracked separately in #1055): the redundancy-DNS
 strategy and the rootless per-app pod runtime.
 
+### Hosted-app pod-per-app runner (`APP_*`, CRAM slice A1, aceteam#9672)
+
+Runs a real server-side web app as one pod on a node and fronts it with a
+gateway route. Design of record: aceteam#9641 comment 5641273114 (§3.3 is A1).
+Three layers, mirroring the EXPOSE_SET shape so the routing/validation is
+unit-testable without an engine:
+
+- **`internal/worker/app_deploy.go` (`AppHandler`, `AppOps`)** owns the six
+  `APP_DEPLOY`/`APP_STOP`/`APP_START`/`APP_STATUS`/`APP_LOGS`/`APP_DESTROY` job
+  types (one handler, `CanHandle` over the family, switch on type, like
+  `InstanceHandler`). Privileged in the EXPOSE_SET sense: `isPerNodeStream`
+  only, fail closed on the shared pool. `parseAppDeployRequest` is the field
+  boundary check (refuses `platform` visibility as A5, and `git`/`workspace`
+  source as A2); the node-edge validation (image/runtime allowlist, volume
+  confinement) is in `jobs.ParseAppSpec`. A `Deploy` error wrapping
+  `worker.ErrAppTransient` retries; anything else fails terminally.
+- **`internal/jobs/app_pod.go` (`ParseAppSpec`, `AppPodRunner`)** is the pod
+  logic. It EXTENDS `service_payload.go` (reuses `validateImageRef`/
+  `validateRuntime`/`resolveStateVolumePath`), not a sixth launcher. Every
+  engine call goes through the `catalog.ContainerRuntime` seam (the #1041 CI
+  guard forbids a literal `exec.Command("docker"/"podman")`), so podman gets a
+  real pod (`pod create` + `run --pod`) and docker gets a single labeled
+  container with the identical publish/limits/labels (`pod_id` = container id).
+  The `aceteam.app*` labels (incl. `host_port`/`health_path`) are the durable
+  record: there is NO store, so STATUS/LOGS/DESTROY/redeploy recover everything
+  by resolving the container by its `aceteam.app` label (works on both engines;
+  only pod stop/start branch). `execFn` is the injectable seam its argv tests
+  drive.
+- **`cmd/app_ops.go` (`liveAppOps`)** wires the three cmd-only edges the worker
+  package must not import: the runtime seam, the gateway (via the SAME
+  `liveExposeOps{}.Expose`/`Unexpose` funnel EXPOSE_SET uses, so an app route
+  gets the durable exposure record + epoch high-water + restart restore for
+  free), and the node signing key. It checks the gateway ref FIRST (transient
+  retry) so a not-ready gateway never strands a routeless pod; DESTROY
+  Unexposes BEFORE pod teardown; redeploy reuses the existing pod's host port
+  (label read) and re-Exposes with `Rotate:false` so the epoch and any link
+  token survive.
+
+Load-bearing details a future edit must preserve:
+
+- **The `app-` gateway prefix is reserved** (`gateway.AppExposePrefix`). Only
+  `liveAppOps` mints `app-<short_code>` routes (it bypasses the operator
+  parsers); `worker.parseExposeRequest`/`parseUnexposeRequest` and the
+  `/agent/expose` control path (`cmd/agent_tools.go`) refuse the prefix, so an
+  operator can neither shadow nor tear down an app route.
+- **APP_DESTROY route teardown is gateway-independent, and the allocator
+  reserves durable `app-` routes** (`teardownAppRoute` / `exposedAppRoutePorts`,
+  `cmd/app_ops.go`, citadel-cli#1157). `teardownAppRoute` ALWAYS calls
+  `liveExposeOps.Unexpose` (no `getProvisionedServiceGateway` guard): with a live
+  gateway that drops both the live route AND the durable exposure record, but
+  `Unexpose` NEEDS a running gateway. Its "no in-process gateway" error is the
+  deliberate UNEXPOSE-job retry signal (`internal/worker/unexpose.go`
+  `isNoGatewayErr`), so it must NOT be changed to swallow it; a pod destroyed
+  while the worker is gateway-off therefore deletes the durable record directly
+  (`config.DeleteExposure` under `exposeOpsMu`) as the backstop, or the route
+  re-exposes on the next restart onto a host port a later deploy could reuse.
+  Separately, `Deploy`'s allocator folds `exposedAppRoutePorts` into its in-use
+  predicate, so a host port still claimed by ANY durable `app-` record (a live
+  pod's route, or one that outlived its pruned container) is never handed to a
+  new pod. Reusing it would place two app routes on one upstream under different
+  visibility policies, letting a visitor authorized for one reach the other.
+- **`APP_DEPLOY` is in `unboundedJobTypes`** (`internal/worker/deadline.go`):
+  the image pull is opaque-long (no watchdog cap), and unbounded membership
+  ALSO puts it on the serialized (exec-1) lane, which is what makes
+  `services.AllocateAppPodPort` race-free without a lock. The other five verbs
+  are quick and take the default tier. `TestSerializedLaneJobTypes` pins the
+  set; extend it there when adding a manifest/lockfile-shaped verb.
+- **Host ports come from `services.AppPodPortRange` (18900-18999)**, distinct
+  from the apps catalog (8100-8199), the 8200 module block, and the BYOC
+  instance range; `AllocateAppPodPort` allocates over an in-use predicate.
+- **cgroup limits are preflighted before create** (`rt.PreflightLimitControllers`,
+  E2): a rootless-podman node that cannot enforce cpu/memory/pids refuses fast
+  rather than running unlimited (DoR §3.7/§6, the highest-probability landmine).
+  Every container carries `--cap-drop=ALL`, so an app must listen above 1024.
+- **The AEP receipt** (`aep.BuildSignedAppDeployReceipt`, a thin
+  `BuildSignedReceiptV2` wrapper) has `action="app_deploy"`, empty
+  engine/model/verdict_hash, zero grounding, `input_sha256` = the coordinator's
+  `manifest_sha256` (fallback: node-canonical), `output_sha256` =
+  sha256("<image_digest>\n<pod_id>"). It gates on `CITADEL_SIGN_AEP_RECEIPTS`
+  ALONE (no grounding prerequisite) and fails open.
+- **Heartbeat Apps entries** for `aceapp-*` pods ride
+  `CollectorConfig.AppPods` (injected from cmd's `appPodListings`, so
+  `internal/status` stays free of the runtime/catalog import, mirroring
+  Reservations/PinnedServices); the entry `Name` is the short code A7's
+  reconcile keys on.
+
+Deliberately deferred (documented, not silent): git/workspace source delivery
+and dependency install (A2 runtime images); the coordinator MCP tools + the
+`node:apps` API-key scope (A4, aceteam-side; citadel's gate is the per-node
+stream); the public relay/ingress + subdomain (A5); placement/tenancy and idle
+sleep/metering (A6/A7); GPU app requests; `preflightRuntime` is NOT called (it
+is docker-shaped) so a missing OCI runtime fails at `run`, loud not silent;
+`--read-only` rootfs and a forced non-root `--user` (the runtime image owns
+the non-root user).
+
 ### Verified mesh identity + mesh-only transport for cache-transfer (`internal/meshtransfer`, citadel-cli#1068, aceteam#8553 S3.0)
 
 The first, identity-only slice of source-local peer-cache delegation. It preserves

@@ -230,6 +230,46 @@ func BuildSignedReceiptV2(signer Signer, nodeID, jobID, engine, model string, in
 	return receipt, nil
 }
 
+// AppDeployAction is the AEPReceiptV2.Action value for a hosted-app deployment
+// receipt (aceteam-ai/citadel-cli#9672, CRAM slice A1). Unlike the inference
+// receipt's Trust Engine verdicts (pass/flag/block), an app_deploy receipt
+// attests a deployment EVENT, not a content check: it carries no grounding
+// (grounded=false, score=0, claims_checked=0) and an empty verdict_hash. The
+// aceteam verifier (A4/A5) branches on this action to skip the verdict-hash
+// recomputation the inference path performs.
+const AppDeployAction = "app_deploy"
+
+// BuildSignedAppDeployReceipt signs a v2 receipt for a hosted-app deployment.
+// It is a thin wrapper over BuildSignedReceiptV2 that reuses that function's
+// finite-score guard, newline refuse-to-sign guard, and empty-flagged-list
+// hashing (so a verifier recomputing the canon gets the exact
+// hashFlaggedClaims(nil) value, not ""), fixing the app_deploy shape:
+//
+//   - Action       = AppDeployAction ("app_deploy")
+//   - InputSHA256  = sha256 of the canonical app manifest (already "sha256:<hex>")
+//   - OutputSHA256 = sha256 of "<image_digest>\n<pod_id>" (already "sha256:<hex>")
+//   - PolicyHash   = EmptyPolicyHash (no on-node policy delivery yet, S5)
+//   - VerdictHash  = "" (a deploy has no Trust Engine verdict)
+//   - Engine/Model = "" (a deploy has neither)
+//
+// and an empty trust.GroundingResult (grounded=false, score=0, claims=0). The
+// caller resolves nodeID via aep.ResolveNodeID and gates signing on
+// CITADEL_SIGN_AEP_RECEIPTS, exactly as the inference receipt path does.
+func BuildSignedAppDeployReceipt(signer Signer, nodeID, jobID, inputSHA256, outputSHA256 string, now time.Time) (*AEPReceiptV2, error) {
+	return BuildSignedReceiptV2(
+		signer, nodeID, jobID, "", "",
+		V2Inputs{
+			InputSHA256:  inputSHA256,
+			OutputSHA256: outputSHA256,
+			PolicyHash:   EmptyPolicyHash,
+			Action:       AppDeployAction,
+			VerdictHash:  "",
+		},
+		trust.GroundingResult{},
+		now,
+	)
+}
+
 // ToMap returns the receipt as a map[string]any (via its own json tags), the
 // same shape rule as AEPReceiptV1.ToMap — callers MUST use this rather than
 // attaching *AEPReceiptV2 to job output directly (a typed Go pointer in a map

@@ -234,6 +234,15 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Log: opts.HandlerLog,
 	}))
 
+	// APP_* (CRAM slice A1, aceteam#9672): the hosted-app pod-per-app runner.
+	// Same privilege posture as EXPOSE_SET (per-node stream only, fail closed).
+	// The live ops drive the container runtime seam, the shared expose funnel,
+	// and AEP receipt signing.
+	runner.RegisterHandler(worker.NewAppHandler(worker.AppHandlerConfig{
+		Ops: liveAppOps{},
+		Log: opts.HandlerLog,
+	}))
+
 	// INSTANCE_* is a mutating hypervisor capability: only register it when the
 	// required Proxmox configuration is enabled. A node without that config must
 	// not advertise work it will refuse.

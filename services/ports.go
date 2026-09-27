@@ -454,6 +454,37 @@ const (
 	AppsPortRangeEnd   = 8199
 )
 
+// AppPodPortRange is the inclusive host-port range hosted-app pods
+// (aceteam-ai/citadel-cli#9672, CRAM slice A1) publish their loopback port
+// from. It is deliberately clear of the apps catalog range
+// (AppsPortRangeStart-End), the 8200 module block, citadel's own reserved
+// listeners (ReservedCitadelPorts), AND the BYOC instance range the platform
+// assigns verbatim (18800-18899), so a hosted-app allocation can never collide
+// with any of them. The 100 slots also cap a node at 100 concurrent app pods,
+// the v1 cap in the design's port-exhaustion note.
+const (
+	AppPodPortRangeStart = 18900
+	AppPodPortRangeEnd   = 18999
+)
+
+// AllocateAppPodPort returns the lowest free host port in the hosted-app pod
+// range for which inUse reports false, or an error when the range is
+// exhausted. It is pure over the injected predicate: the live caller builds
+// inUse from the ports already published by aceapp-* pods plus a loopback bind
+// probe, and a test drives it with a fake. Allocation needs no lock because
+// APP_DEPLOY runs on the serialized (exec-concurrency-1) worker lane
+// (internal/worker/deadline.go serializedLaneJobTypes), so at most one
+// allocation is ever in flight on a node.
+func AllocateAppPodPort(inUse func(int) bool) (int, error) {
+	for p := AppPodPortRangeStart; p <= AppPodPortRangeEnd; p++ {
+		if inUse == nil || !inUse(p) {
+			return p, nil
+		}
+	}
+	return 0, fmt.Errorf("no free hosted-app host port in range %d-%d (node at the %d-app cap)",
+		AppPodPortRangeStart, AppPodPortRangeEnd, AppPodPortRangeEnd-AppPodPortRangeStart+1)
+}
+
 // fixedComposeHostPorts are embedded compose services that publish a FIXED,
 // well-known host port NOT managed through the ${CITADEL_*_HOST_PORT} registry
 // and deliberately NOT listed in ReservedCitadelPorts -- they are owned by their

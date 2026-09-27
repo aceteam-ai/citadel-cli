@@ -133,6 +133,9 @@ func parseUnexposeRequest(payload map[string]any) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("unexpose request is missing a name")
 	}
+	if strings.HasPrefix(name, reservedAppExposePrefix) {
+		return "", fmt.Errorf("exposure name %q uses the reserved %q prefix (hosted-app pod routes); use APP_DESTROY to remove a hosted app", name, reservedAppExposePrefix)
+	}
 	return name, nil
 }
 

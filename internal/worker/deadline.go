@@ -92,6 +92,13 @@ var unboundedJobTypes = map[string]struct{}{
 	JobTypeInstanceProvision: {},
 	JobTypeAgentUpdate:       {},
 	JobTypeWhatsAppProvision: {},
+	// APP_DEPLOY pulls an image and creates a pod inline, with opaque duration
+	// (pull size), so it gets no fallback deadline (CRAM A1, aceteam#9672).
+	// Unbounded membership ALSO routes it onto the serialized (exec-1) lane via
+	// serializedLaneJobTypes' superset, which is what makes host-port allocation
+	// race-free without a lock (services.AllocateAppPodPort). The other APP_*
+	// verbs (stop/start/status/logs/destroy) are quick and take the default tier.
+	JobTypeAppDeploy: {},
 }
 
 // serializedLaneJobTypes decides which job types are routed onto the general

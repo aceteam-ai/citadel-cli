@@ -43,6 +43,7 @@ type Collector struct {
 	cacheReport     func() *CacheReport              // live cache-index attribution (citadel #682 P3), optional
 	jobTypes        func() []string                  // live registered worker job types (aceteam #9962), optional
 	permissions     func() *config.Permissions       // authoritative node permission policy, optional
+	appPods         func() []AppInfo                 // live hosted-app pod entries (CRAM A1, aceteam#9672), optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -118,6 +119,12 @@ type CollectorConfig struct {
 	// ConfigDir resolved inside status: a worker may run as root while a status
 	// caller has a different HOME. Nil preserves the secure default-deny posture.
 	PermissionsProvider func() *config.Permissions
+	// AppPods, when set, returns the node's hosted-app pod entries (CRAM slice
+	// A1, aceteam#9672) appended to NodeStatus.Apps. Injected from cmd (built off
+	// jobs.AppPodRunner.List) so internal/status stays free of the container
+	// runtime / catalog import, mirroring Reservations/PinnedServices. Optional:
+	// nil on a pure status node or a legacy build leaves Apps unchanged.
+	AppPods func() []AppInfo
 }
 
 // NewCollector creates a new status collector.
@@ -144,6 +151,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		cacheReport:     cfg.CacheReport,
 		jobTypes:        cfg.JobTypes,
 		permissions:     cfg.PermissionsProvider,
+		appPods:         cfg.AppPods,
 	}
 }
 
@@ -396,8 +404,14 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 		}
 	}
 
-	// Collect installed app status
+	// Collect installed app status (catalog apps) plus any hosted-app pods
+	// (CRAM slice A1, aceteam#9672). The hosted-app lister is injected from cmd
+	// (CollectorConfig.AppPods) so internal/status does not import the container
+	// runtime / catalog layer, mirroring PinnedServices/Reservations.
 	status.Apps = c.collectAppStatus()
+	if c.appPods != nil {
+		status.Apps = append(status.Apps, c.appPods()...)
+	}
 
 	// Attach live resource footprints (CPU/RAM/VRAM/GPU) to running managed
 	// services and apps in one batched pass (citadel #421). This is what makes
