@@ -94,6 +94,12 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 			return agentWorkerRestart()
 		},
 		Expose: func(spec status.ExposeSpec) (any, error) {
+			// The "app-" prefix is reserved for hosted-app pod routes (CRAM A1);
+			// only the app runner may mint one. Refuse it on the operator control
+			// path so an operator cannot shadow an app route.
+			if err := refuseReservedAppExposeName(spec.Name, "pick another name"); err != nil {
+				return nil, err
+			}
 			// Delegates to the same live adapter the EXPOSE_SET job uses, so the
 			// CLI/MCP path and the job path cannot drift.
 			return liveExposeOps{}.Expose(ctx, worker.ExposeRequest{
@@ -108,6 +114,9 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 			})
 		},
 		Unexpose: func(name string) (any, error) {
+			if err := refuseReservedAppExposeName(name, "use APP_DESTROY to remove a hosted app"); err != nil {
+				return nil, err
+			}
 			return liveExposeOps{}.Unexpose(ctx, name)
 		},
 	}

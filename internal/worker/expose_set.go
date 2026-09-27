@@ -156,6 +156,14 @@ func (h *ExposeSetHandler) CanHandle(jobType string) bool {
 // kept local to avoid a worker->gateway dependency).
 var validVisibilities = map[string]bool{"private": true, "org": true, "link": true, "platform": true}
 
+// reservedAppExposePrefix mirrors gateway.AppExposePrefix (the authority; kept
+// local for the same worker->gateway no-import reason as validVisibilities).
+// The operator expose/unexpose verbs refuse this prefix so an operator can
+// never shadow or tear down a hosted-app pod route "app-<short_code>", which
+// only the app runner (cmd.liveAppOps, bypassing these parsers) may mint
+// (CRAM A1, aceteam#9672).
+const reservedAppExposePrefix = "app-"
+
 // Execute programs the gateway to expose one local service. See the package doc
 // for the privilege gate.
 func (h *ExposeSetHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
@@ -223,6 +231,9 @@ func parseExposeRequest(payload map[string]any) (ExposeRequest, error) {
 	req.Visibility = strings.ToLower(strings.TrimSpace(req.Visibility))
 	if req.Name == "" {
 		return req, fmt.Errorf("expose request is missing a name")
+	}
+	if strings.HasPrefix(req.Name, reservedAppExposePrefix) {
+		return req, fmt.Errorf("exposure name %q uses the reserved %q prefix (hosted-app pod routes); pick another name", req.Name, reservedAppExposePrefix)
 	}
 	// Port and Path are mutually exclusive source types (issue #943): a proxy
 	// target and a directory share cannot both back the same exposure.

@@ -155,6 +155,16 @@ const (
 	JobTypeShowPairingCode    = "SHOW_PAIRING_CODE"    // Render a node:exec pairing code on this node's console (issue #659)
 	JobTypeClearPairingCode   = "CLEAR_PAIRING_CODE"   // Clear a displayed node:exec pairing code (issue #659)
 
+	// Hosted-app pod-per-app runner (CRAM slice A1, aceteam#9672). Privileged in
+	// the EXPOSE_SET sense: honored only on the per-node stream, fail closed on
+	// the shared pool. See internal/worker/app_deploy.go.
+	JobTypeAppDeploy  = "APP_DEPLOY"  // Deploy a hosted app as a pod-per-app and wire its gateway route
+	JobTypeAppStop    = "APP_STOP"    // Stop a hosted app's pod (release memory; keep the route + volumes)
+	JobTypeAppStart   = "APP_START"   // Start a stopped hosted app's pod
+	JobTypeAppStatus  = "APP_STATUS"  // Report a hosted app pod's live state
+	JobTypeAppLogs    = "APP_LOGS"    // Tail a hosted app pod's logs
+	JobTypeAppDestroy = "APP_DESTROY" // Remove a hosted app's pod, its volumes, and its gateway route
+
 	// Fabric instance provisioning on a local hypervisor (aceteam#5963). These
 	// act on hypervisor VMs; JobTypeInstanceMessage above predates this family
 	// and addresses hosted agent instances, not VMs.
@@ -226,6 +236,12 @@ var allKnownJobTypes = []string{
 	JobTypeDocumentRasterize,
 	JobTypeShowPairingCode,
 	JobTypeClearPairingCode,
+	JobTypeAppDeploy,
+	JobTypeAppStop,
+	JobTypeAppStart,
+	JobTypeAppStatus,
+	JobTypeAppLogs,
+	JobTypeAppDestroy,
 	JobTypeInstanceProvision,
 	JobTypeInstanceStart,
 	JobTypeInstanceStop,
