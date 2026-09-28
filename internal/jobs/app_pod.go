@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -187,22 +186,17 @@ func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, erro
 		StateMountPath: mountPath,
 	}
 
-	// State volume: the node DERIVES the mount under its own per-app directory
-	// (citadel-cache/apps/<short_code>). A payload state_volume_path is IGNORED.
-	// Honoring one allowed a check-then-use race -- the value validated at parse
-	// time was not the value handed to the engine, and a symlink could be swapped
-	// in between -- and let the caller choose the host path; the A4 dispatch gate
-	// does not forward the field. Deriving the path removes both. The stored value
-	// is the symlink-RESOLVED absolute path, so the engine's -v mounts exactly
-	// what the node validated.
-	resolvedStateDir, err := resolveAppStateDir(homeDir, shortCode)
-	if err != nil {
-		return nil, err
-	}
-	if strings.ContainsAny(resolvedStateDir, ":,") {
-		return nil, fmt.Errorf("resolved state dir %q must not contain ':' or ','", resolvedStateDir)
-	}
-	spec.StateVolume = resolvedStateDir
+	// State volume: an app always gets an engine-managed per-app NAMED VOLUME,
+	// removed on destroy. A payload state_volume_path is IGNORED. Honoring a host
+	// path allowed a check-then-use race (the value validated at parse time was
+	// not the one handed to the engine, and a symlink could be swapped in between)
+	// and let the caller pick the host path, while the A4 dispatch gate does not
+	// forward the field. A named volume has no host path at all, so it removes the
+	// escape surface entirely, avoids a root-owned directory under rootful docker,
+	// and is garbage-collected on destroy (no stale state when a short_code is
+	// reused).
+	spec.NamedVolume = podName + "-data"
+	spec.StateVolume = spec.NamedVolume
 
 	// PORT is injected so a base-path-agnostic app listens on the port we publish
 	// (DoR §3.2 "port from env"); an explicit payload PORT wins.
@@ -594,31 +588,6 @@ var jobsAppShortCodeRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 func isValidJobsAppShortCode(code string) bool {
 	return jobsAppShortCodeRe.MatchString(code)
-}
-
-// resolveAppStateDir derives an app's per-app state directory
-// (<home>/citadel-cache/apps/<shortCode>), resolves symlinks in the existing
-// portion, and verifies the result is within citadel-cache. It returns the
-// symlink-RESOLVED absolute path, so the value handed to the engine's -v is the
-// one the node validated, not an unresolved path a later symlink swap could
-// redirect. The leaf need not exist yet (the deploy creates it).
-func resolveAppStateDir(homeDir, shortCode string) (string, error) {
-	if homeDir == "" {
-		return "", fmt.Errorf("cannot resolve app state dir: home directory unknown")
-	}
-	raw := filepath.Join(homeDir, "citadel-cache", "apps", shortCode)
-	resolved, err := resolveNearestAncestor(raw)
-	if err != nil {
-		return "", fmt.Errorf("resolve app state dir %q: %w", raw, err)
-	}
-	cacheRoot, err := resolveNearestAncestor(filepath.Join(homeDir, "citadel-cache"))
-	if err != nil {
-		return "", fmt.Errorf("resolve citadel-cache root: %w", err)
-	}
-	if !withinDir(cacheRoot, resolved) {
-		return "", fmt.Errorf("app state dir %q resolves to %q, outside citadel-cache", raw, resolved)
-	}
-	return resolved, nil
 }
 
 // --- helpers ---------------------------------------------------------------

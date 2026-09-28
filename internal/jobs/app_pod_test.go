@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -41,12 +40,14 @@ func TestParseAppSpec_Valid(t *testing.T) {
 	if spec.Env["PORT"] != "8501" {
 		t.Errorf("injected PORT = %q, want 8501", spec.Env["PORT"])
 	}
-	// The node derives the per-app state dir; there is no named volume.
-	if spec.NamedVolume != "" {
-		t.Errorf("apps use a derived per-app bind, not a named volume, got %q", spec.NamedVolume)
+	// An app gets an engine-managed per-app named volume (removed on destroy),
+	// never a host bind.
+	wantVol := AppPodNamePrefix + "ac-blue-cat-fox-data"
+	if spec.NamedVolume != wantVol {
+		t.Errorf("named volume = %q, want %q", spec.NamedVolume, wantVol)
 	}
-	if !strings.HasSuffix(spec.StateVolume, "/citadel-cache/apps/ac-blue-cat-fox") {
-		t.Errorf("state volume = %q, want a per-app dir ending citadel-cache/apps/ac-blue-cat-fox", spec.StateVolume)
+	if spec.StateVolume != wantVol {
+		t.Errorf("state volume = %q, want the named volume %q", spec.StateVolume, wantVol)
 	}
 	if spec.StateMountPath != "/data" {
 		t.Errorf("mount path = %q, want /data", spec.StateMountPath)
@@ -138,22 +139,21 @@ func TestParseAppSpec_Rejects(t *testing.T) {
 	})
 }
 
-func TestParseAppSpec_DerivesStateDirIgnoringPayload(t *testing.T) {
-	home := t.TempDir()
+func TestParseAppSpec_IgnoresPayloadStateVolumePath(t *testing.T) {
 	in := baseAppInput()
-	// A payload path pointing at ANOTHER app's dir must not be honored; the node
-	// derives the mount from THIS app's short code.
+	// A payload state_volume_path (here pointing at ANOTHER app's dir) must not be
+	// honored: apps always get their own engine-managed per-app named volume.
 	in.StateVolumePath = "~/citadel-cache/apps/other-app/data"
-	spec, err := ParseAppSpec(in, 18901, home)
+	spec, err := ParseAppSpec(in, 18901, "/home/jason")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.NamedVolume != "" {
-		t.Errorf("derived-bind app should have no named volume, got %q", spec.NamedVolume)
+	wantVol := AppPodNamePrefix + in.ShortCode + "-data"
+	if spec.NamedVolume != wantVol {
+		t.Errorf("named volume = %q, want %q", spec.NamedVolume, wantVol)
 	}
-	wantSuffix := filepath.Join("citadel-cache", "apps", in.ShortCode)
-	if !strings.HasSuffix(spec.StateVolume, wantSuffix) {
-		t.Errorf("state volume = %q, want the derived per-app dir ending %q (payload ignored)", spec.StateVolume, wantSuffix)
+	if spec.StateVolume != wantVol {
+		t.Errorf("state volume = %q, want the named volume %q (payload ignored)", spec.StateVolume, wantVol)
 	}
 	if strings.Contains(spec.StateVolume, "other-app") {
 		t.Errorf("payload path leaked into the mount: %q", spec.StateVolume)
@@ -309,12 +309,12 @@ func TestAppPodRunner_DeployPodman(t *testing.T) {
 	if !fe.argvContains("pull ghcr.io/aceteam-ai/streamlit-runtime:latest") {
 		t.Error("image was not pulled")
 	}
-	// Apps use a derived per-app bind, not a named volume, so nothing is created.
-	if fe.argvContains("volume create") {
-		t.Error("apps must not create a named volume (they use a derived per-app bind)")
+	// Apps use an engine-managed per-app named volume: created before run, mounted in -v.
+	if !fe.argvContains("volume create aceapp-ac-blue-cat-fox-data") {
+		t.Error("per-app named volume was not created")
 	}
-	if !fe.argvContains("citadel-cache/apps/ac-blue-cat-fox:/data") {
-		t.Error("container run must bind the derived per-app state dir")
+	if !fe.argvContains("aceapp-ac-blue-cat-fox-data:/data") {
+		t.Error("container run must mount the per-app named volume")
 	}
 	if !fe.argvContains("pod create --name aceapp-ac-blue-cat-fox") {
 		t.Error("pod was not created")
