@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -132,6 +133,12 @@ func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, erro
 	if shortCode == "" {
 		return nil, fmt.Errorf("app spec missing short_code")
 	}
+	// The short code is used to derive a host path (the per-app state dir), so a
+	// crafted value must never steer it. Require the same grammar the gateway
+	// route name needs: lowercase alphanumerics and single dashes.
+	if !isValidJobsAppShortCode(shortCode) {
+		return nil, fmt.Errorf("invalid short_code %q (want lowercase alphanumerics and single dashes)", shortCode)
+	}
 	image := strings.TrimSpace(in.Image)
 	if err := validateImageRef(image); err != nil {
 		return nil, err
@@ -159,6 +166,11 @@ func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, erro
 	if !strings.HasPrefix(mountPath, "/") {
 		return nil, fmt.Errorf("state_mount_path %q must be an absolute container path", mountPath)
 	}
+	// The -v argument is "source:dest"; a ':' or ',' in either side would split
+	// the mount or add options the caller did not intend.
+	if strings.ContainsAny(mountPath, ":,") {
+		return nil, fmt.Errorf("state_mount_path %q must not contain ':' or ','", mountPath)
+	}
 
 	podName := AppPodNamePrefix + shortCode
 	spec := &AppSpec{
@@ -175,35 +187,22 @@ func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, erro
 		StateMountPath: mountPath,
 	}
 
-	// State volume: an explicit, bounded host path (bind), else a per-app named
-	// volume the destroy path removes.
-	if raw := strings.TrimSpace(in.StateVolumePath); raw != "" {
-		abs, err := resolveStateVolumePath(raw, homeDir)
-		if err != nil {
-			return nil, err
-		}
-		// Per-app confinement: an app's bind mount must resolve within its OWN
-		// per-app subdirectory, never the shared cache root, another app's dir,
-		// or ~/.citadel. This is stricter than the shared resolver (which also
-		// admits instances) and is what stops one app's state_volume_path from
-		// reaching another app's data. Symlink-resolved, same as the resolver.
-		perAppRoot := filepath.Join(homeDir, "citadel-cache", "apps", shortCode)
-		resolvedRoot, err := resolveNearestAncestor(perAppRoot)
-		if err != nil {
-			return nil, fmt.Errorf("resolve per-app state dir %q: %w", perAppRoot, err)
-		}
-		resolvedAbs, err := resolveNearestAncestor(abs)
-		if err != nil {
-			return nil, fmt.Errorf("resolve state_volume_path %q: %w", raw, err)
-		}
-		if !withinDir(resolvedRoot, resolvedAbs) {
-			return nil, fmt.Errorf("state_volume_path %q must resolve within the per-app directory %s", raw, perAppRoot)
-		}
-		spec.StateVolume = abs
-	} else {
-		spec.NamedVolume = podName + "-data"
-		spec.StateVolume = spec.NamedVolume
+	// State volume: the node DERIVES the mount under its own per-app directory
+	// (citadel-cache/apps/<short_code>). A payload state_volume_path is IGNORED.
+	// Honoring one allowed a check-then-use race -- the value validated at parse
+	// time was not the value handed to the engine, and a symlink could be swapped
+	// in between -- and let the caller choose the host path; the A4 dispatch gate
+	// does not forward the field. Deriving the path removes both. The stored value
+	// is the symlink-RESOLVED absolute path, so the engine's -v mounts exactly
+	// what the node validated.
+	resolvedStateDir, err := resolveAppStateDir(homeDir, shortCode)
+	if err != nil {
+		return nil, err
 	}
+	if strings.ContainsAny(resolvedStateDir, ":,") {
+		return nil, fmt.Errorf("resolved state dir %q must not contain ':' or ','", resolvedStateDir)
+	}
+	spec.StateVolume = resolvedStateDir
 
 	// PORT is injected so a base-path-agnostic app listens on the port we publish
 	// (DoR §3.2 "port from env"); an explicit payload PORT wins.
@@ -512,13 +511,21 @@ func (r *AppPodRunner) Logs(ctx context.Context, shortCode string, tail int) (st
 func (r *AppPodRunner) Destroy(ctx context.Context, shortCode string) error {
 	podName := AppPodNamePrefix + shortCode
 	teardownErr := r.teardown(ctx, shortCode, podName)
-	// Remove the per-app named volume (best-effort; a bind-mount app has none).
+	// Remove the per-app named volume (best-effort; a derived-bind app has none,
+	// but an app deployed before the bind change may).
 	_, _ = r.run(r.rt.Volume(ctx, "rm", "-f", podName+"-data"))
-	// Idempotent AND honest: a "no such container" on an already-gone app is
-	// success, but a teardown that left the pod/container in place must NOT be
-	// reported as a successful destroy (the A1 review's masked-failure finding).
-	// Verify by state -- gone means done; still present means surface the error.
-	if _, stillPresent := r.containerID(ctx, shortCode, true); stillPresent {
+	// Idempotent AND honest. A "no such container" on an already-gone app is
+	// success, but a teardown that left the container in place -- OR an engine we
+	// cannot reach to confirm removal -- must NEVER be reported as a successful
+	// destroy (the A1 review's masked-failure finding and its engine-down variant).
+	_, present, checkErr := r.containerPresence(ctx, shortCode, true)
+	if checkErr != nil {
+		if teardownErr != nil {
+			return fmt.Errorf("app %q teardown failed and removal is unverifiable: %w", shortCode, teardownErr)
+		}
+		return fmt.Errorf("app %q removal is unverifiable: %w", shortCode, checkErr)
+	}
+	if present {
 		if teardownErr != nil {
 			return fmt.Errorf("app %q teardown failed: %w", shortCode, teardownErr)
 		}
@@ -578,6 +585,42 @@ func (r *AppPodRunner) UsedAppPorts(ctx context.Context) map[int]bool {
 	return used
 }
 
+// isValidJobsAppShortCode reports whether the short code is lowercase
+// alphanumerics with single dashes. It mirrors internal/worker's
+// isValidAppShortCode; the check is duplicated here because internal/worker
+// imports internal/jobs (not the reverse) and the short code is used to derive a
+// host path in this package.
+var jobsAppShortCodeRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+func isValidJobsAppShortCode(code string) bool {
+	return jobsAppShortCodeRe.MatchString(code)
+}
+
+// resolveAppStateDir derives an app's per-app state directory
+// (<home>/citadel-cache/apps/<shortCode>), resolves symlinks in the existing
+// portion, and verifies the result is within citadel-cache. It returns the
+// symlink-RESOLVED absolute path, so the value handed to the engine's -v is the
+// one the node validated, not an unresolved path a later symlink swap could
+// redirect. The leaf need not exist yet (the deploy creates it).
+func resolveAppStateDir(homeDir, shortCode string) (string, error) {
+	if homeDir == "" {
+		return "", fmt.Errorf("cannot resolve app state dir: home directory unknown")
+	}
+	raw := filepath.Join(homeDir, "citadel-cache", "apps", shortCode)
+	resolved, err := resolveNearestAncestor(raw)
+	if err != nil {
+		return "", fmt.Errorf("resolve app state dir %q: %w", raw, err)
+	}
+	cacheRoot, err := resolveNearestAncestor(filepath.Join(homeDir, "citadel-cache"))
+	if err != nil {
+		return "", fmt.Errorf("resolve citadel-cache root: %w", err)
+	}
+	if !withinDir(cacheRoot, resolved) {
+		return "", fmt.Errorf("app state dir %q resolves to %q, outside citadel-cache", raw, resolved)
+	}
+	return resolved, nil
+}
+
 // --- helpers ---------------------------------------------------------------
 
 func (r *AppPodRunner) run(cmd *exec.Cmd) ([]byte, error) { return r.execFn(cmd) }
@@ -599,9 +642,12 @@ func (r *AppPodRunner) exists(ctx context.Context, shortCode string) bool {
 	return ok
 }
 
-// containerID returns the first container id carrying aceteam.app=<shortCode>.
+// containerPresence returns the first container id carrying aceteam.app=<shortCode>
+// and DISTINGUISHES "listed successfully but not found" (present=false, err=nil)
+// from a listing or engine failure (err!=nil). Destroy relies on that
+// distinction: an engine it cannot reach must never be read as "the app is gone".
 // includeStopped selects `ps -a` (any state) vs `ps` (running only).
-func (r *AppPodRunner) containerID(ctx context.Context, shortCode string, includeStopped bool) (string, bool) {
+func (r *AppPodRunner) containerPresence(ctx context.Context, shortCode string, includeStopped bool) (string, bool, error) {
 	args := []string{"ps"}
 	if includeStopped {
 		args = append(args, "-a")
@@ -609,14 +655,21 @@ func (r *AppPodRunner) containerID(ctx context.Context, shortCode string, includ
 	args = append(args, "--filter", "label="+AppLabelShortCode+"="+shortCode, "--format", "{{.ID}}")
 	out, err := r.run(r.rt.EngineCommandContext(ctx, args...))
 	if err != nil {
-		return "", false
+		return "", false, fmt.Errorf("list container for app %q: %s", shortCode, trimOut(out, err))
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if id := strings.TrimSpace(line); id != "" {
-			return id, true
+			return id, true, nil
 		}
 	}
-	return "", false
+	return "", false, nil
+}
+
+// containerID is the error-swallowing read-only wrapper the listing and port
+// helpers use, where treating an engine error as "absent" is acceptable.
+func (r *AppPodRunner) containerID(ctx context.Context, shortCode string, includeStopped bool) (string, bool) {
+	id, ok, _ := r.containerPresence(ctx, shortCode, includeStopped)
+	return id, ok
 }
 
 // listShortCodes returns every hosted-app short code (running or stopped),
