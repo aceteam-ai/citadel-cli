@@ -26,6 +26,7 @@ require (
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/redis/go-redis/v9 v9.17.2
 	github.com/rivo/tview v0.42.0
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10

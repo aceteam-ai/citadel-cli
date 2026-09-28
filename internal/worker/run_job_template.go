@@ -80,8 +80,7 @@ type TemplateRunRequest struct {
 
 	// InputSchema and OutputSchema are the template's JSON Schemas. They are part
 	// of the hashed manifest, so they MUST be present to recompute the content
-	// hash. They are an ADDITION to the issue's listed payload (which omitted
-	// them); the coordinator dispatch must send them - documented on the PR.
+	// hash. The platform dispatcher sends both fields (aceteam#10445).
 	InputSchema  json.RawMessage `json:"input_schema"`
 	OutputSchema json.RawMessage `json:"output_schema"`
 }
@@ -117,7 +116,9 @@ type TemplateRunOps interface {
 // RunJobTemplateHandlerConfig configures a RunJobTemplateHandler.
 type RunJobTemplateHandlerConfig struct {
 	Ops TemplateRunOps
-	Log func(format string, args ...any)
+	// NodeID comes from local runner configuration, not the payload.
+	NodeID string
+	Log    func(format string, args ...any)
 }
 
 // RunJobTemplateHandler processes RUN_JOB_TEMPLATE jobs.
@@ -140,10 +141,7 @@ func (h *RunJobTemplateHandler) CanHandle(jobType string) bool {
 
 // runnerDescriptor is the closed runner vocabulary. Only Kind == "builtin"
 // dispatches; there is deliberately no "shell" kind.
-type runnerDescriptor struct {
-	Kind    string `json:"kind"`
-	Handler string `json:"handler"`
-}
+type runnerDescriptor = jobs.TemplateRunner
 
 // Execute runs one RUN_JOB_TEMPLATE job. See the package doc for the privilege
 // gate and the two security invariants enforced here before any ops runs.
@@ -164,45 +162,72 @@ func (h *RunJobTemplateHandler) Execute(ctx context.Context, job *Job, stream St
 		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: %w", err)), nil
 	}
 	req.JobID = job.ID
-
-	// Invariant 1 - anti-tamper: recompute the manifest hash and refuse on
-	// mismatch, BEFORE running anything.
-	recomputed, err := jobs.ComputeTemplateManifestHash(req.TemplateKey, req.TemplateVersion, req.InputSchema, req.OutputSchema, req.Runner)
-	if err != nil {
-		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: canonicalize manifest for %q v%d: %w", req.TemplateKey, req.TemplateVersion, err)), nil
+	if h.cfg.NodeID == "" || !strings.HasSuffix(job.SourceQueue, ":node:"+h.cfg.NodeID) {
+		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: source queue does not match executing node")), nil
 	}
-	if !hashesEqual(recomputed, req.ContentHash) {
-		return h.failure(fmt.Errorf(
-			"RUN_JOB_TEMPLATE refused: recomputed manifest hash %s does not match approved content_hash %s for template %q v%d",
-			recomputed, normalizeHash(req.ContentHash), req.TemplateKey, req.TemplateVersion)), nil
-	}
-
-	// Invariant 2 - only a builtin runner kind dispatches; shell never does.
-	runner, err := parseRunnerDescriptor(req.Runner)
+	runner, err := ValidateTemplateRunRequest(req, h.cfg.NodeID)
 	if err != nil {
 		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: %w", err)), nil
 	}
-	if runner.Kind != "builtin" {
-		return h.failure(fmt.Errorf(
-			"RUN_JOB_TEMPLATE refused: runner kind %q is not permitted; only \"builtin\" runs, shell execution is never allowed",
-			runner.Kind)), nil
-	}
-	if runner.Handler == "" {
-		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE refused: builtin runner has no handler name")), nil
-	}
 
 	h.cfg.Log("RUN_JOB_TEMPLATE: template=%q v%d handler=%q", req.TemplateKey, req.TemplateVersion, runner.Handler)
-
 	res, err := h.cfg.Ops.Run(ctx, req)
 	if err != nil {
 		if errors.Is(err, ErrTemplateTransient) {
 			return h.retry(fmt.Errorf("RUN_JOB_TEMPLATE: run %q: %w", req.TemplateKey, err)), nil
 		}
-		// Unknown handler and every builtin failure are terminal.
 		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: run %q: %w", req.TemplateKey, err)), nil
+	}
+	if res == nil {
+		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: ops returned no result")), nil
 	}
 	h.cfg.Log("RUN_JOB_TEMPLATE: %q v%d produced %d output(s) in %dms", req.TemplateKey, req.TemplateVersion, len(res.Outputs), res.DurationMs)
 	return &JobResult{Status: JobStatusSuccess, Output: structToMap(res)}, nil
+}
+
+// ValidateTemplateRunRequest is shared by the worker and live adapter. All
+// manifest, runner, params and reference checks precede filesystem or ops effects.
+func ValidateTemplateRunRequest(req TemplateRunRequest, nodeID string) (jobs.TemplateRunner, error) {
+	var empty jobs.TemplateRunner
+	if nodeID == "" {
+		return empty, fmt.Errorf("executing node identity is not configured")
+	}
+	if req.TemplateKey == "" || req.TemplateVersion <= 0 || req.ContentHash == "" {
+		return empty, fmt.Errorf("missing template identity or content_hash")
+	}
+
+	// Invariant 1 - anti-tamper: recompute the manifest hash and refuse on
+	// mismatch, BEFORE running anything.
+	recomputed, err := jobs.ComputeTemplateManifestHash(req.TemplateKey, req.TemplateVersion, req.InputSchema, req.OutputSchema, req.Runner)
+	if err != nil {
+		return empty, fmt.Errorf("canonicalize manifest for %q v%d: %w", req.TemplateKey, req.TemplateVersion, err)
+	}
+	if !hashesEqual(recomputed, req.ContentHash) {
+		return empty, fmt.Errorf(
+			"RUN_JOB_TEMPLATE refused: recomputed manifest hash %s does not match approved content_hash %s for template %q v%d",
+			recomputed, normalizeHash(req.ContentHash), req.TemplateKey, req.TemplateVersion)
+	}
+
+	// Invariant 2 - only a builtin runner kind dispatches; shell never does.
+	runner, err := parseRunnerDescriptor(req.Runner)
+	if err != nil {
+		return empty, err
+	}
+	if runner.Kind != "builtin" {
+		return empty, fmt.Errorf(
+			"RUN_JOB_TEMPLATE refused: runner kind %q is not permitted; only \"builtin\" runs, shell execution is never allowed",
+			runner.Kind)
+	}
+	if runner.Handler == "" {
+		return empty, fmt.Errorf("RUN_JOB_TEMPLATE refused: builtin runner has no handler name")
+	}
+	if err := jobs.ValidateTemplateParams(req.Params, req.InputSchema, req.OutputSchema); err != nil {
+		return empty, err
+	}
+	if _, err := jobs.ParseTemplateInputFiles(req.InputFiles, nodeID); err != nil {
+		return empty, err
+	}
+	return runner, nil
 }
 
 // parseTemplateRunRequest decodes the payload. It requires every field needed to
@@ -251,22 +276,22 @@ func parseTemplateRunRequest(payload map[string]any) (TemplateRunRequest, error)
 	// params and input_files are optional; absence is fine.
 	if params, ok := tmplFieldRawJSON(payload, "params"); ok {
 		req.Params = params
+	} else if _, present := payload["params"]; present {
+		return req, fmt.Errorf("params must be JSON-encoded object")
+	} else {
+		req.Params = json.RawMessage(`{}`)
 	}
 	if inputFiles, ok := tmplFieldRawJSON(payload, "input_files"); ok {
 		req.InputFiles = inputFiles
+	} else if _, present := payload["input_files"]; present {
+		return req, fmt.Errorf("input_files must be JSON-encoded array")
 	}
 
 	return req, nil
 }
 
 func parseRunnerDescriptor(raw json.RawMessage) (runnerDescriptor, error) {
-	var r runnerDescriptor
-	if err := json.Unmarshal(raw, &r); err != nil {
-		return r, fmt.Errorf("decode runner descriptor: %w", err)
-	}
-	r.Kind = strings.TrimSpace(r.Kind)
-	r.Handler = strings.TrimSpace(r.Handler)
-	return r, nil
+	return jobs.ParseTemplateRunner(raw)
 }
 
 // tmplFieldString reads a trimmed string value from the payload map.

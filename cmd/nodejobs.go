@@ -248,8 +248,9 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 	// only, fail closed). The live ops dispatch to a compiled-in builtin, write
 	// outputs under the node workspace, and sign the AEP receipt.
 	runner.RegisterHandler(worker.NewRunJobTemplateHandler(worker.RunJobTemplateHandlerConfig{
-		Ops: liveTemplateRunOps{workspaceDir: opts.WorkspaceDir},
-		Log: opts.HandlerLog,
+		Ops:    liveTemplateRunOps{workspaceDir: opts.WorkspaceDir, nodeID: runner.NodeID()},
+		NodeID: runner.NodeID(),
+		Log:    opts.HandlerLog,
 	}))
 
 	// INSTANCE_* is a mutating hypervisor capability: only register it when the

@@ -57,7 +57,7 @@ func tmplPayload(t *testing.T, runner, inSchema, outSchema string) map[string]an
 }
 
 func tmplRunJob(ops TemplateRunOps, queue string, payload map[string]any) (*JobResult, error) {
-	h := NewRunJobTemplateHandler(RunJobTemplateHandlerConfig{Ops: ops})
+	h := NewRunJobTemplateHandler(RunJobTemplateHandlerConfig{Ops: ops, NodeID: "1008"})
 	job := &Job{ID: "job-1", Type: JobTypeRunJobTemplate, SourceQueue: queue, Payload: payload}
 	return h.Execute(context.Background(), job, nil)
 }

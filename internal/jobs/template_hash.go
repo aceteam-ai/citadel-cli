@@ -30,8 +30,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/big"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // computeTemplateManifestHash returns the sha256 hex of the canonical JSON of
@@ -71,19 +74,13 @@ func ComputeTemplateManifestHash(templateKey string, version int, inputSchema, o
 }
 
 // decodeCanonicalValue decodes raw JSON into a Go value using json.Number for
-// all numbers, so their original textual form (integer vs float) is preserved
-// through re-serialization. An empty input decodes to a JSON null.
+// all numbers, preserving the integer-vs-float distinction before Python-compatible
+// numeric normalization. An empty input decodes to a JSON null.
 func decodeCanonicalValue(raw json.RawMessage) (interface{}, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, nil
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var v interface{}
-	if err := dec.Decode(&v); err != nil {
-		return nil, err
-	}
-	return v, nil
+	return DecodeTemplateJSON(raw)
 }
 
 // writeCanonicalJSON serializes v to match Python json.dumps(sort_keys=True,
@@ -105,12 +102,27 @@ func writeCanonicalJSON(buf *bytes.Buffer, v interface{}) error {
 	case int:
 		buf.WriteString(strconv.Itoa(val))
 	case json.Number:
-		buf.WriteString(string(val))
+		if !strings.ContainsAny(string(val), ".eE") {
+			n, ok := new(big.Int).SetString(string(val), 10)
+			if !ok {
+				return fmt.Errorf("invalid integer %q", val)
+			}
+			buf.WriteString(n.String())
+			break
+		}
+		f, err := val.Float64()
+		if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
+			return fmt.Errorf("non-finite manifest number %q", val)
+		}
+		buf.WriteString(pythonFloat(f))
 	case float64:
 		// Fallback only: decodeCanonicalValue uses json.Number, so schema
 		// numbers never reach here. Kept so an int-typed caller value can't
 		// panic the serializer.
-		buf.WriteString(strconv.FormatFloat(val, 'g', -1, 64))
+		if math.IsInf(val, 0) || math.IsNaN(val) {
+			return fmt.Errorf("non-finite manifest number")
+		}
+		buf.WriteString(pythonFloat(val))
 	case map[string]interface{}:
 		keys := make([]string, 0, len(val))
 		for k := range val {
@@ -144,6 +156,21 @@ func writeCanonicalJSON(buf *bytes.Buffer, v interface{}) error {
 		return fmt.Errorf("canonical json: unsupported type %T", v)
 	}
 	return nil
+}
+
+// Python repr uses fixed notation for exponents [-4, 16), retains the .0
+// of integral floats and signed floating zero, and pads exponent digits.
+func pythonFloat(f float64) string {
+	text := strconv.FormatFloat(f, 'e', -1, 64)
+	i := strings.IndexByte(text, 'e')
+	exponent, _ := strconv.Atoi(text[i+1:])
+	if exponent >= -4 && exponent < 16 {
+		text = strconv.FormatFloat(f, 'f', -1, 64)
+		if !strings.Contains(text, ".") {
+			text += ".0"
+		}
+	}
+	return text
 }
 
 // writeCanonicalString re-implements Python's py_encode_basestring_ascii:

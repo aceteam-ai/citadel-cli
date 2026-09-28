@@ -68,12 +68,7 @@ func lookupBuiltinTemplateRunner(name string) (BuiltinTemplateRunner, bool) {
 // and the compiled-in builtin registry.
 type liveTemplateRunOps struct {
 	workspaceDir string
-}
-
-type templateInputFile struct {
-	Path     string `json:"path"`
-	NodeID   string `json:"node_id"`
-	NodePath string `json:"node_path"`
+	nodeID       string
 }
 
 // Run dispatches an already-verified template request to its builtin, collects
@@ -87,14 +82,11 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 		return nil, fmt.Errorf("workspace directory is not configured")
 	}
 
-	var runner struct {
-		Kind    string `json:"kind"`
-		Handler string `json:"handler"`
+	runner, err := worker.ValidateTemplateRunRequest(req, o.nodeID)
+	if err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(req.Runner, &runner); err != nil {
-		return nil, fmt.Errorf("decode runner: %w", err)
-	}
-	fn, ok := lookupBuiltinTemplateRunner(strings.TrimSpace(runner.Handler))
+	fn, ok := lookupBuiltinTemplateRunner(runner.Handler)
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", worker.ErrTemplateUnknownHandler, runner.Handler)
 	}
@@ -105,16 +97,19 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 	if err != nil {
 		return nil, fmt.Errorf("resolve output dir: %w", err)
 	}
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create output dir: %w", err)
-	}
-
 	inputs, inputHashes, err := o.resolveInputs(req.InputFiles)
 	if err != nil {
 		return nil, err
 	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create output dir: %w", err)
+	}
+	params := req.Params
+	if len(params) == 0 {
+		params = json.RawMessage(`{}`)
+	}
 
-	outRels, err := fn(ctx, req.Params, inputs, outDir)
+	outRels, err := fn(ctx, params, inputs, outDir)
 	if err != nil {
 		return nil, fmt.Errorf("builtin %q: %w", runner.Handler, err)
 	}
@@ -137,23 +132,14 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 // workspace and hashes it. A file not present on this node is out of scope for
 // this slice and is a terminal error.
 func (o liveTemplateRunOps) resolveInputs(raw json.RawMessage) ([]string, []string, error) {
-	if len(raw) == 0 {
-		return nil, nil, nil
+	files, err := jobs.ParseTemplateInputFiles(raw, o.nodeID)
+	if err != nil {
+		return nil, nil, err
 	}
-	var files []templateInputFile
-	if err := json.Unmarshal(raw, &files); err != nil {
-		return nil, nil, fmt.Errorf("decode input_files: %w", err)
-	}
-	var paths []string
-	var hashes []string
+	paths := make([]string, 0, len(files))
+	hashes := make([]string, 0, len(files))
 	for _, f := range files {
-		rel := strings.TrimSpace(f.NodePath)
-		if rel == "" {
-			rel = strings.TrimSpace(f.Path)
-		}
-		if rel == "" {
-			return nil, nil, fmt.Errorf("input file entry has no path")
-		}
+		rel := f.NodePath
 		abs, err := jobs.ValidateReadPath(o.workspaceDir, rel, false)
 		if err != nil {
 			return nil, nil, fmt.Errorf("resolve input %q: %w", rel, err)
@@ -180,8 +166,8 @@ func (o liveTemplateRunOps) collectOutputs(outDir string, outRels []string) ([]w
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve workspace: %w", err)
 	}
-	var outputs []worker.TemplateOutput
-	var digests []string
+	outputs := make([]worker.TemplateOutput, 0, len(outRels))
+	digests := make([]string, 0, len(outRels))
 	for _, rel := range outRels {
 		abs, err := jobs.ValidatePath(o.workspaceDir, filepath.Join(outDir, rel))
 		if err != nil {
