@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -180,6 +181,23 @@ func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, erro
 		abs, err := resolveStateVolumePath(raw, homeDir)
 		if err != nil {
 			return nil, err
+		}
+		// Per-app confinement: an app's bind mount must resolve within its OWN
+		// per-app subdirectory, never the shared cache root, another app's dir,
+		// or ~/.citadel. This is stricter than the shared resolver (which also
+		// admits instances) and is what stops one app's state_volume_path from
+		// reaching another app's data. Symlink-resolved, same as the resolver.
+		perAppRoot := filepath.Join(homeDir, "citadel-cache", "apps", shortCode)
+		resolvedRoot, err := resolveNearestAncestor(perAppRoot)
+		if err != nil {
+			return nil, fmt.Errorf("resolve per-app state dir %q: %w", perAppRoot, err)
+		}
+		resolvedAbs, err := resolveNearestAncestor(abs)
+		if err != nil {
+			return nil, fmt.Errorf("resolve state_volume_path %q: %w", raw, err)
+		}
+		if !withinDir(resolvedRoot, resolvedAbs) {
+			return nil, fmt.Errorf("state_volume_path %q must resolve within the per-app directory %s", raw, perAppRoot)
 		}
 		spec.StateVolume = abs
 	} else {
@@ -493,9 +511,19 @@ func (r *AppPodRunner) Logs(ctx context.Context, shortCode string, tail int) (st
 // Unexposes the gateway route FIRST (route dark before teardown). Idempotent.
 func (r *AppPodRunner) Destroy(ctx context.Context, shortCode string) error {
 	podName := AppPodNamePrefix + shortCode
-	r.teardown(ctx, shortCode, podName)
+	teardownErr := r.teardown(ctx, shortCode, podName)
 	// Remove the per-app named volume (best-effort; a bind-mount app has none).
 	_, _ = r.run(r.rt.Volume(ctx, "rm", "-f", podName+"-data"))
+	// Idempotent AND honest: a "no such container" on an already-gone app is
+	// success, but a teardown that left the pod/container in place must NOT be
+	// reported as a successful destroy (the A1 review's masked-failure finding).
+	// Verify by state -- gone means done; still present means surface the error.
+	if _, stillPresent := r.containerID(ctx, shortCode, true); stillPresent {
+		if teardownErr != nil {
+			return fmt.Errorf("app %q teardown failed: %w", shortCode, teardownErr)
+		}
+		return fmt.Errorf("app %q is still present after teardown", shortCode)
+	}
 	return nil
 }
 
@@ -557,12 +585,13 @@ func (r *AppPodRunner) run(cmd *exec.Cmd) ([]byte, error) { return r.execFn(cmd)
 // teardown force-removes any pod/container for the short code. Best-effort:
 // each removal ignores "no such object". On podman we remove the pod (which
 // removes its containers); on docker we remove the container.
-func (r *AppPodRunner) teardown(ctx context.Context, shortCode, podName string) {
+func (r *AppPodRunner) teardown(ctx context.Context, shortCode, podName string) error {
 	if r.podman() {
-		_, _ = r.run(r.rt.EngineCommandContext(ctx, "pod", "rm", "-f", podName))
-		return
+		_, err := r.run(r.rt.EngineCommandContext(ctx, "pod", "rm", "-f", podName))
+		return err
 	}
-	_, _ = r.run(r.rt.EngineCommandContext(ctx, "rm", "-f", podName))
+	_, err := r.run(r.rt.EngineCommandContext(ctx, "rm", "-f", podName))
+	return err
 }
 
 func (r *AppPodRunner) exists(ctx context.Context, shortCode string) bool {

@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -116,17 +117,73 @@ func TestParseAppSpec_Rejects(t *testing.T) {
 }
 
 func TestParseAppSpec_BindVolume(t *testing.T) {
+	home := t.TempDir()
 	in := baseAppInput()
-	in.StateVolumePath = "~/citadel-cache/apps/x"
-	spec, err := ParseAppSpec(in, 18901, "/home/jason")
+	// An app's bind mount must live under ITS OWN per-app dir (keyed by short code).
+	in.StateVolumePath = "~/citadel-cache/apps/" + in.ShortCode + "/data"
+	spec, err := ParseAppSpec(in, 18901, home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if spec.NamedVolume != "" {
 		t.Errorf("bind mount should have no named volume, got %q", spec.NamedVolume)
 	}
-	if !strings.HasPrefix(spec.StateVolume, "/home/jason/citadel-cache") {
-		t.Errorf("bind path = %q", spec.StateVolume)
+	wantPrefix := home + "/citadel-cache/apps/" + in.ShortCode
+	if !strings.HasPrefix(spec.StateVolume, wantPrefix) {
+		t.Errorf("bind path = %q, want under %q", spec.StateVolume, wantPrefix)
+	}
+}
+
+func TestParseAppSpec_PerAppConfinement(t *testing.T) {
+	home := t.TempDir()
+	sc := baseAppInput().ShortCode
+	cases := []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{"own per-app dir", "~/citadel-cache/apps/" + sc + "/data", false},
+		{"another apps dir", "~/citadel-cache/apps/other-app/data", true},
+		{"shared cache root", "~/citadel-cache/shared", true},
+		{"dot citadel", "~/.citadel/instances/x", true},
+		{"escape to etc", "/etc", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseAppInput()
+			in.StateVolumePath = tc.path
+			_, err := ParseAppSpec(in, 18901, home)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("path %q: err=%v, wantErr=%v", tc.path, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestAppPodRunner_DestroySurfacesTeardownError(t *testing.T) {
+	// Teardown fails AND the container is still present -> Destroy must surface
+	// the error, not report success (the A1 review's masked-failure finding).
+	fe := &fakeExec{
+		errs:    map[string]error{"rm -f aceapp-ac-x": errors.New("engine unreachable")},
+		outputs: map[string]string{"ps -a": "ctr\n"}, // containerID -> still present
+	}
+	r := newRunner("docker", false, fe)
+	err := r.Destroy(context.Background(), "ac-x")
+	if err == nil {
+		t.Fatal("Destroy must surface a teardown failure when the pod is still present")
+	}
+	if !strings.Contains(err.Error(), "engine unreachable") {
+		t.Errorf("error should wrap the engine failure, got %v", err)
+	}
+}
+
+func TestAppPodRunner_DestroyIdempotentWhenAlreadyGone(t *testing.T) {
+	// rm -f errors "no such container" but the container is gone (no ps output)
+	// -> Destroy is a success (idempotent).
+	fe := &fakeExec{errs: map[string]error{"rm -f aceapp-ac-x": errors.New("No such container: aceapp-ac-x")}}
+	r := newRunner("docker", false, fe)
+	if err := r.Destroy(context.Background(), "ac-x"); err != nil {
+		t.Fatalf("Destroy of an already-gone app must be a no-op success, got %v", err)
 	}
 }
 
@@ -178,11 +235,17 @@ func TestBuildAppPodCreateArgs(t *testing.T) {
 type fakeExec struct {
 	calls   [][]string
 	outputs map[string]string // substring -> stdout
+	errs    map[string]error  // substring -> error (checked before outputs)
 }
 
 func (f *fakeExec) run(cmd *exec.Cmd) ([]byte, error) {
 	f.calls = append(f.calls, append([]string(nil), cmd.Args...))
 	joined := strings.Join(cmd.Args, " ")
+	for sub, e := range f.errs {
+		if strings.Contains(joined, sub) {
+			return nil, e
+		}
+	}
 	for sub, out := range f.outputs {
 		if strings.Contains(joined, sub) {
 			return []byte(out), nil

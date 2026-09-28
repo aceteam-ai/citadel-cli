@@ -349,14 +349,29 @@ func resolveStateVolumePath(raw, homeDir string) (string, error) {
 		filepath.Join(homeDir, "citadel-cache"),
 		filepath.Join(homeDir, ".citadel"),
 	}
+	// Resolve symlinks BEFORE the boundary check. A lexical prefix test on the
+	// unresolved path accepts a symlink placed inside an allowed base that points
+	// OUTSIDE it (e.g. a link under citadel-cache to ~/.ssh), which the bind mount
+	// would then follow -- the escape the A1 review found. resolveNearestAncestor
+	// resolves the existing portion of the path (the leaf may not exist yet, as
+	// the state dir is created later) so the comparison happens in real space, and
+	// withinDir uses filepath.Rel so citadel-cache does not match citadel-cacheEVIL.
+	resolvedTarget, err := resolveNearestAncestor(abs)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve state_volume_path %q: %w", raw, err)
+	}
 	for _, base := range allowedBases {
-		if abs == base || strings.HasPrefix(abs, base+string(filepath.Separator)) {
+		resolvedBase, berr := resolveNearestAncestor(base)
+		if berr != nil {
+			continue
+		}
+		if withinDir(resolvedBase, resolvedTarget) {
 			return abs, nil
 		}
 	}
 	return "", fmt.Errorf(
 		"state_volume_path %q resolves to %q, which is outside the citadel data dir (allowed: %s)",
-		raw, abs, strings.Join(allowedBases, ", "))
+		raw, resolvedTarget, strings.Join(allowedBases, ", "))
 }
 
 // buildDockerRunArgs assembles the `docker run` arguments for a spec. Pure
