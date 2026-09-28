@@ -99,6 +99,12 @@ var unboundedJobTypes = map[string]struct{}{
 	// race-free without a lock (services.AllocateAppPodPort). The other APP_*
 	// verbs (stop/start/status/logs/destroy) are quick and take the default tier.
 	JobTypeAppDeploy: {},
+	// RUN_JOB_TEMPLATE runs an opaque compiled-in builtin (an audio mix, a
+	// headless render+encode) whose duration is dominated by the work itself, so
+	// no fallback deadline. Unbounded membership ALSO routes it onto the
+	// serialized exec-1 lane (via serializedLaneJobTypes' superset), keeping a
+	// template run's per-run workspace writes single-writer, matching APP_DEPLOY.
+	JobTypeRunJobTemplate: {},
 }
 
 // serializedLaneJobTypes decides which job types are routed onto the general
