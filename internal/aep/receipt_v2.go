@@ -270,6 +270,43 @@ func BuildSignedAppDeployReceipt(signer Signer, nodeID, jobID, inputSHA256, outp
 	)
 }
 
+// RunJobTemplateAction is the AEPReceiptV2.Action value for a job-template run
+// receipt (citadel-cli#1149, aceteam#10288). Like app_deploy it attests an
+// EVENT (a template execution), not a content check, so it carries no grounding
+// and an empty verdict_hash; the aceteam verifier branches on this action to
+// skip the inference path's verdict-hash recomputation.
+const RunJobTemplateAction = "run_job_template"
+
+// BuildSignedRunJobTemplateReceipt signs a v2 receipt for a job-template run. It
+// is a thin wrapper over BuildSignedReceiptV2 (reusing its finite-score guard,
+// newline refuse-to-sign guard, and empty-flagged-list hashing) fixing the
+// run_job_template shape:
+//
+//   - Action       = RunJobTemplateAction ("run_job_template")
+//   - InputSHA256  = the template manifest content hash (already "sha256:<hex>")
+//   - OutputSHA256 = sha256 over the run's ordered output digests (already "sha256:<hex>")
+//   - PolicyHash   = EmptyPolicyHash (no on-node policy delivery yet, S5)
+//   - VerdictHash  = "" (a template run has no Trust Engine verdict)
+//   - Engine/Model = "" (a template run has neither)
+//
+// and an empty trust.GroundingResult. The caller resolves nodeID via
+// aep.ResolveNodeID and gates signing on CITADEL_SIGN_AEP_RECEIPTS, exactly as
+// the app_deploy and inference receipt paths do.
+func BuildSignedRunJobTemplateReceipt(signer Signer, nodeID, jobID, inputSHA256, outputSHA256 string, now time.Time) (*AEPReceiptV2, error) {
+	return BuildSignedReceiptV2(
+		signer, nodeID, jobID, "", "",
+		V2Inputs{
+			InputSHA256:  inputSHA256,
+			OutputSHA256: outputSHA256,
+			PolicyHash:   EmptyPolicyHash,
+			Action:       RunJobTemplateAction,
+			VerdictHash:  "",
+		},
+		trust.GroundingResult{},
+		now,
+	)
+}
+
 // ToMap returns the receipt as a map[string]any (via its own json tags), the
 // same shape rule as AEPReceiptV1.ToMap — callers MUST use this rather than
 // attaching *AEPReceiptV2 to job output directly (a typed Go pointer in a map

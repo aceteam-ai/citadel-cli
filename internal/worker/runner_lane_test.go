@@ -29,6 +29,7 @@ func TestSerializedLaneJobTypes(t *testing.T) {
 		JobTypeAgentUpdate:       {},
 		JobTypeWhatsAppProvision: {},
 		JobTypeAppDeploy:         {},
+		JobTypeRunJobTemplate:    {},
 		// Manifest/lockfile writers that are NOT unbounded but still must
 		// serialize (they read-modify-write citadel.yaml / modules.lock).
 		JobTypeModuleSet:         {},

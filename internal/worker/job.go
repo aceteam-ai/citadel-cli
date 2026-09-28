@@ -165,6 +165,13 @@ const (
 	JobTypeAppLogs    = "APP_LOGS"    // Tail a hosted app pod's logs
 	JobTypeAppDestroy = "APP_DESTROY" // Remove a hosted app's pod, its volumes, and its gateway route
 
+	// Node-side runner for the platform job-template registry (aceteam#10288).
+	// Privileged in the EXPOSE_SET sense: honored only on the per-node stream,
+	// fail closed on the shared pool. The node recomputes the template manifest
+	// hash and refuses on mismatch, and only "builtin" runner kinds (never shell)
+	// dispatch to a compiled-in handler. See internal/worker/run_job_template.go.
+	JobTypeRunJobTemplate = "RUN_JOB_TEMPLATE" // Run one approved, content-hash-pinned platform job template
+
 	// Fabric instance provisioning on a local hypervisor (aceteam#5963). These
 	// act on hypervisor VMs; JobTypeInstanceMessage above predates this family
 	// and addresses hosted agent instances, not VMs.
@@ -242,6 +249,7 @@ var allKnownJobTypes = []string{
 	JobTypeAppStatus,
 	JobTypeAppLogs,
 	JobTypeAppDestroy,
+	JobTypeRunJobTemplate,
 	JobTypeInstanceProvision,
 	JobTypeInstanceStart,
 	JobTypeInstanceStop,

@@ -243,6 +243,15 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Log: opts.HandlerLog,
 	}))
 
+	// RUN_JOB_TEMPLATE (aceteam#10288): run an approved, content-hash-pinned
+	// platform job template. Same privilege posture as APP_* (per-node stream
+	// only, fail closed). The live ops dispatch to a compiled-in builtin, write
+	// outputs under the node workspace, and sign the AEP receipt.
+	runner.RegisterHandler(worker.NewRunJobTemplateHandler(worker.RunJobTemplateHandlerConfig{
+		Ops: liveTemplateRunOps{workspaceDir: opts.WorkspaceDir},
+		Log: opts.HandlerLog,
+	}))
+
 	// INSTANCE_* is a mutating hypervisor capability: only register it when the
 	// required Proxmox configuration is enabled. A node without that config must
 	// not advertise work it will refuse.
