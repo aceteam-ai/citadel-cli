@@ -146,15 +146,13 @@ func ParseTemplateRunner(raw json.RawMessage) (TemplateRunner, error) {
 // ValidateTemplateParams compiles the approved schema without fetching files or
 // URLs. References within the supplied schema work; external resources fail closed.
 func ValidateTemplateParams(params, inputSchema, outputSchema json.RawMessage) error {
-	if len(params) == 0 {
-		params = json.RawMessage(`{}`)
-	}
-	v, err := DecodeTemplateJSON(params)
+	normalized, err := NormalizeTemplateParams(params)
 	if err != nil {
-		return fmt.Errorf("params: %w", err)
+		return err
 	}
-	if _, ok := v.(map[string]any); !ok {
-		return fmt.Errorf("params must be an object")
+	v, err := DecodeTemplateJSON(normalized)
+	if err != nil {
+		return err
 	}
 	for _, field := range []struct {
 		name string
@@ -172,7 +170,14 @@ func ValidateTemplateParams(params, inputSchema, outputSchema json.RawMessage) e
 			return nil, fmt.Errorf("external schema resource %q is forbidden", url)
 		}
 		const base = "https://citadel.invalid/template-schema.json"
-		if err := c.AddResource(base, bytes.NewReader(field.raw)); err != nil {
+		// Compile precisely the Python-normalized schema committed by the hash.
+		// A raw underflow/rounded float must not impose different limits under
+		// the same approved hash when the validator supports exact rationals.
+		var canonical bytes.Buffer
+		if err := writeCanonicalJSON(&canonical, schemaValue); err != nil {
+			return fmt.Errorf("%s: %w", field.name, err)
+		}
+		if err := c.AddResource(base, bytes.NewReader(canonical.Bytes())); err != nil {
 			return fmt.Errorf("%s: %w", field.name, err)
 		}
 		schema, err := c.Compile(base)
@@ -186,6 +191,26 @@ func ValidateTemplateParams(params, inputSchema, outputSchema json.RawMessage) e
 		}
 	}
 	return nil
+}
+
+// NormalizeTemplateParams ensures validation and builtin dispatch see the same
+// Python-compatible numeric values, even after a legal wire reserialization.
+func NormalizeTemplateParams(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		raw = json.RawMessage(`{}`)
+	}
+	v, err := DecodeTemplateJSON(raw)
+	if err != nil {
+		return nil, fmt.Errorf("params: %w", err)
+	}
+	if _, ok := v.(map[string]any); !ok {
+		return nil, fmt.Errorf("params must be an object")
+	}
+	var b bytes.Buffer
+	if err := writeCanonicalJSON(&b, v); err != nil {
+		return nil, fmt.Errorf("params: %w", err)
+	}
+	return b.Bytes(), nil
 }
 
 type TemplateInputFile struct{ Path, NodeID, NodePath string }

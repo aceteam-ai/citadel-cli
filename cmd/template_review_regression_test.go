@@ -101,3 +101,20 @@ func TestLiveTemplateRunOps_InputSymlinkEscape(t *testing.T) {
 		t.Fatal("symlink outside workspace accepted")
 	}
 }
+
+func TestLiveTemplateRunOps_DispatchesCanonicalParams(t *testing.T) {
+	var got string
+	registerTestBuiltin(t, "canonical-params", func(_ context.Context, params json.RawMessage, _ []string, _ string) ([]string, error) {
+		got = string(params)
+		return nil, nil
+	})
+	r := verifiedTemplateRequest(t, worker.TemplateRunRequest{JobID: "canonical", TemplateKey: "test", Runner: json.RawMessage(`{"kind":"builtin","handler":"canonical-params"}`)})
+	r.Params = json.RawMessage(`{"gain":1e-400,"rounded":9007199254740993.0}`)
+	res, err := (liveTemplateRunOps{workspaceDir: t.TempDir(), nodeID: "n1"}).Run(context.Background(), r)
+	if err != nil || got != `{"gain":0.0,"rounded":9007199254740992.0}` {
+		t.Fatalf("builtin params %s err=%v", got, err)
+	}
+	if res.Outputs == nil || res.InputHashes == nil {
+		t.Fatal("empty result collections must be arrays")
+	}
+}

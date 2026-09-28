@@ -86,6 +86,10 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 	if err != nil {
 		return nil, err
 	}
+	req.Params, err = jobs.NormalizeTemplateParams(req.Params)
+	if err != nil {
+		return nil, err
+	}
 	fn, ok := lookupBuiltinTemplateRunner(runner.Handler)
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", worker.ErrTemplateUnknownHandler, runner.Handler)
@@ -104,12 +108,7 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
-	params := req.Params
-	if len(params) == 0 {
-		params = json.RawMessage(`{}`)
-	}
-
-	outRels, err := fn(ctx, params, inputs, outDir)
+	outRels, err := fn(ctx, req.Params, inputs, outDir)
 	if err != nil {
 		return nil, fmt.Errorf("builtin %q: %w", runner.Handler, err)
 	}

@@ -37,6 +37,9 @@ including filesystem and network URLs, are forbidden. Input params must satisfy
 the approved schema before any ops call or filesystem effects. The output schema
 is compiled for validity and remains part of the approved hash; output artifacts
 follow the fixed result contract below.
+Schema compilation and builtin params use the same normalized numbers as the
+Python authority. Underflow or binary64 rounding cannot change schema limits
+or dispatched params through a different spelling with the same manifest hash.
 
 Every input must have `node_id` equal to the locally configured executing node
 and a canonical workspace-relative `node_path`. `path` must be that same relative

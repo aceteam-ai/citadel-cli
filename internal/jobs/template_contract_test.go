@@ -98,3 +98,24 @@ func TestTemplatePythonNumericCanonicalization(t *testing.T) {
 		}
 	}
 }
+
+func TestTemplateSchemaUsesHashedNumericSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		schema, params string
+		accept         bool
+	}{
+		{`{"type":"object","properties":{"gain":{"maximum":1e-400}}}`, `{"gain":1e-300}`, false},
+		{`{"type":"object","properties":{"gain":{"minimum":1e-400}}}`, `{"gain":0}`, true},
+		{`{"type":"object","properties":{"gain":{"maximum":9007199254740993.0}}}`, `{"gain":9007199254740993}`, false},
+		{`{"type":"object","properties":{"gain":{"const":0.0}}}`, `{"gain":1e-400}`, true},
+	} {
+		err := ValidateTemplateParams(json.RawMessage(tc.params), json.RawMessage(tc.schema), json.RawMessage(`{}`))
+		if (err == nil) != tc.accept {
+			t.Errorf("schema %s params %s: accept=%v err=%v", tc.schema, tc.params, tc.accept, err)
+		}
+	}
+	got, err := NormalizeTemplateParams(json.RawMessage(`{"gain":1e-400,"rounded":9007199254740993.0,"integer":9007199254740993}`))
+	if err != nil || string(got) != `{"gain":0.0,"integer":9007199254740993,"rounded":9007199254740992.0}` {
+		t.Fatalf("wrong dispatched params: %s %v", got, err)
+	}
+}

@@ -169,6 +169,10 @@ func (h *RunJobTemplateHandler) Execute(ctx context.Context, job *Job, stream St
 	if err != nil {
 		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: %w", err)), nil
 	}
+	req.Params, err = jobs.NormalizeTemplateParams(req.Params)
+	if err != nil {
+		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: %w", err)), nil
+	}
 
 	h.cfg.Log("RUN_JOB_TEMPLATE: template=%q v%d handler=%q", req.TemplateKey, req.TemplateVersion, runner.Handler)
 	res, err := h.cfg.Ops.Run(ctx, req)
