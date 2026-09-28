@@ -178,10 +178,11 @@ func TestAppPodRunner_DestroySurfacesTeardownError(t *testing.T) {
 }
 
 func TestAppPodRunner_DestroyIdempotentWhenAlreadyGone(t *testing.T) {
-	// rm -f errors "no such container" but the container is gone (no ps output)
-	// -> Destroy is a success (idempotent).
-	fe := &fakeExec{errs: map[string]error{"rm -f aceapp-ac-x": errors.New("No such container: aceapp-ac-x")}}
-	r := newRunner("docker", false, fe)
+	// pod rm -f errors "no such pod" but the container is gone (no ps output)
+	// -> Destroy is a success (idempotent). Uses podman so the teardown key
+	// ("pod rm") cannot also match the later "volume rm".
+	fe := &fakeExec{errs: map[string]error{"pod rm -f aceapp-ac-x": errors.New("Error: no such pod aceapp-ac-x")}}
+	r := newRunner("podman", false, fe)
 	if err := r.Destroy(context.Background(), "ac-x"); err != nil {
 		t.Fatalf("Destroy of an already-gone app must be a no-op success, got %v", err)
 	}
@@ -194,6 +195,32 @@ func TestAppPodRunner_DestroyErrorsWhenEngineDown(t *testing.T) {
 	r := newRunner("docker", false, fe)
 	if err := r.Destroy(context.Background(), "ac-x"); err == nil {
 		t.Fatal("Destroy must fail when the engine cannot be reached to verify removal")
+	}
+}
+
+func TestAppPodRunner_DestroySurfacesVolumeRemovalError(t *testing.T) {
+	// Container confirmed gone, but the volume rm fails with a real (not
+	// not-found) error. Destroy must surface it, since the volume removal now runs
+	// AFTER confirmation: a swallowed rm failure would leave the data volume for a
+	// later app that reuses the short code.
+	fe := &fakeExec{errs: map[string]error{"volume rm -f aceapp-ac-x-data": errors.New("device or resource busy")}}
+	r := newRunner("podman", false, fe)
+	err := r.Destroy(context.Background(), "ac-x")
+	if err == nil {
+		t.Fatal("Destroy must surface a real volume-removal error")
+	}
+	if !strings.Contains(err.Error(), "state volume") {
+		t.Errorf("error should name the volume removal, got %v", err)
+	}
+}
+
+func TestAppPodRunner_DestroyVolumeNotFoundIsSuccess(t *testing.T) {
+	// A "no such volume" on rm (already gone, or an older bind-mount app) is an
+	// idempotent success, not an error.
+	fe := &fakeExec{errs: map[string]error{"volume rm -f aceapp-ac-x-data": errors.New("Error: no such volume aceapp-ac-x-data")}}
+	r := newRunner("podman", false, fe)
+	if err := r.Destroy(context.Background(), "ac-x"); err != nil {
+		t.Fatalf("a not-found volume on destroy must be success, got %v", err)
 	}
 }
 
