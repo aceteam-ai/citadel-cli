@@ -58,6 +58,32 @@ func appPodRunner() *jobs.AppPodRunner {
 	return appRunnerRef
 }
 
+// appOpMu serializes MUTATING APP_* ops (deploy/start/stop/destroy) per short
+// code, so a concurrent APP_DEPLOY and APP_DESTROY -- or two of either -- for
+// the SAME app cannot interleave (a destroy racing a redeploy's port reuse or
+// teardown). Different short codes take different locks and stay concurrent.
+// This holds independent of the worker's serialized exec lane, so it is correct
+// even if that lane's membership changes.
+var appOpMu = &keyedMutex{locks: map[string]*sync.Mutex{}}
+
+// keyedMutex hands out one mutex per key; lock returns the unlock func.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	lk := k.locks[key]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		k.locks[key] = lk
+	}
+	k.mu.Unlock()
+	lk.Lock()
+	return lk.Unlock
+}
+
 // liveAppOps implements worker.AppOps against the live container runtime and
 // gateway.
 type liveAppOps struct{}
@@ -69,6 +95,8 @@ type liveAppOps struct{}
 // pod with no route (DoR §3.3). A redeploy reuses the port already published by
 // the existing pod so the gateway upstream stays stable.
 func (liveAppOps) Deploy(ctx context.Context, req worker.AppDeployRequest) (*worker.AppDeployResult, error) {
+	defer appOpMu.lock(req.ShortCode)()
+
 	// Gateway must be running BEFORE we create a pod, or we would strand a
 	// routeless pod. Retry (transient) until `citadel work --gateway` / the
 	// provisioned gateway is serving.
@@ -166,6 +194,7 @@ func (liveAppOps) Deploy(ctx context.Context, req worker.AppDeployRequest) (*wor
 }
 
 func (liveAppOps) Stop(ctx context.Context, shortCode string) (*worker.AppLifecycleResult, error) {
+	defer appOpMu.lock(shortCode)()
 	state, err := appPodRunner().Stop(ctx, shortCode)
 	if err != nil {
 		return nil, err
@@ -174,6 +203,7 @@ func (liveAppOps) Stop(ctx context.Context, shortCode string) (*worker.AppLifecy
 }
 
 func (liveAppOps) Start(ctx context.Context, shortCode string) (*worker.AppLifecycleResult, error) {
+	defer appOpMu.lock(shortCode)()
 	state, err := appPodRunner().Start(ctx, shortCode)
 	if err != nil {
 		return nil, err
@@ -207,6 +237,7 @@ func (liveAppOps) Logs(ctx context.Context, shortCode string, tail int) (*worker
 // Destroy tears the gateway route down FIRST (route dark before teardown), then
 // removes the pod and its volumes.
 func (liveAppOps) Destroy(ctx context.Context, shortCode string) (*worker.AppLifecycleResult, error) {
+	defer appOpMu.lock(shortCode)()
 	teardownAppRoute(ctx, shortCode)
 	if err := appPodRunner().Destroy(ctx, shortCode); err != nil {
 		return nil, err

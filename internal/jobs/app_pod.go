@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -111,12 +112,12 @@ type AppSpec struct {
 	HealthPath    string
 	Limits        appLimits
 	Runtime       string
-	// StateVolume is the -v source: an absolute host path (bind, left intact on
-	// destroy) when the payload supplied state_volume_path, else the per-app
-	// NAMED volume (removed on destroy).
+	// StateVolume is the -v source. Apps always use the per-app engine-managed
+	// NAMED volume (equal to NamedVolume, removed on destroy); a caller-supplied
+	// state_volume_path is ignored, so this is never a host bind path.
 	StateVolume string
-	// NamedVolume is non-empty only when StateVolume is the per-app named volume
-	// (so destroy knows to `volume rm` it). Empty for a bind mount.
+	// NamedVolume is the per-app engine-managed volume (StateVolume equals it), so
+	// destroy knows to `volume rm` it.
 	NamedVolume    string
 	StateMountPath string
 	Labels         map[string]string
@@ -124,12 +125,21 @@ type AppSpec struct {
 
 // ParseAppSpec validates an AppSpecInput and resolves it into a launchable
 // AppSpec, reusing service_payload.go's validators. hostPort is the
-// node-allocated loopback port (services.AllocateAppPodPort); homeDir bounds an
-// optional state_volume_path. Pure apart from the passed-in homeDir.
+// node-allocated loopback port (services.AllocateAppPodPort). A payload
+// state_volume_path is ignored: apps always get an engine-managed per-app named
+// volume, so no caller-chosen host path is ever mounted. Pure. (homeDir is
+// retained for signature compatibility and is currently unused.)
 func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, error) {
 	shortCode := strings.TrimSpace(in.ShortCode)
 	if shortCode == "" {
 		return nil, fmt.Errorf("app spec missing short_code")
+	}
+	// The short code steers the pod / container / named-volume names and the
+	// gateway route name, so a crafted value must never leak into them. Require
+	// the same grammar the gateway route name needs: lowercase alphanumerics and
+	// single dashes.
+	if !isValidJobsAppShortCode(shortCode) {
+		return nil, fmt.Errorf("invalid short_code %q (want lowercase alphanumerics and single dashes)", shortCode)
 	}
 	image := strings.TrimSpace(in.Image)
 	if err := validateImageRef(image); err != nil {
@@ -158,6 +168,11 @@ func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, erro
 	if !strings.HasPrefix(mountPath, "/") {
 		return nil, fmt.Errorf("state_mount_path %q must be an absolute container path", mountPath)
 	}
+	// The -v argument is "source:dest"; a ':' or ',' in either side would split
+	// the mount or add options the caller did not intend.
+	if strings.ContainsAny(mountPath, ":,") {
+		return nil, fmt.Errorf("state_mount_path %q must not contain ':' or ','", mountPath)
+	}
 
 	podName := AppPodNamePrefix + shortCode
 	spec := &AppSpec{
@@ -174,18 +189,17 @@ func ParseAppSpec(in AppSpecInput, hostPort int, homeDir string) (*AppSpec, erro
 		StateMountPath: mountPath,
 	}
 
-	// State volume: an explicit, bounded host path (bind), else a per-app named
-	// volume the destroy path removes.
-	if raw := strings.TrimSpace(in.StateVolumePath); raw != "" {
-		abs, err := resolveStateVolumePath(raw, homeDir)
-		if err != nil {
-			return nil, err
-		}
-		spec.StateVolume = abs
-	} else {
-		spec.NamedVolume = podName + "-data"
-		spec.StateVolume = spec.NamedVolume
-	}
+	// State volume: an app always gets an engine-managed per-app NAMED VOLUME,
+	// removed on destroy. A payload state_volume_path is IGNORED. Honoring a host
+	// path allowed a check-then-use race (the value validated at parse time was
+	// not the one handed to the engine, and a symlink could be swapped in between)
+	// and let the caller pick the host path, while the A4 dispatch gate does not
+	// forward the field. A named volume has no host path at all, so it removes the
+	// escape surface entirely, avoids a root-owned directory under rootful docker,
+	// and is garbage-collected on destroy (no stale state when a short_code is
+	// reused).
+	spec.NamedVolume = podName + "-data"
+	spec.StateVolume = spec.NamedVolume
 
 	// PORT is injected so a base-path-agnostic app listens on the port we publish
 	// (DoR §3.2 "port from env"); an explicit payload PORT wins.
@@ -301,7 +315,7 @@ func sortedEnvKeys(m map[string]string) []string {
 // AppPodRunner drives the app pod lifecycle over the container runtime seam.
 // execFn is an injectable seam so the argv the runner builds is unit-testable
 // without a live engine (the same argv-capture pattern as the WhatsApp bridge
-// tests). homeDir bounds an optional bind mount.
+// tests).
 type AppPodRunner struct {
 	rt      catalog.ContainerRuntime
 	execFn  func(*exec.Cmd) ([]byte, error)
@@ -493,9 +507,34 @@ func (r *AppPodRunner) Logs(ctx context.Context, shortCode string, tail int) (st
 // Unexposes the gateway route FIRST (route dark before teardown). Idempotent.
 func (r *AppPodRunner) Destroy(ctx context.Context, shortCode string) error {
 	podName := AppPodNamePrefix + shortCode
-	r.teardown(ctx, shortCode, podName)
-	// Remove the per-app named volume (best-effort; a bind-mount app has none).
-	_, _ = r.run(r.rt.Volume(ctx, "rm", "-f", podName+"-data"))
+	teardownErr := r.teardown(ctx, shortCode, podName)
+	// Idempotent AND honest. A "no such container" on an already-gone app is
+	// success, but a teardown that left the container in place -- OR an engine we
+	// cannot reach to confirm removal -- must NEVER be reported as a successful
+	// destroy (the A1 review's masked-failure finding and its engine-down variant).
+	_, present, checkErr := r.containerPresence(ctx, shortCode, true)
+	if checkErr != nil {
+		if teardownErr != nil {
+			return fmt.Errorf("app %q teardown failed and removal is unverifiable: %w", shortCode, teardownErr)
+		}
+		return fmt.Errorf("app %q removal is unverifiable: %w", shortCode, checkErr)
+	}
+	if present {
+		if teardownErr != nil {
+			return fmt.Errorf("app %q teardown failed: %w", shortCode, teardownErr)
+		}
+		return fmt.Errorf("app %q is still present after teardown", shortCode)
+	}
+	// Container confirmed gone: ONLY now remove the per-app named volume. Doing it
+	// after confirmation (not before, best-effort) means a failed volume removal
+	// cannot silently leave a data volume behind for a later app that reuses this
+	// short code. A not-found is success (already gone, or an older bind-mount app
+	// that never had a named volume); any other error is surfaced.
+	if out, err := r.run(r.rt.Volume(ctx, "rm", "-f", podName+"-data")); err != nil {
+		if !isVolumeNotFoundErr(out, err) {
+			return fmt.Errorf("app %q: remove state volume: %s", shortCode, trimOut(out, err))
+		}
+	}
 	return nil
 }
 
@@ -550,6 +589,17 @@ func (r *AppPodRunner) UsedAppPorts(ctx context.Context) map[int]bool {
 	return used
 }
 
+// isValidJobsAppShortCode reports whether the short code is lowercase
+// alphanumerics with single dashes. It mirrors internal/worker's
+// isValidAppShortCode; the check is duplicated here because internal/worker
+// imports internal/jobs (not the reverse) and the short code steers the
+// pod / container / named-volume names and the gateway route in this package.
+var jobsAppShortCodeRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+func isValidJobsAppShortCode(code string) bool {
+	return jobsAppShortCodeRe.MatchString(code)
+}
+
 // --- helpers ---------------------------------------------------------------
 
 func (r *AppPodRunner) run(cmd *exec.Cmd) ([]byte, error) { return r.execFn(cmd) }
@@ -557,12 +607,13 @@ func (r *AppPodRunner) run(cmd *exec.Cmd) ([]byte, error) { return r.execFn(cmd)
 // teardown force-removes any pod/container for the short code. Best-effort:
 // each removal ignores "no such object". On podman we remove the pod (which
 // removes its containers); on docker we remove the container.
-func (r *AppPodRunner) teardown(ctx context.Context, shortCode, podName string) {
+func (r *AppPodRunner) teardown(ctx context.Context, shortCode, podName string) error {
 	if r.podman() {
-		_, _ = r.run(r.rt.EngineCommandContext(ctx, "pod", "rm", "-f", podName))
-		return
+		_, err := r.run(r.rt.EngineCommandContext(ctx, "pod", "rm", "-f", podName))
+		return err
 	}
-	_, _ = r.run(r.rt.EngineCommandContext(ctx, "rm", "-f", podName))
+	_, err := r.run(r.rt.EngineCommandContext(ctx, "rm", "-f", podName))
+	return err
 }
 
 func (r *AppPodRunner) exists(ctx context.Context, shortCode string) bool {
@@ -570,9 +621,12 @@ func (r *AppPodRunner) exists(ctx context.Context, shortCode string) bool {
 	return ok
 }
 
-// containerID returns the first container id carrying aceteam.app=<shortCode>.
+// containerPresence returns the first container id carrying aceteam.app=<shortCode>
+// and DISTINGUISHES "listed successfully but not found" (present=false, err=nil)
+// from a listing or engine failure (err!=nil). Destroy relies on that
+// distinction: an engine it cannot reach must never be read as "the app is gone".
 // includeStopped selects `ps -a` (any state) vs `ps` (running only).
-func (r *AppPodRunner) containerID(ctx context.Context, shortCode string, includeStopped bool) (string, bool) {
+func (r *AppPodRunner) containerPresence(ctx context.Context, shortCode string, includeStopped bool) (string, bool, error) {
 	args := []string{"ps"}
 	if includeStopped {
 		args = append(args, "-a")
@@ -580,14 +634,21 @@ func (r *AppPodRunner) containerID(ctx context.Context, shortCode string, includ
 	args = append(args, "--filter", "label="+AppLabelShortCode+"="+shortCode, "--format", "{{.ID}}")
 	out, err := r.run(r.rt.EngineCommandContext(ctx, args...))
 	if err != nil {
-		return "", false
+		return "", false, fmt.Errorf("list container for app %q: %s", shortCode, trimOut(out, err))
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if id := strings.TrimSpace(line); id != "" {
-			return id, true
+			return id, true, nil
 		}
 	}
-	return "", false
+	return "", false, nil
+}
+
+// containerID is the error-swallowing read-only wrapper the listing and port
+// helpers use, where treating an engine error as "absent" is acceptable.
+func (r *AppPodRunner) containerID(ctx context.Context, shortCode string, includeStopped bool) (string, bool) {
+	id, ok, _ := r.containerPresence(ctx, shortCode, includeStopped)
+	return id, ok
 }
 
 // listShortCodes returns every hosted-app short code (running or stopped),
@@ -688,4 +749,18 @@ func trimOut(out []byte, err error) string {
 		return err.Error()
 	}
 	return s
+}
+
+// isVolumeNotFoundErr reports whether a `volume rm` failure is only "the volume
+// does not exist" (docker: "No such volume"; podman: "no such volume" / "no
+// volume with name"), which is a success for an idempotent destroy. Any other
+// failure (engine down, permission) is a real error the caller must surface.
+func isVolumeNotFoundErr(out []byte, err error) bool {
+	if err == nil {
+		return true
+	}
+	s := strings.ToLower(strings.TrimSpace(string(out)) + " " + err.Error())
+	return strings.Contains(s, "no such volume") ||
+		strings.Contains(s, "no volume with name") ||
+		strings.Contains(s, "not found")
 }

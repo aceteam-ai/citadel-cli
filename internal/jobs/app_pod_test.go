@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -39,9 +40,14 @@ func TestParseAppSpec_Valid(t *testing.T) {
 	if spec.Env["PORT"] != "8501" {
 		t.Errorf("injected PORT = %q, want 8501", spec.Env["PORT"])
 	}
-	// No state_volume_path -> per-app named volume, removable on destroy.
-	if spec.NamedVolume != "aceapp-ac-blue-cat-fox-data" || spec.StateVolume != spec.NamedVolume {
-		t.Errorf("named volume = %q, state volume = %q", spec.NamedVolume, spec.StateVolume)
+	// An app gets an engine-managed per-app named volume (removed on destroy),
+	// never a host bind.
+	wantVol := AppPodNamePrefix + "ac-blue-cat-fox-data"
+	if spec.NamedVolume != wantVol {
+		t.Errorf("named volume = %q, want %q", spec.NamedVolume, wantVol)
+	}
+	if spec.StateVolume != wantVol {
+		t.Errorf("state volume = %q, want the named volume %q", spec.StateVolume, wantVol)
 	}
 	if spec.StateMountPath != "/data" {
 		t.Errorf("mount path = %q, want /data", spec.StateMountPath)
@@ -106,27 +112,115 @@ func TestParseAppSpec_Rejects(t *testing.T) {
 			t.Error("accepted a privileged container port")
 		}
 	})
-	t.Run("bind volume escapes citadel dir", func(t *testing.T) {
+	t.Run("payload state_volume_path is ignored, not honored", func(t *testing.T) {
 		in := baseAppInput()
-		in.StateVolumePath = "/etc"
+		in.StateVolumePath = "/etc" // apps derive their own dir; a payload path has no effect
+		spec, err := ParseAppSpec(in, 18901, "/home/jason")
+		if err != nil {
+			t.Fatalf("payload path should be ignored, not error: %v", err)
+		}
+		if strings.Contains(spec.StateVolume, "/etc") {
+			t.Errorf("payload path leaked into the mount: %q", spec.StateVolume)
+		}
+	})
+	t.Run("short_code path traversal rejected", func(t *testing.T) {
+		in := baseAppInput()
+		in.ShortCode = "../evil"
 		if _, err := ParseAppSpec(in, 18901, "/home/jason"); err == nil {
-			t.Error("accepted a state volume outside the citadel data dir")
+			t.Error("accepted a short_code that is not a plain slug")
+		}
+	})
+	t.Run("colon in state_mount_path rejected", func(t *testing.T) {
+		in := baseAppInput()
+		in.StateMountPath = "/data:/evil"
+		if _, err := ParseAppSpec(in, 18901, "/home/jason"); err == nil {
+			t.Error("accepted a state_mount_path containing ':'")
 		}
 	})
 }
 
-func TestParseAppSpec_BindVolume(t *testing.T) {
+func TestParseAppSpec_IgnoresPayloadStateVolumePath(t *testing.T) {
 	in := baseAppInput()
-	in.StateVolumePath = "~/citadel-cache/apps/x"
+	// A payload state_volume_path (here pointing at ANOTHER app's dir) must not be
+	// honored: apps always get their own engine-managed per-app named volume.
+	in.StateVolumePath = "~/citadel-cache/apps/other-app/data"
 	spec, err := ParseAppSpec(in, 18901, "/home/jason")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.NamedVolume != "" {
-		t.Errorf("bind mount should have no named volume, got %q", spec.NamedVolume)
+	wantVol := AppPodNamePrefix + in.ShortCode + "-data"
+	if spec.NamedVolume != wantVol {
+		t.Errorf("named volume = %q, want %q", spec.NamedVolume, wantVol)
 	}
-	if !strings.HasPrefix(spec.StateVolume, "/home/jason/citadel-cache") {
-		t.Errorf("bind path = %q", spec.StateVolume)
+	if spec.StateVolume != wantVol {
+		t.Errorf("state volume = %q, want the named volume %q (payload ignored)", spec.StateVolume, wantVol)
+	}
+	if strings.Contains(spec.StateVolume, "other-app") {
+		t.Errorf("payload path leaked into the mount: %q", spec.StateVolume)
+	}
+}
+
+func TestAppPodRunner_DestroySurfacesTeardownError(t *testing.T) {
+	// Teardown fails AND the container is still present -> Destroy must surface
+	// the error, not report success (the A1 review's masked-failure finding).
+	fe := &fakeExec{
+		errs:    map[string]error{"rm -f aceapp-ac-x": errors.New("engine unreachable")},
+		outputs: map[string]string{"ps -a": "ctr\n"}, // containerID -> still present
+	}
+	r := newRunner("docker", false, fe)
+	err := r.Destroy(context.Background(), "ac-x")
+	if err == nil {
+		t.Fatal("Destroy must surface a teardown failure when the pod is still present")
+	}
+	if !strings.Contains(err.Error(), "engine unreachable") {
+		t.Errorf("error should wrap the engine failure, got %v", err)
+	}
+}
+
+func TestAppPodRunner_DestroyIdempotentWhenAlreadyGone(t *testing.T) {
+	// pod rm -f errors "no such pod" but the container is gone (no ps output)
+	// -> Destroy is a success (idempotent). Uses podman so the teardown key
+	// ("pod rm") cannot also match the later "volume rm".
+	fe := &fakeExec{errs: map[string]error{"pod rm -f aceapp-ac-x": errors.New("Error: no such pod aceapp-ac-x")}}
+	r := newRunner("podman", false, fe)
+	if err := r.Destroy(context.Background(), "ac-x"); err != nil {
+		t.Fatalf("Destroy of an already-gone app must be a no-op success, got %v", err)
+	}
+}
+
+func TestAppPodRunner_DestroyErrorsWhenEngineDown(t *testing.T) {
+	// The presence check itself fails (engine unreachable): a destroy that cannot
+	// confirm removal must NOT report success.
+	fe := &fakeExec{errs: map[string]error{"ps -a": errors.New("Cannot connect to the Docker daemon")}}
+	r := newRunner("docker", false, fe)
+	if err := r.Destroy(context.Background(), "ac-x"); err == nil {
+		t.Fatal("Destroy must fail when the engine cannot be reached to verify removal")
+	}
+}
+
+func TestAppPodRunner_DestroySurfacesVolumeRemovalError(t *testing.T) {
+	// Container confirmed gone, but the volume rm fails with a real (not
+	// not-found) error. Destroy must surface it, since the volume removal now runs
+	// AFTER confirmation: a swallowed rm failure would leave the data volume for a
+	// later app that reuses the short code.
+	fe := &fakeExec{errs: map[string]error{"volume rm -f aceapp-ac-x-data": errors.New("device or resource busy")}}
+	r := newRunner("podman", false, fe)
+	err := r.Destroy(context.Background(), "ac-x")
+	if err == nil {
+		t.Fatal("Destroy must surface a real volume-removal error")
+	}
+	if !strings.Contains(err.Error(), "state volume") {
+		t.Errorf("error should name the volume removal, got %v", err)
+	}
+}
+
+func TestAppPodRunner_DestroyVolumeNotFoundIsSuccess(t *testing.T) {
+	// A "no such volume" on rm (already gone, or an older bind-mount app) is an
+	// idempotent success, not an error.
+	fe := &fakeExec{errs: map[string]error{"volume rm -f aceapp-ac-x-data": errors.New("Error: no such volume aceapp-ac-x-data")}}
+	r := newRunner("podman", false, fe)
+	if err := r.Destroy(context.Background(), "ac-x"); err != nil {
+		t.Fatalf("a not-found volume on destroy must be success, got %v", err)
 	}
 }
 
@@ -178,11 +272,17 @@ func TestBuildAppPodCreateArgs(t *testing.T) {
 type fakeExec struct {
 	calls   [][]string
 	outputs map[string]string // substring -> stdout
+	errs    map[string]error  // substring -> error (checked before outputs)
 }
 
 func (f *fakeExec) run(cmd *exec.Cmd) ([]byte, error) {
 	f.calls = append(f.calls, append([]string(nil), cmd.Args...))
 	joined := strings.Join(cmd.Args, " ")
+	for sub, e := range f.errs {
+		if strings.Contains(joined, sub) {
+			return nil, e
+		}
+	}
 	for sub, out := range f.outputs {
 		if strings.Contains(joined, sub) {
 			return []byte(out), nil
@@ -236,8 +336,12 @@ func TestAppPodRunner_DeployPodman(t *testing.T) {
 	if !fe.argvContains("pull ghcr.io/aceteam-ai/streamlit-runtime:latest") {
 		t.Error("image was not pulled")
 	}
+	// Apps use an engine-managed per-app named volume: created before run, mounted in -v.
 	if !fe.argvContains("volume create aceapp-ac-blue-cat-fox-data") {
-		t.Error("named volume was not created")
+		t.Error("per-app named volume was not created")
+	}
+	if !fe.argvContains("aceapp-ac-blue-cat-fox-data:/data") {
+		t.Error("container run must mount the per-app named volume")
 	}
 	if !fe.argvContains("pod create --name aceapp-ac-blue-cat-fox") {
 		t.Error("pod was not created")
