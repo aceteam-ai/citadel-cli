@@ -4,15 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 func TestProductionTemplateBuiltinsRegistered(t *testing.T) {
@@ -116,7 +122,7 @@ func TestPapercraftRenderBuiltinRendersBothFormatsWithTenFPSCaptureDedup(t *test
 	var pages []*fakePapercraftPage
 	var encoders []*fakePapercraftEncoder
 	deps := papercraftRenderDeps{
-		startPage: func(_ context.Context, _ string, _, _ int, _ string) (papercraftPage, error) {
+		startPage: func(_ context.Context, _ string, _, _ int, _ string, _ []string) (papercraftPage, error) {
 			p := &fakePapercraftPage{duration: 0.31}
 			pages = append(pages, p)
 			return p, nil
@@ -164,7 +170,7 @@ func TestPapercraftRenderBuiltinRejectsMissingFormatAndTimingMismatch(t *testing
 	}
 	portrait := writePapercraftHTML(t, dir, "short.html", 1080, 1920)
 	deps := papercraftRenderDeps{
-		startPage: func(context.Context, string, int, int, string) (papercraftPage, error) {
+		startPage: func(context.Context, string, int, int, string, []string) (papercraftPage, error) {
 			return &fakePapercraftPage{duration: 2}, nil
 		},
 		startEncoder: func(context.Context, papercraftEncoderConfig) (papercraftEncoder, error) {
@@ -235,15 +241,123 @@ func TestPapercraftChromiumArgsKeepSandboxAndBlockWebRTCUDP(t *testing.T) {
 		{name: "darwin root", goos: "darwin", elevated: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			args := papercraftChromiumArgs(`C:\profile`, 1920, 1080, 9222, tc.goos, tc.elevated)
+			args := papercraftChromiumArgs(`C:\profile`, 1920, 1080, 9222, "http://127.0.0.1:43123", tc.goos, tc.elevated)
 			if got := contains(args, "--no-sandbox"); got != tc.wantNoSandbox {
 				t.Fatalf("no-sandbox present = %v, want %v: %v", got, tc.wantNoSandbox, args)
 			}
 			if !contains(args, "--force-webrtc-ip-handling-policy=disable_non_proxied_udp") {
 				t.Fatalf("WebRTC direct UDP policy missing: %v", args)
 			}
+			if !contains(args, "--proxy-server=http://127.0.0.1:43123") || !contains(args, "--proxy-bypass-list=<-loopback>") {
+				t.Fatalf("non-forwarding render proxy is not mandatory: %v", args)
+			}
 		})
 	}
+}
+
+func TestPapercraftBlocksLocalFilesBeforeNavigation(t *testing.T) {
+	blocked := papercraftBlockedURLs()
+	if !containsString(blocked, "file://*") {
+		t.Fatalf("blocked URLs = %v, want file://*", blocked)
+	}
+}
+
+func TestPapercraftAssetServerConfinesFilesToHTMLRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	html := filepath.Join(root, "index.html")
+	asset := filepath.Join(root, "asset.js")
+	secret := filepath.Join(outside, "secret.txt")
+	for path, body := range map[string]string{html: "html", asset: "asset", secret: "secret"} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(secret, filepath.Join(root, "escape.txt")); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, allowed, err := papercraftAssetSet([]string{html, asset})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := "/unguessable-token/"
+	handler := papercraftAssetHandler(resolvedRoot, prefix, allowed)
+	for _, tc := range []struct {
+		method     string
+		host       string
+		path       string
+		wantStatus int
+		wantBody   string
+	}{
+		{method: http.MethodGet, host: papercraftAssetHost, path: prefix + "asset.js", wantStatus: http.StatusOK, wantBody: "asset"},
+		{method: http.MethodGet, host: papercraftAssetHost, path: prefix + "escape.txt", wantStatus: http.StatusNotFound},
+		{method: http.MethodGet, host: papercraftAssetHost, path: "/wrong/asset.js", wantStatus: http.StatusNotFound},
+		{method: http.MethodGet, host: "127.0.0.1:6379", path: prefix + "asset.js", wantStatus: http.StatusNotFound},
+		{method: http.MethodConnect, host: papercraftAssetHost, path: prefix + "asset.js", wantStatus: http.StatusNotFound},
+	} {
+		req := httptest.NewRequest(tc.method, "http://"+tc.host+tc.path, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != tc.wantStatus || (tc.wantBody != "" && response.Body.String() != tc.wantBody) {
+			t.Errorf("GET %s = %d %q, want %d %q", tc.path, response.Code, response.Body.String(), tc.wantStatus, tc.wantBody)
+		}
+	}
+}
+
+func TestPapercraftChromiumCannotLoadFileURLSubresource(t *testing.T) {
+	if !platform.ChromiumAvailable() {
+		t.Skip("Chromium is not installed")
+	}
+	originalCommand := renderLimitedCommand
+	renderLimitedCommand = func(ctx context.Context, binary string, args ...string) (*exec.Cmd, error) {
+		return exec.CommandContext(ctx, binary, args...), nil
+	}
+	t.Cleanup(func() { renderLimitedCommand = originalCommand })
+
+	root, outside := t.TempDir(), t.TempDir()
+	secret := filepath.Join(outside, "secret.svg")
+	if err := os.WriteFile(secret, []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="7" height="9"><rect width="7" height="9" fill="red"/></svg>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secretURL, err := papercraftFileURL(secret, runtime.GOOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := filepath.Join(root, "index.html")
+	body := `<img id="secret"><script>document.getElementById('secret').src=` + strconv.Quote(secretURL) + `; window.READY=true</script>`
+	if err := os.WriteFile(html, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profileRoot, err := os.MkdirTemp("/tmp", "papercraft-profile-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(profileRoot) })
+	page, err := startChromiumRenderPage(context.Background(), html, 100, 100, filepath.Join(profileRoot, "profile"), []string{html})
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			t.Skipf("loopback sockets are unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	defer page.Close()
+	time.Sleep(500 * time.Millisecond)
+	width, err := page.Evaluate(context.Background(), `document.getElementById("secret").naturalWidth`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if width != float64(0) {
+		t.Fatalf("file:// subresource loaded with naturalWidth=%v", width)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeChromiumProcessControl struct {
@@ -282,7 +396,7 @@ func TestPapercraftRenderReportsProfileCleanupFailure(t *testing.T) {
 	portrait := writePapercraftHTML(t, inDir, "short.html", 1080, 1920)
 	removeCalls := 0
 	deps := papercraftRenderDeps{
-		startPage: func(context.Context, string, int, int, string) (papercraftPage, error) {
+		startPage: func(context.Context, string, int, int, string, []string) (papercraftPage, error) {
 			return &fakePapercraftPage{duration: 0.1}, nil
 		},
 		startEncoder: func(_ context.Context, cfg papercraftEncoderConfig) (papercraftEncoder, error) {

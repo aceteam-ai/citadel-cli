@@ -30,6 +30,12 @@ func TestConfigurePapercraftProcessTreeUnix(t *testing.T) {
 }
 
 func TestChromiumShutdownKillsHelpersAfterRootExited(t *testing.T) {
+	originalCommand := renderLimitedCommand
+	renderLimitedCommand = func(ctx context.Context, binary string, args ...string) (*exec.Cmd, error) {
+		return exec.CommandContext(ctx, binary, args...), nil
+	}
+	t.Cleanup(func() { renderLimitedCommand = originalCommand })
+
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	process, err := startChromiumProcess(
 		context.Background(),

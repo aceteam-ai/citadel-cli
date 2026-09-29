@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -36,7 +37,13 @@ func liveAudioMixDeps() audioMixDeps {
 	return audioMixDeps{
 		lookFFmpeg: func() (string, error) { return exec.LookPath("ffmpeg") },
 		run: func(ctx context.Context, bin string, args []string) ([]byte, error) {
-			return exec.CommandContext(ctx, bin, args...).CombinedOutput()
+			cmd, err := renderLimitedCommand(ctx, bin, args...)
+			if err != nil {
+				return nil, err
+			}
+			cmd.WaitDelay = 5 * time.Second
+			configurePapercraftProcessTree(cmd)
+			return cmd.CombinedOutput()
 		},
 	}
 }
@@ -46,6 +53,9 @@ func liveAudioMixDeps() audioMixDeps {
 // stays in paper-trail; this runner owns only the portable mix/normalization
 // bridge requested by #1161.
 func runAudioMixBuiltin(ctx context.Context, params json.RawMessage, inputs []string, outDir string, deps audioMixDeps) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, renderJobWallTimeout)
+	defer cancel()
+
 	if _, err := decodeBuiltinParams(params); err != nil {
 		return nil, err
 	}
