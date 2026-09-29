@@ -34,7 +34,7 @@ func TestTemplateRunnerClosedVocabulary(t *testing.T) {
 }
 
 func TestTemplateSchemaLocalReferences(t *testing.T) {
-	schema := json.RawMessage(`{"type":"object","$defs":{"gain":{"type":"number","maximum":2}},"properties":{"gain":{"$ref":"#/$defs/gain"}},"required":["gain"]}`)
+	schema := json.RawMessage(`{"type":"object","additionalProperties":false,"$defs":{"gain":{"type":"number","maximum":2}},"properties":{"gain":{"$ref":"#/$defs/gain"}},"required":["gain"]}`)
 	if err := ValidateTemplateParams(json.RawMessage(`{"gain":1}`), schema, json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -104,10 +104,10 @@ func TestTemplateSchemaUsesHashedNumericSemantics(t *testing.T) {
 		schema, params string
 		accept         bool
 	}{
-		{`{"type":"object","properties":{"gain":{"maximum":1e-400}}}`, `{"gain":1e-300}`, false},
-		{`{"type":"object","properties":{"gain":{"minimum":1e-400}}}`, `{"gain":0}`, true},
-		{`{"type":"object","properties":{"gain":{"maximum":9007199254740993.0}}}`, `{"gain":9007199254740993}`, false},
-		{`{"type":"object","properties":{"gain":{"const":0.0}}}`, `{"gain":1e-400}`, true},
+		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"maximum":1e-400}}}`, `{"gain":1e-300}`, false},
+		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"minimum":1e-400}}}`, `{"gain":0}`, true},
+		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"maximum":9007199254740993.0}}}`, `{"gain":9007199254740993}`, false},
+		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"const":0.0}}}`, `{"gain":1e-400}`, true},
 	} {
 		err := ValidateTemplateParams(json.RawMessage(tc.params), json.RawMessage(tc.schema), json.RawMessage(`{}`))
 		if (err == nil) != tc.accept {
@@ -117,5 +117,117 @@ func TestTemplateSchemaUsesHashedNumericSemantics(t *testing.T) {
 	got, err := NormalizeTemplateParams(json.RawMessage(`{"gain":1e-400,"rounded":9007199254740993.0,"integer":9007199254740993}`))
 	if err != nil || string(got) != `{"gain":0.0,"integer":9007199254740993,"rounded":9007199254740992.0}` {
 		t.Fatalf("wrong dispatched params: %s %v", got, err)
+	}
+}
+
+// TestClosedInputSchemaGate pins the citadel-cli#1161 gate: an approved
+// input_schema must be closed (additionalProperties:false on every object
+// subschema, no case-fold-colliding property keys, no construct the walk cannot
+// reason about), so an alternate-cased extra param key cannot slip past the schema
+// and then bind a constrained field case-insensitively inside a builtin.
+func TestClosedInputSchemaGate(t *testing.T) {
+	const closed = `{"type":"object","additionalProperties":false,"properties":{"fps":{"type":"integer","maximum":60}}}`
+
+	refused := []struct {
+		name, schema, params, want string
+	}{
+		{
+			// (1) root not closed is refused, even with otherwise-valid params.
+			"open_root",
+			`{"type":"object","properties":{"fps":{"type":"integer"}}}`,
+			`{"fps":30}`,
+			"additionalProperties",
+		},
+		{
+			// (2) recursion: a nested object left open re-opens the hole one level down.
+			"open_nested_object",
+			`{"type":"object","additionalProperties":false,"properties":{"video":{"type":"object","properties":{"fps":{"type":"integer"}}}}}`,
+			`{"video":{"fps":30}}`,
+			"additionalProperties",
+		},
+		{
+			// (3) an alternate-cased extra key is rejected by the compiled schema
+			// itself once additionalProperties:false is enforced.
+			"alt_cased_key_rejected_by_schema",
+			closed,
+			`{"Fps":9999}`,
+			"violate input_schema",
+		},
+		{
+			// (4) two properties colliding under case-fold is a bind ambiguity.
+			"case_fold_property_collision",
+			`{"type":"object","additionalProperties":false,"properties":{"fps":{"type":"integer"},"Fps":{"type":"integer"}}}`,
+			`{}`,
+			"collide under case-fold",
+		},
+		{
+			// (5a) an external / non-local $ref is forbidden.
+			"external_ref",
+			`{"type":"object","$ref":"https://evil.example/schema.json"}`,
+			`{}`,
+			"forbidden",
+		},
+		{
+			// (5b) patternProperties cannot be reasoned about; fail closed.
+			"pattern_properties",
+			`{"type":"object","additionalProperties":false,"patternProperties":{"^x":{"type":"string"}}}`,
+			`{}`,
+			"patternProperties",
+		},
+		{
+			// (5c) a schema-valued additionalProperties is not "exactly false".
+			"schema_valued_additional_properties",
+			`{"type":"object","additionalProperties":{"type":"string"}}`,
+			`{}`,
+			"exactly false",
+		},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateTemplateParams(json.RawMessage(tc.params), json.RawMessage(tc.schema), json.RawMessage(`{}`))
+			if err == nil {
+				t.Fatalf("closed-schema gate accepted %s / %s", tc.schema, tc.params)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+
+	// A well-formed closed schema with an exactly-declared key still validates.
+	if err := ValidateTemplateParams(json.RawMessage(`{"fps":30}`), json.RawMessage(closed), json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("closed schema rejected valid params: %v", err)
+	}
+	// output_schema is deliberately NOT subjected to the gate (it constrains what a
+	// builtin produces, not caller-controlled params): an open output_schema is fine.
+	if err := ValidateTemplateParams(json.RawMessage(`{"fps":30}`), json.RawMessage(closed), json.RawMessage(`{"type":"object","properties":{"mix":{"type":"string"}}}`)); err != nil {
+		t.Fatalf("open output_schema should be allowed: %v", err)
+	}
+}
+
+// TestClosedInputSchemaGateClosesRealBindHole proves both halves the gate exists
+// for: Go's encoding/json really does bind an alternate-cased key to a constrained
+// struct field (the hole), and ValidateTemplateParams refuses that same payload
+// against a closed schema before any builtin could decode it (the fix).
+func TestClosedInputSchemaGateClosesRealBindHole(t *testing.T) {
+	// The hole: a builtin decoding params into its own struct binds "Fps" to the
+	// field tagged `json:"fps"` case-insensitively, bypassing a "fps" constraint.
+	type mixParams struct {
+		Fps int `json:"fps"`
+	}
+	var mp mixParams
+	if err := json.Unmarshal([]byte(`{"Fps":9999}`), &mp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if mp.Fps != 9999 {
+		t.Fatal("expected encoding/json to bind the alternate-cased key (the hole this gate closes)")
+	}
+
+	// The fix: the same payload is refused at validation against a closed schema,
+	// so it never reaches a builtin decode.
+	const closed = `{"type":"object","additionalProperties":false,"properties":{"fps":{"type":"integer","maximum":60}}}`
+	err := ValidateTemplateParams(json.RawMessage(`{"Fps":9999}`), json.RawMessage(closed), json.RawMessage(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "violate input_schema") {
+		t.Fatalf("gate did not refuse the alt-cased key: %v", err)
 	}
 }

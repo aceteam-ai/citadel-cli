@@ -162,8 +162,20 @@ func ValidateTemplateParams(params, inputSchema, outputSchema json.RawMessage) e
 		if err != nil {
 			return fmt.Errorf("%s: %w", field.name, err)
 		}
-		if _, ok := schemaValue.(map[string]any); !ok {
+		schemaMap, ok := schemaValue.(map[string]any)
+		if !ok {
 			return fmt.Errorf("%s must be an object", field.name)
+		}
+		// citadel-cli#1161 gate: an approved input_schema must be "closed" so a
+		// param key that is not an exactly-declared property is rejected here,
+		// before any builtin decodes params into a Go struct (where encoding/json
+		// would bind an alternate-cased key case-insensitively and bypass the
+		// schema). Applies to input_schema only: params are the caller-controlled
+		// surface; output_schema constrains what a builtin produces.
+		if field.name == "input_schema" {
+			if err := enforceClosedInputSchema(schemaMap); err != nil {
+				return fmt.Errorf("input_schema: %w", err)
+			}
 		}
 		c := jsonschema.NewCompiler()
 		c.LoadURL = func(url string) (io.ReadCloser, error) {
@@ -256,4 +268,131 @@ func ParseTemplateInputFiles(raw json.RawMessage, nodeID string) ([]TemplateInpu
 		files = append(files, f)
 	}
 	return files, nil
+}
+
+// enforceClosedInputSchema requires an approved template input_schema to be
+// "closed": every object subschema must declare "additionalProperties": false, so
+// a params key that is not an exactly-declared property is rejected at validation.
+// This is the citadel-cli#1161 gate. Without it, Go's encoding/json binds struct
+// fields case-insensitively, so an alternate-cased extra key (e.g. "Fps" against a
+// field tagged `json:"fps"`) passes the schema as an unconstrained additional
+// property and then binds the constrained field inside a builtin, bypassing the
+// schema. It fails closed on any construct it cannot reason about ($ref,
+// patternProperties, a schema-valued additionalProperties, unevaluatedProperties)
+// and on properties keys that collide under case-fold (another bind ambiguity).
+// Nothing is approved yet, so this strictness costs no compatibility; loosening it
+// later is a one-line change, whereas tightening it later is a hash-breaking
+// re-approval of every template.
+func enforceClosedInputSchema(root map[string]any) error {
+	if !schemaDescribesObject(root) {
+		return fmt.Errorf("root must be an object schema (\"type\":\"object\" with \"additionalProperties\": false)")
+	}
+	return walkClosedSchema(root, "")
+}
+
+// walkClosedSchema enforces the closed-object rule on node and recurses into every
+// place a subschema can legally appear.
+func walkClosedSchema(node any, at string) error {
+	m, ok := node.(map[string]any)
+	if !ok {
+		// A boolean or scalar subschema node constrains nothing a builtin binds.
+		return nil
+	}
+	if ref, present := m["$ref"]; present {
+		// A local "#/..." ref is allowed: its target lives in this same schema
+		// ($defs/definitions/properties), which walkClosedSchema also visits and
+		// requires closed, so the referenced object subschema is enforced too. An
+		// external or non-local ref is forbidden (also blocked at compile by the
+		// LoadURL hook, but rejected here first so the closed-schema reasoning holds).
+		s, ok := ref.(string)
+		if !ok || !strings.HasPrefix(s, "#") {
+			return fmt.Errorf("external or non-local $ref at %s is forbidden; approved schemas must be self-contained", schemaPathOrRoot(at))
+		}
+	}
+	for _, forbidden := range []string{"$dynamicRef", "patternProperties", "unevaluatedProperties"} {
+		if _, present := m[forbidden]; present {
+			return fmt.Errorf("unsupported schema construct %q at %s (approved schemas must be closed and self-contained)", forbidden, schemaPathOrRoot(at))
+		}
+	}
+	if schemaDescribesObject(m) {
+		ap, present := m["additionalProperties"]
+		if !present {
+			return fmt.Errorf("object schema at %s must declare \"additionalProperties\": false", schemaPathOrRoot(at))
+		}
+		if b, ok := ap.(bool); !ok || b {
+			return fmt.Errorf("\"additionalProperties\" at %s must be exactly false, not true or a schema", schemaPathOrRoot(at))
+		}
+		if props, ok := m["properties"].(map[string]any); ok {
+			seen := map[string]string{}
+			for k := range props {
+				lk := strings.ToLower(k)
+				if prev, dup := seen[lk]; dup {
+					return fmt.Errorf("properties keys %q and %q at %s collide under case-fold", prev, k, schemaPathOrRoot(at))
+				}
+				seen[lk] = k
+			}
+			for k, sub := range props {
+				if err := walkClosedSchema(sub, at+".properties."+k); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	switch items := m["items"].(type) {
+	case map[string]any:
+		if err := walkClosedSchema(items, at+".items"); err != nil {
+			return err
+		}
+	case []any:
+		for i, sub := range items {
+			if err := walkClosedSchema(sub, fmt.Sprintf("%s.items[%d]", at, i)); err != nil {
+				return err
+			}
+		}
+	}
+	for _, comb := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := m[comb].([]any); ok {
+			for i, sub := range arr {
+				if err := walkClosedSchema(sub, fmt.Sprintf("%s.%s[%d]", at, comb, i)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, defs := range []string{"$defs", "definitions"} {
+		if dm, ok := m[defs].(map[string]any); ok {
+			for k, sub := range dm {
+				if err := walkClosedSchema(sub, at+"."+defs+"."+k); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// schemaDescribesObject reports whether a schema node constrains an object: it
+// declares "properties" or its "type" is (or includes) "object".
+func schemaDescribesObject(m map[string]any) bool {
+	if _, ok := m["properties"]; ok {
+		return true
+	}
+	switch t := m["type"].(type) {
+	case string:
+		return t == "object"
+	case []any:
+		for _, v := range t {
+			if s, ok := v.(string); ok && s == "object" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaPathOrRoot(at string) string {
+	if at == "" {
+		return "(root)"
+	}
+	return strings.TrimPrefix(at, ".")
 }
