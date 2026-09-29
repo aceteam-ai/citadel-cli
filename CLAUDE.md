@@ -767,6 +767,22 @@ on the node (citadel #780) — this is node-wide. The CLI (`citadel ssh`/`citade
 connect`) is unaffected either way: it always defaults to a bare shell and only
 opts into tmux persistence with `--tmux` (citadel #759).
 
+**A Citadel-started tmux server must not remain in citadel.service's control
+group (citadel-cli#1166).** `tmux.PersistentSessionCommand` is the single launch
+boundary shared by `TMUX_SESSION` detached creation and the terminal PTY's
+attach-or-create path. On Linux, when Citadel is running in a systemd USER unit,
+it wraps the tmux command in a uniquely named `systemd-run --user --scope`; a
+root SYSTEM unit uses the system manager instead. The scope is a sibling of the
+worker unit, so systemd's default `KillMode=control-group` remains intact for
+ordinary worker subprocesses while the tmux server survives a worker restart.
+Do not replace this with `KillMode=process`: that would also strand interrupted
+Docker, ffmpeg, download, and job-handler children. Non-systemd platforms,
+interactive invocations, a missing `systemd-run`, and non-root system units that
+cannot create a sibling system scope retain the direct command as a fail-open
+compatibility path. The last case is an explicit limitation; the shipped
+`citadel.service` acceptance path is the user unit, and the root install.sh
+fleet unit is also covered.
+
 **Key Packages:**
 - **`internal/terminal/server.go`**: WebSocket server with rate limiting
 - **`internal/terminal/session.go`**: PTY session management (creack/pty)
