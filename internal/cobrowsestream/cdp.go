@@ -67,9 +67,11 @@ type screencastFrame struct {
 type cdpClient struct {
 	conn *websocket.Conn
 
-	writeMu sync.Mutex
-	idMu    sync.Mutex
-	nextID  int
+	writeMu   sync.Mutex
+	idMu      sync.Mutex
+	nextID    int
+	pendingMu sync.Mutex
+	pending   map[int]chan cdpResponse
 
 	// onFrame is invoked from the read loop for every screencast frame. It must
 	// not block for long (it feeds the coalescing single-slot holder).
@@ -84,6 +86,40 @@ type cdpClient struct {
 	done      chan struct{}
 }
 
+type cdpResponse struct {
+	result map[string]any
+	err    error
+}
+
+// Client is a persistent request/response CDP connection. The cobrowse stream
+// and offline render builtins share the same target resolution, WebSocket
+// lifecycle, and serialized-write implementation through this wrapper.
+type Client struct{ client *cdpClient }
+
+// DialCDP opens a persistent CDP connection to the first page target exposed on
+// debugPort. Callers must Close it.
+func DialCDP(debugPort int) (*Client, error) {
+	c, err := dialCDP(debugPort, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{client: c}, nil
+}
+
+// Command sends one CDP request and waits for its matching response or ctx.
+func (c *Client) Command(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
+	if c == nil || c.client == nil {
+		return nil, fmt.Errorf("CDP client is nil")
+	}
+	return c.client.command(ctx, method, params)
+}
+
+// Done closes when the browser socket closes.
+func (c *Client) Done() <-chan struct{} { return c.client.Done() }
+
+// Close detaches the CDP connection and waits for its read loop.
+func (c *Client) Close() { c.client.Close() }
+
 // dialCDP resolves the page target for debugPort and opens a persistent CDP
 // WebSocket. onFrame receives every screencast frame once startScreencast runs.
 func dialCDP(debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
@@ -97,7 +133,7 @@ func dialCDP(debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CDP dial: %w", err)
 	}
-	c := &cdpClient{conn: conn, onFrame: onFrame, done: make(chan struct{})}
+	c := &cdpClient{conn: conn, onFrame: onFrame, done: make(chan struct{}), pending: make(map[int]chan cdpResponse)}
 	go c.readLoop()
 	return c, nil
 }
@@ -108,16 +144,61 @@ func dialCDP(debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
 // dispatch does not need the ack to proceed (local RTT, and dropping the wait
 // keeps a flooding viewer from serializing on round-trips).
 func (c *cdpClient) send(method string, params map[string]any) error {
+	_, err := c.writeRequest(method, params, nil)
+	return err
+}
+
+func (c *cdpClient) writeRequest(method string, params map[string]any, response chan cdpResponse) (int, error) {
+	if params == nil {
+		params = map[string]any{}
+	}
 	c.idMu.Lock()
 	c.nextID++
 	id := c.nextID
 	c.idMu.Unlock()
+	if response != nil {
+		c.pendingMu.Lock()
+		c.pending[id] = response
+		c.pendingMu.Unlock()
+	}
 
 	msg := map[string]any{"id": id, "method": method, "params": params}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	return c.conn.WriteJSON(msg)
+	if err := c.conn.WriteJSON(msg); err != nil {
+		if response != nil {
+			c.pendingMu.Lock()
+			delete(c.pending, id)
+			c.pendingMu.Unlock()
+		}
+		return 0, err
+	}
+	return id, nil
+}
+
+func (c *cdpClient) command(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
+	response := make(chan cdpResponse, 1)
+	id, err := c.writeRequest(method, params, response)
+	if err != nil {
+		return nil, fmt.Errorf("CDP %s write: %w", method, err)
+	}
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}()
+	select {
+	case res := <-response:
+		if res.err != nil {
+			return nil, fmt.Errorf("CDP %s: %w", method, res.err)
+		}
+		return res.result, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("CDP %s: %w", method, ctx.Err())
+	case <-c.done:
+		return nil, fmt.Errorf("CDP %s: connection closed", method)
+	}
 }
 
 // readLoop dispatches CDP messages until the conn closes. Events (no id) are
@@ -132,14 +213,31 @@ func (c *cdpClient) readLoop() {
 			return
 		}
 		var msg struct {
+			ID     int             `json:"id"`
 			Method string          `json:"method"`
 			Params json.RawMessage `json:"params"`
+			Result map[string]any  `json:"result"`
+			Error  json.RawMessage `json:"error"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+		if msg.ID != 0 {
+			c.pendingMu.Lock()
+			response := c.pending[msg.ID]
+			delete(c.pending, msg.ID)
+			c.pendingMu.Unlock()
+			if response != nil {
+				res := cdpResponse{result: msg.Result}
+				if len(msg.Error) != 0 && string(msg.Error) != "null" {
+					res.err = fmt.Errorf("browser returned %s", string(msg.Error))
+				}
+				response <- res
+			}
+			continue
+		}
 		if msg.Method != "Page.screencastFrame" {
-			continue // response to a send, or an event we ignore
+			continue // event we ignore
 		}
 		c.handleScreencastFrame(msg.Params)
 	}

@@ -324,6 +324,11 @@ func findChromium() (string, error) {
 	return "", fmt.Errorf("no Chromium/Chrome binary found (install google-chrome or chromium)")
 }
 
+// FindChromium returns the first available Chromium/Chrome binary. Offline
+// render builtins use the same lookup order as the browser automation paths so
+// one node installation satisfies both capabilities.
+func FindChromium() (string, error) { return findChromium() }
+
 // displayMode is how the co-browse browser obtains an X display.
 type displayMode int
 

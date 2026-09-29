@@ -356,6 +356,9 @@ func walkClosedSchema(node any, at string) error {
 				seen[fk] = k
 			}
 			for k, sub := range props {
+				if !schemaHasExplicitType(sub) {
+					return fmt.Errorf("property schema at %s must declare an explicit type", schemaPathOrRoot(at+".properties."+k))
+				}
 				if err := walkClosedSchema(sub, at+".properties."+k); err != nil {
 					return err
 				}
@@ -370,15 +373,17 @@ func walkClosedSchema(node any, at string) error {
 	if items, present := m["items"]; present {
 		switch it := items.(type) {
 		case map[string]any:
+			if !schemaHasExplicitType(it) {
+				return fmt.Errorf("item schema at %s must declare an explicit type", schemaPathOrRoot(at+".items"))
+			}
 			if err := walkClosedSchema(it, at+".items"); err != nil {
 				return err
 			}
-		case bool:
-			// A boolean items schema constrains nothing a builtin binds.
 		default:
-			// An array (tuple) items form needs prefixItems/additionalItems, which
-			// are not in the allowlist; refuse rather than half-enforce it.
-			return fmt.Errorf("\"items\" at %s must be a single schema object", schemaPathOrRoot(at))
+			// Boolean and tuple-form item schemas do not declare a type at the
+			// binding site. Refuse them rather than let a builtin later decode an
+			// unconstrained object into a typed Go value.
+			return fmt.Errorf("\"items\" at %s must be a single schema object with an explicit type", schemaPathOrRoot(at))
 		}
 	}
 	if defs, present := m["$defs"]; present {
@@ -393,6 +398,21 @@ func walkClosedSchema(node any, at string) error {
 		}
 	}
 	return nil
+}
+
+// schemaHasExplicitType is deliberately syntactic. A property or items node
+// must name its type at the exact binding site, even when it also carries a
+// $ref. That keeps an empty, annotation-only, true, or ref-only schema from
+// accepting an arbitrary object that a builtin could later bind to a typed Go
+// struct. The JSON Schema compiler remains the authority for whether the type
+// value itself is valid.
+func schemaHasExplicitType(node any) bool {
+	m, ok := node.(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = m["type"]
+	return ok
 }
 
 // refDefName validates that a $ref is exactly a local "#/$defs/<name>" pointer and
