@@ -15,12 +15,20 @@ import (
 // tmux.Resolve succeeds deterministically without a real tmux on the runner.
 func makeFakeTmux(t *testing.T) string {
 	t.Helper()
+	enablePersistentTmuxForTest(t)
 	bin := filepath.Join(t.TempDir(), "tmux")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("setup fake tmux: %v", err)
 	}
 	t.Setenv("CITADEL_TMUX_BIN", bin)
 	return bin
+}
+
+func enablePersistentTmuxForTest(t *testing.T) {
+	t.Helper()
+	previous := currentPlatformPersistentTmuxSupported
+	currentPlatformPersistentTmuxSupported = func() bool { return true }
+	t.Cleanup(func() { currentPlatformPersistentTmuxSupported = previous })
 }
 
 // TestTmuxInstallTimeoutUnderServerWriteTimeout pins the constraint that

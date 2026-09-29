@@ -175,6 +175,7 @@ func TestResolveSessionCommand_OverrideTriggersInstallOnMissingTmux(t *testing.T
 // platform is gated/unsupported), the connection still succeeds as a bare
 // shell rather than erroring out.
 func TestResolveSessionCommand_OverrideInstallFailsFallsBackToBare(t *testing.T) {
+	enablePersistentTmuxForTest(t)
 	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	t.Setenv("CITADEL_TMUX_BIN", filepath.Join(t.TempDir(), "missing"))
 
@@ -257,6 +258,7 @@ func TestResolveSessionCommand_ExplicitOverrideHonoredInsideTmux(t *testing.T) {
 // can simulate an install landing this exact binary at a controlled moment.
 func makeFakeTmuxPath(t *testing.T) string {
 	t.Helper()
+	enablePersistentTmuxForTest(t)
 	bin := filepath.Join(t.TempDir(), "tmux-installed")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("setup fake tmux: %v", err)

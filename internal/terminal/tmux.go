@@ -164,7 +164,7 @@ func persistentTmuxSupported(goos string) bool {
 	return goos != "windows"
 }
 
-func currentPlatformPersistentTmuxSupported() bool {
+var currentPlatformPersistentTmuxSupported = func() bool {
 	return persistentTmuxSupported(runtime.GOOS)
 }
 
