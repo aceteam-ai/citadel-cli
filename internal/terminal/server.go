@@ -169,8 +169,13 @@ type Server struct {
 	httpServer *http.Server
 	upgrader   websocket.Upgrader
 
-	mu      sync.RWMutex
-	running bool
+	mu       sync.RWMutex
+	running  bool
+	stopping bool
+	// lifecycleMu serializes complete Start/Stop transitions. running=false is
+	// not enough to permit a restart until the prior maintenance context,
+	// listener, and HTTP server have all been joined and shut down.
+	lifecycleMu sync.Mutex
 
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
@@ -182,6 +187,8 @@ type Server struct {
 	cancelMaintenance context.CancelFunc
 	maintenanceWG     sync.WaitGroup
 	listen            func(network, address string) (net.Listener, error)
+	shutdown          func(*http.Server, context.Context) error
+	limiterStopped    bool
 
 	// reapTmuxSessions is the tmux package boundary for the persistent-session
 	// TTL sweep. Kept on Server so tests can prove policy without a live tmux.
@@ -205,6 +212,7 @@ func NewServer(config *Config, auth TokenValidator) *Server {
 		limiter:  NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
 		logger:   newDefaultLogger(config.Debug),
 		listen:   net.Listen,
+		shutdown: func(server *http.Server, ctx context.Context) error { return server.Shutdown(ctx) },
 		now:      time.Now,
 	}
 	s.reapTmuxSessions = func(ctx context.Context, now time.Time) ([]string, error) {
@@ -342,12 +350,15 @@ func (s *Server) checkOrigin(r *http.Request) bool {
 
 // Start starts the terminal server
 func (s *Server) Start() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	if err := s.config.Validate(); err != nil {
 		return fmt.Errorf("invalid terminal server configuration: %w", err)
 	}
 
 	s.mu.Lock()
-	if s.running {
+	if s.running || s.stopping {
 		s.mu.Unlock()
 		return ErrServerAlreadyRunning
 	}
@@ -391,6 +402,10 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen on port %d: %w", s.config.Port, err)
 	}
 	maintenanceCtx, cancelMaintenance := context.WithCancel(context.Background())
+	if s.limiterStopped {
+		s.limiter = NewRateLimiter(s.config.RateLimitRPS, s.config.RateLimitBurst)
+		s.limiterStopped = false
+	}
 	s.httpServer = httpServer
 	s.maintenanceCtx = maintenanceCtx
 	s.cancelMaintenance = cancelMaintenance
@@ -435,13 +450,18 @@ func (s *Server) Start() error {
 
 // Stop gracefully stops the terminal server
 func (s *Server) Stop(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	s.mu.Lock()
-	if !s.running {
+	if !s.running && !s.stopping {
 		s.mu.Unlock()
 		return ErrServerNotRunning
 	}
 	s.running = false
+	s.stopping = true
 	cancelMaintenance := s.cancelMaintenance
+	httpServer := s.httpServer
 	s.cancelMaintenance = nil
 	s.mu.Unlock()
 
@@ -456,6 +476,9 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	// Stop the rate limiter
 	s.limiter.Stop()
+	s.mu.Lock()
+	s.limiterStopped = true
+	s.mu.Unlock()
 
 	// Close all sessions
 	sessionCount := s.sessions.Count()
@@ -465,12 +488,20 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 
 	// Shutdown HTTP server
-	if s.httpServer != nil {
-		if err := s.httpServer.Shutdown(ctx); err != nil {
+	if httpServer != nil {
+		if err := s.shutdown(httpServer, ctx); err != nil {
 			s.logger.Printf("shutdown error: %v", err)
 			return err
 		}
 	}
+
+	s.mu.Lock()
+	if s.httpServer == httpServer {
+		s.httpServer = nil
+		s.maintenanceCtx = nil
+	}
+	s.stopping = false
+	s.mu.Unlock()
 
 	s.logger.Printf("terminal server stopped (total=%d, failed=%d)",
 		atomic.LoadInt64(&s.totalConnections), atomic.LoadInt64(&s.failedConnections))

@@ -28,6 +28,7 @@ type RateLimiter struct {
 
 	// stopCleanup signals the cleanup goroutine to stop
 	stopCleanup chan struct{}
+	stopOnce    sync.Once
 }
 
 // rateLimiterEntry holds a rate limiter and its last access time
@@ -141,7 +142,7 @@ func (rl *RateLimiter) cleanup() {
 
 // Stop stops the rate limiter's cleanup goroutine
 func (rl *RateLimiter) Stop() {
-	close(rl.stopCleanup)
+	rl.stopOnce.Do(func() { close(rl.stopCleanup) })
 }
 
 // Count returns the number of tracked IPs

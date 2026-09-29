@@ -133,6 +133,20 @@ func (f *fakeRunner) Run(ctx context.Context, _ string, args ...string) ([]byte,
 	if len(args) > 0 {
 		key = args[0]
 	}
+	if containsArg(call, "new-session") && f.errs[key] == nil {
+		delete(f.errs, "display-message")
+		lease := call[len(call)-1]
+		f.outputs["display-message"] = []byte("agent\t$1\t42\t0\t" + managedSessionOptionValue + "\t" + lease + "\n")
+	}
+	if key == "if-shell" && len(call) > 5 && strings.HasPrefix(call[5], "set-option ") {
+		fields := strings.Fields(call[5])
+		lease := fields[5]
+		statusFields := strings.Split(strings.TrimSpace(string(f.outputs["display-message"])), "\t")
+		if len(statusFields) == 6 {
+			statusFields[5] = lease
+			f.outputs["display-message"] = []byte(strings.Join(statusFields, "\t") + "\n")
+		}
+	}
 	return f.outputs[key], f.errs[key]
 }
 
@@ -187,7 +201,7 @@ func TestManager_HasSession_InvalidName(t *testing.T) {
 
 func TestManager_EnsureSessionExistingManagedRenewsWithoutCreate(t *testing.T) {
 	f := newFakeRunner()
-	f.outputs["display-message"] = []byte("agent\t0\t" + managedSessionOptionValue + "\t100\n")
+	f.outputs["display-message"] = []byte("agent\t$1\t42\t0\t" + managedSessionOptionValue + "\t100\n")
 	m := NewManagerWith("tmux", f)
 
 	deadline := time.Unix(2_000_000_000, 0)
@@ -199,15 +213,59 @@ func TestManager_EnsureSessionExistingManagedRenewsWithoutCreate(t *testing.T) {
 			t.Fatalf("EnsureSession created a session that already existed: %v", c)
 		}
 	}
-	want := []string{"set-option", "-q", "-t", "agent", managedSessionLeaseOption, "2000000000"}
-	if got := f.calls[len(f.calls)-1]; !reflect.DeepEqual(got, want) {
-		t.Fatalf("renew args = %v, want %v", got, want)
+	if got := f.calls[1]; got[0] != "if-shell" || !strings.Contains(strings.Join(got, " "), "$1") || !strings.Contains(strings.Join(got, " "), "2000000000") {
+		t.Fatalf("identity-bound renew args = %v", got)
+	}
+}
+
+func TestManager_EnsureSessionReplacementDuringRenewFailsClosed(t *testing.T) {
+	f := newFakeRunner()
+	step := 0
+	f.run = func(_ context.Context, args []string) ([]byte, error) {
+		step++
+		switch step {
+		case 1:
+			return []byte("agent\t$7\t42\t0\t" + managedSessionOptionValue + "\t100\n"), nil
+		case 2:
+			if args[0] != "if-shell" || !strings.Contains(args[4], "$7") || !strings.Contains(args[4], "42") {
+				t.Fatalf("renew was not identity-bound: %v", args)
+			}
+			return nil, nil // condition became false after replacement
+		case 3:
+			return []byte("agent\t$0\t99\t0\t\t0\n"), nil
+		default:
+			return nil, fmt.Errorf("unexpected call: %v", args)
+		}
+	}
+	m := NewManagerWith("tmux", f)
+	err := m.EnsureSessionLease(context.Background(), "agent", "/bin/bash", time.Unix(2_000_000_000, 0))
+	if !errors.Is(err, ErrSessionNameCollision) {
+		t.Fatalf("error = %v, want ErrSessionNameCollision", err)
+	}
+}
+
+func TestManager_PrepareSessionAttachIsIdentityBound(t *testing.T) {
+	f := newFakeRunner()
+	f.outputs["display-message"] = []byte("agent\t$7\t42\t0\t" + managedSessionOptionValue + "\t100\n")
+	m := NewManagerWith("tmux", f)
+	command, err := m.PrepareSession(context.Background(), "agent", "/bin/bash", time.Unix(2_000_000_000, 0))
+	if err != nil {
+		t.Fatalf("PrepareSession() error: %v", err)
+	}
+	joined := strings.Join(command, " ")
+	for _, want := range []string{"if-shell", "#{session_id},$7", "#{pid},42", managedSessionOption, "attach-session -t $7"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("identity-bound attach %q missing %q", joined, want)
+		}
+	}
+	if strings.Contains(joined, "attach-session -t agent") {
+		t.Fatalf("attach reused mutable name: %q", joined)
 	}
 }
 
 func TestManager_EnsureSessionRejectsUnmarkedCollisionWithoutMutation(t *testing.T) {
 	f := newFakeRunner()
-	f.outputs["display-message"] = []byte("agent\t0\t\t0\n")
+	f.outputs["display-message"] = []byte("agent\t$1\t42\t0\t\t0\n")
 	m := NewManagerWith("tmux", f)
 
 	err := m.EnsureSessionLease(context.Background(), "agent", "/bin/bash", time.Unix(2_000_000_000, 0))
@@ -228,11 +286,23 @@ func TestManager_EnsureSessionCreatesThenMarksLease(t *testing.T) {
 	if err := m.EnsureSessionLease(context.Background(), "agent", "/bin/bash", deadline); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got, want := f.calls[1], NewDetachedArgs("agent", "/bin/bash"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("create args = %v, want %v", got, want)
+	if len(f.calls) != 3 {
+		t.Fatalf("create and ownership marker must be one invocation: calls=%v", f.calls)
 	}
-	if got, want := f.calls[2], MarkSessionLeaseArgs("agent", deadline.Unix()); !reflect.DeepEqual(got, want) {
-		t.Fatalf("mark args = %v, want %v", got, want)
+	if got, want := f.calls[1], NewManagedDetachedArgs("agent", "/bin/bash", deadline.Unix()); !reflect.DeepEqual(got, want) {
+		t.Fatalf("atomic create/mark args = %v, want %v", got, want)
+	}
+}
+
+func TestNewManagedDetachedArgsMarksOnlyAfterSuccessfulCreateInSameQueue(t *testing.T) {
+	got := NewManagedDetachedArgs("agent", "/bin/bash", 1234)
+	want := []string{
+		"new-session", "-d", "-s", "agent", "/bin/bash",
+		";", "set-option", "-q", "-t", "agent", managedSessionOption, managedSessionOptionValue,
+		";", "set-option", "-q", "-t", "agent", managedSessionLeaseOption, "1234",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NewManagedDetachedArgs() = %v, want %v", got, want)
 	}
 }
 
@@ -246,7 +316,7 @@ func TestManager_EnsureSessionCreateRaceNeverAdoptsUnmarkedWinner(t *testing.T) 
 			if displays == 1 {
 				return nil, exitError(t)
 			}
-			return []byte("agent\t0\t\t0\n"), nil
+			return []byte("agent\t$2\t42\t0\t\t0\n"), nil
 		case "new-session":
 			return []byte("duplicate session: agent"), errors.New("create lost race")
 		default:
@@ -260,22 +330,11 @@ func TestManager_EnsureSessionCreateRaceNeverAdoptsUnmarkedWinner(t *testing.T) 
 	}
 	for _, call := range f.calls {
 		if call[0] == "set-option" || call[0] == "kill-session" {
-			t.Fatalf("race winner was mutated: calls=%v", f.calls)
+			t.Fatalf("race winner received a follow-up mutation: calls=%v", f.calls)
 		}
 	}
-}
-
-func TestManager_EnsureSessionMarkFailureCleansUpOnlyNewSession(t *testing.T) {
-	f := newFakeRunner()
-	f.errs["display-message"] = exitError(t)
-	f.errs["set-option"] = errors.New("mark failed")
-	m := NewManagerWith("tmux", f)
-	err := m.EnsureSessionLease(context.Background(), "agent", "/bin/bash", time.Now().Add(time.Hour))
-	if err == nil {
-		t.Fatal("expected mark failure")
-	}
-	if got, want := f.calls[len(f.calls)-1], KillSessionArgs("agent"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("cleanup = %v, want %v", got, want)
+	if len(f.calls) != 3 || f.calls[1][0] != "new-session" || !containsArg(f.calls[1], managedSessionOption) {
+		t.Fatalf("ownership was not confined to the failed creator queue: calls=%v", f.calls)
 	}
 }
 
@@ -293,13 +352,20 @@ func TestManager_EnsureSessionUsesScopeCommand(t *testing.T) {
 	if err := m.EnsureSession(context.Background(), "agent", "/bin/bash"); err != nil {
 		t.Fatalf("EnsureSession() error: %v", err)
 	}
-	want := []string{"--scope", "--", "/usr/bin/tmux", "new-session", "-d", "-s", "agent", "/bin/bash"}
-	if got := f.calls[len(f.calls)-2]; !reflect.DeepEqual(got, want) {
-		t.Fatalf("scoped create args = %v, want %v", got, want)
+	got := f.calls[len(f.calls)-2]
+	wantPrefix := []string{"--scope", "--", "/usr/bin/tmux", "new-session", "-d", "-s", "agent", "/bin/bash"}
+	if len(got) < len(wantPrefix) || !reflect.DeepEqual(got[:len(wantPrefix)], wantPrefix) || !containsArg(got, managedSessionOption) || !containsArg(got, managedSessionLeaseOption) {
+		t.Fatalf("scoped create/mark args = %v", got)
 	}
-	if got := f.calls[len(f.calls)-1]; len(got) == 0 || got[0] != "set-option" {
-		t.Fatalf("mark args = %v", got)
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
 	}
+	return false
 }
 
 type reaperRunner struct {
@@ -334,7 +400,7 @@ func (r *reaperRunner) Run(ctx context.Context, _ string, args ...string) ([]byt
 			if name == "malformed" {
 				lease = "not-a-lease"
 			}
-			rows = append(rows, fmt.Sprintf("%s\t%d\t%s\t%s", name, attached, marker, lease))
+			rows = append(rows, fmt.Sprintf("%s\t$%d\t42\t%d\t%s\t%s", name, len(rows)+1, attached, marker, lease))
 		}
 		return []byte(strings.Join(rows, "\n") + "\n"), nil
 	case "if-shell":
@@ -369,13 +435,13 @@ func exitErrorForRunner() error {
 func TestManager_ReapExpiredSessionsOnlyKillsMatchingLeaseAtomically(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
 	runner := &reaperRunner{now: now, sessions: map[string]SessionStatus{
-		"expired":         {Name: "expired", Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
-		"became-attached": {Name: "became-attached", Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
-		"renewed":         {Name: "renewed", Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
-		"recent":          {Name: "recent", Managed: true, LeaseExpires: now.Add(time.Hour).Unix()},
-		"attached":        {Name: "attached", Attached: true, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
-		"operator":        {Name: "operator", LeaseExpires: now.Add(-time.Hour).Unix()},
-		"malformed":       {Name: "malformed", Managed: true},
+		"expired":         {Name: "expired", ID: "$1", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+		"became-attached": {Name: "became-attached", ID: "$2", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+		"renewed":         {Name: "renewed", ID: "$3", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+		"recent":          {Name: "recent", ID: "$4", ServerPID: 42, Managed: true, LeaseExpires: now.Add(time.Hour).Unix()},
+		"attached":        {Name: "attached", ID: "$5", ServerPID: 42, Attached: true, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+		"operator":        {Name: "operator", ID: "$6", ServerPID: 42, LeaseExpires: now.Add(-time.Hour).Unix()},
+		"malformed":       {Name: "malformed", ID: "$7", ServerPID: 42, Managed: true},
 	}}
 	runner.beforeAtomic = func(sessions map[string]SessionStatus) {
 		status := sessions["became-attached"]
@@ -408,11 +474,11 @@ func TestManager_ReapExpiredSessionsOnlyKillsMatchingLeaseAtomically(t *testing.
 
 func TestParseSessionStatusesFailsClosed(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
-	out := fmt.Sprintf("managed\t0\t%s\t%d\noperator\t0\t\t%d\nbad name\t0\t%s\t%d\nbad-attached\tnope\t%s\t%d\n", managedSessionOptionValue, now.Unix(), now.Unix(), managedSessionOptionValue, now.Unix(), managedSessionOptionValue, now.Unix())
+	out := fmt.Sprintf("managed\t$1\t42\t0\t%s\t%d\noperator\t$2\t42\t0\t\t%d\nbad name\t$3\t42\t0\t%s\t%d\nbad-attached\t$4\t42\tnope\t%s\t%d\n", managedSessionOptionValue, now.Unix(), now.Unix(), managedSessionOptionValue, now.Unix(), managedSessionOptionValue, now.Unix())
 	got := parseSessionStatuses([]byte(out))
 	want := []SessionStatus{
-		{Name: "managed", Managed: true, LeaseExpires: now.Unix()},
-		{Name: "operator", LeaseExpires: now.Unix()},
+		{Name: "managed", ID: "$1", ServerPID: 42, Managed: true, LeaseExpires: now.Unix()},
+		{Name: "operator", ID: "$2", ServerPID: 42, LeaseExpires: now.Unix()},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("parseSessionStatuses() = %#v, want %#v", got, want)

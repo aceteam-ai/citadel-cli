@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -161,6 +163,102 @@ func TestStopCancelsAndJoinsInflightReaper(t *testing.T) {
 	case <-canceled:
 	case <-time.After(time.Second):
 		t.Fatal("Stop returned without canceling in-flight reaper")
+	}
+}
+
+func TestConcurrentRestartWaitsForCompleteStopLifecycle(t *testing.T) {
+	server := NewServer(validLifecycleConfig(), NewMockTokenValidator())
+	var listenCalls atomic.Int32
+	server.listen = func(string, string) (net.Listener, error) {
+		listenCalls.Add(1)
+		return net.Listen("tcp", "127.0.0.1:0")
+	}
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	var firstReap atomic.Bool
+	server.reapTmuxSessions = func(ctx context.Context, _ time.Time) ([]string, error) {
+		if firstReap.CompareAndSwap(false, true) {
+			close(entered)
+			<-ctx.Done()
+			close(canceled)
+			<-release
+			return nil, ctx.Err()
+		}
+		return nil, nil
+	}
+	if err := server.Start(); err != nil {
+		t.Fatalf("first Start() error: %v", err)
+	}
+	<-entered
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- server.Stop(context.Background()) }()
+	<-canceled // Stop is now blocked joining the old maintenance generation.
+
+	startDone := make(chan error, 1)
+	go func() { startDone <- server.Start() }()
+	time.Sleep(20 * time.Millisecond)
+	if got := listenCalls.Load(); got != 1 {
+		t.Fatalf("restart listened before prior Stop completed: calls=%d", got)
+	}
+	select {
+	case err := <-startDone:
+		t.Fatalf("restart returned before prior Stop completed: %v", err)
+	default:
+	}
+
+	close(release)
+	if err := <-stopDone; err != nil {
+		t.Fatalf("first Stop() error: %v", err)
+	}
+	if err := <-startDone; err != nil {
+		t.Fatalf("restart Start() error: %v", err)
+	}
+	if got := listenCalls.Load(); got != 2 {
+		t.Fatalf("listen calls after restart = %d, want 2", got)
+	}
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatalf("final Stop() error: %v", err)
+	}
+}
+
+func TestShutdownFailureCanBeRetriedBeforeRestart(t *testing.T) {
+	server := NewServer(validLifecycleConfig(), NewMockTokenValidator())
+	server.listen = func(string, string) (net.Listener, error) {
+		return net.Listen("tcp", "127.0.0.1:0")
+	}
+	server.reapTmuxSessions = func(context.Context, time.Time) ([]string, error) { return nil, nil }
+	originalLimiter := server.limiter
+	shutdownAttempts := 0
+	server.shutdown = func(httpServer *http.Server, ctx context.Context) error {
+		shutdownAttempts++
+		if shutdownAttempts == 1 {
+			return errors.New("shutdown timed out")
+		}
+		return httpServer.Shutdown(ctx)
+	}
+
+	if err := server.Start(); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	if err := server.Stop(context.Background()); err == nil {
+		t.Fatal("first Stop() unexpectedly succeeded")
+	}
+	if err := server.Start(); !errors.Is(err, ErrServerAlreadyRunning) {
+		t.Fatalf("Start during incomplete stop = %v, want ErrServerAlreadyRunning", err)
+	}
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatalf("retry Stop() error: %v", err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatalf("restart after completed Stop error: %v", err)
+	}
+	if server.limiter == originalLimiter {
+		t.Fatal("restart reused a rate limiter whose cleanup loop was stopped")
+	}
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatalf("final Stop() error: %v", err)
 	}
 }
 

@@ -772,6 +772,9 @@ selected path plus its reason through the package logger wired in
 `cmd/root.go`. `tmux.Manager.ReapExpiredSessions` owns persistent-session
 cleanup. Citadel marks only sessions it successfully creates; an existing
 unmarked name is an operator collision and must never be adopted or attached.
+Create+mark is one tmux command queue, and subsequent renew/attach commands are
+conditioned on the inspected session ID plus tmux server PID; never split these
+back into name-targeted check-then-act invocations.
 The server renews an explicit retention lease while attached and on detach.
 The reaper does not use `session_activity` (it misses detached pane output and
 `send-keys`); after the lease expires, even a running disconnected task may be

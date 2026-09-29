@@ -124,7 +124,12 @@ Sessions can also be pre-created, listed, or checked out-of-band through the
 Citadel marks only sessions it successfully creates; it never adopts an
 existing unmarked session. If the derived name collides with an operator-owned
 session, the connection logs the collision and safely falls back to a bare
-shell without attaching to or modifying that session.
+shell without attaching to or modifying that session. Creation plus ownership
+metadata are one tmux command queue (a duplicate `new-session` aborts the
+following marker commands). Renew and attach operations are additionally bound
+to both tmux's immutable session ID and the tmux server PID, so killing and
+recreating the same human-readable name cannot redirect Citadel to the
+replacement.
 
 Citadel gives each marked session an explicit retention lease and sweeps once
 per hour. The lease is renewed while a client is attached and once when it
