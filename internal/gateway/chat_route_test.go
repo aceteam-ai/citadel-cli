@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 )
 
 // errSwapFailedForTest is a sentinel error a fakeModelSwapper can return to
@@ -54,6 +56,23 @@ func newChatGatewayWithFallback(lister, installedLister ChatModelLister, swapper
 	gw.registerChatRoutes()
 	gw.mux.HandleFunc("/", gw.handleRoot)
 	return gw
+}
+
+func TestChatUpstreamHostUsesResolvedVLLMHostOnlyForVLLM(t *testing.T) {
+	original := resolveVLLMEndpoint
+	resolveVLLMEndpoint = func() (externalengine.Endpoint, bool, error) {
+		return externalengine.Endpoint{Host: "192.0.2.10", Port: 58000}, true, nil
+	}
+	t.Cleanup(func() { resolveVLLMEndpoint = original })
+
+	if got := chatUpstreamHost("vllm"); got != "192.0.2.10" {
+		t.Fatalf("vLLM upstream host = %q, want resolved override", got)
+	}
+	for _, engine := range []string{"ollama", "llamacpp", "bonsai", "sglang"} {
+		if got := chatUpstreamHost(engine); got != "127.0.0.1" {
+			t.Errorf("%s upstream host = %q, want loopback", engine, got)
+		}
+	}
 }
 
 // TestChatCompletionsRoutesToServingEngine verifies a chat request for a served

@@ -3,6 +3,7 @@ package status
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/services"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 // newTestDiscovery starts an httptest server with the given handler and
 // returns a ModelDiscovery pinned to the server's address plus the server's
@@ -53,6 +62,34 @@ func TestDiscoverModels_VLLM(t *testing.T) {
 	}
 	if !reflect.DeepEqual(models, []string{"Qwen/Qwen3-8B"}) {
 		t.Fatalf("expected [Qwen/Qwen3-8B], got %v", models)
+	}
+}
+
+func TestDiscoverModels_VLLMUsesResolvedHostOverride(t *testing.T) {
+	originalHost := services.VLLMHost
+	services.VLLMHost = "192.0.2.10"
+	t.Cleanup(func() { services.VLLMHost = originalHost })
+
+	var gotHost string
+	discovery := NewModelDiscovery()
+	discovery.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotHost = req.URL.Host
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"data":[{"id":"vendor/model"}]}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	models, err := discovery.DiscoverModels(context.Background(), "vllm", 58000)
+	if err != nil {
+		t.Fatalf("DiscoverModels() error = %v", err)
+	}
+	if gotHost != "192.0.2.10:58000" {
+		t.Fatalf("models probe host = %q, want resolved override", gotHost)
+	}
+	if !reflect.DeepEqual(models, []string{"vendor/model"}) {
+		t.Fatalf("models = %v, want vendor/model", models)
 	}
 }
 

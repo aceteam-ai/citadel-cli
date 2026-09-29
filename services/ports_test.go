@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"testing"
 )
@@ -453,6 +454,59 @@ func TestResolveVLLMHostPort(t *testing.T) {
 				t.Errorf("resolveVLLMHostPort(%q) = %d, want %d", tc.val, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolveVLLMHost pins the CITADEL_VLLM_HOST boundary: only loopback or a
+// canonical address assigned to this node may become an engine dial target.
+// Invalid input fails closed to the historical loopback target.
+func TestResolveVLLMHost(t *testing.T) {
+	local := func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: net.CIDRMask(24, 32)},
+			&net.IPNet{IP: net.ParseIP("2001:db8::10"), Mask: net.CIDRMask(64, 128)},
+		}, nil
+	}
+
+	tests := []struct {
+		name       string
+		value      string
+		want       string
+		configured bool
+	}{
+		{name: "unset", want: defaultVLLMHost},
+		{name: "localhost canonicalizes", value: "localhost", want: defaultVLLMHost, configured: true},
+		{name: "IPv4 loopback", value: "127.0.0.2", want: "127.0.0.2", configured: true},
+		{name: "IPv6 loopback", value: "::1", want: "::1", configured: true},
+		{name: "assigned IPv4", value: "192.0.2.10", want: "192.0.2.10", configured: true},
+		{name: "assigned IPv6", value: "2001:db8::10", want: "2001:db8::10", configured: true},
+		{name: "hostname rejected", value: "engine.example.com", want: defaultVLLMHost},
+		{name: "URL rejected", value: "http://192.0.2.10", want: defaultVLLMHost},
+		{name: "path rejected", value: "192.0.2.10/v1", want: defaultVLLMHost},
+		{name: "unassigned rejected", value: "192.0.2.11", want: defaultVLLMHost},
+		{name: "wildcard rejected", value: "0.0.0.0", want: defaultVLLMHost},
+		{name: "multicast rejected", value: "224.0.0.1", want: defaultVLLMHost},
+		{name: "link local rejected", value: "169.254.169.254", want: defaultVLLMHost},
+		{name: "IPv4 mapped rejected", value: "::ffff:127.0.0.1", want: defaultVLLMHost},
+		{name: "noncanonical rejected", value: "127.0.0.01", want: defaultVLLMHost},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, configured := resolveVLLMHostValue(tc.value, local)
+			if got != tc.want || configured != tc.configured {
+				t.Fatalf("resolveVLLMHostValue(%q) = (%q, %v), want (%q, %v)", tc.value, got, configured, tc.want, tc.configured)
+			}
+		})
+	}
+}
+
+func TestResolveVLLMHostFailsClosedWhenInterfacesCannotBeListed(t *testing.T) {
+	host, configured := resolveVLLMHostValue("192.0.2.10", func() ([]net.Addr, error) {
+		return nil, fmt.Errorf("interface lookup failed")
+	})
+	if host != defaultVLLMHost || configured {
+		t.Fatalf("interface failure resolved to (%q, %v), want (%q, false)", host, configured, defaultVLLMHost)
 	}
 }
 

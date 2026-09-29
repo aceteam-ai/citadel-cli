@@ -3,12 +3,15 @@ package status
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // newTestTracker returns an IdleTracker with a controllable clock so idle_seconds
@@ -394,6 +397,31 @@ func TestIdleTracker_Observe_ScrapesLiveEndpoint(t *testing.T) {
 	}
 	if st.Idle {
 		t.Fatalf("expected not idle 0s after a request")
+	}
+}
+
+func TestIdleTracker_Observe_UsesResolvedVLLMHostOverride(t *testing.T) {
+	originalHost := services.VLLMHost
+	services.VLLMHost = "192.0.2.10"
+	t.Cleanup(func() { services.VLLMHost = originalHost })
+
+	var gotHost string
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	tr := newTestTracker(300, &now)
+	tr.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotHost = req.URL.Host
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("vllm:request_success_total 5\n")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	if _, ok := tr.Observe(context.Background(), "vllm", "vllm", 58000); !ok {
+		t.Fatal("Observe() did not accept vLLM metrics from the resolved host")
+	}
+	if gotHost != "192.0.2.10:58000" {
+		t.Fatalf("metrics probe host = %q, want resolved override", gotHost)
 	}
 }
 

@@ -1532,15 +1532,19 @@ sibling services too. Anything reasoning about "is THIS service up" must filter 
 container name rather than trusting project scoping — see #692, which this stale
 doc helped hide.
 
-**The vLLM host port is the ONE 8200-block port that is env-resolvable, not a
-const (citadel-cli#1076).** `services.resolveVLLMHostPort` (`services/ports.go`)
-decides `services.VLLMHostPort` at process init from `CITADEL_VLLM_HOST_PORT`,
-defaulting to 8201 — so a node serving vLLM off the default (e.g. the RM-01 Jetson
-on :58000) is reached and advertised. It is a package `var`, so it flows to
-`ServiceHostPorts`/`InferenceMetricsPorts`/`HostPortEnv` and every Go dialer
-automatically, keeping the compose publish, the native heartbeat probe, and
-advertising in agreement. `TestResolveVLLMHostPort` pins the fallback rules; don't
-"fix" it back to a const for symmetry with its sibling ports.
+**The vLLM host and host port are process-resolved (citadel-cli#1076/#1167).**
+`services.resolveVLLMHostPort` and `services.resolveVLLMHost`
+(`services/ports.go`) decide `services.VLLMHostPort` and `services.VLLMHost` once
+at process init from `CITADEL_VLLM_HOST_PORT` and `CITADEL_VLLM_HOST`. The port
+defaults to 8201; the host defaults to `127.0.0.1`. A non-loopback host override
+must be a canonical IP literal assigned to a local interface; invalid, remote,
+wildcard, multicast, and link-local values fail closed to loopback. The resolved
+endpoint flows through `externalengine.VLLMEndpoint` to adoption/model/health/idle
+probes, worker and legacy-job base URLs, native readiness, and gateway chat
+proxying, so a vendor engine bound only to the node's primary address is reached
+and advertised consistently. `TestResolveVLLMHostPort` and
+`TestResolveVLLMHost` pin the fallback and validation rules. Do not replace either
+resolved value with a hardcoded loopback or port at a consumer.
 
 **Adopt an already-running EXTERNAL vLLM instead of launching one — even with NO
 docker runtime (citadel-cli#1081 + #1084, RM-01 / aceteam#9945).**
@@ -1574,7 +1578,7 @@ unreachable runtime no longer declines: a box with no container runtime cannot b
 running our container, so a live OpenAI-compat engine there is necessarily external
 and is adopted. Consequence for hermeticity: post-#1084 the external probe fires on
 a neutered-PATH box, so a docker-branch unit test that must not hit the real
-`127.0.0.1:<VLLMHostPort>` (node 1297 serves a real vLLM) injects the probe via
+resolved vLLM endpoint (node 1297 serves a real vLLM) injects the probe via
 `externalEngineServingFn` (jobs) / the `servingCheck` seam (cmd) — `newModelTestHandler`
 seams it to "nothing serving" for exactly this reason. TCP reachability is necessary
 but not sufficient: the body must decode as OpenAI-shaped `{"data":[...]}` (an empty
