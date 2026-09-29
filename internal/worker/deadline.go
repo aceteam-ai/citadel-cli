@@ -99,12 +99,6 @@ var unboundedJobTypes = map[string]struct{}{
 	// race-free without a lock (services.AllocateAppPodPort). The other APP_*
 	// verbs (stop/start/status/logs/destroy) are quick and take the default tier.
 	JobTypeAppDeploy: {},
-	// RUN_JOB_TEMPLATE runs an opaque compiled-in builtin (an audio mix, a
-	// headless render+encode) whose duration is dominated by the work itself, so
-	// no fallback deadline. Unbounded membership ALSO routes it onto the
-	// serialized exec-1 lane (via serializedLaneJobTypes' superset), keeping a
-	// template run's per-run workspace writes single-writer, matching APP_DEPLOY.
-	JobTypeRunJobTemplate: {},
 }
 
 // serializedLaneJobTypes decides which job types are routed onto the general
@@ -160,6 +154,10 @@ var serializedLaneJobTypes = func() map[string]struct{} {
 		JobTypeServiceStop:       {},
 		JobTypeApplyDeviceConfig: {},
 		JobTypeModelCacheEvict:   {},
+		// Template runs keep the serialized exec-1 lane so retries cannot race
+		// over their per-job workspace, but unlike opaque model pulls/builds they
+		// use the generous long-tier watchdog fallback below.
+		JobTypeRunJobTemplate: {},
 	}
 	for jt := range unboundedJobTypes {
 		m[jt] = struct{}{}
@@ -187,6 +185,9 @@ func (r *Runner) resolveJobTimeout(job *Job) (time.Duration, bool) {
 	}
 	if _, unbounded := unboundedJobTypes[job.Type]; unbounded {
 		return 0, false
+	}
+	if job.Type == JobTypeRunJobTemplate {
+		return envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
 	}
 	if _, long := longSessionJobTypes[job.Type]; long {
 		return envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)

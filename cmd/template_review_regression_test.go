@@ -17,7 +17,7 @@ func TestReviewForeignNodeInputRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	o := liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}
-	got, hashes, err := o.resolveInputs(json.RawMessage(`[{"path":"node:other-node/same-name.txt","node_id":"other-node","node_path":"same-name.txt"}]`))
+	got, hashes, err := resolveInputsForReview(t, o, json.RawMessage(`[{"path":"node:other-node/same-name.txt","node_id":"other-node","node_path":"same-name.txt"}]`))
 	if err == nil {
 		t.Fatalf("foreign node reference consumed local file: paths=%v hashes=%v", got, hashes)
 	}
@@ -96,10 +96,34 @@ func TestLiveTemplateRunOps_InputSymlinkEscape(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(ws, "escape")); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := (liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}).resolveInputs(json.RawMessage(`[{"path":"node:n1/escape","node_id":"n1","node_path":"escape"}]`))
+	_, _, err := resolveInputsForReview(t, liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}, json.RawMessage(`[{"path":"node:n1/escape","node_id":"n1","node_path":"escape"}]`))
 	if err == nil {
 		t.Fatal("symlink outside workspace accepted")
 	}
+}
+
+func resolveInputsForReview(t *testing.T, o liveTemplateRunOps, raw json.RawMessage) ([]string, []string, error) {
+	t.Helper()
+	workspaceDir, err := filepath.Abs(o.workspaceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceRoot, err := os.OpenRoot(workspaceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspaceRoot.Close()
+	const inputRel = ".review-inputs"
+	if err := workspaceRoot.MkdirAll(inputRel, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inputRoot, err := workspaceRoot.OpenRoot(inputRel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inputRoot.Close()
+	paths, _, hashes, err := o.resolveInputs(context.Background(), raw, workspaceRoot, inputRoot, filepath.Join(workspaceDir, inputRel))
+	return paths, hashes, err
 }
 
 func TestLiveTemplateRunOps_DispatchesCanonicalParams(t *testing.T) {

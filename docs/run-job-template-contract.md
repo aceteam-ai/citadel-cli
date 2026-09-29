@@ -51,15 +51,31 @@ and a canonical workspace-relative `node_path`. `path` must be that same relativ
 path or `node:<node_id>/<node_path>`, matching platform `FileValue` references.
 Missing or foreign identity, inconsistent paths, malformed references, traversal,
 and workspace-escaping symlinks are refused. All reference metadata is validated
-before resolving or hashing any input. Cross-node transfer is outside this slice.
-The source queue must name the executing node and belong to its per-node stream.
+before resolving or hashing any input. The workspace's absolute path is fully
+resolved before opening its `os.Root`; every path passed to a builtin is rebuilt
+from that resolved root identity rather than the caller's possibly symlinked
+spelling. Each source is copied into a read-only, attempt-unique snapshot while
+it is hashed. Builtins consume only those staged paths, and the snapshots are
+re-hashed before removal, so `input_hashes` describes the bytes available to the
+builtin rather than an earlier by-name read. Cross-node transfer is outside this
+slice. The source queue must name the executing node and belong to its per-node
+stream.
 
 Successful results contain `outputs: [{path, sha256, bytes}]`, `duration_ms`, and
-`input_hashes`. Hashes use the `sha256:` prefix; output paths are workspace-relative.
+`input_hashes`. Hashes use the `sha256:` prefix; output paths are workspace-relative
+and are opened through an `os.Root` fixed at the per-attempt `out` directory, so
+a returned sibling path or escaping symlink is refused. Every delivery gets a
+random 128-bit attempt namespace beneath the template and job directory. A
+deadline can therefore release the serialized lane without letting an older,
+slow-to-cancel goroutine collide with a retry's paths. Staging, post-run input
+verification, and output hashing check cancellation between reads and writes;
+failed attempts remove only their own namespace and report cleanup failures.
 Empty collections serialize as arrays. Large output bytes do not enter the result.
 The platform turns outputs into `node:<node_id>/<path>` file references and reads
 them lazily. Optional AEP v2 signing uses action `run_job_template`, binds the job,
 manifest hash and ordered output digests, and remains fail-open for signing errors.
+Runs retain serialized-lane routing and use the generous long-tier watchdog
+fallback when the payload does not provide `timeout_ms`.
 
 ## Compiled-in builtins
 

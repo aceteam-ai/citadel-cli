@@ -218,6 +218,36 @@ func TestRunJobTemplate_ContentHashAcceptsSha256Prefix(t *testing.T) {
 	}
 }
 
+func TestRunJobTemplate_RejectsDecodedJSONFieldsOutsideWireContract(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "runner object", field: "runner", value: map[string]any{"kind": "builtin", "handler": "audio-mix"}},
+		{name: "input schema object", field: "input_schema", value: map[string]any{"type": "object"}},
+		{name: "output schema object", field: "output_schema", value: map[string]any{"type": "object"}},
+		{name: "params object", field: "params", value: map[string]any{"gain": 1.5}},
+		{name: "input files array", field: "input_files", value: []any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := &fakeTemplateOps{result: &TemplateRunResult{}}
+			payload := tmplPayload(t, tmplBuiltinRunner, tmplInSchema, tmplOutSchema)
+			payload[tc.field] = tc.value
+			res, err := tmplRunJob(ops, tmplPerNodeQueue, payload)
+			if err != nil {
+				t.Fatalf("Execute returned transport error: %v", err)
+			}
+			if res.Status != JobStatusFailure {
+				t.Fatalf("status = %q, want failure", res.Status)
+			}
+			if ops.called {
+				t.Fatal("decoded JSON field reached ops; live payload fields must be JSON strings")
+			}
+		})
+	}
+}
+
 func jobErrText(res *JobResult) string {
 	if res == nil {
 		return ""
