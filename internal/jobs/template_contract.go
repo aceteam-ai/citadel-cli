@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
@@ -270,19 +271,44 @@ func ParseTemplateInputFiles(raw json.RawMessage, nodeID string) ([]TemplateInpu
 	return files, nil
 }
 
+// allowedSchemaKeywords is the closed set of JSON Schema keywords an approved
+// template input_schema may use (citadel-cli#1161). Any keyword outside it fails
+// closed. This allowlist -- not an enumeration of the dangerous keywords -- is what
+// makes the closed-schema guarantee hold: it leaves NO keyword that could carry a
+// subschema walkClosedSchema does not descend into (if/then/else, not, oneOf/anyOf/
+// allOf, contains, dependentSchemas/dependencies, propertyNames, patternProperties,
+// prefixItems/additionalItems, unevaluatedProperties/-Items, ...), and no alternate
+// draft selector ($schema). Loosening it later is a one-line addition (plus a walk
+// for any subschema-bearing keyword); it is deliberately minimal, since no template
+// is approved yet.
+var allowedSchemaKeywords = map[string]struct{}{
+	// Structural. properties/items/$defs carry subschemas the walker descends;
+	// additionalProperties must be exactly false on an object; $ref is restricted
+	// to a local #/$defs/<name> pointer (refDefName).
+	"type": {}, "properties": {}, "additionalProperties": {}, "required": {},
+	"items": {}, "$defs": {}, "$ref": {},
+	// Scalar / array / object validation keywords (no subschemas).
+	"enum": {}, "const": {},
+	"minimum": {}, "maximum": {}, "exclusiveMinimum": {}, "exclusiveMaximum": {}, "multipleOf": {},
+	"minLength": {}, "maxLength": {}, "pattern": {}, "format": {},
+	"minItems": {}, "maxItems": {}, "uniqueItems": {},
+	"minProperties": {}, "maxProperties": {},
+	// Annotations. Not schemas and never $ref targets (refs are $defs-only), so a
+	// value here -- even an object -- is inert metadata, never bound or validated.
+	"title": {}, "description": {}, "default": {}, "examples": {}, "$comment": {},
+}
+
 // enforceClosedInputSchema requires an approved template input_schema to be
-// "closed": every object subschema must declare "additionalProperties": false, so
-// a params key that is not an exactly-declared property is rejected at validation.
-// This is the citadel-cli#1161 gate. Without it, Go's encoding/json binds struct
-// fields case-insensitively, so an alternate-cased extra key (e.g. "Fps" against a
-// field tagged `json:"fps"`) passes the schema as an unconstrained additional
-// property and then binds the constrained field inside a builtin, bypassing the
-// schema. It fails closed on any construct it cannot reason about ($ref,
-// patternProperties, a schema-valued additionalProperties, unevaluatedProperties)
-// and on properties keys that collide under case-fold (another bind ambiguity).
-// Nothing is approved yet, so this strictness costs no compatibility; loosening it
-// later is a one-line change, whereas tightening it later is a hash-breaking
-// re-approval of every template.
+// "closed" so a params key that is not an exactly-declared property is rejected at
+// validation, before any builtin decodes params into a Go struct (where
+// encoding/json would bind an alternate-cased key case-insensitively and bypass the
+// schema). It enforces: a keyword allowlist (fail closed on anything else),
+// "additionalProperties": false on every object subschema, $ref restricted to a
+// local #/$defs/<name> pointer, and no properties keys colliding under the SAME
+// per-rune case-fold encoding/json uses. It descends properties, single-schema
+// items, and $defs; because $ref is never followed inline (only its target name is
+// validated, and every $defs entry is itself walked), no ref cycle can loop the
+// walk. This is the citadel-cli#1161 gate.
 func enforceClosedInputSchema(root map[string]any) error {
 	if !schemaDescribesObject(root) {
 		return fmt.Errorf("root must be an object schema (\"type\":\"object\" with \"additionalProperties\": false)")
@@ -290,28 +316,26 @@ func enforceClosedInputSchema(root map[string]any) error {
 	return walkClosedSchema(root, "")
 }
 
-// walkClosedSchema enforces the closed-object rule on node and recurses into every
-// place a subschema can legally appear.
+// walkClosedSchema enforces the allowlist + closed-object rule on node and recurses
+// into every subschema-bearing keyword the allowlist permits.
 func walkClosedSchema(node any, at string) error {
 	m, ok := node.(map[string]any)
 	if !ok {
 		// A boolean or scalar subschema node constrains nothing a builtin binds.
 		return nil
 	}
-	if ref, present := m["$ref"]; present {
-		// A local "#/..." ref is allowed: its target lives in this same schema
-		// ($defs/definitions/properties), which walkClosedSchema also visits and
-		// requires closed, so the referenced object subschema is enforced too. An
-		// external or non-local ref is forbidden (also blocked at compile by the
-		// LoadURL hook, but rejected here first so the closed-schema reasoning holds).
-		s, ok := ref.(string)
-		if !ok || !strings.HasPrefix(s, "#") {
-			return fmt.Errorf("external or non-local $ref at %s is forbidden; approved schemas must be self-contained", schemaPathOrRoot(at))
+	for k := range m {
+		if _, allowed := allowedSchemaKeywords[k]; !allowed {
+			return fmt.Errorf("schema keyword %q at %s is not allowed; approved template schemas use a closed keyword set", k, schemaPathOrRoot(at))
 		}
 	}
-	for _, forbidden := range []string{"$dynamicRef", "patternProperties", "unevaluatedProperties"} {
-		if _, present := m[forbidden]; present {
-			return fmt.Errorf("unsupported schema construct %q at %s (approved schemas must be closed and self-contained)", forbidden, schemaPathOrRoot(at))
+	if ref, present := m["$ref"]; present {
+		s, ok := ref.(string)
+		if !ok {
+			return fmt.Errorf("$ref at %s must be a string", schemaPathOrRoot(at))
+		}
+		if _, err := refDefName(s); err != nil {
+			return fmt.Errorf("$ref at %s: %w", schemaPathOrRoot(at), err)
 		}
 	}
 	if schemaDescribesObject(m) {
@@ -325,11 +349,11 @@ func walkClosedSchema(node any, at string) error {
 		if props, ok := m["properties"].(map[string]any); ok {
 			seen := map[string]string{}
 			for k := range props {
-				lk := strings.ToLower(k)
-				if prev, dup := seen[lk]; dup {
+				fk := jsonFoldKey(k)
+				if prev, dup := seen[fk]; dup {
 					return fmt.Errorf("properties keys %q and %q at %s collide under case-fold", prev, k, schemaPathOrRoot(at))
 				}
-				seen[lk] = k
+				seen[fk] = k
 			}
 			for k, sub := range props {
 				if err := walkClosedSchema(sub, at+".properties."+k); err != nil {
@@ -337,38 +361,84 @@ func walkClosedSchema(node any, at string) error {
 				}
 			}
 		}
-	}
-	switch items := m["items"].(type) {
-	case map[string]any:
-		if err := walkClosedSchema(items, at+".items"); err != nil {
-			return err
+	} else if ap, present := m["additionalProperties"]; present {
+		// On a non-object schema additionalProperties is only meaningful/safe as false.
+		if b, ok := ap.(bool); !ok || b {
+			return fmt.Errorf("\"additionalProperties\" at %s must be exactly false, not true or a schema", schemaPathOrRoot(at))
 		}
-	case []any:
-		for i, sub := range items {
-			if err := walkClosedSchema(sub, fmt.Sprintf("%s.items[%d]", at, i)); err != nil {
+	}
+	if items, present := m["items"]; present {
+		switch it := items.(type) {
+		case map[string]any:
+			if err := walkClosedSchema(it, at+".items"); err != nil {
+				return err
+			}
+		case bool:
+			// A boolean items schema constrains nothing a builtin binds.
+		default:
+			// An array (tuple) items form needs prefixItems/additionalItems, which
+			// are not in the allowlist; refuse rather than half-enforce it.
+			return fmt.Errorf("\"items\" at %s must be a single schema object", schemaPathOrRoot(at))
+		}
+	}
+	if defs, present := m["$defs"]; present {
+		dm, ok := defs.(map[string]any)
+		if !ok {
+			return fmt.Errorf("\"$defs\" at %s must be an object", schemaPathOrRoot(at))
+		}
+		for k, sub := range dm {
+			if err := walkClosedSchema(sub, at+".$defs."+k); err != nil {
 				return err
 			}
 		}
 	}
-	for _, comb := range []string{"allOf", "anyOf", "oneOf"} {
-		if arr, ok := m[comb].([]any); ok {
-			for i, sub := range arr {
-				if err := walkClosedSchema(sub, fmt.Sprintf("%s.%s[%d]", at, comb, i)); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	for _, defs := range []string{"$defs", "definitions"} {
-		if dm, ok := m[defs].(map[string]any); ok {
-			for k, sub := range dm {
-				if err := walkClosedSchema(sub, at+"."+defs+"."+k); err != nil {
-					return err
-				}
-			}
-		}
-	}
 	return nil
+}
+
+// refDefName validates that a $ref is exactly a local "#/$defs/<name>" pointer and
+// returns the JSON-Pointer-unescaped def name. Any other target (a deeper pointer,
+// an external URL, a ref into properties/items/etc.) is refused, so a ref can only
+// resolve to a $defs entry walkClosedSchema has already enforced closed -- closing
+// the "the validator resolves a ref into an un-walked open object" bypass.
+func refDefName(ref string) (string, error) {
+	const prefix = "#/$defs/"
+	if !strings.HasPrefix(ref, prefix) {
+		return "", fmt.Errorf("only local %q<name> references are allowed; an external or non-local $ref is forbidden, got %q", prefix, ref)
+	}
+	name := ref[len(prefix):]
+	// A literal "/" here is a deeper pointer (into a $defs entry's internals); an
+	// escaped slash in a name is "~1", handled by the unescape below.
+	if name == "" || strings.Contains(name, "/") {
+		return "", fmt.Errorf("$ref must point to a single $defs entry, got %q", ref)
+	}
+	name = strings.ReplaceAll(name, "~1", "/")
+	name = strings.ReplaceAll(name, "~0", "~")
+	return name, nil
+}
+
+// jsonFoldKey folds a string with the SAME per-rune case-fold encoding/json uses to
+// match an object key to a struct field (encoding/json/fold.go's foldRune): each
+// rune is folded to the minimum rune in its Unicode simple-fold orbit. strings.ToLower
+// is not equivalent -- it misses foldings like LATIN SMALL LETTER LONG S (U+017F) and
+// KELVIN SIGN (U+212A), which encoding/json treats as case-equal, so two schema
+// properties that ToLower keeps distinct could still both bind one struct field.
+func jsonFoldKey(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		b.WriteRune(foldRuneMin(r))
+	}
+	return b.String()
+}
+
+func foldRuneMin(r rune) rune {
+	for {
+		r2 := unicode.SimpleFold(r)
+		if r2 <= r {
+			return r2
+		}
+		r = r2
+	}
 }
 
 // schemaDescribesObject reports whether a schema node constrains an object: it

@@ -121,87 +121,85 @@ func TestTemplateSchemaUsesHashedNumericSemantics(t *testing.T) {
 }
 
 // TestClosedInputSchemaGate pins the citadel-cli#1161 gate: an approved
-// input_schema must be closed (additionalProperties:false on every object
-// subschema, no case-fold-colliding property keys, no construct the walk cannot
-// reason about), so an alternate-cased extra param key cannot slip past the schema
-// and then bind a constrained field case-insensitively inside a builtin.
+// input_schema must use a closed keyword allowlist with additionalProperties:false
+// on every object subschema, so an alternate-cased extra param key cannot slip past
+// the schema and then bind a constrained field case-insensitively inside a builtin.
 func TestClosedInputSchemaGate(t *testing.T) {
 	const closed = `{"type":"object","additionalProperties":false,"properties":{"fps":{"type":"integer","maximum":60}}}`
 
-	refused := []struct {
-		name, schema, params, want string
-	}{
-		{
-			// (1) root not closed is refused, even with otherwise-valid params.
-			"open_root",
-			`{"type":"object","properties":{"fps":{"type":"integer"}}}`,
-			`{"fps":30}`,
-			"additionalProperties",
-		},
-		{
-			// (2) recursion: a nested object left open re-opens the hole one level down.
-			"open_nested_object",
-			`{"type":"object","additionalProperties":false,"properties":{"video":{"type":"object","properties":{"fps":{"type":"integer"}}}}}`,
-			`{"video":{"fps":30}}`,
-			"additionalProperties",
-		},
-		{
-			// (3) an alternate-cased extra key is rejected by the compiled schema
-			// itself once additionalProperties:false is enforced.
-			"alt_cased_key_rejected_by_schema",
-			closed,
-			`{"Fps":9999}`,
-			"violate input_schema",
-		},
-		{
-			// (4) two properties colliding under case-fold is a bind ambiguity.
-			"case_fold_property_collision",
-			`{"type":"object","additionalProperties":false,"properties":{"fps":{"type":"integer"},"Fps":{"type":"integer"}}}`,
-			`{}`,
-			"collide under case-fold",
-		},
-		{
-			// (5a) an external / non-local $ref is forbidden.
-			"external_ref",
-			`{"type":"object","$ref":"https://evil.example/schema.json"}`,
-			`{}`,
-			"forbidden",
-		},
-		{
-			// (5b) patternProperties cannot be reasoned about; fail closed.
-			"pattern_properties",
-			`{"type":"object","additionalProperties":false,"patternProperties":{"^x":{"type":"string"}}}`,
-			`{}`,
-			"patternProperties",
-		},
-		{
-			// (5c) a schema-valued additionalProperties is not "exactly false".
-			"schema_valued_additional_properties",
-			`{"type":"object","additionalProperties":{"type":"string"}}`,
-			`{}`,
-			"exactly false",
-		},
-	}
-	for _, tc := range refused {
-		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateTemplateParams(json.RawMessage(tc.params), json.RawMessage(tc.schema), json.RawMessage(`{}`))
-			if err == nil {
-				t.Fatalf("closed-schema gate accepted %s / %s", tc.schema, tc.params)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error %q does not contain %q", err.Error(), tc.want)
+	// Every keyword outside the allowlist fails closed. This is the core of the fix:
+	// a subschema hidden in ANY of these (or an alternate draft via $schema) would
+	// otherwise escape the walk, and the validator would still resolve/apply it.
+	for _, kw := range []struct{ name, schema string }{
+		{"if", `{"type":"object","additionalProperties":false,"if":{"type":"object","properties":{"Fps":{"type":"integer"}}}}`},
+		{"then", `{"type":"object","additionalProperties":false,"then":{"type":"object","properties":{"Fps":{"type":"integer"}}}}`},
+		{"else", `{"type":"object","additionalProperties":false,"else":{"type":"object"}}`},
+		{"not", `{"type":"object","additionalProperties":false,"not":{"type":"object"}}`},
+		{"oneOf", `{"type":"object","additionalProperties":false,"oneOf":[{"type":"object","properties":{"Fps":{"type":"integer"}}}]}`},
+		{"anyOf", `{"type":"object","additionalProperties":false,"anyOf":[{"type":"object"}]}`},
+		{"allOf", `{"type":"object","additionalProperties":false,"allOf":[{"type":"object"}]}`},
+		{"contains", `{"type":"object","additionalProperties":false,"contains":{"type":"object"}}`},
+		{"dependentSchemas", `{"type":"object","additionalProperties":false,"dependentSchemas":{"x":{"type":"object"}}}`},
+		{"dependencies", `{"type":"object","additionalProperties":false,"dependencies":{"x":{"type":"object"}}}`},
+		{"propertyNames", `{"type":"object","additionalProperties":false,"propertyNames":{"pattern":"^x"}}`},
+		{"patternProperties", `{"type":"object","additionalProperties":false,"patternProperties":{"^x":{"type":"string"}}}`},
+		{"prefixItems", `{"type":"object","additionalProperties":false,"prefixItems":[{"type":"string"}]}`},
+		{"additionalItems", `{"type":"object","additionalProperties":false,"additionalItems":{"type":"object"}}`},
+		{"unevaluatedProperties", `{"type":"object","additionalProperties":false,"unevaluatedProperties":false}`},
+		{"definitions", `{"type":"object","additionalProperties":false,"definitions":{"x":{"type":"object"}}}`},
+		{"schema_draft", `{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","additionalProperties":false}`},
+		{"id", `{"$id":"urn:x","type":"object","additionalProperties":false}`},
+		{"dynamicRef", `{"type":"object","additionalProperties":false,"$dynamicRef":"#x"}`},
+	} {
+		t.Run("keyword_"+kw.name, func(t *testing.T) {
+			err := ValidateTemplateParams(json.RawMessage(`{}`), json.RawMessage(kw.schema), json.RawMessage(`{}`))
+			if err == nil || !strings.Contains(err.Error(), "not allowed") {
+				t.Fatalf("keyword %q: want 'not allowed', got %v", kw.name, err)
 			}
 		})
 	}
 
-	// A well-formed closed schema with an exactly-declared key still validates.
-	if err := ValidateTemplateParams(json.RawMessage(`{"fps":30}`), json.RawMessage(closed), json.RawMessage(`{}`)); err != nil {
-		t.Fatalf("closed schema rejected valid params: %v", err)
+	// Structural refusals with specific messages.
+	for _, tc := range []struct{ name, schema, params, want string }{
+		{"open_root", `{"type":"object","properties":{"fps":{"type":"integer"}}}`, `{"fps":30}`, "additionalProperties"},
+		{"open_nested_object", `{"type":"object","additionalProperties":false,"properties":{"video":{"type":"object","properties":{"fps":{"type":"integer"}}}}}`, `{"video":{"fps":30}}`, "additionalProperties"},
+		{"schema_valued_additionalProperties", `{"type":"object","additionalProperties":{"type":"string"}}`, `{}`, "exactly false"},
+		{"external_ref", `{"type":"object","additionalProperties":false,"properties":{"x":{"$ref":"https://evil.example/s.json"}}}`, `{}`, "$defs"},
+		{"deep_ref", `{"type":"object","additionalProperties":false,"$defs":{"a":{"type":"object","additionalProperties":false,"properties":{"b":{"type":"integer"}}}},"properties":{"x":{"$ref":"#/$defs/a/properties/b"}}}`, `{}`, "single $defs entry"},
+		{"tuple_items", `{"type":"object","additionalProperties":false,"properties":{"xs":{"type":"array","items":[{"type":"string"}]}}}`, `{}`, "single schema object"},
+		{"case_fold_ascii", `{"type":"object","additionalProperties":false,"properties":{"fps":{"type":"integer"},"Fps":{"type":"integer"}}}`, `{}`, "collide under case-fold"},
+		// Long-s (U+017F) folds with "s" under encoding/json's fold but NOT under
+		// strings.ToLower -- proves jsonFoldKey uses the Go fold.
+		{"case_fold_long_s", "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"s\":{\"type\":\"integer\"},\"ſ\":{\"type\":\"integer\"}}}", `{}`, "collide under case-fold"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateTemplateParams(json.RawMessage(tc.params), json.RawMessage(tc.schema), json.RawMessage(`{}`))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s: want %q, got %v", tc.name, tc.want, err)
+			}
+		})
 	}
-	// output_schema is deliberately NOT subjected to the gate (it constrains what a
-	// builtin produces, not caller-controlled params): an open output_schema is fine.
+
+	// The compiled closed schema itself rejects an alternate-cased extra key, at the
+	// root and nested one level deep.
+	for _, params := range []struct{ schema, params string }{
+		{closed, `{"Fps":9999}`},
+		{`{"type":"object","additionalProperties":false,"properties":{"video":{"type":"object","additionalProperties":false,"properties":{"fps":{"type":"integer","maximum":60}}}}}`, `{"video":{"Fps":9999}}`},
+	} {
+		err := ValidateTemplateParams(json.RawMessage(params.params), json.RawMessage(params.schema), json.RawMessage(`{}`))
+		if err == nil || !strings.Contains(err.Error(), "violate input_schema") {
+			t.Fatalf("alt-cased key %s not rejected by closed schema: %v", params.params, err)
+		}
+	}
+
+	// A well-formed closed schema still validates, an open output_schema is fine
+	// (the gate is input_schema only), and a local #/$defs/<name> ref is allowed.
 	if err := ValidateTemplateParams(json.RawMessage(`{"fps":30}`), json.RawMessage(closed), json.RawMessage(`{"type":"object","properties":{"mix":{"type":"string"}}}`)); err != nil {
-		t.Fatalf("open output_schema should be allowed: %v", err)
+		t.Fatalf("closed schema rejected valid params / open output_schema: %v", err)
+	}
+	okRef := `{"type":"object","additionalProperties":false,"$defs":{"gain":{"type":"number","maximum":2}},"properties":{"gain":{"$ref":"#/$defs/gain"}}}`
+	if err := ValidateTemplateParams(json.RawMessage(`{"gain":1}`), json.RawMessage(okRef), json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("closed schema with a local $defs ref rejected: %v", err)
 	}
 }
 

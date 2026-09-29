@@ -18,9 +18,18 @@ import (
 func verifiedTemplateRequest(t *testing.T, req worker.TemplateRunRequest) worker.TemplateRunRequest {
 	t.Helper()
 	req.TemplateVersion = 1
-	req.InputSchema = json.RawMessage(`{"type":"object"}`)
-	req.OutputSchema = json.RawMessage(`{"type":"object"}`)
-	req.Params = json.RawMessage(`{}`)
+	// Default to a closed empty input_schema (the #1161 gate requires
+	// additionalProperties:false on every object subschema); a caller that needs
+	// declared params supplies its own closed schema so the hash still covers it.
+	if req.InputSchema == nil {
+		req.InputSchema = json.RawMessage(`{"type":"object","additionalProperties":false}`)
+	}
+	if req.OutputSchema == nil {
+		req.OutputSchema = json.RawMessage(`{"type":"object"}`)
+	}
+	if req.Params == nil {
+		req.Params = json.RawMessage(`{}`)
+	}
 	hash, err := jobs.ComputeTemplateManifestHash(req.TemplateKey, req.TemplateVersion, req.InputSchema, req.OutputSchema, req.Runner)
 	if err != nil {
 		t.Fatal(err)
