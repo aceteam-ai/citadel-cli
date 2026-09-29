@@ -2757,3 +2757,35 @@ Auto-generated log of every release.
   - feat(apps): node app runner, pod-per-app (CRAM A1, aceteam#9672) (#1157)
 
 
+---
+
+## v2.175.0 — 2026-09-29
+
+| Metric | Value |
+|--------|-------|
+| Commits | 18 |
+| Files changed | 69 |
+| Lines added | +5892 |
+
+**Changes:**
+
+  - Merge pull request #1147 from aceteam-ai/feat/1145-word-timestamps
+  - feat(tts): add opt-in word timestamp transport
+  - Merge pull request #1176 from aceteam-ai/fix/1174-tmux-session-reaper
+  - test(terminal): make tmux platform gate explicit
+  - fix(tmux): bind reaping to server identity
+  - fix(terminal): bind tmux lifecycle to identity
+  - fix(terminal): harden tmux lease ownership
+  - fix(terminal): bound persistent tmux sessions
+  - Merge pull request #1182 from aceteam-ai/fix/1173-render-hardening
+  - fix(render): isolate browser files and resources
+  - Merge pull request #1172 from aceteam-ai/fix/1164-template-hardening
+  - fix(worker): harden template run isolation
+  - Merge pull request #1170 from aceteam-ai/feat/1167-vllm-host
+  - fix(terminal): preserve tmux sessions across restarts (#1169)
+  - feat(worker): add media template builtins (#1171)
+  - fix(services): route remaining vllm consumers
+  - feat(services): resolve vllm host override
+  - fix(worker): require closed input_schema for RUN_JOB_TEMPLATE (#1161 gate) (#1168)
+
+
