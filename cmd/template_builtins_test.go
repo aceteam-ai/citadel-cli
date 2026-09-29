@@ -10,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
 )
 
 func TestProductionTemplateBuiltinsRegistered(t *testing.T) {
@@ -56,6 +59,7 @@ type fakePapercraftPage struct {
 	evaluations []string
 	captures    int
 	closed      bool
+	closeErr    error
 }
 
 func (p *fakePapercraftPage) Evaluate(_ context.Context, expression string) (any, error) {
@@ -71,7 +75,7 @@ func (p *fakePapercraftPage) CapturePNG(context.Context) ([]byte, error) {
 	return []byte("\x89PNG\r\n\x1a\npixels"), nil
 }
 
-func (p *fakePapercraftPage) Close() error { p.closed = true; return nil }
+func (p *fakePapercraftPage) Close() error { p.closed = true; return p.closeErr }
 
 type fakePapercraftEncoder struct {
 	cfg      papercraftEncoderConfig
@@ -183,6 +187,133 @@ func TestPapercraftFFmpegArgsAreArgvOnlyAndMatchReferenceCodec(t *testing.T) {
 	}
 	if strings.Contains(joined, "sh -c") || strings.Contains(joined, "/bin/sh") {
 		t.Fatalf("shell found in args: %v", args)
+	}
+}
+
+func TestPapercraftFileURLCrossPlatform(t *testing.T) {
+	for _, tc := range []struct {
+		name, goos, path, want string
+	}{
+		{"posix escaping", "linux", "/tmp/a b%/é.html", "file:///tmp/a%20b%25/%C3%A9.html?render=1"},
+		{"windows drive", "windows", `C:\workspace\a b%\紙.html`, "file:///C:/workspace/a%20b%25/%E7%B4%99.html?render=1"},
+		{"windows UNC", "windows", `\\server\share\a b%\紙.html`, "file://server/share/a%20b%25/%E7%B4%99.html?render=1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := papercraftFileURL(tc.path, tc.goos)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("URL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct{ goos, path string }{
+		{"linux", "relative/index.html"},
+		{"windows", `workspace\index.html`},
+		{"windows", `\\server`},
+	} {
+		if got, err := papercraftFileURL(tc.path, tc.goos); err == nil {
+			t.Fatalf("papercraftFileURL(%q, %q) = %q, want error", tc.path, tc.goos, got)
+		}
+	}
+}
+
+func TestPapercraftChromiumArgsKeepSandboxAndBlockWebRTCUDP(t *testing.T) {
+	contains := func(args []string, want string) bool {
+		return strings.Contains(" "+strings.Join(args, " ")+" ", " "+want+" ")
+	}
+	for _, tc := range []struct {
+		name          string
+		goos          string
+		elevated      bool
+		wantNoSandbox bool
+	}{
+		{name: "linux root", goos: "linux", elevated: true, wantNoSandbox: true},
+		{name: "linux user", goos: "linux", elevated: false},
+		{name: "windows administrator", goos: "windows", elevated: true},
+		{name: "darwin root", goos: "darwin", elevated: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := papercraftChromiumArgs(`C:\profile`, 1920, 1080, 9222, tc.goos, tc.elevated)
+			if got := contains(args, "--no-sandbox"); got != tc.wantNoSandbox {
+				t.Fatalf("no-sandbox present = %v, want %v: %v", got, tc.wantNoSandbox, args)
+			}
+			if !contains(args, "--force-webrtc-ip-handling-policy=disable_non_proxied_udp") {
+				t.Fatalf("WebRTC direct UDP policy missing: %v", args)
+			}
+		})
+	}
+}
+
+type fakeChromiumProcessControl struct {
+	done        chan struct{}
+	shutdown    bool
+	shutdownErr error
+}
+
+func (p *fakeChromiumProcessControl) Done() <-chan struct{} { return p.done }
+func (p *fakeChromiumProcessControl) WaitErr() error        { <-p.done; return nil }
+func (p *fakeChromiumProcessControl) Diagnostic() string    { return "fake Chromium" }
+func (p *fakeChromiumProcessControl) Shutdown() error {
+	p.shutdown = true
+	return p.shutdownErr
+}
+
+func TestWaitForChromiumCDPCancellationShutsDownAndReportsCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cleanupErr := errors.New("process tree did not reap")
+	process := &fakeChromiumProcessControl{done: make(chan struct{}), shutdownErr: cleanupErr}
+	_, err := waitForChromiumCDP(ctx, process, func() (*cobrowsestream.Client, error) {
+		return nil, errors.New("not ready")
+	}, time.Minute, time.Millisecond)
+	if !process.shutdown {
+		t.Fatal("startup cancellation did not synchronously shut down the Chromium process tree")
+	}
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("error = %v, want cancellation and cleanup failure", err)
+	}
+}
+
+func TestPapercraftRenderReportsProfileCleanupFailure(t *testing.T) {
+	inDir, outDir := t.TempDir(), t.TempDir()
+	landscape := writePapercraftHTML(t, inDir, "index.html", 1920, 1080)
+	portrait := writePapercraftHTML(t, inDir, "short.html", 1080, 1920)
+	removeCalls := 0
+	deps := papercraftRenderDeps{
+		startPage: func(context.Context, string, int, int, string) (papercraftPage, error) {
+			return &fakePapercraftPage{duration: 0.1}, nil
+		},
+		startEncoder: func(_ context.Context, cfg papercraftEncoderConfig) (papercraftEncoder, error) {
+			return &fakePapercraftEncoder{cfg: cfg}, nil
+		},
+		removeAll: func(string) error {
+			removeCalls++
+			if removeCalls == 2 {
+				return errors.New("profile locked")
+			}
+			return nil
+		},
+	}
+	_, err := runPapercraftRenderBuiltin(context.Background(), json.RawMessage(`{}`), []string{landscape, portrait}, outDir, deps)
+	if err == nil || !strings.Contains(err.Error(), "profile locked") || !strings.Contains(err.Error(), "remove Chromium profile") {
+		t.Fatalf("cleanup error = %v", err)
+	}
+}
+
+func TestPapercraftCleanupDoesNotRaceUnreapedBrowser(t *testing.T) {
+	page := &fakePapercraftPage{closeErr: errChromiumShutdownIncomplete}
+	removed := false
+	err := cleanupPapercraftRender(page, "profile", func(string) error {
+		removed = true
+		return nil
+	})
+	if !errors.Is(err, errChromiumShutdownIncomplete) {
+		t.Fatalf("cleanup error = %v, want shutdown-incomplete sentinel", err)
+	}
+	if removed {
+		t.Fatal("profile removal raced an unreaped Chromium process tree")
 	}
 }
 

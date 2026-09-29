@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -14,8 +15,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
@@ -30,6 +33,8 @@ const (
 	papercraftMaxHTML     = 128 << 20
 	papercraftMaxPNG      = 32 << 20
 )
+
+var errChromiumShutdownIncomplete = errors.New("Chromium process tree shutdown incomplete")
 
 type papercraftFormat struct {
 	name       string
@@ -67,6 +72,7 @@ type papercraftEncoderConfig struct {
 type papercraftRenderDeps struct {
 	startPage    func(context.Context, string, int, int, string) (papercraftPage, error)
 	startEncoder func(context.Context, papercraftEncoderConfig) (papercraftEncoder, error)
+	removeAll    func(string) error
 }
 
 func init() {
@@ -76,7 +82,7 @@ func init() {
 }
 
 func livePapercraftRenderDeps() papercraftRenderDeps {
-	return papercraftRenderDeps{startPage: startChromiumRenderPage, startEncoder: startPapercraftFFmpeg}
+	return papercraftRenderDeps{startPage: startChromiumRenderPage, startEncoder: startPapercraftFFmpeg, removeAll: os.RemoveAll}
 }
 
 func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inputs []string, outDir string, deps papercraftRenderDeps) ([]string, error) {
@@ -102,7 +108,7 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 			return nil, err
 		}
 		profileDir := filepath.Join(outDir, ".chromium-"+format.name)
-		if err := os.RemoveAll(profileDir); err != nil {
+		if err := removePapercraftProfile(profileDir, deps.removeAll); err != nil {
 			return nil, fmt.Errorf("reset Chromium profile: %w", err)
 		}
 		if err := os.MkdirAll(profileDir, 0o700); err != nil {
@@ -110,27 +116,34 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 		}
 		page, err := deps.startPage(ctx, format.html, format.width, format.height, profileDir)
 		if err != nil {
-			_ = os.RemoveAll(profileDir)
-			return nil, fmt.Errorf("start %s Chromium render: %w", format.name, err)
+			var cleanupErr error
+			if !errors.Is(err, errChromiumShutdownIncomplete) {
+				cleanupErr = removePapercraftProfile(profileDir, deps.removeAll)
+			}
+			return nil, errors.Join(
+				fmt.Errorf("start %s Chromium render: %w", format.name, err),
+				cleanupErr,
+			)
 		}
 
 		durationValue, evalErr := page.Evaluate(ctx, "window.DUR")
 		duration, durationErr := finiteFloat(durationValue)
 		if evalErr != nil || durationErr != nil || duration <= 0 || duration > papercraftMaxDuration {
-			_ = page.Close()
-			_ = os.RemoveAll(profileDir)
+			var durationFailure error
 			if evalErr != nil {
-				return nil, fmt.Errorf("read %s window.DUR: %w", format.name, evalErr)
+				durationFailure = fmt.Errorf("read %s window.DUR: %w", format.name, evalErr)
+			} else if durationErr != nil {
+				durationFailure = fmt.Errorf("read %s window.DUR: %w", format.name, durationErr)
+			} else {
+				durationFailure = fmt.Errorf("%s window.DUR must be greater than 0 and at most %d", format.name, papercraftMaxDuration)
 			}
-			if durationErr != nil {
-				return nil, fmt.Errorf("read %s window.DUR: %w", format.name, durationErr)
-			}
-			return nil, fmt.Errorf("%s window.DUR must be greater than 0 and at most %d", format.name, papercraftMaxDuration)
+			return nil, errors.Join(durationFailure, cleanupPapercraftRender(page, profileDir, deps.removeAll))
 		}
 		if hasDuration && math.Abs(duration-wantDuration) > 1.0/papercraftFPS {
-			_ = page.Close()
-			_ = os.RemoveAll(profileDir)
-			return nil, fmt.Errorf("%s window.DUR %.6f disagrees with duration_seconds %.6f", format.name, duration, wantDuration)
+			return nil, errors.Join(
+				fmt.Errorf("%s window.DUR %.6f disagrees with duration_seconds %.6f", format.name, duration, wantDuration),
+				cleanupPapercraftRender(page, profileDir, deps.removeAll),
+			)
 		}
 		if hasDuration {
 			duration = wantDuration
@@ -140,18 +153,17 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 		encodedDuration := float64(frameCount) / papercraftFPS
 		outputPath := filepath.Join(outDir, format.outputName)
 		if err := removeStaleBuiltinOutput(outputPath); err != nil {
-			_ = page.Close()
-			_ = os.RemoveAll(profileDir)
-			return nil, err
+			return nil, errors.Join(err, cleanupPapercraftRender(page, profileDir, deps.removeAll))
 		}
 		encoder, err := deps.startEncoder(ctx, papercraftEncoderConfig{
 			Width: format.width, Height: format.height, FPS: papercraftFPS,
 			DurationSeconds: encodedDuration, AudioPath: audio, OutputPath: outputPath,
 		})
 		if err != nil {
-			_ = page.Close()
-			_ = os.RemoveAll(profileDir)
-			return nil, fmt.Errorf("start %s ffmpeg encode: %w", format.name, err)
+			return nil, errors.Join(
+				fmt.Errorf("start %s ffmpeg encode: %w", format.name, err),
+				cleanupPapercraftRender(page, profileDir, deps.removeAll),
+			)
 		}
 
 		renderErr := renderPapercraftFrames(ctx, page, encoder, frameCount)
@@ -160,13 +172,9 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 		} else {
 			encoder.Abort()
 		}
-		closeErr := page.Close()
-		_ = os.RemoveAll(profileDir)
-		if renderErr != nil {
-			return nil, fmt.Errorf("render %s: %w", format.name, renderErr)
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close %s Chromium render: %w", format.name, closeErr)
+		cleanupErr := cleanupPapercraftRender(page, profileDir, deps.removeAll)
+		if combined := errors.Join(renderErr, cleanupErr); combined != nil {
+			return nil, fmt.Errorf("render %s: %w", format.name, combined)
 		}
 		info, err := os.Stat(outputPath)
 		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
@@ -175,6 +183,27 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 		outputs = append(outputs, format.outputName)
 	}
 	return outputs, nil
+}
+
+func cleanupPapercraftRender(page papercraftPage, profileDir string, removeAll func(string) error) error {
+	if page != nil {
+		if err := page.Close(); err != nil {
+			// A failed close means the browser process tree may still hold profile
+			// files. Leave the directory in place rather than racing a live child.
+			return fmt.Errorf("close Chromium render before profile removal: %w", err)
+		}
+	}
+	return removePapercraftProfile(profileDir, removeAll)
+}
+
+func removePapercraftProfile(profileDir string, removeAll func(string) error) error {
+	if removeAll == nil {
+		removeAll = os.RemoveAll
+	}
+	if err := removeAll(profileDir); err != nil {
+		return fmt.Errorf("remove Chromium profile %q: %w", profileDir, err)
+	}
+	return nil
 }
 
 func renderPapercraftFrames(ctx context.Context, page papercraftPage, encoder papercraftEncoder, frameCount int) error {
@@ -314,10 +343,24 @@ func finiteFloat(v any) (float64, error) {
 }
 
 type chromiumRenderPage struct {
-	cdp    *cobrowsestream.Client
-	cancel context.CancelFunc
-	wait   <-chan error
-	stderr *bytes.Buffer
+	cdp     *cobrowsestream.Client
+	process chromiumProcessControl
+}
+
+type chromiumProcessControl interface {
+	Done() <-chan struct{}
+	WaitErr() error
+	Diagnostic() string
+	Shutdown() error
+}
+
+type execChromiumProcess struct {
+	cancel   context.CancelFunc
+	done     chan struct{}
+	stderr   *bytes.Buffer
+	waitErr  error
+	stopOnce sync.Once
+	stopErr  error
 }
 
 func startChromiumRenderPage(ctx context.Context, html string, width, height int, profileDir string) (papercraftPage, error) {
@@ -329,62 +372,24 @@ func startChromiumRenderPage(ctx context.Context, html string, width, height int
 	if err != nil {
 		return nil, err
 	}
-	procCtx, cancel := context.WithCancel(ctx)
-	args := []string{
-		"--headless=new", "--disable-gpu", "--force-color-profile=srgb", "--font-render-hinting=none",
-		"--disable-background-networking", "--disable-component-update", "--disable-sync", "--metrics-recording-only",
-		"--disable-breakpad", "--disable-crash-reporter", "--crash-dumps-dir=" + filepath.Join(profileDir, "crash"),
-		"--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=<-loopback>",
-		"--remote-debugging-address=127.0.0.1", fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir=" + profileDir, "--disk-cache-dir=" + filepath.Join(profileDir, "cache"),
-		fmt.Sprintf("--window-size=%d,%d", width, height), "--hide-scrollbars", "--no-first-run", "--no-default-browser-check",
-		"about:blank",
-	}
-	if platform.IsRoot() {
-		// Chromium refuses to start as root with its setuid sandbox. The worker's
-		// approved-template gate remains the code authorization boundary on that
-		// deployment shape; non-root nodes retain Chromium's sandbox.
-		args = append([]string{"--no-sandbox"}, args...)
-	}
-	cmd := exec.CommandContext(procCtx, chrome, args...)
-	stderr := &bytes.Buffer{}
-	cmd.Stdout = io.Discard
-	cmd.Stderr = stderr
-	cmd.Env = withEnvOverrides(os.Environ(),
+	args := papercraftChromiumArgs(profileDir, width, height, port, runtime.GOOS, platform.IsRoot())
+	env := withEnvOverrides(os.Environ(),
 		"HOME="+profileDir,
 		"XDG_CACHE_HOME="+filepath.Join(profileDir, "cache"),
 		"XDG_CONFIG_HOME="+filepath.Join(profileDir, "config"),
 		"TMPDIR="+profileDir, "TMP="+profileDir, "TEMP="+profileDir,
 	)
-	if err := cmd.Start(); err != nil {
-		cancel()
+	process, err := startChromiumProcess(ctx, chrome, args, env)
+	if err != nil {
 		return nil, fmt.Errorf("start Chromium: %w", err)
 	}
-	wait := make(chan error, 1)
-	go func() { wait <- cmd.Wait() }()
-
-	var cdp *cobrowsestream.Client
-	deadline := time.Now().Add(30 * time.Second)
-	for cdp == nil && time.Now().Before(deadline) {
-		select {
-		case err := <-wait:
-			cancel()
-			return nil, fmt.Errorf("Chromium exited before CDP became ready: %v: %s", err, compactCommandOutput(stderr.Bytes()))
-		case <-ctx.Done():
-			cancel()
-			return nil, ctx.Err()
-		default:
-		}
-		cdp, err = cobrowsestream.DialCDP(port)
-		if err != nil {
-			time.Sleep(50 * time.Millisecond)
-		}
+	cdp, err := waitForChromiumCDP(ctx, process, func() (*cobrowsestream.Client, error) {
+		return cobrowsestream.DialCDP(port)
+	}, 30*time.Second, 50*time.Millisecond)
+	if err != nil {
+		return nil, err
 	}
-	if cdp == nil {
-		cancel()
-		return nil, fmt.Errorf("Chromium CDP did not become ready: %w", err)
-	}
-	p := &chromiumRenderPage{cdp: cdp, cancel: cancel, wait: wait, stderr: stderr}
+	p := &chromiumRenderPage{cdp: cdp, process: process}
 	for _, command := range []struct {
 		method string
 		params map[string]any
@@ -395,14 +400,15 @@ func startChromiumRenderPage(ctx context.Context, html string, width, height int
 		{"Emulation.setDeviceMetricsOverride", map[string]any{"width": width, "height": height, "deviceScaleFactor": 1, "mobile": false}},
 	} {
 		if _, err := cdp.Command(ctx, command.method, command.params); err != nil {
-			_ = p.Close()
-			return nil, err
+			return nil, errors.Join(err, p.Close())
 		}
 	}
-	pageURL := (&url.URL{Scheme: "file", Path: html}).String() + "?render=1"
+	pageURL, err := papercraftFileURL(html, runtime.GOOS)
+	if err != nil {
+		return nil, errors.Join(err, p.Close())
+	}
 	if _, err := cdp.Command(ctx, "Page.navigate", map[string]any{"url": pageURL}); err != nil {
-		_ = p.Close()
-		return nil, err
+		return nil, errors.Join(err, p.Close())
 	}
 	readyDeadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(readyDeadline) {
@@ -414,13 +420,154 @@ func startChromiumRenderPage(ctx context.Context, html string, width, height int
 		}
 		select {
 		case <-ctx.Done():
-			_ = p.Close()
-			return nil, ctx.Err()
+			return nil, errors.Join(ctx.Err(), p.Close())
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	_ = p.Close()
-	return nil, fmt.Errorf("timed out waiting for window.READY")
+	return nil, errors.Join(fmt.Errorf("timed out waiting for window.READY"), p.Close())
+}
+
+func startChromiumProcess(ctx context.Context, binary string, args, env []string) (*execChromiumProcess, error) {
+	procCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(procCtx, binary, args...)
+	stderr := &bytes.Buffer{}
+	cmd.Stdout = io.Discard
+	cmd.Stderr = stderr
+	cmd.Env = env
+	cmd.WaitDelay = 5 * time.Second
+	configurePapercraftProcessTree(cmd)
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, err
+	}
+	process := &execChromiumProcess{cancel: cancel, done: make(chan struct{}), stderr: stderr}
+	go func() {
+		process.waitErr = cmd.Wait()
+		close(process.done)
+	}()
+	return process, nil
+}
+
+func (p *execChromiumProcess) Done() <-chan struct{} { return p.done }
+
+func (p *execChromiumProcess) WaitErr() error {
+	<-p.done
+	return p.waitErr
+}
+
+func (p *execChromiumProcess) Diagnostic() string {
+	return compactCommandOutput(p.stderr.Bytes())
+}
+
+func (p *execChromiumProcess) Shutdown() error {
+	p.stopOnce.Do(func() {
+		p.cancel()
+		select {
+		case <-p.done:
+		case <-time.After(10 * time.Second):
+			p.stopErr = fmt.Errorf("%w: timed out waiting for Chromium process tree to exit", errChromiumShutdownIncomplete)
+		}
+	})
+	return p.stopErr
+}
+
+func waitForChromiumCDP(
+	ctx context.Context,
+	process chromiumProcessControl,
+	dial func() (*cobrowsestream.Client, error),
+	timeout, retry time.Duration,
+) (*cobrowsestream.Client, error) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	var lastErr error
+	for {
+		cdp, err := dial()
+		if err == nil && cdp != nil {
+			return cdp, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("CDP dial returned a nil client")
+		}
+		lastErr = err
+		retryTimer := time.NewTimer(retry)
+		select {
+		case <-process.Done():
+			retryTimer.Stop()
+			return nil, errors.Join(
+				fmt.Errorf("Chromium exited before CDP became ready: %v: %s", process.WaitErr(), process.Diagnostic()),
+				process.Shutdown(),
+			)
+		case <-ctx.Done():
+			retryTimer.Stop()
+			return nil, errors.Join(ctx.Err(), process.Shutdown())
+		case <-deadline.C:
+			retryTimer.Stop()
+			shutdownErr := process.Shutdown()
+			startupErr := fmt.Errorf("Chromium CDP did not become ready: %w", lastErr)
+			if shutdownErr == nil {
+				startupErr = fmt.Errorf("Chromium CDP did not become ready: %w: %s", lastErr, process.Diagnostic())
+			}
+			return nil, errors.Join(
+				startupErr,
+				shutdownErr,
+			)
+		case <-retryTimer.C:
+		}
+	}
+}
+
+func papercraftChromiumArgs(profileDir string, width, height, port int, goos string, elevated bool) []string {
+	args := []string{
+		"--headless=new", "--disable-gpu", "--force-color-profile=srgb", "--font-render-hinting=none",
+		"--disable-background-networking", "--disable-component-update", "--disable-sync", "--metrics-recording-only",
+		"--disable-breakpad", "--disable-crash-reporter", "--crash-dumps-dir=" + filepath.Join(profileDir, "crash"),
+		"--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=<-loopback>",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--remote-debugging-address=127.0.0.1", fmt.Sprintf("--remote-debugging-port=%d", port),
+		"--user-data-dir=" + profileDir, "--disk-cache-dir=" + filepath.Join(profileDir, "cache"),
+		fmt.Sprintf("--window-size=%d,%d", width, height), "--hide-scrollbars", "--no-first-run", "--no-default-browser-check",
+		"about:blank",
+	}
+	if goos == "linux" && elevated {
+		// Chromium refuses to start as root with its setuid sandbox. The worker's
+		// approved-template gate remains the code authorization boundary on that
+		// Linux deployment shape. Windows administrators and all non-root nodes
+		// retain Chromium's sandbox.
+		args = append([]string{"--no-sandbox"}, args...)
+	}
+	return args
+}
+
+func papercraftFileURL(path, goos string) (string, error) {
+	u := &url.URL{Scheme: "file", RawQuery: "render=1"}
+	if goos != "windows" {
+		if !strings.HasPrefix(path, "/") {
+			return "", fmt.Errorf("local player path is not absolute: %q", path)
+		}
+		u.Path = path
+		return u.String(), nil
+	}
+
+	slashPath := strings.ReplaceAll(path, `\`, "/")
+	if strings.HasPrefix(slashPath, "//") {
+		unc := strings.TrimPrefix(slashPath, "//")
+		host, sharePath, ok := strings.Cut(unc, "/")
+		if !ok || host == "" || sharePath == "" {
+			return "", fmt.Errorf("UNC player path is incomplete: %q", path)
+		}
+		u.Host = host
+		u.Path = "/" + sharePath
+		return u.String(), nil
+	}
+	if len(slashPath) < 3 || slashPath[1] != ':' || slashPath[2] != '/' || !isASCIIAlpha(slashPath[0]) {
+		return "", fmt.Errorf("Windows player path is not absolute: %q", path)
+	}
+	u.Path = "/" + slashPath
+	return u.String(), nil
+}
+
+func isASCIIAlpha(b byte) bool {
+	return b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
 }
 
 func (p *chromiumRenderPage) Evaluate(ctx context.Context, expression string) (any, error) {
@@ -460,14 +607,8 @@ func (p *chromiumRenderPage) Close() error {
 	if p.cdp != nil {
 		p.cdp.Close()
 	}
-	p.cancel()
-	select {
-	case err := <-p.wait:
-		if err != nil && !strings.Contains(err.Error(), "killed") && !strings.Contains(err.Error(), "signal") {
-			return fmt.Errorf("Chromium exit: %w: %s", err, compactCommandOutput(p.stderr.Bytes()))
-		}
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("timed out waiting for Chromium to exit")
+	if p.process != nil {
+		return p.process.Shutdown()
 	}
 	return nil
 }

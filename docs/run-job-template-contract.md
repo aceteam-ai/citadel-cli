@@ -68,13 +68,16 @@ manifest hash and ordered output digests, and remains fail-open for signing erro
 required stage declaration, `1920x1080` and `1080x1920`, plus the referenced
 asset files and at most one optional audio file. Each player must expose
 `window.READY`, `window.DUR`, and `window.renderFrame(t)`. The runner blocks
-HTTP(S), WebSocket, and FTP requests before navigating to the local player,
-captures a PNG whenever the 10 fps render key changes, repeats those frames into
-a 30 fps image pipe, and encodes H.264 (`libx264`, CRF 17, slow/animation,
-`yuv420p`) with optional AAC audio. Outputs are `landscape.mp4` and
+HTTP(S), WebSocket, FTP, and non-proxied WebRTC UDP before navigating to the
+OS-correct local file URL. It captures a PNG whenever the 10 fps render key
+changes, repeats those frames into a 30 fps image pipe, and encodes H.264
+(`libx264`, CRF 17, slow/animation, `yuv420p`) with optional AAC audio. Outputs
+are `landscape.mp4` and
 `portrait.mp4`. Chromium profile/cache/temp files stay inside the run output
-directory and are removed after each format. Runtime dependencies are Chromium
-or Chrome and ffmpeg.
+directory and are removed after each format. Cancellation terminates the browser
+process tree and waits before profile removal; cleanup failures fail the run.
+Only a root process on Linux receives Chromium's required `--no-sandbox` switch.
+Runtime dependencies are Chromium or Chrome and ffmpeg.
 
 The matching closed input schema is:
 
