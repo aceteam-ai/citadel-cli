@@ -15,12 +15,20 @@ import (
 // tmux.Resolve succeeds deterministically without a real tmux on the runner.
 func makeFakeTmux(t *testing.T) string {
 	t.Helper()
+	enablePersistentTmuxForTest(t)
 	bin := filepath.Join(t.TempDir(), "tmux")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("setup fake tmux: %v", err)
 	}
 	t.Setenv("CITADEL_TMUX_BIN", bin)
 	return bin
+}
+
+func enablePersistentTmuxForTest(t *testing.T) {
+	t.Helper()
+	previous := currentPlatformPersistentTmuxSupported
+	currentPlatformPersistentTmuxSupported = func() bool { return true }
+	t.Cleanup(func() { currentPlatformPersistentTmuxSupported = previous })
 }
 
 // TestTmuxInstallTimeoutUnderServerWriteTimeout pins the constraint that
@@ -45,6 +53,17 @@ func TestSessionCommand_NoSessionName(t *testing.T) {
 	}
 }
 
+func TestPersistentTmuxSupported(t *testing.T) {
+	if persistentTmuxSupported("windows") {
+		t.Fatal("persistent tmux must remain disabled on Windows until ConPTY argv escaping is implemented")
+	}
+	for _, goos := range []string{"linux", "darwin", "freebsd"} {
+		if !persistentTmuxSupported(goos) {
+			t.Errorf("persistentTmuxSupported(%q) = false", goos)
+		}
+	}
+}
+
 func TestSessionCommand_InvalidName(t *testing.T) {
 	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	makeFakeTmux(t)
@@ -62,11 +81,11 @@ func TestSessionCommand_TmuxUnavailable(t *testing.T) {
 	}
 }
 
-func TestSessionCommand_BuildsAttachOrCreate(t *testing.T) {
+func TestSessionCommand_BuildsAttach(t *testing.T) {
 	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	bin := makeFakeTmux(t)
 	got := sessionCommand("agent", "/bin/bash", false)
-	want := []string{bin, "new-session", "-A", "-s", "agent", "/bin/bash"}
+	want := append([]string{bin}, tmux.AttachArgs("agent")...)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand = %v, want %v", got, want)
 	}
@@ -95,7 +114,7 @@ func TestSessionCommand_ExplicitHonoredInsideTmux(t *testing.T) {
 	bin := makeFakeTmux(t)
 	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
 	got := sessionCommand("agent", "/bin/bash", true)
-	want := []string{bin, "new-session", "-A", "-s", "agent", "/bin/bash"}
+	want := append([]string{bin}, tmux.AttachArgs("agent")...)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand(explicit=true) = %v, want %v (explicit --tmux must win over the nesting guard)", got, want)
 	}

@@ -65,6 +65,7 @@ citadel work --mode=nexus --terminal --terminal-port 7860
 | `CITADEL_TERMINAL_MAX_CONNECTIONS` | Max concurrent sessions | 10 |
 | `CITADEL_TERMINAL_SHELL` | Shell to spawn | Platform default |
 | `CITADEL_TERMINAL_SESSION` | Persistent tmux session base name to back connections, or a disable sentinel (`none`/`off`/`disabled`/`false`/`0`, case-insensitive) to force a bare shell | `citadel` (tmux backing ON) |
+| `CITADEL_TERMINAL_SESSION_TTL` | Retention lease after disconnect for a Citadel-managed tmux session; minimum non-zero value `1m`, Go duration syntax, `0` disables the reaper | `168h` (7 days) |
 | `CITADEL_TMUX_BIN` | Explicit path to a tmux binary (overrides PATH/managed lookup) | (unset) |
 | `CITADEL_AUTH_HOST` | Authentication service URL | https://aceteam.ai |
 | `CITADEL_TOKEN_REFRESH_INTERVAL` | Token cache refresh interval in minutes | 60 |
@@ -73,7 +74,7 @@ citadel work --mode=nexus --terminal --terminal-port 7860
 
 By default (`CITADEL_TERMINAL_SESSION` unset, base name `citadel`), and as long
 as a usable `tmux` binary is available, each WebSocket connection is backed by a
-named tmux session via `tmux new-session -A -s <name>` instead of a fresh bare
+named tmux session instead of a fresh bare
 shell. The tmux server keeps the session alive after a client disconnects, so
 reconnecting re-attaches to the same session and the terminal state (running
 programs, scrollback, working directory) survives reconnects. This backs the
@@ -84,6 +85,9 @@ tmux is never assumed to be installed. The binary is resolved in order:
 `CITADEL_TMUX_BIN` → `tmux` on `PATH` → a Citadel-managed binary at
 `~/.citadel/bin/tmux`. When none is found, the server falls back to a bare shell
 (connections still work, but do not persist across reconnects).
+Persistent tmux backing is currently disabled on Windows: the ConPTY launcher
+flattens argv and cannot safely preserve the identity-checked tmux command
+queue. Windows connections therefore use the normal bare shell.
 
 **Opting out (citadel #780):** a power user who runs their own tmux — connecting
 through the Citadel console, sshing elsewhere, running `tmux a` there — ends up
@@ -120,6 +124,29 @@ Sessions can also be pre-created, listed, or checked out-of-band through the
 `TMUX_SESSION` job type (payload `action`: `ensure`|`create`|`list`|`has`,
 `name`, optional `shell`), dispatched through the standard worker mechanism.
 
+Citadel marks only sessions it successfully creates; it never adopts an
+existing unmarked session. If the derived name collides with an operator-owned
+session, the connection logs the collision and safely falls back to a bare
+shell without attaching to or modifying that session. Creation plus ownership
+metadata are one tmux command queue (a duplicate `new-session` aborts the
+following marker commands). Renew and attach operations are additionally bound
+to both tmux's immutable session ID and the tmux server PID, so killing and
+recreating the same human-readable name cannot redirect Citadel to the
+replacement.
+
+Citadel gives each marked session an explicit retention lease and sweeps once
+per hour. The lease is renewed while a client is attached and once when it
+disconnects. A session becomes eligible only after the lease expires and it is
+detached. This is deliberately not called an idle timeout: tmux's
+`session_activity` does not reflect detached pane output or `send-keys`, so it
+cannot prove that a background task is idle. Consequently, a still-running task
+in a disconnected session may be terminated after the configured retention
+lease. At removal, tmux atomically checks the exact session ID and tmux server
+PID as well as detached state, marker, and the exact expired lease that was
+observed; an attach, renewal, or killed-and-recreated server racing the sweep
+therefore fails closed. Unmarked and
+malformed sessions are never removed. Set the TTL to `0` to disable cleanup.
+
 ### Surviving a managed worker restart
 
 On Linux, a tmux server started by `citadel.service` would normally inherit the
@@ -139,6 +166,16 @@ tmux session.
 Non-systemd platforms and interactive `citadel work` invocations keep invoking
 tmux directly. A Linux system service running as a non-root user also keeps the
 direct behavior because that user cannot safely create a sibling system scope.
+Each launch writes one diagnostic line to the Citadel log stating whether it
+used a transient scope or the direct fallback, including the fallback reason.
+
+Sessions created by a pre-upgrade binary remain unscoped and therefore still
+die on the first worker restart after upgrading; sessions created or reattached
+after the upgrade use the new scope behavior.
+
+Upgrade transition: a pre-existing unmarked session that collides with a
+Citadel name is no longer adopted; rename or remove it explicitly before
+reconnecting if it should become Citadel-managed.
 
 #### Manual restart proof
 

@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 )
 
 func TestResolveSessionOverride(t *testing.T) {
@@ -60,7 +62,7 @@ func TestResolveSessionCommand_NoOverridePreservesDefault(t *testing.T) {
 		if !wanted {
 			t.Fatal("wantedSession = false, want true (node default names a session)")
 		}
-		want := []string{bin, "new-session", "-A", "-s", name, "/bin/bash"}
+		want := append([]string{bin}, tmux.AttachArgs(name)...)
 		if !reflect.DeepEqual(cmd, want) {
 			t.Errorf("command = %v, want %v", cmd, want)
 		}
@@ -129,7 +131,7 @@ func TestResolveSessionCommand_OverrideNamedRequestsTmux(t *testing.T) {
 	if !wanted {
 		t.Fatal("wantedSession = false, want true (override names a session)")
 	}
-	want := []string{bin, "new-session", "-A", "-s", name, "/bin/bash"}
+	want := append([]string{bin}, tmux.AttachArgs(name)...)
 	if !reflect.DeepEqual(cmd, want) {
 		t.Errorf("command = %v, want %v", cmd, want)
 	}
@@ -162,7 +164,7 @@ func TestResolveSessionCommand_OverrideTriggersInstallOnMissingTmux(t *testing.T
 	if installCalls != 1 {
 		t.Fatalf("ensureInstall called %d times, want 1", installCalls)
 	}
-	want := []string{installedBin, "new-session", "-A", "-s", name, "/bin/bash"}
+	want := append([]string{installedBin}, tmux.AttachArgs(name)...)
 	if !reflect.DeepEqual(cmd, want) {
 		t.Errorf("command = %v, want %v (should resolve via the newly installed binary)", cmd, want)
 	}
@@ -173,6 +175,7 @@ func TestResolveSessionCommand_OverrideTriggersInstallOnMissingTmux(t *testing.T
 // platform is gated/unsupported), the connection still succeeds as a bare
 // shell rather than erroring out.
 func TestResolveSessionCommand_OverrideInstallFailsFallsBackToBare(t *testing.T) {
+	enablePersistentTmuxForTest(t)
 	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	t.Setenv("CITADEL_TMUX_BIN", filepath.Join(t.TempDir(), "missing"))
 
@@ -241,7 +244,7 @@ func TestResolveSessionCommand_ExplicitOverrideHonoredInsideTmux(t *testing.T) {
 	if !wanted {
 		t.Fatal("wantedSession = false, want true (override names a session)")
 	}
-	want := []string{bin, "new-session", "-A", "-s", name, "/bin/bash"}
+	want := append([]string{bin}, tmux.AttachArgs(name)...)
 	if !reflect.DeepEqual(cmd, want) {
 		t.Errorf("command = %v, want %v (explicit --tmux must win over the nesting guard)", cmd, want)
 	}
@@ -255,6 +258,7 @@ func TestResolveSessionCommand_ExplicitOverrideHonoredInsideTmux(t *testing.T) {
 // can simulate an install landing this exact binary at a controlled moment.
 func makeFakeTmuxPath(t *testing.T) string {
 	t.Helper()
+	enablePersistentTmuxForTest(t)
 	bin := filepath.Join(t.TempDir(), "tmux-installed")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("setup fake tmux: %v", err)

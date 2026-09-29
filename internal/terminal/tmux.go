@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -110,10 +111,11 @@ func sessionNameForUser(base, userID string) string {
 // sessionCommand returns the program + args the PTY should run for a connection.
 //
 // When the server is configured with a SessionName and a usable tmux binary is
-// available, it returns a `tmux new-session -A -s <name>` invocation so the
-// connection attaches to (or creates) a persistent named session that survives
-// reconnects. Otherwise it returns nil, signalling the caller to fall back to a
-// bare shell.
+// available, it returns an attach invocation as an availability signal. The
+// handler must call Manager.PrepareSession before running it: that separate
+// ownership step creates and marks only a new Citadel session and rejects a
+// colliding operator-owned name. Otherwise it returns nil, signalling the
+// caller to fall back to a bare shell.
 //
 // A SessionName matching a disable sentinel ("none"/"off"/...) returns nil so
 // operators can opt out of persistence without unsetting the default.
@@ -131,6 +133,9 @@ func sessionNameForUser(base, userID string) string {
 // The returned command starts only a shell inside tmux; launching claude (or
 // any agent) is a separate explicit step and never coupled here.
 func sessionCommand(sessionName, shell string, explicit bool) []string {
+	if !currentPlatformPersistentTmuxSupported() {
+		return nil
+	}
 	if sessionName == "" || sessionDisabled(sessionName) {
 		return nil
 	}
@@ -144,8 +149,23 @@ func sessionCommand(sessionName, shell string, explicit bool) []string {
 	if err != nil {
 		return nil
 	}
-	command := append([]string{bin}, tmux.AttachOrCreateArgs(sessionName, shell)...)
-	return tmux.PersistentSessionCommand(sessionName, command)
+	command := append([]string{bin}, tmux.AttachArgs(sessionName)...)
+	// This is only an availability sentinel. The handler replaces it with the
+	// identity-bound command from Manager.PrepareSession, which owns the one
+	// real scope decision and diagnostic line.
+	return command
+}
+
+func persistentTmuxSupported(goos string) bool {
+	// Windows ConPTY accepts a flattened command line rather than an argv
+	// vector. Identity-bound tmux if-shell actions intentionally contain spaces
+	// and command separators, which cannot be represented safely by the current
+	// Windows session launcher. Fall back to the ordinary shell explicitly.
+	return goos != "windows"
+}
+
+var currentPlatformPersistentTmuxSupported = func() bool {
+	return persistentTmuxSupported(runtime.GOOS)
 }
 
 // resolveSessionOverride decides the effective session BASE name for a single
@@ -197,7 +217,7 @@ func resolveSessionCommand(configDefault, requestOverride, userID, shell string,
 
 	sessionName = sessionNameForUser(base, userID)
 	command = sessionCommand(sessionName, shell, overridden)
-	if command == nil && overridden && ensureInstall != nil {
+	if command == nil && overridden && currentPlatformPersistentTmuxSupported() && ensureInstall != nil {
 		if ensureInstall() {
 			command = sessionCommand(sessionName, shell, overridden)
 		}

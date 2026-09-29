@@ -12,6 +12,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
@@ -158,6 +159,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 		// Debug routes to the dated log file always and to the console only under
 		// --debug, so this costs nothing at the terminal.
 		network.SetLogf(Debug)
+		tmux.SetLogf(Debug)
 
 		// Handle global --no-color flag and NO_COLOR env var
 		if noColorGlobal || os.Getenv("NO_COLOR") != "" {

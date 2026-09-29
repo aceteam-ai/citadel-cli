@@ -767,10 +767,29 @@ on the node (citadel #780) — this is node-wide. The CLI (`citadel ssh`/`citade
 connect`) is unaffected either way: it always defaults to a bare shell and only
 opts into tmux persistence with `--tmux` (citadel #759).
 
+`tmux.PersistentSessionCommand` owns the systemd-scope decision and logs the
+selected path plus its reason through the package logger wired in
+`cmd/root.go`. `tmux.Manager.ReapExpiredSessions` owns persistent-session
+cleanup. Citadel marks only sessions it successfully creates; an existing
+unmarked name is an operator collision and must never be adopted or attached.
+Create+mark is one tmux command queue, and subsequent renew/attach commands are
+conditioned on the inspected session ID plus tmux server PID; never split these
+back into name-targeted check-then-act invocations.
+The server renews an explicit retention lease while attached and on detach.
+The reaper does not use `session_activity` (it misses detached pane output and
+`send-keys`); after the lease expires, even a running disconnected task may be
+terminated. The kill is one tmux `if-shell` operation that atomically requires
+the session ID, tmux server PID, detached state, marker, and exact observed
+expired lease to remain unchanged, so concurrent attach/renewal or a killed and
+recreated tmux server fails closed. `terminal.DefaultSessionTTL`
+pins the seven-day default, the minimum non-zero value is one minute, and the
+server runs the sweep hourly; `0` disables it. Never replace ownership with a
+name prefix or an all-server sweep — operators may share that tmux server.
+
 **A Citadel-started tmux server must not remain in citadel.service's control
 group (citadel-cli#1166).** `tmux.PersistentSessionCommand` is the single launch
 boundary shared by `TMUX_SESSION` detached creation and the terminal PTY's
-attach-or-create path. On Linux, when Citadel is running in a systemd USER unit,
+verified attach path. On Linux, when Citadel is running in a systemd USER unit,
 it wraps the tmux command in a uniquely named `systemd-run --user --scope`; a
 root SYSTEM unit uses the system manager instead. The scope is a sibling of the
 worker unit, so systemd's default `KillMode=control-group` remains intact for

@@ -7,9 +7,12 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 )
 
 func TestDefaultConfig(t *testing.T) {
+	t.Setenv("CITADEL_TERMINAL_SESSION_TTL", "")
 	config := DefaultConfig()
 
 	if config.Port != 7860 {
@@ -27,6 +30,9 @@ func TestDefaultConfig(t *testing.T) {
 	if config.MaxConnections != 10 {
 		t.Errorf("expected default max connections 10, got %d", config.MaxConnections)
 	}
+	if config.SessionTTL != DefaultSessionTTL {
+		t.Errorf("expected default persistent session TTL %v, got %v", DefaultSessionTTL, config.SessionTTL)
+	}
 
 	if config.Shell == "" {
 		t.Error("expected default shell to be set")
@@ -43,11 +49,13 @@ func TestConfigFromEnv(t *testing.T) {
 	os.Setenv("CITADEL_TERMINAL_ENABLED", "false")
 	os.Setenv("CITADEL_TERMINAL_IDLE_TIMEOUT", "60")
 	os.Setenv("CITADEL_TERMINAL_MAX_CONNECTIONS", "20")
+	os.Setenv("CITADEL_TERMINAL_SESSION_TTL", "48h")
 	defer func() {
 		os.Unsetenv("CITADEL_TERMINAL_PORT")
 		os.Unsetenv("CITADEL_TERMINAL_ENABLED")
 		os.Unsetenv("CITADEL_TERMINAL_IDLE_TIMEOUT")
 		os.Unsetenv("CITADEL_TERMINAL_MAX_CONNECTIONS")
+		os.Unsetenv("CITADEL_TERMINAL_SESSION_TTL")
 	}()
 
 	config := DefaultConfig()
@@ -66,6 +74,9 @@ func TestConfigFromEnv(t *testing.T) {
 
 	if config.MaxConnections != 20 {
 		t.Errorf("expected max connections 20 from env, got %d", config.MaxConnections)
+	}
+	if config.SessionTTL != 48*time.Hour {
+		t.Errorf("expected persistent session TTL 48h from env, got %v", config.SessionTTL)
 	}
 }
 
@@ -89,7 +100,7 @@ func TestDefaultConfig_TmuxOnByDefault(t *testing.T) {
 		t.Error("expected tmux backing to be ENABLED by default (citadel #585)")
 	}
 	got := sessionCommand(config.SessionName, "/bin/bash", false)
-	want := []string{bin, "new-session", "-A", "-s", "citadel", "/bin/bash"}
+	want := append([]string{bin}, tmux.AttachArgs("citadel")...)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand = %v, want %v", got, want)
 	}
@@ -207,6 +218,28 @@ func TestConfigValidate(t *testing.T) {
 				OrgID:          "test-org",
 			},
 			wantErr: ErrInvalidIdleTimeout,
+		},
+		{
+			name: "persistent session TTL shorter than sweep floor",
+			config: &Config{
+				Port:           7860,
+				MaxConnections: 10,
+				IdleTimeout:    30 * time.Minute,
+				SessionTTL:     30 * time.Second,
+				OrgID:          "test-org",
+			},
+			wantErr: ErrInvalidSessionTTL,
+		},
+		{
+			name: "persistent session TTL disabled",
+			config: &Config{
+				Port:           7860,
+				MaxConnections: 10,
+				IdleTimeout:    30 * time.Minute,
+				SessionTTL:     0,
+				OrgID:          "test-org",
+			},
+			wantErr: nil,
 		},
 		{
 			name: "missing org ID",

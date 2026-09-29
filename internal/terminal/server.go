@@ -15,7 +15,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	tmuxReapInterval = time.Hour
+	tmuxReapTimeout  = 10 * time.Second
 )
 
 // terminalPasscodeSubprotocol is the WebSocket subprotocol marker a BROWSER
@@ -163,15 +169,33 @@ type Server struct {
 	httpServer *http.Server
 	upgrader   websocket.Upgrader
 
-	mu      sync.RWMutex
-	running bool
+	mu       sync.RWMutex
+	running  bool
+	stopping bool
+	// lifecycleMu serializes complete Start/Stop transitions. running=false is
+	// not enough to permit a restart until the prior maintenance context,
+	// listener, and HTTP server have all been joined and shut down.
+	lifecycleMu sync.Mutex
 
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
 
-	// stopIdleChecker signals the idle checker to stop
-	stopIdleChecker chan struct{}
+	// Maintenance is scoped to one successful Start. Creating it only after
+	// Listen succeeds prevents failed/retried starts from leaking reapers.
+	maintenanceCtx    context.Context
+	cancelMaintenance context.CancelFunc
+	maintenanceWG     sync.WaitGroup
+	listen            func(network, address string) (net.Listener, error)
+	shutdown          func(*http.Server, context.Context) error
+	limiterStopped    bool
+
+	// reapTmuxSessions is the tmux package boundary for the persistent-session
+	// TTL sweep. Kept on Server so tests can prove policy without a live tmux.
+	reapTmuxSessions   func(context.Context, time.Time) ([]string, error)
+	prepareTmuxSession func(context.Context, string, string, time.Time) ([]string, error)
+	renewTmuxSession   func(context.Context, string, time.Time) error
+	now                func() time.Time
 
 	// Connection tracking for debugging
 	totalConnections  int64
@@ -182,12 +206,38 @@ type Server struct {
 // NewServer creates a new terminal server
 func NewServer(config *Config, auth TokenValidator) *Server {
 	s := &Server{
-		config:          config,
-		sessions:        NewSessionManager(config.MaxConnections),
-		auth:            auth,
-		limiter:         NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
-		logger:          newDefaultLogger(config.Debug),
-		stopIdleChecker: make(chan struct{}),
+		config:   config,
+		sessions: NewSessionManager(config.MaxConnections),
+		auth:     auth,
+		limiter:  NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
+		logger:   newDefaultLogger(config.Debug),
+		listen:   net.Listen,
+		shutdown: func(server *http.Server, ctx context.Context) error { return server.Shutdown(ctx) },
+		now:      time.Now,
+	}
+	s.reapTmuxSessions = func(ctx context.Context, now time.Time) ([]string, error) {
+		manager, err := tmux.NewManager()
+		if errors.Is(err, tmux.ErrTmuxNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return manager.ReapExpiredSessions(ctx, now)
+	}
+	s.prepareTmuxSession = func(ctx context.Context, name, shell string, leaseUntil time.Time) ([]string, error) {
+		manager, err := tmux.NewManager()
+		if err != nil {
+			return nil, err
+		}
+		return manager.PrepareSession(ctx, name, shell, leaseUntil)
+	}
+	s.renewTmuxSession = func(ctx context.Context, name string, leaseUntil time.Time) error {
+		manager, err := tmux.NewManager()
+		if err != nil {
+			return err
+		}
+		return manager.RenewSessionLease(ctx, name, leaseUntil)
 	}
 
 	s.upgrader = websocket.Upgrader{
@@ -300,17 +350,22 @@ func (s *Server) checkOrigin(r *http.Request) bool {
 
 // Start starts the terminal server
 func (s *Server) Start() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if err := s.config.Validate(); err != nil {
+		return fmt.Errorf("invalid terminal server configuration: %w", err)
+	}
+
 	s.mu.Lock()
-	if s.running {
+	if s.running || s.stopping {
 		s.mu.Unlock()
 		return ErrServerAlreadyRunning
 	}
-	s.running = true
-	s.mu.Unlock()
 
 	s.logger.Printf("starting terminal server on %s:%d", s.config.Host, s.config.Port)
-	s.logger.Debugf("configuration: max_connections=%d, idle_timeout=%v, shell=%s, org_id=%s",
-		s.config.MaxConnections, s.config.IdleTimeout, s.config.Shell, s.config.OrgID)
+	s.logger.Debugf("configuration: max_connections=%d, idle_timeout=%v, persistent_session_ttl=%v, shell=%s, org_id=%s",
+		s.config.MaxConnections, s.config.IdleTimeout, s.config.SessionTTL, s.config.Shell, s.config.OrgID)
 
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
@@ -319,7 +374,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/stats", s.handleStats)
 
-	s.httpServer = &http.Server{
+	httpServer := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", s.config.Host, s.config.Port),
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
@@ -338,17 +393,32 @@ func (s *Server) Start() error {
 		},
 	}
 
-	// Start idle session checker
-	go s.idleCheckerLoop()
-
-	// Start the HTTP server
-	listener, err := net.Listen("tcp", s.httpServer.Addr)
+	// Establish the primary listener before publishing running state or
+	// starting maintenance. A failed Start therefore owns no goroutines.
+	listener, err := s.listen("tcp", httpServer.Addr)
 	if err != nil {
-		s.mu.Lock()
-		s.running = false
 		s.mu.Unlock()
 		s.logger.Printf("failed to start: %v", err)
 		return fmt.Errorf("failed to listen on port %d: %w", s.config.Port, err)
+	}
+	maintenanceCtx, cancelMaintenance := context.WithCancel(context.Background())
+	if s.limiterStopped {
+		s.limiter = NewRateLimiter(s.config.RateLimitRPS, s.config.RateLimitBurst)
+		s.limiterStopped = false
+	}
+	s.httpServer = httpServer
+	s.maintenanceCtx = maintenanceCtx
+	s.cancelMaintenance = cancelMaintenance
+	s.running = true
+	extraListeners := append([]net.Listener(nil), s.extraListeners...)
+	s.maintenanceWG.Add(1)
+	if s.config.SessionTTL > 0 {
+		s.maintenanceWG.Add(1)
+	}
+
+	go s.idleCheckerLoop(maintenanceCtx)
+	if s.config.SessionTTL > 0 {
+		go s.tmuxReaperLoop(maintenanceCtx)
 	}
 
 	// Get the actual port (useful when port 0 is specified)
@@ -356,42 +426,59 @@ func (s *Server) Start() error {
 	s.logger.Printf("listening on %s", actualAddr.String())
 
 	go func() {
-		if err := s.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			s.logger.Printf("server error: %v", err)
 		}
 	}()
 
 	// Serve on any extra listeners (e.g., tsnet VPN)
-	for _, ln := range s.extraListeners {
+	for _, ln := range extraListeners {
 		ln := ln // capture loop variable
 		s.logger.Printf("also listening on %s (VPN)", ln.Addr().String())
 		go func() {
-			if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 				s.logger.Printf("VPN listener error: %v", err)
 			}
 		}()
 	}
 
+	// Publish the completed start as one lifecycle transition. Stop cannot
+	// observe running=true until every listener and maintenance loop is owned.
+	s.mu.Unlock()
 	return nil
 }
 
 // Stop gracefully stops the terminal server
 func (s *Server) Stop(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	s.mu.Lock()
-	if !s.running {
+	if !s.running && !s.stopping {
 		s.mu.Unlock()
 		return ErrServerNotRunning
 	}
 	s.running = false
+	s.stopping = true
+	cancelMaintenance := s.cancelMaintenance
+	httpServer := s.httpServer
+	s.cancelMaintenance = nil
 	s.mu.Unlock()
 
 	s.logger.Printf("stopping terminal server...")
 
-	// Stop the idle checker
-	close(s.stopIdleChecker)
+	// Stop and join maintenance first. This also cancels an in-flight tmux
+	// command because every reap context is derived from maintenanceCtx.
+	if cancelMaintenance != nil {
+		cancelMaintenance()
+	}
+	s.maintenanceWG.Wait()
 
 	// Stop the rate limiter
 	s.limiter.Stop()
+	s.mu.Lock()
+	s.limiterStopped = true
+	s.mu.Unlock()
 
 	// Close all sessions
 	sessionCount := s.sessions.Count()
@@ -401,12 +488,20 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 
 	// Shutdown HTTP server
-	if s.httpServer != nil {
-		if err := s.httpServer.Shutdown(ctx); err != nil {
+	if httpServer != nil {
+		if err := s.shutdown(httpServer, ctx); err != nil {
 			s.logger.Printf("shutdown error: %v", err)
 			return err
 		}
 	}
+
+	s.mu.Lock()
+	if s.httpServer == httpServer {
+		s.httpServer = nil
+		s.maintenanceCtx = nil
+	}
+	s.stopping = false
+	s.mu.Unlock()
 
 	s.logger.Printf("terminal server stopped (total=%d, failed=%d)",
 		atomic.LoadInt64(&s.totalConnections), atomic.LoadInt64(&s.failedConnections))
@@ -678,7 +773,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.logger.Printf("creating session %s for user %s from %s", sessionID, tokenInfo.UserID, ip)
 
 	// When a persistent named session is configured and tmux is available, back
-	// the PTY with `tmux new-session -A -s <name>` so the session survives
+	// the PTY with a verified Citadel-owned tmux session so it survives
 	// reconnects; otherwise fall back to a bare shell. The tmux session name is
 	// derived per-user from the configured base name so a reconnecting client
 	// re-attaches to its own live session (running command, scrollback, cwd all
@@ -695,9 +790,22 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	sessionOverride := r.URL.Query().Get("session")
 	tmuxCommand, tmuxSessionName, wantedSession := resolveSessionCommand(
 		s.config.SessionName, sessionOverride, tokenInfo.UserID, s.config.Shell, ensureTmuxInstalledFn)
+	var tmuxFallbackReason error
+	if tmuxCommand != nil {
+		prepareCtx, cancel := context.WithTimeout(r.Context(), tmuxReapTimeout)
+		tmuxCommand, tmuxFallbackReason = s.prepareTmuxSession(
+			prepareCtx, tmuxSessionName, s.config.Shell, sessionLeaseDeadline(s.now(), s.config.SessionTTL))
+		cancel()
+	}
 	if wantedSession {
 		if tmuxCommand != nil {
 			s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, tmuxSessionName)
+		} else if errors.Is(tmuxFallbackReason, tmux.ErrSessionNameCollision) {
+			s.logger.Printf("tmux session name %q is operator-owned; session %s falls back to a bare shell rather than attaching to or modifying it", tmuxSessionName, sessionID)
+		} else if tmuxFallbackReason != nil {
+			s.logger.Printf("could not safely prepare tmux session %q: %v; session %s falls back to a bare shell", tmuxSessionName, tmuxFallbackReason, sessionID)
+		} else if !currentPlatformPersistentTmuxSupported() {
+			s.logger.Printf("persistent tmux sessions are unsupported on this platform; session %s uses a bare shell", sessionID)
 		} else if sessionOverride == "" && insideTmux() {
 			// citadel #751: this citadel process is itself already running
 			// inside a tmux client, and this session was AUTO-started off the
@@ -757,10 +865,86 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.logger.Printf("session %s started (user=%s, shell=%s, sessions=%d)",
 		sessionID, tokenInfo.UserID, s.config.Shell, s.sessions.Count())
 
+	stopLeaseRenewal := s.startTmuxLeaseRenewal(tmuxSessionName, tmuxCommand != nil)
+	defer stopLeaseRenewal()
+
 	// Handle the connection
 	s.handleConnection(conn, sc, session)
 
 	s.logger.Printf("session %s ended (sessions=%d)", sessionID, s.sessions.Count())
+}
+
+func sessionLeaseDeadline(now time.Time, ttl time.Duration) time.Time {
+	if ttl <= 0 {
+		return time.Time{}
+	}
+	return now.Add(ttl)
+}
+
+func sessionLeaseRenewInterval(ttl time.Duration) time.Duration {
+	interval := ttl / 2
+	if interval > time.Hour {
+		interval = time.Hour
+	}
+	if interval < time.Second {
+		interval = time.Second
+	}
+	return interval
+}
+
+// startTmuxLeaseRenewal maintains an explicit retention lease while a client
+// is attached. Its returned function stops the loop and renews once on detach,
+// so disconnected persistence is bounded by SessionTTL without pretending
+// tmux's session_activity is evidence that a background task is idle.
+func (s *Server) startTmuxLeaseRenewal(name string, prepared bool) func() {
+	if !prepared || name == "" || s.config.SessionTTL <= 0 || s.renewTmuxSession == nil {
+		return func() {}
+	}
+
+	s.mu.RLock()
+	parent := s.maintenanceCtx
+	s.mu.RUnlock()
+	if parent == nil {
+		return func() {}
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(sessionLeaseRenewInterval(s.config.SessionTTL))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.renewTmuxLease(ctx, name)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+		// Use the server maintenance context for the final detach renewal. If
+		// Stop already canceled it, the tmux command is canceled too.
+		s.renewTmuxLease(parent, name)
+	}
+}
+
+func (s *Server) renewTmuxLease(parent context.Context, name string) {
+	if parent.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, tmuxReapTimeout)
+	defer cancel()
+	if err := s.renewTmuxSession(ctx, name, sessionLeaseDeadline(s.now(), s.config.SessionTTL)); err != nil {
+		if errors.Is(err, context.Canceled) && parent.Err() != nil {
+			return
+		}
+		s.logger.Printf("failed to renew tmux session %q retention lease: %v", name, err)
+	}
 }
 
 // handleConnection manages the bidirectional communication between WebSocket
@@ -875,7 +1059,8 @@ func (s *Server) handleConnection(conn *websocket.Conn, sc *safeConn, session *S
 }
 
 // idleCheckerLoop periodically checks for and closes idle sessions
-func (s *Server) idleCheckerLoop() {
+func (s *Server) idleCheckerLoop(ctx context.Context) {
+	defer s.maintenanceWG.Done()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
@@ -886,9 +1071,49 @@ func (s *Server) idleCheckerLoop() {
 			if closed > 0 {
 				s.logger.Printf("closed %d idle terminal session(s)", closed)
 			}
-		case <-s.stopIdleChecker:
+		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// tmuxReaperLoop bounds detached persistent-session lifetime independently of
+// the WebSocket/PTY idle checker. It runs once at server start, then hourly;
+// the tmux layer itself atomically enforces ownership, detachment, and an
+// unchanged expired retention lease in the same command that performs a kill.
+func (s *Server) tmuxReaperLoop(ctx context.Context) {
+	defer s.maintenanceWG.Done()
+	s.reapExpiredTmuxSessions(ctx)
+	ticker := time.NewTicker(tmuxReapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.reapExpiredTmuxSessions(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *Server) reapExpiredTmuxSessions(parent context.Context) {
+	if s.config.SessionTTL <= 0 || s.reapTmuxSessions == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, tmuxReapTimeout)
+	defer cancel()
+
+	reaped, err := s.reapTmuxSessions(ctx, s.now())
+	if err != nil {
+		if errors.Is(err, context.Canceled) && parent.Err() != nil {
+			return
+		}
+		s.logger.Printf("persistent tmux session reaper failed: %v", err)
+		return
+	}
+	if len(reaped) > 0 {
+		s.logger.Printf("reaped %d detached tmux session(s) after their %s retention lease expired", len(reaped), s.config.SessionTTL)
 	}
 }
 

@@ -6,14 +6,16 @@ import (
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 )
 
 // DefaultSessionName is the base tmux session name used when
 // CITADEL_TERMINAL_SESSION is not set.
 //
 // It defaults to "citadel", which turns persistent tmux backing ON by default
-// (citadel #585, Gap 2): each connection attaches to (or creates) a per-user
-// `tmux new-session -A -s <name>` session, so a repeated `citadel connect
+// (citadel #585, Gap 2): each connection safely creates or attaches to a
+// Citadel-owned per-user tmux session, so a repeated `citadel connect
 // <node>` — and a reconnect after a drop — re-attaches to the SAME live shell
 // (running command, scrollback, cwd preserved) instead of spawning a duplicate.
 //
@@ -24,6 +26,10 @@ import (
 // (b) operators can force a bare shell by setting CITADEL_TERMINAL_SESSION to a
 // disable sentinel ("none"/"off"/"disabled"/"false"/"0").
 const DefaultSessionName = "citadel"
+
+// DefaultSessionTTL bounds disconnected persistence with an explicit lease.
+// It is intentionally much longer than the connection IdleTimeout.
+const DefaultSessionTTL = tmux.DefaultSessionLeaseTTL
 
 // Config holds the terminal server configuration
 type Config struct {
@@ -50,7 +56,7 @@ type Config struct {
 	Shell string
 
 	// SessionName, when non-empty, makes the server back every connection with
-	// a persistent named tmux session (`tmux new-session -A -s <name>`) instead
+	// a persistent, Citadel-owned named tmux session instead
 	// of a fresh bare shell. The tmux server keeps the session alive after a
 	// client disconnects, so reconnecting re-attaches to the same session and
 	// the terminal state survives. Requires a resolvable tmux binary; when tmux
@@ -69,6 +75,16 @@ type Config struct {
 	// that wants no state bleed across connections), set CITADEL_TERMINAL_SESSION
 	// to a disable sentinel ("none"/"off"/"disabled"/"false"/"0").
 	SessionName string
+
+	// SessionTTL is the Citadel retention lease for a disconnected tmux
+	// session. It is renewed while a client is attached and once on detach; it
+	// is deliberately not inferred from tmux session_activity, which misses
+	// detached pane output. After this lease expires, even a task still running
+	// in the detached session may be terminated. The reaper never touches
+	// attached or unmarked sessions. Zero disables reaping. Configured via
+	// CITADEL_TERMINAL_SESSION_TTL as a Go duration (for example "24h" or
+	// "168h").
+	SessionTTL time.Duration
 
 	// TrustMeshPeers enables mesh-peer identity trust for connections that
 	// arrive over the VPN listener (citadel #585). When true AND a
@@ -132,6 +148,7 @@ func DefaultConfig() *Config {
 		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
 		Shell:                getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
 		SessionName:          getEnvOrDefault("CITADEL_TERMINAL_SESSION", DefaultSessionName),
+		SessionTTL:           getEnvDuration("CITADEL_TERMINAL_SESSION_TTL", DefaultSessionTTL),
 		TrustMeshPeers:       getEnvBool("CITADEL_TERMINAL_TRUST_MESH", true),
 		AuthServiceURL:       getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
 		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
@@ -188,6 +205,15 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	if value := os.Getenv(key); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+	}
+	return defaultValue
+}
+
 // Validate checks that the configuration is valid
 func (c *Config) Validate() error {
 	if c.Port < 1 || c.Port > 65535 {
@@ -198,6 +224,9 @@ func (c *Config) Validate() error {
 	}
 	if c.IdleTimeout < time.Minute {
 		return ErrInvalidIdleTimeout
+	}
+	if c.SessionTTL < 0 || (c.SessionTTL > 0 && c.SessionTTL < time.Minute) {
+		return ErrInvalidSessionTTL
 	}
 	if c.OrgID == "" {
 		return ErrMissingOrgID
