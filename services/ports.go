@@ -224,9 +224,10 @@ const (
 const defaultVLLMHostPort = 8201
 
 // defaultVLLMHost is the vLLM dial host when CITADEL_VLLM_HOST is unset or
-// invalid. It preserves the existing loopback-only behavior while avoiding
-// localhost resolving to an IPv6 address for an IPv4-only engine.
-const defaultVLLMHost = "127.0.0.1"
+// invalid. Keep the literal "localhost": existing endpoint builders emitted
+// that exact spelling and relied on the platform resolver's IPv4/IPv6 behavior
+// before the host became configurable (citadel-cli#1167).
+const defaultVLLMHost = "localhost"
 
 // VLLMHost is the effective, process-level vLLM dial host. Only localhost or a
 // canonical IP literal assigned to this node is accepted. Invalid, remote,

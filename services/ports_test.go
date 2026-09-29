@@ -461,6 +461,13 @@ func TestResolveVLLMHostPort(t *testing.T) {
 // canonical address assigned to this node may become an engine dial target.
 // Invalid input fails closed to the historical loopback target.
 func TestResolveVLLMHost(t *testing.T) {
+	if defaultVLLMHost != "localhost" {
+		t.Fatalf("defaultVLLMHost = %q, want byte-compatible localhost", defaultVLLMHost)
+	}
+	if _, set := os.LookupEnv(EnvVLLMHost); !set && VLLMHost != "localhost" {
+		t.Fatalf("VLLMHost = %q at init, want localhost with the env var unset", VLLMHost)
+	}
+
 	local := func() ([]net.Addr, error) {
 		return []net.Addr{
 			&net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: net.CIDRMask(24, 32)},

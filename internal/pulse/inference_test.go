@@ -2,14 +2,22 @@ package pulse
 
 import (
 	"context"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 // vllmMetricsT0 / vllmMetricsT1 are canned vLLM /metrics expositions 10s
 // apart. The modern dialect: no throughput gauges, so tokens/s must come from
@@ -100,7 +108,7 @@ func metricsServer(t *testing.T, engine string) (*httptest.Server, *engineScrape
 	if err != nil {
 		t.Fatalf("test server port: %v", err)
 	}
-	return srv, newEngineScraper(engine, port, time.Second), &body
+	return srv, newEngineScraper(engine, u.Hostname(), port, time.Second), &body
 }
 
 func TestVLLMCounterRateAndHistogramP50(t *testing.T) {
@@ -218,10 +226,30 @@ func TestSGLangDialect(t *testing.T) {
 	}
 }
 
+func TestInferenceScraperUsesTargetHostAndFormatsIPv6(t *testing.T) {
+	var gotURL string
+	scraper := newEngineScraper("vllm", "2001:db8::10", 58000, time.Second)
+	scraper.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotURL = req.URL.String()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(vllmLegacyMetrics)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	if stat := scraper.Observe(context.Background()); stat == nil {
+		t.Fatal("scraper returned nil for valid vLLM metrics")
+	}
+	if gotURL != "http://[2001:db8::10]:58000/metrics" {
+		t.Fatalf("metrics URL = %q, want IPv6-safe resolved endpoint", gotURL)
+	}
+}
+
 func TestScrapeFailuresReturnNil(t *testing.T) {
 	t.Run("endpoint absent", func(t *testing.T) {
 		// A port with nothing listening: connection refused, silently nil.
-		scraper := newEngineScraper("vllm", 1, 200*time.Millisecond)
+		scraper := newEngineScraper("vllm", "127.0.0.1", 1, 200*time.Millisecond)
 		if stat := scraper.Observe(context.Background()); stat != nil {
 			t.Errorf("expected nil for absent endpoint, got %+v", stat)
 		}

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -59,7 +60,21 @@ func ResolveInterval(flagValue string) time.Duration {
 // EngineTarget names a local inference engine metrics endpoint to scrape.
 type EngineTarget struct {
 	Engine string
+	Host   string
 	Port   int
+}
+
+var resolveVLLMEndpoint = externalengine.VLLMEndpoint
+
+func resolveEngineTarget(engine string, port int) (EngineTarget, bool) {
+	if engine != "vllm" {
+		return EngineTarget{Engine: engine, Host: "127.0.0.1", Port: port}, true
+	}
+	endpoint, enabled, err := resolveVLLMEndpoint()
+	if err != nil || !enabled {
+		return EngineTarget{}, false
+	}
+	return EngineTarget{Engine: engine, Host: endpoint.Host, Port: endpoint.Port}, true
 }
 
 // DefaultEngineTargets returns the scrape targets for every engine registered
@@ -70,7 +85,14 @@ func DefaultEngineTargets() []EngineTarget {
 	ports := services.InferenceMetricsPorts()
 	targets := make([]EngineTarget, 0, len(ports))
 	for engine, port := range ports {
-		targets = append(targets, EngineTarget{Engine: engine, Port: port})
+		target, enabled := resolveEngineTarget(engine, port)
+		if !enabled {
+			continue
+		}
+		// Default production targets follow the complete shared endpoint. An
+		// explicit adopted vLLM record can override both the environment host and
+		// port; the pulse scraper must agree with dispatch and discovery.
+		targets = append(targets, target)
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].Engine < targets[j].Engine })
 	return targets
@@ -127,7 +149,15 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		if _, ok := dialects[t.Engine]; !ok {
 			continue
 		}
-		c.scrapers = append(c.scrapers, newEngineScraper(t.Engine, t.Port, scrapeTimeout))
+		host := t.Host
+		if host == "" {
+			resolved, enabled := resolveEngineTarget(t.Engine, t.Port)
+			if !enabled {
+				continue
+			}
+			host = resolved.Host
+		}
+		c.scrapers = append(c.scrapers, newEngineScraper(t.Engine, host, t.Port, scrapeTimeout))
 	}
 	return c
 }

@@ -79,9 +79,12 @@ func runChat(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	client := localchat.NewClient(choice.Port, choice.Model)
+	client, err := localchat.NewClient(choice.Engine, choice.Port, choice.Model)
+	if err != nil {
+		return fmt.Errorf("resolve engine %q endpoint: %w", choice.Engine, err)
+	}
 	if err := client.HealthCheck(ctx); err != nil {
-		return fmt.Errorf("engine %q is not responding on localhost:%d: %w", choice.Engine, choice.Port, err)
+		return fmt.Errorf("engine %q is not responding at %s: %w", choice.Engine, client.BaseURL, err)
 	}
 
 	return chatLoop(ctx, client, choice)
@@ -139,7 +142,7 @@ func chatLoop(ctx context.Context, client *localchat.Client, choice localchat.En
 		label = choice.Engine + " (default model)"
 	}
 	assistantStyle.Printf("Chatting with %s", label)
-	fmt.Printf(" on localhost:%d\n", choice.Port)
+	fmt.Printf(" at %s\n", client.BaseURL)
 	mutedStyle.Println("Type your message and press Enter. Ctrl-C interrupts a reply; /exit or Ctrl-D quits.")
 	fmt.Println()
 

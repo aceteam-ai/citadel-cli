@@ -7,7 +7,7 @@ import (
 )
 
 // EngineChoice is a single selectable chat target: a running engine and one of
-// its served models, plus the localhost port to reach it.
+// its served models, plus the host port to reach it.
 type EngineChoice struct {
 	Engine string // vllm, ollama, llamacpp, bonsai
 	Model  string // served model id (may be empty for a running engine with no reported model)
@@ -17,9 +17,9 @@ type EngineChoice struct {
 // Label is the human-readable line shown in the picker.
 func (c EngineChoice) Label() string {
 	if c.Model == "" {
-		return fmt.Sprintf("%s (default model) — localhost:%d", c.Engine, c.Port)
+		return fmt.Sprintf("%s (default model) — port %d", c.Engine, c.Port)
 	}
-	return fmt.Sprintf("%s — %s — localhost:%d", c.Engine, c.Model, c.Port)
+	return fmt.Sprintf("%s — %s — port %d", c.Engine, c.Model, c.Port)
 }
 
 // BuildChoices flattens discovered local engines into one choice per served

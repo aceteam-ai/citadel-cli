@@ -16,9 +16,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 )
 
 // DefaultMaxTokens is the completion budget used when the caller does not set
@@ -114,23 +118,37 @@ func ParseSSELine(line string) (chunk StreamChunk, handled bool, done bool, err 
 	return StreamChunk{Content: d.Content, Reasoning: d.ReasoningContent}, true, false, nil
 }
 
-// Client talks to one engine's OpenAI-compatible API at a base URL such as
-// "http://localhost:8210".
+// Client talks to one engine's OpenAI-compatible API.
 type Client struct {
 	BaseURL string
 	Model   string
 	HTTP    *http.Client
 }
 
-// NewClient builds a Client for the engine at the given localhost port. The HTTP
+var resolveVLLMEndpoint = externalengine.VLLMEndpoint
+
+// NewClient builds a Client for the selected engine. vLLM uses the shared
+// process-resolved endpoint so an adopted vendor server bound to a non-loopback
+// local address is reachable. Every other engine remains on localhost. The HTTP
 // client has no overall timeout because a streaming completion is open-ended;
 // per-request cancellation is done via the context passed to Stream.
-func NewClient(port int, model string) *Client {
+func NewClient(engine string, port int, model string) (*Client, error) {
+	host := "localhost"
+	if engine == "vllm" {
+		endpoint, enabled, err := resolveVLLMEndpoint()
+		if err != nil {
+			return nil, fmt.Errorf("resolve vllm endpoint: %w", err)
+		}
+		if !enabled {
+			return nil, fmt.Errorf("vllm is explicitly detached")
+		}
+		host = endpoint.Host
+	}
 	return &Client{
-		BaseURL: fmt.Sprintf("http://localhost:%d", port),
+		BaseURL: "http://" + net.JoinHostPort(host, strconv.Itoa(port)),
 		Model:   model,
 		HTTP:    &http.Client{},
-	}
+	}, nil
 }
 
 // Stream sends the conversation and invokes onChunk for every streamed delta as

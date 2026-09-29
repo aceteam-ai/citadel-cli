@@ -1536,7 +1536,8 @@ doc helped hide.
 `services.resolveVLLMHostPort` and `services.resolveVLLMHost`
 (`services/ports.go`) decide `services.VLLMHostPort` and `services.VLLMHost` once
 at process init from `CITADEL_VLLM_HOST_PORT` and `CITADEL_VLLM_HOST`. The port
-defaults to 8201; the host defaults to `127.0.0.1`. A non-loopback host override
+defaults to 8201; the host defaults to `localhost` to preserve the pre-#1167 URL
+bytes and platform resolver behavior. A non-loopback host override
 must be a canonical IP literal assigned to a local interface; invalid, remote,
 wildcard, multicast, and link-local values fail closed to loopback. The resolved
 endpoint flows through `externalengine.VLLMEndpoint` to adoption/model/health/idle
