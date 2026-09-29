@@ -4,10 +4,21 @@ package tmux
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func captureScopeLog(t *testing.T) *[]string {
+	t.Helper()
+	var lines []string
+	SetLogf(func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	})
+	t.Cleanup(func() { SetLogf(func(string, ...any) {}) })
+	return &lines
+}
 
 func withScopeSeams(t *testing.T, cgroup string, lookupErr error) {
 	t.Helper()
@@ -30,6 +41,7 @@ func withScopeSeams(t *testing.T, cgroup string, lookupErr error) {
 }
 
 func TestPersistentSessionCommand_UserServiceUsesSiblingScope(t *testing.T) {
+	logs := captureScopeLog(t)
 	t.Setenv(systemdInvocationIDEnv, "invocation")
 	withScopeSeams(t, "0::/user.slice/user-1001.slice/user@1001.service/app.slice/citadel.service\n", nil)
 
@@ -53,6 +65,9 @@ func TestPersistentSessionCommand_UserServiceUsesSiblingScope(t *testing.T) {
 	if !reflect.DeepEqual(command, []string{"/usr/bin/tmux", "new-session", "-d", "-s", "agent", "/bin/bash"}) {
 		t.Errorf("input command mutated: %v", command)
 	}
+	if len(*logs) != 1 || !strings.Contains((*logs)[0], "transient systemd scope: user manager") {
+		t.Fatalf("scope log = %v, want one user-manager decision", *logs)
+	}
 }
 
 func TestPersistentSessionCommand_ScopesRootSystemService(t *testing.T) {
@@ -70,6 +85,7 @@ func TestPersistentSessionCommand_ScopesRootSystemService(t *testing.T) {
 }
 
 func TestPersistentSessionCommand_NonRootSystemServiceIsUnchanged(t *testing.T) {
+	logs := captureScopeLog(t)
 	t.Setenv(systemdInvocationIDEnv, "invocation")
 	withScopeSeams(t, "0::/system.slice/citadel-worker.service\n", nil)
 	command := []string{"tmux", "new-session", "-d", "-s", "agent"}
@@ -77,26 +93,52 @@ func TestPersistentSessionCommand_NonRootSystemServiceIsUnchanged(t *testing.T) 
 	if got := PersistentSessionCommand("agent", command); !reflect.DeepEqual(got, command) {
 		t.Fatalf("got %v, want unchanged %v", got, command)
 	}
+	if len(*logs) != 1 || !strings.Contains((*logs)[0], "non-root process in a system service") {
+		t.Fatalf("fallback log = %v, want one privilege reason", *logs)
+	}
 }
 
 func TestPersistentSessionCommand_UnmanagedOrUnavailableIsUnchanged(t *testing.T) {
 	command := []string{"tmux", "new-session", "-d", "-s", "agent"}
 
 	t.Run("not service managed", func(t *testing.T) {
+		logs := captureScopeLog(t)
 		t.Setenv(systemdInvocationIDEnv, "")
 		withScopeSeams(t, "0::/user.slice/user-1001.slice/user@1001.service/app.slice/citadel.service\n", nil)
 		if got := PersistentSessionCommand("agent", command); !reflect.DeepEqual(got, command) {
 			t.Fatalf("got %v, want unchanged %v", got, command)
 		}
+		if len(*logs) != 1 || !strings.Contains((*logs)[0], "INVOCATION_ID is unset") {
+			t.Fatalf("fallback log = %v, want one unmanaged reason", *logs)
+		}
 	})
 
 	t.Run("systemd-run missing", func(t *testing.T) {
+		logs := captureScopeLog(t)
 		t.Setenv(systemdInvocationIDEnv, "invocation")
 		withScopeSeams(t, "0::/user.slice/user-1001.slice/user@1001.service/app.slice/citadel.service\n", errors.New("missing"))
 		if got := PersistentSessionCommand("agent", command); !reflect.DeepEqual(got, command) {
 			t.Fatalf("got %v, want unchanged %v", got, command)
 		}
+		if len(*logs) != 1 || !strings.Contains((*logs)[0], "systemd-run is unavailable") {
+			t.Fatalf("fallback log = %v, want one missing-binary reason", *logs)
+		}
 	})
+}
+
+func TestPersistentSessionCommand_CgroupReadFailureIsLogged(t *testing.T) {
+	logs := captureScopeLog(t)
+	t.Setenv(systemdInvocationIDEnv, "invocation")
+	withScopeSeams(t, "", nil)
+	readSelfCgroup = func() ([]byte, error) { return nil, errors.New("permission denied") }
+
+	command := []string{"tmux", "new-session", "-d", "-s", "agent"}
+	if got := PersistentSessionCommand("agent", command); !reflect.DeepEqual(got, command) {
+		t.Fatalf("got %v, want unchanged %v", got, command)
+	}
+	if len(*logs) != 1 || !strings.Contains((*logs)[0], "cannot read /proc/self/cgroup: permission denied") {
+		t.Fatalf("fallback log = %v, want one cgroup-read reason", *logs)
+	}
 }
 
 func TestPersistentSessionCommand_InvalidSessionNameIsUnchanged(t *testing.T) {

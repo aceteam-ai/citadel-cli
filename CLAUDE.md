@@ -767,6 +767,16 @@ on the node (citadel #780) — this is node-wide. The CLI (`citadel ssh`/`citade
 connect`) is unaffected either way: it always defaults to a bare shell and only
 opts into tmux persistence with `--tmux` (citadel #759).
 
+`tmux.PersistentSessionCommand` owns the systemd-scope decision and logs the
+selected path plus its reason through the package logger wired in
+`cmd/root.go`. `tmux.Manager.ReapIdleSessions` owns persistent-session cleanup:
+only sessions carrying Citadel's tmux user-option marker, detached at both the
+list and immediate pre-kill checks, and inactive beyond `Config.SessionTTL` are
+eligible. `terminal.DefaultSessionTTL` pins the seven-day default and the server
+runs the sweep hourly; `0` explicitly disables it. Never replace the marker
+check with a name prefix or an all-server sweep — operators may share that tmux
+server with unrelated sessions.
+
 **A Citadel-started tmux server must not remain in citadel.service's control
 group (citadel-cli#1166).** `tmux.PersistentSessionCommand` is the single launch
 boundary shared by `TMUX_SESSION` detached creation and the terminal PTY's

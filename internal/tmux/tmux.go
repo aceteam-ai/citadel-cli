@@ -28,7 +28,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ErrTmuxNotFound indicates no usable tmux binary could be located on the node.
@@ -40,6 +42,33 @@ var ErrInvalidSessionName = errors.New("invalid tmux session name")
 // envTmuxBin is an optional override for the tmux binary path. When set it takes
 // precedence over PATH lookup and the managed location.
 const envTmuxBin = "CITADEL_TMUX_BIN"
+
+// managedSessionOption is stored as a tmux user option on every session
+// Citadel creates or adopts. The reaper checks this marker before acting, so a
+// user's unrelated tmux sessions on the same server are never TTL-managed.
+const managedSessionOption = "@citadel_managed"
+
+const managedSessionOptionValue = "citadel-v1"
+
+// logf receives package diagnostics. The CLI wires it to its durable log in
+// PersistentPreRun; the no-op default keeps library users quiet.
+var logf = func(string, ...any) {}
+
+var logfSet bool
+
+// SetLogf wires tmux lifecycle diagnostics into the caller's logging system.
+// It must be called before concurrent tmux operations begin.
+func SetLogf(fn func(string, ...any)) {
+	if fn != nil {
+		logf = fn
+		logfSet = true
+	}
+}
+
+// LogfConfigured reports whether the CLI installed a real diagnostic logger.
+// It exists for the root wiring regression test: a forgotten SetLogf otherwise
+// compiles while silently discarding every scope/fallback decision.
+func LogfConfigured() bool { return logfSet }
 
 // sessionNamePattern restricts session names to a safe character set. tmux
 // session names may not contain '.' or ':' (used to address windows/panes), and
@@ -194,16 +223,58 @@ func NewDetachedArgs(name, shell string) []string {
 // Launching claude is deliberately NOT part of this command; the session is a
 // plain shell until something explicitly sends keys to start an agent.
 func AttachOrCreateArgs(name, shell string) []string {
+	// Keep the established attach-or-create behavior and append the marker in
+	// the same tmux command list. This avoids a detach/reattach transition while
+	// still adopting older Citadel sessions on their first post-upgrade attach.
 	args := []string{"new-session", "-A", "-s", name}
 	if shell != "" {
 		args = append(args, shell)
 	}
+	args = append(args,
+		";", "set-option", "-q", "-t", name, managedSessionOption, managedSessionOptionValue,
+	)
 	return args
 }
 
 // ListSessionsArgs returns the tmux argv that lists session names, one per line.
 func ListSessionsArgs() []string {
 	return []string{"list-sessions", "-F", "#{session_name}"}
+}
+
+// sessionStatusFormat is deliberately tab-delimited: validated Citadel names
+// cannot contain tabs, and malformed/operator-created rows are skipped by the
+// parser rather than broadening the reaper's authority.
+const sessionStatusFormat = "#{session_name}\t#{session_activity}\t#{session_attached}\t#{@citadel_managed}"
+
+// SessionStatus is the subset of tmux metadata needed by the idle-session
+// reaper.
+type SessionStatus struct {
+	Name         string
+	LastActivity time.Time
+	Attached     bool
+	Managed      bool
+}
+
+// ListSessionStatusArgs returns tmux argv for one metadata row per session.
+func ListSessionStatusArgs() []string {
+	return []string{"list-sessions", "-F", sessionStatusFormat}
+}
+
+// DisplaySessionStatusArgs returns tmux argv for a fresh single-session
+// snapshot. ReapIdleSessions uses it immediately before a kill so a session
+// that became attached or active after the initial list is spared.
+func DisplaySessionStatusArgs(name string) []string {
+	return []string{"display-message", "-p", "-t", name, sessionStatusFormat}
+}
+
+// MarkSessionArgs marks a session as Citadel-managed using a tmux user option.
+func MarkSessionArgs(name string) []string {
+	return []string{"set-option", "-q", "-t", name, managedSessionOption, managedSessionOptionValue}
+}
+
+// KillSessionArgs returns tmux argv for removing one validated session.
+func KillSessionArgs(name string) []string {
+	return []string{"kill-session", "-t", name}
 }
 
 // HasSession reports whether a session with the given (validated) name exists.
@@ -236,13 +307,18 @@ func (m *Manager) EnsureSession(ctx context.Context, name, shell string) error {
 	if err != nil {
 		return err
 	}
-	if exists {
-		return nil
+	if !exists {
+		command := append([]string{m.bin}, NewDetachedArgs(name, shell)...)
+		command = m.scopeCommand(name, command)
+		if out, err := m.runner.Run(ctx, command[0], command[1:]...); err != nil {
+			return fmt.Errorf("tmux new-session failed: %w: %s", err, strings.TrimSpace(string(out)))
+		}
 	}
-	command := append([]string{m.bin}, NewDetachedArgs(name, shell)...)
-	command = m.scopeCommand(name, command)
-	if out, err := m.runner.Run(ctx, command[0], command[1:]...); err != nil {
-		return fmt.Errorf("tmux new-session failed: %w: %s", err, strings.TrimSpace(string(out)))
+	// Mark both newly-created and already-existing sessions. The latter adopts
+	// sessions created by the immediately preceding release once they are next
+	// ensured, without ever sweeping arbitrary unmarked tmux state.
+	if out, err := m.runner.Run(ctx, m.bin, MarkSessionArgs(name)...); err != nil {
+		return fmt.Errorf("tmux mark session failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -274,4 +350,98 @@ func parseSessionList(out []byte) []string {
 		}
 	}
 	return names
+}
+
+// ReapIdleSessions kills Citadel-managed sessions that are detached and whose
+// tmux activity timestamp is not newer than cutoff. It never acts on an
+// unmarked session. Each candidate is re-read immediately before the kill to
+// avoid using a stale attachment/activity snapshot.
+func (m *Manager) ReapIdleSessions(ctx context.Context, cutoff time.Time) ([]string, error) {
+	statuses, err := m.listSessionStatuses(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var reaped []string
+	for _, status := range statuses {
+		if !reapEligible(status, cutoff) {
+			continue
+		}
+		fresh, ok, err := m.sessionStatus(ctx, status.Name)
+		if err != nil {
+			return reaped, err
+		}
+		if !ok || !reapEligible(fresh, cutoff) {
+			continue
+		}
+		if out, err := m.runner.Run(ctx, m.bin, KillSessionArgs(status.Name)...); err != nil {
+			return reaped, fmt.Errorf("tmux kill-session %q failed: %w: %s", status.Name, err, strings.TrimSpace(string(out)))
+		}
+		reaped = append(reaped, status.Name)
+	}
+	return reaped, nil
+}
+
+func (m *Manager) listSessionStatuses(ctx context.Context) ([]SessionStatus, error) {
+	out, err := m.runner.Run(ctx, m.bin, ListSessionStatusArgs()...)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("tmux list-sessions for reaper failed: %w", err)
+	}
+	return parseSessionStatuses(out), nil
+}
+
+func (m *Manager) sessionStatus(ctx context.Context, name string) (SessionStatus, bool, error) {
+	if err := ValidateSessionName(name); err != nil {
+		return SessionStatus{}, false, err
+	}
+	out, err := m.runner.Run(ctx, m.bin, DisplaySessionStatusArgs(name)...)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return SessionStatus{}, false, nil
+		}
+		return SessionStatus{}, false, fmt.Errorf("tmux inspect session %q failed: %w", name, err)
+	}
+	statuses := parseSessionStatuses(out)
+	if len(statuses) != 1 || statuses[0].Name != name {
+		return SessionStatus{}, false, nil
+	}
+	return statuses[0], true, nil
+}
+
+func reapEligible(status SessionStatus, cutoff time.Time) bool {
+	return status.Managed && !status.Attached && !status.LastActivity.IsZero() && !status.LastActivity.After(cutoff)
+}
+
+func parseSessionStatuses(out []byte) []SessionStatus {
+	var statuses []SessionStatus
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 4 || ValidateSessionName(fields[0]) != nil {
+			continue
+		}
+		activity, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil || activity <= 0 {
+			continue
+		}
+		attached, err := strconv.Atoi(fields[2])
+		if err != nil || attached < 0 {
+			continue
+		}
+		statuses = append(statuses, SessionStatus{
+			Name:         fields[0],
+			LastActivity: time.Unix(activity, 0),
+			Attached:     attached > 0,
+			Managed:      fields[3] == managedSessionOptionValue,
+		})
+	}
+	return statuses
 }

@@ -25,6 +25,12 @@ import (
 // disable sentinel ("none"/"off"/"disabled"/"false"/"0").
 const DefaultSessionName = "citadel"
 
+// DefaultSessionTTL bounds how long a detached, inactive Citadel-managed tmux
+// session is retained. It is intentionally much longer than the connection
+// IdleTimeout: reconnect persistence is useful across days, while abandoned
+// sessions must not accumulate for the lifetime of a node.
+const DefaultSessionTTL = 7 * 24 * time.Hour
+
 // Config holds the terminal server configuration
 type Config struct {
 	// Host is the address the WebSocket server binds to (default: 127.0.0.1)
@@ -69,6 +75,12 @@ type Config struct {
 	// that wants no state bleed across connections), set CITADEL_TERMINAL_SESSION
 	// to a disable sentinel ("none"/"off"/"disabled"/"false"/"0").
 	SessionName string
+
+	// SessionTTL is the maximum inactivity age of a detached, Citadel-managed
+	// tmux session. The reaper never touches attached or unmarked sessions. Zero
+	// disables reaping. Configured via CITADEL_TERMINAL_SESSION_TTL as a Go
+	// duration (for example "24h" or "168h").
+	SessionTTL time.Duration
 
 	// TrustMeshPeers enables mesh-peer identity trust for connections that
 	// arrive over the VPN listener (citadel #585). When true AND a
@@ -132,6 +144,7 @@ func DefaultConfig() *Config {
 		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
 		Shell:                getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
 		SessionName:          getEnvOrDefault("CITADEL_TERMINAL_SESSION", DefaultSessionName),
+		SessionTTL:           getEnvDuration("CITADEL_TERMINAL_SESSION_TTL", DefaultSessionTTL),
 		TrustMeshPeers:       getEnvBool("CITADEL_TERMINAL_TRUST_MESH", true),
 		AuthServiceURL:       getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
 		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
@@ -188,6 +201,15 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	if value := os.Getenv(key); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+	}
+	return defaultValue
+}
+
 // Validate checks that the configuration is valid
 func (c *Config) Validate() error {
 	if c.Port < 1 || c.Port > 65535 {
@@ -198,6 +220,9 @@ func (c *Config) Validate() error {
 	}
 	if c.IdleTimeout < time.Minute {
 		return ErrInvalidIdleTimeout
+	}
+	if c.SessionTTL < 0 || (c.SessionTTL > 0 && c.SessionTTL < time.Minute) {
+		return ErrInvalidSessionTTL
 	}
 	if c.OrgID == "" {
 		return ErrMissingOrgID

@@ -15,7 +15,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	tmuxReapInterval = time.Hour
+	tmuxReapTimeout  = 10 * time.Second
 )
 
 // terminalPasscodeSubprotocol is the WebSocket subprotocol marker a BROWSER
@@ -170,8 +176,13 @@ type Server struct {
 	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
 
-	// stopIdleChecker signals the idle checker to stop
-	stopIdleChecker chan struct{}
+	// stopMaintenance signals the connection-idle and tmux-TTL loops to stop.
+	stopMaintenance chan struct{}
+
+	// reapTmuxSessions is the tmux package boundary for the persistent-session
+	// TTL sweep. Kept on Server so tests can prove policy without a live tmux.
+	reapTmuxSessions func(context.Context, time.Time) ([]string, error)
+	now              func() time.Time
 
 	// Connection tracking for debugging
 	totalConnections  int64
@@ -187,7 +198,18 @@ func NewServer(config *Config, auth TokenValidator) *Server {
 		auth:            auth,
 		limiter:         NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
 		logger:          newDefaultLogger(config.Debug),
-		stopIdleChecker: make(chan struct{}),
+		stopMaintenance: make(chan struct{}),
+		now:             time.Now,
+	}
+	s.reapTmuxSessions = func(ctx context.Context, cutoff time.Time) ([]string, error) {
+		manager, err := tmux.NewManager()
+		if errors.Is(err, tmux.ErrTmuxNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return manager.ReapIdleSessions(ctx, cutoff)
 	}
 
 	s.upgrader = websocket.Upgrader{
@@ -309,8 +331,8 @@ func (s *Server) Start() error {
 	s.mu.Unlock()
 
 	s.logger.Printf("starting terminal server on %s:%d", s.config.Host, s.config.Port)
-	s.logger.Debugf("configuration: max_connections=%d, idle_timeout=%v, shell=%s, org_id=%s",
-		s.config.MaxConnections, s.config.IdleTimeout, s.config.Shell, s.config.OrgID)
+	s.logger.Debugf("configuration: max_connections=%d, idle_timeout=%v, persistent_session_ttl=%v, shell=%s, org_id=%s",
+		s.config.MaxConnections, s.config.IdleTimeout, s.config.SessionTTL, s.config.Shell, s.config.OrgID)
 
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
@@ -340,6 +362,9 @@ func (s *Server) Start() error {
 
 	// Start idle session checker
 	go s.idleCheckerLoop()
+	if s.config.SessionTTL > 0 {
+		go s.tmuxReaperLoop()
+	}
 
 	// Start the HTTP server
 	listener, err := net.Listen("tcp", s.httpServer.Addr)
@@ -388,7 +413,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Printf("stopping terminal server...")
 
 	// Stop the idle checker
-	close(s.stopIdleChecker)
+	close(s.stopMaintenance)
 
 	// Stop the rate limiter
 	s.limiter.Stop()
@@ -886,9 +911,46 @@ func (s *Server) idleCheckerLoop() {
 			if closed > 0 {
 				s.logger.Printf("closed %d idle terminal session(s)", closed)
 			}
-		case <-s.stopIdleChecker:
+		case <-s.stopMaintenance:
 			return
 		}
+	}
+}
+
+// tmuxReaperLoop bounds detached persistent-session lifetime independently of
+// the WebSocket/PTY idle checker. It runs once at server start, then hourly;
+// the tmux layer itself enforces the managed-marker, detached, and activity
+// checks immediately before every kill.
+func (s *Server) tmuxReaperLoop() {
+	s.reapExpiredTmuxSessions()
+	ticker := time.NewTicker(tmuxReapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.reapExpiredTmuxSessions()
+		case <-s.stopMaintenance:
+			return
+		}
+	}
+}
+
+func (s *Server) reapExpiredTmuxSessions() {
+	if s.config.SessionTTL <= 0 || s.reapTmuxSessions == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tmuxReapTimeout)
+	defer cancel()
+
+	cutoff := s.now().Add(-s.config.SessionTTL)
+	reaped, err := s.reapTmuxSessions(ctx, cutoff)
+	if err != nil {
+		s.logger.Printf("persistent tmux session reaper failed: %v", err)
+		return
+	}
+	if len(reaped) > 0 {
+		s.logger.Printf("reaped %d detached tmux session(s) inactive for at least %s", len(reaped), s.config.SessionTTL)
 	}
 }
 

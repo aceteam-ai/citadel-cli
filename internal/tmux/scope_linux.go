@@ -25,22 +25,22 @@ var (
 // service talks to the system manager. A non-root process in a system unit
 // cannot create a sibling system scope, so it keeps the old direct command
 // instead of turning a working terminal into a failed systemd-run invocation.
-func persistentSessionCommand(sessionName string, command []string) []string {
+func persistentSessionCommand(sessionName string, command []string) scopeDecision {
 	if os.Getenv(systemdInvocationIDEnv) == "" {
-		return command
+		return scopeDecision{command: command, reason: "process is not running in a systemd service (INVOCATION_ID is unset)"}
 	}
 	systemdRun, err := lookupSystemdRun("systemd-run")
 	if err != nil {
-		return command
+		return scopeDecision{command: command, reason: "systemd-run is unavailable"}
 	}
 
 	cgroup, err := readSelfCgroup()
 	if err != nil {
-		return command
+		return scopeDecision{command: command, reason: fmt.Sprintf("cannot read /proc/self/cgroup: %v", err)}
 	}
 	userManager := isUserManagerCgroup(string(cgroup))
 	if !userManager && currentEUID() != 0 {
-		return command
+		return scopeDecision{command: command, reason: "non-root process in a system service cannot create a sibling system scope"}
 	}
 
 	args := make([]string, 0, len(command)+7)
@@ -55,7 +55,15 @@ func persistentSessionCommand(sessionName string, command []string) []string {
 		"--",
 	)
 	args = append(args, command...)
-	return append([]string{systemdRun}, args...)
+	manager := "system manager"
+	if userManager {
+		manager = "user manager"
+	}
+	return scopeDecision{
+		command: append([]string{systemdRun}, args...),
+		scoped:  true,
+		reason:  manager,
+	}
 }
 
 func isUserManagerCgroup(cgroup string) bool {

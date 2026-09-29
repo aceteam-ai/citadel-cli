@@ -13,6 +13,8 @@ var (
 
 	// ErrInvalidIdleTimeout indicates idle timeout is too short
 	ErrInvalidIdleTimeout = errors.New("idle timeout must be at least 1 minute")
+	// ErrInvalidSessionTTL indicates the persistent tmux TTL is negative or too short
+	ErrInvalidSessionTTL = errors.New("persistent session TTL must be 0 (disabled) or at least 1 minute")
 
 	// ErrMissingOrgID indicates the organization ID is required but not set
 	ErrMissingOrgID = errors.New("organization ID is required")

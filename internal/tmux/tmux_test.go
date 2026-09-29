@@ -3,12 +3,15 @@ package tmux
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateSessionName(t *testing.T) {
@@ -57,14 +60,20 @@ func TestValidateSessionName_TooLong(t *testing.T) {
 
 func TestAttachOrCreateArgs(t *testing.T) {
 	got := AttachOrCreateArgs("agent", "/bin/bash")
-	want := []string{"new-session", "-A", "-s", "agent", "/bin/bash"}
+	want := []string{
+		"new-session", "-A", "-s", "agent", "/bin/bash",
+		";", "set-option", "-q", "-t", "agent", managedSessionOption, managedSessionOptionValue,
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AttachOrCreateArgs = %v, want %v", got, want)
 	}
 
 	// Empty shell omits the trailing program so tmux uses its default.
 	got = AttachOrCreateArgs("agent", "")
-	want = []string{"new-session", "-A", "-s", "agent"}
+	want = []string{
+		"new-session", "-A", "-s", "agent",
+		";", "set-option", "-q", "-t", "agent", managedSessionOption, managedSessionOptionValue,
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AttachOrCreateArgs (no shell) = %v, want %v", got, want)
 	}
@@ -196,6 +205,9 @@ func TestManager_EnsureSession_Idempotent(t *testing.T) {
 			t.Fatalf("EnsureSession created a session that already existed: %v", c)
 		}
 	}
+	if got := f.calls[len(f.calls)-1]; !reflect.DeepEqual(got, MarkSessionArgs("agent")) {
+		t.Fatalf("existing session was not adopted as managed: %v", got)
+	}
 }
 
 func TestManager_EnsureSession_CreatesWhenAbsent(t *testing.T) {
@@ -237,8 +249,79 @@ func TestManager_EnsureSessionUsesScopeCommand(t *testing.T) {
 		t.Fatalf("EnsureSession() error: %v", err)
 	}
 	want := []string{"--scope", "--", "/usr/bin/tmux", "new-session", "-d", "-s", "agent", "/bin/bash"}
-	if got := f.calls[len(f.calls)-1]; !reflect.DeepEqual(got, want) {
+	if got := f.calls[len(f.calls)-2]; !reflect.DeepEqual(got, want) {
 		t.Fatalf("scoped create args = %v, want %v", got, want)
+	}
+	if got := f.calls[len(f.calls)-1]; !reflect.DeepEqual(got, MarkSessionArgs("agent")) {
+		t.Fatalf("mark args = %v, want %v", got, MarkSessionArgs("agent"))
+	}
+}
+
+type reaperRunner struct {
+	calls [][]string
+	now   time.Time
+}
+
+func (r *reaperRunner) Run(_ context.Context, _ string, args ...string) ([]byte, error) {
+	r.calls = append(r.calls, append([]string(nil), args...))
+	switch args[0] {
+	case "list-sessions":
+		return []byte(strings.Join([]string{
+			fmt.Sprintf("expired\t%d\t0\t%s", r.now.Add(-8*time.Hour).Unix(), managedSessionOptionValue),
+			fmt.Sprintf("became-attached\t%d\t0\t%s", r.now.Add(-8*time.Hour).Unix(), managedSessionOptionValue),
+			fmt.Sprintf("recent\t%d\t0\t%s", r.now.Add(-time.Hour).Unix(), managedSessionOptionValue),
+			fmt.Sprintf("attached\t%d\t1\t%s", r.now.Add(-8*time.Hour).Unix(), managedSessionOptionValue),
+			fmt.Sprintf("operator\t%d\t0\t", r.now.Add(-8*time.Hour).Unix()),
+			"malformed\tnot-a-time\t0\t" + managedSessionOptionValue,
+		}, "\n") + "\n"), nil
+	case "display-message":
+		name := args[3]
+		attached := 0
+		if name == "became-attached" {
+			attached = 1
+		}
+		return []byte(fmt.Sprintf("%s\t%d\t%d\t%s\n", name, r.now.Add(-8*time.Hour).Unix(), attached, managedSessionOptionValue)), nil
+	case "kill-session":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+}
+
+func TestManager_ReapIdleSessionsOnlyKillsManagedDetachedExpired(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	runner := &reaperRunner{now: now}
+	manager := NewManagerWith("tmux", runner)
+
+	reaped, err := manager.ReapIdleSessions(context.Background(), now.Add(-7*time.Hour))
+	if err != nil {
+		t.Fatalf("ReapIdleSessions() error: %v", err)
+	}
+	if want := []string{"expired"}; !reflect.DeepEqual(reaped, want) {
+		t.Fatalf("reaped = %v, want %v", reaped, want)
+	}
+
+	var killed []string
+	for _, call := range runner.calls {
+		if len(call) >= 3 && call[0] == "kill-session" {
+			killed = append(killed, call[2])
+		}
+	}
+	if want := []string{"expired"}; !reflect.DeepEqual(killed, want) {
+		t.Fatalf("kill targets = %v, want %v; calls=%v", killed, want, runner.calls)
+	}
+}
+
+func TestParseSessionStatusesFailsClosed(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	out := fmt.Sprintf("managed\t%d\t0\t%s\noperator\t%d\t0\t\nbad name\t%d\t0\t%s\n", now.Unix(), managedSessionOptionValue, now.Unix(), now.Unix(), managedSessionOptionValue)
+	got := parseSessionStatuses([]byte(out))
+	want := []SessionStatus{
+		{Name: "managed", LastActivity: now, Managed: true},
+		{Name: "operator", LastActivity: now},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseSessionStatuses() = %#v, want %#v", got, want)
 	}
 }
 

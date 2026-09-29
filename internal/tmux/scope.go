@@ -1,5 +1,15 @@
 package tmux
 
+// scopeDecision records both the command to execute and why it is (or is not)
+// wrapped in a transient service-manager scope. Keeping the reason alongside
+// the decision prevents the diagnostic from drifting away from the branch that
+// selected it.
+type scopeDecision struct {
+	command []string
+	scoped  bool
+	reason  string
+}
+
 // PersistentSessionCommand moves a tmux create or attach command into a
 // service-manager scope when the platform can do so safely. A tmux server is a
 // long-lived child: if Citadel is the process that starts it, leaving it in the
@@ -15,9 +25,16 @@ func PersistentSessionCommand(sessionName string, command []string) []string {
 		return copyOf
 	}
 	if err := ValidateSessionName(sessionName); err != nil {
+		logf("tmux session %q launch is unscoped: invalid session name", sessionName)
 		return copyOf
 	}
-	return persistentSessionCommand(sessionName, copyOf)
+	decision := persistentSessionCommand(sessionName, copyOf)
+	if decision.scoped {
+		logf("tmux session %q launch uses a transient systemd scope: %s", sessionName, decision.reason)
+	} else {
+		logf("tmux session %q launch is unscoped: %s", sessionName, decision.reason)
+	}
+	return decision.command
 }
 
 func identitySessionCommand(_ string, command []string) []string {

@@ -66,7 +66,7 @@ func TestSessionCommand_BuildsAttachOrCreate(t *testing.T) {
 	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	bin := makeFakeTmux(t)
 	got := sessionCommand("agent", "/bin/bash", false)
-	want := []string{bin, "new-session", "-A", "-s", "agent", "/bin/bash"}
+	want := append([]string{bin}, tmux.AttachOrCreateArgs("agent", "/bin/bash")...)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand = %v, want %v", got, want)
 	}
@@ -95,7 +95,7 @@ func TestSessionCommand_ExplicitHonoredInsideTmux(t *testing.T) {
 	bin := makeFakeTmux(t)
 	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
 	got := sessionCommand("agent", "/bin/bash", true)
-	want := []string{bin, "new-session", "-A", "-s", "agent", "/bin/bash"}
+	want := append([]string{bin}, tmux.AttachOrCreateArgs("agent", "/bin/bash")...)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand(explicit=true) = %v, want %v (explicit --tmux must win over the nesting guard)", got, want)
 	}

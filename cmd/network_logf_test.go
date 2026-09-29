@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 	"github.com/spf13/cobra"
 )
 
@@ -27,6 +28,10 @@ func TestRootPersistentPreRunWiresNetworkLogf(t *testing.T) {
 	if !network.LogfConfigured() {
 		t.Error("PersistentPreRun must install a real network diagnostic logger; " +
 			"without it every command silently discards engine diagnostics (#662)")
+	}
+	if !tmux.LogfConfigured() {
+		t.Error("PersistentPreRun must install a real tmux diagnostic logger; " +
+			"without it scope/fallback decisions are silently discarded (#1174)")
 	}
 }
 
