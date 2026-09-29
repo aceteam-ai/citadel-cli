@@ -2740,3 +2740,20 @@ Auto-generated log of every release.
   - feat: enroll existing identity key through device-auth CSR poll (#1098)
 
 
+---
+
+## v2.174.0 — 2026-09-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 41 |
+| Lines added | +5135 |
+
+**Changes:**
+
+  - feat(worker): RUN_JOB_TEMPLATE execution framework (#1149) (#1160)
+  - fix(apps): confine app bind mounts, resolve symlinks before allowlist check (#1158) (#1162)
+  - feat(apps): node app runner, pod-per-app (CRAM A1, aceteam#9672) (#1157)
+
+
