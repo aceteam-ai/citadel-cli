@@ -67,7 +67,7 @@ type SessionConfig struct {
 	// Command, when non-empty, overrides Shell: the session runs Command[0]
 	// with Command[1:] as arguments instead of spawning a bare shell. This is
 	// how a tmux-backed persistent session is started (e.g.
-	// `tmux new-session -A -s <name>`). When set, Shell is ignored for the
+	// an identity-verified tmux attach). When set, Shell is ignored for the
 	// process but its existence check is skipped in favour of Command[0].
 	Command []string
 
@@ -95,7 +95,7 @@ func NewSession(config SessionConfig) (*Session, error) {
 	}
 
 	// Determine the program to run: an explicit Command (e.g. a tmux
-	// attach-or-create invocation) takes precedence over a bare shell.
+	// verified attach invocation) takes precedence over a bare shell.
 	var name string
 	var args []string
 	if len(config.Command) > 0 {

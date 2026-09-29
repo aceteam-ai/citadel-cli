@@ -14,8 +14,8 @@ import (
 // CITADEL_TERMINAL_SESSION is not set.
 //
 // It defaults to "citadel", which turns persistent tmux backing ON by default
-// (citadel #585, Gap 2): each connection attaches to (or creates) a per-user
-// `tmux new-session -A -s <name>` session, so a repeated `citadel connect
+// (citadel #585, Gap 2): each connection safely creates or attaches to a
+// Citadel-owned per-user tmux session, so a repeated `citadel connect
 // <node>` — and a reconnect after a drop — re-attaches to the SAME live shell
 // (running command, scrollback, cwd preserved) instead of spawning a duplicate.
 //
@@ -56,7 +56,7 @@ type Config struct {
 	Shell string
 
 	// SessionName, when non-empty, makes the server back every connection with
-	// a persistent named tmux session (`tmux new-session -A -s <name>`) instead
+	// a persistent, Citadel-owned named tmux session instead
 	// of a fresh bare shell. The tmux server keeps the session alive after a
 	// client disconnects, so reconnecting re-attaches to the same session and
 	// the terminal state survives. Requires a resolvable tmux binary; when tmux

@@ -383,7 +383,7 @@ func (r *reaperRunner) Run(ctx context.Context, _ string, args ...string) ([]byt
 	switch args[0] {
 	case "list-sessions":
 		var rows []string
-		for _, name := range []string{"expired", "became-attached", "renewed", "recent", "attached", "operator", "malformed"} {
+		for _, name := range []string{"expired", "became-attached", "renewed", "recreated", "recent", "attached", "operator", "malformed"} {
 			status, ok := r.sessions[name]
 			if !ok {
 				continue
@@ -400,7 +400,7 @@ func (r *reaperRunner) Run(ctx context.Context, _ string, args ...string) ([]byt
 			if name == "malformed" {
 				lease = "not-a-lease"
 			}
-			rows = append(rows, fmt.Sprintf("%s\t$%d\t42\t%d\t%s\t%s", name, len(rows)+1, attached, marker, lease))
+			rows = append(rows, fmt.Sprintf("%s\t%s\t%d\t%d\t%s\t%s", name, status.ID, status.ServerPID, attached, marker, lease))
 		}
 		return []byte(strings.Join(rows, "\n") + "\n"), nil
 	case "if-shell":
@@ -410,7 +410,10 @@ func (r *reaperRunner) Run(ctx context.Context, _ string, args ...string) ([]byt
 		}
 		name := args[3]
 		status, ok := r.sessions[name]
-		if ok && status.Managed && !status.Attached && strings.Contains(args[4], fmt.Sprintf(",%d}", status.LeaseExpires)) {
+		identityMatches := strings.Contains(args[4], "#{session_id},"+status.ID) &&
+			strings.Contains(args[4], fmt.Sprintf("#{pid},%d", status.ServerPID))
+		if ok && status.Managed && !status.Attached && identityMatches &&
+			strings.Contains(args[4], fmt.Sprintf(",%d}", status.LeaseExpires)) {
 			delete(r.sessions, name)
 		}
 		return nil, nil
@@ -438,10 +441,11 @@ func TestManager_ReapExpiredSessionsOnlyKillsMatchingLeaseAtomically(t *testing.
 		"expired":         {Name: "expired", ID: "$1", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
 		"became-attached": {Name: "became-attached", ID: "$2", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
 		"renewed":         {Name: "renewed", ID: "$3", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
-		"recent":          {Name: "recent", ID: "$4", ServerPID: 42, Managed: true, LeaseExpires: now.Add(time.Hour).Unix()},
-		"attached":        {Name: "attached", ID: "$5", ServerPID: 42, Attached: true, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
-		"operator":        {Name: "operator", ID: "$6", ServerPID: 42, LeaseExpires: now.Add(-time.Hour).Unix()},
-		"malformed":       {Name: "malformed", ID: "$7", ServerPID: 42, Managed: true},
+		"recreated":       {Name: "recreated", ID: "$4", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+		"recent":          {Name: "recent", ID: "$5", ServerPID: 42, Managed: true, LeaseExpires: now.Add(time.Hour).Unix()},
+		"attached":        {Name: "attached", ID: "$6", ServerPID: 42, Attached: true, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+		"operator":        {Name: "operator", ID: "$7", ServerPID: 42, LeaseExpires: now.Add(-time.Hour).Unix()},
+		"malformed":       {Name: "malformed", ID: "$8", ServerPID: 42, Managed: true},
 	}}
 	runner.beforeAtomic = func(sessions map[string]SessionStatus) {
 		status := sessions["became-attached"]
@@ -450,6 +454,12 @@ func TestManager_ReapExpiredSessionsOnlyKillsMatchingLeaseAtomically(t *testing.
 		status = sessions["renewed"]
 		status.LeaseExpires = now.Add(time.Hour).Unix()
 		sessions["renewed"] = status
+		// A killed last session can restart the tmux server and reuse $0/name.
+		// Even if marker and lease are copied exactly, the new server PID must
+		// make the observed candidate ineligible.
+		status = sessions["recreated"]
+		status.ServerPID = 99
+		sessions["recreated"] = status
 	}
 	manager := NewManagerWith("tmux", runner)
 
@@ -467,7 +477,7 @@ func TestManager_ReapExpiredSessionsOnlyKillsMatchingLeaseAtomically(t *testing.
 			conditional = append(conditional, call[3])
 		}
 	}
-	if want := []string{"expired", "became-attached", "renewed"}; !reflect.DeepEqual(conditional, want) {
+	if want := []string{"expired", "became-attached", "renewed", "recreated"}; !reflect.DeepEqual(conditional, want) {
 		t.Fatalf("conditional targets = %v, want %v; calls=%v", conditional, want, runner.calls)
 	}
 }
@@ -486,9 +496,9 @@ func TestParseSessionStatusesFailsClosed(t *testing.T) {
 }
 
 func TestReapExpiredLeaseArgsIncludesAtomicGuards(t *testing.T) {
-	args := ReapExpiredLeaseArgs("agent", 1234)
+	args := ReapExpiredLeaseArgs(SessionStatus{Name: "agent", ID: "$7", ServerPID: 42, Managed: true, LeaseExpires: 1234})
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"if-shell", "#{session_attached}", managedSessionOption, managedSessionOptionValue, managedSessionLeaseOption, "1234", "kill-session -t agent"} {
+	for _, want := range []string{"if-shell", "#{session_id},$7", "#{pid},42", "#{session_attached}", managedSessionOption, managedSessionOptionValue, managedSessionLeaseOption, "1234", "kill-session -t $7"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args %q missing %q", joined, want)
 		}

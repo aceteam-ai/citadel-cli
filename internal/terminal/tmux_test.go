@@ -45,6 +45,17 @@ func TestSessionCommand_NoSessionName(t *testing.T) {
 	}
 }
 
+func TestPersistentTmuxSupported(t *testing.T) {
+	if persistentTmuxSupported("windows") {
+		t.Fatal("persistent tmux must remain disabled on Windows until ConPTY argv escaping is implemented")
+	}
+	for _, goos := range []string{"linux", "darwin", "freebsd"} {
+		if !persistentTmuxSupported(goos) {
+			t.Errorf("persistentTmuxSupported(%q) = false", goos)
+		}
+	}
+}
+
 func TestSessionCommand_InvalidName(t *testing.T) {
 	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	makeFakeTmux(t)

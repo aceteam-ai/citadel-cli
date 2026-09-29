@@ -85,6 +85,9 @@ tmux is never assumed to be installed. The binary is resolved in order:
 `CITADEL_TMUX_BIN` → `tmux` on `PATH` → a Citadel-managed binary at
 `~/.citadel/bin/tmux`. When none is found, the server falls back to a bare shell
 (connections still work, but do not persist across reconnects).
+Persistent tmux backing is currently disabled on Windows: the ConPTY launcher
+flattens argv and cannot safely preserve the identity-checked tmux command
+queue. Windows connections therefore use the normal bare shell.
 
 **Opting out (citadel #780):** a power user who runs their own tmux — connecting
 through the Citadel console, sshing elsewhere, running `tmux a` there — ends up
@@ -138,9 +141,10 @@ detached. This is deliberately not called an idle timeout: tmux's
 `session_activity` does not reflect detached pane output or `send-keys`, so it
 cannot prove that a background task is idle. Consequently, a still-running task
 in a disconnected session may be terminated after the configured retention
-lease. At removal, tmux atomically checks that the session is still detached,
-still marked, and still carries the exact expired lease that was observed; an
-attach or renewal racing the sweep therefore fails closed. Unmarked and
+lease. At removal, tmux atomically checks the exact session ID and tmux server
+PID as well as detached state, marker, and the exact expired lease that was
+observed; an attach, renewal, or killed-and-recreated server racing the sweep
+therefore fails closed. Unmarked and
 malformed sessions are never removed. Set the TTL to `0` to disable cleanup.
 
 ### Surviving a managed worker restart

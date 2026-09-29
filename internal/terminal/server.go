@@ -773,7 +773,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.logger.Printf("creating session %s for user %s from %s", sessionID, tokenInfo.UserID, ip)
 
 	// When a persistent named session is configured and tmux is available, back
-	// the PTY with `tmux new-session -A -s <name>` so the session survives
+	// the PTY with a verified Citadel-owned tmux session so it survives
 	// reconnects; otherwise fall back to a bare shell. The tmux session name is
 	// derived per-user from the configured base name so a reconnecting client
 	// re-attaches to its own live session (running command, scrollback, cwd all
@@ -804,6 +804,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			s.logger.Printf("tmux session name %q is operator-owned; session %s falls back to a bare shell rather than attaching to or modifying it", tmuxSessionName, sessionID)
 		} else if tmuxFallbackReason != nil {
 			s.logger.Printf("could not safely prepare tmux session %q: %v; session %s falls back to a bare shell", tmuxSessionName, tmuxFallbackReason, sessionID)
+		} else if !currentPlatformPersistentTmuxSupported() {
+			s.logger.Printf("persistent tmux sessions are unsupported on this platform; session %s uses a bare shell", sessionID)
 		} else if sessionOverride == "" && insideTmux() {
 			// citadel #751: this citadel process is itself already running
 			// inside a tmux client, and this session was AUTO-started off the

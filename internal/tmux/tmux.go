@@ -282,17 +282,17 @@ func KillSessionArgs(name string) []string {
 	return []string{"kill-session", "-t", name}
 }
 
-// ReapExpiredLeaseArgs performs the final ownership, attachment, and lease
-// check inside one tmux command queue item. Matching the exact observed lease
-// makes a concurrent renewal fail closed; checking session_attached in the same
-// expression as kill-session closes the attach-after-check TOCTOU.
-func ReapExpiredLeaseArgs(name string, observedLease int64) []string {
+// ReapExpiredLeaseArgs performs the final identity, ownership, attachment, and
+// lease check inside one tmux command queue item. Session ID alone is not
+// sufficient because a new tmux server starts numbering at $0 again; the
+// server PID distinguishes that replacement incarnation.
+func ReapExpiredLeaseArgs(status SessionStatus) []string {
 	condition := fmt.Sprintf(
-		"#{&&:#{==:#{session_attached},0},#{&&:#{==:#{%s},%s},#{==:#{%s},%d}}}",
-		managedSessionOption, managedSessionOptionValue,
-		managedSessionLeaseOption, observedLease,
+		"#{&&:%s,#{&&:#{==:#{session_attached},0},#{==:#{%s},%d}}}",
+		ownedSessionCondition(status),
+		managedSessionLeaseOption, status.LeaseExpires,
 	)
-	return []string{"if-shell", "-F", "-t", name, condition, "kill-session -t " + name, ""}
+	return []string{"if-shell", "-F", "-t", status.Name, condition, "kill-session -t " + status.ID, ""}
 }
 
 func ownedSessionCondition(status SessionStatus) string {
@@ -496,7 +496,7 @@ func (m *Manager) ReapExpiredSessions(ctx context.Context, now time.Time) ([]str
 		if !reapEligible(status, now) {
 			continue
 		}
-		if out, err := m.runner.Run(ctx, m.bin, ReapExpiredLeaseArgs(status.Name, status.LeaseExpires)...); err != nil {
+		if out, err := m.runner.Run(ctx, m.bin, ReapExpiredLeaseArgs(status)...); err != nil {
 			return reaped, fmt.Errorf("tmux conditional reap %q failed: %w: %s", status.Name, err, strings.TrimSpace(string(out)))
 		}
 		exists, err := m.HasSession(ctx, status.Name)

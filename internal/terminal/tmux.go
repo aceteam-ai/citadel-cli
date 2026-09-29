@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -132,6 +133,9 @@ func sessionNameForUser(base, userID string) string {
 // The returned command starts only a shell inside tmux; launching claude (or
 // any agent) is a separate explicit step and never coupled here.
 func sessionCommand(sessionName, shell string, explicit bool) []string {
+	if !currentPlatformPersistentTmuxSupported() {
+		return nil
+	}
 	if sessionName == "" || sessionDisabled(sessionName) {
 		return nil
 	}
@@ -146,7 +150,22 @@ func sessionCommand(sessionName, shell string, explicit bool) []string {
 		return nil
 	}
 	command := append([]string{bin}, tmux.AttachArgs(sessionName)...)
-	return tmux.PersistentSessionCommand(sessionName, command)
+	// This is only an availability sentinel. The handler replaces it with the
+	// identity-bound command from Manager.PrepareSession, which owns the one
+	// real scope decision and diagnostic line.
+	return command
+}
+
+func persistentTmuxSupported(goos string) bool {
+	// Windows ConPTY accepts a flattened command line rather than an argv
+	// vector. Identity-bound tmux if-shell actions intentionally contain spaces
+	// and command separators, which cannot be represented safely by the current
+	// Windows session launcher. Fall back to the ordinary shell explicitly.
+	return goos != "windows"
+}
+
+func currentPlatformPersistentTmuxSupported() bool {
+	return persistentTmuxSupported(runtime.GOOS)
 }
 
 // resolveSessionOverride decides the effective session BASE name for a single
@@ -198,7 +217,7 @@ func resolveSessionCommand(configDefault, requestOverride, userID, shell string,
 
 	sessionName = sessionNameForUser(base, userID)
 	command = sessionCommand(sessionName, shell, overridden)
-	if command == nil && overridden && ensureInstall != nil {
+	if command == nil && overridden && currentPlatformPersistentTmuxSupported() && ensureInstall != nil {
 		if ensureInstall() {
 			command = sessionCommand(sessionName, shell, overridden)
 		}
