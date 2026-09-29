@@ -100,7 +100,7 @@ func TestDefaultConfig_TmuxOnByDefault(t *testing.T) {
 		t.Error("expected tmux backing to be ENABLED by default (citadel #585)")
 	}
 	got := sessionCommand(config.SessionName, "/bin/bash", false)
-	want := append([]string{bin}, tmux.AttachOrCreateArgs("citadel", "/bin/bash")...)
+	want := append([]string{bin}, tmux.AttachArgs("citadel")...)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand = %v, want %v", got, want)
 	}

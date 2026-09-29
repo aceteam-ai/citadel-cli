@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 )
 
 // DefaultSessionName is the base tmux session name used when
@@ -25,11 +27,9 @@ import (
 // disable sentinel ("none"/"off"/"disabled"/"false"/"0").
 const DefaultSessionName = "citadel"
 
-// DefaultSessionTTL bounds how long a detached, inactive Citadel-managed tmux
-// session is retained. It is intentionally much longer than the connection
-// IdleTimeout: reconnect persistence is useful across days, while abandoned
-// sessions must not accumulate for the lifetime of a node.
-const DefaultSessionTTL = 7 * 24 * time.Hour
+// DefaultSessionTTL bounds disconnected persistence with an explicit lease.
+// It is intentionally much longer than the connection IdleTimeout.
+const DefaultSessionTTL = tmux.DefaultSessionLeaseTTL
 
 // Config holds the terminal server configuration
 type Config struct {
@@ -76,10 +76,14 @@ type Config struct {
 	// to a disable sentinel ("none"/"off"/"disabled"/"false"/"0").
 	SessionName string
 
-	// SessionTTL is the maximum inactivity age of a detached, Citadel-managed
-	// tmux session. The reaper never touches attached or unmarked sessions. Zero
-	// disables reaping. Configured via CITADEL_TERMINAL_SESSION_TTL as a Go
-	// duration (for example "24h" or "168h").
+	// SessionTTL is the Citadel retention lease for a disconnected tmux
+	// session. It is renewed while a client is attached and once on detach; it
+	// is deliberately not inferred from tmux session_activity, which misses
+	// detached pane output. After this lease expires, even a task still running
+	// in the detached session may be terminated. The reaper never touches
+	// attached or unmarked sessions. Zero disables reaping. Configured via
+	// CITADEL_TERMINAL_SESSION_TTL as a Go duration (for example "24h" or
+	// "168h").
 	SessionTTL time.Duration
 
 	// TrustMeshPeers enables mesh-peer identity trust for connections that

@@ -62,7 +62,7 @@ func TestResolveSessionCommand_NoOverridePreservesDefault(t *testing.T) {
 		if !wanted {
 			t.Fatal("wantedSession = false, want true (node default names a session)")
 		}
-		want := append([]string{bin}, tmux.AttachOrCreateArgs(name, "/bin/bash")...)
+		want := append([]string{bin}, tmux.AttachArgs(name)...)
 		if !reflect.DeepEqual(cmd, want) {
 			t.Errorf("command = %v, want %v", cmd, want)
 		}
@@ -131,7 +131,7 @@ func TestResolveSessionCommand_OverrideNamedRequestsTmux(t *testing.T) {
 	if !wanted {
 		t.Fatal("wantedSession = false, want true (override names a session)")
 	}
-	want := append([]string{bin}, tmux.AttachOrCreateArgs(name, "/bin/bash")...)
+	want := append([]string{bin}, tmux.AttachArgs(name)...)
 	if !reflect.DeepEqual(cmd, want) {
 		t.Errorf("command = %v, want %v", cmd, want)
 	}
@@ -164,7 +164,7 @@ func TestResolveSessionCommand_OverrideTriggersInstallOnMissingTmux(t *testing.T
 	if installCalls != 1 {
 		t.Fatalf("ensureInstall called %d times, want 1", installCalls)
 	}
-	want := append([]string{installedBin}, tmux.AttachOrCreateArgs(name, "/bin/bash")...)
+	want := append([]string{installedBin}, tmux.AttachArgs(name)...)
 	if !reflect.DeepEqual(cmd, want) {
 		t.Errorf("command = %v, want %v (should resolve via the newly installed binary)", cmd, want)
 	}
@@ -243,7 +243,7 @@ func TestResolveSessionCommand_ExplicitOverrideHonoredInsideTmux(t *testing.T) {
 	if !wanted {
 		t.Fatal("wantedSession = false, want true (override names a session)")
 	}
-	want := append([]string{bin}, tmux.AttachOrCreateArgs(name, "/bin/bash")...)
+	want := append([]string{bin}, tmux.AttachArgs(name)...)
 	if !reflect.DeepEqual(cmd, want) {
 		t.Errorf("command = %v, want %v (explicit --tmux must win over the nesting guard)", cmd, want)
 	}

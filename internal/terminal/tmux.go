@@ -110,10 +110,11 @@ func sessionNameForUser(base, userID string) string {
 // sessionCommand returns the program + args the PTY should run for a connection.
 //
 // When the server is configured with a SessionName and a usable tmux binary is
-// available, it returns a `tmux new-session -A -s <name>` invocation so the
-// connection attaches to (or creates) a persistent named session that survives
-// reconnects. Otherwise it returns nil, signalling the caller to fall back to a
-// bare shell.
+// available, it returns an attach invocation as an availability signal. The
+// handler must call Manager.PrepareSession before running it: that separate
+// ownership step creates and marks only a new Citadel session and rejects a
+// colliding operator-owned name. Otherwise it returns nil, signalling the
+// caller to fall back to a bare shell.
 //
 // A SessionName matching a disable sentinel ("none"/"off"/...) returns nil so
 // operators can opt out of persistence without unsetting the default.
@@ -144,7 +145,7 @@ func sessionCommand(sessionName, shell string, explicit bool) []string {
 	if err != nil {
 		return nil
 	}
-	command := append([]string{bin}, tmux.AttachOrCreateArgs(sessionName, shell)...)
+	command := append([]string{bin}, tmux.AttachArgs(sessionName)...)
 	return tmux.PersistentSessionCommand(sessionName, command)
 }
 

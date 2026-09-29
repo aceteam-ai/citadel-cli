@@ -8,11 +8,9 @@
 // is found it returns ErrTmuxNotFound with actionable guidance rather than
 // crashing.
 //
-// Sessions are created with `tmux new-session -A -s <name>`, which attaches to
-// an existing session of that name or creates a new detached one. Because the
-// tmux server keeps sessions alive after a client detaches, a WebSocket client
-// can disconnect and later re-attach to the same named session — the terminal
-// state survives reconnects.
+// Citadel creates sessions detached, marks only the session it just created,
+// and then attaches with a separate command. A pre-existing unmarked session
+// with the requested name is a collision, never something Citadel adopts.
 //
 // Starting a session is intentionally decoupled from launching `claude`: a
 // session is just a shell. Launching an agent inside it is a separate, explicit
@@ -39,16 +37,27 @@ var ErrTmuxNotFound = errors.New("tmux not found: no tmux binary on PATH and no 
 // ErrInvalidSessionName indicates a session name failed validation.
 var ErrInvalidSessionName = errors.New("invalid tmux session name")
 
+// ErrSessionNameCollision means a requested name already belongs to an
+// unmarked tmux session. Citadel fails closed rather than attaching to or
+// adopting terminal state it did not create.
+var ErrSessionNameCollision = errors.New("tmux session name is already owned outside Citadel")
+
 // envTmuxBin is an optional override for the tmux binary path. When set it takes
 // precedence over PATH lookup and the managed location.
 const envTmuxBin = "CITADEL_TMUX_BIN"
 
 // managedSessionOption is stored as a tmux user option on every session
-// Citadel creates or adopts. The reaper checks this marker before acting, so a
+// Citadel creates. The reaper checks this marker before acting, so a
 // user's unrelated tmux sessions on the same server are never TTL-managed.
 const managedSessionOption = "@citadel_managed"
 
 const managedSessionOptionValue = "citadel-v1"
+
+const managedSessionLeaseOption = "@citadel_lease_expires"
+
+// DefaultSessionLeaseTTL is shared by the terminal service and TMUX_SESSION
+// jobs so both creation paths receive the same bounded default lease.
+const DefaultSessionLeaseTTL = 7 * 24 * time.Hour
 
 // logf receives package diagnostics. The CLI wires it to its durable log in
 // PersistentPreRun; the no-op default keeps library users quiet.
@@ -215,25 +224,12 @@ func NewDetachedArgs(name, shell string) []string {
 	return args
 }
 
-// AttachOrCreateArgs returns the tmux argv that attaches to a named session,
-// creating it (running shell) if it does not already exist. This is what the
-// terminal PTY runs so the same name survives reconnects: `-A` makes
-// new-session attach-if-exists, giving create/attach idempotency in one call.
-//
-// Launching claude is deliberately NOT part of this command; the session is a
-// plain shell until something explicitly sends keys to start an agent.
-func AttachOrCreateArgs(name, shell string) []string {
-	// Keep the established attach-or-create behavior and append the marker in
-	// the same tmux command list. This avoids a detach/reattach transition while
-	// still adopting older Citadel sessions on their first post-upgrade attach.
-	args := []string{"new-session", "-A", "-s", name}
-	if shell != "" {
-		args = append(args, shell)
-	}
-	args = append(args,
-		";", "set-option", "-q", "-t", name, managedSessionOption, managedSessionOptionValue,
-	)
-	return args
+// AttachArgs returns argv that attaches to an already-proven Citadel session.
+// Creation and ownership verification happen in Manager.PrepareSession first;
+// keeping attach separate prevents `new-session -A` from adopting an operator
+// session that merely collides by name.
+func AttachArgs(name string) []string {
+	return []string{"attach-session", "-t", name}
 }
 
 // ListSessionsArgs returns the tmux argv that lists session names, one per line.
@@ -244,15 +240,14 @@ func ListSessionsArgs() []string {
 // sessionStatusFormat is deliberately tab-delimited: validated Citadel names
 // cannot contain tabs, and malformed/operator-created rows are skipped by the
 // parser rather than broadening the reaper's authority.
-const sessionStatusFormat = "#{session_name}\t#{session_activity}\t#{session_attached}\t#{@citadel_managed}"
+const sessionStatusFormat = "#{session_name}\t#{session_attached}\t#{@citadel_managed}\t#{@citadel_lease_expires}"
 
-// SessionStatus is the subset of tmux metadata needed by the idle-session
-// reaper.
+// SessionStatus is the subset of tmux metadata needed by the lease reaper.
 type SessionStatus struct {
 	Name         string
-	LastActivity time.Time
 	Attached     bool
 	Managed      bool
+	LeaseExpires int64
 }
 
 // ListSessionStatusArgs returns tmux argv for one metadata row per session.
@@ -261,20 +256,37 @@ func ListSessionStatusArgs() []string {
 }
 
 // DisplaySessionStatusArgs returns tmux argv for a fresh single-session
-// snapshot. ReapIdleSessions uses it immediately before a kill so a session
-// that became attached or active after the initial list is spared.
+// snapshot.
 func DisplaySessionStatusArgs(name string) []string {
 	return []string{"display-message", "-p", "-t", name, sessionStatusFormat}
 }
 
-// MarkSessionArgs marks a session as Citadel-managed using a tmux user option.
-func MarkSessionArgs(name string) []string {
-	return []string{"set-option", "-q", "-t", name, managedSessionOption, managedSessionOptionValue}
+// MarkSessionLeaseArgs marks a newly-created session and records its explicit
+// retention lease. This must only be called by the code path that successfully
+// created name; it is never an adoption primitive.
+func MarkSessionLeaseArgs(name string, leaseExpires int64) []string {
+	return []string{
+		"set-option", "-q", "-t", name, managedSessionOption, managedSessionOptionValue,
+		";", "set-option", "-q", "-t", name, managedSessionLeaseOption, strconv.FormatInt(leaseExpires, 10),
+	}
 }
 
 // KillSessionArgs returns tmux argv for removing one validated session.
 func KillSessionArgs(name string) []string {
 	return []string{"kill-session", "-t", name}
+}
+
+// ReapExpiredLeaseArgs performs the final ownership, attachment, and lease
+// check inside one tmux command queue item. Matching the exact observed lease
+// makes a concurrent renewal fail closed; checking session_attached in the same
+// expression as kill-session closes the attach-after-check TOCTOU.
+func ReapExpiredLeaseArgs(name string, observedLease int64) []string {
+	condition := fmt.Sprintf(
+		"#{&&:#{==:#{session_attached},0},#{&&:#{==:#{%s},%s},#{==:#{%s},%d}}}",
+		managedSessionOption, managedSessionOptionValue,
+		managedSessionLeaseOption, observedLease,
+	)
+	return []string{"if-shell", "-F", "-t", name, condition, "kill-session -t " + name, ""}
 }
 
 // HasSession reports whether a session with the given (validated) name exists.
@@ -295,32 +307,96 @@ func (m *Manager) HasSession(ctx context.Context, name string) (bool, error) {
 	return false, fmt.Errorf("tmux has-session failed: %w", err)
 }
 
-// EnsureSession creates a detached named session if it does not already exist.
-// It is idempotent: calling it for an existing session is a no-op. The session
-// runs the given shell (empty uses tmux's default); claude is never launched
-// here.
+// EnsureSession creates a detached, leased Citadel session, or renews the
+// default lease of an existing Citadel-owned session. An unmarked pre-existing
+// name is rejected as ErrSessionNameCollision and is never modified.
 func (m *Manager) EnsureSession(ctx context.Context, name, shell string) error {
+	return m.EnsureSessionLease(ctx, name, shell, time.Now().Add(DefaultSessionLeaseTTL))
+}
+
+// EnsureSessionLease is EnsureSession with an explicit absolute lease deadline.
+func (m *Manager) EnsureSessionLease(ctx context.Context, name, shell string, leaseUntil time.Time) error {
 	if err := ValidateSessionName(name); err != nil {
 		return err
 	}
-	exists, err := m.HasSession(ctx, name)
+	status, exists, err := m.sessionStatus(ctx, name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if !status.Managed {
+			return fmt.Errorf("%w: %q", ErrSessionNameCollision, name)
+		}
+		return m.setSessionLease(ctx, name, leaseUntil)
+	}
+
+	command := append([]string{m.bin}, NewDetachedArgs(name, shell)...)
+	command = m.scopeCommand(name, command)
+	if out, createErr := m.runner.Run(ctx, command[0], command[1:]...); createErr != nil {
+		// Another creator may have won the absent->create race. It is safe to
+		// continue only if that winner has already marked the session as
+		// Citadel-owned; an unmarked winner remains an operator collision.
+		status, nowExists, inspectErr := m.sessionStatus(ctx, name)
+		if inspectErr == nil && nowExists {
+			if !status.Managed {
+				return fmt.Errorf("%w: %q", ErrSessionNameCollision, name)
+			}
+			return m.setSessionLease(ctx, name, leaseUntil)
+		}
+		return fmt.Errorf("tmux new-session failed: %w: %s", createErr, strings.TrimSpace(string(out)))
+	}
+
+	// Only this successful creator may establish ownership. If marking fails,
+	// remove the session we just created so it cannot linger unleased.
+	if out, err := m.runner.Run(ctx, m.bin, MarkSessionLeaseArgs(name, leaseUnix(leaseUntil))...); err != nil {
+		_, _ = m.runner.Run(ctx, m.bin, KillSessionArgs(name)...)
+		return fmt.Errorf("tmux mark session lease failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// PrepareSession ensures ownership/lease then returns the scoped attach command
+// for a terminal PTY.
+func (m *Manager) PrepareSession(ctx context.Context, name, shell string, leaseUntil time.Time) ([]string, error) {
+	if err := m.EnsureSessionLease(ctx, name, shell, leaseUntil); err != nil {
+		return nil, err
+	}
+	command := append([]string{m.bin}, AttachArgs(name)...)
+	return m.scopeCommand(name, command), nil
+}
+
+// RenewSessionLease extends only an already-marked Citadel session.
+func (m *Manager) RenewSessionLease(ctx context.Context, name string, leaseUntil time.Time) error {
+	if err := ValidateSessionName(name); err != nil {
+		return err
+	}
+	status, exists, err := m.sessionStatus(ctx, name)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		command := append([]string{m.bin}, NewDetachedArgs(name, shell)...)
-		command = m.scopeCommand(name, command)
-		if out, err := m.runner.Run(ctx, command[0], command[1:]...); err != nil {
-			return fmt.Errorf("tmux new-session failed: %w: %s", err, strings.TrimSpace(string(out)))
-		}
+		return nil
 	}
-	// Mark both newly-created and already-existing sessions. The latter adopts
-	// sessions created by the immediately preceding release once they are next
-	// ensured, without ever sweeping arbitrary unmarked tmux state.
-	if out, err := m.runner.Run(ctx, m.bin, MarkSessionArgs(name)...); err != nil {
-		return fmt.Errorf("tmux mark session failed: %w: %s", err, strings.TrimSpace(string(out)))
+	if !status.Managed {
+		return fmt.Errorf("%w: %q", ErrSessionNameCollision, name)
+	}
+	return m.setSessionLease(ctx, name, leaseUntil)
+}
+
+func (m *Manager) setSessionLease(ctx context.Context, name string, leaseUntil time.Time) error {
+	out, err := m.runner.Run(ctx, m.bin,
+		"set-option", "-q", "-t", name, managedSessionLeaseOption, strconv.FormatInt(leaseUnix(leaseUntil), 10))
+	if err != nil {
+		return fmt.Errorf("tmux renew session lease failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func leaseUnix(leaseUntil time.Time) int64 {
+	if leaseUntil.IsZero() {
+		return 0
+	}
+	return leaseUntil.Unix()
 }
 
 // ListSessions returns the names of all sessions on the node's tmux server.
@@ -352,11 +428,11 @@ func parseSessionList(out []byte) []string {
 	return names
 }
 
-// ReapIdleSessions kills Citadel-managed sessions that are detached and whose
-// tmux activity timestamp is not newer than cutoff. It never acts on an
-// unmarked session. Each candidate is re-read immediately before the kill to
-// avoid using a stale attachment/activity snapshot.
-func (m *Manager) ReapIdleSessions(ctx context.Context, cutoff time.Time) ([]string, error) {
+// ReapExpiredSessions removes detached Citadel sessions whose explicit
+// retention lease has expired. It does not use session_activity: tmux does not
+// update that field for detached pane output or send-keys, so it cannot safely
+// identify an idle task.
+func (m *Manager) ReapExpiredSessions(ctx context.Context, now time.Time) ([]string, error) {
 	statuses, err := m.listSessionStatuses(ctx)
 	if err != nil {
 		return nil, err
@@ -364,18 +440,18 @@ func (m *Manager) ReapIdleSessions(ctx context.Context, cutoff time.Time) ([]str
 
 	var reaped []string
 	for _, status := range statuses {
-		if !reapEligible(status, cutoff) {
+		if !reapEligible(status, now) {
 			continue
 		}
-		fresh, ok, err := m.sessionStatus(ctx, status.Name)
+		if out, err := m.runner.Run(ctx, m.bin, ReapExpiredLeaseArgs(status.Name, status.LeaseExpires)...); err != nil {
+			return reaped, fmt.Errorf("tmux conditional reap %q failed: %w: %s", status.Name, err, strings.TrimSpace(string(out)))
+		}
+		exists, err := m.HasSession(ctx, status.Name)
 		if err != nil {
 			return reaped, err
 		}
-		if !ok || !reapEligible(fresh, cutoff) {
+		if exists {
 			continue
-		}
-		if out, err := m.runner.Run(ctx, m.bin, KillSessionArgs(status.Name)...); err != nil {
-			return reaped, fmt.Errorf("tmux kill-session %q failed: %w: %s", status.Name, err, strings.TrimSpace(string(out)))
 		}
 		reaped = append(reaped, status.Name)
 	}
@@ -413,8 +489,8 @@ func (m *Manager) sessionStatus(ctx context.Context, name string) (SessionStatus
 	return statuses[0], true, nil
 }
 
-func reapEligible(status SessionStatus, cutoff time.Time) bool {
-	return status.Managed && !status.Attached && !status.LastActivity.IsZero() && !status.LastActivity.After(cutoff)
+func reapEligible(status SessionStatus, now time.Time) bool {
+	return status.Managed && !status.Attached && status.LeaseExpires > 0 && status.LeaseExpires <= now.Unix()
 }
 
 func parseSessionStatuses(out []byte) []SessionStatus {
@@ -428,19 +504,19 @@ func parseSessionStatuses(out []byte) []SessionStatus {
 		if len(fields) != 4 || ValidateSessionName(fields[0]) != nil {
 			continue
 		}
-		activity, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil || activity <= 0 {
-			continue
-		}
-		attached, err := strconv.Atoi(fields[2])
+		attached, err := strconv.Atoi(fields[1])
 		if err != nil || attached < 0 {
 			continue
 		}
+		lease, err := strconv.ParseInt(fields[3], 10, 64)
+		if err != nil {
+			lease = 0
+		}
 		statuses = append(statuses, SessionStatus{
 			Name:         fields[0],
-			LastActivity: time.Unix(activity, 0),
 			Attached:     attached > 0,
-			Managed:      fields[3] == managedSessionOptionValue,
+			Managed:      fields[2] == managedSessionOptionValue,
+			LeaseExpires: lease,
 		})
 	}
 	return statuses
