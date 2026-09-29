@@ -7,7 +7,69 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 )
+
+func TestNewClientUsesSharedVLLMEndpointAndIsolatesOtherEngines(t *testing.T) {
+	original := resolveVLLMEndpoint
+	t.Cleanup(func() { resolveVLLMEndpoint = original })
+
+	resolveVLLMEndpoint = func() (externalengine.Endpoint, bool, error) {
+		return externalengine.Endpoint{Host: "192.0.2.10", Port: 58000}, true, nil
+	}
+	client, err := NewClient("vllm", 58000, "vendor/model")
+	if err != nil {
+		t.Fatalf("NewClient(vllm) error = %v", err)
+	}
+	if client.BaseURL != "http://192.0.2.10:58000" {
+		t.Fatalf("vLLM BaseURL = %q, want resolved override", client.BaseURL)
+	}
+
+	resolveVLLMEndpoint = func() (externalengine.Endpoint, bool, error) {
+		t.Fatal("non-vLLM client must not resolve the vLLM endpoint")
+		return externalengine.Endpoint{}, false, nil
+	}
+	client, err = NewClient("ollama", 11434, "llama3")
+	if err != nil {
+		t.Fatalf("NewClient(ollama) error = %v", err)
+	}
+	if client.BaseURL != "http://localhost:11434" {
+		t.Fatalf("ollama BaseURL = %q, want localhost isolation", client.BaseURL)
+	}
+}
+
+func TestNewClientPreservesUnsetVLLMLocalhostURL(t *testing.T) {
+	original := resolveVLLMEndpoint
+	resolveVLLMEndpoint = func() (externalengine.Endpoint, bool, error) {
+		return externalengine.Endpoint{Host: "localhost", Port: 8201}, true, nil
+	}
+	t.Cleanup(func() { resolveVLLMEndpoint = original })
+
+	client, err := NewClient("vllm", 8201, "model")
+	if err != nil {
+		t.Fatalf("NewClient(vllm) error = %v", err)
+	}
+	if client.BaseURL != "http://localhost:8201" {
+		t.Fatalf("unset vLLM BaseURL = %q, want byte-compatible localhost URL", client.BaseURL)
+	}
+}
+
+func TestNewClientFormatsIPv6VLLMHost(t *testing.T) {
+	original := resolveVLLMEndpoint
+	resolveVLLMEndpoint = func() (externalengine.Endpoint, bool, error) {
+		return externalengine.Endpoint{Host: "2001:db8::10", Port: 58000}, true, nil
+	}
+	t.Cleanup(func() { resolveVLLMEndpoint = original })
+
+	client, err := NewClient("vllm", 58000, "model")
+	if err != nil {
+		t.Fatalf("NewClient(vllm) error = %v", err)
+	}
+	if client.BaseURL != "http://[2001:db8::10]:58000" {
+		t.Fatalf("IPv6 vLLM BaseURL = %q", client.BaseURL)
+	}
+}
 
 func TestBuildRequestBody_DefaultsAndFields(t *testing.T) {
 	msgs := []Message{

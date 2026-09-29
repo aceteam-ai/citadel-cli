@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 func TestEndpointValidationAndFormatting(t *testing.T) {
@@ -38,6 +40,19 @@ func TestNonLoopbackRequiresAssignedInterface(t *testing.T) {
 	}
 	if _, err := validateEndpoint(Endpoint{Host: "192.0.2.11", Port: 58000}, true, local); err == nil {
 		t.Fatal("unassigned endpoint accepted")
+	}
+}
+
+func TestConfiguredVLLMEndpointUsesProcessResolvedHostAndPort(t *testing.T) {
+	originalHost, originalPort := services.VLLMHost, services.VLLMHostPort
+	services.VLLMHost, services.VLLMHostPort = "192.0.2.10", 58000
+	t.Cleanup(func() {
+		services.VLLMHost, services.VLLMHostPort = originalHost, originalPort
+	})
+
+	endpoint := configuredVLLMEndpoint()
+	if endpoint.Host != "192.0.2.10" || endpoint.Port != 58000 || endpoint.BaseURL() != "http://192.0.2.10:58000" {
+		t.Fatalf("configured endpoint = %+v (%s), want resolved host and port", endpoint, endpoint.BaseURL())
 	}
 }
 

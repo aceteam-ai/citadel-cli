@@ -4,12 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/engine"
 	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	nativesvc "github.com/aceteam-ai/citadel-cli/internal/services"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // idleCapableEngines lists the serving engines for which idle detection has a
@@ -379,7 +379,7 @@ func enginePortIfRunning(running map[string]bool, name string) (port int, isRunn
 			}
 			return c.Endpoint.Port, true
 		}
-		if !running[name] && os.Getenv("CITADEL_VLLM_HOST") != "" {
+		if !running[name] && services.VLLMHostConfigured {
 			if endpoint, enabled, err := externalengine.VLLMEndpoint(); err == nil && enabled {
 				if _, serving := OpenAICompatServing(context.Background(), "vllm", endpoint.Port); serving {
 					return endpoint.Port, true

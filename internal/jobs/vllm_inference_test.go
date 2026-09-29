@@ -3,9 +3,10 @@ package jobs
 
 import (
 	"encoding/json"
-	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -18,7 +19,7 @@ import (
 // reachable host port on any published-port setup.
 func TestVLLMInferenceBaseURLUsesRegistryPort(t *testing.T) {
 	got := vllmInferenceBaseURL()
-	want := fmt.Sprintf("http://localhost:%d", services.VLLMHostPort)
+	want := "http://" + net.JoinHostPort(services.VLLMHost, strconv.Itoa(services.VLLMHostPort))
 	if got != want {
 		t.Fatalf("vllmInferenceBaseURL() = %q, want %q", got, want)
 	}

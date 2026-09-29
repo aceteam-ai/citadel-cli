@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -88,6 +90,7 @@ const modelNameLabel = "model_name"
 // concurrent use; the Collector calls it from a single goroutine.
 type engineScraper struct {
 	engine  string
+	host    string
 	port    int
 	dialect engineDialect
 	client  *http.Client
@@ -117,9 +120,10 @@ type histSnapshot struct {
 	has     bool
 }
 
-func newEngineScraper(engine string, port int, timeout time.Duration) *engineScraper {
+func newEngineScraper(engine, host string, port int, timeout time.Duration) *engineScraper {
 	return &engineScraper{
 		engine:  engine,
+		host:    host,
 		port:    port,
 		dialect: dialects[engine],
 		client:  &http.Client{Timeout: timeout},
@@ -209,9 +213,11 @@ func (s *engineScraper) Observe(ctx context.Context) *InferenceStat {
 	return stat
 }
 
-// fetch GETs the engine's /metrics endpoint on loopback and parses it.
+// fetch GETs the engine's /metrics endpoint and parses it. vLLM may use a
+// validated non-loopback address assigned to this node; other engines remain
+// loopback-only through DefaultEngineTargets.
 func (s *engineScraper) fetch(ctx context.Context) ([]promSample, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", s.port)
+	url := "http://" + net.JoinHostPort(s.host, strconv.Itoa(s.port)) + "/metrics"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

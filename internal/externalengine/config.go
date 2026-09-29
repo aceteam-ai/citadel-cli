@@ -310,17 +310,11 @@ func VLLMEndpoint() (Endpoint, bool, error) {
 		}
 		return c.Endpoint, true, nil
 	}
-	host := os.Getenv("CITADEL_VLLM_HOST")
-	if host == "" {
-		// Preserve the legacy URL spelling and dual-stack resolver behavior when
-		// no explicit host is configured.
-		return Endpoint{Host: "localhost", Port: services.VLLMHostPort}, true, nil
-	}
-	endpoint, err := ValidateEndpoint(Endpoint{Host: host, Port: services.VLLMHostPort}, true)
-	if err != nil {
-		return Endpoint{}, false, err
-	}
-	return endpoint, true, nil
+	return configuredVLLMEndpoint(), true, nil
+}
+
+func configuredVLLMEndpoint() Endpoint {
+	return Endpoint{Host: services.VLLMHost, Port: services.VLLMHostPort}
 }
 
 func VLLMBaseURL() string {

@@ -5,6 +5,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	svcports "github.com/aceteam-ai/citadel-cli/services"
 )
 
 // listenOnFreePort opens a real listener and returns its port. The tests use a
@@ -26,12 +28,12 @@ func listenOnFreePort(t *testing.T) (port int, closeFn func()) {
 // returns true.
 func TestPortAnswersDistinguishesLiveFromDeadPort(t *testing.T) {
 	port, closeFn := listenOnFreePort(t)
-	if !portAnswers(port, time.Second) {
+	if !portAnswers("ollama", port, time.Second) {
 		t.Fatalf("expected port %d to answer while a listener is open", port)
 	}
 
 	closeFn()
-	if portAnswers(port, 250*time.Millisecond) {
+	if portAnswers("ollama", port, 250*time.Millisecond) {
 		t.Errorf("expected port %d NOT to answer after the listener closed", port)
 	}
 }
@@ -40,11 +42,26 @@ func TestPortAnswersDistinguishesLiveFromDeadPort(t *testing.T) {
 // no configured port. Returning true there would reinstate the bug for any
 // future engine added to NativeServices without a port.
 func TestPortAnswersRejectsUnsetPort(t *testing.T) {
-	if portAnswers(0, time.Second) {
+	if portAnswers("ollama", 0, time.Second) {
 		t.Error("port 0 must never be reported as answering")
 	}
-	if portAnswers(-1, time.Second) {
+	if portAnswers("ollama", -1, time.Second) {
 		t.Error("a negative port must never be reported as answering")
+	}
+}
+
+func TestServiceDialHostUsesVLLMOverrideOnlyForVLLM(t *testing.T) {
+	original := svcports.VLLMHost
+	svcports.VLLMHost = "192.0.2.10"
+	t.Cleanup(func() { svcports.VLLMHost = original })
+
+	if got := serviceDialHost("vllm"); got != "192.0.2.10" {
+		t.Fatalf("vLLM dial host = %q, want resolved override", got)
+	}
+	for _, serviceName := range []string{"ollama", "llamacpp", "bonsai", ""} {
+		if got := serviceDialHost(serviceName); got != "127.0.0.1" {
+			t.Errorf("%s dial host = %q, want loopback", serviceName, got)
+		}
 	}
 }
 

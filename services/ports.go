@@ -23,6 +23,8 @@ package services
 
 import (
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strconv"
 )
@@ -31,6 +33,10 @@ import (
 // exported constants so consumers (Go code that reaches these services) and the
 // compose templates share one spelling.
 const (
+	// EnvVLLMHost carries the local host address of an externally managed vLLM
+	// endpoint. Unlike the compose bind address, this is a dial target for the
+	// citadel process itself.
+	EnvVLLMHost           = "CITADEL_VLLM_HOST"
 	EnvLlamacppHostPort   = "CITADEL_LLAMACPP_HOST_PORT"
 	EnvVLLMHostPort       = "CITADEL_VLLM_HOST_PORT"
 	EnvExtractionHostPort = "CITADEL_EXTRACTION_HOST_PORT"
@@ -216,6 +222,61 @@ const (
 // It stays 8201 (its long-standing 8200-block slot) so an unset node behaves
 // byte-identically to before this became env-resolvable.
 const defaultVLLMHostPort = 8201
+
+// defaultVLLMHost is the vLLM dial host when CITADEL_VLLM_HOST is unset or
+// invalid. Keep the literal "localhost": existing endpoint builders emitted
+// that exact spelling and relied on the platform resolver's IPv4/IPv6 behavior
+// before the host became configurable (citadel-cli#1167).
+const defaultVLLMHost = "localhost"
+
+// VLLMHost is the effective, process-level vLLM dial host. Only localhost or a
+// canonical IP literal assigned to this node is accepted. Invalid, remote,
+// wildcard, multicast, and link-local values fail closed to loopback.
+//
+// VLLMHostConfigured reports whether a non-empty environment override passed
+// validation. Callers use it to distinguish the explicit external-engine
+// adoption path from the default managed-engine path without re-reading the
+// environment after process initialization.
+var VLLMHost, VLLMHostConfigured = resolveVLLMHost()
+
+func resolveVLLMHost() (string, bool) {
+	return resolveVLLMHostValue(os.Getenv(EnvVLLMHost), net.InterfaceAddrs)
+}
+
+// resolveVLLMHostValue is the injectable core used by tests. A non-loopback
+// address must be present on a local interface so this host-only escape hatch
+// cannot turn citadel's unauthenticated local engine client into an arbitrary
+// network client.
+func resolveVLLMHostValue(value string, localAddrs func() ([]net.Addr, error)) (string, bool) {
+	if value == "" {
+		return defaultVLLMHost, false
+	}
+	if value == "localhost" {
+		return defaultVLLMHost, true
+	}
+
+	addr, err := netip.ParseAddr(value)
+	if err != nil || addr.Zone() != "" || addr.String() != value || addr.Is4In6() ||
+		addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() || (!addr.IsLoopback() && !addr.IsGlobalUnicast()) {
+		return defaultVLLMHost, false
+	}
+	if addr.IsLoopback() {
+		return value, true
+	}
+
+	ifaces, err := localAddrs()
+	if err != nil {
+		return defaultVLLMHost, false
+	}
+	for _, iface := range ifaces {
+		prefix, err := netip.ParsePrefix(iface.String())
+		if err == nil && prefix.Addr().Unmap() == addr {
+			return value, true
+		}
+	}
+	return defaultVLLMHost, false
+}
 
 // VLLMHostPort is the effective vLLM host port. It is the ONE 8200-block port
 // that is a var rather than a const, because some nodes serve vLLM on a

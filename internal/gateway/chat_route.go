@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 )
 
 // chat_route.go implements the node-side of served-engine chat routing
@@ -44,6 +46,17 @@ import (
 // this only caps the peek so a hostile/buggy client cannot make the router hold
 // an unbounded body in memory.
 const maxChatProbeBody = 8 << 20 // 8 MiB
+
+var resolveVLLMEndpoint = externalengine.VLLMEndpoint
+
+func chatUpstreamHost(engine string) string {
+	if engine == "vllm" {
+		if endpoint, enabled, err := resolveVLLMEndpoint(); err == nil && enabled {
+			return endpoint.Host
+		}
+	}
+	return "127.0.0.1"
+}
 
 // ChatUpstream is one local serving engine on THIS node that can answer
 // OpenAI-compatible chat/completions, plus the model(s) it currently serves.
@@ -234,9 +247,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 
-	// Dial the engine on the loopback host port. 127.0.0.1 (not "localhost") to
-	// dodge an IPv6-first (::1) resolution against an IPv4-only engine bind.
-	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
+	// Every engine stays loopback-only except vLLM, whose validated host may be
+	// a non-loopback address assigned to this node for a vendor-managed server.
+	host := chatUpstreamHost(engine)
+	target := &url.URL{Scheme: "http", Host: net.JoinHostPort(host, strconv.Itoa(port))}
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme

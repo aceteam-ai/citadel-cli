@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 )
 
 func TestCollectorOmitsEmptyArrays(t *testing.T) {
@@ -78,6 +80,12 @@ func TestCollectorSurvivesPanickingSource(t *testing.T) {
 }
 
 func TestDefaultEngineTargets(t *testing.T) {
+	original := resolveVLLMEndpoint
+	resolveVLLMEndpoint = func() (externalengine.Endpoint, bool, error) {
+		return externalengine.Endpoint{Host: "192.0.2.10", Port: 58000}, true, nil
+	}
+	t.Cleanup(func() { resolveVLLMEndpoint = original })
+
 	targets := DefaultEngineTargets()
 	if len(targets) != 2 {
 		t.Fatalf("expected vllm + sglang, got %+v", targets)
@@ -92,6 +100,19 @@ func TestDefaultEngineTargets(t *testing.T) {
 		}
 		if _, ok := dialects[tgt.Engine]; !ok {
 			t.Errorf("%s has no metrics dialect", tgt.Engine)
+		}
+		switch tgt.Engine {
+		case "vllm":
+			if tgt.Host != "192.0.2.10" {
+				t.Errorf("vLLM host = %q, want shared endpoint override", tgt.Host)
+			}
+			if tgt.Port != 58000 {
+				t.Errorf("vLLM port = %d, want shared endpoint override", tgt.Port)
+			}
+		case "sglang":
+			if tgt.Host != "127.0.0.1" {
+				t.Errorf("SGLang host = %q, want loopback isolation", tgt.Host)
+			}
 		}
 	}
 }

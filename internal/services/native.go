@@ -213,18 +213,27 @@ func StartNativeService(serviceName string, logDir string) (*NativeProcess, erro
 // as not serving.
 const nativeProbeTimeout = 1500 * time.Millisecond
 
+func serviceDialHost(serviceName string) string {
+	if serviceName == "vllm" {
+		return svcports.VLLMHost
+	}
+	return "127.0.0.1"
+}
+
 // portAnswers reports whether something accepts a TCP connection on the given
-// loopback port within timeout.
+// service port within timeout. vLLM may use a validated, node-local non-loopback
+// host; every other native service retains the loopback-only behavior.
 //
 // net.DialTimeout rather than shelling out to `nc`: nc is absent on minimal
 // images (slim containers, LXC templates), where exec would fail on every
 // attempt and the probe would report "never ready" for a perfectly healthy
 // engine. This has no external dependency.
-func portAnswers(port int, timeout time.Duration) bool {
+func portAnswers(serviceName string, port int, timeout time.Duration) bool {
 	if port <= 0 {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), timeout)
+	host := serviceDialHost(serviceName)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
 	if err != nil {
 		return false
 	}
@@ -274,7 +283,7 @@ func IsNativeServiceServing(serviceName string) bool {
 	if !ok {
 		return false
 	}
-	return portAnswers(service.Port, nativeProbeTimeout)
+	return portAnswers(serviceName, service.Port, nativeProbeTimeout)
 }
 
 // StopNativeService lives in native_stop.go: it targets the PID recorded at
@@ -300,7 +309,7 @@ func WaitForServiceReady(serviceName string, timeout time.Duration) error {
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for service %s to be ready on port %d", serviceName, service.Port)
 		default:
-			if portAnswers(service.Port, nativeProbeTimeout) {
+			if portAnswers(serviceName, service.Port, nativeProbeTimeout) {
 				return nil
 			}
 			time.Sleep(500 * time.Millisecond)
