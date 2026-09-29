@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -96,6 +97,9 @@ func TestSynthesizeSpeech_Success(t *testing.T) {
 	}
 	if res["format"] != "opus" {
 		t.Errorf("result format = %v, want opus", res["format"])
+	}
+	if _, present := res["words"]; present {
+		t.Fatalf("default response added opt-in words: %#v", res["words"])
 	}
 	// The base64 content must decode back to the exact audio bytes.
 	content, _ := res["content"].(string)
@@ -343,6 +347,189 @@ func TestSynthesizeSpeech_SpeedAndInstructionsForwarded(t *testing.T) {
 	}
 	if gotBody["instructions"] != "warm, gentle, slightly slower pace" {
 		t.Errorf("forwarded instructions = %v", gotBody["instructions"])
+	}
+}
+
+func TestSynthesizeSpeech_CaptionedOptIn(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+		case "/info":
+			_, _ = w.Write([]byte(`{"model_license":"Apache-2.0"}`))
+		case "/v1/audio/speech/captioned":
+			gotPath = r.URL.Path
+			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+				t.Errorf("decode captioned request: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"audio_base64":"YXVkaW8=","words":[{"word":"hello","start":0.1,"end":0.5}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"kokoro": srv.URL}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID: "captioned", Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hello", "speed": "1.5", "word_timestamps": "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/audio/speech/captioned" {
+		t.Fatalf("captioned request path = %q, want /v1/audio/speech/captioned", gotPath)
+	}
+	if gotBody["speed"] != 1.5 {
+		t.Fatalf("captioned request speed = %#v, want 1.5", gotBody["speed"])
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["content"] != "YXVkaW8=" {
+		t.Fatalf("captioned content = %#v, want exact encoded audio", result["content"])
+	}
+	words, ok := result["words"].([]any)
+	if !ok {
+		t.Fatalf("captioned words type = %T, want []any", result["words"])
+	}
+	if len(words) != 1 {
+		t.Fatalf("captioned words count = %d, want 1", len(words))
+	}
+	word, ok := words[0].(map[string]any)
+	if !ok {
+		t.Fatalf("captioned word type = %T, want map[string]any", words[0])
+	}
+	if got, ok := word["word"].(string); !ok || got != "hello" {
+		t.Fatalf("captioned word = %#v, want string hello", word["word"])
+	}
+	if got, ok := word["start"].(float64); !ok || got != 0.1 {
+		t.Fatalf("captioned start = %#v, want float64(0.1)", word["start"])
+	}
+	if got, ok := word["end"].(float64); !ok || got != 0.5 {
+		t.Fatalf("captioned end = %#v, want float64(0.5)", word["end"])
+	}
+}
+
+func TestSynthesizeSpeech_WordTimestampsFalsePreservesRawContract(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte("raw-audio"))
+	}))
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"kokoro": srv.URL}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID: "captioned-false", Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hello", "word_timestamps": "false"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/audio/speech" {
+		t.Fatalf("word_timestamps=false path = %q, want raw speech path", gotPath)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := result["words"]; present {
+		t.Fatalf("word_timestamps=false added words to raw envelope: %#v", result["words"])
+	}
+}
+
+func TestSynthesizeSpeech_CaptionedNon200PreservesServiceError(t *testing.T) {
+	const response = `{"detail":"no alignable spoken words"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(response))
+	}))
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"kokoro": srv.URL}}
+	body, err := h.Execute(JobContext{}, &nexus.Job{
+		ID: "captioned-no-words", Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "...", "word_timestamps": "true"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "422 Unprocessable Entity") {
+		t.Fatalf("captioned 422 error = %v, want explicit non-200 status", err)
+	}
+	if string(body) != response {
+		t.Fatalf("captioned 422 body = %q, want %q", body, response)
+	}
+}
+
+func TestSynthesizeSpeech_CaptionedUnsupportedServiceFailsClearly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"kokoro": srv.URL}}
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID: "old-service", Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hello", "word_timestamps": "true"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support word timestamps") {
+		t.Fatalf("expected upgrade hint, got %v", err)
+	}
+}
+
+func TestSynthesizeSpeech_CaptionedRejectsMalformedWords(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"wrong timestamp type", `{"audio_base64":"YXVkaW8=","words":[{"word":"hello","start":"zero","end":0.5}]}`},
+		{"missing timestamp", `{"audio_base64":"YXVkaW8=","words":[{"word":"hello","start":0.1}]}`},
+		{"empty word", `{"audio_base64":"YXVkaW8=","words":[{"word":" ","start":0.1,"end":0.5}]}`},
+		{"negative timestamp", `{"audio_base64":"YXVkaW8=","words":[{"word":"hello","start":-0.1,"end":0.5}]}`},
+		{"reversed interval", `{"audio_base64":"YXVkaW8=","words":[{"word":"hello","start":0.5,"end":0.1}]}`},
+		{"overlapping intervals", `{"audio_base64":"YXVkaW8=","words":[{"word":"hello","start":0.1,"end":0.5},{"word":"world","start":0.4,"end":0.8}]}`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"kokoro": srv.URL}}
+			body, err := h.Execute(JobContext{}, &nexus.Job{
+				ID: "malformed-captioned", Type: "SYNTHESIZE_SPEECH",
+				Payload: map[string]string{"text": "hello", "word_timestamps": "true"},
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid captioned speech response") {
+				t.Fatalf("malformed captioned response error = %v", err)
+			}
+			if body != nil {
+				t.Fatalf("malformed captioned response returned body %q", body)
+			}
+		})
 	}
 }
 
