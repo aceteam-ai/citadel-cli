@@ -7,9 +7,8 @@
 // builtin, write outputs under the node workspace, hash inputs/outputs, and sign
 // the AEP receipt with the node key. Same seam shape as liveAppOps / liveExposeOps.
 //
-// The builtin registry ships EMPTY with an exported RegisterBuiltinTemplateRunner
-// seam. The first real builtins (audio-mix, papercraft-render) are S3
-// (aceteam#10286), registered from their own files, not here.
+// Production builtins register through the exported
+// RegisterBuiltinTemplateRunner seam from their own files, not here.
 package cmd
 
 import (
@@ -49,8 +48,7 @@ var (
 
 // RegisterBuiltinTemplateRunner registers a compiled-in builtin under the name a
 // template's runner.handler references. Real builtins (audio-mix,
-// papercraft-render) register themselves from their own files (S3); the registry
-// is intentionally empty in this slice.
+// papercraft-render) register themselves from their own files.
 func RegisterBuiltinTemplateRunner(name string, fn BuiltinTemplateRunner) {
 	builtinTemplateRunnersMu.Lock()
 	defer builtinTemplateRunnersMu.Unlock()

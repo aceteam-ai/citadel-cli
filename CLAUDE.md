@@ -1360,6 +1360,30 @@ what `bufferedChatCompletions`/`streamChatCompletions` return as
 for that consumer today. `streamChatCompletions`' `toolCallAccumulator` merges
 the engine's own incremental deltas into one final array before returning it.
 
+### Approved job-template builtins (`RUN_JOB_TEMPLATE`, citadel-cli#1161)
+
+`cmd/run_job_template_ops.go` remains the workspace/hash/receipt adapter;
+`cmd/template_builtin_papercraft.go` and `template_builtin_audio_mix.go` are the
+only production registry entries. Both invoke fixed argv directly, never a
+shell. `papercraft-render` shares Chromium discovery with
+`platform.FindChromium` and the persistent request/response CDP transport in
+`internal/cobrowsestream`; it blocks network schemes before local-file
+navigation and disables non-proxied WebRTC UDP, captures the Paper Trail 10 fps
+animation states, and pipes them to a 30 fps ffmpeg encode for both required
+stages. Browser cancellation must terminate and wait for the process tree before
+profile removal; cleanup failure is a run failure. `audio-mix` is the portable
+ffmpeg `amix` plus two-pass -14 LUFS bridge; Paper Trail's numpy procedural
+synthesis is deliberately not copied here. The exact input, param, and output
+contract is in [docs/run-job-template-contract.md](docs/run-job-template-contract.md).
+
+The schema gate is not the builtin decoder. `walkClosedSchema` requires an
+explicit type at every `properties`/`items` binding site, while each builtin
+separately uses `decodeBuiltinParams` for exact-key decoding. Preserve both
+layers: Go struct decoding is
+case-insensitive, so replacing the builtin decoder with `json.Unmarshal` into a
+struct reopens the alternate-case bind hole even if today's approved schemas are
+closed.
+
 ## Important Implementation Notes
 
 ### Manifest Loading

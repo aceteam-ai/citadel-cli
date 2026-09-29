@@ -39,7 +39,7 @@ func verifiedTemplateRequest(t *testing.T, req worker.TemplateRunRequest) worker
 }
 
 // registerTestBuiltin registers a builtin for the duration of a test and removes
-// it afterward, so the global registry stays empty for other tests.
+// only that test entry afterward, preserving the production registry.
 func registerTestBuiltin(t *testing.T, name string, fn BuiltinTemplateRunner) {
 	t.Helper()
 	RegisterBuiltinTemplateRunner(name, fn)

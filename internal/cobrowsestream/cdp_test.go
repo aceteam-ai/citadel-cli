@@ -1,6 +1,7 @@
 package cobrowsestream
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -111,7 +112,34 @@ func (f *fakeChrome) serve(conn *websocket.Conn) {
 			f.mu.Lock()
 			f.keys = append(f.keys, msg.Params)
 			f.mu.Unlock()
+		case "Runtime.evaluate":
+			_ = conn.WriteJSON(map[string]any{
+				"id":     msg.ID,
+				"result": map[string]any{"result": map[string]any{"value": 12.5}},
+			})
 		}
+	}
+}
+
+func TestExportedCDPClientWaitsForMatchingResponse(t *testing.T) {
+	f := newFakeChrome()
+	defer f.close()
+	withFakeCDP(t, f)
+
+	c, err := DialCDP(9222)
+	if err != nil {
+		t.Fatalf("DialCDP: %v", err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	res, err := c.Command(ctx, "Runtime.evaluate", map[string]any{"expression": "window.DUR"})
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	inner, _ := res["result"].(map[string]any)
+	if got, _ := inner["value"].(float64); got != 12.5 {
+		t.Fatalf("value = %v, want 12.5 (full response %v)", got, res)
 	}
 }
 

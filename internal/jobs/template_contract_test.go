@@ -34,7 +34,7 @@ func TestTemplateRunnerClosedVocabulary(t *testing.T) {
 }
 
 func TestTemplateSchemaLocalReferences(t *testing.T) {
-	schema := json.RawMessage(`{"type":"object","additionalProperties":false,"$defs":{"gain":{"type":"number","maximum":2}},"properties":{"gain":{"$ref":"#/$defs/gain"}},"required":["gain"]}`)
+	schema := json.RawMessage(`{"type":"object","additionalProperties":false,"$defs":{"gain":{"type":"number","maximum":2}},"properties":{"gain":{"type":"number","$ref":"#/$defs/gain"}},"required":["gain"]}`)
 	if err := ValidateTemplateParams(json.RawMessage(`{"gain":1}`), schema, json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -104,10 +104,10 @@ func TestTemplateSchemaUsesHashedNumericSemantics(t *testing.T) {
 		schema, params string
 		accept         bool
 	}{
-		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"maximum":1e-400}}}`, `{"gain":1e-300}`, false},
-		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"minimum":1e-400}}}`, `{"gain":0}`, true},
-		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"maximum":9007199254740993.0}}}`, `{"gain":9007199254740993}`, false},
-		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"const":0.0}}}`, `{"gain":1e-400}`, true},
+		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"type":"number","maximum":1e-400}}}`, `{"gain":1e-300}`, false},
+		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"type":"number","minimum":1e-400}}}`, `{"gain":0}`, true},
+		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"type":"number","maximum":9007199254740993.0}}}`, `{"gain":9007199254740993}`, false},
+		{`{"type":"object","additionalProperties":false,"properties":{"gain":{"type":"number","const":0.0}}}`, `{"gain":1e-400}`, true},
 	} {
 		err := ValidateTemplateParams(json.RawMessage(tc.params), json.RawMessage(tc.schema), json.RawMessage(`{}`))
 		if (err == nil) != tc.accept {
@@ -164,9 +164,15 @@ func TestClosedInputSchemaGate(t *testing.T) {
 		{"open_root", `{"type":"object","properties":{"fps":{"type":"integer"}}}`, `{"fps":30}`, "additionalProperties"},
 		{"open_nested_object", `{"type":"object","additionalProperties":false,"properties":{"video":{"type":"object","properties":{"fps":{"type":"integer"}}}}}`, `{"video":{"fps":30}}`, "additionalProperties"},
 		{"schema_valued_additionalProperties", `{"type":"object","additionalProperties":{"type":"string"}}`, `{}`, "exactly false"},
-		{"external_ref", `{"type":"object","additionalProperties":false,"properties":{"x":{"$ref":"https://evil.example/s.json"}}}`, `{}`, "$defs"},
-		{"deep_ref", `{"type":"object","additionalProperties":false,"$defs":{"a":{"type":"object","additionalProperties":false,"properties":{"b":{"type":"integer"}}}},"properties":{"x":{"$ref":"#/$defs/a/properties/b"}}}`, `{}`, "single $defs entry"},
+		{"external_ref", `{"type":"object","additionalProperties":false,"properties":{"x":{"type":"string","$ref":"https://evil.example/s.json"}}}`, `{}`, "$defs"},
+		{"deep_ref", `{"type":"object","additionalProperties":false,"$defs":{"a":{"type":"object","additionalProperties":false,"properties":{"b":{"type":"integer"}}}},"properties":{"x":{"type":"integer","$ref":"#/$defs/a/properties/b"}}}`, `{}`, "single $defs entry"},
 		{"tuple_items", `{"type":"object","additionalProperties":false,"properties":{"xs":{"type":"array","items":[{"type":"string"}]}}}`, `{}`, "single schema object"},
+		{"untyped_property", `{"type":"object","additionalProperties":false,"properties":{"video":{"description":"unconstrained"}}}`, `{}`, "explicit type"},
+		{"empty_property", `{"type":"object","additionalProperties":false,"properties":{"video":{}}}`, `{}`, "explicit type"},
+		{"boolean_property", `{"type":"object","additionalProperties":false,"properties":{"video":true}}`, `{}`, "explicit type"},
+		{"ref_only_property", `{"type":"object","additionalProperties":false,"$defs":{"gain":{"type":"number"}},"properties":{"gain":{"$ref":"#/$defs/gain"}}}`, `{}`, "explicit type"},
+		{"untyped_items", `{"type":"object","additionalProperties":false,"properties":{"xs":{"type":"array","items":{"description":"unconstrained"}}}}`, `{}`, "explicit type"},
+		{"boolean_items", `{"type":"object","additionalProperties":false,"properties":{"xs":{"type":"array","items":true}}}`, `{}`, "explicit type"},
 		{"case_fold_ascii", `{"type":"object","additionalProperties":false,"properties":{"fps":{"type":"integer"},"Fps":{"type":"integer"}}}`, `{}`, "collide under case-fold"},
 		// Long-s (U+017F) folds with "s" under encoding/json's fold but NOT under
 		// strings.ToLower -- proves jsonFoldKey uses the Go fold.
@@ -197,7 +203,7 @@ func TestClosedInputSchemaGate(t *testing.T) {
 	if err := ValidateTemplateParams(json.RawMessage(`{"fps":30}`), json.RawMessage(closed), json.RawMessage(`{"type":"object","properties":{"mix":{"type":"string"}}}`)); err != nil {
 		t.Fatalf("closed schema rejected valid params / open output_schema: %v", err)
 	}
-	okRef := `{"type":"object","additionalProperties":false,"$defs":{"gain":{"type":"number","maximum":2}},"properties":{"gain":{"$ref":"#/$defs/gain"}}}`
+	okRef := `{"type":"object","additionalProperties":false,"$defs":{"gain":{"type":"number","maximum":2}},"properties":{"gain":{"type":"number","$ref":"#/$defs/gain"}}}`
 	if err := ValidateTemplateParams(json.RawMessage(`{"gain":1}`), json.RawMessage(okRef), json.RawMessage(`{}`)); err != nil {
 		t.Fatalf("closed schema with a local $defs ref rejected: %v", err)
 	}

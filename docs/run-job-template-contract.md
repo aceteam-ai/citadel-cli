@@ -5,7 +5,8 @@ The dispatcher is `python-backend/routes/aceteam_mcp_code.py::dispatch_run_job_t
 and `RunNodeJobNode.run` forwards the registered schemas and file metadata.
 Platform main already supplies both schema fields (aceteam#10445); no coordinator
 schema change is needed for citadel-cli#1160. This is the node framework for
-citadel-cli#1149 / aceteam#10427. The compiled-in builtin registry remains empty.
+citadel-cli#1149 / aceteam#10427. The compiled-in registry currently exposes
+`papercraft-render` and `audio-mix`.
 
 The platform sends string-valued payload fields:
 
@@ -31,12 +32,16 @@ Reordering a runner cannot change the selected builtin under one approved hash.
 Only `kind == "builtin"` is executable. Case aliases and unknown runner fields
 are terminal errors. The handler and live adapter share this validation.
 
-Schemas compile locally (default JSON Schema draft 2020-12, or the supported
-draft named by `$schema`). Internal `$ref` works. External schema resources,
-including filesystem and network URLs, are forbidden. Input params must satisfy
-the approved schema before any ops call or filesystem effects. The output schema
-is compiled for validity and remains part of the approved hash; output artifacts
-follow the fixed result contract below.
+Schemas compile locally with a closed input-schema vocabulary. Every object is
+closed with `additionalProperties: false`; every property and present array item
+schema declares an explicit `type`; and local references are limited to one
+`#/$defs/<name>` segment. `$schema`, external resources,
+unwalked applicators, boolean/empty property schemas, and boolean/empty item
+schemas are forbidden. Input params must satisfy the approved schema before any
+ops call or filesystem effects. Each builtin also decodes exact keys itself, so
+Go's case-insensitive struct binding is not part of the trust boundary. The
+output schema is compiled for validity and remains part of the approved hash;
+output artifacts follow the fixed result contract below.
 Schema compilation and builtin params use the same normalized numbers as the
 Python authority. Underflow or binary64 rounding cannot change schema limits
 or dispatched params through a different spelling with the same manifest hash.
@@ -55,6 +60,43 @@ Empty collections serialize as arrays. Large output bytes do not enter the resul
 The platform turns outputs into `node:<node_id>/<path>` file references and reads
 them lazily. Optional AEP v2 signing uses action `run_job_template`, binds the job,
 manifest hash and ordered output digests, and remains fail-open for signing errors.
+
+## Compiled-in builtins
+
+`papercraft-render` accepts params `{}` or a finite `duration_seconds` in
+`(0, 3600]`. Its inputs include exactly one built Paper Trail player for each
+required stage declaration, `1920x1080` and `1080x1920`, plus the referenced
+asset files and at most one optional audio file. Each player must expose
+`window.READY`, `window.DUR`, and `window.renderFrame(t)`. The runner blocks
+HTTP(S), WebSocket, FTP, and non-proxied WebRTC UDP before navigating to the
+OS-correct local file URL. It captures a PNG whenever the 10 fps render key
+changes, repeats those frames into a 30 fps image pipe, and encodes H.264
+(`libx264`, CRF 17, slow/animation, `yuv420p`) with optional AAC audio. Outputs
+are `landscape.mp4` and
+`portrait.mp4`. Chromium profile/cache/temp files stay inside the run output
+directory and are removed after each format. Cancellation terminates the browser
+process tree and waits before profile removal; cleanup failures fail the run.
+Only a root process on Linux receives Chromium's required `--no-sandbox` switch.
+Runtime dependencies are Chromium or Chrome and ffmpeg.
+
+The matching closed input schema is:
+
+```json
+{"type":"object","additionalProperties":false,"properties":{"duration_seconds":{"type":"number","exclusiveMinimum":0,"maximum":3600}}}
+```
+
+`audio-mix` accepts only `{}` and one to sixteen input stems. It runs ffmpeg
+directly, never through a shell: `amix` with longest-input duration and no
+implicit normalization, followed by a measured two-pass EBU R128 `loudnorm` at
+-14 LUFS integrated, -2 dBTP, and LRA 11. It writes one 48 kHz 24-bit PCM
+`mix.wav`. A silent/non-finite loudness analysis fails explicitly rather than
+claiming a normalized output.
+
+The matching closed input schema is:
+
+```json
+{"type":"object","additionalProperties":false}
+```
 
 Regression tests include the four independent review probes at original head
 `e6375a723be5894e392f98cfb19f52c386aa3a5c`. Run the guard-removal suite with
