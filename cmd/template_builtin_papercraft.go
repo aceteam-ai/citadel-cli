@@ -355,12 +355,13 @@ type chromiumProcessControl interface {
 }
 
 type execChromiumProcess struct {
-	cancel   context.CancelFunc
-	done     chan struct{}
-	stderr   *bytes.Buffer
-	waitErr  error
-	stopOnce sync.Once
-	stopErr  error
+	cancel        context.CancelFunc
+	terminateTree func() error
+	done          chan struct{}
+	stderr        *bytes.Buffer
+	waitErr       error
+	stopOnce      sync.Once
+	stopErr       error
 }
 
 func startChromiumRenderPage(ctx context.Context, html string, width, height int, profileDir string) (papercraftPage, error) {
@@ -435,12 +436,17 @@ func startChromiumProcess(ctx context.Context, binary string, args, env []string
 	cmd.Stderr = stderr
 	cmd.Env = env
 	cmd.WaitDelay = 5 * time.Second
-	configurePapercraftProcessTree(cmd)
+	terminateTree := configurePapercraftProcessTree(cmd)
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return nil, err
 	}
-	process := &execChromiumProcess{cancel: cancel, done: make(chan struct{}), stderr: stderr}
+	process := &execChromiumProcess{
+		cancel:        cancel,
+		terminateTree: terminateTree,
+		done:          make(chan struct{}),
+		stderr:        stderr,
+	}
 	go func() {
 		process.waitErr = cmd.Wait()
 		close(process.done)
@@ -461,12 +467,22 @@ func (p *execChromiumProcess) Diagnostic() string {
 
 func (p *execChromiumProcess) Shutdown() error {
 	p.stopOnce.Do(func() {
+		// Do not rely on exec.Cmd.Cancel alone. os/exec stops watching the
+		// command context after the root process exits, while Chromium helpers
+		// in its process group may still be alive. Explicit termination here is
+		// therefore required even when Done is already closed.
+		terminateErr := p.terminateTree()
 		p.cancel()
 		select {
 		case <-p.done:
 		case <-time.After(10 * time.Second):
-			p.stopErr = fmt.Errorf("%w: timed out waiting for Chromium process tree to exit", errChromiumShutdownIncomplete)
+			p.stopErr = errors.Join(
+				terminateErr,
+				fmt.Errorf("%w: timed out waiting for Chromium process tree to exit", errChromiumShutdownIncomplete),
+			)
+			return
 		}
+		p.stopErr = terminateErr
 	})
 	return p.stopErr
 }

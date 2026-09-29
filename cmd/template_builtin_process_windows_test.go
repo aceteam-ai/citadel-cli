@@ -10,11 +10,14 @@ import (
 
 func TestConfigurePapercraftProcessTreeWindows(t *testing.T) {
 	cmd := exec.Command("unused.exe")
-	configurePapercraftProcessTree(cmd)
+	terminate := configurePapercraftProcessTree(cmd)
 	if cmd.SysProcAttr == nil || cmd.SysProcAttr.CreationFlags&syscall.CREATE_NEW_PROCESS_GROUP == 0 {
 		t.Fatal("Chromium must launch in a dedicated Windows process group")
 	}
 	if cmd.Cancel == nil {
 		t.Fatal("Chromium taskkill tree cancellation is not configured")
+	}
+	if terminate == nil {
+		t.Fatal("Chromium explicit tree termination is not configured")
 	}
 }
