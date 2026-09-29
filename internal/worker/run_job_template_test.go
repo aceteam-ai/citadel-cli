@@ -28,7 +28,7 @@ const (
 	tmplPerNodeQueue   = "jobs:v1:shell:org_test:node:1008"
 	tmplSharedOrgQueue = "jobs:v1:shell:org_test"
 	tmplBuiltinRunner  = `{"kind":"builtin","handler":"audio-mix"}`
-	tmplInSchema       = `{"type":"object","properties":{"gain":{"type":"number"}}}`
+	tmplInSchema       = `{"type":"object","additionalProperties":false,"properties":{"gain":{"type":"number"}}}`
 	tmplOutSchema      = `{"type":"object","properties":{"mix":{"type":"string"}}}`
 	tmplKey            = "audio-mix"
 	tmplVersion        = 2
