@@ -3,13 +3,16 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -32,9 +35,13 @@ const (
 	papercraftMaxDuration = 60 * 60
 	papercraftMaxHTML     = 128 << 20
 	papercraftMaxPNG      = 32 << 20
+	renderJobWallTimeout  = 2 * time.Hour
+	papercraftAssetHost   = "citadel-render.invalid"
 )
 
 var errChromiumShutdownIncomplete = errors.New("Chromium process tree shutdown incomplete")
+
+var renderLimitedCommand = newRenderLimitedCommand
 
 type papercraftFormat struct {
 	name       string
@@ -70,7 +77,7 @@ type papercraftEncoderConfig struct {
 }
 
 type papercraftRenderDeps struct {
-	startPage    func(context.Context, string, int, int, string) (papercraftPage, error)
+	startPage    func(context.Context, string, int, int, string, []string) (papercraftPage, error)
 	startEncoder func(context.Context, papercraftEncoderConfig) (papercraftEncoder, error)
 	removeAll    func(string) error
 }
@@ -86,6 +93,9 @@ func livePapercraftRenderDeps() papercraftRenderDeps {
 }
 
 func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inputs []string, outDir string, deps papercraftRenderDeps) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, renderJobWallTimeout)
+	defer cancel()
+
 	m, err := decodeBuiltinParams(params, "duration_seconds")
 	if err != nil {
 		return nil, err
@@ -114,7 +124,7 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 		if err := os.MkdirAll(profileDir, 0o700); err != nil {
 			return nil, fmt.Errorf("create Chromium profile: %w", err)
 		}
-		page, err := deps.startPage(ctx, format.html, format.width, format.height, profileDir)
+		page, err := deps.startPage(ctx, format.html, format.width, format.height, profileDir, inputs)
 		if err != nil {
 			var cleanupErr error
 			if !errors.Is(err, errChromiumShutdownIncomplete) {
@@ -343,8 +353,9 @@ func finiteFloat(v any) (float64, error) {
 }
 
 type chromiumRenderPage struct {
-	cdp     *cobrowsestream.Client
-	process chromiumProcessControl
+	cdp         *cobrowsestream.Client
+	process     chromiumProcessControl
+	assetServer *http.Server
 }
 
 type chromiumProcessControl interface {
@@ -364,16 +375,21 @@ type execChromiumProcess struct {
 	stopErr       error
 }
 
-func startChromiumRenderPage(ctx context.Context, html string, width, height int, profileDir string) (papercraftPage, error) {
-	chrome, err := platform.FindChromium()
+func startChromiumRenderPage(ctx context.Context, html string, width, height int, profileDir string, inputs []string) (papercraftPage, error) {
+	assetServer, pageURL, proxyURL, err := startPapercraftAssetServer(html, inputs)
 	if err != nil {
 		return nil, err
+	}
+	closeAssetServer := func() error { return assetServer.Shutdown(context.Background()) }
+	chrome, err := platform.FindChromium()
+	if err != nil {
+		return nil, errors.Join(err, closeAssetServer())
 	}
 	port, err := reserveLoopbackPort()
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, closeAssetServer())
 	}
-	args := papercraftChromiumArgs(profileDir, width, height, port, runtime.GOOS, platform.IsRoot())
+	args := papercraftChromiumArgs(profileDir, width, height, port, proxyURL, runtime.GOOS, platform.IsRoot())
 	env := withEnvOverrides(os.Environ(),
 		"HOME="+profileDir,
 		"XDG_CACHE_HOME="+filepath.Join(profileDir, "cache"),
@@ -382,21 +398,21 @@ func startChromiumRenderPage(ctx context.Context, html string, width, height int
 	)
 	process, err := startChromiumProcess(ctx, chrome, args, env)
 	if err != nil {
-		return nil, fmt.Errorf("start Chromium: %w", err)
+		return nil, errors.Join(fmt.Errorf("start Chromium: %w", err), closeAssetServer())
 	}
 	cdp, err := waitForChromiumCDP(ctx, process, func() (*cobrowsestream.Client, error) {
 		return cobrowsestream.DialCDP(port)
 	}, 30*time.Second, 50*time.Millisecond)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, closeAssetServer())
 	}
-	p := &chromiumRenderPage{cdp: cdp, process: process}
+	p := &chromiumRenderPage{cdp: cdp, process: process, assetServer: assetServer}
 	for _, command := range []struct {
 		method string
 		params map[string]any
 	}{
 		{"Network.enable", nil},
-		{"Network.setBlockedURLs", map[string]any{"urls": []string{"http://*", "https://*", "ws://*", "wss://*", "ftp://*"}}},
+		{"Network.setBlockedURLs", map[string]any{"urls": papercraftBlockedURLs()}},
 		{"Page.enable", nil},
 		{"Emulation.setDeviceMetricsOverride", map[string]any{"width": width, "height": height, "deviceScaleFactor": 1, "mobile": false}},
 	} {
@@ -404,12 +420,12 @@ func startChromiumRenderPage(ctx context.Context, html string, width, height int
 			return nil, errors.Join(err, p.Close())
 		}
 	}
-	pageURL, err := papercraftFileURL(html, runtime.GOOS)
+	navigation, err := cdp.Command(ctx, "Page.navigate", map[string]any{"url": pageURL})
 	if err != nil {
 		return nil, errors.Join(err, p.Close())
 	}
-	if _, err := cdp.Command(ctx, "Page.navigate", map[string]any{"url": pageURL}); err != nil {
-		return nil, errors.Join(err, p.Close())
+	if errorText, _ := navigation["errorText"].(string); errorText != "" {
+		return nil, errors.Join(fmt.Errorf("navigate render document: %s", errorText), p.Close())
 	}
 	readyDeadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(readyDeadline) {
@@ -430,7 +446,11 @@ func startChromiumRenderPage(ctx context.Context, html string, width, height int
 
 func startChromiumProcess(ctx context.Context, binary string, args, env []string) (*execChromiumProcess, error) {
 	procCtx, cancel := context.WithCancel(ctx)
-	cmd := exec.CommandContext(procCtx, binary, args...)
+	cmd, err := renderLimitedCommand(procCtx, binary, args...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	stderr := &bytes.Buffer{}
 	cmd.Stdout = io.Discard
 	cmd.Stderr = stderr
@@ -532,12 +552,12 @@ func waitForChromiumCDP(
 	}
 }
 
-func papercraftChromiumArgs(profileDir string, width, height, port int, goos string, elevated bool) []string {
+func papercraftChromiumArgs(profileDir string, width, height, port int, proxyURL, goos string, elevated bool) []string {
 	args := []string{
 		"--headless=new", "--disable-gpu", "--force-color-profile=srgb", "--font-render-hinting=none",
 		"--disable-background-networking", "--disable-component-update", "--disable-sync", "--metrics-recording-only",
 		"--disable-breakpad", "--disable-crash-reporter", "--crash-dumps-dir=" + filepath.Join(profileDir, "crash"),
-		"--host-resolver-rules=MAP * ~NOTFOUND", "--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=<-loopback>",
+		"--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1", "--proxy-server=" + proxyURL, "--proxy-bypass-list=<-loopback>",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--remote-debugging-address=127.0.0.1", fmt.Sprintf("--remote-debugging-port=%d", port),
 		"--user-data-dir=" + profileDir, "--disk-cache-dir=" + filepath.Join(profileDir, "cache"),
@@ -552,6 +572,125 @@ func papercraftChromiumArgs(profileDir string, width, height, port int, goos str
 		args = append([]string{"--no-sandbox"}, args...)
 	}
 	return args
+}
+
+func papercraftBlockedURLs() []string {
+	return []string{"file://*", "ws://*", "wss://*", "ftp://*"}
+}
+
+// startPapercraftAssetServer serves the render document and its relative assets
+// through an unguessable route on a loopback-only, non-forwarding HTTP proxy.
+// Chromium can therefore block file:// before navigation without breaking
+// legitimate sibling CSS, JavaScript, fonts, and images. The handler resolves
+// every path and refuses undeclared inputs and symlink escapes.
+func startPapercraftAssetServer(html string, inputs []string) (*http.Server, string, string, error) {
+	root, allowed, err := papercraftAssetSet(inputs)
+	if err != nil {
+		return nil, "", "", err
+	}
+	entry, err := filepath.EvalSymlinks(html)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("resolve render HTML: %w", err)
+	}
+	if _, ok := allowed[entry]; !ok {
+		return nil, "", "", fmt.Errorf("render HTML is not a declared input")
+	}
+
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return nil, "", "", fmt.Errorf("generate render asset token: %w", err)
+	}
+	prefix := "/" + hex.EncodeToString(tokenBytes) + "/"
+	handler := papercraftAssetHandler(root, prefix, allowed)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, "", "", fmt.Errorf("listen for render assets: %w", err)
+	}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = server.Serve(listener) }()
+	entryRel, err := filepath.Rel(root, entry)
+	if err != nil {
+		_ = server.Close()
+		return nil, "", "", fmt.Errorf("resolve render HTML path: %w", err)
+	}
+	u := &url.URL{
+		Scheme:   "http",
+		Host:     papercraftAssetHost,
+		Path:     prefix + filepath.ToSlash(entryRel),
+		RawQuery: "render=1",
+	}
+	return server, u.String(), "http://" + listener.Addr().String(), nil
+}
+
+func papercraftAssetSet(inputs []string) (string, map[string]struct{}, error) {
+	if len(inputs) == 0 {
+		return "", nil, fmt.Errorf("render has no declared input assets")
+	}
+	allowed := make(map[string]struct{}, len(inputs))
+	var root string
+	for _, input := range inputs {
+		resolved, err := filepath.EvalSymlinks(input)
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve render asset %q: %w", input, err)
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return "", nil, fmt.Errorf("make render asset %q absolute: %w", input, err)
+		}
+		allowed[resolved] = struct{}{}
+		if root == "" {
+			root = filepath.Dir(resolved)
+			continue
+		}
+		for !pathWithinRoot(root, resolved) {
+			parent := filepath.Dir(root)
+			if parent == root {
+				return "", nil, fmt.Errorf("render inputs do not share a filesystem root")
+			}
+			root = parent
+		}
+	}
+	return root, allowed, nil
+}
+
+func papercraftAssetHandler(root, prefix string, allowed map[string]struct{}) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method != http.MethodGet && r.Method != http.MethodHead) || r.Host != papercraftAssetHost || !strings.HasPrefix(r.URL.Path, prefix) {
+			http.NotFound(w, r)
+			return
+		}
+		rel := strings.TrimPrefix(r.URL.Path, prefix)
+		if rel == "" || filepath.IsAbs(rel) {
+			http.NotFound(w, r)
+			return
+		}
+		candidate, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil || !pathWithinRoot(root, candidate) {
+			http.NotFound(w, r)
+			return
+		}
+		if _, ok := allowed[candidate]; !ok {
+			http.NotFound(w, r)
+			return
+		}
+		f, err := os.Open(candidate)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeContent(w, r, info.Name(), info.ModTime(), f)
+	})
+}
+
+func pathWithinRoot(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 func papercraftFileURL(path, goos string) (string, error) {
@@ -623,10 +762,14 @@ func (p *chromiumRenderPage) Close() error {
 	if p.cdp != nil {
 		p.cdp.Close()
 	}
+	var errs []error
 	if p.process != nil {
-		return p.process.Shutdown()
+		errs = append(errs, p.process.Shutdown())
 	}
-	return nil
+	if p.assetServer != nil {
+		errs = append(errs, p.assetServer.Shutdown(context.Background()))
+	}
+	return errors.Join(errs...)
 }
 
 func reserveLoopbackPort() (int, error) {
@@ -642,10 +785,11 @@ func reserveLoopbackPort() (int, error) {
 }
 
 type ffmpegFrameEncoder struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stderr *bytes.Buffer
-	done   bool
+	cmd           *exec.Cmd
+	stdin         io.WriteCloser
+	stderr        *bytes.Buffer
+	done          bool
+	terminateTree func() error
 }
 
 func startPapercraftFFmpeg(ctx context.Context, cfg papercraftEncoderConfig) (papercraftEncoder, error) {
@@ -654,9 +798,14 @@ func startPapercraftFFmpeg(ctx context.Context, cfg papercraftEncoderConfig) (pa
 		return nil, fmt.Errorf("ffmpeg not found in PATH: install ffmpeg on the render node")
 	}
 	args := papercraftFFmpegArgs(cfg)
-	cmd := exec.CommandContext(ctx, ffmpeg, args...)
+	cmd, err := renderLimitedCommand(ctx, ffmpeg, args...)
+	if err != nil {
+		return nil, err
+	}
 	stderr := &bytes.Buffer{}
 	cmd.Stderr = stderr
+	cmd.WaitDelay = 5 * time.Second
+	terminateTree := configurePapercraftProcessTree(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -665,7 +814,7 @@ func startPapercraftFFmpeg(ctx context.Context, cfg papercraftEncoderConfig) (pa
 		_ = stdin.Close()
 		return nil, err
 	}
-	return &ffmpegFrameEncoder{cmd: cmd, stdin: stdin, stderr: stderr}, nil
+	return &ffmpegFrameEncoder{cmd: cmd, stdin: stdin, stderr: stderr, terminateTree: terminateTree}, nil
 }
 
 func papercraftFFmpegArgs(cfg papercraftEncoderConfig) []string {
@@ -700,7 +849,7 @@ func (e *ffmpegFrameEncoder) Finish() error {
 	}
 	e.done = true
 	if err := e.stdin.Close(); err != nil {
-		_ = e.cmd.Process.Kill()
+		_ = e.terminateTree()
 		_ = e.cmd.Wait()
 		return err
 	}
@@ -716,6 +865,6 @@ func (e *ffmpegFrameEncoder) Abort() {
 	}
 	e.done = true
 	_ = e.stdin.Close()
-	_ = e.cmd.Process.Kill()
+	_ = e.terminateTree()
 	_ = e.cmd.Wait()
 }
