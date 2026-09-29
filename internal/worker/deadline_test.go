@@ -277,6 +277,19 @@ func TestResolveJobTimeout(t *testing.T) {
 		}
 	})
 
+	t.Run("template run uses long fallback while retaining its serialized lane", func(t *testing.T) {
+		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeRunJobTemplate})
+		if !ok || d != defaultLongJobTimeoutSeconds*time.Second {
+			t.Fatalf("got (%s, %v), want (%ds, true)", d, ok, defaultLongJobTimeoutSeconds)
+		}
+		if !needsSerializedLane(JobTypeRunJobTemplate) {
+			t.Fatal("RUN_JOB_TEMPLATE must retain serialized-lane routing")
+		}
+		if _, unbounded := unboundedJobTypes[JobTypeRunJobTemplate]; unbounded {
+			t.Fatal("RUN_JOB_TEMPLATE must not remain in the no-fallback tier")
+		}
+	})
+
 	t.Run("unbounded types get no fallback cap (must not kill model pulls)", func(t *testing.T) {
 		for _, jt := range []string{JobTypeModelCachePull, JobTypeDownloadModel, JobTypeOllamaPull, JobTypeServiceStart, JobTypeAndroidBuild, JobTypeInstanceProvision} {
 			if _, ok := r.resolveJobTimeout(&Job{Type: jt}); ok {

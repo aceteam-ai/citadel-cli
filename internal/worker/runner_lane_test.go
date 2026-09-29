@@ -12,9 +12,9 @@ import (
 // TestGPUBoundJobTypes for the GPU-slot gate, this is the authority for which
 // job types are serialized on the exec-concurrency-1 lane -- read this, not a
 // doc copy. It must be a SUPERSET of unboundedJobTypes (every unbounded job is a
-// manifest writer or ran one-at-a-time on the sequential loop) plus the two
-// manifest/lockfile writers that are deliberately NOT unbounded (they keep their
-// watchdog tier): MODULE_SET and SERVICE_STOP.
+// manifest writer or ran one-at-a-time on the sequential loop) plus the
+// explicitly serialized state/workspace writers that deliberately retain a
+// watchdog tier.
 func TestSerializedLaneJobTypes(t *testing.T) {
 	want := map[string]struct{}{
 		// The unbounded tier (also the watchdog "no fallback deadline" set).
@@ -29,12 +29,13 @@ func TestSerializedLaneJobTypes(t *testing.T) {
 		JobTypeAgentUpdate:       {},
 		JobTypeWhatsAppProvision: {},
 		JobTypeAppDeploy:         {},
-		JobTypeRunJobTemplate:    {},
 		// Manifest/lockfile writers that are NOT unbounded but still must
 		// serialize (they read-modify-write citadel.yaml / modules.lock).
 		JobTypeModuleSet:         {},
 		JobTypeServiceStop:       {},
 		JobTypeApplyDeviceConfig: {},
+		// Per-run workspace writer with a long-tier watchdog fallback.
+		JobTypeRunJobTemplate: {},
 		// Not a manifest writer, but a read-modify-write of the SAME-shaped
 		// shared-state file (cache-index.json, citadel-cli#682 P2a) -- see
 		// serializedLaneJobTypes' doc comment.

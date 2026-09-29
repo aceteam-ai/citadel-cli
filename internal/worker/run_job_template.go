@@ -347,28 +347,24 @@ func tmplFieldVersion(payload map[string]any, key string) (int, error) {
 	return n, nil
 }
 
-// tmplFieldRawJSON returns a payload field as raw JSON, accepting either the wire
-// form (a JSON-encoded string) or an already-decoded map/array (test
-// convenience). A missing, nil, or empty-string value returns ok == false.
+// tmplFieldRawJSON returns a JSON-encoded string from the payload. The live job
+// wire contract is map[string]string; accepting already-decoded maps or arrays
+// here would create a second, test-only payload shape that production never
+// receives. A missing, non-string, nil, or empty-string value returns false.
 func tmplFieldRawJSON(payload map[string]any, key string) (json.RawMessage, bool) {
 	v, ok := payload[key]
 	if !ok || v == nil {
 		return nil, false
 	}
-	switch t := v.(type) {
-	case string:
-		s := strings.TrimSpace(t)
-		if s == "" {
-			return nil, false
-		}
-		return json.RawMessage(s), true
-	default:
-		b, err := json.Marshal(t)
-		if err != nil {
-			return nil, false
-		}
-		return json.RawMessage(b), true
+	s, ok := v.(string)
+	if !ok {
+		return nil, false
 	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	return json.RawMessage(s), true
 }
 
 // normalizeHash lowercases, trims, and strips an optional "sha256:" prefix so a

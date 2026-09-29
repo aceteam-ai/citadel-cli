@@ -29,9 +29,12 @@ func main() {
 		{"params_schema", "internal/jobs/template_contract.go", "if err := schema.Validate(v); err != nil", "if err := schema.Validate(v); false && err != nil", "./internal/worker", "TestRunJobTemplate_InputContractRefusedBeforeOps/wrong_property_type"},
 		{"adapter_validation", "cmd/run_job_template_ops.go", "worker.ValidateTemplateRunRequest(req, o.nodeID)", "jobs.ParseTemplateRunner(req.Runner)", "./cmd", "TestLiveTemplateRunOps_RefusesBeforeEffects/invalid_schema_params"},
 		{"python_numbers", "internal/jobs/template_hash.go", "buf.WriteString(pythonFloat(f))", "buf.WriteString(string(val))", "./internal/jobs", "TestReviewPythonNumberParity"},
-		{"workspace_outputs", "cmd/run_job_template_ops.go", "jobs.ValidatePath(o.workspaceDir, filepath.Join(outDir, rel))", "filepath.Abs(filepath.Join(outDir, rel))", "./cmd", "TestLiveTemplateRunOps_OutputEscapingWorkspaceRejected"},
+		{"per_run_output_root", "cmd/run_job_template_ops.go", "outRoot.Open(rel)", "os.Open(filepath.Join(outRoot.Name(), rel))", "./cmd", "TestLiveTemplateRunOps_OutputSymlinkOutsidePerRunDirectoryRejected"},
 		{"hashed_schema_numbers", "internal/jobs/template_contract.go", "bytes.NewReader(canonical.Bytes())", "bytes.NewReader(field.raw)", "./internal/jobs", "TestTemplateSchemaUsesHashedNumericSemantics"},
 		{"canonical_builtin_params", "cmd/run_job_template_ops.go", "req.Params, err = jobs.NormalizeTemplateParams(req.Params)", "req.Params, err = req.Params, nil", "./cmd", "TestLiveTemplateRunOps_DispatchesCanonicalParams"},
+		{"resolved_workspace_root", "cmd/run_job_template_ops.go", "workspaceDir, err = filepath.EvalSymlinks(workspaceDir)", "workspaceDir, err = workspaceDir, nil", "./cmd", "TestLiveTemplateRunOps_SymlinkWorkspaceRetargetCannotChangeStagedInput"},
+		{"unique_attempt_namespace", "cmd/run_job_template_ops.go", "attempt, err := newTemplateAttemptSegment()", "attempt, err := \"attempt-fixed\", error(nil)", "./cmd", "TestLiveTemplateRunOps_CancelledAttemptCannotOverlapRetryNamespace"},
+		{"cancellable_template_copy", "cmd/run_job_template_ops.go", "if nr > 0 {\n\t\t\tif err := ctx.Err(); err != nil {", "if nr > 0 {\n\t\t\tif err := ctx.Err(); false && err != nil {", "./cmd", "TestCopyTemplateWithContextStopsBetweenChunks"},
 	}
 	for _, m := range mutations {
 		source := filepath.Join(root, m.file)

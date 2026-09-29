@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
@@ -140,4 +142,343 @@ func TestLiveTemplateRunOps_OutputEscapingWorkspaceRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error for an output escaping the workspace, got nil")
 	}
+}
+
+func TestLiveTemplateRunOps_OutputEscapingPerRunDirectoryRejected(t *testing.T) {
+	ws := t.TempDir()
+	registerTestBuiltin(t, "test-sibling-output", func(_ context.Context, _ json.RawMessage, _ []string, outDir string) ([]string, error) {
+		if err := os.WriteFile(filepath.Join(outDir, "..", "sibling.txt"), []byte("not an output"), 0o644); err != nil {
+			return nil, err
+		}
+		return []string{"../sibling.txt"}, nil
+	})
+	_, err := (liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}).Run(context.Background(), verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID:       "job-sibling",
+		TemplateKey: "t",
+		Runner:      json.RawMessage(`{"kind":"builtin","handler":"test-sibling-output"}`),
+	}))
+	if err == nil || !strings.Contains(err.Error(), "per-run output directory") {
+		t.Fatalf("sibling output error = %v, want per-run confinement refusal", err)
+	}
+}
+
+func TestLiveTemplateRunOps_OutputSymlinkOutsidePerRunDirectoryRejected(t *testing.T) {
+	ws := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registerTestBuiltin(t, "test-output-symlink", func(_ context.Context, _ json.RawMessage, _ []string, outDir string) ([]string, error) {
+		if err := os.Symlink(outside, filepath.Join(outDir, "link.txt")); err != nil {
+			return nil, err
+		}
+		return []string{"link.txt"}, nil
+	})
+	_, err := (liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}).Run(context.Background(), verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID:       "job-symlink",
+		TemplateKey: "t",
+		Runner:      json.RawMessage(`{"kind":"builtin","handler":"test-output-symlink"}`),
+	}))
+	if err == nil {
+		t.Fatal("output symlink outside the per-run root was accepted")
+	}
+}
+
+func TestLiveTemplateRunOps_InputHashMatchesStagedBytesBuiltinConsumed(t *testing.T) {
+	ws := t.TempDir()
+	source := filepath.Join(ws, "source.txt")
+	if err := os.WriteFile(source, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var consumed []byte
+	registerTestBuiltin(t, "test-staged-input", func(_ context.Context, _ json.RawMessage, inputs []string, outDir string) ([]string, error) {
+		// Change the original after dispatch. The builtin must still consume the
+		// staged snapshot whose digest is returned in input_hashes.
+		if err := os.WriteFile(source, []byte("after"), 0o644); err != nil {
+			return nil, err
+		}
+		var err error
+		consumed, err = os.ReadFile(inputs[0])
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(outDir, "result.txt"), consumed, 0o644); err != nil {
+			return nil, err
+		}
+		return []string{"result.txt"}, nil
+	})
+	req := verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID:       "job-staged",
+		TemplateKey: "t",
+		Runner:      json.RawMessage(`{"kind":"builtin","handler":"test-staged-input"}`),
+		InputFiles:  json.RawMessage(`[{"path":"source.txt","node_id":"n1","node_path":"source.txt"}]`),
+	})
+	res, err := (liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}).Run(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(consumed) != "before" {
+		t.Fatalf("builtin consumed %q, want staged pre-mutation bytes", consumed)
+	}
+	wantHash := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte("before")))
+	if len(res.InputHashes) != 1 || res.InputHashes[0] != wantHash {
+		t.Fatalf("input hashes = %v, want %q", res.InputHashes, wantHash)
+	}
+	inputDir := filepath.Join(ws, "templates", "t", "job-staged", "inputs")
+	if _, err := os.Stat(inputDir); !os.IsNotExist(err) {
+		t.Fatalf("staged inputs persisted after run: stat error = %v", err)
+	}
+}
+
+func TestLiveTemplateRunOps_RetryStartsWithCleanRunNamespace(t *testing.T) {
+	ws := t.TempDir()
+	invocations := 0
+	var firstOutDir string
+	registerTestBuiltin(t, "test-clean-retry", func(_ context.Context, _ json.RawMessage, _ []string, outDir string) ([]string, error) {
+		invocations++
+		stale := filepath.Join(outDir, "stale.txt")
+		if invocations == 1 {
+			firstOutDir = outDir
+			if err := os.WriteFile(stale, []byte("partial"), 0o644); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("first attempt failed")
+		}
+		if _, err := os.Stat(stale); !os.IsNotExist(err) {
+			return nil, fmt.Errorf("stale output survived retry reset: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(outDir, "fresh.txt"), []byte("fresh"), 0o644); err != nil {
+			return nil, err
+		}
+		return []string{"fresh.txt"}, nil
+	})
+	req := verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID:       "job-retry",
+		TemplateKey: "t",
+		Runner:      json.RawMessage(`{"kind":"builtin","handler":"test-clean-retry"}`),
+	})
+	ops := liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}
+	if _, err := ops.Run(context.Background(), req); err == nil {
+		t.Fatal("first attempt unexpectedly succeeded")
+	}
+	if _, err := os.Stat(filepath.Dir(firstOutDir)); !os.IsNotExist(err) {
+		t.Fatalf("failed attempt namespace persisted: stat error = %v", err)
+	}
+	res, err := ops.Run(context.Background(), req)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if len(res.Outputs) != 1 || !strings.HasSuffix(res.Outputs[0].Path, "/fresh.txt") {
+		t.Fatalf("retry outputs = %+v, want only fresh.txt", res.Outputs)
+	}
+}
+
+func TestLiveTemplateRunOps_SymlinkWorkspaceRetargetCannotChangeStagedInput(t *testing.T) {
+	parent := t.TempDir()
+	workspaceA := filepath.Join(parent, "workspace-a")
+	workspaceB := filepath.Join(parent, "workspace-b")
+	workspaceLink := filepath.Join(parent, "workspace")
+	for _, dir := range []string{workspaceA, workspaceB} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(workspaceA, workspaceLink); err != nil {
+		t.Skipf("symlink workspace unavailable: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspaceA, "source.txt"), []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var consumed []byte
+	registerTestBuiltin(t, "test-retargeted-workspace", func(_ context.Context, _ json.RawMessage, inputs []string, outDir string) ([]string, error) {
+		inputRel, err := templatePathFromTemplates(inputs[0])
+		if err != nil {
+			return nil, err
+		}
+		outRel, err := templatePathFromTemplates(outDir)
+		if err != nil {
+			return nil, err
+		}
+		replacementInput := filepath.Join(workspaceB, inputRel)
+		if err := os.MkdirAll(filepath.Dir(replacementInput), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(replacementInput, []byte("substituted"), 0o644); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(filepath.Join(workspaceB, outRel), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.Remove(workspaceLink); err != nil {
+			return nil, err
+		}
+		if err := os.Symlink(workspaceB, workspaceLink); err != nil {
+			return nil, err
+		}
+		consumed, err = os.ReadFile(inputs[0])
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(outDir, "result.txt"), consumed, 0o644); err != nil {
+			return nil, err
+		}
+		return []string{"result.txt"}, nil
+	})
+
+	res, err := (liveTemplateRunOps{workspaceDir: workspaceLink, nodeID: "n1"}).Run(context.Background(), verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID:       "job-retarget",
+		TemplateKey: "t",
+		Runner:      json.RawMessage(`{"kind":"builtin","handler":"test-retargeted-workspace"}`),
+		InputFiles:  json.RawMessage(`[{"path":"source.txt","node_id":"n1","node_path":"source.txt"}]`),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(consumed) != "original" {
+		t.Fatalf("builtin consumed %q after workspace symlink retarget, want original snapshot", consumed)
+	}
+	wantHash := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte("original")))
+	if len(res.InputHashes) != 1 || res.InputHashes[0] != wantHash {
+		t.Fatalf("input hashes = %v, want %q", res.InputHashes, wantHash)
+	}
+	if len(res.Outputs) != 1 {
+		t.Fatalf("outputs = %+v, want one", res.Outputs)
+	}
+	outputBytes, err := os.ReadFile(filepath.Join(workspaceA, filepath.FromSlash(res.Outputs[0].Path)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(outputBytes) != "original" {
+		t.Fatalf("anchored output = %q, want original", outputBytes)
+	}
+}
+
+func TestLiveTemplateRunOps_CancelledAttemptCannotOverlapRetryNamespace(t *testing.T) {
+	ws := t.TempDir()
+	firstStarted := make(chan string, 1)
+	releaseFirst := make(chan struct{})
+	var invocation atomic.Int32
+	registerTestBuiltin(t, "test-cancelled-attempt", func(_ context.Context, _ json.RawMessage, _ []string, outDir string) ([]string, error) {
+		switch invocation.Add(1) {
+		case 1:
+			if err := os.WriteFile(filepath.Join(outDir, "partial.txt"), []byte("partial"), 0o644); err != nil {
+				return nil, err
+			}
+			firstStarted <- outDir
+			<-releaseFirst
+			return []string{"partial.txt"}, nil
+		case 2:
+			if err := os.WriteFile(filepath.Join(outDir, "fresh.txt"), []byte("fresh"), 0o644); err != nil {
+				return nil, err
+			}
+			return []string{"fresh.txt"}, nil
+		default:
+			return nil, fmt.Errorf("unexpected invocation")
+		}
+	})
+	req := verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID:       "same-job",
+		TemplateKey: "t",
+		Runner:      json.RawMessage(`{"kind":"builtin","handler":"test-cancelled-attempt"}`),
+	})
+	ops := liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := ops.Run(firstCtx, req)
+		firstDone <- err
+	}()
+	firstOutDir := <-firstStarted
+	cancelFirst()
+
+	second, err := ops.Run(context.Background(), req)
+	if err != nil {
+		t.Fatalf("retry while cancelled builtin was still running: %v", err)
+	}
+	if len(second.Outputs) != 1 {
+		t.Fatalf("retry outputs = %+v, want one", second.Outputs)
+	}
+	secondPath := filepath.Join(ws, filepath.FromSlash(second.Outputs[0].Path))
+	if filepath.Dir(secondPath) == firstOutDir {
+		t.Fatal("retry reused the still-running attempt namespace")
+	}
+	close(releaseFirst)
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled attempt error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(filepath.Dir(firstOutDir)); !os.IsNotExist(err) {
+		t.Fatalf("cancelled attempt namespace persisted: stat error = %v", err)
+	}
+	if got, err := os.ReadFile(secondPath); err != nil || string(got) != "fresh" {
+		t.Fatalf("retry output after old cleanup = %q, %v", got, err)
+	}
+}
+
+func TestCopyTemplateWithContextStopsBetweenChunks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	src := cancelAfterFirstRead{cancel: cancel, reader: bytes.NewReader(make([]byte, 256*1024))}
+	var dst bytes.Buffer
+	n, err := copyTemplateWithContext(ctx, &dst, &src)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copy error = %v, want context.Canceled", err)
+	}
+	if n != 0 || dst.Len() != 0 {
+		t.Fatalf("copy wrote %d reported bytes and %d buffered bytes after read cancelled the context", n, dst.Len())
+	}
+}
+
+func TestLiveTemplateRunOps_PartialStagingFailureRemovesAttempt(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "present.txt"), []byte("present"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	registerTestBuiltin(t, "test-partial-staging", func(context.Context, json.RawMessage, []string, string) ([]string, error) {
+		called = true
+		return nil, nil
+	})
+	_, err := (liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}).Run(context.Background(), verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID:       "job-partial",
+		TemplateKey: "t",
+		Runner:      json.RawMessage(`{"kind":"builtin","handler":"test-partial-staging"}`),
+		InputFiles: json.RawMessage(`[
+			{"path":"present.txt","node_id":"n1","node_path":"present.txt"},
+			{"path":"missing.txt","node_id":"n1","node_path":"missing.txt"}
+		]`),
+	}))
+	if err == nil {
+		t.Fatal("partial staging unexpectedly succeeded")
+	}
+	if called {
+		t.Fatal("builtin ran after partial staging failure")
+	}
+	jobDir := filepath.Join(ws, "templates", "t", "job-partial")
+	entries, readErr := os.ReadDir(jobDir)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("partial staging left attempt directories: %v", entries)
+	}
+}
+
+type cancelAfterFirstRead struct {
+	cancel context.CancelFunc
+	reader *bytes.Reader
+}
+
+func (r *cancelAfterFirstRead) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.cancel()
+	return n, err
+}
+
+func templatePathFromTemplates(path string) (string, error) {
+	marker := string(filepath.Separator) + "templates" + string(filepath.Separator)
+	i := strings.Index(path, marker)
+	if i < 0 {
+		return "", fmt.Errorf("path %q has no templates segment", path)
+	}
+	return path[i+1:], nil
 }

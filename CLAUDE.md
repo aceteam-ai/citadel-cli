@@ -1392,6 +1392,21 @@ ffmpeg `amix` plus two-pass -14 LUFS bridge; Paper Trail's numpy procedural
 synthesis is deliberately not copied here. The exact input, param, and output
 contract is in [docs/run-job-template-contract.md](docs/run-job-template-contract.md).
 
+The adapter resolves the workspace's absolute path before opening its `os.Root`,
+then derives every path given to a builtin from that resolved root identity. This
+matters when the configured workspace itself is a symlink: retargeting the
+symlink after staging must not redirect what the builtin consumes. Inputs are
+staged and hashed in a read-only snapshot and re-hashed after execution. Returned
+output paths are relative to an already-open per-attempt `out` root, not merely
+checked against the whole workspace. Each delivery uses a random 128-bit attempt
+namespace because the watchdog can release the serialized lane before an
+uncooperative handler goroutine exits; a retry must never reset paths that the
+orphan still owns. Staging, verification, and output hashing check cancellation
+between I/O operations, and failure paths join cleanup errors instead of hiding
+retained state. In `internal/worker/deadline.go`, `RUN_JOB_TEMPLATE` deliberately
+remains in `serializedLaneJobTypes` while using the long-tier watchdog fallback;
+lane selection and deadline selection are separate decisions.
+
 The schema gate is not the builtin decoder. `walkClosedSchema` requires an
 explicit type at every `properties`/`items` binding site, while each builtin
 separately uses `decodeBuiltinParams` for exact-key decoding. Preserve both
@@ -2853,7 +2868,9 @@ node showed green while executing nothing. Three defenses (`internal/worker/`):
      real human-session length; 4h catches a wedge without killing a live meeting
      — plus `TRANSCRIBE_AUDIO` (citadel#1045): a caller-selected larger model on
      CPU transcribing a long recording runs several-x slower than real time and
-     the default 60min tier would abandon it mid-transcription.
+     the default 60min tier would abandon it mid-transcription — plus
+     `RUN_JOB_TEMPLATE`, whose render/encode work needs a generous cap but must
+     not be allowed to wedge its serialized lane forever.
    - Unbounded (no fallback cap): model pulls/downloads, builds, `SERVICE_START`,
      `INSTANCE_PROVISION`, `AGENT_UPDATE`, `WHATSAPP_PROVISION` — opaque long
      progress; a blanket cap would risk killing a legit job. Set either env to `0`
@@ -2892,7 +2909,7 @@ should render the new `{ok:true, restarting:true}` response instead of the old
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `WORKER_JOB_TIMEOUT_SECONDS` | `3600` | Fallback per-job deadline for ordinary job types. `0` = unbounded. |
-| `WORKER_JOB_TIMEOUT_LONG_SECONDS` | `14400` | Fallback deadline for long-session types (MEETING_JOIN, COBROWSE, TRANSCRIBE_AUDIO). `0` = unbounded. |
+| `WORKER_JOB_TIMEOUT_LONG_SECONDS` | `14400` | Fallback deadline for long-session types plus RUN_JOB_TEMPLATE. `0` = unbounded. |
 | `WORKER_SELF_HEAL` | on | Set falsey (`0`/`false`/`no`/`off`) to disable the self-heal monitor. |
 | `WORKER_SELF_HEAL_STALL_SECONDS` | `600` | No-poll gap (with nothing in flight) before self-heal restarts. |
 | `WORKER_SELF_HEAL_STUCK_SECONDS` | `18000` | Single-job in-flight ceiling before self-heal restarts. `0` = disabled. |
@@ -2924,8 +2941,9 @@ waiting happens inside the spawned goroutine). Two instances, constructed in
 
 - **unbounded lane**, exec-concurrency **1**, for `serializedLaneJobTypes`
   (`deadline.go` — the authority, pinned by `TestSerializedLaneJobTypes`; it is
-  `unboundedJobTypes` PLUS `MODULE_SET`/`SERVICE_STOP`/`APPLY_DEVICE_CONFIG`, the
-  manifest/lockfile writers that aren't unbounded). Exec-concurrency 1 REPRODUCES
+  `unboundedJobTypes` plus the explicitly serialized state writers and
+  `RUN_JOB_TEMPLATE`, whose per-job workspace must remain single-writer even
+  though it now has a fallback deadline). Exec-concurrency 1 REPRODUCES
   today's implicit single-writer safety over the unlocked
   `citadel.yaml`/`modules.lock` read-modify-write paths EXACTLY — that is why v1
   needs no manifest locking (Phase 3 in the doc is deferred). `needsSerializedLane`,
@@ -3054,7 +3072,7 @@ design issue (decoupling job receipt from execution generally). **Stage 2
 landed as citadel-cli#908's serialized unbounded lane (see "Node execution
 model" below) — this paragraph describes the PRE-#908 state and is kept for
 history; `needsSerializedLane`'s superset (`unboundedJobTypes` plus the
-manifest/lockfile writers) now dispatches onto that lane, never inline, on
+explicitly serialized state/workspace writers) now dispatches onto that lane, never inline, on
 every node regardless of `maxConcurrency`.** The remaining inline-blocking
 case today is narrower: an ordinary job type that is none of long-session,
 serialized-lane, or GPU-bound-with-a-tracker (shell, file, config, or
