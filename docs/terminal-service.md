@@ -120,6 +120,86 @@ Sessions can also be pre-created, listed, or checked out-of-band through the
 `TMUX_SESSION` job type (payload `action`: `ensure`|`create`|`list`|`has`,
 `name`, optional `shell`), dispatched through the standard worker mechanism.
 
+### Surviving a managed worker restart
+
+On Linux, a tmux server started by `citadel.service` would normally inherit the
+service control group. systemd's default stop behavior kills the whole control
+group, including the tmux server, when Citadel restarts. Citadel avoids that by
+launching tmux create and attach commands in a separate transient scope when it
+is running as a systemd user service. A root system service uses an equivalent
+system scope. Other worker subprocesses remain in the Citadel control group and
+retain normal cleanup behavior.
+
+The scope names begin with `citadel-session-`. They include the session name,
+worker PID, and a sequence number so concurrent connections cannot collide.
+The scope owns the tmux server or attached client, not the WebSocket itself.
+Closing a WebSocket still detaches normally, and reconnecting reaches the same
+tmux session.
+
+Non-systemd platforms and interactive `citadel work` invocations keep invoking
+tmux directly. A Linux system service running as a non-root user also keeps the
+direct behavior because that user cannot safely create a sibling system scope.
+
+#### Manual restart proof
+
+Run this only with a dedicated test account or test node. The procedure uses a
+private tmux socket, so it never lists, attaches to, or stops the account's
+ordinary tmux sessions.
+
+1. Create a temporary `tmux` wrapper that selects a private server socket:
+
+   ```bash
+   proof_dir=$(mktemp -d /tmp/citadel-1166.XXXXXX)
+   real_tmux=$(command -v tmux)
+   printf '#!/bin/sh\nexec %s -L citadel-1166 "$@"\n' "$real_tmux" >"$proof_dir/tmux"
+   chmod 700 "$proof_dir/tmux"
+   test ! -e "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/citadel-1166"
+   ```
+
+   The final `test` must succeed. If it does not, choose a different private
+   socket name before continuing.
+
+2. Point the test account's systemd user manager at the wrapper, then restart
+   the test worker once so it inherits the setting:
+
+   ```bash
+   systemctl --user set-environment CITADEL_TMUX_BIN="$proof_dir/tmux"
+   systemctl --user restart citadel.service
+   ```
+
+3. Dispatch this job to the test node through the normal job path:
+
+   ```json
+   {"type":"TMUX_SESSION","payload":{"action":"ensure","name":"citadel1166proof"}}
+   ```
+
+4. Confirm the private session and its separate scope exist:
+
+   ```bash
+   tmux -L citadel-1166 has-session -t citadel1166proof
+   systemctl --user list-units 'citadel-session-citadel1166proof-*.scope'
+   ```
+
+5. Restart Citadel and confirm the same private session is still present:
+
+   ```bash
+   systemctl --user restart citadel.service
+   tmux -L citadel-1166 has-session -t citadel1166proof
+   ```
+
+6. Clean up only the isolated proof session and restore the worker environment:
+
+   ```bash
+   tmux -L citadel-1166 kill-session -t citadel1166proof
+   systemctl --user unset-environment CITADEL_TMUX_BIN
+   systemctl --user restart citadel.service
+   rm -r "$proof_dir"
+   ```
+
+The final `has-session` command must exit zero. Before this fix it reports no
+server after the service restart because the tmux server remains inside
+`citadel.service` and is killed with the worker.
+
 ### Platform Defaults
 
 **Shell Selection:**

@@ -222,6 +222,26 @@ func TestManager_EnsureSession_CreatesWhenAbsent(t *testing.T) {
 	}
 }
 
+func TestManager_EnsureSessionUsesScopeCommand(t *testing.T) {
+	f := newFakeRunner()
+	f.errs["has-session"] = exitError(t)
+	m := &Manager{
+		bin:    "/usr/bin/tmux",
+		runner: f,
+		scopeCommand: func(_ string, command []string) []string {
+			return append([]string{"systemd-run", "--scope", "--"}, command...)
+		},
+	}
+
+	if err := m.EnsureSession(context.Background(), "agent", "/bin/bash"); err != nil {
+		t.Fatalf("EnsureSession() error: %v", err)
+	}
+	want := []string{"--scope", "--", "/usr/bin/tmux", "new-session", "-d", "-s", "agent", "/bin/bash"}
+	if got := f.calls[len(f.calls)-1]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("scoped create args = %v, want %v", got, want)
+	}
+}
+
 func TestManager_ListSessions(t *testing.T) {
 	f := newFakeRunner()
 	f.outputs["list-sessions"] = []byte("agent\nconsole\n")

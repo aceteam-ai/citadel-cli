@@ -144,7 +144,8 @@ func sessionCommand(sessionName, shell string, explicit bool) []string {
 	if err != nil {
 		return nil
 	}
-	return append([]string{bin}, tmux.AttachOrCreateArgs(sessionName, shell)...)
+	command := append([]string{bin}, tmux.AttachOrCreateArgs(sessionName, shell)...)
+	return tmux.PersistentSessionCommand(sessionName, command)
 }
 
 // resolveSessionOverride decides the effective session BASE name for a single

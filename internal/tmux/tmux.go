@@ -142,8 +142,9 @@ func DefaultRunner() Runner { return execRunner{} }
 // Manager manages named tmux sessions through a resolved tmux binary and a
 // Runner. Construct it with NewManager.
 type Manager struct {
-	bin    string
-	runner Runner
+	bin          string
+	runner       Runner
+	scopeCommand func(sessionName string, command []string) []string
 }
 
 // NewManager resolves tmux and returns a Manager bound to it. It returns
@@ -153,13 +154,16 @@ func NewManager() (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{bin: bin, runner: DefaultRunner()}, nil
+	return &Manager{bin: bin, runner: DefaultRunner(), scopeCommand: PersistentSessionCommand}, nil
 }
 
 // NewManagerWith constructs a Manager from an explicit binary path and Runner.
 // It is intended for tests; production code should use NewManager.
 func NewManagerWith(bin string, runner Runner) *Manager {
-	return &Manager{bin: bin, runner: runner}
+	// Tests and embedders that inject a Runner get the exact command they asked
+	// for. The production constructor is what opts tmux creation into a detached
+	// service-manager scope.
+	return &Manager{bin: bin, runner: runner, scopeCommand: identitySessionCommand}
 }
 
 // Binary returns the resolved tmux binary path the Manager invokes.
@@ -235,7 +239,9 @@ func (m *Manager) EnsureSession(ctx context.Context, name, shell string) error {
 	if exists {
 		return nil
 	}
-	if out, err := m.runner.Run(ctx, m.bin, NewDetachedArgs(name, shell)...); err != nil {
+	command := append([]string{m.bin}, NewDetachedArgs(name, shell)...)
+	command = m.scopeCommand(name, command)
+	if out, err := m.runner.Run(ctx, command[0], command[1:]...); err != nil {
 		return fmt.Errorf("tmux new-session failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
