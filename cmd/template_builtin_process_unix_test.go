@@ -17,14 +17,14 @@ import (
 
 func TestConfigurePapercraftProcessTreeUnix(t *testing.T) {
 	cmd := exec.Command("unused")
-	terminate := configurePapercraftProcessTree(&renderCommand{cmd: cmd})
+	processTree := configurePapercraftProcessTree(&renderCommand{cmd: cmd})
 	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
 		t.Fatal("Chromium must launch in a dedicated process group")
 	}
 	if cmd.Cancel == nil {
 		t.Fatal("Chromium process group cancellation is not configured")
 	}
-	if terminate == nil {
+	if processTree == nil {
 		t.Fatal("Chromium process group explicit termination is not configured")
 	}
 }
@@ -107,7 +107,7 @@ func TestPostWaitCleanupNeverSignalsReusedProcessGroup(t *testing.T) {
 		scopeStops++
 		return nil
 	}}
-	cleanup := configurePapercraftProcessTree(limited)
+	processTree := configurePapercraftProcessTree(limited)
 	if err := root.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestPostWaitCleanupNeverSignalsReusedProcessGroup(t *testing.T) {
 	})
 	root.Process = unrelated.Process
 
-	if err := cleanup(); err != nil {
+	if err := processTree.cleanupAfterWait(); err != nil {
 		t.Fatalf("post-Wait cleanup: %v", err)
 	}
 	if scopeStops != 1 {
@@ -159,6 +159,70 @@ func TestCommandCancellationKillsLiveProcessGroupBeforeScopeCleanup(t *testing.T
 	_ = limited.cmd.Wait()
 	if !scopeStopped {
 		t.Fatal("live cancellation did not stop the systemd scope")
+	}
+}
+
+func TestChromiumShutdownKillsLiveChildWhenScopeCleanupFails(t *testing.T) {
+	originalCommand := renderLimitedCommand
+	want := errors.New("systemctl stop denied")
+	renderLimitedCommand = func(ctx context.Context, _ []string, binary string, args ...string) (*renderCommand, error) {
+		return &renderCommand{
+			cmd:       exec.CommandContext(ctx, binary, args...),
+			stopScope: func() error { return want },
+		}, nil
+	}
+	t.Cleanup(func() { renderLimitedCommand = originalCommand })
+
+	process, err := startChromiumProcess(context.Background(), "/bin/sh", []string{"-c", "exec sleep 60"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = process.Shutdown()
+	if !errors.Is(err, want) {
+		t.Fatalf("Shutdown error = %v, want scope cleanup failure", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("Shutdown took %s after scope cleanup failure", elapsed)
+	}
+	if err := process.processTree.cmd.Process.Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("live Chromium child survived failed scope cleanup: %v", err)
+	}
+}
+
+func TestFFmpegAbortKillsLiveChildWhenScopeCleanupFails(t *testing.T) {
+	binDir := t.TempDir()
+	ffmpeg := filepath.Join(binDir, "ffmpeg")
+	if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\nexec /bin/sleep 60\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	originalCommand := renderLimitedCommand
+	want := errors.New("systemctl stop denied")
+	var child *exec.Cmd
+	renderLimitedCommand = func(ctx context.Context, _ []string, binary string, args ...string) (*renderCommand, error) {
+		child = exec.CommandContext(ctx, binary, args...)
+		return &renderCommand{cmd: child, stopScope: func() error { return want }}, nil
+	}
+	t.Cleanup(func() { renderLimitedCommand = originalCommand })
+
+	encoder, err := startPapercraftFFmpeg(context.Background(), papercraftEncoderConfig{
+		Width: 16, Height: 16, FPS: 1, DurationSeconds: 1, OutputPath: filepath.Join(t.TempDir(), "out.mp4"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = encoder.Abort()
+	if !errors.Is(err, want) {
+		t.Fatalf("Abort error = %v, want scope cleanup failure", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("Abort took %s after scope cleanup failure", elapsed)
+	}
+	if err := child.Process.Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("live ffmpeg child survived failed scope cleanup: %v", err)
 	}
 }
 
@@ -239,17 +303,19 @@ func TestChromiumShutdownKillsSetsidDescendantThroughScope(t *testing.T) {
 func TestConfigurePapercraftProcessTreeReportsScopeCleanupFailure(t *testing.T) {
 	want := errors.New("systemctl stop denied")
 	limited := &renderCommand{
-		cmd: exec.CommandContext(context.Background(), "/bin/sh", "-c", "exec sleep 60"),
+		cmd: exec.CommandContext(context.Background(), "/bin/sh", "-c", "exit 0"),
 		stopScope: func() error {
 			return want
 		},
 	}
-	terminate := configurePapercraftProcessTree(limited)
+	processTree := configurePapercraftProcessTree(limited)
 	if err := limited.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	err := terminate()
-	_ = limited.cmd.Wait()
+	if err := limited.cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	err := processTree.cleanupAfterWait()
 	if !errors.Is(err, want) {
 		t.Fatalf("terminate error = %v, want scope cleanup failure", err)
 	}

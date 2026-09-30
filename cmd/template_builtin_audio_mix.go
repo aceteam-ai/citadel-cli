@@ -44,9 +44,12 @@ func liveAudioMixDeps() audioMixDeps {
 			}
 			cmd := limited.cmd
 			cmd.WaitDelay = 5 * time.Second
-			terminateTree := configurePapercraftProcessTree(limited)
+			processTree := configurePapercraftProcessTree(limited)
+			// CombinedOutput starts and waits internally. Disable raw PGID
+			// signaling before it can reap; the scope remains authoritative.
+			processTree.beginWait()
 			out, runErr := cmd.CombinedOutput()
-			return out, errors.Join(runErr, terminateTree())
+			return out, errors.Join(runErr, processTree.cleanupAfterWait())
 		},
 	}
 }

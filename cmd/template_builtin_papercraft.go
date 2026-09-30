@@ -366,13 +366,17 @@ type chromiumProcessControl interface {
 }
 
 type execChromiumProcess struct {
-	cancel        context.CancelFunc
-	terminateTree func() error
-	done          chan struct{}
-	stderr        *bytes.Buffer
-	waitErr       error
-	stopOnce      sync.Once
-	stopErr       error
+	cancel      context.CancelFunc
+	cmd         *exec.Cmd
+	processTree *papercraftProcessTree
+	done        chan struct{}
+	stderr      *bytes.Buffer
+	observeErr  error
+	waitErr     error
+	waitOnce    sync.Once
+	waitDone    chan struct{}
+	stopOnce    sync.Once
+	stopErr     error
 }
 
 func startChromiumRenderPage(ctx context.Context, html string, width, height int, profileDir string, inputs []string) (papercraftPage, error) {
@@ -451,19 +455,21 @@ func startChromiumProcess(ctx context.Context, binary string, args, env []string
 	cmd.Stdout = io.Discard
 	cmd.Stderr = stderr
 	cmd.WaitDelay = 5 * time.Second
-	terminateTree := configurePapercraftProcessTree(limited)
+	processTree := configurePapercraftProcessTree(limited)
 	if err := cmd.Start(); err != nil {
 		cancel()
-		return nil, errors.Join(err, terminateTree())
+		return nil, errors.Join(err, processTree.cleanupAfterWait())
 	}
 	process := &execChromiumProcess{
-		cancel:        cancel,
-		terminateTree: terminateTree,
-		done:          make(chan struct{}),
-		stderr:        stderr,
+		cancel:      cancel,
+		cmd:         cmd,
+		processTree: processTree,
+		done:        make(chan struct{}),
+		stderr:      stderr,
+		waitDone:    make(chan struct{}),
 	}
 	go func() {
-		process.waitErr = cmd.Wait()
+		process.observeErr = waitForPapercraftProcessExit(cmd.Process)
 		close(process.done)
 	}()
 	return process, nil
@@ -473,6 +479,11 @@ func (p *execChromiumProcess) Done() <-chan struct{} { return p.done }
 
 func (p *execChromiumProcess) WaitErr() error {
 	<-p.done
+	p.reap()
+	<-p.waitDone
+	if p.waitErr == nil && p.observeErr != nil {
+		return p.observeErr
+	}
 	return p.waitErr
 }
 
@@ -482,24 +493,40 @@ func (p *execChromiumProcess) Diagnostic() string {
 
 func (p *execChromiumProcess) Shutdown() error {
 	p.stopOnce.Do(func() {
-		// Do not rely on exec.Cmd.Cancel alone. os/exec stops watching the
-		// command context after the root process exits, while Chromium helpers
-		// in its process group may still be alive. Explicit termination here is
-		// therefore required even when Done is already closed.
-		terminateErr := p.terminateTree()
-		p.cancel()
+		// The exit observer deliberately leaves the root unreaped. If it is
+		// still live, terminate its identity-valid group before scope stop and
+		// before allowing Wait to reap it. If it has exited, the scope is the
+		// sole authority for surviving helpers.
 		select {
 		case <-p.done:
+			p.processTree.beginWait()
+		default:
+			p.stopErr = p.processTree.terminateLiveBeforeWait()
+		}
+		p.cancel()
+		p.reap()
+		select {
+		case <-p.waitDone:
 		case <-time.After(10 * time.Second):
 			p.stopErr = errors.Join(
-				terminateErr,
+				p.stopErr,
 				fmt.Errorf("%w: timed out waiting for Chromium process tree to exit", errChromiumShutdownIncomplete),
 			)
 			return
 		}
-		p.stopErr = terminateErr
+		p.stopErr = errors.Join(p.stopErr, p.processTree.cleanupAfterWait())
 	})
 	return p.stopErr
+}
+
+func (p *execChromiumProcess) reap() {
+	p.waitOnce.Do(func() {
+		p.processTree.beginWait()
+		go func() {
+			p.waitErr = p.cmd.Wait()
+			close(p.waitDone)
+		}()
+	})
 }
 
 func waitForChromiumCDP(
@@ -780,11 +807,12 @@ func reserveLoopbackPort() (int, error) {
 }
 
 type ffmpegFrameEncoder struct {
-	cmd           *exec.Cmd
-	stdin         io.WriteCloser
-	stderr        *bytes.Buffer
-	done          bool
-	terminateTree func() error
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stderr      *bytes.Buffer
+	done        bool
+	cancel      context.CancelFunc
+	processTree *papercraftProcessTree
 }
 
 func startPapercraftFFmpeg(ctx context.Context, cfg papercraftEncoderConfig) (papercraftEncoder, error) {
@@ -793,24 +821,28 @@ func startPapercraftFFmpeg(ctx context.Context, cfg papercraftEncoderConfig) (pa
 		return nil, fmt.Errorf("ffmpeg not found in PATH: install ffmpeg on the render node")
 	}
 	args := papercraftFFmpegArgs(cfg)
-	limited, err := renderLimitedCommand(ctx, minimalRenderChildEnv(filepath.Dir(cfg.OutputPath)), ffmpeg, args...)
+	procCtx, cancel := context.WithCancel(ctx)
+	limited, err := renderLimitedCommand(procCtx, minimalRenderChildEnv(filepath.Dir(cfg.OutputPath)), ffmpeg, args...)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	cmd := limited.cmd
 	stderr := &bytes.Buffer{}
 	cmd.Stderr = stderr
 	cmd.WaitDelay = 5 * time.Second
-	terminateTree := configurePapercraftProcessTree(limited)
+	processTree := configurePapercraftProcessTree(limited)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, errors.Join(err, processTree.cleanupAfterWait())
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
-		return nil, errors.Join(err, terminateTree())
+		cancel()
+		return nil, errors.Join(err, processTree.cleanupAfterWait())
 	}
-	return &ffmpegFrameEncoder{cmd: cmd, stdin: stdin, stderr: stderr, terminateTree: terminateTree}, nil
+	return &ffmpegFrameEncoder{cmd: cmd, stdin: stdin, stderr: stderr, cancel: cancel, processTree: processTree}, nil
 }
 
 func papercraftFFmpegArgs(cfg papercraftEncoderConfig) []string {
@@ -845,16 +877,18 @@ func (e *ffmpegFrameEncoder) Finish() error {
 	}
 	e.done = true
 	if err := e.stdin.Close(); err != nil {
-		terminateErr := e.terminateTree()
-		_ = e.cmd.Wait()
-		return errors.Join(err, terminateErr)
+		terminateErr := e.processTree.terminateLiveBeforeWait()
+		e.cancel()
+		waitErr := e.cmd.Wait()
+		return errors.Join(err, terminateErr, waitErr, e.processTree.cleanupAfterWait())
 	}
+	e.processTree.beginWait()
 	waitErr := e.cmd.Wait()
-	terminateErr := e.terminateTree()
+	cleanupErr := e.processTree.cleanupAfterWait()
 	if waitErr != nil {
-		return errors.Join(fmt.Errorf("ffmpeg exited: %w: %s", waitErr, compactCommandOutput(e.stderr.Bytes())), terminateErr)
+		return errors.Join(fmt.Errorf("ffmpeg exited: %w: %s", waitErr, compactCommandOutput(e.stderr.Bytes())), cleanupErr)
 	}
-	return terminateErr
+	return cleanupErr
 }
 
 func (e *ffmpegFrameEncoder) Abort() error {
@@ -863,7 +897,9 @@ func (e *ffmpegFrameEncoder) Abort() error {
 	}
 	e.done = true
 	closeErr := e.stdin.Close()
-	terminateErr := e.terminateTree()
+	terminateErr := e.processTree.terminateLiveBeforeWait()
+	e.cancel()
 	waitErr := e.cmd.Wait()
-	return errors.Join(closeErr, terminateErr, waitErr)
+	cleanupErr := e.processTree.cleanupAfterWait()
+	return errors.Join(closeErr, terminateErr, waitErr, cleanupErr)
 }
