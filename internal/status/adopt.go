@@ -3,8 +3,8 @@ package status
 import "context"
 
 // OpenAICompatServing reports whether an OpenAI-compatible engine is already
-// answering GET /v1/models with a 200 and a parseable models list on loopback
-// :port, and returns the served model id(s).
+// answering GET /v1/models with a 200 and a parseable models list on its
+// resolved node-local endpoint, and returns the served model id(s).
 //
 // This is the adoption SIGNAL for aceteam-ai/citadel-cli#1081: a node that
 // already serves a vendor engine (e.g. the RM-01's vLLM on

@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"testing"
+	"time"
 )
 
 // TestMeetingHostPortsRegistered pins the meeting media-stack module's two
@@ -459,13 +460,13 @@ func TestResolveVLLMHostPort(t *testing.T) {
 
 // TestResolveVLLMHost pins the CITADEL_VLLM_HOST boundary: only loopback or a
 // canonical address assigned to this node may become an engine dial target.
-// Invalid input fails closed to the historical loopback target.
+// Invalid input fails closed to the managed engine's IPv4 loopback target.
 func TestResolveVLLMHost(t *testing.T) {
-	if defaultVLLMHost != "localhost" {
-		t.Fatalf("defaultVLLMHost = %q, want byte-compatible localhost", defaultVLLMHost)
+	if defaultVLLMHost != "127.0.0.1" {
+		t.Fatalf("defaultVLLMHost = %q, want IPv4 loopback", defaultVLLMHost)
 	}
-	if _, set := os.LookupEnv(EnvVLLMHost); !set && VLLMHost != "localhost" {
-		t.Fatalf("VLLMHost = %q at init, want localhost with the env var unset", VLLMHost)
+	if _, set := os.LookupEnv(EnvVLLMHost); !set && VLLMHost != defaultVLLMHost {
+		t.Fatalf("VLLMHost = %q at init, want %q with the env var unset", VLLMHost, defaultVLLMHost)
 	}
 
 	local := func() ([]net.Addr, error) {
@@ -506,6 +507,28 @@ func TestResolveVLLMHost(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDefaultVLLMHostReachesIPv4OnlyListener guards the reason the default is
+// an IP literal rather than "localhost": managed vLLM publishes only on IPv4
+// loopback. A successful connection here proves the fallback is directly
+// usable when no IPv6 listener exists.
+func TestDefaultVLLMHostReachesIPv4OnlyListener(t *testing.T) {
+	listener, err := net.Listen("tcp4", net.JoinHostPort(defaultVLLMHost, "0"))
+	if err != nil {
+		t.Fatalf("listen on IPv4 loopback: %v", err)
+	}
+	defer listener.Close()
+
+	host, configured := resolveVLLMHostValue("", nil)
+	if configured || host != defaultVLLMHost {
+		t.Fatalf("unset host resolved to (%q, %v), want (%q, false)", host, configured, defaultVLLMHost)
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprint(listener.Addr().(*net.TCPAddr).Port)), time.Second)
+	if err != nil {
+		t.Fatalf("dial IPv4-only vLLM listener via default host: %v", err)
+	}
+	conn.Close()
 }
 
 func TestResolveVLLMHostFailsClosedWhenInterfacesCannotBeListed(t *testing.T) {

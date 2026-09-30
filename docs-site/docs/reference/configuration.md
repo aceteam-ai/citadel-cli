@@ -91,5 +91,14 @@ This directory persists across restarts so the node reconnects automatically wit
 | `WORKER_QUEUE` | `jobs:v1:gpu-general` | Redis Stream queue name to consume from |
 | `CITADEL_AUTH_HOST` | `https://aceteam.ai` | Auth service URL for device authorization |
 | `CITADEL_DEVICE_CODE` | (none) | Device code from the authorization flow, used for config lookup |
+| `CITADEL_VLLM_HOST` | `127.0.0.1` | Node-local IP address where Citadel should dial an externally managed vLLM server |
+| `CITADEL_VLLM_HOST_PORT` | `8201` | Host port where Citadel should dial vLLM |
 
-Environment variables override default values but are themselves overridden by command-line flags when both are specified.
+Environment variables override default values. Where a corresponding
+command-line flag exists, the flag takes precedence.
+
+> **Warning:** `CITADEL_VLLM_HOST` is a dial target, not an access-control
+> setting. If an externally managed vLLM server binds to a public interface,
+> that unauthenticated API is publicly exposed unless you restrict it with a
+> firewall or another authenticated proxy. Prefer a loopback-only bind whenever
+> the server and Citadel run on the same node.
