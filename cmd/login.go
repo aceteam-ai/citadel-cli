@@ -112,6 +112,11 @@ func runNonInteractiveLogin() {
 		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
 		os.Exit(1)
 	}
+	if err := persistPrivateCATrust(authServiceURL, nexusURL); err != nil {
+		_ = network.Disconnect()
+		spinner.StopWithError(err.Error())
+		os.Exit(1)
+	}
 
 	// Persist the control URL we enrolled against (citadel-cli#1110) so later
 	// reconnects target this control plane, not the compiled-in default.
@@ -287,6 +292,11 @@ func runInteractiveLogin() {
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
 		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
+		os.Exit(1)
+	}
+	if err := persistPrivateCATrust(authServiceURL, nexusURL); err != nil {
+		_ = network.Disconnect()
+		spinner.StopWithError(err.Error())
 		os.Exit(1)
 	}
 

@@ -1788,6 +1788,10 @@ func connectToNetwork(nodeName, authKey string) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
+	if err := persistPrivateCATrust(authServiceURL, nexusURL); err != nil {
+		_ = network.Disconnect()
+		return err
+	}
 
 	// Persist the control URL we just enrolled against so every later reconnect
 	// (citadel work, control center, recoverStaleVPN) targets the SAME control

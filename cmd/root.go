@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/catrust"
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/tmux"
@@ -30,6 +31,7 @@ func getEnvOrDefault(key, defaultValue string) string {
 var cfgFile string
 var nexusURL string
 var authServiceURL string
+var caCertPath string
 var debugMode bool
 var noColorGlobal bool
 
@@ -113,6 +115,14 @@ control center. All other subcommands are for scripting and advanced use.`,
 		// corrupt the JSON-RPC stream under `--debug citadel mcp`).
 		if cmd.Name() == "mcp" {
 			debugToStderr = true
+		}
+
+		// Private control-plane trust must be installed before the updater,
+		// device auth, or Tailscale performs the process's first TLS root load.
+		// Go caches that pool, so doing this later cannot repair userspace tsnet.
+		if err := preparePrivateCATrust(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: configure private CA trust: %v\n", err)
+			os.Exit(1)
 		}
 
 		// citadel#926: repair a Windows binary swap interrupted mid-update
@@ -287,6 +297,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.citadel-cli.yaml)")
 	rootCmd.PersistentFlags().StringVar(&nexusURL, "nexus", "https://nexus.aceteam.ai", "The URL of the AceTeam Nexus server")
 	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"), "The URL of the authentication service")
+	rootCmd.PersistentFlags().StringVar(&caCertPath, "ca-cert", getEnvOrDefault(catrust.EnvCACert, ""), "Trust this private CA for a self-hosted auth service and Nexus (Linux)")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
 	rootCmd.PersistentFlags().BoolVar(&noColorGlobal, "no-color", false, "Disable colorized output")
 	rootCmd.PersistentFlags().StringVar(&containerRuntimeFlag, "runtime", "", "Container runtime for module containers: docker or podman (default: auto-detect)")
