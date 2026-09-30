@@ -601,8 +601,18 @@ func papercraftChromiumArgs(profileDir string, width, height, port int, proxyURL
 	return args
 }
 
+// papercraftBlockedURLs is applied via CDP Network.setBlockedURLs before
+// navigation. data: URIs are deliberately NOT on this list: they never leave
+// the renderer (no DNS resolution, no socket, no reachable external origin).
+// Blocking them added nothing to the loopback-only SSRF boundary the proxy
+// and the other blocked schemes enforce, and it broke the canvas-generated
+// data: URI textures lib/paper.js's makeTextures() produces for every Paper
+// Trail render (citadel-cli#1202: paper-grain background and every card/tag
+// texture rendered as a broken-image placeholder). file://, blob:, ws://,
+// wss://, and ftp:// stay blocked; HTTP(S) to anything but the declared
+// inputs is separately refused by the non-forwarding asset proxy.
 func papercraftBlockedURLs() []string {
-	return []string{"file://*", "data:*", "blob:*", "ws://*", "wss://*", "ftp://*"}
+	return []string{"file://*", "blob:*", "ws://*", "wss://*", "ftp://*"}
 }
 
 // startPapercraftAssetServer serves the render document and its relative assets

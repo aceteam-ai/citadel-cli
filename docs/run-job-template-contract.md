@@ -101,8 +101,10 @@ fallback when the payload does not provide `timeout_ms`.
 required stage declaration, `1920x1080` and `1080x1920`, plus the referenced
 asset files and at most one optional audio file. Each player must expose
 `window.READY`, `window.DUR`, and `window.renderFrame(t)`. The runner blocks
-HTTP(S), `file:`, `data:`, `blob:`, WebSocket, FTP, and non-proxied WebRTC UDP
-before navigating to the loopback asset route. It captures a PNG whenever the
+HTTP(S), `file:`, `blob:`, WebSocket, FTP, and non-proxied WebRTC UDP
+before navigating to the loopback asset route (`data:` is allowed; it never
+leaves the renderer, and blocking it broke canvas-generated texture data
+URIs, citadel-cli#1202). It captures a PNG whenever the
 10 fps render key changes, repeats those frames into a 30 fps image pipe, and encodes H.264
 (`libx264`, CRF 17, slow/animation, `yuv420p`) with optional AAC audio. Outputs
 are `landscape.mp4` and
