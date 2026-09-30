@@ -316,13 +316,15 @@ func TestPapercraftAssetServerConfinesFilesToHTMLRoot(t *testing.T) {
 	}
 }
 
-func TestPapercraftChromiumCannotLoadFileURLSubresource(t *testing.T) {
+func TestPapercraftChromiumCannotLoadBlockedURLSubresources(t *testing.T) {
 	if !platform.ChromiumAvailable() {
 		t.Skip("Chromium is not installed")
 	}
 	originalCommand := renderLimitedCommand
-	renderLimitedCommand = func(ctx context.Context, _ []string, binary string, args ...string) (*renderCommand, error) {
-		return &renderCommand{cmd: exec.CommandContext(ctx, binary, args...)}, nil
+	renderLimitedCommand = func(ctx context.Context, env []string, binary string, args ...string) (*renderCommand, error) {
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Env = append([]string(nil), env...)
+		return &renderCommand{cmd: cmd}, nil
 	}
 	t.Cleanup(func() { renderLimitedCommand = originalCommand })
 
@@ -336,7 +338,12 @@ func TestPapercraftChromiumCannotLoadFileURLSubresource(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := filepath.Join(root, "index.html")
-	body := `<img id="secret"><script>document.getElementById('secret').src=` + strconv.Quote(secretURL) + `; window.READY=true</script>`
+	inlineSVG := `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="13"><rect width="11" height="13" fill="blue"/></svg>`
+	body := `<img id="secret"><img id="data"><img id="blob"><script>` +
+		`document.getElementById('secret').src=` + strconv.Quote(secretURL) + `;` +
+		`document.getElementById('data').src=` + strconv.Quote("data:image/svg+xml,"+inlineSVG) + `;` +
+		`document.getElementById('blob').src=URL.createObjectURL(new Blob([` + strconv.Quote(inlineSVG) + `],{type:'image/svg+xml'}));` +
+		`window.READY=true</script>`
 	if err := os.WriteFile(html, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -354,12 +361,14 @@ func TestPapercraftChromiumCannotLoadFileURLSubresource(t *testing.T) {
 	}
 	defer page.Close()
 	time.Sleep(500 * time.Millisecond)
-	width, err := page.Evaluate(context.Background(), `document.getElementById("secret").naturalWidth`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if width != float64(0) {
-		t.Fatalf("file:// subresource loaded with naturalWidth=%v", width)
+	for _, id := range []string{"secret", "data", "blob"} {
+		width, err := page.Evaluate(context.Background(), `document.getElementById(`+strconv.Quote(id)+`).naturalWidth`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if width != float64(0) {
+			t.Fatalf("blocked %s subresource loaded with naturalWidth=%v", id, width)
+		}
 	}
 }
 

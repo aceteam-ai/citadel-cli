@@ -479,11 +479,16 @@ func (p *execChromiumProcess) Done() <-chan struct{} { return p.done }
 
 func (p *execChromiumProcess) WaitErr() error {
 	<-p.done
-	p.reap()
-	<-p.waitDone
-	if p.waitErr == nil && p.observeErr != nil {
+	// A failed non-reaping observer does not prove that the child exited.
+	// Surface that failure before starting a potentially blocking Wait so the
+	// caller can run Shutdown immediately. Shutdown then crosses the wait
+	// boundary before cancellation, restricting cleanup to the process handle
+	// and unique scope instead of an unverified numeric process group.
+	if p.observeErr != nil {
 		return p.observeErr
 	}
+	p.reap()
+	<-p.waitDone
 	return p.waitErr
 }
 

@@ -3,8 +3,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -190,6 +194,54 @@ func TestChromiumShutdownKillsLiveChildWhenScopeCleanupFails(t *testing.T) {
 	}
 }
 
+func TestChromiumObserverErrorReturnsBeforeShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	limited := &renderCommand{
+		cmd:       exec.CommandContext(ctx, "/bin/sh", "-c", "exec sleep 60"),
+		stopScope: func() error { return nil },
+	}
+	processTree := configurePapercraftProcessTree(limited)
+	if err := limited.cmd.Start(); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+
+	want := errors.New("waitid refused")
+	process := &execChromiumProcess{
+		cancel:      cancel,
+		cmd:         limited.cmd,
+		processTree: processTree,
+		done:        make(chan struct{}),
+		observeErr:  want,
+		waitDone:    make(chan struct{}),
+	}
+	close(process.done)
+	t.Cleanup(func() { _ = process.Shutdown() })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- process.WaitErr() }()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, want) {
+			t.Fatalf("WaitErr = %v, want observer failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		_ = process.Shutdown()
+		t.Fatal("WaitErr blocked on cmd.Wait after observer failure")
+	}
+
+	started := time.Now()
+	if err := process.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("Shutdown took %s after observer failure", elapsed)
+	}
+	if err := limited.cmd.Process.Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Chromium child survived observer-error cleanup: %v", err)
+	}
+}
+
 func TestFFmpegAbortKillsLiveChildWhenScopeCleanupFails(t *testing.T) {
 	binDir := t.TempDir()
 	ffmpeg := filepath.Join(binDir, "ffmpeg")
@@ -223,6 +275,56 @@ func TestFFmpegAbortKillsLiveChildWhenScopeCleanupFails(t *testing.T) {
 	}
 	if err := child.Process.Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("live ffmpeg child survived failed scope cleanup: %v", err)
+	}
+}
+
+func TestRealFFmpegLeavesOnlyReportedOutput(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is unavailable")
+	}
+
+	originalCommand := renderLimitedCommand
+	renderLimitedCommand = func(ctx context.Context, env []string, binary string, args ...string) (*renderCommand, error) {
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Env = append([]string(nil), env...)
+		return &renderCommand{cmd: cmd, stopScope: func() error { return nil }}, nil
+	}
+	t.Cleanup(func() { renderLimitedCommand = originalCommand })
+
+	outDir := t.TempDir()
+	outPath := filepath.Join(outDir, "render.mp4")
+	encoder, err := startPapercraftFFmpeg(context.Background(), papercraftEncoderConfig{
+		Width: 16, Height: 16, FPS: 1, DurationSeconds: 1, OutputPath: outPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 16; x++ {
+			frame.Set(x, y, color.RGBA{R: 0x44, G: 0x88, B: 0xcc, A: 0xff})
+		}
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, frame); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(encoded.Bytes()); err != nil {
+		_ = encoder.Abort()
+		t.Fatal(err)
+	}
+	if err := encoder.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := validateTemplateOutputTree(root, []string{"render.mp4"}, templateMaxOutputFiles, templateMaxOutputEntries, templateMaxOutputBytes); err != nil {
+		t.Fatalf("real ffmpeg output violates template output contract: %v", err)
 	}
 }
 
