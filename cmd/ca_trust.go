@@ -14,18 +14,35 @@ import (
 // use, including durable values used by unattended reconnects, then primes the
 // Linux process trust pool before any HTTPS request can cache it.
 func preparePrivateCATrust(cmd *cobra.Command) error {
-	authURL := authServiceURL
-	if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
-		if cfg := getDeviceConfigFromFile(); cfg != nil && strings.TrimSpace(cfg.APIBaseURL) != "" {
-			authURL = cfg.APIBaseURL
-		}
-	}
+	nodeDir := nodeConfigDirFn()
 	nexus := nexusURL
 	if !flagChanged(cmd, "nexus") {
 		nexus = network.ResolveControlURL()
 	}
-	_, err := catrust.Bootstrap(caCertPath, nodeConfigDirFn(), authURL, nexus)
-	return err
+	authURL := authServiceURL
+	if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
+		if cfg := getDeviceConfigFromFile(); cfg != nil && strings.TrimSpace(cfg.APIBaseURL) != "" {
+			authURL = cfg.APIBaseURL
+		} else if strings.TrimSpace(caCertPath) == "" {
+			storedAuth, err := catrust.AuthOriginForNexus(nodeDir, nexus)
+			if err != nil {
+				return err
+			}
+			if storedAuth != "" {
+				authURL = storedAuth
+			}
+		}
+	}
+	if _, err := catrust.Bootstrap(caCertPath, nodeDir, authURL, nexus); err != nil {
+		return err
+	}
+
+	// Keep the rest of this invocation on the same endpoint pair we just
+	// validated. In particular, an authkey-only reconnect has no device config
+	// from which later commands could recover the self-hosted auth origin.
+	authServiceURL = authURL
+	nexusURL = nexus
+	return nil
 }
 
 func flagChanged(cmd *cobra.Command, name string) bool {

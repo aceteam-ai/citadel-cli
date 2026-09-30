@@ -37,6 +37,9 @@ one or more valid PEM CA certificates. Citadel adds those certificates to the
 normal system roots, keeps hostname verification enabled, and uses them for
 device authorization and the embedded mesh connection.
 
+This option is limited to self-hosted tenants. Citadel refuses private CA
+configuration when either endpoint is the managed `aceteam.ai` service.
+
 The server certificate still needs a SAN matching each requested hostname.
 Trusting the CA does not make a certificate for `ingress.local` valid for a
 tenant web or Nexus hostname.

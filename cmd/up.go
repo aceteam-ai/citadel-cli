@@ -148,6 +148,10 @@ func runUp() error {
 		}
 		return err
 	}
+	if err := persistPrivateCATrust(authServiceURL, nexusURL); err != nil {
+		_ = network.Disconnect()
+		return err
+	}
 
 	// Persist the control URL this machine joined against (citadel-cli#1110).
 	persistNexusURLBestEffort(nexusURL)

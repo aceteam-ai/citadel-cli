@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,6 +27,9 @@ const (
 	maxBundleBytes = 1 << 20
 	recordVersion  = 1
 	recordFileName = "control-ca.json"
+
+	managedAuthOrigin  = "https://aceteam.ai"
+	managedNexusOrigin = "https://nexus.aceteam.ai"
 )
 
 type material struct {
@@ -52,6 +56,11 @@ var (
 // request in the process because the Linux system root pool is cached once.
 // The bool reports whether private trust was installed.
 func Bootstrap(explicitPath, nodeConfigDir, authURL, nexusURL string) (bool, error) {
+	if strings.TrimSpace(explicitPath) != "" {
+		if err := refuseManagedOrigins(authURL, nexusURL); err != nil {
+			return false, err
+		}
+	}
 	var m *material
 	var err error
 	if strings.TrimSpace(explicitPath) != "" {
@@ -101,6 +110,9 @@ func PersistActive(nodeConfigDir, authURL, nexusURL string) (bool, error) {
 	}
 	pemBytes := append([]byte(nil), active.pem...)
 	activeMu.RUnlock()
+	if err := refuseManagedOrigins(authURL, nexusURL); err != nil {
+		return false, err
+	}
 
 	authOrigin, err := endpointOrigin(authURL)
 	if err != nil {
@@ -183,28 +195,9 @@ func loadFile(path string) (*material, error) {
 }
 
 func loadPersisted(nodeConfigDir, authURL, nexusURL string) (*material, error) {
-	path := filepath.Join(nodeConfigDir, "identity", recordFileName)
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read persisted private CA: %w", err)
-	}
-	if len(data) > maxBundleBytes {
-		return nil, fmt.Errorf("persisted private CA record exceeds %d bytes", maxBundleBytes)
-	}
-	var r record
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&r); err != nil {
-		return nil, fmt.Errorf("decode persisted private CA: %w", err)
-	}
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return nil, fmt.Errorf("decode persisted private CA: trailing data")
-	}
-	if r.Version != recordVersion {
-		return nil, fmt.Errorf("unsupported persisted private CA version %d", r.Version)
+	r, certs, normalized, err := readPersisted(nodeConfigDir)
+	if err != nil || r == nil {
+		return nil, err
 	}
 	authOrigin, err := endpointOrigin(authURL)
 	if err != nil {
@@ -217,15 +210,61 @@ func loadPersisted(nodeConfigDir, authURL, nexusURL string) (*material, error) {
 	if r.AuthOrigin != authOrigin || r.NexusOrigin != nexusOrigin {
 		return nil, nil
 	}
+	return &material{pem: normalized, certs: certs, fromStore: true}, nil
+}
+
+// AuthOriginForNexus returns the persisted auth origin when the supplied Nexus
+// belongs to the same saved tenant. This lets authkey-only enrollments recover
+// the complete endpoint pair on a later process even though they have no
+// device credential record carrying APIBaseURL.
+func AuthOriginForNexus(nodeConfigDir, nexusURL string) (string, error) {
+	r, _, _, err := readPersisted(nodeConfigDir)
+	if err != nil || r == nil {
+		return "", err
+	}
+	nexusOrigin, err := endpointOrigin(nexusURL)
+	if err != nil || r.NexusOrigin != nexusOrigin {
+		return "", nil
+	}
+	return r.AuthOrigin, nil
+}
+
+func readPersisted(nodeConfigDir string) (*record, []*x509.Certificate, []byte, error) {
+	path := filepath.Join(nodeConfigDir, "identity", recordFileName)
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read persisted private CA: %w", err)
+	}
+	if len(data) > maxBundleBytes {
+		return nil, nil, nil, fmt.Errorf("persisted private CA record exceeds %d bytes", maxBundleBytes)
+	}
+	var r record
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&r); err != nil {
+		return nil, nil, nil, fmt.Errorf("decode persisted private CA: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, nil, nil, fmt.Errorf("decode persisted private CA: trailing data")
+	}
+	if r.Version != recordVersion {
+		return nil, nil, nil, fmt.Errorf("unsupported persisted private CA version %d", r.Version)
+	}
+	if r.AuthOrigin == managedAuthOrigin || r.NexusOrigin == managedNexusOrigin {
+		return nil, nil, nil, fmt.Errorf("persisted private CA targets a managed AceTeam endpoint")
+	}
 	digest := sha256.Sum256([]byte(r.PEM))
 	if !strings.EqualFold(r.SHA256, hex.EncodeToString(digest[:])) {
-		return nil, fmt.Errorf("persisted private CA fingerprint mismatch")
+		return nil, nil, nil, fmt.Errorf("persisted private CA fingerprint mismatch")
 	}
 	certs, normalized, err := parseBundle([]byte(r.PEM), time.Now())
 	if err != nil {
-		return nil, fmt.Errorf("persisted private CA: %w", err)
+		return nil, nil, nil, fmt.Errorf("persisted private CA: %w", err)
 	}
-	return &material{pem: normalized, certs: certs, fromStore: true}, nil
+	return &r, certs, normalized, nil
 }
 
 func parseBundle(data []byte, now time.Time) ([]*x509.Certificate, []byte, error) {
@@ -246,6 +285,9 @@ func parseBundle(data []byte, now time.Time) ([]*x509.Certificate, []byte, error
 		}
 		if !cert.IsCA || !cert.BasicConstraintsValid {
 			return nil, nil, fmt.Errorf("contains a certificate that is not a CA")
+		}
+		if cert.KeyUsage != 0 && cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+			return nil, nil, fmt.Errorf("contains a CA certificate without certificate-signing usage")
 		}
 		if now.Before(cert.NotBefore) {
 			return nil, nil, fmt.Errorf("contains a CA certificate that is not valid yet")
@@ -271,5 +313,31 @@ func endpointOrigin(raw string) (string, error) {
 	if !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.User != nil {
 		return "", fmt.Errorf("must be an HTTPS URL with a host")
 	}
-	return "https://" + strings.ToLower(u.Host), nil
+	hostname := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if hostname == "" {
+		return "", fmt.Errorf("must be an HTTPS URL with a host")
+	}
+	host := hostname
+	if strings.Contains(hostname, ":") {
+		host = "[" + hostname + "]"
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		host = net.JoinHostPort(hostname, port)
+	}
+	return "https://" + host, nil
+}
+
+func refuseManagedOrigins(authURL, nexusURL string) error {
+	authOrigin, err := endpointOrigin(authURL)
+	if err != nil {
+		return fmt.Errorf("invalid auth service URL: %w", err)
+	}
+	nexusOrigin, err := endpointOrigin(nexusURL)
+	if err != nil {
+		return fmt.Errorf("invalid Nexus URL: %w", err)
+	}
+	if authOrigin == managedAuthOrigin || nexusOrigin == managedNexusOrigin {
+		return fmt.Errorf("private CA trust is limited to self-hosted tenants and cannot be enabled for managed AceTeam endpoints")
+	}
+	return nil
 }

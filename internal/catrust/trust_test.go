@@ -45,6 +45,10 @@ func TestParseBundleStrictCAOnly(t *testing.T) {
 	if _, _, err := parseBundle(expired, time.Now()); err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expired CA error = %v", err)
 	}
+	badUsagePEM, _, _ := makeCAWithUsage(t, "bad usage", time.Now().Add(-time.Hour), time.Now().Add(time.Hour), x509.KeyUsageDigitalSignature)
+	if _, _, err := parseBundle(badUsagePEM, time.Now()); err == nil || !strings.Contains(err.Error(), "certificate-signing") {
+		t.Fatalf("bad key usage error = %v", err)
+	}
 }
 
 func TestPersistedTrustIsOriginBoundAndFingerprinted(t *testing.T) {
@@ -79,6 +83,14 @@ func TestPersistedTrustIsOriginBoundAndFingerprinted(t *testing.T) {
 	if err != nil || loaded != nil {
 		t.Fatalf("cross-tenant load = %#v, %v", loaded, err)
 	}
+	storedAuth, err := AuthOriginForNexus(dir, "https://NEXUS.tenant.test/path")
+	if err != nil || storedAuth != "https://web.tenant.test" {
+		t.Fatalf("AuthOriginForNexus = %q, %v", storedAuth, err)
+	}
+	storedAuth, err = AuthOriginForNexus(dir, "https://nexus.other.test")
+	if err != nil || storedAuth != "" {
+		t.Fatalf("cross-tenant AuthOriginForNexus = %q, %v", storedAuth, err)
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -98,6 +110,39 @@ func TestPersistedTrustIsOriginBoundAndFingerprinted(t *testing.T) {
 	}
 	if _, err := loadPersisted(dir, "https://web.tenant.test", "https://nexus.tenant.test"); err == nil {
 		t.Fatal("tampered record accepted")
+	}
+}
+
+func TestPrivateCATrustRefusesManagedOrigins(t *testing.T) {
+	caPEM, ca, _ := makeCA(t, "tenant root", time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	activeMu.Lock()
+	old := active
+	active = &material{pem: caPEM, certs: []*x509.Certificate{ca}}
+	activeMu.Unlock()
+	t.Cleanup(func() {
+		activeMu.Lock()
+		active = old
+		activeMu.Unlock()
+	})
+
+	for name, endpoints := range map[string][2]string{
+		"managed auth":       {managedAuthOrigin, "https://nexus.tenant.test"},
+		"managed auth port":  {"https://ACETEAM.AI:443/path", "https://nexus.tenant.test"},
+		"managed nexus":      {"https://web.tenant.test", managedNexusOrigin},
+		"managed nexus port": {"https://web.tenant.test", "https://NEXUS.ACETEAM.AI:443/"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := PersistActive(t.TempDir(), endpoints[0], endpoints[1]); err == nil {
+				t.Fatal("managed endpoint accepted private CA")
+			}
+		})
+	}
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, caPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bootstrap(path, t.TempDir(), managedAuthOrigin, managedNexusOrigin); err == nil {
+		t.Fatal("Bootstrap accepted private CA for managed endpoints")
 	}
 }
 
@@ -128,6 +173,44 @@ func TestBootstrapFreshProcessPreservesExistingRootsAndHostnameChecks(t *testing
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("child failed: %v\n%s", err, out)
+	}
+}
+
+func TestPersistedBootstrapFreshProcessRecoversAuthOrigin(t *testing.T) {
+	if os.Getenv("CITADEL_CA_PERSISTED_CHILD") == "1" {
+		dir := os.Getenv("CITADEL_CA_TEST_DIR")
+		nexusURL := "https://nexus.tenant.test"
+		authURL, err := AuthOriginForNexus(dir, nexusURL)
+		if err != nil || authURL != "https://web.tenant.test" {
+			t.Fatalf("AuthOriginForNexus = %q, %v", authURL, err)
+		}
+		if ok, err := Bootstrap("", dir, authURL, nexusURL); err != nil || !ok {
+			t.Fatalf("persisted Bootstrap = %v, %v", ok, err)
+		}
+		return
+	}
+
+	caPEM, ca, _ := makeCA(t, "persisted root", time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	activeMu.Lock()
+	old := active
+	active = &material{pem: caPEM, certs: []*x509.Certificate{ca}}
+	activeMu.Unlock()
+	t.Cleanup(func() {
+		activeMu.Lock()
+		active = old
+		activeMu.Unlock()
+	})
+	dir := t.TempDir()
+	if wrote, err := PersistActive(dir, "https://web.tenant.test", "https://nexus.tenant.test"); err != nil || !wrote {
+		t.Fatalf("PersistActive = %v, %v", wrote, err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPersistedBootstrapFreshProcessRecoversAuthOrigin$")
+	cmd.Env = append(os.Environ(),
+		"CITADEL_CA_PERSISTED_CHILD=1",
+		"CITADEL_CA_TEST_DIR="+dir,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("persisted child failed: %v\n%s", err, out)
 	}
 }
 
@@ -172,6 +255,10 @@ func runBootstrapChild(t *testing.T) {
 }
 
 func makeCA(t *testing.T, name string, notBefore, notAfter time.Time) ([]byte, *x509.Certificate, *ecdsa.PrivateKey) {
+	return makeCAWithUsage(t, name, notBefore, notAfter, x509.KeyUsageCertSign|x509.KeyUsageDigitalSignature)
+}
+
+func makeCAWithUsage(t *testing.T, name string, notBefore, notAfter time.Time, usage x509.KeyUsage) ([]byte, *x509.Certificate, *ecdsa.PrivateKey) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -184,7 +271,7 @@ func makeCA(t *testing.T, name string, notBefore, notAfter time.Time) ([]byte, *
 		NotAfter:              notAfter,
 		IsCA:                  true,
 		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		KeyUsage:              usage,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
