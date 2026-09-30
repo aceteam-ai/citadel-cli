@@ -74,14 +74,16 @@ deadline can therefore release the serialized lane without letting an older,
 slow-to-cancel goroutine collide with a retry's paths. Staging, post-run input
 verification, and output hashing check cancellation between reads and writes;
 failed attempts remove only their own namespace and report cleanup failures.
-At most 16 regular output files totaling 8 GiB are retained. Every regular file
-left in `out` must be reported by the builtin; duplicate paths, unreported files,
-symlinks, special files, and boundary overruns fail the attempt and remove its
-namespace. Successful output namespaces carry a node-owned completion marker and
+At most 16 regular output files totaling 8 GiB are retained, within at most 64
+total output-tree entries including directories. Every regular file left in `out`
+must be reported by the builtin; duplicate paths, unreported files, symlinks,
+special files, and boundary overruns fail the attempt and remove its namespace.
+Successful output namespaces carry an exact node-owned completion marker and
 remain available for lazy `node:<node_id>/<path>` reads for seven days. A sweep
 before each new template attempt removes only completed namespaces strictly older
 than that window. Active or incomplete namespaces (identified by their retained
-input snapshot) are never swept, including watchdog-abandoned attempts; the
+input snapshot, which takes precedence over any marker) are never swept,
+including watchdog-abandoned attempts; the
 pre-marker successful layout from v2.175.0 is also recognized and expired.
 Empty collections serialize as arrays. Large output bytes do not enter the result.
 The platform turns outputs into `node:<node_id>/<path>` file references and reads

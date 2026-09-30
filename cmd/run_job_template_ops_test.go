@@ -535,11 +535,53 @@ func TestTemplateOutputCapsBoundaryAndUnreportedFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer root.Close()
-			err = validateTemplateOutputTree(root, tc.reported, tc.maxFiles, tc.maxBytes)
+			err = validateTemplateOutputTree(root, tc.reported, tc.maxFiles, 16, tc.maxBytes)
 			if tc.wantErr != (err != nil) {
 				t.Fatalf("validateTemplateOutputTree error = %v, wantErr=%v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestTemplateOutputEntryCapCountsEmptyDirectories(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 4; i++ {
+		if err := os.Mkdir(filepath.Join(dir, fmt.Sprintf("empty-%d", i)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := validateTemplateOutputTree(root, nil, templateMaxOutputFiles, 3, templateMaxOutputBytes); err == nil || !strings.Contains(err.Error(), "entries; limit") {
+		t.Fatalf("empty-directory entry cap error = %v", err)
+	}
+}
+
+func TestLiveTemplateRunOps_OutputEntryFailureCleansAttempt(t *testing.T) {
+	ws := t.TempDir()
+	registerTestBuiltin(t, "test-too-many-output-entries", func(_ context.Context, _ json.RawMessage, _ []string, outDir string) ([]string, error) {
+		for i := 0; i <= templateMaxOutputEntries; i++ {
+			if err := os.Mkdir(filepath.Join(outDir, fmt.Sprintf("empty-%02d", i)), 0o700); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	})
+	_, err := (liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}).Run(context.Background(), verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID: "job-output-entry-cap", TemplateKey: "t", Runner: json.RawMessage(`{"kind":"builtin","handler":"test-too-many-output-entries"}`),
+	}))
+	if err == nil || !strings.Contains(err.Error(), "entries; limit") {
+		t.Fatalf("output entry count error = %v", err)
+	}
+	entries, readErr := os.ReadDir(filepath.Join(ws, "templates", "t", "job-output-entry-cap"))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("over-limit output tree left attempt directories: %v", entries)
 	}
 }
 
@@ -615,6 +657,7 @@ func TestPruneRetainedTemplateAttempts(t *testing.T) {
 	freshMarked := makeAttempt("attempt-00000000000000000000000000000003", true, false, fresh)
 	exactCutoff := makeAttempt("attempt-00000000000000000000000000000004", true, false, cutoff)
 	activeOld := makeAttempt("attempt-00000000000000000000000000000005", false, true, old)
+	activeMarkedOld := makeAttempt("attempt-00000000000000000000000000000006", true, true, old)
 	notAttempt := makeAttempt("attempt-not-random", true, false, old)
 
 	if err := pruneRetainedTemplateAttempts(root, now, templateOutputRetention); err != nil {
@@ -625,7 +668,7 @@ func TestPruneRetainedTemplateAttempts(t *testing.T) {
 			t.Errorf("expired attempt %s survived: %v", rel, err)
 		}
 	}
-	for _, rel := range []string{freshMarked, exactCutoff, activeOld, notAttempt} {
+	for _, rel := range []string{freshMarked, exactCutoff, activeOld, activeMarkedOld, notAttempt} {
 		if _, err := root.Stat(rel); err != nil {
 			t.Errorf("protected attempt %s was removed: %v", rel, err)
 		}
@@ -633,21 +676,37 @@ func TestPruneRetainedTemplateAttempts(t *testing.T) {
 }
 
 func TestPruneRetainedTemplateAttemptsFailsClosedOnInvalidMarker(t *testing.T) {
-	ws := t.TempDir()
-	root, err := os.OpenRoot(ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer root.Close()
-	rel := filepath.Join("templates", "t", "job", "attempt-00000000000000000000000000000001")
-	if err := root.MkdirAll(filepath.Join(rel, "out"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := root.Mkdir(filepath.Join(rel, templateCompleteMarker), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := pruneRetainedTemplateAttempts(root, time.Now(), templateOutputRetention); err == nil {
-		t.Fatal("non-file completion marker was accepted")
+	for _, tc := range []struct {
+		name string
+		make func(*testing.T, *os.Root, string)
+	}{
+		{name: "directory", make: func(t *testing.T, root *os.Root, marker string) {
+			if err := root.Mkdir(marker, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "invalid_contents", make: func(t *testing.T, root *os.Root, marker string) {
+			if err := root.WriteFile(marker, []byte("invalid!\n"), 0o400); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			root, err := os.OpenRoot(ws)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			rel := filepath.Join("templates", "t", "job", "attempt-00000000000000000000000000000001")
+			if err := root.MkdirAll(filepath.Join(rel, "out"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			tc.make(t, root, filepath.Join(rel, templateCompleteMarker))
+			if err := pruneRetainedTemplateAttempts(root, time.Now(), templateOutputRetention); err == nil {
+				t.Fatal("invalid completion marker was accepted")
+			}
+		})
 	}
 }
 

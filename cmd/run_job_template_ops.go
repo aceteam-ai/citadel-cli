@@ -78,15 +78,17 @@ const (
 	// ceiling permits sizable media assets without allowing one delivery to stage
 	// an unbounded snapshot. The output ceiling accommodates the two hour-scale
 	// videos or one PCM mix produced by today's approved builtins.
-	templateMaxInputBytes  int64 = 4 << 30
-	templateMaxOutputFiles       = 16
-	templateMaxOutputBytes int64 = 8 << 30
+	templateMaxInputBytes    int64 = 4 << 30
+	templateMaxOutputFiles         = 16
+	templateMaxOutputEntries       = 64
+	templateMaxOutputBytes   int64 = 8 << 30
 
 	// Lazy node:path consumers need successful outputs after the job completes.
 	// Seven days covers delayed collection/retry without making artifacts
 	// permanent. A sweep runs before each template attempt.
 	templateOutputRetention = 7 * 24 * time.Hour
 	templateCompleteMarker  = ".citadel-complete-v1"
+	templateCompleteBody    = "complete\n"
 )
 
 var templateGCMu sync.Mutex
@@ -173,7 +175,7 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 		return nil, errors.Join(err, cleanupTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun))
 	}
 
-	outputs, outputDigests, err := o.collectOutputs(ctx, outRoot, relOut, outRels, templateMaxOutputFiles, templateMaxOutputBytes)
+	outputs, outputDigests, err := o.collectOutputs(ctx, outRoot, relOut, outRels, templateMaxOutputFiles, templateMaxOutputEntries, templateMaxOutputBytes)
 	if err != nil {
 		return nil, errors.Join(err, cleanupTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun))
 	}
@@ -312,11 +314,11 @@ func verifyStagedTemplateInputs(ctx context.Context, inputRoot *os.Root, rels, h
 // per-run output root. os.Root follows only symlinks that remain beneath that
 // root and opens the validated target directly, closing both the sibling-path
 // gap and the validate-then-open race.
-func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root, relOut string, outRels []string, maxFiles int, maxBytes int64) ([]worker.TemplateOutput, []string, error) {
+func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root, relOut string, outRels []string, maxFiles, maxEntries int, maxBytes int64) ([]worker.TemplateOutput, []string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	if err := validateTemplateOutputTree(outRoot, outRels, maxFiles, maxBytes); err != nil {
+	if err := validateTemplateOutputTree(outRoot, outRels, maxFiles, maxEntries, maxBytes); err != nil {
 		return nil, nil, err
 	}
 	outputs := make([]worker.TemplateOutput, 0, len(outRels))
@@ -365,9 +367,11 @@ func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root
 
 // validateTemplateOutputTree bounds what will be retained, not merely what a
 // builtin reports. Otherwise an unreported file could bypass both caps and live
-// forever beside an accepted output. Symlinks and special files are rejected so
-// counting and later lazy reads have one unambiguous regular-file meaning.
-func validateTemplateOutputTree(outRoot *os.Root, outRels []string, maxFiles int, maxBytes int64) error {
+// forever beside an accepted output. The total-entry cap counts directories as
+// well as files so empty-directory/inode growth cannot bypass the byte and file
+// ceilings. Symlinks and special files are rejected so counting and later lazy
+// reads have one unambiguous regular-file meaning.
+func validateTemplateOutputTree(outRoot *os.Root, outRels []string, maxFiles, maxEntries int, maxBytes int64) error {
 	if len(outRels) > maxFiles {
 		return fmt.Errorf("builtin reported %d outputs; limit is %d", len(outRels), maxFiles)
 	}
@@ -384,13 +388,21 @@ func validateTemplateOutputTree(outRoot *os.Root, outRels []string, maxFiles int
 	}
 
 	seen := make(map[string]struct{}, len(outRels))
-	var count int
+	var fileCount int
+	var entryCount int
 	var total int64
 	err := fs.WalkDir(outRoot.FS(), ".", func(name string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if name == "." || d.IsDir() {
+		if name == "." {
+			return nil
+		}
+		entryCount++
+		if entryCount > maxEntries {
+			return fmt.Errorf("output tree contains %d entries; limit is %d", entryCount, maxEntries)
+		}
+		if d.IsDir() {
 			return nil
 		}
 		info, err := d.Info()
@@ -404,8 +416,8 @@ func validateTemplateOutputTree(outRoot *os.Root, outRels []string, maxFiles int
 		if _, reported := want[name]; !reported {
 			return fmt.Errorf("builtin left unreported output file %q", name)
 		}
-		count++
-		if count > maxFiles {
+		fileCount++
+		if fileCount > maxFiles {
 			return fmt.Errorf("output tree contains more than %d files", maxFiles)
 		}
 		if info.Size() < 0 || info.Size() > maxBytes-total {
@@ -571,7 +583,7 @@ func finishTemplateAttempt(workspaceRoot, inputRoot, outRoot *os.Root, relRun, r
 		return errors.Join(err, removeTemplateAttempt(workspaceRoot, relRun))
 	}
 	marker := filepath.Join(relRun, templateCompleteMarker)
-	if err := workspaceRoot.WriteFile(marker, []byte("complete\n"), 0o400); err != nil {
+	if err := workspaceRoot.WriteFile(marker, []byte(templateCompleteBody), 0o400); err != nil {
 		return errors.Join(
 			fmt.Errorf("mark template attempt complete: %w", err),
 			removeTemplateAttempt(workspaceRoot, relRun),
@@ -671,10 +683,54 @@ func pruneRetainedTemplateAttempts(workspaceRoot *os.Root, now time.Time, retent
 }
 
 func templateAttemptCompletionTime(workspaceRoot *os.Root, relRun string) (time.Time, bool, error) {
-	markerInfo, err := workspaceRoot.Lstat(filepath.Join(relRun, templateCompleteMarker))
+	// An input snapshot is authoritative evidence that the attempt is active or
+	// incomplete. Check it before any marker so a corrupt, forged, or partially
+	// transitioned marker can never make GC remove paths a live goroutine owns.
+	if _, err := workspaceRoot.Lstat(filepath.Join(relRun, "inputs")); err == nil {
+		return time.Time{}, false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return time.Time{}, false, err
+	}
+
+	markerPath := filepath.Join(relRun, templateCompleteMarker)
+	markerLstat, err := workspaceRoot.Lstat(markerPath)
 	if err == nil {
-		if !markerInfo.Mode().IsRegular() {
+		if !markerLstat.Mode().IsRegular() {
 			return time.Time{}, false, fmt.Errorf("completion marker is not a regular file")
+		}
+		marker, openErr := workspaceRoot.Open(markerPath)
+		if openErr != nil {
+			return time.Time{}, false, fmt.Errorf("open completion marker: %w", openErr)
+		}
+		markerInfo, statErr := marker.Stat()
+		if statErr != nil {
+			return time.Time{}, false, errors.Join(
+				fmt.Errorf("stat completion marker: %w", statErr),
+				closeTemplateRootFile(marker, "completion marker"),
+			)
+		}
+		if !markerInfo.Mode().IsRegular() || !os.SameFile(markerLstat, markerInfo) {
+			return time.Time{}, false, errors.Join(
+				fmt.Errorf("completion marker changed while it was inspected"),
+				closeTemplateRootFile(marker, "completion marker"),
+			)
+		}
+		if markerInfo.Size() != int64(len(templateCompleteBody)) {
+			return time.Time{}, false, errors.Join(
+				fmt.Errorf("completion marker has invalid size"),
+				closeTemplateRootFile(marker, "completion marker"),
+			)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(marker, int64(len(templateCompleteBody)+1)))
+		closeErr := marker.Close()
+		if readErr != nil || closeErr != nil {
+			return time.Time{}, false, errors.Join(
+				wrapTemplateError(readErr, "read completion marker"),
+				wrapTemplateError(closeErr, "close completion marker"),
+			)
+		}
+		if string(body) != templateCompleteBody {
+			return time.Time{}, false, fmt.Errorf("completion marker has invalid contents")
 		}
 		return markerInfo.ModTime(), true, nil
 	}
@@ -684,11 +740,6 @@ func templateAttemptCompletionTime(workspaceRoot *os.Root, relRun string) (time.
 
 	// Backward compatibility for successful v2.175.0 attempts: successful
 	// completion removed inputs and retained out, but wrote no marker.
-	if _, err := workspaceRoot.Lstat(filepath.Join(relRun, "inputs")); err == nil {
-		return time.Time{}, false, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return time.Time{}, false, err
-	}
 	outInfo, err := workspaceRoot.Lstat(filepath.Join(relRun, "out"))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
