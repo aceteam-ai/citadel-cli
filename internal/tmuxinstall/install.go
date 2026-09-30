@@ -81,10 +81,17 @@ func (i *Installer) AlreadyInstalled() bool {
 //     should fall back to a bare shell)
 //   - (false, err) when an install was attempted and failed
 //
-// Ensure never executes the downloaded binary.
+// Ensure probes an already-installed binary with -V. It never executes a newly
+// downloaded binary as part of the install transaction.
 func (i *Installer) Ensure() (installed bool, err error) {
 	if i.AlreadyInstalled() {
-		return true, nil
+		if err := tmux.ValidateBinary(i.destPath); err == nil {
+			return true, nil
+		} else if !Available() {
+			return false, fmt.Errorf("managed tmux at %s is unusable and no supported replacement is available: %w", i.destPath, err)
+		}
+		// A supported, checksum-pinned source is available. Replace the old or
+		// malformed managed binary instead of reporting it as installed.
 	}
 	if !Available() {
 		// Gated/unsupported platform: not an error condition for best-effort
@@ -113,7 +120,7 @@ func (i *Installer) Install() error {
 // concrete (vetted) source. Split out for testability.
 func (i *Installer) installFrom(src Source) error {
 	if !src.vetted() {
-		return fmt.Errorf("refusing to install tmux: source is not checksum-verified (gated)")
+		return fmt.Errorf("refusing to install tmux: source is not checksum- and version-vetted (gated)")
 	}
 
 	destDir := filepath.Dir(i.destPath)

@@ -17,7 +17,7 @@ func makeFakeTmux(t *testing.T) string {
 	t.Helper()
 	enablePersistentTmuxForTest(t)
 	bin := filepath.Join(t.TempDir(), "tmux")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'tmux 3.4'\n"), 0o755); err != nil {
 		t.Fatalf("setup fake tmux: %v", err)
 	}
 	t.Setenv("CITADEL_TMUX_BIN", bin)

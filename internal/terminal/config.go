@@ -148,7 +148,7 @@ func DefaultConfig() *Config {
 		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
 		Shell:                getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
 		SessionName:          getEnvOrDefault("CITADEL_TERMINAL_SESSION", DefaultSessionName),
-		SessionTTL:           getEnvDuration("CITADEL_TERMINAL_SESSION_TTL", DefaultSessionTTL),
+		SessionTTL:           tmux.SessionLeaseTTLFromEnv(),
 		TrustMeshPeers:       getEnvBool("CITADEL_TERMINAL_TRUST_MESH", true),
 		AuthServiceURL:       getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
 		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
@@ -200,15 +200,6 @@ func getEnvBool(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
 		if boolVal, err := strconv.ParseBool(value); err == nil {
 			return boolVal
-		}
-	}
-	return defaultValue
-}
-
-func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
 		}
 	}
 	return defaultValue

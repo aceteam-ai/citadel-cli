@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/tmux"
@@ -35,11 +36,25 @@ type TmuxSessionHandler struct {
 	// DefaultShell is used for "ensure"/"create" when the payload omits "shell".
 	// Empty lets tmux use its configured default.
 	DefaultShell string
+	newManager   func() (tmuxSessionManager, error)
+	now          func() time.Time
+}
+
+type tmuxSessionManager interface {
+	ListSessions(context.Context) ([]string, error)
+	HasSession(context.Context, string) (bool, error)
+	EnsureSessionLease(context.Context, string, string, time.Time) error
 }
 
 // NewTmuxSessionHandler constructs a handler with an optional default shell.
 func NewTmuxSessionHandler(defaultShell string) *TmuxSessionHandler {
-	return &TmuxSessionHandler{DefaultShell: defaultShell}
+	return &TmuxSessionHandler{
+		DefaultShell: defaultShell,
+		newManager: func() (tmuxSessionManager, error) {
+			return tmux.NewManager()
+		},
+		now: time.Now,
+	}
 }
 
 // tmuxSessionResult is the JSON envelope returned to the dispatcher.
@@ -57,7 +72,7 @@ func (h *TmuxSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 		action = "ensure"
 	}
 
-	mgr, err := tmux.NewManager()
+	mgr, err := h.newManager()
 	if err != nil {
 		// tmux not available: surface the actionable guidance from the package.
 		return nil, err
@@ -88,7 +103,8 @@ func (h *TmuxSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 		if shell == "" {
 			shell = h.DefaultShell
 		}
-		if err := mgr.EnsureSession(bg, name, shell); err != nil {
+		leaseUntil := tmux.SessionLeaseDeadline(h.now(), tmux.SessionLeaseTTLFromEnv())
+		if err := mgr.EnsureSessionLease(bg, name, shell, leaseUntil); err != nil {
 			return nil, err
 		}
 		ctx.Log("info", "     - [Job %s] ensured tmux session %q", job.ID, name)

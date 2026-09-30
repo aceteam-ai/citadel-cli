@@ -132,17 +132,32 @@ func ManagedBinaryPath() string {
 func Resolve() (string, error) {
 	if override := os.Getenv(envTmuxBin); override != "" {
 		if fileExists(override) {
+			if err := probeTmuxVersion(override); err != nil {
+				return "", err
+			}
 			return override, nil
 		}
 		return "", fmt.Errorf("%w: %s=%q does not point to an existing file", ErrTmuxNotFound, envTmuxBin, override)
 	}
 
+	var incompatible error
 	if path, err := exec.LookPath("tmux"); err == nil {
-		return path, nil
+		if err := probeTmuxVersion(path); err == nil {
+			return path, nil
+		} else {
+			incompatible = err
+		}
 	}
 
 	if managed := ManagedBinaryPath(); fileExists(managed) {
-		return managed, nil
+		if err := probeTmuxVersion(managed); err == nil {
+			return managed, nil
+		} else if incompatible == nil {
+			incompatible = err
+		}
+	}
+	if incompatible != nil {
+		return "", incompatible
 	}
 
 	return "", ErrTmuxNotFound
@@ -182,7 +197,7 @@ func DefaultRunner() Runner { return execRunner{} }
 type Manager struct {
 	bin          string
 	runner       Runner
-	scopeCommand func(sessionName string, command []string) []string
+	scopeCommand func(sessionName string, command []string) scopeDecision
 }
 
 // NewManager resolves tmux and returns a Manager bound to it. It returns
@@ -192,7 +207,7 @@ func NewManager() (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{bin: bin, runner: DefaultRunner(), scopeCommand: PersistentSessionCommand}, nil
+	return &Manager{bin: bin, runner: DefaultRunner(), scopeCommand: persistentSessionDecision}, nil
 }
 
 // NewManagerWith constructs a Manager from an explicit binary path and Runner.
@@ -369,20 +384,33 @@ func (m *Manager) ensureSessionLease(ctx context.Context, name, shell string, le
 	// Ownership is established in the same tmux command queue as creation.
 	// tmux aborts the remaining queue on a duplicate-session error, so a
 	// pre-existing or racing operator session cannot receive our marker.
-	command := append([]string{m.bin}, NewManagedDetachedArgs(name, shell, leaseUnix(leaseUntil))...)
-	command = m.scopeCommand(name, command)
-	if out, createErr := m.runner.Run(ctx, command[0], command[1:]...); createErr != nil {
+	directCommand := append([]string{m.bin}, NewManagedDetachedArgs(name, shell, leaseUnix(leaseUntil))...)
+	decision := m.scopeCommand(name, directCommand)
+	out, createErr := m.runner.Run(ctx, decision.command[0], decision.command[1:]...)
+	if createErr != nil {
 		// Another creator may have won the absent->create race. It is safe to
 		// continue only if that winner has already marked the session as
 		// Citadel-owned; an unmarked winner remains an operator collision.
-		status, nowExists, inspectErr := m.sessionStatus(ctx, name)
-		if inspectErr == nil && nowExists {
-			if !status.Managed {
-				return SessionStatus{}, fmt.Errorf("%w: %q", ErrSessionNameCollision, name)
-			}
-			return m.setSessionLease(ctx, status, leaseUntil)
+		if recovered, handled, err := m.recoverCreateRace(ctx, name, leaseUntil); handled {
+			return recovered, err
 		}
-		return SessionStatus{}, fmt.Errorf("tmux new-session failed: %w: %s", createErr, strings.TrimSpace(string(out)))
+		if !decision.scoped || ctx.Err() != nil {
+			return SessionStatus{}, fmt.Errorf("tmux new-session failed: %w: %s", createErr, strings.TrimSpace(string(out)))
+		}
+
+		// systemd-run was selected successfully at build time but failed before
+		// it launched tmux. Retry the exact same atomic create/mark/lease queue
+		// directly. The intervening ownership inspection above is load-bearing:
+		// a racing operator session is rejected before this fallback can run.
+		logf("tmux session %q transient scope failed at runtime; retrying the atomic create command unscoped: %v: %s",
+			name, createErr, strings.TrimSpace(string(out)))
+		out, createErr = m.runner.Run(ctx, directCommand[0], directCommand[1:]...)
+		if createErr != nil {
+			if recovered, handled, err := m.recoverCreateRace(ctx, name, leaseUntil); handled {
+				return recovered, err
+			}
+			return SessionStatus{}, fmt.Errorf("tmux unscoped fallback new-session failed: %w: %s", createErr, strings.TrimSpace(string(out)))
+		}
 	}
 
 	status, exists, err = m.sessionStatus(ctx, name)
@@ -395,6 +423,21 @@ func (m *Manager) ensureSessionLease(ctx context.Context, name, shell string, le
 	return status, nil
 }
 
+func (m *Manager) recoverCreateRace(ctx context.Context, name string, leaseUntil time.Time) (SessionStatus, bool, error) {
+	status, exists, err := m.sessionStatus(ctx, name)
+	if err != nil {
+		return SessionStatus{}, true, err
+	}
+	if !exists {
+		return SessionStatus{}, false, nil
+	}
+	if !status.Managed {
+		return SessionStatus{}, true, fmt.Errorf("%w: %q", ErrSessionNameCollision, name)
+	}
+	status, err = m.setSessionLease(ctx, status, leaseUntil)
+	return status, true, err
+}
+
 // PrepareSession ensures ownership/lease then returns the scoped attach command
 // for a terminal PTY.
 func (m *Manager) PrepareSession(ctx context.Context, name, shell string, leaseUntil time.Time) ([]string, error) {
@@ -403,7 +446,7 @@ func (m *Manager) PrepareSession(ctx context.Context, name, shell string, leaseU
 		return nil, err
 	}
 	command := append([]string{m.bin}, AttachOwnedSessionArgs(status, leaseUnix(leaseUntil))...)
-	return m.scopeCommand(name, command), nil
+	return m.scopeCommand(name, command).command, nil
 }
 
 // RenewSessionLease extends only an already-marked Citadel session.
@@ -492,23 +535,32 @@ func (m *Manager) ReapExpiredSessions(ctx context.Context, now time.Time) ([]str
 	}
 
 	var reaped []string
+	var reapErrors []error
 	for _, status := range statuses {
 		if !reapEligible(status, now) {
 			continue
 		}
 		if out, err := m.runner.Run(ctx, m.bin, ReapExpiredLeaseArgs(status)...); err != nil {
-			return reaped, fmt.Errorf("tmux conditional reap %q failed: %w: %s", status.Name, err, strings.TrimSpace(string(out)))
+			reapErrors = append(reapErrors, fmt.Errorf("tmux conditional reap %q failed: %w: %s", status.Name, err, strings.TrimSpace(string(out))))
+			if ctx.Err() != nil {
+				break
+			}
+			continue
 		}
 		exists, err := m.HasSession(ctx, status.Name)
 		if err != nil {
-			return reaped, err
+			reapErrors = append(reapErrors, fmt.Errorf("verify tmux reap %q: %w", status.Name, err))
+			if ctx.Err() != nil {
+				break
+			}
+			continue
 		}
 		if exists {
 			continue
 		}
 		reaped = append(reaped, status.Name)
 	}
-	return reaped, nil
+	return reaped, errors.Join(reapErrors...)
 }
 
 func (m *Manager) listSessionStatuses(ctx context.Context) ([]SessionStatus, error) {
