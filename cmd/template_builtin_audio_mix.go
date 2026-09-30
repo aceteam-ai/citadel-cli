@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -37,13 +38,15 @@ func liveAudioMixDeps() audioMixDeps {
 	return audioMixDeps{
 		lookFFmpeg: func() (string, error) { return exec.LookPath("ffmpeg") },
 		run: func(ctx context.Context, bin string, args []string) ([]byte, error) {
-			cmd, err := renderLimitedCommand(ctx, bin, args...)
+			limited, err := renderLimitedCommand(ctx, minimalRenderChildEnv(""), bin, args...)
 			if err != nil {
 				return nil, err
 			}
+			cmd := limited.cmd
 			cmd.WaitDelay = 5 * time.Second
-			configurePapercraftProcessTree(cmd)
-			return cmd.CombinedOutput()
+			terminateTree := configurePapercraftProcessTree(limited)
+			out, runErr := cmd.CombinedOutput()
+			return out, errors.Join(runErr, terminateTree())
 		},
 	}
 }

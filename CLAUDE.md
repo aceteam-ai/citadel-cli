@@ -1426,16 +1426,24 @@ shell. `papercraft-render` shares Chromium discovery with
 `platform.FindChromium` and the persistent request/response CDP transport in
 `internal/cobrowsestream`. `startPapercraftAssetServer` is the browser's
 non-forwarding HTTP proxy: its random route serves declared inputs only, while
-every other HTTP/HTTPS/WebSocket request fails there and CDP blocks `file://`
-before navigation. Keep Chromium's `<-loopback>` proxy rule -- allowing ordinary
+every other HTTP/HTTPS/WebSocket request fails there and CDP blocks `file://`,
+`data:`, `blob:`, WebSocket, and FTP before navigation. Keep Chromium's
+`<-loopback>` proxy rule -- allowing ordinary
 loopback bypass would turn render HTML into a localhost-SSRF primitive. The
 browser also disables non-proxied WebRTC UDP, captures the Paper Trail 10 fps
 animation states, and pipes them to a 30 fps ffmpeg encode for both required
 stages. `newRenderLimitedCommand` owns the Linux cgroup ceilings inherited by
-Chromium, its helpers, and ffmpeg; it deliberately fails closed on a missing
-systemd manager and on non-Linux systems. Both builtins additionally apply the
-independent `renderJobWallTimeout`. Browser cancellation must terminate and wait
-for the process tree before profile removal; cleanup failure is a run failure.
+Chromium, its helpers, and ffmpeg. A rootless launch preflights delegated
+`cpu`/`memory`/`pids` controllers, and every child crosses an `env -i` boundary
+with only the render allowlist rather than worker credentials. Each launch owns
+a random named scope; shutdown stops that scope as well as its process group so
+a `setsid` descendant cannot escape, and cleanup failure is a run failure. The
+constructor deliberately fails closed on missing systemd launch/cleanup tools
+and on non-Linux systems. The Windows process helper is only a compile stub; it
+is unreachable behind that non-Linux refusal, not a partial taskkill fallback.
+Both builtins additionally apply the independent `renderJobWallTimeout`.
+Browser cancellation must terminate and wait for the process tree before
+profile removal.
 `audio-mix` is the portable ffmpeg `amix` plus two-pass -14 LUFS bridge; Paper
 Trail's numpy procedural synthesis is deliberately not copied here. The exact
 input, param, and output contract is in

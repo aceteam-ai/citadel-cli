@@ -65,7 +65,7 @@ type papercraftPage interface {
 type papercraftEncoder interface {
 	WriteFrame([]byte) error
 	Finish() error
-	Abort()
+	Abort() error
 }
 
 type papercraftEncoderConfig struct {
@@ -180,7 +180,7 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 		if renderErr == nil {
 			renderErr = encoder.Finish()
 		} else {
-			encoder.Abort()
+			renderErr = errors.Join(renderErr, encoder.Abort())
 		}
 		cleanupErr := cleanupPapercraftRender(page, profileDir, deps.removeAll)
 		if combined := errors.Join(renderErr, cleanupErr); combined != nil {
@@ -390,12 +390,7 @@ func startChromiumRenderPage(ctx context.Context, html string, width, height int
 		return nil, errors.Join(err, closeAssetServer())
 	}
 	args := papercraftChromiumArgs(profileDir, width, height, port, proxyURL, runtime.GOOS, platform.IsRoot())
-	env := withEnvOverrides(os.Environ(),
-		"HOME="+profileDir,
-		"XDG_CACHE_HOME="+filepath.Join(profileDir, "cache"),
-		"XDG_CONFIG_HOME="+filepath.Join(profileDir, "config"),
-		"TMPDIR="+profileDir, "TMP="+profileDir, "TEMP="+profileDir,
-	)
+	env := minimalRenderChildEnv(profileDir)
 	process, err := startChromiumProcess(ctx, chrome, args, env)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("start Chromium: %w", err), closeAssetServer())
@@ -446,20 +441,20 @@ func startChromiumRenderPage(ctx context.Context, html string, width, height int
 
 func startChromiumProcess(ctx context.Context, binary string, args, env []string) (*execChromiumProcess, error) {
 	procCtx, cancel := context.WithCancel(ctx)
-	cmd, err := renderLimitedCommand(procCtx, binary, args...)
+	limited, err := renderLimitedCommand(procCtx, env, binary, args...)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
+	cmd := limited.cmd
 	stderr := &bytes.Buffer{}
 	cmd.Stdout = io.Discard
 	cmd.Stderr = stderr
-	cmd.Env = env
 	cmd.WaitDelay = 5 * time.Second
-	terminateTree := configurePapercraftProcessTree(cmd)
+	terminateTree := configurePapercraftProcessTree(limited)
 	if err := cmd.Start(); err != nil {
 		cancel()
-		return nil, err
+		return nil, errors.Join(err, terminateTree())
 	}
 	process := &execChromiumProcess{
 		cancel:        cancel,
@@ -575,7 +570,7 @@ func papercraftChromiumArgs(profileDir string, width, height, port int, proxyURL
 }
 
 func papercraftBlockedURLs() []string {
-	return []string{"file://*", "ws://*", "wss://*", "ftp://*"}
+	return []string{"file://*", "data:*", "blob:*", "ws://*", "wss://*", "ftp://*"}
 }
 
 // startPapercraftAssetServer serves the render document and its relative assets
@@ -798,21 +793,22 @@ func startPapercraftFFmpeg(ctx context.Context, cfg papercraftEncoderConfig) (pa
 		return nil, fmt.Errorf("ffmpeg not found in PATH: install ffmpeg on the render node")
 	}
 	args := papercraftFFmpegArgs(cfg)
-	cmd, err := renderLimitedCommand(ctx, ffmpeg, args...)
+	limited, err := renderLimitedCommand(ctx, minimalRenderChildEnv(filepath.Dir(cfg.OutputPath)), ffmpeg, args...)
 	if err != nil {
 		return nil, err
 	}
+	cmd := limited.cmd
 	stderr := &bytes.Buffer{}
 	cmd.Stderr = stderr
 	cmd.WaitDelay = 5 * time.Second
-	terminateTree := configurePapercraftProcessTree(cmd)
+	terminateTree := configurePapercraftProcessTree(limited)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
-		return nil, err
+		return nil, errors.Join(err, terminateTree())
 	}
 	return &ffmpegFrameEncoder{cmd: cmd, stdin: stdin, stderr: stderr, terminateTree: terminateTree}, nil
 }
@@ -849,22 +845,25 @@ func (e *ffmpegFrameEncoder) Finish() error {
 	}
 	e.done = true
 	if err := e.stdin.Close(); err != nil {
-		_ = e.terminateTree()
+		terminateErr := e.terminateTree()
 		_ = e.cmd.Wait()
-		return err
+		return errors.Join(err, terminateErr)
 	}
-	if err := e.cmd.Wait(); err != nil {
-		return fmt.Errorf("ffmpeg exited: %w: %s", err, compactCommandOutput(e.stderr.Bytes()))
+	waitErr := e.cmd.Wait()
+	terminateErr := e.terminateTree()
+	if waitErr != nil {
+		return errors.Join(fmt.Errorf("ffmpeg exited: %w: %s", waitErr, compactCommandOutput(e.stderr.Bytes())), terminateErr)
 	}
-	return nil
+	return terminateErr
 }
 
-func (e *ffmpegFrameEncoder) Abort() {
+func (e *ffmpegFrameEncoder) Abort() error {
 	if e.done {
-		return
+		return nil
 	}
 	e.done = true
-	_ = e.stdin.Close()
-	_ = e.terminateTree()
-	_ = e.cmd.Wait()
+	closeErr := e.stdin.Close()
+	terminateErr := e.terminateTree()
+	waitErr := e.cmd.Wait()
+	return errors.Join(closeErr, terminateErr, waitErr)
 }

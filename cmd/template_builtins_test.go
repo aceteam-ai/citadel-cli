@@ -40,10 +40,20 @@ func TestDecodeBuiltinParamsUsesExactKeys(t *testing.T) {
 	}
 }
 
-func TestWithEnvOverridesRemovesEarlierValues(t *testing.T) {
-	got := withEnvOverrides([]string{"PATH=/bin", "HOME=/real", "home=/also-real"}, "HOME=/isolated", "TMP=/isolated")
-	if !reflect.DeepEqual(got, []string{"PATH=/bin", "HOME=/isolated", "TMP=/isolated"}) {
-		t.Fatalf("env = %v", got)
+func TestMinimalRenderChildEnvDoesNotLeakWorkerCredentials(t *testing.T) {
+	t.Setenv("CITADEL_DEVICE_API_TOKEN", "worker-secret")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "cloud-secret")
+	t.Setenv("PATH", "/safe/bin")
+	got := minimalRenderChildEnv("/attempt/profile")
+	for _, entry := range got {
+		if strings.Contains(entry, "worker-secret") || strings.Contains(entry, "cloud-secret") || strings.HasPrefix(entry, "CITADEL_") || strings.HasPrefix(entry, "AWS_") {
+			t.Fatalf("render child inherited worker credential: %q", entry)
+		}
+	}
+	for _, want := range []string{"HOME=/attempt/profile", "PATH=/safe/bin", "XDG_CACHE_HOME=/attempt/profile/cache", "TMPDIR=/attempt/profile"} {
+		if !containsString(got, want) {
+			t.Errorf("minimal env missing %q: %v", want, got)
+		}
 	}
 }
 
@@ -91,7 +101,7 @@ type fakePapercraftEncoder struct {
 }
 
 func (e *fakePapercraftEncoder) WriteFrame([]byte) error { e.frames++; return nil }
-func (e *fakePapercraftEncoder) Abort()                  { e.aborted = true }
+func (e *fakePapercraftEncoder) Abort() error            { e.aborted = true; return nil }
 func (e *fakePapercraftEncoder) Finish() error {
 	e.finished = true
 	return os.WriteFile(e.cfg.OutputPath, []byte("mp4"), 0o600)
@@ -255,10 +265,12 @@ func TestPapercraftChromiumArgsKeepSandboxAndBlockWebRTCUDP(t *testing.T) {
 	}
 }
 
-func TestPapercraftBlocksLocalFilesBeforeNavigation(t *testing.T) {
+func TestPapercraftBlocksNonProxySchemesBeforeNavigation(t *testing.T) {
 	blocked := papercraftBlockedURLs()
-	if !containsString(blocked, "file://*") {
-		t.Fatalf("blocked URLs = %v, want file://*", blocked)
+	for _, want := range []string{"file://*", "data:*", "blob:*", "ws://*", "wss://*", "ftp://*"} {
+		if !containsString(blocked, want) {
+			t.Errorf("blocked URLs = %v, want %q", blocked, want)
+		}
 	}
 }
 
@@ -309,8 +321,8 @@ func TestPapercraftChromiumCannotLoadFileURLSubresource(t *testing.T) {
 		t.Skip("Chromium is not installed")
 	}
 	originalCommand := renderLimitedCommand
-	renderLimitedCommand = func(ctx context.Context, binary string, args ...string) (*exec.Cmd, error) {
-		return exec.CommandContext(ctx, binary, args...), nil
+	renderLimitedCommand = func(ctx context.Context, _ []string, binary string, args ...string) (*renderCommand, error) {
+		return &renderCommand{cmd: exec.CommandContext(ctx, binary, args...)}, nil
 	}
 	t.Cleanup(func() { renderLimitedCommand = originalCommand })
 

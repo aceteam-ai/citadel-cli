@@ -4,16 +4,17 @@ package cmd
 
 import (
 	"errors"
-	"os/exec"
+	"fmt"
 	"sync"
 	"syscall"
 )
 
-// configurePapercraftProcessTree places Chromium and every renderer/helper it
-// forks in a dedicated process group. CommandContext cancellation then kills
-// the whole group before Wait returns, rather than leaving browser children
-// holding the temporary profile open.
-func configurePapercraftProcessTree(cmd *exec.Cmd) func() error {
+// configurePapercraftProcessTree combines a process-group kill with the
+// transient systemd scope stop owned by newRenderLimitedCommand. The process
+// group is a fast local fallback; the scope is authoritative for descendants
+// that call setsid and escape their ancestor's pgid.
+func configurePapercraftProcessTree(limited *renderCommand) func() error {
+	cmd := limited.cmd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var (
 		stopOnce sync.Once
@@ -24,9 +25,12 @@ func configurePapercraftProcessTree(cmd *exec.Cmd) func() error {
 			return nil
 		}
 		stopOnce.Do(func() {
+			scopeErr := limited.stopSystemdScope()
+			var groupErr error
 			if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-				stopErr = err
+				groupErr = fmt.Errorf("kill render process group: %w", err)
 			}
+			stopErr = errors.Join(scopeErr, groupErr)
 		})
 		return stopErr
 	}
