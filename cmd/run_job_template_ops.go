@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -71,6 +73,24 @@ type liveTemplateRunOps struct {
 	nodeID       string
 }
 
+const (
+	// These are code-owned execution-policy limits, not feature flags. The input
+	// ceiling permits sizable media assets without allowing one delivery to stage
+	// an unbounded snapshot. The output ceiling accommodates the two hour-scale
+	// videos or one PCM mix produced by today's approved builtins.
+	templateMaxInputBytes  int64 = 4 << 30
+	templateMaxOutputFiles       = 16
+	templateMaxOutputBytes int64 = 8 << 30
+
+	// Lazy node:path consumers need successful outputs after the job completes.
+	// Seven days covers delayed collection/retry without making artifacts
+	// permanent. A sweep runs before each template attempt.
+	templateOutputRetention = 7 * 24 * time.Hour
+	templateCompleteMarker  = ".citadel-complete-v1"
+)
+
+var templateGCMu sync.Mutex
+
 // Run dispatches an already-verified template request to its builtin, collects
 // the outputs as node-backed references, and (when enabled) attaches a signed
 // receipt. The worker handler has already checked the per-node gate, the manifest
@@ -94,6 +114,10 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", worker.ErrTemplateUnknownHandler, runner.Handler)
 	}
+	inputFiles, err := jobs.ParseTemplateInputFiles(req.InputFiles, o.nodeID)
+	if err != nil {
+		return nil, err
+	}
 
 	workspaceDir, err := filepath.Abs(o.workspaceDir)
 	if err != nil {
@@ -108,6 +132,9 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 		return nil, fmt.Errorf("open workspace root: %w", err)
 	}
 	defer workspaceRoot.Close()
+	if err := pruneRetainedTemplateAttempts(workspaceRoot, time.Now(), templateOutputRetention); err != nil {
+		return nil, fmt.Errorf("prune retained template outputs: %w", err)
+	}
 
 	// Each delivery attempt owns a unique namespace. executeWithDeadline can
 	// abandon a handler that has not observed cancellation yet; a later retry
@@ -129,7 +156,7 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("open input staging root: %w", err), removeTemplateAttempt(workspaceRoot, relRun))
 	}
-	inputs, inputRels, inputHashes, err := o.resolveInputs(ctx, req.InputFiles, workspaceRoot, inputRoot, filepath.Join(workspaceRoot.Name(), relInputs))
+	inputs, inputRels, inputHashes, err := o.resolveInputs(ctx, inputFiles, workspaceRoot, inputRoot, filepath.Join(workspaceRoot.Name(), relInputs), templateMaxInputBytes)
 	if err != nil {
 		return nil, errors.Join(err, cleanupTemplateAttempt(workspaceRoot, inputRoot, nil, relRun))
 	}
@@ -146,11 +173,11 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 		return nil, errors.Join(err, cleanupTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun))
 	}
 
-	outputs, outputDigests, err := o.collectOutputs(ctx, outRoot, relOut, outRels)
+	outputs, outputDigests, err := o.collectOutputs(ctx, outRoot, relOut, outRels, templateMaxOutputFiles, templateMaxOutputBytes)
 	if err != nil {
 		return nil, errors.Join(err, cleanupTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun))
 	}
-	if err := finishTemplateAttempt(workspaceRoot, inputRoot, outRoot, relInputs); err != nil {
+	if err := finishTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun, relInputs); err != nil {
 		return nil, err
 	}
 
@@ -167,21 +194,24 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 // copies it into a private per-run snapshot, and hashes the bytes while writing
 // that snapshot. Builtins consume only the staged paths, so InputHashes describe
 // the bytes they see rather than an earlier by-name read of a mutable source.
-func (o liveTemplateRunOps) resolveInputs(ctx context.Context, raw json.RawMessage, workspaceRoot, inputRoot *os.Root, inputDir string) ([]string, []string, []string, error) {
-	files, err := jobs.ParseTemplateInputFiles(raw, o.nodeID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+func (o liveTemplateRunOps) resolveInputs(ctx context.Context, files []jobs.TemplateInputFile, workspaceRoot, inputRoot *os.Root, inputDir string, maxBytes int64) ([]string, []string, []string, error) {
 	paths := make([]string, 0, len(files))
 	rels := make([]string, 0, len(files))
 	hashes := make([]string, 0, len(files))
 	stagedHashes := make(map[string]string, len(files))
+	stagedSizes := make(map[string]int64, len(files))
+	var declaredBytes int64
 	for _, f := range files {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, err
 		}
 		rel := filepath.FromSlash(f.NodePath)
 		if digest, ok := stagedHashes[rel]; ok {
+			size := stagedSizes[rel]
+			if size > maxBytes-declaredBytes {
+				return nil, nil, nil, fmt.Errorf("declared input bytes exceed %d-byte limit", maxBytes)
+			}
+			declaredBytes += size
 			paths = append(paths, filepath.Join(inputDir, rel))
 			rels = append(rels, rel)
 			hashes = append(hashes, digest)
@@ -196,6 +226,12 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, raw json.RawMessa
 			return nil, nil, nil, errors.Join(
 				fmt.Errorf("input file %q is not present on this node", f.NodePath),
 				wrapTemplateError(statErr, "stat input %q", f.NodePath),
+				closeTemplateRootFile(src, "input source"),
+			)
+		}
+		if info.Size() < 0 || info.Size() > maxBytes-declaredBytes {
+			return nil, nil, nil, errors.Join(
+				fmt.Errorf("declared input bytes exceed %d-byte limit at %q", maxBytes, f.NodePath),
 				closeTemplateRootFile(src, "input source"),
 			)
 		}
@@ -216,7 +252,7 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, raw json.RawMessa
 			)
 		}
 		h := sha256.New()
-		_, copyErr := copyTemplateWithContext(ctx, io.MultiWriter(dst, h), src)
+		copied, copyErr := copyTemplateWithContextLimit(ctx, io.MultiWriter(dst, h), src, maxBytes-declaredBytes)
 		closeSrcErr := src.Close()
 		chmodErr := dst.Chmod(0o400)
 		closeDstErr := dst.Close()
@@ -230,6 +266,8 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, raw json.RawMessa
 		}
 		digest := "sha256:" + hex.EncodeToString(h.Sum(nil))
 		stagedHashes[rel] = digest
+		stagedSizes[rel] = copied
+		declaredBytes += copied
 		paths = append(paths, filepath.Join(inputDir, rel))
 		rels = append(rels, rel)
 		hashes = append(hashes, digest)
@@ -274,12 +312,16 @@ func verifyStagedTemplateInputs(ctx context.Context, inputRoot *os.Root, rels, h
 // per-run output root. os.Root follows only symlinks that remain beneath that
 // root and opens the validated target directly, closing both the sibling-path
 // gap and the validate-then-open race.
-func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root, relOut string, outRels []string) ([]worker.TemplateOutput, []string, error) {
+func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root, relOut string, outRels []string, maxFiles int, maxBytes int64) ([]worker.TemplateOutput, []string, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if err := validateTemplateOutputTree(outRoot, outRels, maxFiles, maxBytes); err != nil {
 		return nil, nil, err
 	}
 	outputs := make([]worker.TemplateOutput, 0, len(outRels))
 	digests := make([]string, 0, len(outRels))
+	remainingBytes := maxBytes
 	for _, rel := range outRels {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
@@ -299,7 +341,7 @@ func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root
 				closeTemplateRootFile(f, "output"),
 			)
 		}
-		digest, size, hashErr := sha256OpenFile(ctx, f)
+		digest, size, hashErr := sha256OpenFileLimit(ctx, f, remainingBytes)
 		closeErr := f.Close()
 		if hashErr != nil {
 			return nil, nil, errors.Join(
@@ -310,6 +352,7 @@ func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root
 		if closeErr != nil {
 			return nil, nil, fmt.Errorf("close output %q: %w", rel, closeErr)
 		}
+		remainingBytes -= size
 		outputs = append(outputs, worker.TemplateOutput{
 			Path:   filepath.ToSlash(filepath.Join(relOut, rel)),
 			SHA256: "sha256:" + digest,
@@ -318,6 +361,69 @@ func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root
 		digests = append(digests, "sha256:"+digest)
 	}
 	return outputs, digests, nil
+}
+
+// validateTemplateOutputTree bounds what will be retained, not merely what a
+// builtin reports. Otherwise an unreported file could bypass both caps and live
+// forever beside an accepted output. Symlinks and special files are rejected so
+// counting and later lazy reads have one unambiguous regular-file meaning.
+func validateTemplateOutputTree(outRoot *os.Root, outRels []string, maxFiles int, maxBytes int64) error {
+	if len(outRels) > maxFiles {
+		return fmt.Errorf("builtin reported %d outputs; limit is %d", len(outRels), maxFiles)
+	}
+	want := make(map[string]struct{}, len(outRels))
+	for _, rel := range outRels {
+		if rel == "" || rel == "." || filepath.IsAbs(rel) || !filepath.IsLocal(rel) || filepath.Clean(rel) != rel {
+			return fmt.Errorf("output %q is not a canonical path beneath the per-run output directory", rel)
+		}
+		rel = filepath.ToSlash(rel)
+		if _, duplicate := want[rel]; duplicate {
+			return fmt.Errorf("output %q was reported more than once", rel)
+		}
+		want[rel] = struct{}{}
+	}
+
+	seen := make(map[string]struct{}, len(outRels))
+	var count int
+	var total int64
+	err := fs.WalkDir(outRoot.FS(), ".", func(name string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if name == "." || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("output tree entry %q is not a regular file", name)
+		}
+		name = path.Clean(name)
+		if _, reported := want[name]; !reported {
+			return fmt.Errorf("builtin left unreported output file %q", name)
+		}
+		count++
+		if count > maxFiles {
+			return fmt.Errorf("output tree contains more than %d files", maxFiles)
+		}
+		if info.Size() < 0 || info.Size() > maxBytes-total {
+			return fmt.Errorf("output bytes exceed %d-byte limit", maxBytes)
+		}
+		total += info.Size()
+		seen[name] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for name := range want {
+		if _, ok := seen[name]; !ok {
+			return fmt.Errorf("reported output %q was not written as a regular file", name)
+		}
+	}
+	return nil
 }
 
 // signRunJobTemplateReceipt builds the signed AEP v2 run_job_template receipt
@@ -385,7 +491,26 @@ func sha256OpenFile(ctx context.Context, f *os.File) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
+func sha256OpenFileLimit(ctx context.Context, f *os.File, maxBytes int64) (string, int64, error) {
+	h := sha256.New()
+	n, err := copyTemplateWithContextLimit(ctx, h, f, maxBytes)
+	if err != nil {
+		return "", n, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
 func copyTemplateWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	return copyTemplateWithContextLimit(ctx, dst, src, int64(^uint64(0)>>1))
+}
+
+// copyTemplateWithContextLimit refuses before writing the byte that would cross
+// maxBytes. The pre-copy Stat check makes ordinary oversized inputs cheap; this
+// streaming check closes the race where a source grows after Stat.
+func copyTemplateWithContextLimit(ctx context.Context, dst io.Writer, src io.Reader, maxBytes int64) (int64, error) {
+	if maxBytes < 0 {
+		return 0, fmt.Errorf("byte limit must not be negative")
+	}
 	buf := make([]byte, 128*1024)
 	var written int64
 	for {
@@ -396,6 +521,9 @@ func copyTemplateWithContext(ctx context.Context, dst io.Writer, src io.Reader) 
 		if nr > 0 {
 			if err := ctx.Err(); err != nil {
 				return written, err
+			}
+			if int64(nr) > maxBytes-written {
+				return written, fmt.Errorf("byte limit of %d exceeded", maxBytes)
 			}
 			nw, writeErr := dst.Write(buf[:nr])
 			written += int64(nw)
@@ -434,12 +562,22 @@ func cleanupTemplateAttempt(workspaceRoot, inputRoot, outRoot *os.Root, relRun s
 	)
 }
 
-func finishTemplateAttempt(workspaceRoot, inputRoot, outRoot *os.Root, relInputs string) error {
-	return errors.Join(
+func finishTemplateAttempt(workspaceRoot, inputRoot, outRoot *os.Root, relRun, relInputs string) error {
+	if err := errors.Join(
 		closeTemplateRoot(inputRoot, "input staging root"),
 		closeTemplateRoot(outRoot, "output root"),
 		wrapTemplateError(workspaceRoot.RemoveAll(relInputs), "remove input staging directory"),
-	)
+	); err != nil {
+		return errors.Join(err, removeTemplateAttempt(workspaceRoot, relRun))
+	}
+	marker := filepath.Join(relRun, templateCompleteMarker)
+	if err := workspaceRoot.WriteFile(marker, []byte("complete\n"), 0o400); err != nil {
+		return errors.Join(
+			fmt.Errorf("mark template attempt complete: %w", err),
+			removeTemplateAttempt(workspaceRoot, relRun),
+		)
+	}
+	return nil
 }
 
 func removeTemplateAttempt(workspaceRoot *os.Root, relRun string) error {
@@ -465,4 +603,118 @@ func wrapTemplateError(err error, format string, args ...any) error {
 		return nil
 	}
 	return fmt.Errorf(format+": %w", append(args, err)...)
+}
+
+// pruneRetainedTemplateAttempts removes only completed, attempt-shaped
+// namespaces older than retention. An attempt with an inputs directory is
+// active or incomplete and is preserved even if very old; this prevents a
+// watchdog-abandoned goroutine from losing paths it may still own. Successful
+// pre-marker attempts are recognized by the legacy out-without-inputs shape.
+func pruneRetainedTemplateAttempts(workspaceRoot *os.Root, now time.Time, retention time.Duration) error {
+	if retention <= 0 {
+		return fmt.Errorf("template output retention must be positive")
+	}
+	templateGCMu.Lock()
+	defer templateGCMu.Unlock()
+
+	if _, err := workspaceRoot.Stat("templates"); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	templates, err := fs.ReadDir(workspaceRoot.FS(), "templates")
+	if err != nil {
+		return err
+	}
+	cutoff := now.Add(-retention)
+	for _, templateEntry := range templates {
+		if !templateEntry.IsDir() {
+			continue
+		}
+		templateRel := path.Join("templates", templateEntry.Name())
+		jobsEntries, err := fs.ReadDir(workspaceRoot.FS(), templateRel)
+		if err != nil {
+			return err
+		}
+		for _, jobEntry := range jobsEntries {
+			if !jobEntry.IsDir() {
+				continue
+			}
+			jobRel := path.Join(templateRel, jobEntry.Name())
+			attempts, err := fs.ReadDir(workspaceRoot.FS(), jobRel)
+			if err != nil {
+				return err
+			}
+			for _, attemptEntry := range attempts {
+				if !attemptEntry.IsDir() || !isTemplateAttemptSegment(attemptEntry.Name()) {
+					continue
+				}
+				attemptRelSlash := path.Join(jobRel, attemptEntry.Name())
+				attemptRel := filepath.FromSlash(attemptRelSlash)
+				completedAt, eligible, err := templateAttemptCompletionTime(workspaceRoot, attemptRel)
+				if err != nil {
+					return fmt.Errorf("inspect %s: %w", attemptRelSlash, err)
+				}
+				// "Older than" is strict: an attempt exactly at the cutoff is
+				// retained until the next sweep.
+				if !eligible || !completedAt.Before(cutoff) {
+					continue
+				}
+				if err := workspaceRoot.RemoveAll(attemptRel); err != nil {
+					return fmt.Errorf("remove expired attempt %s: %w", attemptRelSlash, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func templateAttemptCompletionTime(workspaceRoot *os.Root, relRun string) (time.Time, bool, error) {
+	markerInfo, err := workspaceRoot.Lstat(filepath.Join(relRun, templateCompleteMarker))
+	if err == nil {
+		if !markerInfo.Mode().IsRegular() {
+			return time.Time{}, false, fmt.Errorf("completion marker is not a regular file")
+		}
+		return markerInfo.ModTime(), true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return time.Time{}, false, err
+	}
+
+	// Backward compatibility for successful v2.175.0 attempts: successful
+	// completion removed inputs and retained out, but wrote no marker.
+	if _, err := workspaceRoot.Lstat(filepath.Join(relRun, "inputs")); err == nil {
+		return time.Time{}, false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return time.Time{}, false, err
+	}
+	outInfo, err := workspaceRoot.Lstat(filepath.Join(relRun, "out"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
+	}
+	if !outInfo.IsDir() {
+		return time.Time{}, false, fmt.Errorf("legacy output path is not a directory")
+	}
+	attemptInfo, err := workspaceRoot.Lstat(relRun)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return attemptInfo.ModTime(), true, nil
+}
+
+func isTemplateAttemptSegment(name string) bool {
+	const prefix = "attempt-"
+	if len(name) != len(prefix)+32 || !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	for _, c := range name[len(prefix):] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

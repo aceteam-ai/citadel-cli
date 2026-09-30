@@ -49,6 +49,10 @@ or dispatched params through a different spelling with the same manifest hash.
 Every input must have `node_id` equal to the locally configured executing node
 and a canonical workspace-relative `node_path`. `path` must be that same relative
 path or `node:<node_id>/<node_path>`, matching platform `FileValue` references.
+The node accepts at most 128 declared inputs and 4 GiB of declared input bytes
+per attempt. Repeated references count repeatedly toward the byte ceiling even
+though their snapshot is staged only once. Both limits are fixed execution
+policy, not operator-tunable feature flags.
 Missing or foreign identity, inconsistent paths, malformed references, traversal,
 and workspace-escaping symlinks are refused. All reference metadata is validated
 before resolving or hashing any input. The workspace's absolute path is fully
@@ -70,6 +74,15 @@ deadline can therefore release the serialized lane without letting an older,
 slow-to-cancel goroutine collide with a retry's paths. Staging, post-run input
 verification, and output hashing check cancellation between reads and writes;
 failed attempts remove only their own namespace and report cleanup failures.
+At most 16 regular output files totaling 8 GiB are retained. Every regular file
+left in `out` must be reported by the builtin; duplicate paths, unreported files,
+symlinks, special files, and boundary overruns fail the attempt and remove its
+namespace. Successful output namespaces carry a node-owned completion marker and
+remain available for lazy `node:<node_id>/<path>` reads for seven days. A sweep
+before each new template attempt removes only completed namespaces strictly older
+than that window. Active or incomplete namespaces (identified by their retained
+input snapshot) are never swept, including watchdog-abandoned attempts; the
+pre-marker successful layout from v2.175.0 is also recognized and expired.
 Empty collections serialize as arrays. Large output bytes do not enter the result.
 The platform turns outputs into `node:<node_id>/<path>` file references and reads
 them lazily. Optional AEP v2 signing uses action `run_job_template`, binds the job,

@@ -3,6 +3,7 @@ package jobs
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -66,6 +67,27 @@ func TestTemplateInputReferenceValidation(t *testing.T) {
 	}
 	if _, err := ParseTemplateInputFiles(json.RawMessage(`[{"path":"node:n1/a.txt","node_id":"n1","node_path":"a.txt"}]`), "n1"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTemplateInputFileCountLimitBoundary(t *testing.T) {
+	makeRaw := func(n int) json.RawMessage {
+		entries := make([]map[string]string, n)
+		for i := range entries {
+			name := "asset-" + strconv.Itoa(i) + ".dat"
+			entries[i] = map[string]string{"path": name, "node_id": "n1", "node_path": name}
+		}
+		raw, err := json.Marshal(entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	if files, err := ParseTemplateInputFiles(makeRaw(MaxTemplateInputFiles), "n1"); err != nil || len(files) != MaxTemplateInputFiles {
+		t.Fatalf("exact input count limit: len=%d err=%v", len(files), err)
+	}
+	if _, err := ParseTemplateInputFiles(makeRaw(MaxTemplateInputFiles+1), "n1"); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("over-limit input count error = %v", err)
 	}
 }
 

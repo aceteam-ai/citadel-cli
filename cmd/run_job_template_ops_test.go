@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
@@ -460,6 +461,193 @@ func TestLiveTemplateRunOps_PartialStagingFailureRemovesAttempt(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("partial staging left attempt directories: %v", entries)
+	}
+}
+
+func TestResolveTemplateInputsTotalBytesBoundaryAndDuplicates(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		files    map[string]string
+		declared []string
+		maxBytes int64
+		wantErr  bool
+	}{
+		{name: "exact", files: map[string]string{"a": "abc", "b": "de"}, declared: []string{"a", "b"}, maxBytes: 5},
+		{name: "one_over", files: map[string]string{"a": "abc", "b": "def"}, declared: []string{"a", "b"}, maxBytes: 5, wantErr: true},
+		{name: "duplicate_counts_as_declared_bytes", files: map[string]string{"a": "abc"}, declared: []string{"a", "a"}, maxBytes: 5, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			for name, contents := range tc.files {
+				if err := os.WriteFile(filepath.Join(ws, name), []byte(contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root, err := os.OpenRoot(ws)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			if err := root.Mkdir("staged", 0o700); err != nil {
+				t.Fatal(err)
+			}
+			staged, err := root.OpenRoot("staged")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer staged.Close()
+			files := make([]jobs.TemplateInputFile, 0, len(tc.declared))
+			for _, name := range tc.declared {
+				files = append(files, jobs.TemplateInputFile{Path: name, NodeID: "n1", NodePath: name})
+			}
+			_, _, _, err = (liveTemplateRunOps{nodeID: "n1"}).resolveInputs(context.Background(), files, root, staged, filepath.Join(ws, "staged"), tc.maxBytes)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("resolveInputs error = %v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestTemplateOutputCapsBoundaryAndUnreportedFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		files    map[string]string
+		reported []string
+		maxFiles int
+		maxBytes int64
+		wantErr  bool
+	}{
+		{name: "exact", files: map[string]string{"a": "abc", "b": "de"}, reported: []string{"a", "b"}, maxFiles: 2, maxBytes: 5},
+		{name: "one_byte_over", files: map[string]string{"a": "abc", "b": "def"}, reported: []string{"a", "b"}, maxFiles: 2, maxBytes: 5, wantErr: true},
+		{name: "one_file_over", files: map[string]string{"a": "a", "b": "b"}, reported: []string{"a", "b"}, maxFiles: 1, maxBytes: 5, wantErr: true},
+		{name: "duplicate_report", files: map[string]string{"a": "a"}, reported: []string{"a", "a"}, maxFiles: 2, maxBytes: 5, wantErr: true},
+		{name: "unreported", files: map[string]string{"a": "a", "hidden": "x"}, reported: []string{"a"}, maxFiles: 2, maxBytes: 5, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, contents := range tc.files {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			err = validateTemplateOutputTree(root, tc.reported, tc.maxFiles, tc.maxBytes)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("validateTemplateOutputTree error = %v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLiveTemplateRunOps_OutputCountFailureCleansAttempt(t *testing.T) {
+	ws := t.TempDir()
+	registerTestBuiltin(t, "test-too-many-outputs", func(_ context.Context, _ json.RawMessage, _ []string, outDir string) ([]string, error) {
+		outputs := make([]string, templateMaxOutputFiles+1)
+		for i := range outputs {
+			outputs[i] = fmt.Sprintf("%02d.txt", i)
+			if err := os.WriteFile(filepath.Join(outDir, outputs[i]), []byte("x"), 0o600); err != nil {
+				return nil, err
+			}
+		}
+		return outputs, nil
+	})
+	_, err := (liveTemplateRunOps{workspaceDir: ws, nodeID: "n1"}).Run(context.Background(), verifiedTemplateRequest(t, worker.TemplateRunRequest{
+		JobID: "job-output-cap", TemplateKey: "t", Runner: json.RawMessage(`{"kind":"builtin","handler":"test-too-many-outputs"}`),
+	}))
+	if err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("output count error = %v", err)
+	}
+	entries, readErr := os.ReadDir(filepath.Join(ws, "templates", "t", "job-output-cap"))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("over-limit output left attempt directories: %v", entries)
+	}
+}
+
+func TestPruneRetainedTemplateAttempts(t *testing.T) {
+	ws := t.TempDir()
+	root, err := os.OpenRoot(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	now := time.Unix(2_000_000_000, 0)
+	old := now.Add(-templateOutputRetention - time.Second)
+	cutoff := now.Add(-templateOutputRetention)
+	fresh := now.Add(-templateOutputRetention + time.Second)
+
+	makeAttempt := func(name string, marker bool, inputs bool, stamp time.Time) string {
+		t.Helper()
+		rel := filepath.Join("templates", "t", "job", name)
+		if err := root.MkdirAll(filepath.Join(rel, "out"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := root.WriteFile(filepath.Join(rel, "out", "result"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if inputs {
+			if err := root.Mkdir(filepath.Join(rel, "inputs"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if marker {
+			markerPath := filepath.Join(rel, templateCompleteMarker)
+			if err := root.WriteFile(markerPath, []byte("complete\n"), 0o400); err != nil {
+				t.Fatal(err)
+			}
+			if err := root.Chtimes(markerPath, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := root.Chtimes(rel, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		return rel
+	}
+
+	oldMarked := makeAttempt("attempt-00000000000000000000000000000001", true, false, old)
+	legacyOld := makeAttempt("attempt-00000000000000000000000000000002", false, false, old)
+	freshMarked := makeAttempt("attempt-00000000000000000000000000000003", true, false, fresh)
+	exactCutoff := makeAttempt("attempt-00000000000000000000000000000004", true, false, cutoff)
+	activeOld := makeAttempt("attempt-00000000000000000000000000000005", false, true, old)
+	notAttempt := makeAttempt("attempt-not-random", true, false, old)
+
+	if err := pruneRetainedTemplateAttempts(root, now, templateOutputRetention); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{oldMarked, legacyOld} {
+		if _, err := root.Stat(rel); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("expired attempt %s survived: %v", rel, err)
+		}
+	}
+	for _, rel := range []string{freshMarked, exactCutoff, activeOld, notAttempt} {
+		if _, err := root.Stat(rel); err != nil {
+			t.Errorf("protected attempt %s was removed: %v", rel, err)
+		}
+	}
+}
+
+func TestPruneRetainedTemplateAttemptsFailsClosedOnInvalidMarker(t *testing.T) {
+	ws := t.TempDir()
+	root, err := os.OpenRoot(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	rel := filepath.Join("templates", "t", "job", "attempt-00000000000000000000000000000001")
+	if err := root.MkdirAll(filepath.Join(rel, "out"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Mkdir(filepath.Join(rel, templateCompleteMarker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := pruneRetainedTemplateAttempts(root, time.Now(), templateOutputRetention); err == nil {
+		t.Fatal("non-file completion marker was accepted")
 	}
 }
 
