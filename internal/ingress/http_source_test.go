@@ -129,9 +129,9 @@ func TestHTTPSourcesRejectRedirectsWithoutForwardingSecrets(t *testing.T) {
 			}
 
 			authorizer := NewHTTPAuthorizer("https://control.example/authz", "authz-secret", caller)
-			allow, subject, err := authorizer.Authorize(context.Background(), "app", "session=secret")
-			if err == nil || allow || subject != "" {
-				t.Fatalf("redirect status %d was trusted: allow=%v subject=%q err=%v", status, allow, subject, err)
+			decision, err := authorizer.Authorize(context.Background(), "app", "session=secret")
+			if err == nil || decision.Allow || decision.Subject != "" {
+				t.Fatalf("redirect status %d was trusted: allow=%v subject=%q err=%v", status, decision.Allow, decision.Subject, err)
 			}
 			if targetHits != 0 || targetAuthorization != "" || targetCookie != "" || targetBody != "" {
 				t.Fatalf("redirect target received request/secrets: hits=%d authorization=%q cookie=%q body=%q", targetHits, targetAuthorization, targetCookie, targetBody)
@@ -210,11 +210,11 @@ func TestHTTPSourcesPreserveNormalResponses(t *testing.T) {
 		if got.Slug != "app" || got.Cookie != "session=secret" {
 			t.Fatalf("authz request = %+v", got)
 		}
-		return httpSourceResponse(req, http.StatusOK, `{"allow":true,"subject":"user-1"}`), nil
+		return httpSourceResponse(req, http.StatusOK, `{"allow":true,"subject":"user-1","reason":"revoked"}`), nil
 	})
 	authorizer := NewHTTPAuthorizer("https://control.example/authz", "authz-secret", &http.Client{Transport: authzTransport})
-	allow, subject, err := authorizer.Authorize(context.Background(), "app", "session=secret")
-	if err != nil || !allow || subject != "user-1" {
-		t.Fatalf("normal authz 200: allow=%v subject=%q err=%v", allow, subject, err)
+	decision, err := authorizer.Authorize(context.Background(), "app", "session=secret")
+	if err != nil || !decision.Allow || decision.Subject != "user-1" || decision.Reason != "revoked" {
+		t.Fatalf("normal authz 200: decision=%+v err=%v", decision, err)
 	}
 }

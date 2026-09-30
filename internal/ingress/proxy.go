@@ -2,10 +2,14 @@ package ingress
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
+	"html"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,6 +38,7 @@ type Resolver interface {
 }
 
 type routeCtxKey struct{}
+type cookieNamesCtxKey struct{}
 
 // Proxy is the per-request reverse proxy handler. It resolves the host to a
 // slug, the slug to a mesh pod, enforces gated authz, strips inbound trust
@@ -43,6 +48,7 @@ type Proxy struct {
 	appsDomain         string
 	resolver           Resolver
 	authorizer         Authorizer
+	exchanger          Exchanger
 	defaultCookieNames []string
 	logf               func(format string, args ...any)
 	rp                 *httputil.ReverseProxy
@@ -63,11 +69,13 @@ type ProxyConfig struct {
 	AppsDomain string
 	Resolver   Resolver
 	Authorizer Authorizer
+	Exchanger  Exchanger
 	// DialContext dials the mesh pod. In production this is network.Dial; tests
 	// inject a dialer that targets an httptest server (and can assert it is
 	// never called for an unknown slug).
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-	// DefaultCookieNames is used when the routes payload carries none.
+	// DefaultCookieNames is always unioned with the route-feed list. Feed changes
+	// may add protected cookies but cannot remove local fail-safe defaults.
 	DefaultCookieNames []string
 	Logf               func(format string, args ...any)
 }
@@ -90,11 +98,16 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 			return nil, errors.New("ingress: no mesh dialer configured")
 		}
 	}
+	defaults := mergeCookieNames(
+		[]string{AppCredentialCookieName, AppNonceCookieName},
+		cfg.DefaultCookieNames,
+	)
 	p := &Proxy{
 		appsDomain:         strings.ToLower(cfg.AppsDomain),
 		resolver:           cfg.Resolver,
 		authorizer:         cfg.Authorizer,
-		defaultCookieNames: cfg.DefaultCookieNames,
+		exchanger:          cfg.Exchanger,
+		defaultCookieNames: defaults,
 		logf:               logf,
 		stripFn:            stripInbound,
 	}
@@ -123,8 +136,12 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 		FlushInterval: -1,
 		ModifyResponse: func(resp *http.Response) error {
 			if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
+				augment, _ := resp.Request.Context().Value(cookieNamesCtxKey{}).([]string)
 				resp.Header.Del("Set-Cookie")
 				for _, c := range cookies {
+					if protectedSetCookie(c, augment) {
+						continue
+					}
 					resp.Header.Add("Set-Cookie", rewriteSetCookie(c))
 				}
 			}
@@ -184,6 +201,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	augment := p.cookieNames()
+	if strings.HasPrefix(r.URL.Path, "/_ace/") {
+		p.serveReserved(w, r, slug)
+		return
+	}
 	subject := ""
 	if route.Visibility == VisibilityGated {
 		// Always consult authz, even with no session presented: the control plane
@@ -196,10 +217,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// plane's header/size cap; route to a clean re-login instead of a doomed
 			// upstream call and an opaque 403. Log the byte count only, never a value.
 			p.logf("[ingress] session material over cap (%d bytes) for slug=%q; re-login", len(sessionCookie), slug)
-			p.loginRedirect(w)
+			p.bounce(w, r, slug)
 			return
 		}
-		allow, subj, err := p.authorize(r.Context(), slug, sessionCookie)
+		decision, err := p.authorize(r.Context(), slug, sessionCookie)
 		switch {
 		case err != nil:
 			// Authz backend unavailable (transport/timeout/5xx all map to err in
@@ -208,11 +229,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.logf("[ingress] authz unavailable for slug=%q: %v", slug, err)
 			serviceUnavailable(w)
 			return
-		case allow:
-			subject = subj
-		case sessionCookie == "":
+		case decision.Allow:
+			subject = decision.Subject
+		case decision.Reason != "":
+			p.clearCredential(w)
+			p.bounce(w, r, slug)
+			return
+		case !hasCookie(r, AppCredentialCookieName):
 			// Explicit deny with no session presented: steer the visitor to log in.
-			p.loginRedirect(w)
+			p.bounce(w, r, slug)
 			return
 		default:
 			// Explicit deny with a session: forbidden.
@@ -225,7 +250,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (both public and gated), then verify no platform session cookie survived --
 	// if one did, refuse rather than forward (guaranteed removal or reject).
 	p.stripFn(r, augment)
-	if outboundSessionCookieLeaked(r) {
+	if outboundSessionCookieLeaked(r, augment) {
 		p.logf("[ingress] session isolation failed for slug=%q; refusing", slug)
 		sessionIsolationFailed(w)
 		return
@@ -233,14 +258,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setForwardHeaders(r, host, subject)
 
 	ctx := context.WithValue(r.Context(), routeCtxKey{}, route)
+	ctx = context.WithValue(ctx, cookieNamesCtxKey{}, augment)
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
 }
 
 // authzResult is the shared value singleflight passes to every in-flight waiter.
 // It is NOT retained after the call returns.
 type authzResult struct {
-	allow   bool
-	subject string
+	decision AuthzDecision
 }
 
 // authorize resolves the gated authz decision. It does NOT cache across requests
@@ -250,41 +275,221 @@ type authzResult struct {
 // singleflight (keyed on decisionKey), cutting brownout amplification without
 // widening the revocation window at all. An authz error (backend unavailable) is
 // propagated so the caller fails closed; it is never turned into an allow.
-func (p *Proxy) authorize(ctx context.Context, slug, cookie string) (bool, string, error) {
+func (p *Proxy) authorize(ctx context.Context, slug, cookie string) (AuthzDecision, error) {
 	if p.authorizer == nil {
-		return false, "", errors.New("no authorizer configured")
+		return AuthzDecision{}, errors.New("no authorizer configured")
 	}
 	res, err, _ := p.authzGroup.Do(decisionKey(slug, cookie), func() (any, error) {
-		allow, subject, aerr := p.authorizer.Authorize(ctx, slug, cookie)
+		decision, aerr := p.authorizer.Authorize(ctx, slug, cookie)
 		if aerr != nil {
 			return nil, aerr
 		}
-		return authzResult{allow: allow, subject: subject}, nil
+		return authzResult{decision: decision}, nil
 	})
 	if err != nil {
-		return false, "", err
+		return AuthzDecision{}, err
 	}
-	r := res.(authzResult)
-	return r.allow, r.subject, nil
+	return res.(authzResult).decision, nil
 }
 
 func (p *Proxy) cookieNames() []string {
-	if names := p.resolver.CookieNames(); len(names) > 0 {
-		return names
-	}
-	return p.defaultCookieNames
+	return mergeCookieNames(p.defaultCookieNames, p.resolver.CookieNames())
 }
 
-// loginRedirect responds to an unauthenticated gated request. Per the DoR this
-// is a "401 redirect": a 401 status carrying the control-plane login URL (from
-// the routes payload) in the Location header, so an SPA/fetch client can steer
-// the browser without the ingress hardcoding any login endpoint.
-func (p *Proxy) loginRedirect(w http.ResponseWriter) {
-	if url := p.resolver.LoginURL(); url != "" {
-		w.Header().Set("Location", url)
+func mergeCookieNames(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, names := range groups {
+		for _, name := range names {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
 	}
-	w.WriteHeader(http.StatusUnauthorized)
+	return out
+}
+
+func hasCookie(r *http.Request, name string) bool {
+	ck, err := r.Cookie(name)
+	return err == nil && ck.Value != ""
+}
+
+// bounce binds a one-time login handoff to this browser. Navigations receive a
+// 303; programmatic fetches retain the 401 contract but still get Location.
+func (p *Proxy) bounce(w http.ResponseWriter, r *http.Request, slug string) {
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		p.logf("[ingress] cannot mint handoff nonce for slug=%q: %v", slug, err)
+		serviceUnavailable(w)
+		return
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(nonceBytes)
+	location := p.loginLocation(slug, nonce, requestNext(r))
+	if location == "" {
+		p.logf("[ingress] login URL unavailable for slug=%q", slug)
+		serviceUnavailable(w)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: AppNonceCookieName, Value: nonce, Path: "/", Secure: true,
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 300,
+	})
+	w.Header().Set("Location", location)
+	if isNavigation(r) {
+		w.WriteHeader(http.StatusSeeOther)
+	} else {
+		w.WriteHeader(http.StatusUnauthorized)
+	}
 	_, _ = w.Write([]byte("authentication required\n"))
+}
+
+func (p *Proxy) loginLocation(slug, nonce, next string) string {
+	u, err := url.Parse(p.resolver.LoginURL())
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	q := u.Query()
+	q.Set("slug", slug)
+	q.Set("nonce", nonce)
+	q.Set("next", next)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func requestNext(r *http.Request) string {
+	next := r.URL.EscapedPath()
+	if next == "" {
+		next = "/"
+	}
+	if r.URL.RawQuery != "" {
+		next += "?" + r.URL.RawQuery
+	}
+	return next
+}
+
+func isNavigation(r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")), "navigate") {
+		return true
+	}
+	var htmlQ, otherQ float64 = -1, -1
+	for _, item := range strings.Split(r.Header.Get("Accept"), ",") {
+		parts := strings.Split(item, ";")
+		media := strings.ToLower(strings.TrimSpace(parts[0]))
+		q := 1.0
+		for _, parameter := range parts[1:] {
+			key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+			if ok && strings.EqualFold(key, "q") {
+				if parsed, err := strconv.ParseFloat(value, 64); err == nil {
+					q = parsed
+				}
+			}
+		}
+		switch media {
+		case "text/html", "application/xhtml+xml":
+			if q > htmlQ {
+				htmlQ = q
+			}
+		case "", "*/*", "text/*":
+			// A wildcard does not express a preference for a non-HTML format.
+		default:
+			if q > otherQ {
+				otherQ = q
+			}
+		}
+	}
+	return htmlQ > 0 && htmlQ >= otherQ
+}
+
+func (p *Proxy) serveReserved(w http.ResponseWriter, r *http.Request, slug string) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	switch r.URL.Path {
+	case "/_ace/session":
+		p.serveSession(w, r, slug)
+	case "/_ace/logout":
+		p.clearCredential(w)
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	default:
+		notFound(w)
+	}
+}
+
+func (p *Proxy) serveSession(w http.ResponseWriter, r *http.Request, slug string) {
+	code := r.URL.Query().Get("code")
+	nonce, nonceErr := r.Cookie(AppNonceCookieName)
+	decoded, codeErr := base64.RawURLEncoding.DecodeString(code)
+	if len(code) != 43 || codeErr != nil || len(decoded) != 32 || nonceErr != nil || nonce.Value == "" {
+		p.handoffFailed(w)
+		return
+	}
+	if p.exchanger == nil {
+		serviceUnavailableRetry(w)
+		return
+	}
+	result, status, err := p.exchanger.Exchange(r.Context(), slug, code, nonce.Value)
+	if err != nil || status >= 500 {
+		p.logf("[ingress] handoff exchange unavailable for slug=%q: status=%d err=%v", slug, status, err)
+		serviceUnavailableRetry(w)
+		return
+	}
+	if status >= 400 && status < 500 {
+		p.handoffFailed(w)
+		return
+	}
+	if status != http.StatusOK || result.Credential == "" || result.MaxAge <= 0 || !safeNext(result.Next) {
+		p.handoffFailed(w)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: AppCredentialCookieName, Value: result.Credential, Path: "/", Secure: true,
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: result.MaxAge,
+	})
+	p.clearNonce(w)
+	http.Redirect(w, r, result.Next, http.StatusSeeOther)
+}
+
+func safeNext(next string) bool {
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.Contains(next, "\\") || strings.ContainsAny(next, "\r\n") {
+		return false
+	}
+	u, err := url.ParseRequestURI(next)
+	return err == nil && u.IsAbs() == false && u.Host == ""
+}
+
+func (p *Proxy) handoffFailed(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusBadRequest)
+	login := html.EscapeString(p.resolver.LoginURL())
+	_, _ = w.Write([]byte("<!doctype html><title>Handoff failed</title><h1>handoff failed</h1><p><a href=\"" + login + "\">Return to login</a></p>"))
+}
+
+func (p *Proxy) clearCredential(w http.ResponseWriter) {
+	expireCookie(w, AppCredentialCookieName)
+}
+
+func (p *Proxy) clearNonce(w http.ResponseWriter) {
+	expireCookie(w, AppNonceCookieName)
+}
+
+func expireCookie(w http.ResponseWriter, name string) {
+	http.SetCookie(w, &http.Cookie{
+		Name: name, Value: "", Path: "/", Secure: true, HttpOnly: true,
+		SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0).UTC(),
+	})
+}
+
+func serviceUnavailableRetry(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	serviceUnavailable(w)
 }
 
 func forbidden(w http.ResponseWriter) {

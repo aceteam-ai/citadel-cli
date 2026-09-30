@@ -3,6 +3,8 @@ package ingress
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -46,6 +49,47 @@ func TestSlugFromHost(t *testing.T) {
 	}
 }
 
+func TestIsNavigation(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, accept string
+		want               bool
+	}{
+		{name: "fetch mode navigate", mode: "navigate", accept: "application/json", want: true},
+		{name: "browser HTML preference", accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", want: true},
+		{name: "HTML lower quality", accept: "application/json;q=1,text/html;q=0.5", want: false},
+		{name: "fetch wildcard", accept: "*/*", want: false},
+		{name: "HTML excluded", accept: "text/html;q=0", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "https://app.apps.example.com/", nil)
+			r.Header.Set("Sec-Fetch-Mode", tc.mode)
+			r.Header.Set("Accept", tc.accept)
+			if got := isNavigation(r); got != tc.want {
+				t.Fatalf("isNavigation(mode=%q Accept=%q) = %v, want %v", tc.mode, tc.accept, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSafeNext(t *testing.T) {
+	for _, tc := range []struct {
+		next string
+		want bool
+	}{
+		{next: "/", want: true},
+		{next: "/docs?q=1", want: true},
+		{next: "//evil.example/", want: false},
+		{next: "/\\evil.example/", want: false},
+		{next: "https://evil.example/", want: false},
+		{next: "relative", want: false},
+		{next: "/ok\r\nLocation: https://evil.example", want: false},
+	} {
+		if got := safeNext(tc.next); got != tc.want {
+			t.Errorf("safeNext(%q) = %v, want %v", tc.next, got, tc.want)
+		}
+	}
+}
+
 // --- test doubles -----------------------------------------------------------
 
 type fakeResolver struct {
@@ -70,15 +114,32 @@ func (f *fakeResolver) Fresh() bool           { return !f.stale }
 type fakeAuthorizer struct {
 	allow      bool
 	subject    string
+	reason     string
 	err        error
 	calls      int32
 	lastCookie string // the cookie material the proxy forwarded (read after the round trip)
 }
 
-func (f *fakeAuthorizer) Authorize(_ context.Context, _, cookie string) (bool, string, error) {
+type fakeExchanger struct {
+	result ExchangeResult
+	status int
+	err    error
+	calls  int32
+	slug   string
+	code   string
+	nonce  string
+}
+
+func (f *fakeExchanger) Exchange(_ context.Context, slug, code, nonce string) (ExchangeResult, int, error) {
+	atomic.AddInt32(&f.calls, 1)
+	f.slug, f.code, f.nonce = slug, code, nonce
+	return f.result, f.status, f.err
+}
+
+func (f *fakeAuthorizer) Authorize(_ context.Context, _, cookie string) (AuthzDecision, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.lastCookie = cookie
-	return f.allow, f.subject, f.err
+	return AuthzDecision{Allow: f.allow, Subject: f.subject, Reason: f.reason}, f.err
 }
 
 type countingDialer struct {
@@ -101,12 +162,17 @@ func gatedRoute() Route {
 // startProxy wires a Proxy in front of upstreamAddr and returns an httptest
 // server hosting it plus the dialer (to assert dial counts).
 func startProxy(t *testing.T, res Resolver, authz Authorizer, upstreamAddr string) (*httptest.Server, *countingDialer) {
+	return startProxyWithExchanger(t, res, authz, nil, upstreamAddr)
+}
+
+func startProxyWithExchanger(t *testing.T, res Resolver, authz Authorizer, exchanger Exchanger, upstreamAddr string) (*httptest.Server, *countingDialer) {
 	t.Helper()
 	d := &countingDialer{target: upstreamAddr}
 	p := NewProxy(ProxyConfig{
 		AppsDomain:         "apps.example.com",
 		Resolver:           res,
 		Authorizer:         authz,
+		Exchanger:          exchanger,
 		DialContext:        d.dial,
 		DefaultCookieNames: []string{"sess"},
 	})
@@ -351,14 +417,340 @@ func TestProxy_GatedNoCookieDeniedIs401Redirect(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); loc != "https://login.example.com/start" {
-		t.Fatalf("Location = %q, want the login URL", loc)
+	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "https://login.example.com/start?") {
+		t.Fatalf("Location = %q, want the login URL with handoff query", loc)
 	}
 	if atomic.LoadInt32(&authz.calls) != 1 {
 		t.Fatalf("authz calls = %d, want 1 (authz is the visibility authority even for anonymous)", atomic.LoadInt32(&authz.calls))
 	}
 	if atomic.LoadInt32(&d.calls) != 0 {
 		t.Fatal("no dial should happen for a denied gated request")
+	}
+}
+
+func TestProxy_GatedNavigationBounceCarriesBoundHandoff(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start?existing=1"}
+	authz := &fakeAuthorizer{allow: false}
+	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+	resp := get(t, ts, "app.apps.example.com", "/docs?q=one%20two", map[string]string{
+		"Sec-Fetch-Mode": "navigate",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	location, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := location.Query()
+	if location.Host != "login.example.com" || q.Get("existing") != "1" || q.Get("slug") != "app" || q.Get("next") != "/docs?q=one%20two" {
+		t.Fatalf("handoff Location = %q", location.String())
+	}
+	nonce := q.Get("nonce")
+	decoded, err := base64.RawURLEncoding.DecodeString(nonce)
+	if err != nil || len(decoded) != 16 {
+		t.Fatalf("nonce = %q, decoded=%d err=%v", nonce, len(decoded), err)
+	}
+	var nonceCookie *http.Cookie
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == AppNonceCookieName {
+			nonceCookie = cookie
+		}
+	}
+	if nonceCookie == nil || nonceCookie.Value != nonce || nonceCookie.Path != "/" || !nonceCookie.Secure || !nonceCookie.HttpOnly || nonceCookie.SameSite != http.SameSiteLaxMode || nonceCookie.MaxAge != 300 {
+		t.Fatalf("nonce cookie = %#v", nonceCookie)
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("bounce must not dial a pod")
+	}
+}
+
+func TestProxy_HandoffThenCredentialAuthzAndPodIsolation(t *testing.T) {
+	var podCookie string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		podCookie = r.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	code := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	exchange := &fakeExchanger{
+		status: http.StatusOK,
+		result: ExchangeResult{Credential: "minted-credential", MaxAge: 600, Next: "/welcome?x=1"},
+	}
+	res := &fakeResolver{
+		routes: map[string]Route{"app": gatedRoute()},
+		login:  "https://login.example.com/start",
+	}
+	authz := &fakeAuthorizer{allow: true, subject: "viewer"}
+	ts, _ := startProxyWithExchanger(t, res, authz, exchange, upstream.Listener.Addr().String())
+
+	resp := get(t, ts, "app.apps.example.com", "/_ace/session?code="+code, map[string]string{
+		"Cookie": AppNonceCookieName + "=browser-nonce",
+	})
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/welcome?x=1" {
+		t.Fatalf("handoff status=%d Location=%q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	var credential, expiredNonce *http.Cookie
+	for _, cookie := range resp.Cookies() {
+		switch cookie.Name {
+		case AppCredentialCookieName:
+			credential = cookie
+		case AppNonceCookieName:
+			expiredNonce = cookie
+		}
+	}
+	resp.Body.Close()
+	if credential == nil || credential.Value != "minted-credential" || credential.MaxAge != 600 || !credential.Secure || !credential.HttpOnly || credential.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("credential cookie = %#v", credential)
+	}
+	if expiredNonce == nil || expiredNonce.MaxAge >= 0 {
+		t.Fatalf("expired nonce cookie = %#v", expiredNonce)
+	}
+	if exchange.slug != "app" || exchange.code != code || exchange.nonce != "browser-nonce" {
+		t.Fatalf("exchange request slug=%q code=%q nonce=%q", exchange.slug, exchange.code, exchange.nonce)
+	}
+
+	resp = get(t, ts, "app.apps.example.com", "/welcome", map[string]string{
+		"Cookie": AppCredentialCookieName + "=minted-credential; theme=dark",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("credential request status = %d", resp.StatusCode)
+	}
+	if authz.lastCookie != AppCredentialCookieName+"=minted-credential" {
+		t.Fatalf("authz cookie = %q", authz.lastCookie)
+	}
+	if podCookie != "theme=dark" {
+		t.Fatalf("pod cookie = %q, want only unrelated cookie", podCookie)
+	}
+}
+
+func TestProxy_AppCredentialHandoffAcceptance(t *testing.T) {
+	feedBody := mustBody(t, routesPayload{
+		Routes: map[string]routeEntry{
+			"app": {MeshIP: "100.64.0.10", Port: 8080, Visibility: "gated"},
+		},
+		AppsDomain:     "apps.example.com",
+		LoginURL:       "https://login.example.com/start",
+		SessionCookies: []string{AppCredentialCookieName, AppNonceCookieName},
+	})
+	source := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			return http.StatusOK, "feed-v1", feedBody, nil
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) {
+			return http.StatusNotFound, nil, nil
+		},
+	}
+	routes := NewClient(ClientConfig{Source: source, AppsDomain: "apps.example.com"})
+	routes.pollOnce(context.Background())
+
+	code := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	var exchangeCalls int32
+	var expectedNonce string
+	exchangeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := atomic.AddInt32(&exchangeCalls, 1)
+		var request exchangeRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode exchange request: %v", err)
+		}
+		if request.Slug != "app" || request.Code != code || request.Nonce != expectedNonce {
+			t.Errorf("exchange request = %+v, expected nonce %q", request, expectedNonce)
+		}
+		if call > 1 {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential":"minted","max_age":600,"next":"/dashboard"}`))
+	}))
+	defer exchangeServer.Close()
+
+	var podCookie string
+	pod := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		podCookie = r.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer pod.Close()
+	authz := &fakeAuthorizer{allow: false}
+	ts, _ := startProxyWithExchanger(t, routes, authz, NewHTTPExchanger(exchangeServer.URL, "", exchangeServer.Client()), pod.Listener.Addr().String())
+
+	bounce := get(t, ts, "app.apps.example.com", "/dashboard", map[string]string{"Accept": "text/html,application/json;q=0.5"})
+	if bounce.StatusCode != http.StatusSeeOther {
+		t.Fatalf("navigation bounce status = %d", bounce.StatusCode)
+	}
+	location, _ := url.Parse(bounce.Header.Get("Location"))
+	expectedNonce = location.Query().Get("nonce")
+	bounce.Body.Close()
+	if expectedNonce == "" || location.Query().Get("slug") != "app" || location.Query().Get("next") != "/dashboard" {
+		t.Fatalf("bounce Location = %q", location.String())
+	}
+
+	handoff := get(t, ts, "app.apps.example.com", "/_ace/session?code="+code, map[string]string{
+		"Cookie": AppNonceCookieName + "=" + expectedNonce,
+	})
+	if handoff.StatusCode != http.StatusSeeOther || handoff.Header.Get("Location") != "/dashboard" {
+		t.Fatalf("handoff status=%d Location=%q", handoff.StatusCode, handoff.Header.Get("Location"))
+	}
+	var minted string
+	for _, cookie := range handoff.Cookies() {
+		if cookie.Name == AppCredentialCookieName {
+			minted = cookie.Value
+		}
+	}
+	handoff.Body.Close()
+	if minted != "minted" {
+		t.Fatalf("credential = %q", minted)
+	}
+
+	authz.allow = true
+	proxied := get(t, ts, "app.apps.example.com", "/dashboard", map[string]string{
+		"Cookie": AppCredentialCookieName + "=" + minted,
+	})
+	proxied.Body.Close()
+	if proxied.StatusCode != http.StatusOK || authz.lastCookie != AppCredentialCookieName+"=minted" || podCookie != "" {
+		t.Fatalf("proxied status=%d authzCookie=%q podCookie=%q", proxied.StatusCode, authz.lastCookie, podCookie)
+	}
+
+	replay := get(t, ts, "app.apps.example.com", "/_ace/session?code="+code, map[string]string{
+		"Cookie": AppNonceCookieName + "=" + expectedNonce,
+	})
+	defer replay.Body.Close()
+	replayBody, _ := io.ReadAll(replay.Body)
+	if replay.StatusCode != http.StatusBadRequest || !strings.Contains(string(replayBody), "handoff failed") {
+		t.Fatalf("replay status=%d body=%q", replay.StatusCode, replayBody)
+	}
+}
+
+func TestProxy_HandoffReplayShowsStaticFailure(t *testing.T) {
+	code := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	exchange := &fakeExchanger{status: http.StatusConflict}
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"}
+	ts, d := startProxyWithExchanger(t, res, &fakeAuthorizer{}, exchange, "127.0.0.1:1")
+	resp := get(t, ts, "app.apps.example.com", "/_ace/session?code="+code, map[string]string{
+		"Cookie": AppNonceCookieName + "=browser-nonce",
+	})
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "handoff failed") || resp.Header.Get("Location") != "" {
+		t.Fatalf("replay status=%d Location=%q body=%q", resp.StatusCode, resp.Header.Get("Location"), body)
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("failed exchange must not dial pod")
+	}
+}
+
+func TestProxy_ReservedPathsFailClosedWithoutPodDial(t *testing.T) {
+	code := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	for _, tc := range []struct {
+		name   string
+		res    *fakeResolver
+		path   string
+		cookie string
+		want   int
+	}{
+		{
+			name: "stale session",
+			res:  &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, stale: true},
+			path: "/_ace/session?code=" + code, cookie: AppNonceCookieName + "=nonce", want: http.StatusServiceUnavailable,
+		},
+		{
+			name: "unknown slug session",
+			res:  &fakeResolver{routes: map[string]Route{}},
+			path: "/_ace/session?code=" + code, cookie: AppNonceCookieName + "=nonce", want: http.StatusNotFound,
+		},
+		{
+			name: "invalid code",
+			res:  &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"},
+			path: "/_ace/session?code=not-base64url", cookie: AppNonceCookieName + "=nonce", want: http.StatusBadRequest,
+		},
+		{
+			name: "unknown reserved path",
+			res:  &fakeResolver{routes: map[string]Route{"app": gatedRoute()}},
+			path: "/_ace/not-a-handler", want: http.StatusNotFound,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exchange := &fakeExchanger{status: http.StatusOK, result: ExchangeResult{Credential: "c", MaxAge: 1, Next: "/"}}
+			ts, d := startProxyWithExchanger(t, tc.res, &fakeAuthorizer{allow: true}, exchange, "127.0.0.1:1")
+			headers := map[string]string{}
+			if tc.cookie != "" {
+				headers["Cookie"] = tc.cookie
+			}
+			resp := get(t, ts, "app.apps.example.com", tc.path, headers)
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+			if atomic.LoadInt32(&exchange.calls) != 0 || atomic.LoadInt32(&d.calls) != 0 {
+				t.Fatalf("calls exchange=%d dial=%d, want zero", exchange.calls, d.calls)
+			}
+		})
+	}
+}
+
+func TestProxy_HandoffUnavailableIsRetryable(t *testing.T) {
+	code := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"}
+	exchange := &fakeExchanger{status: http.StatusBadGateway}
+	ts, d := startProxyWithExchanger(t, res, &fakeAuthorizer{}, exchange, "127.0.0.1:1")
+	resp := get(t, ts, "app.apps.example.com", "/_ace/session?code="+code, map[string]string{
+		"Cookie": AppNonceCookieName + "=nonce",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("status=%d Retry-After=%q", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("exchange failure must not dial pod")
+	}
+}
+
+func TestProxy_LogoutClearsCredentialWithoutControlPlaneCall(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}}
+	authz := &fakeAuthorizer{allow: true}
+	exchange := &fakeExchanger{status: http.StatusOK}
+	ts, d := startProxyWithExchanger(t, res, authz, exchange, "127.0.0.1:1")
+	resp := get(t, ts, "app.apps.example.com", "/_ace/logout", map[string]string{
+		"Cookie": AppCredentialCookieName + "=credential",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/" {
+		t.Fatalf("status=%d Location=%q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	var cleared bool
+	for _, cookie := range resp.Cookies() {
+		cleared = cleared || cookie.Name == AppCredentialCookieName && cookie.MaxAge < 0
+	}
+	if !cleared || atomic.LoadInt32(&authz.calls) != 0 || atomic.LoadInt32(&exchange.calls) != 0 || atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatalf("cleared=%v authz=%d exchange=%d dial=%d", cleared, authz.calls, exchange.calls, d.calls)
+	}
+}
+
+func TestProxy_ReasonDenyClearsCredentialAndRebounces(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"}
+	authz := &fakeAuthorizer{reason: "revoked"}
+	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+	resp := get(t, ts, "app.apps.example.com", "/private", map[string]string{
+		"Cookie":         AppCredentialCookieName + "=garbage",
+		"Sec-Fetch-Mode": "navigate",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	var cleared, nonce bool
+	for _, cookie := range resp.Cookies() {
+		cleared = cleared || cookie.Name == AppCredentialCookieName && cookie.MaxAge < 0
+		nonce = nonce || cookie.Name == AppNonceCookieName && cookie.MaxAge == 300
+	}
+	if !cleared || !nonce {
+		t.Fatalf("Set-Cookie = %v, want cleared credential and fresh nonce", resp.Header.Values("Set-Cookie"))
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("reason deny must not dial pod")
 	}
 }
 
@@ -429,7 +821,7 @@ func TestProxy_GatedDeny403(t *testing.T) {
 	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}}
 	authz := &fakeAuthorizer{allow: false}
 	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
-	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": AppCredentialCookieName + "=abc"})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", resp.StatusCode)
@@ -542,6 +934,8 @@ func TestProxy_NilDialerFailsClosed(t *testing.T) {
 func TestProxy_ModifyResponseStripsCookieDomain(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Set-Cookie", "id=abc; Domain=apps.example.com; Path=/")
+		w.Header().Add("Set-Cookie", AppCredentialCookieName+"=pod-replacement; Path=/")
+		w.Header().Add("Set-Cookie", "sb-ref-auth-token=pod-session; Path=/")
 		w.WriteHeader(200)
 	}))
 	defer upstream.Close()
@@ -549,7 +943,11 @@ func TestProxy_ModifyResponseStripsCookieDomain(t *testing.T) {
 	ts, _ := startProxy(t, res, nil, upstream.Listener.Addr().String())
 	resp := get(t, ts, "app.apps.example.com", "/", nil)
 	defer resp.Body.Close()
-	sc := resp.Header.Get("Set-Cookie")
+	values := resp.Header.Values("Set-Cookie")
+	if len(values) != 1 {
+		t.Fatalf("Set-Cookie = %v, want only the unrelated cookie", values)
+	}
+	sc := values[0]
 	if strings.Contains(strings.ToLower(sc), "domain=") {
 		t.Fatalf("Set-Cookie still has Domain: %q", sc)
 	}
@@ -662,8 +1060,8 @@ func TestProxy_OversizeSessionCookie401NoAuthzNoDial(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 for an oversize session", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); loc != "https://login.example.com/start" {
-		t.Fatalf("Location = %q, want the login URL", loc)
+	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "https://login.example.com/start?") {
+		t.Fatalf("Location = %q, want the login URL with handoff query", loc)
 	}
 	if atomic.LoadInt32(&authz.calls) != 0 {
 		t.Fatal("oversize session must not call authz")
@@ -712,11 +1110,11 @@ type blockingAuthorizer struct {
 	subject string
 }
 
-func (b *blockingAuthorizer) Authorize(_ context.Context, _, _ string) (bool, string, error) {
+func (b *blockingAuthorizer) Authorize(_ context.Context, _, _ string) (AuthzDecision, error) {
 	atomic.AddInt32(&b.calls, 1)
 	b.entered <- struct{}{}
 	<-b.release
-	return b.allow, b.subject, nil
+	return AuthzDecision{Allow: b.allow, Subject: b.subject}, nil
 }
 
 // TestProxy_ConcurrentIdenticalAuthzCollapsesToOneCall pins FIX 1b: two
@@ -765,9 +1163,9 @@ func TestProxy_SequentialAuthzNotCached(t *testing.T) {
 	authz := &fakeAuthorizer{allow: true, subject: "u"}
 	ts, _ := startProxy(t, res, authz, upstream.Listener.Addr().String())
 
-	r1 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	r1 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": AppCredentialCookieName + "=abc"})
 	r1.Body.Close()
-	r2 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	r2 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": AppCredentialCookieName + "=abc"})
 	r2.Body.Close()
 	if n := atomic.LoadInt32(&authz.calls); n != 2 {
 		t.Fatalf("authz calls = %d, want 2 (no cross-request caching)", n)
@@ -784,7 +1182,7 @@ func TestProxy_AuthzDecisionNotCached_ImmediateRevocation(t *testing.T) {
 	authz := &fakeAuthorizer{allow: true, subject: "u"}
 	ts, d := startProxy(t, res, authz, upstream.Listener.Addr().String())
 
-	r1 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	r1 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": AppCredentialCookieName + "=abc"})
 	if r1.StatusCode != 200 {
 		t.Fatalf("first request status = %d, want 200 (allowed)", r1.StatusCode)
 	}
@@ -794,7 +1192,7 @@ func TestProxy_AuthzDecisionNotCached_ImmediateRevocation(t *testing.T) {
 	// immediately -- no cached allow.
 	authz.allow = false
 	dialsBefore := atomic.LoadInt32(&d.calls)
-	r2 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	r2 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": AppCredentialCookieName + "=abc"})
 	if r2.StatusCode != http.StatusForbidden {
 		t.Fatalf("second request status = %d, want 403 (immediate revocation)", r2.StatusCode)
 	}
@@ -814,15 +1212,15 @@ func TestHTTPAuthorizer_FailsClosedOnServerErrorAndCanceledContext(t *testing.T)
 	defer srv.Close()
 	a := NewHTTPAuthorizer(srv.URL, "tok", srv.Client())
 
-	allow, _, err := a.Authorize(context.Background(), "app", "sess=abc")
-	if err == nil || allow {
-		t.Fatalf("5xx must map to (allow=false, err!=nil); got allow=%v err=%v", allow, err)
+	decision, err := a.Authorize(context.Background(), "app", "sess=abc")
+	if err == nil || decision.Allow {
+		t.Fatalf("5xx must map to (allow=false, err!=nil); got allow=%v err=%v", decision.Allow, err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // stands in for a transport/timeout failure
-	allow, _, err = a.Authorize(ctx, "app", "sess=abc")
-	if err == nil || allow {
-		t.Fatalf("canceled context must map to (allow=false, err!=nil); got allow=%v err=%v", allow, err)
+	decision, err = a.Authorize(ctx, "app", "sess=abc")
+	if err == nil || decision.Allow {
+		t.Fatalf("canceled context must map to (allow=false, err!=nil); got allow=%v err=%v", decision.Allow, err)
 	}
 }

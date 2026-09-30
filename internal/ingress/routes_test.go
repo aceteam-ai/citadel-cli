@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,7 +26,7 @@ func mustBody(t *testing.T, v any) []byte {
 
 func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 	now := time.Unix(1000, 0)
-	prev := &RouteMap{etag: "old", routes: map[string]Route{"old": {Slug: "old"}}, fetchedAt: time.Unix(500, 0)}
+	prev := &RouteMap{etag: "old", routes: map[string]Route{"old": {Slug: "old"}}, appsDomain: "old.example.com", fetchedAt: time.Unix(500, 0)}
 
 	// 304 re-stamps last-good fresh: a NEW map sharing prev's routes/etag with
 	// fetchedAt advanced to now (so a healthy 304 feed does not expire).
@@ -36,8 +37,8 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 	if got == prev {
 		t.Fatal("304: expected a re-stamped clone, got the same pointer")
 	}
-	if got.ETag() != "old" || got.routes["old"].Slug != "old" {
-		t.Fatalf("304: content should be preserved, got etag=%q routes=%v", got.ETag(), got.routes)
+	if got.ETag() != "old" || got.AppsDomain() != "old.example.com" || got.routes["old"].Slug != "old" {
+		t.Fatalf("304: content should be preserved, got etag=%q domain=%q routes=%v", got.ETag(), got.AppsDomain(), got.routes)
 	}
 	if !got.fetchedAt.Equal(now) {
 		t.Fatalf("304: fetchedAt = %v, want %v (freshness reset)", got.fetchedAt, now)
@@ -65,6 +66,7 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 			"badport": {MeshIP: "100.64.0.9", Port: 0, Visibility: "public"},
 			"gated":   {MeshIP: "100.100.0.2", Port: 9000, Visibility: "gated"},
 		},
+		AppsDomain:     "apps.example.com",
 		LoginURL:       "https://login.example.com",
 		SessionCookies: []string{"sess"},
 	})
@@ -95,8 +97,75 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 	if len(got.routes) != 2 {
 		t.Fatalf("route count = %d, want 2 (good, gated)", len(got.routes))
 	}
-	if got.LoginURL() != "https://login.example.com" || len(got.CookieNames()) != 1 {
-		t.Errorf("payload fields not carried: login=%q cookies=%v", got.LoginURL(), got.CookieNames())
+	if got.AppsDomain() != "apps.example.com" || got.LoginURL() != "https://login.example.com" || len(got.CookieNames()) != 1 {
+		t.Errorf("payload fields not carried: domain=%q login=%q cookies=%v", got.AppsDomain(), got.LoginURL(), got.CookieNames())
+	}
+}
+
+func TestClient_WarnsEverySuccessfulPollOnAppsDomainMismatch(t *testing.T) {
+	body := mustBody(t, routesPayload{
+		Routes:     map[string]routeEntry{},
+		AppsDomain: "feed.example.com",
+	})
+	var calls int
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			calls++
+			if calls == 1 {
+				return 200, "e1", body, nil
+			}
+			if calls == 2 {
+				return 304, "e1", nil, nil
+			}
+			return 0, "", nil, errors.New("poll unavailable")
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) { return 404, nil, nil },
+	}
+	var logs []string
+	c := NewClient(ClientConfig{
+		Source:     src,
+		AppsDomain: "apps.example.com",
+		Logf: func(format string, args ...any) {
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
+	})
+
+	c.pollOnce(context.Background()) // 200
+	c.pollOnce(context.Background()) // 304
+	c.pollOnce(context.Background()) // transport error retains mismatched last-good
+
+	var mismatchLogs []string
+	for _, log := range logs {
+		if strings.Contains(log, "routes feed apps_domain") {
+			mismatchLogs = append(mismatchLogs, log)
+		}
+	}
+	if len(mismatchLogs) != 3 {
+		t.Fatalf("domain mismatch logs = %v, want one warning for every poll", mismatchLogs)
+	}
+	for _, log := range mismatchLogs {
+		if !strings.Contains(log, `apps_domain="feed.example.com"`) || !strings.Contains(log, `configured apps domain="apps.example.com"`) {
+			t.Errorf("domain mismatch warning lacks both domains: %q", log)
+		}
+	}
+}
+
+func TestClient_DoesNotWarnForEquivalentAppsDomain(t *testing.T) {
+	body := mustBody(t, routesPayload{Routes: map[string]routeEntry{}, AppsDomain: "APPS.EXAMPLE.COM"})
+	src := &fakeSource{
+		fetchFn:    func(context.Context, string) (int, string, []byte, error) { return 200, "e1", body, nil },
+		fetchOneFn: func(context.Context, string) (int, []byte, error) { return 404, nil, nil },
+	}
+	var logs []string
+	c := NewClient(ClientConfig{
+		Source:     src,
+		AppsDomain: " apps.example.com ",
+		Logf:       func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
+	})
+
+	c.pollOnce(context.Background())
+	if len(logs) != 0 {
+		t.Fatalf("equivalent domain produced warnings: %v", logs)
 	}
 }
 

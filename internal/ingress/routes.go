@@ -83,6 +83,7 @@ type Route struct {
 type RouteMap struct {
 	etag        string
 	routes      map[string]Route
+	appsDomain  string
 	loginURL    string
 	cookieNames []string
 	// fetchedAt is when the control plane last confirmed this map fresh (a 200
@@ -105,7 +106,7 @@ func (m *RouteMap) fresh(now time.Time, maxAge time.Duration) bool {
 }
 
 // refreshed returns a shallow copy of m with fetchedAt advanced to now. routes,
-// loginURL, and cookieNames are shared by reference (immutable after
+// appsDomain, loginURL, and cookieNames are shared by reference (immutable after
 // construction), so this is cheap. Used on a 304 Not Modified: the content is
 // unchanged but the control plane has just CONFIRMED it is current, so the
 // freshness clock resets -- otherwise a healthy feed returning 304 every poll
@@ -137,6 +138,16 @@ func (m *RouteMap) LoginURL() string {
 	return m.loginURL
 }
 
+// AppsDomain is the control-plane domain this route feed was generated for.
+// The client compares it with its configured public domain after every poll so
+// a crossed environment/feed remains visible to operators during outages too.
+func (m *RouteMap) AppsDomain() string {
+	if m == nil {
+		return ""
+	}
+	return m.appsDomain
+}
+
 // CookieNames are the session-cookie names stripped from an inbound request
 // before it reaches the pod. Empty means "use the caller-configured default".
 func (m *RouteMap) CookieNames() []string {
@@ -150,6 +161,7 @@ func (m *RouteMap) CookieNames() []string {
 // minimal subset the ingress needs.
 type routesPayload struct {
 	Routes         map[string]routeEntry `json:"routes"`
+	AppsDomain     string                `json:"apps_domain"`
 	LoginURL       string                `json:"login_url"`
 	SessionCookies []string              `json:"session_cookies"`
 }
@@ -193,6 +205,7 @@ func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, n
 		next := &RouteMap{
 			etag:        etag,
 			routes:      make(map[string]Route, len(p.Routes)),
+			appsDomain:  p.AppsDomain,
 			loginURL:    p.LoginURL,
 			cookieNames: p.SessionCookies,
 			fetchedAt:   now,
@@ -382,6 +395,7 @@ type overlayEntry struct {
 type Client struct {
 	src          RoutesSource
 	pollInterval time.Duration
+	appsDomain   string
 	logf         func(format string, args ...any)
 
 	current     atomic.Pointer[RouteMap]
@@ -421,8 +435,13 @@ type Client struct {
 type ClientConfig struct {
 	Source       RoutesSource
 	PollInterval time.Duration
-	NegativeTTL  time.Duration
-	NegativeMax  int
+	// AppsDomain is the public domain this ingress is configured to serve. A
+	// feed whose apps_domain differs is still applied, but warns on every poll
+	// (including 304 and failures retaining last-good) so crossed environment
+	// wiring is not silent.
+	AppsDomain  string
+	NegativeTTL time.Duration
+	NegativeMax int
 	// OnMissRateLimit and OnMissBurst bound the single global FetchOne budget.
 	// Non-positive values use conservative defaults. Admission is immediate;
 	// Resolve never waits for a token.
@@ -458,6 +477,7 @@ func NewClient(cfg ClientConfig) *Client {
 	c := &Client{
 		src:          cfg.Source,
 		pollInterval: poll,
+		appsDomain:   strings.TrimSpace(cfg.AppsDomain),
 		logf:         logf,
 		now:          time.Now,
 		maxAge:       maxAge,
@@ -502,14 +522,17 @@ func (c *Client) pollOnce(ctx context.Context) {
 	requestStartedAt := c.now()
 	status, etag, body, err := c.src.Fetch(ctx, prev.ETag())
 	if err != nil {
+		c.warnAppsDomainMismatch(prev)
 		c.noteFailure(fmt.Sprintf("routes fetch failed: %v", err))
 		return
 	}
 	next, aerr := applyRoutesResponse(prev, status, etag, body, requestStartedAt)
 	if aerr != nil {
+		c.warnAppsDomainMismatch(prev)
 		c.noteFailure(fmt.Sprintf("routes response rejected: %v", aerr))
 		return
 	}
+	c.warnAppsDomainMismatch(next)
 	c.noteHealthy()
 	if next == prev {
 		return // 5xx path: last-good kept, no re-stamp
@@ -530,6 +553,17 @@ func (c *Client) pollOnce(ctx context.Context) {
 		return
 	}
 	c.current.Store(next)
+}
+
+func (c *Client) warnAppsDomainMismatch(m *RouteMap) {
+	if c.appsDomain == "" || m == nil {
+		return
+	}
+	feedDomain := strings.TrimSpace(m.AppsDomain())
+	if strings.EqualFold(feedDomain, c.appsDomain) {
+		return
+	}
+	c.logf("[ingress] WARNING: routes feed apps_domain=%q differs from configured apps domain=%q", feedDomain, c.appsDomain)
 }
 
 // Poll runs the fetch loop until ctx is cancelled. It fetches immediately, then

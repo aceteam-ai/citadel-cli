@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"reflect"
 	"syscall"
 	"testing"
 	"time"
@@ -106,6 +107,58 @@ func TestResolveIngressOptions_RequiresRoutesURLAndDomain(t *testing.T) {
 	}
 	if _, ok := opts.cert.(*ingress.StaticFileCertProvider); !ok {
 		t.Fatalf("expected StaticFileCertProvider, got %T", opts.cert)
+	}
+	if opts.exchanger == nil {
+		t.Fatal("expected production credential exchanger wiring")
+	}
+	if want := []string{ingress.AppCredentialCookieName, ingress.AppNonceCookieName}; !reflect.DeepEqual(opts.cookieNames, want) {
+		t.Fatalf("default cookie names = %q, want %q", opts.cookieNames, want)
+	}
+}
+
+func TestIngressSessionCookieNames(t *testing.T) {
+	defaults := []string{ingress.AppCredentialCookieName, ingress.AppNonceCookieName}
+	tests := []struct {
+		name  string
+		value string
+		want  []string
+	}{
+		{name: "unset keeps secure defaults", want: defaults},
+		{name: "blank entries", value: " ,\t, ", want: defaults},
+		{
+			name:  "trim comma list and deduplicate",
+			value: " custom_session, second ,custom_session ,, third ",
+			want:  append(append([]string(nil), defaults...), "custom_session", "second", "third"),
+		},
+		{
+			name:  "operator cannot remove or duplicate defaults",
+			value: ingress.AppNonceCookieName + ", custom_session, " + ingress.AppCredentialCookieName,
+			want:  append(append([]string(nil), defaults...), "custom_session"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ingressSessionCookieNames(tt.value); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ingressSessionCookieNames(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveIngressOptions_ParsesSessionCookieEnvironment(t *testing.T) {
+	t.Setenv("CITADEL_INGRESS_ROUTES_URL", "https://cp.example.com/ingress/routes")
+	t.Setenv("CITADEL_INGRESS_APPS_DOMAIN", "apps.example.com")
+	t.Setenv("CITADEL_INGRESS_CERT_FILE", "/tmp/does-not-need-to-exist.crt")
+	t.Setenv("CITADEL_INGRESS_KEY_FILE", "/tmp/does-not-need-to-exist.key")
+	t.Setenv("CITADEL_INGRESS_SESSION_COOKIE", " custom_session, second, custom_session ")
+
+	opts, err := resolveIngressOptions(context.Background())
+	if err != nil {
+		t.Fatalf("resolveIngressOptions() error: %v", err)
+	}
+	want := []string{ingress.AppCredentialCookieName, ingress.AppNonceCookieName, "custom_session", "second"}
+	if !reflect.DeepEqual(opts.cookieNames, want) {
+		t.Fatalf("cookieNames = %q, want %q", opts.cookieNames, want)
 	}
 }
 
