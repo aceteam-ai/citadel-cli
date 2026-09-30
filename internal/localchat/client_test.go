@@ -39,10 +39,10 @@ func TestNewClientUsesSharedVLLMEndpointAndIsolatesOtherEngines(t *testing.T) {
 	}
 }
 
-func TestNewClientPreservesUnsetVLLMLocalhostURL(t *testing.T) {
+func TestNewClientUsesIPv4LoopbackVLLMEndpoint(t *testing.T) {
 	original := resolveVLLMEndpoint
 	resolveVLLMEndpoint = func() (externalengine.Endpoint, bool, error) {
-		return externalengine.Endpoint{Host: "localhost", Port: 8201}, true, nil
+		return externalengine.Endpoint{Host: "127.0.0.1", Port: 8201}, true, nil
 	}
 	t.Cleanup(func() { resolveVLLMEndpoint = original })
 
@@ -50,8 +50,8 @@ func TestNewClientPreservesUnsetVLLMLocalhostURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient(vllm) error = %v", err)
 	}
-	if client.BaseURL != "http://localhost:8201" {
-		t.Fatalf("unset vLLM BaseURL = %q, want byte-compatible localhost URL", client.BaseURL)
+	if client.BaseURL != "http://127.0.0.1:8201" {
+		t.Fatalf("default vLLM BaseURL = %q, want IPv4 loopback URL", client.BaseURL)
 	}
 }
 

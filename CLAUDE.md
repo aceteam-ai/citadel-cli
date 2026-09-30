@@ -1614,20 +1614,17 @@ sibling services too. Anything reasoning about "is THIS service up" must filter 
 container name rather than trusting project scoping — see #692, which this stale
 doc helped hide.
 
-**The vLLM host and host port are process-resolved (citadel-cli#1076/#1167).**
+**The vLLM endpoint has two explicit owners (citadel-cli#1076/#1167/#1186).**
 `services.resolveVLLMHostPort` and `services.resolveVLLMHost`
-(`services/ports.go`) decide `services.VLLMHostPort` and `services.VLLMHost` once
-at process init from `CITADEL_VLLM_HOST_PORT` and `CITADEL_VLLM_HOST`. The port
-defaults to 8201; the host defaults to `localhost` to preserve the pre-#1167 URL
-bytes and platform resolver behavior. A non-loopback host override
-must be a canonical IP literal assigned to a local interface; invalid, remote,
-wildcard, multicast, and link-local values fail closed to loopback. The resolved
-endpoint flows through `externalengine.VLLMEndpoint` to adoption/model/health/idle
-probes, worker and legacy-job base URLs, native readiness, and gateway chat
-proxying, so a vendor engine bound only to the node's primary address is reached
-and advertised consistently. `TestResolveVLLMHostPort` and
-`TestResolveVLLMHost` pin the fallback and validation rules. Do not replace either
-resolved value with a hardcoded loopback or port at a consumer.
+(`services/ports.go`) own the process-level environment fallback and validation
+rules. Their tests pin the exact defaults, including the IPv4 loopback literal
+needed by an IPv4-only managed vLLM bind. `externalengine.VLLMEndpoint` owns the
+active routing endpoint: it gives an adopted record precedence over that
+process-level configuration. Consumers that must follow adoption use that
+function. Native lifecycle readiness is the deliberate exception:
+`internal/services.serviceDialHost` uses the process-level host because external
+adoption short-circuits before native startup/readiness. Preserve those ownership
+boundaries rather than copying endpoint rules into consumers.
 
 **Adopt an already-running EXTERNAL vLLM instead of launching one — even with NO
 docker runtime (citadel-cli#1081 + #1084, RM-01 / aceteam#9945).**
