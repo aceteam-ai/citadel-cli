@@ -32,12 +32,18 @@ import (
 // use, and compose's own `<project>-<service>-<n>` (whatsapp-bridge's `bridge`
 // and `db`, which a `citadel-<name>` container lookup would miss entirely).
 //
+// Every non-profiled service declared by one compose file is part of that
+// managed service. A multi-container module is running only when every one of
+// those components is running; one surviving sidecar must not mask a missing or
+// exited sibling.
+//
 // Container presence is not the whole test either. Ollama runs as a NATIVE
 // systemd service on some nodes (`/usr/local/bin/ollama serve`, port 11434), so
 // "no container" must not mean "not running". ResolveServiceState takes an
-// injected native-serving probe and consults it only when no declared container
-// is present, mirroring internal/status.managedEnginePortIfRunning (the
-// heartbeat path, which already gets this right).
+// injected native-serving probe and consults it for a single-service compose
+// file only, mirroring internal/status.managedEnginePortIfRunning (the
+// heartbeat path, which already gets this right) without allowing one native
+// process to satisfy a multi-container module.
 
 // PSContainer is the subset of a `docker compose ps --format json` record the
 // operator surfaces read.
@@ -107,11 +113,13 @@ func ParsePS(output []byte) []PSContainer {
 	return out
 }
 
-// DeclaredServices returns the set of service keys declared by a compose file.
-// A nil result means the file could not be read or parsed; callers must treat
-// that as "unknown" and fall back to the unfiltered view rather than concluding
-// the service is stopped (a false "stopped" is a worse defect than the false
-// "running" this filtering removes).
+// DeclaredServices returns the set of service keys that Compose starts by
+// default. Services guarded by `profiles:` are excluded because citadel does
+// not enable profiles on its compose-up/status paths. A nil result means the
+// file could not be read or parsed; callers must treat that as "unknown" and
+// fall back to the unfiltered view rather than concluding the service is
+// stopped (a false "stopped" is a worse defect than the false "running" this
+// filtering removes).
 func DeclaredServices(composePath string) map[string]bool {
 	data, err := os.ReadFile(composePath)
 	if err != nil {
@@ -123,7 +131,9 @@ func DeclaredServices(composePath string) map[string]bool {
 // DeclaredServicesFromYAML is the pure form of DeclaredServices.
 func DeclaredServicesFromYAML(data []byte) map[string]bool {
 	var doc struct {
-		Services map[string]yaml.Node `yaml:"services"`
+		Services map[string]struct {
+			Profiles []string `yaml:"profiles"`
+		} `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil
@@ -132,18 +142,22 @@ func DeclaredServicesFromYAML(data []byte) map[string]bool {
 		return nil
 	}
 	set := make(map[string]bool, len(doc.Services))
-	for name := range doc.Services {
+	for name, service := range doc.Services {
+		if len(service.Profiles) > 0 {
+			continue
+		}
 		set[name] = true
 	}
 	return set
 }
 
-// FilterPS keeps only the containers belonging to the declared services. When
-// declared is empty (compose file unreadable or unparseable) it returns the
+// FilterPS keeps only the containers belonging to the declared services. A nil
+// set means the compose file was unreadable or unparseable, so it returns the
 // input unchanged: fail open to the pre-existing behavior rather than reporting
-// a running service as stopped.
+// a running service as stopped. A known empty set (for example a file containing
+// only profile-gated services) correctly matches no containers.
 func FilterPS(containers []PSContainer, declared map[string]bool) []PSContainer {
-	if len(declared) == 0 {
+	if declared == nil {
 		return containers
 	}
 	out := make([]PSContainer, 0, len(containers))
@@ -159,44 +173,82 @@ func FilterPS(containers []PSContainer, declared map[string]bool) []PSContainer 
 // project-wide `docker compose ps --format json` output, the set of services its
 // compose file declares, and an optional native-serving probe.
 //
-// Order of evidence:
-//  1. A declared container that is running wins, and is reported.
-//  2. Otherwise, if nativeServing is non-nil and reports true, the service is
-//     running natively. This is what keeps a systemd ollama from being called
-//     stopped, and it deliberately outranks a non-running container: a live
-//     socket is stronger evidence of serving than a stale container is of
-//     stopped. Nodes accumulate exited containers (see
-//     compose.RemoveLegacyProjectContainers), so an exited citadel-ollama
-//     sitting next to a serving systemd ollama is a real shape. Same ordering as
-//     internal/status.managedEnginePortIfRunning on the heartbeat path.
-//  3. Otherwise a declared container in a non-running state is reported, with
-//     its raw state kept on Container so a crash loop stays visible.
-//  4. Otherwise the service is stopped. This is the case #692 got wrong.
+// For a known compose file, every non-profiled declared component must have a
+// running container. A single-service file may instead be satisfied by the
+// native-serving probe; this keeps a systemd ollama healthy even beside a stale
+// exited container. A multi-service file may not use that fallback because one
+// native socket cannot prove its other components are alive.
+//
+// A nil declared set means the file could not be parsed. That deliberately
+// retains the historical fail-open behavior: select any running project
+// container rather than introducing a false stopped result.
 func ResolveServiceState(psOutput []byte, declared map[string]bool, nativeServing func() bool) ServiceState {
-	mine := FilterPS(ParsePS(psOutput), declared)
-
-	var first *PSContainer
-	for i := range mine {
-		if mine[i].Running() {
-			c := mine[i]
-			return ServiceState{State: StateRunning, Running: true, Container: &c}
-		}
-		if first == nil {
-			c := mine[i]
-			first = &c
-		}
+	containers := ParsePS(psOutput)
+	if declared == nil {
+		return resolveAnyServiceState(containers, nativeServing)
 	}
 
+	var representative *PSContainer
+	for serviceName := range declared {
+		var first, running *PSContainer
+		for i := range containers {
+			if containers[i].Service != serviceName {
+				continue
+			}
+			container := containers[i]
+			if first == nil {
+				first = &container
+			}
+			if container.Running() {
+				running = &container
+				break
+			}
+		}
+		if running != nil {
+			if representative == nil {
+				representative = running
+			}
+			continue
+		}
+
+		// Native serving is an alternative only for a compose file representing
+		// one service. It deliberately outranks that service's stale container.
+		if len(declared) == 1 && nativeServing != nil && nativeServing() {
+			return ServiceState{State: StateRunning, Running: true, Native: true}
+		}
+		return stoppedServiceState(first)
+	}
+
+	if representative != nil {
+		return ServiceState{State: StateRunning, Running: true, Container: representative}
+	}
+	return ServiceState{State: StateStopped}
+}
+
+func resolveAnyServiceState(containers []PSContainer, nativeServing func() bool) ServiceState {
+	var first *PSContainer
+	for i := range containers {
+		container := containers[i]
+		if container.Running() {
+			return ServiceState{State: StateRunning, Running: true, Container: &container}
+		}
+		if first == nil {
+			first = &container
+		}
+	}
 	if nativeServing != nil && nativeServing() {
 		return ServiceState{State: StateRunning, Running: true, Native: true}
 	}
+	return stoppedServiceState(first)
+}
 
-	if first != nil {
-		state := strings.ToLower(first.State)
-		if strings.Contains(state, "exited") || strings.Contains(state, "dead") || state == "" {
-			state = StateStopped
-		}
-		return ServiceState{State: state, Container: first}
+func stoppedServiceState(container *PSContainer) ServiceState {
+	if container == nil {
+		return ServiceState{State: StateStopped}
 	}
-	return ServiceState{State: StateStopped}
+	state := strings.ToLower(container.State)
+	if strings.Contains(state, "exited") || strings.Contains(state, "dead") || state == "" {
+		state = StateStopped
+	}
+	return ServiceState{State: state, Container: container}
 }

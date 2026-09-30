@@ -1616,9 +1616,13 @@ walks the whole service tree and owns this invariant, including the rule that a
 running, while `desired_status: stopped` expects it stopped. A missing compose
 file, absent container/native process, non-running container, or failed status
 probe is unhealthy and makes doctor exit non-zero; an explicit native service
-does not require a compose file. Keep both operator surfaces routed through this
-one decision so a failed compose-up cannot be red in one and silently stopped in
-the other.
+does not require a compose file. For a multi-container compose module, every
+non-profiled service key must have a running container; profile-gated services
+are not expected because citadel does not enable profiles. The native fallback
+applies only to a single-service compose file, so one native socket cannot hide
+a failed sibling component. Keep both operator surfaces routed through this one
+decision so a failed compose-up cannot be red in one and silently stopped in the
+other.
 
 That is deliberate (#528): the per-service `-p citadel-<name>` form is legacy, and
 `removeLegacyCitadelProject` (`cmd/service.go`) exists solely to clean up
@@ -1628,9 +1632,9 @@ name conflict.
 
 **The consequence that bites:** a bare `docker compose ps` in a service's
 directory is scoped to the shared project, not to that service, so it lists
-sibling services too. Anything reasoning about "is THIS service up" must filter by
-container name rather than trusting project scoping — see #692, which this stale
-doc helped hide.
+sibling services too. Anything reasoning about "is THIS service up" must filter
+by the service keys declared in its compose file rather than trusting project
+scoping — see #692, which this stale doc helped hide.
 
 **The vLLM endpoint has two explicit owners (citadel-cli#1076/#1167/#1186).**
 `services.resolveVLLMHostPort` and `services.resolveVLLMHost`

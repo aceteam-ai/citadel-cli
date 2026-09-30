@@ -141,15 +141,35 @@ func TestResolveServiceStateExited(t *testing.T) {
 	}
 }
 
-// TestResolveServiceStatePrefersRunning: when a multi-service compose file has
-// one container up and one down, the running one is selected so the uptime and
-// state read off it are the live ones.
-func TestResolveServiceStatePrefersRunning(t *testing.T) {
+// TestResolveServiceStateRejectsExitedSibling pins the #1188 review finding:
+// one running component must not mask an exited sibling in a multi-container
+// compose module.
+func TestResolveServiceStateRejectsExitedSibling(t *testing.T) {
 	out := `{"ID":"a","Name":"services-db-1","Service":"db","State":"exited","Status":"Exited (0)"}
 {"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
 	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, never)
-	if !got.Running || got.Container == nil || got.Container.ID != "b" {
-		t.Fatalf("got %+v, want the running container", got)
+	if got.Running || got.Container == nil || got.Container.ID != "a" {
+		t.Fatalf("got %+v, want the exited sibling to make the module unhealthy", got)
+	}
+}
+
+// TestResolveServiceStateRejectsAbsentSibling is the missing-component variant
+// of the same regression: every non-profiled declared service must be present.
+func TestResolveServiceStateRejectsAbsentSibling(t *testing.T) {
+	out := `{"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
+	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, never)
+	if got.Running || got.State != StateStopped || got.Container != nil {
+		t.Fatalf("got %+v, want the absent sibling to make the module stopped", got)
+	}
+}
+
+// TestResolveServiceStateMultiContainerDoesNotUseNativeFallback ensures one
+// native socket cannot satisfy the other components of a compose module.
+func TestResolveServiceStateMultiContainerDoesNotUseNativeFallback(t *testing.T) {
+	out := `{"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
+	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, always)
+	if got.Running || got.Native {
+		t.Fatalf("got %+v, want missing db to remain unhealthy", got)
 	}
 }
 
@@ -212,6 +232,11 @@ func TestDeclaredServicesFromYAML(t *testing.T) {
 			name: "two services, compose-default container names",
 			yaml: "services:\n  bridge:\n    image: bridge:latest\n  db:\n    image: postgres:16-alpine\n",
 			want: []string{"bridge", "db"},
+		},
+		{
+			name: "profile-gated service is not started by default",
+			yaml: "services:\n  api:\n    image: example/api\n  debug:\n    image: example/debug\n    profiles: [debug]\n",
+			want: []string{"api"},
 		},
 	}
 	for _, tt := range tests {
