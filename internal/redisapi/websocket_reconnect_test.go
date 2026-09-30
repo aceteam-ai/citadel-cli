@@ -228,6 +228,7 @@ func TestCloseDuringTheBackoffPreventsAFurtherDial(t *testing.T) {
 	var dials atomic.Int64
 	upgrader := websocket.Upgrader{}
 	release := make(chan struct{})
+	firstDialObserved := make(chan struct{}, 1)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -236,6 +237,10 @@ func TestCloseDuringTheBackoffPreventsAFurtherDial(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 		dials.Add(1)
+		select {
+		case firstDialObserved <- struct{}{}:
+		default:
+		}
 		<-release
 	}))
 	// LIFO: release the parked handlers before the server shuts down.
@@ -255,6 +260,15 @@ func TestCloseDuringTheBackoffPreventsAFurtherDial(t *testing.T) {
 
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)
+	}
+	// The client can finish reading the 101 response before the server handler
+	// resumes after Upgrade. Synchronize with the handler before inspecting its
+	// dial count; an immediate load has no happens-before edge and flakes under
+	// runner contention.
+	select {
+	case <-firstDialObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not observe the first successful WebSocket upgrade")
 	}
 	if got := dials.Load(); got != 1 {
 		t.Fatalf("dials after the first connect = %d, want 1", got)
