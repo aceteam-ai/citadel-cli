@@ -10,6 +10,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var deviceConfigForCATrustFn = getDeviceConfigFromFile
+
 // preparePrivateCATrust resolves the endpoints this invocation will actually
 // use, including durable values used by unattended reconnects, then primes the
 // Linux process trust pool before any HTTPS request can cache it.
@@ -21,9 +23,9 @@ func preparePrivateCATrust(cmd *cobra.Command) error {
 	}
 	authURL := authServiceURL
 	if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
-		if cfg := getDeviceConfigFromFile(); cfg != nil && strings.TrimSpace(cfg.APIBaseURL) != "" {
+		if cfg := deviceConfigForCATrustFn(); cfg != nil && strings.TrimSpace(cfg.APIBaseURL) != "" {
 			authURL = cfg.APIBaseURL
-		} else if strings.TrimSpace(caCertPath) == "" {
+		} else {
 			storedAuth, err := catrust.AuthOriginForNexus(nodeDir, nexus)
 			if err != nil {
 				return err
