@@ -24,6 +24,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/singleflight"
+	"golang.org/x/time/rate"
 )
 
 // RouteMaxAge bounds how long a fetched route map may be served after it was
@@ -33,6 +36,11 @@ import (
 // keep steering dials indefinitely through a control-plane outage. 60s is the
 // owner-chosen bound (citadel-cli#1099).
 const RouteMaxAge = 60 * time.Second
+
+const (
+	defaultOnMissRate  = rate.Limit(10)
+	defaultOnMissBurst = 20
+)
 
 // jitter returns d perturbed by up to +/-10% so a fleet of ingresses polling
 // the same control plane does not synchronize into a thundering herd.
@@ -306,11 +314,22 @@ func (n *negativeCache) has(slug string) bool {
 }
 
 func (n *negativeCache) add(slug string) {
+	n.addAt(slug, n.now())
+}
+
+func (n *negativeCache) addAt(slug string, fetchedAt time.Time) {
 	if n == nil {
 		return
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	expiresAt := fetchedAt.Add(n.ttl)
+	if !n.now().Before(expiresAt) {
+		// A slow lookup consumed the whole negative TTL. Do not evict a live
+		// entry merely to insert one that is already expired on arrival.
+		delete(n.entries, slug)
+		return
+	}
 	if len(n.entries) >= n.maxEntries {
 		n.purgeExpiredLocked()
 		if len(n.entries) >= n.maxEntries {
@@ -323,7 +342,7 @@ func (n *negativeCache) add(slug string) {
 			}
 		}
 	}
-	n.entries[slug] = n.now().Add(n.ttl)
+	n.entries[slug] = expiresAt
 }
 
 func (n *negativeCache) purgeExpiredLocked() {
@@ -376,6 +395,9 @@ type Client struct {
 
 	neg *negativeCache
 
+	missGroup   singleflight.Group
+	missLimiter *rate.Limiter
+
 	overlayMu sync.RWMutex
 	// overlay holds positive on-miss single-slug results. Cleared on a fresh full
 	// map (200), AND each entry carries its own fetchedAt so it expires after
@@ -383,6 +405,11 @@ type Client struct {
 	// re-stamped fresh but never replaced), a slug absent from the full map and
 	// later tombstoned could resolve forever.
 	overlay map[string]overlayEntry
+	// generation advances with every authoritative 200 while overlayMu is held.
+	// An on-miss request snapshots it before I/O and may commit only if it is
+	// unchanged, preventing an older FetchOne from resurrecting a route after a
+	// newer full map superseded it.
+	generation uint64
 
 	// lastState tracks the last-logged feed health so we log at most once per
 	// state change (healthy <-> failing), not on every failed poll.
@@ -396,6 +423,11 @@ type ClientConfig struct {
 	PollInterval time.Duration
 	NegativeTTL  time.Duration
 	NegativeMax  int
+	// OnMissRateLimit and OnMissBurst bound the single global FetchOne budget.
+	// Non-positive values use conservative defaults. Admission is immediate;
+	// Resolve never waits for a token.
+	OnMissRateLimit rate.Limit
+	OnMissBurst     int
 	// MaxAge bounds route freshness on the request path; 0 uses RouteMaxAge.
 	MaxAge time.Duration
 	Logf   func(format string, args ...any)
@@ -415,6 +447,14 @@ func NewClient(cfg ClientConfig) *Client {
 	if maxAge <= 0 {
 		maxAge = RouteMaxAge
 	}
+	onMissRate := cfg.OnMissRateLimit
+	if onMissRate <= 0 {
+		onMissRate = defaultOnMissRate
+	}
+	onMissBurst := cfg.OnMissBurst
+	if onMissBurst <= 0 {
+		onMissBurst = defaultOnMissBurst
+	}
 	c := &Client{
 		src:          cfg.Source,
 		pollInterval: poll,
@@ -422,8 +462,12 @@ func NewClient(cfg ClientConfig) *Client {
 		now:          time.Now,
 		maxAge:       maxAge,
 		neg:          newNegativeCache(cfg.NegativeTTL, cfg.NegativeMax),
+		missLimiter:  rate.NewLimiter(onMissRate, onMissBurst),
 		overlay:      make(map[string]overlayEntry),
 	}
+	// Keep negative-cache expiry on the same injectable clock as freshness and
+	// rate admission so slow-response and limiter tests remain deterministic.
+	c.neg.now = func() time.Time { return c.now() }
 	return c
 }
 
@@ -455,12 +499,13 @@ func (c *Client) Fresh() bool {
 // from Poll so tests can drive a single cycle deterministically.
 func (c *Client) pollOnce(ctx context.Context) {
 	prev := c.current.Load()
+	requestStartedAt := c.now()
 	status, etag, body, err := c.src.Fetch(ctx, prev.ETag())
 	if err != nil {
 		c.noteFailure(fmt.Sprintf("routes fetch failed: %v", err))
 		return
 	}
-	next, aerr := applyRoutesResponse(prev, status, etag, body, c.now())
+	next, aerr := applyRoutesResponse(prev, status, etag, body, requestStartedAt)
 	if aerr != nil {
 		c.noteFailure(fmt.Sprintf("routes response rejected: %v", aerr))
 		return
@@ -472,14 +517,19 @@ func (c *Client) pollOnce(ctx context.Context) {
 	// Store on any change, INCLUDING a 304's re-stamped clone -- that is what
 	// resets the freshness clock so a healthy feed returning 304 every poll does
 	// not expire after RouteMaxAge.
-	c.current.Store(next)
 	if status == 200 {
-		c.fetchedOnce.Store(true)
-		// A fresh authoritative map supersedes any on-miss overlay entries.
+		// Publish the new authoritative map, generation, and empty overlay as one
+		// commit relative to FetchOne insertion. Readers that already observed the
+		// old map recheck inside their singleflight leader before doing I/O.
 		c.overlayMu.Lock()
+		c.current.Store(next)
+		c.generation++
 		c.overlay = make(map[string]overlayEntry)
 		c.overlayMu.Unlock()
+		c.fetchedOnce.Store(true)
+		return
 	}
+	c.current.Store(next)
 }
 
 // Poll runs the fetch loop until ctx is cancelled. It fetches immediately, then
@@ -504,60 +554,139 @@ func (c *Client) Poll(ctx context.Context) {
 // into a 404). It combines the pure lookup with the on-miss single-slug fetch:
 // a decisionMiss triggers exactly one FetchOne; a positive result is inserted
 // into the overlay and a negative result is negative-cached. THE MAP IS THE
-// AUTHORIZATION BOUNDARY -- ok=false means no dial.
-func (c *Client) Resolve(ctx context.Context, slug string) (Route, bool) {
-	m := c.current.Load()
-	if !m.fresh(c.now(), c.maxAge) {
-		// Config-absent (never fetched) or expired past RouteMaxAge: fail closed.
-		// The proxy's Fresh() gate returns 503 before reaching here; this is the
-		// defensive backstop for any direct caller and stops a stale overlay
-		// lookup too.
-		return Route{}, false
-	}
-	r, dec := lookup(m, slug, c.neg)
-	switch dec {
-	case decisionHit:
-		return r, true
-	case decisionNegative:
-		return Route{}, false
+// AUTHORIZATION BOUNDARY -- ok=false or err!=nil means no dial. Same-slug
+// misses collapse into one request, and a global immediate-deny token bucket
+// bounds distinct misses so random-slug scans cannot amplify into control-plane
+// traffic. Control-plane failures remain distinguishable so the proxy can
+// return retryable 503 instead of misreporting them as an unknown-slug 404.
+func (c *Client) Resolve(ctx context.Context, slug string) (Route, bool, error) {
+	if r, dec := c.resolveCached(slug, c.now()); dec != decisionMiss {
+		return r, dec == decisionHit, nil
 	}
 
-	// decisionMiss: check the overlay (a prior on-miss positive) before making
-	// another control-plane call. An overlay entry past its own maxAge is treated
-	// as a miss and re-validated via FetchOne below -- so a tombstoned slug stops
-	// resolving after maxAge even when the full-map poll never advances past 304.
+	result := c.missGroup.DoChan(slug, func() (any, error) {
+		return c.resolveMiss(ctx, slug)
+	})
+	select {
+	case <-ctx.Done():
+		return Route{}, false, ctx.Err()
+	case call := <-result:
+		if call.Err != nil {
+			return Route{}, false, call.Err
+		}
+		resolved := call.Val.(resolveResult)
+		return resolved.route, resolved.ok, nil
+	}
+}
+
+type resolveResult struct {
+	route Route
+	ok    bool
+}
+
+// resolveCached performs the lock-bounded, I/O-free resolution shared by the
+// fast path and the singleflight leader's mandatory recheck.
+func (c *Client) resolveCached(slug string, now time.Time) (Route, decision) {
+	m := c.current.Load()
+	if !m.fresh(now, c.maxAge) {
+		return Route{}, decisionNegative
+	}
+	if r, dec := lookup(m, slug, c.neg); dec != decisionMiss {
+		return r, dec
+	}
 	c.overlayMu.RLock()
 	oe, ok := c.overlay[slug]
 	c.overlayMu.RUnlock()
-	if ok && c.now().Sub(oe.fetchedAt) <= c.maxAge {
-		return oe.route, true
+	if ok && now.Sub(oe.fetchedAt) <= c.maxAge {
+		return oe.route, decisionHit
+	}
+	return Route{}, decisionMiss
+}
+
+func (c *Client) resolveMiss(ctx context.Context, slug string) (resolveResult, error) {
+	// Another request or a full-map 200 may have populated/suppressed this slug
+	// while this caller waited to become the per-slug leader.
+	if r, dec := c.resolveCached(slug, c.now()); dec != decisionMiss {
+		return resolveResult{route: r, ok: dec == decisionHit}, nil
+	}
+	if !c.missLimiter.AllowN(c.now(), 1) {
+		return resolveResult{}, fmt.Errorf("routes: single-slug lookup rate limited")
 	}
 
+	// Snapshot the authoritative generation immediately before request send.
+	// No client lock is held across control-plane I/O.
+	c.overlayMu.RLock()
+	generation := c.generation
+	c.overlayMu.RUnlock()
+	requestStartedAt := c.now()
 	status, body, err := c.src.FetchOne(ctx, slug)
-	if err != nil || status != 200 {
-		// Unknown or transient failure: negative-cache so a scan cannot amplify.
-		c.neg.add(slug)
-		return Route{}, false
+	if current, superseded := c.resolveAfterGenerationChange(slug, generation); superseded {
+		return current, nil
+	}
+	if err != nil {
+		return resolveResult{}, fmt.Errorf("routes: single-slug fetch failed: %w", err)
+	}
+	if status == 404 {
+		c.neg.addAt(slug, requestStartedAt)
+		return resolveResult{}, nil
+	}
+	if status != 200 {
+		return resolveResult{}, fmt.Errorf("routes: unexpected single-slug status %d", status)
 	}
 	var p routesPayload
 	if err := json.Unmarshal(body, &p); err != nil {
-		c.neg.add(slug)
-		return Route{}, false
+		return resolveResult{}, fmt.Errorf("routes: malformed single-slug response: %w", err)
 	}
 	e, ok := p.Routes[slug]
 	if !ok {
-		c.neg.add(slug)
-		return Route{}, false
+		c.neg.addAt(slug, requestStartedAt)
+		return resolveResult{}, nil
 	}
 	route, ok := decodeRoute(slug, e)
 	if !ok {
-		c.neg.add(slug)
-		return Route{}, false
+		c.neg.addAt(slug, requestStartedAt)
+		return resolveResult{}, nil
 	}
+
 	c.overlayMu.Lock()
-	c.overlay[slug] = overlayEntry{route: route, fetchedAt: c.now()}
-	c.overlayMu.Unlock()
-	return route, true
+	defer c.overlayMu.Unlock()
+	if c.generation != generation {
+		// A newer authoritative map won while FetchOne was blocked. Never return
+		// or reinsert the older result; resolve only from that winning map.
+		m := c.current.Load()
+		if m.fresh(c.now(), c.maxAge) {
+			if current, exists := m.routes[slug]; exists {
+				return resolveResult{route: current, ok: true}, nil
+			}
+		}
+		return resolveResult{}, nil
+	}
+	now := c.now()
+	if !c.current.Load().fresh(now, c.maxAge) || now.Sub(requestStartedAt) > c.maxAge {
+		return resolveResult{}, fmt.Errorf("routes: single-slug response exceeded freshness bound")
+	}
+	c.overlay[slug] = overlayEntry{route: route, fetchedAt: requestStartedAt}
+	return resolveResult{route: route, ok: true}, nil
+}
+
+// resolveAfterGenerationChange discards every result from a FetchOne request
+// that overlapped a newer authoritative map. This check must happen before
+// interpreting either successful or failed FetchOne responses: the winning
+// map may already contain the slug even when the older request returned a
+// transport error, redirect, 404, or malformed payload.
+func (c *Client) resolveAfterGenerationChange(slug string, generation uint64) (resolveResult, bool) {
+	c.overlayMu.RLock()
+	defer c.overlayMu.RUnlock()
+	if c.generation == generation {
+		return resolveResult{}, false
+	}
+	m := c.current.Load()
+	if m.fresh(c.now(), c.maxAge) {
+		if current, exists := m.routes[slug]; exists {
+			return resolveResult{route: current, ok: true}, true
+		}
+	}
+	return resolveResult{}, true
 }
 
 func (c *Client) noteFailure(msg string) {

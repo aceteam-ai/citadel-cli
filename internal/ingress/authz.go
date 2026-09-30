@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"net"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -48,7 +48,17 @@ var platformSessionCookieExact = []string{
 // is deliberate (fail-closed toward stripping a session cookie) while genuinely
 // unrelated cookies (sess, theme, an app's own id) match neither test.
 func isPlatformSessionCookie(name string) bool {
-	lower := strings.ToLower(name)
+	decoded := name
+	if unescaped, err := url.PathUnescape(name); err == nil {
+		decoded = unescaped
+	}
+	lower := strings.ToLower(decoded)
+	for _, prefix := range []string{"__secure-", "__host-"} {
+		if strings.HasPrefix(lower, prefix) {
+			lower = strings.TrimPrefix(lower, prefix)
+			break
+		}
+	}
 	if strings.HasPrefix(lower, "sb-") && strings.Contains(lower, "auth-token") {
 		return true
 	}
@@ -62,16 +72,45 @@ func isPlatformSessionCookie(name string) bool {
 
 // stripInbound removes every trust header and every session cookie (the hardcoded
 // platform family, ALWAYS, plus any augment name) from the request before it is
-// forwarded to the pod. It deliberately does NOT touch hop-by-hop headers
-// (Connection, Upgrade, ...) so a WebSocket upgrade still works through the
-// proxy. Unrelated cookies survive.
+// forwarded to the pod. It removes trust-header tokens from Connection so a
+// client cannot nominate an ingress-owned header for ReverseProxy to delete
+// after the ingress sets it. Other hop-by-hop tokens, notably Upgrade for a
+// WebSocket handshake, survive. Unrelated cookies survive.
 func stripInbound(r *http.Request, augment []string) {
 	for key := range r.Header {
 		if isTrustHeader(key) {
 			r.Header.Del(key)
 		}
 	}
+	sanitizeConnectionHeader(r.Header)
 	stripCookies(r, augment)
+}
+
+// sanitizeConnectionHeader removes only tokens that name trust headers. Go's
+// ReverseProxy strips every header nominated by Connection after Director has
+// run, so leaving these client-controlled tokens in place would let a client
+// erase the ingress-owned values set by setForwardHeaders. Non-trust tokens are
+// preserved, including Upgrade, which is required for WebSocket proxying.
+func sanitizeConnectionHeader(h http.Header) {
+	values := h.Values("Connection")
+	if len(values) == 0 {
+		return
+	}
+
+	h.Del("Connection")
+	for _, value := range values {
+		var kept []string
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" || isTrustHeader(token) {
+				continue
+			}
+			kept = append(kept, token)
+		}
+		if len(kept) > 0 {
+			h.Add("Connection", strings.Join(kept, ", "))
+		}
+	}
 }
 
 func isTrustHeader(key string) bool {
@@ -173,9 +212,9 @@ func gatedSessionCookie(r *http.Request, augment []string) string {
 // is the authenticated identity from a gated authz decision; the pod can trust
 // X-Ingress-Subject precisely because inbound copies were deleted first.
 func setForwardHeaders(r *http.Request, publicHost, subject string) {
-	if ip := clientIP(r.RemoteAddr); ip != "" {
-		r.Header.Set("X-Forwarded-For", ip)
-	}
+	// ReverseProxy owns X-Forwarded-For and derives it once from RemoteAddr
+	// after stripping hop-by-hop headers. Setting it here would make the proxy
+	// append the same client IP a second time.
 	r.Header.Set("X-Forwarded-Proto", "https")
 	if publicHost != "" {
 		r.Header.Set("X-Forwarded-Host", publicHost)
@@ -183,17 +222,6 @@ func setForwardHeaders(r *http.Request, publicHost, subject string) {
 	if subject != "" {
 		r.Header.Set("X-Ingress-Subject", subject)
 	}
-}
-
-// clientIP returns just the host part of a RemoteAddr (which is host:port).
-// The existing gateway code sets the raw RemoteAddr including the port; for an
-// X-Forwarded-For value the port is wrong, so we strip it.
-func clientIP(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		return remoteAddr
-	}
-	return host
 }
 
 // rewriteSetCookie strips the Domain= attribute (in any position, any case) so a
@@ -206,8 +234,11 @@ func rewriteSetCookie(v string) string {
 	for i, p := range parts {
 		trimmed := strings.TrimSpace(p)
 		lower := strings.ToLower(trimmed)
-		if i > 0 && strings.HasPrefix(lower, "domain=") {
-			continue // drop the Domain attribute
+		if i > 0 {
+			name, _, hasValue := strings.Cut(trimmed, "=")
+			if hasValue && strings.EqualFold(strings.TrimSpace(name), "domain") {
+				continue // drop the Domain attribute
+			}
 		}
 		if lower == "secure" {
 			hasSecure = true

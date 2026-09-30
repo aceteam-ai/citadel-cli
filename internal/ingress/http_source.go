@@ -25,10 +25,11 @@ type httpRoutesSource struct {
 // NewHTTPRoutesSource builds a RoutesSource over the given routes endpoint URL
 // and bearer token.
 func NewHTTPRoutesSource(routesURL, token string, client *http.Client) RoutesSource {
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+	return &httpRoutesSource{
+		baseURL: routesURL,
+		token:   token,
+		client:  clientWithoutRedirects(client, 15*time.Second),
 	}
-	return &httpRoutesSource{baseURL: routesURL, token: token, client: client}
 }
 
 func (s *httpRoutesSource) Fetch(ctx context.Context, etag string) (int, string, []byte, error) {
@@ -86,10 +87,27 @@ type httpAuthorizer struct {
 
 // NewHTTPAuthorizer builds an Authorizer. authzURL is the full authz endpoint.
 func NewHTTPAuthorizer(authzURL, token string, client *http.Client) Authorizer {
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+	return &httpAuthorizer{
+		authzURL: authzURL,
+		token:    token,
+		client:   clientWithoutRedirects(client, 10*time.Second),
 	}
-	return &httpAuthorizer{authzURL: authzURL, token: token, client: client}
+}
+
+// clientWithoutRedirects returns a private copy of client which exposes the
+// first redirect response to the caller instead of forwarding control-plane
+// credentials or request bodies to the redirect target. The copy is important:
+// callers may share their client with unrelated traffic whose redirect policy
+// must remain untouched.
+func clientWithoutRedirects(client *http.Client, defaultTimeout time.Duration) *http.Client {
+	if client == nil {
+		client = &http.Client{Timeout: defaultTimeout}
+	}
+	cloned := *client
+	cloned.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &cloned
 }
 
 type authzRequest struct {
