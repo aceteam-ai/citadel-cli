@@ -130,6 +130,7 @@ type ingressOptions struct {
 
 	routes      *ingress.Client
 	authorizer  ingress.Authorizer
+	exchanger   ingress.Exchanger
 	cert        ingress.CertProvider
 	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	isConnected func() bool
@@ -185,6 +186,7 @@ func resolveIngressOptions(_ context.Context) (ingressOptions, error) {
 	routes := ingress.NewClient(ingress.ClientConfig{
 		Source:       src,
 		PollInterval: poll,
+		AppsDomain:   appsDomain,
 		Logf:         Log,
 	})
 
@@ -194,11 +196,13 @@ func resolveIngressOptions(_ context.Context) (ingressOptions, error) {
 	}
 	authorizer := ingress.NewHTTPAuthorizer(authzURL, token, nil)
 
-	cookieName := os.Getenv("CITADEL_INGRESS_SESSION_COOKIE")
-	var cookieNames []string
-	if cookieName != "" {
-		cookieNames = []string{cookieName}
+	exchangeURL, err := ingress.DeriveExchangeURL(routesURL)
+	if err != nil {
+		return ingressOptions{}, fmt.Errorf("ingress: cannot derive credential exchange URL from routes URL: %w", err)
 	}
+	exchanger := ingress.NewHTTPExchanger(exchangeURL, token, nil)
+
+	cookieNames := ingressSessionCookieNames(os.Getenv("CITADEL_INGRESS_SESSION_COOKIE"))
 
 	return ingressOptions{
 		appsDomain:  appsDomain,
@@ -207,6 +211,7 @@ func resolveIngressOptions(_ context.Context) (ingressOptions, error) {
 		cookieNames: cookieNames,
 		routes:      routes,
 		authorizer:  authorizer,
+		exchanger:   exchanger,
 		cert:        cert,
 		dialContext: ingressDialContext,
 		isConnected: ingressIsConnected,
@@ -333,6 +338,7 @@ func ingressServe(
 		AppsDomain:         opts.appsDomain,
 		Resolver:           opts.routes,
 		Authorizer:         opts.authorizer,
+		Exchanger:          opts.exchanger,
 		DialContext:        opts.dialContext,
 		DefaultCookieNames: opts.cookieNames,
 		Logf:               opts.logf,
@@ -392,6 +398,30 @@ func ingressServe(
 		}
 		return nil
 	}
+}
+
+// ingressSessionCookieNames returns the fail-safe cookie strip defaults plus
+// any operator-supplied comma-separated names. The platform handoff credential
+// and its nonce are always present: an empty or customized environment value
+// must not make either browser credential eligible to reach an app pod.
+func ingressSessionCookieNames(value string) []string {
+	candidates := []string{ingress.AppCredentialCookieName, ingress.AppNonceCookieName}
+	candidates = append(candidates, strings.Split(value, ",")...)
+
+	seen := make(map[string]struct{}, len(candidates))
+	names := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		name := strings.TrimSpace(candidate)
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
 }
 
 // flagOrEnv returns the flag value if non-empty, else the env var.

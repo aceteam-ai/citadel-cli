@@ -118,16 +118,17 @@ type authzRequest struct {
 type authzResponse struct {
 	Allow   bool   `json:"allow"`
 	Subject string `json:"subject"`
+	Reason  string `json:"reason"`
 }
 
-func (a *httpAuthorizer) Authorize(ctx context.Context, slug, cookie string) (bool, string, error) {
+func (a *httpAuthorizer) Authorize(ctx context.Context, slug, cookie string) (AuthzDecision, error) {
 	payload, err := json.Marshal(authzRequest{Slug: slug, Cookie: cookie})
 	if err != nil {
-		return false, "", err
+		return AuthzDecision{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.authzURL, bytes.NewReader(payload))
 	if err != nil {
-		return false, "", err
+		return AuthzDecision{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if a.token != "" {
@@ -135,18 +136,18 @@ func (a *httpAuthorizer) Authorize(ctx context.Context, slug, cookie string) (bo
 	}
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return false, "", err
+		return AuthzDecision{}, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
-		return false, "", fmt.Errorf("authz: unexpected status %d", resp.StatusCode)
+		return AuthzDecision{}, fmt.Errorf("authz: unexpected status %d", resp.StatusCode)
 	}
 	var ar authzResponse
 	if err := json.Unmarshal(body, &ar); err != nil {
-		return false, "", err
+		return AuthzDecision{}, err
 	}
-	return ar.Allow, ar.Subject, nil
+	return AuthzDecision{Allow: ar.Allow, Subject: ar.Subject, Reason: ar.Reason}, nil
 }
 
 // DeriveAuthzURL turns a routes endpoint URL into its sibling authz URL

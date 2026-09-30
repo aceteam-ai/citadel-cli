@@ -40,6 +40,14 @@ var platformSessionCookieExact = []string{
 	"supabase-auth-token", // legacy combined auth cookie
 }
 
+const (
+	// AppCredentialCookieName is the host-only credential minted by the control
+	// plane for an app host. AppNonceCookieName binds the one-time browser
+	// handoff to the browser that initiated it. Neither may ever reach a pod.
+	AppCredentialCookieName = "__Host-ace_app"
+	AppNonceCookieName      = "__Host-ace_app_nonce"
+)
+
 // isPlatformSessionCookie reports whether a cookie name belongs to the platform
 // session family. It matches the Supabase auth-token family broadly -- the base
 // cookie sb-<ref>-auth-token, every chunk suffix (.0, .1, ...) a large session
@@ -170,16 +178,52 @@ func stripCookies(r *http.Request, augment []string) {
 // for the session-isolation invariant: once the ingress has read a session
 // cookie for its own authz decision, that cookie must never reach the pod, so a
 // request whose outbound Cookie header still carries one is refused rather than
-// forwarded (see Proxy.ServeHTTP). It inspects the platform family only; the
-// augment names are the payload's own and are not the credential this guard
-// protects.
-func outboundSessionCookieLeaked(r *http.Request) bool {
+// forwarded (see Proxy.ServeHTTP). It covers both the hardcoded platform family
+// and the active feed/config augment so newly introduced credentials fail
+// closed if stripping ever regresses.
+func outboundSessionCookieLeaked(r *http.Request, augment []string) bool {
+	drop := cookieNameSet(augment)
 	for _, ck := range r.Cookies() {
-		if isPlatformSessionCookie(ck.Name) {
+		if isPlatformSessionCookie(ck.Name) || cookieNameInSet(ck.Name, drop) {
 			return true
 		}
 	}
 	return false
+}
+
+func cookieNameSet(names []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name = strings.TrimSpace(name); name != "" {
+			set[name] = struct{}{}
+		}
+	}
+	return set
+}
+
+func cookieNameInSet(name string, set map[string]struct{}) bool {
+	if _, ok := set[name]; ok {
+		return true
+	}
+	if unescaped, err := url.PathUnescape(name); err == nil {
+		_, ok := set[unescaped]
+		return ok
+	}
+	return false
+}
+
+// protectedSetCookie reports whether a pod-originated Set-Cookie attempts to
+// replace a platform or configured ingress credential. Malformed values are
+// left to net/http/browser parsing; values with no cookie-pair cannot name a
+// protected cookie.
+func protectedSetCookie(v string, augment []string) bool {
+	pair, _, _ := strings.Cut(v, ";")
+	name, _, ok := strings.Cut(strings.TrimSpace(pair), "=")
+	if !ok {
+		return false
+	}
+	name = strings.TrimSpace(name)
+	return isPlatformSessionCookie(name) || cookieNameInSet(name, cookieNameSet(augment))
 }
 
 // gatedSessionCookie extracts the session-cookie material a gated app's authz
@@ -253,10 +297,16 @@ func rewriteSetCookie(v string) string {
 
 // Authorizer is the injectable server-to-server gated-app check. The production
 // implementation POSTs to the control plane; a fake is used in tests.
+type AuthzDecision struct {
+	Allow   bool
+	Subject string
+	Reason  string
+}
+
 type Authorizer interface {
 	// Authorize reports whether the (slug, session cookie) pair may access the
 	// app, and returns the authenticated subject when allowed.
-	Authorize(ctx context.Context, slug, cookie string) (allow bool, subject string, err error)
+	Authorize(ctx context.Context, slug, cookie string) (AuthzDecision, error)
 }
 
 // maxGatedSessionCookieBytes caps the assembled session-cookie material sent to

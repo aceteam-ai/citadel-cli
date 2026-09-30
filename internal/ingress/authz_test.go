@@ -147,12 +147,12 @@ func TestPlatformCookieConsumersUseNormalizedNames(t *testing.T) {
 	if got := gatedSessionCookie(r, nil); got != encoded+"=secret" {
 		t.Fatalf("gatedSessionCookie = %q, want normalized platform cookie", got)
 	}
-	if !outboundSessionCookieLeaked(r) {
+	if !outboundSessionCookieLeaked(r, nil) {
 		t.Fatal("outboundSessionCookieLeaked did not detect normalized platform cookie")
 	}
 
 	stripInbound(r, nil)
-	if outboundSessionCookieLeaked(r) {
+	if outboundSessionCookieLeaked(r, nil) {
 		t.Fatal("normalized platform cookie survived stripInbound")
 	}
 	if got := r.Header.Get("Cookie"); got != "theme=dark" {
@@ -186,13 +186,34 @@ func TestStripCookies_StripsPlatformFamilyWithEmptyAugment(t *testing.T) {
 func TestOutboundSessionCookieLeaked(t *testing.T) {
 	leaked := httptest.NewRequest(http.MethodGet, "https://x/", nil)
 	leaked.Header.Set("Cookie", "keep=1; sb-projref-auth-token=stillhere")
-	if !outboundSessionCookieLeaked(leaked) {
+	if !outboundSessionCookieLeaked(leaked, nil) {
 		t.Error("a surviving platform session cookie must be detected as leaked")
 	}
 	clean := httptest.NewRequest(http.MethodGet, "https://x/", nil)
 	clean.Header.Set("Cookie", "keep=1; theme=dark")
-	if outboundSessionCookieLeaked(clean) {
+	if outboundSessionCookieLeaked(clean, nil) {
 		t.Error("unrelated cookies must not be reported as a leak")
+	}
+	augmented := httptest.NewRequest(http.MethodGet, "https://x/", nil)
+	augmented.Header.Set("Cookie", "custom-session=stillhere")
+	if !outboundSessionCookieLeaked(augmented, []string{"custom-session"}) {
+		t.Error("a surviving augment-named cookie must be detected as leaked")
+	}
+}
+
+func TestProtectedSetCookie(t *testing.T) {
+	for _, value := range []string{
+		"sb-ref-auth-token=secret; Path=/",
+		AppCredentialCookieName + "=replacement; Path=/",
+		AppNonceCookieName + "=replacement; Path=/",
+		"custom-session=replacement; Path=/",
+	} {
+		if !protectedSetCookie(value, []string{AppCredentialCookieName, AppNonceCookieName, "custom-session"}) {
+			t.Errorf("protectedSetCookie(%q) = false", value)
+		}
+	}
+	if protectedSetCookie("theme=dark; Path=/", []string{AppCredentialCookieName}) {
+		t.Error("unrelated app cookie must not be dropped")
 	}
 }
 
