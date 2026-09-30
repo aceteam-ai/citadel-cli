@@ -6,8 +6,9 @@
 # returns document text (with optional structure/bbox markers), so it routes
 # through the SAME OpenAI surface as every other citadel engine.
 #
-# UNLIKE the generic vllm.yml (which pulls stock vllm/vllm-openai:latest), this
-# service uses Baidu's PURPOSE-BUILT image tag `vllm/vllm-openai:unlimited-ocr`.
+# UNLIKE the generic vllm.yml (which pulls stock
+# docker.io/vllm/vllm-openai:latest), this service uses Baidu's PURPOSE-BUILT
+# image tag `docker.io/vllm/vllm-openai:unlimited-ocr`.
 # The model is `trust_remote_code` (custom modeling code + a no-repeat n-gram
 # logits processor that ships INSIDE this image as
 # vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor), so stock
@@ -22,7 +23,7 @@
 
 services:
   unlimited-ocr:
-    image: vllm/vllm-openai:unlimited-ocr
+    image: docker.io/vllm/vllm-openai:unlimited-ocr
     container_name: citadel-unlimited-ocr
     # Host port is owned by citadel (services/ports.go), supplied via
     # CITADEL_UNLIMITED_OCR_HOST_PORT. Loopback-only publish (127.0.0.1),

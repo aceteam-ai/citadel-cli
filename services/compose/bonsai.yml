@@ -23,7 +23,10 @@ services:
     build:
       context: ./bonsai
       dockerfile: Dockerfile
-    image: citadel-bonsai:local
+    # Podman treats an unqualified image name as a registry lookup even when
+    # Compose builds it locally. The localhost/ namespace is Podman's explicit
+    # local-storage namespace and remains a normal local tag under Docker.
+    image: localhost/citadel-bonsai:local
     container_name: citadel-bonsai
     # Host port is owned by citadel (services/ports.go), supplied via
     # CITADEL_BONSAI_HOST_PORT. Loopback-only publish (127.0.0.1),

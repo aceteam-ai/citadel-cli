@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
@@ -68,6 +69,52 @@ func TestDoctorReportOKIncludesPodmanSafetyChecks(t *testing.T) {
 	base.gpuHealth = gpuProbeHealth{Applicable: true, OK: false, Message: "CDI failed"}
 	if base.ok() {
 		t.Fatal("failed CDI probe must fail doctor")
+	}
+}
+
+func TestDoctorReportFailsForMissingManagedService(t *testing.T) {
+	r := doctorReport{
+		dockerHealth:    platform.DockerHealth{OK: true},
+		doctor:          healthyDoctorPayload(),
+		servicesChecked: true,
+		serviceHealth: []managedServiceHealth{{
+			Name: "ollama", State: "missing", Detail: "configured to run, but no container or native process is running",
+		}},
+	}
+	if r.ok() {
+		t.Fatal("a missing configured service must fail doctor")
+	}
+	if got := r.problem(); !strings.Contains(got, "service ollama") {
+		t.Fatalf("problem = %q, want service name", got)
+	}
+
+	var buf bytes.Buffer
+	renderDoctorReport(&buf, r)
+	for _, want := range []string{"MANAGED SERVICES", "[FAIL] ollama: missing", "Overall: PROBLEMS DETECTED"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("rendered report missing %q\nfull output:\n%s", want, buf.String())
+		}
+	}
+}
+
+func TestDoctorReportFailsForPartiallyRunningDesiredStoppedService(t *testing.T) {
+	checks := []managedServiceHealth{{
+		Name: "module", State: compose.StatePartial,
+		Detail: "some service components are running despite desired_status: stopped",
+	}}
+	r := doctorReport{
+		dockerHealth: platform.DockerHealth{OK: true}, doctor: healthyDoctorPayload(),
+		servicesChecked: true, serviceHealth: checks,
+	}
+	if r.ok() {
+		t.Fatal("partially running desired-stopped service must fail doctor")
+	}
+	var buf bytes.Buffer
+	renderDoctorReport(&buf, r)
+	for _, want := range []string{"[FAIL] module: partial", "desired_status: stopped", "Overall: PROBLEMS DETECTED"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("rendered report missing %q\nfull output:\n%s", want, buf.String())
+		}
 	}
 }
 
@@ -258,7 +305,9 @@ func TestRenderDoctorReport_DockerCheckShownOnce(t *testing.T) {
 // the report never panics and returns a well-formed payload for a zero-value
 // (no live worker) snapshot.
 func TestRunDoctorChecksNoCrash(t *testing.T) {
-	report := runDoctorChecks()
+	report := runDoctorChecksFor(platform.IsDarwin(), func() ([]managedServiceHealth, bool) {
+		return nil, false
+	})
 
 	if report.doctor == nil {
 		t.Fatalf("expected a non-nil doctor payload")
@@ -375,11 +424,20 @@ func TestDoctorReportOK_DarwinDockerOptional(t *testing.T) {
 // refactor dropping that wiring is caught even though CI runs on Linux where the
 // darwin branch never executes end-to-end.
 func TestRunDoctorChecksForWiresDockerOptional(t *testing.T) {
-	if r := runDoctorChecksFor(true); !r.dockerOptional {
+	noServices := func() ([]managedServiceHealth, bool) { return nil, false }
+	if r := runDoctorChecksFor(true, noServices); !r.dockerOptional {
 		t.Errorf("runDoctorChecksFor(true) must set dockerOptional")
 	}
-	if r := runDoctorChecksFor(false); r.dockerOptional {
+	if r := runDoctorChecksFor(false, noServices); r.dockerOptional {
 		t.Errorf("runDoctorChecksFor(false) must not set dockerOptional")
+	}
+}
+
+func TestRunDoctorChecksForWiresManagedServiceHealth(t *testing.T) {
+	want := []managedServiceHealth{{Name: "ollama", State: "missing", Detail: "not running"}}
+	r := runDoctorChecksFor(false, func() ([]managedServiceHealth, bool) { return want, true })
+	if !r.servicesChecked || !reflect.DeepEqual(r.serviceHealth, want) {
+		t.Fatalf("managed service health = (%+v, checked=%v), want (%+v, true)", r.serviceHealth, r.servicesChecked, want)
 	}
 }
 

@@ -2,7 +2,7 @@
 
 services:
   sglang:
-    image: lmsysorg/sglang:latest
+    image: docker.io/lmsysorg/sglang:latest
     container_name: citadel-sglang
     # Loopback-only publish (127.0.0.1), deliberately (aceteam-ai/aceteam#9523):
     # this is an OpenAI-compatible server with no auth of its own. Unlike

@@ -34,6 +34,7 @@ func TestStatusModelRender(t *testing.T) {
 		Services: []ServiceStatus{
 			{Name: "vllm", Status: "running", Uptime: "2d 14h"},
 			{Name: "ollama", Status: "stopped"},
+			{Name: "sglang", Status: "error", Detail: "configured but not running"},
 		},
 		Peers: []PeerInfo{
 			{Hostname: "macbook-pro", IP: "100.64.0.10", Online: true, Latency: "12ms", ConnType: "direct"},
@@ -66,6 +67,8 @@ func TestStatusModelRender(t *testing.T) {
 		"SERVICES",
 		"vllm",
 		"ollama",
+		"sglang",
+		"configured but not running",
 		"NETWORK PEERS",
 		"macbook-pro",
 		"server-02",

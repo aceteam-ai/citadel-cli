@@ -24,7 +24,7 @@
 # otherwise, so recordings never silently land on the local disk.
 services:
   wyze-bridge:
-    image: idisposablegithub365/wyze-bridge:latest
+    image: docker.io/idisposablegithub365/wyze-bridge:latest
     container_name: citadel-nvr-wyze-bridge
     # HOST NETWORKING IS MANDATORY AND NON-NEGOTIABLE. TUTK P2P needs LAN broadcast
     # + UDP hole-punching; Docker bridge NAT breaks camera discovery and EVERY
@@ -83,7 +83,7 @@ services:
       - ~/.citadel-cli/nvr/media:/media
 
   mosquitto:
-    image: eclipse-mosquitto:2
+    image: docker.io/eclipse-mosquitto:2
     container_name: citadel-nvr-mosquitto
     # DELIBERATELY NO `ports:` BLOCK. The broker is reachable only on this
     # module's compose network, never from the host, the LAN, or the fabric.

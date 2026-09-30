@@ -80,15 +80,15 @@ func TestRewriteContainerNameLine_Success(t *testing.T) {
 
 // TestRewriteContainerNameLine_DoesNotTouchImageTag pins the exact incident
 // bonsai's compose would hit with a naive substring replace: it references
-// "citadel-bonsai" TWICE (once as `image: citadel-bonsai:local`, once as
+// "citadel-bonsai" TWICE (once as `image: localhost/citadel-bonsai:local`, once as
 // `container_name: citadel-bonsai`), and only the second must change.
 func TestRewriteContainerNameLine_DoesNotTouchImageTag(t *testing.T) {
-	content := "services:\n  bonsai:\n    build: {context: ./bonsai}\n    image: citadel-bonsai:local\n    container_name: citadel-bonsai\n"
+	content := "services:\n  bonsai:\n    build: {context: ./bonsai}\n    image: localhost/citadel-bonsai:local\n    container_name: citadel-bonsai\n"
 	rewritten, err := RewriteContainerNameLine(content, "bonsai", "citadel-abc123def456-bonsai")
 	if err != nil {
 		t.Fatalf("RewriteContainerNameLine returned error: %v", err)
 	}
-	if !strings.Contains(rewritten, "image: citadel-bonsai:local") {
+	if !strings.Contains(rewritten, "image: localhost/citadel-bonsai:local") {
 		t.Fatalf("image tag must be untouched, got: %s", rewritten)
 	}
 	if !strings.Contains(rewritten, "container_name: citadel-abc123def456-bonsai") {

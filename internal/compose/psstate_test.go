@@ -15,7 +15,7 @@ import (
 // returns the entire project, so a caller that reads the first record concludes
 // vllm is running when vllm has no container at all.
 const livePSOutput = `
-{"ID":"61bfa011e53f","Name":"citadel-bonsai","Image":"citadel-bonsai:local","Service":"bonsai","State":"running","Status":"Up 10 hours","Ports":"0.0.0.0:8210->8080/tcp"}
+{"ID":"61bfa011e53f","Name":"citadel-bonsai","Image":"localhost/citadel-bonsai:local","Service":"bonsai","State":"running","Status":"Up 10 hours","Ports":"0.0.0.0:8210->8080/tcp"}
 {"ID":"97d7fac7c972","Name":"citadel-gotenberg","Image":"gotenberg:8","Service":"gotenberg","State":"running","Status":"Up 10 hours (healthy)","Ports":"127.0.0.1:8209->3000/tcp"}
 {"ID":"53b6c466f956","Name":"citadel-kokoro","Image":"kokoro-service:latest","Service":"kokoro","State":"running","Status":"Up 10 hours (healthy)","Ports":"127.0.0.1:8211->8080/tcp"}
 {"ID":"3e8aac0c4d1b","Name":"citadel-meeting","Image":"meeting-service:latest","Service":"meeting","State":"running","Status":"Up 10 hours (healthy)","Ports":"127.0.0.1:8207->8102/tcp"}
@@ -33,7 +33,7 @@ func always() bool { return true }
 // whose own container is in the project-wide output and is up.
 func TestResolveServiceStateContainerBacked(t *testing.T) {
 	got := ResolveServiceState([]byte(livePSOutput), map[string]bool{"kokoro": true}, never)
-	if !got.Running || got.State != StateRunning {
+	if !got.Running || !got.AnyRunning || got.State != StateRunning {
 		t.Fatalf("kokoro: got %+v, want running", got)
 	}
 	if got.Native {
@@ -56,7 +56,7 @@ func TestResolveServiceStateContainerBacked(t *testing.T) {
 func TestResolveServiceStateMultiContainerService(t *testing.T) {
 	declared := map[string]bool{"bridge": true, "db": true}
 	got := ResolveServiceState([]byte(livePSOutput), declared, never)
-	if !got.Running {
+	if !got.Running || !got.AnyRunning {
 		t.Fatalf("whatsapp-bridge: got %+v, want running", got)
 	}
 	if got.Container == nil || !strings.HasPrefix(got.Container.Name, "services-") {
@@ -71,7 +71,7 @@ func TestResolveServiceStateMultiContainerService(t *testing.T) {
 // decides.
 func TestResolveServiceStateNative(t *testing.T) {
 	got := ResolveServiceState([]byte(livePSOutput), map[string]bool{"ollama": true}, always)
-	if !got.Running || got.State != StateRunning {
+	if !got.Running || !got.AnyRunning || got.State != StateRunning {
 		t.Fatalf("native ollama: got %+v, want running", got)
 	}
 	if !got.Native {
@@ -90,7 +90,7 @@ func TestResolveServiceStateNative(t *testing.T) {
 func TestResolveServiceStateNativeBeatsStaleContainer(t *testing.T) {
 	out := `{"ID":"a","Name":"citadel-ollama","Service":"ollama","State":"exited","Status":"Exited (0) 3 days ago"}`
 	got := ResolveServiceState([]byte(out), map[string]bool{"ollama": true}, always)
-	if !got.Running || !got.Native {
+	if !got.Running || !got.AnyRunning || !got.Native {
 		t.Fatalf("got %+v, want running via the native probe", got)
 	}
 	// Same input with nothing serving must still read the stale container.
@@ -141,15 +141,35 @@ func TestResolveServiceStateExited(t *testing.T) {
 	}
 }
 
-// TestResolveServiceStatePrefersRunning: when a multi-service compose file has
-// one container up and one down, the running one is selected so the uptime and
-// state read off it are the live ones.
-func TestResolveServiceStatePrefersRunning(t *testing.T) {
+// TestResolveServiceStateRejectsExitedSibling pins the #1188 review finding:
+// one running component must not mask an exited sibling in a multi-container
+// compose module.
+func TestResolveServiceStateRejectsExitedSibling(t *testing.T) {
 	out := `{"ID":"a","Name":"services-db-1","Service":"db","State":"exited","Status":"Exited (0)"}
 {"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
 	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, never)
-	if !got.Running || got.Container == nil || got.Container.ID != "b" {
-		t.Fatalf("got %+v, want the running container", got)
+	if got.Running || !got.AnyRunning || got.State != StatePartial || got.Container == nil || got.Container.ID != "a" {
+		t.Fatalf("got %+v, want the exited sibling to make the module unhealthy", got)
+	}
+}
+
+// TestResolveServiceStateRejectsAbsentSibling is the missing-component variant
+// of the same regression: every non-profiled declared service must be present.
+func TestResolveServiceStateRejectsAbsentSibling(t *testing.T) {
+	out := `{"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
+	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, never)
+	if got.Running || !got.AnyRunning || got.State != StatePartial || got.Container != nil {
+		t.Fatalf("got %+v, want the absent sibling to make the module stopped", got)
+	}
+}
+
+// TestResolveServiceStateMultiContainerDoesNotUseNativeFallback ensures one
+// native socket cannot satisfy the other components of a compose module.
+func TestResolveServiceStateMultiContainerDoesNotUseNativeFallback(t *testing.T) {
+	out := `{"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
+	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, always)
+	if got.Running || !got.AnyRunning || got.State != StatePartial || got.Native {
+		t.Fatalf("got %+v, want missing db to remain unhealthy", got)
 	}
 }
 
@@ -212,6 +232,11 @@ func TestDeclaredServicesFromYAML(t *testing.T) {
 			name: "two services, compose-default container names",
 			yaml: "services:\n  bridge:\n    image: bridge:latest\n  db:\n    image: postgres:16-alpine\n",
 			want: []string{"bridge", "db"},
+		},
+		{
+			name: "profile-gated service is not started by default",
+			yaml: "services:\n  api:\n    image: example/api\n  debug:\n    image: example/debug\n    profiles: [debug]\n",
+			want: []string{"api"},
 		},
 	}
 	for _, tt := range tests {

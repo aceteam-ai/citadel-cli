@@ -97,7 +97,8 @@ func ContainerName(svc, overrideDir string) string {
 // exists to prevent. "container_name: citadel-<svc>" (not just "citadel-<svc>")
 // is deliberately the search string: some services also reference
 // "citadel-<svc>" in an `image:` tag (e.g. bonsai's locally-built
-// `citadel-bonsai:local`), and a bare-substring replace would corrupt that too.
+// `localhost/citadel-bonsai:local`), and a bare-substring replace would corrupt
+// that too.
 func RewriteContainerNameLine(content, svc, newName string) (string, error) {
 	old := "container_name: citadel-" + svc
 	if !strings.Contains(content, old) {
