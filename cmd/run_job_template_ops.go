@@ -622,6 +622,9 @@ func wrapTemplateError(err error, format string, args ...any) error {
 // active or incomplete and is preserved even if very old; this prevents a
 // watchdog-abandoned goroutine from losing paths it may still own. Successful
 // pre-marker attempts are recognized by the legacy out-without-inputs shape.
+// After attempt pruning, now-empty job and template parents are removed so
+// unique job IDs do not leave one permanent inode each; non-empty parents are
+// always preserved.
 func pruneRetainedTemplateAttempts(workspaceRoot *os.Root, now time.Time, retention time.Duration) error {
 	if retention <= 0 {
 		return fmt.Errorf("template output retention must be positive")
@@ -677,7 +680,44 @@ func pruneRetainedTemplateAttempts(workspaceRoot *os.Root, now time.Time, retent
 					return fmt.Errorf("remove expired attempt %s: %w", attemptRelSlash, err)
 				}
 			}
+			if err := removeTemplateDirIfEmpty(workspaceRoot, filepath.FromSlash(jobRel)); err != nil {
+				return fmt.Errorf("remove empty template job directory %s: %w", jobRel, err)
+			}
 		}
+		if err := removeTemplateDirIfEmpty(workspaceRoot, filepath.FromSlash(templateRel)); err != nil {
+			return fmt.Errorf("remove empty template directory %s: %w", templateRel, err)
+		}
+	}
+	return nil
+}
+
+// removeTemplateDirIfEmpty removes one internal GC parent only when it has no
+// children. A concurrent attempt may populate the directory between ReadDir and
+// Remove; re-reading after a failed removal treats that now-non-empty directory
+// as protected rather than turning a benign race into a failed template run.
+func removeTemplateDirIfEmpty(workspaceRoot *os.Root, rel string) error {
+	entries, err := fs.ReadDir(workspaceRoot.FS(), filepath.ToSlash(rel))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if len(entries) != 0 {
+		return nil
+	}
+	if err := workspaceRoot.Remove(rel); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		entries, readErr := fs.ReadDir(workspaceRoot.FS(), filepath.ToSlash(rel))
+		if errors.Is(readErr, os.ErrNotExist) {
+			return nil
+		}
+		if readErr == nil && len(entries) != 0 {
+			return nil
+		}
+		return errors.Join(err, wrapTemplateError(readErr, "re-read directory after failed removal"))
 	}
 	return nil
 }

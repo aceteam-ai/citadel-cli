@@ -675,6 +675,98 @@ func TestPruneRetainedTemplateAttempts(t *testing.T) {
 	}
 }
 
+func TestPruneRetainedTemplateAttemptsRemovesEmptyUniqueJobParents(t *testing.T) {
+	ws := t.TempDir()
+	root, err := os.OpenRoot(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	now := time.Unix(2_000_000_000, 0)
+	old := now.Add(-templateOutputRetention - time.Second)
+	templateRel := filepath.Join("templates", "t")
+	for i := 0; i < 4; i++ {
+		rel := filepath.Join(templateRel, fmt.Sprintf("unique-job-%d", i), fmt.Sprintf("attempt-%032x", i+1))
+		if err := root.MkdirAll(filepath.Join(rel, "out"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(rel, templateCompleteMarker)
+		if err := root.WriteFile(marker, []byte(templateCompleteBody), 0o400); err != nil {
+			t.Fatal(err)
+		}
+		if err := root.Chtimes(marker, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := pruneRetainedTemplateAttempts(root, now, templateOutputRetention); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.Stat(templateRel); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired unique jobs left empty template/job parents: %v", err)
+	}
+}
+
+func TestPruneRetainedTemplateAttemptsPreservesNonEmptyParents(t *testing.T) {
+	ws := t.TempDir()
+	root, err := os.OpenRoot(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	now := time.Unix(2_000_000_000, 0)
+	old := now.Add(-templateOutputRetention - time.Second)
+	fresh := now.Add(-templateOutputRetention + time.Second)
+	templateRel := filepath.Join("templates", "t")
+
+	makeAttempt := func(job, attempt string, markerTime *time.Time, active bool) string {
+		t.Helper()
+		rel := filepath.Join(templateRel, job, attempt)
+		if err := root.MkdirAll(filepath.Join(rel, "out"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if active {
+			if err := root.Mkdir(filepath.Join(rel, "inputs"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if markerTime != nil {
+			marker := filepath.Join(rel, templateCompleteMarker)
+			if err := root.WriteFile(marker, []byte(templateCompleteBody), 0o400); err != nil {
+				t.Fatal(err)
+			}
+			if err := root.Chtimes(marker, *markerTime, *markerTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return rel
+	}
+
+	oldFresh := makeAttempt("fresh-sibling", "attempt-00000000000000000000000000000001", &old, false)
+	freshSibling := makeAttempt("fresh-sibling", "attempt-00000000000000000000000000000002", &fresh, false)
+	oldActive := makeAttempt("active-sibling", "attempt-00000000000000000000000000000003", &old, false)
+	activeSibling := makeAttempt("active-sibling", "attempt-00000000000000000000000000000004", nil, true)
+	oldOther := makeAttempt("other-sibling", "attempt-00000000000000000000000000000005", &old, false)
+	otherPath := filepath.Join(templateRel, "other-sibling", "operator-note")
+	if err := root.WriteFile(otherPath, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pruneRetainedTemplateAttempts(root, now, templateOutputRetention); err != nil {
+		t.Fatal(err)
+	}
+	for _, expired := range []string{oldFresh, oldActive, oldOther} {
+		if _, err := root.Stat(expired); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("expired attempt %s survived: %v", expired, err)
+		}
+	}
+	for _, preserved := range []string{freshSibling, activeSibling, otherPath, templateRel} {
+		if _, err := root.Stat(preserved); err != nil {
+			t.Errorf("non-empty parent sibling %s was removed: %v", preserved, err)
+		}
+	}
+}
+
 func TestPruneRetainedTemplateAttemptsFailsClosedOnInvalidMarker(t *testing.T) {
 	for _, tc := range []struct {
 		name string

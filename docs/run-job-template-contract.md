@@ -81,9 +81,11 @@ special files, and boundary overruns fail the attempt and remove its namespace.
 Successful output namespaces carry an exact node-owned completion marker and
 remain available for lazy `node:<node_id>/<path>` reads for seven days. A sweep
 before each new template attempt removes only completed namespaces strictly older
-than that window. Active or incomplete namespaces (identified by their retained
-input snapshot, which takes precedence over any marker) are never swept,
-including watchdog-abandoned attempts; the
+than that window, then removes only job/template parent directories left empty by
+the sweep. Parents containing fresh, active, or unrelated siblings are retained.
+Active or incomplete namespaces (identified by their retained input snapshot,
+which takes precedence over any marker) are never swept, including
+watchdog-abandoned attempts; the
 pre-marker successful layout from v2.175.0 is also recognized and expired.
 Empty collections serialize as arrays. Large output bytes do not enter the result.
 The platform turns outputs into `node:<node_id>/<path>` file references and reads
