@@ -2,6 +2,7 @@
 package terminal
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -85,6 +86,10 @@ type Config struct {
 	// CITADEL_TERMINAL_SESSION_TTL as a Go duration (for example "24h" or
 	// "168h").
 	SessionTTL time.Duration
+	// sessionTTLErr preserves an invalid environment value until Validate, since
+	// DefaultConfig historically returns only *Config rather than (*Config,
+	// error). Directly-constructed Config values use the shared duration check.
+	sessionTTLErr error
 
 	// TrustMeshPeers enables mesh-peer identity trust for connections that
 	// arrive over the VPN listener (citadel #585). When true AND a
@@ -139,6 +144,7 @@ type Config struct {
 
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
+	sessionTTL, sessionTTLErr := tmux.SessionLeaseTTLFromEnv()
 	return &Config{
 		Host:                 getEnvOrDefault("CITADEL_TERMINAL_HOST", "127.0.0.1"),
 		Port:                 getEnvInt("CITADEL_TERMINAL_PORT", 7860),
@@ -148,7 +154,8 @@ func DefaultConfig() *Config {
 		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
 		Shell:                getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
 		SessionName:          getEnvOrDefault("CITADEL_TERMINAL_SESSION", DefaultSessionName),
-		SessionTTL:           getEnvDuration("CITADEL_TERMINAL_SESSION_TTL", DefaultSessionTTL),
+		SessionTTL:           sessionTTL,
+		sessionTTLErr:        sessionTTLErr,
 		TrustMeshPeers:       getEnvBool("CITADEL_TERMINAL_TRUST_MESH", true),
 		AuthServiceURL:       getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
 		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
@@ -205,15 +212,6 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
-func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
-		}
-	}
-	return defaultValue
-}
-
 // Validate checks that the configuration is valid
 func (c *Config) Validate() error {
 	if c.Port < 1 || c.Port > 65535 {
@@ -225,7 +223,10 @@ func (c *Config) Validate() error {
 	if c.IdleTimeout < time.Minute {
 		return ErrInvalidIdleTimeout
 	}
-	if c.SessionTTL < 0 || (c.SessionTTL > 0 && c.SessionTTL < time.Minute) {
+	if c.sessionTTLErr != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSessionTTL, c.sessionTTLErr)
+	}
+	if err := tmux.ValidateSessionLeaseTTL(c.SessionTTL); err != nil {
 		return ErrInvalidSessionTTL
 	}
 	if c.OrgID == "" {

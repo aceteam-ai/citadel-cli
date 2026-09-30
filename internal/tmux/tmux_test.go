@@ -344,8 +344,8 @@ func TestManager_EnsureSessionUsesScopeCommand(t *testing.T) {
 	m := &Manager{
 		bin:    "/usr/bin/tmux",
 		runner: f,
-		scopeCommand: func(_ string, command []string) []string {
-			return append([]string{"systemd-run", "--scope", "--"}, command...)
+		scopeCommand: func(_ string, command []string) scopeDecision {
+			return scopeDecision{command: append([]string{"systemd-run", "--scope", "--"}, command...), scoped: true}
 		},
 	}
 
@@ -356,6 +356,114 @@ func TestManager_EnsureSessionUsesScopeCommand(t *testing.T) {
 	wantPrefix := []string{"--scope", "--", "/usr/bin/tmux", "new-session", "-d", "-s", "agent", "/bin/bash"}
 	if len(got) < len(wantPrefix) || !reflect.DeepEqual(got[:len(wantPrefix)], wantPrefix) || !containsArg(got, managedSessionOption) || !containsArg(got, managedSessionLeaseOption) {
 		t.Fatalf("scoped create/mark args = %v", got)
+	}
+}
+
+func TestManager_EnsureSessionScopeRuntimeFailureFallsBackToAtomicDirectCreate(t *testing.T) {
+	f := newFakeRunner()
+	displays := 0
+	f.run = func(_ context.Context, args []string) ([]byte, error) {
+		switch args[0] {
+		case "display-message":
+			displays++
+			if displays < 3 {
+				return nil, exitError(t)
+			}
+			return []byte("agent\t$1\t42\t0\t" + managedSessionOptionValue + "\t2000000000\n"), nil
+		case "--scope":
+			return []byte("Failed to connect to bus"), errors.New("systemd-run failed")
+		case "new-session":
+			if !containsArg(args, managedSessionOption) || !containsArg(args, managedSessionLeaseOption) {
+				t.Fatalf("direct fallback lost atomic marker/lease queue: %v", args)
+			}
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("unexpected command: %v", args)
+		}
+	}
+	m := &Manager{
+		bin:    "/usr/bin/tmux",
+		runner: f,
+		scopeCommand: func(_ string, command []string) scopeDecision {
+			return scopeDecision{command: append([]string{"systemd-run", "--scope", "--"}, command...), scoped: true}
+		},
+	}
+
+	if err := m.EnsureSessionLease(context.Background(), "agent", "/bin/bash", time.Unix(2_000_000_000, 0)); err != nil {
+		t.Fatalf("EnsureSessionLease() error: %v", err)
+	}
+	if len(f.calls) != 5 || f.calls[1][0] != "--scope" || f.calls[3][0] != "new-session" {
+		t.Fatalf("scope fallback call sequence = %v", f.calls)
+	}
+}
+
+func TestManager_EnsureSessionScopeFailureNeverAdoptsRacingOperatorSession(t *testing.T) {
+	f := newFakeRunner()
+	displays := 0
+	f.run = func(_ context.Context, args []string) ([]byte, error) {
+		switch args[0] {
+		case "display-message":
+			displays++
+			if displays == 1 {
+				return nil, exitError(t)
+			}
+			return []byte("agent\t$9\t99\t0\t\t0\n"), nil
+		case "--scope":
+			return []byte("Failed to connect to bus"), errors.New("systemd-run failed")
+		default:
+			t.Fatalf("operator collision reached mutation: %v", args)
+			return nil, nil
+		}
+	}
+	m := &Manager{
+		bin:    "/usr/bin/tmux",
+		runner: f,
+		scopeCommand: func(_ string, command []string) scopeDecision {
+			return scopeDecision{command: append([]string{"systemd-run", "--scope", "--"}, command...), scoped: true}
+		},
+	}
+
+	err := m.EnsureSessionLease(context.Background(), "agent", "/bin/bash", time.Now().Add(time.Hour))
+	if !errors.Is(err, ErrSessionNameCollision) {
+		t.Fatalf("error = %v, want ErrSessionNameCollision", err)
+	}
+	if len(f.calls) != 3 {
+		t.Fatalf("operator session was touched after collision: %v", f.calls)
+	}
+}
+
+func TestManager_EnsureSessionScopeFailureDoesNotFallbackWhenInspectionFails(t *testing.T) {
+	f := newFakeRunner()
+	displays := 0
+	f.run = func(_ context.Context, args []string) ([]byte, error) {
+		switch args[0] {
+		case "display-message":
+			displays++
+			if displays == 1 {
+				return nil, exitError(t)
+			}
+			return nil, errors.New("inspection unavailable")
+		case "--scope":
+			return []byte("Failed to connect to bus"), errors.New("systemd-run failed")
+		default:
+			t.Fatalf("fallback ran without proving the name absent: %v", args)
+			return nil, nil
+		}
+	}
+	m := &Manager{
+		bin:    "/usr/bin/tmux",
+		runner: f,
+		scopeCommand: func(_ string, command []string) scopeDecision {
+			return scopeDecision{command: append([]string{"systemd-run", "--scope", "--"}, command...), scoped: true}
+		},
+	}
+
+	err := m.EnsureSessionLease(context.Background(), "agent", "/bin/bash", time.Now().Add(time.Hour))
+	if err == nil || !strings.Contains(err.Error(), "inspection unavailable") {
+		t.Fatalf("error = %v, want inspection failure", err)
+	}
+	if len(f.calls) != 3 {
+		t.Fatalf("unexpected command sequence: %v", f.calls)
 	}
 }
 
@@ -373,6 +481,8 @@ type reaperRunner struct {
 	now          time.Time
 	sessions     map[string]SessionStatus
 	beforeAtomic func(map[string]SessionStatus)
+	failReap     map[string]error
+	failHas      map[string]error
 }
 
 func (r *reaperRunner) Run(ctx context.Context, _ string, args ...string) ([]byte, error) {
@@ -409,6 +519,9 @@ func (r *reaperRunner) Run(ctx context.Context, _ string, args ...string) ([]byt
 			r.beforeAtomic = nil
 		}
 		name := args[3]
+		if err := r.failReap[name]; err != nil {
+			return []byte("scripted reap failure"), err
+		}
 		status, ok := r.sessions[name]
 		identityMatches := strings.Contains(args[4], "#{session_id},"+status.ID) &&
 			strings.Contains(args[4], fmt.Sprintf("#{pid},%d", status.ServerPID))
@@ -418,12 +531,48 @@ func (r *reaperRunner) Run(ctx context.Context, _ string, args ...string) ([]byt
 		}
 		return nil, nil
 	case "has-session":
+		if err := r.failHas[args[2]]; err != nil {
+			return nil, err
+		}
 		if _, ok := r.sessions[args[2]]; !ok {
 			return nil, exitErrorForRunner()
 		}
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+}
+
+func TestManager_ReapExpiredSessionsContinuesAfterPerSessionErrors(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	runner := &reaperRunner{
+		now: now,
+		sessions: map[string]SessionStatus{
+			"expired":         {Name: "expired", ID: "$1", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+			"became-attached": {Name: "became-attached", ID: "$2", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+			"renewed":         {Name: "renewed", ID: "$3", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+			"recreated":       {Name: "recreated", ID: "$4", ServerPID: 42, Managed: true, LeaseExpires: now.Add(-time.Hour).Unix()},
+			"operator":        {Name: "operator", ID: "$7", ServerPID: 42, LeaseExpires: now.Add(-time.Hour).Unix()},
+		},
+		failReap: map[string]error{"expired": errors.New("session vanished")},
+		failHas:  map[string]error{"became-attached": errors.New("verify failed")},
+	}
+	manager := NewManagerWith("tmux", runner)
+
+	reaped, err := manager.ReapExpiredSessions(context.Background(), now)
+	if err == nil || !strings.Contains(err.Error(), "expired") || !strings.Contains(err.Error(), "became-attached") {
+		t.Fatalf("aggregate error = %v, want both per-session failures", err)
+	}
+	if want := []string{"renewed", "recreated"}; !reflect.DeepEqual(reaped, want) {
+		t.Fatalf("reaped = %v, want %v", reaped, want)
+	}
+	if _, ok := runner.sessions["operator"]; !ok {
+		t.Fatal("reaper killed an unmarked operator session")
+	}
+	for _, call := range runner.calls {
+		if len(call) >= 4 && call[0] == "if-shell" && call[3] == "operator" {
+			t.Fatalf("operator session reached a kill-capable command: %v", call)
+		}
 	}
 }
 
@@ -563,7 +712,7 @@ func TestResolve_OverrideMissing(t *testing.T) {
 func TestResolve_OverridePresent(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "tmux")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'tmux 3.4'\n"), 0o755); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	t.Setenv(envTmuxBin, bin)
@@ -573,6 +722,19 @@ func TestResolve_OverridePresent(t *testing.T) {
 	}
 	if got != bin {
 		t.Errorf("Resolve() = %q, want %q", got, bin)
+	}
+}
+
+func TestResolve_RejectsOldOverride(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'tmux 2.5'\n"), 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	t.Setenv(envTmuxBin, bin)
+	_, err := Resolve()
+	if !errors.Is(err, ErrTmuxVersionUnsupported) {
+		t.Fatalf("Resolve() error = %v, want ErrTmuxVersionUnsupported", err)
 	}
 }
 

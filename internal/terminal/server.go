@@ -186,6 +186,7 @@ type Server struct {
 	maintenanceCtx    context.Context
 	cancelMaintenance context.CancelFunc
 	maintenanceWG     sync.WaitGroup
+	activeTmuxLeases  map[string]int
 	listen            func(network, address string) (net.Listener, error)
 	shutdown          func(*http.Server, context.Context) error
 	limiterStopped    bool
@@ -206,14 +207,15 @@ type Server struct {
 // NewServer creates a new terminal server
 func NewServer(config *Config, auth TokenValidator) *Server {
 	s := &Server{
-		config:   config,
-		sessions: NewSessionManager(config.MaxConnections),
-		auth:     auth,
-		limiter:  NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
-		logger:   newDefaultLogger(config.Debug),
-		listen:   net.Listen,
-		shutdown: func(server *http.Server, ctx context.Context) error { return server.Shutdown(ctx) },
-		now:      time.Now,
+		config:           config,
+		sessions:         NewSessionManager(config.MaxConnections),
+		auth:             auth,
+		limiter:          NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
+		logger:           newDefaultLogger(config.Debug),
+		listen:           net.Listen,
+		shutdown:         func(server *http.Server, ctx context.Context) error { return server.Shutdown(ctx) },
+		now:              time.Now,
+		activeTmuxLeases: make(map[string]int),
 	}
 	s.reapTmuxSessions = func(ctx context.Context, now time.Time) ([]string, error) {
 		manager, err := tmux.NewManager()
@@ -466,6 +468,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.mu.Unlock()
 
 	s.logger.Printf("stopping terminal server...")
+
+	// Refresh every currently attached persistent session before canceling the
+	// maintenance generation. With a short TTL, a slow worker restart could
+	// otherwise let the startup reaper observe the pre-Stop deadline and reap a
+	// session that was attached moments earlier. RenewSessionLease performs the
+	// immutable ID/server-PID/marker check, so this never adopts an operator
+	// session whose name raced with shutdown.
+	s.renewActiveTmuxLeasesForStop()
 
 	// Stop and join maintenance first. This also cancels an in-flight tmux
 	// command because every reap context is derived from maintenanceCtx.
@@ -875,10 +885,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func sessionLeaseDeadline(now time.Time, ttl time.Duration) time.Time {
-	if ttl <= 0 {
-		return time.Time{}
-	}
-	return now.Add(ttl)
+	return tmux.SessionLeaseDeadline(now, ttl)
 }
 
 func sessionLeaseRenewInterval(ttl time.Duration) time.Duration {
@@ -907,6 +914,7 @@ func (s *Server) startTmuxLeaseRenewal(name string, prepared bool) func() {
 	if parent == nil {
 		return func() {}
 	}
+	unregister := s.registerActiveTmuxLease(name)
 
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
@@ -927,10 +935,58 @@ func (s *Server) startTmuxLeaseRenewal(name string, prepared bool) func() {
 	return func() {
 		cancel()
 		<-done
-		// Use the server maintenance context for the final detach renewal. If
-		// Stop already canceled it, the tmux command is canceled too.
-		s.renewTmuxLease(parent, name)
+		// Detach may be caused by Server.Stop after it canceled the maintenance
+		// context. Use an independent bounded context so the final lease survives
+		// a graceful worker restart.
+		s.renewTmuxLease(context.Background(), name)
+		unregister()
 	}
+}
+
+func (s *Server) registerActiveTmuxLease(name string) func() {
+	s.mu.Lock()
+	s.activeTmuxLeases[name]++
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if s.activeTmuxLeases[name] <= 1 {
+				delete(s.activeTmuxLeases, name)
+			} else {
+				s.activeTmuxLeases[name]--
+			}
+			s.mu.Unlock()
+		})
+	}
+}
+
+func (s *Server) renewActiveTmuxLeasesForStop() {
+	if s.config.SessionTTL <= 0 || s.renewTmuxSession == nil {
+		return
+	}
+	s.mu.RLock()
+	names := make([]string, 0, len(s.activeTmuxLeases))
+	for name := range s.activeTmuxLeases {
+		names = append(names, name)
+	}
+	s.mu.RUnlock()
+	if len(names) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), tmuxReapTimeout)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, name := range names {
+		name := name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.renewTmuxLease(ctx, name)
+		}()
+	}
+	wg.Wait()
 }
 
 func (s *Server) renewTmuxLease(parent context.Context, name string) {

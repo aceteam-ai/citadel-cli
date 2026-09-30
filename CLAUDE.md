@@ -785,6 +785,25 @@ recreated tmux server fails closed. `terminal.DefaultSessionTTL`
 pins the seven-day default, the minimum non-zero value is one minute, and the
 server runs the sweep hourly; `0` disables it. Never replace ownership with a
 name prefix or an all-server sweep — operators may share that tmux server.
+The terminal and `TMUX_SESSION` job paths both resolve the lease from
+`CITADEL_TERMINAL_SESSION_TTL` through the same parser: literal `0` is the only
+disable value, enabled leases have a one-minute floor, and malformed, negative,
+or shorter values fail clearly. A graceful server Stop renews every tracked
+attached lease before canceling maintenance, and the detach path performs an
+independent bounded final renewal, so a short lease cannot expire during a slow
+worker restart. Each renewal still uses the immutable identity guard. The
+reaper continues after a per-session command or verification failure and
+returns an aggregate error after processing the remaining candidates.
+
+`tmux.Resolve` executes `tmux -V` and requires tmux 2.6 or newer. This is the
+first release containing both `#{==}` and `#{&&}`, which the atomic ownership
+guards require; `if-shell -F` is older. Explicit overrides, PATH binaries, and
+managed binaries all pass through that probe. Managed artifact metadata also
+pins a supported release before an artifact can become installable. The
+`citadel tmux install` non-force path runs the same version-aware `Ensure` path:
+it must never report an old managed binary as installed, and it may replace one
+only when a checksum- and version-vetted artifact exists. `--force` likewise
+fails honestly on a gated platform instead of claiming a replacement.
 
 **A Citadel-started tmux server must not remain in citadel.service's control
 group (citadel-cli#1166).** `tmux.PersistentSessionCommand` is the single launch
@@ -800,7 +819,10 @@ interactive invocations, a missing `systemd-run`, and non-root system units that
 cannot create a sibling system scope retain the direct command as a fail-open
 compatibility path. The last case is an explicit limitation; the shipped
 `citadel.service` acceptance path is the user unit, and the root install.sh
-fleet unit is also covered.
+fleet unit is also covered. If a selected `systemd-run` fails at execution time,
+creation re-inspects the name and retries the exact atomic create+mark+lease
+queue directly only when no session exists. A racing unmarked session remains a
+collision, and a racing marked session is identity-bound before renewal.
 
 **Key Packages:**
 - **`internal/terminal/server.go`**: WebSocket server with rate limiting

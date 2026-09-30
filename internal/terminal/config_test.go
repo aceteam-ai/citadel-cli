@@ -2,6 +2,7 @@
 package terminal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -77,6 +78,19 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 	if config.SessionTTL != 48*time.Hour {
 		t.Errorf("expected persistent session TTL 48h from env, got %v", config.SessionTTL)
+	}
+}
+
+func TestDefaultConfigRejectsInvalidSessionTTLFromEnv(t *testing.T) {
+	for _, value := range []string{"30s", "-1m", "not-a-duration"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(tmux.EnvSessionLeaseTTL, value)
+			config := DefaultConfig()
+			config.OrgID = "test-org"
+			if err := config.Validate(); !errors.Is(err, ErrInvalidSessionTTL) {
+				t.Fatalf("Validate() error = %v, want ErrInvalidSessionTTL", err)
+			}
+		})
 	}
 }
 

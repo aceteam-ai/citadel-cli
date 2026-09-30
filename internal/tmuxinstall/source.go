@@ -30,6 +30,8 @@ package tmuxinstall
 import (
 	"fmt"
 	"runtime"
+
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 )
 
 // archiveFormat describes how the downloaded artifact is packaged so the
@@ -54,10 +56,11 @@ const (
 // Source describes where to obtain a Citadel-managed static tmux binary for a
 // specific OS/arch and how to verify it.
 //
-// A Source is "vetted" (installable) only when both URL and SHA256 are non-empty.
-// When SHA256 is empty the platform is GATED: no download is attempted, because
-// we never install a binary we cannot checksum-verify. This is enforced in
-// (Source).vetted and surfaced by Available / Install.
+// A Source is "vetted" (installable) only when URL, SHA256, and a supported
+// Version are all present. When any is missing the platform is GATED: no
+// download is attempted, because we never install a binary we cannot
+// checksum-verify or safely use. This is enforced in (Source).vetted and
+// surfaced by Available / Install.
 type Source struct {
 	// URL is the download location of the artifact. Must be HTTPS and point at a
 	// Citadel-org-controlled artifact (citadel-cli release asset or managed
@@ -66,6 +69,9 @@ type Source struct {
 	// SHA256 is the lowercase hex SHA-256 of the downloaded artifact (the file at
 	// URL, before extraction). Empty means the platform is gated.
 	SHA256 string
+	// Version is the tmux release contained in the artifact. It must satisfy
+	// tmux.MinimumVersion before the source can become installable.
+	Version string
 	// Format is how the artifact is packaged (see archiveFormat).
 	Format archiveFormat
 	// Note documents provenance / why a platform is gated. Surfaced in errors.
@@ -73,9 +79,9 @@ type Source struct {
 }
 
 // vetted reports whether this source can actually be installed: it must have a
-// URL and a checksum. A missing checksum gates the platform.
+// URL, checksum, and release satisfying tmux.MinimumVersion.
 func (s Source) vetted() bool {
-	return s.URL != "" && s.SHA256 != ""
+	return s.URL != "" && s.SHA256 != "" && tmux.SupportsVersion(s.Version)
 }
 
 // platformKey is the "<goos>/<goarch>" map key for the source table.
@@ -105,34 +111,39 @@ func platformKey(goos, goarch string) string {
 // via PATH).
 var sources = map[string]Source{
 	platformKey("linux", "amd64"): {
-		URL:    "",
-		SHA256: "",
-		Format: formatTarGz,
-		Note:   "org-built static tmux (libevent+ncurses) for linux/amd64 not yet published; gated until a CI artifact + verified SHA-256 exists",
+		URL:     "",
+		SHA256:  "",
+		Version: "",
+		Format:  formatTarGz,
+		Note:    "org-built static tmux (libevent+ncurses) for linux/amd64 not yet published; gated until a CI artifact + verified SHA-256 exists",
 	},
 	platformKey("linux", "arm64"): {
-		URL:    "",
-		SHA256: "",
-		Format: formatTarGz,
-		Note:   "org-built static tmux for linux/arm64 not yet published; gated until a CI artifact + verified SHA-256 exists",
+		URL:     "",
+		SHA256:  "",
+		Version: "",
+		Format:  formatTarGz,
+		Note:    "org-built static tmux for linux/arm64 not yet published; gated until a CI artifact + verified SHA-256 exists",
 	},
 	platformKey("darwin", "amd64"): {
-		URL:    "",
-		SHA256: "",
-		Format: formatTarGz,
-		Note:   "macOS cannot produce a fully static tmux; gated. Install tmux via Homebrew (`brew install tmux`) and it will be picked up on PATH",
+		URL:     "",
+		SHA256:  "",
+		Version: "",
+		Format:  formatTarGz,
+		Note:    "macOS cannot produce a fully static tmux; gated. Install tmux via Homebrew (`brew install tmux`) and it will be picked up on PATH",
 	},
 	platformKey("darwin", "arm64"): {
-		URL:    "",
-		SHA256: "",
-		Format: formatTarGz,
-		Note:   "macOS cannot produce a fully static tmux; gated. Install tmux via Homebrew (`brew install tmux`) and it will be picked up on PATH",
+		URL:     "",
+		SHA256:  "",
+		Version: "",
+		Format:  formatTarGz,
+		Note:    "macOS cannot produce a fully static tmux; gated. Install tmux via Homebrew (`brew install tmux`) and it will be picked up on PATH",
 	},
 	platformKey("windows", "amd64"): {
-		URL:    "",
-		SHA256: "",
-		Format: formatZip,
-		Note:   "Windows has no native static tmux (requires Cygwin/MSYS2); gated. Persistent sessions fall back to a bare shell on Windows",
+		URL:     "",
+		SHA256:  "",
+		Version: "",
+		Format:  formatZip,
+		Note:    "Windows has no native static tmux (requires Cygwin/MSYS2); gated. Persistent sessions fall back to a bare shell on Windows",
 	},
 }
 
@@ -149,10 +160,10 @@ func CurrentSource() (Source, bool) {
 	return SourceFor(runtime.GOOS, runtime.GOARCH)
 }
 
-// Available reports whether a vetted (checksum-verified) managed tmux artifact
-// exists for the current platform — i.e. whether Install can do anything other
-// than return a "gated"/"unsupported" error. It does not perform any network or
-// filesystem I/O.
+// Available reports whether a vetted (checksum-verified, supported-version)
+// managed tmux artifact exists for the current platform — i.e. whether Install
+// can do anything other than return a "gated"/"unsupported" error. It does not
+// perform any network or filesystem I/O.
 func Available() bool {
 	s, ok := CurrentSource()
 	return ok && s.vetted()

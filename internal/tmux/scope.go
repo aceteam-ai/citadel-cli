@@ -20,13 +20,17 @@ type scopeDecision struct {
 // manager receive the original command unchanged. The returned slice is always
 // a fresh allocation so callers can safely retain or modify their input.
 func PersistentSessionCommand(sessionName string, command []string) []string {
+	return persistentSessionDecision(sessionName, command).command
+}
+
+func persistentSessionDecision(sessionName string, command []string) scopeDecision {
 	copyOf := append([]string(nil), command...)
 	if len(copyOf) == 0 {
-		return copyOf
+		return scopeDecision{command: copyOf}
 	}
 	if err := ValidateSessionName(sessionName); err != nil {
 		logf("tmux session %q launch is unscoped: invalid session name", sessionName)
-		return copyOf
+		return scopeDecision{command: copyOf, reason: "invalid session name"}
 	}
 	decision := persistentSessionCommand(sessionName, copyOf)
 	if decision.scoped {
@@ -34,9 +38,9 @@ func PersistentSessionCommand(sessionName string, command []string) []string {
 	} else {
 		logf("tmux session %q launch is unscoped: %s", sessionName, decision.reason)
 	}
-	return decision.command
+	return decision
 }
 
-func identitySessionCommand(_ string, command []string) []string {
-	return append([]string(nil), command...)
+func identitySessionCommand(_ string, command []string) scopeDecision {
+	return scopeDecision{command: append([]string(nil), command...), reason: "scope disabled"}
 }

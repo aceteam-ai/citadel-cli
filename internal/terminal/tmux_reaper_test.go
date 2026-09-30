@@ -285,16 +285,66 @@ func TestTmuxLeaseRenewsOnDetachWithExplicitDeadline(t *testing.T) {
 	}
 }
 
-func TestTmuxLeaseRenewalStopsWhenServerContextCanceled(t *testing.T) {
+func TestTmuxLeaseRenewsOnDetachAfterServerContextCanceled(t *testing.T) {
 	server := NewServer(&Config{SessionTTL: time.Minute}, NewMockTokenValidator())
 	ctx, cancel := context.WithCancel(context.Background())
 	server.maintenanceCtx = ctx
-	server.renewTmuxSession = func(context.Context, string, time.Time) error {
-		t.Fatal("renewal ran after server cancellation")
+	renewed := 0
+	server.renewTmuxSession = func(ctx context.Context, name string, _ time.Time) error {
+		if ctx.Err() != nil {
+			t.Fatal("final detach renewal inherited canceled maintenance context")
+		}
+		if name != "agent" {
+			t.Fatalf("renewed name = %q, want agent", name)
+		}
+		renewed++
 		return nil
 	}
 
 	stop := server.startTmuxLeaseRenewal("agent", true)
 	cancel()
 	stop()
+	if renewed != 1 {
+		t.Fatalf("detach renewals = %d, want 1", renewed)
+	}
+}
+
+func TestStopRenewsEveryActiveTmuxLeaseBeforeMaintenanceCancellation(t *testing.T) {
+	server := NewServer(validLifecycleConfig(), NewMockTokenValidator())
+	server.listen = func(string, string) (net.Listener, error) {
+		return net.Listen("tcp", "127.0.0.1:0")
+	}
+	server.reapTmuxSessions = func(context.Context, time.Time) ([]string, error) { return nil, nil }
+	now := time.Unix(2_000_000_000, 0)
+	server.now = func() time.Time { return now }
+	var mu sync.Mutex
+	renewed := map[string]time.Time{}
+	server.renewTmuxSession = func(ctx context.Context, name string, deadline time.Time) error {
+		if ctx.Err() != nil {
+			t.Errorf("stop renewal for %q used canceled context", name)
+		}
+		mu.Lock()
+		renewed[name] = deadline
+		mu.Unlock()
+		return nil
+	}
+
+	if err := server.Start(); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	unregisterA := server.registerActiveTmuxLease("agent-a")
+	unregisterB := server.registerActiveTmuxLease("agent-b")
+	defer unregisterA()
+	defer unregisterB()
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, name := range []string{"agent-a", "agent-b"} {
+		if got := renewed[name]; !got.Equal(now.Add(time.Minute)) {
+			t.Fatalf("renewed[%q] = %v, want %v", name, got, now.Add(time.Minute))
+		}
+	}
 }
