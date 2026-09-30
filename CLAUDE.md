@@ -1613,12 +1613,15 @@ walks the whole service tree and owns this invariant, including the rule that a
 
 `cmd.checkManagedServiceHealth` is the shared expected-state decision used by
 `citadel status` and `citadel doctor`: a manifest service defaults to expected
-running, while `desired_status: stopped` expects it stopped. A missing compose
+running, while `desired_status: stopped` requires that no managed component or
+native alternative remains running. A missing compose
 file, absent container/native process, non-running container, or failed status
 probe is unhealthy and makes doctor exit non-zero; an explicit native service
 does not require a compose file. For a multi-container compose module, every
-non-profiled service key must have a running container; profile-gated services
-are not expected because citadel does not enable profiles. The native fallback
+non-profiled service key must have a running container; a stack with only some
+components running is explicitly partial and unhealthy for either desired state.
+Profile-gated services are not expected because citadel does not enable profiles.
+The native fallback
 applies only to a single-service compose file, so one native socket cannot hide
 a failed sibling component. Keep both operator surfaces routed through this one
 decision so a failed compose-up cannot be red in one and silently stopped in the

@@ -64,20 +64,32 @@ func checkManagedServiceHealth(manifest *CitadelManifest, configDir string, prob
 			continue
 		}
 		check.Native = state.Native
-		if state.Running {
-			check.State = compose.StateRunning
-			check.OK = !serviceStartDisabled(service)
-			if !check.OK {
+		if serviceStartDisabled(service) {
+			switch {
+			case state.Running:
+				check.State = compose.StateRunning
 				check.Detail = "service is running despite desired_status: stopped"
+			case state.AnyRunning:
+				check.State = compose.StatePartial
+				check.Detail = "some service components are running despite desired_status: stopped"
+			default:
+				check.State = compose.StateStopped
+				check.Detail = "desired_status: stopped"
+				check.OK = true
 			}
 			checks = append(checks, check)
 			continue
 		}
 
-		if serviceStartDisabled(service) {
-			check.State = compose.StateStopped
-			check.Detail = "desired_status: stopped"
+		if state.Running {
+			check.State = compose.StateRunning
 			check.OK = true
+			checks = append(checks, check)
+			continue
+		}
+		if state.AnyRunning {
+			check.State = compose.StatePartial
+			check.Detail = "configured to run, but only some service components are running"
 			checks = append(checks, check)
 			continue
 		}

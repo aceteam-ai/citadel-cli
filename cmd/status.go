@@ -547,16 +547,7 @@ func gatherStatusData() (dashboard.StatusData, error) {
 	// Services
 	if manifest != nil {
 		for _, check := range checkManagedServiceHealth(manifest, manifestConfigDir, probeManagedServiceState) {
-			status := check.State
-			if !check.OK {
-				status = "error"
-			}
-			svcStatus := dashboard.ServiceStatus{
-				Name:   check.Name,
-				Status: status,
-				Detail: check.Detail,
-			}
-			data.Services = append(data.Services, svcStatus)
+			data.Services = append(data.Services, dashboardServiceStatus(check))
 		}
 	}
 
@@ -573,6 +564,14 @@ func gatherStatusData() (dashboard.StatusData, error) {
 	}
 
 	return data, nil
+}
+
+func dashboardServiceStatus(check managedServiceHealth) dashboard.ServiceStatus {
+	status := check.State
+	if !check.OK {
+		status = "error"
+	}
+	return dashboard.ServiceStatus{Name: check.Name, Status: status, Detail: check.Detail}
 }
 
 // printCacheInfo renders cache attribution (citadel #682 P3, design doc

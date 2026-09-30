@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
@@ -79,5 +81,47 @@ func TestCheckManagedServiceHealthRejectsRunningDesiredStoppedService(t *testing
 	})
 	if len(checks) != 1 || checks[0].OK || checks[0].State != compose.StateRunning {
 		t.Fatalf("checks = %+v, want unexpected running service to fail", checks)
+	}
+}
+
+func TestCheckManagedServiceHealthRejectsPartiallyRunningDesiredStoppedService(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "module.yml"), []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &CitadelManifest{Services: []Service{{
+		Name: "module", ComposeFile: "module.yml", DesiredStatus: "stopped",
+	}}}
+	for _, tc := range []struct {
+		name string
+		ps   string
+	}{
+		{name: "running_and_exited", ps: `{"ID":"api","Service":"api","State":"running"}
+{"ID":"db","Service":"db","State":"exited"}`},
+		{name: "running_and_absent", ps: `{"ID":"api","Service":"api","State":"running"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checks := checkManagedServiceHealth(manifest, dir, func(string, string) (compose.ServiceState, error) {
+				return compose.ResolveServiceState([]byte(tc.ps), map[string]bool{"api": true, "db": true}, func() bool { return false }), nil
+			})
+			if len(checks) != 1 || checks[0].OK || checks[0].State != compose.StatePartial {
+				t.Fatalf("checks = %+v, want unhealthy partial state", checks)
+			}
+			if !strings.Contains(checks[0].Detail, "desired_status: stopped") {
+				t.Fatalf("detail = %q, want stopped-target explanation", checks[0].Detail)
+			}
+
+			status := dashboardServiceStatus(checks[0])
+			if status.Status != "error" || status.Detail != checks[0].Detail {
+				t.Fatalf("dashboard status = %+v, want error with exact detail", status)
+			}
+			raw, err := json.Marshal(status)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(raw), `"status":"error"`) || !strings.Contains(string(raw), `"detail":`) {
+				t.Fatalf("JSON status = %s, want error + detail", raw)
+			}
+		})
 	}
 }

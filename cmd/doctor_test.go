@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
@@ -90,6 +91,27 @@ func TestDoctorReportFailsForMissingManagedService(t *testing.T) {
 	var buf bytes.Buffer
 	renderDoctorReport(&buf, r)
 	for _, want := range []string{"MANAGED SERVICES", "[FAIL] ollama: missing", "Overall: PROBLEMS DETECTED"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("rendered report missing %q\nfull output:\n%s", want, buf.String())
+		}
+	}
+}
+
+func TestDoctorReportFailsForPartiallyRunningDesiredStoppedService(t *testing.T) {
+	checks := []managedServiceHealth{{
+		Name: "module", State: compose.StatePartial,
+		Detail: "some service components are running despite desired_status: stopped",
+	}}
+	r := doctorReport{
+		dockerHealth: platform.DockerHealth{OK: true}, doctor: healthyDoctorPayload(),
+		servicesChecked: true, serviceHealth: checks,
+	}
+	if r.ok() {
+		t.Fatal("partially running desired-stopped service must fail doctor")
+	}
+	var buf bytes.Buffer
+	renderDoctorReport(&buf, r)
+	for _, want := range []string{"[FAIL] module: partial", "desired_status: stopped", "Overall: PROBLEMS DETECTED"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("rendered report missing %q\nfull output:\n%s", want, buf.String())
 		}

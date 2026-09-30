@@ -33,7 +33,7 @@ func always() bool { return true }
 // whose own container is in the project-wide output and is up.
 func TestResolveServiceStateContainerBacked(t *testing.T) {
 	got := ResolveServiceState([]byte(livePSOutput), map[string]bool{"kokoro": true}, never)
-	if !got.Running || got.State != StateRunning {
+	if !got.Running || !got.AnyRunning || got.State != StateRunning {
 		t.Fatalf("kokoro: got %+v, want running", got)
 	}
 	if got.Native {
@@ -56,7 +56,7 @@ func TestResolveServiceStateContainerBacked(t *testing.T) {
 func TestResolveServiceStateMultiContainerService(t *testing.T) {
 	declared := map[string]bool{"bridge": true, "db": true}
 	got := ResolveServiceState([]byte(livePSOutput), declared, never)
-	if !got.Running {
+	if !got.Running || !got.AnyRunning {
 		t.Fatalf("whatsapp-bridge: got %+v, want running", got)
 	}
 	if got.Container == nil || !strings.HasPrefix(got.Container.Name, "services-") {
@@ -71,7 +71,7 @@ func TestResolveServiceStateMultiContainerService(t *testing.T) {
 // decides.
 func TestResolveServiceStateNative(t *testing.T) {
 	got := ResolveServiceState([]byte(livePSOutput), map[string]bool{"ollama": true}, always)
-	if !got.Running || got.State != StateRunning {
+	if !got.Running || !got.AnyRunning || got.State != StateRunning {
 		t.Fatalf("native ollama: got %+v, want running", got)
 	}
 	if !got.Native {
@@ -90,7 +90,7 @@ func TestResolveServiceStateNative(t *testing.T) {
 func TestResolveServiceStateNativeBeatsStaleContainer(t *testing.T) {
 	out := `{"ID":"a","Name":"citadel-ollama","Service":"ollama","State":"exited","Status":"Exited (0) 3 days ago"}`
 	got := ResolveServiceState([]byte(out), map[string]bool{"ollama": true}, always)
-	if !got.Running || !got.Native {
+	if !got.Running || !got.AnyRunning || !got.Native {
 		t.Fatalf("got %+v, want running via the native probe", got)
 	}
 	// Same input with nothing serving must still read the stale container.
@@ -148,7 +148,7 @@ func TestResolveServiceStateRejectsExitedSibling(t *testing.T) {
 	out := `{"ID":"a","Name":"services-db-1","Service":"db","State":"exited","Status":"Exited (0)"}
 {"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
 	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, never)
-	if got.Running || got.Container == nil || got.Container.ID != "a" {
+	if got.Running || !got.AnyRunning || got.State != StatePartial || got.Container == nil || got.Container.ID != "a" {
 		t.Fatalf("got %+v, want the exited sibling to make the module unhealthy", got)
 	}
 }
@@ -158,7 +158,7 @@ func TestResolveServiceStateRejectsExitedSibling(t *testing.T) {
 func TestResolveServiceStateRejectsAbsentSibling(t *testing.T) {
 	out := `{"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
 	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, never)
-	if got.Running || got.State != StateStopped || got.Container != nil {
+	if got.Running || !got.AnyRunning || got.State != StatePartial || got.Container != nil {
 		t.Fatalf("got %+v, want the absent sibling to make the module stopped", got)
 	}
 }
@@ -168,7 +168,7 @@ func TestResolveServiceStateRejectsAbsentSibling(t *testing.T) {
 func TestResolveServiceStateMultiContainerDoesNotUseNativeFallback(t *testing.T) {
 	out := `{"ID":"b","Name":"services-bridge-1","Service":"bridge","State":"running","Status":"Up 3 hours"}`
 	got := ResolveServiceState([]byte(out), map[string]bool{"bridge": true, "db": true}, always)
-	if got.Running || got.Native {
+	if got.Running || !got.AnyRunning || got.State != StatePartial || got.Native {
 		t.Fatalf("got %+v, want missing db to remain unhealthy", got)
 	}
 }

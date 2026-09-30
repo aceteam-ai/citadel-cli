@@ -65,12 +65,16 @@ func (c PSContainer) Running() bool {
 
 // ServiceState is the resolved run state of one manifest service.
 type ServiceState struct {
-	// State is the normalized state string: "running", "stopped", or the raw
-	// docker state ("restarting", "paused", ...) when it is neither.
+	// State is the normalized state string: "running", "partial", "stopped",
+	// or the raw docker state ("restarting", "paused", ...) when it is neither.
 	State string
 	// Running is true when the service is serving, whether by container or as a
 	// native process.
 	Running bool
+	// AnyRunning is true when at least one managed component or the native
+	// alternative is running. Running implies AnyRunning; a partial
+	// multi-container stack has AnyRunning true and Running false.
+	AnyRunning bool
 	// Native is true when no declared container exists but the injected native
 	// probe reported the service serving (e.g. ollama under systemd).
 	Native bool
@@ -80,9 +84,10 @@ type ServiceState struct {
 }
 
 const (
-	// StateRunning and StateStopped are the two normalized states.
+	// These are the normalized aggregate states shared by status and doctor.
 	StateRunning = "running"
 	StateStopped = "stopped"
+	StatePartial = "partial"
 )
 
 // ParsePS decodes `docker compose ps --format json` output. Compose emits one
@@ -189,6 +194,9 @@ func ResolveServiceState(psOutput []byte, declared map[string]bool, nativeServin
 	}
 
 	var representative *PSContainer
+	var failedContainer *PSContainer
+	allRunning := true
+	anyRunning := false
 	for serviceName := range declared {
 		var first, running *PSContainer
 		for i := range containers {
@@ -205,6 +213,7 @@ func ResolveServiceState(psOutput []byte, declared map[string]bool, nativeServin
 			}
 		}
 		if running != nil {
+			anyRunning = true
 			if representative == nil {
 				representative = running
 			}
@@ -214,15 +223,23 @@ func ResolveServiceState(psOutput []byte, declared map[string]bool, nativeServin
 		// Native serving is an alternative only for a compose file representing
 		// one service. It deliberately outranks that service's stale container.
 		if len(declared) == 1 && nativeServing != nil && nativeServing() {
-			return ServiceState{State: StateRunning, Running: true, Native: true}
+			return ServiceState{State: StateRunning, Running: true, AnyRunning: true, Native: true}
 		}
-		return stoppedServiceState(first)
+		allRunning = false
+		if failedContainer == nil && first != nil {
+			failedContainer = first
+		}
 	}
 
-	if representative != nil {
-		return ServiceState{State: StateRunning, Running: true, Container: representative}
+	if allRunning && representative != nil {
+		return ServiceState{State: StateRunning, Running: true, AnyRunning: true, Container: representative}
 	}
-	return ServiceState{State: StateStopped}
+	state := stoppedServiceState(failedContainer)
+	state.AnyRunning = anyRunning
+	if anyRunning {
+		state.State = StatePartial
+	}
+	return state
 }
 
 func resolveAnyServiceState(containers []PSContainer, nativeServing func() bool) ServiceState {
@@ -230,14 +247,14 @@ func resolveAnyServiceState(containers []PSContainer, nativeServing func() bool)
 	for i := range containers {
 		container := containers[i]
 		if container.Running() {
-			return ServiceState{State: StateRunning, Running: true, Container: &container}
+			return ServiceState{State: StateRunning, Running: true, AnyRunning: true, Container: &container}
 		}
 		if first == nil {
 			first = &container
 		}
 	}
 	if nativeServing != nil && nativeServing() {
-		return ServiceState{State: StateRunning, Running: true, Native: true}
+		return ServiceState{State: StateRunning, Running: true, AnyRunning: true, Native: true}
 	}
 	return stoppedServiceState(first)
 }
