@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Paper Trail: self-serve short</title>
+<style>
+html,body{margin:0;height:100%;background:#1b1714;overflow:hidden;font-family:'Noto Sans','Helvetica Neue',Arial,sans-serif}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+#stage{width:100vw;height:calc(100vw*1.777778);max-height:100vh;max-width:calc(100vh*0.562500);display:block}
+#ov{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:22px;background:rgba(27,23,20,.42);cursor:pointer}
+#ov button{font:700 30px 'Noto Sans','Helvetica Neue',Arial,sans-serif;letter-spacing:.08em;color:#fbf6ea;background:#2563eb;border:0;padding:22px 54px 22px 46px;border-radius:6px;cursor:pointer;box-shadow:4px 7px 0 rgba(43,37,32,.45),0 16px 30px rgba(0,0,0,.35);transform:rotate(-1.5deg)}
+#ov button:hover{background:#3b76f0}
+#ov small{color:#efe5d3;font-size:17px;letter-spacing:.1em;text-transform:uppercase;background:rgba(27,23,20,.72);padding:8px 16px;border-radius:4px}
+body.render #ov{display:none}
+body.render #stage{width:1080px;height:1920px;max-width:none;max-height:none}
+</style>
+</head>
+<body>
+<div id="wrap">
+<svg id="stage" viewBox="0 0 1080 1920" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<pattern id="grain" patternUnits="userSpaceOnUse" width="256" height="256"><image id="grainImg" width="256" height="256"/></pattern>
+<filter id="b1" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="2.5"/></filter>
+<filter id="b2" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="6"/></filter>
+<filter id="b3" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="11"/></filter>
+<linearGradient id="sheen" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".17"/><stop offset=".5" stop-color="#fff" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity=".11"/></linearGradient>
+<radialGradient id="vig" cx=".5" cy=".47" r=".78"><stop offset=".5" stop-color="#2b2520" stop-opacity="0"/><stop offset="1" stop-color="#2b2520" stop-opacity=".30"/></radialGradient>
+</defs>
+<image id="table" x="0" y="0" width="1080" height="1920"/>
+<g id="world"></g>
+<rect width="1080" height="1920" fill="url(#vig)" pointer-events="none"/>
+<rect id="flick" width="1080" height="1920" fill="#fff" opacity="0" pointer-events="none"/>
+</svg>
+</div>
+<div id="ov"><button id="playBtn" type="button">&#9654;&nbsp; PLAY</button><small id="ovCap">Paper Trail · sound on</small></div>
+<audio id="aud" preload="auto" src=""></audio>
+<script>
+/* Paper Trail series kit: paper primitives, motion, stage textures, master clock and player.
+   Extracted and generalized from the Docker explainer (renderAt(t), 10 fps stepped clock).
+   Everything is deterministic: seeded hashes only, no Math.random, no wall clock, no CSS transitions.
+   An episode provides window.EPISODE = {DUR, A, SCENES, SFX, CAP} before paperBoot() is called. */
+'use strict';
+/* == palette (series language, epic #10284) == */
+const INK='#2b2520', PAPER='#ecdfc6', CREAM='#fbf6ea', RECEIPT='#fbfaf6', THERMAL='#6b6964';
+const BLUE='#2563eb', BLUE_D='#1d4ed8', BLUE_L='#93b4f5', NAVY='#0f172a', NAVY_L='#1e293b';
+const GREEN='#16a34a', RED='#dc2626', AMBER='#f59e0b', AMBER_D='#b45309';
+const MUSTARD='#e4b23f', TEAL='#2f8f83', TERRA='#d9694f', KRAFT='#c9a878', KRAFT_D='#a8865a', SLATE='#4a4f63';
+const SANS="'Noto Sans','Helvetica Neue',Arial,sans-serif", MONO="'DejaVu Sans Mono',Menlo,Consolas,monospace";
+const AFPS=10;
+
+/* == series stage formats (epic #10418): horizontal is the original 16:9 stage;
+   vertical is the 9:16 Shorts stage, recomposed per scene, not cropped from horizontal.
+   safe: px to keep clear of the Shorts UI (channel row top, like/comment/seek bar bottom,
+   share-button column right) so nothing important sits under the app chrome.
+   safe.captionY is the burned-in caption baseline: the YouTube Shorts UI overlay covers roughly
+   the bottom 20-25% of the frame, so the caption row sits at about 66% (well above that band,
+   with scene content, which stays at VY_LOW=1080 or above, clear above it in turn). This is a
+   FORMATS value, not a per-scene constant, so Ep1 to Ep9 inherit it automatically.
+   labelScale (bizdev nit on aceteam-ai/aceteam#10298): small text baked into a round sticker or
+   a tight pill (a risk sticker's READ-ONLY/REVERSIBLE, a tool chip's name, a version tag) was
+   getting copied at the same absolute size into the vertical cut, or even smaller, and read as a
+   grey smudge on a phone. A prop that draws one of these small labels should size its text off
+   FORMATS[FORMAT].labelScale (1 on horizontal) instead of a bare constant, so every episode gets
+   the phone-legible size for free and a scene only overrides it on purpose.
+   propScale and titleAtStart (bizdev nits from the Ep1 review, added on Ep02): vertical props
+   were reading as a narrow column under a third of the frame width, so container props should
+   scale their size params by FORMATS.vertical.propScale (1.3) instead of copying the horizontal
+   numbers down. And the payoff beat left the tall vertical stage mostly empty before the title
+   card slid in near the beat's end, so FORMATS.vertical.titleAtStart (true) tells a final scene
+   to bring the card in at the sign-off beat's start on vertical instead (false, unchanged, on
+   horizontal). Existing episodes pick both up on their next rebuild; their committed cuts are
+   untouched until then.
+   safeMarginXFrac (bizdev QA on Ep02's short): propScale grew a prop's width without checking
+   whether the wider result still fit the frame, so a wide-enough prop (Ep02's conveyor belt)
+   pushed past the left edge. FORMATS.vertical.safeMarginXFrac (0.06, 6% of the frame width on
+   each side) is the side gutter scaledW() (below) keeps a scaled prop inside; 0 on horizontal is
+   a no-op.
+   legacyLayout (bizdev design call after Ep02's QA): propScale, safeMarginXFrac and the
+   caption/end-card gate (paperBoot(), below) are now DEFAULT-ON for the vertical format: any
+   episode using scaledW() or setting TITLE_T gets the scaled, clamped, gate-suppressed behaviour
+   without asking for it. window.EPISODE.legacyLayout is the one explicit opt-out, and it must
+   reproduce the exact pre-change behaviour, not just "off": scaledW() returns the raw width
+   unscaled (props were never clamped before), and the caption gate draws every caption
+   ungated (captions were never suppressed before; a legacy episode burns one for any vertical
+   frame with a non-empty CAPTIONS entry in its committed cut, and never sets TITLE_T, so gating
+   by TITLE_T would silently strip those captions instead of preserving them).
+   Only Ep00 sets legacyLayout: true: it shipped as-is before this design call, so its committed
+   cut stays byte-identical on a rebuild. Every other episode is default-on. An episode's own
+   title-card time (TITLE_T) is still its own to declare; what is default now is the gating and
+   the scale/clamp math, not that time value.
+   titleDelay (per-episode, vertical, default 0): an episode whose final beat has a brand payoff to
+   finish before the end card takes over (Ep03's receipt, the series namesake) pushes its
+   titleAtStart card later by this many seconds. The episode adds titleDelay to its own TITLE_T, so
+   the card entry and the caption gate both follow the delayed start. It is 0 for every other
+   episode, and no other scene.js reads it, so their renders are unchanged. == */
+const FORMATS={
+ horizontal:{w:1920,h:1080,labelScale:1,propScale:1,titleAtStart:false,safeMarginXFrac:0,titleDelay:0},
+ vertical:{w:1080,h:1920,safe:{top:250,bottom:480,right:150,captionY:1270},labelScale:1.5,propScale:1.3,titleAtStart:true,safeMarginXFrac:0.06,titleDelay:0}
+};
+/* propScale and the side safe-margin in one place, default-on for vertical unless the episode
+   opts out with window.EPISODE.legacyLayout (see the FORMATS comment above): scales w by
+   FORMATS[fmt].propScale, then caps the result so a shape centred at cx still fits inside
+   FORMATS[fmt].safeMarginXFrac of the frame edge (horizontal's propScale=1/safeMarginXFrac=0
+   already make this a no-op there, independent of legacyLayout). Callers that already multiply
+   by a local PS constant for narrower props (icons, tags) can keep doing that; this is for the
+   width-bearing container props most likely to overflow once scaled up. */
+function scaledW(w,cx,fmt){if(typeof window!=='undefined'&&window.EPISODE&&window.EPISODE.legacyLayout)return w;
+ const F=FORMATS[fmt]||FORMATS.horizontal;const sw=w*(F.propScale||1);
+ const m=(F.safeMarginXFrac||0)*F.w;if(!m)return sw;
+ const maxW=2*Math.min(cx-m,(F.w-m)-cx);return maxW>0?Math.min(sw,maxW):sw}
+/* vertical layout constants shared by every episode's vertical scenes: three stacked rows inside
+   the safe band, and a title-tag row just below the top safe cut. VY_LOW leaves clearance above
+   FORMATS.vertical.safe.captionY for the tallest low-row prop (a scaled-up teammate figure). */
+const VX=495;                          /* safe-zone centre x (clear of the right UI column) */
+const VY_TITLE=320, VY_TOP=520, VY_MID=880, VY_LOW=1080;
+
+/* == deterministic helpers == */
+function h(){let x=2166136261>>>0;for(let a=0;a<arguments.length;a++){const s=String(arguments[a]);for(let i=0;i<s.length;i++){x^=s.charCodeAt(i);x=Math.imul(x,16777619)}x^=0x5bd1;x=Math.imul(x,16777619)}x^=x>>>15;x=Math.imul(x,2246822507);x^=x>>>13;x=Math.imul(x,3266489909);x^=x>>>16;return (x>>>0)/4294967296}
+function rng(seed){let s=seed>>>0;return()=>{s=(s+0x6D2B79F5)>>>0;let t=s;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296}}
+const clamp=(v,a=0,b=1)=>Math.max(a,Math.min(b,v));
+const eOut=u=>1-Math.pow(1-u,3), eIn=u=>u*u*u, eIO=u=>u<.5?4*u*u*u:1-Math.pow(-2*u+2,3)/2;
+const eBack=u=>{const c=1.4;return 1+(c+1)*Math.pow(u-1,3)+c*Math.pow(u-1,2)};
+const lerp=(a,b,u)=>a+(b-a)*u;
+const f1=v=>(Math.round(v*10)/10).toString();
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+/* quantize a 0..1 progress to n stop-motion steps */
+const stepq=(u,n)=>Math.floor(clamp(u)*n+1e-6)/n;
+
+let BF=0;         /* boil frame index */
+let EXIT=null;    /* current scene exit time */
+let TNOW=0;
+
+/* == text == */
+const mctx=document.createElement('canvas').getContext('2d');
+const twCache={};
+function tw(str,sz,mono){const k=str+'|'+sz+'|'+(mono?1:0);if(twCache[k])return twCache[k];mctx.font=`700 ${sz}px ${mono?MONO:SANS}`;let w=mctx.measureText(str).width;if(!mono)w+=sz*0.06*(str.length-1);return twCache[k]=w}
+function T(str,x,y,sz,o={}){const ls=o.mono?0:(o.ls!=null?o.ls:sz*0.06);return `<text x="${f1(x)}" y="${f1(y)}" font-size="${sz}" fill="${o.fill||INK}" text-anchor="${o.anchor||'middle'}" dominant-baseline="central" font-family="${o.mono?MONO:SANS}" font-weight="${o.w||700}" letter-spacing="${f1(ls)}"${o.op!=null?` opacity="${o.op}"`:''}${o.it?' font-style="italic"':''}>${esc(str)}</text>`}
+
+/* == shapes (local coords, centred) == */
+function rr(w,hh,r=7){const p=[],x=w/2,y=hh/2;r=Math.min(r,w/2,hh/2);const c=[[x-r,-y+r,-90],[x-r,y-r,0],[-x+r,y-r,90],[-x+r,-y+r,180]];for(const [cx,cy,a0] of c){for(let k=0;k<=2;k++){const a=(a0+k*45)*Math.PI/180;p.push([cx+r*Math.cos(a),cy+r*Math.sin(a)])}}return p}
+function ell(rx,ry,n=30){const p=[];for(let i=0;i<n;i++){const a=i/n*Math.PI*2;p.push([rx*Math.cos(a),ry*Math.sin(a)])}return p}
+function bez(p0,p1,p2,n=8){const o=[];for(let i=0;i<n;i++){const u=i/n;o.push([(1-u)*(1-u)*p0[0]+2*(1-u)*u*p1[0]+u*u*p2[0],(1-u)*(1-u)*p0[1]+2*(1-u)*u*p1[1]+u*u*p2[1]])}return o}
+function shift(pts,dx,dy){return pts.map(p=>[p[0]+dx,p[1]+dy])}
+function rot(pts,deg){const a=deg*Math.PI/180,c=Math.cos(a),s=Math.sin(a);return pts.map(p=>[p[0]*c-p[1]*s,p[0]*s+p[1]*c])}
+
+/* hand-cut edge: subdivide + jitter along normals; static + boil */
+function cut(pts,id,amp,seg){const out=[];const n=pts.length;const boil=amp*0.42;
+ for(let i=0;i<n;i++){const [x0,y0]=pts[i],[x1,y1]=pts[(i+1)%n];const L=Math.hypot(x1-x0,y1-y0)||1;const m=Math.max(1,Math.round(L/seg));const nx=-(y1-y0)/L,ny=(x1-x0)/L;
+  for(let k=0;k<m;k++){const u=k/m;const j=(h(id,i,k)-.5)*2*amp+(h(id,i,k,BF)-.5)*2*boil;out.push([x0+(x1-x0)*u+nx*j,y0+(y1-y0)*u+ny*j])}}
+ return out}
+function pd(polys){return polys.map(p=>'M'+p.map(q=>f1(q[0])+' '+f1(q[1])).join('L')+'Z').join('')}
+
+/* == the paper piece ==
+   o: id,x,y,r,s,sx,sy,ox,oy,lift,fill,shape (poly or [poly,...] for holes),ch (children svg, local),amp,seg,op,shadow,nx (no exit),a (motion) */
+function P(o){
+ if(!o||o.hide||o.a===null)return '';
+ const id=o.id;let x=o.x||0,y=o.y||0,lift=o.lift||0,s=(o.s==null?1:o.s),sx=o.sx||1,sy=o.sy||1,r=o.r||0,op=o.op==null?1:o.op;
+ if(o.a){const a=o.a;x+=a.dx||0;y+=a.dy||0;lift=Math.max(lift,a.lift||0);if(a.s!=null)s*=a.s;if(a.sx)sx*=a.sx;if(a.sy)sy*=a.sy;if(a.r)r+=a.r;if(a.op!=null)op*=a.op}
+ if(EXIT!=null&&!o.nx){const t1=EXIT+h(id,'ex')*0.16;const u=clamp((TNOW-t1)/0.34);if(u>0){x+=-2300*eIn(u);y+=-120*eIn(u);lift=Math.max(lift,0.55);r+=-6*u}}
+ if(s<=0.001||op<=0.001)return '';
+ const tilt=o.tilt==null?1.1:o.tilt;
+ const rt=r+(h(id,'r')-.5)*2*tilt+(h(id,'rb',BF)-.5)*0.22;
+ const jx=(h(id,'x',BF)-.5)*0.9,jy=(h(id,'y',BF)-.5)*0.9;
+ const polys=Array.isArray(o.shape[0][0])?o.shape:[o.shape];
+ const amp=o.amp==null?1.5:o.amp,seg=o.seg||46;
+ const d=pd(polys.map((p,i)=>cut(p,id+'#'+i,amp,seg)));
+ const fr=polys.length>1?' fill-rule="evenodd"':'';
+ let g=`<g transform="translate(${f1(x+jx)} ${f1(y+jy)}) rotate(${rt.toFixed(2)}) scale(${(s*sx).toFixed(3)} ${(s*sy).toFixed(3)})${o.ox||o.oy?` translate(${f1(-(o.ox||0))} ${f1(-(o.oy||0))})`:''}"${op<1?` opacity="${op.toFixed(2)}"`:''}>`;
+ if(o.back)g+=o.back;
+ if(o.shadow!==false){const sdx=3+lift*20,sdy=5+lift*30;const a=-rt*Math.PI/180;const ss=s*Math.min(sx,sy)||1;
+  const lx=(sdx*Math.cos(a)-sdy*Math.sin(a))/ss,ly=(sdx*Math.sin(a)+sdy*Math.cos(a))/ss;
+  const bl=lift<0.12?'b1':lift<0.45?'b2':'b3';const so=(o.so||0.36)-lift*0.13;
+  g+=`<path d="${d}"${fr} transform="translate(${f1(lx)} ${f1(ly)})" fill="${INK}" opacity="${so.toFixed(2)}" filter="url(#${bl})"/>`}
+ if(o.fill!=='none'){g+=`<path d="${d}"${fr} fill="${o.fill}"/><path d="${d}"${fr} fill="url(#grain)"/>`;
+  if(o.sheen!==false)g+=`<path d="${d}"${fr} fill="url(#sheen)"/>`;
+  if(o.edge!==false)g+=`<path d="${d}"${fr} fill="none" stroke="#fff" stroke-opacity=".20" stroke-width="1.5"/>`}
+ g+=(o.ch||'')+'</g>';
+ return g}
+/* flat child piece: no shadow, no exit, tiny amp */
+function F(o){return P(Object.assign({shadow:false,nx:true,amp:0.9,tilt:0.4,edge:false,sheen:false},o))}
+/* child piece with small shadow */
+function C(o){return P(Object.assign({nx:true,so:0.28,tilt:0.8},o))}
+/* invisible group: carries position, motion and exit for its children */
+function G(o){return P(Object.assign({fill:'none',shape:rr(4,4,1),shadow:false,tilt:0},o))}
+
+/* == motion (all on the quantized clock) == */
+function slide(t,t0,d,fx,fy){if(t<t0-1e-6)return null;const u=clamp((t-t0)/d);const e=eBack(u);return{dx:fx*(1-e),dy:fy*(1-e),lift:u<1?0.5*(1-u):0}}
+function pop(t,t0){if(t<t0-1e-6)return null;const k=Math.floor((t-t0)*AFPS+1e-6);const S=[0.5,1.13,0.96,1];return{s:S[Math.min(k,3)],lift:k<2?0.35:0,r:k===0?-5:k===1?2:0}}
+function drop(t,t0,H=520,d=0.3){if(t<t0-1e-6)return null;const u=(t-t0)/d;if(u<1-1e-6)return{dy:-H*(1-u*u),lift:0.9*(1-u)+0.15,sx:0.97,sy:1.04};const k=Math.floor((t-t0-d)*AFPS+1e-6);const S=[[1.09,0.87],[0.96,1.05],[1.015,0.99]];const q=S[k]||[1,1];return{dy:0,lift:0,sx:q[0],sy:q[1]}}
+function stamp(t,t0){if(t<t0-1e-6)return null;const k=Math.floor((t-t0)*AFPS+1e-6);const S=[1.45,0.93,1.03,1];return{s:S[Math.min(k,3)],lift:k===0?0.8:0,r:k===0?-3:0}}
+function fly(t,t0,d,x0,y0,x1,y1,arc=140){const u=clamp((t-t0)/d);const e=eIO(u);return{x:lerp(x0,x1,e),y:lerp(y0,y1,e)-arc*Math.sin(Math.PI*u),lift:Math.sin(Math.PI*u)*0.8,u}}
+/* flick away: piece lifts and is thrown up and right over d seconds */
+function flick(t,t0,d=0.3,fx=900,fy=-700){if(t<t0-1e-6)return{};const u=clamp((t-t0)/d);return{dx:fx*eIn(u),dy:fy*eIn(u),lift:0.3+u*0.6,r:25*u,op:u>=1?0:1}}
+/* combine motions (offsets add, scales multiply) */
+function mix(...ms){if(ms.some(m=>m===null))return null;const o={dx:0,dy:0,lift:0,s:1,sx:1,sy:1,r:0,op:1};for(const m of ms){if(!m)continue;o.dx+=m.dx||0;o.dy+=m.dy||0;o.lift=Math.max(o.lift,m.lift||0);if(m.s!=null)o.s*=m.s;if(m.sx)o.sx*=m.sx;if(m.sy)o.sy*=m.sy;o.r+=m.r||0;if(m.op!=null)o.op*=m.op}return o}
+/* timing of the frame on which an event at te first shows */
+const vis=te=>Math.ceil(te*AFPS-1e-6)/AFPS;
+
+/* == small generic props == */
+function tag(id,text,x,y,sz,bg,fg,o={}){const w=tw(text,sz,o.mono)+sz*(o.pad||1.1),hh=sz*1.6;return P(Object.assign({id,x,y,fill:bg,shape:rr(w,hh,6),ch:T(text,0,sz*0.03,sz,{fill:fg,mono:o.mono})},o))}
+/* burned-in caption row for the vertical Shorts cut (#10418): the word timings' active card,
+   sized for a phone screen, sitting on its own dark bar at FORMATS.vertical.safe.captionY, clear
+   of the Shorts UI overlay. Static (no paper jitter/shadow/exit) so it reads as a caption. */
+function captionCard(t,C){for(const [a,z,text] of C){if(t>=a-1e-6&&t<z){
+ let sz=46,w=tw(text,sz)+sz*1.3;const maxW=940;if(w>maxW){sz=sz*maxW/w;w=maxW}
+ const capY=FORMATS.vertical.safe.captionY;
+ return `<g transform="translate(${f1(VX)} ${f1(capY)})"><rect x="${f1(-w/2)}" y="${f1(-sz*0.95)}" width="${f1(w)}" height="${f1(sz*1.9)}" rx="10" fill="#1b1714" opacity=".84"/>${T(text,0,sz*0.03,sz,{fill:CREAM})}</g>`}}
+ return ''}
+function ctag(id,text,x,y,sz,bg,fg,o={}){const w=tw(text,sz,o.mono)+sz*(o.pad||1.1),hh=sz*1.6;return C(Object.assign({id,x,y,fill:bg,shape:rr(w,hh,5),ch:T(text,0,sz*0.03,sz,{fill:fg,mono:o.mono})},o))}
+function check(id,x,y,r,a,top,col){return C({id,x,y,a,nx:!top,fill:col||GREEN,shape:ell(r,r,20),ch:F({id:id+'k',fill:CREAM,shape:[[-r*.52,-r*.02],[-r*.34,-r*.2],[-r*.1,r*.06],[r*.36,-r*.44],[r*.54,-r*.26],[-r*.1,r*.44]]})})}
+function xmark(id,x,y,r,a,top){return C({id,x,y,a,nx:!top,fill:RED,shape:ell(r,r,20),ch:F({id:id+'1',fill:CREAM,shape:rr(r*1.25,r*.3,3),r:45,tilt:0})+F({id:id+'2',fill:CREAM,shape:rr(r*1.25,r*.3,3),r:-45,tilt:0})})}
+function gear(id,x,y,r,col,a){const p=[];const n=8;for(let i=0;i<n*2;i++){const a0=i/(n*2)*Math.PI*2;const rr_=i%2?r*.78:r;p.push([rr_*Math.cos(a0-0.14),rr_*Math.sin(a0-0.14)]);p.push([rr_*Math.cos(a0+0.14),rr_*Math.sin(a0+0.14)])}return C({id,x,y,a,fill:col,shape:[p,ell(r*.32,r*.32,14)],seg:80})}
+function folder(id,x,y,r,col,a,o={}){const w=r*2,hh=r*1.5;const p=[[-w/2,-hh/2],[-w*.08,-hh/2],[w*.04,-hh/2+hh*.16],[w/2,-hh/2+hh*.16],[w/2,hh/2],[-w/2,hh/2]];return C(Object.assign({id,x,y,a,fill:col,shape:p,ch:F({id:id+'f',fill:'#f1c663',shape:rr(w*.96,hh*.62,4),y:hh*.18})+(o.ch||'')},o,{ch:F({id:id+'f',fill:'#f1c663',shape:rr(w*.96,hh*.62,4),y:hh*.18})+(o.ch||'')}))}
+function lock(id,x,y,r,col,a){const sh=[];for(let i=0;i<=10;i++){const q=Math.PI+i/10*Math.PI;sh.push([r*.62*Math.cos(q),-r*.2+r*.62*Math.sin(q)])}for(let i=10;i>=0;i-=1){const q=Math.PI+i/10*Math.PI;sh.push([r*.36*Math.cos(q),-r*.2+r*.36*Math.sin(q)])}
+ return C({id,x,y,a,nx:false,fill:'#b9b0a2',shape:[[...sh.slice(0,11),[r*.62,r*.1],[r*.36,r*.1],...sh.slice(11),[-r*.36,r*.1],[-r*.62,r*.1]]],seg:80,ch:C({id:id+'b',fill:col,shape:rr(r*1.7,r*1.25,6),y:r*.55,ch:F({id:id+'h',fill:INK,shape:ell(r*.16,r*.16,10),y:-r*.08})+F({id:id+'h2',fill:INK,shape:rr(r*.12,r*.34,2),y:r*.12})})})}
+function arrow(id,x,y,len,col,a,o={}){const th=o.th||34,hw=o.hw||44,hl=o.hl||54;const L=len/2;return P(Object.assign({id,x,y,a,fill:col,shape:[[-L,-th/2],[L-hl,-th/2],[L-hl,-hw],[L,0],[L-hl,hw],[L-hl,th/2],[-L,th/2]],seg:60},o))}
+/* paper strip between two points (tube, string, ribbon); u reveals it from p0 toward p1 in steps */
+function strip(id,x0,y0,x1,y1,wd,col,u=1,o={}){if(u<=0)return '';const L=Math.hypot(x1-x0,y1-y0)*u;const ang=Math.atan2(y1-y0,x1-x0)*180/Math.PI;
+ return P(Object.assign({id,x:x0,y:y0,r:ang,tilt:0.3,fill:col,shape:[[0,-wd/2],[L,-wd/2],[L,wd/2],[0,wd/2]],seg:40,amp:1.1,so:.25},o))}
+/* hand-drawn string (stroke) through points with boil; dashed optional; u reveals */
+function stringPath(id,pts,col,wd=4,u=1,o={}){if(u<=0)return '';if(EXIT!=null&&!o.nx){const t1=EXIT+h(id,'ex')*0.16;const q=clamp((TNOW-t1)/0.34);if(q>0){const dx=-2300*eIn(q),dy=-120*eIn(q);pts=pts.map(p=>[p[0]+dx,p[1]+dy])}}const n=Math.max(2,Math.ceil(pts.length*u));let d='';
+ for(let i=0;i<n;i++){const p=pts[Math.min(i,pts.length-1)];const j=(h(id,i,BF)-.5)*2.2;d+=(i?'L':'M')+f1(p[0]+j)+' '+f1(p[1]-j)}
+ return `<path d="${d}" fill="none" stroke="${INK}" stroke-opacity=".22" stroke-width="${wd+2}" stroke-linecap="round" stroke-linejoin="round" transform="translate(2 4)"${o.dash?` stroke-dasharray="${o.dash}"`:''}/><path d="${d}" fill="none" stroke="${col}" stroke-width="${wd}" stroke-linecap="round" stroke-linejoin="round"${o.dash?` stroke-dasharray="${o.dash}"`:''}/>`}
+function curve(p0,p1,p2,n=18){const o=bez(p0,p1,p2,n);o.push(p2);return o}
+
+/* == stage textures (seeded, generated once) == */
+function makeTextures(paperCol,W,H){
+ W=W||1920;H=H||1080;
+ const g=document.createElement('canvas');g.width=g.height=256;const c=g.getContext('2d');const R=rng(7);const im=c.createImageData(256,256);
+ for(let i=0;i<256*256;i++){const r=R();let v,a;if(r<0.5){v=0;a=R()*22}else{v=255;a=R()*20}if(R()<0.012){v=40;a=70+R()*40}im.data[i*4]=v;im.data[i*4+1]=v;im.data[i*4+2]=v;im.data[i*4+3]=a}
+ c.putImageData(im,0,0);
+ c.lineCap='round';for(let i=0;i<70;i++){const x=R()*256,y=R()*256,l=6+R()*18,a=R()*Math.PI;c.strokeStyle=R()<.5?'rgba(255,255,255,.22)':'rgba(60,45,30,.16)';c.lineWidth=0.6+R()*0.8;c.beginPath();c.moveTo(x,y);c.quadraticCurveTo(x+Math.cos(a)*l*.5+R()*4,y+Math.sin(a)*l*.5+R()*4,x+Math.cos(a)*l,y+Math.sin(a)*l);c.stroke()}
+ document.getElementById('grainImg').setAttribute('href',g.toDataURL('image/png'));
+ const tb=document.createElement('canvas');tb.width=W;tb.height=H;const t=tb.getContext('2d');
+ t.fillStyle=paperCol||PAPER;t.fillRect(0,0,W,H);
+ const sm=document.createElement('canvas');sm.width=48;sm.height=27;const s2=sm.getContext('2d');const si=s2.createImageData(48,27);const R2=rng(11);
+ for(let i=0;i<48*27;i++){const v=R2()<.5?0:255;si.data[i*4]=v;si.data[i*4+1]=v;si.data[i*4+2]=v;si.data[i*4+3]=R2()*12}
+ s2.putImageData(si,0,0);t.imageSmoothingEnabled=true;t.imageSmoothingQuality='high';t.drawImage(sm,0,0,W,H);
+ for(let y=0;y<H;y+=256)for(let x=0;x<W;x+=256)t.drawImage(g,x,y);
+ const R3=rng(5);t.lineCap='round';for(let i=0;i<900;i++){const x=R3()*W,y=R3()*H,l=8+R3()*26,a=R3()*Math.PI;t.strokeStyle=R3()<.5?'rgba(255,255,255,.35)':'rgba(120,95,60,.14)';t.lineWidth=0.7+R3();t.beginPath();t.moveTo(x,y);t.lineTo(x+Math.cos(a)*l,y+Math.sin(a)*l);t.stroke()}
+ document.getElementById('table').setAttribute('href',tb.toDataURL('image/jpeg',0.9));
+}
+
+/* == master clock + player == */
+function paperBoot(){
+ const EP=window.EPISODE, DUR=EP.DUR;
+ const world=document.getElementById('world'),flk=document.getElementById('flick');
+ function renderAt(t){t=Math.max(0,Math.min(t,DUR-0.001));const tq=Math.floor(t*AFPS+1e-6)/AFPS;BF=Math.floor(t*AFPS+1e-6);TNOW=tq;let out='';
+  for(const sc of EP.SCENES){if(tq>=sc.a-1e-6&&tq<sc.b){EXIT=sc.x;out+=sc.f(tq);EXIT=null}}
+  /* bizdev QA on Ep02's short: the end/title card (which already prints the sign-off text
+     itself) can start before the narration finishes, so a burned-in caption card would draw on
+     top of the card's lower third. EP.TITLE_T (an episode sets it once it knows its own title
+     card's start time) gates the caption off from that point on. This gate is default-on for
+     vertical. EP.legacyLayout is the one explicit opt-out, and by default it must reproduce the
+     exact pre-change behaviour: a legacy episode burns a caption for every vertical frame with a
+     non-empty CAPTIONS entry, ungated, in its committed cut, so a legacy episode draws captions
+     unconditionally here too (EP.legacyLayout short-circuits the TITLE_T check instead of
+     suppressing the caption, which would have silently stripped those captions on a rebuild).
+     A legacy episode can still opt back into the gate on top of its own TITLE_T (for example,
+     when its committed cut has grown its own end-card overlap since it shipped) by also setting
+     EP.gateCaptions:true; EP.legacyLayout then only short-circuits the gate while gateCaptions is
+     not set, so legacyLayout's other behaviour (scaledW's no-op passthrough, etc.) is unaffected
+     either way. Only a non-legacy (or gateCaptions-opted-in) episode with TITLE_T set gets the new
+     gate. The SRT file is untouched either way: this only ever affects the burned-in overlay, not
+     the delivered captions track. */
+  if(EP.FORMAT==='vertical'&&EP.CAPTIONS&&EP.CAPTIONS.length&&((EP.legacyLayout&&!EP.gateCaptions)||EP.TITLE_T==null||tq<EP.TITLE_T))out+=captionCard(tq,EP.CAPTIONS);
+  world.innerHTML=out;
+  const fl=(h('flick',BF)-.5)*0.03;flk.setAttribute('fill',fl>0?'#fff':'#000');flk.setAttribute('opacity',Math.abs(fl).toFixed(3))}
+ window.renderAt=renderAt;window.SFX=EP.SFX;window.DUR=DUR;window.FORMAT=EP.FORMAT||'horizontal';
+ makeTextures(EP.PAPER,EP.W,EP.H);
+ const aud=document.getElementById('aud'),ov=document.getElementById('ov'),btn=document.getElementById('playBtn');
+ const RENDER=/[?&]render=1/.test(location.search);
+ if(RENDER){document.body.classList.add('render');
+  window.renderFrame=t=>new Promise(res=>{renderAt(t);requestAnimationFrame(()=>requestAnimationFrame(()=>res(true)))});
+  window.READY=true;return}
+ renderAt(EP.POSTER!=null?EP.POSTER:DUR-0.6);
+ let lastF=-1;
+ const loop=()=>{const t=aud.currentTime;const f=Math.floor(t*AFPS+1e-6);if(f!==lastF){lastF=f;renderAt(t)}if(!aud.paused&&!aud.ended)requestAnimationFrame(loop)};
+ const start=()=>{ov.style.display='none';if(aud.ended||aud.currentTime>=DUR-0.05)aud.currentTime=0;lastF=-1;aud.play().then(()=>requestAnimationFrame(loop)).catch(()=>{ov.style.display='flex'})};
+ ov.addEventListener('click',start);
+ document.getElementById('stage').addEventListener('click',()=>{if(ov.style.display==='none'){if(aud.paused){aud.play();requestAnimationFrame(loop)}else aud.pause()}});
+ document.addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();if(ov.style.display!=='none')start();else if(aud.paused){aud.play();requestAnimationFrame(loop)}else aud.pause()}});
+ aud.addEventListener('ended',()=>{renderAt(DUR-0.01);btn.innerHTML='&#8635;&nbsp; REPLAY';document.getElementById('ovCap').textContent=EP.CAP_END||EP.CAP;ov.style.display='flex'});
+ window.READY=true;
+}
+/* SFX cue helpers: a cue sits 40 ms ahead of the frame where its visual change first appears */
+function land(te,d){return vis(te+d)-0.04}
+function on(te){return Math.max(0,vis(te)-0.04)}
+/* standard scene table from beat anchors: scene k runs from its beat start (minus lead) to next beat start (plus overlap) */
+function sceneTable(A,beats,fns,o={}){const lead=o.lead||0.3,ov=o.ov||0.15,ex=o.ex||0.45;const T=[];
+ for(let i=0;i<fns.length;i++){const a=i===0?0:A[beats[i]]-lead;const nb=beats[i+1];T.push({f:fns[i],a,b:nb?A[nb]+ov:1e9,x:nb?A[nb]-ex:null})}return T}
+
+/* Paper Trail series kit: recurring props. Needs paper.js.
+   Ace (folded index-card mascot), teammate cards, lanyard and tool tokens, receipt, rubber stamps and marks,
+   risk stickers, paper house, luggage tag, review tray, belt, gate, printer, and small channel icons.
+   Every prop is drawn in local coords around (x,y) and takes a motion object `a` (null = hidden). */
+'use strict';
+
+/* == Ace and teammates == */
+/* index card body with ruled lines, red header rule, folded corner, A mark, face, arms, legs.
+   o: s (scale), band (header colour), mark (letter), arms: [leftDeg,rightDeg] (0 = hanging, 90 = out), hold (svg in right hand, local),
+      lanyard (array of token colours), label (text on card), blink (bool), mouth ('smile'|'o'), look (-1..1 eye shift) */
+function cardFigure(id,x,y,a,o={}){
+ if(a===null)return '';
+ const W=o.w||200,H=o.h||260,band=o.band||BLUE;
+ let back='';
+ /* legs and arms sit behind the card body */
+ const legL=F({id:id+'lg1',fill:CREAM,shape:shift(rr(22,54,8),0,27),x:-W*0.2,y:H/2-12,r:o.walk?(BF%2?8:-8):3,tilt:0});
+ const legR=F({id:id+'lg2',fill:CREAM,shape:shift(rr(22,54,8),0,27),x:W*0.2,y:H/2-12,r:o.walk?(BF%2?-8:8):-3,tilt:0});
+ const feet=F({id:id+'ft1',fill:band,shape:ell(20,10,14),x:-W*0.2-6,y:H/2+44})+F({id:id+'ft2',fill:band,shape:ell(20,10,14),x:W*0.2+6,y:H/2+44});
+ const ar=o.arms||[18,18];const AL=o.armLen||120;
+ const armL=C({id:id+'al',fill:CREAM,shape:shift(rr(24,AL,10),0,AL/2-6),x:-W/2+8,y:-H*0.06,r:ar[0],tilt:0,so:.22,ch:F({id:id+'hl',fill:CREAM,shape:ell(17,17,16),y:AL-4})});
+ const armR=C({id:id+'ar',fill:CREAM,shape:shift(rr(24,AL,10),0,AL/2-6),x:W/2-8,y:-H*0.06,r:-ar[1],tilt:0,so:.22,ch:F({id:id+'hr',fill:CREAM,shape:ell(17,17,16),y:AL-4})+(o.hold?`<g transform="translate(0 ${AL+6}) rotate(${ar[1]})">${o.hold}</g>`:'')});
+ back=legL+legR+feet+armL;
+ /* card face */
+ let ch='';
+ ch+=F({id:id+'bd',fill:band,shape:rr(W-10,H*0.19,5),y:-H/2+H*0.1+3});
+ for(let i=0;i<5;i++)ch+=F({id:id+'ln'+i,fill:'#8fb3e8',shape:rr(W-34,2.4,1),y:-H/2+H*0.33+i*H*0.13,op:.55});
+ ch+=F({id:id+'rl',fill:'#e27d7d',shape:rr(W-34,3,1),y:-H/2+H*0.225,op:.8});
+ /* folded corner (dog-ear) top right */
+ const fc=W*0.2;ch+=F({id:id+'fd',fill:'#d9cdb5',shape:[[W/2-fc,-H/2],[W/2,-H/2+fc],[W/2-fc,-H/2+fc]],amp:.5});
+ ch+=F({id:id+'fdl',fill:INK,shape:[[W/2-fc,-H/2+1],[W/2-1,-H/2+fc],[W/2-4,-H/2+fc+2]],op:.12,amp:.3});
+ /* A mark */
+ if(o.mark!==false){const mk=o.mark||'A';ch+=C({id:id+'mk',fill:CREAM,shape:rr(46,46,10),x:-W/2+38,y:-H/2+H*0.1+3,so:.2,ch:T(mk,0,2,32,{fill:band})})}
+ /* face */
+ const fy=-H*0.02,lk=(o.look||0)*6;
+ const blink=o.blink||(h(id,'bl',Math.floor(BF/7))<0.12);
+ if(blink){ch+=F({id:id+'e1',fill:INK,shape:rr(22,5,2),x:-34+lk,y:fy})+F({id:id+'e2',fill:INK,shape:rr(22,5,2),x:34+lk,y:fy})}
+ else{ch+=F({id:id+'e1',fill:INK,shape:ell(11,13,14),x:-34+lk,y:fy,ch:F({id:id+'g1',fill:'#fff',shape:ell(3.5,3.5,8),x:3,y:-4})})+F({id:id+'e2',fill:INK,shape:ell(11,13,14),x:34+lk,y:fy,ch:F({id:id+'g2',fill:'#fff',shape:ell(3.5,3.5,8),x:3,y:-4})})}
+ ch+=F({id:id+'ck1',fill:'#f0a3a3',shape:ell(12,7,12),x:-58,y:fy+26,op:.55})+F({id:id+'ck2',fill:'#f0a3a3',shape:ell(12,7,12),x:58,y:fy+26,op:.55});
+ if(o.mouth==='o')ch+=F({id:id+'mo',fill:INK,shape:ell(9,11,12),y:fy+36});
+ else ch+=F({id:id+'mo',fill:INK,shape:[...bez([-20,fy+28],[0,fy+52],[20,fy+28],8),[20,fy+28],...bez([15,fy+31],[0,fy+42],[-15,fy+31],8).reverse()],amp:.4});
+ if(o.label)ch+=T(o.label,o.mark===false?0:18,-H/2+H*0.1+3,o.labelSz||24,{fill:o.labelFg||CREAM});
+ /* lanyard: string V from shoulders to a token row on the chest */
+ if(o.lanyard){const n=o.lanyard.length,ty=H*0.3;const u=o.lanU==null?1:o.lanU;
+  ch+=`<path d="M${f1(-W*0.3)} ${f1(-H/2+H*0.19)} L${f1(-n*14)} ${f1(ty-18)} M${f1(W*0.3)} ${f1(-H/2+H*0.19)} L${f1(n*14)} ${f1(ty-18)}" stroke="${INK}" stroke-width="3" stroke-opacity=".55" fill="none"/>`;
+  for(let i=0;i<n;i++){if(i>=Math.ceil(n*u-1e-6))break;const tx=(i-(n-1)/2)*30;ch+=token(id+'tk'+i,tx,ty,o.lanyard[i],i)}}
+ const body=P({id,x:0,y:0,fill:o.fill||'#fffdf6',shape:rr(W,H,8),seg:50,so:.34,lift:a?a.lift:0,nx:true,ch,back});
+ const front=armR;
+ const s=o.s||1;
+ const m=a||{};const ex=EXIT!=null&&!o.nx?exitOffset(id):{dx:0,dy:0};
+ return `<g transform="translate(${f1(x+(m.dx||0)+ex.dx)} ${f1(y+(m.dy||0)+ex.dy)}) rotate(${f1((m.r||0)+(o.r||0))}) scale(${(s*(m.s==null?1:m.s)*(m.sx||1)).toFixed(3)} ${(s*(m.s==null?1:m.s)*(m.sy||1)).toFixed(3)})"${m.op!=null&&m.op<1?` opacity="${m.op.toFixed(2)}"`:''}>`+body+front+'</g>'}
+/* whole-figure exit offset (so arms and card leave together) */
+function exitOffset(id){const t1=EXIT+h(id,'ex')*0.16;const u=clamp((TNOW-t1)/0.34);return{dx:-2300*eIn(u),dy:-120*eIn(u)}}
+function ace(id,x,y,a,o={}){return cardFigure(id,x,y,a,Object.assign({band:BLUE,mark:'A'},o))}
+function teammate(id,x,y,a,o={}){return cardFigure(id,x,y,a,Object.assign({w:150,h:196,armLen:88,band:o.band||AMBER,mark:o.mark||false},o))}
+/* tool token: small round paper disc with a glyph */
+function token(id,x,y,col,k){const glyphs=[
+ F({id:id+'g',fill:CREAM,shape:[[-6,-7],[6,-7],[6,7],[-6,7]],amp:.3}),
+ F({id:id+'g',fill:CREAM,shape:ell(6,6,10),ch:''})+F({id:id+'g2',fill:CREAM,shape:rr(3,8,1),x:6,y:6,r:-45}),
+ F({id:id+'g',fill:CREAM,shape:[[-7,-5],[7,-5],[7,5],[-7,5]],amp:.3,ch:F({id:id+'g3',fill:col,shape:[[-7,-5],[0,1],[7,-5]],amp:.2})}),
+ F({id:id+'g',fill:CREAM,shape:[[0,-8],[7,6],[-7,6]],amp:.3})][k%4];
+ return C({id,x,y,fill:col,shape:ell(13,13,16),so:.25,ch:glyphs})}
+
+/* == paperwork == */
+/* plain sheet with header text and grey text lines */
+function sheet(id,x,y,a,o={}){const W=o.w||170,H=o.h||210;let ch='';
+ if(o.head)ch+=F({id:id+'hb',fill:o.headCol||KRAFT,shape:rr(W-22,34,4),y:-H/2+28})+T(o.head,0,-H/2+29,o.headSz||20,{fill:o.headFg||INK});
+ const n=o.lines==null?4:o.lines;for(let i=0;i<n;i++)ch+=F({id:id+'l'+i,fill:'#c9bfae',shape:rr((W-44)*(i%3===2?0.62:1),7,2),x:i%3===2?-(W-44)*0.19:0,y:-H/2+(o.head?66:34)+i*24});
+ return P(Object.assign({id,x,y,a,fill:o.fill||'#fffaf0',shape:rr(W,H,4),ch:ch+(o.ch||''),seg:48},o,{ch:ch+(o.ch||'')}))}
+/* thermal receipt: serrated top and bottom; lines = [[left,right],...]; u = printed fraction 0..1 (grows downward from the top) */
+function receiptShape(W,H){const p=[];const n=Math.max(4,Math.round(W/18));for(let i=0;i<=n;i++)p.push([-W/2+i*W/n,-H/2+(i%2?7:0)]);for(let i=n;i>=0;i-=1)p.push([-W/2+i*W/n,H/2-(i%2?7:0)]);return p}
+function receipt(id,x,y,a,o={}){const W=o.w||230,lines=o.lines||[],lh=o.lh||30,H=o.h||(70+lines.length*lh);const u=o.u==null?1:o.u;
+ const Hs=Math.max(24,H*u);let ch='';const top=-Hs/2;
+ if(o.head)ch+=T(o.head,0,top+28,o.headSz||20,{fill:INK,mono:true});
+ for(let i=0;i<lines.length;i++){const yy=top+(o.head?62:30)+i*lh;if(yy>Hs/2-16)break;const [l,r,col]=lines[i];
+  ch+=T(l,-W/2+18,yy,o.sz||16,{fill:col||THERMAL,mono:true,anchor:'start'});if(r)ch+=T(r,W/2-18,yy,o.sz||16,{fill:col||THERMAL,mono:true,anchor:'end'})}
+ if(o.dash!==false&&u>=1)ch+=`<line x1="${-W/2+16}" x2="${W/2-16}" y1="${f1(Hs/2-26)}" y2="${f1(Hs/2-26)}" stroke="${THERMAL}" stroke-width="2" stroke-dasharray="6 5" opacity=".6"/>`;
+ return P(Object.assign({id,x,y:y+(o.anchorTop?Hs/2:0),a,fill:RECEIPT,shape:receiptShape(W,Hs),ch,seg:40,amp:.9},o,{ch,y:y+(o.anchorTop?Hs/2:0)}))}
+/* rubber stamp impression: bordered text, slightly rotated, ink texture */
+function stampMark(id,text,x,y,col,a,o={}){const sz=o.sz||40;const w=tw(text,sz)+sz*1.1,hh=sz*1.7;
+ const ring=[rr(w,hh,8),rr(w-12,hh-12,5)];
+ return P(Object.assign({id,x,y,a,r:o.r==null?-6:o.r,fill:col,shape:ring,seg:30,amp:1.2,shadow:false,sheen:false,edge:false,op:.92,ch:T(text,0,2,sz,{fill:col})+`<rect x="${f1(-w/2)}" y="${f1(-hh/2)}" width="${f1(w)}" height="${f1(hh)}" fill="url(#grain)" opacity=".9"/>`},o))}
+/* rubber stamp tool: wooden knob + handle + base */
+function rubberStamp(id,x,y,a,col){if(a===null)return '';return P({id,x,y,a,fill:'#8a6a47',shape:rr(120,34,6),y:y,ch:F({id:id+'h',fill:'#9c7a54',shape:rr(40,70,8),y:-50})+C({id:id+'k',fill:col||GREEN,shape:ell(38,26,20),y:-96})+F({id:id+'p',fill:INK,shape:rr(126,12,3),y:22,op:.8})})}
+/* vertical label bump (bizdev nit on aceteam-ai/aceteam#10298, FORMATS.labelScale in paper.js):
+   a prop's default text size for a small sticker/chip/tag label scales up automatically on the
+   vertical stage instead of copying the horizontal default straight down. A scene that already
+   hand-tunes an explicit sz for its layout is unaffected; this only changes the fallback. */
+function labelScale(){return typeof FORMAT!=='undefined'?(FORMATS[FORMAT]||FORMATS.horizontal).labelScale:1}
+/* risk sticker: round sticker in the three series colours */
+const RISK={read:[GREEN,'READ-ONLY'],rev:[AMBER,'REVERSIBLE'],oneway:[RED,'ONE-WAY DOOR']};
+function riskSticker(id,kind,x,y,a,o={}){const [col,lab]=RISK[kind];const r=o.r_||46;return C({id,x,y,a,nx:o.nx,fill:col,shape:ell(r,r,26),ch:T(o.text||lab,0,1,o.sz||14*labelScale(),{fill:CREAM})})}
+/* luggage tag with string hole */
+function luggageTag(id,text,x,y,a,o={}){const sz=o.sz||26;const w=tw(text,sz)+sz*2.2,hh=sz*1.9;const p=[[-w/2+hh*0.45,-hh/2],[w/2,-hh/2],[w/2,hh/2],[-w/2+hh*0.45,hh/2],[-w/2,0]];
+ return P(Object.assign({id,x,y,a,fill:o.bg||BLUE,shape:[p,ell(6,6,10).map(q=>[q[0]-w/2+hh*0.42,q[1]])],ch:T(text,sz*0.35,1,sz,{fill:o.fg||CREAM})},o))}
+/* review tray: open box with label on the front lip */
+function tray(id,label,x,y,a,o={}){const W=o.w||300,H=o.h||110;let ch=F({id:id+'in',fill:'#5b4a37',shape:rr(W-26,34,4),y:-H/2+14,op:.55});
+ ch+=(o.inner||'');ch+=C({id:id+'lip',fill:o.col||KRAFT_D,shape:rr(W,H*0.62,6),y:H*0.19,so:.2,ch:T(label,0,2,o.sz||30,{fill:CREAM})});
+ return P(Object.assign({id,x,y,a,fill:o.col||KRAFT,shape:rr(W,H,8),ch},o,{ch}))}
+/* paper house: navy walls with a big cutout window (interior shows the stage) */
+function house(id,x,y,a,o={}){const W=o.w||1200,H=o.h||620,R=o.roof||230,th=o.th||34;
+ const outer=[[-W/2,H/2],[-W/2,-H/2],[0,-H/2-R],[W/2,-H/2],[W/2,H/2]];
+ const inner=[[-W/2+th,H/2-th],[-W/2+th,-H/2+th*0.5],[0,-H/2-R+th*1.6],[W/2-th,-H/2+th*0.5],[W/2-th,H/2-th]];
+ return P(Object.assign({id,x,y,a,fill:NAVY,shape:[outer,inner],seg:60,amp:1.8,so:.4},o))}
+/* conveyor belt with stepped moving stripes; ph = belt phase (0..1 per stripe) */
+function belt(id,x,y,W,a,ph=0,o={}){let ch='';const n=Math.round(W/60);for(let i=0;i<n;i++){const xx=-W/2+((i+ph)%n)*W/n+18;if(xx>W/2-20)continue;ch+=F({id:id+'s'+i,fill:BLUE_D,shape:rr(10,22,2),x:xx,op:.55})}
+ for(let i=0;i<5;i++)ch+=F({id:id+'r'+i,fill:NAVY_L,shape:ell(14,14,12),x:-W/2+30+i*(W-60)/4,y:30,op:.9});
+ return P(Object.assign({id,x,y,a,fill:BLUE,shape:rr(W,40,18),ch,seg:60},o))}
+/* barrier gate: post + striped arm pivoting at the post; ang 0 = down (horizontal), -80 = raised */
+function gate(id,x,y,a,ang,o={}){if(a===null)return '';const L=o.len||300;let st='';for(let i=0;i<5;i++)st+=F({id:id+'st'+i,fill:i%2?CREAM:RED,shape:rr(L/5,30,2),x:L/10+i*L/5-4});
+ const arm=C({id:id+'arm',x:0,y:-120,r:ang,fill:RED,shape:shift(rr(L,30,6),L/2,0),ch:st,tilt:0});
+ return P(Object.assign({id,x,y,a,fill:NAVY,shape:rr(46,170,8),y,oy:-85,ch:arm+C({id:id+'cap',fill:AMBER,shape:ell(20,20,14),y:-120})},o))}
+/* receipt printer: box with a slot at the top */
+function printer(id,x,y,a,o={}){let ch=F({id:id+'sl',fill:NAVY,shape:rr(270,16,4),y:-78})+F({id:id+'led',fill:(o.on?GREEN:'#6b7280'),shape:ell(10,10,10),x:120,y:40})+T('RECEIPTS',-20,40,26,{fill:CREAM});
+ return P(Object.assign({id,x,y,a,fill:BLUE,shape:rr(330,190,16),ch,seg:50},o,{ch}))}
+
+/* == small icons == */
+function chatBubble(id,x,y,a,o={}){const w=o.w||190,hh=o.h||120;const b=rr(w,hh,34);const tail=[[-w*0.18,hh/2-4],[-w*0.32,hh/2+34],[-w*0.02,hh/2-4]];let ch='';
+ for(let i=0;i<3;i++)ch+=F({id:id+'d'+i,fill:o.dot||SLATE,shape:ell(10,10,10),x:(i-1)*34,y:-4});
+ return P(Object.assign({id,x,y,a,fill:o.fill||'#ffffff',shape:[...b.slice(0,8),...tail,...b.slice(8)],ch:o.ch||ch,seg:40},o))}
+function envelope(id,x,y,a,o={}){const w=o.w||160,hh=o.h||104;return P(Object.assign({id,x,y,a,fill:o.fill||'#fffaf0',shape:rr(w,hh,5),ch:F({id:id+'fl',fill:o.flap||'#e8dcc4',shape:[[-w/2+4,-hh/2+4],[0,hh*0.12],[w/2-4,-hh/2+4]],amp:.6})},o))}
+function phone(id,x,y,a,o={}){let ch=F({id:id+'hs',fill:INK,shape:[...bez([-80,-50],[0,-95],[80,-50],10),[80,-50],[88,-24],[50,-20],[40,-40],...bez([40,-40],[0,-56],[-40,-40],8),[-40,-40],[-50,-20],[-88,-24]],amp:1,y:-10});
+ ch+=F({id:id+'dl',fill:CREAM,shape:ell(40,40,24),y:34});for(let i=0;i<8;i++){const q=i/8*Math.PI*1.6+Math.PI*0.7;ch+=F({id:id+'dh'+i,fill:INK,shape:ell(5,5,8),x:28*Math.cos(q),y:34+28*Math.sin(q),op:.7})}
+ return P(Object.assign({id,x,y,a,fill:o.fill||TERRA,shape:[[-80,-20],[80,-20],[100,80],[-100,80]],ch,seg:40},o))}
+function msgApp(id,x,y,a,o={}){const r=74;const b=ell(r,r*0.86,28);const tail=[[-r*0.5,r*0.6],[-r*0.9,r*1.0],[-r*0.2,r*0.8]];
+ let ch=F({id:id+'b1',fill:CREAM,shape:rr(70,12,4),y:-14})+F({id:id+'b2',fill:CREAM,shape:rr(48,12,4),x:-11,y:12});
+ return P(Object.assign({id,x,y,a,fill:o.fill||GREEN,shape:[...b.slice(0,9),...tail,...b.slice(9)],ch,seg:36},o))}
+function clockIcon(id,x,y,a,hand=0,o={}){const r=o.r||62;let ch=F({id:id+'f',fill:CREAM,shape:ell(r-10,r-10,26)});for(let i=0;i<12;i++){const q=i/12*Math.PI*2;ch+=F({id:id+'t'+i,fill:INK,shape:rr(4,i%3?6:12,1),x:(r-20)*Math.sin(q),y:-(r-20)*Math.cos(q),r:i*30,op:.7})}
+ ch+=F({id:id+'h1',fill:INK,shape:[[-4,4],[-3,-r*0.5],[3,-r*0.5],[4,4]],r:hand*30+60,tilt:0})+F({id:id+'h2',fill:RED,shape:[[-3,4],[-2,-r*0.72],[2,-r*0.72],[3,4]],r:hand*36,tilt:0})+F({id:id+'c',fill:INK,shape:ell(6,6,10)});
+ return P(Object.assign({id,x,y,a,fill:o.fill||AMBER,shape:ell(r,r,30),ch},o))}
+function mailSlot(id,x,y,a,o={}){return P(Object.assign({id,x,y,a,fill:o.fill||KRAFT_D,shape:rr(170,110,10),ch:F({id:id+'s',fill:INK,shape:rr(120,16,6),y:-8})+T('MAIL',0,30,20,{fill:CREAM})},o))}
+function cloud(id,x,y,a,o={}){const s=o.sc||1;const cc=[[-120,40,95],[0,-10,130],[125,35,100],[-30,70,110],[70,75,100]];let out='';
+ for(let i=0;i<cc.length;i++){const [cx,cy,r]=cc[i];out+=P({id:id+i,x:x+cx*s,y:y+cy*s,a,fill:i%2?'#e2eaf6':'#f4f7fb',shape:ell(r*s,r*s*0.82,28),so:.22,nx:o.nx})}return out}
+function laptop(id,x,y,a,o={}){let ch=F({id:id+'sc',fill:'#e9eef6',shape:rr(250,150,6),y:-16})+(o.screen||'');
+ return P(Object.assign({id,x,y,a,fill:'#3b342e',shape:rr(280,180,12),ch:ch+F({id:id+'kb',fill:'#b8ab96',shape:[[-160,90],[160,90],[176,112],[-176,112]],amp:.8})},o))}
+function gpuBox(id,x,y,a,o={}){let ch='';for(let i=0;i<2;i++){ch+=F({id:id+'fan'+i,fill:'#4b433b',shape:ell(46,46,24),x:-62+i*124,y:-8});ch+=F({id:id+'fh'+i,fill:'#2b2520',shape:ell(14,14,12),x:-62+i*124,y:-8})}
+ ch+=F({id:id+'led',fill:GREEN,shape:rr(60,8,3),x:0,y:62});ch+=T(o.label||'GPU',0,62-26,22,{fill:CREAM});
+ return P(Object.assign({id,x,y,a,fill:'#2f2924',shape:rr(300,170,12),ch},o))}
+/* paper hand (mitten with thumb), pointing down; hold = svg drawn at the palm */
+function hand(id,x,y,a,o={}){const p=[[-50,-160],[50,-160],[52,-20],[74,-30],[88,-8],[58,30],...bez([48,34],[46,70],[26,70],4),...bez([26,70],[18,84],[4,72],4),...bez([4,72],[-6,86],[-18,72],4),...bez([-18,72],[-30,84],[-40,68],4),...bez([-40,68],[-56,60],[-54,30],4)];
+ return P(Object.assign({id,x,y,a,fill:o.fill||'#f2c9a0',shape:p,ch:F({id:id+'cuff',fill:o.cuff||BLUE,shape:rr(116,64,6),y:-160})+(o.hold||''),seg:30},o))}
+/* inbox tray (wire tray look in kraft) */
+function inbox(id,x,y,a,label,o={}){return tray(id,label||'INBOX',x,y,a,Object.assign({w:360,h:120,col:KRAFT},o))}
+
+/* == one-way door (Ep03+): a door in a frame that will not open without a key ==
+   frame stays put; the leaf (+ knob, label, lock) slides sideways along o.slide ([ux,uy], default right)
+   as openU goes 0..1, revealing a dark doorway behind. o.label prints on the leaf (e.g. SEND);
+   o.locked draws a padlock on the leaf that fades out once the door starts to open. */
+function doorProp(id,x,y,a,openU=0,o={}){if(a===null)return '';const W=o.w||220,H=o.h||360;const sv=o.slide||[1,0];const u=clamp(openU);
+ const ox=sv[0]*W*1.05*u,oy=sv[1]*W*1.05*u,fop=1-0.9*u;
+ /* leaf first, so the knob/label/lock mounted on its face paint on top of it, not under it
+    (a closed door, openU=0, was rendering as a flat card with the label invisible) */
+ let ch=F({id:id+'well',fill:'#1a1512',shape:rr(W-24,H-24,6),op:.9});
+ ch+=F({id:id+'leaf',fill:o.col||RED,shape:rr(W-20,H-20,8),x:ox,y:oy,op:fop});
+ ch+=F({id:id+'kn',fill:INK,shape:ell(14,14,14),x:(sv[0]>=0?W*0.28:-W*0.28)+ox,y:6+oy,op:fop});
+ if(o.label)ch+=F({id:id+'pl',fill:CREAM,shape:rr(W*0.62,H*0.16,4),x:ox,y:-H*0.28+oy,op:fop,ch:T(o.label,0,1,26,{fill:o.col||RED})});
+ if(o.locked&&u<0.999)ch+=lock(id+'lk',(sv[0]>=0?W*0.28:-W*0.28)+ox,H*0.12+oy,26,MUSTARD,{op:1-u});
+ return P(Object.assign({id,x,y,a,fill:NAVY,shape:rr(W,H,10),so:.35,ch},o,{ch}))}
+/* small paper key: shaft + round bow + two teeth, held in a hand's palm (pass as o.hold to hand()) */
+function keyIcon(id,x,y,r,col,a){if(a===null)return '';const c=col||MUSTARD;
+ return C({id,x,y,a,fill:c,shape:[ell(r*0.52,r*0.52,16),[[r*0.4,-r*0.08],[r*1.5,-r*0.08],[r*1.5,r*0.08],[r*0.4,r*0.08]],[[r*1.1,r*0.08],[r*1.3,r*0.08],[r*1.3,r*0.32],[r*1.1,r*0.32]],[[r*1.32,r*0.08],[r*1.5,r*0.08],[r*1.5,r*0.28],[r*1.32,r*0.28]]],
+  ch:C({id:id+'h',fill:'#1a1512',shape:ell(r*0.24,r*0.24,12)})})}
+/* == Ep01+: Workbench props (paper-craft "employee card" build: model, role, parameters, tools) == */
+/* parameter dial: a round gauge with tick marks sweeping from one label to the other and a needle
+   at u (0=left label, 1=right label). Used for "how careful or creative" and any future paired
+   Workbench slider. o.lo/o.hi are the two end labels (short, they sit outside the dial). */
+function dial(id,x,y,r,u,col,a,o={}){if(a===null)return '';const uu=clamp(u==null?0.5:u);
+ const a0=-210,a1=30;let ch='';for(let i=0;i<=8;i++){const q=(a0+(a1-a0)*i/8)*Math.PI/180;
+  ch+=F({id:id+'t'+i,fill:i/8<=uu?(col||AMBER):'#c9bfae',shape:rr(4,r*0.22,1),x:(r*0.78)*Math.cos(q),y:(r*0.78)*Math.sin(q),r:i/8*240-90,tilt:0})}
+ const nq=(a0+(a1-a0)*uu)*Math.PI/180;
+ ch+=F({id:id+'n',fill:INK,shape:[[-4,6],[4,6],[0,-r*0.66]],x:0,y:0,r:(nq*180/Math.PI)+90,tilt:0.3})+F({id:id+'hub',fill:INK,shape:ell(9,9,12),tilt:0.3});
+ if(o.lo)ch+=T(o.lo,-r*0.98,r*0.62,o.sz||18,{fill:INK,anchor:'end'});
+ if(o.hi)ch+=T(o.hi,r*0.98,r*0.62,o.sz||18,{fill:INK,anchor:'start'});
+ return P(Object.assign({id,x,y,a,fill:CREAM,shape:ell(r,r,28),so:.3,ch},o,{ch}))}
+/* pencil: simple angled body + graphite tip + eraser, for a "writing" beat. tilt is fixed (o.r) so
+   it reads as mid-stroke rather than boiling like a loose paper piece. */
+function pencilIcon(id,x,y,r,col,a,o={}){if(a===null)return '';const L=r*2.4;
+ return P({id,x,y,a,r:o.r==null?-38:o.r,fill:col||'#e8b23f',tilt:0.2,shadow:o.shadow!==false,
+  shape:[[-L/2,-9],[L/2-24,-9],[L/2,0],[L/2-24,9],[-L/2,9]],
+  ch:F({id:id+'tip',fill:'#3b342e',shape:[[L/2-24,-9],[L/2,0],[L/2-24,9]]})+F({id:id+'nib',fill:'#f2c9a0',shape:[[L/2-6,-3],[L/2,0],[L/2-6,3]]})+F({id:id+'er',fill:'#e78a8a',shape:rr(20,18,4),x:-L/2+10})})}
+
+/* == Ep02+: trigger heads and flow-editor props == */
+/* press button: a round red button on a kraft mounting plate, one of the four swappable trigger
+   heads (Ep02). o.r sets the button radius. */
+function pressButton(id,x,y,a,o={}){const r=o.r||54;
+ return P(Object.assign({id,x,y,a,fill:o.plate||KRAFT_D,shape:rr(r*2.7,r*2.7,16),
+  ch:C({id:id+'b',fill:RED,shape:ell(r,r,24),y:-4,so:.32,ch:F({id:id+'hl',fill:'#f0a3a3',shape:ell(r*0.36,r*0.24,14),x:-r*0.28,y:-r*0.32,op:.6})})},o))}
+/* doorbell: a slate wall plate with an amber button and three chime bars fanning out, the fourth
+   trigger head ("something happening in your workspace"). */
+function doorbell(id,x,y,a,o={}){let ch=C({id:id+'b',fill:AMBER,shape:ell(28,28,20),x:-14,y:10,so:.28});
+ for(let i=0;i<3;i++)ch+=F({id:id+'w'+i,fill:CREAM,shape:rr(9,30+i*16,4),x:34+i*15,y:-6-i*6,r:-22,op:.85-i*0.18});
+ return P(Object.assign({id,x,y,a,fill:o.fill||SLATE,shape:rr(120,168,10),ch},o))}
+/* card catalog / lookup cabinet: stacked drawers with pull handles, for a LOOKUP station or any
+   future "search your data" beat. */
+function cabinet(id,x,y,a,o={}){const w=o.w||150,hh=o.h||168,n=o.n||3;let ch='';
+ for(let i=0;i<n;i++){const dy=-hh/2+hh/(n*2)+i*hh/n;
+  ch+=F({id:id+'d'+i,fill:'#e8dcc4',shape:rr(w-22,hh/n-12,3),y:dy})+F({id:id+'h'+i,fill:INK,shape:rr(34,7,3),y:dy+hh/(n*2)-16,op:.6})}
+ return P(Object.assign({id,x,y,a,fill:o.fill||KRAFT_D,shape:rr(w,hh,8),ch},o))}
+/* magnifier: a ring lens (evenodd donut, same technique as lock()) with a rotated handle bar, for
+   a READ station or "inspect this step's output" beat. */
+function magnifier(id,x,y,a,o={}){const r=o.r||42,col=o.col||INK;
+ return C({id,x,y,a,nx:o.nx,fill:col,shape:[ell(r,r,28),ell(r-11,r-11,24)],seg:60,
+  ch:F({id:id+'hd',fill:col,shape:rr(15,r*1.05,6),x:r*0.62,y:r*0.62,r:45,tilt:0})})}
+/* checklist card: a KRAFT-headed card with label rows, each ending in a status dot (check() with
+   col AMBER while pending, GREEN once satisfied). rows: [[label,ok],...]. For a pre-flight check
+   beat; the caller re-renders with each row's ok flag flipped as the beat's anchors pass. */
+function checklistCard(id,x,y,a,o={}){const rows=o.rows||[],W=o.w||340,rh=o.rh||48;
+ const H=o.h||(o.head?76:34)+rows.length*rh+18;let ch='';
+ if(o.head)ch+=F({id:id+'hd',fill:o.headCol||NAVY,shape:rr(W-24,38,4),y:-H/2+30})+T(o.head,0,-H/2+31,o.headSz||22,{fill:o.headFg||CREAM});
+ for(let i=0;i<rows.length;i++){const [txt,ok]=rows[i];const ry=-H/2+(o.head?70:32)+i*rh;
+  ch+=T(txt,-W/2+26,ry,o.sz||21,{fill:INK,anchor:'start'})+check(id+'k'+i,W/2-38,ry,17,{},false,ok?GREEN:AMBER)}
+ return P(Object.assign({id,x,y,a,fill:o.fill||'#fffaf0',shape:rr(W,H,6),ch,seg:44},o,{ch}))}
+
+/* == Ep05+: Citadel node props (machines you own become nodes; a program slots in; a USB boots a
+   laptop; a device wears a NODE tag; a toggle mixes in cloud models). Append-only, so later
+   episodes about Citadel, Fabric or nodes can reuse them. == */
+/* paper machine box: a box inside the house that a node runs on. o.kind widens the family without
+   a new prop: 'mem' draws standing memory sticks (the big-memory machine), 'mini' draws a vent
+   grid on a caller-sized smaller box (the mini PC), 'plain' is a bare node box. o.label prints on
+   the front near the LED strip; o.on lights the strip green (it has become a node). GPU boxes and
+   laptops keep their own props (gpuBox, laptop); this covers the rest of the line-up and any
+   generic node box in later beats. */
+function machineBox(id,x,y,a,o={}){const w=o.w||220,hh=o.h||170,kind=o.kind||'plain';let ch='';
+ if(kind==='mem'){for(let i=0;i<4;i++)ch+=F({id:id+'m'+i,fill:'#d7cbb2',shape:rr(22,hh*0.5,3),x:-w*0.3+i*w*0.2,y:-hh*0.08})}
+ else if(kind==='mini'){for(let r=0;r<3;r++)for(let c=0;c<6;c++)ch+=F({id:id+'v'+r+'_'+c,fill:'#2b2520',shape:ell(5,5,8),x:-w*0.28+c*w*0.112,y:-hh*0.2+r*hh*0.17,op:.6})}
+ ch+=F({id:id+'led',fill:o.on?GREEN:'#6b7280',shape:rr(58,8,3),y:hh/2-20});
+ if(o.label)ch+=T(o.label,0,hh/2-48,o.sz||22,{fill:CREAM});
+ return P(Object.assign({id,x,y,a,fill:o.fill||SLATE,shape:rr(w,hh,12),ch,seg:52},o,{ch}))}
+/* USB stick: a body with a metal connector on the +x end, for the laptop that boots from a USB
+   node. o.on lights a small LED on the body; o.label prints on the body; connector points right,
+   so rotate the whole prop (o.r or the motion's r) to aim it into a port. */
+function usbStick(id,x,y,a,o={}){const w=o.w||150,hh=o.h||52;
+ const conn=F({id:id+'cn',fill:'#c7ccd6',shape:rr(46,hh*0.64,3),x:w/2+14})+F({id:id+'cn2',fill:'#9aa1ad',shape:rr(28,hh*0.38,2),x:w/2+18});
+ let ch=F({id:id+'ld',fill:o.on?GREEN:'#6b7280',shape:ell(6,6,10),x:-w/2+18})+F({id:id+'sm',fill:INK,shape:rr(4,hh-16,1),x:w/2-16,op:.5});
+ if(o.label)ch+=T(o.label,0,1,o.sz||18,{fill:CREAM});
+ return P(Object.assign({id,x,y,a,fill:o.fill||BLUE_D,shape:rr(w,hh,10),back:conn,ch,seg:44},o,{ch,back:conn}))}
+/* Citadel card: the one small program that slots into a machine, drawn as a cartridge with a gold
+   contact strip along the bottom edge and a chip square, so it reads as "slot this in". o.label
+   defaults to CITADEL; o.bg sets the card colour. */
+function citadelCard(id,x,y,a,o={}){const w=o.w||150,hh=o.h||188;
+ let ch=F({id:id+'ct',fill:MUSTARD,shape:rr(w-22,hh*0.16,3),y:hh/2-hh*0.12});
+ const cw=w-46;for(let i=0;i<6;i++)ch+=F({id:id+'cc'+i,fill:'#b8862f',shape:rr(cw/9,hh*0.11,1),x:-cw/2+cw*0.09+i*cw/6,y:hh/2-hh*0.12,op:.85});
+ ch+=C({id:id+'chip',fill:CREAM,shape:rr(w*0.34,w*0.28,5),y:-hh*0.16,so:.2,ch:T('C',0,2,w*0.2,{fill:o.bg||BLUE})});
+ ch+=T(o.label||'CITADEL',0,hh*0.12,o.sz||20,{fill:CREAM});
+ return P(Object.assign({id,x,y,a,fill:o.bg||BLUE,shape:rr(w,hh,10),ch,seg:46},o,{ch}))}
+/* device screen on a stand: a monitor whose screen shows o.screen (svg drawn local to the screen
+   centre, e.g. a check() when a device has joined as a node). o.on lights a power dot. For the
+   NODE check beat and any later Fabric node-status display. */
+function monitor(id,x,y,a,o={}){const w=o.w||300,hh=o.h||196;
+ const stand=F({id:id+'sd',fill:'#3b342e',shape:rr(34,50,4),y:hh/2+22})+F({id:id+'bs',fill:'#3b342e',shape:rr(150,22,5),y:hh/2+54});
+ let ch=F({id:id+'sc',fill:o.screenFill||'#e9eef6',shape:rr(w-30,hh-30,6)})+(o.screen||'');
+ if(o.on)ch+=F({id:id+'ld',fill:GREEN,shape:ell(6,6,10),x:w/2-24,y:hh/2-16});
+ return P(Object.assign({id,x,y,a,fill:o.fill||'#2f2924',shape:rr(w,hh,12),back:stand,ch,seg:52},o,{ch,back:stand}))}
+/* paper toggle switch: a rounded track with a cream knob, for "mix in cloud models, per agent, per
+   step". o.on slides the knob right and turns the track green; off is a slate track, knob left. */
+function toggleSwitch(id,x,y,a,o={}){const w=o.w||132,hh=o.h||62;const on=!!o.on;
+ const knob=C({id:id+'k',fill:CREAM,shape:ell(hh*0.4,hh*0.4,18),x:on?w*0.26:-w*0.26,so:.24});
+ return P(Object.assign({id,x,y,a,fill:on?GREEN:SLATE,shape:rr(w,hh,hh/2),ch:knob,seg:40},o,{ch:knob}))}
+
+/* == Ep04+: the bound report ("one request prints the report"). Append-only, so later
+   accountability episodes (AEP report and bundle, records, audits) can reuse it. A ring-binder
+   cover with a left spine and rings, a cream title plate, a few faint content lines, and a stack of
+   page edges peeking out behind it. o.label sets the title plate text (default REPORT); o.col the
+   cover colour, o.spine the spine colour; o.lines the count of faint content lines; o.rings the
+   ring count. Ace holds a small one on the title card, so it reads at both stage and hand scale. */
+function binder(id,x,y,a,o={}){const w=o.w||260,hh=o.h||330,col=o.col||NAVY;
+ let back='';
+ for(let i=0;i<3;i+=1)back+=F({id:id+'pg'+i,fill:i%2?'#f4efe2':'#e8dcc4',shape:rr(w-10,hh-10,4),x:10+i*5,y:-4+i*3});
+ let ch=F({id:id+'sp',fill:o.spine||NAVY_L,shape:rr(w*0.17,hh-16,4),x:-w/2+w*0.11});
+ const nr=o.rings==null?3:o.rings;for(let i=0;i<nr;i+=1)ch+=C({id:id+'rg'+i,fill:MUSTARD,shape:[ell(9,9,14),ell(4.5,4.5,10)],x:-w/2+w*0.11,y:-hh*0.28+i*hh*0.28});
+ ch+=F({id:id+'tp',fill:CREAM,shape:rr(w*0.6,hh*0.15,4),x:w*0.11,y:-hh/2+hh*0.16})+T(o.label||'REPORT',w*0.11,-hh/2+hh*0.16,o.sz||24,{fill:col});
+ const nl=o.lines==null?4:o.lines;for(let i=0;i<nl;i+=1)ch+=F({id:id+'ln'+i,fill:'#8f9bb3',shape:rr(w*0.56*(i%3===2?0.6:1),5,2),x:w*0.11-(i%3===2?w*0.56*0.2:0),y:-hh*0.05+i*hh*0.11,op:.7});
+ return P(Object.assign({id,x,y,a,fill:col,shape:rr(w,hh,10),ch,back,seg:54},o,{ch,back}))}
+
+/* Paper Trail series kit: opening sting and title/end card. Needs paper.js + props.js.
+   SERIES = {name, badge, title, tagline, url, receipt:[lines]} comes from the episode.
+   Both pieces are format-aware (window.FORMAT, set by paperBoot): horizontal keeps the
+   original 16:9 layout; vertical recomposes for the 9:16 Shorts stage (#10418), stacked
+   and centred instead of the horizontal card's left Ace / right text split. */
+'use strict';
+/* 0.7 s paper-flick sting: series card pops in, Ace peeks, the card is flicked off. Returns svg for time t. */
+function sting(t,S){if(t>=0.95)return '';let s='';const k=pop(t,0.0),fl=flick(t,0.5,0.3,1100,-760);
+ const a=mix(k,fl);if(!a||a.op<=0)return '';
+ const V=window.FORMAT==='vertical';
+ const cx=V?540:960,cy=V?VY_TOP:540,cw=V?700:800,ch_=220,nx0=V?-235:-270,rw=V?360:420;
+ let ch=T(S.name.toUpperCase(),cw*0.0875,-6,70,{fill:CREAM})+F({id:'stR',fill:AMBER,shape:rr(rw,8,3),x:cw*0.0875,y:44});
+ ch+=`<g transform="translate(${nx0} -4) scale(0.4)">`+ace('stAce',0,0,{},{nx:true,arms:[30,70]})+'</g>';
+ s+=P({id:'stCard',x:cx,y:cy,a,fill:NAVY,shape:rr(cw,ch_,14),ch,nx:true,seg:60});
+ return s}
+/* title card: navy card slides up at t0; badge, title and tagline stamp in; Ace holds `prop` (svg, local to hand) */
+function titleCard(t,t0,S,o={}){const card=slide(t,t0,0.45,0,1200);if(!card)return '';let s='';
+ const V=window.FORMAT==='vertical';
+ if(!V){
+  let ch='';for(let i=0;i<9;i++)ch+=F({id:'tcl'+i,fill:NAVY_L,shape:rr(1640,3,1),y:-360+i*90,op:.55});
+  s+=P({id:'tcC',x:960,y:540,a:card,fill:NAVY,shape:rr(1780,960,16),seg:80,ch,nx:true});
+  s+=`<g transform="translate(0 ${f1(card.dy)})">`;
+  s+=ace('tcAce',470,560,slide(t,t0+0.12,0.5,-900,0),{nx:true,s:1.45,arms:[22,64],hold:o.prop||'',look:0.4});
+  s+=tag('tcS',S.name.toUpperCase(),1010,215,34,AMBER,INK,{a:pop(t,t0+0.25),r:-2,nx:true,anchor:'start'});
+  s+=tag('tcB',S.badge,1330,215,34,BLUE,CREAM,{a:pop(t,t0+0.35),r:2,nx:true});
+  s+=tag('tcT',S.title,1230,390,S.titleSz||92,CREAM,NAVY,{a:stamp(t,t0+0.5),r:-1.2,nx:true});
+  const tl=S.tagline.split(/(?<=\.)\s+/);
+  for(let i=0;i<tl.length;i++)s+=P({id:'tcG'+i,x:1230,y:540+i*70,a:pop(t,t0+0.85+i*0.25),fill:'none',shape:rr(10,10,2),shadow:false,nx:true,ch:T(tl[i],0,0,48,{fill:CREAM,ls:1})});
+  if(S.url)s+=tag('tcU',S.url,1230,760,40,BLUE,CREAM,{a:pop(t,t0+1.45),r:1,nx:true});
+  if(S.receipt)s+=receipt('tcR',1230,905,pop(t,t0+1.7),{w:520,lines:S.receipt,lh:28,h:120,sz:18,r:-1.5,nx:true,dash:false});
+  s+='</g>';
+  return s}
+ /* vertical: Ace and the card stack centred in the safe column instead of a left/right split */
+ let ch='';for(let i=0;i<9;i++)ch+=F({id:'tcl'+i,fill:NAVY_L,shape:rr(860,3,1),y:-460+i*115,op:.55});
+ s+=P({id:'tcC',x:VX,y:880,a:card,fill:NAVY,shape:rr(940,1120,16),seg:80,ch,nx:true});
+ s+=`<g transform="translate(0 ${f1(card.dy)})">`;
+ s+=ace('tcAce',VX,560,slide(t,t0+0.12,0.5,0,-260),{nx:true,s:1.2,arms:[22,64],hold:o.prop||'',look:0.4});
+ s+=tag('tcS',S.name.toUpperCase(),VX-135,760,28,AMBER,INK,{a:pop(t,t0+0.25),r:-2,nx:true});
+ s+=tag('tcB',S.badge,VX+135,760,28,BLUE,CREAM,{a:pop(t,t0+0.35),r:2,nx:true});
+ s+=tag('tcT',S.title,VX,890,S.titleSzV||70,CREAM,NAVY,{a:stamp(t,t0+0.5),r:-1.2,nx:true});
+ const tl=S.tagline.split(/(?<=\.)\s+/);
+ for(let i=0;i<tl.length;i++)s+=P({id:'tcG'+i,x:VX,y:1010+i*62,a:pop(t,t0+0.85+i*0.25),fill:'none',shape:rr(10,10,2),shadow:false,nx:true,ch:T(tl[i],0,0,40,{fill:CREAM,ls:1})});
+ /* tcU/tcR sit below FORMATS.vertical.safe.captionY (1270): a caption can still be on screen for
+    the first instant of the title card sliding in, so these stay clear of it, not just of the
+    card's own bottom edge */
+ if(S.url)s+=tag('tcU',S.url,VX,1180,36,BLUE,CREAM,{a:pop(t,t0+1.45),r:1,nx:true});
+ if(S.receipt)s+=receipt('tcR',VX,1380,pop(t,t0+1.7),{w:460,lines:S.receipt,lh:26,h:110,sz:17,r:-1.5,nx:true,dash:false});
+ s+='</g>';
+ return s}
+
+</script>
+<script>
+const FORMAT="vertical", STAGE_W=1080, STAGE_H=1920;
+window.SCENE_INPUT={"scene":__SCENE_JSON__,"timings":__TIMINGS_JSON__};
+/* Self-serve generic scene renderer (aceteam-ai/aceteam#10502). Unlike a hand-authored
+   episodes/epNN-slug/scene.js, this one file drives ANY scene: it reads a data-only scene
+   definition (beats: heading, bullets, a visual directive, an accent color) instead of
+   bespoke per-beat choreography. It uses only the shared, format-aware kit already used by
+   every Paper Trail episode (lib/paper.js, lib/props.js, lib/titlecard.js) so the output is
+   visually the same paper-craft style, just generic instead of hand-tuned.
+
+   Runtime contract (no build-time token substitution, so this file is baked verbatim into a
+   STATIC shell, see lib/selfserve/build_shells.py): the page must set window.SCENE_INPUT
+   before this script runs:
+     window.SCENE_INPUT = {
+       "scene": <scene.json, see lib/selfserve/scene.schema.json>,
+       "timings": <per-beat timings map, {beat_id: [start, end], ..., "total": seconds}>,
+       "tail": <optional, seconds of runway after narration ends for the title card, default 3.5>
+     }
+   Everything else (anchors, total duration, beat-level captions) is derived HERE, in the
+   browser, from those two JSON blobs alone. That is what makes the shell truly static: the
+   only per-render input is this one JSON assignment, injected as plain text (no HTML/JS
+   templating, no Node build) by whatever wrote scene.json and the timings map.
+
+   FORMAT/STAGE_W/STAGE_H are NOT part of SCENE_INPUT: each shell (landscape or portrait) bakes
+   its own format in directly (see build_shells.py), since a given shell is always one fixed
+   stage size. */
+'use strict';
+const INPUT = window.SCENE_INPUT;
+const SCENE = INPUT.scene;
+const TL = INPUT.timings;
+const TAIL = INPUT.tail == null ? 3.5 : INPUT.tail;
+const V = FORMAT === 'vertical';
+
+// anchors: beat id -> start time, "end_<lastBeat>", and "title" (when the end card starts).
+// Beat-level only, built directly from the timings map; no word-level ASR anchor resolution
+// (contrast lib/pipeline/anchors.py), which is what makes this safe to drive from arbitrary
+// upstream content instead of a hand-placed episode script.
+const BEATS = SCENE.beats.map(function (b) { return b.id; });
+const A = {};
+BEATS.forEach(function (id) { A[id] = TL[id][0]; });
+A['end_' + BEATS[BEATS.length - 1]] = TL[BEATS[BEATS.length - 1]][1];
+A.title = Math.round((TL.total + 0.15) * 1000) / 1000;
+const DUR = Math.round((TL.total + Math.max(TAIL, 2.5)) * 1000) / 1000;
+
+// beat-level captions (vertical only): each beat's own [start, end) window and its narration
+// text (falling back to the heading), no ASR word alignment (contrast lib/pipeline/captions.py).
+const CAPTIONS = V ? SCENE.beats.map(function (b) {
+  const span = TL[b.id];
+  return [span[0], span[1], b.narration || b.heading];
+}).filter(function (c) { return c[2]; }) : [];
+
+const SERIES = {
+  name: 'Paper Trail', badge: SCENE.badge || 'SHORT', title: SCENE.title, tagline: SCENE.tagline,
+  url: 'aceteam.ai',
+  // titleCard() (lib/titlecard.js) defaults to a fixed font size (92 horizontal, 70 vertical)
+  // sized for a short, hand-written episode title; arbitrary user titles can run much longer,
+  // so shrink proportionally past ~20 chars instead of letting long titles run off the stage.
+  titleSz: SCENE.title.length > 20 ? Math.max(48, Math.round(92 * 20 / SCENE.title.length)) : 92,
+  titleSzV: SCENE.title.length > 20 ? Math.max(38, Math.round(70 * 20 / SCENE.title.length)) : 70,
+};
+
+/* accent name -> [background, foreground] pair. Foreground is chosen for contrast against
+   each series color (amber/mustard read better with ink text than cream). */
+const ACCENTS = {
+  blue: [BLUE, CREAM], green: [GREEN, CREAM], amber: [AMBER, INK],
+  terra: [TERRA, CREAM], teal: [TEAL, CREAM], navy: [NAVY, CREAM],
+};
+function accentOf(name) { return ACCENTS[name] || ACCENTS.blue; }
+
+/* a tag() that shrinks its font to fit maxW instead of overflowing the stage, mirroring
+   paper.js's captionCard() auto-shrink for the same reason (arbitrary-length user text). */
+function fitTag(id, text, x, y, maxW, baseSz, bg, fg, o) {
+  let sz = baseSz;
+  const w = tw(text, sz) + sz * 1.1;
+  if (w > maxW) sz = Math.max(16, sz * maxW / w);
+  return tag(id, text, x, y, sz, bg, fg, o || {});
+}
+
+/* visual directive -> a small generic prop already in lib/props.js or lib/paper.js. Every
+   option here is brand-neutral (no Ace mascot, no AceTeam-specific copy), so it fits
+   arbitrary user content. "none" draws nothing. */
+function drawIcon(kind, x, y, a, accentBg) {
+  if (!a) return '';
+  switch (kind) {
+    case 'document': return folder('ic', x, y, 78, AMBER, a);
+    case 'process': return gear('ic', x, y, 78, accentBg || BLUE, a);
+    case 'done': return check('ic', x, y, 78, a, true, GREEN);
+    case 'idea': return cloud('ic', x, y, a, { sc: 0.62 });
+    case 'secure': return lock('ic', x, y, 78, MUSTARD, a);
+    case 'message': return chatBubble('ic', x, y, a, { w: 240, h: 150 });
+    default: return '';
+  }
+}
+
+/* one scene per beat: icon, heading, then the bullet list staggered in below it. The LAST
+   beat also brings in the series title/end card once A.title is reached (sceneTable gives
+   the last scene an open-ended window, so it keeps rendering through the card). */
+function makeBeatScene(beat, idx, isLast) {
+  const [bg, fg] = accentOf(beat.accent);
+  const t0 = A[beat.id];
+  const iconX = V ? VX : 960, iconY = V ? VY_TOP : 330;
+  const headY = V ? VY_TOP + 230 : 560;
+  const bulletX = V ? VX : 960, bulletY0 = V ? VY_TOP + 340 : 700;
+  const dy = V ? 92 : 96;
+  const maxW = V ? STAGE_W * (1 - 2 * 0.08) : STAGE_W * 0.72;
+  return function (t) {
+    let s = '';
+    s += drawIcon(beat.visual, iconX, iconY, pop(t, t0), bg);
+    s += fitTag('hd' + idx, beat.heading, V ? VX : 960, headY, maxW, V ? 58 : 72, bg, fg, { a: pop(t, t0 + 0.15), r: -1.5 });
+    (beat.bullets || []).forEach(function (b, i) {
+      s += fitTag('bl' + idx + '_' + i, b, bulletX, bulletY0 + i * dy, maxW, V ? 36 : 42, CREAM, INK,
+        { a: pop(t, t0 + 0.35 + i * 0.18) });
+    });
+    if (isLast) s += titleCard(t, A.title, SERIES, {});
+    return s;
+  };
+}
+
+const FNS = SCENE.beats.map(function (b, i) { return makeBeatScene(b, i, i === SCENE.beats.length - 1); });
+const SC = sceneTable(A, BEATS, FNS);
+SC.unshift({ f: function (t) { return sting(t, SERIES); }, a: 0, b: 1.0, x: null });
+
+/* No procedural music/SFX for the self-serve pilot (#10502): arbitrary user content has no
+   hand-placed word anchors to time cues off, and the render+mux step (render.py video, or the
+   papercraft-render RunNodeJob builtin) takes the narration audio directly, so SFX is simply
+   empty here. Reusing the full numpy music/foley mixer is a documented follow-up, not required
+   for a correct, playable pilot render. */
+const SFX = [];
+
+window.EPISODE = {
+  DUR: DUR, A: A, SCENES: SC, SFX: SFX,
+  CAP: SERIES.name + ' · ' + SERIES.title, CAP_END: SERIES.name + ' · ' + SERIES.title,
+  POSTER: Math.max(0, DUR - 0.6), FORMAT: FORMAT, W: STAGE_W, H: STAGE_H,
+  CAPTIONS: CAPTIONS, TITLE_T: A.title,
+};
+
+paperBoot();
+paperBoot();
+</script>
+</body>
+</html>

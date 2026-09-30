@@ -267,10 +267,16 @@ func TestPapercraftChromiumArgsKeepSandboxAndBlockWebRTCUDP(t *testing.T) {
 
 func TestPapercraftBlocksNonProxySchemesBeforeNavigation(t *testing.T) {
 	blocked := papercraftBlockedURLs()
-	for _, want := range []string{"file://*", "data:*", "blob:*", "ws://*", "wss://*", "ftp://*"} {
+	for _, want := range []string{"file://*", "blob:*", "ws://*", "wss://*", "ftp://*"} {
 		if !containsString(blocked, want) {
 			t.Errorf("blocked URLs = %v, want %q", blocked, want)
 		}
+	}
+	// data: URIs are deliberately NOT blocked (citadel-cli#1202): they never
+	// leave the renderer, and every Paper Trail texture is a canvas-generated
+	// data: URI (lib/paper.js's makeTextures()).
+	if containsString(blocked, "data:*") {
+		t.Errorf("blocked URLs = %v, must not include \"data:*\" (citadel-cli#1202)", blocked)
 	}
 }
 
@@ -361,7 +367,10 @@ func TestPapercraftChromiumCannotLoadBlockedURLSubresources(t *testing.T) {
 	}
 	defer page.Close()
 	time.Sleep(500 * time.Millisecond)
-	for _, id := range []string{"secret", "data", "blob"} {
+	// file:// and blob: stay blocked. data: is deliberately allowed
+	// (citadel-cli#1202) since every Paper Trail texture is a
+	// canvas-generated data: URI and data: never reaches an external origin.
+	for _, id := range []string{"secret", "blob"} {
 		width, err := page.Evaluate(context.Background(), `document.getElementById(`+strconv.Quote(id)+`).naturalWidth`)
 		if err != nil {
 			t.Fatal(err)
@@ -369,6 +378,13 @@ func TestPapercraftChromiumCannotLoadBlockedURLSubresources(t *testing.T) {
 		if width != float64(0) {
 			t.Fatalf("blocked %s subresource loaded with naturalWidth=%v", id, width)
 		}
+	}
+	dataWidth, err := page.Evaluate(context.Background(), `document.getElementById('data').naturalWidth`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dataWidth != float64(11) {
+		t.Fatalf("data: subresource did not load, naturalWidth=%v, want 11 (citadel-cli#1202)", dataWidth)
 	}
 }
 
