@@ -3,21 +3,18 @@
 package cmd
 
 import (
+	"context"
 	"os/exec"
-	"syscall"
+	"strings"
 	"testing"
 )
 
 func TestConfigurePapercraftProcessTreeWindows(t *testing.T) {
-	cmd := exec.Command("unused.exe")
-	terminate := configurePapercraftProcessTree(cmd)
-	if cmd.SysProcAttr == nil || cmd.SysProcAttr.CreationFlags&syscall.CREATE_NEW_PROCESS_GROUP == 0 {
-		t.Fatal("Chromium must launch in a dedicated Windows process group")
+	if _, err := newRenderLimitedCommand(context.Background(), nil, "unused.exe"); err == nil || !strings.Contains(err.Error(), "unsupported on windows") {
+		t.Fatalf("non-Linux render command error = %v", err)
 	}
-	if cmd.Cancel == nil {
-		t.Fatal("Chromium taskkill tree cancellation is not configured")
-	}
-	if terminate == nil {
-		t.Fatal("Chromium explicit tree termination is not configured")
+	processTree := configurePapercraftProcessTree(&renderCommand{cmd: exec.Command("unused.exe")})
+	if err := processTree.cleanupAfterWait(); err == nil || !strings.Contains(err.Error(), "unsupported on Windows") {
+		t.Fatalf("dead Windows process stub error = %v", err)
 	}
 }

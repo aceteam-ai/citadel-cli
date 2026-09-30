@@ -40,10 +40,20 @@ func TestDecodeBuiltinParamsUsesExactKeys(t *testing.T) {
 	}
 }
 
-func TestWithEnvOverridesRemovesEarlierValues(t *testing.T) {
-	got := withEnvOverrides([]string{"PATH=/bin", "HOME=/real", "home=/also-real"}, "HOME=/isolated", "TMP=/isolated")
-	if !reflect.DeepEqual(got, []string{"PATH=/bin", "HOME=/isolated", "TMP=/isolated"}) {
-		t.Fatalf("env = %v", got)
+func TestMinimalRenderChildEnvDoesNotLeakWorkerCredentials(t *testing.T) {
+	t.Setenv("CITADEL_DEVICE_API_TOKEN", "worker-secret")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "cloud-secret")
+	t.Setenv("PATH", "/safe/bin")
+	got := minimalRenderChildEnv("/attempt/profile")
+	for _, entry := range got {
+		if strings.Contains(entry, "worker-secret") || strings.Contains(entry, "cloud-secret") || strings.HasPrefix(entry, "CITADEL_") || strings.HasPrefix(entry, "AWS_") {
+			t.Fatalf("render child inherited worker credential: %q", entry)
+		}
+	}
+	for _, want := range []string{"HOME=/attempt/profile", "PATH=/safe/bin", "XDG_CACHE_HOME=/attempt/profile/cache", "TMPDIR=/attempt/profile"} {
+		if !containsString(got, want) {
+			t.Errorf("minimal env missing %q: %v", want, got)
+		}
 	}
 }
 
@@ -91,7 +101,7 @@ type fakePapercraftEncoder struct {
 }
 
 func (e *fakePapercraftEncoder) WriteFrame([]byte) error { e.frames++; return nil }
-func (e *fakePapercraftEncoder) Abort()                  { e.aborted = true }
+func (e *fakePapercraftEncoder) Abort() error            { e.aborted = true; return nil }
 func (e *fakePapercraftEncoder) Finish() error {
 	e.finished = true
 	return os.WriteFile(e.cfg.OutputPath, []byte("mp4"), 0o600)
@@ -255,10 +265,12 @@ func TestPapercraftChromiumArgsKeepSandboxAndBlockWebRTCUDP(t *testing.T) {
 	}
 }
 
-func TestPapercraftBlocksLocalFilesBeforeNavigation(t *testing.T) {
+func TestPapercraftBlocksNonProxySchemesBeforeNavigation(t *testing.T) {
 	blocked := papercraftBlockedURLs()
-	if !containsString(blocked, "file://*") {
-		t.Fatalf("blocked URLs = %v, want file://*", blocked)
+	for _, want := range []string{"file://*", "data:*", "blob:*", "ws://*", "wss://*", "ftp://*"} {
+		if !containsString(blocked, want) {
+			t.Errorf("blocked URLs = %v, want %q", blocked, want)
+		}
 	}
 }
 
@@ -304,13 +316,15 @@ func TestPapercraftAssetServerConfinesFilesToHTMLRoot(t *testing.T) {
 	}
 }
 
-func TestPapercraftChromiumCannotLoadFileURLSubresource(t *testing.T) {
+func TestPapercraftChromiumCannotLoadBlockedURLSubresources(t *testing.T) {
 	if !platform.ChromiumAvailable() {
 		t.Skip("Chromium is not installed")
 	}
 	originalCommand := renderLimitedCommand
-	renderLimitedCommand = func(ctx context.Context, binary string, args ...string) (*exec.Cmd, error) {
-		return exec.CommandContext(ctx, binary, args...), nil
+	renderLimitedCommand = func(ctx context.Context, env []string, binary string, args ...string) (*renderCommand, error) {
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Env = append([]string(nil), env...)
+		return &renderCommand{cmd: cmd}, nil
 	}
 	t.Cleanup(func() { renderLimitedCommand = originalCommand })
 
@@ -324,7 +338,12 @@ func TestPapercraftChromiumCannotLoadFileURLSubresource(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := filepath.Join(root, "index.html")
-	body := `<img id="secret"><script>document.getElementById('secret').src=` + strconv.Quote(secretURL) + `; window.READY=true</script>`
+	inlineSVG := `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="13"><rect width="11" height="13" fill="blue"/></svg>`
+	body := `<img id="secret"><img id="data"><img id="blob"><script>` +
+		`document.getElementById('secret').src=` + strconv.Quote(secretURL) + `;` +
+		`document.getElementById('data').src=` + strconv.Quote("data:image/svg+xml,"+inlineSVG) + `;` +
+		`document.getElementById('blob').src=URL.createObjectURL(new Blob([` + strconv.Quote(inlineSVG) + `],{type:'image/svg+xml'}));` +
+		`window.READY=true</script>`
 	if err := os.WriteFile(html, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -342,12 +361,14 @@ func TestPapercraftChromiumCannotLoadFileURLSubresource(t *testing.T) {
 	}
 	defer page.Close()
 	time.Sleep(500 * time.Millisecond)
-	width, err := page.Evaluate(context.Background(), `document.getElementById("secret").naturalWidth`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if width != float64(0) {
-		t.Fatalf("file:// subresource loaded with naturalWidth=%v", width)
+	for _, id := range []string{"secret", "data", "blob"} {
+		width, err := page.Evaluate(context.Background(), `document.getElementById(`+strconv.Quote(id)+`).naturalWidth`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if width != float64(0) {
+			t.Fatalf("blocked %s subresource loaded with naturalWidth=%v", id, width)
+		}
 	}
 }
 

@@ -4,10 +4,68 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
+
+type renderCommand struct {
+	cmd       *exec.Cmd
+	stopScope func() error
+}
+
+func (c *renderCommand) stopSystemdScope() error {
+	if c == nil || c.stopScope == nil {
+		return nil
+	}
+	return c.stopScope()
+}
+
+// minimalRenderChildEnv is the complete environment visible to Chromium and
+// ffmpeg. The worker may carry long-lived device, Redis, model-provider, or
+// source credentials; none are inherited by render children. The locale and
+// identity values are benign compatibility inputs, while Chromium receives an
+// attempt-private HOME/XDG/tmp tree.
+func minimalRenderChildEnv(home string) []string {
+	tempDir := home
+	if home == "" {
+		home = "/nonexistent"
+		tempDir = os.TempDir()
+	}
+	pathEnv := os.Getenv("PATH")
+	if pathEnv == "" {
+		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	env := []string{
+		"HOME=" + home,
+		"PATH=" + pathEnv,
+		"XDG_CACHE_HOME=" + filepath.Join(home, "cache"),
+		"XDG_CONFIG_HOME=" + filepath.Join(home, "config"),
+		"TMPDIR=" + tempDir,
+		"TMP=" + tempDir,
+		"TEMP=" + tempDir,
+	}
+	for _, key := range []string{"USER", "LOGNAME", "LANG", "LC_ALL", "TZ"} {
+		if value := os.Getenv(key); value != "" {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
+
+// minimalRenderControlEnv is used by systemd-run/systemctl themselves. User
+// managers may require XDG_RUNTIME_DIR or DBUS_SESSION_BUS_ADDRESS, but those
+// control-plane values are not forwarded through the env -i child boundary.
+func minimalRenderControlEnv() []string {
+	env := minimalRenderChildEnv("")
+	for _, key := range []string{"XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"} {
+		if value := os.Getenv(key); value != "" {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
 
 // decodeBuiltinParams gives compiled-in runners an exact-key decoder. The
 // approved schema gate is the first line of defence; this second line makes a
@@ -44,27 +102,4 @@ func removeStaleBuiltinOutput(path string) error {
 		return nil
 	}
 	return fmt.Errorf("remove stale output %q: %w", path, err)
-}
-
-func withEnvOverrides(base []string, overrides ...string) []string {
-	keys := make([]string, 0, len(overrides))
-	for _, entry := range overrides {
-		key, _, _ := strings.Cut(entry, "=")
-		keys = append(keys, key)
-	}
-	out := make([]string, 0, len(base)+len(overrides))
-	for _, entry := range base {
-		key, _, _ := strings.Cut(entry, "=")
-		replaced := false
-		for _, overrideKey := range keys {
-			if strings.EqualFold(key, overrideKey) {
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			out = append(out, entry)
-		}
-	}
-	return append(out, overrides...)
 }

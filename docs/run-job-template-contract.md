@@ -101,16 +101,20 @@ fallback when the payload does not provide `timeout_ms`.
 required stage declaration, `1920x1080` and `1080x1920`, plus the referenced
 asset files and at most one optional audio file. Each player must expose
 `window.READY`, `window.DUR`, and `window.renderFrame(t)`. The runner blocks
-HTTP(S), WebSocket, FTP, and non-proxied WebRTC UDP before navigating to the
-OS-correct local file URL. It captures a PNG whenever the 10 fps render key
-changes, repeats those frames into a 30 fps image pipe, and encodes H.264
+HTTP(S), `file:`, `data:`, `blob:`, WebSocket, FTP, and non-proxied WebRTC UDP
+before navigating to the loopback asset route. It captures a PNG whenever the
+10 fps render key changes, repeats those frames into a 30 fps image pipe, and encodes H.264
 (`libx264`, CRF 17, slow/animation, `yuv420p`) with optional AAC audio. Outputs
 are `landscape.mp4` and
 `portrait.mp4`. Chromium profile/cache/temp files stay inside the run output
 directory and are removed after each format. Cancellation terminates the browser
-process tree and waits before profile removal; cleanup failures fail the run.
-Only a root process on Linux receives Chromium's required `--no-sandbox` switch.
-Runtime dependencies are Chromium or Chrome and ffmpeg.
+process group and its named systemd scope before profile removal, so a `setsid`
+descendant cannot escape; cleanup failures fail the run. Rootless scopes require
+delegated cpu, memory, and pids controllers. Chromium and ffmpeg receive a fixed
+minimal environment rather than worker credentials. Only a root process on
+Linux receives Chromium's required `--no-sandbox` switch. Rendering fails closed
+outside Linux; the Windows process helper is an unreachable compile stub.
+Runtime dependencies are Chromium or Chrome, ffmpeg, systemd-run, and systemctl.
 
 The matching closed input schema is:
 
