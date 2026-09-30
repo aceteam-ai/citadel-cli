@@ -1430,9 +1430,14 @@ namespace because the watchdog can release the serialized lane before an
 uncooperative handler goroutine exits; a retry must never reset paths that the
 orphan still owns. Staging, verification, and output hashing check cancellation
 between I/O operations, and failure paths join cleanup errors instead of hiding
-retained state. In `internal/worker/deadline.go`, `RUN_JOB_TEMPLATE` deliberately
-remains in `serializedLaneJobTypes` while using the long-tier watchdog fallback;
-lane selection and deadline selection are separate decisions.
+retained state. `jobs.MaxTemplateInputFiles` and the code-owned limits beside
+`liveTemplateRunOps` cap declared inputs at 128/4 GiB and retained outputs at
+16/8 GiB. Successful attempts carry a completion marker and are swept after the
+fixed seven-day lazy-read window; an attempt retaining `inputs` is active or
+incomplete and is never swept. In `internal/worker/deadline.go`,
+`RUN_JOB_TEMPLATE` deliberately remains in `serializedLaneJobTypes` while using
+the long-tier watchdog fallback; lane selection and deadline selection are
+separate decisions.
 
 The schema gate is not the builtin decoder. `walkClosedSchema` requires an
 explicit type at every `properties`/`items` binding site, while each builtin

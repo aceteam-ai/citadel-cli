@@ -122,7 +122,11 @@ func resolveInputsForReview(t *testing.T, o liveTemplateRunOps, raw json.RawMess
 		t.Fatal(err)
 	}
 	defer inputRoot.Close()
-	paths, _, hashes, err := o.resolveInputs(context.Background(), raw, workspaceRoot, inputRoot, filepath.Join(workspaceDir, inputRel))
+	files, err := jobs.ParseTemplateInputFiles(raw, o.nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	paths, _, hashes, err := o.resolveInputs(context.Background(), files, workspaceRoot, inputRoot, filepath.Join(workspaceDir, inputRel), templateMaxInputBytes)
 	return paths, hashes, err
 }
 

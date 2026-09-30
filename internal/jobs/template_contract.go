@@ -228,6 +228,13 @@ func NormalizeTemplateParams(raw json.RawMessage) (json.RawMessage, error) {
 
 type TemplateInputFile struct{ Path, NodeID, NodePath string }
 
+// MaxTemplateInputFiles is the node-edge cap on declared template inputs. It is
+// intentionally code-owned rather than operator-tunable: the approved builtin
+// contract is the same on every node, and a payload must not become executable
+// merely because one node carries a looser environment setting. 128 leaves
+// ample room for papercraft assets while bounding validation and staging work.
+const MaxTemplateInputFiles = 128
+
 // ParseTemplateInputFiles validates every reference before any filesystem work.
 // NodeID is supplied by local worker configuration, never by the job payload.
 func ParseTemplateInputFiles(raw json.RawMessage, nodeID string) ([]TemplateInputFile, error) {
@@ -241,6 +248,9 @@ func ParseTemplateInputFiles(raw json.RawMessage, nodeID string) ([]TemplateInpu
 	a, ok := v.([]any)
 	if !ok {
 		return nil, fmt.Errorf("input_files must be an array")
+	}
+	if len(a) > MaxTemplateInputFiles {
+		return nil, fmt.Errorf("input_files declares %d files; limit is %d", len(a), MaxTemplateInputFiles)
 	}
 	files := make([]TemplateInputFile, 0, len(a))
 	for _, entry := range a {
