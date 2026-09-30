@@ -26,6 +26,9 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// darwin node's composerefresh recognizes the materialized variant as
 		// citadel-written; pinned by TestKnownComposeHashesCoverDarwinVariants.
 		"35eded55d912833bb7076c144ed58722a72019c471817de75cd40dc4ff6e7a5b": true,
+		// citadel-cli#1188: explicit docker.io registry (linux + darwin).
+		"756169d49cbc99b77f89ac6512597690d45abd8c018a61ff7f9f11c1521400e8": true,
+		"820145af6625731c91da613c0fab47d04a973b7529fa029cc1af05e51bb6eae3": true,
 	},
 	"vllm": {
 		"07588f4ef245f011396874bcdd7c6aa0c463a356c5f6601618c3b4e213be812a": true,
@@ -44,6 +47,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"58b4576aa49864067d040e719c929f8d19ee74ca137c4c83350f9c3c3f71df54": true,
 		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_VLLM_BIND:-127.0.0.1}).
 		"937570137f5758ddd72fd20d0d24e5b78c84ae31e486cf34c9b89bd4c1fb8a19": true,
+		// citadel-cli#1188: explicit docker.io registry for Podman.
+		"9237f28c7c3f0b2a210ca63ee5a871042e722ff226fa34473be0bc0280d34440": true,
 	},
 	"llamacpp": {
 		"03985065ef91d7ea3a512b3dc3029f08e57ca72a9d6ac96e5a6c3d52d1d9f249": true,
@@ -73,6 +78,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"53bb28a964349de503495857d0f73368a0489109f273822ee5b91c87dacb6f1f": true,
 		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_SGLANG_BIND:-127.0.0.1}).
 		"59af61468b3d158164e9725ed57f6fbadef160e58d7e707da13d8cc71f35689e": true,
+		// citadel-cli#1188: explicit docker.io registry for Podman.
+		"b4a7d3a0a751bb14a373b0fc498757669dbe4c71bb6e24f7fa19c33e99c1897d": true,
 	},
 	"extraction": {
 		"3f7f02536458773d7f8b22da3e7d4213b943db47c457ce669d9270ff2e0a7260": true,
@@ -109,6 +116,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"a97ea6b823df5fde3cb20c8d53d2e486b55833900a949f49851bb934405bb78d": true,
 		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_BONSAI_BIND:-127.0.0.1}).
 		"3eebefe135279f62e56d984de0454c9ba69c20c3d8c9af848a78861c738948af": true,
+		// citadel-cli#1188: explicit localhost/ tag for the local build.
+		"73bb0598090577df97ef92d568b8744920c82a0ea1bfdd0c45ccc3ec00db1168": true,
 	},
 	"kokoro": {
 		"3ce764e232b286c75f776872bb3554e15b2e03b229863abce271324a815ab777": true,
@@ -122,6 +131,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"75fe75f1342aedc35fad293a8836baab47048c00f35c6dab0b3c288282fc73e0": true,
 		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_UNLIMITED_OCR_BIND:-127.0.0.1}).
 		"baa1d24e1729af469aaf3cd6b7e171b73dcf8e99dfce99cb8209fa83bbc9b387": true,
+		// citadel-cli#1188: explicit docker.io registry for Podman.
+		"a1d9dc59a39103e6a2fcc971a748ea7da3d070bca5927cb2c05a4dc8c209bf8c": true,
 	},
 	"omnivoice": {
 		"5a58ceded5200f2dd1d67a199b407edddd3bfe1bd91dd2700cbbed55ee2abe39": true,

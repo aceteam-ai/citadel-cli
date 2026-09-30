@@ -1602,6 +1602,24 @@ Services are started with `docker compose -f <path> up -d` — **no `-p`**. Comp
 therefore derives the project name from the compose file's directory basename
 (`services`), so every service shares ONE project rather than getting its own.
 
+**Every checked-in `services/**` compose image is registry-qualified
+(citadel-cli#1188).** Rootless Podman deliberately refuses short image names
+when the host has no `unqualified-search-registries`; Docker's implicit
+Docker-Hub resolution hid that defect. Pullable Docker Hub images therefore use
+`docker.io/...`, while a compose-built local image uses the explicit
+`localhost/...` storage namespace. `services.TestCheckedInComposeImagesAreRegistryQualified`
+walks the whole service tree and owns this invariant, including the rule that a
+`localhost/` image must have a sibling `build:` declaration.
+
+`cmd.checkManagedServiceHealth` is the shared expected-state decision used by
+`citadel status` and `citadel doctor`: a manifest service defaults to expected
+running, while `desired_status: stopped` expects it stopped. A missing compose
+file, absent container/native process, non-running container, or failed status
+probe is unhealthy and makes doctor exit non-zero; an explicit native service
+does not require a compose file. Keep both operator surfaces routed through this
+one decision so a failed compose-up cannot be red in one and silently stopped in
+the other.
+
 That is deliberate (#528): the per-service `-p citadel-<name>` form is legacy, and
 `removeLegacyCitadelProject` (`cmd/service.go`) exists solely to clean up
 containers left behind by it — a pinned `container_name` owned by another compose

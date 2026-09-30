@@ -15,7 +15,7 @@ import (
 // returns the entire project, so a caller that reads the first record concludes
 // vllm is running when vllm has no container at all.
 const livePSOutput = `
-{"ID":"61bfa011e53f","Name":"citadel-bonsai","Image":"citadel-bonsai:local","Service":"bonsai","State":"running","Status":"Up 10 hours","Ports":"0.0.0.0:8210->8080/tcp"}
+{"ID":"61bfa011e53f","Name":"citadel-bonsai","Image":"localhost/citadel-bonsai:local","Service":"bonsai","State":"running","Status":"Up 10 hours","Ports":"0.0.0.0:8210->8080/tcp"}
 {"ID":"97d7fac7c972","Name":"citadel-gotenberg","Image":"gotenberg:8","Service":"gotenberg","State":"running","Status":"Up 10 hours (healthy)","Ports":"127.0.0.1:8209->3000/tcp"}
 {"ID":"53b6c466f956","Name":"citadel-kokoro","Image":"kokoro-service:latest","Service":"kokoro","State":"running","Status":"Up 10 hours (healthy)","Ports":"127.0.0.1:8211->8080/tcp"}
 {"ID":"3e8aac0c4d1b","Name":"citadel-meeting","Image":"meeting-service:latest","Service":"meeting","State":"running","Status":"Up 10 hours (healthy)","Ports":"127.0.0.1:8207->8102/tcp"}

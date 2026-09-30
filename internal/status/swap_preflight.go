@@ -158,7 +158,7 @@ var engineImagePresentFn = defaultEngineImagePresent
 // is what actually distinguishes "docker GC'd the image, YAML survived" from
 // "genuinely never pulled" -- the citadel-cli#683 incident. Works uniformly
 // for a build-based engine (bonsai) too: its compose declares BOTH `build:`
-// and a fixed `image: citadel-bonsai:local` (the tag compose assigns to the
+// and a fixed `image: localhost/citadel-bonsai:local` (the tag compose assigns to the
 // built image), so the same inspect call answers "was it ever built" exactly
 // as it answers "was it ever pulled" for a prebuilt-image engine.
 func defaultEngineImagePresent(name string) bool {

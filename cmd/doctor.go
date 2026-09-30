@@ -43,6 +43,9 @@ import (
 //     cleanly -- it just always reports "no live worker" rather than real
 //     routing health. That section is therefore informational only here and
 //     does NOT affect the exit code; see (doctorReport).ok.
+//  4. checkManagedServiceHealth -- expected-vs-observed state for every service
+//     in the node manifest. Unlike job routing, this is a standalone observable
+//     and therefore does affect the exit code.
 type doctorReport struct {
 	dockerHealth platform.DockerHealth
 	doctor       map[string]any
@@ -62,6 +65,8 @@ type doctorReport struct {
 	// operator choice, not a failure).
 	bindWarnings        []string
 	serviceExecWarnings []string
+	serviceHealth       []managedServiceHealth
+	servicesChecked     bool
 }
 
 // ok reports whether doctor found a problem worth a non-zero exit. Engine
@@ -73,7 +78,8 @@ func (r doctorReport) ok() bool {
 	engineOK := r.dockerHealth.OK || r.dockerOptional
 	delegationOK := !r.cgroupHealth.Applicable || r.cgroupHealth.OK
 	gpuOK := !r.gpuHealth.Applicable || r.gpuHealth.OK
-	return engineOK && delegationOK && gpuOK
+	servicesOK := !r.servicesChecked || managedServicesHealthy(r.serviceHealth)
+	return engineOK && delegationOK && gpuOK && servicesOK
 }
 
 func (r doctorReport) problem() string {
@@ -85,6 +91,11 @@ func (r doctorReport) problem() string {
 	}
 	if r.gpuHealth.Applicable && !r.gpuHealth.OK {
 		return r.gpuHealth.Message
+	}
+	for _, check := range r.serviceHealth {
+		if !check.OK {
+			return fmt.Sprintf("service %s: %s", check.Name, check.Detail)
+		}
 	}
 	return "unknown problem"
 }
@@ -134,14 +145,15 @@ func runPodmanGPUProbe(rt catalog.ContainerRuntime, lookPath func(string) (strin
 // from doctorRunE so tests can exercise rendering/exit-code logic against a
 // hand-built doctorReport without touching a real docker/podman install.
 func runDoctorChecks() doctorReport {
-	return runDoctorChecksFor(platform.IsDarwin())
+	return runDoctorChecksFor(platform.IsDarwin(), currentManagedServiceHealth)
 }
 
 // runDoctorChecksFor is the seam runDoctorChecks wraps: isDarwin is passed in so
 // a test can pin that the darwin branch (Docker optional) is wired to
-// platform.IsDarwin() without needing to run on a Mac. runDoctorChecks resolves
-// the real value; a hand-built doctorReport in a test would bypass this wiring.
-func runDoctorChecksFor(isDarwin bool) doctorReport {
+// platform.IsDarwin() without needing to run on a Mac. serviceHealthFn is
+// injected so unit tests never resolve the real machine-convergent node dir or
+// inspect live containers. runDoctorChecks supplies the production source.
+func runDoctorChecksFor(isDarwin bool, serviceHealthFn func() ([]managedServiceHealth, bool)) doctorReport {
 	rt := catalog.SelectContainerRuntime()
 	cgroupHealth := platform.CgroupDelegationHealth{OK: true, Message: "not applicable to the selected runtime"}
 	if rt.EngineBin == "podman" && rt.Rootless && platform.IsLinux() {
@@ -150,6 +162,7 @@ func runDoctorChecksFor(isDarwin bool) doctorReport {
 	gpuHealth := runPodmanGPUProbe(rt, exec.LookPath, func(ctx context.Context, binary string, args ...string) ([]byte, error) {
 		return exec.CommandContext(ctx, binary, args...).CombinedOutput()
 	})
+	serviceHealth, servicesChecked := serviceHealthFn()
 	return doctorReport{
 		dockerHealth:        platform.CheckDockerUsable(rt.EngineBin),
 		doctor:              agentDoctor(worker.WorkerSnapshot{}),
@@ -158,6 +171,8 @@ func runDoctorChecksFor(isDarwin bool) doctorReport {
 		dockerOptional:      isDarwin,
 		bindWarnings:        engineBindExposureWarnings(),
 		serviceExecWarnings: service.EphemeralManagedExecStarts(),
+		serviceHealth:       serviceHealth,
+		servicesChecked:     servicesChecked,
 	}
 }
 
@@ -197,6 +212,30 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 		fmt.Fprintf(w, "  %s %s\n", goodColor.Sprint("[OK]"), r.gpuHealth.Message)
 	} else {
 		fmt.Fprintf(w, "  %s %s\n", badColor.Sprint("[FAIL]"), r.gpuHealth.Message)
+	}
+
+	headerColor.Fprintln(w, "\nMANAGED SERVICES")
+	switch {
+	case !r.servicesChecked:
+		fmt.Fprintf(w, "  %s no node manifest available\n", faintColor.Sprint("[N/A]"))
+	case len(r.serviceHealth) == 0:
+		fmt.Fprintf(w, "  %s no managed services are configured\n", goodColor.Sprint("[OK]"))
+	default:
+		for _, check := range r.serviceHealth {
+			if check.OK {
+				detail := check.State
+				if check.Detail != "" {
+					detail += " (" + check.Detail + ")"
+				}
+				fmt.Fprintf(w, "  %s %s: %s\n", goodColor.Sprint("[OK]"), check.Name, detail)
+				continue
+			}
+			detail := check.State
+			if check.Detail != "" {
+				detail += " — " + check.Detail
+			}
+			fmt.Fprintf(w, "  %s %s: %s\n", badColor.Sprint("[FAIL]"), check.Name, detail)
+		}
 	}
 
 	headerColor.Fprintln(w, "\nJOB ROUTING / WORKER HEALTH")
@@ -258,22 +297,24 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 var doctorCmd = &cobra.Command{
 	Use:     "doctor",
 	Aliases: []string{"dr"},
-	Short:   "Diagnose engine, Podman isolation, GPU, and job-routing health",
+	Short:   "Diagnose engine, managed services, Podman isolation, GPU, and job-routing health",
 	Long: `citadel doctor runs a quick, scriptable health check by wiring together
 existing diagnostics rather than reimplementing detection logic:
 
   - Docker/engine usability (the same preflight used before starting a
     docker-based service): is the CLI on PATH, is the daemon reachable, and
     if not, what's the platform-specific fix?
+  - Managed services configured to run: are their compose files present and
+    is each container or native process actually running?
   - Job-routing / worker health (the same diagnosis served by a live
     'citadel work'/'citadel up' at /agent/doctor): identity resolution,
     per-node stream subscription, and recent poll activity. Since a
     standalone 'citadel doctor' has no live worker to inspect, this section
     is shown for context only and does not affect the exit code.
 
-Exits non-zero if the engine preflight, required rootless cgroup delegation,
-or an applicable Podman NVIDIA CDI probe fails, so it can be used in scripts
-and health checks.`,
+Exits non-zero if the engine preflight, a configured managed service, required
+rootless cgroup delegation, or an applicable Podman NVIDIA CDI probe fails, so
+it can be used in scripts and health checks.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		report := runDoctorChecks()
 		renderDoctorReport(cmd.OutOrStdout(), report)

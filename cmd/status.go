@@ -440,7 +440,7 @@ func gatherStatusData() (dashboard.StatusData, error) {
 	}
 
 	// Load manifest
-	manifest, _, _ := findAndReadManifest()
+	manifest, manifestConfigDir, _ := findAndReadManifest()
 	if manifest != nil {
 		data.NodeName = manifest.Node.Name
 		data.OrgID = manifest.Node.OrgID
@@ -546,26 +546,16 @@ func gatherStatusData() (dashboard.StatusData, error) {
 
 	// Services
 	if manifest != nil {
-		configDir := ""
-		if m, cd, err := findAndReadManifest(); err == nil && m != nil {
-			configDir = cd
-		}
-
-		for _, service := range manifest.Services {
+		for _, check := range checkManagedServiceHealth(manifest, manifestConfigDir, probeManagedServiceState) {
+			status := check.State
+			if !check.OK {
+				status = "error"
+			}
 			svcStatus := dashboard.ServiceStatus{
-				Name:   service.Name,
-				Status: "stopped",
+				Name:   check.Name,
+				Status: status,
+				Detail: check.Detail,
 			}
-
-			if configDir != "" {
-				fullComposePath := filepath.Join(configDir, service.ComposeFile)
-				if _, err := os.Stat(fullComposePath); err == nil {
-					if state, err := composeServiceState(fullComposePath, service.Name); err == nil {
-						svcStatus.Status = state.State
-					}
-				}
-			}
-
 			data.Services = append(data.Services, svcStatus)
 		}
 	}
@@ -1249,68 +1239,35 @@ func printServiceInfo(w *tabwriter.Writer) {
 		return
 	}
 
-	// If services are listed in the manifest, the 'services' directory must exist.
-	servicesDir := filepath.Join(configDir, "services")
-	if _, statErr := os.Stat(servicesDir); os.IsNotExist(statErr) {
-		fmt.Fprintf(w, "  %s\n", warnColor.Sprint("⚠️  Configuration Error"))
-		fmt.Fprintf(w, "    The configuration file lists services, but the 'services' directory is missing.\n")
-		fmt.Fprintf(w, "    Expected at: %s\n", servicesDir)
-		return
-	}
-
-	for _, service := range manifest.Services {
-		fullComposePath := filepath.Join(configDir, service.ComposeFile)
-
-		// Proactively check if the compose file exists to provide a better error message.
-		if _, statErr := os.Stat(fullComposePath); os.IsNotExist(statErr) {
-			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Configuration Error"))
-			fmt.Fprintf(w, "    Compose file not found: %s\n", service.ComposeFile)
-			continue
-		}
-
-		psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
-		psCmd := composeCommand(psArgs...)
-		output, err := psCmd.CombinedOutput() // Use CombinedOutput to get stderr
-		if err != nil {
-			errMsg := string(output)
-			if strings.Contains(errMsg, "permission denied") && strings.Contains(errMsg, "docker.sock") {
+	checks := checkManagedServiceHealth(manifest, configDir, probeManagedServiceState)
+	for i, service := range manifest.Services {
+		check := checks[i]
+		switch {
+		case check.OK && check.State == "running":
+			statusStr := goodColor.Sprint("🟢 RUNNING")
+			if check.Native {
+				statusStr += labelColor.Sprint(" (native)")
+			}
+			// For running serving engines, show the model(s) actually loaded,
+			// e.g. "🟢 RUNNING (Qwen/Qwen3-8B)" (#529).
+			if models := discoverServiceModels(service.Name); len(models) > 0 {
+				statusStr += fmt.Sprintf(" (%s)", strings.Join(models, ", "))
+			}
+			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, statusStr)
+		case check.OK:
+			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, labelColor.Sprint("⚫ STOPPED (desired)"))
+		default:
+			if strings.Contains(check.Detail, "permission denied") && strings.Contains(check.Detail, "docker.sock") {
 				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, badColor.Sprint("❌ PERMISSION DENIED"))
 				fmt.Fprintf(w, "    %s\n", "Could not connect to the Docker daemon.")
 				fmt.Fprintf(w, "    %s\n", "Hint: Add your user to the 'docker' group (`sudo usermod -aG docker $USER`)")
 				fmt.Fprintf(w, "    %s\n", "      then log out and log back in for the change to take effect.")
 			} else {
-				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Could not get status"))
-				fmt.Fprintf(w, "    %s\n", strings.TrimSpace(errMsg))
+				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, badColor.Sprintf("🔴 %s", strings.ToUpper(check.State)))
+				if check.Detail != "" {
+					fmt.Fprintf(w, "    %s\n", check.Detail)
+				}
 			}
-			continue
-		}
-
-		svcState := composeServiceStateFrom(output, fullComposePath, service.Name)
-		switch {
-		case svcState.Running:
-			statusStr := goodColor.Sprint("🟢 RUNNING")
-			if svcState.Native {
-				statusStr += labelColor.Sprint(" (native)")
-			}
-			// For running serving engines, show the model(s) actually loaded,
-			// e.g. "🟢 RUNNING (Qwen/Qwen3-8B)" (#529). Non-engine services and
-			// engines that don't answer within the short probe window print
-			// unchanged.
-			if models := discoverServiceModels(service.Name); len(models) > 0 {
-				statusStr += fmt.Sprintf(" (%s)", strings.Join(models, ", "))
-			}
-			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, statusStr)
-		case svcState.Container != nil:
-			// A container exists for this service but is not up. Report its real
-			// state rather than a bare STOPPED so a crash loop is visible.
-			raw := strings.ToUpper(svcState.Container.State)
-			if strings.Contains(raw, "EXITED") || strings.Contains(raw, "DEAD") {
-				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, badColor.Sprintf("🔴 %s", raw))
-			} else {
-				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprintf("🟡 %s", raw))
-			}
-		default:
-			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, labelColor.Sprint("⚫ STOPPED"))
 		}
 
 		// aceteam-ai/citadel-cli#1023: warn when an embedded engine is published

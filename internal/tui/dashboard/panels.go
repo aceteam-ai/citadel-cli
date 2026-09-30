@@ -156,6 +156,7 @@ type ServicePanel struct {
 type ServiceStatus struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`           // "running", "stopped", "error"
+	Detail string `json:"detail,omitempty"` // failure reason when status is "error"
 	Uptime string `json:"uptime,omitempty"` // e.g., "2d 14h"
 }
 
@@ -182,6 +183,9 @@ func (p ServicePanel) Render() string {
 		}
 
 		uptime := svc.Uptime
+		if uptime == "" && svc.Detail != "" {
+			uptime = svc.Detail
+		}
 		if uptime == "" {
 			uptime = "-"
 		}

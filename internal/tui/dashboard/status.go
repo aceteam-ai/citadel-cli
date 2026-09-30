@@ -423,6 +423,9 @@ func (m StatusModel) formatServiceLine(svc ServiceStatus, width int) string {
 	}
 
 	uptime := svc.Uptime
+	if uptime == "" && svc.Detail != "" {
+		uptime = svc.Detail
+	}
 	if uptime == "" {
 		uptime = "-"
 	}

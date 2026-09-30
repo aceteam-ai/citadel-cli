@@ -12,7 +12,7 @@
 # container creation with `could not select device driver "nvidia" with
 # capabilities: [[gpu]]`. This variant drops that block so ollama runs CPU-only,
 # which is how Ollama itself documents running in Docker on a Mac (no `--gpus`).
-# The `ollama/ollama` image is multi-arch (native linux/arm64), so it runs
+# The `docker.io/ollama/ollama` image is multi-arch (native linux/arm64), so it runs
 # natively on Apple Silicon rather than under emulation.
 #
 # Everything else is kept identical to ollama.yml so the two files differ ONLY
@@ -26,7 +26,7 @@
 
 services:
   ollama:
-    image: ollama/ollama:latest
+    image: docker.io/ollama/ollama:latest
     container_name: citadel-ollama
     ports:
       - "${CITADEL_OLLAMA_BIND:-0.0.0.0}:11434:11434"
