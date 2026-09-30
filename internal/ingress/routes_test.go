@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 func mustBody(t *testing.T, v any) []byte {
@@ -129,7 +132,7 @@ func TestClientResolve_OnMissThenNegativeCacheSuppresses(t *testing.T) {
 	c := NewClient(ClientConfig{Source: src, NegativeTTL: time.Minute})
 	c.pollOnce(context.Background())
 
-	if _, ok := c.Resolve(context.Background(), "known"); !ok {
+	if _, ok, err := c.Resolve(context.Background(), "known"); err != nil || !ok {
 		t.Fatal("known slug should resolve from the map")
 	}
 	if atomic.LoadInt32(&src.fetchOneCalls) != 0 {
@@ -137,18 +140,41 @@ func TestClientResolve_OnMissThenNegativeCacheSuppresses(t *testing.T) {
 	}
 
 	// First unknown lookup -> one on-miss FetchOne.
-	if _, ok := c.Resolve(context.Background(), "unknown"); ok {
+	if _, ok, err := c.Resolve(context.Background(), "unknown"); err != nil || ok {
 		t.Fatal("unknown slug must not resolve")
 	}
 	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 1 {
 		t.Fatalf("first unknown: FetchOne calls = %d, want 1", got)
 	}
 	// Second unknown lookup within TTL -> negative cache suppresses the lookup.
-	if _, ok := c.Resolve(context.Background(), "unknown"); ok {
+	if _, ok, err := c.Resolve(context.Background(), "unknown"); err != nil || ok {
 		t.Fatal("unknown slug must still not resolve")
 	}
 	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 1 {
 		t.Fatalf("second unknown: FetchOne calls = %d, want still 1 (negative-cached)", got)
+	}
+}
+
+func TestClientResolve_OnMissRedirectFailsRetryablyWithoutNegativeCache(t *testing.T) {
+	empty := mustBody(t, routesPayload{Routes: map[string]routeEntry{}})
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			return 200, "e1", empty, nil
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) {
+			return 307, nil, nil
+		},
+	}
+	c := NewClient(ClientConfig{Source: src})
+	c.pollOnce(context.Background())
+
+	for i := 0; i < 2; i++ {
+		if _, ok, err := c.Resolve(context.Background(), "redirected"); err == nil || ok {
+			t.Fatalf("attempt %d: ok=%v err=%v, want retryable failure", i+1, ok, err)
+		}
+	}
+	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 2 {
+		t.Fatalf("FetchOne calls = %d, want 2 (redirect failures are not negative-cached)", got)
 	}
 }
 
@@ -164,16 +190,360 @@ func TestClientResolve_OnMissPositiveInsertedIntoOverlay(t *testing.T) {
 	c := NewClient(ClientConfig{Source: src})
 	c.pollOnce(context.Background())
 
-	r, ok := c.Resolve(context.Background(), "late")
+	r, ok, err := c.Resolve(context.Background(), "late")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || r.Port != 3000 {
 		t.Fatalf("on-miss positive should resolve: ok=%v r=%+v", ok, r)
 	}
 	// Second lookup served from the overlay, no second FetchOne.
-	if _, ok := c.Resolve(context.Background(), "late"); !ok {
+	if _, ok, err := c.Resolve(context.Background(), "late"); err != nil || !ok {
 		t.Fatal("overlay lookup should resolve")
 	}
 	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 1 {
 		t.Fatalf("FetchOne calls = %d, want 1 (overlay caches the positive)", got)
+	}
+}
+
+func TestClientResolve_ConcurrentSameSlugCollapsesFetchOne(t *testing.T) {
+	empty := mustBody(t, routesPayload{Routes: map[string]routeEntry{}})
+	one := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"late": {MeshIP: "100.64.0.7", Port: 3000, Visibility: "public"},
+	}})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			return 200, "e1", empty, nil
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) {
+			startedOnce.Do(func() { close(started) })
+			<-release
+			return 200, one, nil
+		},
+	}
+	c := NewClient(ClientConfig{Source: src})
+	c.pollOnce(context.Background())
+
+	const callers = 32
+	results := make(chan bool, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, ok, _ := c.Resolve(context.Background(), "late")
+			results <- ok
+		}()
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FetchOne did not start")
+	}
+	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 1 {
+		t.Fatalf("concurrent same-slug FetchOne calls = %d, want 1", got)
+	}
+	close(release)
+	wg.Wait()
+	close(results)
+	for ok := range results {
+		if !ok {
+			t.Fatal("collapsed caller did not receive the positive route")
+		}
+	}
+	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 1 {
+		t.Fatalf("final FetchOne calls = %d, want 1", got)
+	}
+}
+
+func TestClientResolve_GlobalOnMissRateCapDeniesRandomSlugScan(t *testing.T) {
+	empty := mustBody(t, routesPayload{Routes: map[string]routeEntry{}})
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			return 200, "e1", empty, nil
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) {
+			return 404, nil, nil
+		},
+	}
+	c := NewClient(ClientConfig{
+		Source:          src,
+		OnMissRateLimit: rate.Limit(1),
+		OnMissBurst:     3,
+	})
+	now := time.Unix(1_000, 0)
+	c.now = func() time.Time { return now }
+	c.pollOnce(context.Background())
+
+	type result struct {
+		ok  bool
+		err error
+	}
+	results := make(chan result, 100)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, ok, err := c.Resolve(context.Background(), fmt.Sprintf("scan-%d", i))
+			results <- result{ok: ok, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var denied int
+	for result := range results {
+		if result.ok {
+			t.Fatal("random unknown slug unexpectedly resolved")
+		}
+		if result.err != nil {
+			denied++
+		}
+	}
+	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 3 {
+		t.Fatalf("random-slug FetchOne calls = %d, want burst cap 3", got)
+	}
+	if denied != 97 {
+		t.Fatalf("rate-limited results = %d, want 97", denied)
+	}
+}
+
+func TestClientResolve_CacheHitsDoNotSpendOnMissBudget(t *testing.T) {
+	full := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"known": {MeshIP: "100.64.0.1", Port: 8080, Visibility: "public"},
+	}})
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			return 200, "e1", full, nil
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) {
+			return 404, nil, nil
+		},
+	}
+	c := NewClient(ClientConfig{Source: src, OnMissRateLimit: rate.Limit(1), OnMissBurst: 1})
+	now := time.Unix(1_000, 0)
+	c.now = func() time.Time { return now }
+	c.pollOnce(context.Background())
+
+	for i := 0; i < 10; i++ {
+		if _, ok, err := c.Resolve(context.Background(), "known"); err != nil || !ok {
+			t.Fatalf("known lookup %d: ok=%v err=%v", i+1, ok, err)
+		}
+	}
+	if _, ok, err := c.Resolve(context.Background(), "unknown"); err != nil || ok {
+		t.Fatalf("first miss after cache hits: ok=%v err=%v", ok, err)
+	}
+	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 1 {
+		t.Fatalf("FetchOne calls = %d, want 1", got)
+	}
+}
+
+func TestClientResolve_BlockedFetchOneCannotOutliveNewerFullMap(t *testing.T) {
+	empty := mustBody(t, routesPayload{Routes: map[string]routeEntry{}})
+	authoritative := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"late": {MeshIP: "100.64.0.8", Port: 4000, Visibility: "gated"},
+	}})
+	staleOne := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"late": {MeshIP: "100.64.0.7", Port: 3000, Visibility: "public"},
+	}})
+	var fullCalls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			if fullCalls.Add(1) == 1 {
+				return 200, "e1", empty, nil
+			}
+			return 200, "e2", authoritative, nil
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) {
+			close(started)
+			<-release
+			return 200, staleOne, nil
+		},
+	}
+	c := NewClient(ClientConfig{Source: src})
+	c.pollOnce(context.Background())
+
+	result := make(chan Route, 1)
+	go func() {
+		route, _, _ := c.Resolve(context.Background(), "late")
+		result <- route
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FetchOne did not start")
+	}
+	c.pollOnce(context.Background())
+	close(release)
+	got := <-result
+	if got.Port != 4000 || got.Visibility != VisibilityGated {
+		t.Fatalf("blocked FetchOne returned stale route %+v, want newer authoritative route", got)
+	}
+	c.overlayMu.RLock()
+	_, reinserted := c.overlay["late"]
+	c.overlayMu.RUnlock()
+	if reinserted {
+		t.Fatal("blocked FetchOne reinserted an overlay after a newer 200 map")
+	}
+}
+
+func TestClientResolve_BlockedNonPositiveFetchCannotOutliveNewerFullMap(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		err    error
+	}{
+		{name: "not found", status: 404},
+		{name: "redirect", status: 307},
+		{name: "transport error", err: errors.New("connection reset")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			empty := mustBody(t, routesPayload{Routes: map[string]routeEntry{}})
+			authoritative := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+				"late": {MeshIP: "100.64.0.8", Port: 4000, Visibility: "gated"},
+			}})
+			var fullCalls atomic.Int32
+			started := make(chan struct{})
+			release := make(chan struct{})
+			src := &fakeSource{
+				fetchFn: func(context.Context, string) (int, string, []byte, error) {
+					if fullCalls.Add(1) == 1 {
+						return 200, "e1", empty, nil
+					}
+					return 200, "e2", authoritative, nil
+				},
+				fetchOneFn: func(context.Context, string) (int, []byte, error) {
+					close(started)
+					<-release
+					return tt.status, nil, tt.err
+				},
+			}
+			c := NewClient(ClientConfig{Source: src})
+			c.pollOnce(context.Background())
+
+			type resolution struct {
+				route Route
+				ok    bool
+				err   error
+			}
+			result := make(chan resolution, 1)
+			go func() {
+				route, ok, err := c.Resolve(context.Background(), "late")
+				result <- resolution{route: route, ok: ok, err: err}
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("FetchOne did not start")
+			}
+			c.pollOnce(context.Background())
+			close(release)
+
+			got := <-result
+			if got.err != nil || !got.ok || got.route.Port != 4000 || got.route.Visibility != VisibilityGated {
+				t.Fatalf("blocked FetchOne result = %+v, want newer authoritative route", got)
+			}
+			if c.neg.has("late") {
+				t.Fatal("superseded FetchOne inserted a negative-cache entry")
+			}
+		})
+	}
+}
+
+func TestClient_RequestStartControlsMapAnd304Freshness(t *testing.T) {
+	full := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"app": {MeshIP: "100.64.0.1", Port: 8080, Visibility: "public"},
+	}})
+	now := time.Unix(1_000, 0)
+	var calls int
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			calls++
+			switch calls {
+			case 1:
+				now = now.Add(2 * time.Minute)
+				return 200, "e1", full, nil
+			default:
+				now = now.Add(2 * time.Minute)
+				return 304, "e1", nil, nil
+			}
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) { return 404, nil, nil },
+	}
+	c := NewClient(ClientConfig{Source: src, MaxAge: time.Minute})
+	c.now = func() time.Time { return now }
+
+	c.pollOnce(context.Background())
+	if c.Fresh() {
+		t.Fatal("slow 200 was stamped at response arrival instead of request send")
+	}
+	firstStamp := c.Current().fetchedAt
+	if !firstStamp.Equal(time.Unix(1_000, 0)) {
+		t.Fatalf("slow 200 fetchedAt = %v, want request start", firstStamp)
+	}
+
+	c.pollOnce(context.Background())
+	if c.Fresh() {
+		t.Fatal("slow 304 was stamped at response arrival instead of request send")
+	}
+	if want := time.Unix(1_000, 0).Add(2 * time.Minute); !c.Current().fetchedAt.Equal(want) {
+		t.Fatalf("slow 304 fetchedAt = %v, want request start %v", c.Current().fetchedAt, want)
+	}
+}
+
+func TestClient_RequestStartControlsOverlayAndNegativeFreshness(t *testing.T) {
+	empty := mustBody(t, routesPayload{Routes: map[string]routeEntry{}})
+	one := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"late": {MeshIP: "100.64.0.7", Port: 3000, Visibility: "public"},
+	}})
+	now := time.Unix(2_000, 0)
+	var mode atomic.Int32
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			return 200, "e1", empty, nil
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) {
+			now = now.Add(2 * time.Second)
+			if mode.Load() == 0 {
+				return 200, one, nil
+			}
+			return 404, nil, nil
+		},
+	}
+	c := NewClient(ClientConfig{Source: src, MaxAge: time.Second, NegativeTTL: time.Second, OnMissBurst: 10})
+	c.now = func() time.Time { return now }
+	c.pollOnce(context.Background())
+
+	if _, ok, err := c.Resolve(context.Background(), "late"); ok || err == nil {
+		t.Fatalf("slow FetchOne result = ok %v err %v, want freshness error", ok, err)
+	}
+	c.overlayMu.RLock()
+	_, inserted := c.overlay["late"]
+	c.overlayMu.RUnlock()
+	if inserted {
+		t.Fatal("slow FetchOne result exceeded maxAge but entered the overlay")
+	}
+
+	// Refresh the authoritative empty map, then prove a slow 404's negative TTL
+	// starts at request send: it is already expired when the response arrives.
+	c.pollOnce(context.Background())
+	mode.Store(1)
+	if _, ok, err := c.Resolve(context.Background(), "missing"); err != nil || ok {
+		t.Fatal("missing slug unexpectedly resolved")
+	}
+	c.pollOnce(context.Background())
+	if _, ok, err := c.Resolve(context.Background(), "missing"); err != nil || ok {
+		t.Fatal("missing slug unexpectedly resolved on retry")
+	}
+	if got := atomic.LoadInt32(&src.fetchOneCalls); got != 3 {
+		t.Fatalf("FetchOne calls = %d, want 3 (slow positive plus two expired negatives)", got)
 	}
 }
 
@@ -198,7 +568,7 @@ func TestClient_ServesLastGoodAfterFetchFailure(t *testing.T) {
 	if !c.FetchedOnce() {
 		t.Fatal("FetchedOnce should stay true after a later failure")
 	}
-	if _, ok := c.Resolve(context.Background(), "app"); !ok {
+	if _, ok, err := c.Resolve(context.Background(), "app"); err != nil || !ok {
 		t.Fatal("must keep serving last-good routes through a fetch failure")
 	}
 }
@@ -268,7 +638,7 @@ func TestClientFresh_NilMapAndExpiryFailClosed(t *testing.T) {
 	if c.Fresh() {
 		t.Fatal("a never-fetched client must not be fresh")
 	}
-	if _, ok := c.Resolve(context.Background(), "app"); ok {
+	if _, ok, err := c.Resolve(context.Background(), "app"); err != nil || ok {
 		t.Fatal("resolve must fail closed before any successful fetch")
 	}
 
@@ -276,7 +646,7 @@ func TestClientFresh_NilMapAndExpiryFailClosed(t *testing.T) {
 	if !c.Fresh() {
 		t.Fatal("fresh right after a 200 fetch")
 	}
-	if _, ok := c.Resolve(context.Background(), "app"); !ok {
+	if _, ok, err := c.Resolve(context.Background(), "app"); err != nil || !ok {
 		t.Fatal("resolve should hit within maxAge")
 	}
 
@@ -285,7 +655,7 @@ func TestClientFresh_NilMapAndExpiryFailClosed(t *testing.T) {
 	if c.Fresh() {
 		t.Fatal("must expire past maxAge")
 	}
-	if _, ok := c.Resolve(context.Background(), "app"); ok {
+	if _, ok, err := c.Resolve(context.Background(), "app"); err != nil || ok {
 		t.Fatal("resolve must fail closed once the map is expired")
 	}
 }
@@ -318,7 +688,7 @@ func TestClient_304RefreshesFreshness(t *testing.T) {
 	if !c.Fresh() {
 		t.Fatal("a 304 must reset the freshness clock so a healthy feed does not expire")
 	}
-	if _, ok := c.Resolve(context.Background(), "app"); !ok {
+	if _, ok, err := c.Resolve(context.Background(), "app"); err != nil || !ok {
 		t.Fatal("resolve should still hit after a 304 re-stamp")
 	}
 }
@@ -358,7 +728,7 @@ func TestClient_OverlayEntryExpiresIndependentlyUnderPerpetual304(t *testing.T) 
 	c.pollOnce(context.Background()) // 200 at t=1000
 
 	// On-miss positive: "late" resolves and enters the overlay (fetchedAt=1000).
-	if _, ok := c.Resolve(context.Background(), "late"); !ok {
+	if _, ok, err := c.Resolve(context.Background(), "late"); err != nil || !ok {
 		t.Fatal("late should resolve via on-miss FetchOne")
 	}
 	if got := atomic.LoadInt32(&oneN); got != 1 {
@@ -378,7 +748,7 @@ func TestClient_OverlayEntryExpiresIndependentlyUnderPerpetual304(t *testing.T) 
 	// must expire and re-validate to a 404 -> no longer resolves.
 	tombstoned.Store(true)
 	now = time.Unix(1061, 0)
-	if _, ok := c.Resolve(context.Background(), "late"); ok {
+	if _, ok, err := c.Resolve(context.Background(), "late"); err != nil || ok {
 		t.Fatal("an expired overlay entry must not resolve past RouteMaxAge under a perpetual-304 feed")
 	}
 	if got := atomic.LoadInt32(&oneN); got != 2 {

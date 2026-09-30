@@ -53,11 +53,15 @@ type fakeResolver struct {
 	login   string
 	cookies []string
 	stale   bool // when true, Fresh() reports not-fresh (config-absent / expired)
+	err     error
 }
 
-func (f *fakeResolver) Resolve(_ context.Context, slug string) (Route, bool) {
+func (f *fakeResolver) Resolve(_ context.Context, slug string) (Route, bool, error) {
+	if f.err != nil {
+		return Route{}, false, f.err
+	}
 	r, ok := f.routes[slug]
-	return r, ok
+	return r, ok, nil
 }
 func (f *fakeResolver) LoginURL() string      { return f.login }
 func (f *fakeResolver) CookieNames() []string { return f.cookies }
@@ -144,6 +148,43 @@ func TestProxy_UnknownSlug404NoDial(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&d.calls); n != 0 {
 		t.Fatalf("dialer called %d times for an unknown slug; must be 0 (map is the authz boundary)", n)
+	}
+}
+
+func TestProxy_RouteLookupFailure503NoDial(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{}, err: errors.New("control plane unavailable")}
+	ts, d := startProxy(t, res, nil, "127.0.0.1:1")
+	resp := get(t, ts, "ghost.apps.example.com", "/", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&d.calls); got != 0 {
+		t.Fatalf("dialer called %d times on route lookup failure", got)
+	}
+}
+
+func TestProxy_OnMissRedirectStatus503NoDial(t *testing.T) {
+	empty := mustBody(t, routesPayload{Routes: map[string]routeEntry{}})
+	src := &fakeSource{
+		fetchFn: func(context.Context, string) (int, string, []byte, error) {
+			return http.StatusOK, "e1", empty, nil
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) {
+			return http.StatusTemporaryRedirect, nil, nil
+		},
+	}
+	client := NewClient(ClientConfig{Source: src})
+	client.pollOnce(context.Background())
+	ts, d := startProxy(t, client, nil, "127.0.0.1:1")
+
+	resp := get(t, ts, "ghost.apps.example.com", "/", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for control-plane redirect", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&d.calls); got != 0 {
+		t.Fatalf("dialer called %d times on redirected route lookup", got)
 	}
 }
 
@@ -427,6 +468,41 @@ func TestProxy_GatedAllowSetsSubjectAndStripsSpoof(t *testing.T) {
 	}
 	if !strings.Contains(sawCookie, "keep=1") {
 		t.Fatalf("pod should still see unrelated cookies, got %q", sawCookie)
+	}
+}
+
+func TestProxy_ConnectionCannotDeleteVouchedHeadersAndXFFIsSingle(t *testing.T) {
+	var sawSubject, sawProto, sawHost, sawXFF string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawSubject = r.Header.Get("X-Ingress-Subject")
+		sawProto = r.Header.Get("X-Forwarded-Proto")
+		sawHost = r.Header.Get("X-Forwarded-Host")
+		sawXFF = r.Header.Get("X-Forwarded-For")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}}
+	authz := &fakeAuthorizer{allow: true, subject: "real-user"}
+	ts, _ := startProxy(t, res, authz, upstream.Listener.Addr().String())
+	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{
+		"Cookie":            "sess=abc",
+		"Connection":        "X-Ingress-Subject, X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-For",
+		"X-Ingress-Subject": "spoofed",
+		"X-Forwarded-Proto": "http",
+		"X-Forwarded-Host":  "evil.example",
+		"X-Forwarded-For":   "192.0.2.99",
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if sawSubject != "real-user" || sawProto != "https" || sawHost != "app.apps.example.com" {
+		t.Fatalf("vouched headers subject=%q proto=%q host=%q", sawSubject, sawProto, sawHost)
+	}
+	if sawXFF == "" || strings.Contains(sawXFF, ",") || net.ParseIP(sawXFF) == nil {
+		t.Fatalf("X-Forwarded-For = %q, want one client IP", sawXFF)
 	}
 }
 

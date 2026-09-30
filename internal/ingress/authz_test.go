@@ -50,6 +50,48 @@ func TestStripInbound_RemovesTrustHeadersAndSessionCookiePreservesRest(t *testin
 	}
 }
 
+func TestStripInbound_SanitizesConnectionTrustHeaderTokens(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "https://app.apps.example.com/", nil)
+	r.Header["Connection"] = []string{
+		"keep-alive, X-Ingress-Subject, Upgrade",
+		" x-forwarded-proto , X-CITADEL-Node, custom-hop ",
+		"X-Auth-Token, Forwarded, X-Real-IP",
+	}
+	r.Header.Set("Upgrade", "websocket")
+	r.Header.Set("X-Ingress-Subject", "attacker")
+	r.Header.Set("X-Forwarded-Proto", "http")
+	r.Header.Set("X-Citadel-Node", "attacker")
+	r.Header.Set("X-Auth-Token", "attacker")
+	r.Header.Set("Forwarded", "for=192.0.2.1")
+	r.Header.Set("X-Real-IP", "192.0.2.1")
+
+	stripInbound(r, nil)
+
+	if got, want := r.Header.Values("Connection"), []string{"keep-alive, Upgrade", "custom-hop"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("Connection values = %#v, want %#v", got, want)
+	}
+	if got := r.Header.Get("Upgrade"); got != "websocket" {
+		t.Fatalf("Upgrade = %q, want websocket", got)
+	}
+	for _, h := range []string{"X-Ingress-Subject", "X-Forwarded-Proto", "X-Citadel-Node", "X-Auth-Token", "Forwarded", "X-Real-IP"} {
+		if got := r.Header.Get(h); got != "" {
+			t.Errorf("trust header %q survived with value %q", h, got)
+		}
+	}
+}
+
+func TestStripInbound_RemovesConnectionWhenOnlyTrustTokensRemain(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "https://app.apps.example.com/", nil)
+	r.Header.Add("Connection", "X-Ingress-Subject")
+	r.Header.Add("Connection", "X-Forwarded-Proto, Forwarded")
+
+	stripInbound(r, nil)
+
+	if got := r.Header.Values("Connection"); len(got) != 0 {
+		t.Fatalf("Connection values = %#v, want header removed", got)
+	}
+}
+
 func TestStripCookies_DeletesHeaderWhenEmpty(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "https://x/", nil)
 	r.Header.Set("Cookie", "sess=secret")
@@ -64,25 +106,57 @@ func TestIsPlatformSessionCookie(t *testing.T) {
 		name string
 		want bool
 	}{
-		{"sb-projref-auth-token", true},               // base Supabase auth cookie
-		{"sb-projref-auth-token.0", true},             // chunk
-		{"sb-projref-auth-token.1", true},             // chunk
-		{"sb-projref-auth-token.42", true},            // higher chunk
-		{"sb-projref-auth-token-code-verifier", true}, // PKCE verifier
-		{"SB-PROJREF-AUTH-TOKEN", true},               // case-insensitive
-		{"sb-access-token", true},                     // legacy exact
-		{"sb-refresh-token", true},                    // legacy exact
-		{"supabase-auth-token", true},                 // legacy exact
-		{"sess", false},                               // unrelated app session cookie
-		{"theme", false},                              // unrelated
-		{"sb-feature-flag", false},                    // sb- prefix but not an auth token
-		{"my-auth-token", false},                      // has auth-token but not sb- prefix
+		{"sb-projref-auth-token", true},                  // base Supabase auth cookie
+		{"sb-projref-auth-token.0", true},                // chunk
+		{"sb-projref-auth-token.1", true},                // chunk
+		{"sb-projref-auth-token.42", true},               // higher chunk
+		{"sb-projref-auth-token-code-verifier", true},    // PKCE verifier
+		{"SB-PROJREF-AUTH-TOKEN", true},                  // case-insensitive
+		{"sb-access-token", true},                        // legacy exact
+		{"sb-refresh-token", true},                       // legacy exact
+		{"supabase-auth-token", true},                    // legacy exact
+		{"__Secure-sb-projref-auth-token", true},         // secure prefix
+		{"__HOST-SB-PROJREF-AUTH-TOKEN.0", true},         // host prefix, case-insensitive
+		{"__Host-sb-access-token", true},                 // prefix plus legacy exact
+		{"%5F%5FSecure-sb-projref-auth-token", true},     // encoded prefix
+		{"__Secure-sb%2Dprojref-auth%2Dtoken.1", true},   // encoded family name
+		{"sb%2Drefresh%2Dtoken", true},                   // encoded legacy exact
+		{"%73b-projref-auth-token", true},                // encoded family prefix
+		{"sess", false},                                  // unrelated app session cookie
+		{"theme", false},                                 // unrelated
+		{"sb-feature-flag", false},                       // sb- prefix but not an auth token
+		{"my-auth-token", false},                         // has auth-token but not sb- prefix
+		{"__Secure-theme", false},                        // prefixed but unrelated
+		{"__Host-__Secure-sb-projref-auth-token", false}, // only one prefix is removed
+		{"%ZZsb-projref-auth-token", false},              // invalid leading escape remains unrelated
+		{"sb-projref-auth-token%ZZ", true},               // invalid suffix cannot evade the broad family
 		{"", false},
 	}
 	for _, tc := range cases {
 		if got := isPlatformSessionCookie(tc.name); got != tc.want {
 			t.Errorf("isPlatformSessionCookie(%q) = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestPlatformCookieConsumersUseNormalizedNames(t *testing.T) {
+	const encoded = "%5F%5FHost-sb-projref-auth-token.0"
+	r := httptest.NewRequest(http.MethodGet, "https://x/", nil)
+	r.Header.Set("Cookie", encoded+"=secret; theme=dark")
+
+	if got := gatedSessionCookie(r, nil); got != encoded+"=secret" {
+		t.Fatalf("gatedSessionCookie = %q, want normalized platform cookie", got)
+	}
+	if !outboundSessionCookieLeaked(r) {
+		t.Fatal("outboundSessionCookieLeaked did not detect normalized platform cookie")
+	}
+
+	stripInbound(r, nil)
+	if outboundSessionCookieLeaked(r) {
+		t.Fatal("normalized platform cookie survived stripInbound")
+	}
+	if got := r.Header.Get("Cookie"); got != "theme=dark" {
+		t.Fatalf("Cookie = %q, want only unrelated cookie", got)
 	}
 }
 
@@ -145,12 +219,12 @@ func TestGatedSessionCookie(t *testing.T) {
 	}
 }
 
-func TestSetForwardHeaders_UsesHostOnlyForXFF(t *testing.T) {
+func TestSetForwardHeaders_LeavesXFFToReverseProxy(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "https://app.apps.example.com/", nil)
 	r.RemoteAddr = "203.0.113.7:54321"
 	setForwardHeaders(r, "app.apps.example.com", "user-42")
-	if got := r.Header.Get("X-Forwarded-For"); got != "203.0.113.7" {
-		t.Errorf("X-Forwarded-For = %q, want host only (no port)", got)
+	if got := r.Header.Get("X-Forwarded-For"); got != "" {
+		t.Errorf("X-Forwarded-For = %q, want empty so ReverseProxy sets it once", got)
 	}
 	if got := r.Header.Get("X-Forwarded-Proto"); got != "https" {
 		t.Errorf("X-Forwarded-Proto = %q, want https", got)
@@ -171,6 +245,8 @@ func TestRewriteSetCookie(t *testing.T) {
 	}{
 		{"drop domain mid", "id=abc; Domain=apps.example.com; Path=/; HttpOnly", "id=abc; Path=/; HttpOnly; Secure"},
 		{"drop domain case", "id=abc; DOMAIN=.example.com; Path=/", "id=abc; Path=/; Secure"},
+		{"drop domain whitespace", "id=abc; Domain = apps.example.com; Path=/", "id=abc; Path=/; Secure"},
+		{"drop domain tab whitespace", "id=abc;\tDoMaIn\t=\t.example.com; HttpOnly", "id=abc; HttpOnly; Secure"},
 		{"drop domain end", "id=abc; Path=/; domain=example.com", "id=abc; Path=/; Secure"},
 		{"already secure", "id=abc; Path=/; Secure", "id=abc; Path=/; Secure"},
 		{"add secure", "id=abc; Path=/; HttpOnly", "id=abc; Path=/; HttpOnly; Secure"},

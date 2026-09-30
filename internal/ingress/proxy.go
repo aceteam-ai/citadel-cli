@@ -21,12 +21,13 @@ import (
 var slugRegexp = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // Resolver is the slug->route boundary the proxy consults. *Client implements
-// it; a fake is used in proxy tests. Resolve returning ok=false is a 404 and
-// MUST NOT cause any upstream dial -- the map is the authorization boundary.
+// it; a fake is used in proxy tests. Resolve returning ok=false is a 404, while
+// an error is a retryable 503; neither may cause an upstream dial because the
+// map is the authorization boundary.
 // Fresh reports whether the route data is present and within its max-age bound;
 // a false Fresh fails closed (503, no dial) before Resolve is consulted.
 type Resolver interface {
-	Resolve(ctx context.Context, slug string) (Route, bool)
+	Resolve(ctx context.Context, slug string) (Route, bool, error)
 	LoginURL() string
 	CookieNames() []string
 	Fresh() bool
@@ -170,7 +171,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	route, ok := p.resolver.Resolve(r.Context(), slug)
+	route, ok, err := p.resolver.Resolve(r.Context(), slug)
+	if err != nil {
+		p.logf("[ingress] route lookup unavailable for slug=%q: %v", slug, err)
+		serviceUnavailable(w)
+		return
+	}
 	if !ok {
 		// Unknown / torn-down / malformed slug: 404, no dial.
 		notFound(w)
