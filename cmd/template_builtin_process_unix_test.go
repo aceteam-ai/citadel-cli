@@ -31,12 +31,25 @@ func TestConfigurePapercraftProcessTreeUnix(t *testing.T) {
 
 func TestChromiumShutdownKillsHelpersAfterRootExited(t *testing.T) {
 	originalCommand := renderLimitedCommand
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	renderLimitedCommand = func(ctx context.Context, _ []string, binary string, args ...string) (*renderCommand, error) {
-		return &renderCommand{cmd: exec.CommandContext(ctx, binary, args...)}, nil
+		return &renderCommand{cmd: exec.CommandContext(ctx, binary, args...), stopScope: func() error {
+			rawPID, err := os.ReadFile(pidFile)
+			if err != nil {
+				return err
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(rawPID)))
+			if err != nil {
+				return err
+			}
+			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return err
+			}
+			return nil
+		}}, nil
 	}
 	t.Cleanup(func() { renderLimitedCommand = originalCommand })
 
-	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	process, err := startChromiumProcess(
 		context.Background(),
 		"/bin/sh",
@@ -85,6 +98,68 @@ func TestChromiumShutdownKillsHelpersAfterRootExited(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("helper process %d survived Shutdown after its root exited", childPID)
+}
+
+func TestPostWaitCleanupNeverSignalsReusedProcessGroup(t *testing.T) {
+	root := exec.CommandContext(context.Background(), "/bin/sh", "-c", "exit 0")
+	scopeStops := 0
+	limited := &renderCommand{cmd: root, stopScope: func() error {
+		scopeStops++
+		return nil
+	}}
+	cleanup := configurePapercraftProcessTree(limited)
+	if err := root.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deterministically model the kernel reusing the reaped root's numeric
+	// PID/PGID for an unrelated process group. Post-Wait cleanup must use only
+	// the unique scope identity and must not signal this replacement group.
+	unrelated := exec.Command("/bin/sh", "-c", "exec sleep 60")
+	unrelated.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := unrelated.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = unrelated.Process.Kill()
+		_ = unrelated.Wait()
+	})
+	root.Process = unrelated.Process
+
+	if err := cleanup(); err != nil {
+		t.Fatalf("post-Wait cleanup: %v", err)
+	}
+	if scopeStops != 1 {
+		t.Fatalf("scope stops = %d, want 1", scopeStops)
+	}
+	if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("post-Wait cleanup signaled reused process group: %v", err)
+	}
+}
+
+func TestCommandCancellationKillsLiveProcessGroupBeforeScopeCleanup(t *testing.T) {
+	var scopeStopped bool
+	limited := &renderCommand{
+		cmd: exec.CommandContext(context.Background(), "/bin/sh", "-c", "exec sleep 60"),
+		stopScope: func() error {
+			scopeStopped = true
+			return nil
+		},
+	}
+	_ = configurePapercraftProcessTree(limited)
+	if err := limited.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := limited.cmd.Cancel(); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	_ = limited.cmd.Wait()
+	if !scopeStopped {
+		t.Fatal("live cancellation did not stop the systemd scope")
+	}
 }
 
 func TestChromiumShutdownKillsSetsidDescendantThroughScope(t *testing.T) {
