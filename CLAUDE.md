@@ -786,7 +786,9 @@ pins the seven-day default, the minimum non-zero value is one minute, and the
 server runs the sweep hourly; `0` disables it. Never replace ownership with a
 name prefix or an all-server sweep — operators may share that tmux server.
 The terminal and `TMUX_SESSION` job paths both resolve the lease from
-`CITADEL_TERMINAL_SESSION_TTL`. A graceful server Stop renews every tracked
+`CITADEL_TERMINAL_SESSION_TTL` through the same parser: literal `0` is the only
+disable value, enabled leases have a one-minute floor, and malformed, negative,
+or shorter values fail clearly. A graceful server Stop renews every tracked
 attached lease before canceling maintenance, and the detach path performs an
 independent bounded final renewal, so a short lease cannot expire during a slow
 worker restart. Each renewal still uses the immutable identity guard. The
@@ -797,7 +799,11 @@ returns an aggregate error after processing the remaining candidates.
 first release containing both `#{==}` and `#{&&}`, which the atomic ownership
 guards require; `if-shell -F` is older. Explicit overrides, PATH binaries, and
 managed binaries all pass through that probe. Managed artifact metadata also
-pins a supported release before an artifact can become installable.
+pins a supported release before an artifact can become installable. The
+`citadel tmux install` non-force path runs the same version-aware `Ensure` path:
+it must never report an old managed binary as installed, and it may replace one
+only when a checksum- and version-vetted artifact exists. `--force` likewise
+fails honestly on a gated platform instead of claiming a replacement.
 
 **A Citadel-started tmux server must not remain in citadel.service's control
 group (citadel-cli#1166).** `tmux.PersistentSessionCommand` is the single launch

@@ -116,3 +116,51 @@ func TestTmuxSessionHandler_EnsureHonorsDisabledExpiry(t *testing.T) {
 		t.Fatalf("disabled lease deadline = %v, want zero", mgr.leaseUntil)
 	}
 }
+
+func TestTmuxSessionHandler_EnsureValidatesTerminalSessionTTL(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	for _, tc := range []struct {
+		name      string
+		value     string
+		wantLease time.Time
+		wantErr   bool
+	}{
+		{name: "minimum", value: "1m", wantLease: now.Add(time.Minute)},
+		{name: "disabled", value: "0", wantLease: time.Time{}},
+		{name: "below floor", value: "30s", wantErr: true},
+		{name: "negative", value: "-1m", wantErr: true},
+		{name: "malformed", value: "not-a-duration", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tmux.EnvSessionLeaseTTL, tc.value)
+			mgr := &fakeTmuxSessionManager{}
+			h := NewTmuxSessionHandler("")
+			h.now = func() time.Time { return now }
+			managerCalls := 0
+			h.newManager = func() (tmuxSessionManager, error) {
+				managerCalls++
+				return mgr, nil
+			}
+
+			_, err := h.Execute(JobContext{}, tmuxJob(map[string]string{"action": "ensure", "name": "agent"}))
+			if tc.wantErr {
+				if !errors.Is(err, tmux.ErrInvalidSessionLeaseTTL) {
+					t.Fatalf("Execute() error = %v, want ErrInvalidSessionLeaseTTL", err)
+				}
+				if !mgr.leaseUntil.IsZero() {
+					t.Fatalf("invalid TTL reached manager with deadline %v", mgr.leaseUntil)
+				}
+				if managerCalls != 0 {
+					t.Fatalf("invalid TTL constructed tmux manager %d time(s), want fail before tmux access", managerCalls)
+				}
+				return
+			}
+			if err != nil || !mgr.leaseUntil.Equal(tc.wantLease) {
+				t.Fatalf("Execute() = deadline %v, error %v; want %v, nil", mgr.leaseUntil, err, tc.wantLease)
+			}
+			if managerCalls != 1 {
+				t.Fatalf("valid TTL constructed tmux manager %d time(s), want 1", managerCalls)
+			}
+		})
+	}
+}

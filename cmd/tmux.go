@@ -12,6 +12,16 @@ import (
 
 var tmuxInstallForce bool
 
+type managedTmuxInstaller interface {
+	AlreadyInstalled() bool
+	DestPath() string
+	Ensure() (bool, error)
+	Install() error
+}
+
+var newManagedTmuxInstaller = func() managedTmuxInstaller { return tmuxinstall.New() }
+var managedTmuxArtifactAvailable = tmuxinstall.Available
+
 var tmuxCmd = &cobra.Command{
 	Use:   "tmux",
 	Short: "Manage the Citadel-managed tmux binary for persistent terminal sessions",
@@ -78,14 +88,25 @@ func runTmuxStatus(cmd *cobra.Command, args []string) error {
 }
 
 func runTmuxInstall(cmd *cobra.Command, args []string) error {
-	inst := tmuxinstall.New()
+	inst := newManagedTmuxInstaller()
 
-	if inst.AlreadyInstalled() && !tmuxInstallForce {
-		fmt.Printf("Managed tmux already installed at %s (use --force to reinstall).\n", inst.DestPath())
-		return nil
+	if !tmuxInstallForce {
+		wasPresent := inst.AlreadyInstalled()
+		installed, err := inst.Ensure()
+		if err != nil {
+			return fmt.Errorf("ensure managed tmux at %s: %w", inst.DestPath(), err)
+		}
+		if installed {
+			if wasPresent {
+				fmt.Printf("Managed tmux at %s satisfies the required version.\n", inst.DestPath())
+			} else {
+				fmt.Printf("Installed checksum- and version-vetted tmux at %s.\n", inst.DestPath())
+			}
+			return nil
+		}
 	}
 
-	if !tmuxinstall.Available() {
+	if !managedTmuxArtifactAvailable() {
 		if src, ok := tmuxinstall.CurrentSource(); ok {
 			return fmt.Errorf("no managed tmux artifact for %s/%s: %s", runtime.GOOS, runtime.GOARCH, src.Note)
 		}

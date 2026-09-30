@@ -71,6 +71,14 @@ func (h *TmuxSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	if action == "" {
 		action = "ensure"
 	}
+	var leaseUntil time.Time
+	if action == "ensure" || action == "create" {
+		ttl, err := tmux.SessionLeaseTTLFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		leaseUntil = tmux.SessionLeaseDeadline(h.now(), ttl)
+	}
 
 	mgr, err := h.newManager()
 	if err != nil {
@@ -103,7 +111,6 @@ func (h *TmuxSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 		if shell == "" {
 			shell = h.DefaultShell
 		}
-		leaseUntil := tmux.SessionLeaseDeadline(h.now(), tmux.SessionLeaseTTLFromEnv())
 		if err := mgr.EnsureSessionLease(bg, name, shell, leaseUntil); err != nil {
 			return nil, err
 		}

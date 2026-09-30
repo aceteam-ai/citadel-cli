@@ -65,7 +65,7 @@ citadel work --mode=nexus --terminal --terminal-port 7860
 | `CITADEL_TERMINAL_MAX_CONNECTIONS` | Max concurrent sessions | 10 |
 | `CITADEL_TERMINAL_SHELL` | Shell to spawn | Platform default |
 | `CITADEL_TERMINAL_SESSION` | Persistent tmux session base name to back connections, or a disable sentinel (`none`/`off`/`disabled`/`false`/`0`, case-insensitive) to force a bare shell | `citadel` (tmux backing ON) |
-| `CITADEL_TERMINAL_SESSION_TTL` | Retention lease after disconnect for a Citadel-managed tmux session; minimum non-zero value `1m`, Go duration syntax, `0` disables the reaper | `168h` (7 days) |
+| `CITADEL_TERMINAL_SESSION_TTL` | Retention lease after disconnect for a Citadel-managed tmux session; minimum non-zero value `1m`, Go duration syntax, literal `0` disables the reaper, malformed/negative/sub-minute values are rejected | `168h` (7 days) |
 | `CITADEL_TMUX_BIN` | Explicit path to a tmux binary (overrides PATH/managed lookup) | (unset) |
 | `CITADEL_AUTH_HOST` | Authentication service URL | https://aceteam.ai |
 | `CITADEL_TOKEN_REFRESH_INTERVAL` | Token cache refresh interval in minutes | 60 |
@@ -128,8 +128,10 @@ keys to the session once `claude` is installed).
 Sessions can also be pre-created, listed, or checked out-of-band through the
 `TMUX_SESSION` job type (payload `action`: `ensure`|`create`|`list`|`has`,
 `name`, optional `shell`), dispatched through the standard worker mechanism.
-Ensure/create uses the same `CITADEL_TERMINAL_SESSION_TTL` value as WebSocket
-sessions, including `0` for a non-expiring lease.
+Ensure/create uses the same validated `CITADEL_TERMINAL_SESSION_TTL` value as
+WebSocket sessions, including literal `0` for a non-expiring lease. Malformed,
+negative, and non-zero values below `1m` fail instead of silently weakening the
+retention policy.
 
 Citadel marks only sessions it successfully creates; it never adopts an
 existing unmarked session. If the derived name collides with an operator-owned

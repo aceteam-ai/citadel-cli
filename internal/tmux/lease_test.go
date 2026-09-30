@@ -1,21 +1,49 @@
 package tmux
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
 
 func TestSessionLeaseTTLFromEnv(t *testing.T) {
-	t.Setenv(EnvSessionLeaseTTL, "90m")
-	if got := SessionLeaseTTLFromEnv(); got != 90*time.Minute {
-		t.Fatalf("TTL = %v, want 90m", got)
+	tests := []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "unset uses default", value: "", want: DefaultSessionLeaseTTL},
+		{name: "operator override", value: "90m", want: 90 * time.Minute},
+		{name: "minimum", value: "1m", want: time.Minute},
+		{name: "literal zero disables", value: "0", want: 0},
+		{name: "below floor", value: "30s", wantErr: true},
+		{name: "negative", value: "-1m", wantErr: true},
+		{name: "zero duration is not literal zero", value: "0s", wantErr: true},
+		{name: "malformed", value: "invalid", wantErr: true},
 	}
-	t.Setenv(EnvSessionLeaseTTL, "invalid")
-	if got := SessionLeaseTTLFromEnv(); got != DefaultSessionLeaseTTL {
-		t.Fatalf("invalid TTL = %v, want default %v", got, DefaultSessionLeaseTTL)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(EnvSessionLeaseTTL, tc.value)
+			got, err := SessionLeaseTTLFromEnv()
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidSessionLeaseTTL) {
+					t.Fatalf("SessionLeaseTTLFromEnv() error = %v, want ErrInvalidSessionLeaseTTL", err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("SessionLeaseTTLFromEnv() = (%v, %v), want (%v, nil)", got, err, tc.want)
+			}
+		})
 	}
+
 	t.Setenv(EnvSessionLeaseTTL, "0")
-	if got := SessionLeaseDeadline(time.Unix(100, 0), SessionLeaseTTLFromEnv()); !got.IsZero() {
+	ttl, err := SessionLeaseTTLFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := SessionLeaseDeadline(time.Unix(100, 0), ttl); !got.IsZero() {
 		t.Fatalf("disabled deadline = %v, want zero", got)
 	}
 }

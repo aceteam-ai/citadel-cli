@@ -1,7 +1,10 @@
 package tmux
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -9,19 +12,56 @@ import (
 // connections and TMUX_SESSION jobs.
 const EnvSessionLeaseTTL = "CITADEL_TERMINAL_SESSION_TTL"
 
-// SessionLeaseTTLFromEnv resolves EnvSessionLeaseTTL with the same forgiving
-// startup semantics used by the terminal service: unset or malformed values use
-// the seven-day default, while zero explicitly disables expiry.
-func SessionLeaseTTLFromEnv() time.Duration {
-	value := os.Getenv(EnvSessionLeaseTTL)
+// MinimumSessionLeaseTTL is the shortest enabled retention lease. The terminal
+// reaper and TMUX_SESSION job share this floor so neither path can create a
+// lease the other path considers invalid.
+const MinimumSessionLeaseTTL = time.Minute
+
+// ErrInvalidSessionLeaseTTL identifies malformed, negative, or too-short
+// persistent-session retention values.
+var ErrInvalidSessionLeaseTTL = errors.New("persistent session TTL must be 0 (disabled) or at least 1 minute")
+
+// ParseSessionLeaseTTL resolves one operator-provided retention value. Empty
+// means unset and uses the seven-day default. The literal value 0 is the only
+// disable sentinel; every other value must be a valid Go duration at or above
+// MinimumSessionLeaseTTL.
+func ParseSessionLeaseTTL(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
 	if value == "" {
-		return DefaultSessionLeaseTTL
+		return DefaultSessionLeaseTTL, nil
+	}
+	if value == "0" {
+		return 0, nil
 	}
 	ttl, err := time.ParseDuration(value)
 	if err != nil {
-		return DefaultSessionLeaseTTL
+		return 0, fmt.Errorf("%w: parse %q as a Go duration: %v", ErrInvalidSessionLeaseTTL, value, err)
 	}
-	return ttl
+	if err := ValidateSessionLeaseTTL(ttl); err != nil {
+		return 0, err
+	}
+	if ttl == 0 {
+		return 0, fmt.Errorf("%w: use the literal value 0 to disable expiry", ErrInvalidSessionLeaseTTL)
+	}
+	return ttl, nil
+}
+
+// ValidateSessionLeaseTTL enforces the shared duration domain for callers that
+// construct Config values directly rather than parsing EnvSessionLeaseTTL.
+func ValidateSessionLeaseTTL(ttl time.Duration) error {
+	if ttl < 0 || (ttl > 0 && ttl < MinimumSessionLeaseTTL) {
+		return fmt.Errorf("%w: got %s", ErrInvalidSessionLeaseTTL, ttl)
+	}
+	return nil
+}
+
+// SessionLeaseTTLFromEnv parses and validates EnvSessionLeaseTTL.
+func SessionLeaseTTLFromEnv() (time.Duration, error) {
+	ttl, err := ParseSessionLeaseTTL(os.Getenv(EnvSessionLeaseTTL))
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", EnvSessionLeaseTTL, err)
+	}
+	return ttl, nil
 }
 
 // SessionLeaseDeadline converts a TTL into the absolute timestamp stored in
