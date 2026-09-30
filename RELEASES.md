@@ -2789,3 +2789,26 @@ Auto-generated log of every release.
   - fix(worker): require closed input_schema for RUN_JOB_TEMPLATE (#1161 gate) (#1168)
 
 
+---
+
+## v2.176.0 — 2026-09-30
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 88 |
+| Lines added | +7997 |
+
+**Changes:**
+
+  - Add papercraft-scene-render builtin and fix data: URI texture blocklist
+  - feat(ingress): add app credential handoff (#1200)
+  - fix(template): harden render child isolation (#1193)
+  - fix: harden tmux session lifecycle (#1192)
+  - fix(worker): bound template artifact retention and size (#1191)
+  - fix(ingress): harden session and route boundaries (#1197)
+  - test(redisapi): synchronize initial websocket dial (#1196)
+  - fix(podman): qualify service image references (#1190)
+  - fix(services): restore IPv4 vLLM loopback default (#1189)
+
+
