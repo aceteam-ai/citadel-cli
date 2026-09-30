@@ -195,7 +195,7 @@ func loadFile(path string) (*material, error) {
 }
 
 func loadPersisted(nodeConfigDir, authURL, nexusURL string) (*material, error) {
-	r, certs, normalized, err := readPersisted(nodeConfigDir)
+	r, err := readPersistedRecord(nodeConfigDir)
 	if err != nil || r == nil {
 		return nil, err
 	}
@@ -210,6 +210,10 @@ func loadPersisted(nodeConfigDir, authURL, nexusURL string) (*material, error) {
 	if r.AuthOrigin != authOrigin || r.NexusOrigin != nexusOrigin {
 		return nil, nil
 	}
+	certs, normalized, err := parseBundle([]byte(r.PEM), time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("persisted private CA: %w", err)
+	}
 	return &material{pem: normalized, certs: certs, fromStore: true}, nil
 }
 
@@ -218,7 +222,7 @@ func loadPersisted(nodeConfigDir, authURL, nexusURL string) (*material, error) {
 // the complete endpoint pair on a later process even though they have no
 // device credential record carrying APIBaseURL.
 func AuthOriginForNexus(nodeConfigDir, nexusURL string) (string, error) {
-	r, _, _, err := readPersisted(nodeConfigDir)
+	r, err := readPersistedRecord(nodeConfigDir)
 	if err != nil || r == nil {
 		return "", err
 	}
@@ -229,42 +233,50 @@ func AuthOriginForNexus(nodeConfigDir, nexusURL string) (string, error) {
 	return r.AuthOrigin, nil
 }
 
-func readPersisted(nodeConfigDir string) (*record, []*x509.Certificate, []byte, error) {
+// readPersistedRecord validates the durable metadata and PEM fingerprint but
+// deliberately does not validate certificate dates. Endpoint recovery must
+// still work when an expired persisted CA is being replaced by an explicit
+// valid bundle; loadPersisted performs full certificate validation before use.
+func readPersistedRecord(nodeConfigDir string) (*record, error) {
 	path := filepath.Join(nodeConfigDir, "identity", recordFileName)
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return nil, nil, nil, nil
+		return nil, nil
 	}
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("read persisted private CA: %w", err)
+		return nil, fmt.Errorf("read persisted private CA: %w", err)
 	}
 	if len(data) > maxBundleBytes {
-		return nil, nil, nil, fmt.Errorf("persisted private CA record exceeds %d bytes", maxBundleBytes)
+		return nil, fmt.Errorf("persisted private CA record exceeds %d bytes", maxBundleBytes)
 	}
 	var r record
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&r); err != nil {
-		return nil, nil, nil, fmt.Errorf("decode persisted private CA: %w", err)
+		return nil, fmt.Errorf("decode persisted private CA: %w", err)
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return nil, nil, nil, fmt.Errorf("decode persisted private CA: trailing data")
+		return nil, fmt.Errorf("decode persisted private CA: trailing data")
 	}
 	if r.Version != recordVersion {
-		return nil, nil, nil, fmt.Errorf("unsupported persisted private CA version %d", r.Version)
+		return nil, fmt.Errorf("unsupported persisted private CA version %d", r.Version)
 	}
-	if r.AuthOrigin == managedAuthOrigin || r.NexusOrigin == managedNexusOrigin {
-		return nil, nil, nil, fmt.Errorf("persisted private CA targets a managed AceTeam endpoint")
+	authOrigin, err := endpointOrigin(r.AuthOrigin)
+	if err != nil || authOrigin != r.AuthOrigin {
+		return nil, fmt.Errorf("persisted private CA has an invalid auth origin")
+	}
+	nexusOrigin, err := endpointOrigin(r.NexusOrigin)
+	if err != nil || nexusOrigin != r.NexusOrigin {
+		return nil, fmt.Errorf("persisted private CA has an invalid Nexus origin")
+	}
+	if authOrigin == managedAuthOrigin || nexusOrigin == managedNexusOrigin {
+		return nil, fmt.Errorf("persisted private CA targets a managed AceTeam endpoint")
 	}
 	digest := sha256.Sum256([]byte(r.PEM))
 	if !strings.EqualFold(r.SHA256, hex.EncodeToString(digest[:])) {
-		return nil, nil, nil, fmt.Errorf("persisted private CA fingerprint mismatch")
+		return nil, fmt.Errorf("persisted private CA fingerprint mismatch")
 	}
-	certs, normalized, err := parseBundle([]byte(r.PEM), time.Now())
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("persisted private CA: %w", err)
-	}
-	return &r, certs, normalized, nil
+	return &r, nil
 }
 
 func parseBundle(data []byte, now time.Time) ([]*x509.Certificate, []byte, error) {

@@ -44,18 +44,19 @@ func TestPreparePrivateCATrustRecoversAuthOriginWithExplicitCA(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	caPEM := makePrivateCATestCA(t)
+	oldCAPEM := makePrivateCATestCA(t, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+	newCAPEM := makePrivateCATestCA(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
 	caPath := filepath.Join(dir, "tenant-ca.pem")
-	if err := os.WriteFile(caPath, caPEM, 0600); err != nil {
+	if err := os.WriteFile(caPath, newCAPEM, 0600); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(caPEM)
+	digest := sha256.Sum256(oldCAPEM)
 	record := map[string]any{
 		"version":      1,
 		"auth_origin":  "https://web.tenant.test",
 		"nexus_origin": "https://nexus.tenant.test",
 		"sha256":       hex.EncodeToString(digest[:]),
-		"pem":          string(caPEM),
+		"pem":          string(oldCAPEM),
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -80,7 +81,7 @@ func TestPreparePrivateCATrustRecoversAuthOriginWithExplicitCA(t *testing.T) {
 	}
 }
 
-func makePrivateCATestCA(t *testing.T) []byte {
+func makePrivateCATestCA(t *testing.T, notBefore, notAfter time.Time) []byte {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -89,8 +90,8 @@ func makePrivateCATestCA(t *testing.T) []byte {
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "tenant root"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
