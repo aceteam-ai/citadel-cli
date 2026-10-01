@@ -98,9 +98,9 @@ def _valid_turn_token(value: object) -> bool:
         return False
 
 
-# Same 8 provider-key env var names /health already enumerates (see below) --
-# keep this list and that one in sync.
-_SECRET_ENV_NAMES = (
+# Keep provider reporting separate from the callback credential scrub: the
+# gateway key is secret too, but it is not an inference provider.
+_PROVIDER_ENV_NAMES = (
     "OPENROUTER_API_KEY",
     "OPENAI_API_KEY",
     "FIREWORKS_API_KEY",
@@ -110,6 +110,7 @@ _SECRET_ENV_NAMES = (
     "KIMI_API_KEY",
     "MINIMAX_API_KEY",
 )
+_SECRET_ENV_NAMES = (*_PROVIDER_ENV_NAMES, "ACETEAM_GATEWAY_KEY")
 
 
 def _scrub_secrets(text: str) -> str:
@@ -123,10 +124,14 @@ def _scrub_secrets(text: str) -> str:
     providers and risks corrupting legitimate reply content (aceteam#8170
     PR #849 review; citadel#898).
     """
-    for name in _SECRET_ENV_NAMES:
-        value = os.environ.get(name)
-        if value and len(value) >= 8:  # floor avoids redacting trivially-short/incidental values
-            text = text.replace(value, f"[REDACTED_{name}]")
+    secrets = (
+        (name, value)
+        for name in _SECRET_ENV_NAMES
+        if (value := os.environ.get(name)) and len(value) >= 8
+    )
+    # Longer values first so an overlapping shorter value cannot leave a tail.
+    for name, value in sorted(secrets, key=lambda item: len(item[1]), reverse=True):
+        text = text.replace(value, f"[REDACTED_{name}]")
     return text
 
 
@@ -206,7 +211,13 @@ def _post_reply(body: dict, turn_token: str) -> None:
         )
         return
     url = f"{PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply"
-    data = json.dumps({**body, "turnToken": turn_token}).encode("utf-8")
+    # Final callback boundary covers raw output and unexpected exceptions.
+    safe_body = {
+        key: _scrub_secrets(value) if isinstance(value, str) else value
+        for key, value in body.items()
+        if key != "turnToken"
+    }
+    data = json.dumps({**safe_body, "turnToken": turn_token}).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     # Outbound auth is the RAW gateway key -- NOT the hooks_-prefixed inbound token.
@@ -244,7 +255,7 @@ def health():
     confirm without shell access (booleans/labels only -- never the secret
     values). Does not invoke the CLI.
     """
-    provider_keys_set = sorted(name for name in _SECRET_ENV_NAMES if os.environ.get(name))
+    provider_keys_set = sorted(name for name in _PROVIDER_ENV_NAMES if os.environ.get(name))
     return {
         "status": "ok",
         "instance_id": INSTANCE_ID or None,

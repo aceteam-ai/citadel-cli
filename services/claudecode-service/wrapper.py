@@ -187,12 +187,14 @@ def _run_claude_turn(message: str) -> str:
     if isinstance(payload, dict):
         if payload.get("is_error"):
             raise RuntimeError(
-                f"Claude Code reported an error: {payload.get('result') or payload}"
+                "Claude Code reported an error: "
+                f"{_scrub_secrets(str(payload.get('result') or payload))}"
             )
         for key in ("result", "text", "response"):
             val = payload.get(key)
             if isinstance(val, str) and val:
-                return val
+                # JSON escaping can hide a credential from the stream scrub.
+                return _scrub_secrets(val)
     # Fell through -- return the serialized payload rather than losing the turn.
     return stdout
 
@@ -210,7 +212,14 @@ def _post_reply(body: dict, turn_token: str) -> None:
         )
         return
     url = f"{PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply"
-    data = json.dumps({**body, "turnToken": turn_token}).encode("utf-8")
+    # Final callback boundary: also covers unexpected exceptions and future
+    # callers that supply text without passing through the CLI stream scrub.
+    safe_body = {
+        key: _scrub_secrets(value) if isinstance(value, str) else value
+        for key, value in body.items()
+        if key != "turnToken"
+    }
+    data = json.dumps({**safe_body, "turnToken": turn_token}).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     # Outbound auth is the RAW gateway key -- NOT the hooks_-prefixed inbound token.

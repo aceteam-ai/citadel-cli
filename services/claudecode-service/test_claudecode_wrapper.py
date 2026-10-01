@@ -21,6 +21,11 @@ def wrapper(monkeypatch):
 
 
 TOKEN = "123e4567-e89b-42d3-a456-426614174000"
+SECRET_NAMES = (
+    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "GOOGLE_API_KEY",
+    "OPENAI_API_KEY", "ACETEAM_GATEWAY_KEY",
+)
 
 
 def record_callback(wrapper, monkeypatch, fail=False):
@@ -48,11 +53,7 @@ def record_callback(wrapper, monkeypatch, fail=False):
     return bodies
 
 
-@pytest.mark.parametrize("secret_name", [
-    "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
-    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "GOOGLE_API_KEY",
-    "OPENAI_API_KEY", "ACETEAM_GATEWAY_KEY",
-])
+@pytest.mark.parametrize("secret_name", SECRET_NAMES)
 def test_failed_stderr_redacts_live_credentials_before_callback_or_log(
     wrapper, monkeypatch, capsys, secret_name
 ):
@@ -154,3 +155,78 @@ def test_overlapping_secrets_and_short_placeholders(wrapper, monkeypatch):
     assert wrapper._scrub_secrets("shared-secret-with-suffix and short") == (
         "[REDACTED_ANTHROPIC_AUTH_TOKEN] and short"
     )
+
+
+@pytest.mark.parametrize("secret_name", SECRET_NAMES)
+@pytest.mark.parametrize("path", ["structured_success", "structured_error", "raw_success", "unexpected"])
+def test_every_credential_stays_out_of_all_callback_paths(
+    wrapper, monkeypatch, capsys, secret_name, path
+):
+    secret = (
+        "gateway-secret-value" if secret_name == "ACETEAM_GATEWAY_KEY"
+        else f"configured-secret-{secret_name.lower()}"
+    )
+    monkeypatch.setenv(secret_name, secret)
+    bodies = record_callback(wrapper, monkeypatch, fail=True)
+    if path.startswith("structured"):
+        # Escape one ASCII character so the raw JSON stream does not contain
+        # the literal secret. Decoding must scrub the newly materialized value.
+        escaped = secret.replace(secret[0], f"\\u{ord(secret[0]):04x}", 1)
+        stdout = (
+            '{"is_error":true,"result":"provider rejected ' + escaped + '"}'
+            if path == "structured_error"
+            else '{"result":"answer with ' + escaped + '"}'
+        )
+        proc = SimpleNamespace(returncode=0, stderr="", stdout=stdout)
+        monkeypatch.setattr(wrapper.subprocess, "run", lambda *args, **kwargs: proc)
+    elif path == "raw_success":
+        proc = SimpleNamespace(returncode=0, stderr="", stdout=f"answer with {secret}")
+        monkeypatch.setattr(wrapper.subprocess, "run", lambda *args, **kwargs: proc)
+    else:
+        def fail(*args, **kwargs):
+            raise OSError(f"failed to start Claude with {secret}")
+        monkeypatch.setattr(wrapper.subprocess, "run", fail)
+
+    if path == "structured_success":
+        assert wrapper._run_claude_turn("hello") == (
+            f"answer with [REDACTED_{secret_name}]"
+        )
+    wrapper._process_turn("hello", TOKEN)
+
+    assert len(bodies) == 1
+    assert bodies[0]["turnToken"] == TOKEN
+    assert secret not in json.dumps(bodies)
+    expected = f"[REDACTED_{secret_name}]"
+    if path in ("structured_success", "raw_success"):
+        assert bodies[0]["reply"] == f"answer with {expected}"
+    elif path == "structured_error":
+        assert bodies[0]["error"] == f"Claude Code reported an error: provider rejected {expected}"
+    else:
+        assert bodies[0]["error"] == f"failed to start Claude with {expected}"
+    diagnostics = capsys.readouterr().err
+    assert "reply POST failed" in diagnostics
+    assert secret not in diagnostics
+    assert TOKEN not in diagnostics
+
+
+@pytest.mark.parametrize("secret_name", SECRET_NAMES)
+def test_callback_boundary_scrubs_direct_success_and_error(
+    wrapper, monkeypatch, capsys, secret_name
+):
+    secret = (
+        "gateway-secret-value" if secret_name == "ACETEAM_GATEWAY_KEY"
+        else f"configured-secret-{secret_name.lower()}"
+    )
+    monkeypatch.setenv(secret_name, secret)
+    bodies = record_callback(wrapper, monkeypatch, fail=True)
+    wrapper._post_reply({"reply": f"answer with {secret}"}, TOKEN)
+    wrapper._post_reply({"error": f"retry after {secret}"}, TOKEN)
+
+    assert bodies == [
+        {"reply": f"answer with [REDACTED_{secret_name}]", "turnToken": TOKEN},
+        {"error": f"retry after [REDACTED_{secret_name}]", "turnToken": TOKEN},
+    ]
+    diagnostics = capsys.readouterr().err
+    assert diagnostics.count("reply POST failed") == 2
+    assert secret not in diagnostics
+    assert TOKEN not in diagnostics
