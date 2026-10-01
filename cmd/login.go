@@ -152,6 +152,14 @@ func runInteractiveLogin() {
 	// so the serving identity stays the display hostname exactly as before.
 	var servingNodeUID string
 
+	// credsPersisted is true once a device-auth login has saved fabric
+	// credentials (a device API token or a direct-Redis URL) to disk. When set,
+	// a subsequent mesh-connect failure is non-fatal: the node is already
+	// enrolled and can serve fabric jobs over direct-Redis without the mesh
+	// (the self-host / single-box tenant shape, where headscale connectivity
+	// may be unavailable). See the network.Connect error handling below.
+	var credsPersisted bool
+
 	switch choice {
 	case nexus.NetChoiceVerified:
 		// The GetNetworkChoice function already printed a success message.
@@ -199,10 +207,14 @@ func runInteractiveLogin() {
 		if authResult.Token.DeviceAPIToken != "" {
 			if err := saveDeviceConfigToFile(authResult.Token); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save device config: %v\n", err)
+			} else {
+				credsPersisted = true
 			}
 		} else if authResult.Token.RedisURL != "" {
 			if err := saveRedisURLToConfig(authResult.Token.RedisURL); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
+			} else {
+				credsPersisted = true
 			}
 		}
 
@@ -291,6 +303,26 @@ func runInteractiveLogin() {
 
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
+		// A device-auth enrollment that already persisted fabric credentials
+		// must not be reported as a total failure just because the mesh
+		// (headscale) connection could not be established. Such a node can
+		// still serve fabric jobs over direct-Redis, which is the self-host /
+		// single-box tenant shape where mesh connectivity is often
+		// unavailable. Keep the saved credentials, finish enrollment with a
+		// clear warning, and let the worker keep retrying the mesh on its own.
+		// An authkey-only login (no persisted fabric creds) still fails hard,
+		// since the mesh connection is the entire point of that path.
+		if credsPersisted {
+			spinner.StopWithError(fmt.Sprintf("Mesh connection failed: %v", err))
+			persistNexusURLBestEffort(nexusURL)
+			if _, serr := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), choice == nexus.NetChoiceDevice); serr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not persist session mode: %v\n", serr)
+			}
+			fmt.Fprintln(os.Stderr, "\n⚠️  Enrolled, but could not join the mesh network.")
+			fmt.Fprintln(os.Stderr, "   Device credentials are saved; this node can serve fabric jobs over direct-Redis.")
+			fmt.Fprintln(os.Stderr, "   The worker re-establishes its own connection and keeps retrying the mesh.")
+			return
+		}
 		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
 		os.Exit(1)
 	}
