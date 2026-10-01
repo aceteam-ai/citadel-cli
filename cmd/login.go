@@ -31,6 +31,7 @@ const (
 )
 
 type loginNetworkChoiceFn func(string) (nexus.NetworkChoice, string, error)
+type loginConnectFn func() (*network.NetworkServer, error)
 
 func validateLoginOptions(authkey string, newDevice bool) error {
 	if authkey != "" && newDevice {
@@ -48,6 +49,19 @@ func selectLoginNetworkChoice(newDevice bool, choose loginNetworkChoiceFn) (nexu
 		return nexus.NetChoiceDevice, "", nil
 	}
 	return choose("")
+}
+
+// connectLoginNetwork retires the prior mesh identity before connecting with
+// the newly issued authkey. A force-new login must not start tsnet if that
+// retirement failed: tsnet could otherwise reuse tailscaled.state and silently
+// reconnect the mapping the operator explicitly asked to replace. Legacy login
+// keeps its existing best-effort logout behavior.
+func connectLoginNetwork(newDevice bool, logout func() error, connect loginConnectFn) (*network.NetworkServer, bool, error) {
+	if err := logout(); err != nil && newDevice {
+		return nil, false, fmt.Errorf("retire existing network identity: %w", err)
+	}
+	srv, err := connect()
+	return srv, true, err
 }
 
 // canKeepFabricEnrollmentWithoutMesh is deliberately narrow: only a
@@ -374,9 +388,6 @@ func runInteractiveLogin() {
 		}
 	}
 
-	// Disconnect any existing connection first
-	_ = network.Logout()
-
 	// Connect using tsnet with animated spinner
 	spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)
 	spinner.Start()
@@ -390,7 +401,13 @@ func runInteractiveLogin() {
 		AuthKey:    authKey,
 	}
 
-	srv, err := network.Connect(ctx, config)
+	srv, connectAttempted, err := connectLoginNetwork(loginNewDevice, network.Logout, func() (*network.NetworkServer, error) {
+		return network.Connect(ctx, config)
+	})
+	if !connectAttempted {
+		spinner.StopWithError(fmt.Sprintf("Failed to replace existing network identity: %v", err))
+		os.Exit(1)
+	}
 	if err != nil {
 		// A device-auth enrollment with independently persisted fabric
 		// credentials need not be discarded just because its mesh connection

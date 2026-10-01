@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 )
@@ -109,6 +110,43 @@ func TestValidateLoginOptions(t *testing.T) {
 	}
 	if err := validateLoginOptions("key", true); err == nil {
 		t.Fatal("--authkey with --new-device was accepted")
+	}
+}
+
+func TestConnectLoginNetworkNewDeviceStopsOnStateRetirementFailure(t *testing.T) {
+	connectCalled := false
+	srv, attempted, err := connectLoginNetwork(
+		true,
+		func() error { return errors.New("state retirement failed") },
+		func() (*network.NetworkServer, error) {
+			connectCalled = true
+			return &network.NetworkServer{}, nil
+		},
+	)
+	if err == nil {
+		t.Fatal("state retirement failure was ignored")
+	}
+	if attempted || connectCalled || srv != nil {
+		t.Fatalf("attempted=%v connectCalled=%v srv=%v; want no connect attempt", attempted, connectCalled, srv)
+	}
+}
+
+func TestConnectLoginNetworkDefaultKeepsBestEffortLogout(t *testing.T) {
+	want := &network.NetworkServer{}
+	connectCalled := false
+	srv, attempted, err := connectLoginNetwork(
+		false,
+		func() error { return errors.New("legacy logout failure") },
+		func() (*network.NetworkServer, error) {
+			connectCalled = true
+			return want, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !attempted || !connectCalled || srv != want {
+		t.Fatalf("attempted=%v connectCalled=%v srv=%p; want connect result %p", attempted, connectCalled, srv, want)
 	}
 }
 
