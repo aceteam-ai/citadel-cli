@@ -2812,3 +2812,19 @@ Auto-generated log of every release.
   - fix(services): restore IPv4 vLLM loopback default (#1189)
 
 
+---
+
+## v2.177.0 — 2026-09-30
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 18 |
+| Lines added | +1356 |
+
+**Changes:**
+
+  - Fix Chromium SingletonSocket path too long in papercraft render
+  - feat(auth): trust self-hosted private CAs (#1204)
+
+
