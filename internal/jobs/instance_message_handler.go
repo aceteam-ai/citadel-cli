@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/google/uuid"
 )
 
 // InstanceMessageHandler resolves a running BYOC instance's published loopback
@@ -103,6 +104,7 @@ type instanceMessageResult struct {
 //   - message : the turn text to deliver
 //   - name    : the message name/label (e.g. "Kickoff" / "Coordination")
 //   - bearer  : the fully-derived /hooks/agent bearer ("hooks_<gateway_key>")
+//   - turnToken : canonical UUID per-turn callback token supplied by the platform
 //
 // Fail-closed: if the service is not a known running instance in THIS node's
 // store, the turn is rejected rather than delivered to some other container.
@@ -118,6 +120,13 @@ func (h *InstanceMessageHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	bearer := job.Payload["bearer"]
 	if bearer == "" {
 		return nil, errors.New("job payload missing 'bearer' field")
+	}
+	turnToken := job.Payload["turnToken"]
+	parsedToken, tokenErr := uuid.Parse(turnToken)
+	if tokenErr != nil || parsedToken.String() != turnToken ||
+		parsedToken.Variant() != uuid.RFC4122 ||
+		parsedToken.Version() < 1 || parsedToken.Version() > 8 {
+		return nil, errors.New("job payload invalid turn token")
 	}
 	name := job.Payload["name"]
 	if name == "" {
@@ -141,7 +150,7 @@ func (h *InstanceMessageHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	url := hooksAgentURL(h.baseURL(rec.HostPort))
 	ctx.Log("info", "     - [Job %s] Delivering turn to instance %s at %s", job.ID, service, url)
 
-	body, err := json.Marshal(map[string]string{"message": message, "name": name})
+	body, err := json.Marshal(map[string]string{"message": message, "name": name, "turnToken": turnToken})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal turn body: %w", err)
 	}

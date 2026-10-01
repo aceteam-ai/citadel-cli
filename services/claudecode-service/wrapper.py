@@ -6,12 +6,12 @@ The model is pointed at the AceTeam fabric proxy (an Anthropic-compatible
 endpoint) via the ANTHROPIC_* env, so a full turn runs with NO external Anthropic
 API key -- the "agent AND model on your own metal" story that Fly cannot match.
 
-Contract (pinned by the routing-seam PR #4593 -- do NOT change it):
+Contract (routing seam PR #4593, extended with turnToken by citadel-cli#1212):
 
   Inbound (platform -> this container):
     POST /hooks/agent
     Authorization: Bearer hooks_{GATEWAY_KEY}
-    { "message": "<user text>", "name": "<label>" }
+    { "message": "<user text>", "name": "<label>", "turnToken": "<canonical UUID>" }
   We validate the bearer token equals "hooks_" + the container's gateway key,
   then ACK FAST with 200 {"delivered": true} and process the turn on a
   background thread (the caller expects a quick delivery ack, not a blocking
@@ -20,8 +20,8 @@ Contract (pinned by the routing-seam PR #4593 -- do NOT change it):
   Outbound (this container -> platform), when the turn finishes:
     POST {PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply
     Authorization: Bearer {GATEWAY_KEY}          # RAW key, NOT hooks_-prefixed
-    { "reply": "<assistant text>" }              # on success
-    { "error": "<user-facing message>" }         # on terminal failure
+    { "reply": "<assistant text>", "turnToken": "<same token>" }  # success
+    { "error": "<user-facing message>", "turnToken": "<same token>" }  # failure
   Expect 200 {"accepted": true}.
 
 Everything is driven by env (no secrets baked into the image); see the compose
@@ -36,6 +36,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
@@ -70,10 +71,52 @@ CLAUDE_STATE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", "/home/claude/.claude")
 
 app = FastAPI(title="citadel-claudecode-runtime")
 
+# Credentials the Claude CLI can inherit from this wrapper's environment. Keep
+# gateway auth here too: a CLI error can echo any inherited value. Match live
+# values literally, as in the Hermes wrapper, rather than guessing key shapes.
+_SECRET_ENV_NAMES = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_API_KEY",
+    "OPENAI_API_KEY",
+    "ACETEAM_GATEWAY_KEY",
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Replace configured credential values before CLI output becomes public."""
+    secrets = (
+        (name, value)
+        for name in _SECRET_ENV_NAMES
+        if (value := os.environ.get(name)) and len(value) >= 8
+    )
+    # Longer values first so an overlapping shorter value cannot leave a tail.
+    for name, value in sorted(secrets, key=lambda item: len(item[1]), reverse=True):
+        text = text.replace(value, f"[REDACTED_{name}]")
+    return text
+
 
 def _expected_inbound_bearer() -> str:
     """The inbound Authorization value the platform must present."""
     return f"hooks_{GATEWAY_KEY}"
+
+
+def _valid_turn_token(value: object) -> bool:
+    """Accept only the canonical UUID string used by the reply API."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+        return (
+            str(parsed) == value
+            and parsed.variant == uuid.RFC_4122
+            and parsed.version in range(1, 9)
+        )
+    except ValueError:
+        return False
 
 
 def _run_claude_turn(message: str) -> str:
@@ -115,14 +158,20 @@ def _run_claude_turn(message: str) -> str:
             f"Claude Code turn timed out after {TURN_TIMEOUT_SECONDS}s"
         )
 
+    # Both streams can become callback content, including JSON error envelopes.
+    # Scrub before choosing a stream or truncating it; truncation could split a
+    # credential and make a later literal match ineffective.
+    stdout_text = _scrub_secrets(proc.stdout or "")
+    stderr_text = _scrub_secrets(proc.stderr or "")
+
     if proc.returncode != 0:
         # Surface the tail of stderr so the terminal error is actionable, but
         # keep it short -- it goes to a user-facing chat.
-        err = (proc.stderr or proc.stdout or "").strip()
+        err = (stderr_text or stdout_text).strip()
         tail = err[-800:] if err else "(no output)"
         raise RuntimeError(f"Claude Code exited {proc.returncode}: {tail}")
 
-    stdout = (proc.stdout or "").strip()
+    stdout = stdout_text.strip()
     if not stdout:
         raise RuntimeError("Claude Code produced no output")
 
@@ -138,18 +187,23 @@ def _run_claude_turn(message: str) -> str:
     if isinstance(payload, dict):
         if payload.get("is_error"):
             raise RuntimeError(
-                f"Claude Code reported an error: {payload.get('result') or payload}"
+                "Claude Code reported an error: "
+                f"{_scrub_secrets(str(payload.get('result') or payload))}"
             )
         for key in ("result", "text", "response"):
             val = payload.get(key)
             if isinstance(val, str) and val:
-                return val
+                # JSON escaping can hide a credential from the stream scrub.
+                return _scrub_secrets(val)
     # Fell through -- return the serialized payload rather than losing the turn.
     return stdout
 
 
-def _post_reply(body: dict) -> None:
+def _post_reply(body: dict, turn_token: str) -> None:
     """POST the outbound reply/error to the platform callback (best-effort)."""
+    if not _valid_turn_token(turn_token):
+        print("claudecode: invalid turn token; cannot post reply", file=sys.stderr, flush=True)
+        return
     if not PLATFORM_URL or not INSTANCE_ID:
         print(
             "claudecode: PLATFORM_URL/INSTANCE_ID unset; cannot post reply",
@@ -158,7 +212,14 @@ def _post_reply(body: dict) -> None:
         )
         return
     url = f"{PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply"
-    data = json.dumps(body).encode("utf-8")
+    # Final callback boundary: also covers unexpected exceptions and future
+    # callers that supply text without passing through the CLI stream scrub.
+    safe_body = {
+        key: _scrub_secrets(value) if isinstance(value, str) else value
+        for key, value in body.items()
+        if key != "turnToken"
+    }
+    data = json.dumps({**safe_body, "turnToken": turn_token}).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     # Outbound auth is the RAW gateway key -- NOT the hooks_-prefixed inbound token.
@@ -168,21 +229,24 @@ def _post_reply(body: dict) -> None:
             resp.read()
     except urllib.error.HTTPError as exc:
         print(
-            f"claudecode: reply POST to {url} failed: {exc.code} {exc.reason}",
+            f"claudecode: reply POST failed with status {exc.code}",
             file=sys.stderr,
             flush=True,
         )
-    except Exception as exc:  # network error, DNS, etc.
-        print(f"claudecode: reply POST to {url} failed: {exc}", file=sys.stderr, flush=True)
+    except Exception:  # network error, DNS, etc.
+        print("claudecode: reply POST failed", file=sys.stderr, flush=True)
 
 
-def _process_turn(message: str) -> None:
+def _process_turn(message: str, turn_token: str) -> None:
     """Background worker: run the turn, then post reply or error."""
+    if not _valid_turn_token(turn_token):
+        print("claudecode: invalid turn token; cannot run turn", file=sys.stderr, flush=True)
+        return
     try:
         reply = _run_claude_turn(message)
-        _post_reply({"reply": reply})
+        _post_reply({"reply": reply}, turn_token)
     except Exception as exc:  # any terminal failure -> user-facing {error}
-        _post_reply({"error": str(exc)})
+        _post_reply({"error": _scrub_secrets(str(exc))}, turn_token)
 
 
 @app.get("/health")
@@ -225,11 +289,14 @@ async def hooks_agent(request: Request, authorization: str = Header(default=""))
     message = body.get("message") if isinstance(body, dict) else None
     if not isinstance(message, str) or not message:
         raise HTTPException(status_code=400, detail="missing 'message'")
+    turn_token = body.get("turnToken")
+    if not _valid_turn_token(turn_token):
+        raise HTTPException(status_code=400, detail="invalid turn token")
 
     # ACK FAST: hand the (blocking) model turn to a background thread so the
     # inbound request returns a delivery ack immediately. daemon=True so a
     # container stop never hangs on an in-flight turn.
-    threading.Thread(target=_process_turn, args=(message,), daemon=True).start()
+    threading.Thread(target=_process_turn, args=(message, turn_token), daemon=True).start()
 
     return {"delivered": True}
 

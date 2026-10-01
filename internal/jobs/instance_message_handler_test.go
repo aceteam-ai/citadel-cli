@@ -14,6 +14,11 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
+const (
+	messageTokenA = "123e4567-e89b-42d3-a456-426614174000"
+	messageTokenB = "123e4567-e89b-42d3-a456-426614174001"
+)
+
 func newMessageTestStore(t *testing.T) *instanceStore {
 	t.Helper()
 	return &instanceStore{path: filepath.Join(t.TempDir(), "instances", "state.json")}
@@ -24,7 +29,7 @@ func newMessageJob(payload map[string]string) *nexus.Job {
 }
 
 // TestInstanceMessage_DeliversToResolvedPort verifies the handler resolves the
-// host port from the store and POSTs {message,name} with the bearer to
+// host port from the store and POSTs {message,name,turnToken} with the bearer to
 // <base>/hooks/agent.
 func TestInstanceMessage_DeliversToResolvedPort(t *testing.T) {
 	var gotPath, gotAuth, gotContentType string
@@ -54,10 +59,11 @@ func TestInstanceMessage_DeliversToResolvedPort(t *testing.T) {
 	}
 
 	out, err := h.Execute(JobContext{}, newMessageJob(map[string]string{
-		"service": "ac-abc",
-		"message": "hello there",
-		"name":    "Kickoff",
-		"bearer":  "hooks_gw_key_123",
+		"service":   "ac-abc",
+		"message":   "hello there",
+		"name":      "Kickoff",
+		"bearer":    "hooks_gw_key_123",
+		"turnToken": messageTokenA,
 	}))
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -77,6 +83,9 @@ func TestInstanceMessage_DeliversToResolvedPort(t *testing.T) {
 	}
 	if gotBody["message"] != "hello there" || gotBody["name"] != "Kickoff" {
 		t.Errorf("body = %+v, want message=hello there name=Kickoff", gotBody)
+	}
+	if gotBody["turnToken"] != messageTokenA {
+		t.Errorf("turn token = %q, want exact inbound token", gotBody["turnToken"])
 	}
 
 	var res instanceMessageResult
@@ -105,7 +114,7 @@ func TestInstanceMessage_DefaultsName(t *testing.T) {
 	h := &InstanceMessageHandler{instances: store, loopbackBaseURL: func(int) string { return srv.URL }}
 
 	if _, err := h.Execute(JobContext{}, newMessageJob(map[string]string{
-		"service": "ac-abc", "message": "hi", "bearer": "hooks_x",
+		"service": "ac-abc", "message": "hi", "bearer": "hooks_x", "turnToken": messageTokenA,
 	})); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -128,7 +137,7 @@ func TestInstanceMessage_FailsClosedOnUnknownInstance(t *testing.T) {
 	h := &InstanceMessageHandler{instances: store, loopbackBaseURL: func(int) string { return srv.URL }}
 
 	_, err := h.Execute(JobContext{}, newMessageJob(map[string]string{
-		"service": "ac-missing", "message": "hi", "bearer": "hooks_x",
+		"service": "ac-missing", "message": "hi", "bearer": "hooks_x", "turnToken": messageTokenA,
 	}))
 	if err == nil {
 		t.Fatal("expected error for unknown instance, got nil")
@@ -149,9 +158,10 @@ func TestInstanceMessage_MissingFields(t *testing.T) {
 		payload map[string]string
 		want    string
 	}{
-		{"no service", map[string]string{"message": "m", "bearer": "b"}, "service"},
-		{"no message", map[string]string{"service": "ac-x", "bearer": "b"}, "message"},
-		{"no bearer", map[string]string{"service": "ac-x", "message": "m"}, "bearer"},
+		{"no service", map[string]string{"message": "m", "bearer": "b", "turnToken": messageTokenA}, "service"},
+		{"no message", map[string]string{"service": "ac-x", "bearer": "b", "turnToken": messageTokenA}, "message"},
+		{"no bearer", map[string]string{"service": "ac-x", "message": "m", "turnToken": messageTokenA}, "bearer"},
+		{"no turn token", map[string]string{"service": "ac-x", "message": "m", "bearer": "b"}, "turn token"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,6 +170,65 @@ func TestInstanceMessage_MissingFields(t *testing.T) {
 				t.Errorf("err = %v, want mention of %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestInstanceMessage_InvalidTokenDoesNotDeliver(t *testing.T) {
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	store := newMessageTestStore(t)
+	if err := store.Put(InstanceRecord{ServiceName: "ac-abc", InstanceID: "instance-secret", HostPort: 20000}); err != nil {
+		t.Fatal(err)
+	}
+	h := &InstanceMessageHandler{instances: store, loopbackBaseURL: func(int) string { return srv.URL }}
+	for _, token := range []string{"", "sensitive-malformed-token", "123E4567-E89B-42D3-A456-426614174000", "123e4567e89b42d3a456426614174000", "00000000-0000-0000-0000-000000000000", "123e4567-e89b-92d3-a456-426614174000"} {
+		_, err := h.Execute(JobContext{}, newMessageJob(map[string]string{
+			"service": "ac-abc", "message": "sensitive-message", "bearer": "hooks_secret-key", "turnToken": token,
+		}))
+		if err == nil || err.Error() != "job payload invalid turn token" {
+			t.Fatalf("invalid-token diagnostic = %v", err)
+		}
+		for _, secret := range []string{token, "sensitive-message", "hooks_secret-key", "instance-secret"} {
+			if secret != "" && strings.Contains(err.Error(), secret) {
+				t.Fatalf("diagnostic exposed sensitive value: %q", err)
+			}
+		}
+	}
+	if posts != 0 {
+		t.Fatalf("delivered %d tokenless turns", posts)
+	}
+}
+
+func TestInstanceMessage_RetryPreservesEachTurnToken(t *testing.T) {
+	var tokens []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		tokens = append(tokens, body["turnToken"])
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	store := newMessageTestStore(t)
+	if err := store.Put(InstanceRecord{ServiceName: "ac-abc", InstanceID: "same-instance", HostPort: 20000}); err != nil {
+		t.Fatal(err)
+	}
+	h := &InstanceMessageHandler{instances: store, loopbackBaseURL: func(int) string { return srv.URL }}
+	for _, token := range []string{messageTokenA, messageTokenB} {
+		_, err := h.Execute(JobContext{}, newMessageJob(map[string]string{
+			"service": "ac-abc", "message": "hi", "bearer": "hooks_x", "turnToken": token,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(tokens) != 2 || tokens[0] != messageTokenA || tokens[1] != messageTokenB {
+		t.Fatalf("delivered tokens = %v", tokens)
 	}
 }
 
@@ -176,7 +245,7 @@ func TestInstanceMessage_PropagatesHooks4xx(t *testing.T) {
 	h := &InstanceMessageHandler{instances: store, loopbackBaseURL: func(int) string { return srv.URL }}
 
 	_, err := h.Execute(JobContext{}, newMessageJob(map[string]string{
-		"service": "ac-abc", "message": "hi", "bearer": "hooks_x",
+		"service": "ac-abc", "message": "hi", "bearer": "hooks_x", "turnToken": messageTokenA,
 	}))
 	if err == nil || !strings.Contains(err.Error(), "401") {
 		t.Errorf("err = %v, want status 401 surfaced", err)
