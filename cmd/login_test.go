@@ -38,6 +38,31 @@ func TestCanKeepFabricEnrollmentWithoutMesh(t *testing.T) {
 	}
 }
 
+func TestLoginNewDeviceFlag(t *testing.T) {
+	flag := loginCmd.Flags().Lookup("new-device")
+	if flag == nil {
+		t.Fatal("--new-device flag not found")
+	}
+	if flag.DefValue != "false" {
+		t.Fatalf("--new-device default = %q, want false", flag.DefValue)
+	}
+	if flag.Usage == "" {
+		t.Fatal("--new-device flag should have a usage description")
+	}
+
+	old := loginNewDevice
+	t.Cleanup(func() {
+		loginNewDevice = old
+		_ = flag.Value.Set("false")
+	})
+	if err := flag.Value.Set("true"); err != nil {
+		t.Fatalf("set --new-device: %v", err)
+	}
+	if !loginNewDevice {
+		t.Fatal("--new-device did not bind the login device-auth force-new option")
+	}
+}
+
 func TestPersistedFabricCredentialsTransportName(t *testing.T) {
 	if got := fabricCredentialsAPI.transportName(); got != "the fabric API" {
 		t.Fatalf("API transport name = %q", got)

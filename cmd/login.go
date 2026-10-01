@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	loginAuthkey  string
-	loginNodeName string
+	loginAuthkey   string
+	loginNodeName  string
+	loginNewDevice bool
 )
 
 type persistedFabricCredentials uint8
@@ -253,7 +254,7 @@ func runInteractiveLogin() {
 		}
 
 		// Device authorization flow (carries the CSR when we have one)
-		authResult, err := runDeviceAuthFlowWithCSR(authServiceURL, false, csrPEM)
+		authResult, err := runDeviceAuthFlowWithCSR(authServiceURL, loginNewDevice, csrPEM)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			if nexus.IsNetworkError(err) {
@@ -426,4 +427,5 @@ func init() {
 	rootCmd.AddCommand(loginCmd)
 	loginCmd.Flags().StringVar(&loginAuthkey, "authkey", "", "Pre-generated authkey for non-interactive login")
 	loginCmd.Flags().StringVar(&loginNodeName, "node-name", "", "Override the node name (defaults to hostname)")
+	loginCmd.Flags().BoolVar(&loginNewDevice, "new-device", false, "Force fresh registration, ignoring any existing machine mapping")
 }
