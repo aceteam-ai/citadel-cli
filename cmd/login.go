@@ -30,6 +30,26 @@ const (
 	fabricCredentialsRedis
 )
 
+type loginNetworkChoiceFn func(string) (nexus.NetworkChoice, string, error)
+
+func validateLoginOptions(authkey string, newDevice bool) error {
+	if authkey != "" && newDevice {
+		return fmt.Errorf("--authkey and --new-device cannot be used together")
+	}
+	return nil
+}
+
+// selectLoginNetworkChoice makes --new-device authoritative. In particular,
+// do not let a healthy/stale existing mesh short-circuit the explicit request
+// before device authorization can send force_new to the auth service. The old
+// mesh state is left untouched until the ordinary post-authorization path.
+func selectLoginNetworkChoice(newDevice bool, choose loginNetworkChoiceFn) (nexus.NetworkChoice, string, error) {
+	if newDevice {
+		return nexus.NetChoiceDevice, "", nil
+	}
+	return choose("")
+}
+
 // canKeepFabricEnrollmentWithoutMesh is deliberately narrow: only a
 // self-hosted interactive device grant can enroll the fabric side independently
 // of the mesh, and only after one of its fabric credential writes succeeded.
@@ -102,6 +122,11 @@ Use --authkey for non-interactive authentication (ideal for automation).`,
   # Override the node name
   citadel login --authkey tskey-auth-xxx --node-name my-gpu-server`,
 	Run: func(cmd *cobra.Command, args []string) {
+		if err := validateLoginOptions(loginAuthkey, loginNewDevice); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+
 		// Refuse an explicit --nexus that differs from the control plane this
 		// node is already enrolled against (citadel-cli#1110).
 		if err := refuseNexusFlagMismatch(cmd); err != nil {
@@ -204,7 +229,7 @@ func runNonInteractiveLogin() {
 
 // runInteractiveLogin handles the interactive login flow
 func runInteractiveLogin() {
-	choice, key, err := nexus.GetNetworkChoice("")
+	choice, key, err := selectLoginNetworkChoice(loginNewDevice, nexus.GetNetworkChoice)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
 		os.Exit(1)

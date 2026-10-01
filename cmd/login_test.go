@@ -63,6 +63,55 @@ func TestLoginNewDeviceFlag(t *testing.T) {
 	}
 }
 
+func TestSelectLoginNetworkChoiceNewDeviceBypassesExistingState(t *testing.T) {
+	called := false
+	choice, key, err := selectLoginNetworkChoice(true, func(string) (nexus.NetworkChoice, string, error) {
+		called = true
+		return nexus.NetChoiceVerified, "stale", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("--new-device consulted existing network state")
+	}
+	if choice != nexus.NetChoiceDevice || key != "" {
+		t.Fatalf("choice, key = %q, %q; want device auth with no key", choice, key)
+	}
+}
+
+func TestSelectLoginNetworkChoiceDefaultDelegates(t *testing.T) {
+	called := false
+	choice, key, err := selectLoginNetworkChoice(false, func(authkey string) (nexus.NetworkChoice, string, error) {
+		called = true
+		if authkey != "" {
+			t.Fatalf("authkey = %q, want empty", authkey)
+		}
+		return nexus.NetChoiceVerified, "", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called || choice != nexus.NetChoiceVerified || key != "" {
+		t.Fatalf("called, choice, key = %v, %q, %q", called, choice, key)
+	}
+}
+
+func TestValidateLoginOptions(t *testing.T) {
+	if err := validateLoginOptions("", false); err != nil {
+		t.Fatalf("default options: %v", err)
+	}
+	if err := validateLoginOptions("", true); err != nil {
+		t.Fatalf("new-device only: %v", err)
+	}
+	if err := validateLoginOptions("key", false); err != nil {
+		t.Fatalf("authkey only: %v", err)
+	}
+	if err := validateLoginOptions("key", true); err == nil {
+		t.Fatal("--authkey with --new-device was accepted")
+	}
+}
+
 func TestPersistedFabricCredentialsTransportName(t *testing.T) {
 	if got := fabricCredentialsAPI.transportName(); got != "the fabric API" {
 		t.Fatalf("API transport name = %q", got)
