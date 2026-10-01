@@ -11,7 +11,7 @@ Contract (routing seam PR #4593, extended with turnToken by citadel-cli#1212):
   Inbound (platform -> this container):
     POST /hooks/agent
     Authorization: Bearer hooks_{GATEWAY_KEY}
-    { "message": "<user text>", "name": "<label>", "turnToken": "<opaque token>" }
+    { "message": "<user text>", "name": "<label>", "turnToken": "<canonical UUID>" }
   We validate the bearer token equals "hooks_" + the container's gateway key,
   then ACK FAST with 200 {"delivered": true} and process the turn on a
   background thread (the caller expects a quick delivery ack, not a blocking
@@ -36,6 +36,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
@@ -74,6 +75,21 @@ app = FastAPI(title="citadel-claudecode-runtime")
 def _expected_inbound_bearer() -> str:
     """The inbound Authorization value the platform must present."""
     return f"hooks_{GATEWAY_KEY}"
+
+
+def _valid_turn_token(value: object) -> bool:
+    """Accept only the canonical UUID string used by the reply API."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+        return (
+            str(parsed) == value
+            and parsed.variant == uuid.RFC_4122
+            and parsed.version in range(1, 9)
+        )
+    except ValueError:
+        return False
 
 
 def _run_claude_turn(message: str) -> str:
@@ -150,8 +166,8 @@ def _run_claude_turn(message: str) -> str:
 
 def _post_reply(body: dict, turn_token: str) -> None:
     """POST the outbound reply/error to the platform callback (best-effort)."""
-    if not isinstance(turn_token, str) or not turn_token:
-        print("claudecode: missing turn token; cannot post reply", file=sys.stderr, flush=True)
+    if not _valid_turn_token(turn_token):
+        print("claudecode: invalid turn token; cannot post reply", file=sys.stderr, flush=True)
         return
     if not PLATFORM_URL or not INSTANCE_ID:
         print(
@@ -181,6 +197,9 @@ def _post_reply(body: dict, turn_token: str) -> None:
 
 def _process_turn(message: str, turn_token: str) -> None:
     """Background worker: run the turn, then post reply or error."""
+    if not _valid_turn_token(turn_token):
+        print("claudecode: invalid turn token; cannot run turn", file=sys.stderr, flush=True)
+        return
     try:
         reply = _run_claude_turn(message)
         _post_reply({"reply": reply}, turn_token)
@@ -229,8 +248,8 @@ async def hooks_agent(request: Request, authorization: str = Header(default=""))
     if not isinstance(message, str) or not message:
         raise HTTPException(status_code=400, detail="missing 'message'")
     turn_token = body.get("turnToken")
-    if not isinstance(turn_token, str) or not turn_token:
-        raise HTTPException(status_code=400, detail="missing turn token")
+    if not _valid_turn_token(turn_token):
+        raise HTTPException(status_code=400, detail="invalid turn token")
 
     # ACK FAST: hand the (blocking) model turn to a background thread so the
     # inbound request returns a delivery ack immediately. daemon=True so a

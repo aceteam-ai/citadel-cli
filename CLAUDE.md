@@ -479,11 +479,13 @@ Job handlers registered in `cmd/agent.go:init()` map job types to handler implem
 ### Hosted agent turn callbacks (citadel-cli#1212)
 
 `internal/jobs/instance_message_handler.go` owns the node-side `INSTANCE_MESSAGE`
-delivery to `/hooks/agent`. It requires the platform's opaque `turnToken` and
-passes it unchanged alongside the message. The Claude Code and Hermes runtime
-wrappers keep that token as a per-turn argument through their background thread
-and include it in both success and error `/reply` bodies. A turn without a
-token is rejected before execution or callback. Do not derive a callback token
+delivery to `/hooks/agent`. It requires a canonical UUID `turnToken` from the
+platform and passes it unchanged alongside the message. The Claude Code and
+Hermes runtime wrappers keep that token as a per-turn argument through their
+background thread and include it in both success and error `/reply` bodies. A
+turn without a valid UUID token is rejected before execution or callback. All
+AceTeam BYOC job and non-node kickoff producers must send a UUID token before
+this stricter contract can roll out. Do not derive a callback token
 from instance identity or retain it as mutable instance-level state: retries
 of one instance can finish out of order. The exact token and credentials must
 not appear in diagnostics. `tests/test_hosted_turn_token.py` and

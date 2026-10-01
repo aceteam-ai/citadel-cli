@@ -18,7 +18,7 @@ cannot match.
 
 - Inbound `POST /hooks/agent` with `Authorization: Bearer hooks_{GATEWAY_KEY}`
   and `{"message","name","turnToken"}`. The wrapper validates the bearer and
-  requires the server-provided turn token, then **ACKs fast** with
+  requires a canonical UUID turn token from the server, then **ACKs fast** with
   `200 {"delivered": true}`, and runs the turn on a background thread.
 - The turn shells out to `claude -p "<message>" --output-format json
   --dangerously-skip-permissions`, capturing the assistant text from the JSON

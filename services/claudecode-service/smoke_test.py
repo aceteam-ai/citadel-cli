@@ -38,7 +38,7 @@ IMAGE = "citadel-claudecode-service:smoke"
 CONTAINER = "citadel-claudecode-smoke"
 GATEWAY_KEY = "smoke-gateway-key-123"
 INSTANCE_ID = "inst_smoke_1"
-TURN_TOKEN = "smoke-turn-claudecode"
+TURN_TOKEN = "123e4567-e89b-42d3-a456-426614174010"
 CANNED_REPLY = "Hello from the fabric proxy. 2 plus 2 is 4."
 HOST_PORT = 8299  # ephemeral host port for the wrapper during the test
 
@@ -261,8 +261,31 @@ def main() -> int:
             return 1
         print("PASS: /health is up", flush=True)
 
-        # 4. POST an inbound turn and assert a FAST ack (before the turn finishes).
+        # Invalid tokens must be refused before reaching the model or callback.
         turn_url = f"http://127.0.0.1:{HOST_PORT}/hooks/agent"
+        for bad_token in ("", "private-malformed-token"):
+            invalid = urllib.request.Request(
+                turn_url,
+                data=json.dumps({"message": "private-message", "turnToken": bad_token}).encode(),
+                method="POST",
+            )
+            invalid.add_header("Content-Type", "application/json")
+            invalid.add_header("Authorization", f"Bearer hooks_{GATEWAY_KEY}")
+            try:
+                urllib.request.urlopen(invalid, timeout=5)
+                print("FAIL: invalid turn token was accepted", file=sys.stderr)
+                return 1
+            except urllib.error.HTTPError as exc:
+                if exc.code != 400 or json.loads(exc.read()).get("detail") != "invalid turn token":
+                    print("FAIL: invalid turn token returned the wrong diagnostic", file=sys.stderr)
+                    return 1
+        with observed_lock:
+            if observed["proxy_hits"] or observed["reply_body"] is not None:
+                print("FAIL: invalid token reached the model or callback", file=sys.stderr)
+                return 1
+        print("PASS: invalid tokens rejected before model and callback", flush=True)
+
+        # 4. POST an inbound turn and assert a FAST ack (before the turn finishes).
         req = urllib.request.Request(
             turn_url,
             data=json.dumps({"message": "what is 2+2?", "name": "smoke", "turnToken": TURN_TOKEN}).encode(),

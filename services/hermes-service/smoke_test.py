@@ -47,7 +47,7 @@ IMAGE = "citadel-hermes-service:smoke"
 CONTAINER = "citadel-hermes-smoke"
 GATEWAY_KEY = "smoke-gateway-key-456"
 INSTANCE_ID = "inst_smoke_hermes_1"
-TURN_TOKEN = "smoke-turn-hermes"
+TURN_TOKEN = "123e4567-e89b-42d3-a456-426614174011"
 HOST_PORT = 8298  # ephemeral host port for the wrapper during the test
 
 SERVICE_DIR = Path(__file__).resolve().parent
@@ -196,6 +196,19 @@ def main() -> int:
                 "health: provider_keys_configured should be empty in this smoke test "
                 f"(got {health.get('provider_keys_configured')!r})"
             )
+
+        print("=== Rejecting invalid turn tokens ===", flush=True)
+        for bad_token in ("", "private-malformed-token"):
+            code, body = http_post_json(
+                f"http://localhost:{HOST_PORT}/hooks/agent",
+                {"message": "private-message", "turnToken": bad_token},
+                headers={"Authorization": f"Bearer hooks_{GATEWAY_KEY}"},
+            )
+            if code != 400 or body.get("detail") != "invalid turn token":
+                failures.append("invalid turn token returned the wrong diagnostic")
+        with observed_lock:
+            if observed["reply_body"] is not None:
+                failures.append("invalid turn token reached the callback")
 
         print("=== POST /hooks/agent (fast-ack check) ===", flush=True)
         t0 = time.monotonic()
