@@ -1256,7 +1256,10 @@ func verifyConfigPersisted(configFile, expectedToken string) error {
 // saveRedisURLToConfig saves the Redis URL to the machine-convergent node
 // config file (see saveDeviceConfigToFile's doc comment -- same #845 reasoning).
 // Deprecated: use saveDeviceConfigToFile instead.
-// This is called after device auth to store the org-specific Redis endpoint.
+// This is called after a Redis-only device grant to store the org-specific
+// endpoint. The write is a transport transition: any API-mode identity from a
+// prior enrollment must be removed, otherwise runWork will prefer the stale
+// device_api_token and silently ignore this newly issued Redis URL.
 func saveRedisURLToConfig(redisURL string) error {
 	globalConfigDir := nodeConfigDirFn()
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
@@ -1282,8 +1285,18 @@ func saveRedisURLToConfig(redisURL string) error {
 	// Seed-on-first-write (citadel-cli#845): see seedAceteamAPIKeyFromLegacyFile.
 	seedAceteamAPIKeyFromLegacyFile(config, filepath.Join(platform.ConfigDir(), "config.yaml"))
 
-	// Add Redis URL
+	// Switch atomically to direct-Redis mode. Preserve unrelated operator-owned
+	// settings (notably aceteam_api_key), but remove every API identity field
+	// that could select or attribute the prior enrollment. nexus_url is updated
+	// by the caller after the enrollment outcome is known.
 	config["redis_url"] = redisURL
+	delete(config, "device_api_token")
+	delete(config, "api_base_url")
+	delete(config, "org_id")
+	delete(config, "org_name")
+	delete(config, "user_email")
+	delete(config, "user_name")
+	delete(config, "fabric_node_id")
 
 	// Write back
 	newData, err := yaml.Marshal(config)
@@ -1293,11 +1306,35 @@ func saveRedisURLToConfig(redisURL string) error {
 	if err := os.WriteFile(globalConfigFile, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}
+	if err := verifyRedisConfigPersisted(globalConfigFile, redisURL); err != nil {
+		return fmt.Errorf("config verification failed after write: %w", err)
+	}
 
 	// Fix ownership of the node config dir after a successful write --
 	// see saveDeviceConfigToFile's identical comment (citadel-cli #878).
 	fixStatePermissionsFn()
 
+	return nil
+}
+
+func verifyRedisConfigPersisted(configFile, expectedURL string) error {
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return fmt.Errorf("cannot read back config file %s: %w", configFile, err)
+	}
+	var readBack struct {
+		DeviceAPIToken string `yaml:"device_api_token"`
+		RedisURL       string `yaml:"redis_url"`
+	}
+	if err := yaml.Unmarshal(data, &readBack); err != nil {
+		return fmt.Errorf("config file is corrupted: %w", err)
+	}
+	if readBack.RedisURL != expectedURL {
+		return fmt.Errorf("Redis URL mismatch: written URL was not persisted")
+	}
+	if readBack.DeviceAPIToken != "" {
+		return fmt.Errorf("conflicting device API token remained after Redis enrollment")
+	}
 	return nil
 }
 

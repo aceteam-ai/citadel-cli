@@ -60,8 +60,10 @@ func flagChanged(cmd *cobra.Command, name string) bool {
 	return false
 }
 
-// persistPrivateCATrust is called only after the mesh connection succeeds.
-// This avoids pinning an unusable CA or endpoint pair after a failed attempt.
+// persistPrivateCATrust is called after the mesh connection succeeds, or after
+// a self-hosted device grant has independently persisted usable fabric
+// credentials. This avoids pinning an unusable CA or endpoint pair before any
+// control-plane authentication has succeeded.
 func persistPrivateCATrust(authURL, controlURL string) error {
 	wrote, err := catrust.PersistActive(nodeConfigDirFn(), authURL, controlURL)
 	if err != nil {

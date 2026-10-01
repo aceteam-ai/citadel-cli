@@ -4,7 +4,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -15,9 +17,108 @@ import (
 )
 
 var (
-	loginAuthkey  string
-	loginNodeName string
+	loginAuthkey   string
+	loginNodeName  string
+	loginNewDevice bool
 )
+
+type persistedFabricCredentials uint8
+
+const (
+	fabricCredentialsNone persistedFabricCredentials = iota
+	fabricCredentialsAPI
+	fabricCredentialsRedis
+)
+
+type loginNetworkChoiceFn func(string) (nexus.NetworkChoice, string, error)
+type loginConnectFn func() (*network.NetworkServer, error)
+
+func validateLoginOptions(authkey string, newDevice bool) error {
+	if authkey != "" && newDevice {
+		return fmt.Errorf("--authkey and --new-device cannot be used together")
+	}
+	return nil
+}
+
+// selectLoginNetworkChoice makes --new-device authoritative. In particular,
+// do not let a healthy/stale existing mesh short-circuit the explicit request
+// before device authorization can send force_new to the auth service. The old
+// mesh state is left untouched until the ordinary post-authorization path.
+func selectLoginNetworkChoice(newDevice bool, choose loginNetworkChoiceFn) (nexus.NetworkChoice, string, error) {
+	if newDevice {
+		return nexus.NetChoiceDevice, "", nil
+	}
+	return choose("")
+}
+
+// connectLoginNetwork retires the prior mesh identity before connecting with
+// the newly issued authkey. A force-new login must not start tsnet if that
+// retirement failed: tsnet could otherwise reuse tailscaled.state and silently
+// reconnect the mapping the operator explicitly asked to replace. Legacy login
+// keeps its existing best-effort logout behavior.
+func connectLoginNetwork(newDevice bool, logout func() error, connect loginConnectFn) (*network.NetworkServer, bool, error) {
+	if err := logout(); err != nil && newDevice {
+		return nil, false, fmt.Errorf("retire existing network identity: %w", err)
+	}
+	srv, err := connect()
+	return srv, true, err
+}
+
+// canKeepFabricEnrollmentWithoutMesh is deliberately narrow: only a
+// self-hosted interactive device grant can enroll the fabric side independently
+// of the mesh, and only after one of its fabric credential writes succeeded.
+// Managed aceteam.ai login retains its existing fail-closed mesh requirement.
+func canKeepFabricEnrollmentWithoutMesh(choice nexus.NetworkChoice, creds persistedFabricCredentials, authURL, controlURL string) bool {
+	return choice == nexus.NetChoiceDevice &&
+		creds != fabricCredentialsNone &&
+		isSelfHostedEndpointPair(authURL, controlURL)
+}
+
+func isSelfHostedEndpointPair(authURL, controlURL string) bool {
+	for _, raw := range []string{authURL, controlURL} {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || u.User != nil ||
+			(u.Scheme != "https" && u.Scheme != "http") {
+			return false
+		}
+		host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+		if host == "aceteam.ai" || strings.HasSuffix(host, ".aceteam.ai") {
+			return false
+		}
+	}
+	return true
+}
+
+func (c persistedFabricCredentials) transportName() string {
+	if c == fabricCredentialsRedis {
+		return "direct Redis"
+	}
+	return "the fabric API"
+}
+
+// persistFabricEnrollmentWithoutMesh makes the partial enrollment durable
+// before login reports success. Unlike the ordinary connected path, none of
+// these writes can be best-effort: without the CA or Nexus URL an unattended
+// worker may not reach this self-hosted tenant, and without valid session
+// state a later bare invocation cannot honor the operator's preserved intent.
+func persistFabricEnrollmentWithoutMesh(
+	authURL, controlURL, nodeConfigDir string,
+	persistTrust func(string, string) error,
+	persistControlURL func(string) error,
+	persistSession func(string, bool) (nodesession.Config, error),
+) (nodesession.Config, error) {
+	if err := persistTrust(authURL, controlURL); err != nil {
+		return nodesession.Config{}, fmt.Errorf("persist control-plane trust: %w", err)
+	}
+	if err := persistControlURL(controlURL); err != nil {
+		return nodesession.Config{}, fmt.Errorf("persist Nexus URL: %w", err)
+	}
+	cfg, err := persistSession(nodeConfigDir, true)
+	if err != nil {
+		return nodesession.Config{}, fmt.Errorf("persist node session mode: %w", err)
+	}
+	return cfg, nil
+}
 
 var loginCmd = &cobra.Command{
 	Use:   "login",
@@ -35,6 +136,11 @@ Use --authkey for non-interactive authentication (ideal for automation).`,
   # Override the node name
   citadel login --authkey tskey-auth-xxx --node-name my-gpu-server`,
 	Run: func(cmd *cobra.Command, args []string) {
+		if err := validateLoginOptions(loginAuthkey, loginNewDevice); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+
 		// Refuse an explicit --nexus that differs from the control plane this
 		// node is already enrolled against (citadel-cli#1110).
 		if err := refuseNexusFlagMismatch(cmd); err != nil {
@@ -137,7 +243,7 @@ func runNonInteractiveLogin() {
 
 // runInteractiveLogin handles the interactive login flow
 func runInteractiveLogin() {
-	choice, key, err := nexus.GetNetworkChoice("")
+	choice, key, err := selectLoginNetworkChoice(loginNewDevice, nexus.GetNetworkChoice)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
 		os.Exit(1)
@@ -151,6 +257,11 @@ func runInteractiveLogin() {
 	// name. Empty on every login today (backend companion aceteam#9576 unmerged),
 	// so the serving identity stays the display hostname exactly as before.
 	var servingNodeUID string
+
+	// persistedCreds records which independent fabric transport a device-auth
+	// login saved. A later mesh failure can preserve that enrollment without
+	// claiming a transport the token did not configure.
+	var persistedCreds persistedFabricCredentials
 
 	switch choice {
 	case nexus.NetChoiceVerified:
@@ -182,7 +293,7 @@ func runInteractiveLogin() {
 		}
 
 		// Device authorization flow (carries the CSR when we have one)
-		authResult, err := runDeviceAuthFlowWithCSR(authServiceURL, false, csrPEM)
+		authResult, err := runDeviceAuthFlowWithCSR(authServiceURL, loginNewDevice, csrPEM)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			if nexus.IsNetworkError(err) {
@@ -199,10 +310,14 @@ func runInteractiveLogin() {
 		if authResult.Token.DeviceAPIToken != "" {
 			if err := saveDeviceConfigToFile(authResult.Token); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save device config: %v\n", err)
+			} else {
+				persistedCreds = fabricCredentialsAPI
 			}
 		} else if authResult.Token.RedisURL != "" {
 			if err := saveRedisURLToConfig(authResult.Token.RedisURL); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
+			} else {
+				persistedCreds = fabricCredentialsRedis
 			}
 		}
 
@@ -273,9 +388,6 @@ func runInteractiveLogin() {
 		}
 	}
 
-	// Disconnect any existing connection first
-	_ = network.Logout()
-
 	// Connect using tsnet with animated spinner
 	spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)
 	spinner.Start()
@@ -289,8 +401,44 @@ func runInteractiveLogin() {
 		AuthKey:    authKey,
 	}
 
-	srv, err := network.Connect(ctx, config)
+	srv, connectAttempted, err := connectLoginNetwork(loginNewDevice, network.Logout, func() (*network.NetworkServer, error) {
+		return network.Connect(ctx, config)
+	})
+	if !connectAttempted {
+		spinner.StopWithError(fmt.Sprintf("Failed to replace existing network identity: %v", err))
+		os.Exit(1)
+	}
 	if err != nil {
+		// A device-auth enrollment with independently persisted fabric
+		// credentials need not be discarded just because its mesh connection
+		// failed. Before reporting that partial success, make any explicitly
+		// supplied private CA durable for the unattended worker. An authkey-only
+		// login, or a failed credential write, still fails hard because it has no
+		// usable non-mesh enrollment to preserve.
+		if canKeepFabricEnrollmentWithoutMesh(choice, persistedCreds, authServiceURL, nexusURL) {
+			spinner.StopWithError(fmt.Sprintf("Mesh connection failed: %v", err))
+			sessionCfg, persistErr := persistFabricEnrollmentWithoutMesh(
+				authServiceURL,
+				nexusURL,
+				network.GetNodeConfigDir(),
+				persistPrivateCATrust,
+				saveNexusURLToConfig,
+				nodesession.LoadOrInitialize,
+			)
+			if persistErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: fabric credentials were saved, but enrollment state could not be persisted: %v\n", persistErr)
+				os.Exit(1)
+			}
+			fmt.Fprintln(os.Stderr, "\n⚠️  Fabric enrollment completed, but the mesh connection failed.")
+			fmt.Fprintf(os.Stderr, "   Credentials are saved for %s.\n", persistedCreds.transportName())
+			if sessionCfg.Mode == nodesession.Worker {
+				fmt.Fprintln(os.Stderr, "   Worker mode is active; the node can serve fabric jobs without the mesh.")
+				fmt.Fprintln(os.Stderr, "   The worker will retry the mesh when it starts.")
+			} else {
+				fmt.Fprintln(os.Stderr, "   Existing presence-only mode was preserved; run 'citadel work' explicitly to serve jobs.")
+			}
+			return
+		}
 		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
 		os.Exit(1)
 	}
@@ -321,4 +469,5 @@ func init() {
 	rootCmd.AddCommand(loginCmd)
 	loginCmd.Flags().StringVar(&loginAuthkey, "authkey", "", "Pre-generated authkey for non-interactive login")
 	loginCmd.Flags().StringVar(&loginNodeName, "node-name", "", "Override the node name (defaults to hostname)")
+	loginCmd.Flags().BoolVar(&loginNewDevice, "new-device", false, "Force fresh registration, ignoring any existing machine mapping")
 }
