@@ -113,40 +113,61 @@ func TestValidateLoginOptions(t *testing.T) {
 	}
 }
 
-func TestConnectLoginNetworkNewDeviceStopsOnStateRetirementFailure(t *testing.T) {
-	connectCalled := false
-	srv, attempted, err := connectLoginNetwork(
-		true,
-		func() error { return errors.New("state retirement failed") },
-		func() (*network.NetworkServer, error) {
-			connectCalled = true
-			return &network.NetworkServer{}, nil
-		},
-	)
-	if err == nil {
-		t.Fatal("state retirement failure was ignored")
+func TestConnectLoginNetwork(t *testing.T) {
+	logoutErr := errors.New("state retirement failed")
+	connectErr := errors.New("mesh connect failed")
+	wantServer := &network.NetworkServer{}
+	tests := []struct {
+		name          string
+		newDevice     bool
+		logoutErr     error
+		connectErr    error
+		wantCalls     []string
+		wantAttempted bool
+		wantServer    *network.NetworkServer
+		wantErr       error
+	}{
+		{name: "force-new retirement failure stops before connect", newDevice: true, logoutErr: logoutErr, wantCalls: []string{"logout"}, wantErr: logoutErr},
+		{name: "force-new successful retirement connects", newDevice: true, wantCalls: []string{"logout", "connect"}, wantAttempted: true, wantServer: wantServer},
+		{name: "legacy logout failure remains best effort", logoutErr: logoutErr, wantCalls: []string{"logout", "connect"}, wantAttempted: true, wantServer: wantServer},
+		{name: "connect failure remains an attempted mesh connection", newDevice: true, connectErr: connectErr, wantCalls: []string{"logout", "connect"}, wantAttempted: true, wantErr: connectErr},
 	}
-	if attempted || connectCalled || srv != nil {
-		t.Fatalf("attempted=%v connectCalled=%v srv=%v; want no connect attempt", attempted, connectCalled, srv)
-	}
-}
 
-func TestConnectLoginNetworkDefaultKeepsBestEffortLogout(t *testing.T) {
-	want := &network.NetworkServer{}
-	connectCalled := false
-	srv, attempted, err := connectLoginNetwork(
-		false,
-		func() error { return errors.New("legacy logout failure") },
-		func() (*network.NetworkServer, error) {
-			connectCalled = true
-			return want, nil
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !attempted || !connectCalled || srv != want {
-		t.Fatalf("attempted=%v connectCalled=%v srv=%p; want connect result %p", attempted, connectCalled, srv, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []string
+			srv, attempted, err := connectLoginNetwork(
+				tt.newDevice,
+				func() error {
+					calls = append(calls, "logout")
+					return tt.logoutErr
+				},
+				func() (*network.NetworkServer, error) {
+					calls = append(calls, "connect")
+					if tt.connectErr != nil {
+						return nil, tt.connectErr
+					}
+					return wantServer, nil
+				},
+			)
+			if attempted != tt.wantAttempted {
+				t.Fatalf("attempted = %v, want %v", attempted, tt.wantAttempted)
+			}
+			if srv != tt.wantServer {
+				t.Fatalf("server = %p, want %p", srv, tt.wantServer)
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if len(calls) != len(tt.wantCalls) {
+				t.Fatalf("calls = %v, want %v", calls, tt.wantCalls)
+			}
+			for i := range tt.wantCalls {
+				if calls[i] != tt.wantCalls[i] {
+					t.Fatalf("calls = %v, want %v", calls, tt.wantCalls)
+				}
+			}
+		})
 	}
 }
 
