@@ -306,6 +306,124 @@ func TestPapercraftSceneRenderBuiltinRealChromiumAndFFmpeg(t *testing.T) {
 	}
 }
 
+// TestPapercraftSceneRenderBuiltinRealChromiumUnderLongAttemptWorkspacePath
+// reproduces citadel-cli's real RUN_JOB_TEMPLATE dispatch path, where outDir
+// is NOT a short top-level scratch directory (see the short, top-level
+// pcs-in-/pcs-out- comment on TestPapercraftSceneRenderBuiltinRealChromiumAndFFmpeg
+// above) but a long, deeply nested on-node attempt workspace:
+// <workspace>/templates/<template_key>/<job_id>/attempt-<32hex>/out, built by
+// cmd/run_job_template_ops.go's Run. Before the fix, deriving the Chromium
+// profile dir (and therefore its SingletonSocket) from that long outDir made
+// every real dispatch of papercraft-render/papercraft-scene-render on a node
+// abort with "Socket path too long", a failure the short-scratch-dir test
+// above never exercises. This test builds that same long nesting shape and
+// asserts the render still completes, with both outputs landing in outDir.
+func TestPapercraftSceneRenderBuiltinRealChromiumUnderLongAttemptWorkspacePath(t *testing.T) {
+	if !platform.ChromiumAvailable() {
+		t.Skip("Chromium is not installed")
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+
+	workspaceRoot, err := os.MkdirTemp("", "citadel-node-workspace-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(workspaceRoot) })
+
+	// Mirrors run_job_template_ops.go's relRun/relOut shape exactly:
+	// templates/<template_key>/<job_id>/attempt-<32hex>/out, so this test
+	// fails the same way a real node dispatch failed (not an arbitrary long
+	// string) when the Chromium profile dir is still derived from outDir.
+	jobID := "5c76607b-b2a4-4de4-8525-2ae0a5b74bdb"
+	attempt := "attempt-" + strings.Repeat("a9c7157c71792b10f767f445848d28c6", 1)
+	outDir := filepath.Join(workspaceRoot, "templates", "papercraft-scene-render", jobID, attempt, "out")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	inDir, err := os.MkdirTemp("", "pcs-long-in-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(inDir) })
+	scenePath := filepath.Join(inDir, "scene.json")
+	timingsPath := filepath.Join(inDir, "timings.json")
+	audioPath := filepath.Join(inDir, "narration.wav")
+
+	scene := map[string]any{
+		"title":   "Long Workspace Path Smoke Test",
+		"tagline": "Reproduces the real attempt-workspace nesting depth.",
+		"badge":   "TEST",
+		"beats": []map[string]any{
+			{
+				"id":      "b1",
+				"heading": "Hello",
+				"bullets": []string{"A real render under a long outDir"},
+				"visual":  "idea",
+				"accent":  "blue",
+			},
+		},
+	}
+	sceneBytes, err := json.Marshal(scene)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scenePath, sceneBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	timings := map[string]any{"b1": []float64{0, 1.2}, "total": 1.2}
+	timingsBytes, err := json.Marshal(timings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(timingsPath, timingsBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(audioPath, silentWAV(t, 2*time.Second), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := runPapercraftSceneRenderBuiltin(
+		context.Background(),
+		json.RawMessage(`{}`),
+		[]string{scenePath, timingsPath, audioPath},
+		outDir,
+		livePapercraftRenderDeps(),
+	)
+	if err != nil {
+		t.Fatalf("runPapercraftSceneRenderBuiltin under long attempt-workspace outDir: %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{"landscape.mp4", "portrait.mp4"}) {
+		t.Fatalf("outputs = %v", got)
+	}
+	for _, name := range got {
+		p := filepath.Join(outDir, name)
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		if info.Size() < 1000 {
+			t.Fatalf("%s is suspiciously small: %d bytes", name, info.Size())
+		}
+		t.Logf("%s: %d bytes under long outDir %s", name, info.Size(), outDir)
+	}
+
+	// The ephemeral Chromium profile must not have been left nested under
+	// outDir (the bug's root cause); only the two expected outputs belong
+	// there.
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != "landscape.mp4" && entry.Name() != "portrait.mp4" {
+			t.Errorf("unexpected entry left in outDir: %s", entry.Name())
+		}
+	}
+}
+
 // silentWAV builds a minimal valid PCM16 mono WAV of the given duration at
 // 8kHz, small enough to keep this test fast while still giving ffmpeg a real
 // audio stream to mux.

@@ -131,6 +131,7 @@ func TestPapercraftRenderBuiltinRendersBothFormatsWithTenFPSCaptureDedup(t *test
 
 	var pages []*fakePapercraftPage
 	var encoders []*fakePapercraftEncoder
+	profileBase := t.TempDir()
 	deps := papercraftRenderDeps{
 		startPage: func(_ context.Context, _ string, _, _ int, _ string, _ []string) (papercraftPage, error) {
 			p := &fakePapercraftPage{duration: 0.31}
@@ -142,6 +143,7 @@ func TestPapercraftRenderBuiltinRendersBothFormatsWithTenFPSCaptureDedup(t *test
 			encoders = append(encoders, e)
 			return e, nil
 		},
+		mkdirTemp: func(_, pattern string) (string, error) { return os.MkdirTemp(profileBase, pattern) },
 	}
 	got, err := runPapercraftRenderBuiltin(context.Background(), json.RawMessage(`{"duration_seconds":0.31}`), []string{asset, portrait, audio, landscape}, outDir, deps)
 	if err != nil {
@@ -179,6 +181,7 @@ func TestPapercraftRenderBuiltinRejectsMissingFormatAndTimingMismatch(t *testing
 		t.Fatalf("missing portrait error = %v", err)
 	}
 	portrait := writePapercraftHTML(t, dir, "short.html", 1080, 1920)
+	profileBase := t.TempDir()
 	deps := papercraftRenderDeps{
 		startPage: func(context.Context, string, int, int, string, []string) (papercraftPage, error) {
 			return &fakePapercraftPage{duration: 2}, nil
@@ -186,6 +189,7 @@ func TestPapercraftRenderBuiltinRejectsMissingFormatAndTimingMismatch(t *testing
 		startEncoder: func(context.Context, papercraftEncoderConfig) (papercraftEncoder, error) {
 			return nil, errors.New("must not encode")
 		},
+		mkdirTemp: func(_, pattern string) (string, error) { return os.MkdirTemp(profileBase, pattern) },
 	}
 	_, err := runPapercraftRenderBuiltin(context.Background(), json.RawMessage(`{"duration_seconds":1}`), []string{landscape, portrait}, t.TempDir(), deps)
 	if err == nil || !strings.Contains(err.Error(), "disagrees") {
@@ -432,6 +436,7 @@ func TestPapercraftRenderReportsProfileCleanupFailure(t *testing.T) {
 	landscape := writePapercraftHTML(t, inDir, "index.html", 1920, 1080)
 	portrait := writePapercraftHTML(t, inDir, "short.html", 1080, 1920)
 	removeCalls := 0
+	profileBase := t.TempDir()
 	deps := papercraftRenderDeps{
 		startPage: func(context.Context, string, int, int, string, []string) (papercraftPage, error) {
 			return &fakePapercraftPage{duration: 0.1}, nil
@@ -446,6 +451,7 @@ func TestPapercraftRenderReportsProfileCleanupFailure(t *testing.T) {
 			}
 			return nil
 		},
+		mkdirTemp: func(_, pattern string) (string, error) { return os.MkdirTemp(profileBase, pattern) },
 	}
 	_, err := runPapercraftRenderBuiltin(context.Background(), json.RawMessage(`{}`), []string{landscape, portrait}, outDir, deps)
 	if err == nil || !strings.Contains(err.Error(), "profile locked") || !strings.Contains(err.Error(), "remove Chromium profile") {

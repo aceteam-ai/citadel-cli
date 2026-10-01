@@ -1444,6 +1444,20 @@ is unreachable behind that non-Linux refusal, not a partial taskkill fallback.
 Both builtins additionally apply the independent `renderJobWallTimeout`.
 Browser cancellation must terminate and wait for the process tree before
 profile removal.
+
+**The Chromium profile dir is a short OS temp directory, never nested under
+outDir (citadel-cli papercraft profile path fix).** `outDir` is the on-node
+RUN_JOB_TEMPLATE attempt workspace (`cmd/run_job_template_ops.go`'s
+`templates/<key>/<job_id>/attempt-<32hex>/out`), which is nested deep enough
+that a profile dir derived from it plus Chromium's own
+`com.google.Chrome.<rand>/SingletonSocket` suffix overflows the AF_UNIX
+`sun_path` limit, aborting Chromium with a FATAL `Socket path too long` on
+every real dispatch. `runPapercraftRenderBuiltin` allocates `profileDir` via
+`os.MkdirTemp("", "pcr-<format>-")` instead (per-format, per-render-unique,
+cleaned up through the same `cleanupPapercraftRender`/`removePapercraftProfile`
+path as before), while render output still lands under `outDir` unchanged.
+The seam is `papercraftRenderDeps.mkdirTemp`, mirroring `removeAll`'s existing
+injectable pattern for tests.
 `audio-mix` is the portable ffmpeg `amix` plus two-pass -14 LUFS bridge; Paper
 Trail's numpy procedural synthesis is deliberately not copied here. The exact
 input, param, and output contract is in

@@ -37,6 +37,16 @@ const (
 	papercraftMaxPNG      = 32 << 20
 	renderJobWallTimeout  = 2 * time.Hour
 	papercraftAssetHost   = "citadel-render.invalid"
+
+	// papercraftProfileTempPrefix roots the ephemeral Chromium profile dir
+	// (where SingletonSocket lives) under the OS temp dir instead of outDir.
+	// outDir is the on-node RUN_JOB_TEMPLATE attempt workspace
+	// (cmd/run_job_template_ops.go), which nests several UUID/hex segments
+	// deep and can exceed the AF_UNIX sun_path limit once Chromium appends
+	// its own "com.google.Chrome.<rand>/SingletonSocket" suffix. A short,
+	// top-level temp dir keeps the full profile path well under that limit
+	// regardless of how deep outDir itself is nested.
+	papercraftProfileTempPrefix = "pcr-"
 )
 
 var errChromiumShutdownIncomplete = errors.New("Chromium process tree shutdown incomplete")
@@ -80,6 +90,7 @@ type papercraftRenderDeps struct {
 	startPage    func(context.Context, string, int, int, string, []string) (papercraftPage, error)
 	startEncoder func(context.Context, papercraftEncoderConfig) (papercraftEncoder, error)
 	removeAll    func(string) error
+	mkdirTemp    func(dir, pattern string) (string, error)
 }
 
 func init() {
@@ -89,12 +100,17 @@ func init() {
 }
 
 func livePapercraftRenderDeps() papercraftRenderDeps {
-	return papercraftRenderDeps{startPage: startChromiumRenderPage, startEncoder: startPapercraftFFmpeg, removeAll: os.RemoveAll}
+	return papercraftRenderDeps{startPage: startChromiumRenderPage, startEncoder: startPapercraftFFmpeg, removeAll: os.RemoveAll, mkdirTemp: os.MkdirTemp}
 }
 
 func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inputs []string, outDir string, deps papercraftRenderDeps) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, renderJobWallTimeout)
 	defer cancel()
+
+	mkdirTemp := deps.mkdirTemp
+	if mkdirTemp == nil {
+		mkdirTemp = os.MkdirTemp
+	}
 
 	m, err := decodeBuiltinParams(params, "duration_seconds")
 	if err != nil {
@@ -117,11 +133,16 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		profileDir := filepath.Join(outDir, ".chromium-"+format.name)
-		if err := removePapercraftProfile(profileDir, deps.removeAll); err != nil {
-			return nil, fmt.Errorf("reset Chromium profile: %w", err)
-		}
-		if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		// The Chromium profile dir (where SingletonSocket lives) is
+		// deliberately NOT nested under outDir: outDir is the on-node
+		// RUN_JOB_TEMPLATE attempt workspace, which can be nested deep
+		// enough to overflow the AF_UNIX sun_path limit once Chromium
+		// appends its own subdirectory and socket filename. A short,
+		// unique, top-level temp dir keeps the full profile path short
+		// regardless of outDir's depth; render OUTPUT still goes to
+		// outDir below, unchanged.
+		profileDir, err := mkdirTemp("", papercraftProfileTempPrefix+format.name+"-")
+		if err != nil {
 			return nil, fmt.Errorf("create Chromium profile: %w", err)
 		}
 		page, err := deps.startPage(ctx, format.html, format.width, format.height, profileDir, inputs)
