@@ -71,6 +71,33 @@ CLAUDE_STATE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", "/home/claude/.claude")
 
 app = FastAPI(title="citadel-claudecode-runtime")
 
+# Credentials the Claude CLI can inherit from this wrapper's environment. Keep
+# gateway auth here too: a CLI error can echo any inherited value. Match live
+# values literally, as in the Hermes wrapper, rather than guessing key shapes.
+_SECRET_ENV_NAMES = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_API_KEY",
+    "OPENAI_API_KEY",
+    "ACETEAM_GATEWAY_KEY",
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Replace configured credential values before CLI output becomes public."""
+    secrets = (
+        (name, value)
+        for name in _SECRET_ENV_NAMES
+        if (value := os.environ.get(name)) and len(value) >= 8
+    )
+    # Longer values first so an overlapping shorter value cannot leave a tail.
+    for name, value in sorted(secrets, key=lambda item: len(item[1]), reverse=True):
+        text = text.replace(value, f"[REDACTED_{name}]")
+    return text
+
 
 def _expected_inbound_bearer() -> str:
     """The inbound Authorization value the platform must present."""
@@ -131,14 +158,20 @@ def _run_claude_turn(message: str) -> str:
             f"Claude Code turn timed out after {TURN_TIMEOUT_SECONDS}s"
         )
 
+    # Both streams can become callback content, including JSON error envelopes.
+    # Scrub before choosing a stream or truncating it; truncation could split a
+    # credential and make a later literal match ineffective.
+    stdout_text = _scrub_secrets(proc.stdout or "")
+    stderr_text = _scrub_secrets(proc.stderr or "")
+
     if proc.returncode != 0:
         # Surface the tail of stderr so the terminal error is actionable, but
         # keep it short -- it goes to a user-facing chat.
-        err = (proc.stderr or proc.stdout or "").strip()
+        err = (stderr_text or stdout_text).strip()
         tail = err[-800:] if err else "(no output)"
         raise RuntimeError(f"Claude Code exited {proc.returncode}: {tail}")
 
-    stdout = (proc.stdout or "").strip()
+    stdout = stdout_text.strip()
     if not stdout:
         raise RuntimeError("Claude Code produced no output")
 
@@ -204,7 +237,7 @@ def _process_turn(message: str, turn_token: str) -> None:
         reply = _run_claude_turn(message)
         _post_reply({"reply": reply}, turn_token)
     except Exception as exc:  # any terminal failure -> user-facing {error}
-        _post_reply({"error": str(exc)}, turn_token)
+        _post_reply({"error": _scrub_secrets(str(exc))}, turn_token)
 
 
 @app.get("/health")
