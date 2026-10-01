@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build linux
 
 package reconstruct
 
@@ -13,8 +13,8 @@ import (
 
 type osExecutor struct{}
 
-// NewOSExecutor returns the Linux/Unix process executor. Every command starts
-// in its own process group; context cancellation kills the entire group rather
+// NewOSExecutor returns the Linux process executor. Every command starts in
+// its own process group; context cancellation kills the entire group rather
 // than only ffmpeg or Spirula's direct parent process.
 func NewOSExecutor() Executor { return osExecutor{} }
 
