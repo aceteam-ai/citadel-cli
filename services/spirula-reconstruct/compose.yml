@@ -1,0 +1,44 @@
+services:
+  reconstruct:
+    image: localhost/spirula-reconstruct:local
+    build:
+      context: ../..
+      dockerfile: services/spirula-reconstruct/Dockerfile
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: graphics,display,utility
+      SS_LANG: en
+    user: "${PUID:-1000}:${PGID:-1000}"
+    read_only: true
+    network_mode: none
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    tmpfs:
+      - /tmp:mode=1777
+    volumes:
+      - "${RECONSTRUCT_INPUT:?set RECONSTRUCT_INPUT to a video file or frame directory}:/input/source:ro"
+      # Mount the output parent at the same absolute node path so the JSON
+      # artifact reference remains valid after this one-shot container exits.
+      - "${RECONSTRUCT_OUTPUT:?set RECONSTRUCT_OUTPUT to a writable absolute output directory}:${RECONSTRUCT_OUTPUT:?set RECONSTRUCT_OUTPUT to a writable absolute output directory}"
+    command:
+      - --input
+      - /input/source
+      - --output
+      - "${RECONSTRUCT_OUTPUT:?set RECONSTRUCT_OUTPUT to a writable absolute output directory}/${RECONSTRUCT_JOB_ID:?set a new RECONSTRUCT_JOB_ID}"
+      - --sfm-quality
+      - "${SFM_QUALITY:-high}"
+      - --train-quality
+      - "${TRAIN_QUALITY:-high}"
+      - --frame-fps
+      - "${FRAME_FPS:-12}"
+      - --cap-max
+      - "${CAP_MAX:-1000000}"
+      - --iterations
+      - "${ITERATIONS:-30000}"
+      - --train-resolution-divisor
+      - "${TRAIN_RESOLUTION_DIVISOR:-1}"
