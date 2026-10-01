@@ -16,20 +16,44 @@ When you run `citadel init`, the following happens:
 
 ## Configuration
 
-You can configure the CLI to point to your own self-hosted control plane and Nexus instance using environment variables.
+You can configure the CLI to point to your own self-hosted control plane and Nexus instance using global flags.
 
-*   `CITADEL_AUTH_HOST`: The base URL for your Authentication Service.
-    *   **Default:** `https://aceteam.ai`
-*   `CITADEL_NEXUS_HOST`: The URL for your Headscale instance.
-    *   **Default:** `https://nexus.aceteam.ai`
+*   `--auth-service`: The base URL for your Authentication Service. `CITADEL_AUTH_HOST` supplies its default.
+*   `--nexus`: The URL for your Headscale instance.
+*   `--ca-cert`: A private CA bundle for a self-hosted Authentication Service and Nexus. `CITADEL_CA_CERT` supplies its default.
 
 **Example:**
 ```sh
-export CITADEL_AUTH_HOST="https://my-control-plane.com"
-export CITADEL_NEXUS_HOST="https://my-headscale.com"
-sudo -E citadel init
+citadel init \
+  --auth-service "https://web.tenant.aceteam.internal" \
+  --nexus "https://nexus.tenant.aceteam.internal" \
+  --ca-cert "/path/to/tenant-ca.pem"
 ```
-*Note: `sudo -E` is required to preserve the environment variables for the root user.*
+
+### Private CA requirements
+
+Private CA bootstrap is currently supported on Linux. The bundle must contain
+one or more valid PEM CA certificates. Citadel adds those certificates to the
+normal system roots, keeps hostname verification enabled, and uses them for
+device authorization and the embedded mesh connection.
+
+This option is limited to self-hosted tenants. Citadel refuses private CA
+configuration when either endpoint is the managed `aceteam.ai` service.
+
+The server certificate still needs a SAN matching each requested hostname.
+Trusting the CA does not make a certificate for `ingress.local` valid for a
+tenant web or Nexus hostname.
+
+Citadel copies the validated public CA material into its machine-convergent
+node configuration only after the first mesh connection succeeds. The saved
+record is bound to the exact Authentication Service and Nexus origins, so
+worker and service restarts can reconnect without the source file while the CA
+cannot be reused for another tenant. An explicit `--ca-cert` or
+`CITADEL_CA_CERT` takes precedence over the saved record.
+
+On macOS and Windows, install the private CA in the operating system trust
+store. The separate `citadel device` flow drives an already-running system
+Tailscale daemon, so that daemon also requires operating system trust.
 
 ## Implementing a Custom Authentication Service
 
@@ -81,4 +105,4 @@ The CLI will poll this endpoint at the specified `interval` until the user authe
     }
     ```
 
-The `citadel-cli` will then use this `access_token` to complete its registration with the `CITADEL_NEXUS_HOST`.
+The `citadel-cli` will then use this `access_token` to complete its registration with the configured `--nexus` URL.

@@ -1936,6 +1936,10 @@ func ccConnectWithAuthkey(authkey string) error {
 
 	_, err := network.Connect(ctx, config)
 	if err == nil {
+		if trustErr := persistPrivateCATrust(authServiceURL, nexusURL); trustErr != nil {
+			_ = network.Disconnect()
+			return trustErr
+		}
 		// Persist the control URL enrolled against (citadel-cli#1110) so later
 		// reconnects target this control plane, not the compiled-in default.
 		persistNexusURLBestEffort(nexusURL)

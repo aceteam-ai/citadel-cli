@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catrust"
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/client/local"
 
@@ -121,6 +122,7 @@ func (b *tunBackend) Up(ctx context.Context) error {
 	CleanUpSystemState()
 
 	sys := tsd.NewSystem()
+	sys.ExtraRootCAs = catrust.ActivePool()
 	b.sys = sys
 
 	netMon, err := netmon.New(sys.Bus.Get(), logf)
@@ -178,6 +180,7 @@ func (b *tunBackend) Up(ctx context.Context) error {
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		HealthTracker: sys.HealthTracker.Get(),
+		ExtraRootCAs:  sys.ExtraRootCAs,
 		Metrics:       sys.UserMetricsRegistry(),
 		EventBus:      sys.Bus.Get(),
 	})
