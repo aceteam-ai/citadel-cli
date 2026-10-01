@@ -6,12 +6,12 @@ The model is pointed at the AceTeam fabric proxy (an Anthropic-compatible
 endpoint) via the ANTHROPIC_* env, so a full turn runs with NO external Anthropic
 API key -- the "agent AND model on your own metal" story that Fly cannot match.
 
-Contract (pinned by the routing-seam PR #4593 -- do NOT change it):
+Contract (routing seam PR #4593, extended with turnToken by citadel-cli#1212):
 
   Inbound (platform -> this container):
     POST /hooks/agent
     Authorization: Bearer hooks_{GATEWAY_KEY}
-    { "message": "<user text>", "name": "<label>" }
+    { "message": "<user text>", "name": "<label>", "turnToken": "<opaque token>" }
   We validate the bearer token equals "hooks_" + the container's gateway key,
   then ACK FAST with 200 {"delivered": true} and process the turn on a
   background thread (the caller expects a quick delivery ack, not a blocking
@@ -20,8 +20,8 @@ Contract (pinned by the routing-seam PR #4593 -- do NOT change it):
   Outbound (this container -> platform), when the turn finishes:
     POST {PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply
     Authorization: Bearer {GATEWAY_KEY}          # RAW key, NOT hooks_-prefixed
-    { "reply": "<assistant text>" }              # on success
-    { "error": "<user-facing message>" }         # on terminal failure
+    { "reply": "<assistant text>", "turnToken": "<same token>" }  # success
+    { "error": "<user-facing message>", "turnToken": "<same token>" }  # failure
   Expect 200 {"accepted": true}.
 
 Everything is driven by env (no secrets baked into the image); see the compose
@@ -148,8 +148,11 @@ def _run_claude_turn(message: str) -> str:
     return stdout
 
 
-def _post_reply(body: dict) -> None:
+def _post_reply(body: dict, turn_token: str) -> None:
     """POST the outbound reply/error to the platform callback (best-effort)."""
+    if not isinstance(turn_token, str) or not turn_token:
+        print("claudecode: missing turn token; cannot post reply", file=sys.stderr, flush=True)
+        return
     if not PLATFORM_URL or not INSTANCE_ID:
         print(
             "claudecode: PLATFORM_URL/INSTANCE_ID unset; cannot post reply",
@@ -158,7 +161,7 @@ def _post_reply(body: dict) -> None:
         )
         return
     url = f"{PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply"
-    data = json.dumps(body).encode("utf-8")
+    data = json.dumps({**body, "turnToken": turn_token}).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     # Outbound auth is the RAW gateway key -- NOT the hooks_-prefixed inbound token.
@@ -168,21 +171,21 @@ def _post_reply(body: dict) -> None:
             resp.read()
     except urllib.error.HTTPError as exc:
         print(
-            f"claudecode: reply POST to {url} failed: {exc.code} {exc.reason}",
+            f"claudecode: reply POST failed with status {exc.code}",
             file=sys.stderr,
             flush=True,
         )
-    except Exception as exc:  # network error, DNS, etc.
-        print(f"claudecode: reply POST to {url} failed: {exc}", file=sys.stderr, flush=True)
+    except Exception:  # network error, DNS, etc.
+        print("claudecode: reply POST failed", file=sys.stderr, flush=True)
 
 
-def _process_turn(message: str) -> None:
+def _process_turn(message: str, turn_token: str) -> None:
     """Background worker: run the turn, then post reply or error."""
     try:
         reply = _run_claude_turn(message)
-        _post_reply({"reply": reply})
+        _post_reply({"reply": reply}, turn_token)
     except Exception as exc:  # any terminal failure -> user-facing {error}
-        _post_reply({"error": str(exc)})
+        _post_reply({"error": str(exc)}, turn_token)
 
 
 @app.get("/health")
@@ -225,11 +228,14 @@ async def hooks_agent(request: Request, authorization: str = Header(default=""))
     message = body.get("message") if isinstance(body, dict) else None
     if not isinstance(message, str) or not message:
         raise HTTPException(status_code=400, detail="missing 'message'")
+    turn_token = body.get("turnToken")
+    if not isinstance(turn_token, str) or not turn_token:
+        raise HTTPException(status_code=400, detail="missing turn token")
 
     # ACK FAST: hand the (blocking) model turn to a background thread so the
     # inbound request returns a delivery ack immediately. daemon=True so a
     # container stop never hangs on an in-flight turn.
-    threading.Thread(target=_process_turn, args=(message,), daemon=True).start()
+    threading.Thread(target=_process_turn, args=(message, turn_token), daemon=True).start()
 
     return {"delivered": True}
 

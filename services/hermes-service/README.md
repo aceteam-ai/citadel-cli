@@ -30,14 +30,15 @@ HTTP wrapper.
 ```
 
 - Inbound `POST /hooks/agent` with `Authorization: Bearer hooks_{GATEWAY_KEY}`
-  and `{"message","name"}`. The wrapper validates the token, **ACKs fast** with
+  and `{"message","name","turnToken"}`. The wrapper validates the bearer and
+  requires the server-provided turn token, then **ACKs fast** with
   `200 {"delivered": true}`, and runs the turn on a background thread.
 - The turn shells out to `hermes chat -q "<message>" -Q` (verified against
   `hermes_cli/_parser.py`'s `chat` subparser upstream: `-q/--query` is
   "Single query (non-interactive mode)"; `-Q/--quiet` is "Quiet mode for
   programmatic use: suppress banner, spinner, and tool previews. Only output
   the final response and session info."), capturing stdout.
-- On completion it POSTs `{"reply": "<text>"}` (or `{"error": "..."}` on
+- On completion it POSTs `{"reply": "<text>", "turnToken": "<same token>"}` (or `{"error": "...", "turnToken": "<same token>"}` on
   failure) to `{PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply` with
   `Authorization: Bearer {GATEWAY_KEY}` (the **raw** key, not `hooks_`-prefixed) --
   **byte-identical wire contract to claudecode-service**, which is the whole

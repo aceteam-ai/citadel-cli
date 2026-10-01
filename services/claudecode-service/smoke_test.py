@@ -38,6 +38,7 @@ IMAGE = "citadel-claudecode-service:smoke"
 CONTAINER = "citadel-claudecode-smoke"
 GATEWAY_KEY = "smoke-gateway-key-123"
 INSTANCE_ID = "inst_smoke_1"
+TURN_TOKEN = "smoke-turn-claudecode"
 CANNED_REPLY = "Hello from the fabric proxy. 2 plus 2 is 4."
 HOST_PORT = 8299  # ephemeral host port for the wrapper during the test
 
@@ -264,7 +265,7 @@ def main() -> int:
         turn_url = f"http://127.0.0.1:{HOST_PORT}/hooks/agent"
         req = urllib.request.Request(
             turn_url,
-            data=json.dumps({"message": "what is 2+2?", "name": "smoke"}).encode(),
+            data=json.dumps({"message": "what is 2+2?", "name": "smoke", "turnToken": TURN_TOKEN}).encode(),
             method="POST",
         )
         req.add_header("Content-Type", "application/json")
@@ -337,6 +338,9 @@ def main() -> int:
         if "reply" not in reply and "error" not in reply:
             print(f"FAIL: reply body has neither reply nor error: {reply}",
                   file=sys.stderr)
+            return 1
+        if reply.get("turnToken") != TURN_TOKEN:
+            print("FAIL: reply did not echo the inbound turn token", file=sys.stderr)
             return 1
         if "error" in reply:
             print(f"FAIL: turn ended in error: {reply['error']}", file=sys.stderr)

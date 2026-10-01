@@ -47,6 +47,7 @@ IMAGE = "citadel-hermes-service:smoke"
 CONTAINER = "citadel-hermes-smoke"
 GATEWAY_KEY = "smoke-gateway-key-456"
 INSTANCE_ID = "inst_smoke_hermes_1"
+TURN_TOKEN = "smoke-turn-hermes"
 HOST_PORT = 8298  # ephemeral host port for the wrapper during the test
 
 SERVICE_DIR = Path(__file__).resolve().parent
@@ -200,7 +201,7 @@ def main() -> int:
         t0 = time.monotonic()
         code, body = http_post_json(
             f"http://localhost:{HOST_PORT}/hooks/agent",
-            {"message": "what is 2+2?", "name": "smoke-test"},
+            {"message": "what is 2+2?", "name": "smoke-test", "turnToken": TURN_TOKEN},
             headers={"Authorization": f"Bearer hooks_{GATEWAY_KEY}"},
         )
         ack_latency = time.monotonic() - t0
@@ -223,6 +224,8 @@ def main() -> int:
                 f"expected a terminal {{error: ...}} reply (no provider configured), "
                 f"got {reply_body!r}"
             )
+        if not isinstance(reply_body, dict) or reply_body.get("turnToken") != TURN_TOKEN:
+            failures.append("reply did not echo the inbound turn token")
         elif "provider" not in reply_body["error"].lower() and "inference" not in reply_body["error"].lower():
             failures.append(
                 f"error message doesn't look like Hermes's 'no provider configured' "

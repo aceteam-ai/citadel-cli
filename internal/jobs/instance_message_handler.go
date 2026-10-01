@@ -103,6 +103,7 @@ type instanceMessageResult struct {
 //   - message : the turn text to deliver
 //   - name    : the message name/label (e.g. "Kickoff" / "Coordination")
 //   - bearer  : the fully-derived /hooks/agent bearer ("hooks_<gateway_key>")
+//   - turnToken : opaque per-turn callback token supplied by the platform
 //
 // Fail-closed: if the service is not a known running instance in THIS node's
 // store, the turn is rejected rather than delivered to some other container.
@@ -118,6 +119,10 @@ func (h *InstanceMessageHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	bearer := job.Payload["bearer"]
 	if bearer == "" {
 		return nil, errors.New("job payload missing 'bearer' field")
+	}
+	turnToken := job.Payload["turnToken"]
+	if turnToken == "" {
+		return nil, errors.New("job payload missing turn token")
 	}
 	name := job.Payload["name"]
 	if name == "" {
@@ -141,7 +146,7 @@ func (h *InstanceMessageHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	url := hooksAgentURL(h.baseURL(rec.HostPort))
 	ctx.Log("info", "     - [Job %s] Delivering turn to instance %s at %s", job.ID, service, url)
 
-	body, err := json.Marshal(map[string]string{"message": message, "name": name})
+	body, err := json.Marshal(map[string]string{"message": message, "name": name, "turnToken": turnToken})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal turn body: %w", err)
 	}
