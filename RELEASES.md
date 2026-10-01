@@ -2828,3 +2828,20 @@ Auto-generated log of every release.
   - feat(auth): trust self-hosted private CAs (#1204)
 
 
+---
+
+## v2.178.0 — 2026-10-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 22 |
+| Lines added | +2405 |
+
+**Changes:**
+
+  - feat: add Spirula reconstruct pipeline (#1210)
+  - fix(login): keep a device-auth enrollment when the mesh connection fails (#1201 gap 4b) (#1207)
+  - fix(ingress): harden app handoff edge cases (#1206) (#1208)
+
+
