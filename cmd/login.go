@@ -19,6 +19,52 @@ var (
 	loginNodeName string
 )
 
+type persistedFabricCredentials uint8
+
+const (
+	fabricCredentialsNone persistedFabricCredentials = iota
+	fabricCredentialsAPI
+	fabricCredentialsRedis
+)
+
+// canKeepFabricEnrollmentWithoutMesh is deliberately narrow: only an
+// interactive device grant can enroll the fabric side independently of the
+// mesh, and only after one of its fabric credential writes succeeded. An
+// authkey-only login still depends entirely on the mesh connection.
+func canKeepFabricEnrollmentWithoutMesh(choice nexus.NetworkChoice, creds persistedFabricCredentials) bool {
+	return choice == nexus.NetChoiceDevice && creds != fabricCredentialsNone
+}
+
+func (c persistedFabricCredentials) transportName() string {
+	if c == fabricCredentialsRedis {
+		return "direct Redis"
+	}
+	return "the fabric API"
+}
+
+// persistFabricEnrollmentWithoutMesh makes the partial enrollment durable
+// before login reports success. Unlike the ordinary connected path, none of
+// these writes can be best-effort: without the CA or Nexus URL an unattended
+// worker may not reach this self-hosted tenant, and without a valid session
+// mode it may not start as a worker.
+func persistFabricEnrollmentWithoutMesh(
+	authURL, controlURL, nodeConfigDir string,
+	persistTrust func(string, string) error,
+	persistControlURL func(string) error,
+	persistSession func(string, bool) (nodesession.Config, error),
+) error {
+	if err := persistTrust(authURL, controlURL); err != nil {
+		return fmt.Errorf("persist private CA trust: %w", err)
+	}
+	if err := persistControlURL(controlURL); err != nil {
+		return fmt.Errorf("persist Nexus URL: %w", err)
+	}
+	if _, err := persistSession(nodeConfigDir, true); err != nil {
+		return fmt.Errorf("persist worker session mode: %w", err)
+	}
+	return nil
+}
+
 var loginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "Authenticate this machine with the AceTeam Network",
@@ -152,13 +198,10 @@ func runInteractiveLogin() {
 	// so the serving identity stays the display hostname exactly as before.
 	var servingNodeUID string
 
-	// credsPersisted is true once a device-auth login has saved fabric
-	// credentials (a device API token or a direct-Redis URL) to disk. When set,
-	// a subsequent mesh-connect failure is non-fatal: the node is already
-	// enrolled and can serve fabric jobs over direct-Redis without the mesh
-	// (the self-host / single-box tenant shape, where headscale connectivity
-	// may be unavailable). See the network.Connect error handling below.
-	var credsPersisted bool
+	// persistedCreds records which independent fabric transport a device-auth
+	// login saved. A later mesh failure can preserve that enrollment without
+	// claiming a transport the token did not configure.
+	var persistedCreds persistedFabricCredentials
 
 	switch choice {
 	case nexus.NetChoiceVerified:
@@ -208,13 +251,13 @@ func runInteractiveLogin() {
 			if err := saveDeviceConfigToFile(authResult.Token); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save device config: %v\n", err)
 			} else {
-				credsPersisted = true
+				persistedCreds = fabricCredentialsAPI
 			}
 		} else if authResult.Token.RedisURL != "" {
 			if err := saveRedisURLToConfig(authResult.Token.RedisURL); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
 			} else {
-				credsPersisted = true
+				persistedCreds = fabricCredentialsRedis
 			}
 		}
 
@@ -303,24 +346,28 @@ func runInteractiveLogin() {
 
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
-		// A device-auth enrollment that already persisted fabric credentials
-		// must not be reported as a total failure just because the mesh
-		// (headscale) connection could not be established. Such a node can
-		// still serve fabric jobs over direct-Redis, which is the self-host /
-		// single-box tenant shape where mesh connectivity is often
-		// unavailable. Keep the saved credentials, finish enrollment with a
-		// clear warning, and let the worker keep retrying the mesh on its own.
-		// An authkey-only login (no persisted fabric creds) still fails hard,
-		// since the mesh connection is the entire point of that path.
-		if credsPersisted {
+		// A device-auth enrollment with independently persisted fabric
+		// credentials need not be discarded just because its mesh connection
+		// failed. Before reporting that partial success, make any explicitly
+		// supplied private CA durable for the unattended worker. An authkey-only
+		// login, or a failed credential write, still fails hard because it has no
+		// usable non-mesh enrollment to preserve.
+		if canKeepFabricEnrollmentWithoutMesh(choice, persistedCreds) {
 			spinner.StopWithError(fmt.Sprintf("Mesh connection failed: %v", err))
-			persistNexusURLBestEffort(nexusURL)
-			if _, serr := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), choice == nexus.NetChoiceDevice); serr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not persist session mode: %v\n", serr)
+			if persistErr := persistFabricEnrollmentWithoutMesh(
+				authServiceURL,
+				nexusURL,
+				network.GetNodeConfigDir(),
+				persistPrivateCATrust,
+				saveNexusURLToConfig,
+				nodesession.LoadOrInitialize,
+			); persistErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: fabric credentials were saved, but enrollment state could not be persisted: %v\n", persistErr)
+				os.Exit(1)
 			}
-			fmt.Fprintln(os.Stderr, "\n⚠️  Enrolled, but could not join the mesh network.")
-			fmt.Fprintln(os.Stderr, "   Device credentials are saved; this node can serve fabric jobs over direct-Redis.")
-			fmt.Fprintln(os.Stderr, "   The worker re-establishes its own connection and keeps retrying the mesh.")
+			fmt.Fprintln(os.Stderr, "\n⚠️  Fabric enrollment completed, but the mesh connection failed.")
+			fmt.Fprintf(os.Stderr, "   Credentials are saved; this node can serve fabric jobs over %s.\n", persistedCreds.transportName())
+			fmt.Fprintln(os.Stderr, "   The worker will retry the mesh when it starts.")
 			return
 		}
 		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
