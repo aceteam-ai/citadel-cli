@@ -206,7 +206,10 @@ func TestProtectedSetCookie(t *testing.T) {
 		"sb-ref-auth-token=secret; Path=/",
 		AppCredentialCookieName + "=replacement; Path=/",
 		AppNonceCookieName + "=replacement; Path=/",
+		"__host-ACE_APP_EXCHANGE=replacement; Path=/",
+		"%5F%5FHOST-ACE_APP_EXCHANGE=replacement; Path=/",
 		"custom-session=replacement; Path=/",
+		"CUSTOM-SESSION=replacement; Path=/",
 	} {
 		if !protectedSetCookie(value, []string{AppCredentialCookieName, AppNonceCookieName, "custom-session"}) {
 			t.Errorf("protectedSetCookie(%q) = false", value)
@@ -214,6 +217,9 @@ func TestProtectedSetCookie(t *testing.T) {
 	}
 	if protectedSetCookie("theme=dark; Path=/", []string{AppCredentialCookieName}) {
 		t.Error("unrelated app cookie must not be dropped")
+	}
+	if !protectedSetCookie("custom-session=replacement; Path=/", []string{"CUSTOM-SESSION"}) {
+		t.Error("configured protected cookie matching must be case-insensitive in both directions")
 	}
 }
 
@@ -237,6 +243,13 @@ func TestGatedSessionCookie(t *testing.T) {
 	none.Header.Set("Cookie", "theme=dark")
 	if v := gatedSessionCookie(none, nil); v != "" {
 		t.Errorf("gatedSessionCookie with no session material = %q, want empty", v)
+	}
+
+	marker := httptest.NewRequest(http.MethodGet, "https://x/", nil)
+	marker.Header.Set("Cookie", AppCredentialCookieName+"=credential; "+AppExchangeCookieName+"=internal")
+	got = gatedSessionCookie(marker, []string{AppCredentialCookieName, AppExchangeCookieName})
+	if got != AppCredentialCookieName+"=credential" {
+		t.Fatalf("gatedSessionCookie with remotely augmented marker = %q, want credential only", got)
 	}
 }
 

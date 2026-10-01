@@ -43,10 +43,23 @@ var platformSessionCookieExact = []string{
 const (
 	// AppCredentialCookieName is the host-only credential minted by the control
 	// plane for an app host. AppNonceCookieName binds the one-time browser
-	// handoff to the browser that initiated it. Neither may ever reach a pod.
+	// handoff to the browser that initiated it. AppExchangeCookieName is the
+	// short-lived loop-breaker marker set after a successful exchange. None may
+	// ever reach a pod.
 	AppCredentialCookieName = "__Host-ace_app"
 	AppNonceCookieName      = "__Host-ace_app_nonce"
+	AppExchangeCookieName   = "__Host-ace_app_exchange"
 )
+
+func isIngressInternalCookie(name string) bool {
+	decoded := name
+	if unescaped, err := url.PathUnescape(name); err == nil {
+		decoded = unescaped
+	}
+	return strings.EqualFold(decoded, AppCredentialCookieName) ||
+		strings.EqualFold(decoded, AppNonceCookieName) ||
+		strings.EqualFold(decoded, AppExchangeCookieName)
+}
 
 // isPlatformSessionCookie reports whether a cookie name belongs to the platform
 // session family. It matches the Supabase auth-token family broadly -- the base
@@ -148,13 +161,10 @@ func stripCookies(r *http.Request, augment []string) {
 	if len(cookies) == 0 {
 		return
 	}
-	drop := make(map[string]struct{}, len(augment))
-	for _, n := range augment {
-		drop[n] = struct{}{}
-	}
+	drop := cookieNameSet(augment)
 	kept := cookies[:0]
 	for _, ck := range cookies {
-		if _, ok := drop[ck.Name]; ok {
+		if isIngressInternalCookie(ck.Name) || cookieNameInSet(ck.Name, drop) {
 			continue
 		}
 		if isPlatformSessionCookie(ck.Name) {
@@ -184,7 +194,7 @@ func stripCookies(r *http.Request, augment []string) {
 func outboundSessionCookieLeaked(r *http.Request, augment []string) bool {
 	drop := cookieNameSet(augment)
 	for _, ck := range r.Cookies() {
-		if isPlatformSessionCookie(ck.Name) || cookieNameInSet(ck.Name, drop) {
+		if isIngressInternalCookie(ck.Name) || isPlatformSessionCookie(ck.Name) || cookieNameInSet(ck.Name, drop) {
 			return true
 		}
 	}
@@ -205,9 +215,20 @@ func cookieNameInSet(name string, set map[string]struct{}) bool {
 	if _, ok := set[name]; ok {
 		return true
 	}
+	for candidate := range set {
+		if strings.EqualFold(name, candidate) {
+			return true
+		}
+	}
 	if unescaped, err := url.PathUnescape(name); err == nil {
-		_, ok := set[unescaped]
-		return ok
+		if _, ok := set[unescaped]; ok {
+			return true
+		}
+		for candidate := range set {
+			if strings.EqualFold(unescaped, candidate) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -223,7 +244,7 @@ func protectedSetCookie(v string, augment []string) bool {
 		return false
 	}
 	name = strings.TrimSpace(name)
-	return isPlatformSessionCookie(name) || cookieNameInSet(name, cookieNameSet(augment))
+	return isIngressInternalCookie(name) || isPlatformSessionCookie(name) || cookieNameInSet(name, cookieNameSet(augment))
 }
 
 // gatedSessionCookie extracts the session-cookie material a gated app's authz
@@ -238,8 +259,14 @@ func gatedSessionCookie(r *http.Request, augment []string) string {
 	for _, n := range augment {
 		keep[n] = struct{}{}
 	}
+	exchangeMarkerNames := cookieNameSet([]string{AppExchangeCookieName})
 	var parts []string
 	for _, ck := range r.Cookies() {
+		// The exchange marker is ingress-internal loop state, never authz
+		// material. A remote feed cannot opt it into the authz request.
+		if cookieNameInSet(ck.Name, exchangeMarkerNames) {
+			continue
+		}
 		if isPlatformSessionCookie(ck.Name) {
 			parts = append(parts, ck.Name+"="+ck.Value)
 			continue

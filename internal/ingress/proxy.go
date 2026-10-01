@@ -2,7 +2,9 @@ package ingress
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"html"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,6 +26,12 @@ import (
 // bare apps domain (empty slug), or any host with an underscore (e.g. the
 // reserved _health host) is rejected here and 404s without a dial.
 var slugRegexp = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+const (
+	exchangeMarkerVersion = "v1"
+	exchangeMarkerMaxAge  = 30 * time.Second
+	exchangeMarkerSkew    = 5 * time.Second
+)
 
 // Resolver is the slug->route boundary the proxy consults. *Client implements
 // it; a fake is used in proxy tests. Resolve returning ok=false is a 404, while
@@ -201,7 +210,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	augment := p.cookieNames()
-	if strings.HasPrefix(r.URL.Path, "/_ace/") {
+	if reservedIngressPath(r.URL.Path) {
 		p.serveReserved(w, r, slug)
 		return
 	}
@@ -231,8 +240,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case decision.Allow:
 			subject = decision.Subject
+			if hasCookie(r, AppExchangeCookieName) {
+				p.clearExchangeMarker(w)
+			}
 		case decision.Reason != "":
 			p.clearCredential(w)
+			if p.hasFreshExchangeMarker(r, slug) {
+				p.clearExchangeMarker(w)
+				p.clearNonce(w)
+				p.handoffFailed(w)
+				return
+			}
 			p.bounce(w, r, slug)
 			return
 		case !hasCookie(r, AppCredentialCookieName):
@@ -320,9 +338,34 @@ func hasCookie(r *http.Request, name string) bool {
 	return err == nil && ck.Value != ""
 }
 
+func reservedIngressPath(requestPath string) bool {
+	isReserved := func(candidate string) bool {
+		candidate = strings.ToLower(candidate)
+		return candidate == "/_ace" || strings.HasPrefix(candidate, "/_ace/")
+	}
+	return isReserved(requestPath) || isReserved(path.Clean(requestPath))
+}
+
 // bounce binds a one-time login handoff to this browser. Navigations receive a
 // 303; programmatic fetches retain the 401 contract but still get Location.
 func (p *Proxy) bounce(w http.ResponseWriter, r *http.Request, slug string) {
+	if !isNavigation(r) {
+		nonce := ""
+		if existing, err := r.Cookie(AppNonceCookieName); err == nil && validHandoffNonce(existing.Value) {
+			nonce = existing.Value
+		}
+		location := p.loginLocation(slug, nonce, requestNext(r))
+		if location == "" {
+			p.logf("[ingress] login URL unavailable for slug=%q", slug)
+			serviceUnavailable(w)
+			return
+		}
+		w.Header().Set("Location", location)
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("authentication required\n"))
+		return
+	}
+
 	nonceBytes := make([]byte, 16)
 	if _, err := rand.Read(nonceBytes); err != nil {
 		p.logf("[ingress] cannot mint handoff nonce for slug=%q: %v", slug, err)
@@ -340,13 +383,15 @@ func (p *Proxy) bounce(w http.ResponseWriter, r *http.Request, slug string) {
 		Name: AppNonceCookieName, Value: nonce, Path: "/", Secure: true,
 		HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 300,
 	})
+	p.clearExchangeMarker(w)
 	w.Header().Set("Location", location)
-	if isNavigation(r) {
-		w.WriteHeader(http.StatusSeeOther)
-	} else {
-		w.WriteHeader(http.StatusUnauthorized)
-	}
+	w.WriteHeader(http.StatusSeeOther)
 	_, _ = w.Write([]byte("authentication required\n"))
+}
+
+func validHandoffNonce(value string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	return len(value) == 22 && err == nil && len(decoded) == 16
 }
 
 func (p *Proxy) loginLocation(slug, nonce, next string) string {
@@ -417,6 +462,7 @@ func (p *Proxy) serveReserved(w http.ResponseWriter, r *http.Request, slug strin
 		p.serveSession(w, r, slug)
 	case "/_ace/logout":
 		p.clearCredential(w)
+		p.clearExchangeMarker(w)
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	default:
 		notFound(w)
@@ -453,16 +499,70 @@ func (p *Proxy) serveSession(w http.ResponseWriter, r *http.Request, slug string
 		Name: AppCredentialCookieName, Value: result.Credential, Path: "/", Secure: true,
 		HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: result.MaxAge,
 	})
+	p.setExchangeMarker(w, result.Credential, slug, time.Now())
 	p.clearNonce(w)
-	http.Redirect(w, r, result.Next, http.StatusSeeOther)
+	w.Header().Set("Location", result.Next)
+	w.WriteHeader(http.StatusSeeOther)
 }
 
 func safeNext(next string) bool {
 	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.Contains(next, "\\") || strings.ContainsAny(next, "\r\n") {
 		return false
 	}
+	for i := 0; i < len(next); i++ {
+		if next[i] <= 0x20 || next[i] == 0x7f {
+			return false
+		}
+	}
 	u, err := url.ParseRequestURI(next)
-	return err == nil && u.IsAbs() == false && u.Host == ""
+	if err != nil || u.IsAbs() || u.Host != "" {
+		return false
+	}
+	for _, segment := range strings.Split(u.Path, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func exchangeMarker(credential, slug string, issued time.Time) string {
+	issuedUnix := strconv.FormatInt(issued.Unix(), 10)
+	mac := hmac.New(sha256.New, []byte(credential))
+	_, _ = mac.Write([]byte("ace-app-exchange\x00" + slug + "\x00" + issuedUnix))
+	return exchangeMarkerVersion + "." + issuedUnix + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func validExchangeMarker(marker, credential, slug string, now time.Time) bool {
+	parts := strings.Split(marker, ".")
+	if len(parts) != 3 || parts[0] != exchangeMarkerVersion || credential == "" {
+		return false
+	}
+	issuedUnix, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return false
+	}
+	issued := time.Unix(issuedUnix, 0)
+	if issued.After(now.Add(exchangeMarkerSkew)) || now.Sub(issued) > exchangeMarkerMaxAge {
+		return false
+	}
+	want := exchangeMarker(credential, slug, issued)
+	return hmac.Equal([]byte(marker), []byte(want))
+}
+
+func (p *Proxy) hasFreshExchangeMarker(r *http.Request, slug string) bool {
+	marker, markerErr := r.Cookie(AppExchangeCookieName)
+	credential, credentialErr := r.Cookie(AppCredentialCookieName)
+	return markerErr == nil && credentialErr == nil &&
+		validExchangeMarker(marker.Value, credential.Value, slug, time.Now())
+}
+
+func (p *Proxy) setExchangeMarker(w http.ResponseWriter, credential, slug string, issued time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name: AppExchangeCookieName, Value: exchangeMarker(credential, slug, issued),
+		Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		MaxAge: int(exchangeMarkerMaxAge / time.Second),
+	})
 }
 
 func (p *Proxy) handoffFailed(w http.ResponseWriter) {
@@ -478,6 +578,10 @@ func (p *Proxy) clearCredential(w http.ResponseWriter) {
 
 func (p *Proxy) clearNonce(w http.ResponseWriter) {
 	expireCookie(w, AppNonceCookieName)
+}
+
+func (p *Proxy) clearExchangeMarker(w http.ResponseWriter) {
+	expireCookie(w, AppExchangeCookieName)
 }
 
 func expireCookie(w http.ResponseWriter, name string) {
