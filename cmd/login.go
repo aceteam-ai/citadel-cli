@@ -4,7 +4,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -27,12 +29,29 @@ const (
 	fabricCredentialsRedis
 )
 
-// canKeepFabricEnrollmentWithoutMesh is deliberately narrow: only an
-// interactive device grant can enroll the fabric side independently of the
-// mesh, and only after one of its fabric credential writes succeeded. An
-// authkey-only login still depends entirely on the mesh connection.
-func canKeepFabricEnrollmentWithoutMesh(choice nexus.NetworkChoice, creds persistedFabricCredentials) bool {
-	return choice == nexus.NetChoiceDevice && creds != fabricCredentialsNone
+// canKeepFabricEnrollmentWithoutMesh is deliberately narrow: only a
+// self-hosted interactive device grant can enroll the fabric side independently
+// of the mesh, and only after one of its fabric credential writes succeeded.
+// Managed aceteam.ai login retains its existing fail-closed mesh requirement.
+func canKeepFabricEnrollmentWithoutMesh(choice nexus.NetworkChoice, creds persistedFabricCredentials, authURL, controlURL string) bool {
+	return choice == nexus.NetChoiceDevice &&
+		creds != fabricCredentialsNone &&
+		isSelfHostedEndpointPair(authURL, controlURL)
+}
+
+func isSelfHostedEndpointPair(authURL, controlURL string) bool {
+	for _, raw := range []string{authURL, controlURL} {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || u.User != nil ||
+			(u.Scheme != "https" && u.Scheme != "http") {
+			return false
+		}
+		host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+		if host == "aceteam.ai" || strings.HasSuffix(host, ".aceteam.ai") {
+			return false
+		}
+	}
+	return true
 }
 
 func (c persistedFabricCredentials) transportName() string {
@@ -45,24 +64,25 @@ func (c persistedFabricCredentials) transportName() string {
 // persistFabricEnrollmentWithoutMesh makes the partial enrollment durable
 // before login reports success. Unlike the ordinary connected path, none of
 // these writes can be best-effort: without the CA or Nexus URL an unattended
-// worker may not reach this self-hosted tenant, and without a valid session
-// mode it may not start as a worker.
+// worker may not reach this self-hosted tenant, and without valid session
+// state a later bare invocation cannot honor the operator's preserved intent.
 func persistFabricEnrollmentWithoutMesh(
 	authURL, controlURL, nodeConfigDir string,
 	persistTrust func(string, string) error,
 	persistControlURL func(string) error,
 	persistSession func(string, bool) (nodesession.Config, error),
-) error {
+) (nodesession.Config, error) {
 	if err := persistTrust(authURL, controlURL); err != nil {
-		return fmt.Errorf("persist private CA trust: %w", err)
+		return nodesession.Config{}, fmt.Errorf("persist control-plane trust: %w", err)
 	}
 	if err := persistControlURL(controlURL); err != nil {
-		return fmt.Errorf("persist Nexus URL: %w", err)
+		return nodesession.Config{}, fmt.Errorf("persist Nexus URL: %w", err)
 	}
-	if _, err := persistSession(nodeConfigDir, true); err != nil {
-		return fmt.Errorf("persist worker session mode: %w", err)
+	cfg, err := persistSession(nodeConfigDir, true)
+	if err != nil {
+		return nodesession.Config{}, fmt.Errorf("persist node session mode: %w", err)
 	}
-	return nil
+	return cfg, nil
 }
 
 var loginCmd = &cobra.Command{
@@ -352,22 +372,28 @@ func runInteractiveLogin() {
 		// supplied private CA durable for the unattended worker. An authkey-only
 		// login, or a failed credential write, still fails hard because it has no
 		// usable non-mesh enrollment to preserve.
-		if canKeepFabricEnrollmentWithoutMesh(choice, persistedCreds) {
+		if canKeepFabricEnrollmentWithoutMesh(choice, persistedCreds, authServiceURL, nexusURL) {
 			spinner.StopWithError(fmt.Sprintf("Mesh connection failed: %v", err))
-			if persistErr := persistFabricEnrollmentWithoutMesh(
+			sessionCfg, persistErr := persistFabricEnrollmentWithoutMesh(
 				authServiceURL,
 				nexusURL,
 				network.GetNodeConfigDir(),
 				persistPrivateCATrust,
 				saveNexusURLToConfig,
 				nodesession.LoadOrInitialize,
-			); persistErr != nil {
+			)
+			if persistErr != nil {
 				fmt.Fprintf(os.Stderr, "Error: fabric credentials were saved, but enrollment state could not be persisted: %v\n", persistErr)
 				os.Exit(1)
 			}
 			fmt.Fprintln(os.Stderr, "\n⚠️  Fabric enrollment completed, but the mesh connection failed.")
-			fmt.Fprintf(os.Stderr, "   Credentials are saved; this node can serve fabric jobs over %s.\n", persistedCreds.transportName())
-			fmt.Fprintln(os.Stderr, "   The worker will retry the mesh when it starts.")
+			fmt.Fprintf(os.Stderr, "   Credentials are saved for %s.\n", persistedCreds.transportName())
+			if sessionCfg.Mode == nodesession.Worker {
+				fmt.Fprintln(os.Stderr, "   Worker mode is active; the node can serve fabric jobs without the mesh.")
+				fmt.Fprintln(os.Stderr, "   The worker will retry the mesh when it starts.")
+			} else {
+				fmt.Fprintln(os.Stderr, "   Existing presence-only mode was preserved; run 'citadel work' explicitly to serve jobs.")
+			}
 			return
 		}
 		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))

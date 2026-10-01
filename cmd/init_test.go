@@ -777,6 +777,66 @@ func TestSaveRedisURLToConfig_CallsFixStatePermissionsAfterWrite(t *testing.T) {
 	}
 }
 
+func TestSaveRedisURLToConfig_ReplacesPriorAPIIdentity(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.yaml")
+	withHookOverrides(t, dir, func() {})
+
+	prior := `device_api_token: dat_old_tenant
+api_base_url: https://old.example
+org_id: old-org
+org_name: Old Org
+user_email: old@example.com
+user_name: Old User
+fabric_node_id: "123"
+nexus_url: https://old-nexus.example
+aceteam_api_key: act_operator_owned
+custom_setting: keep-me
+`
+	if err := os.WriteFile(configFile, []byte(prior), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	const redisURL = "redis://new-tenant.example:6379"
+	if err := saveRedisURLToConfig(redisURL); err != nil {
+		t.Fatalf("saveRedisURLToConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]interface{}
+	if err := yaml.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["redis_url"] != redisURL {
+		t.Fatalf("redis_url = %v, want %s", got["redis_url"], redisURL)
+	}
+	for _, stale := range []string{
+		"device_api_token", "api_base_url", "org_id", "org_name",
+		"user_email", "user_name", "fabric_node_id",
+	} {
+		if _, ok := got[stale]; ok {
+			t.Errorf("stale API identity field %q survived Redis-only enrollment", stale)
+		}
+	}
+	if got["aceteam_api_key"] != "act_operator_owned" {
+		t.Errorf("operator-owned aceteam_api_key was not preserved: %v", got["aceteam_api_key"])
+	}
+	if got["custom_setting"] != "keep-me" {
+		t.Errorf("unrelated config was not preserved: %v", got["custom_setting"])
+	}
+	if got["nexus_url"] != "https://old-nexus.example" {
+		t.Errorf("nexus_url changed before enrollment outcome: %v", got["nexus_url"])
+	}
+
+	dc := readDeviceConfigFromDirs([]string{dir})
+	if dc == nil || dc.DeviceAPIToken != "" || dc.RedisURL != redisURL {
+		t.Fatalf("effective device config = %+v, want Redis-only", dc)
+	}
+}
+
 // TestSaveDeviceConfigToFile_SkipsFixStatePermissionsOnWriteFailure verifies
 // the fix is applied only after a SUCCESSFUL write: fixStatePermissionsFn must
 // never run (and must never turn a failed write into a reported success) when

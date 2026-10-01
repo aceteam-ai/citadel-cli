@@ -13,20 +13,26 @@ func TestCanKeepFabricEnrollmentWithoutMesh(t *testing.T) {
 		name   string
 		choice nexus.NetworkChoice
 		creds  persistedFabricCredentials
+		auth   string
+		nexus  string
 		want   bool
 	}{
-		{name: "device API credentials saved", choice: nexus.NetChoiceDevice, creds: fabricCredentialsAPI, want: true},
-		{name: "device Redis credentials saved", choice: nexus.NetChoiceDevice, creds: fabricCredentialsRedis, want: true},
-		{name: "device credential write failed", choice: nexus.NetChoiceDevice, creds: fabricCredentialsNone, want: false},
-		{name: "authkey has no independent fabric enrollment", choice: nexus.NetChoiceAuthkey, creds: fabricCredentialsNone, want: false},
-		{name: "authkey cannot inherit API state", choice: nexus.NetChoiceAuthkey, creds: fabricCredentialsAPI, want: false},
-		{name: "verified choice does not enroll", choice: nexus.NetChoiceVerified, creds: fabricCredentialsAPI, want: false},
+		{name: "self-host device API credentials saved", choice: nexus.NetChoiceDevice, creds: fabricCredentialsAPI, auth: "https://aceteam.internal", nexus: "https://nexus.aceteam.internal", want: true},
+		{name: "self-host device Redis credentials saved", choice: nexus.NetChoiceDevice, creds: fabricCredentialsRedis, auth: "https://aceteam.internal", nexus: "https://nexus.aceteam.internal", want: true},
+		{name: "device credential write failed", choice: nexus.NetChoiceDevice, creds: fabricCredentialsNone, auth: "https://aceteam.internal", nexus: "https://nexus.aceteam.internal", want: false},
+		{name: "authkey has no independent fabric enrollment", choice: nexus.NetChoiceAuthkey, creds: fabricCredentialsNone, auth: "https://aceteam.internal", nexus: "https://nexus.aceteam.internal", want: false},
+		{name: "authkey cannot inherit API state", choice: nexus.NetChoiceAuthkey, creds: fabricCredentialsAPI, auth: "https://aceteam.internal", nexus: "https://nexus.aceteam.internal", want: false},
+		{name: "verified choice does not enroll", choice: nexus.NetChoiceVerified, creds: fabricCredentialsAPI, auth: "https://aceteam.internal", nexus: "https://nexus.aceteam.internal", want: false},
+		{name: "managed pair still requires mesh", choice: nexus.NetChoiceDevice, creds: fabricCredentialsAPI, auth: "https://aceteam.ai", nexus: "https://nexus.aceteam.ai", want: false},
+		{name: "managed auth with custom Nexus still requires mesh", choice: nexus.NetChoiceDevice, creds: fabricCredentialsAPI, auth: "https://api.aceteam.ai", nexus: "https://nexus.internal", want: false},
+		{name: "custom auth with managed Nexus still requires mesh", choice: nexus.NetChoiceDevice, creds: fabricCredentialsAPI, auth: "https://auth.internal", nexus: "https://nexus.aceteam.ai", want: false},
+		{name: "invalid endpoint rejected", choice: nexus.NetChoiceDevice, creds: fabricCredentialsAPI, auth: "://bad", nexus: "https://nexus.internal", want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := canKeepFabricEnrollmentWithoutMesh(tt.choice, tt.creds); got != tt.want {
-				t.Fatalf("canKeepFabricEnrollmentWithoutMesh(%q, %d) = %v, want %v", tt.choice, tt.creds, got, tt.want)
+			if got := canKeepFabricEnrollmentWithoutMesh(tt.choice, tt.creds, tt.auth, tt.nexus); got != tt.want {
+				t.Fatalf("canKeepFabricEnrollmentWithoutMesh(%q, %d, %q, %q) = %v, want %v", tt.choice, tt.creds, tt.auth, tt.nexus, got, tt.want)
 			}
 		})
 	}
@@ -43,7 +49,7 @@ func TestPersistedFabricCredentialsTransportName(t *testing.T) {
 
 func TestPersistFabricEnrollmentWithoutMesh(t *testing.T) {
 	var calls []string
-	err := persistFabricEnrollmentWithoutMesh(
+	cfg, err := persistFabricEnrollmentWithoutMesh(
 		"https://auth.internal",
 		"https://nexus.internal",
 		"/node",
@@ -60,11 +66,14 @@ func TestPersistFabricEnrollmentWithoutMesh(t *testing.T) {
 				t.Fatal("meshless device enrollment persisted a non-worker session")
 			}
 			calls = append(calls, "session:"+dir)
-			return nodesession.Config{}, nil
+			return nodesession.Config{Mode: nodesession.Worker}, nil
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.Mode != nodesession.Worker {
+		t.Fatalf("session mode = %q, want worker", cfg.Mode)
 	}
 	want := []string{
 		"trust:https://auth.internal:https://nexus.internal",
@@ -97,7 +106,7 @@ func TestPersistFabricEnrollmentWithoutMeshFailsClosed(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			calls := 0
-			err := persistFabricEnrollmentWithoutMesh(
+			_, err := persistFabricEnrollmentWithoutMesh(
 				"https://auth.internal",
 				"https://nexus.internal",
 				"/node",
@@ -115,5 +124,24 @@ func TestPersistFabricEnrollmentWithoutMeshFailsClosed(t *testing.T) {
 				t.Fatalf("persistence calls = %d, want %d", calls, tt.wantCalls)
 			}
 		})
+	}
+}
+
+func TestPersistFabricEnrollmentWithoutMeshPreservesPresenceIntent(t *testing.T) {
+	cfg, err := persistFabricEnrollmentWithoutMesh(
+		"https://auth.internal",
+		"https://nexus.internal",
+		"/node",
+		func(string, string) error { return nil },
+		func(string) error { return nil },
+		func(string, bool) (nodesession.Config, error) {
+			return nodesession.Config{Mode: nodesession.Presence}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Mode != nodesession.Presence {
+		t.Fatalf("session mode = %q, want preserved presence", cfg.Mode)
 	}
 }
