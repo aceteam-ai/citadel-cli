@@ -78,14 +78,49 @@ func TestSafeNext(t *testing.T) {
 	}{
 		{next: "/", want: true},
 		{next: "/docs?q=1", want: true},
+		{next: "/a//b?x=%2F%20", want: true},
+		{next: "/ok?next=/../evil", want: true},
+		{next: "/%2F%2F", want: true},
+		{next: "/%5C", want: true},
+		{next: "/%09", want: true},
 		{next: "//evil.example/", want: false},
 		{next: "/\\evil.example/", want: false},
 		{next: "https://evil.example/", want: false},
 		{next: "relative", want: false},
 		{next: "/ok\r\nLocation: https://evil.example", want: false},
+		{next: "/a/..//evil.example", want: false},
+		{next: "/.//evil.example", want: false},
+		{next: "/../evil.example", want: false},
+		{next: "/a/./b", want: false},
+		{next: "/%2e%2e/evil.example", want: false},
+		{next: "/a/.%2E/b", want: false},
+		{next: "/has space", want: false},
+		{next: "/has\ttab", want: false},
+		{next: "/has\x7fdelete", want: false},
 	} {
 		if got := safeNext(tc.next); got != tc.want {
 			t.Errorf("safeNext(%q) = %v, want %v", tc.next, got, tc.want)
+		}
+	}
+}
+
+func TestReservedIngressPath(t *testing.T) {
+	for _, tc := range []struct {
+		requestPath string
+		want        bool
+	}{
+		{requestPath: "/_ace", want: true},
+		{requestPath: "/_ace/session", want: true},
+		{requestPath: "//_ace/session", want: true},
+		{requestPath: "/_ACE/session", want: true},
+		{requestPath: "/x/../_ace/session", want: true},
+		{requestPath: "/_ace/../public", want: true},
+		{requestPath: "/_aceevil", want: false},
+		{requestPath: "/x/_ace/session", want: false},
+		{requestPath: "/", want: false},
+	} {
+		if got := reservedIngressPath(tc.requestPath); got != tc.want {
+			t.Errorf("reservedIngressPath(%q) = %v, want %v", tc.requestPath, got, tc.want)
 		}
 	}
 }
@@ -355,7 +390,10 @@ func TestProxy_SSEIncremental(t *testing.T) {
 func TestProxy_WebSocketEcho(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := upgrader.Upgrade(w, r, nil)
+		responseHeader := http.Header{}
+		responseHeader.Add("Set-Cookie", "__HOST-ACE_APP_EXCHANGE=pod-marker; Path=/")
+		responseHeader.Add("Set-Cookie", "SESS=pod-session; Path=/")
+		c, err := upgrader.Upgrade(w, r, responseHeader)
 		if err != nil {
 			return
 		}
@@ -383,11 +421,17 @@ func TestProxy_WebSocketEcho(t *testing.T) {
 		},
 		HandshakeTimeout: 5 * time.Second,
 	}
-	c, _, err := dialer.Dial("ws://app.apps.example.com/", nil)
+	c, handshake, err := dialer.Dial("ws://app.apps.example.com/", nil)
 	if err != nil {
 		t.Fatalf("ws dial through proxy: %v", err)
 	}
 	defer c.Close()
+	if handshake == nil {
+		t.Fatal("ws dial returned no handshake response")
+	}
+	if got := handshake.Header.Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("protected WebSocket Set-Cookie survived upgrade: %v", got)
+	}
 	if err := c.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
 		t.Fatal(err)
 	}
@@ -417,14 +461,57 @@ func TestProxy_GatedNoCookieDeniedIs401Redirect(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "https://login.example.com/start?") {
+	loc := resp.Header.Get("Location")
+	if !strings.HasPrefix(loc, "https://login.example.com/start?") {
 		t.Fatalf("Location = %q, want the login URL with handoff query", loc)
+	}
+	parsedLocation, err := url.Parse(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nonce := parsedLocation.Query().Get("nonce"); nonce != "" {
+		t.Fatalf("fetch without an in-flight nonce reflected %q", nonce)
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == AppNonceCookieName {
+			t.Fatalf("fetch 401 must not set or clear the nonce cookie: %#v", cookie)
+		}
 	}
 	if atomic.LoadInt32(&authz.calls) != 1 {
 		t.Fatalf("authz calls = %d, want 1 (authz is the visibility authority even for anonymous)", atomic.LoadInt32(&authz.calls))
 	}
 	if atomic.LoadInt32(&d.calls) != 0 {
 		t.Fatal("no dial should happen for a denied gated request")
+	}
+}
+
+func TestProxy_FetchBouncePreservesInFlightNonce(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"}
+	authz := &fakeAuthorizer{allow: false}
+	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+	nonce := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef"))
+	resp := get(t, ts, "app.apps.example.com", "/poll", map[string]string{
+		"Cookie": AppNonceCookieName + "=" + nonce,
+		"Accept": "application/json",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	location, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := location.Query().Get("nonce"); got != nonce {
+		t.Fatalf("Location nonce = %q, want existing in-flight nonce", got)
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == AppNonceCookieName {
+			t.Fatalf("fetch 401 overwrote in-flight nonce: %#v", cookie)
+		}
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("fetch bounce must not dial a pod")
 	}
 }
 
@@ -477,7 +564,7 @@ func TestProxy_HandoffThenCredentialAuthzAndPodIsolation(t *testing.T) {
 	code := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	exchange := &fakeExchanger{
 		status: http.StatusOK,
-		result: ExchangeResult{Credential: "minted-credential", MaxAge: 600, Next: "/welcome?x=1"},
+		result: ExchangeResult{Credential: "minted-credential", MaxAge: 600, Next: "/welcome//next?x=%2F%20"},
 	}
 	res := &fakeResolver{
 		routes: map[string]Route{"app": gatedRoute()},
@@ -489,14 +576,16 @@ func TestProxy_HandoffThenCredentialAuthzAndPodIsolation(t *testing.T) {
 	resp := get(t, ts, "app.apps.example.com", "/_ace/session?code="+code, map[string]string{
 		"Cookie": AppNonceCookieName + "=browser-nonce",
 	})
-	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/welcome?x=1" {
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/welcome//next?x=%2F%20" {
 		t.Fatalf("handoff status=%d Location=%q", resp.StatusCode, resp.Header.Get("Location"))
 	}
-	var credential, expiredNonce *http.Cookie
+	var credential, exchangeMarkerCookie, expiredNonce *http.Cookie
 	for _, cookie := range resp.Cookies() {
 		switch cookie.Name {
 		case AppCredentialCookieName:
 			credential = cookie
+		case AppExchangeCookieName:
+			exchangeMarkerCookie = cookie
 		case AppNonceCookieName:
 			expiredNonce = cookie
 		}
@@ -504,6 +593,12 @@ func TestProxy_HandoffThenCredentialAuthzAndPodIsolation(t *testing.T) {
 	resp.Body.Close()
 	if credential == nil || credential.Value != "minted-credential" || credential.MaxAge != 600 || !credential.Secure || !credential.HttpOnly || credential.SameSite != http.SameSiteLaxMode {
 		t.Fatalf("credential cookie = %#v", credential)
+	}
+	if exchangeMarkerCookie == nil || exchangeMarkerCookie.Path != "/" || exchangeMarkerCookie.MaxAge != int(exchangeMarkerMaxAge/time.Second) || !exchangeMarkerCookie.Secure || !exchangeMarkerCookie.HttpOnly || exchangeMarkerCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("exchange marker cookie = %#v", exchangeMarkerCookie)
+	}
+	if !validExchangeMarker(exchangeMarkerCookie.Value, credential.Value, "app", time.Now()) {
+		t.Fatal("exchange marker is not bound to the minted credential and slug")
 	}
 	if expiredNonce == nil || expiredNonce.MaxAge >= 0 {
 		t.Fatalf("expired nonce cookie = %#v", expiredNonce)
@@ -642,6 +737,31 @@ func TestProxy_HandoffReplayShowsStaticFailure(t *testing.T) {
 	}
 }
 
+func TestProxy_HandoffRejectsUnsafeNextWithoutCredential(t *testing.T) {
+	code := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	exchange := &fakeExchanger{
+		status: http.StatusOK,
+		result: ExchangeResult{Credential: "must-not-be-set", MaxAge: 600, Next: "/a/../evil"},
+	}
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"}
+	ts, d := startProxyWithExchanger(t, res, &fakeAuthorizer{}, exchange, "127.0.0.1:1")
+	resp := get(t, ts, "app.apps.example.com", "/_ace/session?code="+code, map[string]string{
+		"Cookie": AppNonceCookieName + "=browser-nonce",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || resp.Header.Get("Location") != "" {
+		t.Fatalf("status=%d Location=%q, want static 400", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == AppCredentialCookieName || cookie.Name == AppExchangeCookieName {
+			t.Fatalf("unsafe next set credential state: %#v", cookie)
+		}
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("unsafe next must not dial a pod")
+	}
+}
+
 func TestProxy_ReservedPathsFailClosedWithoutPodDial(t *testing.T) {
 	code := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	for _, tc := range []struct {
@@ -670,6 +790,36 @@ func TestProxy_ReservedPathsFailClosedWithoutPodDial(t *testing.T) {
 			name: "unknown reserved path",
 			res:  &fakeResolver{routes: map[string]Route{"app": gatedRoute()}},
 			path: "/_ace/not-a-handler", want: http.StatusNotFound,
+		},
+		{
+			name: "bare reserved path",
+			res:  &fakeResolver{routes: map[string]Route{"app": publicRoute()}},
+			path: "/_ace", want: http.StatusNotFound,
+		},
+		{
+			name: "repeated slash alias",
+			res:  &fakeResolver{routes: map[string]Route{"app": publicRoute()}},
+			path: "//_ace/session", want: http.StatusNotFound,
+		},
+		{
+			name: "case alias",
+			res:  &fakeResolver{routes: map[string]Route{"app": publicRoute()}},
+			path: "/_ACE/session", want: http.StatusNotFound,
+		},
+		{
+			name: "dot segment alias",
+			res:  &fakeResolver{routes: map[string]Route{"app": publicRoute()}},
+			path: "/x/../_ace/session", want: http.StatusNotFound,
+		},
+		{
+			name: "encoded mixed alias",
+			res:  &fakeResolver{routes: map[string]Route{"app": publicRoute()}},
+			path: "/x/%2e%2e/%5fAcE/session", want: http.StatusNotFound,
+		},
+		{
+			name: "reserved path cannot clean out",
+			res:  &fakeResolver{routes: map[string]Route{"app": publicRoute()}},
+			path: "/_ace/../public", want: http.StatusNotFound,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -714,18 +864,19 @@ func TestProxy_LogoutClearsCredentialWithoutControlPlaneCall(t *testing.T) {
 	exchange := &fakeExchanger{status: http.StatusOK}
 	ts, d := startProxyWithExchanger(t, res, authz, exchange, "127.0.0.1:1")
 	resp := get(t, ts, "app.apps.example.com", "/_ace/logout", map[string]string{
-		"Cookie": AppCredentialCookieName + "=credential",
+		"Cookie": AppCredentialCookieName + "=credential; " + AppExchangeCookieName + "=marker",
 	})
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/" {
 		t.Fatalf("status=%d Location=%q", resp.StatusCode, resp.Header.Get("Location"))
 	}
-	var cleared bool
+	var credentialCleared, markerCleared bool
 	for _, cookie := range resp.Cookies() {
-		cleared = cleared || cookie.Name == AppCredentialCookieName && cookie.MaxAge < 0
+		credentialCleared = credentialCleared || cookie.Name == AppCredentialCookieName && cookie.MaxAge < 0
+		markerCleared = markerCleared || cookie.Name == AppExchangeCookieName && cookie.MaxAge < 0
 	}
-	if !cleared || atomic.LoadInt32(&authz.calls) != 0 || atomic.LoadInt32(&exchange.calls) != 0 || atomic.LoadInt32(&d.calls) != 0 {
-		t.Fatalf("cleared=%v authz=%d exchange=%d dial=%d", cleared, authz.calls, exchange.calls, d.calls)
+	if !credentialCleared || !markerCleared || atomic.LoadInt32(&authz.calls) != 0 || atomic.LoadInt32(&exchange.calls) != 0 || atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatalf("credentialCleared=%v markerCleared=%v authz=%d exchange=%d dial=%d", credentialCleared, markerCleared, authz.calls, exchange.calls, d.calls)
 	}
 }
 
@@ -751,6 +902,134 @@ func TestProxy_ReasonDenyClearsCredentialAndRebounces(t *testing.T) {
 	}
 	if atomic.LoadInt32(&d.calls) != 0 {
 		t.Fatal("reason deny must not dial pod")
+	}
+}
+
+func TestExchangeMarkerValidation(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	marker := exchangeMarker("credential", "app", now)
+	for _, tc := range []struct {
+		name       string
+		marker     string
+		credential string
+		slug       string
+		now        time.Time
+		want       bool
+	}{
+		{name: "valid", marker: marker, credential: "credential", slug: "app", now: now.Add(10 * time.Second), want: true},
+		{name: "wrong credential", marker: marker, credential: "other", slug: "app", now: now.Add(10 * time.Second)},
+		{name: "wrong slug", marker: marker, credential: "credential", slug: "other", now: now.Add(10 * time.Second)},
+		{name: "expired", marker: marker, credential: "credential", slug: "app", now: now.Add(exchangeMarkerMaxAge + time.Second)},
+		{name: "too far in future", marker: marker, credential: "credential", slug: "app", now: now.Add(-exchangeMarkerSkew - time.Second)},
+		{name: "malformed", marker: "v1.bad.signature", credential: "credential", slug: "app", now: now},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validExchangeMarker(tc.marker, tc.credential, tc.slug, tc.now); got != tc.want {
+				t.Fatalf("validExchangeMarker = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProxy_FreshExchangeReasonDenyStopsBounceLoop(t *testing.T) {
+	const credential = "fresh-credential"
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"}
+	authz := &fakeAuthorizer{reason: "revoked"}
+	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+	marker := exchangeMarker(credential, "app", time.Now())
+	resp := get(t, ts, "app.apps.example.com", "/private", map[string]string{
+		"Cookie":         AppCredentialCookieName + "=" + credential + "; " + AppExchangeCookieName + "=" + marker,
+		"Sec-Fetch-Mode": "navigate",
+	})
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "handoff failed") {
+		t.Fatalf("status=%d body=%q, want static handoff failure", resp.StatusCode, body)
+	}
+	if location := resp.Header.Get("Location"); location != "" {
+		t.Fatalf("loop breaker must not redirect, got Location %q", location)
+	}
+	cleared := map[string]bool{}
+	for _, cookie := range resp.Cookies() {
+		if cookie.MaxAge < 0 {
+			cleared[cookie.Name] = true
+		}
+		if cookie.Name == AppNonceCookieName && cookie.MaxAge > 0 {
+			t.Fatalf("loop breaker minted a new nonce: %#v", cookie)
+		}
+	}
+	for _, name := range []string{AppCredentialCookieName, AppExchangeCookieName, AppNonceCookieName} {
+		if !cleared[name] {
+			t.Fatalf("cookie %q was not cleared: %v", name, resp.Header.Values("Set-Cookie"))
+		}
+	}
+	if strings.Contains(authz.lastCookie, AppExchangeCookieName) {
+		t.Fatalf("exchange marker leaked to authz: %q", authz.lastCookie)
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("loop breaker must not dial a pod")
+	}
+}
+
+func TestProxy_StaleExchangeMarkerPreservesRebounce(t *testing.T) {
+	const credential = "stale-credential"
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"}
+	authz := &fakeAuthorizer{reason: "revoked"}
+	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+	marker := exchangeMarker(credential, "app", time.Now().Add(-exchangeMarkerMaxAge-time.Second))
+	resp := get(t, ts, "app.apps.example.com", "/private", map[string]string{
+		"Cookie":         AppCredentialCookieName + "=" + credential + "; " + AppExchangeCookieName + "=" + marker,
+		"Sec-Fetch-Mode": "navigate",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") == "" {
+		t.Fatalf("status=%d Location=%q, want normal re-bounce", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	var credentialCleared, markerCleared, nonceMinted bool
+	for _, cookie := range resp.Cookies() {
+		credentialCleared = credentialCleared || cookie.Name == AppCredentialCookieName && cookie.MaxAge < 0
+		markerCleared = markerCleared || cookie.Name == AppExchangeCookieName && cookie.MaxAge < 0
+		nonceMinted = nonceMinted || cookie.Name == AppNonceCookieName && cookie.MaxAge == 300
+	}
+	if !credentialCleared || !markerCleared || !nonceMinted {
+		t.Fatalf("Set-Cookie = %v, want cleared credential/marker and fresh nonce", resp.Header.Values("Set-Cookie"))
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("stale marker re-bounce must not dial a pod")
+	}
+}
+
+func TestProxy_AllowedRequestClearsAndStripsExchangeMarker(t *testing.T) {
+	var podCookie string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		podCookie = r.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	const credential = "fresh-credential"
+	marker := exchangeMarker(credential, "app", time.Now())
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}}
+	authz := &fakeAuthorizer{allow: true, subject: "viewer"}
+	ts, _ := startProxy(t, res, authz, upstream.Listener.Addr().String())
+	resp := get(t, ts, "app.apps.example.com", "/private", map[string]string{
+		"Cookie": AppCredentialCookieName + "=" + credential + "; " + AppExchangeCookieName + "=" + marker + "; theme=dark",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if strings.Contains(authz.lastCookie, AppExchangeCookieName) {
+		t.Fatalf("exchange marker leaked to authz: %q", authz.lastCookie)
+	}
+	if podCookie != "theme=dark" {
+		t.Fatalf("pod Cookie = %q, want only unrelated cookie", podCookie)
+	}
+	var markerCleared bool
+	for _, cookie := range resp.Cookies() {
+		markerCleared = markerCleared || cookie.Name == AppExchangeCookieName && cookie.MaxAge < 0
+	}
+	if !markerCleared {
+		t.Fatalf("successful authz did not clear exchange marker: %v", resp.Header.Values("Set-Cookie"))
 	}
 }
 
@@ -935,7 +1214,9 @@ func TestProxy_ModifyResponseStripsCookieDomain(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Set-Cookie", "id=abc; Domain=apps.example.com; Path=/")
 		w.Header().Add("Set-Cookie", AppCredentialCookieName+"=pod-replacement; Path=/")
+		w.Header().Add("Set-Cookie", "__HOST-ACE_APP_EXCHANGE=pod-marker; Path=/")
 		w.Header().Add("Set-Cookie", "sb-ref-auth-token=pod-session; Path=/")
+		w.Header().Add("Set-Cookie", "SESS=case-variant; Path=/")
 		w.WriteHeader(200)
 	}))
 	defer upstream.Close()
