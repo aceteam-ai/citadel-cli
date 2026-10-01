@@ -43,19 +43,21 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates ffmpeg libgomp1 libopengl0 libvulkan1 vulkan-tools \
+       ca-certificates ffmpeg libegl1 libgomp1 libopengl0 libvulkan1 vulkan-tools \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /input /output /usr/share/licenses/spirula-studio
+    && mkdir -p /input /output \
+       /usr/share/licenses/citadel-cli /usr/share/licenses/spirula-studio
 
 COPY --from=runner-build /out/spirula-reconstruct /usr/local/bin/spirula-reconstruct
 COPY --from=upstream /usr/local/bin/spirula /usr/local/bin/spirula
 COPY --from=upstream /usr/share/licenses/spirula-studio/LICENSE /usr/share/licenses/spirula-studio/LICENSE
+COPY LICENSE /usr/share/licenses/citadel-cli/LICENSE
 COPY services/spirula-reconstruct/THIRD_PARTY_NOTICES.md /usr/share/doc/spirula-reconstruct/THIRD_PARTY_NOTICES.md
 
 LABEL org.opencontainers.image.title="AceTeam Spirula reconstruct worker" \
       org.opencontainers.image.description="One-shot node-local frames-to-3DGS pipeline" \
       org.opencontainers.image.source="https://github.com/aceteam-ai/citadel-cli" \
-      org.opencontainers.image.licenses="Apache-2.0 AND GPL-3.0-only" \
+      org.opencontainers.image.licenses="Elastic-2.0 AND GPL-3.0-only" \
       org.opencontainers.image.vendor="AceTeam.ai" \
       ai.aceteam.spirula.version="2026.9.30" \
       ai.aceteam.spirula.source="https://github.com/harry7557558/spirula-studio/tree/1943edaf83abf0d00b9ca2d2023424ba1e831d6a"

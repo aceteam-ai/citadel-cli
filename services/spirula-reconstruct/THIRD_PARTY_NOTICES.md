@@ -12,6 +12,9 @@ This image contains the unmodified Linux release binary of Spirula Studio:
 The complete GPL text is installed in the image at
 `/usr/share/licenses/spirula-studio/LICENSE`.
 
-Spirula is a separate program. The Apache-2.0 Citadel orchestration binary
+Spirula is a separate program. The Elastic-2.0 Citadel orchestration binary
 invokes it as a subprocess and neither vendors nor links Spirula source. The two
 programs are distributed together as mere aggregation in this container.
+
+The Citadel orchestration binary's Elastic License 2.0 terms are installed at
+`/usr/share/licenses/citadel-cli/LICENSE`.

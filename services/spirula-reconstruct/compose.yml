@@ -21,13 +21,13 @@ services:
     tmpfs:
       - /tmp:mode=1777
     volumes:
-      - "${RECONSTRUCT_INPUT:?set RECONSTRUCT_INPUT to a video file or frame directory}:/input:ro"
+      - "${RECONSTRUCT_INPUT:?set RECONSTRUCT_INPUT to a video file or frame directory}:/input/source:ro"
       # Mount the output parent at the same absolute node path so the JSON
       # artifact reference remains valid after this one-shot container exits.
       - "${RECONSTRUCT_OUTPUT:?set RECONSTRUCT_OUTPUT to a writable absolute output directory}:${RECONSTRUCT_OUTPUT:?set RECONSTRUCT_OUTPUT to a writable absolute output directory}"
     command:
       - --input
-      - /input
+      - /input/source
       - --output
       - "${RECONSTRUCT_OUTPUT:?set RECONSTRUCT_OUTPUT to a writable absolute output directory}/${RECONSTRUCT_JOB_ID:?set a new RECONSTRUCT_JOB_ID}"
       - --sfm-quality
