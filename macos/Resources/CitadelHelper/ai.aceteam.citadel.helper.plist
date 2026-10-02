@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon definition for CitadelHelper, registered via
+  SMAppService.daemon(plistName: "ai.aceteam.citadel.helper.plist") from
+  CitadelKit/HelperConnection.swift.
+
+  Placement requirement (enforced by the OS, not by this repo): once bundled
+  by #672's packaging step, this file must live at
+  Contents/Library/LaunchDaemons/ai.aceteam.citadel.helper.plist inside
+  Citadel.app, and BundleProgram must point at the helper executable within
+  the SAME bundle (Contents/MacOS/CitadelHelper). SMAppService refuses to
+  register a daemon plist found anywhere else.
+
+  Label, the MachServices key, and BundleProgram's executable name must stay
+  in sync with CitadelKit/HelperConstants.swift and the CitadelHelper
+  executable target's actual output name.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.aceteam.citadel.helper</string>
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/CitadelHelper</string>
+    <key>MachServices</key>
+    <dict>
+        <key>ai.aceteam.citadel.helper</key>
+        <true/>
+    </dict>
+    <!-- On-demand: launchd starts the helper the first time the app
+         connects (NSXPCConnection(machServiceName:)) rather than keeping it
+         resident, matching how `citadel up` is used today (invoked, then
+         torn down on disconnect) rather than always-on. -->
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
