@@ -7,11 +7,11 @@ Packer configuration for building a Citadel GPU node VM image that can be import
 The built image is an Ubuntu 24.04 LTS qcow2 with:
 
 - NVIDIA driver (570.x) + CUDA 12.8 toolkit (via runfile, DKMS-registered)
-- Docker CE + NVIDIA Container Toolkit (nvidia as default runtime)
+- Rootless Podman for the citadel user, NVIDIA Container Toolkit with CDI
 - Citadel CLI (latest release from GitHub)
-- vLLM Docker image pre-pulled
+- vLLM image pre-pulled into the citadel user's Podman storage
 - A first-boot service that initializes the node when an authkey is provided
-- systemd worker service gated on successful initialization
+- systemd user worker with linger, a user Podman socket, and cgroup delegation
 
 ## Prerequisites
 
@@ -85,9 +85,9 @@ The `deploy-to-proxmox.sh` script handles the full workflow: upload, template cr
 On first boot, the `citadel-firstboot.service` runs once:
 
 1. Reads the authkey from `/etc/citadel/authkey` (written by cloud-init)
-2. Runs `citadel init --authkey <key>` to join the network (no `--provision` since Docker/NVIDIA are already installed)
+2. Runs `citadel init --authkey <key>` as citadel to join the network (Podman/NVIDIA tooling is already installed)
 3. Copies the generated manifest to `/etc/citadel/citadel.yaml`
-4. Enables and starts `citadel-worker.service`
+4. Generates NVIDIA CDI after the driver loads and enables the citadel user worker
 5. Removes the authkey file and disables itself
 
 If no authkey is present, the service logs a warning and exits cleanly. You can manually initialize later:
@@ -95,7 +95,7 @@ If no authkey is present, the service logs a warning and exits cleanly. You can 
 ```bash
 ssh citadel@<vm-ip>
 citadel init --authkey <your-key>
-sudo systemctl enable --now citadel-worker.service
+systemctl --user enable --now podman.socket citadel-worker.service
 ```
 
 ## Manual Proxmox import
@@ -146,9 +146,9 @@ qm set 200 --hostpci0 0000:01:00,pcie=1
 |--------|---------|
 | `scripts/01-base.sh` | apt update, essential tools (curl, git, jq, htop, tmux, build-essential, dkms) |
 | `scripts/02-nvidia.sh` | NVIDIA driver + CUDA 12.8 via runfile installer with DKMS |
-| `scripts/03-docker.sh` | Docker CE + NVIDIA Container Toolkit, configures nvidia as default runtime |
-| `scripts/04-citadel.sh` | Downloads latest citadel-cli, creates systemd worker service (disabled) |
-| `scripts/05-vllm.sh` | Pre-pulls `vllm/vllm-openai:latest` Docker image |
+| `scripts/03-podman.sh` | Rootless Podman, user socket, subids, delegation and NVIDIA CDI tooling |
+| `scripts/04-citadel.sh` | Downloads latest citadel-cli, creates systemd user worker (disabled) |
+| `scripts/05-vllm.sh` | Pre-pulls vLLM and trusted hosted-app runtimes into Podman storage |
 | `scripts/06-firstboot.sh` | Installs one-shot first-boot service for authkey-based initialization |
 
 ## Customization

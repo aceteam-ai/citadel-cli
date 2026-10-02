@@ -209,9 +209,8 @@ write_files:
     owner: root:root
     permissions: '0600'
 
-# Ensure the citadel user has required group access
-runcmd:
-  - usermod -aG docker,systemd-journal,adm citadel || true
+# Group membership is baked and verified by scripts/03-podman.sh and
+# scripts/04-citadel.sh. Cloud-init must not add Docker privileges.
 CIEOF
 )
 

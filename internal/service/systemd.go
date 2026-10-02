@@ -53,8 +53,8 @@ func GenerateUnitFile(cfg ServiceConfig) (string, error) {
 func generateUserUnit(description, execLine string) string {
 	return fmt.Sprintf(`[Unit]
 Description=%s
-After=network-online.target
-Wants=network-online.target
+After=network-online.target podman.socket
+Wants=network-online.target podman.socket
 # Defense in depth against a crash-loop self-DoS (#443): if the process keeps
 # failing fast, enter a cooldown instead of a 10s restart storm.
 StartLimitIntervalSec=300

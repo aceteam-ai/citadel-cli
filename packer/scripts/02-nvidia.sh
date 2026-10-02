@@ -6,6 +6,17 @@
 # time -- only nvidia-smi verification is skipped.
 set -euo pipefail
 
+# JetPack owns the driver/toolkit on Jetson; the generic CUDA runfile would
+# replace its L4T stack. A CPU-only arm64 image does not need NVIDIA packages.
+if [ -s /etc/nv_tegra_release ] || grep -qiE 'jetson|tegra' /proc/device-tree/model /sys/firmware/devicetree/base/model 2>/dev/null; then
+    echo '==> Keeping JetPack-provided NVIDIA driver and toolkit.'
+    exit 0
+fi
+if [ "$(uname -m)" = aarch64 ] || [ "$(uname -m)" = arm64 ]; then
+    echo '==> CPU-only arm64 image; skipping generic NVIDIA driver/toolkit.'
+    exit 0
+fi
+
 echo "==> Installing NVIDIA driver + CUDA toolkit..."
 
 export DEBIAN_FRONTEND=noninteractive
@@ -22,7 +33,7 @@ RUNFILE_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/
 # Ensure kernel headers and DKMS are present (should be from 01-base.sh)
 apt-get update -y
 apt-get install -y --no-install-recommends \
-    linux-headers-$(uname -r) \
+    "linux-headers-$(uname -r)" \
     dkms \
     build-essential \
     pkg-config \

@@ -5,7 +5,7 @@
 #   1. Reads the authkey from /etc/citadel/authkey (injected by deploy script)
 #   2. Runs "citadel init --authkey <key>" to join the network
 #   3. Copies the generated manifest to /etc/citadel/ for the worker service
-#   4. Enables and starts citadel-worker.service
+#   4. Generates GPU CDI and starts the rootless user worker
 #   5. Disables itself so it never runs again
 set -euo pipefail
 
@@ -34,6 +34,27 @@ log() {
 
 log "Starting Citadel first-boot initialization..."
 
+# On a retry after worker startup, stop before authkey, manifest, or user-
+# manager changes. An operator must drain the worker for an explicit repair.
+citadel_uid=$(id -u citadel)
+as_citadel() {
+    runuser -u citadel -- env HOME=/home/citadel XDG_RUNTIME_DIR="/run/user/${citadel_uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${citadel_uid}/bus" "$@"
+}
+require_drained_firstboot_worker() {
+    local state unit
+    state=$(systemctl show "user@${citadel_uid}.service" -p ActiveState --value) || return 1
+    if [ "$state" = active ]; then
+        as_citadel systemctl --user show-environment >/dev/null || return 1
+        for unit in citadel-worker.service citadel.service; do
+            if as_citadel systemctl --user is-active --quiet "$unit"; then
+                log "ERROR: ${unit} is active; drain it before retrying firstboot."
+                return 1
+            fi
+        done
+    fi
+}
+require_drained_firstboot_worker || { log "ERROR: Cannot prove the worker is drained; refusing firstboot replay."; exit 1; }
+
 # -----------------------------------------------------------------------
 # 1. Read authkey
 # -----------------------------------------------------------------------
@@ -48,7 +69,7 @@ if [ -z "${AUTHKEY}" ]; then
     log "WARNING: No authkey found at ${AUTHKEY_FILE}."
     log "The node cannot join the network automatically."
     log "To initialize manually, run: citadel init --authkey <your-key>"
-    log "Then: sudo systemctl enable --now citadel-worker.service"
+    log "Then: sudo -u citadel systemctl --user enable --now citadel-worker.service"
     # Don't fail -- the VM is still usable, just needs manual init
     systemctl disable citadel-firstboot.service
     exit 0
@@ -81,23 +102,63 @@ fi
 CITADEL_HOME="/home/citadel"
 if [ -f "${CITADEL_HOME}/citadel-node/citadel.yaml" ]; then
     cp "${CITADEL_HOME}/citadel-node/citadel.yaml" "${MANIFEST_DIR}/citadel.yaml"
-    chown citadel:docker "${MANIFEST_DIR}/citadel.yaml"
+    chown citadel:citadel "${MANIFEST_DIR}/citadel.yaml"
     log "Manifest copied to ${MANIFEST_DIR}/citadel.yaml"
 elif [ -f "${CITADEL_HOME}/citadel.yaml" ]; then
     cp "${CITADEL_HOME}/citadel.yaml" "${MANIFEST_DIR}/citadel.yaml"
-    chown citadel:docker "${MANIFEST_DIR}/citadel.yaml"
+    chown citadel:citadel "${MANIFEST_DIR}/citadel.yaml"
     log "Manifest copied to ${MANIFEST_DIR}/citadel.yaml"
 else
-    log "WARNING: No manifest found after init. Worker may not start."
+    log "ERROR: No manifest found after init. Keeping the authkey for a retry."
+    exit 1
 fi
 
 # -----------------------------------------------------------------------
 # 4. Enable and start the worker
 # -----------------------------------------------------------------------
-log "Enabling and starting citadel-worker.service..."
-systemctl enable citadel-worker.service
-systemctl start citadel-worker.service
-log "citadel-worker.service started."
+log "Preparing rootless Podman and starting the Citadel user worker..."
+loginctl enable-linger citadel
+systemctl start "user@${citadel_uid}.service"
+as_citadel systemctl --user enable --now podman.socket
+as_citadel podman info >/dev/null
+has_nvidia_hardware() {
+    if [ -s /etc/nv_tegra_release ]; then return 0; fi
+    if grep -qiE 'jetson|tegra' /proc/device-tree/model /sys/firmware/devicetree/base/model 2>/dev/null; then return 0; fi
+    if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then return 0; fi
+    [ -d /proc/driver/nvidia/gpus ] && [ "$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)" -gt 0 ]
+}
+if has_nvidia_hardware; then
+    command -v nvidia-ctk >/dev/null 2>&1 || { log "ERROR: GPU present but NVIDIA CDI toolkit is missing."; exit 1; }
+    getent group video >/dev/null && getent group render >/dev/null || { log "ERROR: GPU access groups are missing."; exit 1; }
+    usermod -aG video,render citadel
+    # The image build may have had no passthrough GPU. Refresh the user
+    # manager now, before first enabling its worker, so it inherits GPU groups.
+    systemctl restart "user@${citadel_uid}.service"
+    as_citadel systemctl --user enable --now podman.socket
+    install -d -m 755 /etc/udev/rules.d
+    cat > /etc/udev/rules.d/70-citadel-nvidia.rules <<'RULE'
+KERNEL=="nvidia[0-9]*", GROUP="video", MODE="0660"
+KERNEL=="nvidiactl", GROUP="video", MODE="0660"
+KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
+KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
+RULE
+    udevadm control --reload-rules
+    install -d -m 755 /etc/cdi
+    cdi_ready=false
+    for attempt in $(seq 1 30); do
+        if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+           nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
+            cdi_ready=true
+            break
+        fi
+        sleep 2
+    done
+    $cdi_ready || { log "ERROR: NVIDIA CDI unavailable; keeping firstboot pending for a safe retry."; exit 1; }
+    log "NVIDIA CDI devices verified."
+fi
+as_citadel systemctl --user daemon-reload
+as_citadel systemctl --user enable --now citadel-worker.service
+log "Citadel user worker started."
 
 # -----------------------------------------------------------------------
 # 5. Clean up authkey and disable this service
@@ -118,9 +179,8 @@ chmod 755 /opt/citadel/firstboot.sh
 cat > /etc/systemd/system/citadel-firstboot.service << 'UNIT'
 [Unit]
 Description=Citadel First-Boot Initialization
-After=network-online.target cloud-init.target docker.service
+After=network-online.target cloud-init.target
 Wants=network-online.target
-Requires=docker.service
 
 # Only run if the authkey file exists or if the manifest hasn't been created yet
 ConditionPathExists=!/etc/citadel/.firstboot-done
