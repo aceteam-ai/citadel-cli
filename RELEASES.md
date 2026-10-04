@@ -2845,3 +2845,18 @@ Auto-generated log of every release.
   - fix(ingress): harden app handoff edge cases (#1206) (#1208)
 
 
+---
+
+## v2.179.0 — 2026-10-04
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 12 |
+| Lines added | +836 |
+
+**Changes:**
+
+  - fix: bind hosted replies to exact turn tokens (#1213)
+
+
