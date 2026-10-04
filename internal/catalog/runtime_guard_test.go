@@ -150,12 +150,12 @@ func scanLiteralEngineExecs(t *testing.T, root string) []engineExecSite {
 		}
 		if info.IsDir() {
 			switch info.Name() {
-			// .claude/worktrees holds full nested COPIES of the repo (background
-			// agent worktrees) on a dev checkout; without skipping it the scan
-			// counts their engine execs too and false-fails a LOCAL `go test` /
-			// release, even though CI (a clean checkout with no .claude) is
-			// unaffected (citadel-cli#1051).
-			case ".git", "vendor", "testdata", "node_modules", ".claude":
+			// .claude/worktrees and .worktrees hold full nested COPIES of the repo
+			// on a dev checkout; without skipping them the scan counts their engine
+			// execs too and false-fails a LOCAL `go test` / release, even though CI
+			// (a clean checkout with neither directory) is unaffected
+			// (citadel-cli#1051, #1218).
+			case ".git", "vendor", "testdata", "node_modules", ".claude", ".worktrees":
 				return filepath.SkipDir
 			}
 			return nil
