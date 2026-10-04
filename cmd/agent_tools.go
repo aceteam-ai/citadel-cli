@@ -268,7 +268,7 @@ func agentNodeInfo(nodeName, headscaleNodeID, orgID string, startedAt time.Time)
 	// one. Surface the mismatch so the platform can prompt a restart; a
 	// missing/corrupt state.json (no update ever recorded) or an equal
 	// version adds neither field, leaving the payload unchanged from today.
-	if st, err := loadUpdateState(); err == nil && st.CurrentVersion != "" && st.CurrentVersion != Version {
+	if st, err := loadUpdateState(); err == nil && st.CurrentVersion != "" && strings.TrimPrefix(st.CurrentVersion, "v") != strings.TrimPrefix(Version, "v") {
 		info["pending_version"] = st.CurrentVersion
 		info["restart_required"] = true
 	}
