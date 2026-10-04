@@ -10,9 +10,18 @@ Run:  python3 -m pytest services/hermes-service/test_wrapper.py
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
+import json
+from types import SimpleNamespace
 
+import pytest
 import wrapper
+
+TOKEN = "123e4567-e89b-42d3-a456-426614174000"
+SECRET_NAMES = (
+    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "FIREWORKS_API_KEY",
+    "GOOGLE_API_KEY", "GEMINI_API_KEY", "GLM_API_KEY", "KIMI_API_KEY",
+    "MINIMAX_API_KEY", "ACETEAM_GATEWAY_KEY",
+)
 
 
 def test_scrub_secrets_redacts_known_leaked_value(monkeypatch):
@@ -23,9 +32,10 @@ def test_scrub_secrets_redacts_known_leaked_value(monkeypatch):
     assert "[REDACTED_OPENAI_API_KEY]" in scrubbed
 
 
-def test_scrub_secrets_redacts_every_configured_provider_key(monkeypatch):
+def test_scrub_secrets_redacts_every_configured_credential(monkeypatch):
+    assert set(wrapper._SECRET_ENV_NAMES) == set(SECRET_NAMES)
     values = {}
-    for name in wrapper._SECRET_ENV_NAMES:
+    for name in SECRET_NAMES:
         value = f"secretvalue-{name.lower()}"
         monkeypatch.setenv(name, value)
         values[name] = value
@@ -75,15 +85,105 @@ def test_scrub_secrets_handles_empty_string(monkeypatch):
 
 
 def test_health_provider_list_stays_in_sync_with_scrub_list(monkeypatch):
-    """/health's `provider_keys_configured` is built from the SAME
-    `_SECRET_ENV_NAMES` tuple `_scrub_secrets` scrubs against -- pin that they
-    can't silently drift apart (the module docstring claims this; nothing else
-    enforces it)."""
+    """Health lists providers while the scrub also protects gateway auth."""
     for name in wrapper._SECRET_ENV_NAMES:
         monkeypatch.setenv(name, f"secretvalue-{name.lower()}")
 
-    with TestClient(wrapper.app) as client:
-        resp = client.get("/health")
+    health = wrapper.health()
 
-    assert resp.status_code == 200
-    assert resp.json()["provider_keys_configured"] == sorted(wrapper._SECRET_ENV_NAMES)
+    assert health["provider_keys_configured"] == sorted(wrapper._PROVIDER_ENV_NAMES)
+    assert "ACETEAM_GATEWAY_KEY" not in health["provider_keys_configured"]
+
+
+@pytest.mark.parametrize("secret_name", SECRET_NAMES)
+@pytest.mark.parametrize("path", ["raw_success", "stderr_failure", "stdout_failure", "unexpected"])
+def test_every_credential_stays_out_of_all_callback_paths(
+    monkeypatch, capsys, secret_name, path
+):
+    secret = (
+        "gateway-secret-value" if secret_name == "ACETEAM_GATEWAY_KEY"
+        else f"configured-secret-{secret_name.lower()}"
+    )
+    monkeypatch.setenv(secret_name, secret)
+    monkeypatch.setattr(wrapper, "GATEWAY_KEY", "gateway-secret-value")
+    monkeypatch.setattr(wrapper, "PLATFORM_URL", "https://platform.example")
+    monkeypatch.setattr(wrapper, "INSTANCE_ID", "instance-1")
+    bodies = []
+
+    def urlopen(req, timeout):
+        assert timeout == 30
+        assert req.get_header("Authorization") == "Bearer gateway-secret-value"
+        bodies.append(json.loads(req.data))
+        raise RuntimeError("network unavailable")
+
+    monkeypatch.setattr(wrapper.urllib.request, "urlopen", urlopen)
+    if path == "unexpected":
+        def fail(*args, **kwargs):
+            raise OSError(f"failed to start Hermes with {secret}")
+        monkeypatch.setattr(wrapper.subprocess, "run", fail)
+    else:
+        proc = SimpleNamespace(
+            returncode=0 if path == "raw_success" else 7,
+            stdout=f"answer with {secret}" if path in ("raw_success", "stdout_failure") else "",
+            stderr=f"provider rejected {secret}" if path == "stderr_failure" else "",
+        )
+        monkeypatch.setattr(wrapper.subprocess, "run", lambda *args, **kwargs: proc)
+
+    wrapper._process_turn("hello", TOKEN)
+
+    assert len(bodies) == 1
+    assert bodies[0]["turnToken"] == TOKEN
+    assert secret not in json.dumps(bodies)
+    expected = f"[REDACTED_{secret_name}]"
+    if path == "raw_success":
+        assert bodies[0]["reply"] == f"answer with {expected}"
+    elif path == "stderr_failure":
+        assert bodies[0]["error"] == f"Hermes exited 7: provider rejected {expected}"
+    elif path == "stdout_failure":
+        assert bodies[0]["error"] == f"Hermes exited 7: answer with {expected}"
+    else:
+        assert bodies[0]["error"] == f"failed to start Hermes with {expected}"
+    diagnostics = capsys.readouterr().err
+    assert "reply POST failed" in diagnostics
+    assert secret not in diagnostics
+    assert TOKEN not in diagnostics
+
+
+def test_overlapping_credentials_redact_longer_value_first(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "shared-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "shared-secret-with-suffix")
+    assert wrapper._scrub_secrets("shared-secret-with-suffix") == (
+        "[REDACTED_OPENROUTER_API_KEY]"
+    )
+
+
+@pytest.mark.parametrize("secret_name", SECRET_NAMES)
+def test_callback_boundary_scrubs_direct_success_and_error(monkeypatch, capsys, secret_name):
+    secret = (
+        "gateway-secret-value" if secret_name == "ACETEAM_GATEWAY_KEY"
+        else f"configured-secret-{secret_name.lower()}"
+    )
+    monkeypatch.setenv(secret_name, secret)
+    monkeypatch.setattr(wrapper, "GATEWAY_KEY", "gateway-secret-value")
+    monkeypatch.setattr(wrapper, "PLATFORM_URL", "https://platform.example")
+    monkeypatch.setattr(wrapper, "INSTANCE_ID", "instance-1")
+    bodies = []
+
+    def urlopen(req, timeout):
+        assert timeout == 30
+        assert req.get_header("Authorization") == "Bearer gateway-secret-value"
+        bodies.append(json.loads(req.data))
+        raise RuntimeError("network unavailable")
+
+    monkeypatch.setattr(wrapper.urllib.request, "urlopen", urlopen)
+    wrapper._post_reply({"reply": f"answer with {secret}"}, TOKEN)
+    wrapper._post_reply({"error": f"retry after {secret}"}, TOKEN)
+
+    assert bodies == [
+        {"reply": f"answer with [REDACTED_{secret_name}]", "turnToken": TOKEN},
+        {"error": f"retry after [REDACTED_{secret_name}]", "turnToken": TOKEN},
+    ]
+    diagnostics = capsys.readouterr().err
+    assert diagnostics.count("reply POST failed") == 2
+    assert secret not in diagnostics
+    assert TOKEN not in diagnostics

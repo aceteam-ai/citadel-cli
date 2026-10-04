@@ -17,12 +17,13 @@ cannot match.
 ```
 
 - Inbound `POST /hooks/agent` with `Authorization: Bearer hooks_{GATEWAY_KEY}`
-  and `{"message","name"}`. The wrapper validates the token, **ACKs fast** with
+  and `{"message","name","turnToken"}`. The wrapper validates the bearer and
+  requires a canonical UUID turn token from the server, then **ACKs fast** with
   `200 {"delivered": true}`, and runs the turn on a background thread.
 - The turn shells out to `claude -p "<message>" --output-format json
   --dangerously-skip-permissions`, capturing the assistant text from the JSON
   `result` field.
-- On completion it POSTs `{"reply": "<text>"}` (or `{"error": "..."}` on
+- On completion it POSTs `{"reply": "<text>", "turnToken": "<same token>"}` (or `{"error": "...", "turnToken": "<same token>"}` on
   failure) to `{PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply` with
   `Authorization: Bearer {GATEWAY_KEY}` (the **raw** key, not `hooks_`-prefixed).
 - `GET /health` backs the compose healthcheck and reports the proxy wiring.

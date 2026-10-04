@@ -6,14 +6,13 @@ headless Hermes Agent (https://github.com/NousResearch/hermes-agent) turn,
 reusing the SAME generic runtime path claudecode proved out. Hermes itself
 knows nothing about AceTeam -- this wrapper is the only harness-specific glue.
 
-Contract (pinned by the routing-seam PR #4593 -- do NOT change it; this is
-BYTE-IDENTICAL to claudecode-service/wrapper.py's contract, which is the whole
-point of "reusing the generic runtime path"):
+Contract (routing seam PR #4593, extended with turnToken by citadel-cli#1212;
+same wire contract as claudecode-service/wrapper.py):
 
   Inbound (platform -> this container):
     POST /hooks/agent
     Authorization: Bearer hooks_{GATEWAY_KEY}
-    { "message": "<user text>", "name": "<label>" }
+    { "message": "<user text>", "name": "<label>", "turnToken": "<canonical UUID>" }
   We validate the bearer token equals "hooks_" + the container's gateway key,
   then ACK FAST with 200 {"delivered": true} and process the turn on a
   background thread (the caller expects a quick delivery ack, not a blocking
@@ -22,8 +21,8 @@ point of "reusing the generic runtime path"):
   Outbound (this container -> platform), when the turn finishes:
     POST {PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply
     Authorization: Bearer {GATEWAY_KEY}          # RAW key, NOT hooks_-prefixed
-    { "reply": "<assistant text>" }              # on success
-    { "error": "<user-facing message>" }         # on terminal failure
+    { "reply": "<assistant text>", "turnToken": "<same token>" }  # success
+    { "error": "<user-facing message>", "turnToken": "<same token>" }  # failure
   Expect 200 {"accepted": true}.
 
 Model/provider wiring is harness-specific and deliberately NOT the same as
@@ -45,6 +44,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+import uuid
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
@@ -83,9 +83,24 @@ def _expected_inbound_bearer() -> str:
     return f"hooks_{GATEWAY_KEY}"
 
 
-# Same 8 provider-key env var names /health already enumerates (see below) --
-# keep this list and that one in sync.
-_SECRET_ENV_NAMES = (
+def _valid_turn_token(value: object) -> bool:
+    """Accept only the canonical UUID string used by the reply API."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+        return (
+            str(parsed) == value
+            and parsed.variant == uuid.RFC_4122
+            and parsed.version in range(1, 9)
+        )
+    except ValueError:
+        return False
+
+
+# Keep provider reporting separate from the callback credential scrub: the
+# gateway key is secret too, but it is not an inference provider.
+_PROVIDER_ENV_NAMES = (
     "OPENROUTER_API_KEY",
     "OPENAI_API_KEY",
     "FIREWORKS_API_KEY",
@@ -95,6 +110,7 @@ _SECRET_ENV_NAMES = (
     "KIMI_API_KEY",
     "MINIMAX_API_KEY",
 )
+_SECRET_ENV_NAMES = (*_PROVIDER_ENV_NAMES, "ACETEAM_GATEWAY_KEY")
 
 
 def _scrub_secrets(text: str) -> str:
@@ -108,10 +124,14 @@ def _scrub_secrets(text: str) -> str:
     providers and risks corrupting legitimate reply content (aceteam#8170
     PR #849 review; citadel#898).
     """
-    for name in _SECRET_ENV_NAMES:
-        value = os.environ.get(name)
-        if value and len(value) >= 8:  # floor avoids redacting trivially-short/incidental values
-            text = text.replace(value, f"[REDACTED_{name}]")
+    secrets = (
+        (name, value)
+        for name in _SECRET_ENV_NAMES
+        if (value := os.environ.get(name)) and len(value) >= 8
+    )
+    # Longer values first so an overlapping shorter value cannot leave a tail.
+    for name, value in sorted(secrets, key=lambda item: len(item[1]), reverse=True):
+        text = text.replace(value, f"[REDACTED_{name}]")
     return text
 
 
@@ -178,8 +198,11 @@ def _run_hermes_turn(message: str) -> str:
     return stdout
 
 
-def _post_reply(body: dict) -> None:
+def _post_reply(body: dict, turn_token: str) -> None:
     """POST the outbound reply/error to the platform callback (best-effort)."""
+    if not _valid_turn_token(turn_token):
+        print("hermes: invalid turn token; cannot post reply", file=sys.stderr, flush=True)
+        return
     if not PLATFORM_URL or not INSTANCE_ID:
         print(
             "hermes: PLATFORM_URL/INSTANCE_ID unset; cannot post reply",
@@ -188,7 +211,13 @@ def _post_reply(body: dict) -> None:
         )
         return
     url = f"{PLATFORM_URL}/api/instances/{INSTANCE_ID}/reply"
-    data = json.dumps(body).encode("utf-8")
+    # Final callback boundary covers raw output and unexpected exceptions.
+    safe_body = {
+        key: _scrub_secrets(value) if isinstance(value, str) else value
+        for key, value in body.items()
+        if key != "turnToken"
+    }
+    data = json.dumps({**safe_body, "turnToken": turn_token}).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     # Outbound auth is the RAW gateway key -- NOT the hooks_-prefixed inbound token.
@@ -198,21 +227,24 @@ def _post_reply(body: dict) -> None:
             resp.read()
     except urllib.error.HTTPError as exc:
         print(
-            f"hermes: reply POST to {url} failed: {exc.code} {exc.reason}",
+            f"hermes: reply POST failed with status {exc.code}",
             file=sys.stderr,
             flush=True,
         )
-    except Exception as exc:  # network error, DNS, etc.
-        print(f"hermes: reply POST to {url} failed: {exc}", file=sys.stderr, flush=True)
+    except Exception:  # network error, DNS, etc.
+        print("hermes: reply POST failed", file=sys.stderr, flush=True)
 
 
-def _process_turn(message: str) -> None:
+def _process_turn(message: str, turn_token: str) -> None:
     """Background worker: run the turn, then post reply or error."""
+    if not _valid_turn_token(turn_token):
+        print("hermes: invalid turn token; cannot run turn", file=sys.stderr, flush=True)
+        return
     try:
         reply = _run_hermes_turn(message)
-        _post_reply({"reply": reply})
+        _post_reply({"reply": reply}, turn_token)
     except Exception as exc:  # any terminal failure -> user-facing {error}
-        _post_reply({"error": str(exc)})
+        _post_reply({"error": str(exc)}, turn_token)
 
 
 @app.get("/health")
@@ -223,7 +255,7 @@ def health():
     confirm without shell access (booleans/labels only -- never the secret
     values). Does not invoke the CLI.
     """
-    provider_keys_set = sorted(name for name in _SECRET_ENV_NAMES if os.environ.get(name))
+    provider_keys_set = sorted(name for name in _PROVIDER_ENV_NAMES if os.environ.get(name))
     return {
         "status": "ok",
         "instance_id": INSTANCE_ID or None,
@@ -257,11 +289,14 @@ async def hooks_agent(request: Request, authorization: str = Header(default=""))
     message = body.get("message") if isinstance(body, dict) else None
     if not isinstance(message, str) or not message:
         raise HTTPException(status_code=400, detail="missing 'message'")
+    turn_token = body.get("turnToken")
+    if not _valid_turn_token(turn_token):
+        raise HTTPException(status_code=400, detail="invalid turn token")
 
     # ACK FAST: hand the (blocking) model turn to a background thread so the
     # inbound request returns a delivery ack immediately. daemon=True so a
     # container stop never hangs on an in-flight turn.
-    threading.Thread(target=_process_turn, args=(message,), daemon=True).start()
+    threading.Thread(target=_process_turn, args=(message, turn_token), daemon=True).start()
 
     return {"delivered": True}
 
