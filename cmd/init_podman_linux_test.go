@@ -202,6 +202,16 @@ func TestProvisionDoesNotGrantWorkerSudoOrUseInvokingOwner(t *testing.T) {
 	if strings.Contains(string(worker), "name := platform.GetSudoUser()") {
 		t.Fatal("rootless owner regressed to invoking sudo user")
 	}
+	if !strings.Contains(string(worker), `exec.Command("sudo", "-n", "-l", "-U", podmanServiceUser)`) || strings.Contains(string(worker), `"LC_ALL=C", "sudo", "-n", "-l"`) {
+		t.Fatal("sudo policy must be queried by root for the dedicated worker")
+	}
+	installer, err := os.ReadFile("../install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(installer), `sudo -n -l -U "$SERVICE_USER"`) || strings.Contains(string(installer), `runuser -u "$SERVICE_USER" -- env LC_ALL=C sudo`) {
+		t.Fatal("shell installer must audit the worker sudo policy without authenticating as it")
+	}
 	packer, err := os.ReadFile("../packer/deploy-to-proxmox.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -218,6 +228,7 @@ func TestEffectiveSudoAuditRejectsScopedGrant(t *testing.T) {
 		wantDenied   bool
 	}{
 		{"no-grants", "Sorry, user citadel may not run sudo on node.\n", &exec.ExitError{}, true},
+		{"root-query-no-grants", "User citadel is not allowed to run sudo on node.\n", nil, true},
 		{"scoped-nopasswd", "User citadel may run the following commands:\n (root) NOPASSWD: /usr/bin/systemctl\n", nil, false},
 		{"scoped-password", "User citadel may run the following commands:\n (root) /usr/bin/systemctl\n", nil, false},
 		{"mixed-denial-and-grant", "User citadel may not run sudo normally\nUser citadel may run the following commands: NOPASSWD: /bin/systemctl", &exec.ExitError{}, false},
@@ -245,6 +256,80 @@ func TestEffectiveSudoAuditRejectsScopedGrant(t *testing.T) {
 		if validPodmanUserMarker(marker.data, marker.mode, marker.uid, "1001") {
 			t.Fatalf("unsafe marker accepted: %+v", marker)
 		}
+	}
+}
+
+func TestPodmanComposeInstallHasJammyFallback(t *testing.T) {
+	for _, path := range []string{"../install.sh", "../packer/scripts/03-podman.sh", "init_podman_linux.go"} {
+		source, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := string(source)
+		if !strings.Contains(code, "apt-cache") || !strings.Contains(code, "podman-compose==1.0.6") {
+			t.Fatalf("%s lacks the pinned Ubuntu 22.04 podman-compose fallback", path)
+		}
+	}
+	installer, _ := os.ReadFile("../install.sh")
+	if strings.Contains(string(installer), "podman podman-compose uidmap") {
+		t.Fatal("optional podman-compose package must not make the base dependency transaction fail")
+	}
+	packer, _ := os.ReadFile("../packer/scripts/03-podman.sh")
+	if strings.Contains(string(packer), "podman podman-compose uidmap") {
+		t.Fatal("Packer base dependency transaction still requires podman-compose")
+	}
+}
+
+func TestInstallerParsesMultilineVersionForIdempotentRerun(t *testing.T) {
+	source, err := os.ReadFile("../install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(source)
+	if !strings.Contains(code, "installed_citadel_version()") || !strings.Contains(code, `1s/^Citadel CLI version[[:space:]]*//p`) {
+		t.Fatal("installer does not normalize the multiline citadel version output")
+	}
+	if strings.Contains(code, `current_ver=$("${INSTALL_DIR}/${BINARY_NAME}" version`) {
+		t.Fatal("installer still compares the full multiline version output")
+	}
+}
+
+func TestFreshGPUProvisionCreatesMissingStandardGroups(t *testing.T) {
+	installer, err := os.ReadFile("../install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(installer), `groupadd --system "$group"`) {
+		t.Fatal("fresh installer does not create a missing standard GPU group")
+	}
+	if !strings.Contains(string(installer), "dbus-user-session git gnupg udev") {
+		t.Fatal("fresh installer does not install udevadm before configuring GPU rules")
+	}
+	if strings.Contains(string(installer), `udevadm control --reload-rules || die`) {
+		t.Fatal("fresh installer makes an image-builder udev reload fatal")
+	}
+	if !strings.Contains(string(installer), "--feature-flag no-additional-gids-for-device-nodes") {
+		t.Fatal("fresh installer emits CDI 0.7 additionalGids that Ubuntu 24.04 Podman 4.9 cannot parse")
+	}
+	packer, err := os.ReadFile("../packer/scripts/03-podman.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(packer), `groupadd --system "$group"`) {
+		t.Fatal("Packer does not create a missing standard GPU group")
+	}
+	if !strings.Contains(string(packer), "dbus-user-session udev") {
+		t.Fatal("Packer does not install udevadm before configuring GPU rules")
+	}
+	if !strings.Contains(string(packer), "--feature-flag no-additional-gids-for-device-nodes") {
+		t.Fatal("Packer emits CDI 0.7 additionalGids that Ubuntu 24.04 Podman 4.9 cannot parse")
+	}
+	worker, err := os.ReadFile("init_podman_linux.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(worker), `provisionCommand("groupadd", "--system", group)`) {
+		t.Fatal("Go provisioner does not create a missing standard GPU group")
 	}
 }
 

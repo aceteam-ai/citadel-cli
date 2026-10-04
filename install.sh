@@ -348,9 +348,7 @@ verify_service_account() {
     done
     [ ! -e "/etc/sudoers.d/99-citadel-${SERVICE_USER}" ] || die "Dedicated worker has a legacy sudo grant"
     if command -v sudo >/dev/null 2>&1; then
-        if sudo_listing=$(runuser -u "$SERVICE_USER" -- env LC_ALL=C sudo -n -l 2>&1); then
-            die "Dedicated worker has effective sudo privileges"
-        fi
+        sudo_listing=$(LC_ALL=C sudo -n -l -U "$SERVICE_USER" 2>&1) || true
         case "${sudo_listing,,}" in
             *"may run the following commands"*|*"nopasswd:"*) die "Dedicated worker has effective sudo privileges" ;;
             *"not allowed to run sudo"*|*"may not run sudo"*) ;;
@@ -401,6 +399,15 @@ require_service_groups() {
     local group
     for group in "$@"; do
         getent group "$group" >/dev/null || die "Required GPU group ${group} is missing"
+    done
+}
+
+ensure_service_groups() {
+    local group
+    for group in "$@"; do
+        if ! getent group "$group" >/dev/null; then
+            groupadd --system "$group" || die "Could not create required GPU group ${group}"
+        fi
     done
 }
 
@@ -472,7 +479,16 @@ podman_meets_cdi_floor() {
 install_podman() {
     step "Installing rootless Podman"
     apt-get update -qq >> "$LOG_FILE" 2>&1 || die "apt-get update failed"
-    apt-get install -y -qq podman podman-compose uidmap fuse-overlayfs crun slirp4netns dbus-user-session git gnupg >> "$LOG_FILE" 2>&1 || die "Podman dependency installation failed"
+    apt-get install -y -qq podman uidmap fuse-overlayfs crun slirp4netns dbus-user-session git gnupg udev >> "$LOG_FILE" 2>&1 || die "Podman dependency installation failed"
+    if ! command -v podman-compose >/dev/null 2>&1; then
+        if apt-cache show podman-compose >/dev/null 2>&1; then
+            apt-get install -y -qq podman-compose >> "$LOG_FILE" 2>&1 || die "podman-compose installation failed"
+        else
+            apt-get install -y -qq python3-pip >> "$LOG_FILE" 2>&1 || die "podman-compose fallback dependencies failed"
+            python3 -m pip install --disable-pip-version-check --no-cache-dir 'podman-compose==1.0.6' >> "$LOG_FILE" 2>&1 || die "Pinned podman-compose fallback installation failed"
+        fi
+    fi
+    command -v podman-compose >/dev/null 2>&1 || die "podman-compose executable is unavailable after installation"
     # Ubuntu 22.04 can use slirp4netns when passt/pasta is unavailable.
     if apt-cache show passt >/dev/null 2>&1; then
         apt-get install -y -qq passt >> "$LOG_FILE" 2>&1 || die "passt installation failed"
@@ -554,7 +570,7 @@ install_nvidia_toolkit() {
     command -v nvidia-ctk >/dev/null || die "NVIDIA toolkit installed without nvidia-ctk"
     # The worker owns only its own GPU access. The CDI spec is shared read-only
     # with Podman; never configure a Docker default runtime on a fresh node.
-    require_service_groups video render
+    ensure_service_groups video render
     usermod -aG video,render "$SERVICE_USER" || die "Could not grant ${SERVICE_USER} GPU groups"
     refresh_user_manager "$(id -u "$SERVICE_USER")" video render
     install -d -m 755 /etc/udev/rules.d /etc/cdi
@@ -564,13 +580,15 @@ KERNEL=="nvidiactl", GROUP="video", MODE="0660"
 KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
 KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
 RULE
-    udevadm control --reload-rules || die "Could not reload GPU device rules"
+    if ! udevadm control --reload-rules >> "$LOG_FILE" 2>&1; then
+        warn "udev daemon unavailable; persisted NVIDIA device rules will load on boot"
+    fi
     install -d -m 755 /usr/local/libexec
     cat > /usr/local/libexec/citadel-nvidia-cdi-refresh <<'SCRIPT'
 #!/bin/sh
 set -eu
 for attempt in $(seq 1 30); do
-    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+    if nvidia-ctk cdi generate --feature-flag no-additional-gids-for-device-nodes --output=/etc/cdi/nvidia.yaml &&
        nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
         exit 0
     fi
@@ -594,7 +612,7 @@ WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
     systemctl enable citadel-nvidia-cdi.service >> "$LOG_FILE" 2>&1 || die "Could not enable GPU CDI refresh"
-    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >> "$LOG_FILE" 2>&1 &&
+    if nvidia-ctk cdi generate --feature-flag no-additional-gids-for-device-nodes --output=/etc/cdi/nvidia.yaml >> "$LOG_FILE" 2>&1 &&
        nvidia-ctk cdi list | tee -a "$LOG_FILE" | grep -F 'nvidia.com/gpu' >/dev/null; then
         ok "NVIDIA CDI devices verified"
     else
@@ -629,13 +647,19 @@ install_node_tools() {
 # ---------------------------------------------------------------------------
 # Download and install citadel binary
 # ---------------------------------------------------------------------------
+installed_citadel_version() {
+    "${INSTALL_DIR}/${BINARY_NAME}" version 2>/dev/null |
+        sed -n '1s/^Citadel CLI version[[:space:]]*//p'
+}
+
 install_citadel_binary() {
     step "Installing Citadel CLI"
 
     # Check if already installed and up to date
     if [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
         local current_ver
-        current_ver=$("${INSTALL_DIR}/${BINARY_NAME}" version 2>/dev/null || echo "unknown")
+        current_ver=$(installed_citadel_version)
+        [ -n "$current_ver" ] || current_ver="unknown"
         msg "Citadel already installed (${current_ver}) - checking for updates..."
     fi
 
@@ -654,7 +678,7 @@ install_citadel_binary() {
     # Check if current version matches
     if [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
         local current_ver
-        current_ver=$("${INSTALL_DIR}/${BINARY_NAME}" version 2>/dev/null || echo "")
+        current_ver=$(installed_citadel_version)
         if [ "$current_ver" = "$version" ] || [ "$current_ver" = "${version#v}" ]; then
             ok "Already at latest version (${version})"
             return 0

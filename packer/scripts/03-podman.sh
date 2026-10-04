@@ -41,9 +41,7 @@ for group in $(id -nG citadel); do
     case "$group" in sudo|wheel|docker) echo "ERROR: dedicated citadel user has privileged $group membership" >&2; exit 1 ;; esac
 done
 if command -v sudo >/dev/null 2>&1; then
-    if sudo_listing=$(runuser -u citadel -- env LC_ALL=C sudo -n -l 2>&1); then
-        echo 'ERROR: Dedicated citadel account has sudo grants' >&2; exit 1
-    fi
+    sudo_listing=$(LC_ALL=C sudo -n -l -U citadel 2>&1) || true
     case "${sudo_listing,,}" in
         *"may run the following commands"*|*"nopasswd:"*) echo 'ERROR: Dedicated citadel account has sudo grants' >&2; exit 1 ;;
         *"not allowed to run sudo"*|*"may not run sudo"*) ;;
@@ -51,7 +49,16 @@ if command -v sudo >/dev/null 2>&1; then
     esac
 fi
 apt-get update -y
-apt-get install -y --no-install-recommends podman podman-compose uidmap fuse-overlayfs crun slirp4netns dbus-user-session
+apt-get install -y --no-install-recommends podman uidmap fuse-overlayfs crun slirp4netns dbus-user-session udev
+if ! command -v podman-compose >/dev/null 2>&1; then
+    if apt-cache show podman-compose >/dev/null 2>&1; then
+        apt-get install -y --no-install-recommends podman-compose
+    else
+        apt-get install -y --no-install-recommends python3-pip
+        python3 -m pip install --disable-pip-version-check --no-cache-dir 'podman-compose==1.0.6'
+    fi
+fi
+command -v podman-compose >/dev/null 2>&1
 if apt-cache show passt >/dev/null 2>&1; then
     apt-get install -y --no-install-recommends passt
 fi
@@ -142,7 +149,9 @@ has_nvidia_hardware() {
 if command -v nvidia-ctk >/dev/null; then
 if has_nvidia_hardware; then
 for group in video render; do
-    getent group "$group" >/dev/null || { echo "ERROR: Required GPU group $group is missing" >&2; exit 1; }
+    if ! getent group "$group" >/dev/null; then
+        groupadd --system "$group"
+    fi
 done
 usermod -aG video,render citadel
 systemctl restart "user@${citadel_uid}.service"
@@ -153,7 +162,9 @@ KERNEL=="nvidiactl", GROUP="video", MODE="0660"
 KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
 KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
 RULE
-udevadm control --reload-rules
+# Image builders do not necessarily run udev. The persisted rule is loaded by
+# systemd-udevd on boot; live CDI validation below remains the GPU gate.
+udevadm control --reload-rules || echo 'WARN: udev daemon unavailable; NVIDIA device rules will load on boot' >&2
 install -d -m 755 /usr/local/libexec /etc/cdi
 cat > /usr/local/libexec/citadel-nvidia-cdi-refresh <<'SCRIPT'
 #!/bin/sh
@@ -168,7 +179,7 @@ if ! has_nvidia_hardware; then
     exit 0
 fi
 for attempt in $(seq 1 30); do
-    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+    if nvidia-ctk cdi generate --feature-flag no-additional-gids-for-device-nodes --output=/etc/cdi/nvidia.yaml &&
        nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
         exit 0
     fi

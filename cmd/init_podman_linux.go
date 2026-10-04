@@ -22,7 +22,7 @@ const podmanUserMarker = "/etc/citadel/rootless-worker-user"
 const nvidiaCDIRefreshScript = `#!/bin/sh
 set -eu
 for attempt in $(seq 1 30); do
-    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+    if nvidia-ctk cdi generate --feature-flag no-additional-gids-for-device-nodes --output=/etc/cdi/nvidia.yaml &&
        nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
         exit 0
     fi
@@ -223,7 +223,7 @@ func verifyDedicatedPodmanUser(owner *user.User) error {
 		return err
 	}
 	if _, err := exec.LookPath("sudo"); err == nil {
-		out, listErr := exec.Command("runuser", "-u", podmanServiceUser, "--", "env", "LC_ALL=C", "sudo", "-n", "-l").CombinedOutput()
+		out, listErr := exec.Command("sudo", "-n", "-l", "-U", podmanServiceUser).CombinedOutput()
 		if !sudoListDeniesAll(string(out), listErr) {
 			return fmt.Errorf("cannot prove dedicated %s account has no effective sudo grants: %s", podmanServiceUser, strings.TrimSpace(string(out)))
 		}
@@ -233,10 +233,7 @@ func verifyDedicatedPodmanUser(owner *user.User) error {
 	return nil
 }
 
-func sudoListDeniesAll(output string, err error) bool {
-	if err == nil {
-		return false // even a scoped command grant defeats the worker boundary
-	}
+func sudoListDeniesAll(output string, _ error) bool {
 	denial := strings.ToLower(strings.TrimSpace(output))
 	if strings.Contains(denial, "may run the following commands") || strings.Contains(denial, "nopasswd:") {
 		return false
@@ -412,8 +409,11 @@ func installRootlessPodmanLinux() error {
 	if err := pm.Update(); err != nil {
 		return err
 	}
-	if err := pm.Install("podman", "podman-compose", "uidmap", "fuse-overlayfs", "crun", "slirp4netns", "dbus-user-session", "git", "gnupg"); err != nil {
+	if err := pm.Install("podman", "uidmap", "fuse-overlayfs", "crun", "slirp4netns", "dbus-user-session", "git", "gnupg", "udev"); err != nil {
 		return fmt.Errorf("install rootless Podman dependencies: %w", err)
+	}
+	if err := installPodmanCompose(pm); err != nil {
+		return err
 	}
 	if err := provisionCommand("apt-cache", "show", "passt"); err == nil {
 		if err := pm.Install("passt"); err != nil {
@@ -453,6 +453,32 @@ func installRootlessPodmanLinux() error {
 		} else if err := runAsPodmanUser(name, uid, home, binary, "service", "catalog", "pre-pull-runtimes"); err != nil {
 			fmt.Fprintf(os.Stderr, "⚠️  Trusted app runtime pre-pull is pending: %v\n", err)
 		}
+	}
+	return nil
+}
+
+func installPodmanCompose(pm platform.PackageManager) error {
+	if _, err := exec.LookPath("podman-compose"); err == nil {
+		return nil
+	} else if !isExecutableNotFound(err) {
+		return fmt.Errorf("inspect podman-compose availability: %w", err)
+	}
+	if err := provisionCommand("apt-cache", "show", "podman-compose"); err == nil {
+		if err := pm.Install("podman-compose"); err != nil {
+			return fmt.Errorf("install podman-compose package: %w", err)
+		}
+	} else {
+		// Ubuntu 22.04 does not publish podman-compose. Keep the fallback pinned
+		// so a fresh node never executes an unreviewed future PyPI release.
+		if err := pm.Install("python3-pip"); err != nil {
+			return fmt.Errorf("install podman-compose fallback dependencies: %w", err)
+		}
+		if err := provisionCommand("python3", "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", "podman-compose==1.0.6"); err != nil {
+			return fmt.Errorf("install pinned podman-compose fallback: %w", err)
+		}
+	}
+	if _, err := exec.LookPath("podman-compose"); err != nil {
+		return fmt.Errorf("podman-compose installation did not provide an executable: %w", err)
 	}
 	return nil
 }
@@ -554,7 +580,12 @@ func configureNvidiaCDILinux() error {
 	}
 	for _, group := range []string{"video", "render"} {
 		if _, err := user.LookupGroup(group); err != nil {
-			return fmt.Errorf("required GPU group %s unavailable: %w", group, err)
+			if err := provisionCommand("groupadd", "--system", group); err != nil {
+				return fmt.Errorf("create required GPU group %s: %w", group, err)
+			}
+			if _, err := user.LookupGroup(group); err != nil {
+				return fmt.Errorf("required GPU group %s unavailable after creation: %w", group, err)
+			}
 		}
 	}
 	if err := provisionCommand("usermod", "-aG", "video,render", name); err != nil {
@@ -571,7 +602,7 @@ func configureNvidiaCDILinux() error {
 		return err
 	}
 	if err := provisionCommand("udevadm", "control", "--reload-rules"); err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "⚠️  udev daemon unavailable; persisted NVIDIA device rules will load on boot: %v\n", err)
 	}
 	if err := os.MkdirAll("/etc/cdi", 0755); err != nil {
 		return err
@@ -595,7 +626,7 @@ func configureNvidiaCDILinux() error {
 	if err := provisionCommand("systemctl", "enable", "citadel-nvidia-cdi.service"); err != nil {
 		return err
 	}
-	if err := provisionCommand("nvidia-ctk", "cdi", "generate", "--output=/etc/cdi/nvidia.yaml"); err != nil {
+	if err := provisionCommand("nvidia-ctk", "cdi", "generate", "--feature-flag", "no-additional-gids-for-device-nodes", "--output=/etc/cdi/nvidia.yaml"); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  NVIDIA CDI generation pending driver readiness; boot unit will retry: %v\n", err)
 		return nil
 	}
