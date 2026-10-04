@@ -527,6 +527,9 @@ func fineTuneEngineArgs(spec FineTuneSpec, image, cacheDir string, runtime catal
 	}
 	args := []string{"run", "--rm", "-i", "--name", name}
 	args = append(args, gpuArgs...)
-	args = append(args, "--network", "none", "--read-only", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "--tmpfs", "/tmp:rw,nosuid,size=2g", "--mount", "type=bind,src="+spec.DatasetPath+",dst=/data/train.jsonl,readonly", "--mount", "type=bind,src="+spec.OutputDir+",dst=/output", "--mount", "type=bind,src="+cacheDir+",dst=/cache,readonly", "-e", "HF_HOME=/cache", "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1", image)
+	// Triton compiles a small CUDA driver shim at first use and dlopens it, so
+	// its isolated tmpfs must permit execution even though the image root is
+	// read-only and the container has no network.
+	args = append(args, "--network", "none", "--read-only", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "--tmpfs", "/tmp:rw,exec,nosuid,size=2g", "--mount", "type=bind,src="+spec.DatasetPath+",dst=/data/train.jsonl,readonly", "--mount", "type=bind,src="+spec.OutputDir+",dst=/output", "--mount", "type=bind,src="+cacheDir+",dst=/cache,readonly", "-e", "HF_HOME=/cache", "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1", "-e", "TRITON_CACHE_DIR=/tmp/triton", "-e", "XDG_CACHE_HOME=/tmp/.cache", image)
 	return args, nil
 }

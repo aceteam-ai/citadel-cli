@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,28 @@ class FakeTokenizer:
 
 
 class TrainingContractTest(unittest.TestCase):
+    def test_cached_model_resolves_main_snapshot_without_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            repo = home / "hub" / "models--Qwen--Qwen3-0.6B"
+            snapshot = repo / "snapshots" / "abc123"
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            (repo / "refs").mkdir()
+            (repo / "refs" / "main").write_text("abc123", encoding="utf-8")
+            previous = os.environ.get("HF_HOME")
+            os.environ["HF_HOME"] = str(home)
+            try:
+                self.assertEqual(train.resolve_cached_model("Qwen/Qwen3-0.6B"), str(snapshot))
+                (repo / "refs" / "main").write_text("../escape", encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    train.resolve_cached_model("Qwen/Qwen3-0.6B")
+            finally:
+                if previous is None:
+                    os.environ.pop("HF_HOME", None)
+                else:
+                    os.environ["HF_HOME"] = previous
+
     def test_progress_fields_are_finite_and_bounded(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

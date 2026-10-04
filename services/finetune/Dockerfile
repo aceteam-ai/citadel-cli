@@ -1,9 +1,13 @@
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN python -m pip install --no-cache-dir \
     'torch==2.5.1' \
     xformers==0.0.28.post3 \
     transformers==4.51.3 \
+    accelerate==1.6.0 \
     peft==0.15.2 \
     trl==0.15.2 \
     bitsandbytes==0.45.5 \

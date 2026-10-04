@@ -9,12 +9,33 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
 
 DATASET = Path("/data/train.jsonl")
 OUTPUT = Path("/output")
+
+
+def resolve_cached_model(model_id: str) -> str:
+    """Resolve one approved model to its pinned local HF snapshot."""
+    hf_home = os.environ.get("HF_HOME")
+    if not hf_home:
+        raise ValueError("HF_HOME is required for offline training")
+    repo = Path(hf_home) / "hub" / ("models--" + model_id.replace("/", "--"))
+    ref = repo / "refs" / "main"
+    try:
+        revision = ref.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"cached model ref is unavailable for {model_id}") from exc
+    if not revision or not revision.isalnum():
+        raise ValueError(f"cached model ref is invalid for {model_id}")
+    snapshots = (repo / "snapshots").resolve(strict=True)
+    snapshot = (snapshots / revision).resolve(strict=True)
+    if snapshot.parent != snapshots or not (snapshot / "config.json").is_file():
+        raise ValueError(f"cached model snapshot is incomplete for {model_id}")
+    return str(snapshot)
 
 
 def emit(progress_percent: float, current_epoch: int, current_loss: float) -> None:
@@ -64,11 +85,18 @@ def main() -> None:
     if method not in ("lora", "qlora", "full"):
         raise ValueError("unsupported training method")
     hp = spec["hyperparameters"]
+    model_path = resolve_cached_model(model_id)
 
     # Imports live inside main so the contract test can load this module with
     # ordinary Python and no GPU or heavy ML wheels.
     import torch
     from datasets import Dataset
+    if method != "full":
+        # Import Unsloth before transformers/peft so its patches apply. Passing
+        # a resolved snapshot path also prevents its repository probe from
+        # attempting a network request while HF_HUB_OFFLINE=1.
+        from unsloth import FastLanguageModel
+
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
@@ -79,17 +107,13 @@ def main() -> None:
     )
 
     if method == "full":
-        tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, local_files_only=True, torch_dtype=torch.float16
+            model_path, local_files_only=True, torch_dtype=torch.float16
         )
     else:
-        # Unsloth accelerates the one-GPU adapter path. Offline mode means
-        # this never fetches a customer's dataset or a base model at run time.
-        from unsloth import FastLanguageModel
-
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_id,
+            model_name=model_path,
             max_seq_length=hp["max_seq_length"],
             dtype=torch.float16,
             load_in_4bit=(method == "qlora"),

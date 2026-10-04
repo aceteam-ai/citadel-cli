@@ -19,3 +19,13 @@ PyTorch release. LoRA and QLoRA use Unsloth; full training uses Transformers.
 The existing device-authenticated API companion must be available for
 API-proxy workers. Do not mark the issue or PR ready until a real RTX 3090
 toy run demonstrates progress, cancellation, preemption, and restoration.
+
+On an approved GPU node, the opt-in acceptance test runs those node-side gates
+through the real worker handler and service reservation implementation:
+
+```sh
+CITADEL_FINETUNE_ACCEPTANCE=1 \
+CITADEL_FINETUNE_CONFIG_DIR=/path/to/node \
+CITADEL_FINETUNE_CACHE_DIR="$HOME/citadel-cache/huggingface" \
+go test ./cmd -run '^TestFineTuneRTXAcceptance$' -v -count=1
+```

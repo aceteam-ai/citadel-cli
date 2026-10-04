@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -13,6 +14,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // nodeJobHandlerOpts bundles the node/environment edges the node-job handler set
@@ -191,7 +193,7 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 			NodeID: runner.NodeID(), WorkspaceDir: opts.WorkspaceDir,
 			OutputRoot:  filepath.Join(opts.ConfigDir, "finetune", "adapters"),
 			SafetyDir:   finetunesafety.Dir(opts.ConfigDir),
-			CacheDir:    filepath.Join(opts.ConfigDir, "finetune", "cache"),
+			CacheDir:    fineTuneModelCacheDir(),
 			Image:       "citadel-finetune:local",
 			Control:     control,
 			Reservation: &fineTuneServiceReservation{service: service},
@@ -293,6 +295,13 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 }
 
 type fineTuneServiceReservation struct{ service *jobs.ServiceHandler }
+
+// fineTuneModelCacheDir is the same Hugging Face cache mounted by model
+// services and populated by MODEL_CACHE_PULL. A private config-dir cache would
+// make an offline trainer unable to see models Citadel already reports cached.
+func fineTuneModelCacheDir() string {
+	return filepath.Join(cacheindex.DefaultCacheRoot(), services.HFHubCacheDirName)
+}
 
 func (r *fineTuneServiceReservation) Reserve(ctx context.Context, jobID string) ([]string, error) {
 	var res *jobs.Reservation

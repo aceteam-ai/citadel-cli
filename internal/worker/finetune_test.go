@@ -315,7 +315,7 @@ func TestFineTuneDockerContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"run --rm -i", "--gpus all", "--network none", "--read-only", "dst=/data/train.jsonl,readonly", "dst=/output", "dst=/cache,readonly", "HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1", "citadel-finetune:local"} {
+	for _, want := range []string{"run --rm -i", "--gpus all", "--network none", "--read-only", "/tmp:rw,exec,nosuid,size=2g", "dst=/data/train.jsonl,readonly", "dst=/output", "dst=/cache,readonly", "HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1", "TRITON_CACHE_DIR=/tmp/triton", "XDG_CACHE_HOME=/tmp/.cache", "citadel-finetune:local"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("Docker arguments lack %q: %s", want, joined)
 		}

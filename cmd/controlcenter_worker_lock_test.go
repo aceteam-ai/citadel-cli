@@ -12,7 +12,7 @@ import (
 
 func TestTUIWorkerAndWorkStartupShareExclusiveLock(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "network")
-	tuiLock, monitor, _, err := acquireTUIWorkerOwnership(stateDir)
+	tuiLock, monitor, _, err := acquireControlCenterWorkerLock(stateDir, nil)
 	if err != nil || monitor || tuiLock == nil {
 		t.Fatalf("TUI ownership = (lock %v, monitor %v, err %v)", tuiLock, monitor, err)
 	}
@@ -32,7 +32,7 @@ func TestTUIWorkerAndWorkStartupShareExclusiveLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer workLock.Release()
-	secondTUI, monitor, _, err := acquireTUIWorkerOwnership(stateDir)
+	secondTUI, monitor, _, err := acquireControlCenterWorkerLock(stateDir, nil)
 	if err != nil || !monitor || secondTUI != nil {
 		t.Fatalf("TUI under work ownership = (lock %v, monitor %v, err %v)", secondTUI, monitor, err)
 	}
@@ -68,7 +68,7 @@ func TestTUIWorkerRefusesWhenOwnershipCannotBeEstablished(t *testing.T) {
 	if err := os.WriteFile(blockedDir, []byte("x"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	lock, monitor, _, err := acquireTUIWorkerOwnership(filepath.Join(blockedDir, "network"))
+	lock, monitor, _, err := acquireControlCenterWorkerLock(filepath.Join(blockedDir, "network"), nil)
 	if err == nil || lock != nil || monitor {
 		t.Fatalf("lock failure = (lock %v, monitor %v, err %v), want refusal", lock, monitor, err)
 	}
