@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -324,12 +325,166 @@ func TestFreshGPUProvisionCreatesMissingStandardGroups(t *testing.T) {
 	if !strings.Contains(string(packer), "--feature-flag no-additional-gids-for-device-nodes") {
 		t.Fatal("Packer emits CDI 0.7 additionalGids that Ubuntu 24.04 Podman 4.9 cannot parse")
 	}
+	firstboot, err := os.ReadFile("../packer/scripts/06-firstboot.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(firstboot), "--feature-flag no-additional-gids-for-device-nodes") {
+		t.Fatal("Packer firstboot does not preserve the Podman-4.9-compatible CDI document")
+	}
+	if strings.Contains(string(firstboot), "/usr/local/libexec/citadel-nvidia-cdi-refresh") {
+		t.Fatal("Packer firstboot depends on a refresh helper omitted when the image was built without GPU passthrough")
+	}
+	if !strings.Contains(string(firstboot), "podman run --rm --pull=never --device nvidia.com/gpu=all") {
+		t.Fatal("Packer firstboot starts the worker without a rootless Podman GPU CDI canary")
+	}
 	worker, err := os.ReadFile("init_podman_linux.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(worker), `provisionCommand("groupadd", "--system", group)`) {
 		t.Fatal("Go provisioner does not create a missing standard GPU group")
+	}
+}
+
+func TestEveryNvidiaCDIGenerationDisablesAdditionalGIDs(t *testing.T) {
+	needle := "nvidia-ctk cdi " + "generate"
+	err := filepath.WalkDir("..", func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".worktrees", "vendor", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(path, "_test.go") || (!strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, ".sh")) {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for lineNumber, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, needle) && !strings.Contains(line, "no-additional-gids-for-device-nodes") {
+				t.Errorf("%s:%d generates a CDI document incompatible with Podman 4.9", path, lineNumber+1)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUninstallerMarkerBoundary(t *testing.T) {
+	source, err := os.ReadFile("../uninstall.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := strings.SplitN(string(source), "# End independently testable uninstaller marker-boundary functions.", 2)
+	if len(boundary) != 2 {
+		t.Fatal("uninstaller marker boundary unavailable")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "rootless-worker-user")
+	write := func(data string, mode os.FileMode) {
+		t.Helper()
+		if err := os.RemoveAll(marker); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(marker, []byte(data), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner := strconv.Itoa(os.Getuid())
+	check := func(want bool, uid, home, expectedOwner string) {
+		t.Helper()
+		script := boundary[0] + "\nrootless_worker_marker_valid_at \"$1\" \"$2\" \"$3\" \"$4\"\n"
+		cmd := exec.Command("bash", "-c", script, "marker-test", marker, uid, home, expectedOwner)
+		if got := cmd.Run() == nil; got != want {
+			t.Fatalf("marker safe=%v, want %v (uid=%q home=%q owner=%q)", got, want, uid, home, expectedOwner)
+		}
+	}
+
+	write("1001\n", 0600)
+	check(true, "1001", "/home/citadel", owner)
+	check(false, "0", "/home/citadel", owner)
+	check(false, "1001", "/home/someone", owner)
+	check(false, "1001", "/home/citadel", "99999")
+	write("1001 \n", 0600)
+	check(false, "1001", "/home/citadel", owner)
+	write("1001\n\n", 0600)
+	check(false, "1001", "/home/citadel", owner)
+	write("1001\n", 0644)
+	check(false, "1001", "/home/citadel", owner)
+	write("1001\n", 0600)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	check(false, "1001", "/home/citadel", owner)
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "missing"), marker); err != nil {
+		t.Fatal(err)
+	}
+	check(false, "1001", "/home/citadel", owner)
+	linkedParent := filepath.Join(t.TempDir(), "linked-parent")
+	if err := os.Symlink(dir, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+	marker = filepath.Join(linkedParent, "rootless-worker-user")
+	check(false, "1001", "/home/citadel", owner)
+}
+
+func TestPodmanVersionMeetsCDIFloor(t *testing.T) {
+	tests := []struct {
+		output string
+		want   bool
+	}{
+		{"podman version 3.4.4", false},
+		{"podman version 4.0.3", false},
+		{"podman version 4.1.0", true},
+		{"podman version 4.9.3", true},
+		{"podman version 5.4.2", true},
+		{"podman version unknown", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := podmanVersionMeetsCDIFloor(tc.output); got != tc.want {
+			t.Errorf("podmanVersionMeetsCDIFloor(%q) = %v, want %v", tc.output, got, tc.want)
+		}
+	}
+}
+
+func TestUbuntuJammyDetection(t *testing.T) {
+	for _, tc := range []struct {
+		data string
+		want bool
+	}{
+		{`ID=ubuntu
+VERSION_ID="22.04"
+`, true},
+		{`ID='ubuntu'
+VERSION_ID='24.04'
+`, false},
+		{`ID=debian
+VERSION_ID="12"
+`, false},
+		{"", false},
+	} {
+		if got := ubuntuJammy([]byte(tc.data)); got != tc.want {
+			t.Errorf("ubuntuJammy(%q) = %v, want %v", tc.data, got, tc.want)
+		}
 	}
 }
 

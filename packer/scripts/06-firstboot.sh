@@ -144,17 +144,32 @@ KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
 RULE
     udevadm control --reload-rules
     install -d -m 755 /etc/cdi
+    # The image may have been built without GPU passthrough, in which case
+    # 03-podman intentionally did not persist its refresh helper. Generate
+    # directly here with the same Podman-4.9-compatible feature flag.
     cdi_ready=false
     for attempt in $(seq 1 30); do
-        if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+        if nvidia-ctk cdi generate --feature-flag no-additional-gids-for-device-nodes --output=/etc/cdi/nvidia.yaml &&
            nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
             cdi_ready=true
             break
         fi
         sleep 2
     done
-    $cdi_ready || { log "ERROR: NVIDIA CDI unavailable; keeping firstboot pending for a safe retry."; exit 1; }
-    log "NVIDIA CDI devices verified."
+    $cdi_ready || {
+        log "ERROR: NVIDIA CDI unavailable; keeping firstboot pending for a safe retry."
+        exit 1
+    }
+    # Prove Podman itself can parse the generated CDI document and inject a
+    # real GPU before the worker is allowed to start. The Packer build always
+    # pre-pulls this image into the citadel user's rootless storage.
+    as_citadel podman run --rm --pull=never --device nvidia.com/gpu=all \
+        --security-opt=label=disable --entrypoint nvidia-smi \
+        vllm/vllm-openai:latest -L >/dev/null || {
+        log "ERROR: Rootless Podman NVIDIA CDI canary failed; refusing to start the worker."
+        exit 1
+    }
+    log "NVIDIA CDI devices verified through rootless Podman."
 fi
 as_citadel systemctl --user daemon-reload
 as_citadel systemctl --user enable --now citadel-worker.service

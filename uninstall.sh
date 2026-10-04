@@ -69,18 +69,34 @@ as_citadel_user() {
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" "$@"
 }
 
+# The marker boundary mirrors install.sh exactly. Keep the path/identity inputs
+# explicit so regressions can exercise it without creating a real account.
+rootless_worker_marker_valid_at() {
+    local marker="$1" uid="$2" home="$3" owner="$4" dir mode content
+    case "$uid" in ''|0|*[!0-9]*) return 1 ;; esac
+    [ "$home" = /home/citadel ] || return 1
+    dir=$(dirname "$marker") || return 1
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    [ "$(stat -c %u "$dir" 2>/dev/null)" = "$owner" ] || return 1
+    mode=$(stat -c %a "$dir" 2>/dev/null) || return 1
+    [ "$((8#$mode & 8#22))" -eq 0 ] || return 1
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    [ "$(stat -c %u "$marker" 2>/dev/null)" = "$owner" ] || return 1
+    [ "$(stat -c %a "$marker" 2>/dev/null)" = 600 ] || return 1
+    content="$(cat "$marker" 2>/dev/null && printf x)" || return 1
+    [ "$content" = "${uid}"$'\n'x ]
+}
+# End independently testable uninstaller marker-boundary functions.
+
 # The citadel account is safe to delete only when Citadel's trusted provenance
-# marker proves the installer created it (a root-owned regular file whose
-# content is the account's own UID). A pre-existing human "citadel" account has
-# no such marker and must never be removed.
+# marker proves the installer created it. A pre-existing human "citadel"
+# account has no such marker and must never be removed.
 rootless_worker_marker_valid() {
-    local uid content
+    local uid home
     id citadel >/dev/null 2>&1 || return 1
     uid=$(id -u citadel) || return 1
-    [ -f "$WORKER_MARKER" ] && [ ! -L "$WORKER_MARKER" ] || return 1
-    [ "$(stat -c %u "$WORKER_MARKER" 2>/dev/null)" = "0" ] || return 1
-    content=$(tr -d '[:space:]' < "$WORKER_MARKER" 2>/dev/null)
-    [ "$content" = "$uid" ]
+    home=$(getent passwd citadel | cut -d: -f6) || return 1
+    rootless_worker_marker_valid_at "$WORKER_MARKER" "$uid" "$home" 0
 }
 
 # ---------------------------------------------------------------------------

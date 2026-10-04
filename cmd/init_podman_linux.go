@@ -66,6 +66,84 @@ func hasNvidiaHardwareLinux() bool {
 	return false
 }
 
+func podmanVersionMeetsCDIFloor(output string) bool {
+	fields := strings.Fields(output)
+	if len(fields) == 0 {
+		return false
+	}
+	version := fields[len(fields)-1]
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	if majorErr != nil || minorErr != nil {
+		return false
+	}
+	return major > 4 || major == 4 && minor >= 1
+}
+
+func requirePodmanCDIFloorForGPU() error {
+	if !hasNvidiaHardwareLinux() {
+		return nil
+	}
+	podmanPath, err := exec.LookPath("podman")
+	if err != nil {
+		return fmt.Errorf("GPU node needs Podman >= 4.1 for rootless CDI GPU injection (nvidia.com/gpu): %w", err)
+	}
+	out, err := exec.Command(podmanPath, "--version").CombinedOutput()
+	if err == nil && podmanVersionMeetsCDIFloor(string(out)) {
+		return nil
+	}
+	version := strings.TrimSpace(string(out))
+	if version == "" {
+		version = "unknown"
+	}
+	if err != nil {
+		return fmt.Errorf("GPU node needs Podman >= 4.1 for rootless CDI GPU injection (nvidia.com/gpu), but found %s: %w", version, err)
+	}
+	return fmt.Errorf("GPU node needs Podman >= 4.1 for rootless CDI GPU injection (nvidia.com/gpu), but found %s", version)
+}
+
+func ubuntuJammy(data []byte) bool {
+	id, version := "", ""
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		value = strings.Trim(value, `"'`)
+		switch key {
+		case "ID":
+			id = value
+		case "VERSION_ID":
+			version = value
+		}
+	}
+	return id == "ubuntu" && version == "22.04"
+}
+
+// Jammy's default Podman is known to be 3.4.4. Refuse before creating the
+// dedicated account or enrolling a node unless an operator has already
+// installed a compatible Podman from another source. Every platform is also
+// checked again after package installation.
+func rejectJammyGPUWithoutCompatiblePodman() error {
+	if !hasNvidiaHardwareLinux() {
+		return nil
+	}
+	osRelease, err := os.ReadFile("/etc/os-release")
+	if err != nil || !ubuntuJammy(osRelease) {
+		return nil
+	}
+	if _, err := exec.LookPath("podman"); err == nil {
+		return requirePodmanCDIFloorForGPU()
+	} else if !isExecutableNotFound(err) {
+		return fmt.Errorf("inspect Podman before GPU provisioning: %w", err)
+	}
+	return fmt.Errorf("GPU provisioning on Ubuntu 22.04 needs Podman >= 4.1 before init; the default package is 3.4.4. Install a compatible Podman or use Ubuntu 24.04")
+}
+
 var legacySystemWorkerUnits = []string{
 	"/etc/systemd/system/citadel-worker.service",
 	"/etc/systemd/system/citadel.service",
@@ -93,6 +171,9 @@ func prepareLinuxPodmanProvision() (bool, error) {
 	}
 	if !platform.IsRoot() {
 		return false, nil // existing privilege diagnostic runs next
+	}
+	if err := rejectJammyGPUWithoutCompatiblePodman(); err != nil {
+		return false, err
 	}
 	ready, err := classifyExistingPodmanWorker(user.Lookup, verifyDedicatedPodmanUser, existingRootlessWorker)
 	if err != nil || ready {
@@ -288,6 +369,9 @@ func existingRootlessWorker(owner *user.User) (bool, error) {
 		return false, err
 	}
 	if hasNvidiaHardwareLinux() {
+		if err := requirePodmanCDIFloorForGPU(); err != nil {
+			return false, err
+		}
 		if err := requireManagerGroups(uid, []string{"video", "render"}); err != nil {
 			return false, err
 		}
@@ -411,6 +495,12 @@ func installRootlessPodmanLinux() error {
 	}
 	if err := pm.Install("podman", "uidmap", "fuse-overlayfs", "crun", "slirp4netns", "dbus-user-session", "git", "gnupg", "udev"); err != nil {
 		return fmt.Errorf("install rootless Podman dependencies: %w", err)
+	}
+	// Ubuntu 22.04 ships Podman 3.4.4, which cannot consume CDI devices in
+	// rootless containers. Refuse a GPU provision before subids, linger, the
+	// user manager, or the Podman socket are mutated.
+	if err := requirePodmanCDIFloorForGPU(); err != nil {
+		return err
 	}
 	if err := installPodmanCompose(pm); err != nil {
 		return err
