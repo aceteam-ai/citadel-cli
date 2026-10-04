@@ -2860,3 +2860,19 @@ Auto-generated log of every release.
   - fix: bind hosted replies to exact turn tokens (#1213)
 
 
+---
+
+## v2.180.0 — 2026-10-04
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 3 |
+| Lines added | +164 |
+
+**Changes:**
+
+  - fix(release): ignore nested worktrees in runtime guard
+  - feat(files): support bounded chunk reads for Drive ingestion
+
+
