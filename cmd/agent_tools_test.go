@@ -232,21 +232,26 @@ func TestAgentNodeInfoNoPendingUpdate(t *testing.T) {
 	Version = "v1.0.0"
 
 	cases := []struct {
-		name string
-		load func() (*update.State, error)
+		name           string
+		runningVersion string
+		load           func() (*update.State, error)
 	}{
-		{"versions equal", func() (*update.State, error) {
+		{"versions equal", "v1.0.0", func() (*update.State, error) {
 			return &update.State{CurrentVersion: "v1.0.0"}, nil
 		}},
-		{"no state recorded", func() (*update.State, error) {
+		{"versions equal with staged tag prefix", "1.0.0", func() (*update.State, error) {
+			return &update.State{CurrentVersion: "v1.0.0"}, nil
+		}},
+		{"no state recorded", "v1.0.0", func() (*update.State, error) {
 			return &update.State{}, nil
 		}},
-		{"state load error", func() (*update.State, error) {
+		{"state load error", "v1.0.0", func() (*update.State, error) {
 			return nil, os.ErrNotExist
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			Version = tc.runningVersion
 			loadUpdateState = tc.load
 			info := agentNodeInfo("node-1", "1008", "org-x", time.Now())
 			if _, ok := info["pending_version"]; ok {
