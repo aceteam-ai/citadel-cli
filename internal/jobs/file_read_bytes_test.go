@@ -13,9 +13,12 @@ import (
 
 // fileReadBytesResult mirrors the JSON contract the coordinator decodes.
 type fileReadBytesResult struct {
-	Encoding string `json:"encoding"`
-	Content  string `json:"content"`
-	Size     int    `json:"size"`
+	Encoding  string `json:"encoding"`
+	Content   string `json:"content"`
+	Size      int    `json:"size"`
+	Offset    *int64 `json:"offset"`
+	TotalSize *int64 `json:"total_size"`
+	EOF       *bool  `json:"eof"`
 }
 
 func runFileReadBytes(t *testing.T, ws string, payload map[string]string) fileReadBytesResult {
@@ -107,6 +110,96 @@ func TestFileReadBytes_MaxBytesAllowsWithinCap(t *testing.T) {
 	})
 	if result.Size != len(raw) {
 		t.Errorf("size = %d, want %d", result.Size, len(raw))
+	}
+}
+
+func TestFileReadBytes_RangeRoundTrip(t *testing.T) {
+	ws := setupWorkspace(t)
+	raw := []byte("0123456789abcdef")
+	path := filepath.Join(ws, "range.bin")
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result := runFileReadBytes(t, ws, map[string]string{
+		"path": path, "offset": "4", "length": "6",
+	})
+	decoded, err := base64.StdEncoding.DecodeString(result.Content)
+	if err != nil {
+		t.Fatalf("content is not valid standard base64: %v", err)
+	}
+	if string(decoded) != "456789" {
+		t.Fatalf("decoded = %q, want %q", decoded, "456789")
+	}
+	if result.Offset == nil || *result.Offset != 4 {
+		t.Fatalf("offset = %v, want 4", result.Offset)
+	}
+	if result.TotalSize == nil || *result.TotalSize != int64(len(raw)) {
+		t.Fatalf("total_size = %v, want %d", result.TotalSize, len(raw))
+	}
+	if result.EOF == nil || *result.EOF {
+		t.Fatalf("eof = %v, want false", result.EOF)
+	}
+}
+
+func TestFileReadBytes_RangeClampsAtEOF(t *testing.T) {
+	ws := setupWorkspace(t)
+	path := writeTestFile(t, ws, "range.txt", "0123456789")
+
+	result := runFileReadBytes(t, ws, map[string]string{
+		"path": path, "offset": "8", "length": "8",
+	})
+	decoded, err := base64.StdEncoding.DecodeString(result.Content)
+	if err != nil {
+		t.Fatalf("content is not valid standard base64: %v", err)
+	}
+	if string(decoded) != "89" {
+		t.Fatalf("decoded = %q, want %q", decoded, "89")
+	}
+	if result.Size != 2 || result.EOF == nil || !*result.EOF {
+		t.Fatalf("size/eof = %d/%v, want 2/true", result.Size, result.EOF)
+	}
+}
+
+func TestFileReadBytes_RangeAtEOFIsEmpty(t *testing.T) {
+	ws := setupWorkspace(t)
+	path := writeTestFile(t, ws, "range.txt", "0123456789")
+
+	result := runFileReadBytes(t, ws, map[string]string{
+		"path": path, "offset": "10", "length": "8",
+	})
+	if result.Size != 0 || result.Content != "" || result.EOF == nil || !*result.EOF {
+		t.Fatalf("result = %+v, want empty EOF chunk", result)
+	}
+}
+
+func TestFileReadBytes_RangeValidation(t *testing.T) {
+	ws := setupWorkspace(t)
+	path := writeTestFile(t, ws, "range.txt", "0123456789")
+	h := NewFileReadBytesHandler(ws)
+	tests := []map[string]string{
+		{"path": path, "offset": "0"},
+		{"path": path, "length": "1"},
+		{"path": path, "offset": "-1", "length": "1"},
+		{"path": path, "offset": "nope", "length": "1"},
+		{"path": path, "offset": "0", "length": "0"},
+		{"path": path, "offset": "0", "length": fmt.Sprintf("%d", maxReadChunkBytes+1)},
+		{"path": path, "offset": "11", "length": "1"},
+	}
+	for _, payload := range tests {
+		if _, err := h.Execute(JobContext{}, makeJob(payload)); err == nil {
+			t.Errorf("payload %v: expected error", payload)
+		}
+	}
+}
+
+func TestFileReadBytes_WholeFileResponseStaysBackwardCompatible(t *testing.T) {
+	ws := setupWorkspace(t)
+	path := writeTestFile(t, ws, "legacy.txt", "legacy")
+
+	result := runFileReadBytes(t, ws, map[string]string{"path": path})
+	if result.Offset != nil || result.TotalSize != nil || result.EOF != nil {
+		t.Fatalf("legacy response gained range fields: %+v", result)
 	}
 }
 
