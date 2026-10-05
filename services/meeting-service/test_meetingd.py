@@ -12,15 +12,30 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 import wave
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 import meetingd
+
+
+@pytest.fixture
+def mic_session(monkeypatch):
+    """Install the one active session required by session-scoped mic routes."""
+    session = SimpleNamespace(lock=threading.Lock(), ending=False, mic_process=None)
+    monkeypatch.setattr(
+        meetingd,
+        "_get_session",
+        lambda session_id: session if session_id == "s1" else None,
+    )
+    return session
 
 
 def test_chrome_args_load_bearing_flags():
@@ -183,6 +198,7 @@ def test_health_returns_503_when_pulse_down(monkeypatch):
     monkeypatch.setattr(meetingd, "_chromium_binary", lambda: "/usr/bin/chromium")
     monkeypatch.setattr(meetingd.shutil, "which", lambda _: "/usr/bin/ffmpeg")
     monkeypatch.setattr(meetingd, "pulse_ready", lambda: False)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
     with TestClient(meetingd.app) as client:
         r = client.get("/health")
     assert r.status_code == 503
@@ -195,6 +211,7 @@ def test_health_returns_503_when_canary_silent(monkeypatch):
     monkeypatch.setattr(meetingd, "_chromium_binary", lambda: "/usr/bin/chromium")
     monkeypatch.setattr(meetingd.shutil, "which", lambda _: "/usr/bin/ffmpeg")
     monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
     monkeypatch.setattr(
         meetingd,
         "run_canary",
@@ -210,6 +227,7 @@ def test_health_returns_200_when_canary_passes(monkeypatch):
     monkeypatch.setattr(meetingd, "_chromium_binary", lambda: "/usr/bin/chromium")
     monkeypatch.setattr(meetingd.shutil, "which", lambda _: "/usr/bin/ffmpeg")
     monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
     monkeypatch.setattr(
         meetingd,
         "run_canary",
@@ -219,3 +237,375 @@ def test_health_returns_200_when_canary_passes(monkeypatch):
         r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "healthy"
+    # The virtual-mic block rides every /health body (additive; #7079).
+    vm = r.json()["virtual_mic"]
+    assert vm["present"] is True
+    assert vm["sink"] == meetingd.MIC_SINK
+    assert vm["source"] == meetingd.MIC_SOURCE
+
+
+# --- virtual microphone (bot -> room speaking path, aceteam#7079) --------------
+
+
+def test_health_reports_but_does_not_fail_on_missing_mic(monkeypatch):
+    """CRITICAL additive contract: a missing virtual mic must NOT 503 /health by
+    default -- that would strip meeting-CAPTURE capability from every node that
+    pulls the new image but hits a remap-source hiccup. It is only REPORTED
+    (present=false) unless MEETING_MIC_REQUIRED opts in."""
+    monkeypatch.setattr(meetingd, "_chromium_binary", lambda: "/usr/bin/chromium")
+    monkeypatch.setattr(meetingd.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "MIC_REQUIRED", False)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: False)
+    monkeypatch.setattr(
+        meetingd,
+        "run_canary",
+        lambda: meetingd.CanaryResult(ok=True, rms_dbfs=-12.0, detail="non-silent capture"),
+    )
+    with TestClient(meetingd.app) as client:
+        r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["virtual_mic"]["present"] is False
+
+
+def test_health_fails_on_missing_mic_when_required(monkeypatch):
+    """When MEETING_MIC_REQUIRED is set (a speaking node), an absent mic IS a 503."""
+    monkeypatch.setattr(meetingd, "_chromium_binary", lambda: "/usr/bin/chromium")
+    monkeypatch.setattr(meetingd.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "MIC_REQUIRED", True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: False)
+    with TestClient(meetingd.app) as client:
+        r = client.get("/health")
+    assert r.status_code == 503
+    assert r.json()["virtual_mic"]["present"] is False
+
+
+def test_mic_arg_builders():
+    """Pin the pure arg builders for the speaking path (no pulse needed)."""
+    dec = meetingd.build_mic_decode_ffmpeg_args("/tmp/play.wav")
+    assert dec[0] == "ffmpeg"
+    assert dec[dec.index("-protocol_whitelist") + 1] == "pipe"
+    assert dec[dec.index("-i") + 1] == "pipe:0"
+    assert dec[dec.index("-t") + 1] == str(meetingd.MIC_DECODE_LIMIT_SECONDS)
+    assert dec[dec.index("-ac") + 1] == "1"
+    assert dec[dec.index("-ar") + 1] == "48000"
+    assert dec[dec.index("-c:a") + 1] == "pcm_s16le"
+    assert dec[dec.index("-f") + 1] == "wav"
+    assert dec[dec.index("-fs") + 1] == str(meetingd.MIC_DECODE_MAX_BYTES)
+    assert dec[-1] == "/tmp/play.wav"
+
+    pa = meetingd.build_paplay_mic_args("citadel_mic", "/tmp/play.wav")
+    assert pa == ["paplay", "--device=citadel_mic", "/tmp/play.wav"]
+
+    pc = meetingd.build_pacat_mic_args("citadel_mic", 24000, 1)
+    assert pc[0] == "pacat"
+    assert "--playback" in pc
+    assert "--device=citadel_mic" in pc
+    assert "--format=s16le" in pc
+    assert "--rate=24000" in pc
+    assert "--channels=1" in pc
+
+
+def test_mic_play_503_when_mic_absent(monkeypatch, mic_session):
+    """The speaking endpoints refuse (503) when the virtual mic is not present, so a
+    caller gets a clear signal rather than silently playing into nothing."""
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: False)
+    with TestClient(meetingd.app) as client:
+        r = client.post("/sessions/s1/mic/play", json={"path": "tts/hi.wav"})
+    assert r.status_code == 503
+
+
+def test_mic_play_404_on_missing_file(monkeypatch, mic_session):
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    monkeypatch.setattr(meetingd, "WORKSPACE", "/workspace")
+    with TestClient(meetingd.app) as client:
+        r = client.post("/sessions/s1/mic/play", json={"path": "tts/does-not-exist.wav"})
+    assert r.status_code == 404
+
+
+def test_mic_play_rejects_path_traversal(monkeypatch, mic_session):
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    monkeypatch.setattr(meetingd, "WORKSPACE", "/workspace")
+    with TestClient(meetingd.app) as client:
+        r = client.post("/sessions/s1/mic/play", json={"path": "../etc/passwd"})
+    assert r.status_code == 400
+
+
+def test_mic_play_rejects_workspace_symlink_escape(monkeypatch, tmp_path, mic_session):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.wav").write_bytes(b"RIFF....")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    monkeypatch.setattr(meetingd, "WORKSPACE", str(workspace))
+    with TestClient(meetingd.app) as client:
+        r = client.post("/sessions/s1/mic/play", json={"path": "escape/secret.wav"})
+    assert r.status_code == 400
+
+
+def test_mic_play_file_happy_path(monkeypatch, tmp_path, mic_session):
+    """A present mic + a real file plays: the injection helper is stubbed (no pulse
+    in CI) so this pins the endpoint wiring/response, not the audio subprocess."""
+    ws = tmp_path
+    (ws / "tts").mkdir()
+    f = ws / "tts" / "hi.wav"
+    f.write_bytes(b"RIFF....")
+    played: dict[str, str] = {}
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    monkeypatch.setattr(meetingd, "WORKSPACE", str(ws))
+    monkeypatch.setattr(
+        meetingd, "_play_file_into_mic", lambda session, p: played.update(path=p)
+    )
+    with TestClient(meetingd.app) as client:
+        r = client.post("/sessions/s1/mic/play", json={"path": "tts/hi.wav"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["played"] is True and body["source"] == "file"
+    assert played["path"] == str(f)
+
+
+def test_mic_play_pcm_happy_path(monkeypatch, mic_session):
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    monkeypatch.setattr(
+        meetingd,
+        "_play_pcm_into_mic",
+        lambda session, pcm, rate, channels: captured.update(
+            n=len(pcm), rate=rate, channels=channels
+        ),
+    )
+    with TestClient(meetingd.app) as client:
+        r = client.post(
+            "/sessions/s1/mic/play/pcm?rate=16000&channels=1",
+            content=b"\x01\x02\x03\x04",
+            headers={"content-type": "application/octet-stream"},
+        )
+    assert r.status_code == 200
+    assert r.json() == {"played": True, "source": "pcm", "bytes": 4}
+    assert captured == {"n": 4, "rate": 16000, "channels": 1}
+
+
+def test_mic_play_pcm_rejects_empty_body(monkeypatch, mic_session):
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    with TestClient(meetingd.app) as client:
+        r = client.post(
+            "/sessions/s1/mic/play/pcm",
+            content=b"",
+            headers={"content-type": "application/octet-stream"},
+        )
+    assert r.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "query,body,status",
+    [
+        ("rate=7999&channels=1", b"\x00\x00", 400),
+        ("rate=24000&channels=9", b"\x00" * 18, 400),
+        ("rate=24000&channels=2", b"\x00\x00", 400),
+    ],
+)
+def test_mic_play_pcm_rejects_invalid_format_before_probe(
+    monkeypatch, mic_session, query, body, status
+):
+    # Input validation is independent of device health and runs before Pulse probes.
+    monkeypatch.setattr(
+        meetingd,
+        "pulse_ready",
+        lambda: pytest.fail("invalid PCM must be rejected before probing Pulse"),
+    )
+    with TestClient(meetingd.app) as client:
+        r = client.post(
+            f"/sessions/s1/mic/play/pcm?{query}",
+            content=body,
+            headers={"content-type": "application/octet-stream"},
+        )
+    assert r.status_code == status
+
+
+def test_mic_play_pcm_rejects_oversized_body(monkeypatch, mic_session):
+    monkeypatch.setattr(meetingd, "MIC_PCM_MAX_BYTES", 4)
+    monkeypatch.setattr(
+        meetingd,
+        "pulse_ready",
+        lambda: pytest.fail("oversized PCM must be rejected before probing Pulse"),
+    )
+    with TestClient(meetingd.app) as client:
+        r = client.post(
+            "/sessions/s1/mic/play/pcm?rate=24000&channels=1",
+            content=b"\x00" * 6,
+            headers={"content-type": "application/octet-stream"},
+        )
+    assert r.status_code == 413
+
+
+def test_mic_play_pcm_accepts_exact_duration_and_absolute_limit(monkeypatch, mic_session):
+    # 8 kHz * mono * 2 bytes * 1 second = exactly 16,000 bytes. Both limits are
+    # inclusive; only the first byte beyond either bound is rejected.
+    monkeypatch.setattr(meetingd, "MIC_PLAY_TIMEOUT", 1)
+    monkeypatch.setattr(meetingd, "MIC_PCM_MAX_BYTES", 16000)
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    captured: dict[str, int] = {}
+    monkeypatch.setattr(
+        meetingd,
+        "_play_pcm_into_mic",
+        lambda session, pcm, rate, channels: captured.update(size=len(pcm)),
+    )
+    with TestClient(meetingd.app) as client:
+        r = client.post(
+            "/sessions/s1/mic/play/pcm?rate=8000&channels=1",
+            content=b"\x00" * 16000,
+            headers={"content-type": "application/octet-stream"},
+        )
+    assert r.status_code == 200
+    assert captured == {"size": 16000}
+
+
+def test_mic_routes_reject_wrong_and_ended_sessions_before_probe(monkeypatch, mic_session):
+    monkeypatch.setattr(
+        meetingd,
+        "pulse_ready",
+        lambda: pytest.fail("missing sessions must be rejected before probing Pulse"),
+    )
+    with TestClient(meetingd.app) as client:
+        wrong = client.post("/sessions/wrong/mic/play", json={"path": "tts/hi.wav"})
+        assert wrong.status_code == 404
+        monkeypatch.setattr(meetingd, "_get_session", lambda _: None)
+        ended = client.post(
+            "/sessions/s1/mic/play/pcm?rate=24000&channels=1",
+            content=b"\x00\x00",
+            headers={"content-type": "application/octet-stream"},
+        )
+    assert ended.status_code == 404
+
+
+def test_mic_file_duration_rejects_over_timeout(monkeypatch, tmp_path):
+    wav = tmp_path / "too-long.wav"
+    with wave.open(str(wav), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(8000)
+        out.writeframes(b"\x00" * 8000 * 2 * 2)
+    monkeypatch.setattr(meetingd, "MIC_PLAY_TIMEOUT", 1)
+    monkeypatch.setattr(meetingd, "MIC_DECODE_MAX_BYTES", wav.stat().st_size + 1)
+    with pytest.raises(meetingd.MicMediaError, match="exceeds 1 seconds"):
+        meetingd._validate_decoded_mic_wav(str(wav))
+
+
+def test_open_workspace_audio_rejects_final_symlink(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"RIFF")
+    link = workspace / "linked.wav"
+    link.symlink_to(outside)
+    monkeypatch.setattr(meetingd, "WORKSPACE", str(workspace))
+    with pytest.raises(meetingd.MicMediaError, match="opened safely"):
+        with meetingd._open_workspace_audio(str(link)):
+            pytest.fail("unsafe symlink was opened")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_pipe_only_decode_rejects_nested_file_reference(tmp_path):
+    outside = tmp_path / "outside.wav"
+    with wave.open(str(outside), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(8000)
+        wav.writeframes(b"\x00" * 16000)
+    manifest = f"#EXTM3U\n#EXTINF:1.0,\nfile://{outside}\n#EXT-X-ENDLIST\n".encode()
+    decoded = tmp_path / "decoded.wav"
+    result = subprocess.run(
+        meetingd.build_mic_decode_ffmpeg_args(str(decoded)),
+        input=manifest,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert b"not on whitelist" in result.stderr or b"Invalid data" in result.stderr
+
+
+class _FakeProcess:
+    def __init__(self, running: bool = True):
+        self.returncode = None if running else 0
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def test_teardown_cancels_active_mic_process_without_holding_session_lock(monkeypatch):
+    mic = _FakeProcess()
+    session = meetingd.Session(
+        session_id="s1",
+        sink_name="sink",
+        sink_module_id="7",
+        chrome=_FakeProcess(running=False),
+        cdp_port=9223,
+        created_at=0,
+        max_duration_seconds=60,
+        mic_process=mic,
+    )
+    unloaded: list[str] = []
+    monkeypatch.setattr(meetingd, "_unload_module", unloaded.append)
+    meetingd._teardown(session)
+    assert session.ending is True
+    assert mic.terminated is True
+    assert mic.killed is False
+    assert session.mic_process is None
+    assert unloaded == ["7"]
+
+
+def test_end_session_reserves_slot_until_teardown_finishes(monkeypatch):
+    session = SimpleNamespace(lock=threading.Lock(), ending=False)
+    monkeypatch.setattr(meetingd, "_sessions", {"s1": session})
+    observed: list[bool] = []
+
+    def fake_teardown(s):
+        observed.append(meetingd._sessions.get("s1") is s and s.ending)
+
+    monkeypatch.setattr(meetingd, "_teardown", fake_teardown)
+    response = meetingd.end_session("s1")
+    assert response.status_code == 200
+    assert observed == [True]
+    assert "s1" not in meetingd._sessions
+
+
+def test_citadel_pa_declares_virtual_mic():
+    """Pin the citadel.pa virtual-mic topology the way the entrypoint test pins its
+    load-bearing lines: the null sink, the monitor REMAP to a real source (not the
+    raw monitor, which Chromium filters), and the default-source selection."""
+    pa = os.path.join(os.path.dirname(__file__), "citadel.pa")
+    body = open(pa).read()
+    # .nofail keeps a mic-line failure from killing PulseAudio (and CAPTURE) under
+    # `pulseaudio -n -F`'s fail-fast default. The line a future cleanup deletes.
+    assert ".nofail" in body
+    assert "sink_name=citadel_mic" in body
+    assert "module-remap-source" in body
+    assert "master=citadel_mic.monitor" in body
+    assert "source_name=citadel_virtmic" in body
+    # device.class=sound is what stops Chromium filtering it as a monitor.
+    assert "device.class=sound" in body
+    assert "set-default-source citadel_virtmic" in body

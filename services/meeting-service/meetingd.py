@@ -57,6 +57,7 @@ import math
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -64,12 +65,18 @@ import time
 import uuid
 import wave
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
+from typing import BinaryIO, Iterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
+
+
+def _truthy(val: str | None) -> bool:
+    return (val or "").strip().lower() in {"1", "true", "yes", "on"}
 
 # --- configuration (env, with the same defaults the service.yaml declares) ---
 
@@ -93,6 +100,46 @@ CANARY_FLOOR_DBFS = -50.0
 # buildAudioFFmpegArgs so the transcribe sidecar reads it unchanged.
 WAV_CHANNELS = "1"
 WAV_RATE = "16000"
+
+# --- virtual microphone (bot -> room speaking path, aceteam#7079) ---
+#
+# The container boots (citadel.pa) a null sink MIC_SINK whose monitor is remapped
+# to a real capture source MIC_SOURCE, set as the default source so the Chromium
+# tab publishes it as its mic. Audio played INTO MIC_SINK is therefore heard by the
+# meeting. This is strictly ADDITIVE to the capture path (the per-meeting sinks and
+# the canary both name `<sink>.monitor` EXPLICITLY, so making MIC_SOURCE the default
+# source cannot touch them): a bot that never calls /mic/play publishes silence,
+# exactly as before.
+MIC_SINK = os.environ.get("MEETING_MIC_SINK", "citadel_mic")
+MIC_SOURCE = os.environ.get("MEETING_MIC_SOURCE", "citadel_virtmic")
+# By default a missing virtual mic is REPORTED in /health (never fails it): a node
+# that pulls the new image but hits a remap-source hiccup must keep its existing
+# meeting-CAPTURE capability, which works today. Set MEETING_MIC_REQUIRED truthy on
+# a speaking node to make an absent mic a hard 503.
+MIC_REQUIRED = _truthy(os.environ.get("MEETING_MIC_REQUIRED"))
+# Upper bound on a single /mic/play or /mic/play/pcm playback. A TTS clip is
+# seconds-to-a-minute; this is a safety cap, not the expected duration.
+MIC_PLAY_TIMEOUT = int(os.environ.get("MEETING_MIC_PLAY_TIMEOUT", "120"))
+# Default raw-PCM format for /mic/play/pcm when the caller omits the query params.
+MIC_PCM_RATE = int(os.environ.get("MEETING_MIC_PCM_RATE", "24000"))
+MIC_PCM_CHANNELS = int(os.environ.get("MEETING_MIC_PCM_CHANNELS", "1"))
+# Bound the loopback control surface even though it is not mesh-exposed. Twenty-four
+# MiB covers 120 seconds of the largest accepted stream (48 kHz stereo s16le is
+# 23,040,000 bytes), while keeping a local peer from pinning unbounded memory.
+MIC_PCM_MAX_BYTES = max(1, int(os.environ.get("MEETING_MIC_PCM_MAX_BYTES", str(24 << 20))))
+MIC_PCM_MIN_RATE = 8000
+MIC_PCM_MAX_RATE = 48000
+MIC_PCM_MAX_CHANNELS = 2
+# Decode one second past the accepted duration so a longer source cannot hide
+# behind ffmpeg's output truncation. Mono 48 kHz s16le is 96,000 bytes/second;
+# the small allowance covers the WAV container header and metadata chunks.
+MIC_DECODE_LIMIT_SECONDS = MIC_PLAY_TIMEOUT + 1
+MIC_DECODE_MAX_BYTES = MIC_DECODE_LIMIT_SECONDS * 48000 * 2 + 4096
+
+# Serializes injection so two overlapping clips never garble the mic. One clip at a
+# time; a second concurrent request gets 409 (no barge-in / mid-clip stop yet --
+# that is the later realtime wave).
+_mic_lock = threading.Lock()
 
 
 def _chromium_binary() -> str | None:
@@ -191,6 +238,242 @@ def _unload_module(module_id: str) -> None:
         )
     except (subprocess.SubprocessError, OSError):
         pass
+
+
+def _pactl_short(kind: str) -> list[str]:
+    """Names of the pulse objects of `kind` ("sinks"/"sources") via `pactl list
+    short`. Column 1 is the object name (tab-separated). Returns [] on any failure
+    so a probe treats 'pactl unavailable' the same as 'object absent'."""
+    if not shutil.which("pactl"):
+        return []
+    try:
+        r = subprocess.run(
+            ["pactl", "list", "short", kind],
+            env=_pactl_env(),
+            capture_output=True,
+            timeout=5,
+            text=True,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if r.returncode != 0:
+        return []
+    names: list[str] = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            names.append(parts[1])
+    return names
+
+
+def virtual_mic_present() -> bool:
+    """True when BOTH the virtual-mic null sink and its remapped source exist, i.e.
+    citadel.pa's mic topology loaded. Cheap (two `pactl list short` calls), so it is
+    safe to call on every /health."""
+    return MIC_SINK in _pactl_short("sinks") and MIC_SOURCE in _pactl_short("sources")
+
+
+def build_mic_decode_ffmpeg_args(out_path: str) -> list[str]:
+    """Decode a streamable audio file from stdin into a bounded plain WAV.
+
+    ``pipe`` is the only allowed protocol, so playlist/container content cannot
+    make ffmpeg fetch a URL or open another local file. The output is mono 48 kHz
+    s16le and is capped one second beyond the accepted playback duration; the
+    caller inspects the decoded WAV and rejects anything over the real limit.
+    """
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-protocol_whitelist",
+        "pipe",
+        "-i",
+        "pipe:0",
+        "-t",
+        str(MIC_DECODE_LIMIT_SECONDS),
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        "-fs",
+        str(MIC_DECODE_MAX_BYTES),
+        "-y",
+        out_path,
+    ]
+
+
+def build_paplay_mic_args(sink: str, wav_path: str) -> list[str]:
+    """paplay args to play a WAV into `sink` (the virtual-mic null sink). Mirrors the
+    canary's `paplay --device=<sink> <file>` invocation, which is proven to work."""
+    return ["paplay", f"--device={sink}", wav_path]
+
+
+def build_pacat_mic_args(sink: str, rate: int, channels: int) -> list[str]:
+    """pacat args to play raw signed-16-bit little-endian PCM (read from stdin) into
+    `sink`. This is the low-latency path a realtime TTS engine would stream to. Pure
+    so the format flags are unit-testable."""
+    return [
+        "pacat",
+        "--playback",
+        f"--device={sink}",
+        "--format=s16le",
+        f"--rate={int(rate)}",
+        f"--channels={int(channels)}",
+    ]
+
+
+class MicMediaError(ValueError):
+    """The requested media violates the bounded speaking contract."""
+
+
+class MicPlaybackCancelled(RuntimeError):
+    """The owning meeting session ended while its audio was being processed."""
+
+
+def _run_mic_process(
+    session: Session,
+    args: list[str],
+    *,
+    timeout: float,
+    input_bytes: bytes | None = None,
+    input_stream: BinaryIO | None = None,
+    capture_output: bool = False,
+) -> bytes:
+    """Run and track one mic subprocess so session teardown can cancel it.
+
+    The process is registered without holding the lock while waiting. Teardown
+    marks the session ending and terminates the registered child, which prevents
+    meeting-A audio from continuing into a later meeting-B session.
+    """
+    with session.lock:
+        if session.ending:
+            raise MicPlaybackCancelled("meeting session ended")
+        # Check + spawn + registration are one critical section. Starting the
+        # child before this lock would leave a narrow stale-session race where
+        # teardown could finish and a later meeting could start just before the
+        # old child connected to the node-wide mic.
+        if input_bytes is not None and input_stream is not None:
+            raise ValueError("mic process accepts only one stdin source")
+        proc = subprocess.Popen(
+            args,
+            env=_pactl_env(),
+            stdin=subprocess.PIPE if input_bytes is not None else input_stream,
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE if capture_output else None,
+        )
+        session.mic_process = proc
+    try:
+        stdout, stderr = proc.communicate(input=input_bytes, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        with session.lock:
+            if session.mic_process is proc:
+                session.mic_process = None
+    if proc.returncode != 0:
+        with session.lock:
+            cancelled = session.ending
+        if cancelled:
+            raise MicPlaybackCancelled("meeting session ended")
+        raise subprocess.CalledProcessError(proc.returncode, args, output=stdout, stderr=stderr)
+    return stdout or b""
+
+
+@contextmanager
+def _open_workspace_audio(src_path: str) -> Iterator[BinaryIO]:
+    """Open a regular workspace file without following its final symlink.
+
+    The post-open ``/proc/self/fd`` check validates the inode actually opened, so
+    replacing an intermediate directory between path validation and ``open`` does
+    not turn the request into a read outside the workspace.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(src_path, flags)
+    except OSError as exc:
+        raise MicMediaError("audio file could not be opened safely") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MicMediaError("audio input must be a regular file")
+        workspace_root = os.path.realpath(WORKSPACE)
+        opened_path = os.path.realpath(f"/proc/self/fd/{fd}")
+        try:
+            confined = os.path.commonpath([workspace_root, opened_path]) == workspace_root
+        except ValueError:
+            confined = False
+        if not confined:
+            raise MicMediaError("audio input escapes the workspace")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            yield stream
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _validate_decoded_mic_wav(wav_path: str) -> None:
+    try:
+        size = os.path.getsize(wav_path)
+        with wave.open(wav_path, "rb") as decoded:
+            rate = decoded.getframerate()
+            frames = decoded.getnframes()
+    except (OSError, wave.Error) as exc:
+        raise MicMediaError("decoded audio is not a valid WAV") from exc
+    if size > MIC_DECODE_MAX_BYTES:
+        raise MicMediaError("decoded audio is too large")
+    if rate <= 0 or frames / rate > MIC_PLAY_TIMEOUT:
+        raise MicMediaError(f"audio duration exceeds {MIC_PLAY_TIMEOUT} seconds")
+
+
+def _play_file_into_mic(session: Session, src_path: str) -> None:
+    """Decode `src_path` to a scratch WAV and play it into MIC_SINK, so it is
+    published on the virtual mic into the live meeting. Blocks until playback
+    finishes (pulse paces the null sink at wall-clock rate)."""
+    tmpdir = tempfile.mkdtemp(prefix="mic_")
+    wav = os.path.join(tmpdir, "play.wav")
+    # ONE budget shared across decode + playback (not MIC_PLAY_TIMEOUT each), so
+    # meetingd's total worst case stays under MIC_PLAY_TIMEOUT and never holds
+    # _mic_lock past the Go client's (larger) timeout -- otherwise the next call
+    # gets a confusing 409 while a runaway clip is still "playing".
+    start = time.monotonic()
+    try:
+        with _open_workspace_audio(src_path) as source:
+            try:
+                _run_mic_process(
+                    session,
+                    build_mic_decode_ffmpeg_args(wav),
+                    input_stream=source,
+                    timeout=MIC_PLAY_TIMEOUT,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise MicMediaError("audio could not be decoded safely") from exc
+        _validate_decoded_mic_wav(wav)
+        remaining = max(1.0, MIC_PLAY_TIMEOUT - (time.monotonic() - start))
+        _run_mic_process(
+            session,
+            build_paplay_mic_args(MIC_SINK, wav),
+            timeout=remaining,
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _play_pcm_into_mic(session: Session, pcm: bytes, rate: int, channels: int) -> None:
+    """Play raw s16le PCM bytes into MIC_SINK via pacat. Blocks until done."""
+    _run_mic_process(
+        session,
+        build_pacat_mic_args(MIC_SINK, rate, channels),
+        input_bytes=pcm,
+        timeout=MIC_PLAY_TIMEOUT,
+    )
 
 
 def build_record_ffmpeg_args(monitor_source: str, out_path: str) -> list[str]:
@@ -331,6 +614,8 @@ class Session:
     max_duration_seconds: int
     recorder: subprocess.Popen[bytes] | None = None
     record_path: str | None = None
+    mic_process: subprocess.Popen[bytes] | None = None
+    ending: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -341,6 +626,13 @@ class StartSessionRequest(BaseModel):
 
 class RecordRequest(BaseModel):
     out: str
+
+
+class MicPlayRequest(BaseModel):
+    # path is a workspace-relative audio file (any format ffmpeg decodes). It is
+    # resolved through _safe_workspace_path, so it cannot escape the /workspace
+    # mount -- same guard the recorder uses for its output path.
+    path: str
 
 
 @asynccontextmanager
@@ -356,16 +648,31 @@ _sessions_lock = threading.Lock()
 
 
 def _safe_workspace_path(rel: str) -> str:
-    """Resolve a workspace-relative output path, rejecting traversal outside the
-    workspace mount."""
+    """Resolve a workspace-relative path, rejecting traversal (including through
+    a symlink inside the workspace) outside the workspace mount."""
     rel = rel.strip().lstrip("/")
     if not rel:
         raise ValueError("empty output path")
-    full = os.path.normpath(os.path.join(WORKSPACE, rel))
-    workspace_root = os.path.normpath(WORKSPACE)
+    workspace_root = os.path.realpath(WORKSPACE)
+    full = os.path.realpath(os.path.join(workspace_root, rel))
     if full != workspace_root and not full.startswith(workspace_root + os.sep):
         raise ValueError("output path escapes the workspace")
     return full
+
+
+def _virtual_mic_health() -> dict[str, object]:
+    """The virtual-mic block attached to every /health body. Best-effort: a probe
+    failure reports present=False rather than raising."""
+    try:
+        present = virtual_mic_present()
+    except Exception:  # noqa: BLE001 -- report, never fail the whole probe
+        present = False
+    return {
+        "present": present,
+        "sink": MIC_SINK,
+        "source": MIC_SOURCE,
+        "required": MIC_REQUIRED,
+    }
 
 
 @app.get("/health")
@@ -378,28 +685,46 @@ def health() -> JSONResponse:
         problems.append("ffmpeg not found")
     if not pulse_ready():
         problems.append("pulse server not ready")
+    mic = _virtual_mic_health()
+    # The virtual mic is the SPEAKING path; a missing one never breaks CAPTURE, so by
+    # default it is only reported. Only a node explicitly required to speak
+    # (MEETING_MIC_REQUIRED) treats its absence as unhealthy.
+    if MIC_REQUIRED and not mic["present"]:
+        problems.append(f"virtual mic not present (sink={MIC_SINK}, source={MIC_SOURCE})")
     if problems:
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "problems": problems},
+            content={"status": "unhealthy", "problems": problems, "virtual_mic": mic},
         )
     try:
         canary = run_canary()
     except Exception as exc:  # noqa: BLE001 -- any canary failure is unhealthy
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "problems": [f"canary error: {exc}"]},
+            content={
+                "status": "unhealthy",
+                "problems": [f"canary error: {exc}"],
+                "virtual_mic": mic,
+            },
         )
     if not canary.ok:
         # 503 (5xx) so catalog.ProbeHealth classifies this as UNHEALTHY. A 4xx
         # would be read as healthy by that prober.
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "canary": canary.model_dump()},
+            content={
+                "status": "unhealthy",
+                "canary": canary.model_dump(),
+                "virtual_mic": mic,
+            },
         )
     return JSONResponse(
         status_code=200,
-        content={"status": "healthy", "canary": canary.model_dump()},
+        content={
+            "status": "healthy",
+            "canary": canary.model_dump(),
+            "virtual_mic": mic,
+        },
     )
 
 
@@ -521,17 +846,188 @@ def stop_record(session_id: str) -> JSONResponse:
     return JSONResponse(content={"recording": False, "path": path})
 
 
+# --- speaking path (bot -> room, aceteam#7079) ---------------------------------
+#
+# Two operations, one body shape each (cleaner than content-type switching):
+#   POST /sessions/{id}/mic/play
+#                         JSON {"path": "<workspace-relative audio file>"}
+#                         Decodes a streamable audio file (for example WAV/MP3)
+#                         through pipe-only ffmpeg and plays it into the virtual
+#                         mic. 200 {"played": true, "source": "file", ...}.
+#   POST /sessions/{id}/mic/play/pcm
+#                         raw body = signed-16-bit little-endian PCM
+#                         query: ?rate=<hz>&channels=<n> (default 24000/1)
+#                         Streams the bytes straight into the virtual mic via pacat.
+#                         200 {"played": true, "source": "pcm", "bytes": N}.
+#
+# The mic device is node-wide, so requests are serialized by _mic_lock and return
+# 409 while a clip is already playing. The URL is nevertheless session-scoped: a
+# stale meeting-A callback cannot speak into a later meeting B, and session teardown
+# cancels the active child process. Playback is SYNCHRONOUS (the request returns
+# when the clip finishes); barge-in is a later realtime wave.
+
+
+def _mic_not_ready() -> JSONResponse | None:
+    """Shared pre-flight for the speaking endpoints: pulse up and the virtual mic
+    present. Returns a 503 response when not ready, else None."""
+    if not pulse_ready():
+        return JSONResponse(status_code=503, content={"error": "pulse server not ready"})
+    if not virtual_mic_present():
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"virtual mic not present (sink={MIC_SINK}, source={MIC_SOURCE})"},
+        )
+    return None
+
+
+@app.post("/sessions/{session_id}/mic/play")
+def mic_play(session_id: str, req: MicPlayRequest) -> JSONResponse:
+    session = _get_session(session_id)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "no such session"})
+    not_ready = _mic_not_ready()
+    if not_ready is not None:
+        return not_ready
+    try:
+        src = _safe_workspace_path(req.path)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if not os.path.isfile(src):
+        return JSONResponse(status_code=404, content={"error": f"no such file: {req.path}"})
+    if not _mic_lock.acquire(blocking=False):
+        return JSONResponse(status_code=409, content={"error": "already speaking"})
+    try:
+        _play_file_into_mic(session, src)
+    except MicMediaError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except MicPlaybackCancelled:
+        return JSONResponse(status_code=409, content={"error": "meeting session ended"})
+    except subprocess.TimeoutExpired:
+        return JSONResponse(status_code=504, content={"error": "mic playback timed out"})
+    except subprocess.CalledProcessError as exc:
+        return JSONResponse(status_code=500, content={"error": f"mic playback failed: {exc}"})
+    finally:
+        _mic_lock.release()
+    # Echo the caller's confined relative name, not an internal absolute mount path.
+    return JSONResponse(content={"played": True, "source": "file", "path": req.path})
+
+
+class MicBodyTooLarge(ValueError):
+    pass
+
+
+async def _read_pcm_body(request: Request, max_bytes: int) -> bytes:
+    """Read a request incrementally and stop before an oversized body is retained."""
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            raise MicBodyTooLarge
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _mic_play_pcm_response(
+    session: Session, pcm: bytes, rate: int, channels: int
+) -> JSONResponse:
+    not_ready = _mic_not_ready()
+    if not_ready is not None:
+        return not_ready
+    if not _mic_lock.acquire(blocking=False):
+        return JSONResponse(status_code=409, content={"error": "already speaking"})
+    try:
+        _play_pcm_into_mic(session, pcm, rate, channels)
+    except MicPlaybackCancelled:
+        return JSONResponse(status_code=409, content={"error": "meeting session ended"})
+    except subprocess.TimeoutExpired:
+        return JSONResponse(status_code=504, content={"error": "mic playback timed out"})
+    except subprocess.CalledProcessError as exc:
+        return JSONResponse(status_code=500, content={"error": f"mic playback failed: {exc}"})
+    finally:
+        _mic_lock.release()
+    return JSONResponse(content={"played": True, "source": "pcm", "bytes": len(pcm)})
+
+
+@app.post("/sessions/{session_id}/mic/play/pcm")
+async def mic_play_pcm(
+    session_id: str,
+    request: Request,
+    rate: int = MIC_PCM_RATE,
+    channels: int = MIC_PCM_CHANNELS,
+) -> JSONResponse:
+    session = _get_session(session_id)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "no such session"})
+    if not MIC_PCM_MIN_RATE <= rate <= MIC_PCM_MAX_RATE:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"rate must be between {MIC_PCM_MIN_RATE} and {MIC_PCM_MAX_RATE} Hz"
+            },
+        )
+    if not 1 <= channels <= MIC_PCM_MAX_CHANNELS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"channels must be between 1 and {MIC_PCM_MAX_CHANNELS}"},
+        )
+    max_duration_bytes = rate * channels * 2 * MIC_PLAY_TIMEOUT
+    max_bytes = min(MIC_PCM_MAX_BYTES, max_duration_bytes)
+    try:
+        pcm = await _read_pcm_body(request, max_bytes)
+    except MicBodyTooLarge:
+        return JSONResponse(status_code=413, content={"error": "PCM body is too large"})
+    if not pcm:
+        return JSONResponse(status_code=400, content={"error": "empty PCM body"})
+    frame_bytes = 2 * channels
+    if len(pcm) % frame_bytes != 0:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"PCM body must contain whole {frame_bytes}-byte frames"},
+        )
+    # Keep the async request reader responsive: the synchronous pacat process runs
+    # in Starlette's worker pool, just like the other sync FastAPI handlers.
+    return await run_in_threadpool(_mic_play_pcm_response, session, pcm, rate, channels)
+
+
 @app.delete("/sessions/{session_id}")
 def end_session(session_id: str) -> JSONResponse:
     with _sessions_lock:
-        s = _sessions.pop(session_id, None)
+        s = _sessions.get(session_id)
     if s is None:
         return JSONResponse(status_code=404, content={"error": "no such session"})
+    with s.lock:
+        if s.ending:
+            return JSONResponse(status_code=409, content={"error": "session is ending"})
+        s.ending = True
+    # Keep the ending session in the map until every child is stopped and its
+    # Pulse sink is unloaded. Otherwise POST /sessions can admit meeting B while
+    # meeting A's node-wide mic process is still being torn down.
     _teardown(s)
+    with _sessions_lock:
+        if _sessions.get(session_id) is s:
+            _sessions.pop(session_id)
     return JSONResponse(content={"session_id": session_id, "ended": True})
 
 
 def _teardown(s: Session) -> None:
+    # Mark ending before touching the active child. _run_mic_process observes this
+    # flag both before registration and after a non-zero exit, so no new decode or
+    # playback stage can start while teardown is in progress. Do not hold s.lock
+    # while waiting: the request thread clears the same mic_process field in its
+    # finally block.
+    with s.lock:
+        s.ending = True
+        mic_process = s.mic_process
+    if mic_process is not None and mic_process.poll() is None:
+        mic_process.terminate()
+        try:
+            mic_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            mic_process.kill()
+            mic_process.wait()
+    with s.lock:
+        if s.mic_process is mic_process:
+            s.mic_process = None
+
     with s.lock:
         if s.recorder is not None and s.recorder.poll() is None:
             s.recorder.send_signal(signal.SIGINT)
@@ -560,6 +1056,12 @@ def _reaper() -> None:
         with _sessions_lock:
             for sid, s in list(_sessions.items()):
                 if now - s.created_at > s.max_duration_seconds:
-                    expired.append(_sessions.pop(sid))
+                    with s.lock:
+                        if not s.ending:
+                            s.ending = True
+                            expired.append(s)
         for s in expired:
             _teardown(s)
+            with _sessions_lock:
+                if _sessions.get(s.session_id) is s:
+                    _sessions.pop(s.session_id)
