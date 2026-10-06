@@ -9,13 +9,9 @@
 // a third-party DOM we must reverse-engineer — the page auto-joins audio-only and
 // publishes a machine-pollable readiness signal we just read.
 //
-// SCOPE (this wave): JOIN + presence CONFIRMATION only. The handler mints a
-// short-lived bot token, navigates the container browser to the bot page, polls
-// `window.__huddleBotState.state` until `joined` (patiently handling the
-// `connecting` and lobby states), reports the roster/presence, then tears the
-// session down (the bot LEAVES). Staying resident in the call and bridging a
-// realtime STT/TTS engine to the container's virtual mic (aceteam#7079) is the
-// NEXT wave — deliberately NOT here.
+// With payload `converse:true`, the handler stays resident after join and bridges
+// room audio to AceTeam's realtime engine and its PCM responses back into the
+// session-scoped virtual mic. The default remains join + presence confirmation.
 //
 // The container + virtual mic are reused verbatim from the meeting media stack
 // (meeting_media.go): a session launch (POST /sessions) wires the in-container
@@ -83,6 +79,13 @@ const (
 	// a same-node retry is never blocked by our own not-yet-reaped session; Close
 	// (DELETE /sessions) tears it down on the normal path well before this.
 	huddleSessionMaxDuration = 1 * time.Hour
+	// A resident job may occupy the worker for four hours, but the huddle bot key
+	// is currently minted for one hour and is also the least-privilege realtime WS
+	// credential. The meetingd session is capped to the remaining token lifetime;
+	// a longer renewable server contract is an external rollout gate.
+	converseSessionMaxDuration = 4 * time.Hour
+	huddleTokenExpiryMargin    = 30 * time.Second
+	converseStatePollInterval  = 3 * time.Second
 )
 
 // ErrHuddleTeardownPending marks a non-terminal execution result: the exact
@@ -192,9 +195,6 @@ func parseHuddleJoinParams(jobID, jobType string, payload map[string]string) (hu
 	if nodeID, err := strconv.ParseUint(p.NodeID, 10, 64); err != nil || nodeID == 0 || strconv.FormatUint(nodeID, 10) != p.NodeID {
 		return huddleJoinParams{}, fmt.Errorf("target_node must be a canonical positive integer string")
 	}
-	if p.Converse {
-		return huddleJoinParams{}, fmt.Errorf("this HUDDLE_JOIN build does not support resident converse")
-	}
 	return p, nil
 }
 
@@ -239,7 +239,7 @@ type HuddleJoinHandler struct {
 	// newBrowser launches (or reuses) the container session and returns the
 	// CDP-driven browser plus a cleanup that tears the session down. nil uses the
 	// real container-session implementation; tests inject a fake browser.
-	newBrowser func(ctx context.Context, p huddleJoinParams) (br huddleBrowser, cleanup func(context.Context) error, err error)
+	newBrowser func(ctx context.Context, p huddleJoinParams, maxDuration time.Duration) (br huddleBrowser, media converseMedia, cleanup func(context.Context) error, err error)
 	// acknowledgeReady promotes the exact server-owned lifecycle attempt only
 	// after the browser proves its call/self/room/transport state. nil uses the
 	// authenticated same-origin HTTP endpoint.
@@ -257,6 +257,9 @@ type HuddleJoinHandler struct {
 	cleanupNodeSession func(ctx context.Context, p huddleJoinParams) error
 	outboxMu           sync.Mutex
 	outboxDir          string
+	// runConverse is a test seam. Production uses the minted huddle-bot token for
+	// the same agent identity on the trusted enrolled origin's realtime endpoint.
+	runConverse func(ctx JobContext, br huddleBrowser, media converseMedia, apiBase *url.URL, tok huddleToken, p huddleJoinParams, stopAt time.Time) (converseStats, error)
 
 	// Tunables (zero => package defaults at use). Tests set them to milliseconds.
 	connectTimeout time.Duration
@@ -370,10 +373,16 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 		joinChannel = p.ChannelID
 	}
 	ctx.Log("info", "     - [Job %s] minted bot token (self=%s, kind=%s, channel=%s)", job.ID, tok.SelfID, tok.SelfKind, joinChannel)
+	sessionNow := time.Now()
+	sessionDuration, err := huddleSessionDuration(p, tok, sessionNow)
+	if err != nil {
+		return nil, err
+	}
+	sessionStopAt := sessionNow.Add(sessionDuration)
 
-	// Launch (or reuse) the container session -> CDP browser.
-	br, launchedCleanup, err := h.launchBrowser(jobCtx, p)
-	cleanup = launchedCleanup
+	// Launch the container session -> CDP browser and, for converse, its capture
+	// and session-scoped microphone surface.
+	br, media, cleanup, err := h.launchBrowser(jobCtx, p, sessionDuration)
 	if err != nil {
 		return nil, fmt.Errorf("launch huddle browser: %w", err)
 	}
@@ -418,7 +427,7 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 		return nil, fmt.Errorf("acknowledge huddle media readiness: %w", err)
 	}
 
-	out, _ := json.Marshal(map[string]any{
+	result := map[string]any{
 		"status":               "completed",
 		"lifecycle_state":      "completed",
 		"organization_id":      p.OrganizationID,
@@ -433,7 +442,17 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 		"peer_count":           final.PeerCount,
 		"connected_peer_count": final.ConnectedPeerCount,
 		"state":                final.State,
-	})
+	}
+	if p.Converse {
+		ctx.Log("info", "     - [Job %s] converse enabled; starting resident voice bridge", job.ID)
+		stats, converseErr := h.converse(ctx, br, media, apiBase, tok, p, sessionStopAt)
+		if converseErr != nil {
+			return nil, fmt.Errorf("resident huddle converse failed: %w", converseErr)
+		}
+		result["converse"] = stats
+	}
+
+	out, _ := json.Marshal(result)
 	return out, nil
 }
 
@@ -492,6 +511,76 @@ func (h *HuddleJoinHandler) runAuthorizedCleanup(apiBase *url.URL, deviceToken s
 		return fmt.Errorf("confirm node teardown: %w", err)
 	}
 	return nil
+}
+
+func huddleSessionDuration(p huddleJoinParams, tok huddleToken, now time.Time) (time.Duration, error) {
+	if !p.Converse {
+		return huddleSessionMaxDuration, nil
+	}
+	stopAt, err := huddleTokenStopAt(tok)
+	if err != nil {
+		return 0, err
+	}
+	remaining := stopAt.Sub(now)
+	if remaining < time.Minute {
+		return 0, fmt.Errorf("huddle bot token expires too soon for a resident conversation")
+	}
+	if remaining > converseSessionMaxDuration {
+		remaining = converseSessionMaxDuration
+	}
+	return remaining, nil
+}
+
+func huddleTokenStopAt(tok huddleToken) (time.Time, error) {
+	if strings.TrimSpace(tok.ExpiresAt) == "" {
+		return time.Time{}, fmt.Errorf("converse requires a huddle bot token expiry so the resident session cannot outlive its credential")
+	}
+	expiresAt, err := time.Parse(time.RFC3339, tok.ExpiresAt)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse huddle bot token expiry: %w", err)
+	}
+	return expiresAt.Add(-huddleTokenExpiryMargin), nil
+}
+
+func (h *HuddleJoinHandler) converse(ctx JobContext, br huddleBrowser, media converseMedia, apiBase *url.URL, tok huddleToken, p huddleJoinParams, stopAt time.Time) (converseStats, error) {
+	if h.runConverse != nil {
+		return h.runConverse(ctx, br, media, apiBase, tok, p, stopAt)
+	}
+	if media == nil {
+		return converseStats{}, fmt.Errorf("converse requires the meeting container media session")
+	}
+	if !time.Now().Before(stopAt) {
+		return converseStats{}, fmt.Errorf("huddle bot token reached its resident-session expiry before converse could start")
+	}
+	conn, err := dialRealtime(ctx.Context(), apiBase, tok.Token, p.AgentID)
+	if err != nil {
+		return converseStats{}, fmt.Errorf("authenticate realtime engine: %w", err)
+	}
+	defer conn.Close()
+	bridge := newConverseBridge(conn, media, postJoinHuddleStateCheck(br),
+		func(level, format string, args ...any) { ctx.Log(level, format, args...) },
+		converseConfig{StatePollInterval: converseStatePollInterval, StopAt: stopAt})
+	return bridge.Run(ctx.Context())
+}
+
+func postJoinHuddleStateCheck(br huddleBrowser) stateCheckFunc {
+	return func(stateCtx context.Context) (bool, string, error) {
+		st, present, stateErr := readHuddleBotState(stateCtx, br)
+		if stateErr != nil {
+			return false, "", stateErr
+		}
+		if !present {
+			return false, "", fmt.Errorf("huddle bot readiness state disappeared after join")
+		}
+		switch st.State {
+		case "left":
+			return true, "bot left the call", nil
+		case "error":
+			return true, "bot reported an error", fmt.Errorf("huddle bot page: %s", st.Error)
+		default:
+			return false, "", nil
+		}
+	}
 }
 
 func (h *HuddleJoinHandler) resolveDeviceAuth(p huddleJoinParams) (*url.URL, string, error) {
@@ -830,11 +919,11 @@ func validateHuddleMediaReady(state huddleBotState, callID, selfID string) error
 
 // launchBrowser delegates to the injected browser seam or the real container
 // session implementation.
-func (h *HuddleJoinHandler) launchBrowser(ctx context.Context, p huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
+func (h *HuddleJoinHandler) launchBrowser(ctx context.Context, p huddleJoinParams, maxDuration time.Duration) (huddleBrowser, converseMedia, func(context.Context) error, error) {
 	if h.newBrowser != nil {
-		return h.newBrowser(ctx, p)
+		return h.newBrowser(ctx, p, maxDuration)
 	}
-	return defaultHuddleBrowser(ctx, p)
+	return defaultHuddleBrowser(ctx, p, maxDuration)
 }
 
 // defaultHuddleBrowser launches a meeting-service container session (reusing the
@@ -842,28 +931,28 @@ func (h *HuddleJoinHandler) launchBrowser(ctx context.Context, p huddleJoinParam
 // capture sink) and returns its CDP browser plus a session-teardown cleanup. The
 // meeting module MUST be healthy on this node — huddle join is a WebRTC join that
 // needs the container's headless Chromium; there is no host fallback here.
-func defaultHuddleBrowser(ctx context.Context, p huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
+func defaultHuddleBrowser(ctx context.Context, p huddleJoinParams, maxDuration time.Duration) (huddleBrowser, converseMedia, func(context.Context) error, error) {
 	if !meetingdHealthyContext(ctx, &http.Client{Timeout: meetingContainerHealthTimeout}, meetingdBaseURL()) {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return nil, nil, fmt.Errorf("the meeting-service container is not healthy on this node; HUDDLE_JOIN requires it (install/enable the meeting module)")
+		return nil, nil, nil, fmt.Errorf("the meeting-service container is not healthy on this node; HUDDLE_JOIN requires it (install/enable the meeting module)")
 	}
 	// No recording for join+confirm, so the WAV paths are empty. Start() creates
 	// the session and returns the CDP browser; Close() (cleanup) deletes it.
 	// The meetingd resource is lifecycle-attempt scoped, not channel scoped.
 	// A delayed cleanup for an old attempt must never address a successor's
 	// session on the same channel.
-	media := newContainerMedia(p.AttemptID, "", "", huddleSessionMaxDuration)
+	media := newContainerMedia(p.AttemptID, "", "", maxDuration)
 	br, err := media.StartContext(ctx)
 	if err != nil {
 		// StartContext can fail while a deterministic session still exists (for
 		// example, a same-attempt retry whose stale-session DELETE returned 500).
 		// Returning the cleanup seam lets Execute retain lifecycle recovery debt
 		// unless a final bounded DELETE confirms that session is gone.
-		return nil, media.CloseContext, err
+		return nil, media, media.CloseContext, err
 	}
-	return br, media.CloseContext, nil
+	return br, media, media.CloseContext, nil
 }
 
 // huddlePollOpts bundles the readiness poll budget and cadence.

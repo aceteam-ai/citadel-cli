@@ -569,6 +569,74 @@ func (m *containerMedia) SpeakFile(wavRelPath string) error {
 	return nil
 }
 
+// errMicBusy is the sentinel a SpeakPCM caller sees on a 409 (another clip is
+// already playing on the node-wide virtual mic). The converse bridge treats it as
+// retryable (brief backoff) rather than fatal, since a client-side timeout can
+// leave meetingd still holding its mic lock.
+var errMicBusy = fmt.Errorf("meetingd mic busy (another clip is playing)")
+
+// SpeakPCM streams raw signed-16-bit little-endian PCM into the container's
+// virtual microphone via meetingd's session-scoped POST
+// /sessions/{id}/mic/play/pcm (the low-latency realtime
+// SPEAK path, the byte-stream sibling of SpeakFile). rate/channels are passed as
+// query params so meetingd plays at the engine's format (24000/1). It blocks until
+// meetingd finishes playing the clip (synchronous playback), so it uses the
+// dedicated long-timeout client. A 409 returns errMicBusy; a 503 means the virtual
+// mic is not present on this node.
+func (m *containerMedia) SpeakPCM(ctx context.Context, pcm []byte, rate, channels int) error {
+	u := fmt.Sprintf("%s%s?rate=%d&channels=%d", m.base, m.sessionPath("/mic/play/pcm"), rate, channels)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(pcm))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	client := *m.client
+	client.Timeout = meetingSpeakTimeout
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("meetingd mic play pcm: %w", err)
+	}
+	defer resp.Body.Close()
+	out, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if readErr != nil {
+		return fmt.Errorf("read meetingd mic play pcm response: %w", readErr)
+	}
+	if resp.StatusCode == http.StatusConflict && strings.Contains(strings.ToLower(string(out)), "already speaking") {
+		return errMicBusy
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("meetingd mic play pcm returned status %d: %s", resp.StatusCode, string(out))
+	}
+	return nil
+}
+
+// CaptureStream opens meetingd's GET /sessions/{id}/capture/pcm and returns the
+// live raw s16le PCM body (the room's mixed audio -- the HEAR source the converse
+// bridge forwards to the realtime engine). The caller MUST Close the returned
+// ReadCloser to stop the container-side pacat (meetingd kills it on client
+// disconnect). No client timeout is set: the stream is meant to run for the whole
+// meeting; cancellation flows through ctx (closing the response body).
+func (m *containerMedia) CaptureStream(ctx context.Context, rate, channels int) (io.ReadCloser, error) {
+	u := fmt.Sprintf("%s/sessions/%s/capture/pcm?rate=%d&channels=%d",
+		m.base, url.PathEscape(m.sessionID), rate, channels)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := *m.client
+	client.Timeout = 0
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("meetingd capture stream: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		out, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		resp.Body.Close()
+		return nil, fmt.Errorf("meetingd capture stream returned status %d: %s", resp.StatusCode, string(out))
+	}
+	return resp.Body, nil
+}
+
 func (m *containerMedia) sessionPath(suffix string) string {
 	return "/sessions/" + url.PathEscape(m.sessionID) + suffix
 }
@@ -635,6 +703,7 @@ func (m *containerMedia) postJSONContext(ctx context.Context, path string, body 
 var (
 	_ MeetingMedia   = (*hostMedia)(nil)
 	_ MeetingMedia   = (*containerMedia)(nil)
+	_ converseMedia  = (*containerMedia)(nil)
 	_ meetingBrowser = (*platform.MeetingBrowser)(nil)
 	_ meetingBrowser = (*platform.CDPBrowser)(nil)
 )

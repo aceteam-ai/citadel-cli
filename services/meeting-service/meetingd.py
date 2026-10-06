@@ -69,8 +69,8 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import BinaryIO, Iterator
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
@@ -130,6 +130,11 @@ MIC_PCM_MAX_BYTES = max(1, int(os.environ.get("MEETING_MIC_PCM_MAX_BYTES", str(2
 MIC_PCM_MIN_RATE = 8000
 MIC_PCM_MAX_RATE = 48000
 MIC_PCM_MAX_CHANNELS = 2
+# Room-monitor capture uses the realtime engine's PCM16 format by default and is
+# bounded to the same sane format range as microphone playback.
+CAPTURE_PCM_RATE = int(os.environ.get("MEETING_CAPTURE_PCM_RATE", "24000"))
+CAPTURE_PCM_CHANNELS = int(os.environ.get("MEETING_CAPTURE_PCM_CHANNELS", "1"))
+CAPTURE_CHUNK_BYTES = max(2, int(os.environ.get("MEETING_CAPTURE_CHUNK_BYTES", "1920")))
 # Decode one second past the accepted duration so a longer source cannot hide
 # behind ffmpeg's output truncation. Mono 48 kHz s16le is 96,000 bytes/second;
 # the small allowance covers the WAV container header and metadata chunks.
@@ -325,6 +330,19 @@ def build_pacat_mic_args(sink: str, rate: int, channels: int) -> list[str]:
         "--format=s16le",
         f"--rate={int(rate)}",
         f"--channels={int(channels)}",
+    ]
+
+
+def build_pacat_capture_args(source: str, rate: int, channels: int) -> list[str]:
+    """Record a session monitor as raw s16le PCM on stdout."""
+    return [
+        "pacat",
+        "--record",
+        f"--device={source}",
+        "--format=s16le",
+        f"--rate={int(rate)}",
+        f"--channels={int(channels)}",
+        "--latency-msec=20",
     ]
 
 
@@ -615,6 +633,7 @@ class Session:
     recorder: subprocess.Popen[bytes] | None = None
     record_path: str | None = None
     mic_process: subprocess.Popen[bytes] | None = None
+    capture_process: subprocess.Popen[bytes] | None = None
     ending: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -846,6 +865,103 @@ def stop_record(session_id: str) -> JSONResponse:
     return JSONResponse(content={"recording": False, "path": path})
 
 
+# --- listening path (room -> bot) --------------------------------------------
+
+
+def _stop_capture_process(proc: subprocess.Popen[bytes]) -> None:
+    """Stop a capture child after its caller atomically claimed ownership."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
+def _claim_capture_process(
+    session: Session, expected: subprocess.Popen[bytes] | None = None
+) -> subprocess.Popen[bytes] | None:
+    """Detach one capture child so disconnect and teardown cannot both stop it."""
+    with session.lock:
+        proc = session.capture_process
+        if proc is None or (expected is not None and proc is not expected):
+            return None
+        session.capture_process = None
+        return proc
+
+
+def _capture_pcm_stream(session: Session, proc: subprocess.Popen[bytes]) -> Iterator[bytes]:
+    """Yield PCM until disconnect/teardown and always reap the capture child."""
+    try:
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(CAPTURE_CHUNK_BYTES)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        owned = _claim_capture_process(session, proc)
+        if owned is not None:
+            _stop_capture_process(owned)
+
+
+@app.get("/sessions/{session_id}/capture/pcm")
+def capture_pcm(
+    session_id: str,
+    rate: int = CAPTURE_PCM_RATE,
+    channels: int = CAPTURE_PCM_CHANNELS,
+) -> Response:
+    session = _get_session(session_id)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "no such session"})
+    if not MIC_PCM_MIN_RATE <= rate <= MIC_PCM_MAX_RATE:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"rate must be between {MIC_PCM_MIN_RATE} and {MIC_PCM_MAX_RATE} Hz"},
+        )
+    if not 1 <= channels <= MIC_PCM_MAX_CHANNELS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"channels must be between 1 and {MIC_PCM_MAX_CHANNELS}"},
+        )
+    # Reject stale/duplicate session requests before probing Pulse. Re-check under
+    # the same lock below after the probe so teardown cannot race the spawn.
+    with session.lock:
+        if session.ending:
+            return JSONResponse(status_code=409, content={"error": "session is ending"})
+        if session.capture_process is not None and session.capture_process.poll() is None:
+            return JSONResponse(status_code=409, content={"error": "already capturing"})
+    if not pulse_ready():
+        return JSONResponse(status_code=503, content={"error": "pulse server not ready"})
+    with session.lock:
+        if session.ending:
+            return JSONResponse(status_code=409, content={"error": "session is ending"})
+        if session.capture_process is not None and session.capture_process.poll() is None:
+            return JSONResponse(status_code=409, content={"error": "already capturing"})
+        try:
+            proc = subprocess.Popen(
+                build_pacat_capture_args(f"{session.sink_name}.monitor", rate, channels),
+                env=_pactl_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            return JSONResponse(status_code=500, content={"error": f"start capture: {exc}"})
+        session.capture_process = proc
+    return StreamingResponse(
+        _capture_pcm_stream(session, proc),
+        media_type="application/octet-stream",
+    )
+
+
 # --- speaking path (bot -> room, aceteam#7079) ---------------------------------
 #
 # Two operations, one body shape each (cleaner than content-type switching):
@@ -1017,6 +1133,9 @@ def _teardown(s: Session) -> None:
     with s.lock:
         s.ending = True
         mic_process = s.mic_process
+    capture_process = _claim_capture_process(s)
+    if capture_process is not None:
+        _stop_capture_process(capture_process)
     if mic_process is not None and mic_process.poll() is None:
         mic_process.terminate()
         try:

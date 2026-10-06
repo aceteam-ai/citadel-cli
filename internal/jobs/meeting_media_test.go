@@ -344,6 +344,105 @@ func TestMeetingdHealthyContextHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestContainerMediaSpeakPCMUsesSessionScopedRouteAndCancellation(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.URL.Query().Get("rate") != "24000" || r.URL.Query().Get("channels") != "1" {
+			t.Errorf("query = %s", r.URL.RawQuery)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	m := newTestContainerMedia(srv.URL)
+	m.client = srv.Client()
+	if err := m.SpeakPCM(context.Background(), []byte{0, 0}, 24000, 1); err != nil {
+		t.Fatalf("SpeakPCM: %v", err)
+	}
+	srv.Close()
+	if gotPath != "/sessions/m1/mic/play/pcm" {
+		t.Fatalf("path = %q, want session-scoped microphone route", gotPath)
+	}
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	blocked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer blocked.Close()
+	defer close(release)
+	m = newTestContainerMedia(blocked.URL)
+	m.client = blocked.Client()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.SpeakPCM(ctx, []byte{0, 0}, 24000, 1) }()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("SpeakPCM error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SpeakPCM did not stop on context cancellation")
+	}
+}
+
+func TestContainerMediaSpeakPCMOnlyTreatsActivePlaybackAsBusy(t *testing.T) {
+	for _, tc := range []struct {
+		body     string
+		wantBusy bool
+	}{
+		{body: `{"error":"already speaking"}`, wantBusy: true},
+		{body: `{"error":"meeting session ended"}`, wantBusy: false},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(tc.body))
+		}))
+		m := newTestContainerMedia(srv.URL)
+		err := m.SpeakPCM(context.Background(), []byte{0, 0}, 24000, 1)
+		srv.Close()
+		if errors.Is(err, errMicBusy) != tc.wantBusy {
+			t.Fatalf("body %s error = %v, wantBusy=%v", tc.body, err, tc.wantBusy)
+		}
+	}
+}
+
+func TestContainerMediaCaptureStreamUsesSessionAndStopsOnCancel(t *testing.T) {
+	started := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{1, 2})
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	m := newTestContainerMedia(srv.URL)
+	m.client = srv.Client()
+	ctx, cancel := context.WithCancel(context.Background())
+	body, err := m.CaptureStream(ctx, 24000, 1)
+	if err != nil {
+		t.Fatalf("CaptureStream: %v", err)
+	}
+	if uri := <-started; uri != "/sessions/m1/capture/pcm?rate=24000&channels=1" {
+		t.Fatalf("capture URI = %q", uri)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(body, buf); err != nil {
+		t.Fatalf("read capture: %v", err)
+	}
+	cancel()
+	_ = body.Close()
+}
+
 // fakeMedia is a MeetingMedia stub for selection tests.
 type fakeMedia struct{}
 
