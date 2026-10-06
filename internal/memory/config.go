@@ -7,8 +7,12 @@ package memory
 
 import (
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -72,7 +76,46 @@ func (c *Config) ValidateCredential() error {
 	if c == nil || strings.TrimSpace(c.APIKey) == "" {
 		return fmt.Errorf("no memory API key configured")
 	}
-	return ValidateScopes(c.Scopes)
+	if !validAceTeamAPIKey(c.APIKey) {
+		return fmt.Errorf("memory API key has an invalid format")
+	}
+	if err := ValidateScopes(c.Scopes); err != nil {
+		return err
+	}
+	return ValidateMCPURL(c.EffectiveMCPURL())
+}
+
+func validAceTeamAPIKey(key string) bool {
+	if len(key) != 68 || !strings.HasPrefix(key, "act_") {
+		return false
+	}
+	for _, ch := range key[4:] {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateMCPURL prevents a scoped bearer from being sent to an ambiguous or
+// plaintext remote endpoint. Plain HTTP remains available for loopback-only
+// development servers.
+func ValidateMCPURL(raw string) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("memory MCP URL is invalid")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback()) {
+			return nil
+		}
+	}
+	return fmt.Errorf("memory MCP URL must use HTTPS (HTTP is allowed only on loopback)")
 }
 
 // DefaultMCPURL derives the AceTeam MCP endpoint for external clients from an
@@ -105,7 +148,8 @@ func ConfigPath(configDir string) string {
 // Load reads the memory config from configDir. It returns (nil, nil) when the
 // file does not exist so callers (hooks) can fail open silently.
 func Load(configDir string) (*Config, error) {
-	data, err := os.ReadFile(ConfigPath(configDir))
+	path := ConfigPath(configDir)
+	data, err := readPrivateRegularFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -117,6 +161,49 @@ func Load(configDir string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", ConfigFileName, err)
 	}
 	return &c, nil
+}
+
+const maxConfigBytes = 1 << 20
+
+// readPrivateRegularFile refuses links, special files, and (on Unix) files
+// readable by another user. The second pathname check closes the ordinary
+// lstat/open replacement window: the descriptor we read must still name the
+// same regular file after open. The credential is tiny, so also cap reads to
+// avoid turning a corrupt file into an unbounded allocation.
+func readPrivateRegularFile(path string) ([]byte, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("memory config is not a regular file")
+	}
+	if runtime.GOOS != "windows" && pathInfo.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("memory config has insecure permissions %04o (group/other access is forbidden)", pathInfo.Mode().Perm())
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("memory config is not a regular file")
+	}
+	currentInfo, err := os.Lstat(path)
+	if err != nil || currentInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(openedInfo, currentInfo) {
+		return nil, fmt.Errorf("memory config changed while opening")
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxConfigBytes {
+		return nil, fmt.Errorf("memory config exceeds %d bytes", maxConfigBytes)
+	}
+	return data, nil
 }
 
 // Save writes the memory config to configDir with user-only (0600) perms,

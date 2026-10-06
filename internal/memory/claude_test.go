@@ -118,6 +118,57 @@ func TestWriteMCPServer_Idempotent(t *testing.T) {
 	}
 }
 
+func TestClaudeConfigMutation_RefusesWrongShapeWithoutClobbering(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed string
+		run  func(string) error
+	}{
+		{
+			name: "mcpServers is array",
+			seed: `{"theme":"dark","mcpServers":[{"future":"shape"}]}`,
+			run: func(path string) error {
+				_, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"})
+				return err
+			},
+		},
+		{
+			name: "hooks is array",
+			seed: `{"theme":"dark","hooks":[{"future":"shape"}]}`,
+			run: func(path string) error {
+				_, err := MergeHook(path, "SessionEnd", "/bin/citadel memory capture", CaptureMarker, 15)
+				return err
+			},
+		},
+		{
+			name: "event is object",
+			seed: `{"theme":"dark","hooks":{"SessionEnd":{"future":"shape"}}}`,
+			run: func(path string) error {
+				_, err := RemoveHook(path, "SessionEnd", CaptureMarker)
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			before := []byte(tc.seed)
+			if err := os.WriteFile(path, before, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.run(path); err == nil {
+				t.Fatal("wrong-shaped Claude config was accepted")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Fatalf("config changed on refusal: before=%s after=%s", before, after)
+			}
+		})
+	}
+}
+
 func TestRemoveMCPServer_PreservesUnrelatedServers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".claude.json")

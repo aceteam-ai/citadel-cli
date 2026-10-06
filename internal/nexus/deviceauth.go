@@ -198,10 +198,11 @@ type StartFlowOptions struct {
 
 // MemoryTokenResponse is the poll response for a device_kind:"memory" flow
 // (aceteam #7160). Unlike the citadel TokenResponse (which returns a Headscale
-// authkey and signals pending via an HTTP 400 authorization_pending error),
-// the memory endpoint always returns HTTP 200 and signals lifecycle via the
-// Status field. On approval it carries a scoped act_ API key in APIKey — the
-// same credential external MCP clients (like Claude Code) authenticate with.
+// authkey), a live memory record returns HTTP 200 and signals pending/approved
+// via Status. The shared endpoint still returns RFC 8628 HTTP 400 errors after
+// expiry or denial; checkMemoryTokenContext maps those into the same lifecycle
+// statuses. On approval it carries a scoped act_ API key in APIKey — the same
+// credential external MCP clients (like Claude Code) authenticate with.
 type MemoryTokenResponse struct {
 	Status    string   `json:"status"` // pending | approved | expired | denied
 	APIKey    string   `json:"api_key,omitempty"`
@@ -486,9 +487,10 @@ func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenR
 // PollForMemoryToken polls the /token endpoint for a device_kind:"memory" flow
 // until the device is approved, denied, expires, or the client times out.
 //
-// The memory endpoint always returns HTTP 200 with a Status field (it does NOT
-// use the RFC 8628 authorization_pending error), so this method cannot reuse
-// PollForToken. The citadel PollForToken path is left untouched.
+// Live memory records return HTTP 200 with a Status field (they do NOT use the
+// RFC 8628 authorization_pending error), so this method cannot reuse
+// PollForToken. Shared-endpoint expiry/denial errors are normalized separately.
+// The citadel PollForToken path is left untouched.
 func (c *DeviceAuthClient) PollForMemoryToken(deviceCode string, interval int) (*MemoryTokenResponse, error) {
 	return c.PollForMemoryTokenContext(context.Background(), deviceCode, interval)
 }
@@ -622,6 +624,22 @@ func (c *DeviceAuthClient) checkMemoryTokenContext(ctx context.Context, deviceCo
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		return nil, fmt.Errorf("authentication service unavailable")
+	}
+	if resp.StatusCode == http.StatusBadRequest {
+		var tokenErr TokenError
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&tokenErr); err != nil {
+			return nil, fmt.Errorf("failed to parse memory token error response: %w", err)
+		}
+		switch tokenErr.ErrorCode {
+		case "expired_token":
+			return &MemoryTokenResponse{Status: "expired"}, nil
+		case "access_denied":
+			return &MemoryTokenResponse{Status: "denied"}, nil
+		case "authorization_pending":
+			return &MemoryTokenResponse{Status: "pending"}, nil
+		default:
+			return nil, fmt.Errorf("memory token request failed: %s", tokenErr.Error())
+		}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)

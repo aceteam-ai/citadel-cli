@@ -5,15 +5,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
+const testAPIKey = "act_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func TestSaveLoadRoundTrip_UserOnlyPerms(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{
-		APIKey:     "act_abc123",
+		APIKey:     testAPIKey,
 		APIBaseURL: "https://aceteam.ai",
 		OrgID:      "org_1",
 		OrgName:    "Acme",
@@ -35,7 +38,7 @@ func TestSaveLoadRoundTrip_UserOnlyPerms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got == nil || got.APIKey != "act_abc123" || got.OrgName != "Acme" || len(got.Scopes) != 2 {
+	if got == nil || got.APIKey != testAPIKey || got.OrgName != "Acme" || len(got.Scopes) != 2 {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }
@@ -195,6 +198,34 @@ func TestLoadMissingReturnsNil(t *testing.T) {
 	}
 }
 
+func TestLoadRefusesInsecureOrLinkedCredential(t *testing.T) {
+	dir := t.TempDir()
+	path := ConfigPath(dir)
+	content := []byte("api_key: act_not_for_other_users\nscopes:\n  - memory:read\n  - memory:write\n")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "insecure permissions") {
+			t.Fatalf("world-readable credential accepted: %v", err)
+		}
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "target.yaml")
+	if err := os.WriteFile(target, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("linked credential accepted: %v", err)
+	}
+}
+
 func TestEffectiveMCPURL(t *testing.T) {
 	cases := []struct {
 		cfg  Config
@@ -237,5 +268,37 @@ func TestValidateScopes_ExactLeastPrivilegeSet(t *testing.T) {
 				t.Fatalf("ValidateScopes(%v) unexpectedly succeeded", tt.scopes)
 			}
 		})
+	}
+}
+
+func TestValidateCredential_KeyAndEndpoint(t *testing.T) {
+	base := Config{APIKey: testAPIKey, Scopes: []string{ScopeRead, ScopeWrite}}
+	if err := base.ValidateCredential(); err != nil {
+		t.Fatalf("valid credential rejected: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		mut  func(*Config)
+	}{
+		{name: "short key", mut: func(c *Config) { c.APIKey = "act_short" }},
+		{name: "uppercase key", mut: func(c *Config) { c.APIKey = "act_" + strings.Repeat("A", 64) }},
+		{name: "remote plaintext", mut: func(c *Config) { c.MCPURL = "http://example.test/mcp" }},
+		{name: "userinfo", mut: func(c *Config) { c.MCPURL = "https://user:pass@example.test/mcp" }},
+		{name: "query", mut: func(c *Config) { c.MCPURL = "https://example.test/mcp?token=x" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.mut(&cfg)
+			if err := cfg.ValidateCredential(); err == nil {
+				t.Fatal("unsafe credential accepted")
+			}
+		})
+	}
+
+	loopback := base
+	loopback.MCPURL = "http://127.0.0.1:8080/mcp"
+	if err := loopback.ValidateCredential(); err != nil {
+		t.Fatalf("loopback development endpoint rejected: %v", err)
 	}
 }

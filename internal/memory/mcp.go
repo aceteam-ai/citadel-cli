@@ -15,6 +15,8 @@ import (
 // mcpProtocolVersion is the MCP protocol version advertised in initialize.
 const mcpProtocolVersion = "2025-06-18"
 
+const maxMCPResponseBytes = 4 << 20
+
 // MCPClient is a minimal streamable-HTTP MCP (JSON-RPC 2.0) client for the
 // AceTeam memory endpoint. It is deliberately small: it supports exactly the
 // tools/call requests the recall/capture commands need.
@@ -92,21 +94,36 @@ func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]a
 
 	session, protocolVersion, err := c.initialize(ctx)
 	if err != nil {
-		return "", fmt.Errorf("initialize MCP session: %w", err)
+		return "", c.safeError(fmt.Errorf("initialize MCP session: %w", err))
 	}
-	resp, _, err := c.post(ctx, session, protocolVersion, rpcRequest{
+	defer func() { c.terminateSession(session, protocolVersion) }()
+	resp, activeSession, err := c.post(ctx, session, protocolVersion, rpcRequest{
 		JSONRPC: "2.0", ID: 2, Method: "tools/call", Params: params,
 	})
+	if activeSession != "" {
+		session = activeSession
+	}
 	if err != nil {
-		return "", err
+		return "", c.safeError(err)
 	}
 	if resp == nil {
 		return "", fmt.Errorf("empty MCP tools/call response")
 	}
 	if resp.Error != nil {
-		return "", resp.Error
+		return "", c.safeError(resp.Error)
 	}
-	return decodeToolResult(resp.Result)
+	text, err := decodeToolResult(resp.Result)
+	if err != nil {
+		return "", c.safeError(err)
+	}
+	return RedactSensitiveText(text, c.apiKey), nil
+}
+
+func (c *MCPClient) safeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s", RedactSensitiveText(err.Error(), c.apiKey))
 }
 
 // initialize performs initialize + notifications/initialized and returns the
@@ -147,9 +164,37 @@ func (c *MCPClient) initialize(ctx context.Context) (string, string, error) {
 		JSONRPC: "2.0", Method: "notifications/initialized",
 	})
 	if err != nil {
+		c.terminateSession(session, negotiated.ProtocolVersion)
 		return "", "", fmt.Errorf("send initialized notification: %w", err)
 	}
 	return session, negotiated.ProtocolVersion, nil
+}
+
+// terminateSession releases server-side streamable-HTTP state after each
+// short-lived recall/capture call. Cleanup is best-effort and independently
+// bounded so it cannot turn a successful Claude hook into a failure or hang.
+func (c *MCPClient) terminateSession(session, protocolVersion string) {
+	if session == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Mcp-Session-Id", session)
+	if protocolVersion != "" {
+		req.Header.Set("MCP-Protocol-Version", protocolVersion)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
 }
 
 // post sends one JSON-RPC message and returns the parsed response (nil for
@@ -198,7 +243,7 @@ func (c *MCPClient) post(ctx context.Context, session, protocolVersion string, b
 		return nil, newSession, nil
 	}
 
-	resp, err := parseRPCResponse(httpResp.Header.Get("Content-Type"), httpResp.Body, body.ID)
+	resp, err := parseRPCResponse(httpResp.Header.Get("Content-Type"), io.LimitReader(httpResp.Body, maxMCPResponseBytes+1), body.ID)
 	if err != nil {
 		return nil, newSession, err
 	}
@@ -221,8 +266,16 @@ func parseRPCResponse(contentType string, body io.Reader, expectedID int) (*rpcR
 		return parseSSE(buf, expectedID)
 	}
 	var resp rpcResponse
-	if err := json.NewDecoder(buf).Decode(&resp); err != nil {
+	decoder := json.NewDecoder(buf)
+	if err := decoder.Decode(&resp); err != nil {
 		return nil, fmt.Errorf("decode MCP response: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("decode MCP response: multiple JSON values")
+		}
+		return nil, fmt.Errorf("decode MCP response trailing data: %w", err)
 	}
 	if err := validateRPCResponse(&resp, expectedID); err != nil {
 		return nil, err

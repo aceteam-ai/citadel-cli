@@ -24,7 +24,11 @@ const (
 // runtime, so the bearer credential has exactly one on-disk copy.
 func WriteMCPServer(claudeJSONPath, name, command string, args []string) (bool, error) {
 	return updateJSONObject(claudeJSONPath, func(root map[string]any) (bool, error) {
-		servers, _ := root["mcpServers"].(map[string]any)
+		rawServers, exists := root["mcpServers"]
+		servers, ok := rawServers.(map[string]any)
+		if exists && rawServers != nil && !ok {
+			return false, fmt.Errorf("mcpServers is not a JSON object")
+		}
 		if servers == nil {
 			servers = map[string]any{}
 		}
@@ -42,7 +46,11 @@ func WriteMCPServer(claudeJSONPath, name, command string, args []string) (bool, 
 // unrelated Claude Code setting and MCP server.
 func RemoveMCPServer(claudeJSONPath, name string) (bool, error) {
 	return updateJSONObject(claudeJSONPath, func(root map[string]any) (bool, error) {
-		servers, _ := root["mcpServers"].(map[string]any)
+		rawServers, exists := root["mcpServers"]
+		servers, ok := rawServers.(map[string]any)
+		if exists && rawServers != nil && !ok {
+			return false, fmt.Errorf("mcpServers is not a JSON object")
+		}
 		if servers == nil {
 			return false, nil
 		}
@@ -65,11 +73,19 @@ type hookGroup struct {
 // retaining unrelated hooks even when they share the same group.
 func RemoveHook(settingsPath, event, marker string) (bool, error) {
 	return updateJSONObject(settingsPath, func(root map[string]any) (bool, error) {
-		hooks, _ := root["hooks"].(map[string]any)
+		rawHooks, exists := root["hooks"]
+		hooks, ok := rawHooks.(map[string]any)
+		if exists && rawHooks != nil && !ok {
+			return false, fmt.Errorf("hooks is not a JSON object")
+		}
 		if hooks == nil {
 			return false, nil
 		}
-		groups, _ := hooks[event].([]any)
+		rawGroups, exists := hooks[event]
+		groups, ok := rawGroups.([]any)
+		if exists && rawGroups != nil && !ok {
+			return false, fmt.Errorf("hooks.%s is not a JSON array", event)
+		}
 		changed := false
 		keptGroups := make([]any, 0, len(groups))
 		for _, rawGroup := range groups {
@@ -123,15 +139,23 @@ type hookSpec struct {
 // contains marker, nothing is written and changed=false is returned.
 func MergeHook(settingsPath, event, command, marker string, timeout int) (bool, error) {
 	return updateJSONObject(settingsPath, func(root map[string]any) (bool, error) {
-		hooks, _ := root["hooks"].(map[string]any)
+		rawHooks, exists := root["hooks"]
+		hooks, ok := rawHooks.(map[string]any)
+		if exists && rawHooks != nil && !ok {
+			return false, fmt.Errorf("hooks is not a JSON object")
+		}
 		if hooks == nil {
 			hooks = map[string]any{}
 		}
 
 		// Existing groups for this event (as generic slice for preservation).
 		var groups []any
-		if raw, ok := hooks[event].([]any); ok {
-			groups = raw
+		if raw, exists := hooks[event]; exists && raw != nil {
+			var ok bool
+			groups, ok = raw.([]any)
+			if !ok {
+				return false, fmt.Errorf("hooks.%s is not a JSON array", event)
+			}
 		}
 
 		// Idempotency: bail if marker already present in any command for this event.

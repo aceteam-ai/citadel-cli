@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/memory"
 )
 
 func TestTruncate(t *testing.T) {
@@ -231,6 +233,17 @@ func TestMemoryBridgeAllowlistAndToolsListFiltering(t *testing.T) {
 	}
 }
 
+func TestMemoryBridge_EndpointCannotBeOverridden(t *testing.T) {
+	cfg := &memory.Config{APIBaseURL: "https://aceteam.ai"}
+	got := selectMCPEndpoint("https://attacker.invalid/mcp", cfg)
+	if want := cfg.EffectiveMCPURL(); got != want {
+		t.Fatalf("memory credential endpoint=%q want bound endpoint %q", got, want)
+	}
+	if got := selectMCPEndpoint("https://custom.test/mcp", nil); got != "https://custom.test/mcp" {
+		t.Fatalf("general MCP endpoint override changed: %q", got)
+	}
+}
+
 func TestMemoryBridgeValidatesBackendJSONRPCAndSSEIDs(t *testing.T) {
 	for _, raw := range []string{
 		`{"jsonrpc":"1.0","id":4,"result":{}}`,
@@ -351,6 +364,79 @@ func TestMCPBridge_RefusesRedirectWithoutLeakingBearer(t *testing.T) {
 	}
 	if targetAuth != "" {
 		t.Fatalf("bearer leaked to redirect target: %q", targetAuth)
+	}
+}
+
+func TestMemoryBridge_RedactsCredentialAndSessionFromBackend(t *testing.T) {
+	const key = "act_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const session = "private-session-token"
+
+	t.Run("success response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Mcp-Session-Id", session)
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"\u0061\u0063\u0074\u005f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef `+session+`"}]}}`)
+		}))
+		defer srv.Close()
+		b := &mcpBridge{apiKey: key, endpointURL: srv.URL, httpClient: srv.Client(), remoteToolAllowlist: map[string]struct{}{"memory_search": {}}}
+		got, err := b.forwardToBackend(&jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "tools/call"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded any
+		if err := json.Unmarshal(got, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		decodedText := fmt.Sprintf("%v", decoded)
+		if strings.Contains(string(got), session) || strings.Contains(decodedText, key) || strings.Contains(decodedText, session) {
+			t.Fatalf("backend response leaked credential material: %s", got)
+		}
+	})
+
+	t.Run("error response does not poison session", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Mcp-Session-Id", session)
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, key+" "+session)
+		}))
+		defer srv.Close()
+		b := &mcpBridge{apiKey: key, endpointURL: srv.URL, httpClient: srv.Client(), sessionID: "existing-session"}
+		_, err := b.forwardToBackend(&jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "tools/list"})
+		if err == nil || strings.Contains(err.Error(), key) || strings.Contains(err.Error(), session) {
+			t.Fatalf("unsafe backend error: %v", err)
+		}
+		if b.sessionID != "existing-session" {
+			t.Fatalf("error response poisoned session: %q", b.sessionID)
+		}
+	})
+}
+
+func TestMCPBridge_ClosesBackendSessionWithoutProtocolOutput(t *testing.T) {
+	var gotMethod, gotAuth, gotSession string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotAuth = r.Header.Get("Authorization")
+		gotSession = r.Header.Get("Mcp-Session-Id")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	var out bytes.Buffer
+	b := &mcpBridge{
+		apiKey:      "act_test_key",
+		endpointURL: srv.URL,
+		sessionID:   "session-to-close",
+		httpClient:  srv.Client(),
+		stdout:      &out,
+	}
+	b.closeBackendSession()
+	if gotMethod != http.MethodDelete || gotAuth != "Bearer act_test_key" || gotSession != "session-to-close" {
+		t.Fatalf("bad close request: method=%q auth=%q session=%q", gotMethod, gotAuth, gotSession)
+	}
+	if b.sessionID != "" {
+		t.Fatalf("closed session retained: %q", b.sessionID)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("session close wrote to MCP stdout: %s", out.String())
 	}
 }
 

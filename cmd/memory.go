@@ -77,6 +77,12 @@ func runMemoryInstall(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	if needsAuthorization {
+		// Validate the eventual credential destination before minting anything;
+		// discovering an unsafe endpoint after approval would orphan a live key.
+		if err := memory.ValidateMCPURL(memory.DefaultMCPURL(authServiceURL)); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Refusing unsafe memory endpoint: %v\n", err)
+			os.Exit(1)
+		}
 		// Preflight: verify API reachability before an interactive prompt.
 		if err := nexus.CheckAPIReachable(authServiceURL); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Cannot reach AceTeam: %v\n", err)
@@ -99,6 +105,10 @@ func runMemoryInstall(cmd *cobra.Command, args []string) {
 			OrgID:      token.OrgID,
 			OrgName:    token.OrgName,
 			Scopes:     token.Scopes,
+		}
+		if err := cfg.ValidateCredential(); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Refusing unsafe memory credential: %v\n", err)
+			os.Exit(1)
 		}
 		if err := memory.Save(configDir, cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Could not save memory config: %v\n", err)

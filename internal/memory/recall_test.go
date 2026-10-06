@@ -87,7 +87,7 @@ func TestRecall_EndToEnd(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := &Config{APIKey: "act_k", MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}
+	cfg := &Config{APIKey: testAPIKey, MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}
 	block, err := Recall(context.Background(), cfg, "aceteam", "how does railway reach nodes", 0)
 	if err != nil {
 		t.Fatalf("Recall: %v", err)
@@ -131,7 +131,7 @@ func TestRecall_EmptyScopeOmitted(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := &Config{APIKey: "act_k", MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}
+	cfg := &Config{APIKey: testAPIKey, MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}
 	// Empty scope => search ALL scopes => no "scope" key in the arguments.
 	if _, err := Recall(context.Background(), cfg, "", "any query", 0); err != nil {
 		t.Fatalf("Recall: %v", err)
@@ -162,7 +162,7 @@ func TestRecall_ResultIsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := Recall(context.Background(), &Config{APIKey: "act_k", MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}, "", "query", 100)
+	_, err := Recall(context.Background(), &Config{APIKey: testAPIKey, MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}, "", "query", 100)
 	if err == nil || !strings.Contains(err.Error(), "recall rejected") {
 		t.Fatalf("expected tool-level recall error, got %v", err)
 	}

@@ -54,7 +54,7 @@ func TestCaptureNote_ForwardsArgs(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := &Config{APIKey: "act_k", MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}
+	cfg := &Config{APIKey: testAPIKey, MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}
 	out, err := CaptureNote(context.Background(), cfg, "My Note", "durable fact", "a desc", "aceteam")
 	if err != nil {
 		t.Fatalf("CaptureNote: %v", err)
@@ -94,7 +94,7 @@ func TestCaptureNote_ResultIsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := CaptureNote(context.Background(), &Config{APIKey: "act_k", MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}, "n", "fact", "", "")
+	_, err := CaptureNote(context.Background(), &Config{APIKey: testAPIKey, MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}, "n", "fact", "", "")
 	if err == nil || !strings.Contains(err.Error(), "capture rejected") {
 		t.Fatalf("expected tool-level capture error, got %v", err)
 	}

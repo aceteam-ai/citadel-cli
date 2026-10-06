@@ -20,7 +20,7 @@ func TestPollForMemoryToken_ApprovesAfterPending(t *testing.T) {
 		}
 		n := atomic.AddInt32(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK) // memory endpoint always returns 200
+		w.WriteHeader(http.StatusOK) // live memory records use the status-shaped response
 		if n < 2 {
 			w.Write([]byte(`{"status":"pending"}`))
 			return
@@ -42,6 +42,20 @@ func TestPollForMemoryToken_ApprovesAfterPending(t *testing.T) {
 	}
 	if tok.ExpiresIn != nil {
 		t.Fatalf("expected nil expires_in, got %v", *tok.ExpiresIn)
+	}
+}
+
+func TestPollForMemoryToken_MapsSharedEndpointExpiry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"expired_token","error_description":"expired"}`))
+	}))
+	defer srv.Close()
+
+	_, err := NewDeviceAuthClient(srv.URL).pollMemory("devcode", time.Millisecond, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "device code expired") {
+		t.Fatalf("shared endpoint expiry was not mapped: %v", err)
 	}
 }
 

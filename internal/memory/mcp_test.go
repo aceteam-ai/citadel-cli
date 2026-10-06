@@ -95,10 +95,19 @@ func TestCallTool_InitializesStatelessServer(t *testing.T) {
 func TestCallTool_SessionHandshake(t *testing.T) {
 	const sessionID = "sess-xyz"
 	var sawInitialized bool
+	terminated := make(chan struct{}, 1)
 	var toolCallSession string
 	var initializedProtocol, toolProtocol string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			if r.Header.Get("Mcp-Session-Id") != sessionID {
+				t.Errorf("terminated session = %q, want %q", r.Header.Get("Mcp-Session-Id"), sessionID)
+			}
+			terminated <- struct{}{}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		method, _, session := decodeReq(t, r)
 		switch method {
 		case "tools/call":
@@ -136,6 +145,11 @@ func TestCallTool_SessionHandshake(t *testing.T) {
 	}
 	if initializedProtocol != mcpProtocolVersion || toolProtocol != mcpProtocolVersion {
 		t.Fatalf("negotiated protocol header not carried: initialized=%q tool=%q", initializedProtocol, toolProtocol)
+	}
+	select {
+	case <-terminated:
+	default:
+		t.Fatal("MCP session was not terminated after the tool call")
 	}
 }
 
@@ -287,6 +301,7 @@ func TestParseRPCResponse_RequiresVersionAndMatchingID(t *testing.T) {
 		{"wrong id", `{"jsonrpc":"2.0","id":9,"result":{}}`, "does not match"},
 		{"wrong version", `{"jsonrpc":"1.0","id":2,"result":{}}`, "version"},
 		{"result and error", `{"jsonrpc":"2.0","id":2,"result":{},"error":{"code":-32000,"message":"ambiguous"}}`, "exactly one"},
+		{"trailing JSON", `{"jsonrpc":"2.0","id":2,"result":{}} {}`, "multiple JSON values"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := parseRPCResponse("application/json", strings.NewReader(tc.body), 2)
@@ -368,5 +383,56 @@ func TestMCPClient_RefusesRedirectWithoutLeakingBearer(t *testing.T) {
 	}
 	if targetAuth != "" {
 		t.Fatalf("bearer leaked to redirect target: %q", targetAuth)
+	}
+}
+
+func TestCallTool_RedactsCredentialFromSuccessAndErrors(t *testing.T) {
+	const key = "act_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		toolBody   string
+		wantErr    bool
+	}{
+		{name: "success", statusCode: http.StatusOK, toolBody: key},
+		{name: "rpc error", statusCode: http.StatusOK, toolBody: key, wantErr: true},
+		{name: "http error", statusCode: http.StatusBadGateway, toolBody: key, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				method, _, _ := decodeReq(t, r)
+				switch method {
+				case "initialize":
+					writeInitialize(w, "")
+				case "notifications/initialized":
+					w.WriteHeader(http.StatusAccepted)
+				case "tools/call":
+					if tc.statusCode != http.StatusOK {
+						w.WriteHeader(tc.statusCode)
+						_, _ = io.WriteString(w, tc.toolBody)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if tc.wantErr {
+						_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 2, "error": map[string]any{"code": -32000, "message": tc.toolBody}})
+						return
+					}
+					writeResult(w, tc.toolBody)
+				}
+			}))
+			defer srv.Close()
+
+			out, err := NewMCPClient(srv.URL, key, time.Second).CallTool(context.Background(), "memory_search", nil)
+			combined := out
+			if err != nil {
+				combined += err.Error()
+			}
+			if strings.Contains(combined, key) || strings.Contains(combined, "act_012345") {
+				t.Fatalf("credential leaked: out=%q err=%v", out, err)
+			}
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("error=%v wantErr=%v", err, tc.wantErr)
+			}
+		})
 	}
 }

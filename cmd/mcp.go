@@ -129,6 +129,8 @@ type mcpBridge struct {
 	nodeID string
 }
 
+const maxMCPBackendResponseBytes = 10 << 20
+
 // bridgeStdout returns the JSON-RPC transport writer -- see the stdout
 // field's doc comment for why this must NOT simply read os.Stdout at write
 // time.
@@ -214,18 +216,10 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	}
 
 	bridge := &mcpBridge{
-		apiKey:    apiKey,
-		apiURL:    apiURL,
-		mcpServer: mcpServer,
-		endpointURL: func() string {
-			if mcpEndpointURL != "" {
-				return mcpEndpointURL
-			}
-			if memoryCfg != nil {
-				return memoryCfg.EffectiveMCPURL()
-			}
-			return ""
-		}(),
+		apiKey:      apiKey,
+		apiURL:      apiURL,
+		mcpServer:   mcpServer,
+		endpointURL: selectMCPEndpoint(mcpEndpointURL, memoryCfg),
 		httpClient: &http.Client{
 			Timeout: 120 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -243,13 +237,26 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		nodeID: resolveNodeIDForMCPHeader(),
 	}
 
-	Debug("MCP bridge starting: server=%s, url=%s, local_tools=%d", mcpServer, apiURL, len(bridge.localTools))
+	Debug("MCP bridge starting: server=%s, url=%s, local_tools=%d",
+		memory.RedactSensitiveText(mcpServer, apiKey),
+		memory.RedactSensitiveText(apiURL, apiKey),
+		len(bridge.localTools))
 
 	return bridge.run()
 }
 
+func selectMCPEndpoint(explicit string, memoryCfg *memory.Config) string {
+	if memoryCfg != nil {
+		// --memory-config is a credential-bound mode: never let a generic CLI
+		// override redirect its bearer away from the validated saved endpoint.
+		return memoryCfg.EffectiveMCPURL()
+	}
+	return explicit
+}
+
 // run starts the stdio JSON-RPC loop.
 func (b *mcpBridge) run() error {
+	defer b.closeBackendSession()
 	scanner := bufio.NewScanner(os.Stdin)
 	// Increase buffer size to handle large tool lists (default 64KB is too small).
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
@@ -268,7 +275,9 @@ func (b *mcpBridge) run() error {
 			continue
 		}
 
-		Debug("MCP: received method=%s id=%s", req.Method, string(req.ID))
+		Debug("MCP: received method=%s id=%s",
+			memory.RedactSensitiveText(req.Method, b.apiKey, b.sessionID),
+			memory.RedactSensitiveText(string(req.ID), b.apiKey, b.sessionID))
 
 		// A JSON-RPC notification omits id entirely. Null and compound IDs are
 		// refused: accepting them would make response correlation ambiguous and
@@ -324,8 +333,9 @@ func (b *mcpBridge) run() error {
 			// Forward all other requests to the backend.
 			resp, err := b.forwardToBackend(&req)
 			if err != nil {
-				Debug("MCP: backend error for %s: %v", req.Method, err)
-				b.writeError(req.ID, -32603, fmt.Sprintf("Backend error: %v", err))
+				safeErr := memory.RedactSensitiveText(err.Error(), b.apiKey, b.sessionID)
+				Debug("MCP: backend error for %s: %s", req.Method, safeErr)
+				b.writeError(req.ID, -32603, "Backend error: "+safeErr)
 				continue
 			}
 			if resp == nil {
@@ -405,7 +415,8 @@ func (b *mcpBridge) handleInitialize(req *jsonRPCRequest) {
 
 	resp, err := b.forwardToBackend(req)
 	if err != nil {
-		Debug("MCP: initialize backend error: %v, using local fallback", err)
+		Debug("MCP: initialize backend error: %s, using local fallback",
+			memory.RedactSensitiveText(err.Error(), b.apiKey, b.sessionID))
 		b.writeLocalInitializeResult(req.ID)
 		return
 	}
@@ -460,7 +471,8 @@ func (b *mcpBridge) handleToolsList(req *jsonRPCRequest) {
 
 	resp, err := b.forwardToBackend(req)
 	if err != nil {
-		Debug("MCP: tools/list backend error: %v; serving local tools only", err)
+		Debug("MCP: tools/list backend error: %s; serving local tools only",
+			memory.RedactSensitiveText(err.Error(), b.apiKey, b.sessionID))
 		b.writeToolsListResult(req.ID, localRaw)
 		return
 	}
@@ -547,7 +559,7 @@ func (b *mcpBridge) tryLocalToolsCall(req *jsonRPCRequest) bool {
 		return false
 	}
 
-	Debug("MCP: dispatching local tool %q", tool.Name)
+	Debug("MCP: dispatching local tool %q", memory.RedactSensitiveText(tool.Name, b.apiKey, b.sessionID))
 	ctx, cancel := context.WithTimeout(context.Background(), localToolCallTimeout)
 	defer cancel()
 	text, err := callLocalToolWithTimeout(ctx, tool, params.Arguments)
@@ -656,11 +668,11 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	url := b.endpointURL
-	if url == "" {
-		url = fmt.Sprintf("%s/api/mcp/%s/mcp", b.apiURL, b.mcpServer)
-	}
-	Debug("MCP: POST %s (method=%s)", url, req.Method)
+	url := b.backendEndpointURL()
+	// The configured URL may itself contain operator-supplied diagnostics or
+	// legacy query material. Do not copy it to stderr; the method is sufficient
+	// to correlate a failed bridge request.
+	Debug("MCP: POST backend (method=%s)", req.Method)
 
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
 	if err != nil {
@@ -692,18 +704,21 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer httpResp.Body.Close()
-
-	// Capture session ID from response.
-	if sid := httpResp.Header.Get("Mcp-Session-Id"); sid != "" {
-		b.sessionID = sid
-		Debug("MCP: session ID: %s", sid)
-	}
+	responseSession := httpResp.Header.Get("Mcp-Session-Id")
 
 	// 200 = success with body, 202 = accepted (notifications), both are OK.
 	if httpResp.StatusCode != http.StatusOK && httpResp.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(httpResp.Body)
-		Debug("MCP: backend returned %d: %s", httpResp.StatusCode, string(body))
-		return nil, fmt.Errorf("backend returned HTTP %d: %s", httpResp.StatusCode, truncate(string(body), 200))
+		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 64<<10))
+		safeBody := string(b.redactBackendPayload(body, responseSession))
+		Debug("MCP: backend returned %d: %s", httpResp.StatusCode, safeBody)
+		return nil, fmt.Errorf("backend returned HTTP %d: %s", httpResp.StatusCode, truncate(safeBody, 200))
+	}
+
+	// Only a successful protocol response may establish or rotate the session.
+	// An error response's headers must not poison the next request.
+	if responseSession != "" {
+		b.sessionID = responseSession
+		Debug("MCP: backend session established")
 	}
 
 	// 202 Accepted is valid only for notifications. A correlated JSON-RPC
@@ -718,23 +733,59 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 	}
 
 	contentType := httpResp.Header.Get("Content-Type")
-	Debug("MCP: response Content-Type: %s", contentType)
+	Debug("MCP: response Content-Type: %s", memory.RedactSensitiveText(contentType, b.apiKey, b.sessionID))
 
 	if strings.Contains(contentType, "text/event-stream") {
 		return b.parseSSEResponseExpected(httpResp.Body, req.ID, b.remoteToolAllowlist != nil)
 	}
 
 	// Plain JSON response.
-	body, err := io.ReadAll(httpResp.Body)
+	body, err := io.ReadAll(io.LimitReader(httpResp.Body, maxMCPBackendResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
+	if len(body) > maxMCPBackendResponseBytes {
+		return nil, fmt.Errorf("backend response exceeds %d bytes", maxMCPBackendResponseBytes)
+	}
+	body = b.redactBackendPayload(body)
 	if b.remoteToolAllowlist != nil && len(req.ID) > 0 && string(req.ID) != "null" {
 		if err := validateBackendRPCResponse(body, req.ID); err != nil {
 			return nil, err
 		}
 	}
 	return body, nil
+}
+
+func (b *mcpBridge) backendEndpointURL() string {
+	if b.endpointURL != "" {
+		return b.endpointURL
+	}
+	return fmt.Sprintf("%s/api/mcp/%s/mcp", b.apiURL, b.mcpServer)
+}
+
+// closeBackendSession releases the server-side MCP session when the stdio
+// client disconnects. It is deliberately best-effort and tightly bounded;
+// process shutdown must not hang or emit protocol noise to stdout.
+func (b *mcpBridge) closeBackendSession() {
+	if b.sessionID == "" || b.apiKey == "" || b.httpClient == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, b.backendEndpointURL(), nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+b.apiKey)
+	req.Header.Set("Mcp-Session-Id", b.sessionID)
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	b.sessionID = ""
 }
 
 func validateBackendRPCResponse(data, expectedID json.RawMessage) error {
@@ -792,6 +843,7 @@ func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.Raw
 				continue
 			}
 
+			data = string(b.redactBackendPayload([]byte(data)))
 			Debug("MCP: SSE data: %s", truncate(data, 200))
 			candidate := []byte(data)
 			if strict {
@@ -822,6 +874,14 @@ func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.Raw
 	}
 
 	return lastResponse, nil
+}
+
+func (b *mcpBridge) redactBackendPayload(data []byte, extra ...string) []byte {
+	sensitive := append([]string{b.apiKey, b.sessionID}, extra...)
+	if redacted, err := memory.RedactSensitiveJSON(data, sensitive...); err == nil {
+		return redacted
+	}
+	return []byte(memory.RedactSensitiveText(string(data), sensitive...))
 }
 
 // writeResult writes a successful JSON-RPC response to stdout.
@@ -928,6 +988,6 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpAPIKey, "api-key", "", "AceTeam API key (or set ACETEAM_API_KEY env)")
 	mcpCmd.Flags().StringVar(&mcpAPIURL, "api-url", "", "AceTeam API URL (default: https://aceteam.ai)")
 	mcpCmd.Flags().StringVar(&mcpServer, "server", "aceteam", "MCP server name to proxy (default: aceteam)")
-	mcpCmd.Flags().StringVar(&mcpEndpointURL, "endpoint-url", "", "Exact MCP endpoint URL (overrides --api-url/--server)")
+	mcpCmd.Flags().StringVar(&mcpEndpointURL, "endpoint-url", "", "Exact MCP endpoint URL (overrides --api-url/--server except in --memory-config mode)")
 	mcpCmd.Flags().BoolVar(&mcpMemoryConfig, "memory-config", false, "Read the scoped key and endpoint from memory.yaml")
 }
