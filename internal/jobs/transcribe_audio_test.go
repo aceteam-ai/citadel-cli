@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -20,6 +21,12 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
+type transcribeRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn transcribeRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
 func TestTranscribeAudio_MissingAudioPath(t *testing.T) {
 	h := NewTranscribeAudioHandler(t.TempDir())
 	_, err := h.Execute(JobContext{}, &nexus.Job{
@@ -29,6 +36,70 @@ func TestTranscribeAudio_MissingAudioPath(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for missing audio_path")
+	}
+}
+
+func TestApplyTranscribeOptions_DiarizationModes(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		wantReq map[string]any
+	}{
+		{name: "speaker", mode: "speaker", wantReq: map[string]any{"diarize": true, "speaker": true}},
+		{name: "basic", mode: "true", wantReq: map[string]any{"diarize": true}},
+		{name: "off", mode: "false", wantReq: map[string]any{}},
+		{name: "unknown", mode: "yes", wantReq: map[string]any{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := map[string]any{}
+			if err := applyTranscribeOptions(got, map[string]string{"diarize": test.mode}); err != nil {
+				t.Fatalf("applyTranscribeOptions: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.wantReq) {
+				t.Fatalf("request = %#v, want %#v", got, test.wantReq)
+			}
+		})
+	}
+}
+
+func TestTranscribeAudio_ErrorBodyIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.webm"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("setup audio: %v", err)
+	}
+	h := NewTranscribeAudioHandler(dir)
+	h.ServiceURL = "http://transcribe.test"
+	h.HTTPClient = &http.Client{Transport: transcribeRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		status := http.StatusInternalServerError
+		body := strings.Repeat("x", transcribeErrorBodyLimit*2)
+		if req.URL.Path == "/health" {
+			status = http.StatusOK
+			body = ""
+		}
+		return &http.Response{
+			StatusCode: status,
+			Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})}
+	h.probeAudioDurationFn = func(string) (time.Duration, error) {
+		return time.Second, nil
+	}
+	body, err := h.Execute(JobContext{}, &nexus.Job{
+		ID: "bounded-error", Type: "TRANSCRIBE_AUDIO",
+		Payload: map[string]string{"audio_path": "a.webm"},
+	})
+	if err == nil {
+		t.Fatal("expected sidecar error")
+	}
+	if len(body) != transcribeErrorBodyLimit+len("\n[truncated]") {
+		t.Fatalf("error body length = %d, want %d", len(body), transcribeErrorBodyLimit+len("\n[truncated]"))
+	}
+	if !strings.HasSuffix(string(body), "\n[truncated]") {
+		t.Fatal("bounded error body is missing truncation marker")
 	}
 }
 

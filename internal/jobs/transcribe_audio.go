@@ -96,6 +96,10 @@ const (
 	// transcribeDurationProbeTimeout stops malformed containers or a stuck
 	// ffprobe binary from delaying a job before the sidecar request begins.
 	transcribeDurationProbeTimeout = 2 * time.Second
+
+	// transcribeErrorBodyLimit bounds an untrusted sidecar error response.
+	// Success bodies contain the full transcript and are not subject to it.
+	transcribeErrorBodyLimit = 64 << 10
 )
 
 // TranscribeAudioHandler handles TRANSCRIBE_AUDIO jobs node-locally.
@@ -359,9 +363,9 @@ func transcribeTimeoutForDuration(duration time.Duration, modelSize string) time
 }
 
 // allowedWhisperModelSizes whitelists the model_size values accepted from the
-// payload, matching faster-whisper 1.0.3's _MODELS keys (verified against the
-// pinned tag, faster_whisper/utils.py). The Python sidecar enforces the same
-// set as defense in depth. A value outside this set is a hard error (fail fast
+// payload, preserving the established set supported by pinned faster-whisper.
+// The Python sidecar enforces the same set as defense in depth. A value outside
+// this set is a hard error (fail fast
 // with a clear message) rather than a silent fall-back to the default model —
 // the caller asked for a specific model and should be told it is unavailable.
 var allowedWhisperModelSizes = []string{
@@ -398,7 +402,11 @@ func applyTranscribeOptions(req map[string]any, payload map[string]string) error
 	if lang, ok := payload["language"]; ok && lang != "" {
 		req["language"] = lang
 	}
-	if diarize, ok := payload["diarize"]; ok && diarize == "true" {
+	switch payload["diarize"] {
+	case "speaker":
+		req["diarize"] = true
+		req["speaker"] = true
+	case "true":
 		req["diarize"] = true
 	}
 	if value := payload["word_timestamps"]; value != "" {
@@ -457,7 +465,9 @@ func applyTranscribeOptions(req map[string]any, payload map[string]string) error
 // Payload fields (all strings via nexus.Job):
 //   - audio_path: workspace-relative or absolute path to the recorded audio.
 //   - language:   optional ISO language hint (e.g. "en"); empty = auto-detect.
-//   - diarize:    optional "true"/"false"; basic per-segment speaker labels.
+//   - diarize:    optional speaker-labelling mode. "speaker" requests real
+//     voice diarization, "true" requests basic silence-gap labels, and any
+//     other value requests no labels.
 //   - model_size: optional faster-whisper model (tiny|base|small|medium|
 //     large-v3|...); empty = the sidecar's configured default. Loaded on demand.
 //   - denoise:    optional "true"/"false"; ffmpeg afftdn denoise preprocessing.
@@ -479,8 +489,10 @@ func applyTranscribeOptions(req map[string]any, payload map[string]string) error
 //	  "language": "en",
 //	  "language_probability": 0.98,
 //	  "segments": [
-//	    {"start": 0.0, "end": 3.2, "text": "...", "speaker": "Speaker 1"}
-//	  ]
+//	    {"start": 0.0, "end": 3.2, "text": "...", "speaker": "SPEAKER_00"}
+//	  ],
+//	  "speakers": [{"id": "SPEAKER_00", "label": "Speaker 1", "talkTimePct": 100.0}],
+//	  "diarization": "speaker"
 //	}
 func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	// citadel#891: refuse fast, before burning the transcribeReadyTimeout
@@ -565,10 +577,14 @@ func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, transcribeErrorBodyLimit+1))
+		if len(bodyBytes) > transcribeErrorBodyLimit {
+			bodyBytes = append(bodyBytes[:transcribeErrorBodyLimit], []byte("\n[truncated]")...)
+		}
 		return bodyBytes, fmt.Errorf("transcription API returned non-200 status: %s", resp.Status)
 	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
 
 	// Attach the additive no-speech/low-confidence guard (citadel#1045). On any
 	// parse failure attachTranscriptionGuard returns bodyBytes verbatim.

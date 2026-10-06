@@ -10,11 +10,12 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY app.py /app/app.py
 
 ENV PORT=8101
+ENV PYANNOTE_METRICS_ENABLED=false
 EXPOSE 8101
 
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]

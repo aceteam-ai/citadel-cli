@@ -10,10 +10,11 @@ Audio never leaves the node: the workspace is mounted read-only at /workspace
 and the resulting transcript is returned to the local Go worker, which relays
 it back over the VPN mesh to the user's own AceTeam org.
 
-Diarization (Phase 1): BASIC. faster-whisper produces timestamped segments but
-no speaker identities. We label segments heuristically (a new speaker after a
-silence gap) so distinct speakers read better than unlabelled imports. Full
-diarization (pyannote/whisperx) is deferred to a later phase.
+Diarization has two fail-soft tiers. Basic mode labels silence-separated
+segments. Speaker mode uses gated pyannote voice diarization and emits stable
+raw `SPEAKER_NN` join keys. Missing credentials, model access, or a transient
+runtime failure returns the basic tier so transcription itself remains usable
+and the orchestrator can retry the speaker pass later.
 
 citadel#1045: this service is the SENSOR half of the low-SNR-hallucination fix.
 It accepts an optional model_size (loaded on demand), an optional denoise
@@ -24,13 +25,21 @@ computes — the Go handler's no-speech/low-confidence guard reasons over those.
 This service makes no policy decision itself; it only reports the signals.
 """
 
+import logging
 import os
 import subprocess
 import tempfile
 import threading
+import time
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+logger = logging.getLogger("citadel-whisper-service")
+
+# pyannote 4 enables anonymous telemetry by default. Keep the node-local
+# privacy boundary unless an operator deliberately opts in before startup.
+os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "false")
 
 # Workspace mount inside the container (see services/compose/transcribe.yml).
 WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "/workspace")
@@ -42,7 +51,8 @@ WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
 # Allowed faster-whisper model sizes. MUST stay in sync with the Go handler's
 # allowedWhisperModelSizes (internal/jobs/transcribe_audio.go), which is the
 # first line of defense; this set is defense-in-depth so the service never
-# trusts the wire blindly. Matches faster-whisper 1.0.3's _MODELS keys.
+# trusts the wire blindly. Preserves the established model set after upgrading
+# the engine to faster-whisper 1.2.1.
 ALLOWED_MODELS = {
     "tiny",
     "tiny.en",
@@ -67,6 +77,15 @@ ALLOWED_MODELS = {
 # tagging every line the same.
 SPEAKER_GAP_SECONDS = float(os.environ.get("WHISPER_SPEAKER_GAP_SECONDS", "2.0"))
 
+# Real speaker diarization is opt-in because its model is gated. Initialization
+# failures are retried after a bounded cooldown so repaired network access or
+# newly accepted model terms recover without a container restart.
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+DIARIZE_MODEL = os.environ.get(
+    "DIARIZE_MODEL", "pyannote/speaker-diarization-community-1"
+)
+DIARIZE_RETRY_SECONDS = max(1.0, float(os.environ.get("DIARIZE_RETRY_SECONDS", "30")))
+
 app = FastAPI(title="citadel-whisper-service")
 
 # Single-slot model cache (citadel#1045). Keeping every requested size resident
@@ -79,6 +98,12 @@ app = FastAPI(title="citadel-whisper-service")
 _model = None
 _model_name = None
 _model_lock = threading.Lock()
+
+_diarizer = None
+_diarizer_lock = threading.Lock()
+_diarizer_run_lock = threading.Lock()
+_diarizer_next_retry_at = 0.0
+_diarizer_last_error: str | None = None
 
 
 def _resolve_model_name(requested: str | None) -> str:
@@ -123,6 +148,9 @@ class TranscribeRequest(BaseModel):
     language: str | None = None
     # BASIC speaker labelling when True.
     diarize: bool = False
+    # Request gated pyannote diarization. Failure falls back to BASIC and the
+    # response reports that tier so the orchestrator can retry safely.
+    speaker: bool = False
     word_timestamps: bool = False
 
     # citadel#1045 tuning params, all optional. Absent = today's behavior.
@@ -143,9 +171,13 @@ def _resolve_audio_path(audio_path: str) -> str:
     Rejects paths that escape WORKSPACE_ROOT (defense in depth: the Go handler
     already validates, but the service must not trust the wire blindly).
     """
-    candidate = os.path.normpath(os.path.join(WORKSPACE_ROOT, audio_path))
-    root = os.path.normpath(WORKSPACE_ROOT)
-    if candidate != root and not candidate.startswith(root + os.sep):
+    root = os.path.realpath(WORKSPACE_ROOT)
+    candidate = os.path.realpath(os.path.join(root, audio_path))
+    try:
+        contained = os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        contained = False
+    if not contained:
         raise HTTPException(400, "audio_path resolves outside the workspace")
     if not os.path.isfile(candidate):
         raise HTTPException(404, f"audio file not found: {audio_path}")
@@ -206,6 +238,142 @@ def _label_speakers(segments: list[dict]) -> list[dict]:
     return segments
 
 
+def _speaker_label(speaker_id: str) -> str:
+    """Return a human-friendly label without changing the roster join key."""
+    if speaker_id.startswith("SPEAKER_"):
+        try:
+            return f"Speaker {int(speaker_id.rsplit('_', 1)[1]) + 1}"
+        except (IndexError, ValueError):
+            pass
+    return speaker_id
+
+
+def _summarize_speakers(segments: list[dict]) -> list[dict]:
+    totals: dict[str, float] = {}
+    order: list[str] = []
+    for segment in segments:
+        speaker = segment.get("speaker")
+        if not speaker:
+            continue
+        if speaker not in totals:
+            totals[speaker] = 0.0
+            order.append(speaker)
+        totals[speaker] += max(0.0, float(segment["end"]) - float(segment["start"]))
+    total = sum(totals.values())
+    return [
+        {
+            "id": speaker,
+            "label": _speaker_label(speaker),
+            "talkTimePct": round(100.0 * totals[speaker] / total, 1) if total else 0.0,
+        }
+        for speaker in order
+    ]
+
+
+def _load_diarizer():
+    """Load pyannote once, retrying transient failures after a cooldown."""
+    global _diarizer, _diarizer_last_error, _diarizer_next_retry_at
+    if not HF_TOKEN:
+        _diarizer_last_error = "missing_token"
+        return None
+    if _diarizer is not None:
+        return _diarizer
+
+    now = time.monotonic()
+    if now < _diarizer_next_retry_at:
+        return None
+    with _diarizer_lock:
+        if _diarizer is not None:
+            return _diarizer
+        now = time.monotonic()
+        if now < _diarizer_next_retry_at:
+            return None
+        try:
+            from pyannote.audio import Pipeline
+
+            pipeline = Pipeline.from_pretrained(DIARIZE_MODEL, token=HF_TOKEN)
+            if pipeline is None:
+                raise RuntimeError("diarization model did not load")
+            if WHISPER_DEVICE == "cuda":
+                import torch
+
+                pipeline.to(torch.device("cuda"))
+            _diarizer = pipeline
+            _diarizer_last_error = None
+            _diarizer_next_retry_at = 0.0
+        except Exception as exc:  # noqa: BLE001 - fail-soft retryable boundary.
+            _diarizer_last_error = type(exc).__name__
+            _diarizer_next_retry_at = time.monotonic() + DIARIZE_RETRY_SECONDS
+            logger.warning(
+                "speaker diarizer initialization failed (%s); retrying later",
+                _diarizer_last_error,
+            )
+            return None
+    return _diarizer
+
+
+def _speaker_turns(output) -> list[tuple[float, float, str]]:
+    """Normalize current and legacy pyannote pipeline outputs."""
+    # pyannote 4's exclusive form removes overlapping turns specifically for
+    # downstream transcription. Older outputs expose only speaker_diarization
+    # or are already an Annotation.
+    annotation = getattr(output, "exclusive_speaker_diarization", None)
+    if annotation is None:
+        annotation = getattr(output, "speaker_diarization", output)
+    turns = [
+        (float(turn.start), float(turn.end), str(speaker))
+        for turn, _, speaker in annotation.itertracks(yield_label=True)
+        if float(turn.end) > float(turn.start)
+    ]
+    return sorted(turns, key=lambda item: (item[0], item[1], item[2]))
+
+
+def _best_speaker(
+    start: float, end: float, turns: list[tuple[float, float, str]]
+) -> str | None:
+    overlaps: dict[str, float] = {}
+    for turn_start, turn_end, speaker in turns:
+        overlap = max(0.0, min(end, turn_end) - max(start, turn_start))
+        if overlap:
+            overlaps[speaker] = overlaps.get(speaker, 0.0) + overlap
+    if overlaps:
+        return max(overlaps, key=lambda speaker: (overlaps[speaker], speaker))
+    if not turns:
+        return None
+    midpoint = (start + end) / 2.0
+    return min(
+        turns,
+        key=lambda item: (abs(midpoint - ((item[0] + item[1]) / 2.0)), item[2]),
+    )[2]
+
+
+def _apply_speaker_turns(
+    segments: list[dict], turns: list[tuple[float, float, str]]
+) -> bool:
+    if not turns:
+        return False
+    for segment in segments:
+        segment["speaker"] = _best_speaker(segment["start"], segment["end"], turns)
+        for word in segment.get("words", []):
+            word["speaker"] = _best_speaker(word["start"], word["end"], turns)
+    return True
+
+
+def _diarize(path: str, segments: list[dict]) -> bool:
+    pipeline = _load_diarizer()
+    if pipeline is None:
+        return False
+    try:
+        with _diarizer_run_lock:
+            output = pipeline(path)
+        return _apply_speaker_turns(segments, _speaker_turns(output))
+    except Exception as exc:  # noqa: BLE001 - transcription must fail soft.
+        logger.warning(
+            "speaker diarization failed (%s); using basic labels", type(exc).__name__
+        )
+        return False
+
+
 def _format_segment(segment, include_words: bool) -> dict:
     formatted = {
         "start": round(segment.start, 3),
@@ -230,7 +398,23 @@ def _format_segment(segment, include_words: bool) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": WHISPER_MODEL}
+    if not HF_TOKEN:
+        capability = "missing_token"
+    elif _diarizer is not None:
+        capability = "ready"
+    elif time.monotonic() < _diarizer_next_retry_at:
+        capability = "retrying"
+    else:
+        capability = "configured"
+    return {
+        "status": "ok",
+        "model": WHISPER_MODEL,
+        "speaker_diarization": {
+            "status": capability,
+            "model": DIARIZE_MODEL,
+            "last_error": _diarizer_last_error,
+        },
+    }
 
 
 @app.post("/transcribe")
@@ -239,6 +423,8 @@ def transcribe(req: TranscribeRequest):
     model, model_name = _get_model(req.model_size)
 
     denoised_tmp: str | None = None
+    want_labels = req.diarize or req.speaker
+    diarization_tier = "none"
     try:
         if req.denoise:
             denoised_tmp = _denoise_to_tmp(path)
@@ -262,15 +448,18 @@ def transcribe(req: TranscribeRequest):
         segments_iter, info = model.transcribe(path, **kwargs)
 
         segments = [_format_segment(s, req.word_timestamps) for s in segments_iter]
+        if want_labels:
+            if req.speaker and _diarize(path, segments):
+                diarization_tier = "speaker"
+            else:
+                segments = _label_speakers(segments)
+                diarization_tier = "basic"
     finally:
         if denoised_tmp is not None:
             try:
                 os.unlink(denoised_tmp)
             except OSError:
                 pass
-
-    if req.diarize:
-        segments = _label_speakers(segments)
 
     text = " ".join(s["text"] for s in segments).strip()
 
@@ -282,6 +471,8 @@ def transcribe(req: TranscribeRequest):
         "model": model_name,
         "denoised": bool(req.denoise),
         "segments": segments,
-        # Surface diarization status so callers know what they got.
-        "diarization": "basic" if req.diarize else "none",
+        "speakers": _summarize_speakers(segments) if want_labels else [],
+        # Surface the actual tier so the caller can retain and retry a quick
+        # transcript when gated speaker diarization was unavailable.
+        "diarization": diarization_tier,
     }
