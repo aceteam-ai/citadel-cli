@@ -36,6 +36,21 @@ def _segment(text=" hello ", start=0.0, end=2.0):
     )
 
 
+def _mixed_segment():
+    return SimpleNamespace(
+        start=0.0,
+        end=2.0,
+        text=" first second ",
+        no_speech_prob=0.01234,
+        avg_logprob=-0.12345,
+        compression_ratio=1.23456,
+        words=[
+            SimpleNamespace(word=" first ", start=0.0, end=1.0, probability=0.99),
+            SimpleNamespace(word=" second ", start=1.0, end=2.0, probability=0.01),
+        ],
+    )
+
+
 class FakeModel:
     def __init__(self):
         self.kwargs = None
@@ -58,6 +73,13 @@ class FakeAnnotation:
         assert yield_label
         yield FakeTurn(0.0, 1.5), None, "SPEAKER_00"
         yield FakeTurn(1.5, 2.0), None, "SPEAKER_01"
+
+
+class MixedAnnotation:
+    def itertracks(self, *, yield_label):
+        assert yield_label
+        yield FakeTurn(0.0, 1.0), None, "SPEAKER_00"
+        yield FakeTurn(1.0, 2.0), None, "SPEAKER_01"
 
 
 def test_pyannote_exclusive_turns_are_preferred_for_transcription():
@@ -136,6 +158,55 @@ def test_speaker_success_preserves_tuning_words_and_confidence(monkeypatch):
     ]
 
 
+def test_mixed_speaker_segment_roster_uses_word_timings_not_confidence(monkeypatch):
+    model = FakeModel()
+
+    def transcribe(_path, **kwargs):
+        model.kwargs = kwargs
+        return iter([_mixed_segment()]), SimpleNamespace(
+            language="en", language_probability=0.98765, duration=2.0
+        )
+
+    model.transcribe = transcribe
+    monkeypatch.setattr(app, "_get_model", lambda _name: (model, "medium"))
+    monkeypatch.setattr(
+        app,
+        "_load_diarizer",
+        lambda: lambda _path: SimpleNamespace(speaker_diarization=MixedAnnotation()),
+    )
+
+    result = app.transcribe(
+        app.TranscribeRequest(
+            audio_path="audio.wav", diarize=True, speaker=True, word_timestamps=True
+        )
+    )
+
+    # Segment compatibility is retained: its existing stable raw-ID tie-break
+    # stays at the segment level, while the roster reflects both word IDs.
+    assert result["segments"][0]["speaker"] == "SPEAKER_01"
+    assert [word["speaker"] for word in result["segments"][0]["words"]] == [
+        "SPEAKER_00",
+        "SPEAKER_01",
+    ]
+    assert [word["probability"] for word in result["segments"][0]["words"]] == [
+        0.99,
+        0.01,
+    ]
+    assert result["speakers"] == [
+        {"id": "SPEAKER_00", "label": "Speaker 1", "talkTimePct": 50.0},
+        {"id": "SPEAKER_01", "label": "Speaker 2", "talkTimePct": 50.0},
+    ]
+
+
+def test_speaker_boundary_tie_uses_stable_raw_id():
+    turns = [
+        (0.0, 1.0, "SPEAKER_00"),
+        (1.0, 2.0, "SPEAKER_01"),
+    ]
+
+    assert app._best_speaker(0.5, 1.5, turns) == "SPEAKER_01"
+
+
 def test_request_parsing_and_denoised_audio_reach_both_models(monkeypatch, tmp_path):
     model = FakeModel()
     model_paths = []
@@ -151,7 +222,7 @@ def test_request_parsing_and_denoised_audio_reach_both_models(monkeypatch, tmp_p
     monkeypatch.setattr(
         app,
         "_denoise_to_tmp",
-        lambda _path: (denoised.write_bytes(b"denoised") and str(denoised)),
+        lambda _path: denoised.write_bytes(b"denoised") and str(denoised),
     )
 
     def pipeline(path):
@@ -181,12 +252,20 @@ def test_speaker_failure_falls_back_and_reports_basic(monkeypatch):
     monkeypatch.setattr(app, "_load_diarizer", lambda: None)
 
     result = app.transcribe(
-        app.TranscribeRequest(audio_path="audio.wav", diarize=True, speaker=True)
+        app.TranscribeRequest(
+            audio_path="audio.wav",
+            diarize=True,
+            speaker=True,
+            word_timestamps=True,
+        )
     )
 
     assert result["diarization"] == "basic"
     assert result["segments"][0]["speaker"] == "Speaker 1"
-    assert result["speakers"][0]["id"] == "Speaker 1"
+    assert "speaker" not in result["segments"][0]["words"][0]
+    assert result["speakers"] == [
+        {"id": "Speaker 1", "label": "Speaker 1", "talkTimePct": 100.0}
+    ]
 
 
 def test_diarizer_initialization_failure_is_retryable(monkeypatch):

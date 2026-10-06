@@ -249,16 +249,42 @@ def _speaker_label(speaker_id: str) -> str:
 
 
 def _summarize_speakers(segments: list[dict]) -> list[dict]:
+    """Build a stable roster from the finest speaker timing available.
+
+    Speaker diarization can assign more than one speaker inside a single
+    transcription segment.  When word timings carry speaker IDs, use those
+    timings for both roster membership and talk-time percentages instead of
+    charging the whole segment to its majority speaker.  BASIC diarization
+    and requests without word timestamps retain the segment-level behavior.
+
+    Word confidence is deliberately not a duration weight: it describes the
+    transcription token, not the diarizer's speaker decision.
+    """
     totals: dict[str, float] = {}
     order: list[str] = []
-    for segment in segments:
-        speaker = segment.get("speaker")
+
+    def add(speaker: str | None, start: float, end: float) -> None:
         if not speaker:
-            continue
+            return
+        duration = max(0.0, float(end) - float(start))
+        if duration <= 0.0:
+            return
         if speaker not in totals:
             totals[speaker] = 0.0
             order.append(speaker)
-        totals[speaker] += max(0.0, float(segment["end"]) - float(segment["start"]))
+        totals[speaker] += duration
+
+    for segment in segments:
+        attributed_words = [
+            word
+            for word in segment.get("words", [])
+            if word.get("speaker") and float(word["end"]) > float(word["start"])
+        ]
+        if attributed_words:
+            for word in attributed_words:
+                add(word["speaker"], word["start"], word["end"])
+        else:
+            add(segment.get("speaker"), segment["start"], segment["end"])
     total = sum(totals.values())
     return [
         {
@@ -337,6 +363,8 @@ def _best_speaker(
         if overlap:
             overlaps[speaker] = overlaps.get(speaker, 0.0) + overlap
     if overlaps:
+        # Preserve the existing stable raw-ID tie-break when a word straddles
+        # a speaker boundary with equal overlap.
         return max(overlaps, key=lambda speaker: (overlaps[speaker], speaker))
     if not turns:
         return None
