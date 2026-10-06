@@ -1,6 +1,10 @@
 # Runtime inputs for the hash-locked requirements.txt. Regenerate with the
 # exact command recorded in requirements.txt.
 faster-whisper==1.2.1
+# faster-whisper 1.2.1 still passes metadata_errors= to av.open. PyAV 19
+# removed that keyword; keep the last compatible release until the merged
+# upstream adaptation ships in a faster-whisper release.
+av==18.1.0
 requests==2.34.2
 fastapi==0.142.2
 starlette==1.3.1

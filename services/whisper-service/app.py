@@ -387,13 +387,33 @@ def _apply_speaker_turns(
     return True
 
 
+def _decode_diarization_audio(path: str) -> dict:
+    """Decode once into pyannote's supported in-memory audio contract.
+
+    The locked torchcodec wheel cannot load its native image library in this
+    CPU container, so handing pyannote a path would make it invoke an
+    unavailable decoder. faster-whisper's locked PyAV boundary already
+    produces the mono float32 samples that pyannote expects.
+    """
+    import torch
+    from faster_whisper.audio import decode_audio
+
+    sample_rate = 16_000
+    decoded = decode_audio(path, sampling_rate=sample_rate)
+    return {
+        "waveform": torch.from_numpy(decoded).unsqueeze(0),
+        "sample_rate": sample_rate,
+    }
+
+
 def _diarize(path: str, segments: list[dict]) -> bool:
     pipeline = _load_diarizer()
     if pipeline is None:
         return False
     try:
         with _diarizer_run_lock:
-            output = pipeline(path)
+            audio = _decode_diarization_audio(path)
+            output = pipeline(audio)
         return _apply_speaker_turns(segments, _speaker_turns(output))
     except Exception as exc:  # noqa: BLE001 - transcription must fail soft.
         logger.warning(

@@ -20,6 +20,14 @@ def reset_state(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "_diarizer", None)
     monkeypatch.setattr(app, "_diarizer_next_retry_at", 0.0)
     monkeypatch.setattr(app, "_diarizer_last_error", None)
+    monkeypatch.setattr(
+        app,
+        "_decode_diarization_audio",
+        lambda _path: {
+            "waveform": SimpleNamespace(shape=(1, 16_000), dtype="torch.float32"),
+            "sample_rate": 16_000,
+        },
+    )
     (tmp_path / "audio.wav").write_bytes(b"audio")
 
 
@@ -105,7 +113,14 @@ def test_speaker_success_preserves_tuning_words_and_confidence(monkeypatch):
     monkeypatch.setattr(
         app,
         "_load_diarizer",
-        lambda: lambda _path: SimpleNamespace(speaker_diarization=FakeAnnotation()),
+        lambda: lambda audio: (
+            SimpleNamespace(speaker_diarization=FakeAnnotation())
+            if isinstance(audio, dict)
+            and audio["waveform"].shape == (1, 16_000)
+            and audio["waveform"].dtype == "torch.float32"
+            and audio["sample_rate"] == 16_000
+            else (_ for _ in ()).throw(AssertionError("expected waveform dictionary"))
+        ),
     )
 
     result = app.transcribe(
@@ -172,7 +187,11 @@ def test_mixed_speaker_segment_roster_uses_word_timings_not_confidence(monkeypat
     monkeypatch.setattr(
         app,
         "_load_diarizer",
-        lambda: lambda _path: SimpleNamespace(speaker_diarization=MixedAnnotation()),
+        lambda: lambda audio: (
+            SimpleNamespace(speaker_diarization=MixedAnnotation())
+            if isinstance(audio, dict)
+            else (_ for _ in ()).throw(AssertionError("expected waveform dictionary"))
+        ),
     )
 
     result = app.transcribe(
@@ -225,10 +244,21 @@ def test_request_parsing_and_denoised_audio_reach_both_models(monkeypatch, tmp_p
         lambda _path: denoised.write_bytes(b"denoised") and str(denoised),
     )
 
-    def pipeline(path):
+    def decode_diarization_audio(path):
         diarizer_paths.append(path)
+        return {
+            "waveform": SimpleNamespace(shape=(1, 16_000), dtype="torch.float32"),
+            "sample_rate": 16_000,
+        }
+
+    def pipeline(audio):
+        assert isinstance(audio, dict)
+        assert audio["waveform"].shape == (1, 16_000)
+        assert audio["waveform"].dtype == "torch.float32"
+        assert audio["sample_rate"] == 16_000
         return SimpleNamespace(speaker_diarization=FakeAnnotation())
 
+    monkeypatch.setattr(app, "_decode_diarization_audio", decode_diarization_audio)
     monkeypatch.setattr(app, "_load_diarizer", lambda: pipeline)
     request = app.TranscribeRequest.model_validate(
         {
@@ -266,6 +296,70 @@ def test_speaker_failure_falls_back_and_reports_basic(monkeypatch):
     assert result["speakers"] == [
         {"id": "Speaker 1", "label": "Speaker 1", "talkTimePct": 100.0}
     ]
+
+
+def test_diarization_decode_failure_is_fail_soft(monkeypatch):
+    def pipeline(_audio):
+        raise AssertionError("pipeline must not run when audio decode fails")
+
+    def decode_failure(_path):
+        raise RuntimeError("decoder unavailable")
+
+    monkeypatch.setattr(app, "_load_diarizer", lambda: pipeline)
+    monkeypatch.setattr(app, "_decode_diarization_audio", decode_failure)
+
+    segments = [{"start": 0.0, "end": 1.0, "words": []}]
+    assert app._diarize("audio.wav", segments) is False
+    assert segments == [{"start": 0.0, "end": 1.0, "words": []}]
+
+
+def test_diarization_decode_and_pipeline_are_single_flight(monkeypatch):
+    active_decoders = 0
+    max_active_decoders = 0
+    counter_lock = threading.Lock()
+    start_barrier = threading.Barrier(9)
+
+    def decode_audio(_path):
+        nonlocal active_decoders, max_active_decoders
+        with counter_lock:
+            active_decoders += 1
+            max_active_decoders = max(max_active_decoders, active_decoders)
+        time.sleep(0.02)
+        with counter_lock:
+            active_decoders -= 1
+        return {
+            "waveform": SimpleNamespace(shape=(1, 16_000), dtype="torch.float32"),
+            "sample_rate": 16_000,
+        }
+
+    def pipeline(audio):
+        assert audio["waveform"].shape == (1, 16_000)
+        time.sleep(0.01)
+        return SimpleNamespace(speaker_diarization=FakeAnnotation())
+
+    monkeypatch.setattr(app, "_decode_diarization_audio", decode_audio)
+    monkeypatch.setattr(app, "_load_diarizer", lambda: pipeline)
+    results = []
+
+    def run_diarization():
+        start_barrier.wait()
+        results.append(
+            app._diarize("audio.wav", [{"start": 0.0, "end": 2.0, "words": []}])
+        )
+
+    threads = [
+        threading.Thread(target=run_diarization)
+        for _ in range(8)
+    ]
+
+    for thread in threads:
+        thread.start()
+    start_barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert results == [True] * 8
+    assert max_active_decoders == 1
 
 
 def test_diarizer_initialization_failure_is_retryable(monkeypatch):

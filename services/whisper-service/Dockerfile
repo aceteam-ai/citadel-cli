@@ -12,7 +12,8 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
-COPY app.py /app/app.py
+COPY app.py decode_smoke.py /app/
+RUN python /app/decode_smoke.py
 
 ENV PORT=8101
 ENV PYANNOTE_METRICS_ENABLED=false
