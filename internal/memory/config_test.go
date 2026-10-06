@@ -231,9 +231,11 @@ func TestEffectiveMCPURL(t *testing.T) {
 		cfg  Config
 		want string
 	}{
-		{Config{APIBaseURL: "https://aceteam.ai"}, "https://aceteam.ai/api/mcp/aceteam/mcp"},
-		{Config{APIBaseURL: "https://aceteam.ai/"}, "https://aceteam.ai/api/mcp/aceteam/mcp"},
-		{Config{}, "https://aceteam.ai/api/mcp/aceteam/mcp"},
+		{Config{APIBaseURL: "https://aceteam.ai"}, "https://aceteam.ai/api/mcp/aceteam/memory/mcp"},
+		{Config{APIBaseURL: "https://aceteam.ai/"}, "https://aceteam.ai/api/mcp/aceteam/memory/mcp"},
+		{Config{}, "https://aceteam.ai/api/mcp/aceteam/memory/mcp"},
+		{Config{APIBaseURL: "http://127.0.0.1:3000/"}, "http://127.0.0.1:3000/api/mcp/aceteam/memory/mcp"},
+		{Config{MCPURL: "https://aceteam.ai/api/mcp/aceteam/mcp"}, "https://aceteam.ai/api/mcp/aceteam/mcp"},
 		{Config{MCPURL: "https://custom/mcp"}, "https://custom/mcp"},
 	}
 	for _, c := range cases {

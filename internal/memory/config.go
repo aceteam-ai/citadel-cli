@@ -118,14 +118,14 @@ func ValidateMCPURL(raw string) error {
 	return fmt.Errorf("memory MCP URL must use HTTPS (HTTP is allowed only on loopback)")
 }
 
-// DefaultMCPURL derives the AceTeam MCP endpoint for external clients from an
-// API base URL, e.g. https://aceteam.ai/api/mcp/aceteam/mcp.
+// DefaultMCPURL derives the least-privilege AceTeam memory profile endpoint.
+// The generic MCP transport requires capabilities the memory key must not have.
 func DefaultMCPURL(apiBaseURL string) string {
 	base := strings.TrimRight(apiBaseURL, "/")
 	if base == "" {
 		base = DefaultAPIBaseURL
 	}
-	return base + "/api/mcp/aceteam/mcp"
+	return base + "/api/mcp/aceteam/memory/mcp"
 }
 
 // EffectiveMCPURL returns the configured MCP URL or one derived from the base.
