@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -15,12 +16,29 @@ const redactedValue = "[REDACTED]"
 // matcher deliberately a little broader so diagnostics stay safe if the key
 // encoding changes before this client is upgraded.
 var aceTeamBearerPattern = regexp.MustCompile(`act_[0-9A-Za-z._-]{8,}`)
+var jsonUnicodeEscapePattern = regexp.MustCompile(`\\u[0-9A-Fa-f]{4}`)
 
 // RedactSensitiveText removes explicitly supplied credentials/session tokens
 // and any AceTeam bearer-shaped value from text that may reach stdout, stderr,
 // or a JSON-RPC client. It is intentionally exported for the stdio MCP bridge,
 // which lives in cmd and must scrub untrusted backend diagnostics too.
 func RedactSensitiveText(text string, sensitive ...string) string {
+	redacted := redactPlainSensitiveText(text, sensitive...)
+	// Errors may embed JSON rather than consist of one complete JSON value.
+	// Decode unicode escapes in a copy only to detect a hidden credential. If
+	// one appears, suppress the whole diagnostic rather than risk reproducing
+	// an attacker-controlled escape spelling at the caller.
+	decoded := jsonUnicodeEscapePattern.ReplaceAllStringFunc(redacted, func(escape string) string {
+		value, _ := strconv.ParseUint(escape[2:], 16, 16)
+		return string(rune(value))
+	})
+	if decoded != redacted && redactPlainSensitiveText(decoded, sensitive...) != decoded {
+		return redactedValue
+	}
+	return redacted
+}
+
+func redactPlainSensitiveText(text string, sensitive ...string) string {
 	for _, value := range sensitive {
 		if value != "" {
 			text = strings.ReplaceAll(text, value, redactedValue)
@@ -45,6 +63,18 @@ func RedactSensitiveJSON(data []byte, sensitive ...string) ([]byte, error) {
 		return nil, fmt.Errorf("JSON for redaction contains trailing data")
 	}
 	return json.Marshal(redactJSONValue(value, sensitive))
+}
+
+// redactSensitivePayload structurally redacts a complete JSON value so
+// unicode-escaped secrets cannot bypass byte-oriented replacement. Non-JSON
+// diagnostics retain their original shape and receive ordinary text
+// redaction.
+func redactSensitivePayload(data []byte, sensitive ...string) string {
+	redacted, err := RedactSensitiveJSON(data, sensitive...)
+	if err == nil {
+		return string(redacted)
+	}
+	return RedactSensitiveText(string(data), sensitive...)
 }
 
 func redactJSONValue(value any, sensitive []string) any {

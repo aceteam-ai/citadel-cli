@@ -1,8 +1,10 @@
 package memory
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -232,8 +234,17 @@ func readJSONObject(path string) (map[string]any, error) {
 		return map[string]any{}, nil
 	}
 	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&m); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parse %s: multiple JSON values", path)
+		}
+		return nil, fmt.Errorf("parse %s trailing data: %w", path, err)
 	}
 	if m == nil {
 		m = map[string]any{}

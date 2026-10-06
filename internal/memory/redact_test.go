@@ -19,6 +19,15 @@ func TestRedactSensitiveText(t *testing.T) {
 	}
 }
 
+func TestRedactSensitiveText_CatchesEmbeddedUnicodeEscapes(t *testing.T) {
+	key := "act_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	session := "session-private-123"
+	got := RedactSensitiveText(`HTTP error: bearer=\u0061ct_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef session=\u0073ession-private-123`, key, session)
+	if got != redactedValue {
+		t.Fatalf("escaped secrets survived embedded diagnostic redaction: %q", got)
+	}
+}
+
 func TestRedactSensitiveJSON_CatchesEscapedBearer(t *testing.T) {
 	key := "act_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	escaped := `{"jsonrpc":"2.0","result":{"text":"\u0061\u0063\u0074\u005f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}`

@@ -94,7 +94,7 @@ func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]a
 
 	session, protocolVersion, err := c.initialize(ctx)
 	if err != nil {
-		return "", c.safeError(fmt.Errorf("initialize MCP session: %w", err))
+		return "", c.safeError(fmt.Errorf("initialize MCP session: %w", err), session)
 	}
 	defer func() { c.terminateSession(session, protocolVersion) }()
 	resp, activeSession, err := c.post(ctx, session, protocolVersion, rpcRequest{
@@ -104,32 +104,43 @@ func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]a
 		session = activeSession
 	}
 	if err != nil {
-		return "", c.safeError(err)
+		return "", c.safeError(err, session)
 	}
 	if resp == nil {
 		return "", fmt.Errorf("empty MCP tools/call response")
 	}
 	if resp.Error != nil {
-		return "", c.safeError(resp.Error)
+		return "", c.safeError(resp.Error, session)
 	}
-	text, err := decodeToolResult(resp.Result)
+	text, err := decodeToolResult(resp.Result, c.apiKey, session)
 	if err != nil {
-		return "", c.safeError(err)
+		return "", c.safeError(err, session)
 	}
-	return RedactSensitiveText(text, c.apiKey), nil
+	return text, nil
 }
 
-func (c *MCPClient) safeError(err error) error {
+func (c *MCPClient) safeError(err error, sensitive ...string) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%s", RedactSensitiveText(err.Error(), c.apiKey))
+	return fmt.Errorf("%s", RedactSensitiveText(err.Error(), append(sensitive, c.apiKey)...))
 }
 
 // initialize performs initialize + notifications/initialized and returns the
 // negotiated Mcp-Session-Id (may be empty if the server does not use one).
-func (c *MCPClient) initialize(ctx context.Context) (string, string, error) {
-	initResp, session, err := c.post(ctx, "", "", rpcRequest{
+func (c *MCPClient) initialize(ctx context.Context) (session, protocolVersion string, err error) {
+	protocolVersion = mcpProtocolVersion
+	// A server may allocate a session before its initialize response proves
+	// parseable or protocol-compatible. Release that state on every failure.
+	defer func() {
+		if err != nil && session != "" {
+			c.terminateSession(session, protocolVersion)
+			err = c.safeError(err, session)
+		}
+	}()
+
+	var initResp *rpcResponse
+	initResp, session, err = c.post(ctx, "", "", rpcRequest{
 		JSONRPC: "2.0", ID: 1, Method: "initialize", Params: map[string]any{
 			"protocolVersion": mcpProtocolVersion,
 			"capabilities":    map[string]any{},
@@ -137,37 +148,41 @@ func (c *MCPClient) initialize(ctx context.Context) (string, string, error) {
 		},
 	})
 	if err != nil {
-		return "", "", err
+		return session, protocolVersion, err
 	}
 	if initResp == nil {
-		return "", "", fmt.Errorf("empty initialize result")
+		return session, protocolVersion, fmt.Errorf("empty initialize result")
 	}
 	if initResp.Error != nil {
-		return "", "", initResp.Error
+		return session, protocolVersion, initResp.Error
 	}
 	if len(initResp.Result) == 0 {
-		return "", "", fmt.Errorf("empty initialize result")
+		return session, protocolVersion, fmt.Errorf("empty initialize result")
 	}
 	var negotiated struct {
 		ProtocolVersion string `json:"protocolVersion"`
 	}
 	if err := json.Unmarshal(initResp.Result, &negotiated); err != nil {
-		return "", "", fmt.Errorf("decode initialize result: %w", err)
+		return session, protocolVersion, fmt.Errorf("decode initialize result: %w", err)
 	}
 	if negotiated.ProtocolVersion != mcpProtocolVersion {
-		return "", "", fmt.Errorf("unsupported MCP protocol version %q (want %q)", negotiated.ProtocolVersion, mcpProtocolVersion)
+		return session, protocolVersion, fmt.Errorf("unsupported MCP protocol version %q (want %q)", negotiated.ProtocolVersion, mcpProtocolVersion)
 	}
+	protocolVersion = negotiated.ProtocolVersion
 
 	// Notifications do not have a response body, but transport failures are
 	// still fatal: tools/call before initialized is not protocol-conformant.
-	_, session, err = c.post(ctx, session, negotiated.ProtocolVersion, rpcRequest{
+	var activeSession string
+	_, activeSession, err = c.post(ctx, session, protocolVersion, rpcRequest{
 		JSONRPC: "2.0", Method: "notifications/initialized",
 	})
-	if err != nil {
-		c.terminateSession(session, negotiated.ProtocolVersion)
-		return "", "", fmt.Errorf("send initialized notification: %w", err)
+	if activeSession != "" {
+		session = activeSession
 	}
-	return session, negotiated.ProtocolVersion, nil
+	if err != nil {
+		return session, protocolVersion, fmt.Errorf("send initialized notification: %w", err)
+	}
+	return session, protocolVersion, nil
 }
 
 // terminateSession releases server-side streamable-HTTP state after each
@@ -234,7 +249,8 @@ func (c *MCPClient) post(ctx context.Context, session, protocolVersion string, b
 	if httpResp.StatusCode != http.StatusOK && httpResp.StatusCode != http.StatusAccepted &&
 		httpResp.StatusCode != http.StatusNoContent {
 		snippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, 2048))
-		return nil, newSession, fmt.Errorf("MCP HTTP %d: %s", httpResp.StatusCode, strings.TrimSpace(string(snippet)))
+		safeSnippet := redactSensitivePayload(bytes.TrimSpace(snippet), c.apiKey, session, newSession)
+		return nil, newSession, fmt.Errorf("MCP HTTP %d: %s", httpResp.StatusCode, safeSnippet)
 	}
 
 	// A notification yields an empty 200/202/204 body.
@@ -363,7 +379,7 @@ func parseSSE(body io.Reader, expectedID int) (*rpcResponse, error) {
 }
 
 // decodeToolResult extracts concatenated text from a tools/call result.
-func decodeToolResult(raw json.RawMessage) (string, error) {
+func decodeToolResult(raw json.RawMessage, sensitive ...string) (string, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return "", fmt.Errorf("MCP tools/call response omitted result")
@@ -378,16 +394,16 @@ func decodeToolResult(raw json.RawMessage) (string, error) {
 		return "", fmt.Errorf("MCP tools/call response contained no result content")
 	}
 	if res.IsError {
-		msg := strings.TrimSpace(toolResultText(res))
+		msg := strings.TrimSpace(toolResultText(res, sensitive...))
 		if msg == "" {
 			msg = "unspecified tool failure"
 		}
 		return "", fmt.Errorf("MCP tool reported an error: %s", msg)
 	}
-	return toolResultText(res), nil
+	return toolResultText(res, sensitive...), nil
 }
 
-func toolResultText(res toolCallResult) string {
+func toolResultText(res toolCallResult, sensitive ...string) string {
 	var b strings.Builder
 	for _, c := range res.Content {
 		if c.Type == "text" && c.Text != "" {
@@ -398,7 +414,7 @@ func toolResultText(res toolCallResult) string {
 		}
 	}
 	if b.Len() == 0 && len(res.StructuredContent) > 0 {
-		return string(res.StructuredContent)
+		return redactSensitivePayload(res.StructuredContent, sensitive...)
 	}
-	return b.String()
+	return RedactSensitiveText(b.String(), sensitive...)
 }

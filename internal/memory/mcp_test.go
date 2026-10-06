@@ -345,11 +345,21 @@ func TestParseSSE_RejectsResponseWithResultAndError(t *testing.T) {
 
 func TestCallTool_RejectsUnsupportedProtocol(t *testing.T) {
 	var afterInitialize int
+	var terminated int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			if got := r.Header.Get("Mcp-Session-Id"); got != "session-private-123" {
+				t.Errorf("terminated session = %q", got)
+			}
+			terminated++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		method, _, _ := decodeReq(t, r)
 		if method != "initialize" {
 			afterInitialize++
 		}
+		w.Header().Set("Mcp-Session-Id", "session-private-123")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"jsonrpc": "2.0", "id": 1,
@@ -363,6 +373,35 @@ func TestCallTool_RejectsUnsupportedProtocol(t *testing.T) {
 	}
 	if afterInitialize != 0 {
 		t.Fatalf("continued after unsupported protocol: %d requests", afterInitialize)
+	}
+	if terminated != 1 {
+		t.Fatalf("allocated session cleanup count = %d, want 1", terminated)
+	}
+}
+
+func TestCallTool_InitializeParseFailureTerminatesAllocatedSession(t *testing.T) {
+	var terminated int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			if got := r.Header.Get("Mcp-Session-Id"); got != "session-private-123" {
+				t.Errorf("terminated session = %q", got)
+			}
+			terminated++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Mcp-Session-Id", "session-private-123")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":`)
+	}))
+	defer srv.Close()
+
+	_, err := NewMCPClient(srv.URL, "act_key", time.Second).CallTool(context.Background(), "memory_search", nil)
+	if err == nil || !strings.Contains(err.Error(), "decode MCP response") {
+		t.Fatalf("expected initialize parse failure, got %v", err)
+	}
+	if terminated != 1 {
+		t.Fatalf("allocated session cleanup count = %d, want 1", terminated)
 	}
 }
 
@@ -434,5 +473,84 @@ func TestCallTool_RedactsCredentialFromSuccessAndErrors(t *testing.T) {
 				t.Fatalf("error=%v wantErr=%v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestCallTool_RedactsUnicodeEscapedStructuredSecrets(t *testing.T) {
+	const (
+		key       = "act_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		sessionID = "session-private-123"
+	)
+	var terminated int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			terminated++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		method, _, _ := decodeReq(t, r)
+		switch method {
+		case "initialize":
+			writeInitialize(w, sessionID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"bearer":"\u0061ct_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","session":"\u0073ession-private-123"}}}`)
+		}
+	}))
+	defer srv.Close()
+
+	out, err := NewMCPClient(srv.URL, key, time.Second).CallTool(context.Background(), "memory_search", nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("output is not JSON: %q: %v", out, err)
+	}
+	if decoded["bearer"] == key || decoded["session"] == sessionID {
+		t.Fatalf("structured secret survived redaction: %#v", decoded)
+	}
+	if strings.Contains(out, `\u0061ct_`) || strings.Contains(out, `\u0073ession-private-123`) {
+		t.Fatalf("escaped secret survived redaction: %q", out)
+	}
+	if terminated != 1 {
+		t.Fatalf("session cleanup count = %d, want 1", terminated)
+	}
+}
+
+func TestCallTool_RedactsUnicodeEscapedHTTPErrorSecrets(t *testing.T) {
+	const (
+		key       = "act_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		sessionID = "session-private-123"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		method, _, _ := decodeReq(t, r)
+		switch method {
+		case "initialize":
+			writeInitialize(w, sessionID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"bearer":"\u0061ct_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","session":"\u0073ession-private-123"}`)
+		}
+	}))
+	defer srv.Close()
+
+	_, err := NewMCPClient(srv.URL, key, time.Second).CallTool(context.Background(), "memory_search", nil)
+	if err == nil {
+		t.Fatal("expected HTTP error")
+	}
+	got := err.Error()
+	if strings.Contains(got, key) || strings.Contains(got, sessionID) ||
+		strings.Contains(got, `\u0061ct_`) || strings.Contains(got, `\u0073ession-private-123`) {
+		t.Fatalf("HTTP error leaked an escaped secret: %q", got)
 	}
 }

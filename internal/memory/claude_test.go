@@ -118,6 +118,27 @@ func TestWriteMCPServer_Idempotent(t *testing.T) {
 	}
 }
 
+func TestWriteMCPServer_PreservesLargeIntegerExactly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	const largeInteger = "9007199254740993"
+	seed := []byte(`{"unrelatedLargeInteger":` + largeInteger + `}`)
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp", "--memory-config"})
+	if err != nil || !changed {
+		t.Fatalf("WriteMCPServer changed=%v err=%v", changed, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"unrelatedLargeInteger": `+largeInteger) {
+		t.Fatalf("large integer was rounded during config rewrite: %s", got)
+	}
+}
+
 func TestClaudeConfigMutation_RefusesWrongShapeWithoutClobbering(t *testing.T) {
 	for _, tc := range []struct {
 		name string
