@@ -223,7 +223,7 @@ func ClaudeSettingsPath(homeDir string) string {
 // readJSONObject reads a JSON object file into a map, returning an empty map if
 // the file does not exist.
 func readJSONObject(path string) (map[string]any, error) {
-	data, err := os.ReadFile(path)
+	data, err := readClaudeConfigFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return map[string]any{}, nil
@@ -250,6 +250,46 @@ func readJSONObject(path string) (map[string]any, error) {
 		m = map[string]any{}
 	}
 	return m, nil
+}
+
+const maxClaudeConfigBytes = 8 << 20
+
+// readClaudeConfigFile refuses links and special files before opening, then
+// verifies that the opened descriptor still names the same regular path. This
+// prevents a FIFO from blocking configuration updates and avoids silently
+// severing a dotfile manager's symlink during the later atomic rename. Reads
+// are bounded so a corrupt file cannot cause an unbounded allocation.
+func readClaudeConfigFile(path string) ([]byte, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("Claude config is not a regular file")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("Claude config is not a regular file")
+	}
+	currentInfo, err := os.Lstat(path)
+	if err != nil || currentInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(openedInfo, currentInfo) {
+		return nil, fmt.Errorf("Claude config changed while opening")
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxClaudeConfigBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxClaudeConfigBytes {
+		return nil, fmt.Errorf("Claude config exceeds %d bytes", maxClaudeConfigBytes)
+	}
+	return data, nil
 }
 
 // writeJSONObject writes the map as indented JSON, creating parent dirs. The

@@ -129,7 +129,10 @@ type mcpBridge struct {
 	nodeID string
 }
 
-const maxMCPBackendResponseBytes = 10 << 20
+const (
+	maxMCPBackendResponseBytes = 10 << 20
+	mcpBridgeProtocolVersion   = "2025-03-26"
+)
 
 // bridgeStdout returns the JSON-RPC transport writer -- see the stdout
 // field's doc comment for why this must NOT simply read os.Stdout at write
@@ -431,7 +434,7 @@ func (b *mcpBridge) handleInitialize(req *jsonRPCRequest) {
 // fallback when the backend is unreachable.
 func (b *mcpBridge) writeLocalInitializeResult(id json.RawMessage) {
 	result := map[string]interface{}{
-		"protocolVersion": "2025-03-26",
+		"protocolVersion": mcpBridgeProtocolVersion,
 		"capabilities": map[string]interface{}{
 			"tools": map[string]interface{}{},
 		},
@@ -703,8 +706,24 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
-	defer httpResp.Body.Close()
 	responseSession := httpResp.Header.Get("Mcp-Session-Id")
+	responseAccepted := false
+	// The backend can allocate or rotate a session before its response has
+	// proved usable. Keep the prior session untouched until validation passes;
+	// on every failure, close a distinct candidate after releasing this body.
+	defer func() {
+		_ = httpResp.Body.Close()
+		if !responseAccepted && responseSession != "" && responseSession != b.sessionID {
+			b.deleteBackendSession(responseSession)
+		}
+	}()
+	commitResponseSession := func() {
+		if responseSession != "" {
+			b.sessionID = responseSession
+			Debug("MCP: backend session established")
+		}
+		responseAccepted = true
+	}
 
 	// 200 = success with body, 202 = accepted (notifications), both are OK.
 	if httpResp.StatusCode != http.StatusOK && httpResp.StatusCode != http.StatusAccepted {
@@ -712,13 +731,6 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 		safeBody := string(b.redactBackendPayload(body, responseSession))
 		Debug("MCP: backend returned %d: %s", httpResp.StatusCode, safeBody)
 		return nil, fmt.Errorf("backend returned HTTP %d: %s", httpResp.StatusCode, truncate(safeBody, 200))
-	}
-
-	// Only a successful protocol response may establish or rotate the session.
-	// An error response's headers must not poison the next request.
-	if responseSession != "" {
-		b.sessionID = responseSession
-		Debug("MCP: backend session established")
 	}
 
 	// 202 Accepted is valid only for notifications. A correlated JSON-RPC
@@ -729,14 +741,30 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 		if idErr != nil || !isNotification {
 			return nil, fmt.Errorf("backend returned HTTP 202 for a JSON-RPC request")
 		}
+		commitResponseSession()
 		return nil, nil
 	}
 
 	contentType := httpResp.Header.Get("Content-Type")
-	Debug("MCP: response Content-Type: %s", memory.RedactSensitiveText(contentType, b.apiKey, b.sessionID))
+	Debug("MCP: response Content-Type: %s", memory.RedactSensitiveText(contentType, b.apiKey, b.sessionID, responseSession))
+	isNotification, idErr := classifyJSONRPCRequestID(req.ID)
+	if idErr != nil {
+		return nil, fmt.Errorf("invalid forwarded JSON-RPC id: %w", idErr)
+	}
+	strictResponse := !isNotification
 
 	if strings.Contains(contentType, "text/event-stream") {
-		return b.parseSSEResponseExpected(httpResp.Body, req.ID, b.remoteToolAllowlist != nil)
+		body, err := b.parseSSEResponseExpected(httpResp.Body, req.ID, strictResponse, responseSession)
+		if err != nil {
+			return nil, err
+		}
+		if req.Method == "initialize" {
+			if err := validateBackendInitializeResponse(body, req); err != nil {
+				return nil, err
+			}
+		}
+		commitResponseSession()
+		return body, nil
 	}
 
 	// Plain JSON response.
@@ -747,12 +775,17 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 	if len(body) > maxMCPBackendResponseBytes {
 		return nil, fmt.Errorf("backend response exceeds %d bytes", maxMCPBackendResponseBytes)
 	}
-	body = b.redactBackendPayload(body)
-	if b.remoteToolAllowlist != nil && len(req.ID) > 0 && string(req.ID) != "null" {
+	body = b.redactBackendPayload(body, responseSession)
+	if req.Method == "initialize" {
+		if err := validateBackendInitializeResponse(body, req); err != nil {
+			return nil, err
+		}
+	} else if strictResponse {
 		if err := validateBackendRPCResponse(body, req.ID); err != nil {
 			return nil, err
 		}
 	}
+	commitResponseSession()
 	return body, nil
 }
 
@@ -767,7 +800,19 @@ func (b *mcpBridge) backendEndpointURL() string {
 // client disconnects. It is deliberately best-effort and tightly bounded;
 // process shutdown must not hang or emit protocol noise to stdout.
 func (b *mcpBridge) closeBackendSession() {
-	if b.sessionID == "" || b.apiKey == "" || b.httpClient == nil {
+	if b.sessionID == "" {
+		return
+	}
+	session := b.sessionID
+	b.deleteBackendSession(session)
+	b.sessionID = ""
+}
+
+// deleteBackendSession releases one exact session without mutating the
+// bridge's committed session. This is used to discard an unvalidated response
+// candidate while preserving the prior usable session.
+func (b *mcpBridge) deleteBackendSession(session string) {
+	if session == "" || b.apiKey == "" || b.httpClient == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -778,14 +823,13 @@ func (b *mcpBridge) closeBackendSession() {
 	}
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+b.apiKey)
-	req.Header.Set("Mcp-Session-Id", b.sessionID)
+	req.Header.Set("Mcp-Session-Id", session)
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	_ = resp.Body.Close()
-	b.sessionID = ""
 }
 
 func validateBackendRPCResponse(data, expectedID json.RawMessage) error {
@@ -812,6 +856,36 @@ func validateBackendRPCResponse(data, expectedID json.RawMessage) error {
 	return nil
 }
 
+func validateBackendInitializeResponse(data []byte, req *jsonRPCRequest) error {
+	if err := validateBackendRPCResponse(data, req.ID); err != nil {
+		return err
+	}
+	requestedVersion := mcpBridgeProtocolVersion
+	if len(bytes.TrimSpace(req.Params)) > 0 {
+		var params struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return fmt.Errorf("decode initialize request: %w", err)
+		}
+		if params.ProtocolVersion != "" {
+			requestedVersion = params.ProtocolVersion
+		}
+	}
+	var resp struct {
+		Result struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("decode initialize response: %w", err)
+	}
+	if resp.Result.ProtocolVersion != requestedVersion {
+		return fmt.Errorf("backend initialize protocol version %q does not match requested %q", resp.Result.ProtocolVersion, requestedVersion)
+	}
+	return nil
+}
+
 // parseSSEResponse reads an SSE stream and extracts JSON-RPC messages from
 // "data:" lines within "event: message" frames. Returns the last JSON-RPC
 // response or error message found (the final result for this request).
@@ -819,7 +893,7 @@ func (b *mcpBridge) parseSSEResponse(body io.Reader) ([]byte, error) {
 	return b.parseSSEResponseExpected(body, nil, false)
 }
 
-func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.RawMessage, strict bool) ([]byte, error) {
+func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.RawMessage, strict bool, extraSensitive ...string) ([]byte, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
@@ -843,7 +917,7 @@ func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.Raw
 				continue
 			}
 
-			data = string(b.redactBackendPayload([]byte(data)))
+			data = string(b.redactBackendPayload([]byte(data), extraSensitive...))
 			Debug("MCP: SSE data: %s", truncate(data, 200))
 			candidate := []byte(data)
 			if strict {

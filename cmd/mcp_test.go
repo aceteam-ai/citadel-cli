@@ -440,6 +440,194 @@ func TestMCPBridge_ClosesBackendSessionWithoutProtocolOutput(t *testing.T) {
 	}
 }
 
+func TestMemoryBridge_InvalidInitializeReleasesCandidateSession(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		body        string
+		wantError   string
+	}{
+		{
+			name:        "malformed JSON",
+			contentType: "application/json",
+			body:        `{"jsonrpc":"2.0","id":1,"result":`,
+			wantError:   "decode JSON-RPC response",
+		},
+		{
+			name:        "malformed SSE",
+			contentType: "text/event-stream",
+			body:        "event: message\ndata: {not-json}\n\n",
+			wantError:   "decode JSON-RPC response",
+		},
+		{
+			name:        "protocol mismatch",
+			contentType: "application/json",
+			body:        `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2099-01-01"}}`,
+			wantError:   "protocol version",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const candidate = "candidate-session"
+			var deleted []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					deleted = append(deleted, r.Header.Get("Mcp-Session-Id"))
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				w.Header().Set("Mcp-Session-Id", candidate)
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+
+			b := &mcpBridge{
+				apiKey:              "scoped-key",
+				endpointURL:         srv.URL,
+				httpClient:          srv.Client(),
+				remoteToolAllowlist: map[string]struct{}{"memory_search": {}},
+			}
+			_, err := b.forwardToBackend(&jsonRPCRequest{
+				JSONRPC: "2.0",
+				ID:      json.RawMessage(`1`),
+				Method:  "initialize",
+				Params:  json.RawMessage(`{"protocolVersion":"2025-03-26"}`),
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error=%v, want %q", err, tc.wantError)
+			}
+			if b.sessionID != "" {
+				t.Fatalf("invalid initialize committed candidate session %q", b.sessionID)
+			}
+			if len(deleted) != 1 || deleted[0] != candidate {
+				t.Fatalf("candidate session cleanup=%v, want [%s]", deleted, candidate)
+			}
+		})
+	}
+}
+
+func TestMemoryBridge_InitializeFallbackDoesNotRetainCandidateSession(t *testing.T) {
+	const candidate = "fallback-candidate-session"
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.Header.Get("Mcp-Session-Id"))
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Mcp-Session-Id", candidate)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":`)
+	}))
+	defer srv.Close()
+
+	var out bytes.Buffer
+	b := &mcpBridge{
+		apiKey:              "scoped-key",
+		endpointURL:         srv.URL,
+		httpClient:          srv.Client(),
+		stdout:              &out,
+		remoteToolAllowlist: map[string]struct{}{"memory_search": {}},
+	}
+	b.handleInitialize(&jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(`1`),
+		Method:  "initialize",
+		Params:  json.RawMessage(`{"protocolVersion":"2025-03-26"}`),
+	})
+	if b.sessionID != "" {
+		t.Fatalf("fallback retained rejected candidate %q", b.sessionID)
+	}
+	if len(deleted) != 1 || deleted[0] != candidate {
+		t.Fatalf("fallback candidate cleanup=%v, want [%s]", deleted, candidate)
+	}
+	var response struct {
+		Result struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatalf("fallback response is not JSON: %q: %v", out.String(), err)
+	}
+	if response.Result.ProtocolVersion != mcpBridgeProtocolVersion {
+		t.Fatalf("fallback protocol=%q, want %q", response.Result.ProtocolVersion, mcpBridgeProtocolVersion)
+	}
+}
+
+func TestMemoryBridge_InvalidRotationRestoresPriorSession(t *testing.T) {
+	const (
+		prior     = "prior-session"
+		candidate = "rotated-session"
+	)
+	var requestSession string
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.Header.Get("Mcp-Session-Id"))
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		requestSession = r.Header.Get("Mcp-Session-Id")
+		w.Header().Set("Mcp-Session-Id", candidate)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":99,"result":{}}`)
+	}))
+	defer srv.Close()
+
+	b := &mcpBridge{
+		apiKey:      "scoped-key",
+		endpointURL: srv.URL,
+		httpClient:  srv.Client(),
+		sessionID:   prior,
+	}
+	_, err := b.forwardToBackend(&jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`2`), Method: "tools/list"})
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("expected response validation error, got %v", err)
+	}
+	if requestSession != prior {
+		t.Fatalf("request session=%q, want prior %q", requestSession, prior)
+	}
+	if b.sessionID != prior {
+		t.Fatalf("invalid rotation replaced prior session: %q", b.sessionID)
+	}
+	if len(deleted) != 1 || deleted[0] != candidate {
+		t.Fatalf("rotated candidate cleanup=%v, want [%s]", deleted, candidate)
+	}
+}
+
+func TestMemoryBridge_ValidRotationCommitsCandidateSession(t *testing.T) {
+	const candidate = "rotated-session"
+	var deletes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletes++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Mcp-Session-Id", candidate)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":2,"result":{}}`)
+	}))
+	defer srv.Close()
+
+	b := &mcpBridge{
+		apiKey:              "scoped-key",
+		endpointURL:         srv.URL,
+		httpClient:          srv.Client(),
+		sessionID:           "prior-session",
+		remoteToolAllowlist: map[string]struct{}{"memory_search": {}},
+	}
+	if _, err := b.forwardToBackend(&jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`2`), Method: "tools/list"}); err != nil {
+		t.Fatal(err)
+	}
+	if b.sessionID != candidate {
+		t.Fatalf("valid rotation session=%q, want %q", b.sessionID, candidate)
+	}
+	if deletes != 0 {
+		t.Fatalf("valid candidate was deleted %d times", deletes)
+	}
+}
+
 func TestMCPBridgeForwardToBackendSSE(t *testing.T) {
 	server, _, _ := newMockMCPServer(true)
 	defer server.Close()

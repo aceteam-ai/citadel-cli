@@ -139,6 +139,60 @@ func TestWriteMCPServer_PreservesLargeIntegerExactly(t *testing.T) {
 	}
 }
 
+func TestClaudeConfigMutation_RejectsSymlinkWithoutReplacingIt(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "managed.json")
+	path := filepath.Join(dir, ".claude.json")
+	before := []byte(`{"managed":true}`)
+	if err := os.WriteFile(target, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"}); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("managed symlink was not rejected: %v", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("managed symlink was severed: info=%v err=%v", info, err)
+	}
+	after, err := os.ReadFile(target)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("managed target changed: got=%q err=%v", after, err)
+	}
+}
+
+func TestClaudeConfigMutation_RejectsOversizedAndSpecialFiles(t *testing.T) {
+	t.Run("oversized", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), ".claude.json")
+		const hostileClaudeConfigBytes = (8 << 20) + 1
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(hostileClaudeConfigBytes); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		_ = f.Close()
+		if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"}); err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("oversized config was not rejected: %v", err)
+		}
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), ".claude.json")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"}); err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("special config was not rejected: %v", err)
+		}
+	})
+}
+
 func TestClaudeConfigMutation_RefusesWrongShapeWithoutClobbering(t *testing.T) {
 	for _, tc := range []struct {
 		name string
