@@ -38,6 +38,8 @@ type fakeHuddleBrowser struct {
 	evalCalls       int
 	closed          bool
 	closeErr        error
+	closeErrors     []error
+	closeCalls      int
 	blockNavigate   bool
 	blockEvaluate   bool
 	navigateStarted chan struct{}
@@ -92,6 +94,12 @@ func (f *fakeHuddleBrowser) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = true
+	f.closeCalls++
+	if len(f.closeErrors) > 0 {
+		err := f.closeErrors[0]
+		f.closeErrors = f.closeErrors[1:]
+		return err
+	}
 	return f.closeErr
 }
 
@@ -697,10 +705,45 @@ func TestHuddleJoin_CancellationInterruptsBlockedEvaluateAndCleansUp(t *testing.
 func TestHuddleJoin_SuccessRequiresCleanup(t *testing.T) {
 	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}, closeErr: errors.New("delete returned 500")}
 	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
+	terminalCalls := 0
+	h.reportTerminal = func(context.Context, *url.URL, huddleToken, string, string) error {
+		terminalCalls++
+		return nil
+	}
 
 	_, err := h.Execute(JobContext{}, huddleJob())
 	if err == nil || !strings.Contains(err.Error(), "cleanup failed") || !strings.Contains(err.Error(), "delete returned 500") {
 		t.Fatalf("Execute error = %v, want cleanup failure", err)
+	}
+	if br.closeCalls != 2 {
+		t.Fatalf("cleanup attempts = %d, want bounded explicit + deferred retry", br.closeCalls)
+	}
+	if terminalCalls != 0 {
+		t.Fatalf("terminal reports = %d, want cleanup debt retained", terminalCalls)
+	}
+}
+
+func TestHuddleJoin_TransientCleanupFailureReportsOnlyAfterConfirmedRetry(t *testing.T) {
+	br := &fakeHuddleBrowser{
+		states:      []string{stateJSON("joined", huddleTestAgentID, 1, 1)},
+		closeErrors: []error{errors.New("delete returned 500"), nil},
+	}
+	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
+	var terminalStatus string
+	h.reportTerminal = func(_ context.Context, _ *url.URL, _ huddleToken, status, _ string) error {
+		terminalStatus = status
+		return nil
+	}
+
+	_, err := h.Execute(JobContext{}, huddleJob())
+	if err == nil || !strings.Contains(err.Error(), "cleanup failed") {
+		t.Fatalf("Execute error = %v, want first cleanup failure", err)
+	}
+	if br.closeCalls != 2 {
+		t.Fatalf("cleanup attempts = %d, want explicit + deferred retry", br.closeCalls)
+	}
+	if terminalStatus != "failed" {
+		t.Fatalf("terminal status = %q, want failed after confirmed teardown", terminalStatus)
 	}
 }
 

@@ -240,7 +240,15 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 	if err := validateHuddleToken(tok, p); err != nil {
 		return nil, fmt.Errorf("mint huddle bot token: %w", err)
 	}
+	nodeTeardownConfirmed := true
 	defer func() {
+		// A terminal report is also the server's proof that this exact node
+		// session is gone. If meetingd teardown is still unconfirmed, leave the
+		// attempt indexed so durable server cleanup cannot be discarded.
+		if !nodeTeardownConfirmed {
+			ctx.Log("error", "     - [Job %s] retaining huddle lifecycle cleanup debt: node teardown is unconfirmed", job.ID)
+			return
+		}
 		status := "completed"
 		detail := ""
 		if err != nil {
@@ -275,6 +283,7 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 	if err != nil {
 		return nil, fmt.Errorf("launch huddle browser: %w", err)
 	}
+	nodeTeardownConfirmed = false
 	cleaned := false
 	defer func() {
 		if cleanup != nil && !cleaned {
@@ -282,6 +291,9 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 			defer cancel()
 			if cleanupErr := cleanup(cleanupCtx); cleanupErr != nil {
 				ctx.Log("error", "     - [Job %s] huddle session cleanup failed after job error: %v", job.ID, cleanupErr)
+			} else {
+				cleaned = true
+				nodeTeardownConfirmed = true
 			}
 		}
 	}()
@@ -332,10 +344,11 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), meetingContainerHTTPTimeout)
 		cleanupErr := cleanup(cleanupCtx)
 		cancel()
-		cleaned = true
 		if cleanupErr != nil {
 			return nil, fmt.Errorf("huddle joined but session cleanup failed: %w", cleanupErr)
 		}
+		cleaned = true
+		nodeTeardownConfirmed = true
 	}
 
 	out, _ := json.Marshal(map[string]any{
