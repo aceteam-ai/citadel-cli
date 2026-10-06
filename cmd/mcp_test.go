@@ -339,8 +339,8 @@ func TestMCPBridgeSuppressesRequestMethodNotifications(t *testing.T) {
 	if out.Len() != 0 {
 		t.Fatalf("notifications produced responses: %s", out.String())
 	}
-	if backendHits != 1 {
-		t.Fatalf("backend hits=%d, want only notifications/initialized forwarded", backendHits)
+	if backendHits != 0 {
+		t.Fatalf("backend hits=%d, want pre-initialize notifications suppressed", backendHits)
 	}
 }
 
@@ -506,7 +506,7 @@ func TestMemoryBridge_InvalidInitializeReleasesCandidateSession(t *testing.T) {
 	}
 }
 
-func TestMemoryBridge_InitializeFallbackDoesNotRetainCandidateSession(t *testing.T) {
+func TestMemoryBridge_InitializeFailureDoesNotFallbackOrRetainCandidateSession(t *testing.T) {
 	const candidate = "fallback-candidate-session"
 	var deleted []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -542,15 +542,13 @@ func TestMemoryBridge_InitializeFallbackDoesNotRetainCandidateSession(t *testing
 		t.Fatalf("fallback candidate cleanup=%v, want [%s]", deleted, candidate)
 	}
 	var response struct {
-		Result struct {
-			ProtocolVersion string `json:"protocolVersion"`
-		} `json:"result"`
+		Error *jsonRPCError `json:"error"`
 	}
 	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
-		t.Fatalf("fallback response is not JSON: %q: %v", out.String(), err)
+		t.Fatalf("failure response is not JSON: %q: %v", out.String(), err)
 	}
-	if response.Result.ProtocolVersion != mcpBridgeProtocolVersion {
-		t.Fatalf("fallback protocol=%q, want %q", response.Result.ProtocolVersion, mcpBridgeProtocolVersion)
+	if response.Error == nil || !strings.Contains(response.Error.Message, "Backend initialization failed") {
+		t.Fatalf("memory bridge incorrectly fell back: %s", out.String())
 	}
 }
 
@@ -1155,5 +1153,91 @@ func TestBridgeToolsCallTimeoutRespondsOnStableWriter(t *testing.T) {
 	}
 	if !strings.Contains(out, `"isError":true`) {
 		t.Errorf("expected isError:true in the response, got: %q", out)
+	}
+}
+
+func TestMemoryBridge_RequiresCompleteInitializeLifecycle(t *testing.T) {
+	var toolCalls, listCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var req jsonRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "memory-session")
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"test","version":"1"}}}`, req.ID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			listCalls++
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}`, req.ID)
+		case "tools/call":
+			toolCalls++
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}`, req.ID)
+		}
+	}))
+	defer srv.Close()
+
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin; _ = r.Close() })
+	lines := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_search","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_search","arguments":{}}}`,
+	}
+	for _, line := range lines {
+		_, _ = io.WriteString(w, line+"\n")
+	}
+	_ = w.Close()
+
+	var out bytes.Buffer
+	b := &mcpBridge{
+		apiKey: "act_scoped", endpointURL: srv.URL, httpClient: srv.Client(), stdout: &out,
+		remoteToolAllowlist: map[string]struct{}{"memory_search": {}, "memory_write": {}},
+	}
+	if err := b.run(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = oldStdin
+	if toolCalls != 1 || listCalls != 0 {
+		t.Fatalf("pre-initialize request reached backend: toolCalls=%d listCalls=%d", toolCalls, listCalls)
+	}
+	if strings.Count(out.String(), "MCP initialization required") != 2 || !strings.Contains(out.String(), `"id":4`) {
+		t.Fatalf("unexpected lifecycle output: %s", out.String())
+	}
+}
+
+func TestMCPBridge_BoundsAggregateSSEBeforeResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunk := strings.Repeat(": keepalive\n", 1024)
+		written := 0
+		for written <= maxMCPBackendResponseBytes {
+			n, err := io.WriteString(w, chunk)
+			written += n
+			if err != nil {
+				return
+			}
+		}
+		_, _ = io.WriteString(w, "event: message\n"+`data: {"jsonrpc":"2.0","id":7,"result":{}}`+"\n\n")
+	}))
+	defer srv.Close()
+	b := &mcpBridge{apiKey: "key", endpointURL: srv.URL, httpClient: srv.Client()}
+	_, err := b.forwardToBackend(&jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`7`), Method: "tools/list"})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("aggregate SSE cap not enforced: %v", err)
 	}
 }

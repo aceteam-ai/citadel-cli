@@ -86,7 +86,7 @@ func TestUninstallMemory_RequiresRemoteRevocationConfirmation(t *testing.T) {
 	if err := memory.Save(configDir, &memory.Config{APIKey: "act_existing"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := memory.WriteMCPServer(memory.ClaudeJSONPath(home), memory.MCPServerName, "/bin/citadel", []string{"mcp", "--memory-config"}); err != nil {
+	if _, err := memory.WriteMCPServer(memory.ClaudeJSONPath(home), memory.MCPServerName, "/bin/citadel", []string{"--no-auto-update", "mcp", "--memory-config"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := uninstallMemory(home, configDir, false); err == nil {

@@ -15,7 +15,7 @@ func TestClaudeConfigMutation_RejectsFIFOWithoutOpening(t *testing.T) {
 	if err := syscall.Mkfifo(path, 0o600); err != nil {
 		t.Skipf("mkfifo unavailable: %v", err)
 	}
-	if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"}); err == nil || !strings.Contains(err.Error(), "regular file") {
+	if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", managedMCPArgs); err == nil || !strings.Contains(err.Error(), "regular file") {
 		t.Fatalf("FIFO config was not rejected: %v", err)
 	}
 	info, err := os.Lstat(path)

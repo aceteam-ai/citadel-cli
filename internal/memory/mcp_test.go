@@ -294,6 +294,112 @@ func TestCallTool_InitializedNotificationFailureStopsCall(t *testing.T) {
 	}
 }
 
+func TestCallTool_RejectedRotationCleansCandidateAndPrior(t *testing.T) {
+	const (
+		prior     = "prior-session"
+		candidate = "candidate-session"
+	)
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.Header.Get("Mcp-Session-Id"))
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		method, _, _ := decodeReq(t, r)
+		switch method {
+		case "initialize":
+			writeInitialize(w, prior)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			w.Header().Set("Mcp-Session-Id", candidate)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":99,"result":{}}`)
+		}
+	}))
+	defer srv.Close()
+
+	_, err := NewMCPClient(srv.URL, "act_key", time.Second).CallTool(context.Background(), "memory_search", nil)
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("rejected rotation error=%v", err)
+	}
+	if len(deleted) != 2 || deleted[0] != candidate || deleted[1] != prior {
+		t.Fatalf("session cleanup=%v, want [%s %s]", deleted, candidate, prior)
+	}
+}
+
+func TestCallTool_RejectedInitializedRotationCleansCandidateAndPrior(t *testing.T) {
+	const (
+		prior     = "prior-session"
+		candidate = "candidate-session"
+	)
+	var deleted []string
+	var toolCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.Header.Get("Mcp-Session-Id"))
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		method, _, _ := decodeReq(t, r)
+		switch method {
+		case "initialize":
+			writeInitialize(w, prior)
+		case "notifications/initialized":
+			w.Header().Set("Mcp-Session-Id", candidate)
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, "rejected")
+		case "tools/call":
+			toolCalls++
+		}
+	}))
+	defer srv.Close()
+
+	_, err := NewMCPClient(srv.URL, "act_key", time.Second).CallTool(context.Background(), "memory_search", nil)
+	if err == nil || !strings.Contains(err.Error(), "initialized notification") {
+		t.Fatalf("notification rotation error=%v", err)
+	}
+	if toolCalls != 0 {
+		t.Fatalf("tools/call executed after rejected notification: %d", toolCalls)
+	}
+	if len(deleted) != 2 || deleted[0] != candidate || deleted[1] != prior {
+		t.Fatalf("session cleanup=%v, want [%s %s]", deleted, candidate, prior)
+	}
+}
+
+func TestCallTool_BoundsInitializedNotificationBody(t *testing.T) {
+	var deleted []string
+	var toolCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.Header.Get("Mcp-Session-Id"))
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		method, _, _ := decodeReq(t, r)
+		switch method {
+		case "initialize":
+			writeInitialize(w, "prior-session")
+		case "notifications/initialized":
+			w.Header().Set("Mcp-Session-Id", "candidate-session")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, strings.Repeat("x", maxMCPResponseBytes+1))
+		case "tools/call":
+			toolCalls++
+		}
+	}))
+	defer srv.Close()
+
+	_, err := NewMCPClient(srv.URL, "act_key", 3*time.Second).CallTool(context.Background(), "memory_search", nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized notification accepted: %v", err)
+	}
+	if toolCalls != 0 || len(deleted) != 2 {
+		t.Fatalf("toolCalls=%d cleanup=%v", toolCalls, deleted)
+	}
+}
+
 func TestParseRPCResponse_RequiresVersionAndMatchingID(t *testing.T) {
 	for _, tc := range []struct{ name, body, want string }{
 		{"missing id", `{"jsonrpc":"2.0","result":{}}`, "omitted id"},

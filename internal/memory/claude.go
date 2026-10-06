@@ -10,21 +10,25 @@ import (
 	"strings"
 )
 
-// Claude Code integration constants. The recall/capture hook commands are
-// matched by these markers for idempotency (re-running install must not add a
-// duplicate hook), independent of the absolute binary path prefix.
+// Claude Code integration constants. RecallMarker and CaptureMarker are exact
+// inert CLI ownership flags appended to commands installed by Citadel.
 const (
 	// MCPServerName is the key under mcpServers in ~/.claude.json.
 	MCPServerName = "aceteam-memory"
-	// RecallMarker / CaptureMarker identify our hooks for dedup.
-	RecallMarker  = "citadel memory recall"
-	CaptureMarker = "citadel memory capture"
+	RecallMarker  = "--citadel-memory-hook-owner=recall-v1"
+	CaptureMarker = "--citadel-memory-hook-owner=capture-v1"
 )
+
+var managedMCPArgs = []string{"--no-auto-update", "mcp", "--memory-config"}
 
 // WriteMCPServer registers (or updates) the local Citadel stdio bridge in
 // Claude Code's user-scoped ~/.claude.json. The bridge reads memory.yaml at
 // runtime, so the bearer credential has exactly one on-disk copy.
 func WriteMCPServer(claudeJSONPath, name, command string, args []string) (bool, error) {
+	entry := map[string]any{"type": "stdio", "command": command, "args": args}
+	if !isManagedMCPServer(entry) {
+		return false, fmt.Errorf("refusing non-Citadel MCP server shape")
+	}
 	return updateJSONObject(claudeJSONPath, func(root map[string]any) (bool, error) {
 		rawServers, exists := root["mcpServers"]
 		servers, ok := rawServers.(map[string]any)
@@ -34,9 +38,14 @@ func WriteMCPServer(claudeJSONPath, name, command string, args []string) (bool, 
 		if servers == nil {
 			servers = map[string]any{}
 		}
-		entry := map[string]any{"type": "stdio", "command": command, "args": args}
-		if existing, ok := servers[name].(map[string]any); ok && jsonEqual(existing, entry) {
-			return false, nil
+		if existingRaw, present := servers[name]; present {
+			existing, ok := existingRaw.(map[string]any)
+			if !ok || !isManagedMCPServer(existing) {
+				return false, fmt.Errorf("mcpServers.%s already exists and is not owned by Citadel", name)
+			}
+			if jsonEqual(existing, entry) {
+				return false, nil
+			}
 		}
 		servers[name] = entry
 		root["mcpServers"] = servers
@@ -56,8 +65,13 @@ func RemoveMCPServer(claudeJSONPath, name string) (bool, error) {
 		if servers == nil {
 			return false, nil
 		}
-		if _, ok := servers[name]; !ok {
+		existingRaw, present := servers[name]
+		if !present {
 			return false, nil
+		}
+		existing, ok := existingRaw.(map[string]any)
+		if !ok || !isManagedMCPServer(existing) {
+			return false, fmt.Errorf("mcpServers.%s is not owned by Citadel", name)
 		}
 		delete(servers, name)
 		root["mcpServers"] = servers
@@ -71,8 +85,8 @@ type hookGroup struct {
 	Hooks   []hookSpec `json:"hooks"`
 }
 
-// RemoveHook removes only command hooks containing marker from one event,
-// retaining unrelated hooks even when they share the same group.
+// RemoveHook removes only hooks carrying Citadel's exact ownership tag and
+// exact generated entry shape, retaining unrelated hooks in the same group.
 func RemoveHook(settingsPath, event, marker string) (bool, error) {
 	return updateJSONObject(settingsPath, func(root map[string]any) (bool, error) {
 		rawHooks, exists := root["hooks"]
@@ -92,7 +106,8 @@ func RemoveHook(settingsPath, event, marker string) (bool, error) {
 		keptGroups := make([]any, 0, len(groups))
 		for _, rawGroup := range groups {
 			group, ok := rawGroup.(map[string]any)
-			if !ok {
+			matcher, matcherOK := group["matcher"].(string)
+			if !ok || !matcherOK || matcher != "" {
 				keptGroups = append(keptGroups, rawGroup)
 				continue
 			}
@@ -104,8 +119,7 @@ func RemoveHook(settingsPath, event, marker string) (bool, error) {
 			keptEntries := make([]any, 0, len(entries))
 			for _, rawEntry := range entries {
 				entry, ok := rawEntry.(map[string]any)
-				command, _ := entry["command"].(string)
-				if ok && strings.Contains(command, marker) {
+				if ok && isManagedHookEntry(entry, marker) {
 					changed = true
 					continue
 				}
@@ -137,9 +151,14 @@ type hookSpec struct {
 
 // MergeHook additively appends a command hook for the given event to Claude
 // Code's ~/.claude/settings.json, preserving all existing hooks and settings.
-// It is idempotent: if any existing hook command for that event already
-// contains marker, nothing is written and changed=false is returned.
+// It is idempotent and updates only an entry carrying the exact ownership tag;
+// prose or unrelated commands containing similar words are never claimed.
 func MergeHook(settingsPath, event, command, marker string, timeout int) (bool, error) {
+	if marker != RecallMarker && marker != CaptureMarker {
+		return false, fmt.Errorf("unknown Citadel hook marker")
+	}
+	managedCommand := strings.TrimSpace(command) + " " + marker
+	desired := map[string]any{"type": "command", "command": managedCommand, "timeout": timeout}
 	return updateJSONObject(settingsPath, func(root map[string]any) (bool, error) {
 		rawHooks, exists := root["hooks"]
 		hooks, ok := rawHooks.(map[string]any)
@@ -160,15 +179,38 @@ func MergeHook(settingsPath, event, command, marker string, timeout int) (bool, 
 			}
 		}
 
-		// Idempotency: bail if marker already present in any command for this event.
-		if hookMarkerPresent(groups, marker) {
-			return false, nil
+		// Update only a provably Citadel-owned entry. This supports binary path
+		// changes without ever overwriting a user's same-name hook.
+		for _, rawGroup := range groups {
+			group, ok := rawGroup.(map[string]any)
+			matcher, matcherOK := group["matcher"].(string)
+			if !ok || !matcherOK || matcher != "" {
+				continue
+			}
+			entries, ok := group["hooks"].([]any)
+			if !ok {
+				continue
+			}
+			for i, rawEntry := range entries {
+				entry, ok := rawEntry.(map[string]any)
+				if !ok || !isManagedHookEntry(entry, marker) {
+					continue
+				}
+				if jsonEqual(entry, desired) {
+					return false, nil
+				}
+				entries[i] = desired
+				group["hooks"] = entries
+				hooks[event] = groups
+				root["hooks"] = hooks
+				return true, nil
+			}
 		}
 
 		newGroup := map[string]any{
 			"matcher": "",
 			"hooks": []any{
-				map[string]any{"type": "command", "command": command, "timeout": timeout},
+				desired,
 			},
 		}
 		groups = append(groups, newGroup)
@@ -179,16 +221,16 @@ func MergeHook(settingsPath, event, command, marker string, timeout int) (bool, 
 	})
 }
 
-// hookMarkerPresent reports whether any hook command in the event groups
-// contains the marker substring.
+// hookMarkerPresent reports whether an exact Citadel-owned hook is present.
 func hookMarkerPresent(groups []any, marker string) bool {
 	for _, g := range groups {
 		gm, ok := g.(map[string]any)
 		if !ok {
 			continue
 		}
+		matcher, matcherOK := gm["matcher"].(string)
 		inner, ok := gm["hooks"].([]any)
-		if !ok {
+		if !ok || !matcherOK || matcher != "" {
 			continue
 		}
 		for _, h := range inner {
@@ -196,12 +238,54 @@ func hookMarkerPresent(groups []any, marker string) bool {
 			if !ok {
 				continue
 			}
-			if cmd, ok := hm["command"].(string); ok && strings.Contains(cmd, marker) {
+			if isManagedHookEntry(hm, marker) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func isManagedHookEntry(entry map[string]any, marker string) bool {
+	if marker != RecallMarker && marker != CaptureMarker || len(entry) != 3 {
+		return false
+	}
+	typeValue, typeOK := entry["type"].(string)
+	command, commandOK := entry["command"].(string)
+	if !typeOK || typeValue != "command" || !commandOK ||
+		!strings.HasSuffix(command, " "+marker) || strings.TrimSuffix(command, " "+marker) == "" {
+		return false
+	}
+	switch timeout := entry["timeout"].(type) {
+	case json.Number:
+		value, err := timeout.Int64()
+		return err == nil && value > 0
+	case int:
+		return timeout > 0
+	case float64:
+		return timeout > 0 && timeout == float64(int64(timeout))
+	default:
+		return false
+	}
+}
+
+func isManagedMCPServer(entry map[string]any) bool {
+	if len(entry) != 3 || entry["type"] != "stdio" {
+		return false
+	}
+	command, ok := entry["command"].(string)
+	if !ok || command == "" {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(command))
+	if base != "citadel" && base != "citadel.exe" {
+		return false
+	}
+	rawArgs, ok := entry["args"]
+	if !ok {
+		return false
+	}
+	return jsonEqual(rawArgs, managedMCPArgs)
 }
 
 // DetectClaudeCode reports whether Claude Code appears installed for the user

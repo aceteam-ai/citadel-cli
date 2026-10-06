@@ -30,6 +30,8 @@ var (
 	memoryCaptureName        string
 	memoryCaptureScope       string
 	memoryCaptureDesc        string
+	memoryRecallHookOwner    string
+	memoryCaptureHookOwner   string
 )
 
 var memoryCmd = &cobra.Command{
@@ -549,4 +551,8 @@ func init() {
 	memoryCaptureCmd.Flags().StringVar(&memoryCaptureName, "name", "", "Memory slug (default: stable hash of the Claude session ID)")
 	memoryCaptureCmd.Flags().StringVar(&memoryCaptureScope, "scope", "", "Memory scope to write (project name or 'global'; default: global)")
 	memoryCaptureCmd.Flags().StringVar(&memoryCaptureDesc, "description", "", "Short description for the memory frontmatter")
+	memoryRecallCmd.Flags().StringVar(&memoryRecallHookOwner, "citadel-memory-hook-owner", "", "Citadel-managed hook ownership marker")
+	memoryCaptureCmd.Flags().StringVar(&memoryCaptureHookOwner, "citadel-memory-hook-owner", "", "Citadel-managed hook ownership marker")
+	_ = memoryRecallCmd.Flags().MarkHidden("citadel-memory-hook-owner")
+	_ = memoryCaptureCmd.Flags().MarkHidden("citadel-memory-hook-owner")
 }

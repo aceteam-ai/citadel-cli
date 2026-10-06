@@ -118,6 +118,54 @@ func TestWriteMCPServer_Idempotent(t *testing.T) {
 	}
 }
 
+func TestWriteAndRemoveMCPServer_RefuseUnownedSameNameEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	userEntry := map[string]any{"type": "http", "url": "https://user.example/mcp"}
+	seed, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{MCPServerName: userEntry}})
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+
+	if changed, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", managedMCPArgs); err == nil || changed {
+		t.Fatalf("unowned collision accepted: changed=%v err=%v", changed, err)
+	}
+	afterWrite, _ := os.ReadFile(path)
+	if string(afterWrite) != string(before) {
+		t.Fatalf("unowned entry changed during install: before=%s after=%s", before, afterWrite)
+	}
+	if changed, err := RemoveMCPServer(path, MCPServerName); err == nil || changed {
+		t.Fatalf("unowned replacement removed: changed=%v err=%v", changed, err)
+	}
+	afterRemove, _ := os.ReadFile(path)
+	if string(afterRemove) != string(before) {
+		t.Fatalf("unowned entry changed during uninstall: before=%s after=%s", before, afterRemove)
+	}
+}
+
+func TestRemoveMCPServer_RefusesUserReplacementAfterInstall(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", managedMCPArgs); err != nil {
+		t.Fatal(err)
+	}
+	root := readJSON(t, path)
+	root["mcpServers"].(map[string]any)[MCPServerName] = map[string]any{
+		"type": "stdio", "command": "/bin/user-memory", "args": managedMCPArgs,
+	}
+	data, _ := json.Marshal(root)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+	if changed, err := RemoveMCPServer(path, MCPServerName); err == nil || changed {
+		t.Fatalf("user replacement removed: changed=%v err=%v", changed, err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatalf("user replacement changed: before=%s after=%s", before, after)
+	}
+}
+
 func TestWriteMCPServer_PreservesLargeIntegerExactly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".claude.json")
 	const largeInteger = "9007199254740993"
@@ -126,7 +174,7 @@ func TestWriteMCPServer_PreservesLargeIntegerExactly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changed, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp", "--memory-config"})
+	changed, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", managedMCPArgs)
 	if err != nil || !changed {
 		t.Fatalf("WriteMCPServer changed=%v err=%v", changed, err)
 	}
@@ -151,7 +199,7 @@ func TestClaudeConfigMutation_RejectsSymlinkWithoutReplacingIt(t *testing.T) {
 		t.Skipf("symlink unavailable: %v", err)
 	}
 
-	if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"}); err == nil || !strings.Contains(err.Error(), "regular file") {
+	if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", managedMCPArgs); err == nil || !strings.Contains(err.Error(), "regular file") {
 		t.Fatalf("managed symlink was not rejected: %v", err)
 	}
 	info, err := os.Lstat(path)
@@ -177,7 +225,7 @@ func TestClaudeConfigMutation_RejectsOversizedAndSpecialFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = f.Close()
-		if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"}); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", managedMCPArgs); err == nil || !strings.Contains(err.Error(), "exceeds") {
 			t.Fatalf("oversized config was not rejected: %v", err)
 		}
 	})
@@ -187,7 +235,7 @@ func TestClaudeConfigMutation_RejectsOversizedAndSpecialFiles(t *testing.T) {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"}); err == nil || !strings.Contains(err.Error(), "regular file") {
+		if _, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", managedMCPArgs); err == nil || !strings.Contains(err.Error(), "regular file") {
 			t.Fatalf("special config was not rejected: %v", err)
 		}
 	})
@@ -203,7 +251,7 @@ func TestClaudeConfigMutation_RefusesWrongShapeWithoutClobbering(t *testing.T) {
 			name: "mcpServers is array",
 			seed: `{"theme":"dark","mcpServers":[{"future":"shape"}]}`,
 			run: func(path string) error {
-				_, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", []string{"mcp"})
+				_, err := WriteMCPServer(path, MCPServerName, "/bin/citadel", managedMCPArgs)
 				return err
 			},
 		},
@@ -248,7 +296,7 @@ func TestRemoveMCPServer_PreservesUnrelatedServers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".claude.json")
 	seed := map[string]any{"mcpServers": map[string]any{
-		MCPServerName: map[string]any{"type": "stdio", "command": "citadel"},
+		MCPServerName: map[string]any{"type": "stdio", "command": "citadel", "args": managedMCPArgs},
 		"other":       map[string]any{"type": "http", "url": "https://example.test/mcp"},
 	}}
 	data, _ := json.Marshal(seed)
@@ -308,25 +356,62 @@ func TestMergeHook_AdditiveAndIdempotent(t *testing.T) {
 		t.Fatalf("expected 2 hook groups (existing + ours), got %d", len(groups))
 	}
 	// Existing hook still present.
-	if !hookMarkerPresent(groups, "bash existing.sh") {
+	encodedGroups, _ := json.Marshal(groups)
+	if !strings.Contains(string(encodedGroups), "bash existing.sh") {
 		t.Fatal("existing hook was clobbered")
 	}
 	if !hookMarkerPresent(groups, RecallMarker) {
 		t.Fatal("recall hook not added")
 	}
 
-	// Idempotency: re-merge with a DIFFERENT binary path but same marker.
+	// A provably owned hook may be updated when the Citadel binary moves.
 	changed, err = MergeHook(path, "UserPromptSubmit", "/opt/citadel memory recall", RecallMarker, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changed {
-		t.Fatal("expected changed=false; marker already present")
+	if !changed {
+		t.Fatal("expected changed=true when updating an owned binary path")
 	}
 	got = readJSON(t, path)
 	groups = got["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
 	if len(groups) != 2 {
 		t.Fatalf("re-merge duplicated hook: got %d groups", len(groups))
+	}
+	encodedGroups, _ = json.Marshal(groups)
+	if !strings.Contains(string(encodedGroups), "/opt/citadel memory recall") {
+		t.Fatalf("owned hook path was not updated: %s", encodedGroups)
+	}
+}
+
+func TestHookOwnershipRequiresExactManagedTagAndShape(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	unrelated := "printf 'citadel memory recall and " + RecallMarker + " are prose'"
+	seed := map[string]any{"hooks": map[string]any{"UserPromptSubmit": []any{map[string]any{
+		"matcher": "",
+		"hooks":   []any{map[string]any{"type": "command", "command": unrelated, "timeout": 10}},
+	}}}}
+	data, _ := json.Marshal(seed)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := MergeHook(path, "UserPromptSubmit", "/bin/citadel memory recall --no-auto-update", RecallMarker, 10)
+	if err != nil || !changed {
+		t.Fatalf("unrelated prose suppressed install: changed=%v err=%v", changed, err)
+	}
+	groups := readJSON(t, path)["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
+	if len(groups) != 2 || !hookMarkerPresent(groups, RecallMarker) {
+		t.Fatalf("managed hook missing after collision: %#v", groups)
+	}
+
+	changed, err = RemoveHook(path, "UserPromptSubmit", RecallMarker)
+	if err != nil || !changed {
+		t.Fatalf("managed hook removal failed: changed=%v err=%v", changed, err)
+	}
+	groups = readJSON(t, path)["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
+	encoded, _ := json.Marshal(groups)
+	if !strings.Contains(string(encoded), "are prose") || hookMarkerPresent(groups, RecallMarker) {
+		t.Fatalf("uninstall removed unrelated hook or retained managed hook: %s", encoded)
 	}
 }
 
@@ -336,7 +421,7 @@ func TestRemoveHook_PreservesOtherEntriesInGroup(t *testing.T) {
 	seed := map[string]any{"hooks": map[string]any{"SessionEnd": []any{map[string]any{
 		"matcher": "",
 		"hooks": []any{
-			map[string]any{"type": "command", "command": "/bin/citadel memory capture --no-auto-update"},
+			map[string]any{"type": "command", "command": "/bin/citadel memory capture --no-auto-update " + CaptureMarker, "timeout": 15},
 			map[string]any{"type": "command", "command": "other cleanup"},
 		},
 	}}}}
@@ -349,7 +434,8 @@ func TestRemoveHook_PreservesOtherEntriesInGroup(t *testing.T) {
 		t.Fatalf("RemoveHook changed=%v err=%v", changed, err)
 	}
 	groups := readJSON(t, path)["hooks"].(map[string]any)["SessionEnd"].([]any)
-	if hookMarkerPresent(groups, CaptureMarker) || !hookMarkerPresent(groups, "other cleanup") {
+	encodedGroups, _ := json.Marshal(groups)
+	if hookMarkerPresent(groups, CaptureMarker) || !strings.Contains(string(encodedGroups), "other cleanup") {
 		t.Fatalf("unexpected remaining groups: %#v", groups)
 	}
 }

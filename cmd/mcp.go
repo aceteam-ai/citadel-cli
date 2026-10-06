@@ -100,6 +100,10 @@ type mcpBridge struct {
 	// normal general-purpose bridge; a non-nil map is enforced locally before
 	// any authenticated request reaches the backend.
 	remoteToolAllowlist map[string]struct{}
+	// Credential-scoped memory bridges fail closed until the complete MCP
+	// initialize -> notifications/initialized lifecycle succeeds upstream.
+	initializeAccepted bool
+	initialized        bool
 
 	// stdout is the JSON-RPC transport writer, captured ONCE at startup
 	// (runMCP) before any tool call can run. citadel#858: reading the live
@@ -303,13 +307,33 @@ func (b *mcpBridge) run() error {
 				}
 				continue
 			}
+			if req.Method != "initialize" {
+				if req.Method == "notifications/initialized" {
+					if !b.initializeAccepted {
+						continue
+					}
+				} else if !b.initialized {
+					if !isNotification {
+						b.writeError(req.ID, -32002, "MCP initialization required")
+					}
+					continue
+				}
+			}
 		}
 		if isNotification {
 			// MCP request methods require correlated results and are not executed
 			// in notification form. Protocol notifications are forwarded for
 			// backend session state, but their response (if any) is discarded.
 			if strings.HasPrefix(req.Method, "notifications/") && b.apiKey != "" {
-				_, _ = b.forwardToBackend(&req)
+				_, forwardErr := b.forwardToBackend(&req)
+				if req.Method == "notifications/initialized" && b.remoteToolAllowlist != nil {
+					if forwardErr == nil {
+						b.initialized = true
+					} else {
+						Debug("MCP: initialized notification backend error: %s",
+							memory.RedactSensitiveText(forwardErr.Error(), b.apiKey, b.sessionID))
+					}
+				}
 			}
 			continue
 		}
@@ -411,22 +435,34 @@ func (b *mcpBridge) memoryMethodAllowed(req *jsonRPCRequest) bool {
 // the local response instead of forwarding first and waiting on a call that
 // will only fail.
 func (b *mcpBridge) handleInitialize(req *jsonRPCRequest) {
+	if b.remoteToolAllowlist != nil {
+		b.initializeAccepted = false
+		b.initialized = false
+	}
 	if b.apiKey == "" {
 		b.writeLocalInitializeResult(req.ID)
+		b.initializeAccepted = true
 		return
 	}
 
 	resp, err := b.forwardToBackend(req)
 	if err != nil {
-		Debug("MCP: initialize backend error: %s, using local fallback",
-			memory.RedactSensitiveText(err.Error(), b.apiKey, b.sessionID))
+		safeErr := memory.RedactSensitiveText(err.Error(), b.apiKey, b.sessionID)
+		if b.remoteToolAllowlist != nil {
+			Debug("MCP: initialize backend error: %s", safeErr)
+			b.writeError(req.ID, -32603, "Backend initialization failed: "+safeErr)
+			return
+		}
+		Debug("MCP: initialize backend error: %s, using local fallback", safeErr)
 		b.writeLocalInitializeResult(req.ID)
+		b.initializeAccepted = true
 		return
 	}
 
 	// Write the backend's response directly.
 	b.bridgeStdout().Write(resp)
 	b.bridgeStdout().Write([]byte("\n"))
+	b.initializeAccepted = true
 }
 
 // writeLocalInitializeResult writes a self-contained initialize response with
@@ -894,7 +930,8 @@ func (b *mcpBridge) parseSSEResponse(body io.Reader) ([]byte, error) {
 }
 
 func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.RawMessage, strict bool, extraSensitive ...string) ([]byte, error) {
-	scanner := bufio.NewScanner(body)
+	limited := &io.LimitedReader{R: body, N: maxMCPBackendResponseBytes + 1}
+	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
 	var lastResponse []byte
@@ -918,12 +955,14 @@ func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.Raw
 			}
 
 			data = string(b.redactBackendPayload([]byte(data), extraSensitive...))
-			Debug("MCP: SSE data: %s", truncate(data, 200))
 			candidate := []byte(data)
 			if strict {
 				if err := validateBackendRPCResponse(candidate, expectedID); err != nil {
 					lastValidationErr = err
 					continue
+				}
+				if limited.N == 0 {
+					return nil, fmt.Errorf("backend SSE response exceeds %d bytes", maxMCPBackendResponseBytes)
 				}
 				return candidate, nil
 			}
@@ -936,6 +975,9 @@ func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.Raw
 		}
 	}
 
+	if limited.N == 0 {
+		return nil, fmt.Errorf("backend SSE response exceeds %d bytes", maxMCPBackendResponseBytes)
+	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("SSE read error: %w", err)
 	}

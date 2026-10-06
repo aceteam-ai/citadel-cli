@@ -97,14 +97,18 @@ func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]a
 		return "", c.safeError(fmt.Errorf("initialize MCP session: %w", err), session)
 	}
 	defer func() { c.terminateSession(session, protocolVersion) }()
+	priorSession := session
 	resp, activeSession, err := c.post(ctx, session, protocolVersion, rpcRequest{
 		JSONRPC: "2.0", ID: 2, Method: "tools/call", Params: params,
 	})
+	if err != nil {
+		if activeSession != "" && activeSession != priorSession {
+			c.terminateSession(activeSession, protocolVersion)
+		}
+		return "", c.safeError(err, priorSession, activeSession)
+	}
 	if activeSession != "" {
 		session = activeSession
-	}
-	if err != nil {
-		return "", c.safeError(err, session)
 	}
 	if resp == nil {
 		return "", fmt.Errorf("empty MCP tools/call response")
@@ -172,15 +176,19 @@ func (c *MCPClient) initialize(ctx context.Context) (session, protocolVersion st
 
 	// Notifications do not have a response body, but transport failures are
 	// still fatal: tools/call before initialized is not protocol-conformant.
+	priorSession := session
 	var activeSession string
 	_, activeSession, err = c.post(ctx, session, protocolVersion, rpcRequest{
 		JSONRPC: "2.0", Method: "notifications/initialized",
 	})
+	if err != nil {
+		if activeSession != "" && activeSession != priorSession {
+			c.terminateSession(activeSession, protocolVersion)
+		}
+		return session, protocolVersion, fmt.Errorf("send initialized notification: %w", err)
+	}
 	if activeSession != "" {
 		session = activeSession
-	}
-	if err != nil {
-		return session, protocolVersion, fmt.Errorf("send initialized notification: %w", err)
 	}
 	return session, protocolVersion, nil
 }
@@ -255,7 +263,13 @@ func (c *MCPClient) post(ctx context.Context, session, protocolVersion string, b
 
 	// A notification yields an empty 200/202/204 body.
 	if body.Method == "notifications/initialized" {
-		_, _ = io.Copy(io.Discard, httpResp.Body)
+		read, err := io.Copy(io.Discard, io.LimitReader(httpResp.Body, maxMCPResponseBytes+1))
+		if err != nil {
+			return nil, newSession, fmt.Errorf("read initialized notification response: %w", err)
+		}
+		if read > maxMCPResponseBytes {
+			return nil, newSession, fmt.Errorf("initialized notification response exceeds %d bytes", maxMCPResponseBytes)
+		}
 		return nil, newSession, nil
 	}
 

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 )
 
@@ -36,7 +35,7 @@ func TranscriptSummary(path string, budget int) string {
 	if strings.TrimSpace(path) == "" || budget <= 0 {
 		return ""
 	}
-	f, err := os.Open(path)
+	f, err := openRegularTranscript(path)
 	if err != nil {
 		return ""
 	}

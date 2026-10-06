@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -176,5 +177,115 @@ func TestDeviceAuthClient_RefusesRedirect(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&targetHits); got != 0 {
 		t.Fatalf("device code was replayed to redirect target (%d hits)", got)
+	}
+}
+
+func TestMemoryDeviceAuth_RedactsReflectedBearerErrors(t *testing.T) {
+	key := "act_" + strings.Repeat("a", 64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(TokenError{
+			ErrorCode: "hostile_error", ErrorDescription: "reflected " + key,
+		})
+	}))
+	defer srv.Close()
+
+	_, err := NewDeviceAuthClient(srv.URL).checkMemoryToken("devcode")
+	if err == nil || strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("unsafe reflected error: %v", err)
+	}
+}
+
+func TestMemoryDeviceAuth_BoundsSuccessAndStartBodies(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		run  func(*DeviceAuthClient) error
+	}{
+		{
+			name: "start",
+			body: `{"device_code":"dc","user_code":"UC","expires_in":600,"interval":1}` + strings.Repeat(" ", maxDeviceAuthResponseBytes),
+			run: func(c *DeviceAuthClient) error {
+				_, err := c.StartFlow(&StartFlowOptions{DeviceKind: "memory"})
+				return err
+			},
+		},
+		{
+			name: "memory token",
+			body: `{"status":"approved","api_key":"act_minted"}` + strings.Repeat(" ", maxDeviceAuthResponseBytes),
+			run:  func(c *DeviceAuthClient) error { _, err := c.checkMemoryToken("dc"); return err },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			err := tc.run(NewDeviceAuthClient(srv.URL))
+			if err == nil || !strings.Contains(err.Error(), "exceeds") {
+				t.Fatalf("oversized response accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestMemoryDeviceAuth_RedactsPrintableSuccessMetadata(t *testing.T) {
+	key := "act_" + strings.Repeat("b", 64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/start") {
+			_ = json.NewEncoder(w).Encode(DeviceCodeResponse{DeviceCode: "dc", UserCode: key})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(MemoryTokenResponse{
+			Status: "approved", APIKey: key, OrgName: "reflected " + key, Scopes: []string{"memory:read", key},
+		})
+	}))
+	defer srv.Close()
+	c := NewDeviceAuthClient(srv.URL)
+	start, err := c.StartFlow(&StartFlowOptions{DeviceKind: "memory"})
+	if err != nil || strings.Contains(start.UserCode, key) {
+		t.Fatalf("start response retained printable bearer: start=%+v err=%v", start, err)
+	}
+	token, err := c.checkMemoryToken("dc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.APIKey != key || strings.Contains(token.OrgName, key) || strings.Contains(strings.Join(token.Scopes, ","), key) {
+		t.Fatalf("success metadata redaction wrong: %+v", token)
+	}
+}
+
+func TestDeviceAuth_RedactsLegacyTokenMetadataButKeepsCredentialField(t *testing.T) {
+	key := "act_" + strings.Repeat("c", 64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(TokenResponse{
+			Authkey: key, DeviceAPIToken: key, OrgName: "reflected " + key,
+		})
+	}))
+	defer srv.Close()
+	token, err := NewDeviceAuthClient(srv.URL).CheckToken("dc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.DeviceAPIToken != key || strings.Contains(token.Authkey, key) || strings.Contains(token.OrgName, key) {
+		t.Fatalf("legacy token metadata redaction wrong: %+v", token)
+	}
+}
+
+func TestMemoryDeviceAuth_SlowDownIsRetriedWithRFCInterval(t *testing.T) {
+	if got := slowDownMemoryPollInterval(time.Second); got != 6*time.Second {
+		t.Fatalf("slow_down interval=%s want 6s", got)
+	}
+	if got := slowDownMemoryPollInterval(maxMemoryPollInterval); got != maxMemoryPollInterval {
+		t.Fatalf("slow_down cap=%s want %s", got, maxMemoryPollInterval)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"slow_down","error_description":"wait"}`)
+	}))
+	defer srv.Close()
+	resp, err := NewDeviceAuthClient(srv.URL).checkMemoryToken("dc")
+	if err != nil || resp.Status != "slow_down" {
+		t.Fatalf("slow_down not normalized for poll loop: resp=%+v err=%v", resp, err)
 	}
 }
