@@ -74,7 +74,14 @@ func runLogout(cmd *cobra.Command, args []string) {
 	apiKey := os.Getenv("CITADEL_API_KEY")
 	if logoutAPIKeyStdin {
 		var err error
-		apiKey, err = readLogoutAPIKeyStdin(cmd.InOrStdin())
+		input := cmd.InOrStdin()
+		isTerminal := false
+		if file, ok := input.(*os.File); ok {
+			if info, statErr := file.Stat(); statErr == nil {
+				isTerminal = info.Mode()&os.ModeCharDevice != 0
+			}
+		}
+		apiKey, err = readLogoutAPIKeyStdin(input, isTerminal)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading --api-key-stdin: %v\n", err)
 			os.Exit(1)
@@ -93,9 +100,12 @@ func runLogout(cmd *cobra.Command, args []string) {
 		Debug("skipping backend deregistration (--keep-registration)")
 	}
 
-	// Logout (disconnect and clear state)
-	if err := network.Logout(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error logging out: %v\n", err)
+	// A strict cleanup must retain the local identity until the coordination
+	// server has confirmed deletion. That leaves a transient failure
+	// recoverable with the same HOME and node identity instead of orphaning a
+	// remote registration after clearing its only local state.
+	if err := completeRequiredDeregistration(deregisterErr, logoutRequireDeregister, network.Logout); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	if !logoutKeepRegistration {
@@ -105,17 +115,22 @@ func runLogout(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Warning: could not clear prior session mode: %v\n", err)
 		}
 	}
-	if deregisterErr != nil && logoutRequireDeregister {
-		fmt.Fprintf(os.Stderr, "Error: required backend deregistration failed: %v\n", deregisterErr)
-		os.Exit(1)
-	}
-
 	fmt.Println("✅ Successfully disconnected from the AceTeam Network.")
 	if logoutKeepRegistration {
 		fmt.Println("   Node registration preserved. To reconnect, run 'citadel login'")
 	} else {
 		fmt.Println("   To register again, run 'citadel init'")
 	}
+}
+
+func completeRequiredDeregistration(deregisterErr error, requireDeregister bool, localLogout func() error) error {
+	if deregisterErr != nil && requireDeregister {
+		return fmt.Errorf("required backend deregistration failed: %w", deregisterErr)
+	}
+	if err := localLogout(); err != nil {
+		return fmt.Errorf("logging out locally: %w", err)
+	}
+	return nil
 }
 
 // deregisterFromBackend deregisters the node via the backend API. Its caller
@@ -175,7 +190,10 @@ func requireBackendDeregistration(ctx context.Context, nodeName, apiKey string, 
 
 const maxStdinAPIKeyBytes = 4096
 
-func readLogoutAPIKeyStdin(r io.Reader) (string, error) {
+func readLogoutAPIKeyStdin(r io.Reader, isTerminal bool) (string, error) {
+	if isTerminal {
+		return "", fmt.Errorf("--api-key-stdin requires piped or redirected input; refusing to read a secret from a terminal")
+	}
 	b, err := io.ReadAll(io.LimitReader(r, maxStdinAPIKeyBytes+1))
 	if err != nil {
 		return "", err

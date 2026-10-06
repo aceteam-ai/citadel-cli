@@ -21,7 +21,7 @@ func TestReadLogoutAPIKeyStdinStrictFraming(t *testing.T) {
 		{name: "extra newline", input: "api-token\n\n", bad: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := readLogoutAPIKeyStdin(strings.NewReader(tt.input))
+			got, err := readLogoutAPIKeyStdin(strings.NewReader(tt.input), false)
 			if (err != nil) != tt.bad || got != tt.want {
 				t.Fatalf("got %q, err %v", got, err)
 			}
@@ -29,6 +29,31 @@ func TestReadLogoutAPIKeyStdinStrictFraming(t *testing.T) {
 				t.Fatal("error exposed secret input")
 			}
 		})
+	}
+}
+
+func TestReadLogoutAPIKeyStdinRefusesTerminal(t *testing.T) {
+	if _, err := readLogoutAPIKeyStdin(strings.NewReader("secret"), true); err == nil {
+		t.Fatal("terminal API-key input was accepted")
+	}
+}
+
+func TestStrictDeregistrationFailurePreservesLocalState(t *testing.T) {
+	backendErr := errors.New("backend unavailable")
+	localCalls := 0
+	localLogout := func() error { localCalls++; return nil }
+
+	if err := completeRequiredDeregistration(backendErr, true, localLogout); !errors.Is(err, backendErr) {
+		t.Fatalf("strict error = %v", err)
+	}
+	if localCalls != 0 {
+		t.Fatalf("strict failure cleared local state %d time(s)", localCalls)
+	}
+	if err := completeRequiredDeregistration(backendErr, false, localLogout); err != nil {
+		t.Fatalf("best-effort logout failed: %v", err)
+	}
+	if localCalls != 1 {
+		t.Fatalf("best-effort logout calls = %d", localCalls)
 	}
 }
 

@@ -30,7 +30,7 @@ CLEANUP_DONE=0
 CLEANUP_FAILED=0
 LAN_RELAXED=0
 
-declare -A NODE_HOST NODE_HOME NODE_BIN NODE_PID NODE_PID_ROLE NODE_LOG LOGIN_CLEANUP_REQUIRED
+declare -A NODE_HOST NODE_HOME NODE_BIN NODE_PID NODE_PID_ROLE NODE_PID_FINGERPRINT NODE_LOG LOGIN_CLEANUP_REQUIRED
 
 log() { printf '%s\n' "[egress-relay-test] $*"; }
 ok() { printf '%s\n' "[egress-relay-test] OK: $*"; }
@@ -158,7 +158,11 @@ run_bg_on() {
   shift 2
   local host out pid launch
   host="${NODE_HOST[$who]:-}"
-  out="/tmp/egress-relay-test-${RUN_ID}-${label}.log"
+  valid_harness_home "${NODE_HOME[$who]:-}" || die "cannot start $label without a guarded disposable home"
+  # Keep logs below the 0700 mktemp home. Predictable files directly under
+  # /tmp would permit another local user to pre-place a symlink and redirect
+  # the harness's truncating open into a file owned by this account.
+  out="${NODE_HOME[$who]}/.${label}.log"
   NODE_LOG[$label]="$out"
   if [[ -n "$host" ]]; then
     launch="nohup $(remote_command "$@") >$(shell_quote "$out") 2>&1 </dev/null & printf '%s\\n' \$!"
@@ -170,22 +174,51 @@ run_bg_on() {
   [[ "$pid" =~ ^[0-9]+$ ]] || die "could not capture $label PID"
   NODE_PID[$label]="$pid"
   NODE_PID_ROLE[$label]="$who"
+  local fingerprint
+  fingerprint="$(run_on "$who" ps -p "$pid" -o lstart= -o args=)" \
+    || die "$label exited before its process identity could be captured"
+  [[ -n "$fingerprint" ]] || die "could not fingerprint $label PID"
+  NODE_PID_FINGERPRINT[$label]="$fingerprint"
 }
 
 kill_bg() {
-  local label="$1" pid who
+  local label="$1" pid who expected current
   pid="${NODE_PID[$label]:-}"
   who="${NODE_PID_ROLE[$label]:-}"
   [[ -n "$pid" && -n "$who" ]] || return 0
+  expected="${NODE_PID_FINGERPRINT[$label]:-}"
+  current="$(run_on "$who" ps -p "$pid" -o lstart= -o args= 2>/dev/null)" || {
+    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+    return 0
+  }
+  if [[ -z "$expected" || "$current" != "$expected" ]]; then
+    warn "refusing to signal reused or unverified $label PID $pid"
+    CLEANUP_FAILED=1
+    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+    return 1
+  fi
   run_on "$who" kill -TERM "$pid" >/dev/null 2>&1 || true
   local attempts=0
   while ((attempts < 20)); do
-    run_on "$who" kill -0 "$pid" >/dev/null 2>&1 || { unset 'NODE_PID[$label]'; return 0; }
+    run_on "$who" kill -0 "$pid" >/dev/null 2>&1 || {
+      unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+      return 0
+    }
     sleep 0.1
     ((attempts += 1))
   done
+  current="$(run_on "$who" ps -p "$pid" -o lstart= -o args= 2>/dev/null)" || {
+    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+    return 0
+  }
+  if [[ "$current" != "$expected" ]]; then
+    warn "refusing KILL for reused $label PID $pid"
+    CLEANUP_FAILED=1
+    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+    return 1
+  fi
   run_on "$who" kill -KILL "$pid" >/dev/null 2>&1 || true
-  unset 'NODE_PID[$label]'
+  unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
 }
 
 valid_harness_home() {
@@ -205,16 +238,24 @@ cleanup() {
   kill_bg relay-probe
   kill_bg relay-serve
 
-  local who home marker
+  local who home marker deregistered
   for who in client relay; do
+    deregistered=1
     if [[ "${LOGIN_CLEANUP_REQUIRED[$who]:-0}" == 1 && -n "${NODE_BIN[$who]:-}" ]]; then
-      node_cmd_stdin "$who" "$API_KEY_FILE" logout --force --api-key-stdin --require-deregister >/dev/null 2>&1 || { warn "$who strict deregistration/logout failed"; CLEANUP_FAILED=1; }
+      if ! node_cmd_stdin "$who" "$API_KEY_FILE" logout --force --api-key-stdin --require-deregister >/dev/null 2>&1; then
+        warn "$who strict deregistration/logout failed; retaining its guarded home for retry"
+        CLEANUP_FAILED=1
+        deregistered=0
+      fi
     fi
     home="${NODE_HOME[$who]:-}"
     if [[ -n "$home" ]]; then
       if ! valid_harness_home "$home"; then
         warn "refusing cleanup of unexpected $who path: $home"
         CLEANUP_FAILED=1
+        continue
+      fi
+      if ((deregistered == 0)); then
         continue
       fi
       marker="${RUN_ID}:${who}"
@@ -260,7 +301,7 @@ preflight_host() {
     if [ -d "$HOME/citadel-node/network" ] && [ -n "$(find "$HOME/citadel-node/network" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
       echo "existing Citadel network state exists in the account home" >&2; exit 42
     fi
-    for c in bash curl python3 mktemp uname; do command -v "$c" >/dev/null || { echo "missing prerequisite: $c" >&2; exit 43; }; done
+    for c in bash curl python3 mktemp ps uname; do command -v "$c" >/dev/null || { echo "missing prerequisite: $c" >&2; exit 43; }; done
   '
 }
 
