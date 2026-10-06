@@ -46,17 +46,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/google/uuid"
 )
 
 // JobTypeHuddleJoinType is the wire type string for the huddle-join job,
@@ -94,23 +97,57 @@ type huddleBrowser interface {
 // are BOTH required: the aceteam mint route binds the server-minted credential
 // to the agent's distinct mesh identity and gates + normalizes the target.
 type huddleJoinParams struct {
+	OrganizationID   string
 	ChannelID        string
+	CallID           string
 	AgentID          string
+	NodeID           string
+	JobID            string
+	AttemptID        string
 	RequestedAPIBase string // legacy compatibility check only; never a destination
+	Converse         bool
 }
 
 // parseHuddleJoinParams validates + normalizes the raw string payload.
-func parseHuddleJoinParams(payload map[string]string) (huddleJoinParams, error) {
+func parseHuddleJoinParams(jobID string, payload map[string]string) (huddleJoinParams, error) {
 	p := huddleJoinParams{
-		ChannelID:        strings.TrimSpace(payload["channel_id"]),
-		AgentID:          strings.TrimSpace(payload["agent_id"]),
+		OrganizationID:   strings.TrimSpace(payload["organizationId"]),
+		ChannelID:        strings.TrimSpace(payload["channelId"]),
+		CallID:           strings.TrimSpace(payload["callId"]),
+		AgentID:          strings.TrimSpace(payload["agentId"]),
+		NodeID:           strings.TrimSpace(payload["target_node"]),
+		JobID:            strings.TrimSpace(jobID),
+		AttemptID:        strings.TrimSpace(payload["lifecycleAttemptId"]),
 		RequestedAPIBase: strings.TrimSpace(payload["api_base"]),
 	}
-	if p.ChannelID == "" {
-		return huddleJoinParams{}, fmt.Errorf("job payload missing required 'channel_id' field")
+	if raw := strings.TrimSpace(payload["converse"]); raw != "" {
+		converse, err := strconv.ParseBool(raw)
+		if err != nil {
+			return huddleJoinParams{}, fmt.Errorf("invalid 'converse' value %q: must be true or false", raw)
+		}
+		p.Converse = converse
 	}
-	if p.AgentID == "" {
-		return huddleJoinParams{}, fmt.Errorf("job payload missing required 'agent_id' field")
+	for field, value := range map[string]string{
+		"organizationId":     p.OrganizationID,
+		"channelId":          p.ChannelID,
+		"callId":             p.CallID,
+		"agentId":            p.AgentID,
+		"jobId":              p.JobID,
+		"lifecycleAttemptId": p.AttemptID,
+	} {
+		parsed, err := uuid.Parse(value)
+		if err != nil || parsed.String() != value {
+			return huddleJoinParams{}, fmt.Errorf("%s must be a canonical UUID", field)
+		}
+	}
+	if p.NodeID == "" || strings.HasPrefix(p.NodeID, "0") {
+		return huddleJoinParams{}, fmt.Errorf("target_node must be a canonical positive integer string")
+	}
+	if nodeID, err := strconv.ParseUint(p.NodeID, 10, 64); err != nil || nodeID == 0 || strconv.FormatUint(nodeID, 10) != p.NodeID {
+		return huddleJoinParams{}, fmt.Errorf("target_node must be a canonical positive integer string")
+	}
+	if p.Converse {
+		return huddleJoinParams{}, fmt.Errorf("this HUDDLE_JOIN build does not support resident converse")
 	}
 	return p, nil
 }
@@ -123,6 +160,8 @@ type huddleToken struct {
 	ChannelID string `json:"channelId"`
 	SelfID    string `json:"selfId"`
 	SelfKind  string `json:"selfKind"`
+	CallID    string `json:"callId"`
+	AttemptID string `json:"lifecycleAttemptId"`
 	ExpiresAt string `json:"expiresAt"`
 }
 
@@ -155,6 +194,13 @@ type HuddleJoinHandler struct {
 	// CDP-driven browser plus a cleanup that tears the session down. nil uses the
 	// real container-session implementation; tests inject a fake browser.
 	newBrowser func(ctx context.Context, p huddleJoinParams) (br huddleBrowser, cleanup func(context.Context) error, err error)
+	// acknowledgeReady promotes the exact server-owned lifecycle attempt only
+	// after the browser proves its call/self/room/transport state. nil uses the
+	// authenticated same-origin HTTP endpoint.
+	acknowledgeReady func(ctx context.Context, apiBase *url.URL, tok huddleToken, final huddleBotState) error
+	// reportTerminal persists the exact attempt's completed, failed, or
+	// cancelled state. nil uses the authenticated lifecycle terminal endpoint.
+	reportTerminal func(ctx context.Context, apiBase *url.URL, tok huddleToken, status, detail string) error
 
 	// Tunables (zero => package defaults at use). Tests set them to milliseconds.
 	connectTimeout time.Duration
@@ -172,8 +218,8 @@ func NewHuddleJoinHandler(workspace string) *HuddleJoinHandler {
 // container means a misconfigured token (401) or an unreachable/forbidden
 // channel (403/404) costs nothing — we never pay for a container session we would
 // immediately abandon.
-func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
-	p, err := parseHuddleJoinParams(job.Payload)
+func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []byte, err error) {
+	p, err := parseHuddleJoinParams(job.ID, job.Payload)
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +240,26 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 	if err := validateHuddleToken(tok, p); err != nil {
 		return nil, fmt.Errorf("mint huddle bot token: %w", err)
 	}
+	defer func() {
+		status := "completed"
+		detail := ""
+		if err != nil {
+			status = "failed"
+			detail = truncateHuddleDetail(err.Error())
+			if errors.Is(err, context.Canceled) || errors.Is(jobCtx.Err(), context.Canceled) {
+				status = "cancelled"
+			}
+		}
+		reportCtx, cancel := context.WithTimeout(context.Background(), huddleTokenHTTPTimeout)
+		defer cancel()
+		if reportErr := h.terminal(reportCtx, apiBase, tok, status, detail); reportErr != nil {
+			if err == nil {
+				err = fmt.Errorf("report huddle lifecycle terminal state: %w", reportErr)
+			} else {
+				ctx.Log("error", "     - [Job %s] terminal lifecycle report failed: %v", job.ID, reportErr)
+			}
+		}
+	}()
 	if err := jobCtx.Err(); err != nil {
 		return nil, fmt.Errorf("huddle join cancelled after token mint: %w", err)
 	}
@@ -237,8 +303,11 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 
 	// Poll the readiness signal until joined / terminal failure / timeout.
 	final, err := pollForHuddleJoined(ctx, br, huddlePollOpts{
-		connectTimeout: h.effConnectTimeout(),
-		interval:       h.effPollInterval(),
+		connectTimeout:   h.effConnectTimeout(),
+		interval:         h.effPollInterval(),
+		expectedCallID:   p.CallID,
+		expectedSelfID:   p.AgentID,
+		requireTransport: true,
 	})
 	if err != nil {
 		return nil, err
@@ -253,6 +322,10 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 	ctx.Log("info", "     - [Job %s] JOINED huddle %s (self=%s, peers=%d, connected=%d)",
 		job.ID, joinChannel, final.SelfID, final.PeerCount, final.ConnectedPeerCount)
 
+	if err := h.ready(jobCtx, apiBase, tok, final); err != nil {
+		return nil, fmt.Errorf("acknowledge huddle media readiness: %w", err)
+	}
+
 	// A joined result is only successful after meetingd confirms teardown. This
 	// prevents a leaked one-session-per-node slot from being reported as success.
 	if cleanup != nil {
@@ -266,9 +339,14 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 	}
 
 	out, _ := json.Marshal(map[string]any{
-		"status":               "joined",
+		"status":               "completed",
+		"lifecycle_state":      "completed",
+		"organization_id":      p.OrganizationID,
 		"channel_id":           joinChannel,
 		"agent_id":             p.AgentID,
+		"node_id":              p.NodeID,
+		"job_id":               p.JobID,
+		"lifecycle_attempt_id": p.AttemptID,
 		"self_id":              final.SelfID,
 		"self_kind":            tok.SelfKind,
 		"call_id":              final.CallID,
@@ -346,7 +424,10 @@ func (h *HuddleJoinHandler) mint(ctx context.Context, apiBase *url.URL, deviceTo
 // surfaced with the status + response body (the body carries the backend's error
 // message and never the token, so it is safe to include).
 func mintHuddleBotToken(ctx context.Context, client *http.Client, apiBase *url.URL, deviceToken string, p huddleJoinParams) (huddleToken, error) {
-	body, err := json.Marshal(map[string]string{"agentId": p.AgentID, "channelId": p.ChannelID})
+	body, err := json.Marshal(map[string]string{
+		"agentId": p.AgentID, "channelId": p.ChannelID, "callId": p.CallID,
+		"jobId": p.JobID, "lifecycleAttemptId": p.AttemptID,
+	})
 	if err != nil {
 		return huddleToken{}, err
 	}
@@ -405,6 +486,126 @@ func validateHuddleToken(tok huddleToken, p huddleJoinParams) error {
 	if tok.SelfID != p.AgentID {
 		return fmt.Errorf("mint endpoint bound credential to unexpected agent %q (requested %q)", tok.SelfID, p.AgentID)
 	}
+	if tok.CallID != p.CallID {
+		return fmt.Errorf("mint endpoint bound credential to unexpected call %q (requested %q)", tok.CallID, p.CallID)
+	}
+	if tok.AttemptID != p.AttemptID {
+		return fmt.Errorf("mint endpoint bound credential to unexpected lifecycle attempt %q (requested %q)", tok.AttemptID, p.AttemptID)
+	}
+	return nil
+}
+
+func (h *HuddleJoinHandler) ready(ctx context.Context, apiBase *url.URL, tok huddleToken, final huddleBotState) error {
+	if h.acknowledgeReady != nil {
+		return h.acknowledgeReady(ctx, apiBase, tok, final)
+	}
+	return acknowledgeHuddleReady(ctx, &http.Client{Timeout: huddleTokenHTTPTimeout}, apiBase, tok, final)
+}
+
+func (h *HuddleJoinHandler) terminal(ctx context.Context, apiBase *url.URL, tok huddleToken, status, detail string) error {
+	if h.reportTerminal != nil {
+		return h.reportTerminal(ctx, apiBase, tok, status, detail)
+	}
+	return reportHuddleTerminal(ctx, &http.Client{Timeout: huddleTokenHTTPTimeout}, apiBase, tok, status, detail)
+}
+
+// acknowledgeHuddleReady sends the server-required boolean ACK only after the
+// caller has obtained real source evidence: the meetingd-owned browser is in
+// the exact call as the exact agent and all advertised room peers have an
+// established transport. The booleans are therefore derived assertions, never
+// caller optimism.
+func acknowledgeHuddleReady(ctx context.Context, client *http.Client, apiBase *url.URL, tok huddleToken, final huddleBotState) error {
+	if err := validateHuddleMediaReady(final, tok.CallID, tok.SelfID); err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]any{
+		"callId": tok.CallID, "selfId": tok.SelfID,
+		"roomReady": true, "transportReady": true,
+	})
+	if err != nil {
+		return err
+	}
+	readyURL := *apiBase
+	readyURL.Path = "/api/huddle-bot/lifecycle/ready"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, readyURL.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tok.Token)
+	noRedirectClient := *client
+	noRedirectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusNoContent {
+		message := strings.ReplaceAll(strings.TrimSpace(string(raw)), tok.Token, "<redacted>")
+		return fmt.Errorf("readiness endpoint returned status %d: %s", resp.StatusCode, message)
+	}
+	return nil
+}
+
+func reportHuddleTerminal(ctx context.Context, client *http.Client, apiBase *url.URL, tok huddleToken, status, detail string) error {
+	if status != "completed" && status != "failed" && status != "cancelled" {
+		return fmt.Errorf("invalid huddle terminal status %q", status)
+	}
+	body, err := json.Marshal(map[string]string{
+		"callId": tok.CallID, "lifecycleAttemptId": tok.AttemptID,
+		"status": status, "detail": truncateHuddleDetail(detail),
+	})
+	if err != nil {
+		return err
+	}
+	terminalURL := *apiBase
+	terminalURL.Path = "/api/huddle-bot/lifecycle/terminal"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, terminalURL.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tok.Token)
+	noRedirectClient := *client
+	noRedirectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusNoContent {
+		message := strings.ReplaceAll(strings.TrimSpace(string(raw)), tok.Token, "<redacted>")
+		return fmt.Errorf("terminal endpoint returned status %d: %s", resp.StatusCode, message)
+	}
+	return nil
+}
+
+func truncateHuddleDetail(detail string) string {
+	runes := []rune(detail)
+	if len(runes) > 400 {
+		runes = runes[:400]
+	}
+	return string(runes)
+}
+
+func validateHuddleMediaReady(state huddleBotState, callID, selfID string) error {
+	if state.State != "joined" {
+		return fmt.Errorf("huddle room is not joined (state=%q)", state.State)
+	}
+	if state.CallID != callID {
+		return fmt.Errorf("huddle browser joined unexpected call %q (expected %q)", state.CallID, callID)
+	}
+	if state.SelfID != selfID {
+		return fmt.Errorf("huddle browser joined as unexpected peer %q (expected %q)", state.SelfID, selfID)
+	}
+	if state.PeerCount < 1 {
+		return fmt.Errorf("huddle room has no remote peer to prove media transport readiness")
+	}
+	if state.ConnectedPeerCount != state.PeerCount {
+		return fmt.Errorf("huddle media transport is not ready (%d/%d peers connected)", state.ConnectedPeerCount, state.PeerCount)
+	}
 	return nil
 }
 
@@ -441,8 +642,11 @@ func defaultHuddleBrowser(ctx context.Context, p huddleJoinParams) (huddleBrowse
 
 // huddlePollOpts bundles the readiness poll budget and cadence.
 type huddlePollOpts struct {
-	connectTimeout time.Duration
-	interval       time.Duration
+	connectTimeout   time.Duration
+	interval         time.Duration
+	expectedCallID   string
+	expectedSelfID   string
+	requireTransport bool
 }
 
 // huddleReadinessPage is the slice of the browser pollForHuddleJoined needs, so
@@ -502,8 +706,20 @@ func pollForHuddleJoined(ctx JobContext, page huddleReadinessPage, opts huddlePo
 			last, everSaw = st, true
 			switch st.State {
 			case "joined":
-				// Terminal success. Return NOW without another sample so a later
-				// `left` (call ended after we confirmed) can't flip a real success.
+				if opts.expectedCallID != "" && st.CallID != opts.expectedCallID {
+					return st, fmt.Errorf("huddle browser joined unexpected call %q (expected %q)", st.CallID, opts.expectedCallID)
+				}
+				if opts.expectedSelfID != "" && st.SelfID != opts.expectedSelfID {
+					return st, fmt.Errorf("huddle browser joined as unexpected peer %q (expected %q)", st.SelfID, opts.expectedSelfID)
+				}
+				if opts.requireTransport {
+					// `joined` proves roster + local mic only. Wait until the bot page's
+					// actual RTCPeerConnection observations prove the remote room and
+					// every advertised peer transport are connected.
+					if st.PeerCount < 1 || st.ConnectedPeerCount != st.PeerCount {
+						break
+					}
+				}
 				return st, nil
 			case "error":
 				msg := st.Error
@@ -528,7 +744,11 @@ func pollForHuddleJoined(ctx JobContext, page huddleReadinessPage, opts huddlePo
 		case now.After(connectDeadline):
 			detail := "the bot never left 'connecting'"
 			if everSaw {
-				detail = fmt.Sprintf("the bot never left '%s'", last.State)
+				if last.State == "joined" && opts.requireTransport {
+					detail = fmt.Sprintf("media transport never became ready (%d/%d peers connected)", last.ConnectedPeerCount, last.PeerCount)
+				} else {
+					detail = fmt.Sprintf("the bot never left '%s'", last.State)
+				}
 			} else {
 				detail = "the bot page never published a readiness signal"
 			}

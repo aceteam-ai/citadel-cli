@@ -142,6 +142,20 @@ type MockJobHandler struct {
 	mu         sync.Mutex
 }
 
+type contextBlockingHandler struct {
+	started chan struct{}
+}
+
+func (h *contextBlockingHandler) CanHandle(jobType string) bool {
+	return jobType == JobTypeHuddleJoin
+}
+
+func (h *contextBlockingHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	close(h.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func NewMockJobHandler(jobType string, shouldFail bool) *MockJobHandler {
 	return &MockJobHandler{
 		jobType:    jobType,
@@ -176,6 +190,58 @@ func (m *MockJobHandler) ExecutedJobs() []*Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.executed
+}
+
+func TestRunnerHuddleCancellationInterruptsAndTerminatesWithoutRetry(t *testing.T) {
+	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	source.cancelledJobs = map[string]bool{}
+	handler := &contextBlockingHandler{started: make(chan struct{})}
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	runner.huddleCancelPoll = time.Millisecond
+	stream := &recordingStreamWriter{}
+	done := make(chan bool, 1)
+	go func() {
+		done <- runner.executeJob(context.Background(), job, stream, time.Now(), false, 0)
+	}()
+	<-handler.started
+	source.mu.Lock()
+	source.cancelledJobs[job.ID] = true
+	source.mu.Unlock()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("cancelled huddle job reported success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("huddle cancellation did not interrupt the handler")
+	}
+	if !stream.cancelled || stream.errored || stream.ended {
+		t.Fatalf("terminal events cancelled=%v errored=%v ended=%v", stream.cancelled, stream.errored, stream.ended)
+	}
+	if len(source.AckedJobs()) != 1 || len(source.NackedJobs()) != 0 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("ack/nack/fail = %d/%d/%d", len(source.AckedJobs()), len(source.NackedJobs()), len(source.FailedJobs()))
+	}
+}
+
+func TestRunnerHuddleFailureIsTerminalForExactAttempt(t *testing.T) {
+	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	handler := NewMockJobHandler(JobTypeHuddleJoin, true)
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	runner.huddleCancelPoll = time.Millisecond
+	stream := &recordingStreamWriter{}
+
+	if runner.executeJob(context.Background(), job, stream, time.Now(), false, 0) {
+		t.Fatal("failed huddle job reported success")
+	}
+	if len(source.FailedJobs()) != 1 || len(source.NackedJobs()) != 0 {
+		t.Fatalf("failed/nacked = %d/%d", len(source.FailedJobs()), len(source.NackedJobs()))
+	}
+	if !stream.errored || stream.cancelled || stream.ended {
+		t.Fatalf("terminal events errored=%v cancelled=%v ended=%v", stream.errored, stream.cancelled, stream.ended)
+	}
 }
 
 // MockStreamWriter is a test implementation of StreamWriter.

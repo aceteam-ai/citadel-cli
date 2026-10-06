@@ -17,6 +17,15 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
+const (
+	huddleTestOrgID     = "11111111-1111-4111-8111-111111111111"
+	huddleTestChannelID = "22222222-2222-4222-8222-222222222222"
+	huddleTestCallID    = "33333333-3333-4333-8333-333333333333"
+	huddleTestAgentID   = "44444444-4444-4444-8444-444444444444"
+	huddleTestJobID     = "55555555-5555-4555-8555-555555555555"
+	huddleTestAttemptID = "66666666-6666-4666-8666-666666666666"
+)
+
 // fakeHuddleBrowser is an injectable huddleBrowser that returns a scripted
 // sequence of window.__huddleBotState JSON strings from Evaluate. Each Evaluate
 // consumes the next scripted value; once exhausted it repeats the last one (so a
@@ -90,7 +99,7 @@ func (f *fakeHuddleBrowser) Close() error {
 func stateJSON(state, selfID string, peers, connected int) string {
 	b, _ := json.Marshal(huddleBotState{
 		State:              state,
-		CallID:             "call-123",
+		CallID:             huddleTestCallID,
 		SelfID:             selfID,
 		PeerCount:          peers,
 		ConnectedPeerCount: connected,
@@ -108,6 +117,12 @@ func newTestHuddleHandler(deviceToken string, mint func(ctx context.Context, api
 			return config.DeviceCreds{Token: deviceToken, APIBaseURL: "https://aceteam.ai"}
 		},
 		mintToken: mint,
+		acknowledgeReady: func(context.Context, *url.URL, huddleToken, huddleBotState) error {
+			return nil
+		},
+		reportTerminal: func(context.Context, *url.URL, huddleToken, string, string) error {
+			return nil
+		},
 		newBrowser: func(ctx context.Context, p huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
 			return br, func(context.Context) error { return br.Close() }, nil
 		},
@@ -127,15 +142,41 @@ func okMint(tok huddleToken) func(ctx context.Context, apiBase *url.URL, token s
 		if tok.SelfKind == "" {
 			tok.SelfKind = "agent"
 		}
+		if tok.CallID == "" {
+			tok.CallID = p.CallID
+		}
+		if tok.AttemptID == "" {
+			tok.AttemptID = p.AttemptID
+		}
 		return tok, nil
+	}
+}
+
+func testHuddleParams() huddleJoinParams {
+	return huddleJoinParams{
+		OrganizationID: huddleTestOrgID,
+		ChannelID:      huddleTestChannelID,
+		CallID:         huddleTestCallID,
+		AgentID:        huddleTestAgentID,
+		NodeID:         "1297",
+		JobID:          huddleTestJobID,
+		AttemptID:      huddleTestAttemptID,
 	}
 }
 
 func huddleJob() *nexus.Job {
 	return &nexus.Job{
-		ID:      "job-1",
-		Type:    JobTypeHuddleJoinType,
-		Payload: map[string]string{"channel_id": "chan-1", "agent_id": "agent-1", "api_base": "https://aceteam.ai"},
+		ID:   huddleTestJobID,
+		Type: JobTypeHuddleJoinType,
+		Payload: map[string]string{
+			"organizationId":     huddleTestOrgID,
+			"channelId":          huddleTestChannelID,
+			"callId":             huddleTestCallID,
+			"agentId":            huddleTestAgentID,
+			"target_node":        "1297",
+			"lifecycleAttemptId": huddleTestAttemptID,
+			"api_base":           "https://aceteam.ai",
+		},
 	}
 }
 
@@ -143,12 +184,17 @@ func huddleJob() *nexus.Job {
 // startup and reports the final distinct-agent joined state.
 func TestHuddleJoin_ConnectingJoined(t *testing.T) {
 	br := &fakeHuddleBrowser{states: []string{
-		"",                                   // not published yet
-		stateJSON("connecting", "", 0, 0),    // mounting
-		stateJSON("joined", "agent-1", 2, 1), // admitted + mic
+		"",                                // not published yet
+		stateJSON("connecting", "", 0, 0), // mounting
+		stateJSON("joined", huddleTestAgentID, 2, 2), // exact room + transport ready
 	}}
-	tok := huddleToken{Token: "act_secret", ChannelID: "chan-norm", SelfID: "agent-1", SelfKind: "agent"}
+	tok := huddleToken{Token: "act_secret", ChannelID: huddleTestChannelID, SelfID: huddleTestAgentID, SelfKind: "agent", CallID: huddleTestCallID, AttemptID: huddleTestAttemptID}
 	h := newTestHuddleHandler("s3cr3t", okMint(tok), br)
+	var terminalStatus string
+	h.reportTerminal = func(_ context.Context, _ *url.URL, _ huddleToken, status, _ string) error {
+		terminalStatus = status
+		return nil
+	}
 
 	out, err := h.Execute(JobContext{}, huddleJob())
 	if err != nil {
@@ -158,17 +204,17 @@ func TestHuddleJoin_ConnectingJoined(t *testing.T) {
 	if err := json.Unmarshal(out, &res); err != nil {
 		t.Fatalf("unmarshal result: %v", err)
 	}
-	if res["status"] != "joined" || res["state"] != "joined" {
-		t.Errorf("status/state = %v/%v, want joined/joined", res["status"], res["state"])
+	if res["status"] != "completed" || res["state"] != "joined" {
+		t.Errorf("status/state = %v/%v, want completed/joined", res["status"], res["state"])
 	}
-	if res["channel_id"] != "chan-norm" {
-		t.Errorf("channel_id = %v, want normalized chan-norm", res["channel_id"])
+	if res["channel_id"] != huddleTestChannelID {
+		t.Errorf("channel_id = %v, want normalized %s", res["channel_id"], huddleTestChannelID)
 	}
-	if res["self_id"] != "agent-1" || res["self_kind"] != "agent" {
-		t.Errorf("self identity = %v/%v, want agent-1/agent", res["self_id"], res["self_kind"])
+	if res["self_id"] != huddleTestAgentID || res["self_kind"] != "agent" {
+		t.Errorf("self identity = %v/%v, want %s/agent", res["self_id"], res["self_kind"], huddleTestAgentID)
 	}
-	if res["connected_peer_count"].(float64) != 1 {
-		t.Errorf("connected_peer_count = %v, want 1", res["connected_peer_count"])
+	if res["connected_peer_count"].(float64) != 2 {
+		t.Errorf("connected_peer_count = %v, want 2", res["connected_peer_count"])
 	}
 	if br.evalCalls < 3 {
 		t.Errorf("evalCalls = %d, expected the loop to poll through startup", br.evalCalls)
@@ -179,11 +225,14 @@ func TestHuddleJoin_ConnectingJoined(t *testing.T) {
 		t.Fatalf("navigated = %v, want exactly one navigation", br.navigated)
 	}
 	nav := br.navigated[0]
-	if !strings.Contains(nav, "/huddle-bot/chan-norm#token=act_secret") {
+	if !strings.Contains(nav, "/huddle-bot/"+huddleTestChannelID+"#token=act_secret") {
 		t.Errorf("navigation URL %q missing normalized channel + fragment token", nav)
 	}
 	if !br.closed {
 		t.Errorf("session cleanup (Close) was not called")
+	}
+	if terminalStatus != "completed" {
+		t.Errorf("terminal status = %q, want completed", terminalStatus)
 	}
 }
 
@@ -242,8 +291,8 @@ func TestHuddleJoin_NeverPublishes(t *testing.T) {
 // confirmed success into failure).
 func TestHuddleJoin_JoinedIsTerminal(t *testing.T) {
 	br := &fakeHuddleBrowser{states: []string{
-		stateJSON("joined", "agent-1", 1, 1),
-		stateJSON("left", "agent-1", 0, 0), // would fail if re-sampled
+		stateJSON("joined", huddleTestAgentID, 1, 1),
+		stateJSON("left", huddleTestAgentID, 0, 0), // would fail if re-sampled
 	}}
 	h := newTestHuddleHandler("s3cr3t", okMint(huddleToken{Token: "t", ChannelID: "c"}), br)
 
@@ -253,8 +302,8 @@ func TestHuddleJoin_JoinedIsTerminal(t *testing.T) {
 	}
 	var res map[string]any
 	_ = json.Unmarshal(out, &res)
-	if res["status"] != "joined" {
-		t.Errorf("status = %v, want joined", res["status"])
+	if res["status"] != "completed" {
+		t.Errorf("status = %v, want completed", res["status"])
 	}
 	if br.idx > 1 {
 		t.Errorf("browser was sampled %d times; joined should be terminal (no re-poll into left)", br.idx)
@@ -355,11 +404,11 @@ func TestHuddleJoin_PayloadAPIBaseCannotRedirectCredential(t *testing.T) {
 }
 
 func TestHuddleJoin_UsesConvergedCredentialOrigin(t *testing.T) {
-	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", "agent-1", 1, 1)}}
+	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}}
 	var gotBase, gotToken string
 	h := newTestHuddleHandler("ignored", func(_ context.Context, base *url.URL, token string, _ huddleJoinParams) (huddleToken, error) {
 		gotBase, gotToken = base.String(), token
-		return huddleToken{Token: "bot", ChannelID: "chan-1", SelfID: "agent-1", SelfKind: "agent"}, nil
+		return huddleToken{Token: "bot", ChannelID: huddleTestChannelID, SelfID: huddleTestAgentID, SelfKind: "agent", CallID: huddleTestCallID, AttemptID: huddleTestAttemptID}, nil
 	}, br)
 	h.credsFn = func() config.DeviceCreds {
 		return config.DeviceCreds{Token: "enrolled-device-token", APIBaseURL: "https://ORG.EXAMPLE/"}
@@ -416,18 +465,20 @@ func TestMintHuddleBotToken_RequestShape(t *testing.T) {
 		raw, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(raw, &gotBody)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"token":     "act_xyz",
-			"channelId": "chan-normalized",
-			"selfId":    "agent-1",
-			"selfKind":  "agent",
-			"expiresAt": "2026-01-01T00:00:00Z",
+			"token":              "act_xyz",
+			"channelId":          huddleTestChannelID,
+			"selfId":             huddleTestAgentID,
+			"selfKind":           "agent",
+			"callId":             huddleTestCallID,
+			"lifecycleAttemptId": huddleTestAttemptID,
+			"expiresAt":          "2026-01-01T00:00:00Z",
 		})
 	}))
 	defer srv.Close()
 
 	base, _ := url.Parse(srv.URL)
 	tok, err := mintHuddleBotToken(context.Background(), srv.Client(), base, "top-secret",
-		huddleJoinParams{ChannelID: "chan-1", AgentID: "agent-1"})
+		testHuddleParams())
 	if err != nil {
 		t.Fatalf("mint returned error: %v", err)
 	}
@@ -437,10 +488,10 @@ func TestMintHuddleBotToken_RequestShape(t *testing.T) {
 	if gotAuth != "Bearer top-secret" {
 		t.Errorf("auth = %q, want Bearer top-secret", gotAuth)
 	}
-	if gotBody["agentId"] != "agent-1" || gotBody["channelId"] != "chan-1" {
-		t.Errorf("body = %v, want {agentId:agent-1, channelId:chan-1}", gotBody)
+	if gotBody["agentId"] != huddleTestAgentID || gotBody["channelId"] != huddleTestChannelID || gotBody["callId"] != huddleTestCallID || gotBody["jobId"] != huddleTestJobID || gotBody["lifecycleAttemptId"] != huddleTestAttemptID {
+		t.Errorf("body = %v, want the exact lifecycle tuple", gotBody)
 	}
-	if tok.Token != "act_xyz" || tok.ChannelID != "chan-normalized" || tok.SelfID != "agent-1" || tok.SelfKind != "agent" {
+	if tok.Token != "act_xyz" || tok.ChannelID != huddleTestChannelID || tok.SelfID != huddleTestAgentID || tok.SelfKind != "agent" || tok.CallID != huddleTestCallID || tok.AttemptID != huddleTestAttemptID {
 		t.Errorf("parsed token = %+v, want distinct agent identity contract populated", tok)
 	}
 }
@@ -454,16 +505,18 @@ func TestMintHuddleBotToken_RejectsLegacyOrMismatchedIdentity(t *testing.T) {
 		{
 			name: "legacy author identity",
 			body: map[string]any{
-				"token": "act_xyz", "channelId": "chan-1",
+				"token": "act_xyz", "channelId": huddleTestChannelID,
 				"selfUserId": "author-1", "access": "member",
+				"callId": huddleTestCallID, "lifecycleAttemptId": huddleTestAttemptID,
 			},
 			want: "distinct agent identity",
 		},
 		{
 			name: "different agent",
 			body: map[string]any{
-				"token": "act_xyz", "channelId": "chan-1",
+				"token": "act_xyz", "channelId": huddleTestChannelID,
 				"selfId": "agent-2", "selfKind": "agent",
+				"callId": huddleTestCallID, "lifecycleAttemptId": huddleTestAttemptID,
 			},
 			want: "unexpected agent",
 		},
@@ -476,7 +529,7 @@ func TestMintHuddleBotToken_RejectsLegacyOrMismatchedIdentity(t *testing.T) {
 
 			base, _ := url.Parse(srv.URL)
 			_, err := mintHuddleBotToken(context.Background(), srv.Client(), base, "device-token",
-				huddleJoinParams{ChannelID: "chan-1", AgentID: "agent-1"})
+				testHuddleParams())
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("mint error = %v, want %q", err, tc.want)
 			}
@@ -561,7 +614,7 @@ func TestHuddleJoin_CancelledAfterMintNeverLaunchesBrowser(t *testing.T) {
 	launched := false
 	h := newTestHuddleHandler("device-token", func(context.Context, *url.URL, string, huddleJoinParams) (huddleToken, error) {
 		cancel()
-		return huddleToken{Token: "bot", ChannelID: "c", SelfID: "agent-1", SelfKind: "agent"}, nil
+		return huddleToken{Token: "bot", ChannelID: huddleTestChannelID, SelfID: huddleTestAgentID, SelfKind: "agent", CallID: huddleTestCallID, AttemptID: huddleTestAttemptID}, nil
 	}, &fakeHuddleBrowser{})
 	h.newBrowser = func(context.Context, huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
 		launched = true
@@ -580,6 +633,11 @@ func TestHuddleJoin_CancelledAfterMintNeverLaunchesBrowser(t *testing.T) {
 func TestHuddleJoin_CancellationInterruptsBlockedNavigateAndCleansUp(t *testing.T) {
 	br := &fakeHuddleBrowser{blockNavigate: true, navigateStarted: make(chan struct{}, 1)}
 	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
+	var terminalStatus string
+	h.reportTerminal = func(_ context.Context, _ *url.URL, _ huddleToken, status, _ string) error {
+		terminalStatus = status
+		return nil
+	}
 	jobCtx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -602,6 +660,9 @@ func TestHuddleJoin_CancellationInterruptsBlockedNavigateAndCleansUp(t *testing.
 	}
 	if !br.closed {
 		t.Fatal("session cleanup did not run after cancelled navigation")
+	}
+	if terminalStatus != "cancelled" {
+		t.Fatalf("terminal status = %q, want cancelled", terminalStatus)
 	}
 }
 
@@ -634,7 +695,7 @@ func TestHuddleJoin_CancellationInterruptsBlockedEvaluateAndCleansUp(t *testing.
 }
 
 func TestHuddleJoin_SuccessRequiresCleanup(t *testing.T) {
-	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", "agent-1", 1, 1)}, closeErr: errors.New("delete returned 500")}
+	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}, closeErr: errors.New("delete returned 500")}
 	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
 
 	_, err := h.Execute(JobContext{}, huddleJob())
@@ -656,6 +717,79 @@ func TestHuddleJoin_FailureKeepsPrimaryAndLogsCleanupFailure(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(logs, "\n"), "cleanup failed") {
 		t.Fatalf("logs = %v, want secondary cleanup failure", logs)
+	}
+}
+
+func TestHuddleLifecycleEndpointsUseExactBoundIdentity(t *testing.T) {
+	var paths []string
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer act_bound" {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		paths = append(paths, r.URL.Path)
+		bodies = append(bodies, body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL)
+	tok := huddleToken{
+		Token: "act_bound", ChannelID: huddleTestChannelID, SelfID: huddleTestAgentID,
+		SelfKind: "agent", CallID: huddleTestCallID, AttemptID: huddleTestAttemptID,
+	}
+	state := huddleBotState{
+		State: "joined", CallID: huddleTestCallID, SelfID: huddleTestAgentID,
+		PeerCount: 2, ConnectedPeerCount: 2,
+	}
+	if err := acknowledgeHuddleReady(context.Background(), srv.Client(), base, tok, state); err != nil {
+		t.Fatalf("acknowledgeHuddleReady: %v", err)
+	}
+	if err := reportHuddleTerminal(context.Background(), srv.Client(), base, tok, "cancelled", "host_removed"); err != nil {
+		t.Fatalf("reportHuddleTerminal: %v", err)
+	}
+	if len(paths) != 2 || paths[0] != "/api/huddle-bot/lifecycle/ready" || paths[1] != "/api/huddle-bot/lifecycle/terminal" {
+		t.Fatalf("paths = %v", paths)
+	}
+	if bodies[0]["callId"] != huddleTestCallID || bodies[0]["selfId"] != huddleTestAgentID || bodies[0]["roomReady"] != true || bodies[0]["transportReady"] != true {
+		t.Errorf("readiness body = %v", bodies[0])
+	}
+	if bodies[1]["callId"] != huddleTestCallID || bodies[1]["lifecycleAttemptId"] != huddleTestAttemptID || bodies[1]["status"] != "cancelled" || bodies[1]["detail"] != "host_removed" {
+		t.Errorf("terminal body = %v", bodies[1])
+	}
+}
+
+func TestReportHuddleTerminalRedactsCredentialAndRefusesRedirect(t *testing.T) {
+	errorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"bad act_secret"}`))
+	}))
+	defer errorServer.Close()
+	errorBase, _ := url.Parse(errorServer.URL)
+	tok := huddleToken{Token: "act_secret", CallID: huddleTestCallID, AttemptID: huddleTestAttemptID}
+	err := reportHuddleTerminal(context.Background(), errorServer.Client(), errorBase, tok, "failed", "test")
+	if err == nil || strings.Contains(err.Error(), tok.Token) || !strings.Contains(err.Error(), "<redacted>") {
+		t.Fatalf("terminal error was not credential-safe: %v", err)
+	}
+
+	var leakedAuth string
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer destination.Close()
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, destination.URL+"/stolen", http.StatusTemporaryRedirect)
+	}))
+	defer start.Close()
+	base, _ := url.Parse(start.URL)
+	err = reportHuddleTerminal(context.Background(), start.Client(), base, tok, "failed", "test")
+	if err == nil || !strings.Contains(err.Error(), "307") || strings.Contains(err.Error(), tok.Token) {
+		t.Fatalf("terminal redirect error = %v", err)
+	}
+	if leakedAuth != "" {
+		t.Fatalf("credential leaked to redirect destination: %q", leakedAuth)
 	}
 }
 

@@ -45,6 +45,7 @@ type Runner struct {
 	unboundedLane      *lane
 	inferenceLane      *lane
 	inferenceQueueWait time.Duration
+	huddleCancelPoll   time.Duration
 
 	// state, when set, records live introspection metrics (poll time, job
 	// counts) for the out-of-band status/control path (issue #236).
@@ -892,14 +893,25 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	execStart := time.Now()
 	var result *JobResult
 	var err error
+	handlerCtx, stopCancellationWatch := r.watchHuddleCancellation(ctx, job)
 	if timeout, ok := r.resolveJobTimeout(job); ok {
-		result, err = r.executeWithDeadline(ctx, handler, job, stream, timeout)
+		result, err = r.executeWithDeadline(handlerCtx, handler, job, stream, timeout)
 	} else {
-		result, err = handler.Execute(ctx, job, stream)
+		result, err = handler.Execute(handlerCtx, job, stream)
 	}
+	cancelled := stopCancellationWatch()
 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
+	if cancelled {
+		r.log("info", "Huddle job %s cancelled during execution", job.ID)
+		r.recordJob(buildUsageRecord(job, "cancelled", startTime, endTime, result, context.Canceled))
+		if werr := stream.WriteCancelled("Huddle lifecycle cancelled"); werr != nil {
+			r.log("warning", "Failed to publish cancelled event for job %s: %v", job.ID, werr)
+		}
+		r.source.Ack(ctx, job)
+		return false
+	}
 
 	if err != nil || (result != nil && result.Status == JobStatusFailure) {
 		actualErr := err
@@ -933,6 +945,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// Files permission is captured when handlers are built. A refusal is
 		// terminal even on the first delivery: retries cannot enable Files.
 		isFilesDisabled := errors.Is(actualErr, jobs.ErrFilesDisabled)
+		isHuddleJoin := job.Type == JobTypeHuddleJoin
 
 		// Exactly one terminal event per job id (issue #826). A generic failure
 		// that will be retried (Nack path, another attempt still within budget)
@@ -947,7 +960,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// publishes, so a job that exhausts its retries still reports failure
 		// exactly once. Mirrors the reasoning #822/#559 already applied to the
 		// JobStatusRetry and no-GPU-slot Nack paths below/above.
-		if isDeadlineExceeded || isFilesDisabled || !willRetry(job) {
+		if isDeadlineExceeded || isFilesDisabled || isHuddleJoin || !willRetry(job) {
 			if werr := stream.WriteError(actualErr, false); werr != nil {
 				r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
 			}
@@ -965,6 +978,16 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		if isFilesDisabled {
 			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "files_disabled"}); ferr != nil {
 				r.log("warning", "Failed to ack Files-disabled job %s: %v", job.ID, ferr)
+			}
+			return false
+		}
+
+		// A HUDDLE_JOIN lifecycle attempt is itself the retry boundary. The
+		// platform owns successor-attempt creation, so redelivering the same job
+		// after an exact terminal report would only replay stale authority.
+		if isHuddleJoin {
+			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "huddle_lifecycle_failed"}); ferr != nil {
+				r.log("warning", "Failed to ack terminal huddle job %s: %v", job.ID, ferr)
 			}
 			return false
 		}
@@ -998,6 +1021,48 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	}
 	r.finishSuccess(ctx, job, stream, result, startTime, endTime)
 	return true
+}
+
+// watchHuddleCancellation turns the platform's durable cancellation marker
+// into the execution context cancellation resident HUDDLE_JOIN handlers need.
+// Other job types retain the existing pre-execution-only cancellation check.
+func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context.Context, func() bool) {
+	if job.Type != JobTypeHuddleJoin {
+		return ctx, func() bool { return false }
+	}
+	execCtx, cancelExec := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var cancelled atomic.Bool
+	interval := r.huddleCancelPoll
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if r.source.IsJobCancelled(ctx, job.ID) {
+					cancelled.Store(true)
+					cancelExec()
+					return
+				}
+			}
+		}
+	}()
+	return execCtx, func() bool {
+		close(stop)
+		<-done
+		cancelExec()
+		return cancelled.Load()
+	}
 }
 
 // finishWorkerControl ACKs before reporting acceptance. Scheduling is prepared
