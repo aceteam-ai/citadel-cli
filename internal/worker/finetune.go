@@ -218,6 +218,21 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 			}
 			fields := map[string]any{"status": "failed", "error": errorText, "finished_at": time.Now().UTC().Format(time.RFC3339)}
 			if persistErr := h.persistTerminal(job.ID, fields, !honorCancellation); persistErr != nil {
+				// Cancellation can commit after the read above but before this
+				// terminal write. The non-critical update then correctly conflicts
+				// with the canonical cancelling state. Re-read before treating that
+				// conflict as a failure: only a successful canonical cancellation
+				// read may reclassify the outcome, and cancelled() must still persist
+				// the terminal state before the safety hold is cleared.
+				if honorCancellation {
+					cancelled, checkErr := h.cfg.Control.Cancelled(context.Background(), job.ID)
+					if checkErr == nil && cancelled {
+						return h.cancelled(context.Background(), job.ID, stream, "cancelled", holdArmed && safeCleanup)
+					}
+					if checkErr != nil {
+						err = errors.Join(err, fmt.Errorf("FINETUNE_START: cancellation status recheck after failed terminal update: %w", checkErr))
+					}
+				}
 				err = errors.Join(err, fmt.Errorf("FINETUNE_START: canonical failure status update failed: %w", persistErr))
 			} else if holdArmed && safeCleanup {
 				if clearErr := h.clearSafetyHold(job.ID); clearErr != nil {

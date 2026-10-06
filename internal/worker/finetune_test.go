@@ -14,24 +14,41 @@ import (
 )
 
 type fineTuneControlFake struct {
-	mu          sync.Mutex
-	cancelled   bool
-	updates     []map[string]any
-	critical    []map[string]any
-	events      []map[string]any
-	updateErr   error
-	terminalErr error
-	cancelErr   error
+	mu           sync.Mutex
+	cancelled    bool
+	cancelChecks []fineTuneCancelCheck
+	updates      []map[string]any
+	critical     []map[string]any
+	events       []map[string]any
+	updateErr    error
+	terminalErr  error
+	cancelErr    error
+	updateHook   func(map[string]any) error
+}
+
+type fineTuneCancelCheck struct {
+	cancelled bool
+	err       error
 }
 
 func (c *fineTuneControlFake) Cancelled(context.Context, string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(c.cancelChecks) > 0 {
+		result := c.cancelChecks[0]
+		c.cancelChecks = c.cancelChecks[1:]
+		return result.cancelled, result.err
+	}
 	return c.cancelled, c.cancelErr
 }
 func (c *fineTuneControlFake) Update(_ context.Context, _ string, fields map[string]any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.updateHook != nil {
+		if err := c.updateHook(fields); err != nil {
+			return err
+		}
+	}
 	if c.updateErr != nil {
 		return c.updateErr
 	}
@@ -270,6 +287,109 @@ func TestFineTuneCancelPollFailureStopsRunAndReportsFailure(t *testing.T) {
 	defer control.mu.Unlock()
 	if len(control.updates) == 0 || control.updates[len(control.updates)-1]["status"] != "failed" {
 		t.Fatalf("final status = %#v", control.updates)
+	}
+}
+
+func TestFineTuneFailureConflictRechecksCancellationAndPersistsCancelled(t *testing.T) {
+	cfg, job, control, reservation := fineTuneFixture(t)
+	control.cancelChecks = []fineTuneCancelCheck{
+		{},                // pre-start
+		{},                // post-run
+		{},                // terminalFailure before the failed write
+		{cancelled: true}, // cancellation committed concurrently with the write
+	}
+	conflicts := 0
+	control.updateHook = func(fields map[string]any) error {
+		if fields["status"] == "failed" {
+			conflicts++
+			return errors.New("status conflict")
+		}
+		return nil
+	}
+	cfg.Run = func(context.Context, FineTuneSpec, func(map[string]any) error) error {
+		return errors.New("training failed")
+	}
+	stream := &MockStreamWriter{}
+	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, stream)
+	if res.Status != JobStatusCancelled || !stream.cancelled {
+		t.Fatalf("result=%+v stream.cancelled=%v", res, stream.cancelled)
+	}
+	if conflicts != 3 {
+		t.Fatalf("failed terminal attempts=%d, want 3", conflicts)
+	}
+	if reservation.release != 1 {
+		t.Fatalf("restore=%d", reservation.release)
+	}
+	if got := control.updates[len(control.updates)-1]["status"]; got != "cancelled" {
+		t.Fatalf("final status=%v updates=%#v", got, control.updates)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.SafetyDir, fineTuneSafetyHold)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("confirmed cancellation left safety hold: %v", err)
+	}
+}
+
+func TestFineTuneFailureConflictFailsClosedWithoutConfirmedCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		recheck     fineTuneCancelCheck
+		wantMessage string
+	}{
+		{name: "not cancelled", recheck: fineTuneCancelCheck{}},
+		{name: "recheck error", recheck: fineTuneCancelCheck{err: errors.New("canonical read unavailable")}, wantMessage: "cancellation status recheck"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, job, control, reservation := fineTuneFixture(t)
+			control.cancelChecks = []fineTuneCancelCheck{{}, {}, {}, test.recheck}
+			control.updateHook = func(fields map[string]any) error {
+				if fields["status"] == "failed" {
+					return errors.New("status conflict")
+				}
+				return nil
+			}
+			cfg.Run = func(context.Context, FineTuneSpec, func(map[string]any) error) error {
+				return errors.New("training failed")
+			}
+			stream := &MockStreamWriter{}
+			res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, stream)
+			if res.Status != JobStatusTerminalFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "canonical failure status update failed") {
+				t.Fatalf("result=%+v", res)
+			}
+			if test.wantMessage != "" && !strings.Contains(res.Error.Error(), test.wantMessage) {
+				t.Fatalf("error=%q, want %q", res.Error, test.wantMessage)
+			}
+			if stream.cancelled || reservation.release != 1 {
+				t.Fatalf("stream.cancelled=%v restore=%d", stream.cancelled, reservation.release)
+			}
+			if _, err := os.Stat(filepath.Join(cfg.SafetyDir, fineTuneSafetyHold)); err != nil {
+				t.Fatalf("unconfirmed terminal state lost safety hold: %v", err)
+			}
+		})
+	}
+}
+
+func TestFineTuneFailureConflictKeepsHoldWhenCancelledPersistenceFails(t *testing.T) {
+	cfg, job, control, reservation := fineTuneFixture(t)
+	control.cancelChecks = []fineTuneCancelCheck{{}, {}, {}, {cancelled: true}}
+	control.terminalErr = errors.New("cancelled status unavailable")
+	control.updateHook = func(fields map[string]any) error {
+		if fields["status"] == "failed" {
+			return errors.New("status conflict")
+		}
+		return nil
+	}
+	cfg.Run = func(context.Context, FineTuneSpec, func(map[string]any) error) error {
+		return errors.New("training failed")
+	}
+	stream := &MockStreamWriter{}
+	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, stream)
+	if res.Status != JobStatusTerminalFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "canonical status update failed") {
+		t.Fatalf("result=%+v", res)
+	}
+	if stream.cancelled || reservation.release != 1 {
+		t.Fatalf("stream.cancelled=%v restore=%d", stream.cancelled, reservation.release)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.SafetyDir, fineTuneSafetyHold)); err != nil {
+		t.Fatalf("failed cancellation persistence lost safety hold: %v", err)
 	}
 }
 
