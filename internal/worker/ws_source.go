@@ -259,6 +259,52 @@ func (s *WSSource) Nack(ctx context.Context, job *Job, err error) error {
 	return nil
 }
 
+func (s *WSSource) DeferHuddleTeardown(ctx context.Context, job *Job, err error) error {
+	return s.AckHuddleCoordinatorTerminal(ctx, job)
+}
+
+func (s *WSSource) AckHuddleCoordinatorTerminal(ctx context.Context, job *Job) error {
+	queue := job.SourceQueue
+	if queue == "" {
+		if qs := s.snapshotQueues(); len(qs) > 0 {
+			queue = qs[0]
+		}
+	}
+	ws := s.client.WebSocket()
+	if ws != nil && ws.IsConnected() {
+		if ackErr := ws.AckJob(queue, s.config.ConsumerGroup, job.MessageID); ackErr == nil {
+			return nil
+		}
+	}
+	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
+		Queue: queue, Group: s.config.ConsumerGroup, MessageID: job.MessageID,
+	})
+}
+
+func (s *WSSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err error) error {
+	if statusErr := s.client.SetJobStatus(ctx, job.ID, "retry", map[string]any{
+		"reason": "huddle_terminal_intent_pending",
+		"error":  err.Error(),
+	}); statusErr != nil {
+		return statusErr
+	}
+	queue := job.SourceQueue
+	if queue == "" {
+		if qs := s.snapshotQueues(); len(qs) > 0 {
+			queue = qs[0]
+		}
+	}
+	ws := s.client.WebSocket()
+	if ws != nil && ws.IsConnected() {
+		if ackErr := ws.AckJob(queue, s.config.ConsumerGroup, job.MessageID); ackErr == nil {
+			return nil
+		}
+	}
+	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
+		Queue: queue, Group: s.config.ConsumerGroup, MessageID: job.MessageID,
+	})
+}
+
 // Fail is a terminal failure: record "failed" status (with structured data) and
 // ACK the message so it is removed from the consumer group's PEL. Used for
 // failures that will never succeed on retry (e.g. an unsupported job type). The

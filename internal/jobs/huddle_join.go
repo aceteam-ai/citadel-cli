@@ -54,6 +54,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
@@ -67,6 +68,7 @@ import (
 // JobType constants and imports this package, not the reverse). Kept in sync with
 // worker.JobTypeHuddleJoin.
 const JobTypeHuddleJoinType = "HUDDLE_JOIN"
+const JobTypeHuddleTeardownType = "HUDDLE_TEARDOWN"
 
 // Timeouts and cadence for the mint -> navigate -> confirm lifecycle.
 // huddleConnectTimeout bounds the page mounting, acquiring the mic, opening the
@@ -82,6 +84,29 @@ const (
 	// (DELETE /sessions) tears it down on the normal path well before this.
 	huddleSessionMaxDuration = 1 * time.Hour
 )
+
+// ErrHuddleTeardownPending marks a non-terminal execution result: the exact
+// lifecycle attempt may still own its deterministic meetingd session and must
+// be redelivered until node teardown is positively confirmed. The worker must
+// Nack this without publishing a terminal stream event or acknowledging a
+// cancellation, otherwise the coordinator's durable cleanup debt is stranded.
+var ErrHuddleTeardownPending = errors.New("huddle node teardown pending")
+
+// ErrHuddleTerminalIntentPending means the coordinator did not durably accept
+// the exact attempt's terminal target. Unlike teardown debt, the original
+// delivery must remain retryable: no server-owned recovery job exists yet.
+var ErrHuddleTerminalIntentPending = errors.New("huddle terminal intent pending")
+
+// ErrHuddleLifecycleOutboxUnavailable means neither the server nor the durable
+// node-local outbox owns recovery. The original delivery must remain pending.
+var ErrHuddleLifecycleOutboxUnavailable = errors.New("huddle lifecycle outbox unavailable")
+
+// ErrHuddleTerminalOwned means the coordinator has already committed (and
+// exactly-once published) the original delivery's terminal result. The Runner
+// must only remove the queue delivery; publishing locally would duplicate it.
+var ErrHuddleTerminalOwned = errors.New("huddle terminal owned by coordinator")
+
+var errHuddleAlreadyTerminal = errors.New("huddle lifecycle already terminal")
 
 // huddleBrowser is the minimal CDP surface the huddle join drives — navigate to
 // the bot page and poll the readiness signal. It is a subset of the
@@ -106,19 +131,40 @@ type huddleJoinParams struct {
 	AttemptID        string
 	RequestedAPIBase string // legacy compatibility check only; never a destination
 	Converse         bool
+	TeardownOnly     bool
+	TerminalResult   string
 }
 
 // parseHuddleJoinParams validates + normalizes the raw string payload.
-func parseHuddleJoinParams(jobID string, payload map[string]string) (huddleJoinParams, error) {
+func parseHuddleJoinParams(jobID, jobType string, payload map[string]string) (huddleJoinParams, error) {
+	teardownOnly, err := strconv.ParseBool(strings.TrimSpace(payload["teardownOnly"]))
+	if strings.TrimSpace(payload["teardownOnly"]) == "" {
+		teardownOnly = false
+		err = nil
+	}
+	if err != nil {
+		return huddleJoinParams{}, fmt.Errorf("invalid 'teardownOnly' value %q: must be true or false", payload["teardownOnly"])
+	}
+	if jobType == JobTypeHuddleTeardownType && !teardownOnly {
+		return huddleJoinParams{}, fmt.Errorf("HUDDLE_TEARDOWN requires teardownOnly=true")
+	}
+	if jobType == JobTypeHuddleJoinType && teardownOnly {
+		return huddleJoinParams{}, fmt.Errorf("HUDDLE_JOIN cannot run teardownOnly mode")
+	}
+	lifecycleJobID := strings.TrimSpace(jobID)
+	if teardownOnly {
+		lifecycleJobID = strings.TrimSpace(payload["lifecycleJobId"])
+	}
 	p := huddleJoinParams{
 		OrganizationID:   strings.TrimSpace(payload["organizationId"]),
 		ChannelID:        strings.TrimSpace(payload["channelId"]),
 		CallID:           strings.TrimSpace(payload["callId"]),
 		AgentID:          strings.TrimSpace(payload["agentId"]),
 		NodeID:           strings.TrimSpace(payload["target_node"]),
-		JobID:            strings.TrimSpace(jobID),
+		JobID:            lifecycleJobID,
 		AttemptID:        strings.TrimSpace(payload["lifecycleAttemptId"]),
 		RequestedAPIBase: strings.TrimSpace(payload["api_base"]),
+		TeardownOnly:     teardownOnly,
 	}
 	if raw := strings.TrimSpace(payload["converse"]); raw != "" {
 		converse, err := strconv.ParseBool(raw)
@@ -201,6 +247,16 @@ type HuddleJoinHandler struct {
 	// reportTerminal persists the exact attempt's completed, failed, or
 	// cancelled state. nil uses the authenticated lifecycle terminal endpoint.
 	reportTerminal func(ctx context.Context, apiBase *url.URL, tok huddleToken, status, detail string) error
+	// confirmNodeTeardown uses enrolled-device auth so a restart-safe cleanup
+	// delivery never has to persist the short-lived bot bearer.
+	confirmNodeTeardown   func(ctx context.Context, apiBase *url.URL, deviceToken string, p huddleJoinParams, leaseID string) error
+	prepareTerminalIntent func(ctx context.Context, apiBase *url.URL, deviceToken string, p huddleJoinParams, status, detail string) error
+	authorizeNodeTeardown func(ctx context.Context, apiBase *url.URL, deviceToken string, p huddleJoinParams) (string, error)
+	// cleanupNodeSession removes the deterministic meetingd session for a
+	// cleanup-only recovery delivery. nil uses containerMedia.CloseContext.
+	cleanupNodeSession func(ctx context.Context, p huddleJoinParams) error
+	outboxMu           sync.Mutex
+	outboxDir          string
 
 	// Tunables (zero => package defaults at use). Tests set them to milliseconds.
 	connectTimeout time.Duration
@@ -219,7 +275,7 @@ func NewHuddleJoinHandler(workspace string) *HuddleJoinHandler {
 // channel (403/404) costs nothing — we never pay for a container session we would
 // immediately abandon.
 func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []byte, err error) {
-	p, err := parseHuddleJoinParams(job.ID, job.Payload)
+	p, err := parseHuddleJoinParams(job.ID, job.Type, job.Payload)
 	if err != nil {
 		return nil, err
 	}
@@ -231,24 +287,16 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 	}
 
 	ctx.Log("info", "     - [Job %s] HUDDLE_JOIN channel=%s agent=%s (api_origin=%s)", job.ID, p.ChannelID, p.AgentID, apiBase.Redacted())
+	if p.TeardownOnly {
+		return h.executeTeardownOnly(ctx, apiBase, deviceToken, p)
+	}
 
-	// Mint the short-lived bot token FIRST (before any container work).
-	tok, err := h.mint(jobCtx, apiBase, deviceToken, p)
-	if err != nil {
-		return nil, fmt.Errorf("mint huddle bot token: %w", err)
-	}
-	if err := validateHuddleToken(tok, p); err != nil {
-		return nil, fmt.Errorf("mint huddle bot token: %w", err)
-	}
-	nodeTeardownConfirmed := true
+	var cleanup func(context.Context) error
+	// One ordered finalizer owns every exit path. It persists terminal intent
+	// before any destructive DELETE, then performs an exact-attempt authorized
+	// cleanup. If either phase is interrupted, the coordinator's indexed
+	// lifecycle or the original unacked delivery remains the durable owner.
 	defer func() {
-		// A terminal report is also the server's proof that this exact node
-		// session is gone. If meetingd teardown is still unconfirmed, leave the
-		// attempt indexed so durable server cleanup cannot be discarded.
-		if !nodeTeardownConfirmed {
-			ctx.Log("error", "     - [Job %s] retaining huddle lifecycle cleanup debt: node teardown is unconfirmed", job.ID)
-			return
-		}
 		status := "completed"
 		detail := ""
 		if err != nil {
@@ -258,16 +306,61 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 				status = "cancelled"
 			}
 		}
-		reportCtx, cancel := context.WithTimeout(context.Background(), huddleTokenHTTPTimeout)
-		defer cancel()
-		if reportErr := h.terminal(reportCtx, apiBase, tok, status, detail); reportErr != nil {
-			if err == nil {
-				err = fmt.Errorf("report huddle lifecycle terminal state: %w", reportErr)
-			} else {
-				ctx.Log("error", "     - [Job %s] terminal lifecycle report failed: %v", job.ID, reportErr)
-			}
+		terminalResult := map[string]any{}
+		if status == "completed" {
+			terminalResult["output"] = string(output)
+		}
+		terminalResultJSON, marshalErr := json.Marshal(terminalResult)
+		if marshalErr != nil {
+			err = errors.Join(err, fmt.Errorf("%w: encode terminal result: %v", ErrHuddleLifecycleOutboxUnavailable, marshalErr))
+			return
+		}
+		p.TerminalResult = string(terminalResultJSON)
+		outboxPath, outboxErr := h.persistLifecycleDebt(p, status, detail)
+		if outboxErr != nil {
+			err = errors.Join(err, fmt.Errorf("%w: %v", ErrHuddleLifecycleOutboxUnavailable, outboxErr))
+			return
+		}
+		prepare := h.prepareTerminalIntent
+		if prepare == nil {
+			prepare = prepareHuddleTerminalIntent
+		}
+		prepareCtx, cancel := context.WithTimeout(context.Background(), huddleTokenHTTPTimeout)
+		prepareErr := prepare(prepareCtx, apiBase, deviceToken, p, status, detail)
+		cancel()
+		if errors.Is(prepareErr, errHuddleAlreadyTerminal) {
+			_ = removeLifecycleDebt(outboxPath)
+			err = errors.Join(err, ErrHuddleTerminalOwned)
+			return
+		}
+		if prepareErr != nil {
+			err = errors.Join(err, fmt.Errorf("%w: %v", ErrHuddleTerminalIntentPending, prepareErr))
+			return
+		}
+		_ = removeLifecycleDebt(outboxPath)
+		if cleanup == nil {
+			cleanup = func(context.Context) error { return nil }
+		}
+		if cleanupErr := h.runAuthorizedCleanup(apiBase, deviceToken, p, cleanup); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("%w: %v", ErrHuddleTeardownPending, cleanupErr))
+			return
+		}
+		// Preserve the primary error while marking its terminal as coordinator
+		// owned. A successful handler remains successful: Runner has a dedicated
+		// HUDDLE_JOIN success branch that raw-ACKs without publishing locally.
+		if err != nil {
+			err = errors.Join(err, ErrHuddleTerminalOwned)
 		}
 	}()
+
+	// Mint the short-lived bot token FIRST (before any container work).
+	tok, err := h.mint(jobCtx, apiBase, deviceToken, p)
+	if err != nil {
+		return nil, fmt.Errorf("mint huddle bot token: %w", err)
+	}
+	if err := validateHuddleToken(tok, p); err != nil {
+		return nil, fmt.Errorf("mint huddle bot token: %w", err)
+	}
 	if err := jobCtx.Err(); err != nil {
 		return nil, fmt.Errorf("huddle join cancelled after token mint: %w", err)
 	}
@@ -279,24 +372,11 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 	ctx.Log("info", "     - [Job %s] minted bot token (self=%s, kind=%s, channel=%s)", job.ID, tok.SelfID, tok.SelfKind, joinChannel)
 
 	// Launch (or reuse) the container session -> CDP browser.
-	br, cleanup, err := h.launchBrowser(jobCtx, p)
+	br, launchedCleanup, err := h.launchBrowser(jobCtx, p)
+	cleanup = launchedCleanup
 	if err != nil {
 		return nil, fmt.Errorf("launch huddle browser: %w", err)
 	}
-	nodeTeardownConfirmed = false
-	cleaned := false
-	defer func() {
-		if cleanup != nil && !cleaned {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), meetingContainerHTTPTimeout)
-			defer cancel()
-			if cleanupErr := cleanup(cleanupCtx); cleanupErr != nil {
-				ctx.Log("error", "     - [Job %s] huddle session cleanup failed after job error: %v", job.ID, cleanupErr)
-			} else {
-				cleaned = true
-				nodeTeardownConfirmed = true
-			}
-		}
-	}()
 	if err := jobCtx.Err(); err != nil {
 		return nil, fmt.Errorf("huddle join cancelled after browser launch: %w", err)
 	}
@@ -338,19 +418,6 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 		return nil, fmt.Errorf("acknowledge huddle media readiness: %w", err)
 	}
 
-	// A joined result is only successful after meetingd confirms teardown. This
-	// prevents a leaked one-session-per-node slot from being reported as success.
-	if cleanup != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), meetingContainerHTTPTimeout)
-		cleanupErr := cleanup(cleanupCtx)
-		cancel()
-		if cleanupErr != nil {
-			return nil, fmt.Errorf("huddle joined but session cleanup failed: %w", cleanupErr)
-		}
-		cleaned = true
-		nodeTeardownConfirmed = true
-	}
-
 	out, _ := json.Marshal(map[string]any{
 		"status":               "completed",
 		"lifecycle_state":      "completed",
@@ -368,6 +435,63 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) (output []by
 		"state":                final.State,
 	})
 	return out, nil
+}
+
+func (h *HuddleJoinHandler) executeTeardownOnly(ctx JobContext, apiBase *url.URL, deviceToken string, p huddleJoinParams) ([]byte, error) {
+	cleanup := h.cleanupNodeSession
+	if cleanup == nil {
+		cleanup = func(cleanupCtx context.Context, p huddleJoinParams) error {
+			media := newContainerMedia(p.AttemptID, "", "", huddleSessionMaxDuration)
+			return media.CloseContext(cleanupCtx)
+		}
+	}
+	if err := h.runAuthorizedCleanup(apiBase, deviceToken, p, func(cleanupCtx context.Context) error {
+		return cleanup(cleanupCtx, p)
+	}); err != nil {
+		return nil, fmt.Errorf("cleanup huddle meetingd session: %w", err)
+	}
+	out, _ := json.Marshal(map[string]any{
+		"status":               "completed",
+		"lifecycle_state":      "teardown_confirmed",
+		"organization_id":      p.OrganizationID,
+		"channel_id":           p.ChannelID,
+		"call_id":              p.CallID,
+		"agent_id":             p.AgentID,
+		"node_id":              p.NodeID,
+		"job_id":               p.JobID,
+		"lifecycle_attempt_id": p.AttemptID,
+	})
+	return out, nil
+}
+
+func (h *HuddleJoinHandler) runAuthorizedCleanup(apiBase *url.URL, deviceToken string, p huddleJoinParams, cleanup func(context.Context) error) error {
+	authorize := h.authorizeNodeTeardown
+	if authorize == nil {
+		authorize = authorizeHuddleNodeTeardown
+	}
+	authorizeCtx, cancel := context.WithTimeout(context.Background(), huddleTokenHTTPTimeout)
+	leaseID, err := authorize(authorizeCtx, apiBase, deviceToken, p)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("authorize node teardown: %w", err)
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), meetingContainerHTTPTimeout)
+	err = cleanup(cleanupCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("delete attempt-scoped meetingd session: %w", err)
+	}
+	confirm := h.confirmNodeTeardown
+	if confirm == nil {
+		confirm = confirmHuddleNodeTeardown
+	}
+	confirmCtx, cancel := context.WithTimeout(context.Background(), huddleTokenHTTPTimeout)
+	err = confirm(confirmCtx, apiBase, deviceToken, p, leaseID)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("confirm node teardown: %w", err)
+	}
+	return nil
 }
 
 func (h *HuddleJoinHandler) resolveDeviceAuth(p huddleJoinParams) (*url.URL, string, error) {
@@ -440,6 +564,7 @@ func mintHuddleBotToken(ctx context.Context, client *http.Client, apiBase *url.U
 	body, err := json.Marshal(map[string]string{
 		"agentId": p.AgentID, "channelId": p.ChannelID, "callId": p.CallID,
 		"jobId": p.JobID, "lifecycleAttemptId": p.AttemptID,
+		"terminalProtocol": "coordinator-v1",
 	})
 	if err != nil {
 		return huddleToken{}, err
@@ -595,6 +720,87 @@ func reportHuddleTerminal(ctx context.Context, client *http.Client, apiBase *url
 	return nil
 }
 
+func prepareHuddleTerminalIntent(ctx context.Context, apiBase *url.URL, deviceToken string, p huddleJoinParams, status, detail string) error {
+	var response struct {
+		State string `json:"state"`
+	}
+	if err := postHuddleDeviceLifecycle(ctx, apiBase, deviceToken, "/api/huddle-bot/lifecycle/terminal-intent", map[string]string{
+		"channelId": p.ChannelID, "callId": p.CallID, "agentId": p.AgentID,
+		"jobId": p.JobID, "lifecycleAttemptId": p.AttemptID,
+		"status": status, "detail": detail, "result": p.TerminalResult,
+	}, http.StatusOK, &response); err != nil {
+		return err
+	}
+	if response.State == "terminal" {
+		return errHuddleAlreadyTerminal
+	}
+	if response.State != "pending" {
+		return fmt.Errorf("terminal-intent endpoint returned invalid state %q", response.State)
+	}
+	return nil
+}
+
+func authorizeHuddleNodeTeardown(ctx context.Context, apiBase *url.URL, deviceToken string, p huddleJoinParams) (string, error) {
+	var response struct {
+		TeardownLeaseID string `json:"teardownLeaseId"`
+	}
+	err := postHuddleDeviceLifecycle(ctx, apiBase, deviceToken, "/api/huddle-bot/lifecycle/node-teardown/authorize", map[string]string{
+		"channelId": p.ChannelID, "callId": p.CallID, "agentId": p.AgentID,
+		"jobId": p.JobID, "lifecycleAttemptId": p.AttemptID,
+	}, http.StatusOK, &response)
+	if err != nil {
+		return "", err
+	}
+	if _, err := uuid.Parse(response.TeardownLeaseID); err != nil {
+		return "", fmt.Errorf("node teardown endpoint returned invalid lease id")
+	}
+	return response.TeardownLeaseID, nil
+}
+
+func confirmHuddleNodeTeardown(ctx context.Context, apiBase *url.URL, deviceToken string, p huddleJoinParams, leaseID string) error {
+	return postHuddleDeviceLifecycle(ctx, apiBase, deviceToken, "/api/huddle-bot/lifecycle/node-teardown", map[string]string{
+		"channelId": p.ChannelID, "callId": p.CallID, "agentId": p.AgentID,
+		"jobId": p.JobID, "lifecycleAttemptId": p.AttemptID, "teardownLeaseId": leaseID,
+	}, http.StatusNoContent, nil)
+}
+
+func postHuddleDeviceLifecycle(ctx context.Context, apiBase *url.URL, deviceToken, path string, payload map[string]string, wantStatus int, response any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	teardownURL := *apiBase
+	teardownURL.Path = path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, teardownURL.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+deviceToken)
+	client := &http.Client{
+		Timeout: huddleTokenHTTPTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != wantStatus {
+		message := strings.ReplaceAll(strings.TrimSpace(string(raw)), deviceToken, "<redacted>")
+		return fmt.Errorf("huddle lifecycle endpoint returned status %d: %s", resp.StatusCode, message)
+	}
+	if response != nil {
+		if err := json.Unmarshal(raw, response); err != nil {
+			return fmt.Errorf("decode huddle lifecycle response: %w", err)
+		}
+	}
+	return nil
+}
+
 func truncateHuddleDetail(detail string) string {
 	runes := []rune(detail)
 	if len(runes) > 400 {
@@ -645,10 +851,17 @@ func defaultHuddleBrowser(ctx context.Context, p huddleJoinParams) (huddleBrowse
 	}
 	// No recording for join+confirm, so the WAV paths are empty. Start() creates
 	// the session and returns the CDP browser; Close() (cleanup) deletes it.
-	media := newContainerMedia(p.ChannelID, "", "", huddleSessionMaxDuration)
+	// The meetingd resource is lifecycle-attempt scoped, not channel scoped.
+	// A delayed cleanup for an old attempt must never address a successor's
+	// session on the same channel.
+	media := newContainerMedia(p.AttemptID, "", "", huddleSessionMaxDuration)
 	br, err := media.StartContext(ctx)
 	if err != nil {
-		return nil, nil, err
+		// StartContext can fail while a deterministic session still exists (for
+		// example, a same-attempt retry whose stale-session DELETE returned 500).
+		// Returning the cleanup seam lets Execute retain lifecycle recovery debt
+		// unless a final bounded DELETE confirms that session is gone.
+		return nil, media.CloseContext, err
 	}
 	return br, media.CloseContext, nil
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -321,6 +322,15 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Semaphore for concurrent job processing
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	for _, handler := range r.handlers {
+		if background, ok := handler.(interface{ RunBackground(context.Context) }); ok {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				background.RunBackground(ctx)
+			}()
+		}
+	}
 
 	// Main processing loop with exponential backoff on errors
 	backoff := time.Second
@@ -904,6 +914,31 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
 	if cancelled {
+		if errors.Is(err, jobs.ErrHuddleTerminalOwned) {
+			r.log("info", "Huddle job %s terminal is coordinator-owned", job.ID)
+			r.ackHuddleCoordinatorTerminal(ctx, job)
+			return false
+		}
+		if errors.Is(err, jobs.ErrHuddleLifecycleOutboxUnavailable) {
+			r.log("warning", "Huddle job %s cannot persist lifecycle recovery debt", job.ID)
+			r.source.Nack(ctx, job, err)
+			return false
+		}
+		if errors.Is(err, jobs.ErrHuddleTerminalIntentPending) {
+			r.log("warning", "Huddle job %s cancellation is waiting for durable terminal intent", job.ID)
+			r.recordJob(buildUsageRecord(job, "retry", startTime, endTime, result, err))
+			r.deferHuddleTerminalIntent(ctx, job, err)
+			return false
+		}
+		// Cancellation does not erase node teardown debt.  The exact huddle job
+		// must be redelivered until its deterministic meetingd session is proven
+		// gone; ACKing here would strand the coordinator's cancelling lifecycle.
+		if errors.Is(err, jobs.ErrHuddleTeardownPending) {
+			r.log("warning", "Huddle job %s cancellation is waiting for node teardown", job.ID)
+			r.recordJob(buildUsageRecord(job, "retry", startTime, endTime, result, err))
+			r.deferHuddleTeardown(ctx, job, err)
+			return false
+		}
 		r.log("info", "Huddle job %s cancelled during execution", job.ID)
 		r.recordJob(buildUsageRecord(job, "cancelled", startTime, endTime, result, context.Canceled))
 		if werr := stream.WriteCancelled("Huddle lifecycle cancelled"); werr != nil {
@@ -917,6 +952,32 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		actualErr := err
 		if actualErr == nil && result != nil {
 			actualErr = result.Error
+		}
+		if errors.Is(actualErr, jobs.ErrHuddleTerminalOwned) {
+			r.log("info", "Huddle job %s terminal is coordinator-owned", job.ID)
+			r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
+			r.ackHuddleCoordinatorTerminal(ctx, job)
+			return false
+		}
+		if errors.Is(actualErr, jobs.ErrHuddleLifecycleOutboxUnavailable) {
+			r.log("warning", "Huddle job %s cannot persist lifecycle recovery debt: %v", job.ID, actualErr)
+			r.source.Nack(ctx, job, actualErr)
+			return false
+		}
+		if errors.Is(actualErr, jobs.ErrHuddleTerminalIntentPending) {
+			r.log("warning", "Huddle job %s is waiting for durable terminal intent (%v): %v", job.ID, duration, actualErr)
+			r.recordJob(buildUsageRecord(job, "retry", startTime, endTime, result, actualErr))
+			r.deferHuddleTerminalIntent(ctx, job, actualErr)
+			return false
+		}
+		// This is not a terminal huddle failure: the same exact attempt owns
+		// durable teardown debt and must be retried without an `error` stream
+		// event. A later delivery reports terminal only after DELETE succeeds.
+		if errors.Is(actualErr, jobs.ErrHuddleTeardownPending) {
+			r.log("warning", "Huddle job %s is waiting for node teardown (%v): %v", job.ID, duration, actualErr)
+			r.recordJob(buildUsageRecord(job, "retry", startTime, endTime, result, actualErr))
+			r.deferHuddleTeardown(ctx, job, actualErr)
+			return false
 		}
 		r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
 		r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
@@ -1016,11 +1077,80 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		result = r.attachLatencyMetrics(result, queueWaitMs, startTime, execStart, endTime)
 	}
 	r.log("success", "Job %s completed (%v)", job.ID, duration)
+	if job.Type == JobTypeHuddleJoin && !huddleTeardownOnly(job) {
+		// The handler returned only after AceTeam committed participant cleanup,
+		// durable status, and the original terminal event. Never publish or write
+		// status a second time from the disposable delivery.
+		r.recordJob(buildUsageRecord(job, "completed", startTime, endTime, result, nil))
+		r.ackHuddleCoordinatorTerminal(ctx, job)
+		return true
+	}
 	if job.Type == JobTypeWorkerControl {
 		return r.finishWorkerControl(ctx, job, stream, handler, result, startTime, endTime)
 	}
 	r.finishSuccess(ctx, job, stream, result, startTime, endTime)
 	return true
+}
+
+type huddleTeardownDeferrer interface {
+	DeferHuddleTeardown(context.Context, *Job, error) error
+}
+
+type huddleTerminalIntentDeferrer interface {
+	DeferHuddleTerminalIntent(context.Context, *Job, error) error
+}
+
+type huddleCoordinatorTerminalAcker interface {
+	AckHuddleCoordinatorTerminal(context.Context, *Job) error
+}
+
+func huddleTeardownOnly(job *Job) bool {
+	if job == nil || job.Payload == nil {
+		return false
+	}
+	switch value := job.Payload["teardownOnly"].(type) {
+	case bool:
+		return value
+	case string:
+		parsed, err := strconv.ParseBool(value)
+		return err == nil && parsed
+	default:
+		return false
+	}
+}
+
+func (r *Runner) ackHuddleCoordinatorTerminal(ctx context.Context, job *Job) {
+	if source, ok := r.source.(huddleCoordinatorTerminalAcker); ok {
+		if err := source.AckHuddleCoordinatorTerminal(ctx, job); err != nil {
+			r.log("warning", "Failed to acknowledge coordinator-owned huddle job %s: %v", job.ID, err)
+		}
+		return
+	}
+	if err := r.source.Ack(ctx, job); err != nil {
+		r.log("warning", "Failed to acknowledge coordinator-owned huddle job %s: %v", job.ID, err)
+	}
+}
+
+func (r *Runner) deferHuddleTerminalIntent(ctx context.Context, job *Job, err error) {
+	if source, ok := r.source.(huddleTerminalIntentDeferrer); ok {
+		if deferErr := source.DeferHuddleTerminalIntent(ctx, job, err); deferErr != nil {
+			r.log("warning", "Failed to defer huddle terminal intent job %s: %v", job.ID, deferErr)
+		}
+		return
+	}
+	r.source.Nack(ctx, job, err)
+}
+
+func (r *Runner) deferHuddleTeardown(ctx context.Context, job *Job, err error) {
+	if source, ok := r.source.(huddleTeardownDeferrer); ok {
+		if deferErr := source.DeferHuddleTeardown(ctx, job, err); deferErr != nil {
+			r.log("warning", "Failed to defer huddle teardown job %s: %v", job.ID, deferErr)
+		}
+		return
+	}
+	// Test/custom sources retain the legacy unacked retry behavior. All three
+	// production sources implement the durable server-owned deferral above.
+	r.source.Nack(ctx, job, err)
 }
 
 // watchHuddleCancellation turns the platform's durable cancellation marker

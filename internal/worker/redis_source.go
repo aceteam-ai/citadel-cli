@@ -391,6 +391,36 @@ func (s *RedisSource) Nack(ctx context.Context, job *Job, err error) error {
 	return nil
 }
 
+// DeferHuddleTeardown records a truthful non-terminal state and ACKs this
+// delivery. AceTeam's durable lifecycle reconciler owns fresh cleanup-only
+// deliveries on the exact node queue, so the generic max-attempts DLQ must not
+// be the recovery owner for node teardown debt.
+func (s *RedisSource) DeferHuddleTeardown(ctx context.Context, job *Job, err error) error {
+	return s.AckHuddleCoordinatorTerminal(ctx, job)
+}
+
+// AckHuddleCoordinatorTerminal removes only the source delivery. AceTeam owns
+// durable job status and terminal publication after accepting terminal intent.
+func (s *RedisSource) AckHuddleCoordinatorTerminal(ctx context.Context, job *Job) error {
+	if job.SourceQueue != "" {
+		return s.client.AckJobOnQueue(ctx, job.SourceQueue, job.MessageID)
+	}
+	return s.client.AckJob(ctx, job.MessageID)
+}
+
+func (s *RedisSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err error) error {
+	if statusErr := s.client.SetJobStatus(ctx, job.ID, "retry", map[string]any{
+		"reason": "huddle_terminal_intent_pending",
+		"error":  err.Error(),
+	}); statusErr != nil {
+		return statusErr
+	}
+	if job.SourceQueue != "" {
+		return s.client.AckJobOnQueue(ctx, job.SourceQueue, job.MessageID)
+	}
+	return s.client.AckJob(ctx, job.MessageID)
+}
+
 // Fail is a terminal failure: record "failed" status (with structured data) and
 // ACK the message so it is removed from the consumer group's PEL. Used for
 // failures that will never succeed on retry (e.g. an unsupported job type),

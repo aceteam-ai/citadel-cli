@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -119,8 +122,10 @@ func stateJSON(state, selfID string, peers, connected int) string {
 // newTestHuddleHandler wires a handler with fast poll budgets, fixed enrolled creds, an
 // injected mint, and an injected browser.
 func newTestHuddleHandler(deviceToken string, mint func(ctx context.Context, apiBase *url.URL, token string, p huddleJoinParams) (huddleToken, error), br *fakeHuddleBrowser) *HuddleJoinHandler {
+	outboxDir, _ := os.MkdirTemp("", "citadel-huddle-test-outbox-")
 	return &HuddleJoinHandler{
 		WorkspaceDir: "/tmp",
+		outboxDir:    outboxDir,
 		credsFn: func() config.DeviceCreds {
 			return config.DeviceCreds{Token: deviceToken, APIBaseURL: "https://aceteam.ai"}
 		},
@@ -128,9 +133,13 @@ func newTestHuddleHandler(deviceToken string, mint func(ctx context.Context, api
 		acknowledgeReady: func(context.Context, *url.URL, huddleToken, huddleBotState) error {
 			return nil
 		},
-		reportTerminal: func(context.Context, *url.URL, huddleToken, string, string) error {
+		prepareTerminalIntent: func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
 			return nil
 		},
+		authorizeNodeTeardown: func(context.Context, *url.URL, string, huddleJoinParams) (string, error) {
+			return "77777777-7777-4777-8777-777777777777", nil
+		},
+		confirmNodeTeardown: func(context.Context, *url.URL, string, huddleJoinParams, string) error { return nil },
 		newBrowser: func(ctx context.Context, p huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
 			return br, func(context.Context) error { return br.Close() }, nil
 		},
@@ -199,7 +208,7 @@ func TestHuddleJoin_ConnectingJoined(t *testing.T) {
 	tok := huddleToken{Token: "act_secret", ChannelID: huddleTestChannelID, SelfID: huddleTestAgentID, SelfKind: "agent", CallID: huddleTestCallID, AttemptID: huddleTestAttemptID}
 	h := newTestHuddleHandler("s3cr3t", okMint(tok), br)
 	var terminalStatus string
-	h.reportTerminal = func(_ context.Context, _ *url.URL, _ huddleToken, status, _ string) error {
+	h.prepareTerminalIntent = func(_ context.Context, _ *url.URL, _ string, _ huddleJoinParams, status, _ string) error {
 		terminalStatus = status
 		return nil
 	}
@@ -496,7 +505,7 @@ func TestMintHuddleBotToken_RequestShape(t *testing.T) {
 	if gotAuth != "Bearer top-secret" {
 		t.Errorf("auth = %q, want Bearer top-secret", gotAuth)
 	}
-	if gotBody["agentId"] != huddleTestAgentID || gotBody["channelId"] != huddleTestChannelID || gotBody["callId"] != huddleTestCallID || gotBody["jobId"] != huddleTestJobID || gotBody["lifecycleAttemptId"] != huddleTestAttemptID {
+	if gotBody["agentId"] != huddleTestAgentID || gotBody["channelId"] != huddleTestChannelID || gotBody["callId"] != huddleTestCallID || gotBody["jobId"] != huddleTestJobID || gotBody["lifecycleAttemptId"] != huddleTestAttemptID || gotBody["terminalProtocol"] != "coordinator-v1" {
 		t.Errorf("body = %v, want the exact lifecycle tuple", gotBody)
 	}
 	if tok.Token != "act_xyz" || tok.ChannelID != huddleTestChannelID || tok.SelfID != huddleTestAgentID || tok.SelfKind != "agent" || tok.CallID != huddleTestCallID || tok.AttemptID != huddleTestAttemptID {
@@ -642,7 +651,7 @@ func TestHuddleJoin_CancellationInterruptsBlockedNavigateAndCleansUp(t *testing.
 	br := &fakeHuddleBrowser{blockNavigate: true, navigateStarted: make(chan struct{}, 1)}
 	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
 	var terminalStatus string
-	h.reportTerminal = func(_ context.Context, _ *url.URL, _ huddleToken, status, _ string) error {
+	h.prepareTerminalIntent = func(_ context.Context, _ *url.URL, _ string, _ huddleJoinParams, status, _ string) error {
 		terminalStatus = status
 		return nil
 	}
@@ -706,20 +715,20 @@ func TestHuddleJoin_SuccessRequiresCleanup(t *testing.T) {
 	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}, closeErr: errors.New("delete returned 500")}
 	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
 	terminalCalls := 0
-	h.reportTerminal = func(context.Context, *url.URL, huddleToken, string, string) error {
+	h.prepareTerminalIntent = func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
 		terminalCalls++
 		return nil
 	}
 
 	_, err := h.Execute(JobContext{}, huddleJob())
-	if err == nil || !strings.Contains(err.Error(), "cleanup failed") || !strings.Contains(err.Error(), "delete returned 500") {
+	if !errors.Is(err, ErrHuddleTeardownPending) || !strings.Contains(err.Error(), "delete returned 500") {
 		t.Fatalf("Execute error = %v, want cleanup failure", err)
 	}
-	if br.closeCalls != 2 {
-		t.Fatalf("cleanup attempts = %d, want bounded explicit + deferred retry", br.closeCalls)
+	if br.closeCalls != 1 {
+		t.Fatalf("cleanup attempts = %d, want one authorized attempt", br.closeCalls)
 	}
-	if terminalCalls != 0 {
-		t.Fatalf("terminal reports = %d, want cleanup debt retained", terminalCalls)
+	if terminalCalls != 1 {
+		t.Fatalf("terminal intents = %d, want durable intent before cleanup", terminalCalls)
 	}
 }
 
@@ -730,20 +739,73 @@ func TestHuddleJoin_TransientCleanupFailureReportsOnlyAfterConfirmedRetry(t *tes
 	}
 	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
 	var terminalStatus string
-	h.reportTerminal = func(_ context.Context, _ *url.URL, _ huddleToken, status, _ string) error {
+	h.prepareTerminalIntent = func(_ context.Context, _ *url.URL, _ string, _ huddleJoinParams, status, _ string) error {
 		terminalStatus = status
 		return nil
 	}
 
 	_, err := h.Execute(JobContext{}, huddleJob())
-	if err == nil || !strings.Contains(err.Error(), "cleanup failed") {
+	if !errors.Is(err, ErrHuddleTeardownPending) {
 		t.Fatalf("Execute error = %v, want first cleanup failure", err)
 	}
-	if br.closeCalls != 2 {
-		t.Fatalf("cleanup attempts = %d, want explicit + deferred retry", br.closeCalls)
+	if br.closeCalls != 1 {
+		t.Fatalf("cleanup attempts = %d, want one authorized attempt", br.closeCalls)
 	}
-	if terminalStatus != "failed" {
-		t.Fatalf("terminal status = %q, want failed after confirmed teardown", terminalStatus)
+	if terminalStatus != "completed" {
+		t.Fatalf("terminal status = %q, want completed intent persisted before cleanup", terminalStatus)
+	}
+}
+
+func TestHuddleJoin_RedeliveryRetainsDebtUntilNodeCleanupIsConfirmed(t *testing.T) {
+	first := &fakeHuddleBrowser{
+		states:   []string{stateJSON("joined", huddleTestAgentID, 1, 1)},
+		closeErr: errors.New("delete returned 500"),
+	}
+	second := &fakeHuddleBrowser{
+		states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)},
+	}
+	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), first)
+	launches := 0
+	h.newBrowser = func(context.Context, huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
+		launches++
+		br := first
+		if launches == 2 {
+			br = second
+		}
+		return br, func(context.Context) error { return br.Close() }, nil
+	}
+	var terminalStatuses []string
+	h.prepareTerminalIntent = func(_ context.Context, _ *url.URL, _ string, _ huddleJoinParams, status, _ string) error {
+		terminalStatuses = append(terminalStatuses, status)
+		return nil
+	}
+
+	_, err := h.Execute(JobContext{}, huddleJob())
+	if !errors.Is(err, ErrHuddleTeardownPending) {
+		t.Fatalf("first Execute error = %v, want ErrHuddleTeardownPending", err)
+	}
+	if len(terminalStatuses) != 1 || terminalStatuses[0] != "completed" {
+		t.Fatalf("terminal intents = %v, want one completed before cleanup", terminalStatuses)
+	}
+}
+
+func TestHuddleJoin_LaunchFailureRetainsDebtWhenFinalDeleteFails(t *testing.T) {
+	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), &fakeHuddleBrowser{})
+	h.newBrowser = func(context.Context, huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
+		return nil, func(context.Context) error { return errors.New("delete returned 500") }, errors.New("clear stale meetingd session")
+	}
+	terminalCalls := 0
+	h.prepareTerminalIntent = func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
+		terminalCalls++
+		return nil
+	}
+
+	_, err := h.Execute(JobContext{}, huddleJob())
+	if !errors.Is(err, ErrHuddleTeardownPending) {
+		t.Fatalf("Execute error = %v, want ErrHuddleTeardownPending", err)
+	}
+	if terminalCalls != 1 {
+		t.Fatalf("terminal intents = %d, want one before cleanup", terminalCalls)
 	}
 }
 
@@ -755,11 +817,8 @@ func TestHuddleJoin_FailureKeepsPrimaryAndLogsCleanupFailure(t *testing.T) {
 	ctx := JobContext{LogFn: func(_ string, msg string) { logs = append(logs, msg) }}
 
 	_, err := h.Execute(ctx, huddleJob())
-	if err == nil || !strings.Contains(err.Error(), "join denied") || strings.Contains(err.Error(), "delete returned 500") {
-		t.Fatalf("Execute error = %v, want original join error only", err)
-	}
-	if !strings.Contains(strings.Join(logs, "\n"), "cleanup failed") {
-		t.Fatalf("logs = %v, want secondary cleanup failure", logs)
+	if err == nil || !strings.Contains(err.Error(), "join denied") || !strings.Contains(err.Error(), "delete returned 500") {
+		t.Fatalf("Execute error = %v, want primary error plus durable teardown debt", err)
 	}
 }
 
@@ -857,5 +916,440 @@ func TestHuddleBotURL_FragmentRedaction(t *testing.T) {
 	}
 	if got := huddleBotURL(base, "org/channel", "token"); !strings.Contains(got, "/huddle-bot/org%2Fchannel#") || strings.Contains(got, "%252F") {
 		t.Errorf("channel path segment was not escaped exactly once: %q", got)
+	}
+}
+
+func TestParseHuddleJoinParams_TeardownUsesOriginalLifecycleJob(t *testing.T) {
+	payload := huddleJob().Payload
+	payload["teardownOnly"] = "true"
+	payload["lifecycleJobId"] = huddleTestJobID
+	p, err := parseHuddleJoinParams("77777777-7777-4777-8777-777777777777", JobTypeHuddleTeardownType, payload)
+	if err != nil {
+		t.Fatalf("parseHuddleJoinParams: %v", err)
+	}
+	if !p.TeardownOnly || p.JobID != huddleTestJobID {
+		t.Fatalf("teardown params = %+v, want original lifecycle job %s", p, huddleTestJobID)
+	}
+}
+
+func TestHuddleJoin_TeardownOnlyCleansThenConfirmsExactAttempt(t *testing.T) {
+	job := huddleJob()
+	job.Type = JobTypeHuddleTeardownType
+	job.ID = "77777777-7777-4777-8777-777777777777"
+	job.Payload["teardownOnly"] = "true"
+	job.Payload["lifecycleJobId"] = huddleTestJobID
+	cleanupCalls := 0
+	confirmCalls := 0
+	h := &HuddleJoinHandler{
+		credsFn: func() config.DeviceCreds {
+			return config.DeviceCreds{Token: "device-token", APIBaseURL: "https://aceteam.ai"}
+		},
+		cleanupNodeSession: func(_ context.Context, p huddleJoinParams) error {
+			cleanupCalls++
+			if p.JobID != huddleTestJobID || p.AttemptID != huddleTestAttemptID || p.NodeID != "1297" {
+				t.Fatalf("cleanup identity = %+v", p)
+			}
+			return nil
+		},
+		authorizeNodeTeardown: func(context.Context, *url.URL, string, huddleJoinParams) (string, error) {
+			return "88888888-8888-4888-8888-888888888888", nil
+		},
+		confirmNodeTeardown: func(_ context.Context, _ *url.URL, token string, p huddleJoinParams, leaseID string) error {
+			confirmCalls++
+			if token != "device-token" || p.CallID != huddleTestCallID || p.AgentID != huddleTestAgentID || p.JobID != huddleTestJobID || p.AttemptID != huddleTestAttemptID || leaseID != "88888888-8888-4888-8888-888888888888" {
+				t.Fatalf("confirmation identity/token = %+v / %q", p, token)
+			}
+			return nil
+		},
+	}
+	out, err := h.Execute(JobContext{}, job)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if cleanupCalls != 1 || confirmCalls != 1 {
+		t.Fatalf("cleanup/confirm calls = %d/%d, want 1/1", cleanupCalls, confirmCalls)
+	}
+	if !strings.Contains(string(out), `"lifecycle_state":"teardown_confirmed"`) {
+		t.Fatalf("output = %s", out)
+	}
+}
+
+func TestHuddleJoin_TeardownOnlyDoesNotConfirmFailedCleanup(t *testing.T) {
+	job := huddleJob()
+	job.Type = JobTypeHuddleTeardownType
+	job.ID = "77777777-7777-4777-8777-777777777777"
+	job.Payload["teardownOnly"] = "true"
+	job.Payload["lifecycleJobId"] = huddleTestJobID
+	confirmCalls := 0
+	h := &HuddleJoinHandler{
+		credsFn: func() config.DeviceCreds {
+			return config.DeviceCreds{Token: "device-token", APIBaseURL: "https://aceteam.ai"}
+		},
+		cleanupNodeSession: func(context.Context, huddleJoinParams) error {
+			return errors.New("delete returned 500")
+		},
+		authorizeNodeTeardown: func(context.Context, *url.URL, string, huddleJoinParams) (string, error) {
+			return "88888888-8888-4888-8888-888888888888", nil
+		},
+		confirmNodeTeardown: func(context.Context, *url.URL, string, huddleJoinParams, string) error {
+			confirmCalls++
+			return nil
+		},
+	}
+	_, err := h.Execute(JobContext{}, job)
+	if err == nil || !strings.Contains(err.Error(), "delete returned 500") {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if confirmCalls != 0 {
+		t.Fatalf("confirmation called %d times after failed cleanup", confirmCalls)
+	}
+}
+
+func TestHuddleJoin_TerminalIntentOutboxSurvivesRestartWithoutDeletingFirst(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}}
+	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
+	h.outboxDir = filepath.Join(root, "outbox")
+	h.prepareTerminalIntent = func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
+		return errors.New("coordinator unavailable")
+	}
+
+	_, err := h.Execute(JobContext{}, huddleJob())
+	if !errors.Is(err, ErrHuddleTerminalIntentPending) {
+		t.Fatalf("Execute error = %v, want durable terminal-intent debt", err)
+	}
+	if br.closeCalls != 0 {
+		t.Fatalf("meetingd DELETE ran %d times before terminal intent was durable", br.closeCalls)
+	}
+	path := filepath.Join(root, "outbox", huddleTestAttemptID+".json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("durable outbox record missing: %v", err)
+	}
+
+	replayed := 0
+	restarted := &HuddleJoinHandler{
+		outboxDir: filepath.Join(root, "outbox"),
+		credsFn: func() config.DeviceCreds {
+			return config.DeviceCreds{Token: "device-token", APIBaseURL: "https://aceteam.ai"}
+		},
+		prepareTerminalIntent: func(_ context.Context, _ *url.URL, token string, p huddleJoinParams, status, _ string) error {
+			replayed++
+			if token != "device-token" || p.AttemptID != huddleTestAttemptID || status != "completed" {
+				t.Fatalf("replayed terminal intent = token %q params %+v status %q", token, p, status)
+			}
+			return nil
+		},
+	}
+	restarted.processLifecycleOutbox(context.Background())
+	if replayed != 1 {
+		t.Fatalf("replayed intents = %d, want 1", replayed)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outbox record retained after server ownership: %v", err)
+	}
+}
+
+func TestHuddleJoin_TerminalIntentOutboxDropsExactAlreadyTerminalReplay(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h := &HuddleJoinHandler{
+		outboxDir: filepath.Join(root, "outbox"),
+		credsFn: func() config.DeviceCreds {
+			return config.DeviceCreds{Token: "device-token", APIBaseURL: "https://aceteam.ai"}
+		},
+	}
+	path, err := h.persistLifecycleDebt(testHuddleParams(), "completed", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.prepareTerminalIntent = func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
+		return errHuddleAlreadyTerminal
+	}
+	h.processLifecycleOutbox(context.Background())
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("already-terminal outbox record retained: %v", err)
+	}
+}
+
+func TestHuddleJoin_TerminalIntentOutboxRetriesCredentialResolutionInSameProcess(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	credentialsAvailable := false
+	prepareCalls := 0
+	h := &HuddleJoinHandler{
+		outboxDir: filepath.Join(root, "outbox"),
+		credsFn: func() config.DeviceCreds {
+			if !credentialsAvailable {
+				return config.DeviceCreds{}
+			}
+			return config.DeviceCreds{Token: "rotated-token", APIBaseURL: "https://aceteam.ai"}
+		},
+		prepareTerminalIntent: func(_ context.Context, _ *url.URL, token string, _ huddleJoinParams, _, _ string) error {
+			prepareCalls++
+			if token != "rotated-token" {
+				t.Fatalf("prepare token = %q", token)
+			}
+			return nil
+		},
+	}
+	path, err := h.persistLifecycleDebt(testHuddleParams(), "failed", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.processLifecycleOutbox(context.Background())
+	if prepareCalls != 0 {
+		t.Fatalf("prepare called %d times without credentials", prepareCalls)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("credential failure did not restore retryable record: %v", err)
+	}
+	credentialsAvailable = true
+	h.processLifecycleOutbox(context.Background())
+	if prepareCalls != 1 {
+		t.Fatalf("prepare calls after credential recovery = %d, want 1", prepareCalls)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("accepted recovered record retained: %v", err)
+	}
+}
+
+func TestHuddleJoin_OrdersIntentAuthorizeDeleteConfirm(t *testing.T) {
+	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}}
+	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), br)
+	orderRoot := t.TempDir()
+	if err := os.Chmod(orderRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h.outboxDir = filepath.Join(orderRoot, "outbox")
+	var order []string
+	h.prepareTerminalIntent = func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
+		order = append(order, "intent")
+		return nil
+	}
+	h.authorizeNodeTeardown = func(context.Context, *url.URL, string, huddleJoinParams) (string, error) {
+		order = append(order, "authorize")
+		return "88888888-8888-4888-8888-888888888888", nil
+	}
+	h.newBrowser = func(context.Context, huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
+		return br, func(context.Context) error {
+			order = append(order, "delete")
+			return nil
+		}, nil
+	}
+	h.confirmNodeTeardown = func(context.Context, *url.URL, string, huddleJoinParams, string) error {
+		order = append(order, "confirm")
+		return nil
+	}
+	if _, err := h.Execute(JobContext{}, huddleJob()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got, want := strings.Join(order, ","), "intent,authorize,delete,confirm"; got != want {
+		t.Fatalf("lifecycle ordering = %s, want %s", got, want)
+	}
+}
+
+func TestHuddleJoin_MeetingdSessionIdentityIsAttemptScoped(t *testing.T) {
+	oldAttempt := "77777777-7777-4777-8777-777777777777"
+	newAttempt := "99999999-9999-4999-8999-999999999999"
+	oldSession := newContainerMedia(oldAttempt, "", "", time.Minute).sessionID
+	newSession := newContainerMedia(newAttempt, "", "", time.Minute).sessionID
+	if oldSession == newSession {
+		t.Fatalf("old and successor attempts share meetingd session %q", oldSession)
+	}
+	if oldSession != sanitizeMeetingFilename(oldAttempt) || newSession != sanitizeMeetingFilename(newAttempt) {
+		t.Fatalf("session ids = %q/%q, want attempt-derived", oldSession, newSession)
+	}
+}
+
+func TestHuddleTeardownTypeRejectsJoinModeBeforeMintOrBrowser(t *testing.T) {
+	job := huddleJob()
+	job.Type = JobTypeHuddleTeardownType
+	delete(job.Payload, "teardownOnly")
+	mintCalls := 0
+	h := &HuddleJoinHandler{
+		mintToken: func(context.Context, *url.URL, string, huddleJoinParams) (huddleToken, error) {
+			mintCalls++
+			return huddleToken{}, nil
+		},
+	}
+	_, err := h.Execute(JobContext{}, job)
+	if err == nil || !strings.Contains(err.Error(), "requires teardownOnly=true") {
+		t.Fatalf("Execute error = %v, want teardown-only rejection", err)
+	}
+	if mintCalls != 0 {
+		t.Fatalf("mint called %d times for malicious teardown delivery", mintCalls)
+	}
+}
+
+func TestHuddleJoinTypeRejectsTeardownModeBeforeCredentialOrCleanup(t *testing.T) {
+	job := huddleJob()
+	job.Payload["teardownOnly"] = "true"
+	job.Payload["lifecycleJobId"] = huddleTestJobID
+	credentialCalls := 0
+	cleanupCalls := 0
+	h := &HuddleJoinHandler{
+		credsFn: func() config.DeviceCreds {
+			credentialCalls++
+			return config.DeviceCreds{Token: "device-token", APIBaseURL: "https://aceteam.ai"}
+		},
+		cleanupNodeSession: func(context.Context, huddleJoinParams) error {
+			cleanupCalls++
+			return nil
+		},
+	}
+	_, err := h.Execute(JobContext{}, job)
+	if err == nil || !strings.Contains(err.Error(), "HUDDLE_JOIN cannot run teardownOnly mode") {
+		t.Fatalf("Execute error = %v, want join-mode rejection", err)
+	}
+	if credentialCalls != 0 || cleanupCalls != 0 {
+		t.Fatalf("credential/cleanup calls = %d/%d, want 0/0", credentialCalls, cleanupCalls)
+	}
+}
+
+func TestHuddleLifecycleOutboxRejectsSymlinkRootAndRecord(t *testing.T) {
+	realDir := t.TempDir()
+	symlinkRoot := filepath.Join(t.TempDir(), "outbox-link")
+	if err := os.Symlink(realDir, symlinkRoot); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	h := &HuddleJoinHandler{outboxDir: symlinkRoot}
+	if _, err := h.persistLifecycleDebt(testHuddleParams(), "failed", "test"); err == nil {
+		t.Fatal("symlink outbox root was accepted")
+	}
+
+	secureDir := filepath.Join(t.TempDir(), "outbox")
+	if err := os.Mkdir(secureDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "planted.json")
+	debt := huddleLifecycleDebt{
+		OrganizationID: huddleTestOrgID, ChannelID: huddleTestChannelID,
+		CallID: huddleTestCallID, AgentID: huddleTestAgentID, NodeID: "1297",
+		JobID: huddleTestJobID, AttemptID: huddleTestAttemptID,
+		Status: "failed", Detail: "planted",
+	}
+	raw, _ := json.Marshal(debt)
+	if err := os.WriteFile(target, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(secureDir, huddleTestAttemptID+".json")); err != nil {
+		t.Skipf("record symlink unavailable: %v", err)
+	}
+	prepareCalls := 0
+	h = &HuddleJoinHandler{
+		outboxDir: secureDir,
+		prepareTerminalIntent: func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
+			prepareCalls++
+			return nil
+		},
+	}
+	h.processLifecycleOutbox(context.Background())
+	if prepareCalls != 0 {
+		t.Fatalf("planted symlink triggered %d credentialed prepare calls", prepareCalls)
+	}
+}
+
+func TestHuddleLifecycleOutboxBlockedReplayDoesNotBlockDistinctPersist(t *testing.T) {
+	blockedRoot := t.TempDir()
+	if err := os.Chmod(blockedRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(blockedRoot, "outbox")
+	h := &HuddleJoinHandler{
+		outboxDir: dir,
+		credsFn: func() config.DeviceCreds {
+			return config.DeviceCreds{Token: "device-token", APIBaseURL: "https://aceteam.ai"}
+		},
+	}
+	if _, err := h.persistLifecycleDebt(testHuddleParams(), "failed", "first"); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h.prepareTerminalIntent = func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
+		close(started)
+		<-release
+		return errors.New("still unavailable")
+	}
+	done := make(chan struct{})
+	go func() {
+		h.processLifecycleOutbox(context.Background())
+		close(done)
+	}()
+	<-started
+	second := testHuddleParams()
+	second.AttemptID = "99999999-9999-4999-8999-999999999999"
+	second.JobID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	persisted := make(chan error, 1)
+	go func() {
+		_, err := h.persistLifecycleDebt(second, "failed", "second")
+		persisted <- err
+	}()
+	select {
+	case err := <-persisted:
+		if err != nil {
+			t.Fatalf("persist distinct debt: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("blocked network replay held the outbox filesystem lock")
+	}
+	close(release)
+	<-done
+}
+
+func TestHuddleLifecycleOutboxBoundsRecordCountButAllowsExactOverwrite(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h := &HuddleJoinHandler{outboxDir: filepath.Join(root, "outbox")}
+	var first huddleJoinParams
+	for index := 1; index <= huddleOutboxMaxRecords; index++ {
+		p := testHuddleParams()
+		p.AttemptID = fmt.Sprintf("00000000-0000-4000-8000-%012d", index)
+		p.JobID = fmt.Sprintf("10000000-0000-4000-8000-%012d", index)
+		if index == 1 {
+			first = p
+		}
+		if _, err := h.persistLifecycleDebt(p, "failed", "bounded"); err != nil {
+			t.Fatalf("persist record %d: %v", index, err)
+		}
+	}
+	overflow := testHuddleParams()
+	overflow.AttemptID = "00000000-0000-4000-8000-000000000099"
+	overflow.JobID = "10000000-0000-4000-8000-000000000099"
+	if _, err := h.persistLifecycleDebt(overflow, "failed", "overflow"); err == nil || !strings.Contains(err.Error(), "outbox is full") {
+		t.Fatalf("overflow persist error = %v, want bounded refusal", err)
+	}
+	if _, err := h.persistLifecycleDebt(first, "cancelled", "updated"); err != nil {
+		t.Fatalf("exact-attempt overwrite should remain available: %v", err)
+	}
+}
+
+func TestHuddleLifecycleOutboxBoundsTotalActiveBytesIncludingProcessing(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "outbox")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A claimed .processing record remains active debt and therefore consumes
+	// the same durable capacity as a .json record.
+	large := filepath.Join(dir, "00000000-0000-4000-8000-000000000001.processing")
+	if err := os.WriteFile(large, make([]byte, huddleOutboxTotalMaxBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &HuddleJoinHandler{outboxDir: dir}
+	if _, err := h.persistLifecycleDebt(testHuddleParams(), "failed", "backpressure"); err == nil || !strings.Contains(err.Error(), "outbox is full") {
+		t.Fatalf("byte-bound persist error = %v, want durable backpressure", err)
 	}
 }

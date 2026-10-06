@@ -208,6 +208,37 @@ func TestExecuteWithDeadlineHonorsCancellingHandler(t *testing.T) {
 	}
 }
 
+func TestCancelledHungHuddleNacksWhenRecoveryOwnershipIsUnknown(t *testing.T) {
+	hang := newHangingHandler(JobTypeHuddleJoin)
+	defer close(hang.release)
+	previousDrain := huddleCancellationDrainTimeout
+	huddleCancellationDrainTimeout = 10 * time.Millisecond
+	defer func() { huddleCancellationDrainTimeout = previousDrain }()
+
+	job := &Job{ID: "huddle-hung", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	runner := NewRunner(source, []JobHandler{hang}, RunnerConfig{WorkerID: "test"})
+	stream := &MockStreamWriter{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() {
+		done <- runner.executeJob(ctx, job, stream, time.Now(), false, 0)
+	}()
+	<-hang.started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled huddle did not leave bounded drain")
+	}
+	if len(source.NackedJobs()) != 1 || len(source.AckedJobs()) != 0 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("nack/ack/fail = %d/%d/%d, want 1/0/0", len(source.NackedJobs()), len(source.AckedJobs()), len(source.FailedJobs()))
+	}
+	if stream.errorCount != 0 || stream.endCount != 0 || stream.cancelled {
+		t.Fatalf("terminal error/end/cancelled = %d/%d/%v, want none while ownership is unknown", stream.errorCount, stream.endCount, stream.cancelled)
+	}
+}
+
 func TestJobExecTimeout(t *testing.T) {
 	cases := []struct {
 		name    string

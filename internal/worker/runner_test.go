@@ -3,11 +3,13 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	jobhandlers "github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
@@ -156,6 +158,20 @@ func (h *contextBlockingHandler) Execute(ctx context.Context, _ *Job, _ StreamWr
 	return nil, ctx.Err()
 }
 
+type teardownDebtOnCancellationHandler struct {
+	started chan struct{}
+}
+
+func (h *teardownDebtOnCancellationHandler) CanHandle(jobType string) bool {
+	return jobType == JobTypeHuddleJoin
+}
+
+func (h *teardownDebtOnCancellationHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	close(h.started)
+	<-ctx.Done()
+	return nil, errors.Join(ctx.Err(), jobhandlers.ErrHuddleTeardownPending)
+}
+
 func NewMockJobHandler(jobType string, shouldFail bool) *MockJobHandler {
 	return &MockJobHandler{
 		jobType:    jobType,
@@ -225,6 +241,36 @@ func TestRunnerHuddleCancellationInterruptsAndTerminatesWithoutRetry(t *testing.
 	}
 }
 
+func TestRunnerHuddleCancellationRetainsTeardownDebtWithoutAck(t *testing.T) {
+	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	source.cancelledJobs = map[string]bool{}
+	handler := &teardownDebtOnCancellationHandler{started: make(chan struct{})}
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	runner.huddleCancelPoll = time.Millisecond
+	stream := &recordingStreamWriter{}
+	done := make(chan bool, 1)
+	go func() {
+		done <- runner.executeJob(context.Background(), job, stream, time.Now(), false, 0)
+	}()
+	<-handler.started
+	source.mu.Lock()
+	source.cancelledJobs[job.ID] = true
+	source.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("huddle cancellation did not interrupt the handler")
+	}
+	if stream.cancelled || stream.errored || stream.ended {
+		t.Fatalf("terminal events cancelled=%v errored=%v ended=%v, want none", stream.cancelled, stream.errored, stream.ended)
+	}
+	if len(source.AckedJobs()) != 0 || len(source.NackedJobs()) != 1 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("ack/nack/fail = %d/%d/%d, want 0/1/0", len(source.AckedJobs()), len(source.NackedJobs()), len(source.FailedJobs()))
+	}
+}
+
 func TestRunnerHuddleFailureIsTerminalForExactAttempt(t *testing.T) {
 	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
 	source := NewMockJobSource("test", nil)
@@ -241,6 +287,70 @@ func TestRunnerHuddleFailureIsTerminalForExactAttempt(t *testing.T) {
 	}
 	if !stream.errored || stream.cancelled || stream.ended {
 		t.Fatalf("terminal events errored=%v cancelled=%v ended=%v", stream.errored, stream.cancelled, stream.ended)
+	}
+}
+
+type huddleTeardownThenSuccessHandler struct {
+	executions int
+}
+
+func (h *huddleTeardownThenSuccessHandler) CanHandle(jobType string) bool {
+	return jobType == JobTypeHuddleJoin
+}
+
+func (h *huddleTeardownThenSuccessHandler) Execute(context.Context, *Job, StreamWriter) (*JobResult, error) {
+	h.executions++
+	if h.executions == 1 {
+		err := fmt.Errorf("%w: meetingd DELETE returned 500", jobhandlers.ErrHuddleTeardownPending)
+		return &JobResult{Status: JobStatusFailure, Error: err}, err
+	}
+	return &JobResult{Status: JobStatusSuccess, Output: map[string]any{"cleaned": true}}, nil
+}
+
+func TestRunnerHuddleTeardownDebtNacksWithoutTerminalThenRedelivers(t *testing.T) {
+	job := &Job{
+		ID:       "huddle-job",
+		Type:     JobTypeHuddleJoin,
+		Payload:  map[string]any{},
+		Metadata: JobMetadata{Attempts: 1, MaxAttempts: 3},
+	}
+	source := NewMockJobSource("test", []*Job{job})
+	source.requeueOnNack = true
+	handler := &huddleTeardownThenSuccessHandler{}
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(*Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if handler.executions != 2 {
+		t.Fatalf("handler executions = %d, want teardown retry + success", handler.executions)
+	}
+	if len(source.NackedJobs()) != 1 || len(source.AckedJobs()) != 1 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("nack/ack/fail = %d/%d/%d, want 1/1/0", len(source.NackedJobs()), len(source.AckedJobs()), len(source.FailedJobs()))
+	}
+	if stream.errorCount != 0 || stream.endCount != 0 {
+		t.Fatalf("terminal error/end = %d/%d, want 0/0 (coordinator-owned)", stream.errorCount, stream.endCount)
+	}
+}
+
+func TestRunnerSuccessfulHuddleJoinRawAcksWithoutLocalTerminal(t *testing.T) {
+	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	handler := NewMockJobHandler(JobTypeHuddleJoin, false)
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	stream := &MockStreamWriter{}
+
+	if !runner.executeJob(context.Background(), job, stream, time.Now(), false, 0) {
+		t.Fatal("successful huddle job reported failure")
+	}
+	if len(source.AckedJobs()) != 1 || len(source.NackedJobs()) != 0 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("ack/nack/fail = %d/%d/%d, want 1/0/0", len(source.AckedJobs()), len(source.NackedJobs()), len(source.FailedJobs()))
+	}
+	if stream.errorCount != 0 || stream.endCount != 0 {
+		t.Fatalf("terminal error/end = %d/%d, want 0/0 (coordinator-owned)", stream.errorCount, stream.endCount)
 	}
 }
 
