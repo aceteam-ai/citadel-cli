@@ -300,6 +300,7 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 		return h.cancelled(context.Background(), job.ID, stream, "preempted by demand", true)
 	}
 	stopPoll := make(chan struct{})
+	pollErr := make(chan error, 1)
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -311,7 +312,17 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 				return
 			case <-ticker.C:
 				cancelled, err := h.cfg.Control.Cancelled(trainCtx, job.ID)
-				if err != nil || cancelled {
+				if err != nil {
+					// A failed canonical-state read is not evidence that the user
+					// cancelled. Stop the trainer fail closed, but preserve the
+					// transport/auth failure so the terminal state remains truthful.
+					// Send before cancelling: once Run returns, the buffered error is
+					// guaranteed to be available without waiting on this goroutine.
+					pollErr <- fmt.Errorf("FINETUNE_START: cancellation status check failed: %w", err)
+					cancel()
+					return
+				}
+				if cancelled {
 					cancel()
 					return
 				}
@@ -345,6 +356,11 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 	wasCancelled := trainCtx.Err() != nil
 	close(stopPoll)
 	cancel()
+	var cancelPollErr error
+	select {
+	case cancelPollErr = <-pollErr:
+	default:
+	}
 	var terminationErr *fineTuneTerminationError
 	if errors.As(runErr, &terminationErr) {
 		// The container may still own GPU memory. Keep the durable reservation
@@ -359,6 +375,9 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 	h.mu.Lock()
 	demanded := h.demanded
 	h.mu.Unlock()
+	if cancelPollErr != nil {
+		return fail(cancelPollErr)
+	}
 	if wasCancelled {
 		reason := "cancelled"
 		if demanded {

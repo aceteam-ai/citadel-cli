@@ -4,8 +4,11 @@
 target architecture before enabling the worker:
 
 ```sh
-docker build -t citadel-finetune:local services/finetune
+podman build -t citadel-finetune:local services/finetune
 ```
+
+Use `docker` in place of `podman` on a legacy Docker-managed node. Fresh Linux
+nodes use the rootless Podman runtime provisioned by `citadel init`.
 
 The worker accepts only the approved Qwen3 base models and a workspace-relative
 `dataset_node_path` on the same pinned node. Dataset rows are JSONL objects with

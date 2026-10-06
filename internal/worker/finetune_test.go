@@ -21,12 +21,13 @@ type fineTuneControlFake struct {
 	events      []map[string]any
 	updateErr   error
 	terminalErr error
+	cancelErr   error
 }
 
 func (c *fineTuneControlFake) Cancelled(context.Context, string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.cancelled, nil
+	return c.cancelled, c.cancelErr
 }
 func (c *fineTuneControlFake) Update(_ context.Context, _ string, fields map[string]any) error {
 	c.mu.Lock()
@@ -233,6 +234,42 @@ func TestFineTuneCancelKeyKillsRunAndRestores(t *testing.T) {
 	}
 	if reservation.release != 1 {
 		t.Fatalf("restore=%d", reservation.release)
+	}
+}
+
+func TestFineTuneCancelPollFailureStopsRunAndReportsFailure(t *testing.T) {
+	cfg, job, control, reservation := fineTuneFixture(t)
+	started := make(chan struct{})
+	cfg.Run = func(ctx context.Context, _ FineTuneSpec, _ func(map[string]any) error) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	result := make(chan *JobResult, 1)
+	go func() {
+		res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, &MockStreamWriter{})
+		result <- res
+	}()
+	<-started
+	control.mu.Lock()
+	control.cancelErr = errors.New("canonical status unavailable")
+	control.mu.Unlock()
+
+	select {
+	case res := <-result:
+		if res.Status != JobStatusTerminalFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "cancellation status check failed") {
+			t.Fatalf("result=%+v", res)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancellation poll failure did not stop training")
+	}
+	if reservation.release != 1 {
+		t.Fatalf("restore=%d", reservation.release)
+	}
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	if len(control.updates) == 0 || control.updates[len(control.updates)-1]["status"] != "failed" {
+		t.Fatalf("final status = %#v", control.updates)
 	}
 }
 
