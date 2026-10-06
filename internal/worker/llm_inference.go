@@ -29,12 +29,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -612,6 +614,80 @@ func (h *LLMInferenceHandler) bufferedOllama(stream StreamWriter, body io.Reader
 	}), nil
 }
 
+func ollamaImagesFromContent(content json.RawMessage) ([]string, error) {
+	trimmed := bytes.TrimSpace(content)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, nil
+	}
+
+	type imageURLPart struct {
+		URL string `json:"url"`
+	}
+	type contentPart struct {
+		Type     string        `json:"type"`
+		ImageURL *imageURLPart `json:"image_url"`
+	}
+
+	var parts []contentPart
+	if err := json.Unmarshal(trimmed, &parts); err != nil {
+		return nil, fmt.Errorf("invalid content-parts array: %w", err)
+	}
+
+	var images []string
+	for i, part := range parts {
+		if part.Type != "image_url" {
+			continue
+		}
+		if part.ImageURL == nil || part.ImageURL.URL == "" {
+			return nil, fmt.Errorf("image_url part %d is missing a URL", i)
+		}
+		image, err := ollamaImageFromDataURL(part.ImageURL.URL)
+		if err != nil {
+			return nil, fmt.Errorf("image_url part %d: %w", i, err)
+		}
+		images = append(images, image)
+	}
+	return images, nil
+}
+
+// ollamaImageFromDataURL validates an inline image and returns only its raw
+// base64 payload, which is the shape Ollama's native /api/chat expects. The
+// error deliberately never includes the URL so image data cannot leak into job
+// errors or logs.
+func ollamaImageFromDataURL(rawURL string) (string, error) {
+	if len(rawURL) < len("data:") || !strings.EqualFold(rawURL[:len("data:")], "data:") {
+		return "", fmt.Errorf("remote image URLs are not allowed; use a base64 image data URL")
+	}
+
+	metadata, encoded, ok := strings.Cut(rawURL[len("data:"):], ",")
+	if !ok {
+		return "", fmt.Errorf("malformed image data URL: missing comma separator")
+	}
+	base64Marker := strings.LastIndex(metadata, ";")
+	if base64Marker < 0 || !strings.EqualFold(strings.TrimSpace(metadata[base64Marker+1:]), "base64") {
+		return "", fmt.Errorf("image data URL must use base64 encoding")
+	}
+	mediaType, _, err := mime.ParseMediaType(metadata[:base64Marker])
+	if err != nil || !strings.HasPrefix(strings.ToLower(mediaType), "image/") || len(mediaType) == len("image/") {
+		return "", fmt.Errorf("data URL media type must be a valid image type")
+	}
+	if encoded == "" {
+		return "", fmt.Errorf("image data URL has an empty base64 payload")
+	}
+	// Go's base64 decoder intentionally ignores CR/LF. They are not part of the
+	// raw payload Ollama expects, so reject them rather than silently forwarding
+	// a non-canonical value. Accept both padded and unpadded standard base64.
+	if strings.ContainsAny(encoded, "\r\n") {
+		return "", fmt.Errorf("image data URL contains invalid base64")
+	}
+	if _, err := base64.StdEncoding.Strict().DecodeString(encoded); err != nil {
+		if _, rawErr := base64.RawStdEncoding.Strict().DecodeString(encoded); rawErr != nil {
+			return "", fmt.Errorf("image data URL contains invalid base64")
+		}
+	}
+	return encoded, nil
+}
+
 // executeOllamaChat handles chat-style inference via Ollama's native /api/chat
 // API. Unlike /api/generate (prompt in, `response` out), /api/chat takes
 // `messages` and returns the assistant turn in `message.content`, applying the
@@ -631,13 +707,20 @@ func (h *LLMInferenceHandler) bufferedOllama(stream StreamWriter, body io.Reader
 // forwarded: Ollama's support for it is inconsistent across
 // versions/models, unlike the OpenAI-compatible engines' native support.
 func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload) (*JobResult, error) {
-	// Ollama's /api/chat takes text content (images ride a separate `images`
-	// field we do not populate), so flatten any multimodal content to its text
-	// parts. OCR/vision fabric models run on vLLM (executeChatCompletionsAt), not
-	// this path.
+	// Ollama's /api/chat takes text content and puts image payloads in a separate
+	// `images` field. Translate OpenAI image_url content parts at this boundary
+	// while preserving the existing flattened text view. Remote URLs are never
+	// fetched by the node: callers must supply an inline base64 image data URL.
 	messages := make([]map[string]any, 0, len(payload.Messages))
-	for _, m := range payload.Messages {
+	for i, m := range payload.Messages {
 		msg := map[string]any{"role": m.Role, "content": m.Text()}
+		images, err := ollamaImagesFromContent(m.Content)
+		if err != nil {
+			return h.failure(fmt.Errorf("Ollama message %d: %w", i, err)), nil
+		}
+		if len(images) > 0 {
+			msg["images"] = images
+		}
 		// Replay an assistant turn's prior tool_calls (OpenAI shape, as stored
 		// on ChatMessage) converted to Ollama's request shape -- see
 		// openAIToolCallsToOllama's doc comment for exactly what changes.
