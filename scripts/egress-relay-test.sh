@@ -30,7 +30,7 @@ CLEANUP_DONE=0
 CLEANUP_FAILED=0
 LAN_RELAXED=0
 
-declare -A NODE_HOST NODE_HOME NODE_BIN NODE_PID NODE_PID_ROLE NODE_PID_FINGERPRINT NODE_LOG LOGIN_CLEANUP_REQUIRED
+declare -A NODE_HOST NODE_HOME NODE_BIN NODE_PID NODE_PID_ROLE NODE_PID_FINGERPRINT NODE_LOG LOGIN_CLEANUP_REQUIRED NODE_TERMINATION_UNCONFIRMED
 
 log() { printf '%s\n' "[egress-relay-test] $*"; }
 ok() { printf '%s\n' "[egress-relay-test] OK: $*"; }
@@ -181,44 +181,120 @@ run_bg_on() {
   NODE_PID_FINGERPRINT[$label]="$fingerprint"
 }
 
+inspect_bg() {
+  local who="$1" pid="$2" output status
+  if output="$(run_on "$who" sh -c '
+    output=$(ps -p "$1" -o lstart= -o args= 2>/dev/null)
+    status=$?
+    case "$status" in
+      0) [ -n "$output" ] || exit 70; printf "%s" "$output" ;;
+      1) exit 3 ;;
+      *) exit 70 ;;
+    esac
+  ' sh "$pid")"; then
+    printf '%s' "$output"
+    return 0
+  else
+    status=$?
+  fi
+  # The remote helper reserves 3 for a clean ps "no such process" result.
+  # SSH transport failures and every other ps/protocol failure are unknown,
+  # never evidence that it is safe to deregister or delete the guarded HOME.
+  [[ "$status" == 3 ]] && return 1
+  return 2
+}
+
+wait_bg_gone() {
+  local who="$1" pid="$2" expected="$3" attempts=0 current status
+  while ((attempts < 20)); do
+    if current="$(inspect_bg "$who" "$pid" 2>/dev/null)"; then
+      [[ "$current" == "$expected" ]] || return 3
+    else
+      status=$?
+      [[ "$status" == 1 ]] && return 0
+      return 2
+    fi
+    sleep 0.1
+    ((attempts += 1))
+  done
+  return 1
+}
+
+retain_unconfirmed_bg() {
+  local who="$1" label="$2" pid="$3" reason="$4"
+  warn "$reason for $label PID $pid; retaining PID/fingerprint, registration, logs, and guarded HOME for recovery"
+  CLEANUP_FAILED=1
+  NODE_TERMINATION_UNCONFIRMED[$who]=1
+}
+
 kill_bg() {
-  local label="$1" pid who expected current
+  local label="$1" pid who expected current status
   pid="${NODE_PID[$label]:-}"
   who="${NODE_PID_ROLE[$label]:-}"
   [[ -n "$pid" && -n "$who" ]] || return 0
   expected="${NODE_PID_FINGERPRINT[$label]:-}"
-  current="$(run_on "$who" ps -p "$pid" -o lstart= -o args= 2>/dev/null)" || {
-    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
-    return 0
-  }
-  if [[ -z "$expected" || "$current" != "$expected" ]]; then
-    warn "refusing to signal reused or unverified $label PID $pid"
-    CLEANUP_FAILED=1
-    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
-    return 1
-  fi
-  run_on "$who" kill -TERM "$pid" >/dev/null 2>&1 || true
-  local attempts=0
-  while ((attempts < 20)); do
-    run_on "$who" kill -0 "$pid" >/dev/null 2>&1 || {
+  if current="$(inspect_bg "$who" "$pid" 2>/dev/null)"; then
+    :
+  else
+    status=$?
+    if [[ "$status" == 1 ]]; then
       unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
       return 0
-    }
-    sleep 0.1
-    ((attempts += 1))
-  done
-  current="$(run_on "$who" ps -p "$pid" -o lstart= -o args= 2>/dev/null)" || {
-    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
-    return 0
-  }
-  if [[ "$current" != "$expected" ]]; then
-    warn "refusing KILL for reused $label PID $pid"
-    CLEANUP_FAILED=1
-    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+    fi
+    retain_unconfirmed_bg "$who" "$label" "$pid" "could not inspect process identity"
     return 1
   fi
-  run_on "$who" kill -KILL "$pid" >/dev/null 2>&1 || true
-  unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+  if [[ -z "$expected" || "$current" != "$expected" ]]; then
+    retain_unconfirmed_bg "$who" "$label" "$pid" "refusing to signal reused or unverified process"
+    return 1
+  fi
+  if ! run_on "$who" kill -TERM "$pid" >/dev/null 2>&1; then
+    retain_unconfirmed_bg "$who" "$label" "$pid" "TERM delivery failed"
+    return 1
+  fi
+  if wait_bg_gone "$who" "$pid" "$expected"; then
+    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+    return 0
+  else
+    status=$?
+  fi
+  case "$status" in
+    2) retain_unconfirmed_bg "$who" "$label" "$pid" "post-TERM process inspection failed"; return 1 ;;
+    3) retain_unconfirmed_bg "$who" "$label" "$pid" "refusing KILL for a reused process"; return 1 ;;
+  esac
+  # Re-check immediately before the irreversible KILL escalation. The last
+  # wait-loop probe may precede this point by a sleep interval, during which
+  # the original process could exit and its numeric PID could be reused.
+  if current="$(inspect_bg "$who" "$pid" 2>/dev/null)"; then
+    if [[ "$current" != "$expected" ]]; then
+      retain_unconfirmed_bg "$who" "$label" "$pid" "refusing KILL for a reused process"
+      return 1
+    fi
+  else
+    status=$?
+    if [[ "$status" == 1 ]]; then
+      unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+      return 0
+    fi
+    retain_unconfirmed_bg "$who" "$label" "$pid" "pre-KILL process inspection failed"
+    return 1
+  fi
+  if ! run_on "$who" kill -KILL "$pid" >/dev/null 2>&1; then
+    retain_unconfirmed_bg "$who" "$label" "$pid" "KILL delivery failed"
+    return 1
+  fi
+  if wait_bg_gone "$who" "$pid" "$expected"; then
+    unset 'NODE_PID[$label]' 'NODE_PID_FINGERPRINT[$label]'
+    return 0
+  else
+    status=$?
+  fi
+  case "$status" in
+    1) retain_unconfirmed_bg "$who" "$label" "$pid" "process remained live after KILL" ;;
+    2) retain_unconfirmed_bg "$who" "$label" "$pid" "post-KILL process inspection failed" ;;
+    3) retain_unconfirmed_bg "$who" "$label" "$pid" "PID changed after KILL" ;;
+  esac
+  return 1
 }
 
 valid_harness_home() {
@@ -234,12 +310,17 @@ cleanup() {
     node_cmd relay egress-relay allow-lan off >/dev/null 2>&1 || { warn "could not restore deny-LAN config"; CLEANUP_FAILED=1; }
     LAN_RELAXED=0
   fi
-  kill_bg client-proxy
-  kill_bg relay-probe
-  kill_bg relay-serve
+  kill_bg client-proxy || true
+  kill_bg relay-probe || true
+  kill_bg relay-serve || true
 
   local who home marker deregistered
   for who in client relay; do
+    if [[ "${NODE_TERMINATION_UNCONFIRMED[$who]:-0}" == 1 ]]; then
+      warn "$who process termination is unconfirmed; retaining registration and guarded home for recovery"
+      CLEANUP_FAILED=1
+      continue
+    fi
     deregistered=1
     if [[ "${LOGIN_CLEANUP_REQUIRED[$who]:-0}" == 1 && -n "${NODE_BIN[$who]:-}" ]]; then
       if ! node_cmd_stdin "$who" "$API_KEY_FILE" logout --force --api-key-stdin --require-deregister >/dev/null 2>&1; then
@@ -267,7 +348,10 @@ cleanup() {
   local label
   for label in "${!NODE_LOG[@]}"; do
     who="${NODE_PID_ROLE[$label]:-}"
-    [[ -n "$who" ]] && run_on "$who" rm -f -- "${NODE_LOG[$label]}" >/dev/null 2>&1 || true
+    if [[ -n "$who" ]]; then
+      [[ "${NODE_TERMINATION_UNCONFIRMED[$who]:-0}" == 1 ]] && continue
+      run_on "$who" rm -f -- "${NODE_LOG[$label]}" >/dev/null 2>&1 || true
+    fi
   done
   if [[ -n "$BUILD_DIR" ]]; then
     if [[ "$BUILD_DIR" =~ ^/tmp/egress-relay-test-build\.[A-Za-z0-9]+$ ]]; then
@@ -416,6 +500,32 @@ port_open() {
   run_on "$who" bash -c ': </dev/tcp/127.0.0.1/$1' bash "$port"
 }
 
+validate_public_ip_response() {
+  python3 -c '
+import ipaddress
+import sys
+
+raw = sys.stdin.buffer.read(4097)
+if len(raw) > 4096:
+    raise SystemExit("public IP response exceeds 4096 bytes")
+try:
+    value = raw.decode("ascii").strip()
+except UnicodeDecodeError:
+    raise SystemExit("public IP response is not ASCII")
+if not value or any(ch.isspace() for ch in value) or "%" in value:
+    raise SystemExit("public IP response must contain exactly one bare address")
+try:
+    address = ipaddress.ip_address(value)
+except ValueError:
+    raise SystemExit("public IP response is not one IP address")
+if (not address.is_global or address.is_loopback or address.is_private or
+        address.is_link_local or address.is_multicast or address.is_reserved or
+        address.is_unspecified or getattr(address, "is_site_local", False)):
+    raise SystemExit("public IP response is not globally routable")
+print(address.compressed)
+'
+}
+
 fetch_ip() {
   local who="$1"; shift
   if (($# == 0)); then
@@ -427,7 +537,7 @@ fetch_ip() {
     # environment prevents ambient proxy variables from replacing it; do not
     # use --noproxy here because that would bypass this explicit tunnel too.
     run_on "$who" env -i "PATH=$NODE_PATH" curl --fail --silent --show-error --max-time 20 "$@" "$IP_ECHO_URL"
-  fi | tr -d '[:space:]'
+  fi | validate_public_ip_response
 }
 
 log "mode: $MODE"
