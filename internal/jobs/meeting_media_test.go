@@ -412,6 +412,24 @@ func TestContainerMediaSpeakPCMOnlyTreatsActivePlaybackAsBusy(t *testing.T) {
 	}
 }
 
+func TestContainerMediaStopSpeakingUsesExactSessionRoute(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"stopped":true}`))
+	}))
+	defer srv.Close()
+	m := newTestContainerMedia(srv.URL)
+	m.client = srv.Client()
+	if err := m.StopSpeaking(context.Background()); err != nil {
+		t.Fatalf("StopSpeaking: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/sessions/m1/mic/stop" {
+		t.Fatalf("request = %s %s, want POST /sessions/m1/mic/stop", gotMethod, gotPath)
+	}
+}
+
 func TestContainerMediaCaptureStreamUsesSessionAndStopsOnCancel(t *testing.T) {
 	started := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

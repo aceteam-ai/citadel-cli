@@ -28,6 +28,7 @@ type mockRealtimeConn struct {
 	incoming chan []byte
 	closed   chan struct{}
 	once     sync.Once
+	onSend   func([]byte)
 }
 
 func newMockConn() *mockRealtimeConn {
@@ -37,7 +38,11 @@ func newMockConn() *mockRealtimeConn {
 func (m *mockRealtimeConn) Send(p []byte) error {
 	m.mu.Lock()
 	m.sent = append(m.sent, append([]byte(nil), p...))
+	hook := m.onSend
 	m.mu.Unlock()
+	if hook != nil {
+		hook(p)
+	}
 	return nil
 }
 
@@ -89,6 +94,7 @@ type mockConverseMedia struct {
 	played    [][]byte
 	speakGate chan struct{} // nil => don't block
 	speakErr  error
+	stops     int
 }
 
 func (m *mockConverseMedia) CaptureStream(ctx context.Context, rate, channels int) (io.ReadCloser, error) {
@@ -115,6 +121,13 @@ func (m *mockConverseMedia) SpeakPCM(ctx context.Context, pcm []byte, rate, chan
 	return nil
 }
 
+func (m *mockConverseMedia) StopSpeaking(context.Context) error {
+	m.mu.Lock()
+	m.stops++
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *mockConverseMedia) playedCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -129,6 +142,12 @@ func (m *mockConverseMedia) playedBytes() int {
 		n += len(p)
 	}
 	return n
+}
+
+func (m *mockConverseMedia) stopCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stops
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -375,6 +394,63 @@ func TestConverseBridge_PropagatesProtocolFailures(t *testing.T) {
 	}
 }
 
+func TestConverseBridge_RejectsOversizedAudioDelta(t *testing.T) {
+	pr, _ := io.Pipe()
+	conn := newMockConn()
+	cfg := fastConfig()
+	cfg.MaxAudioDeltaBytes = 4
+	done := make(chan error, 1)
+	go func() {
+		_, err := newConverseBridge(conn, &mockConverseMedia{capture: pr}, nil, nil, cfg).Run(context.Background())
+		done <- err
+	}()
+	conn.incoming <- audioDeltaMsg([]byte{1, 2, 3, 4, 5, 6})
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "exceeds 4-byte limit") {
+			t.Fatalf("Run error = %v, want decoded audio bound", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("oversized realtime delta did not stop bridge")
+	}
+}
+
+func TestConverseBridge_AcceptsExactAudioDeltaLimitWithPadding(t *testing.T) {
+	pr, _ := io.Pipe()
+	media := &mockConverseMedia{capture: pr}
+	conn := newMockConn()
+	cfg := fastConfig()
+	cfg.MaxAudioDeltaBytes = 4
+	b := newConverseBridge(conn, media, nil, nil, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Run(ctx)
+		done <- err
+	}()
+	conn.incoming <- audioDeltaMsg([]byte{1, 2, 3, 4})
+	waitFor(t, "exact-limit padded delta played", func() bool { return media.playedBytes() == 4 })
+	cancel()
+	conn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bridge did not stop after exact-limit regression")
+	}
+}
+
+func TestConverseBridge_RejectsOversizedCoalescedBurst(t *testing.T) {
+	cfg := fastConfig()
+	cfg.MaxAudioDeltaBytes = 4
+	cfg.MaxSpeakBufferBytes = 8
+	b := newConverseBridge(newMockConn(), &mockConverseMedia{}, nil, nil, cfg)
+	b.speakCh <- []byte{1, 2, 3, 4}
+	b.speakCh <- []byte{1, 2, 3, 4}
+	if _, err := b.coalesce(context.Background(), []byte{1, 2, 3, 4}); err == nil || !strings.Contains(err.Error(), "exceeds 8-byte limit") {
+		t.Fatalf("coalesce error = %v, want burst bound", err)
+	}
+}
+
 func TestConverseBridge_CredentialDeadlineFailsBeforeFalseCompletion(t *testing.T) {
 	pr, _ := io.Pipe()
 	conn := newMockConn()
@@ -389,11 +465,13 @@ func TestConverseBridge_CredentialDeadlineFailsBeforeFalseCompletion(t *testing.
 	}
 }
 
-// TestConverseBridge_GateDropsFramesWhileSpeaking asserts that with the (default)
+// TestConverseBridge_GateDropsFramesWhileSpeaking asserts that with the optional
 // speaking gate on, captured frames are dropped while the bot is playing TTS, so
 // the bot's own audio can't be fed back as user speech.
 func TestConverseBridge_GateDropsFramesWhileSpeaking(t *testing.T) {
 	cfg := fastConfig()
+	on := true
+	cfg.GateWhileSpeaking = &on
 	pr, pw := io.Pipe()
 	gate := make(chan struct{})
 	media := &mockConverseMedia{capture: pr, speakGate: gate}
@@ -423,19 +501,31 @@ func TestConverseBridge_GateDropsFramesWhileSpeaking(t *testing.T) {
 	conn.Close()
 }
 
-// TestConverseBridge_BargeInDropsQueuedTTS asserts a speech_started event drops
-// TTS still queued to play (the human interrupted), counted as a barge-in.
-func TestConverseBridge_BargeInDropsQueuedTTS(t *testing.T) {
+// TestConverseBridge_CapturedHumanAudioInterruptsActiveTTS exercises the actual
+// barge-in chain: echo-free room capture reaches server VAD during playback, the
+// resulting speech_started cancels the active SpeakPCM request, calls meetingd's
+// explicit mic-stop operation, and drains later TTS.
+func TestConverseBridge_CapturedHumanAudioInterruptsActiveTTS(t *testing.T) {
 	cfg := fastConfig()
-	pr, _ := io.Pipe()
+	pr, pw := io.Pipe()
 	gate := make(chan struct{})
 	media := &mockConverseMedia{capture: pr, speakGate: gate}
 	conn := newMockConn()
+	var vadOnce sync.Once
+	conn.onSend = func(raw []byte) {
+		var msg struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(raw, &msg) == nil && msg.Type == msgInputAudioAppend {
+			vadOnce.Do(func() { conn.incoming <- speechStartedMsg() })
+		}
+	}
 	b := newConverseBridge(conn, media, nil, nil, cfg)
 
 	go b.Run(context.Background())
 
-	// First delta enters the speaker and blocks on `gate`; subsequent deltas queue.
+	// First delta enters the speaker and blocks in the current play; later deltas
+	// queue behind it.
 	conn.incoming <- audioDeltaMsg([]byte{1, 1})
 	waitFor(t, "speaker holding first chunk", func() bool { return b.speaking.Load() })
 	// Let the first chunk's coalesce window close and playback block on `gate`, so
@@ -447,12 +537,47 @@ func TestConverseBridge_BargeInDropsQueuedTTS(t *testing.T) {
 	}
 	waitFor(t, "chunks queued", func() bool { return len(b.speakCh) > 0 })
 
-	// Human starts talking -> drop the queued TTS.
-	conn.incoming <- speechStartedMsg()
+	// Human room PCM remains audible to VAD while speaking (the default gate is
+	// off); the reactive mock emits speech_started only after observing append.
+	frameBytes := pcmFrameBytes(cfg.CaptureRate, cfg.EngineChannels, cfg.FrameDuration)
+	if _, err := pw.Write(make([]byte, frameBytes)); err != nil {
+		t.Fatalf("write human capture: %v", err)
+	}
+	waitFor(t, "captured human frame forwarded during playback", func() bool {
+		return conn.countType(msgInputAudioAppend) >= 1
+	})
 	waitFor(t, "barge-in recorded", func() bool { return b.snapshot().Barges >= 1 })
+	waitFor(t, "active mic playback stopped", func() bool { return media.stopCount() == 1 })
 	waitFor(t, "speak queue drained", func() bool { return len(b.speakCh) == 0 })
+	waitFor(t, "active playback returned after cancellation", func() bool { return !b.speaking.Load() })
 
-	close(gate)
+	conn.Close()
+}
+
+func TestConverseBridge_BargeInDuringCoalesceDiscardsHeldAudio(t *testing.T) {
+	cfg := fastConfig()
+	cfg.SpeakCoalesce = 200 * time.Millisecond
+	pr, _ := io.Pipe()
+	media := &mockConverseMedia{capture: pr}
+	conn := newMockConn()
+	b := newConverseBridge(conn, media, nil, nil, cfg)
+	go b.Run(context.Background())
+
+	conn.incoming <- audioDeltaMsg([]byte{1, 2})
+	waitFor(t, "interruptible coalesce generation", func() bool {
+		b.playMu.Lock()
+		defer b.playMu.Unlock()
+		return b.playStop != nil && !b.playStarted
+	})
+	conn.incoming <- speechStartedMsg()
+	waitFor(t, "coalesce barge-in recorded", func() bool { return b.snapshot().Barges == 1 })
+	time.Sleep(2 * cfg.SpeakCoalesce)
+	if got := media.playedCount(); got != 0 {
+		t.Fatalf("SpeakPCM calls = %d, want held coalesced audio discarded", got)
+	}
+	if got := media.stopCount(); got != 0 {
+		t.Fatalf("StopSpeaking calls = %d, want no server stop before playback starts", got)
+	}
 	conn.Close()
 }
 
@@ -581,6 +706,30 @@ func TestDialRealtimeWaitsForConnectionReady(t *testing.T) {
 		_ = got.conn.Close()
 	case <-time.After(time.Second):
 		t.Fatal("dial did not return after connection_ready")
+	}
+}
+
+func TestDialRealtimeAppliesInboundMessageReadLimit(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteJSON(map[string]any{"type": "connected"})
+		_ = conn.WriteJSON(map[string]any{"type": "connection_ready", "config": map[string]any{"voiceCloneId": nil}})
+		_ = conn.WriteMessage(websocket.TextMessage, make([]byte, realtimeWSMessageMaxBytes+1))
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	conn, err := dialRealtime(context.Background(), base, "act_test", "agent-1")
+	if err != nil {
+		t.Fatalf("dial readiness: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Recv(); err == nil || !strings.Contains(err.Error(), "read limit") {
+		t.Fatalf("Recv error = %v, want websocket read limit", err)
 	}
 }
 

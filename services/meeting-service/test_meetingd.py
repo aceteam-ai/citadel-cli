@@ -10,8 +10,9 @@ Run:  python3 -m pytest services/meeting-service/test_meetingd.py
 
 from __future__ import annotations
 
-import math
 import io
+import json
+import math
 import os
 import shutil
 import struct
@@ -619,6 +620,70 @@ class _FakeProcess:
 
     def wait(self, timeout=None):
         return self.returncode
+
+
+def test_mic_stop_terminates_only_active_playback_and_is_idempotent(monkeypatch):
+    mic = _FakeProcess()
+    session = SimpleNamespace(lock=threading.Lock(), ending=False, mic_process=mic)
+    monkeypatch.setattr(
+        meetingd,
+        "_get_session",
+        lambda session_id: session if session_id == "s1" else None,
+    )
+    stopped = meetingd.mic_stop("s1")
+    again = meetingd.mic_stop("s1")
+    missing = meetingd.mic_stop("missing")
+    assert stopped.status_code == 200
+    assert json.loads(stopped.body) == {"stopped": True}
+    assert mic.terminated is True and mic.killed is False
+    assert session.mic_process is None
+    assert again.status_code == 200 and json.loads(again.body) == {"stopped": False}
+    assert missing.status_code == 404
+
+
+def test_mic_stop_waits_for_playback_lock_release_before_next_play(monkeypatch):
+    session = SimpleNamespace(lock=threading.Lock(), ending=False, mic_process=None)
+    monkeypatch.setattr(meetingd, "_get_session", lambda _: session)
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    started = threading.Event()
+    first = _FakeProcess()
+    calls = 0
+
+    def play(_session, _pcm, _rate, _channels):
+        nonlocal calls
+        calls += 1
+        if calls != 1:
+            return
+        with session.lock:
+            session.mic_process = first
+        started.set()
+        while not first.terminated:
+            threading.Event().wait(0.001)
+        # Deliberately retain the request/global mic lock briefly after process
+        # exit; mic_stop must not return until this handler's finally releases it.
+        threading.Event().wait(0.02)
+        with session.lock:
+            if session.mic_process is first:
+                session.mic_process = None
+
+    monkeypatch.setattr(meetingd, "_play_pcm_into_mic", play)
+    first_done = threading.Event()
+
+    def run_first():
+        meetingd._mic_play_pcm_response(session, b"\x00\x00", 24000, 1)
+        first_done.set()
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert started.wait(timeout=1)
+    stopped = meetingd.mic_stop("s1")
+    assert stopped.status_code == 200
+    assert first_done.wait(timeout=1)
+    second = meetingd._mic_play_pcm_response(session, b"\x00\x00", 24000, 1)
+    thread.join(timeout=1)
+    assert second.status_code == 200
+    assert calls == 2
 
 
 def test_teardown_cancels_active_mic_process_without_holding_session_lock(monkeypatch):

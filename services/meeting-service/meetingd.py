@@ -141,9 +141,9 @@ CAPTURE_CHUNK_BYTES = max(2, int(os.environ.get("MEETING_CAPTURE_CHUNK_BYTES", "
 MIC_DECODE_LIMIT_SECONDS = MIC_PLAY_TIMEOUT + 1
 MIC_DECODE_MAX_BYTES = MIC_DECODE_LIMIT_SECONDS * 48000 * 2 + 4096
 
-# Serializes injection so two overlapping clips never garble the mic. One clip at a
-# time; a second concurrent request gets 409 (no barge-in / mid-clip stop yet --
-# that is the later realtime wave).
+# Serializes injection so two overlapping clips never garble the mic. One clip at
+# a time; a second concurrent request gets 409. The session-scoped mic-stop route
+# terminates the tracked child for realtime barge-in without ending the session.
 _mic_lock = threading.Lock()
 
 
@@ -980,7 +980,7 @@ def capture_pcm(
 # 409 while a clip is already playing. The URL is nevertheless session-scoped: a
 # stale meeting-A callback cannot speak into a later meeting B, and session teardown
 # cancels the active child process. Playback is SYNCHRONOUS (the request returns
-# when the clip finishes); barge-in is a later realtime wave.
+# when the clip finishes); POST /sessions/{id}/mic/stop can interrupt it.
 
 
 def _mic_not_ready() -> JSONResponse | None:
@@ -1102,6 +1102,39 @@ async def mic_play_pcm(
     # Keep the async request reader responsive: the synchronous pacat process runs
     # in Starlette's worker pool, just like the other sync FastAPI handlers.
     return await run_in_threadpool(_mic_play_pcm_response, session, pcm, rate, channels)
+
+
+@app.post("/sessions/{session_id}/mic/stop")
+def mic_stop(session_id: str) -> JSONResponse:
+    """Stop this session's active mic child without ending the session."""
+    session = _get_session(session_id)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "no such session"})
+    with session.lock:
+        proc = session.mic_process
+    stopped = proc is not None and proc.poll() is None
+    if stopped:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    with session.lock:
+        if session.mic_process is proc:
+            session.mic_process = None
+    if stopped:
+        # Process exit slightly precedes the playback request's finally block,
+        # which owns `_mic_lock`. Synchronize with that release so the caller
+        # can start its next short TTS immediately instead of racing a stale 409.
+        idle = _mic_lock.acquire(timeout=5)
+        if not idle:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "mic playback did not release after stop"},
+            )
+        _mic_lock.release()
+    return JSONResponse(content={"stopped": stopped})
 
 
 @app.delete("/sessions/{session_id}")

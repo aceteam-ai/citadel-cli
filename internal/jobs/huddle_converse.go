@@ -26,12 +26,11 @@
 // monitor -- the OTHER participants' mixed audio. The bot's own TTS is published on
 // a DIFFERENT sink (`citadel_mic`), and WebRTC does not echo a peer's own mic back
 // to it, so the capture is echo-free BY CONSTRUCTION. As belt-and-suspenders (and
-// for any node where the two ever merge) the bridge GATES the HEAR->engine stream
-// while it is speaking (default on), with a short hangover after playback and an
-// `input_audio_buffer.clear` on gate release so no half-buffered self-audio leaks
-// in. Barge-in: on the engine's `input_audio_buffer.speech_started` we drop queued
-// TTS so the agent stops talking over a human (current in-flight chunk still plays
-// -- bounded by the coalesce window; true mid-clip stop is a documented follow-up).
+// for any node where the two ever merge) callers can opt into a HEAR gate while
+// speaking. It is OFF by default because gating an echo-free capture would also
+// hide the human speech needed for server-side VAD and barge-in. On the engine's
+// `input_audio_buffer.speech_started` the bridge cancels the in-flight HTTP play,
+// stops meetingd's active mic subprocess, and drops queued TTS.
 package jobs
 
 import (
@@ -90,6 +89,7 @@ type realtimeConn interface {
 type converseMedia interface {
 	CaptureStream(ctx context.Context, rate, channels int) (io.ReadCloser, error)
 	SpeakPCM(ctx context.Context, pcm []byte, rate, channels int) error
+	StopSpeaking(ctx context.Context) error
 }
 
 // stateCheckFunc reports whether the bridge should stop because the call ended.
@@ -126,11 +126,19 @@ type converseConfig struct {
 	// pacat play before posting, to avoid one subprocess spawn per delta (default
 	// 200ms).
 	SpeakCoalesce time.Duration
+	// MaxAudioDeltaBytes bounds one decoded PCM16 realtime event. Defaults to
+	// five seconds at the negotiated engine format.
+	MaxAudioDeltaBytes int
+	// MaxSpeakBufferBytes bounds a coalesced mic playback. Defaults to ten
+	// seconds at the negotiated engine format, below meetingd's own absolute and
+	// duration caps.
+	MaxSpeakBufferBytes int
 	// SpeakHangover holds the speaking gate closed this long after the last chunk
 	// plays, before reopening HEAR (default 250ms).
 	SpeakHangover time.Duration
-	// GateWhileSpeaking drops HEAR frames while the bot is speaking (default on).
-	// Disable to allow full-duplex barge-in on an echo-free node.
+	// GateWhileSpeaking drops HEAR frames while the bot is speaking (default off).
+	// Enable only when capture includes the bot's own mic; doing so deliberately
+	// disables server-VAD barge-in while playback is active.
 	GateWhileSpeaking *bool
 	// MicBusyBackoff is the retry pause on a 409 from SpeakPCM (default 50ms).
 	MicBusyBackoff time.Duration
@@ -150,8 +158,14 @@ type converseBridge struct {
 	log   func(level, format string, args ...any)
 	cfg   converseConfig
 
-	speaking atomic.Bool
-	speakCh  chan []byte
+	speaking    atomic.Bool
+	speakCh     chan []byte
+	playMu      sync.Mutex
+	playStop    context.CancelFunc
+	playStarted bool
+	// playInterrupted is protected by playMu and consumed by speakerLoop after
+	// SpeakPCM returns. It distinguishes an expected barge-in from a real error.
+	playInterrupted bool
 
 	// stats is mutated only from the recv/hear/speaker goroutines; guarded so the
 	// final read in Run is race-free.
@@ -175,6 +189,13 @@ func newConverseBridge(conn realtimeConn, media converseMedia, state stateCheckF
 	if cfg.SpeakCoalesce <= 0 {
 		cfg.SpeakCoalesce = 200 * time.Millisecond
 	}
+	bytesPerSecond := cfg.EngineRate * cfg.EngineChannels * bytesPerSample
+	if cfg.MaxAudioDeltaBytes <= 0 {
+		cfg.MaxAudioDeltaBytes = bytesPerSecond * 5
+	}
+	if cfg.MaxSpeakBufferBytes <= 0 {
+		cfg.MaxSpeakBufferBytes = bytesPerSecond * 10
+	}
 	if cfg.SpeakHangover <= 0 {
 		cfg.SpeakHangover = 250 * time.Millisecond
 	}
@@ -185,8 +206,8 @@ func newConverseBridge(conn realtimeConn, media converseMedia, state stateCheckF
 		cfg.StatePollInterval = 3 * time.Second
 	}
 	if cfg.GateWhileSpeaking == nil {
-		on := true
-		cfg.GateWhileSpeaking = &on
+		off := false
+		cfg.GateWhileSpeaking = &off
 	}
 	if log == nil {
 		log = func(string, string, ...any) {}
@@ -399,9 +420,17 @@ func (b *converseBridge) recvLoop(ctx context.Context, stop func(string, error))
 				stop("unsupported realtime audio", fmt.Errorf("realtime audio format %q is not PCM16", ev.Format))
 				return
 			}
+			if len(ev.Delta) > base64.StdEncoding.EncodedLen(b.cfg.MaxAudioDeltaBytes) {
+				stop("oversized realtime audio", fmt.Errorf("realtime PCM16 delta exceeds %d-byte limit", b.cfg.MaxAudioDeltaBytes))
+				return
+			}
 			pcm, decErr := base64.StdEncoding.DecodeString(ev.Delta)
 			if decErr != nil || len(pcm) == 0 {
 				stop("invalid realtime audio", fmt.Errorf("realtime PCM16 delta is empty or invalid base64"))
+				return
+			}
+			if len(pcm) > b.cfg.MaxAudioDeltaBytes {
+				stop("oversized realtime audio", fmt.Errorf("realtime PCM16 delta exceeds %d-byte limit", b.cfg.MaxAudioDeltaBytes))
 				return
 			}
 			if len(pcm)%bytesPerSample != 0 {
@@ -417,13 +446,19 @@ func (b *converseBridge) recvLoop(ctx context.Context, stop func(string, error))
 				return
 			}
 		case evtSpeechStarted:
-			// Barge-in: the human started talking; drop pending TTS so the agent
-			// yields the floor.
-			if n := b.drainSpeakCh(); n > 0 {
+			// Cancelling the HTTP request alone does not stop meetingd's pacat
+			// child, so stop both the in-flight process and queued TTS.
+			n := b.drainSpeakCh()
+			active, stopErr := b.interruptPlayback(ctx)
+			if stopErr != nil {
+				stop("mic playback stop failed", stopErr)
+				return
+			}
+			if active || n > 0 {
 				b.statsMu.Lock()
 				b.stats.Barges++
 				b.statsMu.Unlock()
-				b.log("info", "     - converse: barge-in, dropped %d queued TTS chunk(s)", n)
+				b.log("info", "     - converse: barge-in, stopped active=%t and dropped %d queued TTS chunk(s)", active, n)
 			}
 		case evtAudioDone:
 			// Nothing to force: the speaker releases the gate on idle.
@@ -461,13 +496,46 @@ func (b *converseBridge) speakerLoop(ctx context.Context, stop func(string, erro
 		case chunk := <-b.speakCh:
 			b.speaking.Store(true)
 			releasePending = false
-			buf := b.coalesce(ctx, chunk)
-			if err := b.play(ctx, buf); err != nil {
+			playCtx, cancel := context.WithCancel(ctx)
+			b.playMu.Lock()
+			b.playStop = cancel
+			b.playStarted = false
+			b.playInterrupted = false
+			b.playMu.Unlock()
+			buf, err := b.coalesce(playCtx, chunk)
+			if err != nil {
+				interrupted := b.finishPlayback(cancel)
+				if interrupted {
+					b.speaking.Store(false)
+					continue
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				stop("oversized realtime audio", err)
+				return
+			}
+			if !b.markPlaybackStarted() {
+				_ = b.finishPlayback(cancel)
+				b.speaking.Store(false)
+				continue
+			}
+			err = b.play(playCtx, buf)
+			interrupted := b.finishPlayback(cancel)
+			if interrupted {
+				b.speaking.Store(false)
+				continue
+			}
+			if err != nil {
 				stop("mic playback failed", err)
 				return
 			}
-			releasePending = true
-			resetTimer(idle, b.cfg.SpeakHangover)
+			if *b.cfg.GateWhileSpeaking {
+				releasePending = true
+				resetTimer(idle, b.cfg.SpeakHangover)
+			} else {
+				b.speaking.Store(false)
+			}
 		case <-idle.C:
 			if releasePending {
 				b.speaking.Store(false)
@@ -481,20 +549,70 @@ func (b *converseBridge) speakerLoop(ctx context.Context, stop func(string, erro
 	}
 }
 
+func (b *converseBridge) interruptPlayback(ctx context.Context) (bool, error) {
+	b.playMu.Lock()
+	cancel := b.playStop
+	if cancel == nil {
+		b.playMu.Unlock()
+		return false, nil
+	}
+	b.playInterrupted = true
+	started := b.playStarted
+	cancel()
+	b.playMu.Unlock()
+
+	if !started {
+		return true, nil
+	}
+	stopCtx, stopCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer stopCancel()
+	if err := b.media.StopSpeaking(stopCtx); err != nil {
+		return true, fmt.Errorf("stop active meeting mic playback: %w", err)
+	}
+	return true, nil
+}
+
+func (b *converseBridge) markPlaybackStarted() bool {
+	b.playMu.Lock()
+	defer b.playMu.Unlock()
+	if b.playInterrupted {
+		return false
+	}
+	b.playStarted = true
+	return true
+}
+
+func (b *converseBridge) finishPlayback(cancel context.CancelFunc) bool {
+	b.playMu.Lock()
+	defer b.playMu.Unlock()
+	interrupted := b.playInterrupted
+	b.playStop = nil
+	b.playStarted = false
+	b.playInterrupted = false
+	cancel()
+	return interrupted
+}
+
 // coalesce appends any deltas already queued (up to SpeakCoalesce) to the first
 // chunk so a burst plays as one clip.
-func (b *converseBridge) coalesce(ctx context.Context, first []byte) []byte {
+func (b *converseBridge) coalesce(ctx context.Context, first []byte) ([]byte, error) {
+	if len(first) > b.cfg.MaxSpeakBufferBytes {
+		return nil, fmt.Errorf("coalesced realtime PCM16 exceeds %d-byte limit", b.cfg.MaxSpeakBufferBytes)
+	}
 	buf := append([]byte(nil), first...)
 	deadline := time.NewTimer(b.cfg.SpeakCoalesce)
 	defer deadline.Stop()
 	for {
 		select {
 		case more := <-b.speakCh:
+			if len(more) > b.cfg.MaxSpeakBufferBytes-len(buf) {
+				return nil, fmt.Errorf("coalesced realtime PCM16 exceeds %d-byte limit", b.cfg.MaxSpeakBufferBytes)
+			}
 			buf = append(buf, more...)
 		case <-deadline.C:
-			return buf
+			return buf, nil
 		case <-ctx.Done():
-			return buf
+			return nil, ctx.Err()
 		}
 	}
 }

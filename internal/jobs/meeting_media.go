@@ -610,6 +610,28 @@ func (m *containerMedia) SpeakPCM(ctx context.Context, pcm []byte, rate, channel
 	return nil
 }
 
+// StopSpeaking interrupts only this exact meeting session's active virtual-mic
+// playback. It leaves the browser/session joined for continued conversation.
+func (m *containerMedia) StopSpeaking(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.base+m.sessionPath("/mic/stop"), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("meetingd mic stop: %w", err)
+	}
+	defer resp.Body.Close()
+	out, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if readErr != nil {
+		return fmt.Errorf("read meetingd mic stop response: %w", readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("meetingd mic stop returned status %d: %s", resp.StatusCode, string(out))
+	}
+	return nil
+}
+
 // CaptureStream opens meetingd's GET /sessions/{id}/capture/pcm and returns the
 // live raw s16le PCM body (the room's mixed audio -- the HEAR source the converse
 // bridge forwards to the realtime engine). The caller MUST Close the returned

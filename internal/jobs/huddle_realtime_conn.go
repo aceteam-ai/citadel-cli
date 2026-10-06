@@ -25,8 +25,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// realtimeDialTimeout bounds the WS handshake (not the session).
-const realtimeDialTimeout = 20 * time.Second
+const (
+	// realtimeDialTimeout bounds the WS handshake (not the session).
+	realtimeDialTimeout = 20 * time.Second
+	// The realtime protocol carries JSON control events plus base64 PCM chunks.
+	// One MiB is far above a normal audio delta while preventing a peer from
+	// making gorilla allocate an unbounded message before recvLoop can validate
+	// its decoded PCM payload.
+	realtimeWSMessageMaxBytes int64 = 1 << 20
+)
 
 // gorillaRealtimeConn adapts a *websocket.Conn to the realtimeConn seam. gorilla
 // allows a single READER and a single WRITER at a time. recvLoop is the only
@@ -73,6 +80,7 @@ func dialRealtime(ctx context.Context, apiBase *url.URL, token, agentID string) 
 		}
 		return nil, fmt.Errorf("dial realtime ws: %w", err)
 	}
+	c.SetReadLimit(realtimeWSMessageMaxBytes)
 	// DialContext only covers the HTTP upgrade. ReadMessage below can otherwise
 	// remain blocked until the readiness deadline even after the job is cancelled.
 	// Closing a gorilla connection is safe concurrently with a read and wakes that
