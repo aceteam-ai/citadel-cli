@@ -1,13 +1,18 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -199,6 +204,143 @@ func TestMeetingdHealthy(t *testing.T) {
 	}
 	if meetingdHealthy(client, "http://127.0.0.1:0") {
 		t.Error("meetingdHealthy = true for an unreachable meetingd, want false")
+	}
+}
+
+func TestContainerMediaDeleteSessionValidatesStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		wantErr bool
+	}{
+		{http.StatusNoContent, false},
+		{http.StatusNotFound, false}, // already reaped is idempotent success
+		{http.StatusInternalServerError, true},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodDelete || r.URL.Path != "/sessions/m1" {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			w.WriteHeader(tc.status)
+			_, _ = w.Write([]byte(`{"error":"teardown failed"}`))
+		}))
+		m := newTestContainerMedia(srv.URL)
+		err := m.deleteSession()
+		srv.Close()
+		if (err != nil) != tc.wantErr {
+			t.Errorf("DELETE status %d error = %v, wantErr=%v", tc.status, err, tc.wantErr)
+		}
+	}
+}
+
+func TestContainerMediaMalformedCreatedResponseCleansSession(t *testing.T) {
+	var deletes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"session_id":`))
+		case http.MethodDelete:
+			deletes.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	m := newTestContainerMedia(srv.URL)
+	err := m.createSession()
+	if err == nil || !strings.Contains(err.Error(), "parse meetingd session response") {
+		t.Fatalf("createSession error = %v, want malformed-response failure", err)
+	}
+	if deletes.Load() != 1 {
+		t.Fatalf("DELETE calls = %d, want cleanup of created deterministic session", deletes.Load())
+	}
+}
+
+func TestContainerMediaCreatedResponseReadFailureCleansSession(t *testing.T) {
+	var deletes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletes.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("test server does not support hijacking")
+		}
+		conn, rw, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("Hijack: %v", err)
+			return
+		}
+		_, _ = fmt.Fprint(rw, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"session_id\":")
+		_ = rw.Flush()
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+	m := newTestContainerMedia(srv.URL)
+	err := m.createSession()
+	if err == nil || !strings.Contains(err.Error(), "meetingd create session") {
+		t.Fatalf("createSession error = %v, want response-read failure", err)
+	}
+	if deletes.Load() != 1 {
+		t.Fatalf("DELETE calls = %d, want cleanup after ambiguous 201 read failure", deletes.Load())
+	}
+}
+
+func TestContainerMediaReadyCancellationCleansSession(t *testing.T) {
+	deletes := make(chan struct{}, 1)
+	meetingd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"session_id":"m1","cdp_port":9223}`))
+		case http.MethodDelete:
+			deletes <- struct{}{}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer meetingd.Close()
+	probeStarted := make(chan struct{}, 1)
+	cdp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probeStarted <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer cdp.Close()
+
+	m := newTestContainerMedia(meetingd.URL)
+	m.cdpPort = cdp.Listener.Addr().(*net.TCPAddr).Port
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.StartContext(ctx)
+		result <- err
+	}()
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("CDP readiness probe did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StartContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CDP readiness did not wake promptly on cancellation")
+	}
+	select {
+	case <-deletes:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled CDP readiness did not release meetingd session")
+	}
+}
+
+func TestMeetingdHealthyContextHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if meetingdHealthyContext(ctx, &http.Client{Timeout: time.Second}, "http://127.0.0.1:1") {
+		t.Fatal("cancelled meetingd health check reported healthy")
 	}
 }
 

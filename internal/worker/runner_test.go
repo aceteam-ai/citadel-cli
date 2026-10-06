@@ -479,6 +479,9 @@ func TestRunnerUnsupportedJobTypeDistinguishesGatedFromUnknown(t *testing.T) {
 		// gatedJobTypeReasons, but no FILE_READ handler is registered below --
 		// exactly the "files permission disabled" shape from the issue.
 		{ID: "job-gated", Type: JobTypeFileRead, Payload: map[string]any{}},
+		// HUDDLE_JOIN is known to the build but is not registered when the
+		// node's default-on meeting capability has been explicitly disabled.
+		{ID: "job-huddle-gated", Type: JobTypeHuddleJoin, Payload: map[string]any{}},
 		// A type this build has never heard of at all.
 		{ID: "job-unknown", Type: "TOTALLY_MADE_UP_JOB_TYPE", Payload: map[string]any{}},
 	}
@@ -495,8 +498,8 @@ func TestRunnerUnsupportedJobTypeDistinguishesGatedFromUnknown(t *testing.T) {
 
 	failed := source.FailedJobs()
 	data := source.FailedData()
-	if len(failed) != 2 || len(data) != 2 {
-		t.Fatalf("Failed jobs = %d, data = %d, want 2 each", len(failed), len(data))
+	if len(failed) != 3 || len(data) != 3 {
+		t.Fatalf("Failed jobs = %d, data = %d, want 3 each", len(failed), len(data))
 	}
 
 	byType := make(map[string]map[string]any)
@@ -514,6 +517,18 @@ func TestRunnerUnsupportedJobTypeDistinguishesGatedFromUnknown(t *testing.T) {
 	reason, _ := gated["unregistered_reason"].(string)
 	if reason == "" || !strings.Contains(reason, "files") {
 		t.Errorf("FILE_READ unregistered_reason = %q, want it to name the files permission", reason)
+	}
+
+	huddleGated := byType[JobTypeHuddleJoin]
+	if huddleGated == nil {
+		t.Fatalf("no failure recorded for %s", JobTypeHuddleJoin)
+	}
+	if huddleGated["known_to_build"] != true {
+		t.Errorf("HUDDLE_JOIN known_to_build = %v, want true", huddleGated["known_to_build"])
+	}
+	huddleReason, _ := huddleGated["unregistered_reason"].(string)
+	if !strings.Contains(huddleReason, "meeting capability") {
+		t.Errorf("HUDDLE_JOIN unregistered_reason = %q, want it to name the meeting capability", huddleReason)
 	}
 
 	unknown := byType["TOTALLY_MADE_UP_JOB_TYPE"]

@@ -151,6 +151,7 @@ const (
 	JobTypeExposeList         = "EXPOSE_LIST"          // Read back this node's durable exposure inventory (issue #944)
 	JobTypeUnexpose           = "UNEXPOSE"             // Remotely revoke a gateway exposure (issue #944)
 	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
+	JobTypeHuddleJoin         = "HUDDLE_JOIN"          // Join a native AceTeam huddle AS the agent (headless bot page) + confirm presence (aceteam#7081)
 	JobTypeDocumentRasterize  = "document_rasterize"   // Render selected PDF pages to images on this node so a scan can reach an OCR model (issue #675)
 	JobTypeShowPairingCode    = "SHOW_PAIRING_CODE"    // Render a node:exec pairing code on this node's console (issue #659)
 	JobTypeClearPairingCode   = "CLEAR_PAIRING_CODE"   // Clear a displayed node:exec pairing code (issue #659)
@@ -240,6 +241,7 @@ var allKnownJobTypes = []string{
 	JobTypeExposeList,
 	JobTypeUnexpose,
 	JobTypeMeetingJoin,
+	JobTypeHuddleJoin,
 	JobTypeDocumentRasterize,
 	JobTypeShowPairingCode,
 	JobTypeClearPairingCode,
@@ -282,9 +284,10 @@ var allKnownJobTypes = []string{
 //     `desktop` permission, also default-DENY.
 //   - config dir: SERVICE_START/SERVICE_STOP/SERVICE_STATUS register only when
 //     ConfigDir != "" (a resolved citadel.yaml manifest directory).
-//   - workspace: MEETING_JOIN registers only when WorkspaceDir != "" and the
+//   - meeting: MEETING_JOIN registers only when WorkspaceDir != "" and the
 //     node's meeting capability is enabled (config.LoadMeeting(...).MeetingEnabled,
-//     default-on).
+//     default-on). HUDDLE_JOIN does not need a workspace, but it is gated by the
+//     same meeting-capability toggle.
 //
 // A type absent from this map but also absent from a node's registered
 // handlers is either genuinely unsupported by this build (not in
@@ -309,4 +312,5 @@ var gatedJobTypeReasons = map[string]string{
 	JobTypeServiceStop:        "this node has no citadel.yaml manifest / config directory configured",
 	JobTypeServiceStatus:      "this node has no citadel.yaml manifest / config directory configured",
 	JobTypeMeetingJoin:        "this node has no workspace directory configured, or its meeting capability is toggled off",
+	JobTypeHuddleJoin:         "this node's meeting capability is toggled off",
 }

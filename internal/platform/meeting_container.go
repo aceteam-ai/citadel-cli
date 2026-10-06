@@ -20,6 +20,7 @@
 package platform
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"time"
@@ -47,7 +48,11 @@ func rewriteLoopbackWSPort(wsURL string, port int) (string, error) {
 // before dialing — the advertised URL names a port that only exists inside the
 // container.
 func cdpCommandPublished(debugPort int, method string, params map[string]any) (map[string]any, error) {
-	target, err := pickTarget(debugPort)
+	return cdpCommandPublishedContext(context.Background(), debugPort, method, params)
+}
+
+func cdpCommandPublishedContext(ctx context.Context, debugPort int, method string, params map[string]any) (map[string]any, error) {
+	target, err := pickTargetContext(ctx, debugPort)
 	if err != nil {
 		return nil, err
 	}
@@ -55,14 +60,18 @@ func cdpCommandPublished(debugPort int, method string, params map[string]any) (m
 	if err != nil {
 		return nil, err
 	}
-	return cdpDialAndSend(wsURL, method, params)
+	return cdpDialAndSendContext(ctx, wsURL, method, params)
 }
 
 // cdpEvaluatePublished mirrors cdpEvaluate for the published-port path: it runs a
 // JS expression and returns its by-value result, surfacing a JS throw as a Go
 // error, but rewrites the container-internal ws URL first.
 func cdpEvaluatePublished(debugPort int, expression string) (any, error) {
-	return cdpEvalValue(cdpCommandPublished(debugPort, "Runtime.evaluate", runtimeEvalParams(expression)))
+	return cdpEvaluatePublishedContext(context.Background(), debugPort, expression)
+}
+
+func cdpEvaluatePublishedContext(ctx context.Context, debugPort int, expression string) (any, error) {
+	return cdpEvalValue(cdpCommandPublishedContext(ctx, debugPort, "Runtime.evaluate", runtimeEvalParams(expression)))
 }
 
 // CDPBrowser drives a Chromium launched by the containerized meeting module over
@@ -88,10 +97,14 @@ func NewCDPBrowser(debugPort int) *CDPBrowser {
 // readiness poll alone is not enough: it is forwarded fine even when the ws path
 // (which the advertised URL misdirects to the container-internal port) is broken.
 func (b *CDPBrowser) Ready(timeout time.Duration) error {
-	if err := waitForCDPReady(b.debugPort, timeout); err != nil {
+	return b.ReadyContext(context.Background(), timeout)
+}
+
+func (b *CDPBrowser) ReadyContext(ctx context.Context, timeout time.Duration) error {
+	if err := waitForCDPReadyContext(ctx, b.debugPort, timeout); err != nil {
 		return fmt.Errorf("meeting container CDP not ready on host port %d: %w", b.debugPort, err)
 	}
-	if _, err := cdpEvaluatePublished(b.debugPort, "1"); err != nil {
+	if _, err := cdpEvaluatePublishedContext(ctx, b.debugPort, "1"); err != nil {
 		return fmt.Errorf("meeting container CDP websocket unreachable on host port %d "+
 			"(port publish or in-container socat forward broken): %w", b.debugPort, err)
 	}
@@ -100,7 +113,11 @@ func (b *CDPBrowser) Ready(timeout time.Duration) error {
 
 // Navigate drives the browser to a URL over CDP.
 func (b *CDPBrowser) Navigate(rawURL string) error {
-	_, err := cdpCommandPublished(b.debugPort, "Page.navigate", map[string]any{"url": rawURL})
+	return b.NavigateContext(context.Background(), rawURL)
+}
+
+func (b *CDPBrowser) NavigateContext(ctx context.Context, rawURL string) error {
+	_, err := cdpCommandPublishedContext(ctx, b.debugPort, "Page.navigate", map[string]any{"url": rawURL})
 	return err
 }
 
@@ -117,7 +134,11 @@ func (b *CDPBrowser) CurrentURL() (string, error) {
 // Evaluate runs a JS expression and returns its by-value result; a JS throw is a
 // Go error (see cdpEvalValue).
 func (b *CDPBrowser) Evaluate(expression string) (any, error) {
-	return cdpEvaluatePublished(b.debugPort, expression)
+	return b.EvaluateContext(context.Background(), expression)
+}
+
+func (b *CDPBrowser) EvaluateContext(ctx context.Context, expression string) (any, error) {
+	return cdpEvaluatePublishedContext(ctx, b.debugPort, expression)
 }
 
 // Type sets the value of the first element matching selector, erroring if none

@@ -21,11 +21,13 @@ package jobs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -331,7 +333,15 @@ func meetingdBaseURL() string {
 // it can actually capture non-silent audio (the canary tone probe returns 503
 // otherwise), so this is a strictly stronger signal than the host-binary probes.
 func meetingdHealthy(client *http.Client, base string) bool {
-	resp, err := client.Get(base + "/health")
+	return meetingdHealthyContext(context.Background(), client, base)
+}
+
+func meetingdHealthyContext(ctx context.Context, client *http.Client, base string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/health", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
@@ -384,12 +394,30 @@ func newContainerMedia(meetingID, wavRelPath, wavAbsPath string, maxDuration tim
 }
 
 func (m *containerMedia) Start() (meetingBrowser, error) {
-	if err := m.createSession(); err != nil {
+	return m.StartContext(context.Background())
+}
+
+func (m *containerMedia) StartContext(ctx context.Context) (*platform.CDPBrowser, error) {
+	if err := m.createSessionContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
+		}
 		return nil, err
 	}
 	br := platform.NewCDPBrowser(m.cdpPort)
-	if err := br.Ready(meetingContainerCDPTimeout); err != nil {
-		_ = m.deleteSession()
+	if err := br.ReadyContext(ctx, meetingContainerCDPTimeout); err != nil {
+		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
+		}
 		return nil, err
 	}
 	m.browser = br
@@ -397,13 +425,21 @@ func (m *containerMedia) Start() (meetingBrowser, error) {
 }
 
 func (m *containerMedia) createSession() error {
+	return m.createSessionContext(context.Background())
+}
+
+func (m *containerMedia) createSessionContext(ctx context.Context) error {
 	body := map[string]any{
 		"session_id":           m.sessionID,
 		"max_duration_seconds": int(m.maxDuration.Seconds()),
 	}
-	respBody, status, err := m.postJSON("/sessions", body)
+	respBody, status, err := m.postJSONContext(ctx, "/sessions", body)
 	if err != nil {
-		return fmt.Errorf("meetingd create session: %w", err)
+		primary := fmt.Errorf("meetingd create session: %w", err)
+		if status == http.StatusCreated {
+			return m.cleanupAmbiguousCreatedSession(primary)
+		}
+		return primary
 	}
 	if status == http.StatusConflict {
 		// A prior session is still active. meetingd enforces one meeting per node
@@ -412,17 +448,23 @@ func (m *containerMedia) createSession() error {
 		// deterministic id, so clear it and retry once; a DIFFERENT meeting's
 		// orphan we cannot address (meetingd has no list/clear endpoint) and it is
 		// a legitimate busy state, so we surface a clear error below.
-		_ = m.deleteSession()
-		respBody, status, err = m.postJSON("/sessions", body)
+		if cleanupErr := m.deleteSessionContext(ctx); cleanupErr != nil {
+			return fmt.Errorf("clear stale meetingd session: %w", cleanupErr)
+		}
+		respBody, status, err = m.postJSONContext(ctx, "/sessions", body)
 		if err != nil {
-			return fmt.Errorf("meetingd create session (after clearing stale): %w", err)
+			primary := fmt.Errorf("meetingd create session (after clearing stale): %w", err)
+			if status == http.StatusCreated {
+				return m.cleanupAmbiguousCreatedSession(primary)
+			}
+			return primary
 		}
 	}
 	switch status {
 	case http.StatusCreated:
 		var sr meetingSessionResponse
 		if err := json.Unmarshal(respBody, &sr); err != nil {
-			return fmt.Errorf("parse meetingd session response: %w", err)
+			return m.cleanupAmbiguousCreatedSession(fmt.Errorf("parse meetingd session response: %w", err))
 		}
 		if sr.SessionID != "" {
 			m.sessionID = sr.SessionID
@@ -436,6 +478,15 @@ func (m *containerMedia) createSession() error {
 	default:
 		return fmt.Errorf("meetingd POST /sessions returned status %d: %s", status, string(respBody))
 	}
+}
+
+func (m *containerMedia) cleanupAmbiguousCreatedSession(primary error) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), meetingContainerHTTPTimeout)
+	defer cancel()
+	if cleanupErr := m.deleteSessionContext(cleanupCtx); cleanupErr != nil {
+		return fmt.Errorf("%w (session cleanup also failed: %v)", primary, cleanupErr)
+	}
+	return primary
 }
 
 func (m *containerMedia) StartRecording() error {
@@ -473,11 +524,15 @@ func (m *containerMedia) RecordingAlive() <-chan struct{} {
 }
 
 func (m *containerMedia) Close() error {
+	return m.CloseContext(context.Background())
+}
+
+func (m *containerMedia) CloseContext(ctx context.Context) error {
 	if m.browser != nil {
 		_ = m.browser.Close()
 		m.browser = nil
 	}
-	return m.deleteSession()
+	return m.deleteSessionContext(ctx)
 }
 
 // SpeakFile injects a workspace-relative audio file into the container's virtual
@@ -519,7 +574,11 @@ func (m *containerMedia) sessionPath(suffix string) string {
 }
 
 func (m *containerMedia) deleteSession() error {
-	req, err := http.NewRequest(http.MethodDelete, m.base+"/sessions/"+url.PathEscape(m.sessionID), nil)
+	return m.deleteSessionContext(context.Background())
+}
+
+func (m *containerMedia) deleteSessionContext(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, m.base+"/sessions/"+url.PathEscape(m.sessionID), nil)
 	if err != nil {
 		return err
 	}
@@ -528,13 +587,23 @@ func (m *containerMedia) deleteSession() error {
 		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return readErr
+	}
+	if (resp.StatusCode < 200 || resp.StatusCode >= 300) && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("meetingd DELETE /sessions/%s returned status %d: %s", url.PathEscape(m.sessionID), resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 	return nil
 }
 
 // postJSON POSTs an optional JSON body to path and returns the response body,
 // status code, and any transport error. A nil body sends an empty POST.
 func (m *containerMedia) postJSON(path string, body any) ([]byte, int, error) {
+	return m.postJSONContext(context.Background(), path, body)
+}
+
+func (m *containerMedia) postJSONContext(ctx context.Context, path string, body any) ([]byte, int, error) {
 	var buf io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -543,7 +612,7 @@ func (m *containerMedia) postJSON(path string, body any) ([]byte, int, error) {
 		}
 		buf = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(http.MethodPost, m.base+path, buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.base+path, buf)
 	if err != nil {
 		return nil, 0, err
 	}
