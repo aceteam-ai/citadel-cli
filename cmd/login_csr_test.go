@@ -779,7 +779,9 @@ func TestLoginUIDRegistersAndDeregistersSameServingName(t *testing.T) {
 		if request.NodeName != registered {
 			t.Errorf("logout node_name = %q, registered = %q", request.NodeName, registered)
 		}
-		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(nexus.DeregisterResponse{Success: true}); err != nil {
+			t.Error(err)
+		}
 	}))
 	defer server.Close()
 	if err := nexus.NewDeregisterClient(server.URL, "test-token").Deregister(context.Background(), nexus.DeregisterRequest{NodeName: logoutServingNodeName("display-name")}); err != nil {

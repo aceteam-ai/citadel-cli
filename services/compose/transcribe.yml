@@ -40,5 +40,12 @@ services:
       - WHISPER_MODEL=base
       - WHISPER_DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=int8
+      # Real speaker diarization is gated. Supply a read token after accepting
+      # the configured model terms. Missing or transiently failing credentials
+      # fall back to the retryable BASIC tier without breaking transcription.
+      - HF_TOKEN=${HF_TOKEN:-}
+      - DIARIZE_MODEL=${DIARIZE_MODEL:-pyannote/speaker-diarization-community-1}
+      - DIARIZE_RETRY_SECONDS=${DIARIZE_RETRY_SECONDS:-30}
+      - PYANNOTE_METRICS_ENABLED=false
       - PORT=8101
     restart: unless-stopped

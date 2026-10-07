@@ -43,6 +43,8 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Test macOS DMG entrypoint
+        run: desktop/scripts/build-macos-dmg-test.sh
 
   review-head:
     name: Verify reviewed native build head

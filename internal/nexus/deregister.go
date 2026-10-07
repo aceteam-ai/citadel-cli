@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -33,6 +34,8 @@ type DeregisterError struct {
 	ErrorCode   string `json:"error"`
 	Description string `json:"error_description,omitempty"`
 }
+
+const maxDeregisterResponseBytes = 4096
 
 func (e *DeregisterError) Error() string {
 	if e.Description != "" {
@@ -84,7 +87,14 @@ func (c *DeregisterClient) Deregister(ctx context.Context, req DeregisterRequest
 	// Handle response based on status code
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		// Success
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxDeregisterResponseBytes+1))
+		if err != nil || len(body) > maxDeregisterResponseBytes {
+			return fmt.Errorf("server returned an invalid deregistration response")
+		}
+		var result DeregisterResponse
+		if err := json.Unmarshal(body, &result); err != nil || !result.Success {
+			return fmt.Errorf("server did not confirm deregistration")
+		}
 		return nil
 
 	case resp.StatusCode == http.StatusNotFound:
@@ -100,6 +110,6 @@ func (c *DeregisterClient) Deregister(ctx context.Context, req DeregisterRequest
 		return fmt.Errorf("server returned status %d", resp.StatusCode)
 
 	default:
-		return nil
+		return fmt.Errorf("server returned unexpected status %d", resp.StatusCode)
 	}
 }
