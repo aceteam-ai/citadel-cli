@@ -56,6 +56,7 @@ func TestCheckSecrets(t *testing.T) {
 		{name: "pem rsa key", input: "-----BEGIN RSA PRIVATE KEY-----\nMIIEowI...", wantType: "PEM private key", wantSev: SeverityHigh, wantSrc: "input"},
 		{name: "pem ec key", input: "-----BEGIN EC PRIVATE KEY-----\nMHQ...", wantType: "PEM private key", wantSev: SeverityHigh, wantSrc: "input"},
 		{name: "gitlab pat", input: "glpat-xxxxxxxxxxxxxxxxxxxx", wantType: "GitLab", wantSev: SeverityHigh, wantSrc: "input"},
+		{name: "aceteam api key", input: "raw act_abcdefghijklmnopqrstuvwxyz0123456789", wantType: "AceTeam API key", wantSev: SeverityHigh, wantSrc: "input"},
 		{name: "generic api key", input: `api_key="sk_1234567890abcdefghijklmnop"`, wantType: "generic API key", wantSev: SeverityHigh, wantSrc: "input"},
 		{name: "google api key", input: "key=" + googleAPIKey, wantType: "Google API key", wantSev: SeverityHigh, wantSrc: "input"},
 		{name: "clean text no secrets", input: "Hello world, this is a normal message with no secrets.", output: "The weather is nice today. Let me help you with that.", wantEmpty: true},

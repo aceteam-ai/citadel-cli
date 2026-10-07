@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -111,7 +112,7 @@ func ClassifyHTTPError(statusCode int, body string) error {
 		return fmt.Errorf("API gateway error (%d) — the service may be restarting", statusCode)
 	default:
 		if body != "" {
-			return fmt.Errorf("API returned HTTP %d: %s", statusCode, body)
+			return fmt.Errorf("API returned HTTP %d: %s", statusCode, redactDeviceAuthText(body))
 		}
 		return fmt.Errorf("API returned HTTP %d", statusCode)
 	}
@@ -121,6 +122,58 @@ func ClassifyHTTPError(statusCode int, body string) error {
 type DeviceAuthClient struct {
 	baseURL    string
 	httpClient *http.Client
+}
+
+const maxDeviceAuthResponseBytes = 64 << 10
+
+var canonicalAceTeamBearerPattern = regexp.MustCompile(`act_[0-9A-Fa-f]{64}`)
+
+// redactDeviceAuthText prevents a hostile device endpoint from reflecting a
+// minted bearer through an error_description or another printable field.
+// Successful memory responses retain APIKey because that is the credential
+// this flow exists to return; every diagnostic must pass through this helper.
+func redactDeviceAuthText(value string) string {
+	return canonicalAceTeamBearerPattern.ReplaceAllString(value, "[REDACTED]")
+}
+
+func redactTokenResponseMetadata(token *TokenResponse) {
+	// DeviceAPIToken is the expected act_ credential and must survive for its
+	// secure config destination. Every other server-controlled string is
+	// metadata or a different credential format and may later be displayed.
+	token.Authkey = redactDeviceAuthText(token.Authkey)
+	token.NexusURL = redactDeviceAuthText(token.NexusURL)
+	token.OrgID = redactDeviceAuthText(token.OrgID)
+	token.OrgName = redactDeviceAuthText(token.OrgName)
+	token.RedisURL = redactDeviceAuthText(token.RedisURL)
+	token.APIBaseURL = redactDeviceAuthText(token.APIBaseURL)
+	token.UserEmail = redactDeviceAuthText(token.UserEmail)
+	token.UserName = redactDeviceAuthText(token.UserName)
+	token.FabricNodeID = redactDeviceAuthText(token.FabricNodeID)
+	token.LeafPem = redactDeviceAuthText(token.LeafPem)
+	token.ChainPem = redactDeviceAuthText(token.ChainPem)
+	token.NodeUID = redactDeviceAuthText(token.NodeUID)
+}
+
+func decodeBoundedDeviceAuthJSON(r io.Reader, out any, label string) error {
+	body, err := io.ReadAll(io.LimitReader(r, maxDeviceAuthResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", label, err)
+	}
+	if len(body) > maxDeviceAuthResponseBytes {
+		return fmt.Errorf("%s exceeds %d bytes", label, maxDeviceAuthResponseBytes)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(out); err != nil {
+		return fmt.Errorf("parse %s: %w", label, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("parse %s: multiple JSON values", label)
+		}
+		return fmt.Errorf("parse %s trailing data: %w", label, err)
+	}
+	return nil
 }
 
 // DeviceCodeResponse represents the response from the /start endpoint
@@ -181,11 +234,35 @@ type StartFlowRequest struct {
 	Hostname      string `json:"hostname,omitempty"`
 	MachineID     string `json:"machine_id,omitempty"`
 	ForceNew      bool   `json:"force_new,omitempty"`
+	// DeviceKind selects the backend authorization path. Absent (empty) reads
+	// as "citadel" server-side, so existing callers are unaffected. The memory
+	// onboarding installer (aceteam #7160) sends "memory" so the backend mints
+	// a scoped act_ API key instead of a Headscale preauthkey.
+	DeviceKind string `json:"device_kind,omitempty"`
 }
 
 // StartFlowOptions contains options for starting the device authorization flow
 type StartFlowOptions struct {
 	ForceNew bool // Force fresh registration, ignoring existing machine mapping
+	// DeviceKind, when set (e.g. "memory"), is forwarded to the /start endpoint
+	// to select a non-citadel authorization path. Empty = citadel (default).
+	DeviceKind string
+}
+
+// MemoryTokenResponse is the poll response for a device_kind:"memory" flow
+// (aceteam #7160). Unlike the citadel TokenResponse (which returns a Headscale
+// authkey), a live memory record returns HTTP 200 and signals pending/approved
+// via Status. The shared endpoint still returns RFC 8628 HTTP 400 errors after
+// expiry or denial; checkMemoryTokenContext maps those into the same lifecycle
+// statuses. On approval it carries a scoped act_ API key in APIKey — the same
+// credential external MCP clients (like Claude Code) authenticate with.
+type MemoryTokenResponse struct {
+	Status    string   `json:"status"` // pending | approved | expired | denied
+	APIKey    string   `json:"api_key,omitempty"`
+	ExpiresIn *int     `json:"expires_in,omitempty"` // nullable; memory keys are minted without expiry
+	OrgID     string   `json:"org_id,omitempty"`
+	OrgName   string   `json:"org_name,omitempty"`
+	Scopes    []string `json:"scopes,omitempty"`
 }
 
 // TokenRequest represents the request body for /token endpoint
@@ -206,6 +283,11 @@ func NewDeviceAuthClient(baseURL string) *DeviceAuthClient {
 		baseURL: baseURL,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
+			// Device codes authorize credential minting and must not be replayed
+			// to a redirect target. Endpoint changes must be explicit.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
@@ -232,6 +314,7 @@ func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeRespons
 	// Apply options if provided
 	if opts != nil {
 		reqBody.ForceNew = opts.ForceNew
+		reqBody.DeviceKind = opts.DeviceKind
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -268,9 +351,10 @@ func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeRespons
 
 	// Parse response
 	var response DeviceCodeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	if err := decodeBoundedDeviceAuthJSON(resp.Body, &response, "device authorization response"); err != nil {
+		return nil, err
 	}
+	response.UserCode = redactDeviceAuthText(response.UserCode)
 
 	// Override verification URI to use the auth service base URL
 	// This ensures local development works correctly
@@ -340,7 +424,7 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 					csr = ""
 					break
 				}
-				return nil, fmt.Errorf("authentication error: %s", tokenErr.ErrorDescription)
+				return nil, fmt.Errorf("authentication error: %s", tokenErr.Error())
 			}
 		}
 
@@ -374,7 +458,7 @@ func isCertificateEnrollmentCode(code string) bool {
 // the code, or "" when the body is not that shape.
 func decodeErrorCode(r io.Reader) string {
 	var e TokenError
-	if json.NewDecoder(r).Decode(&e) != nil {
+	if decodeBoundedDeviceAuthJSON(r, &e, "token error response") != nil {
 		return ""
 	}
 	return e.ErrorCode
@@ -421,17 +505,18 @@ func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenR
 	// Success case
 	if resp.StatusCode == http.StatusOK {
 		var tokenResp TokenResponse
-		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-			return nil, fmt.Errorf("failed to parse token response: %w", err)
+		if err := decodeBoundedDeviceAuthJSON(resp.Body, &tokenResp, "token response"); err != nil {
+			return nil, err
 		}
+		redactTokenResponseMetadata(&tokenResp)
 		return &tokenResp, nil
 	}
 
 	// Error case - parse error response
 	if resp.StatusCode == http.StatusBadRequest {
 		var tokenErr TokenError
-		if err := json.NewDecoder(resp.Body).Decode(&tokenErr); err != nil {
-			return nil, fmt.Errorf("failed to parse error response: %w", err)
+		if err := decodeBoundedDeviceAuthJSON(resp.Body, &tokenErr, "token error response"); err != nil {
+			return nil, err
 		}
 		return nil, &tokenErr
 	}
@@ -454,10 +539,201 @@ func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenR
 	return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 }
 
+// PollForMemoryToken polls the /token endpoint for a device_kind:"memory" flow
+// until the device is approved, denied, expires, or the client times out.
+//
+// Live memory records return HTTP 200 with a Status field (they do NOT use the
+// RFC 8628 authorization_pending error), so this method cannot reuse
+// PollForToken. Shared-endpoint expiry/denial errors are normalized separately.
+// The citadel PollForToken path is left untouched.
+func (c *DeviceAuthClient) PollForMemoryToken(deviceCode string, interval int) (*MemoryTokenResponse, error) {
+	return c.PollForMemoryTokenContext(context.Background(), deviceCode, interval)
+}
+
+const (
+	defaultMemoryPollInterval = 5 * time.Second
+	maxMemoryPollInterval     = 30 * time.Second
+	memorySlowDownStep        = 5 * time.Second
+	memoryPollTimeout         = 10 * time.Minute
+)
+
+// PollForMemoryTokenContext is PollForMemoryToken with caller cancellation.
+// The backend-provided interval is normalized to a finite safe range, and the
+// timer is always capped to the remaining authorization budget.
+func (c *DeviceAuthClient) PollForMemoryTokenContext(ctx context.Context, deviceCode string, interval int) (*MemoryTokenResponse, error) {
+	pollingInterval := normalizeMemoryPollInterval(interval)
+	return c.pollMemoryContext(ctx, deviceCode, pollingInterval, memoryPollTimeout)
+}
+
+func normalizeMemoryPollInterval(seconds int) time.Duration {
+	if seconds <= 0 {
+		return defaultMemoryPollInterval
+	}
+	if seconds > int(maxMemoryPollInterval/time.Second) {
+		return maxMemoryPollInterval
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func slowDownMemoryPollInterval(current time.Duration) time.Duration {
+	current += memorySlowDownStep
+	if current > maxMemoryPollInterval {
+		return maxMemoryPollInterval
+	}
+	return current
+}
+
+// pollMemory is retained as the duration-parameterized test seam.
+func (c *DeviceAuthClient) pollMemory(deviceCode string, pollingInterval, timeout time.Duration) (*MemoryTokenResponse, error) {
+	return c.pollMemoryContext(context.Background(), deviceCode, pollingInterval, timeout)
+}
+
+func (c *DeviceAuthClient) pollMemoryContext(parent context.Context, deviceCode string, pollingInterval, timeout time.Duration) (*MemoryTokenResponse, error) {
+	if pollingInterval <= 0 {
+		return nil, fmt.Errorf("memory polling interval must be positive")
+	}
+	if pollingInterval > maxMemoryPollInterval {
+		pollingInterval = maxMemoryPollInterval
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	for {
+		resp, err := c.checkMemoryTokenContext(ctx, deviceCode)
+		if err != nil {
+			// classifyNetworkError intentionally presents friendly errors and does
+			// not retain the request error in its chain, so consult the governing
+			// context as well when the request ended at our poll deadline.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("authentication timeout after %s", timeout)
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+
+		switch resp.Status {
+		case "approved":
+			if resp.APIKey == "" {
+				return nil, fmt.Errorf("device approved but no API key was returned")
+			}
+			return resp, nil
+		case "denied":
+			return nil, fmt.Errorf("authorization denied by user")
+		case "expired":
+			return nil, fmt.Errorf("device code expired, please run the command again")
+		case "pending":
+			// Keep polling within the context deadline below.
+		case "slow_down":
+			// RFC 8628 requires increasing the interval by five seconds for
+			// this and all subsequent requests in the active device flow.
+			pollingInterval = slowDownMemoryPollInterval(pollingInterval)
+		default:
+			return nil, fmt.Errorf("unexpected memory authorization status %q", resp.Status)
+		}
+
+		wait := pollingInterval
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil, fmt.Errorf("authentication timeout after %s", timeout)
+			}
+			if wait > remaining {
+				wait = remaining
+			}
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf("authentication timeout after %s", timeout)
+			}
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// checkMemoryToken makes a single /token request for a memory-kind device.
+func (c *DeviceAuthClient) checkMemoryToken(deviceCode string) (*MemoryTokenResponse, error) {
+	return c.checkMemoryTokenContext(context.Background(), deviceCode)
+}
+
+func (c *DeviceAuthClient) checkMemoryTokenContext(ctx context.Context, deviceCode string) (*MemoryTokenResponse, error) {
+	url := c.baseURL + "/api/fabric/device-auth/token"
+
+	reqBody := TokenRequest{
+		DeviceCode: deviceCode,
+		GrantType:  "urn:ietf:params:oauth:grant-type:device_code",
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, classifyNetworkError(err, c.baseURL)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return nil, fmt.Errorf("authentication service unavailable")
+	}
+	if resp.StatusCode == http.StatusBadRequest {
+		var tokenErr TokenError
+		if err := decodeBoundedDeviceAuthJSON(resp.Body, &tokenErr, "memory token error response"); err != nil {
+			return nil, err
+		}
+		switch tokenErr.ErrorCode {
+		case "expired_token":
+			return &MemoryTokenResponse{Status: "expired"}, nil
+		case "access_denied":
+			return &MemoryTokenResponse{Status: "denied"}, nil
+		case "authorization_pending":
+			return &MemoryTokenResponse{Status: "pending"}, nil
+		case "slow_down":
+			return &MemoryTokenResponse{Status: "slow_down"}, nil
+		default:
+			return nil, fmt.Errorf("memory token request failed: %s", tokenErr.Error())
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	var out MemoryTokenResponse
+	if err := decodeBoundedDeviceAuthJSON(resp.Body, &out, "memory token response"); err != nil {
+		return nil, err
+	}
+	// The API key is the sole expected bearer field. All other server-controlled
+	// strings can reach user-visible install output or the saved metadata.
+	out.Status = redactDeviceAuthText(out.Status)
+	out.OrgID = redactDeviceAuthText(out.OrgID)
+	out.OrgName = redactDeviceAuthText(out.OrgName)
+	for i := range out.Scopes {
+		out.Scopes[i] = redactDeviceAuthText(out.Scopes[i])
+	}
+	return &out, nil
+}
+
 // Error implements the error interface for TokenError
 func (e *TokenError) Error() string {
 	if e.ErrorDescription != "" {
-		return fmt.Sprintf("%s: %s", e.ErrorCode, e.ErrorDescription)
+		return fmt.Sprintf("%s: %s", redactDeviceAuthText(e.ErrorCode), redactDeviceAuthText(e.ErrorDescription))
 	}
-	return e.ErrorCode
+	return redactDeviceAuthText(e.ErrorCode)
 }
