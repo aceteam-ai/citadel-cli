@@ -341,6 +341,19 @@ func TestReconnectTimeoutConstant(t *testing.T) {
 	}
 }
 
+// TestRecoveryReauthTimeoutConstant pins that the IP-preserving reauth budget
+// outlasts waitForConnection's own 60s cap, so a slow-but-reachable control
+// plane reattaches with the preserved machine key instead of timing out early
+// and refusing recovery (#1235).
+func TestRecoveryReauthTimeoutConstant(t *testing.T) {
+	if recoveryReauthTimeout <= 60*time.Second {
+		t.Errorf("recoveryReauthTimeout = %v, must exceed waitForConnection's 60s cap", recoveryReauthTimeout)
+	}
+	if recoveryReauthTimeout <= reconnectTimeout {
+		t.Errorf("recoveryReauthTimeout (%v) must exceed the no-authkey probe timeout reconnectTimeout (%v)", recoveryReauthTimeout, reconnectTimeout)
+	}
+}
+
 // TestReconnectAttemptsConstant verifies the retry count for VerifyOrReconnect
 // is high enough to survive boot-time network delays without being so high
 // that a genuinely revoked key wastes minutes before failing (issue #246).

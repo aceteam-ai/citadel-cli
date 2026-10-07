@@ -105,7 +105,7 @@ func egressRelayServe(
 		if deviceConfig != nil && deviceConfig.APIBaseURL != "" {
 			apiBaseURL = deviceConfig.APIBaseURL
 		}
-		result := recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
+		result := recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL, false)
 		connected = result.Connected
 		if !result.Connected {
 			msg := "could not restore the AceTeam Network connection automatically"

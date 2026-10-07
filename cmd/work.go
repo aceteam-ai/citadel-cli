@@ -1155,7 +1155,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			apiBaseURL = authServiceURL
 		}
 
-		result := recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
+		result := recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL, false)
 		connected = result.Connected
 		if result.Connected {
 			if result.IPPreserved {
@@ -2071,6 +2071,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					Client:          apiSource.Client(),
 					NodeID:          nodeName,
 					HeadscaleNodeID: headscaleNodeID,
+					StableNodeID:    resolveStableNodeID(),
 					OrgID:           orgID,
 					AgentVersion:    Version,
 					DebugFunc:       Debug,
@@ -2147,6 +2148,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				RedisPassword:   workRedisPass,
 				NodeID:          nodeName,
 				HeadscaleNodeID: headscaleNodeID,
+				StableNodeID:    resolveStableNodeID(),
 				DeviceCode:      deviceCode,
 				AgentVersion:    Version,
 				ChannelOverride: workStatusChannel,

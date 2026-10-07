@@ -85,7 +85,7 @@ func TestRecoverStaleVPNNoToken(t *testing.T) {
 	ctx := context.Background()
 
 	// nil config: should return error about missing token
-	r1 := recoverStaleVPN(ctx, nil, "test-node", "https://example.com")
+	r1 := recoverStaleVPN(ctx, nil, "test-node", "https://example.com", false)
 	if r1.Connected {
 		t.Error("expected Connected=false with nil config")
 	}
@@ -94,7 +94,7 @@ func TestRecoverStaleVPNNoToken(t *testing.T) {
 	}
 
 	// empty token: same result
-	r2 := recoverStaleVPN(ctx, &DeviceConfig{DeviceAPIToken: ""}, "test-node", "https://example.com")
+	r2 := recoverStaleVPN(ctx, &DeviceConfig{DeviceAPIToken: ""}, "test-node", "https://example.com", false)
 	if r2.Connected {
 		t.Error("expected Connected=false with empty token")
 	}
@@ -111,7 +111,7 @@ func TestRecoverStaleVPNFetchAuthkeyFails(t *testing.T) {
 	// Use a config with a token but pointing to a non-existent server.
 	// FetchFreshAuthkey will fail with a connection error.
 	cfg := &DeviceConfig{DeviceAPIToken: "act_test_token_12345"}
-	r := recoverStaleVPN(ctx, cfg, "test-node", "http://127.0.0.1:1")
+	r := recoverStaleVPN(ctx, cfg, "test-node", "http://127.0.0.1:1", false)
 	if r.Connected {
 		t.Error("expected Connected=false when authkey fetch fails")
 	}

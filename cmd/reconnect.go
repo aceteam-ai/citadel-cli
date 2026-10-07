@@ -15,6 +15,22 @@ import (
 
 var reconnectForce bool
 
+// Indirection seams so the recovery path is testable without touching real
+// network state. On a live node GetStateDir() resolves to that node's live
+// tailscaled.state, so a test that reached the real ClearState()/Connect() would
+// wipe the node's identity (issue #1235). Tests swap these for stubs and assert
+// clearStateFn is never called on an unattended (non --force) recovery.
+var (
+	fetchFreshAuthkeyFn    = network.FetchFreshAuthkey
+	reconnectWithAuthKeyFn = network.ReconnectWithAuthKey
+	connectFn              = network.Connect
+	clearStateFn           = network.ClearState
+	getStateDirFn          = network.GetStateDir
+	hasStateFn             = network.HasState
+	resolveControlURLFn    = network.ResolveControlURL
+	reclaimStaleNodeFn     = reclaimStaleNodeByHostname
+)
+
 var reconnectCmd = &cobra.Command{
 	Use:   "reconnect",
 	Short: "Recover a stale VPN connection",
@@ -76,10 +92,10 @@ func runReconnect() {
 	if reconnectForce {
 		// Skip verify, clear state first, then use shared recovery
 		fmt.Println("Forcing VPN reconnect (clearing state)...")
-		if err := network.ClearState(); err != nil {
+		if err := clearStateFn(); err != nil {
 			Debug("failed to clear state: %v", err)
 		}
-		result = recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
+		result = recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL, true)
 	} else {
 		// Normal flow: verify first, then recover if stale
 		result = attemptVPNRecovery(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
@@ -135,8 +151,9 @@ func attemptVPNRecovery(ctx context.Context, deviceConfig *DeviceConfig, hostnam
 		return VPNRecoveryResult{Err: fmt.Errorf("unexpected network error: %w", err)}
 	}
 
-	// State is stale (or no state) -- delegate to core recovery
-	return recoverStaleVPN(ctx, deviceConfig, hostname, apiBaseURL)
+	// State is stale (or no state) -- delegate to core recovery. This is the
+	// unattended 'citadel reconnect' path: never churn node identity here.
+	return recoverStaleVPN(ctx, deviceConfig, hostname, apiBaseURL, false)
 }
 
 // recoverStaleVPN performs the actual VPN recovery: fetch a fresh authkey,
@@ -146,9 +163,9 @@ func attemptVPNRecovery(ctx context.Context, deviceConfig *DeviceConfig, hostnam
 // and by attemptVPNRecovery (which verifies first on behalf of
 // 'citadel reconnect'). Also used by the --force path to avoid
 // duplicating fetch+connect logic.
-func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, apiBaseURL string) VPNRecoveryResult {
-	Log("VPN state is stale, attempting recovery (state_dir=%s, has_state=%v)...",
-		network.GetStateDir(), network.HasState())
+func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, apiBaseURL string, allowChurn bool) VPNRecoveryResult {
+	Log("VPN state is stale, attempting recovery (state_dir=%s, has_state=%v, allow_churn=%v)...",
+		getStateDirFn(), hasStateFn(), allowChurn)
 
 	if deviceConfig == nil || deviceConfig.DeviceAPIToken == "" {
 		Log("no device API token available for auto-recovery")
@@ -159,7 +176,7 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 
 	// Fetch a fresh authkey from the platform
 	Log("requesting fresh authkey from %s", apiBaseURL)
-	freshKey, fetchErr := network.FetchFreshAuthkey(ctx, apiBaseURL, deviceConfig.DeviceAPIToken)
+	freshKey, fetchErr := fetchFreshAuthkeyFn(ctx, apiBaseURL, deviceConfig.DeviceAPIToken)
 	if fetchErr != nil {
 		Log("failed to fetch fresh authkey: %v", fetchErr)
 		return VPNRecoveryResult{
@@ -169,73 +186,86 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 
 	// Attempt 1: reconnect with existing state + fresh key (preserves IP)
 	Log("attempting reconnect with existing state (IP-preserving)...")
-	if ok, reconnErr := network.ReconnectWithAuthKey(ctx, freshKey); reconnErr == nil && ok {
+	if ok, reconnErr := reconnectWithAuthKeyFn(ctx, freshKey); reconnErr == nil && ok {
 		Log("reconnected with existing state (IP preserved)")
 		return VPNRecoveryResult{Connected: true, IPPreserved: true}
 	} else {
 		Log("IP-preserving reconnect failed: %v", reconnErr)
 	}
 
-	// Attempt 2: clear state and connect from scratch (new IP/hostname).
-	//
-	// THIS IS THE IDENTITY-CHURN PATH. Reaching here means the persisted machine
-	// identity in tailscaled.state could not be re-authorized even with a fresh
-	// authkey — so we are about to discard it and register as a brand-new node.
-	// That mints a new fabric/Headscale node id, a new mesh IP, and (on the
-	// backend) a new device key. The usual root cause is an EPHEMERAL Headscale
-	// registration: when the node went offline, Headscale removed the ephemeral
-	// node, so the persisted machine key no longer maps to any node and only a
-	// fresh registration succeeds. The durable fix is backend PR #4584 (register
-	// non-ephemerally) so an offline node is never removed; see aceteam #4583.
-	// Warn loudly so this is diagnosable in the field rather than silent.
+	// Attempt 1 failed. Re-registering from scratch here would discard the
+	// persisted machine key and mint a BRAND-NEW node (new id, new IP, new
+	// device key), orphaning every capability bound to the old node id
+	// (WhatsApp/WeChat creds, Files, node:exec grants, the per-node job stream)
+	// -- issue #1235. That is only ever acceptable as an EXPLICIT operator
+	// action, never on an unattended path. Unless churn was explicitly
+	// authorized (citadel reconnect --force), refuse and leave the persisted
+	// identity intact so a later reattach (or the control-plane fix) recovers
+	// the SAME node.
+	if !allowChurn {
+		Log("refusing to churn node identity on an unattended recovery; leaving persisted state intact")
+		return VPNRecoveryResult{
+			Err: fmt.Errorf("could not re-establish the VPN with the existing node identity, and " +
+				"automatic identity churn is disabled: the control plane may be unreachable or the " +
+				"node key may need re-authorization. Re-run 'citadel reconnect --force' to re-register " +
+				"as a new node (this mints a new node id and requires re-provisioning capabilities bound " +
+				"to the old one), or 'citadel login --authkey <key>'"),
+		}
+	}
+
+	// Attempt 2 (EXPLICIT CHURN, --force only): discard the persisted identity
+	// and register as a new node. See warnIdentityChurn.
 	warnIdentityChurn(hostname)
 
-	// Before clearing, reclaim the stale Headscale node so the dashboard
-	// doesn't accumulate duplicate entries on every restart (issue #246).
-	if deviceConfig.DeviceAPIToken != "" && hostname != "" {
+	// Reclaim the stale Headscale node so the dashboard doesn't accumulate
+	// duplicate entries (issue #246). Best-effort.
+	if hostname != "" {
 		Log("reclaiming stale node '%s' before fresh connect...", hostname)
-		reclaimStaleNodeByHostname(deviceConfig.DeviceAPIToken, hostname)
+		reclaimStaleNodeFn(deviceConfig.DeviceAPIToken, hostname)
 	}
 	Log("clearing state for fresh connect...")
-	if clearErr := network.ClearState(); clearErr != nil {
+	if clearErr := clearStateFn(); clearErr != nil {
 		Log("failed to clear network state: %v", clearErr)
 	}
+
+	// Attempt 1 may have spent the single-use authkey at the control plane, and
+	// a spent single-use key on an expired node is the headscale #2434 panic/401
+	// condition. Fetch a fresh key for the churn connect rather than reusing it.
+	churnKey, churnKeyErr := fetchFreshAuthkeyFn(ctx, apiBaseURL, deviceConfig.DeviceAPIToken)
+	if churnKeyErr != nil {
+		Log("failed to fetch fresh authkey for churn connect: %v", churnKeyErr)
+		return VPNRecoveryResult{Err: fmt.Errorf("could not fetch authkey for fresh connect: %w", churnKeyErr)}
+	}
+
 	freshCtx, freshCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer freshCancel()
 	config := network.ServerConfig{
 		Hostname:   hostname,
-		ControlURL: network.ResolveControlURL(),
-		StateDir:   network.GetStateDir(),
-		AuthKey:    freshKey,
+		ControlURL: resolveControlURLFn(),
+		StateDir:   getStateDirFn(),
+		AuthKey:    churnKey,
 	}
-	_, connectErr := network.Connect(freshCtx, config)
-	if connectErr == nil {
-		Log("reconnected with fresh state (new IP)")
-		return VPNRecoveryResult{Connected: true, IPPreserved: false}
+	if _, connectErr := connectFn(freshCtx, config); connectErr != nil {
+		Log("fresh connect also failed: %v", connectErr)
+		return VPNRecoveryResult{Err: fmt.Errorf("all recovery attempts failed: %w", connectErr)}
 	}
-
-	Log("fresh connect also failed: %v", connectErr)
-	return VPNRecoveryResult{
-		Err: fmt.Errorf("all recovery attempts failed: %w", connectErr),
-	}
+	Log("reconnected with fresh state (new IP)")
+	return VPNRecoveryResult{Connected: true, IPPreserved: false}
 }
 
 // warnIdentityChurn emits a prominent, structured warning that the node is about
-// to lose its persisted identity and re-register as a new node. This is the
-// symptom of an ephemeral Headscale registration (the node was removed while
-// offline); the durable fix is non-ephemeral registration (backend #4584 /
-// aceteam #4583). Surfacing it loudly makes the churn diagnosable in the field
-// instead of a silent id/IP/device-key change.
+// to lose its persisted identity and re-register as a new node. This path runs
+// only under an explicit 'citadel reconnect --force' (issue #1235): Headscale
+// reattaches on a preserved machine key, so a new node is minted precisely
+// because a fresh machine key is being presented. The churn orphans every
+// capability bound to the old node id. Surfaced loudly so it is diagnosable.
 func warnIdentityChurn(hostname string) {
-	Log("IDENTITY CHURN: reusing persisted identity failed; re-registering '%s' as a NEW node "+
-		"(new fabric id + new mesh IP + new device key). Likely cause: ephemeral Headscale "+
-		"registration removed the node while offline. Durable fix: non-ephemeral registration. "+
-		"One-time migration: re-run 'citadel init' so this node "+
-		"re-registers with a persistent key.", hostname)
+	Log("IDENTITY CHURN (--force): discarding persisted identity and re-registering '%s' as a NEW node "+
+		"(new fabric id + new mesh IP + new device key). Capabilities bound to the old node id "+
+		"(WhatsApp/WeChat, Files, node:exec, per-node job stream) will need re-provisioning.", hostname)
 	fmt.Fprintln(os.Stderr, "   - WARNING: node identity is being reset (new node id, new IP, new device key).")
-	fmt.Fprintln(os.Stderr, "     Cause: the persisted identity could not be re-authorized (likely an ephemeral")
-	fmt.Fprintln(os.Stderr, "     registration removed while offline). This node will keep working but appears as a")
-	fmt.Fprintln(os.Stderr, "     new node. To stop recurring churn, re-run 'citadel init' to re-register persistently.")
+	fmt.Fprintln(os.Stderr, "     Capabilities bound to the old node id (WhatsApp/WeChat, Files, node:exec) will")
+	fmt.Fprintln(os.Stderr, "     need re-provisioning. This was requested explicitly via --force.")
 }
 
 func init() {

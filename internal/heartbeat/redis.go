@@ -34,13 +34,17 @@ var nodeIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
 
 // StatusMessage is the payload published to Redis for status updates.
 type StatusMessage struct {
-	Version         string             `json:"version"`
-	Timestamp       string             `json:"timestamp"`
-	NodeID          string             `json:"nodeId"`
-	HeadscaleNodeID string             `json:"headscaleNodeId,omitempty"`
-	DeviceCode      string             `json:"deviceCode,omitempty"`
-	Status          *status.NodeStatus `json:"status"`
-	Permissions     *PermissionState   `json:"permissions,omitempty"`
+	Version         string `json:"version"`
+	Timestamp       string `json:"timestamp"`
+	NodeID          string `json:"nodeId"`
+	HeadscaleNodeID string `json:"headscaleNodeId,omitempty"`
+	// StableNodeID is the durable machine-convergent identity fingerprint
+	// ("sha256:<hex>"); the backend maps it to the current node id to rebind
+	// capabilities across a churn (#1235). Inert until the backend consumes it.
+	StableNodeID string             `json:"stableNodeId,omitempty"`
+	DeviceCode   string             `json:"deviceCode,omitempty"`
+	Status       *status.NodeStatus `json:"status"`
+	Permissions  *PermissionState   `json:"permissions,omitempty"`
 	// Stats is the compact Fabric Pulse block (GPU + inference internals,
 	// citadel-cli#587). Optional and versioned: legacy backends ignore it,
 	// legacy nodes omit it. Read from the pulse collector's cache via
@@ -105,6 +109,7 @@ type RedisPublisher struct {
 	redisURL        string // For debug logging
 	nodeID          string
 	headscaleNodeID string // Headscale numeric node ID (e.g., "758")
+	stableNodeID    string // durable machine-convergent identity fingerprint (#1235)
 	agentVersion    string // citadel-cli binary version, reported as agent_version
 	interval        time.Duration
 	collector       *status.Collector
@@ -212,6 +217,8 @@ type RedisPublisherConfig struct {
 	// When set, included in heartbeat messages so the Python worker can skip
 	// the Headscale hostname-to-ID lookup.
 	HeadscaleNodeID string
+	// StableNodeID is the durable machine-convergent identity fingerprint (#1235).
+	StableNodeID string
 
 	// DeviceCode is the device authorization code for config lookup (optional)
 	DeviceCode string
@@ -276,6 +283,7 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 		redisURL:        cfg.RedisURL,
 		nodeID:          cfg.NodeID,
 		headscaleNodeID: cfg.HeadscaleNodeID,
+		stableNodeID:    cfg.StableNodeID,
 		agentVersion:    cfg.AgentVersion,
 		deviceCode:      cfg.DeviceCode,
 		interval:        cfg.Interval,
@@ -381,6 +389,7 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		Timestamp:       time.Now().UTC().Format(time.RFC3339),
 		NodeID:          p.nodeID,
 		HeadscaleNodeID: p.headscaleNodeID,
+		StableNodeID:    p.stableNodeID,
 		DeviceCode:      deviceCode,
 		Status:          nodeStatus,
 		Permissions:     p.currentPermissions(),
