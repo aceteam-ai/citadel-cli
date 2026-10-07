@@ -2896,3 +2896,25 @@ Auto-generated log of every release.
   - fix(update): normalize pending version prefix (#1221)
 
 
+---
+
+## v2.182.0 — 2026-10-07
+
+| Metric | Value |
+|--------|-------|
+| Commits | 8 |
+| Files changed | 135 |
+| Lines added | +23465 |
+
+**Changes:**
+
+  - fix(egress-relay): make test harness self-location set -u-safe (#1236)
+  - feat(finetune): node-local training and safe cancellation (#1141)
+  - feat(huddle): resident realtime converse bridge (#668)
+  - feat(huddle): enrolled-device HUDDLE_JOIN and durable lifecycle (#667)
+  - feat(transcribe): rebuild speaker diarization on current stack (#1232)
+  - feat(memory): bounded opt-in Claude Memory onboarding (#669)
+  - build(desktop): bounded opt-in macOS DMG entrypoint (#1233)
+  - test: hardened opt-in egress-relay acceptance harness (#1006)
+
+
