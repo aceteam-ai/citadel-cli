@@ -102,6 +102,9 @@ type ServiceHandler struct {
 	// StopServiceByName / StartServiceByName.
 	stopServiceFn  func(name string) error
 	startServiceFn func(name string) error
+	// startWithModelFn overrides only the local exclusive start transaction in
+	// tests, avoiding a live container runtime while exercising rollback order.
+	startWithModelFn func(JobContext, string, string, uint64) ([]byte, error)
 	// writeManifestFn, when non-nil, overrides the final write in every
 	// yaml.Node-surgery manifest setter (addServiceToManifestFile,
 	// setDesiredStatusInManifestFile, setEvictedMarkersInManifestFile). Tests
@@ -272,24 +275,33 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 			resolveRequiredVRAMBytes(svc.Name, job.Payload), parseRequiredRAMBytes(job.Payload),
 			parseTrustRemoteCodeIntent(job.Payload))
 	case "SERVICE_STOP":
-		// A remote SERVICE_STOP is operator/cloud intent: mark the service
-		// durably stopped FIRST (mirrors liveModuleOps.Stop) so the stop
-		// survives a worker restart / reboot even if the compose down below is
-		// interrupted (#528). Deliberately NOT done in StopServiceByName: the
-		// auto-stop-when-idle reconciler (#416) evicts actual state, not desired
-		// state, and must not prevent an evicted service from starting on boot.
-		if err := h.setDesiredStatusInManifestFile(svc.Name, "stopped"); err != nil {
-			ctx.Log("warning", "     - [Job %s] could not set stopped marker for %s: %v", job.ID, svc.Name, err)
-		}
-		// Also clear any job-scoped reservation eviction tag (#832): an explicit
-		// operator/platform stop is its own reason for the service being down,
-		// so it must NOT later be restarted by an unrelated reservation's
-		// Release just because it happens to still carry that reservation's
-		// job id from an earlier eviction. Best-effort, same as above.
-		if err := h.setEvictedMarkersInManifestFile(svc.Name, "", ""); err != nil {
-			ctx.Log("warning", "     - [Job %s] could not clear reservation marker for %s: %v", job.ID, svc.Name, err)
-		}
-		return h.serviceStop(ctx, svc)
+		// SERVICE_STOP is not a demand job, so Runner does not preempt a
+		// trainer for it. Keep a held fine-tune tag intact; otherwise a
+		// subsequent local start would no longer know this service is reserved.
+		var result []byte
+		err := h.withHeldServiceGuard(svc.Name, false, "", false, func() error {
+			// A remote SERVICE_STOP is operator/cloud intent: mark the service
+			// durably stopped FIRST (mirrors liveModuleOps.Stop) so the stop
+			// survives a worker restart / reboot even if the compose down below is
+			// interrupted (#528). Deliberately NOT done in StopServiceByName: the
+			// auto-stop-when-idle reconciler (#416) evicts actual state, not desired
+			// state, and must not prevent an evicted service from starting on boot.
+			if err := h.setDesiredStatusInManifestFile(svc.Name, "stopped"); err != nil {
+				ctx.Log("warning", "     - [Job %s] could not set stopped marker for %s: %v", job.ID, svc.Name, err)
+			}
+			// Also clear any job-scoped reservation eviction tag (#832): an explicit
+			// operator/platform stop is its own reason for the service being down,
+			// so it must NOT later be restarted by an unrelated reservation's
+			// Release just because it happens to still carry that reservation's
+			// job id from an earlier eviction. Best-effort, same as above.
+			if err := h.setEvictedMarkersInManifestFile(svc.Name, "", ""); err != nil {
+				ctx.Log("warning", "     - [Job %s] could not clear reservation marker for %s: %v", job.ID, svc.Name, err)
+			}
+			var stopErr error
+			result, stopErr = h.serviceStop(ctx, svc)
+			return stopErr
+		})
+		return result, err
 	default:
 		return nil, fmt.Errorf("unknown service job type: %s", job.Type)
 	}
@@ -775,6 +787,14 @@ func (h *ServiceHandler) StopServiceByName(name string) error {
 // Like StopServiceByName, this does NOT touch desired_status or the
 // reservation markers — callers own that.
 func (h *ServiceHandler) StartServiceByName(name string) error {
+	return h.WithHeldServiceGuard(name, func() error {
+		return h.startServiceByNameUnchecked(name)
+	})
+}
+
+// Called by Release while it owns the reservation lock and has already
+// checked either hold absence or verified fine-tune termination.
+func (h *ServiceHandler) startServiceByNameUnchecked(name string) error {
 	manifest, err := h.loadManifest()
 	if err != nil {
 		return fmt.Errorf("failed to load manifest: %w", err)
@@ -1195,7 +1215,7 @@ func (h *ServiceHandler) startByName(name string) error {
 	if h.startServiceFn != nil {
 		return h.startServiceFn(name)
 	}
-	return h.StartServiceByName(name)
+	return h.startServiceByNameUnchecked(name)
 }
 
 // writeManifestBytes performs the final write in every yaml.Node-surgery

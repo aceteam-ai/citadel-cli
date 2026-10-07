@@ -37,6 +37,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -205,6 +206,10 @@ func resolveLargestGPUTotalVRAMMB() (mb int, found bool) {
 // behind function values, so the decision logic (runDefaultServeReconcile)
 // is unit-testable without a real GPU, docker daemon, or ollama binary.
 type defaultServeDeps struct {
+	// Production uses the same config dir as its ServiceHandler's fine-tune
+	// hold; tests can leave this empty to use nodeConfigDir.
+	safetyConfigDir       string
+	canonicalPointerGuard bool
 	largestGPUTotalVRAMMB func() (mb int, found bool)
 	// executeServiceStart synthesizes the exact steps a platform
 	// SERVICE_START {service, model} dispatch performs: materialize the
@@ -213,7 +218,10 @@ type defaultServeDeps struct {
 	// cmd/manifest.go Service.DesiredStatus), and start it -- reusing
 	// jobs.ServiceHandler.Execute exactly, not a second implementation.
 	executeServiceStart func(engine, model string) error
-	log                 func(format string, args ...any)
+	// Production's reconcile already owns pointer→reservation locks; its
+	// direct callback independently takes those locks for safe standalone use.
+	executeServiceStartUnderGuard func(engine, model string) error
+	log                           func(format string, args ...any)
 }
 
 // realDefaultServeDeps builds the production defaultServeDeps, routing
@@ -222,18 +230,31 @@ type defaultServeDeps struct {
 // (citadel-cli#832) already constructs at this point in startup
 // (reservationHandler), so no second ServiceHandler is created.
 func realDefaultServeDeps(handler *jobs.ServiceHandler) defaultServeDeps {
+	execute := func(engine, model string) error {
+		if err := finetunesafety.RequireAbsent(handler.ConfigDir); err != nil {
+			return err
+		}
+		payload := map[string]string{"service": engine}
+		if model != "" {
+			payload["model"] = model
+		}
+		job := &nexus.Job{ID: "default-serve", Type: "SERVICE_START", Payload: payload}
+		_, err := handler.Execute(jobs.JobContext{LogFn: func(_, msg string) { Log("%s", msg) }}, job)
+		return err
+	}
 	return defaultServeDeps{
+		safetyConfigDir:       handler.ConfigDir,
+		canonicalPointerGuard: true,
 		largestGPUTotalVRAMMB: resolveLargestGPUTotalVRAMMB,
 		executeServiceStart: func(engine, model string) error {
-			payload := map[string]string{"service": engine}
-			if model != "" {
-				payload["model"] = model
-			}
-			job := &nexus.Job{ID: "default-serve", Type: "SERVICE_START", Payload: payload}
-			_, err := handler.Execute(jobs.JobContext{LogFn: func(_, msg string) { Log("%s", msg) }}, job)
-			return err
+			return withCanonicalNodePointerLock(handler.ConfigDir, func(nodeDirSource) error {
+				return finetunesafety.WithExclusive(finetunesafety.Dir(handler.ConfigDir), func() error {
+					return execute(engine, model)
+				})
+			})
 		},
-		log: Log,
+		executeServiceStartUnderGuard: execute,
+		log:                           Log,
 	}
 }
 
@@ -249,6 +270,41 @@ func runDefaultServeReconcile(manifest *CitadelManifest, nodeConfigDir string, d
 		// subsequent boot.
 		return
 	}
+	safetyConfigDir := deps.safetyConfigDir
+	if safetyConfigDir == "" {
+		safetyConfigDir = nodeConfigDir
+	}
+	// Cover the entire once-marker/status/manifest/start transaction. A hold
+	// already present is a pure deferral (not a once-ever failed attempt), and
+	// a hold cannot be armed after the check but before SERVICE_START.
+	run := func() error {
+		return finetunesafety.WithExclusive(finetunesafety.Dir(safetyConfigDir), func() error {
+			if err := finetunesafety.RequireAbsent(safetyConfigDir); err != nil {
+				return err
+			}
+			runDefaultServeReconcileUnlocked(manifest, nodeConfigDir, deps)
+			return nil
+		})
+	}
+	var err error
+	if deps.canonicalPointerGuard {
+		err = withCanonicalNodePointerLock(safetyConfigDir, func(nodeDirSource) error {
+			if filepath.Clean(nodeConfigDir) != filepath.Clean(safetyConfigDir) {
+				return fmt.Errorf("default-serve node directory differs from locked reservation directory")
+			}
+			return run()
+		})
+	} else {
+		err = run()
+	}
+	if err != nil {
+		deps.log("default-serve: deferred while fine-tune reservation is active: %v", err)
+	}
+}
+
+// Caller owns reservation.lock and has checked active.hold. Keep the marker
+// and service-start steps in this same critical section.
+func runDefaultServeReconcileUnlocked(manifest *CitadelManifest, nodeConfigDir string, deps defaultServeDeps) {
 	if _, ok := loadDefaultServeMarker(nodeConfigDir); ok {
 		deps.log("default-serve: already attempted on this node (see %s); skipping", filepath.Join(nodeConfigDir, defaultServeMarkerFile))
 		return
@@ -287,7 +343,11 @@ func runDefaultServeReconcile(manifest *CitadelManifest, nodeConfigDir string, d
 	}
 	deps.log("default-serve: appliance mode auto-serving %s on this blank %d MB-VRAM GPU node (opt-in; see 'citadel run --service %s' or the AceTeam dashboard to change it later)", target, vramMB, engine)
 
-	if err := deps.executeServiceStart(engine, model); err != nil {
+	execute := deps.executeServiceStart
+	if deps.executeServiceStartUnderGuard != nil {
+		execute = deps.executeServiceStartUnderGuard
+	}
+	if err := execute(engine, model); err != nil {
 		deps.log("default-serve: FAILED to auto-serve %s: %v (will not retry -- see %s)", target, err, filepath.Join(nodeConfigDir, defaultServeMarkerFile))
 		if mErr := saveDefaultServeMarker(nodeConfigDir, "failed: "+err.Error(), engine, model, vramMB); mErr != nil {
 			deps.log("default-serve: warning: failed to write completion marker: %v", mErr)

@@ -433,15 +433,9 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	// Find or create the node manifest to get the services directory.
-	manifest, configDir, err := findOrCreateManifest()
+	configDir, err := localServiceConfigDir()
 	if err != nil {
-		return fmt.Errorf("failed to initialize configuration: %w", err)
-	}
-
-	// Check if already installed.
-	if hasService(manifest, name) {
-		fmt.Printf("Service '%s' is already in the node manifest.\n", name)
-		return nil
+		return fmt.Errorf("failed to resolve configuration: %w", err)
 	}
 
 	servicesDir := filepath.Join(configDir, "services")
@@ -467,7 +461,27 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	// skipHardening is always false here: the catalog-install path has no
 	// --no-harden escape hatch, so untrusted community installs are always
 	// hardened (the safe default for the primary untrusted surface).
-	result, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, overrides, true, allowPrivileged, untrusted, false)
+	var result *catalog.InstallResult
+	err = withLocalServiceMutationLockSource(configDir, func(source nodeDirSource) error {
+		manifest, _, manifestErr := findOrCreateManifestLockedAt(configDir, source)
+		if manifestErr != nil {
+			return manifestErr
+		}
+		if hasService(manifest, name) {
+			fmt.Printf("Service '%s' is already in the node manifest.\n", name)
+			return nil
+		}
+		var installErr error
+		result, installErr = catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, overrides, true, allowPrivileged, untrusted, false)
+		if installErr != nil {
+			return installErr
+		}
+		if registerErr := addServiceToManifest(configDir, result.Name); registerErr != nil {
+			return fmt.Errorf("failed to update manifest: %w", registerErr)
+		}
+		recordCatalogModuleLock(result.Name, overrides, result.Sandboxed, resolved.Manifest.HealthCheck.ComposeService)
+		return nil
+	})
 	if err != nil {
 		// Defense-in-depth: the up-front IsInstallable check above already
 		// diverts host-provisioned services, but InstallFromManifest also guards.
@@ -476,14 +490,12 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 		}
 		return fmt.Errorf("install failed: %w", err)
 	}
+	if result == nil {
+		return nil
+	} // already installed
 
 	if result.Sandboxed {
 		fmt.Printf("  Applied least-privilege sandbox: %s\n", result.SandboxOverridePath)
-	}
-
-	// Register in the node manifest using existing helpers.
-	if err := addServiceToManifest(configDir, result.Name); err != nil {
-		return fmt.Errorf("failed to update manifest: %w", err)
 	}
 
 	// Record provenance into the lockfile so this module is recognized as
@@ -492,8 +504,6 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	// (ManagedBy empty = protected from drift-uninstall, citadel#624 D1). The
 	// manifest's health_check.compose_service is still carried so a bridge-shaped
 	// module installed this way reports health correctly (sub-collision 3).
-	recordCatalogModuleLock(result.Name, overrides, result.Sandboxed, resolved.Manifest.HealthCheck.ComposeService)
-
 	fmt.Printf("\nInstalled %s successfully.\n", result.Name)
 	fmt.Printf("  Compose: %s\n", result.ComposeDestPath)
 	if result.EnvDestPath != "" {

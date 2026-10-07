@@ -605,6 +605,75 @@ func TestFindOrCreateManifest_NodeDirOverride_BootstrapsThereNotHome(t *testing.
 	}
 }
 
+func TestLocalServiceConfigDirRejectsAmbiguousGlobalPointer(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pointer string
+	}{
+		{"empty", ""},
+		{"missing node dir", "other: value\n"},
+		{"relative node dir", "node_config_dir: relative/node\n"},
+		{"malformed yaml", "node_config_dir: [\n"},
+		{"duplicate node dir", "node_config_dir: /tmp/one\nnode_config_dir: /tmp/two\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CITADEL_NODE_DIR", "")
+			path := filepath.Join(home, ".citadel-cli", "config.yaml")
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.pointer), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if dir, err := localServiceConfigDir(); err == nil {
+				t.Fatalf("ambiguous pointer resolved to %q", dir)
+			}
+			if _, _, err := findAndReadManifest(); err == nil {
+				t.Fatal("read-only manifest lookup repaired an ambiguous pointer")
+			}
+			if _, _, err := findOrCreateManifest(); err == nil {
+				t.Fatal("ambiguous pointer allowed bootstrap")
+			}
+			if _, err := os.Stat(filepath.Join(home, "citadel-node", "citadel.yaml")); !os.IsNotExist(err) {
+				t.Fatalf("default manifest created: %v", err)
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != tc.pointer {
+				t.Fatalf("pointer mutated: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestFindOrCreateManifestNoPointerBootstrapsDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CITADEL_NODE_DIR", "")
+	dir, err := localServiceConfigDir()
+	if err != nil || dir != filepath.Join(home, "citadel-node") {
+		t.Fatalf("fresh node dir = %q, %v", dir, err)
+	}
+	if err := withLocalServiceMutationLockSource(dir, func(source nodeDirSource) error {
+		_, createdDir, err := findOrCreateManifestLockedAt(dir, source)
+		if err != nil {
+			return err
+		}
+		if createdDir != dir {
+			t.Fatalf("created dir = %q, want %q", createdDir, dir)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "citadel.yaml")); err != nil {
+		t.Fatalf("default manifest missing: %v", err)
+	}
+	if _, _, err := findAndReadManifest(); err != nil {
+		t.Fatalf("default bootstrap pointer not usable: %v", err)
+	}
+}
+
 // writeYAMLFile marshals v to YAML and writes it to path, creating parent
 // directories as needed. Test helper shared by the --node-dir override tests.
 func writeYAMLFile(t *testing.T, path string, v interface{}) {

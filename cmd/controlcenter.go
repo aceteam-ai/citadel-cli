@@ -1648,35 +1648,37 @@ func ccStartService(name string) error {
 			// fails transiently. Best-effort: the service is in the manifest (we
 			// just found it), so a failure here is unexpected but must not block
 			// the start.
-			_ = setServiceDesiredStatus(configDir, name, "")
-			// Transitional (#528): drop any container still under the legacy
-			// "citadel-<name>" project so the no-`-p` up below does not conflict
-			// on the pinned container_name.
-			removeLegacyCitadelProject(name)
-			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			// Include the least-privilege sandbox override when present so a
-			// TUI-installed untrusted module also starts hardened here (the
-			// override would otherwise be bypassed by this start site).
-			// No -p: the default compose project (dir basename, "services") is the
-			// standardized convention shared with the boot/run/stop/job paths and
-			// the no-`-p` status reads (#528).
-			composeArgs := composeFileArgs(fullComposePath, fullComposePath)
-			composeArgs = append(composeArgs, "up", "-d")
-			// Warn (never refuse) when an embedded engine will be published on
-			// all interfaces (aceteam-ai/citadel-cli#1023) so a TUI-started
-			// `bind: all` (or ollama's default) engine isn't silently exposed.
-			if w := serviceBindExposureWarning(service, configDir); w != "" {
-				clilog.Writef("warning", "%s", w)
-			}
-			// composeCommand injects the citadel-owned host ports so the
-			// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
-			// start button dies for llamacpp/vllm/extraction/diffusers on
-			// v2.57.0 (#426). composeEnvForService additionally supplies the
-			// #1023 CITADEL_<SVC>_BIND entry so a `bind: all` engine started
-			// from the TUI is not silently reverted to loopback.
-			ccCmd := composeCommandFor(rt, composeArgs...)
-			ccCmd.Env = composeEnvForService(name)
-			return ccCmd.Run()
+			return withLocalServiceStartGuard(configDir, name, func() error {
+				_ = setServiceDesiredStatus(configDir, name, "")
+				// Transitional (#528): drop any container still under the legacy
+				// "citadel-<name>" project so the no-`-p` up below does not conflict
+				// on the pinned container_name.
+				removeLegacyCitadelProject(name)
+				fullComposePath := filepath.Join(configDir, service.ComposeFile)
+				// Include the least-privilege sandbox override when present so a
+				// TUI-installed untrusted module also starts hardened here (the
+				// override would otherwise be bypassed by this start site).
+				// No -p: the default compose project (dir basename, "services") is the
+				// standardized convention shared with the boot/run/stop/job paths and
+				// the no-`-p` status reads (#528).
+				composeArgs := composeFileArgs(fullComposePath, fullComposePath)
+				composeArgs = append(composeArgs, "up", "-d")
+				// Warn (never refuse) when an embedded engine will be published on
+				// all interfaces (aceteam-ai/citadel-cli#1023) so a TUI-started
+				// `bind: all` (or ollama's default) engine isn't silently exposed.
+				if w := serviceBindExposureWarning(service, configDir); w != "" {
+					clilog.Writef("warning", "%s", w)
+				}
+				// composeCommand injects the citadel-owned host ports so the
+				// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
+				// start button dies for llamacpp/vllm/extraction/diffusers on
+				// v2.57.0 (#426). composeEnvForService additionally supplies the
+				// #1023 CITADEL_<SVC>_BIND entry so a `bind: all` engine started
+				// from the TUI is not silently reverted to loopback.
+				ccCmd := composeCommandFor(rt, composeArgs...)
+				ccCmd.Env = composeEnvForService(name)
+				return ccCmd.Run()
+			})
 		}
 	}
 
@@ -1737,27 +1739,29 @@ func ccRestartService(name string) error {
 			}
 			// A restart expresses "keep this running": clear any durable stopped
 			// marker so the service also starts on the next boot. Best-effort.
-			_ = setServiceDesiredStatus(configDir, name, "")
-			// Transitional (#528): a container still under the legacy
-			// "citadel-<name>" project is invisible to a no-`-p` `compose restart`
-			// (silent no-op) AND conflicts with a no-`-p` up on the pinned
-			// container_name. Remove it, then converge with `up -d
-			// --force-recreate`, which restarts a default-project container and
-			// (re)creates one when the legacy container was just removed --
-			// `restart` alone would no-op in that case.
-			removeLegacyCitadelProject(name)
-			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			// Warn (never refuse) on all-interfaces exposure, and inject the
-			// #1023 CITADEL_<SVC>_BIND entry (via composeEnvForService) so a
-			// restarted `bind: all` engine keeps its chosen interface instead of
-			// being silently reverted to loopback.
-			if w := serviceBindExposureWarning(service, configDir); w != "" {
-				clilog.Writef("warning", "%s", w)
-			}
-			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "up", "-d", "--force-recreate")
-			cmd := composeCommandFor(rt, restartArgs...)
-			cmd.Env = composeEnvForService(name)
-			return cmd.Run()
+			return withLocalServiceStartGuard(configDir, name, func() error {
+				_ = setServiceDesiredStatus(configDir, name, "")
+				// Transitional (#528): a container still under the legacy
+				// "citadel-<name>" project is invisible to a no-`-p` `compose restart`
+				// (silent no-op) AND conflicts with a no-`-p` up on the pinned
+				// container_name. Remove it, then converge with `up -d
+				// --force-recreate`, which restarts a default-project container and
+				// (re)creates one when the legacy container was just removed --
+				// `restart` alone would no-op in that case.
+				removeLegacyCitadelProject(name)
+				fullComposePath := filepath.Join(configDir, service.ComposeFile)
+				// Warn (never refuse) on all-interfaces exposure, and inject the
+				// #1023 CITADEL_<SVC>_BIND entry (via composeEnvForService) so a
+				// restarted `bind: all` engine keeps its chosen interface instead of
+				// being silently reverted to loopback.
+				if w := serviceBindExposureWarning(service, configDir); w != "" {
+					clilog.Writef("warning", "%s", w)
+				}
+				restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "up", "-d", "--force-recreate")
+				cmd := composeCommandFor(rt, restartArgs...)
+				cmd.Env = composeEnvForService(name)
+				return cmd.Run()
+			})
 		}
 	}
 
@@ -1839,23 +1843,19 @@ func ccGetServiceLogs(name string) ([]string, error) {
 
 // ccAddService adds a new service to the manifest and extracts its compose file
 func ccAddService(name string) error {
-	// Find or create config directory
-	_, configDir, err := findOrCreateManifest()
+	configDir, err := localServiceConfigDir()
 	if err != nil {
 		return fmt.Errorf("failed to get config directory: %w", err)
 	}
-
-	// Ensure compose file exists
-	if err := ensureComposeFile(configDir, name); err != nil {
-		return err
-	}
-
-	// Add to manifest
-	if err := addServiceToManifest(configDir, name); err != nil {
-		return err
-	}
-
-	return nil
+	return withLocalServiceStartGuardSource(configDir, name, func(source nodeDirSource) error {
+		if _, _, err := findOrCreateManifestLockedAt(configDir, source); err != nil {
+			return err
+		}
+		if err := ensureComposeFile(configDir, name); err != nil {
+			return err
+		}
+		return addServiceToManifest(configDir, name)
+	})
 }
 
 // ccGetConfiguredServices returns the list of services already configured in the manifest
@@ -2082,7 +2082,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// only) and lets the real worker own all job consumption.
 	//
 	// Hold this lease through runner and updater shutdown, so a later work
-	// invocation cannot become a second consumer or automatic installer.
+	// invocation cannot become a second consumer, automatic installer, or
+	// reservation reconciler while a fine-tune job is active here.
 	ccWorkerLock, workerHeld, workerPID, err := acquireControlCenterWorkerLock(network.GetStateDir(),
 		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) })
 	if err != nil {
@@ -2463,6 +2464,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ccPinnedServices = manifestPinnedServices(m)
 	}
 	nodeJobOpts := nodeJobHandlerOpts{
+		Source:                    source,
 		OrgID:                     nodeJobOrgID(),
 		NodeID:                    headscaleNodeID,
 		LogFn:                     activity,

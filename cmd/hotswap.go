@@ -110,24 +110,29 @@ func (c *swapController) StopNonDurable(name string) error {
 // engine's compose-up runs to completion here (may build/load for minutes); the
 // caller runs this on a background context, not a job context.
 func (c *swapController) Start(ctx context.Context, backend, model string) error {
-	c.logf("[hotswap] starting %s (model=%s)", backend, model)
-	payload := map[string]string{"service": backend}
-	if model != "" {
-		payload["model"] = model
-	}
-	job := &nexus.Job{
-		ID:      "hotswap-" + backend,
-		Type:    "SERVICE_START",
-		Payload: payload,
-	}
-	jctx := jobs.JobContext{
-		Ctx:   ctx,
-		LogFn: func(level, msg string) { c.logf("[hotswap] %s", msg) },
-	}
-	if _, err := c.svc.Execute(jctx, job); err != nil {
-		return err
-	}
-	return nil
+	// Gateway-triggered swaps do not pass through Runner's demand-yield gate.
+	return withCanonicalNodePointerLock(c.configDir, func(nodeDirSource) error {
+		return c.svc.WithHeldServiceGuard(backend, func() error {
+			c.logf("[hotswap] starting %s (model=%s)", backend, model)
+			payload := map[string]string{"service": backend}
+			if model != "" {
+				payload["model"] = model
+			}
+			job := &nexus.Job{
+				ID:      "hotswap-" + backend,
+				Type:    "SERVICE_START",
+				Payload: payload,
+			}
+			jctx := jobs.JobContext{
+				Ctx:   ctx,
+				LogFn: func(level, msg string) { c.logf("[hotswap] %s", msg) },
+			}
+			if _, err := c.svc.Execute(jctx, job); err != nil {
+				return err
+			}
+			return nil
+		})
+	})
 }
 
 // Ready reports whether the engine has actually LOADED a model and can serve —

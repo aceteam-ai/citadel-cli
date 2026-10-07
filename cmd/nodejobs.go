@@ -2,13 +2,19 @@ package cmd
 
 import (
 	"context"
+	"path/filepath"
+	"runtime"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // nodeJobHandlerOpts bundles the node/environment edges the node-job handler set
@@ -17,6 +23,7 @@ import (
 // as the dedicated worker — no more "node vX has no handler for WHATSAPP_PROVISION"
 // when only the control center runs (the competing-consumer incident).
 type nodeJobHandlerOpts struct {
+	Source worker.JobSource
 	// OrgID is the organization chosen for this worker's per-node queue.
 	OrgID string
 	// NodeID is the exact Headscale node identifier used for control jobs.
@@ -169,6 +176,29 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		},
 		Log: opts.HandlerLog,
 	}))
+
+	// Both direct Redis and API-proxy workers use the platform's canonical
+	// fine-tune hash and cancel key. API mode requires the scoped companion
+	// endpoint; it never falls back to the generic KV route.
+	var control worker.FineTuneControl
+	switch src := opts.Source.(type) {
+	case *worker.RedisSource:
+		control = worker.NewRedisFineTuneControl(src, opts.OrgID, runner.NodeID())
+	case *worker.APISource:
+		control = worker.NewAPIFineTuneControl(src)
+	}
+	if control != nil && runtime.GOOS == "linux" && opts.ConfigDir != "" && opts.WorkspaceDir != "" {
+		service := jobs.NewServiceHandlerWithWorkspace(opts.ConfigDir, opts.WorkspaceDir)
+		runner.RegisterHandler(worker.NewFineTuneHandler(worker.FineTuneConfig{
+			NodeID: runner.NodeID(), WorkspaceDir: opts.WorkspaceDir,
+			OutputRoot:  filepath.Join(opts.ConfigDir, "finetune", "adapters"),
+			SafetyDir:   finetunesafety.Dir(opts.ConfigDir),
+			CacheDir:    fineTuneModelCacheDir(),
+			Image:       "citadel-finetune:local",
+			Control:     control,
+			Reservation: &fineTuneServiceReservation{service: service},
+		}))
+	}
 	// AGENT_UPDATE (aceteam#4427): remote agent update + restart for this node.
 	runner.RegisterHandler(worker.NewAgentUpdateHandler(worker.AgentUpdateConfig{
 		Version:    Version,
@@ -262,6 +292,36 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 			Log:      opts.HandlerLog,
 		}))
 	}
+}
+
+type fineTuneServiceReservation struct{ service *jobs.ServiceHandler }
+
+// fineTuneModelCacheDir is the same Hugging Face cache mounted by model
+// services and populated by MODEL_CACHE_PULL. A private config-dir cache would
+// make an offline trainer unable to see models Citadel already reports cached.
+func fineTuneModelCacheDir() string {
+	return filepath.Join(cacheindex.DefaultCacheRoot(), services.HFHubCacheDirName)
+}
+
+func (r *fineTuneServiceReservation) Reserve(ctx context.Context, jobID string) ([]string, error) {
+	var res *jobs.Reservation
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(r.service.ConfigDir), func() error {
+		if err := finetunesafety.RequireOwned(r.service.ConfigDir, jobID); err != nil {
+			return err
+		}
+		var reserveErr error
+		res, reserveErr = r.service.ReserveNamed(jobs.JobContext{Ctx: ctx}, jobID, []string{finetunesafety.OCRService, finetunesafety.OllamaService})
+		return reserveErr
+	})
+	if res == nil {
+		return nil, err
+	}
+	return res.Evicted, err
+}
+
+func (r *fineTuneServiceReservation) Release(ctx context.Context, jobID string) error {
+	_, err := r.service.ReleaseAfterVerifiedFineTuneTermination(jobs.JobContext{Ctx: ctx}, jobID)
+	return err
 }
 
 // nodeJobOrgID mirrors the per-node queue builder's device-first org choice.

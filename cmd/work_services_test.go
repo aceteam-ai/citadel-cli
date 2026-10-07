@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"gopkg.in/yaml.v3"
 )
 
@@ -78,6 +79,25 @@ func TestStartManagedServicesCanceledContextDoesNotStart(t *testing.T) {
 	started := startManagedServices(ctx)
 	if len(started) != 0 {
 		t.Fatalf("expected no services started under a canceled context, got %v", started)
+	}
+}
+
+func TestStartManagedServicesHeldUntaggedGPUDoesNotBoot(t *testing.T) {
+	configDir := writeManifestWithServices(t, []Service{{Name: "vllm", Type: "docker", ComposeFile: filepath.Join("services", "vllm.yml")}})
+	if err := os.WriteFile(filepath.Join(configDir, "services", "vllm.yml"), []byte("services:\n  vllm:\n    image: example/vllm\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(finetunesafety.Dir(configDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(configDir), []byte("train-job"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if started := startManagedServices(context.Background()); len(started) != 0 {
+		t.Fatalf("boot admitted untagged GPU service under hold: %v", started)
+	}
+	if err := finetunesafety.RequireOwned(configDir, "train-job"); err != nil {
+		t.Fatalf("hold changed: %v", err)
 	}
 }
 

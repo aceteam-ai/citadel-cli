@@ -34,6 +34,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/composerefresh"
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -42,6 +43,10 @@ import (
 // binary version is unchanged it is a cheap no-op. Failures are logged and never
 // abort startup -- a refresh problem must not stop the node from serving jobs.
 func refreshManagedComposeFiles(configDir string) {
+	refreshManagedComposeFilesWithSweep(configDir, composerefresh.Sweep)
+}
+
+func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composerefresh.Options) (composerefresh.Result, error)) {
 	if configDir == "" {
 		return
 	}
@@ -49,17 +54,27 @@ func refreshManagedComposeFiles(configDir string) {
 
 	var recreator composerefresh.PortRecreator
 	if recreateOnUpgradeEnabled() {
-		recreator = enginePortRecreator
+		// The sweep owns reservation.lock; avoid a nested lock in its callback.
+		recreator = enginePortRecreatorUnchecked
 	}
-
-	res, err := composerefresh.Sweep(composerefresh.Options{
-		ServicesDir:           servicesDir,
-		Version:               Version,
-		Embedded:              services.ServiceMap,
-		PortManaged:           services.ServiceHostPorts,
-		KnownHistoricalHashes: services.KnownComposeHashes,
-		Recreator:             recreator,
-		Log:                   func(format string, args ...any) { Log(format, args...) },
+	var res composerefresh.Result
+	err := withLocalServiceMutationLock(configDir, func() error {
+		// A sweep may replace a CPU-looking compose with a GPU template before
+		// force-recreate. Defer the entire rewrite while training is held.
+		if err := finetunesafety.RequireAbsent(configDir); err != nil {
+			return err
+		}
+		var sweepErr error
+		res, sweepErr = sweep(composerefresh.Options{
+			ServicesDir:           servicesDir,
+			Version:               Version,
+			Embedded:              services.ServiceMap,
+			PortManaged:           services.ServiceHostPorts,
+			KnownHistoricalHashes: services.KnownComposeHashes,
+			Recreator:             recreator,
+			Log:                   func(format string, args ...any) { Log(format, args...) },
+		})
+		return sweepErr
 	})
 	if err != nil {
 		Log("compose-refresh: sweep error: %v", err)
@@ -100,6 +115,17 @@ func recreateOnUpgradeEnabled() bool {
 // container is not running or already publishes the wanted port, it is left
 // untouched (recreated=false).
 func enginePortRecreator(service, composePath string, wantHostPort int) (bool, error) {
+	configDir := filepath.Dir(filepath.Dir(composePath))
+	var recreated bool
+	err := withLocalServiceStartGuard(configDir, service, func() error {
+		var recreateErr error
+		recreated, recreateErr = enginePortRecreatorUnchecked(service, composePath, wantHostPort)
+		return recreateErr
+	})
+	return recreated, err
+}
+
+func enginePortRecreatorUnchecked(service, composePath string, wantHostPort int) (bool, error) {
 	rt := catalog.SelectContainerRuntime()
 	// citadel#860: this sweep only ever runs from citadel work's boot path
 	// (refreshManagedComposeFiles, cmd/work.go), which refuses --node-dir/

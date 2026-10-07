@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
@@ -62,6 +64,30 @@ func TestResolveDefaultServe_NilManifest(t *testing.T) {
 	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
 	if got := resolveDefaultServe(nil); got != true {
 		t.Errorf("resolveDefaultServe(nil) with env=1 = %v, want true", got)
+	}
+}
+
+func TestRealDefaultServeCallbackRefusesRetargetedHeldNode(t *testing.T) {
+	a := writeManifestWithServices(t, nil)
+	b := filepath.Join(os.Getenv("HOME"), "held-default-serve")
+	if err := os.MkdirAll(finetunesafety.Dir(b), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(b), []byte("train-job\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGlobalConfigFile(filepath.Join(platform.ConfigDir(), "config.yaml"), b); err != nil {
+		t.Fatal(err)
+	}
+	deps := realDefaultServeDeps(jobs.NewServiceHandler(a))
+	if err := deps.executeServiceStart("vllm", "some-model"); err == nil {
+		t.Fatal("production default-serve callback followed stale node A after pointer moved to held B")
+	}
+	if _, err := os.Stat(filepath.Join(a, "services", "vllm.yml")); !os.IsNotExist(err) {
+		t.Fatalf("stale node A compose materialized: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(b, "citadel.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("held node B manifest materialized: %v", err)
 	}
 }
 
@@ -282,3 +308,79 @@ type staticError string
 func (e staticError) Error() string { return string(e) }
 
 var errBoom = staticError("boom")
+
+func TestDefaultServeHeldBlank24GBDefersWithoutMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
+	configDir := t.TempDir()
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
+	original := []byte("services: []\n")
+	if err := os.WriteFile(manifestPath, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(finetunesafety.Dir(configDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(configDir), []byte("train-job"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	probe, execute := 0, 0
+	deps := defaultServeDeps{
+		largestGPUTotalVRAMMB: func() (int, bool) { probe++; return 24576, true },
+		executeServiceStart:   func(string, string) error { execute++; return nil },
+		log:                   func(string, ...any) {},
+	}
+	runDefaultServeReconcile(&CitadelManifest{}, configDir, deps)
+	if probe != 0 || execute != 0 {
+		t.Fatalf("held default-serve probed/started: %d/%d", probe, execute)
+	}
+	if _, ok := loadDefaultServeMarker(configDir); ok {
+		t.Fatal("hold consumed once-ever marker")
+	}
+	if got, err := os.ReadFile(manifestPath); err != nil || string(got) != string(original) {
+		t.Fatalf("manifest mutated: %q %v", got, err)
+	}
+	if err := finetunesafety.RequireOwned(configDir, "train-job"); err != nil {
+		t.Fatalf("hold lost: %v", err)
+	}
+	if err := os.Remove(finetunesafety.Path(configDir)); err != nil {
+		t.Fatal(err)
+	}
+	runDefaultServeReconcile(&CitadelManifest{}, configDir, deps)
+	if probe != 1 || execute != 1 {
+		t.Fatalf("default-serve did not resume: %d/%d", probe, execute)
+	}
+	if marker, ok := loadDefaultServeMarker(configDir); !ok || marker.Status != "applied" || marker.Engine == "" {
+		t.Fatalf("marker after clear: %+v %t", marker, ok)
+	}
+}
+
+func TestRealDefaultServeDepsRefusesHeldCalleeBeforeExecute(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
+	configDir := t.TempDir()
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
+	original := []byte("services: []\n")
+	if err := os.WriteFile(manifestPath, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(finetunesafety.Dir(configDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(configDir), []byte("train-job"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	deps := realDefaultServeDeps(jobs.NewServiceHandler(configDir))
+	deps.largestGPUTotalVRAMMB = func() (int, bool) { t.Fatal("GPU probe under hold"); return 0, false }
+	deps.log = func(string, ...any) {}
+	runDefaultServeReconcile(&CitadelManifest{}, configDir, deps)
+	if err := deps.executeServiceStart("vllm", "some-model"); err == nil {
+		t.Fatal("production callback admitted held SERVICE_START")
+	}
+	if _, ok := loadDefaultServeMarker(configDir); ok {
+		t.Fatal("production path consumed marker")
+	}
+	if got, err := os.ReadFile(manifestPath); err != nil || string(got) != string(original) {
+		t.Fatalf("production path mutated manifest: %q %v", got, err)
+	}
+}

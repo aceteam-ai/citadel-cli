@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
@@ -97,6 +99,76 @@ func newReservationTestHandlerWithManifest(t *testing.T, manifestYAML string, st
 	return h, exec
 }
 
+func TestHeldGuardInspectsCustomComposeAndCatalogGPURequirements(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	h, _ := newReservationTestHandlerWithManifest(t, `services:
+  - name: custom-gpu
+    type: docker
+    compose_file: services/custom-gpu.yml
+  - name: custom-catalog
+    type: docker
+    compose_file: services/custom-catalog.yml
+  - name: custom-cpu
+    type: docker
+    compose_file: services/custom-cpu.yml
+`, fullGPUStatus())
+	servicesDir := filepath.Join(h.ConfigDir, "services")
+	if err := os.MkdirAll(servicesDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, compose := range map[string]string{
+		"custom-gpu":     "services:\n  custom-gpu:\n    image: example/gpu\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - capabilities: [gpu]\n",
+		"custom-catalog": "services:\n  custom-catalog:\n    image: example/catalog\n",
+		"custom-cpu":     "services:\n  custom-cpu:\n    image: example/cpu\n",
+	} {
+		if err := os.WriteFile(filepath.Join(servicesDir, name+".yml"), []byte(compose), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	catalogDir := filepath.Join(catalog.GetCatalogPath(), "services", "custom-catalog")
+	if err := os.MkdirAll(catalogDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(catalogDir, "service.yaml"), []byte("name: custom-catalog\nrequires:\n  gpu: true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(finetunesafety.Dir(h.ConfigDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(h.ConfigDir), []byte("train-job"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"custom-gpu", "custom-catalog"} {
+		called := false
+		if err := h.WithHeldServiceGuard(name, func() error { called = true; return nil }); err == nil || called {
+			t.Fatalf("%s admitted under hold: called=%t err=%v", name, called, err)
+		}
+	}
+	called := false
+	if err := h.WithHeldServiceGuard("custom-cpu", func() error { called = true; return nil }); err != nil || !called {
+		t.Fatalf("custom CPU wrongly blocked: called=%t err=%v", called, err)
+	}
+	malformedCatalogDir := filepath.Join(catalog.GetCatalogPath(), "services", "custom-cpu")
+	if err := os.MkdirAll(malformedCatalogDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(malformedCatalogDir, "service.yaml"), []byte("requires: [malformed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.WithHeldServiceGuard("custom-cpu", func() error { t.Fatal("malformed catalog metadata admitted"); return nil }); err == nil {
+		t.Fatal("malformed catalog metadata did not fail closed against CPU compose")
+	}
+	if err := os.Remove(filepath.Join(malformedCatalogDir, "service.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(servicesDir, "custom-cpu.yml"), []byte("services: [malformed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.WithHeldServiceGuard("custom-cpu", func() error { t.Fatal("malformed compose admitted"); return nil }); err == nil {
+		t.Fatal("malformed compose did not fail closed")
+	}
+}
+
 // nativeReservationTestManifestYAML mirrors reservationTestManifestYAML but
 // declares every service `type: native` instead of `type: docker`. Reserve
 // and Release never consult this field (they evict/restore exclusively
@@ -173,6 +245,59 @@ func fullGPUStatus(services ...status.ServiceInfo) *status.NodeStatus {
 }
 
 const testJobID = "job-1"
+
+const fineTuneReservationManifestYAML = `node:
+  name: test-node
+services:
+  - name: unlimited-ocr
+    type: docker
+    compose_file: ./services/unlimited-ocr.yml
+    desired_status: running
+  - name: ollama
+    type: docker
+    compose_file: ./services/ollama.yml
+    desired_status: running
+  - name: paw-compile
+    type: docker
+    compose_file: ./services/paw-compile.yml
+    desired_status: running
+`
+
+func TestReserveNamedStopsOnlyApprovedServicesAndRestores(t *testing.T) {
+	h, exec := newReservationTestHandlerWithManifest(t, fineTuneReservationManifestYAML,
+		fullGPUStatus(svcInfo("unlimited-ocr", false, 3), svcInfo("ollama", false, 5), svcInfo("paw-compile", false, 2)))
+	res, err := h.ReserveNamed(testCtx(), testJobID, []string{"unlimited-ocr", "ollama"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(res.Evicted, ","); got != "ollama,unlimited-ocr" {
+		t.Fatalf("evicted %q", got)
+	}
+	if got := strings.Join(exec.stopped, ","); got != "ollama,unlimited-ocr" {
+		t.Fatalf("stopped %q", got)
+	}
+	if _, err := h.Release(testCtx(), testJobID); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(exec.started, ","); got != "unlimited-ocr,ollama" {
+		t.Fatalf("restored %q", got)
+	}
+}
+
+func TestReserveNamedPartialStopFailureCanRestore(t *testing.T) {
+	h, exec := newReservationTestHandlerWithManifest(t, fineTuneReservationManifestYAML,
+		fullGPUStatus(svcInfo("unlimited-ocr", false, 3), svcInfo("ollama", false, 5)))
+	exec.failStop = map[string]bool{"unlimited-ocr": true}
+	if _, err := h.ReserveNamed(testCtx(), testJobID, []string{"unlimited-ocr", "ollama"}); err == nil {
+		t.Fatal("expected partial stop failure")
+	}
+	if _, err := h.Release(testCtx(), testJobID); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(exec.started, ","); got != "unlimited-ocr,ollama" {
+		t.Fatalf("restored %q", got)
+	}
+}
 
 func testCtx() JobContext {
 	return JobContext{LogFn: func(string, string) {}}
@@ -606,6 +731,124 @@ services:
 	}
 	if len(restored2) != 0 {
 		t.Errorf("second reconcile restored %v, want none", restored2)
+	}
+}
+
+func TestReconcileOrphanedReservationsDefersFineTuneHoldAcrossRestart(t *testing.T) {
+	const heldManifest = `node:
+  name: test-node
+services:
+  - name: unlimited-ocr
+    type: docker
+    compose_file: ./services/unlimited-ocr.yml
+    desired_status: stopped
+    evicted_by_job: train-job-42
+`
+	dir := t.TempDir()
+	writeManifestFile(t, dir, heldManifest)
+	holdDir := filepath.Join(dir, "finetune", "safety")
+	if err := os.MkdirAll(holdDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	hold := filepath.Join(holdDir, "active.hold")
+	if err := os.WriteFile(hold, []byte("train-job-42\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &fakeReservationExec{}
+	// A new handler models citadel work after a worker crash: its worklock is
+	// free, but the trainer container may have survived that process.
+	for i := 0; i < 2; i++ {
+		h := NewServiceHandler(dir)
+		h.startServiceFn = exec.start
+		if restored, err := h.ReconcileOrphanedReservations(testCtx(), true); err == nil || len(restored) != 0 {
+			t.Fatalf("reconcile attempt %d with hold = (%v, %v), want refusal before restore", i, restored, err)
+		}
+		for _, jobID := range []string{"train-job-42", "other-job"} {
+			if restored, err := h.Release(testCtx(), jobID); err == nil || len(restored) != 0 {
+				t.Fatalf("generic release %q under hold = (%v, %v), want refusal", jobID, restored, err)
+			}
+		}
+		if restored, err := h.ReleaseAfterVerifiedFineTuneTermination(testCtx(), "wrong-job"); err == nil || len(restored) != 0 {
+			t.Fatalf("verified release for wrong job = (%v, %v), want refusal", restored, err)
+		}
+		if _, err := h.Execute(testCtx(), &nexus.Job{ID: "stop-job", Type: "SERVICE_STOP", Payload: map[string]string{"service": "unlimited-ocr"}}); err == nil {
+			t.Fatal("remote SERVICE_STOP erased an active fine-tune reservation tag")
+		}
+		if err := h.StartServiceByName("unlimited-ocr"); err == nil {
+			t.Fatal("direct service start bypassed active fine-tune reservation tag")
+		}
+		if len(exec.started) != 0 {
+			t.Fatalf("started services while trainer hold remains: %v", exec.started)
+		}
+		entry := manifestServiceEntry(t, readManifestMap(t, dir), "unlimited-ocr")
+		if entry["evicted_by_job"] != "train-job-42" || entry["desired_status"] != "stopped" {
+			t.Fatalf("reservation changed under hold: %v", entry)
+		}
+	}
+	// Manual recovery is outside startup: after separately verifying trainer
+	// termination, the job-scoped release may restore its service. Only after
+	// canonical terminal state is reconciled may an operator remove the hold.
+	h := NewServiceHandler(dir)
+	h.startServiceFn = exec.start
+	if restored, err := h.ReleaseAfterVerifiedFineTuneTermination(testCtx(), "train-job-42"); err != nil || !equalStrings(restored, []string{"unlimited-ocr"}) {
+		t.Fatalf("manual release = (%v, %v)", restored, err)
+	}
+	if err := os.Remove(hold); err != nil {
+		t.Fatal(err)
+	}
+	if restored, err := h.ReleaseAfterVerifiedFineTuneTermination(testCtx(), "train-job-42"); err == nil || len(restored) != 0 {
+		t.Fatalf("verified release without hold = (%v, %v), want refusal", restored, err)
+	}
+	if restored, err := h.ReconcileOrphanedReservations(testCtx(), true); err != nil || len(restored) != 0 {
+		t.Fatalf("reconcile after manual recovery = (%v, %v)", restored, err)
+	}
+	if !equalStrings(exec.started, []string{"unlimited-ocr"}) {
+		t.Fatalf("start calls after recovery = %v", exec.started)
+	}
+}
+
+func TestGenericReleaseSerializesServiceRestartAgainstFineTuneHold(t *testing.T) {
+	const manifest = `services:
+  - name: unlimited-ocr
+    type: docker
+    desired_status: stopped
+    evicted_by_job: previous-job
+`
+	dir := t.TempDir()
+	writeManifestFile(t, dir, manifest)
+	h := NewServiceHandler(dir)
+	starting := make(chan struct{})
+	finishStart := make(chan struct{})
+	h.startServiceFn = func(string) error {
+		close(starting)
+		<-finishStart
+		return nil
+	}
+	released := make(chan error, 1)
+	go func() {
+		_, err := h.Release(testCtx(), "previous-job")
+		released <- err
+	}()
+	<-starting // generic release has passed the hold check and is restarting
+	created := false
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(dir), func() error {
+		created = true
+		return os.WriteFile(finetunesafety.Path(dir), []byte("train-job\n"), 0600)
+	})
+	if err == nil || created {
+		t.Fatalf("hold creation raced in during service restart: callback=%v err=%v", created, err)
+	}
+	close(finishStart)
+	if err := <-released; err != nil {
+		t.Fatalf("original release: %v", err)
+	}
+	if err := finetunesafety.WithExclusive(finetunesafety.Dir(dir), func() error {
+		return os.WriteFile(finetunesafety.Path(dir), []byte("train-job\n"), 0600)
+	}); err != nil {
+		t.Fatalf("arm hold after release: %v", err)
+	}
+	if _, err := h.Release(testCtx(), "previous-job"); err == nil {
+		t.Fatal("generic release succeeded after fine-tune hold became active")
 	}
 }
 

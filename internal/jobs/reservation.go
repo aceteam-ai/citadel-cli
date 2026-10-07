@@ -2,11 +2,17 @@
 package jobs
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 )
 
 // Package-level doc for the job-scoped GPU reservation primitive
@@ -34,6 +40,9 @@ import (
 // worker now holds the same lock while it consumes jobs, but reconcile is still
 // wired only in `citadel work`; a future control-center reservation caller
 // must decide how to restore orphaned tags on its own startup.
+// A fine-tune safety hold additionally vetoes reconciliation even after a
+// crashed worker releases that lock: its named trainer may still be running
+// outside the worker process.
 
 // Reservation is the result of a job-scoped GPU VRAM hold (citadel-cli#832).
 type Reservation struct {
@@ -81,6 +90,138 @@ type Reservation struct {
 type ReservationSummary struct {
 	JobID           string
 	EvictedServices []string
+}
+
+// WithHeldServiceGuard guards a local service start or a mutation that could
+// erase a held reservation tag. A service tagged by the active fine-tune job
+// must remain stopped and tagged until verified cleanup; unrelated services
+// retain their existing behavior. The filesystem lock also prevents a
+// fine-tune reservation from tagging the service mid-start. Remote
+// SERVICE_START jobs use their existing Runner demand-yield path.
+func (h *ServiceHandler) WithHeldServiceGuard(name string, start func() error) error {
+	return h.withHeldServiceGuard(name, true, "", false, start)
+}
+
+// WithHeldServiceGuardIncoming includes the definition about to replace the
+// on-disk compose. The caller must perform every write and start inside fn;
+// checking only the old file would admit a CPU-to-GPU update under a hold.
+func (h *ServiceHandler) WithHeldServiceGuardIncoming(name, incomingComposePath string, incomingRequiresGPU bool, fn func() error) error {
+	return h.withHeldServiceGuard(name, true, incomingComposePath, incomingRequiresGPU, fn)
+}
+
+// A stop may still proceed for an untagged serving module; it only needs to
+// preserve a tag it would otherwise erase. Start operations additionally
+// block any GPU/model-serving service even when it was already stopped and
+// therefore had no eviction tag.
+func (h *ServiceHandler) withHeldServiceGuard(name string, blockGPUDemand bool, incomingComposePath string, incomingRequiresGPU bool, mutation func() error) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("local service start: name is required")
+	}
+	return finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		holdJob, held, err := finetunesafety.HeldJobID(h.ConfigDir)
+		if err != nil {
+			return fmt.Errorf("local service start %s: %w", name, err)
+		}
+		if held {
+			manifest, err := h.loadManifest()
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("local service start %s: cannot inspect held reservation: %w", name, err)
+				}
+				manifest = &serviceManifest{}
+			}
+			for _, service := range manifest.Services {
+				if service.Name == name && service.EvictedByJob == holdJob {
+					return fmt.Errorf("local service start %s: service is reserved by active fine-tune job; verified cleanup required", name)
+				}
+			}
+			if blockGPUDemand {
+				if incomingRequiresGPU {
+					return fmt.Errorf("local service start %s: incoming service is reserved by active fine-tune job; verified cleanup required", name)
+				}
+				incomingKnown := incomingComposePath != ""
+				if incomingKnown {
+					contents, readErr := os.ReadFile(incomingComposePath)
+					if readErr != nil {
+						return fmt.Errorf("local service start %s: cannot inspect incoming compose: %w", name, readErr)
+					}
+					incomingGPU, parseErr := catalog.ComposeDeclaresGPU(string(contents))
+					if parseErr != nil {
+						return fmt.Errorf("local service start %s: cannot parse incoming compose: %w", name, parseErr)
+					}
+					if incomingGPU {
+						return fmt.Errorf("local service start %s: incoming service is reserved by active fine-tune job; verified cleanup required", name)
+					}
+				}
+				gpu, inspectErr := h.serviceMayDemandGPU(name, manifest, incomingKnown)
+				if inspectErr != nil {
+					return fmt.Errorf("local service start %s: cannot prove service is non-GPU while fine-tune is active: %w", name, inspectErr)
+				}
+				if gpu {
+					return fmt.Errorf("local service start %s: service is reserved by active fine-tune job; verified cleanup required", name)
+				}
+			}
+		}
+		return mutation()
+	})
+}
+
+// serviceMayDemandGPU classifies NEW starts, not just services fine-tune would
+// evict. A previously stopped serving engine is untagged, yet starting it
+// during training would still overlap the trainer. Check the canonical engine
+// budget and both embedded/on-disk compose GPU declarations. Catalog requires
+// metadata catches catalog-only modules. Unknown custom services with no
+// inspectable compose or catalog metadata fail closed under an active hold.
+func (h *ServiceHandler) serviceMayDemandGPU(name string, manifest *serviceManifest, incomingKnown bool) (bool, error) {
+	if finetunesafety.CouldEvict(name) || status.EngineVRAMEstimateMB(name) > 0 {
+		return true, nil
+	}
+	inspected := false
+	if embedded, ok := embeddedservices.ServiceMap[name]; ok {
+		gpu, err := catalog.ComposeDeclaresGPU(embedded)
+		if err != nil {
+			return false, fmt.Errorf("embedded compose: %w", err)
+		}
+		inspected = true
+		if gpu {
+			return true, nil
+		}
+	}
+	for _, service := range manifest.Services {
+		if service.Name != name || service.ComposeFile == "" {
+			continue
+		}
+		path := service.ComposeFile
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(h.ConfigDir, path)
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return false, fmt.Errorf("read compose %s: %w", path, err)
+		}
+		gpu, err := catalog.ComposeDeclaresGPU(string(contents))
+		if err != nil {
+			return false, fmt.Errorf("parse compose %s: %w", path, err)
+		}
+		inspected = true
+		if gpu {
+			return true, nil
+		}
+		break
+	}
+	definition, err := catalog.LoadServiceManifest(name)
+	if err == nil {
+		inspected = true
+		if definition.Requires.GPU || definition.Requires.VRAMMinGB > 0 {
+			return true, nil
+		}
+	} else if !errors.Is(err, catalog.ErrServiceNotFound) {
+		return false, fmt.Errorf("inspect catalog metadata: %w", err)
+	}
+	if !inspected && !incomingKnown {
+		return false, fmt.Errorf("no inspectable GPU declaration for %q", name)
+	}
+	return false, nil
 }
 
 // Reserve evicts non-pinned services to free requiredVRAMBytes of VRAM on
@@ -182,6 +323,59 @@ func (h *ServiceHandler) Reserve(ctx JobContext, jobID string, requiredVRAMBytes
 	return res, nil
 }
 
+// ReserveNamed durably stops only the named, running services for a job. Fine
+// tuning uses this instead of whole-card exclusivity: the approved window
+// permits stopping unlimited-ocr and ollama, while paw-compile may keep serving.
+// A partial reservation is returned with an error and must still be released.
+func (h *ServiceHandler) ReserveNamed(ctx JobContext, jobID string, names []string) (*Reservation, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil, fmt.Errorf("reserve named: job id is required")
+	}
+	res := &Reservation{JobID: jobID}
+	st, err := h.collectNodeStatus()
+	if err != nil {
+		return nil, fmt.Errorf("reserve named %s: collect status: %w", jobID, err)
+	}
+	manifest, err := h.loadManifest()
+	if err != nil {
+		return nil, fmt.Errorf("reserve named %s: load manifest: %w", jobID, err)
+	}
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
+	}
+	prior := make(map[string]string, len(manifest.Services))
+	for _, svc := range manifest.Services {
+		prior[svc.Name] = svc.DesiredStatus
+	}
+	var stop []string
+	for _, candidate := range buildPreemptCandidates(st, "", manifest.pinnedSet()) {
+		if !wanted[candidate.Name] {
+			continue
+		}
+		if candidate.Pinned {
+			return res, fmt.Errorf("reserve named %s: required service %s is pinned", jobID, candidate.Name)
+		}
+		stop = append(stop, candidate.Name)
+	}
+	sort.Strings(stop)
+	for _, name := range stop {
+		if err := h.setEvictedMarkersInManifestFile(name, jobID, prior[name]); err != nil {
+			return res, fmt.Errorf("reserve named %s: tag %s: %w", jobID, name, err)
+		}
+		if err := h.setDesiredStatusInManifestFile(name, "stopped"); err != nil {
+			return res, fmt.Errorf("reserve named %s: mark %s stopped: %w", jobID, name, err)
+		}
+		if err := h.stopByName(name); err != nil {
+			return res, fmt.Errorf("reserve named %s: stop %s: %w", jobID, name, err)
+		}
+		res.Evicted = append(res.Evicted, name)
+		ctx.Log("info", "     - [reserve %s] stopped %s for fine tuning", jobID, name)
+	}
+	return res, nil
+}
+
 // Release restores every service tagged evicted_by_job==jobID: restarts each
 // one, then restores EvictedPriorStatus (rather than unconditionally clearing
 // desired_status — see that field's doc), THEN clears the reservation tag —
@@ -203,12 +397,55 @@ func (h *ServiceHandler) Reserve(ctx JobContext, jobID string, requiredVRAMBytes
 // an operator independently stopped for another reason — an explicit
 // SERVICE_STOP/SERVICE_START clears the tag (see Execute()), which is exactly
 // what makes that service invisible to every future Release call.
+// An active fine-tune safety hold blocks this generic API, even when jobID
+// names another tag. Only the fine-tune worker's verified-termination cleanup
+// API may restore its matching tag while the hold remains.
 func (h *ServiceHandler) Release(ctx JobContext, jobID string) ([]string, error) {
 	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
 		return nil, fmt.Errorf("release: job id is required")
 	}
+	var restored []string
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		if err := finetunesafety.RequireAbsent(h.ConfigDir); err != nil {
+			return err
+		}
+		var releaseErr error
+		restored, releaseErr = h.releaseReservation(ctx, jobID)
+		return releaseErr
+	})
+	if err != nil {
+		return restored, fmt.Errorf("release %s: %w", jobID, err)
+	}
+	return restored, nil
+}
 
+// ReleaseAfterVerifiedFineTuneTermination is only for the fine-tune worker
+// after its named training container has been confirmed absent (or before a
+// container was ever launched). It permits restoring THIS job's reservation
+// while its durable hold still protects the node from generic/manual release.
+// The worker clears the hold only after canonical terminal persistence.
+func (h *ServiceHandler) ReleaseAfterVerifiedFineTuneTermination(ctx JobContext, jobID string) ([]string, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil, fmt.Errorf("fine-tune release: job id is required")
+	}
+	var restored []string
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		if err := finetunesafety.RequireOwned(h.ConfigDir, jobID); err != nil {
+			return err
+		}
+		var releaseErr error
+		restored, releaseErr = h.releaseReservation(ctx, jobID)
+		return releaseErr
+	})
+	if err != nil {
+		return restored, fmt.Errorf("fine-tune release %s: %w", jobID, err)
+	}
+	return restored, nil
+}
+
+func (h *ServiceHandler) releaseReservation(ctx JobContext, jobID string) ([]string, error) {
 	manifest, err := h.loadManifest()
 	if err != nil {
 		return nil, fmt.Errorf("release %s: failed to load manifest: %w", jobID, err)
@@ -293,12 +530,24 @@ func (h *ServiceHandler) Release(ctx JobContext, jobID string) ([]string, error)
 // must decide whether and when to call it after taking the lock, before jobs
 // can create new reservations. Local CLI/MCP reservation calls do not hold this
 // worker lock and remain a separate ownership consideration.
+// A previous worker's fine-tune container can outlive its process and lock, so
+// an active fine-tune safety hold independently vetoes ALL reconciliation
+// before any tag is released or service restarted. Only verified trainer
+// termination, reservation restore, and canonical status persistence can
+// remove that hold; startup must never infer cleanup from a stale lock or an
+// absent worker.
 //
 // Idempotent: a service already restored (tag cleared) is not visited again,
 // so calling this twice restores nothing the second time — see Release.
 func (h *ServiceHandler) ReconcileOrphanedReservations(ctx JobContext, holdsWorkerLock bool) ([]string, error) {
 	if !holdsWorkerLock {
 		return nil, fmt.Errorf("reconcile reservations: refusing to run without the node's single-instance worker lock (internal/worklock) -- see cmd/work.go's runWork for the only safe call site")
+	}
+	// Check before reading or acting on ANY job tag. A hold can survive a worker
+	// crash while the trainer container remains alive, so even other tagged jobs
+	// must wait for explicit recovery rather than risk a GPU service restart.
+	if err := finetunesafety.RequireAbsent(h.ConfigDir); err != nil {
+		return nil, fmt.Errorf("reconcile reservations: %w", err)
 	}
 
 	manifest, err := h.loadManifest()

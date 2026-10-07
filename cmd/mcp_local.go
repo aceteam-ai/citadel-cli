@@ -625,7 +625,10 @@ type localHasReservationFn func(jobID string) (bool, error)
 // existing injection pattern exactly: tests stub each independently without
 // ever constructing a real internal/jobs.ServiceHandler.
 type localReservationOps struct {
-	deploy               localDeployFn
+	deploy localDeployFn
+	// Production exclusive deploy is one reservation-lock transaction. The
+	// older split callbacks remain only as injectable test seams.
+	runExclusive         func(jobID, serviceName, model string, requiredVRAMBytes uint64, budgeted bool) ([]string, string, string, error)
 	reserveExclusive     localReserveExclusiveFn
 	reserveBudget        localReserveBudgetFn
 	release              localReleaseFn
@@ -653,6 +656,29 @@ func realLocalReservationOps() localReservationOps {
 	jctx := jobs.JobContext{LogFn: localJobLogFn}
 
 	return localReservationOps{
+		runExclusive: func(jobID, serviceName, model string, requiredVRAMBytes uint64, budgeted bool) ([]string, string, string, error) {
+			h, err := resolve()
+			if err != nil {
+				return nil, "", "", err
+			}
+			if model != "" {
+				pull := &jobs.ModelCachePullHandler{}
+				if _, pullErr := pull.Execute(jctx, &nexus.Job{ID: jobID, Payload: map[string]string{"model_name": model, "engine": serviceName}}); pullErr != nil {
+					return nil, "", "", fmt.Errorf("pull model %q for %q: %w", model, serviceName, pullErr)
+				}
+			}
+			var res *jobs.Reservation
+			var out []byte
+			startErr := withCanonicalNodePointerLock(h.ConfigDir, func(nodeDirSource) error {
+				var err error
+				res, out, err = h.StartExclusiveWithModel(jctx, jobID, serviceName, model, requiredVRAMBytes, budgeted)
+				return err
+			})
+			if res == nil {
+				return nil, "", string(out), startErr
+			}
+			return res.Evicted, res.Reason, string(out), startErr
+		},
 		deploy: func(jobID, serviceName, model string, requiredVRAMBytes uint64) (string, error) {
 			h, err := resolve()
 			if err != nil {
@@ -664,40 +690,29 @@ func realLocalReservationOps() localReservationOps {
 					return "", fmt.Errorf("pull model %q for %q: %w", model, serviceName, pullErr)
 				}
 			}
-			out, startErr := h.StartServiceWithModel(jctx, serviceName, model, requiredVRAMBytes)
+			var out []byte
+			startErr := withCanonicalNodePointerLock(h.ConfigDir, func(nodeDirSource) error {
+				var err error
+				out, err = h.StartServiceWithModel(jctx, serviceName, model, requiredVRAMBytes)
+				return err
+			})
 			if startErr != nil {
 				return "", startErr
 			}
 			return string(out), nil
-		},
-		reserveExclusive: func(jobID, exclude string) ([]string, string, error) {
-			h, err := resolve()
-			if err != nil {
-				return nil, "", err
-			}
-			res, resErr := h.ReserveExclusive(jctx, jobID, exclude)
-			if res == nil {
-				return nil, "", resErr
-			}
-			return res.Evicted, res.Reason, resErr
-		},
-		reserveBudget: func(jobID string, requiredVRAMBytes uint64) ([]string, string, error) {
-			h, err := resolve()
-			if err != nil {
-				return nil, "", err
-			}
-			res, resErr := h.Reserve(jctx, jobID, requiredVRAMBytes)
-			if res == nil {
-				return nil, "", resErr
-			}
-			return res.Evicted, res.Reason, resErr
 		},
 		release: func(jobID string) ([]string, error) {
 			h, err := resolve()
 			if err != nil {
 				return nil, err
 			}
-			return h.Release(jctx, jobID)
+			var restored []string
+			err = withCanonicalNodePointerLock(h.ConfigDir, func(nodeDirSource) error {
+				var releaseErr error
+				restored, releaseErr = h.Release(jctx, jobID)
+				return releaseErr
+			})
+			return restored, err
 		},
 		hasActiveReservation: func(jobID string) (bool, error) {
 			h, err := resolve()
@@ -844,7 +859,7 @@ func localRunExclusiveCall(deps localMCPDeps, args json.RawMessage) (string, err
 	if engine == "" {
 		return "", fmt.Errorf("'engine' is required (the target managed service, e.g. \"vllm\"); not inferred from the model name")
 	}
-	if deps.reservations.deploy == nil {
+	if deps.reservations.runExclusive == nil && deps.reservations.deploy == nil {
 		return "", fmt.Errorf("exclusive model run is not available")
 	}
 
@@ -852,7 +867,16 @@ func localRunExclusiveCall(deps localMCPDeps, args json.RawMessage) (string, err
 	var evicted []string
 	var reason string
 	var err error
-	if in.VRAMMB > 0 {
+	var startOut string
+	if deps.reservations.runExclusive != nil {
+		evicted, reason, startOut, err = deps.reservations.runExclusive(jobID, engine, model, vramMBToBytes(in.VRAMMB), in.VRAMMB > 0)
+		if err != nil {
+			if len(evicted) > 0 {
+				return "", fmt.Errorf("exclusive start %q failed and rollback is incomplete for %s: %w; inspect reservation %s before retrying release", engine, strings.Join(evicted, ", "), err, jobID)
+			}
+			return "", fmt.Errorf("exclusive start %q failed: %w", engine, err)
+		}
+	} else if in.VRAMMB > 0 {
 		if deps.reservations.reserveBudget == nil {
 			return "", fmt.Errorf("bounded (vram_mb) reservation is not available")
 		}
@@ -867,11 +891,14 @@ func localRunExclusiveCall(deps localMCPDeps, args json.RawMessage) (string, err
 		return "", fmt.Errorf("reserve GPU for %q: %w (evicted before the failure: %s)", engine, err, strings.Join(evicted, ", "))
 	}
 
-	startOut, startErr := deps.reservations.deploy(jobID, engine, model, 0)
-	if startErr != nil {
-		return "", fmt.Errorf("reservation %s is HELD (evicted: %s) but starting %q failed: %w -- "+
-			"call local_model_stop(model=%q) or 'citadel module reservations release %s' to restore the evicted peers",
-			jobID, strings.Join(evicted, ", "), engine, startErr, model, jobID)
+	if deps.reservations.runExclusive == nil {
+		var startErr error
+		startOut, startErr = deps.reservations.deploy(jobID, engine, model, 0)
+		if startErr != nil {
+			return "", fmt.Errorf("reservation %s is HELD (evicted: %s) but starting %q failed: %w -- "+
+				"call local_model_stop(model=%q) or 'citadel module reservations release %s' to restore the evicted peers",
+				jobID, strings.Join(evicted, ", "), engine, startErr, model, jobID)
+		}
 	}
 
 	result := map[string]any{

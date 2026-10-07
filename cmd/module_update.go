@@ -172,31 +172,37 @@ func updateOne(entry catalog.LockEntry, src catalog.Source, servicesDir string) 
 	// Preserve the recorded sandbox posture across an update: if the module was
 	// installed as untrusted/sandboxed, regenerate its hardening override from the
 	// (possibly changed) new compose so the override never goes stale.
-	res, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, false, entry.Sandboxed, false)
+	configDir := filepath.Dir(servicesDir)
+	rollbackNeeded := false
+	err = withModuleUpdateTransaction(configDir, entry.Name, resolved.Manifest, resolved.ComposePath, func() error {
+		// Replacement, lockfile mutation and restart are one transaction. A
+		// guarded CPU start cannot classify the old file then race this copy.
+		res, installErr := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, false, entry.Sandboxed, false)
+		if installErr != nil {
+			return fmt.Errorf("re-install %s: %w", entry.Name, installErr)
+		}
+		newEntry := updatedLockEntry(entry, resolved.Manifest.Name, resolved.ResolvedRef, resolved.Commit, catalog.BuildLockImages(resolved.Images), res.Sandboxed)
+		if lockErr := catalog.UpsertLockEntry(newEntry); lockErr != nil {
+			fmt.Fprintf(os.Stderr, "  could not update lockfile for %s: %v\n", entry.Name, lockErr)
+		}
+		if moduleUpdateRestart && wasRunning {
+			if restartErr := composeUpDetachedUnchecked(entry.Name, filepath.Join(servicesDir, entry.Name+".yml")); restartErr != nil {
+				fmt.Fprintf(os.Stderr, "  restart failed for %s: %v\n", entry.Name, restartErr)
+			} else if catalog.HasHealthProbe(resolved.Manifest.HealthCheck) &&
+				catalog.ProbeHealth(resolved.Manifest.HealthCheck) == catalog.ProbeUnhealthy {
+				rollbackNeeded = true
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  re-install failed for %s: %v\n", entry.Name, err)
+		fmt.Fprintf(os.Stderr, "  re-install refused for %s: %v\n", entry.Name, err)
 		return false
 	}
-
-	newEntry := updatedLockEntry(entry, resolved.Manifest.Name, resolved.ResolvedRef, resolved.Commit, catalog.BuildLockImages(resolved.Images), res.Sandboxed)
-	if err := catalog.UpsertLockEntry(newEntry); err != nil {
-		fmt.Fprintf(os.Stderr, "  could not update lockfile for %s: %v\n", entry.Name, err)
-	}
-
-	// Restart the container if it was running, so the on-disk compose/env change
-	// actually takes effect (InstallFromManifest only copies files; it does not
-	// recreate the container). Only then is a health probe meaningful.
-	if moduleUpdateRestart && wasRunning {
-		if err := composeUpDetached(entry.Name, filepath.Join(servicesDir, entry.Name+".yml")); err != nil {
-			fmt.Fprintf(os.Stderr, "  restart failed for %s: %v\n", entry.Name, err)
-		} else if catalog.HasHealthProbe(resolved.Manifest.HealthCheck) &&
-			catalog.ProbeHealth(resolved.Manifest.HealthCheck) == catalog.ProbeUnhealthy {
-			// Health rollback: only on a definitively-unhealthy probe (best-effort;
-			// a not-probeable result never triggers a rollback).
-			fmt.Printf("  %s\n", color.RedString("health check failed after update; rolling back"))
-			rollback(entry, servicesDir)
-			return false
-		}
+	if rollbackNeeded {
+		fmt.Printf("  %s\n", color.RedString("health check failed after update; rolling back"))
+		rollback(entry, servicesDir)
+		return false
 	}
 
 	fmt.Printf("  %s\n", color.GreenString("updated"))
@@ -241,18 +247,27 @@ func rollback(prev catalog.LockEntry, servicesDir string) {
 		fmt.Fprintf(os.Stderr, "  rollback failed to re-resolve previous version: %v\n", err)
 		return
 	}
-	if _, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, true, prev.Sandboxed, false); err != nil {
-		fmt.Fprintf(os.Stderr, "  rollback re-install failed: %v\n", err)
+	configDir := filepath.Dir(servicesDir)
+	if err := withModuleUpdateTransaction(configDir, prev.Name, resolved.Manifest, resolved.ComposePath, func() error {
+		if _, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, true, prev.Sandboxed, false); err != nil {
+			return fmt.Errorf("rollback re-install: %w", err)
+		}
+		if err := catalog.UpsertLockEntry(prev); err != nil {
+			fmt.Fprintf(os.Stderr, "  rollback could not restore lockfile: %v\n", err)
+		}
+		return composeUpDetachedUnchecked(prev.Name, filepath.Join(servicesDir, prev.Name+".yml"))
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "  rollback refused or restart failed: %v\n", err)
 		return
 	}
-	// Restore the lockfile to the previous provenance.
-	if err := catalog.UpsertLockEntry(prev); err != nil {
-		fmt.Fprintf(os.Stderr, "  rollback could not restore lockfile: %v\n", err)
-	}
-	if err := composeUpDetached(prev.Name, filepath.Join(servicesDir, prev.Name+".yml")); err != nil {
-		fmt.Fprintf(os.Stderr, "  rollback restart failed: %v\n", err)
-	}
 	fmt.Printf("  %s %s\n", color.YellowString("rolled back to"), shortCommit(prev.Commit))
+}
+
+// Shared by update and rollback so neither can replace the inspected compose
+// or restart outside the fine-tune reservation critical section.
+func withModuleUpdateTransaction(configDir, name string, incoming *catalog.ServiceManifest, composePath string, mutation func() error) error {
+	return withIncomingServiceStartGuard(configDir, name, composePath,
+		incoming.Requires.GPU || incoming.Requires.VRAMMinGB > 0, mutation)
 }
 
 // runModuleGC removes module cache directories not referenced by the lockfile.
@@ -294,6 +309,13 @@ func pruneUnreferenced() error {
 // composeUpDetached starts/recreates a service's container non-interactively. It
 // is intentionally minimal (no prompts) so `module update` is scriptable.
 func composeUpDetached(name, composePath string) error {
+	configDir := filepath.Dir(filepath.Dir(composePath))
+	return withLocalServiceStartGuard(configDir, name, func() error {
+		return composeUpDetachedUnchecked(name, composePath)
+	})
+}
+
+func composeUpDetachedUnchecked(name, composePath string) error {
 	if _, err := os.Stat(composePath); err != nil {
 		return fmt.Errorf("compose file not found: %s", composePath)
 	}
