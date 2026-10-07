@@ -1,7 +1,7 @@
 [Unit]
 Description=Citadel Worker - AceTeam Sovereign Compute
-After=network-online.target docker.service
-Wants=network-online.target docker.service
+After=podman.socket
+Wants=podman.socket
 # Defense in depth against a crash-loop self-DoS (#443): if the process keeps
 # failing fast, enter a cooldown instead of a 10s restart storm.
 StartLimitIntervalSec=300
@@ -16,8 +16,8 @@ Restart=on-failure
 RestartSec=10
 RestartSteps=5
 RestartMaxDelaySec=300
-Environment=HOME=/root
-WorkingDirectory=/root
+Environment=HOME=/home/citadel
+WorkingDirectory=/home/citadel
 
 # Logging
 StandardOutput=journal
@@ -29,4 +29,4 @@ LimitNOFILE=65535
 LimitNPROC=65535
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

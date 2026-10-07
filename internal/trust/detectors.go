@@ -131,6 +131,7 @@ var secretPatterns = []secretPattern{
 	{regexp.MustCompile(`sq0atp-[0-9a-zA-Z\-]{22,}`), "Square access token"},
 	{regexp.MustCompile(`sqOatp-[0-9a-zA-Z\-]{22,}`), "Square OAuth token"},
 	{regexp.MustCompile(`EZAK[0-9a-zA-Z\-]{54,}`), "EasyPost API key"},
+	{regexp.MustCompile(`\bact_[0-9a-zA-Z._\-]{16,}\b`), "AceTeam API key"},
 	{regexp.MustCompile(`(?i)(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token)\s*[:=]\s*['"]?([A-Za-z0-9\-._]{20,})`), "generic API key/token"},
 }
 

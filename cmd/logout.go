@@ -4,6 +4,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -15,8 +16,10 @@ import (
 )
 
 var (
-	logoutKeepRegistration bool
-	logoutForce            bool
+	logoutKeepRegistration  bool
+	logoutForce             bool
+	logoutAPIKeyStdin       bool
+	logoutRequireDeregister bool
 )
 
 var logoutCmd = &cobra.Command{
@@ -38,8 +41,12 @@ to the same organization later.`,
 }
 
 func runLogout(cmd *cobra.Command, args []string) {
+	if logoutKeepRegistration && (logoutAPIKeyStdin || logoutRequireDeregister) {
+		fmt.Fprintln(os.Stderr, "Error: --keep-registration cannot be combined with strict deregistration options")
+		os.Exit(1)
+	}
 	// Check if connected or has state
-	if !network.IsGlobalConnected() && !network.HasState() {
+	if !network.IsGlobalConnected() && !network.HasState() && !(logoutRequireDeregister && getSavedHostname() != "") {
 		fmt.Println("Not connected to any network.")
 		return
 	}
@@ -64,17 +71,41 @@ func runLogout(cmd *cobra.Command, args []string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	apiKey := os.Getenv("CITADEL_API_KEY")
+	if logoutAPIKeyStdin {
+		var err error
+		input := cmd.InOrStdin()
+		isTerminal := false
+		if file, ok := input.(*os.File); ok {
+			if info, statErr := file.Stat(); statErr == nil {
+				isTerminal = info.Mode()&os.ModeCharDevice != 0
+			}
+		}
+		apiKey, err = readLogoutAPIKeyStdin(input, isTerminal)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading --api-key-stdin: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	// Try to deregister from backend (unless --keep-registration is set)
+	var deregisterErr error
 	if !logoutKeepRegistration {
-		deregisterFromBackend(ctx)
+		deregisterErr = deregisterFromBackend(ctx, apiKey)
+		if deregisterErr != nil && !logoutRequireDeregister {
+			fmt.Printf("   - Warning: Could not deregister from backend: %v\n", deregisterErr)
+			fmt.Println("   - Node may still be registered in Headscale")
+		}
 	} else {
 		Debug("skipping backend deregistration (--keep-registration)")
 	}
 
-	// Logout (disconnect and clear state)
-	if err := network.Logout(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error logging out: %v\n", err)
+	// A strict cleanup must retain the local identity until the coordination
+	// server has confirmed deletion. That leaves a transient failure
+	// recoverable with the same HOME and node identity instead of orphaning a
+	// remote registration after clearing its only local state.
+	if err := completeRequiredDeregistration(deregisterErr, logoutRequireDeregister, network.Logout); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	if !logoutKeepRegistration {
@@ -84,7 +115,6 @@ func runLogout(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Warning: could not clear prior session mode: %v\n", err)
 		}
 	}
-
 	fmt.Println("✅ Successfully disconnected from the AceTeam Network.")
 	if logoutKeepRegistration {
 		fmt.Println("   Node registration preserved. To reconnect, run 'citadel login'")
@@ -93,9 +123,19 @@ func runLogout(cmd *cobra.Command, args []string) {
 	}
 }
 
-// deregisterFromBackend attempts to deregister the node from Headscale via the backend API.
-// This is a best-effort operation - errors are logged but don't block logout.
-func deregisterFromBackend(ctx context.Context) {
+func completeRequiredDeregistration(deregisterErr error, requireDeregister bool, localLogout func() error) error {
+	if deregisterErr != nil && requireDeregister {
+		return fmt.Errorf("required backend deregistration failed: %w", deregisterErr)
+	}
+	if err := localLogout(); err != nil {
+		return fmt.Errorf("logging out locally: %w", err)
+	}
+	return nil
+}
+
+// deregisterFromBackend deregisters the node via the backend API. Its caller
+// decides whether a failure is a warning or a hard cleanup failure.
+func deregisterFromBackend(ctx context.Context, apiKey string) error {
 	var nodeName string
 
 	// Try to get node identity from manifest
@@ -115,35 +155,67 @@ func deregisterFromBackend(ctx context.Context) {
 	// display name, so an offline logout must resolve the signed serving
 	// identity before asking the backend to deregister that exact node.
 	nodeName = logoutServingNodeName(nodeName)
+	if nodeName == "" {
+		nodeName = getSavedHostname()
+	}
 
 	// Skip if we have no identity information
 	if nodeName == "" {
-		Debug("no node identity found, skipping deregistration")
-		return
+		return fmt.Errorf("no node identity found")
 	}
 
-	// Resolve API key for authentication
-	apiKey := os.Getenv("CITADEL_API_KEY")
+	if err := requireBackendDeregistration(ctx, nodeName, apiKey, func(ctx context.Context, nodeName, apiKey string) error {
+		Debug("deregistering from backend: nodeName=%s", nodeName)
+		client := nexus.NewDeregisterClient(authServiceURL, apiKey)
+		return client.Deregister(ctx, nexus.DeregisterRequest{NodeName: nodeName})
+	}); err != nil {
+		return err
+	}
+	fmt.Println("   - Deregistered from coordination server")
+	return nil
+}
+
+func requireBackendDeregistration(ctx context.Context, nodeName, apiKey string, deregister func(context.Context, string, string) error) error {
+	if nodeName == "" {
+		return fmt.Errorf("no node identity found")
+	}
 	if apiKey == "" {
-		Debug("no API key configured, skipping deregistration")
-		fmt.Println("   - Warning: CITADEL_API_KEY not set, cannot deregister from backend")
-		return
+		return fmt.Errorf("no API key configured")
 	}
+	if err := deregister(ctx, nodeName, apiKey); err != nil {
+		return fmt.Errorf("coordination server did not confirm deregistration: %w", err)
+	}
+	return nil
+}
 
-	// Call backend to deregister
-	Debug("deregistering from backend: nodeName=%s", nodeName)
-	client := nexus.NewDeregisterClient(authServiceURL, apiKey)
-	req := nexus.DeregisterRequest{
-		NodeName: nodeName,
-	}
+const maxStdinAPIKeyBytes = 4096
 
-	if err := client.Deregister(ctx, req); err != nil {
-		// Warning only - continue with local logout
-		fmt.Printf("   - Warning: Could not deregister from backend: %v\n", err)
-		fmt.Println("   - Node may still be registered in Headscale")
-	} else {
-		fmt.Println("   - Deregistered from coordination server")
+func readLogoutAPIKeyStdin(r io.Reader, isTerminal bool) (string, error) {
+	if isTerminal {
+		return "", fmt.Errorf("--api-key-stdin requires piped or redirected input; refusing to read a secret from a terminal")
 	}
+	b, err := io.ReadAll(io.LimitReader(r, maxStdinAPIKeyBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(b) > maxStdinAPIKeyBytes {
+		return "", fmt.Errorf("input exceeds %d bytes", maxStdinAPIKeyBytes)
+	}
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+		if len(b) > 0 && b[len(b)-1] == '\r' {
+			b = b[:len(b)-1]
+		}
+	}
+	if len(b) == 0 {
+		return "", fmt.Errorf("input is empty")
+	}
+	for _, c := range b {
+		if c < 0x21 || c > 0x7e {
+			return "", fmt.Errorf("input must be one visible ASCII token")
+		}
+	}
+	return string(b), nil
 }
 
 func logoutServingNodeName(fallback string) string {
@@ -156,4 +228,6 @@ func init() {
 	logoutCmd.Flags().BoolVar(&logoutKeepRegistration, "keep-registration", false,
 		"Only disconnect locally, keep node registered in Headscale (for temporary disconnects)")
 	logoutCmd.Flags().BoolVarP(&logoutForce, "force", "f", false, "Skip confirmation prompt.")
+	logoutCmd.Flags().BoolVar(&logoutAPIKeyStdin, "api-key-stdin", false, "Read the backend API key from stdin (keeps it out of argv)")
+	logoutCmd.Flags().BoolVar(&logoutRequireDeregister, "require-deregister", false, "Fail unless backend deregistration is confirmed")
 }

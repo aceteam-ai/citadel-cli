@@ -3,11 +3,13 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	jobhandlers "github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
@@ -142,6 +144,34 @@ type MockJobHandler struct {
 	mu         sync.Mutex
 }
 
+type contextBlockingHandler struct {
+	started chan struct{}
+}
+
+func (h *contextBlockingHandler) CanHandle(jobType string) bool {
+	return jobType == JobTypeHuddleJoin
+}
+
+func (h *contextBlockingHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	close(h.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type teardownDebtOnCancellationHandler struct {
+	started chan struct{}
+}
+
+func (h *teardownDebtOnCancellationHandler) CanHandle(jobType string) bool {
+	return jobType == JobTypeHuddleJoin
+}
+
+func (h *teardownDebtOnCancellationHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	close(h.started)
+	<-ctx.Done()
+	return nil, errors.Join(ctx.Err(), jobhandlers.ErrHuddleTeardownPending)
+}
+
 func NewMockJobHandler(jobType string, shouldFail bool) *MockJobHandler {
 	return &MockJobHandler{
 		jobType:    jobType,
@@ -176,6 +206,152 @@ func (m *MockJobHandler) ExecutedJobs() []*Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.executed
+}
+
+func TestRunnerHuddleCancellationInterruptsAndTerminatesWithoutRetry(t *testing.T) {
+	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	source.cancelledJobs = map[string]bool{}
+	handler := &contextBlockingHandler{started: make(chan struct{})}
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	runner.huddleCancelPoll = time.Millisecond
+	stream := &recordingStreamWriter{}
+	done := make(chan bool, 1)
+	go func() {
+		done <- runner.executeJob(context.Background(), job, stream, time.Now(), false, 0)
+	}()
+	<-handler.started
+	source.mu.Lock()
+	source.cancelledJobs[job.ID] = true
+	source.mu.Unlock()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("cancelled huddle job reported success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("huddle cancellation did not interrupt the handler")
+	}
+	if !stream.cancelled || stream.errored || stream.ended {
+		t.Fatalf("terminal events cancelled=%v errored=%v ended=%v", stream.cancelled, stream.errored, stream.ended)
+	}
+	if len(source.AckedJobs()) != 1 || len(source.NackedJobs()) != 0 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("ack/nack/fail = %d/%d/%d", len(source.AckedJobs()), len(source.NackedJobs()), len(source.FailedJobs()))
+	}
+}
+
+func TestRunnerHuddleCancellationRetainsTeardownDebtWithoutAck(t *testing.T) {
+	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	source.cancelledJobs = map[string]bool{}
+	handler := &teardownDebtOnCancellationHandler{started: make(chan struct{})}
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	runner.huddleCancelPoll = time.Millisecond
+	stream := &recordingStreamWriter{}
+	done := make(chan bool, 1)
+	go func() {
+		done <- runner.executeJob(context.Background(), job, stream, time.Now(), false, 0)
+	}()
+	<-handler.started
+	source.mu.Lock()
+	source.cancelledJobs[job.ID] = true
+	source.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("huddle cancellation did not interrupt the handler")
+	}
+	if stream.cancelled || stream.errored || stream.ended {
+		t.Fatalf("terminal events cancelled=%v errored=%v ended=%v, want none", stream.cancelled, stream.errored, stream.ended)
+	}
+	if len(source.AckedJobs()) != 0 || len(source.NackedJobs()) != 1 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("ack/nack/fail = %d/%d/%d, want 0/1/0", len(source.AckedJobs()), len(source.NackedJobs()), len(source.FailedJobs()))
+	}
+}
+
+func TestRunnerHuddleFailureIsTerminalForExactAttempt(t *testing.T) {
+	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	handler := NewMockJobHandler(JobTypeHuddleJoin, true)
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	runner.huddleCancelPoll = time.Millisecond
+	stream := &recordingStreamWriter{}
+
+	if runner.executeJob(context.Background(), job, stream, time.Now(), false, 0) {
+		t.Fatal("failed huddle job reported success")
+	}
+	if len(source.FailedJobs()) != 1 || len(source.NackedJobs()) != 0 {
+		t.Fatalf("failed/nacked = %d/%d", len(source.FailedJobs()), len(source.NackedJobs()))
+	}
+	if !stream.errored || stream.cancelled || stream.ended {
+		t.Fatalf("terminal events errored=%v cancelled=%v ended=%v", stream.errored, stream.cancelled, stream.ended)
+	}
+}
+
+type huddleTeardownThenSuccessHandler struct {
+	executions int
+}
+
+func (h *huddleTeardownThenSuccessHandler) CanHandle(jobType string) bool {
+	return jobType == JobTypeHuddleJoin
+}
+
+func (h *huddleTeardownThenSuccessHandler) Execute(context.Context, *Job, StreamWriter) (*JobResult, error) {
+	h.executions++
+	if h.executions == 1 {
+		err := fmt.Errorf("%w: meetingd DELETE returned 500", jobhandlers.ErrHuddleTeardownPending)
+		return &JobResult{Status: JobStatusFailure, Error: err}, err
+	}
+	return &JobResult{Status: JobStatusSuccess, Output: map[string]any{"cleaned": true}}, nil
+}
+
+func TestRunnerHuddleTeardownDebtNacksWithoutTerminalThenRedelivers(t *testing.T) {
+	job := &Job{
+		ID:       "huddle-job",
+		Type:     JobTypeHuddleJoin,
+		Payload:  map[string]any{},
+		Metadata: JobMetadata{Attempts: 1, MaxAttempts: 3},
+	}
+	source := NewMockJobSource("test", []*Job{job})
+	source.requeueOnNack = true
+	handler := &huddleTeardownThenSuccessHandler{}
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(*Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if handler.executions != 2 {
+		t.Fatalf("handler executions = %d, want teardown retry + success", handler.executions)
+	}
+	if len(source.NackedJobs()) != 1 || len(source.AckedJobs()) != 1 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("nack/ack/fail = %d/%d/%d, want 1/1/0", len(source.NackedJobs()), len(source.AckedJobs()), len(source.FailedJobs()))
+	}
+	if stream.errorCount != 0 || stream.endCount != 0 {
+		t.Fatalf("terminal error/end = %d/%d, want 0/0 (coordinator-owned)", stream.errorCount, stream.endCount)
+	}
+}
+
+func TestRunnerSuccessfulHuddleJoinRawAcksWithoutLocalTerminal(t *testing.T) {
+	job := &Job{ID: "huddle-job", Type: JobTypeHuddleJoin, Payload: map[string]any{}}
+	source := NewMockJobSource("test", nil)
+	handler := NewMockJobHandler(JobTypeHuddleJoin, false)
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{ActivityFn: func(string, string) {}})
+	stream := &MockStreamWriter{}
+
+	if !runner.executeJob(context.Background(), job, stream, time.Now(), false, 0) {
+		t.Fatal("successful huddle job reported failure")
+	}
+	if len(source.AckedJobs()) != 1 || len(source.NackedJobs()) != 0 || len(source.FailedJobs()) != 0 {
+		t.Fatalf("ack/nack/fail = %d/%d/%d, want 1/0/0", len(source.AckedJobs()), len(source.NackedJobs()), len(source.FailedJobs()))
+	}
+	if stream.errorCount != 0 || stream.endCount != 0 {
+		t.Fatalf("terminal error/end = %d/%d, want 0/0 (coordinator-owned)", stream.errorCount, stream.endCount)
+	}
 }
 
 // MockStreamWriter is a test implementation of StreamWriter.
@@ -479,6 +655,9 @@ func TestRunnerUnsupportedJobTypeDistinguishesGatedFromUnknown(t *testing.T) {
 		// gatedJobTypeReasons, but no FILE_READ handler is registered below --
 		// exactly the "files permission disabled" shape from the issue.
 		{ID: "job-gated", Type: JobTypeFileRead, Payload: map[string]any{}},
+		// HUDDLE_JOIN is known to the build but is not registered when the
+		// node's default-on meeting capability has been explicitly disabled.
+		{ID: "job-huddle-gated", Type: JobTypeHuddleJoin, Payload: map[string]any{}},
 		// A type this build has never heard of at all.
 		{ID: "job-unknown", Type: "TOTALLY_MADE_UP_JOB_TYPE", Payload: map[string]any{}},
 	}
@@ -495,8 +674,8 @@ func TestRunnerUnsupportedJobTypeDistinguishesGatedFromUnknown(t *testing.T) {
 
 	failed := source.FailedJobs()
 	data := source.FailedData()
-	if len(failed) != 2 || len(data) != 2 {
-		t.Fatalf("Failed jobs = %d, data = %d, want 2 each", len(failed), len(data))
+	if len(failed) != 3 || len(data) != 3 {
+		t.Fatalf("Failed jobs = %d, data = %d, want 3 each", len(failed), len(data))
 	}
 
 	byType := make(map[string]map[string]any)
@@ -514,6 +693,18 @@ func TestRunnerUnsupportedJobTypeDistinguishesGatedFromUnknown(t *testing.T) {
 	reason, _ := gated["unregistered_reason"].(string)
 	if reason == "" || !strings.Contains(reason, "files") {
 		t.Errorf("FILE_READ unregistered_reason = %q, want it to name the files permission", reason)
+	}
+
+	huddleGated := byType[JobTypeHuddleJoin]
+	if huddleGated == nil {
+		t.Fatalf("no failure recorded for %s", JobTypeHuddleJoin)
+	}
+	if huddleGated["known_to_build"] != true {
+		t.Errorf("HUDDLE_JOIN known_to_build = %v, want true", huddleGated["known_to_build"])
+	}
+	huddleReason, _ := huddleGated["unregistered_reason"].(string)
+	if !strings.Contains(huddleReason, "meeting capability") {
+		t.Errorf("HUDDLE_JOIN unregistered_reason = %q, want it to name the meeting capability", huddleReason)
 	}
 
 	unknown := byType["TOTALLY_MADE_UP_JOB_TYPE"]

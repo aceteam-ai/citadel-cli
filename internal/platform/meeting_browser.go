@@ -25,6 +25,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -185,17 +186,30 @@ func findFreeDebugPort() (int, error) {
 // timeout elapses. Package-level (not a MeetingBrowser method) so it is reusable
 // and stays free of manager state.
 func waitForCDPReady(debugPort int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	return waitForCDPReadyContext(context.Background(), debugPort, timeout)
+}
+
+func waitForCDPReadyContext(parent context.Context, debugPort int, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
 	var lastErr error
-	for time.Now().Before(deadline) {
-		if _, err := pickTarget(debugPort); err == nil {
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("CDP endpoint not ready after %s (last probe: %v): %w", timeout, lastErr, err)
+		}
+		if _, err := pickTargetContext(ctx, debugPort); err == nil {
 			return nil
 		} else {
 			lastErr = err
 		}
-		time.Sleep(300 * time.Millisecond)
+		timer := time.NewTimer(300 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("CDP endpoint not ready after %s (last probe: %v): %w", timeout, lastErr, ctx.Err())
+		case <-timer.C:
+		}
 	}
-	return fmt.Errorf("CDP endpoint not ready after %s: %v", timeout, lastErr)
 }
 
 // clickJS builds a JS expression that clicks the first element matching selector

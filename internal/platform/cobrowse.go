@@ -749,7 +749,15 @@ var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 // pickTarget returns the first "page" target's WebSocket URL from /json.
 func pickTarget(debugPort int) (cdpTarget, error) {
-	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
+	return pickTargetContext(context.Background(), debugPort)
+}
+
+func pickTargetContext(ctx context.Context, debugPort int) (cdpTarget, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json", debugPort), nil)
+	if err != nil {
+		return cdpTarget{}, err
+	}
+	resp, err := cdpHTTPClient.Do(req)
 	if err != nil {
 		return cdpTarget{}, err
 	}
@@ -787,28 +795,47 @@ func cdpCommand(debugPort int, method string, params map[string]any) (map[string
 // host, see cdpCommandPublished — shares the exact same request/response
 // handling.
 func cdpDialAndSend(wsURL, method string, params map[string]any) (map[string]any, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	return cdpDialAndSendContext(context.Background(), wsURL, method, params)
+}
+
+func cdpDialAndSendContext(parent context.Context, wsURL, method string, params map[string]any) (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("CDP dial: %w", err)
 	}
 	defer conn.Close()
+	stopCancelWatch := make(chan struct{})
+	defer close(stopCancelWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopCancelWatch:
+		}
+	}()
 
 	if params == nil {
 		params = map[string]any{}
 	}
 	req := map[string]any{"id": 1, "method": method, "params": params}
-	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_ = conn.SetWriteDeadline(contextDeadlineOr(ctx, 10*time.Second))
 	if err := conn.WriteJSON(req); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("CDP write: %w", ctxErr)
+		}
 		return nil, fmt.Errorf("CDP write: %w", err)
 	}
 
 	// Read until we see the response with id==1 (skip async events).
-	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	_ = conn.SetReadDeadline(contextDeadlineOr(ctx, 15*time.Second))
 	for {
 		var msg map[string]any
 		if err := conn.ReadJSON(&msg); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("CDP read: %w", ctxErr)
+			}
 			return nil, fmt.Errorf("CDP read: %w", err)
 		}
 		idv, ok := msg["id"]
@@ -826,6 +853,14 @@ func cdpDialAndSend(wsURL, method string, params map[string]any) (map[string]any
 		}
 		return map[string]any{}, nil
 	}
+}
+
+func contextDeadlineOr(ctx context.Context, fallback time.Duration) time.Time {
+	deadline := time.Now().Add(fallback)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
 }
 
 func (m *CobrowseManager) navigateLocked(url string) error {

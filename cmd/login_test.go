@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -99,17 +100,66 @@ func TestSelectLoginNetworkChoiceDefaultDelegates(t *testing.T) {
 }
 
 func TestValidateLoginOptions(t *testing.T) {
-	if err := validateLoginOptions("", false); err != nil {
+	if err := validateLoginOptions("", false, false); err != nil {
 		t.Fatalf("default options: %v", err)
 	}
-	if err := validateLoginOptions("", true); err != nil {
+	if err := validateLoginOptions("", false, true); err != nil {
 		t.Fatalf("new-device only: %v", err)
 	}
-	if err := validateLoginOptions("key", false); err != nil {
+	if err := validateLoginOptions("key", false, false); err != nil {
 		t.Fatalf("authkey only: %v", err)
 	}
-	if err := validateLoginOptions("key", true); err == nil {
+	if err := validateLoginOptions("", true, false); err != nil {
+		t.Fatalf("authkey-stdin only: %v", err)
+	}
+	if err := validateLoginOptions("key", false, true); err == nil {
 		t.Fatal("--authkey with --new-device was accepted")
+	}
+	if err := validateLoginOptions("key", true, false); err == nil {
+		t.Fatal("--authkey with --authkey-stdin was accepted")
+	}
+	if err := validateLoginOptions("", true, true); err == nil {
+		t.Fatal("--authkey-stdin with --new-device was accepted")
+	}
+}
+
+func TestReadLoginAuthkeyStdin(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		terminal bool
+		want     string
+		wantErr  bool
+	}{
+		{name: "one token", input: "tskey-auth-example\n", want: "tskey-auth-example"},
+		{name: "empty", input: " \n\t", wantErr: true},
+		{name: "embedded whitespace", input: "tskey-auth bad", wantErr: true},
+		{name: "non-breaking space", input: "tskey-auth-\u00a0bad", wantErr: true},
+		{name: "leading non-breaking space", input: "\u00a0tskey-auth-bad\n", wantErr: true},
+		{name: "trailing non-breaking space", input: "tskey-auth-bad\u00a0\n", wantErr: true},
+		{name: "C1 control", input: "tskey-auth-\u0085bad", wantErr: true},
+		{name: "leading C1 NEL", input: "\u0085tskey-auth-bad\n", wantErr: true},
+		{name: "trailing C1 NEL", input: "tskey-auth-bad\u0085\n", wantErr: true},
+		{name: "extra newline", input: "tskey-auth-bad\n\n", wantErr: true},
+		{name: "bare carriage return", input: "tskey-auth-bad\r", wantErr: true},
+		{name: "bidi format", input: "tskey-auth-\u202ebad", wantErr: true},
+		{name: "punctuation outside token alphabet", input: "tskey-auth-bad!", wantErr: true},
+		{name: "terminal refused", input: "tskey-auth-example", terminal: true, wantErr: true},
+		{name: "bounded", input: strings.Repeat("x", maxStdinAuthkeyBytes+1), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readLoginAuthkeyStdin(strings.NewReader(tt.input), tt.terminal)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("key = %q, want %q", got, tt.want)
+			}
+			if err != nil && strings.Contains(err.Error(), tt.input) && tt.input != "" {
+				t.Fatalf("error exposed input: %v", err)
+			}
+		})
 	}
 }
 

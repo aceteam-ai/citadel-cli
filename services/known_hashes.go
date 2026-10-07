@@ -97,6 +97,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"8afe0d514760ab96a5289f1b56de278e7d57af761de716aeb76e1d41c29ebdbf": true,
 		// aceteam-ai/citadel-cli#1060: bind hatch (${CITADEL_TRANSCRIBE_BIND:-127.0.0.1}).
 		"6e6ac50fcc5b911e08931759f0e4a0f5b622b66c5d034e065adb6461e2b9daa7": true,
+		// citadel-cli#522: gated speaker diarization with retryable fallback.
+		"b5d09243cf6183c8eaae38caa0746fdf4990c0a79c5bc32502e29a14935eb82b": true,
 	},
 	"diffusers": {
 		"3f2059400959adcc0f55ea8134cb492530ca65d4faf51778a68f35d0d5d9c93a": true,

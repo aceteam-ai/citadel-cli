@@ -82,6 +82,9 @@ echo "==> Citadel CLI installed: $(${INSTALL_DIR}/${BINARY_NAME} version)"
 # Add citadel user to log-reading groups so journalctl returns entries
 # ---------------------------------------------------------------------------
 
+for group in systemd-journal adm; do
+    getent group "$group" >/dev/null || { echo "ERROR: Required log-reader group $group is missing" >&2; exit 1; }
+done
 usermod -aG systemd-journal,adm citadel
 
 # ---------------------------------------------------------------------------
@@ -95,15 +98,15 @@ chmod 755 /etc/citadel
 # Create systemd service (disabled -- first-boot enables it)
 # ---------------------------------------------------------------------------
 
-echo "==> Creating citadel-worker.service..."
+echo "==> Creating citadel-worker user service..."
 
-cat > /etc/systemd/system/citadel-worker.service << 'UNIT'
+install -d -m 755 /etc/systemd/user
+cat > /etc/systemd/user/citadel-worker.service << 'UNIT'
 [Unit]
 Description=Citadel Worker - AceTeam Sovereign Compute Agent
 Documentation=https://github.com/aceteam-ai/citadel-cli
-After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
+After=podman.socket
+Wants=podman.socket
 
 # Only start if citadel init has been run (manifest exists)
 ConditionPathExists=/etc/citadel/citadel.yaml
@@ -122,8 +125,6 @@ Restart=always
 RestartSec=10
 RestartSteps=5
 RestartMaxDelaySec=300
-User=citadel
-Group=docker
 Environment=HOME=/home/citadel
 
 # Working directory where citadel looks for its manifest
@@ -134,14 +135,16 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=citadel-worker
 
-# Generous timeout for service startup (Docker containers may take a while)
+# Generous timeout for container startup
 TimeoutStartSec=300
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 UNIT
 
 systemctl daemon-reload
+citadel_uid=$(id -u citadel)
+runuser -u citadel -- env HOME=/home/citadel XDG_RUNTIME_DIR="/run/user/${citadel_uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${citadel_uid}/bus" systemctl --user daemon-reload
 
-echo "==> citadel-worker.service created (not enabled -- first-boot will enable it)."
+echo "==> citadel-worker user service created (first-boot will enable it)."
 echo "==> Citadel CLI installation complete."

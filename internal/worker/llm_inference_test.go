@@ -533,6 +533,161 @@ func TestLLMInferenceHandler_BackendRouting(t *testing.T) {
 	})
 }
 
+func TestLLMInferenceHandler_OllamaMultimodalImages(t *testing.T) {
+	var gotReq struct {
+		Messages []struct {
+			Role    string   `json:"role"`
+			Content string   `json:"content"`
+			Images  []string `json:"images"`
+		} `json:"messages"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"described"},"done":true}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+	payload := &jobs.LLMInferencePayload{
+		Model:   "vision-model",
+		Backend: "ollama",
+		Messages: []jobs.ChatMessage{
+			{Role: "system", Content: json.RawMessage(`"describe images"`)},
+			{
+				Role: "user",
+				Content: json.RawMessage(`[` +
+					`{"type":"text","text":"first "},` +
+					`{"type":"image_url","image_url":{"url":"data:image/png;base64,cG5nMQ=="}},` +
+					`{"type":"text","text":"then second"},` +
+					`{"type":"image_url","image_url":{"url":"data:image/jpeg;charset=binary;base64,anBlZzI"}}` +
+					`]`),
+			},
+			{Role: "assistant", Content: json.RawMessage(`"prior reply"`)},
+		},
+	}
+
+	result, err := h.executeOllamaChat(context.Background(), &MockStreamWriter{}, payload)
+	if err != nil {
+		t.Fatalf("executeOllamaChat error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if len(gotReq.Messages) != 3 {
+		t.Fatalf("messages = %+v, want three messages in input order", gotReq.Messages)
+	}
+	if gotReq.Messages[0].Role != "system" || gotReq.Messages[0].Content != "describe images" || gotReq.Messages[0].Images != nil {
+		t.Errorf("system message = %+v, want unchanged text and no images", gotReq.Messages[0])
+	}
+	if gotReq.Messages[1].Role != "user" || gotReq.Messages[1].Content != "first then second" {
+		t.Errorf("multimodal message = %+v, want concatenated text in place", gotReq.Messages[1])
+	}
+	wantImages := []string{"cG5nMQ==", "anBlZzI"}
+	if len(gotReq.Messages[1].Images) != len(wantImages) {
+		t.Fatalf("images = %#v, want %#v", gotReq.Messages[1].Images, wantImages)
+	}
+	for i := range wantImages {
+		if gotReq.Messages[1].Images[i] != wantImages[i] {
+			t.Errorf("images[%d] = %q, want %q", i, gotReq.Messages[1].Images[i], wantImages[i])
+		}
+	}
+	if gotReq.Messages[2].Role != "assistant" || gotReq.Messages[2].Content != "prior reply" || gotReq.Messages[2].Images != nil {
+		t.Errorf("assistant message = %+v, want unchanged text and no images", gotReq.Messages[2])
+	}
+}
+
+func TestLLMInferenceHandler_OllamaRejectsInvalidImageURLs(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantMessage string
+	}{
+		{
+			name:        "remote URL",
+			content:     `[{"type":"image_url","image_url":{"url":"https://example.com/private.png"}}]`,
+			wantMessage: "remote image URLs are not allowed",
+		},
+		{
+			name:        "missing comma",
+			content:     `[{"type":"image_url","image_url":{"url":"data:image/png;base64"}}]`,
+			wantMessage: "missing comma separator",
+		},
+		{
+			name:        "not base64",
+			content:     `[{"type":"image_url","image_url":{"url":"data:image/png,plain"}}]`,
+			wantMessage: "must use base64 encoding",
+		},
+		{
+			name:        "non-image media type",
+			content:     `[{"type":"image_url","image_url":{"url":"data:text/plain;base64,dGV4dA=="}}]`,
+			wantMessage: "valid image type",
+		},
+		{
+			name:        "empty payload",
+			content:     `[{"type":"image_url","image_url":{"url":"data:image/png;base64,"}}]`,
+			wantMessage: "empty base64 payload",
+		},
+		{
+			name:        "malformed base64",
+			content:     `[{"type":"image_url","image_url":{"url":"data:image/png;base64,not%%%base64"}}]`,
+			wantMessage: "invalid base64",
+		},
+		{
+			name:        "missing image URL object",
+			content:     `[{"type":"image_url"}]`,
+			wantMessage: "is missing a URL",
+		},
+		{
+			name:        "malformed content parts",
+			content:     `[{"type":"image_url","image_url":"wrong-shape"}]`,
+			wantMessage: "invalid content-parts array",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := 0
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				_, _ = w.Write([]byte(`{"message":{"content":"should not run"},"done":true}`))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["ollama"] = ts.URL
+			payload := &jobs.LLMInferencePayload{
+				Model:    "vision-model",
+				Backend:  "ollama",
+				Messages: []jobs.ChatMessage{{Role: "user", Content: json.RawMessage(tc.content)}},
+			}
+			result, err := h.executeOllamaChat(context.Background(), &MockStreamWriter{}, payload)
+			if err != nil {
+				t.Fatalf("executeOllamaChat returned transport error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusFailure || result.Error == nil {
+				t.Fatalf("result = %+v, want validation failure", result)
+			}
+			if !strings.Contains(result.Error.Error(), tc.wantMessage) {
+				t.Errorf("error = %q, want substring %q", result.Error, tc.wantMessage)
+			}
+			if strings.Contains(result.Error.Error(), "private.png") || strings.Contains(result.Error.Error(), "not%%%base64") {
+				t.Errorf("error leaked image URL/payload: %q", result.Error)
+			}
+			if requests != 0 {
+				t.Errorf("engine requests = %d, want zero for invalid image input", requests)
+			}
+		})
+	}
+}
+
 // TestPromptTextFromPayload_NilSafe pins that the grounding guardrail's input
 // extraction never panics on a nil or empty payload — a defensive edge case
 // with no HTTP round-trip needed, since it's a pure function of the payload.
