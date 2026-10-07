@@ -4,6 +4,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -17,10 +18,13 @@ import (
 )
 
 var (
-	loginAuthkey   string
-	loginNodeName  string
-	loginNewDevice bool
+	loginAuthkey      string
+	loginAuthkeyStdin bool
+	loginNodeName     string
+	loginNewDevice    bool
 )
+
+const maxStdinAuthkeyBytes = 4096
 
 type persistedFabricCredentials uint8
 
@@ -33,11 +37,60 @@ const (
 type loginNetworkChoiceFn func(string) (nexus.NetworkChoice, string, error)
 type loginConnectFn func() (*network.NetworkServer, error)
 
-func validateLoginOptions(authkey string, newDevice bool) error {
+func validateLoginOptions(authkey string, authkeyStdin, newDevice bool) error {
+	if authkey != "" && authkeyStdin {
+		return fmt.Errorf("--authkey and --authkey-stdin cannot be used together")
+	}
 	if authkey != "" && newDevice {
 		return fmt.Errorf("--authkey and --new-device cannot be used together")
 	}
+	if authkeyStdin && newDevice {
+		return fmt.Errorf("--authkey-stdin and --new-device cannot be used together")
+	}
 	return nil
+}
+
+// readLoginAuthkeyStdin reads a non-interactive preauth key without placing it
+// in argv. Automation can pipe a secret file into `citadel login
+// --authkey-stdin`; argv and process listings then contain only the flag, never
+// the reusable key. Refuse terminals so a typo cannot produce an echoed secret
+// prompt, and bound the read so an accidentally redirected file is not retained
+// wholesale.
+func readLoginAuthkeyStdin(r io.Reader, isTerminal bool) (string, error) {
+	if isTerminal {
+		return "", fmt.Errorf("--authkey-stdin requires piped or redirected input; refusing to read a secret from a terminal")
+	}
+	b, err := io.ReadAll(io.LimitReader(r, maxStdinAuthkeyBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read --authkey-stdin: %w", err)
+	}
+	if len(b) > maxStdinAuthkeyBytes {
+		return "", fmt.Errorf("--authkey-stdin input exceeds %d bytes", maxStdinAuthkeyBytes)
+	}
+	// Accept only the conventional single ASCII line ending written by secret
+	// files. Do this on bytes before token validation: strings.TrimSpace would
+	// silently discard Unicode whitespace such as NBSP and C1 NEL at the edges.
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+		if len(b) > 0 && b[len(b)-1] == '\r' {
+			b = b[:len(b)-1]
+		}
+	}
+	key := string(b)
+	if key == "" {
+		return "", fmt.Errorf("--authkey-stdin input is empty")
+	}
+	// Headscale preauth keys use an ASCII alphanumeric/hyphen alphabet. Keep
+	// this deliberately stricter than a whitespace check: Unicode spaces
+	// (NBSP), C1 controls, bidi/format characters, and other invisible bytes
+	// must not survive as a visually plausible but different credential.
+	if strings.IndexFunc(key, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-')
+	}) >= 0 {
+		return "", fmt.Errorf("--authkey-stdin must contain one ASCII alphanumeric/hyphen token")
+	}
+	return key, nil
 }
 
 // selectLoginNetworkChoice makes --new-device authoritative. In particular,
@@ -126,19 +179,32 @@ var loginCmd = &cobra.Command{
 	Long: `Connects this machine to your AceTeam network. If already connected, it does
 nothing. Otherwise, it interactively prompts for an authentication method.
 
-Use --authkey for non-interactive authentication (ideal for automation).`,
+Use --authkey for non-interactive authentication. Automation that handles a
+reusable secret should prefer --authkey-stdin so the key never appears in argv.`,
 	Example: `  # Interactive login (prompts for auth method)
   citadel login
 
   # Non-interactive login with authkey (for automation)
   citadel login --authkey tskey-auth-xxx
 
-  # Override the node name
-  citadel login --authkey tskey-auth-xxx --node-name my-gpu-server`,
+  # Keep a reusable key out of process listings
+  citadel login --authkey-stdin --node-name my-gpu-server < /run/secrets/citadel-authkey`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if err := validateLoginOptions(loginAuthkey, loginNewDevice); err != nil {
+		if err := validateLoginOptions(loginAuthkey, loginAuthkeyStdin, loginNewDevice); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			os.Exit(1)
+		}
+		if loginAuthkeyStdin {
+			stdinInfo, err := os.Stdin.Stat()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ inspect --authkey-stdin input: %v\n", err)
+				os.Exit(1)
+			}
+			loginAuthkey, err = readLoginAuthkeyStdin(os.Stdin, stdinInfo.Mode()&os.ModeCharDevice != 0)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 		// Refuse an explicit --nexus that differs from the control plane this
@@ -468,6 +534,7 @@ func runInteractiveLogin() {
 func init() {
 	rootCmd.AddCommand(loginCmd)
 	loginCmd.Flags().StringVar(&loginAuthkey, "authkey", "", "Pre-generated authkey for non-interactive login")
+	loginCmd.Flags().BoolVar(&loginAuthkeyStdin, "authkey-stdin", false, "Read a pre-generated authkey from stdin (keeps it out of argv)")
 	loginCmd.Flags().StringVar(&loginNodeName, "node-name", "", "Override the node name (defaults to hostname)")
 	loginCmd.Flags().BoolVar(&loginNewDevice, "new-device", false, "Force fresh registration, ignoring any existing machine mapping")
 }
