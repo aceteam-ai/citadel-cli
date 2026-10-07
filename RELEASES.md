@@ -2876,3 +2876,23 @@ Auto-generated log of every release.
   - feat(files): support bounded chunk reads for Drive ingestion
 
 
+---
+
+## v2.181.0 — 2026-10-06
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 37 |
+| Lines added | +4612 |
+
+**Changes:**
+
+  - docs(desktop): propose pinned chat and local model bootstrap (#1234)
+  - feat(installer): provision fresh Linux nodes with rootless Podman (#1142)
+  - docs: record the implemented generic inference server ADR (#1007)
+  - fix(ollama): forward inline chat images (#1231)
+  - feat(meeting): add bot->room virtual-mic speaking path (#665)
+  - fix(update): normalize pending version prefix (#1221)
+
+
