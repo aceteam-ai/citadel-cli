@@ -35,6 +35,14 @@ const reconnectTimeout = 10 * time.Second
 // (issue #246).
 const reconnectAttempts = 3
 
+// recoveryReauthTimeout bounds the IP-preserving reauth (ReconnectWithAuthKey)
+// in recoverStaleVPN's Attempt 1. It must exceed waitForConnection's own 60s cap
+// so a slow-but-reachable control plane can complete the reattach with the
+// preserved machine key, rather than timing out early and (post-#1235) refusing
+// the recovery. Distinct from reconnectTimeout, which deliberately keeps
+// VerifyOrReconnect's no-authkey probe short and retried.
+const recoveryReauthTimeout = 75 * time.Second
+
 var (
 	globalServer *NetworkServer
 	globalMu     sync.RWMutex
@@ -426,7 +434,7 @@ func ReconnectWithAuthKey(ctx context.Context, authKey string) (bool, error) {
 	}
 
 	srv := NewServer(config)
-	reconnectCtx, cancel := context.WithTimeout(ctx, reconnectTimeout)
+	reconnectCtx, cancel := context.WithTimeout(ctx, recoveryReauthTimeout)
 	defer cancel()
 
 	if err := srv.Connect(reconnectCtx, authKey); err != nil {
