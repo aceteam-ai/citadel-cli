@@ -399,37 +399,17 @@ func runControlCenter() {
 					if apiBaseURL == "" {
 						apiBaseURL = authServiceURL
 					}
-					if freshKey, fetchErr := network.FetchFreshAuthkey(ctx, apiBaseURL, deviceConfig.DeviceAPIToken); fetchErr != nil {
-						cc.AddActivity("warning", fmt.Sprintf("Auto-recovery failed: %v", fetchErr))
+					// Route through the single shared recovery policy
+					// (cmd/reconnect.go) with churn disabled: this unattended TUI
+					// path must never re-register the node under a new identity
+					// (issue #1235). On a stale key it reattaches with the
+					// preserved machine key or refuses, never ClearState().
+					hostname := getWorkHostname()
+					if result := recoverStaleVPN(ctx, deviceConfig, hostname, apiBaseURL, false); result.Connected {
+						cc.AddActivity("success", "VPN reconnected")
+						networkConnected = true
 					} else {
-						// Try reconnect with existing state (preserves IP)
-						if ok, reconnErr := network.ReconnectWithAuthKey(ctx, freshKey); reconnErr == nil && ok {
-							cc.AddActivity("success", "VPN reconnected (IP preserved)")
-							networkConnected = true
-						} else {
-							// Clear state and connect fresh (new IP) — IDENTITY-CHURN
-							// path. Warn loudly (same reasoning as recoverStaleVPN): the
-							// persisted identity could not be re-authorized, so the node
-							// re-registers with a new id/IP/device key. Root cause is
-							// usually ephemeral registration; durable fix is #4584/#4583.
-							hostname, _ := os.Hostname()
-							warnIdentityChurn(hostname)
-							cc.AddActivity("warning", "Node identity reset (new id/IP); re-run 'citadel init' to stop churn")
-							_ = network.ClearState()
-							freshCtx, freshCancel := context.WithTimeout(ctx, 15*time.Second)
-							config := network.ServerConfig{
-								Hostname:   hostname,
-								ControlURL: network.ResolveControlURL(),
-								AuthKey:    freshKey,
-							}
-							if _, connectErr := network.Connect(freshCtx, config); connectErr == nil {
-								cc.AddActivity("success", "VPN reconnected (fresh state)")
-								networkConnected = true
-							} else {
-								cc.AddActivity("warning", fmt.Sprintf("VPN recovery failed: %v", connectErr))
-							}
-							freshCancel()
-						}
+						cc.AddActivity("warning", fmt.Sprintf("VPN recovery failed: %v", result.Err))
 					}
 				} else {
 					cc.AddActivity("warning", "VPN keys expired, login required")
