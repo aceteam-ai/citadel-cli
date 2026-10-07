@@ -1,6 +1,7 @@
 name: Build whisper-service image
 
-# Builds and publishes the node-local faster-whisper STT sidecar to GHCR as
+# Builds and publishes the node-local transcription and speaker-diarization
+# sidecar to GHCR as
 # ghcr.io/aceteam-ai/whisper-service. The node compose file
 # (services/compose/transcribe.yml) pulls this image when a node provisions the
 # "transcribe" runtime via SERVICE_START, so the image MUST exist in the
@@ -13,6 +14,11 @@ name: Build whisper-service image
 # commit SHA for pinning/rollback.
 on:
   push:
+    branches: [main]
+    paths:
+      - "services/whisper-service/**"
+      - ".github/workflows/build-whisper-service.yml"
+  pull_request:
     branches: [main]
     paths:
       - "services/whisper-service/**"
@@ -41,6 +47,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -52,7 +59,9 @@ jobs:
         with:
           context: services/whisper-service
           file: services/whisper-service/Dockerfile
-          push: true
+          # PRs build the complete hash-locked image without publishing it.
+          # Main and manual runs publish immutable SHA plus latest tags.
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.sha }}
