@@ -74,6 +74,7 @@ const (
 // meeting transcribe rides MEETING_JOIN's own long tier and is unaffected.
 var longSessionJobTypes = map[string]struct{}{
 	JobTypeMeetingJoin:     {},
+	JobTypeHuddleJoin:      {},
 	JobTypeCobrowse:        {},
 	JobTypeTranscribeAudio: {},
 }

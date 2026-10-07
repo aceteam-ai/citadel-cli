@@ -140,8 +140,8 @@ func newTestHuddleHandler(deviceToken string, mint func(ctx context.Context, api
 			return "77777777-7777-4777-8777-777777777777", nil
 		},
 		confirmNodeTeardown: func(context.Context, *url.URL, string, huddleJoinParams, string) error { return nil },
-		newBrowser: func(ctx context.Context, p huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
-			return br, func(context.Context) error { return br.Close() }, nil
+		newBrowser: func(ctx context.Context, p huddleJoinParams, _ time.Duration) (huddleBrowser, converseMedia, func(context.Context) error, error) {
+			return br, nil, func(context.Context) error { return br.Close() }, nil
 		},
 		connectTimeout: 200 * time.Millisecond,
 		pollInterval:   2 * time.Millisecond,
@@ -633,9 +633,9 @@ func TestHuddleJoin_CancelledAfterMintNeverLaunchesBrowser(t *testing.T) {
 		cancel()
 		return huddleToken{Token: "bot", ChannelID: huddleTestChannelID, SelfID: huddleTestAgentID, SelfKind: "agent", CallID: huddleTestCallID, AttemptID: huddleTestAttemptID}, nil
 	}, &fakeHuddleBrowser{})
-	h.newBrowser = func(context.Context, huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
+	h.newBrowser = func(context.Context, huddleJoinParams, time.Duration) (huddleBrowser, converseMedia, func(context.Context) error, error) {
 		launched = true
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	_, err := h.Execute(JobContext{Ctx: jobCtx}, huddleJob())
@@ -766,13 +766,13 @@ func TestHuddleJoin_RedeliveryRetainsDebtUntilNodeCleanupIsConfirmed(t *testing.
 	}
 	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), first)
 	launches := 0
-	h.newBrowser = func(context.Context, huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
+	h.newBrowser = func(context.Context, huddleJoinParams, time.Duration) (huddleBrowser, converseMedia, func(context.Context) error, error) {
 		launches++
 		br := first
 		if launches == 2 {
 			br = second
 		}
-		return br, func(context.Context) error { return br.Close() }, nil
+		return br, nil, func(context.Context) error { return br.Close() }, nil
 	}
 	var terminalStatuses []string
 	h.prepareTerminalIntent = func(_ context.Context, _ *url.URL, _ string, _ huddleJoinParams, status, _ string) error {
@@ -791,8 +791,8 @@ func TestHuddleJoin_RedeliveryRetainsDebtUntilNodeCleanupIsConfirmed(t *testing.
 
 func TestHuddleJoin_LaunchFailureRetainsDebtWhenFinalDeleteFails(t *testing.T) {
 	h := newTestHuddleHandler("device-token", okMint(huddleToken{Token: "bot", ChannelID: "c"}), &fakeHuddleBrowser{})
-	h.newBrowser = func(context.Context, huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
-		return nil, func(context.Context) error { return errors.New("delete returned 500") }, errors.New("clear stale meetingd session")
+	h.newBrowser = func(context.Context, huddleJoinParams, time.Duration) (huddleBrowser, converseMedia, func(context.Context) error, error) {
+		return nil, nil, func(context.Context) error { return errors.New("delete returned 500") }, errors.New("clear stale meetingd session")
 	}
 	terminalCalls := 0
 	h.prepareTerminalIntent = func(context.Context, *url.URL, string, huddleJoinParams, string, string) error {
@@ -892,6 +892,132 @@ func TestReportHuddleTerminalRedactsCredentialAndRefusesRedirect(t *testing.T) {
 	}
 	if leakedAuth != "" {
 		t.Fatalf("credential leaked to redirect destination: %q", leakedAuth)
+	}
+}
+
+func TestHuddleJoin_ConverseUsesMintedTokenContractAndFailsClosed(t *testing.T) {
+	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}}
+	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	h := newTestHuddleHandler("device-token", okMint(huddleToken{
+		Token: "act_bot", ChannelID: huddleTestChannelID, ExpiresAt: expires,
+	}), br)
+	called := false
+	ready := false
+	h.acknowledgeReady = func(context.Context, *url.URL, huddleToken, huddleBotState) error {
+		ready = true
+		return nil
+	}
+	h.runConverse = func(_ JobContext, _ huddleBrowser, _ converseMedia, apiBase *url.URL, tok huddleToken, p huddleJoinParams, stopAt time.Time) (converseStats, error) {
+		called = true
+		if !ready {
+			t.Fatal("resident bridge started before exact lifecycle readiness was acknowledged")
+		}
+		if apiBase.String() != "https://aceteam.ai" || tok.Token != "act_bot" || !p.Converse {
+			t.Fatalf("converse auth contract = base %q token %q params %+v", apiBase, tok.Token, p)
+		}
+		wantStopAt, _ := huddleTokenStopAt(tok)
+		if stopAt.Sub(wantStopAt).Abs() > time.Second {
+			t.Fatalf("converse stopAt = %v, want token boundary %v", stopAt, wantStopAt)
+		}
+		return converseStats{StopReason: "bot left the call"}, nil
+	}
+	job := huddleJob()
+	job.Payload["converse"] = "true"
+	out, err := h.Execute(JobContext{}, job)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !called || !strings.Contains(string(out), `"converse"`) {
+		t.Fatalf("converse not invoked/reported: called=%v out=%s", called, out)
+	}
+
+	br2 := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}}
+	h2 := newTestHuddleHandler("device-token", okMint(huddleToken{
+		Token: "act_bot", ChannelID: huddleTestChannelID, ExpiresAt: expires,
+	}), br2)
+	h2.runConverse = func(JobContext, huddleBrowser, converseMedia, *url.URL, huddleToken, huddleJoinParams, time.Time) (converseStats, error) {
+		return converseStats{}, errors.New("realtime auth rejected")
+	}
+	job2 := huddleJob()
+	job2.Payload["converse"] = "true"
+	out, err = h2.Execute(JobContext{}, job2)
+	if err == nil || !strings.Contains(err.Error(), "realtime auth rejected") || out != nil {
+		t.Fatalf("Execute = out %s err %v, want hard converse failure and no joined result", out, err)
+	}
+	if !br2.closed {
+		t.Fatal("failed converse did not clean up meeting session")
+	}
+}
+
+func TestHuddleJoin_ConverseCancellationReportsExactAttemptCancelled(t *testing.T) {
+	br := &fakeHuddleBrowser{states: []string{stateJSON("joined", huddleTestAgentID, 1, 1)}}
+	expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	h := newTestHuddleHandler("device-token", okMint(huddleToken{
+		Token: "act_bot", ChannelID: huddleTestChannelID, ExpiresAt: expires,
+	}), br)
+	h.runConverse = func(JobContext, huddleBrowser, converseMedia, *url.URL, huddleToken, huddleJoinParams, time.Time) (converseStats, error) {
+		return converseStats{}, context.Canceled
+	}
+	var terminalStatus string
+	var terminalAttempt string
+	h.prepareTerminalIntent = func(_ context.Context, _ *url.URL, _ string, p huddleJoinParams, status, _ string) error {
+		terminalStatus = status
+		terminalAttempt = p.AttemptID
+		return nil
+	}
+	job := huddleJob()
+	job.Payload["converse"] = "true"
+
+	out, err := h.Execute(JobContext{}, job)
+	if !errors.Is(err, context.Canceled) || out != nil {
+		t.Fatalf("Execute = out %s err %v, want cancelled resident attempt", out, err)
+	}
+	if terminalStatus != "cancelled" || terminalAttempt != huddleTestAttemptID {
+		t.Fatalf("terminal = %q attempt %q, want cancelled/%s", terminalStatus, terminalAttempt, huddleTestAttemptID)
+	}
+	if !br.closed {
+		t.Fatal("cancelled resident conversation did not clean up meeting session")
+	}
+}
+
+func TestPostJoinHuddleStateMissingFailsClosed(t *testing.T) {
+	check := postJoinHuddleStateCheck(&fakeHuddleBrowser{states: []string{""}})
+	ended, reason, err := check(context.Background())
+	if ended || reason != "" {
+		t.Fatalf("missing state = (%v, %q), want non-terminal error", ended, reason)
+	}
+	if err == nil || !strings.Contains(err.Error(), "state disappeared") {
+		t.Fatalf("missing post-join state error = %v", err)
+	}
+}
+
+func TestHuddleSessionDurationCapsConverseToTokenExpiry(t *testing.T) {
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	got, err := huddleSessionDuration(huddleJoinParams{Converse: true}, huddleToken{
+		ExpiresAt: now.Add(time.Hour).Format(time.RFC3339),
+	}, now)
+	if err != nil {
+		t.Fatalf("huddleSessionDuration: %v", err)
+	}
+	if want := time.Hour - huddleTokenExpiryMargin; got != want {
+		t.Fatalf("duration = %v, want token-bound %v", got, want)
+	}
+	for _, expiry := range []string{"", "not-a-time", now.Add(20 * time.Second).Format(time.RFC3339)} {
+		if _, err := huddleSessionDuration(huddleJoinParams{Converse: true}, huddleToken{ExpiresAt: expiry}, now); err == nil {
+			t.Fatalf("expiry %q unexpectedly accepted", expiry)
+		}
+	}
+	if got, err := huddleSessionDuration(huddleJoinParams{}, huddleToken{}, now); err != nil || got != huddleSessionMaxDuration {
+		t.Fatalf("plain duration = %v, %v", got, err)
+	}
+}
+
+func TestParseHuddleJoinParamsRejectsInvalidConverse(t *testing.T) {
+	p := huddleJob().Payload
+	p["converse"] = "sometimes"
+	_, err := parseHuddleJoinParams(huddleTestJobID, "HUDDLE_JOIN", p)
+	if err == nil || !strings.Contains(err.Error(), "must be true or false") {
+		t.Fatalf("parse error = %v", err)
 	}
 }
 
@@ -1137,8 +1263,8 @@ func TestHuddleJoin_OrdersIntentAuthorizeDeleteConfirm(t *testing.T) {
 		order = append(order, "authorize")
 		return "88888888-8888-4888-8888-888888888888", nil
 	}
-	h.newBrowser = func(context.Context, huddleJoinParams) (huddleBrowser, func(context.Context) error, error) {
-		return br, func(context.Context) error {
+	h.newBrowser = func(context.Context, huddleJoinParams, time.Duration) (huddleBrowser, converseMedia, func(context.Context) error, error) {
+		return br, nil, func(context.Context) error {
 			order = append(order, "delete")
 			return nil
 		}, nil

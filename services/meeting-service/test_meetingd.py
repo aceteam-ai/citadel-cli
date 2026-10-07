@@ -10,6 +10,8 @@ Run:  python3 -m pytest services/meeting-service/test_meetingd.py
 
 from __future__ import annotations
 
+import io
+import json
 import math
 import os
 import shutil
@@ -306,6 +308,70 @@ def test_mic_arg_builders():
     assert "--rate=24000" in pc
     assert "--channels=1" in pc
 
+    # The room->bot HEAR path RECORDS the per-session monitor to stdout.
+    cap = meetingd.build_pacat_capture_args("citadel_meeting_abc.monitor", 24000, 1)
+    assert cap[0] == "pacat"
+    assert "--record" in cap
+    assert "--playback" not in cap
+    assert "--device=citadel_meeting_abc.monitor" in cap
+    assert "--format=s16le" in cap
+    assert "--rate=24000" in cap
+    assert "--channels=1" in cap
+
+
+def test_capture_pcm_stream_is_session_scoped_and_reaped(monkeypatch):
+    session = SimpleNamespace(
+        lock=threading.Lock(),
+        ending=False,
+        sink_name="citadel_meeting_s1",
+        capture_process=None,
+    )
+    monkeypatch.setattr(meetingd, "_get_session", lambda sid: session if sid == "s1" else None)
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+
+    class CaptureProcess(_FakeProcess):
+        def __init__(self):
+            super().__init__()
+            self.stdout = io.BytesIO(b"\x01\x02\x03\x04")
+
+    proc = CaptureProcess()
+    popen_args: list[list[str]] = []
+
+    def fake_popen(args, **kwargs):
+        popen_args.append(args)
+        assert kwargs["stdout"] is subprocess.PIPE
+        return proc
+
+    monkeypatch.setattr(meetingd.subprocess, "Popen", fake_popen)
+    with TestClient(meetingd.app) as client:
+        response = client.get("/sessions/s1/capture/pcm?rate=24000&channels=1")
+    assert response.status_code == 200
+    assert response.content == b"\x01\x02\x03\x04"
+    assert "--device=citadel_meeting_s1.monitor" in popen_args[0]
+    assert proc.terminated is True
+    assert session.capture_process is None
+
+
+def test_capture_pcm_rejects_wrong_ending_and_duplicate_sessions(monkeypatch):
+    monkeypatch.setattr(
+        meetingd,
+        "pulse_ready",
+        lambda: pytest.fail("invalid session must be rejected before probing Pulse"),
+    )
+    monkeypatch.setattr(meetingd, "_get_session", lambda _: None)
+    assert meetingd.capture_pcm("missing").status_code == 404
+
+    running = _FakeProcess()
+    session = SimpleNamespace(
+        lock=threading.Lock(), ending=True, sink_name="sink", capture_process=None
+    )
+    monkeypatch.setattr(meetingd, "_get_session", lambda _: session)
+    assert meetingd.capture_pcm("s1").status_code == 409
+    session.ending = False
+    session.capture_process = running
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    assert meetingd.capture_pcm("s1").status_code == 409
+
 
 def test_mic_play_503_when_mic_absent(monkeypatch, mic_session):
     """The speaking endpoints refuse (503) when the virtual mic is not present, so a
@@ -556,6 +622,70 @@ class _FakeProcess:
         return self.returncode
 
 
+def test_mic_stop_terminates_only_active_playback_and_is_idempotent(monkeypatch):
+    mic = _FakeProcess()
+    session = SimpleNamespace(lock=threading.Lock(), ending=False, mic_process=mic)
+    monkeypatch.setattr(
+        meetingd,
+        "_get_session",
+        lambda session_id: session if session_id == "s1" else None,
+    )
+    stopped = meetingd.mic_stop("s1")
+    again = meetingd.mic_stop("s1")
+    missing = meetingd.mic_stop("missing")
+    assert stopped.status_code == 200
+    assert json.loads(stopped.body) == {"stopped": True}
+    assert mic.terminated is True and mic.killed is False
+    assert session.mic_process is None
+    assert again.status_code == 200 and json.loads(again.body) == {"stopped": False}
+    assert missing.status_code == 404
+
+
+def test_mic_stop_waits_for_playback_lock_release_before_next_play(monkeypatch):
+    session = SimpleNamespace(lock=threading.Lock(), ending=False, mic_process=None)
+    monkeypatch.setattr(meetingd, "_get_session", lambda _: session)
+    monkeypatch.setattr(meetingd, "pulse_ready", lambda: True)
+    monkeypatch.setattr(meetingd, "virtual_mic_present", lambda: True)
+    started = threading.Event()
+    first = _FakeProcess()
+    calls = 0
+
+    def play(_session, _pcm, _rate, _channels):
+        nonlocal calls
+        calls += 1
+        if calls != 1:
+            return
+        with session.lock:
+            session.mic_process = first
+        started.set()
+        while not first.terminated:
+            threading.Event().wait(0.001)
+        # Deliberately retain the request/global mic lock briefly after process
+        # exit; mic_stop must not return until this handler's finally releases it.
+        threading.Event().wait(0.02)
+        with session.lock:
+            if session.mic_process is first:
+                session.mic_process = None
+
+    monkeypatch.setattr(meetingd, "_play_pcm_into_mic", play)
+    first_done = threading.Event()
+
+    def run_first():
+        meetingd._mic_play_pcm_response(session, b"\x00\x00", 24000, 1)
+        first_done.set()
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert started.wait(timeout=1)
+    stopped = meetingd.mic_stop("s1")
+    assert stopped.status_code == 200
+    assert first_done.wait(timeout=1)
+    second = meetingd._mic_play_pcm_response(session, b"\x00\x00", 24000, 1)
+    thread.join(timeout=1)
+    assert second.status_code == 200
+    assert calls == 2
+
+
 def test_teardown_cancels_active_mic_process_without_holding_session_lock(monkeypatch):
     mic = _FakeProcess()
     session = meetingd.Session(
@@ -576,6 +706,47 @@ def test_teardown_cancels_active_mic_process_without_holding_session_lock(monkey
     assert mic.killed is False
     assert session.mic_process is None
     assert unloaded == ["7"]
+
+
+def test_teardown_cancels_active_capture_process(monkeypatch):
+    capture = _FakeProcess()
+    session = meetingd.Session(
+        session_id="s1",
+        sink_name="sink",
+        sink_module_id="7",
+        chrome=_FakeProcess(running=False),
+        cdp_port=9223,
+        created_at=0,
+        max_duration_seconds=60,
+        capture_process=capture,
+    )
+    monkeypatch.setattr(meetingd, "_unload_module", lambda _: None)
+    meetingd._teardown(session)
+    assert capture.terminated is True
+    assert session.capture_process is None
+
+
+def test_capture_process_stop_has_single_atomic_owner():
+    capture = _FakeProcess()
+    session = meetingd.Session(
+        session_id="s1",
+        sink_name="sink",
+        sink_module_id="7",
+        chrome=_FakeProcess(running=False),
+        cdp_port=9223,
+        created_at=0,
+        max_duration_seconds=60,
+        capture_process=capture,
+    )
+    # Stream-finally and teardown may race, but only one can detach/stop the
+    # process. The loser observes no registered child and does nothing.
+    first = meetingd._claim_capture_process(session, capture)
+    second = meetingd._claim_capture_process(session)
+    assert first is capture
+    assert second is None
+    meetingd._stop_capture_process(first)
+    assert capture.terminated is True
+    assert session.capture_process is None
 
 
 def test_end_session_reserves_slot_until_teardown_finishes(monkeypatch):
