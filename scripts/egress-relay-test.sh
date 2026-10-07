@@ -23,7 +23,11 @@ DRY_RUN=0
 RUN_ID="$(date +%s)-$$"
 RELAY_NODE_NAME="egress-relay-test-relay-${RUN_ID}"
 CLIENT_NODE_NAME="egress-relay-test-client-${RUN_ID}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ${BASH_SOURCE[0]:-$0}: BASH_SOURCE is unset when the helper prefix is executed
+# via `bash -c` (the egress_relay_harness_test.go probes), which otherwise trips
+# `set -u` here and aborts before any helper runs. Falls back to $0; a normal
+# `bash egress-relay-test.sh` invocation still resolves BASH_SOURCE unchanged.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR=""
 CLEANUP_DONE=0
