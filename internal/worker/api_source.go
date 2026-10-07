@@ -483,6 +483,40 @@ func (s *APISource) Nack(ctx context.Context, job *Job, err error) error {
 	return nil
 }
 
+func (s *APISource) DeferHuddleTeardown(ctx context.Context, job *Job, err error) error {
+	return s.AckHuddleCoordinatorTerminal(ctx, job)
+}
+
+func (s *APISource) AckHuddleCoordinatorTerminal(ctx context.Context, job *Job) error {
+	queue := job.SourceQueue
+	if queue == "" {
+		if qs := s.snapshotQueues(); len(qs) > 0 {
+			queue = qs[0]
+		}
+	}
+	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
+		Queue: queue, Group: s.config.ConsumerGroup, MessageID: job.MessageID,
+	})
+}
+
+func (s *APISource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err error) error {
+	if statusErr := s.client.SetJobStatus(ctx, job.ID, "retry", map[string]any{
+		"reason": "huddle_terminal_intent_pending",
+		"error":  err.Error(),
+	}); statusErr != nil {
+		return statusErr
+	}
+	queue := job.SourceQueue
+	if queue == "" {
+		if qs := s.snapshotQueues(); len(qs) > 0 {
+			queue = qs[0]
+		}
+	}
+	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
+		Queue: queue, Group: s.config.ConsumerGroup, MessageID: job.MessageID,
+	})
+}
+
 // Fail is a terminal failure: record "failed" status (with structured data) and
 // ACK the message so it is removed from the consumer group's PEL. Used for
 // failures that will never succeed on retry (e.g. an unsupported job type).

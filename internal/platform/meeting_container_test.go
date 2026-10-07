@@ -1,6 +1,14 @@
 package platform
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
 
 // TestRewriteLoopbackWSPort is the load-bearing unit for the container CDP path
 // (#514): a containerized Chrome advertises its container-internal debug port in
@@ -74,5 +82,47 @@ func TestNewCDPBrowserSatisfiesInterface(t *testing.T) {
 	}
 	if err := b.Close(); err != nil {
 		t.Errorf("CDPBrowser.Close() = %v, want nil (meetingd owns the process)", err)
+	}
+}
+
+func TestCDPBrowserContextMethodsCancelBlockedTargetProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*CDPBrowser, context.Context) error
+	}{
+		{name: "navigate", call: func(b *CDPBrowser, ctx context.Context) error {
+			return b.NavigateContext(ctx, "https://aceteam.ai/huddle-bot/c")
+		}},
+		{name: "evaluate", call: func(b *CDPBrowser, ctx context.Context) error {
+			_, err := b.EvaluateContext(ctx, "1")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{}, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				started <- struct{}{}
+				<-r.Context().Done()
+			}))
+			defer srv.Close()
+			port := srv.Listener.Addr().(*net.TCPAddr).Port
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- tc.call(NewCDPBrowser(port), ctx) }()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("CDP target probe did not start")
+			}
+			cancel()
+			select {
+			case err := <-result:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("context method error = %v, want context.Canceled", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("CDP context method did not wake on cancellation")
+			}
+		})
 	}
 }

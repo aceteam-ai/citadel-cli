@@ -16,10 +16,11 @@ import (
 // LegacyHandlerAdapter wraps a jobs.JobHandler to implement worker.JobHandler.
 // This allows existing handlers to work with the new worker abstraction.
 type LegacyHandlerAdapter struct {
-	jobType string
-	handler jobs.JobHandler
-	logFn   func(level, msg string)
-	enabled func() bool
+	jobType         string
+	handler         jobs.JobHandler
+	logFn           func(level, msg string)
+	enabled         func() bool
+	backgroundOwner bool
 }
 
 // newGatedLegacyHandlerAdapter creates an adapter whose dispatchability follows
@@ -35,8 +36,9 @@ func newGatedLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, enabl
 // NewLegacyHandlerAdapter creates an adapter for an existing job handler.
 func NewLegacyHandlerAdapter(jobType string, handler jobs.JobHandler) *LegacyHandlerAdapter {
 	return &LegacyHandlerAdapter{
-		jobType: jobType,
-		handler: handler,
+		jobType:         jobType,
+		handler:         handler,
+		backgroundOwner: true,
 	}
 }
 
@@ -48,6 +50,15 @@ func (a *LegacyHandlerAdapter) SetLogFn(logFn func(level, msg string)) {
 // CanHandle returns true if this adapter handles the given job type.
 func (a *LegacyHandlerAdapter) CanHandle(jobType string) bool {
 	return a.jobType == jobType && (a.enabled == nil || a.enabled())
+}
+
+func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
+	if !a.backgroundOwner {
+		return
+	}
+	if background, ok := a.handler.(interface{ RunBackground(context.Context) }); ok {
+		background.RunBackground(ctx)
+	}
 }
 
 // Execute processes the job using the wrapped legacy handler.
@@ -94,7 +105,6 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 			}
 		}
 	}
-
 	// Execute the legacy handler with log callback. Thread the worker context so
 	// handlers that shell out (e.g. SHELL_COMMAND) honor a per-job deadline or
 	// cancellation and actually terminate their child process (aceteam#6000).
@@ -190,6 +200,11 @@ type LegacyHandlerOpts struct {
 	// handlers stay registered behind a per-dispatch fail-closed gate so both
 	// capability advertisement and execution track permission revocation.
 	FilesEnabled func() bool
+	// MeetingEnabled is the live meeting-permission source. When nil the
+	// persisted meeting configuration is loaded for each dispatch. Tests may
+	// inject it to prove that disabling new joins does not disable exact-attempt
+	// teardown recovery.
+	MeetingEnabled func() bool
 	// GOOS overrides the host OS for handler-registration tests. Empty uses the
 	// running binary's OS.
 	GOOS string
@@ -407,6 +422,29 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			)
 		}
 	}
+
+	// Native-huddle agent join (aceteam#7081). Part of the SAME default-on meeting
+	// capability as MEETING_JOIN, but registered OUTSIDE the workspace gate above:
+	// HUDDLE_JOIN records nothing (join + presence confirmation only), so it needs
+	// no workspace — a meeting-enabled node without a configured workspace must
+	// still take it. It drives the meeting-service container's headless Chromium to
+	// the aceteam huddle-bot page over CDP.
+	// Always register the adapter so its restart-safe lifecycle outbox remains
+	// owned by the Runner lifespan even after meeting work is disabled. The live
+	// gate still removes HUDDLE_JOIN from dispatchability/capability advertising.
+	huddleHandler := jobs.NewHuddleJoinHandler(opts.WorkspaceDir)
+	huddleTeardown := NewLegacyHandlerAdapter(JobTypeHuddleTeardown, huddleHandler)
+	huddleTeardown.backgroundOwner = false
+	meetingEnabled := opts.MeetingEnabled
+	if meetingEnabled == nil {
+		meetingEnabled = func() bool {
+			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
+		}
+	}
+	handlers = append(handlers,
+		newGatedLegacyHandlerAdapter(JobTypeHuddleJoin, huddleHandler, meetingEnabled),
+		huddleTeardown,
+	)
 
 	// Register service-management handlers when a config directory is available.
 	if opts.ConfigDir != "" {

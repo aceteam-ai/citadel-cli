@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 // Fallback per-job execution budgets (issue #548). PR #552 added an OPT-IN
@@ -422,6 +424,12 @@ type deadlineExceededError struct {
 	timeout time.Duration
 }
 
+// huddleCancellationDrainTimeout bounds how long the watchdog waits for a
+// cancelled HUDDLE_JOIN handler to finish its own bounded meetingd teardown.
+// Returning before that result is known would let executeJob ACK cancellation
+// while node teardown was still failed or in flight. Package-var for tests.
+var huddleCancellationDrainTimeout = 35 * time.Second
+
 func (e *deadlineExceededError) Error() string {
 	return fmt.Sprintf(
 		"job exceeded its execution deadline of %s and was abandoned by the worker",
@@ -477,6 +485,24 @@ func (r *Runner) executeWithDeadline(
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			r.log("error", "Job %s abandoned: exceeded execution deadline of %s", job.ID, timeout)
 			return nil, &deadlineExceededError{timeout: timeout}
+		}
+		if job.Type == JobTypeHuddleJoin {
+			// HUDDLE_JOIN owns a deterministic node session. Its handler observes
+			// cancellation and performs a bounded DELETE before returning. Preserve
+			// that result so executeJob can Nack teardown debt rather than ACKing
+			// cancellation while an orphan remains. If the handler itself wedges,
+			// ownership is unknown: the handler may be wedged before it persisted
+			// local debt or established server intent. Surface outbox-unavailable so
+			// executeJob Nacks; teardown-pending would raw-ACK on production sources
+			// and could lose the only delivery.
+			timer := time.NewTimer(huddleCancellationDrainTimeout)
+			defer timer.Stop()
+			select {
+			case hr := <-done:
+				return hr.result, hr.err
+			case <-timer.C:
+				return nil, errors.Join(execCtx.Err(), jobs.ErrHuddleLifecycleOutboxUnavailable)
+			}
 		}
 		// Parent context cancelled (worker shutdown): surface the raw error so
 		// the loop unwinds without misreporting a deadline breach.

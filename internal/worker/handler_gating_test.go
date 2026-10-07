@@ -80,6 +80,18 @@ func TestFreshNode_StillServesInferenceAndMeeting(t *testing.T) {
 	}
 }
 
+func TestMeetingDisabled_RefusesNewHuddleJoinButRetainsTeardownRecovery(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		MeetingEnabled: func() bool { return false },
+	})
+	if anyHandles(handlers, JobTypeHuddleJoin) {
+		t.Fatal("meeting-disabled node must not advertise or admit HUDDLE_JOIN")
+	}
+	if !anyHandles(handlers, JobTypeHuddleTeardown) {
+		t.Fatal("meeting-disabled node must retain exact-attempt HUDDLE_TEARDOWN recovery")
+	}
+}
+
 // TestEnabledNode_RegistersSensitiveHandlers confirms opting in (Desktop/Files
 // enabled) restores the handlers.
 func TestEnabledNode_RegistersSensitiveHandlers(t *testing.T) {
