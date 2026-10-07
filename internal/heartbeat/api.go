@@ -33,6 +33,7 @@ type APIPublisher struct {
 	client          *redisapi.Client
 	nodeID          string
 	headscaleNodeID string // Headscale numeric node ID (e.g., "758")
+	stableNodeID    string // durable machine-convergent identity fingerprint (#1235)
 	orgID           string
 	agentVersion    string // citadel-cli binary version, reported as agent_version
 	interval        time.Duration
@@ -135,6 +136,8 @@ type APIPublisherConfig struct {
 	// When set, included in heartbeat messages so the Python worker can skip
 	// the Headscale hostname-to-ID lookup.
 	HeadscaleNodeID string
+	// StableNodeID is the durable machine-convergent identity fingerprint (#1235).
+	StableNodeID string
 
 	// OrgID is the organization ID for channel scoping (required for API mode)
 	OrgID string
@@ -186,6 +189,7 @@ func NewAPIPublisher(cfg APIPublisherConfig, collector *status.Collector) (*APIP
 		client:          cfg.Client,
 		nodeID:          cfg.NodeID,
 		headscaleNodeID: cfg.HeadscaleNodeID,
+		stableNodeID:    cfg.StableNodeID,
 		orgID:           cfg.OrgID,
 		agentVersion:    cfg.AgentVersion,
 		interval:        cfg.Interval,
@@ -283,6 +287,7 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 		Timestamp:       timestamp,
 		NodeID:          p.nodeID,
 		HeadscaleNodeID: p.headscaleNodeID,
+		StableNodeID:    p.stableNodeID,
 		Status:          nodeStatus,
 		Permissions:     p.currentPermissions(),
 		AgentVersion:    p.agentVersion,
