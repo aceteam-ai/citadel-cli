@@ -1268,7 +1268,10 @@ unit-testable without an engine:
   `worker.ErrAppTransient` retries; anything else fails terminally.
 - **`internal/jobs/app_pod.go` (`ParseAppSpec`, `AppPodRunner`)** is the pod
   logic. It EXTENDS `service_payload.go` (reuses `validateImageRef`/
-  `validateRuntime`/`resolveStateVolumePath`), not a sixth launcher. Every
+  `validateRuntime`), not a sixth launcher. It does NOT use
+  `resolveStateVolumePath` — an app ignores any `state_volume_path` and always
+  mounts a per-app engine-managed named volume, so the instance resolver's
+  `~/.citadel/instances` confinement (citadel-cli#1163) does not touch apps. Every
   engine call goes through the `catalog.ContainerRuntime` seam (the #1041 CI
   guard forbids a literal `exec.Command("docker"/"podman")`), so podman gets a
   real pod (`pod create` + `run --pod`) and docker gets a single labeled

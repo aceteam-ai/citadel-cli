@@ -191,7 +191,17 @@ func TestResolveStateVolumePath(t *testing.T) {
 	}{
 		{"tilde slash under cache", "~/citadel-cache/instances/x", filepath.Join(testHome, "citadel-cache/instances/x"), false},
 		{"bare tilde is home not allowed", "~", "", true},
-		{"absolute under .citadel", filepath.Join(testHome, ".citadel/instances/x"), filepath.Join(testHome, ".citadel/instances/x"), false},
+		{"absolute under .citadel/instances", filepath.Join(testHome, ".citadel/instances/x"), filepath.Join(testHome, ".citadel/instances/x"), false},
+		{"tilde under .citadel/instances", "~/.citadel/instances/i-1", filepath.Join(testHome, ".citadel/instances/i-1"), false},
+		// citadel-cli#1163: ~/.citadel holds node config/credentials, so an
+		// instance bind must be confined to the .citadel/instances SUBDIR. A path
+		// elsewhere under .citadel is now rejected.
+		{"bare .citadel root rejected", filepath.Join(testHome, ".citadel"), "", true},
+		{"config under .citadel rejected", filepath.Join(testHome, ".citadel/config.yaml"), "", true},
+		{"storage under .citadel rejected", filepath.Join(testHome, ".citadel/storage/data"), "", true},
+		{"network creds under .citadel rejected", filepath.Join(testHome, ".citadel/network/tsnet"), "", true},
+		{"instances sibling-prefix not matched", filepath.Join(testHome, ".citadel/instancesEVIL/x"), "", true},
+		{"lexical traversal out of instances rejected", "~/.citadel/instances/../config.yaml", "", true},
 		{"escape to etc", "/etc/passwd", "", true},
 		{"prefix sibling not matched", filepath.Join(testHome, "citadel-cache-evil/x"), "", true},
 		{"empty", "", "", true},
