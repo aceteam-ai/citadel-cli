@@ -1272,6 +1272,25 @@ func runWork(cmd *cobra.Command, args []string) {
 	Log("registered: online=%v node_name=%s headscale_id=%s state_dir=%s",
 		connected, nodeName, headscaleNodeID, network.GetStateDir())
 
+	// Persist this node's confirmed identity (#1235) so a later recovery can
+	// report an identity churn honestly ("was X") and diagnostics keep the last
+	// good registration. Best-effort/non-fatal; written beside (not inside) the
+	// network/ state dir, so it survives ClearState.
+	if connected && headscaleNodeID != "" {
+		meshIP := ""
+		if st, statusErr := network.GetGlobalStatus(ctx); statusErr == nil {
+			meshIP = st.IPv4
+		}
+		if err := network.SaveConnectedIdentity(network.IdentityRecord{
+			HeadscaleNodeID: headscaleNodeID,
+			MeshIP:          meshIP,
+			Hostname:        nodeName,
+			StableID:        resolveStableNodeID(),
+		}); err != nil {
+			Debug("failed to persist node identity record: %v", err)
+		}
+	}
+
 	// Start the background resource-footprint sampler (issue #422). It appends a
 	// lightweight per-service + node-level time-series to rotated, DuckDB-queryable
 	// CSVs under ~/citadel-node/footprints/, so an idle service hoarding RSS/VRAM
