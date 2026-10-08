@@ -275,3 +275,107 @@ func TestResolveWorkerQueuesRepresentativeConfig(t *testing.T) {
 		t.Errorf("resolveWorkerQueues is not deterministic for the same config:\n  first:  %+v\n  second: %+v", got, got2)
 	}
 }
+
+// containsStr reports whether s is present in xs.
+func containsStr(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestResolveDirectRedisQueues pins the direct-Redis queue set, especially the
+// citadel-cli#1159 fix: a CPU/TTS node (no explicit --queue) must ALWAYS
+// subscribe to jobs:v1:cpu-general (the coordinator's default for unpinned
+// non-GPU-routed dispatch, e.g. SYNTHESIZE_SPEECH) while KEEPING
+// jobs:v1:gpu-general and its capability tag queues. Before #1159 the resolver
+// hardcoded only gpu-general as the base, so such a node silently never
+// consumed cpu-general.
+func TestResolveDirectRedisQueues(t *testing.T) {
+	cpuGeneral := worker.DefaultCPUQueue // "jobs:v1:cpu-general"
+	const gpuGeneral = "jobs:v1:gpu-general"
+
+	tests := []struct {
+		name          string
+		explicitQueue string
+		nodeTags      []string
+		manual        []capabilities.Capability
+		orgID         string
+		wantContains  []string
+		wantMissing   []string
+		wantExact     []string // when set, the full slice must match exactly (order included)
+	}{
+		{
+			name:         "CPU-only linux node: cpu-general present AND gpu-general kept",
+			nodeTags:     []string{"cpu:general", "os:linux", "arch:amd64"},
+			wantContains: []string{cpuGeneral, gpuGeneral, "jobs:v1:tag:os:linux", "jobs:v1:tag:arch:amd64"},
+			// cpu:general is absorbed by the base cpu-general queue, never a tag queue.
+			wantMissing: []string{"jobs:v1:tag:cpu:general"},
+		},
+		{
+			name:         "GPU node: cpu-general added additively alongside gpu-general and tag queues",
+			nodeTags:     []string{"gpu:rtx3090", "engine:vllm", "os:linux", "arch:amd64"},
+			wantContains: []string{cpuGeneral, gpuGeneral, "jobs:v1:tag:gpu:rtx3090", "jobs:v1:tag:engine:vllm"},
+		},
+		{
+			name:      "no tags, no manual, no org: cpu-general + gpu-general (pre-#1159 was gpu-general only via redis_source default)",
+			wantExact: []string{cpuGeneral, gpuGeneral},
+		},
+		{
+			name:      "no tags, org set: cpu-general + gpu-general + shell queue",
+			orgID:     "org-1",
+			wantExact: []string{cpuGeneral, gpuGeneral, "jobs:v1:shell:org_org-1"},
+		},
+		{
+			name:          "explicit --queue is honored verbatim (workaround/back-compat), cpu-general NOT forced",
+			explicitQueue: "jobs:v1:some-special",
+			nodeTags:      []string{"cpu:general", "os:linux"},
+			wantExact:     []string{"jobs:v1:some-special"},
+		},
+		{
+			name:          "explicit --queue + org: base verbatim plus shell queue, still no forced cpu-general",
+			explicitQueue: "jobs:v1:some-special",
+			orgID:         "org-1",
+			wantExact:     []string{"jobs:v1:some-special", "jobs:v1:shell:org_org-1"},
+		},
+		{
+			name:         "manual --capabilities duplicating a detected tag is de-duplicated",
+			nodeTags:     []string{"cpu:general", "os:linux"},
+			manual:       []capabilities.Capability{{Tag: "os:linux", Category: "os"}, {Tag: "engine:vllm", Category: "engine"}},
+			wantContains: []string{cpuGeneral, gpuGeneral, "jobs:v1:tag:os:linux", "jobs:v1:tag:engine:vllm"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveDirectRedisQueues(tt.explicitQueue, tt.nodeTags, tt.manual, tt.orgID)
+
+			if tt.wantExact != nil {
+				if !reflect.DeepEqual(got, tt.wantExact) {
+					t.Fatalf("got %v, want exactly %v", got, tt.wantExact)
+				}
+			}
+			for _, q := range tt.wantContains {
+				if !containsStr(got, q) {
+					t.Errorf("resolved set %v is missing required queue %q", got, q)
+				}
+			}
+			for _, q := range tt.wantMissing {
+				if containsStr(got, q) {
+					t.Errorf("resolved set %v unexpectedly contains %q", got, q)
+				}
+			}
+
+			// No duplicates in any case.
+			seen := make(map[string]bool, len(got))
+			for _, q := range got {
+				if seen[q] {
+					t.Errorf("resolved set %v contains duplicate queue %q", got, q)
+				}
+				seen[q] = true
+			}
+		})
+	}
+}
