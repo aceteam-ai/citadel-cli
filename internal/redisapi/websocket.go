@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 	"github.com/gorilla/websocket"
 )
 
@@ -154,6 +155,13 @@ type WSMessage struct {
 	ID        string            `json:"id,omitempty"`        // Stream message ID (job delivery)
 	MessageID string            `json:"messageId,omitempty"` // Ack message ID
 	Data      map[string]string `json:"data,omitempty"`      // Job data fields from stream
+
+	observation *deliverymetadata.Observation `json:"-"`
+}
+
+// DeliveryObservation returns the original frame snapshot, never a mutable map.
+func (m WSMessage) DeliveryObservation() *deliverymetadata.Observation {
+	return m.observation.Clone()
 }
 
 // initialReconnectBackoff is the delay before the first reconnect attempt, and
@@ -428,6 +436,9 @@ func (c *WSClient) readLoop() {
 		if err := json.Unmarshal(message, &msg); err != nil {
 			c.debug("ws: failed to parse message: %v", err)
 			continue
+		}
+		if msg.Type == "job" {
+			msg.observation = deliverymetadata.CaptureWS(message)
 		}
 
 		c.debug("ws: received message type=%s", msg.Type)

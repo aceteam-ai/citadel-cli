@@ -31,16 +31,18 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 
 	// Convert the first StreamMessage to a Job
 	msg := resp.Messages[0]
+	msg.Data.observation = msg.Data.observation.WithSource(req.Queue, req.Group, "redis-api")
 	return ParseStreamMessage(msg)
 }
 
 // ParseStreamMessage converts a StreamMessage to a Job.
 func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 	job := &Job{
-		MessageID: msg.ID,
-		JobID:     msg.Data.JobID,
-		Type:      msg.Data.Type, // Top-level stream field (e.g., SHELL_COMMAND)
-		RawData:   make(map[string]any),
+		observation: msg.Data.observation.Clone(),
+		MessageID:   msg.ID,
+		JobID:       msg.Data.JobID,
+		Type:        msg.Data.Type, // Top-level stream field (e.g., SHELL_COMMAND)
+		RawData:     make(map[string]any),
 	}
 
 	// Preserve raw fields from stream message data

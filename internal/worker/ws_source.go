@@ -442,6 +442,7 @@ func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
 	}
 
 	job := &Job{
+		observation: msg.DeliveryObservation().WithSource("", s.config.ConsumerGroup, "websocket"),
 		ID:          apiJob.JobID,
 		Type:        apiJob.Type,
 		Payload:     apiJob.Payload,

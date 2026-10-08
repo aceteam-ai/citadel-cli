@@ -3068,6 +3068,15 @@ The raw-payload tests in the Redis, Redis API and worker packages pin preservati
 and serialization exclusion. This preparation does not persist terminal results
 or change execution, authorization or acknowledgement behavior.
 
+HTTP consume and WS receive boundaries retain passive delivery observations
+(#1241): `deliverymetadata.CaptureHTTP`/`CaptureWS` own bounded original-wire
+snapshots; conversions clone them without rebinding identity from mutable jobs.
+The stdlib JSON decoder remains unchanged, so manual decoding is not a freshness
+or invalidation hook. `deliverymetadata.Observation` stores its immutable record
+behind an opaque function: Go's nested bad-verb formatting can bypass Formatters
+and print secret-bearing private pointer fields. Its formatting/shape tests pin
+that boundary. These observations do not enable durable execution or ACKs.
+
 `Runner.Run`'s fetch loop no longer conflates "claim a job" with "execute it"
 (this is what `processJob` used to do inline, blocking `source.Next()` for the
 whole handler run). Design doc:

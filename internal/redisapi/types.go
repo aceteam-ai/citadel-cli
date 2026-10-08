@@ -7,6 +7,8 @@
 // All API calls require a device_api_token obtained during device authentication.
 package redisapi
 
+import "github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+
 // ConsumeRequest is the request body for POST /api/fabric/redis/jobs/consume
 type ConsumeRequest struct {
 	Queue    string `json:"queue"`
@@ -34,6 +36,8 @@ type StreamMessageData struct {
 	Payload    string `json:"payload"` // JSON-encoded job payload
 	EnqueuedAt string `json:"enqueuedAt"`
 	RayID      string `json:"rayId"`
+
+	observation *deliverymetadata.Observation `json:"-"`
 }
 
 // Job represents a parsed job ready for processing
@@ -45,6 +49,13 @@ type Job struct {
 	// RawPayload keeps the original stream bytes for request digests, not wire output.
 	RawPayload []byte         `json:"-"`
 	RawData    map[string]any `json:"raw_data,omitempty"`
+
+	observation *deliverymetadata.Observation `json:"-"`
+}
+
+// DeliveryObservation returns an opaque copy, not a claim credential or authority.
+func (j *Job) DeliveryObservation() *deliverymetadata.Observation {
+	return j.observation.Clone()
 }
 
 // AcknowledgeRequest is the request body for POST /api/fabric/redis/jobs/acknowledge

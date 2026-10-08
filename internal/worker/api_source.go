@@ -438,12 +438,13 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 // convertJob converts an API job to a worker.Job.
 func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 	job := &Job{
-		ID:         aj.JobID,
-		Type:       aj.Type,
-		Payload:    aj.Payload,
-		RawPayload: bytes.Clone(aj.RawPayload),
-		Source:     "redis-api",
-		MessageID:  aj.MessageID,
+		observation: aj.DeliveryObservation(),
+		ID:          aj.JobID,
+		Type:        aj.Type,
+		Payload:     aj.Payload,
+		RawPayload:  bytes.Clone(aj.RawPayload),
+		Source:      "redis-api",
+		MessageID:   aj.MessageID,
 	}
 	// Extract rayId: check RawData first, then payload
 	if aj.RawData != nil {

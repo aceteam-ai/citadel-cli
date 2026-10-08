@@ -16,11 +16,16 @@
 //  5. Repeat
 package worker
 
-import "time"
+import (
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"time"
+)
 
 // Job represents a unit of work to be processed.
 // This is the common job format used internally, regardless of source.
 type Job struct {
+	// Passive original delivery snapshot, not handler execution authority.
+	observation *deliverymetadata.Observation `json:"-"`
 	// ID uniquely identifies this job
 	ID string
 
