@@ -30,6 +30,10 @@ type Job struct {
 	// Payload contains job-specific data
 	Payload map[string]any
 
+	// RawPayload is the original queue payload, never a reserialization of Payload.
+	// Nil means this source did not provide digest input. It is internal only.
+	RawPayload []byte `json:"-"`
+
 	// Source identifies where this job came from (for logging/debugging)
 	Source string
 

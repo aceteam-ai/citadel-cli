@@ -3059,6 +3059,15 @@ should render the new `{ok:true, restarting:true}` response instead of the old
 
 ### Node execution model: claim/execute decoupling + bounded lanes (citadel #908, aceteam#8254)
 
+`redis.Client.parseMessage`, `redisapi.ParseStreamMessage`, and the worker source
+conversions preserve original queue payload bytes in internal `Job.RawPayload`
+metadata (#1239). Request digests must use those bytes, not a reserialization of
+the decoded handler map: whitespace, key order and large integer lexemes can
+change during decoding. Absent bytes stay nil; the metadata is excluded from JSON.
+The raw-payload tests in the Redis, Redis API and worker packages pin preservation
+and serialization exclusion. This preparation does not persist terminal results
+or change execution, authorization or acknowledgement behavior.
+
 `Runner.Run`'s fetch loop no longer conflates "claim a job" with "execute it"
 (this is what `processJob` used to do inline, blocking `source.Next()` for the
 whole handler run). Design doc:
