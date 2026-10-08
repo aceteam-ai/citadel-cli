@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 	"github.com/google/uuid"
 )
 
@@ -327,6 +328,13 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 		if err := json.Unmarshal(respBody, result); err != nil {
 			return fmt.Errorf("%s %s returned status %d with an unparseable body (%s): %w",
 				method, path, resp.StatusCode, truncateBody(respBody), err)
+		}
+		// Capture after the unchanged decoder; existing raw log/error surfaces
+		// are not redacted by this private bookkeeping.
+		if method == http.MethodPost && path == "/api/fabric/redis/jobs/consume" {
+			if consume, ok := result.(*ConsumeResponse); ok && len(consume.Messages) > 0 {
+				consume.Messages[0].Data.observation = deliverymetadata.CaptureHTTP(respBody)
+			}
 		}
 	}
 
