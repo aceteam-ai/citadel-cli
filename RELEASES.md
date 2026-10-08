@@ -2933,3 +2933,20 @@ Auto-generated log of every release.
   - fix(1235): stable node identity across reconnect (node-side) (#1237)
 
 
+---
+
+## v2.184.0 — 2026-10-08
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 24 |
+| Lines added | +2043 |
+
+**Changes:**
+
+  - fix(worker): retain private delivery observations (#1242)
+  - fix(worker): preserve exact queue payload bytes (#1240)
+  - fix(1235): node-identity follow-ups (persist identity + distinct given-name) (#1238)
+
+
