@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"context"
+	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
@@ -179,4 +180,77 @@ func resolveWorkerQueues(ctx context.Context, p workerQueueParams) workerQueueRe
 		Queues:    queueNames,
 		Missing:   missing,
 	}
+}
+
+// resolveDirectRedisQueues is the authority for the Redis Streams queue set a
+// direct-Redis worker (`citadel work` with a config redis_url -- the offline /
+// self-host path, e.g. the asusrog node) subscribes to. It is the direct-Redis
+// analogue of resolveWorkerQueues, extracted from runWork's inline block so the
+// rule is pure/string-in-string-out and can be pinned by a test.
+//
+// The rules, and why each is load-bearing:
+//
+//   - explicitQueue (`--queue`) is honored VERBATIM as the sole base queue
+//     (plus the per-org shell queue below). This is the documented single-queue
+//     workaround/back-compat contract; cpu-general is deliberately NOT forced
+//     onto it, because an operator who pins `--queue X` means X.
+//
+//   - Otherwise the base set ALWAYS contains worker.DefaultCPUQueue
+//     (jobs:v1:cpu-general) -- the citadel-cli#1159 fix. The coordinator
+//     dispatches every unpinned job that has no capability engine to route by
+//     and no target_node (e.g. SYNTHESIZE_SPEECH) to jobs:v1:cpu-general (its
+//     default_queue, aceteam fabric_dispatch). Before this, the direct-Redis
+//     resolver hardcoded only jobs:v1:gpu-general as its base, so a CPU/TTS node
+//     silently never consumed cpu-general -- a dark node with a healthy-looking
+//     heartbeat. This mirrors the API-mode path (resolveWorkerQueues), which
+//     starts every node from the cpu-general base.
+//
+//   - jobs:v1:gpu-general stays in the set UNCONDITIONALLY (additive to the
+//     cpu-general fix, never a replacement). Direct-Redis mode has always joined
+//     gpu-general regardless of `serving`, and the Dynamic Inference-Queue
+//     Resubscription design (citadel-cli#612) relies on that: a target_node-
+//     pinned inference job for this node lands on gpu-general, and a CPU node
+//     that later starts an engine needs no boot-time reconciler because it is
+//     already subscribed.
+//
+//   - Per-capability tag queues (os/arch/gpu/engine/... via
+//     capabilities.ResolveQueues) and the per-org shell queue are joined as
+//     before. cpu:general is intentionally absorbed by the base queue, not
+//     emitted as a jobs:v1:tag:cpu:general queue (ResolveQueues skips it).
+//
+// worker.DefaultCPUQueue is placed first so queueNames[0] -- the RedisSource
+// "primary" / backwards-compat ClientConfig.QueueName -- matches API mode's
+// cpu-general base. This is cosmetic: RedisSource.nextMulti acks/DLQs against
+// each job's own origin queue (SourceQueue), and EnsureConsumerGroups creates a
+// group for every queue, so no queue is privileged by being index 0.
+func resolveDirectRedisQueues(explicitQueue string, nodeTags []string, manual []capabilities.Capability, orgID string) []string {
+	var queueNames []string
+	if explicitQueue != "" {
+		// Explicit --queue: honor it verbatim (documented workaround / back-compat).
+		queueNames = []string{explicitQueue}
+	} else {
+		allCaps := make([]capabilities.Capability, 0, len(nodeTags)+len(manual))
+		for _, tag := range nodeTags {
+			category := tag
+			if idx := strings.Index(tag, ":"); idx > 0 {
+				category = tag[:idx]
+			}
+			allCaps = append(allCaps, capabilities.Capability{Tag: tag, Category: category})
+		}
+		allCaps = append(allCaps, manual...)
+
+		// cpu-general base (the fix) + gpu-general (unconditional) + per-tag
+		// queues. ResolveQueues always appends its gpu-general base queue even
+		// when allCaps is empty, so gpu-general survives for a tag-less node too.
+		queueNames = []string{worker.DefaultCPUQueue}
+		queueNames = appendUniqueQueues(queueNames, capabilities.ResolveQueues(allCaps, "jobs:v1:gpu-general"))
+	}
+
+	// Per-org shell queue, appended for BOTH branches (unchanged behavior: the
+	// pre-#1159 code appended it after whichever base it had resolved).
+	if orgID != "" {
+		queueNames = appendUniqueQueues(queueNames, []string{shellQueueName(orgID)})
+	}
+
+	return queueNames
 }

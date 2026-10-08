@@ -1045,56 +1045,32 @@ func runWork(cmd *cobra.Command, args []string) {
 		Debug("using direct Redis mode")
 		Debug("Redis URL configured")
 
-		// Resolve queue names: explicit --queue takes priority, otherwise use capabilities
-		var queueNames []string
-		if workQueue != "" {
-			// Explicit queue specified -- use it directly (backwards compat)
-			queueNames = []string{workQueue}
-		} else {
-			// Use resolved node capabilities for queue routing
-			var allCaps []capabilities.Capability
+		// Resolve queue names. resolveDirectRedisQueues is the authority for the
+		// set (explicit --queue vs. the capability-routed base). It ALWAYS
+		// includes jobs:v1:cpu-general on the non-explicit path (citadel-cli#1159)
+		// so a CPU/TTS node actually consumes unpinned coordinator dispatch, while
+		// keeping gpu-general unconditional. See its doc comment for the rules.
+		var nodeTags []string
+		if nodeCaps != nil {
+			nodeTags = nodeCaps.Tags
+		}
 
-			// Add capabilities from auto-detected nodeCaps (already resolved above)
-			if nodeCaps != nil && len(nodeCaps.Tags) > 0 {
-				for _, tag := range nodeCaps.Tags {
-					category := tag
-					if idx := strings.Index(tag, ":"); idx > 0 {
-						category = tag[:idx]
-					}
-					allCaps = append(allCaps, capabilities.Capability{Tag: tag, Category: category})
-				}
-			}
-
-			// Also honor --capabilities flag for manual overrides
-			if workCapabilities != "" {
-				manual := capabilities.ParseTags(workCapabilities)
-				allCaps = append(allCaps, manual...)
-				for _, c := range manual {
-					fmt.Printf("   - Manual tag: %s\n", c.Tag)
-				}
-			}
-
-			if len(allCaps) > 0 {
-				baseQueue := "jobs:v1:gpu-general"
-				queueNames = capabilities.ResolveQueues(allCaps, baseQueue)
+		var manual []capabilities.Capability
+		if workQueue == "" && workCapabilities != "" {
+			manual = capabilities.ParseTags(workCapabilities)
+			for _, c := range manual {
+				fmt.Printf("   - Manual tag: %s\n", c.Tag)
 			}
 		}
 
-		// Add per-org shell queue if org_id is known.
-		// Ensure the default base queue is present when no explicit queue
-		// or capabilities were resolved (otherwise shell-only list would
-		// suppress the default fallback inside NewRedisSource).
 		orgID := ""
 		if deviceConfig != nil {
 			orgID = deviceConfig.OrgID
 		}
+
+		queueNames := resolveDirectRedisQueues(workQueue, nodeTags, manual, orgID)
 		if orgID != "" {
-			shellQ := shellQueueName(orgID)
-			if len(queueNames) == 0 {
-				queueNames = []string{"jobs:v1:gpu-general"}
-			}
-			queueNames = append(queueNames, shellQ)
-			Debug("shell queue: %s", shellQ)
+			Debug("shell queue: %s", shellQueueName(orgID))
 		}
 
 		// Create Redis job source
