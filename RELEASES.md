@@ -2918,3 +2918,18 @@ Auto-generated log of every release.
   - test: hardened opt-in egress-relay acceptance harness (#1006)
 
 
+---
+
+## v2.183.0 — 2026-10-08
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +498 |
+
+**Changes:**
+
+  - fix(1235): stable node identity across reconnect (node-side) (#1237)
+
+
