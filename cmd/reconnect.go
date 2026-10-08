@@ -240,7 +240,10 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 	freshCtx, freshCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer freshCancel()
 	config := network.ServerConfig{
-		Hostname:   hostname,
+		// Distinct citadel given-name so this fresh registration cannot collide
+		// with the host's own system-tailscaled node (#1235). A reattach never
+		// reaches here, so an already-registered node is not renamed in place.
+		Hostname:   network.CitadelGivenName(hostname),
 		ControlURL: resolveControlURLFn(),
 		StateDir:   getStateDirFn(),
 		AuthKey:    churnKey,
@@ -260,6 +263,14 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 // because a fresh machine key is being presented. The churn orphans every
 // capability bound to the old node id. Surfaced loudly so it is diagnosable.
 func warnIdentityChurn(hostname string) {
+	// Surface the actual prior identity (#1235) so the churn is diagnosable with
+	// the concrete id/IP it is leaving behind, not just the hostname. Best-effort.
+	if prior, err := network.LoadConnectedIdentity(); err == nil && (prior.HeadscaleNodeID != "" || prior.MeshIP != "") {
+		Log("IDENTITY CHURN (--force): previous identity headscale_id=%s ip=%s hostname=%s stable_id=%s",
+			prior.HeadscaleNodeID, prior.MeshIP, prior.Hostname, prior.StableID)
+		fmt.Fprintf(os.Stderr, "     Previous identity: headscale_id=%s ip=%s (its bindings will need re-provisioning).\n",
+			prior.HeadscaleNodeID, prior.MeshIP)
+	}
 	Log("IDENTITY CHURN (--force): discarding persisted identity and re-registering '%s' as a NEW node "+
 		"(new fabric id + new mesh IP + new device key). Capabilities bound to the old node id "+
 		"(WhatsApp/WeChat, Files, node:exec, per-node job stream) will need re-provisioning.", hostname)
