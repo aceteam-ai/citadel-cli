@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/url"
@@ -355,11 +356,12 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 // convertJob converts a redis.Job to a worker.Job.
 func (s *RedisSource) convertJob(rj *redisclient.Job) *Job {
 	job := &Job{
-		ID:        rj.JobID,
-		Type:      rj.Type,
-		Payload:   rj.Payload,
-		Source:    "redis",
-		MessageID: rj.MessageID,
+		ID:         rj.JobID,
+		Type:       rj.Type,
+		Payload:    rj.Payload,
+		RawPayload: bytes.Clone(rj.RawPayload),
+		Source:     "redis",
+		MessageID:  rj.MessageID,
 	}
 	// Extract rayId: check RawData first (top-level stream field), then payload
 	if rayID, ok := rj.RawData["rayId"].(string); ok && rayID != "" {

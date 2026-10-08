@@ -14,6 +14,7 @@
 package redis
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -36,10 +37,12 @@ type StreamEvent struct {
 
 // Job represents a job read from Redis Streams.
 type Job struct {
-	MessageID  string
-	JobID      string
-	Type       string
-	Payload    map[string]interface{}
+	MessageID string
+	JobID     string
+	Type      string
+	Payload   map[string]interface{}
+	// RawPayload keeps the original stream bytes for request digests, not wire output.
+	RawPayload []byte `json:"-"`
 	RawData    map[string]interface{}
 	EnqueuedAt string // JQS-Core: original enqueue timestamp, preserved for DLQ
 }
@@ -653,6 +656,7 @@ func (c *Client) parseMessage(msg redis.XMessage) (*Job, error) {
 			return nil, fmt.Errorf("failed to parse job payload: %w", err)
 		}
 		job.Payload = payload
+		job.RawPayload = []byte(payloadStr)
 
 		// Also extract type from payload if not at top level
 		if job.Type == "" {
@@ -660,6 +664,11 @@ func (c *Client) parseMessage(msg redis.XMessage) (*Job, error) {
 				job.Type = t
 			}
 		}
+	}
+	// Keep byte-valued authoritative input too, without changing the legacy
+	// string-only decoder above. Never reconstruct bytes from the parsed map.
+	if payloadBytes, ok := msg.Values["payload"].([]byte); ok {
+		job.RawPayload = bytes.Clone(payloadBytes)
 	}
 
 	return job, nil

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -444,6 +445,7 @@ func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
 		ID:          apiJob.JobID,
 		Type:        apiJob.Type,
 		Payload:     apiJob.Payload,
+		RawPayload:  bytes.Clone(apiJob.RawPayload),
 		Source:      "websocket",
 		MessageID:   apiJob.MessageID,
 		SourceQueue: msg.Queue,

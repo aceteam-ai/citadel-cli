@@ -42,7 +42,9 @@ type Job struct {
 	JobID     string         `json:"job_id"`
 	Type      string         `json:"type"`
 	Payload   map[string]any `json:"payload"`
-	RawData   map[string]any `json:"raw_data,omitempty"`
+	// RawPayload keeps the original stream bytes for request digests, not wire output.
+	RawPayload []byte         `json:"-"`
+	RawData    map[string]any `json:"raw_data,omitempty"`
 }
 
 // AcknowledgeRequest is the request body for POST /api/fabric/redis/jobs/acknowledge

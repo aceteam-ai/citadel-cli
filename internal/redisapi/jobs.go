@@ -58,6 +58,7 @@ func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 			return nil, fmt.Errorf("failed to parse job payload: %w", err)
 		}
 		job.Payload = payload
+		job.RawPayload = []byte(msg.Data.Payload)
 
 		// Fall back to type from payload if not at top level
 		if job.Type == "" {
