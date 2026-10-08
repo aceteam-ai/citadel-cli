@@ -2,8 +2,8 @@
 //
 // Hosted-app pod-per-app runner (CRAM slice A1, aceteam#9672). This EXTENDS the
 // BYOC launcher in service_payload.go rather than adding a sixth: it reuses that
-// file's validators (validateImageRef, validateRuntime, resolveStateVolumePath)
-// unchanged and adds the pod semantics the app runner needs - one pod per app,
+// file's validators (validateImageRef, validateRuntime) unchanged and adds the
+// pod semantics the app runner needs - one pod per app,
 // a node-allocated loopback host port, size-derived cgroup limits, cap-drop=ALL,
 // and the aceteam.app* labels the heartbeat and lifecycle verbs recover state
 // from.

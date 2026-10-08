@@ -45,3 +45,45 @@ func TestResolveStateVolumePath_RejectsSymlinkEscape(t *testing.T) {
 		t.Errorf("rejected a not-yet-existent in-base path: %v", err)
 	}
 }
+
+// TestResolveStateVolumePath_RejectsCitadelConfigEscapeViaSymlink is the
+// regression citadel-cli#1163 exists for: ~/.citadel holds the node's own
+// config and credentials, so a symlink under the allowed .citadel/instances
+// base that points back up at the .citadel config area (or anywhere outside
+// instances) must be rejected after the symlink-resolved boundary check -- the
+// bind mount would otherwise follow it into the credential area.
+func TestResolveStateVolumePath_RejectsCitadelConfigEscapeViaSymlink(t *testing.T) {
+	home := t.TempDir()
+	instances := filepath.Join(home, ".citadel", "instances")
+	if err := os.MkdirAll(instances, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Populate the credential area the instance bind must never reach.
+	citadelDir := filepath.Join(home, ".citadel")
+	if err := os.WriteFile(filepath.Join(citadelDir, "config.yaml"), []byte("node_config_dir: x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A symlink inside .citadel/instances pointing UP to the forbidden .citadel
+	// config dir. Pre-#1163 (whole-.citadel base) this escape did not even need a
+	// symlink; the symlink makes it a lexical-vs-resolved escape that must fail.
+	evil := filepath.Join(instances, "escape")
+	if err := os.Symlink(citadelDir, evil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveStateVolumePath("~/.citadel/instances/escape", home); err == nil {
+		t.Error("accepted a symlink under .citadel/instances that escapes up into the .citadel config/credential area")
+	}
+
+	// A plain (non-symlink) path directly under .citadel but outside instances is
+	// rejected too: the whole point is that config/creds are no longer reachable.
+	if _, err := resolveStateVolumePath("~/.citadel/config.yaml", home); err == nil {
+		t.Error("accepted a bind into the node .citadel config area")
+	}
+
+	// A legitimate not-yet-created instance dir under .citadel/instances is still
+	// accepted (the state dir is MkdirAll'd later).
+	if _, err := resolveStateVolumePath("~/.citadel/instances/i-new", home); err != nil {
+		t.Errorf("rejected a legit instance path under .citadel/instances: %v", err)
+	}
+}

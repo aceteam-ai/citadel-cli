@@ -318,10 +318,17 @@ func parsePort(raw string) (int, error) {
 }
 
 // resolveStateVolumePath expands a leading "~" to homeDir, makes the path
-// absolute, and bounds it to a citadel data dir. Docker's -v does NOT expand
-// "~" (unlike compose), so the node must do it. Bounding it to
-// <home>/citadel-cache or <home>/.citadel rejects a host-path mount that would
-// escape the citadel data area (e.g. "/etc" or "~/.ssh").
+// absolute, and bounds it to the instance state area. Docker's -v does NOT
+// expand "~" (unlike compose), so the node must do it. Bounding it to
+// <home>/citadel-cache or <home>/.citadel/instances rejects a host-path mount
+// that would escape the instance state area (e.g. "/etc" or "~/.ssh"). The
+// second base is deliberately the .citadel/instances SUBDIR, not all of
+// .citadel: ~/.citadel also holds the node's own config and credentials
+// (config.yaml, network/, storage/, the vault), and an instance-scoped bind
+// mount must never be able to reach them (citadel-cli#1163). The only
+// production caller is parseInstanceSpec (the BYOC instance path); the hosted
+// app path (ParseAppSpec) does NOT use this resolver -- it ignores any
+// state_volume_path and always mounts a per-app engine-managed named volume.
 func resolveStateVolumePath(raw, homeDir string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -347,7 +354,9 @@ func resolveStateVolumePath(raw, homeDir string) (string, error) {
 
 	allowedBases := []string{
 		filepath.Join(homeDir, "citadel-cache"),
-		filepath.Join(homeDir, ".citadel"),
+		// Only the instances SUBDIR of .citadel, never the whole dir: ~/.citadel
+		// holds node config and credentials (citadel-cli#1163).
+		filepath.Join(homeDir, ".citadel", "instances"),
 	}
 	// Resolve symlinks BEFORE the boundary check. A lexical prefix test on the
 	// unresolved path accepts a symlink placed inside an allowed base that points
