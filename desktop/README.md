@@ -30,7 +30,9 @@ npm ci
 ./scripts/build-macos-dmg.sh x86_64-apple-darwin
 ```
 
-The two artifacts remain separate. Universal binaries and mixed-architecture bundles are rejected. These commands intentionally pass `--no-sign`; their output is not distributable until the Developer ID signing and Apple notarization gates are implemented and accepted. The repository-root `build-dmg.sh` remains a legacy command-line wrapper and is not the desktop distribution path.
+From the repository root, `./build-dmg.sh` is a compatibility dispatcher to that exact Tauri builder. With no arguments it selects the host architecture; `--arch` accepts `arm64`/`aarch64` or `amd64`/`x86_64` aliases and the two canonical target triples. The retired `--binary` and `--version` options fail closed because Tauri owns the bundled helper and application version.
+
+The two artifacts remain separate. Universal binaries and mixed-architecture bundles are rejected. Both entrypoints intentionally pass `--no-sign`; their output is not distributable until the Developer ID signing, Apple notarization, stapling, native installer acceptance, and publishing gates are implemented and accepted. There is no legacy Terminal-launcher packaging path.
 
 ## Native acceptance gate
 
@@ -38,4 +40,4 @@ Pull requests run the frontend build on a hosted runner. Before this workflow la
 
 Before accepting a build for distribution, install and open the app from a DMG, eject the DMG, move the app, and launch it under Gatekeeper App Translocation. On each path, enroll a test node and confirm launchd starts from the Application Support helper path. On an app upgrade, open the app without repeating setup and confirm launchd repoints to the new helper and restarts once, while the prior helper and enrollment identity remain intact. Confirm a second app open does not restart the already-current service, and that a manual launchd job is never adopted. Also check cancellation, timeout, and app quit during setup; none should leave a setup child running. This manual macOS gate is required until those platform behaviors are exercised in native automation.
 
-The existing repository-root `build-dmg.sh` still builds the old command-line wrapper. The desktop app is a separate draft artifact until its macOS build, onboarding, and installer acceptance checks pass. Do not distribute an unsigned debug bundle as the production app.
+The repository-root `build-dmg.sh` builds only through the reviewed Tauri entrypoint. The desktop app remains an unsigned, non-distributable artifact until its native macOS build, onboarding, installer lifecycle, Developer ID, notarization, stapling, and publishing checks pass. Do not distribute an unsigned debug bundle as the production app.
