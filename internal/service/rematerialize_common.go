@@ -24,29 +24,38 @@ func selfExe() string {
 }
 
 // rootRemediationCommand returns the command an operator should run as root to
-// apply a refresh that the current (unprivileged) invocation could not
-// (citadel-cli#1266). It deliberately avoids a bare `sudo citadel ...`: sudo's
-// secure_path strips ~/.local/bin (and other non-standard install locations),
-// so a bare `sudo citadel` is "command not found" for the common `~/.local/bin`
-// install. An ABSOLUTE path is used instead -- shell-agnostic (works in fish
-// too, unlike `$(command -v citadel)`) and immune to secure_path. When
-// os.Executable() could not be resolved (exe == ""), it falls back to a
+// do something the current (unprivileged) invocation could not (citadel-cli#1266,
+// #1268). subcommand is the citadel arguments to run, e.g. "service refresh-unit"
+// or "service install --system". It deliberately avoids a bare `sudo citadel
+// ...`: sudo's secure_path strips ~/.local/bin (and other non-standard install
+// locations), so a bare `sudo citadel` is "command not found" for the common
+// `~/.local/bin` install. An ABSOLUTE path is used instead -- shell-agnostic
+// (works in fish too, unlike `$(command -v citadel)`) and immune to secure_path.
+// When os.Executable() could not be resolved (exe == ""), it falls back to a
 // command-substitution form that still avoids the broken bare invocation.
 //
-// It targets `service refresh-unit`, not `update install`: refresh-unit is
-// network-free, so the remediation cannot fail a second way on a node without
-// internet egress (the already-latest path of `update install` still exits
-// non-zero when the GitHub check fails).
-func rootRemediationCommand(exe string) string {
+// Callers should prefer a network-free subcommand (e.g. `service refresh-unit`)
+// where possible, so the remediation cannot fail a second way on a node without
+// internet egress.
+func rootRemediationCommand(exe, subcommand string) string {
 	if exe != "" {
 		// %q double-quotes the path, which is correct for any realistic
 		// Linux/macOS binary path (including one with spaces). It is NOT a
 		// general shell-escaper -- a path containing $, backtick, or a backslash
 		// would be Go-escaped, not shell-escaped -- but such a citadel install
 		// path does not occur in practice; do not "fix" this into strconv.Quote.
-		return fmt.Sprintf("sudo %q service refresh-unit", exe)
+		return fmt.Sprintf("sudo %q %s", exe, subcommand)
 	}
-	return `sudo "$(command -v citadel)" service refresh-unit`
+	return fmt.Sprintf(`sudo "$(command -v citadel)" %s`, subcommand)
+}
+
+// RootRemediationCommand builds a secure_path-safe root remediation command for
+// callers outside this package (cmd/init_service.go's `service install --system`
+// hint, citadel-cli#1268): it resolves the running binary's absolute path and
+// returns `sudo "<exe>" <subcommand>` (see rootRemediationCommand). subcommand
+// is the citadel args to run as root, e.g. "service install --system".
+func RootRemediationCommand(subcommand string) string {
+	return rootRemediationCommand(selfExe(), subcommand)
 }
 
 // backupUnit copies the current unit/plist to <path>.citadel-bak so an operator
