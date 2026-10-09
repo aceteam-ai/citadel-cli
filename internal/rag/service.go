@@ -133,6 +133,7 @@ func (s *Service) Provenance() string {
 type IndexResult struct {
 	FilesIndexed   int    `json:"files_indexed"`
 	FilesSkipped   int    `json:"files_skipped"`
+	FilesFailed    int    `json:"files_failed"`
 	FilesRemoved   int    `json:"files_removed"`
 	ChunksUpserted int    `json:"chunks_upserted"`
 	ChunksEmbedded int    `json:"chunks_embedded"`
