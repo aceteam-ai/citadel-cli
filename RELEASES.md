@@ -2999,3 +2999,19 @@ Auto-generated log of every release.
   - fix(init): refuse Jetson without nvidia-ctk in the Go provision preflight (#1247)
 
 
+---
+
+## v2.188.0 — 2026-10-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 14 |
+| Lines added | +1811 |
+
+**Changes:**
+
+  - feat(worker): VOICE_MANAGE job for voice-clone enroll/list/delete (#1248) (#1253)
+  - feat(tts): voice-clone SYNTHESIZE_SPEECH backend + port 8215 + GPU compose wiring (#1245) (#1252)
+
+
