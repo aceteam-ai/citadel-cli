@@ -1,0 +1,1945 @@
+{
+  "_doc": "Paper Trail self-serve style registry: every supported built-in preset. scene.json selects one with \"theme\": \"<key>\", or passes an object of overrides with optional \"base\": \"<key>\". No theme means the original look, byte-identical. kind \"theme\" recolors and retextures the paper kit (lib/paper.js); kind \"skin\" swaps the drawing language (lib/selfserve/skins.js). Unknown names fail closed. Shape: lib/selfserve/presets.schema.json. Authoring guide: lib/selfserve/STYLES.md.",
+  "kraft": {
+    "name": "Kraft",
+    "kind": "theme",
+    "intent": "Warm brown kraft paper with cream cutouts, the closest cousin of the original look.",
+    "tags": {
+      "mood": [
+        "warm",
+        "handmade",
+        "friendly"
+      ],
+      "tone": "light",
+      "audience": [
+        "general",
+        "education",
+        "storytelling"
+      ]
+    },
+    "page": "#2a1f14",
+    "background": "#c29a6b",
+    "paper": {
+      "surface": "#f6ecd6",
+      "ink": "#2e2116",
+      "card": "#3a2a1c",
+      "card_line": "#56402b"
+    },
+    "accents": {
+      "blue": [
+        "#35577d",
+        "#f6ecd6"
+      ],
+      "green": [
+        "#557a35",
+        "#f6ecd6"
+      ],
+      "amber": [
+        "#e3a63b",
+        "#2e2116"
+      ],
+      "terra": [
+        "#b4512d",
+        "#f6ecd6"
+      ],
+      "teal": [
+        "#2d7468",
+        "#f6ecd6"
+      ],
+      "navy": [
+        "#2b2a3a",
+        "#f6ecd6"
+      ]
+    },
+    "fonts": {
+      "sans": "'Noto Sans','Helvetica Neue',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono',Menlo,Consolas,monospace"
+    },
+    "grain": 1.7,
+    "shadow": 1.15,
+    "shadow_color": "#2a1a0c",
+    "vignette": {
+      "color": "#2a1a0c",
+      "opacity": 0.38
+    },
+    "pattern": {
+      "kind": "stains",
+      "col": "#7a5530",
+      "op": 0.06
+    },
+    "mustard": "#d9a43a",
+    "icons": {
+      "folder_tab": "#f0c36a",
+      "cloud": [
+        "#f6ecd6",
+        "#e8d8b8"
+      ],
+      "bubble": "#f6ecd6",
+      "shackle": "#a99a84"
+    }
+  },
+  "blueprint": {
+    "name": "Blueprint",
+    "kind": "theme",
+    "intent": "Engineering blueprint: deep blue sheet, white outlined pieces, drafting grid.",
+    "tags": {
+      "mood": [
+        "technical",
+        "precise",
+        "calm"
+      ],
+      "tone": "dark",
+      "audience": [
+        "engineering",
+        "product",
+        "b2b"
+      ]
+    },
+    "page": "#0d2547",
+    "background": "#1d4b86",
+    "paper": {
+      "surface": "#f2f7ff",
+      "ink": "#0d2547",
+      "card": "#163d70",
+      "card_line": "#2f62a3"
+    },
+    "pill": [
+      "#1f5394",
+      "#f2f7ff"
+    ],
+    "accents": {
+      "blue": [
+        "#f2f7ff",
+        "#163d70"
+      ],
+      "green": [
+        "#bfe3ff",
+        "#0d2547"
+      ],
+      "amber": [
+        "#ffe9a8",
+        "#0d2547"
+      ],
+      "terra": [
+        "#ffc7b5",
+        "#0d2547"
+      ],
+      "teal": [
+        "#b5fff0",
+        "#0d2547"
+      ],
+      "navy": [
+        "#163d70",
+        "#f2f7ff"
+      ]
+    },
+    "fonts": {
+      "sans": "'Noto Sans Mono','DejaVu Sans Mono','Liberation Mono',monospace",
+      "mono": "'Noto Sans Mono','DejaVu Sans Mono',monospace"
+    },
+    "grain": 0.5,
+    "shadow": 0.45,
+    "shadow_color": "#061630",
+    "jitter": 0.5,
+    "sheen": 0.3,
+    "edge": {
+      "color": "#f2f7ff",
+      "opacity": 0.95,
+      "width": 2.5
+    },
+    "vignette": {
+      "color": "#061630",
+      "opacity": 0.45
+    },
+    "pattern": {
+      "kind": "grid",
+      "col": "#dceaff",
+      "op": 0.09,
+      "step": 48
+    },
+    "mustard": "#bfe3ff",
+    "red": "#ffc7b5",
+    "icons": {
+      "folder_tab": "#dceaff",
+      "cloud": [
+        "#f2f7ff",
+        "#cfe0f7"
+      ],
+      "bubble": "#f2f7ff",
+      "shackle": "#cfe0f7"
+    },
+    "caption_bg": "#061630"
+  },
+  "newsprint": {
+    "name": "Newsprint",
+    "kind": "theme",
+    "intent": "Gray newspaper stock, black ink, halftone dots and serif headlines.",
+    "tags": {
+      "mood": [
+        "serious",
+        "editorial",
+        "sober"
+      ],
+      "tone": "light",
+      "audience": [
+        "news",
+        "analysis",
+        "finance"
+      ]
+    },
+    "page": "#1a1a1a",
+    "background": "#d8d5cd",
+    "paper": {
+      "surface": "#f1efe8",
+      "ink": "#141414",
+      "card": "#1b1b1b",
+      "card_line": "#3a3a3a"
+    },
+    "accents": {
+      "blue": [
+        "#1b1b1b",
+        "#f1efe8"
+      ],
+      "green": [
+        "#3d3d3d",
+        "#f1efe8"
+      ],
+      "amber": [
+        "#b9b6ad",
+        "#141414"
+      ],
+      "terra": [
+        "#5a5a5a",
+        "#f1efe8"
+      ],
+      "teal": [
+        "#2e2e2e",
+        "#f1efe8"
+      ],
+      "navy": [
+        "#141414",
+        "#f1efe8"
+      ]
+    },
+    "fonts": {
+      "sans": "'Nimbus Roman','Liberation Serif','Times New Roman','DejaVu Serif',serif",
+      "mono": "'Nimbus Mono PS','Liberation Mono','DejaVu Sans Mono',monospace"
+    },
+    "grain": 1.3,
+    "shadow": 0.55,
+    "shadow_color": "#000000",
+    "jitter": 0.6,
+    "sheen": 0.4,
+    "vignette": {
+      "color": "#000000",
+      "opacity": 0.22
+    },
+    "pattern": {
+      "kind": "halftone",
+      "col": "#000000",
+      "op": 0.11,
+      "step": 10
+    },
+    "mustard": "#8a8a8a",
+    "red": "#3a3a3a",
+    "icons": {
+      "folder_tab": "#d0cdc4",
+      "cloud": [
+        "#f1efe8",
+        "#c9c6bd"
+      ],
+      "bubble": "#f1efe8",
+      "shackle": "#9a978f"
+    }
+  },
+  "risograph": {
+    "name": "Risograph",
+    "kind": "theme",
+    "intent": "Two-color riso print: fluorescent pink and teal, slightly misregistered.",
+    "tags": {
+      "mood": [
+        "playful",
+        "indie",
+        "artsy"
+      ],
+      "tone": "light",
+      "audience": [
+        "creative",
+        "marketing",
+        "culture"
+      ]
+    },
+    "page": "#1e1a1a",
+    "background": "#f3eee2",
+    "paper": {
+      "surface": "#fff8f1",
+      "ink": "#0b5866",
+      "card": "#0b7a85",
+      "card_line": "#2a98a1"
+    },
+    "accents": {
+      "blue": [
+        "#0b8f99",
+        "#fff8f1"
+      ],
+      "green": [
+        "#0b7a85",
+        "#fff8f1"
+      ],
+      "amber": [
+        "#ff8fcb",
+        "#0b5866"
+      ],
+      "terra": [
+        "#ff3fa4",
+        "#fff8f1"
+      ],
+      "teal": [
+        "#1a8a8a",
+        "#fff8f1"
+      ],
+      "navy": [
+        "#0b5866",
+        "#fff8f1"
+      ]
+    },
+    "fonts": {
+      "sans": "'URW Gothic','Noto Sans','Helvetica Neue',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono',monospace"
+    },
+    "grain": 1.3,
+    "shadow": 0,
+    "sheen": 0,
+    "jitter": 0.8,
+    "edge": {
+      "color": "#ffffff",
+      "opacity": 0,
+      "width": 1
+    },
+    "vignette": {
+      "color": "#0b5866",
+      "opacity": 0.12
+    },
+    "misregister": {
+      "color": "#ff3fa4",
+      "dx": 7,
+      "dy": 4,
+      "opacity": 0.55
+    },
+    "mustard": "#ff8fcb",
+    "red": "#ff3fa4",
+    "icons": {
+      "folder_tab": "#ffb3dc",
+      "cloud": [
+        "#c9f0f0",
+        "#ffd3ea"
+      ],
+      "bubble": "#fff8f1",
+      "shackle": "#7cc9c9"
+    }
+  },
+  "chalkboard": {
+    "name": "Chalkboard",
+    "kind": "theme",
+    "intent": "Dark green classroom board, chalk-white lettering and soft chalk dust.",
+    "tags": {
+      "mood": [
+        "classroom",
+        "explanatory",
+        "calm"
+      ],
+      "tone": "dark",
+      "audience": [
+        "education",
+        "training"
+      ]
+    },
+    "page": "#121c16",
+    "background": "#2c4535",
+    "paper": {
+      "surface": "#eef1e8",
+      "ink": "#1d2e23",
+      "card": "#1f3327",
+      "card_line": "#3c5a47"
+    },
+    "pill": [
+      "#36533f",
+      "#eef1e8"
+    ],
+    "accents": {
+      "blue": [
+        "#a9c9ec",
+        "#1d2e23"
+      ],
+      "green": [
+        "#b9e0a5",
+        "#1d2e23"
+      ],
+      "amber": [
+        "#f4dc8f",
+        "#1d2e23"
+      ],
+      "terra": [
+        "#f2ab92",
+        "#1d2e23"
+      ],
+      "teal": [
+        "#a2dccf",
+        "#1d2e23"
+      ],
+      "navy": [
+        "#eef1e8",
+        "#1d2e23"
+      ]
+    },
+    "fonts": {
+      "sans": "'URW Gothic','Noto Sans',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono',monospace"
+    },
+    "grain": 1.4,
+    "shadow": 0.5,
+    "shadow_color": "#08110c",
+    "sheen": 0.3,
+    "edge": {
+      "color": "#eef1e8",
+      "opacity": 0.45,
+      "width": 2
+    },
+    "vignette": {
+      "color": "#050a07",
+      "opacity": 0.5
+    },
+    "pattern": {
+      "kind": "smudge",
+      "col": "#e8efe4",
+      "op": 0.05
+    },
+    "mustard": "#f4dc8f",
+    "red": "#f2ab92",
+    "icons": {
+      "folder_tab": "#f4dc8f",
+      "cloud": [
+        "#eef1e8",
+        "#cfd9cb"
+      ],
+      "bubble": "#eef1e8",
+      "shackle": "#b8c4b6"
+    },
+    "caption_bg": "#0d1711"
+  },
+  "washi": {
+    "name": "Washi",
+    "kind": "theme",
+    "intent": "Soft fibrous Japanese paper, muted indigo and vermilion, calm serif type.",
+    "tags": {
+      "mood": [
+        "calm",
+        "refined",
+        "quiet"
+      ],
+      "tone": "light",
+      "audience": [
+        "wellness",
+        "design",
+        "storytelling"
+      ]
+    },
+    "page": "#24233a",
+    "background": "#ede4d3",
+    "paper": {
+      "surface": "#faf6ec",
+      "ink": "#28304a",
+      "card": "#2b3559",
+      "card_line": "#45507a"
+    },
+    "accents": {
+      "blue": [
+        "#34467a",
+        "#faf6ec"
+      ],
+      "green": [
+        "#6a7a4c",
+        "#faf6ec"
+      ],
+      "amber": [
+        "#d7a446",
+        "#28304a"
+      ],
+      "terra": [
+        "#c5432a",
+        "#faf6ec"
+      ],
+      "teal": [
+        "#4c7d78",
+        "#faf6ec"
+      ],
+      "navy": [
+        "#28304a",
+        "#faf6ec"
+      ]
+    },
+    "fonts": {
+      "sans": "'Noto Serif CJK JP','Noto Serif','DejaVu Serif',Georgia,serif",
+      "mono": "'DejaVu Sans Mono',monospace"
+    },
+    "grain": 1.0,
+    "shadow": 0.65,
+    "shadow_color": "#3a3448",
+    "jitter": 1.3,
+    "sheen": 0.6,
+    "vignette": {
+      "color": "#3a3448",
+      "opacity": 0.18
+    },
+    "pattern": {
+      "kind": "smudge",
+      "col": "#c9b896",
+      "op": 0.05
+    },
+    "mustard": "#d7a446",
+    "red": "#c5432a",
+    "icons": {
+      "folder_tab": "#e7c98a",
+      "cloud": [
+        "#faf6ec",
+        "#e3dccb"
+      ],
+      "bubble": "#faf6ec",
+      "shackle": "#a8a2a0"
+    }
+  },
+  "midnight": {
+    "name": "Midnight",
+    "kind": "theme",
+    "intent": "Near-black stage with dark paper pills and bright neon accents.",
+    "tags": {
+      "mood": [
+        "bold",
+        "modern",
+        "energetic"
+      ],
+      "tone": "dark",
+      "audience": [
+        "product",
+        "tech",
+        "launch"
+      ]
+    },
+    "page": "#06070d",
+    "background": "#11121c",
+    "paper": {
+      "surface": "#efeeff",
+      "ink": "#07080f",
+      "card": "#171930",
+      "card_line": "#2a2e55"
+    },
+    "pill": [
+      "#1d2033",
+      "#e8e8ff"
+    ],
+    "accents": {
+      "blue": [
+        "#4d8dff",
+        "#07080f"
+      ],
+      "green": [
+        "#3cf58c",
+        "#07080f"
+      ],
+      "amber": [
+        "#ffd43f",
+        "#07080f"
+      ],
+      "terra": [
+        "#ff4f7f",
+        "#07080f"
+      ],
+      "teal": [
+        "#2ff0e0",
+        "#07080f"
+      ],
+      "navy": [
+        "#9a6bff",
+        "#07080f"
+      ]
+    },
+    "fonts": {
+      "sans": "'Noto Sans','Helvetica Neue',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono',monospace"
+    },
+    "grain": 0.45,
+    "shadow": 1.3,
+    "shadow_color": "#000000",
+    "sheen": 0.6,
+    "edge": {
+      "color": "#ffffff",
+      "opacity": 0.12,
+      "width": 1.5
+    },
+    "vignette": {
+      "color": "#000000",
+      "opacity": 0.55
+    },
+    "mustard": "#ffd43f",
+    "red": "#ff4f7f",
+    "icons": {
+      "folder_tab": "#ffe58a",
+      "cloud": [
+        "#2ff0e0",
+        "#9a6bff"
+      ],
+      "bubble": "#1d2033",
+      "shackle": "#8b8fb0"
+    },
+    "caption_bg": "#000000"
+  },
+  "pastel": {
+    "name": "Pastel Studio",
+    "kind": "theme",
+    "intent": "Cream studio table, soft pastel cutouts, gentle shadows, friendly and light.",
+    "tags": {
+      "mood": [
+        "soft",
+        "friendly",
+        "approachable"
+      ],
+      "tone": "light",
+      "audience": [
+        "consumer",
+        "onboarding",
+        "kids"
+      ]
+    },
+    "page": "#3b3346",
+    "background": "#f6eee1",
+    "paper": {
+      "surface": "#ffffff",
+      "ink": "#4a3f58",
+      "card": "#6f5f91",
+      "card_line": "#8a7aac"
+    },
+    "accents": {
+      "blue": [
+        "#a9c8f2",
+        "#3a3150"
+      ],
+      "green": [
+        "#b6e2c3",
+        "#3a3150"
+      ],
+      "amber": [
+        "#ffc56e",
+        "#3a3150"
+      ],
+      "terra": [
+        "#f6b1a6",
+        "#3a3150"
+      ],
+      "teal": [
+        "#a5ded6",
+        "#3a3150"
+      ],
+      "navy": [
+        "#cbb9ee",
+        "#3a3150"
+      ]
+    },
+    "fonts": {
+      "sans": "'URW Gothic','Noto Sans','Helvetica Neue',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono',monospace"
+    },
+    "grain": 0.6,
+    "shadow": 0.55,
+    "shadow_color": "#6f5f91",
+    "sheen": 0.7,
+    "vignette": {
+      "color": "#6f5f91",
+      "opacity": 0.1
+    },
+    "mustard": "#ffd8a1",
+    "red": "#f6b1a6",
+    "icons": {
+      "folder_tab": "#ffe6bf",
+      "cloud": [
+        "#ffffff",
+        "#e6ddf6"
+      ],
+      "bubble": "#ffffff",
+      "shackle": "#cfc6dc"
+    }
+  },
+  "legalpad": {
+    "name": "Legal Pad",
+    "kind": "theme",
+    "intent": "Yellow ruled legal pad with a red margin and typewriter lettering.",
+    "tags": {
+      "mood": [
+        "practical",
+        "notes",
+        "informal"
+      ],
+      "tone": "light",
+      "audience": [
+        "legal",
+        "consulting",
+        "how-to"
+      ]
+    },
+    "page": "#2d2a1a",
+    "background": "#f9ec96",
+    "paper": {
+      "surface": "#fffbe3",
+      "ink": "#1f2a44",
+      "card": "#1f2a44",
+      "card_line": "#34436a"
+    },
+    "accents": {
+      "blue": [
+        "#2a4d9b",
+        "#fffbe3"
+      ],
+      "green": [
+        "#2f7a48",
+        "#fffbe3"
+      ],
+      "amber": [
+        "#f0b030",
+        "#1f2a44"
+      ],
+      "terra": [
+        "#c3402c",
+        "#fffbe3"
+      ],
+      "teal": [
+        "#2b7775",
+        "#fffbe3"
+      ],
+      "navy": [
+        "#1f2a44",
+        "#fffbe3"
+      ]
+    },
+    "fonts": {
+      "sans": "'Courier 10 Pitch','Nimbus Mono PS','Liberation Mono','Courier New',monospace",
+      "mono": "'Courier 10 Pitch','Nimbus Mono PS',monospace"
+    },
+    "grain": 0.8,
+    "shadow": 0.8,
+    "shadow_color": "#4a3f10",
+    "vignette": {
+      "color": "#4a3f10",
+      "opacity": 0.2
+    },
+    "pattern": {
+      "kind": "lines",
+      "col": "#5b87c9",
+      "op": 0.42,
+      "step": 56,
+      "top": 160,
+      "margin": "#d9534f"
+    },
+    "mustard": "#f0b030",
+    "red": "#c3402c",
+    "icons": {
+      "folder_tab": "#ffe07a",
+      "cloud": [
+        "#fffbe3",
+        "#e8e2c0"
+      ],
+      "bubble": "#fffbe3",
+      "shackle": "#b5ad8a"
+    }
+  },
+  "swiss": {
+    "name": "Swiss",
+    "kind": "theme",
+    "intent": "International style: flat white, red and black, bold grotesk, no texture.",
+    "tags": {
+      "mood": [
+        "clean",
+        "confident",
+        "minimal"
+      ],
+      "tone": "light",
+      "audience": [
+        "corporate",
+        "design",
+        "b2b"
+      ]
+    },
+    "page": "#111111",
+    "background": "#f4f4f1",
+    "paper": {
+      "surface": "#ffffff",
+      "ink": "#111111",
+      "card": "#111111",
+      "card_line": "#2a2a2a"
+    },
+    "pill": [
+      "#111111",
+      "#ffffff"
+    ],
+    "accents": {
+      "blue": [
+        "#e2001a",
+        "#ffffff"
+      ],
+      "green": [
+        "#111111",
+        "#ffffff"
+      ],
+      "amber": [
+        "#111111",
+        "#ffffff"
+      ],
+      "terra": [
+        "#e2001a",
+        "#ffffff"
+      ],
+      "teal": [
+        "#111111",
+        "#ffffff"
+      ],
+      "navy": [
+        "#e2001a",
+        "#ffffff"
+      ]
+    },
+    "fonts": {
+      "sans": "'Nimbus Sans','Liberation Sans','Helvetica Neue',Helvetica,Arial,sans-serif",
+      "mono": "'Nimbus Mono PS','Liberation Mono',monospace"
+    },
+    "grain": 0,
+    "shadow": 0,
+    "jitter": 0.12,
+    "sheen": 0,
+    "edge": {
+      "color": "#ffffff",
+      "opacity": 0,
+      "width": 1
+    },
+    "vignette": {
+      "color": "#000000",
+      "opacity": 0
+    },
+    "mustard": "#e2001a",
+    "red": "#e2001a",
+    "icons": {
+      "folder_tab": "#e2001a",
+      "cloud": [
+        "#111111",
+        "#e2001a"
+      ],
+      "bubble": "#ffffff",
+      "shackle": "#111111"
+    }
+  },
+  "terminal": {
+    "name": "Terminal",
+    "kind": "theme",
+    "intent": "Black CRT, phosphor green monospace, scanlines and a faint glow.",
+    "tags": {
+      "mood": [
+        "hacker",
+        "technical",
+        "retro"
+      ],
+      "tone": "dark",
+      "audience": [
+        "developers",
+        "security",
+        "devops"
+      ]
+    },
+    "page": "#000000",
+    "background": "#040804",
+    "paper": {
+      "surface": "#b9ffc6",
+      "ink": "#021005",
+      "card": "#03160a",
+      "card_line": "#0d3d1b"
+    },
+    "pill": [
+      "#06180b",
+      "#3dff70"
+    ],
+    "accents": {
+      "blue": [
+        "#3dff70",
+        "#021005"
+      ],
+      "green": [
+        "#8dffab",
+        "#021005"
+      ],
+      "amber": [
+        "#ffc533",
+        "#021005"
+      ],
+      "terra": [
+        "#ff5f56",
+        "#021005"
+      ],
+      "teal": [
+        "#2fe0c9",
+        "#021005"
+      ],
+      "navy": [
+        "#1c7a3a",
+        "#d8ffe0"
+      ]
+    },
+    "fonts": {
+      "sans": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',Menlo,monospace",
+      "mono": "'DejaVu Sans Mono','Liberation Mono',monospace"
+    },
+    "grain": 0.25,
+    "shadow": 0.55,
+    "shadow_color": "#1dff5a",
+    "jitter": 0.15,
+    "sheen": 0,
+    "edge": {
+      "color": "#3dff70",
+      "opacity": 0.65,
+      "width": 2
+    },
+    "vignette": {
+      "color": "#000000",
+      "opacity": 0.7
+    },
+    "pattern": {
+      "kind": "scanlines",
+      "col": "#3dff70",
+      "op": 0.05,
+      "step": 4
+    },
+    "mustard": "#ffc533",
+    "red": "#ff5f56",
+    "icons": {
+      "folder_tab": "#8dffab",
+      "cloud": [
+        "#0d3d1b",
+        "#145c29"
+      ],
+      "bubble": "#06180b",
+      "shackle": "#2a8a45"
+    },
+    "caption_bg": "#000000"
+  },
+  "archive": {
+    "name": "Archive",
+    "kind": "theme",
+    "intent": "Aged parchment with foxing stains, sepia ink and old book serif type.",
+    "tags": {
+      "mood": [
+        "historical",
+        "scholarly",
+        "vintage"
+      ],
+      "tone": "light",
+      "audience": [
+        "history",
+        "research",
+        "culture"
+      ]
+    },
+    "page": "#2a1d10",
+    "background": "#dfc796",
+    "paper": {
+      "surface": "#f3e5c2",
+      "ink": "#3a2814",
+      "card": "#3a2814",
+      "card_line": "#56402a"
+    },
+    "accents": {
+      "blue": [
+        "#4c5a68",
+        "#f3e5c2"
+      ],
+      "green": [
+        "#5d6a3a",
+        "#f3e5c2"
+      ],
+      "amber": [
+        "#c79a42",
+        "#3a2814"
+      ],
+      "terra": [
+        "#8c3a22",
+        "#f3e5c2"
+      ],
+      "teal": [
+        "#4a6a61",
+        "#f3e5c2"
+      ],
+      "navy": [
+        "#3a2814",
+        "#f3e5c2"
+      ]
+    },
+    "fonts": {
+      "sans": "'C059','Century Schoolbook','P052','Noto Serif','DejaVu Serif',serif",
+      "mono": "'Nimbus Mono PS','DejaVu Sans Mono',monospace"
+    },
+    "grain": 1.9,
+    "shadow": 0.85,
+    "shadow_color": "#3a2410",
+    "jitter": 1.2,
+    "sheen": 0.5,
+    "vignette": {
+      "color": "#4a2e10",
+      "opacity": 0.5
+    },
+    "pattern": {
+      "kind": "stains",
+      "col": "#8a5a24",
+      "op": 0.13
+    },
+    "mustard": "#c79a42",
+    "red": "#8c3a22",
+    "icons": {
+      "folder_tab": "#e6c983",
+      "cloud": [
+        "#f3e5c2",
+        "#e2cfa3"
+      ],
+      "bubble": "#f3e5c2",
+      "shackle": "#a99878"
+    }
+  },
+  "flat": {
+    "name": "Flat Vector",
+    "kind": "skin",
+    "intent": "Explainer-channel flat vector: deep space gradient, planets, bold flat shapes with soft highlights.",
+    "tags": {
+      "mood": [
+        "explainer",
+        "optimistic",
+        "cosmic"
+      ],
+      "tone": "dark",
+      "audience": [
+        "education",
+        "science",
+        "general"
+      ]
+    },
+    "skin": "flat",
+    "palette": {
+      "page": "#0e0f26",
+      "bg": "#17183b",
+      "bg2": "#3b2667",
+      "planet": "#ff8a5b",
+      "ring": "#ffd166",
+      "planet2": "#2e86de",
+      "card": "#232659",
+      "cardText": "#ffffff",
+      "titleBg": "#ffd166",
+      "titleFg": "#17183b",
+      "amberL": "#ffe5a3",
+      "cloud": "#e8f0ff",
+      "aceInk": "#17183b",
+      "chipA": [
+        "#ffd166",
+        "#17183b"
+      ],
+      "chipB": [
+        "#3a86ff",
+        "#ffffff"
+      ]
+    },
+    "pill": [
+      "#ffffff",
+      "#17183b"
+    ],
+    "accents": {
+      "blue": [
+        "#3a86ff",
+        "#ffffff"
+      ],
+      "green": [
+        "#06d6a0",
+        "#0b1b2b"
+      ],
+      "amber": [
+        "#ffd166",
+        "#17183b"
+      ],
+      "terra": [
+        "#ff6b6b",
+        "#1b1b3a"
+      ],
+      "teal": [
+        "#4cc9f0",
+        "#0b1b2b"
+      ],
+      "navy": [
+        "#7b5cff",
+        "#ffffff"
+      ]
+    },
+    "fonts": {
+      "sans": "'Nimbus Sans','Liberation Sans','Helvetica Neue',Helvetica,Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    }
+  },
+  "glass": {
+    "name": "Glassmorphism",
+    "kind": "skin",
+    "intent": "Frosted translucent panels with bright hairline borders floating over a blurred neon colour field.",
+    "tags": {
+      "mood": [
+        "modern",
+        "sleek",
+        "premium"
+      ],
+      "tone": "dark",
+      "audience": [
+        "product",
+        "saas",
+        "launch"
+      ]
+    },
+    "skin": "glass",
+    "palette": {
+      "page": "#120e33",
+      "bg": "#1a1446",
+      "blob1": "#ff4ecd",
+      "blob2": "#4d7cff",
+      "blob3": "#00d4c8",
+      "blob4": "#ffb84d",
+      "card": "#ffffff",
+      "cardText": "#ffffff",
+      "titleBg": "#ffffff",
+      "titleFg": "#ffffff",
+      "aceInk": "#1a1446",
+      "chipA": [
+        "#ffc85c",
+        "#ffffff"
+      ],
+      "chipB": [
+        "#6aa0ff",
+        "#ffffff"
+      ],
+      "cloud": "#ffffff",
+      "bubble": "#ffffff"
+    },
+    "pill": [
+      "#1a1446",
+      "#ffffff"
+    ],
+    "accents": {
+      "blue": [
+        "#6aa0ff",
+        "#ffffff"
+      ],
+      "green": [
+        "#3ee6b0",
+        "#ffffff"
+      ],
+      "amber": [
+        "#ffc85c",
+        "#ffffff"
+      ],
+      "terra": [
+        "#ff6f91",
+        "#ffffff"
+      ],
+      "teal": [
+        "#3fd4e0",
+        "#ffffff"
+      ],
+      "navy": [
+        "#8f7bff",
+        "#ffffff"
+      ]
+    },
+    "fonts": {
+      "sans": "'Noto Sans','Helvetica Neue',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    },
+    "text_plate": "#2a2050"
+  },
+  "iso": {
+    "name": "Isometric 3D",
+    "kind": "skin",
+    "intent": "Chunky extruded 2.5D blocks with side faces and ground shadows on an isometric grid.",
+    "tags": {
+      "mood": [
+        "structured",
+        "systems",
+        "tidy"
+      ],
+      "tone": "light",
+      "audience": [
+        "product",
+        "b2b",
+        "architecture"
+      ]
+    },
+    "skin": "iso",
+    "palette": {
+      "page": "#1d2033",
+      "bg": "#eef1f8",
+      "grid": "#dde3ef",
+      "card": "#3d5af1",
+      "cardText": "#ffffff",
+      "titleBg": "#ffffff",
+      "titleFg": "#2b2d42",
+      "ink": "#2b2d42",
+      "aceInk": "#2b2d42",
+      "chipA": [
+        "#ffb703",
+        "#2b2d42"
+      ],
+      "chipB": [
+        "#14b8a6",
+        "#ffffff"
+      ],
+      "cloud": "#dfe8ff"
+    },
+    "pill": [
+      "#ffffff",
+      "#2b2d42"
+    ],
+    "accents": {
+      "blue": [
+        "#3d5af1",
+        "#ffffff"
+      ],
+      "green": [
+        "#15803d",
+        "#ffffff"
+      ],
+      "amber": [
+        "#ffb703",
+        "#2b2d42"
+      ],
+      "terra": [
+        "#fb5607",
+        "#ffffff"
+      ],
+      "teal": [
+        "#0f766e",
+        "#ffffff"
+      ],
+      "navy": [
+        "#5b5fc7",
+        "#ffffff"
+      ]
+    },
+    "fonts": {
+      "sans": "'URW Gothic','Noto Sans',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    }
+  },
+  "kinetic": {
+    "name": "Kinetic Type",
+    "kind": "skin",
+    "intent": "Type-led motion: huge headline revealed word by word, accent wipe, minimal props, giant beat numerals.",
+    "tags": {
+      "mood": [
+        "bold",
+        "punchy",
+        "editorial"
+      ],
+      "tone": "dark",
+      "audience": [
+        "marketing",
+        "social",
+        "announcements"
+      ]
+    },
+    "skin": "kinetic",
+    "palette": {
+      "page": "#000000",
+      "bg": "#0c0c0c",
+      "fg": "#f4f1ea",
+      "fg2": "#bdb8ad",
+      "faint": "rgba(244,241,234,.10)",
+      "card": "#161616",
+      "cardText": "#f4f1ea",
+      "titleBg": "#ff4d2e",
+      "titleFg": "#0c0c0c",
+      "aceBody": "#f4f1ea",
+      "aceInk": "#0c0c0c",
+      "chipA": [
+        "#ffd23f",
+        "#0c0c0c"
+      ],
+      "chipB": [
+        "#f4f1ea",
+        "#0c0c0c"
+      ]
+    },
+    "accents": {
+      "blue": [
+        "#4d7cff",
+        "#0c0c0c"
+      ],
+      "green": [
+        "#b6ff3b",
+        "#0c0c0c"
+      ],
+      "amber": [
+        "#ffd23f",
+        "#0c0c0c"
+      ],
+      "terra": [
+        "#ff4d2e",
+        "#0c0c0c"
+      ],
+      "teal": [
+        "#2de2c9",
+        "#0c0c0c"
+      ],
+      "navy": [
+        "#c77dff",
+        "#0c0c0c"
+      ]
+    },
+    "fonts": {
+      "sans": "'Nimbus Sans','Liberation Sans','Helvetica Neue',Helvetica,Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    }
+  },
+  "synthwave": {
+    "name": "Neon Synthwave",
+    "kind": "skin",
+    "intent": "Retro sunset, scrolling neon grid, glowing outline shapes and a chromatic glitch on every entrance.",
+    "tags": {
+      "mood": [
+        "retro",
+        "hype",
+        "energetic"
+      ],
+      "tone": "dark",
+      "audience": [
+        "launch",
+        "gaming",
+        "social"
+      ]
+    },
+    "skin": "synthwave",
+    "palette": {
+      "page": "#05010d",
+      "ink": "#ffe6fb",
+      "card": "#ff2bd6",
+      "cardText": "#ffe6fb",
+      "titleBg": "#00e5ff",
+      "titleFg": "#e6fdff",
+      "amber": "#ffd23f",
+      "amberL": "#ffd23f",
+      "green": "#39ff9e",
+      "mustard": "#ffd23f",
+      "shackle": "#ff2bd6",
+      "cloud": "#00e5ff",
+      "bubble": "#00e5ff",
+      "light": "#ffe6fb",
+      "aceBody": "#00e5ff",
+      "aceBand": "#ff2bd6",
+      "aceInk": "#ffe6fb",
+      "aceRule": "#00e5ff",
+      "aceCheek": "#ff2bd6",
+      "chipA": [
+        "#ffd23f",
+        "#fff7d6"
+      ],
+      "chipB": [
+        "#00e5ff",
+        "#e6fdff"
+      ]
+    },
+    "pill": [
+      "#00e5ff",
+      "#e6fdff"
+    ],
+    "accents": {
+      "blue": [
+        "#00e5ff",
+        "#e6fdff"
+      ],
+      "green": [
+        "#39ff9e",
+        "#eafff4"
+      ],
+      "amber": [
+        "#ffd23f",
+        "#fff7d6"
+      ],
+      "terra": [
+        "#ff2bd6",
+        "#ffe6fb"
+      ],
+      "teal": [
+        "#00ffd5",
+        "#e6fffb"
+      ],
+      "navy": [
+        "#b14cff",
+        "#f4e6ff"
+      ]
+    },
+    "fonts": {
+      "sans": "'Noto Sans','Helvetica Neue',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    },
+    "text_plate": "#12032a"
+  },
+  "pixel": {
+    "name": "Pixel Art",
+    "kind": "skin",
+    "intent": "8-bit game screen: chunky bitmaps, notched boxes with hard shadows, monospace caps, stepped motion.",
+    "tags": {
+      "mood": [
+        "retro",
+        "playful",
+        "nerdy"
+      ],
+      "tone": "dark",
+      "audience": [
+        "gaming",
+        "developers",
+        "kids"
+      ]
+    },
+    "skin": "pixel",
+    "palette": {
+      "page": "#000000",
+      "bg": "#1d2b53",
+      "ground": "#ab5236",
+      "grass": "#00e436",
+      "hill": "#008751",
+      "ink": "#000000",
+      "card": "#7e2553",
+      "cardText": "#fff1e8",
+      "titleBg": "#ffec27",
+      "titleFg": "#1d2b53",
+      "amber": "#ffa300",
+      "amberL": "#ffec27",
+      "green": "#00e436",
+      "mustard": "#ffec27",
+      "shackle": "#c2c3c7",
+      "aceBand": "#29adff",
+      "aceCheek": "#ff77a8",
+      "aceRule": "#c2c3c7",
+      "chipA": [
+        "#ffa300",
+        "#1d2b53"
+      ],
+      "chipB": [
+        "#29adff",
+        "#1d2b53"
+      ]
+    },
+    "pill": [
+      "#fff1e8",
+      "#1d2b53"
+    ],
+    "accents": {
+      "blue": [
+        "#29adff",
+        "#1d2b53"
+      ],
+      "green": [
+        "#00e436",
+        "#1d2b53"
+      ],
+      "amber": [
+        "#ffa300",
+        "#1d2b53"
+      ],
+      "terra": [
+        "#ff004d",
+        "#fff1e8"
+      ],
+      "teal": [
+        "#3fd9c2",
+        "#1d2b53"
+      ],
+      "navy": [
+        "#7e2553",
+        "#fff1e8"
+      ]
+    },
+    "fonts": {
+      "sans": "'PT Pixel','DejaVu Sans Mono',monospace",
+      "mono": "'PT Pixel','DejaVu Sans Mono',monospace"
+    }
+  },
+  "sketch": {
+    "name": "Whiteboard Sketch",
+    "kind": "skin",
+    "intent": "Marker on a whiteboard: outlines draw on stroke by stroke, highlighter washes, handwriting-style text reveal.",
+    "tags": {
+      "mood": [
+        "explanatory",
+        "casual",
+        "human"
+      ],
+      "tone": "light",
+      "audience": [
+        "education",
+        "workshops",
+        "how-to"
+      ]
+    },
+    "skin": "sketch",
+    "palette": {
+      "page": "#2b2f33",
+      "bg": "#f7f7f3",
+      "ink": "#1f2328",
+      "card": "#ffffff",
+      "cardText": "#1f2328",
+      "titleBg": "#ffe066",
+      "titleFg": "#1f2328",
+      "amber": "#ffd43b",
+      "amberL": "#fff3bf",
+      "green": "#69db7c",
+      "mustard": "#ffd43b",
+      "cloud": "#a5d8ff",
+      "aceBand": "#74c0fc",
+      "aceInk": "#1f2328",
+      "chipA": [
+        "#ffe066",
+        "#1f2328"
+      ],
+      "chipB": [
+        "#74c0fc",
+        "#1f2328"
+      ]
+    },
+    "pill": [
+      "#dee2e6",
+      "#1f2328"
+    ],
+    "accents": {
+      "blue": [
+        "#74c0fc",
+        "#1f2328"
+      ],
+      "green": [
+        "#8ce99a",
+        "#1f2328"
+      ],
+      "amber": [
+        "#ffe066",
+        "#1f2328"
+      ],
+      "terra": [
+        "#ffa8a8",
+        "#1f2328"
+      ],
+      "teal": [
+        "#63e6be",
+        "#1f2328"
+      ],
+      "navy": [
+        "#b197fc",
+        "#1f2328"
+      ]
+    },
+    "fonts": {
+      "sans": "'PT Hand','Ubuntu','Noto Sans',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono',monospace"
+    }
+  },
+  "clay": {
+    "name": "Clay 3D",
+    "kind": "skin",
+    "intent": "Soft puffy clay forms with gentle light and shade, big contact shadows and squash and stretch.",
+    "tags": {
+      "mood": [
+        "soft",
+        "friendly",
+        "tactile"
+      ],
+      "tone": "light",
+      "audience": [
+        "consumer",
+        "onboarding",
+        "kids"
+      ]
+    },
+    "skin": "clay",
+    "palette": {
+      "page": "#3a2a2a",
+      "bg": "#fde8d7",
+      "bg2": "#f3c4a8",
+      "blob1": "#ffb3c1",
+      "blob2": "#b8e0ff",
+      "shadow": "#8a4b3a",
+      "card": "#7c6cf0",
+      "cardText": "#ffffff",
+      "titleBg": "#ffffff",
+      "titleFg": "#4a3fb0",
+      "ink": "#3d2b26",
+      "amber": "#ffc15e",
+      "amberL": "#ffe0a6",
+      "aceBody": "#fff7f0",
+      "aceBand": "#6c8cff",
+      "aceInk": "#3d2b26",
+      "cloud": "#e6f2ff",
+      "chipA": [
+        "#ffc15e",
+        "#5a3d1e"
+      ],
+      "chipB": [
+        "#6c8cff",
+        "#ffffff"
+      ]
+    },
+    "pill": [
+      "#ffffff",
+      "#5a4a42"
+    ],
+    "accents": {
+      "blue": [
+        "#6c8cff",
+        "#ffffff"
+      ],
+      "green": [
+        "#5fd39a",
+        "#2b2320"
+      ],
+      "amber": [
+        "#ffc15e",
+        "#5a3d1e"
+      ],
+      "terra": [
+        "#ff7a6b",
+        "#2b2320"
+      ],
+      "teal": [
+        "#46c9c0",
+        "#2b2320"
+      ],
+      "navy": [
+        "#7c6cf0",
+        "#ffffff"
+      ]
+    },
+    "fonts": {
+      "sans": "'URW Gothic','Noto Sans',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    }
+  },
+  "brutal": {
+    "name": "Brutalist Editorial",
+    "kind": "skin",
+    "intent": "Raw grid, heavy black outlines, hard offset shadows, all caps grotesk and a running ticker.",
+    "tags": {
+      "mood": [
+        "loud",
+        "raw",
+        "editorial"
+      ],
+      "tone": "light",
+      "audience": [
+        "culture",
+        "marketing",
+        "opinion"
+      ]
+    },
+    "skin": "brutal",
+    "palette": {
+      "page": "#111111",
+      "bg": "#efece3",
+      "block": "#ff3b1f",
+      "ink": "#111111",
+      "card": "#ffffff",
+      "cardText": "#111111",
+      "titleBg": "#ffe500",
+      "titleFg": "#111111",
+      "amber": "#ffe500",
+      "amberL": "#ffffff",
+      "aceBand": "#2b59ff",
+      "aceInk": "#111111",
+      "chipA": [
+        "#ffe500",
+        "#111111"
+      ],
+      "chipB": [
+        "#2b59ff",
+        "#ffffff"
+      ]
+    },
+    "pill": [
+      "#ffffff",
+      "#111111"
+    ],
+    "accents": {
+      "blue": [
+        "#2b59ff",
+        "#ffffff"
+      ],
+      "green": [
+        "#00c26e",
+        "#111111"
+      ],
+      "amber": [
+        "#ffe500",
+        "#111111"
+      ],
+      "terra": [
+        "#ff3b1f",
+        "#111111"
+      ],
+      "teal": [
+        "#00d1c1",
+        "#111111"
+      ],
+      "navy": [
+        "#111111",
+        "#ffffff"
+      ]
+    },
+    "fonts": {
+      "sans": "'Nimbus Sans','Liberation Sans','Helvetica Neue',Helvetica,Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    }
+  },
+  "dash": {
+    "name": "Data Dashboard",
+    "kind": "skin",
+    "intent": "Dark product UI: cards with accent rails, gauge rings, a live sparkline, bar chart, timer and progress bar.",
+    "tags": {
+      "mood": [
+        "analytical",
+        "product",
+        "technical"
+      ],
+      "tone": "dark",
+      "audience": [
+        "saas",
+        "ops",
+        "finance"
+      ]
+    },
+    "skin": "dash",
+    "palette": {
+      "page": "#0d1117",
+      "bg": "#0d1117",
+      "grid": "#1f2733",
+      "chrome": "#161b22",
+      "border": "#2d3748",
+      "card": "#161b22",
+      "card2": "#1c2330",
+      "fg": "#e6edf3",
+      "dim": "#7d8590",
+      "accent": "#58a6ff",
+      "accent2": "#f778ba",
+      "cardText": "#e6edf3",
+      "titleBg": "#58a6ff",
+      "titleFg": "#ffffff",
+      "ink": "#0d1117",
+      "amber": "#d29922",
+      "green": "#3fb950",
+      "aceBody": "#1c2330",
+      "aceBand": "#58a6ff",
+      "aceInk": "#e6edf3",
+      "aceRule": "#2d3748",
+      "aceCheek": "#f778ba",
+      "chipA": [
+        "#d29922",
+        "#e6edf3"
+      ],
+      "chipB": [
+        "#58a6ff",
+        "#e6edf3"
+      ]
+    },
+    "pill": [
+      "#8b949e",
+      "#c9d1d9"
+    ],
+    "accents": {
+      "blue": [
+        "#58a6ff",
+        "#e6edf3"
+      ],
+      "green": [
+        "#3fb950",
+        "#e6edf3"
+      ],
+      "amber": [
+        "#d29922",
+        "#e6edf3"
+      ],
+      "terra": [
+        "#f85149",
+        "#e6edf3"
+      ],
+      "teal": [
+        "#39c5cf",
+        "#e6edf3"
+      ],
+      "navy": [
+        "#a371f7",
+        "#e6edf3"
+      ]
+    },
+    "fonts": {
+      "sans": "'Noto Sans','Helvetica Neue',Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    },
+    "text_plate": "#1c2330"
+  },
+  "cad": {
+    "name": "CAD Schematic",
+    "kind": "skin",
+    "intent": "Technical drawing sheet: thin cyan line work drawn on, dimension lines, crosshairs and a title block.",
+    "tags": {
+      "mood": [
+        "technical",
+        "precise",
+        "engineering"
+      ],
+      "tone": "dark",
+      "audience": [
+        "engineering",
+        "hardware",
+        "architecture"
+      ]
+    },
+    "skin": "cad",
+    "palette": {
+      "page": "#061222",
+      "bg": "#0b1d33",
+      "grid": "#1e4a7a",
+      "line": "#9ad8ff",
+      "fg": "#d6efff",
+      "dim": "#6fa8d6",
+      "accent": "#ffd166",
+      "card": "#0b1d33",
+      "cardText": "#d6efff",
+      "titleBg": "#0b1d33",
+      "titleFg": "#9ad8ff",
+      "aceBody": "#9ad8ff",
+      "aceBand": "#9ad8ff",
+      "aceInk": "#9ad8ff",
+      "aceRule": "#9ad8ff",
+      "aceCheek": "#9ad8ff",
+      "chipA": [
+        "#ffd166",
+        "#ffe9b0"
+      ],
+      "chipB": [
+        "#9ad8ff",
+        "#d6efff"
+      ]
+    },
+    "pill": [
+      "#9ad8ff",
+      "#d6efff"
+    ],
+    "accents": {
+      "blue": [
+        "#4cc9f0",
+        "#d6efff"
+      ],
+      "green": [
+        "#80ffdb",
+        "#d6efff"
+      ],
+      "amber": [
+        "#ffd166",
+        "#ffe9b0"
+      ],
+      "terra": [
+        "#ff8fab",
+        "#ffd6e0"
+      ],
+      "teal": [
+        "#64dfdf",
+        "#d6efff"
+      ],
+      "navy": [
+        "#9ad8ff",
+        "#d6efff"
+      ]
+    },
+    "fonts": {
+      "sans": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    },
+    "text_plate": "#0b1d33"
+  },
+  "comic": {
+    "name": "Comic Pop Art",
+    "kind": "skin",
+    "intent": "Sunburst and Ben-Day dots, thick ink outlines, hard shadows, slanted outlined caps and starbursts.",
+    "tags": {
+      "mood": [
+        "fun",
+        "loud",
+        "pop"
+      ],
+      "tone": "light",
+      "audience": [
+        "social",
+        "consumer",
+        "kids"
+      ]
+    },
+    "skin": "comic",
+    "palette": {
+      "page": "#111111",
+      "bg": "#ffd60a",
+      "ray": "#ffc300",
+      "burst": "#ff3b30",
+      "ink": "#111111",
+      "card": "#1f6feb",
+      "cardText": "#ffffff",
+      "titleBg": "#ff3b30",
+      "titleFg": "#ffffff",
+      "amber": "#ff9f1c",
+      "amberL": "#ffd166",
+      "cloud": "#ffffff",
+      "aceBand": "#ff3b30",
+      "aceInk": "#111111",
+      "chipA": [
+        "#ffd60a",
+        "#111111"
+      ],
+      "chipB": [
+        "#ffffff",
+        "#111111"
+      ]
+    },
+    "pill": [
+      "#ffffff",
+      "#111111"
+    ],
+    "accents": {
+      "blue": [
+        "#1f6feb",
+        "#ffffff"
+      ],
+      "green": [
+        "#2ecc40",
+        "#111111"
+      ],
+      "amber": [
+        "#ff9f1c",
+        "#111111"
+      ],
+      "terra": [
+        "#ff3b30",
+        "#ffffff"
+      ],
+      "teal": [
+        "#00b4d8",
+        "#111111"
+      ],
+      "navy": [
+        "#6a4cff",
+        "#ffffff"
+      ]
+    },
+    "fonts": {
+      "sans": "'Nimbus Sans','Liberation Sans','Helvetica Neue',Helvetica,Arial,sans-serif",
+      "mono": "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+    }
+  }
+}

@@ -23,3 +23,9 @@ Re-vendor by copying the two files again from a newer paper-trail commit if
 `lib/selfserve/scene_template.js` change there. There is no build step here: these are
 committed as final, ready-to-serve HTML, matching how `lib/selfserve/build_shells.py`
 already produces them in the source repo.
+
+These v1 shells are frozen: an approved `papercraft-scene-render` v1 template must keep
+rendering exactly what it rendered when it was approved. Newer shells (style presets, the
+`theme` field, end-card fixes) live in `cmd/papercraft_scene_assets_v2/` behind the separate
+`papercraft-scene-render-v2` builtin; re-vendor there, or add a further version, rather than
+replacing these files.
