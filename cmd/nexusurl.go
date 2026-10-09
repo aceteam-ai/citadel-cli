@@ -136,3 +136,61 @@ func nexusFlagMismatchError(hasState, explicitFlag bool, flagURL, persistedURL s
 func normalizeControlURL(url string) string {
 	return strings.TrimSuffix(strings.TrimSpace(url), "/")
 }
+
+// applyDeviceAuthNexusURL adopts the effective control URL for a
+// device-authorization enroll (citadel-cli#1122), so BOTH the connection and
+// the #1110 persistence target the org's authoritative nexus instead of the
+// compiled-in default. It is the production wrapper around the pure
+// resolveDeviceAuthNexusURL, reading the live signals (whether --nexus was set,
+// whether this node is already enrolled, and what URL is persisted) and
+// mutating the package-level nexusURL that every enroll site threads into
+// network.ServerConfig.ControlURL.
+//
+// By the time this runs, root.go's PersistentPreRun -> preparePrivateCATrust has
+// already set nexusURL to the explicit flag value (if changed) or
+// network.ResolveControlURL() (persisted-or-default) otherwise, so nexusURL is
+// the correct "preRun" input to the resolver.
+func applyDeviceAuthNexusURL(nexusFlagChanged bool, tokenNexusURL string) {
+	hasState := network.HasState()
+	persisted := network.PersistedControlURL()
+	// Trace the one case the resolver deliberately ignores the token: an
+	// already-enrolled node whose backend-supplied nexus differs from what it
+	// persisted. D7 keeps it on the persisted control plane (moving enrolled
+	// state to a different nexus is the persisted!=connected churn #1110/#1235
+	// closed), but a disagreement is worth logging rather than hiding.
+	if !nexusFlagChanged && hasState && strings.TrimSpace(tokenNexusURL) != "" &&
+		strings.TrimSpace(persisted) != "" &&
+		normalizeControlURL(persisted) != normalizeControlURL(tokenNexusURL) {
+		Debug("device-auth token nexus %q differs from persisted %q; keeping persisted (citadel-cli#1110 D7)",
+			tokenNexusURL, persisted)
+	}
+	nexusURL = resolveDeviceAuthNexusURL(nexusFlagChanged, hasState, nexusURL, persisted, tokenNexusURL)
+}
+
+// resolveDeviceAuthNexusURL is the pure decision for the effective device-auth
+// control URL. Precedence (citadel-cli#1122):
+//
+//  1. explicit --nexus flag        -> preRunURL (the flag value PersistentPreRun resolved)
+//  2. already enrolled             -> persistedURL  (D7: persisted wins everywhere)
+//  3. TokenResponse.NexusURL set   -> tokenNexusURL (the bug #1122 fixes)
+//  4. otherwise                    -> preRunURL     (the compiled-in default)
+//
+// "Already enrolled" requires BOTH network state and a persisted URL, mirroring
+// nexusFlagMismatchError: after `citadel logout` the tsnet state is gone
+// (hasState==false) but config.yaml remains, and that post-logout re-enroll to a
+// different org — the "move this node" path — must let the token (tier 3) win
+// rather than being pinned to the stale persisted URL. On the --relogin path the
+// state is preserved, so tier 2 keeps the node on its own control plane even
+// when the token names a different one.
+func resolveDeviceAuthNexusURL(explicitFlag, enrolledWithState bool, preRunURL, persistedURL, tokenNexusURL string) string {
+	if explicitFlag {
+		return preRunURL
+	}
+	if enrolledWithState && strings.TrimSpace(persistedURL) != "" {
+		return persistedURL
+	}
+	if strings.TrimSpace(tokenNexusURL) != "" {
+		return tokenNexusURL
+	}
+	return preRunURL
+}
