@@ -119,6 +119,12 @@ just run 'citadel enroll' and scan.`,
 		// does not appear twice in the Fabric dashboard after re-installs.
 		reclaimStaleNodeByHostname(result.Token.DeviceAPIToken, nodeName)
 
+		// Honor the org's authoritative nexus from the device-auth token when
+		// --nexus was not explicitly set (citadel-cli#1122), so a QR-enroll
+		// against a self-hosted backend joins THAT control plane (and persists
+		// it) rather than the compiled-in default. Explicit --nexus still wins.
+		applyDeviceAuthNexusURL(flagChanged(cmd, "nexus"), result.Token.NexusURL)
+
 		fmt.Println("\n--- 🌐 Joining your org's Fabric ---")
 		fmt.Printf("Connecting as '%s'...\n", nodeName)
 		if err := connectToNetwork(nodeName, result.Token.Authkey); err != nil {

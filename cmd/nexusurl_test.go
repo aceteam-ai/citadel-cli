@@ -189,6 +189,88 @@ func TestClearNodeDeviceFieldsPreservingNexusURL(t *testing.T) {
 	})
 }
 
+// TestResolveDeviceAuthNexusURL pins the citadel-cli#1122 precedence hermetically
+// (pure core, no cmd/network/config): explicit --nexus flag > persisted (when
+// already enrolled) > TokenResponse.NexusURL > the built-in default. Driven with
+// injected values so it never touches the live node's GetNodeConfigDir().
+func TestResolveDeviceAuthNexusURL(t *testing.T) {
+	const (
+		explicit  = "https://nexus.explicit"
+		persisted = "https://nexus.persisted"
+		token     = "https://nexus.token"
+		def       = "https://nexus.aceteam.ai"
+	)
+	tests := []struct {
+		name          string
+		explicitFlag  bool
+		enrolled      bool
+		preRunURL     string
+		persistedURL  string
+		tokenNexusURL string
+		want          string
+	}{
+		{
+			name:          "explicit flag wins over token (fresh node)",
+			explicitFlag:  true,
+			preRunURL:     explicit,
+			tokenNexusURL: token,
+			want:          explicit,
+		},
+		{
+			name:          "explicit flag wins over both persisted and token (enrolled)",
+			explicitFlag:  true,
+			enrolled:      true,
+			preRunURL:     explicit,
+			persistedURL:  persisted,
+			tokenNexusURL: token,
+			want:          explicit,
+		},
+		{
+			name:          "enrolled node keeps persisted even when token differs (relogin / D7)",
+			enrolled:      true,
+			preRunURL:     persisted, // == ResolveControlURL() when enrolled + flag unchanged
+			persistedURL:  persisted,
+			tokenNexusURL: token,
+			want:          persisted,
+		},
+		{
+			name:          "fresh node (no state) honors token over the default",
+			preRunURL:     def,
+			tokenNexusURL: token,
+			want:          token,
+		},
+		{
+			name:          "post-logout move: persisted remains but state is gone, token wins",
+			enrolled:      false,
+			preRunURL:     def,
+			persistedURL:  persisted, // stale config.yaml after `citadel logout`
+			tokenNexusURL: token,
+			want:          token,
+		},
+		{
+			name:          "no token, not enrolled: falls back to the default",
+			preRunURL:     def,
+			tokenNexusURL: "",
+			want:          def,
+		},
+		{
+			name:          "whitespace-only token is treated as empty",
+			preRunURL:     def,
+			tokenNexusURL: "   ",
+			want:          def,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveDeviceAuthNexusURL(tt.explicitFlag, tt.enrolled, tt.preRunURL, tt.persistedURL, tt.tokenNexusURL)
+			if got != tt.want {
+				t.Fatalf("resolveDeviceAuthNexusURL(explicit=%t, enrolled=%t, preRun=%q, persisted=%q, token=%q) = %q, want %q",
+					tt.explicitFlag, tt.enrolled, tt.preRunURL, tt.persistedURL, tt.tokenNexusURL, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNormalizeControlURL(t *testing.T) {
 	if got := normalizeControlURL("  https://x/ "); got != "https://x" {
 		t.Fatalf("trailing slash + space not normalized: %q", got)

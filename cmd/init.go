@@ -249,6 +249,14 @@ and system user configuration (requires sudo).`,
 				Debug("no device config in token response")
 			}
 
+			// Honor the org's authoritative nexus from the device-auth token when
+			// --nexus was not explicitly set (citadel-cli#1122): a device-auth
+			// enroll against a self-hosted backend must join THAT control plane,
+			// not the compiled-in default. This drives both connectToNetwork's
+			// ServerConfig.ControlURL and the #1110 persistence (persisted ==
+			// connected). An explicit --nexus still wins.
+			applyDeviceAuthNexusURL(flagChanged(cmd, "nexus"), deviceAuthResult.Token.NexusURL)
+
 			// Immediately connect to network after device auth succeeds
 			fmt.Println("\n--- 🌐 Connecting to AceTeam Network ---")
 

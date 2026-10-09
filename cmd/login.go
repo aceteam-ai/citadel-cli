@@ -220,8 +220,10 @@ reusable secret should prefer --authkey-stdin so the key never appears in argv.`
 			return
 		}
 
-		// Interactive mode
-		runInteractiveLogin()
+		// Interactive mode. Thread whether --nexus was explicitly set so the
+		// device-auth path can honor the token's nexus when it was not
+		// (citadel-cli#1122).
+		runInteractiveLogin(flagChanged(cmd, "nexus"))
 	},
 }
 
@@ -307,8 +309,10 @@ func runNonInteractiveLogin() {
 	_ = network.Disconnect()
 }
 
-// runInteractiveLogin handles the interactive login flow
-func runInteractiveLogin() {
+// runInteractiveLogin handles the interactive login flow. nexusFlagChanged
+// reports whether --nexus was explicitly set, so the device-auth path can honor
+// the token's nexus when it was not (citadel-cli#1122).
+func runInteractiveLogin(nexusFlagChanged bool) {
 	choice, key, err := selectLoginNetworkChoice(loginNewDevice, nexus.GetNetworkChoice)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
@@ -371,6 +375,14 @@ func runInteractiveLogin() {
 			os.Exit(1)
 		}
 		authKey = authResult.Token.Authkey
+
+		// Honor the org's authoritative nexus from the device-auth token when
+		// --nexus was not explicitly set (citadel-cli#1122). Mutates the
+		// package-level nexusURL the ServerConfig below (and the #1110
+		// persistence) reads, so a device login against a self-hosted backend
+		// joins and persists THAT control plane rather than the compiled-in
+		// default. Scoped to the device case: the authkey path carries no token.
+		applyDeviceAuthNexusURL(nexusFlagChanged, authResult.Token.NexusURL)
 
 		// Persist device config so the token survives across sessions
 		if authResult.Token.DeviceAPIToken != "" {
