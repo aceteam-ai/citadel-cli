@@ -3,7 +3,7 @@
 // These tests exercise the pure row-building / sorting / formatting / JSON core
 // of "citadel ps" over INJECTED *status.NodeStatus and *resmon.Snapshot
 // fixtures. They never call runPs, findAndReadManifest, Collect, resmon.Collect,
-// nvidia-smi, or any container runtime -- this box runs a live citadel node and
+// nvidia-smi, or any container runtime. This box runs a live citadel node and
 // must not have a built binary or a live collection pointed at it.
 package cmd
 

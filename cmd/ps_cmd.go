@@ -284,7 +284,7 @@ func psAppRow(a *status.AppInfo, runtimeBin string) psRow {
 		Status: a.Status,
 		Port:   a.Port,
 	}
-	// An app is a container, so its runtime is the container runtime -- but only
+	// An app is a container, so its runtime is the container runtime, but only
 	// claim it when a stats row actually resolved (Footprint != nil); otherwise
 	// the runtime is honestly unknown.
 	if a.Footprint != nil {
@@ -295,6 +295,14 @@ func psAppRow(a *status.AppInfo, runtimeBin string) psRow {
 }
 
 // psSystemRow builds a row for a non-citadel GPU holder from a resmon snapshot.
+//
+// Reclaimable/Note are carried through from the consumer, but note resmon's
+// own contract: a single on-demand Collect (which `citadel ps --system` is)
+// sees every consumer for the first time with idleFor=0, so Reclaimable is
+// never true and Note is empty in a one-shot run. It flips true only for a
+// long-lived poller (the heartbeat path), the same limitation `citadel status`
+// has. This path still carries the fields so a future continuous caller gets
+// them for free.
 func psSystemRow(c *resmon.Consumer) psRow {
 	row := psRow{
 		Name:        c.Owner,
@@ -341,7 +349,7 @@ func psServiceRuntime(name, runtimeBin string, hasFootprint bool) string {
 // psApplyFootprint copies the live footprint's CPU/RAM/VRAM onto a row, honoring
 // each field's documented unknown-vs-zero contract (ServiceFootprint): CPU -1 is
 // unknown, RAM 0 is unknown, and VRAM is only meaningful when the node has a GPU
-// (HasGPU) -- there a 0 is a real zero. A nil footprint leaves all three unknown.
+// (HasGPU), where a 0 is a real zero. A nil footprint leaves all three unknown.
 func psApplyFootprint(row *psRow, fp *status.ServiceFootprint) {
 	if fp == nil {
 		return
