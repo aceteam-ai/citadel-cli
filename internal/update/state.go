@@ -19,6 +19,19 @@ type State struct {
 	LastUpdate      time.Time `json:"last_update,omitzero"`
 	AutoUpdate      bool      `json:"auto_update"`
 	Channel         string    `json:"channel"` // "stable" or "rc"
+
+	// Telemetry fields for the heartbeat auto_update report (citadel-cli#1134).
+	// Written on every attempted check and terminal result through the atomic
+	// mutateState path (report.go), which only ever touches these fields so a
+	// concurrent preference write (AutoUpdate, via `citadel update
+	// enable/disable`) is never clobbered. Additive and omitzero/omitempty:
+	// older state.json files lack them and read as zero (degraded to
+	// "unknown"/"never_checked" by the report builder), keeping this struct
+	// JSON-compatible with every pre-#1134 state file.
+	LastCheckAt   time.Time `json:"last_check_at,omitzero"`   // last release check actually attempted
+	LatestVersion string    `json:"latest_version,omitempty"` // last release observed by this node
+	LastResultAt  time.Time `json:"last_result_at,omitzero"`  // when LastResult was recorded
+	LastResult    string    `json:"last_result,omitempty"`    // bounded result code (see report.go)
 }
 
 // DefaultCheckInterval is the minimum time between update checks
