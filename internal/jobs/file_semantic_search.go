@@ -2,8 +2,10 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -67,12 +69,16 @@ func (h *FileSemanticSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]b
 
 	ctx.Log("info", "     - [Job %s] FILE_SEMANTIC_SEARCH query=%q top_k=%d model=%q", job.ID, truncateLine(query, 80), topK, model)
 
-	vecs, err := embedTexts(model, []string{query})
+	op := newTEIEmbeddingOperation(teiBaseURL())
+	vecs, err := embedTexts(ctx.Context(), op, model, []string{query})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 	if len(vecs) == 0 || len(vecs[0]) == 0 {
 		return nil, fmt.Errorf("embedding service returned an empty query vector")
+	}
+	if err := ctx.Context().Err(); err != nil {
+		return nil, fmt.Errorf("semantic search cancelled: %w", err)
 	}
 
 	hits, err := store.Search(vecs[0], topK)
@@ -94,15 +100,11 @@ func (h *FileSemanticSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]b
 // embedTexts embeds inputs via the node's TEI service, waiting for readiness,
 // and returns the vectors as float32 (the index's storage type). It reuses the
 // same TEI call path as the EmbeddingHandler.
-func embedTexts(model string, inputs []string) ([][]float32, error) {
+func embedTexts(ctx context.Context, op *teiEmbeddingOperation, model string, inputs []string) ([][]float32, error) {
 	if len(inputs) == 0 {
 		return nil, nil
 	}
-	base := teiBaseURL()
-	if err := waitForTEIReady(base, teiReadyTimeout); err != nil {
-		return nil, err
-	}
-	res, err := callTEIEmbeddings(base, &EmbeddingRequest{Model: model, Input: inputs})
+	res, err := op.embed(ctx, &EmbeddingRequest{Model: model, Input: inputs})
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +115,9 @@ func embedTexts(model string, inputs []string) ([][]float32, error) {
 	for i, v := range res.Embeddings {
 		f32 := make([]float32, len(v))
 		for j, f := range v {
+			if math.IsNaN(f) || math.IsInf(f, 0) || f > math.MaxFloat32 || f < -math.MaxFloat32 {
+				return nil, fmt.Errorf("embedding service returned non-float32 value at vector %d dimension %d", i, j)
+			}
 			f32[j] = float32(f)
 		}
 		out[i] = f32

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,37 +26,29 @@ const teiDefaultURL = "http://localhost:8102"
 
 // teiReadyTimeout bounds how long the handler waits for TEI to report healthy
 // before giving up. Mirrors the vLLM/SGLang readiness budget in
-// llm_inference.go. A var (not a const) so tests can shrink it rather than
-// wait the full budget for the not-ready path.
-var teiReadyTimeout = 60 * time.Second
+// llm_inference.go.
+const teiReadyTimeout = 60 * time.Second
 
-// teiDefaultMaxClientBatchSize is the per-request input cap assumed when TEI's
-// GET /info is unavailable or omits max_client_batch_size. It matches the stock
-// TEI module's default (see services/compose/tei.yml). TEI rejects any request
-// whose input array exceeds its max_client_batch_size with HTTP 413, so callers
-// must sub-batch to this limit (see callTEIEmbeddings).
-const teiDefaultMaxClientBatchSize = 32
-
-// teiInfoTimeout bounds the best-effort GET /info probe used to learn a TEI
-// backend's max_client_batch_size. Mirrors recordModelLicense's /info probe.
-const teiInfoTimeout = 10 * time.Second
-
-// errTEINotReady is returned (wrapped) by waitForTEIReady when the service does
-// not become healthy within the timeout. The FILE_INDEX walk distinguishes this
-// "service is gone" condition from a single file's embed failure: the former
-// aborts the walk (nothing else can succeed), the latter is recorded and
-// skipped so one bad file never stalls a large index.
+// errTEINotReady identifies a failed operation-wide readiness probe, rather
+// than a transient embedding failure for one file in a healthy operation.
 var errTEINotReady = errors.New("TEI service not ready")
 
-// teiBatchSizeMu guards teiBatchSizeCache.
-var teiBatchSizeMu sync.Mutex
-
-// teiBatchSizeCache memoizes each TEI base URL's resolved max_client_batch_size
-// so the GET /info probe runs at most once per URL per process (the FILE_INDEX
-// walk embeds many files through the same base URL). Keyed by base URL so
-// distinct backends — including distinct httptest servers in tests — never share
-// a cached limit.
-var teiBatchSizeCache = map[string]int{}
+const (
+	// teiDefaultClientBatchSize matches the stock TEI module's
+	// max_client_batch_size and is the safe fallback when /info is unavailable
+	// or does not provide a trustworthy limit.
+	teiDefaultClientBatchSize = 32
+	// teiMaxClientBatchSize prevents a malformed or compromised /info response
+	// from disabling client-side batching with an implausibly large value.
+	teiMaxClientBatchSize      = 1024
+	teiInfoTimeout             = 5 * time.Second
+	teiEmbeddingRequestTimeout = 2 * time.Minute
+	// Embeddings are local calls, but a stalled socket must not hang a CLI
+	// operation forever when its parent context has no deadline.
+	teiHealthRequestTimeout   = 3 * time.Second
+	teiEmbeddingResponseLimit = 16 << 20 // 16 MiB across at most one sub-batch
+	teiErrorResponseLimit     = 4 << 10  // bounded drain; bodies never enter errors
+)
 
 // EmbeddingHandler handles JobTypeEmbedding ("embedding") jobs by routing them
 // to the local TEI service's OpenAI-compatible /v1/embeddings endpoint.
@@ -139,12 +132,13 @@ func (h *EmbeddingHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	}
 
 	ctx.Log("info", "     - [Job %s] Waiting for TEI embedding service to become ready...", job.ID)
-	if err := waitForTEIReady(teiBaseURL(), teiReadyTimeout); err != nil {
+	op := newTEIEmbeddingOperation(teiBaseURL())
+	if err := op.initialize(ctx.Context()); err != nil {
 		return nil, err
 	}
 	ctx.Log("info", "     - [Job %s] TEI ready. Embedding %d text(s) with model %q", job.ID, len(req.Input), req.Model)
 
-	result, err := callTEIEmbeddings(teiBaseURL(), req)
+	result, err := op.embed(ctx.Context(), req)
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +148,141 @@ func (h *EmbeddingHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, fmt.Errorf("failed to marshal embedding result: %w", err)
 	}
 	return out, nil
+}
+
+// teiEmbeddingOperation owns one logical embedding operation (one job or one
+// index walk). It probes readiness and /info at most once, then applies the
+// discovered batch limit to every request in that operation. Keeping this
+// state operation-scoped avoids stale process-wide limits after TEI restarts or
+// is reconfigured.
+type teiEmbeddingOperation struct {
+	baseURL        string
+	client         *http.Client
+	requestTimeout time.Duration
+	readyTimeout   time.Duration
+
+	initOnce  sync.Once
+	initErr   error
+	batchSize int
+}
+
+func newTEIEmbeddingOperation(baseURL string) *teiEmbeddingOperation {
+	return &teiEmbeddingOperation{
+		baseURL:        strings.TrimRight(baseURL, "/"),
+		client:         &http.Client{Timeout: teiEmbeddingRequestTimeout},
+		requestTimeout: teiEmbeddingRequestTimeout,
+		readyTimeout:   teiReadyTimeout,
+	}
+}
+
+// initialize waits for TEI and resolves its advertised client batch size once.
+// /info is advisory: unavailable, malformed, or implausible values fall back to
+// 32. Cancellation of the parent operation remains fatal and is never hidden by
+// that fallback.
+func (o *teiEmbeddingOperation) initialize(ctx context.Context) error {
+	o.initOnce.Do(func() {
+		if err := waitForTEIReady(ctx, o.client, o.baseURL, o.readyTimeout); err != nil {
+			o.initErr = err
+			return
+		}
+		o.batchSize, o.initErr = resolveTEIClientBatchSize(ctx, o.client, o.baseURL)
+	})
+	return o.initErr
+}
+
+type teiInfoResponse struct {
+	MaxClientBatchSize int `json:"max_client_batch_size"`
+}
+
+func resolveTEIClientBatchSize(ctx context.Context, client *http.Client, baseURL string) (int, error) {
+	fallback := func() (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return teiDefaultClientBatchSize, nil
+	}
+	infoCtx, cancel := context.WithTimeout(ctx, teiInfoTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(infoCtx, http.MethodGet, baseURL+"/info", nil)
+	if err != nil {
+		return fallback()
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		return fallback()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fallback()
+	}
+
+	const infoBodyLimit = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, infoBodyLimit+1))
+	if err != nil || len(body) > infoBodyLimit {
+		return fallback()
+	}
+	var info teiInfoResponse
+	if err := json.Unmarshal(body, &info); err != nil {
+		return fallback()
+	}
+	if info.MaxClientBatchSize < 1 || info.MaxClientBatchSize > teiMaxClientBatchSize {
+		return fallback()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return info.MaxClientBatchSize, nil
+}
+
+// embed splits req.Input into server-sized batches and returns one atomic,
+// input-ordered result. A later batch failure returns no partial result.
+func (o *teiEmbeddingOperation) embed(ctx context.Context, req *EmbeddingRequest) (*EmbeddingResult, error) {
+	if req == nil || len(req.Input) == 0 {
+		return nil, fmt.Errorf("embedding input must contain at least one text")
+	}
+	if err := o.initialize(ctx); err != nil {
+		return nil, err
+	}
+
+	result := &EmbeddingResult{
+		Model:      req.Model,
+		Embeddings: make([][]float64, len(req.Input)),
+	}
+	firstBatch := true
+	for start := 0; start < len(req.Input); start += o.batchSize {
+		end := start + o.batchSize
+		if end > len(req.Input) {
+			end = len(req.Input)
+		}
+		batch, err := callTEIEmbeddingBatch(ctx, o.client, o.baseURL, o.requestTimeout, &EmbeddingRequest{
+			Model:      req.Model,
+			Input:      req.Input[start:end],
+			Dimensions: req.Dimensions,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("embedding batch %d-%d: %w", start, end-1, err)
+		}
+		if result.Dimensions == 0 {
+			result.Dimensions = batch.Dimensions
+		} else if batch.Dimensions != result.Dimensions {
+			return nil, fmt.Errorf("TEI returned inconsistent embedding dimensions: batch %d-%d has %d, want %d", start, end-1, batch.Dimensions, result.Dimensions)
+		}
+		if batch.Model != "" {
+			if !firstBatch && batch.Model != result.Model {
+				return nil, fmt.Errorf("TEI returned inconsistent models across embedding batches at batch %d-%d", start, end-1)
+			}
+			result.Model = batch.Model
+		}
+		firstBatch = false
+		copy(result.Embeddings[start:end], batch.Embeddings)
+		result.Usage.PromptTokens += batch.Usage.PromptTokens
+		result.Usage.TotalTokens += batch.Usage.TotalTokens
+	}
+	return result, nil
 }
 
 // parseEmbeddingPayload extracts and validates the embedding request from the
@@ -202,61 +331,19 @@ func parseEmbeddingPayload(payload map[string]string) (*EmbeddingRequest, error)
 	return req, nil
 }
 
-// callTEIEmbeddings embeds all of req.Input via TEI's /v1/embeddings, sub-batching
-// to the backend's max_client_batch_size so a request larger than that limit does
-// not fail with HTTP 413 ("batch size N > maximum allowed batch size M"). The
-// per-batch responses are concatenated IN ORDER, so the returned vectors line up
-// one-to-one with req.Input regardless of how many batches were needed or how the
-// engine ordered each response. Usage counts are summed across batches; the model
-// name and dimensionality are taken from the first batch.
-//
-// A single input (the FILE_SEMANTIC_SEARCH query path) collapses to one batch and
-// produces a request byte-identical to the pre-sub-batching behavior.
+// callTEIEmbeddings is retained as a test-facing convenience for one complete
+// operation. Production call paths keep and reuse a teiEmbeddingOperation.
 func callTEIEmbeddings(baseURL string, req *EmbeddingRequest) (*EmbeddingResult, error) {
-	limit := teiMaxClientBatchSize(baseURL)
-	if limit < 1 {
-		limit = teiDefaultMaxClientBatchSize
-	}
-
-	result := &EmbeddingResult{
-		Model:      req.Model,
-		Embeddings: make([][]float64, 0, len(req.Input)),
-	}
-	first := true
-	for start := 0; start < len(req.Input); start += limit {
-		end := start + limit
-		if end > len(req.Input) {
-			end = len(req.Input)
-		}
-		batch := &EmbeddingRequest{
-			Model:      req.Model,
-			Input:      req.Input[start:end],
-			Dimensions: req.Dimensions,
-		}
-		batchRes, err := postTEIEmbeddingsBatch(baseURL, batch)
-		if err != nil {
-			return nil, err
-		}
-		result.Embeddings = append(result.Embeddings, batchRes.Embeddings...)
-		result.Usage.PromptTokens += batchRes.Usage.PromptTokens
-		result.Usage.TotalTokens += batchRes.Usage.TotalTokens
-		if first {
-			result.Model = batchRes.Model
-			first = false
-		}
-	}
-	if len(result.Embeddings) > 0 {
-		result.Dimensions = len(result.Embeddings[0])
-	}
-	return result, nil
+	return newTEIEmbeddingOperation(baseURL).embed(context.Background(), req)
 }
 
-// postTEIEmbeddingsBatch POSTs a single (already size-bounded) batch to TEI's
-// /v1/embeddings and returns the parsed result sized to exactly len(req.Input).
-// It rejects a response whose entry count differs from the input count, or that
-// leaves any input position without a vector, so a short/garbled response errors
-// rather than silently storing a nil embedding downstream.
-func postTEIEmbeddingsBatch(baseURL string, req *EmbeddingRequest) (*EmbeddingResult, error) {
+// callTEIEmbeddingBatch POSTs one already-bounded embedding request to TEI's
+// /v1/embeddings endpoint and strictly validates cardinality, indices, and
+// vector dimensions before returning it to the operation-level aggregator.
+func callTEIEmbeddingBatch(ctx context.Context, client *http.Client, baseURL string, timeout time.Duration, req *EmbeddingRequest) (*EmbeddingResult, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	reqPayload := map[string]any{
 		"model": req.Model,
 		"input": req.Input,
@@ -272,20 +359,37 @@ func postTEIEmbeddingsBatch(baseURL string, req *EmbeddingRequest) (*EmbeddingRe
 		return nil, fmt.Errorf("failed to marshal TEI request: %w", err)
 	}
 
-	resp, err := http.Post(baseURL+"/v1/embeddings", "application/json", bytes.NewBuffer(reqBody))
+	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, baseURL+"/v1/embeddings", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create TEI request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to TEI service: %w", err)
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("TEI returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		// Drain only a bounded prefix for connection reuse, but never place an
+		// upstream body in an error: a local server may echo indexed content.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, teiErrorResponseLimit))
+		return nil, &teiHTTPError{StatusCode: resp.StatusCode}
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, teiEmbeddingResponseLimit+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read TEI response: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(bodyBytes) > teiEmbeddingResponseLimit {
+		return nil, fmt.Errorf("TEI response exceeds %d bytes", teiEmbeddingResponseLimit)
 	}
 
 	var teiResp teiEmbeddingResponse
 	if err := json.Unmarshal(bodyBytes, &teiResp); err != nil {
-		return nil, fmt.Errorf("failed to parse TEI response: %w", err)
+		return nil, errors.New("failed to parse TEI response")
 	}
 	if len(teiResp.Data) != len(req.Input) {
 		return nil, fmt.Errorf("TEI returned %d embeddings for %d inputs", len(teiResp.Data), len(req.Input))
@@ -293,11 +397,13 @@ func postTEIEmbeddingsBatch(baseURL string, req *EmbeddingRequest) (*EmbeddingRe
 
 	result := &EmbeddingResult{
 		Model:      teiResp.Model,
-		Embeddings: make([][]float64, len(req.Input)),
+		Embeddings: make([][]float64, len(teiResp.Data)),
 	}
 	if result.Model == "" {
 		result.Model = req.Model
 	}
+	seen := make([]bool, len(result.Embeddings))
+	dim := 0
 	for _, d := range teiResp.Data {
 		// TEI returns data entries with explicit indices; place each vector at
 		// its index so output order matches the input order regardless of how
@@ -305,78 +411,74 @@ func postTEIEmbeddingsBatch(baseURL string, req *EmbeddingRequest) (*EmbeddingRe
 		if d.Index < 0 || d.Index >= len(result.Embeddings) {
 			return nil, fmt.Errorf("TEI returned out-of-range embedding index %d", d.Index)
 		}
+		if seen[d.Index] {
+			return nil, fmt.Errorf("TEI returned duplicate embedding index %d", d.Index)
+		}
+		if len(d.Embedding) == 0 {
+			return nil, fmt.Errorf("TEI returned empty embedding at index %d", d.Index)
+		}
+		if dim == 0 {
+			dim = len(d.Embedding)
+		} else if len(d.Embedding) != dim {
+			return nil, fmt.Errorf("TEI returned embedding dimension %d at index %d, want %d", len(d.Embedding), d.Index, dim)
+		}
+		seen[d.Index] = true
 		result.Embeddings[d.Index] = d.Embedding
 	}
-	for i, v := range result.Embeddings {
-		if v == nil {
-			return nil, fmt.Errorf("TEI response missing embedding for input index %d", i)
+	for i, present := range seen {
+		if !present {
+			return nil, fmt.Errorf("TEI response missing embedding index %d", i)
 		}
 	}
-	if len(result.Embeddings) > 0 {
-		result.Dimensions = len(result.Embeddings[0])
+	if req.Dimensions > 0 && dim != req.Dimensions {
+		return nil, fmt.Errorf("TEI returned embedding dimension %d, requested %d", dim, req.Dimensions)
 	}
+	result.Dimensions = dim
 	result.Usage.PromptTokens = teiResp.Usage.PromptTokens
 	result.Usage.TotalTokens = teiResp.Usage.TotalTokens
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	return result, nil
 }
 
-// teiMaxClientBatchSize returns the backend's max_client_batch_size, fetched from
-// GET /info at most once per base URL (memoized). Any failure resolves to
-// teiDefaultMaxClientBatchSize, which is also cached so a down /info endpoint is
-// probed only once.
-func teiMaxClientBatchSize(baseURL string) int {
-	teiBatchSizeMu.Lock()
-	defer teiBatchSizeMu.Unlock()
-	if v, ok := teiBatchSizeCache[baseURL]; ok {
-		return v
-	}
-	limit := fetchTEIMaxClientBatchSize(baseURL)
-	teiBatchSizeCache[baseURL] = limit
-	return limit
+type teiHTTPError struct {
+	StatusCode int
 }
 
-// fetchTEIMaxClientBatchSize performs a best-effort GET <baseURL>/info and returns
-// the reported max_client_batch_size. It falls back to teiDefaultMaxClientBatchSize
-// on any failure: unreachable, non-200, unparsable body, a missing/zero/negative
-// field. Mirrors recordModelLicense's defensive /info probe.
-func fetchTEIMaxClientBatchSize(baseURL string) int {
-	ctx, cancel := context.WithTimeout(context.Background(), teiInfoTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/info", nil)
-	if err != nil {
-		return teiDefaultMaxClientBatchSize
+func (e *teiHTTPError) Error() string {
+	return fmt.Sprintf("TEI returned status %d", e.StatusCode)
+}
+
+// teiFailureCategory deliberately excludes upstream response bodies. FILE_INDEX
+// continues after a per-file embedding failure, so logging the complete error
+// there would turn a server that echoes input into a persistent content leak.
+func teiFailureCategory(err error) string {
+	var httpErr *teiHTTPError
+	if errors.As(err, &httpErr) {
+		return fmt.Sprintf("TEI HTTP %d", httpErr.StatusCode)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return teiDefaultMaxClientBatchSize
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return teiDefaultMaxClientBatchSize
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-	if err != nil {
-		return teiDefaultMaxClientBatchSize
-	}
-	var info struct {
-		MaxClientBatchSize int `json:"max_client_batch_size"`
-	}
-	if err := json.Unmarshal(body, &info); err != nil || info.MaxClientBatchSize <= 0 {
-		return teiDefaultMaxClientBatchSize
-	}
-	return info.MaxClientBatchSize
+	return "TEI request failed"
 }
 
 // waitForTEIReady polls TEI's /health endpoint until it reports ready or the
 // timeout elapses. Mirrors waitForVLLMReady in llm_inference.go.
-func waitForTEIReady(baseURL string, timeout time.Duration) error {
+func waitForTEIReady(ctx context.Context, client *http.Client, baseURL string, timeout time.Duration) error {
 	healthURL := baseURL + "/health"
 	pollInterval := 1 * time.Second
-	startTime := time.Now()
+	readyCtx, readyCancel := context.WithTimeout(ctx, timeout)
+	defer readyCancel()
 
-	for time.Since(startTime) < timeout {
-		resp, err := http.Get(healthURL)
+	for {
+		healthCtx, cancel := context.WithTimeout(readyCtx, teiHealthRequestTimeout)
+		req, err := http.NewRequestWithContext(healthCtx, http.MethodGet, healthURL, nil)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("create TEI health request: %w", err)
+		}
+		resp, err := client.Do(req)
+		cancel()
 		if err == nil && resp.StatusCode == http.StatusOK {
 			resp.Body.Close()
 			return nil
@@ -384,7 +486,13 @@ func waitForTEIReady(baseURL string, timeout time.Duration) error {
 		if resp != nil {
 			resp.Body.Close()
 		}
-		time.Sleep(pollInterval)
+		select {
+		case <-readyCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("%w within %v", errTEINotReady, timeout)
+		case <-time.After(pollInterval):
+		}
 	}
-	return fmt.Errorf("TEI service did not become ready within %v: %w", timeout, errTEINotReady)
 }

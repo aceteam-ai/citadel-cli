@@ -17,16 +17,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
-// resetTEIBatchSizeCache clears the process-wide /info-derived batch-size cache.
-// Tests that assert a specific resolved limit must call this first: httptest
-// servers can reuse an ephemeral port across tests, so a stale cache entry for a
-// reused URL would otherwise leak one test's limit into another.
-func resetTEIBatchSizeCache() {
-	teiBatchSizeMu.Lock()
-	defer teiBatchSizeMu.Unlock()
-	teiBatchSizeCache = map[string]int{}
-}
-
 // batchTEIStub is a stub TEI service that records every /v1/embeddings batch
 // size it sees, rejects any batch larger than maxBatch with HTTP 413 (TEI's
 // exact message shape), and returns a 1-dim embedding that encodes the integer
@@ -128,7 +118,6 @@ func numberedInputs(n int) []string {
 }
 
 func TestCallTEIEmbeddings_SubBatchesAndPreservesOrder(t *testing.T) {
-	resetTEIBatchSizeCache()
 	// /info says 32; the engine 413s anything over 32. 40 inputs must still
 	// succeed via two batches (32 + 8), concatenated in input order.
 	st := newBatchTEIStub(t, "present", 32, 32)
@@ -177,7 +166,6 @@ func TestCallTEIEmbeddings_InfoLimitResolution(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resetTEIBatchSizeCache()
 			st := newBatchTEIStub(t, tc.infoMode, tc.infoLimit, tc.maxBatch)
 
 			const n = 40
@@ -203,7 +191,6 @@ func TestCallTEIEmbeddings_InfoLimitResolution(t *testing.T) {
 }
 
 func TestCallTEIEmbeddings_ShortResponseErrors(t *testing.T) {
-	resetTEIBatchSizeCache()
 	// Returns only one embedding for two inputs; must error, not store a nil.
 	srv := newTEIServer(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data":[{"index":0,"embedding":[0.1]}],"model":"gte","usage":{"prompt_tokens":1,"total_tokens":1}}`)
@@ -216,7 +203,6 @@ func TestCallTEIEmbeddings_ShortResponseErrors(t *testing.T) {
 }
 
 func TestEmbeddingHandler_Execute_SubBatchesLargeInput(t *testing.T) {
-	resetTEIBatchSizeCache()
 	// The EMBEDDING job takes an unbounded `input` array from the caller
 	// (run_fabric_embeddings). 33 inputs against a 32-cap engine must succeed via
 	// the shared sub-batching path, with usage summed across batches.
@@ -256,7 +242,6 @@ func TestEmbeddingHandler_Execute_SubBatchesLargeInput(t *testing.T) {
 }
 
 func TestFileIndex_LargeFileSubBatches(t *testing.T) {
-	resetTEIBatchSizeCache()
 	// A single file yielding >32 chunks must index successfully against a 32-cap
 	// engine (the #1260 regression: it used to abort the whole walk with a 413).
 	st := newBatchTEIStub(t, "present", 32, 32)
@@ -306,7 +291,6 @@ func TestFileIndex_LargeFileSubBatches(t *testing.T) {
 }
 
 func TestFileIndex_ContinuesPastFailedFile(t *testing.T) {
-	resetTEIBatchSizeCache()
 	// TEI 500s on any input containing the poison marker; one poisoned file must
 	// be recorded as failed and the walk must continue to index the others.
 	const poison = "POISONPILL"
@@ -376,7 +360,6 @@ func TestFileIndex_ContinuesPastFailedFile(t *testing.T) {
 }
 
 func TestFileIndex_AbortsWhenTEINeverReady(t *testing.T) {
-	resetTEIBatchSizeCache()
 	// /health never reports OK, so waitForTEIReady times out with errTEINotReady.
 	// That must ABORT the walk (a dead service can embed nothing) rather than be
 	// swallowed as a per-file failure and spin the full readiness budget on every
@@ -388,10 +371,6 @@ func TestFileIndex_AbortsWhenTEINeverReady(t *testing.T) {
 	t.Setenv("CITADEL_TEI_URL", srv.URL)
 	t.Setenv("CITADEL_INDEX_DB", "")
 
-	orig := teiReadyTimeout
-	teiReadyTimeout = 50 * time.Millisecond
-	defer func() { teiReadyTimeout = orig }()
-
 	ws := t.TempDir()
 	for _, name := range []string{"a.txt", "b.txt"} {
 		if err := os.WriteFile(filepath.Join(ws, name), []byte("some indexable text"), 0o644); err != nil {
@@ -400,6 +379,8 @@ func TestFileIndex_AbortsWhenTEINeverReady(t *testing.T) {
 	}
 	dbPath := filepath.Join(t.TempDir(), "index.db")
 	idx := NewFileIndexHandler(ws, dbPath)
+	idx.embeddingOp = newTEIEmbeddingOperation(srv.URL)
+	idx.embeddingOp.readyTimeout = 50 * time.Millisecond
 	_, err := idx.Execute(JobContext{}, &nexus.Job{ID: "j", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
 	if err == nil {
 		t.Fatalf("expected the walk to abort when TEI is never ready")

@@ -51,6 +51,9 @@ type FileIndexHandler struct {
 	DBPath string
 	// AllowOutsideWorkspace mirrors the read-handler relaxation flag.
 	AllowOutsideWorkspace bool
+	// embeddingOp is an optional hermetic test seam. Production always creates
+	// one fresh operation per Execute call below.
+	embeddingOp *teiEmbeddingOperation
 }
 
 // NewFileIndexHandler creates a FileIndexHandler rooted at workspace.
@@ -105,10 +108,20 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	seen := make(map[string]struct{})
 	var indexed, skipped, failed, embedded, chunksUpserted int
 	dim := 0
+	embedOp := h.embeddingOp
+	if embedOp == nil {
+		embedOp = newTEIEmbeddingOperation(teiBaseURL())
+	}
 
 	walkErr := filepath.WalkDir(validated, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
+			if p == validated {
+				return err
+			}
 			return nil // skip unreadable entries
+		}
+		if err := ctx.Context().Err(); err != nil {
+			return err
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -157,20 +170,23 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			skipped++
 			return nil
 		}
-		vecs, err := embedTexts(model, chunks)
+		vecs, err := embedTexts(ctx.Context(), embedOp, model, chunks)
 		if err != nil {
-			// A dead embedding service (readiness timeout) aborts the walk —
-			// nothing else can succeed, and continuing would block the full
-			// readiness budget on every remaining file. A single file's embed
-			// failure (e.g. TEI 413 on an un-sub-batchable input, a transient
-			// upstream error) is recorded and skipped so one bad file never
-			// stalls a large index, mirroring the oversized-file skip above.
+			if ctxErr := ctx.Context().Err(); ctxErr != nil {
+				return fmt.Errorf("embed %s: %w", p, ctxErr)
+			}
 			if errors.Is(err, errTEINotReady) {
+				// Readiness belongs to the entire operation. A dead service is
+				// fatal, while individual requests against a ready service may
+				// fail without abandoning the remaining files.
 				return fmt.Errorf("embed %s: %w", p, err)
 			}
 			failed++
-			ctx.Log("warn", "     - [Job %s] FILE_INDEX skipping %s: embed failed: %v", job.ID, p, err)
+			ctx.Log("error", "     - [Job %s] Failed to embed %s (%s); continuing", job.ID, p, teiFailureCategory(err))
 			return nil
+		}
+		if err := ctx.Context().Err(); err != nil {
+			return fmt.Errorf("embed %s: %w", p, err)
 		}
 		idxChunks := make([]nodeindex.Chunk, len(chunks))
 		for i := range chunks {
@@ -190,6 +206,9 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	if walkErr != nil {
 		return nil, fmt.Errorf("index walk failed: %w", walkErr)
 	}
+	if err := ctx.Context().Err(); err != nil {
+		return nil, fmt.Errorf("index walk cancelled: %w", err)
+	}
 
 	// Prune entries whose files vanished from disk under the indexed root.
 	removed := 0
@@ -200,6 +219,9 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		}
 		rootPrefix := validated + string(filepath.Separator)
 		for known_path := range known {
+			if err := ctx.Context().Err(); err != nil {
+				return nil, fmt.Errorf("index prune cancelled: %w", err)
+			}
 			if known_path != validated && !strings.HasPrefix(known_path, rootPrefix) {
 				continue // outside the indexed root; leave it
 			}
@@ -211,6 +233,9 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			}
 			removed++
 		}
+	}
+	if err := ctx.Context().Err(); err != nil {
+		return nil, fmt.Errorf("index operation cancelled: %w", err)
 	}
 
 	out := map[string]any{

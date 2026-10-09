@@ -2615,6 +2615,20 @@ additional margin is applied on top here; the swap planner's OWN separate
 swap.go`, citadel#874) is a different code path entirely and is untouched by
 this change.
 
+### TEI batching and indexing failure boundaries (citadel-cli#1260)
+
+`jobs.teiEmbeddingOperation` owns readiness and `/info` discovery once per job
+or index walk, not in a process-wide URL cache. It applies bounded,
+parent-context-aware requests and validates the complete ordered result before
+a file can be published. `FileIndexHandler.Execute` keeps operation-wide
+readiness failure, parent cancellation, root traversal failure, and storage
+failure fatal; individual embedding failures against a ready service increment
+`files_failed` and continue without pruning that file's prior row. Upstream
+response bodies must never appear in continuation logs. Both local index CLI
+entry points report `PARTIAL` when any file fails. Tests in
+`embedding_handler_test.go`, `embedding_batch_test.go`, and `file_index_test.go`
+pin these boundaries without reaching a live TEI service or index.
+
 ### Job-scoped GPU reserve/evict/restore (citadel #832)
 
 `internal/jobs.ServiceHandler.Reserve` / `.Release` / `.ReconcileOrphanedReservations`
