@@ -79,6 +79,29 @@ var svcStatusCmd = &cobra.Command{
 	RunE:  runSvcStatus,
 }
 
+var svcRefreshUnitCmd = &cobra.Command{
+	Use:   "refresh-unit",
+	Short: "Re-apply the service unit's restart policy from the current binary",
+	Long: `Re-render this node's citadel-managed service unit on disk so restart-policy
+changes shipped in newer binaries actually reach a node that was deployed by an
+older binary (the crash-restart-storm hardening: StartLimitIntervalSec,
+StartLimitBurst, RestartSteps, RestartMaxDelaySec).
+
+This is network-free and idempotent: a unit already carrying the current policy
+is left byte-for-byte untouched. It does NOT restart the service -- the refreshed
+unit takes effect on the next (natural or operator-driven) restart. A system
+unit (under /etc) requires root to rewrite; run under sudo if prompted.
+
+This refresh also runs automatically on 'citadel update install' (including when
+already on the latest version) and at worker startup; this command exposes it
+directly for the case where neither has run.`,
+	// Exits non-zero when a managed unit still needs root to refresh (so a
+	// scripted caller can tell "applied" from "run again under sudo"); silence
+	// the usage dump so only the actionable error line shows on that path.
+	SilenceUsage: true,
+	RunE:         runSvcRefreshUnit,
+}
+
 // Called by the desktop shell on startup. It never enrolls a node or adopts
 // an unrelated service; the result is deliberately safe to display in UI.
 var svcReconcileDesktopCmd = &cobra.Command{
@@ -127,6 +150,7 @@ func init() {
 	svcCmd.AddCommand(svcStartCmd)
 	svcCmd.AddCommand(svcStopCmd)
 	svcCmd.AddCommand(svcStatusCmd)
+	svcCmd.AddCommand(svcRefreshUnitCmd)
 	svcCmd.AddCommand(svcReconcileDesktopCmd)
 
 	// Top-level aliases.
@@ -256,6 +280,33 @@ func runSvcStart(_ *cobra.Command, _ []string) error {
 func runSvcStop(_ *cobra.Command, _ []string) error {
 	mgr := service.NewManager()
 	return mgr.Stop()
+}
+
+// runSvcRefreshUnit re-materializes the managed service unit (the #444
+// restart-storm hardening) directly, for the case neither `citadel update
+// install` nor a worker restart has applied it (citadel-cli#1266). It reuses
+// refreshManagedServiceUnits -- the SAME idempotent, non-restarting refresh the
+// update path runs -- so there is one implementation, not two.
+func runSvcRefreshUnit(_ *cobra.Command, _ []string) error {
+	fmt.Println("Refreshing citadel-managed service unit(s)...")
+	rewritten, reported := refreshManagedServiceUnits(os.Stdout)
+	switch {
+	case rewritten == 0 && !reported:
+		// Nothing was rewritten and nothing was reported: every managed unit is
+		// already current (or none is installed). Say so explicitly rather than
+		// exit silently, which would read as the command having done nothing.
+		fmt.Println("No citadel-managed service unit needed refreshing (already current).")
+		return nil
+	case rewritten == 0 && reported:
+		// Something was reported but nothing was applied -- most commonly a
+		// system unit that needs root. Exit non-zero (the refresh lines above
+		// carry the specifics, e.g. the exact `sudo ...` to run) so a scripted
+		// caller or an operator chaining with && can tell "applied" from
+		// "refused, re-run as root".
+		return fmt.Errorf("no managed service unit was refreshed; see the messages above (a system unit may need root -- re-run under sudo)")
+	default:
+		return nil
+	}
 }
 
 func runSvcStatus(_ *cobra.Command, _ []string) error {

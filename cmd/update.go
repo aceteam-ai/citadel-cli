@@ -53,6 +53,12 @@ var updateCheckCmd = &cobra.Command{
 // to (see the warn-vs-restart split in installUpdate).
 var updateInstallRestart bool
 
+// rematerializeManagedUnitsFn is the managed-unit refresh, as a package var so
+// refreshManagedServiceUnits is unit-testable with a recorder (mirrors the
+// activeManagedUnitFn seam in cmd/service_cmd.go). Production wiring is
+// service.RematerializeManagedUnits.
+var rematerializeManagedUnitsFn = service.RematerializeManagedUnits
+
 var updateInstallCmd = &cobra.Command{
 	Use:   "install",
 	Short: "Download and install the latest version",
@@ -183,6 +189,17 @@ func installUpdate() {
 
 	if release == nil {
 		checkSpinner.StopWithSuccess(fmt.Sprintf("You are running the latest version (%s)", Version))
+		// citadel-cli#1266: the managed-unit refresh must run even when no binary
+		// update is needed. Otherwise `sudo citadel update install` on an
+		// already-latest node exits here without ever re-materializing the unit,
+		// so a node deployed by a pre-#444 binary never gets the restart-storm
+		// hardening. RematerializeManagedUnits is idempotent (a unit already
+		// current is a clean no-op), so running it here is safe on every call.
+		// We do NOT run warnOrRestartManagedService: the binary is unchanged, so
+		// there is no old-vs-new split-brain to warn about -- the only live
+		// consequence is the rewritten unit, which the refresh itself reports
+		// applies on the next restart.
+		refreshManagedServiceUnits(os.Stdout)
 		return
 	}
 
@@ -241,14 +258,7 @@ func installUpdate() {
 	// the on-disk unit was written once at install time and is otherwise never
 	// refreshed on a version change (#426 does the same for compose files).
 	// Idempotent: a unit already carrying the hardening is left untouched.
-	if rewritten, err := service.RematerializeManagedUnits(func(format string, args ...any) {
-		fmt.Printf("   - "+format+"\n", args...)
-	}); err != nil {
-		fmt.Printf("Warning: could not refresh managed service unit(s): %v\n", err)
-	} else if len(rewritten) > 0 {
-		fmt.Printf("Refreshed managed service unit(s): %s\n", strings.Join(rewritten, ", "))
-		fmt.Println("The new restart policy applies on the next service restart.")
-	}
+	refreshManagedServiceUnits(os.Stdout)
 
 	fmt.Println("\nRun 'citadel version' to verify.")
 
@@ -259,6 +269,36 @@ func installUpdate() {
 	// terms"); this is that "own terms" for the manual CLI path: warn loudly by
 	// default, or restart when the operator explicitly opted in via --restart.
 	warnOrRestartManagedService(updateInstallRestart)
+}
+
+// refreshManagedServiceUnits runs the idempotent managed-unit refresh and
+// reports the result to out. It is the single call site for the unit-refresh,
+// shared by both branches of `citadel update install` (post-install AND the
+// already-latest early return, citadel-cli#1266) and the `citadel service
+// refresh-unit` command. The per-unit progress lines are prefixed "   - " to
+// nest them under the enclosing step.
+//
+// Returns (rewritten, reported): rewritten is the number of units rewritten,
+// and reported is whether the refresh emitted ANY output at all (a rewrite, a
+// needs-root remediation, a not-managed note, or an error). A fully-current node
+// produces neither a rewrite nor a log line, so both are zero/false -- which lets
+// the dedicated refresh-unit command print an explicit "nothing to do" line
+// rather than exiting silently (and looking broken), while the update-install
+// path keeps its existing silence on no-change.
+func refreshManagedServiceUnits(out io.Writer) (rewritten int, reported bool) {
+	paths, err := rematerializeManagedUnitsFn(func(format string, args ...any) {
+		reported = true
+		fmt.Fprintf(out, "   - "+format+"\n", args...)
+	})
+	if err != nil {
+		fmt.Fprintf(out, "Warning: could not refresh managed service unit(s): %v\n", err)
+		return 0, true
+	}
+	if len(paths) > 0 {
+		fmt.Fprintf(out, "Refreshed managed service unit(s): %s\n", strings.Join(paths, ", "))
+		fmt.Fprintln(out, "The new restart policy applies on the next service restart.")
+	}
+	return len(paths), reported
 }
 
 func rollbackUpdate() {

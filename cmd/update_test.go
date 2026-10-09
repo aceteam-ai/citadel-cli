@@ -513,6 +513,95 @@ func TestRunManagedServiceGate_DrainAgainstRealHTTPServer(t *testing.T) {
 	}
 }
 
+// TestRefreshManagedServiceUnits_TableDriven pins the shared unit-refresh helper
+// (citadel-cli#1266) that BOTH branches of `citadel update install` (post-install
+// and the already-latest early return) and `citadel service refresh-unit` now
+// call. It swaps the rematerializeManagedUnitsFn seam with a recorder, so no
+// real systemd unit is touched and systemctl is never invoked.
+func TestRefreshManagedServiceUnits_TableDriven(t *testing.T) {
+	orig := rematerializeManagedUnitsFn
+	t.Cleanup(func() { rematerializeManagedUnitsFn = orig })
+
+	cases := []struct {
+		name          string
+		fn            func(logf func(string, ...any)) ([]string, error)
+		wantRewritten int
+		wantReported  bool
+		wantOutSubstr []string
+		wantOutAbsent []string
+	}{
+		{
+			name: "drift rewritten: summary + next-restart line",
+			fn: func(logf func(string, ...any)) ([]string, error) {
+				logf("unit-refresh: %s: applied #444 restart-storm hardening", "/etc/systemd/system/citadel-worker.service")
+				return []string{"/etc/systemd/system/citadel-worker.service"}, nil
+			},
+			wantRewritten: 1,
+			wantReported:  true,
+			wantOutSubstr: []string{
+				"Refreshed managed service unit(s): /etc/systemd/system/citadel-worker.service",
+				"applies on the next service restart",
+				"   - unit-refresh:",
+			},
+		},
+		{
+			name: "no drift: clean no-op, no output",
+			fn: func(logf func(string, ...any)) ([]string, error) {
+				return nil, nil // nothing rewritten, logf never called
+			},
+			wantRewritten: 0,
+			wantReported:  false,
+			wantOutAbsent: []string{"Refreshed", "Warning", "   - "},
+		},
+		{
+			name: "needs root (non-root system unit): remediation reported, nothing rewritten",
+			fn: func(logf func(string, ...any)) ([]string, error) {
+				logf("unit-refresh: %s: needs the #444 restart-storm hardening but rewriting a system unit requires root; re-run as root: %s",
+					"/etc/systemd/system/citadel-worker.service", `sudo "/home/jason/.local/bin/citadel" service refresh-unit`)
+				return nil, nil
+			},
+			wantRewritten: 0,
+			wantReported:  true,
+			wantOutSubstr: []string{"requires root", "service refresh-unit"},
+			wantOutAbsent: []string{"Refreshed", "sudo citadel "},
+		},
+		{
+			name: "systemic error: warning, nothing rewritten",
+			fn: func(logf func(string, ...any)) ([]string, error) {
+				return nil, errors.New("sweep boom")
+			},
+			wantRewritten: 0,
+			wantReported:  true,
+			wantOutSubstr: []string{"Warning: could not refresh managed service unit(s): sweep boom"},
+			wantOutAbsent: []string{"Refreshed"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rematerializeManagedUnitsFn = tc.fn
+			var out bytes.Buffer
+			rewritten, reported := refreshManagedServiceUnits(&out)
+			if rewritten != tc.wantRewritten {
+				t.Fatalf("rewritten = %d, want %d", rewritten, tc.wantRewritten)
+			}
+			if reported != tc.wantReported {
+				t.Fatalf("reported = %v, want %v (out=%q)", reported, tc.wantReported, out.String())
+			}
+			for _, want := range tc.wantOutSubstr {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("output %q missing %q", out.String(), want)
+				}
+			}
+			for _, absent := range tc.wantOutAbsent {
+				if strings.Contains(out.String(), absent) {
+					t.Errorf("output %q should not contain %q", out.String(), absent)
+				}
+			}
+		})
+	}
+}
+
 // fakeManager is a minimal service.Manager test double that records Stop/Start
 // call order without touching systemctl/launchctl/sc.
 type fakeManager struct {
