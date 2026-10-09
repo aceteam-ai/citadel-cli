@@ -3015,3 +3015,22 @@ Auto-generated log of every release.
   - feat(tts): voice-clone SYNTHESIZE_SPEECH backend + port 8215 + GPU compose wiring (#1245) (#1252)
 
 
+---
+
+## v2.189.0 — 2026-10-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 44 |
+| Lines added | +4597 |
+
+**Changes:**
+
+  - fix(rag): sub-batch TEI embeddings to max_client_batch_size (#1260) (#1265)
+  - feat(desktopmodel): add inactive synthetic archive foundation (#1261)
+  - feat(ollama): persistent OLLAMA_MAX_LOADED_MODELS policy via manifest field (#1258)
+  - feat(files): add versioned bounded binary range reads (#1255)
+  - build(desktop): retire legacy Terminal DMG path (#1257)
+
+
