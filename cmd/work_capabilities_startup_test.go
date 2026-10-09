@@ -58,7 +58,7 @@ func TestControlCenterInitialHeartbeatIncludesPrivilegedHandlers(t *testing.T) {
 		for _, jobType := range initial.Capabilities.JobTypes {
 			got[jobType] = true
 		}
-		for _, jobType := range []string{worker.JobTypeAgentUpdate, worker.JobTypeWhatsAppProvision} {
+		for _, jobType := range []string{worker.JobTypeAgentUpdate, worker.JobTypeWhatsAppProvision, worker.JobTypeFileReadRangeV1} {
 			if !got[jobType] {
 				t.Fatalf("initial control-center capabilities omit privileged handler %s: %v", jobType, initial.Capabilities.JobTypes)
 			}

@@ -6,6 +6,9 @@ import (
 	"strings"
 )
 
+// JobTypeFileReadRangeV1 identifies the versioned bounded binary range job.
+const JobTypeFileReadRangeV1 = "FILE_READ_BYTES_RANGE_V1"
+
 // Job types that citadel can handle
 const (
 	// JobTypeLLMInference handles local LLM completion requests

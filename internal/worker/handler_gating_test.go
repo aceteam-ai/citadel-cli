@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 // anyHandles reports whether the built handler set registers a handler for the
@@ -42,7 +44,7 @@ func TestFreshNode_RefusesSensitiveJobs(t *testing.T) {
 	}
 
 	fileJobs := []string{
-		JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileWrite,
+		JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileWrite,
 		JobTypeFileEdit, JobTypeFileList,
 		JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch,
 	}
@@ -105,6 +107,39 @@ func TestEnabledNode_RegistersSensitiveHandlers(t *testing.T) {
 	}
 	if !anyHandles(handlers, JobTypeFileRead) {
 		t.Error("enabled node should register FILE_READ")
+	}
+	if !anyHandles(handlers, JobTypeFileReadRangeV1) {
+		t.Error("enabled node should register FILE_READ_BYTES_RANGE_V1")
+	}
+}
+
+func TestFileReadBytesRangeV1CapabilityRequiresLiveHandler(t *testing.T) {
+	workspace := t.TempDir()
+	legacy := NewRunner(nil, []JobHandler{
+		NewLegacyHandlerAdapter(JobTypeFileReadBytes, jobs.NewFileReadBytesHandler(workspace)),
+	}, RunnerConfig{})
+	for _, jobType := range legacy.SupportedJobTypes() {
+		if jobType == JobTypeFileReadRangeV1 {
+			t.Fatal("legacy-only node advertised the versioned range contract")
+		}
+	}
+
+	filesEnabled := true
+	current := NewRunner(nil, CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		WorkspaceDir: workspace,
+		FilesEnabled: func() bool { return filesEnabled },
+	}), RunnerConfig{})
+	if !anyHandles(current.handlers, JobTypeFileReadRangeV1) {
+		t.Fatal("range-capable node did not register the versioned handler")
+	}
+	filesEnabled = false
+	if anyHandles(current.handlers, JobTypeFileReadRangeV1) {
+		t.Fatal("revoked Files permission left the versioned handler available")
+	}
+	for _, jobType := range current.SupportedJobTypes() {
+		if jobType == JobTypeFileReadRangeV1 {
+			t.Fatal("revoked Files permission left range capability advertised")
+		}
 	}
 }
 

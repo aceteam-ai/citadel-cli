@@ -12,8 +12,8 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
-// defaultMaxReadBytes caps a single FILE_READ_BYTES read at 50 MB, matching the
-// server-side cap. Used when the job payload omits or empties 'max_bytes'.
+// defaultMaxReadBytes caps a single FILE_READ_BYTES read at 50 MiB, even when
+// the job payload requests a larger max_bytes.
 const defaultMaxReadBytes int64 = 50 * 1024 * 1024
 
 // maxReadChunkBytes keeps one encoded job result comfortably below the mesh
@@ -42,7 +42,7 @@ func NewFileReadBytesHandler(workspace string) *FileReadBytesHandler {
 //
 // Payload fields (all strings via nexus.Job):
 //   - path: absolute or workspace-relative path to read
-//   - max_bytes: server's size cap as a decimal string (default 50 MB)
+//   - max_bytes: requested size cap as a decimal string (hard limit 50 MiB)
 //   - offset: optional zero-based byte offset; requires length
 //   - length: optional requested byte count, capped at 8 MB; requires offset
 //
@@ -70,6 +70,9 @@ func (h *FileReadBytesHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 		if err != nil || maxBytes <= 0 {
 			return nil, fmt.Errorf("invalid max_bytes: %q", v)
 		}
+	}
+	if maxBytes > defaultMaxReadBytes {
+		maxBytes = defaultMaxReadBytes
 	}
 
 	info, err := os.Stat(validated)
@@ -138,7 +141,12 @@ func (h *FileReadBytesHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 
 	ctx.Log("info", "     - [Job %s] FILE_READ_BYTES %s (size=%d, max_bytes=%d)", job.ID, validated, info.Size(), maxBytes)
 
-	data, err := os.ReadFile(validated)
+	file, err := os.Open(validated)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
