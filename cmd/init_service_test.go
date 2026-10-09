@@ -22,9 +22,14 @@ func TestDecideLinuxWorkerSetup(t *testing.T) {
 	found := func(u service.ManagedUnit) func() (service.ManagedUnit, bool) {
 		return func() (service.ManagedUnit, bool) { return u, true }
 	}
+	// The install-fallback remediation string is injected (resolved from
+	// os.Executable() in production via service.RootRemediationCommand); the
+	// decision function must echo it verbatim, never a bare `sudo citadel`
+	// (citadel-cli#1268).
+	const testInstallRemediation = `sudo "/opt/citadel" service install --system`
 
 	t.Run("root + existing unit -> enable it, never install", func(t *testing.T) {
-		d := decideLinuxWorkerSetup(true, found(workerUnit))
+		d := decideLinuxWorkerSetup(true, found(workerUnit), testInstallRemediation)
 		if d.action != linuxWorkerEnableExisting {
 			t.Fatalf("action = %v, want linuxWorkerEnableExisting", d.action)
 		}
@@ -34,14 +39,14 @@ func TestDecideLinuxWorkerSetup(t *testing.T) {
 	})
 
 	t.Run("root + no unit -> install a fresh system unit", func(t *testing.T) {
-		d := decideLinuxWorkerSetup(true, none)
+		d := decideLinuxWorkerSetup(true, none, testInstallRemediation)
 		if d.action != linuxWorkerInstallNew {
 			t.Fatalf("action = %v, want linuxWorkerInstallNew", d.action)
 		}
 	})
 
 	t.Run("non-root + existing system unit -> print sudo enable command", func(t *testing.T) {
-		d := decideLinuxWorkerSetup(false, found(workerUnit))
+		d := decideLinuxWorkerSetup(false, found(workerUnit), testInstallRemediation)
 		if d.action != linuxWorkerPrintCommand {
 			t.Fatalf("action = %v, want linuxWorkerPrintCommand", d.action)
 		}
@@ -51,7 +56,7 @@ func TestDecideLinuxWorkerSetup(t *testing.T) {
 	})
 
 	t.Run("non-root + existing user unit -> print sudo-free --user command", func(t *testing.T) {
-		d := decideLinuxWorkerSetup(false, found(userUnit))
+		d := decideLinuxWorkerSetup(false, found(userUnit), testInstallRemediation)
 		if d.action != linuxWorkerPrintCommand {
 			t.Fatalf("action = %v, want linuxWorkerPrintCommand", d.action)
 		}
@@ -61,11 +66,11 @@ func TestDecideLinuxWorkerSetup(t *testing.T) {
 	})
 
 	t.Run("non-root + no unit -> print system-service install command", func(t *testing.T) {
-		d := decideLinuxWorkerSetup(false, none)
+		d := decideLinuxWorkerSetup(false, none, testInstallRemediation)
 		if d.action != linuxWorkerPrintCommand {
 			t.Fatalf("action = %v, want linuxWorkerPrintCommand", d.action)
 		}
-		if d.nextCommand != "sudo citadel service install --system" {
+		if d.nextCommand != testInstallRemediation {
 			t.Fatalf("nextCommand = %q", d.nextCommand)
 		}
 	})
@@ -78,10 +83,10 @@ func TestApplyLinuxWorkerSetup_PrintCommandNamesExactCommand(t *testing.T) {
 	out := captureStdoutForTest(t, func() {
 		applyLinuxWorkerSetup(linuxWorkerDecision{
 			action:      linuxWorkerPrintCommand,
-			nextCommand: "sudo citadel service install --system",
+			nextCommand: `sudo "/opt/citadel" service install --system`,
 		})
 	})
-	if !strings.Contains(out, "sudo citadel service install --system") {
+	if !strings.Contains(out, `sudo "/opt/citadel" service install --system`) {
 		t.Fatalf("output did not name the next command:\n%s", out)
 	}
 }
