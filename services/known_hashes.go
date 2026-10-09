@@ -29,6 +29,10 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// citadel-cli#1188: explicit docker.io registry (linux + darwin).
 		"756169d49cbc99b77f89ac6512597690d45abd8c018a61ff7f9f11c1521400e8": true,
 		"820145af6625731c91da613c0fab47d04a973b7529fa029cc1af05e51bb6eae3": true,
+		// citadel-cli#1209: key-only OLLAMA_MAX_LOADED_MODELS environment entry
+		// (linux + darwin), injected only when ollama_max_loaded_models: is set.
+		"3fdd289266040a94f4b37211d352be156e0f24cc6c5992ee95b9e4182c41041d": true,
+		"36a620df59728701394cefd54ab7f27bb1605b09a088713a24ef2db654b8b1c3": true,
 	},
 	"vllm": {
 		"07588f4ef245f011396874bcdd7c6aa0c463a356c5f6601618c3b4e213be812a": true,

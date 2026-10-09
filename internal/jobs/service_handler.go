@@ -71,6 +71,14 @@ type manifestService struct {
 	// services.BindEnv so the compose ${CITADEL_<SVC>_BIND:-...} substitution
 	// resolves. Empty => the compose default applies. See services/bind.go.
 	Bind string `yaml:"bind,omitempty"`
+	// OllamaMaxLoadedModels mirrors cmd/manifest.go Service.OllamaMaxLoadedModels:
+	// the aceteam-ai/citadel-cli#1209 per-service ollama residency policy
+	// (OLLAMA_MAX_LOADED_MODELS). serviceStart's docker branch injects it at
+	// `docker compose up` via services.OllamaMaxLoadedModelsEnv so the compose
+	// key-only `environment:` entry passes it through. A *int so nil (unset) is
+	// distinguishable from an explicit 0; nil => inject nothing. See
+	// services/ollama_policy.go.
+	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
 }
 
 // ServiceHandler manages start/stop/status of services declared in the node's
@@ -609,10 +617,11 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 			}
 			cmd := rt.ComposeCommand(composeArgs...)
 			// Inject the #1023 CITADEL_<SVC>_BIND entry (from the manifest bind:)
-			// so the compose bind-hatch substitution resolves to the operator's
-			// chosen interface. An unrecognized bind value fails the start loudly
-			// rather than silently falling through to the compose default.
-			if env, bindErr := h.composeEnvWithBind(svc.Name, svc.Bind); bindErr != nil {
+			// and the #1209 OLLAMA_MAX_LOADED_MODELS entry (from the manifest
+			// ollama_max_loaded_models:) so the compose substitution/passthrough
+			// resolve. An invalid value fails the start loudly rather than
+			// silently falling through to the compose/engine default.
+			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels); bindErr != nil {
 				err = fmt.Errorf("docker compose up failed: %s", bindErr)
 			} else {
 				cmd.Env = env
@@ -2213,13 +2222,22 @@ func (h *ServiceHandler) composeEnv() []string {
 	return env
 }
 
-// composeEnvWithBind returns composeEnv() plus the aceteam-ai/citadel-cli#1023
-// CITADEL_<SVC>_BIND entry for a hatch-capable service (from the manifest bind:
-// value), so the compose ${CITADEL_<SVC>_BIND:-...} substitution resolves to the
-// operator's chosen interface. A non-hatch service or an empty bind injects
-// nothing (the compose default applies). An unrecognized bind value is a hard
-// error the caller surfaces as a start failure.
-func (h *ServiceHandler) composeEnvWithBind(serviceName, bind string) ([]string, error) {
+// composeEnvForEngineStart returns composeEnv() plus the per-engine overrides
+// injected at `docker compose up` for an embedded engine service:
+//
+//   - the aceteam-ai/citadel-cli#1023 CITADEL_<SVC>_BIND entry (from the manifest
+//     bind: value) so the compose ${CITADEL_<SVC>_BIND:-...} substitution resolves
+//     to the operator's chosen interface;
+//   - the aceteam-ai/citadel-cli#1209 OLLAMA_MAX_LOADED_MODELS entry (from the
+//     manifest ollama_max_loaded_models: value) so the ollama compose key-only
+//     `environment:` entry passes the residency policy through.
+//
+// A non-hatch service / empty bind / nil policy injects nothing (the
+// compose/engine default applies). An invalid bind or policy value is a hard
+// error the caller surfaces as a start failure. The policy entry is appended
+// LAST so a manifest value wins over any inherited worker-process value
+// (exec.Cmd.Env uses the last duplicate).
+func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int) ([]string, error) {
 	entry, inject, err := embeddedservices.BindEnv(serviceName, bind)
 	if err != nil {
 		return nil, err
@@ -2227,6 +2245,13 @@ func (h *ServiceHandler) composeEnvWithBind(serviceName, bind string) ([]string,
 	env := h.composeEnv()
 	if inject {
 		env = append(env, entry)
+	}
+	oentry, oinject, oerr := embeddedservices.OllamaMaxLoadedModelsEnv(serviceName, ollamaMaxLoaded)
+	if oerr != nil {
+		return nil, oerr
+	}
+	if oinject {
+		env = append(env, oentry)
 	}
 	return env, nil
 }

@@ -219,6 +219,59 @@ services:
 	}
 }
 
+// TestUpdateManifest_PreservesOllamaMaxLoadedModels is the aceteam-ai/citadel-cli#1209
+// field-drop regression guard, identical in shape to PreservesServiceBind above:
+// the per-service ollama_max_loaded_models: policy must round-trip through
+// APPLY_DEVICE_CONFIG. If ManifestService were missing the OllamaMaxLoadedModels
+// field, an operator's one-resident-model policy would be silently DROPPED on
+// every dashboard config save, un-capping residency on a memory-tight node.
+func TestUpdateManifest_PreservesOllamaMaxLoadedModels(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "citadel.yaml")
+
+	initial := `node:
+  name: existing-node
+  tags: [gpu]
+services:
+  - name: ollama
+    compose_file: ./services/ollama.yml
+    ollama_max_loaded_models: 1
+`
+	if err := os.WriteFile(manifestPath, []byte(initial), 0600); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	h := NewConfigHandler(dir)
+	// A device config that does not mention services at all -- the normal
+	// onboarding-wizard shape -- must leave the existing policy untouched.
+	config := &DeviceConfig{DeviceName: "existing-node"}
+	if err := h.updateManifest(dir, config); err != nil {
+		t.Fatalf("updateManifest: %v", err)
+	}
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+
+	var got CitadelManifest
+	if err := yaml.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal round-tripped manifest: %v", err)
+	}
+	var policy *int
+	for _, s := range got.Services {
+		if s.Name == "ollama" {
+			policy = s.OllamaMaxLoadedModels
+		}
+	}
+	if policy == nil || *policy != 1 {
+		t.Fatalf("ollama_max_loaded_models did not survive the APPLY_DEVICE_CONFIG round-trip: got %v, want 1", policy)
+	}
+	if !strings.Contains(string(data), "ollama_max_loaded_models: 1") {
+		t.Fatalf("round-tripped manifest is missing the ollama_max_loaded_models key entirely:\n%s", data)
+	}
+}
+
 // TestManifestServiceBindFromFile pins the shared best-effort helper the two
 // secondary embedded-engine start paths (llamacpp_inference.go's model-swap
 // restart, config_handler.go's APPLY_DEVICE_CONFIG compose-up) use to thread an

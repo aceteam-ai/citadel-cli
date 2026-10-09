@@ -489,6 +489,14 @@ type ManifestService struct {
 	// operator's `bind: all` opt-in would vanish on the next dashboard config
 	// save (aceteam-ai/citadel-cli#1060).
 	Bind string `yaml:"bind,omitempty"`
+	// OllamaMaxLoadedModels mirrors cmd/manifest.go Service.OllamaMaxLoadedModels:
+	// the aceteam-ai/citadel-cli#1209 per-service ollama residency policy
+	// (OLLAMA_MAX_LOADED_MODELS), a *int so nil (unset) is distinguishable from an
+	// explicit 0. It MUST be modeled here for the same #528/#850 reason as Bind
+	// above: updateManifest round-trips the whole citadel.yaml through this struct,
+	// so a field missing here is silently DROPPED on every APPLY_DEVICE_CONFIG --
+	// the policy would vanish on the next dashboard config save.
+	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
 }
 
 // ManifestConfig represents additional configuration in the manifest.
@@ -666,6 +674,11 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// manifest simply falls through to loopback (aceteam-ai/citadel-cli#1060).
 		manifestPath := filepath.Join(configDir, "citadel.yaml")
 		env = append(env, bindEnvForService(svcName, manifestServiceBindFromFile(manifestPath, svcName))...)
+		// Honor the aceteam-ai/citadel-cli#1209 ollama residency policy here too
+		// (OLLAMA_MAX_LOADED_MODELS), appended LAST so a manifest value wins over
+		// any inherited process value. Best-effort per-service: a nil/unset value
+		// injects nothing (the compose key-only entry then passes nothing through).
+		env = append(env, ollamaMaxLoadedModelsEnvForService(svcName, ollamaMaxLoadedModelsFromFile(manifestPath, svcName))...)
 		// PUID/PGID = this node process's uid/gid, so the meeting media stack runs
 		// as the node owner and writes node-owned files into bind-mounted dirs
 		// (see composeEnv in service_handler.go). Guarded so a non-POSIX host never

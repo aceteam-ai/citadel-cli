@@ -57,6 +57,17 @@ type Service struct {
 	// hatch-capable engines honor it; it is injected as CITADEL_<SVC>_BIND at
 	// `docker compose up` via services.BindEnv. See services/bind.go.
 	Bind string `yaml:"bind,omitempty"`
+	// OllamaMaxLoadedModels is the aceteam-ai/citadel-cli#1209 per-service policy
+	// for the embedded ollama engine: the max number of models ollama keeps
+	// resident at once (OLLAMA_MAX_LOADED_MODELS). Set it to 1 for a
+	// one-resident-model policy on a memory-tight node. A *int so nil (unset) is
+	// distinguishable from an explicit 0 (ollama's "auto/default"); nil => inject
+	// nothing and the engine's default applies. Only the ollama service honors it;
+	// it is injected as OLLAMA_MAX_LOADED_MODELS at `docker compose up` via
+	// services.OllamaMaxLoadedModelsEnv. See services/ollama_policy.go. Modeled
+	// here (and in internal/jobs' two manifest structs) so a cmd-package manifest
+	// rewrite does not silently drop it -- the #528/#850 field-drop failure mode.
+	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
 }
 
 // serviceStartDisabled reports whether a service is marked "stopped" and must be

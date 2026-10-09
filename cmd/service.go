@@ -154,14 +154,21 @@ func startService(serviceName, composeFilePath string) error {
 		return fmt.Errorf("service %s has no compose_file defined", serviceName)
 	}
 
-	// Resolve the #1023 host-bind hatch ONCE (manifest bind: -> CITADEL_<SVC>_BIND
-	// env), then reuse it for the drift decision, the compose-up env, and the
-	// exposure warning below so they can never disagree. An unrecognized bind
-	// value refuses loudly here (an operator can fix it) rather than silently
-	// falling through to the compose default.
-	bindEnv, bindErr := serviceBindEnvMap(serviceName, manifestServiceBind(serviceName))
+	// Read the manifest service entry ONCE, then resolve the #1023 host-bind hatch
+	// (manifest bind: -> CITADEL_<SVC>_BIND env) and the #1209 ollama residency
+	// policy (ollama_max_loaded_models: -> OLLAMA_MAX_LOADED_MODELS) from it. The
+	// bind env is reused for the drift decision, the compose-up env, and the
+	// exposure warning below so they can never disagree. An invalid bind or
+	// policy value refuses loudly here (an operator can fix it) rather than
+	// silently falling through to the compose/engine default.
+	manifestSvc, _ := manifestServiceFor(serviceName)
+	bindEnv, bindErr := serviceBindEnvMap(serviceName, manifestSvc.Bind)
 	if bindErr != nil {
 		return fmt.Errorf("cannot start %s: %w", serviceName, bindErr)
+	}
+	ollamaEntries, ollamaErr := ollamaMaxLoadedModelsEntriesStrict(serviceName, manifestSvc.OllamaMaxLoadedModels)
+	if ollamaErr != nil {
+		return fmt.Errorf("cannot start %s: %w", serviceName, ollamaErr)
 	}
 
 	// Warn (never refuse) when an embedded engine will be published on all
@@ -369,8 +376,11 @@ func startService(serviceName, composeFilePath string) error {
 	// before). Mirrors internal/jobs.ServiceHandler.composeEnv (#426). Also append
 	// the #1023 CITADEL_<SVC>_BIND entry so the compose bind-hatch substitution
 	// resolves to the operator's chosen interface (empty bindEnv -> compose
-	// default).
+	// default). The #1209 OLLAMA_MAX_LOADED_MODELS entry is appended LAST so a
+	// manifest value wins over any inherited worker-process value (exec.Cmd.Env
+	// uses the last duplicate); empty ollamaEntries -> nothing passed through.
 	composeCmd.Env = append(composeEnv(), bindEnvEntries(bindEnv)...)
+	composeCmd.Env = append(composeCmd.Env, ollamaEntries...)
 	output, err := composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
