@@ -166,9 +166,9 @@ func startService(serviceName, composeFilePath string) error {
 	if bindErr != nil {
 		return fmt.Errorf("cannot start %s: %w", serviceName, bindErr)
 	}
-	ollamaEntries, ollamaErr := ollamaMaxLoadedModelsEntriesStrict(serviceName, manifestSvc.OllamaMaxLoadedModels)
-	if ollamaErr != nil {
-		return fmt.Errorf("cannot start %s: %w", serviceName, ollamaErr)
+	composeProcessEnv, policyErr := composeEnvForStrictServiceStart(serviceName, manifestSvc, bindEnv)
+	if policyErr != nil {
+		return fmt.Errorf("cannot start %s: %w", serviceName, policyErr)
 	}
 
 	// Warn (never refuse) when an embedded engine will be published on all
@@ -376,11 +376,10 @@ func startService(serviceName, composeFilePath string) error {
 	// before). Mirrors internal/jobs.ServiceHandler.composeEnv (#426). Also append
 	// the #1023 CITADEL_<SVC>_BIND entry so the compose bind-hatch substitution
 	// resolves to the operator's chosen interface (empty bindEnv -> compose
-	// default). The #1209 OLLAMA_MAX_LOADED_MODELS entry is appended LAST so a
-	// manifest value wins over any inherited worker-process value (exec.Cmd.Env
-	// uses the last duplicate); empty ollamaEntries -> nothing passed through.
-	composeCmd.Env = append(composeEnv(), bindEnvEntries(bindEnv)...)
-	composeCmd.Env = append(composeCmd.Env, ollamaEntries...)
+	// default). Normalize the #1209 OLLAMA_MAX_LOADED_MODELS entry last so a
+	// manifest value wins over inherited shell/.env values; nil becomes explicit
+	// empty, which preserves Ollama's automatic policy while blocking fallback.
+	composeCmd.Env = composeProcessEnv
 	output, err := composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))

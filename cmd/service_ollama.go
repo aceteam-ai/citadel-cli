@@ -14,6 +14,20 @@ import (
 	svcports "github.com/aceteam-ai/citadel-cli/services"
 )
 
+// composeEnvForStrictServiceStart constructs startService's complete compose
+// process environment before any runtime selection, inspection, adoption, or
+// stale-container removal can occur. A negative manifest policy returns an
+// error here so startService remains side-effect-free on invalid input.
+func composeEnvForStrictServiceStart(serviceName string, service Service, bindEnv map[string]string) ([]string, error) {
+	// Validate against an empty slice first: composeEnv resolves/creates the
+	// workspace, so it must not run for a policy that will be refused.
+	if _, err := svcports.OllamaMaxLoadedModelsComposeEnv(nil, serviceName, service.OllamaMaxLoadedModels); err != nil {
+		return nil, err
+	}
+	env := append(composeEnv(), bindEnvEntries(bindEnv)...)
+	return svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, service.OllamaMaxLoadedModels)
+}
+
 // warnIfOllamaPolicyIgnoredNative prints a warning when an ollama service carries
 // an #1209 ollama_max_loaded_models policy but resolved to the NATIVE engine (a
 // host-managed ollama, or an explicit type: native) -- there is no compose to
@@ -26,33 +40,4 @@ func warnIfOllamaPolicyIgnoredNative(service Service) {
 	if service.Name == "ollama" && service.OllamaMaxLoadedModels != nil {
 		fmt.Printf("   ⚠️  ollama_max_loaded_models is set but %s resolved to native (no compose to inject into); pin `type: docker` in citadel.yaml to apply OLLAMA_MAX_LOADED_MODELS\n", service.Name)
 	}
-}
-
-// ollamaMaxLoadedModelsEntriesStrict returns the OLLAMA_MAX_LOADED_MODELS=<n>
-// env entry (0 or 1) to inject at `docker compose up` for serviceName given its
-// manifest value, surfacing an invalid value as an error. Used by the
-// operator-facing start path (startService), which refuses loudly so the
-// operator can fix the manifest.
-func ollamaMaxLoadedModelsEntriesStrict(serviceName string, maxLoaded *int) ([]string, error) {
-	entry, inject, err := svcports.OllamaMaxLoadedModelsEnv(serviceName, maxLoaded)
-	if err != nil {
-		return nil, err
-	}
-	if !inject {
-		return nil, nil
-	}
-	return []string{entry}, nil
-}
-
-// ollamaMaxLoadedModelsEntries is the best-effort flavor for paths where a start
-// must not fail on a bad value (the boot-time port-drift recreate): an invalid
-// value is logged and dropped so the engine default applies, matching
-// composeEnvForService's bind handling.
-func ollamaMaxLoadedModelsEntries(serviceName string, maxLoaded *int) []string {
-	entries, err := ollamaMaxLoadedModelsEntriesStrict(serviceName, maxLoaded)
-	if err != nil {
-		Log("ollama policy: %s: %v; using engine default", serviceName, err)
-		return nil
-	}
-	return entries
 }

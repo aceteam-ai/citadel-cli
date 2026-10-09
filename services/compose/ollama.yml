@@ -19,10 +19,12 @@
 # OLLAMA_MAX_LOADED_MODELS (aceteam-ai/citadel-cli#1209) caps how many models
 # ollama keeps resident at once -- set `ollama_max_loaded_models: 1` on this
 # service in citadel.yaml for a one-resident-model policy on a memory-tight node.
-# The KEY-ONLY form below means compose passes the var through ONLY when citadel
-# injects it (services.OllamaMaxLoadedModelsEnv, injected at `up` only when the
-# manifest field is set); when unset nothing is passed and the container env is
-# byte-equivalent to before this field existed.
+# The KEY-ONLY form below is paired with
+# services.OllamaMaxLoadedModelsComposeEnv on every Citadel compose-up path.
+# Citadel always supplies one authoritative value for ollama: the manifest's
+# non-negative integer, or explicit empty when unset/invalid-best-effort. Empty
+# defeats hostile shell and .env fallback while Ollama interprets it like its
+# absent/zero automatic setting (verified against official Ollama v0.40.2).
 
 services:
   ollama:

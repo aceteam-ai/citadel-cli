@@ -74,9 +74,10 @@ type manifestService struct {
 	// OllamaMaxLoadedModels mirrors cmd/manifest.go Service.OllamaMaxLoadedModels:
 	// the aceteam-ai/citadel-cli#1209 per-service ollama residency policy
 	// (OLLAMA_MAX_LOADED_MODELS). serviceStart's docker branch injects it at
-	// `docker compose up` via services.OllamaMaxLoadedModelsEnv so the compose
-	// key-only `environment:` entry passes it through. A *int so nil (unset) is
-	// distinguishable from an explicit 0; nil => inject nothing. See
+	// `docker compose up` via services.OllamaMaxLoadedModelsComposeEnv so the
+	// key-only `environment:` entry is protected from shell/.env fallback. A *int
+	// so nil (unset) is distinguishable from an explicit 0; nil => explicit empty.
+	// See
 	// services/ollama_policy.go.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
 }
@@ -431,6 +432,16 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		}
 
 	case "docker":
+		// Validate the strict #1209 policy before adoption, model/trust
+		// persistence, the already-running shortcut, resource preemption, RAM
+		// overrides, runtime probes, or legacy-container cleanup. The outer
+		// Execute path intentionally records desired-state intent before calling
+		// serviceStart; this guard promises no engine-side effects, not zero
+		// manifest intent writes.
+		if _, policyErr := embeddedservices.OllamaMaxLoadedModelsComposeEnv(nil, svc.Name, svc.OllamaMaxLoadedModels); policyErr != nil {
+			err = fmt.Errorf("docker compose up failed: %s", policyErr)
+			break
+		}
 		if svc.Name == "vllm" {
 			external, loadErr := externalengine.LoadPersisted(h.ConfigDir)
 			if loadErr != nil {
@@ -2240,11 +2251,11 @@ func (h *ServiceHandler) composeEnv() []string {
 //     manifest ollama_max_loaded_models: value) so the ollama compose key-only
 //     `environment:` entry passes the residency policy through.
 //
-// A non-hatch service / empty bind / nil policy injects nothing (the
-// compose/engine default applies). An invalid bind or policy value is a hard
-// error the caller surfaces as a start failure. The policy entry is appended
-// LAST so a manifest value wins over any inherited worker-process value
-// (exec.Cmd.Env uses the last duplicate).
+// A non-hatch service / empty bind leaves its existing behavior unchanged. For
+// ollama, a nil policy becomes an explicit empty entry so shell/.env fallback
+// cannot become policy while Ollama retains automatic concurrency. An invalid
+// bind or negative policy value is a hard error the caller surfaces as a start
+// failure. The policy entry is the final, sole copy of its key.
 func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int) ([]string, error) {
 	entry, inject, err := embeddedservices.BindEnv(serviceName, bind)
 	if err != nil {
@@ -2254,14 +2265,7 @@ func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, olla
 	if inject {
 		env = append(env, entry)
 	}
-	oentry, oinject, oerr := embeddedservices.OllamaMaxLoadedModelsEnv(serviceName, ollamaMaxLoaded)
-	if oerr != nil {
-		return nil, oerr
-	}
-	if oinject {
-		env = append(env, oentry)
-	}
-	return env, nil
+	return embeddedservices.OllamaMaxLoadedModelsComposeEnv(env, serviceName, ollamaMaxLoaded)
 }
 
 // bindExposureWarning returns a warning line when an embedded engine will be

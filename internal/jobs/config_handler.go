@@ -674,11 +674,6 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// manifest simply falls through to loopback (aceteam-ai/citadel-cli#1060).
 		manifestPath := filepath.Join(configDir, "citadel.yaml")
 		env = append(env, bindEnvForService(svcName, manifestServiceBindFromFile(manifestPath, svcName))...)
-		// Honor the aceteam-ai/citadel-cli#1209 ollama residency policy here too
-		// (OLLAMA_MAX_LOADED_MODELS), appended LAST so a manifest value wins over
-		// any inherited process value. Best-effort per-service: a nil/unset value
-		// injects nothing (the compose key-only entry then passes nothing through).
-		env = append(env, ollamaMaxLoadedModelsEnvForService(svcName, ollamaMaxLoadedModelsFromFile(manifestPath, svcName))...)
 		// PUID/PGID = this node process's uid/gid, so the meeting media stack runs
 		// as the node owner and writes node-owned files into bind-mounted dirs
 		// (see composeEnv in service_handler.go). Guarded so a non-POSIX host never
@@ -689,6 +684,14 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// Configure GPU runtime if on Linux
 		if platform.IsLinux() {
 			env = append(env, "DOCKER_DEFAULT_RUNTIME=nvidia")
+		}
+		// Normalize the aceteam-ai/citadel-cli#1209 policy after every other env
+		// entry. This APPLY_DEVICE_CONFIG path is best-effort: a negative value is
+		// logged and becomes explicit empty, as do missing/unreadable manifests,
+		// so hostile shell/.env values cannot silently become node policy.
+		env, policyErr := composeEnvForAppliedService(env, manifestPath, svcName)
+		if policyErr != nil {
+			clilog.Writef("warning", "ollama policy for %s: %v; using engine default", svcName, policyErr)
 		}
 		cmd.Env = env
 

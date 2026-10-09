@@ -15,16 +15,19 @@
 // bind-only, so this must not widen them.
 //
 // Mechanism: services/compose/ollama.yml (and its darwin variant) declare the
-// KEY-ONLY env form `environment: ["OLLAMA_MAX_LOADED_MODELS"]`, so when the var
-// is ABSENT from the compose process environment compose passes nothing through
-// (the container env is byte-equivalent to before this field existed). citadel
-// injects OLLAMA_MAX_LOADED_MODELS=<n> into that process environment ONLY when
-// the manifest field is set (OllamaMaxLoadedModelsEnv returns inject=false
-// otherwise), exactly how BindEnv injects CITADEL_<SVC>_BIND only on an explicit
-// `bind:` value.
+// KEY-ONLY env form `environment: ["OLLAMA_MAX_LOADED_MODELS"]`. Every Citadel
+// compose-up path normalizes that one key through
+// OllamaMaxLoadedModelsComposeEnv: an explicit manifest value wins, while an
+// unset or best-effort-invalid value becomes an explicit empty string. The empty
+// value is intentional: it shields Compose from an ambient shell value and from
+// .env/--env-file fallback while retaining Ollama's automatic policy.
 package services
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // EnvOllamaMaxLoadedModels is the env var the embedded ollama image reads to cap
 // the number of models it keeps resident simultaneously. Kept as an exported
@@ -32,29 +35,45 @@ import "fmt"
 // code that injects it share one spelling.
 const EnvOllamaMaxLoadedModels = "OLLAMA_MAX_LOADED_MODELS"
 
-// OllamaMaxLoadedModelsEnv returns the "OLLAMA_MAX_LOADED_MODELS=<n>" entry to
-// inject for the embedded ollama service given its manifest
-// `ollama_max_loaded_models:` value, and whether to inject it. Contract (mirrors
-// BindEnv):
+// OllamaMaxLoadedModelsComposeEnv returns env with exactly one effective
+// OLLAMA_MAX_LOADED_MODELS entry at the end for the embedded ollama service.
+// It removes every inherited duplicate before appending the manifest value, or
+// an explicit empty value when the manifest field is unset. It does not mutate
+// env. For every non-ollama service it returns env unchanged.
 //
-//   - service != "ollama"  -> ("", false, nil)  // env var only means anything
-//     to the ollama image; never injected for another engine.
-//   - maxLoaded == nil      -> ("", false, nil)  // unset: inject nothing, the
-//     compose key-only `environment:` entry then passes nothing through.
-//   - maxLoaded < 0         -> ("", false, error) // nonsensical; refuse loudly
-//     (the ResolveBindAddr "typo refuses rather than guesses" posture) rather
-//     than feed a negative to the engine.
-//   - maxLoaded >= 0         -> ("OLLAMA_MAX_LOADED_MODELS=<n>", true, nil)
+// A negative manifest value returns the same safe, explicit-empty environment
+// plus an error. Strict callers refuse the start; best-effort callers log the
+// error and use the returned environment so ambient or env-file values still
+// cannot silently become node policy.
 //
-// 0 is a legitimate explicit value (ollama treats it as "auto/default"), which is
-// why the field is a *int: nil (unset) must be distinguishable from an explicit
-// 0, and only the former means "inject nothing".
-func OllamaMaxLoadedModelsEnv(service string, maxLoaded *int) (string, bool, error) {
-	if service != "ollama" || maxLoaded == nil {
-		return "", false, nil
+// Empty and explicit 0 both retain Ollama's automatic concurrency semantics.
+// This was verified against official Ollama release v0.40.2, commit
+// b061384d90ff455462bc32745dd0de479de717a3: envconfig.Var returns empty for an
+// empty value, Uint("OLLAMA_MAX_LOADED_MODELS", 0) therefore returns 0, and
+// server/sched.go treats maxRunners <= 0 as the automatic setting. Keep this
+// source pin current when changing the empty-value contract.
+func OllamaMaxLoadedModelsComposeEnv(env []string, service string, maxLoaded *int) ([]string, error) {
+	if service != "ollama" {
+		return env, nil
 	}
-	if *maxLoaded < 0 {
-		return "", false, fmt.Errorf("invalid ollama_max_loaded_models %d: must be >= 0", *maxLoaded)
+
+	value := ""
+	var policyErr error
+	if maxLoaded != nil {
+		if *maxLoaded < 0 {
+			policyErr = fmt.Errorf("invalid ollama_max_loaded_models %d: must be >= 0", *maxLoaded)
+		} else {
+			value = strconv.Itoa(*maxLoaded)
+		}
 	}
-	return fmt.Sprintf("%s=%d", EnvOllamaMaxLoadedModels, *maxLoaded), true, nil
+
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key != EnvOllamaMaxLoadedModels {
+			out = append(out, entry)
+		}
+	}
+	out = append(out, EnvOllamaMaxLoadedModels+"="+value)
+	return out, policyErr
 }

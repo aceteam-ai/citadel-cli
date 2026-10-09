@@ -33,6 +33,10 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// (linux + darwin), injected only when ollama_max_loaded_models: is set.
 		"3fdd289266040a94f4b37211d352be156e0f24cc6c5992ee95b9e4182c41041d": true,
 		"36a620df59728701394cefd54ab7f27bb1605b09a088713a24ef2db654b8b1c3": true,
+		// citadel-cli#1258 review fix: documents explicit-empty normalization
+		// (linux + darwin); semantic policy change is in the Go env builder.
+		"bd7bc9fc5e040e41ec2b85dadd8b9e28f6a6d570d2fb5eb27cf905dfbfb3e28e": true,
+		"75c1ac0a8b3af9d8cf8e344c389ebe2ef7289148296e03d70013eb9bb8df81e8": true,
 	},
 	"vllm": {
 		"07588f4ef245f011396874bcdd7c6aa0c463a356c5f6601618c3b4e213be812a": true,

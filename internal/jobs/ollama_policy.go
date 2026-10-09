@@ -19,8 +19,8 @@ import (
 // ollamaMaxLoadedModelsFromFile reads the manifest at manifestPath (best-effort)
 // and returns the #1209 `ollama_max_loaded_models:` value for serviceName, or nil
 // when the file is unreadable/unparseable, the service is absent, or the field is
-// unset. A nil result lets the caller inject nothing (the compose key-only
-// `environment:` entry then passes nothing through).
+// unset. The caller normalizes nil to explicit empty so Compose cannot fall
+// back to a hostile shell or env-file value.
 func ollamaMaxLoadedModelsFromFile(manifestPath, serviceName string) *int {
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -43,16 +43,10 @@ func ollamaMaxLoadedModelsFromFile(manifestPath, serviceName string) *int {
 	return nil
 }
 
-// ollamaMaxLoadedModelsEnvForService returns the "OLLAMA_MAX_LOADED_MODELS=<n>"
-// entries to append to a `docker compose up` env for serviceName given its
-// manifest value, or nil to inject nothing (not ollama, value unset, or an
-// invalid value). Best-effort like bindEnvForService: an invalid value degrades
-// to nothing injected (the engine default applies) rather than failing the
-// start -- this is a secondary path where the operator cannot act on an error.
-func ollamaMaxLoadedModelsEnvForService(serviceName string, maxLoaded *int) []string {
-	entry, inject, err := services.OllamaMaxLoadedModelsEnv(serviceName, maxLoaded)
-	if err != nil || !inject {
-		return nil
-	}
-	return []string{entry}
+// composeEnvForAppliedService is the hermetic core of APPLY_DEVICE_CONFIG's
+// compose-process environment policy. It deliberately accepts the manifest
+// path so tests can use a private fixture rather than the live node config.
+func composeEnvForAppliedService(env []string, manifestPath, serviceName string) ([]string, error) {
+	return services.OllamaMaxLoadedModelsComposeEnv(
+		env, serviceName, ollamaMaxLoadedModelsFromFile(manifestPath, serviceName))
 }

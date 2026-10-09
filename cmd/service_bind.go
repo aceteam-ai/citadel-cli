@@ -78,19 +78,28 @@ func bindEnvEntries(bindEnv map[string]string) []string {
 // startService/serviceStart, the paths where an operator can act on the error,
 // refuse loudly instead.
 func composeEnvForService(serviceName string) []string {
-	env := composeEnv()
 	svc, _ := manifestServiceFor(serviceName)
+	return composeEnvForServiceValues(serviceName, svc)
+}
+
+// composeEnvForServiceValues is the hermetic core of composeEnvForService. It
+// keeps the port-drift/restart builder testable without resolving the live node
+// manifest, while production still supplies the one entry read above.
+func composeEnvForServiceValues(serviceName string, svc Service) []string {
+	env := composeEnv()
 	bindEnv, err := serviceBindEnvMap(serviceName, svc.Bind)
 	if err != nil {
 		Log("bind: %s: %v; using compose default", serviceName, err)
 	} else {
 		env = append(env, bindEnvEntries(bindEnv)...)
 	}
-	// Append the #1209 ollama residency policy LAST so a manifest value wins over
-	// any inherited worker-process OLLAMA_MAX_LOADED_MODELS (exec.Cmd.Env uses the
-	// last duplicate). Best-effort: an invalid value is logged and dropped here
-	// (a recreate must not fail), matching the bind handling above.
-	env = append(env, ollamaMaxLoadedModelsEntries(serviceName, svc.OllamaMaxLoadedModels)...)
+	// Normalize the #1209 Ollama policy LAST. Even nil/unreadable/invalid
+	// best-effort policy becomes an explicit empty entry for ollama so neither an
+	// inherited shell value nor Compose .env fallback can become node policy.
+	env, policyErr := svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, svc.OllamaMaxLoadedModels)
+	if policyErr != nil {
+		Log("ollama policy: %s: %v; using engine default", serviceName, policyErr)
+	}
 	return env
 }
 
