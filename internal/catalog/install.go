@@ -45,6 +45,11 @@ type InstallResult struct {
 	// SandboxOverridePath is the absolute path of the <name>.sandbox.yml override,
 	// or empty when not sandboxed.
 	SandboxOverridePath string
+	// GPUDeviceOverridePath is the absolute path of the <name>.gpu.yml override
+	// (the module's compose.gpu.yml NVIDIA device reservation), or empty when the
+	// module ships none or declares no GPU requirement. The managed start path
+	// layers it as a second `-f` on docker (aceteam-ai/citadel-cli#1245).
+	GPUDeviceOverridePath string
 }
 
 // Install copies a catalog service's compose.yml (and optional .env) into the
@@ -229,6 +234,21 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 		Name:            name,
 		ComposeDestPath: composeDest,
 	}
+
+	// 6a. Copy the module's GPU device-reservation override (compose.gpu.yml) when
+	// it ships one AND the module requires a GPU, so the managed start path can
+	// layer the NVIDIA reservation the base compose omits
+	// (aceteam-ai/citadel-cli#1245, the voice-clone module). Gated on
+	// manifest.Requires.GPU — which step 3 already proved the host satisfies — so a
+	// stray override is never applied on a non-GPU module. kokoro's optional-GPU
+	// case (live detection needed) is the deliberately-uncovered other half of
+	// "kokoro has the same gap" (see the PR). Additive no-op for every module that
+	// ships no compose.gpu.yml.
+	gpuOverride, gpuErr := copyGPUDeviceOverride(composeSrcPath, servicesDir, name, manifest.Requires.GPU)
+	if gpuErr != nil {
+		return nil, gpuErr
+	}
+	result.GPUDeviceOverridePath = gpuOverride
 
 	// 6b. Least-privilege sandbox (untrusted/Tier-2 only, unless --no-harden).
 	// Generate a hardening override from the manifest's declared needs and write

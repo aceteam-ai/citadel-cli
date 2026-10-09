@@ -566,3 +566,47 @@ func TestVLLMHostPortFlowsToRegistries(t *testing.T) {
 		t.Errorf("HostPortEnv() did not emit %q", want)
 	}
 }
+
+// TestVoiceCloneHostPortRegistered pins the voice-cloning TTS module's host port
+// (aceteam-ai/citadel-services#28/#29, the node-side follow-up #1245): it must be
+// registered, distinct from every other managed/reserved port, and above the apps
+// auto-allocation range. Like gotenberg/hermes/nvr, voice-clone's compose lives in
+// citadel-services (not the embedded ServiceMap), so this registry -- and this
+// test -- are the only thing stopping a future module from hardcoding over 8215.
+func TestVoiceCloneHostPortRegistered(t *testing.T) {
+	got, ok := ServiceHostPorts["voice-clone"]
+	if !ok || got != VoiceCloneHostPort {
+		t.Errorf("ServiceHostPorts[%q] = %d (present=%v), want %d", "voice-clone", got, ok, VoiceCloneHostPort)
+	}
+	if _, ok := serviceHostPortEnv["voice-clone"]; !ok {
+		t.Errorf("serviceHostPortEnv is missing %q; HostPortEnv() will not inject its host port", "voice-clone")
+	}
+	if VoiceCloneHostPort >= AppsPortRangeStart && VoiceCloneHostPort <= AppsPortRangeEnd {
+		t.Errorf("voice-clone host port %d sits inside the apps auto-allocation range %d-%d", VoiceCloneHostPort, AppsPortRangeStart, AppsPortRangeEnd)
+	}
+	if name, taken := ReservedCitadelPorts[VoiceCloneHostPort]; taken {
+		t.Errorf("voice-clone host port %d collides with reserved citadel port %q", VoiceCloneHostPort, name)
+	}
+	// Pairwise-unique against every other managed service.
+	for svc, port := range ServiceHostPorts {
+		if svc == "voice-clone" {
+			continue
+		}
+		if port == VoiceCloneHostPort {
+			t.Errorf("voice-clone host port collides with managed service %q (%d)", svc, port)
+		}
+	}
+	// HostPortEnv must emit the voice-clone var so a compose that defers to it
+	// resolves.
+	want := fmt.Sprintf("%s=%d", EnvVoiceCloneHostPort, VoiceCloneHostPort)
+	found := false
+	for _, kv := range HostPortEnv() {
+		if kv == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+}

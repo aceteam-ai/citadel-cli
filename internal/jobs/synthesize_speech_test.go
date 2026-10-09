@@ -311,6 +311,14 @@ func TestSynthesizeSpeech_DefaultBackendRequestByteIdenticalWithoutSpeedOrInstru
 	if _, present := gotBody["backend"]; present {
 		t.Errorf("the OUTGOING sidecar request must not carry a 'backend' key (that selector is citadel-side only), got %v", gotBody["backend"])
 	}
+	// The voice-clone passthroughs (aceteam-ai/citadel-services#29) must ALSO be
+	// absent when the job payload omits them, so a pre-voice-clone kokoro dispatch
+	// is byte-identical to before they existed.
+	for _, key := range []string{"engine", "language", "instruct", "word_timestamps"} {
+		if _, present := gotBody[key]; present {
+			t.Errorf("request body must not carry a %q key when the job payload omits it, got %v", key, gotBody[key])
+		}
+	}
 	// The three pre-#1007 keys must still be present, unchanged.
 	for _, key := range []string{"input", "voice", "response_format"} {
 		if _, present := gotBody[key]; !present {
@@ -656,5 +664,404 @@ func TestSynthesizeSpeech_UnknownBackendFailsWithoutHTTPCall(t *testing.T) {
 	}
 	if called {
 		t.Error("an unrecognized backend must fail WITHOUT ever making an HTTP call")
+	}
+}
+
+// voiceCloneStub implements the voice-clone module contract
+// (aceteam-ai/citadel-services#29): /health 200 with model_loaded, /info 404
+// (recordModelLicense's top-level parse no-ops anyway), and /v1/audio/speech
+// capturing the posted body + path. When word_timestamps is requested in the
+// body it returns the {audio_base64, mime, words, receipt} JSON the module sends;
+// otherwise raw audio bytes. Every response carries the module's X-TTS-* headers,
+// including X-TTS-Model-License and the padded-urlsafe-base64 X-TTS-Receipt.
+func voiceCloneStub(t *testing.T, gotBody *map[string]any, gotPath *string) *httptest.Server {
+	t.Helper()
+	// The module's full receipt (padded urlsafe-base64 in X-TTS-Receipt): carries
+	// commercial_use/watermark/consent that have no dedicated header.
+	fullReceipt := `{"model_license":"CC-BY-NC","engine":"omnivoice","voice_id":"jane-doe","commercial_use":false,"watermark":true,"consent":{"speaker_name":"Jane Doe","attested_by":"jane@example.com","statement":"I consent to this clone","attested_at":"2026-10-09T00:00:00Z"}}`
+	receiptHeader := base64.URLEncoding.EncodeToString([]byte(fullReceipt))
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		if r.URL.Path == "/info" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/v1/audio/speech" {
+			if gotPath != nil {
+				*gotPath = r.URL.Path
+			}
+			body, _ := io.ReadAll(r.Body)
+			if gotBody != nil {
+				_ = json.Unmarshal(body, gotBody)
+			}
+			var req map[string]any
+			_ = json.Unmarshal(body, &req)
+			w.Header().Set("X-TTS-Model-Version", "voice-clone-0.1.0")
+			w.Header().Set("X-TTS-Model-License", "CC-BY-NC")
+			w.Header().Set("X-TTS-Engine", "omnivoice")
+			w.Header().Set("X-TTS-Voice-Id", "jane-doe")
+			w.Header().Set("X-TTS-Receipt", receiptHeader)
+			if wt, _ := req["word_timestamps"].(bool); wt {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"audio_base64":"YXVkaW8=","mime":"audio/mpeg","words":[{"word":"hello","start":0.1,"end":0.5}],"receipt":{}}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("mp3-bytes"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+}
+
+// TestSynthesizeSpeech_VoiceCloneRoutesToOwnURL verifies backend=voice-clone
+// dispatches to the voice-clone entry in BaseURLs (not kokoro/omnivoice), that
+// the omitted-field defaults are the module's own auto/mp3, and the result's
+// "backend" reflects it.
+func TestSynthesizeSpeech_VoiceCloneRoutesToOwnURL(t *testing.T) {
+	var kokoroBody, vcBody map[string]any
+	kokoroSrv := ttsStub(&kokoroBody)
+	defer kokoroSrv.Close()
+	vcSrv := voiceCloneStub(t, &vcBody, nil)
+	defer vcSrv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{
+		"kokoro":      kokoroSrv.URL,
+		"voice-clone": vcSrv.URL,
+	}}
+
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "vc-route",
+		Type:    "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "clone me", "backend": "voice-clone"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if kokoroBody != nil {
+		t.Errorf("kokoro stub received a request; it must not be dialed when backend=voice-clone: %v", kokoroBody)
+	}
+	if vcBody == nil {
+		t.Fatal("voice-clone stub received no request; the voice-clone backend was not dialed")
+	}
+	if vcBody["voice"] != "auto" {
+		t.Errorf("voice-clone forwarded voice = %v, want defaulted auto", vcBody["voice"])
+	}
+	if vcBody["response_format"] != "mp3" {
+		t.Errorf("voice-clone forwarded response_format = %v, want defaulted mp3", vcBody["response_format"])
+	}
+	var res map[string]any
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	if res["backend"] != "voice-clone" {
+		t.Errorf("result backend = %v, want voice-clone", res["backend"])
+	}
+}
+
+// TestSynthesizeSpeech_VoiceCloneForwardsPassthroughs verifies the new voice-clone
+// passthroughs (engine/language/instruct) reach the module when supplied, under
+// voice=auto (instruct requires auto on the module side).
+func TestSynthesizeSpeech_VoiceCloneForwardsPassthroughs(t *testing.T) {
+	var gotBody map[string]any
+	srv := voiceCloneStub(t, &gotBody, nil)
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"voice-clone": srv.URL}}
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "vc-passthroughs",
+		Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{
+			"text":     "design a new voice",
+			"backend":  "voice-clone",
+			"engine":   "omnivoice",
+			"language": "en",
+			"instruct": "warm, calm, measured",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotBody["engine"] != "omnivoice" {
+		t.Errorf("forwarded engine = %v, want omnivoice", gotBody["engine"])
+	}
+	if gotBody["language"] != "en" {
+		t.Errorf("forwarded language = %v, want en", gotBody["language"])
+	}
+	if gotBody["instruct"] != "warm, calm, measured" {
+		t.Errorf("forwarded instruct = %v", gotBody["instruct"])
+	}
+}
+
+// TestSynthesizeSpeech_VoiceCloneWordTimestamps pins the per-backend word-timestamps
+// routing: voice-clone uses the BASE /v1/audio/speech with a word_timestamps body
+// flag (NOT kokoro's /captioned endpoint), and the {audio_base64, words} JSON is
+// decoded into the envelope.
+func TestSynthesizeSpeech_VoiceCloneWordTimestamps(t *testing.T) {
+	var gotBody map[string]any
+	var gotPath string
+	srv := voiceCloneStub(t, &gotBody, &gotPath)
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"voice-clone": srv.URL}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "vc-words",
+		Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{
+			"text":            "hello",
+			"backend":         "voice-clone",
+			"voice":           "my-voice",
+			"word_timestamps": "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotPath != "/v1/audio/speech" {
+		t.Fatalf("voice-clone word_timestamps path = %q, want the base /v1/audio/speech (not /captioned)", gotPath)
+	}
+	if wt, _ := gotBody["word_timestamps"].(bool); !wt {
+		t.Fatalf("voice-clone request must carry word_timestamps:true in the body, got %#v", gotBody["word_timestamps"])
+	}
+	var res map[string]any
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	if res["content"] != "YXVkaW8=" {
+		t.Fatalf("content = %#v, want the module's base64 audio", res["content"])
+	}
+	words, ok := res["words"].([]any)
+	if !ok || len(words) != 1 {
+		t.Fatalf("words = %#v, want one aligned span", res["words"])
+	}
+}
+
+// TestSynthesizeSpeech_VoiceCloneReceiptCarriesLicenseAndConsent verifies the
+// module's model_license (X-TTS-Model-License) and consent echo (from the
+// padded-urlsafe-base64 X-TTS-Receipt) are carried into the job receipt.
+func TestSynthesizeSpeech_VoiceCloneReceiptCarriesLicenseAndConsent(t *testing.T) {
+	srv := voiceCloneStub(t, nil, nil)
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"voice-clone": srv.URL}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "vc-receipt",
+		Type:    "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "clone me", "backend": "voice-clone", "voice": "my-voice"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var res map[string]any
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	receipt, ok := res["receipt"].(map[string]any)
+	if !ok {
+		t.Fatalf("receipt missing or wrong type: %v", res["receipt"])
+	}
+	if receipt["model_license"] != "CC-BY-NC" {
+		t.Errorf("receipt model_license = %v, want CC-BY-NC", receipt["model_license"])
+	}
+	if receipt["engine"] != "omnivoice" {
+		t.Errorf("receipt engine = %v, want omnivoice", receipt["engine"])
+	}
+	if receipt["voice_id"] != "jane-doe" {
+		t.Errorf("receipt voice_id = %v, want jane-doe", receipt["voice_id"])
+	}
+	if receipt["commercial_use"] != false {
+		t.Errorf("receipt commercial_use = %v, want false", receipt["commercial_use"])
+	}
+	if receipt["watermark"] != true {
+		t.Errorf("receipt watermark = %v, want true", receipt["watermark"])
+	}
+	consent, ok := receipt["consent"].(map[string]any)
+	if !ok {
+		t.Fatalf("receipt consent missing or wrong type: %v", receipt["consent"])
+	}
+	if consent["speaker_name"] != "Jane Doe" {
+		t.Errorf("consent speaker_name = %v, want Jane Doe", consent["speaker_name"])
+	}
+}
+
+// TestSynthesizeSpeech_KokoroReceiptHasNoVoiceCloneKeys pins the additive contract
+// from the receipt side: a kokoro response (which sets neither X-TTS-Model-License
+// nor X-TTS-Receipt) produces a receipt with NO model_license and NO consent key,
+// byte-identical to before those fields existed.
+func TestSynthesizeSpeech_KokoroReceiptHasNoVoiceCloneKeys(t *testing.T) {
+	var gotBody map[string]any
+	srv := ttsStub(&gotBody)
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"kokoro": srv.URL}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "kokoro-receipt",
+		Type:    "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hi"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var res map[string]any
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	receipt, _ := res["receipt"].(map[string]any)
+	for _, key := range []string{"model_license", "engine", "voice_id", "commercial_use", "watermark", "consent"} {
+		if _, present := receipt[key]; present {
+			t.Errorf("kokoro receipt must not carry %q, got %v", key, receipt[key])
+		}
+	}
+}
+
+// TestSynthesizeSpeech_VoiceCloneReceiptMalformedHeaderNoConsentNoError verifies a
+// malformed X-TTS-Receipt header degrades to "no consent key" rather than failing
+// the job (same best-effort posture as every other receipt field).
+func TestSynthesizeSpeech_VoiceCloneReceiptMalformedHeaderNoConsentNoError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		if r.URL.Path == "/info" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("X-TTS-Model-License", "MIT")
+		w.Header().Set("X-TTS-Receipt", "!!!not-base64!!!")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("mp3-bytes"))
+	}))
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"voice-clone": srv.URL}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "vc-bad-receipt",
+		Type:    "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hi", "backend": "voice-clone"},
+	})
+	if err != nil {
+		t.Fatalf("malformed X-TTS-Receipt must not fail the job: %v", err)
+	}
+	var res map[string]any
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	receipt, _ := res["receipt"].(map[string]any)
+	if receipt["model_license"] != "MIT" {
+		t.Errorf("receipt model_license = %v, want MIT (from its own header)", receipt["model_license"])
+	}
+	if _, present := receipt["consent"]; present {
+		t.Errorf("a malformed X-TTS-Receipt must yield no consent key, got %v", receipt["consent"])
+	}
+}
+
+// TestSynthesizeSpeech_VoiceClone403SurfacesModuleMessage pins the acceptance: an
+// OmniVoice request with the license flag unset returns the module's 403 message,
+// which must surface in the job error (not just a bare status).
+func TestSynthesizeSpeech_VoiceClone403SurfacesModuleMessage(t *testing.T) {
+	const detail = "OmniVoice is disabled; set OMNIVOICE_ACCEPT_NONCOMMERCIAL_LICENSE=true"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"detail":"` + detail + `"}`))
+	}))
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"voice-clone": srv.URL}}
+	body, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "vc-403",
+		Type:    "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hi", "backend": "voice-clone", "engine": "omnivoice"},
+	})
+	if err == nil {
+		t.Fatal("expected an error for a 403 license refusal")
+	}
+	if !strings.Contains(err.Error(), detail) {
+		t.Fatalf("403 error must surface the module's message; got %v", err)
+	}
+	// The module's refusal body must be passed through VERBATIM (aceteam#10823
+	// item 4): not swallowed, not rewritten.
+	wantBody := `{"detail":"` + detail + `"}`
+	if string(body) != wantBody {
+		t.Fatalf("403 body must be returned verbatim; got %q, want %q", body, wantBody)
+	}
+}
+
+// TestSynthesizeSpeech_VoiceCloneInstructionsMapToInstruct pins aceteam#10823
+// item 2: the platform's standard `instructions` field is translated to the
+// module's `instruct` field for the voice-clone backend, and `instructions` is
+// NOT also forwarded.
+func TestSynthesizeSpeech_VoiceCloneInstructionsMapToInstruct(t *testing.T) {
+	var gotBody map[string]any
+	srv := voiceCloneStub(t, &gotBody, nil)
+	defer srv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"voice-clone": srv.URL}}
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "vc-instructions-map",
+		Type: "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{
+			"text":         "design me",
+			"backend":      "voice-clone",
+			"instructions": "bright, energetic",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotBody["instruct"] != "bright, energetic" {
+		t.Errorf("voice-clone must map instructions -> instruct, got instruct=%v", gotBody["instruct"])
+	}
+	if _, present := gotBody["instructions"]; present {
+		t.Errorf("voice-clone must NOT forward the `instructions` key (the module has no such field), got %v", gotBody["instructions"])
+	}
+}
+
+// TestSynthesizeSpeech_VoiceCloneEngineOmnivoiceRoutesTo8215 pins aceteam#10823
+// item 5: backend=voice-clone + engine=omnivoice dials the voice-clone module
+// (8215 in production), NEVER the standalone omnivoice sidecar (8214). The
+// `engine` body field is forwarded to the module; it is not the citadel backend
+// selector.
+func TestSynthesizeSpeech_VoiceCloneEngineOmnivoiceRoutesTo8215(t *testing.T) {
+	var omnivoiceBody, vcBody map[string]any
+	omnivoiceSrv := ttsStub(&omnivoiceBody)
+	defer omnivoiceSrv.Close()
+	vcSrv := voiceCloneStub(t, &vcBody, nil)
+	defer vcSrv.Close()
+
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{
+		"omnivoice":   omnivoiceSrv.URL,
+		"voice-clone": vcSrv.URL,
+	}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "vc-engine-omnivoice",
+		Type:    "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "hi", "backend": "voice-clone", "engine": "omnivoice"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if omnivoiceBody != nil {
+		t.Fatalf("the standalone omnivoice sidecar must NOT be dialed; engine=omnivoice is a voice-clone body field: %v", omnivoiceBody)
+	}
+	if vcBody == nil {
+		t.Fatal("the voice-clone module was not dialed")
+	}
+	if vcBody["engine"] != "omnivoice" {
+		t.Errorf("voice-clone request engine = %v, want omnivoice forwarded in the body", vcBody["engine"])
+	}
+	var res map[string]any
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	if res["backend"] != "voice-clone" {
+		t.Errorf("result backend = %v, want voice-clone", res["backend"])
 	}
 }
