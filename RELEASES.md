@@ -2966,3 +2966,18 @@ Auto-generated log of every release.
   - fix(jobs): confine instance state_volume_path to ~/.citadel/instances (#1163) (#1243)
 
 
+---
+
+## v2.186.0 — 2026-10-08
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 7 |
+| Lines added | +5737 |
+
+**Changes:**
+
+  - feat(papercraft): add papercraft-scene-render-v2 builtin with style presets (#1246)
+
+
