@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -370,5 +372,39 @@ func TestFileIndex_ContinuesPastFailedFile(t *testing.T) {
 	}
 	if res["files_failed"].(float64) != 1 {
 		t.Fatalf("expected 1 file failed, got %v (result=%s)", res["files_failed"], out)
+	}
+}
+
+func TestFileIndex_AbortsWhenTEINeverReady(t *testing.T) {
+	resetTEIBatchSizeCache()
+	// /health never reports OK, so waitForTEIReady times out with errTEINotReady.
+	// That must ABORT the walk (a dead service can embed nothing) rather than be
+	// swallowed as a per-file failure and spin the full readiness budget on every
+	// remaining file.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	t.Setenv("CITADEL_TEI_URL", srv.URL)
+	t.Setenv("CITADEL_INDEX_DB", "")
+
+	orig := teiReadyTimeout
+	teiReadyTimeout = 50 * time.Millisecond
+	defer func() { teiReadyTimeout = orig }()
+
+	ws := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte("some indexable text"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	idx := NewFileIndexHandler(ws, dbPath)
+	_, err := idx.Execute(JobContext{}, &nexus.Job{ID: "j", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
+	if err == nil {
+		t.Fatalf("expected the walk to abort when TEI is never ready")
+	}
+	if !errors.Is(err, errTEINotReady) {
+		t.Fatalf("expected errTEINotReady, got %v", err)
 	}
 }

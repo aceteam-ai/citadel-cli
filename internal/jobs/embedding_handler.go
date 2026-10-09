@@ -25,8 +25,9 @@ const teiDefaultURL = "http://localhost:8102"
 
 // teiReadyTimeout bounds how long the handler waits for TEI to report healthy
 // before giving up. Mirrors the vLLM/SGLang readiness budget in
-// llm_inference.go.
-const teiReadyTimeout = 60 * time.Second
+// llm_inference.go. A var (not a const) so tests can shrink it rather than
+// wait the full budget for the not-ready path.
+var teiReadyTimeout = 60 * time.Second
 
 // teiDefaultMaxClientBatchSize is the per-request input cap assumed when TEI's
 // GET /info is unavailable or omits max_client_batch_size. It matches the stock
