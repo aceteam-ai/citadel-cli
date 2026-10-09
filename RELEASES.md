@@ -2950,3 +2950,19 @@ Auto-generated log of every release.
   - fix(1235): node-identity follow-ups (persist identity + distinct given-name) (#1238)
 
 
+---
+
+## v2.185.0 — 2026-10-08
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 8 |
+| Lines added | +268 |
+
+**Changes:**
+
+  - fix(work): direct-Redis resolver always joins jobs:v1:cpu-general (#1244)
+  - fix(jobs): confine instance state_volume_path to ~/.citadel/instances (#1163) (#1243)
+
+
