@@ -71,6 +71,15 @@ type manifestService struct {
 	// services.BindEnv so the compose ${CITADEL_<SVC>_BIND:-...} substitution
 	// resolves. Empty => the compose default applies. See services/bind.go.
 	Bind string `yaml:"bind,omitempty"`
+	// OllamaMaxLoadedModels mirrors cmd/manifest.go Service.OllamaMaxLoadedModels:
+	// the aceteam-ai/citadel-cli#1209 per-service ollama residency policy
+	// (OLLAMA_MAX_LOADED_MODELS). serviceStart's docker branch injects it at
+	// `docker compose up` via services.OllamaMaxLoadedModelsComposeEnv so the
+	// key-only `environment:` entry is protected from shell/.env fallback. A *int
+	// so nil (unset) is distinguishable from an explicit 0; nil => explicit empty.
+	// See
+	// services/ollama_policy.go.
+	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
 }
 
 // ServiceHandler manages start/stop/status of services declared in the node's
@@ -373,6 +382,14 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 
 	switch kind {
 	case "native":
+		// aceteam-ai/citadel-cli#1209: a native ollama (a host-managed systemd
+		// ollama auto-detected by resolveKind, or an explicit type: native) has no
+		// compose env to inject into, so an OLLAMA_MAX_LOADED_MODELS policy cannot
+		// take effect. Warn rather than silently no-op (the exact OOM this policy
+		// exists to prevent on a memory-tight node): pin `type: docker` to apply it.
+		if svc.Name == "ollama" && svc.OllamaMaxLoadedModels != nil {
+			ctx.Log("warn", "     - %s: ollama_max_loaded_models is set but the service resolved to native (no compose to inject into); pin `type: docker` in citadel.yaml to apply OLLAMA_MAX_LOADED_MODELS", svc.Name)
+		}
 		// Native ollama has no compose env to inject, but its model contract is
 		// pull-based: SERVICE_START {service: ollama, model: X} must ensure X is
 		// pulled (idempotent, fast when cached) so the deploy contract holds even
@@ -415,6 +432,16 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		}
 
 	case "docker":
+		// Validate the strict #1209 policy before adoption, model/trust
+		// persistence, the already-running shortcut, resource preemption, RAM
+		// overrides, runtime probes, or legacy-container cleanup. The outer
+		// Execute path intentionally records desired-state intent before calling
+		// serviceStart; this guard promises no engine-side effects, not zero
+		// manifest intent writes.
+		if _, policyErr := embeddedservices.OllamaMaxLoadedModelsComposeEnv(nil, svc.Name, svc.OllamaMaxLoadedModels); policyErr != nil {
+			err = fmt.Errorf("docker compose up failed: %s", policyErr)
+			break
+		}
 		if svc.Name == "vllm" {
 			external, loadErr := externalengine.LoadPersisted(h.ConfigDir)
 			if loadErr != nil {
@@ -609,10 +636,11 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 			}
 			cmd := rt.ComposeCommand(composeArgs...)
 			// Inject the #1023 CITADEL_<SVC>_BIND entry (from the manifest bind:)
-			// so the compose bind-hatch substitution resolves to the operator's
-			// chosen interface. An unrecognized bind value fails the start loudly
-			// rather than silently falling through to the compose default.
-			if env, bindErr := h.composeEnvWithBind(svc.Name, svc.Bind); bindErr != nil {
+			// and the #1209 OLLAMA_MAX_LOADED_MODELS entry (from the manifest
+			// ollama_max_loaded_models:) so the compose substitution/passthrough
+			// resolve. An invalid value fails the start loudly rather than
+			// silently falling through to the compose/engine default.
+			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels); bindErr != nil {
 				err = fmt.Errorf("docker compose up failed: %s", bindErr)
 			} else {
 				cmd.Env = env
@@ -2213,13 +2241,22 @@ func (h *ServiceHandler) composeEnv() []string {
 	return env
 }
 
-// composeEnvWithBind returns composeEnv() plus the aceteam-ai/citadel-cli#1023
-// CITADEL_<SVC>_BIND entry for a hatch-capable service (from the manifest bind:
-// value), so the compose ${CITADEL_<SVC>_BIND:-...} substitution resolves to the
-// operator's chosen interface. A non-hatch service or an empty bind injects
-// nothing (the compose default applies). An unrecognized bind value is a hard
-// error the caller surfaces as a start failure.
-func (h *ServiceHandler) composeEnvWithBind(serviceName, bind string) ([]string, error) {
+// composeEnvForEngineStart returns composeEnv() plus the per-engine overrides
+// injected at `docker compose up` for an embedded engine service:
+//
+//   - the aceteam-ai/citadel-cli#1023 CITADEL_<SVC>_BIND entry (from the manifest
+//     bind: value) so the compose ${CITADEL_<SVC>_BIND:-...} substitution resolves
+//     to the operator's chosen interface;
+//   - the aceteam-ai/citadel-cli#1209 OLLAMA_MAX_LOADED_MODELS entry (from the
+//     manifest ollama_max_loaded_models: value) so the ollama compose key-only
+//     `environment:` entry passes the residency policy through.
+//
+// A non-hatch service / empty bind leaves its existing behavior unchanged. For
+// ollama, a nil policy becomes an explicit empty entry so shell/.env fallback
+// cannot become policy while Ollama retains automatic concurrency. An invalid
+// bind or negative policy value is a hard error the caller surfaces as a start
+// failure. The policy entry is the final, sole copy of its key.
+func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int) ([]string, error) {
 	entry, inject, err := embeddedservices.BindEnv(serviceName, bind)
 	if err != nil {
 		return nil, err
@@ -2228,7 +2265,7 @@ func (h *ServiceHandler) composeEnvWithBind(serviceName, bind string) ([]string,
 	if inject {
 		env = append(env, entry)
 	}
-	return env, nil
+	return embeddedservices.OllamaMaxLoadedModelsComposeEnv(env, serviceName, ollamaMaxLoaded)
 }
 
 // bindExposureWarning returns a warning line when an embedded engine will be

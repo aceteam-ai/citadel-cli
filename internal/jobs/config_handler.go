@@ -489,6 +489,14 @@ type ManifestService struct {
 	// operator's `bind: all` opt-in would vanish on the next dashboard config
 	// save (aceteam-ai/citadel-cli#1060).
 	Bind string `yaml:"bind,omitempty"`
+	// OllamaMaxLoadedModels mirrors cmd/manifest.go Service.OllamaMaxLoadedModels:
+	// the aceteam-ai/citadel-cli#1209 per-service ollama residency policy
+	// (OLLAMA_MAX_LOADED_MODELS), a *int so nil (unset) is distinguishable from an
+	// explicit 0. It MUST be modeled here for the same #528/#850 reason as Bind
+	// above: updateManifest round-trips the whole citadel.yaml through this struct,
+	// so a field missing here is silently DROPPED on every APPLY_DEVICE_CONFIG --
+	// the policy would vanish on the next dashboard config save.
+	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
 }
 
 // ManifestConfig represents additional configuration in the manifest.
@@ -676,6 +684,14 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// Configure GPU runtime if on Linux
 		if platform.IsLinux() {
 			env = append(env, "DOCKER_DEFAULT_RUNTIME=nvidia")
+		}
+		// Normalize the aceteam-ai/citadel-cli#1209 policy after every other env
+		// entry. This APPLY_DEVICE_CONFIG path is best-effort: a negative value is
+		// logged and becomes explicit empty, as do missing/unreadable manifests,
+		// so hostile shell/.env values cannot silently become node policy.
+		env, policyErr := composeEnvForAppliedService(env, manifestPath, svcName)
+		if policyErr != nil {
+			clilog.Writef("warning", "ollama policy for %s: %v; using engine default", svcName, policyErr)
 		}
 		cmd.Env = env
 

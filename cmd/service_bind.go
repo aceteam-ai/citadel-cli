@@ -16,21 +16,35 @@ import (
 	svcports "github.com/aceteam-ai/citadel-cli/services"
 )
 
-// manifestServiceBind returns the manifest `bind:` value for serviceName, or ""
-// if unresolvable/unset. Best-effort and --node-dir-aware (it reads through
-// findAndReadManifest); any manifest read error yields "" so the compose `:-`
-// default applies rather than failing the caller.
-func manifestServiceBind(serviceName string) string {
+// manifestServiceFor returns the manifest Service entry for serviceName (and
+// whether one was found). Best-effort and --node-dir-aware (it reads through
+// findAndReadManifest); any manifest read error yields (zero, false) so callers
+// fall through to the compose defaults rather than failing. The single manifest
+// read both the #1023 bind hatch and the #1209 ollama policy derive from, so a
+// start path does not read citadel.yaml twice.
+func manifestServiceFor(serviceName string) (Service, bool) {
 	manifest, _, err := findAndReadManifest()
 	if err != nil || manifest == nil {
-		return ""
+		return Service{}, false
 	}
 	for _, s := range manifest.Services {
 		if s.Name == serviceName {
-			return s.Bind
+			return s, true
 		}
 	}
-	return ""
+	return Service{}, false
+}
+
+// manifestServiceBind returns the manifest `bind:` value for serviceName, or ""
+// if unresolvable/unset. Best-effort and --node-dir-aware; any manifest read
+// error yields "" so the compose `:-` default applies rather than failing the
+// caller.
+func manifestServiceBind(serviceName string) string {
+	s, ok := manifestServiceFor(serviceName)
+	if !ok {
+		return ""
+	}
+	return s.Bind
 }
 
 // serviceBindEnvMap resolves the single-entry {CITADEL_<SVC>_BIND: addr} map for
@@ -64,13 +78,29 @@ func bindEnvEntries(bindEnv map[string]string) []string {
 // startService/serviceStart, the paths where an operator can act on the error,
 // refuse loudly instead.
 func composeEnvForService(serviceName string) []string {
+	svc, _ := manifestServiceFor(serviceName)
+	return composeEnvForServiceValues(serviceName, svc)
+}
+
+// composeEnvForServiceValues is the hermetic core of composeEnvForService. It
+// keeps the port-drift/restart builder testable without resolving the live node
+// manifest, while production still supplies the one entry read above.
+func composeEnvForServiceValues(serviceName string, svc Service) []string {
 	env := composeEnv()
-	bindEnv, err := serviceBindEnvMap(serviceName, manifestServiceBind(serviceName))
+	bindEnv, err := serviceBindEnvMap(serviceName, svc.Bind)
 	if err != nil {
 		Log("bind: %s: %v; using compose default", serviceName, err)
-		return env
+	} else {
+		env = append(env, bindEnvEntries(bindEnv)...)
 	}
-	return append(env, bindEnvEntries(bindEnv)...)
+	// Normalize the #1209 Ollama policy LAST. Even nil/unreadable/invalid
+	// best-effort policy becomes an explicit empty entry for ollama so neither an
+	// inherited shell value nor Compose .env fallback can become node policy.
+	env, policyErr := svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, svc.OllamaMaxLoadedModels)
+	if policyErr != nil {
+		Log("ollama policy: %s: %v; using engine default", serviceName, policyErr)
+	}
+	return env
 }
 
 // engineExposedOnAllInterfaces reports whether an embedded engine service, as it

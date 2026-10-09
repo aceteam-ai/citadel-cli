@@ -30,6 +30,14 @@ services:
     container_name: citadel-ollama
     ports:
       - "${CITADEL_OLLAMA_BIND:-0.0.0.0}:11434:11434"
+    # OLLAMA_MAX_LOADED_MODELS (aceteam-ai/citadel-cli#1209): see ollama.yml for
+    # the full explanation. The key-only form is normalized by Citadel to the
+    # manifest value or explicit empty (Ollama's semantic automatic default),
+    # preventing shell and .env fallback from silently becoming node policy.
+    # Kept identical to ollama.yml so the two files differ ONLY by the GPU
+    # reservation (TestDarwinComposeVariantsOnlyDropGPU).
+    environment:
+      - OLLAMA_MAX_LOADED_MODELS
     volumes:
       # Mount a user-accessible directory for Ollama models
       - ~/citadel-cache/ollama:/root/.ollama
