@@ -225,16 +225,64 @@ func hardenUnitContent(content string) (string, bool) {
 	return strings.Join(lines, "\n"), true
 }
 
+// unitRefreshDecision is what the pure decideUnitRefresh concludes for one
+// candidate unit, so the I/O-free verdict can be unit-tested directly.
+type unitRefreshDecision int
+
+const (
+	// refreshNotManaged: the file at this path is not a citadel-managed unit
+	// (leave it untouched; never normalize an unrelated unit).
+	refreshNotManaged unitRefreshDecision = iota
+	// refreshNoChange: a citadel unit already carrying the hardening (no write,
+	// no daemon-reload churn).
+	refreshNoChange
+	// refreshNeedsRoot: a citadel SYSTEM unit that needs the hardening but the
+	// current process lacks the privilege to rewrite /etc. Emit a remediation.
+	refreshNeedsRoot
+	// refreshRewrite: a citadel unit that needs the hardening and we may rewrite
+	// it (a user unit, or a system unit as root).
+	refreshRewrite
+)
+
+// decideUnitRefresh is the pure per-candidate decision. euid is injected
+// (os.Geteuid() in production) so the root/non-root branch for system units is
+// testable without actually dropping privileges. On refreshRewrite/refreshNeedsRoot
+// it returns the hardened content; otherwise the string is empty.
+func decideUnitRefresh(content string, userMode bool, euid int) (hardened string, decision unitRefreshDecision) {
+	if !isCitadelManagedUnit(content) {
+		return "", refreshNotManaged
+	}
+	hardened, changed := hardenUnitContent(content)
+	if !changed {
+		return "", refreshNoChange
+	}
+	// System units live under /etc and require root to rewrite.
+	if !userMode && euid != 0 {
+		return hardened, refreshNeedsRoot
+	}
+	return hardened, refreshRewrite
+}
+
 // RematerializeManagedUnits re-renders every citadel-managed systemd unit on disk
 // so the #444 crash-storm hardening reaches nodes deployed by an older binary. It
-// is safe to call on every `citadel update install` and (version-gated) at boot:
-// a unit already carrying the hardening is left untouched and triggers no
-// daemon-reload. logf may be nil.
+// is safe to call on every `citadel update install` (including its already-latest
+// path, citadel-cli#1266) and (version-gated) at boot: a unit already carrying the
+// hardening is left untouched and triggers no daemon-reload. logf may be nil.
 //
 // Returns the list of unit paths it actually rewrote (empty when everything was
 // already current). Errors on individual units are logged and do not abort the
 // others; the returned error is non-nil only for a systemic failure.
+//
+// This is a thin production wrapper over rematerializeManagedUnits, which takes
+// the candidate set, euid, and systemctl runner as explicit parameters so the
+// full loop (backup, atomic write, daemon-reload selection, remediation logging)
+// is hermetically testable against t.TempDir() with a fake runner -- never a real
+// /etc unit and never a real `systemctl` on the test host.
 func RematerializeManagedUnits(logf func(format string, args ...any)) ([]string, error) {
+	return rematerializeManagedUnits(candidateManagedUnits(), os.Geteuid(), runCmd, logf)
+}
+
+func rematerializeManagedUnits(cands []managedUnitCandidate, euid int, run func(name string, args ...string) error, logf func(format string, args ...any)) ([]string, error) {
 	log := func(format string, args ...any) {
 		if logf != nil {
 			logf(format, args...)
@@ -245,7 +293,7 @@ func RematerializeManagedUnits(logf func(format string, args ...any)) ([]string,
 	reloadUser := false
 	reloadSystem := false
 
-	for _, cand := range candidateManagedUnits() {
+	for _, cand := range cands {
 		data, err := os.ReadFile(cand.path)
 		if os.IsNotExist(err) {
 			continue
@@ -256,21 +304,18 @@ func RematerializeManagedUnits(logf func(format string, args ...any)) ([]string,
 		}
 		content := string(data)
 
-		if !isCitadelManagedUnit(content) {
+		hardened, decision := decideUnitRefresh(content, cand.userMode, euid)
+		switch decision {
+		case refreshNotManaged:
 			log("unit-refresh: %s: not a citadel-managed unit; leaving untouched", cand.path)
 			continue
-		}
-
-		hardened, changed := hardenUnitContent(content)
-		if !changed {
+		case refreshNoChange:
 			continue // already current: no write, no reload churn
-		}
-
-		// System units live under /etc and require root to rewrite. Skip (with a
-		// hint) rather than error when we lack privileges, e.g. an unprivileged
-		// `citadel update install` on a system-unit node.
-		if !cand.userMode && os.Geteuid() != 0 {
-			log("unit-refresh: %s: needs the #444 restart-storm hardening but rewriting a system unit requires root; re-run `sudo citadel update install` (or reinstall) to apply", cand.path)
+		case refreshNeedsRoot:
+			// Skip (with an actionable, secure_path-proof hint) rather than error
+			// when we lack privileges, e.g. an unprivileged `citadel update install`
+			// on a system-unit node (citadel-cli#1266).
+			log("unit-refresh: %s: needs the #444 restart-storm hardening but rewriting a system unit requires root; re-run as root: %s", cand.path, rootRemediationCommand(selfExe()))
 			continue
 		}
 
@@ -296,12 +341,12 @@ func RematerializeManagedUnits(logf func(format string, args ...any)) ([]string,
 	// mid-update restart would drop in-flight jobs. The new unit takes effect on
 	// the next (natural or update-driven) restart.
 	if reloadSystem {
-		if err := runCmd("systemctl", "daemon-reload"); err != nil {
+		if err := run("systemctl", "daemon-reload"); err != nil {
 			log("unit-refresh: systemctl daemon-reload (system) failed: %v", err)
 		}
 	}
 	if reloadUser {
-		if err := runCmd("systemctl", "--user", "daemon-reload"); err != nil {
+		if err := run("systemctl", "--user", "daemon-reload"); err != nil {
 			log("unit-refresh: systemctl --user daemon-reload failed: %v", err)
 		}
 	}

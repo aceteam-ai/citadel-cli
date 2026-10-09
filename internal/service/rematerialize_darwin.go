@@ -75,7 +75,7 @@ func RematerializeManagedUnits(logf func(format string, args ...any)) ([]string,
 		// The system LaunchDaemon lives under /Library and requires root to
 		// rewrite. Skip (with a hint) rather than error when unprivileged.
 		if !userMode && os.Geteuid() != 0 {
-			log("plist-refresh: %s: needs a Homebrew ExecPath heal but rewriting a system LaunchDaemon requires root; re-run `sudo citadel update install`", pp)
+			log("plist-refresh: %s: needs a Homebrew ExecPath heal but rewriting a system LaunchDaemon requires root; re-run as root: %s", pp, rootRemediationCommand(selfExe()))
 			continue
 		}
 

@@ -3,6 +3,7 @@
 package service
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -169,86 +170,178 @@ WantedBy=multi-user.target
 	}
 }
 
-// TestRematerializeManagedUnits_UserUnit drives the full file path via the user
-// unit (no root, no systemctl side effects verified -- daemon-reload failing in
-// CI is tolerated and logged). It proves an out-of-date on-disk unit is rewritten
-// to the hardened form and that a second run is a no-op.
-func TestRematerializeManagedUnits_UserUnit(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+// fakeSystemctl records runCmd invocations so tests can assert which
+// daemon-reload (system vs --user) was requested without shelling out to the
+// real systemctl -- critical because the build host is itself a live citadel
+// node running a systemd user unit (see CLAUDE.md hermeticity notes).
+type fakeSystemctl struct {
+	calls [][]string
+}
 
-	unitPath, err := unitFilePath(true)
+func (f *fakeSystemctl) run(name string, args ...string) error {
+	f.calls = append(f.calls, append([]string{name}, args...))
+	return nil
+}
+
+// writeTempUnit writes content to a fresh file in t.TempDir() and returns a
+// candidate for it, so the injectable core operates entirely under a tempdir --
+// never a real /etc or ~/.config unit.
+func writeTempUnit(t *testing.T, content string, userMode bool) managedUnitCandidate {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "citadel-worker.service")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write temp unit: %v", err)
+	}
+	return managedUnitCandidate{path: path, userMode: userMode}
+}
+
+// TestDecideUnitRefresh pins the pure per-candidate verdict, including the
+// root/non-root branch for system units (euid injected, no privilege drop).
+func TestDecideUnitRefresh(t *testing.T) {
+	alreadyHardened, _ := hardenUnitContent(oldWorkerUnit)
+	foreign := "[Unit]\nDescription=Not citadel\n\n[Service]\nExecStart=/usr/bin/other\n"
+
+	cases := []struct {
+		name     string
+		content  string
+		userMode bool
+		euid     int
+		want     unitRefreshDecision
+	}{
+		{"system unit, drift, root -> rewrite", oldWorkerUnit, false, 0, refreshRewrite},
+		{"system unit, drift, non-root -> needs root", oldWorkerUnit, false, 1000, refreshNeedsRoot},
+		{"user unit, drift, non-root -> rewrite", oldWorkerUnit, true, 1000, refreshRewrite},
+		{"already hardened -> no change", alreadyHardened, false, 0, refreshNoChange},
+		{"foreign unit -> not managed", foreign, false, 0, refreshNotManaged},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hardened, got := decideUnitRefresh(tc.content, tc.userMode, tc.euid)
+			if got != tc.want {
+				t.Fatalf("decision = %d, want %d", got, tc.want)
+			}
+			// On a rewrite/needs-root verdict the hardened content must carry the
+			// #444 directives; otherwise it must be empty.
+			if tc.want == refreshRewrite || tc.want == refreshNeedsRoot {
+				for _, d := range []string{"StartLimitIntervalSec=300", "StartLimitBurst=5", "RestartSteps=5", "RestartMaxDelaySec=300"} {
+					if !strings.Contains(hardened, d) {
+						t.Errorf("hardened content missing %q", d)
+					}
+				}
+			} else if hardened != "" {
+				t.Errorf("expected empty hardened content for decision %d, got %q", got, hardened)
+			}
+		})
+	}
+}
+
+// TestRematerializeManagedUnits_SystemUnitAsRoot drives the full loop over a
+// tempdir SYSTEM unit with euid=0: the unit is rewritten with the #444
+// directives, backed up, and a SYSTEM daemon-reload (not --user) is requested
+// via the injected runner. A second run over the now-current unit is a clean
+// no-op (no rewrite, no reload).
+func TestRematerializeManagedUnits_SystemUnitAsRoot(t *testing.T) {
+	cand := writeTempUnit(t, oldWorkerUnit, false /* system */)
+	fake := &fakeSystemctl{}
+
+	rewritten, err := rematerializeManagedUnits([]managedUnitCandidate{cand}, 0 /* root */, fake.run, nil)
 	if err != nil {
-		t.Fatalf("unitFilePath: %v", err)
+		t.Fatalf("rematerializeManagedUnits: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	// Write a pre-#444 user unit (citadel-managed, missing hardening).
-	userUnit := strings.Replace(oldWorkerUnit,
-		"Description=Citadel Worker - AceTeam Sovereign Compute",
-		"Description=Citadel Node Agent - AceTeam Sovereign Compute", 1)
-	if err := os.WriteFile(unitPath, []byte(userUnit), 0o644); err != nil {
-		t.Fatalf("write unit: %v", err)
+	if len(rewritten) != 1 || rewritten[0] != cand.path {
+		t.Fatalf("expected rewrite of %s, got %v", cand.path, rewritten)
 	}
 
-	rewritten, err := RematerializeManagedUnits(nil)
-	if err != nil {
-		t.Fatalf("RematerializeManagedUnits: %v", err)
-	}
-	if len(rewritten) != 1 || rewritten[0] != unitPath {
-		t.Fatalf("expected rewrite of %s, got %v", unitPath, rewritten)
-	}
-
-	got, _ := os.ReadFile(unitPath)
-	for _, want := range []string{"StartLimitIntervalSec=300", "RestartSteps=5", "RestartMaxDelaySec=300"} {
+	got, _ := os.ReadFile(cand.path)
+	for _, want := range []string{"StartLimitIntervalSec=300", "StartLimitBurst=5", "RestartSteps=5", "RestartMaxDelaySec=300"} {
 		if !strings.Contains(string(got), want) {
-			t.Errorf("rewritten unit missing %q", want)
+			t.Errorf("rewritten unit missing %q\n%s", want, got)
 		}
 	}
-	// Backup of the prior file exists.
-	if _, err := os.Stat(unitPath + ".citadel-bak"); err != nil {
+	if _, err := os.Stat(cand.path + ".citadel-bak"); err != nil {
 		t.Errorf("expected backup file, got err: %v", err)
 	}
+	// A system unit must trigger a SYSTEM daemon-reload, never --user.
+	if len(fake.calls) != 1 {
+		t.Fatalf("expected exactly one systemctl call, got %v", fake.calls)
+	}
+	if got := strings.Join(fake.calls[0], " "); got != "systemctl daemon-reload" {
+		t.Fatalf("expected `systemctl daemon-reload`, got %q", got)
+	}
 
-	// Second run: unit already current -> no rewrite.
-	rewritten2, err := RematerializeManagedUnits(nil)
+	// Second run: already current -> no rewrite, no reload churn.
+	fake2 := &fakeSystemctl{}
+	rewritten2, err := rematerializeManagedUnits([]managedUnitCandidate{cand}, 0, fake2.run, nil)
 	if err != nil {
-		t.Fatalf("second RematerializeManagedUnits: %v", err)
+		t.Fatalf("second rematerializeManagedUnits: %v", err)
 	}
 	if len(rewritten2) != 0 {
 		t.Errorf("second run rewrote units (not idempotent): %v", rewritten2)
 	}
+	if len(fake2.calls) != 0 {
+		t.Errorf("second run issued a daemon-reload on an unchanged unit: %v", fake2.calls)
+	}
 }
 
-// TestRematerializeManagedUnits_LeavesForeignUnit ensures a non-citadel unit at a
-// candidate path is never touched.
+// TestRematerializeManagedUnits_SystemUnitNonRoot proves the non-root path:
+// a system unit with drift is NOT rewritten (no privilege), its content is left
+// untouched, no daemon-reload is attempted, and the logged remediation is the
+// corrected, secure_path-proof form -- never a bare `sudo citadel`.
+func TestRematerializeManagedUnits_SystemUnitNonRoot(t *testing.T) {
+	cand := writeTempUnit(t, oldWorkerUnit, false /* system */)
+	fake := &fakeSystemctl{}
+	var logs []string
+	logf := func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+
+	rewritten, err := rematerializeManagedUnits([]managedUnitCandidate{cand}, 1000 /* non-root */, fake.run, logf)
+	if err != nil {
+		t.Fatalf("rematerializeManagedUnits: %v", err)
+	}
+	if len(rewritten) != 0 {
+		t.Fatalf("non-root run rewrote a system unit: %v", rewritten)
+	}
+	if got, _ := os.ReadFile(cand.path); string(got) != oldWorkerUnit {
+		t.Errorf("system unit content changed on a non-root run:\n%s", got)
+	}
+	if len(fake.calls) != 0 {
+		t.Errorf("non-root run attempted a daemon-reload: %v", fake.calls)
+	}
+	if _, err := os.Stat(cand.path + ".citadel-bak"); err == nil {
+		t.Errorf("non-root run wrote a backup file (should not touch the unit at all)")
+	}
+
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "requires root") {
+		t.Fatalf("expected a needs-root remediation log, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "sudo citadel ") {
+		t.Fatalf("remediation uses a bare `sudo citadel` that secure_path breaks:\n%s", joined)
+	}
+	if !strings.Contains(joined, "service refresh-unit") {
+		t.Fatalf("remediation should point at the network-free `service refresh-unit`:\n%s", joined)
+	}
+}
+
+// TestRematerializeManagedUnits_LeavesForeignUnit ensures a non-citadel unit at
+// a candidate path is never touched and never triggers a reload.
 func TestRematerializeManagedUnits_LeavesForeignUnit(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	unitPath, err := unitFilePath(true)
-	if err != nil {
-		t.Fatalf("unitFilePath: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
 	foreign := "[Unit]\nDescription=Not citadel\n\n[Service]\nExecStart=/usr/bin/other\n"
-	if err := os.WriteFile(unitPath, []byte(foreign), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	cand := writeTempUnit(t, foreign, true)
+	fake := &fakeSystemctl{}
 
-	rewritten, err := RematerializeManagedUnits(nil)
+	rewritten, err := rematerializeManagedUnits([]managedUnitCandidate{cand}, 0, fake.run, nil)
 	if err != nil {
-		t.Fatalf("RematerializeManagedUnits: %v", err)
+		t.Fatalf("rematerializeManagedUnits: %v", err)
 	}
 	if len(rewritten) != 0 {
 		t.Errorf("foreign unit was rewritten: %v", rewritten)
 	}
-	got, _ := os.ReadFile(unitPath)
-	if string(got) != foreign {
+	if got, _ := os.ReadFile(cand.path); string(got) != foreign {
 		t.Errorf("foreign unit content changed:\n%s", got)
+	}
+	if len(fake.calls) != 0 {
+		t.Errorf("foreign unit triggered a daemon-reload: %v", fake.calls)
 	}
 }
 

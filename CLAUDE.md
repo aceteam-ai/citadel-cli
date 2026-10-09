@@ -3837,6 +3837,22 @@ concluding the macOS/Windows half of that issue is still open).
 `citadel update install` now warns loudly by default when a managed service is
 detected, and restarts it only with an explicit `--restart` flag.
 
+**The managed-unit refresh runs on the ALREADY-LATEST path too, not just after a
+download (citadel-cli#1266).** Both branches of `installUpdate` — the post-install
+one AND the early return when `release == nil` — now call
+`cmd/update.go`'s `refreshManagedServiceUnits` (the single wrapper over
+`service.RematerializeManagedUnits`, exposed as the `rematerializeManagedUnitsFn`
+seam for tests, and also driving the new `citadel service refresh-unit`). Before
+this, `sudo citadel update install` on an up-to-date node exited at "You are
+running the latest version" without ever re-materializing the unit, so a node
+deployed by a pre-#444 binary never received the restart-storm hardening (seen on
+node 1314). The already-latest branch deliberately skips `warnOrRestartManagedService`
+(the binary is unchanged, so there is no old-vs-new split-brain). Separately, the
+unprivileged-system-unit remediation (`service.rootRemediationCommand`) resolves
+`os.Executable()` to an ABSOLUTE path and targets the network-free
+`service refresh-unit`, because a bare `sudo citadel …` is "command not found"
+under sudo's secure_path for a `~/.local/bin` install.
+
 **The restart is preceded by a bounded, best-effort drain (citadel#887), not
 the unconditional immediate `systemctl restart` / `Stop()+Start()` this
 section used to describe.** `drainManagedServiceBeforeRestart` (`cmd/update.go`)

@@ -8,6 +8,54 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/service"
 )
 
+// TestRunSvcRefreshUnit_ExitCode pins the honest exit-code contract of
+// `citadel service refresh-unit` (citadel-cli#1266): a clean no-op and a
+// successful rewrite exit 0, but a reported-yet-unapplied refresh (most
+// commonly a system unit that needs root) returns a non-nil error so Execute()
+// exits non-zero. Uses the rematerializeManagedUnitsFn seam -- no real unit or
+// systemctl.
+func TestRunSvcRefreshUnit_ExitCode(t *testing.T) {
+	orig := rematerializeManagedUnitsFn
+	t.Cleanup(func() { rematerializeManagedUnitsFn = orig })
+
+	cases := []struct {
+		name    string
+		fn      func(logf func(string, ...any)) ([]string, error)
+		wantErr bool
+	}{
+		{
+			name:    "already current (no-op): exit 0",
+			fn:      func(func(string, ...any)) ([]string, error) { return nil, nil },
+			wantErr: false,
+		},
+		{
+			name: "rewritten: exit 0",
+			fn: func(logf func(string, ...any)) ([]string, error) {
+				logf("unit-refresh: applied")
+				return []string{"/etc/systemd/system/citadel-worker.service"}, nil
+			},
+			wantErr: false,
+		},
+		{
+			name: "needs root (reported, nothing applied): non-zero exit",
+			fn: func(logf func(string, ...any)) ([]string, error) {
+				logf("unit-refresh: needs root; re-run as root: sudo ...")
+				return nil, nil
+			},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rematerializeManagedUnitsFn = tc.fn
+			err := runSvcRefreshUnit(nil, nil)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("runSvcRefreshUnit err = %v, wantErr = %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestCompetingManagedUnit_TableDriven pins citadel#882's fix: `citadel
 // service install` must refuse when an already-ACTIVE citadel-managed unit is
 // something other than the one about to be written, and must treat "no active
