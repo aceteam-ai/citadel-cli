@@ -144,6 +144,25 @@ func rejectJammyGPUWithoutCompatiblePodman() error {
 	return fmt.Errorf("GPU provisioning on Ubuntu 22.04 needs Podman >= 4.1 before init; the default package is 3.4.4. Install a compatible Podman or use Ubuntu 24.04")
 }
 
+// rejectJetsonWithoutNvidiaCTKAt is the pure decision behind the Jetson/L4T
+// toolkit preflight. A Jetson needs its JetPack-matched nvidia-ctk; the generic
+// upstream Container Toolkit does not fit, so GPU CDI cannot be wired without
+// it. Fail closed (refuse) when a Jetson has no nvidia-ctk on PATH; a non-Jetson
+// never refuses here (its toolkit is installed by the NVIDIA toolkit step).
+func rejectJetsonWithoutNvidiaCTKAt(isJetson func() bool, lookPath func(string) (string, error)) error {
+	if !isJetson() {
+		return nil
+	}
+	if _, err := lookPath("nvidia-ctk"); err == nil {
+		return nil
+	}
+	return fmt.Errorf("Jetson/L4T needs its JetPack-matched NVIDIA toolkit (nvidia-ctk) installed before provisioning; refusing the generic upstream package. Install it, then re-run")
+}
+
+func rejectJetsonWithoutNvidiaCTK() error {
+	return rejectJetsonWithoutNvidiaCTKAt(isJetsonLinux, exec.LookPath)
+}
+
 var legacySystemWorkerUnits = []string{
 	"/etc/systemd/system/citadel-worker.service",
 	"/etc/systemd/system/citadel.service",
@@ -178,6 +197,15 @@ func prepareLinuxPodmanProvision() (bool, error) {
 	ready, err := classifyExistingPodmanWorker(user.Lookup, verifyDedicatedPodmanUser, existingRootlessWorker)
 	if err != nil || ready {
 		return ready, err
+	}
+	// A Jetson/L4T box needs its JetPack-matched nvidia-ctk before provisioning.
+	// Refuse here, before the dedicated account or any host mutation, rather than
+	// mid-provision: the NVIDIA Container Toolkit step's error is swallowed
+	// (warn-and-continue) by init's step loop, so a Jetson lacking nvidia-ctk
+	// would otherwise silently provision CPU-only. Mirrors install.sh's preflight
+	// gate, which was moved out of install_nvidia_toolkit for the same reason.
+	if err := rejectJetsonWithoutNvidiaCTK(); err != nil {
+		return false, err
 	}
 	// All state resolvers in the enrollment flow must see the worker's home,
 	// not the human sudo caller's or root's home. Refuse a pre-existing foreign
