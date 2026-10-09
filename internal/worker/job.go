@@ -104,6 +104,9 @@ const (
 	JobStatusTerminalFailure JobStatus = "terminal_failure"
 )
 
+// JobTypeFileReadRangeV1 is the bounded binary range contract for large files.
+const JobTypeFileReadRangeV1 = "FILE_READ_BYTES_RANGE_V1"
+
 // Common job types used across sources.
 //
 // This const block is the source of truth for job types. When adding a new type
@@ -218,6 +221,7 @@ var allKnownJobTypes = []string{
 	JobTypeWebFetch,
 	JobTypeFileRead,
 	JobTypeFileReadBytes,
+	JobTypeFileReadRangeV1,
 	JobTypeFileWrite,
 	JobTypeFileWriteBytes,
 	JobTypeFileEdit,
@@ -313,6 +317,7 @@ var allKnownJobTypes = []string{
 var gatedJobTypeReasons = map[string]string{
 	JobTypeFileRead:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileReadBytes:      "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileReadRangeV1:    "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileWrite:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileWriteBytes:     "this node has no workspace directory configured",
 	JobTypeFileEdit:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",

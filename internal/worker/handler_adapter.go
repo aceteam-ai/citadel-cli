@@ -364,6 +364,8 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 
 			readBytesHandler := jobs.NewFileReadBytesHandler(opts.WorkspaceDir)
 			readBytesHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			readBytesRangeHandler := jobs.NewFileReadBytesRangeHandler(opts.WorkspaceDir)
+			readBytesRangeHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
 			listHandler := jobs.NewFileListHandler(opts.WorkspaceDir)
 			listHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
@@ -383,6 +385,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			handlers = append(handlers,
 				newGatedLegacyHandlerAdapter(JobTypeFileRead, readHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler, gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileReadRangeV1, readBytesRangeHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir), gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir), gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileList, listHandler, gate),
