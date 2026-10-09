@@ -61,6 +61,15 @@ type StatusMessage struct {
 	// known-good value with. Distinct from Version above, which is the wire
 	// protocol version ("1.0").
 	AgentVersion string `json:"agentVersion,omitempty"`
+
+	// AutoUpdate is the versioned effective-auto-update-policy + last-attempt
+	// report (citadel-cli#1134), supplied from a cheap cached snapshot of the
+	// running worker via SetAutoUpdateProvider. Additive and omitempty: nil on a
+	// process with no updater wired (non-owner/monitor-only) and on legacy
+	// nodes/backends, so a heartbeat without it is byte-unchanged. Backends
+	// ingest with extra=ignore, so an unknown field is inert. Both transports
+	// (redis.go here, api.go) emit the identical block.
+	AutoUpdate *status.AutoUpdateReport `json:"auto_update,omitempty"`
 }
 
 // PermissionState mirrors config.Permissions for the heartbeat payload.
@@ -165,6 +174,12 @@ type RedisPublisher struct {
 	// and may return nil (no stats field on that heartbeat). Optional.
 	statsFn func() *pulse.StatsBlock
 
+	// autoUpdateFn, when set, returns the latest cached auto-update report
+	// (citadel-cli#1134). Like statsFn it is a pure cache read — no release
+	// lookup, no disk op — and may return nil (no auto_update field on that
+	// heartbeat). Optional.
+	autoUpdateFn func() *status.AutoUpdateReport
+
 	// markerDir, when non-empty, is where the cross-process heartbeat
 	// freshness marker is written after every publish attempt (#726; see
 	// marker.go). Empty (the default, including in every test in this
@@ -183,6 +198,14 @@ type RedisPublisher struct {
 // heartbeat without stats, not a late heartbeat.
 func (p *RedisPublisher) SetStatsProvider(fn func() *pulse.StatsBlock) {
 	p.statsFn = fn
+}
+
+// SetAutoUpdateProvider registers the cheap cached auto-update report reader
+// (citadel-cli#1134). The heartbeat attaches whatever the cache holds on each
+// publish; the reader must never block, error, perform a release lookup, or
+// touch disk. Mirrors SetStatsProvider's envelope-provider contract.
+func (p *RedisPublisher) SetAutoUpdateProvider(fn func() *status.AutoUpdateReport) {
+	p.autoUpdateFn = fn
 }
 
 // SetOnStatus registers a callback invoked with each collected status. Used to
@@ -397,6 +420,9 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 	}
 	if p.statsFn != nil {
 		msg.Stats = p.statsFn()
+	}
+	if p.autoUpdateFn != nil {
+		msg.AutoUpdate = p.autoUpdateFn()
 	}
 
 	return p.publishMessage(ctx, msg, deviceCode)

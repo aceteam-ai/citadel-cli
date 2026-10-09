@@ -862,6 +862,25 @@ func runWork(cmd *cobra.Command, args []string) {
 	// reader goroutine starts; this one is not, so it needs its own
 	// synchronization instead of relying on assignment order.
 	var nodeSwapManager atomic.Pointer[worker.SwapManager]
+	// nodeAutoUpdateReport caches the heartbeat auto_update snapshot
+	// (citadel-cli#1134) behind an atomic pointer so the status-publisher
+	// goroutines read it with no disk or release-lookup op. It is created HERE,
+	// before any publisher starts, and seeded once below; the periodic updater
+	// refreshes it to "periodic" mode via autoUpdateRuntime.refresh (passed at
+	// the runWorkerWithAutoUpdater call site), while a process that runs no
+	// updater leaves it at the seeded "unavailable" snapshot. Unlike
+	// nodeSwapManager it needs no atomic.Pointer wrapper of its own — ReportCache
+	// already stores its snapshot atomically, and the value itself is assigned
+	// here before any reader goroutine starts.
+	nodeAutoUpdateReport := &update.ReportCache{}
+	autoUpdateReportFn := func() *status.AutoUpdateReport {
+		return autoUpdateReportFrom(nodeAutoUpdateReport.Load())
+	}
+	// Reconcile a persisted restart-pending outcome with the compiled running
+	// version (clears it only when they now match), then seed the cache. Both
+	// are best-effort: telemetry must never interrupt or delay the worker.
+	_ = update.ReconcilePendingOnStartup(time.Now(), Version)
+	nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "unavailable"))
 	// nodeReconcileHealth is the desired-state PULL reconcile loop's
 	// full-wipe-guard HealthTracker (citadel-cli#742), same atomic-pointer
 	// reasoning as nodeSwapManager above: the status-publisher goroutines that
@@ -2120,6 +2139,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					if pulseStats != nil {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
+					apiPublisher.SetAutoUpdateProvider(autoUpdateReportFn)
 					startStatusPublisher = func() {
 						go func() {
 							fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
@@ -2173,6 +2193,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				if pulseStats != nil {
 					redisPublisher.SetStatsProvider(pulseStats.Latest)
 				}
+				redisPublisher.SetAutoUpdateProvider(autoUpdateReportFn)
 				startStatusPublisher = func() {
 					go func() {
 						fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
@@ -2760,8 +2781,15 @@ func runWork(cmd *cobra.Command, args []string) {
 		go monitor.Run(ctx)
 	}
 
-	// Run the worker
-	if err := runWorkerWithAutoUpdater(ctx, workerLock, workAutoUpdatePolicyInputs(), runner, workAutoUpdateLog, autoUpdateRuntime{}); err != nil {
+	// Run the worker. The refresh closure flips the heartbeat auto_update
+	// snapshot to "periodic" mode and keeps its policy/outcome fields current
+	// (citadel-cli#1134); it only runs when this process actually owns a periodic
+	// updater (worker lock held), so a non-owner keeps the seeded "unavailable".
+	if err := runWorkerWithAutoUpdater(ctx, workerLock, workAutoUpdatePolicyInputs(), runner, workAutoUpdateLog, autoUpdateRuntime{
+		refresh: func() {
+			nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "periodic"))
+		},
+	}); err != nil {
 		if err != context.Canceled {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
