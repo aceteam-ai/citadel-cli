@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -102,7 +103,7 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 
 	// Enumerate candidate files first so pruning can compare against on-disk state.
 	seen := make(map[string]struct{})
-	var indexed, skipped, embedded, chunksUpserted int
+	var indexed, skipped, failed, embedded, chunksUpserted int
 	dim := 0
 
 	walkErr := filepath.WalkDir(validated, func(p string, d os.DirEntry, err error) error {
@@ -158,7 +159,18 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		}
 		vecs, err := embedTexts(model, chunks)
 		if err != nil {
-			return fmt.Errorf("embed %s: %w", p, err)
+			// A dead embedding service (readiness timeout) aborts the walk —
+			// nothing else can succeed, and continuing would block the full
+			// readiness budget on every remaining file. A single file's embed
+			// failure (e.g. TEI 413 on an un-sub-batchable input, a transient
+			// upstream error) is recorded and skipped so one bad file never
+			// stalls a large index, mirroring the oversized-file skip above.
+			if errors.Is(err, errTEINotReady) {
+				return fmt.Errorf("embed %s: %w", p, err)
+			}
+			failed++
+			ctx.Log("warn", "     - [Job %s] FILE_INDEX skipping %s: embed failed: %v", job.ID, p, err)
+			return nil
 		}
 		idxChunks := make([]nodeindex.Chunk, len(chunks))
 		for i := range chunks {
@@ -204,6 +216,7 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	out := map[string]any{
 		"files_indexed":   indexed,
 		"files_skipped":   skipped,
+		"files_failed":    failed,
 		"files_removed":   removed,
 		"chunks_upserted": chunksUpserted,
 		"chunks_embedded": embedded,

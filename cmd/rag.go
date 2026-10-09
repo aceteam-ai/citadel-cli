@@ -99,8 +99,8 @@ func runRAGIndex(cmd *cobra.Command, args []string) error {
 	if ragJSON {
 		return printJSON(res)
 	}
-	fmt.Printf("%s indexed %d file(s), skipped %d, pruned %d (%d chunks embedded, dim %d)\n",
-		color.GreenString("OK"), res.FilesIndexed, res.FilesSkipped, res.FilesRemoved, res.ChunksEmbedded, res.Dim)
+	fmt.Printf("%s indexed %d file(s), skipped %d, failed %d, pruned %d (%d chunks embedded, dim %d)\n",
+		color.GreenString("OK"), res.FilesIndexed, res.FilesSkipped, res.FilesFailed, res.FilesRemoved, res.ChunksEmbedded, res.Dim)
 	return nil
 }
 
