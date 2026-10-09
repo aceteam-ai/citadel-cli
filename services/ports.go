@@ -216,6 +216,16 @@ const (
 	// kokoro, the service has no auth of its own and its sole consumer is the
 	// co-located citadel worker).
 	OmniVoiceHostPort = 8214
+	// voice-clone: a consented voice-enrollment + voice-cloned TTS module
+	// (aceteam-ai/citadel-services#28). Next free slot in the 8200 block after
+	// omnivoice's 8214. Its compose lives in aceteam-ai/citadel-services (like
+	// claudecode/meeting/gotenberg), served loopback-only; this registry is the
+	// only thing stopping a future module from hardcoding over 8215. NOTE:
+	// overlaps aceteam-ai/citadel-cli#1245 (voice-clone SYNTHESIZE_SPEECH
+	// backend), which also adds this constant; reconcile at merge (merge #1245
+	// first). Deliberately NOT added to ServiceHostPorts/serviceHostPortEnv here
+	// — that full registration is #1245's, so this stays a minimal definition.
+	VoiceCloneHostPort = 8215
 )
 
 // defaultVLLMHostPort is the vLLM host port when CITADEL_VLLM_HOST_PORT is unset.

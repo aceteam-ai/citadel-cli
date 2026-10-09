@@ -264,6 +264,16 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Log: opts.HandlerLog,
 	}))
 
+	// VOICE_MANAGE (issue #1248): enroll / list / delete consented voices on the
+	// local voice-clone module, proxied to its loopback /v1/voices API. Same
+	// privilege posture as EXPOSE_SET/APP_* (per-node stream only, fail closed).
+	// Registered unconditionally (like RESOURCE_SNAPSHOT); when the module is not
+	// installed the handler relays a clear transport failure, not a crash.
+	runner.RegisterHandler(worker.NewVoiceManageHandler(worker.VoiceManageConfig{
+		WorkspaceDir: opts.WorkspaceDir,
+		Log:          opts.HandlerLog,
+	}))
+
 	// APP_* (CRAM slice A1, aceteam#9672): the hosted-app pod-per-app runner.
 	// Same privilege posture as EXPOSE_SET (per-node stream only, fail closed).
 	// The live ops drive the container runtime seam, the shared expose funnel,

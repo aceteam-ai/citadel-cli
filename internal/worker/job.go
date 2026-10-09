@@ -168,6 +168,7 @@ const (
 	JobTypeDocumentRasterize  = "document_rasterize"   // Render selected PDF pages to images on this node so a scan can reach an OCR model (issue #675)
 	JobTypeShowPairingCode    = "SHOW_PAIRING_CODE"    // Render a node:exec pairing code on this node's console (issue #659)
 	JobTypeClearPairingCode   = "CLEAR_PAIRING_CODE"   // Clear a displayed node:exec pairing code (issue #659)
+	JobTypeVoiceManage        = "VOICE_MANAGE"         // Enroll/list/delete consented voices on the local voice-clone module (issue #1248). Per-node stream only, fail closed.
 
 	// Hosted-app pod-per-app runner (CRAM slice A1, aceteam#9672). Privileged in
 	// the EXPOSE_SET sense: honored only on the per-node stream, fail closed on
@@ -260,6 +261,7 @@ var allKnownJobTypes = []string{
 	JobTypeDocumentRasterize,
 	JobTypeShowPairingCode,
 	JobTypeClearPairingCode,
+	JobTypeVoiceManage,
 	JobTypeAppDeploy,
 	JobTypeAppStop,
 	JobTypeAppStart,
