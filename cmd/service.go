@@ -352,7 +352,7 @@ func startService(serviceName, composeFilePath string) error {
 	// modules). A no-op for every existing (non-sandboxed) service. The sibling is
 	// derived from the ORIGINAL compose path, not actualComposePath -- on non-Linux
 	// the latter may be a GPU-stripped temp file in a different directory.
-	composeUpArgs := startServiceComposeArgs(composeFilePath, actualComposePath)
+	composeUpArgs := startServiceComposeArgs(composeFilePath, actualComposePath, rt.EngineBin)
 	if forceRecreateForBindDrift {
 		// Recreate the still-running container in place so the loopback publish
 		// applies. Graceful (compose stops then recreates) and on the sanctioned
@@ -468,10 +468,28 @@ func managedContainerRunningForStart(engineBin, containerName string) bool {
 // separated from startService so the argv contract -- -p present/absent, and
 // its exact position relative to -f/up/-d -- is unit-testable without
 // invoking docker (see TestStartServiceComposeArgs*).
-func startServiceComposeArgs(composeFilePath, actualComposePath string) []string {
+//
+// engineBin is the resolved container runtime binary (docker/podman): a catalog
+// module's GPU device-reservation override (<name>.gpu.yml, aceteam-ai/
+// citadel-cli#1245) is layered as a second `-f` on docker only -- see
+// catalog.GPUDeviceOverrideFileArg for why Podman is a follow-up. A no-op for
+// every service that ships no .gpu.yml override.
+func startServiceComposeArgs(composeFilePath, actualComposePath, engineBin string) []string {
 	args := composeFileArgs(composeFilePath, actualComposePath)
+	args = append(args, gpuDeviceOverrideArgsFor(composeFilePath, engineBin)...)
 	args = append(args, "up", "-d")
 	return composeArgsWithProject(args)
+}
+
+// gpuDeviceOverrideArgsFor resolves the ["-f", <name>.gpu.yml] argument for the
+// service whose compose is at composePath, delegating the docker-vs-podman
+// decision to catalog.GPUDeviceOverrideFileArg. Mirrors sandboxOverridePathFor's
+// path derivation (dir + name without extension).
+func gpuDeviceOverrideArgsFor(composePath, engineBin string) []string {
+	dir := filepath.Dir(composePath)
+	base := filepath.Base(composePath)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	return catalog.GPUDeviceOverrideFileArg(dir, name, engineBin)
 }
 
 // composeFailureMessage formats a `docker compose up` failure, appending a

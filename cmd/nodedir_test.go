@@ -164,7 +164,7 @@ func TestComposeArgsWithProject_PrependsUnderOverride(t *testing.T) {
 
 func TestStartServiceComposeArgs_NoOverride_NoDashP(t *testing.T) {
 	setNodeDirOverrideForTest(t, "")
-	got := startServiceComposeArgs("/n/services/vllm.yml", "/n/services/vllm.yml")
+	got := startServiceComposeArgs("/n/services/vllm.yml", "/n/services/vllm.yml", "docker")
 	for _, a := range got {
 		if a == "-p" {
 			t.Fatalf("startServiceComposeArgs() = %v, must NOT contain -p when no override is active", got)
@@ -180,10 +180,39 @@ func TestStartServiceComposeArgs_Override_DashPBeforeDashF(t *testing.T) {
 	setNodeDirOverrideForTest(t, t.TempDir())
 	project := composeProjectOverride()
 
-	got := startServiceComposeArgs("/n/services/vllm.yml", "/n/services/vllm.yml")
+	got := startServiceComposeArgs("/n/services/vllm.yml", "/n/services/vllm.yml", "docker")
 	want := []string{"-p", project, "-f", "/n/services/vllm.yml", "up", "-d"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("startServiceComposeArgs() = %v, want %v", got, want)
+	}
+}
+
+// TestStartServiceComposeArgs_GPUDeviceOverrideLayeredOnDockerOnly pins the
+// aceteam-ai/citadel-cli#1245 up-site wiring: a materialized <name>.gpu.yml is
+// layered as a second `-f` on docker, but NOT on podman (follow-up), and the
+// override `-f` precedes `up` so compose merges it into the base.
+func TestStartServiceComposeArgs_GPUDeviceOverrideLayeredOnDockerOnly(t *testing.T) {
+	setNodeDirOverrideForTest(t, "")
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "voice-clone.yml")
+	if err := os.WriteFile(composePath, []byte("services: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gpuOverride := filepath.Join(dir, "voice-clone.gpu.yml")
+	if err := os.WriteFile(gpuOverride, []byte("services: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	docker := startServiceComposeArgs(composePath, composePath, "docker")
+	wantDocker := []string{"-f", composePath, "-f", gpuOverride, "up", "-d"}
+	if strings.Join(docker, " ") != strings.Join(wantDocker, " ") {
+		t.Fatalf("docker args = %v, want %v (GPU override layered before up)", docker, wantDocker)
+	}
+
+	podman := startServiceComposeArgs(composePath, composePath, "podman")
+	wantPodman := []string{"-f", composePath, "up", "-d"}
+	if strings.Join(podman, " ") != strings.Join(wantPodman, " ") {
+		t.Fatalf("podman args = %v, want %v (raw device override must NOT be layered on podman)", podman, wantPodman)
 	}
 }
 
