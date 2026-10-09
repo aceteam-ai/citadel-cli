@@ -2878,6 +2878,7 @@ func startManagedServices(ctx context.Context) []startedService {
 
 		if serviceType == internalServices.ServiceTypeNative {
 			fmt.Printf("   - Starting %s (native)...\n", service.Name)
+			warnIfOllamaPolicyIgnoredNative(service)
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
 				return startNativeService(service.Name, configDir)
 			}); err != nil {

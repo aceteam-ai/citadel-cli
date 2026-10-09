@@ -381,6 +381,14 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 
 	switch kind {
 	case "native":
+		// aceteam-ai/citadel-cli#1209: a native ollama (a host-managed systemd
+		// ollama auto-detected by resolveKind, or an explicit type: native) has no
+		// compose env to inject into, so an OLLAMA_MAX_LOADED_MODELS policy cannot
+		// take effect. Warn rather than silently no-op (the exact OOM this policy
+		// exists to prevent on a memory-tight node): pin `type: docker` to apply it.
+		if svc.Name == "ollama" && svc.OllamaMaxLoadedModels != nil {
+			ctx.Log("warn", "     - %s: ollama_max_loaded_models is set but the service resolved to native (no compose to inject into); pin `type: docker` in citadel.yaml to apply OLLAMA_MAX_LOADED_MODELS", svc.Name)
+		}
 		// Native ollama has no compose env to inject, but its model contract is
 		// pull-based: SERVICE_START {service: ollama, model: X} must ensure X is
 		// pulled (idempotent, fast when cached) so the deploy contract holds even

@@ -9,8 +9,24 @@
 package cmd
 
 import (
+	"fmt"
+
 	svcports "github.com/aceteam-ai/citadel-cli/services"
 )
+
+// warnIfOllamaPolicyIgnoredNative prints a warning when an ollama service carries
+// an #1209 ollama_max_loaded_models policy but resolved to the NATIVE engine (a
+// host-managed ollama, or an explicit type: native) -- there is no compose to
+// inject OLLAMA_MAX_LOADED_MODELS into, so the policy is a silent no-op otherwise.
+// Both boot-time start paths (runAllServices, startManagedServices) call this
+// before startNativeService so an operator sees why their residency cap did not
+// take effect (pin `type: docker` to apply it), rather than silent unlimited
+// residency on a memory-tight node.
+func warnIfOllamaPolicyIgnoredNative(service Service) {
+	if service.Name == "ollama" && service.OllamaMaxLoadedModels != nil {
+		fmt.Printf("   ⚠️  ollama_max_loaded_models is set but %s resolved to native (no compose to inject into); pin `type: docker` in citadel.yaml to apply OLLAMA_MAX_LOADED_MODELS\n", service.Name)
+	}
+}
 
 // ollamaMaxLoadedModelsEntriesStrict returns the OLLAMA_MAX_LOADED_MODELS=<n>
 // env entry (0 or 1) to inject at `docker compose up` for serviceName given its

@@ -105,6 +105,7 @@ func runAllServices() {
 
 		if serviceType == internalServices.ServiceTypeNative {
 			fmt.Printf("🚀 Starting service: %s (native)\n", service.Name)
+			warnIfOllamaPolicyIgnoredNative(service)
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
 				return startNativeService(service.Name, configDir)
 			}); err != nil {
