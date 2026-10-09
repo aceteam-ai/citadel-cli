@@ -144,8 +144,9 @@ type IndexResult struct {
 // Index (re)indexes the files under path (a directory or single file),
 // incrementally: unchanged files are skipped by content hash and files deleted
 // on disk are pruned. filePattern optionally restricts filenames (e.g. "*.md").
-// It requires the local TEI embedding service to be reachable; a clear error is
-// returned when it is not.
+// Per-file embedding failures against a ready local TEI service are counted in
+// FilesFailed while the walk continues. Operation-wide readiness failure,
+// cancellation, root-walk failures, and index-storage failures remain fatal.
 func (s *Service) Index(ctx context.Context, path, filePattern string) (IndexResult, error) {
 	if path == "" {
 		return IndexResult{}, fmt.Errorf("index path is required")

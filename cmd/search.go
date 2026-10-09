@@ -199,7 +199,7 @@ func runSearchIndex(cmd *cobra.Command, args []string) error {
 		targets = []string{args[0]}
 	}
 
-	var totalIndexed, totalSkipped, totalRemoved, totalChunks int
+	var totalIndexed, totalSkipped, totalFailed, totalRemoved, totalChunks int
 	for _, t := range targets {
 		fmt.Printf("Indexing %s via %s ...\n", t, svc.Model())
 		res, err := svc.Index(cmd.Context(), t, "")
@@ -208,11 +208,16 @@ func runSearchIndex(cmd *cobra.Command, args []string) error {
 		}
 		totalIndexed += res.FilesIndexed
 		totalSkipped += res.FilesSkipped
+		totalFailed += res.FilesFailed
 		totalRemoved += res.FilesRemoved
 		totalChunks += res.ChunksEmbedded
 	}
-	fmt.Printf("%s indexed %d file(s), skipped %d, pruned %d (%d chunks embedded)\n",
-		color.GreenString("OK"), totalIndexed, totalSkipped, totalRemoved, totalChunks)
+	status := color.GreenString("OK")
+	if totalFailed > 0 {
+		status = color.YellowString("PARTIAL")
+	}
+	fmt.Printf("%s indexed %d file(s), skipped %d, failed %d, pruned %d (%d chunks embedded)\n",
+		status, totalIndexed, totalSkipped, totalFailed, totalRemoved, totalChunks)
 	return nil
 }
 

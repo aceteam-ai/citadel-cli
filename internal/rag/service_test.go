@@ -119,6 +119,44 @@ func TestServiceIncrementalReindexSkipsUnchanged(t *testing.T) {
 	}
 }
 
+func TestServiceIndexReportsPerFileEmbeddingFailures(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"max_client_batch_size":32}`))
+	})
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if len(req.Input) > 0 && strings.Contains(req.Input[0], "bad embedding") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		data := make([]map[string]any, len(req.Input))
+		for i := range data {
+			data[i] = map[string]any{"index": i, "embedding": []float64{1, 0}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "model": "gte-multilingual-base"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("CITADEL_TEI_URL", srv.URL)
+	t.Setenv("CITADEL_INDEX_DB", filepath.Join(t.TempDir(), "index.db"))
+
+	ws := t.TempDir()
+	writeFile(t, ws, "00-bad.md", "bad embedding")
+	writeFile(t, ws, "01-good.md", "good embedding")
+	res, err := New(ws, "").Index(context.Background(), ws, "")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if res.FilesIndexed != 1 || res.FilesFailed != 1 {
+		t.Fatalf("typed index result = %+v, want indexed=1 failed=1", res)
+	}
+}
+
 func TestServiceStatus(t *testing.T) {
 	svc, ws := newTestService(t)
 
