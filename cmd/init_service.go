@@ -136,7 +136,7 @@ func maybeFinishLinuxNodeSetup(choice nexus.NetworkChoice, nodeName string) {
 	if finishProvisionedLinuxUserWorker() {
 		return
 	}
-	applyLinuxWorkerSetup(decideLinuxWorkerSetup(platform.IsRoot(), service.InstalledManagedUnit))
+	applyLinuxWorkerSetup(decideLinuxWorkerSetup(platform.IsRoot(), service.InstalledManagedUnit, service.RootRemediationCommand("service install --system")))
 }
 
 // linuxWorkerAction enumerates how `citadel init` finishes worker setup on
@@ -165,7 +165,7 @@ type linuxWorkerDecision struct {
 // citadel-managed unit (if any) is already installed on disk. Kept pure +
 // injectable (installedUnit) so the branch selection is unit-testable without
 // touching systemctl or the filesystem, mirroring competingManagedUnit.
-func decideLinuxWorkerSetup(isRoot bool, installedUnit func() (service.ManagedUnit, bool)) linuxWorkerDecision {
+func decideLinuxWorkerSetup(isRoot bool, installedUnit func() (service.ManagedUnit, bool), installRemediation string) linuxWorkerDecision {
 	unit, found := installedUnit()
 	if isRoot {
 		if found {
@@ -187,7 +187,7 @@ func decideLinuxWorkerSetup(isRoot bool, installedUnit func() (service.ManagedUn
 	}
 	return linuxWorkerDecision{
 		action:      linuxWorkerPrintCommand,
-		nextCommand: "sudo citadel service install --system",
+		nextCommand: installRemediation,
 	}
 }
 
@@ -220,7 +220,7 @@ func installLinuxWorkerService() {
 	cfg, err := service.DefaultConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "⚠️  Could not resolve worker service config: %v\n", err)
-		fmt.Fprintln(os.Stderr, "   Install it later with: sudo citadel service install --system")
+		fmt.Fprintf(os.Stderr, "   Install it later with: %s\n", service.RootRemediationCommand("service install --system"))
 		return
 	}
 	cfg.Args = []string{"work"}

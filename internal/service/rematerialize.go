@@ -315,7 +315,7 @@ func rematerializeManagedUnits(cands []managedUnitCandidate, euid int, run func(
 			// Skip (with an actionable, secure_path-proof hint) rather than error
 			// when we lack privileges, e.g. an unprivileged `citadel update install`
 			// on a system-unit node (citadel-cli#1266).
-			log("unit-refresh: %s: needs the #444 restart-storm hardening but rewriting a system unit requires root; re-run as root: %s", cand.path, rootRemediationCommand(selfExe()))
+			log("unit-refresh: %s: needs the #444 restart-storm hardening but rewriting a system unit requires root; re-run as root: %s", cand.path, rootRemediationCommand(selfExe(), "service refresh-unit"))
 			continue
 		}
 
