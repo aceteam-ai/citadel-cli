@@ -569,6 +569,15 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		if ramOverridePath != "" {
 			composeArgs = append(composeArgs, "-f", ramOverridePath)
 		}
+		// Catalog GPU device-reservation override (<name>.gpu.yml,
+		// aceteam-ai/citadel-cli#1245) for a module whose compose ships the NVIDIA
+		// reservation separately (e.g. voice-clone). Docker only — see
+		// catalog.GPUDeviceOverrideFileArg for why Podman is a follow-up. A no-op
+		// for every service that ships no .gpu.yml.
+		composeArgs = append(composeArgs, catalog.GPUDeviceOverrideFileArg(
+			filepath.Dir(composePath),
+			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath))),
+			rt.EngineBin)...)
 		// Pass the sibling config env (<name>.env) explicitly: docker compose
 		// only auto-loads a file literally named ".env", so without --env-file
 		// the persisted model selection (#530) and any catalog install-time

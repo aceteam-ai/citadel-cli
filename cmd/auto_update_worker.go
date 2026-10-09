@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/update"
@@ -24,22 +23,12 @@ func workAutoUpdatePolicyInputs() autoUpdatePolicyInputs {
 
 // resolveAutoUpdateEnabled is evaluated on every tick so persisted changes take
 // effect without restarting the worker. Dev builds and explicit opt-out veto
-// every enable signal, including the work-only flag.
+// every enable signal, including the work-only flag. It delegates to
+// resolveAutoUpdatePolicy so the effective decision reported on the heartbeat
+// (citadel-cli#1134) can never drift from the decision the loop actually makes.
 func resolveAutoUpdateEnabled(inputs autoUpdatePolicyInputs) bool {
-	if !autoUpdateAllowed() {
-		return false
-	}
-	if inputs.force {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_AUTO_UPDATE"))) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	}
-	state, err := update.LoadState()
-	return err == nil && state != nil && state.AutoUpdate
+	enabled, _ := resolveAutoUpdatePolicy(inputs)
+	return enabled
 }
 
 // resolveAutoUpdateInterval uses a work-only flag before the shared env value.
@@ -69,6 +58,10 @@ type autoUpdateRuntime struct {
 	restart     func() error
 	afterTick   func()
 	afterCancel func()
+	// refresh, when set, is wired to AutoUpdaterConfig.Refresh so the running
+	// updater rebuilds the cmd-owned heartbeat auto_update snapshot on start,
+	// each tick, and after each result (citadel-cli#1134). Nil in tests.
+	refresh func()
 }
 
 // startWorkerAutoUpdater may be called only after a worker is fully initialized.
@@ -97,6 +90,7 @@ func startWorkerAutoUpdater(ctx context.Context, ownsWorker bool, inputs autoUpd
 		BeginDrain: runner.BeginDrain,
 		Apply:      runtime.apply,
 		Restart:    runtime.restart,
+		Refresh:    runtime.refresh,
 		Log:        logf,
 	})
 	done := make(chan struct{})

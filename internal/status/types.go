@@ -390,6 +390,49 @@ type ReconcileHealth struct {
 	Count int `json:"count,omitempty"`
 }
 
+// AutoUpdateReport is the heartbeat-facing view of the node's effective
+// auto-update policy and most recent update attempt outcome (citadel-cli#1134).
+// It rides the heartbeat ENVELOPE (heartbeat.StatusMessage.AutoUpdate), not
+// NodeStatus, supplied from a cheap cached snapshot of the running worker via
+// the publisher's SetAutoUpdateProvider — the same envelope-provider pattern as
+// Stats/SetStatsProvider, so no release lookup or disk op happens on the
+// serialization path. internal/status cannot import internal/update (it would
+// not be a cycle today, but the hand-mirror convention keeps the heartbeat
+// schema owned here beside its siblings), so this is a hand-maintained mirror
+// of update.ReportSnapshot; the projection is autoUpdateReportFrom in
+// cmd/work.go and TestAutoUpdateShapeParity keeps the two shapes honest.
+//
+// Semantics a consumer must respect:
+//   - ConfiguredEnabled/EffectiveEnabled are boolean|null; null means UNKNOWN
+//     (state unreadable/corrupt), which is DISTINCT from a confident disabled.
+//   - PolicySource names what decided EffectiveEnabled: persisted|env|flag|dev|
+//     opt-out|unknown.
+//   - Mode is periodic (a loop is running) or unavailable (no periodic updater
+//     in this process).
+//   - LatestVersion is the last release THIS node observed, not the platform's
+//     current release lookup.
+//   - LastResult is one of update's bounded result codes (never_checked/
+//     up_to_date/check_failed/download_failed/drain_deferred/apply_failed/
+//     restart_pending/restart_failed/manual_update_required/unknown) — never a
+//     raw URL, path, log line, or secret.
+//   - The outer heartbeat timestamp remains the observation-freshness signal;
+//     LastCheckAt/LastResultAt are RFC3339 UTC, matching that encoding.
+type AutoUpdateReport struct {
+	SchemaVersion     int        `json:"schema_version"`
+	ConfiguredEnabled *bool      `json:"configured_enabled"`
+	EffectiveEnabled  *bool      `json:"effective_enabled"`
+	PolicySource      string     `json:"policy_source"`
+	Mode              string     `json:"mode"`
+	IntervalSeconds   int        `json:"interval_seconds"`
+	RunningVersion    string     `json:"running_version"`
+	PendingVersion    string     `json:"pending_version,omitempty"`
+	RestartRequired   bool       `json:"restart_required"`
+	LastCheckAt       *time.Time `json:"last_check_at,omitempty"`
+	LatestVersion     string     `json:"latest_version,omitempty"`
+	LastResultAt      *time.Time `json:"last_result_at,omitempty"`
+	LastResult        string     `json:"last_result"`
+}
+
 // AppInfo contains information about an installed catalog app.
 type AppInfo struct {
 	Name   string `json:"name"`

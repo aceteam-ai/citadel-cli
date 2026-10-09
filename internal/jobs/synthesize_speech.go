@@ -39,6 +39,15 @@ func omnivoiceServiceURL() string {
 	return fmt.Sprintf("http://localhost:%d", embeddedservices.OmniVoiceHostPort)
 }
 
+// voiceCloneServiceURL is the local voice-clone TTS module base URL
+// (aceteam-ai/citadel-services#28/#29, Chatterbox default + opt-in OmniVoice
+// voice cloning/design). Same loopback reasoning as the other TTS backends: the
+// module has no auth of its own and its sole consumer is this co-located worker,
+// so its compose publishes 127.0.0.1 ONLY on CITADEL_VOICE_CLONE_HOST_PORT.
+func voiceCloneServiceURL() string {
+	return fmt.Sprintf("http://localhost:%d", embeddedservices.VoiceCloneHostPort)
+}
+
 const (
 	// defaultSynthesizeBackend is the TTS backend used when a job payload omits
 	// `backend`. Kept as kokoro so every existing dispatch (which has never sent
@@ -151,6 +160,21 @@ func validateCaptionedSpeechWords(wireWords []captionedSpeechWireWord) ([]captio
 var synthesizeBackendDefaults = map[string]ttsBackendDefaults{
 	"kokoro":    {voice: defaultSynthesizeVoice, format: defaultSynthesizeFormat},
 	"omnivoice": {voice: "auto", format: "wav"},
+	// voice-clone (aceteam-ai/citadel-services#29): `voice` is an enrolled
+	// voice_id or "auto" (Chatterbox/OmniVoice design), so am_michael is not a
+	// valid default; the module's own VOICE_CLONE_DEFAULT_FORMAT is mp3.
+	"voice-clone": {voice: "auto", format: "mp3"},
+}
+
+// wordTimestampsCapableBackends names the TTS backends that return per-word
+// timings, and distinguishes HOW: kokoro exposes them via a separate
+// /v1/audio/speech/captioned endpoint (the flag is implied by the path);
+// voice-clone takes a `word_timestamps` body flag on the base /v1/audio/speech
+// (aceteam-ai/citadel-services#29). omnivoice has no forced-alignment path, so a
+// word_timestamps request for it is refused before any HTTP call.
+var wordTimestampsCapableBackends = map[string]bool{
+	"kokoro":      true,
+	"voice-clone": true,
 }
 
 // backendDefaultsFor returns the omitted-field defaults for backend, falling
@@ -194,8 +218,9 @@ type SynthesizeSpeechHandler struct {
 // sidecars, keyed by backend name (citadel-cli#1007).
 func NewSynthesizeSpeechHandler() *SynthesizeSpeechHandler {
 	return &SynthesizeSpeechHandler{BaseURLs: map[string]string{
-		"kokoro":    synthesizeServiceURL(),
-		"omnivoice": omnivoiceServiceURL(),
+		"kokoro":      synthesizeServiceURL(),
+		"omnivoice":   omnivoiceServiceURL(),
+		"voice-clone": voiceCloneServiceURL(),
 	}}
 }
 
@@ -240,24 +265,31 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 // Payload fields (all strings via nexus.Job):
 //   - text / input:       the text to synthesize (required; `text` preferred,
 //     `input` accepted as an alias for the OpenAI request-body spelling).
-//   - backend:            optional TTS backend selector ("kokoro" | "omnivoice");
-//     empty defaults to kokoro, so every pre-#1007 dispatch is unaffected
-//     (citadel-cli#1007). An unrecognized value fails the job without
-//     attempting any HTTP call.
+//   - backend:            optional TTS backend selector ("kokoro" | "omnivoice" |
+//     "voice-clone"); empty defaults to kokoro, so every pre-#1007 dispatch is
+//     unaffected (citadel-cli#1007). An unrecognized value fails the job without
+//     attempting any HTTP call. The backend selects which loopback sidecar to
+//     dial; "voice-clone" is the citadel-services voice-cloning module on 8215.
 //   - voice:              optional voice; empty defaults PER BACKEND —
-//     am_michael for kokoro, "auto" for omnivoice (am_michael is not an
-//     omnivoice preset, so it would 400). See synthesizeBackendDefaults.
+//     am_michael for kokoro, "auto" for omnivoice/voice-clone (am_michael is not
+//     one of their presets). See synthesizeBackendDefaults.
 //   - response_format:    optional output container; empty defaults PER
-//     BACKEND — opus for kokoro, wav for omnivoice (the OmniVoice adapter is
-//     wav-only, so opus would 400). `format` accepted as an alias.
+//     BACKEND — opus for kokoro, wav for omnivoice, mp3 for voice-clone.
+//     `format` accepted as an alias.
 //   - speed:              optional playback speed (0.5-2.0); omitted from the
-//     forwarded request entirely when absent, so a server relying on its own
-//     default sees no change (citadel-cli#603's omit-if-empty rule).
-//   - instructions:       optional free-text voice design, forwarded verbatim;
-//     omitted entirely when absent. kokoro ignores it; omnivoice honors it.
-//   - word_timestamps:    optional boolean; true calls Kokoro's captioned
-//     endpoint and adds word start/end seconds to the envelope. Absent/false
-//     preserves the raw-audio route and envelope.
+//     forwarded request entirely when absent (citadel-cli#603's omit-if-empty rule).
+//   - instructions:       optional free-text voice design. kokoro ignores it;
+//     omnivoice honors it (forwarded as `instructions`). For the voice-clone
+//     backend it is TRANSLATED to the module's `instruct` field (aceteam#10823);
+//     an explicit `instruct` payload wins. Omitted entirely when absent.
+//   - engine / language:  voice-clone ONLY (aceteam-ai/citadel-services#29),
+//     omit-if-empty. engine (chatterbox|omnivoice) picks the cloning engine
+//     WITHIN the voice-clone module — it is not the citadel `backend` selector.
+//   - word_timestamps:    optional boolean, supported by kokoro and voice-clone
+//     (see wordTimestampsCapableBackends). kokoro uses a separate
+//     /v1/audio/speech/captioned endpoint; voice-clone sends a `word_timestamps`
+//     body flag on the base /v1/audio/speech. Either way word start/end seconds
+//     are added to the envelope; absent/false preserves the raw-audio route.
 //
 // Response JSON (this handler DEFINES the envelope; nothing on the aceteam side
 // parses it yet; the fabric may also call the endpoint directly):
@@ -275,7 +307,16 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 //	    "duration_seconds": 3.575,
 //	    "model_version":    "kokoro-0.9.4+hexgrad/Kokoro-82M",
 //	    "cache_key":        "<sha256>",
-//	    "cache_hit":        false
+//	    "cache_hit":        false,
+//	    // voice-clone ONLY (aceteam#10823), present when the module sets them;
+//	    // model_license/engine/voice_id come from X-TTS-* headers, the rest from
+//	    // the X-TTS-Receipt JSON (see voiceCloneReceiptFields):
+//	    "model_license":  "CC-BY-NC",
+//	    "engine":         "omnivoice",
+//	    "voice_id":       "jane-doe",
+//	    "commercial_use": false,
+//	    "watermark":      true,
+//	    "consent":        {"speaker_name": "...", "attested_by": "...", ...}
 //	  },
 //	  "words": [{"word":"hello","start":0.1,"end":0.5}] // opt-in only
 //	}
@@ -323,8 +364,8 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 		}
 		wordTimestamps = enabled
 	}
-	if wordTimestamps && backend != defaultSynthesizeBackend {
-		return nil, fmt.Errorf("word timestamps are only supported by the kokoro backend")
+	if wordTimestamps && !wordTimestampsCapableBackends[backend] {
+		return nil, fmt.Errorf("word timestamps are not supported by the %q backend", backend)
 	}
 
 	ctx.Log("info", "     - [Job %s] Waiting for TTS service (%s) to become ready...", job.ID, backend)
@@ -347,8 +388,50 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 			requestPayload["speed"] = speed
 		}
 	}
-	if instructions := job.Payload["instructions"]; instructions != "" {
+	// Voice-design/instruct field, PER BACKEND (the platform design pass,
+	// aceteam#10823): the platform sends its standard `instructions` field, but the
+	// voice-clone module's field is `instruct`, so for that backend we translate
+	// `instructions` -> `instruct` (an explicit `instruct` payload wins) and do NOT
+	// also send `instructions` (the module has no such field). kokoro ignores it;
+	// omnivoice (the CIS sidecar, citadel-cli#1007) honors `instructions` natively,
+	// so those backends keep the original passthrough unchanged (byte-identical).
+	if backend == "voice-clone" {
+		// engine (chatterbox|omnivoice) and language are voice-clone request fields;
+		// forwarded only for this backend, omit-if-empty. engine selects the cloning
+		// engine WITHIN the voice-clone module on 127.0.0.1:8215 -- it is NOT the
+		// citadel `backend` selector, so engine:"omnivoice" here never routes to the
+		// standalone omnivoice sidecar on 8214 (aceteam#10823 item 5).
+		if engine := job.Payload["engine"]; engine != "" {
+			requestPayload["engine"] = engine
+		}
+		if language := job.Payload["language"]; language != "" {
+			requestPayload["language"] = language
+		}
+		instruct := job.Payload["instruct"]
+		if instruct == "" {
+			instruct = job.Payload["instructions"]
+		}
+		if instruct != "" {
+			requestPayload["instruct"] = instruct
+		}
+	} else if instructions := job.Payload["instructions"]; instructions != "" {
 		requestPayload["instructions"] = instructions
+	}
+
+	// Word-timestamps routing differs per backend (both pinned by tests):
+	//   kokoro      -> a SEPARATE /v1/audio/speech/captioned endpoint; the flag is
+	//                  implied by the path, never sent in the body.
+	//   voice-clone -> the base /v1/audio/speech with a `word_timestamps` body flag
+	//                  (aceteam-ai/citadel-services#29). Its response is the SAME
+	//                  {audio_base64, words} JSON kokoro's captioned endpoint returns
+	//                  (plus mime/receipt fields the decoder below ignores).
+	endpoint := "/v1/audio/speech"
+	if wordTimestamps {
+		if backend == defaultSynthesizeBackend {
+			endpoint = "/v1/audio/speech/captioned"
+		} else {
+			requestPayload["word_timestamps"] = true
+		}
 	}
 
 	reqBody, err := json.Marshal(requestPayload)
@@ -359,10 +442,6 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 	reqCtx, cancel := context.WithTimeout(context.Background(), synthesizeRequestTimeout)
 	defer cancel()
 
-	endpoint := "/v1/audio/speech"
-	if wordTimestamps {
-		endpoint = "/v1/audio/speech/captioned"
-	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, serviceURL+endpoint, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to build synthesis request: %w", err)
@@ -380,11 +459,17 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 		return nil, fmt.Errorf("failed to read TTS response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		// On error the body is a JSON error, not audio; surface it verbatim.
-		if wordTimestamps && resp.StatusCode == http.StatusNotFound {
+		// kokoro's captioned endpoint is a separate path; an old kokoro image
+		// lacking it 404s. voice-clone takes the flag on the base path and never
+		// 404s for this reason, so the upgrade hint stays kokoro-only.
+		if wordTimestamps && backend == defaultSynthesizeBackend && resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("Kokoro service does not support word timestamps; update its image")
 		}
-		return responseBody, fmt.Errorf("TTS API returned non-200 status: %s", resp.Status)
+		// Surface the service's OWN error body (e.g. voice-clone's 403 refusal when
+		// OmniVoice is requested with OMNIVOICE_ACCEPT_NONCOMMERCIAL_LICENSE unset)
+		// so an operator sees the module's reason, not just a bare status. Bounded
+		// so a large body cannot bloat the error.
+		return responseBody, fmt.Errorf("TTS API returned non-200 status: %s%s", resp.Status, detailSuffix(responseBody))
 	}
 	audio := responseBody
 	var words []captionedSpeechWord
@@ -394,15 +479,15 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 			Words       []captionedSpeechWireWord `json:"words"`
 		}
 		if err := json.Unmarshal(responseBody, &captioned); err != nil || captioned.AudioBase64 == "" {
-			return nil, fmt.Errorf("Kokoro service returned an invalid captioned speech response")
+			return nil, fmt.Errorf("TTS service returned an invalid captioned speech response")
 		}
 		words, err = validateCaptionedSpeechWords(captioned.Words)
 		if err != nil {
-			return nil, fmt.Errorf("Kokoro service returned an invalid captioned speech response: %w", err)
+			return nil, fmt.Errorf("TTS service returned an invalid captioned speech response: %w", err)
 		}
 		audio, err = base64.StdEncoding.DecodeString(captioned.AudioBase64)
 		if err != nil || len(audio) == 0 {
-			return nil, fmt.Errorf("Kokoro service returned invalid captioned audio")
+			return nil, fmt.Errorf("TTS service returned invalid captioned audio")
 		}
 	}
 
@@ -483,7 +568,95 @@ func synthesizeReceiptFromHeaders(headers http.Header) map[string]any {
 	}
 	// X-TTS-Cache-Hit is "0" or "1".
 	receipt["cache_hit"] = headers.Get("X-TTS-Cache-Hit") == "1"
+	// Voice-clone additions (aceteam-ai/citadel-services#29 + the platform design
+	// pass, aceteam#10823), present ONLY when the serving engine sets them —
+	// kokoro/omnivoice set none, so their receipt is byte-identical to before.
+	// model_license/engine/voice_id have dedicated X-TTS-* headers; commercial_use,
+	// watermark and the consent echo live only in the full X-TTS-Receipt JSON.
+	// These let a downstream consumer label CC-BY-NC OmniVoice output, know whether
+	// output is watermarked/commercially usable, and carry the enrolled speaker's
+	// consent attestation with every clone.
+	if license := headers.Get("X-TTS-Model-License"); license != "" {
+		receipt["model_license"] = license
+	}
+	if engine := headers.Get("X-TTS-Engine"); engine != "" {
+		receipt["engine"] = engine
+	}
+	if voiceID := headers.Get("X-TTS-Voice-Id"); voiceID != "" {
+		receipt["voice_id"] = voiceID
+	}
+	if vc := voiceCloneReceiptFields(headers.Get("X-TTS-Receipt")); vc != nil {
+		if vc.CommercialUse != nil {
+			receipt["commercial_use"] = *vc.CommercialUse
+		}
+		if vc.Watermark != nil {
+			receipt["watermark"] = *vc.Watermark
+		}
+		if vc.Consent != nil {
+			receipt["consent"] = vc.Consent
+		}
+		// Fall back to the receipt JSON's own copies when a dedicated header was
+		// absent, so the two can never silently disagree.
+		if _, ok := receipt["model_license"]; !ok && vc.ModelLicense != "" {
+			receipt["model_license"] = vc.ModelLicense
+		}
+		if _, ok := receipt["engine"]; !ok && vc.Engine != "" {
+			receipt["engine"] = vc.Engine
+		}
+		if _, ok := receipt["voice_id"]; !ok && vc.VoiceID != "" {
+			receipt["voice_id"] = vc.VoiceID
+		}
+	}
 	return receipt
+}
+
+// voiceCloneReceipt is the subset of the voice-clone module's receipt this
+// handler surfaces (aceteam#10823). Bool fields are pointers so an ABSENT field
+// (kokoro/omnivoice, or an older module) is distinguishable from a real false.
+type voiceCloneReceipt struct {
+	ModelLicense  string         `json:"model_license"`
+	Engine        string         `json:"engine"`
+	VoiceID       string         `json:"voice_id"`
+	CommercialUse *bool          `json:"commercial_use"`
+	Watermark     *bool          `json:"watermark"`
+	Consent       map[string]any `json:"consent"`
+}
+
+// voiceCloneReceiptFields decodes the voice-clone module's X-TTS-Receipt header
+// (the full receipt as padded urlsafe-base64 JSON — Python urlsafe_b64encode, so
+// base64.URLEncoding, not RawURLEncoding) and returns the fields above, or nil
+// when the header is absent or malformed. Best-effort like every other receipt
+// field: a parse failure never fails the job, and kokoro/omnivoice do not set
+// this header at all.
+func voiceCloneReceiptFields(encoded string) *voiceCloneReceipt {
+	if encoded == "" {
+		return nil
+	}
+	decoded, err := base64.URLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil
+	}
+	var r voiceCloneReceipt
+	if err := json.Unmarshal(decoded, &r); err != nil {
+		return nil
+	}
+	return &r
+}
+
+// detailSuffix returns a bounded ": <trimmed body>" suffix for a non-200 TTS
+// error, or "" when the body is empty. This surfaces the service's own message
+// (e.g. voice-clone's 403 OmniVoice license refusal) in the job error without
+// letting a large body bloat it.
+func detailSuffix(body []byte) string {
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		return ""
+	}
+	const maxDetail = 512
+	if len(msg) > maxDetail {
+		msg = msg[:maxDetail]
+	}
+	return ": " + msg
 }
 
 // waitForReady polls the TTS sidecar's /health until it reports ready, with the

@@ -3747,6 +3747,40 @@ reclaimed by anything in this fix — cobrowse's `cobrowse_orphan.go` reaper
 only sweeps the fixed cobrowse `:9222`, not the meeting bot's random CDP port
 or `citadel_meeting_*` sink naming. Tracked separately under citadel#488.
 
+### Heartbeat auto-update telemetry (citadel-cli#1134)
+
+The heartbeat ENVELOPE carries an optional `auto_update` block (effective policy
++ last attempt outcome) so the platform sees per-node update health without
+shell access. It rides `heartbeat.StatusMessage.AutoUpdate` via
+`SetAutoUpdateProvider` on BOTH publishers — the same envelope-provider pattern
+as `Stats`/`SetStatsProvider`, NOT a `NodeStatus`/collector field — so the
+serialization path does a pure atomic cache read (no release lookup, no disk).
+Owners: `update.ReportCache` (the atomic snapshot the provider reads, created
+before any publisher starts — the #717 race lesson), `cmd.buildAutoUpdateSnapshot`
+(policy + persisted-outcome assembly, off the heartbeat path), `cmd.resolveAutoUpdatePolicy`
+(effective bool + source; `resolveAutoUpdateEnabled` delegates to it so they
+can't drift), `autoUpdateReportFrom` (the hand projection, pinned by
+`TestAutoUpdateShapeParity`), and `update.{RecordCheckResult,RecordStagedUpdate,
+ReconcilePendingOnStartup,ReadStateForReport}` (the atomic, preference-preserving
+state writes under `update.stateMu`). The periodic updater refreshes the cache
+via `AutoUpdaterConfig.Refresh` (threaded through `autoUpdateRuntime.refresh`);
+`buildAutoUpdateSnapshot` reuses agentNodeInfo's #923 `CurrentVersion!=running`
+rule for pending_version/restart_required. pending clears only when the running
+binary matches the staged version (`ReconcilePendingOnStartup`). Corrupt state
+degrades to `configured_enabled=null`/`last_result=unknown`, never a confident
+disabled.
+
+**Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
+The update state file resolves from HOME (`getUserHomeDir`), and the shipped
+`citadel.service` is a systemd USER unit (HOME=/home/jason), so that file is the
+LIVE node's updater state — not a throwaway. `runOnce` now records a result on
+every terminal path (not just apply-success as before), so a `go test
+./internal/update/` with no HOME sandbox writes bogus telemetry (e.g.
+`current_version: v9.9.9`) into the operator's real state.json, which then shows
+as a false `restart_required` on the heartbeat. `internal/update/main_test.go`'s
+`TestMain` redirects HOME/LOCALAPPDATA/APPDATA/USERPROFILE for the whole package
+run; keep it, and keep per-test `t.Setenv("HOME", t.TempDir())` for isolation.
+
 ### Manual `citadel update install` vs the two automatic update paths (citadel #454)
 
 Three code paths swap the citadel binary; only two of them restart the process

@@ -110,6 +110,13 @@ const (
 	// kokoro/unlimited-ocr it is an EMBEDDED ServiceMap compose (services/compose/
 	// omnivoice.yml), so its compose defers the host publish to this var.
 	EnvOmniVoiceHostPort = "CITADEL_OMNIVOICE_HOST_PORT"
+	// EnvVoiceCloneHostPort carries the host port for the voice-clone TTS service
+	// (Chatterbox default + opt-in OmniVoice voice cloning/design,
+	// aceteam-ai/citadel-services#28/#29). Unlike kokoro/omnivoice its compose
+	// lives in citadel-services as a catalog MODULE (not the embedded ServiceMap),
+	// like gotenberg/hermes, so this env var supplies the host publish
+	// `${CITADEL_VOICE_CLONE_HOST_PORT}` the module's compose defers to.
+	EnvVoiceCloneHostPort = "CITADEL_VOICE_CLONE_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -216,15 +223,16 @@ const (
 	// kokoro, the service has no auth of its own and its sole consumer is the
 	// co-located citadel worker).
 	OmniVoiceHostPort = 8214
-	// voice-clone: a consented voice-enrollment + voice-cloned TTS module
-	// (aceteam-ai/citadel-services#28). Next free slot in the 8200 block after
-	// omnivoice's 8214. Its compose lives in aceteam-ai/citadel-services (like
-	// claudecode/meeting/gotenberg), served loopback-only; this registry is the
-	// only thing stopping a future module from hardcoding over 8215. NOTE:
-	// overlaps aceteam-ai/citadel-cli#1245 (voice-clone SYNTHESIZE_SPEECH
-	// backend), which also adds this constant; reconcile at merge (merge #1245
-	// first). Deliberately NOT added to ServiceHostPorts/serviceHostPortEnv here
-	// — that full registration is #1245's, so this stays a minimal definition.
+	// voice-clone: the voice-cloning TTS module (Resemble AI Chatterbox, MIT, the
+	// default; opt-in k2-fsa OmniVoice CC-BY-NC voice design) --
+	// aceteam-ai/citadel-services#28/#29. Next free slot in the 8200 block after
+	// omnivoice's 8214 (8205 is hermes's, see above). UNLIKE kokoro/omnivoice its
+	// compose lives in citadel-services as a catalog module (like
+	// gotenberg/hermes/nvr), NOT the embedded ServiceMap -- so this registry, and
+	// TestVoiceCloneHostPortRegistered, are the only thing stopping a future module
+	// from hardcoding over 8215. The container serves :8080 -> this HOST publish,
+	// bound to 127.0.0.1 only: enrolled voices are biometric data, the service has
+	// no auth of its own, and its sole consumer is the co-located citadel worker.
 	VoiceCloneHostPort = 8215
 )
 
@@ -348,6 +356,7 @@ var ServiceHostPorts = map[string]int{
 	"nvr":           FrigateHostPort,
 	"unlimited-ocr": UnlimitedOCRHostPort,
 	"omnivoice":     OmniVoiceHostPort,
+	"voice-clone":   VoiceCloneHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -367,6 +376,7 @@ var serviceHostPortEnv = map[string]string{
 	"nvr":           EnvFrigateHostPort,
 	"unlimited-ocr": EnvUnlimitedOCRHostPort,
 	"omnivoice":     EnvOmniVoiceHostPort,
+	"voice-clone":   EnvVoiceCloneHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,

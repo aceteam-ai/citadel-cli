@@ -113,6 +113,16 @@ type AutoUpdaterConfig struct {
 	// Log reports progress and errors. Required for visibility; if nil a no-op
 	// logger is used.
 	Log func(format string, args ...any)
+
+	// Refresh, if set, is invoked whenever the heartbeat auto_update snapshot
+	// may have changed: once at Run start (so periodic mode is reported promptly
+	// rather than after the first tick), at the top of every tick (to reflect a
+	// policy toggle flipped on the running agent), and after every recorded
+	// result. It must be cheap and must not block (the cmd layer rebuilds its
+	// cached ReportSnapshot from state — no network, no release lookup). A nil
+	// Refresh disables heartbeat reporting from this updater (tests leave it nil
+	// and assert on state.json directly).
+	Refresh func()
 }
 
 // AutoUpdater periodically checks for and applies updates.
@@ -120,15 +130,25 @@ type AutoUpdater struct {
 	cfg AutoUpdaterConfig
 }
 
+// ClampInterval applies the updater's interval rules — zero/negative uses
+// DefaultAutoUpdateInterval, anything below MinAutoUpdateInterval is raised to
+// the floor — so a caller (e.g. the heartbeat report builder, citadel-cli#1134)
+// can report the interval the loop will actually use without duplicating the
+// rule.
+func ClampInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return DefaultAutoUpdateInterval
+	}
+	if d < MinAutoUpdateInterval {
+		return MinAutoUpdateInterval
+	}
+	return d
+}
+
 // NewAutoUpdater constructs an AutoUpdater, applying defaults and clamping the
 // interval to the safe floor.
 func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
-	if cfg.Interval <= 0 {
-		cfg.Interval = DefaultAutoUpdateInterval
-	}
-	if cfg.Interval < MinAutoUpdateInterval {
-		cfg.Interval = MinAutoUpdateInterval
-	}
+	cfg.Interval = ClampInterval(cfg.Interval)
 	if cfg.IdlePollInterval <= 0 {
 		cfg.IdlePollInterval = 2 * time.Second
 	}
@@ -161,6 +181,9 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 // next tick so the agent keeps running regardless.
 func (a *AutoUpdater) Run(ctx context.Context) {
 	a.cfg.Log("auto-update: monitoring (interval %s)", a.cfg.Interval)
+	// Publish the heartbeat snapshot (periodic mode + current policy) promptly,
+	// before the first tick fires up to an interval later (citadel-cli#1134).
+	a.refresh()
 	ticks := a.cfg.Ticks
 	if ticks == nil {
 		ticker := time.NewTicker(a.cfg.Interval)
@@ -180,6 +203,10 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 				if a.cfg.AfterTick != nil {
 					defer a.cfg.AfterTick()
 				}
+				// Refresh the snapshot every tick so a policy toggle flipped on the
+				// running agent (persisted/env) is reflected even on a cycle that
+				// installs nothing (citadel-cli#1134).
+				a.refresh()
 				// Re-check the toggle every tick so it can be flipped on a running
 				// agent without a restart.
 				if a.cfg.Enabled != nil && !a.cfg.Enabled() {
@@ -211,6 +238,8 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	if CurrentBinaryIsDesktopManaged() {
 		a.cfg.Log("auto-update: desktop helper is updated with the app")
+		// A desktop-managed binary cannot self-swap; no release check ran.
+		a.record(ResultManualUpdateRequired, false, "")
 		return false
 	}
 	if ctx.Err() != nil {
@@ -219,10 +248,12 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	release, err := a.cfg.Checker.CheckForUpdate()
 	if err != nil {
 		a.cfg.Log("auto-update: check failed: %v", err)
+		a.record(ResultCheckFailed, true, "")
 		return false
 	}
 	if release == nil {
 		a.cfg.Log("auto-update: up to date")
+		a.record(ResultUpToDate, true, "")
 		return false
 	}
 	if ctx.Err() != nil {
@@ -235,6 +266,7 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	// never apply. ApplyUpdate enforces the same rule as a backstop.
 	if a.cfg.HomebrewManaged != nil && a.cfg.HomebrewManaged() {
 		a.cfg.Log("auto-update: %s available but citadel is Homebrew-managed; update with `brew upgrade citadel` (skipping in-place swap)", release.TagName)
+		a.record(ResultManualUpdateRequired, true, release.TagName)
 		return false
 	}
 
@@ -244,6 +276,7 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	// and does not require an idle node.
 	if err := a.cfg.Checker.DownloadAndVerify(release, a.cfg.PendingPath); err != nil {
 		a.cfg.Log("auto-update: download/verify failed: %v", err)
+		a.record(ResultDownloadFailed, true, release.TagName)
 		return false
 	}
 	if ctx.Err() != nil {
@@ -267,6 +300,7 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 
 	if err := a.waitForIdle(ctx); err != nil {
 		a.cfg.Log("auto-update: %v; deferring to next cycle", err)
+		a.record(ResultDrainDeferred, true, release.TagName)
 		return false
 	}
 	if ctx.Err() != nil {
@@ -278,17 +312,17 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	// failure internally).
 	if err := a.cfg.Apply(a.cfg.PendingPath); err != nil {
 		a.cfg.Log("auto-update: apply failed (kept current version): %v", err)
+		a.record(ResultApplyFailed, true, release.TagName)
 		return false
 	}
 	a.cfg.Log("auto-update: applied %s, restarting...", release.TagName)
 
-	// Record the update in persistent state for the new process / status cmd.
-	if state, serr := LoadState(); serr == nil {
-		RecordUpdate(state, state.CurrentVersion, release.TagName)
-		state.AvailableUpdate = ""
-		UpdateLastCheck(state)
-		_ = SaveState(state)
-	}
+	// Record the staged update for the new process / status cmd, and mark
+	// restart_pending: the swap is on disk but the new process is not yet proven
+	// running (citadel-cli#1134). This replaces the prior inline LoadState/
+	// RecordUpdate/SaveState with the atomic, preference-preserving write.
+	_ = RecordStagedUpdate(a.cfg.Now(), release.TagName)
+	a.refresh()
 	if ctx.Err() != nil {
 		a.cfg.Log("auto-update: context cancelled after apply (new binary will load on next start)")
 		return false
@@ -299,9 +333,34 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 		// (systemd Restart=always / Windows SCM) will pick it up on the next
 		// natural restart. Log and keep running on the old image for now.
 		a.cfg.Log("auto-update: restart failed: %v (new binary will load on next restart)", err)
+		a.record(ResultRestartFailed, true, release.TagName)
 		return false
 	}
 	return true
+}
+
+// record persists one attempt outcome (best-effort) and refreshes the
+// heartbeat snapshot. Telemetry failure never interrupts the updater.
+func (a *AutoUpdater) record(result string, checked bool, latest string) {
+	_ = RecordCheckResult(a.cfg.Now(), result, checked, latest)
+	a.refresh()
+}
+
+// refresh triggers the configured heartbeat-snapshot rebuild, if any. It is
+// called from the tick loop and Run start (outside runOnce's own recover), so
+// it guards itself: a panic in the cmd-supplied snapshot builder must never
+// take down the updater goroutine or the worker ("telemetry failure never
+// interrupts a worker", citadel-cli#1134).
+func (a *AutoUpdater) refresh() {
+	if a.cfg.Refresh == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			a.cfg.Log("auto-update: snapshot refresh panic recovered: %v", r)
+		}
+	}()
+	a.cfg.Refresh()
 }
 
 // waitForIdle blocks until ActiveJobs reports 0, ctx is cancelled, or the idle

@@ -774,3 +774,58 @@ fi
 		t.Fatal("active-worker firstboot retry mutated config or PID")
 	}
 }
+
+func TestRejectJetsonWithoutNvidiaCTK(t *testing.T) {
+	found := func(string) (string, error) { return "/usr/bin/nvidia-ctk", nil }
+	missing := func(string) (string, error) { return "", exec.ErrNotFound }
+	for _, tc := range []struct {
+		name     string
+		jetson   bool
+		lookPath func(string) (string, error)
+		wantErr  bool
+	}{
+		{"jetson-missing-ctk-refuses", true, missing, true},
+		{"jetson-with-ctk-ok", true, found, false},
+		{"non-jetson-missing-ctk-ok", false, missing, false},
+		{"non-jetson-with-ctk-ok", false, found, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := rejectJetsonWithoutNvidiaCTKAt(func() bool { return tc.jetson }, tc.lookPath)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("rejectJetsonWithoutNvidiaCTKAt err=%v, wantErr=%v", err, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "nvidia-ctk") {
+				t.Fatalf("Jetson refusal lacks nvidia-ctk guidance: %v", err)
+			}
+		})
+	}
+}
+
+func TestJetsonCTKPreflightPrecedesHostMutation(t *testing.T) {
+	// install.sh refuses a Jetson lacking nvidia-ctk in preflight(), before any
+	// package or host change. Pin that the Go preflight does the same: the gate
+	// runs after the healthy-worker no-op but before foreign-state resolution and
+	// the dedicated-account mutation, so a refused Jetson leaves the host clean.
+	source, err := os.ReadFile("init_podman_linux.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(source)
+	start := strings.Index(code, "func prepareLinuxPodmanProvision() (bool, error) {")
+	if start < 0 {
+		t.Fatal("prepareLinuxPodmanProvision not found")
+	}
+	body := code[start:]
+	if end := strings.Index(body[1:], "\nfunc "); end >= 0 {
+		body = body[:end+1]
+	}
+	gate := strings.Index(body, "rejectJetsonWithoutNvidiaCTK()")
+	foreignState := strings.Index(body, "network.GetNodeConfigDir()")
+	userMutation := strings.Index(body, "ensureDedicatedPodmanUser()")
+	if gate < 0 || foreignState < 0 || userMutation < 0 {
+		t.Fatalf("prepareLinuxPodmanProvision missing an anchor: gate=%d foreign=%d mutation=%d", gate, foreignState, userMutation)
+	}
+	if gate > foreignState || gate > userMutation {
+		t.Fatal("Jetson nvidia-ctk preflight must precede foreign-state resolution and the dedicated-account mutation")
+	}
+}

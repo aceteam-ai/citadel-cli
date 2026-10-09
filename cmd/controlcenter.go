@@ -39,6 +39,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
@@ -2083,6 +2084,18 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	ccWorkerConsuming = ccWorkerLock != nil
 	ccWorkerMu.Unlock()
 
+	// Heartbeat auto_update telemetry (citadel-cli#1134), the control-center's
+	// worker-owned startup path. Mirrors runWork: a cache created before the
+	// publisher starts, seeded once ("unavailable"), reconciled against the
+	// running version, and flipped to "periodic" by the updater's refresh only
+	// when this process owns the worker lock (ccWorkerLock != nil).
+	ccAutoUpdateReport := &update.ReportCache{}
+	ccAutoUpdateReportFn := func() *status.AutoUpdateReport {
+		return autoUpdateReportFrom(ccAutoUpdateReport.Load())
+	}
+	_ = update.ReconcilePendingOnStartup(time.Now(), Version)
+	ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "unavailable"))
+
 	// Determine job source mode
 	var source worker.JobSource
 	var streamFactory func(job *worker.Job) worker.StreamWriter
@@ -2360,6 +2373,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 						go pulseStats.Run(ctx)
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
+					apiPublisher.SetAutoUpdateProvider(ccAutoUpdateReportFn)
 					startHeartbeatPublisher = func() {
 						go func() {
 							activity("info", "Heartbeat publishing started")
@@ -2509,7 +2523,11 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// drain/idle signals; its return also stops the updater before the lock is
 	// released, even when no explicit stop cancelled the parent context.
 	return runWorkerWithAutoUpdater(ctx, ccWorkerLock, autoUpdatePolicyInputs{}, runner,
-		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) }, autoUpdateRuntime{})
+		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) }, autoUpdateRuntime{
+			refresh: func() {
+				ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic"))
+			},
+		})
 }
 
 // buildProxmoxConfig checks for saved Proxmox configuration or auto-detects
