@@ -2981,3 +2981,21 @@ Auto-generated log of every release.
   - feat(papercraft): add papercraft-scene-render-v2 builtin with style presets (#1246)
 
 
+---
+
+## v2.187.0 — 2026-10-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 25 |
+| Lines added | +2439 |
+
+**Changes:**
+
+  - feat(cli): add 'citadel ps' for live per-workload resource inventory (#1249)
+  - feat(heartbeat): publish effective auto-update policy and attempt outcomes (#1134) (#1251)
+  - fix(enroll): honor device-auth token NexusURL when --nexus not explicit (#1122) (#1250)
+  - fix(init): refuse Jetson without nvidia-ctk in the Go provision preflight (#1247)
+
+
