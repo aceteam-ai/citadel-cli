@@ -2,9 +2,12 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	jobhandlers "github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 // TestSerializedLaneJobTypes pins the exact membership of the general
@@ -57,11 +60,232 @@ func TestSerializedLaneJobTypes(t *testing.T) {
 			t.Errorf("unbounded job type %q must also route to the serialized lane", jt)
 		}
 	}
-	// A representative non-member must NOT route there.
-	for _, jt := range []string{JobTypeShellCommand, JobTypeFileRead, JobTypeLLMInference, JobTypeMeetingJoin} {
+	// A representative non-member must NOT route there. FILE_INDEX is explicitly
+	// listed: it routes to the dedicated HEAVY lane, not the serialized lane
+	// (aceteam#10876 C1) — a multi-hour index must never queue manifest writers.
+	for _, jt := range []string{JobTypeShellCommand, JobTypeFileRead, JobTypeLLMInference, JobTypeMeetingJoin, JobTypeFileIndex} {
 		if needsSerializedLane(jt) {
 			t.Errorf("%q must NOT route to the serialized lane", jt)
 		}
+	}
+}
+
+// TestHeavyLaneJobTypes pins the exact membership of the dedicated heavy-lane
+// routing set (aceteam#10876 C1). It is the authority for which job types run on
+// the exec-1/admit-2 heavy lane; read this, not a doc copy.
+func TestHeavyLaneJobTypes(t *testing.T) {
+	want := map[string]struct{}{JobTypeFileIndex: {}}
+	if len(heavyLaneJobTypes) != len(want) {
+		t.Fatalf("heavyLaneJobTypes has %d entries, want %d: %v", len(heavyLaneJobTypes), len(want), heavyLaneJobTypes)
+	}
+	for jt := range want {
+		if !needsHeavyLane(jt) {
+			t.Errorf("expected %q to route to the heavy lane", jt)
+		}
+	}
+	// The heavy lane is disjoint from the serialized/long/GPU routing sets.
+	if needsSerializedLane(JobTypeFileIndex) {
+		t.Error("FILE_INDEX must NOT be on the serialized lane (dedicated heavy lane instead)")
+	}
+	if _, long := longSessionJobTypes[JobTypeFileIndex]; long {
+		t.Error("FILE_INDEX must NOT be in longSessionJobTypes (that would also route it to the #489 always-async lane and race the heavy lane)")
+	}
+	for _, jt := range []string{JobTypeServiceStart, JobTypeShellCommand, JobTypeLLMInference, JobTypeMeetingJoin} {
+		if needsHeavyLane(jt) {
+			t.Errorf("%q must NOT route to the heavy lane", jt)
+		}
+	}
+}
+
+// TestCooperativeCancelJobTypes pins which job types get the graceful mid-job
+// cancel watch (aceteam#10876 C1). HUDDLE_JOIN is deliberately excluded — it has
+// its own hard ctx-cancel watch.
+func TestCooperativeCancelJobTypes(t *testing.T) {
+	want := map[string]struct{}{JobTypeFileIndex: {}}
+	if len(cooperativeCancelJobTypes) != len(want) {
+		t.Fatalf("cooperativeCancelJobTypes has %d entries, want %d: %v", len(cooperativeCancelJobTypes), len(want), cooperativeCancelJobTypes)
+	}
+	if !needsCooperativeCancelWatch(JobTypeFileIndex) {
+		t.Error("FILE_INDEX must get the cooperative cancel watch")
+	}
+	for _, jt := range []string{JobTypeHuddleJoin, JobTypeServiceStart, JobTypeShellCommand} {
+		if needsCooperativeCancelWatch(jt) {
+			t.Errorf("%q must NOT get the cooperative cancel watch", jt)
+		}
+	}
+}
+
+// TestRunnerHeavyLaneDoesNotBlockFetchLoop pins acceptance #4 (aceteam#10876
+// C1): a long-running FILE_INDEX on the heavy lane must NOT block the fetch loop
+// from claiming and executing a FILE_READ_BYTES queued behind it. The index runs
+// off the fetch loop (heavy lane), so the file read is claimed and completed
+// while the index is still executing.
+func TestRunnerHeavyLaneDoesNotBlockFetchLoop(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	indexHandler := &blockingJobHandler{
+		jobType: JobTypeFileIndex,
+		onStart: func() { once.Do(func() { close(started) }) },
+		release: release,
+	}
+	fileHandler := NewMockJobHandler(JobTypeFileReadBytes, false)
+
+	jobs := []*Job{
+		{ID: "index-1", Type: JobTypeFileIndex, Payload: map[string]any{"path": "/ws"}},
+		{ID: "file-1", Type: JobTypeFileReadBytes, Payload: map[string]any{}},
+	}
+	source := NewMockJobSource("test", jobs)
+	state := NewWorkerState()
+	runner := NewRunner(source, []JobHandler{indexHandler, fileHandler}, RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 1,
+		State:          state,
+		ActivityFn:     func(string, string) {},
+	})
+	streams := newKeyedStreamWriterFactory()
+	runner.WithStreamWriterFactory(streams.factory)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { runner.Run(ctx); close(runDone) }()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FILE_INDEX handler never started")
+	}
+	if s := streams.get("index-1"); s == nil || !s.claimed {
+		t.Error("expected FILE_INDEX to publish its claim-ack synchronously at fetch time")
+	}
+	// While the index is still blocked in its handler, the file read must complete.
+	if !laneWaitFor(5*time.Second, func() bool { return len(fileHandler.ExecutedJobs()) >= 1 }) {
+		t.Fatal("FILE_READ_BYTES was not dispatched while FILE_INDEX was still in flight (heavy lane head-of-line blocking regression)")
+	}
+	if s := streams.get("index-1"); s != nil && s.ended {
+		t.Error("FILE_INDEX should not have a terminal event yet — its handler is still blocked")
+	}
+	// The heavy lane reports the executing index.
+	if !laneWaitFor(5*time.Second, func() bool {
+		for _, s := range runner.LaneSnapshots() {
+			if s.Lane == "heavy" && s.Executing >= 1 {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("heavy lane never showed the executing index; got %+v", runner.LaneSnapshots())
+	}
+
+	close(release)
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// coopCancelObserverHandler is a FILE_INDEX worker.JobHandler that waits for a
+// cooperative cancel to be surfaced on its context (via jobs.CancelRequested)
+// and then returns a partial `cancelled` result — WITHOUT its context being hard
+// cancelled. It proves the runner's cooperative-cancel watch sets the graceful
+// flag on the handler ctx without cancelling it (aceteam#10876 C1).
+type coopCancelObserverHandler struct {
+	started     chan struct{}
+	observed    chan struct{}
+	hardCancel  chan struct{}
+	startedOnce sync.Once
+}
+
+func (h *coopCancelObserverHandler) CanHandle(jt string) bool { return jt == JobTypeFileIndex }
+
+func (h *coopCancelObserverHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	h.startedOnce.Do(func() { close(h.started) })
+	pred := jobhandlers.CancelRequestedFrom(ctx)
+	if pred == nil {
+		return nil, errors.New("no cooperative-cancel predicate wired on the handler context")
+	}
+	for {
+		if pred() {
+			close(h.observed)
+			return &JobResult{Status: JobStatusSuccess, Output: map[string]any{"status": "cancelled", "checkpoint": "partial", "files_indexed": 1}}, nil
+		}
+		select {
+		case <-ctx.Done():
+			// A cooperative cancel must NOT hard-cancel the handler ctx.
+			close(h.hardCancel)
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// TestRunnerFileIndexCooperativeCancelObservedByHandler pins acceptance #1
+// plumbing (aceteam#10876 C1): a job:cancelled marker set AFTER execution begins
+// is surfaced to the FILE_INDEX handler as a cooperative (graceful) cancel on its
+// context — never a hard ctx cancel — and the resulting partial result is ACKed.
+func TestRunnerFileIndexCooperativeCancelObservedByHandler(t *testing.T) {
+	handler := &coopCancelObserverHandler{
+		started:    make(chan struct{}),
+		observed:   make(chan struct{}),
+		hardCancel: make(chan struct{}),
+	}
+	source := NewMockJobSource("test", []*Job{{ID: "index-1", Type: JobTypeFileIndex, Payload: map[string]any{"path": "/ws"}}})
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 1,
+		ActivityFn:     func(string, string) {},
+	})
+	runner.coopCancelPoll = 5 * time.Millisecond
+	streams := newKeyedStreamWriterFactory()
+	runner.WithStreamWriterFactory(streams.factory)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { runner.Run(ctx); close(runDone) }()
+
+	select {
+	case <-handler.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FILE_INDEX handler never started")
+	}
+	// Trigger the cooperative cancel AFTER execution has begun.
+	source.SetCancelled("index-1")
+
+	select {
+	case <-handler.observed:
+		// Good: the handler saw CancelRequested()==true.
+	case <-handler.hardCancel:
+		t.Fatal("cooperative cancel hard-cancelled the handler context (must be a graceful flag only)")
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler never observed the cooperative cancel within ~3s")
+	}
+
+	// The partial result must be ACKed (not Nacked/Failed), with one terminal end.
+	if !laneWaitFor(5*time.Second, func() bool {
+		for _, j := range source.AckedJobs() {
+			if j.ID == "index-1" {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("index-1 was not ACKed after a cooperative cancel; acked=%v nacked=%v", jobIDs(source.AckedJobs()), jobIDs(source.NackedJobs()))
+	}
+	if s := streams.get("index-1"); s == nil || !s.ended {
+		t.Fatal("expected a terminal end event carrying the partial result")
+	} else if s.endResult["status"] != "cancelled" {
+		t.Errorf("terminal result status = %v, want cancelled", s.endResult["status"])
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
 	}
 }
 

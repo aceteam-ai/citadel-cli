@@ -179,6 +179,11 @@ var (
 	// general lane's admission depth). Small on purpose: hitting it Nacks (a
 	// transparent retry), and it should only be reached under a real backlog.
 	unboundedLaneQueueDefault = 8
+	// heavyLaneAdmitDepth is the heavy lane's admission depth (aceteam#10876 C1,
+	// design 2a.6): one FILE_INDEX executes (exec 1) while at most one more is
+	// claimed+queued, so the fetch loop never blocks; a third is Nacked for a
+	// transparent retry. A package var so tests can resize it.
+	heavyLaneAdmitDepth = 2
 )
 
 // resolveInferenceQueueWait reads the inference queue-wait budget from the env,

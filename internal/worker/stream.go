@@ -59,6 +59,15 @@ func (w *RedisStreamWriter) WriteCancelled(reason string) error {
 	return w.client.PublishCancelled(w.ctx, w.jobID, w.rayID, reason)
 }
 
+// WriteProgress publishes a throttled progress event on the job's pub/sub stream
+// and mirrors the latest snapshot into the bounded job:<id>:progress hash. The
+// hash mirror is best-effort (a dropped mirror never fails the job); the pub/sub
+// event is the primary path.
+func (w *RedisStreamWriter) WriteProgress(event map[string]any) error {
+	_ = w.client.SetJobProgress(w.ctx, w.jobID, event)
+	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "progress", event)
+}
+
 // Ensure RedisStreamWriter implements StreamWriter
 var _ StreamWriter = (*RedisStreamWriter)(nil)
 
@@ -120,6 +129,14 @@ func (w *APIStreamWriter) WriteError(err error, recoverable bool) error {
 func (w *APIStreamWriter) WriteCancelled(reason string) error {
 	w.client.SetJobStatus(w.ctx, w.jobID, "cancelled", nil)
 	return w.client.PublishCancelled(w.ctx, w.jobID, w.rayID, reason)
+}
+
+// WriteProgress publishes a throttled progress event via the API proxy and
+// mirrors the latest snapshot into the bounded job:<id>:progress key. The mirror
+// is best-effort; the pub/sub event is the primary path.
+func (w *APIStreamWriter) WriteProgress(event map[string]any) error {
+	_ = w.client.SetJobProgress(w.ctx, w.jobID, event)
+	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "progress", event)
 }
 
 // Ensure APIStreamWriter implements StreamWriter

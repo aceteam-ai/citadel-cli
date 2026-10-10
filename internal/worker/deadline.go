@@ -177,6 +177,54 @@ func needsSerializedLane(jobType string) bool {
 	return ok
 }
 
+// heavyLaneJobTypes route to the dedicated HEAVY execution lane (exec 1, admit 2
+// — runner.go) instead of running inline on the fetch loop. FILE_INDEX is the
+// first member (aceteam#10876 C1, design 2a.6):
+//
+//   - It is the single DISPATCHED writer to the node-local index DB, so exec 1
+//     gives single-writer safety with no new lock (the same relocated-lock idea
+//     as the unbounded lane, over a DIFFERENT file).
+//   - Its walk+embed is minutes-to-hours long, so running inline would
+//     head-of-line-block the fetch loop (the #489/#908 incident shape).
+//   - It must NOT share the serialized/unbounded lane, which carries the
+//     manifest/lockfile writers (SERVICE_START, MODULE_SET, ...): a multi-hour
+//     index on that single-slot lane would queue every deploy behind it.
+//
+// admit 2 lets a second FILE_INDEX be claimed and queued (so the fetch loop
+// never blocks) while exec 1 keeps only one executing. Lane membership and the
+// watchdog TIER are SEPARATE decisions: a heavy job takes the long tier below
+// but is NOT in longSessionJobTypes (that set also means the #489 always-async
+// goroutine, which would race this lane's dispatch). Pinned by
+// TestHeavyLaneJobTypes.
+var heavyLaneJobTypes = map[string]struct{}{
+	JobTypeFileIndex: {},
+}
+
+// needsHeavyLane reports whether jobType routes to the dedicated heavy lane.
+func needsHeavyLane(jobType string) bool {
+	_, ok := heavyLaneJobTypes[jobType]
+	return ok
+}
+
+// cooperativeCancelJobTypes get a mid-job cancel WATCH that polls
+// job:cancelled:<id> and sets a GRACEFUL-stop flag the handler observes at a safe
+// unit boundary (JobContext.CancelRequested) — as opposed to HUDDLE_JOIN's hard
+// ctx-cancel watch. FILE_INDEX uses it to commit the current file then return
+// `cancelled` with partial counts (aceteam#10876 C1). Scoped deliberately: a
+// watch per in-flight job costs one Redis EXISTS per poll, so only long
+// cooperative walks get one (today, exactly the heavy-lane set). Pinned by
+// TestCooperativeCancelJobTypes.
+var cooperativeCancelJobTypes = map[string]struct{}{
+	JobTypeFileIndex: {},
+}
+
+// needsCooperativeCancelWatch reports whether jobType gets the graceful mid-job
+// cancel watch. See cooperativeCancelJobTypes.
+func needsCooperativeCancelWatch(jobType string) bool {
+	_, ok := cooperativeCancelJobTypes[jobType]
+	return ok
+}
+
 // resolveJobTimeout returns the execution budget the runner should apply to a
 // job. An explicit payload timeout_ms wins; otherwise the per-class fallback
 // applies. ok=false means "run unbounded" (no watchdog), preserving the exact
@@ -192,6 +240,13 @@ func (r *Runner) resolveJobTimeout(job *Job) (time.Duration, bool) {
 		return 0, false
 	}
 	if job.Type == JobTypeRunJobTemplate {
+		return envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
+	}
+	// Heavy-lane jobs (FILE_INDEX) take the long tier: a full-archive walk+embed
+	// legitimately runs for hours. Like RUN_JOB_TEMPLATE this is an explicit
+	// branch, NOT longSessionJobTypes membership (which would also route it onto
+	// the #489 always-async goroutine and race the heavy lane). aceteam#10876 C1.
+	if _, heavy := heavyLaneJobTypes[job.Type]; heavy {
 		return envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
 	}
 	if _, long := longSessionJobTypes[job.Type]; long {
@@ -433,6 +488,16 @@ type deadlineExceededError struct {
 // while node teardown was still failed or in flight. Package-var for tests.
 var huddleCancellationDrainTimeout = 35 * time.Second
 
+// heavyDeadlineDrainTimeout bounds how long executeWithDeadline waits, after a
+// heavy-lane job's (FILE_INDEX) deadline fires, for the handler goroutine to
+// observe the cancelled context, finish its in-flight upsert, and close the
+// index DB. Without this wait the heavy lane's exec-1 slot would be released to
+// the next FILE_INDEX while an orphaned writer was still mid-upsert on the same
+// DB — breaking the single-writer property exactly on deadline (aceteam#10876 C1
+// acceptance 2). The deadline is still terminal (Fail/DLQ); any partial result
+// the handler returns during the drain is discarded. Package-var for tests.
+var heavyDeadlineDrainTimeout = 5 * time.Second
+
 func (e *deadlineExceededError) Error() string {
 	return fmt.Sprintf(
 		"job exceeded its execution deadline of %s and was abandoned by the worker",
@@ -487,6 +552,21 @@ func (r *Runner) executeWithDeadline(
 	case <-execCtx.Done():
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			r.log("error", "Job %s abandoned: exceeded execution deadline of %s", job.ID, timeout)
+			if needsHeavyLane(job.Type) {
+				// A heavy-lane job (FILE_INDEX) writes the single-writer index DB.
+				// Wait (bounded) for the handler goroutine to observe the cancelled
+				// ctx, finish its in-flight upsert, and close the store, so the heavy
+				// lane's exec slot is not released to the next index while an orphan
+				// is still writing the same DB (aceteam#10876 C1 acceptance 2). The
+				// deadline stays terminal; the drained result is discarded.
+				timer := time.NewTimer(heavyDeadlineDrainTimeout)
+				defer timer.Stop()
+				select {
+				case <-done:
+				case <-timer.C:
+					r.log("warning", "Job %s heavy-lane deadline drain timed out after %s; writer may still be unwinding", job.ID, heavyDeadlineDrainTimeout)
+				}
+			}
 			return nil, &deadlineExceededError{timeout: timeout}
 		}
 		if job.Type == JobTypeHuddleJoin {

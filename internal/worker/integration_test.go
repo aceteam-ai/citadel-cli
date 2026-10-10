@@ -73,6 +73,8 @@ func (w *recordingStreamWriter) WriteCancelled(reason string) error {
 	return nil
 }
 
+func (w *recordingStreamWriter) WriteProgress(event map[string]any) error { return nil }
+
 // recordingStreamWriterFactory creates recordingStreamWriters and captures the
 // rayID that was on the job at factory invocation time.
 type recordingStreamWriterFactory struct {

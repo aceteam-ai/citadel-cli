@@ -40,6 +40,13 @@ type StreamWriter interface {
 
 	// WriteCancelled signals job cancellation (JQS-Core terminal event).
 	WriteCancelled(reason string) error
+
+	// WriteProgress emits a throttled, NON-terminal progress update (counts and
+	// basenames only) on the job's stream and mirrors it into a bounded Redis
+	// snapshot for the polled progress route (aceteam#10876 C1). Most job types
+	// never call it; it is wired for long-running handlers (FILE_INDEX) via
+	// JobContext.Progress. It must never be treated as a terminal event.
+	WriteProgress(event map[string]any) error
 }
 
 // NoOpStreamWriter is a StreamWriter that does nothing.
@@ -52,6 +59,7 @@ func (n *NoOpStreamWriter) WriteChunk(content string, index int) error   { retur
 func (n *NoOpStreamWriter) WriteEnd(result map[string]any) error         { return nil }
 func (n *NoOpStreamWriter) WriteError(err error, recoverable bool) error { return nil }
 func (n *NoOpStreamWriter) WriteCancelled(reason string) error           { return nil }
+func (n *NoOpStreamWriter) WriteProgress(event map[string]any) error     { return nil }
 
 // Ensure NoOpStreamWriter implements StreamWriter
 var _ StreamWriter = (*NoOpStreamWriter)(nil)
