@@ -322,7 +322,7 @@ func TestPublicRollbackAcquiresMutationLockOnce(t *testing.T) {
 	if descriptors, err := os.ReadDir("/proc/self/fd"); err == nil {
 		for _, descriptor := range descriptors {
 			target, readErr := os.Readlink(filepath.Join("/proc/self/fd", descriptor.Name()))
-			if readErr == nil && strings.Contains(target, dir) && strings.Contains(target, ".citadel-update-stage-") {
+			if readErr == nil && (target == installed || (strings.Contains(target, dir) && strings.Contains(target, ".citadel-update-stage-"))) {
 				t.Fatalf("rollback left swap-stage descriptor open: %s -> %s", descriptor.Name(), target)
 			}
 		}
