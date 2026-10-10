@@ -19,6 +19,7 @@
 package nodeindex
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
@@ -63,6 +64,9 @@ type Store struct {
 	// accelerator is disabled via CITADEL_INDEX_HNSW. Shared across every Store
 	// opened against the same index so a long-running process builds it once.
 	accel *accelerator
+	// beforeCommit is a nil-by-default deterministic test seam. Production
+	// cannot configure it and it performs no I/O when unset.
+	beforeCommit func()
 }
 
 // Chunk is one embedded unit of a file: a slice of text and its vector.
@@ -121,7 +125,12 @@ func (s *Store) Close() error {
 // FileHash returns the content hash recorded for path and whether the path is
 // currently indexed. It lets FILE_INDEX skip files whose content is unchanged.
 func (s *Store) FileHash(path string) (hash string, indexed bool, err error) {
-	row := s.db.QueryRow(`SELECT content_hash FROM indexed_files WHERE path = ?`, path)
+	return s.FileHashContext(context.Background(), path)
+}
+
+// FileHashContext is FileHash with caller-owned cancellation.
+func (s *Store) FileHashContext(ctx context.Context, path string) (hash string, indexed bool, err error) {
+	row := s.db.QueryRowContext(ctx, `SELECT content_hash FROM indexed_files WHERE path = ?`, path)
 	switch err := row.Scan(&hash); err {
 	case nil:
 		return hash, true, nil
@@ -135,7 +144,12 @@ func (s *Store) FileHash(path string) (hash string, indexed bool, err error) {
 // IndexedPaths returns the set of currently indexed file paths, so a re-index of
 // a directory can prune entries whose files were deleted on disk.
 func (s *Store) IndexedPaths() (map[string]struct{}, error) {
-	rows, err := s.db.Query(`SELECT path FROM indexed_files`)
+	return s.IndexedPathsContext(context.Background())
+}
+
+// IndexedPathsContext is IndexedPaths with caller-owned cancellation.
+func (s *Store) IndexedPathsContext(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT path FROM indexed_files`)
 	if err != nil {
 		return nil, fmt.Errorf("query indexed paths: %w", err)
 	}
@@ -155,16 +169,25 @@ func (s *Store) IndexedPaths() (map[string]struct{}, error) {
 // prior chunks for path and inserts the file row plus its chunks in one
 // transaction, so a re-index never leaves duplicate or orphaned chunks.
 func (s *Store) UpsertFile(path, contentHash string, mtime, size int64, model string, dim int, chunks []Chunk) error {
-	tx, err := s.db.Begin()
+	return s.UpsertFileContext(context.Background(), path, contentHash, mtime, size, model, dim, chunks)
+}
+
+// UpsertFileContext is UpsertFile with cancellation bound to every SQL
+// operation and the transaction lifetime.
+func (s *Store) UpsertFileContext(ctx context.Context, path, contentHash string, mtime, size int64, model string, dim int, chunks []Chunk) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
-	if _, err := tx.Exec(`DELETE FROM chunks WHERE path = ?`, path); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE path = ?`, path); err != nil {
 		return fmt.Errorf("delete old chunks: %w", err)
 	}
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO indexed_files (path, content_hash, mtime, size, model, dim, chunk_count, indexed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
@@ -179,15 +202,21 @@ func (s *Store) UpsertFile(path, contentHash string, mtime, size int64, model st
 		time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return fmt.Errorf("upsert file row: %w", err)
 	}
-	stmt, err := tx.Prepare(`INSERT INTO chunks (path, chunk_index, text, embedding) VALUES (?, ?, ?, ?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO chunks (path, chunk_index, text, embedding) VALUES (?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare chunk insert: %w", err)
 	}
 	defer stmt.Close()
 	for _, c := range chunks {
-		if _, err := stmt.Exec(path, c.Index, c.Text, encodeVector(c.Embedding)); err != nil {
+		if _, err := stmt.ExecContext(ctx, path, c.Index, c.Text, encodeVector(c.Embedding)); err != nil {
 			return fmt.Errorf("insert chunk %d: %w", c.Index, err)
 		}
+	}
+	if s.beforeCommit != nil {
+		s.beforeCommit()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
@@ -198,16 +227,31 @@ func (s *Store) UpsertFile(path, contentHash string, mtime, size int64, model st
 // DeleteFile removes a file and its chunks from the index (used when a file that
 // was previously indexed no longer exists on disk).
 func (s *Store) DeleteFile(path string) error {
-	tx, err := s.db.Begin()
+	return s.DeleteFileContext(context.Background(), path)
+}
+
+// DeleteFileContext is DeleteFile with cancellation bound to every SQL
+// operation and the transaction lifetime.
+func (s *Store) DeleteFileContext(ctx context.Context, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if _, err := tx.Exec(`DELETE FROM chunks WHERE path = ?`, path); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE path = ?`, path); err != nil {
 		return fmt.Errorf("delete chunks: %w", err)
 	}
-	if _, err := tx.Exec(`DELETE FROM indexed_files WHERE path = ?`, path); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM indexed_files WHERE path = ?`, path); err != nil {
 		return fmt.Errorf("delete file row: %w", err)
+	}
+	if s.beforeCommit != nil {
+		s.beforeCommit()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

@@ -1,10 +1,13 @@
 package nodeindex
 
 import (
+	"context"
+	"errors"
 	"math"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func openTemp(t *testing.T) *Store {
@@ -16,6 +19,70 @@ func openTemp(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+func TestUpsertFileContextObservedPrecommitCancellationRollsBack(t *testing.T) {
+	s := openTemp(t)
+	if err := s.UpsertFile("/ws/a.md", "old", 1, 1, "m", 1, []Chunk{{Index: 0, Text: "old", Embedding: []float32{1}}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.beforeCommit = cancel
+	err := s.UpsertFileContext(ctx, "/ws/a.md", "new", 2, 2, "m", 1, []Chunk{{Index: 0, Text: "new", Embedding: []float32{2}}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context.Canceled", err)
+	}
+	hash, indexed, err := s.FileHash("/ws/a.md")
+	if err != nil || !indexed || hash != "old" {
+		t.Fatalf("hash/indexed/error=%q/%v/%v, want old/true/nil", hash, indexed, err)
+	}
+}
+
+func TestUpsertFileContextCancelsBlockedSQLOperation(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	blocker, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	writer, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	// Keep the driver's lock wait bounded for this deterministic fixture. The
+	// assertion below is the returned context identity, not wall-clock timing.
+	if _, err := writer.db.Exec(`PRAGMA busy_timeout=100`); err != nil {
+		t.Fatal(err)
+	}
+
+	lockTx, err := blocker.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockTx.Rollback() //nolint:errcheck
+	if _, err := lockTx.Exec(`INSERT INTO indexed_files(path, content_hash) VALUES('/held', 'h')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- writer.UpsertFileContext(ctx, "/ws/blocked.md", "new", 1, 1, "m", 1, []Chunk{{Index: 0, Text: "new", Embedding: []float32{1}}})
+	}()
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocked SQL error=%v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context-bound SQL write did not unblock after cancellation")
+	}
+	if _, indexed, err := writer.FileHash("/ws/blocked.md"); err != nil || indexed {
+		t.Fatalf("blocked row indexed/error=%v/%v, want false/nil", indexed, err)
+	}
 }
 
 func TestVectorCodecRoundTrip(t *testing.T) {

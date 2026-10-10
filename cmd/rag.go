@@ -2,10 +2,12 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 
@@ -94,6 +96,8 @@ func newRAGService() *rag.Service {
 
 func runRAGIndex(cmd *cobra.Command, args []string) error {
 	svc := newRAGService()
+	softCtx, stopSoft := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stopSoft()
 	fmt.Printf("Indexing %s via %s ...\n", args[0], svc.Model())
 	// Live, throttled progress line while the walk runs (aceteam#10876 C1). Not
 	// in --json mode, where the single JSON result is the only output. Ctrl-C
@@ -102,7 +106,9 @@ func runRAGIndex(cmd *cobra.Command, args []string) error {
 	if !ragJSON {
 		svc.SetProgressSink(printRAGProgressLine)
 	}
-	res, err := svc.Index(cmd.Context(), args[0], ragFilePattern)
+	res, err := svc.IndexCooperatively(cmd.Context(), args[0], ragFilePattern, func() bool {
+		return softCtx.Err() != nil
+	})
 	if !ragJSON {
 		fmt.Fprint(os.Stderr, "\r\033[K") // clear the live line before the summary
 	}

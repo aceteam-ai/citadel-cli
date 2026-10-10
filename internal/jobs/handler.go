@@ -13,9 +13,9 @@ import (
 // It carries counts and BASENAMES only — never full paths or content — so it is
 // safe to publish on the job's stream and mirror into Redis.
 type ProgressEvent struct {
-	// Stage is the coarse phase. "index" / "prune" today; "plan" / "extract" /
-	// "embed" / "upsert" arrive with later slices.
-	Stage string
+	// Stage is the coarse phase. Only the approved ProgressStage constants are
+	// emitted by FILE_INDEX.
+	Stage ProgressStage
 	// Done / Total measure progress in Unit terms. Total == 0 means unknown.
 	Done  int
 	Total int
@@ -25,10 +25,27 @@ type ProgressEvent struct {
 	Current string
 	// Counts carries optional additive per-stage tallies (indexed/skipped/...).
 	Counts map[string]int
-	// Final marks the last update of the job (completion or cancel). A Final
-	// event always passes the throttle so the UI lands on the true end state.
+	// InFlight is internal accounting for candidates that have begun but do not
+	// yet have a terminal disposition. It is never projected onto the wire.
+	InFlight int
+	// Final marks a successfully completed full walk. It is internal/non-wire
+	// state and is the only condition that permits a 100 percent projection.
 	Final bool
+	// Flush forces a non-final snapshot through throttling (for example a
+	// cooperative partial stop). It is internal and never projected onto wire.
+	Flush bool
 }
+
+// ProgressStage is the closed FILE_INDEX progress vocabulary.
+type ProgressStage string
+
+const (
+	ProgressStagePlan    ProgressStage = "plan"
+	ProgressStageExtract ProgressStage = "extract"
+	ProgressStageEmbed   ProgressStage = "embed"
+	ProgressStageUpsert  ProgressStage = "upsert"
+	ProgressStagePrune   ProgressStage = "prune"
+)
 
 // JobContext can hold shared resources like a logger, config, etc.
 type JobContext struct {

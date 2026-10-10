@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/nodeindex"
 )
 
 // passthroughAuth is a no-op auth middleware for exercising the route wiring;
@@ -22,6 +27,59 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts, ws
+}
+
+func TestServerIndexRequestCancellationIsHard(t *testing.T) {
+	started := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"max_client_batch_size":32}`)) })
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(started)
+		<-r.Context().Done()
+	})
+	tei := httptest.NewServer(mux)
+	defer tei.Close()
+	t.Setenv("CITADEL_TEI_URL", tei.URL)
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	ws := t.TempDir()
+	path := filepath.Join(ws, "a.md")
+	if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	svc := New(ws, "")
+	svc.dbPath = dbPath
+	body, _ := json.Marshal(indexRequest{Path: ws})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/rag/index", bytes.NewReader(body)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { NewServer(svc).handleIndex(rec, req); close(done) }()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("embedding request did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("HTTP handler did not propagate request cancellation")
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s, want 502", rec.Code, rec.Body.String())
+	}
+	store, err := nodeindex.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, indexed, err := store.FileHash(path); err != nil || indexed {
+		t.Fatalf("row indexed/error=%v/%v, want false/nil", indexed, err)
+	}
 }
 
 func TestServerIndexQueryStatusRoundTrip(t *testing.T) {

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,26 @@ import (
 type ctxHandler struct {
 	jobType   string
 	sawCancel atomic.Bool
+}
+
+type successAfterCancelHandler struct{}
+
+func (*successAfterCancelHandler) CanHandle(jobType string) bool { return jobType == JobTypeFileIndex }
+
+func (*successAfterCancelHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	<-ctx.Done()
+	return &JobResult{Status: JobStatusSuccess}, nil
+}
+
+func TestExecuteWithDeadlineHeavyHardCancellationWinsSuccessfulReturn(t *testing.T) {
+	h := &successAfterCancelHandler{}
+	r := NewRunner(NewMockJobSource("test", nil), []JobHandler{h}, RunnerConfig{WorkerID: "test"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := r.executeWithDeadline(ctx, h, &Job{ID: "idx", Type: JobTypeFileIndex}, &MockStreamWriter{}, time.Hour)
+	if !errors.Is(err, context.Canceled) || result != nil {
+		t.Fatalf("result/error=%v/%v, want nil/context.Canceled", result, err)
+	}
 }
 
 func (h *ctxHandler) CanHandle(jobType string) bool { return h.jobType == jobType }

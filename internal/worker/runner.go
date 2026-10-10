@@ -1312,10 +1312,10 @@ func (r *Runner) watchCooperativeCancellation(ctx context.Context, job *Job) (co
 		return ctx, func() {}
 	}
 	var requested atomic.Bool
+	pollCtx, cancelPoll := context.WithCancel(ctx)
 	// The predicate reads the live flag, so setting it below is observed by the
 	// handler on its next poll. Thread it to the adapter via the context.
 	ctx = jobs.WithCancelRequested(ctx, requested.Load)
-	stop := make(chan struct{})
 	done := make(chan struct{})
 	interval := r.coopCancelPoll
 	if interval <= 0 {
@@ -1327,20 +1327,19 @@ func (r *Runner) watchCooperativeCancellation(ctx context.Context, job *Job) (co
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stop:
-				return
-			case <-ctx.Done():
+			case <-pollCtx.Done():
 				return
 			case <-ticker.C:
-				if r.source.IsJobCancelled(ctx, job.ID) {
+				if r.source.IsJobCancelled(pollCtx, job.ID) {
 					requested.Store(true)
 					return // once requested, stop polling; the handler stops gracefully
 				}
 			}
 		}
 	}()
+	var stopOnce sync.Once
 	return ctx, func() {
-		close(stop)
+		stopOnce.Do(cancelPoll)
 		<-done
 	}
 }

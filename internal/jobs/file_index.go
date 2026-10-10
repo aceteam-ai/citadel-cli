@@ -54,6 +54,9 @@ type FileIndexHandler struct {
 	// embeddingOp is an optional hermetic test seam. Production always creates
 	// one fresh operation per Execute call below.
 	embeddingOp *teiEmbeddingOperation
+	// afterUpsert is a nil-by-default deterministic test seam invoked only after
+	// a successful store commit and before the handler's hard-context check.
+	afterUpsert func()
 }
 
 // NewFileIndexHandler creates a FileIndexHandler rooted at workspace.
@@ -104,37 +107,56 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 
 	ctx.Log("info", "     - [Job %s] FILE_INDEX %s model=%q pattern=%q", job.ID, validated, model, filePattern)
 
-	// Cheap pre-count of candidate files so progress can report done/total. It
-	// only stats entries (no reads/embeds) and honors cancellation, so it is a
-	// small fraction of the embedding cost. It over-counts (a candidate may later
-	// be skipped as binary/unchanged/too-large), but gives a stable denominator.
+	// Cheap pre-count gives progress an estimate. The actual denominator evolves
+	// during the real walk because files may be added between these traversals.
 	total := countIndexCandidates(validated, filePattern, ctx)
+	if err := ctx.Context().Err(); err != nil {
+		return nil, fmt.Errorf("index planning cancelled: %w", err)
+	}
 
-	// Enumerate candidate files first so pruning can compare against on-disk state.
 	seen := make(map[string]struct{})
-	var indexed, skipped, failed, embedded, chunksUpserted, processed int
+	var indexed, skipped, failed, embedded, chunksUpserted, filesSeen, done, inFlight int
 	dim := 0
 	cancelled := false
+	stage := ProgressStagePlan
 	embedOp := h.embeddingOp
 	if embedOp == nil {
 		embedOp = newTEIEmbeddingOperation(teiBaseURL())
 	}
-	// emitProgress reports the current walk position, throttled by the caller's
-	// wiring (jobs.NewThrottledProgress). Counts/basename only — never a full path.
-	emitProgress := func(current string, final bool) {
+	emitProgress := func(current string, final, flush bool) {
 		ctx.EmitProgress(ProgressEvent{
-			Stage:   indexStageWalk,
-			Done:    processed,
-			Total:   total,
-			Unit:    "files",
-			Current: current,
-			Final:   final,
+			Stage:    stage,
+			Done:     done,
+			Total:    total,
+			Unit:     "files",
+			Current:  current,
+			InFlight: inFlight,
+			Final:    final,
+			Flush:    flush,
 			Counts: map[string]int{
 				"indexed": indexed,
 				"skipped": skipped,
 				"failed":  failed,
 			},
 		})
+	}
+	emitProgress("", false, false)
+
+	stopAfterDisposition := func() error {
+		if err := ctx.Context().Err(); err != nil {
+			return err
+		}
+		if ctx.CancelRequestedNow() {
+			cancelled = true
+			return filepath.SkipAll
+		}
+		return nil
+	}
+	finishDisposition := func(current string) error {
+		done++
+		inFlight = 0
+		emitProgress(current, false, false)
+		return stopAfterDisposition()
 	}
 
 	walkErr := filepath.WalkDir(validated, func(p string, d os.DirEntry, err error) error {
@@ -144,19 +166,13 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			}
 			return nil // skip unreadable entries
 		}
-		// Cooperative (graceful) cancel is checked at the file boundary ONLY, so
-		// the file currently being embedded/upserted finishes and commits before
-		// we stop — "cancel commits the current file" (aceteam#10876 C1). SkipAll
-		// stops the walk WITHOUT an error, so a partial, consistent index remains.
+		// Hard cancellation always wins over a simultaneously visible soft stop.
+		if err := ctx.Context().Err(); err != nil {
+			return err
+		}
 		if ctx.CancelRequestedNow() {
 			cancelled = true
 			return filepath.SkipAll
-		}
-		// A HARD ctx cancellation (watchdog deadline / worker shutdown) remains
-		// fatal exactly as before: it returns the error and leaves the prior index
-		// untouched (prune is skipped below on any non-clean exit).
-		if err := ctx.Context().Err(); err != nil {
-			return err
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -171,52 +187,58 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 				return nil
 			}
 		}
-		// A candidate file: count it and surface progress (throttled downstream).
-		processed++
-		emitProgress(filepath.Base(p), false)
+		current := filepath.Base(p)
+		filesSeen++
+		inFlight = 1
+		seen[p] = struct{}{}
+		stage = ProgressStageEmbed
+		emitProgress(current, false, false)
 		info, err := d.Info()
 		if err != nil {
-			return nil
+			if hardErr := ctx.Context().Err(); hardErr != nil {
+				return hardErr
+			}
+			failed++
+			return finishDisposition(current)
 		}
 		if info.Size() > maxIndexFileBytes {
 			skipped++
-			return nil
+			return finishDisposition(current)
 		}
 		content, err := os.ReadFile(p)
 		if err != nil {
-			return nil
+			if hardErr := ctx.Context().Err(); hardErr != nil {
+				return hardErr
+			}
+			failed++
+			return finishDisposition(current)
 		}
 		if len(content) == 0 || isBinaryContent(content) {
 			skipped++
-			return nil
+			return finishDisposition(current)
 		}
 
-		seen[p] = struct{}{}
 		hash := hashContent(content)
 
-		prev, wasIndexed, herr := store.FileHash(p)
+		prev, wasIndexed, herr := store.FileHashContext(ctx.Context(), p)
 		if herr != nil {
 			return fmt.Errorf("read prior hash for %s: %w", p, herr)
 		}
+		if hardErr := ctx.Context().Err(); hardErr != nil {
+			return hardErr
+		}
 		if wasIndexed && prev == hash {
 			skipped++
-			return nil // unchanged
+			return finishDisposition(current)
 		}
 
 		chunks := chunkText(string(content))
 		if len(chunks) == 0 {
 			skipped++
-			return nil
+			return finishDisposition(current)
 		}
 		vecs, err := embedTexts(ctx.Context(), embedOp, model, chunks)
 		if err != nil {
-			// A graceful cancel can land mid-embed (local Ctrl-C, where the soft
-			// signal and the hard ctx share a source): stop gracefully and keep
-			// the files committed so far rather than reporting a fatal error.
-			if ctx.CancelRequestedNow() {
-				cancelled = true
-				return filepath.SkipAll
-			}
 			if ctxErr := ctx.Context().Err(); ctxErr != nil {
 				return fmt.Errorf("embed %s: %w", p, ctxErr)
 			}
@@ -228,11 +250,8 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			}
 			failed++
 			ctx.Log("error", "     - [Job %s] Failed to embed %s (%s); continuing", job.ID, p, teiFailureCategory(err))
-			return nil
+			return finishDisposition(current)
 		}
-		// No cooperative-cancel check between a successful embed and its upsert:
-		// the current file must COMMIT once embedded (the C1 guarantee). A hard
-		// ctx cancellation here is still fatal before the write (unchanged).
 		if err := ctx.Context().Err(); err != nil {
 			return fmt.Errorf("embed %s: %w", p, err)
 		}
@@ -243,25 +262,30 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		if len(vecs) > 0 {
 			dim = len(vecs[0])
 		}
-		if err := store.UpsertFile(p, hash, info.ModTime().Unix(), info.Size(), model, dim, idxChunks); err != nil {
+		stage = ProgressStageUpsert
+		emitProgress(current, false, false)
+		if err := store.UpsertFileContext(ctx.Context(), p, hash, info.ModTime().Unix(), info.Size(), model, dim, idxChunks); err != nil {
+			return fmt.Errorf("upsert %s: %w", p, err)
+		}
+		if h.afterUpsert != nil {
+			h.afterUpsert()
+		}
+		if err := ctx.Context().Err(); err != nil {
 			return fmt.Errorf("upsert %s: %w", p, err)
 		}
 		indexed++
 		embedded += len(chunks)
 		chunksUpserted += len(idxChunks)
-		return nil
+		return finishDisposition(current)
 	})
 	if walkErr != nil {
 		return nil, fmt.Errorf("index walk failed: %w", walkErr)
 	}
-	// A non-cancelled walk must not have been interrupted by a hard ctx cancel.
-	// On a cooperative cancel we skip this so the partial result is returned
-	// rather than a fatal error (even when the local Ctrl-C path also cancelled
-	// the hard ctx).
-	if !cancelled {
-		if err := ctx.Context().Err(); err != nil {
-			return nil, fmt.Errorf("index walk cancelled: %w", err)
-		}
+	if err := ctx.Context().Err(); err != nil {
+		return nil, fmt.Errorf("index walk cancelled: %w", err)
+	}
+	if !cancelled && ctx.CancelRequestedNow() {
+		cancelled = true
 	}
 
 	// Prune entries whose files vanished from disk under the indexed root. Only
@@ -271,7 +295,9 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	// via the content-hash skip.
 	removed := 0
 	if !cancelled && prune {
-		known, err := store.IndexedPaths()
+		stage = ProgressStagePrune
+		emitProgress("", false, false)
+		known, err := store.IndexedPathsContext(ctx.Context())
 		if err != nil {
 			return nil, fmt.Errorf("list indexed paths: %w", err)
 		}
@@ -286,16 +312,15 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			if _, present := seen[known_path]; present {
 				continue
 			}
-			if err := store.DeleteFile(known_path); err != nil {
+			if err := store.DeleteFileContext(ctx.Context(), known_path); err != nil {
 				return nil, fmt.Errorf("prune %s: %w", known_path, err)
 			}
 			removed++
+			emitProgress(filepath.Base(known_path), false, false)
 		}
 	}
-	if !cancelled {
-		if err := ctx.Context().Err(); err != nil {
-			return nil, fmt.Errorf("index operation cancelled: %w", err)
-		}
+	if err := ctx.Context().Err(); err != nil {
+		return nil, fmt.Errorf("index operation cancelled: %w", err)
 	}
 
 	status := "completed"
@@ -304,10 +329,15 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		status = "cancelled"
 		checkpoint = "partial"
 	}
-	emitProgress("", true)
+	if cancelled {
+		emitProgress("", false, true)
+	} else {
+		total = done
+		emitProgress("", true, false)
+	}
 
 	out := map[string]any{
-		"files_seen":      processed,
+		"files_seen":      filesSeen,
 		"files_indexed":   indexed,
 		"files_skipped":   skipped,
 		"files_failed":    failed,
@@ -321,11 +351,6 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	}
 	return json.Marshal(out)
 }
-
-// indexStageWalk is the progress stage label for the file walk. C1 has a single
-// walk-and-embed stage; the design's plan/extract/embed/upsert stages arrive
-// with later slices.
-const indexStageWalk = "index"
 
 // countIndexCandidates walks root and counts files matching filePattern (and not
 // under a skipped noise directory) WITHOUT reading them, so FILE_INDEX progress
@@ -341,7 +366,7 @@ func countIndexCandidates(root, filePattern string, ctx JobContext) int {
 			}
 			return nil
 		}
-		if ctx.CancelRequestedNow() || ctx.Context().Err() != nil {
+		if ctx.Context().Err() != nil || ctx.CancelRequestedNow() {
 			return filepath.SkipAll
 		}
 		if d.IsDir() {

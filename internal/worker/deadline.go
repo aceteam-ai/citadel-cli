@@ -488,16 +488,6 @@ type deadlineExceededError struct {
 // while node teardown was still failed or in flight. Package-var for tests.
 var huddleCancellationDrainTimeout = 35 * time.Second
 
-// heavyDeadlineDrainTimeout bounds how long executeWithDeadline waits, after a
-// heavy-lane job's (FILE_INDEX) deadline fires, for the handler goroutine to
-// observe the cancelled context, finish its in-flight upsert, and close the
-// index DB. Without this wait the heavy lane's exec-1 slot would be released to
-// the next FILE_INDEX while an orphaned writer was still mid-upsert on the same
-// DB — breaking the single-writer property exactly on deadline (aceteam#10876 C1
-// acceptance 2). The deadline is still terminal (Fail/DLQ); any partial result
-// the handler returns during the drain is discarded. Package-var for tests.
-var heavyDeadlineDrainTimeout = 5 * time.Second
-
 func (e *deadlineExceededError) Error() string {
 	return fmt.Sprintf(
 		"job exceeded its execution deadline of %s and was abandoned by the worker",
@@ -506,13 +496,15 @@ func (e *deadlineExceededError) Error() string {
 }
 
 // executeWithDeadline runs handler.Execute under a child context bounded by
-// timeout, but never blocks the job loop past that deadline (aceteam#6000).
+// timeout (aceteam#6000).
 //
 // The handler runs in its own goroutine. If it honors context cancellation
 // (e.g. SHELL_COMMAND via exec.CommandContext) the underlying child process is
 // terminated; if it ignores cancellation the goroutine keeps running in the
-// background while this function returns and the loop advances. Either way one
-// wedged handler can no longer stall every subsequent job on the node.
+// background while this function returns and the loop advances. Heavy-lane
+// handlers are the deliberate exception: they retain their single-writer lane
+// until actual goroutine exit, so an uncooperative FILE_INDEX fails closed by
+// halting only the heavy lane instead of overlapping another index writer.
 //
 // On timeout it returns a *deadlineExceededError; the caller's existing failure
 // path publishes the terminal error event and Nacks on the LIVE parent context
@@ -542,31 +534,25 @@ func (r *Runner) executeWithDeadline(
 
 	select {
 	case hr := <-done:
-		// If the handler returned an error exactly as the deadline elapsed (e.g.
-		// exec.CommandContext killed the child, yielding "signal: killed"),
-		// prefer the clear deadline message over the incidental one.
-		if hr.err != nil && errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return nil, &deadlineExceededError{timeout: timeout}
+		// Hard cancellation always wins a race with a handler result. In
+		// particular, a cooperative partial result must never mask shutdown.
+		if hardErr := execCtx.Err(); hardErr != nil {
+			if errors.Is(hardErr, context.DeadlineExceeded) {
+				return nil, &deadlineExceededError{timeout: timeout}
+			}
+			return nil, hardErr
 		}
 		return hr.result, hr.err
 	case <-execCtx.Done():
+		if needsHeavyLane(job.Type) {
+			// A heavy handler owns the single dispatched-writer slot until its
+			// goroutine really exits. An uncooperative handler intentionally holds
+			// this call (and runner shutdown) fail-closed rather than overlapping
+			// a second writer after an arbitrary escape timer.
+			<-done
+		}
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			r.log("error", "Job %s abandoned: exceeded execution deadline of %s", job.ID, timeout)
-			if needsHeavyLane(job.Type) {
-				// A heavy-lane job (FILE_INDEX) writes the single-writer index DB.
-				// Wait (bounded) for the handler goroutine to observe the cancelled
-				// ctx, finish its in-flight upsert, and close the store, so the heavy
-				// lane's exec slot is not released to the next index while an orphan
-				// is still writing the same DB (aceteam#10876 C1 acceptance 2). The
-				// deadline stays terminal; the drained result is discarded.
-				timer := time.NewTimer(heavyDeadlineDrainTimeout)
-				defer timer.Stop()
-				select {
-				case <-done:
-				case <-timer.C:
-					r.log("warning", "Job %s heavy-lane deadline drain timed out after %s; writer may still be unwinding", job.ID, heavyDeadlineDrainTimeout)
-				}
-			}
 			return nil, &deadlineExceededError{timeout: timeout}
 		}
 		if job.Type == JobTypeHuddleJoin {

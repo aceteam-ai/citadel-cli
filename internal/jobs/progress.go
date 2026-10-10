@@ -1,7 +1,13 @@
 // internal/jobs/progress.go
 package jobs
 
-import "time"
+import (
+	"path/filepath"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+)
 
 // Progress throttle defaults (aceteam#10876 C1, design 2a.3): emit at most one
 // update per 2 seconds OR per 1 percent of advance, whichever comes first. The
@@ -30,26 +36,40 @@ func NewThrottledProgress(emit func(map[string]any), now func() time.Time) func(
 	}
 	start := now()
 	var (
-		haveEmitted bool
-		lastEmit    time.Time
-		lastPercent = -1
-		lastStage   string
+		haveEmitted   bool
+		lastEmit      time.Time
+		lastPercent   = -1
+		lastStage     ProgressStage
+		evolvingTotal int
 	)
 	return func(ev ProgressEvent) {
 		t := now()
+		minimumTotal := ev.Done + ev.InFlight
+		if ev.Total > minimumTotal {
+			minimumTotal = ev.Total
+		}
+		if minimumTotal > evolvingTotal {
+			evolvingTotal = minimumTotal
+		}
+		projectedTotal := evolvingTotal
+		if ev.Final {
+			projectedTotal = ev.Done
+		}
 		percent := -1
-		if ev.Total > 0 {
-			percent = ev.Done * 100 / ev.Total
-			if percent > 100 {
+		if projectedTotal > 0 {
+			percent = ev.Done * 100 / projectedTotal
+			if ev.Final {
 				percent = 100
+			} else if percent >= 100 {
+				percent = 99
 			}
 		}
 		pass := false
 		switch {
 		case !haveEmitted:
 			pass = true // always emit the first update
-		case ev.Final:
-			pass = true // always emit the terminal snapshot
+		case ev.Final || ev.Flush:
+			pass = true // always emit completion or requested partial snapshot
 		case ev.Stage != lastStage:
 			pass = true // a stage change is always worth surfacing
 		case percent >= 0 && lastPercent >= 0 && percent-lastPercent >= defaultProgressMinPercentDelta:
@@ -68,11 +88,11 @@ func NewThrottledProgress(emit func(map[string]any), now func() time.Time) func(
 		}
 
 		m := map[string]any{
-			"stage":   ev.Stage,
+			"stage":   string(ev.Stage),
 			"done":    ev.Done,
-			"total":   ev.Total,
+			"total":   projectedTotal,
 			"unit":    ev.Unit,
-			"current": ev.Current,
+			"current": sanitizeProgressCurrent(ev.Current),
 		}
 		if percent >= 0 {
 			m["percent"] = percent
@@ -80,8 +100,8 @@ func NewThrottledProgress(emit func(map[string]any), now func() time.Time) func(
 		if elapsed := t.Sub(start).Seconds(); elapsed > 0 {
 			rate := float64(ev.Done) / elapsed
 			m["rate"] = rate
-			if rate > 0 && ev.Total > ev.Done {
-				m["eta_seconds"] = int(float64(ev.Total-ev.Done) / rate)
+			if rate > 0 && projectedTotal > ev.Done {
+				m["eta_seconds"] = int(float64(projectedTotal-ev.Done) / rate)
 			}
 		}
 		if len(ev.Counts) > 0 {
@@ -93,4 +113,35 @@ func NewThrottledProgress(emit func(map[string]any), now func() time.Time) func(
 		}
 		emit(m)
 	}
+}
+
+const maxProgressCurrentBytes = 128
+
+// sanitizeProgressCurrent projects an untrusted path/name into bounded display
+// metadata. It intentionally does not claim to redact human-readable secrets.
+func sanitizeProgressCurrent(value string) string {
+	if value == "" {
+		return "_"
+	}
+	value = filepath.Base(value)
+	var b strings.Builder
+	for len(value) > 0 && b.Len() < maxProgressCurrentBytes {
+		r, size := utf8.DecodeRuneInString(value)
+		value = value[size:]
+		if r == utf8.RuneError && size == 1 {
+			r = '_'
+		}
+		if unicode.IsControl(r) || r == '/' || r == '\\' {
+			r = '_'
+		}
+		need := utf8.RuneLen(r)
+		if need < 0 || b.Len()+need > maxProgressCurrentBytes {
+			break
+		}
+		b.WriteRune(r)
+	}
+	if b.Len() == 0 {
+		return "_"
+	}
+	return b.String()
 }

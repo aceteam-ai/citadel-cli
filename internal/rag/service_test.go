@@ -3,12 +3,18 @@ package rag
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/nodeindex"
 )
 
 // fakeTEI stands in for the node's local TEI embedding service. It returns
@@ -51,6 +57,88 @@ func fakeTEI(t *testing.T) *httptest.Server {
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+func TestServiceIndexPreservesCallerHardCancellation(t *testing.T) {
+	svc, ws := newTestService(t)
+	writeFile(t, ws, "a.md", "content")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res, err := svc.IndexCooperatively(ctx, ws, "", func() bool { return true })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context.Canceled", err)
+	}
+	if res.Status == "cancelled" {
+		t.Fatalf("hard cancellation was weakened into cooperative result: %+v", res)
+	}
+}
+
+func TestServiceIndexCooperativelyCommitsCurrentFile(t *testing.T) {
+	svc, ws := newTestService(t)
+	writeFile(t, ws, "a.md", "first")
+	writeFile(t, ws, "b.md", "second")
+	var stop atomic.Bool
+	svc.SetProgressSink(func(m map[string]any) {
+		if m["stage"] == "upsert" {
+			stop.Store(true)
+		}
+	})
+	res, err := svc.IndexCooperatively(context.Background(), ws, "", stop.Load)
+	if err != nil {
+		t.Fatalf("IndexCooperatively: %v", err)
+	}
+	if res.Status != "cancelled" || res.Checkpoint != "partial" || res.FilesIndexed != 1 {
+		t.Fatalf("result=%+v, want one committed file and cancelled/partial", res)
+	}
+}
+
+func TestServiceIndexInflightParentCancellationIsFatal(t *testing.T) {
+	started := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"max_client_batch_size":32}`)) })
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		close(started)
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("CITADEL_TEI_URL", srv.URL)
+	t.Setenv("CITADEL_INDEX_DB", filepath.Join(t.TempDir(), "index.db"))
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	ws := t.TempDir()
+	writeFile(t, ws, "a.md", "content")
+	svc := New(ws, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.Index(ctx, ws, "")
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("embedding request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error=%v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Index did not propagate in-flight parent cancellation")
+	}
+	store, err := nodeindex.Open(svc.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, indexed, err := store.FileHash(filepath.Join(ws, "a.md")); err != nil || indexed {
+		t.Fatalf("row indexed/error=%v/%v, want false/nil", indexed, err)
+	}
 }
 
 // newTestService points a Service at a temp workspace + temp db, with TEI mocked.

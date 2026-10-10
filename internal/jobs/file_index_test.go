@@ -613,6 +613,7 @@ func (b *cancelOnEOFBody) Close() error { return nil }
 func TestFileIndexCancellationAfterFinalEmbedIsFatalBeforePrune(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var soft atomic.Bool
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		var body io.ReadCloser = io.NopCloser(strings.NewReader(""))
 		switch req.URL.Path {
@@ -621,7 +622,10 @@ func TestFileIndexCancellationAfterFinalEmbedIsFatalBeforePrune(t *testing.T) {
 		case "/v1/embeddings":
 			body = &cancelOnEOFBody{
 				Reader: strings.NewReader(`{"data":[{"index":0,"embedding":[1]}],"model":"gte"}`),
-				cancel: cancel,
+				cancel: func() {
+					soft.Store(true)
+					cancel()
+				},
 			}
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: req}, nil
@@ -650,7 +654,7 @@ func TestFileIndexCancellationAfterFinalEmbedIsFatalBeforePrune(t *testing.T) {
 
 	h := NewFileIndexHandler(ws, dbPath)
 	h.embeddingOp = op
-	_, err = h.Execute(JobContext{Ctx: ctx}, &nexus.Job{ID: "cancel-after-embed", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
+	_, err = h.Execute(JobContext{Ctx: ctx, CancelRequested: soft.Load}, &nexus.Job{ID: "cancel-after-embed", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled rather than success", err)
 	}
@@ -668,6 +672,66 @@ func TestFileIndexCancellationAfterFinalEmbedIsFatalBeforePrune(t *testing.T) {
 	files, chunks, err := store.Stats()
 	if err != nil || files != 1 || chunks != 1 {
 		t.Fatalf("files/chunks/error after cancellation = %d/%d/%v, want prior 1/1 only", files, chunks, err)
+	}
+}
+
+func TestFileIndexHardCancellationBeatsSoftOnEmbeddingFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var soft atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"max_client_batch_size":32}`)) })
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, _ *http.Request) {
+		soft.Store(true)
+		cancel()
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("CITADEL_TEI_URL", srv.URL)
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	ws := t.TempDir()
+	path := filepath.Join(ws, "a.md")
+	if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	_, err := NewFileIndexHandler(ws, dbPath).Execute(
+		JobContext{Ctx: ctx, CancelRequested: soft.Load},
+		&nexus.Job{ID: "hard-on-embed-failure", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want fatal context.Canceled rather than soft partial", err)
+	}
+	store, openErr := nodeindex.Open(dbPath)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer store.Close()
+	if _, indexed, hashErr := store.FileHash(path); hashErr != nil || indexed {
+		t.Fatalf("failed/cancelled row indexed/error=%v/%v, want false/nil", indexed, hashErr)
+	}
+}
+
+func TestFileIndexHardCancellationBeatsSoftBeforePrune(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var checks atomic.Int64
+	soft := func() bool {
+		if checks.Add(1) == 3 {
+			cancel()
+			return true
+		}
+		return false
+	}
+	ws := t.TempDir()
+	_, err := NewFileIndexHandler(ws, filepath.Join(t.TempDir(), "index.db")).Execute(
+		JobContext{Ctx: ctx, CancelRequested: soft},
+		&nexus.Job{ID: "hard-before-prune", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want fatal context.Canceled rather than soft partial", err)
 	}
 }
 
@@ -833,6 +897,14 @@ func TestFileIndexEmitsProgress(t *testing.T) {
 	}
 	sawCurrent := false
 	for _, ev := range events {
+		switch ev.Stage {
+		case ProgressStagePlan, ProgressStageEmbed, ProgressStageUpsert, ProgressStagePrune:
+		default:
+			t.Errorf("FILE_INDEX progress stage = %q, want plan/embed/upsert/prune", ev.Stage)
+		}
+		if ev.Stage == ProgressStage("index") {
+			t.Errorf("progress used retired index stage: %+v", ev)
+		}
 		if ev.Unit != "files" {
 			t.Errorf("progress unit = %q, want files", ev.Unit)
 		}
@@ -845,6 +917,291 @@ func TestFileIndexEmitsProgress(t *testing.T) {
 	}
 	if !sawCurrent {
 		t.Error("expected at least one progress event naming the current basename")
+	}
+}
+
+func TestFileIndexProgressAdvancesOnlyAfterDisposition(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var requests atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"max_client_batch_size":32}`)) })
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		call := requests.Add(1)
+		if call == 1 {
+			close(started)
+			<-release
+		}
+		for _, input := range req.Input {
+			if strings.Contains(input, "embedding fails") {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+		data := make([]map[string]any, len(req.Input))
+		for i := range data {
+			data[i] = map[string]any{"index": i, "embedding": []float64{1, 0}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "model": "gte"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	defer releaseOnce.Do(func() { close(release) })
+	t.Setenv("CITADEL_TEI_URL", srv.URL)
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+
+	ws := t.TempDir()
+	for name, body := range map[string]string{
+		"00-committed.md": "committed content",
+		"01-skipped.md":   "",
+		"02-failed.md":    "embedding fails",
+	} {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var progressMu sync.Mutex
+	var events []map[string]any
+	progress := NewThrottledProgress(func(event map[string]any) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		events = append(events, event)
+	}, func() time.Time { return time.Unix(0, 0) })
+	type executeResult struct {
+		out []byte
+		err error
+	}
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	resultCh := make(chan executeResult, 1)
+	go func() {
+		out, err := NewFileIndexHandler(ws, dbPath).Execute(
+			JobContext{Progress: progress},
+			&nexus.Job{ID: "disposition-progress", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}},
+		)
+		resultCh <- executeResult{out: out, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first embedding request did not start")
+	}
+	progressMu.Lock()
+	activeEvents := append([]map[string]any(nil), events...)
+	progressMu.Unlock()
+	if len(activeEvents) == 0 {
+		t.Fatal("expected active progress before first disposition")
+	}
+	for _, event := range activeEvents {
+		if done, _ := event["done"].(int); done != 0 {
+			t.Fatalf("progress advanced before first disposition: %v", activeEvents)
+		}
+		if percent, ok := event["percent"].(int); ok && percent >= 100 {
+			t.Fatalf("active progress reported %d%% before disposition: %v", percent, activeEvents)
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	var result executeResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("index did not finish after release")
+	}
+	if result.err != nil {
+		t.Fatalf("Execute: %v", result.err)
+	}
+	var payload struct {
+		FilesIndexed int `json:"files_indexed"`
+		FilesSkipped int `json:"files_skipped"`
+		FilesFailed  int `json:"files_failed"`
+	}
+	if err := json.Unmarshal(result.out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.FilesIndexed != 1 || payload.FilesSkipped != 1 || payload.FilesFailed != 1 {
+		t.Fatalf("dispositions=%+v, want one committed, skipped, and failed", payload)
+	}
+	progressMu.Lock()
+	finalEvents := append([]map[string]any(nil), events...)
+	progressMu.Unlock()
+	last := finalEvents[len(finalEvents)-1]
+	if last["done"] != 3 || last["total"] != 3 || last["percent"] != 100 {
+		t.Fatalf("final progress=%v, want done=total=3 percent=100", last)
+	}
+}
+
+func TestFileIndexHardCancellationBeatsSoftAtInitialBoundary(t *testing.T) {
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "a.md"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hard, cancel := context.WithCancel(context.Background())
+	cancel()
+	h := NewFileIndexHandler(ws, filepath.Join(t.TempDir(), "index.db"))
+	_, err := h.Execute(JobContext{Ctx: hard, CancelRequested: func() bool { return true }}, &nexus.Job{
+		ID: "hard-before-soft", Type: "FILE_INDEX", Payload: map[string]string{"path": ws},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want hard context.Canceled rather than partial cancellation", err)
+	}
+}
+
+func TestFileIndexHardCancellationAfterCommittedUpsertIsFatal(t *testing.T) {
+	tei := fakeTEI(t)
+	t.Setenv("CITADEL_TEI_URL", tei.URL)
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	ws := t.TempDir()
+	path := filepath.Join(ws, "a.md")
+	if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hard, cancel := context.WithCancel(context.Background())
+	h := NewFileIndexHandler(ws, filepath.Join(t.TempDir(), "index.db"))
+	var soft atomic.Bool
+	h.afterUpsert = func() { soft.Store(true); cancel() }
+	_, err := h.Execute(JobContext{Ctx: hard, CancelRequested: soft.Load}, &nexus.Job{
+		ID: "post-upsert-hard", Type: "FILE_INDEX", Payload: map[string]string{"path": ws},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want fatal context.Canceled", err)
+	}
+	store, openErr := nodeindex.Open(h.DBPath)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer store.Close()
+	if _, indexed, hashErr := store.FileHash(path); hashErr != nil || !indexed {
+		t.Fatalf("committed row indexed/error=%v/%v, want true/nil", indexed, hashErr)
+	}
+}
+
+func TestFileIndexSoftCancelAfterFailedCurrentFileCountsFailure(t *testing.T) {
+	var requests atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"max_client_batch_size":32}`)) })
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("CITADEL_TEI_URL", srv.URL)
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	ws := t.TempDir()
+	for _, name := range []string{"a.md", "b.md"} {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte("content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	h := NewFileIndexHandler(ws, dbPath)
+	out, err := h.Execute(JobContext{CancelRequested: func() bool { return requests.Load() >= 1 }}, &nexus.Job{
+		ID: "failed-soft", Type: "FILE_INDEX", Payload: map[string]string{"path": ws},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var res struct {
+		Seen, Failed int
+		Status       string
+		Checkpoint   string
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(out, &raw); err != nil {
+		t.Fatal(err)
+	}
+	res.Seen = int(raw["files_seen"].(float64))
+	res.Failed = int(raw["files_failed"].(float64))
+	res.Status, _ = raw["status"].(string)
+	res.Checkpoint, _ = raw["checkpoint"].(string)
+	if res.Seen != 1 || res.Failed != 1 || res.Status != "cancelled" || res.Checkpoint != "partial" {
+		t.Fatalf("result=%s, want seen=1 failed=1 cancelled/partial", out)
+	}
+	store, err := nodeindex.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, name := range []string{"a.md", "b.md"} {
+		if _, indexed, err := store.FileHash(filepath.Join(ws, name)); err != nil || indexed {
+			t.Fatalf("%s indexed/error=%v/%v, want false/nil", name, indexed, err)
+		}
+	}
+}
+
+func TestFileIndexDynamicCandidateGrowsProgressDenominator(t *testing.T) {
+	ws := t.TempDir()
+	laterDir := filepath.Join(ws, "z-later")
+	if err := os.Mkdir(laterDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "a.md"), []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"max_client_batch_size":32}`)) })
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() {
+			if err := os.WriteFile(filepath.Join(laterDir, "b.md"), []byte("second"), 0o644); err != nil {
+				t.Errorf("write late candidate: %v", err)
+			}
+		})
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		data := make([]map[string]any, len(req.Input))
+		for i := range data {
+			data[i] = map[string]any{"index": i, "embedding": []float64{1, 0}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "model": "gte"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("CITADEL_TEI_URL", srv.URL)
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	var projected []map[string]any
+	progress := NewThrottledProgress(func(m map[string]any) { projected = append(projected, m) }, func() time.Time { return time.Unix(0, 0) })
+	h := NewFileIndexHandler(ws, filepath.Join(t.TempDir(), "index.db"))
+	out, err := h.Execute(JobContext{Progress: progress}, &nexus.Job{ID: "dynamic", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(string(out), `"files_seen":2`) {
+		t.Fatalf("result=%s, want late candidate visited", out)
+	}
+	sawGrown := false
+	for i, ev := range projected {
+		if total, _ := ev["total"].(int); i < len(projected)-1 && total >= 2 {
+			sawGrown = true
+		}
+		if i < len(projected)-1 {
+			if percent, ok := ev["percent"].(int); ok && percent >= 100 {
+				t.Fatalf("non-final event reported %d%%: %v", percent, ev)
+			}
+		}
+	}
+	if !sawGrown {
+		t.Fatalf("progress denominator never grew for late candidate: %v", projected)
+	}
+	last := projected[len(projected)-1]
+	if last["total"] != 2 || last["percent"] != 100 {
+		t.Fatalf("final progress=%v, want total=2 percent=100", last)
 	}
 }
 
