@@ -88,6 +88,45 @@ func ManagedVLLMContainerRunning() bool {
 	return runningEmbeddedServices(containerRuntimeBin())["vllm"]
 }
 
+// teiContainerImageFn returns the resolved image reference of the running
+// citadel-tei container. Package var seam (like runningContainerNames) so status
+// tests never shell out to a container runtime. It takes no arguments so a stub
+// fully neutralizes the inspect (including the runtime detection).
+var teiContainerImageFn = inspectTEIContainerImage
+
+// inspectTEIContainerImage returns the .Config.Image of the running citadel-tei
+// container (which docker/podman store with the compose ${...} already resolved
+// to a concrete tag), or "" when it cannot be read.
+func inspectTEIContainerImage() string {
+	out, err := exec.Command(containerRuntimeBin(), "inspect", "--format", "{{.Config.Image}}", citadelContainerPrefix+services.TEIServiceName).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// annotateTEIBuild sets ImageTag/Device on a running tei ServiceInfo by parsing
+// the resolved image of the running citadel-tei container
+// (aceteam-ai/citadel-cli#1269). No-op for a non-tei or non-running entry, or
+// when the image cannot be read / parsed, so the pre-#1269 heartbeat shape is
+// preserved whenever the build cannot be determined. The inspect (and the
+// runtime detection it needs) only runs when a running tei entry is present.
+func annotateTEIBuild(svcs []ServiceInfo) {
+	for i := range svcs {
+		if svcs[i].Name != services.TEIServiceName || svcs[i].Status != ServiceStatusRunning {
+			continue
+		}
+		img := teiContainerImageFn()
+		if img == "" {
+			continue
+		}
+		if tag, device := services.ParseTEIServingImage(img); tag != "" {
+			svcs[i].ImageTag = tag
+			svcs[i].Device = device
+		}
+	}
+}
+
 // containerRuntimeBin resolves the container runtime binary once per collection,
 // mirroring the start path (cmd/service.go). GPU/inference containers are the
 // ones most likely to run under the hardened podman runtime (#348); a

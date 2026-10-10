@@ -615,6 +615,16 @@ type ServiceInfo struct {
 	// unpersisted log mirroring request_recorder.go's requestLog.
 	ModelLicense string `json:"model_license,omitempty"`
 
+	// ImageTag and Device report which build of a serving engine is actually
+	// running and on what compute device, read from the running container's
+	// resolved image (aceteam-ai/citadel-cli#1269 for TEI: ImageTag "86-1.6" /
+	// Device "cuda" on a GPU node, "cpu-1.6" / "cpu" on a CPU node). This answers
+	// "is this node embedding on the GPU?" without shell access. Additive and
+	// omitempty: absent when the producer did not resolve them (the pre-#1269
+	// heartbeat shape byte-for-byte). Device is "cpu" or "cuda".
+	ImageTag string `json:"image_tag,omitempty"`
+	Device   string `json:"device,omitempty"`
+
 	// Idle usage signal for running LLM services. Populated only when the
 	// service is a running inference engine whose metrics endpoint could be
 	// scraped; omitted otherwise. Promotes idle/idle_seconds/last_request_at

@@ -80,6 +80,13 @@ type manifestService struct {
 	// See
 	// services/ollama_policy.go.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// Threads mirrors cmd/manifest.go Service.Threads: the aceteam-ai/citadel-cli#1269
+	// per-service CPU thread opt-in for the tei embedding service, injected as
+	// CITADEL_TEI_NUM_THREADS at `docker compose up` via services.TEIComposeEnv. A
+	// *int so nil (unset => compose default 1) is distinguishable from an explicit
+	// 0 (auto = cores minus headroom). Modeled here for the same #528/#850
+	// field-drop reason as Bind/OllamaMaxLoadedModels above.
+	Threads *int `yaml:"threads,omitempty"`
 }
 
 // ServiceHandler manages start/stop/status of services declared in the node's
@@ -640,7 +647,7 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 			// ollama_max_loaded_models:) so the compose substitution/passthrough
 			// resolve. An invalid value fails the start loudly rather than
 			// silently falling through to the compose/engine default.
-			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels); bindErr != nil {
+			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels, svc.Threads); bindErr != nil {
 				err = fmt.Errorf("docker compose up failed: %s", bindErr)
 			} else {
 				cmd.Env = env
@@ -2256,7 +2263,7 @@ func (h *ServiceHandler) composeEnv() []string {
 // cannot become policy while Ollama retains automatic concurrency. An invalid
 // bind or negative policy value is a hard error the caller surfaces as a start
 // failure. The policy entry is the final, sole copy of its key.
-func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int) ([]string, error) {
+func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int, threads *int) ([]string, error) {
 	entry, inject, err := embeddedservices.BindEnv(serviceName, bind)
 	if err != nil {
 		return nil, err
@@ -2265,7 +2272,13 @@ func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, olla
 	if inject {
 		env = append(env, entry)
 	}
-	return embeddedservices.OllamaMaxLoadedModelsComposeEnv(env, serviceName, ollamaMaxLoaded)
+	env, err = embeddedservices.OllamaMaxLoadedModelsComposeEnv(env, serviceName, ollamaMaxLoaded)
+	if err != nil {
+		return nil, err
+	}
+	// aceteam-ai/citadel-cli#1269: GPU-aware tei image tag / CPU thread opt-in.
+	// nil for every non-tei service, so this is a no-op elsewhere.
+	return append(env, teiComposeEnvEntries(serviceName, threads)...), nil
 }
 
 // bindExposureWarning returns a warning line when an embedded engine will be

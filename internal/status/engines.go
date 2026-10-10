@@ -229,7 +229,11 @@ func (c *Collector) collectEmbeddingServiceStatus(running map[string]bool) []Ser
 		lister = c.modelDiscovery
 	}
 	portIfRunning := func(name string) (int, bool) { return enginePortIfRunning(running, name) }
-	return collectEmbeddingServices(context.Background(), portIfRunning, embeddingServiceHealthy, lister)
+	out := collectEmbeddingServices(context.Background(), portIfRunning, embeddingServiceHealthy, lister)
+	// aceteam-ai/citadel-cli#1269: report which TEI build (image tag) and device
+	// (cpu/cuda) is actually serving, read from the running container's image.
+	annotateTEIBuild(out)
+	return out
 }
 
 // embeddingModelLister is the slice of ModelDiscovery collectEmbeddingServices
