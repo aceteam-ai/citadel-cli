@@ -1,6 +1,9 @@
 package rag
 
 import (
+	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -29,6 +32,26 @@ func TestWatcherIgnoresIndexDBEvents(t *testing.T) {
 	// A normal file under a root must NOT be ignored.
 	if _, ok := w.dbPaths[filepath.Join(t.TempDir(), "notes.md")]; ok {
 		t.Error("a regular file must not be in the ignore set")
+	}
+}
+
+func TestWatcherServicePreservesHardCancellation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.md"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CITADEL_INDEX_DB", filepath.Join(t.TempDir(), "index.db"))
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	w, err := NewWatcher([]string{root}, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = w.svc.Index(ctx, root, "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("watcher service error=%v, want context.Canceled", err)
 	}
 }
 
