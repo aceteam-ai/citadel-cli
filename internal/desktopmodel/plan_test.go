@@ -193,12 +193,21 @@ func TestAutomaticPlanRejectsActionableIneligiblePayload(t *testing.T) {
 		func(p *automaticPlan) { p.limits = policy.Limits },
 		func(p *automaticPlan) { p.deadlinesSeconds = policy.DeadlinesSeconds },
 		func(p *automaticPlan) { p.reason = "" },
+		func(p *automaticPlan) { p.reason = "unknown_reason" },
+		func(p *automaticPlan) { p.eligibility = "unknown_eligibility" },
+		func(p *automaticPlan) { *p = automaticPlan{} },
 	}
 	for i, mutate := range mutations {
 		candidate := p
 		mutate(&candidate)
 		if candidate.valid() {
 			t.Fatalf("mutation %d retained valid ineligible plan", i)
+		}
+		if b, err := candidate.canonical(); err != errPlan || b != nil {
+			t.Fatalf("mutation %d canonical = %q, %v", i, b, err)
+		}
+		if fingerprint, err := candidate.fingerprint(); err != errPlan || fingerprint != "" {
+			t.Fatalf("mutation %d fingerprint = %q, %v", i, fingerprint, err)
 		}
 	}
 }

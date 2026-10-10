@@ -2,6 +2,7 @@ package desktopmodel
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -57,10 +58,12 @@ func TestBootstrapPolicyRatifiedValuesAndUnits(t *testing.T) {
 }
 
 func TestBootstrapPolicyRejectsEveryMutation(t *testing.T) {
-	tests := []struct {
+	type mutationCase struct {
 		name   string
 		mutate func(*bootstrapPolicyManifest)
-	}{
+	}
+	tests := []mutationCase{
+		{"schema zero", func(p *bootstrapPolicyManifest) { p.SchemaVersion = 0 }},
 		{"schema", func(p *bootstrapPolicyManifest) { p.SchemaVersion = 2 }},
 		{"runtime version", func(p *bootstrapPolicyManifest) { p.Runtime.Version = "v0.35.2" }},
 		{"runtime url", func(p *bootstrapPolicyManifest) { p.Runtime.AssetURL += "?changed" }},
@@ -68,8 +71,11 @@ func TestBootstrapPolicyRejectsEveryMutation(t *testing.T) {
 		{"runtime digest", func(p *bootstrapPolicyManifest) { p.Runtime.SHA256 = strings.Repeat("0", 64) }},
 		{"runtime digest uppercase", func(p *bootstrapPolicyManifest) { p.Runtime.SHA256 = strings.ToUpper(p.Runtime.SHA256) }},
 		{"runtime digest short", func(p *bootstrapPolicyManifest) { p.Runtime.SHA256 = p.Runtime.SHA256[:63] }},
+		{"runtime digest nonhex", func(p *bootstrapPolicyManifest) { p.Runtime.SHA256 = strings.Repeat("g", 64) }},
 		{"runtime provenance", func(p *bootstrapPolicyManifest) { p.Runtime.SHA256Provenance = "downloaded" }},
 		{"model order", func(p *bootstrapPolicyManifest) { p.Models[0], p.Models[1] = p.Models[1], p.Models[0] }},
+		{"duplicate model", func(p *bootstrapPolicyManifest) { p.Models[2] = p.Models[1] }},
+		{"missing model", func(p *bootstrapPolicyManifest) { p.Models[1] = bootstrapModelPolicy{} }},
 		{"model id", func(p *bootstrapPolicyManifest) { p.Models[0].ID = "qwen3:2b" }},
 		{"model digest", func(p *bootstrapPolicyManifest) { p.Models[1].ManifestBodySHA256 = strings.Repeat("f", 64) }},
 		{"model digest uppercase", func(p *bootstrapPolicyManifest) {
@@ -77,6 +83,7 @@ func TestBootstrapPolicyRejectsEveryMutation(t *testing.T) {
 		}},
 		{"model provenance", func(p *bootstrapPolicyManifest) { p.Models[2].SHA256Provenance = "layer_hash" }},
 		{"model floor", func(p *bootstrapPolicyManifest) { p.Models[1].MinimumFreeDiskBytes = 8_000_000_000 }},
+		{"model floor overflow", func(p *bootstrapPolicyManifest) { p.Models[1].MinimumFreeDiskBytes = ^uint64(0) }},
 		{"1.7b automatic", func(p *bootstrapPolicyManifest) { p.Models[0].StartPolicy = "automatic" }},
 		{"4b disabled", func(p *bootstrapPolicyManifest) { p.Models[1].StartPolicy = "disabled" }},
 		{"8b disabled", func(p *bootstrapPolicyManifest) { p.Models[2].StartPolicy = "disabled" }},
@@ -87,6 +94,10 @@ func TestBootstrapPolicyRejectsEveryMutation(t *testing.T) {
 		}},
 		{"tier decimal minimum", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[0].MinimumMemoryBytes = 16_000_000_000 }},
 		{"tier gap", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[0].MaximumMemoryBytesExclusive-- }},
+		{"tier bounds reversed", func(p *bootstrapPolicyManifest) {
+			p.AutomaticTiers[0].MaximumMemoryBytesExclusive = p.AutomaticTiers[0].MinimumMemoryBytes - 1
+		}},
+		{"tier minimum overflow", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[0].MinimumMemoryBytes = ^uint64(0) }},
 		{"tier overlap", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[1].MinimumMemoryBytes-- }},
 		{"nonfinal open upper", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[0].MaximumMemoryBytesExclusive = 0 }},
 		{"final upper", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[1].MaximumMemoryBytesExclusive = ^uint64(0) }},
@@ -101,6 +112,26 @@ func TestBootstrapPolicyRejectsEveryMutation(t *testing.T) {
 		{"model evidence", func(p *bootstrapPolicyManifest) { p.EvidenceLimits.ModelLayers = "downloaded" }},
 		{"license evidence", func(p *bootstrapPolicyManifest) { p.EvidenceLimits.License = "accepted" }},
 		{"native evidence", func(p *bootstrapPolicyManifest) { p.EvidenceLimits.Native = "executed" }},
+	}
+	for i := range compiledBootstrapPolicy().Models {
+		index := i
+		prefix := "model " + strconv.Itoa(index) + " "
+		tests = append(tests,
+			mutationCase{prefix + "id", func(p *bootstrapPolicyManifest) { p.Models[index].ID += "changed" }},
+			mutationCase{prefix + "digest", func(p *bootstrapPolicyManifest) { p.Models[index].ManifestBodySHA256 = strings.Repeat("g", 64) }},
+			mutationCase{prefix + "provenance", func(p *bootstrapPolicyManifest) { p.Models[index].SHA256Provenance = "changed" }},
+			mutationCase{prefix + "floor", func(p *bootstrapPolicyManifest) { p.Models[index].MinimumFreeDiskBytes++ }},
+			mutationCase{prefix + "start policy", func(p *bootstrapPolicyManifest) { p.Models[index].StartPolicy = "changed" }},
+		)
+	}
+	for i := range compiledBootstrapPolicy().AutomaticTiers {
+		index := i
+		prefix := "tier " + strconv.Itoa(index) + " "
+		tests = append(tests,
+			mutationCase{prefix + "minimum", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[index].MinimumMemoryBytes++ }},
+			mutationCase{prefix + "maximum", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[index].MaximumMemoryBytesExclusive++ }},
+			mutationCase{prefix + "model", func(p *bootstrapPolicyManifest) { p.AutomaticTiers[index].ModelID += "changed" }},
+		)
 	}
 
 	for _, tt := range tests {
