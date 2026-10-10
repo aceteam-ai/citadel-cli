@@ -497,6 +497,14 @@ type ManifestService struct {
 	// so a field missing here is silently DROPPED on every APPLY_DEVICE_CONFIG --
 	// the policy would vanish on the next dashboard config save.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// Threads mirrors cmd/manifest.go Service.Threads: the aceteam-ai/citadel-cli#1269
+	// per-service CPU thread opt-in for the tei embedding service
+	// (CITADEL_TEI_NUM_THREADS). A *int so nil (unset) is distinguishable from an
+	// explicit 0 (auto). It MUST be modeled here for the same #528/#850 reason as
+	// Bind/OllamaMaxLoadedModels above: updateManifest round-trips the whole
+	// citadel.yaml through this struct, so a field missing here is silently
+	// DROPPED on every APPLY_DEVICE_CONFIG.
+	Threads *int `yaml:"threads,omitempty"`
 }
 
 // ManifestConfig represents additional configuration in the manifest.
@@ -674,6 +682,10 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// manifest simply falls through to loopback (aceteam-ai/citadel-cli#1060).
 		manifestPath := filepath.Join(configDir, "citadel.yaml")
 		env = append(env, bindEnvForService(svcName, manifestServiceBindFromFile(manifestPath, svcName))...)
+		// aceteam-ai/citadel-cli#1269: GPU-aware tei image tag (so this onboarding
+		// compose-up picks the same CUDA image serviceStart would, no recreate
+		// flip-flop) + the manifest `threads:` CPU opt-in. No-op for non-tei.
+		env = append(env, teiComposeEnvEntries(svcName, manifestServiceThreadsFromFile(manifestPath, svcName))...)
 		// PUID/PGID = this node process's uid/gid, so the meeting media stack runs
 		// as the node owner and writes node-owned files into bind-mounted dirs
 		// (see composeEnv in service_handler.go). Guarded so a non-POSIX host never

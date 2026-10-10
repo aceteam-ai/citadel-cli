@@ -138,3 +138,57 @@ func TestEnginePortIfRunning_UsesRunningSet(t *testing.T) {
 		t.Fatalf("port = %d, want %d", port, services.VLLMHostPort)
 	}
 }
+
+// TestAnnotateTEIBuild pins the aceteam-ai/citadel-cli#1269 reporting half: a
+// running tei entry is annotated with the ImageTag/Device read from its running
+// container's resolved image; everything else is left untouched. The inspect is
+// driven through the teiContainerImageFn seam so it never shells out.
+func TestAnnotateTEIBuild(t *testing.T) {
+	prev := teiContainerImageFn
+	t.Cleanup(func() { teiContainerImageFn = prev })
+
+	// GPU image on a running tei entry -> ImageTag + Device "cuda".
+	teiContainerImageFn = func() string {
+		return "ghcr.io/huggingface/text-embeddings-inference:86-1.6"
+	}
+	svcs := []ServiceInfo{{Name: services.TEIServiceName, Status: ServiceStatusRunning}}
+	annotateTEIBuild(svcs)
+	if svcs[0].ImageTag != "86-1.6" || svcs[0].Device != "cuda" {
+		t.Errorf("GPU tei: got (%q,%q), want (86-1.6,cuda)", svcs[0].ImageTag, svcs[0].Device)
+	}
+
+	// CPU image -> Device "cpu".
+	teiContainerImageFn = func() string {
+		return "ghcr.io/huggingface/text-embeddings-inference:cpu-1.6"
+	}
+	svcs = []ServiceInfo{{Name: services.TEIServiceName, Status: ServiceStatusRunning}}
+	annotateTEIBuild(svcs)
+	if svcs[0].ImageTag != "cpu-1.6" || svcs[0].Device != "cpu" {
+		t.Errorf("CPU tei: got (%q,%q), want (cpu-1.6,cpu)", svcs[0].ImageTag, svcs[0].Device)
+	}
+
+	// A non-running tei and a non-tei service are never inspected (the stub
+	// fails the test if called) and never annotated.
+	teiContainerImageFn = func() string {
+		t.Fatal("teiContainerImageFn must not be called for a non-running tei or a non-tei service")
+		return ""
+	}
+	for _, s := range []ServiceInfo{
+		{Name: services.TEIServiceName, Status: ServiceStatusStopped},
+		{Name: "vllm", Status: ServiceStatusRunning},
+	} {
+		svcs = []ServiceInfo{s}
+		annotateTEIBuild(svcs)
+		if svcs[0].ImageTag != "" || svcs[0].Device != "" {
+			t.Errorf("%s (%s) must not be annotated, got (%q,%q)", s.Name, s.Status, svcs[0].ImageTag, svcs[0].Device)
+		}
+	}
+
+	// An unreadable image leaves the fields empty (pre-#1269 heartbeat shape).
+	teiContainerImageFn = func() string { return "" }
+	svcs = []ServiceInfo{{Name: services.TEIServiceName, Status: ServiceStatusRunning}}
+	annotateTEIBuild(svcs)
+	if svcs[0].ImageTag != "" || svcs[0].Device != "" {
+		t.Errorf("unreadable image must leave fields empty, got (%q,%q)", svcs[0].ImageTag, svcs[0].Device)
+	}
+}

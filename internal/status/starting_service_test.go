@@ -89,6 +89,12 @@ func TestCollectEmbeddingServices_ReadyReportsModelAndOK(t *testing.T) {
 // The collector wrapper must thread the once-per-heartbeat running set into that
 // same decision, so the seam the tests above use is the one production runs.
 func TestCollectEmbeddingServiceStatus_UsesRunningSet(t *testing.T) {
+	// Neutralize the #1269 TEI image inspect so this test (about running-set
+	// threading, not build annotation) never shells out to a container runtime.
+	prevImg := teiContainerImageFn
+	teiContainerImageFn = func() string { return "" }
+	t.Cleanup(func() { teiContainerImageFn = prevImg })
+
 	c := &Collector{}
 
 	got := c.collectEmbeddingServiceStatus(map[string]bool{"tei": true})
@@ -98,6 +104,12 @@ func TestCollectEmbeddingServiceStatus_UsesRunningSet(t *testing.T) {
 	}
 	if got[0].Status != ServiceStatusRunning {
 		t.Errorf("status = %q, want %q", got[0].Status, ServiceStatusRunning)
+	}
+	// With the inspect stubbed to "", no build is annotated. This also makes the
+	// stub load-bearing: a regression that calls teiContainerImageFn with a real
+	// runtime would populate ImageTag and trip here.
+	if got[0].ImageTag != "" || got[0].Device != "" {
+		t.Errorf("stubbed inspect must leave build/device empty, got (%q,%q)", got[0].ImageTag, got[0].Device)
 	}
 	// Health is whichever branch the live /health probe took on this machine.
 	// Both are valid; what must never happen again is the entry being absent, or

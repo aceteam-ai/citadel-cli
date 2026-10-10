@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/rag"
+	svcports "github.com/aceteam-ai/citadel-cli/services"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
@@ -131,14 +134,41 @@ func runRAGQuery(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// ragStatusJSON wraps rag.Status with the serving TEI build/device
+// (aceteam-ai/citadel-cli#1269) for the --json output. rag.Status is embedded so
+// its fields stay at the top level (byte-compatible JSON when the TEI fields are
+// absent).
+type ragStatusJSON struct {
+	rag.Status
+	TEIBuild  string `json:"tei_build,omitempty"`
+	TEIDevice string `json:"tei_device,omitempty"`
+}
+
+// teiServingBuildFn reports the image tag and compute device (cpu/cuda) of the
+// running citadel-tei container, or ("","") when it cannot be determined.
+// Package var seam so a cmd test never shells out to a container runtime.
+var teiServingBuildFn = inspectTEIServingBuild
+
+// inspectTEIServingBuild reads the running citadel-tei container's resolved
+// image and parses it into (tag, device).
+func inspectTEIServingBuild() (tag, device string) {
+	rt := catalog.SelectContainerRuntime()
+	out, err := exec.Command(rt.EngineBin, "inspect", "--format", "{{.Config.Image}}", "citadel-"+svcports.TEIServiceName).Output()
+	if err != nil {
+		return "", ""
+	}
+	return svcports.ParseTEIServingImage(strings.TrimSpace(string(out)))
+}
+
 func runRAGStatus(cmd *cobra.Command, args []string) error {
 	svc := newRAGService()
 	st, err := svc.Status()
 	if err != nil {
 		return err
 	}
+	teiBuild, teiDevice := teiServingBuildFn()
 	if ragJSON {
-		return printJSON(st)
+		return printJSON(ragStatusJSON{Status: st, TEIBuild: teiBuild, TEIDevice: teiDevice})
 	}
 	fmt.Printf("Node-local semantic index\n")
 	fmt.Printf("  model:        %s\n", st.Model)
@@ -150,6 +180,9 @@ func runRAGStatus(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  last indexed: %s\n", last)
 	fmt.Printf("  db:           %s\n", st.DBPath)
+	if teiBuild != "" {
+		fmt.Printf("  tei build:    %s (%s)\n", teiBuild, teiDevice)
+	}
 	fmt.Printf("  %s\n", color.New(color.Faint).Sprint(st.Provenance))
 	return nil
 }

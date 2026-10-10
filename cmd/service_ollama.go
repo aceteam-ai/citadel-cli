@@ -25,7 +25,13 @@ func composeEnvForStrictServiceStart(serviceName string, service Service, bindEn
 		return nil, err
 	}
 	env := append(composeEnv(), bindEnvEntries(bindEnv)...)
-	return svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, service.OllamaMaxLoadedModels)
+	env, err := svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, service.OllamaMaxLoadedModels)
+	if err != nil {
+		return nil, err
+	}
+	// aceteam-ai/citadel-cli#1269: GPU-aware tei image tag / CPU thread opt-in
+	// (tei only; nil for every other service).
+	return append(env, teiComposeEnvEntries(serviceName, service.Threads)...), nil
 }
 
 // warnIfOllamaPolicyIgnoredNative prints a warning when an ollama service carries

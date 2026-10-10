@@ -116,7 +116,7 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 	}
 
 	one := 1
-	env, err := h.composeEnvForEngineStart("ollama", "", &one)
+	env, err := h.composeEnvForEngineStart("ollama", "", &one, nil)
 	if err != nil {
 		t.Fatalf("set: unexpected error: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 		t.Errorf("set: policy entry must be last (so it wins), got %q", env[len(env)-1])
 	}
 
-	envNil, err := h.composeEnvForEngineStart("ollama", "", nil)
+	envNil, err := h.composeEnvForEngineStart("ollama", "", nil, nil)
 	if err != nil {
 		t.Fatalf("unset: unexpected error: %v", err)
 	}
@@ -139,13 +139,13 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 	}
 
 	neg := -1
-	if _, err := h.composeEnvForEngineStart("ollama", "", &neg); err == nil {
+	if _, err := h.composeEnvForEngineStart("ollama", "", &neg, nil); err == nil {
 		t.Errorf("negative: want a hard error, got nil")
 	}
 
 	// A non-ollama engine remains byte-for-byte outside this policy authority;
 	// the hostile inherited value therefore remains present and unchanged.
-	envVLLM, err := h.composeEnvForEngineStart("vllm", "", &one)
+	envVLLM, err := h.composeEnvForEngineStart("vllm", "", &one, nil)
 	if err != nil {
 		t.Fatalf("vllm: unexpected error: %v", err)
 	}

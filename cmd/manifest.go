@@ -68,6 +68,19 @@ type Service struct {
 	// here (and in internal/jobs' two manifest structs) so a cmd-package manifest
 	// rewrite does not silently drop it -- the #528/#850 field-drop failure mode.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// Threads is the aceteam-ai/citadel-cli#1269 per-service CPU thread opt-in for
+	// the embedded tei embedding service: the MKL/OMP/RAYON thread count injected
+	// as CITADEL_TEI_NUM_THREADS at `docker compose up`. A *int so nil (unset,
+	// the default) is distinguishable from an explicit 0. nil => not injected, so
+	// the compose default (1) applies -- the only combination proven stable on
+	// cpu-1.6 (aceteam-ai/citadel-services#14). An explicit 0 => "auto"
+	// (services.TEICPUThreads = cores minus a small headroom); a positive value
+	// is used verbatim. Irrelevant on the GPU image (threads are a CPU-path
+	// knob). Only the tei service honors it; injected via services.TEIComposeEnv.
+	// Modeled here (and in internal/jobs' two manifest structs) so a cmd-package
+	// manifest rewrite does not silently drop it -- the #528/#850 field-drop
+	// failure mode.
+	Threads *int `yaml:"threads,omitempty"`
 }
 
 // serviceStartDisabled reports whether a service is marked "stopped" and must be

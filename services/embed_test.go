@@ -75,10 +75,13 @@ func TestBonsaiComposeVRAMTuning(t *testing.T) {
 	}
 }
 
-// TestTEIComposeContract guards the sovereign-embedding TEI module. The
-// float32 + single-thread MKL/OMP/RAYON combination is load-bearing: float16 on
-// CPU segfaults through Intel MKL (citadel-services#14), so if these drift the
-// service crash-loops on start. The container serves :80 published to the fixed
+// TestTEIComposeContract guards the sovereign-embedding TEI module. --dtype
+// float32 is load-bearing on BOTH paths: it preserves cross-node vector parity
+// (verified cosine 1.000000) and avoids the Intel-MKL fp16->fp32 CPU segfault
+// (citadel-services#14). The GPU-aware image tag and the CPU thread count are
+// env substitutions whose :- DEFAULTS must resolve to the pre-#1269 values
+// (cpu-1.6 image, single-thread MKL/OMP/RAYON) so a node with no citadel env
+// injection is byte-compatible. The container serves :80 published to the fixed
 // host port 8102 (the gateway's /v1/embeddings upstream); a drift there silently
 // breaks discovery + the gateway proxy.
 func TestTEIComposeContract(t *testing.T) {
@@ -89,15 +92,34 @@ func TestTEIComposeContract(t *testing.T) {
 	for _, want := range []string{
 		"Alibaba-NLP/gte-multilingual-base",
 		"--dtype", "float32",
-		"MKL_NUM_THREADS=1",
-		"OMP_NUM_THREADS=1",
-		"RAYON_NUM_THREADS=1",
+		// GPU-aware image tag (aceteam-ai/citadel-cli#1269): substitution form +
+		// registry-qualified repo.
+		TEIImageRepo + ":${" + EnvTEIImageTag + ":-" + TEICPUImageTag + "}",
+		// Opt-in CPU thread count: all three MKL/OMP/RAYON vars share one knob.
+		"MKL_NUM_THREADS=${" + EnvTEINumThreads + ":-1}",
+		"OMP_NUM_THREADS=${" + EnvTEINumThreads + ":-1}",
+		"RAYON_NUM_THREADS=${" + EnvTEINumThreads + ":-1}",
 		"127.0.0.1:8102:80",
-		"cpu-1.6",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("tei compose missing required contract fragment %q", want)
 		}
+	}
+
+	// The image substitution's :- default must resolve to the CPU image, and the
+	// thread substitution's to 1, with no citadel env injected (the hand-run
+	// `docker compose up` case, byte-compatible with pre-#1269).
+	imageTok := "${" + EnvTEIImageTag + ":-" + TEICPUImageTag + "}"
+	if got := resolveComposeToken(imageTok, nil); got != TEICPUImageTag {
+		t.Errorf("tei image tag default = %q, want %q", got, TEICPUImageTag)
+	}
+	threadsTok := "${" + EnvTEINumThreads + ":-1}"
+	if got := resolveComposeToken(threadsTok, nil); got != "1" {
+		t.Errorf("tei thread-count default = %q, want \"1\"", got)
+	}
+	// A resolved GPU tag flows through the same substitution.
+	if got := resolveComposeToken(imageTok, map[string]string{EnvTEIImageTag: "86-1.6"}); got != "86-1.6" {
+		t.Errorf("tei image tag with CITADEL_TEI_IMAGE_TAG=86-1.6 = %q, want \"86-1.6\"", got)
 	}
 }
 

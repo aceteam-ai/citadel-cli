@@ -8,12 +8,30 @@
 # with every vector). The backend reaches this through the node's mesh-exposed
 # citadel gateway (/v1/embeddings upstream), never this host port directly.
 #
-# CPU by default: gte-multilingual-base is ~600MB and runs comfortably on CPU,
-# leaving GPU VRAM for inference engines on shared nodes. `--dtype float32` is
-# DELIBERATE and load-bearing -- float16 on CPU segfaults through Intel MKL
-# (aceteam-ai/citadel-services#14); the single-thread MKL/OMP/RAYON env is the
-# segfault-safe combination proven on the cpu-1.6 image. A GPU variant
-# (float16, no MKL pinning) can follow as a separate compose.
+# Image tag is GPU-aware (aceteam-ai/citadel-cli#1269). The CPU image embeds
+# ~125x slower than the matching CUDA image on a GPU node (measured on node 1795
+# / RTX 3090: a 41k-chunk index went from ~25h to ~30min, identical vectors,
+# cosine 1.000000). Citadel resolves the node's GPU compute capability and
+# injects CITADEL_TEI_IMAGE_TAG (e.g. 86-1.6 on sm86) at `docker compose up`;
+# with no usable GPU the substitution defaults to cpu-1.6. `--dtype float32` is
+# DELIBERATE on BOTH paths and load-bearing -- it preserves vector parity across
+# heterogeneous nodes (verified cosine 1.000000) and avoids the Intel-MKL
+# fp16->fp32 CPU segfault (aceteam-ai/citadel-services#14).
+#
+# GPU acceleration requires the Docker runtime with default-runtime=nvidia (what
+# `citadel init --provision` configures): tei.yml carries no GPU reservation (it
+# must also start on CPU-only nodes, where a mandatory nvidia reservation fails
+# container creation), so the CUDA image only sees a GPU on a runtime that
+# provides one to an unqualified container. Rootless Podman needs a CDI device
+# declaration an env substitution cannot add, so a Podman GPU node keeps the CPU
+# image (a documented follow-up, not a regression -- it stays as fast as before).
+#
+# CPU threads: pinned to 1 by default, the ONLY combination proven stable on the
+# cpu-1.6 image (float32 + single-thread MKL/OMP/RAYON, citadel-services#14).
+# Multi-thread float32 on this image is not yet validated, so it is OPT-IN rather
+# than on-by-default: set `threads: <N>` on the tei service in citadel.yaml
+# (`threads: 0` = auto, services.TEICPUThreads = cores minus a small headroom) to
+# raise it, which citadel injects as CITADEL_TEI_NUM_THREADS here.
 #
 # Host port: the container serves :80, published to the fixed host port 8102
 # (services/ports.go TEIEmbeddingPort), which the gateway's /v1/embeddings
@@ -25,17 +43,19 @@
 # embeddings through the gateway (TLS), never this port.
 services:
   tei:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6
+    image: ghcr.io/huggingface/text-embeddings-inference:${CITADEL_TEI_IMAGE_TAG:-cpu-1.6}
     container_name: citadel-tei
     command: ["--model-id", "Alibaba-NLP/gte-multilingual-base", "--dtype", "float32"]
     ports:
       - "127.0.0.1:8102:80"
     environment:
-      # Single-thread MKL/OMP/RAYON: float32-on-CPU is stable only when these are
-      # pinned to 1 (citadel-services#14). Do not remove.
-      - MKL_NUM_THREADS=1
-      - OMP_NUM_THREADS=1
-      - RAYON_NUM_THREADS=1
+      # Single-thread MKL/OMP/RAYON by default: float32-on-CPU is proven stable
+      # only when these are pinned to 1 (citadel-services#14). Raised via the
+      # manifest `threads:` opt-in (CITADEL_TEI_NUM_THREADS); irrelevant on the
+      # GPU image. Do not change the default to a hardcoded higher value.
+      - MKL_NUM_THREADS=${CITADEL_TEI_NUM_THREADS:-1}
+      - OMP_NUM_THREADS=${CITADEL_TEI_NUM_THREADS:-1}
+      - RAYON_NUM_THREADS=${CITADEL_TEI_NUM_THREADS:-1}
       # HuggingFace cache: gte-multilingual-base (~600MB) downloads here once and
       # persists across restarts (shared with other HF-based services).
       - HUGGINGFACE_HUB_CACHE=/data

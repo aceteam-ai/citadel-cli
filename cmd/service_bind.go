@@ -100,6 +100,9 @@ func composeEnvForServiceValues(serviceName string, svc Service) []string {
 	if policyErr != nil {
 		Log("ollama policy: %s: %v; using engine default", serviceName, policyErr)
 	}
+	// aceteam-ai/citadel-cli#1269: GPU-aware tei image tag / CPU thread opt-in.
+	// No-op for every non-tei service.
+	env = append(env, teiComposeEnvEntries(serviceName, svc.Threads)...)
 	return env
 }
 
