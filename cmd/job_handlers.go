@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
@@ -102,6 +103,15 @@ func init() {
 	shellHandler.HasPasscode = nodeHasPasscode
 	shellHandler.VerifyPasscode = nodePasscodeVerifier
 
+	// Per-org index namespaces (aceteam#10876 C2): point the FILE_INDEX /
+	// FILE_SEMANTIC_SEARCH handlers at the machine-convergent indexes dir so a
+	// payload `index` namespace resolves here too, not just on the worker path.
+	indexesDir := jobs.IndexesDirFor(network.GetNodeConfigDir())
+	fileIndexHandler := jobs.NewFileIndexHandler("", "")
+	fileIndexHandler.IndexesDir = indexesDir
+	fileSemanticSearchHandler := jobs.NewFileSemanticSearchHandler("", "")
+	fileSemanticSearchHandler.IndexesDir = indexesDir
+
 	// Register all job handlers for test command
 	jobHandlers = map[string]jobs.JobHandler{
 		"SHELL_COMMAND":        shellHandler,
@@ -121,8 +131,8 @@ func init() {
 		"GOMOBILE_BUILD":       jobs.NewGomobileBuildHandler(""),
 		"COBROWSE":             jobs.NewCobrowseHandler(),
 		"COBROWSE_SESSION":     jobs.NewCobrowseSessionHandler(),
-		"FILE_INDEX":           jobs.NewFileIndexHandler("", ""),
-		"FILE_SEMANTIC_SEARCH": jobs.NewFileSemanticSearchHandler("", ""),
+		"FILE_INDEX":           fileIndexHandler,
+		"FILE_SEMANTIC_SEARCH": fileSemanticSearchHandler,
 		"HTTP_PROXY":           &jobs.HTTPProxyHandler{},
 		"WEB_FETCH":            &jobs.WebFetchHandler{},
 	}

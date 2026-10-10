@@ -249,3 +249,48 @@ func writeFile(t *testing.T, dir, name, content string) {
 		t.Fatal(err)
 	}
 }
+
+// TestServiceWithIndexNamespace pins that WithIndexNamespace routes the Service's
+// DB to a confined per-namespace path under the indexes dir (aceteam#10876 C2),
+// so a local `citadel rag --index` operator reads/writes the same per-org DB a
+// worker's namespaced FILE_INDEX uses, and that a traversal namespace is refused.
+func TestServiceWithIndexNamespace(t *testing.T) {
+	tei := fakeTEI(t)
+	t.Setenv("CITADEL_TEI_URL", tei.URL)
+	t.Setenv("CITADEL_INDEX_DB", filepath.Join(t.TempDir(), "legacy.db"))
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+
+	indexesDir := t.TempDir()
+	ws := t.TempDir()
+	writeFile(t, ws, "cats.md", "The cat sat on the mat. A kitten is a small feline.")
+
+	svc := New(ws, "")
+	if err := svc.WithIndexNamespace(indexesDir, "org_5/docs"); err != nil {
+		t.Fatalf("WithIndexNamespace: %v", err)
+	}
+	wantDB := filepath.Join(indexesDir, "org_5", "docs.db")
+	if svc.DBPath() != wantDB {
+		t.Fatalf("DBPath = %q, want %q", svc.DBPath(), wantDB)
+	}
+	if _, err := svc.Index(context.Background(), ws, ""); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if _, err := os.Stat(wantDB); err != nil {
+		t.Fatalf("namespace DB not written: %v", err)
+	}
+
+	// A fresh default-DB service sees nothing from the namespaced index.
+	plain := New(ws, "")
+	st, err := plain.Status()
+	if err != nil {
+		t.Fatalf("plain status: %v", err)
+	}
+	if st.Files != 0 {
+		t.Fatalf("legacy DB saw %d files; the namespaced index must be isolated", st.Files)
+	}
+
+	// Traversal is refused and leaves dbPath unchanged.
+	if err := svc.WithIndexNamespace(indexesDir, "../escape"); err == nil {
+		t.Fatal("traversal namespace accepted; want refusal")
+	}
+}
