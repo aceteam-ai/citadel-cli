@@ -95,7 +95,17 @@ func newRAGService() *rag.Service {
 func runRAGIndex(cmd *cobra.Command, args []string) error {
 	svc := newRAGService()
 	fmt.Printf("Indexing %s via %s ...\n", args[0], svc.Model())
+	// Live, throttled progress line while the walk runs (aceteam#10876 C1). Not
+	// in --json mode, where the single JSON result is the only output. Ctrl-C
+	// requests a graceful stop: the current file commits and a partial, consistent
+	// index remains.
+	if !ragJSON {
+		svc.SetProgressSink(printRAGProgressLine)
+	}
 	res, err := svc.Index(cmd.Context(), args[0], ragFilePattern)
+	if !ragJSON {
+		fmt.Fprint(os.Stderr, "\r\033[K") // clear the live line before the summary
+	}
 	if err != nil {
 		return ragEmbedError(err)
 	}
@@ -103,12 +113,48 @@ func runRAGIndex(cmd *cobra.Command, args []string) error {
 		return printJSON(res)
 	}
 	status := color.GreenString("OK")
-	if res.FilesFailed > 0 {
+	switch {
+	case res.Status == "cancelled":
+		status = color.YellowString("CANCELLED")
+	case res.FilesFailed > 0:
 		status = color.YellowString("PARTIAL")
 	}
 	fmt.Printf("%s indexed %d file(s), skipped %d, failed %d, pruned %d (%d chunks embedded, dim %d)\n",
 		status, res.FilesIndexed, res.FilesSkipped, res.FilesFailed, res.FilesRemoved, res.ChunksEmbedded, res.Dim)
+	if res.Status == "cancelled" {
+		fmt.Printf("%s\n", color.New(color.Faint).Sprint("cancelled; the partial index is consistent — re-run to resume (unchanged files are skipped)"))
+	}
 	return nil
+}
+
+// printRAGProgressLine renders one throttled progress update as a single
+// carriage-returned status line on stderr (so --json stdout stays clean). It
+// reads the throttled event map emitted by jobs.NewThrottledProgress.
+func printRAGProgressLine(m map[string]any) {
+	asInt := func(k string) int {
+		switch v := m[k].(type) {
+		case int:
+			return v
+		case float64:
+			return int(v)
+		}
+		return 0
+	}
+	done, total := asInt("done"), asInt("total")
+	line := fmt.Sprintf("  indexing: %d", done)
+	if total > 0 {
+		line += fmt.Sprintf("/%d (%d%%)", total, asInt("percent"))
+	}
+	if rate, ok := m["rate"].(float64); ok && rate > 0 {
+		line += fmt.Sprintf("  %.1f files/s", rate)
+	}
+	if eta := asInt("eta_seconds"); eta > 0 {
+		line += fmt.Sprintf("  eta %ds", eta)
+	}
+	if cur, ok := m["current"].(string); ok && cur != "" {
+		line += "  " + cur
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
 }
 
 func runRAGQuery(cmd *cobra.Command, args []string) error {

@@ -108,6 +108,15 @@ func (c *Client) SetJobStatus(ctx context.Context, jobID, status string, data ma
 	return c.SetKey(ctx, key, fields, 86400) // 24-hour TTL
 }
 
+// SetJobProgress mirrors the latest progress event into job:<id>:progress with a
+// 7-day TTL, the API-proxy counterpart of redis.Client.SetJobProgress. The whole
+// event (including nested counts) is stored as one JSON value. Best-effort; the
+// pub/sub "progress" event is the primary path (aceteam#10876 C1).
+func (c *Client) SetJobProgress(ctx context.Context, jobID string, event map[string]any) error {
+	key := fmt.Sprintf("job:%s:progress", jobID)
+	return c.SetKey(ctx, key, event, 604800) // 7-day TTL
+}
+
 // doRequestWithTimeout is like doRequest but with a custom timeout.
 func (c *Client) doRequestWithTimeout(ctx context.Context, method, path string, body any, result any, timeout time.Duration) error {
 	// Create a new HTTP client with custom timeout for this request

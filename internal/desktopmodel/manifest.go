@@ -1,5 +1,6 @@
-// Package desktopmodel contains unreachable, synthetic archive-validation
-// foundations. It does not install, execute, download, or select a model.
+// Package desktopmodel contains unreachable synthetic archive-validation and
+// approved pure model-planning foundations. It does not install, execute,
+// download, activate, or serve a model.
 package desktopmodel
 
 import (

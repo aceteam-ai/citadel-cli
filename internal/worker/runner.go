@@ -45,8 +45,12 @@ type Runner struct {
 	// routing in Run.
 	unboundedLane      *lane
 	inferenceLane      *lane
+	heavyLane          *lane
 	inferenceQueueWait time.Duration
 	huddleCancelPoll   time.Duration
+	// coopCancelPoll is the mid-job cooperative-cancel poll interval for
+	// cooperativeCancelJobTypes (FILE_INDEX). Defaults to 1s; tests shorten it.
+	coopCancelPoll time.Duration
 
 	// state, when set, records live introspection metrics (poll time, job
 	// counts) for the out-of-band status/control path (issue #236).
@@ -128,6 +132,14 @@ func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Ru
 	// The general unbounded lane always exists (exec-concurrency 1): it is the
 	// relocated single-writer lock over the unlocked manifest/lockfile paths.
 	r.unboundedLane = newLane("unbounded", resolveUnboundedLaneQueue(), 1, false)
+
+	// The heavy lane always exists (exec 1, admit 2): FILE_INDEX and future heavy
+	// index/extract work. exec 1 keeps a single DISPATCHED index-DB writer; admit 2
+	// lets one more be claimed+queued so the fetch loop never blocks. It is kept
+	// SEPARATE from the unbounded manifest-writer lane so a multi-hour index never
+	// queues a deploy (aceteam#10876 C1). hasExecWait=false: a queued heavy job
+	// waits (unbounded) for the single exec slot, like the unbounded lane.
+	r.heavyLane = newLane("heavy", heavyLaneAdmitDepth, 1, false)
 
 	// The inference admission queue exists ONLY on a node with a real discrete
 	// GPU (a non-nil tracker with >=1 slot). On a GPU-less node that still
@@ -503,6 +515,12 @@ runLoop:
 				// in lockstep in production, so the queue-wait is the real
 				// backpressure and the #825 Nack becomes effectively unreachable.
 				r.dispatchLane(ctx, r.inferenceLane, job, stream, startTime, &wg)
+			case r.heavyLane != nil && needsHeavyLane(job.Type):
+				// Dedicated heavy lane (exec 1, admit 2): FILE_INDEX (and future
+				// heavy index/extract work). A single DISPATCHED index-DB writer off
+				// the fetch loop, isolated from the manifest-writer lane so a
+				// multi-hour index never queues a deploy (aceteam#10876 C1).
+				r.dispatchLane(ctx, r.heavyLane, job, stream, startTime, &wg)
 			case longSession || gpuBound:
 				// #489 long-session lane (MEETING_JOIN/COBROWSE), plus the
 				// degenerate GPU-bound-but-no-inference-lane case (a tracker with
@@ -963,11 +981,19 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	var result *JobResult
 	var err error
 	handlerCtx, stopCancellationWatch := r.watchHuddleCancellation(ctx, job)
+	// Cooperative (graceful) mid-job cancel watch for cooperativeCancelJobTypes
+	// (FILE_INDEX): polls job:cancelled:<id> and sets a flag the handler reads via
+	// JobContext.CancelRequested, WITHOUT cancelling handlerCtx — so the current
+	// file finishes and commits before the walk stops (aceteam#10876 C1). A no-op
+	// for every other job type, and harmless alongside the huddle watch (their
+	// job-type sets are disjoint).
+	handlerCtx, stopCoopCancelWatch := r.watchCooperativeCancellation(handlerCtx, job)
 	if timeout, ok := r.resolveJobTimeout(job); ok {
 		result, err = r.executeWithDeadline(handlerCtx, handler, job, stream, timeout)
 	} else {
 		result, err = handler.Execute(handlerCtx, job, stream)
 	}
+	stopCoopCancelWatch()
 	cancelled := stopCancellationWatch()
 
 	endTime := time.Now()
@@ -1270,6 +1296,55 @@ func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context
 	}
 }
 
+// watchCooperativeCancellation turns the platform's durable cancellation marker
+// into a GRACEFUL stop signal for cooperativeCancelJobTypes (FILE_INDEX). Unlike
+// watchHuddleCancellation it does NOT cancel the handler context: it polls
+// job:cancelled:<id> and, on cancel, sets a flag the handler reads via
+// JobContext.CancelRequested (threaded through the returned context). The handler
+// finishes the current unit (file), commits it, and returns `cancelled` with
+// partial counts — "cancel commits the current file" (aceteam#10876 C1).
+//
+// For any job type NOT in cooperativeCancelJobTypes this returns ctx unchanged
+// and a no-op stop, so it is inert for every other job. The returned stop func
+// halts the poll goroutine (call it once execution is done).
+func (r *Runner) watchCooperativeCancellation(ctx context.Context, job *Job) (context.Context, func()) {
+	if !needsCooperativeCancelWatch(job.Type) {
+		return ctx, func() {}
+	}
+	var requested atomic.Bool
+	// The predicate reads the live flag, so setting it below is observed by the
+	// handler on its next poll. Thread it to the adapter via the context.
+	ctx = jobs.WithCancelRequested(ctx, requested.Load)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	interval := r.coopCancelPoll
+	if interval <= 0 {
+		interval = time.Second
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if r.source.IsJobCancelled(ctx, job.ID) {
+					requested.Store(true)
+					return // once requested, stop polling; the handler stops gracefully
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		close(stop)
+		<-done
+	}
+}
+
 // finishWorkerControl ACKs before reporting acceptance. Scheduling is prepared
 // behind a gate before the accepted event, and the gate opens only after that
 // event has been published. Thus neither an ACK nor scheduling failure can
@@ -1432,6 +1507,9 @@ func (r *Runner) LaneSnapshots() []LaneSnapshot {
 	var out []LaneSnapshot
 	if r.unboundedLane != nil {
 		out = append(out, r.unboundedLane.snapshot())
+	}
+	if r.heavyLane != nil {
+		out = append(out, r.heavyLane.snapshot())
 	}
 	if r.inferenceLane != nil {
 		out = append(out, r.inferenceLane.snapshot())

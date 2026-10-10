@@ -826,6 +826,38 @@ func (c *Client) IsJobCancelled(ctx context.Context, jobID string) (bool, error)
 	return result > 0, nil
 }
 
+// progressHashTTL bounds job:<id>:progress so a crashed, cancelled, or completed
+// job's last progress snapshot self-expires rather than leaking a key forever
+// (aceteam#10876 C1, design 2a.3: 7-day TTL).
+const progressHashTTL = 7 * 24 * time.Hour
+
+// SetJobProgress mirrors the latest progress event into the Redis hash
+// job:<id>:progress with a bounded TTL, for the polled progress route
+// (aceteam#10876 A3). The nested "counts" map is JSON-encoded to a single hash
+// field since Redis hash values are scalars. Best-effort by contract (the
+// pub/sub "progress" event is the primary path); a failure is returned so the
+// caller can log it, but callers treat it as non-fatal.
+func (c *Client) SetJobProgress(ctx context.Context, jobID string, event map[string]interface{}) error {
+	key := fmt.Sprintf("job:%s:progress", jobID)
+	fields := make(map[string]interface{}, len(event)+2)
+	for k, v := range event {
+		switch v.(type) {
+		case map[string]any, []any, map[string]int:
+			if b, err := json.Marshal(v); err == nil {
+				fields[k] = string(b)
+				continue
+			}
+		}
+		fields[k] = v
+	}
+	fields["worker_id"] = c.workerID
+	fields["updated_at"] = time.Now().UTC().Format(time.RFC3339)
+	if err := c.client.HSet(ctx, key, fields).Err(); err != nil {
+		return err
+	}
+	return c.client.Expire(ctx, key, progressHashTTL).Err()
+}
+
 // SetJobStatus stores job status in Redis (simpler than Supabase for now).
 func (c *Client) SetJobStatus(ctx context.Context, jobID, status string, data map[string]interface{}) error {
 	key := fmt.Sprintf("job:%s:status", jobID)

@@ -107,6 +107,17 @@ func (m *MockJobSource) IsJobCancelled(ctx context.Context, jobID string) bool {
 	return m.cancelledJobs[jobID]
 }
 
+// SetCancelled flips a job's cancellation flag (thread-safe), so a test can
+// trigger a mid-job cooperative cancel after execution has begun.
+func (m *MockJobSource) SetCancelled(jobID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cancelledJobs == nil {
+		m.cancelledJobs = make(map[string]bool)
+	}
+	m.cancelledJobs[jobID] = true
+}
+
 func (m *MockJobSource) Close() error {
 	m.closed = true
 	return nil
@@ -374,6 +385,10 @@ type MockStreamWriter struct {
 	erroredRecover bool
 	cancelled      bool
 
+	// progress captures every WriteProgress event (aceteam#10876 C1), so a test
+	// can assert throttled progress was published and inspect the latest snapshot.
+	progress []map[string]any
+
 	// endCount/errorCount count every WriteEnd/WriteError call, not just
 	// whether one happened -- needed to assert "exactly one terminal event"
 	// (issue #826) when the SAME writer instance is reused across multiple
@@ -465,6 +480,11 @@ func (m *MockStreamWriter) WriteError(err error, recoverable bool) error {
 
 func (m *MockStreamWriter) WriteCancelled(reason string) error {
 	m.cancelled = true
+	return nil
+}
+
+func (m *MockStreamWriter) WriteProgress(event map[string]any) error {
+	m.progress = append(m.progress, event)
 	return nil
 }
 

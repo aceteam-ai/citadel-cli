@@ -105,10 +105,31 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 			}
 		}
 	}
+	// Wire throttled progress to the job's stream (aceteam#10876 C1). The throttle
+	// state is per-Execute (local to this call); most handlers never emit, so this
+	// is inert unless the handler calls ctx.EmitProgress (FILE_INDEX today). A
+	// dropped progress publish never fails the job.
+	var progress func(jobs.ProgressEvent)
+	if stream != nil {
+		progress = jobs.NewThrottledProgress(func(m map[string]any) {
+			if err := stream.WriteProgress(m); err != nil && a.logFn != nil {
+				a.logFn("debug", fmt.Sprintf("progress publish for job %s failed: %v", job.ID, err))
+			}
+		}, nil)
+	}
+
 	// Execute the legacy handler with log callback. Thread the worker context so
 	// handlers that shell out (e.g. SHELL_COMMAND) honor a per-job deadline or
 	// cancellation and actually terminate their child process (aceteam#6000).
-	jobCtx := jobs.JobContext{LogFn: a.logFn, Ctx: ctx}
+	// CancelRequested carries the cooperative (graceful) cancel predicate the
+	// runner's mid-job watch sets on ctx for cooperative-cancel job types; nil for
+	// every other job (aceteam#10876 C1).
+	jobCtx := jobs.JobContext{
+		LogFn:           a.logFn,
+		Ctx:             ctx,
+		Progress:        progress,
+		CancelRequested: jobs.CancelRequestedFrom(ctx),
+	}
 	output, err := a.handler.Execute(jobCtx, nexusJob)
 
 	duration := time.Since(start)
