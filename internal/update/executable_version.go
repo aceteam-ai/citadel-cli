@@ -191,6 +191,9 @@ func parseExecutableBuildInfo(bi *runtimedebug.BuildInfo) (ExecutableVersion, er
 		result.Source = VersionSourceModule
 		return result, nil
 	}
+	if bi.Main.Version != "(devel)" {
+		return ExecutableVersion{}, fmt.Errorf("executable version provenance is missing")
+	}
 	result.Version = "dev"
 	result.Source = VersionSourceDevelopment
 	return result, nil

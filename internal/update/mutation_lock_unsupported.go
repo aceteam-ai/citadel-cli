@@ -30,6 +30,10 @@ func createPrivateAttemptDir(string) (string, os.FileInfo, error) {
 	return "", nil, fmt.Errorf("update attempt unsupported on this platform")
 }
 
+func validatePrivateAttemptDir(string) (os.FileInfo, error) {
+	return nil, fmt.Errorf("update attempt unsupported on this platform")
+}
+
 func openRegularNoFollow(string) (*os.File, error) {
 	return nil, fmt.Errorf("executable metadata unsupported on this platform")
 }

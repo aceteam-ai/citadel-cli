@@ -282,6 +282,9 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 				"old_version": installedBefore, "new_version": installedBefore,
 			}), nil
 		}
+		if relation == update.TargetOlder {
+			return h.terminalFailure(fmt.Errorf("exact update target is older than the installed Citadel release")), nil
+		}
 	}
 
 	lookupTarget := target

@@ -450,18 +450,23 @@ func TestAgentUpdateExactDeterministicPreflightIsTerminalWithoutLookup(t *testin
 		name     string
 		relation update.VersionRelation
 	}{
-		{name: "stale"},
+		{name: "stale", relation: update.TargetOlder},
+		{name: "unknown"},
 		{name: "equal", relation: update.TargetEqual},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			lookups := 0
 			h := newTestHandler(t, func(c *AgentUpdateConfig) {
 				c.CheckExact = func(context.Context, string) (string, update.VersionRelation, error) {
-					if tc.name == "stale" {
-						_, _, err := update.CheckExactTarget(context.Background(), "not-semver")
+					if tc.name == "unknown" {
+						_, err := update.CompareReleaseVersions("v2.47.0", "unverifiable")
 						return "", 0, err
 					}
-					return "v2.46.0", tc.relation, nil
+					installed := "v2.46.0"
+					if tc.name == "stale" {
+						installed = "v2.48.0"
+					}
+					return installed, tc.relation, nil
 				}
 				c.GetRelease = func(string) (*update.Release, error) {
 					lookups++
@@ -475,11 +480,44 @@ func TestAgentUpdateExactDeterministicPreflightIsTerminalWithoutLookup(t *testin
 			if lookups != 0 {
 				t.Fatalf("release lookups = %d, want zero", lookups)
 			}
-			if tc.name == "stale" && res.Status != JobStatusTerminalFailure {
+			if (tc.name == "stale" || tc.name == "unknown") && res.Status != JobStatusTerminalFailure {
 				t.Fatalf("status = %v, want terminal failure", res.Status)
 			}
 			if tc.name == "equal" && res.Status != JobStatusSuccess {
 				t.Fatalf("status = %v, want success no-op", res.Status)
+			}
+		})
+	}
+}
+
+func TestAgentUpdateTransientPreflightAndNetworkFailuresRemainRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+		mutate  func(*AgentUpdateConfig)
+	}{
+		{
+			name:    "lock",
+			payload: map[string]any{"target_version": "v2.47.0"},
+			mutate: func(c *AgentUpdateConfig) {
+				c.CheckExact = func(context.Context, string) (string, update.VersionRelation, error) {
+					return "", 0, errors.New("update lock unavailable")
+				}
+			},
+		},
+		{
+			name: "network",
+			mutate: func(c *AgentUpdateConfig) {
+				c.GetRelease = func(string) (*update.Release, error) {
+					return nil, errors.New("temporary network failure")
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := newTestHandler(t, tc.mutate).Execute(context.Background(), agentUpdateJob(perNodeQueue, tc.payload), &NoOpStreamWriter{})
+			if err != nil || res.Status != JobStatusFailure {
+				t.Fatalf("transient result = %#v, %v", res, err)
 			}
 		})
 	}
@@ -526,6 +564,26 @@ func TestAgentUpdateFinalSupersededNoStateDrainOrRestart(t *testing.T) {
 	}
 	if recorded || drained || restarted {
 		t.Fatalf("no-op effects: record=%v drain=%v restart=%v", recorded, drained, restarted)
+	}
+}
+
+func TestAgentUpdateFinalDeterministicRefusalNoStateDrainOrRestart(t *testing.T) {
+	var recorded, drained, restarted bool
+	h := newTestHandler(t, func(c *AgentUpdateConfig) {
+		c.ApplyRelease = func(context.Context, string, string, string, update.ApplyIntent) (update.ApplyResult, error) {
+			_, err := update.CompareReleaseVersions("v2.47.0", "unverifiable")
+			return update.ApplyResult{}, err
+		}
+		c.RecordState = func(string, string) { recorded = true }
+		c.Drain = func() { drained = true }
+		c.Restart = func() error { restarted = true; return nil }
+	})
+	res, err := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, map[string]any{"target_version": "v2.47.0"}), &NoOpStreamWriter{})
+	if err != nil || res.Status != JobStatusTerminalFailure {
+		t.Fatalf("final refusal = %#v, %v", res, err)
+	}
+	if recorded || drained || restarted {
+		t.Fatalf("terminal refusal effects: record=%v drain=%v restart=%v", recorded, drained, restarted)
 	}
 }
 

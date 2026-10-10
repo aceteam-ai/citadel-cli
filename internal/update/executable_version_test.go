@@ -1,14 +1,29 @@
 package update
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	runtimedebug "runtime/debug"
 	"strings"
 	"testing"
+	"time"
 )
+
+func buildCitadelFixture(t *testing.T, output, version string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", output, "-ldflags", "-s -w -X github.com/aceteam-ai/citadel-cli/cmd.version="+version, "./cmd/citadel")
+	cmd.Dir = filepath.Join("..", "..")
+	data, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compile-only Citadel fixture %s: %v\n%s", version, err, data)
+	}
+}
 
 func TestNormalizeExactVersionStrictIdentityAndPrecedence(t *testing.T) {
 	valid := map[string]string{
@@ -52,6 +67,13 @@ func TestParseExecutableBuildInfoModuleDevTrimpathAndBounds(t *testing.T) {
 		got, err := parseExecutableBuildInfo(base())
 		if err != nil || got.Version != "dev" || got.Source != VersionSourceDevelopment {
 			t.Fatalf("metadata = %#v, %v", got, err)
+		}
+	})
+	t.Run("empty main version", func(t *testing.T) {
+		info := base()
+		info.Main.Version = ""
+		if _, err := parseExecutableBuildInfo(info); err == nil {
+			t.Fatal("missing module provenance accepted as development build")
 		}
 	})
 	t.Run("module", func(t *testing.T) {

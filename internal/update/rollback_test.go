@@ -2,34 +2,39 @@
 package update
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 )
 
-// writeTestBinary writes content to path, creating parent dirs as needed.
-func writeTestBinary(t *testing.T, path, content string) {
+func provisionTestMutationLock(t *testing.T, destination string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		t.Fatalf("failed to create dir for %s: %v", path, err)
+	lock, err := acquireMutationLock(context.Background(), destination, true)
+	if err != nil {
+		t.Fatalf("provision validated mutation lock: %v", err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
-		t.Fatalf("failed to write %s: %v", path, err)
+	if err := lock.Release(); err != nil {
+		t.Fatalf("release provisioned mutation lock: %v", err)
 	}
 }
 
-// readIfExists returns (content, true) if path exists, else ("", false).
-func readIfExists(t *testing.T, path string) (string, bool) {
+func executableVersionIfExists(t *testing.T, path string) (string, bool) {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	_, err := os.Stat(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return "", false
 		}
-		t.Fatalf("failed to stat/read %s: %v", path, err)
+		t.Fatalf("stat %s: %v", path, err)
 	}
-	return string(data), true
+	meta, err := ReadExecutableVersion(path)
+	if err != nil {
+		t.Fatalf("read executable metadata %s: %v", path, err)
+	}
+	return meta.Version, true
 }
 
 // assertCompleteBinarySomewhere is the core citadel#926 invariant: after any
@@ -37,19 +42,19 @@ func readIfExists(t *testing.T, path string) (string, bool) {
 // new content -- both are valid, complete binaries) must be recoverable at
 // either dst or dst+".old". It must never be the case that neither holds a
 // complete binary.
-func assertCompleteBinarySomewhere(t *testing.T, dst, oldContent, newContent string) {
+func assertCompleteBinarySomewhere(t *testing.T, dst, oldVersion, newVersion string) {
 	t.Helper()
-	dstContent, dstOK := readIfExists(t, dst)
-	oldPathContent, oldOK := readIfExists(t, dst+".old")
+	dstVersion, dstOK := executableVersionIfExists(t, dst)
+	oldPathVersion, oldOK := executableVersionIfExists(t, dst+".old")
 
-	if dstOK && (dstContent == oldContent || dstContent == newContent) {
+	if dstOK && (dstVersion == oldVersion || dstVersion == newVersion) {
 		return
 	}
-	if oldOK && (oldPathContent == oldContent || oldPathContent == newContent) {
+	if oldOK && (oldPathVersion == oldVersion || oldPathVersion == newVersion) {
 		return
 	}
 	t.Fatalf("no complete binary recoverable at %s or %s.old (dst=%q[present=%v], old=%q[present=%v])",
-		dst, dst, dstContent, dstOK, oldPathContent, oldOK)
+		dst, dst, dstVersion, dstOK, oldPathVersion, oldOK)
 }
 
 // TestAtomicReplaceWindows_InjectedFailures tables the four points at which a
@@ -61,8 +66,8 @@ func TestAtomicReplaceWindows_InjectedFailures(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows swap/recovery semantics require native Windows handles and ACLs")
 	}
-	const oldContent = "old-binary-content-v1"
-	const newContent = "new-binary-content-v2-longer-than-v1"
+	const oldVersion = "v2.0.0"
+	const newVersion = "v2.1.0"
 
 	cases := []struct {
 		name           string
@@ -105,8 +110,9 @@ func TestAtomicReplaceWindows_InjectedFailures(t *testing.T) {
 			src := filepath.Join(dir, "citadel.new.download")
 			dst := filepath.Join(dir, "citadel.exe")
 
-			writeTestBinary(t, src, newContent)
-			writeTestBinary(t, dst, oldContent)
+			buildCitadelFixture(t, src, newVersion)
+			buildCitadelFixture(t, dst, oldVersion)
+			provisionTestMutationLock(t, dst)
 
 			windowsSwapFailAt = tc.failAt
 			defer func() { windowsSwapFailAt = "" }()
@@ -120,14 +126,18 @@ func TestAtomicReplaceWindows_InjectedFailures(t *testing.T) {
 				t.Fatalf("expected no error for the success path, got: %v", err)
 			}
 
-			_, dstPresent := readIfExists(t, dst)
+			_, statErr := os.Stat(dst)
+			dstPresent := statErr == nil
+			if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("stat destination: %v", statErr)
+			}
 			if dstPresent == tc.wantDstMissing {
 				t.Fatalf("dst presence mismatch: present=%v, wantMissing=%v", dstPresent, tc.wantDstMissing)
 			}
 
 			// Core invariant: a complete binary must be recoverable at dst or
 			// dst+".old" in every single case, including the interrupted ones.
-			assertCompleteBinarySomewhere(t, dst, oldContent, newContent)
+			assertCompleteBinarySomewhere(t, dst, oldVersion, newVersion)
 
 			// Now drive the auto-recovery helper and confirm it restores dst
 			// whenever dst was left missing.
@@ -142,19 +152,19 @@ func TestAtomicReplaceWindows_InjectedFailures(t *testing.T) {
 				t.Fatalf("expected recoverInterruptedSwap to be a no-op when dst was present, got recovered=true")
 			}
 
-			finalContent, finalPresent := readIfExists(t, dst)
+			finalVersion, finalPresent := executableVersionIfExists(t, dst)
 			if !finalPresent {
 				t.Fatalf("dst missing after recovery attempt")
 			}
-			if finalContent != oldContent && finalContent != newContent {
-				t.Fatalf("dst content after recovery is neither old nor new binary: %q", finalContent)
+			if finalVersion != oldVersion && finalVersion != newVersion {
+				t.Fatalf("dst version after recovery is neither old nor new binary: %q", finalVersion)
 			}
 
 			// Specifically for the after_rename1 case, recovery should prefer
 			// the fully-staged new binary (completing the intended update)
 			// over silently rolling back to the old one.
-			if tc.failAt == "after_rename1" && finalContent != newContent {
-				t.Fatalf("expected recovery to prefer the staged new binary; got content %q", finalContent)
+			if tc.failAt == "after_rename1" && finalVersion != newVersion {
+				t.Fatalf("expected recovery to prefer the staged new binary; got version %q", finalVersion)
 			}
 		})
 	}
@@ -172,7 +182,11 @@ func TestRecoverInterruptedSwap_OnlyOldPresent(t *testing.T) {
 	dst := filepath.Join(dir, "citadel.exe")
 	oldPath := dst + ".old"
 
-	writeTestBinary(t, oldPath, "previous-version-binary")
+	buildCitadelFixture(t, dst, "v2.0.0")
+	provisionTestMutationLock(t, dst)
+	if err := os.Rename(dst, oldPath); err != nil {
+		t.Fatal(err)
+	}
 
 	recovered, err := recoverInterruptedSwap(dst)
 	if err != nil {
@@ -182,17 +196,42 @@ func TestRecoverInterruptedSwap_OnlyOldPresent(t *testing.T) {
 		t.Fatalf("expected recovery to report true")
 	}
 
-	content, present := readIfExists(t, dst)
+	version, present := executableVersionIfExists(t, dst)
 	if !present {
 		t.Fatalf("dst was not created by recovery")
 	}
-	if content != "previous-version-binary" {
-		t.Fatalf("unexpected recovered content: %q", content)
+	if version != "v2.0.0" {
+		t.Fatalf("unexpected recovered version: %q", version)
 	}
 
 	// .old should have been consumed by the rename (moved, not copied).
-	if _, stillPresent := readIfExists(t, oldPath); stillPresent {
+	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf(".old should have been renamed away, but still exists")
+	}
+}
+
+func TestRecoverInterruptedSwap_OnlyNewPresent(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows recovery requires native Windows handles and ACLs")
+	}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "citadel.exe")
+	newPath := dst + ".new"
+	buildCitadelFixture(t, dst, "v2.1.0")
+	provisionTestMutationLock(t, dst)
+	if err := os.Rename(dst, newPath); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := recoverInterruptedSwap(dst)
+	if err != nil || !recovered {
+		t.Fatalf("new-only recovery = %v, %v", recovered, err)
+	}
+	if version, present := executableVersionIfExists(t, dst); !present || version != "v2.1.0" {
+		t.Fatalf("new-only recovered version = %q, present=%v", version, present)
+	}
+	if _, err := os.Stat(newPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf(".new should have been renamed away: %v", err)
 	}
 }
 
@@ -204,6 +243,11 @@ func TestRecoverInterruptedSwap_NoBackupsAvailable(t *testing.T) {
 	}
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "citadel.exe")
+	buildCitadelFixture(t, dst, "v2.0.0")
+	provisionTestMutationLock(t, dst)
+	if err := os.Remove(dst); err != nil {
+		t.Fatal(err)
+	}
 
 	recovered, err := recoverInterruptedSwap(dst)
 	if err == nil {
@@ -211,6 +255,53 @@ func TestRecoverInterruptedSwap_NoBackupsAvailable(t *testing.T) {
 	}
 	if recovered {
 		t.Fatalf("expected recovered=false alongside the error")
+	}
+}
+
+func TestRecoverInterruptedSwap_RefusesMissingValidatedLock(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows recovery requires native Windows handles and ACLs")
+	}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "citadel.exe")
+	oldPath := dst + ".old"
+	buildCitadelFixture(t, oldPath, "v2.0.0")
+
+	recovered, err := recoverInterruptedSwap(dst)
+	if err == nil || recovered {
+		t.Fatalf("recovery without validated persistent lock = %v, %v", recovered, err)
+	}
+	if _, present := executableVersionIfExists(t, oldPath); !present {
+		t.Fatal("refused recovery removed original backup")
+	}
+}
+
+func TestRecoverInterruptedSwap_RefusesInvalidArtifactIdentity(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows recovery requires native Windows handles and ACLs")
+	}
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "citadel.exe")
+	oldPath := dst + ".old"
+	newPath := dst + ".new"
+	buildCitadelFixture(t, dst, "v2.0.0")
+	provisionTestMutationLock(t, dst)
+	if err := os.Rename(dst, oldPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(newPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := recoverInterruptedSwap(dst)
+	if err == nil || recovered {
+		t.Fatalf("recovery with directory artifact = %v, %v", recovered, err)
+	}
+	if _, statErr := os.Stat(dst); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("refused recovery created destination: %v", statErr)
+	}
+	if _, present := executableVersionIfExists(t, oldPath); !present {
+		t.Fatal("refused recovery removed original backup")
 	}
 }
 
@@ -225,9 +316,10 @@ func TestRecoverInterruptedSwap_NoOpWhenDstPresent(t *testing.T) {
 	oldPath := dst + ".old"
 	newPath := dst + ".new"
 
-	writeTestBinary(t, dst, "current-binary")
-	writeTestBinary(t, oldPath, "old-binary")
-	writeTestBinary(t, newPath, "new-binary")
+	buildCitadelFixture(t, dst, "v2.1.0")
+	provisionTestMutationLock(t, dst)
+	buildCitadelFixture(t, oldPath, "v2.0.0")
+	buildCitadelFixture(t, newPath, "v2.2.0")
 
 	recovered, err := recoverInterruptedSwap(dst)
 	if err != nil {
@@ -238,14 +330,14 @@ func TestRecoverInterruptedSwap_NoOpWhenDstPresent(t *testing.T) {
 	}
 
 	// Nothing should have moved.
-	if content, ok := readIfExists(t, dst); !ok || content != "current-binary" {
-		t.Fatalf("dst was modified unexpectedly: content=%q present=%v", content, ok)
+	if version, ok := executableVersionIfExists(t, dst); !ok || version != "v2.1.0" {
+		t.Fatalf("dst was modified unexpectedly: version=%q present=%v", version, ok)
 	}
-	if content, ok := readIfExists(t, oldPath); !ok || content != "old-binary" {
-		t.Fatalf(".old was modified unexpectedly: content=%q present=%v", content, ok)
+	if version, ok := executableVersionIfExists(t, oldPath); !ok || version != "v2.0.0" {
+		t.Fatalf(".old was modified unexpectedly: version=%q present=%v", version, ok)
 	}
-	if content, ok := readIfExists(t, newPath); !ok || content != "new-binary" {
-		t.Fatalf(".new was modified unexpectedly: content=%q present=%v", content, ok)
+	if version, ok := executableVersionIfExists(t, newPath); !ok || version != "v2.2.0" {
+		t.Fatalf(".new was modified unexpectedly: version=%q present=%v", version, ok)
 	}
 }
 
@@ -262,8 +354,12 @@ func TestRecoverInterruptedSwap_PrefersNewOverOld(t *testing.T) {
 	oldPath := dst + ".old"
 	newPath := dst + ".new"
 
-	writeTestBinary(t, oldPath, "old-binary")
-	writeTestBinary(t, newPath, "new-binary")
+	buildCitadelFixture(t, dst, "v2.0.0")
+	provisionTestMutationLock(t, dst)
+	if err := os.Rename(dst, oldPath); err != nil {
+		t.Fatal(err)
+	}
+	buildCitadelFixture(t, newPath, "v2.1.0")
 
 	recovered, err := recoverInterruptedSwap(dst)
 	if err != nil {
@@ -273,17 +369,17 @@ func TestRecoverInterruptedSwap_PrefersNewOverOld(t *testing.T) {
 		t.Fatalf("expected recovery to report true")
 	}
 
-	content, present := readIfExists(t, dst)
+	version, present := executableVersionIfExists(t, dst)
 	if !present {
 		t.Fatalf("dst was not created by recovery")
 	}
-	if content != "new-binary" {
-		t.Fatalf("expected recovery to prefer the new binary, got %q", content)
+	if version != "v2.1.0" {
+		t.Fatalf("expected recovery to prefer the new binary, got %q", version)
 	}
 
 	// .old is left untouched (not consumed) since .new was used instead.
-	if content, ok := readIfExists(t, oldPath); !ok || content != "old-binary" {
-		t.Fatalf(".old should have been left alone: content=%q present=%v", content, ok)
+	if version, ok := executableVersionIfExists(t, oldPath); !ok || version != "v2.0.0" {
+		t.Fatalf(".old should have been left alone: version=%q present=%v", version, ok)
 	}
 }
 

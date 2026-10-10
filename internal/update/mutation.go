@@ -143,10 +143,10 @@ func ApplyRelease(ctx context.Context, candidatePath, requestedTarget, fetchedTa
 	}
 	keepStage := false
 	defer func() {
-		_ = stage.Close()
 		if !keepStage {
-			_ = os.Remove(stagePath)
+			removeOwnedStage(stage, stagePath)
 		}
+		_ = stage.Close()
 	}()
 	if _, err := io.Copy(stage, candidate); err != nil {
 		return ApplyResult{}, fmt.Errorf("copy candidate into swap stage: %w", err)
@@ -269,6 +269,13 @@ func validateOpenPathIdentity(file *os.File, path string) error {
 	return nil
 }
 
+func removeOwnedStage(file *os.File, path string) {
+	if err := validateOpenPathIdentity(file, path); err != nil {
+		return
+	}
+	_ = os.Remove(path)
+}
+
 func backupCurrentLocked(destination string) error {
 	if err := EnsureUpdateDir(); err != nil {
 		return err
@@ -319,9 +326,6 @@ func replaceValidatedStageLocked(stage *os.File, stagePath, destination string, 
 		return err
 	}
 	if runtime.GOOS != "windows" {
-		if err := stage.Close(); err != nil {
-			return err
-		}
 		return os.Rename(stagePath, destination)
 	}
 	if err := stage.Close(); err != nil {

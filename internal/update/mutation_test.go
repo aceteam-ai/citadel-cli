@@ -4,12 +4,91 @@ package update
 
 import (
 	"context"
+	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
+
+func TestMutationLockRefusesCanceledContextWithoutSideEffect(t *testing.T) {
+	dir := t.TempDir()
+	destination := filepath.Join(dir, "citadel")
+	if err := os.WriteFile(destination, []byte("fixture"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := acquireMutationLock(ctx, destination, true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled lock acquisition error = %v", err)
+	}
+	if _, err := os.Lstat(destination + ".citadel-update.lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled acquisition created sidecar: %v", err)
+	}
+}
+
+func TestMutationLockRefusesFIFOWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	destination := filepath.Join(dir, "citadel")
+	if err := os.WriteFile(destination, []byte("fixture"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := destination + ".citadel-update.lock"
+	if err := unix.Mkfifo(lockPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	requireFIFORefusalPromptly(t, lockPath, func() error {
+		lock, err := acquireMutationLock(context.Background(), destination, true)
+		if lock != nil {
+			_ = lock.Release()
+		}
+		return err
+	})
+}
+
+func TestOpenRegularNoFollowRefusesFIFOWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidate")
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	requireFIFORefusalPromptly(t, path, func() error {
+		file, err := openRegularNoFollow(path)
+		if file != nil {
+			_ = file.Close()
+		}
+		return err
+	})
+}
+
+func requireFIFORefusalPromptly(t *testing.T, path string, open func() error) {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- open() }()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("FIFO was accepted")
+		}
+	case <-time.After(time.Second):
+		// Unblock a mutant that omitted O_NONBLOCK so the test leaves no goroutine.
+		writer, unblockErr := unix.Open(path, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if unblockErr == nil {
+			_ = unix.Close(writer)
+		}
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+			t.Fatalf("FIFO open remained blocked and could not be cleaned up: %v", unblockErr)
+		}
+		t.Fatal("FIFO open blocked instead of refusing promptly")
+	}
+}
 
 func TestMutationLockSerializesPersistsAndRejectsUnsafeMode(t *testing.T) {
 	dir := t.TempDir()
@@ -43,6 +122,17 @@ func TestMutationLockSerializesPersistsAndRejectsUnsafeMode(t *testing.T) {
 	}
 	if _, err := acquireMutationLock(context.Background(), destination, true); err == nil {
 		t.Fatal("unsafe existing lock mode accepted")
+	}
+	if err := os.Chmod(lockPath, 0o644|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(lockPath); err != nil {
+		t.Fatal(err)
+	} else if info.Mode()&os.ModeSticky == 0 {
+		t.Fatal("filesystem did not retain the sticky mode bit")
+	}
+	if _, err := acquireMutationLock(context.Background(), destination, true); err == nil {
+		t.Fatal("lock with special mode bits accepted")
 	}
 }
 
@@ -179,8 +269,10 @@ func TestApplyReleaseRefusesReplacedCompletedStageBeforeBackup(t *testing.T) {
 	buildCitadelFixture(t, replacement, "v2.1.0")
 	originalResolver := resolveInstalledPath
 	originalHook := beforeFinalInstalledCheck
+	var foreignStagePath string
 	resolveInstalledPath = func() (string, error) { return installed, nil }
 	beforeFinalInstalledCheck = func(stagePath string) {
+		foreignStagePath = stagePath
 		if err := os.Remove(stagePath); err != nil {
 			t.Fatal(err)
 		}
@@ -197,6 +289,10 @@ func TestApplyReleaseRefusesReplacedCompletedStageBeforeBackup(t *testing.T) {
 	}
 	if _, err := os.Stat(GetPreviousBinaryPath()); !os.IsNotExist(err) {
 		t.Fatalf("replaced stage created backup: %v", err)
+	}
+	meta, err := ReadExecutableVersion(foreignStagePath)
+	if err != nil || meta.Version != "v2.1.0" {
+		t.Fatalf("refused foreign stage was removed or changed: %#v, %v", meta, err)
 	}
 }
 
@@ -218,18 +314,6 @@ func TestPublicRollbackAcquiresMutationLockOnce(t *testing.T) {
 	meta, err := ReadExecutableVersion(installed)
 	if err != nil || meta.Version != "v2.0.0" {
 		t.Fatalf("rolled-back metadata = %#v, %v", meta, err)
-	}
-}
-
-func buildCitadelFixture(t *testing.T, output, version string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", output, "-ldflags", "-s -w -X github.com/aceteam-ai/citadel-cli/cmd.version="+version, "./cmd/citadel")
-	cmd.Dir = filepath.Join("..", "..")
-	data, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("compile-only Citadel fixture %s: %v\n%s", version, err, data)
 	}
 }
 

@@ -54,6 +54,9 @@ func acquireMutationLock(ctx context.Context, destination string, allowCreate bo
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("update lock unavailable: %w", err)
+	}
 	ctx, cancel := context.WithTimeout(ctx, updateLockDeadline)
 	defer cancel()
 
@@ -90,6 +93,12 @@ func acquireMutationLock(ctx context.Context, destination string, allowCreate bo
 }
 
 func acquireRecoveryMutationLock(ctx context.Context, destination string) (*mutationLock, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("update recovery lock unavailable: %w", err)
+	}
 	if _, err := os.Stat(destination); err == nil {
 		return acquireMutationLock(ctx, destination, false)
 	} else if !os.IsNotExist(err) {
@@ -112,9 +121,6 @@ func acquireRecoveryMutationLock(ctx context.Context, destination string) (*muta
 		}
 	} else if !windowsPathAbsent(err) {
 		return nil, fmt.Errorf("update recovery cannot validate staged artifact: %w", err)
-	}
-	if ctx == nil {
-		ctx = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(ctx, updateLockDeadline)
 	defer cancel()
@@ -436,45 +442,57 @@ func createPrivateAttemptDir(parent string) (string, os.FileInfo, error) {
 		} else if err != nil {
 			return "", nil, err
 		}
-		h, err := openWindowsDirectory(dir, windows.GENERIC_READ|windows.READ_CONTROL)
+		info, err := validatePrivateAttemptDir(dir)
 		if err != nil {
 			_ = os.Remove(dir)
 			return "", nil, err
 		}
-		actual, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-		if err != nil || actual == nil {
-			windows.CloseHandle(h)
-			_ = os.Remove(dir)
-			return "", nil, fmt.Errorf("validate private attempt security: %w", err)
-		}
-		owner, _, ownerErr := actual.Owner()
-		dacl, _, daclErr := actual.DACL()
-		control, _, controlErr := actual.Control()
-		if ownerErr != nil || daclErr != nil || controlErr != nil || owner == nil || !owner.Equals(user.User.Sid) || control&windows.SE_DACL_PROTECTED == 0 {
-			windows.CloseHandle(h)
-			_ = os.Remove(dir)
-			return "", nil, fmt.Errorf("private attempt directory security does not match policy")
-		}
-		if err := validateWindowsACL(dacl, owner, false); err != nil {
-			windows.CloseHandle(h)
-			_ = os.Remove(dir)
-			return "", nil, err
-		}
-		if err := validateWindowsDirectoryPathIdentity(h, dir); err != nil {
-			windows.CloseHandle(h)
-			_ = os.Remove(dir)
-			return "", nil, err
-		}
-		heldDir := os.NewFile(uintptr(h), dir)
-		info, err := heldDir.Stat()
-		_ = heldDir.Close()
-		if err != nil || !info.IsDir() {
-			_ = os.Remove(dir)
-			return "", nil, fmt.Errorf("private attempt directory identity unavailable: %w", err)
-		}
 		return dir, info, nil
 	}
 	return "", nil, fmt.Errorf("could not allocate unique private update attempt")
+}
+
+func validatePrivateAttemptDir(dir string) (os.FileInfo, error) {
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		return nil, err
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return nil, err
+	}
+	h, err := openWindowsDirectory(dir, windows.GENERIC_READ|windows.READ_CONTROL)
+	if err != nil {
+		return nil, err
+	}
+	actual, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil || actual == nil {
+		windows.CloseHandle(h)
+		return nil, fmt.Errorf("validate private attempt security: %w", err)
+	}
+	owner, _, ownerErr := actual.Owner()
+	dacl, _, daclErr := actual.DACL()
+	control, _, controlErr := actual.Control()
+	if ownerErr != nil || daclErr != nil || controlErr != nil || owner == nil || !owner.Equals(user.User.Sid) || control&windows.SE_DACL_PROTECTED == 0 {
+		windows.CloseHandle(h)
+		return nil, fmt.Errorf("private attempt directory security does not match policy")
+	}
+	if err := validateWindowsACL(dacl, owner, false); err != nil {
+		windows.CloseHandle(h)
+		return nil, err
+	}
+	if err := validateWindowsDirectoryPathIdentity(h, dir); err != nil {
+		windows.CloseHandle(h)
+		return nil, err
+	}
+	heldDir := os.NewFile(uintptr(h), dir)
+	info, err := heldDir.Stat()
+	_ = heldDir.Close()
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("private attempt directory identity unavailable: %w", err)
+	}
+	return info, nil
 }
 
 func openRegularNoFollow(path string) (*os.File, error) {

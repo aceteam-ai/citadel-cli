@@ -51,6 +51,9 @@ func acquireMutationLock(ctx context.Context, destination string, allowCreate bo
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("update lock unavailable: %w", err)
+	}
 	ctx, cancel := context.WithTimeout(ctx, updateLockDeadline)
 	defer cancel()
 
@@ -101,7 +104,7 @@ func statInstalledIdentity(path string) (installedIdentity, error) {
 }
 
 func openMutationLock(path string, identity installedIdentity, allowCreate bool) (*os.File, error) {
-	flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
+	flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
 	fd, err := unix.Open(path, flags, 0)
 	if err == nil {
 		file := os.NewFile(uintptr(fd), path)
@@ -153,8 +156,9 @@ func validateLockIdentity(file *os.File, path string, identity installedIdentity
 	if !fdInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(fdInfo, pathInfo) {
 		return fmt.Errorf("lock is not a stable regular file")
 	}
-	if fdInfo.Mode().Perm() != 0o644 {
-		return fmt.Errorf("lock has unsafe mode %04o", fdInfo.Mode().Perm())
+	mode := fdInfo.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+	if mode != 0o644 {
+		return fmt.Errorf("lock has unsafe mode %v", mode)
 	}
 	st, ok := fdInfo.Sys().(*syscall.Stat_t)
 	if !ok || st.Nlink != 1 || st.Uid != identity.uid {
@@ -197,22 +201,34 @@ func createPrivateAttemptDir(parent string) (string, os.FileInfo, error) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", nil, err
 	}
-	fd, err := unix.Open(filepath.Clean(dir), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+	info, err := validatePrivateAttemptDir(dir)
 	if err != nil {
 		return "", nil, err
-	}
-	file := os.NewFile(uintptr(fd), dir)
-	info, err := file.Stat()
-	_ = file.Close()
-	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
-		return "", nil, fmt.Errorf("attempt directory is not private")
 	}
 	cleanup = false
 	return dir, info, nil
 }
 
+func validatePrivateAttemptDir(dir string) (os.FileInfo, error) {
+	fd, err := unix.Open(filepath.Clean(dir), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), dir)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		return nil, fmt.Errorf("attempt directory is not private")
+	}
+	named, err := os.Lstat(dir)
+	if err != nil || named.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, named) {
+		return nil, fmt.Errorf("attempt directory identity is unstable")
+	}
+	return info, nil
+}
+
 func openRegularNoFollow(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
