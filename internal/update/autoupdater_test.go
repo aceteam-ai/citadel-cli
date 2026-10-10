@@ -4,6 +4,7 @@ package update
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -125,6 +126,66 @@ func TestRunOnce_DownloadError_NoApply(t *testing.T) {
 	}
 	if drained {
 		t.Error("must not drain before a successful download")
+	}
+}
+
+func TestRunOnce_FinalSupersededReleasesDrainWithoutStageOrRestart(t *testing.T) {
+	isolateState(t)
+	drained, released, restarted := false, false, false
+	u := NewAutoUpdater(AutoUpdaterConfig{
+		Checker:    &fakeChecker{release: &Release{TagName: "v9.9.9"}},
+		ActiveJobs: func() int { return 0 },
+		BeginDrain: func() func() {
+			drained = true
+			return func() { released = true }
+		},
+		NewAttempt: func() (*UpdateAttempt, error) { return &UpdateAttempt{Candidate: "unused"}, nil },
+		ApplyRelease: func(context.Context, string, string, string, ApplyIntent) (ApplyResult, error) {
+			return ApplyResult{Disposition: Superseded, InstalledBefore: "v10.0.0", InstalledAfter: "v10.0.0"}, nil
+		},
+		Restart: func() error { restarted = true; return nil },
+	})
+	if u.runOnce(context.Background()) {
+		t.Fatal("superseded update reported restart")
+	}
+	if !drained || !released || restarted {
+		t.Fatalf("drained=%v released=%v restarted=%v", drained, released, restarted)
+	}
+	state, err := LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.LastResult != ResultUpToDate || state.CurrentVersion != "" || state.PreviousVersion != "" {
+		t.Fatalf("unexpected no-op state: %#v", state)
+	}
+}
+
+func TestRunOnce_CleansPrivateAttemptBeforeRestart(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var attemptDir string
+	u := NewAutoUpdater(AutoUpdaterConfig{
+		Checker:    &fakeChecker{release: &Release{TagName: "v9.9.9"}},
+		ActiveJobs: func() int { return 0 },
+		BeginDrain: func() func() { return func() {} },
+		NewAttempt: func() (*UpdateAttempt, error) {
+			attempt, err := NewUpdateAttempt()
+			if attempt != nil {
+				attemptDir = attempt.Dir
+			}
+			return attempt, err
+		},
+		ApplyRelease: func(context.Context, string, string, string, ApplyIntent) (ApplyResult, error) {
+			return ApplyResult{Disposition: Applied, InstalledBefore: "v1.0.0", InstalledAfter: "v9.9.9"}, nil
+		},
+		Restart: func() error {
+			if _, err := os.Lstat(attemptDir); !os.IsNotExist(err) {
+				t.Fatalf("attempt still exists at restart: %v", err)
+			}
+			return nil
+		},
+	})
+	if !u.runOnce(context.Background()) {
+		t.Fatal("successful restart path returned false")
 	}
 }
 

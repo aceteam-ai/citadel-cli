@@ -10,6 +10,7 @@ import (
 	"time"
 
 	jobhandlers "github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
@@ -602,6 +603,68 @@ func TestRunnerNacksFailedJobs(t *testing.T) {
 	acked := source.AckedJobs()
 	if len(acked) != 0 {
 		t.Errorf("Acked jobs = %d, want 0", len(acked))
+	}
+}
+
+func TestRunnerAgentUpdateDeterministicRefusalFailsWithoutNack(t *testing.T) {
+	job := &Job{
+		ID:          "agent-update-stale",
+		Type:        JobTypeAgentUpdate,
+		SourceQueue: perNodeQueue,
+		Payload:     map[string]any{"target_version": "not-a-semver"},
+	}
+	source := NewMockJobSource("test", []*Job{job})
+	handler := newTestHandler(t, nil)
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{WorkerID: "test-worker"})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+	if len(source.FailedJobs()) != 1 {
+		t.Fatalf("Failed jobs = %d, want 1", len(source.FailedJobs()))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Fatalf("Nacked jobs = %d, want 0", len(source.NackedJobs()))
+	}
+	if len(source.AckedJobs()) != 0 {
+		t.Fatalf("Acked jobs = %d, want 0", len(source.AckedJobs()))
+	}
+}
+
+func TestRunnerAgentUpdateTransientFailuresNack(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+		mutate  func(*AgentUpdateConfig)
+	}{
+		{
+			name:    "lock",
+			payload: map[string]any{"target_version": "v2.47.0"},
+			mutate: func(c *AgentUpdateConfig) {
+				c.CheckExact = func(context.Context, string) (string, update.VersionRelation, error) {
+					return "", 0, errors.New("update lock unavailable")
+				}
+			},
+		},
+		{
+			name: "network",
+			mutate: func(c *AgentUpdateConfig) {
+				c.GetRelease = func(string) (*update.Release, error) {
+					return nil, errors.New("temporary network failure")
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := agentUpdateJob(perNodeQueue, tc.payload)
+			source := NewMockJobSource("test", []*Job{job})
+			runner := NewRunner(source, []JobHandler{newTestHandler(t, tc.mutate)}, RunnerConfig{WorkerID: "test-worker"})
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			runner.Run(ctx)
+			if len(source.NackedJobs()) != 1 || len(source.FailedJobs()) != 0 || len(source.AckedJobs()) != 0 {
+				t.Fatalf("nack/fail/ack = %d/%d/%d, want 1/0/0", len(source.NackedJobs()), len(source.FailedJobs()), len(source.AckedJobs()))
+			}
+		})
 	}
 }
 

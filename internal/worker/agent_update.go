@@ -53,6 +53,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -74,6 +75,10 @@ type AgentUpdateConfig struct {
 	// the requested/latest version. Defaults to a GitHub-backed lookup.
 	GetRelease func(target string) (*update.Release, error)
 
+	// CheckExact performs the locked installed-disk preflight for an exact
+	// target. It is not used for latest updates.
+	CheckExact func(context.Context, string) (string, update.VersionRelation, error)
+
 	// Download downloads + checksum-verifies the release asset to destPath.
 	// Defaults to update.NewClient(...).DownloadAndVerify.
 	Download func(release *update.Release, destPath string) error
@@ -82,6 +87,12 @@ type AgentUpdateConfig struct {
 	// binary (keeping the previous copy for rollback). Defaults to
 	// update.ApplyUpdate.
 	Apply func(pendingPath string) error
+
+	// ApplyRelease performs the final locked recheck and byte-bound commit.
+	ApplyRelease func(context.Context, string, string, string, update.ApplyIntent) (update.ApplyResult, error)
+
+	// NewAttempt allocates one private download/extraction directory.
+	NewAttempt func() (*update.UpdateAttempt, error)
 
 	// PendingPath is where the downloaded binary is staged.
 	// Defaults to update.GetPendingBinaryPath().
@@ -156,28 +167,37 @@ func NewAgentUpdateHandler(cfg AgentUpdateConfig) *AgentUpdateHandler {
 			if err != nil {
 				return nil, err
 			}
-			// Honor the "already on requested version" case symmetrically with
-			// the latest path so the caller gets (nil, nil) → "already-latest".
-			newer, err := update.IsNewerVersion(cfg.Version, rel.TagName)
-			if err != nil {
-				return nil, err
-			}
-			if !newer {
-				return nil, nil
-			}
 			return rel, nil
 		}
+	}
+	if cfg.CheckExact == nil {
+		cfg.CheckExact = update.CheckExactTarget
 	}
 	if cfg.Download == nil {
 		cfg.Download = func(release *update.Release, destPath string) error {
 			return update.NewClientWithTimeout(cfg.Version, 5*time.Minute).DownloadAndVerify(release, destPath)
 		}
 	}
-	if cfg.Apply == nil {
-		cfg.Apply = update.ApplyUpdate
+	if cfg.ApplyRelease == nil {
+		if cfg.Apply != nil {
+			cfg.ApplyRelease = func(_ context.Context, candidate, _, fetched string, _ update.ApplyIntent) (update.ApplyResult, error) {
+				if err := cfg.Apply(candidate); err != nil {
+					return update.ApplyResult{}, err
+				}
+				return update.ApplyResult{Disposition: update.Applied, InstalledBefore: cfg.Version, InstalledAfter: fetched}, nil
+			}
+		} else {
+			cfg.ApplyRelease = update.ApplyRelease
+		}
 	}
-	if cfg.PendingPath == "" {
-		cfg.PendingPath = update.GetPendingBinaryPath()
+	if cfg.NewAttempt == nil {
+		if cfg.PendingPath != "" {
+			cfg.NewAttempt = func() (*update.UpdateAttempt, error) {
+				return &update.UpdateAttempt{Candidate: cfg.PendingPath}, nil
+			}
+		} else {
+			cfg.NewAttempt = update.NewUpdateAttempt
+		}
 	}
 	if cfg.IsService == nil {
 		cfg.IsService = defaultIsService
@@ -240,8 +260,38 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 
 	target := payloadString(job.Payload, "target_version")
 	h.cfg.Log("AGENT_UPDATE: checking for release (target=%q, current=%s)", target, h.cfg.Version)
+	installedBefore := h.cfg.Version
+	canonicalTarget := ""
+	if target != "" {
+		var relation update.VersionRelation
+		var err error
+		canonicalTarget, err = update.NormalizeExactVersion(target)
+		if err != nil {
+			return h.terminalFailure(err), nil
+		}
+		installedBefore, relation, err = h.cfg.CheckExact(ctx, canonicalTarget)
+		if err != nil {
+			if update.IsDeterministicUpdateError(err) {
+				return h.terminalFailure(err), nil
+			}
+			return h.failure(fmt.Errorf("exact update preflight failed: %w", err)), nil
+		}
+		if relation == update.TargetEqual {
+			return h.success(map[string]any{
+				"updated": false, "reason": "already-latest",
+				"old_version": installedBefore, "new_version": installedBefore,
+			}), nil
+		}
+		if relation == update.TargetOlder {
+			return h.terminalFailure(fmt.Errorf("exact update target is older than the installed Citadel release")), nil
+		}
+	}
 
-	release, err := h.cfg.GetRelease(target)
+	lookupTarget := target
+	if canonicalTarget != "" {
+		lookupTarget = canonicalTarget
+	}
+	release, err := h.cfg.GetRelease(lookupTarget)
 	if err != nil {
 		return h.failure(fmt.Errorf("update check failed: %w", err)), nil
 	}
@@ -252,9 +302,12 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 		return h.success(map[string]any{
 			"updated":     false,
 			"reason":      "already-latest",
-			"old_version": h.cfg.Version,
-			"new_version": h.cfg.Version,
+			"old_version": installedBefore,
+			"new_version": installedBefore,
 		}), nil
+	}
+	if canonicalTarget != "" && !update.ExactVersionIdentityEqual(canonicalTarget, release.TagName) {
+		return h.terminalFailure(fmt.Errorf("fetched release does not match exact update target")), nil
 	}
 
 	// Homebrew-managed nodes (macOS) update through `brew upgrade`, not a remote
@@ -266,33 +319,53 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 		return h.success(map[string]any{
 			"updated":           false,
 			"reason":            "homebrew-managed; update via `brew upgrade citadel`",
-			"old_version":       h.cfg.Version,
-			"new_version":       h.cfg.Version,
+			"old_version":       installedBefore,
+			"new_version":       installedBefore,
 			"available_version": release.TagName,
 		}), nil
 	}
 
+	attempt, err := h.cfg.NewAttempt()
+	if err != nil {
+		return h.failure(fmt.Errorf("create private update attempt: %w", err)), nil
+	}
+	defer attempt.Cleanup()
 	h.cfg.Log("AGENT_UPDATE: downloading %s", release.TagName)
-	if err := h.cfg.Download(release, h.cfg.PendingPath); err != nil {
+	if err := h.cfg.Download(release, attempt.Candidate); err != nil {
 		return h.failure(fmt.Errorf("download/verify failed for %s: %w", release.TagName, err)), nil
 	}
 
 	h.cfg.Log("AGENT_UPDATE: installing %s", release.TagName)
-	if err := h.cfg.Apply(h.cfg.PendingPath); err != nil {
+	intent := update.Latest
+	if canonicalTarget != "" {
+		intent = update.ExactRemote
+	}
+	applyResult, err := h.cfg.ApplyRelease(ctx, attempt.Candidate, canonicalTarget, release.TagName, intent)
+	if err != nil {
 		// Apply validates the new binary and rolls back internally on failure, so
 		// the current version keeps running.
-		return h.failure(fmt.Errorf("install failed for %s (kept %s): %w", release.TagName, h.cfg.Version, err)), nil
+		wrapped := fmt.Errorf("install failed for %s (kept current release): %w", release.TagName, err)
+		if update.IsDeterministicUpdateError(err) {
+			return h.terminalFailure(wrapped), nil
+		}
+		return h.failure(wrapped), nil
+	}
+	if applyResult.Disposition != update.Applied {
+		return h.success(map[string]any{
+			"updated": false, "reason": "already-latest",
+			"old_version": applyResult.InstalledBefore, "new_version": applyResult.InstalledAfter,
+		}), nil
 	}
 
-	h.cfg.RecordState(h.cfg.Version, release.TagName)
+	h.cfg.RecordState(applyResult.InstalledBefore, applyResult.InstalledAfter)
 
 	isService := h.cfg.IsService()
-	h.cfg.Log("AGENT_UPDATE: installed %s (was %s); service=%v", release.TagName, h.cfg.Version, isService)
+	h.cfg.Log("AGENT_UPDATE: installed %s (was %s); service=%v", applyResult.InstalledAfter, applyResult.InstalledBefore, isService)
 
 	result := map[string]any{
 		"updated":     true,
-		"old_version": h.cfg.Version,
-		"new_version": release.TagName,
+		"old_version": applyResult.InstalledBefore,
+		"new_version": applyResult.InstalledAfter,
 		"restarting":  isService,
 	}
 	if !isService {
@@ -306,7 +379,7 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 	// counted active (its defers have not run yet), so the goroutine cannot fire
 	// until ActiveJobs()==0 — which is only reached after the runner publishes
 	// this result and acks the job. Draining first closes the pickup race.
-	h.armRestart(ctx, release.TagName)
+	h.armRestart(ctx, applyResult.InstalledAfter)
 	return h.success(result), nil
 }
 
@@ -364,6 +437,24 @@ func (h *AgentUpdateHandler) failure(err error) *JobResult {
 		Error:  err,
 		Output: map[string]any{"error": err.Error()},
 	}
+}
+
+func (h *AgentUpdateHandler) terminalFailure(err error) *JobResult {
+	message := sanitizedAgentUpdateError(err)
+	sanitized := errors.New(message)
+	return &JobResult{
+		Status: JobStatusTerminalFailure,
+		Error:  sanitized,
+		Output: map[string]any{"error": message},
+	}
+}
+
+func sanitizedAgentUpdateError(err error) string {
+	message := err.Error()
+	if len(message) > 256 {
+		message = message[:256]
+	}
+	return message
 }
 
 // isPerNodeStream reports whether a source queue name is a per-node shell

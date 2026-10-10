@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,14 +60,23 @@ var updateInstallRestart bool
 // service.RematerializeManagedUnits.
 var rematerializeManagedUnitsFn = service.RematerializeManagedUnits
 
+var (
+	newUpdateAttemptFn = update.NewUpdateAttempt
+	applyReleaseFn     = update.ApplyRelease
+	downloadReleaseFn  = func(client *update.Client, release *update.Release, destination string) error {
+		return client.DownloadAndVerify(release, destination)
+	}
+)
+
 var updateInstallCmd = &cobra.Command{
 	Use:   "install",
 	Short: "Download and install the latest version",
 	Long: `Downloads the latest version from GitHub, verifies the checksum,
 backs up the current version, and installs the new binary.
 
-If the new version fails to start, it will automatically roll back
-to the previous version.
+The downloaded executable is inspected without running it and must match this
+platform and release. Transaction failures roll back to the previous version;
+startup/runtime health is verified only after the next launch.
 
 If citadel is running as a managed service (systemd/launchd/Windows
 service), swapping the binary on disk does NOT restart the already-running
@@ -226,26 +236,29 @@ func installUpdate() {
 	dlSpinner := whimsy.NewSimpleSpinner(whimsy.DownloadMessages)
 	dlSpinner.Start()
 
-	pendingPath := update.GetPendingBinaryPath()
-	if err := client.DownloadAndVerify(release, pendingPath); err != nil {
-		dlSpinner.StopWithError(fmt.Sprintf("Error downloading update: %v", err))
+	var installSpinner *whimsy.SimpleSpinner
+	applyResult, err := downloadAndApplyManual(client, release, func() {
+		dlSpinner.StopWithSuccess("Downloaded and verified checksum")
+		installSpinner = whimsy.NewSimpleSpinner(whimsy.ProvisioningMessages)
+		installSpinner.Start()
+	})
+	if err != nil {
+		if installSpinner != nil {
+			installSpinner.StopWithError(fmt.Sprintf("Error installing update: %v", err))
+		} else {
+			dlSpinner.StopWithError(fmt.Sprintf("Error downloading update: %v", err))
+		}
 		os.Exit(1)
 	}
 
-	dlSpinner.StopWithSuccess("Downloaded and verified checksum")
-
-	// Install update
-	installSpinner := whimsy.NewSimpleSpinner(whimsy.ProvisioningMessages)
-	installSpinner.Start()
-
-	if err := update.ApplyUpdate(pendingPath); err != nil {
-		installSpinner.StopWithError(fmt.Sprintf("Error installing update: %v", err))
-		os.Exit(1)
+	if finishManualNoOp(applyResult, os.Stdout) {
+		installSpinner.StopWithSuccess(fmt.Sprintf("You are running the latest version (%s)", applyResult.InstalledAfter))
+		return
 	}
 
 	// Update state
 	state, _ := update.LoadState()
-	update.RecordUpdate(state, Version, release.TagName)
+	update.RecordUpdate(state, applyResult.InstalledBefore, applyResult.InstalledAfter)
 	update.UpdateLastCheck(state)
 	_ = update.SaveState(state)
 
@@ -269,6 +282,31 @@ func installUpdate() {
 	// terms"); this is that "own terms" for the manual CLI path: warn loudly by
 	// default, or restart when the operator explicitly opted in via --restart.
 	warnOrRestartManagedService(updateInstallRestart)
+}
+
+func finishManualNoOp(result update.ApplyResult, out io.Writer) bool {
+	if result.Disposition == update.Applied {
+		return false
+	}
+	refreshManagedServiceUnits(out)
+	return true
+}
+
+// downloadAndApplyManual is returning so its deferred private-attempt cleanup
+// always completes before the Cobra wrapper can call os.Exit.
+func downloadAndApplyManual(client *update.Client, release *update.Release, onDownloaded func()) (update.ApplyResult, error) {
+	attempt, err := newUpdateAttemptFn()
+	if err != nil {
+		return update.ApplyResult{}, fmt.Errorf("create private update attempt: %w", err)
+	}
+	defer attempt.Cleanup()
+	if err := downloadReleaseFn(client, release, attempt.Candidate); err != nil {
+		return update.ApplyResult{}, err
+	}
+	if onDownloaded != nil {
+		onDownloaded()
+	}
+	return applyReleaseFn(context.Background(), attempt.Candidate, "", release.TagName, update.Latest)
 }
 
 // refreshManagedServiceUnits runs the idempotent managed-unit refresh and

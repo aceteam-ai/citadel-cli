@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"time"
 )
 
 // GetCurrentBinaryPath returns the path to the currently running binary
@@ -31,88 +29,37 @@ func GetCurrentBinaryPath() (string, error) {
 
 // BackupCurrent copies the current binary to citadel.previous
 func BackupCurrent() error {
-	currentPath, err := GetCurrentBinaryPath()
+	currentPath, err := resolveInstalledPath()
 	if err != nil {
 		return err
 	}
 
-	previousPath := GetPreviousBinaryPath()
-
-	if err := EnsureUpdateDir(); err != nil {
+	lock, err := acquireMutationLock(context.Background(), currentPath, true)
+	if err != nil {
 		return err
 	}
-
-	return copyFile(currentPath, previousPath)
+	defer lock.Release()
+	return backupCurrentLocked(currentPath)
 }
 
 // ApplyUpdate replaces the current binary with the new one
-// Automatically rolls back if the new binary fails validation
+// It validates metadata/platform without executing the candidate and rolls
+// back if the transaction or post-replacement metadata check fails.
 func ApplyUpdate(newBinaryPath string) error {
-	currentPath, err := GetCurrentBinaryPath()
+	meta, err := ReadExecutableVersion(newBinaryPath)
 	if err != nil {
-		return fmt.Errorf("failed to get current binary path: %w", err)
+		return fmt.Errorf("read candidate metadata: %w", err)
 	}
-
-	// Homebrew guard (citadel-cli#1043): refuse the in-place swap when the
-	// running binary is Homebrew-managed on macOS -- overwriting the Cellar file
-	// would corrupt Homebrew's receipt. This check goes BEFORE BackupCurrent so
-	// we don't copy the Cellar binary to .previous for an update we won't apply.
-	// It is the single chokepoint that protects every caller (the CLI, the
-	// auto-updater, the AGENT_UPDATE handler); callers branch on ErrHomebrewManaged
-	// to render `brew upgrade` guidance instead of a generic failure.
-	if IsHomebrewManagedPath(currentPath, runtime.GOOS) {
-		return ErrHomebrewManaged
+	result, err := ApplyRelease(context.Background(), newBinaryPath, "", meta.Version, Latest)
+	if err == nil && result.Disposition == Applied {
+		_ = os.Remove(newBinaryPath)
 	}
-	if IsDesktopManagedPath(currentPath, runtime.GOOS) {
-		return ErrDesktopManaged
-	}
-
-	// 1. Backup current binary
-	if err := BackupCurrent(); err != nil {
-		return fmt.Errorf("failed to backup current binary: %w", err)
-	}
-
-	// 2. Replace binary (platform-specific)
-	if runtime.GOOS == "windows" {
-		if err := atomicReplaceWindows(newBinaryPath, currentPath); err != nil {
-			if rollbackErr := Rollback(); rollbackErr != nil {
-				return fmt.Errorf("replace failed (%w) and rollback failed (%w)", err, rollbackErr)
-			}
-			return fmt.Errorf("replace failed, rolled back: %w", err)
-		}
-	} else {
-		if err := atomicReplaceUnix(newBinaryPath, currentPath); err != nil {
-			if rollbackErr := Rollback(); rollbackErr != nil {
-				return fmt.Errorf("replace failed (%w) and rollback failed (%w)", err, rollbackErr)
-			}
-			return fmt.Errorf("replace failed, rolled back: %w", err)
-		}
-	}
-
-	// 3. Validate new binary
-	if err := ValidateBinary(currentPath); err != nil {
-		if rollbackErr := Rollback(); rollbackErr != nil {
-			return fmt.Errorf("validation failed (%w) and rollback failed (%w)", err, rollbackErr)
-		}
-		return fmt.Errorf("new binary failed validation, rolled back: %w", err)
-	}
-
-	// 4. Clean up pending binary
-	os.Remove(newBinaryPath)
-
-	return nil
+	return err
 }
 
 // Rollback restores the previous binary
 func Rollback() error {
-	previousPath := GetPreviousBinaryPath()
-
-	// Check if previous binary exists
-	if _, err := os.Stat(previousPath); os.IsNotExist(err) {
-		return fmt.Errorf("no previous binary found at %s", previousPath)
-	}
-
-	currentPath, err := GetCurrentBinaryPath()
+	currentPath, err := resolveInstalledPath()
 	if err != nil {
 		return fmt.Errorf("failed to get current binary path: %w", err)
 	}
@@ -129,27 +76,23 @@ func Rollback() error {
 		return ErrDesktopManaged
 	}
 
-	// Restore previous binary
-	if runtime.GOOS == "windows" {
-		return atomicReplaceWindows(previousPath, currentPath)
+	lock, err := acquireMutationLock(context.Background(), currentPath, true)
+	if err != nil {
+		return err
 	}
-	return atomicReplaceUnix(previousPath, currentPath)
+	defer lock.Release()
+	return rollbackLocked(currentPath, lock.identity)
 }
 
-// ValidateBinary runs the binary with --version to check if it's working
+// ValidateBinary inspects the binary without executing it.
 func ValidateBinary(path string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, path, "version")
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-
-	if err := cmd.Run(); err != nil {
+	f, err := openRegularNoFollow(path)
+	if err != nil {
 		return fmt.Errorf("binary validation failed: %w", err)
 	}
-
-	return nil
+	defer f.Close()
+	_, err = validateExecutableForInstall(f)
+	return err
 }
 
 // HasPreviousVersion returns true if a previous binary exists for rollback
@@ -167,16 +110,11 @@ func GetPreviousVersionInfo() (string, error) {
 		return "", fmt.Errorf("no previous version available")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, previousPath, "version")
-	output, err := cmd.Output()
+	meta, err := ReadExecutableVersion(previousPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to get previous version: %w", err)
 	}
-
-	return string(output), nil
+	return meta.Version, nil
 }
 
 // atomicReplaceUnix replaces a binary atomically on Unix systems
@@ -295,6 +233,18 @@ func atomicReplaceWindows(src, dst string) error {
 // Returns (false, nil) when dst was already present and nothing needed to be
 // done.
 func recoverInterruptedSwap(dst string) (bool, error) {
+	lock, err := acquireRecoveryMutationLock(context.Background(), dst)
+	if err != nil {
+		return false, err
+	}
+	if lock == nil {
+		return false, nil
+	}
+	defer lock.Release()
+	return recoverInterruptedSwapLocked(dst, lock.identity)
+}
+
+func recoverInterruptedSwapLocked(dst string, identity installedIdentity) (bool, error) {
 	if _, err := os.Stat(dst); err == nil {
 		return false, nil // dst present; nothing to recover
 	} else if !os.IsNotExist(err) {
@@ -305,20 +255,50 @@ func recoverInterruptedSwap(dst string) (bool, error) {
 	oldPath := dst + ".old"
 
 	if _, err := os.Stat(newPath); err == nil {
+		if err := validateRecoveryArtifact(newPath, identity); err != nil {
+			return false, fmt.Errorf("unsafe interrupted-update candidate: %w", err)
+		}
+		if _, err := os.Stat(oldPath); err == nil {
+			if err := validateRecoveryArtifact(oldPath, identity); err != nil {
+				return false, fmt.Errorf("unsafe interrupted-update backup: %w", err)
+			}
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("failed to inspect interrupted-update backup: %w", err)
+		}
 		if err := os.Rename(newPath, dst); err != nil {
 			return false, fmt.Errorf("failed to recover %s from %s: %w", dst, newPath, err)
 		}
 		return true, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("failed to inspect interrupted-update candidate: %w", err)
 	}
 
 	if _, err := os.Stat(oldPath); err == nil {
+		if err := validateRecoveryArtifact(oldPath, identity); err != nil {
+			return false, fmt.Errorf("unsafe interrupted-update backup: %w", err)
+		}
 		if err := os.Rename(oldPath, dst); err != nil {
 			return false, fmt.Errorf("failed to recover %s from %s: %w", dst, oldPath, err)
 		}
 		return true, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("failed to inspect interrupted-update backup: %w", err)
 	}
 
 	return false, fmt.Errorf("no backup binary found to recover %s (checked %s and %s)", dst, newPath, oldPath)
+}
+
+func validateRecoveryArtifact(path string, identity installedIdentity) error {
+	file, err := openRegularNoFollow(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := setStageOwner(file, identity); err != nil {
+		return err
+	}
+	_, err = validateExecutableForInstall(file)
+	return err
 }
 
 // RecoverInterruptedSwap checks for and repairs an interrupted Windows binary
@@ -368,10 +348,16 @@ func copyFile(src, dst string) error {
 
 // CleanupOldBinaries removes old/temporary binary files
 func CleanupOldBinaries() error {
-	currentPath, err := GetCurrentBinaryPath()
+	currentPath, err := resolveInstalledPath()
 	if err != nil {
 		return nil // Ignore errors in cleanup
 	}
+
+	lock, err := acquireMutationLock(context.Background(), currentPath, true)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
 
 	// Clean up .old files (Windows leftovers)
 	oldPath := currentPath + ".old"
