@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -314,6 +315,17 @@ func TestPublicRollbackAcquiresMutationLockOnce(t *testing.T) {
 	meta, err := ReadExecutableVersion(installed)
 	if err != nil || meta.Version != "v2.0.0" {
 		t.Fatalf("rolled-back metadata = %#v, %v", meta, err)
+	}
+	if stages, err := filepath.Glob(filepath.Join(dir, ".citadel-update-stage-*")); err != nil || len(stages) != 0 {
+		t.Fatalf("rollback left swap stages = %v, %v", stages, err)
+	}
+	if descriptors, err := os.ReadDir("/proc/self/fd"); err == nil {
+		for _, descriptor := range descriptors {
+			target, readErr := os.Readlink(filepath.Join("/proc/self/fd", descriptor.Name()))
+			if readErr == nil && strings.Contains(target, dir) && strings.Contains(target, ".citadel-update-stage-") {
+				t.Fatalf("rollback left swap-stage descriptor open: %s -> %s", descriptor.Name(), target)
+			}
+		}
 	}
 }
 

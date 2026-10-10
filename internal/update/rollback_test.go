@@ -57,6 +57,53 @@ func assertCompleteBinarySomewhere(t *testing.T, dst, oldVersion, newVersion str
 		dst, dst, dstVersion, dstOK, oldPathVersion, oldOK)
 }
 
+// TestRecoveryOwnerAuthorityMismatchIsRejected exercises the pure owner-key
+// decision used by native Windows recovery without changing any real ACL.
+func TestRecoveryOwnerAuthorityMismatchIsRejected(t *testing.T) {
+	if err := validateOwnerAuthority("owner-a", "owner-a"); err != nil {
+		t.Fatalf("matching owner rejected: %v", err)
+	}
+	for _, actual := range []string{"", "owner-b"} {
+		if err := validateOwnerAuthority("owner-a", actual); err == nil {
+			t.Fatalf("mismatched owner %q accepted", actual)
+		}
+	}
+}
+
+func TestApplyReleaseStageOwnerMismatchRefusesBeforeBackup(t *testing.T) {
+	setAttemptTestHome(t)
+	dir := t.TempDir()
+	installed := filepath.Join(dir, "citadel")
+	candidate := filepath.Join(dir, "candidate")
+	if runtime.GOOS == "windows" {
+		installed += ".exe"
+		candidate += ".exe"
+	}
+	buildCitadelFixture(t, installed, "v2.0.0")
+	buildCitadelFixture(t, candidate, "v2.1.0")
+	originalResolver := resolveInstalledPath
+	originalOwner := preserveSwapStageOwner
+	resolveInstalledPath = func() (string, error) { return installed, nil }
+	preserveSwapStageOwner = func(*os.File, installedIdentity) error {
+		return validateOwnerAuthority("installed-owner", "different-stage-owner")
+	}
+	t.Cleanup(func() {
+		resolveInstalledPath = originalResolver
+		preserveSwapStageOwner = originalOwner
+	})
+
+	if _, err := ApplyRelease(context.Background(), candidate, "v2.1.0", "v2.1.0", ExactRemote); err == nil {
+		t.Fatal("stage owner mismatch was accepted")
+	}
+	if _, err := os.Stat(GetPreviousBinaryPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stage owner mismatch created backup: %v", err)
+	}
+	meta, err := ReadExecutableVersion(installed)
+	if err != nil || meta.Version != "v2.0.0" {
+		t.Fatalf("stage owner mismatch changed installation: %#v, %v", meta, err)
+	}
+}
+
 // TestAtomicReplaceWindows_InjectedFailures tables the four points at which a
 // kill can land in atomicReplaceWindows's sequence (citadel#926) and asserts
 // that in every case a complete binary remains recoverable at dst or

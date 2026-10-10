@@ -116,7 +116,7 @@ func acquireRecoveryMutationLock(ctx context.Context, destination string) (*muta
 			return nil, fmt.Errorf("update recovery has no validated owner artifact: %w", oldErr)
 		}
 	} else if newIdentity, err := windowsInstalledIdentity(newPath); err == nil {
-		if !newIdentity.owner.Equals(identity.owner) {
+		if validateOwnerAuthority(identity.owner.String(), newIdentity.owner.String()) != nil {
 			return nil, fmt.Errorf("update recovery artifacts have mismatched owners")
 		}
 	} else if !windowsPathAbsent(err) {
@@ -405,10 +405,10 @@ func setStageOwner(file *os.File, identity installedIdentity) error {
 		return err
 	}
 	owner, _, err := sd.Owner()
-	if err != nil || owner == nil || !owner.Equals(identity.owner) {
-		return fmt.Errorf("new stage owner does not match installed executable")
+	if err != nil || owner == nil {
+		return fmt.Errorf("read new stage owner: %w", err)
 	}
-	return nil
+	return validateOwnerAuthority(identity.owner.String(), owner.String())
 }
 
 func createPrivateAttemptDir(parent string) (string, os.FileInfo, error) {

@@ -32,6 +32,7 @@ type ApplyResult struct {
 
 var resolveInstalledPath = GetCurrentBinaryPath
 var beforeFinalInstalledCheck = func(string) {}
+var preserveSwapStageOwner = setStageOwner
 
 // CheckExactTarget performs the locked, installed-disk preflight for an exact
 // remote update. It never holds the lock across release lookup or download.
@@ -156,7 +157,7 @@ func ApplyRelease(ctx context.Context, candidatePath, requestedTarget, fetchedTa
 			return ApplyResult{}, fmt.Errorf("set swap stage mode: %w", err)
 		}
 	}
-	if err := setStageOwner(stage, lock.identity); err != nil {
+	if err := preserveSwapStageOwner(stage, lock.identity); err != nil {
 		return ApplyResult{}, err
 	}
 	if err := stage.Sync(); err != nil {
@@ -245,7 +246,7 @@ func createSwapStage(destination string, identity installedIdentity) (*os.File, 
 	if err != nil {
 		return nil, "", fmt.Errorf("create same-directory swap stage: %w", err)
 	}
-	if err := setStageOwner(file, identity); err != nil {
+	if err := preserveSwapStageOwner(file, identity); err != nil {
 		path := file.Name()
 		_ = file.Close()
 		_ = os.Remove(path)
@@ -386,31 +387,29 @@ func rollbackLocked(destination string, identity installedIdentity) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.Remove(stagePath) }()
+	defer func() {
+		removeOwnedStage(stage, stagePath)
+		_ = stage.Close()
+	}()
 	src, err := openRegularNoFollow(previous)
 	if err != nil {
-		_ = stage.Close()
 		return err
 	}
 	_, copyErr := io.Copy(stage, src)
 	_ = src.Close()
 	if copyErr != nil {
-		_ = stage.Close()
 		return copyErr
 	}
 	if runtime.GOOS != "windows" {
 		if err := stage.Chmod(0o755); err != nil {
-			_ = stage.Close()
 			return err
 		}
 	}
 	if err := stage.Sync(); err != nil {
-		_ = stage.Close()
 		return err
 	}
 	previousMeta, err := validateExecutableForInstall(stage)
 	if err != nil {
-		_ = stage.Close()
 		return err
 	}
 	return replaceValidatedStageLocked(stage, stagePath, destination, identity, previousMeta.Version)
@@ -421,4 +420,11 @@ func versionIdentityMatches(actual, expected string) bool {
 		return actual == expected
 	}
 	return ExactVersionIdentityEqual(actual, expected)
+}
+
+func validateOwnerAuthority(expected, actual string) error {
+	if expected == "" || actual == "" || expected != actual {
+		return fmt.Errorf("stage owner does not match installed executable")
+	}
+	return nil
 }
