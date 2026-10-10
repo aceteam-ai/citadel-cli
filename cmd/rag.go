@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/rag"
 	svcports "github.com/aceteam-ai/citadel-cli/services"
 	"github.com/fatih/color"
@@ -17,10 +19,12 @@ import (
 )
 
 var (
-	ragModel       string
-	ragFilePattern string
-	ragTopK        int
-	ragJSON        bool
+	ragModel        string
+	ragFilePattern  string
+	ragTopK         int
+	ragJSON         bool
+	ragIndex        string
+	ragPathPrefixes []string
 )
 
 var ragCmd = &cobra.Command{
@@ -75,8 +79,10 @@ var ragStatusCmd = &cobra.Command{
 func init() {
 	ragCmd.PersistentFlags().StringVar(&ragModel, "model", "", "Embedding model override (default: gte-multilingual-base)")
 	ragCmd.PersistentFlags().BoolVar(&ragJSON, "json", false, "Emit machine-readable JSON")
+	ragCmd.PersistentFlags().StringVar(&ragIndex, "index", "", "Per-org index namespace (org_<id>/<name>); default uses the legacy shared index")
 	ragIndexCmd.Flags().StringVar(&ragFilePattern, "pattern", "", "Restrict indexed filenames (glob, e.g. \"*.md\")")
 	ragQueryCmd.Flags().IntVar(&ragTopK, "top-k", 10, "Max results to return")
+	ragQueryCmd.Flags().StringArrayVar(&ragPathPrefixes, "path-prefix", nil, "Only return chunks whose file is under this path prefix (repeatable)")
 
 	ragCmd.AddCommand(ragIndexCmd)
 	ragCmd.AddCommand(ragQueryCmd)
@@ -85,15 +91,27 @@ func init() {
 }
 
 // newRAGService constructs the local RAG service rooted at the node's workspace,
-// resolving the same index.db a running worker uses.
-func newRAGService() *rag.Service {
+// resolving the same index.db a running worker uses. When --index is set, it
+// routes the service at that per-org namespace's confined DB under the
+// machine-convergent indexes dir (aceteam#10876 C2) instead of the shared
+// legacy DB.
+func newRAGService() (*rag.Service, error) {
 	// Local CLI operator is trusted (has shell access), so allow indexing docs
 	// dirs outside the workspace.
-	return rag.NewLocal(resolveWorkspaceDir(), ragModel)
+	svc := rag.NewLocal(resolveWorkspaceDir(), ragModel)
+	if ragIndex != "" {
+		if err := svc.WithIndexNamespace(jobs.IndexesDirFor(network.GetNodeConfigDir()), ragIndex); err != nil {
+			return nil, err
+		}
+	}
+	return svc, nil
 }
 
 func runRAGIndex(cmd *cobra.Command, args []string) error {
-	svc := newRAGService()
+	svc, err := newRAGService()
+	if err != nil {
+		return err
+	}
 	fmt.Printf("Indexing %s via %s ...\n", args[0], svc.Model())
 	// Live, throttled progress line while the walk runs (aceteam#10876 C1). Not
 	// in --json mode, where the single JSON result is the only output. Ctrl-C
@@ -116,11 +134,16 @@ func runRAGIndex(cmd *cobra.Command, args []string) error {
 	switch {
 	case res.Status == "cancelled":
 		status = color.YellowString("CANCELLED")
-	case res.FilesFailed > 0:
+	case res.FilesFailed > 0 || res.FilesSkippedTooLarge > 0:
 		status = color.YellowString("PARTIAL")
 	}
 	fmt.Printf("%s indexed %d file(s), skipped %d, failed %d, pruned %d (%d chunks embedded, dim %d)\n",
 		status, res.FilesIndexed, res.FilesSkipped, res.FilesFailed, res.FilesRemoved, res.ChunksEmbedded, res.Dim)
+	if res.FilesTruncated > 0 || res.FilesSkippedTooLarge > 0 || res.FilesChunkCapped > 0 {
+		fmt.Printf("%s\n", color.New(color.Faint).Sprintf(
+			"large files: %d truncated (head indexed), %d too large to index, %d hit the chunk cap — tune with CITADEL_INDEX_MAX_FILE_BYTES / CITADEL_INDEX_MAX_CHUNKS_PER_FILE",
+			res.FilesTruncated, res.FilesSkippedTooLarge, res.FilesChunkCapped))
+	}
 	if res.Status == "cancelled" {
 		fmt.Printf("%s\n", color.New(color.Faint).Sprint("cancelled; the partial index is consistent — re-run to resume (unchanged files are skipped)"))
 	}
@@ -159,8 +182,11 @@ func printRAGProgressLine(m map[string]any) {
 
 func runRAGQuery(cmd *cobra.Command, args []string) error {
 	query := strings.Join(args, " ")
-	svc := newRAGService()
-	res, err := svc.Query(cmd.Context(), query, ragTopK)
+	svc, err := newRAGService()
+	if err != nil {
+		return err
+	}
+	res, err := svc.QueryWithPrefixes(cmd.Context(), query, ragTopK, ragPathPrefixes)
 	if err != nil {
 		return ragEmbedError(err)
 	}
@@ -207,7 +233,10 @@ func inspectTEIServingBuild() (tag, device string) {
 }
 
 func runRAGStatus(cmd *cobra.Command, args []string) error {
-	svc := newRAGService()
+	svc, err := newRAGService()
+	if err != nil {
+		return err
+	}
 	st, err := svc.Status()
 	if err != nil {
 		return err

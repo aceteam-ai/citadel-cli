@@ -2686,6 +2686,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
 		PermissionsDir:            nodePermissionsDir(),
+		IndexesDir:                jobs.IndexesDirFor(network.GetNodeConfigDir()),
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,

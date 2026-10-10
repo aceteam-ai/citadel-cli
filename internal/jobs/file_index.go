@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,9 +23,11 @@ import (
 // per-job via the "model" payload field or globally via CITADEL_EMBEDDING_MODEL.
 const defaultEmbeddingModel = "gte-multilingual-base"
 
-// maxIndexFileBytes caps the size of a single file that FILE_INDEX will read and
-// embed. Larger files are skipped (recorded as skipped, not failed) to bound
-// embedding cost and memory.
+// maxIndexFileBytes is the DEFAULT per-file read budget for FILE_INDEX. A file
+// larger than the effective budget (resolveIndexMaxFileBytes: payload >
+// CITADEL_INDEX_MAX_FILE_BYTES > this default) is stream-read up to the budget
+// and its head indexed (reported as truncated), bounding memory without silently
+// dropping the file (aceteam#10876 C2).
 const maxIndexFileBytes = 1 << 20 // 1 MiB
 
 // chunkTargetBytes is the approximate size of one embedded chunk. Chunking is
@@ -49,6 +52,13 @@ type FileIndexHandler struct {
 	// DBPath is the node-local index database path. If empty, it is resolved
 	// from CITADEL_INDEX_DB or a default beside the workspace.
 	DBPath string
+	// IndexesDir is the machine-convergent base dir (<node_config_dir>/indexes)
+	// for per-org namespaced index DBs (aceteam#10876 C2). Resolved in the
+	// cmd/worker layer (jobs.IndexesDirFor(network.GetNodeConfigDir())) and set
+	// here — this leaf package never resolves it itself. Empty means a payload
+	// `index` namespace cannot be served (fails closed); the default (no `index`)
+	// path is unaffected.
+	IndexesDir string
 	// AllowOutsideWorkspace mirrors the read-handler relaxation flag.
 	AllowOutsideWorkspace bool
 	// embeddingOp is an optional hermetic test seam. Production always creates
@@ -76,6 +86,10 @@ func NewFileIndexHandler(workspace, dbPath string) *FileIndexHandler {
 //     narrowing file_pattern will also drop previously-indexed files that no
 //     longer match the pattern. The blast radius is only the recreatable index
 //     (never source data); the default whole-root, no-pattern run is safe.
+//   - index: per-org index namespace (`org_<id>/<name>`, set by the coordinator).
+//     Optional; absent uses the legacy single DB (aceteam#10876 C2).
+//   - max_file_bytes / max_chunks_per_file: optional per-file caps (payload >
+//     CITADEL_INDEX_MAX_FILE_BYTES / CITADEL_INDEX_MAX_CHUNKS_PER_FILE > default).
 func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	path, ok := job.Payload["path"]
 	if !ok || path == "" {
@@ -90,19 +104,28 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	}
 	filePattern := job.Payload["file_pattern"]
 	prune := job.Payload["prune"] != "false"
+	// Per-file caps (configurable; aceteam#10876 C2). A file larger than
+	// maxFileBytes is stream-read up to the cap and its head indexed (reported as
+	// truncated) instead of being silently dropped; maxChunks bounds the chunks a
+	// single file contributes.
+	maxFileBytes := resolveIndexMaxFileBytes(job.Payload)
+	maxChunks := resolveIndexMaxChunks(job.Payload)
 
 	validated, err := ValidateReadPath(h.WorkspaceDir, path, h.AllowOutsideWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}
 
-	store, err := nodeindex.Open(resolveIndexDBPath(h.DBPath, h.WorkspaceDir))
+	// Per-org namespace routing (aceteam#10876 C2): a payload `index`
+	// (`org_<id>/<name>`) resolves to a confined per-namespace DB under
+	// <node_config_dir>/indexes/; absent, the legacy single DB is used unchanged.
+	store, resolvedDB, err := openIndexStore(job.Payload["index"], h.IndexesDir, h.DBPath, h.WorkspaceDir)
 	if err != nil {
-		return nil, fmt.Errorf("open node index: %w", err)
+		return nil, err
 	}
 	defer store.Close()
 
-	ctx.Log("info", "     - [Job %s] FILE_INDEX %s model=%q pattern=%q", job.ID, validated, model, filePattern)
+	ctx.Log("info", "     - [Job %s] FILE_INDEX %s model=%q pattern=%q db=%q", job.ID, validated, model, filePattern, resolvedDB)
 
 	// Cheap pre-count of candidate files so progress can report done/total. It
 	// only stats entries (no reads/embeds) and honors cancellation, so it is a
@@ -113,6 +136,11 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	// Enumerate candidate files first so pruning can compare against on-disk state.
 	seen := make(map[string]struct{})
 	var indexed, skipped, failed, embedded, chunksUpserted, processed int
+	// Explicit, never-silent accounting for the large-file / chunk-cap cases
+	// (aceteam#10876 C2): skippedTooLarge = large files we could not index at all
+	// (binary/empty head); truncated = large text files whose HEAD was indexed;
+	// chunkCapped = files that hit the per-file chunk cap.
+	var skippedTooLarge, truncated, chunkCapped int
 	dim := 0
 	cancelled := false
 	embedOp := h.embeddingOp
@@ -130,9 +158,12 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			Current: current,
 			Final:   final,
 			Counts: map[string]int{
-				"indexed": indexed,
-				"skipped": skipped,
-				"failed":  failed,
+				"indexed":           indexed,
+				"skipped":           skipped,
+				"failed":            failed,
+				"skipped_too_large": skippedTooLarge,
+				"truncated":         truncated,
+				"chunk_capped":      chunkCapped,
 			},
 		})
 	}
@@ -176,18 +207,42 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		emitProgress(filepath.Base(p), false)
 		info, err := d.Info()
 		if err != nil {
+			// A stat failure on a candidate file is no longer swallowed silently
+			// (aceteam#10876 C2): count and log it, then continue the walk.
+			failed++
+			ctx.Log("error", "     - [Job %s] Failed to stat %s (%v); continuing", job.ID, p, err)
 			return nil
 		}
-		if info.Size() > maxIndexFileBytes {
-			skipped++
-			return nil
-		}
-		content, err := os.ReadFile(p)
-		if err != nil {
-			return nil
+		tooLarge := info.Size() > maxFileBytes
+		var content []byte
+		if tooLarge {
+			// Stream-read the first maxFileBytes bytes (bounded memory) and index
+			// that head instead of silently dropping the whole file (aceteam#10876
+			// C2). A byte cut can land mid-rune, so drop any invalid trailing bytes.
+			content, err = readIndexFileHead(p, maxFileBytes)
+			if err != nil {
+				failed++
+				ctx.Log("error", "     - [Job %s] Failed to read %s (%v); continuing", job.ID, p, err)
+				return nil
+			}
+			content = []byte(strings.ToValidUTF8(string(content), ""))
+		} else {
+			content, err = os.ReadFile(p)
+			if err != nil {
+				// Previously a silent skip; now counted and logged (aceteam#10876 C2).
+				failed++
+				ctx.Log("error", "     - [Job %s] Failed to read %s (%v); continuing", job.ID, p, err)
+				return nil
+			}
 		}
 		if len(content) == 0 || isBinaryContent(content) {
-			skipped++
+			// A large file whose head is binary/empty is genuinely not indexable;
+			// report it explicitly (never folded into the generic skipped count).
+			if tooLarge {
+				skippedTooLarge++
+			} else {
+				skipped++
+			}
 			return nil
 		}
 
@@ -203,9 +258,13 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			return nil // unchanged
 		}
 
-		chunks := chunkText(string(content))
+		chunks, capped := chunkTextLimited(string(content), chunkTargetBytes, maxChunks)
 		if len(chunks) == 0 {
-			skipped++
+			if tooLarge {
+				skippedTooLarge++
+			} else {
+				skipped++
+			}
 			return nil
 		}
 		vecs, err := embedTexts(ctx.Context(), embedOp, model, chunks)
@@ -247,6 +306,12 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			return fmt.Errorf("upsert %s: %w", p, err)
 		}
 		indexed++
+		if tooLarge {
+			truncated++ // head indexed; file was larger than the read budget
+		}
+		if capped {
+			chunkCapped++ // hit the per-file chunk cap; the tail was not indexed
+		}
 		embedded += len(chunks)
 		chunksUpserted += len(idxChunks)
 		return nil
@@ -307,17 +372,20 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	emitProgress("", true)
 
 	out := map[string]any{
-		"files_seen":      processed,
-		"files_indexed":   indexed,
-		"files_skipped":   skipped,
-		"files_failed":    failed,
-		"files_removed":   removed,
-		"chunks_upserted": chunksUpserted,
-		"chunks_embedded": embedded,
-		"model":           model,
-		"dim":             dim,
-		"status":          status,
-		"checkpoint":      checkpoint,
+		"files_seen":              processed,
+		"files_indexed":           indexed,
+		"files_skipped":           skipped,
+		"files_failed":            failed,
+		"files_removed":           removed,
+		"files_skipped_too_large": skippedTooLarge,
+		"files_truncated":         truncated,
+		"files_chunk_capped":      chunkCapped,
+		"chunks_upserted":         chunksUpserted,
+		"chunks_embedded":         embedded,
+		"model":                   model,
+		"dim":                     dim,
+		"status":                  status,
+		"checkpoint":              checkpoint,
 	}
 	return json.Marshal(out)
 }
@@ -363,6 +431,22 @@ func countIndexCandidates(root, filePattern string, ctx JobContext) int {
 	return count
 }
 
+// readIndexFileHead reads up to maxBytes from the file at path, bounding memory
+// for a file larger than the read budget (aceteam#10876 C2): instead of
+// os.ReadFile-ing a multi-GB file whole, it reads only the head that will be
+// chunked. The caller indexes this head and reports the file as truncated, so a
+// large text file is partially indexed rather than silently dropped. The hash is
+// computed over this same head (the content actually indexed), so a re-index of
+// an unchanged large file still skips by content hash.
+func readIndexFileHead(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, maxBytes))
+}
+
 // hashContent returns the full lowercase hex SHA-256 of content. The two-tier
 // index dedups across the central and node tiers by this full hash (aceteam#6087
 // standardizes on full sha256, replacing memory's 16-hex truncation).
@@ -371,18 +455,36 @@ func hashContent(content []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// chunkText splits text into paragraph-aware chunks of roughly chunkTargetBytes.
-// Paragraphs (blank-line separated) are accumulated until the target is
-// exceeded; a single paragraph larger than the target is hard-split so no chunk
-// grows unbounded. Returns at most maxChunksPerFile chunks.
+// chunkText splits text into paragraph-aware chunks of roughly chunkTargetBytes,
+// capped at maxChunksPerFile. It is the default-caps wrapper over
+// chunkTextLimited; callers that need the configurable caps or the "was it
+// capped" signal call chunkTextLimited directly.
 func chunkText(text string) []string {
+	chunks, _ := chunkTextLimited(text, chunkTargetBytes, maxChunksPerFile)
+	return chunks
+}
+
+// chunkTextLimited splits text into paragraph-aware chunks of roughly
+// targetBytes. Paragraphs (blank-line separated) are accumulated until the
+// target is exceeded; a single paragraph larger than the target is hard-split on
+// a rune boundary so no chunk grows unbounded. It returns at most maxChunks
+// chunks, and capped reports whether the cap truncated the output (so the caller
+// can report the truncation explicitly rather than dropping the tail silently —
+// aceteam#10876 C2). targetBytes/maxChunks default to the package consts when
+// non-positive.
+func chunkTextLimited(text string, targetBytes, maxChunks int) (chunks []string, capped bool) {
+	if targetBytes <= 0 {
+		targetBytes = chunkTargetBytes
+	}
+	if maxChunks <= 0 {
+		maxChunks = maxChunksPerFile
+	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return nil
+		return nil, false
 	}
 	paras := splitParagraphs(text)
 
-	var chunks []string
 	var cur strings.Builder
 	flush := func() {
 		if cur.Len() > 0 {
@@ -391,32 +493,32 @@ func chunkText(text string) []string {
 		}
 	}
 	for _, para := range paras {
-		for len(para) > chunkTargetBytes {
+		for len(para) > targetBytes {
 			// Hard-split an oversized paragraph on a rune boundary.
-			cut := runeSafeCut(para, chunkTargetBytes)
+			cut := runeSafeCut(para, targetBytes)
 			flush()
 			chunks = append(chunks, strings.TrimSpace(para[:cut]))
 			para = para[cut:]
-			if len(chunks) >= maxChunksPerFile {
-				return chunks[:maxChunksPerFile]
+			if len(chunks) >= maxChunks {
+				return chunks[:maxChunks], true
 			}
 		}
-		if cur.Len() > 0 && cur.Len()+len(para) > chunkTargetBytes {
+		if cur.Len() > 0 && cur.Len()+len(para) > targetBytes {
 			flush()
 		}
 		if cur.Len() > 0 {
 			cur.WriteString("\n\n")
 		}
 		cur.WriteString(para)
-		if len(chunks) >= maxChunksPerFile {
-			return chunks[:maxChunksPerFile]
+		if len(chunks) >= maxChunks {
+			return chunks[:maxChunks], true
 		}
 	}
 	flush()
-	if len(chunks) > maxChunksPerFile {
-		chunks = chunks[:maxChunksPerFile]
+	if len(chunks) > maxChunks {
+		return chunks[:maxChunks], true
 	}
-	return chunks
+	return chunks, false
 }
 
 // splitParagraphs splits on blank lines, dropping empty paragraphs.

@@ -25,6 +25,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/instance"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
@@ -2465,6 +2466,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 ccConfigDir,
 		PermissionsDir:            nodePermissionsDir(),
+		IndexesDir:                jobs.IndexesDirFor(network.GetNodeConfigDir()),
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !ccPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,
