@@ -3,6 +3,8 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,11 +12,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/rag"
+	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	svcports "github.com/aceteam-ai/citadel-cli/services"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
@@ -124,6 +129,7 @@ func runRAGIndex(cmd *cobra.Command, args []string) error {
 	if !ragJSON {
 		svc.SetProgressSink(printRAGProgressLine)
 	}
+	start := time.Now()
 	res, err := svc.IndexCooperatively(cmd.Context(), args[0], ragFilePattern, func() bool {
 		return softCtx.Err() != nil
 	})
@@ -133,6 +139,10 @@ func runRAGIndex(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return ragEmbedError(err)
 	}
+	// Land a local_cli record in the SAME ledger a running worker's FILE_INDEX
+	// writes (aceteam#10876 C7: "citadel rag index lands in the same ledger").
+	// Best-effort: a usage-store failure never fails the index.
+	recordLocalIndexUsage(res, ragIndex, start)
 	if ragJSON {
 		return printJSON(res)
 	}
@@ -154,6 +164,98 @@ func runRAGIndex(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s\n", color.New(color.Faint).Sprint("cancelled; the partial index is consistent — re-run to resume (unchanged files are skipped)"))
 	}
 	return nil
+}
+
+// recordLocalIndexUsage writes a local_cli work record to the node's usage.db
+// (the same file a running `citadel work` syncs), so `citadel rag index` is
+// metered and audited alongside dispatched FILE_INDEX jobs (aceteam#10876 C7).
+// It is best-effort: any failure (no node dir, store open/insert error) is
+// logged at debug and never fails the command — a local index must not break
+// because the ledger is unavailable. It resolves the real node dir and defers to
+// recordLocalIndexUsageTo (the pure, testable core) for the actual write.
+func recordLocalIndexUsage(res rag.IndexResult, namespace string, start time.Time) {
+	nodeDir, err := platform.DefaultNodeDir("")
+	if err != nil {
+		Debug("rag index usage: no node dir, skipping ledger record: %v", err)
+		return
+	}
+	if err := recordLocalIndexUsageTo(filepath.Join(nodeDir, "usage.db"), res, namespace, localIndexNodeName(), start); err != nil {
+		Debug("rag index usage: %v", err)
+	}
+}
+
+// recordLocalIndexUsageTo is the pure core: it opens the usage store at dbPath
+// (an explicit path so a test uses a t.TempDir() DB, never the live node's) and
+// inserts one local_cli index record. The job id is unique per run so repeated
+// local indexes never collide under the ledger's unique-job_id dedup (a constant
+// id would silently drop every run after the first).
+func recordLocalIndexUsageTo(dbPath string, res rag.IndexResult, namespace, nodeName string, start time.Time) error {
+	store, err := usage.OpenStore(dbPath)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer store.Close()
+
+	rec := usage.UsageRecord{
+		JobID:                 localIndexJobID(),
+		JobType:               "FILE_INDEX",
+		Status:                "success",
+		StartedAt:             start,
+		CompletedAt:           time.Now(),
+		DurationMs:            time.Since(start).Milliseconds(),
+		Model:                 res.Model,
+		NodeID:                nodeName,
+		Origin:                jobs.OriginLocalCLI,
+		OrgID:                 localIndexOrgID(namespace),
+		WorkAction:            jobs.WorkActionIndex,
+		ReceiptManifestSHA256: res.WorkManifestSHA256,
+		Units: map[string]int64{
+			"files_indexed":   int64(res.FilesIndexed),
+			"files_removed":   int64(res.FilesRemoved),
+			"chunks_upserted": int64(res.ChunksUpserted),
+			"chunks_embedded": int64(res.ChunksEmbedded),
+		},
+	}
+	if res.Status == "cancelled" {
+		rec.Status = "cancelled"
+	}
+	if err := store.Insert(rec); err != nil {
+		return fmt.Errorf("insert: %w", err)
+	}
+	return nil
+}
+
+// localIndexNodeName resolves this node's name for the local record, mirroring
+// the worker's final fallbacks (CITADEL_NODE_NAME, else hostname). A local record
+// without a node id would publish as node-anonymous and be dropped/misattributed
+// downstream.
+func localIndexNodeName() string {
+	if n := os.Getenv("CITADEL_NODE_NAME"); n != "" {
+		return n
+	}
+	host, _ := os.Hostname()
+	return host
+}
+
+// localIndexJobID returns a unique id for a local `citadel rag index` run so two
+// runs never collide under usage.db's unique-job_id dedup (a constant id would
+// silently drop every run after the first).
+func localIndexJobID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("local:index:%d", time.Now().UnixNano())
+	}
+	return "local:index:" + hex.EncodeToString(b[:])
+}
+
+// localIndexOrgID extracts the org_<id> attribution from an index namespace
+// (org_<id>/<name>), or "" for the legacy un-namespaced local index.
+func localIndexOrgID(namespace string) string {
+	namespace = strings.TrimSpace(namespace)
+	if i := strings.IndexByte(namespace, '/'); i > 0 && strings.HasPrefix(namespace, "org_") {
+		return namespace[:i]
+	}
+	return ""
 }
 
 // printRAGProgressLine renders one throttled progress update as a single

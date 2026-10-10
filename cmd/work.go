@@ -34,6 +34,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
@@ -2680,13 +2681,20 @@ func runWork(cmd *cobra.Command, args []string) {
 	// only worker on the node.
 	workPerms := workAppliedPermissions
 	nodeJobOpts := nodeJobHandlerOpts{
-		Source:                    source,
-		OrgID:                     nodeJobOrgID(),
-		NodeID:                    headscaleNodeID,
-		WorkspaceDir:              wsDir,
-		ConfigDir:                 workConfigDir,
-		PermissionsDir:            nodePermissionsDir(),
-		IndexesDir:                jobs.IndexesDirFor(network.GetNodeConfigDir()),
+		Source:         source,
+		OrgID:          nodeJobOrgID(),
+		NodeID:         headscaleNodeID,
+		WorkspaceDir:   wsDir,
+		ConfigDir:      workConfigDir,
+		PermissionsDir: nodePermissionsDir(),
+		IndexesDir:     jobs.IndexesDirFor(network.GetNodeConfigDir()),
+		// Dispatched work (FILE_INDEX, embedding) signs its receipts with the SAME
+		// machine-convergent node identity the AEP chat receipt + CSR path use
+		// (aceteam#10876 C7). Injected here (never resolved inside internal/worker)
+		// so a worker test never signs with this box's real node identity. NodeID
+		// prefers the fabric node id (#8139), else the signer's fingerprint.
+		WorkReceiptSigner:         nodeidentity.Convergent(network.GetNodeConfigDir()),
+		WorkReceiptNodeID:         config.LoadDeviceCredsConverged().FabricNodeID,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,
@@ -3807,7 +3815,7 @@ func createUsagePublishFn(useAPI bool, apiSource *worker.APISource, redisURL, re
 			client := apiSource.Client()
 			for _, r := range records {
 				payload, err := json.Marshal(usageStreamEntry{
-					Version: "1.0",
+					Version: usage.PayloadVersion,
 					NodeID:  r.NodeID,
 					Record:  usageRecordPayload(r),
 				})
@@ -3838,7 +3846,7 @@ func createUsagePublishFn(useAPI bool, apiSource *worker.APISource, redisURL, re
 		return func(ctx context.Context, records []usage.UsageRecord) error {
 			for _, r := range records {
 				payload, err := json.Marshal(usageStreamEntry{
-					Version: "1.0",
+					Version: usage.PayloadVersion,
 					NodeID:  r.NodeID,
 					Record:  usageRecordPayload(r),
 				})
@@ -3869,39 +3877,53 @@ type usageStreamEntry struct {
 	Record  usageRecordJSON `json:"record"`
 }
 
-// usageRecordJSON is the JSON representation published to Redis.
+// usageRecordJSON is the JSON representation published to Redis. The payload is
+// v2 (usage.PayloadVersion) for aceteam#10876 C7: it adds work attribution
+// (origin/orgId/workAction), typed units, and the receipt manifest binding.
 // ErrorMessage is intentionally excluded to avoid leaking internal error details.
 type usageRecordJSON struct {
-	JobID            string `json:"jobId"`
-	JobType          string `json:"jobType"`
-	Backend          string `json:"backend,omitempty"`
-	Model            string `json:"model,omitempty"`
-	Status           string `json:"status"`
-	StartedAt        string `json:"startedAt"`
-	CompletedAt      string `json:"completedAt"`
-	DurationMs       int64  `json:"durationMs"`
-	PromptTokens     int64  `json:"promptTokens,omitempty"`
-	CompletionTokens int64  `json:"completionTokens,omitempty"`
-	TotalTokens      int64  `json:"totalTokens,omitempty"`
-	RequestBytes     int64  `json:"requestBytes,omitempty"`
-	ResponseBytes    int64  `json:"responseBytes,omitempty"`
+	JobID                 string           `json:"jobId"`
+	JobType               string           `json:"jobType"`
+	Backend               string           `json:"backend,omitempty"`
+	Model                 string           `json:"model,omitempty"`
+	Status                string           `json:"status"`
+	StartedAt             string           `json:"startedAt"`
+	CompletedAt           string           `json:"completedAt"`
+	DurationMs            int64            `json:"durationMs"`
+	PromptTokens          int64            `json:"promptTokens,omitempty"`
+	CompletionTokens      int64            `json:"completionTokens,omitempty"`
+	TotalTokens           int64            `json:"totalTokens,omitempty"`
+	RequestBytes          int64            `json:"requestBytes,omitempty"`
+	ResponseBytes         int64            `json:"responseBytes,omitempty"`
+	Origin                string           `json:"origin,omitempty"`
+	OrgID                 string           `json:"orgId,omitempty"`
+	WorkAction            string           `json:"workAction,omitempty"`
+	Units                 map[string]int64 `json:"units,omitempty"`
+	ReceiptManifestSHA256 string           `json:"receiptManifestSha256,omitempty"`
+	ReceiptSigned         bool             `json:"receiptSigned,omitempty"`
 }
 
 func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
 	return usageRecordJSON{
-		JobID:            r.JobID,
-		JobType:          r.JobType,
-		Backend:          r.Backend,
-		Model:            r.Model,
-		Status:           r.Status,
-		StartedAt:        r.StartedAt.UTC().Format(time.RFC3339),
-		CompletedAt:      r.CompletedAt.UTC().Format(time.RFC3339),
-		DurationMs:       r.DurationMs,
-		PromptTokens:     r.PromptTokens,
-		CompletionTokens: r.CompletionTokens,
-		TotalTokens:      r.TotalTokens,
-		RequestBytes:     r.RequestBytes,
-		ResponseBytes:    r.ResponseBytes,
+		JobID:                 r.JobID,
+		JobType:               r.JobType,
+		Backend:               r.Backend,
+		Model:                 r.Model,
+		Status:                r.Status,
+		StartedAt:             r.StartedAt.UTC().Format(time.RFC3339),
+		CompletedAt:           r.CompletedAt.UTC().Format(time.RFC3339),
+		DurationMs:            r.DurationMs,
+		PromptTokens:          r.PromptTokens,
+		CompletionTokens:      r.CompletionTokens,
+		TotalTokens:           r.TotalTokens,
+		RequestBytes:          r.RequestBytes,
+		ResponseBytes:         r.ResponseBytes,
+		Origin:                r.Origin,
+		OrgID:                 r.OrgID,
+		WorkAction:            r.WorkAction,
+		Units:                 r.Units,
+		ReceiptManifestSHA256: r.ReceiptManifestSHA256,
+		ReceiptSigned:         r.ReceiptSigned,
 	}
 }
 

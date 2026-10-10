@@ -142,6 +142,48 @@ func TestVerifyAEPReceipt_V2RoundTrip(t *testing.T) {
 	}
 }
 
+// TestVerifyAEPReceipt_WorkReceiptRoundTrip proves `citadel aep verify` passes
+// on a signed WORK receipt (aceteam#10876 C7) — the acceptance that the node's
+// FILE_INDEX / embed_served receipts verify offline. No cmd/aep.go change was
+// needed: the v2 branch is action-agnostic (it recomputes canonical bytes +
+// checks the signature), so a work action verifies like any other v2 receipt.
+func TestVerifyAEPReceipt_WorkReceiptRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	signer := newAEPTestSigner(t)
+	nodeID, err := aep.ResolveNodeID(signer, "")
+	if err != nil {
+		t.Fatalf("resolve node id: %v", err)
+	}
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	r, err := aep.BuildSignedWorkReceipt(
+		signer, nodeID, "job-work-cli", aep.WorkActionIndex,
+		"sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64), now)
+	if err != nil {
+		t.Fatalf("BuildSignedWorkReceipt: %v", err)
+	}
+	m, err := r.ToMap()
+	if err != nil {
+		t.Fatalf("ToMap: %v", err)
+	}
+	receiptPath := writeReceiptJSON(t, dir, "work.json", m)
+	pubPath := writePubKeyPEM(t, dir, &signer.key.PublicKey)
+
+	out := verifyAEPReceipt(verifyOptions{
+		receiptPath: receiptPath,
+		pubkeyPath:  pubPath,
+		nodeKeyFn:   mustNotReachNodeIdentity(t),
+	})
+	if !out.Valid {
+		t.Fatalf("expected a work receipt to verify, got reason %q", out.Reason)
+	}
+	if out.ReceiptVersion != "2" {
+		t.Errorf("ReceiptVersion = %q, want 2", out.ReceiptVersion)
+	}
+	if out.summary == nil || out.summary.action != aep.WorkActionIndex {
+		t.Errorf("summary action = %+v, want %q", out.summary, aep.WorkActionIndex)
+	}
+}
+
 func TestVerifyAEPReceipt_TamperedScoreFails(t *testing.T) {
 	dir := t.TempDir()
 	signer := newAEPTestSigner(t)

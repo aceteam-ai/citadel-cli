@@ -10,9 +10,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeindex"
 )
@@ -61,6 +64,22 @@ type FileIndexHandler struct {
 	IndexesDir string
 	// AllowOutsideWorkspace mirrors the read-handler relaxation flag.
 	AllowOutsideWorkspace bool
+	// Signer signs the per-stage work receipt (aceteam#10876 C7). nil on the
+	// local/zero-value path (rag.Service, tests) — no receipt is produced. The
+	// worker construction site sets it alongside Dispatched=true.
+	Signer aep.Signer
+	// NodeID is the preferred receipt node_id (fabric id); empty falls back to the
+	// signer's fingerprint.
+	NodeID string
+	// Dispatched marks this as fail-closed dispatched work: if a receipt cannot be
+	// signed the job FAILS with ErrReceiptSigningUnavailable. Set only on the
+	// worker path; the zero value (local/tests) never signs and never fails closed.
+	Dispatched bool
+	// Origin is the usage-record attribution (OriginDispatched / OriginLocalCLI).
+	// Empty on the zero value.
+	Origin string
+	// nowFn is a test seam for the receipt issued_at; nil uses time.Now.
+	nowFn func() time.Time
 	// embeddingOp is an optional hermetic test seam. Production always creates
 	// one fresh operation per Execute call below.
 	embeddingOp *teiEmbeddingOperation
@@ -117,6 +136,23 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	maxFileBytes := resolveIndexMaxFileBytes(job.Payload)
 	maxChunks := resolveIndexMaxChunks(job.Payload)
 
+	// Work-receipt config (aceteam#10876 C7). Preflight the signer BEFORE the
+	// (potentially long) walk, so a keyless dispatched node fails in milliseconds
+	// with receipt_signing_unavailable rather than after embedding everything.
+	// The zero-value (local/tests) config never signs and never fails closed.
+	namespace := job.Payload["index"]
+	workCfg := WorkReceiptConfig{
+		Signer:     h.Signer,
+		NodeID:     h.NodeID,
+		Dispatched: h.Dispatched,
+		Origin:     h.Origin,
+		OrgID:      orgFromNamespace(namespace),
+		now:        h.nowFn,
+	}
+	if err := workCfg.Preflight(); err != nil {
+		return nil, err
+	}
+
 	validated, err := ValidateReadPath(h.WorkspaceDir, path, h.AllowOutsideWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
@@ -147,6 +183,11 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	// (binary/empty head); truncated = large text files whose HEAD was indexed;
 	// chunkCapped = files that hit the per-file chunk cap.
 	var skippedTooLarge, truncated, chunkCapped int
+	// Per-stage work manifest accounting (aceteam#10876 C7): the indexed files
+	// (path + content hash) bind the receipt's input manifest, and bytesEmbedded
+	// is the typed byte unit on the record.
+	var manifestFiles []indexManifestFile
+	var bytesEmbedded int64
 	dim := 0
 	cancelled := false
 	stage := ProgressStagePlan
@@ -355,6 +396,8 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			return fmt.Errorf("upsert %s: %w", p, err)
 		}
 		indexed++
+		manifestFiles = append(manifestFiles, indexManifestFile{Path: p, SHA256: hash})
+		bytesEmbedded += int64(len(content))
 		if tooLarge {
 			truncated++ // head indexed; file was larger than the read budget
 		}
@@ -459,7 +502,75 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		"status":                  status,
 		"checkpoint":              checkpoint,
 	}
+
+	// Attach the signed work receipt + typed-unit record (aceteam#10876 C7). The
+	// input manifest binds the index NAMESPACE (empty for the legacy single DB),
+	// so two orgs indexing byte-identical content produce DISTINCT receipts. On a
+	// dispatched node that cannot sign, this returns ErrReceiptSigningUnavailable
+	// and the job fails closed (terminal, no retry). Keys are added alongside the
+	// existing result keys above; none is renamed or removed (the C1/C2 contract).
+	sort.Slice(manifestFiles, func(i, j int) bool { return manifestFiles[i].Path < manifestFiles[j].Path })
+	inputManifest := indexInputManifest{
+		Action: WorkActionIndex,
+		Index:  namespace,
+		Root:   validated,
+		Model:  model,
+		Files:  manifestFiles,
+	}
+	outputManifest := indexOutputManifest{
+		Action:         WorkActionIndex,
+		Index:          namespace,
+		Model:          model,
+		FilesIndexed:   indexed,
+		FilesRemoved:   removed,
+		ChunksUpserted: chunksUpserted,
+		ChunksEmbedded: embedded,
+		Dim:            dim,
+		Status:         status,
+	}
+	units := map[string]int64{
+		"files_indexed":   int64(indexed),
+		"files_removed":   int64(removed),
+		"chunks_upserted": int64(chunksUpserted),
+		"chunks_embedded": int64(embedded),
+		"bytes":           bytesEmbedded,
+	}
+	if err := workCfg.attachWorkRecord(out, job.ID, WorkActionIndex, inputManifest, outputManifest, units); err != nil {
+		return nil, err
+	}
 	return json.Marshal(out)
+}
+
+// indexManifestFile binds one indexed file (path + full content hash) into the
+// index work receipt's input manifest. The path is hashed into input_sha256,
+// never disclosed.
+type indexManifestFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
+// indexInputManifest is the per-stage input binding for a FILE_INDEX work
+// receipt. The Index (namespace) field is what makes two orgs indexing
+// byte-identical content produce distinct receipts (aceteam#10876 C7).
+type indexInputManifest struct {
+	Action string              `json:"action"`
+	Index  string              `json:"index"`
+	Root   string              `json:"root"`
+	Model  string              `json:"model"`
+	Files  []indexManifestFile `json:"files"`
+}
+
+// indexOutputManifest binds what the index stage produced.
+type indexOutputManifest struct {
+	Action         string `json:"action"`
+	Index          string `json:"index"`
+	Model          string `json:"model"`
+	FilesIndexed   int    `json:"files_indexed"`
+	FilesRemoved   int    `json:"files_removed"`
+	ChunksUpserted int    `json:"chunks_upserted"`
+	ChunksEmbedded int    `json:"chunks_embedded"`
+	Dim            int    `json:"dim"`
+	Status         string `json:"status"`
 }
 
 // countIndexCandidates walks root and counts files matching filePattern (and not

@@ -2391,6 +2391,95 @@ strand a leafless key for `reconcileFromLegacy` to displace.
 |----------|---------|---------|
 | `CITADEL_SIGN_AEP_RECEIPTS` | unset (OFF) | Attach a signed `aep_receipt` alongside `grounding` on buffered chat-completion results. Requires `CITADEL_GROUNDING_GUARDRAIL` also on. Truthy: `1`/`true`/`yes`/`on`. |
 
+### Signed work receipts + typed-unit work records (aceteam#10876 C7, citadel-cli#1272)
+
+Dispatched node WORK — indexing (`FILE_INDEX`) and serving an embedding
+(`embedding`) — attaches an **event-style v2 AEP work receipt** plus a
+typed-unit `usage` record to its job output. This is a DELIBERATE POSTURE SPLIT
+from the chat-completion receipt above, and the split is the single most
+load-bearing thing to preserve:
+
+| | Chat receipt (`CITADEL_SIGN_AEP_RECEIPTS`) | Work receipt (FILE_INDEX / embedding) |
+|---|---|---|
+| Default | OFF (opt-in env flag) | ON for dispatched work (no flag) |
+| Signing unavailable | fail **OPEN** (job succeeds unsigned) | fail **CLOSED** (`jobs.ErrReceiptSigningUnavailable`) |
+
+Do NOT change the chat path to match, or vice versa. `internal/aep`'s
+`BuildSignedWorkReceipt` (a thin wrapper over `BuildSignedReceiptV2`, mirroring
+`BuildSignedAppDeployReceipt`) is event-style: empty grounding, empty
+`verdict_hash`, `action` ∈ `{index, embed_served, extract, ocr}` (unknown action
+rejected). `citadel aep verify` needs NO change — the v2 branch is action-agnostic.
+
+**The fail-closed sentinel and its routing.** `jobs.ErrReceiptSigningUnavailable`
+mirrors `jobs.ErrFilesDisabled` exactly: the runner (`executeJob`,
+`internal/worker/runner.go`) treats it as terminal on the FIRST delivery
+(`source.Fail` + one terminal `error` event, reason `receipt_signing_unavailable`,
+never Nack/retry — a retry can't make a missing key appear). The handlers
+PREFLIGHT the signer (`WorkReceiptConfig.Preflight`) before the expensive walk and
+also fail closed if `Sign` fails at emit time. `internal/jobs/work_receipt.go`
+owns `WorkReceiptConfig` and the manifest hashing.
+
+The convergent `nodeidentity.Store.Sign`/`PublicKeyFingerprint` MINT a key on
+first use (via `GetOrCreateKey`), so `receipt_signing_unavailable` fires only on a
+genuine unavailability — a nil signer (test/legacy posture), an unwritable/corrupt
+identity dir, or a `Sign` error — NOT on first-use absence, where a work job
+mints identity as a side effect exactly like the chat signer does (inheriting the
+K-A "Residual" window: a root worker on a never-inited node can mint an
+unregistered key whose receipts carry a fingerprint no `fabric_node_certs` row
+matches until the operator's next `citadel init`/enroll heals it).
+
+**Dispatched vs local_cli — the distinction is explicit, pinned by tests.** The
+handler zero value (no `Signer`, `Dispatched=false`) NEVER signs and NEVER fails
+closed — that is what `rag.Service` (`origin=local_cli`), the C1/C2 tests, and the
+legacy `cmd/job_handlers.go` Nexus/diagnostic path get. Only the WORKER
+construction site (`worker.CreateLegacyHandlersWithOpts`, wired from `cmd/work.go`
+AND `cmd/controlcenter.go` via `LegacyHandlerOpts.WorkReceiptSigner` =
+`nodeidentity.Convergent(network.GetNodeConfigDir())`) sets `Dispatched=true` + a
+signer → fail-closed. The signer is INJECTED, never resolved inside
+`internal/worker` (so a worker test never signs with the live node identity).
+Because `nodeidentity.Convergent` never returns nil, production is always
+fail-closed; nil-signer is the test/legacy posture. Pins:
+`internal/jobs.TestFileIndexDispatchedFailsClosedWithoutSigner` /
+`...LocalUnsignedIndexesFine`, `internal/worker.TestRunnerReceiptSigningUnavailablePublishesTerminalErrorWithoutRetry`
+/ `TestCreateLegacyHandlers_FileIndexSignsWhenSignerWired` (the construction-site
+guard).
+
+**Namespace binding (the cross-org isolation).** A FILE_INDEX work receipt's
+`input_sha256` is the hash of a per-stage manifest that BINDS the C2 index
+namespace (`org_<id>/<name>`), so two orgs indexing byte-identical content produce
+DISTINCT receipts (`TestFileIndexNamespaceBindsReceipt`). The result map carries
+`work_manifest_sha256` == the receipt's `input_sha256` (the "manifest hash matches"
+acceptance).
+
+**The usage-record key fix.** A legacy handler's whole JSON output is wrapped by
+`LegacyHandlerAdapter` as `Output["output"] = "<string>"`, so `buildUsageRecord`'s
+top-level `_usage_*` read never saw FILE_INDEX/embedding metrics (zero tokens/bytes
+recorded). `buildUsageRecord` now ALSO decodes that nested string and reads a
+`usage` object (attribution + typed `units` + token/byte metrics + receipt
+binding). The embedding handler meters `request_bytes`/`response_bytes` so
+tokens AND bytes are non-zero (the acceptance). `internal/usage` schema is v2
+(`PRAGMA user_version`, idempotent `ADD COLUMN` migration — node-local SQLite, no
+tooling); the stream payload is `usage.PayloadVersion` "2.0". `OpenStore` sets
+`busy_timeout` so a separate `citadel rag index` process can insert while
+`citadel work` holds the WAL.
+
+**Outbox = usage.db, exactly-once drain.** The syncer (`internal/usage/syncer.go`)
+publishes ONE record per call and `MarkSynced`s it immediately, looping until the
+backlog drains — so a node offline for an hour drains ALL buffered records on
+reconnect in one cycle, and a partial-batch publish failure never re-sends an
+already-published record. Dedup is `INSERT OR IGNORE` on the unique `job_id`;
+`citadel rag index` generates a unique `local:index:<rand>` id so repeated local
+runs don't collide. Pins: `TestSyncerOutboxReplayExactlyOnce`,
+`TestSyncerPartialFailureNoDoubleSend`, `TestSchemaV2MigrationPreservesV1Rows`.
+
+**Deferred (documented, not silent):** `extract`/`ocr` work-receipt actions are
+defined in `BuildSignedWorkReceipt` but not WIRED to any handler — those are the
+sandboxed-extractor (A-side) slice; wiring the fail-closed gate onto
+`ExtractionHandler` would be scope creep on this security PR. The legacy
+`cmd/job_handlers.go` Nexus agent path is unsigned (not the dispatched-worker
+target). The aceteam Python verifier (aceteam#9287) may need the new actions
+added to its event-style "skip verdict recompute" set — cross-repo.
+
 ### Service Idle Detection and Auto-Stop (citadel #416)
 
 Managed services carry a per-service usage/idle signal so a node can tell whether an engine is actually being used or is pinning VRAM/RAM while idle. This is surfaced on the heartbeat and to operators, and can optionally drive auto-eviction.

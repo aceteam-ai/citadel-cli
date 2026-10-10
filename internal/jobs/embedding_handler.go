@@ -4,6 +4,8 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
@@ -73,7 +76,23 @@ const (
 // handler is not wired into the live worker path (see PR notes). We mirror its
 // TEI-call style while conforming to the interface the live dispatch actually
 // uses.
-type EmbeddingHandler struct{}
+type EmbeddingHandler struct {
+	// Signer signs the embed_served work receipt (aceteam#10876 C7). nil on the
+	// local/zero-value path. The worker construction site sets it alongside
+	// Dispatched=true.
+	Signer aep.Signer
+	// NodeID is the preferred receipt node_id (fabric id); empty falls back to the
+	// signer's fingerprint.
+	NodeID string
+	// Dispatched marks fail-closed dispatched work: an embedding job that cannot
+	// sign its receipt FAILS with ErrReceiptSigningUnavailable. Set only on the
+	// worker path.
+	Dispatched bool
+	// Origin is the usage-record attribution (OriginDispatched on the worker path).
+	Origin string
+	// nowFn is a test seam for the receipt issued_at; nil uses time.Now.
+	nowFn func() time.Time
+}
 
 // EmbeddingRequest is the parsed embedding job payload.
 type EmbeddingRequest struct {
@@ -111,6 +130,11 @@ type EmbeddingResult struct {
 	Usage      struct {
 		PromptTokens int `json:"prompt_tokens"`
 		TotalTokens  int `json:"total_tokens"`
+		// RequestBytes/ResponseBytes are the on-wire sizes summed across all TEI
+		// batches (aceteam#10876 C7's "tokens and bytes are non-zero for embedding
+		// jobs"). Additive to the pre-existing prompt/total token fields.
+		RequestBytes  int64 `json:"request_bytes"`
+		ResponseBytes int64 `json:"response_bytes"`
 	} `json:"usage"`
 }
 
@@ -131,6 +155,21 @@ func (h *EmbeddingHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, fmt.Errorf("invalid embedding payload: %w", err)
 	}
 
+	// Work-receipt config (aceteam#10876 C7). Preflight the signer before the TEI
+	// round-trip so a keyless dispatched node fails fast with
+	// receipt_signing_unavailable. The zero value (local/tests) never signs.
+	workCfg := WorkReceiptConfig{
+		Signer:     h.Signer,
+		NodeID:     h.NodeID,
+		Dispatched: h.Dispatched,
+		Origin:     h.Origin,
+		OrgID:      job.Payload["org_id"],
+		now:        h.nowFn,
+	}
+	if err := workCfg.Preflight(); err != nil {
+		return nil, err
+	}
+
 	ctx.Log("info", "     - [Job %s] Waiting for TEI embedding service to become ready...", job.ID)
 	op := newTEIEmbeddingOperation(teiBaseURL())
 	if err := op.initialize(ctx.Context()); err != nil {
@@ -143,11 +182,79 @@ func (h *EmbeddingHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, err
 	}
 
-	out, err := json.Marshal(result)
+	// Build the output as a map so the signed work receipt + typed-unit record can
+	// be attached alongside the existing embeddings/dimensions/model/usage keys
+	// without reshaping them (the usage object is ENRICHED, not replaced).
+	raw, err := json.Marshal(result)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal embedding result: %w", err)
 	}
-	return out, nil
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("failed to assemble embedding output: %w", err)
+	}
+
+	inputManifest := embedInputManifest{
+		Action:     WorkActionEmbedServed,
+		Model:      result.Model,
+		Dimensions: result.Dimensions,
+		Inputs:     hashEmbeddingInputs(req.Input),
+	}
+	outputManifest := embedOutputManifest{
+		Action:       WorkActionEmbedServed,
+		Model:        result.Model,
+		Count:        len(result.Embeddings),
+		Dim:          result.Dimensions,
+		PromptTokens: result.Usage.PromptTokens,
+		TotalTokens:  result.Usage.TotalTokens,
+	}
+	units := map[string]int64{
+		"embeddings":     int64(len(result.Embeddings)),
+		"dim":            int64(result.Dimensions),
+		"prompt_tokens":  int64(result.Usage.PromptTokens),
+		"total_tokens":   int64(result.Usage.TotalTokens),
+		"request_bytes":  result.Usage.RequestBytes,
+		"response_bytes": result.Usage.ResponseBytes,
+	}
+	if err := workCfg.attachWorkRecord(out, job.ID, WorkActionEmbedServed, inputManifest, outputManifest, units); err != nil {
+		return nil, err
+	}
+
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal embedding result: %w", err)
+	}
+	return encoded, nil
+}
+
+// hashEmbeddingInputs returns the sha256 (hex) of each input text, binding WHAT
+// was embedded into the receipt's input manifest WITHOUT storing the text.
+func hashEmbeddingInputs(inputs []string) []string {
+	out := make([]string, len(inputs))
+	for i, s := range inputs {
+		sum := sha256.Sum256([]byte(s))
+		out[i] = hex.EncodeToString(sum[:])
+	}
+	return out
+}
+
+// embedInputManifest binds an embedding job's inputs (per-text sha256) into the
+// embed_served receipt. The texts themselves are never stored.
+type embedInputManifest struct {
+	Action     string   `json:"action"`
+	Model      string   `json:"model"`
+	Dimensions int      `json:"dimensions"`
+	Inputs     []string `json:"inputs"`
+}
+
+// embedOutputManifest binds what the embedding served.
+type embedOutputManifest struct {
+	Action       string `json:"action"`
+	Model        string `json:"model"`
+	Count        int    `json:"count"`
+	Dim          int    `json:"dim"`
+	PromptTokens int    `json:"prompt_tokens"`
+	TotalTokens  int    `json:"total_tokens"`
 }
 
 // teiEmbeddingOperation owns one logical embedding operation (one job or one
@@ -281,6 +388,8 @@ func (o *teiEmbeddingOperation) embed(ctx context.Context, req *EmbeddingRequest
 		copy(result.Embeddings[start:end], batch.Embeddings)
 		result.Usage.PromptTokens += batch.Usage.PromptTokens
 		result.Usage.TotalTokens += batch.Usage.TotalTokens
+		result.Usage.RequestBytes += batch.Usage.RequestBytes
+		result.Usage.ResponseBytes += batch.Usage.ResponseBytes
 	}
 	return result, nil
 }
@@ -436,6 +545,10 @@ func callTEIEmbeddingBatch(ctx context.Context, client *http.Client, baseURL str
 	result.Dimensions = dim
 	result.Usage.PromptTokens = teiResp.Usage.PromptTokens
 	result.Usage.TotalTokens = teiResp.Usage.TotalTokens
+	// On-wire sizes for this batch (aceteam#10876 C7). The request body is what we
+	// POSTed; the response body is what we read and parsed (both already bounded).
+	result.Usage.RequestBytes = int64(len(reqBody))
+	result.Usage.ResponseBytes = int64(len(bodyBytes))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

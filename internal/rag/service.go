@@ -180,6 +180,10 @@ type IndexResult struct {
 	// cancel stopped it; Checkpoint is "complete" or "partial" (aceteam#10876 C1).
 	Status     string `json:"status"`
 	Checkpoint string `json:"checkpoint"`
+	// WorkManifestSHA256 is the per-stage input manifest hash the handler computed
+	// (aceteam#10876 C7). On the local path it binds the ledger record to the work
+	// done even though no receipt is signed; empty when the handler produced none.
+	WorkManifestSHA256 string `json:"work_manifest_sha256"`
 }
 
 // Index (re)indexes the files under path (a directory or single file),
@@ -214,6 +218,12 @@ func (s *Service) index(ctx context.Context, path, filePattern string, cancelReq
 	}
 	h := jobs.NewFileIndexHandler(s.workspaceDir, s.dbPath)
 	h.AllowOutsideWorkspace = s.allowOutsideWorkspace
+	// Local-CLI origin (aceteam#10876 C7): a trusted operator, NOT dispatched
+	// work. The handler stamps origin=local_cli onto the emitted usage object and
+	// does NOT sign a receipt (Dispatched stays false, Signer nil) — a missing
+	// node identity key is never a hard failure on this path. The ledger record is
+	// written by the caller (cmd/rag.go), which reads this same origin.
+	h.Origin = jobs.OriginLocalCLI
 	payload := map[string]string{"path": path, "model": s.model}
 	if filePattern != "" {
 		payload["file_pattern"] = filePattern
