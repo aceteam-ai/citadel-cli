@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -53,7 +54,21 @@ type Service struct {
 	// (cmd/work.go constructs the Service with New(), not NewWithRoots()).
 	roots     []string
 	rootsMode bool
+	// onProgress, when set, receives throttled progress updates during Index
+	// (aceteam#10876 C1). nil for surfaces that do not render progress.
+	onProgress func(map[string]any)
 }
+
+// SetProgressSink wires a throttled progress callback consumed by Index. The
+// callback receives the final progress event map (stage/done/total/percent/
+// current/rate/eta_seconds/counts). Optional; nil means no progress reporting.
+func (s *Service) SetProgressSink(fn func(map[string]any)) { s.onProgress = fn }
+
+// ragCancelGrace is how long a cooperative (Ctrl-C) cancel lets the current file
+// finish and commit before the embed context is hard-aborted. A package var so
+// it can be tuned/tested; the handler normally stops at the next file boundary
+// well within this window.
+var ragCancelGrace = 10 * time.Second
 
 // New constructs a Service with the mesh-safe default (index paths confined to
 // the workspace). workspaceDir is the node's workspace root; modelOverride is
@@ -131,6 +146,7 @@ func (s *Service) Provenance() string {
 // IndexResult is the outcome of an Index call (mirrors the FILE_INDEX handler
 // output, decoded into a typed struct).
 type IndexResult struct {
+	FilesSeen      int    `json:"files_seen"`
 	FilesIndexed   int    `json:"files_indexed"`
 	FilesSkipped   int    `json:"files_skipped"`
 	FilesFailed    int    `json:"files_failed"`
@@ -139,6 +155,10 @@ type IndexResult struct {
 	ChunksEmbedded int    `json:"chunks_embedded"`
 	Model          string `json:"model"`
 	Dim            int    `json:"dim"`
+	// Status is "completed" on a clean walk or "cancelled" when a cooperative
+	// cancel stopped it; Checkpoint is "complete" or "partial" (aceteam#10876 C1).
+	Status     string `json:"status"`
+	Checkpoint string `json:"checkpoint"`
 }
 
 // Index (re)indexes the files under path (a directory or single file),
@@ -167,7 +187,35 @@ func (s *Service) Index(ctx context.Context, path, filePattern string) (IndexRes
 	if filePattern != "" {
 		payload["file_pattern"] = filePattern
 	}
-	out, err := h.Execute(jobCtx(ctx), &nexus.Job{ID: "rag-index", Type: "FILE_INDEX", Payload: payload})
+
+	// Cooperative cancel (aceteam#10876 C1): the caller's ctx cancellation (e.g.
+	// Ctrl-C on `citadel rag index`) requests a GRACEFUL stop — commit the current
+	// file and return partial counts — rather than a hard abort that loses it. We
+	// give the handler a SEPARATE hard context (derived from Background) for embed
+	// bounding so the first signal does not kill the in-flight file; a second
+	// signal or a grace timer escalates to a hard abort. TEI calls self-bound via
+	// the embedding client's own request timeout, so the handler never hangs.
+	hardCtx, cancelHard := context.WithCancel(context.Background())
+	defer cancelHard()
+	go func() {
+		select {
+		case <-ctx.Done():
+			select {
+			case <-time.After(ragCancelGrace):
+				cancelHard() // escalate: the graceful stop did not land in time
+			case <-hardCtx.Done():
+			}
+		case <-hardCtx.Done():
+		}
+	}()
+
+	jc := jobs.JobContext{
+		Ctx:             hardCtx,
+		LogFn:           func(string, string) {},
+		CancelRequested: func() bool { return ctx.Err() != nil },
+		Progress:        jobs.NewThrottledProgress(s.onProgress, nil),
+	}
+	out, err := h.Execute(jc, &nexus.Job{ID: "rag-index", Type: "FILE_INDEX", Payload: payload})
 	if err != nil {
 		return IndexResult{}, err
 	}

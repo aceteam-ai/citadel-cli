@@ -308,6 +308,19 @@ func TestResolveJobTimeout(t *testing.T) {
 		}
 	})
 
+	t.Run("file index (heavy lane) uses the long tier without long-session routing", func(t *testing.T) {
+		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeFileIndex})
+		if !ok || d != defaultLongJobTimeoutSeconds*time.Second {
+			t.Fatalf("got (%s, %v), want (%ds, true) long tier", d, ok, defaultLongJobTimeoutSeconds)
+		}
+		if !needsHeavyLane(JobTypeFileIndex) {
+			t.Fatal("FILE_INDEX must route to the heavy lane")
+		}
+		if _, long := longSessionJobTypes[JobTypeFileIndex]; long {
+			t.Fatal("FILE_INDEX must NOT be in longSessionJobTypes (would race the heavy lane via the #489 async lane)")
+		}
+	})
+
 	t.Run("template run uses long fallback while retaining its serialized lane", func(t *testing.T) {
 		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeRunJobTemplate})
 		if !ok || d != defaultLongJobTimeoutSeconds*time.Second {

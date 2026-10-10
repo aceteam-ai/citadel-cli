@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -696,6 +697,154 @@ func TestFileIndexRootWalkFailurePreservesPriorRows(t *testing.T) {
 	defer store.Close()
 	if hash, present, err := store.FileHash(priorPath); err != nil || !present || hash != "prior-hash" {
 		t.Fatalf("prior hash/present/error = %q/%v/%v, want preserved row", hash, present, err)
+	}
+}
+
+// TestFileIndexCooperativeCancelCommitsCurrentFileAndSkipsPrune pins the C1
+// mid-walk cancel contract (aceteam#10876): a cooperative (graceful) cancel
+// observed at a file boundary stops the walk AFTER committing the current file,
+// returns status "cancelled" / checkpoint "partial" with partial counts, and
+// SKIPS prune (so a not-yet-visited index row is never deleted — the data-loss
+// case). CancelRequested flips true once the first file has been embedded, so
+// exactly the first file commits and the rest are left for a resume.
+func TestFileIndexCooperativeCancelCommitsCurrentFileAndSkipsPrune(t *testing.T) {
+	var embedCount atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"max_client_batch_size":32}`))
+	})
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		embedCount.Add(1)
+		data := make([]map[string]any, len(req.Input))
+		for i := range data {
+			data[i] = map[string]any{"index": i, "embedding": []float64{1, 0}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "model": "gte"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	t.Setenv("CITADEL_TEI_URL", srv.URL)
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+
+	ws := t.TempDir()
+	// Lexical order a < b < c: a.md embeds+commits, then cancel is observed at b.md.
+	for _, name := range []string{"a.md", "b.md", "c.md"} {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte("content of "+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+
+	// Pre-seed an indexed row under the root that is NOT on disk. A COMPLETE walk
+	// would prune it; a CANCELLED walk must NOT (prune is skipped), proving no
+	// data loss on the partial index.
+	preseed := filepath.Join(ws, "zzz-deleted.md")
+	store, err := nodeindex.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertFile(preseed, "old-hash", 0, 1, "gte", 2, []nodeindex.Chunk{{Index: 0, Text: "old", Embedding: []float32{1, 0}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewFileIndexHandler(ws, dbPath)
+	jc := JobContext{
+		// Graceful cancel is requested once the first file has been embedded.
+		CancelRequested: func() bool { return embedCount.Load() >= 1 },
+	}
+	out, err := h.Execute(jc, &nexus.Job{ID: "coop-cancel", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
+	if err != nil {
+		t.Fatalf("cooperative cancel must return a partial result, not an error: %v", err)
+	}
+	var res struct {
+		FilesIndexed int    `json:"files_indexed"`
+		FilesRemoved int    `json:"files_removed"`
+		Status       string `json:"status"`
+		Checkpoint   string `json:"checkpoint"`
+	}
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if res.Status != "cancelled" || res.Checkpoint != "partial" {
+		t.Fatalf("status/checkpoint = %q/%q, want cancelled/partial (result=%s)", res.Status, res.Checkpoint, out)
+	}
+	if res.FilesIndexed != 1 {
+		t.Fatalf("files_indexed = %d, want 1 (only the current file commits before stopping); result=%s", res.FilesIndexed, out)
+	}
+	if res.FilesRemoved != 0 {
+		t.Fatalf("files_removed = %d, want 0 (prune must be skipped on cancel)", res.FilesRemoved)
+	}
+
+	store, err = nodeindex.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// The current file (a.md) committed.
+	if _, indexed, err := store.FileHash(filepath.Join(ws, "a.md")); err != nil || !indexed {
+		t.Fatalf("a.md indexed/err = %v/%v, want true/nil (current file must commit)", indexed, err)
+	}
+	// The pre-seeded, not-visited row survived (prune skipped — no data loss).
+	if hash, indexed, err := store.FileHash(preseed); err != nil || !indexed || hash != "old-hash" {
+		t.Fatalf("pre-seeded row hash/indexed/err = %q/%v/%v, want preserved (prune must be skipped on cancel)", hash, indexed, err)
+	}
+	// A later file was NOT indexed (the walk stopped).
+	if _, indexed, _ := store.FileHash(filepath.Join(ws, "c.md")); indexed {
+		t.Fatal("c.md was indexed; the walk should have stopped at the cancel point")
+	}
+}
+
+// TestFileIndexEmitsProgress pins that FILE_INDEX reports per-file progress with
+// a pre-counted total, basenames (never full paths), and a Final terminal
+// update.
+func TestFileIndexEmitsProgress(t *testing.T) {
+	tei := fakeTEI(t)
+	t.Setenv("CITADEL_TEI_URL", tei.URL)
+
+	ws := t.TempDir()
+	for _, name := range []string{"one.md", "two.md", "three.md"} {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte("the cat sat in "+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var events []ProgressEvent
+	jc := JobContext{Progress: func(ev ProgressEvent) { events = append(events, ev) }}
+	h := NewFileIndexHandler(ws, filepath.Join(t.TempDir(), "index.db"))
+	if _, err := h.Execute(jc, &nexus.Job{ID: "progress", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected progress events, got none")
+	}
+	last := events[len(events)-1]
+	if !last.Final {
+		t.Errorf("last progress event Final=%v, want true", last.Final)
+	}
+	if last.Total != 3 {
+		t.Errorf("pre-counted total = %d, want 3", last.Total)
+	}
+	sawCurrent := false
+	for _, ev := range events {
+		if ev.Unit != "files" {
+			t.Errorf("progress unit = %q, want files", ev.Unit)
+		}
+		if strings.ContainsRune(ev.Current, os.PathSeparator) {
+			t.Errorf("progress current %q leaked a path separator (must be a basename only)", ev.Current)
+		}
+		if ev.Current != "" {
+			sawCurrent = true
+		}
+	}
+	if !sawCurrent {
+		t.Error("expected at least one progress event naming the current basename")
 	}
 }
 
