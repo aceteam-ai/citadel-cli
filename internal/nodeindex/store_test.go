@@ -36,6 +36,26 @@ func TestUpsertFileContextObservedPrecommitCancellationRollsBack(t *testing.T) {
 	if err != nil || !indexed || hash != "old" {
 		t.Fatalf("hash/indexed/error=%q/%v/%v, want old/true/nil", hash, indexed, err)
 	}
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM chunks WHERE path = ?`, "/ws/a.md").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("retained chunks=%d, want exactly one old chunk", count)
+	}
+	var index int
+	var text string
+	var encoded []byte
+	if err := s.db.QueryRow(
+		`SELECT chunk_index, text, embedding FROM chunks WHERE path = ?`,
+		"/ws/a.md",
+	).Scan(&index, &text, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	vector := decodeVector(encoded)
+	if index != 0 || text != "old" || len(vector) != 1 || vector[0] != 1 {
+		t.Fatalf("retained chunk index/text/vector=%d/%q/%v, want 0/old/[1]", index, text, vector)
+	}
 }
 
 func TestUpsertFileContextCancelsBlockedSQLOperation(t *testing.T) {
