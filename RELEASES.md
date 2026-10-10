@@ -3034,3 +3034,21 @@ Auto-generated log of every release.
   - build(desktop): retire legacy Terminal DMG path (#1257)
 
 
+---
+
+## v2.190.0 — 2026-10-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 44 |
+| Lines added | +3114 |
+
+**Changes:**
+
+  - feat(tei): GPU-aware image tag + opt-in CPU threads for the embedding service (#1269) (#1276)
+  - fix(rag): bound and validate TEI embedding operations (#1275)
+  - fix(init): sudo-safe remediation for the Linux worker-setup install hint (#1268) (#1274)
+  - fix(update): refresh managed unit on already-latest path; sudo-safe remediation (#1266) (#1267)
+
+
