@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
-	"github.com/aceteam-ai/citadel-cli/internal/nodeindex"
 )
 
 // defaultSearchTopK is the number of hits FILE_SEMANTIC_SEARCH returns when the
@@ -32,6 +32,11 @@ type FileSemanticSearchHandler struct {
 	// DBPath is the node-local index database path. If empty, it is resolved from
 	// CITADEL_INDEX_DB or a default beside the workspace.
 	DBPath string
+	// IndexesDir is the machine-convergent base dir (<node_config_dir>/indexes)
+	// for per-org namespaced index DBs (aceteam#10876 C2). See
+	// FileIndexHandler.IndexesDir. Empty means a payload `index` namespace cannot
+	// be served (fails closed); the default (no `index`) path is unaffected.
+	IndexesDir string
 }
 
 // NewFileSemanticSearchHandler creates a FileSemanticSearchHandler.
@@ -47,6 +52,10 @@ func NewFileSemanticSearchHandler(workspace, dbPath string) *FileSemanticSearchH
 //   - model: TEI embedding model. Optional; must match the model the index was
 //     built with for scores to be meaningful. Defaults to CITADEL_EMBEDDING_MODEL
 //     or defaultEmbeddingModel.
+//   - index: per-org index namespace (`org_<id>/<name>`). Optional; absent uses
+//     the legacy single DB (aceteam#10876 C2).
+//   - path_prefixes: optional JSON array or comma-separated list of path
+//     prefixes; only chunks whose source file is under one of them are returned.
 func (h *FileSemanticSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	query, ok := job.Payload["query"]
 	if !ok || query == "" {
@@ -60,14 +69,18 @@ func (h *FileSemanticSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]b
 			model = env
 		}
 	}
-
-	store, err := nodeindex.Open(resolveIndexDBPath(h.DBPath, h.WorkspaceDir))
+	keep, err := h.pathPrefixFilter(job.Payload["path_prefixes"])
 	if err != nil {
-		return nil, fmt.Errorf("open node index: %w", err)
+		return nil, err
+	}
+
+	store, resolvedDB, err := openIndexStore(job.Payload["index"], h.IndexesDir, h.DBPath, h.WorkspaceDir)
+	if err != nil {
+		return nil, err
 	}
 	defer store.Close()
 
-	ctx.Log("info", "     - [Job %s] FILE_SEMANTIC_SEARCH query=%q top_k=%d model=%q", job.ID, truncateLine(query, 80), topK, model)
+	ctx.Log("info", "     - [Job %s] FILE_SEMANTIC_SEARCH query=%q top_k=%d model=%q db=%q", job.ID, truncateLine(query, 80), topK, model, resolvedDB)
 
 	op := newTEIEmbeddingOperation(teiBaseURL())
 	vecs, err := embedTexts(ctx.Context(), op, model, []string{query})
@@ -81,7 +94,10 @@ func (h *FileSemanticSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]b
 		return nil, fmt.Errorf("semantic search cancelled: %w", err)
 	}
 
-	hits, err := store.Search(vecs[0], topK)
+	// With a path_prefixes filter the KNN is filtered BEFORE the top-K trim
+	// (store.SearchFiltered), so the K results are exactly the best-scoring chunks
+	// under the prefixes — not an under-filled post-filter of a pre-trimmed set.
+	hits, err := store.SearchFiltered(vecs[0], topK, keep)
 	if err != nil {
 		return nil, fmt.Errorf("index search: %w", err)
 	}
@@ -95,6 +111,40 @@ func (h *FileSemanticSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]b
 		"model": model,
 	}
 	return json.Marshal(out)
+}
+
+// pathPrefixFilter parses the optional path_prefixes payload field (a JSON array
+// or comma-separated list, via the shared parsePatternField) into a keep
+// predicate for store.SearchFiltered. A relative prefix is resolved against the
+// handler's WorkspaceDir, because indexed chunk paths are absolute. Matching uses
+// withinDir (filepath.Rel-based), so `/docs` matches `/docs/a.md` and `/docs`
+// itself but never `/docs-evil`. Returns (nil, nil) when no prefixes are given
+// (no filtering). An empty-after-parse value is treated as "no filter", not an
+// error, so a caller sending path_prefixes="" behaves like omitting it.
+func (h *FileSemanticSearchHandler) pathPrefixFilter(raw string) (func(path string) bool, error) {
+	prefixes := parsePatternField(raw)
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	abs := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		if !filepath.IsAbs(p) {
+			if h.WorkspaceDir == "" {
+				return nil, fmt.Errorf("relative path_prefix %q cannot be resolved without a workspace", p)
+			}
+			p = filepath.Join(h.WorkspaceDir, p)
+		}
+		abs = append(abs, filepath.Clean(p))
+	}
+	return func(path string) bool {
+		clean := filepath.Clean(path)
+		for _, prefix := range abs {
+			if withinDir(prefix, clean) {
+				return true
+			}
+		}
+		return false
+	}, nil
 }
 
 // embedTexts embeds inputs via the node's TEI service, waiting for readiness,

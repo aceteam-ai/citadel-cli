@@ -113,6 +113,27 @@ func NewWithRoots(roots []string, workspaceForDB, modelOverride string) *Service
 // roots mode).
 func (s *Service) Roots() []string { return s.roots }
 
+// WithIndexNamespace routes this Service at a per-org index namespace
+// (`org_<id>/<name>`) under indexesDir instead of the default single DB
+// (aceteam#10876 C2). It resolves and confines the namespace path
+// (jobs.ResolveIndexNamespaceDBPath), creates the parent dir, and overrides the
+// resolved dbPath so every subsequent Index/Query/Status call reads and writes
+// that namespace's DB. indexesDir is resolved by the caller (cmd) from
+// network.GetNodeConfigDir(); this package never resolves it itself. It is the
+// local-surface analogue of the FILE_INDEX / FILE_SEMANTIC_SEARCH `index`
+// payload field and applies the identical validation + path confinement.
+func (s *Service) WithIndexNamespace(indexesDir, ns string) error {
+	dbPath, err := jobs.ResolveIndexNamespaceDBPath(indexesDir, ns)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		return fmt.Errorf("create index namespace dir: %w", err)
+	}
+	s.dbPath = dbPath
+	return nil
+}
+
 // NodeWorkspaceDir resolves the node's workspace directory the same way the
 // worker's resolveWorkspaceDir does (CITADEL_WORKSPACE, else
 // ~/citadel-node/workspace) WITHOUT the --workspace flag or directory creation.
@@ -146,15 +167,22 @@ func (s *Service) Provenance() string {
 // IndexResult is the outcome of an Index call (mirrors the FILE_INDEX handler
 // output, decoded into a typed struct).
 type IndexResult struct {
-	FilesSeen      int    `json:"files_seen"`
-	FilesIndexed   int    `json:"files_indexed"`
-	FilesSkipped   int    `json:"files_skipped"`
-	FilesFailed    int    `json:"files_failed"`
-	FilesRemoved   int    `json:"files_removed"`
-	ChunksUpserted int    `json:"chunks_upserted"`
-	ChunksEmbedded int    `json:"chunks_embedded"`
-	Model          string `json:"model"`
-	Dim            int    `json:"dim"`
+	FilesSeen    int `json:"files_seen"`
+	FilesIndexed int `json:"files_indexed"`
+	FilesSkipped int `json:"files_skipped"`
+	FilesFailed  int `json:"files_failed"`
+	FilesRemoved int `json:"files_removed"`
+	// Large-file / chunk-cap accounting (aceteam#10876 C2): FilesSkippedTooLarge
+	// = large files that could not be indexed at all (binary/empty head);
+	// FilesTruncated = large text files whose head WAS indexed; FilesChunkCapped
+	// = files that hit the per-file chunk cap. All reported, never silent.
+	FilesSkippedTooLarge int    `json:"files_skipped_too_large"`
+	FilesTruncated       int    `json:"files_truncated"`
+	FilesChunkCapped     int    `json:"files_chunk_capped"`
+	ChunksUpserted       int    `json:"chunks_upserted"`
+	ChunksEmbedded       int    `json:"chunks_embedded"`
+	Model                string `json:"model"`
+	Dim                  int    `json:"dim"`
 	// Status is "completed" on a clean walk or "cancelled" when a cooperative
 	// cancel stopped it; Checkpoint is "complete" or "partial" (aceteam#10876 C1).
 	Status     string `json:"status"`
@@ -246,11 +274,26 @@ type QueryResult struct {
 // cosine-nearest chunks from the node-local index. topK <= 0 uses the handler
 // default.
 func (s *Service) Query(ctx context.Context, query string, topK int) (QueryResult, error) {
+	return s.QueryWithPrefixes(ctx, query, topK, nil)
+}
+
+// QueryWithPrefixes is Query restricted to chunks whose source file is under one
+// of pathPrefixes (aceteam#10876 C2's path_prefixes filter). A relative prefix is
+// resolved against the workspace by the handler. nil/empty prefixes behave
+// exactly like Query.
+func (s *Service) QueryWithPrefixes(ctx context.Context, query string, topK int, pathPrefixes []string) (QueryResult, error) {
 	if query == "" {
 		return QueryResult{}, fmt.Errorf("query is required")
 	}
 	h := jobs.NewFileSemanticSearchHandler(s.workspaceDir, s.dbPath)
 	payload := map[string]string{"query": query, "model": s.model}
+	if len(pathPrefixes) > 0 {
+		encoded, err := json.Marshal(pathPrefixes)
+		if err != nil {
+			return QueryResult{}, fmt.Errorf("encode path_prefixes: %w", err)
+		}
+		payload["path_prefixes"] = string(encoded)
+	}
 	// In roots mode we filter returned hits to authorized roots, so over-fetch to
 	// compensate for hits dropped by the filter (result count may still be < topK
 	// when many hits fall outside the roots).
