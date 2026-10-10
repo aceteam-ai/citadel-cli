@@ -24,6 +24,23 @@ import (
 
 const ragSIGINTHelperEnv = "CITADEL_TEST_RAG_SIGINT_HELPER"
 
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
 func TestRunRAGIndexProgrammaticCancellationRemainsHard(t *testing.T) {
 	owned := t.TempDir()
 	workspace := filepath.Join(owned, "workspace")
@@ -122,38 +139,57 @@ func TestRAGIndexOwnedChildSIGINTCommitsCurrentFile(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var output bytes.Buffer
+	var output lockedBuffer
 	child.Stdout = &output
 	child.Stderr = &output
 	if err := child.Start(); err != nil {
 		t.Fatal(err)
 	}
-	waited := false
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	joined := false
+	var waitErr error
+	join := func(kill bool) error {
+		if joined {
+			return waitErr
+		}
+		if kill && child.Process != nil {
+			_ = child.Process.Kill()
+		}
+		select {
+		case waitErr = <-done:
+			joined = true
+			return waitErr
+		case <-time.After(2 * time.Second):
+			return errors.New("owned child Wait did not join")
+		}
+	}
 	t.Cleanup(func() {
 		releaseOnce.Do(func() { close(release) })
-		if !waited && child.Process != nil {
-			_ = child.Process.Kill()
-			_ = child.Wait()
+		if !joined {
+			_ = join(true)
 		}
 	})
 	select {
 	case <-started:
 	case <-ctx.Done():
+		releaseOnce.Do(func() { close(release) })
+		_ = join(true)
 		t.Fatalf("owned child never reached embedding request: %v\n%s", ctx.Err(), output.String())
 	}
 	if err := child.Process.Signal(os.Interrupt); err != nil {
 		t.Fatalf("signal owned child: %v", err)
 	}
 	releaseOnce.Do(func() { close(release) })
-	done := make(chan error, 1)
-	go func() { done <- child.Wait() }()
 	select {
 	case err := <-done:
-		waited = true
+		joined = true
+		waitErr = err
 		if err != nil {
 			t.Fatalf("owned child exit: %v\n%s", err, output.String())
 		}
 	case <-ctx.Done():
+		_ = join(true)
 		t.Fatalf("owned child did not exit: %v\n%s", ctx.Err(), output.String())
 	}
 	if !strings.Contains(output.String(), `"status": "cancelled"`) || !strings.Contains(output.String(), `"checkpoint": "partial"`) {

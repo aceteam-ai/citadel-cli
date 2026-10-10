@@ -120,6 +120,29 @@ func TestSanitizeProgressCurrent(t *testing.T) {
 	}
 }
 
+func TestSanitizeProgressCurrentMultibyteByteBoundaries(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantLen int
+	}{
+		{name: "127 bytes", input: strings.Repeat("a", 125) + "é", wantLen: 127},
+		{name: "128 bytes", input: strings.Repeat("a", 126) + "é", wantLen: 128},
+		{name: "129 bytes drops whole final rune", input: strings.Repeat("a", 127) + "é", wantLen: 127},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeProgressCurrent(tt.input)
+			if !utf8.ValidString(got) || len(got) != tt.wantLen {
+				t.Fatalf("sanitize(%d-byte input)=%q (%d bytes), want valid UTF-8 and %d bytes", len(tt.input), got, len(got), tt.wantLen)
+			}
+			if strings.HasSuffix(got, string(utf8.RuneError)) {
+				t.Fatalf("sanitize(%d-byte input) ended in replacement rune: %q", len(tt.input), got)
+			}
+		})
+	}
+}
+
 func TestProgressStageVocabulary(t *testing.T) {
 	got := []ProgressStage{ProgressStagePlan, ProgressStageExtract, ProgressStageEmbed, ProgressStageUpsert, ProgressStagePrune}
 	want := []ProgressStage{"plan", "extract", "embed", "upsert", "prune"}

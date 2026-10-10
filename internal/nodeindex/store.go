@@ -263,6 +263,27 @@ func (s *Store) DeleteFileContext(ctx context.Context, path string) error {
 // brute-force cosine scan. A query vector with zero magnitude, or an empty
 // index, yields no hits.
 func (s *Store) Search(query []float32, topK int) ([]SearchHit, error) {
+	return s.search(query, topK, nil)
+}
+
+// SearchFiltered is Search restricted to chunks whose source file path satisfies
+// keep. It is the path-prefix filter behind FILE_SEMANTIC_SEARCH's path_prefixes
+// (aceteam#10876 C2): a non-nil keep is applied to each candidate row BEFORE it is
+// scored and before the top-K trim, so the returned K are exactly the K
+// best-scoring rows that pass the filter — never an under-filled top-K produced
+// by post-filtering a pre-trimmed result. When keep is non-nil the HNSW
+// accelerator is bypassed (it returns exactly topK unfilterable candidates, so
+// post-filtering it would under-fill); the brute-force scan is exact and its
+// per-row work is strictly cheaper when a row is filtered out before scoring. A
+// nil keep is identical to Search.
+func (s *Store) SearchFiltered(query []float32, topK int, keep func(path string) bool) ([]SearchHit, error) {
+	return s.search(query, topK, keep)
+}
+
+// search is the shared implementation behind Search/SearchFiltered. With a nil
+// keep it prefers the HNSW accelerator; with a non-nil keep it always uses the
+// exact brute-force scan so the filter is applied before the top-K trim.
+func (s *Store) search(query []float32, topK int, keep func(path string) bool) ([]SearchHit, error) {
 	if topK <= 0 {
 		topK = 10
 	}
@@ -270,7 +291,7 @@ func (s *Store) Search(query []float32, topK int) ([]SearchHit, error) {
 	if qNorm == 0 {
 		return nil, nil
 	}
-	if s.accel != nil {
+	if keep == nil && s.accel != nil {
 		hits, served, err := s.accel.search(s.db, query, qNorm, topK)
 		if err != nil {
 			return nil, err
@@ -279,7 +300,7 @@ func (s *Store) Search(query []float32, topK int) ([]SearchHit, error) {
 			return hits, nil
 		}
 	}
-	return s.searchBrute(query, qNorm, topK)
+	return s.searchBruteFiltered(query, qNorm, topK, keep)
 }
 
 // searchBrute is the brute-force cosine KNN over every stored chunk. It is the
@@ -287,6 +308,12 @@ func (s *Store) Search(query []float32, topK int) ([]SearchHit, error) {
 // dimension-mismatched query) and the parity reference the accelerator is tested
 // against.
 func (s *Store) searchBrute(query []float32, qNorm float64, topK int) ([]SearchHit, error) {
+	return s.searchBruteFiltered(query, qNorm, topK, nil)
+}
+
+// searchBruteFiltered is searchBrute with an optional per-row path filter applied
+// before scoring. keep == nil scores every chunk (the plain brute-force scan).
+func (s *Store) searchBruteFiltered(query []float32, qNorm float64, topK int, keep func(path string) bool) ([]SearchHit, error) {
 	if topK <= 0 {
 		topK = 10
 	}
@@ -306,6 +333,9 @@ func (s *Store) searchBrute(query []float32, qNorm float64, topK int) ([]SearchH
 		)
 		if err := rows.Scan(&path, &idx, &text, &blob); err != nil {
 			return nil, fmt.Errorf("scan chunk row: %w", err)
+		}
+		if keep != nil && !keep(path) {
+			continue
 		}
 		vec := decodeVector(blob)
 		score := cosinePrenorm(query, qNorm, vec)

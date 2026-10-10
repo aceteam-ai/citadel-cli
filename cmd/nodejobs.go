@@ -36,6 +36,10 @@ type nodeJobHandlerOpts struct {
 	// PermissionsDir is the authoritative machine-level node configuration
 	// directory. It must not depend on which user launched the worker.
 	PermissionsDir string
+	// IndexesDir is the machine-convergent base dir for per-org namespaced index
+	// DBs (aceteam#10876 C2), <node_config_dir>/indexes. Threaded to the
+	// FILE_INDEX / FILE_SEMANTIC_SEARCH handlers.
+	IndexesDir string
 	// AllowReadOutsideWorkspace lets read-only file handlers escape the sandbox.
 	AllowReadOutsideWorkspace bool
 	// ShellDisabled omits SHELL_COMMAND because it cannot execute while disabled.
@@ -100,6 +104,7 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 		WorkspaceDir:              opts.WorkspaceDir,
 		ConfigDir:                 opts.ConfigDir,
 		PermissionsDir:            opts.PermissionsDir,
+		IndexesDir:                opts.IndexesDir,
 		AllowReadOutsideWorkspace: opts.AllowReadOutsideWorkspace,
 		ShellDisabled:             opts.ShellDisabled,
 		ShellEnabled:              opts.ShellEnabled,

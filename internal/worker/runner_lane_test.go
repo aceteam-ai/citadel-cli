@@ -265,6 +265,98 @@ func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T)
 	}
 }
 
+type shutdownHeldHeavyHandler struct {
+	started        chan struct{}
+	cancelObserved chan struct{}
+	release        chan struct{}
+	returned       chan struct{}
+	startOnce      sync.Once
+	cancelOnce     sync.Once
+	returnedOnce   sync.Once
+}
+
+func (h *shutdownHeldHeavyHandler) CanHandle(jt string) bool { return jt == JobTypeFileIndex }
+
+func (h *shutdownHeldHeavyHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	h.startOnce.Do(func() { close(h.started) })
+	<-ctx.Done()
+	h.cancelOnce.Do(func() { close(h.cancelObserved) })
+	<-h.release
+	h.returnedOnce.Do(func() { close(h.returned) })
+	return nil, ctx.Err()
+}
+
+func TestRunnerShutdownRetainsHeavyOwnershipUntilActualHandlerExit(t *testing.T) {
+	h := &shutdownHeldHeavyHandler{
+		started:        make(chan struct{}),
+		cancelObserved: make(chan struct{}),
+		release:        make(chan struct{}),
+		returned:       make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(h.release) }) })
+	source := NewMockJobSource("test", []*Job{{ID: "index-shutdown", Type: JobTypeFileIndex, Payload: map[string]any{"path": "/ws"}}})
+	state := NewWorkerState()
+	runner := NewRunner(source, []JobHandler{h}, RunnerConfig{WorkerID: "test", MaxConcurrency: 1, State: state, ActivityFn: func(string, string) {}})
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = runner.Run(ctx); close(runDone) }()
+
+	select {
+	case <-h.started:
+	case <-time.After(time.Second):
+		t.Fatal("heavy handler did not start")
+	}
+	cancel()
+	select {
+	case <-h.cancelObserved:
+	case <-time.After(time.Second):
+		t.Fatal("heavy handler did not observe runner shutdown")
+	}
+	select {
+	case <-runDone:
+		t.Fatal("Runner.Run returned while its heavy handler goroutine still owned the writer slot")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if snap := state.Snapshot(); snap.Executing != 1 || snap.InFlight != 1 {
+		t.Fatalf("state while shutdown join held = %+v, want executing=1 in_flight=1", snap)
+	}
+	var heavy LaneSnapshot
+	for _, snap := range runner.LaneSnapshots() {
+		if snap.Lane == "heavy" {
+			heavy = snap
+		}
+	}
+	if heavy.Executing != 1 {
+		t.Fatalf("heavy lane while shutdown join held = %+v, want executing=1", heavy)
+	}
+	select {
+	case <-h.returned:
+		t.Fatal("handler returned before the owned release")
+	default:
+	}
+
+	releaseOnce.Do(func() { close(h.release) })
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("Runner.Run did not finish after the heavy handler actually returned")
+	}
+	select {
+	case <-h.returned:
+	default:
+		t.Fatal("Runner.Run finished without observing actual handler return")
+	}
+	if snap := state.Snapshot(); snap.Executing != 0 || snap.InFlight != 0 {
+		t.Fatalf("state after shutdown join = %+v, want executing=0 in_flight=0", snap)
+	}
+	for _, snap := range runner.LaneSnapshots() {
+		if snap.Lane == "heavy" && snap.Executing != 0 {
+			t.Fatalf("heavy lane after shutdown join = %+v, want executing=0", snap)
+		}
+	}
+}
+
 // coopCancelObserverHandler is a FILE_INDEX worker.JobHandler that waits for a
 // cooperative cancel to be surfaced on its context (via jobs.CancelRequested)
 // and then returns a partial `cancelled` result — WITHOUT its context being hard

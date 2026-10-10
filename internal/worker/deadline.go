@@ -495,6 +495,27 @@ func (e *deadlineExceededError) Error() string {
 	)
 }
 
+// completedHandlerResult resolves the select race where a handler result and
+// the execution context are both ready. Heavy jobs are index writers: their
+// hard cancellation must win so a partial/success result cannot mask shutdown
+// or a deadline. Every other lane preserves the historical handler result,
+// including HUDDLE_JOIN lifecycle sentinels that drive Ack/Nack recovery debt.
+func completedHandlerResult(jobType string, hardErr error, timeout time.Duration, result *JobResult, handlerErr error) (*JobResult, error) {
+	if hardErr != nil && needsHeavyLane(jobType) {
+		if errors.Is(hardErr, context.DeadlineExceeded) {
+			return nil, &deadlineExceededError{timeout: timeout}
+		}
+		return nil, hardErr
+	}
+	// Preserve the pre-C1 non-heavy race behavior: an incidental handler error
+	// arriving as its deadline elapses is reported as the clearer deadline error,
+	// while a successful result still wins that same select race.
+	if handlerErr != nil && errors.Is(hardErr, context.DeadlineExceeded) {
+		return nil, &deadlineExceededError{timeout: timeout}
+	}
+	return result, handlerErr
+}
+
 // executeWithDeadline runs handler.Execute under a child context bounded by
 // timeout (aceteam#6000).
 //
@@ -534,15 +555,7 @@ func (r *Runner) executeWithDeadline(
 
 	select {
 	case hr := <-done:
-		// Hard cancellation always wins a race with a handler result. In
-		// particular, a cooperative partial result must never mask shutdown.
-		if hardErr := execCtx.Err(); hardErr != nil {
-			if errors.Is(hardErr, context.DeadlineExceeded) {
-				return nil, &deadlineExceededError{timeout: timeout}
-			}
-			return nil, hardErr
-		}
-		return hr.result, hr.err
+		return completedHandlerResult(job.Type, execCtx.Err(), timeout, hr.result, hr.err)
 	case <-execCtx.Done():
 		if needsHeavyLane(job.Type) {
 			// A heavy handler owns the single dispatched-writer slot until its

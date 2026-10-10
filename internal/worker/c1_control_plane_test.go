@@ -2,7 +2,13 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,5 +177,127 @@ func TestLegacyAdapterWiresProgressAndCancel(t *testing.T) {
 	last := stream.progress[len(stream.progress)-1]
 	if last["stage"] != "embed" || last["current"] != "x.md" {
 		t.Errorf("forwarded progress = %v, want stage=embed current=x.md", last)
+	}
+}
+
+type completionOrder struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (o *completionOrder) add(event string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.events = append(o.events, event)
+}
+
+func (o *completionOrder) snapshot() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.events...)
+}
+
+type orderedAckSource struct {
+	*MockJobSource
+	order *completionOrder
+	acked chan struct{}
+	once  sync.Once
+}
+
+func (s *orderedAckSource) Ack(ctx context.Context, job *Job) error {
+	s.order.add("ack")
+	err := s.MockJobSource.Ack(ctx, job)
+	s.once.Do(func() { close(s.acked) })
+	return err
+}
+
+type orderedEndWriter struct {
+	MockStreamWriter
+	order *completionOrder
+}
+
+func (w *orderedEndWriter) WriteEnd(result map[string]any) error {
+	w.order.add("end")
+	return w.MockStreamWriter.WriteEnd(result)
+}
+
+func TestRunnerLegacyFileIndexPublishesNestedResultBeforeAck(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/info", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"max_client_batch_size":32}`)) })
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode embedding request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		data := make([]map[string]any, len(req.Input))
+		for i := range data {
+			data[i] = map[string]any{"index": i, "embedding": []float64{1, 0}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "model": req.Model})
+	})
+	tei := httptest.NewServer(mux)
+	defer tei.Close()
+	t.Setenv("CITADEL_TEI_URL", tei.URL)
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "document.md"), []byte("local document content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	legacy := jobhandlers.NewFileIndexHandler(ws, dbPath)
+	adapter := NewLegacyHandlerAdapter(JobTypeFileIndex, legacy)
+	job := &Job{ID: "actual-file-index", Type: JobTypeFileIndex, Payload: map[string]any{"path": ws}}
+	order := &completionOrder{}
+	source := &orderedAckSource{
+		MockJobSource: NewMockJobSource("test", []*Job{job}),
+		order:         order,
+		acked:         make(chan struct{}),
+	}
+	writer := &orderedEndWriter{order: order}
+	runner := NewRunner(source, []JobHandler{adapter}, RunnerConfig{WorkerID: "test", MaxConcurrency: 1, ActivityFn: func(string, string) {}})
+	runner.WithStreamWriterFactory(func(*Job) StreamWriter { return writer })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	runDone := make(chan struct{})
+	go func() { _ = runner.Run(ctx); close(runDone) }()
+	select {
+	case <-source.acked:
+	case <-ctx.Done():
+		cancel()
+		t.Fatalf("actual FILE_INDEX was not ACKed: %v", ctx.Err())
+	}
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not stop after actual FILE_INDEX completion")
+	}
+
+	if got := order.snapshot(); len(got) != 2 || got[0] != "end" || got[1] != "ack" {
+		t.Fatalf("terminal ordering=%v, want exactly [end ack]", got)
+	}
+	if writer.endCount != 1 {
+		t.Fatalf("terminal end count=%d, want exactly one", writer.endCount)
+	}
+	nested, ok := writer.endResult["output"].(string)
+	if !ok {
+		t.Fatalf("terminal result.output=%T(%v), want nested JSON string", writer.endResult["output"], writer.endResult["output"])
+	}
+	var result struct {
+		FilesIndexed int    `json:"files_indexed"`
+		Status       string `json:"status"`
+		Checkpoint   string `json:"checkpoint"`
+	}
+	if err := json.Unmarshal([]byte(nested), &result); err != nil {
+		t.Fatalf("decode nested FILE_INDEX output: %v; body=%q", err, nested)
+	}
+	if result.FilesIndexed != 1 || result.Status != "completed" || result.Checkpoint != "complete" {
+		t.Fatalf("nested FILE_INDEX result=%+v, want one indexed and completed/complete", result)
 	}
 }

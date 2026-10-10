@@ -866,6 +866,198 @@ func TestFileIndexCooperativeCancelCommitsCurrentFileAndSkipsPrune(t *testing.T)
 	}
 }
 
+func seedPruneFixture(t *testing.T, ws, dbPath string) (current string, stale []string) {
+	t.Helper()
+	current = filepath.Join(ws, "current.md")
+	content := []byte("unchanged current content")
+	if err := os.WriteFile(current, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale = []string{filepath.Join(ws, "stale-a.md"), filepath.Join(ws, "stale-b.md")}
+	store, err := nodeindex.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.UpsertFile(current, hashContent(content), 0, int64(len(content)), "gte", 1, []nodeindex.Chunk{{Index: 0, Text: string(content), Embedding: []float32{1}}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range stale {
+		if err := store.UpsertFile(path, "stale-hash", 0, 5, "gte", 1, []nodeindex.Chunk{{Index: 0, Text: "stale", Embedding: []float32{1}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return current, stale
+}
+
+func TestFileIndexCancelAtPruneStageSkipsAllDeletes(t *testing.T) {
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	ws := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	_, stale := seedPruneFixture(t, ws, dbPath)
+	var soft atomic.Bool
+	var events []ProgressEvent
+	h := NewFileIndexHandler(ws, dbPath)
+	out, err := h.Execute(JobContext{
+		CancelRequested: soft.Load,
+		Progress: func(ev ProgressEvent) {
+			events = append(events, ev)
+			if ev.Stage == ProgressStagePrune {
+				soft.Store(true)
+			}
+		},
+	}, &nexus.Job{ID: "cancel-at-prune", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var result struct {
+		FilesRemoved int    `json:"files_removed"`
+		Status       string `json:"status"`
+		Checkpoint   string `json:"checkpoint"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesRemoved != 0 || result.Status != "cancelled" || result.Checkpoint != "partial" {
+		t.Fatalf("result=%s, want zero deletes and cancelled/partial", out)
+	}
+	if last := events[len(events)-1]; last.Final || !last.Flush {
+		t.Fatalf("terminal progress=%+v, want nonfinal flushed partial", last)
+	}
+	store, err := nodeindex.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, path := range stale {
+		if _, present, err := store.FileHash(path); err != nil || !present {
+			t.Fatalf("stale row %q present/error=%v/%v, want true/nil", path, present, err)
+		}
+	}
+}
+
+func TestFileIndexLatePruneCancelKeepsOneLinearizedDeleteHonest(t *testing.T) {
+	t.Setenv("CITADEL_INDEX_HNSW", "false")
+	ws := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	current, stale := seedPruneFixture(t, ws, dbPath)
+	var soft atomic.Bool
+	var rawEvents []ProgressEvent
+	var projected []map[string]any
+	project := NewThrottledProgress(func(event map[string]any) { projected = append(projected, event) }, func() time.Time { return time.Unix(0, 0) })
+	h := NewFileIndexHandler(ws, dbPath)
+	h.afterDelete = func() { soft.Store(true) }
+	out, err := h.Execute(JobContext{
+		CancelRequested: soft.Load,
+		Progress: func(ev ProgressEvent) {
+			rawEvents = append(rawEvents, ev)
+			project(ev)
+		},
+	}, &nexus.Job{ID: "late-prune-cancel", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var result struct {
+		FilesRemoved int    `json:"files_removed"`
+		Status       string `json:"status"`
+		Checkpoint   string `json:"checkpoint"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesRemoved != 1 || result.Status != "cancelled" || result.Checkpoint != "partial" {
+		t.Fatalf("result=%s, want one linearized delete and cancelled/partial", out)
+	}
+	if last := rawEvents[len(rawEvents)-1]; last.Final || !last.Flush {
+		t.Fatalf("terminal raw progress=%+v, want nonfinal flushed partial", last)
+	}
+	lastProjected := projected[len(projected)-1]
+	if percent, ok := lastProjected["percent"].(int); !ok || percent >= 100 {
+		t.Fatalf("terminal projected progress=%v, want an explicit percent below 100", lastProjected)
+	}
+	store, err := nodeindex.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, present, err := store.FileHash(current); err != nil || !present {
+		t.Fatalf("current row present/error=%v/%v, want true/nil", present, err)
+	}
+	remaining := 0
+	for _, path := range stale {
+		if _, present, err := store.FileHash(path); err != nil {
+			t.Fatal(err)
+		} else if present {
+			remaining++
+		}
+	}
+	if remaining != 1 {
+		t.Fatalf("remaining stale rows=%d, want exactly one after a single linearized delete", remaining)
+	}
+}
+
+func TestFileIndexHardCancellationBeatsSoftAtLatePruneBoundaries(t *testing.T) {
+	for _, afterDelete := range []bool{false, true} {
+		name := "prune-stage"
+		if afterDelete {
+			name = "after-delete"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("CITADEL_INDEX_HNSW", "false")
+			ws := t.TempDir()
+			dbPath := filepath.Join(t.TempDir(), "index.db")
+			_, stale := seedPruneFixture(t, ws, dbPath)
+			hard, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var soft atomic.Bool
+			var pruneDeleteProgress atomic.Int64
+			h := NewFileIndexHandler(ws, dbPath)
+			if afterDelete {
+				h.afterDelete = func() { soft.Store(true); cancel() }
+			}
+			_, err := h.Execute(JobContext{
+				Ctx:             hard,
+				CancelRequested: soft.Load,
+				Progress: func(ev ProgressEvent) {
+					if ev.Stage == ProgressStagePrune && ev.Current != "" {
+						pruneDeleteProgress.Add(1)
+					}
+					if !afterDelete && ev.Stage == ProgressStagePrune {
+						soft.Store(true)
+						cancel()
+					}
+				},
+			}, &nexus.Job{ID: "hard-soft-prune", Type: "FILE_INDEX", Payload: map[string]string{"path": ws}})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error=%v, want fatal context.Canceled", err)
+			}
+			store, openErr := nodeindex.Open(dbPath)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			defer store.Close()
+			remaining := 0
+			for _, path := range stale {
+				if _, present, hashErr := store.FileHash(path); hashErr != nil {
+					t.Fatal(hashErr)
+				} else if present {
+					remaining++
+				}
+			}
+			wantRemaining := 2
+			if afterDelete {
+				wantRemaining = 1
+			}
+			if remaining != wantRemaining {
+				t.Fatalf("remaining stale rows=%d, want %d at hard/soft boundary", remaining, wantRemaining)
+			}
+			if pruneDeleteProgress.Load() != 0 {
+				t.Fatalf("post-delete prune progress events=%d, want zero before fatal hard cancellation", pruneDeleteProgress.Load())
+			}
+		})
+	}
+}
+
 // TestFileIndexEmitsProgress pins that FILE_INDEX reports per-file progress with
 // a pre-counted total, basenames (never full paths), and a Final terminal
 // update.
@@ -1185,10 +1377,13 @@ func TestFileIndexDynamicCandidateGrowsProgressDenominator(t *testing.T) {
 	if !strings.Contains(string(out), `"files_seen":2`) {
 		t.Fatalf("result=%s, want late candidate visited", out)
 	}
-	sawGrown := false
+	sawLateInflight := false
 	for i, ev := range projected {
-		if total, _ := ev["total"].(int); i < len(projected)-1 && total >= 2 {
-			sawGrown = true
+		if ev["current"] == "b.md" && ev["stage"] == string(ProgressStageEmbed) {
+			if ev["done"] != 1 || ev["total"] != 2 {
+				t.Fatalf("late in-flight candidate progress=%v, want done=1 total=2 before its disposition", ev)
+			}
+			sawLateInflight = true
 		}
 		if i < len(projected)-1 {
 			if percent, ok := ev["percent"].(int); ok && percent >= 100 {
@@ -1196,8 +1391,8 @@ func TestFileIndexDynamicCandidateGrowsProgressDenominator(t *testing.T) {
 			}
 		}
 	}
-	if !sawGrown {
-		t.Fatalf("progress denominator never grew for late candidate: %v", projected)
+	if !sawLateInflight {
+		t.Fatalf("no in-flight progress event distinguished the late candidate before disposition: %v", projected)
 	}
 	last := projected[len(projected)-1]
 	if last["total"] != 2 || last["percent"] != 100 {

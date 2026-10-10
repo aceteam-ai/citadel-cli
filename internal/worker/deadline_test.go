@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
@@ -36,6 +37,45 @@ func TestExecuteWithDeadlineHeavyHardCancellationWinsSuccessfulReturn(t *testing
 	result, err := r.executeWithDeadline(ctx, h, &Job{ID: "idx", Type: JobTypeFileIndex}, &MockStreamWriter{}, time.Hour)
 	if !errors.Is(err, context.Canceled) || result != nil {
 		t.Fatalf("result/error=%v/%v, want nil/context.Canceled", result, err)
+	}
+}
+
+func TestCompletedHandlerResultPreservesNonHeavyLifecycleSentinel(t *testing.T) {
+	want := jobs.ErrHuddleLifecycleOutboxUnavailable
+	result := &JobResult{Status: JobStatusFailure, Error: want}
+	gotResult, gotErr := completedHandlerResult(JobTypeHuddleJoin, context.Canceled, time.Hour, result, want)
+	if gotResult != result || !errors.Is(gotErr, want) {
+		t.Fatalf("result/error = %v/%v, want original result and huddle lifecycle sentinel", gotResult, gotErr)
+	}
+}
+
+func TestCompletedHandlerResultPreservesNonHeavyDeadlineSemantics(t *testing.T) {
+	timeout := 3 * time.Second
+	handlerErr := errors.New("incidental handler failure")
+	gotResult, gotErr := completedHandlerResult(JobTypeShellCommand, context.DeadlineExceeded, timeout, nil, handlerErr)
+	var deadlineErr *deadlineExceededError
+	if gotResult != nil || !errors.As(gotErr, &deadlineErr) {
+		t.Fatalf("error=%v, want deadlineExceededError for non-heavy handler error at deadline", gotErr)
+	}
+
+	wantResult := &JobResult{Status: JobStatusSuccess}
+	gotResult, gotErr = completedHandlerResult(JobTypeShellCommand, context.DeadlineExceeded, timeout, wantResult, nil)
+	if gotResult != wantResult || gotErr != nil {
+		t.Fatalf("result/error=%v/%v, want original successful non-heavy result", gotResult, gotErr)
+	}
+}
+
+func TestCompletedHandlerResultHeavyHardCancellationWins(t *testing.T) {
+	result := &JobResult{Status: JobStatusSuccess}
+	gotResult, gotErr := completedHandlerResult(JobTypeFileIndex, context.Canceled, time.Hour, result, nil)
+	if gotResult != nil || !errors.Is(gotErr, context.Canceled) {
+		t.Fatalf("result/error = %v/%v, want nil/context.Canceled", gotResult, gotErr)
+	}
+
+	gotResult, gotErr = completedHandlerResult(JobTypeFileIndex, context.DeadlineExceeded, time.Second, result, nil)
+	var deadlineErr *deadlineExceededError
+	if gotResult != nil || !errors.As(gotErr, &deadlineErr) {
+		t.Fatalf("result/error = %v/%v, want nil/deadlineExceededError", gotResult, gotErr)
 	}
 }
 

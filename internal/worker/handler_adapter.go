@@ -172,6 +172,13 @@ type LegacyHandlerOpts struct {
 	// permissions.yaml. Production callers must resolve it independently of
 	// ConfigDir, which follows the invoking user's manifest search path.
 	PermissionsDir string
+	// IndexesDir is the machine-convergent base dir for per-org namespaced index
+	// DBs (aceteam#10876 C2), typically <node_config_dir>/indexes. Resolved in the
+	// cmd layer via jobs.IndexesDirFor(network.GetNodeConfigDir()) and threaded to
+	// the FILE_INDEX / FILE_SEMANTIC_SEARCH handlers. Empty disables payload
+	// `index` namespaces (they fail closed); the default (no `index`) path works
+	// regardless.
+	IndexesDir string
 	// AllowReadOutsideWorkspace, when true, lets read-only file handlers
 	// (FILE_READ, FILE_READ_BYTES, FILE_LIST, FILE_SEARCH) access paths
 	// outside the workspace sandbox. Write handlers are unaffected.
@@ -402,6 +409,10 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			// like the other read handlers.
 			indexHandler := jobs.NewFileIndexHandler(opts.WorkspaceDir, "")
 			indexHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			indexHandler.IndexesDir = opts.IndexesDir
+
+			semanticSearchHandler := jobs.NewFileSemanticSearchHandler(opts.WorkspaceDir, "")
+			semanticSearchHandler.IndexesDir = opts.IndexesDir
 
 			handlers = append(handlers,
 				newGatedLegacyHandlerAdapter(JobTypeFileRead, readHandler, gate),
@@ -412,7 +423,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 				newGatedLegacyHandlerAdapter(JobTypeFileList, listHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileSearch, searchHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileIndex, indexHandler, gate),
-				newGatedLegacyHandlerAdapter(JobTypeFileSemanticSearch, jobs.NewFileSemanticSearchHandler(opts.WorkspaceDir, ""), gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileSemanticSearch, semanticSearchHandler, gate),
 			)
 		}
 
