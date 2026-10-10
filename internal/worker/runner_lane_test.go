@@ -187,6 +187,176 @@ func TestRunnerHeavyLaneDoesNotBlockFetchLoop(t *testing.T) {
 	}
 }
 
+type deadlineHeldHeavyHandler struct {
+	firstCancelled chan struct{}
+	releaseFirst   chan struct{}
+	secondStarted  chan struct{}
+	firstOnce      sync.Once
+	secondOnce     sync.Once
+}
+
+func (h *deadlineHeldHeavyHandler) CanHandle(jt string) bool { return jt == JobTypeFileIndex }
+
+func (h *deadlineHeldHeavyHandler) Execute(ctx context.Context, job *Job, _ StreamWriter) (*JobResult, error) {
+	if job.ID == "index-1" {
+		<-ctx.Done()
+		h.firstOnce.Do(func() { close(h.firstCancelled) })
+		<-h.releaseFirst
+		return nil, ctx.Err()
+	}
+	h.secondOnce.Do(func() { close(h.secondStarted) })
+	return &JobResult{Status: JobStatusSuccess}, nil
+}
+
+func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T) {
+	h := &deadlineHeldHeavyHandler{
+		firstCancelled: make(chan struct{}),
+		releaseFirst:   make(chan struct{}),
+		secondStarted:  make(chan struct{}),
+	}
+	ordinary := NewMockJobHandler(JobTypeFileReadBytes, false)
+	source := NewMockJobSource("test", []*Job{
+		{ID: "index-1", Type: JobTypeFileIndex, Payload: map[string]any{"timeout_ms": float64(20)}},
+		{ID: "index-2", Type: JobTypeFileIndex, Payload: map[string]any{}},
+		{ID: "ordinary", Type: JobTypeFileReadBytes, Payload: map[string]any{}},
+	})
+	state := NewWorkerState()
+	r := NewRunner(source, []JobHandler{h, ordinary}, RunnerConfig{WorkerID: "test", MaxConcurrency: 1, State: state, ActivityFn: func(string, string) {}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { _ = r.Run(ctx); close(runDone) }()
+	select {
+	case <-h.firstCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("first heavy handler did not reach deadline")
+	}
+	if !laneWaitFor(time.Second, func() bool { return len(ordinary.ExecutedJobs()) == 1 }) {
+		t.Fatal("ordinary lane work did not complete while heavy writer was joined")
+	}
+	select {
+	case <-h.secondStarted:
+		t.Fatal("second heavy writer overlapped the deadline-held first writer")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if snap := state.Snapshot(); snap.Executing != 1 || snap.InFlight < 2 {
+		t.Fatalf("state while held = %+v, want one executing heavy and queued in-flight work", snap)
+	}
+	var heavy LaneSnapshot
+	for _, snap := range r.LaneSnapshots() {
+		if snap.Lane == "heavy" {
+			heavy = snap
+		}
+	}
+	if heavy.Executing != 1 || heavy.Queued < 1 {
+		t.Fatalf("heavy lane while held = %+v, want executing=1 queued>=1", heavy)
+	}
+	close(h.releaseFirst)
+	select {
+	case <-h.secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second heavy writer did not start after actual first-handler exit")
+	}
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not stop")
+	}
+}
+
+type shutdownHeldHeavyHandler struct {
+	started        chan struct{}
+	cancelObserved chan struct{}
+	release        chan struct{}
+	returned       chan struct{}
+	startOnce      sync.Once
+	cancelOnce     sync.Once
+	returnedOnce   sync.Once
+}
+
+func (h *shutdownHeldHeavyHandler) CanHandle(jt string) bool { return jt == JobTypeFileIndex }
+
+func (h *shutdownHeldHeavyHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	h.startOnce.Do(func() { close(h.started) })
+	<-ctx.Done()
+	h.cancelOnce.Do(func() { close(h.cancelObserved) })
+	<-h.release
+	h.returnedOnce.Do(func() { close(h.returned) })
+	return nil, ctx.Err()
+}
+
+func TestRunnerShutdownRetainsHeavyOwnershipUntilActualHandlerExit(t *testing.T) {
+	h := &shutdownHeldHeavyHandler{
+		started:        make(chan struct{}),
+		cancelObserved: make(chan struct{}),
+		release:        make(chan struct{}),
+		returned:       make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(h.release) }) })
+	source := NewMockJobSource("test", []*Job{{ID: "index-shutdown", Type: JobTypeFileIndex, Payload: map[string]any{"path": "/ws"}}})
+	state := NewWorkerState()
+	runner := NewRunner(source, []JobHandler{h}, RunnerConfig{WorkerID: "test", MaxConcurrency: 1, State: state, ActivityFn: func(string, string) {}})
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = runner.Run(ctx); close(runDone) }()
+
+	select {
+	case <-h.started:
+	case <-time.After(time.Second):
+		t.Fatal("heavy handler did not start")
+	}
+	cancel()
+	select {
+	case <-h.cancelObserved:
+	case <-time.After(time.Second):
+		t.Fatal("heavy handler did not observe runner shutdown")
+	}
+	select {
+	case <-runDone:
+		t.Fatal("Runner.Run returned while its heavy handler goroutine still owned the writer slot")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if snap := state.Snapshot(); snap.Executing != 1 || snap.InFlight != 1 {
+		t.Fatalf("state while shutdown join held = %+v, want executing=1 in_flight=1", snap)
+	}
+	var heavy LaneSnapshot
+	for _, snap := range runner.LaneSnapshots() {
+		if snap.Lane == "heavy" {
+			heavy = snap
+		}
+	}
+	if heavy.Executing != 1 {
+		t.Fatalf("heavy lane while shutdown join held = %+v, want executing=1", heavy)
+	}
+	select {
+	case <-h.returned:
+		t.Fatal("handler returned before the owned release")
+	default:
+	}
+
+	releaseOnce.Do(func() { close(h.release) })
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("Runner.Run did not finish after the heavy handler actually returned")
+	}
+	select {
+	case <-h.returned:
+	default:
+		t.Fatal("Runner.Run finished without observing actual handler return")
+	}
+	if snap := state.Snapshot(); snap.Executing != 0 || snap.InFlight != 0 {
+		t.Fatalf("state after shutdown join = %+v, want executing=0 in_flight=0", snap)
+	}
+	for _, snap := range runner.LaneSnapshots() {
+		if snap.Lane == "heavy" && snap.Executing != 0 {
+			t.Fatalf("heavy lane after shutdown join = %+v, want executing=0", snap)
+		}
+	}
+}
+
 // coopCancelObserverHandler is a FILE_INDEX worker.JobHandler that waits for a
 // cooperative cancel to be surfaced on its context (via jobs.CancelRequested)
 // and then returns a partial `cancelled` result — WITHOUT its context being hard
@@ -197,6 +367,87 @@ type coopCancelObserverHandler struct {
 	observed    chan struct{}
 	hardCancel  chan struct{}
 	startedOnce sync.Once
+}
+
+type blockingCancellationSource struct {
+	*MockJobSource
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	honor   bool
+}
+
+func (s *blockingCancellationSource) IsJobCancelled(ctx context.Context, _ string) bool {
+	s.once.Do(func() { close(s.started) })
+	if s.honor {
+		<-ctx.Done()
+		return false
+	}
+	<-s.release
+	return false
+}
+
+func TestWatchCooperativeCancellationStopCancelsPollAndJoinsConcurrently(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	source := &blockingCancellationSource{
+		MockJobSource: NewMockJobSource("test", nil),
+		started:       make(chan struct{}),
+		release:       make(chan struct{}),
+		honor:         true,
+	}
+	r := NewRunner(source, nil, RunnerConfig{WorkerID: "test"})
+	r.coopCancelPoll = time.Millisecond
+	_, stop := r.watchCooperativeCancellation(parent, &Job{ID: "idx", Type: JobTypeFileIndex})
+	select {
+	case <-source.started:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation poll did not start")
+	}
+	joined := make(chan struct{}, 3)
+	for i := 0; i < 3; i++ {
+		go func() { stop(); joined <- struct{}{} }()
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case <-joined:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent stop did not cancel and join the in-flight poll")
+		}
+	}
+	if parent.Err() != nil {
+		t.Fatalf("watcher teardown cancelled handler parent: %v", parent.Err())
+	}
+}
+
+func TestWatchCooperativeCancellationContextIgnoringSourceRetainsJoin(t *testing.T) {
+	source := &blockingCancellationSource{
+		MockJobSource: NewMockJobSource("test", nil),
+		started:       make(chan struct{}),
+		release:       make(chan struct{}),
+		honor:         false,
+	}
+	r := NewRunner(source, nil, RunnerConfig{WorkerID: "test"})
+	r.coopCancelPoll = time.Millisecond
+	_, stop := r.watchCooperativeCancellation(context.Background(), &Job{ID: "idx", Type: JobTypeFileIndex})
+	select {
+	case <-source.started:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation poll did not start")
+	}
+	done := make(chan struct{})
+	go func() { stop(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("stop detached a context-ignoring source instead of retaining ownership")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(source.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not join after the context-ignoring source returned")
+	}
 }
 
 func (h *coopCancelObserverHandler) CanHandle(jt string) bool { return jt == JobTypeFileIndex }

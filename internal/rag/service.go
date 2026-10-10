@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -63,12 +62,6 @@ type Service struct {
 // callback receives the final progress event map (stage/done/total/percent/
 // current/rate/eta_seconds/counts). Optional; nil means no progress reporting.
 func (s *Service) SetProgressSink(fn func(map[string]any)) { s.onProgress = fn }
-
-// ragCancelGrace is how long a cooperative (Ctrl-C) cancel lets the current file
-// finish and commit before the embed context is hard-aborted. A package var so
-// it can be tuned/tested; the handler normally stops at the next file boundary
-// well within this window.
-var ragCancelGrace = 10 * time.Second
 
 // New constructs a Service with the mesh-safe default (index paths confined to
 // the workspace). workspaceDir is the node's workspace root; modelOverride is
@@ -196,6 +189,16 @@ type IndexResult struct {
 // FilesFailed while the walk continues. Operation-wide readiness failure,
 // cancellation, root-walk failures, and index-storage failures remain fatal.
 func (s *Service) Index(ctx context.Context, path, filePattern string) (IndexResult, error) {
+	return s.index(ctx, path, filePattern, nil)
+}
+
+// IndexCooperatively requests a graceful stop at the next file boundary when
+// cancelRequested becomes true. ctx remains the independent hard authority.
+func (s *Service) IndexCooperatively(ctx context.Context, path, filePattern string, cancelRequested func() bool) (IndexResult, error) {
+	return s.index(ctx, path, filePattern, cancelRequested)
+}
+
+func (s *Service) index(ctx context.Context, path, filePattern string, cancelRequested func() bool) (IndexResult, error) {
 	if path == "" {
 		return IndexResult{}, fmt.Errorf("index path is required")
 	}
@@ -216,31 +219,10 @@ func (s *Service) Index(ctx context.Context, path, filePattern string) (IndexRes
 		payload["file_pattern"] = filePattern
 	}
 
-	// Cooperative cancel (aceteam#10876 C1): the caller's ctx cancellation (e.g.
-	// Ctrl-C on `citadel rag index`) requests a GRACEFUL stop — commit the current
-	// file and return partial counts — rather than a hard abort that loses it. We
-	// give the handler a SEPARATE hard context (derived from Background) for embed
-	// bounding so the first signal does not kill the in-flight file; a second
-	// signal or a grace timer escalates to a hard abort. TEI calls self-bound via
-	// the embedding client's own request timeout, so the handler never hangs.
-	hardCtx, cancelHard := context.WithCancel(context.Background())
-	defer cancelHard()
-	go func() {
-		select {
-		case <-ctx.Done():
-			select {
-			case <-time.After(ragCancelGrace):
-				cancelHard() // escalate: the graceful stop did not land in time
-			case <-hardCtx.Done():
-			}
-		case <-hardCtx.Done():
-		}
-	}()
-
 	jc := jobs.JobContext{
-		Ctx:             hardCtx,
+		Ctx:             ctx,
 		LogFn:           func(string, string) {},
-		CancelRequested: func() bool { return ctx.Err() != nil },
+		CancelRequested: cancelRequested,
 		Progress:        jobs.NewThrottledProgress(s.onProgress, nil),
 	}
 	out, err := h.Execute(jc, &nexus.Job{ID: "rag-index", Type: "FILE_INDEX", Payload: payload})
