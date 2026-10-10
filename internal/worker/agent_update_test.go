@@ -26,6 +26,9 @@ func newTestHandler(t *testing.T, mutate func(*AgentUpdateConfig)) *AgentUpdateH
 		GetRelease: func(target string) (*update.Release, error) {
 			return &update.Release{TagName: "v2.47.0"}, nil
 		},
+		CheckExact: func(context.Context, string) (string, update.VersionRelation, error) {
+			return "v2.46.0", update.TargetNewer, nil
+		},
 		Download:    func(*update.Release, string) error { return nil },
 		Apply:       func(string) error { return nil },
 		PendingPath: "/tmp/does-not-matter",
@@ -84,7 +87,7 @@ func TestAgentUpdateAlreadyLatest(t *testing.T) {
 }
 
 // TestAgentUpdateTargetVersionPassthrough: an explicit target_version payload is
-// parsed and forwarded verbatim to GetRelease.
+// parsed and forwarded through the one canonical release lookup key.
 func TestAgentUpdateTargetVersionPassthrough(t *testing.T) {
 	var gotTarget string
 	h := newTestHandler(t, func(c *AgentUpdateConfig) {
@@ -96,12 +99,12 @@ func TestAgentUpdateTargetVersionPassthrough(t *testing.T) {
 		c.IsService = func() bool { return false }
 	})
 
-	_, err := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, map[string]any{"target_version": "v2.99.0"}), &NoOpStreamWriter{})
+	_, err := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, map[string]any{"target_version": "2.99.0"}), &NoOpStreamWriter{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if gotTarget != "v2.99.0" {
-		t.Errorf("target forwarded to GetRelease = %q, want v2.99.0", gotTarget)
+		t.Errorf("canonical target forwarded to GetRelease = %q, want v2.99.0", gotTarget)
 	}
 }
 
@@ -439,5 +442,97 @@ func TestAgentUpdateCanHandle(t *testing.T) {
 	}
 	if h.CanHandle("SHELL_COMMAND") {
 		t.Error("handler must not claim other job types")
+	}
+}
+
+func TestAgentUpdateExactDeterministicPreflightIsTerminalWithoutLookup(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		relation update.VersionRelation
+	}{
+		{name: "stale"},
+		{name: "equal", relation: update.TargetEqual},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lookups := 0
+			h := newTestHandler(t, func(c *AgentUpdateConfig) {
+				c.CheckExact = func(context.Context, string) (string, update.VersionRelation, error) {
+					if tc.name == "stale" {
+						_, _, err := update.CheckExactTarget(context.Background(), "not-semver")
+						return "", 0, err
+					}
+					return "v2.46.0", tc.relation, nil
+				}
+				c.GetRelease = func(string) (*update.Release, error) {
+					lookups++
+					return nil, nil
+				}
+			})
+			res, err := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, map[string]any{"target_version": "v2.47.0"}), &NoOpStreamWriter{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lookups != 0 {
+				t.Fatalf("release lookups = %d, want zero", lookups)
+			}
+			if tc.name == "stale" && res.Status != JobStatusTerminalFailure {
+				t.Fatalf("status = %v, want terminal failure", res.Status)
+			}
+			if tc.name == "equal" && res.Status != JobStatusSuccess {
+				t.Fatalf("status = %v, want success no-op", res.Status)
+			}
+		})
+	}
+}
+
+func TestAgentUpdateExactReleaseAndCandidateMismatchAreTerminal(t *testing.T) {
+	t.Run("release", func(t *testing.T) {
+		h := newTestHandler(t, func(c *AgentUpdateConfig) {
+			c.GetRelease = func(string) (*update.Release, error) { return &update.Release{TagName: "v2.48.0"}, nil }
+		})
+		res, _ := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, map[string]any{"target_version": "v2.47.0"}), &NoOpStreamWriter{})
+		if res.Status != JobStatusTerminalFailure {
+			t.Fatalf("status = %v, want terminal failure", res.Status)
+		}
+	})
+	t.Run("candidate", func(t *testing.T) {
+		h := newTestHandler(t, func(c *AgentUpdateConfig) {
+			c.ApplyRelease = func(context.Context, string, string, string, update.ApplyIntent) (update.ApplyResult, error) {
+				_, _, err := update.CheckExactTarget(context.Background(), "invalid")
+				return update.ApplyResult{}, err
+			}
+		})
+		res, _ := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, map[string]any{"target_version": "v2.47.0"}), &NoOpStreamWriter{})
+		if res.Status != JobStatusTerminalFailure {
+			t.Fatalf("status = %v, want terminal failure", res.Status)
+		}
+	})
+}
+
+func TestAgentUpdateFinalSupersededNoStateDrainOrRestart(t *testing.T) {
+	var recorded, drained, restarted bool
+	h := newTestHandler(t, func(c *AgentUpdateConfig) {
+		c.IsService = func() bool { return true }
+		c.ApplyRelease = func(context.Context, string, string, string, update.ApplyIntent) (update.ApplyResult, error) {
+			return update.ApplyResult{Disposition: update.Superseded, InstalledBefore: "v2.48.0", InstalledAfter: "v2.48.0"}, nil
+		}
+		c.RecordState = func(string, string) { recorded = true }
+		c.Drain = func() { drained = true }
+		c.Restart = func() error { restarted = true; return nil }
+	})
+	res, _ := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if res.Status != JobStatusSuccess || res.Output["updated"] != false {
+		t.Fatalf("result = %#v", res)
+	}
+	if recorded || drained || restarted {
+		t.Fatalf("no-op effects: record=%v drain=%v restart=%v", recorded, drained, restarted)
+	}
+}
+
+func TestAgentUpdateTerminalErrorAndOutputAreBounded(t *testing.T) {
+	h := newTestHandler(t, nil)
+	result := h.terminalFailure(errors.New(strings.Repeat("sensitive", 100)))
+	if len(result.Error.Error()) > 256 || len(result.Output["error"].(string)) > 256 {
+		t.Fatalf("terminal error was not bounded: error=%d output=%d", len(result.Error.Error()), len(result.Output["error"].(string)))
 	}
 }

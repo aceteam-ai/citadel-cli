@@ -4001,6 +4001,16 @@ deliberately does NOT shell `brew` unattended — it returns a structured
 (`scripts/install.sh`, curl|bash) is NOT brew, so its self-update path is
 unaffected and the acceptance ("self-updating service") holds there.
 
+**All Go-owned self-update mutations share the resolved executable's persistent
+sibling lock.** Exact `AGENT_UPDATE` decisions read non-executing build metadata
+from the installed file at preflight and again inside commit; requested,
+fetched, and completed-stage versions must match before backup or rename.
+Downloads use one private attempt directory and commits copy from one held
+candidate descriptor into a validated same-directory stage. Keep rollback,
+Windows recovery, and artifact cleanup lock-assuming internally—never acquire
+the lock recursively or use `cmd.Version`/state JSON as installed authority.
+Shell/package installers and older binaries do not participate in this lock.
+
 ### Node transcription: sidecar is the SENSOR, Go is the POLICY (citadel #1045)
 
 `TRANSCRIBE_AUDIO` on low-SNR/distant-mic audio used to emit confident

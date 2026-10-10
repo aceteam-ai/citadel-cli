@@ -585,6 +585,30 @@ func TestRunnerNacksFailedJobs(t *testing.T) {
 	}
 }
 
+func TestRunnerAgentUpdateDeterministicRefusalFailsWithoutNack(t *testing.T) {
+	job := &Job{
+		ID:          "agent-update-stale",
+		Type:        JobTypeAgentUpdate,
+		SourceQueue: perNodeQueue,
+		Payload:     map[string]any{"target_version": "not-a-semver"},
+	}
+	source := NewMockJobSource("test", []*Job{job})
+	handler := newTestHandler(t, nil)
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{WorkerID: "test-worker"})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+	if len(source.FailedJobs()) != 1 {
+		t.Fatalf("Failed jobs = %d, want 1", len(source.FailedJobs()))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Fatalf("Nacked jobs = %d, want 0", len(source.NackedJobs()))
+	}
+	if len(source.AckedJobs()) != 0 {
+		t.Fatalf("Acked jobs = %d, want 0", len(source.AckedJobs()))
+	}
+}
+
 // TestRunnerUnsupportedJobTypeFailsTerminally verifies that a job whose type has
 // no registered handler is terminally Failed (failed status + ACK) rather than
 // Nacked. A Nack would leave the message pending in the consumer group and it

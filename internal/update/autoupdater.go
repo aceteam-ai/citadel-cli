@@ -95,6 +95,14 @@ type AutoUpdaterConfig struct {
 	// Defaults to ApplyUpdate. Overridable for testing.
 	Apply func(pendingPath string) error
 
+	// ApplyRelease performs the final locked installed-version recheck and
+	// byte-bound commit. Production uses ApplyRelease; Apply remains a legacy
+	// unit-test seam.
+	ApplyRelease func(context.Context, string, string, string, ApplyIntent) (ApplyResult, error)
+
+	// NewAttempt allocates one private download/extraction directory.
+	NewAttempt func() (*UpdateAttempt, error)
+
 	// Restart re-execs / restarts the process onto the new binary.
 	// Defaults to RestartProcess. Overridable for testing.
 	Restart func() error
@@ -148,6 +156,7 @@ func ClampInterval(d time.Duration) time.Duration {
 // NewAutoUpdater constructs an AutoUpdater, applying defaults and clamping the
 // interval to the safe floor.
 func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
+	legacyApplySeam := cfg.Apply != nil
 	cfg.Interval = ClampInterval(cfg.Interval)
 	if cfg.IdlePollInterval <= 0 {
 		cfg.IdlePollInterval = 2 * time.Second
@@ -158,8 +167,17 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	if cfg.Apply == nil {
-		cfg.Apply = ApplyUpdate
+	if cfg.ApplyRelease == nil {
+		if cfg.Apply != nil {
+			cfg.ApplyRelease = func(_ context.Context, candidate, _, fetched string, _ ApplyIntent) (ApplyResult, error) {
+				if err := cfg.Apply(candidate); err != nil {
+					return ApplyResult{}, err
+				}
+				return ApplyResult{Disposition: Applied, InstalledAfter: fetched}, nil
+			}
+		} else {
+			cfg.ApplyRelease = ApplyRelease
+		}
 	}
 	if cfg.Restart == nil {
 		cfg.Restart = RestartProcess
@@ -167,8 +185,18 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 	if cfg.HomebrewManaged == nil {
 		cfg.HomebrewManaged = CurrentBinaryIsHomebrewManaged
 	}
-	if cfg.PendingPath == "" {
-		cfg.PendingPath = GetPendingBinaryPath()
+	if cfg.NewAttempt == nil {
+		if cfg.PendingPath != "" || legacyApplySeam {
+			cfg.NewAttempt = func() (*UpdateAttempt, error) {
+				candidate := cfg.PendingPath
+				if candidate == "" {
+					candidate = GetPendingBinaryPath()
+				}
+				return &UpdateAttempt{Candidate: candidate}, nil
+			}
+		} else {
+			cfg.NewAttempt = NewUpdateAttempt
+		}
 	}
 	if cfg.Log == nil {
 		cfg.Log = func(string, ...any) {}
@@ -271,10 +299,17 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	}
 
 	a.cfg.Log("auto-update: new version available: %s, downloading...", release.TagName)
+	attempt, err := a.cfg.NewAttempt()
+	if err != nil {
+		a.cfg.Log("auto-update: private attempt failed: %v", err)
+		a.record(ResultDownloadFailed, true, release.TagName)
+		return false
+	}
+	defer attempt.Cleanup()
 
 	// Download + verify while jobs may still be running — this is the slow part
 	// and does not require an idle node.
-	if err := a.cfg.Checker.DownloadAndVerify(release, a.cfg.PendingPath); err != nil {
+	if err := a.cfg.Checker.DownloadAndVerify(release, attempt.Candidate); err != nil {
 		a.cfg.Log("auto-update: download/verify failed: %v", err)
 		a.record(ResultDownloadFailed, true, release.TagName)
 		return false
@@ -310,10 +345,19 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 
 	// Apply the swap (atomic; validates the new binary and rolls back on
 	// failure internally).
-	if err := a.cfg.Apply(a.cfg.PendingPath); err != nil {
+	applyResult, err := a.cfg.ApplyRelease(ctx, attempt.Candidate, "", release.TagName, Latest)
+	if err != nil {
 		a.cfg.Log("auto-update: apply failed (kept current version): %v", err)
 		a.record(ResultApplyFailed, true, release.TagName)
 		return false
+	}
+	if applyResult.Disposition != Applied {
+		a.cfg.Log("auto-update: installed release is already current or newer")
+		a.record(ResultUpToDate, true, release.TagName)
+		return false
+	}
+	if err := attempt.Cleanup(); err != nil {
+		a.cfg.Log("auto-update: private attempt cleanup failed after apply: %v", err)
 	}
 	a.cfg.Log("auto-update: applied %s, restarting...", release.TagName)
 

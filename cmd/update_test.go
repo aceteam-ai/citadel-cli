@@ -3,18 +3,117 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/service"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
+
+func TestDownloadAndApplyManualCleansPrivateAttemptBeforeReturn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	originalNew := newUpdateAttemptFn
+	originalDownload := downloadReleaseFn
+	originalApply := applyReleaseFn
+	t.Cleanup(func() {
+		newUpdateAttemptFn = originalNew
+		downloadReleaseFn = originalDownload
+		applyReleaseFn = originalApply
+	})
+	var attemptDir string
+	newUpdateAttemptFn = func() (*update.UpdateAttempt, error) {
+		attempt, err := update.NewUpdateAttempt()
+		if attempt != nil {
+			attemptDir = attempt.Dir
+		}
+		return attempt, err
+	}
+	downloadReleaseFn = func(*update.Client, *update.Release, string) error { return nil }
+	applyReleaseFn = func(context.Context, string, string, string, update.ApplyIntent) (update.ApplyResult, error) {
+		return update.ApplyResult{Disposition: update.AlreadyCurrent, InstalledAfter: "v2.0.0"}, nil
+	}
+	client := update.NewClient("v1.0.0")
+	result, err := downloadAndApplyManual(client, &update.Release{TagName: "v2.0.0"}, nil)
+	if err != nil || result.Disposition != update.AlreadyCurrent {
+		t.Fatalf("result = %#v, %v", result, err)
+	}
+	if attemptDir == "" {
+		t.Fatal("private attempt was not allocated")
+	}
+	if _, err := os.Lstat(attemptDir); !os.IsNotExist(err) {
+		t.Fatalf("attempt still exists after returning helper: %s: %v", filepath.Base(attemptDir), err)
+	}
+}
+
+func TestDownloadAndApplyManualCleansPrivateAttemptOnErrors(t *testing.T) {
+	for _, phase := range []string{"download", "apply"} {
+		t.Run(phase, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			originalNew := newUpdateAttemptFn
+			originalDownload := downloadReleaseFn
+			originalApply := applyReleaseFn
+			t.Cleanup(func() {
+				newUpdateAttemptFn = originalNew
+				downloadReleaseFn = originalDownload
+				applyReleaseFn = originalApply
+			})
+			var attemptDir string
+			newUpdateAttemptFn = func() (*update.UpdateAttempt, error) {
+				attempt, err := update.NewUpdateAttempt()
+				if attempt != nil {
+					attemptDir = attempt.Dir
+				}
+				return attempt, err
+			}
+			downloadReleaseFn = func(*update.Client, *update.Release, string) error {
+				if phase == "download" {
+					return errors.New("download failed")
+				}
+				return nil
+			}
+			applyReleaseFn = func(context.Context, string, string, string, update.ApplyIntent) (update.ApplyResult, error) {
+				return update.ApplyResult{}, errors.New("apply failed")
+			}
+			_, err := downloadAndApplyManual(update.NewClient("v1.0.0"), &update.Release{TagName: "v2.0.0"}, nil)
+			if err == nil {
+				t.Fatal("error path returned nil")
+			}
+			if _, err := os.Lstat(attemptDir); !os.IsNotExist(err) {
+				t.Fatalf("attempt still exists after %s error: %v", phase, err)
+			}
+		})
+	}
+}
+
+func TestFinishManualNoOpRefreshesManagedUnitsWithoutUpdateState(t *testing.T) {
+	original := rematerializeManagedUnitsFn
+	t.Cleanup(func() { rematerializeManagedUnitsFn = original })
+	called := 0
+	rematerializeManagedUnitsFn = func(func(string, ...any)) ([]string, error) {
+		called++
+		return nil, nil
+	}
+	var out strings.Builder
+	if !finishManualNoOp(update.ApplyResult{Disposition: update.Superseded, InstalledAfter: "v2.0.0"}, &out) {
+		t.Fatal("superseded manual apply was not handled as no-op")
+	}
+	if called != 1 {
+		t.Fatalf("managed-unit refresh calls = %d, want 1", called)
+	}
+	if finishManualNoOp(update.ApplyResult{Disposition: update.Applied}, &out) {
+		t.Fatal("applied update handled as no-op")
+	}
+}
 
 // TestManagedServiceTargetFromManagerStatus_TableDriven pins the pure
 // managed-vs-not-managed decision (citadel#454): a service.ServiceStatus only

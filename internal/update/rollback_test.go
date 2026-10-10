@@ -58,6 +58,9 @@ func assertCompleteBinarySomewhere(t *testing.T, dst, oldContent, newContent str
 // dst+".old" -- never neither -- and that recoverInterruptedSwap restores dst
 // when it's missing.
 func TestAtomicReplaceWindows_InjectedFailures(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows swap/recovery semantics require native Windows handles and ACLs")
+	}
 	const oldContent = "old-binary-content-v1"
 	const newContent = "new-binary-content-v2-longer-than-v1"
 
@@ -162,6 +165,9 @@ func TestAtomicReplaceWindows_InjectedFailures(t *testing.T) {
 // missing, and no ".new" staging file left over -- e.g. it was already
 // cleaned up by a previous successful run) must recover to a valid dst.
 func TestRecoverInterruptedSwap_OnlyOldPresent(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows recovery requires native Windows handles and ACLs")
+	}
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "citadel.exe")
 	oldPath := dst + ".old"
@@ -193,6 +199,9 @@ func TestRecoverInterruptedSwap_OnlyOldPresent(t *testing.T) {
 // TestRecoverInterruptedSwap_NoBackupsAvailable asserts the honest failure
 // mode when dst is missing and there is truly nothing to recover from.
 func TestRecoverInterruptedSwap_NoBackupsAvailable(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows recovery requires native Windows handles and ACLs")
+	}
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "citadel.exe")
 
@@ -208,6 +217,9 @@ func TestRecoverInterruptedSwap_NoBackupsAvailable(t *testing.T) {
 // TestRecoverInterruptedSwap_NoOpWhenDstPresent asserts recovery never
 // touches a healthy installation.
 func TestRecoverInterruptedSwap_NoOpWhenDstPresent(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows recovery requires native Windows handles and ACLs")
+	}
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "citadel.exe")
 	oldPath := dst + ".old"
@@ -242,6 +254,9 @@ func TestRecoverInterruptedSwap_NoOpWhenDstPresent(t *testing.T) {
 // (previous version) are present alongside a missing dst, recovery completes
 // the interrupted update rather than silently rolling it back.
 func TestRecoverInterruptedSwap_PrefersNewOverOld(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows recovery requires native Windows handles and ACLs")
+	}
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "citadel.exe")
 	oldPath := dst + ".old"
