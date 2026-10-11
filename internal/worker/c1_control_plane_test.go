@@ -20,6 +20,7 @@ import (
 // deadline context and records when its Execute actually returns, so a test can
 // prove executeWithDeadline waited for it (no orphaned writer).
 type ctxHonoringHeavyHandler struct {
+	fileIndexCapsDecl
 	returned chan struct{}
 }
 
@@ -34,6 +35,7 @@ func (h *ctxHonoringHeavyHandler) Execute(ctx context.Context, job *Job, stream 
 }
 
 type releaseAfterCancelHeavyHandler struct {
+	fileIndexCapsDecl
 	cancelObserved chan struct{}
 	release        chan struct{}
 }

@@ -105,6 +105,3 @@ func fineTuneNumber(value any) (float64, bool) {
 		return 0, false
 	}
 }
-
-// The scoped POST publishes progress after committing the hash update.
-func (c *apiFineTuneControl) Progress(context.Context, string, map[string]any) error { return nil }

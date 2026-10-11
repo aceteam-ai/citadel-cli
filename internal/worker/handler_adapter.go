@@ -53,6 +53,22 @@ func (a *LegacyHandlerAdapter) CanHandle(jobType string) bool {
 	return a.jobType == jobType && (a.enabled == nil || a.enabled())
 }
 
+// DeclaredCapabilities forwards the wrapped legacy handler's capability
+// declaration for this adapter's job type (citadel-cli#1287). It is PERMISSION-
+// INDEPENDENT — it does NOT consult a.enabled — because lane/cancel/deadline
+// routing never depended on the live gate (the old allowlists were static). The
+// wrapped handler is single-purpose, so its jobs.CapabilityDeclarer.Capabilities
+// needs no job-type argument; the adapter supplies the ownership by job type.
+func (a *LegacyHandlerAdapter) DeclaredCapabilities(jobType string) (jobs.JobCapabilities, bool) {
+	if jobType != a.jobType {
+		return jobs.JobCapabilities{}, false
+	}
+	if d, ok := a.handler.(jobs.CapabilityDeclarer); ok {
+		return d.Capabilities(), true
+	}
+	return jobs.JobCapabilities{}, false
+}
+
 func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
 	if !a.backgroundOwner {
 		return

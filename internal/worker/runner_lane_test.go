@@ -70,18 +70,24 @@ func TestSerializedLaneJobTypes(t *testing.T) {
 	}
 }
 
-// TestHeavyLaneJobTypes pins the exact membership of the dedicated heavy-lane
-// routing set (aceteam#10876 C1). It is the authority for which job types run on
-// the exec-1/admit-2 heavy lane; read this, not a doc copy.
+// fileIndexDeclaringRunner builds a runner holding the REAL FILE_INDEX adapter
+// (the first lifecycle-contract adopter), so a test asserts the runner reads the
+// handler's DECLARED capabilities rather than an allowlist (citadel-cli#1287).
+func fileIndexDeclaringRunner(t *testing.T) *Runner {
+	t.Helper()
+	idx := jobhandlers.NewFileIndexHandler(t.TempDir(), "")
+	adapter := newGatedLegacyHandlerAdapter(JobTypeFileIndex, idx, func() bool { return true })
+	return NewRunner(NewMockJobSource("test", nil), []JobHandler{adapter}, RunnerConfig{WorkerID: "test"})
+}
+
+// TestHeavyLaneJobTypes pins that FILE_INDEX DECLARES the dedicated heavy lane
+// (exec-1/admit-2), replacing the old heavyLaneJobTypes allowlist
+// (aceteam#10876 C1 / citadel-cli#1287). The runner reads the declaration via
+// capabilitiesFor — read jobs.FileIndexHandler.Capabilities, not a doc copy.
 func TestHeavyLaneJobTypes(t *testing.T) {
-	want := map[string]struct{}{JobTypeFileIndex: {}}
-	if len(heavyLaneJobTypes) != len(want) {
-		t.Fatalf("heavyLaneJobTypes has %d entries, want %d: %v", len(heavyLaneJobTypes), len(want), heavyLaneJobTypes)
-	}
-	for jt := range want {
-		if !needsHeavyLane(jt) {
-			t.Errorf("expected %q to route to the heavy lane", jt)
-		}
+	r := fileIndexDeclaringRunner(t)
+	if r.capabilitiesFor(JobTypeFileIndex).Lane != jobhandlers.LaneHeavy {
+		t.Error("FILE_INDEX must DECLARE the heavy lane")
 	}
 	// The heavy lane is disjoint from the serialized/long/GPU routing sets.
 	if needsSerializedLane(JobTypeFileIndex) {
@@ -90,27 +96,26 @@ func TestHeavyLaneJobTypes(t *testing.T) {
 	if _, long := longSessionJobTypes[JobTypeFileIndex]; long {
 		t.Error("FILE_INDEX must NOT be in longSessionJobTypes (that would also route it to the #489 always-async lane and race the heavy lane)")
 	}
+	// A job type with no heavy declaration must stay off the heavy lane.
 	for _, jt := range []string{JobTypeServiceStart, JobTypeShellCommand, JobTypeLLMInference, JobTypeMeetingJoin} {
-		if needsHeavyLane(jt) {
-			t.Errorf("%q must NOT route to the heavy lane", jt)
+		if r.capabilitiesFor(jt).Lane == jobhandlers.LaneHeavy {
+			t.Errorf("%q must NOT declare the heavy lane", jt)
 		}
 	}
 }
 
-// TestCooperativeCancelJobTypes pins which job types get the graceful mid-job
-// cancel watch (aceteam#10876 C1). HUDDLE_JOIN is deliberately excluded — it has
-// its own hard ctx-cancel watch.
+// TestCooperativeCancelJobTypes pins that FILE_INDEX DECLARES the graceful
+// mid-job cancel watch (aceteam#10876 C1 / citadel-cli#1287), replacing the old
+// cooperativeCancelJobTypes allowlist. HUDDLE_JOIN is deliberately excluded — it
+// has its own hard ctx-cancel watch and declares no cooperative cancel.
 func TestCooperativeCancelJobTypes(t *testing.T) {
-	want := map[string]struct{}{JobTypeFileIndex: {}}
-	if len(cooperativeCancelJobTypes) != len(want) {
-		t.Fatalf("cooperativeCancelJobTypes has %d entries, want %d: %v", len(cooperativeCancelJobTypes), len(want), cooperativeCancelJobTypes)
-	}
-	if !needsCooperativeCancelWatch(JobTypeFileIndex) {
-		t.Error("FILE_INDEX must get the cooperative cancel watch")
+	r := fileIndexDeclaringRunner(t)
+	if !r.capabilitiesFor(JobTypeFileIndex).CooperativeCancel {
+		t.Error("FILE_INDEX must DECLARE the cooperative cancel watch")
 	}
 	for _, jt := range []string{JobTypeHuddleJoin, JobTypeServiceStart, JobTypeShellCommand} {
-		if needsCooperativeCancelWatch(jt) {
-			t.Errorf("%q must NOT get the cooperative cancel watch", jt)
+		if r.capabilitiesFor(jt).CooperativeCancel {
+			t.Errorf("%q must NOT declare the cooperative cancel watch", jt)
 		}
 	}
 }
@@ -128,6 +133,7 @@ func TestRunnerHeavyLaneDoesNotBlockFetchLoop(t *testing.T) {
 		jobType: JobTypeFileIndex,
 		onStart: func() { once.Do(func() { close(started) }) },
 		release: release,
+		caps:    &jobhandlers.JobCapabilities{Lane: jobhandlers.LaneHeavy, CooperativeCancel: true, Deadline: jobhandlers.DeadlineLong},
 	}
 	fileHandler := NewMockJobHandler(JobTypeFileReadBytes, false)
 
@@ -188,6 +194,7 @@ func TestRunnerHeavyLaneDoesNotBlockFetchLoop(t *testing.T) {
 }
 
 type deadlineHeldHeavyHandler struct {
+	fileIndexCapsDecl
 	firstCancelled chan struct{}
 	releaseFirst   chan struct{}
 	secondStarted  chan struct{}
@@ -266,6 +273,7 @@ func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T)
 }
 
 type shutdownHeldHeavyHandler struct {
+	fileIndexCapsDecl
 	started        chan struct{}
 	cancelObserved chan struct{}
 	release        chan struct{}
@@ -363,6 +371,7 @@ func TestRunnerShutdownRetainsHeavyOwnershipUntilActualHandlerExit(t *testing.T)
 // cancelled. It proves the runner's cooperative-cancel watch sets the graceful
 // flag on the handler ctx without cancelling it (aceteam#10876 C1).
 type coopCancelObserverHandler struct {
+	fileIndexCapsDecl
 	started     chan struct{}
 	observed    chan struct{}
 	hardCancel  chan struct{}
@@ -396,7 +405,7 @@ func TestWatchCooperativeCancellationStopCancelsPollAndJoinsConcurrently(t *test
 		release:       make(chan struct{}),
 		honor:         true,
 	}
-	r := NewRunner(source, nil, RunnerConfig{WorkerID: "test"})
+	r := NewRunner(source, []JobHandler{&blockingJobHandler{jobType: JobTypeFileIndex, caps: &jobhandlers.JobCapabilities{CooperativeCancel: true}}}, RunnerConfig{WorkerID: "test"})
 	r.coopCancelPoll = time.Millisecond
 	_, stop := r.watchCooperativeCancellation(parent, &Job{ID: "idx", Type: JobTypeFileIndex})
 	select {
@@ -427,7 +436,7 @@ func TestWatchCooperativeCancellationContextIgnoringSourceRetainsJoin(t *testing
 		release:       make(chan struct{}),
 		honor:         false,
 	}
-	r := NewRunner(source, nil, RunnerConfig{WorkerID: "test"})
+	r := NewRunner(source, []JobHandler{&blockingJobHandler{jobType: JobTypeFileIndex, caps: &jobhandlers.JobCapabilities{CooperativeCancel: true}}}, RunnerConfig{WorkerID: "test"})
 	r.coopCancelPoll = time.Millisecond
 	_, stop := r.watchCooperativeCancellation(context.Background(), &Job{ID: "idx", Type: JobTypeFileIndex})
 	select {

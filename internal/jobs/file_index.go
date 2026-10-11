@@ -91,6 +91,31 @@ type FileIndexHandler struct {
 	afterDelete func()
 }
 
+// Capabilities declares the FILE_INDEX lifecycle contract (citadel-cli#1287).
+// These values reproduce the prior runner-allowlist behavior exactly: the
+// dedicated heavy lane, the cooperative mid-job cancel watch, the long watchdog
+// tier, the index progress vocabulary, and a HANDLER-signed `index` work receipt
+// (this handler calls attachWorkRecord itself, so the runner never signs for it).
+func (h *FileIndexHandler) Capabilities() JobCapabilities {
+	return JobCapabilities{
+		CooperativeCancel: true,
+		Lane:              LaneHeavy,
+		Deadline:          DeadlineLong,
+		Stages: []string{
+			string(ProgressStagePlan),
+			string(ProgressStageExtract),
+			string(ProgressStageEmbed),
+			string(ProgressStageUpsert),
+			string(ProgressStagePrune),
+		},
+		WorkActions:  []string{WorkActionIndex},
+		ReceiptOwner: ReceiptOwnerHandler,
+	}
+}
+
+// Ensure FileIndexHandler declares its capabilities.
+var _ CapabilityDeclarer = (*FileIndexHandler)(nil)
+
 // NewFileIndexHandler creates a FileIndexHandler rooted at workspace.
 func NewFileIndexHandler(workspace, dbPath string) *FileIndexHandler {
 	return &FileIndexHandler{WorkspaceDir: workspace, DBPath: dbPath}

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
@@ -34,6 +35,18 @@ type Runner struct {
 	// Concurrency support
 	maxConcurrency int
 	gpuTracker     *GPUTracker
+
+	// Work-receipt signing for RUNNER-signed dispatched work (citadel-cli#1287).
+	// When a handler DECLARES ReceiptOwner==ReceiptOwnerRunner and this signer is
+	// set, the runner signs a work receipt for every dispatched success (default
+	// on, independent of CITADEL_SIGN_AEP_RECEIPTS) and FAILS CLOSED when signing
+	// is unavailable. nil leaves such jobs unsigned and never fails them closed —
+	// the same posture a handler-signed path has with no signer wired, so existing
+	// tests that build a runner without a signer are unaffected. Handler-signed
+	// job types (FILE_INDEX, embedding) are untouched by this; they sign inside
+	// the handler via the LegacyHandlerOpts.WorkReceiptSigner path.
+	workReceiptSigner aep.Signer
+	workReceiptNodeID string
 
 	// Bounded execution lanes (citadel-cli#908, aceteam#8254). unboundedLane
 	// carries every manifest/lockfile-writing job type (serializedLaneJobTypes)
@@ -112,6 +125,17 @@ type RunnerConfig struct {
 	// State, when set, is updated with live introspection metrics so the
 	// status/control path can report consume/job activity (issue #236).
 	State *WorkerState
+
+	// WorkReceiptSigner signs RUNNER-signed dispatched-work receipts
+	// (citadel-cli#1287). Injected explicitly (NOT resolved inside this package)
+	// so a test never signs with a real node identity: cmd/work.go passes
+	// nodeidentity.Convergent(network.GetNodeConfigDir()), the SAME signer it
+	// gives LegacyHandlerOpts.WorkReceiptSigner. nil disables runner-signing (and
+	// its fail-closed posture) entirely.
+	WorkReceiptSigner aep.Signer
+	// WorkReceiptNodeID is the preferred receipt node_id (the fabric node id);
+	// empty falls back to the signer's own public-key fingerprint.
+	WorkReceiptNodeID string
 }
 
 // NewRunner creates a new job runner.
@@ -127,6 +151,8 @@ func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Ru
 		gpuTracker:         config.GPUTracker,
 		state:              config.State,
 		inferenceQueueWait: resolveInferenceQueueWait(),
+		workReceiptSigner:  config.WorkReceiptSigner,
+		workReceiptNodeID:  config.WorkReceiptNodeID,
 	}
 
 	// The general unbounded lane always exists (exec-concurrency 1): it is the
@@ -515,9 +541,9 @@ runLoop:
 				// in lockstep in production, so the queue-wait is the real
 				// backpressure and the #825 Nack becomes effectively unreachable.
 				r.dispatchLane(ctx, r.inferenceLane, job, stream, startTime, &wg)
-			case r.heavyLane != nil && needsHeavyLane(job.Type):
-				// Dedicated heavy lane (exec 1, admit 2): FILE_INDEX (and future
-				// heavy index/extract work). A single DISPATCHED index-DB writer off
+			case r.heavyLane != nil && r.capabilitiesFor(job.Type).Lane == jobs.LaneHeavy:
+				// Dedicated heavy lane (exec 1, admit 2): any handler that DECLARES
+				// Lane==LaneHeavy (FILE_INDEX today). A single DISPATCHED index-DB writer off
 				// the fetch loop, isolated from the manifest-writer lane so a
 				// multi-hour index never queues a deploy (aceteam#10876 C1).
 				r.dispatchLane(ctx, r.heavyLane, job, stream, startTime, &wg)
@@ -898,18 +924,30 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	r.state.RecordJobExecuting()
 	defer r.state.RecordJobExecuteDone()
 
-	// Find handler
-	var handler JobHandler
-	for _, h := range r.handlers {
-		if h.CanHandle(job.Type) {
-			handler = h
-			break
-		}
-	}
-
+	// Find handler (shared with the lane-routing lookup via findHandler).
+	handler := r.findHandler(job.Type)
 	if handler == nil {
 		r.failUnsupportedJobType(ctx, job, startTime)
 		return false
+	}
+	caps := capabilitiesOf(handler, job.Type)
+
+	// Preflight RUNNER-signed dispatched work BEFORE executing: a keyless node
+	// fails in milliseconds rather than after a full inference (citadel-cli#1287,
+	// mirroring the handler-signed Preflight). Only a handler that DECLARED
+	// ReceiptOwnerRunner with a signer wired reaches this — never a no-action job.
+	if r.runnerSigns(caps) {
+		if perr := r.newRunnerWorkReceiptConfig(job).Preflight(); perr != nil {
+			r.log("error", "Job %s refused: %v", job.ID, perr)
+			r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, perr))
+			if werr := stream.WriteError(perr, false); werr != nil {
+				r.log("warning", "Failed to publish receipt-signing-unavailable error for job %s: %v", job.ID, werr)
+			}
+			if ferr := r.source.Fail(ctx, job, perr, map[string]any{"reason": "receipt_signing_unavailable"}); ferr != nil {
+				r.log("warning", "Failed to ack receipt-signing-unavailable job %s: %v", job.ID, ferr)
+			}
+			return false
+		}
 	}
 
 	// GPU tracking: acquire/release GPU slot if tracker is set AND this job
@@ -1038,6 +1076,18 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		r.source.Ack(ctx, job)
 		return false
 	}
+
+	// Runner-signed work receipt (citadel-cli#1287): sign a receipt for every
+	// dispatched success of a job that DECLARED ReceiptOwnerRunner (LLM_INFERENCE).
+	// A sign failure becomes `err` here and flows into the isReceiptSigningUnavailable
+	// fail-closed branch below (terminal, Fail/DLQ, one terminal error) — never a
+	// silent unsigned success. model_warming is skipped inside (no inference ran).
+	if err == nil && result != nil && result.Status == JobStatusSuccess && r.runnerSigns(caps) {
+		if signErr := r.attachRunnerWorkReceipt(job, result); signErr != nil {
+			err = signErr
+		}
+	}
+
 	if result != nil && result.Status == JobStatusTerminalFailure {
 		actualErr := result.Error
 		if actualErr == nil {
@@ -1320,7 +1370,7 @@ func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context
 // and a no-op stop, so it is inert for every other job. The returned stop func
 // halts the poll goroutine (call it once execution is done).
 func (r *Runner) watchCooperativeCancellation(ctx context.Context, job *Job) (context.Context, func()) {
-	if !needsCooperativeCancelWatch(job.Type) {
+	if !r.capabilitiesFor(job.Type).CooperativeCancel {
 		return ctx, func() {}
 	}
 	var requested atomic.Bool
@@ -1679,6 +1729,17 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		}
 	}
 
+	// Flow attribution from the job envelope (aceteam#10876 / citadel-cli#1287),
+	// so central fabric_run_work can join this node's work to a flow run. The
+	// producer spellings match the aceteam backend (flow_run_id / flow_node_id /
+	// delegated_node_id / node_uid / receipt_ids). These are read from the decoded
+	// payload; absent keys leave the record field empty.
+	r.FlowRunID = payloadString(job.Payload, "flow_run_id")
+	r.FlowNodeID = payloadString(job.Payload, "flow_node_id")
+	r.DelegatedNodeID = payloadString(job.Payload, "delegated_node_id")
+	r.NodeUID = payloadString(job.Payload, "node_uid")
+	r.ReceiptIDs = payloadStringSlice(job.Payload, "receipt_ids")
+
 	// Extract usage metrics from result output (_usage_* keys). These are set
 	// directly on Output by NATIVE worker handlers (e.g. llm_inference).
 	if result != nil && result.Output != nil {
@@ -1696,6 +1757,13 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		// "usage key fix": without it a FILE_INDEX/embedding job records zero
 		// tokens/bytes and no work attribution.
 		applyNestedUsage(&r, result.Output)
+		// A NATIVE handler (llm_inference, citadel-cli#1287) carries its `usage`
+		// object as a TOP-LEVEL map (not wrapped as a string). The runner-signed
+		// work-receipt path merges attribution into that same map, so decode it
+		// here too to carry origin/action/org_id/units/manifest onto the record.
+		if usg, ok := result.Output["usage"].(map[string]any); ok {
+			applyUsageMap(&r, usg)
+		}
 	}
 
 	if err != nil {
@@ -1711,11 +1779,11 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 
 // applyNestedUsage decodes a legacy handler's JSON output (wrapped as a string
 // under Output["output"]) and, when it carries a nested `usage` object, carries
-// the work attribution, typed units, receipt binding, and token/byte metrics
-// onto the usage record (aceteam#10876 C7). It is a no-op for an output that is
-// not a JSON object or has no `usage` map, so native handlers and non-work jobs
-// are unaffected. Token/byte fields are only taken from the nested object when
-// the top-level _usage_* read did not already set them (native handlers win).
+// the work attribution onto the usage record (aceteam#10876 C7). It is a no-op
+// for an output that is not a JSON object or has no `usage` map, so non-work legacy
+// jobs are unaffected. A NATIVE handler (e.g. llm_inference, citadel-cli#1287)
+// carries its `usage` object as a top-level map instead; buildUsageRecord calls
+// applyUsageMap directly for that case.
 func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
 	raw, ok := output["output"].(string)
 	if !ok || raw == "" {
@@ -1729,7 +1797,18 @@ func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
 	if !ok {
 		return
 	}
+	applyUsageMap(r, usg)
+}
 
+// applyUsageMap carries work attribution, typed units, receipt binding, and
+// token/byte metrics from a decoded `usage` object onto the record. Token/byte
+// fields are only taken from the object when the native _usage_* read did not
+// already set them (native handlers win). Shared by the legacy nested-string
+// path (applyNestedUsage) and the native top-level-map path.
+func applyUsageMap(r *usage.UsageRecord, usg map[string]any) {
+	if usg == nil {
+		return
+	}
 	if s, ok := usg["origin"].(string); ok {
 		r.Origin = s
 	}
@@ -1749,7 +1828,7 @@ func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
 		r.Units = unitsFromAny(units)
 	}
 	// Token/byte metrics: prefer a value already set from the native _usage_*
-	// path; otherwise take the nested object's.
+	// path; otherwise take the object's.
 	if r.PromptTokens == 0 {
 		r.PromptTokens = intFromOutput(usg, "prompt_tokens")
 	}
@@ -1764,6 +1843,40 @@ func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
 	}
 	if r.ResponseBytes == 0 {
 		r.ResponseBytes = intFromOutput(usg, "response_bytes")
+	}
+}
+
+// payloadStringSlice reads a []string from a decoded job payload. It accepts a
+// JSON array (decoded as []any of strings); a bare string yields a single-element
+// slice. Absent or malformed values yield nil.
+func payloadStringSlice(payload map[string]any, key string) []string {
+	if payload == nil {
+		return nil
+	}
+	switch v := payload[key].(type) {
+	case []string:
+		if len(v) == 0 {
+			return nil
+		}
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []string{v}
+	default:
+		return nil
 	}
 }
 

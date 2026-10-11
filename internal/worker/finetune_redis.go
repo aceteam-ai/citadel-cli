@@ -49,11 +49,3 @@ func (c *redisFineTuneControl) FailCritical(ctx context.Context, jobID string, f
 	}
 	return client.FineTuneFailCritical(ctx, jobID, c.orgID, c.nodeID, fields)
 }
-
-func (c *redisFineTuneControl) Progress(ctx context.Context, jobID string, event map[string]any) error {
-	client, err := c.client()
-	if err != nil {
-		return err
-	}
-	return client.PublishStreamEvent(ctx, jobID, "", "progress", event)
-}

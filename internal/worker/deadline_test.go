@@ -20,7 +20,7 @@ type ctxHandler struct {
 	sawCancel atomic.Bool
 }
 
-type successAfterCancelHandler struct{}
+type successAfterCancelHandler struct{ fileIndexCapsDecl }
 
 func (*successAfterCancelHandler) CanHandle(jobType string) bool { return jobType == JobTypeFileIndex }
 
@@ -43,7 +43,7 @@ func TestExecuteWithDeadlineHeavyHardCancellationWinsSuccessfulReturn(t *testing
 func TestCompletedHandlerResultPreservesNonHeavyLifecycleSentinel(t *testing.T) {
 	want := jobs.ErrHuddleLifecycleOutboxUnavailable
 	result := &JobResult{Status: JobStatusFailure, Error: want}
-	gotResult, gotErr := completedHandlerResult(JobTypeHuddleJoin, context.Canceled, time.Hour, result, want)
+	gotResult, gotErr := completedHandlerResult(false, context.Canceled, time.Hour, result, want)
 	if gotResult != result || !errors.Is(gotErr, want) {
 		t.Fatalf("result/error = %v/%v, want original result and huddle lifecycle sentinel", gotResult, gotErr)
 	}
@@ -52,14 +52,14 @@ func TestCompletedHandlerResultPreservesNonHeavyLifecycleSentinel(t *testing.T) 
 func TestCompletedHandlerResultPreservesNonHeavyDeadlineSemantics(t *testing.T) {
 	timeout := 3 * time.Second
 	handlerErr := errors.New("incidental handler failure")
-	gotResult, gotErr := completedHandlerResult(JobTypeShellCommand, context.DeadlineExceeded, timeout, nil, handlerErr)
+	gotResult, gotErr := completedHandlerResult(false, context.DeadlineExceeded, timeout, nil, handlerErr)
 	var deadlineErr *deadlineExceededError
 	if gotResult != nil || !errors.As(gotErr, &deadlineErr) {
 		t.Fatalf("error=%v, want deadlineExceededError for non-heavy handler error at deadline", gotErr)
 	}
 
 	wantResult := &JobResult{Status: JobStatusSuccess}
-	gotResult, gotErr = completedHandlerResult(JobTypeShellCommand, context.DeadlineExceeded, timeout, wantResult, nil)
+	gotResult, gotErr = completedHandlerResult(false, context.DeadlineExceeded, timeout, wantResult, nil)
 	if gotResult != wantResult || gotErr != nil {
 		t.Fatalf("result/error=%v/%v, want original successful non-heavy result", gotResult, gotErr)
 	}
@@ -67,12 +67,12 @@ func TestCompletedHandlerResultPreservesNonHeavyDeadlineSemantics(t *testing.T) 
 
 func TestCompletedHandlerResultHeavyHardCancellationWins(t *testing.T) {
 	result := &JobResult{Status: JobStatusSuccess}
-	gotResult, gotErr := completedHandlerResult(JobTypeFileIndex, context.Canceled, time.Hour, result, nil)
+	gotResult, gotErr := completedHandlerResult(true, context.Canceled, time.Hour, result, nil)
 	if gotResult != nil || !errors.Is(gotErr, context.Canceled) {
 		t.Fatalf("result/error = %v/%v, want nil/context.Canceled", gotResult, gotErr)
 	}
 
-	gotResult, gotErr = completedHandlerResult(JobTypeFileIndex, context.DeadlineExceeded, time.Second, result, nil)
+	gotResult, gotErr = completedHandlerResult(true, context.DeadlineExceeded, time.Second, result, nil)
 	var deadlineErr *deadlineExceededError
 	if gotResult != nil || !errors.As(gotErr, &deadlineErr) {
 		t.Fatalf("result/error = %v/%v, want nil/deadlineExceededError", gotResult, gotErr)
@@ -369,13 +369,17 @@ func TestResolveJobTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("file index (heavy lane) uses the long tier without long-session routing", func(t *testing.T) {
-		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeFileIndex})
+	t.Run("file index (declared heavy lane) uses the long tier without long-session routing", func(t *testing.T) {
+		// FILE_INDEX's long tier is now DECLARED (DeadlineLong), resolved from the
+		// registered handler — not a static map (citadel-cli#1287). Use a runner
+		// that holds a FILE_INDEX declarer.
+		rd := &Runner{handlers: []JobHandler{&blockingJobHandler{jobType: JobTypeFileIndex, caps: &jobs.JobCapabilities{Lane: jobs.LaneHeavy, Deadline: jobs.DeadlineLong}}}}
+		d, ok := rd.resolveJobTimeout(&Job{Type: JobTypeFileIndex})
 		if !ok || d != defaultLongJobTimeoutSeconds*time.Second {
 			t.Fatalf("got (%s, %v), want (%ds, true) long tier", d, ok, defaultLongJobTimeoutSeconds)
 		}
-		if !needsHeavyLane(JobTypeFileIndex) {
-			t.Fatal("FILE_INDEX must route to the heavy lane")
+		if rd.capabilitiesFor(JobTypeFileIndex).Lane != jobs.LaneHeavy {
+			t.Fatal("FILE_INDEX must declare the heavy lane")
 		}
 		if _, long := longSessionJobTypes[JobTypeFileIndex]; long {
 			t.Fatal("FILE_INDEX must NOT be in longSessionJobTypes (would race the heavy lane via the #489 async lane)")

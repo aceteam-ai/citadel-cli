@@ -2459,6 +2459,11 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	if m, _, err := findAndReadManifest(); err == nil {
 		ccPinnedServices = manifestPinnedServices(m)
 	}
+	// Captured once so the HANDLER-signed path (FILE_INDEX/embedding) and the
+	// RUNNER-signed path (LLM_INFERENCE, citadel-cli#1287) share one convergent
+	// signer — the same as runWork.
+	ccWorkReceiptSigner := nodeidentity.Convergent(network.GetNodeConfigDir())
+	ccWorkReceiptNodeID := config.LoadDeviceCredsConverged().FabricNodeID
 	nodeJobOpts := nodeJobHandlerOpts{
 		Source:         source,
 		OrgID:          nodeJobOrgID(),
@@ -2471,8 +2476,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		// The control-center worker is also a dispatched-work path, so it signs
 		// FILE_INDEX/embedding receipts fail-closed too (aceteam#10876 C7), via the
 		// same convergent node identity as runWork.
-		WorkReceiptSigner:         nodeidentity.Convergent(network.GetNodeConfigDir()),
-		WorkReceiptNodeID:         config.LoadDeviceCredsConverged().FabricNodeID,
+		WorkReceiptSigner:         ccWorkReceiptSigner,
+		WorkReceiptNodeID:         ccWorkReceiptNodeID,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !ccPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,
@@ -2514,6 +2519,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			// For now, the activity log covers job status
 			_ = record
 		},
+		// RUNNER-signed dispatched work (LLM_INFERENCE, citadel-cli#1287) signs with
+		// the same convergent identity the handler-signed path uses above.
+		WorkReceiptSigner: ccWorkReceiptSigner,
+		WorkReceiptNodeID: ccWorkReceiptNodeID,
 	})
 
 	if streamFactory != nil {

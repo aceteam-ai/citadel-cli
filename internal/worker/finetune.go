@@ -106,11 +106,20 @@ func parseFineTune(job *Job, workspace, outputRoot string) (FineTuneSpec, error)
 // FineTuneControl is the authenticated, job-scoped status/cancel contract. The
 // API proxy implementation is intentionally absent until its backend companion
 // exposes this exact scope; a generic KV endpoint is not authorized for these keys.
+//
+// Progress is deliberately NOT part of this contract (citadel-cli#1287): training
+// progress now rides the ONE generic progress channel — StreamWriter.WriteProgress
+// (publish "progress" + mirror job:<id>:progress) — the same channel FILE_INDEX
+// uses. This settles #1095's API-mode-vs-direct-Redis question (StreamWriter works
+// in both modes, so API-mode fine-tunes gain progress they never surfaced before)
+// and removes the second, mode-specific progress mechanism. The canonical
+// finetune:job:<id> status hash is still written via Update — that is the
+// authoritative STATE, a distinct concern from the throttled progress stream, and
+// its ownership-checked cancel contract (Cancelled) stays authenticated.
 type FineTuneControl interface {
 	Cancelled(context.Context, string) (bool, error)
 	Update(context.Context, string, map[string]any) error
 	FailCritical(context.Context, string, map[string]any) error
-	Progress(context.Context, string, map[string]any) error
 }
 
 type FineTuneReservation interface {
@@ -359,7 +368,14 @@ func (h *FineTuneHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 		if err := h.cfg.Control.Update(trainCtx, job.ID, event); err != nil {
 			return err
 		}
-		return h.cfg.Control.Progress(trainCtx, job.ID, event)
+		// Surface the throttled progress on the ONE generic channel
+		// (citadel-cli#1287). Best-effort, like FILE_INDEX's progress: a dropped
+		// progress publish must never fail training. The canonical status hash was
+		// already written above (Control.Update), which is the authoritative state.
+		if stream != nil {
+			_ = stream.WriteProgress(event)
+		}
+		return nil
 	}
 	run := h.cfg.Run
 	if run == nil {

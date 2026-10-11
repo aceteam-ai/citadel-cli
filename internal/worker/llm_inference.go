@@ -235,6 +235,23 @@ func (h *LLMInferenceHandler) CanHandle(jobType string) bool {
 	return jobType == JobTypeLLMInference
 }
 
+// DeclaredCapabilities declares LLM_INFERENCE as RUNNER-signed dispatched work
+// (citadel-cli#1287): the runner signs an `inference` work receipt for every
+// dispatched success and fails closed when signing is unavailable. It takes the
+// runner's existing lane/deadline routing (normal lane via gpuBoundJobTypes, the
+// default watchdog tier), so no lane/cancel/deadline capability is declared. The
+// chat-completion grounding/aep_receipt path (CITADEL_SIGN_AEP_RECEIPTS, opt-in,
+// fail-open) is a SEPARATE output key and is untouched by this.
+func (h *LLMInferenceHandler) DeclaredCapabilities(jobType string) (jobs.JobCapabilities, bool) {
+	if jobType != JobTypeLLMInference {
+		return jobs.JobCapabilities{}, false
+	}
+	return jobs.JobCapabilities{
+		WorkActions:  []string{jobs.WorkActionInference},
+		ReceiptOwner: jobs.ReceiptOwnerRunner,
+	}, true
+}
+
 // baseURL returns the configured base URL for a backend (empty if unknown).
 func (h *LLMInferenceHandler) baseURL(backend string) string {
 	return h.baseURLs[backend]

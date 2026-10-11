@@ -2680,6 +2680,14 @@ func runWork(cmd *cobra.Command, args []string) {
 	// helper so the control-center TUI registers the exact same set when it is the
 	// only worker on the node.
 	workPerms := workAppliedPermissions
+	// Dispatched work signs its receipts with the SAME machine-convergent node
+	// identity the AEP chat receipt + CSR path use (aceteam#10876 C7 / #1287).
+	// Captured once so the HANDLER-signed path (FILE_INDEX, embedding — via
+	// LegacyHandlerOpts) and the RUNNER-signed path (LLM_INFERENCE — via
+	// RunnerConfig below) share one signer. NodeID prefers the fabric node id
+	// (#8139), else the signer's fingerprint.
+	workReceiptSigner := nodeidentity.Convergent(network.GetNodeConfigDir())
+	workReceiptNodeID := config.LoadDeviceCredsConverged().FabricNodeID
 	nodeJobOpts := nodeJobHandlerOpts{
 		Source:         source,
 		OrgID:          nodeJobOrgID(),
@@ -2688,13 +2696,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		ConfigDir:      workConfigDir,
 		PermissionsDir: nodePermissionsDir(),
 		IndexesDir:     jobs.IndexesDirFor(network.GetNodeConfigDir()),
-		// Dispatched work (FILE_INDEX, embedding) signs its receipts with the SAME
-		// machine-convergent node identity the AEP chat receipt + CSR path use
-		// (aceteam#10876 C7). Injected here (never resolved inside internal/worker)
-		// so a worker test never signs with this box's real node identity. NodeID
-		// prefers the fabric node id (#8139), else the signer's fingerprint.
-		WorkReceiptSigner:         nodeidentity.Convergent(network.GetNodeConfigDir()),
-		WorkReceiptNodeID:         config.LoadDeviceCredsConverged().FabricNodeID,
+		// Injected here (never resolved inside internal/worker) so a worker test
+		// never signs with this box's real node identity.
+		WorkReceiptSigner:         workReceiptSigner,
+		WorkReceiptNodeID:         workReceiptNodeID,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,
@@ -2759,6 +2764,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		MaxConcurrency: maxConcurrency,
 		GPUTracker:     gpuTracker,
 		State:          workerState,
+		// RUNNER-signed dispatched work (LLM_INFERENCE, citadel-cli#1287) signs with
+		// the same convergent identity the handler-signed path uses above.
+		WorkReceiptSigner: workReceiptSigner,
+		WorkReceiptNodeID: workReceiptNodeID,
 	})
 	// Publish the runner so the heartbeat's laneActivityFn (running on the
 	// already-started status-publisher goroutines) can read its lane activity.
@@ -3878,8 +3887,10 @@ type usageStreamEntry struct {
 }
 
 // usageRecordJSON is the JSON representation published to Redis. The payload is
-// v2 (usage.PayloadVersion) for aceteam#10876 C7: it adds work attribution
-// (origin/orgId/workAction), typed units, and the receipt manifest binding.
+// v3 (usage.PayloadVersion) for citadel-cli#1287: on top of C7's work attribution
+// (origin/orgId/workAction), typed units, and receipt manifest binding, it adds
+// the flow-attribution fields (flowRunId/flowNodeId/delegatedNodeId/nodeUid/
+// receiptIds) so central fabric_run_work can join node work to a flow run.
 // ErrorMessage is intentionally excluded to avoid leaking internal error details.
 type usageRecordJSON struct {
 	JobID                 string           `json:"jobId"`
@@ -3901,6 +3912,13 @@ type usageRecordJSON struct {
 	Units                 map[string]int64 `json:"units,omitempty"`
 	ReceiptManifestSHA256 string           `json:"receiptManifestSha256,omitempty"`
 	ReceiptSigned         bool             `json:"receiptSigned,omitempty"`
+	// Flow attribution (citadel-cli#1287), carried by the outbox so central
+	// fabric_run_work can join node work to a flow run.
+	FlowRunID       string   `json:"flowRunId,omitempty"`
+	FlowNodeID      string   `json:"flowNodeId,omitempty"`
+	DelegatedNodeID string   `json:"delegatedNodeId,omitempty"`
+	NodeUID         string   `json:"nodeUid,omitempty"`
+	ReceiptIDs      []string `json:"receiptIds,omitempty"`
 }
 
 func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
@@ -3924,6 +3942,11 @@ func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
 		Units:                 r.Units,
 		ReceiptManifestSHA256: r.ReceiptManifestSHA256,
 		ReceiptSigned:         r.ReceiptSigned,
+		FlowRunID:             r.FlowRunID,
+		FlowNodeID:            r.FlowNodeID,
+		DelegatedNodeID:       r.DelegatedNodeID,
+		NodeUID:               r.NodeUID,
+		ReceiptIDs:            r.ReceiptIDs,
 	}
 }
 
