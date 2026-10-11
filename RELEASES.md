@@ -3052,3 +3052,23 @@ Auto-generated log of every release.
   - fix(update): refresh managed unit on already-latest path; sudo-safe remediation (#1266) (#1267)
 
 
+---
+
+## v2.191.0 — 2026-10-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 76 |
+| Lines added | +10791 |
+
+**Changes:**
+
+  - feat(rag): signed fail-closed work receipts + typed-unit work records (#1272) (#1284)
+  - fix(update): reject stale exact agent updates (#1285)
+  - fix(rag): make FILE_INDEX cancellation and progress truthful (#1286)
+  - feat(rag): per-org index namespaces, path-prefix filter, no silent large-file skips (#1263) (#1282)
+  - feat(rag): FILE_INDEX control plane — cancel, progress, heavy lane (#1271) (#1279)
+  - feat(desktop): prepare private bootstrap policy and tier planner (#1280)
+
+
