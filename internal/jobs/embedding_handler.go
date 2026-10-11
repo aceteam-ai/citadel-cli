@@ -94,6 +94,20 @@ type EmbeddingHandler struct {
 	nowFn func() time.Time
 }
 
+// Capabilities declares the embedding lifecycle contract (citadel-cli#1287). The
+// embedding job is quick inference-style work (normal lane, deferred deadline, no
+// cooperative cancel) that registers a HANDLER-signed `embed_served` work receipt
+// — this handler calls attachWorkRecord itself, so the runner never signs for it.
+func (h *EmbeddingHandler) Capabilities() JobCapabilities {
+	return JobCapabilities{
+		WorkActions:  []string{WorkActionEmbedServed},
+		ReceiptOwner: ReceiptOwnerHandler,
+	}
+}
+
+// Ensure EmbeddingHandler declares its capabilities.
+var _ CapabilityDeclarer = (*EmbeddingHandler)(nil)
+
 // EmbeddingRequest is the parsed embedding job payload.
 type EmbeddingRequest struct {
 	// Model is the embedding model identifier (e.g. "gte-multilingual-base").

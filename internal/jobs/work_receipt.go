@@ -43,6 +43,9 @@ var ErrReceiptSigningUnavailable = errors.New(`{"reason":"receipt_signing_unavai
 const (
 	WorkActionIndex       = aep.WorkActionIndex
 	WorkActionEmbedServed = aep.WorkActionEmbedServed
+	// WorkActionInference is the runner-signed work action for LLM_INFERENCE
+	// (citadel-cli#1287). Re-exported so the worker references one authority.
+	WorkActionInference = aep.WorkActionInference
 )
 
 // Work origin identifiers carried on the usage record (attribution).

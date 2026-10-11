@@ -13,8 +13,11 @@ import (
 // It carries counts and BASENAMES only — never full paths or content — so it is
 // safe to publish on the job's stream and mirror into Redis.
 type ProgressEvent struct {
-	// Stage is the coarse phase. Only the approved ProgressStage constants are
-	// emitted by FILE_INDEX.
+	// Stage is the coarse phase. It is an OPEN per-handler vocabulary
+	// (citadel-cli#1287): the throttled progress path treats it as an opaque
+	// string, and each handler declares the stages it emits via
+	// JobCapabilities.Stages. The ProgressStage constants below are FILE_INDEX's
+	// declared vocabulary.
 	Stage ProgressStage
 	// Done / Total measure progress in Unit terms. Total == 0 means unknown.
 	Done  int
@@ -36,7 +39,9 @@ type ProgressEvent struct {
 	Flush bool
 }
 
-// ProgressStage is the closed FILE_INDEX progress vocabulary.
+// ProgressStage is a progress phase label. It is an open string type: a handler
+// declares its own vocabulary via JobCapabilities.Stages (citadel-cli#1287). The
+// constants below are FILE_INDEX's declared stages.
 type ProgressStage string
 
 const (

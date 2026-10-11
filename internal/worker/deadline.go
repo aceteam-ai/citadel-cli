@@ -177,53 +177,26 @@ func needsSerializedLane(jobType string) bool {
 	return ok
 }
 
-// heavyLaneJobTypes route to the dedicated HEAVY execution lane (exec 1, admit 2
-// — runner.go) instead of running inline on the fetch loop. FILE_INDEX is the
-// first member (aceteam#10876 C1, design 2a.6):
+// The dedicated HEAVY execution lane (exec 1, admit 2 — runner.go) and the
+// cooperative mid-job cancel WATCH used to be runner-side type allowlists that
+// each held only FILE_INDEX. They are now HANDLER-DECLARED capabilities
+// (jobs.JobCapabilities, resolved via Runner.capabilitiesFor, citadel-cli#1287):
 //
-//   - It is the single DISPATCHED writer to the node-local index DB, so exec 1
-//     gives single-writer safety with no new lock (the same relocated-lock idea
-//     as the unbounded lane, over a DIFFERENT file).
-//   - Its walk+embed is minutes-to-hours long, so running inline would
-//     head-of-line-block the fetch loop (the #489/#908 incident shape).
-//   - It must NOT share the serialized/unbounded lane, which carries the
-//     manifest/lockfile writers (SERVICE_START, MODULE_SET, ...): a multi-hour
-//     index on that single-slot lane would queue every deploy behind it.
+//   - Lane == LaneHeavy routes onto the dedicated heavy lane: a single DISPATCHED
+//     long writer off the fetch loop (exec 1 gives single-writer safety with no
+//     new lock), isolated from the serialized manifest-writer lane so a multi-hour
+//     index never queues a deploy. admit 2 lets a second heavy job be claimed and
+//     queued while exec 1 keeps only one executing.
+//   - CooperativeCancel requests the graceful watch that polls job:cancelled:<id>
+//     and sets JobContext.CancelRequested at a safe unit boundary (as opposed to
+//     HUDDLE_JOIN's hard ctx-cancel watch), so FILE_INDEX commits the current file
+//     then returns `cancelled` with partial counts.
 //
-// admit 2 lets a second FILE_INDEX be claimed and queued (so the fetch loop
-// never blocks) while exec 1 keeps only one executing. Lane membership and the
-// watchdog TIER are SEPARATE decisions: a heavy job takes the long tier below
+// FILE_INDEX declares both (jobs.FileIndexHandler.Capabilities). Lane membership
+// and the watchdog TIER are SEPARATE decisions: a heavy job declares DeadlineLong
 // but is NOT in longSessionJobTypes (that set also means the #489 always-async
 // goroutine, which would race this lane's dispatch). Pinned by
-// TestHeavyLaneJobTypes.
-var heavyLaneJobTypes = map[string]struct{}{
-	JobTypeFileIndex: {},
-}
-
-// needsHeavyLane reports whether jobType routes to the dedicated heavy lane.
-func needsHeavyLane(jobType string) bool {
-	_, ok := heavyLaneJobTypes[jobType]
-	return ok
-}
-
-// cooperativeCancelJobTypes get a mid-job cancel WATCH that polls
-// job:cancelled:<id> and sets a GRACEFUL-stop flag the handler observes at a safe
-// unit boundary (JobContext.CancelRequested) — as opposed to HUDDLE_JOIN's hard
-// ctx-cancel watch. FILE_INDEX uses it to commit the current file then return
-// `cancelled` with partial counts (aceteam#10876 C1). Scoped deliberately: a
-// watch per in-flight job costs one Redis EXISTS per poll, so only long
-// cooperative walks get one (today, exactly the heavy-lane set). Pinned by
-// TestCooperativeCancelJobTypes.
-var cooperativeCancelJobTypes = map[string]struct{}{
-	JobTypeFileIndex: {},
-}
-
-// needsCooperativeCancelWatch reports whether jobType gets the graceful mid-job
-// cancel watch. See cooperativeCancelJobTypes.
-func needsCooperativeCancelWatch(jobType string) bool {
-	_, ok := cooperativeCancelJobTypes[jobType]
-	return ok
-}
+// TestHeavyLaneJobTypes / TestCooperativeCancelJobTypes.
 
 // resolveJobTimeout returns the execution budget the runner should apply to a
 // job. An explicit payload timeout_ms wins; otherwise the per-class fallback
@@ -236,17 +209,22 @@ func (r *Runner) resolveJobTimeout(job *Job) (time.Duration, bool) {
 	if job == nil {
 		return 0, false
 	}
+	// A HANDLER-DECLARED deadline tier wins over the static maps below
+	// (citadel-cli#1287). This replaces the old FILE_INDEX heavy-lane branch:
+	// FILE_INDEX declares DeadlineLong. DeadlineUnset means "no declaration" and
+	// defers to the maps, so every non-declaring job type is byte-identical.
+	switch r.capabilitiesFor(job.Type).Deadline {
+	case jobs.DeadlineUnbounded:
+		return 0, false
+	case jobs.DeadlineLong:
+		return envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
+	case jobs.DeadlineDefault:
+		return envTimeoutSeconds(jobTimeoutDefaultEnvVar, defaultJobTimeoutSeconds)
+	}
 	if _, unbounded := unboundedJobTypes[job.Type]; unbounded {
 		return 0, false
 	}
 	if job.Type == JobTypeRunJobTemplate {
-		return envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
-	}
-	// Heavy-lane jobs (FILE_INDEX) take the long tier: a full-archive walk+embed
-	// legitimately runs for hours. Like RUN_JOB_TEMPLATE this is an explicit
-	// branch, NOT longSessionJobTypes membership (which would also route it onto
-	// the #489 always-async goroutine and race the heavy lane). aceteam#10876 C1.
-	if _, heavy := heavyLaneJobTypes[job.Type]; heavy {
 		return envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
 	}
 	if _, long := longSessionJobTypes[job.Type]; long {
@@ -500,8 +478,8 @@ func (e *deadlineExceededError) Error() string {
 // hard cancellation must win so a partial/success result cannot mask shutdown
 // or a deadline. Every other lane preserves the historical handler result,
 // including HUDDLE_JOIN lifecycle sentinels that drive Ack/Nack recovery debt.
-func completedHandlerResult(jobType string, hardErr error, timeout time.Duration, result *JobResult, handlerErr error) (*JobResult, error) {
-	if hardErr != nil && needsHeavyLane(jobType) {
+func completedHandlerResult(heavy bool, hardErr error, timeout time.Duration, result *JobResult, handlerErr error) (*JobResult, error) {
+	if hardErr != nil && heavy {
 		if errors.Is(hardErr, context.DeadlineExceeded) {
 			return nil, &deadlineExceededError{timeout: timeout}
 		}
@@ -540,6 +518,14 @@ func (r *Runner) executeWithDeadline(
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// A handler that DECLARES the heavy lane retains its single-writer slot until
+	// its goroutine really exits, so an uncooperative handler fails closed by
+	// halting only the heavy lane rather than overlapping another writer
+	// (citadel-cli#1287 — was the heavyLaneJobTypes allowlist). Read from the
+	// handler in hand, not r.handlers, so a caller that passes the handler
+	// directly (tests) resolves the same as production.
+	heavy := capabilitiesOf(handler, job.Type).Lane == jobs.LaneHeavy
+
 	type handlerResult struct {
 		result *JobResult
 		err    error
@@ -555,9 +541,9 @@ func (r *Runner) executeWithDeadline(
 
 	select {
 	case hr := <-done:
-		return completedHandlerResult(job.Type, execCtx.Err(), timeout, hr.result, hr.err)
+		return completedHandlerResult(heavy, execCtx.Err(), timeout, hr.result, hr.err)
 	case <-execCtx.Done():
-		if needsHeavyLane(job.Type) {
+		if heavy {
 			// A heavy handler owns the single dispatched-writer slot until its
 			// goroutine really exits. An uncooperative handler intentionally holds
 			// this call (and runner shutdown) fail-closed rather than overlapping

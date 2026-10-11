@@ -325,6 +325,13 @@ const (
 	// wrapper is ready, but no node handler emits them yet (deferred, documented).
 	WorkActionExtract = "extract"
 	WorkActionOCR     = "ocr"
+	// WorkActionInference is the runner-signed work receipt for a dispatched
+	// LLM_INFERENCE job (the generic lifecycle contract's first runner-signed
+	// adopter, citadel-cli#1287). WorkActionTranscribe is defined for a
+	// TRANSCRIBE_AUDIO adopter and accepted here so the allowlist is ready; no
+	// node handler emits it yet (deferred, documented).
+	WorkActionInference  = "inference"
+	WorkActionTranscribe = "transcribe"
 )
 
 // knownWorkActions is the allowlist BuildSignedWorkReceipt validates against, so
@@ -336,6 +343,8 @@ var knownWorkActions = map[string]struct{}{
 	WorkActionEmbedServed: {},
 	WorkActionExtract:     {},
 	WorkActionOCR:         {},
+	WorkActionInference:   {},
+	WorkActionTranscribe:  {},
 }
 
 // IsWorkAction reports whether action is one of the known event-style work

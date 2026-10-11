@@ -515,9 +515,9 @@ runLoop:
 				// in lockstep in production, so the queue-wait is the real
 				// backpressure and the #825 Nack becomes effectively unreachable.
 				r.dispatchLane(ctx, r.inferenceLane, job, stream, startTime, &wg)
-			case r.heavyLane != nil && needsHeavyLane(job.Type):
-				// Dedicated heavy lane (exec 1, admit 2): FILE_INDEX (and future
-				// heavy index/extract work). A single DISPATCHED index-DB writer off
+			case r.heavyLane != nil && r.capabilitiesFor(job.Type).Lane == jobs.LaneHeavy:
+				// Dedicated heavy lane (exec 1, admit 2): any handler that DECLARES
+				// Lane==LaneHeavy (FILE_INDEX today). A single DISPATCHED index-DB writer off
 				// the fetch loop, isolated from the manifest-writer lane so a
 				// multi-hour index never queues a deploy (aceteam#10876 C1).
 				r.dispatchLane(ctx, r.heavyLane, job, stream, startTime, &wg)
@@ -898,15 +898,8 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	r.state.RecordJobExecuting()
 	defer r.state.RecordJobExecuteDone()
 
-	// Find handler
-	var handler JobHandler
-	for _, h := range r.handlers {
-		if h.CanHandle(job.Type) {
-			handler = h
-			break
-		}
-	}
-
+	// Find handler (shared with the lane-routing lookup via findHandler).
+	handler := r.findHandler(job.Type)
 	if handler == nil {
 		r.failUnsupportedJobType(ctx, job, startTime)
 		return false
@@ -1320,7 +1313,7 @@ func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context
 // and a no-op stop, so it is inert for every other job. The returned stop func
 // halts the poll goroutine (call it once execution is done).
 func (r *Runner) watchCooperativeCancellation(ctx context.Context, job *Job) (context.Context, func()) {
-	if !needsCooperativeCancelWatch(job.Type) {
+	if !r.capabilitiesFor(job.Type).CooperativeCancel {
 		return ctx, func() {}
 	}
 	var requested atomic.Bool

@@ -2353,16 +2353,47 @@ func TestRunnerFailureWithNoRetrySignalPublishesTerminalError(t *testing.T) {
 // cancelled, calling onStart the first time Execute begins. Used by
 // TestRunnerLongSessionJobDoesNotBlockOtherJobs (citadel-cli#489) to hold a
 // MEETING_JOIN job in flight while asserting a later job still completes.
+// fileIndexCapsDecl is an embeddable FILE_INDEX capability declaration for test
+// handlers that stand in for the real jobs.FileIndexHandler (citadel-cli#1287):
+// the dedicated heavy lane, the cooperative mid-job cancel watch, and the long
+// watchdog tier, with a HANDLER-signed index work receipt.
+type fileIndexCapsDecl struct{}
+
+func (fileIndexCapsDecl) DeclaredCapabilities(jt string) (jobhandlers.JobCapabilities, bool) {
+	if jt != JobTypeFileIndex {
+		return jobhandlers.JobCapabilities{}, false
+	}
+	return jobhandlers.JobCapabilities{
+		CooperativeCancel: true,
+		Lane:              jobhandlers.LaneHeavy,
+		Deadline:          jobhandlers.DeadlineLong,
+		WorkActions:       []string{jobhandlers.WorkActionIndex},
+		ReceiptOwner:      jobhandlers.ReceiptOwnerHandler,
+	}, true
+}
+
 type blockingJobHandler struct {
 	jobType string
 	onStart func()
 	release chan struct{}
+	// caps, when set, is the capability declaration this fake handler reports for
+	// its job type (citadel-cli#1287). nil declares nothing (pre-#1287 default).
+	caps *jobhandlers.JobCapabilities
 
 	mu       sync.Mutex
 	executed []*Job
 }
 
 func (h *blockingJobHandler) CanHandle(jobType string) bool { return h.jobType == jobType }
+
+// DeclaredCapabilities lets a blockingJobHandler act as the "fake
+// capability-declaring handler" the #1287 acceptance test needs.
+func (h *blockingJobHandler) DeclaredCapabilities(jt string) (jobhandlers.JobCapabilities, bool) {
+	if h.caps != nil && jt == h.jobType {
+		return *h.caps, true
+	}
+	return jobhandlers.JobCapabilities{}, false
+}
 
 func (h *blockingJobHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	h.mu.Lock()
