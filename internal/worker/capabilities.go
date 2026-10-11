@@ -1,6 +1,9 @@
 package worker
 
-import "github.com/aceteam-ai/citadel-cli/internal/jobs"
+import (
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+)
 
 // capabilityDeclarer is optionally implemented by a worker.JobHandler to declare
 // the generic lifecycle capabilities the runner honors for a job type
@@ -69,4 +72,60 @@ func (r *Runner) findHandler(jobType string) JobHandler {
 		}
 	}
 	return nil
+}
+
+// runnerSigns reports whether the runner must sign a work receipt for a job with
+// these capabilities: the handler DECLARED ReceiptOwnerRunner AND a signer is
+// wired. A handler that registers no work action (ReceiptOwnerNone) or is
+// handler-signed (ReceiptOwnerHandler) never takes this path — so a keyless node
+// never fails SHELL_COMMAND etc. closed (the critical fail-closed scope, #1287).
+func (r *Runner) runnerSigns(caps jobs.JobCapabilities) bool {
+	return caps.ReceiptOwner == jobs.ReceiptOwnerRunner && r.workReceiptSigner != nil
+}
+
+// newRunnerWorkReceiptConfig builds the dispatched, fail-closed WorkReceiptConfig
+// the runner uses to sign a work receipt for a runner-signed job. OrgID is read
+// from the job envelope (org_id) for attribution.
+func (r *Runner) newRunnerWorkReceiptConfig(job *Job) jobs.WorkReceiptConfig {
+	return jobs.WorkReceiptConfig{
+		Signer:     r.workReceiptSigner,
+		NodeID:     r.workReceiptNodeID,
+		Dispatched: true,
+		Origin:     jobs.OriginDispatched,
+		OrgID:      payloadString(job.Payload, "org_id"),
+	}
+}
+
+// attachRunnerWorkReceipt signs and attaches a work receipt to a runner-signed
+// job's successful output (citadel-cli#1287). It is a no-op (returns nil) for a
+// model_warming success — no inference actually ran, so there is nothing to
+// attest. It returns jobs.ErrReceiptSigningUnavailable when dispatched signing
+// fails, which the caller propagates as a terminal, fail-closed error.
+func (r *Runner) attachRunnerWorkReceipt(job *Job, result *JobResult) error {
+	if result == nil || result.Output == nil {
+		return nil
+	}
+	if s, _ := result.Output["status"].(string); s == "model_warming" {
+		return nil
+	}
+	cfg := r.newRunnerWorkReceiptConfig(job)
+	inputManifest := map[string]any{"job_id": job.ID, "payload": rawOrPayload(job)}
+	outputManifest := map[string]any{"content": result.Output["content"]}
+	units := map[string]int64{}
+	if usg, ok := result.Output["usage"].(map[string]any); ok {
+		units["prompt_tokens"] = intFromOutput(usg, "prompt_tokens")
+		units["completion_tokens"] = intFromOutput(usg, "completion_tokens")
+		units["total_tokens"] = intFromOutput(usg, "total_tokens")
+	}
+	return cfg.AttachRunnerWorkReceipt(result.Output, job.ID, aep.WorkActionInference, inputManifest, outputManifest, units)
+}
+
+// rawOrPayload returns the job's original wire bytes (preferred — the exact
+// delivered payload) as a string, falling back to the decoded payload map. Used
+// as the opaque input manifest for a runner-signed receipt.
+func rawOrPayload(job *Job) any {
+	if len(job.RawPayload) > 0 {
+		return string(job.RawPayload)
+	}
+	return job.Payload
 }

@@ -200,6 +200,18 @@ func (c WorkReceiptConfig) attachWorkRecord(out map[string]any, jobID, action st
 	return nil
 }
 
+// AttachRunnerWorkReceipt is the RUNNER's entry point (citadel-cli#1287) for
+// signing a work receipt for a NATIVE handler whose output the runner owns (e.g.
+// LLM_INFERENCE), where the handler itself does not call attachWorkRecord. It is
+// a thin exported wrapper over attachWorkRecord with identical semantics
+// (fail-closed when Dispatched and signing is unavailable; additive `usage` /
+// `work_manifest_sha256` / `work_receipts` keys; never overwrites an existing
+// key in out). inputManifest/outputManifest are opaque per-job digests (the
+// verifier checks the signature over the canonical receipt, not these).
+func (c WorkReceiptConfig) AttachRunnerWorkReceipt(out map[string]any, jobID, action string, inputManifest, outputManifest any, units map[string]int64) error {
+	return c.attachWorkRecord(out, jobID, action, inputManifest, outputManifest, units)
+}
+
 // unitsToAny converts a typed-unit map to map[string]any so it round-trips
 // through JSON as plain numbers (the shape buildUsageRecord decodes).
 func unitsToAny(units map[string]int64) map[string]any {

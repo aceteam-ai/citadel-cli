@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
@@ -34,6 +35,18 @@ type Runner struct {
 	// Concurrency support
 	maxConcurrency int
 	gpuTracker     *GPUTracker
+
+	// Work-receipt signing for RUNNER-signed dispatched work (citadel-cli#1287).
+	// When a handler DECLARES ReceiptOwner==ReceiptOwnerRunner and this signer is
+	// set, the runner signs a work receipt for every dispatched success (default
+	// on, independent of CITADEL_SIGN_AEP_RECEIPTS) and FAILS CLOSED when signing
+	// is unavailable. nil leaves such jobs unsigned and never fails them closed —
+	// the same posture a handler-signed path has with no signer wired, so existing
+	// tests that build a runner without a signer are unaffected. Handler-signed
+	// job types (FILE_INDEX, embedding) are untouched by this; they sign inside
+	// the handler via the LegacyHandlerOpts.WorkReceiptSigner path.
+	workReceiptSigner aep.Signer
+	workReceiptNodeID string
 
 	// Bounded execution lanes (citadel-cli#908, aceteam#8254). unboundedLane
 	// carries every manifest/lockfile-writing job type (serializedLaneJobTypes)
@@ -112,6 +125,17 @@ type RunnerConfig struct {
 	// State, when set, is updated with live introspection metrics so the
 	// status/control path can report consume/job activity (issue #236).
 	State *WorkerState
+
+	// WorkReceiptSigner signs RUNNER-signed dispatched-work receipts
+	// (citadel-cli#1287). Injected explicitly (NOT resolved inside this package)
+	// so a test never signs with a real node identity: cmd/work.go passes
+	// nodeidentity.Convergent(network.GetNodeConfigDir()), the SAME signer it
+	// gives LegacyHandlerOpts.WorkReceiptSigner. nil disables runner-signing (and
+	// its fail-closed posture) entirely.
+	WorkReceiptSigner aep.Signer
+	// WorkReceiptNodeID is the preferred receipt node_id (the fabric node id);
+	// empty falls back to the signer's own public-key fingerprint.
+	WorkReceiptNodeID string
 }
 
 // NewRunner creates a new job runner.
@@ -127,6 +151,8 @@ func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Ru
 		gpuTracker:         config.GPUTracker,
 		state:              config.State,
 		inferenceQueueWait: resolveInferenceQueueWait(),
+		workReceiptSigner:  config.WorkReceiptSigner,
+		workReceiptNodeID:  config.WorkReceiptNodeID,
 	}
 
 	// The general unbounded lane always exists (exec-concurrency 1): it is the
@@ -904,6 +930,25 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		r.failUnsupportedJobType(ctx, job, startTime)
 		return false
 	}
+	caps := capabilitiesOf(handler, job.Type)
+
+	// Preflight RUNNER-signed dispatched work BEFORE executing: a keyless node
+	// fails in milliseconds rather than after a full inference (citadel-cli#1287,
+	// mirroring the handler-signed Preflight). Only a handler that DECLARED
+	// ReceiptOwnerRunner with a signer wired reaches this — never a no-action job.
+	if r.runnerSigns(caps) {
+		if perr := r.newRunnerWorkReceiptConfig(job).Preflight(); perr != nil {
+			r.log("error", "Job %s refused: %v", job.ID, perr)
+			r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, perr))
+			if werr := stream.WriteError(perr, false); werr != nil {
+				r.log("warning", "Failed to publish receipt-signing-unavailable error for job %s: %v", job.ID, werr)
+			}
+			if ferr := r.source.Fail(ctx, job, perr, map[string]any{"reason": "receipt_signing_unavailable"}); ferr != nil {
+				r.log("warning", "Failed to ack receipt-signing-unavailable job %s: %v", job.ID, ferr)
+			}
+			return false
+		}
+	}
 
 	// GPU tracking: acquire/release GPU slot if tracker is set AND this job
 	// type actually contends for a GPU (citadel-cli#825). Unchanged from the
@@ -1031,6 +1076,18 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		r.source.Ack(ctx, job)
 		return false
 	}
+
+	// Runner-signed work receipt (citadel-cli#1287): sign a receipt for every
+	// dispatched success of a job that DECLARED ReceiptOwnerRunner (LLM_INFERENCE).
+	// A sign failure becomes `err` here and flows into the isReceiptSigningUnavailable
+	// fail-closed branch below (terminal, Fail/DLQ, one terminal error) — never a
+	// silent unsigned success. model_warming is skipped inside (no inference ran).
+	if err == nil && result != nil && result.Status == JobStatusSuccess && r.runnerSigns(caps) {
+		if signErr := r.attachRunnerWorkReceipt(job, result); signErr != nil {
+			err = signErr
+		}
+	}
+
 	if result != nil && result.Status == JobStatusTerminalFailure {
 		actualErr := result.Error
 		if actualErr == nil {
