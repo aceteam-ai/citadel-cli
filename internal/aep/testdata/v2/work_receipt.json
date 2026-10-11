@@ -1,0 +1,19 @@
+{
+  "receipt_version": "2",
+  "node_id": "sha256:bff23802e4de79935010493046546f766b69fd76442936955d7f23744b98fe45",
+  "job_id": "job-golden-work",
+  "issued_at": "2026-10-10T12:00:00Z",
+  "engine": "",
+  "model": "",
+  "input_sha256": "sha256:44c083334e7a4bdefe807d680655a33ea7a607e1d0dd367234ec2068d71fcff1",
+  "output_sha256": "sha256:4c569296a44a65415e08ca22c4c2a250d522d5ef5d7cdfe58ece4a6e99a35cb9",
+  "policy_hash": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "action": "index",
+  "verdict_hash": "",
+  "grounded": false,
+  "score": 0,
+  "claims_checked": 0,
+  "flagged_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "signature": "MEUCIAbtiw1R9ckLn23kNztVKMTEf1g1cabsW7+KBT4RA8h/AiEAvrGD6E1neYe5BwG/W0iqvw4/RUWIlxWHmwME/nyAkmM=",
+  "public_key_fingerprint": "sha256:bff23802e4de79935010493046546f766b69fd76442936955d7f23744b98fe45"
+}

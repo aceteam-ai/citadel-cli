@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -179,6 +180,17 @@ type LegacyHandlerOpts struct {
 	// `index` namespaces (they fail closed); the default (no `index`) path works
 	// regardless.
 	IndexesDir string
+	// WorkReceiptSigner signs the dispatched-work receipts for FILE_INDEX and
+	// embedding (aceteam#10876 C7). Injected explicitly (NOT resolved inside this
+	// package) so a test never signs with node 1795's real convergent identity:
+	// cmd/work.go passes nodeidentity.Convergent(network.GetNodeConfigDir()). When
+	// non-nil, those handlers run as fail-closed DISPATCHED work — a job that
+	// cannot sign fails with ErrReceiptSigningUnavailable. nil leaves them unsigned
+	// (the legacy/diagnostic path; the fail-closed contract is the worker path).
+	WorkReceiptSigner aep.Signer
+	// WorkReceiptNodeID is the preferred receipt node_id (the fabric node id);
+	// empty falls back to the signer's own public-key fingerprint.
+	WorkReceiptNodeID string
 	// AllowReadOutsideWorkspace, when true, lets read-only file handlers
 	// (FILE_READ, FILE_READ_BYTES, FILE_LIST, FILE_SEARCH) access paths
 	// outside the workspace sandbox. Write handlers are unaffected.
@@ -270,6 +282,17 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		goos = runtime.GOOS
 	}
 
+	// Embedding handler as fail-closed dispatched work when a signer is wired
+	// (aceteam#10876 C7). Without a signer (legacy/diagnostic paths) it stays
+	// unsigned, exactly as before.
+	embeddingHandler := &jobs.EmbeddingHandler{}
+	if opts.WorkReceiptSigner != nil {
+		embeddingHandler.Signer = opts.WorkReceiptSigner
+		embeddingHandler.NodeID = opts.WorkReceiptNodeID
+		embeddingHandler.Dispatched = true
+		embeddingHandler.Origin = jobs.OriginDispatched
+	}
+
 	handlers := []*LegacyHandlerAdapter{
 		NewLegacyHandlerAdapter(JobTypeTmuxSession, jobs.NewTmuxSessionHandler("")),
 		NewLegacyHandlerAdapter(JobTypeDownloadModel, &jobs.DownloadModelHandler{}),
@@ -282,7 +305,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// the other inference engines it needs no workspace sandbox; nodes that
 		// don't run TEI simply never receive `embedding` jobs (they only land on
 		// nodes carrying the task:embedding capability tag).
-		NewLegacyHandlerAdapter(JobTypeEmbedding, &jobs.EmbeddingHandler{}),
+		NewLegacyHandlerAdapter(JobTypeEmbedding, embeddingHandler),
 		// Thread both resolved paths into ConfigHandler: ConfigDir owns the
 		// manifest, while PermissionsDir owns the machine-level policy enforced
 		// by this worker.
@@ -410,6 +433,14 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			indexHandler := jobs.NewFileIndexHandler(opts.WorkspaceDir, "")
 			indexHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 			indexHandler.IndexesDir = opts.IndexesDir
+			// Fail-closed dispatched-work signing (aceteam#10876 C7) when a signer
+			// is wired; unsigned otherwise (legacy/diagnostic path).
+			if opts.WorkReceiptSigner != nil {
+				indexHandler.Signer = opts.WorkReceiptSigner
+				indexHandler.NodeID = opts.WorkReceiptNodeID
+				indexHandler.Dispatched = true
+				indexHandler.Origin = jobs.OriginDispatched
+			}
 
 			semanticSearchHandler := jobs.NewFileSemanticSearchHandler(opts.WorkspaceDir, "")
 			semanticSearchHandler.IndexesDir = opts.IndexesDir

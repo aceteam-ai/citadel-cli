@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
@@ -40,6 +41,11 @@ type nodeJobHandlerOpts struct {
 	// DBs (aceteam#10876 C2), <node_config_dir>/indexes. Threaded to the
 	// FILE_INDEX / FILE_SEMANTIC_SEARCH handlers.
 	IndexesDir string
+	// WorkReceiptSigner / WorkReceiptNodeID make FILE_INDEX + embedding sign their
+	// work receipts as fail-closed dispatched work (aceteam#10876 C7). Threaded to
+	// the worker handler set; nil leaves those handlers unsigned.
+	WorkReceiptSigner aep.Signer
+	WorkReceiptNodeID string
 	// AllowReadOutsideWorkspace lets read-only file handlers escape the sandbox.
 	AllowReadOutsideWorkspace bool
 	// ShellDisabled omits SHELL_COMMAND because it cannot execute while disabled.
@@ -105,6 +111,8 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 		ConfigDir:                 opts.ConfigDir,
 		PermissionsDir:            opts.PermissionsDir,
 		IndexesDir:                opts.IndexesDir,
+		WorkReceiptSigner:         opts.WorkReceiptSigner,
+		WorkReceiptNodeID:         opts.WorkReceiptNodeID,
 		AllowReadOutsideWorkspace: opts.AllowReadOutsideWorkspace,
 		ShellDisabled:             opts.ShellDisabled,
 		ShellEnabled:              opts.ShellEnabled,

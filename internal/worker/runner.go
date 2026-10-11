@@ -1107,6 +1107,11 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// Files permission is captured when handlers are built. A refusal is
 		// terminal even on the first delivery: retries cannot enable Files.
 		isFilesDisabled := errors.Is(actualErr, jobs.ErrFilesDisabled)
+		// A dispatched work job that cannot sign its receipt is terminal on the
+		// first delivery too (aceteam#10876 C7): a retry cannot make a missing node
+		// identity key appear. Fail (DLQ) with reason receipt_signing_unavailable,
+		// never silently succeed unsigned. Same shape as the Files refusal.
+		isReceiptSigningUnavailable := errors.Is(actualErr, jobs.ErrReceiptSigningUnavailable)
 		isHuddleJoin := job.Type == JobTypeHuddleJoin
 
 		// Exactly one terminal event per job id (issue #826). A generic failure
@@ -1122,7 +1127,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// publishes, so a job that exhausts its retries still reports failure
 		// exactly once. Mirrors the reasoning #822/#559 already applied to the
 		// JobStatusRetry and no-GPU-slot Nack paths below/above.
-		if isDeadlineExceeded || isFilesDisabled || isHuddleJoin || !willRetry(job) {
+		if isDeadlineExceeded || isFilesDisabled || isReceiptSigningUnavailable || isHuddleJoin || !willRetry(job) {
 			if werr := stream.WriteError(actualErr, false); werr != nil {
 				r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
 			}
@@ -1140,6 +1145,13 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		if isFilesDisabled {
 			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "files_disabled"}); ferr != nil {
 				r.log("warning", "Failed to ack Files-disabled job %s: %v", job.ID, ferr)
+			}
+			return false
+		}
+
+		if isReceiptSigningUnavailable {
+			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "receipt_signing_unavailable"}); ferr != nil {
+				r.log("warning", "Failed to ack receipt-signing-unavailable job %s: %v", job.ID, ferr)
 			}
 			return false
 		}
@@ -1667,13 +1679,23 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		}
 	}
 
-	// Extract usage metrics from result output (_usage_* keys)
+	// Extract usage metrics from result output (_usage_* keys). These are set
+	// directly on Output by NATIVE worker handlers (e.g. llm_inference).
 	if result != nil && result.Output != nil {
 		r.PromptTokens = intFromOutput(result.Output, "_usage_prompt_tokens")
 		r.CompletionTokens = intFromOutput(result.Output, "_usage_completion_tokens")
 		r.TotalTokens = intFromOutput(result.Output, "_usage_total_tokens")
 		r.RequestBytes = intFromOutput(result.Output, "_usage_request_bytes")
 		r.ResponseBytes = intFromOutput(result.Output, "_usage_response_bytes")
+
+		// A LEGACY handler's whole JSON output is wrapped as a string under the
+		// "output" key by LegacyHandlerAdapter, so the _usage_* top-level read
+		// above never sees its metrics. FILE_INDEX / embedding emit a nested
+		// `usage` object there (work attribution + typed units + receipt binding,
+		// aceteam#10876 C7); decode it and carry it onto the record. This is the
+		// "usage key fix": without it a FILE_INDEX/embedding job records zero
+		// tokens/bytes and no work attribution.
+		applyNestedUsage(&r, result.Output)
 	}
 
 	if err != nil {
@@ -1685,6 +1707,74 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 	}
 
 	return r
+}
+
+// applyNestedUsage decodes a legacy handler's JSON output (wrapped as a string
+// under Output["output"]) and, when it carries a nested `usage` object, carries
+// the work attribution, typed units, receipt binding, and token/byte metrics
+// onto the usage record (aceteam#10876 C7). It is a no-op for an output that is
+// not a JSON object or has no `usage` map, so native handlers and non-work jobs
+// are unaffected. Token/byte fields are only taken from the nested object when
+// the top-level _usage_* read did not already set them (native handlers win).
+func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
+	raw, ok := output["output"].(string)
+	if !ok || raw == "" {
+		return
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return
+	}
+	usg, ok := decoded["usage"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	if s, ok := usg["origin"].(string); ok {
+		r.Origin = s
+	}
+	if s, ok := usg["org_id"].(string); ok {
+		r.OrgID = s
+	}
+	if s, ok := usg["action"].(string); ok {
+		r.WorkAction = s
+	}
+	if s, ok := usg["manifest_sha256"].(string); ok {
+		r.ReceiptManifestSHA256 = s
+	}
+	if b, ok := usg["signed"].(bool); ok {
+		r.ReceiptSigned = b
+	}
+	if units, ok := usg["units"].(map[string]any); ok {
+		r.Units = unitsFromAny(units)
+	}
+	// Token/byte metrics: prefer a value already set from the native _usage_*
+	// path; otherwise take the nested object's.
+	if r.PromptTokens == 0 {
+		r.PromptTokens = intFromOutput(usg, "prompt_tokens")
+	}
+	if r.CompletionTokens == 0 {
+		r.CompletionTokens = intFromOutput(usg, "completion_tokens")
+	}
+	if r.TotalTokens == 0 {
+		r.TotalTokens = intFromOutput(usg, "total_tokens")
+	}
+	if r.RequestBytes == 0 {
+		r.RequestBytes = intFromOutput(usg, "request_bytes")
+	}
+	if r.ResponseBytes == 0 {
+		r.ResponseBytes = intFromOutput(usg, "response_bytes")
+	}
+}
+
+// unitsFromAny converts a decoded JSON units object to map[string]int64,
+// dropping any non-numeric entry.
+func unitsFromAny(m map[string]any) map[string]int64 {
+	out := make(map[string]int64, len(m))
+	for k := range m {
+		out[k] = intFromOutput(m, k)
+	}
+	return out
 }
 
 // intFromOutput extracts an int64 value from a map[string]any.

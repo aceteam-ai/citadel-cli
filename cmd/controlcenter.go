@@ -28,6 +28,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -2459,14 +2460,19 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ccPinnedServices = manifestPinnedServices(m)
 	}
 	nodeJobOpts := nodeJobHandlerOpts{
-		Source:                    source,
-		OrgID:                     nodeJobOrgID(),
-		NodeID:                    headscaleNodeID,
-		LogFn:                     activity,
-		WorkspaceDir:              wsDir,
-		ConfigDir:                 ccConfigDir,
-		PermissionsDir:            nodePermissionsDir(),
-		IndexesDir:                jobs.IndexesDirFor(network.GetNodeConfigDir()),
+		Source:         source,
+		OrgID:          nodeJobOrgID(),
+		NodeID:         headscaleNodeID,
+		LogFn:          activity,
+		WorkspaceDir:   wsDir,
+		ConfigDir:      ccConfigDir,
+		PermissionsDir: nodePermissionsDir(),
+		IndexesDir:     jobs.IndexesDirFor(network.GetNodeConfigDir()),
+		// The control-center worker is also a dispatched-work path, so it signs
+		// FILE_INDEX/embedding receipts fail-closed too (aceteam#10876 C7), via the
+		// same convergent node identity as runWork.
+		WorkReceiptSigner:         nodeidentity.Convergent(network.GetNodeConfigDir()),
+		WorkReceiptNodeID:         config.LoadDeviceCredsConverged().FabricNodeID,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !ccPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,

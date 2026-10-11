@@ -99,7 +99,10 @@ func TestSyncerPublishFailureDoesNotMarkSynced(t *testing.T) {
 	}
 }
 
-func TestSyncerBatchSize(t *testing.T) {
+// TestSyncerDrainsAllInOneCycle pins the aceteam#10876 C7 contract: one SyncOnce
+// drains the ENTIRE backlog (the "offline for an hour, reconnect" case), one
+// record per publish call, regardless of the QueryUnsynced page size (BatchSize).
+func TestSyncerDrainsAllInOneCycle(t *testing.T) {
 	store, err := OpenStore(tempDBPath(t))
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
@@ -108,43 +111,170 @@ func TestSyncerBatchSize(t *testing.T) {
 
 	seedRecords(t, store, 5)
 
-	var batchSizes []int
+	var publishCalls int
 	var mu sync.Mutex
 
 	syncer := NewSyncer(SyncerConfig{
 		Store:     store,
-		BatchSize: 2,
+		BatchSize: 2, // page size; not the publish granularity
 		PublishFn: func(ctx context.Context, records []UsageRecord) error {
 			mu.Lock()
-			batchSizes = append(batchSizes, len(records))
+			publishCalls++
 			mu.Unlock()
+			if len(records) != 1 {
+				t.Errorf("publish granularity = %d, want 1 (per-record)", len(records))
+			}
 			return nil
 		},
 	})
 
-	// First sync: should get batch of 2
+	// A single SyncOnce drains all 5 across pages of 2.
 	syncer.SyncOnce(context.Background())
 
 	mu.Lock()
-	if len(batchSizes) != 1 || batchSizes[0] != 2 {
-		t.Errorf("first batch size = %v, want [2]", batchSizes)
+	if publishCalls != 5 {
+		t.Errorf("publish calls = %d, want 5 (all drained in one cycle)", publishCalls)
 	}
 	mu.Unlock()
 
-	// Second sync: next batch of 2
-	syncer.SyncOnce(context.Background())
+	remaining, err := store.QueryUnsynced(10)
+	if err != nil {
+		t.Fatalf("QueryUnsynced: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("expected 0 unsynced after one drain cycle, got %d", len(remaining))
+	}
+}
 
-	// Third sync: last 1
+// TestSyncerOutboxReplayExactlyOnce pins the acceptance: a node offline for a
+// while buffers records; on reconnect ALL drain, and a subsequent cycle sends
+// nothing (exactly once).
+func TestSyncerOutboxReplayExactlyOnce(t *testing.T) {
+	store, err := OpenStore(tempDBPath(t))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	seedRecords(t, store, 7)
+
+	var mu sync.Mutex
+	published := map[string]int{} // job_id -> times published
+	online := false
+
+	syncer := NewSyncer(SyncerConfig{
+		Store:     store,
+		BatchSize: 3,
+		PublishFn: func(ctx context.Context, records []UsageRecord) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if !online {
+				return errors.New("offline")
+			}
+			for _, r := range records {
+				published[r.JobID]++
+			}
+			return nil
+		},
+	})
+
+	// Offline: nothing drains, everything stays buffered.
+	syncer.SyncOnce(context.Background())
+	if n := countUnsynced(t, store); n != 7 {
+		t.Fatalf("offline: expected 7 buffered, got %d", n)
+	}
+
+	// Reconnect: one cycle drains all 7.
+	mu.Lock()
+	online = true
+	mu.Unlock()
+	syncer.SyncOnce(context.Background())
+	if n := countUnsynced(t, store); n != 0 {
+		t.Fatalf("after reconnect: expected 0 buffered, got %d", n)
+	}
+
+	// A second cycle sends nothing more.
 	syncer.SyncOnce(context.Background())
 
 	mu.Lock()
-	if len(batchSizes) != 3 {
-		t.Errorf("expected 3 sync cycles, got %d", len(batchSizes))
+	defer mu.Unlock()
+	if len(published) != 7 {
+		t.Fatalf("expected 7 distinct records published, got %d", len(published))
 	}
-	if batchSizes[2] != 1 {
-		t.Errorf("third batch size = %d, want 1", batchSizes[2])
+	for id, n := range published {
+		if n != 1 {
+			t.Errorf("record %s published %d times, want exactly 1", id, n)
+		}
 	}
+}
+
+// TestSyncerPartialFailureNoDoubleSend pins that a publish error partway through
+// marks only the records published BEFORE it, and a retry does not re-send them.
+func TestSyncerPartialFailureNoDoubleSend(t *testing.T) {
+	store, err := OpenStore(tempDBPath(t))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	seedRecords(t, store, 5)
+
+	var mu sync.Mutex
+	published := map[string]int{}
+	failAfter := 2 // first 2 succeed, the 3rd fails
+	count := 0
+
+	syncer := NewSyncer(SyncerConfig{
+		Store:     store,
+		BatchSize: 10,
+		PublishFn: func(ctx context.Context, records []UsageRecord) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if count >= failAfter {
+				return errors.New("boom")
+			}
+			count++
+			for _, r := range records {
+				published[r.JobID]++
+			}
+			return nil
+		},
+	})
+
+	// First cycle: 2 succeed, 3rd fails, cycle ends. 3 remain unsynced.
+	syncer.SyncOnce(context.Background())
+	if n := countUnsynced(t, store); n != 3 {
+		t.Fatalf("after partial failure: expected 3 unsynced, got %d", n)
+	}
+
+	// Recover: now everything publishes.
+	mu.Lock()
+	failAfter = 1 << 30
 	mu.Unlock()
+	syncer.SyncOnce(context.Background())
+	if n := countUnsynced(t, store); n != 0 {
+		t.Fatalf("after recovery: expected 0 unsynced, got %d", n)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(published) != 5 {
+		t.Fatalf("expected 5 distinct records, got %d", len(published))
+	}
+	for id, n := range published {
+		if n != 1 {
+			t.Errorf("record %s published %d times, want exactly 1 (no double-send)", id, n)
+		}
+	}
+}
+
+func countUnsynced(t *testing.T, store *Store) int {
+	t.Helper()
+	recs, err := store.QueryUnsynced(1000)
+	if err != nil {
+		t.Fatalf("QueryUnsynced: %v", err)
+	}
+	return len(recs)
 }
 
 func TestSyncerNoRecordsIsNoop(t *testing.T) {

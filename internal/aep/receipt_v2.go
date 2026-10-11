@@ -307,6 +307,81 @@ func BuildSignedRunJobTemplateReceipt(signer Signer, nodeID, jobID, inputSHA256,
 	)
 }
 
+// Work-receipt actions (aceteam#10876 C7, citadel-cli#1272). Each attests a unit
+// of WORK a node performed (indexing, serving an embedding, extraction, OCR) —
+// an EVENT, like app_deploy / run_job_template, NOT a Trust Engine content
+// check. So a work receipt carries no grounding (grounded=false, score=0,
+// claims=0) and an empty verdict_hash; the aceteam verifier branches on the
+// action to skip the inference path's verdict-hash recomputation (the same
+// posture app_deploy established). The literal strings are a cross-repo contract
+// the backend keys on — do not rename without the aceteam side.
+const (
+	// WorkActionIndex is a FILE_INDEX work receipt (one per index stage).
+	WorkActionIndex = "index"
+	// WorkActionEmbedServed is an embedding job's serving-side receipt.
+	WorkActionEmbedServed = "embed_served"
+	// WorkActionExtract / WorkActionOCR are defined for the sandboxed-extractor
+	// slice (aceteam#10876 A-side). BuildSignedWorkReceipt accepts them so the
+	// wrapper is ready, but no node handler emits them yet (deferred, documented).
+	WorkActionExtract = "extract"
+	WorkActionOCR     = "ocr"
+)
+
+// knownWorkActions is the allowlist BuildSignedWorkReceipt validates against, so
+// a caller cannot smuggle a Trust Engine verdict action ("pass"/"flag"/"block")
+// — which the verifier WOULD try to recompute a verdict for — through the
+// event-style work path.
+var knownWorkActions = map[string]struct{}{
+	WorkActionIndex:       {},
+	WorkActionEmbedServed: {},
+	WorkActionExtract:     {},
+	WorkActionOCR:         {},
+}
+
+// IsWorkAction reports whether action is one of the known event-style work
+// actions (exported so a verifier/consumer can branch the same way).
+func IsWorkAction(action string) bool {
+	_, ok := knownWorkActions[action]
+	return ok
+}
+
+// BuildSignedWorkReceipt signs a v2 receipt for a unit of node work
+// (aceteam#10876 C7). It is a thin wrapper over BuildSignedReceiptV2 (reusing its
+// finite-score guard, newline refuse-to-sign guard, and empty-flagged-list
+// hashing) fixing the work-receipt shape:
+//
+//   - Action       = one of the knownWorkActions (rejected otherwise)
+//   - InputSHA256  = the per-stage input manifest hash (already "sha256:<hex>"),
+//     which BINDS the index namespace so two orgs indexing byte-identical
+//     content produce distinct receipts (aceteam#10876 C7)
+//   - OutputSHA256 = the per-stage output manifest hash (already "sha256:<hex>")
+//   - PolicyHash   = EmptyPolicyHash (no on-node policy delivery yet, S5)
+//   - VerdictHash  = "" (a work event has no Trust Engine verdict)
+//   - Engine/Model = "" (set by the manifest, not the receipt header)
+//
+// and an empty trust.GroundingResult. The caller resolves nodeID via
+// aep.ResolveNodeID. Unlike the chat-completion receipt (CITADEL_SIGN_AEP_RECEIPTS,
+// opt-in, fail-open), dispatched work signs by DEFAULT and FAILS CLOSED when
+// signing is unavailable — that posture lives in the caller
+// (jobs.signWorkReceipt / the handlers), not here.
+func BuildSignedWorkReceipt(signer Signer, nodeID, jobID, action, inputSHA256, outputSHA256 string, now time.Time) (*AEPReceiptV2, error) {
+	if !IsWorkAction(action) {
+		return nil, fmt.Errorf("aep: %q is not a known work action", action)
+	}
+	return BuildSignedReceiptV2(
+		signer, nodeID, jobID, "", "",
+		V2Inputs{
+			InputSHA256:  inputSHA256,
+			OutputSHA256: outputSHA256,
+			PolicyHash:   EmptyPolicyHash,
+			Action:       action,
+			VerdictHash:  "",
+		},
+		trust.GroundingResult{},
+		now,
+	)
+}
+
 // ToMap returns the receipt as a map[string]any (via its own json tags), the
 // same shape rule as AEPReceiptV1.ToMap — callers MUST use this rather than
 // attaching *AEPReceiptV2 to job output directly (a typed Go pointer in a map
