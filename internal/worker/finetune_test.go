@@ -19,7 +19,6 @@ type fineTuneControlFake struct {
 	cancelChecks []fineTuneCancelCheck
 	updates      []map[string]any
 	critical     []map[string]any
-	events       []map[string]any
 	updateErr    error
 	terminalErr  error
 	cancelErr    error
@@ -66,12 +65,6 @@ func (c *fineTuneControlFake) FailCritical(_ context.Context, _ string, fields m
 	}
 	c.critical = append(c.critical, fields)
 	c.updates = append(c.updates, fields)
-	return nil
-}
-func (c *fineTuneControlFake) Progress(_ context.Context, _ string, event map[string]any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.events = append(c.events, event)
 	return nil
 }
 
@@ -157,15 +150,18 @@ func TestFineTuneProgressAndFailureRestore(t *testing.T) {
 		}
 		return errors.New("training failed")
 	}
-	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, &MockStreamWriter{})
+	stream := &MockStreamWriter{}
+	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, stream)
 	if res.Status != JobStatusTerminalFailure {
 		t.Fatalf("status = %q", res.Status)
 	}
 	if reservation.reserve != 1 || reservation.release != 1 {
 		t.Fatalf("reservation = %d/%d", reservation.reserve, reservation.release)
 	}
-	if len(control.events) != 1 || control.events[0]["progress_percent"] != 50.0 || control.events[0]["current_epoch"] != 1.0 || control.events[0]["current_loss"] != 0.7 {
-		t.Fatalf("progress = %#v", control.events)
+	// Progress now rides the ONE generic channel: StreamWriter.WriteProgress
+	// (citadel-cli#1287), not a bespoke Control.Progress.
+	if len(stream.progress) != 1 || stream.progress[0]["progress_percent"] != 50.0 || stream.progress[0]["current_epoch"] != 1.0 || stream.progress[0]["current_loss"] != 0.7 {
+		t.Fatalf("progress = %#v", stream.progress)
 	}
 	if control.updates[len(control.updates)-1]["status"] != "failed" {
 		t.Fatalf("final status = %#v", control.updates)
@@ -173,13 +169,16 @@ func TestFineTuneProgressAndFailureRestore(t *testing.T) {
 }
 
 func TestFineTuneRejectsInjectedProgressAndRestores(t *testing.T) {
-	cfg, job, control, reservation := fineTuneFixture(t)
+	cfg, job, _, reservation := fineTuneFixture(t)
 	cfg.Run = func(_ context.Context, _ FineTuneSpec, progress func(map[string]any) error) error {
 		return progress(map[string]any{"progress_percent": 50.0, "current_epoch": 1.0, "current_loss": 0.7, "status": "succeeded"})
 	}
-	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, &MockStreamWriter{})
-	if res.Status != JobStatusTerminalFailure || reservation.release != 1 || len(control.events) != 0 {
-		t.Fatalf("result=%+v restore=%d events=%v", res, reservation.release, control.events)
+	stream := &MockStreamWriter{}
+	res, _ := NewFineTuneHandler(cfg).Execute(context.Background(), job, stream)
+	// An invalid/injected progress event is rejected BEFORE any publish, so the
+	// generic progress channel stays empty.
+	if res.Status != JobStatusTerminalFailure || reservation.release != 1 || len(stream.progress) != 0 {
+		t.Fatalf("result=%+v restore=%d progress=%v", res, reservation.release, stream.progress)
 	}
 }
 
