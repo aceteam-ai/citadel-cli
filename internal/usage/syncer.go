@@ -7,10 +7,13 @@ import (
 )
 
 // PayloadVersion is the wire version of the usage stream payload the publisher
-// emits (cmd/work.go's usageStreamEntry). Bumped to "2.0" for aceteam#10876 C7,
-// which adds work attribution (origin/org_id/work_action), typed units, and the
-// receipt manifest binding to the published record.
-const PayloadVersion = "2.0"
+// emits (cmd/work.go's usageStreamEntry). "2.0" (aceteam#10876 C7) added work
+// attribution (origin/org_id/work_action), typed units, and the receipt manifest
+// binding. "3.0" (citadel-cli#1287) adds the flow-attribution fields
+// (flow_run_id/flow_node_id/delegated_node_id/node_uid/receipt_ids). The aceteam
+// consumer must accept version "3.0"; all added fields are omitempty, so a "3.0"
+// record with none of them set is wire-identical to a "2.0" one.
+const PayloadVersion = "3.0"
 
 // PublishFunc sends a batch of usage records to an external system (e.g., Redis).
 // It should return an error if the publish fails.

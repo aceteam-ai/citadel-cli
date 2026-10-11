@@ -3887,8 +3887,10 @@ type usageStreamEntry struct {
 }
 
 // usageRecordJSON is the JSON representation published to Redis. The payload is
-// v2 (usage.PayloadVersion) for aceteam#10876 C7: it adds work attribution
-// (origin/orgId/workAction), typed units, and the receipt manifest binding.
+// v3 (usage.PayloadVersion) for citadel-cli#1287: on top of C7's work attribution
+// (origin/orgId/workAction), typed units, and receipt manifest binding, it adds
+// the flow-attribution fields (flowRunId/flowNodeId/delegatedNodeId/nodeUid/
+// receiptIds) so central fabric_run_work can join node work to a flow run.
 // ErrorMessage is intentionally excluded to avoid leaking internal error details.
 type usageRecordJSON struct {
 	JobID                 string           `json:"jobId"`
