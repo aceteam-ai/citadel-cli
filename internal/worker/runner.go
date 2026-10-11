@@ -1162,6 +1162,13 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// identity key appear. Fail (DLQ) with reason receipt_signing_unavailable,
 		// never silently succeed unsigned. Same shape as the Files refusal.
 		isReceiptSigningUnavailable := errors.Is(actualErr, jobs.ErrReceiptSigningUnavailable)
+		// A job that needs a sandboxed helper module this node cannot run
+		// (no runtime able to enforce the sandbox isolation, or the module
+		// image absent) is terminal on first delivery too (citadel-cli#1288):
+		// a sandboxed module runs with no network and cannot pull its own
+		// image, so a retry cannot make it appear. Same shape as the Files /
+		// receipt-signing refusals.
+		isSandboxedModuleUnavailable := errors.Is(actualErr, jobs.ErrSandboxedModuleUnavailable)
 		isHuddleJoin := job.Type == JobTypeHuddleJoin
 
 		// Exactly one terminal event per job id (issue #826). A generic failure
@@ -1177,7 +1184,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// publishes, so a job that exhausts its retries still reports failure
 		// exactly once. Mirrors the reasoning #822/#559 already applied to the
 		// JobStatusRetry and no-GPU-slot Nack paths below/above.
-		if isDeadlineExceeded || isFilesDisabled || isReceiptSigningUnavailable || isHuddleJoin || !willRetry(job) {
+		if isDeadlineExceeded || isFilesDisabled || isReceiptSigningUnavailable || isSandboxedModuleUnavailable || isHuddleJoin || !willRetry(job) {
 			if werr := stream.WriteError(actualErr, false); werr != nil {
 				r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
 			}
@@ -1202,6 +1209,13 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		if isReceiptSigningUnavailable {
 			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "receipt_signing_unavailable"}); ferr != nil {
 				r.log("warning", "Failed to ack receipt-signing-unavailable job %s: %v", job.ID, ferr)
+			}
+			return false
+		}
+
+		if isSandboxedModuleUnavailable {
+			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "sandboxed_module_unavailable"}); ferr != nil {
+				r.log("warning", "Failed to ack sandboxed-module-unavailable job %s: %v", job.ID, ferr)
 			}
 			return false
 		}
