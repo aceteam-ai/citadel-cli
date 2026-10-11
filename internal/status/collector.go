@@ -22,28 +22,29 @@ import (
 
 // Collector gathers status metrics from the system, GPU, and services.
 type Collector struct {
-	nodeName        string
-	configDir       string
-	services        []ServiceConfig
-	startTime       time.Time
-	modelDiscovery  *ModelDiscovery
-	capabilities    *NodeCapabilities                // cached capabilities (set once at startup)
-	workerLiveness  func() *WorkerLiveness           // live worker consume-loop liveness (issue #548), optional
-	swapStats       func() *SwapActivity             // live model-hotswap activity (citadel #717), optional
-	reconcileHealth func() *ReconcileHealth          // live full-wipe-guard refusal state (citadel #742), optional
-	idleTracker     *IdleTracker                     // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
-	fpIdleTracker   *FootprintIdleTracker            // footprint-derived idle for engines #416 can't scrape (citadel #421)
-	netIdleTracker  *IdleTracker                     // network-activity idle for non-vLLM services (citadel #433)
-	reqLog          *requestLog                      // node-routed request log, every engine (citadel #691)
-	pinnedServices  map[string]bool                  // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
-	modelHotswap    bool                             // advertise installed-vs-resident models (citadel #632)
-	reservations    func() []GPUReservation          // live job-scoped GPU reservations (citadel #832), optional
-	laneActivity    func() []LaneActivity            // live bounded-execution-lane activity (citadel #908), optional
-	pairingDisplay  func() *PairingDisplayCapability // live pairing-display capability probe (citadel #659), optional
-	cacheReport     func() *CacheReport              // live cache-index attribution (citadel #682 P3), optional
-	jobTypes        func() []string                  // live registered worker job types (aceteam #9962), optional
-	permissions     func() *config.Permissions       // authoritative node permission policy, optional
-	appPods         func() []AppInfo                 // live hosted-app pod entries (CRAM A1, aceteam#9672), optional
+	nodeName         string
+	configDir        string
+	services         []ServiceConfig
+	startTime        time.Time
+	modelDiscovery   *ModelDiscovery
+	capabilities     *NodeCapabilities                 // cached capabilities (set once at startup)
+	workerLiveness   func() *WorkerLiveness            // live worker consume-loop liveness (issue #548), optional
+	swapStats        func() *SwapActivity              // live model-hotswap activity (citadel #717), optional
+	reconcileHealth  func() *ReconcileHealth           // live full-wipe-guard refusal state (citadel #742), optional
+	idleTracker      *IdleTracker                      // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
+	fpIdleTracker    *FootprintIdleTracker             // footprint-derived idle for engines #416 can't scrape (citadel #421)
+	netIdleTracker   *IdleTracker                      // network-activity idle for non-vLLM services (citadel #433)
+	reqLog           *requestLog                       // node-routed request log, every engine (citadel #691)
+	pinnedServices   map[string]bool                   // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
+	modelHotswap     bool                              // advertise installed-vs-resident models (citadel #632)
+	reservations     func() []GPUReservation           // live job-scoped GPU reservations (citadel #832), optional
+	laneActivity     func() []LaneActivity             // live bounded-execution-lane activity (citadel #908), optional
+	pairingDisplay   func() *PairingDisplayCapability  // live pairing-display capability probe (citadel #659), optional
+	cacheReport      func() *CacheReport               // live cache-index attribution (citadel #682 P3), optional
+	jobTypes         func() []string                   // live registered worker job types (aceteam #9962), optional
+	permissions      func() *config.Permissions        // authoritative node permission policy, optional
+	appPods          func() []AppInfo                  // live hosted-app pod entries (CRAM A1, aceteam#9672), optional
+	sandboxedModules func() *SandboxedModuleCapability // generic sandboxed-module runtime availability (citadel-cli#1288), optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -125,33 +126,41 @@ type CollectorConfig struct {
 	// runtime / catalog import, mirroring Reservations/PinnedServices. Optional:
 	// nil on a pure status node or a legacy build leaves Apps unchanged.
 	AppPods func() []AppInfo
+	// SandboxedModules, when set, returns the node's generic sandboxed-module
+	// runtime availability (citadel-cli#1288), attached to
+	// NodeStatus.Capabilities.SandboxedModules. Injected from cmd (projected from
+	// jobs.ProbeSandboxedRuntime) so internal/status stays free of the container
+	// runtime / catalog import, mirroring AppPods. Optional: nil on a legacy build
+	// or a node with no provider wired leaves the capability omitted.
+	SandboxedModules func() *SandboxedModuleCapability
 }
 
 // NewCollector creates a new status collector.
 func NewCollector(cfg CollectorConfig) *Collector {
 	return &Collector{
-		nodeName:        cfg.NodeName,
-		configDir:       cfg.ConfigDir,
-		services:        cfg.Services,
-		startTime:       time.Now(),
-		modelDiscovery:  NewModelDiscovery(),
-		capabilities:    cfg.Capabilities,
-		workerLiveness:  cfg.WorkerLiveness,
-		swapStats:       cfg.SwapStats,
-		reconcileHealth: cfg.ReconcileHealth,
-		idleTracker:     NewIdleTracker(IdleThresholdSeconds()),
-		fpIdleTracker:   NewFootprintIdleTracker(),
-		netIdleTracker:  NewIdleTracker(IdleThresholdSeconds()),
-		reqLog:          nodeRequestLog,
-		pinnedServices:  toStringSet(cfg.PinnedServices),
-		modelHotswap:    cfg.ModelHotswap,
-		reservations:    cfg.Reservations,
-		laneActivity:    cfg.LaneActivity,
-		pairingDisplay:  cfg.PairingDisplay,
-		cacheReport:     cfg.CacheReport,
-		jobTypes:        cfg.JobTypes,
-		permissions:     cfg.PermissionsProvider,
-		appPods:         cfg.AppPods,
+		nodeName:         cfg.NodeName,
+		configDir:        cfg.ConfigDir,
+		services:         cfg.Services,
+		startTime:        time.Now(),
+		modelDiscovery:   NewModelDiscovery(),
+		capabilities:     cfg.Capabilities,
+		workerLiveness:   cfg.WorkerLiveness,
+		swapStats:        cfg.SwapStats,
+		reconcileHealth:  cfg.ReconcileHealth,
+		idleTracker:      NewIdleTracker(IdleThresholdSeconds()),
+		fpIdleTracker:    NewFootprintIdleTracker(),
+		netIdleTracker:   NewIdleTracker(IdleThresholdSeconds()),
+		reqLog:           nodeRequestLog,
+		pinnedServices:   toStringSet(cfg.PinnedServices),
+		modelHotswap:     cfg.ModelHotswap,
+		reservations:     cfg.Reservations,
+		laneActivity:     cfg.LaneActivity,
+		pairingDisplay:   cfg.PairingDisplay,
+		cacheReport:      cfg.CacheReport,
+		jobTypes:         cfg.JobTypes,
+		permissions:      cfg.PermissionsProvider,
+		appPods:          cfg.AppPods,
+		sandboxedModules: cfg.SandboxedModules,
 	}
 }
 
@@ -499,6 +508,15 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// surfaces never appear dispatchable.
 	if c.jobTypes != nil {
 		status.Capabilities.JobTypes = c.jobTypes()
+	}
+
+	// Advertise the generic sandboxed-module runtime availability (citadel-cli
+	// #1288) so a dispatcher routes untrusted-input helper work only to capable
+	// nodes. The provider is the single probe shared with the dispatch guard, so
+	// the heartbeat and node-side refusal can never disagree. Additive: a nil
+	// provider leaves the capability omitted.
+	if c.sandboxedModules != nil {
+		status.Capabilities.SandboxedModules = c.sandboxedModules()
 	}
 
 	// Attach live worker consume-loop liveness so the platform can distinguish a

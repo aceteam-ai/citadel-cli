@@ -507,6 +507,35 @@ type NodeCapabilities struct {
 	// available. Clients use it to choose H.264 streaming and fall back to noVNC
 	// when absent. Additive to the four flags above (aceteam#4250).
 	H264 *bool `json:"h264,omitempty"`
+
+	// SandboxedModules advertises whether this node can run the generic
+	// sandboxed-module runtime (citadel-cli#1288): a container runtime that can
+	// enforce the profile's no-network / read-only / cgroup-limited posture for
+	// untrusted on-node helpers (extraction, OCR, media probing, archive
+	// unpacking). Probed once at startup and injected from cmd via
+	// CollectorConfig (internal/status must not import the container runtime /
+	// catalog layer, mirroring AppPods/Reservations). A dispatcher uses it to
+	// route sandboxed work only to capable nodes; the node-side backstop is the
+	// typed jobs.ErrSandboxedModuleUnavailable dispatch refusal. Additive/
+	// omitempty: nil on a legacy build or a node with no provider wired.
+	SandboxedModules *SandboxedModuleCapability `json:"sandboxed_modules,omitempty"`
+}
+
+// SandboxedModuleCapability is the heartbeat view of the node's generic
+// sandboxed-module runtime availability (citadel-cli#1288). It is a plain data
+// type so internal/status stays free of the container-runtime import; cmd
+// projects jobs.SandboxedRuntimeStatus into it.
+type SandboxedModuleCapability struct {
+	// Available is true when a container runtime is selected, reachable, and can
+	// enforce the sandbox profile's cgroup limits.
+	Available bool `json:"available"`
+	// Reason explains a false Available (empty when Available is true).
+	Reason string `json:"reason,omitempty"`
+	// Modules optionally lists the sandboxed helper modules whose images are
+	// present locally (and therefore runnable). Empty until a registry of
+	// sandboxed modules is wired (e.g. by citadel-cli#1264); a dispatcher reads
+	// Available alone until then.
+	Modules []string `json:"modules,omitempty"`
 }
 
 // HypervisorInfo describes a detected hypervisor on the node.
