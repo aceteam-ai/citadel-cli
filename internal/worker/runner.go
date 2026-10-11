@@ -1672,6 +1672,17 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		}
 	}
 
+	// Flow attribution from the job envelope (aceteam#10876 / citadel-cli#1287),
+	// so central fabric_run_work can join this node's work to a flow run. The
+	// producer spellings match the aceteam backend (flow_run_id / flow_node_id /
+	// delegated_node_id / node_uid / receipt_ids). These are read from the decoded
+	// payload; absent keys leave the record field empty.
+	r.FlowRunID = payloadString(job.Payload, "flow_run_id")
+	r.FlowNodeID = payloadString(job.Payload, "flow_node_id")
+	r.DelegatedNodeID = payloadString(job.Payload, "delegated_node_id")
+	r.NodeUID = payloadString(job.Payload, "node_uid")
+	r.ReceiptIDs = payloadStringSlice(job.Payload, "receipt_ids")
+
 	// Extract usage metrics from result output (_usage_* keys). These are set
 	// directly on Output by NATIVE worker handlers (e.g. llm_inference).
 	if result != nil && result.Output != nil {
@@ -1689,6 +1700,13 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		// "usage key fix": without it a FILE_INDEX/embedding job records zero
 		// tokens/bytes and no work attribution.
 		applyNestedUsage(&r, result.Output)
+		// A NATIVE handler (llm_inference, citadel-cli#1287) carries its `usage`
+		// object as a TOP-LEVEL map (not wrapped as a string). The runner-signed
+		// work-receipt path merges attribution into that same map, so decode it
+		// here too to carry origin/action/org_id/units/manifest onto the record.
+		if usg, ok := result.Output["usage"].(map[string]any); ok {
+			applyUsageMap(&r, usg)
+		}
 	}
 
 	if err != nil {
@@ -1704,11 +1722,11 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 
 // applyNestedUsage decodes a legacy handler's JSON output (wrapped as a string
 // under Output["output"]) and, when it carries a nested `usage` object, carries
-// the work attribution, typed units, receipt binding, and token/byte metrics
-// onto the usage record (aceteam#10876 C7). It is a no-op for an output that is
-// not a JSON object or has no `usage` map, so native handlers and non-work jobs
-// are unaffected. Token/byte fields are only taken from the nested object when
-// the top-level _usage_* read did not already set them (native handlers win).
+// the work attribution onto the usage record (aceteam#10876 C7). It is a no-op
+// for an output that is not a JSON object or has no `usage` map, so non-work legacy
+// jobs are unaffected. A NATIVE handler (e.g. llm_inference, citadel-cli#1287)
+// carries its `usage` object as a top-level map instead; buildUsageRecord calls
+// applyUsageMap directly for that case.
 func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
 	raw, ok := output["output"].(string)
 	if !ok || raw == "" {
@@ -1722,7 +1740,18 @@ func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
 	if !ok {
 		return
 	}
+	applyUsageMap(r, usg)
+}
 
+// applyUsageMap carries work attribution, typed units, receipt binding, and
+// token/byte metrics from a decoded `usage` object onto the record. Token/byte
+// fields are only taken from the object when the native _usage_* read did not
+// already set them (native handlers win). Shared by the legacy nested-string
+// path (applyNestedUsage) and the native top-level-map path.
+func applyUsageMap(r *usage.UsageRecord, usg map[string]any) {
+	if usg == nil {
+		return
+	}
 	if s, ok := usg["origin"].(string); ok {
 		r.Origin = s
 	}
@@ -1742,7 +1771,7 @@ func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
 		r.Units = unitsFromAny(units)
 	}
 	// Token/byte metrics: prefer a value already set from the native _usage_*
-	// path; otherwise take the nested object's.
+	// path; otherwise take the object's.
 	if r.PromptTokens == 0 {
 		r.PromptTokens = intFromOutput(usg, "prompt_tokens")
 	}
@@ -1757,6 +1786,40 @@ func applyNestedUsage(r *usage.UsageRecord, output map[string]any) {
 	}
 	if r.ResponseBytes == 0 {
 		r.ResponseBytes = intFromOutput(usg, "response_bytes")
+	}
+}
+
+// payloadStringSlice reads a []string from a decoded job payload. It accepts a
+// JSON array (decoded as []any of strings); a bare string yields a single-element
+// slice. Absent or malformed values yield nil.
+func payloadStringSlice(payload map[string]any, key string) []string {
+	if payload == nil {
+		return nil
+	}
+	switch v := payload[key].(type) {
+	case []string:
+		if len(v) == 0 {
+			return nil
+		}
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, e := range v {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []string{v}
+	default:
+		return nil
 	}
 }
 

@@ -11,10 +11,13 @@ import (
 
 // schemaVersion is the current job_usage schema version, tracked in SQLite's
 // PRAGMA user_version. v2 (aceteam#10876 C7) adds the work-attribution + typed-
-// unit + receipt columns. A fresh DB is created at the current version; an
-// existing v1 DB is migrated idempotently by migrateSchema. This is a node-local
-// SQLite file — no external migration tooling is involved.
-const schemaVersion = 2
+// unit + receipt columns; v3 (citadel-cli#1287) adds the flow-attribution columns
+// (flow_run_id / flow_node_id / delegated_node_id / node_uid / receipt_ids). A
+// fresh DB is created at the current version; an existing older DB is migrated
+// idempotently by migrateSchema. This is a node-local SQLite file — no external
+// migration tooling is involved, and every added column is NOT NULL DEFAULT ” so
+// an OLDER binary reopening a newer DB still reads and writes cleanly.
+const schemaVersion = 3
 
 // schema is the full current-version table (applied to a fresh DB). An existing
 // older DB is upgraded by migrateSchema's ADD COLUMN path, not by re-running this.
@@ -42,6 +45,11 @@ CREATE TABLE IF NOT EXISTS job_usage (
     units_json              TEXT NOT NULL DEFAULT '',
     receipt_manifest_sha256 TEXT NOT NULL DEFAULT '',
     receipt_signed          INTEGER NOT NULL DEFAULT 0,
+    flow_run_id             TEXT NOT NULL DEFAULT '',
+    flow_node_id            TEXT NOT NULL DEFAULT '',
+    delegated_node_id       TEXT NOT NULL DEFAULT '',
+    node_uid                TEXT NOT NULL DEFAULT '',
+    receipt_ids             TEXT NOT NULL DEFAULT '',
     synced                  INTEGER NOT NULL DEFAULT 0,
     created_at              TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -57,6 +65,17 @@ var v2Columns = []struct{ name, ddl string }{
 	{"units_json", "ALTER TABLE job_usage ADD COLUMN units_json TEXT NOT NULL DEFAULT ''"},
 	{"receipt_manifest_sha256", "ALTER TABLE job_usage ADD COLUMN receipt_manifest_sha256 TEXT NOT NULL DEFAULT ''"},
 	{"receipt_signed", "ALTER TABLE job_usage ADD COLUMN receipt_signed INTEGER NOT NULL DEFAULT 0"},
+}
+
+// v3Columns are the flow-attribution columns added in schema v3 (citadel-cli#1287),
+// applied via ADD COLUMN to an existing v1/v2 DB. All NOT NULL DEFAULT ” so both
+// old rows and an older binary reopening the DB read and write cleanly.
+var v3Columns = []struct{ name, ddl string }{
+	{"flow_run_id", "ALTER TABLE job_usage ADD COLUMN flow_run_id TEXT NOT NULL DEFAULT ''"},
+	{"flow_node_id", "ALTER TABLE job_usage ADD COLUMN flow_node_id TEXT NOT NULL DEFAULT ''"},
+	{"delegated_node_id", "ALTER TABLE job_usage ADD COLUMN delegated_node_id TEXT NOT NULL DEFAULT ''"},
+	{"node_uid", "ALTER TABLE job_usage ADD COLUMN node_uid TEXT NOT NULL DEFAULT ''"},
+	{"receipt_ids", "ALTER TABLE job_usage ADD COLUMN receipt_ids TEXT NOT NULL DEFAULT ''"},
 }
 
 // Store provides SQLite-backed storage for usage records.
@@ -117,7 +136,13 @@ func migrateSchema(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	for _, col := range v2Columns {
+	// Each added column is check-then-ADD against table_info (SQLite errors on a
+	// duplicate ADD COLUMN and older SQLite lacks ADD COLUMN IF NOT EXISTS), so a
+	// v1->v3 or v2->v3 upgrade applies only the columns actually missing.
+	var toAdd []struct{ name, ddl string }
+	toAdd = append(toAdd, v2Columns...)
+	toAdd = append(toAdd, v3Columns...)
+	for _, col := range toAdd {
 		if _, ok := existing[col.name]; ok {
 			continue
 		}
@@ -170,6 +195,14 @@ func (s *Store) Insert(r UsageRecord) error {
 		}
 		unitsJSON = string(b)
 	}
+	receiptIDsJSON := ""
+	if len(r.ReceiptIDs) > 0 {
+		b, err := json.Marshal(r.ReceiptIDs)
+		if err != nil {
+			return fmt.Errorf("marshal receipt_ids: %w", err)
+		}
+		receiptIDsJSON = string(b)
+	}
 	_, err := s.db.Exec(`
 		INSERT OR IGNORE INTO job_usage (
 			job_id, job_type, backend, model, status,
@@ -178,8 +211,9 @@ func (s *Store) Insert(r UsageRecord) error {
 			request_bytes, response_bytes,
 			error_message, node_id,
 			origin, org_id, work_action, units_json,
-			receipt_manifest_sha256, receipt_signed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			receipt_manifest_sha256, receipt_signed,
+			flow_run_id, flow_node_id, delegated_node_id, node_uid, receipt_ids
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.JobID, r.JobType, r.Backend, r.Model, r.Status,
 		r.StartedAt.UTC().Format(time.RFC3339), r.CompletedAt.UTC().Format(time.RFC3339), r.DurationMs,
 		r.PromptTokens, r.CompletionTokens, r.TotalTokens,
@@ -187,6 +221,7 @@ func (s *Store) Insert(r UsageRecord) error {
 		r.ErrorMessage, r.NodeID,
 		r.Origin, r.OrgID, r.WorkAction, unitsJSON,
 		r.ReceiptManifestSHA256, boolToInt(r.ReceiptSigned),
+		r.FlowRunID, r.FlowNodeID, r.DelegatedNodeID, r.NodeUID, receiptIDsJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("insert usage record: %w", err)
@@ -210,7 +245,8 @@ func (s *Store) QueryUnsynced(limit int) ([]UsageRecord, error) {
 		       request_bytes, response_bytes,
 		       error_message, node_id,
 		       origin, org_id, work_action, units_json,
-		       receipt_manifest_sha256, receipt_signed
+		       receipt_manifest_sha256, receipt_signed,
+		       flow_run_id, flow_node_id, delegated_node_id, node_uid, receipt_ids
 		FROM job_usage
 		WHERE synced = 0
 		ORDER BY id ASC
@@ -223,7 +259,7 @@ func (s *Store) QueryUnsynced(limit int) ([]UsageRecord, error) {
 	var records []UsageRecord
 	for rows.Next() {
 		var r UsageRecord
-		var startedAt, completedAt, unitsJSON string
+		var startedAt, completedAt, unitsJSON, receiptIDsJSON string
 		var receiptSigned int
 		if err := rows.Scan(
 			&r.ID, &r.JobID, &r.JobType, &r.Backend, &r.Model, &r.Status,
@@ -233,6 +269,7 @@ func (s *Store) QueryUnsynced(limit int) ([]UsageRecord, error) {
 			&r.ErrorMessage, &r.NodeID,
 			&r.Origin, &r.OrgID, &r.WorkAction, &unitsJSON,
 			&r.ReceiptManifestSHA256, &receiptSigned,
+			&r.FlowRunID, &r.FlowNodeID, &r.DelegatedNodeID, &r.NodeUID, &receiptIDsJSON,
 		); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
@@ -247,6 +284,12 @@ func (s *Store) QueryUnsynced(limit int) ([]UsageRecord, error) {
 			var units map[string]int64
 			if err := json.Unmarshal([]byte(unitsJSON), &units); err == nil {
 				r.Units = units
+			}
+		}
+		if receiptIDsJSON != "" {
+			var ids []string
+			if err := json.Unmarshal([]byte(receiptIDsJSON), &ids); err == nil {
+				r.ReceiptIDs = ids
 			}
 		}
 		records = append(records, r)

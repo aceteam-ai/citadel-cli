@@ -337,7 +337,12 @@ CREATE TABLE job_usage (
 	if err != nil {
 		t.Fatalf("tableColumns: %v", err)
 	}
-	for _, c := range []string{"origin", "org_id", "work_action", "units_json", "receipt_manifest_sha256", "receipt_signed"} {
+	for _, c := range []string{
+		"origin", "org_id", "work_action", "units_json", "receipt_manifest_sha256", "receipt_signed",
+		// v3 flow-attribution columns (citadel-cli#1287) are applied by the same
+		// check-then-ADD migration loop, so a v1 DB upgrades straight to v3.
+		"flow_run_id", "flow_node_id", "delegated_node_id", "node_uid", "receipt_ids",
+	} {
 		if _, ok := cols[c]; !ok {
 			t.Errorf("migrated DB missing column %q", c)
 		}
@@ -369,6 +374,85 @@ CREATE TABLE job_usage (
 		Origin: "dispatched", WorkAction: "index", Units: map[string]int64{"files_indexed": 1},
 	}); err != nil {
 		t.Fatalf("insert into migrated DB: %v", err)
+	}
+}
+
+// TestFlowAttributionRoundTrip pins that the v3 flow-attribution fields
+// (citadel-cli#1287) survive Insert -> QueryUnsynced, including receipt_ids as a
+// JSON slice.
+func TestFlowAttributionRoundTrip(t *testing.T) {
+	store, err := OpenStore(tempDBPath(t))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	rec := UsageRecord{
+		JobID:           "flow-job-1",
+		JobType:         "llm_inference",
+		Status:          "success",
+		StartedAt:       now,
+		CompletedAt:     now.Add(time.Second),
+		DurationMs:      1000,
+		NodeID:          "node-1",
+		FlowRunID:       "fr_abc",
+		FlowNodeID:      "fn_def",
+		DelegatedNodeID: "node-99",
+		NodeUID:         "uid_777",
+		ReceiptIDs:      []string{"rcpt_1", "rcpt_2"},
+	}
+	if err := store.Insert(rec); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	got, err := store.QueryUnsynced(10)
+	if err != nil {
+		t.Fatalf("QueryUnsynced: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(got))
+	}
+	r := got[0]
+	if r.FlowRunID != "fr_abc" || r.FlowNodeID != "fn_def" || r.DelegatedNodeID != "node-99" || r.NodeUID != "uid_777" {
+		t.Errorf("flow attribution = (%q,%q,%q,%q)", r.FlowRunID, r.FlowNodeID, r.DelegatedNodeID, r.NodeUID)
+	}
+	if len(r.ReceiptIDs) != 2 || r.ReceiptIDs[0] != "rcpt_1" || r.ReceiptIDs[1] != "rcpt_2" {
+		t.Errorf("receipt_ids = %v", r.ReceiptIDs)
+	}
+}
+
+// TestSchemaV3DowngradeSafe proves a hypothetical OLDER binary (one that writes
+// only the v2 columns) can still INSERT into a v3 DB: every v3 column is NOT NULL
+// DEFAULT ”, so an insert that omits them succeeds. This is the property that
+// makes the ADD COLUMN migration downgrade-safe (citadel-cli#1287).
+func TestSchemaV3DowngradeSafe(t *testing.T) {
+	store, err := OpenStore(tempDBPath(t))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	// A v2-shaped INSERT (no flow_run_id / ... / receipt_ids columns listed).
+	if _, err := store.db.Exec(`
+		INSERT INTO job_usage (
+			job_id, job_type, backend, model, status,
+			started_at, completed_at, duration_ms,
+			origin, org_id, work_action, units_json,
+			receipt_manifest_sha256, receipt_signed
+		) VALUES ('old-binary-row', 'llm_inference', '', '', 'success', ?, ?, 10, 'dispatched', 'org_1', 'inference', '', '', 0)`,
+		now, now); err != nil {
+		t.Fatalf("v2-shaped insert into v3 DB failed (not downgrade-safe): %v", err)
+	}
+	got, err := store.QueryUnsynced(10)
+	if err != nil {
+		t.Fatalf("QueryUnsynced: %v", err)
+	}
+	if len(got) != 1 || got[0].JobID != "old-binary-row" {
+		t.Fatalf("v2-shaped row did not read back: %+v", got)
+	}
+	if got[0].FlowRunID != "" || len(got[0].ReceiptIDs) != 0 {
+		t.Errorf("v3 fields should default empty for a v2-shaped insert, got %+v", got[0])
 	}
 }
 

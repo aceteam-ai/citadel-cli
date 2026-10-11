@@ -3901,6 +3901,13 @@ type usageRecordJSON struct {
 	Units                 map[string]int64 `json:"units,omitempty"`
 	ReceiptManifestSHA256 string           `json:"receiptManifestSha256,omitempty"`
 	ReceiptSigned         bool             `json:"receiptSigned,omitempty"`
+	// Flow attribution (citadel-cli#1287), carried by the outbox so central
+	// fabric_run_work can join node work to a flow run.
+	FlowRunID       string   `json:"flowRunId,omitempty"`
+	FlowNodeID      string   `json:"flowNodeId,omitempty"`
+	DelegatedNodeID string   `json:"delegatedNodeId,omitempty"`
+	NodeUID         string   `json:"nodeUid,omitempty"`
+	ReceiptIDs      []string `json:"receiptIds,omitempty"`
 }
 
 func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
@@ -3924,6 +3931,11 @@ func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
 		Units:                 r.Units,
 		ReceiptManifestSHA256: r.ReceiptManifestSHA256,
 		ReceiptSigned:         r.ReceiptSigned,
+		FlowRunID:             r.FlowRunID,
+		FlowNodeID:            r.FlowNodeID,
+		DelegatedNodeID:       r.DelegatedNodeID,
+		NodeUID:               r.NodeUID,
+		ReceiptIDs:            r.ReceiptIDs,
 	}
 }
 

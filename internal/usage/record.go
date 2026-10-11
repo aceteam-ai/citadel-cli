@@ -48,6 +48,19 @@ type UsageRecord struct {
 	ReceiptManifestSHA256 string
 	ReceiptSigned         bool
 
+	// Flow attribution (aceteam#10876 / citadel-cli#1287). Populated from the job
+	// envelope so central fabric_run_work can join this node's work to a flow run.
+	// FlowRunID / FlowNodeID identify the orchestrating flow run and its node;
+	// DelegatedNodeID is the node a parent delegated this work to; NodeUID is the
+	// fabric/platform node UID from the envelope (distinct from NodeID, the
+	// Headscale numeric id). ReceiptIDs are receipt identifiers carried by the
+	// envelope (stored as JSON text).
+	FlowRunID       string
+	FlowNodeID      string
+	DelegatedNodeID string
+	NodeUID         string
+	ReceiptIDs      []string
+
 	// Sync status
 	Synced bool
 }
