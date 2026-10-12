@@ -3935,11 +3935,14 @@ type usageStreamEntry struct {
 }
 
 // usageRecordJSON is the JSON representation published to Redis. The payload is
-// v3 (usage.PayloadVersion) for citadel-cli#1287: on top of C7's work attribution
-// (origin/orgId/workAction), typed units, and receipt manifest binding, it adds
-// the flow-attribution fields (flowRunId/flowNodeId/delegatedNodeId/nodeUid/
-// receiptIds) so central fabric_run_work can join node work to a flow run.
-// ErrorMessage is intentionally excluded to avoid leaking internal error details.
+// v4 (usage.PayloadVersion) for aceteam#11146 / citadel-cli#1291: on top of C7's
+// work attribution (origin/orgId/workAction), typed units, the receipt manifest
+// binding, and #1287's flow-attribution fields (flowRunId/flowNodeId/
+// delegatedNodeId/nodeUid/receiptIds), it adds the signed work-receipt BODIES
+// (receipts[] + receiptsTruncated) so central's verify_and_store_work_receipt()
+// has the bytes to attest. Each receipts[] element is a v2 AEP receipt map
+// EXACTLY as aep.AEPReceiptV2.ToMap() emits it (no wrapper). ErrorMessage is
+// intentionally excluded to avoid leaking internal error details.
 type usageRecordJSON struct {
 	JobID                 string           `json:"jobId"`
 	JobType               string           `json:"jobType"`
@@ -3967,6 +3970,12 @@ type usageRecordJSON struct {
 	DelegatedNodeID string   `json:"delegatedNodeId,omitempty"`
 	NodeUID         string   `json:"nodeUid,omitempty"`
 	ReceiptIDs      []string `json:"receiptIds,omitempty"`
+	// Signed work-receipt bodies (aceteam#11146 / citadel-cli#1291). Receipts is
+	// the array central's NodeUsageRecord.receipts (list[dict]) attests; each
+	// element is a v2 receipt map verbatim from ToMap(). ReceiptsTruncated is the
+	// count dropped to keep the record under the stream bound (0/absent when none).
+	Receipts          []map[string]any `json:"receipts,omitempty"`
+	ReceiptsTruncated int              `json:"receiptsTruncated,omitempty"`
 }
 
 func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
@@ -3995,6 +4004,8 @@ func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
 		DelegatedNodeID:       r.DelegatedNodeID,
 		NodeUID:               r.NodeUID,
 		ReceiptIDs:            r.ReceiptIDs,
+		Receipts:              r.Receipts,
+		ReceiptsTruncated:     r.ReceiptsTruncated,
 	}
 }
 

@@ -2,6 +2,7 @@ package usage
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -340,8 +341,10 @@ CREATE TABLE job_usage (
 	for _, c := range []string{
 		"origin", "org_id", "work_action", "units_json", "receipt_manifest_sha256", "receipt_signed",
 		// v3 flow-attribution columns (citadel-cli#1287) are applied by the same
-		// check-then-ADD migration loop, so a v1 DB upgrades straight to v3.
+		// check-then-ADD migration loop, so a v1 DB upgrades straight to v4.
 		"flow_run_id", "flow_node_id", "delegated_node_id", "node_uid", "receipt_ids",
+		// v4 signed work-receipt-body columns (aceteam#11146 / citadel-cli#1291).
+		"receipts_json", "receipts_truncated",
 	} {
 		if _, ok := cols[c]; !ok {
 			t.Errorf("migrated DB missing column %q", c)
@@ -453,6 +456,127 @@ func TestSchemaV3DowngradeSafe(t *testing.T) {
 	}
 	if got[0].FlowRunID != "" || len(got[0].ReceiptIDs) != 0 {
 		t.Errorf("v3 fields should default empty for a v2-shaped insert, got %+v", got[0])
+	}
+}
+
+// TestWorkReceiptsRoundTrip pins that the v4 signed work-receipt bodies
+// (aceteam#11146 / citadel-cli#1291) survive Insert -> QueryUnsynced byte-for-byte
+// as JSON, carry N>1 receipts on ONE record, and preserve ReceiptsTruncated.
+func TestWorkReceiptsRoundTrip(t *testing.T) {
+	store, err := OpenStore(tempDBPath(t))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	receipts := []map[string]any{
+		{"receipt_version": "2", "job_id": "work-rcpt-1", "action": "index", "signature": "AAAA", "score": float64(0), "claims_checked": float64(0), "grounded": false},
+		{"receipt_version": "2", "job_id": "work-rcpt-1", "action": "index", "signature": "BBBB", "score": float64(0), "claims_checked": float64(0), "grounded": false},
+	}
+	rec := UsageRecord{
+		JobID:             "work-rcpt-1",
+		JobType:           "FILE_INDEX",
+		Status:            "success",
+		StartedAt:         now,
+		CompletedAt:       now.Add(time.Second),
+		DurationMs:        1000,
+		NodeID:            "node-1",
+		Origin:            OriginDispatchedForTest,
+		WorkAction:        "index",
+		ReceiptSigned:     true,
+		Receipts:          receipts,
+		ReceiptsTruncated: 3,
+	}
+	if err := store.Insert(rec); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	got, err := store.QueryUnsynced(10)
+	if err != nil {
+		t.Fatalf("QueryUnsynced: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(got))
+	}
+	r := got[0]
+	if len(r.Receipts) != 2 {
+		t.Fatalf("expected 2 receipts on one record, got %d", len(r.Receipts))
+	}
+	if r.ReceiptsTruncated != 3 {
+		t.Errorf("ReceiptsTruncated = %d, want 3", r.ReceiptsTruncated)
+	}
+	// Byte-for-byte JSON equality (float64 round-trips identically; int-vs-float64
+	// is irrelevant because both render as "0").
+	wantJSON, _ := json.Marshal(receipts)
+	gotJSON, _ := json.Marshal(r.Receipts)
+	if string(wantJSON) != string(gotJSON) {
+		t.Errorf("receipts did not round-trip:\n got %s\nwant %s", gotJSON, wantJSON)
+	}
+}
+
+// TestSchemaV4DowngradeSafe proves a hypothetical OLDER binary (one that writes
+// only the v2/v3 columns) can still INSERT into a v4 DB: both v4 columns are NOT
+// NULL DEFAULT, so an insert that omits them succeeds and the new fields default
+// empty (aceteam#11146 / citadel-cli#1291).
+func TestSchemaV4DowngradeSafe(t *testing.T) {
+	store, err := OpenStore(tempDBPath(t))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	// A v3-shaped INSERT (no receipts_json / receipts_truncated columns listed).
+	if _, err := store.db.Exec(`
+		INSERT INTO job_usage (
+			job_id, job_type, backend, model, status,
+			started_at, completed_at, duration_ms,
+			origin, org_id, work_action, units_json,
+			receipt_manifest_sha256, receipt_signed,
+			flow_run_id, flow_node_id, delegated_node_id, node_uid, receipt_ids
+		) VALUES ('v3-binary-row', 'FILE_INDEX', '', '', 'success', ?, ?, 10, 'dispatched', 'org_1', 'index', '', '', 0, '', '', '', '', '')`,
+		now, now); err != nil {
+		t.Fatalf("v3-shaped insert into v4 DB failed (not downgrade-safe): %v", err)
+	}
+	got, err := store.QueryUnsynced(10)
+	if err != nil {
+		t.Fatalf("QueryUnsynced: %v", err)
+	}
+	if len(got) != 1 || got[0].JobID != "v3-binary-row" {
+		t.Fatalf("v3-shaped row did not read back: %+v", got)
+	}
+	if len(got[0].Receipts) != 0 || got[0].ReceiptsTruncated != 0 {
+		t.Errorf("v4 fields should default empty for a v3-shaped insert, got %+v", got[0])
+	}
+}
+
+// TestWorkReceiptsAbsentByDefault pins back-compat: a record with no receipts
+// (every pre-#1291 path, and the local_cli/watcher index paths that never sign)
+// reads back with an empty Receipts slice and zero ReceiptsTruncated.
+func TestWorkReceiptsAbsentByDefault(t *testing.T) {
+	store, err := OpenStore(tempDBPath(t))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := store.Insert(UsageRecord{
+		JobID: "no-receipts", JobType: "FILE_INDEX", Status: "success",
+		StartedAt: now, CompletedAt: now, NodeID: "node-1",
+	}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	got, err := store.QueryUnsynced(10)
+	if err != nil {
+		t.Fatalf("QueryUnsynced: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(got))
+	}
+	if len(got[0].Receipts) != 0 || got[0].ReceiptsTruncated != 0 {
+		t.Errorf("record with no receipts should read back empty, got %+v", got[0])
 	}
 }
 

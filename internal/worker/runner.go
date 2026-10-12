@@ -1778,6 +1778,15 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		if usg, ok := result.Output["usage"].(map[string]any); ok {
 			applyUsageMap(&r, usg)
 		}
+
+		// Signed work-receipt BODIES (aceteam#11146 / citadel-cli#1291): carry the
+		// full v2 AEP receipt maps the handler/runner already produced onto the
+		// record so central's verify_and_store_work_receipt() has the bytes to
+		// attest. Collected here (inside buildUsageRecord) so EVERY terminal branch
+		// — success, failed, retry, cancelled — is covered uniformly, with no
+		// per-branch wiring; in practice only a success carries receipts.
+		receipts := collectWorkReceipts(result.Output)
+		r.Receipts, r.ReceiptsTruncated = boundWorkReceipts(receipts)
 	}
 
 	if err != nil {
@@ -1870,6 +1879,111 @@ func applyUsageMap(r *usage.UsageRecord, usg map[string]any) {
 	if r.ResponseBytes == 0 {
 		r.ResponseBytes = intFromOutput(usg, "response_bytes")
 	}
+}
+
+// usageReceiptsMaxBytes bounds the JSON size of the receipts[] array carried on a
+// single usage record. Central imposes no hard cap but the record rides a Redis
+// stream (direct XAdd) OR an HTTP StreamAdd through the API proxy (whose body cap
+// is unknown to the node), so we keep it WELL under central's documented ~1 MB
+// guidance. A v2 work receipt is ~700 bytes, so this fits hundreds of receipts —
+// far more than any real job signs (one today). When a job somehow exceeds it,
+// receipts are dropped from the TAIL and the count is reported as
+// ReceiptsTruncated (never a silent drop); central marks such a record partially
+// attested.
+const usageReceiptsMaxBytes = 768 * 1024
+
+// collectWorkReceipts gathers the signed v2 work-receipt maps a handler/runner
+// placed in job output under `work_receipts`. The two producer shapes are
+// mutually exclusive per job: a NATIVE runner-signed handler (LLM_INFERENCE,
+// citadel-cli#1287) sets a TOP-LEVEL `work_receipts` ([]map[string]any, in-memory,
+// never crossing a JSON boundary before this read), while a LEGACY handler
+// (FILE_INDEX / embedding, aceteam#10876 C7) has its whole output marshaled to a
+// JSON string under Output["output"], so its `work_receipts` is nested there
+// (decoded as []any of map[string]any). Top-level wins when present (it is the
+// only producer for that job); otherwise the nested legacy string is decoded.
+// This mirrors the existing usage-map dual handling (applyUsageMap vs
+// applyNestedUsage). Returns nil when a job produced no receipts.
+func collectWorkReceipts(output map[string]any) []map[string]any {
+	if output == nil {
+		return nil
+	}
+	if rs := receiptsFromAny(output["work_receipts"]); len(rs) > 0 {
+		return rs
+	}
+	raw, ok := output["output"].(string)
+	if !ok || raw == "" {
+		return nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return nil
+	}
+	return receiptsFromAny(decoded["work_receipts"])
+}
+
+// receiptsFromAny normalizes a `work_receipts` value to []map[string]any. It
+// accepts the native in-memory shape ([]map[string]any) and the
+// JSON-round-tripped legacy shape ([]any whose elements are map[string]any),
+// skipping any element that is not a map. Any other type yields nil.
+func receiptsFromAny(v any) []map[string]any {
+	switch rs := v.(type) {
+	case []map[string]any:
+		out := make([]map[string]any, 0, len(rs))
+		for _, m := range rs {
+			if m != nil {
+				out = append(out, m)
+			}
+		}
+		return out
+	case []any:
+		out := make([]map[string]any, 0, len(rs))
+		for _, e := range rs {
+			if m, ok := e.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// boundWorkReceipts keeps as many receipts as fit (from the front, in order)
+// under usageReceiptsMaxBytes and returns the kept slice plus the count dropped.
+// It NEVER silently drops: whatever does not fit is counted in the returned
+// truncated value so the payload can carry receiptsTruncated and central marks
+// the record partially attested. A receipt that cannot marshal is also counted as
+// dropped rather than kept corrupt. The first receipt is always kept (a single
+// receipt is tiny relative to the budget), so a job that signed at least one
+// never reports "attested nothing" to central. Returns (nil, 0) for no receipts.
+func boundWorkReceipts(receipts []map[string]any) ([]map[string]any, int) {
+	if len(receipts) == 0 {
+		return nil, 0
+	}
+	kept := make([]map[string]any, 0, len(receipts))
+	total := 2 // the enclosing "[]"
+	full := false
+	for _, m := range receipts {
+		if full {
+			break
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			continue // unmarshalable: drop (counted via len(receipts)-len(kept))
+		}
+		size := len(b) + 1 // + a comma separator; a slight over-count is safe
+		if len(kept) > 0 && total+size > usageReceiptsMaxBytes {
+			full = true
+			break
+		}
+		total += size
+		kept = append(kept, m)
+	}
+	truncated := len(receipts) - len(kept)
+	if len(kept) == 0 {
+		return nil, truncated
+	}
+	return kept, truncated
 }
 
 // payloadStringSlice reads a []string from a decoded job payload. It accepts a
