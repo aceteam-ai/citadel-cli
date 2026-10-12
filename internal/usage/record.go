@@ -61,6 +61,19 @@ type UsageRecord struct {
 	NodeUID         string
 	ReceiptIDs      []string
 
+	// Signed work-receipt bodies (aceteam#11146 / citadel-cli#1291). Receipts
+	// carries the FULL v2 AEP work-receipt maps the handler/runner already produced
+	// in job output `work_receipts` (each element is a receipt's own ToMap() shape,
+	// no wrapper), so central's verify_and_store_work_receipt() has the bytes to
+	// attest — previously the node sent only ReceiptManifestSHA256, so every record
+	// landed attestation=unattested. ALL of a job's receipts ride this ONE record
+	// (central upserts ON CONFLICT (node_id, job_id) DO NOTHING). ReceiptsTruncated
+	// is the count of receipts dropped to keep the serialized record well under
+	// central's ~1 MB stream bound; it is never a silent drop — central marks a
+	// record with ReceiptsTruncated>0 as partially attested.
+	Receipts          []map[string]any
+	ReceiptsTruncated int
+
 	// Sync status
 	Synced bool
 }
