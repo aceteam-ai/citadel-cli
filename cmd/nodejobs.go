@@ -48,6 +48,10 @@ type nodeJobHandlerOpts struct {
 	WorkReceiptNodeID string
 	// AllowReadOutsideWorkspace lets read-only file handlers escape the sandbox.
 	AllowReadOutsideWorkspace bool
+	// AuthorizedRoots resolves the operator-bound authorized roots a dispatched
+	// read job may access in addition to the workspace (aceteam#10876 C6). Live
+	// (read per dispatch) so a newly-bound root is honored without a restart.
+	AuthorizedRoots func() []string
 	// ShellDisabled omits SHELL_COMMAND because it cannot execute while disabled.
 	ShellDisabled bool
 	// ShellEnabled reloads the persisted shell permission for each job so a
@@ -114,6 +118,7 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 		WorkReceiptSigner:         opts.WorkReceiptSigner,
 		WorkReceiptNodeID:         opts.WorkReceiptNodeID,
 		AllowReadOutsideWorkspace: opts.AllowReadOutsideWorkspace,
+		AuthorizedRoots:           opts.AuthorizedRoots,
 		ShellDisabled:             opts.ShellDisabled,
 		ShellEnabled:              opts.ShellEnabled,
 		ShellHasPasscode:          opts.ShellHasPasscode,

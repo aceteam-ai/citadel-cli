@@ -57,6 +57,13 @@ const (
 	// (`citadel rag index`). It records to the same ledger but does not sign and
 	// never fails closed.
 	OriginLocalCLI = "local_cli"
+	// OriginWatcher marks work driven by the on-node authorized-roots file
+	// watcher (aceteam#10876 C6, citadel-cli#1273): an incremental re-index
+	// triggered by a change under a bound root. Like OriginLocalCLI it is trusted
+	// local work (not a dispatched job), records to the same ledger, and never
+	// signs or fails closed — it is distinguished only so the ledger can attribute
+	// watcher-driven re-indexing separately from an explicit `citadel rag index`.
+	OriginWatcher = "watcher"
 )
 
 // WorkReceiptConfig carries everything a handler needs to produce a signed work

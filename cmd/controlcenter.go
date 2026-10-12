@@ -2479,6 +2479,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		WorkReceiptSigner:         ccWorkReceiptSigner,
 		WorkReceiptNodeID:         ccWorkReceiptNodeID,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
+		AuthorizedRoots:           authorizedRootsResolver(),
 		ShellDisabled:             !ccPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,
 		ShellHasPasscode:          nodeHasPasscode,

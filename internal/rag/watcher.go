@@ -5,9 +5,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -73,22 +75,44 @@ func (d *debouncer) stop() {
 	}
 }
 
+// UsageSink records one watcher-driven re-index of a root as a usage record
+// (aceteam#10876 C6, origin=watcher). The cmd layer wires the production sink
+// (writing to the node's usage.db); tests inject an in-memory capture. nil means
+// usage recording is disabled — the re-index still runs. It is called once per
+// re-indexed root, after a successful Index, with the elapsed time's start.
+type UsageSink func(root string, res IndexResult, start time.Time)
+
 // Watcher watches the authorized roots and triggers an incremental re-index of
 // the node-local semantic index when files under them change. It is best-effort:
 // construction and operation degrade to a logged warning rather than failing the
 // caller (a watcher problem must never take down `citadel work`).
+//
+// Re-indexing is PER-ROOT: an event under root A re-indexes only A (not every
+// root), both to avoid thrash and so the usage sink attributes work to the root
+// that actually changed.
 type Watcher struct {
 	svc   *Service
 	roots []string
 	fsw   *fsnotify.Watcher
 	deb   *debouncer
 	logf  func(string, ...any)
-	// dbPaths is the set of index.db files (plus their -wal/-shm/-journal
-	// siblings) the re-index itself writes. Events on these are ignored so a root
-	// that happens to CONTAIN the index (e.g. an operator authorizing ~ or
-	// ~/citadel-node) cannot create a self-sustaining index -> DB-write -> event
-	// -> index loop that never idles.
+	// dbPaths is the set of files (plus their -wal/-shm/-journal siblings) the
+	// re-index itself writes — the index DB AND, once IgnorePath is called from
+	// cmd, the usage.db. Events on these are ignored so a root that happens to
+	// CONTAIN them (e.g. an operator authorizing ~ or ~/citadel-node) cannot
+	// create a self-sustaining write -> event -> index -> write loop that never
+	// idles.
 	dbPaths map[string]struct{}
+
+	// dirty is the set of roots with a pending (debounced) re-index; dirtyMu
+	// guards it. loop() marks the specific root an event fell under; a fire
+	// drains and re-indexes exactly those roots.
+	dirtyMu sync.Mutex
+	dirty   map[string]struct{}
+
+	// usageSink, when set, records each re-index as an origin=watcher usage
+	// record. nil disables recording (the re-index still runs).
+	usageSink UsageSink
 
 	// reindexMu serializes re-index runs so a burst can never run two Index calls
 	// over the same DB concurrently.
@@ -107,6 +131,9 @@ func NewWatcher(roots []string, workspaceForDB, modelOverride string) (*Watcher,
 		return nil, err
 	}
 	svc := NewWithRoots(roots, workspaceForDB, modelOverride)
+	// Watcher-driven re-indexing is attributed as origin=watcher on the usage
+	// record (aceteam#10876 C6), distinct from a `citadel rag index` (local_cli).
+	svc.SetOrigin(jobs.OriginWatcher)
 	db := svc.DBPath()
 	dbPaths := map[string]struct{}{
 		db:              {},
@@ -120,9 +147,27 @@ func NewWatcher(roots []string, workspaceForDB, modelOverride string) (*Watcher,
 		fsw:     fsw,
 		logf:    log.Printf,
 		dbPaths: dbPaths,
+		dirty:   make(map[string]struct{}),
 	}
-	w.deb = newDebouncer(defaultDebounceDelay, w.reindexAll)
+	w.deb = newDebouncer(defaultDebounceDelay, w.reindexDirty)
 	return w, nil
+}
+
+// SetUsageSink wires the usage-record sink invoked once per re-indexed root
+// (origin=watcher). nil disables usage recording. Set before Start.
+func (w *Watcher) SetUsageSink(sink UsageSink) { w.usageSink = sink }
+
+// IgnorePath adds p (and its -wal/-shm/-journal siblings) to the self-trigger
+// ignore set, so a file the re-index itself writes under a watched root — the
+// usage.db in particular — cannot create a write -> event -> re-index loop. Call
+// before Start.
+func (w *Watcher) IgnorePath(p string) {
+	if p == "" {
+		return
+	}
+	for _, s := range []string{p, p + "-wal", p + "-shm", p + "-journal"} {
+		w.dbPaths[s] = struct{}{}
+	}
 }
 
 // SetLogf overrides the log function (tests inject a capturing logger).
@@ -131,7 +176,7 @@ func (w *Watcher) SetLogf(f func(string, ...any)) { w.logf = f }
 // SetDebounceDelay overrides the debounce window (tests use a short delay).
 func (w *Watcher) SetDebounceDelay(d time.Duration) {
 	w.deb.stop()
-	w.deb = newDebouncer(d, w.reindexAll)
+	w.deb = newDebouncer(d, w.reindexDirty)
 }
 
 // Start registers watches for every root (recursively), kicks off an initial
@@ -139,8 +184,9 @@ func (w *Watcher) SetDebounceDelay(d time.Duration) {
 // called. It returns immediately; the event loop runs in a goroutine.
 func (w *Watcher) Start(ctx context.Context) {
 	// Index-on-startup: bring the index current with whatever is on disk now,
-	// before we begin reacting to changes. Best-effort (TEI may be down).
-	go w.reindexAll()
+	// before we begin reacting to changes. Best-effort (TEI may be down). This
+	// legitimately re-indexes every root, and each emits an origin=watcher record.
+	go w.reindexRoots(w.roots)
 
 	for _, root := range w.roots {
 		w.addWatchRecursive(root)
@@ -200,10 +246,15 @@ func (w *Watcher) loop(ctx context.Context) {
 					}
 				}
 			}
-			// Any create/write/remove/rename under a root warrants a re-index.
-			// Chmod-only events are ignored (no content change).
+			// Any create/write/remove/rename UNDER a bound root warrants a
+			// re-index of THAT root. Chmod-only events are ignored (no content
+			// change). An event outside every root (which can happen for a watch
+			// that lingered after a root was de-authorized) is dropped — it marks
+			// no root dirty, so it produces no record.
 			if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) != 0 {
-				w.deb.trigger()
+				if root := rootForPath(w.roots, ev.Name); root != "" {
+					w.markDirty(root)
+				}
 			}
 		case err, ok := <-w.fsw.Errors:
 			if !ok {
@@ -214,20 +265,84 @@ func (w *Watcher) loop(ctx context.Context) {
 	}
 }
 
-// reindexAll re-indexes every authorized root. It is serialized so overlapping
-// triggers cannot run concurrent Index calls, and NEVER passes a file_pattern
-// (prune compares against files visited, so a narrowed run would delete siblings
-// from the index). Errors are logged, not fatal.
-func (w *Watcher) reindexAll() {
+// markDirty records that root has a pending change and (re)arms the debouncer.
+// The debounced fire re-indexes exactly the roots marked dirty since the last
+// fire, not every root.
+func (w *Watcher) markDirty(root string) {
+	w.dirtyMu.Lock()
+	w.dirty[root] = struct{}{}
+	w.dirtyMu.Unlock()
+	w.deb.trigger()
+}
+
+// reindexDirty drains the pending dirty-root set and re-indexes exactly those
+// roots. It is the debouncer's fire callback.
+func (w *Watcher) reindexDirty() {
+	w.dirtyMu.Lock()
+	roots := make([]string, 0, len(w.dirty))
+	for r := range w.dirty {
+		roots = append(roots, r)
+	}
+	w.dirty = make(map[string]struct{})
+	w.dirtyMu.Unlock()
+	if len(roots) == 0 {
+		return
+	}
+	w.reindexRoots(roots)
+}
+
+// reindexRoots re-indexes the given roots. It is serialized so overlapping
+// triggers cannot run concurrent Index calls over the same DB, and NEVER passes
+// a file_pattern (prune compares against files visited, so a narrowed run would
+// delete siblings from the index). Each successfully re-indexed root is recorded
+// via the usage sink (origin=watcher). Errors are logged, not fatal.
+func (w *Watcher) reindexRoots(roots []string) {
 	w.reindexMu.Lock()
 	defer w.reindexMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	for _, root := range w.roots {
-		if _, err := w.svc.Index(ctx, root, ""); err != nil {
+	for _, root := range roots {
+		start := time.Now()
+		res, err := w.svc.Index(ctx, root, "")
+		if err != nil {
 			w.logf("citadel search watcher: reindex %s failed: %v", root, err)
+			continue
+		}
+		// Only record meterable work. A re-index that indexed and pruned nothing
+		// (the common case on an index-on-startup over an already-warm index, and
+		// on a debounced fire for a no-content change) did no billable work, so it
+		// writes no ledger row — otherwise an hourly worker restart would spam the
+		// usage ledger with zero-unit rows, one per root.
+		if w.usageSink != nil && (res.FilesIndexed > 0 || res.FilesRemoved > 0) {
+			w.usageSink(root, res, start)
 		}
 	}
+}
+
+// rootForPath returns the authorized root that p resolves under, or "" when p is
+// under none (so an event outside every root produces no record). The check is
+// lexical containment via withinDir (filepath.Rel), not a string prefix, so a
+// sibling like /data/rootEVIL is never matched by /data/root. Watched paths are
+// derived from the already-normalized roots, so a lexical check is sufficient.
+func rootForPath(roots []string, p string) string {
+	for _, r := range roots {
+		if r != "" && withinDir(r, p) {
+			return r
+		}
+	}
+	return ""
+}
+
+// withinDir reports whether target is dir itself or lexically beneath it, using
+// filepath.Rel so /data/root does not match /data/rootEVIL. An un-relatable pair
+// (different volumes on Windows) is treated as outside — failing closed. This
+// mirrors jobs.withinDir (unexported there).
+func withinDir(dir, target string) bool {
+	rel, err := filepath.Rel(dir, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // Close stops the debouncer and the underlying fsnotify watcher. Safe to call

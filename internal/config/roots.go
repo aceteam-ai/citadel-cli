@@ -49,6 +49,33 @@ func LoadRoots(configDir string) *Roots {
 	return r
 }
 
+// LoadRootsFrom reads the authorized-roots allowlist from the FIRST dir in dirs
+// that has a roots.yaml, returning the empty default when none does. dirs are
+// ordered most-authoritative-first: the machine-convergent node config dir
+// first, then a legacy invoker-scoped dir as a read fallback for roots written
+// by a pre-convergence binary (aceteam#10876 C6 / citadel-cli#1273). The cmd
+// layer resolves the dirs (network.GetNodeConfigDir() / platform.ConfigDir());
+// this leaf package never resolves them itself (the cross-context rule in
+// CLAUDE.md). It is a pure function of its args, so it is testable with
+// t.TempDir() dirs and never touches a real node's config.
+//
+// Writes always go to the primary (first) dir via SaveRoots; this read fallback
+// only keeps an upgraded node seeing roots an operator bound before the storage
+// location became convergent.
+func LoadRootsFrom(dirs ...string) *Roots {
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		if data, err := os.ReadFile(filepath.Join(d, rootsFile)); err == nil {
+			r := DefaultRoots()
+			_ = yaml.Unmarshal(data, r)
+			return r
+		}
+	}
+	return DefaultRoots()
+}
+
 // SaveRoots writes the authorized-roots allowlist to the config directory,
 // mirroring SaveEnergy.
 func SaveRoots(configDir string, r *Roots) error {

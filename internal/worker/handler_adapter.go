@@ -211,6 +211,15 @@ type LegacyHandlerOpts struct {
 	// (FILE_READ, FILE_READ_BYTES, FILE_LIST, FILE_SEARCH) access paths
 	// outside the workspace sandbox. Write handlers are unaffected.
 	AllowReadOutsideWorkspace bool
+	// AuthorizedRoots resolves the operator-bound authorized roots a dispatched
+	// read job may access in addition to the workspace (aceteam#10876 C6,
+	// citadel-cli#1273). It is threaded onto every read handler
+	// (FILE_READ/READ_BYTES/READ_RANGE/LIST/SEARCH/INDEX). A func (not a snapshot)
+	// so a root bound via `citadel search roots add` is honored on the next
+	// dispatch without a worker restart; resolved in the cmd layer over the
+	// machine-convergent roots config (network.GetNodeConfigDir()). nil or an
+	// empty result means workspace-only — the behavior before authorized roots.
+	AuthorizedRoots func() []string
 	// ShellDisabled, when true, skips the SHELL_COMMAND handler because every
 	// command would be refused. Wired from the persisted `shell` permission.
 	ShellDisabled bool
@@ -428,17 +437,22 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			gate := opts.FilesEnabled
 			readHandler := jobs.NewFileReadHandler(opts.WorkspaceDir)
 			readHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			readHandler.AuthorizedRoots = opts.AuthorizedRoots
 
 			readBytesHandler := jobs.NewFileReadBytesHandler(opts.WorkspaceDir)
 			readBytesHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			readBytesHandler.AuthorizedRoots = opts.AuthorizedRoots
 			readBytesRangeHandler := jobs.NewFileReadBytesRangeHandler(opts.WorkspaceDir)
 			readBytesRangeHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			readBytesRangeHandler.AuthorizedRoots = opts.AuthorizedRoots
 
 			listHandler := jobs.NewFileListHandler(opts.WorkspaceDir)
 			listHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			listHandler.AuthorizedRoots = opts.AuthorizedRoots
 
 			searchHandler := jobs.NewFileSearchHandler(opts.WorkspaceDir)
 			searchHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			searchHandler.AuthorizedRoots = opts.AuthorizedRoots
 
 			// Node-local semantic index (aceteam#6087). FILE_INDEX walks the
 			// workspace and (re)embeds changed files via the node's TEI service;
@@ -448,6 +462,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			// like the other read handlers.
 			indexHandler := jobs.NewFileIndexHandler(opts.WorkspaceDir, "")
 			indexHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			indexHandler.AuthorizedRoots = opts.AuthorizedRoots
 			indexHandler.IndexesDir = opts.IndexesDir
 			// Fail-closed dispatched-work signing (aceteam#10876 C7) when a signer
 			// is wired; unsigned otherwise (legacy/diagnostic path).

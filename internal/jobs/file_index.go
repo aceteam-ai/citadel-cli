@@ -64,6 +64,12 @@ type FileIndexHandler struct {
 	IndexesDir string
 	// AllowOutsideWorkspace mirrors the read-handler relaxation flag.
 	AllowOutsideWorkspace bool
+	// AuthorizedRoots resolves the operator-bound authorized roots a dispatched
+	// FILE_INDEX may read in addition to the workspace (aceteam#10876 C6); see
+	// FileReadHandler.AuthorizedRoots. nil/empty means workspace-only. On the
+	// local rag.Service path this stays nil (that path sets AllowOutsideWorkspace
+	// and validates against the roots allowlist itself before dispatch).
+	AuthorizedRoots func() []string
 	// Signer signs the per-stage work receipt (aceteam#10876 C7). nil on the
 	// local/zero-value path (rag.Service, tests) — no receipt is produced. The
 	// worker construction site sets it alongside Dispatched=true.
@@ -178,7 +184,7 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, err
 	}
 
-	validated, err := ValidateReadPath(h.WorkspaceDir, path, h.AllowOutsideWorkspace)
+	validated, err := ValidateReadPathWithRoots(h.WorkspaceDir, resolveAuthorizedRoots(h.AuthorizedRoots), path, h.AllowOutsideWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}

@@ -1829,10 +1829,22 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Best-effort and roots-scoped — a watcher failure must never take down
 		// the worker, and it enforces the roots allowlist (NOT the mesh workspace
 		// boundary used by the /rag HTTP routes above), so it stays a LOCAL surface.
-		if searchRoots := config.LoadRoots(platform.ConfigDir()).Roots; len(searchRoots) > 0 {
+		if searchRoots := loadConvergedRoots().Roots; len(searchRoots) > 0 {
 			if w, werr := rag.NewWatcher(searchRoots, wsDir, ""); werr != nil {
 				Log("search watcher init failed (auto-indexing disabled): %v", werr)
 			} else {
+				// Each watcher re-index lands an origin=watcher usage record in the
+				// same ledger a dispatched FILE_INDEX / `citadel rag index` writes
+				// (aceteam#10876 C6). Best-effort, like the local-CLI record.
+				watcherNodeName := nodeName
+				w.SetUsageSink(func(root string, res rag.IndexResult, start time.Time) {
+					recordWatcherIndexUsage(res, watcherNodeName, start)
+				})
+				// Stop the watcher from re-indexing on its OWN usage.db writes when
+				// an operator authorized a root that contains the node dir.
+				if nodeDir, derr := platform.DefaultNodeDir(""); derr == nil {
+					w.IgnorePath(filepath.Join(nodeDir, "usage.db"))
+				}
 				w.Start(ctx)
 				fmt.Printf("   - Local search watcher active over %d authorized root(s)\n", len(searchRoots))
 			}
@@ -2736,6 +2748,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		WorkReceiptSigner:         workReceiptSigner,
 		WorkReceiptNodeID:         workReceiptNodeID,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
+		AuthorizedRoots:           authorizedRootsResolver(),
 		ShellDisabled:             !workPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,
 		ShellHasPasscode:          nodeHasPasscode,
