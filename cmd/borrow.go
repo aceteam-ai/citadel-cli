@@ -19,6 +19,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
@@ -26,9 +28,25 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/serviceborrow"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
+
+// borrowServeEnabled reports whether this node SERVES peer-service borrow
+// requests (citadel-cli#1289). Default OFF, env-driven: serving lets a same-owner
+// peer consume this node's loopback services and GPU, so — exactly like the
+// egress relay, the other authorized-peer resource-consumption surface — it ships
+// opt-in, per CLAUDE.md's "a behavior that newly consumes or refuses ships
+// default-OFF" rule. Enable with CITADEL_BORROW_SERVE truthy (1/true/yes/on).
+// When off, cmd never calls gw.SetBorrowServer, so the /borrow/ routes are not
+// registered at all — an un-opted node has no borrow surface, not even a 403.
+// Persisted-config / CLI / APPLY_DEVICE_CONFIG toggle surfaces (what the egress
+// relay has via internal/config.EgressRelay) are a documented follow-up; this env
+// knob is the landmine-defusing baseline.
+func borrowServeEnabled() bool {
+	return update.IsTruthy(strings.TrimSpace(os.Getenv("CITADEL_BORROW_SERVE")))
+}
 
 // borrowServerDeps are everything buildBorrowServeConfig needs from runWork. A
 // nil Signer/InsertUsage/Providers get safe defaults; a test injects fakes so no

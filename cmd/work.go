@@ -2566,25 +2566,30 @@ func runWork(cmd *cobra.Command, args []string) {
 			return store.Snapshot(), cacheindex.DefaultCacheRoot()
 		})
 
-		// Peer-service borrowing — serving side (citadel-cli#1289). Let a
-		// same-owner mesh peer (or the platform infra identity) borrow a loopback
-		// service (embedding -> TEI, transcription -> whisper) over this same
-		// gateway, with a signed serving work receipt + work record. Reuses the
-		// mesh resolver + the machine-convergent signer wired above; the platform
-		// allowlist is the SAME platform-exposure.json the gateway's platform
-		// exposures already honor. A nil usage store leaves serving signing intact
-		// (still fails closed when unsigned) but writes no local ledger row.
-		var borrowInsertUsage func(usage.UsageRecord) error
-		if usageStore != nil {
-			borrowInsertUsage = func(r usage.UsageRecord) error { return usageStore.Insert(r) }
+		// Peer-service borrowing — serving side (citadel-cli#1289). Opt-in
+		// (CITADEL_BORROW_SERVE, default OFF): when enabled, a same-owner mesh peer
+		// (or the platform infra identity) can borrow a loopback service
+		// (embedding -> TEI, transcription -> whisper) over this same gateway, with
+		// a signed serving work receipt + work record. Reuses the mesh resolver +
+		// the machine-convergent signer wired above; the platform allowlist is the
+		// SAME platform-exposure.json the gateway's platform exposures already
+		// honor. A nil usage store leaves serving signing intact (still fails closed
+		// when unsigned) but writes no local ledger row. When off, SetBorrowServer
+		// is not called, so the /borrow/ routes are never registered.
+		if borrowServeEnabled() {
+			var borrowInsertUsage func(usage.UsageRecord) error
+			if usageStore != nil {
+				borrowInsertUsage = func(r usage.UsageRecord) error { return usageStore.Insert(r) }
+			}
+			gw.SetBorrowServer(buildBorrowServeConfig(borrowServerDeps{
+				Signer:        workReceiptSigner,
+				NodeID:        workReceiptNodeID,
+				NodeName:      nodeName,
+				InsertUsage:   borrowInsertUsage,
+				AllowedLogins: platformAllowedLogins,
+			}))
+			fmt.Println("   - Peer-service borrowing: serving ENABLED (same-owner/platform-infra, signed receipts)")
 		}
-		gw.SetBorrowServer(buildBorrowServeConfig(borrowServerDeps{
-			Signer:        workReceiptSigner,
-			NodeID:        workReceiptNodeID,
-			NodeName:      nodeName,
-			InsertUsage:   borrowInsertUsage,
-			AllowedLogins: platformAllowedLogins,
-		}))
 
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,

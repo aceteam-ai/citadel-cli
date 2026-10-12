@@ -17,9 +17,15 @@
 //     node operator's platform-infra allowlist (the same platform-exposure.json
 //     the gateway's platform exposures use). A shared-org, foreign, or
 //     unverified caller is refused. This reuses THIS server's existing
-//     meshResolver (-> network.WhoIsPeer) — no second resolver — mirroring
-//     cache_serve.go step 1 and egressrelay.Authorize's posture exactly, with no
-//     token/passcode fallback.
+//     meshResolver (-> network.WhoIsPeer) — no second resolver.
+//
+// The posture is NOT a byte-for-byte copy of egressrelay.Authorize, and
+// deliberately so: it borrows egress-relay's MECHANISM (WhoIsPeer via the
+// gateway's resolver, no token/passcode fallback), takes its POLICY from
+// cmd/platform_exposure.go (same-owner OR platform-infra allowlist — egress-relay
+// is same-owner only), and TIGHTENS both with #1068's "empty stable/owner id
+// means unverified -> refuse" rule, which egress-relay predates. See
+// serviceborrow.Decide for the exact ordered check.
 //
 // Identity is resolved from the request's verified mesh RemoteAddr
 // (resolvePeer), so a spoofed X-Forwarded-For / X-Real-IP is ignored. Because
