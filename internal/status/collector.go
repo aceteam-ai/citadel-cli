@@ -45,6 +45,7 @@ type Collector struct {
 	permissions      func() *config.Permissions        // authoritative node permission policy, optional
 	appPods          func() []AppInfo                  // live hosted-app pod entries (CRAM A1, aceteam#9672), optional
 	sandboxedModules func() *SandboxedModuleCapability // generic sandboxed-module runtime availability (citadel-cli#1288), optional
+	nvrHealth        func() *NVRHealth                 // nvr module per-camera self-heal state (citadel-cli#1295), optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -133,6 +134,13 @@ type CollectorConfig struct {
 	// runtime / catalog import, mirroring AppPods. Optional: nil on a legacy build
 	// or a node with no provider wired leaves the capability omitted.
 	SandboxedModules func() *SandboxedModuleCapability
+	// NVRHealth, when set, returns the nvr module's per-camera self-heal state
+	// (citadel-cli#1295), attached to NodeStatus.NVR. Injected from cmd
+	// (projected from nvr.Monitor.Snapshot) so internal/status stays free of
+	// the container runtime / nvr import, mirroring AppPods/Reservations.
+	// Optional: nil on any node without the nvr module installed, with
+	// self-heal disabled, or a legacy build leaves NodeStatus.NVR omitted.
+	NVRHealth func() *NVRHealth
 }
 
 // NewCollector creates a new status collector.
@@ -161,6 +169,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		permissions:      cfg.PermissionsProvider,
 		appPods:          cfg.AppPods,
 		sandboxedModules: cfg.SandboxedModules,
+		nvrHealth:        cfg.NVRHealth,
 	}
 }
 
@@ -568,6 +577,13 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// nil provider (no cache index store wired) leaves the field omitted.
 	if c.cacheReport != nil {
 		status.Cache = c.cacheReport()
+	}
+
+	// Attach the nvr module's per-camera self-heal state (citadel-cli#1295).
+	// Additive: nil provider (no nvr module / self-heal disabled) leaves
+	// NodeStatus.NVR omitted exactly as before this change.
+	if c.nvrHealth != nil {
+		status.NVR = c.nvrHealth()
 	}
 
 	return status, nil

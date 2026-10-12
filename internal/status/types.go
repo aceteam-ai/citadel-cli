@@ -96,6 +96,16 @@ type NodeStatus struct {
 	// work`, or a legacy build) -- indistinguishable from a pre-P3 node,
 	// which is the correct degradation (see cacheReportFrom, cmd/work.go).
 	Cache *CacheReport `json:"cache,omitempty"`
+	// NVR carries the nvr module's per-camera self-heal state (citadel-cli
+	// #1295): which cameras are recording vs stalled/recovering/offline, and
+	// whether the wyze-bridge self-heal monitor restarted the bridge. It lets
+	// an owner see a dead camera from the heartbeat without opening the Frigate
+	// UI. Additive/omitempty: nil on any node without the nvr module installed
+	// (or with self-heal disabled) or a legacy build, so the heartbeat payload
+	// is unchanged there. Projected from nvr.Snapshot by cmd/nvr_monitor.go's
+	// nvrHealthFrom (internal/status cannot import internal/nvr);
+	// TestNVRHealthShapeParity pins the two shapes.
+	NVR *NVRHealth `json:"nvr,omitempty"`
 }
 
 // CacheReport is the heartbeat-facing projection of a cacheindex.Index
