@@ -153,6 +153,14 @@ health_check:
   # catalog.ProbeHealth GETs http://127.0.0.1:<port><endpoint> ON THE HOST, so the
   # port here is the PUBLISHED HOST port (8212), not the container port. Frigate's
   # /api/version returns 200 once it has loaded config.yml and the detector.
+  #
+  # This is a MODULE-LEVEL probe (is Frigate up at all); it does NOT see a
+  # single wedged camera. Per-camera stall detection + automatic recovery is
+  # worker-side (aceteam-ai/citadel-cli#1295): `citadel work` polls Frigate's
+  # /api/stats over this same host port for camera_fps == 0 and restarts the
+  # wyze-bridge container with per-camera exponential backoff. Default ON for a
+  # node that has this module installed; kill switch CITADEL_NVR_SELF_HEAL=0,
+  # dwell override CITADEL_NVR_STALL_SECONDS. See internal/nvr/selfheal.go.
   endpoint: /api/version
   port: 8212
   interval: 30s

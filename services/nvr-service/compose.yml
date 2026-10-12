@@ -48,6 +48,17 @@ services:
       - WB_FFMPEG=False
     volumes:
       - ~/.citadel-cli/nvr/wyze-tokens:/tokens
+    # NO container healthcheck here, deliberately (aceteam-ai/citadel-cli#1295).
+    # The failure mode is PER-CAMERA, not whole-container: when a Wyze camera
+    # power-cycles the bridge stays "Up" and healthy-looking while that one
+    # stream is wedged on a dead TUTK P2P session, so a container healthcheck
+    # cannot see it (and plain docker/compose does not restart on `unhealthy`
+    # anyway). Recovery is WORKER-SIDE instead: `citadel work` polls Frigate's
+    # /api/stats over loopback, detects a camera stalled at camera_fps == 0 for
+    # N minutes, and restarts this container through its own runtime seam with
+    # per-camera exponential backoff (so an unplugged camera does not loop).
+    # See internal/nvr/selfheal.go. `restart: unless-stopped` still covers a
+    # whole-container crash.
     restart: unless-stopped
 
   nvr-config:

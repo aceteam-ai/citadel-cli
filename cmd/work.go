@@ -1565,6 +1565,19 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 		return rn.SupportedJobTypes()
 	}
+
+	// NVR module per-camera self-heal monitor (citadel-cli#1295). nil when the
+	// nvr module is not installed or self-heal is disabled, in which case the
+	// provider returns nil and NodeStatus.NVR stays omitted. Constructed once
+	// here so the heartbeat collector provider and the OnStatus drivers below
+	// share one instance (its backoff state must persist across ticks).
+	nvrMonitor := newNVRSelfHealMonitor()
+	nvrHealthFn := func() *status.NVRHealth {
+		if nvrMonitor == nil {
+			return nil
+		}
+		return nvrHealthFrom(nvrMonitor.Snapshot())
+	}
 	// Pairing-display capability probe for the heartbeat (citadel-cli#659
 	// P0): can this node render a platform-pushed node:exec pairing code
 	// right now? Independent of the pairingdisplay.Manager singleton's
@@ -1627,6 +1640,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			JobTypes:         jobTypesFn,
 			AppPods:          appPodListings,
 			SandboxedModules: sandboxedModuleCapability,
+			NVRHealth:        nvrHealthFn,
 			// The status process may run as a different user than an interactive
 			// invoker. Advertise the same machine-level policy the worker enforces.
 			PermissionsProvider: loadNodePermissions,
@@ -1963,6 +1977,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				JobTypes:            jobTypesFn,
 				AppPods:             appPodListings,
 				SandboxedModules:    sandboxedModuleCapability,
+				NVRHealth:           nvrHealthFn,
 				PermissionsProvider: loadNodePermissions,
 			})
 		}
@@ -2151,6 +2166,16 @@ func runWork(cmd *cobra.Command, args []string) {
 						// TestInferenceQueueReconciler_ConcurrentReconcile.
 						apiPublisher.SetOnStatus(func(_ *status.NodeStatus) { go inferenceQueueReconciler.Reconcile(ctx) })
 					}
+					if nvrMonitor != nil {
+						// NVR per-camera self-heal (citadel-cli#1295). Dispatched
+						// via `go` because a stall recovery shells out to
+						// `docker restart`, which blocks ~30s -- running it inline
+						// in the OnStatus fan-out would stall every heartbeat
+						// publish. The monitor self-limits to one in-flight
+						// Reconcile (an internal guard), so a wedged runtime costs
+						// at most one blocked goroutine, not one per tick.
+						apiPublisher.SetOnStatus(func(_ *status.NodeStatus) { go nvrMonitor.Reconcile(ctx) })
+					}
 					if pulseStats != nil {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
@@ -2204,6 +2229,13 @@ func runWork(cmd *cobra.Command, args []string) {
 				// jobs.CacheGCEnabled() is false.
 				if gcReconciler != nil {
 					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { gcReconciler.Reconcile(s) })
+				}
+				if nvrMonitor != nil {
+					// NVR per-camera self-heal (citadel-cli#1295). Dispatched via
+					// `go` (a stall recovery shells `docker restart`, ~30s) with
+					// the monitor's own one-in-flight guard -- same reasoning as
+					// the API-mode registration above.
+					redisPublisher.SetOnStatus(func(_ *status.NodeStatus) { go nvrMonitor.Reconcile(ctx) })
 				}
 				if pulseStats != nil {
 					redisPublisher.SetStatsProvider(pulseStats.Latest)
