@@ -7,7 +7,6 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
-	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/rag"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
@@ -130,7 +129,7 @@ func init() {
 // the full authorized allowlist; when --root is set, just that root (which must
 // itself resolve under an authorized root, else an error).
 func activeRoots() ([]string, error) {
-	roots := config.LoadRoots(platform.ConfigDir())
+	roots := loadConvergedRoots()
 	if len(roots.Roots) == 0 {
 		return nil, fmt.Errorf("no authorized roots configured\n\nAuthorize a directory first:  citadel search roots add <path>")
 	}
@@ -186,7 +185,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 }
 
 func runSearchIndex(cmd *cobra.Command, args []string) error {
-	roots := config.LoadRoots(platform.ConfigDir())
+	roots := loadConvergedRoots()
 	if len(roots.Roots) == 0 {
 		return fmt.Errorf("no authorized roots configured\n\nAuthorize a directory first:  citadel search roots add <path>")
 	}
@@ -222,7 +221,7 @@ func runSearchIndex(cmd *cobra.Command, args []string) error {
 }
 
 func runSearchRootsList(cmd *cobra.Command, args []string) error {
-	roots := config.LoadRoots(platform.ConfigDir())
+	roots := loadConvergedRoots()
 	if searchJSON {
 		return printJSON(roots)
 	}
@@ -238,8 +237,9 @@ func runSearchRootsList(cmd *cobra.Command, args []string) error {
 }
 
 func runSearchRootsAdd(cmd *cobra.Command, args []string) error {
-	configDir := platform.ConfigDir()
-	roots := config.LoadRoots(configDir)
+	// Load via the converged reader (so a legacy-dir root is not dropped on the
+	// first post-upgrade mutation), then always save to the convergent write dir.
+	roots := loadConvergedRoots()
 	added, err := roots.Add(args[0])
 	if err != nil {
 		return err
@@ -248,7 +248,7 @@ func runSearchRootsAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s already authorized\n", args[0])
 		return nil
 	}
-	if err := config.SaveRoots(configDir, roots); err != nil {
+	if err := config.SaveRoots(rootsWriteDir(), roots); err != nil {
 		return err
 	}
 	// Report the normalized form that was actually stored.
@@ -259,8 +259,9 @@ func runSearchRootsAdd(cmd *cobra.Command, args []string) error {
 }
 
 func runSearchRootsRemove(cmd *cobra.Command, args []string) error {
-	configDir := platform.ConfigDir()
-	roots := config.LoadRoots(configDir)
+	// Load via the converged reader, then save the result to the convergent write
+	// dir (which also migrates any legacy-dir roots forward, minus the removed one).
+	roots := loadConvergedRoots()
 	removed, err := roots.Remove(args[0])
 	if err != nil {
 		return err
@@ -269,7 +270,7 @@ func runSearchRootsRemove(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s was not an authorized root\n", args[0])
 		return nil
 	}
-	if err := config.SaveRoots(configDir, roots); err != nil {
+	if err := config.SaveRoots(rootsWriteDir(), roots); err != nil {
 		return err
 	}
 	norm, _ := config.NormalizeRoot(args[0])

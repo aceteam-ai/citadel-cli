@@ -20,6 +20,10 @@ type FileSearchHandler struct {
 	// AllowOutsideWorkspace, when true, permits searching files outside the
 	// workspace sandbox. Bounded by OS file permissions and size caps.
 	AllowOutsideWorkspace bool
+	// AuthorizedRoots resolves the operator-bound authorized roots a dispatched
+	// read may access in addition to the workspace (aceteam#10876 C6); see
+	// FileReadHandler.AuthorizedRoots. nil/empty means workspace-only.
+	AuthorizedRoots func() []string
 }
 
 // NewFileSearchHandler creates a new FileSearchHandler rooted at workspace.
@@ -59,7 +63,7 @@ func (h *FileSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 
 	filePattern := job.Payload["file_pattern"] // May be empty.
 
-	validated, err := ValidateReadPath(h.WorkspaceDir, path, h.AllowOutsideWorkspace)
+	validated, err := ValidateReadPathWithRoots(h.WorkspaceDir, resolveAuthorizedRoots(h.AuthorizedRoots), path, h.AllowOutsideWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}

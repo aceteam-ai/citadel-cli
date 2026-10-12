@@ -56,6 +56,21 @@ type Service struct {
 	// onProgress, when set, receives throttled progress updates during Index
 	// (aceteam#10876 C1). nil for surfaces that do not render progress.
 	onProgress func(map[string]any)
+	// origin is the usage attribution stamped on the handler's emitted usage
+	// object (aceteam#10876 C7). Defaults to jobs.OriginLocalCLI (the trusted
+	// `citadel rag index` operator); the authorized-roots watcher overrides it to
+	// jobs.OriginWatcher via SetOrigin so watcher-driven re-indexing is attributed
+	// separately. Empty is treated as OriginLocalCLI.
+	origin string
+}
+
+// SetOrigin overrides the usage-attribution origin stamped on the handler's
+// emitted usage object (default jobs.OriginLocalCLI). The watcher sets
+// jobs.OriginWatcher. An empty value is ignored (keeps the default).
+func (s *Service) SetOrigin(origin string) {
+	if origin != "" {
+		s.origin = origin
+	}
 }
 
 // SetProgressSink wires a throttled progress callback consumed by Index. The
@@ -218,12 +233,17 @@ func (s *Service) index(ctx context.Context, path, filePattern string, cancelReq
 	}
 	h := jobs.NewFileIndexHandler(s.workspaceDir, s.dbPath)
 	h.AllowOutsideWorkspace = s.allowOutsideWorkspace
-	// Local-CLI origin (aceteam#10876 C7): a trusted operator, NOT dispatched
-	// work. The handler stamps origin=local_cli onto the emitted usage object and
-	// does NOT sign a receipt (Dispatched stays false, Signer nil) — a missing
-	// node identity key is never a hard failure on this path. The ledger record is
-	// written by the caller (cmd/rag.go), which reads this same origin.
-	h.Origin = jobs.OriginLocalCLI
+	// Trusted local origin (aceteam#10876 C7): NOT dispatched work. The handler
+	// stamps this origin onto the emitted usage object and does NOT sign a receipt
+	// (Dispatched stays false, Signer nil) — a missing node identity key is never
+	// a hard failure on this path. The ledger record is written by the caller
+	// (cmd/rag.go, or the watcher's usage sink), which carries the same origin.
+	// Default is jobs.OriginLocalCLI (`citadel rag index`); the watcher overrides
+	// it to jobs.OriginWatcher via SetOrigin.
+	h.Origin = s.origin
+	if h.Origin == "" {
+		h.Origin = jobs.OriginLocalCLI
+	}
 	payload := map[string]string{"path": path, "model": s.model}
 	if filePattern != "" {
 		payload["file_pattern"] = filePattern

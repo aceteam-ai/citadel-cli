@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/rag"
 	"github.com/gdamore/tcell/v2"
@@ -48,9 +49,30 @@ func (p *SearchPage) Name() string { return "search" }
 // Title implements Page.
 func (p *SearchPage) Title() string { return "Search" }
 
+// searchRootsDirs returns the machine-convergent authorized-roots config dirs
+// (node dir first, legacy platform.ConfigDir() fallback), matching cmd's
+// rootsConfigDirs so the TUI Search tab, the `citadel search` CLI, the watcher,
+// and the dispatched read handlers all agree on one allowlist (aceteam#10876 C6,
+// citadel-cli#1273). Resolving network.GetNodeConfigDir() here (not in the config
+// leaf) follows the cross-context rule.
+func searchRootsDirs() []string {
+	return []string{network.GetNodeConfigDir(), platform.ConfigDir()}
+}
+
+// searchRootsWriteDir is the single dir roots mutations write to (the first
+// non-empty of searchRootsDirs — the convergent node dir).
+func searchRootsWriteDir() string {
+	for _, d := range searchRootsDirs() {
+		if d != "" {
+			return d
+		}
+	}
+	return platform.ConfigDir()
+}
+
 // service builds a fresh roots-mode rag.Service from the current allowlist.
 func (p *SearchPage) service() (*rag.Service, []string) {
-	roots := config.LoadRoots(platform.ConfigDir()).Roots
+	roots := config.LoadRootsFrom(searchRootsDirs()...).Roots
 	return rag.NewWithRoots(roots, rag.NodeWorkspaceDir(), ""), roots
 }
 
@@ -141,7 +163,7 @@ func (p *SearchPage) cycleFocus() {
 // refreshHeader renders the authorized roots and model into the header. Safe to
 // call from the main goroutine (it writes the primitive directly).
 func (p *SearchPage) refreshHeader() {
-	roots := config.LoadRoots(platform.ConfigDir()).Roots
+	roots := config.LoadRootsFrom(searchRootsDirs()...).Roots
 	var b strings.Builder
 	if len(roots) == 0 {
 		b.WriteString("[yellow]No authorized roots.[white] Add one below to index and search.\n")
@@ -221,15 +243,14 @@ func (p *SearchPage) authorizeRoot(path string) {
 	}
 	p.setStatus("[gray]Authorizing %s ...[white]", path)
 	go func() {
-		configDir := platform.ConfigDir()
-		roots := config.LoadRoots(configDir)
+		roots := config.LoadRootsFrom(searchRootsDirs()...)
 		added, err := roots.Add(path)
 		if err != nil {
 			p.setStatus("[red]Cannot authorize %s: %v[white]", path, err)
 			return
 		}
 		if added {
-			if err := config.SaveRoots(configDir, roots); err != nil {
+			if err := config.SaveRoots(searchRootsWriteDir(), roots); err != nil {
 				p.setStatus("[red]Cannot save roots: %v[white]", err)
 				return
 			}

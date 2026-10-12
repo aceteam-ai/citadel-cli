@@ -184,12 +184,21 @@ func recordLocalIndexUsage(res rag.IndexResult, namespace string, start time.Tim
 	}
 }
 
-// recordLocalIndexUsageTo is the pure core: it opens the usage store at dbPath
-// (an explicit path so a test uses a t.TempDir() DB, never the live node's) and
-// inserts one local_cli index record. The job id is unique per run so repeated
-// local indexes never collide under the ledger's unique-job_id dedup (a constant
-// id would silently drop every run after the first).
+// recordLocalIndexUsageTo is the pure core for the local `citadel rag index`
+// path: it writes one local_cli index record. It is a thin wrapper over
+// recordIndexUsageTo (which also serves the origin=watcher path); keeping this
+// name + signature stable preserves TestRecordLocalIndexUsageTo.
 func recordLocalIndexUsageTo(dbPath string, res rag.IndexResult, namespace, nodeName string, start time.Time) error {
+	return recordIndexUsageTo(dbPath, res, namespace, nodeName, start, jobs.OriginLocalCLI)
+}
+
+// recordIndexUsageTo is the pure core shared by the local-CLI and watcher index
+// paths: it opens the usage store at dbPath (an explicit path so a test uses a
+// t.TempDir() DB, never the live node's) and inserts one index record with the
+// given origin (jobs.OriginLocalCLI or jobs.OriginWatcher). The job id is unique
+// per run so repeated indexes never collide under the ledger's unique-job_id
+// dedup (a constant id would silently drop every run after the first).
+func recordIndexUsageTo(dbPath string, res rag.IndexResult, namespace, nodeName string, start time.Time, origin string) error {
 	store, err := usage.OpenStore(dbPath)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
@@ -205,7 +214,7 @@ func recordLocalIndexUsageTo(dbPath string, res rag.IndexResult, namespace, node
 		DurationMs:            time.Since(start).Milliseconds(),
 		Model:                 res.Model,
 		NodeID:                nodeName,
-		Origin:                jobs.OriginLocalCLI,
+		Origin:                origin,
 		OrgID:                 localIndexOrgID(namespace),
 		WorkAction:            jobs.WorkActionIndex,
 		ReceiptManifestSHA256: res.WorkManifestSHA256,
@@ -223,6 +232,25 @@ func recordLocalIndexUsageTo(dbPath string, res rag.IndexResult, namespace, node
 		return fmt.Errorf("insert: %w", err)
 	}
 	return nil
+}
+
+// recordWatcherIndexUsage writes an origin=watcher work record to the node's
+// usage.db for one watcher-driven re-index (aceteam#10876 C6), mirroring
+// recordLocalIndexUsage but attributing the work to the file watcher. The
+// watcher has no per-org index namespace, so OrgID is empty. Best-effort: any
+// failure is logged at debug and never disrupts the watcher.
+func recordWatcherIndexUsage(res rag.IndexResult, nodeName string, start time.Time) {
+	if nodeName == "" {
+		nodeName = localIndexNodeName()
+	}
+	nodeDir, err := platform.DefaultNodeDir("")
+	if err != nil {
+		Debug("watcher index usage: no node dir, skipping ledger record: %v", err)
+		return
+	}
+	if err := recordIndexUsageTo(filepath.Join(nodeDir, "usage.db"), res, "", nodeName, start, jobs.OriginWatcher); err != nil {
+		Debug("watcher index usage: %v", err)
+	}
 }
 
 // localIndexNodeName resolves this node's name for the local record, mirroring

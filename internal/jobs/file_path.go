@@ -191,6 +191,97 @@ func ValidateReadPath(workspace, requestedPath string, allowOutside bool) (strin
 	return filepath.Clean(target), nil
 }
 
+// PathNotAuthorizedError is returned by ValidateReadPathWithRoots when a
+// requested read path resolves under NEITHER the workspace NOR any authorized
+// root. It is a typed error so a handler/caller can branch on it (errors.As);
+// its message names the remediation — binding an authorized root — WITHOUT
+// disclosing the node's workspace or the bound roots to a remote caller (this
+// message crosses the wire in a dispatched job's error output, so it echoes only
+// the caller's own requested path, never node-internal layout).
+type PathNotAuthorizedError struct {
+	// Path is the requested path, echoed back so the operator knows what was
+	// refused. It is the caller's own input, not node-internal layout.
+	Path string
+}
+
+func (e *PathNotAuthorizedError) Error() string {
+	return fmt.Sprintf("path %q is outside the workspace and all authorized roots; "+
+		"authorize a directory containing it on the node with "+
+		"'citadel search roots add <dir>'", e.Path)
+}
+
+// resolveAuthorizedRoots invokes an authorized-roots resolver, returning nil
+// when the resolver is nil. Read handlers hold the resolver as a func (live, not
+// a boot snapshot) and call this once per dispatch to get the current list.
+func resolveAuthorizedRoots(fn func() []string) []string {
+	if fn == nil {
+		return nil
+	}
+	return fn()
+}
+
+// ValidateReadPathWithRoots is the authorized-roots read sandbox (aceteam#10876
+// C6, citadel-cli#1273). A path is permitted iff it resolves (after symlink
+// resolution) under the workspace OR under one of the authorized roots — the
+// operator-bound directories a dispatched read job may read even when they live
+// outside the workspace sandbox.
+//
+// Three branches, all preserving back-compat:
+//   - allowOutside == true: the --allow-read-outside-workspace escape hatch is
+//     unchanged (ValidateReadPath's relaxed, unconfined cleaning). Authorized
+//     roots are an ADDITIVE permission, never a tightening, so they are not
+//     consulted on this path.
+//   - roots is empty: reduces to ValidateReadPath(workspace, path, false) EXACTLY
+//     — today's workspace-only sandbox, byte-for-byte (same resolution, same
+//     error strings). This is the back-compat guarantee.
+//   - roots is non-empty: try the workspace first (this also anchors a RELATIVE
+//     path), then each authorized root for an ABSOLUTE path. The first boundary
+//     the symlink-resolved path validates under wins.
+//
+// A relative path is only ever resolved against the workspace, never joined to a
+// root: joining a relative path to whichever root happens to contain it would be
+// a surprising new resolution rule, and a relative traversal escaping the
+// workspace (e.g. "../../etc") is refused rather than silently retried against a
+// root. A path under neither boundary is refused with a *PathNotAuthorizedError
+// naming the remediation.
+//
+// Each per-root check reuses ValidatePath, so the symlink-escape boundary
+// (resolveNearestAncestor + withinDir, compared in resolved space) is identical
+// to the single-workspace sandbox: a `..` traversal out of a root, or a symlink
+// inside a root pointing outside it, is refused; a symlink whose target lands
+// back inside an authorized boundary is allowed.
+func ValidateReadPathWithRoots(workspace string, roots []string, requestedPath string, allowOutside bool) (string, error) {
+	if allowOutside {
+		return ValidateReadPath(workspace, requestedPath, true)
+	}
+	if len(roots) == 0 {
+		// Byte-for-byte today's behavior: the workspace-only sandbox with its
+		// existing resolution and error strings.
+		return ValidateReadPath(workspace, requestedPath, false)
+	}
+	if requestedPath == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	// Workspace first — this is also what anchors a relative requestedPath.
+	if workspace != "" {
+		if cleaned, err := ValidatePath(workspace, requestedPath); err == nil {
+			return cleaned, nil
+		}
+	}
+	// Authorized roots only ever match an ABSOLUTE path (see the doc comment).
+	if filepath.IsAbs(requestedPath) {
+		for _, root := range roots {
+			if root == "" {
+				continue
+			}
+			if cleaned, err := ValidatePath(root, requestedPath); err == nil {
+				return cleaned, nil
+			}
+		}
+	}
+	return "", &PathNotAuthorizedError{Path: requestedPath}
+}
+
 // isBinaryContent checks the first n bytes for NUL bytes, which indicate
 // binary content.
 func isBinaryContent(data []byte) bool {

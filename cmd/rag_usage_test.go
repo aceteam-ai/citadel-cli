@@ -69,3 +69,45 @@ func TestRecordLocalIndexUsageTo(t *testing.T) {
 
 // usageLocalCLI mirrors jobs.OriginLocalCLI without importing jobs into the test.
 const usageLocalCLI = "local_cli"
+
+// usageWatcher mirrors jobs.OriginWatcher without importing jobs into the test.
+const usageWatcher = "watcher"
+
+// TestRecordIndexUsageToWatcherOrigin pins that the watcher path writes an
+// origin=watcher work record into the same ledger (aceteam#10876 C6), via the
+// shared recordIndexUsageTo core. Uses an explicit t.TempDir() DB, never the
+// live node's.
+func TestRecordIndexUsageToWatcherOrigin(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "usage.db")
+	res := rag.IndexResult{
+		Model:          "gte-multilingual-base",
+		FilesIndexed:   2,
+		ChunksEmbedded: 5,
+		Status:         "completed",
+	}
+	if err := recordIndexUsageTo(dbPath, res, "", "node-watch", time.Now(), usageWatcher); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	store, err := usage.OpenStore(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	recs, err := store.QueryUnsynced(100)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 watcher record, got %d", len(recs))
+	}
+	r := recs[0]
+	if r.Origin != usageWatcher {
+		t.Errorf("origin = %q, want %q", r.Origin, usageWatcher)
+	}
+	if r.WorkAction != "index" || r.NodeID != "node-watch" || r.OrgID != "" {
+		t.Errorf("attribution wrong: action=%q node=%q org=%q", r.WorkAction, r.NodeID, r.OrgID)
+	}
+	if r.Units["files_indexed"] != 2 {
+		t.Errorf("units = %v", r.Units)
+	}
+}

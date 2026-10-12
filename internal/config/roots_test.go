@@ -73,6 +73,43 @@ func TestRootsRemove(t *testing.T) {
 	}
 }
 
+func TestLoadRootsFromConvergence(t *testing.T) {
+	primary := t.TempDir()
+	legacy := t.TempDir()
+
+	// Nothing anywhere -> empty.
+	if r := LoadRootsFrom(primary, legacy); len(r.Roots) != 0 {
+		t.Fatalf("no roots.yaml anywhere should be empty, got %v", r.Roots)
+	}
+
+	// Only legacy has roots.yaml -> the fallback read returns it.
+	lr := DefaultRoots()
+	_, _ = lr.Add(t.TempDir())
+	if err := SaveRoots(legacy, lr); err != nil {
+		t.Fatal(err)
+	}
+	if r := LoadRootsFrom(primary, legacy); len(r.Roots) != 1 {
+		t.Fatalf("legacy roots should be read as a fallback, got %v", r.Roots)
+	}
+
+	// Primary now has its own roots.yaml with TWO roots -> it WINS over legacy
+	// (first dir with a roots.yaml wins; no merge).
+	pr := DefaultRoots()
+	_, _ = pr.Add(t.TempDir())
+	_, _ = pr.Add(t.TempDir())
+	if err := SaveRoots(primary, pr); err != nil {
+		t.Fatal(err)
+	}
+	if r := LoadRootsFrom(primary, legacy); len(r.Roots) != 2 {
+		t.Fatalf("primary roots must win over legacy, got %v", r.Roots)
+	}
+
+	// An empty dir in the list is skipped.
+	if r := LoadRootsFrom("", primary); len(r.Roots) != 2 {
+		t.Fatalf("empty dir should be skipped, got %v", r.Roots)
+	}
+}
+
 func TestNormalizeRootAbsolute(t *testing.T) {
 	got, err := NormalizeRoot(t.TempDir())
 	if err != nil {

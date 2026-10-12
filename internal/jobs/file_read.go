@@ -19,6 +19,12 @@ type FileReadHandler struct {
 	// AllowOutsideWorkspace, when true, permits reading files outside the
 	// workspace sandbox. Bounded by OS file permissions and size caps.
 	AllowOutsideWorkspace bool
+	// AuthorizedRoots resolves the operator-bound authorized roots a dispatched
+	// read may access in addition to the workspace (aceteam#10876 C6). It is a
+	// func (not a snapshot) so a root bound with `citadel search roots add` is
+	// honored on the next dispatch without a worker restart. nil or an empty
+	// result means workspace-only — the behavior before authorized roots existed.
+	AuthorizedRoots func() []string
 }
 
 // NewFileReadHandler creates a new FileReadHandler rooted at workspace.
@@ -38,7 +44,7 @@ func (h *FileReadHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 		return nil, fmt.Errorf("job payload missing 'path' field")
 	}
 
-	validated, err := ValidateReadPath(h.WorkspaceDir, path, h.AllowOutsideWorkspace)
+	validated, err := ValidateReadPathWithRoots(h.WorkspaceDir, resolveAuthorizedRoots(h.AuthorizedRoots), path, h.AllowOutsideWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}
