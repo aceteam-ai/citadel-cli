@@ -3072,3 +3072,23 @@ Auto-generated log of every release.
   - feat(desktop): prepare private bootstrap policy and tier planner (#1280)
 
 
+---
+
+## v2.192.0 — 2026-10-12
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 82 |
+| Lines added | +8352 |
+
+**Changes:**
+
+  - fix(nvr): per-camera stall detection + backoff-gated bridge self-heal (#1295) (#1298)
+  - feat(usage): carry full signed work-receipt bodies on usage records (#1291) (#1297)
+  - feat(rag): dispatched read jobs honor authorized roots (FILE_INDEX first) (#1273) (#1296)
+  - feat: borrow a same-owner peer's service over the mesh (gate, identity, serving receipt, work record) (#1294)
+  - feat(services): generic sandboxed-module runtime profile (no network, read-only, caps dropped) (#1288) (#1292)
+  - feat: generic node job lifecycle contract (handlers declare capabilities; FILE_INDEX first adopter) (#1290)
+
+
