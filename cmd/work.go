@@ -2378,6 +2378,18 @@ func runWork(cmd *cobra.Command, args []string) {
 	// not connected to the AceTeam Network. Never fails the worker.
 	startEgressRelay(ctx)
 
+	// Dispatched work signs its receipts with the SAME machine-convergent node
+	// identity the AEP chat receipt + CSR path use (aceteam#10876 C7 / #1287).
+	// Constructed ONCE here, above the gateway block, so the serving-side borrow
+	// receipts (citadel-cli#1289, wired into gw.SetBorrowServer below), the
+	// HANDLER-signed path (FILE_INDEX, embedding), and the RUNNER-signed path
+	// (LLM_INFERENCE) all share one signer. NodeID prefers the fabric node id
+	// (#8139), else the signer's fingerprint. Injected (never resolved inside
+	// internal/worker or internal/gateway) so a test never signs with this box's
+	// real node identity.
+	workReceiptSigner := nodeidentity.Convergent(network.GetNodeConfigDir())
+	workReceiptNodeID := config.LoadDeviceCredsConverged().FabricNodeID
+
 	// Start in-process HTTPS gateway if enabled
 	if workGateway {
 		// Validate that gateway port does not collide with upstream ports
@@ -2554,6 +2566,31 @@ func runWork(cmd *cobra.Command, args []string) {
 			return store.Snapshot(), cacheindex.DefaultCacheRoot()
 		})
 
+		// Peer-service borrowing — serving side (citadel-cli#1289). Opt-in
+		// (CITADEL_BORROW_SERVE, default OFF): when enabled, a same-owner mesh peer
+		// (or the platform infra identity) can borrow a loopback service
+		// (embedding -> TEI, transcription -> whisper) over this same gateway, with
+		// a signed serving work receipt + work record. Reuses the mesh resolver +
+		// the machine-convergent signer wired above; the platform allowlist is the
+		// SAME platform-exposure.json the gateway's platform exposures already
+		// honor. A nil usage store leaves serving signing intact (still fails closed
+		// when unsigned) but writes no local ledger row. When off, SetBorrowServer
+		// is not called, so the /borrow/ routes are never registered.
+		if borrowServeEnabled() {
+			var borrowInsertUsage func(usage.UsageRecord) error
+			if usageStore != nil {
+				borrowInsertUsage = func(r usage.UsageRecord) error { return usageStore.Insert(r) }
+			}
+			gw.SetBorrowServer(buildBorrowServeConfig(borrowServerDeps{
+				Signer:        workReceiptSigner,
+				NodeID:        workReceiptNodeID,
+				NodeName:      nodeName,
+				InsertUsage:   borrowInsertUsage,
+				AllowedLogins: platformAllowedLogins,
+			}))
+			fmt.Println("   - Peer-service borrowing: serving ENABLED (same-owner/platform-infra, signed receipts)")
+		}
+
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,
 			StripPrefix: true,
@@ -2682,14 +2719,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	// helper so the control-center TUI registers the exact same set when it is the
 	// only worker on the node.
 	workPerms := workAppliedPermissions
-	// Dispatched work signs its receipts with the SAME machine-convergent node
-	// identity the AEP chat receipt + CSR path use (aceteam#10876 C7 / #1287).
-	// Captured once so the HANDLER-signed path (FILE_INDEX, embedding — via
-	// LegacyHandlerOpts) and the RUNNER-signed path (LLM_INFERENCE — via
-	// RunnerConfig below) share one signer. NodeID prefers the fabric node id
-	// (#8139), else the signer's fingerprint.
-	workReceiptSigner := nodeidentity.Convergent(network.GetNodeConfigDir())
-	workReceiptNodeID := config.LoadDeviceCredsConverged().FabricNodeID
+	// workReceiptSigner / workReceiptNodeID are constructed once above the gateway
+	// block (so the borrow serving receipts share the same signer); reused here
+	// for the HANDLER-signed path (FILE_INDEX, embedding — via LegacyHandlerOpts)
+	// and the RUNNER-signed path (LLM_INFERENCE — via RunnerConfig below).
 	nodeJobOpts := nodeJobHandlerOpts{
 		Source:         source,
 		OrgID:          nodeJobOrgID(),

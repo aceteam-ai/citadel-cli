@@ -194,6 +194,59 @@ func TestBuildUsageRecordNativeUsageUnchanged(t *testing.T) {
 	}
 }
 
+// TestBuildUsageRecordBorrowAttributionFromOutput pins the requester-side
+// peer-service-borrow attribution (citadel-cli#1289): a handler that borrowed a
+// unit of work from a peer sets delegated_node_id + receipt_ids in its output
+// usage map, and buildUsageRecord carries them onto the record — OVERRIDING any
+// envelope-carried values (the runtime borrow decision is more specific than the
+// dispatch-time envelope).
+func TestBuildUsageRecordBorrowAttributionFromOutput(t *testing.T) {
+	job := &Job{
+		ID:   "parent-1",
+		Type: "file_index",
+		Payload: map[string]any{
+			// Envelope defaults (what the producer sent).
+			"delegated_node_id": "envelope-node",
+			"receipt_ids":       []any{"envelope-receipt"},
+		},
+	}
+	result := &JobResult{
+		Status: JobStatusSuccess,
+		Output: map[string]any{
+			"usage": map[string]any{
+				"action":            "index",
+				"delegated_node_id": "serving-node-xyz",
+				"receipt_ids":       []any{"serving-receipt-abc"},
+			},
+		},
+	}
+	rec := buildUsageRecord(job, "success", time.Now(), time.Now(), result, nil)
+	if rec.DelegatedNodeID != "serving-node-xyz" {
+		t.Errorf("delegated_node_id = %q, want the serving node (output wins over envelope)", rec.DelegatedNodeID)
+	}
+	if len(rec.ReceiptIDs) != 1 || rec.ReceiptIDs[0] != "serving-receipt-abc" {
+		t.Errorf("receipt_ids = %v, want the serving receipt (output wins over envelope)", rec.ReceiptIDs)
+	}
+}
+
+// TestBuildUsageRecordBorrowAttributionEnvelopeWhenNoOutput pins that the
+// envelope values still apply when the output carries no borrow attribution (a
+// non-borrowing job is unaffected).
+func TestBuildUsageRecordBorrowAttributionEnvelopeWhenNoOutput(t *testing.T) {
+	job := &Job{
+		ID:   "parent-2",
+		Type: "file_index",
+		Payload: map[string]any{
+			"delegated_node_id": "envelope-node",
+		},
+	}
+	result := &JobResult{Status: JobStatusSuccess, Output: map[string]any{}}
+	rec := buildUsageRecord(job, "success", time.Now(), time.Now(), result, nil)
+	if rec.DelegatedNodeID != "envelope-node" {
+		t.Errorf("delegated_node_id = %q, want envelope value when output has none", rec.DelegatedNodeID)
+	}
+}
+
 // TestCreateLegacyHandlers_FileIndexSignsWhenSignerWired is the construction-site
 // guard: when a signer is threaded through CreateLegacyHandlersWithOpts, a
 // FILE_INDEX dispatch produces a SIGNED work receipt; without one it is unsigned.
