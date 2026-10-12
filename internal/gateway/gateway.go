@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/serviceborrow"
 )
 
 // ModuleRoutePrefix is the namespace under which EVERY provisioned module is
@@ -244,6 +245,16 @@ type Server struct {
 	// same-owner identity + Files capability + node passcode) and the per-family
 	// read surface. Registered from Start alongside the chat routes.
 	cacheProvider CacheIndexProvider
+
+	// borrowCfg, when non-nil, enables the peer-service borrowing routes
+	// (/borrow/...) — the SERVING side of citadel-cli#1289. It lets a same-owner
+	// mesh peer (or the platform infra identity) borrow a loopback service
+	// (embedding, transcription, ...) over the mesh, with a signed serving work
+	// receipt + work record. Set via SetBorrowServer; see borrow_serve.go for the
+	// gate (serviceborrow.Decide over this server's meshResolver) and the
+	// proxy-to-loopback read surface. Registered from Start alongside the cache
+	// routes.
+	borrowCfg *BorrowServeConfig
 }
 
 // NewServer creates a new gateway server.
@@ -437,6 +448,16 @@ func categoryForPath(path string) string {
 	if strings.HasPrefix(path, CacheRoutePrefix) {
 		return ""
 	}
+	// Peer-service borrowing routes (/borrow/...) are gated SOLELY by the borrow
+	// handler's own same-owner/platform-infra identity check (which, unlike this
+	// capability layer, fails CLOSED), and the signed work record is the meter —
+	// so they are deliberately NOT routed through permissionMiddleware or the
+	// metering middleware. Always-allow here so the capability/passcode gate never
+	// runs before the handler's identity-first gate. See borrow_serve.go
+	// (citadel-cli#1289).
+	if strings.HasPrefix(path, serviceborrow.RoutePrefix) {
+		return ""
+	}
 	// Terminal/console
 	if path == "/terminal" || strings.HasPrefix(path, "/terminal/") {
 		return "console"
@@ -563,6 +584,13 @@ func (s *Server) Start(ctx context.Context) error {
 	// identity-first authorize check. See cache_serve.go.
 	if s.cacheProvider != nil {
 		s.registerCacheRoutes()
+	}
+	// Peer-service borrowing routes (/borrow/...) — the serving side of
+	// citadel-cli#1289. Like the cache routes, they ride the same mux (LAN + VPN
+	// listeners), gated SOLELY by the borrow handler's own same-owner/infra
+	// identity check (borrow_serve.go).
+	if s.borrowCfg != nil {
+		s.registerBorrowRoutes()
 	}
 	// Any route added after this point (WireModuleRoute) must register its own
 	// proxy handler live, since this loop has already run.

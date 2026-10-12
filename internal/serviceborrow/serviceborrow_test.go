@@ -75,6 +75,14 @@ func TestServiceIdentityMatch_EmptyWantedModel_NoConstraint(t *testing.T) {
 	}
 }
 
+func TestServiceIdentityMatch_EmptyWantedKind_FailsClosed(t *testing.T) {
+	adv := ServiceIdentity{Kind: ""}
+	want := ServiceIdentity{Kind: ""}
+	if err := adv.Match(want); err == nil {
+		t.Fatal("an empty wanted kind must fail closed, not match two empty kinds")
+	}
+}
+
 func TestServiceIdentityMatch_VersionExactCaseSensitive(t *testing.T) {
 	adv := ServiceIdentity{Kind: "embedding", Version: "V1"}
 	want := ServiceIdentity{Kind: "embedding", Version: "v1"}

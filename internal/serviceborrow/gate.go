@@ -81,7 +81,11 @@ func Decide(id *PeerIdentity, allowed map[string]bool) error {
 		return &AuthzError{Reason: ReasonUnverified, Detail: "peer has no verified stable/owner id"}
 	}
 	sameOwner := id.SameOwner && id.OwnerID != ""
-	if sameOwner || allowed[id.LoginName] {
+	// An allowlisted login must be a non-empty, verified login. Guarding against
+	// an empty login keeps a future caller's accidental {"": true} allowlist from
+	// admitting a login-less identity (the production loader already refuses empty
+	// logins; Decide is a reusable pure function and must not depend on that).
+	if sameOwner || (id.LoginName != "" && allowed[id.LoginName]) {
 		return nil
 	}
 	return &AuthzError{Reason: ReasonNotAuthorized, Detail: fmt.Sprintf("peer %q (%s) is not a same-owner or platform-infra peer", id.NodeName, id.LoginName)}

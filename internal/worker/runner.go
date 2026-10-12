@@ -1838,6 +1838,18 @@ func applyUsageMap(r *usage.UsageRecord, usg map[string]any) {
 	if b, ok := usg["signed"].(bool); ok {
 		r.ReceiptSigned = b
 	}
+	// Peer-service borrowing attribution (citadel-cli#1289). When a REQUESTER
+	// borrows a unit of work from a peer at RUNTIME (a decision the node makes, not
+	// the producer), the handler sets these in its output usage map so central
+	// fabric_run_work can join this node's work to the peer that served it. They
+	// OVERRIDE the envelope-carried values buildUsageRecord read earlier (the
+	// runtime decision is more specific than the dispatch-time envelope).
+	if s, ok := usg["delegated_node_id"].(string); ok && s != "" {
+		r.DelegatedNodeID = s
+	}
+	if ids := payloadStringSlice(usg, "receipt_ids"); ids != nil {
+		r.ReceiptIDs = ids
+	}
 	if units, ok := usg["units"].(map[string]any); ok {
 		r.Units = unitsFromAny(units)
 	}

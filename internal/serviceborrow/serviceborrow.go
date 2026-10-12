@@ -108,6 +108,11 @@ type Advertisement struct {
 // An empty wanted Model/Version is "no constraint on that field". #1270 adds the
 // embedding-specific dtype/dimension checks on top of this; they are NOT here.
 func (adv ServiceIdentity) Match(want ServiceIdentity) error {
+	// An empty wanted kind is a caller bug: a requester must always name the
+	// service kind it needs. Fail closed rather than let two empty kinds "match".
+	if strings.TrimSpace(want.Kind) == "" {
+		return &IdentityMismatchError{Field: "kind", Want: want.Kind, Got: adv.Kind}
+	}
 	if !strings.EqualFold(strings.TrimSpace(adv.Kind), strings.TrimSpace(want.Kind)) {
 		return &IdentityMismatchError{Field: "kind", Want: want.Kind, Got: adv.Kind}
 	}

@@ -150,6 +150,21 @@ func TestDecide_NonAllowlistedForeignLogin_Refused(t *testing.T) {
 	}
 }
 
+func TestDecide_EmptyLoginNeverAdmittedByAllowlist(t *testing.T) {
+	// A verified-but-not-same-owner identity with an empty LoginName must not be
+	// admitted by an accidental {"": true} allowlist.
+	id := &PeerIdentity{
+		NodeName:  "no-login",
+		LoginName: "",
+		StableID:  "nodekey:x",
+		OwnerID:   "userid:7",
+		SameOwner: false,
+	}
+	if err := Decide(id, map[string]bool{"": true}); err == nil {
+		t.Fatal("an empty login must never be admitted by the allowlist")
+	}
+}
+
 // --- Authorize: resolver wiring + fail-closed + RemoteAddr binding --------
 
 func TestAuthorize_NilResolver_FailsClosed(t *testing.T) {
