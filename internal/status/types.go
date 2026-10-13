@@ -18,6 +18,10 @@ import (
 // NodeStatus represents the complete status of a Citadel node.
 // This is the payload sent in heartbeats and returned from /status endpoint.
 type NodeStatus struct {
+	// Cached daemon report. Unknown is explicit null, never false/synced.
+	NTPSynced *bool `json:"ntp_synced"`
+	// Optional S5 placeholder; nil means no measurement, not zero recordings.
+	Recordings   *RecordingsSummary    `json:"recordings,omitempty"`
 	Version      string                `json:"version"`
 	Timestamp    time.Time             `json:"timestamp"`
 	Node         NodeInfo              `json:"node"`
@@ -106,6 +110,11 @@ type NodeStatus struct {
 	// nvrHealthFrom (internal/status cannot import internal/nvr);
 	// TestNVRHealthShapeParity pins the two shapes.
 	NVR *NVRHealth `json:"nvr,omitempty"`
+}
+
+type RecordingsSummary struct {
+	Count int64 `json:"count"`
+	Bytes int64 `json:"bytes"`
 }
 
 // CacheReport is the heartbeat-facing projection of a cacheindex.Index

@@ -8,6 +8,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
@@ -22,6 +23,7 @@ import (
 
 // Collector gathers status metrics from the system, GPU, and services.
 type Collector struct {
+	clockState       clockstate.Provider
 	nodeName         string
 	configDir        string
 	services         []ServiceConfig
@@ -58,6 +60,8 @@ type ServiceConfig struct {
 
 // CollectorConfig holds configuration for the status collector.
 type CollectorConfig struct {
+	// Cheap cached provider shared with this process's runner. No inline probe.
+	ClockState   clockstate.Provider
 	NodeName     string
 	ConfigDir    string
 	Services     []ServiceConfig
@@ -146,6 +150,7 @@ type CollectorConfig struct {
 // NewCollector creates a new status collector.
 func NewCollector(cfg CollectorConfig) *Collector {
 	return &Collector{
+		clockState:       cfg.ClockState,
 		nodeName:         cfg.NodeName,
 		configDir:        cfg.ConfigDir,
 		services:         cfg.Services,
@@ -344,9 +349,17 @@ func (c *Collector) SetCapabilities(caps *NodeCapabilities) {
 	c.capabilities = caps
 }
 
+func (c *Collector) clockSynchronization() *bool {
+	if c.clockState == nil {
+		return nil
+	}
+	return clockstate.Boolean(c.clockState.Snapshot())
+}
+
 // Collect gathers all status metrics and returns a NodeStatus.
 func (c *Collector) Collect() (*NodeStatus, error) {
 	status := &NodeStatus{
+		NTPSynced: c.clockSynchronization(),
 		Version:   StatusVersion,
 		Timestamp: time.Now().UTC(),
 	}

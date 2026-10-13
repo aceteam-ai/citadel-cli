@@ -95,6 +95,16 @@ type ExecutionMetrics struct {
 	NodesExecuted int           `json:"nodes_executed"`
 }
 
+// Handler output carries Metrics directly rather than Execution.MarshalJSON.
+// Convert at this serialization owner, retaining internal monotonic Duration
+// and the already-correct Execution serializer's separate millisecond struct.
+func (m ExecutionMetrics) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		TotalDuration int64 `json:"total_duration_ms"`
+		NodesExecuted int   `json:"nodes_executed"`
+	}{m.TotalDuration.Milliseconds(), m.NodesExecuted})
+}
+
 type ShellConfig struct {
 	AllowList    []string
 	DenyList     []string

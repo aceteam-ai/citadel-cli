@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
+	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
@@ -26,6 +27,8 @@ type Runner struct {
 	handlers     []JobHandler
 	config       RunnerConfig
 	agentVersion string
+	clockState   clockstate.Provider
+	wallNow      func() time.Time
 
 	// Optional integrations (set via WithXxx methods)
 	streamWriterFactory func(job *Job) StreamWriter
@@ -136,11 +139,15 @@ type RunnerConfig struct {
 	// WorkReceiptNodeID is the preferred receipt node_id (the fabric node id);
 	// empty falls back to the signer's own public-key fingerprint.
 	WorkReceiptNodeID string
+	// ClockState is a cheap cached observation, not a probe or execution gate.
+	ClockState clockstate.Provider
 }
 
 // NewRunner creates a new job runner.
 func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Runner {
 	r := &Runner{
+		clockState:         config.ClockState,
+		wallNow:            time.Now,
 		source:             source,
 		handlers:           handlers,
 		config:             config,
@@ -631,13 +638,20 @@ func yieldsFineTune(t string) bool {
 	return false
 }
 
+func (r *Runner) clockNow() time.Time {
+	if r.wallNow != nil {
+		return r.wallNow()
+	}
+	return time.Now()
+}
+
 // newStreamWriter builds the per-job stream writer, falling back to a no-op
 // writer when no factory is configured (e.g. Nexus HTTP source).
 func (r *Runner) newStreamWriter(job *Job) StreamWriter {
 	if r.streamWriterFactory != nil {
-		return r.streamWriterFactory(job)
+		return observeStream(r.streamWriterFactory(job), job.clock)
 	}
-	return &NoOpStreamWriter{}
+	return observeStream(&NoOpStreamWriter{}, job.clock)
 }
 
 // streamWriteRetryAttempts / streamWriteRetryBackoff bound the retry
@@ -792,6 +806,7 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// publish never landed. retryStreamWrite gives it a couple of quick extra
 	// chances before this still falls back to a log-and-proceed non-fatal
 	// warning, same as before.
+	job.clock = newDeliveryClock(r.clockNow, r.clockState)
 	stream = r.newStreamWriter(job)
 	if err := retryStreamWrite(ctx, func() error { return stream.WriteClaimed(r.agentVersion) }); err != nil {
 		r.log("warning", "Failed to publish claimed event for job %s: %v", job.ID, err)
@@ -1035,6 +1050,10 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	cancelled := stopCancellationWatch()
 
 	endTime := time.Now()
+	// Capture after execution using the separate wall seam, never for duration
+	// arithmetic. Handler-owned early terminal observations remain immutable.
+	job.clock.finish(r.clockNow())
+	job.clock.populate(result)
 	duration := endTime.Sub(startTime)
 	if cancelled {
 		if errors.Is(err, jobs.ErrHuddleTerminalOwned) {
@@ -1506,6 +1525,8 @@ func (r *Runner) publishWorkerControlRefusal(ctx context.Context, stream StreamW
 // duplicating it -- duplicating it is how a "queued" job would end up Acked with
 // no terminal event, reintroducing the #559 bug this design exists to avoid.
 func (r *Runner) finishSuccess(ctx context.Context, job *Job, stream StreamWriter, result *JobResult, startTime, endTime time.Time) {
+	job.clock.finish(r.clockNow())
+	job.clock.populate(result)
 	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
 	var output map[string]any
 	if result != nil {
@@ -1685,9 +1706,9 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 	// non-recoverable: retrying an unsupported type on the same node is futile.
 	var stream StreamWriter
 	if r.streamWriterFactory != nil {
-		stream = r.streamWriterFactory(job)
+		stream = observeStream(r.streamWriterFactory(job), job.clock)
 	} else {
-		stream = &NoOpStreamWriter{}
+		stream = observeStream(&NoOpStreamWriter{}, job.clock)
 	}
 	if werr := stream.WriteError(err, false); werr != nil {
 		r.log("warning", "Failed to publish unsupported-type error for job %s: %v", job.ID, werr)

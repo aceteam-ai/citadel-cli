@@ -17,13 +17,19 @@
 package worker
 
 import (
-	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"strconv"
+	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 )
 
 // Job represents a unit of work to be processed.
 // This is the common job format used internally, regardless of source.
 type Job struct {
+	// Passive delivery-scoped wall observations, never scheduling authority.
+	clock *deliveryClock `json:"-"`
 	// Passive original delivery snapshot, not handler execution authority.
 	observation *deliverymetadata.Observation `json:"-"`
 	// ID uniquely identifies this job
@@ -75,6 +81,9 @@ type JobMetadata struct {
 
 // JobResult contains the outcome of job processing.
 type JobResult struct {
+	TClaimWallNs *int64           `json:"t_claim_wall_ns,string,omitempty"`
+	TDoneWallNs  *int64           `json:"t_done_wall_ns,string,omitempty"`
+	ClockState   clockstate.State `json:"clock_state,omitempty"`
 	// Status is the job outcome (success, failure, retry)
 	Status JobStatus
 
@@ -86,6 +95,78 @@ type JobResult struct {
 
 	// Duration is how long the job took to process
 	Duration time.Duration
+}
+
+// deliveryClock belongs to an attempt, not a job ID. A handler may emit its
+// terminal before returning; that first carrier is an observation boundary,
+// not a claim that resource teardown has completed. Publication retries reuse
+// these values. RawPayload and the existing monotonic duration are untouched.
+type deliveryClock struct {
+	mu       sync.Mutex
+	claim    int64
+	done     *int64
+	state    clockstate.State
+	now      func() time.Time
+	provider clockstate.Provider
+}
+
+func newDeliveryClock(now func() time.Time, provider clockstate.Provider) *deliveryClock {
+	return &deliveryClock{claim: now().UnixNano(), now: now, provider: provider}
+}
+
+func (c *deliveryClock) finish(at time.Time) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.done != nil {
+		return
+	}
+	ns := at.UnixNano()
+	c.done = &ns
+	c.state = clockstate.Unknown
+	if c.provider != nil {
+		c.state = clockstate.Normalize(c.provider.Snapshot())
+	}
+}
+
+func (c *deliveryClock) finishNow() {
+	if c != nil {
+		c.finish(c.now())
+	}
+}
+
+func (c *deliveryClock) data(data map[string]any, terminal bool) map[string]any {
+	if c == nil {
+		return data
+	}
+	if terminal {
+		c.finishNow()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	data["t_claim_wall_ns"] = strconv.FormatInt(c.claim, 10)
+	if terminal {
+		data["t_done_wall_ns"] = strconv.FormatInt(*c.done, 10)
+		data["clock_state"] = c.state
+	}
+	return data
+}
+
+func (c *deliveryClock) populate(result *JobResult) {
+	if c == nil || result == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	claim := c.claim
+	result.TClaimWallNs = &claim
+	if c.done != nil {
+		done := *c.done
+		result.TDoneWallNs = &done
+		result.ClockState = c.state
+	}
 }
 
 // JobStatus represents the outcome of job processing.
