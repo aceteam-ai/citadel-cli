@@ -1,0 +1,29 @@
+{
+  "scope": "internal_source_only",
+  "wireSchema": "unavailable",
+  "responseAuthority": "unavailable",
+  "activation": "disabled",
+  "errorCode": "r2_not_activated",
+  "verbs": [
+    "register",
+    "consume",
+    "release",
+    "start",
+    "settle",
+    "recover",
+    "status"
+  ],
+  "forbiddenActivationBy": [
+    "environment",
+    "header",
+    "config"
+  ],
+  "ioBeforeRefusal": [
+    "http",
+    "websocket",
+    "auth",
+    "redis",
+    "queue",
+    "coordinator"
+  ]
+}
