@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestWorkflowGraph_Validate_Valid(t *testing.T) {
@@ -19,6 +20,33 @@ func TestWorkflowGraph_Validate_Valid(t *testing.T) {
 	}
 	if err := g.Validate(); err != nil {
 		t.Fatalf("expected valid graph, got error: %v", err)
+	}
+}
+
+func TestClockMetricsSerializationOwnerMilliseconds(t *testing.T) {
+	for _, duration := range []time.Duration{1500 * time.Millisecond, 999 * time.Microsecond, -1500 * time.Millisecond} {
+		metrics := &ExecutionMetrics{TotalDuration: duration, NodesExecuted: 2}
+		for _, value := range []any{map[string]any{"metrics": metrics}, &Execution{Metrics: metrics}} {
+			b, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out struct {
+				Metrics struct {
+					TotalDuration int64 `json:"total_duration_ms"`
+					NodesExecuted int   `json:"nodes_executed"`
+				} `json:"metrics"`
+			}
+			if err = json.Unmarshal(b, &out); err != nil {
+				t.Fatal(err)
+			}
+			if out.Metrics.TotalDuration != duration.Milliseconds() || out.Metrics.NodesExecuted != 2 {
+				t.Fatalf("wrong owner units/no double divide: %s", b)
+			}
+		}
+		if metrics.TotalDuration != duration {
+			t.Fatal("internal duration mutated")
+		}
 	}
 }
 

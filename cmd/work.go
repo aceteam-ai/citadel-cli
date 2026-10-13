@@ -27,6 +27,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/footprint"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
@@ -375,6 +376,8 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	clockMonitor, stopClockMonitor := startClockMonitor(ctx)
+	defer stopClockMonitor()
 
 	// Cache index (citadel #682 P2a, docs/design-cache-ownership.md §8):
 	// initialize the process-wide store as early as possible, before
@@ -1621,7 +1624,8 @@ func runWork(cmd *cobra.Command, args []string) {
 	var collector *status.Collector
 	if workStatusPort > 0 {
 		collector = status.NewCollector(status.CollectorConfig{
-			NodeName: nodeName,
+			ClockState: clockMonitor,
+			NodeName:   nodeName,
 			// ConfigDir is normally "" on the heartbeat path (engines are probed,
 			// not read from the manifest). Model hotswap (#632) needs it to
 			// enumerate installed-but-stopped engines, so pass it only when enabled.
@@ -1961,6 +1965,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Create collector if not already created
 		if collector == nil {
 			collector = status.NewCollector(status.CollectorConfig{
+				ClockState:          clockMonitor,
 				NodeName:            nodeName,
 				ConfigDir:           hotswapConfigDir(workConfigDir),
 				Services:            nil,
@@ -2835,6 +2840,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// State threads the shared introspection metrics so the /agent/* endpoints
 	// can report consume/job activity.
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
+		ClockState:     clockMonitor,
 		WorkerID:       workerID,
 		NodeID:         headscaleNodeID,
 		AgentVersion:   Version,
@@ -4072,6 +4078,17 @@ func permissionsToHeartbeat(p *config.Permissions) *heartbeat.PermissionState {
 func currentPermissionsForHeartbeat(applied *config.Permissions) *heartbeat.PermissionState {
 	desired := loadNodePermissions()
 	return permissionsToHeartbeatWithApplied(desired, applied)
+}
+
+// Explicit lifecycle ownership: imports/constructors/getters never probe. The
+// loop is shared by heartbeat and job completion; OS uninterruptible reap is
+// not an absolute wall-time guarantee.
+func startClockMonitor(parent context.Context) (*clockstate.Monitor, func()) {
+	monitor := clockstate.New()
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() { defer close(done); monitor.Run(ctx) }()
+	return monitor, func() { cancel(); <-done }
 }
 
 func permissionsToHeartbeatWithApplied(desired, applied *config.Permissions) *heartbeat.PermissionState {

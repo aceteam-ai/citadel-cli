@@ -2,6 +2,7 @@ package heartbeat
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -22,6 +23,44 @@ import (
 type failCommandHook struct {
 	command string
 	err     error
+}
+
+func TestClockHeartbeatRedisExactNullableJSON(t *testing.T) {
+	for _, state := range []string{"synced", "unsynced", "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			pub, mr, _ := newTestRedisPublisher(t)
+			msg := testStatusMessage()
+			if state != "unknown" {
+				value := state == "synced"
+				msg.Status.NTPSynced = &value
+			}
+			msg.Status.Recordings = &status.RecordingsSummary{}
+			if err := pub.publishMessage(context.Background(), msg, ""); err != nil {
+				t.Fatal(err)
+			}
+			entries := streamEntries(t, mr)
+			if len(entries) != 1 {
+				t.Fatal("durable heartbeat missing")
+			}
+			var wire map[string]any
+			if err := json.Unmarshal([]byte(entries[0]["payload"]), &wire); err != nil {
+				t.Fatal(err)
+			}
+			status := wire["status"].(map[string]any)
+			want := any(nil)
+			if state != "unknown" {
+				want = state == "synced"
+			}
+			got, exists := status["ntp_synced"]
+			if !exists || got != want {
+				t.Fatal("nullable field changed", wire)
+			}
+			recordings := status["recordings"].(map[string]any)
+			if recordings["count"] != float64(0) || recordings["bytes"] != float64(0) {
+				t.Fatal("explicit zero placeholder changed")
+			}
+		})
+	}
 }
 
 func (h failCommandHook) DialHook(next redis.DialHook) redis.DialHook { return next }

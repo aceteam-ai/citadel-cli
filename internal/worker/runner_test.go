@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
 	jobhandlers "github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
@@ -35,6 +38,272 @@ type MockJobSource struct {
 	// call within the same Run(). Default false preserves every pre-existing
 	// test's exact behavior (a Nack'd job is never seen again).
 	requeueOnNack bool
+}
+
+type clockFixtureHandler struct {
+	run func(context.Context, *Job, StreamWriter) (*JobResult, error)
+}
+
+type clockOrderSource struct {
+	*MockJobSource
+	order  *[]string
+	ackErr error
+}
+
+func (s clockOrderSource) Ack(ctx context.Context, j *Job) error {
+	*s.order = append(*s.order, "ack")
+	if s.ackErr != nil {
+		return s.ackErr
+	}
+	return s.MockJobSource.Ack(ctx, j)
+}
+
+type clockOrderWriter struct {
+	*clockCaptureWriter
+	order *[]string
+}
+
+func (w clockOrderWriter) WriteEnd(out map[string]any) error {
+	*w.order = append(*w.order, "end")
+	return w.clockCaptureWriter.WriteEnd(out)
+}
+
+func TestRunnerClockSyntheticAndWorkerControlOrdering(t *testing.T) {
+	for _, name := range []string{"warming", "workerControl", "workerControlAckRefusal"} {
+		t.Run(name, func(t *testing.T) {
+			order := []string{}
+			base := NewMockJobSource("fixture", nil)
+			source := clockOrderSource{MockJobSource: base, order: &order}
+			if name == "workerControlAckRefusal" {
+				source.ackErr = errors.New("synthetic ack failure")
+			}
+			job := &Job{ID: "synthetic-terminal", Type: JobTypeWorkerControl, Payload: map[string]any{}}
+			var ns int64 = 100
+			r := NewRunner(source, nil, RunnerConfig{ActivityFn: func(string, string) {}})
+			r.wallNow = func() time.Time { return time.Unix(0, ns) }
+			capture := &clockCaptureWriter{job: job}
+			writer := clockOrderWriter{clockCaptureWriter: capture, order: &order}
+			r.WithStreamWriterFactory(func(*Job) StreamWriter { return writer })
+			_, stream, start := r.claimJob(context.Background(), job)
+			ns = 200
+			if name == "warming" {
+				r.finishQueueWaitExceeded(context.Background(), job, stream, start)
+			} else {
+				r.finishWorkerControl(context.Background(), job, stream, NewMockJobHandler(JobTypeWorkerControl, false), &JobResult{Status: JobStatusSuccess, Output: map[string]any{"accepted": false}}, start, time.Now())
+			}
+			wantOrder := []string{"ack", "end"}
+			if name == "warming" {
+				wantOrder = []string{"end", "ack"}
+			}
+			if !reflect.DeepEqual(order, wantOrder) || len(capture.carriers) != 1 {
+				t.Fatal("special-path event/ACK order changed", order)
+			}
+			if capture.carriers[0]["t_claim_wall_ns"] != "100" || capture.carriers[0]["t_done_wall_ns"] != "200" || capture.carriers[0]["clock_state"] != clockstate.Unknown {
+				t.Fatal("synthetic carrier missing timing", capture.carriers)
+			}
+		})
+	}
+}
+
+func TestRunnerClockSigningPreflightCarrierWithoutExecution(t *testing.T) {
+	job := &Job{ID: "synthetic-signing-refusal", Type: JobTypeLLMInference, Payload: map[string]any{}}
+	h := &declaringHandler{jobType: JobTypeLLMInference, caps: jobhandlers.JobCapabilities{WorkActions: []string{jobhandlers.WorkActionInference}, ReceiptOwner: jobhandlers.ReceiptOwnerRunner}, result: inferenceSuccess()}
+	s := NewMockJobSource("fixture", nil)
+	r := NewRunner(s, []JobHandler{h}, RunnerConfig{WorkReceiptSigner: fpErrSigner{}, ActivityFn: func(string, string) {}})
+	var ns int64 = 100
+	r.wallNow = func() time.Time { return time.Unix(0, ns) }
+	w := &clockCaptureWriter{job: job}
+	r.WithStreamWriterFactory(func(*Job) StreamWriter { return w })
+	_, stream, start := r.claimJob(context.Background(), job)
+	ns = 200
+	if r.executeJob(context.Background(), job, stream, start, false, 0) {
+		t.Fatal("preflight unexpectedly succeeded")
+	}
+	if len(w.carriers) != 1 || w.carriers[0]["t_done_wall_ns"] != "200" || len(s.FailedJobs()) != 1 || w.started {
+		t.Fatal("preflight carrier/execution changed")
+	}
+}
+
+func (h clockFixtureHandler) CanHandle(typ string) bool { return typ == "CLOCK_FIXTURE" }
+func (h clockFixtureHandler) Execute(ctx context.Context, j *Job, w StreamWriter) (*JobResult, error) {
+	return h.run(ctx, j, w)
+}
+
+type clockCaptureWriter struct {
+	MockStreamWriter
+	job      *Job
+	carriers []map[string]any
+	kinds    []string
+}
+
+func (w *clockCaptureWriter) WriteEnd(out map[string]any) error {
+	w.carriers = append(w.carriers, w.job.clock.data(map[string]any{"result": out}, true))
+	w.kinds = append(w.kinds, "end")
+	return w.MockStreamWriter.WriteEnd(out)
+}
+func (w *clockCaptureWriter) WriteError(err error, recoverable bool) error {
+	w.carriers = append(w.carriers, w.job.clock.data(map[string]any{"error": err.Error(), "recoverable": recoverable}, true))
+	w.kinds = append(w.kinds, "error")
+	return w.MockStreamWriter.WriteError(err, recoverable)
+}
+func (w *clockCaptureWriter) WriteCancelled(reason string) error {
+	w.carriers = append(w.carriers, w.job.clock.data(map[string]any{"reason": reason}, true))
+	w.kinds = append(w.kinds, "cancelled")
+	return w.MockStreamWriter.WriteCancelled(reason)
+}
+
+func TestRunnerClockExistingTerminalAndRetrySemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		status                   JobStatus
+		err                      error
+		earlyCancel, unsupported bool
+		kind                     string
+		ack, nack, fail          int
+	}{
+		{name: "success", status: JobStatusSuccess, kind: "end", ack: 1},
+		{name: "nilSuccess", kind: "end", ack: 1},
+		{name: "terminalFailure", status: JobStatusTerminalFailure, err: errors.New("synthetic"), kind: "error", fail: 1},
+		{name: "lastAttemptError", err: errors.New("synthetic"), kind: "error", nack: 1},
+		{name: "retryNoExtraEvent", status: JobStatusRetry, nack: 1},
+		{name: "earlyCancel", earlyCancel: true, kind: "cancelled", ack: 1},
+		{name: "handlerCancelledNoExtraEvent", status: JobStatusCancelled, ack: 1},
+		{name: "unsupported", unsupported: true, kind: "error", fail: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &Job{ID: "same-id", Type: "CLOCK_FIXTURE", Payload: map[string]any{}, Metadata: JobMetadata{MaxAttempts: 1}}
+			if tc.unsupported {
+				job.Type = "UNKNOWN_CLOCK_FIXTURE"
+			}
+			source := NewMockJobSource("fixture", nil)
+			if tc.earlyCancel {
+				source.SetCancelled(job.ID)
+			}
+			var now atomic.Int64
+			now.Store(9007199254740993)
+			var result *JobResult
+			if tc.status != "" {
+				result = &JobResult{Status: tc.status, Error: tc.err, Output: map[string]any{"synthetic": true}}
+			}
+			handler := clockFixtureHandler{func(context.Context, *Job, StreamWriter) (*JobResult, error) {
+				now.Store(9007199254740999)
+				return result, tc.err
+			}}
+			r := NewRunner(source, []JobHandler{handler}, RunnerConfig{ClockState: &fixtureClockState{clockstate.Synced}, ActivityFn: func(string, string) {}})
+			r.wallNow = func() time.Time { return time.Unix(0, now.Load()) }
+			writer := &clockCaptureWriter{job: job}
+			r.WithStreamWriterFactory(func(*Job) StreamWriter { return writer })
+			proceed, stream, start := r.claimJob(context.Background(), job)
+			if proceed {
+				r.executeJob(context.Background(), job, stream, start, false, 0)
+			}
+			if len(source.AckedJobs()) != tc.ack || len(source.NackedJobs()) != tc.nack || len(source.FailedJobs()) != tc.fail {
+				t.Fatal("ACK/Nack/Fail changed")
+			}
+			if tc.kind == "" {
+				if len(writer.carriers) != 0 {
+					t.Fatal("invented terminal", writer.kinds)
+				}
+			} else {
+				if !reflect.DeepEqual(writer.kinds, []string{tc.kind}) {
+					t.Fatal("terminal count/kind", writer.kinds)
+				}
+				data := writer.carriers[0]
+				if data["t_claim_wall_ns"] != "9007199254740993" || data["clock_state"] != clockstate.Synced {
+					t.Fatal("missing observation", data)
+				}
+				if _, ok := data["t_done_wall_ns"].(string); !ok {
+					t.Fatal("missing exact done")
+				}
+				if tc.name == "nilSuccess" {
+					if output, _ := data["result"].(map[string]any); output != nil {
+						t.Fatal("nil output changed")
+					}
+				}
+			}
+			if result != nil && proceed {
+				if result.TClaimWallNs == nil || *result.TClaimWallNs != 9007199254740993 {
+					t.Fatal("JobResult fields never populated")
+				}
+			}
+		})
+	}
+}
+
+func TestRunnerClockClaimBeforeRealLaneWaitAndImmutablePublicationRetry(t *testing.T) {
+	withFastStreamWriteRetry(t)
+	job := &Job{ID: "queued", Type: "CLOCK_FIXTURE", Payload: map[string]any{}}
+	source := NewMockJobSource("fixture", nil)
+	var now atomic.Int64
+	now.Store(100)
+	handler := clockFixtureHandler{func(context.Context, *Job, StreamWriter) (*JobResult, error) {
+		now.Store(300)
+		return &JobResult{Status: JobStatusSuccess}, nil
+	}}
+	r := NewRunner(source, []JobHandler{handler}, RunnerConfig{ClockState: &fixtureClockState{clockstate.Synced}, ActivityFn: func(string, string) {}})
+	r.wallNow = func() time.Time { return time.Unix(0, now.Load()) }
+	w := &clockCaptureWriter{job: job, MockStreamWriter: MockStreamWriter{WriteEndFailures: 2}}
+	r.WithStreamWriterFactory(func(*Job) StreamWriter { return w })
+	proceed, stream, start := r.claimJob(context.Background(), job)
+	if !proceed {
+		t.Fatal("claim refused")
+	}
+	l := newLane("clock-fixture", 1, 1, false)
+	l.exec <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); r.runLaneJob(ctx, l, job, stream, start) }()
+	now.Store(200) // queued delivery's claim must not move to admission/execution.
+	<-l.exec
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("fake lane did not finish")
+	}
+	if len(w.carriers) != 3 {
+		t.Fatal("existing retry count changed", len(w.carriers))
+	}
+	for _, data := range w.carriers {
+		if data["t_claim_wall_ns"] != "100" || data["t_done_wall_ns"] != "300" || !reflect.DeepEqual(data, w.carriers[0]) {
+			t.Fatal("lane/retry recaptured clock", data)
+		}
+	}
+	if len(source.AckedJobs()) != 1 {
+		t.Fatal("success ACK changed")
+	}
+	old := job.clock
+	now.Store(400)
+	r.claimJob(context.Background(), job)
+	if job.clock == old || job.clock.claim != 400 || job.clock.done != nil {
+		t.Fatal("redelivery inherited observation")
+	}
+}
+
+func TestRunnerClockHandlerOwnedEarlyTerminalStaysFirst(t *testing.T) {
+	job := &Job{ID: "early", Type: "CLOCK_FIXTURE", Payload: map[string]any{}}
+	var now atomic.Int64
+	now.Store(100)
+	p := &fixtureClockState{clockstate.Synced}
+	h := clockFixtureHandler{func(_ context.Context, _ *Job, w StreamWriter) (*JobResult, error) {
+		now.Store(200)
+		if err := w.WriteEnd(map[string]any{"signed": "opaque"}); err != nil {
+			return nil, err
+		}
+		p.state = clockstate.Unsynced
+		now.Store(300)
+		return &JobResult{Status: JobStatusCancelled}, nil
+	}}
+	s := NewMockJobSource("fixture", nil)
+	r := NewRunner(s, []JobHandler{h}, RunnerConfig{ClockState: p, ActivityFn: func(string, string) {}})
+	r.wallNow = func() time.Time { return time.Unix(0, now.Load()) }
+	w := &clockCaptureWriter{job: job}
+	r.WithStreamWriterFactory(func(*Job) StreamWriter { return w })
+	_, stream, start := r.claimJob(context.Background(), job)
+	r.executeJob(context.Background(), job, stream, start, false, 0)
+	if len(w.carriers) != 1 || w.carriers[0]["t_done_wall_ns"] != "200" || w.carriers[0]["clock_state"] != clockstate.Synced {
+		t.Fatal("early terminal was restamped", w.carriers)
+	}
 }
 
 func NewMockJobSource(name string, jobs []*Job) *MockJobSource {

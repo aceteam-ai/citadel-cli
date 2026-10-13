@@ -2027,6 +2027,8 @@ func acquireControlCenterWorkerLock(stateDir string, logf func(string, ...any)) 
 
 // runTUIWorker runs the worker for the TUI (simplified version of runWork)
 func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error {
+	clockMonitor, stopClockMonitor := startClockMonitor(ctx)
+	defer stopClockMonitor()
 	activity := func(level, msg string) {
 		if activityFn != nil {
 			activityFn(level, msg)
@@ -2272,6 +2274,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create status collector for heartbeat
 	collector := status.NewCollector(status.CollectorConfig{
+		ClockState:          clockMonitor,
 		NodeName:            nodeName,
 		ConfigDir:           "",
 		Services:            nil,
@@ -2510,6 +2513,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create runner with TUI callbacks
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
+		ClockState:   clockMonitor,
 		WorkerID:     workerID,
 		NodeID:       headscaleNodeID,
 		AgentVersion: Version,

@@ -36,6 +36,51 @@ type redisAPIStub struct {
 	streamPayloads []StatusMessage
 }
 
+func TestClockHeartbeatAPIExactNullableJSON(t *testing.T) {
+	for _, state := range []string{"synced", "unsynced", "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			stub := &redisAPIStub{}
+			pub, _ := newTestAPIPublisher(t, stub)
+			msg := testStatusMessage()
+			if state != "unknown" {
+				value := state == "synced"
+				msg.Status.NTPSynced = &value
+			}
+			if err := pub.publishMessage(context.Background(), msg, msg.Timestamp); err != nil {
+				t.Fatal(err)
+			}
+			landed := stub.landed()
+			if len(landed) != 1 {
+				t.Fatal("durable heartbeat missing")
+			}
+			b, err := json.Marshal(landed[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire map[string]any
+			if err = json.Unmarshal(b, &wire); err != nil {
+				t.Fatal(err)
+			}
+			status := wire["status"].(map[string]any)
+			want := any(nil)
+			if state != "unknown" {
+				want = state == "synced"
+			}
+			got, exists := status["ntp_synced"]
+			if !exists || got != want {
+				t.Fatal("nullable field changed", string(b))
+			}
+			if _, exists := status["recordings"]; exists {
+				t.Fatal("default recording placeholder fabricated")
+			}
+			pubsub, stream := stub.counts()
+			if pubsub != 1 || stream != 1 {
+				t.Fatal("publication counts changed")
+			}
+		})
+	}
+}
+
 func (s *redisAPIStub) server(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
