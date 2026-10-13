@@ -1,0 +1,60 @@
+# Orthanc-only C1 module. Mirror this directory into citadel-services/services/radiology.
+# No bridge, flow trigger, file-root authorization or automatic viewer exposure.
+schema_version: 2
+name: radiology
+version: "0.1.0"
+description: Authenticated node-local Orthanc DICOM receiver for synthetic or public de-identified studies; not for diagnostic use.
+category: tools
+author: AceTeam
+license: Apache-2.0
+homepage: https://github.com/aceteam-ai/citadel-cli/issues/1303
+requires:
+  gpu: false
+  arch: [amd64, arm64]
+ports:
+  - host: 8216
+    container: 8042
+    protocol: tcp
+    description: Authenticated Orthanc HTTP API, loopback only
+  - host: 4242
+    container: 4242
+    protocol: tcp
+    description: LAN DICOM receiver; default reservation, configurable via RADIOLOGY_DICOM_PORT
+config:
+  - name: RADIOLOGY_AET
+    description: Receiver AE title; register this exact title in the sending PACS before acceptance.
+    default: CITADEL
+  - name: PACS_AET
+    description: Allowed sending peer AE title (no unknown peers).
+    required: true
+  - name: PACS_HOST
+    description: Allowed sending peer host address; must match its connection source as seen by Orthanc.
+    required: true
+  - name: PACS_PORT
+    description: Allowed peer DICOM port.
+    default: "4242"
+  - name: RADIOLOGY_DICOM_PORT
+    description: LAN publish port; the operator must reserve/check any nondefault port against other node services.
+    default: "4242"
+  - name: RADIOLOGY_HTTP_PASSWORD
+    description: Sticky generated local HTTP password for the fixed orthanc user; never log or expose it.
+    required: true
+    generate: secret
+  - name: RADIOLOGY_STABLE_AGE
+    description: Seconds of inactivity before a study is stable (XR default; later modalities need reviewed values).
+    default: "60"
+health_check:
+  # Existing catalog.ProbeHealth accepts 401/403 as answering: transport liveness
+  # ONLY. Container health and the C8 monitor authenticate and require HTTP 200.
+  endpoint: /system
+  port: 8216
+  interval: 30s
+  timeout: 10s
+  retries: 5
+volumes:
+  - name: orthanc
+    host: ~/.citadel-cli/radiology/orthanc
+    container: /var/lib/orthanc
+    description: Private raw DICOM and index, outside the workspace; never authorize as a Files root.
+node_tags: [radiology]
+tags: [radiology, orthanc, dicom, tools, cpu]

@@ -117,6 +117,8 @@ const (
 	// like gotenberg/hermes, so this env var supplies the host publish
 	// `${CITADEL_VOICE_CLONE_HOST_PORT}` the module's compose defers to.
 	EnvVoiceCloneHostPort = "CITADEL_VOICE_CLONE_HOST_PORT"
+	// Radiology is a catalog module, not an embedded inference engine.
+	EnvRadiologyHostPort = "CITADEL_RADIOLOGY_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -234,6 +236,10 @@ const (
 	// bound to 127.0.0.1 only: enrolled voices are biometric data, the service has
 	// no auth of its own, and its sole consumer is the co-located citadel worker.
 	VoiceCloneHostPort = 8215
+	// Orthanc's authenticated HTTP API is loopback-only. DICOM has its separate
+	// well-known LAN port below; neither port is an automatic gateway exposure.
+	RadiologyHostPort  = 8216
+	RadiologyDICOMPort = 4242
 )
 
 // defaultVLLMHostPort is the vLLM host port when CITADEL_VLLM_HOST_PORT is unset.
@@ -357,6 +363,7 @@ var ServiceHostPorts = map[string]int{
 	"unlimited-ocr": UnlimitedOCRHostPort,
 	"omnivoice":     OmniVoiceHostPort,
 	"voice-clone":   VoiceCloneHostPort,
+	"radiology":     RadiologyHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -377,6 +384,7 @@ var serviceHostPortEnv = map[string]string{
 	"unlimited-ocr": EnvUnlimitedOCRHostPort,
 	"omnivoice":     EnvOmniVoiceHostPort,
 	"voice-clone":   EnvVoiceCloneHostPort,
+	"radiology":     EnvRadiologyHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,
@@ -577,6 +585,9 @@ func AllocateAppPodPort(inUse func(int) bool) (int, error) {
 var fixedComposeHostPorts = map[int]string{
 	TranscribePort:   "transcribe",
 	TEIEmbeddingPort: "tei",
+	// The radiology catalog module owns this default LAN DICOM publish. A
+	// nondefault RADIOLOGY_DICOM_PORT must be reserved by the node operator.
+	RadiologyDICOMPort: "radiology-dicom",
 }
 
 // ClaimedHostPorts returns every host port citadel claims: its own process
