@@ -1,11 +1,15 @@
 package workflow
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 type Server struct {
@@ -16,10 +20,33 @@ func NewServer(executor *Executor) *Server {
 	return &Server{executor: executor}
 }
 
-func (s *Server) RegisterRoutes(mux *http.ServeMux, authMiddleware func(http.HandlerFunc) http.HandlerFunc) {
-	mux.HandleFunc("/workflow/run", authMiddleware(s.handleRun))
-	mux.HandleFunc("/workflow/", authMiddleware(s.handleWorkflowByID))
-	mux.HandleFunc("/workflow", authMiddleware(s.handleList))
+// RegisterRoutes installs fail-closed stubs on the plaintext status listener
+// (LAN + VPN). No workflow route is served there: mesh origin is not an identity
+// (the #5028 rule that moved SSH-key deployment), and the read routes would
+// expose a run's graph, inputs, and Shell stdout to any mesh peer, while DELETE
+// would let one cancel it. The stubs refuse with a clear signal instead of
+// 404ing. The real routes live on the mTLS control listener
+// (RegisterControlRoutes).
+func (s *Server) RegisterRoutes(mux *http.ServeMux, _ func(http.HandlerFunc) http.HandlerFunc) {
+	mux.HandleFunc("/workflow/run", handleMovedToControl)
+	mux.HandleFunc("/workflow/", handleMovedToControl)
+	mux.HandleFunc("/workflow", handleMovedToControl)
+}
+
+// RegisterControlRoutes installs the workflow API on the mTLS control listener,
+// every route behind requireCoordinator (a verified fabric-CA coordinator client
+// cert). A graph with a Shell node additionally needs the node shell gate (see
+// Submit).
+func (s *Server) RegisterControlRoutes(mux *http.ServeMux, requireCoordinator func(http.HandlerFunc) http.HandlerFunc) {
+	mux.HandleFunc("/workflow/run", requireCoordinator(s.handleRun))
+	mux.HandleFunc("/workflow/", requireCoordinator(s.handleWorkflowByID))
+	mux.HandleFunc("/workflow", requireCoordinator(s.handleList))
+}
+
+func handleMovedToControl(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusForbidden, map[string]string{
+		"error": "the workflow API requires a coordinator mTLS client certificate on the control listener",
+	})
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -37,12 +64,21 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("invalid JSON: %v", err)})
 		return
 	}
-	exec, err := s.executor.Submit(r.Context(), &req)
+	// The run outlives this request (we reply 202 immediately), so detach it
+	// from the request context, which net/http cancels once the handler returns.
+	exec, err := s.executor.Submit(context.WithoutCancel(r.Context()), &req)
 	if err != nil {
+		var refusal *jobs.ShellRefusal
+		if errors.As(err, &refusal) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": refusal.Message, "reason": refusal.Reason})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusAccepted, RunResponse{ID: exec.ID, Status: exec.Status})
+	// Read through Snapshot: the run goroutine is already writing Status.
+	snap := exec.Snapshot()
+	writeJSON(w, http.StatusAccepted, RunResponse{ID: snap.ID, Status: snap.Status})
 }
 
 func (s *Server) handleWorkflowByID(w http.ResponseWriter, r *http.Request) {

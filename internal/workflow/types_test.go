@@ -189,3 +189,22 @@ func TestRunRequest_ParseFromJSON(t *testing.T) {
 		t.Fatal("unexpected parse result")
 	}
 }
+
+// A JSON `null` inner node or edge must be rejected, not dereferenced: a panic
+// in WORKFLOW_RUN would take down the worker (no recover around handlers).
+func TestValidateRejectsNullNodeAndEdge(t *testing.T) {
+	for name, raw := range map[string]string{
+		"null inner node": `{"input_node":{"id":"in","type":"Input"},"output_node":{"id":"out","type":"Output"},"inner_nodes":[null],"edges":[]}`,
+		"null edge":       `{"input_node":{"id":"in","type":"Input"},"output_node":{"id":"out","type":"Output"},"inner_nodes":[],"edges":[null]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var g WorkflowGraph
+			if err := json.Unmarshal([]byte(raw), &g); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.Validate(); err == nil {
+				t.Fatal("expected a validation error, not acceptance")
+			}
+		})
+	}
+}

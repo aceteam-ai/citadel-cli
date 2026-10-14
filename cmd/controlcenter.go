@@ -2454,7 +2454,12 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Workflow executor for WORKFLOW_RUN jobs, mirroring runWork's wiring.
 	ccWfExec := workflow.NewExecutor(workflow.ExecutorConfig{
-		Shell: workflow.ShellConfig{WorkspaceDir: wsDir},
+		Shell: workflow.ShellConfig{
+			WorkspaceDir: wsDir,
+			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
+			// graph with a Shell node needs the `shell` permission + node passcode.
+			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier},
+		},
 	})
 
 	_, ccConfigDir, _ := findAndReadManifest()

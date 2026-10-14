@@ -54,6 +54,35 @@ type ShellRefusal struct {
 	Message string `json:"message"`
 }
 
+// msgWorkflowPasscodeInvalid is the workflow-surface wording for
+// ReasonPasscodeInvalid: a workflow run presents the passcode in its own
+// top-level `passcode` field, not the SHELL_COMMAND payload.
+const msgWorkflowPasscodeInvalid = "a workflow containing a Shell node requires the node passcode; present the correct passcode in the workflow run's `passcode` field"
+
+// shellCommandRefusalMessage maps a ShellGateReason code to SHELL_COMMAND's
+// operator-facing message.
+func shellCommandRefusalMessage(reason string) string {
+	switch reason {
+	case ReasonShellDisabled:
+		return msgShellDisabled
+	case ReasonPasscodeNotSet:
+		return msgPasscodeNotSet
+	default:
+		return msgPasscodeInvalid
+	}
+}
+
+// WorkflowShellRefusal builds the refusal for a workflow run whose graph holds a
+// Shell node and whose run did not pass the shell gate. The reason codes are the
+// SHELL_COMMAND codes, so the platform can prompt the operator the same way.
+func WorkflowShellRefusal(reason string) *ShellRefusal {
+	msg := shellCommandRefusalMessage(reason)
+	if reason == ReasonPasscodeInvalid {
+		msg = msgWorkflowPasscodeInvalid
+	}
+	return &ShellRefusal{Reason: reason, Message: msg}
+}
+
 // Error renders the refusal as a JSON object. Reason and Message are plain
 // strings so json.Marshal cannot fail here; the concatenated fallback exists
 // only to satisfy the error contract defensively and is never expected to run.
@@ -69,6 +98,48 @@ func (e *ShellRefusal) Error() string {
 // per-node passcode. The platform (aceteam#6559) must set this on every shell
 // dispatch once the node has Shell enabled, or the command is refused.
 const ShellPasscodePayloadKey = "passcode"
+
+// ShellGate is the node's shell-execution gate: the live `shell` permission plus
+// the per-node passcode. It is the SINGLE gate for every surface that can run a
+// host shell command. SHELL_COMMAND and the workflow Shell node both consult it
+// through ShellGateReason, so a second shell path cannot skip the permission or
+// the passcode. Field semantics match ShellCommandHandler's identically named
+// fields. The zero value is refused by ShellGateReason (a nil HasPasscode reads
+// as passcode_not_set), but its IsEnabled() alone reports true, mirroring
+// ShellCommandHandler's Disabled=false default. Gate with ShellGateReason, never
+// with IsEnabled alone.
+type ShellGate struct {
+	Disabled       bool
+	Enabled        func() bool
+	HasPasscode    func() bool
+	VerifyPasscode func(pin string) bool
+}
+
+// IsEnabled reports the live shell permission: Enabled supersedes the
+// construction-time Disabled snapshot when non-nil.
+func (g ShellGate) IsEnabled() bool {
+	if g.Enabled != nil {
+		return g.Enabled()
+	}
+	return !g.Disabled
+}
+
+// ShellGateReason applies the gate to a presented passcode. It returns "" when
+// the command may run, otherwise the refusal reason code. Order:
+// shell_disabled beats passcode_not_set beats passcode_invalid. A nil
+// HasPasscode or nil VerifyPasscode refuses (fail closed).
+func ShellGateReason(g ShellGate, presentedPasscode string) string {
+	if !g.IsEnabled() {
+		return ReasonShellDisabled
+	}
+	if g.HasPasscode == nil || !g.HasPasscode() {
+		return ReasonPasscodeNotSet
+	}
+	if g.VerifyPasscode == nil || !g.VerifyPasscode(presentedPasscode) {
+		return ReasonPasscodeInvalid
+	}
+	return ""
+}
 
 // standardPATHDirs are directories ensured on PATH when the inherited process
 // environment is restricted (e.g. citadel running via systemd or nohup with a
@@ -296,30 +367,12 @@ func (h *ShellCommandHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, e
 	// operator precisely. Fail CLOSED throughout: a nil HasPasscode or a nil
 	// VerifyPasscode still refuses, so a forgotten gate never silently opens root
 	// shell to anyone who can dispatch a job.
-	disabled := h.Disabled
-	if h.Enabled != nil {
-		disabled = !h.Enabled()
-	}
-	if disabled {
-		refusal := &ShellRefusal{Reason: ReasonShellDisabled, Message: msgShellDisabled}
-		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, refusal.Message)
-		return nil, refusal
-	}
-
-	// No passcode configured: nothing to check against, so the operator must set
-	// one before shell can run. A nil HasPasscode is treated as "not set".
-	if h.HasPasscode == nil || !h.HasPasscode() {
-		refusal := &ShellRefusal{Reason: ReasonPasscodeNotSet, Message: msgPasscodeNotSet}
-		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, refusal.Message)
-		return nil, refusal
-	}
-
-	// A passcode IS configured: the job must present the correct one. The passcode
-	// is read from a dedicated payload field and is never forwarded into the
-	// command environment. A nil verifier (gate not wired) or a wrong/absent
-	// payload passcode refuses before any command runs.
-	if h.VerifyPasscode == nil || !h.VerifyPasscode(job.Payload[ShellPasscodePayloadKey]) {
-		refusal := &ShellRefusal{Reason: ReasonPasscodeInvalid, Message: msgPasscodeInvalid}
+	//
+	// The passcode is read from a dedicated payload field and is never forwarded
+	// into the command environment.
+	gate := ShellGate{Disabled: h.Disabled, Enabled: h.Enabled, HasPasscode: h.HasPasscode, VerifyPasscode: h.VerifyPasscode}
+	if reason := ShellGateReason(gate, job.Payload[ShellPasscodePayloadKey]); reason != "" {
+		refusal := &ShellRefusal{Reason: reason, Message: shellCommandRefusalMessage(reason)}
 		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, refusal.Message)
 		return nil, refusal
 	}
