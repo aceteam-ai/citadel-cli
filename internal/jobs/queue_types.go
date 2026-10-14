@@ -8,6 +8,7 @@ import (
 
 // JobTypeFileReadRangeV1 identifies the versioned bounded binary range job.
 const JobTypeFileReadRangeV1 = "FILE_READ_BYTES_RANGE_V1"
+const JobTypeFileReadRangeV2 = "FILE_READ_BYTES_RANGE_V2"
 
 // Job types that citadel can handle
 const (

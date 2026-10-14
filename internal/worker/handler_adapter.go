@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
+	"github.com/aceteam-ai/citadel-cli/internal/artifact"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -445,6 +446,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			readBytesRangeHandler := jobs.NewFileReadBytesRangeHandler(opts.WorkspaceDir)
 			readBytesRangeHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 			readBytesRangeHandler.AuthorizedRoots = opts.AuthorizedRoots
+			if artifact.Supported() {
+				conditional := jobs.NewFileReadBytesRangeV2Handler(opts.WorkspaceDir)
+				conditional.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+				conditional.AuthorizedRoots = opts.AuthorizedRoots
+				handlers = append(handlers, newGatedLegacyHandlerAdapter(JobTypeFileReadRangeV2, conditional, gate))
+			}
 
 			listHandler := jobs.NewFileListHandler(opts.WorkspaceDir)
 			listHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace

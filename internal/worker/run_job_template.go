@@ -90,9 +90,10 @@ type TemplateRunRequest struct {
 // ride back through the synchronous job result (aceteam#7553 gaps 3/4); the flow
 // node reads the file lazily as a node:<node_id>/<path> reference.
 type TemplateOutput struct {
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
-	Bytes  int64  `json:"bytes"`
+	Path       string `json:"path"`
+	SHA256     string `json:"sha256"`
+	Bytes      int64  `json:"bytes"`
+	Generation string `json:"generation"`
 }
 
 // TemplateRunResult is the RUN_JOB_TEMPLATE result shape.
