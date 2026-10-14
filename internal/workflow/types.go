@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 // WorkflowGraph is the top-level structure submitted for execution.
@@ -59,6 +61,11 @@ type RunRequest struct {
 	Graph   *WorkflowGraph `json:"graph"`
 	Input   map[string]any `json:"input"`
 	Timeout int            `json:"timeout,omitempty"`
+	// Passcode is the per-node passcode. A graph containing a Shell node runs
+	// only when the node's shell gate (live `shell` permission + this passcode)
+	// admits it, exactly like SHELL_COMMAND. It is checked once at Submit and is
+	// never stored on the Execution, logged, or passed to a node.
+	Passcode string `json:"passcode,omitempty"`
 }
 
 type RunResponse struct {
@@ -109,6 +116,12 @@ type ShellConfig struct {
 	AllowList    []string
 	DenyList     []string
 	WorkspaceDir string
+	// Gate is the node's shell gate, the same one SHELL_COMMAND uses. A zero
+	// value refuses every Shell run at Submit (jobs.ShellGateReason reports
+	// passcode_not_set for a nil HasPasscode), so an executor built without
+	// wiring the gate can never run a host command. Note that the zero value's
+	// IsEnabled() alone reports true; only ShellGateReason is the full gate.
+	Gate jobs.ShellGate
 }
 
 type ExecutorConfig struct {
@@ -136,7 +149,12 @@ func (g *WorkflowGraph) Validate() error {
 	if g.InputNode.ID == g.OutputNode.ID {
 		return fmt.Errorf("input_node and output_node must have different IDs")
 	}
-	for _, n := range g.InnerNodes {
+	for i, n := range g.InnerNodes {
+		// A JSON `null` element decodes to a nil pointer; reject it rather than
+		// panic (WORKFLOW_RUN has no recover, so a panic would kill the worker).
+		if n == nil {
+			return fmt.Errorf("inner node %d is null", i)
+		}
 		if n.ID == "" {
 			return errors.New("inner node has empty ID")
 		}
@@ -151,6 +169,9 @@ func (g *WorkflowGraph) Validate() error {
 		}
 	}
 	for i, e := range g.Edges {
+		if e == nil {
+			return fmt.Errorf("edge %d is null", i)
+		}
 		if e.SourceID == "" || e.TargetID == "" {
 			return fmt.Errorf("edge %d has empty source_id or target_id", i)
 		}

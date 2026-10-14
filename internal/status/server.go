@@ -57,6 +57,10 @@ type Server struct {
 	// install additional routes (e.g., provisioning API) during Start.
 	routeRegistrars []RouteRegistrar
 
+	// controlRouteRegistrars install routes on the mTLS control listener's mux
+	// (buildControlMux) with requireCoordinator; see AddControlRouteRegistrar.
+	controlRouteRegistrars []RouteRegistrar
+
 	// extraRoutes is called during Start() to register additional HTTP routes.
 	extraRoutes func(mux *http.ServeMux)
 	// extraListeners are additional net.Listeners the server will also serve on
@@ -213,6 +217,11 @@ func (s *Server) buildControlMux() *http.ServeMux {
 	mux.HandleFunc("/ping", s.handlePing)
 	// SSH-key injection: the host-takeover crown jewel. Coordinator identity only.
 	mux.HandleFunc("/ssh/authorized-keys", s.caVerifier.requireCoordinator(s.handleSSHAuthorizedKeys))
+	// Feature-package mutating routes (e.g. /workflow/run), each handed the
+	// coordinator-identity gate rather than the VPN-origin one.
+	for _, reg := range s.controlRouteRegistrars {
+		reg(mux, s.caVerifier.requireCoordinator)
+	}
 	return mux
 }
 
@@ -222,6 +231,16 @@ func (s *Server) buildControlMux() *http.ServeMux {
 // Must be called before Start.
 func (s *Server) AddRouteRegistrar(reg RouteRegistrar) {
 	s.routeRegistrars = append(s.routeRegistrars, reg)
+}
+
+// AddControlRouteRegistrar registers a callback that installs MUTATING routes on
+// the mTLS control listener, receiving requireCoordinator as its middleware. Use
+// it, not AddRouteRegistrar, for any endpoint that must not trust mesh origin.
+// When the control listener is not enabled the routes are never served (fail
+// closed), so the feature package must also stub the plaintext path.
+// Must be called before Start.
+func (s *Server) AddControlRouteRegistrar(reg RouteRegistrar) {
+	s.controlRouteRegistrars = append(s.controlRouteRegistrars, reg)
 }
 
 // buildMux constructs the HTTP route multiplexer for the server, registering

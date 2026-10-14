@@ -3,9 +3,11 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
 
@@ -25,6 +27,17 @@ func (h *Handler) CanHandle(jobType string) bool {
 
 func (h *Handler) Execute(ctx context.Context, job *worker.Job, stream worker.StreamWriter) (*worker.JobResult, error) {
 	start := time.Now()
+	// Privilege gate: a workflow graph can run host commands (Shell) and reach
+	// node-local services (HTTP), so WORKFLOW_RUN is privileged + node-targeted,
+	// like EXPOSE_SET/MODULE_SET/RUN_JOB_TEMPLATE. Refuse anything off the shared
+	// org pool before parsing the graph.
+	if !worker.IsPerNodeStream(job.SourceQueue) {
+		err := fmt.Errorf("WORKFLOW_RUN refused: must be dispatched to the per-node stream, got source queue %q", job.SourceQueue)
+		return &worker.JobResult{
+			Status: worker.JobStatusFailure, Error: err, Duration: time.Since(start),
+			Output: map[string]any{"error": err.Error()},
+		}, nil
+	}
 	graphRaw, ok := job.Payload["graph"]
 	if !ok {
 		return &worker.JobResult{
@@ -69,9 +82,19 @@ func (h *Handler) Execute(ctx context.Context, job *worker.Job, stream worker.St
 			timeout = v
 		}
 	}
-	req := &RunRequest{Graph: &graph, Input: input, Timeout: timeout}
+	// The node passcode rides a dedicated payload field, the same key as
+	// SHELL_COMMAND. Submit consults it only when the graph has a Shell node.
+	passcode, _ := job.Payload[jobs.ShellPasscodePayloadKey].(string)
+	req := &RunRequest{Graph: &graph, Input: input, Timeout: timeout, Passcode: passcode}
 	exec, err := h.executor.Submit(ctx, req)
 	if err != nil {
+		var refusal *jobs.ShellRefusal
+		if errors.As(err, &refusal) {
+			return &worker.JobResult{
+				Status: worker.JobStatusFailure, Error: refusal, Duration: time.Since(start),
+				Output: map[string]any{"error": refusal.Message, "reason": refusal.Reason},
+			}, nil
+		}
 		return nil, fmt.Errorf("submit workflow: %w", err)
 	}
 	stream.WriteChunk(fmt.Sprintf("workflow %s started", exec.ID), 0)

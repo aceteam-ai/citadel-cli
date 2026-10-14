@@ -7,6 +7,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 const (
@@ -51,6 +53,17 @@ func (e *Executor) Submit(ctx context.Context, req *RunRequest) (*Execution, err
 	if err := req.Graph.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid graph: %w", err)
 	}
+	// A Shell node runs a host command, so a graph containing one must pass the
+	// node's shell gate (live `shell` permission + node passcode), the SAME gate
+	// SHELL_COMMAND uses. Checked before the run is recorded so a refused run
+	// leaves no trace and starts nothing.
+	shellAuthorized := false
+	if graphHasShellNode(req.Graph) {
+		if reason := jobs.ShellGateReason(e.config.Shell.Gate, req.Passcode); reason != "" {
+			return nil, jobs.WorkflowShellRefusal(reason)
+		}
+		shellAuthorized = true
+	}
 	timeout := e.config.DefaultTimeout
 	if req.Timeout > 0 {
 		timeout = time.Duration(req.Timeout) * time.Second
@@ -69,9 +82,38 @@ func (e *Executor) Submit(ctx context.Context, req *RunRequest) (*Execution, err
 		defer func() { <-e.sem }()
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		if shellAuthorized {
+			runCtx = withShellAuthorized(runCtx)
+		}
 		e.executeGraph(runCtx, exec)
 	}()
 	return exec, nil
+}
+
+// shellAuthorizedKey marks a run context whose graph passed the shell gate at
+// Submit. ShellNodeExecutor refuses without it, so a Shell node reached by any
+// path that skipped Submit's gate fails closed rather than running.
+type shellAuthorizedKey struct{}
+
+func withShellAuthorized(ctx context.Context) context.Context {
+	return context.WithValue(ctx, shellAuthorizedKey{}, true)
+}
+
+func isShellAuthorized(ctx context.Context) bool {
+	ok, _ := ctx.Value(shellAuthorizedKey{}).(bool)
+	return ok
+}
+
+// graphHasShellNode reports whether any node in the graph is a Shell node. It
+// scans AllNodes (not just InnerNodes) so the check does not depend on
+// Validate's input/output type pinning.
+func graphHasShellNode(g *WorkflowGraph) bool {
+	for _, n := range g.AllNodes() {
+		if n != nil && n.Type == NodeTypeShell {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Executor) Get(id string) *Execution {

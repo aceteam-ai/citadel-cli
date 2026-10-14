@@ -13,7 +13,7 @@ func TestClockActualHandlerMetricsOutputMilliseconds(t *testing.T) {
 	// Only pure input/output nodes are installed: no shell, HTTP, model, host
 	// discovery or production constructor is reachable from this fixture.
 	executor := &Executor{runs: make(map[string]*Execution), sem: make(chan struct{}, 1), config: ExecutorConfig{DefaultTimeout: time.Second}, nodeRegistry: map[string]NodeExecutor{NodeTypeInput: &InputNodeExecutor{}, NodeTypeOutput: &OutputNodeExecutor{}}}
-	job := &worker.Job{ID: "synthetic-clock-workflow", Type: JobType, Payload: map[string]any{
+	job := &worker.Job{ID: "synthetic-clock-workflow", Type: JobType, SourceQueue: testPerNodeQueue, Payload: map[string]any{
 		"graph": map[string]any{
 			"input_node":  map[string]any{"id": "in", "type": "Input"},
 			"output_node": map[string]any{"id": "out", "type": "Output"},

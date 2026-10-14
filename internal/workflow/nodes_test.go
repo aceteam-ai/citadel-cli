@@ -60,44 +60,44 @@ func TestTransformNodeExecutor_Passthrough(t *testing.T) {
 }
 
 func TestShellNodeExecutor(t *testing.T) {
-	e := NewShellNodeExecutor(ShellConfig{})
-	output, err := e.Execute(context.Background(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "echo hello"}}, nil)
+	e := NewShellNodeExecutor(ShellConfig{Gate: openShellGate()})
+	output, err := e.Execute(shellAuthorizedCtx(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "echo hello"}}, nil)
 	if err != nil || output["stdout"] != "hello" || output["exit_code"] != 0 {
 		t.Fatalf("unexpected: %v %v", output, err)
 	}
 }
 
 func TestShellNodeExecutor_DenyList(t *testing.T) {
-	e := NewShellNodeExecutor(ShellConfig{DenyList: []string{"rm", "sudo"}})
-	_, err := e.Execute(context.Background(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "rm -rf /"}}, nil)
+	e := NewShellNodeExecutor(ShellConfig{Gate: openShellGate(), DenyList: []string{"rm", "sudo"}})
+	_, err := e.Execute(shellAuthorizedCtx(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "rm -rf /"}}, nil)
 	if err == nil {
 		t.Fatal("expected error for denied command")
 	}
 }
 
 func TestShellNodeExecutor_AllowList(t *testing.T) {
-	e := NewShellNodeExecutor(ShellConfig{AllowList: []string{"echo", "cat"}})
-	output, err := e.Execute(context.Background(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "echo ok"}}, nil)
+	e := NewShellNodeExecutor(ShellConfig{Gate: openShellGate(), AllowList: []string{"echo", "cat"}})
+	output, err := e.Execute(shellAuthorizedCtx(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "echo ok"}}, nil)
 	if err != nil || output["stdout"] != "ok" {
 		t.Fatalf("unexpected: %v %v", output, err)
 	}
-	_, err = e.Execute(context.Background(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "ls -la"}}, nil)
+	_, err = e.Execute(shellAuthorizedCtx(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "ls -la"}}, nil)
 	if err == nil {
 		t.Fatal("expected error for disallowed command")
 	}
 }
 
 func TestShellNodeExecutor_TemplateSubstitution(t *testing.T) {
-	e := NewShellNodeExecutor(ShellConfig{})
-	output, _ := e.Execute(context.Background(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "echo {{message}}"}}, map[string]any{"message": "world"})
+	e := NewShellNodeExecutor(ShellConfig{Gate: openShellGate()})
+	output, _ := e.Execute(shellAuthorizedCtx(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "echo {{message}}"}}, map[string]any{"message": "world"})
 	if output["stdout"] != "world" {
 		t.Fatalf("expected 'world', got %q", output["stdout"])
 	}
 }
 
 func TestShellNodeExecutor_NonZeroExit(t *testing.T) {
-	e := NewShellNodeExecutor(ShellConfig{})
-	output, err := e.Execute(context.Background(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "exit 42"}}, nil)
+	e := NewShellNodeExecutor(ShellConfig{Gate: openShellGate()})
+	output, err := e.Execute(shellAuthorizedCtx(), &Node{ID: "sh", Type: NodeTypeShell, Params: map[string]any{"command": "exit 42"}}, nil)
 	if err != nil || output["exit_code"] != 42 {
 		t.Fatalf("unexpected: %v %v", output, err)
 	}

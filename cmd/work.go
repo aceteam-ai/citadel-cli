@@ -1659,7 +1659,12 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Workflow executor for WORKFLOW_RUN jobs (#105). Created here so the status
 	// server's AddRouteRegistrar closure and the job handler share a single instance.
 	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
-		Shell: workflow.ShellConfig{WorkspaceDir: wsDir},
+		Shell: workflow.ShellConfig{
+			WorkspaceDir: wsDir,
+			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
+			// graph with a Shell node needs the `shell` permission + node passcode.
+			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier},
+		},
 	})
 
 	// Vendor coding-agent probe service (aceteam #8993 S2): caches which vendor
@@ -1827,11 +1832,13 @@ func runWork(cmd *cobra.Command, args []string) {
 			statusServer.AddRouteRegistrar(provisionHandler.RegisterRoutes)
 		}
 
-		// Register workflow API routes, gated by requireVPNOrAuth (#259).
-		statusServer.AddRouteRegistrar(func(mux *http.ServeMux, auth func(http.HandlerFunc) http.HandlerFunc) {
-			wfServer := workflow.NewServer(wfExec)
-			wfServer.RegisterRoutes(mux, auth)
-		})
+		// Register workflow API routes (#259). The whole API lives only on the
+		// mTLS control listener behind a coordinator cert (citadel-cli#1305, the
+		// #5028 rule: mesh origin is not an identity); the plaintext listener
+		// serves fail-closed stubs.
+		wfServer := workflow.NewServer(wfExec)
+		statusServer.AddRouteRegistrar(wfServer.RegisterRoutes)
+		statusServer.AddControlRouteRegistrar(wfServer.RegisterControlRoutes)
 
 		// Register node-local RAG API routes (#589): /rag/index, /rag/query,
 		// /rag/status. Same requireVPNOrAuth posture and workspace root as the

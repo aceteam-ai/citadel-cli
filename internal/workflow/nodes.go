@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 type NodeExecutor interface {
@@ -99,12 +101,27 @@ func NewShellNodeExecutor(cfg ShellConfig) *ShellNodeExecutor {
 }
 
 func (e *ShellNodeExecutor) Execute(ctx context.Context, node *Node, input map[string]any) (map[string]any, error) {
+	// The run must have passed the shell gate at Submit (permission + passcode),
+	// and the live permission is re-read here so revoking Shell stops a run's
+	// remaining Shell nodes. Both refuse before any command is built.
+	if !isShellAuthorized(ctx) {
+		return nil, fmt.Errorf("Shell node %q: run did not pass the node shell gate", node.ID)
+	}
+	if !e.config.Gate.IsEnabled() {
+		return nil, jobs.WorkflowShellRefusal(jobs.ReasonShellDisabled)
+	}
 	command := stringParam(node.Params, "command", "")
 	if command == "" {
 		command = stringParam(input, "command", "")
 	}
 	if command == "" {
 		return nil, fmt.Errorf("Shell node %q: missing 'command' param or input", node.ID)
+	}
+	// Substitute inputs BEFORE the deny/allow checks: the checks must judge the
+	// command that will actually run, or an input value could carry a denied
+	// pattern or a second command past them.
+	for k, v := range input {
+		command = strings.ReplaceAll(command, "{{"+k+"}}", fmt.Sprint(v))
 	}
 	for _, denied := range e.config.DenyList {
 		if strings.Contains(command, denied) {
@@ -122,9 +139,6 @@ func (e *ShellNodeExecutor) Execute(ctx context.Context, node *Node, input map[s
 		if !allowed {
 			return nil, fmt.Errorf("Shell node %q: command not in allow list", node.ID)
 		}
-	}
-	for k, v := range input {
-		command = strings.ReplaceAll(command, "{{"+k+"}}", fmt.Sprint(v))
 	}
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 	if e.config.WorkspaceDir != "" {

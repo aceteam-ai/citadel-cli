@@ -466,6 +466,13 @@ func isPerNodeStream(sourceQueue string) bool {
 	return strings.Contains(sourceQueue, ":node:")
 }
 
+// IsPerNodeStream is isPerNodeStream for privileged handlers that live outside
+// this package (internal/workflow's WORKFLOW_RUN), so every privileged job type
+// gates on the same per-node marker.
+func IsPerNodeStream(sourceQueue string) bool {
+	return isPerNodeStream(sourceQueue)
+}
+
 // payloadString reads a string value from a job payload, coercing common
 // JSON-decoded types (numbers arrive as float64). Missing/empty yields "".
 func payloadString(payload map[string]any, key string) string {
