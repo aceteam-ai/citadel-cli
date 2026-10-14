@@ -3092,3 +3092,22 @@ Auto-generated log of every release.
   - feat: generic node job lifecycle contract (handlers declare capabilities; FILE_INDEX first adopter) (#1290)
 
 
+---
+
+## v2.193.0 — 2026-10-14
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 40 |
+| Lines added | +3288 |
+
+**Changes:**
+
+  - fix(workflow): gate the Shell node behind the node shell permission + passcode (#1315)
+  - Merge pull request #1306 from aceteam-ai/fix/1303-radiology-module
+  - feat: add inactive Orthanc radiology module source
+  - feat(worker): add clock-state delivery telemetry (#1300) (#1302)
+  - feat(worker): add inactive deferral boundary (#1271) (#1301)
+
+
