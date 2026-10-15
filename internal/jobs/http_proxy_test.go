@@ -292,3 +292,38 @@ func TestWebFetchFailsClosedWhenOwnAddrsUnknown(t *testing.T) {
 		t.Fatalf("want errBlockedDestination before any dial, got %v", err)
 	}
 }
+
+// The production default allowlists exactly the WeChat bridge port. The other
+// fixtures override localPorts, so this is the only pin on the zero-value
+// default.
+func TestHTTPProxyDefaultLocalPorts(t *testing.T) {
+	got := (&HTTPProxyHandler{}).allowedLocalPorts()
+	if len(got) != 1 || !got[8000] {
+		t.Fatalf("default local-port allowlist = %v, want {8000}", got)
+	}
+}
+
+// The guarded client must not route through an environment proxy (which would
+// bypass the dial check: the proxy, not the node, picks the destination), and
+// must never follow redirects. Go skips the proxy for loopback targets, so the
+// end-to-end tests cannot observe this; pin the client configuration directly.
+func TestGuardedHTTPClientConfiguration(t *testing.T) {
+	stubInterfaceAddrs(t, []net.Addr{&net.IPAddr{IP: net.ParseIP("192.168.1.10")}}, nil)
+	c, err := newGuardedHTTPClient(map[int]bool{8000: true})
+	if err != nil {
+		t.Fatalf("client construction with known own addresses: %v", err)
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want *http.Transport", c.Transport)
+	}
+	if tr.Proxy != nil {
+		t.Fatal("the guarded transport must not use any proxy")
+	}
+	if tr.DialContext == nil {
+		t.Fatal("the guarded transport must use the checked dialer")
+	}
+	if c.CheckRedirect == nil || c.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+		t.Fatal("redirects must not be followed")
+	}
+}
