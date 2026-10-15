@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -504,4 +505,20 @@ func agentConfig(nodeName, baseURL, orgID string, queues []string) map[string]an
 		"version":         Version,
 		// Secrets (device_api_token, redis password) are intentionally omitted.
 	}
+}
+
+// selfMeshIPs returns this node's own AceTeam Network address for the status
+// server's self-origin gate (citadel-cli#1318). It is read per request, so a
+// re-addressed node is honored without a restart. An unknown address returns
+// nil, and the gate then refuses (fail closed).
+func selfMeshIPs() []netip.Addr {
+	ip, err := network.GetGlobalIPv4()
+	if err != nil || ip == "" {
+		return nil
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return nil
+	}
+	return []netip.Addr{addr}
 }
