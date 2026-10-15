@@ -51,7 +51,7 @@ func (h *HTTPProxyHandler) allowedLocalPorts() map[int]bool {
 // multicast), interface-local multicast and unspecified addresses are always
 // refused. Everything else, including the AceTeam Network range 100.64.0.0/10
 // where mesh peers and the WeChat VM live, is allowed.
-func httpProxyDestinationAllowed(ip netip.Addr, port int, localPorts map[int]bool, own map[netip.Addr]bool) bool {
+func httpProxyDestinationAllowed(ip netip.Addr, port int, localPorts map[int]bool, own ownAddrSet) bool {
 	if !ip.IsValid() {
 		return false
 	}
@@ -59,7 +59,7 @@ func httpProxyDestinationAllowed(ip netip.Addr, port int, localPorts map[int]boo
 	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() {
 		return false
 	}
-	if ip.IsLoopback() || own[ip] {
+	if ip.IsLoopback() || own.has(ip) {
 		return localPorts[port]
 	}
 	return true
@@ -69,7 +69,7 @@ func httpProxyDestinationAllowed(ip netip.Addr, port int, localPorts map[int]boo
 // connect, with the exact address being dialed. Checking here pins the check
 // to the dialed IP, so a DNS answer that changes between a pre-check and the
 // connect (rebinding) cannot slip past it.
-func guardedDialControl(localPorts map[int]bool, own map[netip.Addr]bool) func(network, address string, _ syscall.RawConn) error {
+func guardedDialControl(localPorts map[int]bool, own ownAddrSet) func(network, address string, _ syscall.RawConn) error {
 	return func(network, address string, _ syscall.RawConn) error {
 		host, portStr, err := net.SplitHostPort(address)
 		if err != nil {
@@ -94,9 +94,14 @@ func guardedDialControl(localPorts map[int]bool, own map[netip.Addr]bool) func(n
 // by guardedDialControl, redirects are never followed (the 3xx itself is
 // returned to the caller), and no environment proxy is used, so the guarded
 // dial is the only path out. The node's own interface addresses are
-// snapshotted once per client (one client per job).
-func newGuardedHTTPClient(localPorts map[int]bool) *http.Client {
-	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: guardedDialControl(localPorts, ownInterfaceAddrs())}
+// snapshotted once per client (one client per job); if they cannot be
+// determined, no client is built and the job is refused (fail closed).
+func newGuardedHTTPClient(localPorts map[int]bool) (*http.Client, error) {
+	own, err := ownInterfaceAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errHTTPProxyDestinationBlocked, err)
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: guardedDialControl(localPorts, own)}
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           dialer.DialContext,
@@ -112,7 +117,7 @@ func newGuardedHTTPClient(localPorts map[int]bool) *http.Client {
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-	}
+	}, nil
 }
 
 func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
@@ -164,7 +169,10 @@ func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	client := newGuardedHTTPClient(h.allowedLocalPorts())
+	client, err := newGuardedHTTPClient(h.allowedLocalPorts())
+	if err != nil {
+		return nil, fmt.Errorf("request refused: %w", err)
+	}
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {

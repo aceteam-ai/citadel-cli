@@ -272,8 +272,13 @@ func wfAssertIPAllowed(ip net.IP, allowPrivate bool) error {
 	}
 	// The node's own interface addresses reach the node's own services (which
 	// may bind every interface) exactly like loopback, so they are refused even
-	// with allow_private (citadel-cli#1318).
-	if addr, ok := netip.AddrFromSlice(ip); ok && ownInterfaceAddrs()[addr.Unmap()] {
+	// with allow_private (citadel-cli#1318). If they cannot be determined, any
+	// destination might be one of them, so refuse (fail closed).
+	own, err := ownInterfaceAddrs()
+	if err != nil {
+		return errBlockedDestination
+	}
+	if addr, ok := netip.AddrFromSlice(ip); ok && own.has(addr) {
 		return errBlockedDestination
 	}
 	if allowPrivate {

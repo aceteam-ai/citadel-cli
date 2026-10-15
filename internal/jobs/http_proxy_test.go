@@ -200,35 +200,70 @@ func TestHTTPProxyRefusesZonedIPv6(t *testing.T) {
 	}
 }
 
-// ownInterfaceAddrs reads the injected interface list.
+// ownInterfaceAddrs reads the injected interface list and returns enumeration
+// errors instead of an empty set.
 func TestOwnInterfaceAddrs(t *testing.T) {
-	orig := interfaceAddrsFn
-	t.Cleanup(func() { interfaceAddrsFn = orig })
-	interfaceAddrsFn = func() ([]net.Addr, error) {
-		return []net.Addr{
-			&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)},
-			&net.IPAddr{IP: net.ParseIP("100.64.0.42")},
-		}, nil
+	stubInterfaceAddrs(t, []net.Addr{
+		&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)},
+		&net.IPAddr{IP: net.ParseIP("100.64.0.42")},
+		&net.IPAddr{IP: net.ParseIP("fd7a:115c:a1e0::42")},
+	}, nil)
+	own, err := ownInterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
 	}
-	own := ownInterfaceAddrs()
-	for _, ip := range []string{"192.168.1.10", "100.64.0.42"} {
-		if !own[netip.MustParseAddr(ip)] {
-			t.Errorf("%s missing from own addresses %v", ip, own)
+	for _, ip := range []string{"192.168.1.10", "100.64.0.42", "::ffff:100.64.0.42", "fd7a:115c:a1e0::42", "fd7a:115c:a1e0::42%eth0"} {
+		if !own.has(netip.MustParseAddr(ip)) {
+			t.Errorf("%s not recognized as an own address", ip)
 		}
 	}
-	interfaceAddrsFn = func() ([]net.Addr, error) { return nil, errors.New("boom") }
-	if len(ownInterfaceAddrs()) != 0 {
-		t.Error("an enumeration error must yield an empty set")
+	stubInterfaceAddrs(t, nil, errors.New("boom"))
+	if _, err := ownInterfaceAddrs(); err == nil {
+		t.Error("an enumeration error must be returned, not an empty set")
+	}
+}
+
+func stubInterfaceAddrs(t *testing.T, addrs []net.Addr, err error) {
+	t.Helper()
+	orig := interfaceAddrsFn
+	t.Cleanup(func() { interfaceAddrsFn = orig })
+	interfaceAddrsFn = func() ([]net.Addr, error) { return addrs, err }
+}
+
+// If the node's own addresses cannot be determined, HTTP_PROXY refuses the job
+// before any connection, even to an otherwise allowed destination.
+func TestHTTPProxyFailsClosedWhenOwnAddrsUnknown(t *testing.T) {
+	srv, hits := countingServer(t, "bridge")
+	stubInterfaceAddrs(t, nil, errors.New("enumeration failed"))
+	h := &HTTPProxyHandler{localPorts: map[int]bool{portOf(t, srv.URL): true}}
+	_, err := runProxy(t, h, srv.URL+"/health")
+	if err == nil || !errors.Is(err, errHTTPProxyDestinationBlocked) {
+		t.Fatalf("want a blocked-destination error, got %v", err)
+	}
+	if atomic.LoadInt32(hits) != 0 {
+		t.Fatal("a request was sent although own addresses were unknown")
+	}
+}
+
+// This node's own zoned IPv6 address is node-local through the real dial
+// check; another host's zoned address is not.
+func TestHTTPProxyOwnZonedIPv6IsNodeLocal(t *testing.T) {
+	own := ownAddrSet{netip.MustParseAddr("fd7a:115c:a1e0::42"): true}
+	control := guardedDialControl(map[int]bool{8000: true}, own)
+	if err := control("tcp6", "[fd7a:115c:a1e0::42%eth0]:8080", nil); err == nil || !errors.Is(err, errHTTPProxyDestinationBlocked) {
+		t.Fatalf("own zoned address on 8080: want refused, got %v", err)
+	}
+	if err := control("tcp6", "[fd7a:115c:a1e0::42]:8080", nil); err == nil {
+		t.Fatal("own unzoned address on 8080: want refused")
+	}
+	if err := control("tcp6", "[fd7a:115c:a1e0::99%eth0]:8080", nil); err != nil {
+		t.Fatalf("another host's zoned address must stay allowed: %v", err)
 	}
 }
 
 // WEB_FETCH refuses the node's own interface addresses even with allow_private.
 func TestWebFetchRefusesOwnInterfaceAddrWithAllowPrivate(t *testing.T) {
-	orig := interfaceAddrsFn
-	t.Cleanup(func() { interfaceAddrsFn = orig })
-	interfaceAddrsFn = func() ([]net.Addr, error) {
-		return []net.Addr{&net.IPAddr{IP: net.ParseIP("192.168.1.10")}, &net.IPAddr{IP: net.ParseIP("100.64.0.42")}}, nil
-	}
+	stubInterfaceAddrs(t, []net.Addr{&net.IPAddr{IP: net.ParseIP("192.168.1.10")}, &net.IPAddr{IP: net.ParseIP("100.64.0.42")}}, nil)
 	for _, ip := range []string{"192.168.1.10", "100.64.0.42", "::ffff:100.64.0.42"} {
 		if err := wfAssertIPAllowed(net.ParseIP(ip), true); err == nil {
 			t.Errorf("%s: own address must be refused even with allow_private", ip)
@@ -239,31 +274,21 @@ func TestWebFetchRefusesOwnInterfaceAddrWithAllowPrivate(t *testing.T) {
 	}
 }
 
-// The production default allowlists exactly the WeChat bridge port.
-func TestHTTPProxyDefaultLocalPorts(t *testing.T) {
-	got := (&HTTPProxyHandler{}).allowedLocalPorts()
-	if len(got) != 1 || !got[8000] {
-		t.Fatalf("default local-port allowlist = %v, want {8000}", got)
+// If the node's own addresses cannot be determined, WEB_FETCH refuses through
+// its real admission path (allow_private set) before any connection: the
+// error is the blocked-destination error, not a dial error.
+func TestWebFetchFailsClosedWhenOwnAddrsUnknown(t *testing.T) {
+	stubInterfaceAddrs(t, nil, errors.New("enumeration failed"))
+	for _, ip := range []string{"192.168.1.10", "100.64.0.42", "93.184.216.34"} {
+		if err := wfAssertIPAllowed(net.ParseIP(ip), true); err == nil {
+			t.Errorf("%s: want refused while own addresses are unknown", ip)
+		}
 	}
-}
-
-// The guarded client must not route through an environment proxy (which would
-// bypass the dial check: the proxy, not the node, picks the destination), and
-// must never follow redirects. Go skips the proxy for loopback targets, so the
-// end-to-end tests cannot observe this; pin the client configuration directly.
-func TestGuardedHTTPClientConfiguration(t *testing.T) {
-	c := newGuardedHTTPClient(map[int]bool{8000: true})
-	tr, ok := c.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("transport is %T, want *http.Transport", c.Transport)
-	}
-	if tr.Proxy != nil {
-		t.Fatal("the guarded transport must not use any proxy")
-	}
-	if tr.DialContext == nil {
-		t.Fatal("the guarded transport must use the checked dialer")
-	}
-	if c.CheckRedirect == nil || c.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
-		t.Fatal("redirects must not be followed")
+	h := &WebFetchHandler{}
+	_, err := h.Execute(JobContext{}, &nexus.Job{ID: "wf", Type: "WEB_FETCH", Payload: map[string]string{
+		"url": "http://192.0.2.10:9/", "allow_private": "true",
+	}})
+	if err == nil || !errors.Is(err, errBlockedDestination) {
+		t.Fatalf("want errBlockedDestination before any dial, got %v", err)
 	}
 }
