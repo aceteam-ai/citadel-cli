@@ -119,6 +119,14 @@ func TestRequestLog_SeparateEnginesDoNotShareState(t *testing.T) {
 // interfering with any other test's use of the singleton within this run.
 func TestRecordEngineRequest_GlobalSingleton(t *testing.T) {
 	const engine = "test-engine-691-singleton"
+	// nodeRequestLog is process-global, so remove this test's entry afterwards;
+	// otherwise a repeat run in the same process (go test -count=2) finds it
+	// already stamped (#1319).
+	t.Cleanup(func() {
+		nodeRequestLog.mu.Lock()
+		delete(nodeRequestLog.last, engine)
+		nodeRequestLog.mu.Unlock()
+	})
 	if _, ok := nodeRequestLog.lastRequestAt(engine); ok {
 		t.Fatal("expected no prior record for a test-unique engine name")
 	}
