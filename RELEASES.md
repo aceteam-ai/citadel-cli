@@ -3126,3 +3126,22 @@ Auto-generated log of every release.
   - fix(speech): surface the aligner license and stop dropping Chatterbox receipt fields (#1322)
 
 
+---
+
+## v2.195.0 — 2026-10-15
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 20 |
+| Lines added | +1154 |
+
+**Changes:**
+
+  - fix(security): treat the node's own addresses as node-local in relays and the self-origin gate (#1329)
+  - fix(security): guard HTTP_PROXY destinations and refuse redirects (#1328)
+  - fix(security): restrict expose control routes to node self-origin (#1327)
+  - fix(security): restrict provision and RAG APIs to mTLS control (#1325)
+  - test(status): clean up the global request-log entry in GlobalSingleton (#1324)
+
+
