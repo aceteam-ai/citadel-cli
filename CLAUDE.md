@@ -1536,10 +1536,10 @@ content belongs on the mTLS control listener: register it with
 `internal/workflow/server.go`, `internal/provision/handler.go`,
 `internal/rag/server.go`). The control listener only starts when the fabric CA
 bundle loads, so on a CA-less node a moved route is simply unavailable; that is
-the intended fail-closed direction. Check callers before moving a route: the
-platform's `citadel_*` MCP tools call the `/agent/*` routes over mesh origin
-with no token, and `citadel service expose` dials its own mesh IP to call
-`/agent/expose`.
+the intended fail-closed direction. (Constructing it also needs the verifier
+and the control server cert.) Check callers before moving a route, in aceteam
+as well as in this repo's own CLI commands. Wire both sides with
+`cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
 
 ### Two ActualState reporters, two different module sets (#733)
 

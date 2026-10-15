@@ -47,6 +47,9 @@ func TestPlaintextServesNoRAGRoutes(t *testing.T) {
 // Every control route is wrapped by the coordinator gate it is handed.
 func TestControlRAGRoutesGatedByCoordinator(t *testing.T) {
 	svc, ws := newTestService(t)
+	if err := os.WriteFile(filepath.Join(ws, "doc.txt"), []byte("node content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	mux := http.NewServeMux()
 	refuse := func(http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }
@@ -58,5 +61,12 @@ func TestControlRAGRoutesGatedByCoordinator(t *testing.T) {
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("control %s not gated: got %d", p, w.Code)
 		}
+	}
+	st, err := svc.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Files != 0 || st.Chunks != 0 {
+		t.Fatalf("a gated /rag/index still indexed: files=%d chunks=%d", st.Files, st.Chunks)
 	}
 }

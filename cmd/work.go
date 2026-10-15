@@ -1830,25 +1830,20 @@ func runWork(cmd *cobra.Command, args []string) {
 		// control listener behind a coordinator cert (citadel-cli#1318, the
 		// #5028 rule); the plaintext listener serves fail-closed stubs.
 		if provisionHandler := initProvisionHandler(); provisionHandler != nil {
-			statusServer.AddRouteRegistrar(provisionHandler.RegisterRoutes)
-			statusServer.AddControlRouteRegistrar(provisionHandler.RegisterControlRoutes)
+			registerControlOnlyAPI(statusServer, provisionHandler, requireProvisionPermission)
 		}
 
 		// Register workflow API routes (#259). The whole API lives only on the
 		// mTLS control listener behind a coordinator cert (citadel-cli#1305, the
 		// #5028 rule: mesh origin is not an identity); the plaintext listener
 		// serves fail-closed stubs.
-		wfServer := workflow.NewServer(wfExec)
-		statusServer.AddRouteRegistrar(wfServer.RegisterRoutes)
-		statusServer.AddControlRouteRegistrar(wfServer.RegisterControlRoutes)
+		registerControlOnlyAPI(statusServer, workflow.NewServer(wfExec), nil)
 
 		// Register node-local RAG API routes (#589): /rag/index, /rag/query,
 		// /rag/status. Served only on the mTLS control listener behind a
 		// coordinator cert (citadel-cli#1318); the plaintext listener serves
 		// fail-closed stubs.
-		ragServer := rag.NewServer(rag.New(wsDir, ""))
-		statusServer.AddRouteRegistrar(ragServer.RegisterRoutes)
-		statusServer.AddControlRouteRegistrar(ragServer.RegisterControlRoutes)
+		registerControlOnlyAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), nil)
 
 		// Local semantic-search file watcher (citadel-cli#617-619): if the
 		// operator has authorized any search roots, watch them and keep the

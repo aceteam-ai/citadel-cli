@@ -16,7 +16,7 @@ func TestPlaintextServesNoProvisioningRoutes(t *testing.T) {
 	handler.RegisterRoutes(mux, noAuthMiddleware)
 
 	for _, rq := range []struct{ method, path, body string }{
-		{http.MethodPost, "/provision/create", `{"name":"evil","type":"docker","image":"alpine","command":["sh","-c","id"]}`},
+		{http.MethodPost, "/provision/create", `{"name":"refused-test","type":"docker","image":"alpine"}`},
 		{http.MethodGet, "/provision/list", ""},
 		{http.MethodGet, "/provision/some-id", ""},
 		{http.MethodDelete, "/provision/some-id", ""},
