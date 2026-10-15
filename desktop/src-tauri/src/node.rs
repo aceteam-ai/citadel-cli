@@ -1,4 +1,4 @@
-use crate::auth::{valid_device_code, AuthState};
+use crate::auth::{valid_device_code, valid_operation_id, AuthOrigin, AuthState, BoundResult};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -16,6 +16,7 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct InitState {
     active: AtomicBool,
+    owner: Mutex<Option<SetupBinding>>,
     cancelled: AtomicBool,
     child: Mutex<Option<CommandChild>>,
     cancel_signal: watch::Sender<bool>,
@@ -25,6 +26,7 @@ impl Default for InitState {
     fn default() -> Self {
         Self {
             active: AtomicBool::new(false),
+            owner: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             child: Mutex::new(None),
             cancel_signal: watch::channel(false).0,
@@ -47,20 +49,59 @@ impl InitState {
     }
 }
 
+#[derive(Clone)]
+struct SetupBinding {
+    origin: AuthOrigin,
+    operation_id: String,
+}
+
+async fn setup_binding(auth: &AuthState, expected: &str, operation_id: &str)
+    -> Result<SetupBinding, String>
+{
+    if !valid_operation_id(operation_id) { return Err("Invalid setup operation".into()); }
+    Ok(SetupBinding { origin: auth.capture_origin(expected).await?,
+        operation_id: operation_id.into() })
+}
+
+async fn approve_setup_code(auth: &AuthState, binding: &SetupBinding, code: &str)
+    -> Result<(), String>
+{
+    if !valid_device_code(code) { return Err("Invalid device code".into()); }
+    auth.request_bound(&binding.origin, Method::POST, "/api/fabric/device-auth/approve",
+        Some(json!({ "user_code": code }))).await.map(|_| ())
+}
+
+fn cancel_owned_setup(state: &InitState, epoch: &str, operation_id: &str)
+    -> Result<(), String>
+{
+    // Hold the ownership selection through dispatch so an old cleanup cannot
+    // select a newly admitted setup. This is not process-completion proof.
+    let owner = state.owner.lock().map_err(|_| "Node setup state is unavailable")?;
+    let exact = owner.as_ref().is_some_and(|current| {
+        current.origin.epoch_text() == epoch && current.operation_id == operation_id
+    });
+    if !exact { return Err("Node setup operation changed".into()); }
+    state.cancel();
+    Ok(())
+}
+
 #[derive(Serialize, Clone)]
 pub struct InitEvent {
+    auth_epoch: String,
+    setup_operation_id: String,
     stage: &'static str,
     message: String,
 }
 
-fn emit(app: &AppHandle, stage: &'static str, message: impl Into<String>) {
-    let _ = app.emit(
-        "citadel:init",
-        InitEvent {
-            stage,
-            message: message.into(),
-        },
-    );
+fn emit(app: &AppHandle, binding: &SetupBinding, stage: &'static str, message: impl Into<String>) {
+    emit_to(binding, stage, message, |event| { let _ = app.emit("citadel:init", event); });
+}
+
+fn emit_to(binding: &SetupBinding, stage: &'static str, message: impl Into<String>,
+    publish: impl FnOnce(&InitEvent))
+{
+    publish(&InitEvent { auth_epoch: binding.origin.epoch_text(),
+        setup_operation_id: binding.operation_id.clone(), stage, message: message.into() });
 }
 
 fn sidecar(app: &AppHandle) -> Result<tauri_plugin_shell::process::Command, String> {
@@ -86,14 +127,22 @@ async fn output(app: &AppHandle, args: &[&str]) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn local_status(app: AppHandle) -> Result<Value, String> {
+pub async fn local_status(app: AppHandle, auth: State<'_, AuthState>,
+    expected_auth_epoch: String) -> Result<BoundResult<Value>, String>
+{
+    let origin = auth.capture_origin(&expected_auth_epoch).await?;
     let text = output(&app, &["status", "--json"]).await?;
-    serde_json::from_str(&text).map_err(|_| "Citadel returned invalid status".to_string())
+    let value = serde_json::from_str(&text).map_err(|_| "Citadel returned invalid status")?;
+    auth.finish_bound(&origin, value)
 }
 
 #[tauri::command]
-pub async fn service_status(app: AppHandle) -> Result<String, String> {
-    output(&app, &["service", "status"]).await
+pub async fn service_status(app: AppHandle, auth: State<'_, AuthState>,
+    expected_auth_epoch: String) -> Result<BoundResult<String>, String>
+{
+    let origin = auth.capture_origin(&expected_auth_epoch).await?;
+    let value = output(&app, &["service", "status"]).await?;
+    auth.finish_bound(&origin, value)
 }
 
 #[tauri::command]
@@ -106,37 +155,46 @@ pub async fn reconcile_desktop_helper(app: AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn service_action(app: AppHandle, action: String) -> Result<(), String> {
+pub async fn service_action(app: AppHandle, auth: State<'_, AuthState>,
+    expected_auth_epoch: String, action: String) -> Result<BoundResult<()>, String>
+{
     if action != "start" && action != "stop" {
         return Err("Unsupported node action".to_string());
     }
-    output(&app, &["service", &action]).await.map(|_| ())
+    let origin = auth.capture_origin(&expected_auth_epoch).await?;
+    output(&app, &["service", &action]).await?;
+    auth.finish_bound(&origin, ())
 }
 
 #[tauri::command]
-pub async fn diagnostics(app: AppHandle) -> Result<String, String> {
-    // Explicitly requested by the user. Never uploaded by the app.
-    output(&app, &["doctor"]).await
+pub async fn diagnostics(app: AppHandle, auth: State<'_, AuthState>,
+    expected_auth_epoch: String) -> Result<BoundResult<String>, String>
+{
+    let origin = auth.capture_origin(&expected_auth_epoch).await?;
+    let value = output(&app, &["doctor"]).await?;
+    auth.finish_bound(&origin, value)
 }
 
 #[tauri::command]
-pub async fn list_nodes(auth: State<'_, AuthState>) -> Result<Value, String> {
-    auth.request(Method::GET, "/api/fabric/nodes", None).await
+pub async fn list_nodes(auth: State<'_, AuthState>, expected_auth_epoch: String)
+    -> Result<BoundResult<Value>, String>
+{
+    let origin = auth.capture_origin(&expected_auth_epoch).await?;
+    auth.request_bound(&origin, Method::GET, "/api/fabric/nodes", None).await
 }
 
 #[tauri::command]
-pub async fn approve_device(auth: State<'_, AuthState>, code: String) -> Result<(), String> {
+pub async fn approve_device(auth: State<'_, AuthState>, expected_auth_epoch: String,
+    code: String) -> Result<BoundResult<()>, String>
+{
     let code = code.trim().to_ascii_uppercase();
     if !valid_device_code(&code) {
         return Err("Enter the eight-character code shown on the box".to_string());
     }
-    auth.request(
-        Method::POST,
-        "/api/fabric/device-auth/approve",
-        Some(json!({ "user_code": code })),
-    )
-    .await
-    .map(|_| ())
+    let origin = auth.capture_origin(&expected_auth_epoch).await?;
+    auth.request_bound(&origin, Method::POST, "/api/fabric/device-auth/approve",
+        Some(json!({ "user_code": code }))).await?;
+    auth.finish_bound(&origin, ())
 }
 
 fn code_from_line(line: &str) -> Option<String> {
@@ -145,24 +203,28 @@ fn code_from_line(line: &str) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn init_this_computer(
+pub async fn init_this_computer(
     app: AppHandle,
+    auth: State<'_, AuthState>,
     state: State<'_, InitState>,
+    expected_auth_epoch: String,
+    setup_operation_id: String,
     node_name: String,
-) -> Result<(), String> {
+) -> Result<BoundResult<()>, String> {
     let name = node_name.trim();
     if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
         return Err("Enter a node name of at most 64 characters".to_string());
     }
-    if state
-        .active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
+    let binding = setup_binding(&auth, &expected_auth_epoch, &setup_operation_id).await?;
     {
-        return Err("Node setup is already running".to_string());
+        let mut owner = state.owner.lock().map_err(|_| "Node setup state is unavailable")?;
+        if state.active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return Err("Node setup is already running".to_string());
+        }
+        *owner = Some(binding.clone());
+        state.cancelled.store(false, Ordering::SeqCst);
+        state.cancel_signal.send_replace(false);
     }
-    state.cancelled.store(false, Ordering::SeqCst);
-    state.cancel_signal.send_replace(false);
     let mut cancel_rx = state.cancel_signal.subscribe();
     let command = match sidecar(&app) {
         Ok(command) => command.args([
@@ -197,8 +259,9 @@ pub fn init_this_computer(
         state.cancel();
     }
     let app_for_task = app.clone();
+    let task_binding = binding.clone();
     tauri::async_runtime::spawn(async move {
-        emit(&app_for_task, "registering", "Registering this computer");
+        emit(&app_for_task, &task_binding, "registering", "Registering this computer");
         let mut approved = false;
         let mut exit_code = None;
         let mut had_error = false;
@@ -214,7 +277,7 @@ pub fn init_this_computer(
                 _ = cancel_rx.changed() => break,
                 _ = &mut timeout => {
                     had_error = true;
-                    emit(&app_for_task, "error", "Node setup timed out. Please try again");
+                    emit(&app_for_task, &task_binding, "error", "Node setup timed out. Please try again");
                     break;
                 }
                 event = receiver.recv() => match event {
@@ -229,19 +292,15 @@ pub fn init_this_computer(
                             break;
                         }
                         approved = true;
-                        emit(&app_for_task, "approving", "Approving this computer");
+                        emit(&app_for_task, &task_binding, "approving", "Approving this computer");
                         let auth = app_for_task.state::<AuthState>();
-                        let approval = auth.request(
-                            Method::POST,
-                            "/api/fabric/device-auth/approve",
-                            Some(json!({ "user_code": code })),
-                        );
+                        let approval = approve_setup_code(&auth, &task_binding, &code);
                         let result = tokio::select! {
                             biased;
                             _ = cancel_rx.changed() => break,
                             _ = &mut timeout => {
                                 had_error = true;
-                                emit(&app_for_task, "error", "Node setup timed out. Please try again");
+                                emit(&app_for_task, &task_binding, "error", "Node setup timed out. Please try again");
                                 break;
                             }
                             result = approval => result,
@@ -253,6 +312,7 @@ pub fn init_this_computer(
                             had_error = true;
                             emit(
                                 &app_for_task,
+                                &task_binding,
                                 "error",
                                 "Could not approve this computer. Check your sign in and try again",
                             );
@@ -274,33 +334,38 @@ pub fn init_this_computer(
             }
         }
         if state.cancelled.load(Ordering::SeqCst) {
-            emit(&app_for_task, "cancelled", "Node setup cancelled");
+            emit(&app_for_task, &task_binding, "cancelled", "Node setup cancelled");
         } else if !had_error && exit_code == Some(0) {
             emit(
                 &app_for_task,
+                &task_binding,
                 "ready",
                 "Citadel started. Waiting for this computer to appear online",
             );
         } else if !had_error {
             emit(
                 &app_for_task,
+                &task_binding,
                 "error",
                 format!("Node setup stopped ({})", exit_code.unwrap_or(-1)),
             );
         }
         state.active.store(false, Ordering::SeqCst);
     });
-    Ok(())
+    auth.finish_bound(&binding.origin, ())
 }
 
 #[tauri::command]
-pub fn cancel_init(state: State<'_, InitState>) {
-    state.cancel();
+pub fn cancel_init(state: State<'_, InitState>, originating_auth_epoch: String,
+    setup_operation_id: String) -> Result<(), String>
+{
+    cancel_owned_setup(&state, &originating_auth_epoch, &setup_operation_id)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{code_from_line, InitState};
+    use super::{approve_setup_code, cancel_owned_setup, code_from_line, emit_to, setup_binding, InitState};
+    use crate::auth::AuthState;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -326,4 +391,68 @@ mod tests {
         assert!(receiver.has_changed().unwrap());
         assert!(*receiver.borrow());
     }
+    #[test]
+    fn delayed_setup_code_uses_captured_origin_not_a_later_session() {
+        tauri::async_runtime::block_on(async {
+            let (auth, io) = AuthState::signed_in_fixture();
+            auth.view().await.unwrap();
+            let binding = setup_binding(&auth, "1", "11111111-1111-4111-8111-111111111111")
+                .await.unwrap();
+            io.raw_logout();
+            let logout = auth.sign_out("1", "22222222-2222-4222-8222-222222222222").await.unwrap();
+            io.queue_login();
+            let begun = auth.begin_login(&logout.view.auth_epoch,
+                "33333333-3333-4333-8333-333333333333").await.unwrap();
+            auth.open_begin(begun, |_| Ok(())).await;
+            let replacement = auth.exchange_callback(&format!(
+                "citadel://auth/callback?code={}&state={}", "a".repeat(64), "b".repeat(64)))
+                .await.unwrap();
+            assert!(replacement.view.signed_in);
+            let code = code_from_line("Or enter code manually:      ABCD-1234").unwrap();
+            assert!(approve_setup_code(&auth, &binding, &code).await.is_err());
+            assert!(io.request_count() == 3);
+        });
+    }
+    #[test]
+    fn owned_cancel_cannot_select_another_setup_and_does_not_prove_stop() {
+        tauri::async_runtime::block_on(async {
+            let (auth, _io) = AuthState::signed_in_fixture();
+            auth.view().await.unwrap();
+            let binding = setup_binding(&auth, "1", "11111111-1111-4111-8111-111111111111")
+                .await.unwrap();
+            let state = InitState::default();
+            *state.owner.lock().unwrap() = Some(binding.clone());
+            state.active.store(true, Ordering::SeqCst);
+            assert!(cancel_owned_setup(&state, "1", "33333333-3333-4333-8333-333333333333").is_err());
+            assert!(!state.cancelled.load(Ordering::SeqCst));
+            assert!(cancel_owned_setup(&state, "1", &binding.operation_id).is_ok());
+            assert!(state.cancelled.load(Ordering::SeqCst));
+            assert!(state.active.load(Ordering::SeqCst));
+        });
+    }
+    #[test]
+    fn every_actual_init_event_keeps_original_admission_stamp_after_logout() {
+        tauri::async_runtime::block_on(async {
+            let (auth, io) = AuthState::signed_in_fixture();
+            auth.view().await.unwrap();
+            let operation = "11111111-1111-4111-8111-111111111111";
+            let binding = setup_binding(&auth, "1", operation).await.unwrap();
+            io.raw_logout();
+            auth.sign_out("1", "22222222-2222-4222-8222-222222222222").await.unwrap();
+            for stage in ["registering", "approving", "ready", "cancelled", "error"] {
+                let mut seen = false;
+                emit_to(&binding, stage, "inert stage", |event| {
+                    assert!(event.auth_epoch == "1" && event.setup_operation_id == operation);
+                    assert!(event.stage == stage && event.message == "inert stage");
+                    seen = true;
+                });
+                assert!(seen);
+            }
+            // These are stale UI notifications, not evidence of process stop.
+            assert!(setup_binding(&auth, "1", operation).await.is_err());
+            assert!(auth.finish_bound(&binding.origin, "late local output").is_err());
+            assert!(io.request_count() == 1);
+        });
+    }
 }
+

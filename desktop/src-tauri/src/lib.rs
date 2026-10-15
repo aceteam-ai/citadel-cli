@@ -1,18 +1,11 @@
 mod auth;
 mod node;
 
-use auth::{AuthState, AuthView};
-use serde::Serialize;
+use auth::{AuthOutcome, AuthState, AuthView};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_opener::OpenerExt;
-
-#[derive(Clone, Serialize)]
-struct AuthEvent {
-    view: Option<AuthView>,
-    error: Option<String>,
-}
 
 fn handle_auth_urls(app: AppHandle, urls: Vec<url::Url>, last: Arc<Mutex<Option<String>>>) {
     for url in urls {
@@ -29,44 +22,37 @@ fn handle_auth_urls(app: AppHandle, urls: Vec<url::Url>, last: Arc<Mutex<Option<
         let app_for_exchange = app.clone();
         tauri::async_runtime::spawn(async move {
             let auth = app_for_exchange.state::<AuthState>();
-            let result = auth.exchange_callback(&raw).await;
-            let event = match result {
-                Ok(view) => AuthEvent {
-                    view: Some(view),
-                    error: None,
-                },
-                Err(error) => AuthEvent {
-                    view: None,
-                    error: Some(error),
-                },
-            };
-            let _ = app_for_exchange.emit("citadel:auth", event);
+            if let Ok(outcome) = auth.exchange_callback(&raw).await {
+                auth.publish_auth(&outcome, |current| {
+                    let _ = app_for_exchange.emit("citadel:auth", current);
+                });
+            }
         });
     }
 }
 
 #[tauri::command]
-async fn begin_login(app: AppHandle, auth: State<'_, AuthState>) -> Result<(), String> {
-    let url = auth.begin_login().await?;
-    if app.opener().open_url(url, None::<&str>).is_err() {
-        let _ = auth.cancel_login().await;
-        return Err("Could not open the browser for sign in".to_string());
-    }
-    Ok(())
+async fn begin_login(app: AppHandle, auth: State<'_, AuthState>,
+    expected_auth_epoch: String, operation_id: String) -> Result<AuthOutcome, String>
+{
+    let begun = auth.begin_login(&expected_auth_epoch, &operation_id).await?;
+    Ok(auth.open_begin(begun, |url| {
+        app.opener().open_url(url, None::<&str>).map_err(|_| ())
+    }).await)
 }
 
 #[tauri::command]
-async fn cancel_login(auth: State<'_, AuthState>) -> Result<(), String> {
-    auth.cancel_login().await
+async fn cancel_login(auth: State<'_, AuthState>, expected_auth_epoch: String,
+    operation_id: String, target_operation_id: String) -> Result<AuthOutcome, String>
+{
+    auth.cancel_login(&expected_auth_epoch, &operation_id, &target_operation_id).await
 }
 
 #[tauri::command]
-async fn verify_mfa(
-    auth: State<'_, AuthState>,
-    factor_id: String,
-    code: String,
-) -> Result<AuthView, String> {
-    auth.verify_mfa(&factor_id, &code).await
+async fn verify_mfa(auth: State<'_, AuthState>, expected_auth_epoch: String,
+    operation_id: String, factor_id: String, code: String) -> Result<AuthOutcome, String>
+{
+    auth.verify_mfa(&expected_auth_epoch, &operation_id, &factor_id, &code).await
 }
 
 #[tauri::command]
@@ -75,8 +61,10 @@ async fn session_status(auth: State<'_, AuthState>) -> Result<AuthView, String> 
 }
 
 #[tauri::command]
-async fn sign_out(auth: State<'_, AuthState>) -> Result<(), String> {
-    auth.sign_out().await
+async fn sign_out(auth: State<'_, AuthState>, expected_auth_epoch: String,
+    operation_id: String) -> Result<AuthOutcome, String>
+{
+    auth.sign_out(&expected_auth_epoch, &operation_id).await
 }
 
 pub fn run() {
@@ -128,3 +116,4 @@ pub fn run() {
             }
         });
 }
+
