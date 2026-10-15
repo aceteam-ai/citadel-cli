@@ -625,6 +625,14 @@ func synthesizeReceiptFromHeaders(headers http.Header) map[string]any {
 			receipt["aligner_model"] = vc.AlignerModel
 		}
 	}
+	// An aligner license with no commercial_use from the receipt (missing or
+	// undecodable X-TTS-Receipt) must not read as "commercial OK" by omission.
+	// The module sets both, so this only hardens a degraded response.
+	if _, hasAligner := receipt["aligner_license"]; hasAligner {
+		if _, known := receipt["commercial_use"]; !known {
+			receipt["commercial_use"] = false
+		}
+	}
 	return receipt
 }
 

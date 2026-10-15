@@ -678,7 +678,7 @@ func voiceCloneStub(t *testing.T, gotBody *map[string]any, gotPath *string) *htt
 	t.Helper()
 	// The module's full receipt (padded urlsafe-base64 in X-TTS-Receipt): carries
 	// commercial_use/watermark/consent that have no dedicated header.
-	fullReceipt := `{"model_license":"CC-BY-NC","engine":"omnivoice","voice_id":"jane-doe","commercial_use":false,"watermark":true,"consent":{"speaker_name":"Jane Doe","attested_by":"jane@example.com","statement":"I consent to this clone","attested_at":"2026-10-09T00:00:00Z"}}`
+	fullReceipt := `{"model_license":"CC-BY-NC","engine":"omnivoice","voice_id":"jane-doe","commercial_use":false,"watermark":null,"consent":{"speaker_name":"Jane Doe","attested_by":"jane@example.com","statement":"I consent to this clone","attested_at":"2026-10-09T00:00:00Z"}}`
 	receiptHeader := base64.URLEncoding.EncodeToString([]byte(fullReceipt))
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
@@ -875,8 +875,9 @@ func TestSynthesizeSpeech_VoiceCloneReceiptCarriesLicenseAndConsent(t *testing.T
 	if receipt["commercial_use"] != false {
 		t.Errorf("receipt commercial_use = %v, want false", receipt["commercial_use"])
 	}
-	if receipt["watermark"] != true {
-		t.Errorf("receipt watermark = %v, want true", receipt["watermark"])
+	// OmniVoice has no watermark: the module sends null, which is not emitted.
+	if w, present := receipt["watermark"]; present {
+		t.Errorf("OmniVoice receipt must not carry a watermark, got %v", w)
 	}
 	consent, ok := receipt["consent"].(map[string]any)
 	if !ok {
@@ -1100,8 +1101,9 @@ func chatterboxTimestampStub(t *testing.T, alignerHeader bool) *httptest.Server 
 // mirror of citadel-services#30: a timestamped Chatterbox clone keeps
 // model_license MIT but carries the aligner's CC-BY-NC license and
 // commercial_use=false, from the dedicated header or, when that is absent,
-// from the receipt JSON. Without this, the typed receipt decode silently
-// dropped the aligner fields and the platform saw only "MIT".
+// from the receipt JSON. On the old typed decode this failed outright: the
+// string watermark aborted the whole decode, so commercial_use and consent were
+// missing too.
 func TestSynthesizeSpeech_VoiceCloneAlignerLicenseDisclosed(t *testing.T) {
 	for _, withHeader := range []bool{true, false} {
 		srv := chatterboxTimestampStub(t, withHeader)
@@ -1206,5 +1208,25 @@ func TestVoiceCloneReceiptFields_OneMistypedFieldKeepsTheRest(t *testing.T) {
 	}
 	if r.ModelLicense != "CC-BY-NC" || r.AlignerLicense != "CC-BY-NC" || r.Consent["speaker_name"] != "Test Narrator" {
 		t.Errorf("valid fields were dropped: %+v", r)
+	}
+}
+
+// TestSynthesizeReceipt_AlignerLicenseWithoutReceiptForcesNonCommercial: if the
+// aligner-license header arrives but X-TTS-Receipt is missing or undecodable,
+// the receipt must not omit commercial_use (which a consumer could read as
+// "commercial OK"); it defaults to false, failing toward the label.
+func TestSynthesizeReceipt_AlignerLicenseWithoutReceiptForcesNonCommercial(t *testing.T) {
+	for _, rcpt := range []string{"", "!!!not-base64!!!"} {
+		h := http.Header{}
+		h.Set("X-TTS-Model-License", "MIT")
+		h.Set("X-TTS-Aligner-License", "CC-BY-NC")
+		if rcpt != "" {
+			h.Set("X-TTS-Receipt", rcpt)
+		}
+		receipt := synthesizeReceiptFromHeaders(h)
+		if receipt["aligner_license"] != "CC-BY-NC" || receipt["commercial_use"] != false {
+			t.Errorf("receipt header %q: got aligner_license=%v commercial_use=%v, want CC-BY-NC/false",
+				rcpt, receipt["aligner_license"], receipt["commercial_use"])
+		}
 	}
 }
