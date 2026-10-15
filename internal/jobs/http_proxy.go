@@ -19,10 +19,12 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
-// defaultHTTPProxyLocalPorts are the only ports HTTP_PROXY may reach on a
-// local-only address (loopback, link-local, unspecified): the WeChat bridge
-// (WeChatFerry FastAPI) listens on :8000 on the node's own host
-// (citadel-cli#1326, aceteam#11518).
+// defaultHTTPProxyLocalPorts are the only ports HTTP_PROXY may reach on the
+// node's own host (loopback or one of its own interface addresses), as
+// requested by citadel-cli#1326 for the WeChat bridge port (:8000). The
+// documented deployment reaches the bridge on a separate VM over the LAN or
+// mesh, which this exception does not affect; it only matters if a bridge is
+// co-located on the node host.
 var defaultHTTPProxyLocalPorts = map[int]bool{8000: true}
 
 // errHTTPProxyDestinationBlocked marks a refused destination.
@@ -42,28 +44,32 @@ func (h *HTTPProxyHandler) allowedLocalPorts() map[int]bool {
 }
 
 // httpProxyDestinationAllowed decides whether HTTP_PROXY may connect to ip:port.
-// Loopback, link-local (unicast and multicast), interface-local multicast and
-// unspecified addresses are local-only: reachable solely on an allowlisted
-// port. Everything else, including the AceTeam Network range 100.64.0.0/10
+//
+// Node-local destinations are loopback and the node's own interface addresses
+// (own): they reach the node's own services, which may bind every interface,
+// so they are refused except on an allowlisted port. Link-local (unicast and
+// multicast), interface-local multicast and unspecified addresses are always
+// refused. Everything else, including the AceTeam Network range 100.64.0.0/10
 // where mesh peers and the WeChat VM live, is allowed.
-func httpProxyDestinationAllowed(ip netip.Addr, port int, localPorts map[int]bool) bool {
+func httpProxyDestinationAllowed(ip netip.Addr, port int, localPorts map[int]bool, own map[netip.Addr]bool) bool {
 	if !ip.IsValid() {
 		return false
 	}
 	ip = ip.Unmap()
-	localOnly := ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified()
-	if !localOnly {
-		return true
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() {
+		return false
 	}
-	return localPorts[port]
+	if ip.IsLoopback() || own[ip] {
+		return localPorts[port]
+	}
+	return true
 }
 
 // guardedDialControl runs after name resolution, immediately before each
 // connect, with the exact address being dialed. Checking here pins the check
 // to the dialed IP, so a DNS answer that changes between a pre-check and the
 // connect (rebinding) cannot slip past it.
-func guardedDialControl(localPorts map[int]bool) func(network, address string, _ syscall.RawConn) error {
+func guardedDialControl(localPorts map[int]bool, own map[netip.Addr]bool) func(network, address string, _ syscall.RawConn) error {
 	return func(network, address string, _ syscall.RawConn) error {
 		host, portStr, err := net.SplitHostPort(address)
 		if err != nil {
@@ -77,8 +83,8 @@ func guardedDialControl(localPorts map[int]bool) func(network, address string, _
 		if err != nil {
 			return fmt.Errorf("%w: unparseable port %q", errHTTPProxyDestinationBlocked, portStr)
 		}
-		if !httpProxyDestinationAllowed(ip, port, localPorts) {
-			return fmt.Errorf("%w: %s is local-only and port %d is not allowlisted", errHTTPProxyDestinationBlocked, ip.Unmap(), port)
+		if !httpProxyDestinationAllowed(ip, port, localPorts, own) {
+			return fmt.Errorf("%w: %s port %d", errHTTPProxyDestinationBlocked, ip.Unmap(), port)
 		}
 		return nil
 	}
@@ -87,9 +93,10 @@ func guardedDialControl(localPorts map[int]bool) func(network, address string, _
 // newGuardedHTTPClient builds the HTTP_PROXY client: every connect is checked
 // by guardedDialControl, redirects are never followed (the 3xx itself is
 // returned to the caller), and no environment proxy is used, so the guarded
-// dial is the only path out.
+// dial is the only path out. The node's own interface addresses are
+// snapshotted once per client (one client per job).
 func newGuardedHTTPClient(localPorts map[int]bool) *http.Client {
-	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: guardedDialControl(localPorts)}
+	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: guardedDialControl(localPorts, ownInterfaceAddrs())}
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           dialer.DialContext,

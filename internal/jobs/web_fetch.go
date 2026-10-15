@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -267,6 +268,12 @@ func (h *WebFetchHandler) assertURLHostAllowed(rawURL string, allowPrivate bool)
 func wfAssertIPAllowed(ip net.IP, allowPrivate bool) error {
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast() {
+		return errBlockedDestination
+	}
+	// The node's own interface addresses reach the node's own services (which
+	// may bind every interface) exactly like loopback, so they are refused even
+	// with allow_private (citadel-cli#1318).
+	if addr, ok := netip.AddrFromSlice(ip); ok && ownInterfaceAddrs()[addr.Unmap()] {
 		return errBlockedDestination
 	}
 	if allowPrivate {

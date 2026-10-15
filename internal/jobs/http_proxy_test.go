@@ -140,10 +140,16 @@ func TestHTTPProxyRefusesBadSchemesAndURLs(t *testing.T) {
 	}
 }
 
-// The pure decision: local-only ranges need an allowlisted port; mesh (CGNAT),
-// LAN and public addresses do not.
+// The pure decision. Node-local (loopback, or one of the node's own interface
+// addresses) needs an allowlisted port; link-local and unspecified are always
+// refused; other mesh (CGNAT), LAN and public addresses are allowed.
 func TestHTTPProxyDestinationAllowed(t *testing.T) {
 	ports := map[int]bool{8000: true}
+	own := map[netip.Addr]bool{
+		netip.MustParseAddr("192.168.1.10"): true, // this node's LAN address
+		netip.MustParseAddr("172.17.0.1"):   true, // docker0
+		netip.MustParseAddr("100.64.0.42"):  true, // this node's mesh address (TUN mode)
+	}
 	cases := []struct {
 		ip   string
 		port int
@@ -156,9 +162,17 @@ func TestHTTPProxyDestinationAllowed(t *testing.T) {
 		{"::1", 8000, true},
 		{"::ffff:127.0.0.1", 8080, false},
 		{"169.254.169.254", 80, false},
+		{"169.254.169.254", 8000, false},
 		{"fe80::1", 8080, false},
+		{"fe80::1", 8000, false},
 		{"0.0.0.0", 8080, false},
-		{"::", 8080, false},
+		{"0.0.0.0", 8000, false},
+		{"::", 8000, false},
+		{"192.168.1.10", 8080, false},
+		{"192.168.1.10", 8000, true},
+		{"172.17.0.1", 8080, false},
+		{"100.64.0.42", 8080, false},
+		{"::ffff:100.64.0.42", 8080, false},
 		{"100.64.0.39", 8000, true},
 		{"100.64.0.39", 8080, true},
 		{"192.168.1.50", 8000, true},
@@ -166,12 +180,62 @@ func TestHTTPProxyDestinationAllowed(t *testing.T) {
 		{"93.184.216.34", 443, true},
 	}
 	for _, tc := range cases {
-		if got := httpProxyDestinationAllowed(netip.MustParseAddr(tc.ip), tc.port, ports); got != tc.want {
+		if got := httpProxyDestinationAllowed(netip.MustParseAddr(tc.ip), tc.port, ports, own); got != tc.want {
 			t.Errorf("%s:%d allowed=%v, want %v", tc.ip, tc.port, got, tc.want)
 		}
 	}
-	if httpProxyDestinationAllowed(netip.Addr{}, 8000, ports) {
+	if httpProxyDestinationAllowed(netip.Addr{}, 8000, ports, own) {
 		t.Error("an invalid address must be refused")
+	}
+}
+
+// Zone-qualified IPv6 forms reach the dial check as the address actually
+// dialed and are refused.
+func TestHTTPProxyRefusesZonedIPv6(t *testing.T) {
+	h := &HTTPProxyHandler{localPorts: map[int]bool{8000: true}}
+	for _, u := range []string{"http://[fe80::1%25lo]:8000/", "http://[::1%25lo]:8080/"} {
+		if _, err := runProxy(t, h, u); err == nil || !errors.Is(err, errHTTPProxyDestinationBlocked) {
+			t.Errorf("%s: want a blocked-destination error, got %v", u, err)
+		}
+	}
+}
+
+// ownInterfaceAddrs reads the injected interface list.
+func TestOwnInterfaceAddrs(t *testing.T) {
+	orig := interfaceAddrsFn
+	t.Cleanup(func() { interfaceAddrsFn = orig })
+	interfaceAddrsFn = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)},
+			&net.IPAddr{IP: net.ParseIP("100.64.0.42")},
+		}, nil
+	}
+	own := ownInterfaceAddrs()
+	for _, ip := range []string{"192.168.1.10", "100.64.0.42"} {
+		if !own[netip.MustParseAddr(ip)] {
+			t.Errorf("%s missing from own addresses %v", ip, own)
+		}
+	}
+	interfaceAddrsFn = func() ([]net.Addr, error) { return nil, errors.New("boom") }
+	if len(ownInterfaceAddrs()) != 0 {
+		t.Error("an enumeration error must yield an empty set")
+	}
+}
+
+// WEB_FETCH refuses the node's own interface addresses even with allow_private.
+func TestWebFetchRefusesOwnInterfaceAddrWithAllowPrivate(t *testing.T) {
+	orig := interfaceAddrsFn
+	t.Cleanup(func() { interfaceAddrsFn = orig })
+	interfaceAddrsFn = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPAddr{IP: net.ParseIP("192.168.1.10")}, &net.IPAddr{IP: net.ParseIP("100.64.0.42")}}, nil
+	}
+	for _, ip := range []string{"192.168.1.10", "100.64.0.42", "::ffff:100.64.0.42"} {
+		if err := wfAssertIPAllowed(net.ParseIP(ip), true); err == nil {
+			t.Errorf("%s: own address must be refused even with allow_private", ip)
+		}
+	}
+	if err := wfAssertIPAllowed(net.ParseIP("192.168.1.50"), true); err != nil {
+		t.Errorf("another LAN host with allow_private must stay allowed: %v", err)
 	}
 }
 

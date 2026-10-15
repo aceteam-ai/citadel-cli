@@ -12,6 +12,9 @@ import (
 // source address: WireGuard only accepts a peer's packets from the peer's own
 // allowed IPs.
 //
+// It must also arrive on that address (the connection's local address), which
+// rules out a LAN connection forging the mesh source.
+//
 // Loopback is deliberately NOT accepted. The node gateway and the platform
 // exposure relay both dial loopback (the relay as raw TCP, with no forwarding
 // header), so a loopback source does not prove a local caller. A request
@@ -28,28 +31,53 @@ func (s *Server) requireSelfOrigin(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) isSelfOrigin(r *http.Request) bool {
-	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("Forwarded") != "" || r.Header.Get("X-Real-IP") != "" {
-		return false
+	// Presence, not value: an empty or duplicated forwarding header still marks
+	// a forwarded request.
+	for _, h := range []string{"X-Forwarded-For", "Forwarded", "X-Real-IP"} {
+		if len(r.Header.Values(h)) > 0 {
+			return false
+		}
 	}
 	if s.selfMeshIPs == nil {
 		return false
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	src, err := netip.ParseAddr(host)
-	if err != nil {
+	src, ok := addrIP(r.RemoteAddr)
+	if !ok || src.IsLoopback() || src.IsUnspecified() {
 		return false
 	}
-	src = src.Unmap()
-	if src.IsLoopback() || src.IsUnspecified() {
+	// The connection must also have ARRIVED on the node's own mesh address.
+	// The status server binds every interface, and the WireGuard source check
+	// only holds on the mesh listener; a LAN connection carrying the mesh IP as
+	// its source arrives on the LAN address and is refused here.
+	la, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if la == nil {
 		return false
 	}
+	dst, ok := addrIP(la.String())
+	if !ok {
+		return false
+	}
+	srcSelf, dstSelf := false, false
 	for _, self := range s.selfMeshIPs() {
-		if self.IsValid() && !self.IsLoopback() && !self.IsUnspecified() && self.Unmap() == src {
-			return true
+		if !self.IsValid() || self.IsLoopback() || self.IsUnspecified() {
+			continue
 		}
+		self = self.Unmap()
+		srcSelf = srcSelf || self == src
+		dstSelf = dstSelf || self == dst
 	}
-	return false
+	return srcSelf && dstSelf
+}
+
+// addrIP parses the IP out of a "host:port" (or bare host) address string.
+func addrIP(hostport string) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return ip.Unmap(), true
 }

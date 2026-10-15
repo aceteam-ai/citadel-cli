@@ -2,6 +2,8 @@ package status
 
 import (
 	"bytes"
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -34,7 +36,18 @@ func exposeReq(path, remote string, hdr map[string]string) *http.Request {
 	}
 	r := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
 	r.RemoteAddr = remote
+	local := selfMeshIP + ":8080"
+	if v, ok := hdr["__local"]; ok {
+		local = v
+	}
+	if local != "" {
+		la, _ := net.ResolveTCPAddr("tcp", local)
+		r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, net.Addr(la)))
+	}
 	for k, v := range hdr {
+		if k == "__local" {
+			continue
+		}
 		r.Header.Set(k, v)
 	}
 	return r
@@ -75,6 +88,10 @@ func TestExposeRefusesEverythingButSelfOrigin(t *testing.T) {
 		{"self IP unknown (empty)", func() []netip.Addr { return nil }, selfMeshIP + ":51000", nil},
 		{"self IP is loopback", func() []netip.Addr { return []netip.Addr{netip.MustParseAddr("127.0.0.1")} }, "127.0.0.1:51000", nil},
 		{"unparseable remote", selfIPs, "not-an-ip", nil},
+		{"self source but arrived on the LAN address", selfIPs, selfMeshIP + ":51000", map[string]string{"__local": "192.168.1.10:8080"}},
+		{"self source but arrived on loopback", selfIPs, selfMeshIP + ":51000", map[string]string{"__local": "127.0.0.1:8080"}},
+		{"self source but no local address", selfIPs, selfMeshIP + ":51000", map[string]string{"__local": ""}},
+		{"self but empty X-Forwarded-For", selfIPs, selfMeshIP + ":51000", map[string]string{"X-Forwarded-For": ""}},
 	}
 	for _, tc := range cases {
 		for _, path := range []string{"/agent/expose", "/agent/unexpose"} {
@@ -106,5 +123,15 @@ func TestNonExposeAgentRoutesUnchanged(t *testing.T) {
 	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/worker-status"))
 	if w.Code != http.StatusOK || !called {
 		t.Fatalf("worker-status from a mesh peer: want 200, got %d", w.Code)
+	}
+}
+
+// An IPv4-mapped form of the node's own address on both ends is admitted.
+func TestExposeAdmitsMappedSelfOrigin(t *testing.T) {
+	mux, calls := newExposeServer(selfIPs)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, exposeReq("/agent/expose", "[::ffff:"+selfMeshIP+"]:51000", map[string]string{"__local": "[::ffff:" + selfMeshIP + "]:8080"}))
+	if w.Code != http.StatusOK || *calls != 1 {
+		t.Fatalf("mapped self origin: want 200 and 1 call, got %d and %d", w.Code, *calls)
 	}
 }
