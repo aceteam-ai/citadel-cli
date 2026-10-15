@@ -315,8 +315,12 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 //	    "engine":         "omnivoice",
 //	    "voice_id":       "jane-doe",
 //	    "commercial_use": false,
-//	    "watermark":      true,
-//	    "consent":        {"speaker_name": "...", "attested_by": "...", ...}
+//	    "watermark":      "perth-implicit", // Chatterbox; absent for OmniVoice (null)
+//	    "consent":        {"speaker_name": "...", "attested_by": "...", ...},
+//	    // voice-clone word_timestamps ONLY (citadel-services#30): the forced
+//	    // aligner's own license; the module also sets commercial_use=false.
+//	    "aligner_model":   "torchaudio.pipelines.MMS_FA",
+//	    "aligner_license": "CC-BY-NC"
 //	  },
 //	  "words": [{"word":"hello","start":0.1,"end":0.5}] // opt-in only
 //	}
@@ -585,12 +589,20 @@ func synthesizeReceiptFromHeaders(headers http.Header) map[string]any {
 	if voiceID := headers.Get("X-TTS-Voice-Id"); voiceID != "" {
 		receipt["voice_id"] = voiceID
 	}
+	// Word-timestamp aligner disclosure (aceteam-ai/citadel-services#30): the
+	// module's forced aligner has its own (CC-BY-NC) license, independent of the
+	// engine's model_license. Present ONLY on a word_timestamps response, where
+	// the module also sets commercial_use=false. Carried so the platform can
+	// label the output (label-only policy, aceteam#10823).
+	if alignerLicense := headers.Get("X-TTS-Aligner-License"); alignerLicense != "" {
+		receipt["aligner_license"] = alignerLicense
+	}
 	if vc := voiceCloneReceiptFields(headers.Get("X-TTS-Receipt")); vc != nil {
 		if vc.CommercialUse != nil {
 			receipt["commercial_use"] = *vc.CommercialUse
 		}
 		if vc.Watermark != nil {
-			receipt["watermark"] = *vc.Watermark
+			receipt["watermark"] = vc.Watermark
 		}
 		if vc.Consent != nil {
 			receipt["consent"] = vc.Consent
@@ -606,20 +618,31 @@ func synthesizeReceiptFromHeaders(headers http.Header) map[string]any {
 		if _, ok := receipt["voice_id"]; !ok && vc.VoiceID != "" {
 			receipt["voice_id"] = vc.VoiceID
 		}
+		if _, ok := receipt["aligner_license"]; !ok && vc.AlignerLicense != "" {
+			receipt["aligner_license"] = vc.AlignerLicense
+		}
+		if vc.AlignerModel != "" {
+			receipt["aligner_model"] = vc.AlignerModel
+		}
 	}
 	return receipt
 }
 
 // voiceCloneReceipt is the subset of the voice-clone module's receipt this
-// handler surfaces (aceteam#10823). Bool fields are pointers so an ABSENT field
+// handler surfaces (aceteam#10823). CommercialUse is a pointer so an ABSENT field
 // (kokoro/omnivoice, or an older module) is distinguishable from a real false.
 type voiceCloneReceipt struct {
-	ModelLicense  string         `json:"model_license"`
-	Engine        string         `json:"engine"`
-	VoiceID       string         `json:"voice_id"`
-	CommercialUse *bool          `json:"commercial_use"`
-	Watermark     *bool          `json:"watermark"`
-	Consent       map[string]any `json:"consent"`
+	ModelLicense  string
+	Engine        string
+	VoiceID       string
+	CommercialUse *bool
+	// Watermark is passed through as the module reports it: a scheme name
+	// string ("perth-implicit" for Chatterbox), or absent/null (OmniVoice).
+	Watermark any
+	Consent   map[string]any
+	// Set only on a word_timestamps response (citadel-services#30).
+	AlignerModel   string
+	AlignerLicense string
 }
 
 // voiceCloneReceiptFields decodes the voice-clone module's X-TTS-Receipt header
@@ -628,6 +651,12 @@ type voiceCloneReceipt struct {
 // when the header is absent or malformed. Best-effort like every other receipt
 // field: a parse failure never fails the job, and kokoro/omnivoice do not set
 // this header at all.
+//
+// Fields are picked out of a generic map one at a time, each with its own type
+// check, so one field of an unexpected type cannot discard the others. An
+// earlier typed-struct decode declared watermark a bool while the module sends
+// a string ("perth-implicit"); the type error dropped commercial_use and the
+// consent echo from EVERY Chatterbox (default-engine) receipt.
 func voiceCloneReceiptFields(encoded string) *voiceCloneReceipt {
 	if encoded == "" {
 		return nil
@@ -636,10 +665,24 @@ func voiceCloneReceiptFields(encoded string) *voiceCloneReceipt {
 	if err != nil {
 		return nil
 	}
-	var r voiceCloneReceipt
-	if err := json.Unmarshal(decoded, &r); err != nil {
+	var raw map[string]any
+	if err := json.Unmarshal(decoded, &raw); err != nil {
 		return nil
 	}
+	var r voiceCloneReceipt
+	r.ModelLicense, _ = raw["model_license"].(string)
+	r.Engine, _ = raw["engine"].(string)
+	r.VoiceID, _ = raw["voice_id"].(string)
+	if cu, ok := raw["commercial_use"].(bool); ok {
+		r.CommercialUse = &cu
+	}
+	switch wm := raw["watermark"].(type) {
+	case string, bool:
+		r.Watermark = wm
+	}
+	r.Consent, _ = raw["consent"].(map[string]any)
+	r.AlignerModel, _ = raw["aligner_model"].(string)
+	r.AlignerLicense, _ = raw["aligner_license"].(string)
 	return &r
 }
 

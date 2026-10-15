@@ -910,7 +910,7 @@ func TestSynthesizeSpeech_KokoroReceiptHasNoVoiceCloneKeys(t *testing.T) {
 		t.Fatalf("result not JSON: %v", err)
 	}
 	receipt, _ := res["receipt"].(map[string]any)
-	for _, key := range []string{"model_license", "engine", "voice_id", "commercial_use", "watermark", "consent"} {
+	for _, key := range []string{"model_license", "engine", "voice_id", "commercial_use", "watermark", "consent", "aligner_model", "aligner_license"} {
 		if _, present := receipt[key]; present {
 			t.Errorf("kokoro receipt must not carry %q, got %v", key, receipt[key])
 		}
@@ -1063,5 +1063,148 @@ func TestSynthesizeSpeech_VoiceCloneEngineOmnivoiceRoutesTo8215(t *testing.T) {
 	}
 	if res["backend"] != "voice-clone" {
 		t.Errorf("result backend = %v, want voice-clone", res["backend"])
+	}
+}
+
+// chatterboxTimestampStub mimics voice-clone >= 0.2.0 serving MIT Chatterbox
+// audio WITH word timestamps (citadel-services#30): the engine license stays
+// MIT, but the CC-BY-NC forced aligner is disclosed (X-TTS-Aligner-License +
+// aligner_* in the receipt JSON) and commercial_use is false. alignerHeader=false
+// omits the dedicated header to exercise the receipt-JSON fallback.
+func chatterboxTimestampStub(t *testing.T, alignerHeader bool) *httptest.Server {
+	t.Helper()
+	full := `{"model_license":"MIT","engine":"chatterbox","voice_id":"voice_abc","commercial_use":false,"watermark":"perth-implicit","consent":{"speaker_name":"Test Narrator","attested_by":"node-owner","statement":"synthetic test consent","attested_at":"2026-10-14T00:00:00Z"},"aligner_model":"torchaudio.pipelines.MMS_FA","aligner_license":"CC-BY-NC"}`
+	encoded := base64.URLEncoding.EncodeToString([]byte(full))
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+		case "/v1/audio/speech":
+			w.Header().Set("X-TTS-Model-Version", "voice-clone-0.2.0")
+			w.Header().Set("X-TTS-Model-License", "MIT")
+			w.Header().Set("X-TTS-Engine", "chatterbox")
+			w.Header().Set("X-TTS-Voice-Id", "voice_abc")
+			if alignerHeader {
+				w.Header().Set("X-TTS-Aligner-License", "CC-BY-NC")
+			}
+			w.Header().Set("X-TTS-Receipt", encoded)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"audio_base64":"YXVkaW8=","mime":"audio/mpeg","words":[{"word":"hello","start":0.1,"end":0.5}],"receipt":{}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+// TestSynthesizeSpeech_VoiceCloneAlignerLicenseDisclosed pins the node-side
+// mirror of citadel-services#30: a timestamped Chatterbox clone keeps
+// model_license MIT but carries the aligner's CC-BY-NC license and
+// commercial_use=false, from the dedicated header or, when that is absent,
+// from the receipt JSON. Without this, the typed receipt decode silently
+// dropped the aligner fields and the platform saw only "MIT".
+func TestSynthesizeSpeech_VoiceCloneAlignerLicenseDisclosed(t *testing.T) {
+	for _, withHeader := range []bool{true, false} {
+		srv := chatterboxTimestampStub(t, withHeader)
+		h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"voice-clone": srv.URL}}
+		out, err := h.Execute(JobContext{}, &nexus.Job{
+			ID:   "vc-aligner",
+			Type: "SYNTHESIZE_SPEECH",
+			Payload: map[string]string{
+				"text": "hello", "backend": "voice-clone", "engine": "chatterbox",
+				"voice": "voice_abc", "word_timestamps": "true",
+			},
+		})
+		srv.Close()
+		if err != nil {
+			t.Fatalf("header=%v: unexpected error: %v", withHeader, err)
+		}
+		var res map[string]any
+		if err := json.Unmarshal(out, &res); err != nil {
+			t.Fatalf("header=%v: result not JSON: %v", withHeader, err)
+		}
+		receipt, _ := res["receipt"].(map[string]any)
+		want := map[string]any{
+			"model_license":   "MIT",
+			"commercial_use":  false,
+			"watermark":       "perth-implicit",
+			"aligner_license": "CC-BY-NC",
+			"aligner_model":   "torchaudio.pipelines.MMS_FA",
+		}
+		for k, v := range want {
+			if receipt[k] != v {
+				t.Errorf("header=%v: receipt[%q] = %v, want %v", withHeader, k, receipt[k], v)
+			}
+		}
+		if consent, ok := receipt["consent"].(map[string]any); !ok || consent["speaker_name"] != "Test Narrator" {
+			t.Errorf("header=%v: consent echo missing from a Chatterbox receipt: %v", withHeader, receipt["consent"])
+		}
+	}
+}
+
+// TestSynthesizeSpeech_VoiceCloneWithoutTimestampsHasNoAlignerKeys: a plain
+// (non-timestamped) voice-clone receipt carries no aligner fields.
+func TestSynthesizeSpeech_VoiceCloneWithoutTimestampsHasNoAlignerKeys(t *testing.T) {
+	srv := voiceCloneStub(t, nil, nil)
+	defer srv.Close()
+	h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{"voice-clone": srv.URL}}
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "vc-no-ts",
+		Type:    "SYNTHESIZE_SPEECH",
+		Payload: map[string]string{"text": "clone me", "backend": "voice-clone"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var res map[string]any
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	receipt, _ := res["receipt"].(map[string]any)
+	for _, key := range []string{"aligner_model", "aligner_license"} {
+		if _, present := receipt[key]; present {
+			t.Errorf("non-timestamped receipt must not carry %q, got %v", key, receipt[key])
+		}
+	}
+}
+
+// TestVoiceCloneReceiptFields_ChatterboxStringWatermarkKeepsConsent is the
+// regression for the default-engine bug: the module reports Chatterbox's
+// watermark as a STRING ("perth-implicit"). The old typed decode declared it a
+// bool, failed, and silently dropped commercial_use and the consent echo from
+// every Chatterbox receipt (with or without word timestamps).
+func TestVoiceCloneReceiptFields_ChatterboxStringWatermarkKeepsConsent(t *testing.T) {
+	full := `{"model_license":"MIT","engine":"chatterbox","voice_id":"voice_abc","commercial_use":true,"watermark":"perth-implicit","consent":{"speaker_name":"Test Narrator","attested_by":"node-owner"}}`
+	r := voiceCloneReceiptFields(base64.URLEncoding.EncodeToString([]byte(full)))
+	if r == nil {
+		t.Fatal("a real Chatterbox receipt must decode")
+	}
+	if r.CommercialUse == nil || !*r.CommercialUse {
+		t.Errorf("commercial_use = %v, want true", r.CommercialUse)
+	}
+	if r.Watermark != "perth-implicit" {
+		t.Errorf("watermark = %v, want perth-implicit", r.Watermark)
+	}
+	if r.Consent["speaker_name"] != "Test Narrator" {
+		t.Errorf("consent echo dropped: %v", r.Consent)
+	}
+}
+
+// TestVoiceCloneReceiptFields_OneMistypedFieldKeepsTheRest: a field of an
+// unexpected type is skipped on its own; it must not discard the consent echo
+// or the license fields alongside it.
+func TestVoiceCloneReceiptFields_OneMistypedFieldKeepsTheRest(t *testing.T) {
+	full := `{"model_license":"CC-BY-NC","commercial_use":"no","watermark":{"weird":1},"consent":{"speaker_name":"Test Narrator"},"aligner_license":"CC-BY-NC"}`
+	r := voiceCloneReceiptFields(base64.URLEncoding.EncodeToString([]byte(full)))
+	if r == nil {
+		t.Fatal("a receipt with one mistyped field must still decode")
+	}
+	if r.CommercialUse != nil {
+		t.Errorf("a non-bool commercial_use must be skipped, got %v", *r.CommercialUse)
+	}
+	if r.Watermark != nil {
+		t.Errorf("an object watermark must be skipped, got %v", r.Watermark)
+	}
+	if r.ModelLicense != "CC-BY-NC" || r.AlignerLicense != "CC-BY-NC" || r.Consent["speaker_name"] != "Test Narrator" {
+		t.Errorf("valid fields were dropped: %+v", r)
 	}
 }
