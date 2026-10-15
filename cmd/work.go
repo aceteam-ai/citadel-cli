@@ -1696,9 +1696,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Start status server if enabled
 	if workStatusPort > 0 {
 		serverCfg := status.ServerConfig{
-			Port:    workStatusPort,
-			Version: Version,
-			Agent:   agentProviders,
+			Port:        workStatusPort,
+			Version:     Version,
+			Agent:       agentProviders,
+			SelfMeshIPs: selfMeshIPs,
 		}
 
 		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so

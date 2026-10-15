@@ -163,8 +163,12 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		return p.WorkerRestart()
 	})))
-	mux.HandleFunc("/agent/expose", s.requireVPNOrAuth(s.handleAgentExpose))
-	mux.HandleFunc("/agent/unexpose", s.requireVPNOrAuth(s.handleAgentUnexpose))
+	// Expose/unexpose program the node gateway, so they must not trust mesh
+	// origin (citadel-cli#1318). Their only caller is this node's own
+	// `citadel service expose|unexpose`, which dials the node's own mesh IP;
+	// the platform publishes services through the EXPOSE_SET job instead.
+	mux.HandleFunc("/agent/expose", s.requireSelfOrigin(s.handleAgentExpose))
+	mux.HandleFunc("/agent/unexpose", s.requireSelfOrigin(s.handleAgentUnexpose))
 }
 
 // handleAgentUnexpose revokes an exposure on the in-process gateway. POST with

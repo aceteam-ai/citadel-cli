@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -52,6 +53,9 @@ type Server struct {
 	// agent provides the data/actions backing the /agent/* introspection &
 	// control endpoints (issue #236). Nil disables those routes.
 	agent *AgentProviders
+
+	// selfMeshIPs backs requireSelfOrigin; see ServerConfig.SelfMeshIPs.
+	selfMeshIPs func() []netip.Addr
 
 	// routeRegistrars are callbacks registered via AddRouteRegistrar that
 	// install additional routes (e.g., provisioning API) during Start.
@@ -109,6 +113,12 @@ type ServerConfig struct {
 	// listeners but gated by requireVPNOrAuth.
 	Agent *AgentProviders
 
+	// SelfMeshIPs returns this node's own AceTeam Network addresses. It backs
+	// requireSelfOrigin (citadel-cli#1318), which admits a request only when
+	// its source IP is one of them. Nil, an error, or an empty result refuses
+	// every self-origin route (fail closed).
+	SelfMeshIPs func() []netip.Addr
+
 	// ExtraRoutes, when set, is called during Start() to register additional
 	// HTTP routes on the status server's mux. This allows external packages
 	// (e.g., workflow) to add endpoints without modifying the status package.
@@ -162,6 +172,7 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		enableDesktop:     cfg.EnableDesktop,
 		passcodeVerifier:  cfg.PasscodeVerifier,
 		agent:             cfg.Agent,
+		selfMeshIPs:       cfg.SelfMeshIPs,
 		extraRoutes:       cfg.ExtraRoutes,
 		gatewayCertPath:   cfg.GatewayCertPath,
 		caVerifier:        cfg.CAVerifier,
