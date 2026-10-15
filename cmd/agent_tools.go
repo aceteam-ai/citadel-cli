@@ -511,6 +511,12 @@ func agentConfig(nodeName, baseURL, orgID string, queues []string) map[string]an
 // server's self-origin gate (citadel-cli#1318). It is read per request, so a
 // re-addressed node is honored without a restart. An unknown address returns
 // nil, and the gate then refuses (fail closed).
+//
+// IPv4 only, deliberately. Do not add the node's mesh IPv6 address without
+// first excluding it from platform-exposure and EXPOSE_SET forward targets:
+// those accept any IsPrivate address, which includes the mesh IPv6 range
+// (fc00::/7), and a raw relay to the node's own address would then look like
+// a self-origin request.
 func selfMeshIPs() []netip.Addr {
 	ip, err := network.GetGlobalIPv4()
 	if err != nil || ip == "" {

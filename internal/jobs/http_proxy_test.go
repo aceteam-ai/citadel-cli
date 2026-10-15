@@ -140,10 +140,16 @@ func TestHTTPProxyRefusesBadSchemesAndURLs(t *testing.T) {
 	}
 }
 
-// The pure decision: local-only ranges need an allowlisted port; mesh (CGNAT),
-// LAN and public addresses do not.
+// The pure decision. Node-local (loopback, or one of the node's own interface
+// addresses) needs an allowlisted port; link-local and unspecified are always
+// refused; other mesh (CGNAT), LAN and public addresses are allowed.
 func TestHTTPProxyDestinationAllowed(t *testing.T) {
 	ports := map[int]bool{8000: true}
+	own := map[netip.Addr]bool{
+		netip.MustParseAddr("192.168.1.10"): true, // this node's LAN address
+		netip.MustParseAddr("172.17.0.1"):   true, // docker0
+		netip.MustParseAddr("100.64.0.42"):  true, // this node's mesh address (TUN mode)
+	}
 	cases := []struct {
 		ip   string
 		port int
@@ -156,9 +162,17 @@ func TestHTTPProxyDestinationAllowed(t *testing.T) {
 		{"::1", 8000, true},
 		{"::ffff:127.0.0.1", 8080, false},
 		{"169.254.169.254", 80, false},
+		{"169.254.169.254", 8000, false},
 		{"fe80::1", 8080, false},
+		{"fe80::1", 8000, false},
 		{"0.0.0.0", 8080, false},
-		{"::", 8080, false},
+		{"0.0.0.0", 8000, false},
+		{"::", 8000, false},
+		{"192.168.1.10", 8080, false},
+		{"192.168.1.10", 8000, true},
+		{"172.17.0.1", 8080, false},
+		{"100.64.0.42", 8080, false},
+		{"::ffff:100.64.0.42", 8080, false},
 		{"100.64.0.39", 8000, true},
 		{"100.64.0.39", 8080, true},
 		{"192.168.1.50", 8000, true},
@@ -166,16 +180,122 @@ func TestHTTPProxyDestinationAllowed(t *testing.T) {
 		{"93.184.216.34", 443, true},
 	}
 	for _, tc := range cases {
-		if got := httpProxyDestinationAllowed(netip.MustParseAddr(tc.ip), tc.port, ports); got != tc.want {
+		if got := httpProxyDestinationAllowed(netip.MustParseAddr(tc.ip), tc.port, ports, own); got != tc.want {
 			t.Errorf("%s:%d allowed=%v, want %v", tc.ip, tc.port, got, tc.want)
 		}
 	}
-	if httpProxyDestinationAllowed(netip.Addr{}, 8000, ports) {
+	if httpProxyDestinationAllowed(netip.Addr{}, 8000, ports, own) {
 		t.Error("an invalid address must be refused")
 	}
 }
 
-// The production default allowlists exactly the WeChat bridge port.
+// Zone-qualified IPv6 forms reach the dial check as the address actually
+// dialed and are refused.
+func TestHTTPProxyRefusesZonedIPv6(t *testing.T) {
+	h := &HTTPProxyHandler{localPorts: map[int]bool{8000: true}}
+	for _, u := range []string{"http://[fe80::1%25lo]:8000/", "http://[::1%25lo]:8080/"} {
+		if _, err := runProxy(t, h, u); err == nil || !errors.Is(err, errHTTPProxyDestinationBlocked) {
+			t.Errorf("%s: want a blocked-destination error, got %v", u, err)
+		}
+	}
+}
+
+// ownInterfaceAddrs reads the injected interface list and returns enumeration
+// errors instead of an empty set.
+func TestOwnInterfaceAddrs(t *testing.T) {
+	stubInterfaceAddrs(t, []net.Addr{
+		&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)},
+		&net.IPAddr{IP: net.ParseIP("100.64.0.42")},
+		&net.IPAddr{IP: net.ParseIP("fd7a:115c:a1e0::42")},
+	}, nil)
+	own, err := ownInterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ip := range []string{"192.168.1.10", "100.64.0.42", "::ffff:100.64.0.42", "fd7a:115c:a1e0::42", "fd7a:115c:a1e0::42%eth0"} {
+		if !own.has(netip.MustParseAddr(ip)) {
+			t.Errorf("%s not recognized as an own address", ip)
+		}
+	}
+	stubInterfaceAddrs(t, nil, errors.New("boom"))
+	if _, err := ownInterfaceAddrs(); err == nil {
+		t.Error("an enumeration error must be returned, not an empty set")
+	}
+}
+
+func stubInterfaceAddrs(t *testing.T, addrs []net.Addr, err error) {
+	t.Helper()
+	orig := interfaceAddrsFn
+	t.Cleanup(func() { interfaceAddrsFn = orig })
+	interfaceAddrsFn = func() ([]net.Addr, error) { return addrs, err }
+}
+
+// If the node's own addresses cannot be determined, HTTP_PROXY refuses the job
+// before any connection, even to an otherwise allowed destination.
+func TestHTTPProxyFailsClosedWhenOwnAddrsUnknown(t *testing.T) {
+	srv, hits := countingServer(t, "bridge")
+	stubInterfaceAddrs(t, nil, errors.New("enumeration failed"))
+	h := &HTTPProxyHandler{localPorts: map[int]bool{portOf(t, srv.URL): true}}
+	_, err := runProxy(t, h, srv.URL+"/health")
+	if err == nil || !errors.Is(err, errHTTPProxyDestinationBlocked) {
+		t.Fatalf("want a blocked-destination error, got %v", err)
+	}
+	if atomic.LoadInt32(hits) != 0 {
+		t.Fatal("a request was sent although own addresses were unknown")
+	}
+}
+
+// This node's own zoned IPv6 address is node-local through the real dial
+// check; another host's zoned address is not.
+func TestHTTPProxyOwnZonedIPv6IsNodeLocal(t *testing.T) {
+	own := ownAddrSet{netip.MustParseAddr("fd7a:115c:a1e0::42"): true}
+	control := guardedDialControl(map[int]bool{8000: true}, own)
+	if err := control("tcp6", "[fd7a:115c:a1e0::42%eth0]:8080", nil); err == nil || !errors.Is(err, errHTTPProxyDestinationBlocked) {
+		t.Fatalf("own zoned address on 8080: want refused, got %v", err)
+	}
+	if err := control("tcp6", "[fd7a:115c:a1e0::42]:8080", nil); err == nil {
+		t.Fatal("own unzoned address on 8080: want refused")
+	}
+	if err := control("tcp6", "[fd7a:115c:a1e0::99%eth0]:8080", nil); err != nil {
+		t.Fatalf("another host's zoned address must stay allowed: %v", err)
+	}
+}
+
+// WEB_FETCH refuses the node's own interface addresses even with allow_private.
+func TestWebFetchRefusesOwnInterfaceAddrWithAllowPrivate(t *testing.T) {
+	stubInterfaceAddrs(t, []net.Addr{&net.IPAddr{IP: net.ParseIP("192.168.1.10")}, &net.IPAddr{IP: net.ParseIP("100.64.0.42")}}, nil)
+	for _, ip := range []string{"192.168.1.10", "100.64.0.42", "::ffff:100.64.0.42"} {
+		if err := wfAssertIPAllowed(net.ParseIP(ip), true); err == nil {
+			t.Errorf("%s: own address must be refused even with allow_private", ip)
+		}
+	}
+	if err := wfAssertIPAllowed(net.ParseIP("192.168.1.50"), true); err != nil {
+		t.Errorf("another LAN host with allow_private must stay allowed: %v", err)
+	}
+}
+
+// If the node's own addresses cannot be determined, WEB_FETCH refuses through
+// its real admission path (allow_private set) before any connection: the
+// error is the blocked-destination error, not a dial error.
+func TestWebFetchFailsClosedWhenOwnAddrsUnknown(t *testing.T) {
+	stubInterfaceAddrs(t, nil, errors.New("enumeration failed"))
+	for _, ip := range []string{"192.168.1.10", "100.64.0.42", "93.184.216.34"} {
+		if err := wfAssertIPAllowed(net.ParseIP(ip), true); err == nil {
+			t.Errorf("%s: want refused while own addresses are unknown", ip)
+		}
+	}
+	h := &WebFetchHandler{}
+	_, err := h.Execute(JobContext{}, &nexus.Job{ID: "wf", Type: "WEB_FETCH", Payload: map[string]string{
+		"url": "http://192.0.2.10:9/", "allow_private": "true",
+	}})
+	if err == nil || !errors.Is(err, errBlockedDestination) {
+		t.Fatalf("want errBlockedDestination before any dial, got %v", err)
+	}
+}
+
+// The production default allowlists exactly the WeChat bridge port. The other
+// fixtures override localPorts, so this is the only pin on the zero-value
+// default.
 func TestHTTPProxyDefaultLocalPorts(t *testing.T) {
 	got := (&HTTPProxyHandler{}).allowedLocalPorts()
 	if len(got) != 1 || !got[8000] {
@@ -188,7 +308,11 @@ func TestHTTPProxyDefaultLocalPorts(t *testing.T) {
 // must never follow redirects. Go skips the proxy for loopback targets, so the
 // end-to-end tests cannot observe this; pin the client configuration directly.
 func TestGuardedHTTPClientConfiguration(t *testing.T) {
-	c := newGuardedHTTPClient(map[int]bool{8000: true})
+	stubInterfaceAddrs(t, []net.Addr{&net.IPAddr{IP: net.ParseIP("192.168.1.10")}}, nil)
+	c, err := newGuardedHTTPClient(map[int]bool{8000: true})
+	if err != nil {
+		t.Fatalf("client construction with known own addresses: %v", err)
+	}
 	tr, ok := c.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport is %T, want *http.Transport", c.Transport)
