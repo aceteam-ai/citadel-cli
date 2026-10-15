@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1827,9 +1826,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		// thing that ever execs a vendor binary.
 		agentsProbeSvc.Start(ctx, agentsProbeInterval())
 
-		// Register provisioning API routes on the status server
+		// Register provisioning API routes. The API lives only on the mTLS
+		// control listener behind a coordinator cert (citadel-cli#1318, the
+		// #5028 rule); the plaintext listener serves fail-closed stubs.
 		if provisionHandler := initProvisionHandler(); provisionHandler != nil {
 			statusServer.AddRouteRegistrar(provisionHandler.RegisterRoutes)
+			statusServer.AddControlRouteRegistrar(provisionHandler.RegisterControlRoutes)
 		}
 
 		// Register workflow API routes (#259). The whole API lives only on the
@@ -1841,12 +1843,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		statusServer.AddControlRouteRegistrar(wfServer.RegisterControlRoutes)
 
 		// Register node-local RAG API routes (#589): /rag/index, /rag/query,
-		// /rag/status. Same requireVPNOrAuth posture and workspace root as the
-		// file handlers, so a locally-populated index is queryable over the mesh.
-		statusServer.AddRouteRegistrar(func(mux *http.ServeMux, auth func(http.HandlerFunc) http.HandlerFunc) {
-			ragServer := rag.NewServer(rag.New(wsDir, ""))
-			ragServer.RegisterRoutes(mux, auth)
-		})
+		// /rag/status. Served only on the mTLS control listener behind a
+		// coordinator cert (citadel-cli#1318); the plaintext listener serves
+		// fail-closed stubs.
+		ragServer := rag.NewServer(rag.New(wsDir, ""))
+		statusServer.AddRouteRegistrar(ragServer.RegisterRoutes)
+		statusServer.AddControlRouteRegistrar(ragServer.RegisterControlRoutes)
 
 		// Local semantic-search file watcher (citadel-cli#617-619): if the
 		// operator has authorized any search roots, watch them and keep the

@@ -19,12 +19,27 @@ func NewHandler(manager *Manager) *Handler {
 	return &Handler{manager: manager}
 }
 
-// RegisterRoutes attaches the provisioning endpoints to the given mux.
-// The authMiddleware wraps each handler with VPN-or-auth gating.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMiddleware func(http.HandlerFunc) http.HandlerFunc) {
-	mux.HandleFunc("/provision/create", authMiddleware(h.handleCreate))
-	mux.HandleFunc("/provision/list", authMiddleware(h.handleList))
-	mux.HandleFunc("/provision/", authMiddleware(h.handleByID))
+// RegisterRoutes installs fail-closed stubs on the plaintext status listener
+// (LAN + VPN). Provisioning starts containers from a caller-supplied image and
+// command, so it must not trust mesh origin (the #5028 rule; citadel-cli#1318).
+// The real routes live on the mTLS control listener (RegisterControlRoutes).
+// The stubs refuse with a clear signal instead of 404ing.
+func (h *Handler) RegisterRoutes(mux *http.ServeMux, _ func(http.HandlerFunc) http.HandlerFunc) {
+	mux.HandleFunc("/provision", handleMovedToControl)
+	mux.HandleFunc("/provision/", handleMovedToControl)
+}
+
+// RegisterControlRoutes installs the provisioning API on the mTLS control
+// listener, every route behind requireCoordinator (a verified fabric-CA
+// coordinator client certificate).
+func (h *Handler) RegisterControlRoutes(mux *http.ServeMux, requireCoordinator func(http.HandlerFunc) http.HandlerFunc) {
+	mux.HandleFunc("/provision/create", requireCoordinator(h.handleCreate))
+	mux.HandleFunc("/provision/list", requireCoordinator(h.handleList))
+	mux.HandleFunc("/provision/", requireCoordinator(h.handleByID))
+}
+
+func handleMovedToControl(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusForbidden, "the provisioning API requires a coordinator mTLS client certificate on the control listener")
 }
 
 func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request) {
