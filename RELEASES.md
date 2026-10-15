@@ -3111,3 +3111,18 @@ Auto-generated log of every release.
   - feat(worker): add inactive deferral boundary (#1271) (#1301)
 
 
+---
+
+## v2.194.0 — 2026-10-15
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +232 |
+
+**Changes:**
+
+  - fix(speech): surface the aligner license and stop dropping Chatterbox receipt fields (#1322)
+
+
