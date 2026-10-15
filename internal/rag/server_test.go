@@ -23,7 +23,7 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	svc, ws := newTestService(t)
 	mux := http.NewServeMux()
-	NewServer(svc).RegisterRoutes(mux, passthroughAuth)
+	NewServer(svc).RegisterControlRoutes(mux, passthroughAuth)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts, ws

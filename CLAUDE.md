@@ -1522,6 +1522,25 @@ current directory, and it does not look for `/etc/citadel/citadel.yaml` directly
 Read the function for the exact order; do not re-copy it here. A restated
 algorithm is what went stale before.
 
+### Status-server routes: mesh origin is not an identity (#5028, #1305, #1318)
+
+The status server's plaintext listener (LAN bind plus the tsnet VPN listener)
+gates feature routes with `requireVPNOrAuth`, which admits ANY `100.64.0.0/10`
+source with no token. On the flat mesh that means any peer. So
+`status.Server.AddRouteRegistrar` is only for routes that are safe to serve to
+every mesh peer. A route that mutates node state, runs code, or reads node
+content belongs on the mTLS control listener: register it with
+`status.Server.AddControlRouteRegistrar`, which hands it `requireCoordinator`
+(a verified fabric-CA coordinator client cert). Have the package's plain
+`RegisterRoutes` serve a fail-closed 403 stub on the old path (see
+`internal/workflow/server.go`, `internal/provision/handler.go`,
+`internal/rag/server.go`). The control listener only starts when the fabric CA
+bundle loads, so on a CA-less node a moved route is simply unavailable; that is
+the intended fail-closed direction. (Constructing it also needs the verifier
+and the control server cert.) Check callers before moving a route, in aceteam
+as well as in this repo's own CLI commands. Wire both sides with
+`cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
+
 ### Two ActualState reporters, two different module sets (#733)
 
 A node ships `ActualState` to the control plane from TWO independent paths.

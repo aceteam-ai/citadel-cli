@@ -458,7 +458,7 @@ func setupTestHandler(t *testing.T) (*Handler, *Manager, *mockBackend) {
 func TestHTTPCreate(t *testing.T) {
 	handler, _, _ := setupTestHandler(t)
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux, noAuthMiddleware)
+	handler.RegisterControlRoutes(mux, noAuthMiddleware)
 
 	body := `{"name":"http-test","type":"docker","image":"nginx:latest"}`
 	req := httptest.NewRequest(http.MethodPost, "/provision/create", strings.NewReader(body))
@@ -478,7 +478,7 @@ func TestHTTPCreate(t *testing.T) {
 func TestHTTPCreateInvalid(t *testing.T) {
 	handler, _, _ := setupTestHandler(t)
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux, noAuthMiddleware)
+	handler.RegisterControlRoutes(mux, noAuthMiddleware)
 
 	req := httptest.NewRequest(http.MethodPost, "/provision/create", strings.NewReader(`{"name":"invalid","type":"docker"}`))
 	w := httptest.NewRecorder()
@@ -493,7 +493,7 @@ func TestHTTPList(t *testing.T) {
 	handler, mgr, _ := setupTestHandler(t)
 	ctx := context.Background()
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux, noAuthMiddleware)
+	handler.RegisterControlRoutes(mux, noAuthMiddleware)
 
 	mgr.Create(ctx, &ResourceSpec{Name: "list-1", Type: ResourceTypeDocker, Image: "nginx"})
 	mgr.Create(ctx, &ResourceSpec{Name: "list-2", Type: ResourceTypeDocker, Image: "redis"})
@@ -516,7 +516,7 @@ func TestHTTPStatus(t *testing.T) {
 	handler, mgr, _ := setupTestHandler(t)
 	ctx := context.Background()
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux, noAuthMiddleware)
+	handler.RegisterControlRoutes(mux, noAuthMiddleware)
 
 	result, _ := mgr.Create(ctx, &ResourceSpec{Name: "status-test", Type: ResourceTypeDocker, Image: "nginx"})
 
@@ -532,7 +532,7 @@ func TestHTTPStatus(t *testing.T) {
 func TestHTTPStatusNotFound(t *testing.T) {
 	handler, _, _ := setupTestHandler(t)
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux, noAuthMiddleware)
+	handler.RegisterControlRoutes(mux, noAuthMiddleware)
 
 	req := httptest.NewRequest(http.MethodGet, "/provision/nonexistent-id", nil)
 	w := httptest.NewRecorder()
@@ -547,7 +547,7 @@ func TestHTTPDestroy(t *testing.T) {
 	handler, mgr, _ := setupTestHandler(t)
 	ctx := context.Background()
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux, noAuthMiddleware)
+	handler.RegisterControlRoutes(mux, noAuthMiddleware)
 
 	result, _ := mgr.Create(ctx, &ResourceSpec{Name: "destroy-test", Type: ResourceTypeDocker, Image: "nginx"})
 
@@ -565,7 +565,7 @@ func TestHTTPLogs(t *testing.T) {
 	ctx := context.Background()
 	backend.logsOutput = "hello world\n"
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux, noAuthMiddleware)
+	handler.RegisterControlRoutes(mux, noAuthMiddleware)
 
 	result, _ := mgr.Create(ctx, &ResourceSpec{Name: "logs-test", Type: ResourceTypeDocker, Image: "nginx"})
 
@@ -584,7 +584,7 @@ func TestHTTPLogs(t *testing.T) {
 func TestHTTPListEmpty(t *testing.T) {
 	handler, _, _ := setupTestHandler(t)
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux, noAuthMiddleware)
+	handler.RegisterControlRoutes(mux, noAuthMiddleware)
 
 	req := httptest.NewRequest(http.MethodGet, "/provision/list", nil)
 	w := httptest.NewRecorder()

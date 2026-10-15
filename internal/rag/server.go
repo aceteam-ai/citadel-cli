@@ -18,11 +18,29 @@ type Server struct {
 // NewServer wraps a Service for HTTP exposure.
 func NewServer(svc *Service) *Server { return &Server{svc: svc} }
 
-// RegisterRoutes attaches the /rag/* endpoints to mux behind authMiddleware.
-func (s *Server) RegisterRoutes(mux *http.ServeMux, authMiddleware func(http.HandlerFunc) http.HandlerFunc) {
-	mux.HandleFunc("/rag/index", authMiddleware(s.handleIndex))
-	mux.HandleFunc("/rag/query", authMiddleware(s.handleQuery))
-	mux.HandleFunc("/rag/status", authMiddleware(s.handleStatus))
+// RegisterRoutes installs fail-closed stubs on the plaintext status listener
+// (LAN + VPN). Indexing and querying read node content, so they must not trust
+// mesh origin (the #5028 rule; citadel-cli#1318). The real routes live on the
+// mTLS control listener (RegisterControlRoutes). The local `citadel rag` and
+// `citadel search` commands call the service in-process and are unaffected.
+func (s *Server) RegisterRoutes(mux *http.ServeMux, _ func(http.HandlerFunc) http.HandlerFunc) {
+	mux.HandleFunc("/rag", handleMovedToControl)
+	mux.HandleFunc("/rag/", handleMovedToControl)
+}
+
+// RegisterControlRoutes installs the /rag/* API on the mTLS control listener,
+// every route behind requireCoordinator (a verified fabric-CA coordinator
+// client certificate).
+func (s *Server) RegisterControlRoutes(mux *http.ServeMux, requireCoordinator func(http.HandlerFunc) http.HandlerFunc) {
+	mux.HandleFunc("/rag/index", requireCoordinator(s.handleIndex))
+	mux.HandleFunc("/rag/query", requireCoordinator(s.handleQuery))
+	mux.HandleFunc("/rag/status", requireCoordinator(s.handleStatus))
+}
+
+func handleMovedToControl(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusForbidden, map[string]string{
+		"error": "the RAG API requires a coordinator mTLS client certificate on the control listener",
+	})
 }
 
 type indexRequest struct {
