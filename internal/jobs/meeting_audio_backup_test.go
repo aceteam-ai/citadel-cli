@@ -275,3 +275,11 @@ func containsSeq(hay, needle []string) bool {
 	}
 	return false
 }
+
+func TestMeetingAudioUploadURLEscapesMeetingID(t *testing.T) {
+	got := meetingAudioUploadURL("https://aceteam.ai", "../../other?x=1#f")
+	want := "https://aceteam.ai/api/meetings/..%2F..%2Fother%3Fx=1%23f/audio"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}

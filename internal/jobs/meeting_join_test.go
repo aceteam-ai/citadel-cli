@@ -586,3 +586,33 @@ func TestParseMeetingJoinParams_RejectsUnsupportedPlatform(t *testing.T) {
 		t.Errorf("error = %q, want it to mention 'unsupported meeting_url'", err)
 	}
 }
+
+func TestParseMeetingJoinParamsPinsHTTPS(t *testing.T) {
+	teams := "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc%40thread.v2/0?context=%7b%22Tid%22%3a%22t%22%7d"
+	accept := map[string]string{
+		"https://meet.google.com/abc-defg-hij": "https://meet.google.com/abc-defg-hij",
+		"http://meet.google.com/abc-defg-hij":  "https://meet.google.com/abc-defg-hij",
+		"meet.google.com/abc-defg-hij":         "https://meet.google.com/abc-defg-hij",
+		"HTTPS://meet.google.com/abc-defg-hij": "https://meet.google.com/abc-defg-hij",
+		teams:                                  teams,
+	}
+	for in, want := range accept {
+		p, err := parseMeetingJoinParams(map[string]string{"meeting_url": in, "meeting_id": "m1"})
+		if err != nil {
+			t.Fatalf("%q: unexpected error %v", in, err)
+		}
+		if p.MeetingURL != want {
+			t.Errorf("%q: MeetingURL = %q, want %q", in, p.MeetingURL, want)
+		}
+	}
+	for _, in := range []string{
+		"javascript://meet.google.com/%0Aalert(1)",
+		"file://meet.google.com/etc/hosts",
+		"ftp://meet.google.com/x",
+		"https://user:pw@meet.google.com/abc-defg-hij",
+	} {
+		if _, err := parseMeetingJoinParams(map[string]string{"meeting_url": in, "meeting_id": "m1"}); err == nil {
+			t.Errorf("%q: expected refusal", in)
+		}
+	}
+}
