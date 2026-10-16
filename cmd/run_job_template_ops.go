@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
+	"github.com/aceteam-ai/citadel-cli/internal/artifact"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -71,6 +72,8 @@ func lookupBuiltinTemplateRunner(name string) (BuiltinTemplateRunner, bool) {
 type liveTemplateRunOps struct {
 	workspaceDir string
 	nodeID       string
+	// Per-instance seam for deterministic mutation during output hashing.
+	hashOutput func(context.Context, *os.File, int64) (string, int64, error)
 }
 
 const (
@@ -335,15 +338,20 @@ func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root
 		if err != nil {
 			return nil, nil, fmt.Errorf("open output %q beneath the per-run output directory: %w", rel, err)
 		}
-		info, statErr := f.Stat()
-		if statErr != nil || !info.Mode().IsRegular() {
+		before, statErr := artifact.Capture(f)
+		if statErr != nil {
 			return nil, nil, errors.Join(
 				fmt.Errorf("output %q was not written as a file", rel),
 				wrapTemplateError(statErr, "stat output %q", rel),
 				closeTemplateRootFile(f, "output"),
 			)
 		}
-		digest, size, hashErr := sha256OpenFileLimit(ctx, f, remainingBytes)
+		hash := o.hashOutput
+		if hash == nil {
+			hash = sha256OpenFileLimit
+		}
+		digest, size, hashErr := hash(ctx, f, remainingBytes)
+		after, identityErr := artifact.Capture(f)
 		closeErr := f.Close()
 		if hashErr != nil {
 			return nil, nil, errors.Join(
@@ -354,11 +362,19 @@ func (o liveTemplateRunOps) collectOutputs(ctx context.Context, outRoot *os.Root
 		if closeErr != nil {
 			return nil, nil, fmt.Errorf("close output %q: %w", rel, closeErr)
 		}
+		if identityErr != nil || before != after || size != before.Bytes {
+			return nil, nil, errors.Join(fmt.Errorf("output %q changed while hashing", rel), identityErr)
+		}
+		generation, err := before.Generation("sha256:" + digest)
+		if err != nil {
+			return nil, nil, fmt.Errorf("output %q generation: %w", rel, err)
+		}
 		remainingBytes -= size
 		outputs = append(outputs, worker.TemplateOutput{
-			Path:   filepath.ToSlash(filepath.Join(relOut, rel)),
-			SHA256: "sha256:" + digest,
-			Bytes:  size,
+			Path:       filepath.ToSlash(filepath.Join(relOut, rel)),
+			SHA256:     "sha256:" + digest,
+			Bytes:      size,
+			Generation: generation,
 		})
 		digests = append(digests, "sha256:"+digest)
 	}
