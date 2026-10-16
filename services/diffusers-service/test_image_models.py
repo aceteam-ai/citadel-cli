@@ -11,18 +11,29 @@ import image_models as im
 DEFAULT = "stabilityai/sdxl-turbo"
 
 
-def test_unset_allowlist_is_the_four_verified_models_in_order():
+def test_unset_allowlist_is_the_permissive_models_plus_the_configured_default():
     allowed = im.parse_allowlist(None, DEFAULT)
     assert list(allowed) == [
-        "stabilityai/sdxl-turbo",
         "black-forest-labs/FLUX.2-klein-4B",
         "Tongyi-MAI/Z-Image-Turbo",
         "Qwen/Qwen-Image",
+        "stabilityai/sdxl-turbo",  # present only as the configured default
     ]
 
 
+def test_default_allowlist_contains_only_permissive_models():
+    assert im.DEFAULT_ALLOWLIST
+    assert all(im.CATALOG[m].permissive for m in im.DEFAULT_ALLOWLIST)
+    assert "stabilityai/sdxl-turbo" not in im.DEFAULT_ALLOWLIST
+
+
+def test_switching_the_default_removes_sdxl_turbo_entirely():
+    allowed = im.parse_allowlist(None, "Tongyi-MAI/Z-Image-Turbo")
+    assert "stabilityai/sdxl-turbo" not in allowed
+
+
 def test_blank_allowlist_env_behaves_like_unset():
-    assert list(im.parse_allowlist("  ", DEFAULT)) == list(im.DEFAULT_ALLOWLIST)
+    assert list(im.parse_allowlist("  ", DEFAULT)) == list(im.parse_allowlist(None, DEFAULT))
 
 
 def test_env_allowlist_accepts_commas_and_spaces_and_keeps_default():
@@ -49,7 +60,11 @@ def test_catalog_licences_match_the_verification_record():
     assert im.CATALOG["black-forest-labs/FLUX.2-klein-4B"].license == "apache-2.0"
     assert im.CATALOG["Tongyi-MAI/Z-Image-Turbo"].license == "apache-2.0"
     assert im.CATALOG["Qwen/Qwen-Image"].license == "apache-2.0"
-    assert not im.CATALOG["stabilityai/sdxl-turbo"].license.startswith("apache")
+    sdxl = im.CATALOG["stabilityai/sdxl-turbo"]
+    assert "sai-nc-community" in sdxl.license
+    assert sdxl.permissive is False
+    assert all(im.CATALOG[m].permissive for m in (
+        "black-forest-labs/FLUX.2-klein-4B", "Tongyi-MAI/Z-Image-Turbo", "Qwen/Qwen-Image"))
 
 
 def test_catalog_pipeline_classes():
@@ -59,8 +74,10 @@ def test_catalog_pipeline_classes():
     assert im.CATALOG["stabilityai/sdxl-turbo"].pipeline_class is None
 
 
-def test_qwen_image_is_never_offered_unquantized():
-    assert all(v.quant != "none" for v in im.CATALOG["Qwen/Qwen-Image"].variants)
+def test_qwen_image_is_only_offered_as_nf4():
+    # No full precision (58 GB) and no 8-bit (~28 GB resident, and diffusers
+    # skips CPU-offload hooks for 8-bit text encoders on transformers < 4.58).
+    assert {v.quant for v in im.CATALOG["Qwen/Qwen-Image"].variants} == {"nf4"}
 
 
 def test_resolve_model_none_and_blank_pick_default():
@@ -90,8 +107,11 @@ def test_choose_variant_takes_best_quality_that_fits():
     assert im.choose_variant(flux, 24).offload == "none"
     mid = im.choose_variant(flux, 12)
     assert (mid.quant, mid.offload) == ("none", "model")
+    assert im.choose_variant(flux, 9.5, "int8").quant == "int8"
     low = im.choose_variant(flux, 7.5)
     assert low.quant == "nf4"
+    zi = im.CATALOG["Tongyi-MAI/Z-Image-Turbo"]
+    assert im.choose_variant(zi, 12).quant == "int8"
 
 
 def test_choose_variant_no_budget_takes_first():
@@ -101,7 +121,8 @@ def test_choose_variant_no_budget_takes_first():
 
 def test_choose_variant_qwen_needs_quantization_on_a_shared_card():
     qwen = im.CATALOG["Qwen/Qwen-Image"]
-    assert im.choose_variant(qwen, 24).quant == "int8"
+    assert im.choose_variant(qwen, 24).quant == "nf4"
+    assert im.choose_variant(qwen, 24).offload == "none"
     assert im.choose_variant(qwen, 18).quant == "nf4"
     v = im.choose_variant(qwen, 12)
     assert (v.quant, v.offload) == ("nf4", "model")
@@ -120,7 +141,7 @@ def test_choose_variant_forced_quant_filters_candidates():
     flux = im.CATALOG["black-forest-labs/FLUX.2-klein-4B"]
     assert im.choose_variant(flux, 24, "nf4").quant == "nf4"
     with pytest.raises(im.VramBudgetError):
-        im.choose_variant(flux, 24, "int8")  # klein ships no int8 variant
+        im.choose_variant(im.CATALOG["Qwen/Qwen-Image"], 24, "int8")  # no 8-bit Qwen variant
 
 
 def test_choose_variant_rejects_bad_mode():

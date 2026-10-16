@@ -190,8 +190,10 @@ class ImageModelManager:
             if isinstance(outcome, Lease):
                 return outcome
             load = outcome
-        if self._warm_wait > 0:
-            load.event.wait(self._warm_wait)
+        if self._warm_wait <= 0:
+            with self._cond:
+                raise self._warming_locked(spec, "loading")
+        load.event.wait(self._warm_wait)
         with self._cond:
             outcome = self._try_locked(spec)
             if isinstance(outcome, Lease):
@@ -243,6 +245,7 @@ class ImageModelManager:
                     {
                         "model": spec.model_id,
                         "license": spec.license,
+                        "permissive_license": spec.permissive,
                         "state": state,
                         "default": spec.model_id == self._default_model,
                         "quantization": variant.quant if variant else None,
@@ -327,9 +330,10 @@ class ImageModelManager:
     def _run_load(self, load: _Load) -> None:
         spec, variant = load.spec, load.variant
         try:
+            need_bytes = variant.est_vram_gb * GIB
+            self._refuse_if_eviction_cannot_help(spec, need_bytes)
             self._swap_out_previous()
             free_before = self._free_vram_bytes()
-            need_bytes = variant.est_vram_gb * GIB
             if free_before is not None and free_before < need_bytes:
                 raise InsufficientVram(spec.model_id, variant.est_vram_gb, free_before / GIB)
 
@@ -382,6 +386,22 @@ class ImageModelManager:
                 self._load = None
                 load.event.set()
                 self._cond.notify_all()
+
+    def _refuse_if_eviction_cannot_help(self, spec: ImageModelSpec, need_bytes: float) -> None:
+        """Do not evict a working model for a load that cannot fit anyway: if
+        free VRAM plus what the resident model holds is still short (other
+        services hold the rest), fail before touching it."""
+        with self._cond:
+            resident = self._resident
+        if resident is None:
+            return
+        free_now = self._free_vram_bytes()
+        if free_now is None:
+            return
+        held_gb = resident.measured_vram_gb if resident.measured_vram_gb else resident.variant.est_vram_gb
+        reclaimable = free_now + held_gb * GIB
+        if reclaimable < need_bytes:
+            raise InsufficientVram(spec.model_id, need_bytes / GIB, reclaimable / GIB)
 
     def _swap_out_previous(self) -> None:
         """Drain in-flight work on the resident model, then free it and the

@@ -19,9 +19,12 @@ the diffusers v0.37.1 source for the pipeline's ``__call__`` signature:
   - black-forest-labs/FLUX.2-klein-4B  apache-2.0  Flux2KleinPipeline
   - Tongyi-MAI/Z-Image-Turbo           apache-2.0  ZImagePipeline
   - Qwen/Qwen-Image                    apache-2.0  QwenImagePipeline
-  - stabilityai/sdxl-turbo             "other" (Stability AI community
-    licence, NOT Apache). Kept only because it is the long-standing default
-    and the small fast fallback; it is the one entry that is not permissive.
+  - stabilityai/sdxl-turbo             "other", license_name sai-nc-community
+    (Stability AI Community License: research/non-commercial free; commercial
+    use needs registration and ends above USD 1M annual revenue; requires
+    "Powered by Stability AI" attribution). NOT permissive. It is kept only
+    as the long-standing DIFFUSERS_MODEL default, not on the default
+    allowlist; see DEFAULT_ALLOWLIST.
 
 The ``est_vram_gb`` figures are ESTIMATES derived from the checkpoint sizes
 (bf16 = 2 bytes/param, nf4 ~ 0.55 byte/param incl. quantization constants,
@@ -67,6 +70,9 @@ class LoadVariant:
 class ImageModelSpec:
     model_id: str
     license: str
+    # True only for permissive licences (Apache-2.0 here). Surfaced in /health
+    # so the advertised allowlist never implies more than the cards say.
+    permissive: bool
     # diffusers class name, or None to use AutoPipelineForText2Image.
     pipeline_class: str | None
     # "bfloat16" / "float16"; None means "use DIFFUSERS_DTYPE" (legacy knob).
@@ -107,7 +113,8 @@ _V = LoadVariant
 CATALOG: dict[str, ImageModelSpec] = {
     "stabilityai/sdxl-turbo": ImageModelSpec(
         model_id="stabilityai/sdxl-turbo",
-        license="other (Stability AI community licence, not Apache-2.0)",
+        license="sai-nc-community (Stability AI Community License)",
+        permissive=False,
         pipeline_class=None,  # AutoPipelineForText2Image, exactly as before
         torch_dtype=None,  # honours DIFFUSERS_DTYPE (default float16)
         variants=(_V(QUANT_NONE, OFFLOAD_NONE, 7.0),),
@@ -121,11 +128,13 @@ CATALOG: dict[str, ImageModelSpec] = {
     "black-forest-labs/FLUX.2-klein-4B": ImageModelSpec(
         model_id="black-forest-labs/FLUX.2-klein-4B",
         license="apache-2.0",
+        permissive=True,
         pipeline_class="Flux2KleinPipeline",
         torch_dtype="bfloat16",
         variants=(
             _V(QUANT_NONE, OFFLOAD_NONE, 16.5),
             _V(QUANT_NONE, OFFLOAD_MODEL, 9.0),
+            _V(QUANT_INT8, OFFLOAD_NONE, 9.5),
             _V(QUANT_NF4, OFFLOAD_NONE, 7.0),
         ),
         # Distilled, 4 steps. Flux2KleinPipeline takes no negative_prompt.
@@ -142,11 +151,13 @@ CATALOG: dict[str, ImageModelSpec] = {
     "Tongyi-MAI/Z-Image-Turbo": ImageModelSpec(
         model_id="Tongyi-MAI/Z-Image-Turbo",
         license="apache-2.0",
+        permissive=True,
         pipeline_class="ZImagePipeline",
         torch_dtype="bfloat16",
         variants=(
             _V(QUANT_NONE, OFFLOAD_NONE, 21.0),
             _V(QUANT_NONE, OFFLOAD_MODEL, 16.0),
+            _V(QUANT_INT8, OFFLOAD_NONE, 11.5),
             _V(QUANT_NF4, OFFLOAD_NONE, 8.5),
         ),
         # Few-step distilled model: ~8 DiT forwards, guidance disabled.
@@ -159,13 +170,17 @@ CATALOG: dict[str, ImageModelSpec] = {
     "Qwen/Qwen-Image": ImageModelSpec(
         model_id="Qwen/Qwen-Image",
         license="apache-2.0",
+        permissive=True,
         pipeline_class="QwenImagePipeline",
         torch_dtype="bfloat16",
         # 20B transformer + Qwen2.5-VL-7B text encoder: ~58 GB of bf16 files,
-        # so a 24 GB card shared with other services always needs 8-bit or
-        # nf4. Never offered at full precision.
+        # so a 24 GB card shared with other services always needs nf4. There is
+        # deliberately NO 8-bit variant: 8-bit would be ~28 GB resident, and
+        # diffusers 0.37.1 skips CPU-offload hooks for 8-bit text encoders on
+        # transformers < 4.58 (pipeline_utils.enable_model_cpu_offload), so
+        # offload cannot rescue it. nf4+offload keeps one component on the GPU
+        # at a time; its load-time peak is unmeasured (see PR, GPU acceptance).
         variants=(
-            _V(QUANT_INT8, OFFLOAD_MODEL, 21.0),
             _V(QUANT_NF4, OFFLOAD_NONE, 17.0),
             _V(QUANT_NF4, OFFLOAD_MODEL, 12.0),
         ),
@@ -180,9 +195,14 @@ CATALOG: dict[str, ImageModelSpec] = {
     ),
 }
 
-# Order shown in /health and used when DIFFUSERS_ALLOWED_MODELS is unset.
+# Used when DIFFUSERS_ALLOWED_MODELS is unset: the permissively licensed
+# (Apache-2.0) models only. sdxl-turbo (Stability AI Community Licence:
+# registration, attribution, and a USD 1M annual revenue cap for commercial use)
+# is NOT on it. It stays selectable only because it is the long-standing
+# DIFFUSERS_MODEL default, which parse_allowlist always includes; an operator
+# who wants it gone sets DIFFUSERS_MODEL to a permissive model. Open question
+# for the founder (see the PR).
 DEFAULT_ALLOWLIST: tuple[str, ...] = (
-    "stabilityai/sdxl-turbo",
     "black-forest-labs/FLUX.2-klein-4B",
     "Tongyi-MAI/Z-Image-Turbo",
     "Qwen/Qwen-Image",
@@ -197,6 +217,7 @@ def custom_spec(model_id: str, est_vram_gb: float) -> ImageModelSpec:
     return ImageModelSpec(
         model_id=model_id,
         license="unverified (operator-supplied DIFFUSERS_MODEL)",
+        permissive=False,
         pipeline_class=None,
         torch_dtype=None,
         variants=(_V(QUANT_NONE, OFFLOAD_NONE, est_vram_gb),),
@@ -235,7 +256,7 @@ def parse_allowlist(
         spec = CATALOG.get(model_id)
         if spec is None:
             logger.warning(
-                "diffusers allowlist: %r is not in the verified catalog -- skipping it. "
+                "diffusers allowlist: %r is not in the verified catalog, skipping it. "
                 "Known ids: %s",
                 model_id,
                 ", ".join(sorted(CATALOG)),
@@ -338,7 +359,7 @@ def parse_budget_gb(raw: str | None, default: float | None = 12.0) -> float | No
     try:
         value = float(text)
     except ValueError:
-        logger.warning("DIFFUSERS_VRAM_BUDGET_GB=%r is not a number -- using default %s", raw, default)
+        logger.warning("DIFFUSERS_VRAM_BUDGET_GB=%r is not a number, using default %s", raw, default)
         return default
     return value if value > 0 else None
 
@@ -346,7 +367,7 @@ def parse_budget_gb(raw: str | None, default: float | None = 12.0) -> float | No
 def env_quant_mode() -> str:
     mode = os.environ.get("DIFFUSERS_QUANT", "auto").strip().lower() or "auto"
     if mode not in QUANT_MODES:
-        logger.warning("DIFFUSERS_QUANT=%r is not one of %s -- using auto", mode, ", ".join(QUANT_MODES))
+        logger.warning("DIFFUSERS_QUANT=%r is not one of %s, using auto", mode, ", ".join(QUANT_MODES))
         return "auto"
     return mode
 

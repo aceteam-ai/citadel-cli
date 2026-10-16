@@ -288,3 +288,19 @@ def test_lease_release_is_idempotent():
     lease.release()
     lease.release()
     mgr.lease(FLUX)  # swap must not be blocked by a negative count
+
+
+def test_does_not_evict_a_working_model_for_a_load_that_cannot_fit():
+    # 4 GB free, resident sdxl holds ~7 GB: even evicting it leaves 11 GB, short
+    # of FLUX.2-klein's 16.5 GB full-precision need. The warm model must survive.
+    mgr, loader = make(budget=24.0, free_gb=4.0, warm_wait=5.0)
+    # sdxl needs 7 GB but only 4 are free, so seed the resident directly.
+    mgr._free_vram_bytes = lambda: 40 * GIB
+    mgr.lease(SDXL).release()
+    mgr._free_vram_bytes = lambda: 4 * GIB
+
+    with pytest.raises(InsufficientVram):
+        mgr.lease(FLUX)
+    assert mgr.loaded_model() == SDXL
+    assert loader.unloaded == []
+    assert loader.freed == 0
