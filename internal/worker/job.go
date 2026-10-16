@@ -28,6 +28,8 @@ import (
 // Job represents a unit of work to be processed.
 // This is the common job format used internally, regardless of source.
 type Job struct {
+	// Set only by the dedicated authenticated control source, never from payload.
+	control *workerControlBinding
 	// Passive delivery-scoped wall observations, never scheduling authority.
 	clock *deliveryClock `json:"-"`
 	// Passive original delivery snapshot, not handler execution authority.

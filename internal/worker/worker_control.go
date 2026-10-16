@@ -48,17 +48,17 @@ func (h *WorkerControlHandler) reject(code, message string) (*JobResult, error) 
 	}}, nil
 }
 
-// Execute accepts only an exactly addressed restart delivered over the per-node
-// Redis stream. The producer's node:update/step-up authorization is upstream;
+// Execute accepts only an exactly addressed restart over the dedicated
+// authenticated stream. The producer's node:update/step-up authorization is upstream;
 // the node independently checks the transport, queue, target, and action.
 // A durable reservation is written before claiming acceptance. The runner is
 // responsible for ACKing, scheduling, and publishing before the restart fires.
-func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, _ StreamWriter) (*JobResult, error) {
+func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	if job == nil || job.ID == "" {
 		return h.reject("invalid_job", "WORKER_CONTROL requires a job ID")
 	}
-	if job.Source != "redis" && job.Source != "redis-api" {
-		return h.reject("invalid_source", "WORKER_CONTROL requires a Redis job source")
+	if !authenticatedWorkerControlStream(job, stream) {
+		return h.reject("unauthenticated_control", "WORKER_CONTROL requires authenticated consumption and results")
 	}
 	if !workerControlQueueMatches(job.SourceQueue, h.cfg.OrgID, h.cfg.NodeID) {
 		return h.reject("invalid_queue", "WORKER_CONTROL requires this node's per-node queue")
@@ -175,7 +175,7 @@ func recentWorkerControlMarker(dir, own string) (bool, error) {
 
 func workerControlQueueMatches(queue, orgID, nodeID string) bool {
 	return orgID != "" && nodeID != "" &&
-		queue == fmt.Sprintf("jobs:v1:shell:org_%s:node:%s", orgID, nodeID)
+		queue == workerControlQueue(orgID, nodeID)
 }
 
 func (h *WorkerControlHandler) marker(jobID, suffix string) (string, error) {

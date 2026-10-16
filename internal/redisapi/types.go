@@ -181,8 +181,16 @@ type NodeMeta struct {
 // This endpoint returns the queue and org information needed by the worker
 // without exposing direct Redis credentials.
 type WorkerConfigResponse struct {
-	Queue         string   `json:"queue"`
-	QueueNames    []string `json:"queue_names,omitempty"`
-	ConsumerGroup string   `json:"consumer_group,omitempty"`
-	OrgID         string   `json:"org_id,omitempty"`
+	Queue         string               `json:"queue"`
+	QueueNames    []string             `json:"queue_names,omitempty"`
+	ConsumerGroup string               `json:"consumer_group,omitempty"`
+	OrgID         string               `json:"org_id,omitempty"`
+	WorkerControl *WorkerControlConfig `json:"worker_control,omitempty"`
+}
+
+// WorkerControlConfig is optional server-authored enrollment metadata.
+type WorkerControlConfig struct {
+	Protocol string `json:"protocol"`
+	Queue    string `json:"queue"`
+	Group    string `json:"group"`
 }

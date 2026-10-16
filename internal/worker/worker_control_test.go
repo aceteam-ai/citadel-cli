@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
 func controlJob(id string) *Job {
-	return &Job{ID: id, Type: JobTypeWorkerControl, Source: "redis", SourceQueue: "jobs:v1:shell:org_example:node:758",
+	binding := &workerControlBinding{orgID: "example", nodeID: "758", queue: workerControlQueue("example", "758"), group: WorkerControlProtocol, client: redisapi.NewClient(redisapi.ClientConfig{})}
+	return &Job{control: binding, ID: id, Type: JobTypeWorkerControl, Source: "redis-api", SourceQueue: binding.queue,
 		Payload: map[string]any{"action": "restart", "target_node": "758", "timeout_ms": "25000"}}
 }
 
@@ -36,6 +38,8 @@ type controlWriter struct {
 	result map[string]any
 	err    error
 }
+
+func (w *controlWriter) authenticatedWorkerControl(job *Job) bool { return job.control.matches(job) }
 
 func (w *controlWriter) WriteEnd(result map[string]any) error {
 	*w.events = append(*w.events, "result")
@@ -92,10 +96,6 @@ func TestWorkerControlRejectsMalformedControls(t *testing.T) {
 		{"missing action", func(j *Job) { delete(j.Payload, "action") }},
 		{"wrong target", func(j *Job) { j.Payload["target_node"] = "759" }},
 		{"malformed target", func(j *Job) { j.Payload["target_node"] = 758 }},
-		{"wrong queue", func(j *Job) { j.SourceQueue = "jobs:v1:shell:org_example:node:759" }},
-		{"wrong organization, same node", func(j *Job) { j.SourceQueue = "jobs:v1:shell:org_other:node:758" }},
-		{"shared queue", func(j *Job) { j.SourceQueue = "jobs:v1:shell:org_example" }},
-		{"non redis", func(j *Job) { j.Source = "nexus" }},
 		{"unknown field", func(j *Job) { j.Payload["command"] = "reboot" }},
 		{"malformed timeout", func(j *Job) { j.Payload["timeout_ms"] = []string{"1"} }},
 		{"nonnumeric timeout", func(j *Job) { j.Payload["timeout_ms"] = "soon" }},

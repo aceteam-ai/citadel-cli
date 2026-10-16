@@ -808,8 +808,16 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// warning, same as before.
 	job.clock = newDeliveryClock(r.clockNow, r.clockState)
 	stream = r.newStreamWriter(job)
+	// Never emit control claims/results over legacy Redis or a missing writer.
+	if job.Type == JobTypeWorkerControl && !authenticatedWorkerControlStream(job, stream) {
+		r.log("warning", "Declining WORKER_CONTROL %s without authenticated control delivery/results", job.ID)
+		return false, nil, startTime
+	}
 	if err := retryStreamWrite(ctx, func() error { return stream.WriteClaimed(r.agentVersion) }); err != nil {
 		r.log("warning", "Failed to publish claimed event for job %s: %v", job.ID, err)
+		if job.Type == JobTypeWorkerControl {
+			return false, nil, startTime
+		}
 	}
 
 	// JQS-Core Section 5.6: Check cancellation before processing
@@ -936,6 +944,9 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 // caller passes (false, 0) and executeJob's output is byte-identical to before.
 // Returns jobOK true only on a clean success.
 func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, startTime time.Time, emitLatency bool, queueWaitMs int64) (jobOK bool) {
+	if job.Type == JobTypeWorkerControl && !authenticatedWorkerControlStream(job, stream) {
+		return false
+	}
 	r.state.RecordJobExecuting()
 	defer r.state.RecordJobExecuteDone()
 
@@ -1019,7 +1030,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	}
 
 	// Execute handler (stream writer created at claim time)
-	stream.WriteStart("Job processing started")
+	if job.Type != JobTypeWorkerControl {
+		stream.WriteStart("Job processing started")
+	}
 
 	// Per-job execution deadline (aceteam#6000). When the payload carries a
 	// positive timeout budget, run the handler under a bounded context plus a

@@ -124,10 +124,7 @@ func (c *Client) doRequestWithTimeout(ctx context.Context, method, path string, 
 		Timeout: timeout,
 	}
 
-	// Temporarily swap the client
-	origClient := c.httpClient
-	c.httpClient = client
-	defer func() { c.httpClient = origClient }()
-
-	return c.doRequest(ctx, method, path, body, result)
+	// Consumption and authenticated control publication run concurrently. Never
+	// swap the shared client while a claim/result request may be using it.
+	return c.doRequestUsing(ctx, client, method, path, body, result)
 }
