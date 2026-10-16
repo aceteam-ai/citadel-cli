@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net"
@@ -429,5 +430,132 @@ func TestMediaGenerate_WaitForReady_DoesNotGateOnModelLoaded(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("waitForReady took %v, want near-immediate return on a reachable 200 regardless of model_loaded", elapsed)
+	}
+}
+
+// A warming sidecar is retried by the handler itself (honouring Retry-After)
+// so callers that do not understand model_warming still get an image.
+func TestMediaGenerate_ModelWarmingRetriesThenSucceeds(t *testing.T) {
+	warming := `{"status":"model_warming","model":"Tongyi-MAI/Z-Image-Turbo","eta_seconds":120,"retry_after":5,"reason":"loading"}`
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			stubHealth(w)
+			return
+		}
+		posts++
+		if posts <= 2 {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(warming))
+			return
+		}
+		_, _ = w.Write([]byte(`{"model":"Tongyi-MAI/Z-Image-Turbo","width":64,"height":64,"image_base64":"aGk=","content_type":"image/png"}`))
+	}))
+	defer srv.Close()
+
+	var slept []time.Duration
+	h := NewMediaGenerateHandler()
+	h.ServiceURL = srv.URL
+	h.Sleep = func(_ context.Context, d time.Duration) bool { slept = append(slept, d); return true }
+
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "m-warm-ok",
+		Type:    "MEDIA_GENERATE",
+		Payload: map[string]string{"task": "text-to-image", "prompt": "a cat", "model": "Tongyi-MAI/Z-Image-Turbo"},
+	})
+	if err != nil {
+		t.Fatalf("expected success after warming retries, got %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil || got["content"] != "aGk=" {
+		t.Fatalf("unexpected output %s (%v)", out, err)
+	}
+	if posts != 3 {
+		t.Errorf("posts = %d, want 3", posts)
+	}
+	if len(slept) != 2 || slept[0] != 7*time.Second {
+		t.Errorf("Retry-After not honoured, slept %v", slept)
+	}
+}
+
+// When the next wait would pass the request budget, the typed warming object
+// is returned as the job output (retryable by the platform), not an error.
+func TestMediaGenerate_ModelWarmingPastTimeoutReturnsWarmingOutput(t *testing.T) {
+	warming := `{"status":"model_warming","model":"Qwen/Qwen-Image","eta_seconds":300,"retry_after":5,"reason":"loading"}`
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			stubHealth(w)
+			return
+		}
+		posts++
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(warming))
+	}))
+	defer srv.Close()
+
+	h := NewMediaGenerateHandler()
+	h.ServiceURL = srv.URL
+	h.RequestTimeout = 2 * time.Second // shorter than the 5s Retry-After
+	h.Sleep = func(context.Context, time.Duration) bool { t.Fatal("must not sleep past the budget"); return false }
+
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "m-warm-late",
+		Type:    "MEDIA_GENERATE",
+		Payload: map[string]string{"task": "text-to-image", "prompt": "a cat", "model": "Qwen/Qwen-Image"},
+	})
+	if err != nil {
+		t.Fatalf("model_warming must not be an error, got: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	if got["status"] != "model_warming" || got["retry_after"] != float64(5) {
+		t.Errorf("unexpected warming output: %s", out)
+	}
+	if _, hasContent := got["content"]; hasContent {
+		t.Errorf("warming output must not carry media content: %s", out)
+	}
+	if posts != 1 {
+		t.Errorf("posts = %d, want 1", posts)
+	}
+}
+
+// Only model_warming is softened: other 503s (insufficient_vram) and a
+// non-allowlisted model (400) stay failures.
+func TestMediaGenerate_OtherSidecarRefusalsStayErrors(t *testing.T) {
+	cases := map[string]struct {
+		status int
+		body   string
+	}{
+		"insufficient_vram": {http.StatusServiceUnavailable, `{"status":"insufficient_vram","model":"Qwen/Qwen-Image"}`},
+		"not_allowed":       {http.StatusBadRequest, `{"error":"model_not_allowed","detail":"model \"x\" is not allowed"}`},
+		"unparseable_503":   {http.StatusServiceUnavailable, `upstream down`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					stubHealth(w)
+					return
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			h := NewMediaGenerateHandler()
+			h.ServiceURL = srv.URL
+			_, err := h.Execute(JobContext{}, &nexus.Job{
+				ID:      "m-refuse",
+				Type:    "MEDIA_GENERATE",
+				Payload: map[string]string{"task": "text-to-image", "prompt": "a cat", "model": "x"},
+			})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+		})
 	}
 }

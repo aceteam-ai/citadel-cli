@@ -118,6 +118,12 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"91649ba0dc4f9817c05782ea90066f601f8ba0b1d86584cb03dcd6ed7ea7fbcc": true,
 		// aceteam-ai/citadel-cli#1060: bind hatch (${CITADEL_DIFFUSERS_BIND:-127.0.0.1}).
 		"55a62093c8cfdb8fd0165cf4ad35d34fa1a916c673927abfa737a8a9298528d0": true,
+		// citadel-cli#1335: per-request image model selection env passthrough
+		// (DIFFUSERS_ALLOWED_MODELS / _VRAM_BUDGET_GB / _QUANT / _WARM_WAIT_SECONDS).
+		"8fe0987b5ef79d4111ef878867fe357166688b7b8ebd3d6b16fe90efb2791a73": true,
+		// citadel-cli#1335 review: FLUX.2-klein-4B default model, residency,
+		// backoff and free-disk-floor env.
+		"93385effc412fe5dbb7e8d321f5a35dc11d59a6dd30a2dc0771941243fa07a34": true,
 	},
 	"bonsai": {
 		"124af757f45e93b689bc6a59f08187d48f59c0e62eb2d10c6a006c8ac4d24609": true,

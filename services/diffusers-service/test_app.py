@@ -32,7 +32,6 @@ def _reset_lazy_singletons(monkeypatch):
     """Every test gets a clean slate: app.py's lazy _pipe/_video_pipe globals
     must not leak a fake object set by one test into the next (in particular,
     into /health's *_loaded assertions)."""
-    monkeypatch.setattr(app, "_pipe", None)
     monkeypatch.setattr(app, "_device", None)
     monkeypatch.setattr(app, "_video_pipe", None)
     monkeypatch.setattr(app, "_video_device", None)
@@ -120,13 +119,13 @@ def test_generate_image_returns_base64_png(client, monkeypatch):
     assert base64.b64decode(body["image_base64"]) == b"fake-png-bytes"
     assert body["model"] == app.DIFFUSERS_MODEL
     assert body["device"] == "cpu"
-    assert body["width"] == 512 and body["height"] == 512
+    assert body["width"] == 1024 and body["height"] == 1024  # FLUX.2-klein default size
     assert body["seed"] is None
 
     call = fake_pipe.calls[0]
     assert call["prompt"] == "a cat"
-    assert call["num_inference_steps"] == 4  # sdxl-turbo default
-    assert call["guidance_scale"] == 0.0  # turbo default
+    assert call["num_inference_steps"] == 4  # FLUX.2-klein (distilled) default
+    assert call["guidance_scale"] == 1.0  # FLUX.2-klein default
 
 
 def test_generate_image_load_failure_is_500(client, monkeypatch):
@@ -350,3 +349,386 @@ def test_generate_image_does_not_load_video_pipe(client, monkeypatch):
 
     resp = client.post("/generate", json={"prompt": "x"})
     assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Per-request image model selection, swap, warming and health (citadel-cli#1335).
+# The swap manager is replaced by a fake-loader instance: no torch, diffusers
+# or GPU.
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+
+import image_models  # noqa: E402
+from image_swap import ImageModelManager  # noqa: E402
+
+SDXL = "stabilityai/sdxl-turbo"
+FLUX = "black-forest-labs/FLUX.2-klein-4B"
+ZIMG = "Tongyi-MAI/Z-Image-Turbo"
+QWEN = "Qwen/Qwen-Image"
+
+
+class _RecordingPipe(_FakePipe):
+    def __init__(self, name):
+        super().__init__(images=[_FakeImage()])
+        self.name = name
+
+
+@pytest.fixture
+def swap(monkeypatch):
+    """A real manager over fake pipelines, wired into app. Loads can be gated."""
+    state = SimpleNamespace(gates={}, loads=[], unloaded=[], pipes={})
+
+    def loader(spec, variant):
+        gate = state.gates.get(spec.model_id)
+        if gate is not None:
+            assert gate.wait(5)
+        pipe = _RecordingPipe(spec.model_id)
+        state.pipes[spec.model_id] = pipe
+        state.loads.append((spec.model_id, variant.quant, variant.offload))
+        return pipe, "cuda"
+
+    mgr = ImageModelManager(
+        image_models.parse_allowlist(" ".join(image_models.CATALOG), app.DIFFUSERS_MODEL),
+        app.DIFFUSERS_MODEL,
+        loader=loader,
+        min_residency_seconds=0.0,
+        unloader=lambda pipe: state.unloaded.append(pipe.name),
+        vram_budget_gb=24.0,
+        warm_wait_seconds=0.0,
+        retry_after_seconds=3,
+    )
+    monkeypatch.setattr(app, "_manager", mgr)
+    # The default allowlist excludes sdxl-turbo; these tests exercise it too.
+    monkeypatch.setattr(
+        app,
+        "ALLOWED_IMAGE_MODELS",
+        image_models.parse_allowlist(" ".join(image_models.CATALOG), app.DIFFUSERS_MODEL),
+    )
+    state.mgr = mgr
+    return state
+
+
+def _post(client, model=None, **extra):
+    body = {"prompt": "a synthetic sagittal lumbar MRI", **extra}
+    if model is not None:
+        body["model"] = model
+    return client.post("/generate", json=body)
+
+
+def test_unknown_model_is_a_clear_400(client, swap):
+    resp = _post(client, "totally/not-allowed")
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"] == "model_not_allowed"
+    assert "totally/not-allowed" in body["detail"]
+    assert FLUX in body["allowed_models"]
+    assert swap.loads == []  # nothing was loaded for a rejected request
+
+
+def test_non_allowlisted_catalog_model_is_rejected(client, swap, monkeypatch):
+    narrow = image_models.parse_allowlist(SDXL, SDXL)
+    monkeypatch.setattr(app, "ALLOWED_IMAGE_MODELS", narrow)
+    resp = _post(client, QWEN)
+    assert resp.status_code == 400
+    assert resp.json()["allowed_models"] == [SDXL]
+
+
+def test_cold_model_returns_retryable_warming_then_image(client, swap):
+    gate = swap.gates[FLUX] = threading.Event()
+    resp = _post(client, FLUX)
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "3"
+    body = resp.json()
+    assert body["status"] == "model_warming"
+    assert body["model"] == FLUX
+    assert body["retry_after"] == 3
+    assert body["eta_seconds"] > 0
+    assert body["reason"] == "loading"
+
+    gate.set()
+    assert swap.mgr.wait_for_load(5)
+    resp = _post(client, FLUX)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model"] == FLUX
+    assert body["content_type"] == "image/png"
+    assert body["width"] == 1024 and body["height"] == 1024  # per-model default size
+
+
+def test_omitted_model_serves_the_configured_default(client, swap):
+    assert _post(client).status_code == 503  # cold
+    swap.mgr.wait_for_load(5)
+    resp = _post(client)
+    assert resp.status_code == 200
+    assert resp.json()["model"] == app.DIFFUSERS_MODEL
+    assert swap.loads[0][0] == app.DIFFUSERS_MODEL
+
+
+def test_switching_models_unloads_the_previous_one(client, swap):
+    _post(client, SDXL)
+    swap.mgr.wait_for_load(5)
+    assert _post(client, SDXL).status_code == 200
+
+    assert _post(client, ZIMG).status_code == 503
+    swap.mgr.wait_for_load(5)
+    assert swap.unloaded == [SDXL]
+    assert _post(client, ZIMG).status_code == 200
+    assert swap.mgr.loaded_model() == ZIMG
+
+
+def test_per_model_defaults_and_cfg_param_mapping(client, swap):
+    for model in (QWEN, ZIMG):
+        _post(client, model)
+        swap.mgr.wait_for_load(5)
+    # QWEN was displaced by ZIMG; load QWEN again to inspect its call.
+    _post(client, QWEN)
+    swap.mgr.wait_for_load(5)
+    assert _post(client, QWEN).status_code == 200
+    call = swap.pipes[QWEN].calls[-1]
+    assert call["true_cfg_scale"] == 4.0
+    assert "guidance_scale" not in call
+    assert call["num_inference_steps"] == 30
+    assert call["negative_prompt"] == " "  # Qwen-Image true CFG needs one
+
+
+def test_pipeline_without_negative_prompt_support_never_receives_it(client, swap):
+    _post(client, FLUX, negative_prompt="blurry")
+    swap.mgr.wait_for_load(5)
+    assert _post(client, FLUX, negative_prompt="blurry").status_code == 200
+    call = swap.pipes[FLUX].calls[-1]
+    assert "negative_prompt" not in call
+    assert call["guidance_scale"] == 1.0
+    assert call["num_inference_steps"] == 4
+
+
+def test_explicit_request_values_override_model_defaults(client, swap):
+    _post(client, ZIMG)
+    swap.mgr.wait_for_load(5)
+    resp = _post(client, ZIMG, num_inference_steps=12, guidance_scale=1.5, width=640, height=768)
+    assert resp.status_code == 200
+    call = swap.pipes[ZIMG].calls[-1]
+    assert (call["num_inference_steps"], call["guidance_scale"]) == (12, 1.5)
+    assert (call["width"], call["height"]) == (640, 768)
+
+
+def test_lease_is_released_after_each_request_so_a_swap_can_proceed(client, swap):
+    _post(client, SDXL)
+    swap.mgr.wait_for_load(5)
+    for _ in range(3):
+        assert _post(client, SDXL).status_code == 200
+    _post(client, FLUX)  # starts the swap; drains only if no lease leaked
+    assert swap.mgr.wait_for_load(5)
+    assert swap.mgr.loaded_model() == FLUX
+
+
+def test_lease_is_released_when_inference_fails(client, swap):
+    _post(client, SDXL)
+    swap.mgr.wait_for_load(5)
+
+    class _Boom:
+        def __call__(self, **kw):
+            raise RuntimeError("cuda oom")
+
+    swap.mgr._resident.pipe = _Boom()
+    assert _post(client, SDXL).status_code == 500
+    assert swap.mgr._resident.inflight == 0
+
+
+def test_model_over_vram_budget_is_422(client, swap, monkeypatch):
+    monkeypatch.setattr(
+        app,
+        "_manager",
+        ImageModelManager(
+            app.ALLOWED_IMAGE_MODELS,
+            app.DIFFUSERS_MODEL,
+            loader=lambda s, v: (None, "cuda"),
+            vram_budget_gb=8.0,
+            warm_wait_seconds=0.0,
+        ),
+    )
+    resp = _post(client, QWEN)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "exceeds_vram_budget"
+    assert body["min_required_gb"] == 12 and body["vram_budget_gb"] == 8
+
+
+def test_insufficient_free_vram_is_503_but_not_warming(client, monkeypatch):
+    mgr = ImageModelManager(
+        app.ALLOWED_IMAGE_MODELS,
+        app.DIFFUSERS_MODEL,
+        loader=lambda s, v: pytest.fail("must not load without room"),
+        free_vram_bytes=lambda: 2 * 1024**3,
+        vram_budget_gb=24.0,
+        warm_wait_seconds=0.0,
+    )
+    monkeypatch.setattr(app, "_manager", mgr)
+    _post(client, FLUX)
+    mgr.wait_for_load(5)
+    resp = _post(client, FLUX)
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "insufficient_vram"
+    assert "Retry-After" not in resp.headers
+
+
+def test_load_failure_surfaces_as_500_naming_the_model(client, monkeypatch):
+    mgr = ImageModelManager(
+        app.ALLOWED_IMAGE_MODELS,
+        app.DIFFUSERS_MODEL,
+        loader=lambda s, v: (_ for _ in ()).throw(RuntimeError("401 gated")),
+        vram_budget_gb=24.0,
+        warm_wait_seconds=5.0,
+    )
+    monkeypatch.setattr(app, "_manager", mgr)
+    resp = _post(client, ZIMG)
+    assert resp.status_code == 500
+    assert ZIMG in resp.json()["detail"] and "401 gated" in resp.json()["detail"]
+
+
+def test_health_lists_allowlist_loaded_model_and_warm_vs_cold(client, swap):
+    body = client.get("/health").json()
+    assert body["allowed_models"] == list(app.ALLOWED_IMAGE_MODELS)
+    assert body["loaded_model"] is None and body["model_loaded"] is False
+    assert {m["state"] for m in body["image_models"]} == {"cold"}
+    by_id = {m["model"]: m for m in body["image_models"]}
+    assert by_id[app.DIFFUSERS_MODEL]["default"] is True
+    assert by_id[SDXL]["default"] is False
+    assert by_id[FLUX]["license"] == "apache-2.0"
+    assert body["vram_budget_gb"] == 24.0
+
+    _post(client, ZIMG)
+    swap.mgr.wait_for_load(5)
+    body = client.get("/health").json()
+    assert body["loaded_model"] == ZIMG
+    assert body["model_loaded"] is True
+    assert body["device"] == "cuda"
+    states = {m["model"]: m["state"] for m in client.get("/health").json()["image_models"]}
+    assert states[ZIMG] == "warm"
+    assert states[SDXL] == states[FLUX] == states[QWEN] == "cold"
+    assert body["last_load"]["model"] == ZIMG
+
+
+def test_health_still_reports_the_video_pipeline_independently(client, swap, monkeypatch):
+    monkeypatch.setattr(app, "_video_pipe", object())
+    monkeypatch.setattr(app, "_video_device", "cuda")
+    body = client.get("/health").json()
+    assert body["video_model_loaded"] is True and body["model_loaded"] is False
+
+
+def test_default_model_is_the_permissive_flux2_klein():
+    assert app.DIFFUSERS_MODEL == FLUX
+    assert image_models.CATALOG[FLUX].permissive
+
+
+def test_prepare_pipeline_fails_closed_for_catalog_models_with_a_disk_floor(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(app.model_preflight, "run_preflight", lambda repo, cache, **kw: seen.update(repo=repo, **kw))
+    monkeypatch.setattr(app.model_preflight, "prefetch_filtered_weights", lambda repo, **kw: seen.update(prefetch=kw))
+    for model in (FLUX, ZIMG, QWEN, SDXL):
+        seen.clear()
+        spec = image_models.CATALOG[model]
+        app._prepare_pipeline(spec, spec.variants[0])
+        assert seen["fail_closed"] is True, model
+        assert seen["margin_bytes"] == 20 * 1024**3, model
+        assert seen["allow_patterns"], model
+        assert seen["prefetch"]["allow_patterns"] == seen["allow_patterns"], model
+        assert seen["is_cached_fn"] is not None
+
+
+def test_prepare_pipeline_keeps_warn_only_for_custom_models(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(app.model_preflight, "run_preflight", lambda repo, cache, **kw: seen.update(kw))
+    monkeypatch.setattr(app.model_preflight, "prefetch_filtered_weights", lambda repo, **kw: None)
+    spec = image_models.custom_spec("some/custom-model", 8)
+    app._prepare_pipeline(spec, spec.variants[0])
+    assert seen["fail_closed"] is False
+
+
+def test_concurrent_generations_are_serialized(client, swap):
+    """Sync endpoints run on a threadpool; the pipeline must see one call at a time."""
+    _post(client, FLUX)
+    swap.mgr.wait_for_load(5)
+    state = SimpleNamespace(active=0, peak=0, lock=threading.Lock())
+
+    class _SlowPipe:
+        def __call__(self, **kw):
+            with state.lock:
+                state.active += 1
+                state.peak = max(state.peak, state.active)
+            threading.Event().wait(0.05)
+            with state.lock:
+                state.active -= 1
+            return SimpleNamespace(images=[_FakeImage()])
+
+    swap.mgr._resident.pipe = _SlowPipe()
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(_post(client, FLUX).status_code)) for _ in range(6)]
+    [t.start() for t in threads]
+    [t.join(10) for t in threads]
+    assert results == [200] * 6
+    assert state.peak == 1
+
+
+def test_resident_protected_response_names_the_resident_model(client, monkeypatch):
+    mgr = ImageModelManager(
+        app.ALLOWED_IMAGE_MODELS,
+        app.DIFFUSERS_MODEL,
+        loader=lambda s, v: (object(), "cuda"),
+        vram_budget_gb=24.0,
+        warm_wait_seconds=5.0,
+        min_residency_seconds=120.0,
+    )
+    monkeypatch.setattr(app, "_manager", mgr)
+    monkeypatch.setattr(app, "ALLOWED_IMAGE_MODELS", image_models.parse_allowlist(f"{FLUX} {ZIMG}", FLUX))
+    mgr._warm_wait = 0.0
+    _post(client, FLUX)
+    mgr.wait_for_load(5)
+    resp = _post(client, ZIMG)
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["reason"] == "resident_protected"
+    assert body["resident_model"] == FLUX
+    assert "loading_model" not in body
+
+
+def test_self_test_reports_ok_and_error_in_health(client, monkeypatch):
+    monkeypatch.setattr(app, "_self_test", {"status": "pending", "detail": None})
+    assert client.get("/health").json()["self_test"] == "pending"
+
+    app._run_self_test(lambda: None)
+    body = client.get("/health").json()
+    assert body["self_test"] == "ok" and body["self_test_detail"] is None
+
+    def _boom():
+        raise RuntimeError("Failed to find C compiler. Please specify via CC environment variable.")
+
+    app._run_self_test(_boom)
+    body = client.get("/health").json()
+    assert body["self_test"] == "error"
+    assert "Failed to find C compiler" in body["self_test_detail"]
+    assert body["status"] == "ok"  # liveness is unchanged; the failure is reported, not hidden
+
+
+def test_self_test_catches_systemexit_from_a_broken_extension(monkeypatch):
+    monkeypatch.setattr(app, "_self_test", {"status": "pending", "detail": None})
+
+    def _exit():
+        raise SystemExit(1)
+
+    app._run_self_test(_exit)
+    assert app._self_test["status"] == "error"
+
+
+def test_self_test_flags_missing_pipeline_classes(monkeypatch):
+    import sys
+    import types
+
+    fake = types.ModuleType("diffusers")  # has none of the pipeline classes
+    monkeypatch.setitem(sys.modules, "diffusers", fake)
+    monkeypatch.setitem(sys.modules, "bitsandbytes", types.ModuleType("bitsandbytes"))
+    monkeypatch.setattr(app, "_self_test", {"status": "pending", "detail": None})
+    app._run_self_test()
+    assert app._self_test["status"] == "error"
+    assert "WanPipeline" in app._self_test["detail"]
