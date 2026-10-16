@@ -295,6 +295,31 @@ func parseMeetingURL(rawURL string) parsedMeetingURL {
 	return out
 }
 
+// normalizeMeetingURL returns the https form of a meeting_url whose host has
+// already been classified. A bare host gets https:// prepended, matching
+// meetingURLHost; any scheme other than http or https is refused, and http is
+// upgraded so the node's browser never navigates a non-https meeting link.
+func normalizeMeetingURL(rawURL string) (string, error) {
+	s := strings.TrimSpace(rawURL)
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid meeting_url: %w", err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https", "http":
+		u.Scheme = "https"
+	default:
+		return "", fmt.Errorf("unsupported meeting_url scheme %q: only https links are supported", u.Scheme)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("unsupported meeting_url: credentials in the URL are not allowed")
+	}
+	return u.String(), nil
+}
+
 // meetingJoinParams is the typed, validated job payload.
 type meetingJoinParams struct {
 	MeetingURL         string
@@ -331,6 +356,12 @@ func parseMeetingJoinParams(payload map[string]string) (meetingJoinParams, error
 	if parsed.Platform == platformUnknown {
 		return meetingJoinParams{}, fmt.Errorf("unsupported meeting_url %q: only Google Meet (meet.google.com) and Microsoft Teams (teams.microsoft.com) links are supported", p.MeetingURL)
 	}
+	// The browser navigates exactly the URL validated here, so pin it to https.
+	normalized, err := normalizeMeetingURL(p.MeetingURL)
+	if err != nil {
+		return meetingJoinParams{}, err
+	}
+	p.MeetingURL = normalized
 	p.Platform = parsed.Platform
 	p.Passcode = parsed.Passcode
 	if p.BotDisplayName == "" {

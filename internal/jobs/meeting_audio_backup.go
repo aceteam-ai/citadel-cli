@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -279,11 +280,11 @@ func uploadMeetingAudio(ctx context.Context, client *http.Client, baseURL, token
 	return parsed.AudioDocumentID, nil
 }
 
-// meetingAudioUploadURL builds the backend audio-backup endpoint. meetingID is
-// the meeting_sessions UUID (the route validates it as a UUID); it is safe as a
-// path segment but we still avoid trailing/leading slash surprises.
+// meetingAudioUploadURL builds the backend audio-backup endpoint. meetingID
+// comes from the job payload, so it is escaped as a single path segment: the
+// upload carries the device token and must not reach a different route.
 func meetingAudioUploadURL(baseURL, meetingID string) string {
-	return trimTrailingSlash(baseURL) + "/api/meetings/" + meetingID + "/audio"
+	return trimTrailingSlash(baseURL) + "/api/meetings/" + url.PathEscape(meetingID) + "/audio"
 }
 
 func trimTrailingSlash(s string) string {
