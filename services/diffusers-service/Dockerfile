@@ -47,5 +47,6 @@ EXPOSE 7860
 
 # Exactly ONE uvicorn worker, on purpose (do not add --workers): the image model
 # manager in app.py lives in this process, and a single worker is what enforces
-# one resident image model and serialized generation on the shared GPU.
+# one resident image model on the shared GPU. Generation itself is serialized
+# by a lock in app.py (sync endpoints otherwise run concurrently on a threadpool).
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]

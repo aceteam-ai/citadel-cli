@@ -644,3 +644,50 @@ def test_prepare_pipeline_keeps_warn_only_for_custom_models(monkeypatch):
     spec = image_models.custom_spec("some/custom-model", 8)
     app._prepare_pipeline(spec, spec.variants[0])
     assert seen["fail_closed"] is False
+
+
+def test_concurrent_generations_are_serialized(client, swap):
+    """Sync endpoints run on a threadpool; the pipeline must see one call at a time."""
+    _post(client, FLUX)
+    swap.mgr.wait_for_load(5)
+    state = SimpleNamespace(active=0, peak=0, lock=threading.Lock())
+
+    class _SlowPipe:
+        def __call__(self, **kw):
+            with state.lock:
+                state.active += 1
+                state.peak = max(state.peak, state.active)
+            threading.Event().wait(0.05)
+            with state.lock:
+                state.active -= 1
+            return SimpleNamespace(images=[_FakeImage()])
+
+    swap.mgr._resident.pipe = _SlowPipe()
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(_post(client, FLUX).status_code)) for _ in range(6)]
+    [t.start() for t in threads]
+    [t.join(10) for t in threads]
+    assert results == [200] * 6
+    assert state.peak == 1
+
+
+def test_resident_protected_response_names_the_resident_model(client, monkeypatch):
+    mgr = ImageModelManager(
+        app.ALLOWED_IMAGE_MODELS,
+        app.DIFFUSERS_MODEL,
+        loader=lambda s, v: (object(), "cuda"),
+        vram_budget_gb=24.0,
+        warm_wait_seconds=5.0,
+        min_residency_seconds=120.0,
+    )
+    monkeypatch.setattr(app, "_manager", mgr)
+    monkeypatch.setattr(app, "ALLOWED_IMAGE_MODELS", image_models.parse_allowlist(f"{FLUX} {ZIMG}", FLUX))
+    mgr._warm_wait = 0.0
+    _post(client, FLUX)
+    mgr.wait_for_load(5)
+    resp = _post(client, ZIMG)
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["reason"] == "resident_protected"
+    assert body["resident_model"] == FLUX
+    assert "loading_model" not in body

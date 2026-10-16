@@ -149,7 +149,7 @@ CATALOG: dict[str, ImageModelSpec] = {
         ignore_patterns=("*.onnx", "*.onnx_data", "*.fp16.safetensors"),
         est_disk_gb=14.0,
         est_load_seconds=45,
-        notes="Fast fallback. Fast fallback. Only selectable when named by DIFFUSERS_MODEL or DIFFUSERS_ALLOWED_MODELS.",
+        notes="Fast fallback. Only selectable when named by DIFFUSERS_MODEL or DIFFUSERS_ALLOWED_MODELS.",
     ),
     "black-forest-labs/FLUX.2-klein-4B": ImageModelSpec(
         model_id="black-forest-labs/FLUX.2-klein-4B",
@@ -344,6 +344,26 @@ class VramBudgetError(RuntimeError):
         )
 
 
+def fitting_variants(
+    spec: ImageModelSpec,
+    budget_gb: float | None,
+    quant_mode: str = "auto",
+) -> list[LoadVariant]:
+    """Every variant allowed by ``quant_mode`` that fits ``budget_gb``, best
+    quality first. Raises VramBudgetError when there is none."""
+    if quant_mode not in QUANT_MODES:
+        raise ValueError(f"DIFFUSERS_QUANT must be one of {', '.join(QUANT_MODES)}; got {quant_mode!r}")
+    candidates = [v for v in spec.variants if quant_mode == "auto" or v.quant == quant_mode]
+    if not candidates:
+        raise VramBudgetError(spec.model_id, budget_gb, spec.min_vram_gb(), quant_mode)
+    fits = [v for v in candidates if budget_gb is None or v.est_vram_gb <= budget_gb]
+    if not fits:
+        raise VramBudgetError(
+            spec.model_id, budget_gb, min(v.est_vram_gb for v in candidates), quant_mode
+        )
+    return fits
+
+
 def choose_variant(
     spec: ImageModelSpec,
     budget_gb: float | None,
@@ -355,19 +375,11 @@ def choose_variant(
     precision when the budget allows, then 8-bit, then nf4 (with CPU offload as
     the last resort for the largest models). ``budget_gb=None`` means no
     budget: the first (best) variant is taken. ``quant_mode`` other than
-    "auto" restricts the candidates to that quantization.
+    "auto" restricts the candidates to that quantization. The swap manager
+    additionally falls back to a smaller fitting variant at load time when the
+    card's measured free VRAM is lower than the budget.
     """
-    if quant_mode not in QUANT_MODES:
-        raise ValueError(f"DIFFUSERS_QUANT must be one of {', '.join(QUANT_MODES)}; got {quant_mode!r}")
-    candidates = [v for v in spec.variants if quant_mode == "auto" or v.quant == quant_mode]
-    if not candidates:
-        raise VramBudgetError(spec.model_id, budget_gb, spec.min_vram_gb(), quant_mode)
-    for variant in candidates:
-        if budget_gb is None or variant.est_vram_gb <= budget_gb:
-            return variant
-    raise VramBudgetError(
-        spec.model_id, budget_gb, min(v.est_vram_gb for v in candidates), quant_mode
-    )
+    return fitting_variants(spec, budget_gb, quant_mode)[0]
 
 
 # ---------------------------------------------------------------------------

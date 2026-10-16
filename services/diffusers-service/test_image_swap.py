@@ -235,7 +235,7 @@ def test_insufficient_free_vram_after_unload_is_not_a_warming_state():
     with pytest.raises(InsufficientVram) as err:
         mgr.lease(FLUX)
     assert err.value.free_gb == pytest.approx(3.0)
-    assert err.value.need_gb == 16.5
+    assert err.value.need_gb == 7.0  # the smallest variant that fits the budget
     assert loader.loads == []  # never attempted a load that would OOM other services
 
 
@@ -313,13 +313,14 @@ def test_lease_release_is_idempotent():
 
 
 def test_does_not_evict_a_working_model_for_a_load_that_cannot_fit():
-    # 4 GB free, resident sdxl holds ~7 GB: even evicting it leaves 11 GB, short
-    # of FLUX.2-klein's 16.5 GB full-precision need. The warm model must survive.
-    mgr, loader = make(budget=24.0, free_gb=4.0, warm_wait=5.0)
+    # quant=none: FLUX's smallest variant is bf16 + offload (9 GB). Resident sdxl
+    # holds ~7 GB and 1 GB is free: evicting leaves 8 GB, still short.
+    # The warm model must survive.
+    mgr, loader = make(budget=24.0, quant="none", free_gb=1.0, warm_wait=5.0)
     # sdxl needs 7 GB but only 4 are free, so seed the resident directly.
     mgr._free_vram_bytes = lambda: 40 * GIB
     mgr.lease(SDXL).release()
-    mgr._free_vram_bytes = lambda: 4 * GIB
+    mgr._free_vram_bytes = lambda: 1 * GIB
 
     with pytest.raises(InsufficientVram):
         mgr.lease(FLUX)
@@ -450,3 +451,58 @@ def test_failed_load_is_not_retried_inside_the_backoff_window():
         mgr.lease(ZIMG)  # window over: a fresh load starts
     mgr.wait_for_load(5)
     assert mgr.loaded_model() == ZIMG
+
+
+def test_falls_back_to_a_smaller_variant_that_fits_free_vram():
+    # Budget 12 prefers FLUX bf16+offload (9 GB); only 8 GB is actually free,
+    # so nf4 (7 GB) loads instead of refusing.
+    mgr, loader = make(budget=12.0, free_gb=8.0, warm_wait=5.0)
+    with mgr.lease(FLUX) as lease:
+        assert lease.variant.quant == "nf4"
+    assert loader.loads == [(FLUX, "nf4", "none")]
+
+
+def test_prefers_the_budget_choice_when_free_vram_allows():
+    mgr, loader = make(budget=12.0, free_gb=30.0, warm_wait=5.0)
+    with mgr.lease(FLUX) as lease:
+        assert (lease.variant.quant, lease.variant.offload) == ("none", "model")
+
+
+def test_refuses_only_when_even_the_smallest_variant_does_not_fit():
+    mgr, loader = make(budget=12.0, free_gb=5.0)
+    with pytest.raises(ModelWarming):
+        mgr.lease(FLUX)
+    mgr.wait_for_load(5)
+    with pytest.raises(InsufficientVram) as err:
+        mgr.lease(FLUX)
+    assert err.value.need_gb == 7.0
+    assert loader.loads == []
+
+
+def test_old_failure_is_not_delivered_to_a_fresh_request_later():
+    clock = Clock()
+    loader = FakeLoader()
+    loader.fail[ZIMG] = "boom"
+    mgr, _ = make(loader, backoff=30.0, clock=clock)
+    with pytest.raises(ModelWarming):
+        mgr.lease(ZIMG)
+    mgr.wait_for_load(5)
+    # Nobody retried; a day later a new request must start a fresh load.
+    clock.now += 86400
+    with pytest.raises(ModelWarming) as err:
+        mgr.lease(ZIMG)
+    assert err.value.reason == "loading"
+    mgr.wait_for_load(5)
+    assert mgr.loaded_model() == ZIMG
+
+
+def test_resident_protected_uses_resident_field_not_loading():
+    clock = Clock()
+    mgr, _ = make(min_residency=120.0, clock=clock)
+    with pytest.raises(ModelWarming):
+        mgr.lease(FLUX)
+    mgr.wait_for_load(5)
+    with pytest.raises(ModelWarming) as err:
+        mgr.lease(ZIMG)
+    assert err.value.resident == FLUX
+    assert err.value.loading is None

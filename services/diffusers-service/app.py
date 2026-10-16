@@ -316,8 +316,11 @@ def _cuda_free_bytes():
 
 # One uvicorn worker (see the Dockerfile CMD) is load-bearing: this manager and
 # the pipeline it guards live in this process, so a single worker is what
-# enforces "one image model on the GPU at a time" and serializes generation.
-# Running several workers would each load their own model and break both.
+# enforces "one image model on the GPU at a time". It does NOT serialize
+# generation: sync endpoints run on Starlette's threadpool, so concurrent
+# requests would call the pipeline at once. _gpu_gen_lock below does that.
+# Running several workers would each load their own model.
+_gpu_gen_lock = threading.Lock()
 _manager = ImageModelManager(
     ALLOWED_IMAGE_MODELS,
     DIFFUSERS_MODEL,
@@ -579,6 +582,8 @@ def _warming_response(exc: ModelWarming) -> JSONResponse:
     }
     if exc.loading:
         body["loading_model"] = exc.loading
+    if exc.resident:
+        body["resident_model"] = exc.resident
     return JSONResponse(body, status_code=503, headers={"Retry-After": str(exc.retry_after)})
 
 
@@ -677,7 +682,8 @@ def generate(req: GenerateRequest):
 
         call_kwargs = _build_pipe_kwargs(spec, req, generator)
         try:
-            result = pipe(**_filter_call_kwargs(pipe, call_kwargs))
+            with _gpu_gen_lock:  # one generation on the shared GPU at a time
+                result = pipe(**_filter_call_kwargs(pipe, call_kwargs))
         except Exception as exc:  # inference failure (OOM at generate time, etc.)
             raise HTTPException(500, f"generation failed: {exc}") from None
 
@@ -725,16 +731,17 @@ def generate_video(req: GenerateVideoRequest):
         generator = torch.Generator(device=_video_device).manual_seed(req.seed)
 
     try:
-        result = pipe(
-            prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            generator=generator,
-        )
+        with _gpu_gen_lock:  # shared with /generate: one generation on the GPU at a time
+            result = pipe(
+                prompt=req.prompt,
+                negative_prompt=req.negative_prompt,
+                height=req.height,
+                width=req.width,
+                num_frames=req.num_frames,
+                num_inference_steps=req.num_inference_steps,
+                guidance_scale=req.guidance_scale,
+                generator=generator,
+            )
     except Exception as exc:  # inference failure (OOM at generate time, etc.)
         raise HTTPException(500, f"video generation failed: {exc}")
 

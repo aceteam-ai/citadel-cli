@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from image_models import GIB, ImageModelSpec, LoadVariant, choose_variant
+from image_models import GIB, ImageModelSpec, LoadVariant, choose_variant, fitting_variants
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +49,11 @@ class ModelWarming(Exception):
         retry_after: int,
         reason: str,
         loading: str | None = None,
+        resident: str | None = None,
     ):
         self.model_id = model_id
+        # The model currently on the GPU, when that is why we are warming.
+        self.resident = resident
         self.eta_seconds = max(int(eta_seconds), 0)
         self.retry_after = max(int(retry_after), 1)
         # "loading": this model is being loaded.
@@ -109,6 +112,9 @@ class _Load:
     # True once the load has started displacing the resident model. Until then
     # (while it is only downloading) the resident model keeps serving.
     evicting: bool = False
+    # Every variant that fits the budget, best first; ``variant`` is narrowed to
+    # what fits the measured free VRAM once the previous model is out.
+    candidates: tuple = ()
 
 
 @dataclass
@@ -140,6 +146,9 @@ LoaderFn = Callable[[ImageModelSpec, LoadVariant], "tuple[Any, str]"]
 
 
 class ImageModelManager:
+    # An unreported failure older than its backoff plus this is dropped, not delivered.
+    _STALE_FAILURE_SECONDS = 60.0
+
     def __init__(
         self,
         specs: dict[str, ImageModelSpec],
@@ -293,13 +302,18 @@ class ImageModelManager:
         entry = self._failures.get(spec.model_id)
         if entry is not None:
             err, not_before, reported = entry
-            if not reported or self._clock() < not_before:
+            now = self._clock()
+            # Drop an entry once its backoff has passed and it was reported (or
+            # is long stale), so an old failure is never delivered to a fresh,
+            # unrelated request.
+            if now >= not_before and (reported or now >= not_before + self._STALE_FAILURE_SECONDS):
+                del self._failures[spec.model_id]
+            else:
                 # Reported once to the request that triggered it, then repeated
                 # for the backoff window so a retry loop cannot hammer a load
                 # that just failed (and evict a working model each time).
                 entry[2] = True
                 raise err
-            del self._failures[spec.model_id]
 
         resident = self._resident
         if (
@@ -330,9 +344,14 @@ class ImageModelManager:
                         eta_seconds=int(remaining) + spec.est_load_seconds,
                         retry_after=self._retry_after,
                         reason="resident_protected",
-                        loading=resident.spec.model_id,
+                        resident=resident.spec.model_id,
                     )
-            load = _Load(spec=spec, variant=variant, started_at=self._clock())
+            load = _Load(
+                spec=spec,
+                variant=variant,
+                started_at=self._clock(),
+                candidates=tuple(fitting_variants(spec, self._budget_gb, self._quant_mode)),
+            )
             self._load = load
             self._thread = threading.Thread(
                 target=self._run_load, args=(load,), name=f"diffusers-load-{spec.model_id}", daemon=True
@@ -371,19 +390,28 @@ class ImageModelManager:
     def _run_load(self, load: _Load) -> None:
         spec, variant = load.spec, load.variant
         try:
-            need_bytes = variant.est_vram_gb * GIB
+            candidates = load.candidates or (variant,)
+            smallest = min(candidates, key=lambda v: v.est_vram_gb)
             # Disk first: free-space preflight and weight download happen while
             # the resident model keeps serving, so a slow or failed download
             # never leaves the node with no model.
             self._prepare(spec, variant)
-            self._refuse_if_eviction_cannot_help(spec, need_bytes)
+            self._refuse_if_eviction_cannot_help(spec, smallest.est_vram_gb * GIB)
             self._swap_out_previous(load)
             # Unconditional, so cached blocks left by a previous failed load or
             # an earlier unload never make free VRAM look smaller than it is.
             self._free_memory()
             free_before = self._free_vram_bytes()
-            if free_before is not None and free_before < need_bytes:
-                raise InsufficientVram(spec.model_id, variant.est_vram_gb, free_before / GIB)
+            if free_before is not None:
+                # The budget picked the preferred variant; what the card has free
+                # right now decides which one actually loads. Fall back to the
+                # next smaller variant that fits before refusing.
+                fitting = [v for v in candidates if v.est_vram_gb * GIB <= free_before]
+                if not fitting:
+                    raise InsufficientVram(spec.model_id, smallest.est_vram_gb, free_before / GIB)
+                variant = fitting[0]
+                with self._cond:
+                    load.variant = variant
 
             started = self._clock()
             pipe, device = self._loader(spec, variant)
