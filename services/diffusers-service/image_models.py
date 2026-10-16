@@ -22,9 +22,8 @@ the diffusers v0.37.1 source for the pipeline's ``__call__`` signature:
   - stabilityai/sdxl-turbo             "other", license_name sai-nc-community
     (Stability AI Community License: research/non-commercial free; commercial
     use needs registration and ends above USD 1M annual revenue; requires
-    "Powered by Stability AI" attribution). NOT permissive. It is kept only
-    as the long-standing DIFFUSERS_MODEL default, not on the default
-    allowlist; see DEFAULT_ALLOWLIST.
+    "Powered by Stability AI" attribution). NOT permissive. Not on the
+    default allowlist; see DEFAULT_ALLOWLIST.
 
 The ``est_vram_gb`` figures are ESTIMATES derived from the checkpoint sizes
 (bf16 = 2 bytes/param, nf4 ~ 0.55 byte/param incl. quantization constants,
@@ -110,6 +109,20 @@ class ImageModelSpec:
 
 _V = LoadVariant
 
+# Every catalog entry declares explicit allow patterns (the components its
+# model_index.json names) so the free-space preflight estimates what
+# from_pretrained will actually read, and so the preflight can refuse (fail
+# closed) before a multi-GB download starts. Anything outside these (root
+# single-file checkpoints, onnx exports, other precisions) is never fetched.
+_DIFFUSERS_LAYOUT_ALLOW = (
+    "model_index.json",
+    "scheduler/*",
+    "text_encoder/*",
+    "tokenizer/*",
+    "transformer/*",
+    "vae/*",
+)
+
 CATALOG: dict[str, ImageModelSpec] = {
     "stabilityai/sdxl-turbo": ImageModelSpec(
         model_id="stabilityai/sdxl-turbo",
@@ -121,9 +134,22 @@ CATALOG: dict[str, ImageModelSpec] = {
         default_steps=4,
         default_guidance=0.0,
         default_size=512,
+        # Same files the unvarianted from_pretrained reads (fp32 unet and text
+        # encoders), minus the onnx exports, fp16 duplicates and root checkpoints.
+        allow_patterns=(
+            "model_index.json",
+            "scheduler/*",
+            "text_encoder/*",
+            "text_encoder_2/*",
+            "tokenizer/*",
+            "tokenizer_2/*",
+            "unet/*",
+            "vae/*",
+        ),
+        ignore_patterns=("*.onnx", "*.onnx_data", "*.fp16.safetensors"),
         est_disk_gb=14.0,
         est_load_seconds=45,
-        notes="Fast fallback. Legacy default; unchanged load path.",
+        notes="Fast fallback. Fast fallback. Only selectable when named by DIFFUSERS_MODEL or DIFFUSERS_ALLOWED_MODELS.",
     ),
     "black-forest-labs/FLUX.2-klein-4B": ImageModelSpec(
         model_id="black-forest-labs/FLUX.2-klein-4B",
@@ -143,8 +169,8 @@ CATALOG: dict[str, ImageModelSpec] = {
         default_size=1024,
         supports_negative_prompt=False,
         # The repo also ships a 7.75 GB single-file checkpoint that duplicates
-        # transformer/; the diffusers layout never reads it.
-        ignore_patterns=("flux-2-klein-4b.safetensors",),
+        # transformer/; the allow list leaves it out.
+        allow_patterns=_DIFFUSERS_LAYOUT_ALLOW,
         est_disk_gb=16.0,
         est_load_seconds=90,
     ),
@@ -164,6 +190,7 @@ CATALOG: dict[str, ImageModelSpec] = {
         default_steps=9,
         default_guidance=0.0,
         default_size=1024,
+        allow_patterns=_DIFFUSERS_LAYOUT_ALLOW,
         est_disk_gb=33.0,
         est_load_seconds=150,
     ),
@@ -189,6 +216,7 @@ CATALOG: dict[str, ImageModelSpec] = {
         default_size=1024,
         cfg_param="true_cfg_scale",
         requires_negative_prompt=True,
+        allow_patterns=_DIFFUSERS_LAYOUT_ALLOW,
         est_disk_gb=58.0,
         est_load_seconds=300,
         notes="Needs 8-bit or nf4; quantized at load time from the bf16 files.",
@@ -198,10 +226,9 @@ CATALOG: dict[str, ImageModelSpec] = {
 # Used when DIFFUSERS_ALLOWED_MODELS is unset: the permissively licensed
 # (Apache-2.0) models only. sdxl-turbo (Stability AI Community Licence:
 # registration, attribution, and a USD 1M annual revenue cap for commercial use)
-# is NOT on it. It stays selectable only because it is the long-standing
-# DIFFUSERS_MODEL default, which parse_allowlist always includes; an operator
-# who wants it gone sets DIFFUSERS_MODEL to a permissive model. Open question
-# for the founder (see the PR).
+# is NOT on it. It is selectable only if an operator names it in
+# DIFFUSERS_ALLOWED_MODELS or sets it as DIFFUSERS_MODEL. The default
+# DIFFUSERS_MODEL is FLUX.2-klein-4B (founder decision on citadel-cli PR 1339).
 DEFAULT_ALLOWLIST: tuple[str, ...] = (
     "black-forest-labs/FLUX.2-klein-4B",
     "Tongyi-MAI/Z-Image-Turbo",

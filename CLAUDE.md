@@ -2040,12 +2040,12 @@ owns which variant fits `DIFFUSERS_VRAM_BUDGET_GB`; `image_swap.ImageModelManage
 owns residency, the drain-then-unload swap, and the warming contract. A request's
 optional `model` must be allowlisted (400 otherwise). A cold or swapping model
 answers HTTP 503 with a typed `model_warming` body, and
-`internal/jobs/media_generate.go` passes that body through as the job output
-(not an error) so the caller retries. Other 503s (`insufficient_vram`) and 4xx
+`internal/jobs/media_generate.go` retries it (Retry-After) within its request
+budget and only then returns the body as the job output (not an error). Other 503s (`insufficient_vram`) and 4xx
 stay failures. The VRAM figures in the catalog are estimates; `/health`
 `last_load.measured_vram_gb` records the real delta on each load. Pinned image
-stack and its rationale live in `requirements.txt`; the compose env passthrough
-is covered by `KnownComposeHashes`.
+stack and its rationale live in `requirements.txt`. The default `DIFFUSERS_MODEL` is FLUX.2-klein-4B; sdxl-turbo (non-permissive licence) is selectable only if an operator names it. `ImageModelManager.prepare` (preflight + download) runs BEFORE the resident model is evicted; a fresh model is protected until used (`DIFFUSERS_MIN_RESIDENCY_SECONDS`); and the single uvicorn worker is what enforces one model at a time.
+The compose env passthrough is covered by `KnownComposeHashes`.
 
 ### Meeting media stack — virtual mic / bot speaking path (aceteam#7079)
 

@@ -121,6 +121,9 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// citadel-cli#1335: per-request image model selection env passthrough
 		// (DIFFUSERS_ALLOWED_MODELS / _VRAM_BUDGET_GB / _QUANT / _WARM_WAIT_SECONDS).
 		"8fe0987b5ef79d4111ef878867fe357166688b7b8ebd3d6b16fe90efb2791a73": true,
+		// citadel-cli#1335 review: FLUX.2-klein-4B default model, residency,
+		// backoff and free-disk-floor env.
+		"93385effc412fe5dbb7e8d321f5a35dc11d59a6dd30a2dc0771941243fa07a34": true,
 	},
 	"bonsai": {
 		"124af757f45e93b689bc6a59f08187d48f59c0e62eb2d10c6a006c8ac4d24609": true,

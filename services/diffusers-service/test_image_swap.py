@@ -7,6 +7,7 @@ tests control exactly when a "cold load" finishes."""
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -29,9 +30,21 @@ class FakeLoader:
         self.fail = {}
         self.unloaded = []
         self.freed = 0
+        self.events = []
+        self.prepare_fail = {}
+        self.prepare_gates = {}
         self.lock = threading.Lock()
 
+    def prepare(self, spec, variant):
+        self.events.append(("prepare", spec.model_id))
+        gate = self.prepare_gates.get(spec.model_id)
+        if gate is not None:
+            assert gate.wait(5), "test never released the prepare gate"
+        if spec.model_id in self.prepare_fail:
+            raise RuntimeError(self.prepare_fail.pop(spec.model_id))
+
     def load(self, spec, variant):
+        self.events.append(("load", spec.model_id))
         gate = self.gates.get(spec.model_id)
         if gate is not None:
             assert gate.wait(5), "test never released the load gate"
@@ -42,13 +55,16 @@ class FakeLoader:
         return f"pipe:{spec.model_id}", "cuda"
 
     def unload(self, pipe):
+        self.events.append(("unload", pipe))
         self.unloaded.append(pipe)
 
     def free(self):
+        self.events.append(("free", None))
         self.freed += 1
 
 
-def make(loader=None, *, budget=24.0, quant="auto", free_gb=None, warm_wait=0.0, drain=5.0, **kw):
+def make(loader=None, *, budget=24.0, quant="auto", free_gb=None, warm_wait=0.0, drain=5.0,
+         min_residency=0.0, backoff=0.0, **kw):
     loader = loader or FakeLoader()
     specs = im.parse_allowlist(None, SDXL)
     free_fn = (lambda: None) if free_gb is None else (lambda: int(free_gb * GIB))
@@ -64,6 +80,9 @@ def make(loader=None, *, budget=24.0, quant="auto", free_gb=None, warm_wait=0.0,
         warm_wait_seconds=warm_wait,
         drain_timeout_seconds=drain,
         retry_after_seconds=7,
+        min_residency_seconds=min_residency,
+        failure_backoff_seconds=backoff,
+        prepare=loader.prepare,
         **kw,
     )
     return mgr, loader
@@ -122,7 +141,7 @@ def test_swap_unloads_previous_and_frees_cuda_memory():
     assert mgr.wait_for_load(5)
 
     assert loader.unloaded == [f"pipe:{SDXL}"]
-    assert loader.freed == 1
+    assert loader.freed >= 1
     assert mgr.loaded_model() == FLUX
     assert [m for m, *_ in loader.loads] == [SDXL, FLUX]
 
@@ -154,6 +173,9 @@ def test_outgoing_model_accepts_no_new_leases_while_swap_is_pending():
     busy = mgr.lease(SDXL)
     with pytest.raises(ModelWarming):
         mgr.lease(FLUX)
+    deadline = time.time() + 5
+    while not (mgr._load and mgr._load.evicting) and time.time() < deadline:
+        time.sleep(0.01)  # the load thread has reached the drain step
     with pytest.raises(ModelWarming) as err:
         mgr.lease(SDXL)  # would starve the swap
     assert err.value.reason == "swapping_out"
@@ -303,4 +325,128 @@ def test_does_not_evict_a_working_model_for_a_load_that_cannot_fit():
         mgr.lease(FLUX)
     assert mgr.loaded_model() == SDXL
     assert loader.unloaded == []
-    assert loader.freed == 0
+
+
+def test_failed_load_frees_cuda_memory():
+    loader = FakeLoader()
+    loader.fail[SDXL] = "partial allocation then error"
+    mgr, _ = make(loader)
+    with pytest.raises(ModelWarming):
+        mgr.lease(SDXL)
+    mgr.wait_for_load(5)
+    assert loader.freed >= 1  # also on the failure path, not only after an unload
+
+
+def test_free_memory_runs_even_when_nothing_was_unloaded():
+    mgr, loader = make(warm_wait=5.0)
+    mgr.lease(SDXL).release()  # cold start: no previous model to unload
+    assert ("free", None) in loader.events
+    assert loader.events.index(("free", None)) < loader.events.index(("load", SDXL))
+
+
+def test_download_happens_before_the_resident_model_is_evicted():
+    loader = FakeLoader()
+    gate = loader.prepare_gates[FLUX] = threading.Event()
+    mgr, _ = make(loader)
+    with pytest.raises(ModelWarming):
+        mgr.lease(SDXL)
+    mgr.wait_for_load(5)
+    mgr.lease(SDXL).release()
+    loader.events.clear()
+
+    with pytest.raises(ModelWarming):
+        mgr.lease(FLUX)  # blocks in prepare (the download), SDXL still resident
+    # The old model keeps serving while the new one downloads.
+    with mgr.lease(SDXL) as still_there:
+        assert still_there.model_id == SDXL
+    assert loader.unloaded == []
+    gate.set()
+    assert mgr.wait_for_load(5)
+    order = [e for e in loader.events if e[0] in ("prepare", "unload", "load")]
+    assert order == [("prepare", FLUX), ("unload", f"pipe:{SDXL}"), ("load", FLUX)]
+
+
+def test_failed_download_leaves_the_resident_model_loaded():
+    loader = FakeLoader()
+    loader.prepare_fail[FLUX] = "insufficient disk space"
+    mgr, _ = make(loader)
+    with pytest.raises(ModelWarming):
+        mgr.lease(SDXL)
+    mgr.wait_for_load(5)
+    mgr.lease(SDXL).release()
+
+    with pytest.raises(ModelWarming):
+        mgr.lease(FLUX)
+    mgr.wait_for_load(5)
+    with pytest.raises(ModelLoadFailed) as err:
+        mgr.lease(FLUX)
+    assert "insufficient disk space" in str(err.value)
+    assert mgr.loaded_model() == SDXL
+    assert loader.unloaded == []
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_fresh_model_is_not_evicted_before_its_requester_uses_it():
+    clock = Clock()
+    mgr, loader = make(min_residency=120.0, clock=clock)
+    with pytest.raises(ModelWarming):
+        mgr.lease(FLUX)  # client A
+    mgr.wait_for_load(5)
+
+    with pytest.raises(ModelWarming) as err:  # client B wants another model
+        mgr.lease(ZIMG)
+    assert err.value.reason == "resident_protected"
+    assert mgr.loaded_model() == FLUX
+    assert [m for m, *_ in loader.loads] == [FLUX]
+    assert loader.unloaded == []
+
+    mgr.lease(FLUX).release()  # A finally uses it; protection ends
+    with pytest.raises(ModelWarming):
+        mgr.lease(ZIMG)
+    mgr.wait_for_load(5)
+    assert mgr.loaded_model() == ZIMG
+
+
+def test_unused_model_becomes_evictable_after_min_residency():
+    clock = Clock()
+    mgr, loader = make(min_residency=120.0, clock=clock)
+    with pytest.raises(ModelWarming):
+        mgr.lease(FLUX)
+    mgr.wait_for_load(5)
+    clock.now += 119
+    with pytest.raises(ModelWarming) as err:
+        mgr.lease(ZIMG)
+    assert err.value.reason == "resident_protected"
+    clock.now += 2
+    with pytest.raises(ModelWarming) as err2:
+        mgr.lease(ZIMG)
+    assert err2.value.reason == "loading"
+    mgr.wait_for_load(5)
+    assert mgr.loaded_model() == ZIMG
+
+
+def test_failed_load_is_not_retried_inside_the_backoff_window():
+    clock = Clock()
+    loader = FakeLoader()
+    loader.fail[ZIMG] = "boom"
+    mgr, _ = make(loader, backoff=30.0, clock=clock)
+    with pytest.raises(ModelWarming):
+        mgr.lease(ZIMG)
+    mgr.wait_for_load(5)
+    for _ in range(3):  # reported, then repeated without starting new loads
+        with pytest.raises(ModelLoadFailed):
+            mgr.lease(ZIMG)
+    assert loader.loads == []
+    assert mgr.loading_model() is None
+    clock.now += 31
+    with pytest.raises(ModelWarming):
+        mgr.lease(ZIMG)  # window over: a fresh load starts
+    mgr.wait_for_load(5)
+    assert mgr.loaded_model() == ZIMG

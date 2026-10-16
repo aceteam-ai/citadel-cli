@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -78,6 +79,57 @@ type MediaGenerateHandler struct {
 	ServiceURL string
 	// HTTPClient lets tests inject a stub; nil uses a default client.
 	HTTPClient *http.Client
+	// RequestTimeout bounds the whole generation call including model_warming
+	// retries; zero uses mediaGenerateRequestTimeout. Tests shorten it.
+	RequestTimeout time.Duration
+	// Sleep waits between model_warming retries and returns early (false) if
+	// the job context is cancelled; nil uses a timer. Tests stub it.
+	Sleep func(ctx context.Context, d time.Duration) bool
+}
+
+func (h *MediaGenerateHandler) requestTimeout() time.Duration {
+	if h.RequestTimeout > 0 {
+		return h.RequestTimeout
+	}
+	return mediaGenerateRequestTimeout
+}
+
+func (h *MediaGenerateHandler) sleep(ctx context.Context, d time.Duration) bool {
+	if h.Sleep != nil {
+		return h.Sleep(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// warmingRetryDelay extracts how long to wait before retrying a model_warming
+// response: the Retry-After header, else the body's retry_after, floored at 1s
+// and capped at 60s so one odd value cannot stall the job.
+func warmingRetryDelay(header string, body []byte) time.Duration {
+	secs := 0
+	if n, err := strconv.Atoi(strings.TrimSpace(header)); err == nil {
+		secs = n
+	} else {
+		var probe struct {
+			RetryAfter int `json:"retry_after"`
+		}
+		if json.Unmarshal(body, &probe) == nil {
+			secs = probe.RetryAfter
+		}
+	}
+	if secs < 1 {
+		secs = 1
+	}
+	if secs > 60 {
+		secs = 60
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // NewMediaGenerateHandler creates a handler pointed at the local diffusers
@@ -202,34 +254,47 @@ func (h *MediaGenerateHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	reqCtx, cancel := context.WithTimeout(context.Background(), mediaGenerateRequestTimeout)
+	reqCtx, cancel := context.WithTimeout(context.Background(), h.requestTimeout())
 	defer cancel()
+	deadline, _ := reqCtx.Deadline()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, h.serviceURL()+endpoint, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to build generation request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := h.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to diffusers service: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
 	// A cold or swapping image model answers 503 with a typed model_warming
-	// body (citadel-cli#1335). That is not a failure: pass the sidecar's
-	// {status, model, eta_seconds, retry_after, reason} object through as the
-	// job output, the same typed signal llm_inference returns for a loading
-	// engine, so the caller retries instead of surfacing an error.
-	if resp.StatusCode == http.StatusServiceUnavailable && isModelWarmingBody(body) {
-		ctx.Log("info", "     - [Job %s] diffusers model is warming; returning retryable model_warming", job.ID)
-		return body, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		// On error the body is a JSON error, not media; surface it verbatim.
-		return body, fmt.Errorf("diffusers service returned non-200 status: %s: %s", resp.Status, string(body))
+	// body (citadel-cli#1335). Retry it here, honouring Retry-After, for as long
+	// as the request budget allows, so a caller that does not understand
+	// model_warming still gets an image. Only when the next wait would pass the
+	// budget is the warming object returned as the (retryable) job output.
+	var body []byte
+	for {
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, h.serviceURL()+endpoint, bytes.NewBuffer(reqBody))
+		if err != nil {
+			return nil, fmt.Errorf("failed to build generation request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := h.client().Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to diffusers service: %w", err)
+		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusServiceUnavailable && isModelWarmingBody(body) {
+			delay := warmingRetryDelay(resp.Header.Get("Retry-After"), body)
+			if time.Now().Add(delay).After(deadline) {
+				ctx.Log("info", "     - [Job %s] diffusers model still warming past the request budget; returning retryable model_warming", job.ID)
+				return body, nil
+			}
+			ctx.Log("info", "     - [Job %s] diffusers model warming; retrying in %s", job.ID, delay)
+			if !h.sleep(ctx.Context(), delay) {
+				return nil, fmt.Errorf("job cancelled while waiting for the diffusers model to warm")
+			}
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			// On error the body is a JSON error, not media; surface it verbatim.
+			return body, fmt.Errorf("diffusers service returned non-200 status: %s: %s", resp.Status, string(body))
+		}
+		break
 	}
 
 	var content, model string

@@ -493,3 +493,77 @@ def test_wan21_video_preflight_uses_independent_env_vars_from_image_path(monkeyp
     )
     assert image_allow == ["vae/*"]
     assert video_allow == ["transformer/*"]
+
+
+# ---------------------------------------------------------------------------
+# Catalog preflight (citadel-cli#1335): every catalog model's patterns select
+# only what from_pretrained reads, and fail_closed refuses on a shortfall.
+# ---------------------------------------------------------------------------
+
+import image_models  # noqa: E402
+
+GIB = 1024**3
+
+
+def _fake_repo(spec):
+    """A synthetic listing shaped like the real repo: the model's real
+    component dirs holding est_disk_gb, plus decoys the patterns must skip."""
+    per = int(spec.est_disk_gb * GIB)
+    main_dir = "unet" if "unet/*" in spec.allow_patterns else "transformer"
+    files = [
+        mp.RepoFileInfo("model_index.json", 1000, True),
+        mp.RepoFileInfo(f"{main_dir}/diffusion_pytorch_model.safetensors", per, True),
+        mp.RepoFileInfo("root-duplicate-checkpoint.safetensors", 50 * GIB, True),
+        mp.RepoFileInfo("unet/model.onnx_data", 50 * GIB, True),
+        mp.RepoFileInfo("unet/diffusion_pytorch_model.fp16.safetensors", 50 * GIB, True),
+    ]
+    return lambda repo_id, **kw: files
+
+
+@pytest.mark.parametrize("model_id", sorted(image_models.CATALOG))
+def test_catalog_preflight_refuses_a_shortfall_for_each_model(model_id):
+    spec = image_models.CATALOG[model_id]
+    assert spec.allow_patterns, "every catalog entry must declare allow patterns"
+    allow, ignore = list(spec.allow_patterns), list(spec.ignore_patterns or ())
+    size = mp.estimate_repo_size_bytes(
+        model_id, allow_patterns=allow, ignore_patterns=ignore, list_repo_files_fn=_fake_repo(spec)
+    )
+    assert size < spec.est_disk_gb * GIB + 10_000  # decoys excluded
+    common = dict(
+        allow_patterns=allow,
+        ignore_patterns=ignore,
+        list_repo_files_fn=_fake_repo(spec),
+        margin_bytes=20 * GIB,
+        fail_closed=True,
+    )
+    with pytest.raises(mp.InsufficientDiskSpaceError):  # smaller than the model
+        mp.run_preflight(model_id, "/x", available_disk_bytes_fn=lambda _p: int(spec.est_disk_gb * GIB * 0.5), **common)
+    with pytest.raises(mp.InsufficientDiskSpaceError):  # fits, but breaks the 20 GiB floor
+        mp.run_preflight(model_id, "/x", available_disk_bytes_fn=lambda _p: int(spec.est_disk_gb * GIB) + 10 * GIB, **common)
+    mp.run_preflight(model_id, "/x", available_disk_bytes_fn=lambda _p: int(spec.est_disk_gb * GIB) + 25 * GIB, **common)
+
+
+def test_fail_closed_without_patterns_still_refuses():
+    files = [mp.RepoFileInfo("a.safetensors", 100 * GIB, True)]
+    with pytest.raises(mp.InsufficientDiskSpaceError):
+        mp.run_preflight(
+            "x/y", "/x", list_repo_files_fn=lambda *a, **k: files,
+            available_disk_bytes_fn=lambda _p: 10 * GIB, fail_closed=True,
+        )
+    # unchanged default: warn only
+    mp.run_preflight(
+        "x/y", "/x", list_repo_files_fn=lambda *a, **k: files,
+        available_disk_bytes_fn=lambda _p: 10 * GIB,
+    )
+
+
+def test_already_cached_files_are_netted_out_of_the_estimate():
+    files = [
+        mp.RepoFileInfo("transformer/a.safetensors", 30 * GIB, True),
+        mp.RepoFileInfo("text_encoder/b.safetensors", 8 * GIB, True),
+    ]
+    size = mp.estimate_repo_size_bytes(
+        "x/y", list_repo_files_fn=lambda *a, **k: files,
+        is_cached_fn=lambda repo, path, rev: path.startswith("transformer/"),
+    )
+    assert size == 8 * GIB

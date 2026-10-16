@@ -32,7 +32,7 @@ ENV PORT=7860
 # Default image model, used when a request omits `model`; override at deploy
 # time with DIFFUSERS_MODEL. Requests may name any model on the allowlist
 # (DIFFUSERS_ALLOWED_MODELS, default: the verified catalog in image_models.py).
-ENV DIFFUSERS_MODEL=stabilityai/sdxl-turbo
+ENV DIFFUSERS_MODEL=black-forest-labs/FLUX.2-klein-4B
 # GB of VRAM the image pipeline may hold on the shared GPU (0 = unlimited). The
 # sidecar picks the best load variant (full precision, 8-bit, nf4, CPU offload)
 # that fits, and swaps one model at a time.
@@ -45,4 +45,7 @@ ENV HF_HOME=/root/.cache/huggingface
 
 EXPOSE 7860
 
+# Exactly ONE uvicorn worker, on purpose (do not add --workers): the image model
+# manager in app.py lives in this process, and a single worker is what enforces
+# one resident image model and serialized generation on the shared GPU.
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]

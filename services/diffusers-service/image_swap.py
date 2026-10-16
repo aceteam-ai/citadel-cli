@@ -93,6 +93,10 @@ class _Resident:
     load_seconds: float
     measured_vram_gb: float | None
     inflight: int = 0
+    # Set once any request has leased this pipeline. Until then (and for
+    # min_residency_seconds) a different model may not evict it, so two clients
+    # alternating models cannot evict each other's fresh load before it serves.
+    served: bool = False
 
 
 @dataclass
@@ -102,6 +106,9 @@ class _Load:
     started_at: float
     event: threading.Event = field(default_factory=threading.Event)
     error: Exception | None = None
+    # True once the load has started displacing the resident model. Until then
+    # (while it is only downloading) the resident model keeps serving.
+    evicting: bool = False
 
 
 @dataclass
@@ -142,6 +149,9 @@ class ImageModelManager:
         unloader: Callable[[Any], None] = lambda pipe: None,
         free_memory: Callable[[], None] = lambda: None,
         free_vram_bytes: Callable[[], int | None] = lambda: None,
+        prepare: Callable[[ImageModelSpec, LoadVariant], None] = lambda spec, variant: None,
+        min_residency_seconds: float = 120.0,
+        failure_backoff_seconds: float = 30.0,
         vram_budget_gb: float | None = None,
         quant_mode: str = "auto",
         warm_wait_seconds: float = 15.0,
@@ -155,6 +165,12 @@ class ImageModelManager:
         self._unloader = unloader
         self._free_memory = free_memory
         self._free_vram_bytes = free_vram_bytes
+        # Disk-side preparation (free-space preflight + weight prefetch). Runs
+        # BEFORE anything is evicted, so a slow or failed download never leaves
+        # the node without a model.
+        self._prepare = prepare
+        self._min_residency = max(min_residency_seconds, 0.0)
+        self._failure_backoff = max(failure_backoff_seconds, 0.0)
         self._budget_gb = vram_budget_gb
         self._quant_mode = quant_mode
         self._warm_wait = max(warm_wait_seconds, 0.0)
@@ -165,7 +181,8 @@ class ImageModelManager:
         self._cond = threading.Condition()
         self._resident: _Resident | None = None
         self._load: _Load | None = None
-        self._failures: dict[str, Exception] = {}
+        # model_id -> (error, retry_not_before, already_reported)
+        self._failures: dict[str, list] = {}
         self._last_load: dict[str, Any] | None = None
         self._thread: threading.Thread | None = None
 
@@ -273,12 +290,24 @@ class ImageModelManager:
             return None
 
     def _try_locked(self, spec: ImageModelSpec) -> "Lease | _Load":
-        failure = self._failures.pop(spec.model_id, None)
-        if failure is not None:
-            raise failure
+        entry = self._failures.get(spec.model_id)
+        if entry is not None:
+            err, not_before, reported = entry
+            if not reported or self._clock() < not_before:
+                # Reported once to the request that triggered it, then repeated
+                # for the backoff window so a retry loop cannot hammer a load
+                # that just failed (and evict a working model each time).
+                entry[2] = True
+                raise err
+            del self._failures[spec.model_id]
 
         resident = self._resident
-        if resident is not None and resident.spec.model_id == spec.model_id and self._load is None:
+        if (
+            resident is not None
+            and resident.spec.model_id == spec.model_id
+            and (self._load is None or not self._load.evicting)
+        ):
+            resident.served = True
             resident.inflight += 1
             return Lease(
                 pipe=resident.pipe,
@@ -291,6 +320,18 @@ class ImageModelManager:
 
         if self._load is None:
             variant = choose_variant(spec, self._budget_gb, self._quant_mode)  # VramBudgetError
+            if resident is not None and not resident.served:
+                remaining = self._min_residency - (self._clock() - resident.loaded_at)
+                if remaining > 0:
+                    # The resident model has not served anyone yet: let its
+                    # requester use it before another model displaces it.
+                    raise ModelWarming(
+                        spec.model_id,
+                        eta_seconds=int(remaining) + spec.est_load_seconds,
+                        retry_after=self._retry_after,
+                        reason="resident_protected",
+                        loading=resident.spec.model_id,
+                    )
             load = _Load(spec=spec, variant=variant, started_at=self._clock())
             self._load = load
             self._thread = threading.Thread(
@@ -331,8 +372,15 @@ class ImageModelManager:
         spec, variant = load.spec, load.variant
         try:
             need_bytes = variant.est_vram_gb * GIB
+            # Disk first: free-space preflight and weight download happen while
+            # the resident model keeps serving, so a slow or failed download
+            # never leaves the node with no model.
+            self._prepare(spec, variant)
             self._refuse_if_eviction_cannot_help(spec, need_bytes)
-            self._swap_out_previous()
+            self._swap_out_previous(load)
+            # Unconditional, so cached blocks left by a previous failed load or
+            # an earlier unload never make free VRAM look smaller than it is.
+            self._free_memory()
             free_before = self._free_vram_bytes()
             if free_before is not None and free_before < need_bytes:
                 raise InsufficientVram(spec.model_id, variant.est_vram_gb, free_before / GIB)
@@ -380,8 +428,14 @@ class ImageModelManager:
             else:
                 err = ModelLoadFailed(spec.model_id, str(exc))
             logger.warning("diffusers: load of %s failed: %s", spec.model_id, exc)
+            try:
+                # A failed from_pretrained can leave partially allocated CUDA
+                # blocks cached in this process.
+                self._free_memory()
+            except Exception:  # noqa: BLE001
+                logger.exception("diffusers: freeing memory after a failed load raised")
             with self._cond:
-                self._failures[spec.model_id] = err
+                self._failures[spec.model_id] = [err, self._clock() + self._failure_backoff, False]
                 load.error = err
                 self._load = None
                 load.event.set()
@@ -395,6 +449,9 @@ class ImageModelManager:
             resident = self._resident
         if resident is None:
             return
+        # Release this process's own cached-but-unused blocks first so the
+        # reading counts them as free (they are reclaimable by definition).
+        self._free_memory()
         free_now = self._free_vram_bytes()
         if free_now is None:
             return
@@ -403,13 +460,13 @@ class ImageModelManager:
         if reclaimable < need_bytes:
             raise InsufficientVram(spec.model_id, need_bytes / GIB, reclaimable / GIB)
 
-    def _swap_out_previous(self) -> None:
-        """Drain in-flight work on the resident model, then free it and the
-        CUDA cache. Runs on the load thread."""
+    def _swap_out_previous(self, load: _Load) -> None:
+        """Drain in-flight work on the resident model, then unload it. Runs on the load thread."""
         with self._cond:
             previous = self._resident
             if previous is None:
                 return
+            load.evicting = True  # stop leasing the outgoing model; it would starve the drain
             drained = self._cond.wait_for(lambda: previous.inflight == 0, timeout=self._drain_timeout)
             if not drained:
                 raise TimeoutError(
@@ -426,4 +483,3 @@ class ImageModelManager:
         finally:
             del pipe
             del previous
-        self._free_memory()

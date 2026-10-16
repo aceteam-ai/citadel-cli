@@ -24,7 +24,7 @@ two tiers:
   2. Tokenizer *construction* (not full pipeline/model load) for the model
      families the sidecar actually serves, downloading only the small
      tokenizer/config files (a few KB -- never the multi-GB weight shards):
-       - `stabilityai/sdxl-turbo` (DIFFUSERS_MODEL default): CLIP tokenizer.
+       - `stabilityai/sdxl-turbo` (the previous DIFFUSERS_MODEL default): CLIP tokenizer.
        - FLUX.2-klein-4B, Z-Image-Turbo and Qwen-Image (the citadel-cli#1335
          image allowlist): Qwen2-family BPE tokenizers.
        - `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` (DIFFUSERS_VIDEO_MODEL default,

@@ -21,7 +21,7 @@ Contract (aceteam #4468, `diffusers-text-to-image` provisioning template):
 Image models (citadel-cli#1335): a request may name any ALLOWLISTED model in
 its optional ``model`` field (``DIFFUSERS_ALLOWED_MODELS``, see
 image_models.py for the verified catalog and licences). Omitting it selects
-``DIFFUSERS_MODEL`` (default SDXL-Turbo). The sidecar keeps ONE image pipeline
+``DIFFUSERS_MODEL`` (default black-forest-labs/FLUX.2-klein-4B). The sidecar keeps ONE image pipeline
 on the GPU at a time: a request for another allowlisted model swaps it in
 (image_swap.py), unloading the previous one and checking the card has room
 under ``DIFFUSERS_VRAM_BUDGET_GB``. Big models load quantized (nf4 / 8-bit via
@@ -72,10 +72,12 @@ from image_swap import (
     ModelWarming,
 )
 
-# Model repo id to serve. Defaults to SDXL-Turbo: small (~7GB), fast (1-4 steps),
-# and a good default for a first render. Override for SD 3.5 Medium, SDXL, etc.:
-#   DIFFUSERS_MODEL=stabilityai/stable-diffusion-3.5-medium
-DIFFUSERS_MODEL = os.environ.get("DIFFUSERS_MODEL", "stabilityai/sdxl-turbo")
+# Default image model, used when a request omits `model`. FLUX.2-klein-4B is
+# Apache-2.0 and a 4-step distilled model. (Before citadel-cli#1335 this was
+# stabilityai/sdxl-turbo, whose Stability AI Community License is not
+# permissive; set DIFFUSERS_MODEL back to it to keep the old behavior.)
+# Override for any catalog model, or e.g. stabilityai/stable-diffusion-3.5-medium.
+DIFFUSERS_MODEL = os.environ.get("DIFFUSERS_MODEL", "black-forest-labs/FLUX.2-klein-4B")
 
 # Torch dtype for the pipeline. fp16 halves VRAM and is the norm for GPU serving;
 # fp32 is used automatically on CPU (fp16 is not supported on most CPUs).
@@ -117,6 +119,8 @@ DIFFUSERS_CACHE_DIR = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/
 #   DIFFUSERS_QUANT            auto (default) | none | int8 | nf4.
 #   DIFFUSERS_WARM_WAIT_SECONDS  how long a request waits for a cold load
 #                              before getting a retryable warming response.
+#   DIFFUSERS_MIN_RESIDENCY_SECONDS / DIFFUSERS_FAILURE_BACKOFF_SECONDS /
+#   DIFFUSERS_MIN_FREE_DISK_GB  see below.
 #   DIFFUSERS_DEFAULT_VRAM_GB  VRAM estimate for a custom DIFFUSERS_MODEL that
 #                              is not in the catalog (default 8).
 DIFFUSERS_ALLOWED_MODELS = os.environ.get("DIFFUSERS_ALLOWED_MODELS")
@@ -132,6 +136,14 @@ def _env_float(name: str, default: float) -> float:
 
 
 DIFFUSERS_WARM_WAIT_SECONDS = _env_float("DIFFUSERS_WARM_WAIT_SECONDS", 15.0)
+# A freshly loaded model is kept at least this long unless its requester has
+# used it; and a failed load is not retried for this long (both seconds).
+DIFFUSERS_MIN_RESIDENCY_SECONDS = _env_float("DIFFUSERS_MIN_RESIDENCY_SECONDS", 120.0)
+DIFFUSERS_FAILURE_BACKOFF_SECONDS = _env_float("DIFFUSERS_FAILURE_BACKOFF_SECONDS", 30.0)
+# Free disk that must remain AFTER a model's download (replaces the 2 GiB
+# default margin of model_preflight for image models). The node's disk is shared
+# with every other service's weights, so leave real headroom.
+DIFFUSERS_MIN_FREE_DISK_GB = _env_float("DIFFUSERS_MIN_FREE_DISK_GB", 20.0)
 DIFFUSERS_DEFAULT_VRAM_GB = _env_float("DIFFUSERS_DEFAULT_VRAM_GB", 8.0)
 ALLOWED_IMAGE_MODELS = image_models.parse_allowlist(
     DIFFUSERS_ALLOWED_MODELS, DIFFUSERS_MODEL, custom_vram_gb=DIFFUSERS_DEFAULT_VRAM_GB
@@ -205,25 +217,18 @@ def _quantization_config(variant, dtype, components):
     return None
 
 
-def _load_pipeline(spec, variant):
-    """Downloads (after the per-model free-space preflight) and builds the
-    pipeline for ``spec`` using ``variant``. Returns (pipe, device). Called on
-    the swap manager's load thread, never on a request thread."""
-    import diffusers
-
-    device, dtype = _resolve_device_and_dtype(spec)
-    if device == "cpu" and (variant.quant != image_models.QUANT_NONE or variant.offload != "none"):
-        raise RuntimeError(
-            f"{spec.model_id} needs a GPU for its {variant.label()} load variant; none is visible"
-        )
-
+def _prepare_pipeline(spec, variant):
+    """Disk side of a load: the free-space preflight and the weight download.
+    Runs on the swap manager's load thread BEFORE the resident model is
+    evicted, so a long or failed download never leaves the node without a
+    model."""
     # citadel #902: free-space preflight + file-selection guard, mirroring
-    # #840's Go-side MODEL_CACHE_PULL fix. Now per model (citadel-cli#1335):
-    # the catalog declares each repo's allow/ignore patterns so the size
-    # estimate is reliable and a confirmed shortfall fails CLOSED before any
-    # multi-GB download starts. run_preflight fails OPEN on a metadata or
-    # disk-probe error and only warns on the unfiltered default path; see its
-    # docstring for the full contract.
+    # #840's Go-side MODEL_CACHE_PULL fix. Per model (citadel-cli#1335): every
+    # catalog entry declares allow patterns, so the size estimate is reliable
+    # and a confirmed shortfall fails CLOSED before any download starts (a
+    # custom operator-supplied model has no patterns and keeps the old
+    # warn-only behavior). Files already in the cache are netted out, and
+    # DIFFUSERS_MIN_FREE_DISK_GB must remain free afterwards.
     allow_patterns, ignore_patterns = _patterns_for(spec)
     hf_token = model_preflight.hf_auth_token()
     model_preflight.run_preflight(
@@ -232,6 +237,9 @@ def _load_pipeline(spec, variant):
         allow_patterns=allow_patterns,
         ignore_patterns=ignore_patterns,
         token=hf_token,
+        margin_bytes=int(DIFFUSERS_MIN_FREE_DISK_GB * 1024**3),
+        fail_closed=spec.allow_patterns is not None,
+        is_cached_fn=model_preflight.default_is_cached,
     )
     # from_pretrained ignores allow/ignore kwargs (it derives its own list from
     # model_index.json), so a filtered pull is pre-populated into the shared
@@ -243,6 +251,19 @@ def _load_pipeline(spec, variant):
         ignore_patterns=ignore_patterns,
         token=hf_token,
     )
+
+
+def _load_pipeline(spec, variant):
+    """Builds the pipeline for ``spec`` using ``variant`` from the already
+    prefetched cache. Returns (pipe, device). Called on the swap manager's load
+    thread, never on a request thread, after the previous model was unloaded."""
+    import diffusers
+
+    device, dtype = _resolve_device_and_dtype(spec)
+    if device == "cpu" and (variant.quant != image_models.QUANT_NONE or variant.offload != "none"):
+        raise RuntimeError(
+            f"{spec.model_id} needs a GPU for its {variant.label()} load variant; none is visible"
+        )
 
     pipeline_cls = getattr(diffusers, spec.pipeline_class) if spec.pipeline_class else diffusers.AutoPipelineForText2Image
     kwargs = {"torch_dtype": dtype}
@@ -293,10 +314,17 @@ def _cuda_free_bytes():
     return None
 
 
+# One uvicorn worker (see the Dockerfile CMD) is load-bearing: this manager and
+# the pipeline it guards live in this process, so a single worker is what
+# enforces "one image model on the GPU at a time" and serializes generation.
+# Running several workers would each load their own model and break both.
 _manager = ImageModelManager(
     ALLOWED_IMAGE_MODELS,
     DIFFUSERS_MODEL,
     loader=lambda spec, variant: _load_pipeline(spec, variant),
+    prepare=lambda spec, variant: _prepare_pipeline(spec, variant),
+    min_residency_seconds=DIFFUSERS_MIN_RESIDENCY_SECONDS,
+    failure_backoff_seconds=DIFFUSERS_FAILURE_BACKOFF_SECONDS,
     unloader=lambda pipe: _unload_pipeline(pipe),
     free_memory=lambda: _free_cuda_memory(),
     free_vram_bytes=lambda: _cuda_free_bytes(),
@@ -637,8 +665,9 @@ def generate(req: GenerateRequest):
             status_code=503,
         )
     except Exception as exc:  # model load failure (OOM, bad repo id, auth)
-        raise HTTPException(500, f"failed to load model {spec.model_id}: {exc}")
+        raise HTTPException(500, f"failed to load model {spec.model_id}: {exc}") from None
 
+    result = None
     try:
         generator = None
         if req.seed is not None:
@@ -650,13 +679,17 @@ def generate(req: GenerateRequest):
         try:
             result = pipe(**_filter_call_kwargs(pipe, call_kwargs))
         except Exception as exc:  # inference failure (OOM at generate time, etc.)
-            raise HTTPException(500, f"generation failed: {exc}")
+            raise HTTPException(500, f"generation failed: {exc}") from None
 
         image = result.images[0]
         buf = io.BytesIO()
         image.save(buf, format="PNG")
         image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     finally:
+        # Drop this frame's references to the pipeline before giving the lease
+        # back, so a swap that starts the instant the lease is released is not
+        # holding the old weights alive through this stack frame.
+        del pipe, result
         _release_pipe()
 
     return {

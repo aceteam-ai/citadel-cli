@@ -119,13 +119,13 @@ def test_generate_image_returns_base64_png(client, monkeypatch):
     assert base64.b64decode(body["image_base64"]) == b"fake-png-bytes"
     assert body["model"] == app.DIFFUSERS_MODEL
     assert body["device"] == "cpu"
-    assert body["width"] == 512 and body["height"] == 512
+    assert body["width"] == 1024 and body["height"] == 1024  # FLUX.2-klein default size
     assert body["seed"] is None
 
     call = fake_pipe.calls[0]
     assert call["prompt"] == "a cat"
-    assert call["num_inference_steps"] == 4  # sdxl-turbo default
-    assert call["guidance_scale"] == 0.0  # turbo default
+    assert call["num_inference_steps"] == 4  # FLUX.2-klein (distilled) default
+    assert call["guidance_scale"] == 1.0  # FLUX.2-klein default
 
 
 def test_generate_image_load_failure_is_500(client, monkeypatch):
@@ -389,15 +389,22 @@ def swap(monkeypatch):
         return pipe, "cuda"
 
     mgr = ImageModelManager(
-        app.ALLOWED_IMAGE_MODELS,
+        image_models.parse_allowlist(" ".join(image_models.CATALOG), app.DIFFUSERS_MODEL),
         app.DIFFUSERS_MODEL,
         loader=loader,
+        min_residency_seconds=0.0,
         unloader=lambda pipe: state.unloaded.append(pipe.name),
         vram_budget_gb=24.0,
         warm_wait_seconds=0.0,
         retry_after_seconds=3,
     )
     monkeypatch.setattr(app, "_manager", mgr)
+    # The default allowlist excludes sdxl-turbo; these tests exercise it too.
+    monkeypatch.setattr(
+        app,
+        "ALLOWED_IMAGE_MODELS",
+        image_models.parse_allowlist(" ".join(image_models.CATALOG), app.DIFFUSERS_MODEL),
+    )
     state.mgr = mgr
     return state
 
@@ -586,7 +593,8 @@ def test_health_lists_allowlist_loaded_model_and_warm_vs_cold(client, swap):
     assert body["loaded_model"] is None and body["model_loaded"] is False
     assert {m["state"] for m in body["image_models"]} == {"cold"}
     by_id = {m["model"]: m for m in body["image_models"]}
-    assert by_id[SDXL]["default"] is True
+    assert by_id[app.DIFFUSERS_MODEL]["default"] is True
+    assert by_id[SDXL]["default"] is False
     assert by_id[FLUX]["license"] == "apache-2.0"
     assert body["vram_budget_gb"] == 24.0
 
@@ -607,3 +615,32 @@ def test_health_still_reports_the_video_pipeline_independently(client, swap, mon
     monkeypatch.setattr(app, "_video_device", "cuda")
     body = client.get("/health").json()
     assert body["video_model_loaded"] is True and body["model_loaded"] is False
+
+
+def test_default_model_is_the_permissive_flux2_klein():
+    assert app.DIFFUSERS_MODEL == FLUX
+    assert image_models.CATALOG[FLUX].permissive
+
+
+def test_prepare_pipeline_fails_closed_for_catalog_models_with_a_disk_floor(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(app.model_preflight, "run_preflight", lambda repo, cache, **kw: seen.update(repo=repo, **kw))
+    monkeypatch.setattr(app.model_preflight, "prefetch_filtered_weights", lambda repo, **kw: seen.update(prefetch=kw))
+    for model in (FLUX, ZIMG, QWEN, SDXL):
+        seen.clear()
+        spec = image_models.CATALOG[model]
+        app._prepare_pipeline(spec, spec.variants[0])
+        assert seen["fail_closed"] is True, model
+        assert seen["margin_bytes"] == 20 * 1024**3, model
+        assert seen["allow_patterns"], model
+        assert seen["prefetch"]["allow_patterns"] == seen["allow_patterns"], model
+        assert seen["is_cached_fn"] is not None
+
+
+def test_prepare_pipeline_keeps_warn_only_for_custom_models(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(app.model_preflight, "run_preflight", lambda repo, cache, **kw: seen.update(kw))
+    monkeypatch.setattr(app.model_preflight, "prefetch_filtered_weights", lambda repo, **kw: None)
+    spec = image_models.custom_spec("some/custom-model", 8)
+    app._prepare_pipeline(spec, spec.variants[0])
+    assert seen["fail_closed"] is False
