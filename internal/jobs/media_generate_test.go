@@ -431,3 +431,86 @@ func TestMediaGenerate_WaitForReady_DoesNotGateOnModelLoaded(t *testing.T) {
 		t.Fatalf("waitForReady took %v, want near-immediate return on a reachable 200 regardless of model_loaded", elapsed)
 	}
 }
+
+// TestMediaGenerate_ModelWarmingIsRetryableSuccess pins citadel-cli#1335: the
+// sidecar answers a cold image-model load with 503 + a typed model_warming
+// body. That must reach the caller as the job OUTPUT (so it retries), not as an
+// error.
+func TestMediaGenerate_ModelWarmingIsRetryableSuccess(t *testing.T) {
+	warming := `{"status":"model_warming","model":"Tongyi-MAI/Z-Image-Turbo","eta_seconds":120,"retry_after":5,"reason":"loading"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			stubHealth(w)
+			return
+		}
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(warming))
+	}))
+	defer srv.Close()
+
+	h := NewMediaGenerateHandler()
+	h.ServiceURL = srv.URL
+
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "m-warm",
+		Type: "MEDIA_GENERATE",
+		Payload: map[string]string{
+			"task":   "text-to-image",
+			"prompt": "a cat",
+			"model":  "Tongyi-MAI/Z-Image-Turbo",
+		},
+	})
+	if err != nil {
+		t.Fatalf("model_warming must not be an error, got: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	if got["status"] != "model_warming" || got["model"] != "Tongyi-MAI/Z-Image-Turbo" {
+		t.Errorf("unexpected warming output: %s", out)
+	}
+	if got["retry_after"] != float64(5) {
+		t.Errorf("retry_after not preserved: %s", out)
+	}
+	if _, hasContent := got["content"]; hasContent {
+		t.Errorf("warming output must not carry media content: %s", out)
+	}
+}
+
+// Only model_warming is softened: other 503s (insufficient_vram) and a
+// non-allowlisted model (400) stay failures.
+func TestMediaGenerate_OtherSidecarRefusalsStayErrors(t *testing.T) {
+	cases := map[string]struct {
+		status int
+		body   string
+	}{
+		"insufficient_vram": {http.StatusServiceUnavailable, `{"status":"insufficient_vram","model":"Qwen/Qwen-Image"}`},
+		"not_allowed":       {http.StatusBadRequest, `{"error":"model_not_allowed","detail":"model \"x\" is not allowed"}`},
+		"unparseable_503":   {http.StatusServiceUnavailable, `upstream down`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					stubHealth(w)
+					return
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			h := NewMediaGenerateHandler()
+			h.ServiceURL = srv.URL
+			_, err := h.Execute(JobContext{}, &nexus.Job{
+				ID:      "m-refuse",
+				Type:    "MEDIA_GENERATE",
+				Payload: map[string]string{"task": "text-to-image", "prompt": "a cat", "model": "x"},
+			})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
+}

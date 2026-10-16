@@ -2031,6 +2031,22 @@ shaped like:
 The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
 single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
 
+### Diffusers sidecar: per-request model selection (citadel-cli#1335)
+
+`services/diffusers-service` serves one image model on the GPU at a time and
+swaps on demand. `image_models.CATALOG` owns which models may be served (and
+their licence, pipeline class, and load variants); `image_models.choose_variant`
+owns which variant fits `DIFFUSERS_VRAM_BUDGET_GB`; `image_swap.ImageModelManager`
+owns residency, the drain-then-unload swap, and the warming contract. A request's
+optional `model` must be allowlisted (400 otherwise). A cold or swapping model
+answers HTTP 503 with a typed `model_warming` body, and
+`internal/jobs/media_generate.go` passes that body through as the job output
+(not an error) so the caller retries. Other 503s (`insufficient_vram`) and 4xx
+stay failures. The VRAM figures in the catalog are estimates; `/health`
+`last_load.measured_vram_gb` records the real delta on each load. Pinned image
+stack and its rationale live in `requirements.txt`; the compose env passthrough
+is covered by `KnownComposeHashes`.
+
 ### Meeting media stack — virtual mic / bot speaking path (aceteam#7079)
 
 The `meeting-service` module (`services/meeting-service/`) is a headed Chromium +

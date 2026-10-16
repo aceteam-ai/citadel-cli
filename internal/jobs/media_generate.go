@@ -139,6 +139,9 @@ type diffusersVideoResponse struct {
 //   - prompt:                required.
 //   - model:                 optional; empty omits the field so the sidecar's
 //     own configured default (DIFFUSERS_MODEL/DIFFUSERS_VIDEO_MODEL) applies.
+//     For text-to-image the sidecar validates it against its allowlist (a
+//     non-allowlisted id is a 400, surfaced as a failure) and swaps the model
+//     in on demand; a cold load returns the typed model_warming object below.
 //   - negative_prompt:       optional.
 //   - width / height:        optional numeric strings; empty/invalid omits the
 //     field so the sidecar's own pydantic default applies -- never sent as 0.
@@ -157,6 +160,11 @@ type diffusersVideoResponse struct {
 //	  "model":    "<model used>",     // from the sidecar response
 //	  "receipt":  { ... }             // best-effort advisory metering fields
 //	}
+//
+// While the requested image model is still loading, the output is instead the
+// sidecar's retryable warming object (no "encoding"/"content"):
+//
+//	{"status": "model_warming", "model": "...", "eta_seconds": N, "retry_after": N, "reason": "..."}
 func (h *MediaGenerateHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	task := job.Payload["task"]
 	prompt := job.Payload["prompt"]
@@ -210,6 +218,15 @@ func (h *MediaGenerateHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+	// A cold or swapping image model answers 503 with a typed model_warming
+	// body (citadel-cli#1335). That is not a failure: pass the sidecar's
+	// {status, model, eta_seconds, retry_after, reason} object through as the
+	// job output, the same typed signal llm_inference returns for a loading
+	// engine, so the caller retries instead of surfacing an error.
+	if resp.StatusCode == http.StatusServiceUnavailable && isModelWarmingBody(body) {
+		ctx.Log("info", "     - [Job %s] diffusers model is warming; returning retryable model_warming", job.ID)
+		return body, nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		// On error the body is a JSON error, not media; surface it verbatim.
 		return body, fmt.Errorf("diffusers service returned non-200 status: %s: %s", resp.Status, string(body))
@@ -263,6 +280,20 @@ func (h *MediaGenerateHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 		"receipt":  receipt,
 	}
 	return json.Marshal(result)
+}
+
+// isModelWarmingBody reports whether a sidecar response body is the typed
+// model_warming object (status == "model_warming"). Anything else, including
+// unparseable bodies and the sidecar's other 503 (insufficient_vram), is left
+// to the ordinary error path.
+func isModelWarmingBody(body []byte) bool {
+	var probe struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return false
+	}
+	return probe.Status == "model_warming"
 }
 
 // buildMediaGenerateRequest translates job payload strings into the diffusers
