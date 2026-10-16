@@ -51,6 +51,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build once into the local daemon and smoke-test BEFORE anything is pushed.
+      # What this can and cannot catch: triton only compiles its CUDA driver stub
+      # when a GPU driver initializes, so a GPU-less runner cannot reproduce the
+      # exact "Failed to find C compiler" failure seen in GPU acceptance on node
+      # 1795. It CAN catch the cause: a missing compiler or libc/Python headers
+      # (compiling a C file against Python.h with CC unset), and a broken import
+      # of bitsandbytes / diffusers / the pipeline classes. The sidecar's /health
+      # `self_test` repeats the import check at boot on the real node.
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: services/diffusers-service
+          file: services/diffusers-service/Dockerfile
+          push: false
+          load: true
+          tags: diffusers-service:ci
+          cache-from: type=gha
+
+      - name: Smoke test (imports, C compiler, CC unset)
+        run: |
+          docker run --rm --entrypoint sh diffusers-service:ci -c '
+            set -e
+            unset CC
+            command -v cc || command -v gcc
+            printf "#include <Python.h>\nint main(void){return 0;}\n" > /tmp/t.c
+            cc /tmp/t.c -I"$(python -c "import sysconfig;print(sysconfig.get_paths()[\"include\"])")" -o /tmp/t
+            python -c "import bitsandbytes, diffusers; from diffusers import AutoPipelineForText2Image, Flux2KleinPipeline, ZImagePipeline, QwenImagePipeline, WanPipeline, AutoencoderKLWan, PipelineQuantizationConfig; print(\"imports ok\")"
+          '
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:

@@ -691,3 +691,44 @@ def test_resident_protected_response_names_the_resident_model(client, monkeypatc
     assert body["reason"] == "resident_protected"
     assert body["resident_model"] == FLUX
     assert "loading_model" not in body
+
+
+def test_self_test_reports_ok_and_error_in_health(client, monkeypatch):
+    monkeypatch.setattr(app, "_self_test", {"status": "pending", "detail": None})
+    assert client.get("/health").json()["self_test"] == "pending"
+
+    app._run_self_test(lambda: None)
+    body = client.get("/health").json()
+    assert body["self_test"] == "ok" and body["self_test_detail"] is None
+
+    def _boom():
+        raise RuntimeError("Failed to find C compiler. Please specify via CC environment variable.")
+
+    app._run_self_test(_boom)
+    body = client.get("/health").json()
+    assert body["self_test"] == "error"
+    assert "Failed to find C compiler" in body["self_test_detail"]
+    assert body["status"] == "ok"  # liveness is unchanged; the failure is reported, not hidden
+
+
+def test_self_test_catches_systemexit_from_a_broken_extension(monkeypatch):
+    monkeypatch.setattr(app, "_self_test", {"status": "pending", "detail": None})
+
+    def _exit():
+        raise SystemExit(1)
+
+    app._run_self_test(_exit)
+    assert app._self_test["status"] == "error"
+
+
+def test_self_test_flags_missing_pipeline_classes(monkeypatch):
+    import sys
+    import types
+
+    fake = types.ModuleType("diffusers")  # has none of the pipeline classes
+    monkeypatch.setitem(sys.modules, "diffusers", fake)
+    monkeypatch.setitem(sys.modules, "bitsandbytes", types.ModuleType("bitsandbytes"))
+    monkeypatch.setattr(app, "_self_test", {"status": "pending", "detail": None})
+    app._run_self_test()
+    assert app._self_test["status"] == "error"
+    assert "WanPipeline" in app._self_test["detail"]

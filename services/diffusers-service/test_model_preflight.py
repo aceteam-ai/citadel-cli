@@ -567,3 +567,60 @@ def test_already_cached_files_are_netted_out_of_the_estimate():
         is_cached_fn=lambda repo, path, rev: path.startswith("transformer/"),
     )
     assert size == 8 * GIB
+
+
+def test_free_disk_floor_does_not_apply_to_a_fully_cached_model():
+    spec = image_models.CATALOG["stabilityai/sdxl-turbo"]
+    kw = dict(
+        allow_patterns=list(spec.allow_patterns),
+        ignore_patterns=list(spec.ignore_patterns),
+        list_repo_files_fn=_fake_repo(spec),
+        margin_bytes=20 * GIB,
+        fail_closed=True,
+    )
+    # Disk nearly full (3 GB free) and nothing cached: refused.
+    with pytest.raises(mp.InsufficientDiskSpaceError):
+        mp.run_preflight("stabilityai/sdxl-turbo", "/x", available_disk_bytes_fn=lambda _p: 3 * GIB, **kw)
+    # Same disk, every selected file cached: loads regardless of free disk.
+    def probe(_p):
+        raise AssertionError("disk must not even be probed when nothing is left to download")
+
+    mp.run_preflight(
+        "stabilityai/sdxl-turbo", "/x", available_disk_bytes_fn=probe, is_cached_fn=lambda r, p, v: True, **kw
+    )
+
+
+def test_floor_applies_only_to_the_bytes_still_to_download():
+    files = [
+        mp.RepoFileInfo("transformer/a.safetensors", 30 * GIB, True),
+        mp.RepoFileInfo("text_encoder/b.safetensors", 3 * GIB, True),
+    ]
+    common = dict(
+        list_repo_files_fn=lambda *a, **k: files,
+        margin_bytes=20 * GIB,
+        fail_closed=True,
+        is_cached_fn=lambda r, p, v: p.startswith("transformer/"),  # only 3 GB left
+    )
+    with pytest.raises(mp.InsufficientDiskSpaceError):  # 3 GB + 20 GiB floor > 15 GB free
+        mp.run_preflight("x/y", "/x", available_disk_bytes_fn=lambda _p: 15 * GIB, **common)
+    mp.run_preflight("x/y", "/x", available_disk_bytes_fn=lambda _p: 25 * GIB, **common)
+
+
+def test_realistic_floor_refuses_zimage_download_but_cached_models_still_load():
+    """Node-like numbers: 40 GB free, 20 GB floor. Z-Image-Turbo (33 GB, not
+    cached) is refused; sdxl-turbo and FLUX.2-klein, fully cached, load."""
+    free = lambda _p: 40 * GIB  # noqa: E731
+    zi = image_models.CATALOG["Tongyi-MAI/Z-Image-Turbo"]
+    common = dict(margin_bytes=20 * GIB, fail_closed=True, available_disk_bytes_fn=free)
+    with pytest.raises(mp.InsufficientDiskSpaceError):
+        mp.run_preflight(
+            zi.model_id, "/x", allow_patterns=list(zi.allow_patterns),
+            list_repo_files_fn=_fake_repo(zi), is_cached_fn=lambda r, p, v: False, **common,
+        )
+    for model_id in ("stabilityai/sdxl-turbo", "black-forest-labs/FLUX.2-klein-4B"):
+        spec = image_models.CATALOG[model_id]
+        mp.run_preflight(
+            model_id, "/x", allow_patterns=list(spec.allow_patterns),
+            ignore_patterns=list(spec.ignore_patterns or ()),
+            list_repo_files_fn=_fake_repo(spec), is_cached_fn=lambda r, p, v: True, **common,
+        )

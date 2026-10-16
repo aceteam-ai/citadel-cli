@@ -18,6 +18,16 @@ WORKDIR /app
 
 # torch is already provided by the base image; requirements.txt intentionally
 # omits it so we don't pull a second (possibly CPU-only) torch wheel on top.
+# A C compiler is REQUIRED at runtime on a GPU node: bitsandbytes (imported by
+# diffusers) pulls in triton, whose CUDA driver compiles a small C stub the first
+# time the driver initializes and fails with "Failed to find C compiler" without
+# one. That only happens with a GPU, so a CPU-only import test cannot catch it.
+# gcc + libc6-dev is the minimal fix (the -devel base image is several GB larger).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=gcc
+
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 

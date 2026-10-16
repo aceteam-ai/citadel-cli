@@ -442,6 +442,13 @@ def run_preflight(
         )
         return
 
+    if required_bytes <= 0:
+        # Nothing left to download (every selected file is already cached): the
+        # free-disk floor protects the disk from a download, so it does not
+        # apply. A fully cached model must load regardless of free disk.
+        logger.info("diffusers preflight: %s is fully cached, nothing to download", repo_id)
+        return
+
     try:
         available_bytes = available_disk_bytes_fn(cache_dir)
     except Exception as exc:  # noqa: BLE001 -- same fail-open reasoning

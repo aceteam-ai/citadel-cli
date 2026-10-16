@@ -535,6 +535,40 @@ class GenerateVideoRequest(BaseModel):
     seed: int | None = None
 
 
+# Boot-time import self-test (found by GPU acceptance on node 1795: a missing C
+# compiler made every pipeline import fail at request time, long after the image
+# built). Imports bitsandbytes and every pipeline class the catalog and the video
+# path use, in the background so /health still answers immediately, and reports
+# the result in /health as self_test ok | error | pending.
+_self_test = {"status": "pending", "detail": None}
+
+
+def _self_test_imports():
+    import bitsandbytes  # noqa: F401 - triton/compiler problems surface here
+    import diffusers
+
+    names = {"AutoPipelineForText2Image", "WanPipeline", "AutoencoderKLWan", "PipelineQuantizationConfig"}
+    names |= {m.pipeline_class for m in ALLOWED_IMAGE_MODELS.values() if m.pipeline_class}
+    missing = sorted(n for n in names if getattr(diffusers, n, None) is None)
+    if missing:
+        raise ImportError(f"diffusers is missing: {', '.join(missing)}")
+
+
+def _run_self_test(imports=None):
+    global _self_test
+    try:
+        (imports or _self_test_imports)()
+    except BaseException as exc:  # noqa: BLE001 - any failure, including SystemExit from a C extension
+        _self_test = {"status": "error", "detail": f"{type(exc).__name__}: {exc}"[:1000]}
+    else:
+        _self_test = {"status": "ok", "detail": None}
+
+
+@app.on_event("startup")
+def _start_self_test():
+    threading.Thread(target=_run_self_test, name="diffusers-self-test", daemon=True).start()
+
+
 @app.get("/health")
 def health():
     """Liveness/readiness probe.
@@ -552,6 +586,8 @@ def health():
     image = _manager.status()
     return {
         "status": "ok",
+        "self_test": _self_test["status"],
+        "self_test_detail": _self_test["detail"],
         "model": DIFFUSERS_MODEL,
         "model_loaded": image["loaded_model"] is not None,
         "device": _manager.resident_device(),
