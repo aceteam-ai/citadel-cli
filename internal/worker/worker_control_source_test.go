@@ -3,7 +3,8 @@ package worker
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"github.com/google/uuid"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -12,12 +13,13 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol/controltest"
 )
 
 func controlMetadata() *redisapi.WorkerConfigResponse {
-	return &redisapi.WorkerConfigResponse{OrgID: "example", WorkerControl: &redisapi.WorkerControlConfig{
-		Protocol: WorkerControlProtocol, Queue: workerControlQueue("example", "758"), Group: WorkerControlProtocol,
-	}}
+	c := redisapi.WorkerControlConfig(controltest.Load().Config())
+	return &redisapi.WorkerConfigResponse{OrgID: fixtureOrg, WorkerControl: &c}
 }
 
 func TestWorkerControlMetadataRequiresMatchingLocalIdentity(t *testing.T) {
@@ -33,7 +35,7 @@ func TestWorkerControlMetadataRequiresMatchingLocalIdentity(t *testing.T) {
 		{"wrong org", func(_ **redisapi.WorkerConfigResponse, _, org, _ *string) { *org = "other" }},
 		{"wrong node", func(_ **redisapi.WorkerConfigResponse, _, _, node *string) { *node = "759" }},
 		{"wrong protocol", func(c **redisapi.WorkerConfigResponse, _, _, _ *string) {
-			(*c).WorkerControl.Protocol = "worker-control-v2"
+			(*c).WorkerControl.Protocol = "worker-control-v1"
 		}},
 		{"wrong group", func(c **redisapi.WorkerConfigResponse, _, _, _ *string) { (*c).WorkerControl.Group = "citadel-workers" }},
 		{"old shell queue", func(c **redisapi.WorkerConfigResponse, _, _, _ *string) {
@@ -43,15 +45,15 @@ func TestWorkerControlMetadataRequiresMatchingLocalIdentity(t *testing.T) {
 			(*c).WorkerControl.Queue = workerControlQueue("other", "758")
 		}},
 		{"wrong queue node", func(c **redisapi.WorkerConfigResponse, _, _, _ *string) {
-			(*c).WorkerControl.Queue = workerControlQueue("example", "759")
+			(*c).WorkerControl.Queue = workerControlQueue(fixtureOrg, "759")
 		}},
 	}
-	if !validateWorkerControl(controlMetadata(), "test-device-token", "example", "758") {
-		t.Fatal("matching server metadata should opt in")
+	if !validateWorkerControl(controlMetadata(), "test-device-token", fixtureOrg, "758") {
+		t.Fatal("matching complete authenticated metadata must enable the v2 source")
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, token, org, node := controlMetadata(), "test-device-token", "example", "758"
+			cfg, token, org, node := controlMetadata(), "test-device-token", fixtureOrg, "758"
 			tc.edit(&cfg, &token, &org, &node)
 			if validateWorkerControl(cfg, token, org, node) {
 				t.Fatal("unsafe opt-in")
@@ -68,7 +70,7 @@ func TestWorkerControlRefusesUnauthenticatedDeliveryAndResults(t *testing.T) {
 	}{
 		{"direct redis", func(j *Job) { j.Source = "redis" }, nil},
 		{"legacy api", func(j *Job) { j.control = nil }, nil},
-		{"wrong queue", func(j *Job) { j.SourceQueue = workerControlQueue("example", "759") }, nil},
+		{"wrong queue", func(j *Job) { j.SourceQueue = workerControlQueue(fixtureOrg, "759") }, nil},
 		{"wrong org", func(j *Job) { j.SourceQueue = workerControlQueue("other", "758") }, nil},
 		{"old shell queue", func(j *Job) { j.SourceQueue = "jobs:v1:shell:org_example:node:758" }, nil},
 		{"wrong group", func(j *Job) { j.control.group = "citadel-workers" }, nil},
@@ -93,7 +95,7 @@ func TestWorkerControlRefusesUnauthenticatedDeliveryAndResults(t *testing.T) {
 			if tc.writer != nil {
 				writer = tc.writer(job)
 			}
-			h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { t.Fatal("reached service management"); return true }})
+			h := NewWorkerControlHandler(WorkerControlConfig{OrgID: fixtureOrg, NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { t.Fatal("reached service management"); return true }})
 			source := &controlSource{MockJobSource: NewMockJobSource("redis-api", nil), events: &events}
 			runner := NewRunner(source, []JobHandler{h}, RunnerConfig{})
 			runner.WithStreamWriterFactory(func(*Job) StreamWriter { return writer })
@@ -112,7 +114,7 @@ func TestWorkerControlRefusesUnauthenticatedDeliveryAndResults(t *testing.T) {
 
 func TestWorkerControlQueueCannotBeSubscribedByLegacySources(t *testing.T) {
 	ctx := context.Background()
-	queue := workerControlQueue("example", "758")
+	queue := workerControlQueue(fixtureOrg, "758")
 	for _, group := range []string{"citadel-workers", WorkerControlProtocol} {
 		api := NewAPISource(APISourceConfig{QueueName: queue, ConsumerGroup: group, Token: "test-token"})
 		if err := api.Connect(ctx); err == nil {
@@ -133,75 +135,115 @@ func TestWorkerControlQueueCannotBeSubscribedByLegacySources(t *testing.T) {
 	}
 }
 
-func TestWorkerControlAuthenticatedRESTContractAndOutcomeOrder(t *testing.T) {
-	const jobID = "55d962d8-52a0-4910-b40b-534a14a6f417"
+func TestWorkerControlV1OptOutPreservesOrdinaryJobsAndHealth(t *testing.T) {
+	const ordinaryJob = "ordinary-job"
 	var mu sync.Mutex
-	events := []string{}
-	record := func(event string) { mu.Lock(); events = append(events, event); mu.Unlock() }
+	calls := map[string]int{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer test-device-token" {
-			t.Error("missing device authentication")
-			w.WriteHeader(401)
+		if r.Header.Get("Authorization") != "Bearer synthetic-token" {
+			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		calls[r.URL.Path]++
+		mu.Unlock()
 		switch r.URL.Path {
 		case "/api/fabric/redis/ping":
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		case "/api/fabric/worker-config":
-			_ = json.NewEncoder(w).Encode(controlMetadata())
+			metadata := controlMetadata()
+			metadata.WorkerControl.Protocol = "worker-control-v1"
+			_ = json.NewEncoder(w).Encode(metadata)
 		case "/api/fabric/redis/jobs/consume":
-			var req redisapi.ConsumeRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Error(err)
+			var request redisapi.ConsumeRequest
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			if request.Queue != DefaultCPUQueue || request.Group != "ordinary-workers" {
+				t.Errorf("unsafe consumption: %+v", request)
+				w.WriteHeader(http.StatusForbidden)
+				return
 			}
-			if req.Queue != workerControlQueue("example", "758") || req.Group != WorkerControlProtocol {
-				t.Errorf("consume=%+v", req)
-			}
-			_ = json.NewEncoder(w).Encode(redisapi.ConsumeResponse{Messages: []redisapi.StreamMessage{{ID: "1-0", Data: redisapi.StreamMessageData{JobID: jobID, Type: JobTypeWorkerControl, Payload: `{"action":"restart","target_node":"758"}`}}}})
-		case "/api/fabric/redis/jobs/acknowledge":
-			var req redisapi.AcknowledgeRequest
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			if req.Queue != workerControlQueue("example", "758") || req.Group != WorkerControlProtocol || req.MessageID != "1-0" {
-				t.Errorf("ack=%+v", req)
-			}
-			record("ack")
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-		case "/api/fabric/redis/pubsub/publish":
-			var req redisapi.PublishRequest
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			var event map[string]any
-			if err := json.Unmarshal([]byte(req.Message), &event); err != nil {
-				t.Error(err)
-			}
-			if req.Channel != "stream:v1:"+jobID || event["jobId"] != jobID {
-				t.Errorf("wrong exact ID: %+v %+v", req, event)
-			}
-			for _, key := range []string{"signature", "worker_control_signature", "control_signature"} {
-				if _, ok := event[key]; ok {
-					t.Errorf("fabricated server field %s", key)
-				}
-			}
-			record(event["type"].(string))
-			_, _ = w.Write([]byte(`{"published":true}`))
+			_ = json.NewEncoder(w).Encode(redisapi.ConsumeResponse{Messages: []redisapi.StreamMessage{{ID: "1-0", Data: redisapi.StreamMessageData{JobID: ordinaryJob, Type: "SHELL_COMMAND", Payload: `{"command":"true"}`}}}})
 		default:
-			t.Errorf("unexpected control side channel: %s", r.URL.Path)
-			w.WriteHeader(404)
+			t.Errorf("unexpected side channel: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer srv.Close()
 	ctx := context.Background()
-	api := NewAPISource(APISourceConfig{BaseURL: srv.URL, Token: "test-device-token", QueueName: DefaultCPUQueue, ConsumerGroup: "normal-jobs"})
+	api := NewAPISource(APISourceConfig{BaseURL: srv.URL, Token: "synthetic-token", QueueName: DefaultCPUQueue, ConsumerGroup: "ordinary-workers"})
 	if err := api.Connect(ctx); err != nil {
 		t.Fatal(err)
 	}
 	defer api.Close()
-	control, err := api.WorkerControlSource(ctx, "example", "758")
-	if err != nil || control == nil {
-		t.Fatalf("source=%v err=%v", control, err)
+	control, err := api.WorkerControlSource(ctx, fixtureOrg, "758")
+	if err != nil || control != nil {
+		t.Fatalf("v1 control source=%v err=%v", control, err)
 	}
-	if !reflect.DeepEqual(api.QueueNames(), []string{DefaultCPUQueue}) {
-		t.Fatal("control leaked into normal queue list")
+	job, err := api.Next(ctx)
+	if err != nil || job == nil || job.ID != ordinaryJob {
+		t.Fatalf("ordinary consumption broken: job=%v err=%v", job, err)
+	}
+	if err := api.Client().Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls["/api/fabric/redis/ping"] < 2 || calls["/api/fabric/worker-config"] != 1 {
+		t.Fatalf("ordinary health/config calls=%v", calls)
+	}
+}
+
+func TestWorkerControlAuthenticatedRESTContractAndOutcomeOrder(t *testing.T) {
+	f := controltest.Load()
+	f.Identity.AttemptID = uuid.NewString()
+	f.Identity.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
+	var mu sync.Mutex
+	events := []string{}
+	record := func(s string) { mu.Lock(); events = append(events, s); mu.Unlock() }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer synthetic-token" {
+			t.Error("missing device authentication")
+			w.WriteHeader(401)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/fabric/redis/ping":
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/api/fabric/worker-config":
+			c := redisapi.WorkerControlConfig(f.Config())
+			_ = json.NewEncoder(w).Encode(redisapi.WorkerConfigResponse{OrgID: fixtureOrg, WorkerControl: &c})
+		case "/api/fabric/redis/jobs/consume":
+			var req redisapi.ConsumeRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Queue != f.Identity.Queue || req.Group != WorkerControlProtocol {
+				t.Error("wrong queue/group")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"messages": []any{map[string]any{"id": f.Deliveries["A"].MessageID, "data": f.Data()}}})
+		case "/api/fabric/worker-control/operation":
+			raw, _ := io.ReadAll(r.Body)
+			var req workercontrol.Request
+			if workercontrol.Decode(raw, &req, 16384) != nil || req.Validate() != nil {
+				t.Error("invalid typed request")
+				w.WriteHeader(400)
+				return
+			}
+			record(req.Operation)
+			_ = json.NewEncoder(w).Encode(controltest.Accept(req, time.Now().UnixMilli()))
+		default:
+			t.Errorf("generic route used for control: %s", r.URL.Path)
+			w.WriteHeader(403)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	api := NewAPISource(APISourceConfig{BaseURL: srv.URL, Token: "synthetic-token", QueueName: DefaultCPUQueue})
+	if err := api.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer api.Close()
+	control, err := api.WorkerControlSource(ctx, fixtureOrg, "758")
+	if err != nil || control == nil {
+		t.Fatalf("control=%v err=%v", control, err)
 	}
 	if err := control.Connect(ctx); err != nil {
 		t.Fatal(err)
@@ -211,34 +253,64 @@ func TestWorkerControlAuthenticatedRESTContractAndOutcomeOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: func() (func(), func(), error) {
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: fixtureOrg, NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: func(valid func() bool) (func(), func(), error) {
 		record("schedule")
-		return func() { record("restart") }, func() {}, nil
+		return func() {
+			if !valid() {
+				t.Error("invalid permit")
+			}
+			record("restart")
+		}, func() { record("cancel") }, nil
 	}})
 	runner := NewRunner(control, []JobHandler{h}, RunnerConfig{NodeID: "758"})
 	factory := CreateAPIStreamWriterFactory(ctx, control)
 	runner.WithStreamWriterFactory(factory)
-	writer := factory(job)
-	if err := writer.WriteEnd(map[string]any{"accepted": true}); err == nil {
-		t.Fatal("terminal before claim accepted")
+	if factory(job).WriteEnd(map[string]any{"accepted": true}) == nil {
+		t.Fatal("completion before claim")
+	}
+	// The invalid completion irreversibly cancelled that pipeline. A replacement
+	// source must return the same cancelled Session, rather than reconstruct it.
+	if factory(job).WriteClaimed("cancelled") == nil {
+		t.Fatal("cancelled pipeline reopened")
+	}
+	// A distinct durable attempt exercises the positive transaction ordering.
+	f.Identity.AttemptID = uuid.NewString()
+	job, err = control.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 	proceed, stream, start := runner.claimJob(ctx, job)
 	if !proceed || !runner.executeJob(ctx, job, stream, start, false, 0) {
-		t.Fatal("authenticated restart failed")
+		t.Fatal("confirmed restart failed")
 	}
-	if err := stream.WriteClaimed("late"); err == nil {
+	if stream.WriteClaimed("late") == nil {
 		t.Fatal("late claim reopened terminal")
 	}
-	if err := stream.WriteError(errors.New("late error"), false); err == nil {
-		t.Fatal("late error replaced terminal")
-	}
-	if err := stream.WriteEnd(map[string]any{"accepted": false}); err == nil {
-		t.Fatal("conflicting duplicate end replaced terminal")
-	}
 	mu.Lock()
-	got := append([]string(nil), events...)
-	mu.Unlock()
-	if !reflect.DeepEqual(got, []string{"claimed", "ack", "schedule", "end", "restart"}) {
-		t.Fatalf("ordering=%v", got)
+	defer mu.Unlock()
+	if !reflect.DeepEqual(events, []string{"claim_and_ack", "schedule", "complete", "restart"}) {
+		t.Fatalf("ordering=%v", events)
+	}
+}
+
+func TestWorkerControlWSDeliveryAdapterPreservesTypedEnvelope(t *testing.T) {
+	f := controltest.Load()
+	f.Identity.AttemptID = uuid.NewString()
+	f.Identity.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
+	data := f.Data()
+	raw, _ := json.Marshal(data)
+	var fields map[string]string
+	_ = json.Unmarshal(raw, &fields)
+	client := redisapi.NewClient(redisapi.ClientConfig{Token: "synthetic-token"})
+	s := NewWSSource(WSSourceConfig{Client: client, QueueName: f.Identity.Queue, ConsumerGroup: WorkerControlProtocol})
+	s.control = &workerControlBinding{orgID: fixtureOrg, nodeID: "758", queue: f.Identity.Queue, group: WorkerControlProtocol, client: client, config: f.Config()}
+	msg := redisapi.WSMessage{Type: "job", Queue: f.Identity.Queue, ID: f.Deliveries["A"].MessageID, Data: fields}
+	job, err := s.convertWSJob(msg)
+	if err != nil || job.controlEnvelope == nil || job.controlEnvelope.Identity != f.Identity {
+		t.Fatalf("typed WS mapping err=%v", err)
+	}
+	msg.Data["extra"] = "forbidden"
+	if _, err := s.convertWSJob(msg); err == nil {
+		t.Fatal("unknown control data field accepted")
 	}
 }

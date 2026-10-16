@@ -149,9 +149,15 @@ var _ StreamWriter = (*APIStreamWriter)(nil)
 func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(job *Job) StreamWriter {
 	return func(job *Job) StreamWriter {
 		if source.control != nil {
-			return &workerControlStreamWriter{APIStreamWriter: NewAPIStreamWriter(ctx, source.Client(), job.ID, job.RayID)}
+			return &workerControlStreamWriter{APIStreamWriter: NewAPIStreamWriter(ctx, source.Client(), job.ID, job.RayID), session: job.controlSession}
 		}
 		return NewAPIStreamWriter(ctx, source.Client(), job.ID, job.RayID)
+	}
+}
+
+func CreateWorkerControlStreamWriterFactory(ctx context.Context, client *redisapi.Client) func(*Job) StreamWriter {
+	return func(job *Job) StreamWriter {
+		return &workerControlStreamWriter{APIStreamWriter: NewAPIStreamWriter(ctx, client, job.ID, job.RayID), session: job.controlSession}
 	}
 }
 

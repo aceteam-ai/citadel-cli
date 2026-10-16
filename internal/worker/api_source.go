@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
 )
 
 // APISource implements JobSource using the AceTeam Redis API proxy.
@@ -457,6 +458,11 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 		Source:      "redis-api",
 		MessageID:   aj.MessageID,
 	}
+	if s.control != nil && aj.Control != nil && s.control.config.Matches(aj.Control.Identity) {
+		e := *aj.Control
+		job.controlEnvelope = &e
+		job.controlSession = s.control.session(e)
+	}
 	// Extract rayId: check RawData first, then payload
 	if aj.RawData != nil {
 		if rayID, ok := aj.RawData["rayId"].(string); ok && rayID != "" {
@@ -473,6 +479,12 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 
 // Ack acknowledges successful job completion.
 func (s *APISource) Ack(ctx context.Context, job *Job) error {
+	if s.control != nil {
+		if !s.control.matches(job) || !job.controlSession.CanPrepare() {
+			return workercontrol.ErrDenied
+		}
+		return nil // claim_and_ack already confirmed the durable logical ACK.
+	}
 	if s.control == nil {
 		s.client.SetJobStatus(ctx, job.ID, "completed", nil)
 	}
@@ -617,7 +629,7 @@ func (s *APISource) AddQueue(queue string) {
 // IsJobCancelled checks whether a job has been cancelled by the producer.
 func (s *APISource) IsJobCancelled(ctx context.Context, jobID string) bool {
 	if s.control != nil {
-		return false // worker-control-v1 has claimed/end/error outcomes only.
+		return false // Control cancellation and status use the dedicated authority.
 	}
 	cancelled, err := s.client.IsJobCancelled(ctx, jobID)
 	if err != nil {

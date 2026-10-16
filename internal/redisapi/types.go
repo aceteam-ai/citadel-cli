@@ -7,7 +7,10 @@
 // All API calls require a device_api_token obtained during device authentication.
 package redisapi
 
-import "github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+import (
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
+)
 
 // ConsumeRequest is the request body for POST /api/fabric/redis/jobs/consume
 type ConsumeRequest struct {
@@ -31,11 +34,12 @@ type StreamMessage struct {
 
 // StreamMessageData contains the job data within a stream message
 type StreamMessageData struct {
-	JobID      string `json:"jobId"`
-	Type       string `json:"type"`    // Job type (e.g., "SHELL_COMMAND"), top-level stream field
-	Payload    string `json:"payload"` // JSON-encoded job payload
-	EnqueuedAt string `json:"enqueuedAt"`
-	RayID      string `json:"rayId"`
+	JobID         string `json:"jobId"`
+	Type          string `json:"type"`    // Job type (e.g., "SHELL_COMMAND"), top-level stream field
+	Payload       string `json:"payload"` // JSON-encoded job payload
+	EnqueuedAt    string `json:"enqueuedAt"`
+	RayID         string `json:"rayId"`
+	WorkerControl string `json:"worker_control,omitempty"`
 
 	observation *deliverymetadata.Observation `json:"-"`
 }
@@ -47,8 +51,9 @@ type Job struct {
 	Type      string         `json:"type"`
 	Payload   map[string]any `json:"payload"`
 	// RawPayload keeps the original stream bytes for request digests, not wire output.
-	RawPayload []byte         `json:"-"`
-	RawData    map[string]any `json:"raw_data,omitempty"`
+	RawPayload []byte                  `json:"-"`
+	RawData    map[string]any          `json:"raw_data,omitempty"`
+	Control    *workercontrol.Envelope `json:"-"`
 
 	observation *deliverymetadata.Observation `json:"-"`
 }
@@ -189,8 +194,4 @@ type WorkerConfigResponse struct {
 }
 
 // WorkerControlConfig is optional server-authored enrollment metadata.
-type WorkerControlConfig struct {
-	Protocol string `json:"protocol"`
-	Queue    string `json:"queue"`
-	Group    string `json:"group"`
-}
+type WorkerControlConfig workercontrol.Config
