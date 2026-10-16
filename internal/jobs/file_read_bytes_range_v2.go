@@ -38,6 +38,12 @@ func (h *FileReadBytesRangeV2Handler) openAuthorizedFile(validated string, roots
 	if h.AllowOutsideWorkspace {
 		return os.Open(validated)
 	}
+	// Compare target and root in resolved coordinates. The actual file open
+	// still goes through os.Root so a raced symlink cannot escape the root.
+	resolvedTarget, err := filepath.EvalSymlinks(validated)
+	if err != nil {
+		return nil, err
+	}
 	for _, rootPath := range append([]string{h.WorkspaceDir}, roots...) {
 		absolute, err := filepath.Abs(rootPath)
 		if err != nil {
@@ -47,7 +53,7 @@ func (h *FileReadBytesRangeV2Handler) openAuthorizedFile(validated string, roots
 		if err != nil {
 			continue
 		}
-		relative, err := filepath.Rel(resolved, validated)
+		relative, err := filepath.Rel(resolved, resolvedTarget)
 		if err != nil || !filepath.IsLocal(relative) {
 			continue
 		}

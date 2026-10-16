@@ -479,3 +479,113 @@ func TestConditionalRangeUnsupportedObservationAndAuthorizedRoots(t *testing.T) 
 		t.Fatal("raced symlink escaped root opener")
 	}
 }
+
+func TestConditionalRangeValidSymlinkRootSpellings(t *testing.T) {
+	for _, kind := range []string{"absolute symlink workspace", "absolute symlink authorized root", "absolute ancestor alias", "relative ordinary", "relative symlink workspace"} {
+		t.Run(kind, func(t *testing.T) {
+			base, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ws := filepath.Join(base, "workspace")
+			if err := os.Mkdir(ws, 0700); err != nil {
+				t.Fatal(err)
+			}
+			actual := writeTestFile(t, ws, "video", "ORIGINAL")
+			requested := actual
+			h := NewFileReadBytesRangeV2Handler(ws)
+			switch kind {
+			case "absolute symlink workspace", "relative symlink workspace":
+				alias := filepath.Join(base, "workspace-link")
+				if err := os.Symlink(ws, alias); err != nil {
+					t.Fatal(err)
+				}
+				h.WorkspaceDir = alias
+				requested = filepath.Join(alias, "video")
+				if kind == "relative symlink workspace" {
+					requested = "video"
+				}
+			case "absolute symlink authorized root":
+				root := filepath.Join(base, "authorized")
+				if err := os.Mkdir(root, 0700); err != nil {
+					t.Fatal(err)
+				}
+				actual = writeTestFile(t, root, "video", "ORIGINAL")
+				alias := filepath.Join(base, "authorized-link")
+				if err := os.Symlink(root, alias); err != nil {
+					t.Fatal(err)
+				}
+				h.AuthorizedRoots = func() []string { return []string{alias} }
+				requested = filepath.Join(alias, "video")
+			case "absolute ancestor alias":
+				alias := filepath.Join(base, "ancestor-link")
+				if err := os.Symlink(base, alias); err != nil {
+					t.Fatal(err)
+				}
+				requested = filepath.Join(alias, "workspace", "video")
+			case "relative ordinary":
+				requested = "video"
+			}
+			if _, err := ValidateReadPathWithRoots(h.WorkspaceDir, resolveAuthorizedRoots(h.AuthorizedRoots), requested, false); err != nil {
+				t.Fatalf("valid spelling refused by existing validator: %v", err)
+			}
+			p := pinnedRangePayload(t, actual)
+			p["path"] = requested
+			// Use the real opener and descriptor, not the openFile test seam.
+			assertRangeOK(t, conditionalResult(t, h, p), p, []byte("ORIG"), 8, 0)
+		})
+	}
+}
+
+func TestConditionalRangeAliasRetargetBetweenValidationAndOpenRefuses(t *testing.T) {
+	for _, kind := range []string{"workspace", "authorized root"} {
+		t.Run(kind, func(t *testing.T) {
+			base, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ws := filepath.Join(base, "workspace")
+			if err := os.Mkdir(ws, 0700); err != nil {
+				t.Fatal(err)
+			}
+			root := ws
+			var roots []string
+			if kind == "authorized root" {
+				root = filepath.Join(base, "authorized")
+				if err := os.Mkdir(root, 0700); err != nil {
+					t.Fatal(err)
+				}
+				roots = []string{root}
+			}
+			writeTestFile(t, root, "video", "ORIGINAL")
+			outside := filepath.Join(base, "outside")
+			if err := os.Mkdir(outside, 0700); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, outside, "video", "PRIVATE!")
+			alias := filepath.Join(base, "requested-link")
+			if err := os.Symlink(root, alias); err != nil {
+				t.Fatal(err)
+			}
+			validated, err := ValidateReadPathWithRoots(ws, roots, filepath.Join(alias, "video"), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(alias); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, alias); err != nil {
+				t.Fatal(err)
+			}
+			h := NewFileReadBytesRangeV2Handler(ws)
+			file, err := h.openAuthorizedFile(validated, roots)
+			if file != nil {
+				file.Close()
+				t.Fatal("retargeted alias returned a descriptor outside authorized roots")
+			}
+			if err == nil {
+				t.Fatal("retargeted alias accepted after validation")
+			}
+		})
+	}
+}
