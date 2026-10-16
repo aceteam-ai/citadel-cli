@@ -176,7 +176,7 @@ func TestRunJobTemplate_TransientRetries(t *testing.T) {
 func TestRunJobTemplate_HappyPath(t *testing.T) {
 	want := &TemplateRunResult{
 		Outputs: []TemplateOutput{
-			{Path: "templates/audio-mix/job-1/out/mix.wav", SHA256: "sha256:abc", Bytes: 12345},
+			{Path: "templates/audio-mix/job-1/out/mix.wav", SHA256: "sha256:abc", Bytes: 12345, Generation: "linux-stat-v1:recorded-generation"},
 		},
 		DurationMs:  5000,
 		InputHashes: []string{"sha256:def"},
@@ -194,6 +194,11 @@ func TestRunJobTemplate_HappyPath(t *testing.T) {
 	}
 	if _, ok := res.Output["outputs"]; !ok {
 		t.Errorf("Output missing outputs: %v", res.Output)
+	}
+	outputs := res.Output["outputs"].([]any)
+	output := outputs[0].(map[string]any)
+	if output["path"] != want.Outputs[0].Path || output["sha256"] != want.Outputs[0].SHA256 || output["bytes"] != float64(want.Outputs[0].Bytes) || output["generation"] != want.Outputs[0].Generation {
+		t.Fatalf("producer identity lost at worker result boundary: %+v", output)
 	}
 	if dm, ok := res.Output["duration_ms"].(float64); !ok || int64(dm) != 5000 {
 		t.Errorf("Output duration_ms = %v, want 5000", res.Output["duration_ms"])

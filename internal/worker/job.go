@@ -187,6 +187,7 @@ const (
 
 // JobTypeFileReadRangeV1 is the bounded binary range contract for large files.
 const JobTypeFileReadRangeV1 = "FILE_READ_BYTES_RANGE_V1"
+const JobTypeFileReadRangeV2 = "FILE_READ_BYTES_RANGE_V2"
 
 // Common job types used across sources.
 //
@@ -303,6 +304,7 @@ var allKnownJobTypes = []string{
 	JobTypeFileRead,
 	JobTypeFileReadBytes,
 	JobTypeFileReadRangeV1,
+	JobTypeFileReadRangeV2,
 	JobTypeFileWrite,
 	JobTypeFileWriteBytes,
 	JobTypeFileEdit,
@@ -399,6 +401,7 @@ var gatedJobTypeReasons = map[string]string{
 	JobTypeFileRead:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileReadBytes:      "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileReadRangeV1:    "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileReadRangeV2:    "conditional ranges require Linux artifact observations and the node's Files permission",
 	JobTypeFileWrite:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileWriteBytes:     "this node has no workspace directory configured",
 	JobTypeFileEdit:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
