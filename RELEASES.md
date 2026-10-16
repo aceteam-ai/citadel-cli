@@ -3145,3 +3145,20 @@ Auto-generated log of every release.
   - test(status): clean up the global request-log entry in GlobalSingleton (#1324)
 
 
+---
+
+## v2.196.0 — 2026-10-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 20 |
+| Lines added | +1355 |
+
+**Changes:**
+
+  - fix(jobs): pin meeting_url to https and escape meeting_id in the upload path (#1338)
+  - test(rag): give the inflight-cancellation test a separate startup budget (#1337)
+  - feat: bind template artifacts to conditional Range V2 (#1321)
+
+
