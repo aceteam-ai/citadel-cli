@@ -117,9 +117,13 @@ func TestServiceIndexInflightParentCancellationIsFatal(t *testing.T) {
 		_, err := svc.Index(ctx, ws, "")
 		done <- err
 	}()
+	// Reaching the embed request means a TEI health probe, /info discovery,
+	// the workspace walk and opening the index store. That is real I/O and
+	// can exceed a second under a loaded -race run, so it gets its own
+	// generous budget. It is not what this test asserts.
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("embedding request did not start")
 	}
 	cancel()
@@ -128,7 +132,9 @@ func TestServiceIndexInflightParentCancellationIsFatal(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("error=%v, want context.Canceled", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
+		// The fake TEI handler blocks until its request context ends, so a
+		// path that ignores cancellation hangs here rather than finishing late.
 		t.Fatal("Index did not propagate in-flight parent cancellation")
 	}
 	store, err := nodeindex.Open(svc.DBPath())
