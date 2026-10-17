@@ -120,6 +120,11 @@ func (s *RedisSource) log(level, format string, args ...interface{}) {
 
 // Connect establishes connection to Redis.
 func (s *RedisSource) Connect(ctx context.Context) error {
+	for _, queue := range s.snapshotQueues() {
+		if isWorkerControlQueue(queue) {
+			return fmt.Errorf("worker control requires authenticated API transport")
+		}
+	}
 	// Use first queue as the "primary" for the client config (backwards compat)
 	s.client = redisclient.NewClient(redisclient.ClientConfig{
 		URL:           s.config.URL,
@@ -195,6 +200,11 @@ func (s *RedisSource) getWake() *wakePump {
 // closures.
 func (s *RedisSource) readOnce(ctx context.Context, blockMs int) (*Job, error) {
 	queues := s.snapshotQueues()
+	for _, queue := range queues {
+		if isWorkerControlQueue(queue) {
+			return nil, fmt.Errorf("worker control requires authenticated API transport")
+		}
+	}
 	if len(queues) == 1 {
 		return s.nextSingle(ctx, queues[0], blockMs)
 	}
@@ -469,6 +479,9 @@ func (s *RedisSource) QueueNames() []string {
 // A blank or already-present queue is ignored. Returns an error only if the
 // consumer group cannot be created.
 func (s *RedisSource) AddQueue(ctx context.Context, queue string) error {
+	if isWorkerControlQueue(queue) {
+		return fmt.Errorf("worker control requires authenticated API transport")
+	}
 	if queue == "" {
 		return nil
 	}

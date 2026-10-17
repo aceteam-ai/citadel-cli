@@ -184,16 +184,7 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 // They are registered after the runner exists so AGENT_UPDATE can borrow the
 // runner's Drain/ActiveJobs to drain in-flight work before a self-restart.
 func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandlerOpts) {
-	runner.RegisterHandler(worker.NewWorkerControlHandler(worker.WorkerControlConfig{
-		OrgID:    opts.OrgID,
-		NodeID:   opts.NodeID,
-		StateDir: opts.PermissionsDir,
-		Managed:  managedByServiceManager,
-		Schedule: func() (func(), func(), error) {
-			return worker.PrepareWorkerRestart(func() { processExiter(1) })
-		},
-		Log: opts.HandlerLog,
-	}))
+	runner.RegisterHandler(nodeWorkerControlHandler(opts))
 
 	// Both direct Redis and API-proxy workers use the platform's canonical
 	// fine-tune hash and cancel key. API mode requires the scoped companion
