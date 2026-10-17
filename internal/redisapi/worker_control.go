@@ -181,21 +181,9 @@ func (c *WSClient) failControlWaiters(conn *websocket.Conn) {
 	}
 }
 func (c *WSClient) controlFrame(conn *websocket.Conn, raw []byte) bool {
-	// A generic uncorrelated error never resolves an unrelated operation.
-	var route struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(raw, &route) != nil {
-		if workercontrol.LooksControl(raw) {
-			c.failControlWaiters(conn)
-		}
-		return false
-	}
-	if route.Type != "worker_control_response" {
-		if workercontrol.ContainsToken(raw, "worker_control_response") {
-			c.failControlWaiters(conn)
-			return true
-		}
+	// Only an outer response discriminator can affect control waiters. Scan
+	// every occurrence before strict decoding rejects duplicate/aliased names.
+	if !workercontrol.HasStringField(raw, "worker_control_response", "type") {
 		return false
 	}
 	var frame struct {
@@ -259,7 +247,7 @@ func (c *WorkerControlConfig) UnmarshalJSON(raw []byte) error {
 }
 func (m *StreamMessage) UnmarshalJSON(raw []byte) error {
 	type plain StreamMessage
-	if !workercontrol.LooksControl(raw) {
+	if !workercontrol.LooksControlData(raw, "data") {
 		return json.Unmarshal(raw, (*plain)(m))
 	}
 	var strict struct {
@@ -279,14 +267,14 @@ func (m *StreamMessage) UnmarshalJSON(raw []byte) error {
 
 func (r *ConsumeResponse) UnmarshalJSON(raw []byte) error {
 	type plain ConsumeResponse
-	if workercontrol.LooksControl(raw) && workercontrol.CheckJSON(raw, 4<<20) != nil {
+	if workercontrol.LooksControlData(raw, "messages", "*", "data") && workercontrol.CheckJSON(raw, 4<<20) != nil {
 		return workercontrol.ErrInvalid
 	}
 	return json.Unmarshal(raw, (*plain)(r))
 }
 func (r *WorkerConfigResponse) UnmarshalJSON(raw []byte) error {
 	type plain WorkerConfigResponse
-	if workercontrol.ContainsToken(raw, workercontrol.Protocol) && workercontrol.CheckJSON(raw, 65536) != nil {
+	if workercontrol.HasStringField(raw, workercontrol.Protocol, "worker_control", "protocol") && workercontrol.CheckJSON(raw, 65536) != nil {
 		return workercontrol.ErrInvalid
 	}
 	return json.Unmarshal(raw, (*plain)(r))

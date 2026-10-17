@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -18,7 +19,7 @@ func Decode(raw []byte, out any, limit int) error {
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
-	value, e := readValue(d, 0)
+	value, e := readValue(d, 0, false)
 	if e != nil {
 		return ErrInvalid
 	}
@@ -36,13 +37,15 @@ func Decode(raw []byte, out any, limit int) error {
 }
 
 // CheckJSON checks lexical ambiguity without imposing a generic transport schema.
+// Case-folded duplicates are also rejected before generic struct decoding can
+// overwrite a control-bearing field through an encoding/json alias.
 func CheckJSON(raw []byte, limit int) error {
 	if len(raw) > limit || !utf8.Valid(raw) || !validEscapes(raw) {
 		return ErrInvalid
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
-	if _, e := readValue(d, 0); e != nil {
+	if _, e := readValue(d, 0, true); e != nil {
 		return ErrInvalid
 	}
 	if _, e := d.Token(); e != io.EOF {
@@ -50,19 +53,84 @@ func CheckJSON(raw []byte, limit int) error {
 	}
 	return nil
 }
-func ContainsToken(raw []byte, want string) bool {
+
+// HasStringField classifies only the named JSON path, preserving every duplicate
+// occurrence. Keys follow encoding/json's case folding so aliases cannot evade
+// the strict decoder. A "*" path component visits array elements, never objects.
+// This is classification only; callers must still validate the complete schema.
+func HasStringField(raw []byte, want string, path ...string) bool {
+	return hasField(raw, path, func(t json.Token) bool { return t == want })
+}
+
+func hasField(raw []byte, path []string, match func(json.Token) bool) bool {
 	d := json.NewDecoder(bytes.NewReader(raw))
-	for {
-		t, e := d.Token()
-		if e != nil {
-			return false
+	d.UseNumber()
+	found, _ := scanField(d, path, match)
+	return found
+}
+
+func scanField(d *json.Decoder, path []string, match func(json.Token) bool) (bool, error) {
+	if len(path) == 0 && match == nil {
+		return true, nil // Field presence also classifies malformed control data.
+	}
+	t, err := d.Token()
+	if err != nil {
+		return false, err
+	}
+	if len(path) == 0 {
+		if match(t) {
+			return true, nil
 		}
-		if s, ok := t.(string); ok && s == want {
-			return true
+		// Consume a non-string value without interpreting its descendants.
+		if delim, ok := t.(json.Delim); ok && (delim == '{' || delim == '[') {
+			depth := 1
+			for depth > 0 {
+				t, err = d.Token()
+				if err != nil {
+					return false, err
+				}
+				if delim, ok := t.(json.Delim); ok {
+					switch delim {
+					case '{', '[':
+						depth++
+					case '}', ']':
+						depth--
+					}
+				}
+			}
+		}
+		return false, nil
+	}
+	delim, ok := t.(json.Delim)
+	if !ok {
+		return false, nil
+	}
+	for d.More() {
+		selected := delim == '[' && path[0] == "*"
+		if delim == '{' {
+			key, err := d.Token()
+			if err != nil {
+				return false, err
+			}
+			name, ok := key.(string)
+			selected = ok && path[0] != "*" && strings.EqualFold(name, path[0])
+		}
+		if selected {
+			found, err := scanField(d, path[1:], match)
+			if found || err != nil {
+				return found, err
+			}
+		} else {
+			var discard json.RawMessage
+			if err := d.Decode(&discard); err != nil {
+				return false, err
+			}
 		}
 	}
+	_, err = d.Token()
+	return false, err
 }
-func readValue(d *json.Decoder, depth int) (any, error) {
+func readValue(d *json.Decoder, depth int, foldKeys bool) (any, error) {
 	if depth > 8 {
 		return nil, ErrInvalid
 	}
@@ -74,6 +142,7 @@ func readValue(d *json.Decoder, depth int) (any, error) {
 	case json.Delim:
 		if v == '{' {
 			m := map[string]any{}
+			seen := map[string]bool{}
 			for d.More() {
 				k, e := d.Token()
 				if e != nil {
@@ -83,10 +152,23 @@ func readValue(d *json.Decoder, depth int) (any, error) {
 				if !ok {
 					return nil, ErrInvalid
 				}
-				if _, ok := m[s]; ok {
+				key := s
+				if foldKeys {
+					key = strings.Map(func(r rune) rune {
+						lowest := r
+						for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+							if next < lowest {
+								lowest = next
+							}
+						}
+						return lowest
+					}, key)
+				}
+				if seen[key] {
 					return nil, ErrInvalid
 				}
-				x, e := readValue(d, depth+1)
+				seen[key] = true
+				x, e := readValue(d, depth+1, foldKeys)
 				if e != nil {
 					return nil, e
 				}
@@ -100,7 +182,7 @@ func readValue(d *json.Decoder, depth int) (any, error) {
 		if v == '[' {
 			a := []any{}
 			for d.More() {
-				x, e := readValue(d, depth+1)
+				x, e := readValue(d, depth+1, foldKeys)
 				if e != nil {
 					return nil, e
 				}
@@ -228,19 +310,23 @@ func validEscapes(raw []byte) bool {
 	return true
 }
 
-// LooksControl scans decoded tokens, including overwritten duplicate fields.
-// It is classification only, never schema validation or authority.
+// LooksControl classifies transport and stream-job discriminants, including
+// overwritten duplicates. Application content is never a routing discriminant.
 func LooksControl(raw []byte) bool {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	for {
-		t, e := d.Token()
-		if e != nil {
-			return false
-		}
-		if s, ok := t.(string); ok && (s == "worker_control" || s == "WORKER_CONTROL" || s == "worker_control_response" || s == "worker_control_request" || IsQueue(s)) {
-			return true
-		}
-	}
+	return hasField(raw, []string{"type"}, func(t json.Token) bool {
+		s, _ := t.(string)
+		return s == "worker_control" || s == "WORKER_CONTROL" || s == "worker_control_response" || s == "worker_control_request"
+	}) || hasField(raw, []string{"queue"}, func(t json.Token) bool {
+		s, _ := t.(string)
+		return IsQueue(s)
+	}) || LooksControlData(raw, "data")
+}
+
+// LooksControlData checks only the stream data object at the supplied path.
+func LooksControlData(raw []byte, path ...string) bool {
+	typePath := append(append([]string{}, path...), "type")
+	controlPath := append(append([]string{}, path...), "worker_control")
+	return HasStringField(raw, "WORKER_CONTROL", typePath...) || hasField(raw, controlPath, nil)
 }
 
 type Data struct {
