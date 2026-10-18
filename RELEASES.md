@@ -3162,3 +3162,18 @@ Auto-generated log of every release.
   - feat: bind template artifacts to conditional Range V2 (#1321)
 
 
+---
+
+## v2.197.0 — 2026-10-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 18 |
+| Lines added | +3021 |
+
+**Changes:**
+
+  - feat(diffusers): per-request image model selection, VRAM-aware swap, current open models (#1335)
+
+
