@@ -670,7 +670,7 @@ type DeviceAuthConfig struct {
 type DeviceAuthCallbacks struct {
 	StartFlow  func() (*DeviceAuthConfig, error)                                 // Start device auth flow, returns codes
 	PollToken  func(deviceCode string, interval int) (authkey string, err error) // Poll for token
-	Connect    func(authkey string) error                                        // Connect with authkey
+	Connect    func(authkey, deviceCode string) error                            // Register and link this current grant before returning success
 	Disconnect func() error                                                      // Disconnect from network
 }
 

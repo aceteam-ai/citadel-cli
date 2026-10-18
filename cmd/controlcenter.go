@@ -1897,8 +1897,9 @@ func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
 	return token.Authkey, nil
 }
 
-// ccConnectWithAuthkey connects to the network using an authkey
-func ccConnectWithAuthkey(authkey string) error {
+// ccConnectWithAuthkey registers and links the grant approved by this modal.
+// Saved device credentials alone do not establish a completed device binding.
+func ccConnectWithAuthkey(authkey, deviceCode string) error {
 	// Get node name from manifest or hostname
 	nodeName := ""
 	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
@@ -1917,17 +1918,21 @@ func ccConnectWithAuthkey(authkey string) error {
 		AuthKey:    authkey,
 	}
 
-	_, err := network.Connect(ctx, config)
-	if err == nil {
-		if trustErr := persistPrivateCATrust(authServiceURL, nexusURL); trustErr != nil {
-			_ = network.Disconnect()
-			return trustErr
-		}
-		// Persist the control URL enrolled against (citadel-cli#1110) so later
-		// reconnects target this control plane, not the compiled-in default.
-		persistNexusURLBestEffort(nexusURL)
+	err := ccConnectDeviceEnrollmentWith(authkey, deviceCode, func() error {
+		_, err := network.Connect(ctx, config)
+		return err
+	}, linkDeviceEnrollment, network.Disconnect)
+	if err != nil {
+		return err
 	}
-	return err
+	if trustErr := persistPrivateCATrust(authServiceURL, nexusURL); trustErr != nil {
+		_ = network.Disconnect()
+		return trustErr
+	}
+	// Persist the control URL enrolled against (citadel-cli#1110) so later
+	// reconnects target this control plane, not the compiled-in default.
+	persistNexusURLBestEffort(nexusURL)
+	return nil
 }
 
 // ccDisconnect disconnects from the network

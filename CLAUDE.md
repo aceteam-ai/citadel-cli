@@ -1541,6 +1541,25 @@ and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
 
+`status.Server.ControlTLS` reports the public certificate held by the active
+control listener, using the same immutable DER snapshot as its TLS config.
+Changing certificate files takes effect only after listener restart. The API
+heartbeat emits this as `control_tls.cert_pem` through its cached provider;
+disabled or stopped listeners omit it, and legacy direct Redis never emits it.
+This is authenticated-device evidence through the platform's existing relay
+HMAC envelope, not a device-origin signature. No control transport consumes it.
+After device-grant registration, `cmd.linkDeviceEnrollment` completes the
+server's reserved registration proof through the existing device link route;
+link refusal must propagate before enrollment can report success (#1344).
+Control Center passes the approved modal's `deviceCode` into its connect
+callback and gates both success display and worker startup on completed linking.
+The public link request uses that grant and the server's reserved used
+registration-key proof; it sends no device bearer and needs no token-scope
+expansion. If `init` obtains a fresh grant while already connected, its link
+can refuse the old registration: run `citadel logout && citadel init` to
+register through a fresh reservation. Saved credentials alone never establish
+completed device binding; the link response must confirm it.
+
 ### Two ActualState reporters, two different module sets (#733)
 
 A node ships `ActualState` to the control plane from TWO independent paths.

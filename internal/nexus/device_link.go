@@ -1,0 +1,49 @@
+package nexus
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"regexp"
+)
+
+var enrollmentNodeIDPattern = regexp.MustCompile(`^[1-9][0-9]*$`)
+
+// LinkRegisteredNode completes the current device grant after registration.
+// The server verifies the used registration key against its reservation; neither
+// a hostname nor an IP address is an enrollment proof. The request must never
+// expose its grant in diagnostics or forward it on redirects. The public link
+// route authorizes the grant plus reserved registration proof, not a bearer.
+func (c *DeviceAuthClient) LinkRegisteredNode(ctx context.Context, deviceCode, nodeID string) error {
+	if deviceCode == "" || !enrollmentNodeIDPattern.MatchString(nodeID) {
+		return fmt.Errorf("device link requires the current grant and registered node ID")
+	}
+	body, _ := json.Marshal(struct {
+		NodeID string `json:"nodeId"`
+	}{nodeID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/api/fabric/device-config/"+url.PathEscape(deviceCode)+"/link", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("could not prepare device link request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		// Transport errors can contain the URL (and therefore the grant).
+		return fmt.Errorf("device link request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("device link refused (HTTP %d); enrollment is incomplete", resp.StatusCode)
+	}
+	var result struct {
+		Success bool `json:"success"`
+	}
+	if err := decodeBoundedDeviceAuthJSON(resp.Body, &result, "device link response"); err != nil || !result.Success {
+		return fmt.Errorf("device link did not confirm enrollment")
+	}
+	return nil
+}

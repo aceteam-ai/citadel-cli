@@ -1453,34 +1453,25 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 					return
 				}
 
-				// Success! Connect with the authkey
-				cc.app.QueueUpdateDraw(func() {
-					updateContent("success")
-				})
-
-				cc.AddActivity("success", "Authorization successful!")
-
-				// Connect to network
-				if cc.deviceAuth.Connect != nil {
-					cc.AddActivity("info", "Connecting to network...")
-					if runtime.GOOS == "darwin" {
-						cc.AddActivity("info", "macOS may prompt for network access - click 'Allow'")
+				cc.AddActivity("info", "Connecting to network...")
+				if runtime.GOOS == "darwin" {
+					cc.AddActivity("info", "macOS may prompt for network access - click 'Allow'")
+				}
+				// Success display and worker startup share this gate: Connect must
+				// register AND link the same grant that was just approved.
+				if err := completeDeviceEnrollment(authkey, config.DeviceCode, cc.deviceAuth.Connect, func() {
+					cc.app.QueueUpdateDraw(func() { updateContent("success") })
+					cc.AddActivity("success", "Connected to AceTeam Network")
+					cc.refresh()
+					if cc.onConnect != nil {
+						cc.onConnect(cc.AddActivity)
 					}
-					if err := cc.deviceAuth.Connect(authkey); err != nil {
-						cc.AddActivity("error", fmt.Sprintf("Failed to connect: %v", err))
-					} else {
-						cc.AddActivity("success", "Connected to AceTeam Network")
-						cc.refresh()
-						if cc.onConnect != nil {
-							cc.onConnect(cc.AddActivity)
-						}
-						cc.ShowChat()
-
-						// Set device URL for the "V" key shortcut
-						cc.deviceURL = cc.authServiceURL + "/fabric"
-						cc.AddActivity("info", fmt.Sprintf("View your device: %s", cc.deviceURL))
-						cc.AddActivity("info", "Press [V] to open in browser")
-					}
+					cc.ShowChat()
+					cc.deviceURL = cc.authServiceURL + "/fabric"
+					cc.AddActivity("info", fmt.Sprintf("View your device: %s", cc.deviceURL))
+					cc.AddActivity("info", "Press [V] to open in browser")
+				}); err != nil {
+					cc.AddActivity("error", fmt.Sprintf("Enrollment incomplete: %v", err))
 				}
 
 				time.Sleep(time.Second)
@@ -1493,6 +1484,24 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 			}
 		}
 	}()
+}
+
+// completeDeviceEnrollment gates every successful-enrollment action on a
+// completed network registration and device link, including worker startup.
+func completeDeviceEnrollment(authkey, deviceCode string, connect func(string, string) error, onLinked func()) error {
+	if authkey == "" || deviceCode == "" {
+		return fmt.Errorf("current device authorization is missing")
+	}
+	if connect == nil {
+		return fmt.Errorf("device enrollment connection is unavailable")
+	}
+	if err := connect(authkey, deviceCode); err != nil {
+		return err
+	}
+	if onLinked != nil {
+		onLinked()
+	}
+	return nil
 }
 
 // showNodeDetailModal shows detailed node information
