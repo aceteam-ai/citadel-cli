@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/libdns/cloudflare"
+	"github.com/libdns/rfc2136"
 )
 
 func TestSelfSignedCertProvider_ServesCert(t *testing.T) {
@@ -66,13 +69,17 @@ func TestStaticFileCertProvider_LoadsMountedWildcard(t *testing.T) {
 }
 
 func TestNewACMECertProvider_ValidatesConfig(t *testing.T) {
+	rfc := RFC2136Config{Server: "ns1.example.net:53", KeyName: "k.", KeyAlg: "hmac-sha256.", Key: "c2VjcmV0"}
+	cf := CloudflareConfig{APIToken: "cf-token"}
 	cases := []struct {
 		name string
 		cfg  ACMEConfig
 	}{
-		{"no apps domain", ACMEConfig{DNSZone: "z", StorageDir: "/tmp"}},
-		{"no dns zone", ACMEConfig{AppsDomain: "apps.example.com", StorageDir: "/tmp"}},
-		{"no storage dir", ACMEConfig{AppsDomain: "apps.example.com", DNSZone: "z"}},
+		{"no apps domain", ACMEConfig{DNSZone: "z", StorageDir: "/tmp", RFC2136: rfc}},
+		{"no dns provider", ACMEConfig{AppsDomain: "apps.example.com", DNSZone: "z", StorageDir: "/tmp"}},
+		{"rfc2136 without dns zone", ACMEConfig{AppsDomain: "apps.example.com", StorageDir: "/tmp", RFC2136: rfc}},
+		{"both providers", ACMEConfig{AppsDomain: "apps.example.com", DNSZone: "z", StorageDir: "/tmp", RFC2136: rfc, Cloudflare: cf}},
+		{"no storage dir", ACMEConfig{AppsDomain: "apps.example.com", DNSZone: "z", RFC2136: rfc}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -81,10 +88,33 @@ func TestNewACMECertProvider_ValidatesConfig(t *testing.T) {
 			}
 		})
 	}
-	// A complete config validates (no network contact until Start).
+	// Complete configs validate (no network contact until Start).
 	if _, err := NewACMECertProvider(ACMEConfig{
-		AppsDomain: "apps.example.com", DNSZone: "acme.example.net", StorageDir: t.TempDir(),
+		AppsDomain: "apps.example.com", DNSZone: "acme.example.net", StorageDir: t.TempDir(), RFC2136: rfc,
 	}); err != nil {
-		t.Fatalf("complete config should validate: %v", err)
+		t.Fatalf("complete rfc2136 config should validate: %v", err)
+	}
+	if _, err := NewACMECertProvider(ACMEConfig{
+		AppsDomain: "apps.example.com", StorageDir: t.TempDir(), Cloudflare: cf,
+	}); err != nil {
+		t.Fatalf("cloudflare config without a dns zone should validate: %v", err)
+	}
+}
+
+func TestDNSProviderForSelectsConfiguredBackend(t *testing.T) {
+	p, err := dnsProviderFor(ACMEConfig{Cloudflare: CloudflareConfig{APIToken: "t", ZoneToken: "z"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := p.(*cloudflare.Provider)
+	if !ok || c.APIToken != "t" || c.ZoneToken != "z" {
+		t.Fatalf("cloudflare token selected %T %+v", p, p)
+	}
+	p, err = dnsProviderFor(ACMEConfig{DNSZone: "z", RFC2136: RFC2136Config{Server: "ns:53", KeyName: "k."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := p.(*rfc2136.Provider); !ok || r.Server != "ns:53" || r.KeyName != "k." {
+		t.Fatalf("rfc2136 server selected %T %+v", p, p)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/certmagic"
+	"github.com/libdns/cloudflare"
 	"github.com/libdns/rfc2136"
 	"go.uber.org/zap"
 )
@@ -137,6 +138,16 @@ type RFC2136Config struct {
 	Key     string // base64-encoded TSIG secret
 }
 
+// CloudflareConfig selects Cloudflare's DNS API for the DNS-01 challenge, for
+// an apps domain whose zone is hosted on Cloudflare (which has no RFC 2136
+// interface). APIToken needs Zone.DNS:Edit; scope it to the apps zone only.
+// ZoneToken is an optional Zone:Read token, needed only when APIToken is
+// scoped so tightly it cannot look the zone up.
+type CloudflareConfig struct {
+	APIToken  string
+	ZoneToken string
+}
+
 // ACMEConfig configures the certmagic DNS-01 wildcard provider.
 type ACMEConfig struct {
 	AppsDomain string
@@ -150,11 +161,16 @@ type ACMEConfig struct {
 	// runs a real node that would resolve to the live node's dir (CLAUDE.md #787).
 	StorageDir string
 	// DNSZone is the delegated zone set as certmagic's OverrideDomain. It is
-	// REQUIRED: certmagic's DNS01Solver does NOT follow CNAMEs (confirmed against
-	// v0.25.x), so the challenge TXT must be published directly on the delegated
-	// zone the scoped credential can write, not on _acme-challenge.<apps-domain>.
+	// REQUIRED for RFC 2136: certmagic's DNS01Solver does NOT follow CNAMEs
+	// (confirmed against v0.25.x), so the challenge TXT must be published
+	// directly on the delegated zone the scoped credential can write, not on
+	// _acme-challenge.<apps-domain>. With Cloudflare the token writes the apps
+	// zone itself, so DNSZone is optional and normally left empty.
 	DNSZone string
-	RFC2136 RFC2136Config
+	// Exactly one of RFC2136 (selected by a non-empty Server) or Cloudflare
+	// (selected by a non-empty APIToken) must be configured.
+	RFC2136    RFC2136Config
+	Cloudflare CloudflareConfig
 	// Logger is optional; nil uses a no-op logger (certmagic's default zap logger
 	// is very noisy).
 	Logger *zap.Logger
@@ -172,8 +188,8 @@ func NewACMECertProvider(cfg ACMEConfig) (*ACMECertProvider, error) {
 	if cfg.AppsDomain == "" {
 		return nil, fmt.Errorf("ingress acme: apps domain required")
 	}
-	if cfg.DNSZone == "" {
-		return nil, fmt.Errorf("ingress acme: delegated DNS zone required (OverrideDomain; solver does not follow CNAME)")
+	if _, err := dnsProviderFor(cfg); err != nil {
+		return nil, err
 	}
 	if cfg.StorageDir == "" {
 		return nil, fmt.Errorf("ingress acme: storage dir required")
@@ -191,11 +207,9 @@ func (p *ACMECertProvider) Start(ctx context.Context) error {
 
 	storage := &certmagic.FileStorage{Path: p.cfg.StorageDir}
 
-	dnsProvider := &rfc2136.Provider{
-		Server:  p.cfg.RFC2136.Server,
-		KeyName: p.cfg.RFC2136.KeyName,
-		KeyAlg:  p.cfg.RFC2136.KeyAlg,
-		Key:     p.cfg.RFC2136.Key,
+	dnsProvider, err := dnsProviderFor(p.cfg)
+	if err != nil {
+		return err
 	}
 
 	var magic *certmagic.Config
@@ -237,6 +251,35 @@ func (p *ACMECertProvider) Start(ctx context.Context) error {
 	tlsC.MinVersion = tls.VersionTLS12
 	p.tlsC = tlsC
 	return nil
+}
+
+// dnsProviderFor selects the DNS-01 provider. Exactly one backend must be
+// configured; ambiguity is refused rather than resolved by precedence, so a
+// stale credential left in the environment cannot silently pick the zone.
+func dnsProviderFor(cfg ACMEConfig) (certmagic.DNSProvider, error) {
+	useRFC := cfg.RFC2136.Server != ""
+	useCF := cfg.Cloudflare.APIToken != ""
+	switch {
+	case useRFC && useCF:
+		return nil, fmt.Errorf("ingress acme: both RFC 2136 and Cloudflare DNS credentials are set; configure exactly one")
+	case useCF:
+		return &cloudflare.Provider{
+			APIToken:  cfg.Cloudflare.APIToken,
+			ZoneToken: cfg.Cloudflare.ZoneToken,
+		}, nil
+	case useRFC:
+		if cfg.DNSZone == "" {
+			return nil, fmt.Errorf("ingress acme: delegated DNS zone required for RFC 2136 (OverrideDomain; solver does not follow CNAME)")
+		}
+		return &rfc2136.Provider{
+			Server:  cfg.RFC2136.Server,
+			KeyName: cfg.RFC2136.KeyName,
+			KeyAlg:  cfg.RFC2136.KeyAlg,
+			Key:     cfg.RFC2136.Key,
+		}, nil
+	default:
+		return nil, fmt.Errorf("ingress acme: no DNS-01 provider configured (set a Cloudflare API token or an RFC 2136 server)")
+	}
 }
 
 // TLSConfig returns certmagic's managed TLS config (GetCertificate reads from
