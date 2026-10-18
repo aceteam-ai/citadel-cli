@@ -71,15 +71,15 @@ type Server struct {
 	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
 
-	// caVerifier, when set, gates the MUTATING control endpoints (SSH-key
-	// injection) behind a fabric-CA-signed coordinator client certificate over
-	// mTLS (issue #5028). Nil means the mutating endpoints are refused on every
+	// caVerifier, when set, gates protected control and agent introspection
+	// behind a fabric-CA-signed coordinator client certificate over mTLS
+	// (issue #5028). Nil means these endpoints are refused on every
 	// listener (fail closed) -- they are NEVER served over the plaintext,
 	// VPN-origin-trusting path anymore.
 	caVerifier *FabricCAVerifier
 	// controlPort is the port for the dedicated mTLS control listener that serves
-	// the mutating endpoints. Only used when caVerifier and controlServerCert are
-	// both set.
+	// protected control and agent introspection. Only used when caVerifier and
+	// controlServerCert are both set.
 	controlPort int
 	// controlServerCert is the TLS server certificate the control listener
 	// presents. The caller (coordinator) authenticates the node out-of-band (mesh
@@ -109,8 +109,8 @@ type ServerConfig struct {
 	PasscodeVerifier func(pin string) bool
 
 	// Agent, when set, registers the /agent/* introspection & control
-	// endpoints (issue #236). These are served over the same dual (LAN+VPN)
-	// listeners but gated by requireVPNOrAuth.
+	// endpoints (issue #236). Introspection and worker control require the mTLS
+	// control listener; expose/unexpose retain their separate self-origin gate.
 	Agent *AgentProviders
 
 	// SelfMeshIPs returns this node's own AceTeam Network addresses. It backs
@@ -133,7 +133,7 @@ type ServerConfig struct {
 	GatewayCertPath string
 
 	// CAVerifier, when set, enables the dedicated mTLS control listener that
-	// serves the MUTATING control endpoints (SSH-key injection) gated by a
+	// serves protected control and agent introspection endpoints gated by a
 	// fabric-CA-signed coordinator client certificate (issue #5028). When nil,
 	// those endpoints are refused everywhere (fail closed).
 	CAVerifier *FabricCAVerifier
@@ -199,7 +199,7 @@ func (s *Server) AddControlListener(ln net.Listener) {
 // controlEnabled reports whether the mTLS control listener can be started: it
 // requires both a fabric CA verifier (to authenticate/authorize callers) and a
 // server certificate (to present on the TLS handshake). Absent either, the
-// mutating control endpoints are refused everywhere (fail closed).
+// protected control and agent introspection endpoints are refused everywhere.
 func (s *Server) controlEnabled() bool {
 	return s.caVerifier != nil && s.controlServerCert != nil
 }
@@ -218,8 +218,8 @@ func (s *Server) handleSSHMovedToControl(w http.ResponseWriter, r *http.Request)
 }
 
 // buildControlMux constructs the multiplexer for the dedicated mTLS control
-// listener. Only MUTATING control endpoints live here, each gated by
-// requireCoordinator (a verified fabric-CA-signed coordinator client cert). The
+// listener. Protected control and agent introspection endpoints live here, gated
+// by requireCoordinator (a verified fabric-CA-signed coordinator client cert). The
 // caller must ensure s.controlEnabled() is true before serving this mux.
 func (s *Server) buildControlMux() *http.ServeMux {
 	mux := http.NewServeMux()
@@ -228,6 +228,9 @@ func (s *Server) buildControlMux() *http.ServeMux {
 	mux.HandleFunc("/ping", s.handlePing)
 	// SSH-key injection: the host-takeover crown jewel. Coordinator identity only.
 	mux.HandleFunc("/ssh/authorized-keys", s.caVerifier.requireCoordinator(s.handleSSHAuthorizedKeys))
+	if s.controlEnabled() {
+		s.registerAgentControlRoutes(mux, s.caVerifier.requireCoordinator)
+	}
 	// Feature-package mutating routes (e.g. /workflow/run), each handed the
 	// coordinator-identity gate rather than the VPN-origin one.
 	for _, reg := range s.controlRouteRegistrars {
@@ -288,8 +291,8 @@ func (s *Server) buildMux() *http.ServeMux {
 	// instead of silently 404ing or, worse, still writing keys.
 	mux.HandleFunc("/ssh/authorized-keys", s.handleSSHMovedToControl)
 
-	// Agent introspection & control endpoints (issue #236), gated the same way
-	// (VPN origin or valid org token). No-op when no providers were supplied.
+	// Agent plaintext refusal stubs and self-origin exposure routes.
+	// No-op when no providers were supplied.
 	s.registerAgentRoutes(mux)
 
 	// Invoke registered route registrars (e.g., provisioning API).
