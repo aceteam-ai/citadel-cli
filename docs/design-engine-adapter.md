@@ -201,6 +201,39 @@ that flags `ModelEnvVar` set with `DefaultModel` unset and no compose-time
 default, or vice versa) rather than living in two unrelated files that
 happen to agree today.
 
+### Prior art: LocalAI (citadel-cli#1360)
+
+LocalAI (github.com/mudler/LocalAI, MIT core) solves the same "many engines,
+one surface" problem with a gRPC `Backend` service (`backend/backend.proto`)
+and a gallery index of backend OCI images (`backend/index.yaml`). It is
+recorded here as a design reference, not a dependency; #1360 holds the
+assessment and an optional non-NVIDIA spike. Two ideas are worth adding to
+`EngineSpec`:
+
+- **Per-hardware image variants.** Each LocalAI gallery entry carries one
+  image per target (cpu, cuda-12/13, hipblas, intel-sycl, vulkan, l4t,
+  metal-darwin). Our darwin compose variants
+  (`services/compose_variants_{other,darwin}.go`) are an ad-hoc,
+  two-target version of the same thing. A field such as
+  `Variants map[HardwareTarget]ComposeVariant` would let darwin, and any
+  future AMD/Intel/Vulkan target, be data rather than build tags, and would
+  make "this engine has no variant for this hardware" explicit instead of
+  silently dropped.
+- **Licence metadata per engine.** LocalAI records a licence on every
+  backend entry, and its gallery mixes permissive and non-commercial
+  backends. We have the same mix (Chatterbox MIT, OmniVoice CC-BY-NC, the
+  CC-BY-NC MMS_FA aligner), but only the inference server's `/info` reports
+  `model_license` today. An `EngineSpec.License` (code licence, weights
+  licence, commercial use) would give the heartbeat and receipts one
+  authority for every engine.
+
+LocalAI's residency controls (`MAX_ACTIVE_BACKENDS` LRU, idle/busy
+watchdogs, a VRAM budget, `concurrency_groups`, pinned models) cover the
+same ground as `SwapManager`, `pinned_services` and the reservation
+primitive. They are a useful comparison when tuning ours, and the reason
+LocalAI could only ever be one opaque engine to citadel: two residency
+managers on one card would fight.
+
 ## 3. Migration strategy: incremental, not big-bang
 
 Per #685's own ordering note ("best landed after the readiness and warming
