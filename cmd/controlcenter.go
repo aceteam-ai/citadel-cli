@@ -1885,8 +1885,9 @@ func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
 	// Use checkToken for single poll (not blocking PollForToken)
 	token, err := client.CheckToken(deviceCode)
 	if err != nil {
-		return "", err
+		return "", ccTokenPollError(deviceCode, err)
 	}
+	ccTokenServerErrors.Delete(deviceCode)
 	if token == nil || token.Authkey == "" {
 		return "", fmt.Errorf("authorization_pending")
 	}
@@ -1901,6 +1902,31 @@ func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
 	}
 
 	return token.Authkey, nil
+}
+
+// ccTokenServerErrors counts consecutive 5xx token answers per device code.
+var ccTokenServerErrors sync.Map
+
+// ccTokenPollError keeps the Control Center modal polling through a bounded run
+// of 5xx answers (the modal only continues on a "pending" error), matching the
+// CLI's nexus.PollForTokenWithCSR. Any other error, or too many 5xx in a row,
+// is returned unchanged and ends the modal.
+func ccTokenPollError(deviceCode string, err error) error {
+	var serverErr *nexus.TokenServerError
+	if !errors.As(err, &serverErr) {
+		ccTokenServerErrors.Delete(deviceCode)
+		return err
+	}
+	n := 1
+	if v, ok := ccTokenServerErrors.Load(deviceCode); ok {
+		n = v.(int) + 1
+	}
+	if n > nexus.MaxConsecutiveTokenServerErrors {
+		ccTokenServerErrors.Delete(deviceCode)
+		return err
+	}
+	ccTokenServerErrors.Store(deviceCode, n)
+	return fmt.Errorf("authorization_pending (server error %d, retrying)", serverErr.StatusCode)
 }
 
 // ccConnectWithAuthkey registers and links the grant approved by this modal.

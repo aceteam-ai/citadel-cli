@@ -296,3 +296,34 @@ func TestControlCenterLinkUsesPolledToken(t *testing.T) {
 		t.Fatal("a token for a different authorization must not be used")
 	}
 }
+
+func TestEnrollmentNodeIDUsesThisProcessRegistrationAfterDisconnect(t *testing.T) {
+	t.Cleanup(func() { setRegisteredNodeID("") })
+	setRegisteredNodeID("")
+	if id := enrollmentNodeID(context.Background()); id != "" {
+		t.Fatalf("no registration yet, got %q", id)
+	}
+	// connectToNetwork records the ID and then disconnects, so the global
+	// server is gone; the link must still see the registered identity.
+	setRegisteredNodeID("1234")
+	if id := enrollmentNodeID(context.Background()); id != "1234" {
+		t.Fatalf("enrollment node ID after disconnect = %q, want the registered 1234", id)
+	}
+}
+
+func TestControlCenterTokenPollRetriesServerErrorsBounded(t *testing.T) {
+	t.Cleanup(func() { ccTokenServerErrors.Delete("grant") })
+	serverErr := &nexus.TokenServerError{StatusCode: 500}
+	for i := 1; i <= nexus.MaxConsecutiveTokenServerErrors; i++ {
+		if err := ccTokenPollError("grant", serverErr); !strings.Contains(err.Error(), "pending") {
+			t.Fatalf("5xx #%d must keep the modal polling, got %v", i, err)
+		}
+	}
+	if err := ccTokenPollError("grant", serverErr); err != serverErr {
+		t.Fatalf("too many 5xx in a row must end the modal, got %v", err)
+	}
+	other := errors.New("access denied")
+	if err := ccTokenPollError("grant", other); err != other {
+		t.Fatalf("non-5xx errors pass through unchanged, got %v", err)
+	}
+}

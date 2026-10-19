@@ -1890,6 +1890,9 @@ func connectToNetwork(nodeName, authKey string) error {
 		AuthKey:    authKey,
 	}
 
+	// A failed connect must not leave an earlier registration's ID for the
+	// device link to use.
+	setRegisteredNodeID("")
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
@@ -1914,6 +1917,12 @@ func connectToNetwork(nodeName, authKey string) error {
 	ip, _ := srv.GetIPv4()
 	if ip != "" {
 		fmt.Printf("   IP: %s\n", ip)
+	}
+
+	// Record the registered node ID before disconnecting: the device link that
+	// follows needs it, and the global server is gone after Disconnect.
+	if status, err := srv.Status(ctx); err == nil {
+		setRegisteredNodeID(status.NodeID)
 	}
 
 	// Disconnect cleanly so tsnet flushes its state files, then the
