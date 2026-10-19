@@ -3,7 +3,6 @@ package jobs
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -78,14 +77,15 @@ func fileFetchOrigin(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// Configured reports whether an exact HTTPS origin is configured. Worker
-// capability advertisement also requires a workspace and live Files permission.
+// Configured requires an exact HTTPS origin and working anonymous staging with
+// descriptor-based, create-only publication on the workspace filesystem. Worker
+// capability advertisement also requires live Files permission.
 func (h *FileFetchHandler) Configured() bool {
 	if h.Origin == nil {
 		return false
 	}
 	_, err := fileFetchOrigin(h.Origin())
-	return err == nil
+	return err == nil && fileFetchStorageSupported(h.WorkspaceDir)
 }
 
 func (h *FileFetchHandler) validateURL(raw string) (*url.URL, error) {
@@ -245,6 +245,13 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fileFetchRefusal("invalid_dest_path")
 	}
+	// No name is assigned to the staging inode until its bytes are verified.
+	// Keep the descriptor open through publication; never reopen a staging name.
+	temp, err := fileFetchOpenStaging(root)
+	if err != nil {
+		return nil, fileFetchRefusal("staging_unavailable")
+	}
+	defer temp.Close()
 
 	deadline, cancel := context.WithTimeout(ctx.Context(), fileFetchTimeout)
 	defer cancel()
@@ -298,16 +305,6 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, fileFetchRefusal("size_exceeded")
 	}
 
-	tempName := ".file-fetch-" + rand.Text()
-	// Keep the temporary entry directly under the workspace descriptor. All
-	// operations, including Rename's destination resolution, use this SAME root;
-	// a concurrently replaced ancestor cannot redirect publication or cleanup.
-	temp, err := root.OpenFile(tempName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return nil, fileFetchRefusal("write_failed")
-	}
-	defer root.Remove(tempName)
-	defer temp.Close()
 	hash := sha256.New()
 	n, err := io.Copy(io.MultiWriter(temp, hash), io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
@@ -326,16 +323,16 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	if err := temp.Sync(); err != nil {
 		return nil, fileFetchRefusal("write_failed")
 	}
-	if err := temp.Close(); err != nil {
-		return nil, fileFetchRefusal("write_failed")
-	}
 	if deadline.Err() != nil || ctx.CancelRequestedNow() {
 		return nil, fileFetchRefusal("cancelled_or_timeout")
 	}
 	if (h.Enabled != nil && !h.Enabled()) || (h.Enabled == nil && h.Disabled) {
 		return nil, fileFetchRefusal("files_disabled")
 	}
-	if err := root.Rename(tempName, dest); err != nil {
+	if err := fileFetchPublish(root, temp, dest); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, fileFetchRefusal("destination_exists")
+		}
 		return nil, fileFetchRefusal("publish_failed")
 	}
 	// No URL, token, payload, response headers/body or destination in logs.

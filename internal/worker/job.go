@@ -406,7 +406,7 @@ var gatedJobTypeReasons = map[string]string{
 	JobTypeFileReadRangeV2:    "conditional ranges require Linux artifact observations and the node's Files permission",
 	JobTypeFileWrite:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileWriteBytes:     "this node has no workspace directory configured",
-	JobTypeFileFetch:          "FILE_FETCH requires a workspace, Files permission and a trusted HTTPS coordinator origin",
+	JobTypeFileFetch:          "FILE_FETCH requires supported Linux anonymous staging, a workspace, Files permission and a trusted HTTPS coordinator origin",
 	JobTypeFileEdit:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileList:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileSearch:         "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,6 +25,9 @@ const fileFetchTestToken = "opaque_signed-capability.signature"
 
 func fileFetchFixture(t *testing.T, serve http.HandlerFunc) (*FileFetchHandler, *nexus.Job) {
 	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("FILE_FETCH requires Linux O_TMPFILE")
+	}
 	srv := httptest.NewTLSServer(serve)
 	t.Cleanup(srv.Close)
 	h := NewFileFetchHandler(t.TempDir(), func() string { return "https://example.com" })
@@ -71,12 +75,6 @@ func TestFileFetchSuccess(t *testing.T) {
 	job.Payload["body"] = "ignored"
 	job.Payload["allow_private"] = "true"
 	job.Payload["follow_redirects"] = "true"
-	if err := os.Mkdir(filepath.Join(h.WorkspaceDir, "chapters"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(h.WorkspaceDir, "chapters/film.mp4"), []byte("old film"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	var logs []string
 	out, err := h.Execute(JobContext{LogFn: func(_ string, msg string) { logs = append(logs, msg) }}, job)
 	if err != nil {
@@ -97,12 +95,132 @@ func TestFileFetchSuccess(t *testing.T) {
 	if body, err := os.ReadFile(want); err != nil || string(body) != "film bytes" {
 		t.Fatalf("bad staged content %q: %v", body, err)
 	}
+	if info, err := os.Stat(want); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("published mode: %v %v", info, err)
+	}
 	for _, log := range logs {
 		if strings.Contains(log, fileFetchTestToken) || strings.Contains(log, "https://") || strings.Contains(log, "film.mp4") {
 			t.Fatalf("sensitive log: %s", log)
 		}
 	}
 	assertFileFetchClean(t, h.WorkspaceDir)
+}
+
+func TestFileFetchCreateOnly(t *testing.T) {
+	for _, when := range []string{"before_transfer", "before_publish"} {
+		t.Run(when, func(t *testing.T) {
+			h, job := fileFetchFixture(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "film bytes") })
+			job.Payload["dest_path"] = "film.mp4"
+			path := filepath.Join(h.WorkspaceDir, "film.mp4")
+			create := func() {
+				if err := os.WriteFile(path, []byte("other writer"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if when == "before_transfer" {
+				create()
+			} else {
+				calls := 0
+				h.Enabled = func() bool {
+					calls++
+					if calls == 2 {
+						create()
+					}
+					return true
+				}
+			}
+			out, err := h.Execute(JobContext{}, job)
+			if err == nil || !strings.Contains(err.Error(), "destination_exists") || len(out) != 0 {
+				t.Fatalf("existing destination accepted: %s %v", out, err)
+			}
+			if data, err := os.ReadFile(path); err != nil || string(data) != "other writer" {
+				t.Fatalf("existing destination changed: %q %v", data, err)
+			}
+			assertFileFetchClean(t, h.WorkspaceDir)
+		})
+	}
+}
+
+func TestFileFetchConcurrentCreateOnly(t *testing.T) {
+	h, job := fileFetchFixture(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "film bytes") })
+	done := make(chan error, 8)
+	for range cap(done) {
+		go func() { _, err := h.Execute(JobContext{}, job); done <- err }()
+	}
+	successes := 0
+	for range cap(done) {
+		if err := <-done; err == nil {
+			successes++
+		} else if !strings.Contains(err.Error(), "destination_exists") {
+			t.Errorf("unexpected competing-writer refusal: %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("create-only publication had %d winners", successes)
+	}
+	if data, err := os.ReadFile(filepath.Join(h.WorkspaceDir, job.Payload["dest_path"])); err != nil || string(data) != "film bytes" {
+		t.Fatalf("published content changed: %q %v", data, err)
+	}
+	assertFileFetchClean(t, h.WorkspaceDir)
+}
+
+// The permission callback runs after hashing/sync, exactly where replacing a
+// visible temporary entry previously allowed unverified bytes to be published.
+func TestFileFetchAnonymousStagingCannotBeSubstitutedByName(t *testing.T) {
+	h, job := fileFetchFixture(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "film bytes") })
+	job.Payload["dest_path"] = "film.mp4"
+	calls := 0
+	h.Enabled = func() bool {
+		calls++
+		if calls == 2 {
+			entries, err := os.ReadDir(h.WorkspaceDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Errorf("staging inode has a visible name before publication: %v", entries)
+			}
+			// A substitution attack would discover and replace the named temp.
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".file-fetch-") {
+					path := filepath.Join(h.WorkspaceDir, entry.Name())
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte("unverified bytes"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+		}
+		return true
+	}
+	if _, err := h.Execute(JobContext{}, job); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("did not exercise post-verification boundary: %d callbacks", calls)
+	}
+	if data, err := os.ReadFile(filepath.Join(h.WorkspaceDir, "film.mp4")); err != nil || string(data) != "film bytes" {
+		t.Fatalf("published unverified data: %q %v", data, err)
+	}
+	assertFileFetchClean(t, h.WorkspaceDir)
+}
+
+func TestFileFetchUnsupportedFilesystemRefusesBeforeHTTP(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("procfs fixture requires Linux")
+	}
+	h, job := fileFetchFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("unsupported storage reached HTTP") })
+	h.WorkspaceDir = "/proc"
+	job.Payload["dest_path"] = "file-fetch-test-unsupported"
+	if h.Configured() {
+		t.Fatal("procfs advertised anonymous staging")
+	}
+	out, err := h.Execute(JobContext{}, job)
+	if err == nil || !strings.Contains(err.Error(), "staging_unavailable") || len(out) != 0 {
+		t.Fatalf("unsupported storage accepted: %s %v", out, err)
+	}
 }
 
 func TestFileFetchRefusalsPreserveOldFile(t *testing.T) {

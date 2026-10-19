@@ -7,7 +7,11 @@ the release remains paired with Film S1 (`video-compose` v1).
 
 The platform must require exact-node `FILE_FETCH` support before routing a
 staging request. The worker advertises that exact job type only when a workspace,
-Files permission and a valid HTTPS coordinator origin are configured. Revocation
+Files permission and a valid HTTPS coordinator origin are configured, and a
+workspace probe confirms Linux anonymous staging and create-only FD publication.
+Other operating systems and unsupported kernels, filesystems or sandbox policies
+omit this capability. The probe links an empty anonymous inode to a random probe
+name, checks create-only refusal, then removes that entry. Revocation
 of Files removes the capability and refuses execution/publication. The origin
 comes from the existing device configuration's `api_base_url`, read afresh, with
 no job-supplied origin override.
@@ -44,12 +48,36 @@ special-purpose and node-owned addresses. Reconnects repeat these checks.
 coordinator may mint capabilities with a stricter ceiling. The handler caps
 network execution at five minutes (or an earlier job deadline), honors hard and
 cooperative cancellation, and requires SHA-256 verification before publication.
-The destination is a clean workspace-relative path. Filesystem operations use a
-single `os.Root` descriptor, including temporary-file cleanup and atomic rename;
-ancestor symlink replacement cannot redirect publication outside that root.
-Temporary files use exclusive creation and mode 0600. A failed fetch preserves
-an existing destination and removes its temporary staging file. Subdirectory
-mounts that prevent an atomic rename yield a publication refusal.
+The destination is a clean workspace-relative path. An `O_TMPFILE` inode on the
+workspace filesystem holds the download with mode 0600 and no directory entry.
+After hash verification and sync, `linkat` publishes directly from its still-open
+descriptor into a destination parent opened beneath the original `os.Root`.
+Publication is atomic and **create-only**: an existing file, directory or symlink
+is never replaced. An existing regular file yields `destination_exists` (other
+invalid entries can yield `invalid_dest_path`); a concurrent destination creation
+also refuses. Failed fetches close the anonymous inode and leave no staging name.
+There is no named-temp or overwrite fallback. Subdirectory mounts that prevent
+hard linking yield a publication refusal.
+
+Publication first tries `linkat` with `AT_EMPTY_PATH`. Where an unprivileged
+account receives `EPERM` or `ENOENT`, it uses the Linux `/proc/self/fd` alternative:
+open and pin that directory, verify its filesystem is procfs, and `linkat` the
+still-open staging FD entry with `AT_SYMLINK_FOLLOW`. Both paths link the same
+verified inode and refuse existing destinations. Missing/unsupported primitives
+fail closed; execution checks anonymous creation again before HTTP and refuses
+publication errors. The primitive probe is repeated when checking advertisement.
+
+This closes substitution of a visible staging filename between hashing and
+publication. It does **not** isolate the worker from arbitrary malicious code
+running under the same UID: such code can access process descriptors, move
+directories or change published content. The hash authenticates bytes at
+publication, not their integrity against later local modification.
+
+For Drive references over 25 MiB, the platform must allocate a unique, previously
+unused workspace-relative staging destination, dispatch it as `dest_path`, and
+propagate the returned absolute path into the manifest and node-backed FileValue.
+Retries must allocate a fresh destination or explicitly handle `destination_exists`.
+The existing small-file byte-write path retains its existing behavior.
 
 Success returns `{ "path": "<absolute workspace path>", "bytes": 10,
 "sha256": "<verified digest>" }`. Refusals are sanitized JSON errors with a

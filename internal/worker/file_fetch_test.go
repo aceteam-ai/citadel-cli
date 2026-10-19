@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"math"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -33,8 +34,9 @@ func TestFileFetchCapabilityRequiresWorkspaceFilesAndOrigin(t *testing.T) {
 				WorkspaceDir: workspace, FilesDisabled: !tc.files,
 				FileFetchOrigin: func() string { return tc.origin },
 			})
-			if got := anyHandles(handlers, JobTypeFileFetch); got != tc.want {
-				t.Fatalf("FILE_FETCH available=%t want=%t", got, tc.want)
+			want := tc.want && runtime.GOOS == "linux"
+			if got := anyHandles(handlers, JobTypeFileFetch); got != want {
+				t.Fatalf("FILE_FETCH available=%t want=%t", got, want)
 			}
 			runner := NewRunner(nil, handlers, RunnerConfig{})
 			advertised := false
@@ -43,10 +45,29 @@ func TestFileFetchCapabilityRequiresWorkspaceFilesAndOrigin(t *testing.T) {
 					advertised = true
 				}
 			}
-			if advertised != tc.want {
-				t.Fatalf("FILE_FETCH advertised=%t want=%t", advertised, tc.want)
+			if advertised != want {
+				t.Fatalf("FILE_FETCH advertised=%t want=%t", advertised, want)
 			}
 		})
+	}
+}
+
+func TestFileFetchCapabilityOmitsUnsupportedStorage(t *testing.T) {
+	for _, workspace := range []string{"/proc", "/nonexistent/file-fetch-workspace"} {
+		handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+			WorkspaceDir: workspace, FileFetchOrigin: func() string { return "https://example.com" },
+		})
+		if anyHandles(handlers, JobTypeFileFetch) {
+			t.Fatalf("unsupported workspace advertised FILE_FETCH: %s", workspace)
+		}
+		for _, typ := range NewRunner(nil, handlers, RunnerConfig{}).SupportedJobTypes() {
+			if typ == JobTypeFileFetch {
+				t.Fatalf("unsupported workspace advertised FILE_FETCH: %s", workspace)
+			}
+		}
+		if !anyHandles(handlers, JobTypeFileWriteBytes) {
+			t.Fatal("unsupported FILE_FETCH storage affected existing byte writer")
+		}
 	}
 }
 
@@ -91,6 +112,9 @@ func TestFileFetchAdapterBoundedNumericMaxBytes(t *testing.T) {
 }
 
 func TestFileFetchCapabilityFollowsLivePermissionAndOrigin(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("FILE_FETCH requires Linux O_TMPFILE")
+	}
 	files := false
 	origin := "https://example.com"
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{

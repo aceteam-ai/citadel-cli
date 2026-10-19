@@ -33,12 +33,15 @@ So, when adding to this file:
 
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPrefix`; `worker.CreateLegacyHandlersWithOpts`
-advertises `FILE_FETCH` only with a workspace, live Files permission and the
-trusted coordinator HTTPS origin from existing device configuration. Tests in
+advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,
+live Files permission and the trusted coordinator HTTPS origin from existing
+device configuration. Tests in
 `internal/jobs/file_fetch_test.go` and `internal/worker/file_fetch_test.go` cover
 the URL/network/filesystem boundaries and live capability gating. The dedicated
 coordinator endpoint owns capability HMAC verification and mint/fetch audit;
-the node never needs the HMAC secret. See `docs/file-fetch.md` for the contract.
+the node never needs the HMAC secret. Publication is FD-based and create-only;
+the platform supplies a unique staging destination. See `docs/file-fetch.md` for
+the contract.
 
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
