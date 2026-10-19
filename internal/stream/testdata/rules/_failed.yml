@@ -1,0 +1,24 @@
+{
+  "title": "Synthetic failed login selection",
+  "name": "_failed",
+  "logsource": {
+    "category": "webserver"
+  },
+  "detection": {
+    "selection": {
+      "http.request.method": "POST",
+      "url.original|startswith": "/login",
+      "http.response.status_code": [
+        401,
+        403
+      ]
+    },
+    "condition": "selection"
+  },
+  "x-aceteam": {
+    "escalate": false,
+    "group_by": [
+      "source.ip"
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "title": "Synthetic sensitive path probes",
+  "name": "R3",
+  "logsource": {
+    "category": "webserver"
+  },
+  "detection": {
+    "selection": {
+      "http.request.line|contains": [
+        "/.env",
+        "/wp-admin",
+        "/wp-login",
+        "/etc/passwd",
+        "/.git",
+        "/phpmyadmin",
+        "../"
+      ]
+    },
+    "condition": "selection"
+  },
+  "x-aceteam": {
+    "group_by": [
+      "source.ip"
+    ]
+  }
+}
