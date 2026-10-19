@@ -33,6 +33,11 @@ claude mcp add aceteam -- citadel mcp
 
 Your AI agent can then manage nodes, deploy models, run inference, execute commands, and search documents on your own hardware. See [docs/mcp-server.md](docs/mcp-server.md) for the full tool reference (60+ tools).
 
+Workers with Files enabled and a configured HTTPS coordinator origin advertise
+`FILE_FETCH` for staging large documents by reference. This typed job requires
+a short-lived coordinator capability and SHA-256; it streams into the workspace
+and publishes the verified file atomically. See [the FILE_FETCH contract](docs/file-fetch.md).
+
 ## Documentation
 
 Full documentation is available at **[aceteam-ai.github.io/citadel-cli](https://aceteam-ai.github.io/citadel-cli/)** -- including architecture guides, tutorials, command reference, and development docs.
