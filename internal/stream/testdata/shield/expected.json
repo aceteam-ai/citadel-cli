@@ -1,0 +1,43 @@
+{
+  "a_clean": {
+    "flagged": {},
+    "stat_only": []
+  },
+  "b_sqli_knownbad": {
+    "flagged": {
+      "203.0.113.9": ["R2"],
+      "203.0.113.66": ["R1"]
+    },
+    "stat_only": []
+  },
+  "c_ambiguous_crawler": {
+    "flagged": {},
+    "stat_only": ["192.0.2.150"]
+  },
+  "d_repeat_credstuffing": {
+    "flagged": {
+      "192.0.2.200": ["R3"],
+      "198.51.100.140": ["R4", "R5"]
+    },
+    "stat_only": []
+  },
+  "e_fail_then_success": {
+    "flagged": {
+      "198.18.1.50": ["R4", "R5"],
+      "198.18.1.60": ["R4"]
+    },
+    "stat_only": []
+  },
+  "e2_split_ip_fail_then_success": {
+    "flagged": {
+      "198.18.2.143": ["R5"]
+    },
+    "stat_only": []
+  },
+  "f_multikey_match": {
+    "flagged": {
+      "198.18.9.14": ["R3"]
+    },
+    "stat_only": ["198.18.5.20"]
+  }
+}
