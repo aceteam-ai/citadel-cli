@@ -18,7 +18,16 @@
 
 services:
   diffusers:
-    image: ghcr.io/aceteam-ai/diffusers-service:latest
+    # Pinned to an immutable build (citadel-cli#1346), never the floating
+    # :latest. `docker compose up` only pulls an image that is missing locally,
+    # so a node holding an old :latest kept it forever while this file's
+    # defaults (DIFFUSERS_MODEL below) moved on, and every request failed. A
+    # pinned digest is missing on such a node, so the next start pulls it and
+    # recreates the container. The tag is the main commit that built the image
+    # (build-diffusers-service.yml); the digest is what is verified. Bump both
+    # in a follow-up PR after each sidecar build, and register the new
+    # template hash in known_hashes.go.
+    image: ghcr.io/aceteam-ai/diffusers-service:576734e422e61e4587b7c6f0082a5a3fb930467d@sha256:6f180d3cc76e4655810d63db7231b112dc55becf4aca5e554a49e6d4da2d9a49
     container_name: citadel-diffusers
     # Host port is owned by citadel (services/ports.go), supplied via
     # CITADEL_DIFFUSERS_HOST_PORT. Loopback-only publish (127.0.0.1) by default
