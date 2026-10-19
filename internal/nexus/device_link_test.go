@@ -86,3 +86,33 @@ func TestLinkRegisteredNodeNeverFollowsRedirect(t *testing.T) {
 		t.Fatal("redirect must fail without forwarding enrollment credentials")
 	}
 }
+
+func TestServerVersionReadsVersionField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/version" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		fmt.Fprint(w, `{"version":"1.520.0","sha":"abc","service":"web"}`)
+	}))
+	defer srv.Close()
+	v, err := NewDeviceAuthClient(srv.URL).ServerVersion(context.Background())
+	if err != nil || v != "1.520.0" {
+		t.Fatalf("version = %q, %v", v, err)
+	}
+}
+
+func TestServerVersionUnreadableIsAnError(t *testing.T) {
+	for name, handler := range map[string]http.HandlerFunc{
+		"not found":     func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) },
+		"empty version": func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"version":""}`) },
+		"not json":      func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `<html>`) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(handler)
+			defer srv.Close()
+			if v, err := NewDeviceAuthClient(srv.URL).ServerVersion(context.Background()); err == nil {
+				t.Fatalf("unreadable version must be an error, got %q", v)
+			}
+		})
+	}
+}

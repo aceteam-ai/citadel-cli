@@ -47,3 +47,31 @@ func (c *DeviceAuthClient) LinkRegisteredNode(ctx context.Context, deviceCode, n
 	}
 	return nil
 }
+
+// ServerVersion reads the auth service's release version from /api/version.
+// Callers use it only to interpret a link refusal; an unreadable version is
+// reported as an error, never guessed.
+func (c *DeviceAuthClient) ServerVersion(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/version", nil)
+	if err != nil {
+		return "", fmt.Errorf("could not prepare server version request")
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("server version request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("server version unavailable (HTTP %d)", resp.StatusCode)
+	}
+	var result struct {
+		Version string `json:"version"`
+	}
+	if err := decodeBoundedDeviceAuthJSON(resp.Body, &result, "server version response"); err != nil {
+		return "", err
+	}
+	if result.Version == "" {
+		return "", fmt.Errorf("server version response has no version")
+	}
+	return result.Version, nil
+}

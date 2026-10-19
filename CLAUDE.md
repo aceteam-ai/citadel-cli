@@ -1551,6 +1551,14 @@ HMAC envelope, not a device-origin signature. No control transport consumes it.
 After device-grant registration, `cmd.linkDeviceEnrollment` completes the
 server's reserved registration proof through the existing device link route;
 link refusal must propagate before enrollment can report success (#1344).
+`cmd.linkDeviceEnrollmentGated` decides when a refusal is fatal: only when the
+auth service's `/api/version` reports at least `deviceLinkEnforcedFrom`
+(v1.520.0, aceteam#11743, the first release that creates a missing device
+configuration). An older server refuses every grant approved without the
+onboarding wizard, and an unreadable version proves nothing, so both warn and
+continue. A fatal refusal also clears the device credentials saved earlier in
+the same enrollment, so the next `citadel init` authenticates again instead of
+treating an unlinked token as configured.
 Control Center passes the approved modal's `deviceCode` into its connect
 callback and gates both success display and worker startup on completed linking.
 The public link request uses that grant and the server's reserved used
