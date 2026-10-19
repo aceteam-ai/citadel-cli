@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"gopkg.in/yaml.v3"
 )
@@ -308,6 +309,45 @@ func TestEnrollmentNodeIDUsesThisProcessRegistrationAfterDisconnect(t *testing.T
 	setRegisteredNodeID("1234")
 	if id := enrollmentNodeID(context.Background()); id != "1234" {
 		t.Fatalf("enrollment node ID after disconnect = %q, want the registered 1234", id)
+	}
+}
+
+func TestRecordRegistrationThenDisconnectRecordsBeforeDisconnect(t *testing.T) {
+	t.Cleanup(func() { setRegisteredNodeID("") })
+	setRegisteredNodeID("")
+	var order []string
+	status := func(context.Context) (*network.NetworkStatus, error) {
+		order = append(order, "status")
+		return &network.NetworkStatus{NodeID: "1879"}, nil
+	}
+	disconnect := func() error {
+		order = append(order, "disconnect")
+		registeredNodeID.Lock()
+		got := registeredNodeID.id
+		registeredNodeID.Unlock()
+		if got != "1879" {
+			t.Errorf("node ID at disconnect = %q, want 1879 recorded first", got)
+		}
+		return nil
+	}
+	recordRegistrationThenDisconnect(context.Background(), status, disconnect)
+	if strings.Join(order, ",") != "status,disconnect" {
+		t.Fatalf("call order = %v, want status before disconnect", order)
+	}
+}
+
+func TestRecordRegistrationThenDisconnectStatusErrorStillDisconnects(t *testing.T) {
+	t.Cleanup(func() { setRegisteredNodeID("") })
+	setRegisteredNodeID("")
+	disconnected := false
+	recordRegistrationThenDisconnect(context.Background(),
+		func(context.Context) (*network.NetworkStatus, error) { return nil, errors.New("no status") },
+		func() error { disconnected = true; return nil })
+	if !disconnected {
+		t.Fatal("a status failure must still disconnect")
+	}
+	if id := enrollmentNodeID(context.Background()); id != "" {
+		t.Fatalf("no ID may be recorded when status fails, got %q", id)
 	}
 }
 
