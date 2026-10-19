@@ -46,7 +46,34 @@ type deviceLinker interface {
 // network actually registered. Never fall back to saved credentials/hostname/IP:
 // a stale reservation or a previously connected node must fail at the server.
 func linkDeviceEnrollment(result *DeviceAuthResult) error {
-	return linkDeviceEnrollmentGated(result, network.GetGlobalNodeID, nexus.NewDeviceAuthClient(authServiceURL))
+	return linkDeviceEnrollmentGated(result, enrollmentNodeID, nexus.NewDeviceAuthClient(authServiceURL))
+}
+
+// registeredNodeID holds the Headscale node ID that this process's most recent
+// connectToNetwork registration returned. connectToNetwork disconnects before
+// it returns so tsnet flushes its state, and after that the global server can
+// no longer report the ID; without this, init and enroll never linked.
+var registeredNodeID struct {
+	sync.Mutex
+	id string
+}
+
+func setRegisteredNodeID(id string) {
+	registeredNodeID.Lock()
+	defer registeredNodeID.Unlock()
+	registeredNodeID.id = id
+}
+
+// enrollmentNodeID is the identity the network actually registered: the live
+// connection's node ID, else the one this process's registration just
+// returned. Never a saved credential, hostname or IP.
+func enrollmentNodeID(ctx context.Context) string {
+	if id := network.GetGlobalNodeID(ctx); id != "" {
+		return id
+	}
+	registeredNodeID.Lock()
+	defer registeredNodeID.Unlock()
+	return registeredNodeID.id
 }
 
 // linkDeviceEnrollmentGated links the enrollment and decides whether a failure
