@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
@@ -479,9 +480,7 @@ func (s *APISource) Ack(ctx context.Context, job *Job) error {
 // Nack indicates job failure.
 // For the API, this updates status but does NOT ACK - allowing retry.
 func (s *APISource) Nack(ctx context.Context, job *Job, err error) error {
-	s.client.SetJobStatus(ctx, job.ID, "failed", map[string]any{
-		"error": err.Error(),
-	})
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
 	// Don't ACK - let it retry
 	return nil
 }
@@ -524,10 +523,7 @@ func (s *APISource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err
 // ACK the message so it is removed from the consumer group's PEL. Used for
 // failures that will never succeed on retry (e.g. an unsupported job type).
 func (s *APISource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
-	status := map[string]any{"error": err.Error()}
-	for k, v := range data {
-		status[k] = v
-	}
+	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 	queue := job.SourceQueue
 	if queue == "" {

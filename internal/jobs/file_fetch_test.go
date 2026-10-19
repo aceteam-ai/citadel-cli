@@ -711,3 +711,19 @@ func TestFileFetchCancellationAndPermissionRevocation(t *testing.T) {
 		})
 	}
 }
+
+func TestFileFetchCancellationPrecedesPartialBodyHash(t *testing.T) {
+	var requested atomic.Bool
+	h, job := fileFetchFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "partial bytes")
+		requested.Store(true)
+	})
+	out, err := h.Execute(JobContext{CancelRequested: requested.Load}, job)
+	if err == nil || !strings.Contains(err.Error(), "cancelled_or_timeout") || len(out) != 0 {
+		t.Fatalf("known cancellation was classified as a partial-body hash failure: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(h.WorkspaceDir, job.Payload["dest_path"])); !os.IsNotExist(err) {
+		t.Fatal("cancelled partial body was published")
+	}
+	assertFileFetchClean(t, h.WorkspaceDir)
+}

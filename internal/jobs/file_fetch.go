@@ -326,10 +326,12 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 
 	hash := sha256.New()
 	n, err := io.Copy(io.MultiWriter(temp, hash), io.LimitReader(resp.Body, maxBytes+1))
+	// Cancellation can terminate a partial body with EOF and no Copy error.
+	// Observe cancellation before classifying partial bytes as a hash mismatch.
+	if deadline.Err() != nil || ctx.CancelRequestedNow() {
+		return nil, fileFetchRefusal("cancelled_or_timeout")
+	}
 	if err != nil {
-		if deadline.Err() != nil {
-			return nil, fileFetchRefusal("cancelled_or_timeout")
-		}
 		return nil, fileFetchRefusal("transfer_failed")
 	}
 	if n > maxBytes {

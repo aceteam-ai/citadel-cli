@@ -46,6 +46,26 @@ and fetch. Invalid or expired capabilities receive HTTP 401, 403 or 410.
 This contract requires no new secret
 or persistence on the node.
 
+The bounded capability may be carried in trusted Redis while the original
+delivery is in flight. Retained job diagnostics and dead-letter payloads omit it;
+failed/retry status and logs redact reflected credentials, including failures
+before handler execution. A successful FILE_FETCH acknowledgment atomically
+acknowledges and deletes its original entry; ordinary job retention is unchanged.
+An unacknowledged retry uses only that original pending delivery. The platform
+also requests payload purging and enforces single-use redemption and a maximum
+ten-minute lifetime. Before exposing any terminal result (success, refusal or
+error), and on dispatch timeout, the platform must revoke any unused nonce for
+its remaining lifetime. The node only acknowledges/deletes its delivery; it
+does not inspect the opaque HMAC claims or revoke coordinator authorization.
+
+After a terminal result, retained copies grant no further fetch because their
+nonce has been consumed or revoked. Accepted residual: a crash before terminal
+cleanup can leave an unredeemed token in Redis AOF/crash artifacts until its
+signed expiry, bounded by ten minutes. Consumed, revoked or expired tokens can
+remain in persistence history but grant no further fetch. Deleting a live entry
+does not claim to erase that history. This contract adds no node-side nonce
+binding fields, nonce-key writes, cluster requirements or ACL permissions.
+
 The handler performs a fixed HTTPS GET with no caller-provided headers/body,
 redirects, environment proxy or compression. TLS verifies the origin using the
 system trust store. Every connection resolves and validates all DNS answers;

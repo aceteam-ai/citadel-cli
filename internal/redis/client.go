@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -599,7 +600,7 @@ func (c *Client) MoveToDLQFromQueue(ctx context.Context, queue string, job *Job,
 	fields := map[string]interface{}{
 		"original_message_id": job.MessageID,
 		"original_queue":      queue,
-		"reason":              reason,
+		"reason":              jobprivacy.Text(job.Type, job.Payload, reason),
 		"moved_at":            time.Now().UTC().Format(time.RFC3339),
 		"worker_id":           c.workerID,
 		"jobId":               job.JobID,
@@ -612,7 +613,7 @@ func (c *Client) MoveToDLQFromQueue(ctx context.Context, queue string, job *Job,
 		fields["enqueuedAt"] = ea
 	}
 
-	if payloadBytes, err := json.Marshal(job.Payload); err == nil {
+	if payloadBytes, err := json.Marshal(jobprivacy.Payload(job.Type, job.Payload)); err == nil {
 		fields["payload"] = string(payloadBytes)
 	}
 
@@ -707,7 +708,7 @@ func (c *Client) MoveToDLQ(ctx context.Context, job *Job, reason string) error {
 	fields := map[string]interface{}{
 		"original_message_id": job.MessageID,
 		"original_queue":      c.queueName,
-		"reason":              reason,
+		"reason":              jobprivacy.Text(job.Type, job.Payload, reason),
 		"moved_at":            time.Now().UTC().Format(time.RFC3339),
 		"worker_id":           c.workerID,
 		"jobId":               job.JobID,
@@ -721,7 +722,7 @@ func (c *Client) MoveToDLQ(ctx context.Context, job *Job, reason string) error {
 	}
 
 	// Include original payload
-	if payloadBytes, err := json.Marshal(job.Payload); err == nil {
+	if payloadBytes, err := json.Marshal(jobprivacy.Payload(job.Type, job.Payload)); err == nil {
 		fields["payload"] = string(payloadBytes)
 	}
 
