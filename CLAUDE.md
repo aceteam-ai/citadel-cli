@@ -1230,14 +1230,15 @@ survive; then only the vouched-for headers (incl. `X-Ingress-Subject` from the
 authz decision) are set. `ModifyResponse` runs `rewriteSetCookie` to strip
 `Domain=` and add `Secure` on every upstream `Set-Cookie`.
 
-**TLS:** wildcard via certmagic DNS-01. certmagic's `DNS01Solver` does NOT follow
-CNAMEs (verified against v0.25.x), so `ACMEConfig.DNSZone` is set as
-`DNSManager.OverrideDomain` — publish the challenge TXT directly on the delegated
-zone the scoped RFC 2136 / TSIG credential can write. `StaticFileCertProvider`
-(mount an already-issued wildcard) is the recommended FIRST deployment; the ACME
-path lights up once the delegated zone + nameserver (separate design) exist.
-certmagic + `libdns/rfc2136` are new deps (+15 modules); the DNS provider is
-behind certmagic's own `DNSProvider` interface, so swapping it is one line.
+**TLS:** wildcard via certmagic DNS-01. `ingress.dnsProviderFor` owns the
+backend choice: a Cloudflare API token (for an apps zone hosted on Cloudflare,
+which has no RFC 2136 interface) or an RFC 2136 / TSIG server, exactly one,
+with both or neither refused. certmagic's `DNS01Solver` does NOT follow CNAMEs
+(verified against v0.25.x), so the RFC 2136 path requires `ACMEConfig.DNSZone`
+as `DNSManager.OverrideDomain` and publishes the challenge TXT directly on the
+delegated zone its credential can write; the Cloudflare token writes the apps
+zone itself, so `DNSZone` stays optional there. `StaticFileCertProvider` (mount
+an already-issued wildcard) remains the simplest first deployment.
 
 **Health lives on the public :443 listener under the reserved host
 `_health.<apps-domain>`** (`server.go`), not a loopback endpoint — a completed

@@ -21,6 +21,7 @@ require (
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/gowebpki/jcs v1.0.1
 	github.com/hashicorp/go-version v1.8.0
+	github.com/libdns/cloudflare v0.2.2
 	github.com/libdns/rfc2136 v1.0.1
 	github.com/mattn/go-runewidth v0.0.19
 	github.com/mdp/qrterminal/v3 v3.2.1
