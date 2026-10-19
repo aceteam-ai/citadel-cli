@@ -164,6 +164,9 @@ func validSDName(value string) bool {
 
 // Validate RFC5424 structured data without interpreting its values as code or
 // flattening attacker-controlled names into the ECS namespace.
+// RFC5424 section 6.3.3 permits repeated parameters and requires preserving
+// unknown backslash sequences literally. Retaining the original SD bytes
+// avoids both last-parameter-wins loss and escape reinterpretation.
 func splitStructuredData(value string) (string, string, error) {
 	bad := errors.New("invalid RFC5424 structured data")
 	if value == "-" {
@@ -185,7 +188,6 @@ func splitStructuredData(value string) (string, string, error) {
 			return "", "", bad
 		}
 		ids[id] = true
-		params := make(map[string]bool)
 		for position < len(value) && value[position] == ' ' {
 			position++
 			start = position
@@ -193,10 +195,9 @@ func splitStructuredData(value string) (string, string, error) {
 				position++
 			}
 			name := value[start:position]
-			if !validSDName(name) || params[name] || position+1 >= len(value) || value[position+1] != '"' {
+			if !validSDName(name) || position+1 >= len(value) || value[position+1] != '"' {
 				return "", "", bad
 			}
-			params[name] = true
 			position += 2
 			closed := false
 			for position < len(value) {
@@ -210,10 +211,12 @@ func splitStructuredData(value string) (string, string, error) {
 					return "", "", bad
 				}
 				if char == '\\' {
-					if position == len(value) || !strings.ContainsRune(`\"]`, rune(value[position])) {
+					if position == len(value) {
 						return "", "", bad
 					}
-					position++
+					if strings.ContainsRune(`\"]`, rune(value[position])) {
+						position++
+					}
 				}
 			}
 			if !closed {

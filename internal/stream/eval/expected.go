@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/aceteam-ai/citadel-cli/internal/stream/input"
 	"github.com/aceteam-ai/citadel-cli/internal/stream/ops"
 )
 
@@ -41,18 +43,17 @@ type Comparison struct {
 }
 
 func compareExpected(path string, scenarios []Scenario) (*Comparison, error) {
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
-		return nil, errors.New("stream eval expectations must be a bounded regular file")
-	}
-	file, err := os.Open(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil { return nil, errors.New("stream eval could not open expectations directory") }
+	defer root.Close()
+	file, err := input.OpenRegular(root, filepath.Base(path))
 	if err != nil {
 		return nil, errors.New("stream eval could not open expectations")
 	}
 	defer file.Close()
 	opened, err := file.Stat()
-	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, errors.New("stream eval expectations changed while opening")
+	if err != nil || opened.Size() < 0 || opened.Size() > 1<<20 {
+		return nil, errors.New("stream eval expectations must be a bounded regular file")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
 	if err != nil || len(data) > 1<<20 {
@@ -72,10 +73,9 @@ func compareExpected(path string, scenarios []Scenario) (*Comparison, error) {
 	if _, err := validator.Token(); err != io.EOF {
 		return nil, errors.New("stream eval expectations contain trailing JSON")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var expected Expected
-	if err := decoder.Decode(&expected); err != nil || expected.Scenarios == nil || len(expected.Scenarios) != len(scenarios) {
+	expected, err := decodeExpectedExact(data)
+	if err != nil { return nil, err }
+	if expected.Scenarios == nil || len(expected.Scenarios) != len(scenarios) {
 		return nil, errors.New("stream eval expectations must label exactly the evaluated scenarios")
 	}
 	comparison := &Comparison{Unit: "unique_rule_and_group_per_scenario", Scenarios: uint64(len(scenarios)), Passed: true}
@@ -117,6 +117,37 @@ func compareExpected(path string, scenarios []Scenario) (*Comparison, error) {
 	comparison.FalseDiscoveryRate = ratio(comparison.FalsePositives, comparison.ActualMatches)
 	comparison.Passed = comparison.FalsePositives == 0 && comparison.FalseNegatives == 0
 	return comparison, nil
+}
+
+// Decode exact member names before decoding into any struct: encoding/json's
+// struct matching is case-insensitive even with DisallowUnknownFields. Aliases
+// such as Scenarios or RULE_ID must never replace previously validated labels.
+// The caller has already rejected duplicate exact keys and bounded structure.
+func decodeExpectedExact(data []byte) (Expected, error) {
+	invalid := errors.New("stream eval expectations contain invalid schema members")
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil || len(top) != 1 { return Expected{}, invalid }
+	rawScenarios, ok := top["scenarios"]
+	if !ok { return Expected{}, invalid }
+	var scenarioLabels map[string]json.RawMessage
+	if err := json.Unmarshal(rawScenarios, &scenarioLabels); err != nil || scenarioLabels == nil { return Expected{}, invalid }
+	expected := Expected{Scenarios: make(map[string][]ExpectedMatch, len(scenarioLabels))}
+	for name, rawLabels := range scenarioLabels {
+		var labels []map[string]json.RawMessage
+		if err := json.Unmarshal(rawLabels, &labels); err != nil || labels == nil { return Expected{}, invalid }
+		decoded := make([]ExpectedMatch, 0, len(labels))
+		for _, label := range labels {
+			if len(label) != 2 { return Expected{}, invalid }
+			rawRule, ruleOK := label["rule_id"]
+			rawGroup, groupOK := label["group_key"]
+			if !ruleOK || !groupOK || bytes.Equal(bytes.TrimSpace(rawRule), []byte("null")) || bytes.Equal(bytes.TrimSpace(rawGroup), []byte("null")) { return Expected{}, invalid }
+			var rule, group string
+			if json.Unmarshal(rawRule, &rule) != nil || json.Unmarshal(rawGroup, &group) != nil { return Expected{}, invalid }
+			decoded = append(decoded, ExpectedMatch{RuleID: rule, GroupKey: group})
+		}
+		expected.Scenarios[name] = decoded
+	}
+	return expected, nil
 }
 
 func validKeyDigest(key string) bool {

@@ -14,6 +14,7 @@ const sketchRegisters = 1024
 type observation struct {
 	at int64
 	hash [sha256.Size]byte
+	approximate bool
 }
 
 type windowState struct {
@@ -63,6 +64,12 @@ func NewTumblingWindow(span time.Duration, limits Limits) (*Window, error) {
 }
 
 func (w *Window) Observe(key, value string, at int64) Snapshot {
+	return w.ObserveAnnotated(key,value,at,false)
+}
+
+// ObserveAnnotated retains uncertainty inherited from an upstream correlation.
+// It is independent of whether this window's own distinct set uses a sketch.
+func (w *Window) ObserveAnnotated(key,value string,at int64,approximate bool)Snapshot{
 	if len(value) > MaxValueBytes {
 		w.state.stats.InputRejected++
 		return Snapshot{Rejected: true}
@@ -72,7 +79,7 @@ func (w *Window) Observe(key, value string, at int64) Snapshot {
 	v := w.state.touch(key, at, windowState{})
 	w.prune(&v.value, at)
 	h := sha256.Sum256([]byte(value))
-	event := observation{at: at, hash: h}
+	event := observation{at: at, hash: h,approximate:approximate}
 	if len(v.value.events) < w.state.limits.MaxEventsPerKey {
 		v.value.events = append(v.value.events, event)
 	} else {
@@ -146,6 +153,7 @@ func (w *Window) summarize(s *windowState, at int64) Snapshot {
 	exact := make(map[[sha256.Size]byte]struct{}, exactDistinctLimit+1)
 	var registers [sketchRegisters]uint8
 	for _, event := range s.events {
+		out.Approximate=out.Approximate||event.approximate
 		if len(exact) <= exactDistinctLimit { exact[event.hash] = struct{}{} }
 		hash := binary.BigEndian.Uint64(event.hash[:8])
 		index := hash & (sketchRegisters-1)

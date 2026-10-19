@@ -51,10 +51,12 @@ func parseCombined(line string) (map[string]any, error) {
 	// have a chance to select their own normalization semantics.
 	target := requestParts[1]
 	path := strings.SplitN(target, "?", 2)[0]
-	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
-		start := strings.Index(target, "://") + 3
-		if slash := strings.IndexByte(target[start:], '/'); slash >= 0 {
-			path = strings.SplitN(target[start+slash:], "?", 2)[0]
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		// Query bytes are not an authority or a path. A slash in a redirect
+		// parameter of http://host?next=/admin must not become url.path.
+		start := strings.Index(path, "://") + 3
+		if slash := strings.IndexByte(path[start:], '/'); slash >= 0 {
+			path = path[start+slash:]
 		} else {
 			path = "/"
 		}

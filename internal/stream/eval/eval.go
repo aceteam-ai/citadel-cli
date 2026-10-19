@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/stream/event"
+	"github.com/aceteam-ai/citadel-cli/internal/stream/input"
 	"github.com/aceteam-ai/citadel-cli/internal/stream/rules"
 )
 
@@ -241,7 +242,7 @@ func runScenario(ctx context.Context, root *os.Root, name string, sourceIndex in
 	if before.Size() < 0 || uint64(before.Size()) > MaxTotalBytes-*totalBytes {
 		return Scenario{}, errors.New("stream eval exceeds the total byte limit")
 	}
-	file, err := root.Open(name)
+	file, err := input.OpenRegular(root, name)
 	if err != nil {
 		return Scenario{}, errors.New("stream eval could not open an input file")
 	}

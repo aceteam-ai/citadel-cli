@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/stream/event"
+	"github.com/aceteam-ai/citadel-cli/internal/stream/input"
 	"gopkg.in/yaml.v3"
 )
 
@@ -172,7 +173,7 @@ func validID(s string) bool {
 }
 
 func readBounded(root *os.Root,name string,limit int)([]byte,error){
-	f,err:=root.Open(name)
+	f,err:=input.OpenRegular(root,name)
 	if err!=nil{return nil,err}
 	defer f.Close()
 	info,err:=f.Stat()
@@ -238,6 +239,7 @@ func compileRule(entry RuleEntry,data []byte)(*compiledRule,error){
 	if r.Extension.Rate!=nil{
 		if r.Extension.Rate.Capacity==0||r.Extension.Rate.Capacity>math.MaxInt64{return nil,fmt.Errorf("rate capacity must be positive int64")}
 		var err error;r.RateEvery,err=parseSpan(r.Extension.Rate.Every);if err!=nil{return nil,err}
+		if r.Extension.Rate.Capacity>uint64(math.MaxInt64/int64(r.RateEvery)){return nil,fmt.Errorf("rate capacity and refill interval exceed state bounds")}
 	}
 	if c,ok:=raw["correlation"];ok{
 		if _,both:=raw["detection"];both{return nil,fmt.Errorf("detection and correlation are mutually exclusive")}
@@ -258,6 +260,8 @@ func compileRule(entry RuleEntry,data []byte)(*compiledRule,error){
 				r.Compare,r.Threshold=k,n
 			}
 			if r.Compare==""||spec.Type=="value_count"&&r.ValueField==""{return nil,fmt.Errorf("correlation requires threshold and value_count requires field")}
+			if spec.Type=="event_count"&&r.ValueField!=""{return nil,fmt.Errorf("unsupported event_count condition: field")}
+			if spec.Type=="value_count"{if err:=validateFields([]string{r.ValueField});err!=nil{return nil,err}}
 		case "temporal","temporal_ordered":
 			if spec.Type=="temporal_ordered"&&len(spec.Rules)<2{return nil,fmt.Errorf("temporal_ordered requires at least two rules")}
 			if len(spec.Condition)!=0{return nil,fmt.Errorf("unsupported temporal condition")}

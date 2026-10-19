@@ -81,19 +81,19 @@ type ruleState struct {
 	clocks *clockCache
 }
 
-type clockEntry struct { key string; event event.Event; at int64; fired bool }
+type clockEntry struct { key string; event event.Event; at int64; fired bool; approximate bool }
 type clockCache struct { limit int; fields []string; entries map[string]*list.Element; lru list.List }
-func (c *clockCache) remember(key string,ev event.Event,at int64){
+func (c *clockCache) remember(key string,ev event.Event,at int64,approximate bool){
 	ev.Raw="";ev.RawRef=""
 	values:=map[string]any{}
 	for _,k:=range c.fields{if v,ok:=ev.Fields[k];ok{if s,ok:=v.(string);ok{v=strings.Clone(s)};values[k]=v}}
 	ev.Fields=values
-	if old:=c.entries[key];old!=nil{old.Value=clockEntry{key:key,event:ev,at:at};c.lru.MoveToBack(old);return}
+	if old:=c.entries[key];old!=nil{old.Value=clockEntry{key:key,event:ev,at:at,approximate:approximate};c.lru.MoveToBack(old);return}
 	if len(c.entries)==c.limit{old:=c.lru.Front();delete(c.entries,old.Value.(clockEntry).key);c.lru.Remove(old)}
-	key=strings.Clone(key);c.entries[key]=c.lru.PushBack(clockEntry{key:key,event:ev,at:at})
+	key=strings.Clone(key);c.entries[key]=c.lru.PushBack(clockEntry{key:key,event:ev,at:at,approximate:approximate})
 }
 
-type timerMatch struct { rule *compiledRule; missing ops.Missing; event event.Event }
+type timerMatch struct { rule *compiledRule; missing ops.Missing; event event.Event; approximate bool }
 
 type pendingEvent struct { event event.Event; at int64; order uint64 }
 type pendingHeap []pendingEvent
@@ -202,6 +202,7 @@ func (e *Engine) Advance(at int64)([]Alert,error){
 	meta.TMonoNS=at
 	out=append(out,e.absences(meta,at)...)
 	if e.failure!=nil{return nil,e.failure}
+	e.expireState(at)
 	e.lastAt=at;e.lastEvent=meta
 	return out,nil
 }
@@ -215,12 +216,13 @@ func (e *Engine) process(ev event.Event,at int64)([]Alert,error){
 	matched,err:=e.runRules(ev,at,nil);if err!=nil{return nil,err};out=append(out,matched...)
 	out=append(out,e.absences(ev,at)...)
 	if e.failure!=nil{return nil,e.failure}
+	e.expireState(at)
 	return out,nil
 }
 
 func (e *Engine) runRules(ev event.Event,at int64,seed *timerMatch)([]Alert,error){
 	out:=[]Alert{}
-	signals:=map[string]bool{}
+	signals:=map[string]bool{} // values retain upstream approximation
 	for _,r:=range e.pack.rules{
 		s:=e.states[r.ID]
 		fields:=r.Extension.GroupBy
@@ -228,32 +230,33 @@ func (e *Engine) runRules(ev event.Event,at int64,seed *timerMatch)([]Alert,erro
 		key,ok:=groupKey(fields,ev.Fields);if !ok{continue}
 		matched:=false;count:=uint64(1);start:=at;approximate:=false
 		seeded:=seed!=nil&&seed.rule==r
-		if seeded{matched=true;key=seed.missing.Key;start=seed.missing.LastSeen;count=0}else if r.Correlation==nil{matched=seed==nil&&r.Test(ev.Fields)}else{
+		if seeded{matched=true;key=seed.missing.Key;start=seed.missing.LastSeen;count=0;approximate=seed.approximate}else if r.Correlation==nil{matched=seed==nil&&r.Test(ev.Fields)}else{
 			refs:=r.Correlation.Rules
 			active:=[]int{}
-			for i,id:=range refs{if signals[id]{active=append(active,i)}}
+			for i,id:=range refs{if upstream,ok:=signals[id];ok{active=append(active,i);approximate=approximate||upstream}}
 			if len(active)==0{continue}
 			switch r.Correlation.Type{
 			case "temporal_ordered":
 				// Reverse step processing prevents one event from manufacturing
 				// both the earlier and later member of an ordered sequence.
-				for i:=len(active)-1;i>=0;i--{m:=s.sequence.Observe(key,active[i],at);if m.Rejected{return nil,fmt.Errorf("sequence input refused")};if m.Matched{matched=true;start=m.WindowStart;count=uint64(len(refs))}}
+				for i:=len(active)-1;i>=0;i--{m:=s.sequence.ObserveAnnotated(key,active[i],at,signals[refs[active[i]]]);if m.Rejected{return nil,fmt.Errorf("sequence input refused")};if m.Matched{matched=true;start=m.WindowStart;count=uint64(len(refs));approximate=approximate||m.Approximate}}
 			case "temporal":
 				var snap ops.Snapshot
-				for _,i:=range active{snap=s.window.Observe(key,refs[i],at)}
-				if snap.Rejected{return nil,fmt.Errorf("temporal input refused")};matched=snap.Distinct==uint64(len(refs));count=snap.Distinct;start=snap.WindowStart
+				for _,i:=range active{snap=s.window.ObserveAnnotated(key,refs[i],at,signals[refs[i]])}
+				if snap.Rejected{return nil,fmt.Errorf("temporal input refused")};matched=snap.Distinct==uint64(len(refs));count=snap.Distinct;start=snap.WindowStart;approximate=approximate||snap.Approximate
 			default:
 				value:=""
-				if r.Correlation.Type=="value_count"{v,ok:=ev.Fields[r.ValueField];if !ok{continue};b,err:=json.Marshal(v);if err!=nil{return nil,err};value=string(b)}
-				snap:=s.window.Observe(key,value,at);if snap.Rejected{return nil,fmt.Errorf("window input refused")}
+				if r.Correlation.Type=="value_count"{v,ok:=ev.Fields[r.ValueField];if !ok||v==nil{continue};normalized,ok:=canonicalValue(v);if !ok{return nil,fmt.Errorf("unsupported distinct value type")};b,err:=json.Marshal(normalized);if err!=nil{return nil,err};value=string(b)}
+				snap:=s.window.ObserveAnnotated(key,value,at,approximate);if snap.Rejected{return nil,fmt.Errorf("window input refused")}
 				count=snap.Count;if r.Correlation.Type=="value_count"{count=snap.Distinct};start=snap.WindowStart;approximate=snap.Approximate
 				matched=compare(count,r.Compare,r.Threshold)
 			}
 		}
 		if !matched{continue}
-		if s.absence!=nil&&!seeded{if !s.absence.Observe(key,at){return nil,fmt.Errorf("absence input refused")};s.clocks.remember(key,ev,at);continue}
-		signals[r.ID]=true;e.stats.Matches[r.ID]++
+		if s.absence!=nil&&!seeded{if !s.absence.Observe(key,at){return nil,fmt.Errorf("absence input refused")};s.clocks.remember(key,ev,at,approximate);continue}
+		e.stats.Matches[r.ID]++
 		if s.dedup!=nil&&!s.dedup.Allow(key,at){e.stats.Deduplicated++;continue}
+		signals[r.ID]=approximate
 		if s.rate!=nil&&!s.rate.Allow(key,at){e.stats.RateLimited++;continue}
 		end:=at;if seeded{end=seed.missing.Deadline}
 		out=append(out,e.alert(r,key,start,end,count,approximate,ev))
@@ -288,13 +291,17 @@ func (e *Engine) absences(_ event.Event,at int64)[]Alert{
 				ev:=clock.event;elapsed:=next-clock.at
 				if elapsed<0||ev.TMonoNS>math.MaxInt64-elapsed||ev.TWallNS>math.MaxInt64-elapsed{e.stats.StateRejected++;e.failure=fmt.Errorf("absence clock overflow");return nil}
 				ev.TMonoNS+=elapsed;ev.TWallNS+=elapsed
-				due=append(due,timerMatch{r,missing,ev})
+				due=append(due,timerMatch{r,missing,ev,clock.approximate})
 			}
 		}
 		sort.SliceStable(due,func(i,j int)bool{a,b:=due[i],due[j];if a.rule.ID!=b.rule.ID{return a.rule.ID<b.rule.ID};return a.missing.Key<b.missing.Key})
 		for _,pulse:=range due{a,err:=e.runRules(pulse.event,next,&pulse);if err!=nil{e.stats.StateRejected++;e.failure=err;return nil};out=append(out,a...)}
 	}
 	return out
+}
+
+func (e *Engine) expireState(at int64){
+	for _,s:=range e.states{if s.window!=nil{s.window.Advance(at)};if s.dedup!=nil{s.dedup.Advance(at)};if s.rate!=nil{s.rate.Advance(at)};if s.sequence!=nil{s.sequence.Advance(at)}}
 }
 
 func (e *Engine) alert(r *compiledRule,key string,start,end int64,count uint64,approximate bool,ev event.Event)Alert{
@@ -313,7 +320,7 @@ func (e *Engine) alert(r *compiledRule,key string,start,end int64,count uint64,a
 func groupKey(fields []string,values map[string]any)(string,bool){
 	if len(fields)==0{return "[]",true}
 	parts:=make([]any,0,len(fields)*2)
-	for _,name:=range fields{v,ok:=values[name];if !ok||v==nil{return "",false};switch v.(type){case string,int,int64,uint64,float64,bool,json.Number:default:return "",false};parts=append(parts,name,v)}
+	for _,name:=range fields{v,ok:=values[name];if !ok||v==nil{return "",false};v,ok=canonicalValue(v);if !ok{return "",false};parts=append(parts,name,v)}
 	b,err:=json.Marshal(parts);if err!=nil||len(b)>ops.MaxKeyBytes{return "",false};return string(b),true
 }
 
@@ -332,6 +339,15 @@ func (e *Engine) Stats()EngineStats{
 		s.State[id]=total
 	}
 	return s
+}
+
+// A typed rational tag gives all exact numeric spellings one local identity,
+// without ever aliasing the string "1" with the number 1. JSON decimal and
+// exponent spelling must not evade grouping or inflate distinct counts.
+func canonicalValue(value any)(any,bool){
+	switch v:=value.(type){case string:return v,true;case bool:return v,true}
+	if n,ok:=detectionNumber(value);ok{return map[string]string{"$number":n.RatString()},true}
+	return nil,false
 }
 
 // SortAlerts orders independently produced collections for canonical reports.

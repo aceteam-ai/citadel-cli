@@ -31,7 +31,7 @@ purpose-bound HMAC. It must reject device-supplied reserved identity fields.
 | `group_key` | `sha256:` plus 64 lowercase hex | Digest of the local grouping key, never its values |
 | `window_start_ns`, `window_end_ns` | decimal strings | Evaluation window bounds |
 | `match_count` | nonnegative integer | Count, distinct estimate, or sequence length |
-| `approximate` | boolean | Distinct count used HyperLogLog |
+| `approximate` | boolean | This match or an ancestor depended on HyperLogLog |
 | `t_mono_ns`, `t_wall_ns` | decimal strings | Originating ingest clocks, or the logical timer deadline |
 | `clock_state` | string | Driver-supplied clock state, not verified attestation |
 | `source_id` | string | Logical configured source ID, not an absolute path |
@@ -52,6 +52,10 @@ values in the rule's declared grouping order, for example
 `["source.ip","192.0.2.1"]`. No grouping fields is `[]`. The public
 `group_key` is `sha256:` followed by SHA-256 of those UTF-8 JSON bytes. Hashes
 are pseudonymous, not a claim that low-entropy identifiers are anonymous.
+Numeric values normalize to a typed object such as `{"$number":"1/10"}`
+using the reduced exact rational value; `1`, `1.0` and `1e0` therefore group
+together but remain distinct from the string `"1"`. Distinct counts use the
+same typed normalization. Missing or null distinct fields are not counted.
 
 `alert_id` is the lowercase SHA-256 hex digest of compact UTF-8 JSON:
 
@@ -119,7 +123,10 @@ Ordered sequences require distinct input observations and use an inclusive
 maximum span. State caps and every capacity eviction appear in evaluator
 statistics. Distinct values are exact through 1,024 hashes, then use a
 deterministic 1,024-register HyperLogLog over the retained bounded window.
-An estimate is not an exact threshold proof; `approximate` must be retained.
+An estimate is not an exact threshold proof; `approximate` is retained through
+dependent windows and ordered sequences, even when a later event is exact.
+Deduplication drops the detector signal as well as its emitted match; rate
+limiting suppresses escalation only and does not alter downstream detection.
 
 ## Verification status
 

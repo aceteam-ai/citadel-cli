@@ -168,6 +168,7 @@ func (d *Dedup) Allow(key string, at int64) bool {
 }
 
 func (d *Dedup) Stats() Stats { return d.state.snapshot() }
+func (d *Dedup) Advance(at int64){if d.state.advance(at){d.state.expire(at,d.span)}}
 
 type bucket struct {
 	tokens uint64
@@ -207,6 +208,7 @@ func (r *Rate) Allow(key string, at int64) bool {
 }
 
 func (r *Rate) Stats() Stats { return r.state.snapshot() }
+func (r *Rate) Advance(at int64){if r.state.advance(at){r.state.expire(at,r.idleSpan)}}
 
 type absent struct {
 	seen int64
@@ -258,12 +260,14 @@ type progress struct {
 	starts []int64
 	orders []uint64
 	valid []bool
+	approximate []bool
 }
 
 type SequenceMatch struct {
 	Matched bool
 	Rejected bool
 	WindowStart int64
+	Approximate bool
 }
 
 // Sequence keeps the latest start for each partial stage. A newer first step
@@ -289,6 +293,10 @@ func NewSequence(steps int, span time.Duration, limits Limits) (*Sequence, error
 }
 
 func (s *Sequence) Observe(key string, step int, at int64) SequenceMatch {
+	return s.ObserveAnnotated(key,step,at,false)
+}
+
+func (s *Sequence) ObserveAnnotated(key string,step int,at int64,approximate bool)SequenceMatch{
 	if step < 0 || step >= s.steps {
 		s.state.stats.InputRejected++
 		return SequenceMatch{Rejected: true}
@@ -304,7 +312,7 @@ func (s *Sequence) Observe(key string, step int, at int64) SequenceMatch {
 	v, ok := s.state.get(key)
 	if !ok {
 		if step != 0 { return SequenceMatch{} }
-		v = s.state.touch(key, at, progress{starts: make([]int64, s.steps-1), orders: make([]uint64, s.steps-1), valid: make([]bool, s.steps-1)})
+		v = s.state.touch(key, at, progress{starts: make([]int64, s.steps-1), orders: make([]uint64, s.steps-1), valid: make([]bool, s.steps-1),approximate:make([]bool,s.steps-1)})
 	}
 	s.state.touch(key, at, progress{})
 	for i := range v.value.valid {
@@ -314,15 +322,18 @@ func (s *Sequence) Observe(key string, step int, at int64) SequenceMatch {
 		v.value.starts[0] = at
 		v.value.orders[0] = s.order
 		v.value.valid[0] = true
+		v.value.approximate[0]=approximate
 		return SequenceMatch{}
 	}
 	if !v.value.valid[step-1] { return SequenceMatch{} }
 	start := v.value.starts[step-1]
 	order := v.value.orders[step-1]
+	approximate=approximate||v.value.approximate[step-1]
 	if step < s.steps-1 {
 		v.value.starts[step] = start
 		v.value.orders[step] = order
 		v.value.valid[step] = true
+		v.value.approximate[step]=approximate
 		return SequenceMatch{}
 	}
 	for i := range v.value.valid {
@@ -331,7 +342,16 @@ func (s *Sequence) Observe(key string, step int, at int64) SequenceMatch {
 	active := false
 	for _, valid := range v.value.valid { active = active || valid }
 	if !active { s.state.remove(s.state.entries[key]) }
-	return SequenceMatch{Matched: true, WindowStart: start}
+	return SequenceMatch{Matched: true, WindowStart: start,Approximate:approximate}
 }
 
 func (s *Sequence) Stats() Stats { return s.state.snapshot() }
+
+func (s *Sequence) Advance(at int64){
+	if !s.state.advance(at){return}
+	for key,entry:=range s.state.entries{
+		v:=entry.Value.(*keyed[progress]);active:=false
+		for i,valid:=range v.value.valid{if valid&&at-v.value.starts[i]>s.span{v.value.valid[i]=false};active=active||v.value.valid[i]}
+		if !active{s.state.remove(s.state.entries[key])}
+	}
+}
