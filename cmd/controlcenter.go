@@ -1950,6 +1950,9 @@ func ccConnectWithAuthkey(authkey, deviceCode string) error {
 		AuthKey:    authkey,
 	}
 
+	// A registration ID left by an earlier enroll in this process must not
+	// stand in for this connection's node (citadel-cli#1356).
+	setRegisteredNodeID("")
 	err := ccConnectDeviceEnrollmentWith(authkey, deviceCode, func() error {
 		_, err := network.Connect(ctx, config)
 		return err

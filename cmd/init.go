@@ -1919,18 +1919,23 @@ func connectToNetwork(nodeName, authKey string) error {
 		fmt.Printf("   IP: %s\n", ip)
 	}
 
-	// Record the registered node ID before disconnecting: the device link that
-	// follows needs it, and the global server is gone after Disconnect.
-	if status, err := srv.Status(ctx); err == nil {
-		setRegisteredNodeID(status.NodeID)
-	}
-
 	// Disconnect cleanly so tsnet flushes its state files, then the
 	// post-Close chown in Disconnect() fixes ownership for the non-root
 	// worker process. The work command re-establishes its own connection.
-	_ = network.Disconnect()
+	recordRegistrationThenDisconnect(ctx, srv.Status, network.Disconnect)
 
 	return nil
+}
+
+// recordRegistrationThenDisconnect records the registered node ID and only
+// then disconnects. The order is the v2.199.0 bug: the device link that
+// follows needs the ID, and the global server can no longer report it after
+// Disconnect.
+func recordRegistrationThenDisconnect(ctx context.Context, status func(context.Context) (*network.NetworkStatus, error), disconnect func() error) {
+	if st, err := status(ctx); err == nil && st != nil {
+		setRegisteredNodeID(st.NodeID)
+	}
+	_ = disconnect()
 }
 
 // reclaimStaleNodeByHostname removes a stale Headscale node with the same
