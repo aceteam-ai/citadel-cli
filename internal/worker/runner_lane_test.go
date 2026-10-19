@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -193,8 +194,13 @@ func TestRunnerHeavyLaneDoesNotBlockFetchLoop(t *testing.T) {
 	}
 }
 
+// deadlineHeldHeavyHandler holds whichever heavy job starts FIRST past its
+// deadline, not a fixed job ID: two jobs admitted back to back race for the
+// lane's exec slot, so claim order is not execution order (citadel-cli#1363).
+// The property under test is exclusivity, which holds in either order.
 type deadlineHeldHeavyHandler struct {
 	fileIndexCapsDecl
+	started        atomic.Int32
 	firstCancelled chan struct{}
 	releaseFirst   chan struct{}
 	secondStarted  chan struct{}
@@ -204,8 +210,8 @@ type deadlineHeldHeavyHandler struct {
 
 func (h *deadlineHeldHeavyHandler) CanHandle(jt string) bool { return jt == JobTypeFileIndex }
 
-func (h *deadlineHeldHeavyHandler) Execute(ctx context.Context, job *Job, _ StreamWriter) (*JobResult, error) {
-	if job.ID == "index-1" {
+func (h *deadlineHeldHeavyHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	if h.started.Add(1) == 1 {
 		<-ctx.Done()
 		h.firstOnce.Do(func() { close(h.firstCancelled) })
 		<-h.releaseFirst
@@ -224,7 +230,7 @@ func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T)
 	ordinary := NewMockJobHandler(JobTypeFileReadBytes, false)
 	source := NewMockJobSource("test", []*Job{
 		{ID: "index-1", Type: JobTypeFileIndex, Payload: map[string]any{"timeout_ms": float64(20)}},
-		{ID: "index-2", Type: JobTypeFileIndex, Payload: map[string]any{}},
+		{ID: "index-2", Type: JobTypeFileIndex, Payload: map[string]any{"timeout_ms": float64(20)}},
 		{ID: "ordinary", Type: JobTypeFileReadBytes, Payload: map[string]any{}},
 	})
 	state := NewWorkerState()
