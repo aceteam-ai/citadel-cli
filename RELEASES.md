@@ -3177,3 +3177,19 @@ Auto-generated log of every release.
   - feat(diffusers): per-request image model selection, VRAM-aware swap, current open models (#1335)
 
 
+---
+
+## v2.198.0 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 10 |
+| Lines added | +175 |
+
+**Changes:**
+
+  - fix(diffusers): pin the sidecar image by digest instead of :latest (#1348)
+  - feat(ingress): ACME DNS-01 via Cloudflare for the apps domain (#1343)
+
+
