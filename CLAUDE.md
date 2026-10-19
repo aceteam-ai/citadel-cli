@@ -1551,14 +1551,18 @@ HMAC envelope, not a device-origin signature. No control transport consumes it.
 After device-grant registration, `cmd.linkDeviceEnrollment` completes the
 server's reserved registration proof through the existing device link route;
 link refusal must propagate before enrollment can report success (#1344).
-`cmd.linkDeviceEnrollmentGated` decides when a refusal is fatal: only when the
-auth service's `/api/version` reports at least `deviceLinkEnforcedFrom`
-(v1.520.0, aceteam#11743, the first release that creates a missing device
-configuration). An older server refuses every grant approved without the
-onboarding wizard, and an unreadable version proves nothing, so both warn and
-continue. A fatal refusal also clears the device credentials saved earlier in
-the same enrollment, so the next `citadel init` authenticates again instead of
-treating an unlinked token as configured.
+`cmd.linkDeviceEnrollmentGated` decides when a link failure is fatal: only a
+definite refusal (`nexus.DeviceLinkRefusedError`: a 4xx, or a 200 without
+`success:true`) from a server whose `/api/version` reports at least
+`deviceLinkEnforcedFrom` (v1.520.0, aceteam#11743, the first release that
+creates a missing device configuration). A transport error or 5xx is retried
+once, then reported. A refusal from an older server, or one whose version
+cannot be read, is also reported; enrollment continues in both cases (#1350
+tracks linking such a node later). A fatal refusal runs
+`rollbackEnrollmentCredentials`, which removes only the node-file fields this
+enrollment wrote, and only while that file still holds this enrollment's own
+credential. Never replace it with `clearSavedConfig`: that relogin wipe also
+drops operator keys and a prior enrollment's credentials.
 Control Center passes the approved modal's `deviceCode` into its connect
 callback and gates both success display and worker startup on completed linking.
 The public link request uses that grant and the server's reserved used

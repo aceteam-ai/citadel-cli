@@ -351,6 +351,11 @@ func runControlCenter() {
 	}
 
 	cc := controlcenter.New(cfg)
+	// tview owns the terminal; a device-link warning written to stderr would
+	// garble the screen, so route it to the activity log instead.
+	deviceLinkWarnFn = func(msg string) {
+		cc.AddActivity("warning", strings.TrimSpace(strings.TrimPrefix(msg, "⚠️")))
+	}
 
 	// Show deferred update notification in TUI activity log (if any)
 	if deferredUpdateNotification != "" {
@@ -1886,6 +1891,7 @@ func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
 		return "", fmt.Errorf("authorization_pending")
 	}
 
+	ccEnrollmentTokens.Store(deviceCode, token)
 	// Save the device config including user info when auth succeeds
 	if token.DeviceAPIToken != "" || token.UserEmail != "" {
 		if err := saveDeviceConfigToFile(token); err != nil {

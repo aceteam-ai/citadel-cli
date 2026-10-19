@@ -3,6 +3,7 @@ package nexus
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -34,19 +35,22 @@ func TestLinkRegisteredNodeUsesCurrentDeviceGrantAndIdentity(t *testing.T) {
 
 func TestLinkRegisteredNodeFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status int
-		body   string
+		name    string
+		status  int
+		body    string
+		refusal bool
 	}{
-		{"missing registration proof", 409, `{"error":"private-grant private-token"}`},
-		{"mismatched registration proof", 403, `{"error":"private-grant private-token"}`},
-		{"wrong node", 403, `{"error":"private-grant private-token"}`},
-		{"expired enrollment", 404, `{"error":"private-grant private-token"}`},
-		{"server unavailable", 503, `{"error":"private-grant private-token"}`},
-		{"unconfirmed success", 200, `{"success":false}`},
-		{"malformed success", 200, `{"success":"private-token"}`},
-		{"trailing response", 200, `{"success":true} {}`},
-		{"oversized response", 200, `{"success":true}` + strings.Repeat(" ", maxDeviceAuthResponseBytes)},
+		{"missing registration proof", 409, `{"error":"private-grant private-token"}`, true},
+		{"mismatched registration proof", 403, `{"error":"private-grant private-token"}`, true},
+		{"wrong node", 403, `{"error":"private-grant private-token"}`, true},
+		{"expired enrollment", 404, `{"error":"private-grant private-token"}`, true},
+		{"server unavailable", 503, `{"error":"private-grant private-token"}`, false},
+		{"bad gateway", 502, `<html>private-grant</html>`, false},
+		{"unconfirmed success", 200, `{"success":false}`, true},
+		{"malformed success", 200, `{"success":"private-token"}`, false},
+		{"missing success", 200, `{}`, false},
+		{"trailing response", 200, `{"success":true} {}`, false},
+		{"oversized response", 200, `{"success":true}` + strings.Repeat(" ", maxDeviceAuthResponseBytes), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +64,10 @@ func TestLinkRegisteredNodeFailsClosed(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "private-") {
 				t.Fatal("link diagnostic exposed grant or credential")
+			}
+			var refused *DeviceLinkRefusedError
+			if errors.As(err, &refused) != tc.refusal {
+				t.Fatalf("refusal classification = %v, want %v (%v)", !tc.refusal, tc.refusal, err)
 			}
 		})
 	}

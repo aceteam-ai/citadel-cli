@@ -12,6 +12,20 @@ import (
 
 var enrollmentNodeIDPattern = regexp.MustCompile(`^[1-9][0-9]*$`)
 
+// DeviceLinkRefusedError is a definite answer from the link route: a 4xx, or a
+// 200 that does not confirm the link. Transport failures, timeouts and 5xx are
+// not refusals; they say nothing about whether this enrollment can be linked.
+type DeviceLinkRefusedError struct {
+	StatusCode int
+}
+
+func (e *DeviceLinkRefusedError) Error() string {
+	if e.StatusCode == http.StatusOK {
+		return "device link did not confirm enrollment"
+	}
+	return fmt.Sprintf("device link refused (HTTP %d); enrollment is incomplete", e.StatusCode)
+}
+
 // LinkRegisteredNode completes the current device grant after registration.
 // The server verifies the used registration key against its reservation; neither
 // a hostname nor an IP address is an enrollment proof. The request must never
@@ -36,14 +50,20 @@ func (c *DeviceAuthClient) LinkRegisteredNode(ctx context.Context, deviceCode, n
 		return fmt.Errorf("device link request failed")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		return &DeviceLinkRefusedError{StatusCode: resp.StatusCode}
+	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("device link refused (HTTP %d); enrollment is incomplete", resp.StatusCode)
+		return fmt.Errorf("device link unavailable (HTTP %d)", resp.StatusCode)
 	}
 	var result struct {
-		Success bool `json:"success"`
+		Success *bool `json:"success"`
 	}
-	if err := decodeBoundedDeviceAuthJSON(resp.Body, &result, "device link response"); err != nil || !result.Success {
-		return fmt.Errorf("device link did not confirm enrollment")
+	if err := decodeBoundedDeviceAuthJSON(resp.Body, &result, "device link response"); err != nil || result.Success == nil {
+		return fmt.Errorf("device link response was not understood")
+	}
+	if !*result.Success {
+		return &DeviceLinkRefusedError{StatusCode: http.StatusOK}
 	}
 	return nil
 }

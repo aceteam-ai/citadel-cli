@@ -2,14 +2,18 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	goversion "github.com/hashicorp/go-version"
+	"gopkg.in/yaml.v3"
 )
 
 // deviceLinkEnforcedFrom is the first aceteam release whose link route creates
@@ -18,11 +22,16 @@ import (
 // nothing about this enrollment and must not fail it.
 var deviceLinkEnforcedFrom = goversion.Must(goversion.NewVersion("1.520.0"))
 
-// clearDeviceCredentialsFn removes the device credentials an enrollment saved
+// enrollmentRollbackFn removes the device credentials this enrollment saved
 // before linking, so a fatal refusal does not leave a half-enrolled node that
 // the next `citadel init` treats as configured. A seam so tests never touch
 // the machine's real config.
-var clearDeviceCredentialsFn = clearSavedConfig
+var enrollmentRollbackFn = func(token *nexus.TokenResponse) error {
+	return rollbackEnrollmentCredentials(filepath.Join(nodeConfigDirFn(), "config.yaml"), token)
+}
+
+// deviceLinkRetryDelay spaces the single retry after a transport error or 5xx.
+var deviceLinkRetryDelay = 2 * time.Second
 
 // deviceLinkWarnFn reports a refusal that was not fatal.
 var deviceLinkWarnFn = func(msg string) { fmt.Fprintln(os.Stderr, msg) }
@@ -40,35 +49,166 @@ func linkDeviceEnrollment(result *DeviceAuthResult) error {
 	return linkDeviceEnrollmentGated(result, network.GetGlobalNodeID, nexus.NewDeviceAuthClient(authServiceURL))
 }
 
-// linkDeviceEnrollmentGated links the enrollment and decides whether a refusal
-// is fatal. Only a server that reports v1.520.0 or later is trusted to refuse
-// for a reason that applies to this enrollment; against an older server, or one
-// whose version cannot be read, the refusal is reported and enrollment goes on
-// as it did before linking existed. A fatal refusal also removes the device
-// credentials saved earlier in the same enrollment.
+// linkDeviceEnrollmentGated links the enrollment and decides whether a failure
+// is fatal. Only a definite refusal (nexus.DeviceLinkRefusedError) from a server
+// that reports v1.520.0 or later fails enrollment; that server is the first
+// whose refusal applies to this enrollment rather than to a missing wizard
+// configuration. A transport error or 5xx is retried once and then reported,
+// as is a refusal from an older server or one whose version cannot be read;
+// enrollment then goes on as it did before linking existed (#1350 tracks
+// linking such a node later). A fatal refusal also removes the credentials
+// this enrollment saved, and nothing else.
 func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Context) string, client deviceLinker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	linkErr := linkDeviceEnrollmentWith(ctx, result, nodeID, client.LinkRegisteredNode)
-	cancel()
+	attempt := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return linkDeviceEnrollmentWith(ctx, result, nodeID, client.LinkRegisteredNode)
+	}
+	linkErr := attempt()
+	if linkErr != nil && !isDeviceLinkRefusal(linkErr) {
+		time.Sleep(deviceLinkRetryDelay)
+		linkErr = attempt()
+	}
 	if linkErr == nil {
 		return nil
 	}
+	if !isDeviceLinkRefusal(linkErr) {
+		deviceLinkWarnFn(fmt.Sprintf("⚠️  Device link could not be completed (%v); continuing without a completed device link.", linkErr))
+		return nil
+	}
+
 	// A fresh budget: a slow refusal must not starve the version read.
 	vctx, vcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer vcancel()
 	version, versionErr := client.ServerVersion(vctx)
 	if versionErr == nil {
-		if enforced, ok := deviceLinkEnforced(version); ok && enforced {
-			clearDeviceCredentialsFn()
-			return deviceEnrollmentRecoveryError(linkErr)
-		} else if ok {
-			deviceLinkWarnFn(fmt.Sprintf("⚠️  Device link not completed (%v). The server reports v%s, older than v%s, which cannot link this enrollment; continuing without a completed device link.", linkErr, strings.TrimPrefix(version, "v"), deviceLinkEnforcedFrom))
+		enforced, ok := deviceLinkEnforced(version)
+		if ok && enforced {
+			fatal := deviceEnrollmentRecoveryError(linkErr)
+			if result != nil {
+				if err := enrollmentRollbackFn(result.Token); err != nil {
+					return fmt.Errorf("%w (removing this enrollment's saved credentials also failed: %v)", fatal, err)
+				}
+			}
+			return fatal
+		}
+		if ok {
+			deviceLinkWarnFn(fmt.Sprintf("⚠️  Device link not completed (%v). The server reports v%s, older than v%s, which cannot link this enrollment; continuing without a completed device link.", linkErr, strings.TrimPrefix(strings.TrimSpace(version), "v"), deviceLinkEnforcedFrom))
 			return nil
 		}
 		versionErr = fmt.Errorf("unrecognized server version")
 	}
 	deviceLinkWarnFn(fmt.Sprintf("⚠️  Device link not completed (%v), and the server version could not be read (%v); continuing without a completed device link.", linkErr, versionErr))
 	return nil
+}
+
+func isDeviceLinkRefusal(err error) bool {
+	var refused *nexus.DeviceLinkRefusedError
+	return errors.As(err, &refused)
+}
+
+// rollbackEnrollmentCredentials undoes saveDeviceConfigToFile /
+// saveRedisURLToConfig for one enrollment, in the node config file only. It
+// acts only when the file still holds this enrollment's own credential (proof
+// that its save landed and nothing replaced it), and removes only the fields
+// whose current values this enrollment wrote. Operator and node keys
+// (aceteam_api_key, login_node_uid, nexus_url, node_config_dir, ...) and the
+// legacy config location are never touched. Values the save itself overwrote
+// cannot be restored; that is the save-before-link order #1350 tracks.
+func rollbackEnrollmentCredentials(configFile string, token *nexus.TokenResponse) error {
+	if token == nil {
+		return nil
+	}
+	return withNodePointerLock(configFile, func() error {
+		data, err := os.ReadFile(configFile)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var config map[string]interface{}
+		if err := yaml.Unmarshal(data, &config); err != nil || config == nil {
+			return nil // never rewrite what cannot be read
+		}
+		holds := func(key, want string) bool {
+			got, ok := config[key].(string)
+			return ok && want != "" && got == want
+		}
+		var remove []string
+		switch {
+		case holds("device_api_token", token.DeviceAPIToken):
+			remove = append(remove, "device_api_token")
+			for key, want := range map[string]string{
+				"api_base_url":   token.APIBaseURL,
+				"org_id":         token.OrgID,
+				"org_name":       token.OrgName,
+				"user_email":     token.UserEmail,
+				"user_name":      token.UserName,
+				"fabric_node_id": token.FabricNodeID,
+			} {
+				if holds(key, want) {
+					remove = append(remove, key)
+				}
+			}
+		case token.DeviceAPIToken == "" && holds("redis_url", token.RedisURL):
+			remove = append(remove, "redis_url")
+		default:
+			return nil
+		}
+		for _, key := range remove {
+			delete(config, key)
+		}
+		if len(config) == 0 {
+			return os.Remove(configFile)
+		}
+		out, err := yaml.Marshal(config)
+		if err != nil {
+			return err
+		}
+		return writeConfigFileAtomic(configFile, out)
+	})
+}
+
+// writeConfigFileAtomic replaces path with data (mode 0600) via a temp file in
+// the same directory and a rename, so a crash never leaves a truncated file.
+func writeConfigFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config.yaml.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// ccEnrollmentTokens carries the token Control Center's poll received (and may
+// have saved) to its connect step, keyed by device code, so a fatal refusal can
+// roll back exactly that enrollment's credentials.
+var ccEnrollmentTokens sync.Map
+
+func ccEnrollmentTokenFor(deviceCode, authkey string) *nexus.TokenResponse {
+	if v, ok := ccEnrollmentTokens.LoadAndDelete(deviceCode); ok {
+		if token, ok := v.(*nexus.TokenResponse); ok && token != nil && token.Authkey == authkey {
+			return token
+		}
+	}
+	return &nexus.TokenResponse{Authkey: authkey}
 }
 
 // deviceLinkEnforced reports whether the server version is at or above
@@ -106,7 +246,7 @@ func ccConnectDeviceEnrollmentWith(authkey, deviceCode string, connect func() er
 	if err := connect(); err != nil {
 		return err
 	}
-	if err := link(&DeviceAuthResult{DeviceCode: deviceCode, Token: &nexus.TokenResponse{Authkey: authkey}}); err != nil {
+	if err := link(&DeviceAuthResult{DeviceCode: deviceCode, Token: ccEnrollmentTokenFor(deviceCode, authkey)}); err != nil {
 		_ = disconnect()
 		return err
 	}
