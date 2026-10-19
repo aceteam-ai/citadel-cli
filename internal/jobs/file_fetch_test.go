@@ -12,8 +12,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,8 +45,9 @@ func fileFetchFixture(t *testing.T, serve http.HandlerFunc) (*FileFetchHandler, 
 	h.newTransport = func() *http.Transport { return srv.Client().Transport.(*http.Transport).Clone() }
 	sum := sha256.Sum256([]byte("film bytes"))
 	return h, &nexus.Job{ID: "fetch", Type: "FILE_FETCH", Payload: map[string]string{
-		"url":       "https://example.com" + FileFetchEndpointPrefix + fileFetchTestToken,
-		"dest_path": "chapters/film.mp4", "expected_sha256": hex.EncodeToString(sum[:]), "max_bytes": "100",
+		"url":        "https://example.com" + FileFetchEndpointPath,
+		"capability": fileFetchTestToken,
+		"dest_path":  "chapters/film.mp4", "expected_sha256": hex.EncodeToString(sum[:]), "max_bytes": "100",
 	}}
 }
 
@@ -63,8 +66,8 @@ func assertFileFetchClean(t *testing.T, workspace string) {
 
 func TestFileFetchSuccess(t *testing.T) {
 	h, job := fileFetchFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != FileFetchEndpointPrefix+fileFetchTestToken ||
-			r.Header.Get("Accept-Encoding") != "identity" || r.Header.Get("Authorization") != "" || r.ContentLength != 0 {
+		if r.Method != http.MethodGet || r.URL.Path != FileFetchEndpointPath ||
+			r.Header.Get("Accept-Encoding") != "identity" || r.Header.Get("Authorization") != "Bearer "+fileFetchTestToken || r.ContentLength != 0 {
 			t.Error("request did not preserve fixed capability GET contract")
 		}
 		fmt.Fprint(w, "film bytes")
@@ -89,7 +92,7 @@ func TestFileFetchSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := filepath.Join(h.WorkspaceDir, "chapters/film.mp4")
-	if result.Path != want || result.Bytes != 10 || result.SHA256 != job.Payload["expected_sha256"] {
+	if result.Path != job.Payload["dest_path"] || result.Bytes != 10 || result.SHA256 != job.Payload["expected_sha256"] {
 		t.Fatalf("unexpected result: %s", out)
 	}
 	if body, err := os.ReadFile(want); err != nil || string(body) != "film bytes" {
@@ -102,6 +105,70 @@ func TestFileFetchSuccess(t *testing.T) {
 		if strings.Contains(log, fileFetchTestToken) || strings.Contains(log, "https://") || strings.Contains(log, "film.mp4") {
 			t.Fatalf("sensitive log: %s", log)
 		}
+	}
+	assertFileFetchClean(t, h.WorkspaceDir)
+}
+
+func TestFileFetchSharedWireFixture(t *testing.T) {
+	data, err := os.ReadFile("testdata/file_fetch_v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		SchemaVersion int               `json:"schema_version"`
+		Request       map[string]string `json:"request"`
+		HTTP          struct {
+			Method  string            `json:"method"`
+			Path    string            `json:"path"`
+			Headers map[string]string `json:"headers"`
+		} `json:"http"`
+		BodyUTF8 string         `json:"body_utf8"`
+		Receipt  map[string]any `json:"receipt"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil || fixture.SchemaVersion != 1 {
+		t.Fatalf("invalid shared wire fixture: %v", err)
+	}
+	h, job := fileFetchFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != fixture.HTTP.Method || r.URL.RequestURI() != fixture.HTTP.Path || r.ContentLength != 0 {
+			t.Error("request does not match shared HTTP contract")
+		}
+		for key, value := range fixture.HTTP.Headers {
+			if r.Header.Get(key) != value {
+				t.Errorf("request does not match shared %s contract", key)
+			}
+		}
+		fmt.Fprint(w, fixture.BodyUTF8)
+	})
+	job.Payload = fixture.Request
+	out, err := h.Execute(JobContext{}, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt map[string]any
+	if err := json.Unmarshal(out, &receipt); err != nil || !reflect.DeepEqual(receipt, fixture.Receipt) {
+		t.Fatalf("receipt differs from shared fixture: %s %v", out, err)
+	}
+	if receipt["path"] != fixture.Request["dest_path"] || filepath.IsAbs(receipt["path"].(string)) {
+		t.Fatal("receipt must preserve the exact workspace-relative destination")
+	}
+	inputFiles, err := json.Marshal([]map[string]string{{
+		"path": "node:fixture-node/" + receipt["path"].(string), "node_id": "fixture-node", "node_path": receipt["path"].(string),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseTemplateInputFiles(inputFiles, "fixture-node"); err != nil {
+		t.Fatalf("receipt is not a valid RunNodeJob node-backed input: %v", err)
+	}
+	// A receipt path can be opened relative to the workspace, as downstream
+	// node-backed FileValue/RunNodeJob input resolution expects.
+	root, err := os.OpenRoot(h.WorkspaceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if body, err := root.ReadFile(receipt["path"].(string)); err != nil || string(body) != fixture.BodyUTF8 {
+		t.Fatalf("workspace-relative receipt cannot be opened: %v", err)
 	}
 	assertFileFetchClean(t, h.WorkspaceDir)
 }
@@ -293,24 +360,80 @@ func TestFileFetchRefusalsPreserveOldFile(t *testing.T) {
 
 func TestFileFetchURLPolicy(t *testing.T) {
 	h := NewFileFetchHandler(t.TempDir(), func() string { return "https://example.com" })
-	base := "https://example.com" + FileFetchEndpointPrefix
+	base := "https://example.com" + FileFetchEndpointPath
 	for _, raw := range []string{
-		"", "http://example.com" + FileFetchEndpointPrefix + "token", "https://evil.example" + FileFetchEndpointPrefix + "token",
-		"https://example.com.evil" + FileFetchEndpointPrefix + "token", "https://example.com:443" + FileFetchEndpointPrefix + "token",
-		"https://user@example.com" + FileFetchEndpointPrefix + "token", "https://example.com./api/shared/file-fetch/token",
-		base, base + ".", base + "..", base + "token/extra", base + "token?x=y", base + "token?", base + "token#", base + "token#x",
-		base + "%74oken", base + "token%2fextra", base + "token\\extra", base + strings.Repeat("a", fileFetchMaxTokenBytes+1),
+		"", "http://example.com" + FileFetchEndpointPath, "https://evil.example" + FileFetchEndpointPath,
+		"https://example.com.evil" + FileFetchEndpointPath, "https://example.com:443" + FileFetchEndpointPath,
+		"https://user@example.com" + FileFetchEndpointPath, "https://example.com./api/shared/file-fetch",
+		base + "/", base + "/.", base + "/..", base + "/token/extra", base + "?x=y", base + "?", base + "#", base + "#x",
+		base + "/token", base + "?token=opaque", base + "/%74oken", base + "/token%2fextra", base + "\\extra", base + strings.Repeat("a", fileFetchMaxTokenBytes+1),
 		"https://example.com/api/shared/file-fetch-other/token", "https://example.com/api/shared/../shared/file-fetch/token",
 	} {
 		if _, err := h.validateURL(raw); err == nil {
 			t.Errorf("accepted invalid capability URL %q", raw)
 		}
 	}
+	if _, err := h.validateURL(base); err != nil {
+		t.Fatalf("canonical endpoint refused: %v", err)
+	}
 	for _, raw := range []string{"", "http://example.com", "https://example.com:443", "https://user@example.com", "https://example.com/path", "https://example.com#", "https://example.com?", "https://example.com:"} {
 		h.Origin = func() string { return raw }
 		if h.Configured() {
 			t.Errorf("accepted origin %q", raw)
 		}
+	}
+}
+
+func TestFileFetchCapabilityHeaderValidation(t *testing.T) {
+	if err := fileFetchValidateCapability(strings.Repeat("a", fileFetchMaxTokenBytes)); err != nil {
+		t.Fatalf("capability exactly at the byte limit refused: %v", err)
+	}
+	for _, token := range []string{"", ".", "..", "a b", "Bearer token", "token\r\nX-Injected: yes", "token/extra", "token?query", "token#fragment", "token%2fextra", strings.Repeat("a", fileFetchMaxTokenBytes+1)} {
+		t.Run(fmt.Sprintf("length_%d", len(token)), func(t *testing.T) {
+			h, job := fileFetchFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("invalid capability reached HTTP") })
+			job.Payload["capability"] = token
+			out, err := h.Execute(JobContext{}, job)
+			if err == nil || !strings.Contains(err.Error(), "invalid_capability") || len(out) != 0 {
+				t.Fatalf("invalid capability accepted: %v", err)
+			}
+			if strings.Contains(err.Error(), fileFetchTestToken) || strings.Contains(err.Error(), h.WorkspaceDir) {
+				t.Fatal("capability refusal leaked private fields")
+			}
+			assertFileFetchClean(t, h.WorkspaceDir)
+		})
+	}
+}
+
+func TestFileFetchConfiguredCachesStorageProbe(t *testing.T) {
+	for _, available := range []bool{true, false} {
+		t.Run(fmt.Sprintf("available_%t", available), func(t *testing.T) {
+			h := NewFileFetchHandler("workspace", func() string { return "https://example.com" })
+			var probes atomic.Int32
+			h.probeStorage = func(workspace string) bool {
+				probes.Add(1)
+				if workspace != "workspace" {
+					t.Error("probed incorrect workspace")
+				}
+				return available
+			}
+			var callers sync.WaitGroup
+			for range 32 {
+				callers.Go(func() {
+					if h.Configured() != available {
+						t.Error("unexpected cached storage result")
+					}
+				})
+			}
+			callers.Wait()
+			if probes.Load() != 1 {
+				t.Fatalf("storage capability probe ran %d times", probes.Load())
+			}
+			// Origin remains live despite caching the filesystem primitive.
+			h.Origin = func() string { return "http://example.com" }
+			if h.Configured() || probes.Load() != 1 {
+				t.Fatal("origin checks were cached or storage was reprobed")
+			}
+		})
 	}
 }
 

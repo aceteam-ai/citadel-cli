@@ -95,8 +95,9 @@ func TestFileFetchAdapterBoundedNumericMaxBytes(t *testing.T) {
 			handler := jobs.NewFileFetchHandler("", func() string { return "https://example.com" })
 			adapter := NewLegacyHandlerAdapter(JobTypeFileFetch, handler)
 			_, err := adapter.Execute(context.Background(), &Job{Type: JobTypeFileFetch, Payload: map[string]any{
-				"url":       "https://example.com" + jobs.FileFetchEndpointPrefix + "body.signature",
-				"dest_path": "film.mp4", "expected_sha256": strings.Repeat("0", 64), "max_bytes": tc.value,
+				"url":        "https://example.com" + jobs.FileFetchEndpointPath,
+				"capability": "body.signature",
+				"dest_path":  "film.mp4", "expected_sha256": strings.Repeat("0", 64), "max_bytes": tc.value,
 			}}, &NoOpStreamWriter{})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err=%v want=%s", err, tc.want)

@@ -17,21 +17,22 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
-// FileFetchEndpointPrefix is the dedicated, read-only capability endpoint.
+// FileFetchEndpointPath is the dedicated, read-only capability endpoint.
 // The coordinator owns HMAC verification, exact org/node/document/object/hash/
 // size binding, the ten-minute maximum capability lifetime, and mint/fetch audit.
 // Keep this literal in sync with the coordinator; this is not a proxy allowlist.
-const FileFetchEndpointPrefix = "/api/shared/file-fetch/"
+const FileFetchEndpointPath = "/api/shared/file-fetch"
 
 const (
 	fileFetchHardMaxBytes  int64 = 2 << 30
 	fileFetchTimeout             = 5 * time.Minute
-	fileFetchMaxTokenBytes       = 16 << 10
+	fileFetchMaxTokenBytes       = 4096
 )
 
 // FileFetchHandler stages a capability-bound document into the workspace.
@@ -46,6 +47,10 @@ type FileFetchHandler struct {
 	lookupIP     func(context.Context, string) ([]net.IPAddr, error)
 	dialIP       func(context.Context, string, string) (net.Conn, error)
 	newTransport func() *http.Transport
+	probeStorage func(string) bool
+
+	storageOnce      sync.Once
+	storageAvailable bool
 }
 
 // NewFileFetchHandler creates a handler with no implicit trusted destination.
@@ -84,8 +89,17 @@ func (h *FileFetchHandler) Configured() bool {
 	if h.Origin == nil {
 		return false
 	}
-	_, err := fileFetchOrigin(h.Origin())
-	return err == nil && fileFetchStorageSupported(h.WorkspaceDir)
+	if _, err := fileFetchOrigin(h.Origin()); err != nil {
+		return false
+	}
+	h.storageOnce.Do(func() {
+		probe := h.probeStorage
+		if probe == nil {
+			probe = fileFetchStorageSupported
+		}
+		h.storageAvailable = probe(h.WorkspaceDir)
+	})
+	return h.storageAvailable
 }
 
 func (h *FileFetchHandler) validateURL(raw string) (*url.URL, error) {
@@ -96,31 +110,31 @@ func (h *FileFetchHandler) validateURL(raw string) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(raw) > fileFetchMaxTokenBytes+len(FileFetchEndpointPrefix)+len(origin.Host)+8 {
+	// Bound the job URL to this one canonical endpoint before parsing it.
+	if raw != "https://"+origin.Host+FileFetchEndpointPath {
 		return nil, fileFetchRefusal("invalid_capability_url")
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != origin.Scheme || u.Host != origin.Host ||
 		u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery ||
 		u.Fragment != "" || u.RawFragment != "" || u.RawPath != "" || strings.Contains(raw, "%") ||
-		!strings.HasPrefix(u.Path, FileFetchEndpointPrefix) {
+		u.Path != FileFetchEndpointPath {
 		return nil, fileFetchRefusal("invalid_capability_url")
 	}
-	token := strings.TrimPrefix(u.Path, FileFetchEndpointPrefix)
+	return u, nil
+}
+
+func fileFetchValidateCapability(token string) error {
 	if token == "" || token == "." || token == ".." || len(token) > fileFetchMaxTokenBytes {
-		return nil, fileFetchRefusal("invalid_capability_url")
+		return fileFetchRefusal("invalid_capability")
 	}
 	for _, c := range token {
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
-			return nil, fileFetchRefusal("invalid_capability_url")
+			return fileFetchRefusal("invalid_capability")
 		}
 	}
-	// Reject a trailing '#' as well, even though Parse drops its empty fragment.
-	if raw != "https://"+origin.Host+FileFetchEndpointPrefix+token {
-		return nil, fileFetchRefusal("invalid_capability_url")
-	}
-	return u, nil
+	return nil
 }
 
 // fileFetchPublicIP excludes special-purpose ranges as well as RFC1918/ULA,
@@ -199,9 +213,9 @@ func (h *FileFetchHandler) transport(host string) *http.Transport {
 	return tr
 }
 
-// Execute accepts only url, dest_path, expected_sha256 and max_bytes (plus
+// Execute accepts only url, capability, dest_path, expected_sha256 and max_bytes (plus
 // dispatch metadata ignored by the handler). GET, headers and policy are fixed.
-// The opaque URL's signature and expiry are checked by the dedicated endpoint.
+// The opaque capability's signature, expiry and nonce are checked by the endpoint.
 func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	if (h.Enabled != nil && !h.Enabled()) || (h.Enabled == nil && h.Disabled) {
 		return nil, fileFetchRefusal("files_disabled")
@@ -211,6 +225,10 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	}
 	u, err := h.validateURL(job.Payload["url"])
 	if err != nil {
+		return nil, err
+	}
+	capability := job.Payload["capability"]
+	if err := fileFetchValidateCapability(capability); err != nil {
 		return nil, err
 	}
 	dest := job.Payload["dest_path"]
@@ -277,6 +295,7 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, fileFetchRefusal("invalid_capability_url")
 	}
 	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Authorization", "Bearer "+capability)
 	tr := h.transport(u.Hostname())
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -337,7 +356,7 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	}
 	// No URL, token, payload, response headers/body or destination in logs.
 	ctx.Log("info", "FILE_FETCH completed (%d bytes)", n)
-	return json.Marshal(map[string]any{"path": filepath.Join(workspace, dest), "bytes": n, "sha256": hex.EncodeToString(sum)})
+	return json.Marshal(map[string]any{"path": dest, "bytes": n, "sha256": hex.EncodeToString(sum)})
 }
 
 // Capabilities enables the worker's cooperative cancellation watch; cancellation
