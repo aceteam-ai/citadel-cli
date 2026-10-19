@@ -2047,6 +2047,12 @@ stay failures. The VRAM figures in the catalog are estimates; `/health`
 `last_load.measured_vram_gb` records the real delta on each load. Pinned image
 stack and its rationale live in `requirements.txt`. The default `DIFFUSERS_MODEL` is FLUX.2-klein-4B; sdxl-turbo (non-permissive licence) is selectable only if an operator names it. `ImageModelManager.prepare` (preflight + download) runs BEFORE the resident model is evicted; a fresh model is protected until used (`DIFFUSERS_MIN_RESIDENCY_SECONDS`); and the single uvicorn worker is what enforces one model at a time.
 The compose env passthrough is covered by `KnownComposeHashes`.
+The compose image is pinned by digest, not `:latest` (citadel-cli#1346):
+compose pulls only a missing image, so a node that already held an old
+`:latest` kept serving it under newer compose defaults (FLUX.2-klein-4B on a
+diffusers 0.33 image failed every request). A new sidecar build therefore needs
+a follow-up PR that bumps the pin and registers the template hash;
+`TestOwnSidecarImagesArePinnedByDigest` lists the pinned compose files.
 
 ### Meeting media stack — virtual mic / bot speaking path (aceteam#7079)
 
