@@ -3193,3 +3193,18 @@ Auto-generated log of every release.
   - feat(ingress): ACME DNS-01 via Cloudflare for the apps domain (#1343)
 
 
+---
+
+## v2.199.0 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 20 |
+| Lines added | +1355 |
+
+**Changes:**
+
+  - fix(enrollment): require device linking and report active control certificate (#1347)
+
+
