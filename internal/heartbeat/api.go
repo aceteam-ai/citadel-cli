@@ -94,6 +94,7 @@ type APIPublisher struct {
 	// (citadel-cli#1134). A pure cache read — no release lookup, no disk op —
 	// that may return nil (no auto_update field on that heartbeat). Optional.
 	autoUpdateFn func() *status.AutoUpdateReport
+	controlTLSFn func() *status.ControlTLSReport
 
 	// markerDir, when non-empty, is where the cross-process heartbeat
 	// freshness marker is written after every publish attempt (#726; see
@@ -115,6 +116,14 @@ func (p *APIPublisher) SetStatsProvider(fn func() *pulse.StatsBlock) {
 // both transports emit the identical auto_update block.
 func (p *APIPublisher) SetAutoUpdateProvider(fn func() *status.AutoUpdateReport) {
 	p.autoUpdateFn = fn
+}
+
+// SetControlTLSProvider attaches the active listener's in-memory certificate
+// snapshot. Register before Start; the provider must never read files or probe.
+// Legacy direct-Redis publishing has no authenticated relay envelope and does
+// not publish this evidence.
+func (p *APIPublisher) SetControlTLSProvider(fn func() *status.ControlTLSReport) {
+	p.controlTLSFn = fn
 }
 
 // SetOnStatus registers a callback invoked with each collected status. Used to
@@ -309,6 +318,9 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 	}
 	if p.autoUpdateFn != nil {
 		msg.AutoUpdate = p.autoUpdateFn()
+	}
+	if p.controlTLSFn != nil {
+		msg.ControlTLS = p.controlTLSFn()
 	}
 
 	return p.publishMessage(ctx, msg, timestamp)

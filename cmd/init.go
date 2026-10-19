@@ -275,6 +275,11 @@ and system user configuration (requires sudo).`,
 				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 				os.Exit(1)
 			}
+			if err := linkDeviceEnrollment(deviceAuthResult); err != nil {
+				_ = network.Disconnect()
+				fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
+				os.Exit(1)
+			}
 			ip, _ := network.GetGlobalIPv4()
 			printNetworkSuccessInfo(nodeName, ip)
 			earlyNetworkConnected = true
@@ -345,6 +350,14 @@ and system user configuration (requires sudo).`,
 						if err := saveRedisURLToConfig(deviceAuthResult.Token.RedisURL); err != nil {
 							fmt.Fprintf(os.Stderr, "⚠️  Could not save config: %v\n", err)
 						}
+					}
+					// A fresh grant does not authorize the already-connected node.
+					// Refusal requires explicit logout + init so registration uses
+					// the new reservation; a saved bearer is not a completed link.
+					if err := linkDeviceEnrollment(deviceAuthResult); err != nil {
+						_ = network.Disconnect()
+						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
+						os.Exit(1)
 					}
 				}
 

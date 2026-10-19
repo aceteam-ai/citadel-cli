@@ -131,6 +131,11 @@ just run 'citadel enroll' and scan.`,
 			fmt.Fprintf(os.Stderr, "❌ Failed to join the Fabric: %v\n", err)
 			os.Exit(1)
 		}
+		if err := linkDeviceEnrollment(result); err != nil {
+			_ = network.Disconnect()
+			fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
+			os.Exit(1)
+		}
 
 		ip, _ := network.GetGlobalIPv4()
 		printNetworkSuccessInfo(nodeName, ip)

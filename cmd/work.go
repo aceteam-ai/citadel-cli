@@ -1694,6 +1694,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	})
 
 	// Start status server if enabled
+	var controlTLSProvider func() *status.ControlTLSReport
 	if workStatusPort > 0 {
 		serverCfg := status.ServerConfig{
 			Port:        workStatusPort,
@@ -1819,6 +1820,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 
 		statusServer := status.NewServer(serverCfg, collector)
+		controlTLSProvider = statusServer.ControlTLS
 
 		// Start the vendor-agents probe now that a pull surface exists (aceteam
 		// #8993 S2): async startup probe + hourly timer (CITADEL_AGENTS_PROBE_
@@ -2190,6 +2192,7 @@ func runWork(cmd *cobra.Command, args []string) {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
 					apiPublisher.SetAutoUpdateProvider(autoUpdateReportFn)
+					apiPublisher.SetControlTLSProvider(controlTLSProvider)
 					startStatusPublisher = func() {
 						go func() {
 							fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
