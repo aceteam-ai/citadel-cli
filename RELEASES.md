@@ -3208,3 +3208,18 @@ Auto-generated log of every release.
   - fix(enrollment): require device linking and report active control certificate (#1347)
 
 
+---
+
+## v2.199.1 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +208 |
+
+**Changes:**
+
+  - fix(enrollment): link on init/enroll, retry token-poll 5xx, unblock the root worker unit (#1351)
+
+
