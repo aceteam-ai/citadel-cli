@@ -40,7 +40,7 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 			NodeTypeOutput:    &OutputNodeExecutor{},
 			NodeTypeLLM:       &LLMNodeExecutor{},
 			NodeTypeShell:     NewShellNodeExecutor(cfg.Shell),
-			NodeTypeHTTP:      &HTTPNodeExecutor{},
+			NodeTypeHTTP:      &HTTPNodeExecutor{policy: cfg.HTTP},
 			NodeTypeTransform: &TransformNodeExecutor{},
 		},
 	}

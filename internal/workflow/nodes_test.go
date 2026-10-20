@@ -109,8 +109,8 @@ func TestHTTPNodeExecutor_GET(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}))
 	defer server.Close()
-	e := &HTTPNodeExecutor{}
-	output, err := e.Execute(context.Background(), &Node{ID: "http", Type: NodeTypeHTTP, Params: map[string]any{"url": server.URL, "method": "GET"}}, nil)
+	e := httpExecutorForTestServer(t, server)
+	output, err := e.Execute(context.Background(), &Node{ID: "http", Type: NodeTypeHTTP, Params: map[string]any{"url": "http://public.example", "method": "GET"}}, nil)
 	if err != nil || output["status_code"] != 200 {
 		t.Fatalf("unexpected: %v %v", output, err)
 	}
@@ -128,8 +128,11 @@ func TestHTTPNodeExecutor_POST(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]string{"created": "true"})
 	}))
 	defer server.Close()
-	e := &HTTPNodeExecutor{}
-	output, _ := e.Execute(context.Background(), &Node{ID: "http", Type: NodeTypeHTTP, Params: map[string]any{"url": server.URL, "method": "POST"}}, map[string]any{"body": map[string]any{"key": "value"}})
+	e := httpExecutorForTestServer(t, server)
+	output, err := e.Execute(context.Background(), &Node{ID: "http", Type: NodeTypeHTTP, Params: map[string]any{"url": "http://public.example", "method": "POST"}}, map[string]any{"body": map[string]any{"key": "value"}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if output["status_code"] != 201 {
 		t.Fatalf("expected 201, got %v", output["status_code"])
 	}
