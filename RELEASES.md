@@ -3223,3 +3223,21 @@ Auto-generated log of every release.
   - fix(enrollment): link on init/enroll, retry token-poll 5xx, unblock the root worker unit (#1351)
 
 
+---
+
+## v2.200.0 — 2026-10-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 33 |
+| Lines added | +2405 |
+
+**Changes:**
+
+  - feat(jobs): add bounded create-only FILE_FETCH staging (#1355)
+  - docs: voice cloning shipped outside CIS; LocalAI as engine-adapter prior art (#1360) (#1362)
+  - test(worker): make the heavy-deadline lane test order-independent (#1363) (#1365)
+  - fix(enrollment): reset the registered node ID in Control Center, pin record-before-disconnect order (#1356) (#1361)
+
+
