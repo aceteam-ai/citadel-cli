@@ -138,6 +138,14 @@ func LoadPack(name string) (*Pack, error) {
 	if err != nil {
 		return nil, err
 	}
+	return loadPackBytes(manifestBytes, func(name string) ([]byte, error) {
+		return readBounded(root, name, maxRuleBytes)
+	})
+}
+
+// Both reviewed artifact bundles and local files use this exact compiler and
+// digest normalization. The reader supplies bytes only, never a URL or code.
+func loadPackBytes(manifestBytes []byte, readRule func(string) ([]byte, error)) (*Pack, error) {
 	var m Manifest
 	if err := decodeStrict(manifestBytes, &m); err != nil {
 		return nil, fmt.Errorf("pack manifest: %w", err)
@@ -161,10 +169,7 @@ func LoadPack(name string) (*Pack, error) {
 	p := &Pack{Manifest: m, Refused: []Refusal{}}
 	entries := append([]RuleEntry(nil), m.Rules...)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
-	canonical := m
-	canonical.Rules = entries
-	canonical.Digest = ""
-	canon, err := json.Marshal(canonical)
+	canon, err := CanonicalManifestBytes(m)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +187,7 @@ func LoadPack(name string) (*Pack, error) {
 				return nil, fmt.Errorf("invalid fixture path for %s", entry.ID)
 			}
 		}
-		data, err := readBounded(root, entry.File, maxRuleBytes)
+		data, err := readRule(entry.File)
 		if err != nil {
 			return nil, fmt.Errorf("rule %s: %w", entry.ID, err)
 		}
@@ -210,6 +215,16 @@ func LoadPack(name string) (*Pack, error) {
 		return nil, refused("correlation", err)
 	}
 	return p, nil
+}
+
+// CanonicalManifestBytes is the existing pack-digest serialization: typed Go
+// struct field order, omitted empty optional fields, sorted rule IDs and map
+// keys, and encoding/json HTML escaping. It does not compile a pack.
+func CanonicalManifestBytes(manifest Manifest) ([]byte, error) {
+	manifest.Rules = append([]RuleEntry(nil), manifest.Rules...)
+	sort.Slice(manifest.Rules, func(i, j int) bool { return manifest.Rules[i].ID < manifest.Rules[j].ID })
+	manifest.Digest = ""
+	return json.Marshal(manifest)
 }
 
 func validID(s string) bool {

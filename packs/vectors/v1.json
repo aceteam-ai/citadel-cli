@@ -1,0 +1,133 @@
+{
+  "schema_version": "stream.pack-artifact-vectors.v1",
+  "fixture_commit": "0123456789abcdef0123456789abcdef01234567",
+  "index_file": "packs/index.json",
+  "index_digest": "sha256:7f090f3971a7da3bcd0da42f080a6ddd0e538dd93f1facad7f2a4dae1fab3dd4",
+  "id": "shield-st1-fixtures",
+  "version": "1.0.0",
+  "pack_digest": "sha256:1a6d94bd71ec5f4b3bc091e939a722e02638923346a42dab8553f9bf75ac90cf",
+  "bundle_file": "packs/shield-st1-fixtures/1.0.0/bundle.json",
+  "bundle_digest": "sha256:89d4734bc13eb3cca96058c490212ae4e04a491e2e9b4c2fc871b4d6d2dc391f",
+  "canonical_manifest_base64": "eyJpZCI6InNoaWVsZC1zdDEtZml4dHVyZXMiLCJ2ZXJzaW9uIjoiMS4wLjAiLCJwYXJzZXIiOiJjb21iaW5lZCIsImVucmljaG1lbnRzIjpbInNvdXJjZS5pcF9zdWJuZXQyNCJdLCJydWxlcyI6W3siaWQiOiJSMSIsInZlcnNpb24iOiIxIiwiZmlsZSI6InJ1bGVzL1IxLnltbCJ9LHsiaWQiOiJSMiIsInZlcnNpb24iOiIxIiwiZmlsZSI6InJ1bGVzL1IyLnltbCJ9LHsiaWQiOiJSMyIsInZlcnNpb24iOiIxIiwiZmlsZSI6InJ1bGVzL1IzLnltbCJ9LHsiaWQiOiJSNCIsInZlcnNpb24iOiIxIiwiZmlsZSI6InJ1bGVzL1I0LnltbCJ9LHsiaWQiOiJSNSIsInZlcnNpb24iOiIxIiwiZmlsZSI6InJ1bGVzL1I1LnltbCJ9LHsiaWQiOiJfNDA0IiwidmVyc2lvbiI6IjEiLCJmaWxlIjoicnVsZXMvXzQwNC55bWwifSx7ImlkIjoiX2ZhaWxlZCIsInZlcnNpb24iOiIxIiwiZmlsZSI6InJ1bGVzL19mYWlsZWQueW1sIn0seyJpZCI6Il9zdWJuZXRfZmFpbHVyZXMiLCJ2ZXJzaW9uIjoiMSIsImZpbGUiOiJydWxlcy9fc3VibmV0X2ZhaWx1cmVzLnltbCJ9LHsiaWQiOiJfc3VjY2VzcyIsInZlcnNpb24iOiIxIiwiZmlsZSI6InJ1bGVzL19zdWNjZXNzLnltbCJ9LHsiaWQiOiJzdGF0X29ubHkiLCJ2ZXJzaW9uIjoiMSIsImZpbGUiOiJydWxlcy9zdGF0X29ubHkueW1sIn1dfQ==",
+  "cases": [
+    {
+      "id": "positive",
+      "operation": "none",
+      "refresh_outer": false,
+      "accept": true,
+      "reason": ""
+    },
+    {
+      "id": "index-pin",
+      "operation": "index_append_space",
+      "refresh_outer": false,
+      "accept": false,
+      "reason": "index digest mismatch"
+    },
+    {
+      "id": "bundle-pin",
+      "operation": "bundle_append_space",
+      "refresh_outer": false,
+      "accept": false,
+      "reason": "bundle digest mismatch"
+    },
+    {
+      "id": "inner-rule-bytes",
+      "operation": "rule_append_newline",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "pack digest mismatch"
+    },
+    {
+      "id": "missing-rule",
+      "operation": "remove_last_rule",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "rule file set mismatch"
+    },
+    {
+      "id": "extra-rule",
+      "operation": "append_unknown_rule",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "rule file set mismatch"
+    },
+    {
+      "id": "rule-order",
+      "operation": "swap_first_rules",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "file set/order mismatch"
+    },
+    {
+      "id": "duplicate-rule",
+      "operation": "duplicate_first_file",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "file set/order mismatch"
+    },
+    {
+      "id": "manifest-whitespace",
+      "operation": "manifest_append_space",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "not canonical"
+    },
+    {
+      "id": "manifest-field-order",
+      "operation": "manifest_sort_keys",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "not canonical"
+    },
+    {
+      "id": "manifest-empty-optional",
+      "operation": "manifest_empty_field_map",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "not canonical"
+    },
+    {
+      "id": "base64-newline",
+      "operation": "rule_base64_newline",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "base64"
+    },
+    {
+      "id": "unknown-bundle-key",
+      "operation": "unknown_bundle_field",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "unknown"
+    },
+    {
+      "id": "duplicate-index-key",
+      "operation": "duplicate_index_origin",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "duplicate"
+    },
+    {
+      "id": "path-escape",
+      "operation": "index_path_escape",
+      "refresh_outer": true,
+      "accept": false,
+      "reason": "invalid or duplicate pack index entry"
+    },
+    {
+      "id": "unreviewed-ref",
+      "operation": "non_commit_pin",
+      "refresh_outer": false,
+      "accept": false,
+      "reason": "invalid reviewed pack pin"
+    },
+    {
+      "id": "unindexed-selector",
+      "operation": "unknown_pack_digest",
+      "refresh_outer": false,
+      "accept": false,
+      "reason": "not in the reviewed index"
+    }
+  ]
+}

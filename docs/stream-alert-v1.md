@@ -4,6 +4,11 @@ Source contract for Citadel #1352 (ST1), consumed by ST2 and the paired
 Aceteam ST3 intake. This is not deployment authorization. It does not add a
 network sender, consumer, action sink, or database schema.
 
+Deployment identity uses [the organization-bound definition digest
+profile](stream-definition-v1.md), not the pack framing below. Trusted
+pack publication and resolution are specified in
+[the pack artifact contract](stream-pack-artifacts-v1.md).
+
 ## Two kinds of evaluator output
 
 The shared evaluator returns matches with `schema_version = stream.alert.v1`.

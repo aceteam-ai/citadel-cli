@@ -68,4 +68,6 @@ The machine is shared and CPU isolation was not requested. An earlier run
 overlapping cold Go compilation ranged from 4,739 to 34,557 events/s; do not
 treat the later samples as a guaranteed rate. Small fixture windows do not
 prove performance at the maximum key/event caps or under long-lived load.
-No native arm64 throughput result is claimed here.
+No native arm64 throughput result is claimed here. Coordination confirmed
+there is currently no approved isolated arm64 runner for this test; the Mac
+is allocated to another lane and was not used.

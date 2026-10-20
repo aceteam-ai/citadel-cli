@@ -1,0 +1,23 @@
+{
+  "profile": "stream.definition.v1",
+  "base": {
+    "fixture": "definition-v1.json",
+    "digest": "sha256:a18fb0ddae24e05cdd6e0784418a03a4d249f45d2b5bba0975f194611a864cbc"
+  },
+  "invalid_utf16_keys": [
+    "\"\\ud800\"",
+    "\"\\ud800\\u0041\"",
+    "\"\\ud800\\ud800\"",
+    "\"\\udc00\\ud800\"",
+    "\"\\udc00\\udc00\""
+  ],
+  "unicode_integer_edge": {
+    "base_fixture": "definition-v1.json",
+    "replace_definition_members": {
+      "version": 9007199254740991,
+      "escalate.input_map": {"é<\n": "$logs", "e\u0301": "$logs", "\ue000": "$alert", "\ud800\udc00": "$alert"}
+    },
+    "canonical_input_map_json": "{\"é\":\"$logs\",\"é<\\n\":\"$logs\",\"𐀀\":\"$alert\",\"\":\"$alert\"}",
+    "digest": "sha256:2d43d2653bbaf66794761ea578e78bd293b100ce94eb9c8bdd934d7c4bdaf782"
+  }
+}
