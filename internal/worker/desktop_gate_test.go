@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -40,11 +41,14 @@ func (h *recordingDesktopHandler) calls() []map[string]string {
 	return h.payloads
 }
 
-func passcodeGate(hasPasscode bool) jobs.DesktopGate {
-	return jobs.DesktopGate{
-		HasPasscode:    func() bool { return hasPasscode },
-		VerifyPasscode: func(pin string) bool { return pin == testNodePasscode },
+func passcodeState(hasPasscode bool) func() (jobs.PasscodeState, error) {
+	return func() (jobs.PasscodeState, error) {
+		return jobs.PasscodeState{Set: hasPasscode, Verify: func(pin string) bool { return pin == testNodePasscode }}, nil
 	}
+}
+
+func passcodeGate(hasPasscode bool) jobs.DesktopGate {
+	return jobs.DesktopGate{Load: passcodeState(hasPasscode)}
 }
 
 func TestDesktopAdapterHonorsNodePasscode(t *testing.T) {
@@ -120,9 +124,8 @@ func TestDesktopAdapterPermissionGateRunsFirst(t *testing.T) {
 
 func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
-		DesktopEnabled:        func() bool { return true },
-		DesktopHasPasscode:    func() bool { return true },
-		DesktopVerifyPasscode: func(pin string) bool { return pin == testNodePasscode },
+		DesktopEnabled:       func() bool { return true },
+		DesktopPasscodeState: passcodeState(true),
 	})
 	for _, jobType := range []string{JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions} {
 		var h JobHandler
@@ -151,8 +154,8 @@ func TestCreateLegacyHandlersDesktopFailsClosedWithoutPasscodeWiring(t *testing.
 		}
 		_, err := candidate.Execute(context.Background(), &Job{ID: "nil-gate", Type: JobTypeVNCActions, Payload: map[string]any{}}, nil)
 		var refusal *jobs.ShellRefusal
-		if !errors.As(err, &refusal) {
-			t.Fatalf("unwired passcode gate must refuse, got %v", err)
+		if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeUnavailable {
+			t.Fatalf("unwired passcode gate must refuse with passcode_unavailable, got %v", err)
 		}
 		return
 	}
@@ -170,9 +173,8 @@ func TestRunnerPasscodeRefusalIsTerminal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			source := NewMockJobSource("test", nil)
 			handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
-				DesktopEnabled:        func() bool { return true },
-				DesktopHasPasscode:    func() bool { return true },
-				DesktopVerifyPasscode: func(pin string) bool { return pin == testNodePasscode },
+				DesktopEnabled:       func() bool { return true },
+				DesktopPasscodeState: passcodeState(true),
 			})
 			runner := NewRunner(source, handlers, RunnerConfig{WorkerID: "test-worker"})
 			stream := &MockStreamWriter{}
@@ -218,5 +220,34 @@ func TestRunnerShellPasscodeRefusalIsTerminal(t *testing.T) {
 	}
 	if stream.errorCount != 1 || len(source.FailedJobs()) != 1 || len(source.NackedJobs()) != 0 {
 		t.Fatalf("shell refusal must be terminal: errors=%d failed=%d nacked=%d", stream.errorCount, len(source.FailedJobs()), len(source.NackedJobs()))
+	}
+}
+
+func TestDesktopAdapterRefusesWhenPasscodeStateUnreadable(t *testing.T) {
+	handler := &recordingDesktopHandler{}
+	unreadable := jobs.DesktopGate{Load: func() (jobs.PasscodeState, error) {
+		return jobs.PasscodeState{}, errors.New("read permissions: permission denied")
+	}}
+	a := newDesktopLegacyHandlerAdapter(JobTypeFileScreenshot, handler, func() bool { return true }, unreadable)
+	_, err := a.Execute(context.Background(), &Job{ID: "u", Type: JobTypeFileScreenshot, Payload: map[string]any{}}, nil)
+	var refusal *jobs.ShellRefusal
+	if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeUnavailable {
+		t.Fatalf("an unreadable passcode state must refuse, got %v", err)
+	}
+	if len(handler.calls()) != 0 {
+		t.Fatal("a refused desktop job must never reach the handler")
+	}
+}
+
+func TestWorkerJobRenderingOmitsTheNodePasscode(t *testing.T) {
+	job := Job{ID: "j", Type: JobTypeVNCActions, Payload: map[string]any{"passcode": testNodePasscode, "actions": "[]"}, RawPayload: []byte(testNodePasscode)}
+	encoded, err := json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rendered := range []string{string(encoded), fmt.Sprintf("%v", job), fmt.Sprintf("%+v", job)} {
+		if strings.Contains(rendered, testNodePasscode) {
+			t.Fatalf("job rendering retained the passcode: %s", rendered)
+		}
 	}
 }

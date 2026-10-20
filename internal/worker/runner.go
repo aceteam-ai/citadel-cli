@@ -1195,9 +1195,11 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// image, so a retry cannot make it appear. Same shape as the Files /
 		// receipt-signing refusals.
 		isSandboxedModuleUnavailable := errors.Is(actualErr, jobs.ErrSandboxedModuleUnavailable)
-		// A passcode or permission refusal (SHELL_COMMAND, WORKFLOW_RUN's Shell
-		// node, the desktop handlers) is terminal on the first delivery: a retry
-		// presents the same payload, so it cannot pass the gate.
+		// A gate refusal returned as a *jobs.ShellRefusal is terminal on the first
+		// delivery: a retry presents the same payload, so it cannot pass. That is
+		// SHELL_COMMAND, the desktop handlers, and WORKFLOW_RUN when its Shell gate
+		// refuses at submit. A Shell node refused later, mid-run, fails the
+		// workflow as an ordinary failure instead.
 		var gateRefusal *jobs.ShellRefusal
 		isGateRefusal := errors.As(actualErr, &gateRefusal)
 		isHuddleJoin := job.Type == JobTypeHuddleJoin

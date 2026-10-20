@@ -297,14 +297,11 @@ type LegacyHandlerOpts struct {
 	// desktop handlers stay registered behind a per-dispatch fail-closed gate so
 	// APPLY_DEVICE_CONFIG changes take effect without restarting the worker.
 	DesktopEnabled func() bool
-	// DesktopHasPasscode reports whether a node passcode is configured. When it
-	// does, every desktop job must present the passcode (jobs.DesktopGate).
-	// Required whenever desktop handlers are registered: nil fails closed.
-	DesktopHasPasscode func() bool
-	// DesktopVerifyPasscode checks the passcode a desktop job presents. Required
-	// whenever desktop handlers are registered: nil fails closed on a node with a
-	// passcode set.
-	DesktopVerifyPasscode func(pin string) bool
+	// DesktopPasscodeState reads the node's passcode state once per desktop job
+	// (jobs.DesktopGate.Load). It must return an error, never Set=false, when the
+	// state cannot be read. Required whenever desktop handlers are registered:
+	// nil refuses every desktop job.
+	DesktopPasscodeState func() (jobs.PasscodeState, error)
 	// FilesDisabled, when true, SKIPS registration of the file browse/host job
 	// handlers (FILE_READ/READ_BYTES/WRITE/EDIT/LIST/SEARCH/INDEX/
 	// SEMANTIC_SEARCH). FILE_WRITE_BYTES stays registered in a refusing state
@@ -468,7 +465,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	// `passcode` field. A node without a passcode is unchanged.
 	if opts.DesktopEnabled != nil || !opts.DesktopDisabled {
 		gate := opts.DesktopEnabled
-		passcode := jobs.DesktopGate{HasPasscode: opts.DesktopHasPasscode, VerifyPasscode: opts.DesktopVerifyPasscode}
+		passcode := jobs.DesktopGate{Load: opts.DesktopPasscodeState}
 		handlers = append(handlers,
 			newDesktopLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
 			newDesktopLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
