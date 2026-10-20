@@ -17,6 +17,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
@@ -1048,6 +1049,12 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	}
 	stopCoopCancelWatch()
 	cancelled := stopCancellationWatch()
+	// Sanitize before any generic failure logging, usage record or retry/status
+	// publication. The handler still receives the original in-flight payload.
+	err = jobprivacy.Error(job.Type, job.Payload, err)
+	if result != nil {
+		result.Error = jobprivacy.Error(job.Type, job.Payload, result.Error)
+	}
 
 	endTime := time.Now()
 	// Capture after execution using the separate wall seam, never for duration

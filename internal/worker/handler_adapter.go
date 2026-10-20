@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
@@ -107,6 +108,16 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	if job.Payload != nil {
 		nexusJob.Payload = make(map[string]string)
 		for k, v := range job.Payload {
+			// FILE_FETCH's bounded integer may arrive as a JSON number. Preserve
+			// its decimal form instead of fmt.Sprint's scientific notation for
+			// large float64s. The handler rejects fractions, non-finite values
+			// and out-of-range integers. Other job payload semantics are unchanged.
+			if a.jobType == JobTypeFileFetch && k == "max_bytes" {
+				if number, ok := v.(float64); ok {
+					nexusJob.Payload[k] = strconv.FormatFloat(number, 'f', -1, 64)
+					continue
+				}
+			}
 			switch val := v.(type) {
 			case string:
 				nexusJob.Payload[k] = val
@@ -266,6 +277,10 @@ type LegacyHandlerOpts struct {
 	// handlers stay registered behind a per-dispatch fail-closed gate so both
 	// capability advertisement and execution track permission revocation.
 	FilesEnabled func() bool
+	// FileFetchOrigin overrides the trusted coordinator origin resolver. Nil
+	// reloads the existing converged device configuration on each dispatch.
+	// It must never come from job payloads.
+	FileFetchOrigin func() string
 	// MeetingEnabled is the live meeting-permission source. When nil the
 	// persisted meeting configuration is loaded for each dispatch. Tests may
 	// inject it to prove that disabling new joins does not disable exact-attempt
@@ -420,6 +435,22 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 
 	// Register file-operation handlers when a workspace is configured.
 	if opts.WorkspaceDir != "" {
+		origin := opts.FileFetchOrigin
+		if origin == nil {
+			origin = func() string { return config.LoadDeviceCredsConverged().APIBaseURL }
+		}
+		fetchHandler := jobs.NewFileFetchHandler(opts.WorkspaceDir, origin)
+		fetchHandler.Disabled = opts.FilesDisabled
+		fetchHandler.Enabled = opts.FilesEnabled
+		fetchEnabled := func() bool {
+			files := !opts.FilesDisabled
+			if opts.FilesEnabled != nil {
+				files = opts.FilesEnabled()
+			}
+			return files && fetchHandler.Configured()
+		}
+		handlers = append(handlers, newGatedLegacyHandlerAdapter(JobTypeFileFetch, fetchHandler, fetchEnabled))
+
 		writeBytesHandler := jobs.NewFileWriteBytesHandler(opts.WorkspaceDir)
 		writeBytesHandler.Disabled = opts.FilesDisabled
 		writeBytesHandler.Enabled = opts.FilesEnabled

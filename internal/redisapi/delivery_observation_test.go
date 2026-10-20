@@ -66,8 +66,8 @@ func TestDeliveryObservationHTTPConsumeBoundary(t *testing.T) {
 	if string(job.RawPayload) != `{ "n":9007199254740993,"text":"雪" }` {
 		t.Fatal("exact raw bytes changed")
 	}
-	if !strings.Contains(strings.Join(debug, "\n"), observationClaim) {
-		t.Fatal("baseline raw debug exposure was silently changed")
+	if strings.Contains(strings.Join(debug, "\n"), observationClaim) {
+		t.Fatal("consume diagnostics must omit delivery body credentials")
 	}
 	job.JobID = "mutated"
 	job.Type = "mutated"
@@ -192,15 +192,15 @@ func TestDeliveryObservationManualProvenanceAndRetention(t *testing.T) {
 	}
 }
 
-func TestDeliveryObservationExistingRawHTTPErrorExposure(t *testing.T) {
+func TestDeliveryObservationHTTPErrorOmitsBody(t *testing.T) {
 	body := `{"claimToken":"` + observationClaim + `","messages":`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, body) }))
 	defer srv.Close()
 	c := NewClient(ClientConfig{BaseURL: srv.URL})
 	defer c.Close()
 	_, err := c.ConsumeJob(context.Background(), ConsumeRequest{})
-	if err == nil || !strings.Contains(err.Error(), observationClaim) {
-		t.Fatal("baseline raw malformed-body error exposure changed")
+	if err == nil || strings.Contains(err.Error(), observationClaim) {
+		t.Fatal("malformed consume error must omit delivery body credentials")
 	}
 }
 
