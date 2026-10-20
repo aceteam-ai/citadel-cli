@@ -41,10 +41,15 @@ type Descriptor struct {
 
 // Capability prevents accidental credential disclosure in diagnostics or JSON.
 // Reveal is the explicit escape hatch for the pinned, authorized fetch client.
-type Capability struct{ raw string }
+// The bytes live only in a closure: fmt bypasses methods while traversing an
+// unexported wrapper field, but cannot traverse a function's captured values.
+type Capability struct{ reveal func() string }
 
 func (c Capability) Reveal() string {
-	return c.raw
+	if c.reveal == nil {
+		return ""
+	}
+	return c.reveal()
 }
 
 func (c Capability) String() string {
@@ -179,7 +184,8 @@ func Parse(task string, raw []byte) (Contract, error) {
 				return Contract{}, refuse("invalid_input_path")
 			}
 		case "inbox":
-			input.Capability = Capability{raw: m["capability"].(string)}
+			token := m["capability"].(string)
+			input.Capability = Capability{reveal: func() string { return token }}
 			if !validCapability(input.Capability.Reveal()) {
 				return Contract{}, refuse("invalid_capability")
 			}
