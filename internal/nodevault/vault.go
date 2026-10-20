@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -201,6 +202,20 @@ func (v *Vault) pepperPath() string { return filepath.Join(v.dir, pepperName) }
 func (v *Vault) IsConfigured() bool {
 	_, err := os.Stat(v.headerPath())
 	return err == nil
+}
+
+// Configured is IsConfigured for a gate decision: a missing vault header is
+// (false, nil), but any other stat error is returned rather than read as "no
+// master PIN", so a caller can refuse instead of failing open.
+func (v *Vault) Configured() (bool, error) {
+	_, err := os.Stat(v.headerPath())
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("nodevault: stat header: %w", err)
 }
 
 // SetPIN initializes the vault: enforces policy on pin, generates the pepper

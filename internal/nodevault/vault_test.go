@@ -441,3 +441,28 @@ func TestStatusOnCorruptKDFDoesNotPanic(t *testing.T) {
 		t.Fatal("Status() reported Configured=true for a vault with invalid KDF params")
 	}
 }
+
+func TestConfiguredDistinguishesMissingFromUnreadable(t *testing.T) {
+	v := newTestVault(t)
+	if set, err := v.Configured(); set || err != nil {
+		t.Fatalf("no vault: Configured = %v, %v; want false, nil", set, err)
+	}
+	mustSet(t, v, "correct-horse-battery-1")
+	if set, err := v.Configured(); !set || err != nil {
+		t.Fatalf("enrolled vault: Configured = %v, %v; want true, nil", set, err)
+	}
+	// A vault directory that is a regular file makes the header stat fail with
+	// something other than not-exist. IsConfigured reads that as "no vault";
+	// Configured must report the error instead.
+	notADir := filepath.Join(t.TempDir(), "vault-dir")
+	if err := os.WriteFile(notADir, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	broken := Open(notADir)
+	if broken.IsConfigured() {
+		t.Fatal("precondition: IsConfigured should read the broken path as false")
+	}
+	if _, err := broken.Configured(); err == nil {
+		t.Fatal("Configured must return the stat error, not report no vault")
+	}
+}

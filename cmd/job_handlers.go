@@ -4,6 +4,8 @@ package cmd
 
 import (
 	"fmt"
+	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
 	"os"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
@@ -32,6 +34,34 @@ func nodePasscodeVerifier(pin string) bool {
 // HasPasscode reports only presence, never the hash.
 func nodeHasPasscode() bool {
 	return loadNodePermissions().HasPasscode()
+}
+
+// nodePasscodeState reads the node's passcode configuration once, for a gate
+// that allows a job when no passcode is set (the desktop gate). Unlike
+// nodeHasPasscode it never turns a read failure into "no passcode": a
+// permissions file it cannot read or parse, or a master-PIN vault it cannot
+// stat, is returned as an error so the gate refuses.
+func nodePasscodeState() (jobs.PasscodeState, error) {
+	return passcodeStateFrom(nodePermissionsDir(), masterVault())
+}
+
+// passcodeStateFrom is nodePasscodeState's pure core, taking the permissions
+// directory and vault explicitly so tests never read this machine's node state.
+func passcodeStateFrom(permissionsDir string, vault *nodevault.Vault) (jobs.PasscodeState, error) {
+	perms, err := config.LoadPermissionsStrict(permissionsDir)
+	if err != nil {
+		return jobs.PasscodeState{}, err
+	}
+	vaultSet, err := vault.Configured()
+	if err != nil {
+		return jobs.PasscodeState{}, err
+	}
+	if vaultSet {
+		return jobs.PasscodeState{Set: true, Verify: func(pin string) bool { return pin != "" && vault.VerifyPIN(pin) == nil }}, nil
+	}
+	// The vault was just checked, so verify the legacy hash directly rather
+	// than through the master-PIN hooks, which consult the vault again.
+	return jobs.PasscodeState{Set: perms.PasscodeHash != "", Verify: perms.VerifyLegacyPasscode}, nil
 }
 
 // nodeShellEnabled is the live shell kill-switch. Reloading the small

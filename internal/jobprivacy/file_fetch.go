@@ -6,21 +6,28 @@ import "strings"
 const FileFetch = "FILE_FETCH"
 
 // Payload is for retention/diagnostics only, never execution or redispatch.
+// It drops a FILE_FETCH payload entirely and removes the node passcode field
+// from every other job type.
 func Payload(kind string, payload map[string]any) map[string]any {
 	if kind == FileFetch {
 		return nil
 	}
-	return payload
+	return WithoutPasscode(payload)
 }
 
-// Text removes a reflected delivery credential while preserving safe reasons.
+// Text removes a reflected delivery credential or node passcode while
+// preserving safe reasons.
 func Text(kind string, payload map[string]any, text string) string {
 	if kind == FileFetch {
 		if token, ok := payload["capability"].(string); ok && token != "" {
-			return strings.ReplaceAll(text, token, "[REDACTED]")
+			text = replaceAll(text, token)
 		}
 	}
-	return text
+	return redactPasscode(payload, text)
+}
+
+func replaceAll(text, secret string) string {
+	return strings.ReplaceAll(text, secret, "[REDACTED]")
 }
 
 type redactedError struct {

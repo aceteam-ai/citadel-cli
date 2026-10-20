@@ -2,7 +2,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,6 +103,26 @@ func LoadPermissions(configDir string) *Permissions {
 	return p
 }
 
+// LoadPermissionsStrict is LoadPermissions for a gate decision: a missing file
+// still yields the defaults, but any other read error, or a file that does not
+// parse, is returned instead of being read as the defaults. A gate whose
+// outcome depends on a configured passcode must refuse on that error rather
+// than conclude that no passcode is set.
+func LoadPermissionsStrict(configDir string) (*Permissions, error) {
+	p := DefaultPermissions()
+	data, err := os.ReadFile(filepath.Join(configDir, permissionsFile))
+	if errors.Is(err, fs.ErrNotExist) {
+		return p, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read permissions: %w", err)
+	}
+	if err := yaml.Unmarshal(data, p); err != nil {
+		return nil, fmt.Errorf("parse permissions: %w", err)
+	}
+	return p, nil
+}
+
 // SavePermissions writes permissions to the config directory. The file is
 // written 0600 because it now carries the node passcode hash (a credential):
 // even though bcrypt makes the hash non-reversible cheaply, there is no reason
@@ -115,7 +137,30 @@ func SavePermissions(configDir string, p *Permissions) error {
 		return fmt.Errorf("marshal permissions: %w", err)
 	}
 
-	return os.WriteFile(filepath.Join(configDir, permissionsFile), data, 0600)
+	// Write a temp file and rename it over the old one, so a concurrent reader
+	// sees either the old or the new file, never a partly written one.
+	tmp, err := os.CreateTemp(configDir, permissionsFile+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create permissions temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod permissions temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write permissions: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync permissions: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close permissions temp file: %w", err)
+	}
+	return os.Rename(tmpName, filepath.Join(configDir, permissionsFile))
 }
 
 // SetPasscode hashes pin with bcrypt and stores it in PasscodeHash. An empty pin
@@ -192,6 +237,12 @@ func (p *Permissions) VerifyPasscode(pin string) bool {
 			return ok
 		}
 	}
+	return p.VerifyLegacyPasscode(pin)
+}
+
+// VerifyLegacyPasscode checks pin against the legacy bcrypt passcode hash only,
+// never the master-PIN hooks. It fails closed on an unset hash or empty pin.
+func (p *Permissions) VerifyLegacyPasscode(pin string) bool {
 	if p.PasscodeHash == "" || pin == "" {
 		return false
 	}
