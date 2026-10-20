@@ -160,7 +160,7 @@ as local `LoadPack`; the artifact is not an alternate evaluator.
 
 `packs/vectors/v1.json` is the authoritative portable vector data. Both repos
 must consume the same file unchanged. It identifies the exact index, bundle,
-pack digest and `canonical_manifest_base64` and defines 17 positive/tamper
+pack digest and `canonical_manifest_base64` and defines 22 positive/tamper
 cases. Its `fixture_commit` is an intentionally synthetic syntax-test value,
 not a published commit or a production pin.
 
@@ -182,6 +182,10 @@ Every case starts from the original pinned index/bundle bytes. Operations are:
 | `index_path_escape` | Change the entry's bundle path to `../bundle.json` |
 | `non_commit_pin` | Change the external fixture pin's commit to `main` |
 | `unknown_pack_digest` | Select `sha256:` plus 64 zeroes |
+| `index_wrong_origin`, `index_future_schema` | Set index `origin` to `attacker/repository`, or schema to `stream.pack-index.v2` |
+| `index_duplicate_entry` | Append a copy of the first pack entry |
+| `index_uppercase_digest` | Uppercase the first entry's entire `digest` string |
+| `index_url_path` | Change the first entry's bundle path to `https://example.test/bundle.json` |
 
 When `refresh_outer` is true, this **test only** deliberately updates the
 entry's bundle SHA and the external index SHA to the mutated exact bytes.
@@ -196,6 +200,24 @@ diagnostic substring used by the Go harness, not a required public error API.
 equivalence against all seven original shared Shield log files, in both time
 modes. The common original fixtures are not regenerated or duplicated inside
 the bundle. This leaves history matching in the escalated flow as designed.
+
+`json_schema_cases` additionally holds 17 portable parser-only cases for
+index/bundle coercion, case aliases, duplicate and escaped-duplicate member
+names, and the outer-artifact Unicode restriction. Each starts from the exact
+original index or bundle bytes selected by `target`, replaces the first `old`
+byte string with `new`, then invokes strict JSON artifact decoding without
+compilation. `accept` specifies the expected decoding result. Missing mutation
+targets, duplicate case IDs and unknown targets are harness failures. These
+cases intentionally isolate parser behavior from the outer byte pins and
+inner pack identity; they do not authorize refreshing production pins.
+
+The valid escaped astral pair `\ud800\udc00` is refused in an outer artifact
+filename, whereas its literal UTF-8 representation is accepted by the parser.
+Literal backslash-u text is not a Unicode escape and remains parseable. Neither
+positive parser case is a published pack: full compilation must still verify
+the exact reviewed filename set, canonical manifest and pack digest. The base
+bundle/index bytes, their SHA pins and all positive pack/definition digests
+remain unchanged.
 
 ## Verification and remaining gate
 

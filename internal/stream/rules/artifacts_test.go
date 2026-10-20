@@ -30,6 +30,13 @@ type artifactVectorFile struct {
 	BundleDigest            string           `json:"bundle_digest"`
 	CanonicalManifestBase64 string           `json:"canonical_manifest_base64"`
 	Cases                   []artifactVector `json:"cases"`
+	JSONSchemaCases         []struct {
+		ID     string `json:"id"`
+		Target string `json:"target"`
+		Old    string `json:"old"`
+		New    string `json:"new"`
+		Accept bool   `json:"accept"`
+	} `json:"json_schema_cases"`
 }
 
 func artifactTestInputs(t *testing.T) (artifactVectorFile, []byte, []byte) {
@@ -43,7 +50,7 @@ func artifactTestInputs(t *testing.T) (artifactVectorFile, []byte, []byte) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if vectors.SchemaVersion != "stream.pack-artifact-vectors.v1" || len(vectors.Cases) != 17 {
+	if vectors.SchemaVersion != "stream.pack-artifact-vectors.v1" || len(vectors.Cases) != 22 || len(vectors.JSONSchemaCases) != 17 {
 		t.Fatal("unexpected shared artifact vector contract")
 	}
 	index, err := os.ReadFile(filepath.Join(root, vectors.IndexFile))
@@ -201,6 +208,16 @@ func TestSharedArtifactTamperVectors(t *testing.T) {
 				pin.Commit = "main"
 			case "unknown_pack_digest":
 				selectorDigest = "sha256:" + strings.Repeat("0", 64)
+			case "index_wrong_origin":
+				index.Origin = "attacker/repository"
+			case "index_future_schema":
+				index.SchemaVersion = "stream.pack-index.v2"
+			case "index_duplicate_entry":
+				index.Packs = append(index.Packs, index.Packs[0])
+			case "index_uppercase_digest":
+				index.Packs[0].Digest = strings.ToUpper(index.Packs[0].Digest)
+			case "index_url_path":
+				index.Packs[0].BundlePath = "https://example.test/bundle.json"
 			default:
 				t.Fatalf("unknown shared mutation operation: %s", vector.Operation)
 			}
@@ -237,26 +254,6 @@ func TestSharedArtifactTamperVectors(t *testing.T) {
 
 func TestArtifactLimitsAndStrictIndexSchema(t *testing.T) {
 	vectors, originalIndex, bundle := artifactTestInputs(t)
-	for _, mutation := range []func(*PackIndex){
-		func(index *PackIndex) { index.Origin = "attacker/repository" },
-		func(index *PackIndex) { index.SchemaVersion = "stream.pack-index.v2" },
-		func(index *PackIndex) { index.Packs = append(index.Packs, index.Packs[0]) },
-		func(index *PackIndex) { index.Packs[0].Digest = strings.ToUpper(index.Packs[0].Digest) },
-		func(index *PackIndex) { index.Packs[0].BundlePath = "https://example.test/bundle.json" },
-	} {
-		var index PackIndex
-		if err := decodeArtifactJSON(originalIndex, &index); err != nil {
-			t.Fatal(err)
-		}
-		mutation(&index)
-		data, err := json.Marshal(index)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got, err := ParsePinnedPackIndex(ArtifactPin{Commit: vectors.FixtureCommit, IndexDigest: artifactSHA(data)}, data); err == nil || got != nil {
-			t.Fatal("invalid freshly pinned index was accepted")
-		}
-	}
 	for _, value := range []string{"", "YQ", "YR==", "YQ==\n", strings.Repeat("A", (maxRuleBytes+3)/3*4)} {
 		if _, err := artifactDecodedSize(value, maxRuleBytes); err == nil {
 			if _, err := artifactDecodeBase64(value); err == nil {
@@ -277,39 +274,36 @@ func TestArtifactLimitsAndStrictIndexSchema(t *testing.T) {
 	}
 }
 
-func TestArtifactJSONRejectsTypeCoercionAndUnknownMembers(t *testing.T) {
-	for _, data := range []string{
-		`{"schema_version":"stream.pack-index.v1","origin":"aceteam-ai/citadel-cli","packs":[{"id":123}]}`,
-		`{"schema_version":"stream.pack-index.v1","origin":"aceteam-ai/citadel-cli","packs":[{"version":123}]}`,
-		`{"schema_version":"stream.pack-index.v1","origin":"aceteam-ai/citadel-cli","packs":[],"unknown":true}`,
-	} {
-		var index PackIndex
-		if err := decodeArtifactJSON([]byte(data), &index); err == nil {
-			t.Fatal("artifact JSON schema was weakened by coercion or unknown fields")
-		}
-	}
-}
-
-func TestArtifactJSONRejectsCaseAliasesAndSemanticDuplicateMembers(t *testing.T) {
+func TestSharedArtifactJSONSchemaVectors(t *testing.T) {
 	vectors, originalIndex, originalBundle := artifactTestInputs(t)
-	for _, data := range [][]byte{
-		[]byte(strings.Replace(string(originalIndex), `"id":`, `"ID":`, 1)),
-		[]byte(strings.Replace(string(originalIndex), `"id":`, `"ID":"other","id":`, 1)),
-		[]byte(strings.Replace(string(originalIndex), `"schema_version":`, `"SCHEMA_VERSION":`, 1)),
-	} {
-		pin := ArtifactPin{Commit: vectors.FixtureCommit, IndexDigest: artifactSHA(data)}
-		if index, err := ParsePinnedPackIndex(pin, data); err == nil || index != nil {
-			t.Fatal("exact-case index schema accepted a case alias or semantic overwrite")
+	seen := map[string]bool{}
+	for _, vector := range vectors.JSONSchemaCases {
+		if vector.ID == "" || seen[vector.ID] {
+			t.Fatal("empty or duplicate JSON schema vector id")
 		}
-	}
-	for _, data := range [][]byte{
-		[]byte(strings.Replace(string(originalBundle), `"file":`, `"File":`, 1)),
-		[]byte(strings.Replace(string(originalBundle), `"file":`, `"File":"rules/other.yml","file":`, 1)),
-		[]byte(strings.Replace(string(originalBundle), `"schema_version":`, `"SCHEMA_VERSION":`, 1)),
-	} {
-		var bundle artifactBundle
-		if err := decodeArtifactJSON(data, &bundle); err == nil {
-			t.Fatal("exact-case bundle/rule schema accepted a case alias or semantic overwrite")
-		}
+		seen[vector.ID] = true
+		t.Run(vector.ID, func(t *testing.T) {
+			var original []byte
+			var decoded any
+			switch vector.Target {
+			case "index":
+				original, decoded = originalIndex, &PackIndex{}
+			case "bundle":
+				original, decoded = originalBundle, &artifactBundle{}
+			default:
+				t.Fatal("unknown shared JSON schema target", vector.Target)
+			}
+			if vector.Old == "" || !strings.Contains(string(original), vector.Old) {
+				t.Fatal("shared JSON mutation did not target original bytes")
+			}
+			data := []byte(strings.Replace(string(original), vector.Old, vector.New, 1))
+			if string(data) == string(original) {
+				t.Fatal("shared JSON mutation did not change bytes")
+			}
+			err := decodeArtifactJSON(data, decoded)
+			if (err == nil) != vector.Accept {
+				t.Fatalf("schema-only acceptance=%v, want %v: %v", err == nil, vector.Accept, err)
+			}
+		})
 	}
 }

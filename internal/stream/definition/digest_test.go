@@ -2,6 +2,7 @@ package definition
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -56,42 +57,63 @@ func TestSharedDefinitionVector(t *testing.T) {
 
 func TestDefinitionRefusesAmbiguousAndUnmaterializedData(t *testing.T) {
 	org, original := sharedDefinition(t)
-	for _, tc := range []struct{ name, old, replacement string }{
-		{"unknown top field", `"version": 1`, `"version": 1, "status": "active"`},
-		{"case alias", `"version": 1`, `"Version": 1`},
-		{"duplicate key", `"version": 1`, `"version": 1, "version": 2`},
-		{"escaped duplicate", `"version": 1`, `"version": 1, "\u0076ersion": 2`},
-		{"coercion", `"version": 1`, `"version": "1"`},
-		{"float integer", `"version": 1`, `"version": 1.0`},
-		{"exponent integer", `"version": 1`, `"version": 1e0`},
-		{"unsafe integer", `"version": 1`, `"version": 9007199254740992`},
-		{"negative zero", `"max_lines": 0`, `"max_lines": -0`},
-		{"missing explicit null", `"bind": null,`, ``},
-		{"old floating cost name", `"max_run_cost_micro_usd": 1000000`, `"max_run_cost_usd": 1`},
-		{"fractional micro cost", `"max_run_cost_micro_usd": 1000000`, `"max_run_cost_micro_usd": 0.5`},
-		{"overflow cost", `"daily_cap_micro_usd": 5000000`, `"daily_cap_micro_usd": 5000001`},
-		{"invalid surrogate", `"logs": "$logs"`, `"\ud800": "$logs"`},
-		{"high then non-low surrogate", `"logs": "$logs"`, `"\ud800\u0041": "$logs"`},
-		{"high then high surrogate", `"logs": "$logs"`, `"\ud800\ud800": "$logs"`},
-		{"low then high surrogate", `"logs": "$logs"`, `"\udc00\ud800": "$logs"`},
-		{"low then low surrogate", `"logs": "$logs"`, `"\udc00\udc00": "$logs"`},
-		{"path traversal", `/tmp/synthetic-stream/auth.log`, `/tmp/../auth.log`},
-		{"node overflow", `"node_id": "1297"`, `"node_id": "18446744073709551616"`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mutated := strings.Replace(string(original), tc.old, tc.replacement, 1)
-			if mutated == string(original) {
+	data, err := os.ReadFile(filepath.Join("..", "testdata", "contracts", "definition-v1-vectors.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors struct {
+		Negative []struct {
+			ID        string `json:"id"`
+			Operation string `json:"operation"`
+			Old       string `json:"old"`
+			New       string `json:"new"`
+			Text      string `json:"text"`
+			Depth     int    `json:"depth"`
+			Bytes     int    `json:"bytes"`
+			Hex       string `json:"hex"`
+		} `json:"negative_definitions"`
+	}
+	if err := json.Unmarshal(data, &vectors); err != nil || len(vectors.Negative) != 27 {
+		t.Fatal("missing shared definition refusal vectors", err)
+	}
+	seen := map[string]bool{}
+	for _, vector := range vectors.Negative {
+		if vector.ID == "" || seen[vector.ID] {
+			t.Fatal("duplicate or empty vector id")
+		}
+		seen[vector.ID] = true
+		t.Run(vector.ID, func(t *testing.T) {
+			var mutated []byte
+			switch vector.Operation {
+			case "replace_first":
+				if vector.Old == "" || strings.Count(string(original), vector.Old) != 1 {
+					t.Fatal("mutation must target exactly one base fixture occurrence")
+				}
+				mutated = []byte(strings.Replace(string(original), vector.Old, vector.New, 1))
+			case "raw_text":
+				mutated = []byte(vector.Text)
+			case "append_text":
+				mutated = append(append([]byte(nil), original...), []byte(vector.Text)...)
+			case "nested_arrays":
+				mutated = []byte(strings.Repeat("[", vector.Depth) + strings.Repeat("]", vector.Depth))
+			case "spaces":
+				mutated = bytes.Repeat([]byte{' '}, vector.Bytes)
+			case "raw_hex":
+				var err error
+				mutated, err = hex.DecodeString(vector.Hex)
+				if err != nil {
+					t.Fatal(err)
+				}
+			default:
+				t.Fatal("unknown shared definition operation", vector.Operation)
+			}
+			if bytes.Equal(mutated, original) {
 				t.Fatal("test mutation did not apply")
 			}
-			if _, err := Digest(org, []byte(mutated)); err == nil {
-				t.Fatal("ambiguous or unsupported wire definition accepted")
+			if _, err := Digest(org, mutated); err == nil {
+				t.Fatal("shared negative definition accepted")
 			}
 		})
-	}
-	for _, invalid := range []string{"{}", "null", "[]", string(original) + " {}", strings.Repeat("[", 17) + strings.Repeat("]", 17), strings.Repeat(" ", MaxBytes+1), string([]byte{0xff})} {
-		if _, err := Digest(org, []byte(invalid)); err == nil {
-			t.Fatal("invalid bounded object accepted")
-		}
 	}
 }
 
