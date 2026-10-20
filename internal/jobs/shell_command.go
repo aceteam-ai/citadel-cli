@@ -71,6 +71,8 @@ func shellCommandRefusalMessage(reason string) string {
 		return msgPasscodeThrottled
 	case ReasonPasscodeLocked:
 		return msgPasscodeLocked
+	case ReasonPasscodeUnavailable:
+		return msgPasscodeUnavailable
 	default:
 		return msgPasscodeInvalid
 	}
@@ -137,7 +139,7 @@ func (g ShellGate) IsEnabled() bool {
 // ShellGateReason applies the gate to a presented passcode. It returns "" when
 // the command may run, otherwise the refusal reason code. Order:
 // shell_disabled beats passcode_not_set beats passcode_throttled beats
-// passcode_locked beats passcode_invalid. A nil HasPasscode or nil VerifyPasscode refuses (fail
+// passcode_locked / passcode_unavailable beats passcode_invalid. A nil HasPasscode or nil VerifyPasscode refuses (fail
 // closed).
 func ShellGateReason(g ShellGate, presentedPasscode string) string {
 	if !g.IsEnabled() {

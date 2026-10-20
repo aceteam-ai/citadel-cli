@@ -610,7 +610,8 @@ gate therefore takes one `jobs.PasscodeState` read per job from
 `nodevault.Vault.Configured`: an unreadable or unparseable permissions file, or
 a vault that cannot be stat'ed, refuses with `passcode_unavailable` instead of
 reading as unset. `config.SavePermissions` replaces the file atomically for the
-same reason. The payload `passcode` key never reaches a desktop handler, and
+same reason, keeping the existing file's owner (`keepOwner`) so a save by root
+does not lock the worker out. The payload `passcode` key never reaches a desktop handler, and
 `jobprivacy.Payload`/`Text` plus the `Job` JSON and fmt renderings in
 `internal/worker`, `internal/redis` and `internal/redisapi` drop it for every
 job type, so it is never written to a dead-letter entry or a log.
@@ -622,7 +623,12 @@ process-wide instance (`cmd.nodePasscodeThrottle`) is shared by SHELL_COMMAND,
 the WORKFLOW_RUN Shell gate and the desktop gate, so failures on one count for
 all. After `DefaultPasscodeMaxFailures` within the window, every passcode-gated
 job is refused with `passcode_throttled` for the cooldown without checking the
-passcode. It is in memory, so a worker restart resets it. A master-PIN vault
+passcode. Only a non-empty wrong passcode counts (an absent one is a caller
+without a credential, not a guess); a correct passcode does not clear earlier
+failures, which expire only with time; and checks through the throttle are
+serialized so concurrent jobs cannot overshoot. It is in memory, so a worker
+restart resets it. A vault or permissions error that is not a wrong PIN or a
+lockout is `passcode_unavailable` and is not counted. A master-PIN vault
 lockout is a separate reason, `passcode_locked`: `cmd.vaultPasscodeVerdict`
 maps `nodevault.IsLockedOut` to `jobs.PasscodeLockedOut`, so a correct
 passcode presented during a vault lockout is never reported as

@@ -30,6 +30,9 @@ const (
 	// PasscodeLockedOut: the check could not run because the node's master-PIN
 	// vault is locked out. Not a wrong passcode.
 	PasscodeLockedOut
+	// PasscodeUnavailable: the check could not run because the node's passcode
+	// state could not be read (an I/O or stat error). Not a wrong passcode.
+	PasscodeUnavailable
 )
 
 // BoolCheck adapts a plain true/false verifier, which has no lockout signal.
@@ -60,8 +63,12 @@ const (
 //
 // After MaxFailures wrong passcodes within Window, every passcode-gated job is
 // refused with ReasonPasscodeThrottled for Cooldown, without checking the
-// passcode. A correct passcode outside a cooldown clears the failure count.
-// State is in memory only, so a worker restart resets it.
+// passcode. Only a presented, non-empty passcode that is wrong counts: an
+// absent passcode, a vault lockout and an unreadable passcode state do not.
+// Failures expire only with time; a correct passcode does not clear them, so
+// wrong guesses interleaved with correct ones still reach the limit. Checks
+// through one throttle are serialized, so concurrent jobs cannot overshoot
+// the limit. State is in memory only, so a worker restart resets it.
 //
 // A nil *PasscodeThrottle never throttles.
 type PasscodeThrottle struct {
@@ -98,17 +105,16 @@ func (t *PasscodeThrottle) Throttled() bool {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.throttledLocked()
+}
+
+func (t *PasscodeThrottle) throttledLocked() bool {
 	return t.clock().Before(t.lockedUntil)
 }
 
-// RecordFailure counts one wrong passcode and starts a cooldown once the
+// recordFailureLocked counts one wrong passcode and starts a cooldown once the
 // window holds MaxFailures of them.
-func (t *PasscodeThrottle) RecordFailure() {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *PasscodeThrottle) recordFailureLocked() {
 	now := t.clock()
 	cutoff := now.Add(-t.Window)
 	kept := t.failures[:0]
@@ -124,35 +130,39 @@ func (t *PasscodeThrottle) RecordFailure() {
 	}
 }
 
-// RecordSuccess clears the failure count after a correct passcode.
-func (t *PasscodeThrottle) RecordSuccess() {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.failures = t.failures[:0]
-}
-
-// checkPasscode applies the throttle around one passcode check. It returns ""
-// on a match, ReasonPasscodeThrottled during a cooldown (without calling
-// check), ReasonPasscodeLocked when the vault is locked out (not counted as a
-// failure), or ReasonPasscodeInvalid. A nil check refuses.
+// checkPasscode applies the throttle around one passcode check and returns the
+// refusal reason, or "" on a match:
+//   - ReasonPasscodeThrottled during a cooldown, without calling check;
+//   - ReasonPasscodeLocked or ReasonPasscodeUnavailable when the check could
+//     not run, not counted;
+//   - ReasonPasscodeInvalid for a wrong passcode, counted only when a
+//     non-empty passcode was presented.
+//
+// A nil check refuses. With a non-nil throttle the whole decision, including
+// check, runs under the throttle's lock.
 func checkPasscode(t *PasscodeThrottle, check func(string) PasscodeVerdict, presented string) string {
-	if t.Throttled() {
-		return ReasonPasscodeThrottled
+	if t != nil {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.throttledLocked() {
+			return ReasonPasscodeThrottled
+		}
 	}
 	if check == nil {
 		return ReasonPasscodeInvalid
 	}
 	switch check(presented) {
 	case PasscodeMatch:
-		t.RecordSuccess()
 		return ""
 	case PasscodeLockedOut:
 		return ReasonPasscodeLocked
+	case PasscodeUnavailable:
+		return ReasonPasscodeUnavailable
 	default:
-		t.RecordFailure()
+		// An absent passcode is a caller without a credential, not a guess.
+		if t != nil && presented != "" {
+			t.recordFailureLocked()
+		}
 		return ReasonPasscodeInvalid
 	}
 }

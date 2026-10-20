@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -71,10 +72,9 @@ func TestPasscodeThrottleIsSharedAcrossSurfaces(t *testing.T) {
 	}
 }
 
-func TestPasscodeThrottleWindowAndSuccessReset(t *testing.T) {
+func TestPasscodeThrottleWindowExpiresFailures(t *testing.T) {
 	th, clock := newTestThrottle()
 	g := DesktopGate{Load: setState(pinVerify), Throttle: th}
-	// Failures older than the window do not count.
 	for i := 0; i < DefaultPasscodeMaxFailures-1; i++ {
 		DesktopGateReason(g, "wrong")
 	}
@@ -83,18 +83,71 @@ func TestPasscodeThrottleWindowAndSuccessReset(t *testing.T) {
 	if th.Throttled() {
 		t.Fatal("failures outside the window must not start a cooldown")
 	}
-	// A correct passcode clears the count.
-	th, _ = newTestThrottle()
-	g.Throttle = th
+}
+
+func TestPasscodeThrottleCorrectPasscodeDoesNotClearFailures(t *testing.T) {
+	th, _ := newTestThrottle()
+	g := DesktopGate{Load: setState(pinVerify), Throttle: th}
 	for i := 0; i < DefaultPasscodeMaxFailures-1; i++ {
 		DesktopGateReason(g, "wrong")
+		if got := DesktopGateReason(g, throttlePin); got != "" {
+			t.Fatalf("correct passcode before the limit: %q", got)
+		}
 	}
-	if got := DesktopGateReason(g, throttlePin); got != "" {
-		t.Fatalf("correct passcode before the limit: %q", got)
+	if got := DesktopGateReason(g, "wrong"); got != ReasonPasscodeInvalid {
+		t.Fatalf("limit-reaching guess: %q", got)
 	}
-	DesktopGateReason(g, "wrong")
+	if !th.Throttled() {
+		t.Fatal("wrong guesses interleaved with correct passcodes must still reach the limit")
+	}
+}
+
+func TestPasscodeThrottleDoesNotCountAbsentOrUncheckablePasscodes(t *testing.T) {
+	th, _ := newTestThrottle()
+	counting := func(string) bool { return false } // rejects everything, like a real verifier
+	shell := ShellGate{Enabled: func() bool { return true }, HasPasscode: func() bool { return true }, VerifyPasscode: counting, Throttle: th}
+	desktop := DesktopGate{Load: setState(counting), Throttle: th}
+	for i := 0; i < 3*DefaultPasscodeMaxFailures; i++ {
+		if got := ShellGateReason(shell, ""); got != ReasonPasscodeInvalid {
+			t.Fatalf("absent shell passcode: %q", got)
+		}
+		if got := DesktopGateReason(desktop, ""); got != ReasonPasscodeInvalid {
+			t.Fatalf("absent desktop passcode: %q", got)
+		}
+	}
+	unavailable := DesktopGate{Load: func() (PasscodeState, error) {
+		return PasscodeState{Set: true, Check: func(string) PasscodeVerdict { return PasscodeUnavailable }}, nil
+	}, Throttle: th}
+	for i := 0; i < 3*DefaultPasscodeMaxFailures; i++ {
+		if got := DesktopGateReason(unavailable, throttlePin); got != ReasonPasscodeUnavailable {
+			t.Fatalf("uncheckable passcode: %q", got)
+		}
+	}
 	if th.Throttled() {
-		t.Fatal("a correct passcode must reset the failure count")
+		t.Fatal("absent and uncheckable passcodes must not start a cooldown")
+	}
+}
+
+func TestPasscodeThrottleConcurrentChecksCannotOvershoot(t *testing.T) {
+	th, _ := newTestThrottle()
+	var mu sync.Mutex
+	checked := 0
+	slow := func(string) bool {
+		mu.Lock()
+		checked++
+		mu.Unlock()
+		time.Sleep(2 * time.Millisecond)
+		return false
+	}
+	g := DesktopGate{Load: setState(slow), Throttle: th}
+	var wg sync.WaitGroup
+	for i := 0; i < 4*DefaultPasscodeMaxFailures; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); DesktopGateReason(g, "wrong") }()
+	}
+	wg.Wait()
+	if checked != DefaultPasscodeMaxFailures {
+		t.Fatalf("concurrent wrong guesses checked = %d, want exactly %d before the cooldown", checked, DefaultPasscodeMaxFailures)
 	}
 }
 

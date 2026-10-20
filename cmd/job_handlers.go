@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
@@ -82,8 +83,12 @@ func vaultPasscodeVerdict(vault *nodevault.Vault, pin string) jobs.PasscodeVerdi
 		return jobs.PasscodeMatch
 	case nodevault.IsLockedOut(err):
 		return jobs.PasscodeLockedOut
-	default:
+	case errors.Is(err, nodevault.ErrWrongPIN):
 		return jobs.PasscodeMismatch
+	default:
+		// Any other vault error (I/O, a corrupt header) says nothing about the
+		// presented passcode, so it must not read as, or count as, a wrong one.
+		return jobs.PasscodeUnavailable
 	}
 }
 
@@ -92,11 +97,24 @@ func vaultPasscodeVerdict(vault *nodevault.Vault, pin string) jobs.PasscodeVerdi
 // unlike it, a master-PIN lockout is reported as PasscodeLockedOut, so a
 // correct passcode is never refused as passcode_invalid during a lockout.
 func nodePasscodeCheck(pin string) jobs.PasscodeVerdict {
-	vault := masterVault()
-	if vault.IsConfigured() {
+	return passcodeVerdictFrom(nodePermissionsDir(), masterVault(), pin)
+}
+
+// passcodeVerdictFrom is nodePasscodeCheck's pure core. A permissions file or
+// vault it cannot read yields PasscodeUnavailable, never a mismatch.
+func passcodeVerdictFrom(permissionsDir string, vault *nodevault.Vault, pin string) jobs.PasscodeVerdict {
+	vaultSet, err := vault.Configured()
+	if err != nil {
+		return jobs.PasscodeUnavailable
+	}
+	if vaultSet {
 		return vaultPasscodeVerdict(vault, pin)
 	}
-	return jobs.BoolCheck(loadNodePermissions().VerifyLegacyPasscode)(pin)
+	perms, err := config.LoadPermissionsStrict(permissionsDir)
+	if err != nil {
+		return jobs.PasscodeUnavailable
+	}
+	return jobs.BoolCheck(perms.VerifyLegacyPasscode)(pin)
 }
 
 // nodeShellEnabled is the live shell kill-switch. Reloading the small

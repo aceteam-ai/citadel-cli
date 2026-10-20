@@ -149,6 +149,10 @@ func SavePermissions(configDir string, p *Permissions) error {
 		tmp.Close()
 		return fmt.Errorf("chmod permissions temp file: %w", err)
 	}
+	if err := keepOwner(tmp, filepath.Join(configDir, permissionsFile)); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return fmt.Errorf("write permissions: %w", err)
