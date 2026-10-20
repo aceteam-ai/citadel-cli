@@ -30,8 +30,14 @@
     {"id":"array","operation":"raw_text","text":"[]"},
     {"id":"trailing-document","operation":"append_text","text":" {}"},
     {"id":"nesting-limit","operation":"nested_arrays","depth":17},
-    {"id":"byte-limit","operation":"spaces","bytes":262145},
+    {"id":"byte-limit","operation":"pad_spaces","bytes":262145},
     {"id":"invalid-utf8","operation":"raw_hex","hex":"ff"}
+  ],
+  "structural_json": [
+    {"id":"depth-at-limit","operation":"nested_arrays","depth":16,"accept":true},
+    {"id":"depth-over-limit","operation":"nested_arrays","depth":17,"accept":false},
+    {"id":"tokens-at-limit","operation":"zero_array","count":16382,"accept":true},
+    {"id":"tokens-over-limit","operation":"zero_array","count":16383,"accept":false}
   ],
   "invalid_utf16_keys": [
     "\"\\ud800\"",

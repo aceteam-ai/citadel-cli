@@ -96,8 +96,14 @@ func TestDefinitionRefusesAmbiguousAndUnmaterializedData(t *testing.T) {
 				mutated = append(append([]byte(nil), original...), []byte(vector.Text)...)
 			case "nested_arrays":
 				mutated = []byte(strings.Repeat("[", vector.Depth) + strings.Repeat("]", vector.Depth))
-			case "spaces":
-				mutated = bytes.Repeat([]byte{' '}, vector.Bytes)
+			case "pad_spaces":
+				if vector.Bytes <= len(original) {
+					t.Fatal("padded vector must extend the original valid object")
+				}
+				mutated = append(append([]byte(nil), original...), bytes.Repeat([]byte{' '}, vector.Bytes-len(original))...)
+				if !json.Valid(mutated) {
+					t.Fatal("byte-limit vector must remain valid JSON")
+				}
 			case "raw_hex":
 				var err error
 				mutated, err = hex.DecodeString(vector.Hex)
@@ -112,6 +118,55 @@ func TestDefinitionRefusesAmbiguousAndUnmaterializedData(t *testing.T) {
 			}
 			if _, err := Digest(org, mutated); err == nil {
 				t.Fatal("shared negative definition accepted")
+			}
+		})
+	}
+}
+
+func TestDefinitionByteLimitAcceptsBoundaryAndRefusesOneMore(t *testing.T) {
+	org, original := sharedDefinition(t)
+	padded := append(append([]byte(nil), original...), bytes.Repeat([]byte{' '}, MaxBytes-len(original))...)
+	if got, err := Digest(org, padded); err != nil || got != sharedExpectedDigest(t, "base") {
+		t.Fatal("valid definition at exact byte limit must preserve its digest", err)
+	}
+	if _, err := Digest(org, append(padded, ' ')); err == nil {
+		t.Fatal("valid JSON beyond byte limit was accepted")
+	}
+}
+
+func TestSharedDefinitionStructuralBoundaries(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "testdata", "contracts", "definition-v1-vectors.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors struct {
+		Cases []struct {
+			ID        string `json:"id"`
+			Operation string `json:"operation"`
+			Depth     int    `json:"depth"`
+			Count     int    `json:"count"`
+			Accept    bool   `json:"accept"`
+		} `json:"structural_json"`
+	}
+	if err := json.Unmarshal(data, &vectors); err != nil || len(vectors.Cases) != 4 {
+		t.Fatal("missing structural boundary vectors", err)
+	}
+	for _, vector := range vectors.Cases {
+		t.Run(vector.ID, func(t *testing.T) {
+			var raw []byte
+			switch vector.Operation {
+			case "nested_arrays":
+				raw = []byte(strings.Repeat("[", vector.Depth) + strings.Repeat("]", vector.Depth))
+			case "zero_array":
+				raw = []byte("[" + strings.Repeat("0,", vector.Count-1) + "0]")
+			default:
+				t.Fatal("unknown structural operation", vector.Operation)
+			}
+			if !json.Valid(raw) {
+				t.Fatal("boundary vector must be syntactically valid JSON")
+			}
+			if got := boundedJSON(raw); got != vector.Accept {
+				t.Fatalf("structural admission=%v, want %v", got, vector.Accept)
 			}
 		})
 	}

@@ -98,11 +98,21 @@ Every case must be refused; `id` is unique. `replace_first` replaces exactly
 one occurrence of `old` with `new` before parsing. `raw_text` supplies a whole
 replacement definition; `append_text` appends to the original object bytes.
 `nested_arrays` constructs `depth` opening brackets followed by the same
-number of closing brackets. `spaces` supplies `bytes` ASCII spaces. `raw_hex`
+number of closing brackets. `pad_spaces` appends ASCII spaces to the original
+valid object to reach the specified total `bytes` length. `raw_hex`
 decodes `hex` to bytes so malformed UTF-8 can be tested without corrupting
 the vector document itself. Unknown operations are a harness failure, not a
 skipped test. In particular, `duplicate-key` and `escaped-duplicate-key` must
 not be normalized away before calling the validating canonicalizer.
+
+The four `structural_json` cases isolate the pre-decoding structure guard,
+not full definition-schema validation: depth 16 is accepted and 17 refused;
+an array of 16,382 zeroes yields 16,384 tokens and is accepted, while 16,383
+zeroes is refused. `nested_arrays` uses the operation above; `zero_array`
+constructs `count` comma-separated zeroes inside brackets. A separate full
+definition control is padded to exactly 256 KiB and must retain the base
+digest, while one extra space must be refused. These positive controls keep
+invalid schema or malformed JSON from accidentally masking a missing cap.
 
 The original `invalid_utf16_keys` list remains unchanged for existing
 consumers. The positive base fixture, base/edge expected digests, domain
