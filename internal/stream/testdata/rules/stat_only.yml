@@ -1,0 +1,20 @@
+{
+  "title": "Synthetic statistical not found burst",
+  "name": "stat_only",
+  "correlation": {
+    "type": "event_count",
+    "rules": [
+      "_404"
+    ],
+    "group-by": [
+      "source.ip"
+    ],
+    "timespan": "10m",
+    "condition": {
+      "gte": 8
+    }
+  },
+  "x-aceteam": {
+    "escalate": false
+  }
+}

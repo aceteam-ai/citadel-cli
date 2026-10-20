@@ -107,6 +107,13 @@ control center. All other subcommands are for scripting and advanced use.`,
 	Version: Version,
 	Run:     runBareCitadel,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Offline pack evaluation must not install CA trust, repair/update a
+		// binary, touch node state, or contact the fabric before reading files.
+		// Keep this exact leaf exception narrow: stream serve still inherits
+		// the ordinary agent initialization. Covered by stream command tests.
+		if cmd.CommandPath() == "citadel stream eval" {
+			return
+		}
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr FIRST,
 		// before any Log()/Debug() call in this function -- including
