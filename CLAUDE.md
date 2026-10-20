@@ -606,16 +606,39 @@ VNC_ACTIONS) honor the node passcode like SHELL_COMMAND, through
 desktop permission check. Unlike the shell gate, a node with no passcode set
 runs desktop jobs unchanged, so a false "no passcode" would open the gate. The
 gate therefore takes one `jobs.PasscodeState` read per job from
-`cmd.nodePasscodeState`, which uses `config.LoadPermissionsStrict` and
+`cmd.nodePasscodeState` (the SHELL_COMMAND and workflow Shell gates use the same
+state through `ShellGate.State`, so an unreadable state is `passcode_unavailable`
+there too, not `passcode_not_set`), which uses `config.LoadPermissionsStrict` and
 `nodevault.Vault.Configured`: an unreadable or unparseable permissions file, or
 a vault that cannot be stat'ed, refuses with `passcode_unavailable` instead of
 reading as unset. `config.SavePermissions` replaces the file atomically for the
-same reason. The payload `passcode` key never reaches a desktop handler, and
+same reason, keeping the existing file's owner (`keepOwner`) so a save by root
+does not lock the worker out; it refuses when the owning user cannot be kept
+and tolerates a group it cannot set. The payload `passcode` key never reaches a desktop handler, and
 `jobprivacy.Payload`/`Text` plus the `Job` JSON and fmt renderings in
 `internal/worker`, `internal/redis` and `internal/redisapi` drop it for every
 job type, so it is never written to a dead-letter entry or a log.
 `internal/worker/desktop_gate_test.go`, `cmd/passcode_state_test.go` and
 `internal/redis/passcode_privacy_test.go` pin this.
+
+`jobs.PasscodeThrottle` limits wrong passcodes across those surfaces: one
+process-wide instance (`cmd.nodePasscodeThrottle`) is shared by SHELL_COMMAND,
+the WORKFLOW_RUN Shell gate and the desktop gate, so failures on one count for
+all. After `DefaultPasscodeMaxFailures` within the window, every passcode-gated
+job is refused with `passcode_throttled` for the cooldown without checking the
+passcode. Only a non-empty wrong passcode counts (an absent one is a caller
+without a credential, not a guess); a correct passcode does not clear earlier
+failures, which expire only with time; and a check reserves a slot under the
+throttle's lock but runs outside it (so a KDF or disk read never holds the
+lock), with recent failures plus checks in flight never exceeding the limit. It is in memory, so a worker
+restart resets it. A vault or permissions error that is not a wrong PIN or a
+lockout is `passcode_unavailable` and is not counted. A master-PIN vault
+lockout is a separate reason, `passcode_locked`: `cmd.vaultPasscodeVerdict`
+maps `nodevault.IsLockedOut` to `jobs.PasscodeLockedOut`, so a correct
+passcode presented during a vault lockout is never reported as
+`passcode_invalid`, and a lockout refusal does not count toward the throttle.
+Only node passcodes presented in job payloads are throttled; the gateway's HTTP
+passcode checks are not.
 
 `Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
 a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before

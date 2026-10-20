@@ -302,6 +302,14 @@ type LegacyHandlerOpts struct {
 	// state cannot be read. Required whenever desktop handlers are registered:
 	// nil refuses every desktop job.
 	DesktopPasscodeState func() (jobs.PasscodeState, error)
+	// ShellPasscodeState, when set, replaces ShellHasPasscode and
+	// ShellVerifyPasscode for SHELL_COMMAND with one strict read of the node's
+	// passcode state (jobs.ShellGate.State).
+	ShellPasscodeState func() (jobs.PasscodeState, error)
+	// PasscodeThrottle is the node's shared wrong-passcode throttle, applied to
+	// SHELL_COMMAND and the desktop handlers (and, through the workflow
+	// executor's ShellGate, to the WORKFLOW_RUN Shell gate). Nil never throttles.
+	PasscodeThrottle *jobs.PasscodeThrottle
 	// FilesDisabled, when true, SKIPS registration of the file browse/host job
 	// handlers (FILE_READ/READ_BYTES/WRITE/EDIT/LIST/SEARCH/INDEX/
 	// SEMANTIC_SEARCH). FILE_WRITE_BYTES stays registered in a refusing state
@@ -354,6 +362,8 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	shellHandler.Enabled = opts.ShellEnabled
 	shellHandler.HasPasscode = opts.ShellHasPasscode
 	shellHandler.VerifyPasscode = opts.ShellVerifyPasscode
+	shellHandler.State = opts.ShellPasscodeState
+	shellHandler.Throttle = opts.PasscodeThrottle
 	configHandler := jobs.NewConfigHandler(opts.ConfigDir)
 	configHandler.PermissionsDir = opts.PermissionsDir
 	goos := opts.GOOS
@@ -465,7 +475,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	// `passcode` field. A node without a passcode is unchanged.
 	if opts.DesktopEnabled != nil || !opts.DesktopDisabled {
 		gate := opts.DesktopEnabled
-		passcode := jobs.DesktopGate{Load: opts.DesktopPasscodeState}
+		passcode := jobs.DesktopGate{Load: opts.DesktopPasscodeState, Throttle: opts.PasscodeThrottle}
 		handlers = append(handlers,
 			newDesktopLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
 			newDesktopLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),

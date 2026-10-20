@@ -2498,7 +2498,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			WorkspaceDir: wsDir,
 			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
 			// graph with a Shell node needs the `shell` permission + node passcode.
-			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier},
+			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier, State: nodePasscodeState, Throttle: nodePasscodeThrottle},
 		},
 	})
 
@@ -2535,6 +2535,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		DesktopDisabled:           !ccPerms.Desktop,
 		DesktopEnabled:            nodeDesktopEnabled,
 		DesktopPasscodeState:      nodePasscodeState,
+		ShellPasscodeState:        nodePasscodeState,
+		PasscodeThrottle:          nodePasscodeThrottle,
 		FilesDisabled:             !ccPerms.Files,
 		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              ccWfExec,

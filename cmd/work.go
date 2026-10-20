@@ -1662,7 +1662,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			WorkspaceDir: wsDir,
 			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
 			// graph with a Shell node needs the `shell` permission + node passcode.
-			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier},
+			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier, State: nodePasscodeState, Throttle: nodePasscodeThrottle},
 		},
 	})
 
@@ -2801,6 +2801,8 @@ func runWork(cmd *cobra.Command, args []string) {
 		DesktopDisabled:           !workPerms.Desktop,
 		DesktopEnabled:            nodeDesktopEnabled,
 		DesktopPasscodeState:      nodePasscodeState,
+		ShellPasscodeState:        nodePasscodeState,
+		PasscodeThrottle:          nodePasscodeThrottle,
 		FilesDisabled:             !workPerms.Files,
 		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              wfExec,
