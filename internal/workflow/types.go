@@ -128,6 +128,7 @@ type ExecutorConfig struct {
 	DefaultTimeout    time.Duration
 	MaxConcurrentRuns int
 	Shell             ShellConfig
+	HTTP              HTTPPolicy
 }
 
 func (g *WorkflowGraph) Validate() error {

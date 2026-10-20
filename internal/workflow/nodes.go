@@ -156,7 +156,9 @@ func (e *ShellNodeExecutor) Execute(ctx context.Context, node *Node, input map[s
 	return map[string]any{"stdout": strings.TrimRight(string(output), "\n"), "exit_code": exitCode}, nil
 }
 
-type HTTPNodeExecutor struct{}
+type HTTPNodeExecutor struct {
+	policy HTTPPolicy
+}
 
 func (e *HTTPNodeExecutor) Execute(ctx context.Context, node *Node, input map[string]any) (map[string]any, error) {
 	urlStr := stringParam(node.Params, "url", "")
@@ -165,6 +167,13 @@ func (e *HTTPNodeExecutor) Execute(ctx context.Context, node *Node, input map[st
 	}
 	if urlStr == "" {
 		return nil, fmt.Errorf("HTTP node %q: missing 'url' param or input", node.ID)
+	}
+	timeout := workflowHTTPTimeout(intParam(node.Params, "timeout", 30))
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	validatedURL, pinnedIP, err := e.policy.resolveURL(requestCtx, urlStr)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP node %q: %w", node.ID, err)
 	}
 	method := strings.ToUpper(stringParam(node.Params, "method", "GET"))
 	var bodyReader io.Reader
@@ -178,7 +187,7 @@ func (e *HTTPNodeExecutor) Execute(ctx context.Context, node *Node, input map[st
 			bodyReader = strings.NewReader(bodyParam)
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, method, urlStr, bodyReader)
+	req, err := http.NewRequestWithContext(requestCtx, method, validatedURL.String(), bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP node %q: create request: %w", node.ID, err)
 	}
@@ -190,8 +199,8 @@ func (e *HTTPNodeExecutor) Execute(ctx context.Context, node *Node, input map[st
 	if req.Header.Get("Content-Type") == "" && bodyReader != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	timeout := time.Duration(intParam(node.Params, "timeout", 30)) * time.Second
-	client := &http.Client{Timeout: timeout}
+	client := e.policy.clientFor(validatedURL, pinnedIP, timeout)
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP node %q: request failed: %w", node.ID, err)
@@ -202,6 +211,9 @@ func (e *HTTPNodeExecutor) Execute(ctx context.Context, node *Node, input map[st
 		return nil, fmt.Errorf("HTTP node %q: read response: %w", node.ID, err)
 	}
 	result := map[string]any{"status_code": resp.StatusCode, "body": string(respBody)}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.Header.Get("Location") != "" {
+		result["location"] = resp.Header.Get("Location")
+	}
 	var jsonResp any
 	if err := json.Unmarshal(respBody, &jsonResp); err == nil {
 		result["json"] = jsonResp

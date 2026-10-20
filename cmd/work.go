@@ -1658,6 +1658,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Workflow executor for WORKFLOW_RUN jobs (#105). Created here so the status
 	// server's AddRouteRegistrar closure and the job handler share a single instance.
 	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
+		HTTP: workflowHTTPPolicy(network.GetNodeConfigDir()),
 		Shell: workflow.ShellConfig{
 			WorkspaceDir: wsDir,
 			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
