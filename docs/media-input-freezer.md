@@ -38,7 +38,8 @@ be decoded or that a model supports editing them.
 
 Snapshots expose only copied, path/token-free metadata and independent readers,
 not backing slices. Snapshot and reader diagnostic formatting hides image
-bytes. A read-only reader deliberately still permits its authorized caller to
+bytes, including under unexported caller wrappers: byte buffers live behind
+reader factories, not reflectable slice fields. A read-only reader still permits its authorized caller to
 read the bytes; it is not a sandbox against that caller. No snapshot is written
 to the withheld-output store or published by this package.
 

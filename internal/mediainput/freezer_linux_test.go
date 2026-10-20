@@ -93,6 +93,23 @@ func TestWorkspaceSnapshotIsPrivateAndStable(t *testing.T) {
 			t.Fatalf("unsafe snapshot diagnostic: %q", got)
 		}
 	}
+	reader, err := snapshot.Reader("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []any{
+		struct{ snapshot Snapshot }{snapshot},
+		struct{ reader io.Reader }{reader},
+	} {
+		for _, format := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%d"} {
+			text := fmt.Sprintf(format, value)
+			for _, forbidden := range []string{fmt.Sprint(data), fmt.Sprintf("%#v", data), string(data)} {
+				if strings.Contains(text, forbidden) {
+					t.Fatal("private wrapper leaked encoded image bytes")
+				}
+			}
+		}
+	}
 	raw, err := json.Marshal(snapshot)
 	if err != nil || string(raw) != "{}" {
 		t.Fatalf("snapshot serialization leaked: %s %v", raw, err)

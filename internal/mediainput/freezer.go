@@ -23,7 +23,7 @@ type Metadata struct {
 
 type frozenInput struct {
 	metadata Metadata
-	data     []byte
+	open     func() io.Reader
 }
 
 // Snapshot holds only verified private byte buffers. It exposes independent
@@ -34,10 +34,12 @@ type Snapshot struct {
 	inputs []frozenInput
 }
 
-type snapshotReader struct{ reader *bytes.Reader }
+// Closure fields keep image bytes out of reflective diagnostic traversal even
+// when a caller embeds a Snapshot or Reader in an unexported wrapper field.
+type snapshotReader struct{ read func([]byte) (int, error) }
 
 func (r *snapshotReader) Read(p []byte) (int, error) {
-	return r.reader.Read(p)
+	return r.read(p)
 }
 
 func (r *snapshotReader) Format(state fmt.State, _ rune) {
@@ -55,7 +57,7 @@ func (s Snapshot) Inputs() []Metadata {
 func (s Snapshot) Reader(role string) (io.Reader, error) {
 	for _, input := range s.inputs {
 		if input.metadata.Role == role {
-			return &snapshotReader{reader: bytes.NewReader(input.data)}, nil
+			return input.open(), nil
 		}
 	}
 	return nil, refuse("missing_input_role")
@@ -184,5 +186,8 @@ func (f WorkspaceFreezer) read(ctx context.Context, root *os.Root, input Descrip
 	return frozenInput{metadata: Metadata{
 		Role: input.Role, Origin: input.Origin, SHA256: input.SHA256,
 		Size: input.Size, Format: input.Format, Width: width, Height: height,
-	}, data: data}, nil
+	}, open: func() io.Reader {
+		reader := bytes.NewReader(data)
+		return &snapshotReader{read: reader.Read}
+	}}, nil
 }
