@@ -132,9 +132,17 @@ func TestCapabilityDiagnosticsAlwaysRedact(t *testing.T) {
 		t.Fatal("explicit reveal changed the token")
 	}
 	for name, value := range map[string]any{
-		"contract": contract, "inputs": inputs, "descriptor": inputs[0], "capability": capability,
+		"contract":           contract,
+		"inputs":             inputs,
+		"descriptor":         inputs[0],
+		"capability":         capability,
+		"private contract":   struct{ contract Contract }{contract},
+		"private inputs":     struct{ inputs []Descriptor }{inputs},
+		"private descriptor": struct{ descriptor Descriptor }{inputs[0]},
+		"private capability": struct{ capability Capability }{capability},
+		"private interface":  struct{ value any }{inputs[0]},
 	} {
-		for _, format := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x"} {
+		for _, format := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d", "%f", "%e", "%p", "%T"} {
 			if strings.Contains(fmt.Sprintf(format, value), secret) {
 				t.Fatalf("%s leaked via %s", name, format)
 			}
@@ -149,6 +157,14 @@ func TestCapabilityDiagnosticsAlwaysRedact(t *testing.T) {
 	logger.Info("owned synthetic diagnostic", "capability", capability, "inputs", inputs, "contract", contract)
 	if strings.Contains(output.String(), secret) || strings.Contains(capability.String(), secret) || strings.Contains(capability.GoString(), secret) || strings.Contains(capability.LogValue().String(), secret) {
 		t.Fatal("credential leaked through logging or direct formatting")
+	}
+	output.Reset()
+	slog.New(slog.NewTextHandler(&output, nil)).Info("owned synthetic diagnostic", "capability", capability, "inputs", inputs, "private", struct{ descriptor Descriptor }{inputs[0]})
+	if strings.Contains(output.String(), secret) {
+		t.Fatal("credential leaked through text logging")
+	}
+	if (Capability{}).Reveal() != "" {
+		t.Fatal("zero capability must reveal nothing")
 	}
 }
 
