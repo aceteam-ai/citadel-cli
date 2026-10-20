@@ -73,30 +73,21 @@ func TestVaultPasscodeVerdictReportsLockoutSeparately(t *testing.T) {
 	}
 }
 
-func TestPasscodeVerdictFromUnreadableStateIsUnavailable(t *testing.T) {
-	badPerms := t.TempDir()
-	if err := os.WriteFile(filepath.Join(badPerms, "permissions.yaml"), []byte("passcode_hash: [broken"), 0600); err != nil {
+func TestVaultPasscodeVerdictTreatsOtherVaultErrorsAsUnavailable(t *testing.T) {
+	base := t.TempDir()
+	vault := nodevault.Open(base)
+	if err := vault.SetPIN("correct-horse-battery-1", nodevault.DefaultPolicy(), true); err != nil {
 		t.Fatal(err)
 	}
-	if got := passcodeVerdictFrom(badPerms, nodevault.Open(t.TempDir()), "anything"); got != jobs.PasscodeUnavailable {
-		t.Fatalf("unparseable permissions: %v, want PasscodeUnavailable", got)
-	}
-	notADir := filepath.Join(t.TempDir(), "node-dir")
-	if err := os.WriteFile(notADir, []byte("x"), 0600); err != nil {
+	// A vault header that no longer parses is an error that says nothing
+	// about the presented PIN.
+	if err := os.WriteFile(filepath.Join(base, "vault", "vault.yaml"), []byte("not: [valid"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if got := passcodeVerdictFrom(t.TempDir(), nodevault.Open(notADir), "anything"); got != jobs.PasscodeUnavailable {
-		t.Fatalf("unreadable vault: %v, want PasscodeUnavailable", got)
+	if got := vaultPasscodeVerdict(vault, "correct-horse-battery-1"); got != jobs.PasscodeUnavailable {
+		t.Fatalf("corrupt vault header: %v, want PasscodeUnavailable", got)
 	}
-	p := config.DefaultPermissions()
-	if err := p.SetPasscode("4821-pass"); err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	if err := config.SavePermissions(dir, p); err != nil {
-		t.Fatal(err)
-	}
-	if got := passcodeVerdictFrom(dir, nodevault.Open(t.TempDir()), "wrong"); got != jobs.PasscodeMismatch {
-		t.Fatalf("wrong legacy passcode: %v, want PasscodeMismatch", got)
+	if got := vaultPasscodeVerdict(vault, "wrong-pin-attempt"); got != jobs.PasscodeUnavailable {
+		t.Fatalf("corrupt vault header with a wrong PIN: %v, want PasscodeUnavailable", got)
 	}
 }

@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -37,7 +38,6 @@ func TestPasscodeThrottleCooldownAfterMaxFailures(t *testing.T) {
 	}
 	verifyCalled := false
 	shell.VerifyPasscode = func(p string) bool { verifyCalled = true; return pinVerify(p) }
-	shell.Check = nil
 	if got := ShellGateReason(shell, throttlePin); got != ReasonPasscodeThrottled {
 		t.Fatalf("correct passcode during cooldown: reason %q, want passcode_throttled", got)
 	}
@@ -175,7 +175,7 @@ func TestPasscodeThrottleNilAndNoPasscodeNode(t *testing.T) {
 func TestPasscodeLockoutIsDistinctAndNotCounted(t *testing.T) {
 	th, _ := newTestThrottle()
 	locked := func(string) PasscodeVerdict { return PasscodeLockedOut }
-	shell := ShellGate{Enabled: func() bool { return true }, HasPasscode: func() bool { return true }, Check: locked, Throttle: th}
+	shell := ShellGate{Enabled: func() bool { return true }, State: func() (PasscodeState, error) { return PasscodeState{Set: true, Check: locked}, nil }, Throttle: th}
 	desktop := DesktopGate{Load: func() (PasscodeState, error) { return PasscodeState{Set: true, Check: locked}, nil }, Throttle: th}
 	for i := 0; i < 2*DefaultPasscodeMaxFailures; i++ {
 		if got := ShellGateReason(shell, throttlePin); got != ReasonPasscodeLocked {
@@ -192,5 +192,18 @@ func TestPasscodeLockoutIsDistinctAndNotCounted(t *testing.T) {
 		if r.Reason != ReasonPasscodeLocked || !strings.Contains(r.Message, "locked") {
 			t.Fatalf("lockout refusal = %+v", r)
 		}
+	}
+}
+
+func TestShellGateStateReadErrorIsUnavailableNotUnset(t *testing.T) {
+	g := ShellGate{Enabled: func() bool { return true }, State: func() (PasscodeState, error) {
+		return PasscodeState{}, errors.New("read permissions: permission denied")
+	}}
+	if got := ShellGateReason(g, throttlePin); got != ReasonPasscodeUnavailable {
+		t.Fatalf("unreadable shell passcode state: %q, want passcode_unavailable", got)
+	}
+	g.State = func() (PasscodeState, error) { return PasscodeState{Set: false}, nil }
+	if got := ShellGateReason(g, throttlePin); got != ReasonPasscodeNotSet {
+		t.Fatalf("no passcode set: %q, want passcode_not_set", got)
 	}
 }

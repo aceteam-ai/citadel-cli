@@ -42,8 +42,8 @@ func nodeHasPasscode() bool {
 	return loadNodePermissions().HasPasscode()
 }
 
-// nodePasscodeState reads the node's passcode configuration once, for a gate
-// that allows a job when no passcode is set (the desktop gate). Unlike
+// nodePasscodeState reads the node's passcode configuration once per job, for
+// the desktop gate and the SHELL_COMMAND / workflow Shell gates. Unlike
 // nodeHasPasscode it never turns a read failure into "no passcode": a
 // permissions file it cannot read or parse, or a master-PIN vault it cannot
 // stat, is returned as an error so the gate refuses.
@@ -90,31 +90,6 @@ func vaultPasscodeVerdict(vault *nodevault.Vault, pin string) jobs.PasscodeVerdi
 		// presented passcode, so it must not read as, or count as, a wrong one.
 		return jobs.PasscodeUnavailable
 	}
-}
-
-// nodePasscodeCheck is the lockout-aware passcode check for SHELL_COMMAND and
-// the workflow Shell gate. Like nodePasscodeVerifier it reloads state per call;
-// unlike it, a master-PIN lockout is reported as PasscodeLockedOut, so a
-// correct passcode is never refused as passcode_invalid during a lockout.
-func nodePasscodeCheck(pin string) jobs.PasscodeVerdict {
-	return passcodeVerdictFrom(nodePermissionsDir(), masterVault(), pin)
-}
-
-// passcodeVerdictFrom is nodePasscodeCheck's pure core. A permissions file or
-// vault it cannot read yields PasscodeUnavailable, never a mismatch.
-func passcodeVerdictFrom(permissionsDir string, vault *nodevault.Vault, pin string) jobs.PasscodeVerdict {
-	vaultSet, err := vault.Configured()
-	if err != nil {
-		return jobs.PasscodeUnavailable
-	}
-	if vaultSet {
-		return vaultPasscodeVerdict(vault, pin)
-	}
-	perms, err := config.LoadPermissionsStrict(permissionsDir)
-	if err != nil {
-		return jobs.PasscodeUnavailable
-	}
-	return jobs.BoolCheck(perms.VerifyLegacyPasscode)(pin)
 }
 
 // nodeShellEnabled is the live shell kill-switch. Reloading the small

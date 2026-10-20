@@ -290,7 +290,9 @@ func TestShellPasscodeCheckReportsLockout(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
 		ShellEnabled: func() bool { return true }, ShellHasPasscode: func() bool { return true },
 		ShellVerifyPasscode: func(string) bool { return false },
-		ShellPasscodeCheck:  func(string) jobs.PasscodeVerdict { return jobs.PasscodeLockedOut },
+		ShellPasscodeState: func() (jobs.PasscodeState, error) {
+			return jobs.PasscodeState{Set: true, Check: func(string) jobs.PasscodeVerdict { return jobs.PasscodeLockedOut }}, nil
+		},
 	})
 	for _, h := range handlers {
 		if !h.CanHandle(JobTypeShellCommand) {

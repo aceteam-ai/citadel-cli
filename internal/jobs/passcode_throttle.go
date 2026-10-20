@@ -51,7 +51,7 @@ func BoolCheck(verify func(pin string) bool) func(pin string) PasscodeVerdict {
 // Default throttle bounds: DefaultPasscodeMaxFailures wrong passcodes within
 // DefaultPasscodeFailureWindow start a DefaultPasscodeCooldown.
 const (
-	DefaultPasscodeMaxFailures   = 5
+	DefaultPasscodeMaxFailures   = 10
 	DefaultPasscodeFailureWindow = time.Minute
 	DefaultPasscodeCooldown      = 5 * time.Minute
 )
@@ -67,8 +67,11 @@ const (
 // absent passcode, a vault lockout and an unreadable passcode state do not.
 // Failures expire only with time; a correct passcode does not clear them, so
 // wrong guesses interleaved with correct ones still reach the limit. Checks
-// through one throttle are serialized, so concurrent jobs cannot overshoot
-// the limit. State is in memory only, so a worker restart resets it.
+// through one throttle cannot overshoot
+// the limit: a check reserves a slot under the lock, runs unlocked, and is
+// recorded under the lock, and the window's failures plus checks in flight
+// never exceed MaxFailures. State is in memory only, so a worker restart
+// resets it.
 //
 // A nil *PasscodeThrottle never throttles.
 type PasscodeThrottle struct {
@@ -78,6 +81,7 @@ type PasscodeThrottle struct {
 
 	mu          sync.Mutex
 	failures    []time.Time
+	pending     int
 	lockedUntil time.Time
 	now         func() time.Time
 }
@@ -112,10 +116,8 @@ func (t *PasscodeThrottle) throttledLocked() bool {
 	return t.clock().Before(t.lockedUntil)
 }
 
-// recordFailureLocked counts one wrong passcode and starts a cooldown once the
-// window holds MaxFailures of them.
-func (t *PasscodeThrottle) recordFailureLocked() {
-	now := t.clock()
+// pruneLocked drops failures older than the window.
+func (t *PasscodeThrottle) pruneLocked(now time.Time) {
 	cutoff := now.Add(-t.Window)
 	kept := t.failures[:0]
 	for _, f := range t.failures {
@@ -123,7 +125,38 @@ func (t *PasscodeThrottle) recordFailureLocked() {
 			kept = append(kept, f)
 		}
 	}
-	t.failures = append(kept, now)
+	t.failures = kept
+}
+
+// reserve claims one check slot. It reports false during a cooldown, or when
+// the window's failures plus checks already in flight have used the budget.
+func (t *PasscodeThrottle) reserve() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.clock()
+	if now.Before(t.lockedUntil) {
+		return false
+	}
+	t.pruneLocked(now)
+	if t.MaxFailures > 0 && len(t.failures)+t.pending >= t.MaxFailures {
+		return false
+	}
+	t.pending++
+	return true
+}
+
+// release ends a reserved check, counting it when it was a wrong passcode and
+// starting a cooldown once the window holds MaxFailures of them.
+func (t *PasscodeThrottle) release(failed bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pending--
+	if !failed {
+		return
+	}
+	now := t.clock()
+	t.pruneLocked(now)
+	t.failures = append(t.failures, now)
 	if t.MaxFailures > 0 && len(t.failures) >= t.MaxFailures {
 		t.lockedUntil = now.Add(t.Cooldown)
 		t.failures = t.failures[:0]
@@ -132,26 +165,37 @@ func (t *PasscodeThrottle) recordFailureLocked() {
 
 // checkPasscode applies the throttle around one passcode check and returns the
 // refusal reason, or "" on a match:
-//   - ReasonPasscodeThrottled during a cooldown, without calling check;
+//   - ReasonPasscodeThrottled during a cooldown, or while the failure budget
+//     is used up by recent failures and checks in flight, without calling
+//     check;
 //   - ReasonPasscodeLocked or ReasonPasscodeUnavailable when the check could
 //     not run, not counted;
 //   - ReasonPasscodeInvalid for a wrong passcode, counted only when a
 //     non-empty passcode was presented.
 //
-// A nil check refuses. With a non-nil throttle the whole decision, including
-// check, runs under the throttle's lock.
+// A nil check refuses. An absent passcode is checked without the throttle (it
+// is never counted, so it needs no slot). The check itself, which may be a KDF
+// or read the disk, runs outside the throttle's lock.
 func checkPasscode(t *PasscodeThrottle, check func(string) PasscodeVerdict, presented string) string {
-	if t != nil {
-		t.mu.Lock()
-		defer t.mu.Unlock()
-		if t.throttledLocked() {
-			return ReasonPasscodeThrottled
-		}
-	}
 	if check == nil {
 		return ReasonPasscodeInvalid
 	}
-	switch check(presented) {
+	if t != nil && presented != "" {
+		if !t.reserve() {
+			return ReasonPasscodeThrottled
+		}
+	} else if t.Throttled() {
+		return ReasonPasscodeThrottled
+	}
+	verdict := check(presented)
+	if t != nil && presented != "" {
+		t.release(verdict == PasscodeMismatch)
+	}
+	return verdictReason(verdict)
+}
+
+func verdictReason(v PasscodeVerdict) string {
+	switch v {
 	case PasscodeMatch:
 		return ""
 	case PasscodeLockedOut:
@@ -159,10 +203,6 @@ func checkPasscode(t *PasscodeThrottle, check func(string) PasscodeVerdict, pres
 	case PasscodeUnavailable:
 		return ReasonPasscodeUnavailable
 	default:
-		// An absent passcode is a caller without a credential, not a guess.
-		if t != nil && presented != "" {
-			t.recordFailureLocked()
-		}
 		return ReasonPasscodeInvalid
 	}
 }

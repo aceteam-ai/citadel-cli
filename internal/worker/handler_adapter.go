@@ -302,9 +302,10 @@ type LegacyHandlerOpts struct {
 	// state cannot be read. Required whenever desktop handlers are registered:
 	// nil refuses every desktop job.
 	DesktopPasscodeState func() (jobs.PasscodeState, error)
-	// ShellPasscodeCheck, when set, replaces ShellVerifyPasscode for
-	// SHELL_COMMAND and can report a master-PIN lockout (passcode_locked).
-	ShellPasscodeCheck func(pin string) jobs.PasscodeVerdict
+	// ShellPasscodeState, when set, replaces ShellHasPasscode and
+	// ShellVerifyPasscode for SHELL_COMMAND with one strict read of the node's
+	// passcode state (jobs.ShellGate.State).
+	ShellPasscodeState func() (jobs.PasscodeState, error)
 	// PasscodeThrottle is the node's shared wrong-passcode throttle, applied to
 	// SHELL_COMMAND and the desktop handlers (and, through the workflow
 	// executor's ShellGate, to the WORKFLOW_RUN Shell gate). Nil never throttles.
@@ -361,7 +362,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	shellHandler.Enabled = opts.ShellEnabled
 	shellHandler.HasPasscode = opts.ShellHasPasscode
 	shellHandler.VerifyPasscode = opts.ShellVerifyPasscode
-	shellHandler.Check = opts.ShellPasscodeCheck
+	shellHandler.State = opts.ShellPasscodeState
 	shellHandler.Throttle = opts.PasscodeThrottle
 	configHandler := jobs.NewConfigHandler(opts.ConfigDir)
 	configHandler.PermissionsDir = opts.PermissionsDir

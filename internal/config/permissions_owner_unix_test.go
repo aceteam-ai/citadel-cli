@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -47,5 +48,29 @@ func TestSavePermissionsRefusesWhenOwnerCannotBeKept(t *testing.T) {
 	}
 	if err := keepOwner(tmp, "/"); err == nil {
 		t.Fatal("keepOwner must refuse when the existing owner cannot be kept")
+	}
+}
+
+func TestOwnerDecision(t *testing.T) {
+	denied := func() error { return errors.New("operation not permitted") }
+	ok := func() error { return nil }
+	for _, tc := range []struct {
+		name                     string
+		tmpUID, tmpGID, uid, gid uint32
+		chown                    func() error
+		wantErr                  bool
+	}{
+		{"same owner and group", 1000, 1000, 1000, 1000, denied, false},
+		{"owner differs, chown works", 0, 0, 1000, 1000, ok, false},
+		{"owner differs, chown denied", 1000, 1000, 0, 0, denied, true},
+		{"only group differs, chown denied", 1000, 1000, 1000, 27, denied, false},
+		{"only group differs, chown works", 1000, 1000, 1000, 27, ok, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ownerDecision(tc.tmpUID, tc.tmpGID, tc.uid, tc.gid, tc.chown)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ownerDecision err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
 	}
 }
