@@ -46,6 +46,17 @@ func main() {
 }
 
 func run() error {
+	// Repair legacy 0644 configs BEFORE validating assignment inputs or checking
+	// the NAS. A failed regeneration must not leave the old secret world-readable.
+	dir, err := openPrivateConfigDir("/config")
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return runWithConfigDir(dir)
+}
+
+func runWithConfigDir(dir *os.File) error {
 	detector := nvr.Detector(strings.ToLower(strings.TrimSpace(getenvDefault("NVR_DETECTOR", "openvino"))))
 
 	retention := 12
@@ -129,10 +140,7 @@ func run() error {
 		return err
 	}
 
-	if err := os.MkdirAll("/config", 0o755); err != nil {
-		return fmt.Errorf("create /config: %w", err)
-	}
-	if err := os.WriteFile(configPath, []byte(yamlOut), 0o644); err != nil {
+	if err := writePrivateConfig(dir, []byte(yamlOut)); err != nil {
 		return fmt.Errorf("write %s: %w", configPath, err)
 	}
 	fmt.Printf("nvrconfig: wrote %s (detector=%s retention=%dd storage=%s semantic_search=%t track=%v cameras=%v)\n",

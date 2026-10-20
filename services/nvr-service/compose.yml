@@ -22,6 +22,27 @@
 # ~/.citadel-cli/nvr/media BEFORE assigning the module; nvr-config then statfs-
 # verifies /media is a real, root-writable network mount and REFUSES to start
 # otherwise, so recordings never silently land on the local disk.
+#
+# Security upgrade (#1357): a CLI binary update alone does NOT repair the live
+# host config or replace an already-running init image. An operator-approved
+# module update/start must install this compose AND recreate/run the updated
+# nvr-config init container. It first restricts /config to 0700 and both legacy
+# config.yml/config.yaml to 0600 (even if later validation fails), then atomically
+# replaces config.yml without MQTT credentials. Until that init step runs, an
+# old 0644 file remains exposed. The catalog copy in citadel-services must also
+# be updated before a catalog-installed module can receive this repair. No live
+# restart or rollout is implied by merging source.
+#
+# Identity: nvr-config's Dockerfile and Frigate v0.17.0's final Dockerfile/service
+# entrypoint both use container root; neither service overrides user here. That
+# shared uid can read 0600/0700. Non-root/userns overrides need matching ownership,
+# not broader modes. The :stable tag is floating, NOT a verified digest pin;
+# exact-image/uid acceptance remains an operator-owned rollout gate.
+# Environment substitution reference (MQTT user/password and RTSP supported):
+# https://docs.frigate.video/configuration/config/#environment-variable-substitution
+# https://github.com/blakeblackshear/frigate/blob/v0.17.0/frigate/config/mqtt.py
+# Current RTSP URLs use a fixed bridge host and stream paths, with no separate
+# credential inputs. Wyze secrets remain exclusively in wyze-bridge's env.
 services:
   wyze-bridge:
     image: docker.io/idisposablegithub365/wyze-bridge:latest
@@ -63,6 +84,9 @@ services:
 
   nvr-config:
     image: ghcr.io/aceteam-ai/nvr-config:latest
+    # Fetch security fixes for this floating init image on an approved module
+    # start/update, even when an older :latest is cached locally (#1357).
+    pull_policy: always
     container_name: citadel-nvr-config
     # An init step, not a long-running service: it writes config.yml + verifies the
     # nas mount, then exits. frigate waits for it to complete successfully.
@@ -179,6 +203,10 @@ services:
       - /etc/localtime:/etc/localtime:ro
     environment:
       - TZ=${TZ:-UTC}
+      # The generated YAML contains only placeholders, never these values.
+      # Keep broker and Frigate credentials sourced from the same assignment.
+      - FRIGATE_MQTT_USER=${NVR_MQTT_USER:-frigate}
+      - FRIGATE_MQTT_PASSWORD=${NVR_MQTT_PASSWORD:?nvr requires NVR_MQTT_PASSWORD (mosquitto allows anonymous access by default)}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5000/api/version || exit 1"]
       interval: 30s

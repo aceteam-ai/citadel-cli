@@ -70,6 +70,11 @@ const (
 	// DefaultMQTTTopicPrefix matches Frigate's own default topic namespace.
 	DefaultMQTTTopicPrefix = "frigate"
 
+	// Frigate resolves these from its container environment, not config.yml.
+	// Never serialize assignment credentials into the generated YAML (#1357).
+	FrigateMQTTUserPlaceholder     = "{FRIGATE_MQTT_USER}"
+	FrigateMQTTPasswordPlaceholder = "{FRIGATE_MQTT_PASSWORD}"
+
 	// DefaultSemanticSearchModel / DefaultSemanticSearchModelSize are Frigate's
 	// recommended CPU-friendly embedding model (jina CLIP v1, small). jinav2/large
 	// targets multilingual search and wants more RAM, so it is not the default.
@@ -155,7 +160,9 @@ type MQTTSpec struct {
 	Port int
 	// User and Password authenticate to the broker. Mosquitto allows anonymous
 	// connections by default, so the module always sets credentials rather than
-	// relying on network isolation alone.
+	// relying on network isolation alone. Non-empty values request the fixed
+	// FRIGATE_MQTT_USER/PASSWORD environment placeholders; the actual values are
+	// never serialized. The caller must pass the matching environment to Frigate.
 	User     string
 	Password string
 	// TopicPrefix namespaces this node's topics so a future multi-node consumer
@@ -273,10 +280,10 @@ func mqttBlock(m MQTTSpec) map[string]any {
 	}
 	// Only emit credentials when set: Frigate rejects empty user/password keys.
 	if m.User != "" {
-		block["user"] = m.User
+		block["user"] = FrigateMQTTUserPlaceholder
 	}
 	if m.Password != "" {
-		block["password"] = m.Password
+		block["password"] = FrigateMQTTPasswordPlaceholder
 	}
 	return block
 }
