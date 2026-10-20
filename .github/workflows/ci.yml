@@ -72,6 +72,9 @@ jobs:
       - name: go test
         run: go test ./...
 
+      - name: Media input contract replay (Python stdlib only)
+        run: python3 -I -B -m unittest discover -s internal/mediainput -p test_contract.py
+
       # -race gate for internal/jobs only (not repo-wide: -race is slow and
       # other packages haven't been swept for races yet). This package hit a
       # real intra-test race (#810) that a plain `go test` never caught, so it

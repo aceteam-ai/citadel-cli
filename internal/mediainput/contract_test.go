@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
 )
 
-const fixtureSHA256 = "2dc946dcea1cfbdf28f33f5cea1b7df1ad7ab2adecd0dcd875d5173aa31a26d5"
+const fixtureSHA256 = "e386064cb2c371cadc8bdc4eb6475adf78510a14fa9ae9aac450bcd830c185e0"
 
 type validVector struct {
 	Name  string          `json:"name"`
@@ -20,10 +22,11 @@ type validVector struct {
 }
 
 type invalidVector struct {
-	Name    string   `json:"name"`
-	Base    string   `json:"base"`
-	Task    string   `json:"task"`
-	Replace []string `json:"replace_first"`
+	Name    string          `json:"name"`
+	Base    string          `json:"base"`
+	Task    string          `json:"task"`
+	Replace []string        `json:"replace_first"`
+	Value   json.RawMessage `json:"value"`
 }
 
 func loadVectors(t *testing.T) ([]validVector, []invalidVector) {
@@ -67,6 +70,9 @@ func TestSharedInputContractVectors(t *testing.T) {
 				t.Fatal("unknown vector base")
 			}
 			raw := string(base.Value)
+			if len(vector.Value) != 0 {
+				raw = string(vector.Value)
+			}
 			if len(vector.Replace) != 0 {
 				if len(vector.Replace) != 2 || !strings.Contains(raw, vector.Replace[0]) || vector.Replace[0] == vector.Replace[1] {
 					t.Fatal("ineffective fixture mutation")
@@ -104,6 +110,45 @@ func TestContractRefusalNeverReflectsInputs(t *testing.T) {
 	var refusal *Refusal
 	if !errors.As(err, &refusal) || refusal.Reason() != "invalid_capability" || strings.Contains(err.Error(), "private token") {
 		t.Fatalf("unsafe refusal: %v", err)
+	}
+}
+
+func TestCapabilityDiagnosticsAlwaysRedact(t *testing.T) {
+	valid, _ := loadVectors(t)
+	var inbox validVector
+	for _, vector := range valid {
+		if vector.Name == "inbox" {
+			inbox = vector
+		}
+	}
+	contract, err := Parse(inbox.Task, inbox.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := contract.Inputs()
+	capability := inputs[0].Capability
+	secret := capability.Reveal()
+	if secret != "synthetic.media-input.source" {
+		t.Fatal("explicit reveal changed the token")
+	}
+	for name, value := range map[string]any{
+		"contract": contract, "inputs": inputs, "descriptor": inputs[0], "capability": capability,
+	} {
+		for _, format := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x"} {
+			if strings.Contains(fmt.Sprintf(format, value), secret) {
+				t.Fatalf("%s leaked via %s", name, format)
+			}
+		}
+		raw, err := json.Marshal(value)
+		if err != nil || bytes.Contains(raw, []byte(secret)) {
+			t.Fatalf("%s leaked or failed JSON serialization", name)
+		}
+	}
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	logger.Info("owned synthetic diagnostic", "capability", capability, "inputs", inputs, "contract", contract)
+	if strings.Contains(output.String(), secret) || strings.Contains(capability.String(), secret) || strings.Contains(capability.GoString(), secret) || strings.Contains(capability.LogValue().String(), secret) {
+		t.Fatal("credential leaked through logging or direct formatting")
 	}
 }
 

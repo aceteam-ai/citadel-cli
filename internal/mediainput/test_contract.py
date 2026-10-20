@@ -13,7 +13,7 @@ import unicodedata
 import unittest
 
 
-FIXTURE_SHA256 = "2dc946dcea1cfbdf28f33f5cea1b7df1ad7ab2adecd0dcd875d5173aa31a26d5"
+FIXTURE_SHA256 = "e386064cb2c371cadc8bdc4eb6475adf78510a14fa9ae9aac450bcd830c185e0"
 FIXTURE = Path(__file__).parent / "testdata" / "media_input_v1.json"
 
 
@@ -125,7 +125,7 @@ class ContractVectors(unittest.TestCase):
         for vector in self.fixture["invalid"]:
             with self.subTest(vector["name"]):
                 base = self.by_name[vector["base"]]
-                raw = json.dumps(base["value"], separators=(",", ":"), ensure_ascii=False)
+                raw = json.dumps(vector.get("value", base["value"]), separators=(",", ":"), ensure_ascii=False)
                 if "replace_first" in vector:
                     old, new = vector["replace_first"]
                     self.assertIn(old, raw, "ineffective fixture mutation")

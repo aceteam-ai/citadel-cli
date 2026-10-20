@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -35,7 +36,35 @@ type Descriptor struct {
 	Size       int64
 	Format     string
 	Path       string
-	Capability string
+	Capability Capability
+}
+
+// Capability prevents accidental credential disclosure in diagnostics or JSON.
+// Reveal is the explicit escape hatch for the pinned, authorized fetch client.
+type Capability struct{ raw string }
+
+func (c Capability) Reveal() string {
+	return c.raw
+}
+
+func (c Capability) String() string {
+	return "[REDACTED]"
+}
+
+func (c Capability) GoString() string {
+	return c.String()
+}
+
+func (c Capability) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, c.String())
+}
+
+func (c Capability) MarshalJSON() ([]byte, error) {
+	return []byte(`"[REDACTED]"`), nil
+}
+
+func (c Capability) LogValue() slog.Value {
+	return slog.StringValue(c.String())
 }
 
 // Contract owns its parsed descriptor list. Accessors return copies, so a caller
@@ -46,6 +75,12 @@ type Contract struct {
 
 func (c Contract) Inputs() []Descriptor {
 	return append([]Descriptor(nil), c.inputs...)
+}
+
+// Format also protects the unexported descriptor slice: fmt does not invoke
+// nested formatting methods when traversing unexported struct fields.
+func (c Contract) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, "<private media-input contract>")
 }
 
 // Refusal contains only a static reason, never input paths or capabilities.
@@ -144,8 +179,8 @@ func Parse(task string, raw []byte) (Contract, error) {
 				return Contract{}, refuse("invalid_input_path")
 			}
 		case "inbox":
-			input.Capability = m["capability"].(string)
-			if !validCapability(input.Capability) {
+			input.Capability = Capability{raw: m["capability"].(string)}
+			if !validCapability(input.Capability.Reveal()) {
 				return Contract{}, refuse("invalid_capability")
 			}
 		default:

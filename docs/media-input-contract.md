@@ -18,7 +18,9 @@ one location field:
   characters. Actual descriptor-based opening, Files permission, containment,
   symlink/race checks and snapshot freezing remain prerequisites in C1b.
 - `inbox` requires `capability`, never `path`. The opaque bearer is bounded to
-  4096 ASCII token characters; only the coordinator can authenticate its purpose,
+  4096 ASCII token characters; diagnostics, logs and JSON redact it by default.
+  Only the authorized fetch client should explicitly `Reveal()` it. Only the
+  coordinator can authenticate its purpose,
   signature, binding, expiry and single-use redemption. The node receives no URL
   from this descriptor. Capability privacy must land before anything mints or
   dispatches these jobs.
@@ -31,7 +33,7 @@ budget. Exact keysets and decoded duplicate-key checks prevent case aliases and
 escaped duplicate keys. Malformed UTF-8 and unpaired UTF-16 escapes are refused.
 
 `testdata/media_input_v1.json` is a synthetic **input-only** shared fixture, with
-positive cases and portable first-replacement negative mutations. Go tests and
+positive cases and portable negative values or first-replacement mutations. Go tests and
 an independent stdlib Python replay pin its SHA-256. The illustrative hashes and
 capabilities do not identify real images, documents or live credentials. An
 input fixture pin is not proof of image integrity or execution approval.

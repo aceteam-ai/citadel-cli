@@ -55,6 +55,10 @@
     {"name":"mask-wrong-format","base":"inpaint","replace_first":["\"format\":\"png\"","\"format\":\"jpeg\""]},
     {"name":"inpaint-missing-mask","base":"workspace","task":"inpaint"},
     {"name":"image-to-image-with-mask","base":"inpaint","task":"image-to-image"},
-    {"name":"future-task","base":"workspace","task":"ref-to-video"}
+    {"name":"future-task","base":"workspace","task":"ref-to-video"},
+    {"name":"mask-before-source","base":"inpaint","value":{"schema":"media_input.v1","inputs":[{"role":"mask","origin":"inbox","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":16,"format":"png","capability":"synthetic.media-input.mask"},{"role":"source","origin":"workspace","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1,"format":"jpeg","path":"fixtures/café-🧪.jpeg"}]}},
+    {"name":"empty-inputs","base":"workspace","value":{"schema":"media_input.v1","inputs":[]}},
+    {"name":"duplicate-source","base":"inpaint","replace_first":["\"role\":\"mask\"","\"role\":\"source\""]},
+    {"name":"both-locations","base":"workspace","replace_first":["\"path\":","\"capability\":\"synthetic.extra\",\"path\":"]}
   ]
 }
