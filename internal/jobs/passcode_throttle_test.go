@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -205,5 +206,142 @@ func TestShellGateStateReadErrorIsUnavailableNotUnset(t *testing.T) {
 	g.State = func() (PasscodeState, error) { return PasscodeState{Set: false}, nil }
 	if got := ShellGateReason(g, throttlePin); got != ReasonPasscodeNotSet {
 		t.Fatalf("no passcode set: %q, want passcode_not_set", got)
+	}
+}
+
+func TestPasscodeThrottlePanicReleasesSlotWithoutFailure(t *testing.T) {
+	th, _ := newTestThrottle()
+	panicValue := &struct{ message string }{"owned test panic"}
+	for i := 0; i < 2*th.MaxFailures; i++ {
+		func() {
+			defer func() {
+				if got := recover(); got != panicValue {
+					t.Errorf("panic changed or swallowed: %v", got)
+				}
+			}()
+			checkPasscode(th, func(string) PasscodeVerdict { panic(panicValue) }, throttlePin)
+			t.Error("panicking verifier returned")
+		}()
+		if th.pending != 0 || len(th.failures) != 0 || th.Throttled() {
+			t.Fatalf("panic leaked or counted: pending=%d failures=%d", th.pending, len(th.failures))
+		}
+	}
+	if got := checkPasscode(th, BoolCheck(pinVerify), throttlePin); got != "" {
+		t.Fatalf("correct check after recovered panics refused: %q", got)
+	}
+	if got := checkPasscode(th, BoolCheck(pinVerify), "wrong"); got != ReasonPasscodeInvalid || len(th.failures) != 1 || th.pending != 0 {
+		t.Fatalf("returned mismatch not counted exactly once: reason=%q failures=%d pending=%d", got, len(th.failures), th.pending)
+	}
+}
+
+func TestPasscodeThrottleConcurrentCorrectChecksAreBusyNotIncorrect(t *testing.T) {
+	th, _ := newTestThrottle()
+	started := make(chan struct{}, th.MaxFailures+1)
+	release := make(chan struct{})
+	results := make(chan string, th.MaxFailures+1)
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	var wg sync.WaitGroup
+	defer func() { unblock(); wg.Wait() }()
+	check := func(string) PasscodeVerdict {
+		started <- struct{}{}
+		<-release
+		return PasscodeMatch
+	}
+	startCheck := func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- checkPasscode(th, check, throttlePin)
+		}()
+	}
+	for i := 0; i < th.MaxFailures; i++ {
+		startCheck()
+	}
+	for i := 0; i < th.MaxFailures; i++ {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("reserved checks did not enter the owned verifier")
+		}
+	}
+	startCheck()
+	select {
+	case reason := <-results:
+		if reason != ReasonPasscodeBusy {
+			t.Fatalf("concurrent correct overflow: %q, want retryable busy", reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("busy check blocked instead of returning")
+	}
+	th.mu.Lock()
+	pending, failures, cooldown := th.pending, len(th.failures), th.lockedUntil
+	th.mu.Unlock()
+	if pending != th.MaxFailures || failures != 0 || !cooldown.IsZero() {
+		t.Fatalf("busy changed accounting: pending=%d failures=%d cooldown=%v", pending, failures, cooldown)
+	}
+	unblock()
+	wg.Wait()
+	for i := 0; i < th.MaxFailures; i++ {
+		if reason := <-results; reason != "" {
+			t.Errorf("correct admitted check refused: %q", reason)
+		}
+	}
+	if th.pending != 0 || len(th.failures) != 0 || th.Throttled() {
+		t.Fatal("correct burst counted as failures or leaked slots")
+	}
+	if reason := checkPasscode(th, BoolCheck(pinVerify), throttlePin); reason != "" {
+		t.Fatalf("retry after busy refused: %q", reason)
+	}
+}
+
+func TestPasscodeBusyMessagesPreserveReasonAcrossSurfaces(t *testing.T) {
+	th, _ := newTestThrottle()
+	for i := 0; i < th.MaxFailures; i++ {
+		if reason := th.reserve(); reason != "" {
+			t.Fatal(reason)
+		}
+		defer th.release(false)
+	}
+	load := func() (PasscodeState, error) {
+		return PasscodeState{Set: true, Check: func(string) PasscodeVerdict {
+			t.Error("busy gate called verifier")
+			return PasscodeMatch
+		}}, nil
+	}
+	if reason := DesktopGateReason(DesktopGate{Load: load, Throttle: th}, throttlePin); reason != ReasonPasscodeBusy {
+		t.Errorf("desktop gate lost busy: %q", reason)
+	}
+	if reason := ShellGateReason(ShellGate{Enabled: func() bool { return true }, State: load, Throttle: th}, throttlePin); reason != ReasonPasscodeBusy {
+		t.Errorf("shell/workflow gate lost busy: %q", reason)
+	}
+	for surface, refusal := range map[string]*ShellRefusal{
+		"shell":    {Reason: ReasonPasscodeBusy, Message: shellCommandRefusalMessage(ReasonPasscodeBusy)},
+		"workflow": WorkflowShellRefusal(ReasonPasscodeBusy),
+		"desktop":  DesktopRefusal(ReasonPasscodeBusy),
+	} {
+		var wire struct {
+			Reason  string `json:"reason"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal([]byte(refusal.Error()), &wire); err != nil {
+			t.Fatal(err)
+		}
+		if wire.Reason != ReasonPasscodeBusy || wire.Message != msgPasscodeBusy || !strings.Contains(wire.Message, "retry") || strings.Contains(wire.Message, "incorrect") {
+			t.Errorf("%s busy became incorrect/invalid refusal: %+v", surface, wire)
+		}
+	}
+}
+
+func TestPasscodeBusyDoesNotMaskActualCooldown(t *testing.T) {
+	th, _ := newTestThrottle()
+	for i := 0; i < th.MaxFailures; i++ {
+		checkPasscode(th, func(string) PasscodeVerdict { return PasscodeMismatch }, "wrong")
+	}
+	if reason := checkPasscode(th, func(string) PasscodeVerdict {
+		t.Error("cooldown reached verifier")
+		return PasscodeMatch
+	}, throttlePin); reason != ReasonPasscodeThrottled {
+		t.Fatalf("real failure cooldown changed to %q", reason)
 	}
 }

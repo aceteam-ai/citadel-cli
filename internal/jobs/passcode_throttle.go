@@ -12,6 +12,13 @@ const ReasonPasscodeThrottled = "passcode_throttled"
 
 const msgPasscodeThrottled = "too many incorrect node passcode attempts; passcode-gated jobs on this node are paused briefly, retry after the cooldown"
 
+// ReasonPasscodeBusy means checks already in flight have reserved the remaining
+// failure budget. The presented passcode has not been checked; retry later.
+// This is not a wrong passcode and must not revoke a platform grant window.
+const ReasonPasscodeBusy = "passcode_busy"
+
+const msgPasscodeBusy = "node passcode checks are busy; this passcode was not checked, retry shortly"
+
 // ReasonPasscodeLocked means the node's master-PIN vault is in its own lockout
 // window, so a passcode could not be checked. It says nothing about whether the
 // presented passcode was right.
@@ -70,8 +77,10 @@ const (
 // through one throttle cannot overshoot
 // the limit: a check reserves a slot under the lock, runs unlocked, and is
 // recorded under the lock, and the window's failures plus checks in flight
-// never exceed MaxFailures. State is in memory only, so a worker restart
-// resets it.
+// never exceed MaxFailures. Capacity reserved by in-flight checks is reported
+// as ReasonPasscodeBusy, not as incorrect attempts. A check that panics releases
+// its slot without counting a failure. State is in memory only, so a worker
+// restart resets it.
 //
 // A nil *PasscodeThrottle never throttles.
 type PasscodeThrottle struct {
@@ -128,21 +137,24 @@ func (t *PasscodeThrottle) pruneLocked(now time.Time) {
 	t.failures = kept
 }
 
-// reserve claims one check slot. It reports false during a cooldown, or when
-// the window's failures plus checks already in flight have used the budget.
-func (t *PasscodeThrottle) reserve() bool {
+// reserve claims one check slot and returns "", or a distinct refusal for an
+// actual failure cooldown versus capacity reserved by checks still in flight.
+func (t *PasscodeThrottle) reserve() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.clock()
 	if now.Before(t.lockedUntil) {
-		return false
+		return ReasonPasscodeThrottled
 	}
 	t.pruneLocked(now)
 	if t.MaxFailures > 0 && len(t.failures)+t.pending >= t.MaxFailures {
-		return false
+		if t.pending > 0 {
+			return ReasonPasscodeBusy
+		}
+		return ReasonPasscodeThrottled
 	}
 	t.pending++
-	return true
+	return ""
 }
 
 // release ends a reserved check, counting it when it was a wrong passcode and
@@ -165,9 +177,10 @@ func (t *PasscodeThrottle) release(failed bool) {
 
 // checkPasscode applies the throttle around one passcode check and returns the
 // refusal reason, or "" on a match:
-//   - ReasonPasscodeThrottled during a cooldown, or while the failure budget
-//     is used up by recent failures and checks in flight, without calling
-//     check;
+//   - ReasonPasscodeThrottled during a cooldown or when recorded failures have
+//     used the budget, without calling check;
+//   - ReasonPasscodeBusy when checks in flight have reserved the remaining
+//     budget, without calling check (not a wrong passcode);
 //   - ReasonPasscodeLocked or ReasonPasscodeUnavailable when the check could
 //     not run, not counted;
 //   - ReasonPasscodeInvalid for a wrong passcode, counted only when a
@@ -180,17 +193,19 @@ func checkPasscode(t *PasscodeThrottle, check func(string) PasscodeVerdict, pres
 	if check == nil {
 		return ReasonPasscodeInvalid
 	}
+	failed := false
 	if t != nil && presented != "" {
-		if !t.reserve() {
-			return ReasonPasscodeThrottled
+		if reason := t.reserve(); reason != "" {
+			return reason
 		}
+		// A panic is propagated, but its reservation is not retained and it is
+		// not recorded as a mismatch. Only a returned mismatch counts.
+		defer func() { t.release(failed) }()
 	} else if t.Throttled() {
 		return ReasonPasscodeThrottled
 	}
 	verdict := check(presented)
-	if t != nil && presented != "" {
-		t.release(verdict == PasscodeMismatch)
-	}
+	failed = verdict == PasscodeMismatch
 	return verdictReason(verdict)
 }
 

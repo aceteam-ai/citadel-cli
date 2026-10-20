@@ -69,6 +69,8 @@ func shellCommandRefusalMessage(reason string) string {
 		return msgPasscodeNotSet
 	case ReasonPasscodeThrottled:
 		return msgPasscodeThrottled
+	case ReasonPasscodeBusy:
+		return msgPasscodeBusy
 	case ReasonPasscodeLocked:
 		return msgPasscodeLocked
 	case ReasonPasscodeUnavailable:

@@ -39,8 +39,8 @@ type DesktopGate struct {
 
 // DesktopGateReason applies the gate to a presented passcode. It returns "" when
 // the job may run, otherwise ReasonPasscodeUnavailable, ReasonPasscodeThrottled,
-// ReasonPasscodeLocked or ReasonPasscodeInvalid. A node with no passcode allows every desktop job, as
-// before the gate existed.
+// ReasonPasscodeBusy, ReasonPasscodeLocked or ReasonPasscodeInvalid. A node with
+// no passcode allows every desktop job, as before the gate existed.
 func DesktopGateReason(g DesktopGate, presentedPasscode string) string {
 	if g.Load == nil {
 		return ReasonPasscodeUnavailable
@@ -64,6 +64,8 @@ func DesktopRefusal(reason string) *ShellRefusal {
 		return &ShellRefusal{Reason: reason, Message: msgPasscodeUnavailable}
 	case ReasonPasscodeThrottled:
 		return &ShellRefusal{Reason: reason, Message: msgPasscodeThrottled}
+	case ReasonPasscodeBusy:
+		return &ShellRefusal{Reason: reason, Message: msgPasscodeBusy}
 	case ReasonPasscodeLocked:
 		return &ShellRefusal{Reason: reason, Message: msgPasscodeLocked}
 	}
