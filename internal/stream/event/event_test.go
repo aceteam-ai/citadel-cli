@@ -11,13 +11,13 @@ import (
 
 func testEnvelope() Envelope {
 	return Envelope{
-		Seq: 7,
-		TMonoNS: 1234567,
-		TWallNS: time.Date(2026, 10, 19, 15, 0, 0, 0, time.UTC).UnixNano(),
+		Seq:        7,
+		TMonoNS:    1234567,
+		TWallNS:    time.Date(2026, 10, 19, 15, 0, 0, 0, time.UTC).UnixNano(),
 		ClockState: "synced",
-		SourceID: "fixture",
-		NodeID: "offline-node",
-		RawRef: "fixture:42",
+		SourceID:   "fixture",
+		NodeID:     "offline-node",
+		RawRef:     "fixture:42",
 	}
 }
 
@@ -32,18 +32,18 @@ func TestCombinedPreservesEvidenceAndExtractsFields(t *testing.T) {
 		t.Fatalf("evidence or ingest envelope changed: %+v", got.Envelope)
 	}
 	want := map[string]any{
-		"@timestamp": "2026-10-11T10:03:20Z",
-		"source.ip": "203.0.113.9",
-		"source.ip_subnet24": "203.0.113.0/24",
-		"http.request.method": "GET",
-		"http.request.line": "GET /Products?id=1'%20OR%20'1'='1 HTTP/1.1",
-		"url.original": "/Products?id=1'%20OR%20'1'='1",
-		"url.path": "/Products",
+		"@timestamp":                "2026-10-11T10:03:20Z",
+		"source.ip":                 "203.0.113.9",
+		"source.ip_subnet24":        "203.0.113.0/24",
+		"http.request.method":       "GET",
+		"http.request.line":         "GET /Products?id=1'%20OR%20'1'='1 HTTP/1.1",
+		"url.original":              "/Products?id=1'%20OR%20'1'='1",
+		"url.path":                  "/Products",
 		"http.response.status_code": int64(200),
-		"network.bytes": int64(300),
-		"user.name": "alice",
-		"user_agent.original": "sqlmap/1.7",
-		"message": strings.TrimSuffix(raw, "\r\n"),
+		"network.bytes":             int64(300),
+		"user.name":                 "alice",
+		"user_agent.original":       "sqlmap/1.7",
+		"message":                   strings.TrimSuffix(raw, "\r\n"),
 	}
 	for key, value := range want {
 		if !reflect.DeepEqual(got.Fields[key], value) {
@@ -113,10 +113,10 @@ func TestSyslog5424StructuredDataAndNilFields(t *testing.T) {
 
 func TestOpenSSHAcceptedFailedAndInvalidUsers(t *testing.T) {
 	cases := []struct {
-		line string
-		user string
+		line    string
+		user    string
 		outcome string
-		action string
+		action  string
 	}{
 		{"Oct 19 14:00:00 host sshd[123]: Accepted publickey for alice from 192.0.2.5 port 2222 ssh2: ED25519 SHA256:example", "alice", "success", "ssh_login"},
 		{"2026-10-19T14:00:00+00:00 host sshd-session[124]: Failed password for invalid user bob from 192.0.2.6 port 2223 ssh2", "bob", "failure", "ssh_login"},
@@ -140,7 +140,7 @@ func TestOpenSSHAcceptedFailedAndInvalidUsers(t *testing.T) {
 func TestJSONDeclaredMappingAndTypedFields(t *testing.T) {
 	raw := `{"client":{"ip":"192.0.2.44"},"status":401,"stamp":"2026-10-19T16:00:00+01:00","text":"original","labels":["one","two"]}`
 	options := ParserOptions{
-		FieldMap: map[string]string{"client.ip": "source.ip", "status": "http.response.status_code", "stamp": "@timestamp", "text": "message", "labels": "labels"},
+		FieldMap:    map[string]string{"client.ip": "source.ip", "status": "http.response.status_code", "stamp": "@timestamp", "text": "message", "labels": "labels"},
 		Enrichments: []string{"source.ip_subnet24"},
 	}
 	got, err := Parse("jsonl", raw, testEnvelope(), options)
@@ -162,9 +162,9 @@ func TestJSONDeclaredMappingAndTypedFields(t *testing.T) {
 func TestParsersRefuseMalformedInputWithoutLeakingEvidence(t *testing.T) {
 	jsonMap := ParserOptions{FieldMap: map[string]string{"secret": "message"}}
 	cases := []struct {
-		name string
-		kind string
-		line string
+		name    string
+		kind    string
+		line    string
 		options ParserOptions
 	}{
 		{"unknown parser", "shell", "sensitive-evidence", ParserOptions{}},
@@ -216,7 +216,7 @@ func TestLineLimitsAndDeterminism(t *testing.T) {
 	if _, err := Parse("json", strings.Repeat("x", DefaultMaxLineBytes+1), testEnvelope(), ParserOptions{}); !errors.Is(err, ErrOversize) {
 		t.Fatalf("default line cap: %v", err)
 	}
-	if _, err := Parse("json", "{}", testEnvelope(), ParserOptions{MaxLineBytes: HardMaxLineBytes+1}); err == nil {
+	if _, err := Parse("json", "{}", testEnvelope(), ParserOptions{MaxLineBytes: HardMaxLineBytes + 1}); err == nil {
 		t.Fatal("configuration must not raise the hard line cap")
 	}
 	raw := `{"secret":"value","number":3}`

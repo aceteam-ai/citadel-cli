@@ -9,7 +9,7 @@ import (
 
 func TestDeduplicatedDetectionDoesNotFeedParentCorrelation(t *testing.T) {
 	e := testEngine(t, Options{},
-		testRuleFile{id: "a", body: testDetection("start")+"x-aceteam:\n  group_by: [source.ip]\n  dedup: 10s\n"},
+		testRuleFile{id: "a", body: testDetection("start") + "x-aceteam:\n  group_by: [source.ip]\n  dedup: 10s\n"},
 		testRuleFile{id: "parent", body: testCorrelation("event_count", "a", "source.ip", "    gte: 2\n")},
 	)
 	got := evaluateEvents(t, e,
@@ -23,7 +23,7 @@ func TestDeduplicatedDetectionDoesNotFeedParentCorrelation(t *testing.T) {
 
 func TestRateLimitedEmissionStillFeedsParentDetection(t *testing.T) {
 	e := testEngine(t, Options{},
-		testRuleFile{id: "a", body: testDetection("start")+"x-aceteam:\n  group_by: [source.ip]\n  rate:\n    capacity: 1\n    every: 10s\n"},
+		testRuleFile{id: "a", body: testDetection("start") + "x-aceteam:\n  group_by: [source.ip]\n  rate:\n    capacity: 1\n    every: 10s\n"},
 		testRuleFile{id: "parent", body: testCorrelation("event_count", "a", "source.ip", "    gte: 2\n")},
 	)
 	got := evaluateEvents(t, e,
@@ -63,7 +63,9 @@ func TestOrderedCorrelationRetainsEarlierApproximateQualification(t *testing.T) 
 	e := testEngine(t, Options{}, files...)
 	compositionPopulateDistinct(t, e)
 	got := evaluateEvents(t, e, syntheticEvent(2*time.Second, "success", "192.0.2.1", "demo"))
-	if len(alertsFor(got, "values")) != 0 { t.Fatal("success must not manufacture a current distinct-count qualification") }
+	if len(alertsFor(got, "values")) != 0 {
+		t.Fatal("success must not manufacture a current distinct-count qualification")
+	}
 	completed := alertsFor(got, "ordered")
 	if len(completed) != 1 || !completed[0].Approximate || completed[0].MatchCount != 2 {
 		t.Fatalf("exact final success erased earlier HLL uncertainty: %+v", completed)
@@ -104,9 +106,13 @@ func TestNumericSpellingsShareGroupsAndDistinctIdentityWithoutStringCoercion(t *
 		ev.Fields["identity.value"] = value
 		got := evaluateEvents(t, e, ev)
 		groups, distinct := alertsFor(got, "grouped"), alertsFor(got, "distinct")
-		if len(groups) != 1 || len(distinct) != 1 { t.Fatalf("missing numeric composition matches: %+v", got) }
+		if len(groups) != 1 || len(distinct) != 1 {
+			t.Fatalf("missing numeric composition matches: %+v", got)
+		}
 		if i < 3 {
-			if i == 0 { numericKey = groups[0].GroupKey }
+			if i == 0 {
+				numericKey = groups[0].GroupKey
+			}
 			if groups[0].GroupKey != numericKey || groups[0].MatchCount != uint64(i+1) || distinct[0].MatchCount != 1 {
 				t.Fatalf("numeric spelling %v changed grouping or distinct identity: groups=%+v distinct=%+v", value, groups, distinct)
 			}
@@ -123,7 +129,7 @@ func TestIdleWatermarkAndUnrelatedEventsExpireAllNonAbsenceState(t *testing.T) {
 	for _, driver := range []string{"advance", "unrelated event"} {
 		t.Run(driver, func(t *testing.T) {
 			e := testEngine(t, Options{},
-				testRuleFile{id: "start", body: testDetection("start")+"x-aceteam:\n  group_by: [source.ip]\n  dedup: 10s\n  rate:\n    capacity: 1\n    every: 10s\n"},
+				testRuleFile{id: "start", body: testDetection("start") + "x-aceteam:\n  group_by: [source.ip]\n  dedup: 10s\n  rate:\n    capacity: 1\n    every: 10s\n"},
 				testRuleFile{id: "finish", body: testDetection("finish")},
 				testRuleFile{id: "count", body: testCorrelation("event_count", "start", "source.ip", "    gte: 2\n")},
 				testRuleFile{id: "unfinished", body: testCorrelation("temporal_ordered", "start, finish", "source.ip", "")},
@@ -136,12 +142,16 @@ func TestIdleWatermarkAndUnrelatedEventsExpireAllNonAbsenceState(t *testing.T) {
 			var out []Alert
 			if driver == "advance" {
 				var err error
-				out, err = e.Advance(int64(20*time.Second))
-				if err != nil { t.Fatal(err) }
+				out, err = e.Advance(int64(20 * time.Second))
+				if err != nil {
+					t.Fatal(err)
+				}
 			} else {
 				out = evaluateEvents(t, e, syntheticEvent(20*time.Second, "unrelated", "192.0.2.1", "demo"))
 			}
-			if len(out) != 0 { t.Fatalf("expiry manufactured matches: %+v", out) }
+			if len(out) != 0 {
+				t.Fatalf("expiry manufactured matches: %+v", out)
+			}
 			for rule, state := range e.Stats().State {
 				if state.ActiveKeys != 0 || state.StateEvicted != 0 || state.InputRejected != 0 {
 					t.Fatalf("%s retained naturally expired state or counted expiry as loss: %+v", rule, state)
@@ -150,4 +160,3 @@ func TestIdleWatermarkAndUnrelatedEventsExpireAllNonAbsenceState(t *testing.T) {
 		})
 	}
 }
-

@@ -132,8 +132,11 @@ limiting suppresses escalation only and does not alter downstream detection.
 
 The synthetic Shield inputs and expected flags are preserved in
 `internal/stream/testdata/shield`. History matching remains outside ST1.
-Source tests cover parsers, modifiers, operators, correlations and evaluator
-determinism. Local tests, formatting, builds and throughput measurement are
-not claimed until the execution gate is authorized and actual results are
-recorded. Required exact-head CI and independent Opus review precede ready
-and merge. ST2 and ST4b remain separate dependent issues.
+Tests cover parsers, modifiers, operators, correlations and evaluator
+determinism. After bounded offline verification was authorized, the stream
+package tests and race checks, targeted CLI tests, stream-package vet checks
+and a Linux amd64 build passed. The original seven Shield scenarios pass in
+both ingest and event time. Measured throughput and reproducible commands
+are recorded in [ST1 offline verification](stream-st1-verification.md).
+Required exact-head CI and independent Opus review still precede ready and
+merge. ST2 and ST4b remain separate dependent issues.

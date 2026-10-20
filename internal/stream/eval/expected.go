@@ -24,27 +24,29 @@ type Expected struct {
 }
 
 type ExpectedMatch struct {
-	RuleID string `json:"rule_id"`
+	RuleID   string `json:"rule_id"`
 	GroupKey string `json:"group_key"`
 }
 
 type Comparison struct {
-	Unit string `json:"unit"`
-	Scenarios uint64 `json:"scenarios"`
-	ExpectedMatches uint64 `json:"expected_matches"`
-	ActualMatches uint64 `json:"actual_matches"`
-	TruePositives uint64 `json:"true_positives"`
-	FalsePositives uint64 `json:"false_positives"`
-	FalseNegatives uint64 `json:"false_negatives"`
-	Recall *float64 `json:"recall"`
-	Precision *float64 `json:"precision"`
+	Unit               string   `json:"unit"`
+	Scenarios          uint64   `json:"scenarios"`
+	ExpectedMatches    uint64   `json:"expected_matches"`
+	ActualMatches      uint64   `json:"actual_matches"`
+	TruePositives      uint64   `json:"true_positives"`
+	FalsePositives     uint64   `json:"false_positives"`
+	FalseNegatives     uint64   `json:"false_negatives"`
+	Recall             *float64 `json:"recall"`
+	Precision          *float64 `json:"precision"`
 	FalseDiscoveryRate *float64 `json:"false_discovery_rate"`
-	Passed bool `json:"passed"`
+	Passed             bool     `json:"passed"`
 }
 
 func compareExpected(path string, scenarios []Scenario) (*Comparison, error) {
 	root, err := os.OpenRoot(filepath.Dir(path))
-	if err != nil { return nil, errors.New("stream eval could not open expectations directory") }
+	if err != nil {
+		return nil, errors.New("stream eval could not open expectations directory")
+	}
 	defer root.Close()
 	file, err := input.OpenRegular(root, filepath.Base(path))
 	if err != nil {
@@ -74,7 +76,9 @@ func compareExpected(path string, scenarios []Scenario) (*Comparison, error) {
 		return nil, errors.New("stream eval expectations contain trailing JSON")
 	}
 	expected, err := decodeExpectedExact(data)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	if expected.Scenarios == nil || len(expected.Scenarios) != len(scenarios) {
 		return nil, errors.New("stream eval expectations must label exactly the evaluated scenarios")
 	}
@@ -126,23 +130,37 @@ func compareExpected(path string, scenarios []Scenario) (*Comparison, error) {
 func decodeExpectedExact(data []byte) (Expected, error) {
 	invalid := errors.New("stream eval expectations contain invalid schema members")
 	var top map[string]json.RawMessage
-	if err := json.Unmarshal(data, &top); err != nil || len(top) != 1 { return Expected{}, invalid }
+	if err := json.Unmarshal(data, &top); err != nil || len(top) != 1 {
+		return Expected{}, invalid
+	}
 	rawScenarios, ok := top["scenarios"]
-	if !ok { return Expected{}, invalid }
+	if !ok {
+		return Expected{}, invalid
+	}
 	var scenarioLabels map[string]json.RawMessage
-	if err := json.Unmarshal(rawScenarios, &scenarioLabels); err != nil || scenarioLabels == nil { return Expected{}, invalid }
+	if err := json.Unmarshal(rawScenarios, &scenarioLabels); err != nil || scenarioLabels == nil {
+		return Expected{}, invalid
+	}
 	expected := Expected{Scenarios: make(map[string][]ExpectedMatch, len(scenarioLabels))}
 	for name, rawLabels := range scenarioLabels {
 		var labels []map[string]json.RawMessage
-		if err := json.Unmarshal(rawLabels, &labels); err != nil || labels == nil { return Expected{}, invalid }
+		if err := json.Unmarshal(rawLabels, &labels); err != nil || labels == nil {
+			return Expected{}, invalid
+		}
 		decoded := make([]ExpectedMatch, 0, len(labels))
 		for _, label := range labels {
-			if len(label) != 2 { return Expected{}, invalid }
+			if len(label) != 2 {
+				return Expected{}, invalid
+			}
 			rawRule, ruleOK := label["rule_id"]
 			rawGroup, groupOK := label["group_key"]
-			if !ruleOK || !groupOK || bytes.Equal(bytes.TrimSpace(rawRule), []byte("null")) || bytes.Equal(bytes.TrimSpace(rawGroup), []byte("null")) { return Expected{}, invalid }
+			if !ruleOK || !groupOK || bytes.Equal(bytes.TrimSpace(rawRule), []byte("null")) || bytes.Equal(bytes.TrimSpace(rawGroup), []byte("null")) {
+				return Expected{}, invalid
+			}
 			var rule, group string
-			if json.Unmarshal(rawRule, &rule) != nil || json.Unmarshal(rawGroup, &group) != nil { return Expected{}, invalid }
+			if json.Unmarshal(rawRule, &rule) != nil || json.Unmarshal(rawGroup, &group) != nil {
+				return Expected{}, invalid
+			}
 			decoded = append(decoded, ExpectedMatch{RuleID: rule, GroupKey: group})
 		}
 		expected.Scenarios[name] = decoded

@@ -62,18 +62,18 @@ func parseCombined(line string) (map[string]any, error) {
 		}
 	}
 	fields := map[string]any{
-		"@timestamp": timestamp.UTC().Format(time.RFC3339Nano),
-		"event.category": "web",
-		"event.action": "http_request",
-		"source.ip": ip,
-		"http.request.method": requestParts[0],
-		"http.request.line": request,
-		"http.version": strings.TrimPrefix(requestParts[2], "HTTP/"),
+		"@timestamp":                timestamp.UTC().Format(time.RFC3339Nano),
+		"event.category":            "web",
+		"event.action":              "http_request",
+		"source.ip":                 ip,
+		"http.request.method":       requestParts[0],
+		"http.request.line":         request,
+		"http.version":              strings.TrimPrefix(requestParts[2], "HTTP/"),
 		"http.response.status_code": status,
-		"url.original": target,
-		"url.path": path,
-		"user_agent.original": userAgent,
-		"message": line,
+		"url.original":              target,
+		"url.path":                  path,
+		"user_agent.original":       userAgent,
+		"message":                   line,
 	}
 	if parts[3] != "-" {
 		fields["user.name"] = parts[3]

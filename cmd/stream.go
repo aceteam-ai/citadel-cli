@@ -11,23 +11,23 @@ import (
 
 func newStreamCommand() *cobra.Command {
 	command := &cobra.Command{
-		Use: "stream",
+		Use:   "stream",
 		Short: "Evaluate deterministic stream rules offline",
-		Long: "Evaluate reviewed rule packs against bounded local log files. Live stream sources and deployment are not part of this command.",
+		Long:  "Evaluate reviewed rule packs against bounded local log files. Live stream sources and deployment are not part of this command.",
 	}
 	var mode, expectedPath string
 	var lateness time.Duration
 	evaluate := &cobra.Command{
-		Use: "eval <pack> <logs>",
-		Short: "Evaluate a rule pack against local logs without network access",
-		Long: "Read one local log file or the sorted direct .log and .jsonl files in a directory. Each file is an independent scenario. Output contains matches and digests, not raw log lines. Ingest replay uses a fixed UTC epoch and one millisecond per line. Event-time replay uses parsed timestamps and the configured lateness allowance.",
-		Args: cobra.ExactArgs(2),
+		Use:          "eval <pack> <logs>",
+		Short:        "Evaluate a rule pack against local logs without network access",
+		Long:         "Read one local log file or the sorted direct .log and .jsonl files in a directory. Each file is an independent scenario. Output contains matches and digests, not raw log lines. Ingest replay uses a fixed UTC epoch and one millisecond per line. Event-time replay uses parsed timestamps and the configured lateness allowance.",
+		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(command *cobra.Command, args []string) error {
 			report, err := streameval.Run(command.Context(), args[0], args[1], streameval.Options{
-				TimeMode: mode,
+				TimeMode:        mode,
 				AllowedLateness: lateness,
-				ExpectedPath: expectedPath,
+				ExpectedPath:    expectedPath,
 			})
 			if err != nil {
 				return err

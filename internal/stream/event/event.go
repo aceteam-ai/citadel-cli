@@ -11,21 +11,21 @@ import (
 
 const (
 	DefaultMaxLineBytes = 64 * 1024
-	HardMaxLineBytes = 1024 * 1024
-	ParseStatusOK = "ok"
-	ParseStatusError = "error"
+	HardMaxLineBytes    = 1024 * 1024
+	ParseStatusOK       = "ok"
+	ParseStatusError    = "error"
 )
 
 // Envelope is stamped by the caller at ingest. Event timestamps never replace
 // these values, including when a sender's clock is missing or skewed.
 type Envelope struct {
-	Seq uint64 `json:"seq"`
-	TMonoNS int64 `json:"t_mono_ns"`
-	TWallNS int64 `json:"t_wall_ns"`
-	ClockState string `json:"clock_state"`
-	SourceID string `json:"source_id"`
-	NodeID string `json:"node_id"`
-	RawRef string `json:"raw_ref"`
+	Seq         uint64 `json:"seq"`
+	TMonoNS     int64  `json:"t_mono_ns"`
+	TWallNS     int64  `json:"t_wall_ns"`
+	ClockState  string `json:"clock_state"`
+	SourceID    string `json:"source_id"`
+	NodeID      string `json:"node_id"`
+	RawRef      string `json:"raw_ref"`
 	ParseStatus string `json:"parse_status"`
 }
 
@@ -34,16 +34,16 @@ type Envelope struct {
 type Event struct {
 	Envelope
 	Fields map[string]any `json:"fields"`
-	Raw string `json:"-"`
+	Raw    string         `json:"-"`
 }
 
 // ParserOptions declares all optional normalization. FieldMap is input JSON
 // key/path to output ECS dotted field name. An exact literal JSON key takes
 // precedence over nested path traversal. Missing mapped keys are errors.
 type ParserOptions struct {
-	FieldMap map[string]string `json:"field_map,omitempty"`
-	Enrichments []string `json:"enrichments,omitempty"`
-	MaxLineBytes int `json:"max_line_bytes,omitempty"`
+	FieldMap     map[string]string `json:"field_map,omitempty"`
+	Enrichments  []string          `json:"enrichments,omitempty"`
+	MaxLineBytes int               `json:"max_line_bytes,omitempty"`
 }
 
 var ErrOversize = errors.New("event exceeds line byte limit")

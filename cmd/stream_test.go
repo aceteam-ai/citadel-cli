@@ -15,9 +15,9 @@ func streamCommandFixture(t *testing.T) (string, string) {
 	t.Helper()
 	path := t.TempDir()
 	files := map[string]string{
-		"pack.yml": "id: command-test\nversion: 1.0.0\nparser: json\nfield_map:\n  text: message\nrules:\n  - id: detect\n    version: 1\n    file: detect.yml\n",
+		"pack.yml":   "id: command-test\nversion: 1.0.0\nparser: json\nfield_map:\n  text: message\nrules:\n  - id: detect\n    version: 1\n    file: detect.yml\n",
 		"detect.yml": "title: Offline command test\nname: detect\ndetection:\n  selected:\n    message|contains: alert\n  condition: selected\nx-aceteam:\n  escalate: false\n",
-		"case.log": "{\"text\":\"alert secret-evidence\"}\n",
+		"case.log":   "{\"text\":\"alert secret-evidence\"}\n",
 	}
 	for name, data := range files {
 		if err := os.WriteFile(filepath.Join(path, name), []byte(data), 0600); err != nil {

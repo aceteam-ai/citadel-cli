@@ -21,35 +21,35 @@ import (
 const shieldReplayEpochNS int64 = 1767225600000000000 // Same fixed 2026 UTC epoch as the offline driver.
 
 type shieldFixture struct {
-	name string
-	data []byte
+	name   string
+	data   []byte
 	digest string
 }
 
 type shieldVerdicts struct {
-	Flagged map[string][]string `json:"flagged"`
-	StatOnly []string `json:"stat_only"`
+	Flagged  map[string][]string `json:"flagged"`
+	StatOnly []string            `json:"stat_only"`
 }
 
 type shieldSnapshot struct {
-	Name string `json:"name"`
-	InputDigest string `json:"input_digest"`
-	Alerts []Alert `json:"alerts"`
-	Stats EngineStats `json:"stats"`
+	Name        string      `json:"name"`
+	InputDigest string      `json:"input_digest"`
+	Alerts      []Alert     `json:"alerts"`
+	Stats       EngineStats `json:"stats"`
 }
 
 type shieldCorpusSnapshot struct {
-	PackDigest string `json:"pack_digest"`
-	InputDigest string `json:"input_digest"`
-	TimeMode string `json:"time_mode"`
-	Scenarios []shieldSnapshot `json:"scenarios"`
+	PackDigest  string           `json:"pack_digest"`
+	InputDigest string           `json:"input_digest"`
+	TimeMode    string           `json:"time_mode"`
+	Scenarios   []shieldSnapshot `json:"scenarios"`
 }
 
 // These are the actual seven pre-existing prototype inputs, not regenerated
 // lookalikes. Hashes are recorded independently in shield/PROVENANCE.md.
 func shieldFixtures(tb testing.TB) ([]shieldFixture, map[string]shieldVerdicts) {
 	tb.Helper()
-	sources := []struct { name, digest string }{
+	sources := []struct{ name, digest string }{
 		{"a_clean", "c7ddc9b3d510b292f14eeffd0524737cb694be2c4f4afb9e6dbeceb6ee67c71b"},
 		{"b_sqli_knownbad", "13b565d8ad093aa12d6e5375b453e4557c8946ed55ee526293c5d2d8b9519533"},
 		{"c_ambiguous_crawler", "38aabe9b55a4efd0d1329d24350c2610857e17b8cfaaec1ec34b9e15238bde3b"},
@@ -59,29 +59,39 @@ func shieldFixtures(tb testing.TB) ([]shieldFixture, map[string]shieldVerdicts) 
 		{"f_multikey_match", "271a9ee1ca05c312f140e1aea887d6496c01e00ba4c80fb5e6a07f3b21afeb88"},
 	}
 	root, err := os.OpenRoot(filepath.Join("..", "testdata", "shield"))
-	if err != nil { tb.Fatal(err) }
+	if err != nil {
+		tb.Fatal(err)
+	}
 	defer root.Close()
 	fixtures := make([]shieldFixture, 0, len(sources))
 	totalBytes, totalLines := 0, 0
 	for _, source := range sources {
 		data, err := readBounded(root, source.name+".log", 64*1024)
-		if err != nil { tb.Fatal(err) }
+		if err != nil {
+			tb.Fatal(err)
+		}
 		digest := sha256.Sum256(data)
 		if len(data) == 0 || data[len(data)-1] != '\n' || hex.EncodeToString(digest[:]) != source.digest {
 			tb.Fatalf("%s differs from its original prototype bytes or final newline", source.name)
 		}
 		totalBytes += len(data)
 		totalLines += bytes.Count(data, []byte{'\n'})
-		fixtures = append(fixtures, shieldFixture{source.name, data, "sha256:"+source.digest})
+		fixtures = append(fixtures, shieldFixture{source.name, data, "sha256:" + source.digest})
 	}
 	if totalBytes != 21792 || totalLines != 147 {
 		tb.Fatalf("unexpected Shield corpus bounds: %d bytes, %d lines", totalBytes, totalLines)
 	}
 	labels, err := readBounded(root, "expected.json", 64*1024)
-	if err != nil { tb.Fatal(err) }
+	if err != nil {
+		tb.Fatal(err)
+	}
 	var expected map[string]shieldVerdicts
-	if err := json.Unmarshal(labels, &expected); err != nil { tb.Fatal(err) }
-	if len(expected) != len(fixtures) { tb.Fatal("golden label count differs from fixture count") }
+	if err := json.Unmarshal(labels, &expected); err != nil {
+		tb.Fatal(err)
+	}
+	if len(expected) != len(fixtures) {
+		tb.Fatal("golden label count differs from fixture count")
+	}
 	for _, fixture := range fixtures {
 		if labels, ok := expected[fixture.name]; !ok || labels.Flagged == nil || labels.StatOnly == nil {
 			tb.Fatalf("missing or malformed original labels for %s", fixture.name)
@@ -93,7 +103,9 @@ func shieldFixtures(tb testing.TB) ([]shieldFixture, map[string]shieldVerdicts) 
 func shieldPack(tb testing.TB) *Pack {
 	tb.Helper()
 	pack, err := LoadPack(filepath.Join("..", "testdata", "pack.yml"))
-	if err != nil { tb.Fatal(err) }
+	if err != nil {
+		tb.Fatal(err)
+	}
 	if pack.Manifest.Parser != "combined" || len(pack.Refused) != 0 {
 		tb.Fatal("Shield golden test requires the complete shared combined-log pack")
 	}
@@ -105,39 +117,53 @@ func shieldPack(tb testing.TB) *Pack {
 // and basename:byte-offset references. No machine clock or network is read.
 func shieldEvaluate(tb testing.TB, pack *Pack, fixture shieldFixture, mode string) (shieldSnapshot, map[string]string) {
 	tb.Helper()
-	engine, err := NewEngine(pack, Options{TimeMode: mode, AllowedLateness: 30*time.Second})
-	if err != nil { tb.Fatal(err) }
+	engine, err := NewEngine(pack, Options{TimeMode: mode, AllowedLateness: 30 * time.Second})
+	if err != nil {
+		tb.Fatal(err)
+	}
 	snapshot := shieldSnapshot{Name: fixture.name, InputDigest: fixture.digest, Alerts: []Alert{}}
 	actors := make(map[string]string)
-	filename := fixture.name+".log"
+	filename := fixture.name + ".log"
 	var offset uint64
 	var count uint64
 	for _, line := range bytes.SplitAfter(fixture.data, []byte{'\n'}) {
-		if len(line) == 0 { continue }
+		if len(line) == 0 {
+			continue
+		}
 		count++
-		if len(line) > event.DefaultMaxLineBytes { tb.Fatal("fixture line exceeds parser limit") }
-		stamp := int64(count)*int64(time.Millisecond)
+		if len(line) > event.DefaultMaxLineBytes {
+			tb.Fatal("fixture line exceeds parser limit")
+		}
+		stamp := int64(count) * int64(time.Millisecond)
 		meta := event.Envelope{
-			Seq: count,
-			TMonoNS: stamp,
-			TWallNS: shieldReplayEpochNS+stamp,
+			Seq:        count,
+			TMonoNS:    stamp,
+			TWallNS:    shieldReplayEpochNS + stamp,
 			ClockState: "offline_replay",
-			SourceID: filename,
-			NodeID: "offline-eval",
-			RawRef: filename+":"+strconv.FormatUint(offset, 10),
+			SourceID:   filename,
+			NodeID:     "offline-eval",
+			RawRef:     filename + ":" + strconv.FormatUint(offset, 10),
 		}
 		parsed, err := event.Parse(pack.Manifest.Parser, string(line), meta, pack.ParserOptions())
-		if err != nil { tb.Fatalf("parse %s record %d: %v", fixture.name, count, err) }
+		if err != nil {
+			tb.Fatalf("parse %s record %d: %v", fixture.name, count, err)
+		}
 		actor, ok := parsed.Fields["source.ip"].(string)
-		if !ok || actor == "" { tb.Fatal("fixture parser did not retain its source IP") }
+		if !ok || actor == "" {
+			tb.Fatal("fixture parser did not retain its source IP")
+		}
 		actors[meta.RawRef] = actor
 		alerts, err := engine.Evaluate(parsed)
-		if err != nil { tb.Fatalf("evaluate %s record %d: %v", fixture.name, count, err) }
+		if err != nil {
+			tb.Fatalf("evaluate %s record %d: %v", fixture.name, count, err)
+		}
 		snapshot.Alerts = append(snapshot.Alerts, alerts...)
 		offset += uint64(len(line))
 	}
 	flushed, err := engine.Flush()
-	if err != nil { tb.Fatal(err) }
+	if err != nil {
+		tb.Fatal(err)
+	}
 	snapshot.Alerts = append(snapshot.Alerts, flushed...)
 	SortAlerts(snapshot.Alerts)
 	snapshot.Stats = engine.Stats()
@@ -160,19 +186,29 @@ func shieldProject(tb testing.TB, snapshot shieldSnapshot, actors map[string]str
 	flags := make(map[string]map[string]bool)
 	statistical := make(map[string]bool)
 	for _, alert := range snapshot.Alerts {
-		if len(alert.RawRefs) != 1 { tb.Fatalf("unexpected fixture match references: %+v", alert.RawRefs) }
+		if len(alert.RawRefs) != 1 {
+			tb.Fatalf("unexpected fixture match references: %+v", alert.RawRefs)
+		}
 		actor, ok := actors[alert.RawRefs[0]]
-		if !ok { tb.Fatal("match references an event outside its fixture") }
+		if !ok {
+			tb.Fatal("match references an event outside its fixture")
+		}
 		if !strings.HasPrefix(alert.GroupKey, "sha256:") || len(alert.GroupKey) != len("sha256:")+64 {
 			tb.Fatal("match exposes a non-digest group key")
 		}
 		switch alert.RuleID {
 		case "R1", "R2", "R3", "R4", "R5":
-			if !alert.Escalate { tb.Fatalf("malicious rule %s unexpectedly became a local-only match", alert.RuleID) }
-			if flags[actor] == nil { flags[actor] = make(map[string]bool) }
+			if !alert.Escalate {
+				tb.Fatalf("malicious rule %s unexpectedly became a local-only match", alert.RuleID)
+			}
+			if flags[actor] == nil {
+				flags[actor] = make(map[string]bool)
+			}
 			flags[actor][alert.RuleID] = true
 		case "stat_only":
-			if alert.Escalate { tb.Fatal("stat-only match must remain local-only") }
+			if alert.Escalate {
+				tb.Fatal("stat-only match must remain local-only")
+			}
 			statistical[actor] = true
 		default:
 			if !strings.HasPrefix(alert.RuleID, "_") || alert.Escalate {
@@ -183,12 +219,16 @@ func shieldProject(tb testing.TB, snapshot shieldSnapshot, actors map[string]str
 	projected := shieldVerdicts{Flagged: make(map[string][]string), StatOnly: []string{}}
 	for actor, rules := range flags {
 		ids := make([]string, 0, len(rules))
-		for id := range rules { ids = append(ids, id) }
+		for id := range rules {
+			ids = append(ids, id)
+		}
 		sort.Strings(ids)
 		projected.Flagged[actor] = ids
 	}
 	for actor := range statistical {
-		if len(flags[actor]) == 0 { projected.StatOnly = append(projected.StatOnly, actor) }
+		if len(flags[actor]) == 0 {
+			projected.StatOnly = append(projected.StatOnly, actor)
+		}
 	}
 	sort.Strings(projected.StatOnly)
 	return projected
@@ -206,7 +246,7 @@ func shieldInputDigest(packDigest string, fixtures []shieldFixture) string {
 		fmt.Fprintf(hash, "%d:", len(fixture.data))
 		_, _ = hash.Write(fixture.data)
 	}
-	return "sha256:"+hex.EncodeToString(hash.Sum(nil))
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func TestShieldOriginalGoldenFixturesBothTimeModes(t *testing.T) {
@@ -228,7 +268,9 @@ func TestShieldOriginalGoldenFixturesBothTimeModes(t *testing.T) {
 					corpus.Scenarios = append(corpus.Scenarios, snapshot)
 				}
 				encoded, err := json.Marshal(corpus)
-				if err != nil { t.Fatal(err) }
+				if err != nil {
+					t.Fatal(err)
+				}
 				digest := sha256.Sum256(encoded)
 				if repetition == 0 {
 					firstJSON, firstDigest = encoded, digest
@@ -252,7 +294,9 @@ func BenchmarkShieldEvaluatorCorpus(b *testing.B) {
 	fixtures, _ := shieldFixtures(b)
 	pack := shieldPack(b)
 	var totalBytes int64
-	for _, fixture := range fixtures { totalBytes += int64(len(fixture.data)) }
+	for _, fixture := range fixtures {
+		totalBytes += int64(len(fixture.data))
+	}
 	for _, mode := range []string{"ingest", "event"} {
 		b.Run(mode, func(b *testing.B) {
 			b.ReportAllocs()

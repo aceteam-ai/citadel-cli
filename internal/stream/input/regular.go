@@ -21,16 +21,26 @@ func OpenRegular(root *os.Root, name string) (*os.File, error) {
 // The opener argument permits deterministic replacement tests without a global
 // hook or timing-sensitive mutation loop. Production always uses openRead.
 func openRegular(root *os.Root, name string, opener func(*os.Root, string) (*os.File, error)) (*os.File, error) {
-	if root == nil { return nil, ErrNotRegular }
+	if root == nil {
+		return nil, ErrNotRegular
+	}
 	before, err := root.Lstat(name)
-	if err != nil { return nil, err }
-	if !before.Mode().IsRegular() { return nil, ErrNotRegular }
-	file, err := opener(root, name)
 	if err != nil {
-		if file != nil { file.Close() }
 		return nil, err
 	}
-	if file == nil { return nil, ErrNotRegular }
+	if !before.Mode().IsRegular() {
+		return nil, ErrNotRegular
+	}
+	file, err := opener(root, name)
+	if err != nil {
+		if file != nil {
+			file.Close()
+		}
+		return nil, err
+	}
+	if file == nil {
+		return nil, ErrNotRegular
+	}
 	after, err := file.Stat()
 	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
 		file.Close()

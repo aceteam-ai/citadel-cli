@@ -18,16 +18,16 @@ import (
 type predicate func(map[string]any) bool
 
 const (
-	detectionMaxSelections = 256
-	detectionMaxMapItems = 256
-	detectionMaxListItems = 1024
-	detectionMaxDepth = 16
-	detectionMaxStringBytes = 64 * 1024
-	detectionMaxNodes = 16384
+	detectionMaxSelections   = 256
+	detectionMaxMapItems     = 256
+	detectionMaxListItems    = 1024
+	detectionMaxDepth        = 16
+	detectionMaxStringBytes  = 64 * 1024
+	detectionMaxNodes        = 16384
 	detectionMaxPatternBytes = 1024 * 1024
-	conditionMaxBytes = 8192
-	conditionMaxTokens = 1024
-	conditionMaxDepth = 64
+	conditionMaxBytes        = 8192
+	conditionMaxTokens       = 1024
+	conditionMaxDepth        = 64
 )
 
 // Sigma 2.1 semantics are specified at:
@@ -109,9 +109,9 @@ func compileDetection(detection map[string]any) (predicate, error) {
 }
 
 type detectionBudget struct {
-	nodes int
-	patternBytes int
-	conditionBytes int
+	nodes           int
+	patternBytes    int
+	conditionBytes  int
 	conditionTokens int
 }
 
@@ -181,9 +181,9 @@ func (b *detectionBudget) selection(value any, depth int) (predicate, error) {
 }
 
 type detectionModifiers struct {
-	mode string
-	all bool
-	cased bool
+	mode       string
+	all        bool
+	cased      bool
 	regexFlags string
 }
 
@@ -581,10 +581,10 @@ func conditionLex(expression string) ([]string, error) {
 }
 
 type conditionParser struct {
-	tokens []string
-	position int
+	tokens     []string
+	position   int
 	selections map[string]predicate
-	names []string
+	names      []string
 }
 
 func (p *conditionParser) take(token string) bool {
@@ -632,14 +632,14 @@ func (p *conditionParser) parseUnary(depth int) (predicate, error) {
 		return nil, errors.New("condition exceeds nesting depth limit")
 	}
 	if p.take("not") {
-		next, err := p.parseUnary(depth+1)
+		next, err := p.parseUnary(depth + 1)
 		if err != nil {
 			return nil, err
 		}
 		return func(fields map[string]any) bool { return !next(fields) }, nil
 	}
 	if p.take("(") {
-		next, err := p.parseOr(depth+1)
+		next, err := p.parseOr(depth + 1)
 		if err != nil {
 			return nil, err
 		}

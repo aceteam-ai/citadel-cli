@@ -236,24 +236,26 @@ func TestExpectedRejectsMissingDuplicateAndUnknownLabels(t *testing.T) {
 }
 
 func TestExpectedRejectsCaseAliasesInsteadOfOverwritingLabels(t *testing.T) {
-	path := filepath.Join(t.TempDir(),"expected.json")
+	path := filepath.Join(t.TempDir(), "expected.json")
 	hash := sha256.Sum256([]byte("[]"))
-	key := "sha256:"+hex.EncodeToString(hash[:])
-	identity := `{"rule_id":"detect","group_key":"`+key+`"}`
+	key := "sha256:" + hex.EncodeToString(hash[:])
+	identity := `{"rule_id":"detect","group_key":"` + key + `"}`
 	for _, content := range []string{
 		`{"Scenarios":{"case":[]}}`,
-		`{"scenarios":{"case":[`+identity+`]},"Scenarios":{"case":[]}}`,
-		`{"Scenarios":{"case":[]},"scenarios":{"case":[`+identity+`]}}`,
-		`{"scenarios":{"case":[{"rule_id":"must-fire","RULE_ID":"detect","group_key":"`+key+`"}]}}`,
-		`{"scenarios":{"case":[{"RULE_ID":"detect","group_key":"`+key+`"}]}}`,
-		`{"scenarios":{"case":[{"rule_id":"detect","GROUP_KEY":"`+key+`"}]}}`,
-		`{"scenarios":{"case":[{"rule_id":"detect","group_key":"`+key+`","unknown":true}]}}`,
+		`{"scenarios":{"case":[` + identity + `]},"Scenarios":{"case":[]}}`,
+		`{"Scenarios":{"case":[]},"scenarios":{"case":[` + identity + `]}}`,
+		`{"scenarios":{"case":[{"rule_id":"must-fire","RULE_ID":"detect","group_key":"` + key + `"}]}}`,
+		`{"scenarios":{"case":[{"RULE_ID":"detect","group_key":"` + key + `"}]}}`,
+		`{"scenarios":{"case":[{"rule_id":"detect","GROUP_KEY":"` + key + `"}]}}`,
+		`{"scenarios":{"case":[{"rule_id":"detect","group_key":"` + key + `","unknown":true}]}}`,
 		`{"scenarios":{"case":[]},"unknown":true}`,
 		`{"scenarios":{"case":[{"rule_id":"detect","group_key":null}]}}`,
 	} {
-		writeTestFile(t,path,content)
-		for _, scenario := range []Scenario{{ID:"case",Matches:[]rules.Alert{}},{ID:"case",Matches:[]rules.Alert{{RuleID:"detect",GroupKey:key}}}} {
-			if comparison, err := compareExpected(path,[]Scenario{scenario}); err == nil { t.Fatalf("case-aliased or unknown schema accepted: %s comparison=%+v",content,comparison) }
+		writeTestFile(t, path, content)
+		for _, scenario := range []Scenario{{ID: "case", Matches: []rules.Alert{}}, {ID: "case", Matches: []rules.Alert{{RuleID: "detect", GroupKey: key}}}} {
+			if comparison, err := compareExpected(path, []Scenario{scenario}); err == nil {
+				t.Fatalf("case-aliased or unknown schema accepted: %s comparison=%+v", content, comparison)
+			}
 		}
 	}
 }

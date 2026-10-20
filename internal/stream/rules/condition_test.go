@@ -19,10 +19,10 @@ func conditionTestCompile(t *testing.T, selection any) predicate {
 
 func TestDetectionFieldSemantics(t *testing.T) {
 	tests := []struct {
-		name string
+		name      string
 		selection any
-		fields map[string]any
-		want bool
+		fields    map[string]any
+		want      bool
 	}{
 		{"exact case-insensitive", map[string]any{"user.name": "ALICE"}, map[string]any{"user.name": "alice"}, true},
 		{"exact not substring", map[string]any{"user.name": "alice"}, map[string]any{"user.name": "alice2"}, false},
@@ -89,11 +89,11 @@ func TestDetectionFieldSemantics(t *testing.T) {
 
 func TestDetectionRegexAndCIDR(t *testing.T) {
 	tests := []struct {
-		name string
-		key string
+		name    string
+		key     string
 		pattern string
-		value any
-		want bool
+		value   any
+		want    bool
 	}{
 		{"regex case-sensitive", "message|re", "evil", "EVIL", false},
 		{"regex searches", "message|re", "evil", "prefix evil suffix", true},
@@ -128,8 +128,8 @@ func TestDetectionRegexAndCIDR(t *testing.T) {
 func TestDetectionConditions(t *testing.T) {
 	tests := []struct {
 		expression any
-		fields map[string]any
-		want bool
+		fields     map[string]any
+		want       bool
 	}{
 		{"a or b and c", map[string]any{"a": true}, true},
 		{"a or b and c", map[string]any{"b": true}, false},
@@ -152,11 +152,11 @@ func TestDetectionConditions(t *testing.T) {
 	for index, test := range tests {
 		t.Run(strconv.Itoa(index), func(t *testing.T) {
 			detection := map[string]any{
-				"a": map[string]any{"a": true},
-				"b": map[string]any{"b": true},
-				"c": map[string]any{"c": true},
-				"notepad": map[string]any{"notepad": true},
-				"_hidden": map[string]any{"hidden": true},
+				"a":         map[string]any{"a": true},
+				"b":         map[string]any{"b": true},
+				"c":         map[string]any{"c": true},
+				"notepad":   map[string]any{"notepad": true},
+				"_hidden":   map[string]any{"hidden": true},
 				"condition": test.expression,
 			}
 			compiled, err := compileDetection(detection)
@@ -172,9 +172,9 @@ func TestDetectionConditions(t *testing.T) {
 
 func TestDetectionRefusesUnsupportedOrAmbiguousInput(t *testing.T) {
 	tests := []struct {
-		name string
+		name      string
 		detection map[string]any
-		reason string
+		reason    string
 	}{
 		{"windash named", map[string]any{"selection": map[string]any{"message|windash": "cmd"}, "condition": "selection"}, "unsupported modifier: windash"},
 		{"unreferenced bad selection", map[string]any{"selection": map[string]any{"message": "x"}, "unused": map[string]any{"message|base64": "x"}, "condition": "selection"}, "base64"},
@@ -271,11 +271,11 @@ func TestDetectionCompilationLimits(t *testing.T) {
 		{"selection": map[string]any{"message": tooManyValues}, "condition": "selection"},
 		{"selection": map[string]any{"message": strings.Repeat("x", 64*1024+1)}, "condition": "selection"},
 		{"selection": selection, "condition": strings.Repeat(" ", 8193)},
-		{"selection": selection, "condition": strings.Repeat("not ", 1024)+"selection"},
-		{"selection": selection, "condition": strings.Repeat("(", 65)+"selection"+strings.Repeat(")", 65)},
+		{"selection": selection, "condition": strings.Repeat("not ", 1024) + "selection"},
+		{"selection": selection, "condition": strings.Repeat("(", 65) + "selection" + strings.Repeat(")", 65)},
 		{"selection": largeNodeTree, "condition": "selection"},
 		{"selection": map[string]any{"message": largePatterns}, "condition": "selection"},
-		{"selection": selection, "condition": []string{strings.Repeat(" ", 4100)+"selection", strings.Repeat(" ", 4100)+"selection"}},
+		{"selection": selection, "condition": []string{strings.Repeat(" ", 4100) + "selection", strings.Repeat(" ", 4100) + "selection"}},
 	}
 	for i, detection := range cases {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
@@ -303,8 +303,8 @@ func TestDetectionCompiledPredicateIsImmutableAndDeterministic(t *testing.T) {
 		}
 	}
 	bad := map[string]any{
-		"z": map[string]any{"message|windash": "x"},
-		"a": map[string]any{"message|base64": "x"},
+		"z":         map[string]any{"message|windash": "x"},
+		"a":         map[string]any{"message|base64": "x"},
 		"condition": "1 of them",
 	}
 	for i := 0; i < 100; i++ {

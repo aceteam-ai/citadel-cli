@@ -25,43 +25,43 @@ import (
 )
 
 const (
-	MaxFiles = 128
+	MaxFiles      = 128
 	MaxTotalBytes = 256 << 20
-	MaxAlerts = 100000
+	MaxAlerts     = 100000
 	// A stable replay stamp, not the date on which the evaluator is run. The
 	// envelope timeline advances one millisecond per input record per source.
 	ReplayEpochNS int64 = 1767225600000000000 // 2026-01-01T00:00:00Z
 )
 
 type Options struct {
-	TimeMode string
+	TimeMode        string
 	AllowedLateness time.Duration
-	ExpectedPath string
+	ExpectedPath    string
 }
 
 type Scenario struct {
-	ID string `json:"id"`
-	SourceID string `json:"source_id"`
-	InputDigest string `json:"input_digest"`
-	Bytes uint64 `json:"bytes"`
-	Events uint64 `json:"events"`
-	Matches []rules.Alert `json:"matches"`
-	Stats rules.EngineStats `json:"stats"`
+	ID          string            `json:"id"`
+	SourceID    string            `json:"source_id"`
+	InputDigest string            `json:"input_digest"`
+	Bytes       uint64            `json:"bytes"`
+	Events      uint64            `json:"events"`
+	Matches     []rules.Alert     `json:"matches"`
+	Stats       rules.EngineStats `json:"stats"`
 }
 
 type Report struct {
-	SchemaVersion string `json:"schema_version"`
-	PackID string `json:"pack_id"`
-	PackVersion string `json:"pack_version"`
-	PackDigest string `json:"pack_digest"`
-	TimeMode string `json:"time_mode"`
-	AllowedLatenessNS int64 `json:"allowed_lateness_ns,string"`
-	ReplayEpochNS int64 `json:"replay_epoch_ns,string"`
-	ReplayStepNS int64 `json:"replay_step_ns,string"`
-	Refused []rules.Refusal `json:"refused"`
-	Scenarios []Scenario `json:"scenarios"`
-	Comparison *Comparison `json:"comparison,omitempty"`
-	OutputDigest string `json:"output_digest,omitempty"`
+	SchemaVersion     string          `json:"schema_version"`
+	PackID            string          `json:"pack_id"`
+	PackVersion       string          `json:"pack_version"`
+	PackDigest        string          `json:"pack_digest"`
+	TimeMode          string          `json:"time_mode"`
+	AllowedLatenessNS int64           `json:"allowed_lateness_ns,string"`
+	ReplayEpochNS     int64           `json:"replay_epoch_ns,string"`
+	ReplayStepNS      int64           `json:"replay_step_ns,string"`
+	Refused           []rules.Refusal `json:"refused"`
+	Scenarios         []Scenario      `json:"scenarios"`
+	Comparison        *Comparison     `json:"comparison,omitempty"`
+	OutputDigest      string          `json:"output_digest,omitempty"`
 }
 
 // Run loads a reviewed pack and evaluates one regular file, or the sorted
@@ -95,16 +95,16 @@ func Run(ctx context.Context, packPath, logsPath string, options Options) (Repor
 	}
 	defer root.Close()
 	report := Report{
-		SchemaVersion: "stream.eval.v1",
-		PackID: pack.Manifest.ID,
-		PackVersion: pack.Manifest.Version,
-		PackDigest: pack.Digest,
-		TimeMode: options.TimeMode,
+		SchemaVersion:     "stream.eval.v1",
+		PackID:            pack.Manifest.ID,
+		PackVersion:       pack.Manifest.Version,
+		PackDigest:        pack.Digest,
+		TimeMode:          options.TimeMode,
 		AllowedLatenessNS: int64(options.AllowedLateness),
-		ReplayEpochNS: ReplayEpochNS,
-		ReplayStepNS: int64(time.Millisecond),
-		Refused: append([]rules.Refusal{}, pack.Refused...),
-		Scenarios: []Scenario{},
+		ReplayEpochNS:     ReplayEpochNS,
+		ReplayStepNS:      int64(time.Millisecond),
+		Refused:           append([]rules.Refusal{}, pack.Refused...),
+		Scenarios:         []Scenario{},
 	}
 	var totalBytes uint64
 	totalAlerts := 0
@@ -252,7 +252,7 @@ func runScenario(ctx context.Context, root *os.Root, name string, sourceIndex in
 		return Scenario{}, errors.New("stream eval input changed while opening")
 	}
 	engine, err := rules.NewEngine(pack, rules.Options{
-		TimeMode: options.TimeMode,
+		TimeMode:        options.TimeMode,
 		AllowedLateness: options.AllowedLateness,
 	})
 	if err != nil {
@@ -288,13 +288,13 @@ func runScenario(ctx context.Context, root *os.Root, name string, sourceIndex in
 			_, _ = inputHash.Write(line)
 			stamp := int64(scenario.Events) * int64(time.Millisecond)
 			meta := event.Envelope{
-				Seq: scenario.Events,
-				TMonoNS: stamp,
-				TWallNS: ReplayEpochNS + stamp,
+				Seq:        scenario.Events,
+				TMonoNS:    stamp,
+				TWallNS:    ReplayEpochNS + stamp,
 				ClockState: "offline_replay",
-				SourceID: name,
-				NodeID: "offline-eval",
-				RawRef: name + ":" + strconv.FormatUint(offset, 10),
+				SourceID:   name,
+				NodeID:     "offline-eval",
+				RawRef:     name + ":" + strconv.FormatUint(offset, 10),
 			}
 			parsed, err := event.Parse(pack.Manifest.Parser, string(line), meta, parserOptions)
 			if err != nil {
