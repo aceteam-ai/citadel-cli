@@ -2800,6 +2800,8 @@ func runWork(cmd *cobra.Command, args []string) {
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !workPerms.Desktop,
 		DesktopEnabled:            nodeDesktopEnabled,
+		DesktopHasPasscode:        nodeHasPasscode,
+		DesktopVerifyPasscode:     nodePasscodeVerifier,
 		FilesDisabled:             !workPerms.Files,
 		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              wfExec,

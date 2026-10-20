@@ -24,6 +24,10 @@ type LegacyHandlerAdapter struct {
 	logFn           func(level, msg string)
 	enabled         func() bool
 	backgroundOwner bool
+	// passcodeGate, when set, is evaluated after the permission check and
+	// before the handler runs. On such an adapter the payload passcode key is
+	// removed, so the handler never sees it.
+	passcodeGate func(presented string) error
 }
 
 // newGatedLegacyHandlerAdapter creates an adapter whose dispatchability follows
@@ -33,6 +37,20 @@ type LegacyHandlerAdapter struct {
 func newGatedLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, enabled func() bool) *LegacyHandlerAdapter {
 	a := NewLegacyHandlerAdapter(jobType, handler)
 	a.enabled = enabled
+	return a
+}
+
+// newDesktopLegacyHandlerAdapter gates a desktop handler on both the live
+// desktop permission and the node passcode (jobs.DesktopGate), the way
+// SHELL_COMMAND is gated on the shell permission and the passcode.
+func newDesktopLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, enabled func() bool, gate jobs.DesktopGate) *LegacyHandlerAdapter {
+	a := newGatedLegacyHandlerAdapter(jobType, handler, enabled)
+	a.passcodeGate = func(presented string) error {
+		if reason := jobs.DesktopGateReason(gate, presented); reason != "" {
+			return jobs.DesktopRefusal(reason)
+		}
+		return nil
+	}
 	return a
 }
 
@@ -134,6 +152,21 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 			}
 		}
 	}
+	if a.passcodeGate != nil {
+		presented := ""
+		if nexusJob.Payload != nil {
+			presented = nexusJob.Payload[jobs.ShellPasscodePayloadKey]
+			// The passcode authorizes this job and is never handler input.
+			delete(nexusJob.Payload, jobs.ShellPasscodePayloadKey)
+		}
+		if err := a.passcodeGate(presented); err != nil {
+			if a.logFn != nil {
+				a.logFn("warn", fmt.Sprintf("Refusing %s job %s: %v", job.Type, job.ID, err))
+			}
+			return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
+		}
+	}
+
 	// Wire throttled progress to the job's stream (aceteam#10876 C1). The throttle
 	// state is per-Execute (local to this call); most handlers never emit, so this
 	// is inert unless the handler calls ctx.EmitProgress (FILE_INDEX today). A
@@ -264,6 +297,14 @@ type LegacyHandlerOpts struct {
 	// desktop handlers stay registered behind a per-dispatch fail-closed gate so
 	// APPLY_DEVICE_CONFIG changes take effect without restarting the worker.
 	DesktopEnabled func() bool
+	// DesktopHasPasscode reports whether a node passcode is configured. When it
+	// does, every desktop job must present the passcode (jobs.DesktopGate).
+	// Required whenever desktop handlers are registered: nil fails closed.
+	DesktopHasPasscode func() bool
+	// DesktopVerifyPasscode checks the passcode a desktop job presents. Required
+	// whenever desktop handlers are registered: nil fails closed on a node with a
+	// passcode set.
+	DesktopVerifyPasscode func(pin string) bool
 	// FilesDisabled, when true, SKIPS registration of the file browse/host job
 	// handlers (FILE_READ/READ_BYTES/WRITE/EDIT/LIST/SEARCH/INDEX/
 	// SEMANTIC_SEARCH). FILE_WRITE_BYTES stays registered in a refusing state
@@ -422,14 +463,18 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	// operator's screen. FILE_SCREENSHOT and VNC_SCREENSHOT share one capture
 	// path (the internal/desktop X11 capture); there is no separate VNC
 	// framebuffer source.
+	// Each desktop job also honors the node passcode, like SHELL_COMMAND: on a
+	// node with a passcode set, the job must present it in its payload
+	// `passcode` field. A node without a passcode is unchanged.
 	if opts.DesktopEnabled != nil || !opts.DesktopDisabled {
 		gate := opts.DesktopEnabled
+		passcode := jobs.DesktopGate{HasPasscode: opts.DesktopHasPasscode, VerifyPasscode: opts.DesktopVerifyPasscode}
 		handlers = append(handlers,
-			newGatedLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}, gate),
+			newDesktopLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}, gate, passcode),
 		)
 	}
 

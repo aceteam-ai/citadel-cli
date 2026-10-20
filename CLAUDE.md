@@ -595,6 +595,16 @@ status plus ACK), even when the delivery metadata permits another attempt.
 The handler checks the live Files policy, but a refused job is terminal. After
 enabling Files, the caller submits a new upload.
 
+A passcode or permission refusal (`*jobs.ShellRefusal`) is terminal on the
+first delivery too, for SHELL_COMMAND, the WORKFLOW_RUN Shell node, and the
+desktop handlers: a retry presents the same payload. The five desktop handlers
+(FILE_SCREENSHOT, VNC_SCREENSHOT, VNC_TYPE, VNC_KEYS, VNC_ACTIONS) honor the node
+passcode like SHELL_COMMAND: `jobs.DesktopGateReason` runs in their adapter
+(`newDesktopLegacyHandlerAdapter`) after the live desktop permission check, a
+node without a passcode is unchanged, and the payload `passcode` key is removed
+before the handler sees the payload. `internal/worker/desktop_gate_test.go` pins
+this.
+
 `Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
 a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before
 the normal blocking read. A successful claim increments the Redis-native

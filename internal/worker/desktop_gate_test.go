@@ -1,0 +1,222 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+)
+
+const testNodePasscode = "secret-4821"
+
+// recordingDesktopHandler stands in for a desktop handler and records the
+// payload it was given.
+type recordingDesktopHandler struct {
+	mu       sync.Mutex
+	payloads []map[string]string
+}
+
+func (h *recordingDesktopHandler) Execute(_ jobs.JobContext, job *nexus.Job) ([]byte, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	copied := map[string]string{}
+	for k, v := range job.Payload {
+		copied[k] = v
+	}
+	h.payloads = append(h.payloads, copied)
+	return []byte("ok"), nil
+}
+
+func (h *recordingDesktopHandler) calls() []map[string]string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.payloads
+}
+
+func passcodeGate(hasPasscode bool) jobs.DesktopGate {
+	return jobs.DesktopGate{
+		HasPasscode:    func() bool { return hasPasscode },
+		VerifyPasscode: func(pin string) bool { return pin == testNodePasscode },
+	}
+}
+
+func TestDesktopAdapterHonorsNodePasscode(t *testing.T) {
+	enabled := func() bool { return true }
+	for _, tc := range []struct {
+		name        string
+		hasPasscode bool
+		payload     map[string]any
+		wantRefused bool
+	}{
+		{"no passcode set runs unchanged", false, map[string]any{"actions": "[]"}, false},
+		{"passcode set and absent is refused", true, map[string]any{"actions": "[]"}, true},
+		{"passcode set and wrong is refused", true, map[string]any{"actions": "[]", "passcode": "0000"}, true},
+		{"passcode set and correct runs", true, map[string]any{"actions": "[]", "passcode": testNodePasscode}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &recordingDesktopHandler{}
+			var logs []string
+			a := newDesktopLegacyHandlerAdapter(JobTypeVNCActions, handler, enabled, passcodeGate(tc.hasPasscode))
+			a.SetLogFn(func(level, msg string) { logs = append(logs, level+" "+msg) })
+			result, err := a.Execute(context.Background(), &Job{ID: "d1", Type: JobTypeVNCActions, Payload: tc.payload}, nil)
+
+			if tc.wantRefused {
+				var refusal *jobs.ShellRefusal
+				if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeInvalid {
+					t.Fatalf("err = %v, want a passcode_invalid refusal", err)
+				}
+				if result == nil || result.Status != JobStatusFailure {
+					t.Fatalf("result = %+v, want a failure result", result)
+				}
+				if len(handler.calls()) != 0 {
+					t.Fatal("a refused desktop job must never reach the handler")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				calls := handler.calls()
+				if len(calls) != 1 {
+					t.Fatalf("handler calls = %d, want 1", len(calls))
+				}
+				if _, ok := calls[0][jobs.ShellPasscodePayloadKey]; ok {
+					t.Fatal("the payload passcode must not reach the desktop handler")
+				}
+				if calls[0]["actions"] != "[]" {
+					t.Fatalf("handler payload lost its other fields: %#v", calls[0])
+				}
+			}
+			for _, line := range logs {
+				if strings.Contains(line, testNodePasscode) {
+					t.Fatalf("log line leaks the passcode: %q", line)
+				}
+			}
+			if err != nil && strings.Contains(err.Error(), testNodePasscode) {
+				t.Fatalf("error leaks the passcode: %v", err)
+			}
+		})
+	}
+}
+
+func TestDesktopAdapterPermissionGateRunsFirst(t *testing.T) {
+	handler := &recordingDesktopHandler{}
+	a := newDesktopLegacyHandlerAdapter(JobTypeVNCKeys, handler, func() bool { return false }, passcodeGate(true))
+	_, err := a.Execute(context.Background(), &Job{ID: "d2", Type: JobTypeVNCKeys, Payload: map[string]any{"passcode": testNodePasscode}}, nil)
+	var refusal *jobs.ShellRefusal
+	if err == nil || errors.As(err, &refusal) {
+		t.Fatalf("a disabled desktop permission must refuse before the passcode gate, got %v", err)
+	}
+	if len(handler.calls()) != 0 {
+		t.Fatal("a disabled desktop job must never reach the handler")
+	}
+}
+
+func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		DesktopEnabled:        func() bool { return true },
+		DesktopHasPasscode:    func() bool { return true },
+		DesktopVerifyPasscode: func(pin string) bool { return pin == testNodePasscode },
+	})
+	for _, jobType := range []string{JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions} {
+		var h JobHandler
+		for _, candidate := range handlers {
+			if candidate.CanHandle(jobType) {
+				h = candidate
+				break
+			}
+		}
+		if h == nil {
+			t.Fatalf("%s is not registered with desktop enabled", jobType)
+		}
+		_, err := h.Execute(context.Background(), &Job{ID: "g-" + jobType, Type: jobType, Payload: map[string]any{}}, nil)
+		var refusal *jobs.ShellRefusal
+		if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeInvalid {
+			t.Fatalf("%s without the passcode: err = %v, want passcode_invalid", jobType, err)
+		}
+	}
+}
+
+func TestCreateLegacyHandlersDesktopFailsClosedWithoutPasscodeWiring(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{DesktopEnabled: func() bool { return true }})
+	for _, candidate := range handlers {
+		if !candidate.CanHandle(JobTypeVNCActions) {
+			continue
+		}
+		_, err := candidate.Execute(context.Background(), &Job{ID: "nil-gate", Type: JobTypeVNCActions, Payload: map[string]any{}}, nil)
+		var refusal *jobs.ShellRefusal
+		if !errors.As(err, &refusal) {
+			t.Fatalf("unwired passcode gate must refuse, got %v", err)
+		}
+		return
+	}
+	t.Fatal("VNC_ACTIONS not registered")
+}
+
+func TestRunnerPasscodeRefusalIsTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		metadata JobMetadata
+	}{
+		{"first_redis_delivery", JobMetadata{Attempts: 1, MaxAttempts: 3}},
+		{"without_delivery_metadata", JobMetadata{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := NewMockJobSource("test", nil)
+			handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+				DesktopEnabled:        func() bool { return true },
+				DesktopHasPasscode:    func() bool { return true },
+				DesktopVerifyPasscode: func(pin string) bool { return pin == testNodePasscode },
+			})
+			runner := NewRunner(source, handlers, RunnerConfig{WorkerID: "test-worker"})
+			stream := &MockStreamWriter{}
+			job := &Job{ID: "refused-desktop", Type: JobTypeVNCScreenshot, Payload: map[string]any{"passcode": "wrong"}, Metadata: tc.metadata}
+
+			if runner.executeJob(context.Background(), job, stream, time.Now(), false, 0) {
+				t.Fatal("a passcode refusal must not report job success")
+			}
+			if stream.errorCount != 1 || stream.endCount != 0 || stream.erroredRecover {
+				t.Fatalf("want exactly one non-recoverable error: errors=%d ends=%d recoverable=%v", stream.errorCount, stream.endCount, stream.erroredRecover)
+			}
+			var refusal struct {
+				Reason string `json:"reason"`
+			}
+			if err := json.Unmarshal([]byte(stream.erroredErr.Error()), &refusal); err != nil || refusal.Reason != jobs.ReasonPasscodeInvalid {
+				t.Fatalf("terminal event lost the typed refusal: reason=%q err=%v", refusal.Reason, err)
+			}
+			if len(source.FailedJobs()) != 1 || len(source.NackedJobs()) != 0 || len(source.AckedJobs()) != 0 {
+				t.Fatalf("want source.Fail, never Nack or success Ack: failed=%d nacked=%d acked=%d", len(source.FailedJobs()), len(source.NackedJobs()), len(source.AckedJobs()))
+			}
+			if source.FailedData()[0]["reason"] != jobs.ReasonPasscodeInvalid {
+				t.Fatalf("failed-job metadata lost the reason: %#v", source.FailedData())
+			}
+		})
+	}
+}
+
+func TestRunnerShellPasscodeRefusalIsTerminal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SHELL_COMMAND is not registered on Windows")
+	}
+	source := NewMockJobSource("test", nil)
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ShellEnabled:        func() bool { return true },
+		ShellHasPasscode:    func() bool { return true },
+		ShellVerifyPasscode: func(pin string) bool { return pin == testNodePasscode },
+	})
+	runner := NewRunner(source, handlers, RunnerConfig{WorkerID: "test-worker"})
+	stream := &MockStreamWriter{}
+	job := &Job{ID: "refused-shell", Type: JobTypeShellCommand, Payload: map[string]any{"command": "true"}, Metadata: JobMetadata{Attempts: 1, MaxAttempts: 3}}
+	if runner.executeJob(context.Background(), job, stream, time.Now(), false, 0) {
+		t.Fatal("a passcode refusal must not report job success")
+	}
+	if stream.errorCount != 1 || len(source.FailedJobs()) != 1 || len(source.NackedJobs()) != 0 {
+		t.Fatalf("shell refusal must be terminal: errors=%d failed=%d nacked=%d", stream.errorCount, len(source.FailedJobs()), len(source.NackedJobs()))
+	}
+}
