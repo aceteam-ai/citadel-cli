@@ -617,6 +617,19 @@ job type, so it is never written to a dead-letter entry or a log.
 `internal/worker/desktop_gate_test.go`, `cmd/passcode_state_test.go` and
 `internal/redis/passcode_privacy_test.go` pin this.
 
+`jobs.PasscodeThrottle` limits wrong passcodes across those surfaces: one
+process-wide instance (`cmd.nodePasscodeThrottle`) is shared by SHELL_COMMAND,
+the WORKFLOW_RUN Shell gate and the desktop gate, so failures on one count for
+all. After `DefaultPasscodeMaxFailures` within the window, every passcode-gated
+job is refused with `passcode_throttled` for the cooldown without checking the
+passcode. It is in memory, so a worker restart resets it. A master-PIN vault
+lockout is a separate reason, `passcode_locked`: `cmd.vaultPasscodeVerdict`
+maps `nodevault.IsLockedOut` to `jobs.PasscodeLockedOut`, so a correct
+passcode presented during a vault lockout is never reported as
+`passcode_invalid`, and a lockout refusal does not count toward the throttle.
+Only node passcodes presented in job payloads are throttled; the gateway's HTTP
+passcode checks are not.
+
 `Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
 a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before
 the normal blocking read. A successful claim increments the Redis-native

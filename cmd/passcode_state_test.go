@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
 )
 
@@ -26,7 +27,7 @@ func TestPasscodeStateFromFailsClosedOnUnreadableState(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, err = passcodeStateFrom(permsDir, nodevault.Open(t.TempDir()))
-	if err != nil || !st.Set || !st.Verify("4821-pass") || st.Verify("wrong") {
+	if err != nil || !st.Set || st.Check("4821-pass") != jobs.PasscodeMatch || st.Check("wrong") != jobs.PasscodeMismatch {
 		t.Fatalf("legacy passcode: state = %+v, %v", st, err)
 	}
 
@@ -46,5 +47,28 @@ func TestPasscodeStateFromFailsClosedOnUnreadableState(t *testing.T) {
 	}
 	if _, err := passcodeStateFrom(t.TempDir(), nodevault.Open(notADir)); err == nil {
 		t.Fatal("an unreadable vault must be an error")
+	}
+}
+
+func TestVaultPasscodeVerdictReportsLockoutSeparately(t *testing.T) {
+	vault := nodevault.Open(t.TempDir())
+	if err := vault.SetPIN("correct-horse-battery-1", nodevault.DefaultPolicy(), true); err != nil {
+		t.Fatal(err)
+	}
+	if got := vaultPasscodeVerdict(vault, "correct-horse-battery-1"); got != jobs.PasscodeMatch {
+		t.Fatalf("correct PIN: %v", got)
+	}
+	if got := vaultPasscodeVerdict(vault, ""); got != jobs.PasscodeMismatch {
+		t.Fatalf("empty PIN: %v", got)
+	}
+	locked := false
+	for i := 0; i < 20 && !locked; i++ {
+		locked = vaultPasscodeVerdict(vault, "wrong-pin-attempt") == jobs.PasscodeLockedOut
+	}
+	if !locked {
+		t.Fatal("repeated wrong PINs never reached the vault lockout")
+	}
+	if got := vaultPasscodeVerdict(vault, "correct-horse-battery-1"); got != jobs.PasscodeLockedOut {
+		t.Fatalf("a correct PIN during lockout must be PasscodeLockedOut, not a mismatch: %v", got)
 	}
 }

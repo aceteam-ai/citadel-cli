@@ -11,7 +11,7 @@ func TestDesktopGateReason(t *testing.T) {
 	const pin = "4821"
 	verify := func(p string) bool { return p == pin }
 	state := func(set bool, v func(string) bool) func() (PasscodeState, error) {
-		return func() (PasscodeState, error) { return PasscodeState{Set: set, Verify: v}, nil }
+		return func() (PasscodeState, error) { return PasscodeState{Set: set, Check: BoolCheck(v)}, nil }
 	}
 	for _, tc := range []struct {
 		name      string
@@ -25,7 +25,7 @@ func TestDesktopGateReason(t *testing.T) {
 		{"passcode set, wrong one presented", DesktopGate{Load: state(true, verify)}, "0000", ReasonPasscodeInvalid},
 		{"passcode set, correct one presented", DesktopGate{Load: state(true, verify)}, pin, ""},
 		{"nil Load refuses", DesktopGate{}, pin, ReasonPasscodeUnavailable},
-		{"nil Verify with a passcode set refuses", DesktopGate{Load: state(true, nil)}, pin, ReasonPasscodeInvalid},
+		{"nil Check with a passcode set refuses", DesktopGate{Load: state(true, nil)}, pin, ReasonPasscodeInvalid},
 		{"a read error refuses even with the correct passcode", DesktopGate{Load: func() (PasscodeState, error) {
 			return PasscodeState{}, errors.New("permission denied")
 		}}, pin, ReasonPasscodeUnavailable},
@@ -42,7 +42,7 @@ func TestDesktopGateReadsStateOncePerDecision(t *testing.T) {
 	loads := 0
 	g := DesktopGate{Load: func() (PasscodeState, error) {
 		loads++
-		return PasscodeState{Set: true, Verify: func(p string) bool { return p == "1" }}, nil
+		return PasscodeState{Set: true, Check: BoolCheck(func(p string) bool { return p == "1" })}, nil
 	}}
 	DesktopGateReason(g, "1")
 	if loads != 1 {

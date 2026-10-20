@@ -15,9 +15,9 @@ const msgPasscodeUnavailable = "the node could not read its passcode configurati
 type PasscodeState struct {
 	// Set reports whether a node passcode or master PIN is configured.
 	Set bool
-	// Verify checks a presented passcode against that configuration. A nil
-	// Verify refuses.
-	Verify func(pin string) bool
+	// Check checks a presented passcode against that configuration, reporting a
+	// master-PIN lockout separately from a wrong passcode. A nil Check refuses.
+	Check func(pin string) PasscodeVerdict
 }
 
 // DesktopGate is the per-node passcode gate for the screen/VNC/desktop job
@@ -32,11 +32,14 @@ type DesktopGate struct {
 	// passcode set runs desktop jobs unchanged, so a read failure must be
 	// returned as an error, never as Set=false. A nil Load refuses.
 	Load func() (PasscodeState, error)
+	// Throttle is the node's shared wrong-passcode throttle. Nil never
+	// throttles.
+	Throttle *PasscodeThrottle
 }
 
 // DesktopGateReason applies the gate to a presented passcode. It returns "" when
-// the job may run, otherwise ReasonPasscodeUnavailable or
-// ReasonPasscodeInvalid. A node with no passcode allows every desktop job, as
+// the job may run, otherwise ReasonPasscodeUnavailable, ReasonPasscodeThrottled,
+// ReasonPasscodeLocked or ReasonPasscodeInvalid. A node with no passcode allows every desktop job, as
 // before the gate existed.
 func DesktopGateReason(g DesktopGate, presentedPasscode string) string {
 	if g.Load == nil {
@@ -49,18 +52,20 @@ func DesktopGateReason(g DesktopGate, presentedPasscode string) string {
 	if !state.Set {
 		return ""
 	}
-	if state.Verify == nil || !state.Verify(presentedPasscode) {
-		return ReasonPasscodeInvalid
-	}
-	return ""
+	return checkPasscode(g.Throttle, state.Check, presentedPasscode)
 }
 
 // DesktopRefusal builds the typed refusal for a desktop job that failed
 // DesktopGateReason. It reuses ShellRefusal so the platform parses the same
 // {"reason","message"} shape for every passcode-gated surface.
 func DesktopRefusal(reason string) *ShellRefusal {
-	if reason == ReasonPasscodeUnavailable {
+	switch reason {
+	case ReasonPasscodeUnavailable:
 		return &ShellRefusal{Reason: reason, Message: msgPasscodeUnavailable}
+	case ReasonPasscodeThrottled:
+		return &ShellRefusal{Reason: reason, Message: msgPasscodeThrottled}
+	case ReasonPasscodeLocked:
+		return &ShellRefusal{Reason: reason, Message: msgPasscodeLocked}
 	}
 	return &ShellRefusal{Reason: reason, Message: msgDesktopPasscodeInvalid}
 }

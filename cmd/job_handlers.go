@@ -23,6 +23,11 @@ var jobHandlers map[string]jobs.JobHandler
 // Wired into the SHELL_COMMAND handler so an ENABLED shell still fails closed
 // unless the correct node passcode is presented. VerifyPasscode itself fails
 // closed (no passcode set, or empty/wrong pin, returns false).
+// nodePasscodeThrottle is the process-wide wrong-passcode throttle shared by
+// every passcode-gated job surface (SHELL_COMMAND, the WORKFLOW_RUN Shell node,
+// the desktop handlers).
+var nodePasscodeThrottle = jobs.NewPasscodeThrottle()
+
 func nodePasscodeVerifier(pin string) bool {
 	return loadNodePermissions().VerifyPasscode(pin)
 }
@@ -57,11 +62,41 @@ func passcodeStateFrom(permissionsDir string, vault *nodevault.Vault) (jobs.Pass
 		return jobs.PasscodeState{}, err
 	}
 	if vaultSet {
-		return jobs.PasscodeState{Set: true, Verify: func(pin string) bool { return pin != "" && vault.VerifyPIN(pin) == nil }}, nil
+		return jobs.PasscodeState{Set: true, Check: func(pin string) jobs.PasscodeVerdict { return vaultPasscodeVerdict(vault, pin) }}, nil
 	}
 	// The vault was just checked, so verify the legacy hash directly rather
 	// than through the master-PIN hooks, which consult the vault again.
-	return jobs.PasscodeState{Set: perms.PasscodeHash != "", Verify: perms.VerifyLegacyPasscode}, nil
+	return jobs.PasscodeState{Set: perms.PasscodeHash != "", Check: jobs.BoolCheck(perms.VerifyLegacyPasscode)}, nil
+}
+
+// vaultPasscodeVerdict checks pin against the master-PIN vault, reporting a
+// vault lockout as PasscodeLockedOut rather than a wrong passcode. An empty pin
+// is a mismatch and is not counted by the vault.
+func vaultPasscodeVerdict(vault *nodevault.Vault, pin string) jobs.PasscodeVerdict {
+	if pin == "" {
+		return jobs.PasscodeMismatch
+	}
+	err := vault.VerifyPIN(pin)
+	switch {
+	case err == nil:
+		return jobs.PasscodeMatch
+	case nodevault.IsLockedOut(err):
+		return jobs.PasscodeLockedOut
+	default:
+		return jobs.PasscodeMismatch
+	}
+}
+
+// nodePasscodeCheck is the lockout-aware passcode check for SHELL_COMMAND and
+// the workflow Shell gate. Like nodePasscodeVerifier it reloads state per call;
+// unlike it, a master-PIN lockout is reported as PasscodeLockedOut, so a
+// correct passcode is never refused as passcode_invalid during a lockout.
+func nodePasscodeCheck(pin string) jobs.PasscodeVerdict {
+	vault := masterVault()
+	if vault.IsConfigured() {
+		return vaultPasscodeVerdict(vault, pin)
+	}
+	return jobs.BoolCheck(loadNodePermissions().VerifyLegacyPasscode)(pin)
 }
 
 // nodeShellEnabled is the live shell kill-switch. Reloading the small

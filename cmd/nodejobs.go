@@ -76,6 +76,10 @@ type nodeJobHandlerOpts struct {
 	// DesktopPasscodeState gates desktop jobs on the node passcode, like
 	// SHELL_COMMAND. Required whenever desktop is enabled; nil refuses.
 	DesktopPasscodeState func() (jobs.PasscodeState, error)
+	// ShellPasscodeCheck is the lockout-aware passcode check for SHELL_COMMAND.
+	ShellPasscodeCheck func(pin string) jobs.PasscodeVerdict
+	// PasscodeThrottle is the node's shared wrong-passcode throttle.
+	PasscodeThrottle *jobs.PasscodeThrottle
 	// FilesDisabled skips registration of the file browse/host handlers
 	// (aceteam#6524). Wired from the persisted `files` node permission
 	// (default-DENY on a fresh node).
@@ -129,6 +133,8 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 		DesktopDisabled:           opts.DesktopDisabled,
 		DesktopEnabled:            opts.DesktopEnabled,
 		DesktopPasscodeState:      opts.DesktopPasscodeState,
+		ShellPasscodeCheck:        opts.ShellPasscodeCheck,
+		PasscodeThrottle:          opts.PasscodeThrottle,
 		FilesDisabled:             opts.FilesDisabled,
 		FilesEnabled:              opts.FilesEnabled,
 	})

@@ -43,7 +43,7 @@ func (h *recordingDesktopHandler) calls() []map[string]string {
 
 func passcodeState(hasPasscode bool) func() (jobs.PasscodeState, error) {
 	return func() (jobs.PasscodeState, error) {
-		return jobs.PasscodeState{Set: hasPasscode, Verify: func(pin string) bool { return pin == testNodePasscode }}, nil
+		return jobs.PasscodeState{Set: hasPasscode, Check: jobs.BoolCheck(func(pin string) bool { return pin == testNodePasscode })}, nil
 	}
 }
 
@@ -250,4 +250,58 @@ func TestWorkerJobRenderingOmitsTheNodePasscode(t *testing.T) {
 			t.Fatalf("job rendering retained the passcode: %s", rendered)
 		}
 	}
+}
+
+func TestLegacyHandlersShareOnePasscodeThrottle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SHELL_COMMAND is not registered on Windows")
+	}
+	throttle := jobs.NewPasscodeThrottle()
+	verify := func(pin string) bool { return pin == testNodePasscode }
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ShellEnabled: func() bool { return true }, ShellHasPasscode: func() bool { return true }, ShellVerifyPasscode: verify,
+		DesktopEnabled: func() bool { return true }, DesktopPasscodeState: passcodeState(true),
+		PasscodeThrottle: throttle,
+	})
+	find := func(jobType string) JobHandler {
+		for _, h := range handlers {
+			if h.CanHandle(jobType) {
+				return h
+			}
+		}
+		t.Fatalf("%s not registered", jobType)
+		return nil
+	}
+	shell, desktop := find(JobTypeShellCommand), find(JobTypeVNCActions)
+	for i := 0; i < jobs.DefaultPasscodeMaxFailures; i++ {
+		_, _ = shell.Execute(context.Background(), &Job{ID: "s", Type: JobTypeShellCommand, Payload: map[string]any{"command": "true", "passcode": "wrong"}}, nil)
+	}
+	_, err := desktop.Execute(context.Background(), &Job{ID: "d", Type: JobTypeVNCActions, Payload: map[string]any{"passcode": testNodePasscode}}, nil)
+	var refusal *jobs.ShellRefusal
+	if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeThrottled {
+		t.Fatalf("shell failures must throttle desktop jobs too, got %v", err)
+	}
+}
+
+func TestShellPasscodeCheckReportsLockout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SHELL_COMMAND is not registered on Windows")
+	}
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ShellEnabled: func() bool { return true }, ShellHasPasscode: func() bool { return true },
+		ShellVerifyPasscode: func(string) bool { return false },
+		ShellPasscodeCheck:  func(string) jobs.PasscodeVerdict { return jobs.PasscodeLockedOut },
+	})
+	for _, h := range handlers {
+		if !h.CanHandle(JobTypeShellCommand) {
+			continue
+		}
+		_, err := h.Execute(context.Background(), &Job{ID: "l", Type: JobTypeShellCommand, Payload: map[string]any{"command": "true", "passcode": testNodePasscode}}, nil)
+		var refusal *jobs.ShellRefusal
+		if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeLocked {
+			t.Fatalf("a vault lockout must refuse as passcode_locked, got %v", err)
+		}
+		return
+	}
+	t.Fatal("SHELL_COMMAND not registered")
 }
