@@ -1,6 +1,8 @@
 # Engine, model and module licensing: a design
 
-Status: DESIGN ONLY (2026-10-19). Nothing here is implemented. Follows up
+Status: DESIGN ONLY (2026-10-19). Nothing here is implemented. Owner
+decisions on section 3 were recorded on 2026-10-20 (see section 3 and #1377):
+the first build slice surfaces licence labels only and enforces nothing. Follows up
 `docs/design-engine-adapter.md` section "Prior art: LocalAI", which proposed a
 single `EngineSpec.License` field. This doc argues that one field is the wrong
 shape and proposes what to build instead.
@@ -278,7 +280,7 @@ simply omit the new object and the platform's "absent means None" rule holds.
 | P0 | Licence table + normalizer + fold, in all three languages; normalize `fabric_catalog_models.license` and `model_catalog.json` (data migration, Jason sign-off); every citadel-services `service.yaml` and every `ServiceMap` engine gets a `license.{code,weights}` block; catalog tests fail on a missing block | Jason approves the table and the `LicenseRef-` list |
 | P1 | Per-model resolution: diffusers licence into `MEDIA_GENERATE` output, catalog pin into `llm_inference` output, `ModelLicenses` on the heartbeat, `license_drift` from the pull record, chips read the object | P0 merged |
 | P2 | Receipts and usage: unsigned `license` + `license_hash` beside `aep_receipt`; `UsageRecord` columns; `fabric_run_work` ingest | P1; aceteam#9287 verifier told to ignore the sibling |
-| P3 | Policy: node acceptance file + `citadel license accept`; org policy enum; marketplace default exclusion; signed `license_hash` rides the v3 JCS cutover | Jason decides section 3 items 1, 3, 4 |
+| P3 | Policy: node acceptance file + `citadel license accept`; org policy enum; marketplace default exclusion; signed `license_hash` rides the v3 JCS cutover | Section 3 decided 2026-10-20; the enforcement parts (org `block`, marketplace exclusion) wait for a new decision under the surface-only override |
 
 ### 2i. Testing
 
@@ -305,23 +307,26 @@ content filter; DRM; retroactive relabeling of already-published artifacts
 render time"). The product labels and records; Jason, with counsel, decides what
 any label means for the business.
 
-## 3. Open questions for Jason
+## 3. Owner decisions (2026-10-20)
 
-1. **Should any licence ever hard-block at the org layer?** Recommendation:
-   ship the enum defaulting to `label`, build `block` but leave it off.
-2. **Default for `unknown` weights on a running engine**: label as
-   "unverified" only (recommended), or also warn in the run record?
-3. **Marketplace default exclusion** of `forbidden`/`unknown` weights (2g):
-   yes, no, or opt-in per listing? This is the one place the design proposes a
-   default refusal.
-4. **Licence in signed receipts now or at v3?** Recommendation: unsigned
-   sibling now, signed `license_hash` at the JCS cutover.
-5. **Acceptance UX**: per-node CLI + device config only, or also a per-org
-   acceptance screen with who/when? And does a node-owner acceptance ever
-   satisfy a consuming org's policy (recommendation: never)?
-6. **Who reviews catalog licence pins**: Jason alone, or a `license-review`
-   label on the catalog PR with a named second reviewer?
-7. **paw-compile weights**: keep shipping with `LicenseRef-None-Declared` and
-   an unverified chip, or pull the module until upstream declares terms?
-8. **Data migration** of `fabric_catalog_models.license` and `model_catalog.json`
-   to normalized ids needs your sign-off (DB change).
+Jason accepted all eight recommendations, with one override: **surface only,
+no enforcement for now.** Nothing refuses, gates or excludes until a later
+decision. The held build slice is #1377.
+
+1. **Hard-block at the org layer.** The org policy enum defaults to `label`.
+   `block` is designed (2f) but not built in the first slice.
+2. **Unknown weights on a running engine.** Labelled "unverified" only.
+3. **Marketplace default exclusion** of `forbidden`/`unknown` weights (2g).
+   Accepted in principle, but **not built now**, because it is enforcement.
+4. **Licence in receipts.** An unsigned licence sibling now; a signed
+   `license_hash` at the v3 JCS cutover.
+5. **Acceptance UX.** Per-node CLI plus device config first; a per-org
+   acceptance screen later. A node owner's acceptance never satisfies a
+   consuming org's policy.
+6. **Catalog licence pins.** A `license-review` label on the catalog PR plus a
+   named second reviewer (Jason by default).
+7. **paw-compile weights.** Keep shipping with `LicenseRef-None-Declared` and
+   an "unverified" chip.
+8. **Data migration** of `fabric_catalog_models.license` and
+   `model_catalog.json` to normalized ids. Approved in principle; the exact SQL
+   needs Jason's sign-off before it runs (aceteam side).
