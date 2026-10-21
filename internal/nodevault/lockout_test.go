@@ -114,7 +114,7 @@ func TestNormalizeLockoutWindowBoundaryAndClockRollback(t *testing.T) {
 	original := []time.Time{future, now.Add(-failureWindow), recent, now.Add(-failureWindow - time.Nanosecond)}
 	s := normalizeLockout(lockoutState{
 		FailedAttempts: 99, FailureTimes: original,
-		LockoutUntil: until, LastVerifiedAt: verified,
+		LockoutUntil:   until, LastVerifiedAt: verified,
 	}, now)
 	if s.FailedAttempts != 2 || !reflect.DeepEqual(s.FailureTimes, []time.Time{recent, future}) {
 		t.Fatalf("bad boundary pruning: %+v", s)
@@ -212,7 +212,7 @@ func TestExpiredHistoryDoesNotClearActiveLockout(t *testing.T) {
 	now := time.Now()
 	until := now.Add(time.Hour)
 	if err := v.writeLockout(lockoutState{
-		FailureTimes: []time.Time{now.Add(-failureWindow - time.Minute)},
+		FailureTimes:   []time.Time{now.Add(-failureWindow - time.Minute)},
 		FailedAttempts: 1, LockoutUntil: until,
 	}); err != nil {
 		t.Fatal(err)
