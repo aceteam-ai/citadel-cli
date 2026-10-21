@@ -113,8 +113,10 @@ func TestNormalizeLockoutWindowBoundaryAndClockRollback(t *testing.T) {
 	future := now.Add(time.Hour)
 	original := []time.Time{future, now.Add(-failureWindow), recent, now.Add(-failureWindow - time.Nanosecond)}
 	s := normalizeLockout(lockoutState{
-		FailedAttempts: 99, FailureTimes: original,
-		LockoutUntil:   until, LastVerifiedAt: verified,
+		FailedAttempts: 99,
+		FailureTimes:   original,
+		LockoutUntil:   until,
+		LastVerifiedAt: verified,
 	}, now)
 	if s.FailedAttempts != 2 || !reflect.DeepEqual(s.FailureTimes, []time.Time{recent, future}) {
 		t.Fatalf("bad boundary pruning: %+v", s)
@@ -130,14 +132,16 @@ func TestNormalizeLockoutWindowBoundaryAndClockRollback(t *testing.T) {
 func TestNormalizeLockoutKeepsNewest64AndMirrorsCount(t *testing.T) {
 	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
 	history := make([]time.Time, 0)
-	for i := 0; i < maxFailureHistory+20; i++ {
-		history = append(history, now.Add(-time.Duration(i)*time.Second))
+	limit := maxFailureHistory + 20
+	for i := 0; i < limit; i++ {
+		age := time.Duration(i) * time.Second
+		history = append(history, now.Add(-age))
 	}
 	s := normalizeLockout(lockoutState{FailureTimes: history, FailedAttempts: 999}, now)
 	if len(s.FailureTimes) != maxFailureHistory || s.FailedAttempts != maxFailureHistory {
 		t.Fatalf("unbounded/stale count: %+v", s)
 	}
-	if !s.FailureTimes[0].Equal(now.Add(-time.Duration(maxFailureHistory-1)*time.Second)) || !s.FailureTimes[maxFailureHistory-1].Equal(now) {
+	if !s.FailureTimes[0].Equal(history[maxFailureHistory-1]) || !s.FailureTimes[maxFailureHistory-1].Equal(now) {
 		t.Fatal("retained oldest rather than newest failures")
 	}
 	if backoff(s.FailedAttempts) != lockoutCap {
@@ -213,7 +217,8 @@ func TestExpiredHistoryDoesNotClearActiveLockout(t *testing.T) {
 	until := now.Add(time.Hour)
 	if err := v.writeLockout(lockoutState{
 		FailureTimes:   []time.Time{now.Add(-failureWindow - time.Minute)},
-		FailedAttempts: 1, LockoutUntil: until,
+		FailedAttempts: 1,
+		LockoutUntil:   until,
 	}); err != nil {
 		t.Fatal(err)
 	}
