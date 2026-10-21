@@ -68,12 +68,35 @@ standalone build, toolchain or dependency download, model or service execution.
 
 ## Reuse for multi-reference video
 
-V1 remains the exact source/mask schema above. The source design choice for
-#1374 is a separately reviewed **v2** for multi-reference cardinality/roles,
-not adding a new v1 role or silently reinterpreting an existing envelope.
-V2 must reuse `ValidPath`; bounds, reference identity/order, permissions and
-transport still need their own reviewed contract. No v2 parser, new task or
-live producer is activated here.
+V1 remains the exact source/mask schema above. #1374 needs a separately reviewed
+versioned extension, not a new v1 role or a relaxed two-descriptor parser.
+The [paired #11825 DoR](https://github.com/aceteam-ai/aceteam/issues/11825#issuecomment-6294090893)
+calls that extension **v1.1**, but explicitly leaves the exact discriminator,
+envelope bound, capability advertisement and shared fixture to joint ratification
+by automated-aceteam and automated-citadel. An earlier local **v2** proposal was
+not a settled contract choice. Do not implement either spelling from this doc.
+
+That DoR and [Jason's recorded input/lifecycle decisions](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290189919)
+already settle the relevant bounds: one source for `image-to-video`, ordered
+1..8 references for `ref-to-video`, 16 MiB and 16,777,216 pixels per image,
+128 MiB total reference bytes, a 176 MiB reference sidecar request cap and one
+reference snapshot holder. These are not new product questions. Use the shared
+admission boundary rather than permitting independent edit/video holder pools.
+The [recorded output decision](https://github.com/aceteam-ai/aceteam/issues/11825#issuecomment-6293720735)
+requires the same single-use media-output upload route for both conditioned
+video tasks: **no input or output video/image bytes cross Redis** on this path.
+The legacy text-only bytes remain unchanged.
+
+The extension must reuse `ValidPath`, frozen-byte acquisition and the existing
+permission/publication lifecycle, never workspace staging or a container bind.
+Its implementation starts only after #1314 C5 and the paired contract gates.
+The sole shared fixture must be extended and repinned jointly, not forked.
+Main's accepted C1a input-only fixture is SHA-256
+`e386064cb2c371cadc8bdc4eb6475adf78510a14fa9ae9aac450bcd830c185e0`;
+this draft's lexical/refusal follow-ups use
+`6d19921e8d842ecd00dfba709ad073eacc0511dce7f12e9c2107b0e0f8fcca1e`,
+which is not yet paired platform ratification. Neither pin covers upload/results
+or video activation. No extended parser, new task or live producer is activated.
 
 The #1392/#1393 hard-link count and ownership questions remain acquisition-policy
 gates. The inactive Linux freezer separately pins the leaf with `O_PATH` and
