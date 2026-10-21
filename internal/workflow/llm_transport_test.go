@@ -278,14 +278,23 @@ func TestLLMCallerCancellationDoesNotWaitForDetachedDial(t *testing.T) {
 
 func TestLLMBodyReadCancellationAndNetworkErrorPrivacy(t *testing.T) {
 	ready := make(chan struct{})
+	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain our tiny owned POST before waiting for disconnect: the server's
+		// background connection reader may otherwise be held by the unread body.
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
 		w.Header().Set("Content-Length", "1000")
 		_, _ = io.WriteString(w, "{")
 		w.(http.Flusher).Flush()
 		close(ready)
-		<-r.Context().Done()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
 	}))
 	defer server.Close()
+	defer close(release) // always release this fixture before Server.Close waits
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	endpoint := server.URL + "/api/chat"
