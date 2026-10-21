@@ -34,9 +34,17 @@ const (
 // Refusal contains only a static reason; never wrap a URL, token, body or error.
 type Refusal struct{ reason string }
 
-func (e *Refusal) Error() string  { return "coordinator fetch refused: " + e.reason }
-func (e *Refusal) Reason() string { return e.reason }
-func refuse(reason string) error { return &Refusal{reason: reason} }
+func (e *Refusal) Error() string {
+	return "coordinator fetch refused: " + e.reason
+}
+
+func (e *Refusal) Reason() string {
+	return e.reason
+}
+
+func refuse(reason string) error {
+	return &Refusal{reason: reason}
+}
 
 // Hooks are trusted programmatic test seams, never values from a job. Production
 // callers use zero values except a shared interface-enumeration dependency.

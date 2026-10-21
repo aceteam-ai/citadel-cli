@@ -238,7 +238,10 @@ func TestInboxRevocationAndCancellationDoNotReturnPartialSnapshot(t *testing.T) 
 			}
 			t.Run(strings.Join(origins, "-")+"-"+cause, func(t *testing.T) {
 				var calls atomic.Int32
-				f := inboxFixture(t, func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); _, _ = w.Write(data) })
+				f := inboxFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+					calls.Add(1)
+					_, _ = w.Write(data)
+				})
 				f.WorkspaceDir = t.TempDir()
 				writeOwnedInput(t, f.WorkspaceDir, "source.png", data)
 				writeOwnedInput(t, f.WorkspaceDir, "mask.png", data)
@@ -281,7 +284,10 @@ func TestInboxStaticConfigurationRefusalBeforeNetwork(t *testing.T) {
 	data := encodedPNG(t, image.NewGray(image.Rect(0, 0, 1, 1)))
 	contract := acquisitionContract(t, []string{"inbox"}, [][]byte{data})
 	f := Freezer{MediaInputsEnabled: func() bool { return true }, hooks: coordinatorfetch.Hooks{
-		LookupIP: func(context.Context, string) ([]net.IPAddr, error) { t.Fatal("static refusal reached DNS"); return nil, nil },
+		LookupIP: func(context.Context, string) ([]net.IPAddr, error) {
+			t.Fatal("static refusal reached DNS")
+			return nil, nil
+		},
 	}}
 	_, err := f.Freeze(context.Background(), contract)
 	assertReason(t, err, "inbox_unavailable")
