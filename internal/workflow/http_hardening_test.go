@@ -181,7 +181,7 @@ func TestHTTPNodePreservesSafeCancellation(t *testing.T) {
 	}
 }
 
-func TestHTTPExecuteClampsTimeoutBeforeResolutionAndDial(t *testing.T) {
+func TestHTTPExecuteClampsTimeoutBeforeResolution(t *testing.T) {
 	for seconds, want := range map[int]time.Duration{-1: 30 * time.Second, 0: 30 * time.Second, 1: time.Second, 120: 120 * time.Second, 121: 120 * time.Second} {
 		t.Run(time.Duration(seconds).String(), func(t *testing.T) {
 			started := time.Now()
@@ -200,9 +200,8 @@ func TestHTTPExecuteClampsTimeoutBeforeResolutionAndDial(t *testing.T) {
 					checkDeadline(ctx, "resolve")
 					return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
 				},
-				dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				dial: func(_ context.Context, _, _ string) (net.Conn, error) {
 					dials.Add(1)
-					checkDeadline(ctx, "dial")
 					return nil, errors.New("owned immediate test refusal")
 				},
 			}
@@ -211,6 +210,62 @@ func TestHTTPExecuteClampsTimeoutBeforeResolutionAndDial(t *testing.T) {
 				t.Fatalf("Execute did not traverse guarded path: lookups=%d dials=%d err=%v", lookups.Load(), dials.Load(), err)
 			}
 		})
+	}
+}
+
+func TestHTTPExecuteTimeoutBoundsBlockedDial(t *testing.T) {
+	// net/http detaches its dial context from the request deadline so a
+	// connection can serve another request. Assert the public Execute budget,
+	// not an implementation detail of that detached context.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	dialDone := make(chan struct{})
+	p := HTTPPolicy{
+		resolve: func(context.Context, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+		},
+		dial: func(context.Context, string, string) (net.Conn, error) {
+			defer close(dialDone)
+			close(started)
+			<-release
+			return nil, errors.New("owned released dial refusal")
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	executeDone := make(chan struct{})
+	go func() {
+		defer close(executeDone)
+		_, err := (&HTTPNodeExecutor{policy: p}).Execute(ctx, &Node{ID: "blocked-dial", Params: map[string]any{"url": "http://public.example", "timeout": 1}}, nil)
+		result <- err
+	}()
+	defer func() {
+		cancel()
+		close(release)
+		select {
+		case <-executeDone:
+		case <-time.After(2 * time.Second):
+			t.Error("owned Execute did not join after cancellation")
+		}
+		select {
+		case <-dialDone:
+		case <-time.After(2 * time.Second):
+			t.Error("owned dial did not join after release")
+		}
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("Execute never reached owned dial")
+	}
+	select {
+	case err := <-result:
+		if ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Execute did not apply its one-second budget: parent=%v, result=%v", ctx.Err(), err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Execute exceeded its own budget while dial remained blocked")
 	}
 }
 
