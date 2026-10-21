@@ -2,6 +2,7 @@ package nodevault
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -13,7 +14,7 @@ func always(ok bool) func() bool { return func() bool { return ok } }
 // TestLockoutAttemptAppliesVaultPolicy pins #1398: the exported limiter used by
 // legacy passcode checks enforces the same thresholds and semantics as the vault.
 func TestLockoutAttemptAppliesVaultPolicy(t *testing.T) {
-	l := OpenLockout(t.TempDir())
+	l := OpenLegacyPasscodeLockout(t.TempDir())
 	for i := 1; i <= maxFreeAttempts; i++ {
 		if err := l.Attempt(always(false)); !errors.Is(err, ErrWrongPIN) {
 			t.Fatalf("wrong attempt %d: want ErrWrongPIN, got %v", i, err)
@@ -48,47 +49,57 @@ func TestLockoutAttemptAppliesVaultPolicy(t *testing.T) {
 	}
 }
 
-// TestLockoutSharedWithVault pins the single node-wide counter: legacy checks
-// and the vault read and write the same state file under the same base dir.
-func TestLockoutSharedWithVault(t *testing.T) {
+// TestLegacyLockoutUsesSiblingFile pins the legacy limiter's location: a file
+// directly in the node config directory, never the vault's directory, so a
+// legacy node gains no vault/ directory (whose ownership could block a later
+// enroll) and never looks enrolled. Vault and legacy state do not mix.
+func TestLegacyLockoutUsesSiblingFile(t *testing.T) {
 	base := t.TempDir()
-	v := Open(base)
-	v.paramsOverride = &fastParams
-	mustSet(t, v, "654321")
-
-	l := OpenLockout(base)
-	if got, want := l.path, v.lockoutPath(); got != want {
-		t.Fatalf("lockout path %q, vault lockout path %q", got, want)
+	l := OpenLegacyPasscodeLockout(base)
+	if got, want := l.path, filepath.Join(base, legacyLockoutStateFile); got != want {
+		t.Fatalf("legacy lockout path %q, want %q", got, want)
 	}
-	if got, want := l.path, filepath.Join(base, vaultDirName, lockoutStateFile); got != want {
-		t.Fatalf("lockout path %q, want %q", got, want)
+	v := Open(base)
+	if got := v.LegacyPasscodeLockout().path; got != l.path {
+		t.Fatalf("vault-derived legacy lockout path %q, want %q", got, l.path)
+	}
+	_ = l.Status()
+	for i := 0; i < maxFreeAttempts; i++ {
+		_ = l.Attempt(always(false))
+	}
+	if _, err := os.Stat(filepath.Join(base, vaultDirName)); !os.IsNotExist(err) {
+		t.Fatalf("legacy failures created the vault directory: %v", err)
+	}
+	if v.IsConfigured() {
+		t.Fatal("legacy lockout state made a vault look enrolled")
+	}
+	if !l.Status().LockedOut {
+		t.Fatal("legacy limiter did not lock")
+	}
+	if st := v.LockoutStatus(); st.FailedAttempts != 0 || st.LockedOut {
+		t.Fatalf("legacy failures leaked into the vault's state: %+v", st)
+	}
+}
+
+// TestLockoutResetIfPresent: an absent state file stays absent; an existing
+// one is cleared.
+func TestLockoutResetIfPresent(t *testing.T) {
+	base := t.TempDir()
+	l := OpenLegacyPasscodeLockout(base)
+	if err := l.ResetIfPresent(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(l.path); !os.IsNotExist(err) {
+		t.Fatalf("reset created a state file: %v", err)
 	}
 	for i := 0; i < maxFreeAttempts; i++ {
 		_ = l.Attempt(always(false))
 	}
-	if err := v.VerifyPIN("654321"); !IsLockedOut(err) {
-		t.Fatalf("legacy failures must lock the shared counter: %v", err)
-	}
-	if err := v.ResetLockout(); err != nil {
+	if err := l.ResetIfPresent(); err != nil {
 		t.Fatal(err)
 	}
 	if st := l.Status(); st.LockedOut || st.FailedAttempts != 0 {
-		t.Fatalf("vault reset must clear the shared state: %+v", st)
-	}
-}
-
-// TestLockoutAttemptNoConfigWritesNothingUntilAttempt confirms opening the
-// limiter and reading status does not create state or the vault header.
-func TestLockoutAttemptNoConfigWritesNothingUntilAttempt(t *testing.T) {
-	base := t.TempDir()
-	l := OpenLockout(base)
-	_ = l.Status()
-	if Open(base).IsConfigured() {
-		t.Fatal("status must not configure a vault")
-	}
-	_ = l.Attempt(always(false))
-	if Open(base).IsConfigured() {
-		t.Fatal("recording a legacy failure must not make the vault look enrolled")
+		t.Fatalf("reset left state: %+v", st)
 	}
 }
 
@@ -103,14 +114,14 @@ func TestLockoutAttemptSerializesInProcess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = OpenLockout(base).Attempt(func() bool { checks.Add(1); return false })
+			_ = OpenLegacyPasscodeLockout(base).Attempt(func() bool { checks.Add(1); return false })
 		}()
 	}
 	wg.Wait()
 	if got := checks.Load(); got != maxFreeAttempts {
 		t.Fatalf("%d checks ran, want exactly %d before the lockout refused the rest", got, maxFreeAttempts)
 	}
-	if st := OpenLockout(base).Status(); st.FailedAttempts != maxFreeAttempts || !st.LockedOut {
+	if st := OpenLegacyPasscodeLockout(base).Status(); st.FailedAttempts != maxFreeAttempts || !st.LockedOut {
 		t.Fatalf("status after concurrent guesses: %+v", st)
 	}
 }

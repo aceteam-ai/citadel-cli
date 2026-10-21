@@ -41,12 +41,12 @@ func init() {
 		}
 		return v.VerifyPIN(pin) == nil, true
 	}
-	// Legacy bcrypt passcode checks (no master PIN enrolled) share the vault's
-	// node-wide persisted lockout state (#1398), so the HTTP status server, the
-	// terminal WebSocket servers and the gateway's sensitive and cache routes
-	// are rate-limited in legacy mode too.
+	// Legacy bcrypt passcode checks (no master PIN enrolled) get the vault's
+	// node-wide persisted lockout policy (#1398), with state in a sibling file,
+	// so the HTTP status server, the terminal WebSocket servers and the
+	// gateway's sensitive and cache routes are rate-limited in legacy mode too.
 	config.LegacyPasscodeLockout = func() config.PasscodeAttemptLimiter {
-		return nodevault.OpenLockout(passcodeHookNodeDir())
+		return nodevault.OpenLegacyPasscodeLockout(passcodeHookNodeDir())
 	}
 }
 

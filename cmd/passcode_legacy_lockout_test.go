@@ -16,7 +16,7 @@ import (
 // TestProductionHooksLockLegacyPasscode drives the production hooks this
 // package's init installs (#1398): with no master PIN enrolled, the shared
 // VerifyPasscode entry point that every network surface calls records failures
-// in <node dir>/vault/state.yaml and enforces the vault's lockout.
+// in <node dir>/passcode-lockout.yaml and enforces the vault's lockout policy.
 func TestProductionHooksLockLegacyPasscode(t *testing.T) {
 	dir := useWiredLegacyLockout(t)
 	perms := config.DefaultPermissions()
@@ -26,7 +26,7 @@ func TestProductionHooksLockLegacyPasscode(t *testing.T) {
 	if perms.VerifyPasscode("") {
 		t.Fatal("empty passcode verified")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "vault", "state.yaml")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, "passcode-lockout.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("an empty passcode must not touch lockout state: %v", err)
 	}
 	if !perms.VerifyPasscode("4821-pass") {
@@ -40,12 +40,12 @@ func TestProductionHooksLockLegacyPasscode(t *testing.T) {
 	if perms.VerifyPasscode("4821-pass") {
 		t.Fatal("correct passcode accepted during lockout")
 	}
-	lo := nodevault.OpenLockout(dir).Status()
+	lo := nodevault.OpenLegacyPasscodeLockout(dir).Status()
 	if !lo.LockedOut || lo.FailedAttempts != 5 {
 		t.Fatalf("lockout state: %+v", lo)
 	}
-	if nodevault.Open(dir).IsConfigured() {
-		t.Fatal("legacy lockout state must not make a master PIN look enrolled")
+	if _, err := os.Stat(filepath.Join(dir, "vault")); !os.IsNotExist(err) {
+		t.Fatalf("legacy lockout must not create the vault directory: %v", err)
 	}
 
 	if err := resetPasscodeLockoutAt(dir); err != nil {
@@ -86,8 +86,17 @@ func TestLegacyPasscodeVerdictReportsLockoutSeparately(t *testing.T) {
 	if got := st.Check("4821-pass"); got != jobs.PasscodeLockedOut {
 		t.Fatalf("correct passcode during lockout: %v, want PasscodeLockedOut", got)
 	}
-	if lo := nodevault.OpenLockout(nodeDir).Status(); lo.FailedAttempts != 5 || !lo.LockedOut {
+	if lo := nodevault.OpenLegacyPasscodeLockout(nodeDir).Status(); lo.FailedAttempts != 5 || !lo.LockedOut {
 		t.Fatalf("job checks must share the node-wide lockout: %+v", lo)
+	}
+	if err := resetPasscodeLockoutAt(nodeDir); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Check("4821-pass"); got != jobs.PasscodeMatch {
+		t.Fatalf("correct passcode after reset-lockout: %v", got)
+	}
+	if _, err := os.Stat(filepath.Join(nodeDir, "vault")); !os.IsNotExist(err) {
+		t.Fatalf("reset-lockout created the vault directory on a legacy node: %v", err)
 	}
 }
 

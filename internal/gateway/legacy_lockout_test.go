@@ -14,7 +14,7 @@ import (
 // hooks are set, so VerifyPasscode takes the legacy bcrypt path. Not parallel.
 func useLegacyLockout(t *testing.T) *nodevault.Lockout {
 	t.Helper()
-	lockout := nodevault.OpenLockout(t.TempDir())
+	lockout := nodevault.OpenLegacyPasscodeLockout(t.TempDir())
 	orig := config.LegacyPasscodeLockout
 	config.LegacyPasscodeLockout = func() config.PasscodeAttemptLimiter { return lockout }
 	t.Cleanup(func() { config.LegacyPasscodeLockout = orig })

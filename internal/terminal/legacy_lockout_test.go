@@ -15,7 +15,7 @@ import (
 // node-wide lockout on a legacy-passcode node (#1398). The handler is called
 // directly; no listener is opened.
 func TestPasscodeGate_LegacyPasscodeLockout(t *testing.T) {
-	lockout := nodevault.OpenLockout(t.TempDir())
+	lockout := nodevault.OpenLegacyPasscodeLockout(t.TempDir())
 	orig := config.LegacyPasscodeLockout
 	config.LegacyPasscodeLockout = func() config.PasscodeAttemptLimiter { return lockout }
 	t.Cleanup(func() { config.LegacyPasscodeLockout = orig })

@@ -251,7 +251,7 @@ var ErrPasscodeMismatch = errors.New("config: passcode does not match")
 // PasscodeAttemptLimiter is the node-wide persisted attempt limiter applied to
 // legacy bcrypt passcode checks (#1398). Attempt runs check unless a lockout is
 // active, records the result, and returns nil only for a successful check. It is
-// satisfied by *nodevault.Lockout, the same state the master-PIN vault uses.
+// satisfied by *nodevault.Lockout, which applies the master-PIN vault's policy.
 type PasscodeAttemptLimiter interface {
 	Attempt(check func() bool) error
 }

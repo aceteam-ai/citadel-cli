@@ -3,6 +3,7 @@ package nodevault
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -64,22 +65,32 @@ type lockoutState struct {
 	FailureTimes []time.Time `yaml:"failure_times"`
 }
 
-// Lockout is the node-wide persisted attempt limiter over one state file. The
-// master-PIN vault uses it for VerifyPIN/Unlock/ChangePIN, and the legacy bcrypt
-// passcode gate uses it through Attempt (#1398), so a node's network passcode
-// surfaces are rate-limited whether or not a master PIN is enrolled. A node is in
-// exactly one mode (vault enrolled or legacy passcode), so both share ONE file,
-// <baseDir>/vault/state.yaml: one counter per node, with the same thresholds,
-// backoff, rolling window and history bound in either mode.
+// Lockout is a node-wide persisted attempt limiter over one state file. The
+// master-PIN vault uses one over <baseDir>/vault/state.yaml for
+// VerifyPIN/Unlock/ChangePIN; the legacy bcrypt passcode gate uses one over
+// <baseDir>/passcode-lockout.yaml through Attempt (#1398). Both apply the same
+// thresholds, backoff, rolling window and history bound, so a node's network
+// passcode surfaces are rate-limited whether or not a master PIN is enrolled.
+//
+// Legacy checks use a sibling file rather than the vault's state.yaml so that
+// a legacy node never gains a vault/ directory: a 0700 vault/ directory created
+// by a root worker inside a user-owned node directory would make a later
+// non-root 'citadel passcode enroll' fail, and would turn the vault header stat
+// (Configured) into a permission error. A node is in exactly one mode, so the
+// two files never count the same attempt.
 type Lockout struct {
 	path string
 }
 
-// OpenLockout returns the node-wide limiter whose state lives under baseDir
-// (in production, network.GetNodeConfigDir()). It is the same state a vault
-// opened over baseDir uses. It does not touch disk.
-func OpenLockout(baseDir string) *Lockout {
-	return &Lockout{path: filepath.Join(baseDir, vaultDirName, lockoutStateFile)}
+// legacyLockoutStateFile holds the legacy passcode limiter's state, directly in
+// the node config directory.
+const legacyLockoutStateFile = "passcode-lockout.yaml"
+
+// OpenLegacyPasscodeLockout returns the limiter for legacy passcode checks,
+// with state at <baseDir>/passcode-lockout.yaml (in production baseDir is
+// network.GetNodeConfigDir()). It does not touch disk.
+func OpenLegacyPasscodeLockout(baseDir string) *Lockout {
+	return &Lockout{path: filepath.Join(baseDir, legacyLockoutStateFile)}
 }
 
 // lockoutMus serializes lockout read-modify-write per state file within this
@@ -139,10 +150,28 @@ func (l *Lockout) Reset() error {
 	return writeLockoutAt(l.path, lockoutState{LastVerifiedAt: readLockoutAt(l.path, time.Now()).LastVerifiedAt, FailureTimes: []time.Time{}})
 }
 
+// ResetIfPresent is Reset for a state file that exists; an absent file (no
+// failure ever recorded) is left absent. Any other stat error is returned.
+func (l *Lockout) ResetIfPresent() error {
+	if _, err := os.Stat(l.path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("nodevault: stat lockout state: %w", err)
+	}
+	return l.Reset()
+}
+
 func (v *Vault) lockoutPath() string { return filepath.Join(v.dir, lockoutStateFile) }
 
 // Lockout returns the node-wide limiter backing this vault.
 func (v *Vault) Lockout() *Lockout { return &Lockout{path: v.lockoutPath()} }
+
+// LegacyPasscodeLockout returns the legacy passcode limiter for the node
+// config directory this vault lives in.
+func (v *Vault) LegacyPasscodeLockout() *Lockout {
+	return OpenLegacyPasscodeLockout(filepath.Dir(v.dir))
+}
 
 func (v *Vault) readLockout() lockoutState {
 	return readLockoutAt(v.lockoutPath(), time.Now())
@@ -298,6 +327,6 @@ func (v *Vault) LockoutStatus() LockoutStatus { return v.Lockout().Status() }
 // local-presence recovery path (a human at the machine), consistent with
 // "hard lockout requiring local presence" rather than auto-wipe: someone with
 // local access can clear the lock without waiting out the window and without
-// any data loss. The state is node-wide, so this also clears a lockout earned
-// by legacy passcode checks (#1398).
+// any data loss. It clears the vault's state only; the legacy passcode limiter
+// has its own file (see Lockout).
 func (v *Vault) ResetLockout() error { return v.Lockout().Reset() }

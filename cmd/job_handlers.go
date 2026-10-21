@@ -67,9 +67,10 @@ func passcodeStateFrom(permissionsDir string, vault *nodevault.Vault) (jobs.Pass
 	}
 	// The vault was just checked, so verify the legacy hash directly rather
 	// than through the master-PIN hooks, which consult the vault again. The
-	// legacy check uses the same node-wide lockout state as the vault (#1398),
-	// taken from the vault passed in so tests stay off this machine's state.
-	lockout := vault.Lockout()
+	// legacy check uses the same node-wide legacy passcode lockout as the
+	// network surfaces (#1398), resolved from the vault's node directory so
+	// tests stay off this machine's state.
+	lockout := vault.LegacyPasscodeLockout()
 	return jobs.PasscodeState{Set: perms.PasscodeHash != "", Check: func(pin string) jobs.PasscodeVerdict {
 		return legacyPasscodeVerdict(perms, lockout, pin)
 	}}, nil

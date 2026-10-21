@@ -322,8 +322,8 @@ func runPasscodeStatus(cmd *cobra.Command, args []string) error {
 		perms := loadNodePermissions()
 		if perms.PasscodeHash != "" {
 			fmt.Println("Master PIN: not enrolled (legacy node passcode is set; run 'citadel passcode enroll' to migrate).")
-			// Legacy passcode checks share the node-wide lockout (#1398).
-			printLockoutStatus(v.LockoutStatus())
+			// Legacy passcode checks have their own node-wide lockout (#1398).
+			printLockoutStatus(nodevault.OpenLegacyPasscodeLockout(network.GetNodeConfigDir()).Status())
 		} else {
 			fmt.Println("Master PIN: not set.")
 		}
@@ -335,8 +335,8 @@ func runPasscodeStatus(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// printLockoutStatus reports the node-wide failed-attempt state, shared by the
-// master PIN and the legacy node passcode.
+// printLockoutStatus reports a node-wide failed-attempt state (master PIN or
+// legacy node passcode).
 func printLockoutStatus(lo nodevault.LockoutStatus) {
 	if lo.LockedOut {
 		fmt.Printf("Lockout: ACTIVE until %s (%d failed attempts). Run 'citadel passcode reset-lockout' at the node to clear it.\n", lo.LockoutUntil.Format("15:04:05"), lo.FailedAttempts)
@@ -354,10 +354,16 @@ func runPasscodeResetLockout(cmd *cobra.Command, args []string) error {
 }
 
 // resetPasscodeLockoutAt is the reset-lockout core, taking the node config
-// directory explicitly so tests never touch this machine's node state.
+// directory explicitly so tests never touch this machine's node state. It
+// clears both the master-PIN vault's lockout and the legacy passcode lockout,
+// so the command works whichever mode the node is in. A state file that does
+// not exist is left absent rather than created.
 func resetPasscodeLockoutAt(nodeConfigDir string) error {
-	if err := nodevault.OpenLockout(nodeConfigDir).Reset(); err != nil {
-		return fmt.Errorf("reset passcode lockout: %w", err)
+	v := nodevault.Open(nodeConfigDir)
+	for _, l := range []*nodevault.Lockout{v.Lockout(), v.LegacyPasscodeLockout()} {
+		if err := l.ResetIfPresent(); err != nil {
+			return fmt.Errorf("reset passcode lockout: %w", err)
+		}
 	}
 	return nil
 }
