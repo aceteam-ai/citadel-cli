@@ -42,7 +42,13 @@ func main() {
 		{"film_stream_copy", "cmd/template_builtin_video_compose.go", "a == b && a.VideoCodec", "true || a == b && a.VideoCodec", "./cmd", "TestVideoComposeStreamDecision"},
 		{"film_card_silence", "cmd/template_builtin_papercraft.go", "} else if cfg.SilentAudio {", "} else if false && cfg.SilentAudio {", "./cmd", "TestVideoComposeSingleLandscapeCapture"},
 		{"film_inactive_gate", "cmd/template_builtin_video_compose.go", "if deps.visuals == nil {", "if false && deps.visuals == nil {", "./cmd", "TestVideoComposeInactiveBeforeEffects"},
-		{"film_declared_input", "cmd/template_builtin_video_compose.go", "if files[ch.File] == \"\" {", "if false && files[ch.File] == \"\" {", "./cmd", "TestVideoComposeBindsDeclaredFinalBasenames"},
+		{"film_declared_input", "cmd/template_builtin_video_compose.go", "chapters = append(chapters, files[ch.File])", "chapters = append(chapters, ch.File)", "./cmd", "TestVideoComposeBindsDeclaredFinalBasenames"},
+		{"film_mp4_preflight", "cmd/template_builtin_video_compose.go", "if err := validateVideoComposeMP4(files[ch.File]); err != nil", "if err := validateVideoComposeMP4(files[ch.File]); false && err != nil", "./cmd", "TestVideoComposeRejectsDisguisedDASHBeforeMedia"},
+		{"film_mov_demuxer", "cmd/template_builtin_video_compose.go", "\"-f\", \"mov\", \"-enable_drefs\"", "\"-f\", \"dash\", \"-enable_drefs\"", "./cmd", "TestVideoComposeMP4InputArgsPinned"},
+		{"film_external_refs_disabled", "cmd/template_builtin_video_compose.go", "\"-enable_drefs\", \"0\"", "\"-enable_drefs\", \"1\"", "./cmd", "TestVideoComposeMP4InputArgsPinned"},
+		{"film_mp4_self_contained", "cmd/template_builtin_video_compose.go", "binary.BigEndian.Uint32(data[16:20]) != 1", "false && binary.BigEndian.Uint32(data[16:20]) != 1", "./cmd", "TestVideoComposeMP4RejectsExternalReferences"},
+		{"film_probe_container", "cmd/template_builtin_video_compose.go", "if probe.Format.Name != \"mov,mp4,m4a,3gp,3g2,mj2\"", "if false && probe.Format.Name != \"mov,mp4,m4a,3gp,3g2,mj2\"", "./cmd", "TestVideoComposeProbeRejectsWrongContainer"},
+		{"film_poster_decoder", "cmd/template_builtin_video_compose.go", "\"-c:v\", \"png\", \"-i\", poster", "\"-c:v\", \"mjpeg\", \"-i\", poster", "./cmd", "TestVideoComposeReencodeAndPosterOverride"},
 	}
 	for _, m := range mutations {
 		source := filepath.Join(root, m.file)

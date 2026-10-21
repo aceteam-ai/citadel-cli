@@ -2,13 +2,16 @@ package cmd
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 const validVideoComposeFilm = `{"title":"Flight Log","subtitle":"A film","intro":{"lines":["AceTeam"],"seconds":4},"outro":{"lines":["Made with AceTeam"],"seconds":5},"theme":"blueprint","chapters":[{"file":"staged-a71f-chapter.mp4","title":"Chapter one","narrator":{"name":"the Ace","line":"Narrated by the Ace, the AI"},"narration_identity":"stock","speaks_as_person":false,"disclosure":null,"stamp":{"label":"SIGNED","by":"founder","at":"2026-10-12"},"card_seconds":2.5}]}`
@@ -127,7 +130,7 @@ func videoComposeTestInputs(t *testing.T, raw []byte) []string {
 	dir := t.TempDir()
 	paths := []string{filepath.Join(dir, "film.json"), filepath.Join(dir, "staged-a71f-chapter.mp4")}
 	for i, path := range paths {
-		body := []byte("fake MP4 fixture")
+		body := videoComposeTestMP4(true)
 		if i == 0 {
 			body = raw
 		}
@@ -136,6 +139,199 @@ func videoComposeTestInputs(t *testing.T, raw []byte) []string {
 		}
 	}
 	return paths
+}
+
+// Structural fixture only: codec metadata in ordinary unit tests comes from the
+// fake probe. The separate opt-in local proof uses a real encoded fixture.
+func videoComposeTestBox(kind string, parts ...[]byte) []byte {
+	payload := []byte{}
+	for _, part := range parts {
+		payload = append(payload, part...)
+	}
+	box := make([]byte, 8, 8+len(payload))
+	binary.BigEndian.PutUint32(box[:4], uint32(8+len(payload)))
+	copy(box[4:], kind)
+	return append(box, payload...)
+}
+func videoComposeTestMP4(selfContained bool) []byte {
+	flags := byte(1)
+	if !selfContained {
+		flags = 0
+	}
+	ref := videoComposeTestBox("url ", []byte{0, 0, 0, flags})
+	dref := videoComposeTestBox("dref", []byte{0, 0, 0, 0, 0, 0, 0, 1}, ref)
+	track := videoComposeTestBox("trak", videoComposeTestBox("mdia", videoComposeTestBox("minf", videoComposeTestBox("dinf", dref))))
+	return append(append(videoComposeTestBox("ftyp", []byte("isom\x00\x00\x02\x00isommp41")), videoComposeTestBox("moov", track, track)...), videoComposeTestBox("mdat", []byte{0})...)
+}
+
+func TestVideoComposeRejectsDisguisedDASHBeforeMedia(t *testing.T) {
+	inputs := videoComposeTestInputs(t, []byte(validVideoComposeFilm))
+	// An undeclared local MP4 sits outside the declared input directory. The
+	// manifest points to it, but refusal must precede all media-tool invocation.
+	outside := filepath.Join(t.TempDir(), "undeclared.mp4")
+	if err := os.WriteFile(outside, videoComposeTestMP4(true), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dash := []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet><Representation><BaseURL>` + outside + `</BaseURL></Representation></AdaptationSet></Period></MPD>`)
+	if err := os.WriteFile(inputs[1], dash, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f := &videoComposeFake{t: t, media: map[string]videoComposeMedia{inputs[1]: videoComposeTestMedia(10)}}
+	deps := f.deps()
+	deps.look = func(string) (string, error) { t.Fatal("disguised DASH reached tool discovery"); return "", nil }
+	deps.run = func(context.Context, string, []string) ([]byte, error) {
+		t.Fatal("disguised DASH could consume undeclared media")
+		return nil, nil
+	}
+	outDir := t.TempDir()
+	if _, err := runVideoComposeBuiltin(context.Background(), json.RawMessage(`{}`), inputs, outDir, deps); err == nil {
+		t.Fatal("disguised DASH accepted")
+	}
+	if f.rendered != 0 || len(f.calls) != 0 {
+		t.Fatal("disguised DASH reached renderer/media tools")
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("rejected manifest created outputs: %v %v", entries, err)
+	}
+	if err := os.WriteFile(inputs[1], videoComposeTestMP4(true), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := videoComposeInputs(inputs); err != nil {
+		t.Fatalf("self-contained MP4 structure rejected: %v", err)
+	}
+}
+
+func TestVideoComposeMP4RejectsExternalReferences(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "external.mp4")
+	if err := os.WriteFile(path, videoComposeTestMP4(false), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateVideoComposeMP4(path); err == nil {
+		t.Fatal("non-self-contained MP4 data reference accepted")
+	}
+	for _, body := range [][]byte{
+		videoComposeTestBox("ftyp", []byte("isom\x00\x00\x00\x00")),
+		append(videoComposeTestMP4(true), videoComposeTestBox("moof")...),
+		append(videoComposeTestMP4(true), []byte{0, 0, 0, 1, 'f', 'r', 'e', 'e', 255, 255, 255, 255, 255, 255, 255, 255}...),
+	} {
+		if err := os.WriteFile(path, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateVideoComposeMP4(path); err == nil {
+			t.Fatal("invalid/fragmented MP4 accepted")
+		}
+	}
+}
+
+func TestVideoComposeMP4InputArgsPinned(t *testing.T) {
+	assert := func(args []string) {
+		t.Helper()
+		want := "-protocol_whitelist file -format_whitelist mov -f mov -enable_drefs 0 -use_absolute_path 0 -i input.mp4"
+		if !strings.Contains(strings.Join(args, " "), want) {
+			t.Fatalf("MP4 input could autodetect a manifest/external reference: %v", args)
+		}
+	}
+	assert(videoComposeMP4InputArgs("input.mp4"))
+	assert(videoComposePrepareArgs("input.mp4", "out.mp4", videoComposeTestMedia(10), true))
+	assert(videoComposePrepareArgs("input.mp4", "out.mp4", videoComposeTestMedia(10), false))
+	assert(videoComposeLoudnormArgs("input.mp4", "", videoComposeLoudness{-14, -2, 11}, nil))
+	args, err := videoComposeCapArgs("input.mp4", "out.mp4", 10, 48<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert(args)
+}
+
+// Optional, bounded, offline proof. Supply a disposable genuinely encoded MP4;
+// normal unit tests remain fake-command-only and never discover media tools.
+func TestVideoComposeLocalEncodedMP4(t *testing.T) {
+	fixture := os.Getenv("CITADEL_VIDEO_COMPOSE_OFFLINE_FIXTURE")
+	if fixture == "" {
+		t.Skip("set CITADEL_VIDEO_COMPOSE_OFFLINE_FIXTURE for bounded local proof")
+	}
+	info, err := os.Stat(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		t.Fatal("offline fixture must be a regular MP4 no larger than 1 MiB")
+	}
+	if err := validateVideoComposeMP4(fixture); err != nil {
+		t.Fatalf("genuine encoded MP4 refused: %v", err)
+	}
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	probeArgs := append([]string{"-v", "error", "-show_streams", "-show_format", "-show_data_hash", "sha256", "-of", "json"}, videoComposeMP4InputArgs(fixture)...)
+	raw, err := exec.CommandContext(ctx, ffprobe, probeArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("pinned genuine probe: %v %s", err, raw)
+	}
+	media, err := parseVideoComposeProbe(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, copyStreams := range []bool{true, false} {
+		args := videoComposePrepareArgs(fixture, filepath.Join(t.TempDir(), "prepared.mp4"), media, copyStreams)
+		if out, err := exec.CommandContext(ctx, ffmpeg, args...).CombinedOutput(); err != nil {
+			t.Fatalf("pinned genuine preparation: %v %s", err, out)
+		}
+	}
+	// The undeclared BaseURL exists and contains valid streams. Nevertheless,
+	// source preflight refuses it and forced MOV probing/preparation must fail.
+	dash := filepath.Join(t.TempDir(), "disguised.mp4")
+	manifest := []byte(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet><Representation><BaseURL>` + fixture + `</BaseURL></Representation></AdaptationSet></Period></MPD>`)
+	if manifestPath := os.Getenv("CITADEL_VIDEO_COMPOSE_OFFLINE_MANIFEST"); manifestPath != "" {
+		info, err := os.Stat(manifestPath)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > 64<<10 {
+			t.Fatal("offline manifest must be a regular file no larger than 64 KiB")
+		}
+		manifest, err = os.ReadFile(manifestPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// With the previous autodetection policy this genuine DASH fixture
+		// supplies plausible H264/AAC metadata via undeclared local segments.
+		baseline, err := exec.CommandContext(ctx, ffprobe, "-v", "error", "-protocol_whitelist", "file,pipe", "-show_streams", "-show_format", "-of", "json", "-i", manifestPath).CombinedOutput()
+		if err != nil {
+			t.Fatalf("offline baseline manifest: %v %s", err, baseline)
+		}
+		var value struct {
+			Format struct {
+				Name     string `json:"format_name"`
+				Duration string `json:"duration"`
+			} `json:"format"`
+			Streams []struct {
+				Codec string `json:"codec_name"`
+			} `json:"streams"`
+		}
+		if err := json.Unmarshal(baseline, &value); err != nil {
+			t.Fatal(err)
+		}
+		if value.Format.Name != "dash" || value.Format.Duration == "0.000000" || len(value.Streams) != 2 || value.Streams[0].Codec != "h264" || value.Streams[1].Codec != "aac" {
+			t.Fatalf("baseline does not reproduce manifest metadata confusion: %s", baseline)
+		}
+	}
+	if err := os.WriteFile(dash, manifest, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateVideoComposeMP4(dash); err == nil {
+		t.Fatal("DASH manifest passed MP4 preflight")
+	}
+	if out, err := exec.CommandContext(ctx, ffprobe, append([]string{"-v", "error"}, videoComposeMP4InputArgs(dash)...)...).CombinedOutput(); err == nil {
+		t.Fatalf("forced MOV probe read undeclared BaseURL: %s", out)
+	}
+	if out, err := exec.CommandContext(ctx, ffmpeg, videoComposePrepareArgs(dash, filepath.Join(t.TempDir(), "rejected.mp4"), media, true)...).CombinedOutput(); err == nil {
+		t.Fatalf("forced MOV preparation read undeclared BaseURL: %s", out)
+	}
 }
 
 func TestVideoComposeBindsDeclaredFinalBasenames(t *testing.T) {
@@ -186,7 +382,7 @@ func videoComposeTestMedia(duration float64) videoComposeMedia {
 	return videoComposeMedia{Width: 1920, Height: 1080, FPS: "30/1", VideoCodec: "h264", PixelFormat: "yuv420p", Profile: "High", Level: 40, TimeBase: "1/15360", SampleAspect: "1:1", AudioCodec: "aac", SampleRate: "48000", ChannelLayout: "stereo", Channels: 2, ExtraDataHash: "SHA256:fixture", AudioExtraDataHash: "SHA256:audio", Duration: duration}
 }
 func videoComposeTestProbe(m videoComposeMedia) []byte {
-	return []byte(fmt.Sprintf(`{"streams":[{"codec_type":"video","codec_name":%q,"width":%d,"height":%d,"r_frame_rate":%q,"pix_fmt":%q,"profile":%q,"level":%d,"time_base":%q,"sample_aspect_ratio":%q,"extradata_hash":%q},{"codec_type":"audio","codec_name":%q,"sample_rate":%q,"channels":%d,"channel_layout":%q,"extradata_hash":%q}],"format":{"duration":%q}}`, m.VideoCodec, m.Width, m.Height, m.FPS, m.PixelFormat, m.Profile, m.Level, m.TimeBase, m.SampleAspect, m.ExtraDataHash, m.AudioCodec, m.SampleRate, m.Channels, m.ChannelLayout, m.AudioExtraDataHash, videoComposeNumber(m.Duration)))
+	return []byte(fmt.Sprintf(`{"streams":[{"codec_type":"video","codec_name":%q,"width":%d,"height":%d,"r_frame_rate":%q,"pix_fmt":%q,"profile":%q,"level":%d,"time_base":%q,"sample_aspect_ratio":%q,"extradata_hash":%q},{"codec_type":"audio","codec_name":%q,"sample_rate":%q,"channels":%d,"channel_layout":%q,"extradata_hash":%q}],"format":{"duration":%q,"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}`, m.VideoCodec, m.Width, m.Height, m.FPS, m.PixelFormat, m.Profile, m.Level, m.TimeBase, m.SampleAspect, m.ExtraDataHash, m.AudioCodec, m.SampleRate, m.Channels, m.ChannelLayout, m.AudioExtraDataHash, videoComposeNumber(m.Duration)))
 }
 
 type videoComposeFake struct {
@@ -195,6 +391,7 @@ type videoComposeFake struct {
 	calls                     [][]string
 	encodedBytes, cappedBytes int64
 	disclosures               int
+	rendered                  int
 }
 
 func (f *videoComposeFake) write(path string, m videoComposeMedia, size int64) error {
@@ -210,6 +407,7 @@ func (f *videoComposeFake) write(path string, m videoComposeMedia, size int64) e
 	return file.Close()
 }
 func (f *videoComposeFake) RenderCard(_ context.Context, film videoComposeFilm, index int, ref videoComposeMedia, path string) error {
+	f.rendered++
 	duration := film.Intro.Seconds
 	if index == len(film.Chapters) {
 		duration = film.Outro.Seconds
@@ -232,6 +430,9 @@ func (f *videoComposeFake) BurnDisclosure(_ context.Context, ch videoComposeChap
 func (f *videoComposeFake) run(_ context.Context, bin string, args []string) ([]byte, error) {
 	f.calls = append(f.calls, append([]string{bin}, args...))
 	if bin == "ffprobe" {
+		if !strings.Contains(strings.Join(args, " "), "-f mov -enable_drefs 0 -use_absolute_path 0 -i ") {
+			f.t.Fatal("probe is not pinned to self-contained MOV")
+		}
 		m, ok := f.media[args[len(args)-1]]
 		if !ok {
 			return nil, fmt.Errorf("no fake probe for %s", args[len(args)-1])
@@ -251,6 +452,12 @@ func (f *videoComposeFake) run(_ context.Context, bin string, args []string) ([]
 		if a == "concat" {
 			concat = true
 		}
+	}
+	if !concat && filepath.Ext(input) == ".mp4" && !strings.Contains(strings.Join(args, " "), "-f mov -enable_drefs 0 -use_absolute_path 0 -i ") {
+		f.t.Fatal("ffmpeg MP4 input is not pinned")
+	}
+	if filepath.Ext(input) == ".png" && !strings.Contains(strings.Join(args, " "), "-f image2pipe -c:v png -i ") {
+		f.t.Fatal("poster decoder is not pinned to PNG")
 	}
 	m := f.media[input]
 	if concat {
@@ -371,7 +578,7 @@ func TestVideoComposeMixedAspectRefused(t *testing.T) {
 	})
 	inputs := videoComposeTestInputs(t, raw)
 	other := filepath.Join(filepath.Dir(inputs[0]), "other.mp4")
-	if err := os.WriteFile(other, []byte("fake"), 0600); err != nil {
+	if err := os.WriteFile(other, videoComposeTestMP4(true), 0600); err != nil {
 		t.Fatal(err)
 	}
 	inputs = append(inputs, other)
@@ -422,6 +629,13 @@ func TestVideoComposeProbeRejectsInvalidMetadata(t *testing.T) {
 				t.Fatal("invalid metadata accepted")
 			}
 		})
+	}
+}
+
+func TestVideoComposeProbeRejectsWrongContainer(t *testing.T) {
+	raw := strings.Replace(string(videoComposeTestProbe(videoComposeTestMedia(10))), `"format_name":"mov,mp4,m4a,3gp,3g2,mj2"`, `"format_name":"dash"`, 1)
+	if _, err := parseVideoComposeProbe([]byte(raw)); err == nil {
+		t.Fatal("valid stream metadata from a non-MP4 container accepted")
 	}
 }
 

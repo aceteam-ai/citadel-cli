@@ -6,6 +6,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -194,6 +195,9 @@ func videoComposeInputs(inputs []string) (videoComposeFilm, []string, string, er
 		if files[ch.File] == "" {
 			return film, nil, "", fmt.Errorf("chapter %q is not a declared input", ch.File)
 		}
+		if err := validateVideoComposeMP4(files[ch.File]); err != nil {
+			return film, nil, "", fmt.Errorf("chapter %q: %w", ch.File, err)
+		}
 		chapters = append(chapters, files[ch.File])
 		delete(files, ch.File)
 	}
@@ -201,6 +205,142 @@ func videoComposeInputs(inputs []string) (videoComposeFilm, []string, string, er
 		return film, nil, "", fmt.Errorf("undeclared extra inputs are not supported")
 	}
 	return film, chapters, poster, nil
+}
+
+// This is a bounded container preflight, not a codec parser. Reject manifests
+// disguised as MP4 before handing bytes to any media tool. Walk only the normal
+// non-fragmented MP4 hierarchy and require self-contained data references.
+// Forced MOV demuxing with external references disabled remains mandatory even
+// after this check; a file/pipe protocol allowlist alone permits local-file SSRF.
+func validateVideoComposeMP4(path string) (retErr error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, f.Close()) }()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 32 {
+		return fmt.Errorf("not a self-contained MP4")
+	}
+	boxes, moovs, mdats, tracks, drefs := 0, 0, 0, 0, 0
+	var walk func(int64, int64, string, int) error
+	walk = func(start, end int64, parent string, depth int) error {
+		if depth > 6 {
+			return fmt.Errorf("MP4 nesting exceeds limit")
+		}
+		for offset := start; offset < end; {
+			boxes++
+			if boxes > 4096 || end-offset < 8 {
+				return fmt.Errorf("invalid or excessive MP4 boxes")
+			}
+			var header [16]byte
+			if _, err := f.ReadAt(header[:8], offset); err != nil {
+				return err
+			}
+			size, headerSize := int64(binary.BigEndian.Uint32(header[:4])), int64(8)
+			kind := string(header[4:8])
+			if size == 1 {
+				if end-offset < 16 {
+					return fmt.Errorf("truncated MP4 extended box")
+				}
+				if _, err := f.ReadAt(header[8:], offset+8); err != nil {
+					return err
+				}
+				extended := binary.BigEndian.Uint64(header[8:])
+				if extended > uint64(end-offset) {
+					return fmt.Errorf("MP4 box exceeds parent")
+				}
+				size, headerSize = int64(extended), 16
+			} else if size == 0 {
+				size = end - offset
+			}
+			if size < headerSize || size > end-offset {
+				return fmt.Errorf("invalid MP4 box size")
+			}
+			payload, boxEnd := offset+headerSize, offset+size
+			if parent == "" {
+				if offset == 0 && kind != "ftyp" {
+					return fmt.Errorf("chapter must start with MP4 ftyp, not a manifest")
+				}
+				switch kind {
+				case "ftyp":
+					if offset != 0 || size-headerSize < 8 || size-headerSize > 1024 || (size-headerSize)%4 != 0 {
+						return fmt.Errorf("invalid MP4 ftyp")
+					}
+					var brand [4]byte
+					if _, err := f.ReadAt(brand[:], payload); err != nil {
+						return err
+					}
+					switch string(brand[:]) {
+					case "isom", "iso2", "iso3", "iso4", "iso5", "iso6", "mp41", "mp42", "avc1":
+					default:
+						return fmt.Errorf("unsupported MP4 brand")
+					}
+				case "moov":
+					moovs++
+					if moovs != 1 || size > 16<<20 {
+						return fmt.Errorf("invalid or excessive MP4 moov")
+					}
+				case "mdat":
+					mdats++
+				case "free", "skip", "wide":
+				default:
+					return fmt.Errorf("unsupported MP4 top-level box %q", kind)
+				}
+			}
+			switch kind {
+			case "moov", "trak", "mdia", "minf", "dinf":
+				parents := map[string]string{"moov": "", "trak": "moov", "mdia": "trak", "minf": "mdia", "dinf": "minf"}
+				if parent != parents[kind] {
+					return fmt.Errorf("unexpected MP4 container %q", kind)
+				}
+				before := drefs
+				if err := walk(payload, boxEnd, kind, depth+1); err != nil {
+					return err
+				}
+				if kind == "trak" {
+					tracks++
+					if drefs-before != 1 {
+						return fmt.Errorf("MP4 track requires one self-contained data reference")
+					}
+				}
+			case "dref":
+				// FullBox version/flags=0, entry_count=1, one 12-byte url
+				// FullBox with flag=1 (self-contained) and no external location.
+				if parent != "dinf" || size-headerSize != 20 {
+					return fmt.Errorf("external or unsupported MP4 data reference")
+				}
+				var data [20]byte
+				if _, err := f.ReadAt(data[:], payload); err != nil {
+					return err
+				}
+				if binary.BigEndian.Uint32(data[:4]) != 0 || binary.BigEndian.Uint32(data[4:8]) != 1 || binary.BigEndian.Uint32(data[8:12]) != 12 || string(data[12:16]) != "url " || binary.BigEndian.Uint32(data[16:20]) != 1 {
+					return fmt.Errorf("MP4 data reference must be self-contained")
+				}
+				drefs++
+			case "cmov", "rmra", "rmda", "rdrf":
+				return fmt.Errorf("compressed/reference movie containers are unsupported")
+			}
+			offset = boxEnd
+		}
+		return nil
+	}
+	if err := walk(0, info.Size(), "", 0); err != nil {
+		return err
+	}
+	if moovs != 1 || mdats == 0 || tracks < 1 || tracks > 2 {
+		return fmt.Errorf("MP4 requires local movie, tracks and media data")
+	}
+	return nil
+}
+
+// Every MP4 consumer must use these input options, including future disclosure
+// rendering. Never let ffprobe/ffmpeg autodetect an untrusted chapter basename.
+func videoComposeMP4InputArgs(input string) []string {
+	return []string{"-protocol_whitelist", "file", "-format_whitelist", "mov", "-f", "mov", "-enable_drefs", "0", "-use_absolute_path", "0", "-i", input}
 }
 
 type videoComposeMedia struct {
@@ -230,11 +370,15 @@ func parseVideoComposeProbe(raw []byte) (videoComposeMedia, error) {
 		} `json:"streams"`
 		Format struct {
 			Duration string `json:"duration"`
+			Name     string `json:"format_name"`
 		} `json:"format"`
 	}
 	var m videoComposeMedia
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return m, err
+	}
+	if probe.Format.Name != "mov,mp4,m4a,3gp,3g2,mj2" {
+		return m, fmt.Errorf("probe did not accept a MOV/MP4 container")
 	}
 	if len(probe.Streams) != 2 {
 		return m, fmt.Errorf("chapter requires exactly one video and one audio stream")
@@ -349,7 +493,8 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		return nil, err
 	}
 	probe := func(path string) (videoComposeMedia, error) {
-		raw, err := deps.run(ctx, ffprobe, []string{"-v", "error", "-protocol_whitelist", "file,pipe", "-show_streams", "-show_format", "-show_data_hash", "sha256", "-of", "json", "-i", path})
+		args := append([]string{"-v", "error", "-show_streams", "-show_format", "-show_data_hash", "sha256", "-of", "json"}, videoComposeMP4InputArgs(path)...)
+		raw, err := deps.run(ctx, ffprobe, args)
 		if err != nil {
 			return videoComposeMedia{}, fmt.Errorf("ffprobe failed: %w", err)
 		}
@@ -507,11 +652,14 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		return nil, err
 	}
 	if poster != "" {
-		if err := run([]string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-i", poster, "-frames:v", "1", posterPath}); err != nil {
+		if err := run([]string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file", "-format_whitelist", "image2pipe", "-f", "image2pipe", "-c:v", "png", "-i", poster, "-frames:v", "1", posterPath}); err != nil {
 			return nil, err
 		}
-	} else if err := run([]string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-ss", videoComposeNumber(reference.Duration), "-i", filmPath, "-frames:v", "1", posterPath}); err != nil {
-		return nil, err
+	} else {
+		args := append([]string{"-hide_banner", "-nostdin", "-y", "-ss", videoComposeNumber(reference.Duration)}, videoComposeMP4InputArgs(filmPath)...)
+		if err := run(append(args, "-frames:v", "1", posterPath)); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := videoComposeOutputInfo(posterPath); err != nil {
 		return nil, err
@@ -534,7 +682,8 @@ func videoComposeOutputInfo(path string) (os.FileInfo, error) {
 	return info, nil
 }
 func videoComposePrepareArgs(input, output string, ref videoComposeMedia, copyStreams bool) []string {
-	args := []string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-i", input, "-map", "0:v:0", "-map", "0:a:0", "-map_metadata", "-1", "-map_chapters", "-1"}
+	args := append([]string{"-hide_banner", "-nostdin", "-y"}, videoComposeMP4InputArgs(input)...)
+	args = append(args, "-map", "0:v:0", "-map", "0:a:0", "-map_metadata", "-1", "-map_chapters", "-1")
 	if copyStreams {
 		return append(args, "-c", "copy", output)
 	}
@@ -542,7 +691,7 @@ func videoComposePrepareArgs(input, output string, ref videoComposeMedia, copySt
 }
 func videoComposeLoudnormArgs(input, output string, target videoComposeLoudness, stats *loudnormStats) []string {
 	filter := fmt.Sprintf("loudnorm=I=%s:TP=%s:LRA=%s", videoComposeNumber(target.I), videoComposeNumber(target.TP), videoComposeNumber(target.LRA))
-	args := []string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-i", input}
+	args := append([]string{"-hide_banner", "-nostdin", "-y"}, videoComposeMP4InputArgs(input)...)
 	if stats == nil {
 		return append(args, "-vn", "-af", filter+":print_format=json", "-f", "null", "-")
 	}
@@ -560,5 +709,6 @@ func videoComposeCapArgs(input, output string, duration float64, maxBytes int64)
 		return nil, fmt.Errorf("delivery budget cannot support audio and video")
 	}
 	rate := strconv.FormatInt(videoRate, 10)
-	return []string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-i", input, "-map", "0:v:0", "-map", "0:a:0", "-c:v", "libx264", "-b:v", rate, "-maxrate", rate, "-bufsize", strconv.FormatInt(videoRate*2, 10), "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", output}, nil
+	args := append([]string{"-hide_banner", "-nostdin", "-y"}, videoComposeMP4InputArgs(input)...)
+	return append(args, "-map", "0:v:0", "-map", "0:a:0", "-c:v", "libx264", "-b:v", rate, "-maxrate", rate, "-bufsize", strconv.FormatInt(videoRate*2, 10), "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", output), nil
 }

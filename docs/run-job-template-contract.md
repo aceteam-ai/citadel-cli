@@ -162,6 +162,22 @@ external URL, unlisted file lookup, extra input, or music `bed` is supported.
 Chapter names use ASCII letters/digits/underscore/hyphen/dot, end in `.mp4`, and
 cannot start with a dot or hyphen.
 
+An `.mp4` suffix is not a container guarantee. Before tool discovery, chapter
+preflight requires a normal self-contained, non-fragmented ISO-BMFF MP4:
+initial `ftyp` with a supported MP4 brand, one `moov`, local `mdat`, and one or
+two tracks whose `dref` is exactly a self-contained `url ` entry. Reference/
+compressed movies, external data references, unsupported top-level boxes and
+fragmented containers are refused. Box traversal is capped at 4096 boxes, six
+levels and a 16 MiB movie box, without reading media payloads. The preflight is
+not a codec validator. Every MP4 probe and decode additionally forces the MOV
+demuxer and MOV format whitelist with `enable_drefs=0` and
+`use_absolute_path=0`; returned container metadata must match the MOV family.
+Future disclosure rendering must use the same pinned input options. The
+supplied-poster path forces `image2pipe` and the PNG decoder. A file protocol
+allowlist alone does not prevent a disguised manifest from reading undeclared
+local bytes. FFmpeg documents the external-track controls in its
+[MOV demuxer options](https://ffmpeg.org/ffmpeg-formats.html#mov_002fmp4_002f3gp).
+
 `videoComposeFilmSchema` owns the proposed closed film schema. Exact keys are
 checked at every object level; duplicate keys, trailing JSON and invalid Unicode
 are refused before struct binding. Top-level fields are `title`, `subtitle`,
@@ -221,7 +237,15 @@ review because #11481 specifies the default but does not explicitly spell out
 the maximum. Only an oversized result triggers one x264 bitrate cap pass; it
 reserves mux/audio headroom, copies the normalized audio, and fails if actual
 bytes still exceed the limit. Both final encode paths request `+faststart`.
-No node performance measurement or live ffmpeg validation has been performed.
+No node performance measurement or full-film media validation has been performed.
+The opt-in `TestVideoComposeLocalEncodedMP4` accepts a disposable encoded MP4
+through `CITADEL_VIDEO_COMPOSE_OFFLINE_FIXTURE` (at most 1 MiB) and optional local
+DASH fixture through `CITADEL_VIDEO_COMPOSE_OFFLINE_MANIFEST` (at most 64 KiB).
+It bounds local commands to 15 seconds, verifies the genuine MP4's pinned probe
+and copy/re-encode paths, and refuses the disguised manifest. Normal unit tests
+use synthetic container/probe fixtures and invoke no media binaries. The
+disguised-manifest regression asserts rejection before discovery, subprocesses,
+rendering or output creation, even with a valid undeclared BaseURL target.
 
 Proposed outputs are `film.mp4`, `poster.png`, and `chapters.json`. The poster is
 the frame immediately after the intro or a decoded/re-encoded supplied override.
