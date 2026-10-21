@@ -8,10 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/coordinatorfetch"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
@@ -27,11 +26,11 @@ import (
 // The coordinator owns HMAC verification, exact org/node/document/object/hash/
 // size binding, the ten-minute maximum capability lifetime, and mint/fetch audit.
 // Keep this literal in sync with the coordinator; this is not a proxy allowlist.
-const FileFetchEndpointPath = "/api/shared/file-fetch"
+const FileFetchEndpointPath = coordinatorfetch.FileFetchPath
 
 const (
-	fileFetchHardMaxBytes  int64 = 2 << 30
-	fileFetchTimeout             = 5 * time.Minute
+	fileFetchHardMaxBytes  int64 = coordinatorfetch.MaxBytes
+	fileFetchTimeout             = coordinatorfetch.Timeout
 	fileFetchMaxTokenBytes       = 4096
 )
 
@@ -71,12 +70,8 @@ func fileFetchRefusal(reason string) error {
 }
 
 func fileFetchOrigin(raw string) (*url.URL, error) {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil ||
-		u.Port() != "" || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery ||
-		u.Fragment != "" || u.RawFragment != "" || (u.Path != "" && u.Path != "/") ||
-		u.RawPath != "" || strings.ContainsAny(u.Host, "%\\") || strings.HasSuffix(u.Host, ".") ||
-		(raw != "https://"+u.Host && raw != "https://"+u.Host+"/") || strings.HasSuffix(u.Host, ":") {
+	u, err := coordinatorfetch.Origin(raw)
+	if err != nil {
 		return nil, fileFetchRefusal("untrusted_origin")
 	}
 	return u, nil
@@ -125,92 +120,21 @@ func (h *FileFetchHandler) validateURL(raw string) (*url.URL, error) {
 }
 
 func fileFetchValidateCapability(token string) error {
-	if token == "" || token == "." || token == ".." || len(token) > fileFetchMaxTokenBytes {
+	if !coordinatorfetch.ValidCapability(token) {
 		return fileFetchRefusal("invalid_capability")
-	}
-	for _, c := range token {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
-			return fileFetchRefusal("invalid_capability")
-		}
 	}
 	return nil
 }
 
-// fileFetchPublicIP excludes special-purpose ranges as well as RFC1918/ULA,
-// metadata, loopback, multicast and the mesh. IPv6 transition/NAT64 addresses
-// are refused so they cannot encode a destination that bypasses IPv4 policy.
-func fileFetchPublicIP(ip netip.Addr) bool {
-	ip = ip.Unmap()
-	if !ip.IsValid() || ip.Zone() != "" || !ip.IsGlobalUnicast() || ip.IsPrivate() {
-		return false
+func (h *FileFetchHandler) fetchHooks() coordinatorfetch.Hooks {
+	return coordinatorfetch.Hooks{
+		LookupIP: h.lookupIP, DialIP: h.dialIP, NewTransport: h.newTransport,
+		InterfaceAddrs: func() ([]net.Addr, error) { return interfaceAddrsFn() },
 	}
-	if ip.Is6() && !netip.MustParsePrefix("2000::/3").Contains(ip) {
-		return false
-	}
-	for _, prefix := range []string{
-		"0.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-		"192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "198.18.0.0/15",
-		"198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
-		"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20",
-	} {
-		if netip.MustParsePrefix(prefix).Contains(ip) {
-			return false
-		}
-	}
-	return true
 }
 
 func (h *FileFetchHandler) transport(host string) *http.Transport {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	lookup := h.lookupIP
-	if lookup == nil {
-		lookup = net.DefaultResolver.LookupIPAddr
-	}
-	dial := h.dialIP
-	if dial == nil {
-		dial = dialer.DialContext
-	}
-	tr := &http.Transport{}
-	if h.newTransport != nil {
-		tr = h.newTransport()
-	}
-	tr.Proxy = nil
-	tr.DisableCompression = true
-	tr.DisableKeepAlives = true
-	tr.TLSHandshakeTimeout = 10 * time.Second
-	tr.ResponseHeaderTimeout = 30 * time.Second
-	tr.MaxResponseHeaderBytes = 64 << 10
-	tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		hostname, port, err := net.SplitHostPort(address)
-		if err != nil || hostname != host || port != "443" {
-			return nil, fileFetchRefusal("destination_blocked")
-		}
-		ips, err := lookup(ctx, hostname)
-		if err != nil || len(ips) == 0 {
-			return nil, fileFetchRefusal("dns_failed")
-		}
-		own, err := ownInterfaceAddrs()
-		if err != nil {
-			return nil, fileFetchRefusal("destination_blocked")
-		}
-		// Validate ALL answers before any connect; pin actual numeric addresses.
-		// Re-resolution and these checks run on every transport reconnect.
-		for _, ip := range ips {
-			addr, ok := netip.AddrFromSlice(ip.IP)
-			if !ok || ip.Zone != "" || !fileFetchPublicIP(addr) || own.has(addr) {
-				return nil, fileFetchRefusal("destination_blocked")
-			}
-		}
-		for _, ip := range ips {
-			conn, err := dial(ctx, network, net.JoinHostPort(ip.IP.String(), port))
-			if err == nil {
-				return conn, nil
-			}
-		}
-		return nil, fileFetchRefusal("connect_failed")
-	}
-	return tr
+	return coordinatorfetch.Transport(host, h.fetchHooks())
 }
 
 // Execute accepts only url, capability, dest_path, expected_sha256 and max_bytes (plus
@@ -290,54 +214,19 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			}
 		}()
 	}
-	req, err := http.NewRequestWithContext(deadline, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fileFetchRefusal("invalid_capability_url")
-	}
-	req.Header.Set("Accept-Encoding", "identity")
-	req.Header.Set("Authorization", "Bearer "+capability)
-	tr := h.transport(u.Hostname())
-	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	resp, err := client.Do(req)
-	if err != nil {
-		if deadline.Err() != nil {
-			return nil, fileFetchRefusal("cancelled_or_timeout")
-		}
-		var refusal *fileFetchError
-		if errors.As(err, &refusal) {
-			return nil, refusal
-		}
-		return nil, fileFetchRefusal("fetch_failed")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusGone {
-		return nil, fileFetchRefusal("capability_invalid_or_expired")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fileFetchRefusal("unexpected_status")
-	}
-	if resp.Header.Get("Content-Encoding") != "" && resp.Header.Get("Content-Encoding") != "identity" {
-		return nil, fileFetchRefusal("content_encoding_refused")
-	}
-	if resp.ContentLength > maxBytes {
-		return nil, fileFetchRefusal("size_exceeded")
-	}
-
-	hash := sha256.New()
-	n, err := io.Copy(io.MultiWriter(temp, hash), io.LimitReader(resp.Body, maxBytes+1))
-	// Cancellation can terminate a partial body with EOF and no Copy error.
-	// Observe cancellation before classifying partial bytes as a hash mismatch.
+	result, err := coordinatorfetch.Get(deadline, u.Scheme+"://"+u.Host, coordinatorfetch.FileFetch, capability, maxBytes, temp, h.fetchHooks())
+	// Cooperative cancellation takes precedence over partial-body classification.
 	if deadline.Err() != nil || ctx.CancelRequestedNow() {
 		return nil, fileFetchRefusal("cancelled_or_timeout")
 	}
 	if err != nil {
+		var refusal *coordinatorfetch.Refusal
+		if errors.As(err, &refusal) {
+			return nil, fileFetchRefusal(refusal.Reason())
+		}
 		return nil, fileFetchRefusal("transfer_failed")
 	}
-	if n > maxBytes {
-		return nil, fileFetchRefusal("size_exceeded")
-	}
-	sum := hash.Sum(nil)
+	n, sum := result.Bytes, result.SHA256[:]
 	if !bytes.Equal(sum, wantHash) {
 		return nil, fileFetchRefusal("sha256_mismatch")
 	}

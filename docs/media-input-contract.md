@@ -105,10 +105,12 @@ checks its type before opening the same inode for reading; see
 a matching content hash do not prove that an inode has no outside-workspace
 hard links. No UID restriction is invented by this source change.
 
-The separately prepared workspace freezer and header/EXIF/mask guards remain
-inactive; parsing still does not invoke them or authorize acquisition.
-Remaining #1314 work includes reviewed acquisition-policy decisions, shared
-pinned inbox-fetch transport, withheld store, sidecar and handler wiring and
+The separately prepared workspace/inbox freezers and header/EXIF/mask guards
+remain inactive; parsing still does not invoke them or authorize acquisition.
+The stacked C1c draft prepares the shared pinned inbox client; it is not main
+integration, contract ratification or execution authority. Remaining #1314 work
+includes reviewed acquisition-policy decisions, independent acquisition-client
+review/integration, withheld store, sidecar and handler wiring and
 the live `media_inputs` permission. The published result contract
 must use the separately reviewed upload route: **no edit input or output image
 bytes cross Redis**. No stale base64 publication fixture is pinned here. Native
