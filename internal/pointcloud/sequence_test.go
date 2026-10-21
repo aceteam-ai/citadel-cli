@@ -135,7 +135,7 @@ func TestReaderRejectsMalformedLengthsCountsFPSAndOffsets(t *testing.T) {
 		"zero fps":      func(b []byte) []byte { binary.LittleEndian.PutUint32(b[24:], 0); return b },
 		"zero divisor":  func(b []byte) []byte { binary.LittleEndian.PutUint32(b[28:], 0); return b },
 		"fps above cap": func(b []byte) []byte { binary.LittleEndian.PutUint32(b[24:], 31); return b },
-		"unreduced fps": func(b []byte) []byte { binary.LittleEndian.PutUint32(b[24:], 30); binary.LittleEndian.PutUint32(b[28:], 2); return b },
+		"unreduced fps": withUnreducedFPS,
 		"first offset":  func(b []byte) []byte { binary.LittleEndian.PutUint64(b[32:], 1); return b },
 		"decreasing":    func(b []byte) []byte { binary.LittleEndian.PutUint64(b[48:], 0); return b },
 		"wrong final":   func(b []byte) []byte { binary.LittleEndian.PutUint64(b[56:], 2); return b },
@@ -167,6 +167,12 @@ func TestReaderRejectsMalformedLengthsCountsFPSAndOffsets(t *testing.T) {
 	if VerifySHA256(bytes.NewReader(valid), int64(len(valid)), string(bytes.Repeat([]byte("0"), 64))) != ErrInvalid {
 		t.Fatal("wrong artifact digest accepted")
 	}
+}
+
+func withUnreducedFPS(data []byte) []byte {
+	binary.LittleEndian.PutUint32(data[24:], 30)
+	binary.LittleEndian.PutUint32(data[28:], 2)
+	return data
 }
 
 type failedWriteFile struct {

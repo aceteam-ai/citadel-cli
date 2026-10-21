@@ -52,6 +52,7 @@ jobs:
           if [ -n "$unformatted" ]; then
             echo "::error::The following files are not gofmt-clean. Run 'gofmt -w .':"
             echo "$unformatted"
+            gofmt -d .
             exit 1
           fi
 
