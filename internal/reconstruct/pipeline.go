@@ -4,13 +4,13 @@
 package reconstruct
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -87,6 +87,7 @@ type QualitySignal struct {
 type Artifact struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 // Result reports the quality gate and, only after success, the promoted PLY.
@@ -249,9 +250,12 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if !info.Mode().IsRegular() {
 		return result, fmt.Errorf("reconstruct: final artifact is not a regular file")
 	}
-	digest, err := hashFile(ctx, ply)
+	digest, size, err := hashFile(ctx, ply)
 	if err != nil {
 		return result, fmt.Errorf("reconstruct: hash final artifact: %w", err)
+	}
+	if size == 0 {
+		return result, fmt.Errorf("reconstruct: final artifact is empty")
 	}
 
 	publishDir, err := os.MkdirTemp(parent, "."+base+".publish-")
@@ -278,6 +282,7 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 	result.Artifact = &Artifact{
 		Path:   filepath.Join(output, "splat.ply"),
 		SHA256: "sha256:" + digest,
+		Size:   size,
 	}
 	return result, nil
 }
@@ -333,7 +338,7 @@ func normalizeRequest(req Request) (Request, string, string, bool, error) {
 	if req.FrameFPS == 0 {
 		req.FrameFPS = defaultFrameFPS
 	}
-	if req.FrameFPS <= 0 || req.FrameFPS > 120 {
+	if !finite(req.FrameFPS) || req.FrameFPS <= 0 || req.FrameFPS > 120 {
 		return req, "", "", false, fmt.Errorf("reconstruct: frame FPS must be in (0, 120]")
 	}
 	if req.SFMQuality == "" {
@@ -369,16 +374,20 @@ func normalizeRequest(req Request) (Request, string, string, bool, error) {
 	if req.MinRegisteredPercent == 0 {
 		req.MinRegisteredPercent = defaultMinRegisteredPercent
 	}
-	if req.MinRegisteredPercent < 0 || req.MinRegisteredPercent > 100 {
+	if !finite(req.MinRegisteredPercent) || req.MinRegisteredPercent < 0 || req.MinRegisteredPercent > 100 {
 		return req, "", "", false, fmt.Errorf("reconstruct: minimum registered percent must be in [0, 100]")
 	}
 	if req.MaxMeanReprojectionPX == 0 {
 		req.MaxMeanReprojectionPX = defaultMaxMeanReprojection
 	}
-	if req.MaxMeanReprojectionPX < 0 {
+	if !finite(req.MaxMeanReprojectionPX) || req.MaxMeanReprojectionPX < 0 {
 		return req, "", "", false, fmt.Errorf("reconstruct: maximum mean reprojection must be nonnegative")
 	}
 	return req, input, output, info.IsDir(), nil
+}
+
+func finite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func pathWithin(path, directory string) bool {
@@ -424,24 +433,39 @@ func ParseQualitySignal(output string) (QualitySignal, error) {
 	registered := registeredRE.FindAllStringSubmatch(output, -1)
 	if len(registered) > 0 {
 		last := registered[len(registered)-1]
-		signal.RegisteredImages, _ = strconv.Atoi(last[1])
-		signal.TotalImages, _ = strconv.Atoi(last[2])
-		if signal.TotalImages > 0 {
-			signal.RegisteredPercent = 100 * float64(signal.RegisteredImages) / float64(signal.TotalImages)
+		var registeredErr, totalErr error
+		signal.RegisteredImages, registeredErr = strconv.Atoi(last[1])
+		signal.TotalImages, totalErr = strconv.Atoi(last[2])
+		if registeredErr != nil || totalErr != nil || signal.TotalImages <= 0 ||
+			signal.RegisteredImages > signal.TotalImages {
+			return QualitySignal{}, fmt.Errorf("invalid registered-image counts")
 		}
+		signal.RegisteredPercent = 100 * float64(signal.RegisteredImages) / float64(signal.TotalImages)
 	}
 	reprojection := reprojectionRE.FindAllStringSubmatch(output, -1)
 	if len(reprojection) > 0 {
-		signal.MeanReprojectionPX, _ = strconv.ParseFloat(reprojection[len(reprojection)-1][1], 64)
+		var err error
+		signal.MeanReprojectionPX, err = strconv.ParseFloat(reprojection[len(reprojection)-1][1], 64)
+		if err != nil {
+			return QualitySignal{}, fmt.Errorf("invalid mean-reprojection value")
+		}
 	}
 	result := resultRE.FindAllStringSubmatch(output, -1)
 	if len(result) > 0 {
 		last := result[len(result)-1]
 		if signal.TotalImages == 0 {
-			signal.RegisteredPercent, _ = strconv.ParseFloat(last[1], 64)
+			var err error
+			signal.RegisteredPercent, err = strconv.ParseFloat(last[1], 64)
+			if err != nil {
+				return QualitySignal{}, fmt.Errorf("invalid registered-image percentage")
+			}
 		}
 		if len(reprojection) == 0 {
-			signal.MeanReprojectionPX, _ = strconv.ParseFloat(last[2], 64)
+			var err error
+			signal.MeanReprojectionPX, err = strconv.ParseFloat(last[2], 64)
+			if err != nil {
+				return QualitySignal{}, fmt.Errorf("invalid mean-reprojection value")
+			}
 		}
 	}
 	if signal.TotalImages == 0 && len(result) == 0 {
@@ -450,52 +474,83 @@ func ParseQualitySignal(output string) (QualitySignal, error) {
 	if len(reprojection) == 0 && len(result) == 0 {
 		return QualitySignal{}, fmt.Errorf("mean-reprojection summary not found")
 	}
+	if !finite(signal.RegisteredPercent) || signal.RegisteredPercent < 0 || signal.RegisteredPercent > 100 ||
+		!finite(signal.MeanReprojectionPX) || signal.MeanReprojectionPX < 0 {
+		return QualitySignal{}, fmt.Errorf("quality summary is outside its finite range")
+	}
 	return signal, nil
 }
 
-func hashFile(ctx context.Context, path string) (string, error) {
+func hashFile(ctx context.Context, path string) (string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer f.Close()
 	h := sha256.New()
+	var size int64
 	buf := make([]byte, 256*1024)
 	for {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", 0, err
 		}
 		n, readErr := f.Read(buf)
 		if n > 0 {
-			if _, err := h.Write(buf[:n]); err != nil {
-				return "", err
+			if size > math.MaxInt64-int64(n) {
+				return "", 0, fmt.Errorf("artifact byte count overflow")
 			}
+			if _, err := h.Write(buf[:n]); err != nil {
+				return "", 0, err
+			}
+			size += int64(n)
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil {
-			return "", readErr
+			return "", 0, readErr
 		}
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), size, nil
 }
 
 // synchronizedBuffer tolerates stdout and stderr copy goroutines writing at
 // the same time in os/exec.
 type synchronizedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
+	mu     sync.Mutex
+	data   [maxSFMLogBytes]byte
+	next   int
+	length int
 }
+
+// Only the bounded summary tail is retained. The caller's separate Log writer
+// still receives its original stream; a missing/truncated summary fails closed.
+const maxSFMLogBytes = 256 << 10
 
 func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.Write(p)
+	n := len(p)
+	if n >= maxSFMLogBytes {
+		copy(b.data[:], p[n-maxSFMLogBytes:])
+		b.next, b.length = 0, maxSFMLogBytes
+		return n, nil
+	}
+	first := min(n, maxSFMLogBytes-b.next)
+	copy(b.data[b.next:], p[:first])
+	copy(b.data[:], p[first:])
+	b.next = (b.next + n) % maxSFMLogBytes
+	b.length = min(maxSFMLogBytes, b.length+n)
+	return n, nil
 }
 
 func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.String()
+	start := (b.next - b.length + maxSFMLogBytes) % maxSFMLogBytes
+	first := min(b.length, maxSFMLogBytes-start)
+	return string(b.data[start:start+first]) + string(b.data[:b.length-first])
 }

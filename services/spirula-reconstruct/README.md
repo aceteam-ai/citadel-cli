@@ -13,7 +13,9 @@ manifest/keyframe retention contract, and platform state machine remain in
 ## Execution contract
 
 The container runs to completion and emits one JSON result. A successful result
-contains only the node-local artifact path and its SHA256, never PLY bytes:
+contains only the node-local artifact path, SHA256 and actual hashed byte size,
+never PLY bytes. This example shows shape only; its size is illustrative, not a
+new native acceptance measurement:
 
 ```json
 {
@@ -27,7 +29,8 @@ contains only the node-local artifact path and its SHA256, never PLY bytes:
   },
   "artifact": {
     "path": "/data/reconstruct-results/scan-001/splat.ply",
-    "sha256": "sha256:..."
+    "sha256": "sha256:...",
+    "size": 12345
   }
 }
 ```
@@ -39,6 +42,12 @@ load-bearing because the upstream CLI otherwise stays alive serving its viewer.
 The wrapper parses Spirula's registered-image and mean-reprojection summaries.
 The default go/no-go threshold is at least 50 percent registered and no more
 than 2 px mean reprojection error. A rejected capture exits before training.
+Tuning and parsed quality values must be finite; impossible counts/percentages
+and numeric overflow are refused before training. The summary capture retains
+a bounded tail, owned by `maxSFMLogBytes` in `internal/reconstruct/pipeline.go`;
+if no parseable summary remains, training is refused rather than guessed safe.
+The separate caller log stream is not truncated or privacy-filtered by this
+capture, so it must not be forwarded verbatim as dispatched job progress.
 
 Every child starts in its own process group. SIGINT, SIGTERM, or lifecycle
 context cancellation kills the full ffmpeg/Spirula process tree. Work and
@@ -121,6 +130,15 @@ Acceptance checks:
 4. `sha256sum` of that PLY matches the JSON digest.
 5. During a second run, stop the container while SfM or training is active.
    No `spirula`/`ffmpeg` GPU process and no requested output path may remain.
+
+## Dispatched job follow-up
+
+`docs/reconstruct-splat-job.md` tracks the complete #1381 source work, including
+mandatory SPZ, a genuine optional poster, frozen workspace inputs, create-only
+publication, actual container-exit custody, and the paired v2 event receipt and
+viewer contract. The engine's operator paths are not workspace authority. These
+source hardening changes do not register a job, build/promote a new image, prove
+SPZ conversion or supply new GPU acceptance.
 
 ## Hermetic tests
 
