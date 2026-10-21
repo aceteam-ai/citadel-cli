@@ -2849,14 +2849,22 @@ mod continuation_tests {
         tauri::async_runtime::block_on(async {
             let (auth, io) = AuthState::fixture(None); auth.view().await.unwrap();
             let _begun = start(&auth, &io, false).await.unwrap();
-            io.raw(Route::Cancel, 503, b"");
+            // close_reserved runs clean_pending directly (to gate the departing
+            // refresh) and again through clean_owned, so one failed close makes
+            // two exact cancels of the same unacknowledged handle. Both fail.
+            io.raw(Route::Cancel, 503, b""); io.raw(Route::Cancel, 503, b"");
             let failed = auth.cancel_login("1", OP2, OP1).await.unwrap();
             assert!(failed.error.is_some() && failed.view.auth_epoch == TERMINAL.to_string());
+            assert!(io.request_count() == 3);
+            {
+                let flow = auth.flow.lock().await;
+                assert!(!flow.cleanup.as_ref().unwrap().state.as_ref().unwrap().acknowledged);
+            }
             io.raw(Route::Cancel, 200, b"");
             let cleaned = auth.sign_out(&TERMINAL.to_string(), OP3).await.unwrap();
             assert!(cleaned.error.is_none() && cleaned.view.auth_epoch == TERMINAL.to_string());
             assert!(!auth.flow.lock().await.unknown_issuance && auth.begin_login("3", OP1).await.is_err());
-            assert!(io.request_count() == 3);
+            assert!(io.request_count() == 4);
         });
     }
     #[test]
