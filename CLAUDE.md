@@ -31,6 +31,14 @@ So, when adding to this file:
 
 ## Project Overview
 
+`workflow.LLMPolicy` owns the LLM node's destination authority separately from
+the general HTTP node. `LoadLLMPolicy` reads exact endpoint grants only from the
+explicit node configuration directory; both real worker entrypoints use
+`workflowLLMPolicy`. Zero policy is public-only, including refusal of the legacy
+local Ollama default unless explicitly granted. No graph-supplied grant, proxy,
+redirect, insecure TLS or metadata/link-local exception is supported. See
+`docs/workflow-llm-policy.md` for the source policy, compatibility gate and holds.
+
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
 advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,

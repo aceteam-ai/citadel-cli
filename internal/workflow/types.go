@@ -129,6 +129,7 @@ type ExecutorConfig struct {
 	MaxConcurrentRuns int
 	Shell             ShellConfig
 	HTTP              HTTPPolicy
+	LLM               LLMPolicy
 }
 
 func (g *WorkflowGraph) Validate() error {

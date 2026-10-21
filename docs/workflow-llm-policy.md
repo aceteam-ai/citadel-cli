@@ -86,3 +86,18 @@ tests/build/formatter, real network services or LLM calls, model downloads,
 GPU/inference, policy/credential changes and deployment remain held. Source
 approval, compatibility ratification, readiness and native acceptance are
 separate; no automatic merge or node configuration step is included.
+
+Prepared source now wires the actual LLM node and both real worker entrypoints,
+not only a helper. Tests use owned HTTP/TLS fixtures and private resolver/dial
+seams, never a real model server. The old mock-server test explicitly grants
+only its synthetic endpoint through the same production guard. Prepared cases
+cover closed policy/URL schema and limits; every-answer DNS and later rebinding;
+exact local endpoint versus path/port confusion; hard ranges even with grants;
+proxy/redirect/TLS refusal; response limit minus/exact/plus one; static DNS,
+network, server/body/JSON failures; full request and earlier caller deadlines;
+and caller cancellation while DNS, a detached dial or body read is pending.
+These are not locally executed results; fresh normal CI is still required.
+
+Client cancellation is not proof that a model server stopped inference. This
+change neither evicts a service nor establishes native GPU/process-exit custody.
+It does not fix the separately tracked workflow Cancel implementation by itself.
