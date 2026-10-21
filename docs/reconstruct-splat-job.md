@@ -90,6 +90,11 @@ retained with any later image change. No source metadata is native validation.
 
 ## Acceptance ledger
 
+- Cross-repo signing/manifest/units/viewer choice is [a proposal only](https://github.com/aceteam-ai/aceteam/issues/11829#issuecomment-6327102060),
+  not a frozen design. Automated-aceteam reports no assigned viewer/backend
+  owner while its P0 queue is active. Neither side may invent the new action
+  unilaterally. Actual pinned consumer version, axes/exporter fixture, manifest
+  encoding, signed-unit equality and confinement limits still need ratification.
 - Phase 1 source prepared: artifact sizes count the bytes actually hashed;
   empty final artifacts are refused. Nonfinite tuning, overflowing/impossible
   quality counts and percentages are rejected; SfM capture is a fixed-size
@@ -107,6 +112,12 @@ retained with any later image change. No source metadata is native validation.
   network-filesystem recovery or real container-exit custody is established.
 - Pending: accepted receipt action/units and paired backend owner; viewer SPZ
   version/axes, converter/tool/dependency pins and confined input limits/policy.
+- Bounded progress source prepared: an optional trusted observer receives only
+  fixed stage/state transitions for extraction, SfM and training, at most six
+  events. Synthetic tests include private noisy logs and tool errors, failed
+  quality, cancellation and missing artifacts. Starting does not prove process
+  ownership; training completion does not prove publication or signed success.
+  No authenticated progress transport or job registration is wired by the seam.
 - Pending: complete handler/container/receipt/publication/registration source,
   negative/race/fault tests and exact-head independent review/CI.
 - Held: local candidate execution outside separate grants, GPU/model/binary or

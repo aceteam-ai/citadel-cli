@@ -49,6 +49,15 @@ if no parseable summary remains, training is refused rather than guessed safe.
 The separate caller log stream is not truncated or privacy-filtered by this
 capture, so it must not be forwarded verbatim as dispatched job progress.
 
+`Runner.Progress` is the separate, trusted observer seam for future structured
+progress. It emits at most six fixed events: starting and complete/failed for
+frame extraction (video only), SfM and training; SfM can instead be rejected by
+the quality gate. Events contain only `stage` and `state`, never tool output,
+paths or error messages. A `starting` event is not proof a process/container
+started; `training/complete` is not successful artifact publication or a signed
+job completion. Observers are synchronous and must not block. No dispatched
+transport is wired by this seam.
+
 Every child starts in its own process group. SIGINT, SIGTERM, or lifecycle
 context cancellation asks the Linux executor to kill that group and waits for
 the command. This is not containment of a deliberately detached process or
