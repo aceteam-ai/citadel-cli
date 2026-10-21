@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -23,6 +24,11 @@ const (
 	// legitimate user who fat-fingers the PIN loses time, not data.
 	lockoutBase = 30 * time.Second
 	lockoutCap  = time.Hour
+
+	// Keep escalation across capped lockouts; correct PINs do not erase recent
+	// guesses. At most the newest 64 timestamps are persisted (#1371).
+	failureWindow     = 24 * time.Hour
+	maxFailureHistory = 64
 )
 
 const lockoutStateFile = "state.yaml"
@@ -51,17 +57,55 @@ type lockoutState struct {
 	FailedAttempts int       `yaml:"failed_attempts"`
 	LockoutUntil   time.Time `yaml:"lockout_until"`
 	LastVerifiedAt time.Time `yaml:"last_verified_at"`
+
+	// No omitempty: an explicit empty list distinguishes expired/reset history
+	// from legacy state that has only an undated failed_attempts counter.
+	FailureTimes []time.Time `yaml:"failure_times"`
 }
 
 func (v *Vault) lockoutPath() string { return filepath.Join(v.dir, lockoutStateFile) }
 
 func (v *Vault) readLockout() lockoutState {
+	return v.readLockoutAt(time.Now())
+}
+
+func (v *Vault) readLockoutAt(now time.Time) lockoutState {
 	var s lockoutState
 	data, err := os.ReadFile(v.lockoutPath())
 	if err != nil {
-		return s // absent = clean slate
+		return normalizeLockout(s, now) // absent = clean slate
 	}
 	_ = yaml.Unmarshal(data, &s)
+	return normalizeLockout(s, now)
+}
+
+// normalizeLockout is pure. Reading status never writes/migrates live state.
+// The next existing failure/success write persists the migration once: legacy
+// counts have unknown age, so conservatively seed them at that write's time.
+// Keep the old scalar in sync for older binaries; this does not make mixed-
+// version writers or concurrent processes safe (separate issue #1395).
+func normalizeLockout(s lockoutState, now time.Time) lockoutState {
+	history := make([]time.Time, 0)
+	if s.FailureTimes == nil {
+		for i := 0; i < min(max(s.FailedAttempts, 0), maxFailureHistory); i++ {
+			history = append(history, now)
+		}
+	} else {
+		cutoff := now.Add(-failureWindow)
+		for _, failedAt := range s.FailureTimes {
+			// Retain future timestamps on clock rollback, rather than dropping
+			// recent failures and granting an unintended reset.
+			if failedAt.After(cutoff) {
+				history = append(history, failedAt)
+			}
+		}
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].Before(history[j]) })
+	if len(history) > maxFailureHistory {
+		history = history[len(history)-maxFailureHistory:]
+	}
+	s.FailureTimes = history
+	s.FailedAttempts = len(history)
 	return s
 }
 
@@ -87,18 +131,25 @@ func (v *Vault) checkLockedLocked() error {
 }
 
 func (v *Vault) recordFailureLocked() {
-	s := v.readLockout()
-	s.FailedAttempts++
+	now := time.Now()
+	s := v.readLockoutAt(now)
+	s.FailureTimes = append(s.FailureTimes, now)
+	s = normalizeLockout(s, now)
 	if s.FailedAttempts >= maxFreeAttempts {
-		s.LockoutUntil = time.Now().Add(backoff(s.FailedAttempts))
+		if until := now.Add(backoff(s.FailedAttempts)); until.After(s.LockoutUntil) {
+			s.LockoutUntil = until
+		}
 	}
 	_ = v.writeLockout(s)
 }
 
 func (v *Vault) recordSuccessLocked() {
-	// Reset the counter and refresh last-verified (the sliding re-prompt window
-	// anchor, docs §5). A correct entry clears any accrued lockout.
-	_ = v.writeLockout(lockoutState{LastVerifiedAt: time.Now()})
+	// Refresh the re-prompt anchor only. Recent guesses and any active lockout
+	// survive successes on every PIN surface sharing this persisted state.
+	now := time.Now()
+	s := v.readLockoutAt(now)
+	s.LastVerifiedAt = now
+	_ = v.writeLockout(s)
 }
 
 // backoff returns the lockout window for the given failure count: geometric
@@ -131,10 +182,11 @@ type LockoutStatus struct {
 
 // LockoutStatus returns the current node-wide lockout state.
 func (v *Vault) LockoutStatus() LockoutStatus {
-	s := v.readLockout()
+	now := time.Now()
+	s := v.readLockoutAt(now)
 	return LockoutStatus{
 		FailedAttempts: s.FailedAttempts,
-		LockedOut:      !s.LockoutUntil.IsZero() && time.Now().Before(s.LockoutUntil),
+		LockedOut:      !s.LockoutUntil.IsZero() && now.Before(s.LockoutUntil),
 		LockoutUntil:   s.LockoutUntil,
 		LastVerifiedAt: s.LastVerifiedAt,
 	}
@@ -146,5 +198,5 @@ func (v *Vault) LockoutStatus() LockoutStatus {
 // local access can clear the lock without waiting out the window and without
 // any data loss.
 func (v *Vault) ResetLockout() error {
-	return v.writeLockout(lockoutState{LastVerifiedAt: v.readLockout().LastVerifiedAt})
+	return v.writeLockout(lockoutState{LastVerifiedAt: v.readLockout().LastVerifiedAt, FailureTimes: []time.Time{}})
 }
