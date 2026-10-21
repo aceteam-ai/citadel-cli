@@ -64,6 +64,19 @@ var passcodeStatusCmd = &cobra.Command{
 	RunE:  runPasscodeStatus,
 }
 
+var passcodeResetLockoutCmd = &cobra.Command{
+	Use:   "reset-lockout",
+	Short: "Clear the node's failed-passcode lockout",
+	Long: `Clears the node-wide failed-attempt history and any active lockout window for
+the node passcode or master PIN. Repeated wrong passcodes on any remote surface
+(status server, terminal, gateway, cache serving, passcode-gated jobs) lock the
+node for up to an hour; this is the local recovery path for an operator at the
+machine. It does not change the passcode or master PIN, and needs write access
+to the node configuration directory (run it as the user that runs the worker).`,
+	Args: cobra.NoArgs,
+	RunE: runPasscodeResetLockout,
+}
+
 func init() {
 	passcodeEnrollCmd.Flags().BoolVar(&ackDataLossFlag, "ack-data-loss", false,
 		"acknowledge that forgetting the master PIN (or losing the node pepper) permanently destroys encrypted data (required for non-interactive/piped use)")
@@ -74,6 +87,7 @@ func init() {
 	passcodeCmd.AddCommand(passcodeEnrollCmd)
 	passcodeCmd.AddCommand(passcodeRotateCmd)
 	passcodeCmd.AddCommand(passcodeStatusCmd)
+	passcodeCmd.AddCommand(passcodeResetLockoutCmd)
 }
 
 // errAlreadyEnrolled is returned when enroll is invoked on a node that already
@@ -308,6 +322,8 @@ func runPasscodeStatus(cmd *cobra.Command, args []string) error {
 		perms := loadNodePermissions()
 		if perms.PasscodeHash != "" {
 			fmt.Println("Master PIN: not enrolled (legacy node passcode is set; run 'citadel passcode enroll' to migrate).")
+			// Legacy passcode checks share the node-wide lockout (#1398).
+			printLockoutStatus(v.LockoutStatus())
 		} else {
 			fmt.Println("Master PIN: not set.")
 		}
@@ -315,11 +331,33 @@ func runPasscodeStatus(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("Master PIN: enrolled.")
 	printBadgeLine(st)
-	lo := v.LockoutStatus()
+	printLockoutStatus(v.LockoutStatus())
+	return nil
+}
+
+// printLockoutStatus reports the node-wide failed-attempt state, shared by the
+// master PIN and the legacy node passcode.
+func printLockoutStatus(lo nodevault.LockoutStatus) {
 	if lo.LockedOut {
-		fmt.Printf("Lockout: ACTIVE until %s (%d failed attempts).\n", lo.LockoutUntil.Format("15:04:05"), lo.FailedAttempts)
+		fmt.Printf("Lockout: ACTIVE until %s (%d failed attempts). Run 'citadel passcode reset-lockout' at the node to clear it.\n", lo.LockoutUntil.Format("15:04:05"), lo.FailedAttempts)
 	} else if lo.FailedAttempts > 0 {
-		fmt.Printf("Failed attempts since last success: %d.\n", lo.FailedAttempts)
+		fmt.Printf("Recent failed attempts (last 24h): %d.\n", lo.FailedAttempts)
+	}
+}
+
+func runPasscodeResetLockout(cmd *cobra.Command, args []string) error {
+	if err := resetPasscodeLockoutAt(network.GetNodeConfigDir()); err != nil {
+		return err
+	}
+	fmt.Println("Passcode lockout cleared.")
+	return nil
+}
+
+// resetPasscodeLockoutAt is the reset-lockout core, taking the node config
+// directory explicitly so tests never touch this machine's node state.
+func resetPasscodeLockoutAt(nodeConfigDir string) error {
+	if err := nodevault.OpenLockout(nodeConfigDir).Reset(); err != nil {
+		return fmt.Errorf("reset passcode lockout: %w", err)
 	}
 	return nil
 }

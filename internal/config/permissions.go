@@ -244,13 +244,57 @@ func (p *Permissions) VerifyPasscode(pin string) bool {
 	return p.VerifyLegacyPasscode(pin)
 }
 
+// ErrPasscodeMismatch is CheckLegacyPasscode's result for an unset hash, an
+// empty pin, or (with no limiter wired) a wrong pin.
+var ErrPasscodeMismatch = errors.New("config: passcode does not match")
+
+// PasscodeAttemptLimiter is the node-wide persisted attempt limiter applied to
+// legacy bcrypt passcode checks (#1398). Attempt runs check unless a lockout is
+// active, records the result, and returns nil only for a successful check. It is
+// satisfied by *nodevault.Lockout, the same state the master-PIN vault uses.
+type PasscodeAttemptLimiter interface {
+	Attempt(check func() bool) error
+}
+
+// LegacyPasscodeLockout returns the limiter for legacy passcode checks. Like
+// VaultVerify it is a hook wired in package cmd, because the limiter's state
+// lives under network.GetNodeConfigDir() and this leaf package must not import
+// network. When nil (a unit test, or a binary that never wired it), legacy
+// checks are unlimited, as before #1398.
+var LegacyPasscodeLockout func() PasscodeAttemptLimiter
+
 // VerifyLegacyPasscode checks pin against the legacy bcrypt passcode hash only,
-// never the master-PIN hooks. It fails closed on an unset hash or empty pin.
+// never the master-PIN hooks. It fails closed on an unset hash or empty pin, and
+// is subject to the node-wide lockout when LegacyPasscodeLockout is wired.
 func (p *Permissions) VerifyLegacyPasscode(pin string) bool {
-	if p.PasscodeHash == "" || pin == "" {
-		return false
+	var lim PasscodeAttemptLimiter
+	if LegacyPasscodeLockout != nil {
+		lim = LegacyPasscodeLockout()
 	}
-	return bcrypt.CompareHashAndPassword([]byte(p.PasscodeHash), []byte(pin)) == nil
+	return p.CheckLegacyPasscode(pin, lim) == nil
+}
+
+// CheckLegacyPasscode is VerifyLegacyPasscode with an explicit limiter and the
+// reason preserved: nil on a match, ErrPasscodeMismatch for an unset hash or an
+// empty pin (rejected before the limiter, so neither consumes a failure), and
+// otherwise whatever lim.Attempt returns (for *nodevault.Lockout: ErrWrongPIN on
+// a mismatch, *ErrLockedOut while locked out). A nil lim checks the hash
+// directly with no accounting.
+func (p *Permissions) CheckLegacyPasscode(pin string, lim PasscodeAttemptLimiter) error {
+	if p.PasscodeHash == "" || pin == "" {
+		return ErrPasscodeMismatch
+	}
+	hash := p.PasscodeHash
+	compare := func() bool {
+		return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pin)) == nil
+	}
+	if lim == nil {
+		if compare() {
+			return nil
+		}
+		return ErrPasscodeMismatch
+	}
+	return lim.Attempt(compare)
 }
 
 // IsSensitiveCategory reports whether a permission category is a passcode-gated

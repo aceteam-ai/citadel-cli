@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -63,15 +64,97 @@ type lockoutState struct {
 	FailureTimes []time.Time `yaml:"failure_times"`
 }
 
+// Lockout is the node-wide persisted attempt limiter over one state file. The
+// master-PIN vault uses it for VerifyPIN/Unlock/ChangePIN, and the legacy bcrypt
+// passcode gate uses it through Attempt (#1398), so a node's network passcode
+// surfaces are rate-limited whether or not a master PIN is enrolled. A node is in
+// exactly one mode (vault enrolled or legacy passcode), so both share ONE file,
+// <baseDir>/vault/state.yaml: one counter per node, with the same thresholds,
+// backoff, rolling window and history bound in either mode.
+type Lockout struct {
+	path string
+}
+
+// OpenLockout returns the node-wide limiter whose state lives under baseDir
+// (in production, network.GetNodeConfigDir()). It is the same state a vault
+// opened over baseDir uses. It does not touch disk.
+func OpenLockout(baseDir string) *Lockout {
+	return &Lockout{path: filepath.Join(baseDir, vaultDirName, lockoutStateFile)}
+}
+
+// lockoutMus serializes lockout read-modify-write per state file within this
+// process. It is keyed by path, not held per handle, because gate callers open a
+// fresh Vault/Lockout per check: a per-handle mutex would not serialize them.
+// Cross-process writers remain best-effort (#1395).
+var lockoutMus sync.Map // path -> *sync.Mutex
+
+func lockoutMutex(path string) *sync.Mutex {
+	mu, _ := lockoutMus.LoadOrStore(path, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
+// Attempt runs check under the node-wide lockout. It refuses with
+// *ErrLockedOut, without running check, while a lockout window is active (even
+// for a correct secret). A false check records one failure and returns
+// ErrWrongPIN; a true check refreshes the verification anchor without clearing
+// recent failures and returns nil. The per-path mutex is held across the check,
+// as the vault holds kdfMu across its KDF, so concurrent guesses in one process
+// cannot all pass the admission check before any failure is recorded.
+//
+// Callers reject an empty secret BEFORE calling Attempt: an empty secret is
+// never counted, so unauthenticated probes cannot lock the node.
+func (l *Lockout) Attempt(check func() bool) error {
+	mu := lockoutMutex(l.path)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := checkLockedAt(l.path); err != nil {
+		return err
+	}
+	if !check() {
+		recordFailureAt(l.path)
+		return ErrWrongPIN
+	}
+	recordSuccessAt(l.path)
+	return nil
+}
+
+// Status returns the current node-wide lockout state.
+func (l *Lockout) Status() LockoutStatus {
+	now := time.Now()
+	s := readLockoutAt(l.path, now)
+	return LockoutStatus{
+		FailedAttempts: s.FailedAttempts,
+		LockedOut:      !s.LockoutUntil.IsZero() && now.Before(s.LockoutUntil),
+		LockoutUntil:   s.LockoutUntil,
+		LastVerifiedAt: s.LastVerifiedAt,
+	}
+}
+
+// Reset clears the attempt history and lockout window, keeping the
+// verification anchor. It is the local-presence recovery path.
+func (l *Lockout) Reset() error {
+	mu := lockoutMutex(l.path)
+	mu.Lock()
+	defer mu.Unlock()
+	return writeLockoutAt(l.path, lockoutState{LastVerifiedAt: readLockoutAt(l.path, time.Now()).LastVerifiedAt, FailureTimes: []time.Time{}})
+}
+
 func (v *Vault) lockoutPath() string { return filepath.Join(v.dir, lockoutStateFile) }
 
+// Lockout returns the node-wide limiter backing this vault.
+func (v *Vault) Lockout() *Lockout { return &Lockout{path: v.lockoutPath()} }
+
 func (v *Vault) readLockout() lockoutState {
-	return v.readLockoutAt(time.Now())
+	return readLockoutAt(v.lockoutPath(), time.Now())
 }
 
 func (v *Vault) readLockoutAt(now time.Time) lockoutState {
+	return readLockoutAt(v.lockoutPath(), now)
+}
+
+func readLockoutAt(path string, now time.Time) lockoutState {
 	var s lockoutState
-	data, err := os.ReadFile(v.lockoutPath())
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return normalizeLockout(s, now) // absent = clean slate
 	}
@@ -110,29 +193,57 @@ func normalizeLockout(s lockoutState, now time.Time) lockoutState {
 }
 
 func (v *Vault) writeLockout(s lockoutState) error {
+	return writeLockoutAt(v.lockoutPath(), s)
+}
+
+func writeLockoutAt(path string, s lockoutState) error {
 	data, err := yaml.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("nodevault: marshal lockout state: %w", err)
 	}
-	return writeFileAtomic(v.lockoutPath(), data, 0o600)
+	return writeFileAtomic(path, data, 0o600)
 }
 
 // checkLockedLocked returns ErrLockedOut if a lockout window is active. Read
 // fresh from disk so a lockout set by another process/surface is honored.
-// Caller holds kdfMu (in-process serialization); the cross-process counter is
-// best-effort node-wide (a benign race can under-count under simultaneous
-// multi-process attack, still bounded by the KDF cost).
+// Caller holds kdfMu; the per-path lockout mutex is taken for the read. The
+// cross-process counter is best-effort node-wide (a benign race can
+// under-count under simultaneous multi-process attack, still bounded by the
+// KDF cost).
 func (v *Vault) checkLockedLocked() error {
-	s := v.readLockout()
+	mu := lockoutMutex(v.lockoutPath())
+	mu.Lock()
+	defer mu.Unlock()
+	return checkLockedAt(v.lockoutPath())
+}
+
+func (v *Vault) recordFailureLocked() {
+	mu := lockoutMutex(v.lockoutPath())
+	mu.Lock()
+	defer mu.Unlock()
+	recordFailureAt(v.lockoutPath())
+}
+
+func (v *Vault) recordSuccessLocked() {
+	mu := lockoutMutex(v.lockoutPath())
+	mu.Lock()
+	defer mu.Unlock()
+	recordSuccessAt(v.lockoutPath())
+}
+
+// checkLockedAt, recordFailureAt and recordSuccessAt are the lockout rules
+// shared by every caller. The caller holds lockoutMutex(path).
+func checkLockedAt(path string) error {
+	s := readLockoutAt(path, time.Now())
 	if !s.LockoutUntil.IsZero() && time.Now().Before(s.LockoutUntil) {
 		return &ErrLockedOut{Until: s.LockoutUntil}
 	}
 	return nil
 }
 
-func (v *Vault) recordFailureLocked() {
+func recordFailureAt(path string) {
 	now := time.Now()
-	s := v.readLockoutAt(now)
+	s := readLockoutAt(path, now)
 	s.FailureTimes = append(s.FailureTimes, now)
 	s = normalizeLockout(s, now)
 	if s.FailedAttempts >= maxFreeAttempts {
@@ -140,16 +251,16 @@ func (v *Vault) recordFailureLocked() {
 			s.LockoutUntil = until
 		}
 	}
-	_ = v.writeLockout(s)
+	_ = writeLockoutAt(path, s)
 }
 
-func (v *Vault) recordSuccessLocked() {
+func recordSuccessAt(path string) {
 	// Refresh the re-prompt anchor only. Recent guesses and any active lockout
 	// survive successes on every PIN surface sharing this persisted state.
 	now := time.Now()
-	s := v.readLockoutAt(now)
+	s := readLockoutAt(path, now)
 	s.LastVerifiedAt = now
-	_ = v.writeLockout(s)
+	_ = writeLockoutAt(path, s)
 }
 
 // backoff returns the lockout window for the given failure count: geometric
@@ -181,22 +292,12 @@ type LockoutStatus struct {
 }
 
 // LockoutStatus returns the current node-wide lockout state.
-func (v *Vault) LockoutStatus() LockoutStatus {
-	now := time.Now()
-	s := v.readLockoutAt(now)
-	return LockoutStatus{
-		FailedAttempts: s.FailedAttempts,
-		LockedOut:      !s.LockoutUntil.IsZero() && now.Before(s.LockoutUntil),
-		LockoutUntil:   s.LockoutUntil,
-		LastVerifiedAt: s.LastVerifiedAt,
-	}
-}
+func (v *Vault) LockoutStatus() LockoutStatus { return v.Lockout().Status() }
 
 // ResetLockout clears the attempt counter and lockout window. It exists for a
 // local-presence recovery path (a human at the machine), consistent with
 // "hard lockout requiring local presence" rather than auto-wipe: someone with
 // local access can clear the lock without waiting out the window and without
-// any data loss.
-func (v *Vault) ResetLockout() error {
-	return v.writeLockout(lockoutState{LastVerifiedAt: v.readLockout().LastVerifiedAt, FailureTimes: []time.Time{}})
-}
+// any data loss. The state is node-wide, so this also clears a lockout earned
+// by legacy passcode checks (#1398).
+func (v *Vault) ResetLockout() error { return v.Lockout().Reset() }
