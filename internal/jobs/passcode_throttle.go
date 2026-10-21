@@ -74,10 +74,10 @@ const (
 // absent passcode, a vault lockout and an unreadable passcode state do not.
 // Failures expire only with time; a correct passcode does not clear them, so
 // wrong guesses interleaved with correct ones still reach the limit. Checks
-// through one throttle cannot overshoot
-// the limit: a check reserves a slot under the lock, runs unlocked, and is
-// recorded under the lock, and the window's failures plus checks in flight
-// never exceed MaxFailures. Capacity reserved by in-flight checks is reported
+// through one throttle cannot overshoot the limit: a check reserves a slot
+// under the lock, runs unlocked, and is recorded under the lock. The window's
+// failures plus checks in flight never exceed MaxFailures. Capacity reserved
+// by in-flight checks is reported
 // as ReasonPasscodeBusy, not as incorrect attempts. A check that panics releases
 // its slot without counting a failure. State is in memory only, so a worker
 // restart resets it.

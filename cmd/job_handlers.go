@@ -157,9 +157,10 @@ func init() {
 	// Even on this legacy Nexus/diagnostic path an enabled shell is passcode-gated
 	// (aceteam#6524): executeJob polls remote jobs and reports back, so leaving the
 	// verifier nil here would run enabled shell with no passcode. Fail closed.
-	// HasPasscode lets the handler distinguish passcode_not_set from passcode_invalid.
-	shellHandler.HasPasscode = nodeHasPasscode
-	shellHandler.VerifyPasscode = nodePasscodeVerifier
+	// Strict State preserves I/O failures and vault lockouts as distinct refusal
+	// reasons; the same process throttle protects diagnostic and worker jobs.
+	shellHandler.State = nodePasscodeState
+	shellHandler.Throttle = nodePasscodeThrottle
 
 	// Per-org index namespaces (aceteam#10876 C2): point the FILE_INDEX /
 	// FILE_SEMANTIC_SEARCH handlers at the machine-convergent indexes dir so a
