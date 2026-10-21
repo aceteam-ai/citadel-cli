@@ -55,9 +55,16 @@ claim the commands work. Toolchain/dependency preparation is a separate,
 authorized action; these offline commands do not authorize a download:
 
 ```sh
-GOPROXY=off GOSUMDB=off go test ./internal/mediainput
-python3 -m unittest discover -s internal/mediainput -p 'test_contract.py'
+GOTOOLCHAIN=local go version # must satisfy go.mod, without auto-selection
+GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off go test -vet=off -race -count=1 ./internal/mediainput
+python3 -I -B -m unittest discover -s internal/mediainput -p 'test_contract.py'
 ```
+
+Select that installed Go executable explicitly if `go` on PATH is too old.
+`go version` without `GOTOOLCHAIN=local` may report an automatically selected
+toolchain rather than the executable that the offline test command will use.
+The test-only command disables implicit vet; it does not authorize a formatter,
+standalone build, toolchain or dependency download, model or service execution.
 
 ## Reuse for multi-reference video
 
@@ -68,11 +75,12 @@ V2 must reuse `ValidPath`; bounds, reference identity/order, permissions and
 transport still need their own reviewed contract. No v2 parser, new task or
 live producer is activated here.
 
-The additional #1392/#1393 hard-link count, ownership and descriptor-bound
-`O_PATH` preflight questions remain separate acquisition-policy gates. Do not
-treat this lexical validator or a matching content hash as proof that an
-inode has no outside-workspace hard links. No UID restriction is invented by
-this parser-only change.
+The #1392/#1393 hard-link count and ownership questions remain acquisition-policy
+gates. The inactive Linux freezer separately pins the leaf with `O_PATH` and
+checks its type before opening the same inode for reading; see
+`media-input-freezer.md`. That technical preflight, this lexical validator and
+a matching content hash do not prove that an inode has no outside-workspace
+hard links. No UID restriction is invented by this source change.
 
 The separately prepared workspace freezer and header/EXIF/mask guards remain
 inactive; parsing still does not invoke them or authorize acquisition.

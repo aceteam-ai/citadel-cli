@@ -8,17 +8,28 @@ with `inbox_unavailable`; the shared pinned HTTPS acquisition adapter is still
 required. `media-input-contract.md` describes the descriptor boundary.
 
 On Linux, each read requires a non-nil live Files predicate. Parent resolution
-uses `os.Root`; the leaf opens with `openat` against the anchored parent, with
-`O_NOFOLLOW`, `O_NONBLOCK` and `O_CLOEXEC`. It never relies on a path validation
-followed by an unrestricted open, nor on `Root.OpenFile` to enforce a caller's
-leaf no-follow flag. Other platforms refuse this primitive in v1.
+uses `os.Root`; `openWorkspaceInput` pins the leaf against that parent with
+`O_PATH|O_NOFOLLOW|O_CLOEXEC`, then checks the descriptor is regular before
+opening it for reading. In particular, this flag pair pins a symlink itself,
+which the type check refuses. It does not invoke a device's readable open
+before refusing its type. See the Linux [open(2) O_PATH semantics](https://man7.org/linux/man-pages/man2/open.2.html).
+
+The pin stays live while a directory descriptor anchors `/proc/self/fd` and
+`fstatfs` verifies procfs. The only readable open follows that directory's
+numeric FD alias, with `O_RDONLY|O_NONBLOCK|O_CLOEXEC`, and verifies the same
+regular inode/device. Following this kernel magic link is intentional; the
+untrusted workspace leaf is not followed or resolved a second time. Missing,
+inaccessible or non-procfs FD access refuses; there is no pathname fallback.
+Read permissions still apply when opening the pinned inode for reading. The
+OS and mount namespace are trusted, not a sandbox against a privileged host
+attacker. Other platforms refuse this primitive in v1.
 
 The open descriptor must be regular and exactly the declared size, bounded to
 16 MiB. Reads are chunked, context-checked and followed by an extra-byte check.
 A second stat must match inode, size and modification time. The exact bytes'
 SHA-256 must match the descriptor. No named input staging file is created and
-the source is never reopened. Files permission and cancellation are rechecked
-before the snapshot can be returned.
+the source pathname is never reopened. Files permission and cancellation are
+rechecked before the snapshot can be returned.
 
 PNG and JPEG dimensions use Go's header-only `DecodeConfig`; PNG chunk framing,
 CRC and animation checks follow. WebP uses the cached, pinned BSD-licensed
@@ -73,6 +84,10 @@ follow-up is source-only and does not settle owner UID or hard-link policy.
    GitHub CI may execute; no formatter, model, native device or service run is
    included.
 
-Implementation and current-head test receipts are pending. Independent review
-is still required. Even after this follow-up, owner/hard-link policy and all
-live C1b/C5 acquisition, publication and activation gates remain unresolved.
+The source implements steps 1 and 2; owned offline fixtures cover step 3.
+Consult the PR for exact-head offline and GitHub CI receipts; independent
+review is still required. Even after this follow-up, owner/hard-link policy
+and all live C1b/C5 acquisition,
+publication and activation gates remain unresolved. The O_PATH change does
+not establish that an accepted regular inode has no outside-workspace hard
+links, nor does it restrict owner UID.
