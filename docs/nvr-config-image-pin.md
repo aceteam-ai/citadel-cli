@@ -44,7 +44,7 @@ to substitute for this source review.
 
 ## Cache policy and compatibility
 
-The init service uses `pull_policy: missing`: an exact cached commit/digest
+The init service uses [`pull_policy: missing`](https://docs.docker.com/reference/compose-file/services/#pull_policy): an exact cached commit/digest
 does not require the previous unconditional registry refresh. If it is absent,
 image acquisition still needs network and the operator's ordinary module-start
 authority. This does not claim the entire NVR stack works offline: other images,
