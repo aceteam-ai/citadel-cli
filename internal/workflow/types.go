@@ -6,6 +6,7 @@
 package workflow
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,6 +76,8 @@ type RunResponse struct {
 
 type Execution struct {
 	mu        sync.RWMutex
+	cancel    context.CancelFunc
+	done      chan struct{}
 	ID        string            `json:"id"`
 	Status    ExecutionStatus   `json:"status"`
 	Graph     *WorkflowGraph    `json:"graph"`
@@ -204,18 +207,30 @@ func NewExecution(graph *WorkflowGraph, input map[string]any) *Execution {
 		Graph:     graph,
 		Input:     input,
 		StartedAt: time.Now(),
+		done:      make(chan struct{}),
 	}
 }
 
 func (e *Execution) SetStatus(s ExecutionStatus) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.Status == StatusCancelled || e.Status == StatusCompleted || e.Status == StatusFailed {
+		return
+	}
 	e.Status = s
 }
+
+// Done closes only after the executor goroutine exits and releases its run
+// slot. A cancelled status is a request, not evidence that a node has exited.
+// Manually constructed executions outside Submit have no completion signal.
+func (e *Execution) Done() <-chan struct{} { return e.done }
 
 func (e *Execution) Complete(output map[string]any, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.Status == StatusCancelled || e.Status == StatusCompleted || e.Status == StatusFailed {
+		return
+	}
 	now := time.Now()
 	e.EndedAt = &now
 	if err != nil {
