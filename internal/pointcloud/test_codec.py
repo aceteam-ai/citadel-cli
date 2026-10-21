@@ -133,6 +133,16 @@ class SequenceTests(unittest.TestCase):
         self.assert_invalid(lambda: codec.project(1, 1, [1], b"rgb", None, math.nan, 0.1, 100, 1))
         self.assert_invalid(lambda: codec.project(1, 1, [1], b"rgb", None, 60, 0.1, 100, 0))
 
+    def test_projection_mask_type_and_shape_have_static_errors(self):
+        for mask in (0, False, object(), {}, {0: True}, b"\x01", "x", [1], [None], []):
+            with self.subTest(mask_type=type(mask).__name__):
+                self.assert_invalid(lambda: codec.project(1, 1, [1], b"rgb", mask, 60, 0.1, 100, 1))
+        for mask in ([True], (True,)):
+            self.assertEqual(codec.project(1, 1, [1], b"rgb", mask, 60, 0.1, 100, 1),
+                             [(0, 0, -1, 114, 103, 98)])
+        for mask in ([False], (False,)):
+            self.assertEqual(codec.project(1, 1, [1], b"rgb", mask, 60, 0.1, 100, 1), [])
+
 
 if __name__ == "__main__":
     unittest.main()

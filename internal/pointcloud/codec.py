@@ -194,7 +194,11 @@ def project(width, height, distance, rgb, mask, fov, near, far, point_budget):
         _invalid()
     if pixels > 16777216 or len(distance) != pixels or len(rgb) != 3 * pixels:
         _invalid()
-    if not isinstance(rgb, bytes) or mask is not None and (len(mask) != pixels or any(type(v) is not bool for v in mask)):
+    if mask is not None and (
+        not isinstance(mask, (list, tuple))
+        or len(mask) != pixels
+        or any(type(v) is not bool for v in mask)
+    ):
         _invalid()
     if any(type(v) not in (float, int) or abs(v) > 65504 or not math.isfinite(v) for v in (fov, near, far)):
         _invalid()
