@@ -106,7 +106,9 @@ def test_choose_variant_takes_best_quality_that_fits():
     assert im.choose_variant(flux, 24).quant == "none"
     assert im.choose_variant(flux, 24).offload == "none"
     mid = im.choose_variant(flux, 12)
-    assert (mid.quant, mid.offload) == ("none", "model")
+    assert (mid.quant, mid.offload) == ("int8", "none")
+    # An explicit precision choice remains honored, including CPU offload.
+    assert im.choose_variant(flux, 12, "none").offload == "model"
     assert im.choose_variant(flux, 9.5, "int8").quant == "int8"
     low = im.choose_variant(flux, 7.5)
     assert low.quant == "nf4"

@@ -19,6 +19,7 @@ does NOT require torch/diffusers/accelerate/imageio.)
 from __future__ import annotations
 
 import base64
+import io
 from types import SimpleNamespace
 
 import pytest
@@ -29,12 +30,14 @@ import app
 
 @pytest.fixture(autouse=True)
 def _reset_lazy_singletons(monkeypatch):
-    """Every test gets a clean slate: app.py's lazy _pipe/_video_pipe globals
-    must not leak a fake object set by one test into the next (in particular,
-    into /health's *_loaded assertions)."""
+    """Every test gets independent video residency without real pipelines."""
     monkeypatch.setattr(app, "_device", None)
-    monkeypatch.setattr(app, "_video_pipe", None)
     monkeypatch.setattr(app, "_video_device", None)
+    monkeypatch.setattr(app, "_video_manager", app.ImageModelManager(
+        {app.DIFFUSERS_VIDEO_MODEL: app._video_spec}, app.DIFFUSERS_VIDEO_MODEL,
+        loader=lambda spec, variant: (object(), "cuda"), warm_wait_seconds=5,
+        pinned_models=frozenset({app.DIFFUSERS_VIDEO_MODEL}),
+    ))
 
 
 @pytest.fixture
@@ -88,10 +91,9 @@ def test_health_reports_both_models_unloaded(client):
 
 def test_health_video_loaded_state_is_independent_of_image_state(client, monkeypatch):
     """Loading the video pipe must not report the image pipe as loaded, and
-    vice versa -- the two lazy singletons are independent (citadel #958's
+    vice versa -- the two residency managers are independent (citadel #958's
     coexistence requirement)."""
-    monkeypatch.setattr(app, "_video_pipe", object())
-    monkeypatch.setattr(app, "_video_device", "cuda")
+    app._video_manager.lease(app.DIFFUSERS_VIDEO_MODEL).release()
 
     resp = client.get("/health")
     body = resp.json()
@@ -99,6 +101,73 @@ def test_health_video_loaded_state_is_independent_of_image_state(client, monkeyp
     assert body["video_device"] == "cuda"
     assert body["model_loaded"] is False  # image pipe untouched
     assert body["device"] is None
+
+
+@pytest.mark.parametrize("failure", [None, "inference", "export"])
+def test_video_requests_release_real_lease_on_success_and_failure(client, monkeypatch, failure):
+    callbacks = []
+
+    def timer_factory(delay, callback):
+        callbacks.append(callback)
+        return SimpleNamespace(start=lambda: None, cancel=lambda: None)
+
+    class Pipe(_FakePipe):
+        def __call__(self, **kwargs):
+            if failure == "inference":
+                raise RuntimeError("owned inference refusal")
+            return super().__call__(**kwargs)
+
+    manager = app.ImageModelManager(
+        {app.DIFFUSERS_VIDEO_MODEL: app._video_spec}, app.DIFFUSERS_VIDEO_MODEL,
+        loader=lambda spec, variant: (Pipe(frames=[["owned-frame"]]), "cpu"),
+        warm_wait_seconds=5, idle_unload_seconds=0, timer_factory=timer_factory,
+    )
+    monkeypatch.setattr(app, "_video_manager", manager)
+    monkeypatch.setattr(app, "_host_rss_bytes", lambda: 123456)
+
+    def export(frames, fps):
+        if failure == "export":
+            raise RuntimeError("owned export refusal")
+        return b"owned-video"
+
+    monkeypatch.setattr(app, "_export_video_bytes", export)
+    response = client.post("/generate/video", json={"prompt": "owned-test"})
+    assert response.status_code == (200 if failure is None else 500)
+    assert manager._resident.inflight == 0
+    callbacks[-1]()  # release timer, not the superseded initial-load timer
+    assert manager.loaded_model() is None
+    health = client.get("/health").json()
+    assert health["host_rss_bytes"] == 123456
+    assert health["pipeline_residency"]["video"][0]["resident"] is False
+
+
+def test_video_cold_load_uses_the_existing_retryable_warming_response(client, monkeypatch):
+    def warming():
+        raise app.ModelWarming(app.DIFFUSERS_VIDEO_MODEL, eta_seconds=120, retry_after=5, reason="loading")
+
+    monkeypatch.setattr(app, "_get_video_pipe", warming)
+    response = client.post("/generate/video", json={"prompt": "owned-test"})
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "5"
+    assert response.json()["status"] == "model_warming"
+
+
+def test_health_rss_reads_current_resident_pages_not_peak(monkeypatch):
+    def statm(path, **kwargs):
+        assert path == "/proc/self/statm"
+        return io.StringIO("10000 17 4 0 0 0 0\n")
+
+    monkeypatch.setattr("builtins.open", statm)
+    monkeypatch.setattr(app.os, "sysconf", lambda name: 4096)
+    assert app._host_rss_bytes() == 17 * 4096
+
+
+def test_health_rss_unavailable_is_unknown_not_a_peak_fallback(monkeypatch):
+    def missing(*args, **kwargs):
+        raise OSError("owned missing proc fixture")
+
+    monkeypatch.setattr("builtins.open", missing)
+    assert app._host_rss_bytes() is None
 
 
 # ---------------------------------------------------------------------------
@@ -611,8 +680,7 @@ def test_health_lists_allowlist_loaded_model_and_warm_vs_cold(client, swap):
 
 
 def test_health_still_reports_the_video_pipeline_independently(client, swap, monkeypatch):
-    monkeypatch.setattr(app, "_video_pipe", object())
-    monkeypatch.setattr(app, "_video_device", "cuda")
+    app._video_manager.lease(app.DIFFUSERS_VIDEO_MODEL).release()
     body = client.get("/health").json()
     assert body["video_model_loaded"] is True and body["model_loaded"] is False
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
+import weakref
 
 import pytest
 
@@ -61,6 +62,206 @@ class FakeLoader:
     def free(self):
         self.events.append(("free", None))
         self.freed += 1
+
+
+class ManualTimers:
+    """No sleeps or real timer threads; fire even canceled callbacks to race-test fencing."""
+
+    def __init__(self):
+        self.now = 100.0
+        self.timers = []
+
+    def __call__(self, delay, callback):
+        owner = self
+
+        class Timer:
+            daemon = False
+            canceled = False
+
+            def start(self):
+                owner.timers.append(self)
+
+            def cancel(self):
+                self.canceled = True
+
+            def fire(self):
+                callback()
+
+        timer = Timer()
+        timer.delay = delay
+        return timer
+
+
+@pytest.mark.parametrize("model_id", [SDXL, "owned/video"])
+@pytest.mark.parametrize("idle", [0, 300])
+def test_idle_eviction_clears_image_and_video_leases_and_cold_loads_again(model_id, idle):
+    timers = ManualTimers()
+    loader = FakeLoader()
+    spec = im.CATALOG[SDXL] if model_id == SDXL else im.ImageModelSpec(
+        model_id=model_id, license="test", permissive=False, pipeline_class=None,
+        torch_dtype=None, variants=(im.LoadVariant("none", "none", 0),),
+    )
+    mgr = ImageModelManager(
+        {model_id: spec}, model_id, loader=loader.load, unloader=loader.unload,
+        free_memory=loader.free, warm_wait_seconds=5, idle_unload_seconds=idle,
+        timer_factory=timers, clock=lambda: timers.now,
+    )
+    lease = mgr.lease(model_id)
+    lease.release()
+    assert lease.pipe is None  # keeping the Lease cannot keep weights alive
+    timer = timers.timers[-1]
+    assert timer.delay == idle
+    timers.now += idle
+    timer.fire()
+    assert mgr.loaded_model() is None
+    assert loader.unloaded == [f"pipe:{model_id}"]
+    assert loader.events[-2:] == [("unload", f"pipe:{model_id}"), ("free", None)]
+    # A later cold request uses the same retryable warming contract.
+    mgr._warm_wait = 0
+    gate = loader.gates[model_id] = threading.Event()
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(model_id)
+    finally:
+        gate.set()
+        assert mgr.wait_for_load(5)
+
+
+def test_new_lease_cancels_idle_timer_and_inflight_work_cannot_be_evicted():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    first = mgr.lease(SDXL)
+    first.release()
+    stale = timers.timers[-1]
+    second = mgr.lease(SDXL)
+    third = mgr.lease(SDXL)
+    assert stale.canceled
+    timers.now += 20
+    stale.fire()
+    second.release()
+    stale.fire()
+    assert not loader.unloaded  # third still holds the resident model
+    third.release()
+    current = timers.timers[-1]
+    timers.now += 10
+    current.fire()
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+def test_pinned_image_and_video_models_have_no_idle_eviction_timer():
+    for model_id in (SDXL, "owned/video"):
+        timers = ManualTimers()
+        mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                           pinned_models=frozenset({model_id}),
+                           timer_factory=timers, clock=lambda: timers.now)
+        if model_id not in mgr._specs:
+            mgr._specs[model_id] = im.ImageModelSpec(
+                model_id=model_id, license="test", permissive=False, pipeline_class=None,
+                torch_dtype=None, variants=(im.LoadVariant("none", "none", 0),),
+            )
+        mgr.lease(model_id).release()
+        assert not timers.timers
+        entry = next(m for m in mgr.status()["allowed_models"] if m["model"] == model_id)
+        assert entry["resident"] and entry["pinned"] and entry["evicts_at"] is None
+        assert not loader.unloaded
+
+
+def test_idle_cleanup_drops_all_pipeline_references_before_free_memory():
+    timers = ManualTimers()
+    references = []
+    observed = []
+
+    class Pipeline:
+        pass
+
+    def load(spec, variant):
+        pipe = Pipeline()
+        references.append(weakref.ref(pipe))
+        return pipe, "cuda"
+
+    mgr = ImageModelManager(
+        {SDXL: im.CATALOG[SDXL]}, SDXL, loader=load,
+        free_memory=lambda: observed.append([ref() is None for ref in references]),
+        warm_wait_seconds=5, idle_unload_seconds=0,
+        timer_factory=timers, clock=lambda: timers.now,
+    )
+    lease = mgr.lease(SDXL)
+    lease.release()
+    timers.timers[-1].fire()
+    assert observed[-1] == [True]
+    assert lease.pipe is None
+
+
+def test_failed_swap_resumes_the_outgoing_models_original_idle_deadline():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    timers.now += 3
+    loader.prepare_fail[FLUX] = "owned prepare failure"
+    with pytest.raises(ModelLoadFailed):
+        mgr.lease(FLUX)
+    timer = timers.timers[-1]
+    assert timer.delay == 7
+    timers.now += 7
+    timer.fire()
+    assert mgr.loaded_model() is None
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+def test_idle_cleanup_blocks_new_load_until_memory_release_finishes():
+    timers = ManualTimers()
+    entered, release = threading.Event(), threading.Event()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+
+    def blocked_unload(pipe):
+        entered.set()
+        assert release.wait(5)
+        loader.unload(pipe)
+
+    mgr._unloader = blocked_unload
+    worker = threading.Thread(target=timers.timers[-1].fire)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(ModelWarming) as err:
+            mgr.lease(FLUX)
+        assert err.value.reason == "busy"
+        assert len(loader.loads) == 1
+    finally:
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+
+
+def test_pinning_does_not_prevent_an_explicit_image_model_swap():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                       pinned_models=frozenset({SDXL}), timer_factory=timers,
+                       clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    assert not timers.timers
+    mgr.lease(FLUX).release()
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+    assert mgr.loaded_model() == FLUX
+
+
+def test_unclaimed_background_load_has_only_bounded_retry_grace_at_idle_zero():
+    timers = ManualTimers()
+    mgr, loader = make(idle_unload_seconds=0, timer_factory=timers,
+                       clock=lambda: timers.now)
+    with pytest.raises(ModelWarming):
+        mgr.lease(SDXL)
+    assert mgr.wait_for_load(5)
+    timer = timers.timers[-1]
+    assert timer.delay == 7  # make() advertises Retry-After: 7
+    timers.now += timer.delay
+    timer.fire()
+    assert mgr.loaded_model() is None
+    assert loader.unloaded == [f"pipe:{SDXL}"]
 
 
 def make(loader=None, *, budget=24.0, quant="auto", free_gb=None, warm_wait=0.0, drain=5.0,
@@ -454,7 +655,7 @@ def test_failed_load_is_not_retried_inside_the_backoff_window():
 
 
 def test_falls_back_to_a_smaller_variant_that_fits_free_vram():
-    # Budget 12 prefers FLUX bf16+offload (9 GB); only 8 GB is actually free,
+    # Budget 12 prefers FLUX int8 on GPU (9.5 GB); only 8 GB is actually free,
     # so nf4 (7 GB) loads instead of refusing.
     mgr, loader = make(budget=12.0, free_gb=8.0, warm_wait=5.0)
     with mgr.lease(FLUX) as lease:
@@ -465,7 +666,7 @@ def test_falls_back_to_a_smaller_variant_that_fits_free_vram():
 def test_prefers_the_budget_choice_when_free_vram_allows():
     mgr, loader = make(budget=12.0, free_gb=30.0, warm_wait=5.0)
     with mgr.lease(FLUX) as lease:
-        assert (lease.variant.quant, lease.variant.offload) == ("none", "model")
+        assert (lease.variant.quant, lease.variant.offload) == ("int8", "none")
 
 
 def test_refuses_only_when_even_the_smallest_variant_does_not_fit():

@@ -76,7 +76,7 @@ class ImageModelSpec:
     pipeline_class: str | None
     # "bfloat16" / "float16"; None means "use DIFFUSERS_DTYPE" (legacy knob).
     torch_dtype: str | None
-    # Ordered best-quality-first; choose_variant takes the first that fits.
+    # Quality order within residency class; auto prefers GPU-only variants.
     variants: tuple[LoadVariant, ...]
     # Pipeline components bitsandbytes quantizes when a variant asks for it.
     quantize_components: tuple[str, ...] = ("transformer", "text_encoder")
@@ -354,6 +354,10 @@ def fitting_variants(
     if quant_mode not in QUANT_MODES:
         raise ValueError(f"DIFFUSERS_QUANT must be one of {', '.join(QUANT_MODES)}; got {quant_mode!r}")
     candidates = [v for v in spec.variants if quant_mode == "auto" or v.quant == quant_mode]
+    if quant_mode == "auto":
+        # Stable partition: keep the catalog's quality order on GPU, but do
+        # not park a full model in host RAM merely to avoid quantization.
+        candidates.sort(key=lambda variant: variant.offload != OFFLOAD_NONE)
     if not candidates:
         raise VramBudgetError(spec.model_id, budget_gb, spec.min_vram_gb(), quant_mode)
     fits = [v for v in candidates if budget_gb is None or v.est_vram_gb <= budget_gb]
@@ -372,8 +376,8 @@ def choose_variant(
     """Picks the highest-quality variant that fits ``budget_gb``.
 
     Variants are declared best-quality-first, so the first fit wins: full
-    precision when the budget allows, then 8-bit, then nf4 (with CPU offload as
-    the last resort for the largest models). ``budget_gb=None`` means no
+    precision on GPU when the budget allows, then GPU 8-bit/nf4, with CPU
+    offload only after every GPU-only variant. ``budget_gb=None`` means no
     budget: the first (best) variant is taken. ``quant_mode`` other than
     "auto" restricts the candidates to that quantization. The swap manager
     additionally falls back to a smaller fitting variant at load time when the

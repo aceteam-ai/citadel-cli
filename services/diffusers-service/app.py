@@ -31,8 +31,8 @@ load runs in the background and the request gets a retryable 503
 independently via
 ``DIFFUSERS_VIDEO_MODEL``, defaulting to Wan2.1's 1.3B text-to-video model
 (``Wan-AI/Wan2.1-T2V-1.3B-Diffusers``) -- small enough (~4GB transformer) to
-fit alongside the image model on the same GPU. The two pipelines are separate
-lazy singletons (see ``_get_pipe``/``_get_video_pipe`` below): loading one
+fit alongside the image model on the same GPU. The two pipelines have separate
+lease/residency managers (see ``_get_pipe``/``_get_video_pipe`` below): loading one
 never evicts or blocks the other, so ``/generate`` and ``/generate/video``
 coexist on one running container. GPU is used when available for both; either
 falls back to CPU otherwise so the service still starts (slowly) on a
@@ -55,6 +55,7 @@ import base64
 import gc
 import inspect
 import io
+import math
 import os
 import tempfile
 import threading
@@ -86,7 +87,7 @@ DIFFUSERS_DTYPE = os.environ.get("DIFFUSERS_DTYPE", "float16")
 # Video model repo id to serve (citadel #958). Wan2.1's 1.3B text-to-video
 # model: small enough to run on a consumer GPU (RTX 3090) alongside the image
 # model above, unlike the 14B variant. A SEPARATE env var from DIFFUSERS_MODEL
-# -- the two pipelines are independent lazy singletons (see _get_video_pipe),
+# -- the two pipelines have independent lease/residency managers,
 # so an operator can override one without touching the other.
 DIFFUSERS_VIDEO_MODEL = os.environ.get("DIFFUSERS_VIDEO_MODEL", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
 
@@ -130,7 +131,8 @@ DIFFUSERS_QUANT = image_models.env_quant_mode()
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(os.environ.get(name, default))
+        value = float(os.environ.get(name, default))
+        return value if math.isfinite(value) else default
     except ValueError:
         return default
 
@@ -140,6 +142,8 @@ DIFFUSERS_WARM_WAIT_SECONDS = _env_float("DIFFUSERS_WARM_WAIT_SECONDS", 15.0)
 # used it; and a failed load is not retried for this long (both seconds).
 DIFFUSERS_MIN_RESIDENCY_SECONDS = _env_float("DIFFUSERS_MIN_RESIDENCY_SECONDS", 120.0)
 DIFFUSERS_FAILURE_BACKOFF_SECONDS = _env_float("DIFFUSERS_FAILURE_BACKOFF_SECONDS", 30.0)
+DIFFUSERS_IDLE_UNLOAD_SECONDS = max(_env_float("DIFFUSERS_IDLE_UNLOAD_SECONDS", 300.0), 0.0)
+DIFFUSERS_PINNED_MODELS = frozenset(os.environ.get("DIFFUSERS_PINNED_MODELS", "").replace(",", " ").split())
 # Free disk that must remain AFTER a model's download (replaces the 2 GiB
 # default margin of model_preflight for image models). The node's disk is shared
 # with every other service's weights, so leave real headroom.
@@ -299,6 +303,29 @@ def _free_cuda_memory():
             torch.cuda.ipc_collect()
     except Exception:  # noqa: BLE001 - torch absent on CPU smoke tests
         pass
+    _trim_host_memory()
+
+
+def _trim_host_memory():
+    """Return freed glibc arenas to the OS when supported; not a CUDA action."""
+    try:
+        import ctypes
+
+        trim = ctypes.CDLL(None).malloc_trim
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        trim(0)
+    except (AttributeError, OSError):  # non-glibc platforms have no malloc_trim
+        pass
+
+
+def _host_rss_bytes():
+    """Current Linux RSS, not ru_maxrss (which is a historical high-water mark)."""
+    try:
+        with open("/proc/self/statm", encoding="ascii") as statm:
+            return int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _cuda_free_bytes():
@@ -334,6 +361,8 @@ _manager = ImageModelManager(
     vram_budget_gb=DIFFUSERS_VRAM_BUDGET_GB,
     quant_mode=DIFFUSERS_QUANT,
     warm_wait_seconds=DIFFUSERS_WARM_WAIT_SECONDS,
+    idle_unload_seconds=DIFFUSERS_IDLE_UNLOAD_SECONDS,
+    pinned_models=DIFFUSERS_PINNED_MODELS,
 )
 
 # The lease _get_pipe takes for the in-flight /generate, released in generate()'s
@@ -362,14 +391,8 @@ def _release_pipe():
         held.release()
 
 
-# Separate lazy singleton for the video pipeline (citadel #958) -- its own
-# globals/lock, entirely independent of _pipe/_pipe_lock/_device above. This
-# is what makes /generate and /generate/video coexist: loading the video
-# model never touches, evicts, or blocks on the image model's pipeline, and
-# vice versa (each pays its own one-time load cost, on first use, exactly
-# like the image path already does).
-_video_pipe = None
-_video_pipe_lock = threading.Lock()
+# Video has its own residency manager and leases. No permanent global retains
+# the pipeline after the final request releases it.
 _video_device = None
 
 
@@ -390,68 +413,67 @@ def _resolve_video_device_and_dtype():
     return "cpu", torch.float32
 
 
+def _load_video_pipeline(spec, variant):
+    """Build on the video manager's background load thread, not a request."""
+    import torch
+    from diffusers import AutoencoderKLWan, WanPipeline
+
+    device, dtype = _resolve_video_device_and_dtype()
+    # Preserve the separate video file-selection and disk preflight contract.
+    allow_patterns, ignore_patterns = model_preflight.resolve_allow_ignore_patterns(
+        allow_env="DIFFUSERS_VIDEO_ALLOW_PATTERNS",
+        ignore_env="DIFFUSERS_VIDEO_IGNORE_PATTERNS",
+    )
+    hf_token = model_preflight.hf_auth_token()
+    model_preflight.run_preflight(
+        DIFFUSERS_VIDEO_MODEL, DIFFUSERS_CACHE_DIR,
+        allow_patterns=allow_patterns, ignore_patterns=ignore_patterns, token=hf_token,
+    )
+    model_preflight.prefetch_filtered_weights(
+        DIFFUSERS_VIDEO_MODEL,
+        allow_patterns=allow_patterns, ignore_patterns=ignore_patterns, token=hf_token,
+    )
+    # Wan's VAE stays float32 independently of transformer/text encoder dtype.
+    vae = AutoencoderKLWan.from_pretrained(
+        DIFFUSERS_VIDEO_MODEL, subfolder="vae", torch_dtype=torch.float32,
+    )
+    pipe = WanPipeline.from_pretrained(DIFFUSERS_VIDEO_MODEL, vae=vae, torch_dtype=dtype)
+    return pipe.to(device), device
+
+
+# This spec is a lifecycle adapter, not a new video VRAM-budget claim. Video
+# retains its existing full-precision loading policy and separate preflight.
+_video_spec = image_models.ImageModelSpec(
+    model_id=DIFFUSERS_VIDEO_MODEL, license="unverified", permissive=False,
+    pipeline_class="WanPipeline", torch_dtype=DIFFUSERS_VIDEO_DTYPE,
+    variants=(image_models.LoadVariant("none", "none", 0.0),),
+)
+_video_manager = ImageModelManager(
+    {DIFFUSERS_VIDEO_MODEL: _video_spec}, DIFFUSERS_VIDEO_MODEL,
+    loader=lambda spec, variant: _load_video_pipeline(spec, variant),
+    unloader=lambda pipe: _unload_pipeline(pipe),
+    free_memory=lambda: _free_cuda_memory(),
+    warm_wait_seconds=DIFFUSERS_WARM_WAIT_SECONDS,
+    failure_backoff_seconds=DIFFUSERS_FAILURE_BACKOFF_SECONDS,
+    idle_unload_seconds=DIFFUSERS_IDLE_UNLOAD_SECONDS,
+    pinned_models=DIFFUSERS_PINNED_MODELS,
+)
+
+
 def _get_video_pipe():
-    """Lazy-load the diffusers text-to-video (WanPipeline) pipeline once,
-    thread-safely. Mirrors _get_pipe() above -- same double-checked-locking
-    shape and the identical citadel #902 preflight protections, just against
-    DIFFUSERS_VIDEO_MODEL instead of DIFFUSERS_MODEL and a video-specific
-    allow/ignore-pattern env var pair, since the two repos have unrelated
-    file layouts and sharing one pattern pair would silently misfilter
-    whichever model didn't set it."""
-    global _video_pipe, _video_device
-    if _video_pipe is not None:
-        return _video_pipe
-    with _video_pipe_lock:
-        if _video_pipe is not None:  # re-check inside the lock
-            return _video_pipe
-        import torch
-        from diffusers import AutoencoderKLWan, WanPipeline
+    global _video_device
+    _release_video_pipe()
+    lease = _video_manager.lease(DIFFUSERS_VIDEO_MODEL)
+    _leases.video = lease
+    _video_device = lease.device
+    return lease.pipe
 
-        device, dtype = _resolve_video_device_and_dtype()
 
-        # citadel #902/#958: identical free-space preflight + file-selection
-        # guard as the image path above (see its comments for the full
-        # fail-open/fail-closed contract), parameterized for the video model
-        # via its own env vars so an operator-declared filter for one model
-        # never applies to the other.
-        allow_patterns, ignore_patterns = model_preflight.resolve_allow_ignore_patterns(
-            allow_env="DIFFUSERS_VIDEO_ALLOW_PATTERNS",
-            ignore_env="DIFFUSERS_VIDEO_IGNORE_PATTERNS",
-        )
-        hf_token = model_preflight.hf_auth_token()
-        model_preflight.run_preflight(
-            DIFFUSERS_VIDEO_MODEL,
-            DIFFUSERS_CACHE_DIR,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            token=hf_token,
-        )
-        model_preflight.prefetch_filtered_weights(
-            DIFFUSERS_VIDEO_MODEL,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            token=hf_token,
-        )
-
-        # VAE loaded separately at float32 regardless of DIFFUSERS_VIDEO_DTYPE
-        # -- see DIFFUSERS_VIDEO_DTYPE's module-level comment. Both calls
-        # resolve to the SAME cache (no cache_dir passed, same reasoning as
-        # the image path's from_pretrained call above) so the preflight/
-        # prefetch above governs both downloads.
-        vae = AutoencoderKLWan.from_pretrained(
-            DIFFUSERS_VIDEO_MODEL,
-            subfolder="vae",
-            torch_dtype=torch.float32,
-        )
-        pipe = WanPipeline.from_pretrained(
-            DIFFUSERS_VIDEO_MODEL,
-            vae=vae,
-            torch_dtype=dtype,
-        )
-        pipe = pipe.to(device)
-        _video_device = device
-        _video_pipe = pipe
-        return _video_pipe
+def _release_video_pipe():
+    held = getattr(_leases, "video", None)
+    if held is not None:
+        _leases.video = None
+        held.release()
 
 
 def _export_video_bytes(frames, fps: int) -> bytes:
@@ -581,9 +603,11 @@ def health():
     resident now, ``loading``, ``cold`` = loads on demand and the first request
     gets a retryable warming response), licence, planned quantization under the
     VRAM budget, and whether it fits that budget. ``video_model_loaded`` is
-    independent: the video pipeline is a separate lazy singleton.
+    independent: the video pipeline has its own lease/residency manager.
     """
     image = _manager.status()
+    video = _video_manager.status()
+    residency_fields = ("model", "state", "resident", "pinned", "idle_seconds", "evicts_at")
     return {
         "status": "ok",
         "self_test": _self_test["status"],
@@ -599,8 +623,16 @@ def health():
         "quant_mode": image["quant_mode"],
         "last_load": image["last_load"],
         "video_model": DIFFUSERS_VIDEO_MODEL,
-        "video_model_loaded": _video_pipe is not None,
-        "video_device": _video_device,
+        "video_model_loaded": video["loaded_model"] is not None,
+        "video_device": _video_manager.resident_device(),
+        "video_loading_model": video["loading_model"],
+        "pipeline_residency": {
+            "image": [{key: model[key] for key in residency_fields} for model in image["allowed_models"]],
+            "video": [{key: model[key] for key in residency_fields} for model in video["allowed_models"]],
+        },
+        "pipeline_cleanup": {"image": image["idle_evicting"], "video": video["idle_evicting"]},
+        "host_rss_bytes": _host_rss_bytes(),
+        "idle_unload_seconds": DIFFUSERS_IDLE_UNLOAD_SECONDS,
     }
 
 
@@ -717,11 +749,16 @@ def generate(req: GenerateRequest):
             generator = torch.Generator(device=_device).manual_seed(req.seed)
 
         call_kwargs = _build_pipe_kwargs(spec, req, generator)
+        failure = None
         try:
             with _gpu_gen_lock:  # one generation on the shared GPU at a time
                 result = pipe(**_filter_call_kwargs(pipe, call_kwargs))
         except Exception as exc:  # inference failure (OOM at generate time, etc.)
-            raise HTTPException(500, f"generation failed: {exc}") from None
+            failure = f"generation failed: {exc}"
+        if failure is not None:
+            # Raise outside the except block: a retained original traceback
+            # can otherwise keep pipeline/component weights alive at eviction.
+            raise HTTPException(500, failure)
 
         image = result.images[0]
         buf = io.BytesIO()
@@ -751,44 +788,54 @@ def generate_video(req: GenerateVideoRequest):
     """Render a short video clip from a text prompt and return it as base64
     MP4 (citadel #958).
 
-    Coexists with /generate above: this calls the SEPARATE _get_video_pipe
-    lazy singleton (its own model/globals/lock), so this endpoint never
+    Coexists with /generate above: this calls the SEPARATE video manager,
+    with its own leases and idle-unload timer, so this endpoint never
     loads, evicts, or otherwise disturbs the image pipeline, and vice versa.
     """
     try:
         pipe = _get_video_pipe()
+    except ModelWarming as exc:
+        return _warming_response(exc)
     except Exception as exc:  # model load failure (OOM, bad repo id, auth)
         raise HTTPException(500, f"failed to load model {DIFFUSERS_VIDEO_MODEL}: {exc}")
 
-    generator = None
-    if req.seed is not None:
-        import torch
-
-        generator = torch.Generator(device=_video_device).manual_seed(req.seed)
-
+    result = frames = None
     try:
-        with _gpu_gen_lock:  # shared with /generate: one generation on the GPU at a time
-            result = pipe(
-                prompt=req.prompt,
-                negative_prompt=req.negative_prompt,
-                height=req.height,
-                width=req.width,
-                num_frames=req.num_frames,
-                num_inference_steps=req.num_inference_steps,
-                guidance_scale=req.guidance_scale,
-                generator=generator,
-            )
-    except Exception as exc:  # inference failure (OOM at generate time, etc.)
-        raise HTTPException(500, f"video generation failed: {exc}")
+        generator = None
+        if req.seed is not None:
+            import torch
 
-    frames = result.frames[0]
+            generator = torch.Generator(device=_video_device).manual_seed(req.seed)
+        failure = None
+        try:
+            with _gpu_gen_lock:  # shared with /generate
+                result = pipe(
+                    prompt=req.prompt,
+                    negative_prompt=req.negative_prompt,
+                    height=req.height,
+                    width=req.width,
+                    num_frames=req.num_frames,
+                    num_inference_steps=req.num_inference_steps,
+                    guidance_scale=req.guidance_scale,
+                    generator=generator,
+                )
+        except Exception as exc:
+            failure = f"video generation failed: {exc}"
+        if failure is not None:
+            raise HTTPException(500, failure)
 
-    try:
-        video_bytes = _export_video_bytes(frames, req.fps)
-    except Exception as exc:  # ffmpeg missing, encode failure, etc.
-        raise HTTPException(500, f"video export failed: {exc}")
-
-    video_b64 = base64.b64encode(video_bytes).decode("ascii")
+        frames = result.frames[0]
+        failure = None
+        try:
+            video_bytes = _export_video_bytes(frames, req.fps)
+        except Exception as exc:
+            failure = f"video export failed: {exc}"
+        if failure is not None:
+            raise HTTPException(500, failure)
+        video_b64 = base64.b64encode(video_bytes).decode("ascii")
+    finally:
+        del pipe, result, frames
+        _release_video_pipe()
 
     return {
         "model": DIFFUSERS_VIDEO_MODEL,

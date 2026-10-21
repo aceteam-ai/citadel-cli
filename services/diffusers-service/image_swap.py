@@ -100,6 +100,7 @@ class _Resident:
     # min_residency_seconds) a different model may not evict it, so two clients
     # alternating models cannot evict each other's fresh load before it serves.
     served: bool = False
+    idle_since: float | None = None
 
 
 @dataclass
@@ -133,6 +134,9 @@ class Lease:
     def release(self) -> None:
         if not self._released:
             self._released = True
+            # A released Lease may outlive its request. It must not retain
+            # model weights after the manager evicts the resident pipeline.
+            self.pipe = None
             self._manager._release(self._resident)
 
     def __enter__(self) -> "Lease":
@@ -167,6 +171,9 @@ class ImageModelManager:
         drain_timeout_seconds: float = 600.0,
         retry_after_seconds: int = 5,
         clock: Callable[[], float] = time.monotonic,
+        idle_unload_seconds: float = 300.0,
+        pinned_models: frozenset[str] = frozenset(),
+        timer_factory: Callable = threading.Timer,
     ):
         self._specs = specs
         self._default_model = default_model
@@ -186,6 +193,12 @@ class ImageModelManager:
         self._drain_timeout = drain_timeout_seconds
         self._retry_after = max(int(retry_after_seconds), 1)
         self._clock = clock
+        self._idle_unload = max(idle_unload_seconds, 0.0)
+        self._pinned = frozenset(pinned_models)
+        self._timer_factory = timer_factory
+        self._idle_timer = None
+        self._idle_token = 0
+        self._idle_evicting = False
 
         self._cond = threading.Condition()
         self._resident: _Resident | None = None
@@ -279,6 +292,9 @@ class ImageModelManager:
                         "est_vram_gb": variant.est_vram_gb if variant else None,
                         "fits_vram_budget": variant is not None,
                         "est_disk_gb": spec.est_disk_gb or None,
+                        "resident": spec.model_id == resident_id,
+                        "pinned": spec.model_id in self._pinned,
+                        **self._idle_status_locked(spec.model_id),
                     }
                 )
             return {
@@ -288,6 +304,7 @@ class ImageModelManager:
                 "vram_budget_gb": self._budget_gb,
                 "quant_mode": self._quant_mode,
                 "last_load": dict(self._last_load) if self._last_load else None,
+                "idle_evicting": self._idle_evicting,
             }
 
     # -- internals ----------------------------------------------------------
@@ -299,6 +316,8 @@ class ImageModelManager:
             return None
 
     def _try_locked(self, spec: ImageModelSpec) -> "Lease | _Load":
+        if self._idle_evicting:
+            raise self._warming_locked(spec, "busy")
         entry = self._failures.get(spec.model_id)
         if entry is not None:
             err, not_before, reported = entry
@@ -323,6 +342,8 @@ class ImageModelManager:
         ):
             resident.served = True
             resident.inflight += 1
+            resident.idle_since = None
+            self._cancel_idle_locked()
             return Lease(
                 pipe=resident.pipe,
                 device=resident.device,
@@ -353,6 +374,7 @@ class ImageModelManager:
                 candidates=tuple(fitting_variants(spec, self._budget_gb, self._quant_mode)),
             )
             self._load = load
+            self._cancel_idle_locked()
             self._thread = threading.Thread(
                 target=self._run_load, args=(load,), name=f"diffusers-load-{spec.model_id}", daemon=True
             )
@@ -385,7 +407,82 @@ class ImageModelManager:
         with self._cond:
             if resident.inflight > 0:
                 resident.inflight -= 1
+                if resident.inflight == 0 and self._resident is resident:
+                    resident.idle_since = self._clock()
+                    self._arm_idle_locked(resident)
             self._cond.notify_all()
+
+    def _cancel_idle_locked(self) -> None:
+        self._idle_token += 1
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _idle_deadline(self, resident: _Resident) -> float:
+        # A cold background load may finish after the caller got 503. Give
+        # that caller one Retry-After interval to acquire its first lease,
+        # even with idle=0, rather than evicting before it can ever serve.
+        grace = self._idle_unload if resident.served else max(self._idle_unload, self._retry_after)
+        return resident.idle_since + grace
+
+    def _idle_status_locked(self, model_id: str) -> dict[str, Any]:
+        resident = self._resident
+        idle = resident.idle_since if resident and resident.spec.model_id == model_id else None
+        remaining = None
+        if idle is not None and model_id not in self._pinned and self._load is None:
+            remaining = max(self._idle_deadline(resident) - self._clock(), 0.0)
+        return {
+            "idle_seconds": round(max(self._clock() - idle, 0.0), 2) if idle is not None else None,
+            # Epoch seconds, not a process-local monotonic clock reading.
+            "evicts_at": time.time() + remaining if remaining is not None else None,
+        }
+
+    def _arm_idle_locked(self, resident: _Resident) -> None:
+        self._cancel_idle_locked()
+        if resident.inflight or resident.spec.model_id in self._pinned or self._load is not None:
+            return
+        token = self._idle_token
+        delay = max(self._idle_deadline(resident) - self._clock(), 0.0)
+        timer = self._timer_factory(delay, lambda: self._evict_idle(resident, token))
+        timer.daemon = True
+        self._idle_timer = timer
+        timer.start()
+
+    def _evict_idle(self, resident: _Resident, token: int) -> None:
+        with self._cond:
+            if (
+                token != self._idle_token or self._resident is not resident
+                or resident.inflight or resident.spec.model_id in self._pinned
+                or self._load is not None
+            ):
+                return
+            if self._clock() < self._idle_deadline(resident):
+                self._arm_idle_locked(resident)
+                return
+            self._cancel_idle_locked()
+            self._resident = None
+            self._idle_evicting = True
+        try:
+            self._drop_pipeline(resident)
+            # All manager, lease and unload-frame references are gone before
+            # collection/cache release/host allocator trimming happens.
+            self._free_memory()
+        except Exception:
+            logger.exception("diffusers: idle memory cleanup failed")
+        finally:
+            with self._cond:
+                self._idle_evicting = False
+                self._cond.notify_all()
+
+    def _drop_pipeline(self, resident: _Resident) -> None:
+        pipe = resident.pipe
+        resident.pipe = None
+        try:
+            self._unloader(pipe)
+        except Exception:
+            logger.exception("diffusers: pipeline unload hook failed")
+        finally:
+            del pipe
 
     def _run_load(self, load: _Load) -> None:
         spec, variant = load.spec, load.variant
@@ -430,7 +527,9 @@ class ImageModelManager:
                     loaded_at=self._clock(),
                     load_seconds=elapsed,
                     measured_vram_gb=measured,
+                    idle_since=self._clock(),
                 )
+                del pipe
                 self._last_load = {
                     "model": spec.model_id,
                     "seconds": round(elapsed, 2),
@@ -440,6 +539,7 @@ class ImageModelManager:
                     "measured_vram_gb": round(measured, 2) if measured is not None else None,
                 }
                 self._load = None
+                self._arm_idle_locked(self._resident)
                 load.event.set()
                 self._cond.notify_all()
             logger.info(
@@ -466,6 +566,8 @@ class ImageModelManager:
                 self._failures[spec.model_id] = [err, self._clock() + self._failure_backoff, False]
                 load.error = err
                 self._load = None
+                if self._resident is not None and self._resident.inflight == 0:
+                    self._arm_idle_locked(self._resident)
                 load.event.set()
                 self._cond.notify_all()
 

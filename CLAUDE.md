@@ -2136,6 +2136,12 @@ stay failures. The VRAM figures in the catalog are estimates; `/health`
 `last_load.measured_vram_gb` records the real delta on each load. Pinned image
 stack and its rationale live in `requirements.txt`. The default `DIFFUSERS_MODEL` is FLUX.2-klein-4B; sdxl-turbo (non-permissive licence) is selectable only if an operator names it. `ImageModelManager.prepare` (preflight + download) runs BEFORE the resident model is evicted; a fresh model is protected until used (`DIFFUSERS_MIN_RESIDENCY_SECONDS`); and the single uvicorn worker is what enforces one model at a time.
 The compose env passthrough is covered by `KnownComposeHashes`.
+`ImageModelManager` also owns lease-counted idle eviction for the independent
+video pipeline. `Lease.release` must drop its pipeline reference before idle
+cleanup; app handlers must drop their own references before releasing. Auto
+variant selection ranks GPU-only variants ahead of CPU offload. See
+`docs/diffusers-idle-residency.md` for pins, health fields and the separate
+real-RSS/image-promotion acceptance gates; source tests are not those receipts.
 The compose image is pinned by digest, not `:latest` (citadel-cli#1346):
 compose pulls only a missing image, so a node that already held an old
 `:latest` kept serving it under newer compose defaults (FLUX.2-klein-4B on a
