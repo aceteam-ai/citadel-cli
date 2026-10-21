@@ -95,3 +95,24 @@ belong in the draft PR. The accepted input-only fixture pin is unchanged.
 All phases above remain required. This plan is not a claim that wrappers,
 remote ACK, privacy, holder admission, output upload or live acceptance are
 complete. Minting/activation stays blocked until C2 and its paired gates close.
+
+### C2 phase 1: prepared shared diagnostic policy
+
+`jobprivacy.IsPrivateMedia` uses field presence, not successful JSON/token
+parsing. The shared retention helpers omit the entire private-media payload
+and arbitrary failure fields; private-media text is static without invoking
+the original error formatter. This includes malformed/escaped/oversized inputs
+and workspace-only inputs, rather than guessing which representation is safe.
+Legacy text jobs without `inputs` keep their diagnostic behavior. This is a
+conservative source proposal, not a ratified upload/fixture contract.
+
+The shared `redactedError` now keeps its explicit `Unwrap` projection behind a
+closure, not a reflectable original-error field. A synthetic value-error
+regression first reproduced a FILE_FETCH leak through `%#v`; the source fix
+preserves `errors.Is`/`errors.As` and passes the same wrapper/format cases for
+FILE_FETCH, passcode and private media. No original error object is mutated.
+
+These helpers do not seal `Job.Payload`, `RawPayload` or `RawData`, wire every
+diagnostic path, or delete a Redis entry. Phases 2 through 5 remain required.
+Do not call C2 complete or mint a media capability based on this phase's tests
+or green CI. See the draft for exact-head receipts and independent review.

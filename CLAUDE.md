@@ -31,6 +31,13 @@ So, when adding to this file:
 
 ## Project Overview
 
+`jobprivacy.IsPrivateMedia` owns the malformed-safe diagnostic classification
+for MEDIA_GENERATE inputs; its retention helpers never mutate execution data.
+`redactedError.Unwrap` exposes original classification through a private
+closure so reflected diagnostic wrappers cannot traverse the original error.
+The complete pre-mint privacy/ACK gates remain in
+`docs/media-input-freezer.md`; helper tests alone are not C2 completion.
+
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
 advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,
