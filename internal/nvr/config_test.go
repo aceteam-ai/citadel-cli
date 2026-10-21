@@ -183,7 +183,7 @@ func TestMQTTCredentialsUseEnvironmentPlaceholders(t *testing.T) {
 	for _, enabled := range []bool{true, false} {
 		cfg := Config{
 			RetentionDays: 12, Detector: DetectorCPU,
-			MQTT: MQTTSpec{Enabled: enabled, Host: "mosquitto", User: user, Password: password},
+			MQTT: MQTTSpec{Enabled: enabled, Host: "mosquitto", User: user, Password: password, CredentialsFromEnv: true},
 		}
 		out, err := GenerateFrigateConfig(cfg, []Camera{{Name: "front-door"}})
 		if err != nil {
@@ -201,6 +201,18 @@ func TestMQTTCredentialsUseEnvironmentPlaceholders(t *testing.T) {
 		} else if len(mqtt) != 1 || mqtt["enabled"] != false {
 			t.Error("disabled MQTT must emit no credentials")
 		}
+	}
+}
+
+func TestMQTTLegacyComposeKeepsLiteralCredentials(t *testing.T) {
+	cfg := Config{
+		RetentionDays: 12, Detector: DetectorCPU,
+		MQTT: MQTTSpec{Enabled: true, Host: "mosquitto", User: "old-user", Password: "old-password-$:'\"{}"},
+	}
+	m := parseGenerated(t, cfg, nil)
+	mqtt := m["mqtt"].(map[string]any)
+	if mqtt["user"] != cfg.MQTT.User || mqtt["password"] != cfg.MQTT.Password {
+		t.Error("old compose without Frigate env must retain literal credentials")
 	}
 }
 

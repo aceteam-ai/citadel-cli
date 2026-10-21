@@ -119,6 +119,17 @@ func runWithConfigDir(dir *os.File) error {
 			mqttPort = v
 		}
 	}
+	// Only the updated compose opts in AND passes the matching FRIGATE_ env.
+	// Old catalog compose files can pull this image safely: private literal YAML
+	// remains their default until the compose is updated, with no flag day.
+	mqttCredentialsFromEnv := false
+	if raw := strings.TrimSpace(os.Getenv("NVR_MQTT_CREDENTIALS_FROM_ENV")); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("NVR_MQTT_CREDENTIALS_FROM_ENV must be a boolean")
+		}
+		mqttCredentialsFromEnv = v
+	}
 
 	cfg := nvr.Config{
 		RetentionDays:  retention,
@@ -127,12 +138,13 @@ func runWithConfigDir(dir *os.File) error {
 		SemanticSearch: semanticSearch,
 		TrackObjects:   trackObjects,
 		MQTT: nvr.MQTTSpec{
-			Enabled:     mqttEnabled,
-			Host:        getenvDefault("NVR_MQTT_HOST", "mosquitto"),
-			Port:        mqttPort,
-			User:        os.Getenv("NVR_MQTT_USER"),
-			Password:    os.Getenv("NVR_MQTT_PASSWORD"),
-			TopicPrefix: getenvDefault("NVR_MQTT_TOPIC_PREFIX", nvr.DefaultMQTTTopicPrefix),
+			Enabled:            mqttEnabled,
+			Host:               getenvDefault("NVR_MQTT_HOST", "mosquitto"),
+			Port:               mqttPort,
+			User:               os.Getenv("NVR_MQTT_USER"),
+			Password:           os.Getenv("NVR_MQTT_PASSWORD"),
+			CredentialsFromEnv: mqttCredentialsFromEnv,
+			TopicPrefix:        getenvDefault("NVR_MQTT_TOPIC_PREFIX", nvr.DefaultMQTTTopicPrefix),
 		},
 	}
 	yamlOut, err := nvr.GenerateFrigateConfig(cfg, cameras)

@@ -28,7 +28,9 @@
 # module update/start must install this compose AND recreate/run the updated
 # nvr-config init container. It first restricts /config to 0700 and both legacy
 # config.yml/config.yaml to 0600 (even if later validation fails), then atomically
-# replaces config.yml without MQTT credentials. Until that init step runs, an
+# replaces config.yml (the opt-in below keeps credentials out). Older compose
+# files keep private literal credentials until updated, so pulling the new init
+# image alone does not break Frigate. Until the hardened init step runs, an
 # old 0644 file remains exposed. The catalog copy in citadel-services must also
 # be updated before a catalog-installed module can receive this repair. No live
 # restart or rollout is implied by merging source.
@@ -111,6 +113,8 @@ services:
       # Set NVR_MQTT=false to opt out.
       - NVR_MQTT=${NVR_MQTT:-true}
       - NVR_MQTT_HOST=mosquitto
+      # Set this ONLY alongside Frigate's matching FRIGATE_MQTT_* environment.
+      - NVR_MQTT_CREDENTIALS_FROM_ENV=true
       - NVR_MQTT_USER=${NVR_MQTT_USER:-frigate}
       - NVR_MQTT_PASSWORD=${NVR_MQTT_PASSWORD:?nvr requires NVR_MQTT_PASSWORD (mosquitto allows anonymous access by default)}
     volumes:

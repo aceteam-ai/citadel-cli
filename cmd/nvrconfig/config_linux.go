@@ -25,7 +25,7 @@ func openPrivateConfigDir(path string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open config directory: %w", err)
 	}
-	dir := os.NewFile(uintptr(fd), "nvr config directory")
+	dir := os.NewFile(uintptr(fd), path)
 	fail := func(err error) (*os.File, error) {
 		dir.Close()
 		return nil, err
@@ -35,7 +35,7 @@ func openPrivateConfigDir(path string) (*os.File, error) {
 		return fail(fmt.Errorf("stat config directory: %w", err))
 	}
 	if st.Uid != uint32(os.Geteuid()) {
-		return fail(errors.New("config directory must belong to the init-container user"))
+		return fail(fmt.Errorf("config directory %q must belong to init-container uid %d; chown the host bind source ~/.citadel-cli/nvr/config to the matching mapped uid, not broader modes", path, os.Geteuid()))
 	}
 	if err := dir.Chmod(0o700); err != nil {
 		return fail(fmt.Errorf("restrict config directory: %w", err))
@@ -64,8 +64,11 @@ func hardenExistingConfig(dir *os.File, name string) error {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return fmt.Errorf("stat existing config: %w", err)
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Uid != uint32(os.Geteuid()) {
-		return errors.New("existing config must be a regular, singly linked file owned by the init-container user")
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		return errors.New("existing config must be a regular, singly linked file")
+	}
+	if st.Uid != uint32(os.Geteuid()) {
+		return fmt.Errorf("config %q in %q must belong to init-container uid %d; chown its host file under ~/.citadel-cli/nvr/config to the matching mapped uid, not broader modes", name, dir.Name(), os.Geteuid())
 	}
 	if err := f.Chmod(0o600); err != nil {
 		return fmt.Errorf("restrict existing config: %w", err)

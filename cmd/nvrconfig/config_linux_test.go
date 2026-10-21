@@ -36,6 +36,7 @@ func setAssignment(t *testing.T) {
 		{"NVR_MQTT", "true"},
 		{"NVR_MQTT_HOST", "mosquitto"},
 		{"NVR_MQTT_PORT", "1883"},
+		{"NVR_MQTT_CREDENTIALS_FROM_ENV", "true"},
 		{"NVR_MQTT_USER", "private-broker-user"},
 		{"NVR_MQTT_PASSWORD", "private-broker-password-$:'\"{}"},
 		{"NVR_MQTT_TOPIC_PREFIX", "frigate"},
@@ -227,6 +228,15 @@ func TestComposeSuppliesFrigateCredentialsAndRefreshesInitImage(t *testing.T) {
 			t.Errorf("%s unexpectedly overrides the stock root identity", service)
 		}
 	}
+	initOptIn := false
+	for _, item := range compose.Services["nvr-config"].Environment {
+		if item == "NVR_MQTT_CREDENTIALS_FROM_ENV=true" {
+			initOptIn = true
+		}
+	}
+	if !initOptIn {
+		t.Error("new compose must opt in alongside matching Frigate environment")
+	}
 	env := make(map[string]string)
 	for _, item := range compose.Services["frigate"].Environment {
 		key, value, _ := strings.Cut(item, "=")
@@ -237,5 +247,58 @@ func TestComposeSuppliesFrigateCredentialsAndRefreshesInitImage(t *testing.T) {
 	}
 	if env["FRIGATE_MQTT_PASSWORD"] != "${NVR_MQTT_PASSWORD:?nvr requires NVR_MQTT_PASSWORD (mosquitto allows anonymous access by default)}" {
 		t.Error("Frigate password must use the required broker assignment source")
+	}
+}
+
+func TestPrivateConfigLegacyComposeWritesPrivateLiterals(t *testing.T) {
+	for _, optIn := range []string{"", "false"} {
+		t.Run("opt-in="+optIn, func(t *testing.T) {
+			setAssignment(t)
+			t.Setenv("NVR_MQTT_CREDENTIALS_FROM_ENV", optIn)
+			path := filepath.Join(t.TempDir(), "config")
+			dir, err := openPrivateConfigDir(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dir.Close()
+			if err := runWithConfigDir(dir); err != nil {
+				t.Fatal(err)
+			}
+			file := filepath.Join(path, configName)
+			assertMode(t, path, 0o700)
+			assertMode(t, file, 0o600)
+			data, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cfg struct {
+				MQTT struct {
+					User     string `yaml:"user"`
+					Password string `yaml:"password"`
+				} `yaml:"mqtt"`
+			}
+			if err := yaml.Unmarshal(data, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.MQTT.User != os.Getenv("NVR_MQTT_USER") || cfg.MQTT.Password != os.Getenv("NVR_MQTT_PASSWORD") {
+				t.Error("legacy compose credentials changed")
+			}
+			if strings.Contains(string(data), "{FRIGATE_MQTT_") {
+				t.Error("legacy compose received unresolvable placeholders")
+			}
+		})
+	}
+}
+
+func TestPrivateConfigRejectsInvalidCredentialOptIn(t *testing.T) {
+	setAssignment(t)
+	t.Setenv("NVR_MQTT_CREDENTIALS_FROM_ENV", "not-a-bool")
+	dir, err := openPrivateConfigDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	if err := runWithConfigDir(dir); err == nil {
+		t.Fatal("invalid credential opt-in must fail, not silently choose literals")
 	}
 }
