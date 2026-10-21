@@ -96,6 +96,26 @@ type Result struct {
 	Artifact *Artifact     `json:"artifact,omitempty"`
 }
 
+// ProgressEvent carries only a fixed stage and transition. It never contains
+// filenames, raw tool logs, exception text or model output. A Run emits at most
+// six events: start and one terminal transition for each of its three stages.
+// Stage completion is not bundle publication, receipt signing or job success.
+type ProgressEvent struct {
+	Stage string `json:"stage"`
+	State string `json:"state"`
+}
+
+const (
+	StageExtractFrames = "extract_frames"
+	StageSFM           = "sfm"
+	StageTraining      = "training"
+
+	ProgressStarting = "starting"
+	ProgressComplete = "complete"
+	ProgressFailed   = "failed"
+	ProgressRejected = "rejected"
+)
+
 // ErrQualityGate means SfM completed but its signal did not justify spending
 // GPU time on training.
 var ErrQualityGate = errors.New("reconstruct: SfM quality gate rejected capture")
@@ -108,6 +128,10 @@ type Runner struct {
 	FFmpegPath  string
 	SpirulaPath string
 	Log         io.Writer
+	// Progress is a trusted, synchronous observer of bounded static events.
+	// It must not block. It grants no path/process authority and does not replace
+	// actual-exit custody or a job's authenticated progress transport.
+	Progress func(ProgressEvent)
 }
 
 // Run executes ffmpeg (for video), SfM, the quality gate, and headless 3DGS
@@ -163,9 +187,12 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 			"-vf", "fps=" + strconv.FormatFloat(req.FrameFPS, 'f', -1, 64),
 			"-q:v", "2", framePattern,
 		}
+		r.progress(StageExtractFrames, ProgressStarting)
 		if err := r.run(ctx, log, Invocation{Name: ffmpeg, Args: args, Dir: workDir}); err != nil {
+			r.progress(StageExtractFrames, ProgressFailed)
 			return result, fmt.Errorf("reconstruct: extract frames: %w", err)
 		}
+		r.progress(StageExtractFrames, ProgressComplete)
 	}
 
 	sfmDir := filepath.Join(workDir, "sfm")
@@ -179,6 +206,7 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 		"--quality", req.SFMQuality,
 		"--data-type", "video",
 	}
+	r.progress(StageSFM, ProgressStarting)
 	sfmErr := r.runWithWriters(ctx, Invocation{
 		Name: spirula, Args: sfmArgs, Dir: workDir,
 		Stdout: sfmLog, Stderr: sfmLog,
@@ -188,21 +216,25 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 	// carry the quality signal and a usable sparse model, so apply our explicit
 	// gate instead of confusing those verdicts with a crashed subprocess.
 	if sfmErr != nil && !completedSFMVerdict(sfmErr) {
+		r.progress(StageSFM, ProgressFailed)
 		return result, fmt.Errorf("reconstruct: SfM: %w", sfmErr)
 	}
 	quality, err := ParseQualitySignal(sfmOutput.String())
 	if err != nil {
+		r.progress(StageSFM, ProgressFailed)
 		return result, fmt.Errorf("reconstruct: SfM completed without a parseable quality signal: %w", err)
 	}
 	quality.AcceptedForTraining = quality.RegisteredPercent >= req.MinRegisteredPercent &&
 		quality.MeanReprojectionPX <= req.MaxMeanReprojectionPX
 	result.Quality = quality
 	if !quality.AcceptedForTraining {
+		r.progress(StageSFM, ProgressRejected)
 		return result, fmt.Errorf(
 			"%w: %.1f%% registered (minimum %.1f%%), mean reprojection %.3f px (maximum %.3f px)",
 			ErrQualityGate, quality.RegisteredPercent, req.MinRegisteredPercent,
 			quality.MeanReprojectionPX, req.MaxMeanReprojectionPX)
 	}
+	r.progress(StageSFM, ProgressComplete)
 	// SfM writes COLMAP features/matches/sparse data into its workspace but
 	// intentionally leaves the source images in place. Complete the standard
 	// COLMAP dataset layout for the trainer with a private symlink rather than
@@ -237,9 +269,12 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 		"--disable-viewer", "1",
 		"--keep-viewer-alive", "0",
 	}
+	r.progress(StageTraining, ProgressStarting)
 	if err := r.run(ctx, log, Invocation{Name: spirula, Args: trainArgs, Dir: workDir}); err != nil {
+		r.progress(StageTraining, ProgressFailed)
 		return result, fmt.Errorf("reconstruct: train 3DGS: %w", err)
 	}
+	r.progress(StageTraining, ProgressComplete)
 
 	checkpoint := fmt.Sprintf("step-%09d.ckpt", req.Iterations)
 	ply := filepath.Join(trainRoot, "run", checkpoint, "splat.ply")
@@ -285,6 +320,12 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 		Size:   size,
 	}
 	return result, nil
+}
+
+func (r Runner) progress(stage, state string) {
+	if r.Progress != nil {
+		r.Progress(ProgressEvent{Stage: stage, State: state})
+	}
 }
 
 func (r Runner) run(ctx context.Context, log io.Writer, invocation Invocation) error {
