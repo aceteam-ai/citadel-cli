@@ -2121,6 +2121,14 @@ shaped like:
 The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
 single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
 
+### Depth point-cloud sequence proposal (citadel-cli#1385)
+
+The separate #1385 depth-service proposal is not a registered engine/job.
+`internal/pointcloud` owns its inactive packed-sequence reference codec and
+synthetic camera-distance projection, not model calibration, Files authority or
+artifact publication. `docs/pointcloud-depth-service.md` owns the proposed wire
+layout and unresolved runtime/consumer acceptance gates.
+
 ### Diffusers sidecar: per-request model selection (citadel-cli#1335)
 
 `services/diffusers-service` serves one image model on the GPU at a time and

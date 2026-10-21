@@ -33,6 +33,8 @@ Source revision observed on 2026-10-21:
 This is source provenance, not a verified checkpoint digest or permission to
 download/load it. Model/architecture code, weight digest and dependency pins
 must be independently reviewed before startup. No unsafe pickle fallback.
+The adapter must select `vits` explicitly; upstream's default encoder is not
+the Small model and must not silently select another checkpoint.
 
 The [upstream runner](https://github.com/DepthAnything/Video-Depth-Anything/blob/4f5ae23172ba60fd7bc11ef671cca678842c7072/run.py)
 distinguishes relative and metric modes and only demonstrates point-cloud
@@ -79,6 +81,30 @@ Offsets are not byte offsets. Total file length must be exactly
 counts and declared length before allocations. Refuse nonfinite coordinates
 and values outside binary16's finite range. Never allocate all declared frames
 or points based solely on a header.
+The compact 9-byte records are not an aligned WebGL vertex buffer: the renderer
+must unpack one frame into its typed position/color buffers rather than passing
+stride9 binary16 attributes directly to GPU vertex APIs. This tradeoff needs
+the renderer owner's review before the wire format is frozen.
+
+The inactive reference codecs are `internal/pointcloud`: a seekable writer
+reserves only the bounded header/index, appends one frame at a time, and patches
+the header on successful finish. It refuses a nonempty destination and becomes
+permanently unfinishable after an incomplete/failed write. The caller owns the
+destination and still must sync/hash and perform confined create-only atomic
+publication. Readers validate header/index/actual supplied length before any
+frame allocation and expose one bounded frame at a time. Structural header
+acceptance does not validate every point or authenticate an artifact; consume
+each frame only after independent digest binding and immutable-file custody.
+Neither codec opens paths, loads a model or starts a process/service.
+
+Writers first normalize coordinates to binary32 and then use nearest-even
+binary16 rounding; the Go side uses the already pinned MIT `x448/float16`
+v0.8.4 dependency, not a new version. Quantized bounds are recorded. The shared
+synthetic 91-byte artifact has SHA-256
+`7d2408e90d8e321ac18609a461008e4d8a46495f0d02b477a030a317eaa38e94`;
+the enclosing input/expected-output fixture has reviewed pin
+`8cad831a3f4da7e9f349d45156ade8499c1ee929e20d26652d9a5f86bf228190`.
+Those are synthetic codec pins, not model/image/source-video acceptance.
 
 Coordinates are right-handed: +X image-right, +Y up, -Z forward from the camera.
 Projection uses pixel centres and square pixels:
@@ -87,6 +113,8 @@ Projection uses pixel centres and square pixels:
 Skip nonpositive/nonfinite distance or masked-out pixels; clamp other distances
 to declared near/far planes. If over budget, choose evenly spaced eligible
 row-major pixels deterministically, not a random subset or just the first rows.
+For N eligible pixels and K selected points, select eligible index
+`floor(i*(N-1)/(K-1))`; K=1 selects `floor((N-1)/2)`.
 RGB is copied from the same selected pixel. Bounds must describe the actual
 quantized coordinates, not a pre-quantization approximation.
 
@@ -133,8 +161,14 @@ Progress is bounded per frame/window and excludes input paths or media bytes.
 ## Acceptance ledger
 
 - Pending: source design review by automated-citadel and paired format consumers.
-- Pending: source codecs and synthetic cross-language, malformed length/offset,
-  nonfinite, FPS, mask and deterministic projection tests; normal CI only.
+- Prepared, not locally executed: source codecs and synthetic cross-language,
+  malformed length/offset, nonfinite, FPS, mask and deterministic projection
+  tests. Normal CI only; the draft workflow adds the stdlib Python replay to
+  the existing test job. This workflow source change requires normal independent
+  workflow review/approval before any later merge; it grants no runtime rights.
+- Pending: exact manifest schema/serializer, independently bound source/weight
+  pins, complete worker/service and consumer adoption; the binary alone is not
+  a valid externally published job result.
 - Pending: complete source worker/sidecar, confined publication, custody/fault
   tests, approved model mapping and exact artifact/dependency pins.
 - Held: local candidate execution, model downloads, GPU inference, service or
