@@ -66,8 +66,32 @@ func passcodeStateFrom(permissionsDir string, vault *nodevault.Vault) (jobs.Pass
 		return jobs.PasscodeState{Set: true, Check: func(pin string) jobs.PasscodeVerdict { return vaultPasscodeVerdict(vault, pin) }}, nil
 	}
 	// The vault was just checked, so verify the legacy hash directly rather
-	// than through the master-PIN hooks, which consult the vault again.
-	return jobs.PasscodeState{Set: perms.PasscodeHash != "", Check: jobs.BoolCheck(perms.VerifyLegacyPasscode)}, nil
+	// than through the master-PIN hooks, which consult the vault again. The
+	// legacy check uses the same node-wide legacy passcode lockout as the
+	// network surfaces (#1398), resolved from the vault's node directory so
+	// tests stay off this machine's state.
+	lockout := vault.LegacyPasscodeLockout()
+	return jobs.PasscodeState{Set: perms.PasscodeHash != "", Check: func(pin string) jobs.PasscodeVerdict {
+		return legacyPasscodeVerdict(perms, lockout, pin)
+	}}, nil
+}
+
+// legacyPasscodeVerdict checks pin against the legacy bcrypt hash under the
+// node-wide lockout, reporting a lockout as PasscodeLockedOut rather than a
+// wrong passcode, as vaultPasscodeVerdict does. An empty pin or an unset hash
+// is a mismatch and is not counted.
+func legacyPasscodeVerdict(perms *config.Permissions, lockout *nodevault.Lockout, pin string) jobs.PasscodeVerdict {
+	err := perms.CheckLegacyPasscode(pin, lockout)
+	switch {
+	case err == nil:
+		return jobs.PasscodeMatch
+	case nodevault.IsLockedOut(err):
+		return jobs.PasscodeLockedOut
+	case errors.Is(err, nodevault.ErrWrongPIN), errors.Is(err, config.ErrPasscodeMismatch):
+		return jobs.PasscodeMismatch
+	default:
+		return jobs.PasscodeUnavailable
+	}
 }
 
 // vaultPasscodeVerdict checks pin against the master-PIN vault, reporting a
