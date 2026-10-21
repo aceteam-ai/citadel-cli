@@ -31,7 +31,7 @@ const FileFetchEndpointPath = coordinatorfetch.FileFetchPath
 const (
 	fileFetchHardMaxBytes  int64 = coordinatorfetch.MaxBytes
 	fileFetchTimeout             = coordinatorfetch.Timeout
-	fileFetchMaxTokenBytes       = 4096
+	fileFetchMaxTokenBytes       = coordinatorfetch.MaxTokenBytes
 )
 
 // FileFetchHandler stages a capability-bound document into the workspace.

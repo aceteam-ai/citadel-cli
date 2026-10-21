@@ -21,8 +21,12 @@ type Endpoint uint8
 const (
 	FileFetch Endpoint = iota + 1
 	MediaInput
+)
+
+const (
 	FileFetchPath  = "/api/shared/file-fetch"
 	MediaInputPath = "/api/shared/media-input"
+	MaxTokenBytes  = 4096
 	MaxBytes       = int64(2 << 30)
 	Timeout        = 5 * time.Minute
 )
@@ -64,7 +68,7 @@ func Origin(raw string) (*url.URL, error) {
 }
 
 func ValidCapability(token string) bool {
-	if token == "" || token == "." || token == ".." || len(token) > 4096 {
+	if token == "" || token == "." || token == ".." || len(token) > MaxTokenBytes {
 		return false
 	}
 	for _, c := range token {
