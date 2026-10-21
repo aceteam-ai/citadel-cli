@@ -217,6 +217,7 @@ const (
 	JobTypeFileReadBytes      = "FILE_READ_BYTES"      // Read a file as raw base64-encoded bytes (binary-safe)
 	JobTypeFileWrite          = "FILE_WRITE"           // Write a file to the workspace
 	JobTypeFileWriteBytes     = "FILE_WRITE_BYTES"     // Write a file from raw base64-encoded bytes (binary-safe)
+	JobTypeFileFetch          = "FILE_FETCH"           // Stage an exact coordinator capability into the workspace
 	JobTypeFileEdit           = "FILE_EDIT"            // Edit (string replace) a file in the workspace
 	JobTypeFileList           = "FILE_LIST"            // List directory contents in the workspace
 	JobTypeFileSearch         = "FILE_SEARCH"          // Search for text across files in the workspace
@@ -312,6 +313,7 @@ var allKnownJobTypes = []string{
 	JobTypeFileReadRangeV2,
 	JobTypeFileWrite,
 	JobTypeFileWriteBytes,
+	JobTypeFileFetch,
 	JobTypeFileEdit,
 	JobTypeFileList,
 	JobTypeFileSearch,
@@ -409,6 +411,7 @@ var gatedJobTypeReasons = map[string]string{
 	JobTypeFileReadRangeV2:    "conditional ranges require Linux artifact observations and the node's Files permission",
 	JobTypeFileWrite:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileWriteBytes:     "this node has no workspace directory configured",
+	JobTypeFileFetch:          "FILE_FETCH requires supported Linux anonymous staging, a workspace, Files permission and a trusted HTTPS coordinator origin",
 	JobTypeFileEdit:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileList:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileSearch:         "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",

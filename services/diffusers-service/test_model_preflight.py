@@ -493,3 +493,134 @@ def test_wan21_video_preflight_uses_independent_env_vars_from_image_path(monkeyp
     )
     assert image_allow == ["vae/*"]
     assert video_allow == ["transformer/*"]
+
+
+# ---------------------------------------------------------------------------
+# Catalog preflight (citadel-cli#1335): every catalog model's patterns select
+# only what from_pretrained reads, and fail_closed refuses on a shortfall.
+# ---------------------------------------------------------------------------
+
+import image_models  # noqa: E402
+
+GIB = 1024**3
+
+
+def _fake_repo(spec):
+    """A synthetic listing shaped like the real repo: the model's real
+    component dirs holding est_disk_gb, plus decoys the patterns must skip."""
+    per = int(spec.est_disk_gb * GIB)
+    main_dir = "unet" if "unet/*" in spec.allow_patterns else "transformer"
+    files = [
+        mp.RepoFileInfo("model_index.json", 1000, True),
+        mp.RepoFileInfo(f"{main_dir}/diffusion_pytorch_model.safetensors", per, True),
+        mp.RepoFileInfo("root-duplicate-checkpoint.safetensors", 50 * GIB, True),
+        mp.RepoFileInfo("unet/model.onnx_data", 50 * GIB, True),
+        mp.RepoFileInfo("unet/diffusion_pytorch_model.fp16.safetensors", 50 * GIB, True),
+    ]
+    return lambda repo_id, **kw: files
+
+
+@pytest.mark.parametrize("model_id", sorted(image_models.CATALOG))
+def test_catalog_preflight_refuses_a_shortfall_for_each_model(model_id):
+    spec = image_models.CATALOG[model_id]
+    assert spec.allow_patterns, "every catalog entry must declare allow patterns"
+    allow, ignore = list(spec.allow_patterns), list(spec.ignore_patterns or ())
+    size = mp.estimate_repo_size_bytes(
+        model_id, allow_patterns=allow, ignore_patterns=ignore, list_repo_files_fn=_fake_repo(spec)
+    )
+    assert size < spec.est_disk_gb * GIB + 10_000  # decoys excluded
+    common = dict(
+        allow_patterns=allow,
+        ignore_patterns=ignore,
+        list_repo_files_fn=_fake_repo(spec),
+        margin_bytes=20 * GIB,
+        fail_closed=True,
+    )
+    with pytest.raises(mp.InsufficientDiskSpaceError):  # smaller than the model
+        mp.run_preflight(model_id, "/x", available_disk_bytes_fn=lambda _p: int(spec.est_disk_gb * GIB * 0.5), **common)
+    with pytest.raises(mp.InsufficientDiskSpaceError):  # fits, but breaks the 20 GiB floor
+        mp.run_preflight(model_id, "/x", available_disk_bytes_fn=lambda _p: int(spec.est_disk_gb * GIB) + 10 * GIB, **common)
+    mp.run_preflight(model_id, "/x", available_disk_bytes_fn=lambda _p: int(spec.est_disk_gb * GIB) + 25 * GIB, **common)
+
+
+def test_fail_closed_without_patterns_still_refuses():
+    files = [mp.RepoFileInfo("a.safetensors", 100 * GIB, True)]
+    with pytest.raises(mp.InsufficientDiskSpaceError):
+        mp.run_preflight(
+            "x/y", "/x", list_repo_files_fn=lambda *a, **k: files,
+            available_disk_bytes_fn=lambda _p: 10 * GIB, fail_closed=True,
+        )
+    # unchanged default: warn only
+    mp.run_preflight(
+        "x/y", "/x", list_repo_files_fn=lambda *a, **k: files,
+        available_disk_bytes_fn=lambda _p: 10 * GIB,
+    )
+
+
+def test_already_cached_files_are_netted_out_of_the_estimate():
+    files = [
+        mp.RepoFileInfo("transformer/a.safetensors", 30 * GIB, True),
+        mp.RepoFileInfo("text_encoder/b.safetensors", 8 * GIB, True),
+    ]
+    size = mp.estimate_repo_size_bytes(
+        "x/y", list_repo_files_fn=lambda *a, **k: files,
+        is_cached_fn=lambda repo, path, rev: path.startswith("transformer/"),
+    )
+    assert size == 8 * GIB
+
+
+def test_free_disk_floor_does_not_apply_to_a_fully_cached_model():
+    spec = image_models.CATALOG["stabilityai/sdxl-turbo"]
+    kw = dict(
+        allow_patterns=list(spec.allow_patterns),
+        ignore_patterns=list(spec.ignore_patterns),
+        list_repo_files_fn=_fake_repo(spec),
+        margin_bytes=20 * GIB,
+        fail_closed=True,
+    )
+    # Disk nearly full (3 GB free) and nothing cached: refused.
+    with pytest.raises(mp.InsufficientDiskSpaceError):
+        mp.run_preflight("stabilityai/sdxl-turbo", "/x", available_disk_bytes_fn=lambda _p: 3 * GIB, **kw)
+    # Same disk, every selected file cached: loads regardless of free disk.
+    def probe(_p):
+        raise AssertionError("disk must not even be probed when nothing is left to download")
+
+    mp.run_preflight(
+        "stabilityai/sdxl-turbo", "/x", available_disk_bytes_fn=probe, is_cached_fn=lambda r, p, v: True, **kw
+    )
+
+
+def test_floor_applies_only_to_the_bytes_still_to_download():
+    files = [
+        mp.RepoFileInfo("transformer/a.safetensors", 30 * GIB, True),
+        mp.RepoFileInfo("text_encoder/b.safetensors", 3 * GIB, True),
+    ]
+    common = dict(
+        list_repo_files_fn=lambda *a, **k: files,
+        margin_bytes=20 * GIB,
+        fail_closed=True,
+        is_cached_fn=lambda r, p, v: p.startswith("transformer/"),  # only 3 GB left
+    )
+    with pytest.raises(mp.InsufficientDiskSpaceError):  # 3 GB + 20 GiB floor > 15 GB free
+        mp.run_preflight("x/y", "/x", available_disk_bytes_fn=lambda _p: 15 * GIB, **common)
+    mp.run_preflight("x/y", "/x", available_disk_bytes_fn=lambda _p: 25 * GIB, **common)
+
+
+def test_realistic_floor_refuses_zimage_download_but_cached_models_still_load():
+    """Node-like numbers: 40 GB free, 20 GB floor. Z-Image-Turbo (33 GB, not
+    cached) is refused; sdxl-turbo and FLUX.2-klein, fully cached, load."""
+    free = lambda _p: 40 * GIB  # noqa: E731
+    zi = image_models.CATALOG["Tongyi-MAI/Z-Image-Turbo"]
+    common = dict(margin_bytes=20 * GIB, fail_closed=True, available_disk_bytes_fn=free)
+    with pytest.raises(mp.InsufficientDiskSpaceError):
+        mp.run_preflight(
+            zi.model_id, "/x", allow_patterns=list(zi.allow_patterns),
+            list_repo_files_fn=_fake_repo(zi), is_cached_fn=lambda r, p, v: False, **common,
+        )
+    for model_id in ("stabilityai/sdxl-turbo", "black-forest-labs/FLUX.2-klein-4B"):
+        spec = image_models.CATALOG[model_id]
+        mp.run_preflight(
+            model_id, "/x", allow_patterns=list(spec.allow_patterns),
+            ignore_patterns=list(spec.ignore_patterns or ()),
+            list_repo_files_fn=_fake_repo(spec), is_cached_fn=lambda r, p, v: True, **common,
+        )

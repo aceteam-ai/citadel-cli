@@ -299,7 +299,14 @@ func (c *Client) doRequestUsing(ctx context.Context, client *http.Client, method
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	c.debug("response: %d - %s", resp.StatusCode, string(respBody))
+	// Consume bodies can carry in-flight job credentials, including malformed
+	// deliveries. Keep the decoder's original bytes but omit bodies from ALL
+	// consume diagnostics, including errors before a handler can redact them.
+	diagnosticBody := respBody
+	if path == "/api/fabric/redis/jobs/consume" {
+		diagnosticBody = []byte("<job delivery body omitted>")
+	}
+	c.debug("response: %d - %s", resp.StatusCode, string(diagnosticBody))
 
 	// Record the consume HTTP status for worker introspection (issue #236).
 	// This is the single signal that would have surfaced the pre-fix #3924
@@ -320,21 +327,24 @@ func (c *Client) doRequestUsing(ctx context.Context, client *http.Client, method
 	// so FetchWorkerConfig can fall back to defaults on a 404. Keep it verbatim.
 	if resp.StatusCode >= 400 {
 		var apiErr APIError
-		if err := json.Unmarshal(respBody, &apiErr); err == nil && apiErr.Error != "" {
+		if err := json.Unmarshal(diagnosticBody, &apiErr); err == nil && apiErr.Error != "" {
 			apiErr.StatusCode = resp.StatusCode
 			return fmt.Errorf("%s %s failed with status %d: API error: %s", method, path, resp.StatusCode, apiErr.Err())
 		}
-		return fmt.Errorf("%s %s failed with status %d: %s", method, path, resp.StatusCode, truncateBody(respBody))
+		return fmt.Errorf("%s %s failed with status %d: %s", method, path, resp.StatusCode, truncateBody(diagnosticBody))
 	}
 
 	// Parse success response
 	if result != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, result); err != nil {
+			if path == "/api/fabric/redis/jobs/consume" {
+				return fmt.Errorf("%s %s returned status %d with an unparseable job delivery body: %w", method, path, resp.StatusCode, err)
+			}
 			return fmt.Errorf("%s %s returned status %d with an unparseable body (%s): %w",
-				method, path, resp.StatusCode, truncateBody(respBody), err)
+				method, path, resp.StatusCode, truncateBody(diagnosticBody), err)
 		}
-		// Capture after the unchanged decoder; existing raw log/error surfaces
-		// are not redacted by this private bookkeeping.
+		// Capture after the unchanged decoder. Diagnostic omission above never
+		// substitutes or changes the original bytes used by passive observations.
 		if method == http.MethodPost && path == "/api/fabric/redis/jobs/consume" {
 			if consume, ok := result.(*ConsumeResponse); ok && len(consume.Messages) > 0 {
 				consume.Messages[0].Data.observation = deliverymetadata.CaptureHTTP(respBody)

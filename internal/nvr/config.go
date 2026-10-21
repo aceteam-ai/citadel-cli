@@ -70,6 +70,11 @@ const (
 	// DefaultMQTTTopicPrefix matches Frigate's own default topic namespace.
 	DefaultMQTTTopicPrefix = "frigate"
 
+	// Frigate resolves these from its container environment, not config.yml.
+	// Updated compose opts in to avoid serializing assignment credentials (#1357).
+	FrigateMQTTUserPlaceholder     = "{FRIGATE_MQTT_USER}"
+	FrigateMQTTPasswordPlaceholder = "{FRIGATE_MQTT_PASSWORD}"
+
 	// DefaultSemanticSearchModel / DefaultSemanticSearchModelSize are Frigate's
 	// recommended CPU-friendly embedding model (jina CLIP v1, small). jinav2/large
 	// targets multilingual search and wants more RAM, so it is not the default.
@@ -155,9 +160,16 @@ type MQTTSpec struct {
 	Port int
 	// User and Password authenticate to the broker. Mosquitto allows anonymous
 	// connections by default, so the module always sets credentials rather than
-	// relying on network isolation alone.
+	// relying on network isolation alone. With CredentialsFromEnv, non-empty
+	// values request fixed placeholders and are not serialized. Without that
+	// opt-in, retain literals for older compose files; the writer must still
+	// protect the file (0600 in a 0700 directory).
 	User     string
 	Password string
+	// CredentialsFromEnv is safe only when the paired compose also supplies
+	// FRIGATE_MQTT_USER/PASSWORD to Frigate. Default false preserves old installs
+	// when they pull a newer floating nvr-config image before updating compose.
+	CredentialsFromEnv bool
 	// TopicPrefix namespaces this node's topics so a future multi-node consumer
 	// can tell publishers apart. Defaults to "frigate".
 	TopicPrefix string
@@ -273,10 +285,16 @@ func mqttBlock(m MQTTSpec) map[string]any {
 	}
 	// Only emit credentials when set: Frigate rejects empty user/password keys.
 	if m.User != "" {
-		block["user"] = m.User
+		block["user"] = FrigateMQTTUserPlaceholder
+		if !m.CredentialsFromEnv {
+			block["user"] = m.User
+		}
 	}
 	if m.Password != "" {
-		block["password"] = m.Password
+		block["password"] = FrigateMQTTPasswordPlaceholder
+		if !m.CredentialsFromEnv {
+			block["password"] = m.Password
+		}
 	}
 	return block
 }

@@ -184,6 +184,7 @@ def estimate_repo_size_bytes(
     ignore_patterns: Sequence[str] | None = None,
     token: str | None = None,
     list_repo_files_fn: ListRepoFilesFn = default_list_repo_files,
+    is_cached_fn: Callable[[str, str, str], bool] | None = None,
 ) -> int:
     """Sums the byte size of every FILE entry `patterns_include` selects --
     mirrors sumFilteredSize in internal/jobs/hf_repo_size.go. Pure given an
@@ -195,8 +196,22 @@ def estimate_repo_size_bytes(
             continue
         if not patterns_include(entry.path, allow_patterns, ignore_patterns):
             continue
+        # A file already in the HF cache costs no new disk (a swap back to a
+        # model fetched earlier must not be refused on a full disk).
+        if is_cached_fn is not None and is_cached_fn(repo_id, entry.path, revision):
+            continue
         total += entry.size
     return total
+
+
+def default_is_cached(repo_id: str, path: str, revision: str = "main") -> bool:
+    """True when ``path`` of ``repo_id`` is fully present in the HF cache."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        return isinstance(try_to_load_from_cache(repo_id, path, revision=revision), str)
+    except Exception:  # noqa: BLE001 - netting is best effort; fail toward "not cached"
+        return False
 
 
 def _nearest_existing_dir(path: str) -> str:
@@ -367,6 +382,8 @@ def run_preflight(
     margin_bytes: int = DEFAULT_DISK_SAFETY_MARGIN_BYTES,
     list_repo_files_fn: ListRepoFilesFn = default_list_repo_files,
     available_disk_bytes_fn: AvailableDiskBytesFn = default_available_disk_bytes,
+    fail_closed: bool = False,
+    is_cached_fn: Callable[[str, str, str], bool] | None = None,
 ) -> None:
     """Runs the free-space preflight for `repo_id` before `from_pretrained`
     is allowed to download anything into `cache_dir`.
@@ -402,7 +419,10 @@ def run_preflight(
     real disk-fill scenario #902 targets (an operator-declared, and
     therefore reliably-estimated, subset), and it still fails CLOSED.
     """
-    operator_filter_set = bool(allow_patterns) or bool(ignore_patterns)
+    # ``fail_closed`` (citadel-cli#1335): the caller vouches that its patterns
+    # describe the real download (the diffusers catalog's per-model patterns),
+    # so a confirmed shortfall refuses exactly as an operator-set filter does.
+    operator_filter_set = bool(allow_patterns) or bool(ignore_patterns) or fail_closed
 
     try:
         required_bytes = estimate_repo_size_bytes(
@@ -412,6 +432,7 @@ def run_preflight(
             ignore_patterns=ignore_patterns,
             token=token,
             list_repo_files_fn=list_repo_files_fn,
+            is_cached_fn=is_cached_fn,
         )
     except Exception as exc:  # noqa: BLE001 -- deliberate fail-open, see docstring
         logger.warning(
@@ -419,6 +440,13 @@ def run_preflight(
             repo_id,
             exc,
         )
+        return
+
+    if required_bytes <= 0:
+        # Nothing left to download (every selected file is already cached): the
+        # free-disk floor protects the disk from a download, so it does not
+        # apply. A fully cached model must load regardless of free disk.
+        logger.info("diffusers preflight: %s is fully cached, nothing to download", repo_id)
         return
 
     try:

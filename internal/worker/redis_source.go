@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
@@ -278,7 +279,9 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 		if err := s.client.MoveToDLQ(ctx, redisJob, "Exceeded max retry attempts"); err != nil {
 			s.log("error", "   - Failed to move job to DLQ: %v", err)
 		}
-		s.client.AckJob(ctx, redisJob.MessageID)
+		if err := s.ackDelivery(ctx, redisJob.Type, queue, redisJob.MessageID); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 
@@ -348,7 +351,9 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 		if err := s.client.MoveToDLQFromQueue(ctx, sourceQueue, redisJob, "Exceeded max retry attempts"); err != nil {
 			s.log("error", "   - Failed to move job to DLQ: %v", err)
 		}
-		s.client.AckJobOnQueue(ctx, sourceQueue, redisJob.MessageID)
+		if err := s.ackDelivery(ctx, redisJob.Type, sourceQueue, redisJob.MessageID); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 
@@ -387,18 +392,13 @@ func (s *RedisSource) convertJob(rj *redisclient.Job) *Job {
 // Ack acknowledges successful job completion.
 func (s *RedisSource) Ack(ctx context.Context, job *Job) error {
 	s.client.SetJobStatus(ctx, job.ID, "completed", nil)
-	if job.SourceQueue != "" {
-		return s.client.AckJobOnQueue(ctx, job.SourceQueue, job.MessageID)
-	}
-	return s.client.AckJob(ctx, job.MessageID)
+	return s.ackDelivery(ctx, job.Type, job.SourceQueue, job.MessageID)
 }
 
 // Nack indicates job failure.
 // For Redis, this updates status but does NOT ACK - allowing retry or DLQ.
 func (s *RedisSource) Nack(ctx context.Context, job *Job, err error) error {
-	s.client.SetJobStatus(ctx, job.ID, "failed", map[string]any{
-		"error": err.Error(),
-	})
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
 	// Don't ACK - let it retry or go to DLQ on next read
 	return nil
 }
@@ -438,15 +438,9 @@ func (s *RedisSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, e
 // failures that will never succeed on retry (e.g. an unsupported job type),
 // preventing the message from being redelivered and re-failing forever.
 func (s *RedisSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
-	status := map[string]any{"error": err.Error()}
-	for k, v := range data {
-		status[k] = v
-	}
+	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
-	if job.SourceQueue != "" {
-		return s.client.AckJobOnQueue(ctx, job.SourceQueue, job.MessageID)
-	}
-	return s.client.AckJob(ctx, job.MessageID)
+	return s.ackDelivery(ctx, job.Type, job.SourceQueue, job.MessageID)
 }
 
 // Close cleanly disconnects from Redis.

@@ -1663,11 +1663,12 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Workflow executor for WORKFLOW_RUN jobs (#105). Created here so the status
 	// server's AddRouteRegistrar closure and the job handler share a single instance.
 	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
+		HTTP: workflowHTTPPolicy(network.GetNodeConfigDir()),
 		Shell: workflow.ShellConfig{
 			WorkspaceDir: wsDir,
 			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
 			// graph with a Shell node needs the `shell` permission + node passcode.
-			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier},
+			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier, State: nodePasscodeState, Throttle: nodePasscodeThrottle},
 		},
 	})
 
@@ -1699,6 +1700,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	})
 
 	// Start status server if enabled
+	var controlTLSProvider func() *status.ControlTLSReport
 	if workStatusPort > 0 {
 		serverCfg := status.ServerConfig{
 			Port:        workStatusPort,
@@ -1824,6 +1826,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 
 		statusServer := status.NewServer(serverCfg, collector)
+		controlTLSProvider = statusServer.ControlTLS
 
 		// Start the vendor-agents probe now that a pull surface exists (aceteam
 		// #8993 S2): async startup probe + hourly timer (CITADEL_AGENTS_PROBE_
@@ -2195,6 +2198,7 @@ func runWork(cmd *cobra.Command, args []string) {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
 					apiPublisher.SetAutoUpdateProvider(autoUpdateReportFn)
+					apiPublisher.SetControlTLSProvider(controlTLSProvider)
 					startStatusPublisher = func() {
 						go func() {
 							fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
@@ -2802,6 +2806,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !workPerms.Desktop,
 		DesktopEnabled:            nodeDesktopEnabled,
+		DesktopPasscodeState:      nodePasscodeState,
+		ShellPasscodeState:        nodePasscodeState,
+		PasscodeThrottle:          nodePasscodeThrottle,
 		FilesDisabled:             !workPerms.Files,
 		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              wfExec,

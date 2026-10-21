@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
@@ -88,7 +89,10 @@ type Server struct {
 	controlServerCert *tls.Certificate
 	// controlHTTPServer is the running control server (set during Start) so
 	// shutdown can close it alongside the plaintext server.
-	controlHTTPServer *http.Server
+	controlHTTPServer   *http.Server
+	controlTLSMu        sync.Mutex
+	controlTLSListeners int
+	controlTLSReport    *ControlTLSReport
 	// extraControlListeners are additional net.Listeners (e.g., a tsnet VPN
 	// listener) the mTLS control server will also serve on. Added via
 	// AddControlListener before Start.
@@ -339,6 +343,11 @@ func (s *Server) Start(ctx context.Context) error {
 	// When it is not enabled, the mutating endpoints stay refused everywhere
 	// (fail closed) via the plaintext stub.
 	s.startControlServer()
+	defer func() {
+		if s.controlHTTPServer != nil {
+			_ = s.controlHTTPServer.Close()
+		}
+	}()
 
 	// Wait for context cancellation or server error
 	select {
@@ -368,7 +377,8 @@ func (s *Server) startControlServer() {
 		return
 	}
 
-	tlsConfig := s.caVerifier.ServerTLSConfig(*s.controlServerCert)
+	cert, report := freezeControlCertificate(*s.controlServerCert)
+	tlsConfig := s.caVerifier.ServerTLSConfig(cert)
 	s.controlHTTPServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.controlPort),
 		Handler:      s.buildControlMux(),
@@ -377,28 +387,21 @@ func (s *Server) startControlServer() {
 		WriteTimeout: 30 * time.Second,
 	}
 
-	// Local TCP listener, TLS-wrapped. ServeTLS with empty cert/key paths uses the
-	// certificate already set in TLSConfig. A failure here (e.g. the control port
+	// Bind before recording loaded evidence. A failure here (e.g. the control port
 	// is occupied) must NOT tear down the read-only status server -- it only means
 	// the mutating endpoints stay refused (fail closed), so we log and move on
 	// rather than propagating to the status server's fatal error path.
-	go func() {
+	if ln, err := net.Listen("tcp", s.controlHTTPServer.Addr); err != nil {
+		log.Printf("[status] mTLS control listener bind error (mutating endpoints refused): %v", err)
+	} else {
 		log.Printf("[status] mTLS control listener on :%d (coordinator client cert required)", s.controlPort)
-		if err := s.controlHTTPServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Printf("[status] mTLS control listener error (mutating endpoints refused): %v", err)
-		}
-	}()
+		go s.serveControlListener(ln, tlsConfig, report)
+	}
 
 	// Serve the same mTLS control server on any extra (e.g., VPN) listeners.
 	for _, ln := range s.extraControlListeners {
-		ln := ln // capture loop variable
-		tlsLn := tls.NewListener(ln, tlsConfig)
 		log.Printf("[status] mTLS control listener also on %s (VPN)", ln.Addr().String())
-		go func() {
-			if err := s.controlHTTPServer.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
-				log.Printf("[status] control VPN listener error: %v", err)
-			}
-		}()
+		go s.serveControlListener(ln, tlsConfig, report)
 	}
 }
 

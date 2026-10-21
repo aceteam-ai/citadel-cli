@@ -321,6 +321,7 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 
 	var authKey string
 	var nodeName string
+	var deviceEnrollment *DeviceAuthResult
 	// servingNodeUID is set only when an interactive device-grant login submits
 	// a CSR and the backend returns a validated enrollment bundle (#1062). It
 	// switches this login's serving identity to the deterministic "node-<uid>"
@@ -375,6 +376,7 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 			os.Exit(1)
 		}
 		authKey = authResult.Token.Authkey
+		deviceEnrollment = authResult
 
 		// Honor the org's authoritative nexus from the device-auth token when
 		// --nexus was not explicitly set (citadel-cli#1122). Mutates the
@@ -524,6 +526,13 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 		_ = network.Disconnect()
 		spinner.StopWithError(err.Error())
 		os.Exit(1)
+	}
+	if deviceEnrollment != nil {
+		if err := linkDeviceEnrollment(deviceEnrollment); err != nil {
+			_ = network.Disconnect()
+			spinner.StopWithError(fmt.Sprintf("Enrollment incomplete: %v", err))
+			os.Exit(1)
+		}
 	}
 
 	// Persist the control URL we enrolled against (citadel-cli#1110) so later

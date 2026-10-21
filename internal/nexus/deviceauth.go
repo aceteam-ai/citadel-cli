@@ -387,6 +387,7 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 	// no-CSR poll delivers the authkey. The node stays honestly unverified
 	// instead of failing to log in over a transient CA hiccup or rate limit.
 	csr := csrPEM
+	serverErrors := 0
 
 	for time.Since(startTime) < timeout {
 		// Make token request (same CSR on every retry, until it is dropped).
@@ -396,6 +397,17 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 		if token != nil && token.Authkey != "" {
 			return token, nil
 		}
+
+		var serverErr *TokenServerError
+		if errors.As(err, &serverErr) {
+			serverErrors++
+			if serverErrors > MaxConsecutiveTokenServerErrors {
+				return nil, fmt.Errorf("token request failed: %w", err)
+			}
+			time.Sleep(pollingInterval)
+			continue
+		}
+		serverErrors = 0
 
 		// Handle errors
 		if err != nil {
@@ -531,13 +543,30 @@ func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenR
 		return nil, &TokenError{ErrorCode: code}
 	}
 
-	// Other HTTP errors
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		return nil, fmt.Errorf("authentication service unavailable")
+	if resp.StatusCode >= 500 {
+		return nil, &TokenServerError{StatusCode: resp.StatusCode}
 	}
-
 	return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 }
+
+// TokenServerError is a 5xx from the token endpoint. It says nothing about the
+// grant: the server can fail transiently while an approval is being committed,
+// so the poll retries it instead of aborting the enrollment.
+type TokenServerError struct {
+	StatusCode int
+}
+
+func (e *TokenServerError) Error() string {
+	if e.StatusCode == http.StatusServiceUnavailable {
+		return "authentication service unavailable"
+	}
+	return fmt.Sprintf("unexpected status code: %d", e.StatusCode)
+}
+
+// MaxConsecutiveTokenServerErrors bounds how many 5xx answers in a row the
+// token poll tolerates before failing, so a server that stays down fails in
+// seconds-to-minutes rather than after the full 10-minute grant lifetime.
+const MaxConsecutiveTokenServerErrors = 5
 
 // PollForMemoryToken polls the /token endpoint for a device_kind:"memory" flow
 // until the device is approved, denied, expires, or the client times out.

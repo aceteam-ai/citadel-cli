@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
@@ -23,6 +24,10 @@ type LegacyHandlerAdapter struct {
 	logFn           func(level, msg string)
 	enabled         func() bool
 	backgroundOwner bool
+	// passcodeGate, when set, is evaluated after the permission check and
+	// before the handler runs. On such an adapter the payload passcode key is
+	// removed, so the handler never sees it.
+	passcodeGate func(presented string) error
 }
 
 // newGatedLegacyHandlerAdapter creates an adapter whose dispatchability follows
@@ -32,6 +37,20 @@ type LegacyHandlerAdapter struct {
 func newGatedLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, enabled func() bool) *LegacyHandlerAdapter {
 	a := NewLegacyHandlerAdapter(jobType, handler)
 	a.enabled = enabled
+	return a
+}
+
+// newDesktopLegacyHandlerAdapter gates a desktop handler on both the live
+// desktop permission and the node passcode (jobs.DesktopGate), the way
+// SHELL_COMMAND is gated on the shell permission and the passcode.
+func newDesktopLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, enabled func() bool, gate jobs.DesktopGate) *LegacyHandlerAdapter {
+	a := newGatedLegacyHandlerAdapter(jobType, handler, enabled)
+	a.passcodeGate = func(presented string) error {
+		if reason := jobs.DesktopGateReason(gate, presented); reason != "" {
+			return jobs.DesktopRefusal(reason)
+		}
+		return nil
+	}
 	return a
 }
 
@@ -107,6 +126,16 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	if job.Payload != nil {
 		nexusJob.Payload = make(map[string]string)
 		for k, v := range job.Payload {
+			// FILE_FETCH's bounded integer may arrive as a JSON number. Preserve
+			// its decimal form instead of fmt.Sprint's scientific notation for
+			// large float64s. The handler rejects fractions, non-finite values
+			// and out-of-range integers. Other job payload semantics are unchanged.
+			if a.jobType == JobTypeFileFetch && k == "max_bytes" {
+				if number, ok := v.(float64); ok {
+					nexusJob.Payload[k] = strconv.FormatFloat(number, 'f', -1, 64)
+					continue
+				}
+			}
 			switch val := v.(type) {
 			case string:
 				nexusJob.Payload[k] = val
@@ -123,6 +152,21 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 			}
 		}
 	}
+	if a.passcodeGate != nil {
+		presented := ""
+		if nexusJob.Payload != nil {
+			presented = nexusJob.Payload[jobs.ShellPasscodePayloadKey]
+			// The passcode authorizes this job and is never handler input.
+			delete(nexusJob.Payload, jobs.ShellPasscodePayloadKey)
+		}
+		if err := a.passcodeGate(presented); err != nil {
+			if a.logFn != nil {
+				a.logFn("warn", fmt.Sprintf("Refusing %s job %s: %v", job.Type, job.ID, err))
+			}
+			return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
+		}
+	}
+
 	// Wire throttled progress to the job's stream (aceteam#10876 C1). The throttle
 	// state is per-Execute (local to this call); most handlers never emit, so this
 	// is inert unless the handler calls ctx.EmitProgress (FILE_INDEX today). A
@@ -253,6 +297,19 @@ type LegacyHandlerOpts struct {
 	// desktop handlers stay registered behind a per-dispatch fail-closed gate so
 	// APPLY_DEVICE_CONFIG changes take effect without restarting the worker.
 	DesktopEnabled func() bool
+	// DesktopPasscodeState reads the node's passcode state once per desktop job
+	// (jobs.DesktopGate.Load). It must return an error, never Set=false, when the
+	// state cannot be read. Required whenever desktop handlers are registered:
+	// nil refuses every desktop job.
+	DesktopPasscodeState func() (jobs.PasscodeState, error)
+	// ShellPasscodeState, when set, replaces ShellHasPasscode and
+	// ShellVerifyPasscode for SHELL_COMMAND with one strict read of the node's
+	// passcode state (jobs.ShellGate.State).
+	ShellPasscodeState func() (jobs.PasscodeState, error)
+	// PasscodeThrottle is the node's shared wrong-passcode throttle, applied to
+	// SHELL_COMMAND and the desktop handlers (and, through the workflow
+	// executor's ShellGate, to the WORKFLOW_RUN Shell gate). Nil never throttles.
+	PasscodeThrottle *jobs.PasscodeThrottle
 	// FilesDisabled, when true, SKIPS registration of the file browse/host job
 	// handlers (FILE_READ/READ_BYTES/WRITE/EDIT/LIST/SEARCH/INDEX/
 	// SEMANTIC_SEARCH). FILE_WRITE_BYTES stays registered in a refusing state
@@ -266,6 +323,10 @@ type LegacyHandlerOpts struct {
 	// handlers stay registered behind a per-dispatch fail-closed gate so both
 	// capability advertisement and execution track permission revocation.
 	FilesEnabled func() bool
+	// FileFetchOrigin overrides the trusted coordinator origin resolver. Nil
+	// reloads the existing converged device configuration on each dispatch.
+	// It must never come from job payloads.
+	FileFetchOrigin func() string
 	// MeetingEnabled is the live meeting-permission source. When nil the
 	// persisted meeting configuration is loaded for each dispatch. Tests may
 	// inject it to prove that disabling new joins does not disable exact-attempt
@@ -301,6 +362,8 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	shellHandler.Enabled = opts.ShellEnabled
 	shellHandler.HasPasscode = opts.ShellHasPasscode
 	shellHandler.VerifyPasscode = opts.ShellVerifyPasscode
+	shellHandler.State = opts.ShellPasscodeState
+	shellHandler.Throttle = opts.PasscodeThrottle
 	configHandler := jobs.NewConfigHandler(opts.ConfigDir)
 	configHandler.PermissionsDir = opts.PermissionsDir
 	goos := opts.GOOS
@@ -407,19 +470,39 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	// operator's screen. FILE_SCREENSHOT and VNC_SCREENSHOT share one capture
 	// path (the internal/desktop X11 capture); there is no separate VNC
 	// framebuffer source.
+	// Each desktop job also honors the node passcode, like SHELL_COMMAND: on a
+	// node with a passcode set, the job must present it in its payload
+	// `passcode` field. A node without a passcode is unchanged.
 	if opts.DesktopEnabled != nil || !opts.DesktopDisabled {
 		gate := opts.DesktopEnabled
+		passcode := jobs.DesktopGate{Load: opts.DesktopPasscodeState, Throttle: opts.PasscodeThrottle}
 		handlers = append(handlers,
-			newGatedLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}, gate),
+			newDesktopLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}, gate, passcode),
 		)
 	}
 
 	// Register file-operation handlers when a workspace is configured.
 	if opts.WorkspaceDir != "" {
+		origin := opts.FileFetchOrigin
+		if origin == nil {
+			origin = func() string { return config.LoadDeviceCredsConverged().APIBaseURL }
+		}
+		fetchHandler := jobs.NewFileFetchHandler(opts.WorkspaceDir, origin)
+		fetchHandler.Disabled = opts.FilesDisabled
+		fetchHandler.Enabled = opts.FilesEnabled
+		fetchEnabled := func() bool {
+			files := !opts.FilesDisabled
+			if opts.FilesEnabled != nil {
+				files = opts.FilesEnabled()
+			}
+			return files && fetchHandler.Configured()
+		}
+		handlers = append(handlers, newGatedLegacyHandlerAdapter(JobTypeFileFetch, fetchHandler, fetchEnabled))
+
 		writeBytesHandler := jobs.NewFileWriteBytesHandler(opts.WorkspaceDir)
 		writeBytesHandler.Disabled = opts.FilesDisabled
 		writeBytesHandler.Enabled = opts.FilesEnabled

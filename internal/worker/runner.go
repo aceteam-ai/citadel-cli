@@ -17,6 +17,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
@@ -1076,6 +1077,12 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	}
 	stopCoopCancelWatch()
 	cancelled := stopCancellationWatch()
+	// Sanitize before any generic failure logging, usage record or retry/status
+	// publication. The handler still receives the original in-flight payload.
+	err = jobprivacy.Error(job.Type, job.Payload, err)
+	if result != nil {
+		result.Error = jobprivacy.Error(job.Type, job.Payload, result.Error)
+	}
 
 	endTime := time.Now()
 	// Capture after execution using the separate wall seam, never for duration
@@ -1216,6 +1223,13 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// image, so a retry cannot make it appear. Same shape as the Files /
 		// receipt-signing refusals.
 		isSandboxedModuleUnavailable := errors.Is(actualErr, jobs.ErrSandboxedModuleUnavailable)
+		// A gate refusal returned as a *jobs.ShellRefusal is terminal on the first
+		// delivery: a retry presents the same payload, so it cannot pass. That is
+		// SHELL_COMMAND, the desktop handlers, and WORKFLOW_RUN when its Shell gate
+		// refuses at submit. A Shell node refused later, mid-run, fails the
+		// workflow as an ordinary failure instead.
+		var gateRefusal *jobs.ShellRefusal
+		isGateRefusal := errors.As(actualErr, &gateRefusal)
 		isHuddleJoin := job.Type == JobTypeHuddleJoin
 
 		// Exactly one terminal event per job id (issue #826). A generic failure
@@ -1231,7 +1245,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// publishes, so a job that exhausts its retries still reports failure
 		// exactly once. Mirrors the reasoning #822/#559 already applied to the
 		// JobStatusRetry and no-GPU-slot Nack paths below/above.
-		if isDeadlineExceeded || isFilesDisabled || isReceiptSigningUnavailable || isSandboxedModuleUnavailable || isHuddleJoin || !willRetry(job) {
+		if isDeadlineExceeded || isFilesDisabled || isReceiptSigningUnavailable || isSandboxedModuleUnavailable || isGateRefusal || isHuddleJoin || !willRetry(job) {
 			if werr := stream.WriteError(actualErr, false); werr != nil {
 				r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
 			}
@@ -1263,6 +1277,13 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		if isSandboxedModuleUnavailable {
 			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "sandboxed_module_unavailable"}); ferr != nil {
 				r.log("warning", "Failed to ack sandboxed-module-unavailable job %s: %v", job.ID, ferr)
+			}
+			return false
+		}
+
+		if isGateRefusal {
+			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": gateRefusal.Reason}); ferr != nil {
+				r.log("warning", "Failed to ack refused job %s: %v", job.ID, ferr)
 			}
 			return false
 		}

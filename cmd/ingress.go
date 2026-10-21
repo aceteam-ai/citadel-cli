@@ -92,6 +92,13 @@ Examples:
     citadel ingress --routes-url https://cp.example.com/ingress/routes \
                     --apps-domain apps.example.com
 
+  # ACME DNS-01 with the apps zone hosted on Cloudflare (token scoped to
+  # Zone.DNS:Edit on that zone only):
+  CITADEL_INGRESS_ROUTES_TOKEN=... \
+  CITADEL_INGRESS_DNS_CLOUDFLARE_API_TOKEN=<token> \
+    citadel ingress --routes-url https://cp.example.com/ingress/routes \
+                    --apps-domain apps.example.com --acme-email ops@example.com
+
   # ACME DNS-01 against a delegated zone (RFC 2136 / TSIG):
   CITADEL_INGRESS_ROUTES_TOKEN=... \
   CITADEL_INGRESS_ACME_DNS_ZONE=acme-delegated.example.net \
@@ -231,8 +238,10 @@ func resolveIngressCertProvider(appsDomain string) (ingress.CertProvider, error)
 	}
 
 	dnsZone := os.Getenv("CITADEL_INGRESS_ACME_DNS_ZONE")
-	if dnsZone == "" {
-		return nil, errors.New("ingress: no TLS material configured -- set CITADEL_INGRESS_CERT_FILE+CITADEL_INGRESS_KEY_FILE (mounted wildcard) or CITADEL_INGRESS_ACME_DNS_ZONE + RFC2136 credentials (ACME DNS-01)")
+	cfToken := os.Getenv("CITADEL_INGRESS_DNS_CLOUDFLARE_API_TOKEN")
+	rfcServer := os.Getenv("CITADEL_INGRESS_DNS_RFC2136_SERVER")
+	if cfToken == "" && rfcServer == "" && dnsZone == "" {
+		return nil, errors.New("ingress: no TLS material configured -- set CITADEL_INGRESS_CERT_FILE+CITADEL_INGRESS_KEY_FILE (mounted wildcard), CITADEL_INGRESS_DNS_CLOUDFLARE_API_TOKEN (ACME DNS-01 via Cloudflare), or CITADEL_INGRESS_ACME_DNS_ZONE + RFC2136 credentials (ACME DNS-01)")
 	}
 
 	// certmagic cert cache lives next to the tsnet state so it inherits the same
@@ -247,8 +256,12 @@ func resolveIngressCertProvider(appsDomain string) (ingress.CertProvider, error)
 		CA:         flagOrEnv(ingressACMECAURL, "CITADEL_INGRESS_ACME_CA"),
 		StorageDir: storageDir,
 		DNSZone:    dnsZone,
+		Cloudflare: ingress.CloudflareConfig{
+			APIToken:  cfToken,
+			ZoneToken: os.Getenv("CITADEL_INGRESS_DNS_CLOUDFLARE_ZONE_TOKEN"),
+		},
 		RFC2136: ingress.RFC2136Config{
-			Server:  os.Getenv("CITADEL_INGRESS_DNS_RFC2136_SERVER"),
+			Server:  rfcServer,
 			KeyName: os.Getenv("CITADEL_INGRESS_DNS_RFC2136_KEY_NAME"),
 			KeyAlg:  os.Getenv("CITADEL_INGRESS_DNS_RFC2136_KEY_ALG"),
 			Key:     os.Getenv("CITADEL_INGRESS_DNS_RFC2136_KEY"),

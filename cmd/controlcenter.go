@@ -351,6 +351,11 @@ func runControlCenter() {
 	}
 
 	cc := controlcenter.New(cfg)
+	// tview owns the terminal; a device-link warning written to stderr would
+	// garble the screen, so route it to the activity log instead.
+	deviceLinkWarnFn = func(msg string) {
+		cc.AddActivity("warning", strings.TrimSpace(strings.TrimPrefix(msg, "⚠️")))
+	}
 
 	// Show deferred update notification in TUI activity log (if any)
 	if deferredUpdateNotification != "" {
@@ -1880,12 +1885,14 @@ func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
 	// Use checkToken for single poll (not blocking PollForToken)
 	token, err := client.CheckToken(deviceCode)
 	if err != nil {
-		return "", err
+		return "", ccTokenPollError(deviceCode, err)
 	}
+	ccTokenServerErrors.Delete(deviceCode)
 	if token == nil || token.Authkey == "" {
 		return "", fmt.Errorf("authorization_pending")
 	}
 
+	ccEnrollmentTokens.Store(deviceCode, token)
 	// Save the device config including user info when auth succeeds
 	if token.DeviceAPIToken != "" || token.UserEmail != "" {
 		if err := saveDeviceConfigToFile(token); err != nil {
@@ -1897,8 +1904,34 @@ func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
 	return token.Authkey, nil
 }
 
-// ccConnectWithAuthkey connects to the network using an authkey
-func ccConnectWithAuthkey(authkey string) error {
+// ccTokenServerErrors counts consecutive 5xx token answers per device code.
+var ccTokenServerErrors sync.Map
+
+// ccTokenPollError keeps the Control Center modal polling through a bounded run
+// of 5xx answers (the modal only continues on a "pending" error), matching the
+// CLI's nexus.PollForTokenWithCSR. Any other error, or too many 5xx in a row,
+// is returned unchanged and ends the modal.
+func ccTokenPollError(deviceCode string, err error) error {
+	var serverErr *nexus.TokenServerError
+	if !errors.As(err, &serverErr) {
+		ccTokenServerErrors.Delete(deviceCode)
+		return err
+	}
+	n := 1
+	if v, ok := ccTokenServerErrors.Load(deviceCode); ok {
+		n = v.(int) + 1
+	}
+	if n > nexus.MaxConsecutiveTokenServerErrors {
+		ccTokenServerErrors.Delete(deviceCode)
+		return err
+	}
+	ccTokenServerErrors.Store(deviceCode, n)
+	return fmt.Errorf("authorization_pending (server error %d, retrying)", serverErr.StatusCode)
+}
+
+// ccConnectWithAuthkey registers and links the grant approved by this modal.
+// Saved device credentials alone do not establish a completed device binding.
+func ccConnectWithAuthkey(authkey, deviceCode string) error {
 	// Get node name from manifest or hostname
 	nodeName := ""
 	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
@@ -1917,17 +1950,24 @@ func ccConnectWithAuthkey(authkey string) error {
 		AuthKey:    authkey,
 	}
 
-	_, err := network.Connect(ctx, config)
-	if err == nil {
-		if trustErr := persistPrivateCATrust(authServiceURL, nexusURL); trustErr != nil {
-			_ = network.Disconnect()
-			return trustErr
-		}
-		// Persist the control URL enrolled against (citadel-cli#1110) so later
-		// reconnects target this control plane, not the compiled-in default.
-		persistNexusURLBestEffort(nexusURL)
+	// A registration ID left by an earlier enroll in this process must not
+	// stand in for this connection's node (citadel-cli#1356).
+	setRegisteredNodeID("")
+	err := ccConnectDeviceEnrollmentWith(authkey, deviceCode, func() error {
+		_, err := network.Connect(ctx, config)
+		return err
+	}, linkDeviceEnrollment, network.Disconnect)
+	if err != nil {
+		return err
 	}
-	return err
+	if trustErr := persistPrivateCATrust(authServiceURL, nexusURL); trustErr != nil {
+		_ = network.Disconnect()
+		return trustErr
+	}
+	// Persist the control URL enrolled against (citadel-cli#1110) so later
+	// reconnects target this control plane, not the compiled-in default.
+	persistNexusURLBestEffort(nexusURL)
+	return nil
 }
 
 // ccDisconnect disconnects from the network
@@ -2454,11 +2494,12 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Workflow executor for WORKFLOW_RUN jobs, mirroring runWork's wiring.
 	ccWfExec := workflow.NewExecutor(workflow.ExecutorConfig{
+		HTTP: workflowHTTPPolicy(network.GetNodeConfigDir()),
 		Shell: workflow.ShellConfig{
 			WorkspaceDir: wsDir,
 			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
 			// graph with a Shell node needs the `shell` permission + node passcode.
-			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier},
+			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier, State: nodePasscodeState, Throttle: nodePasscodeThrottle},
 		},
 	})
 
@@ -2494,6 +2535,9 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !ccPerms.Desktop,
 		DesktopEnabled:            nodeDesktopEnabled,
+		DesktopPasscodeState:      nodePasscodeState,
+		ShellPasscodeState:        nodePasscodeState,
+		PasscodeThrottle:          nodePasscodeThrottle,
 		FilesDisabled:             !ccPerms.Files,
 		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              ccWfExec,

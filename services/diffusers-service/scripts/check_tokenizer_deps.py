@@ -24,7 +24,9 @@ two tiers:
   2. Tokenizer *construction* (not full pipeline/model load) for the model
      families the sidecar actually serves, downloading only the small
      tokenizer/config files (a few KB -- never the multi-GB weight shards):
-       - `stabilityai/sdxl-turbo` (DIFFUSERS_MODEL default): CLIP tokenizer.
+       - `stabilityai/sdxl-turbo` (the previous DIFFUSERS_MODEL default): CLIP tokenizer.
+       - FLUX.2-klein-4B, Z-Image-Turbo and Qwen-Image (the citadel-cli#1335
+         image allowlist): Qwen2-family BPE tokenizers.
        - `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` (DIFFUSERS_VIDEO_MODEL default,
          citadel #958 -- the actual video sidecar model app.py serves via
          `/generate/video`): UMT5 tokenizer, the same sentencepiece-backed T5
@@ -191,6 +193,28 @@ def check_served_model_tokenizers() -> None:
     _construct_tokenizer(
         "stabilityai/sdxl-turbo tokenizer (CLIP, subfolder=tokenizer)",
         repo_id="stabilityai/sdxl-turbo",
+        subfolder="tokenizer",
+    )
+
+    # citadel-cli#1335 image-model allowlist (services/diffusers-service/
+    # image_models.py). All three are public, ungated, Apache-2.0 repos whose
+    # tokenizers are Qwen2-family byte-level BPE (tokenizer.json + vocab/merges,
+    # no sentencepiece): this proves the pinned transformers can build the
+    # tokenizer each new pipeline loads, and fails hard on a dependency-shaped
+    # break (a network problem is still only a skip).
+    _construct_tokenizer(
+        "black-forest-labs/FLUX.2-klein-4B tokenizer (Qwen2 BPE, subfolder=tokenizer)",
+        repo_id="black-forest-labs/FLUX.2-klein-4B",
+        subfolder="tokenizer",
+    )
+    _construct_tokenizer(
+        "Tongyi-MAI/Z-Image-Turbo tokenizer (Qwen2 BPE, subfolder=tokenizer)",
+        repo_id="Tongyi-MAI/Z-Image-Turbo",
+        subfolder="tokenizer",
+    )
+    _construct_tokenizer(
+        "Qwen/Qwen-Image tokenizer (Qwen2 BPE, subfolder=tokenizer)",
+        repo_id="Qwen/Qwen-Image",
         subfolder="tokenizer",
     )
 

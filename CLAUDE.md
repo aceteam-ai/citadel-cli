@@ -31,6 +31,19 @@ So, when adding to this file:
 
 ## Project Overview
 
+`jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
+is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
+advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,
+live Files permission and the trusted coordinator HTTPS origin from existing
+device configuration. Tests in
+`internal/jobs/file_fetch_test.go` and `internal/worker/file_fetch_test.go` cover
+the URL/network/filesystem boundaries and live capability gating. The dedicated
+coordinator endpoint owns capability HMAC verification and mint/fetch audit;
+the node never needs the HMAC secret. Publication is FD-based and create-only;
+the platform supplies a unique staging destination and receives that exact
+relative path in the receipt. See `docs/file-fetch.md` for
+the contract.
+
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
 **Key Components:**
@@ -581,6 +594,51 @@ status plus ACK), even when the delivery metadata permits another attempt.
 `TestRunnerFilesDisabledPublishesTerminalErrorWithoutRetry` pins this boundary.
 The handler checks the live Files policy, but a refused job is terminal. After
 enabling Files, the caller submits a new upload.
+
+A gate refusal returned as a `*jobs.ShellRefusal` is terminal on the first
+delivery too (one error event, then Fail with the reason): SHELL_COMMAND, the
+desktop handlers, and WORKFLOW_RUN when its Shell gate refuses at submit. A
+Shell node refused mid-run fails the workflow as an ordinary failure.
+
+The five desktop handlers (FILE_SCREENSHOT, VNC_SCREENSHOT, VNC_TYPE, VNC_KEYS,
+VNC_ACTIONS) honor the node passcode like SHELL_COMMAND, through
+`jobs.DesktopGateReason` in `newDesktopLegacyHandlerAdapter`, after the live
+desktop permission check. Unlike the shell gate, a node with no passcode set
+runs desktop jobs unchanged, so a false "no passcode" would open the gate. The
+gate therefore takes one `jobs.PasscodeState` read per job from
+`cmd.nodePasscodeState` (the SHELL_COMMAND and workflow Shell gates use the same
+state through `ShellGate.State`, so an unreadable state is `passcode_unavailable`
+there too, not `passcode_not_set`), which uses `config.LoadPermissionsStrict` and
+`nodevault.Vault.Configured`: an unreadable or unparseable permissions file, or
+a vault that cannot be stat'ed, refuses with `passcode_unavailable` instead of
+reading as unset. `config.SavePermissions` replaces the file atomically for the
+same reason, keeping the existing file's owner (`keepOwner`) so a save by root
+does not lock the worker out; it refuses when the owning user cannot be kept
+and tolerates a group it cannot set. The payload `passcode` key never reaches a desktop handler, and
+`jobprivacy.Payload`/`Text` plus the `Job` JSON and fmt renderings in
+`internal/worker`, `internal/redis` and `internal/redisapi` drop it for every
+job type, so it is never written to a dead-letter entry or a log.
+`internal/worker/desktop_gate_test.go`, `cmd/passcode_state_test.go` and
+`internal/redis/passcode_privacy_test.go` pin this.
+
+`jobs.PasscodeThrottle` limits wrong passcodes across those surfaces: one
+process-wide instance (`cmd.nodePasscodeThrottle`) is shared by SHELL_COMMAND,
+the WORKFLOW_RUN Shell gate and the desktop gate, so failures on one count for
+all. After `DefaultPasscodeMaxFailures` within the window, every passcode-gated
+job is refused with `passcode_throttled` for the cooldown without checking the
+passcode. Only a non-empty wrong passcode counts (an absent one is a caller
+without a credential, not a guess); a correct passcode does not clear earlier
+failures, which expire only with time; and a check reserves a slot under the
+throttle's lock but runs outside it (so a KDF or disk read never holds the
+lock), with recent failures plus checks in flight never exceeding the limit. It is in memory, so a worker
+restart resets it. A vault or permissions error that is not a wrong PIN or a
+lockout is `passcode_unavailable` and is not counted. A master-PIN vault
+lockout is a separate reason, `passcode_locked`: `cmd.vaultPasscodeVerdict`
+maps `nodevault.IsLockedOut` to `jobs.PasscodeLockedOut`, so a correct
+passcode presented during a vault lockout is never reported as
+`passcode_invalid`, and a lockout refusal does not count toward the throttle.
+Only node passcodes presented in job payloads are throttled; the gateway's HTTP
+passcode checks are not.
 
 `Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
 a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before
@@ -1230,14 +1288,15 @@ survive; then only the vouched-for headers (incl. `X-Ingress-Subject` from the
 authz decision) are set. `ModifyResponse` runs `rewriteSetCookie` to strip
 `Domain=` and add `Secure` on every upstream `Set-Cookie`.
 
-**TLS:** wildcard via certmagic DNS-01. certmagic's `DNS01Solver` does NOT follow
-CNAMEs (verified against v0.25.x), so `ACMEConfig.DNSZone` is set as
-`DNSManager.OverrideDomain` — publish the challenge TXT directly on the delegated
-zone the scoped RFC 2136 / TSIG credential can write. `StaticFileCertProvider`
-(mount an already-issued wildcard) is the recommended FIRST deployment; the ACME
-path lights up once the delegated zone + nameserver (separate design) exist.
-certmagic + `libdns/rfc2136` are new deps (+15 modules); the DNS provider is
-behind certmagic's own `DNSProvider` interface, so swapping it is one line.
+**TLS:** wildcard via certmagic DNS-01. `ingress.dnsProviderFor` owns the
+backend choice: a Cloudflare API token (for an apps zone hosted on Cloudflare,
+which has no RFC 2136 interface) or an RFC 2136 / TSIG server, exactly one,
+with both or neither refused. certmagic's `DNS01Solver` does NOT follow CNAMEs
+(verified against v0.25.x), so the RFC 2136 path requires `ACMEConfig.DNSZone`
+as `DNSManager.OverrideDomain` and publishes the challenge TXT directly on the
+delegated zone its credential can write; the Cloudflare token writes the apps
+zone itself, so `DNSZone` stays optional there. `StaticFileCertProvider` (mount
+an already-issued wildcard) remains the simplest first deployment.
 
 **Health lives on the public :443 listener under the reserved host
 `_health.<apps-domain>`** (`server.go`), not a loopback endpoint — a completed
@@ -1540,6 +1599,37 @@ the intended fail-closed direction. (Constructing it also needs the verifier
 and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
+
+`status.Server.ControlTLS` reports the public certificate held by the active
+control listener, using the same immutable DER snapshot as its TLS config.
+Changing certificate files takes effect only after listener restart. The API
+heartbeat emits this as `control_tls.cert_pem` through its cached provider;
+disabled or stopped listeners omit it, and legacy direct Redis never emits it.
+This is authenticated-device evidence through the platform's existing relay
+HMAC envelope, not a device-origin signature. No control transport consumes it.
+After device-grant registration, `cmd.linkDeviceEnrollment` completes the
+server's reserved registration proof through the existing device link route;
+link refusal must propagate before enrollment can report success (#1344).
+`cmd.linkDeviceEnrollmentGated` decides when a link failure is fatal: only a
+definite refusal (`nexus.DeviceLinkRefusedError`: a 4xx, or a 200 without
+`success:true`) from a server whose `/api/version` reports at least
+`deviceLinkEnforcedFrom` (v1.520.0, aceteam#11743, the first release that
+creates a missing device configuration). A transport error or 5xx is retried
+once, then reported. A refusal from an older server, or one whose version
+cannot be read, is also reported; enrollment continues in both cases (#1350
+tracks linking such a node later). A fatal refusal runs
+`rollbackEnrollmentCredentials`, which removes only the node-file fields this
+enrollment wrote, and only while that file still holds this enrollment's own
+credential. Never replace it with `clearSavedConfig`: that relogin wipe also
+drops operator keys and a prior enrollment's credentials.
+Control Center passes the approved modal's `deviceCode` into its connect
+callback and gates both success display and worker startup on completed linking.
+The public link request uses that grant and the server's reserved used
+registration-key proof; it sends no device bearer and needs no token-scope
+expansion. If `init` obtains a fresh grant while already connected, its link
+can refuse the old registration: run `citadel logout && citadel init` to
+register through a fresh reservation. Saved credentials alone never establish
+completed device binding; the link response must confirm it.
 
 ### Two ActualState reporters, two different module sets (#733)
 
@@ -2030,6 +2120,28 @@ shaped like:
 ```
 The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
 single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
+
+### Diffusers sidecar: per-request model selection (citadel-cli#1335)
+
+`services/diffusers-service` serves one image model on the GPU at a time and
+swaps on demand. `image_models.CATALOG` owns which models may be served (and
+their licence, pipeline class, and load variants); `image_models.choose_variant`
+owns which variant fits `DIFFUSERS_VRAM_BUDGET_GB`; `image_swap.ImageModelManager`
+owns residency, the drain-then-unload swap, and the warming contract. A request's
+optional `model` must be allowlisted (400 otherwise). A cold or swapping model
+answers HTTP 503 with a typed `model_warming` body, and
+`internal/jobs/media_generate.go` retries it (Retry-After) within its request
+budget and only then returns the body as the job output (not an error). Other 503s (`insufficient_vram`) and 4xx
+stay failures. The VRAM figures in the catalog are estimates; `/health`
+`last_load.measured_vram_gb` records the real delta on each load. Pinned image
+stack and its rationale live in `requirements.txt`. The default `DIFFUSERS_MODEL` is FLUX.2-klein-4B; sdxl-turbo (non-permissive licence) is selectable only if an operator names it. `ImageModelManager.prepare` (preflight + download) runs BEFORE the resident model is evicted; a fresh model is protected until used (`DIFFUSERS_MIN_RESIDENCY_SECONDS`); and the single uvicorn worker is what enforces one model at a time.
+The compose env passthrough is covered by `KnownComposeHashes`.
+The compose image is pinned by digest, not `:latest` (citadel-cli#1346):
+compose pulls only a missing image, so a node that already held an old
+`:latest` kept serving it under newer compose defaults (FLUX.2-klein-4B on a
+diffusers 0.33 image failed every request). A new sidecar build therefore needs
+a follow-up PR that bumps the pin and registers the template hash;
+`TestOwnSidecarImagesArePinnedByDigest` lists the pinned compose files.
 
 ### Meeting media stack — virtual mic / bot speaking path (aceteam#7079)
 

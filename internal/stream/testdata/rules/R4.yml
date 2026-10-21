@@ -1,0 +1,17 @@
+{
+  "title": "Five synthetic failed logins",
+  "name": "R4",
+  "correlation": {
+    "type": "event_count",
+    "rules": [
+      "_failed"
+    ],
+    "group-by": [
+      "source.ip"
+    ],
+    "timespan": "10m",
+    "condition": {
+      "gte": 5
+    }
+  }
+}

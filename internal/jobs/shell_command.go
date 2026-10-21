@@ -67,6 +67,14 @@ func shellCommandRefusalMessage(reason string) string {
 		return msgShellDisabled
 	case ReasonPasscodeNotSet:
 		return msgPasscodeNotSet
+	case ReasonPasscodeThrottled:
+		return msgPasscodeThrottled
+	case ReasonPasscodeBusy:
+		return msgPasscodeBusy
+	case ReasonPasscodeLocked:
+		return msgPasscodeLocked
+	case ReasonPasscodeUnavailable:
+		return msgPasscodeUnavailable
 	default:
 		return msgPasscodeInvalid
 	}
@@ -100,19 +108,27 @@ func (e *ShellRefusal) Error() string {
 const ShellPasscodePayloadKey = "passcode"
 
 // ShellGate is the node's shell-execution gate: the live `shell` permission plus
-// the per-node passcode. It is the SINGLE gate for every surface that can run a
-// host shell command. SHELL_COMMAND and the workflow Shell node both consult it
-// through ShellGateReason, so a second shell path cannot skip the permission or
-// the passcode. Field semantics match ShellCommandHandler's identically named
-// fields. The zero value is refused by ShellGateReason (a nil HasPasscode reads
-// as passcode_not_set), but its IsEnabled() alone reports true, mirroring
-// ShellCommandHandler's Disabled=false default. Gate with ShellGateReason, never
+// the per-node passcode. SHELL_COMMAND (including diagnostics) and the workflow
+// Shell node both consult it through ShellGateReason, so neither job path skips
+// the permission or passcode. Field semantics match the handler's identically named
+// fields. State is preferred; legacy HasPasscode/VerifyPasscode apply only when
+// State is nil. The zero value is refused by ShellGateReason (no State and a nil
+// HasPasscode reads as passcode_not_set), but IsEnabled() alone reports true,
+// mirroring ShellCommandHandler's Disabled=false default. Gate with ShellGateReason, never
 // with IsEnabled alone.
 type ShellGate struct {
 	Disabled       bool
 	Enabled        func() bool
 	HasPasscode    func() bool
 	VerifyPasscode func(pin string) bool
+	// State, when set, replaces HasPasscode and VerifyPasscode with one read
+	// of the node's passcode state. A read error refuses with
+	// passcode_unavailable, and its Check can report a master-PIN lockout
+	// (passcode_locked) instead of a wrong passcode.
+	State func() (PasscodeState, error)
+	// Throttle limits wrong passcodes across the node's passcode-gated job
+	// surfaces. Nil never throttles.
+	Throttle *PasscodeThrottle
 }
 
 // IsEnabled reports the live shell permission: Enabled supersedes the
@@ -126,19 +142,29 @@ func (g ShellGate) IsEnabled() bool {
 
 // ShellGateReason applies the gate to a presented passcode. It returns "" when
 // the command may run, otherwise the refusal reason code. Order:
-// shell_disabled beats passcode_not_set beats passcode_invalid. A nil
-// HasPasscode or nil VerifyPasscode refuses (fail closed).
+// shell_disabled beats passcode_unavailable (State read error) beats
+// passcode_not_set beats passcode_throttled beats passcode_locked /
+// passcode_unavailable (check could not run) beats passcode_invalid. When State
+// is nil, a nil HasPasscode or nil VerifyPasscode refuses (fail closed). A
+// configured State does not depend on either legacy callback.
 func ShellGateReason(g ShellGate, presentedPasscode string) string {
 	if !g.IsEnabled() {
 		return ReasonShellDisabled
 	}
+	if g.State != nil {
+		state, err := g.State()
+		if err != nil {
+			return ReasonPasscodeUnavailable
+		}
+		if !state.Set {
+			return ReasonPasscodeNotSet
+		}
+		return checkPasscode(g.Throttle, state.Check, presentedPasscode)
+	}
 	if g.HasPasscode == nil || !g.HasPasscode() {
 		return ReasonPasscodeNotSet
 	}
-	if g.VerifyPasscode == nil || !g.VerifyPasscode(presentedPasscode) {
-		return ReasonPasscodeInvalid
-	}
-	return ""
+	return checkPasscode(g.Throttle, BoolCheck(g.VerifyPasscode), presentedPasscode)
 }
 
 // standardPATHDirs are directories ensured on PATH when the inherited process
@@ -352,6 +378,12 @@ type ShellCommandHandler struct {
 	// sites (worker.CreateLegacyHandlersWithOpts and the legacy cmd/job_handlers
 	// map) wire it from config.LoadPermissions(...).VerifyPasscode.
 	VerifyPasscode func(pin string) bool
+	// State, when set, replaces HasPasscode and VerifyPasscode (see
+	// ShellGate.State).
+	State func() (PasscodeState, error)
+	// Throttle is the node's shared wrong-passcode throttle. Nil never
+	// throttles.
+	Throttle *PasscodeThrottle
 }
 
 // NewShellCommandHandler constructs a handler bound to a workspace directory.
@@ -361,16 +393,13 @@ func NewShellCommandHandler(workspace string) *ShellCommandHandler {
 }
 
 func (h *ShellCommandHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
-	// Refusal decision order (aceteam#6524, #6559): shell_disabled beats
-	// passcode_not_set beats passcode_invalid. Each returns a typed *ShellRefusal
-	// carrying a machine-readable reason code so the platform can prompt the
-	// operator precisely. Fail CLOSED throughout: a nil HasPasscode or a nil
-	// VerifyPasscode still refuses, so a forgotten gate never silently opens root
-	// shell to anyone who can dispatch a job.
+	// ShellGateReason owns refusal precedence and strict-vs-legacy semantics.
+	// Each refusal is typed, with a machine-readable code for platform prompting.
+	// A forgotten gate never silently opens shell to anyone who can dispatch.
 	//
 	// The passcode is read from a dedicated payload field and is never forwarded
 	// into the command environment.
-	gate := ShellGate{Disabled: h.Disabled, Enabled: h.Enabled, HasPasscode: h.HasPasscode, VerifyPasscode: h.VerifyPasscode}
+	gate := ShellGate{Disabled: h.Disabled, Enabled: h.Enabled, HasPasscode: h.HasPasscode, VerifyPasscode: h.VerifyPasscode, State: h.State, Throttle: h.Throttle}
 	if reason := ShellGateReason(gate, job.Payload[ShellPasscodePayloadKey]); reason != "" {
 		refusal := &ShellRefusal{Reason: reason, Message: shellCommandRefusalMessage(reason)}
 		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, refusal.Message)

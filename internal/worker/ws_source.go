@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
 )
@@ -276,9 +277,7 @@ func (s *WSSource) Nack(ctx context.Context, job *Job, err error) error {
 	if s.control != nil {
 		return nil
 	}
-	s.client.SetJobStatus(ctx, job.ID, "failed", map[string]any{
-		"error": err.Error(),
-	})
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
 	return nil
 }
 
@@ -336,10 +335,7 @@ func (s *WSSource) Fail(ctx context.Context, job *Job, err error, data map[strin
 	if s.control != nil {
 		return s.Ack(ctx, job)
 	}
-	status := map[string]any{"error": err.Error()}
-	for k, v := range data {
-		status[k] = v
-	}
+	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 
 	queue := job.SourceQueue

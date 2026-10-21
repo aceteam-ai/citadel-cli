@@ -3145,3 +3145,99 @@ Auto-generated log of every release.
   - test(status): clean up the global request-log entry in GlobalSingleton (#1324)
 
 
+---
+
+## v2.196.0 — 2026-10-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 20 |
+| Lines added | +1355 |
+
+**Changes:**
+
+  - fix(jobs): pin meeting_url to https and escape meeting_id in the upload path (#1338)
+  - test(rag): give the inflight-cancellation test a separate startup budget (#1337)
+  - feat: bind template artifacts to conditional Range V2 (#1321)
+
+
+---
+
+## v2.197.0 — 2026-10-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 18 |
+| Lines added | +3021 |
+
+**Changes:**
+
+  - feat(diffusers): per-request image model selection, VRAM-aware swap, current open models (#1335)
+
+
+---
+
+## v2.198.0 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 10 |
+| Lines added | +175 |
+
+**Changes:**
+
+  - fix(diffusers): pin the sidecar image by digest instead of :latest (#1348)
+  - feat(ingress): ACME DNS-01 via Cloudflare for the apps domain (#1343)
+
+
+---
+
+## v2.199.0 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 20 |
+| Lines added | +1355 |
+
+**Changes:**
+
+  - fix(enrollment): require device linking and report active control certificate (#1347)
+
+
+---
+
+## v2.199.1 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +208 |
+
+**Changes:**
+
+  - fix(enrollment): link on init/enroll, retry token-poll 5xx, unblock the root worker unit (#1351)
+
+
+---
+
+## v2.200.0 — 2026-10-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 33 |
+| Lines added | +2405 |
+
+**Changes:**
+
+  - feat(jobs): add bounded create-only FILE_FETCH staging (#1355)
+  - docs: voice cloning shipped outside CIS; LocalAI as engine-adapter prior art (#1360) (#1362)
+  - test(worker): make the heavy-deadline lane test order-independent (#1363) (#1365)
+  - fix(enrollment): reset the registered node ID in Control Center, pin record-before-disconnect order (#1356) (#1361)
+
+

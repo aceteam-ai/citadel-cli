@@ -72,6 +72,9 @@ jobs:
       - name: go test
         run: go test ./...
 
+      - name: Media input contract replay (Python stdlib only)
+        run: python3 -I -B -m unittest discover -s internal/mediainput -p test_contract.py
+
       # -race gate for internal/jobs only (not repo-wide: -race is slow and
       # other packages haven't been swept for races yet). This package hit a
       # real intra-test race (#810) that a plain `go test` never caught, so it
@@ -236,10 +239,14 @@ jobs:
           echo "$deps"
           pip install $deps httpx
 
+      # citadel-cli#1335: test_image_models.py (allowlist + VRAM-budget variant
+      # selection) and test_image_swap.py (swap/warming logic over a fake
+      # loader) are stdlib-only; test_app.py also covers per-request model
+      # selection over the same fakes.
       - name: App contract tests (image + video paths, pipeline mocked)
         if: steps.changes.outputs.sidecar == 'true'
         working-directory: services/diffusers-service
-        run: python -m pytest test_app.py -v
+        run: python -m pytest test_app.py test_image_models.py test_image_swap.py -v
 
   whisper-sidecar-contract:
     name: Whisper sidecar contract and dependency audit

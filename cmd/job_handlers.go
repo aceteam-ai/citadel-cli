@@ -3,7 +3,10 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
 	"os"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
@@ -21,6 +24,11 @@ var jobHandlers map[string]jobs.JobHandler
 // Wired into the SHELL_COMMAND handler so an ENABLED shell still fails closed
 // unless the correct node passcode is presented. VerifyPasscode itself fails
 // closed (no passcode set, or empty/wrong pin, returns false).
+// nodePasscodeThrottle is the process-wide wrong-passcode throttle shared by
+// every passcode-gated job surface (SHELL_COMMAND, the WORKFLOW_RUN Shell node,
+// the desktop handlers).
+var nodePasscodeThrottle = jobs.NewPasscodeThrottle()
+
 func nodePasscodeVerifier(pin string) bool {
 	return loadNodePermissions().VerifyPasscode(pin)
 }
@@ -32,6 +40,80 @@ func nodePasscodeVerifier(pin string) bool {
 // HasPasscode reports only presence, never the hash.
 func nodeHasPasscode() bool {
 	return loadNodePermissions().HasPasscode()
+}
+
+// nodePasscodeState reads the node's passcode configuration once per job, for
+// the desktop gate and the SHELL_COMMAND / workflow Shell gates. Unlike
+// nodeHasPasscode it never turns a read failure into "no passcode": a
+// permissions file it cannot read or parse, or a master-PIN vault it cannot
+// stat, is returned as an error so the gate refuses.
+func nodePasscodeState() (jobs.PasscodeState, error) {
+	return passcodeStateFrom(nodePermissionsDir(), masterVault())
+}
+
+// passcodeStateFrom is nodePasscodeState's pure core, taking the permissions
+// directory and vault explicitly so tests never read this machine's node state.
+func passcodeStateFrom(permissionsDir string, vault *nodevault.Vault) (jobs.PasscodeState, error) {
+	perms, err := config.LoadPermissionsStrict(permissionsDir)
+	if err != nil {
+		return jobs.PasscodeState{}, err
+	}
+	vaultSet, err := vault.Configured()
+	if err != nil {
+		return jobs.PasscodeState{}, err
+	}
+	if vaultSet {
+		return jobs.PasscodeState{Set: true, Check: func(pin string) jobs.PasscodeVerdict { return vaultPasscodeVerdict(vault, pin) }}, nil
+	}
+	// The vault was just checked, so verify the legacy hash directly rather
+	// than through the master-PIN hooks, which consult the vault again. The
+	// legacy check uses the same node-wide legacy passcode lockout as the
+	// network surfaces (#1398), resolved from the vault's node directory so
+	// tests stay off this machine's state.
+	lockout := vault.LegacyPasscodeLockout()
+	return jobs.PasscodeState{Set: perms.PasscodeHash != "", Check: func(pin string) jobs.PasscodeVerdict {
+		return legacyPasscodeVerdict(perms, lockout, pin)
+	}}, nil
+}
+
+// legacyPasscodeVerdict checks pin against the legacy bcrypt hash under the
+// node-wide lockout, reporting a lockout as PasscodeLockedOut rather than a
+// wrong passcode, as vaultPasscodeVerdict does. An empty pin or an unset hash
+// is a mismatch and is not counted.
+func legacyPasscodeVerdict(perms *config.Permissions, lockout *nodevault.Lockout, pin string) jobs.PasscodeVerdict {
+	err := perms.CheckLegacyPasscode(pin, lockout)
+	switch {
+	case err == nil:
+		return jobs.PasscodeMatch
+	case nodevault.IsLockedOut(err):
+		return jobs.PasscodeLockedOut
+	case errors.Is(err, nodevault.ErrWrongPIN), errors.Is(err, config.ErrPasscodeMismatch):
+		return jobs.PasscodeMismatch
+	default:
+		return jobs.PasscodeUnavailable
+	}
+}
+
+// vaultPasscodeVerdict checks pin against the master-PIN vault, reporting a
+// vault lockout as PasscodeLockedOut rather than a wrong passcode. An empty pin
+// is a mismatch and is not counted by the vault.
+func vaultPasscodeVerdict(vault *nodevault.Vault, pin string) jobs.PasscodeVerdict {
+	if pin == "" {
+		return jobs.PasscodeMismatch
+	}
+	err := vault.VerifyPIN(pin)
+	switch {
+	case err == nil:
+		return jobs.PasscodeMatch
+	case nodevault.IsLockedOut(err):
+		return jobs.PasscodeLockedOut
+	case errors.Is(err, nodevault.ErrWrongPIN):
+		return jobs.PasscodeMismatch
+	default:
+		// Any other vault error (I/O, a corrupt header) says nothing about the
+		// presented passcode, so it must not read as, or count as, a wrong one.
+		return jobs.PasscodeUnavailable
+	}
 }
 
 // nodeShellEnabled is the live shell kill-switch. Reloading the small
@@ -99,9 +181,10 @@ func init() {
 	// Even on this legacy Nexus/diagnostic path an enabled shell is passcode-gated
 	// (aceteam#6524): executeJob polls remote jobs and reports back, so leaving the
 	// verifier nil here would run enabled shell with no passcode. Fail closed.
-	// HasPasscode lets the handler distinguish passcode_not_set from passcode_invalid.
-	shellHandler.HasPasscode = nodeHasPasscode
-	shellHandler.VerifyPasscode = nodePasscodeVerifier
+	// Strict State preserves I/O failures and vault lockouts as distinct refusal
+	// reasons; the same process throttle protects diagnostic and worker jobs.
+	shellHandler.State = nodePasscodeState
+	shellHandler.Throttle = nodePasscodeThrottle
 
 	// Per-org index namespaces (aceteam#10876 C2): point the FILE_INDEX /
 	// FILE_SEMANTIC_SEARCH handlers at the machine-convergent indexes dir so a

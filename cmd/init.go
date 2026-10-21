@@ -275,6 +275,11 @@ and system user configuration (requires sudo).`,
 				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 				os.Exit(1)
 			}
+			if err := linkDeviceEnrollment(deviceAuthResult); err != nil {
+				_ = network.Disconnect()
+				fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
+				os.Exit(1)
+			}
 			ip, _ := network.GetGlobalIPv4()
 			printNetworkSuccessInfo(nodeName, ip)
 			earlyNetworkConnected = true
@@ -345,6 +350,14 @@ and system user configuration (requires sudo).`,
 						if err := saveRedisURLToConfig(deviceAuthResult.Token.RedisURL); err != nil {
 							fmt.Fprintf(os.Stderr, "⚠️  Could not save config: %v\n", err)
 						}
+					}
+					// A fresh grant does not authorize the already-connected node.
+					// Refusal requires explicit logout + init so registration uses
+					// the new reservation; a saved bearer is not a completed link.
+					if err := linkDeviceEnrollment(deviceAuthResult); err != nil {
+						_ = network.Disconnect()
+						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
+						os.Exit(1)
 					}
 				}
 
@@ -1877,6 +1890,9 @@ func connectToNetwork(nodeName, authKey string) error {
 		AuthKey:    authKey,
 	}
 
+	// A failed connect must not leave an earlier registration's ID for the
+	// device link to use.
+	setRegisteredNodeID("")
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
@@ -1906,9 +1922,20 @@ func connectToNetwork(nodeName, authKey string) error {
 	// Disconnect cleanly so tsnet flushes its state files, then the
 	// post-Close chown in Disconnect() fixes ownership for the non-root
 	// worker process. The work command re-establishes its own connection.
-	_ = network.Disconnect()
+	recordRegistrationThenDisconnect(ctx, srv.Status, network.Disconnect)
 
 	return nil
+}
+
+// recordRegistrationThenDisconnect records the registered node ID and only
+// then disconnects. The order is the v2.199.0 bug: the device link that
+// follows needs the ID, and the global server can no longer report it after
+// Disconnect.
+func recordRegistrationThenDisconnect(ctx context.Context, status func(context.Context) (*network.NetworkStatus, error), disconnect func() error) {
+	if st, err := status(ctx); err == nil && st != nil {
+		setRegisteredNodeID(st.NodeID)
+	}
+	_ = disconnect()
 }
 
 // reclaimStaleNodeByHostname removes a stale Headscale node with the same

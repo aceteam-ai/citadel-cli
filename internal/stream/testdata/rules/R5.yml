@@ -1,0 +1,15 @@
+{
+  "title": "Synthetic failures followed by success",
+  "name": "R5",
+  "correlation": {
+    "type": "temporal_ordered",
+    "rules": [
+      "_subnet_failures",
+      "_success"
+    ],
+    "group-by": [
+      "source.ip_subnet24"
+    ],
+    "timespan": "10m"
+  }
+}

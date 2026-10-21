@@ -1,3 +1,4 @@
+# History of the Wan2.1 floor (citadel #958); the current pin is further down.
 # 0.33.1, not 0.31.0: WanPipeline/AutoencoderKLWan (citadel #958, Wan2.1
 # text-to-video) were not exported yet at 0.31.0 -- verified directly against
 # the tagged source (diffusers/__init__.py has no "Wan*" symbol at v0.32.0,
@@ -6,16 +7,35 @@
 # >=4.41.2 / safetensors to >=0.3.1 / accelerate to >=0.31.0 -- all already
 # comfortably satisfied by the pins below, so this bump is otherwise
 # backward-compatible with the existing sdxl-turbo image path.
-diffusers==0.33.1
-transformers==4.46.3
-accelerate==1.1.1
-safetensors==0.4.5
+# Stack bumped for citadel-cli#1335 (per-request model selection), from
+# diffusers 0.33.1 / transformers 4.46.3 / accelerate 1.1.1 / torch 2.5.1:
+#   - diffusers==0.37.1: first release line that exports Flux2KleinPipeline
+#     (FLUX.2 klein), ZImagePipeline (Z-Image-Turbo) and QwenImagePipeline
+#     alongside the pipelines this sidecar already used. Verified against the
+#     tagged source: diffusers/__init__.py at v0.37.1 exports Flux2KleinPipeline,
+#     ZImagePipeline, QwenImagePipeline, WanPipeline, AutoencoderKLWan,
+#     BitsAndBytesConfig and PipelineQuantizationConfig. 0.37.1 declares
+#     huggingface-hub>=0.34,<2.0 and safetensors>=0.3.1. (0.38+ raises the
+#     safetensors floor to a release candidate and 0.40+ needs huggingface-hub
+#     1.x and torch>=2.6, so 0.37.1 is the deliberate stopping point.)
+#   - transformers==4.57.3: the last 4.x line (needs huggingface-hub<1.0). It
+#     provides the Qwen3 (FLUX.2 klein, Z-Image text encoders) and
+#     Qwen2.5-VL (Qwen-Image text encoder) model classes the new pipelines
+#     load, and still has the tokenizer-loading behavior the pins below were
+#     validated against. transformers 5.x is not used: it is a major version
+#     with a different tokenizer stack.
+#   - bitsandbytes==0.48.2: nf4 / 8-bit quantized loads (requires torch>=2.3).
+#   - The base image moves to torch 2.7.1 / CUDA 12.6 (see the Dockerfile).
+diffusers==0.37.1
+transformers==4.57.3
+accelerate==1.11.0
+safetensors==0.7.0
+bitsandbytes==0.48.2
 # Already a transitive dep of diffusers/transformers above, pinned explicitly
 # because model_preflight.py (citadel #902) imports it directly for the
-# free-space preflight's list_repo_tree call. >=0.27.0 is REQUIRED by
-# diffusers==0.33.1 above (verified against its setup.py); bumped from
-# 0.26.2 alongside the diffusers bump for the same reason.
-huggingface_hub==0.27.1
+# free-space preflight's list_repo_tree call. Must satisfy BOTH
+# diffusers==0.37.1 (>=0.34,<2.0) and transformers==4.57.3 (>=0.34,<1.0).
+huggingface_hub==0.36.0
 # export_to_video's preferred backend (diffusers.utils.export_utils), used by
 # the citadel #958 text-to-video path (services/diffusers-service/app.py's
 # /generate/video) to render a WanPipeline result's frames to an MP4
@@ -23,7 +43,7 @@ huggingface_hub==0.27.1
 # OpenCV path (_legacy_export_to_video) that this image does not otherwise
 # need a dependency for -- pin the modern backend instead of relying on the
 # fallback.
-imageio==2.36.1
+imageio==2.37.0
 imageio-ffmpeg==0.5.1
 # Full text-encoder tokenizer stack (citadel-cli#829). AutoTokenizer /
 # AutoPipelineForText2Image / WanPipeline silently depend on different
@@ -48,9 +68,9 @@ imageio-ffmpeg==0.5.1
 # failure again. Pinned to versions contemporaneous with the
 # transformers/diffusers pins above; do NOT loosen any pin in this file when
 # adding to it.
-sentencepiece==0.2.0
+sentencepiece==0.2.1
 protobuf==5.28.3
-tiktoken==0.8.0
+tiktoken==0.12.0
 ftfy==6.3.1
 fastapi==0.115.6
 uvicorn==0.34.0

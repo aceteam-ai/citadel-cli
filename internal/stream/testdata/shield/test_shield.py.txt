@@ -1,0 +1,125 @@
+"""Local proof for Shield S1. Runs gen.py, then renders the real flow/*.j2 templates
+with jinja2 (sandboxed, like the platform) and asserts the expected flags.
+Run: python3 test_shield.py
+"""
+import copy, json, os, re, subprocess, sys
+from jinja2.sandbox import SandboxedEnvironment
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FLOW = os.path.join(HERE, "flow")
+EX = os.path.join(HERE, "examples")
+subprocess.run([sys.executable, os.path.join(HERE, "gen.py")], check=True, capture_output=True, cwd=HERE)
+
+ENV = SandboxedEnvironment()
+def render(name, **kw):
+    return ENV.from_string(open(os.path.join(FLOW, name + ".j2")).read()).render(**kw)
+
+POLICY = json.load(open(os.path.join(FLOW, "policy.default.json")))
+HISTORY = json.load(open(os.path.join(EX, "history.json")))
+def logs(name): return open(os.path.join(EX, name + ".log")).read()
+def sentinel(name, policy=POLICY, history=HISTORY):
+    return json.loads(render("sentinel", logs=logs(name), history=history, policy=policy))
+def with_policy(**kw):
+    p = copy.deepcopy(POLICY); p.update(kw); return p
+def by_ip(s): return {e["ip"]: e for e in s["entities"]}
+def flagged(s): return {e["ip"]: sorted(r["id"] for r in e["rules"]) for e in s["entities"] if e["verdict"] == "flagged"}
+def stat_only(s): return sorted(e["ip"] for e in s["entities"] if e["verdict"] == "stat_only")
+def key_of(e, rid):
+    m = [h for h in e["history_matches"] if h["record_id"] == rid]
+    return m[0]["matched_key"] if m else None
+
+results = []
+def check(label, cond):
+    results.append((label, bool(cond)))
+    print(("PASS " if cond else "FAIL ") + label)
+
+# a: clean batch, a plain successful login without prior failures is not flagged
+s = sentinel("a_clean")
+check("a: nothing flagged, nothing stat-only", flagged(s) == {} and stat_only(s) == [])
+check("a: policy version echoed in sentinel JSON", s["policy_version"] == POLICY["version"])
+
+# b: SQLi plus known-bad IP
+s = sentinel("b_sqli_knownbad")
+check("b: R2 on 203.0.113.9 and R1 on 203.0.113.66 only", flagged(s) == {"203.0.113.9": ["R2"], "203.0.113.66": ["R1"]})
+check("b: sqlmap actor matches INC-2026-0377 on ua_path", key_of(by_ip(s)["203.0.113.9"], "INC-2026-0377") == "ua_path")
+
+# c: ambiguous crawler is stat-only and matches the benign precedent by ip
+s = sentinel("c_ambiguous_crawler")
+check("c: crawler is stat-only, no rule hit", flagged(s) == {} and stat_only(s) == ["192.0.2.150"])
+h = by_ip(s)["192.0.2.150"]["history_matches"]
+check("c: matched key ip, benign precedent INC-2026-0266", key_of(by_ip(s)["192.0.2.150"], "INC-2026-0266") == "ip" and [x for x in h if x["record_id"] == "INC-2026-0266"][0]["verdict"] == "benign")
+
+# d: scanner plus credential stuffing with eventual success
+s = sentinel("d_repeat_credstuffing")
+check("d: R3 scanner and R4+R5 stuffer", flagged(s) == {"192.0.2.200": ["R3"], "198.51.100.140": ["R4", "R5"]})
+check("d: stuffer severity is top", by_ip(s)["198.51.100.140"]["severity"] == "top")
+check("d: scanner matches INC-2026-0301 on ip", key_of(by_ip(s)["192.0.2.200"], "INC-2026-0301") == "ip")
+check("d: stuffer matches INC-2026-0377 on subnet24", key_of(by_ip(s)["198.51.100.140"], "INC-2026-0377") == "subnet24")
+
+# e: fail then success (R5), order sensitivity, below-threshold user
+s = sentinel("e_fail_then_success")
+check("e: R5 only after failures reach threshold; success-first is R4 only; mistyped user clean",
+      flagged(s) == {"198.18.1.50": ["R4", "R5"], "198.18.1.60": ["R4"]})
+check("e: R5 flag is top severity", by_ip(s)["198.18.1.50"]["severity"] == "top")
+s = sentinel("e2_split_ip_fail_then_success")
+check("e2: split-IP failures then success flags R5 (subnet scope) on the succeeding IP, no R4",
+      flagged(s) == {"198.18.2.143": ["R5"]} and "subnet scope" in by_ip(s)["198.18.2.143"]["rules"][0]["detail"])
+
+# f: multi-key matching
+s = sentinel("f_multikey_match")
+check("f: curl scanner from a new /24 is flagged R3", flagged(s) == {"198.18.9.14": ["R3"]})
+check("f: same UA and path pattern from a different /24 matches INC-2026-0301 via ua_path",
+      key_of(by_ip(s)["198.18.9.14"], "INC-2026-0301") == "ua_path")
+check("f: benign crawler is stat-only and matches nothing", stat_only(s) == ["198.18.5.20"] and by_ip(s)["198.18.5.20"]["history_matches"] == [])
+
+# one policy knob changes outcomes with no template edit
+s = sentinel("d_repeat_credstuffing", with_policy(cred_fail_threshold=13))
+check("policy: cred_fail_threshold 5 -> 13 clears R4 and R5 on the stuffer", "198.51.100.140" not in flagged(s))
+s = sentinel("e2_split_ip_fail_then_success", with_policy(r5_subnet_aggregate=False))
+check("policy: r5_subnet_aggregate false clears the split-IP flag", flagged(s) == {})
+s = sentinel("c_ambiguous_crawler", with_policy(stat_404_threshold=11))
+check("policy: stat_404_threshold 8 -> 11 makes the crawler clean", stat_only(s) == [])
+s = sentinel("f_multikey_match", with_policy(match_keys=["ip", "subnet24"]))
+check("policy: dropping ua_path from match_keys removes the multi-key match", by_ip(s)["198.18.9.14"]["history_matches"] == [])
+s = sentinel("b_sqli_knownbad", with_policy(bad_ips=[]))
+check("policy: emptying bad_ips clears R1", "203.0.113.66" not in flagged(s))
+check("policy: truncation by max_lines is reported", sentinel("a_clean", with_policy(max_lines=5))["lines_truncated"] is True)
+
+# guardrail, payload and count share one policy
+props = {"proposals": [
+    {"ip": "1.1.1.1", "action": "block", "ttl_minutes": 60, "confidence": 0.9, "blast_radius": "low", "rationale": "x"},
+    {"ip": "2.2.2.2", "action": "block", "ttl_minutes": 60, "confidence": 0.7, "blast_radius": "low", "rationale": "x"},
+    {"ip": "3.3.3.3", "action": "rate_limit", "ttl_minutes": 30, "confidence": 0.95, "blast_radius": "high", "rationale": "x"},
+    {"ip": "4.4.4.4", "action": "alert", "ttl_minutes": 0, "confidence": 0.1, "blast_radius": "high", "rationale": "x"}]}
+def held(policy):
+    n = int(render("count", g=props, policy=policy))
+    pay = render("payload", g=props, policy=policy)
+    gr = render("guardrail", g=props, policy=policy)
+    assert n == len([l for l in pay.split("\n")[1:] if l.strip()]), "count and payload disagree"
+    assert f"HELD FOR HUMAN APPROVAL ({n}):" in gr, "count and guardrail disagree"
+    return n
+check("guardrail: default policy holds 2.2.2.2 (low confidence) and 3.3.3.3 (high blast); alert never held", held(POLICY) == 2)
+check("policy: confidence_floor 0.85 -> 0.95 also holds 1.1.1.1", held(with_policy(confidence_floor=0.95)) == 3)
+check("policy: blast_radius_hold emptied releases 3.3.3.3", held(with_policy(blast_radius_hold=[])) == 1)
+props = {"proposals": [dict(props["proposals"][0], ip=f"9.9.9.{i}") for i in range(3)]}
+check("policy: max_proposals_per_run 3 -> 2 holds the one overflow proposal", held(POLICY) == 0 and held(with_policy(max_proposals_per_run=2)) == 1)
+rep = render("report", policy=POLICY, sentinel="s", radar="r", investigator="i", guardrail="g", watcher="w", review_count="2")
+check("report prints policy.version", f"Policy version: {POLICY['version']}" in rep)
+
+# build checks: no literals in graph or templates
+sys.path.insert(0, FLOW)
+import build
+g = build.build()
+gs = json.dumps(g)
+cfg = json.load(open(os.path.join(FLOW, "config.json")))
+check("graph agent ids come from config.json", all(a in gs for a in cfg["agents"].values()))
+check("build.py holds no uuid literals", not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}", open(os.path.join(FLOW, "build.py")).read()))
+tpl = "".join(open(os.path.join(FLOW, n + ".j2")).read() for n in ["sentinel", "guardrail", "payload", "count"])
+check("templates hold no hardcoded thresholds",
+      not re.search(r">=\s*\d|<\s*0\.\d|==\s*'high'|0\.85", tpl))
+check("policy is an Input field wired to every consumer",
+      "policy" in g["input_node"]["params"]["fields"] and sum(1 for e in g["edges"] if e["source_key"] == "policy") == 5)
+
+bad = [l for l, ok in results if not ok]
+print(f"\n{len(results) - len(bad)}/{len(results)} checks passed")
+sys.exit(1 if bad else 0)

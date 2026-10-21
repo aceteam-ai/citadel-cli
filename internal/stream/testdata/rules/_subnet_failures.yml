@@ -1,0 +1,20 @@
+{
+  "title": "Five synthetic failures in a subnet",
+  "name": "_subnet_failures",
+  "correlation": {
+    "type": "event_count",
+    "rules": [
+      "_failed"
+    ],
+    "group-by": [
+      "source.ip_subnet24"
+    ],
+    "timespan": "10m",
+    "condition": {
+      "gte": 5
+    }
+  },
+  "x-aceteam": {
+    "escalate": false
+  }
+}
