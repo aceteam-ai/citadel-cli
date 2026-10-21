@@ -1515,6 +1515,14 @@ the engine's own incremental deltas into one final array before returning it.
 
 ### Approved job-template builtins (`RUN_JOB_TEMPLATE`, citadel-cli#1161)
 
+`template_builtin_video_compose.go` is inactive source for aceteam#11481.
+`runVideoComposeBuiltin` owns the proposed closed film decoder, declared-basename
+binding and media composition core, but has no registry entry; its live dependency
+set fails before effects until the pinned v3 card/disclosure renderer lands.
+`renderPapercraftLandscapeCard` shares the existing capture lifecycle for one
+landscape with silent audio; it does not supply card assets. The proposed contract
+and remaining activation gates are in `docs/run-job-template-contract.md`.
+
 `cmd/run_job_template_ops.go` remains the workspace/hash/receipt adapter;
 `cmd/template_builtin_papercraft.go` and `template_builtin_audio_mix.go` are the
 only production registry entries. Both invoke fixed argv directly, never a

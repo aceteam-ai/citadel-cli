@@ -141,3 +141,108 @@ Regression tests include the four independent review probes at original head
 `e6375a723be5894e392f98cfb19f52c386aa3a5c`. Run the guard-removal suite with
 `go run ./scripts/test_job_template_mutations.go`; its temporary Go overlays do
 not modify the checkout and require actual regression assertion failures.
+
+## Proposed video-compose v1 contract (inactive source)
+
+This is **part of aceteam-ai/aceteam#11481**, not a registered or template-ready
+builtin. `runVideoComposeBuiltin` has no registry entry or approved manifest
+hash. Its live dependency set refuses before tool discovery or output creation.
+Activation is blocked on paper-trail card scenes (#11480) and the vendored v3
+shell (#11296), including a real implementation of the card/disclosure seam.
+The fake renderer in unit tests supplies fixtures only; it is not a card renderer.
+
+Params are exactly `{}`. Proposed inputs are exactly one `film.json` (at most
+1 MiB), one to 32 chapter MP4s named in it, and an optional `poster.png` override.
+Files must be declared staged regular files with distinct basenames. Each
+chapter's `file` is the exact final staged basename, including the unique name
+returned by FILE_FETCH/NodeFileWrite. S3 (#11483) must stage first, assemble the
+final film.json from those returned names, then obtain human approval over those
+final inputs. No implicit `ch1.mp4` rename, case folding, directory traversal,
+external URL, unlisted file lookup, extra input, or music `bed` is supported.
+Chapter names use ASCII letters/digits/underscore/hyphen/dot, end in `.mp4`, and
+cannot start with a dot or hyphen.
+
+`videoComposeFilmSchema` owns the proposed closed film schema. Exact keys are
+checked at every object level; duplicate keys, trailing JSON and invalid Unicode
+are refused before struct binding. Top-level fields are `title`, `subtitle`,
+`intro`, `outro`, `theme`, `chapters`, optional `loudness`, and optional `delivery`.
+Intro/outro contain `lines` and positive `seconds` up to 60. Chapters require
+`file`, `title`, `narrator: {name,line}`, `stamp: {label,by,at}`, positive
+`card_seconds` up to 60, nullable `disclosure`, `narration_identity`, and
+`speaks_as_person`. The identity enum is `stock|consented_clone|own_recording`
+(#11484). These last two required fields repair their omission in #11481's JSON
+example: `stock` plus `speaks_as_person:true` without a nonblank disclosure must
+fail closed. A stamp requires `label:"SIGNED"`, a nonblank `by`, and a valid
+`at` calendar date in `YYYY-MM-DD` form. The future renderer must place disclosure
+on the card and burn it for the chapter's entire duration. Text/card-count limits are pinned by the
+source schema; theme names currently use the exact existing v2 preset registry
+and must be reconciled with the pinned v3 registry before activation.
+
+For example, a chapter must now include:
+
+```json
+{
+  "file": "staged-a71f-chapter.mp4",
+  "title": "I signed my own homework",
+  "narrator": {"name": "the Ace", "line": "Narrated by the Ace, the AI"},
+  "narration_identity": "stock",
+  "speaks_as_person": false,
+  "disclosure": null,
+  "stamp": {"label": "SIGNED", "by": "founder", "at": "2026-10-12"},
+  "card_seconds": 2.5
+}
+```
+
+Fixed ffprobe argv inspect every chapter before rendering, recording dimensions,
+rational frame rate, pixel format, codec profile/level/time base/extradata,
+audio codec/rate/channels/extradata and duration. Proposed v1 supports square-pixel
+landscape inputs, even dimensions up to 8192 pixels wide, 1–120 fps and one video
+plus one audio stream; mixed aspect, absent audio, extra streams, invalid metadata
+and missing files fail. The current capture helper is still 30 fps; integrating
+other reference frame rates is an activation requirement, not a tested capability.
+The single-landscape capture entry point uses the same Chromium/cgroup lifecycle
+as existing papercraft rendering and requests continuous stereo 48 kHz silent
+AAC; the existing public papercraft entry point still renders both formats.
+
+The source core copies chapter streams only when the inspected stream parameters
+match the rendered intro reference; otherwise it requests libx264 CRF 17,
+yuv420p and AAC 192k normalization. Prepared clips/cards are probed again and
+must match before the safe concat demuxer consumes a node-written list of fixed
+scratch basenames. These subprocesses use the existing limited-command runner,
+minimal child environment and process-tree cleanup; no shell, NVENC, provider,
+or credential path is introduced. Input protocols are limited to file/pipe.
+
+Audio uses measured two-pass loudnorm, defaulting to -14 LUFS, -2 dBTP and LRA 11.
+An explicit complete `loudness: {i,tp,lra}` can choose -16 LUFS instead.
+`delivery.max_bytes` defaults to 48 MiB (50331648 bytes), including when delivery
+is `{}`. **Proposed conservative v1 policy:** 48 MiB is also its maximum pending
+S5, preserving the current upload ceiling; this upper bound needs contract
+review because #11481 specifies the default but does not explicitly spell out
+the maximum. Only an oversized result triggers one x264 bitrate cap pass; it
+reserves mux/audio headroom, copies the normalized audio, and fails if actual
+bytes still exceed the limit. Both final encode paths request `+faststart`.
+No node performance measurement or live ffmpeg validation has been performed.
+
+Proposed outputs are `film.mp4`, `poster.png`, and `chapters.json`. The poster is
+the frame immediately after the intro or a decoded/re-encoded supplied override.
+The timeline is an object with `chapters: [{index,title,start_s,end_s,card_start_s,
+narrator,stamp,disclosure}]`, `duration_s`, `bytes`, `loudness_measured` (the first
+loudnorm pass's input statistics), `loudness_measured_stage:"pre_normalization"`,
+and `encode_passes` (one audio-normalization
+encode, plus one if the delivery cap ran). Chapter indices start at one;
+start/end exclude the chapter card, card_start includes its start. Times are
+accumulated from prepared media durations, including intro/outro, and final
+duration must agree within one frame. `chapters.json` is an output file: no fields
+are added to the adapter's `outputs/duration_ms/input_hashes/receipt` envelope.
+The five loudness statistic values remain strings; they describe the input
+analysis and must never be presented as measurements of delivered loudness.
+
+Before activation: integrate pinned real card/disclosure assets, reconcile the
+reference format/rate/stream normalization with them, run real media acceptance
+and the capped ten-minute CPU timing on the target node, then review the final
+closed schema and registration manifest/hash. The independent render wall
+timeout is two hours; RunNodeJob currently caps a supplied timeout at 1800 s.
+Coordinate the eventual release with FILE_FETCH (#11482); source presence or a
+version number alone does not establish node capability. Jason owns the eventual
+template registration and approval on node 1795, after the release routed through
+automated-citadel. This source change performs none of those actions.

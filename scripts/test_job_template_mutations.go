@@ -35,6 +35,14 @@ func main() {
 		{"resolved_workspace_root", "cmd/run_job_template_ops.go", "workspaceDir, err = filepath.EvalSymlinks(workspaceDir)", "workspaceDir, err = workspaceDir, nil", "./cmd", "TestLiveTemplateRunOps_SymlinkWorkspaceRetargetCannotChangeStagedInput"},
 		{"unique_attempt_namespace", "cmd/run_job_template_ops.go", "attempt, err := newTemplateAttemptSegment()", "attempt, err := \"attempt-fixed\", error(nil)", "./cmd", "TestLiveTemplateRunOps_CancelledAttemptCannotOverlapRetryNamespace"},
 		{"cancellable_template_copy", "cmd/run_job_template_ops.go", "if nr > 0 {\n\t\t\tif err := ctx.Err(); err != nil {", "if nr > 0 {\n\t\t\tif err := ctx.Err(); false && err != nil {", "./cmd", "TestCopyTemplateWithContextStopsBetweenChunks"},
+		{"film_closed_schema", "cmd/template_builtin_video_compose.go", "if err := schema.Validate(v); err != nil", "if err := schema.Validate(v); false && err != nil", "./cmd", "TestVideoComposeFilmClosedSchema/unknown_top"},
+		{"film_disclosure_guard", "cmd/template_builtin_video_compose.go", "ch.SpeaksAsPerson && ch.Disclosure == nil", "false && ch.SpeaksAsPerson && ch.Disclosure == nil", "./cmd", "TestVideoComposeDisclosureGuard"},
+		{"film_mixed_aspect", "cmd/template_builtin_video_compose.go", "i > 0 && !videoComposeSameAspect(media[0], media[i])", "false && i > 0 && !videoComposeSameAspect(media[0], media[i])", "./cmd", "TestVideoComposeMixedAspectRefused"},
+		{"film_delivery_cap", "cmd/template_builtin_video_compose.go", "if info.Size() > film.Delivery.MaxBytes {", "if false && info.Size() > film.Delivery.MaxBytes {", "./cmd", "TestVideoComposeFakeMediaPipeline"},
+		{"film_stream_copy", "cmd/template_builtin_video_compose.go", "a == b && a.VideoCodec", "true || a == b && a.VideoCodec", "./cmd", "TestVideoComposeStreamDecision"},
+		{"film_card_silence", "cmd/template_builtin_papercraft.go", "} else if cfg.SilentAudio {", "} else if false && cfg.SilentAudio {", "./cmd", "TestVideoComposeSingleLandscapeCapture"},
+		{"film_inactive_gate", "cmd/template_builtin_video_compose.go", "if deps.visuals == nil {", "if false && deps.visuals == nil {", "./cmd", "TestVideoComposeInactiveBeforeEffects"},
+		{"film_declared_input", "cmd/template_builtin_video_compose.go", "if files[ch.File] == \"\" {", "if false && files[ch.File] == \"\" {", "./cmd", "TestVideoComposeBindsDeclaredFinalBasenames"},
 	}
 	for _, m := range mutations {
 		source := filepath.Join(root, m.file)
