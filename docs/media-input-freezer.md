@@ -91,3 +91,38 @@ and all live C1b/C5 acquisition,
 publication and activation gates remain unresolved. The O_PATH change does
 not establish that an accepted regular inode has no outside-workspace hard
 links, nor does it restrict owner UID.
+
+## #1314 C1c: shared inbox acquisition plan
+
+This next source slice is stacked on the #1404 path/type hardening draft. It
+does not complete C5 or enable a media task. The accepted input route and
+lifecycle come from the [shared DoR](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290142842),
+as overridden by [Jason's recorded decisions](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290189919).
+
+1. Extract FILE_FETCH's fixed-origin, public-IP-pinned HTTPS GET policy into
+   an internal shared client with a closed endpoint set and an `io.Writer`
+   sink. Preserve the existing origin/URL, token, proxy, redirect, compression,
+   TLS, DNS/all-answer/own-address, timeout, body-size and static-error rules.
+   FILE_FETCH keeps its live Files checks, cooperative cancellation, anonymous
+   staging, expected-hash verification, sync and create-only publication. Its
+   existing tests and wire fixture must not change.
+2. Prepare an inactive media freezer supporting workspace, inbox and mixed
+   v1 inputs. Inbox uses only `/api/shared/media-input`, declared-size-plus-one
+   bounded memory, exact size/hash and the existing image/header/mask guards.
+   A live media-input predicate is mandatory; workspace inputs additionally
+   require live Files. Inbox-only jobs require no workspace or Files grant.
+   Preserve snapshot privacy and independent readers; no input disk staging,
+   mount, task registration, permission mutation or capability minting.
+3. Verify shared-client policy and every acquisition/permission/cancellation/
+   privacy boundary with owned offline Go/Python fixtures. Use no real token,
+   public network, model or service. Normal existing CI verifies FILE_FETCH
+   compatibility and composed exact-head source. No local formatter/vet or
+   standalone build is authorized by this plan.
+
+The future C5 caller must acquire the shared node-wide holder admission before
+any redemption, then enforce target-node/deadline/cancel, live publication and
+upload gates. This library does not create a competing holder pool. C2 token
+privacy must land before minting/dispatch; D6 upload and C3 withheld lifecycle
+remain prerequisites. In particular, this does not expose #1374's unratified
+video extension or settle owner/hard-link policy. Implementation and fresh
+exact-head test receipts are pending; independent review remains required.
