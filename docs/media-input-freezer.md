@@ -48,3 +48,31 @@ shared pinned inbox transport, capability privacy, global two-holder admission,
 withheld storage/GC, the sidecar, live `media_inputs`, task and publication
 gates, and the reviewed upload route. No edit image bytes may cross Redis.
 Hardware/model acceptance and deployment remain outside this source slice.
+
+## #1392 descriptor preflight follow-up plan
+
+The #1393 review identified a gap: an `O_RDONLY` leaf open can invoke a device
+driver before the subsequent regular-file check refuses that leaf. This
+follow-up is source-only and does not settle owner UID or hard-link policy.
+
+1. Pin the leaf using `O_PATH|O_NOFOLLOW|O_CLOEXEC` against the anchored parent.
+   Inspect its descriptor type before any readable leaf open. Reject every
+   non-regular type, including the symlink itself returned by this flag pair.
+2. Keep that pin alive, anchor `/proc/self/fd` with a directory descriptor,
+   verify procfs using `fstatfs`, and open only the pin's numeric FD alias for
+   reading. Verify the readable descriptor is regular with the same device and
+   inode. Never re-resolve the caller's leaf or fall back to a path-based open.
+   A missing, inaccessible or non-procfs FD directory must fail closed. The
+   process's OS and mount namespace remain trusted; this is not a sandbox
+   against a privileged host attacker.
+3. Add owned offline fixtures for syscall order/flags, synthetic non-regular
+   type observations (without creating/opening devices), replacement and
+   removal of the original pathname, procfs/open/stat failures and FD cleanup.
+   Retain the existing freeze/hash/mask/cancellation/privacy tests and shared
+   Go/Python contract replay. Only already-authorized offline tests and normal
+   GitHub CI may execute; no formatter, model, native device or service run is
+   included.
+
+Implementation and current-head test receipts are pending. Independent review
+is still required. Even after this follow-up, owner/hard-link policy and all
+live C1b/C5 acquisition, publication and activation gates remain unresolved.
