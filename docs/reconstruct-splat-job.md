@@ -98,6 +98,13 @@ retained with any later image change. No source metadata is native validation.
   They are NOT locally executed results. No safe publication/path guarantee is
   inferred from this prerequisite, and the remaining phases are still required.
 - Prepared plan/source phases are not proof of a usable dispatched job.
+- Engine publication prerequisite prepared: Linux no-replace rename with opened
+  parent descriptors, immediate-parent symlink refusal and no unsafe fallback.
+  Synthetic regressions cover late destination collisions, two complete bundles
+  racing, cancellation and parent symlinks. This closes the empty-directory
+  replacement race only; trusted operator ancestor paths/private trees remain
+  outside dispatched input/output confinement. No fsync/crash durability,
+  network-filesystem recovery or real container-exit custody is established.
 - Pending: accepted receipt action/units and paired backend owner; viewer SPZ
   version/axes, converter/tool/dependency pins and confined input limits/policy.
 - Pending: complete handler/container/receipt/publication/registration source,

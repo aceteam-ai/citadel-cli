@@ -50,12 +50,22 @@ The separate caller log stream is not truncated or privacy-filtered by this
 capture, so it must not be forwarded verbatim as dispatched job progress.
 
 Every child starts in its own process group. SIGINT, SIGTERM, or lifecycle
-context cancellation kills the full ffmpeg/Spirula process tree. Work and
-publish directories are private, unpredictable siblings of the requested
-output, and are removed on failure. The requested output directory must not
-already exist and is atomically renamed into place only after a complete regular
-PLY has been hashed. A partial artifact is therefore never returned or exposed
-at the requested path.
+context cancellation asks the Linux executor to kill that group and waits for
+the command. This is not containment of a deliberately detached process or
+proof of a separately launched container's exit. Work and publish directories
+are private, unpredictable siblings of the requested output, with best-effort
+cleanup on failure.
+
+The requested output directory must not already exist. After hashing a complete
+regular PLY, `publishDirectory` promotes its private bundle with Linux
+`renameat2(RENAME_NOREPLACE)`: even an empty directory created during training
+is an error, not something to replace. There is no unsafe rename fallback on
+unsupported kernels/filesystems or other platforms. Parent descriptors use
+no-follow on their final component; symlinked immediate output parents are
+refused. This remains a trusted-operator engine: earlier parent components and
+private-tree mutation are not a dispatched workspace trust boundary. Atomic
+visibility is not fsync/crash durability or network-filesystem recovery. See the
+[Linux rename contract](https://man7.org/linux/man-pages/man2/rename.2.html).
 
 This workload has no internal deadline. A high-quality, multi-hundred-frame 4K
 scan is opaque-long and must run in the reconstruct lifecycle's unbounded tier.
@@ -126,7 +136,7 @@ Acceptance checks:
 
 1. The JSON quality signal reports registered percent and mean reprojection.
 2. Training begins only when `accepted_for_training` is true.
-3. The result references `splat.ply` by path and `sha256:` digest only.
+3. The result references `splat.ply` by path, `sha256:` digest and actual byte size.
 4. `sha256sum` of that PLY matches the JSON digest.
 5. During a second run, stop the container while SfM or training is active.
    No `spirula`/`ffmpeg` GPU process and no requested output path may remain.
@@ -148,6 +158,10 @@ No GPU, container runtime, ffmpeg, or Spirula binary is used by unit tests:
 go test ./internal/reconstruct ./cmd/spirula-reconstruct
 ```
 
-The fake executor proves argv, video/frame branching, the pre-training quality
-gate, reference-only publication, hashing, and cancellation cleanup. A Unix
-unit assertion separately pins dedicated process-group cancellation.
+Prepared fake-executor regressions cover argv, video/frame branching, the
+pre-training quality gate, reference-only publication, hashing and cleanup.
+Linux publication cases cover late empty/nonempty directory, file and symlink
+collisions, two concurrent publishers, cancelled publication and immediate
+parent-symlink refusal. These synthetic cases do not prove native reconstruction,
+workspace confinement or crash recovery. A separate Linux assertion pins
+dedicated process-group setup; native cancellation acceptance remains separate.

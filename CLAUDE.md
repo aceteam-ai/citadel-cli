@@ -63,6 +63,14 @@ public endpoints and only the exact built-in Ollama endpoint; other private
 targets require grants, and hard-denied ranges cannot be granted. See
 `docs/workflow-llm-policy.md` for operator configuration and transport limits.
 
+`reconstruct.Runner` is the trusted-operator engine, not a registered dispatched
+job. `publishDirectory` owns its create-only Linux bundle rename; unsupported
+publication primitives fail closed. The remaining workspace, SPZ, container
+custody and signed-event boundaries for #1381 are tracked in
+`docs/reconstruct-splat-job.md`; helper source or historical GPU acceptance
+does not prove those boundaries. `publish_linux_test.go` pins late collisions
+and competing publishers with synthetic fake executors.
+
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
 advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,
