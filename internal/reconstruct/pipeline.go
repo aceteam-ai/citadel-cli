@@ -275,7 +275,7 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if err := os.Rename(ply, stagedPLY); err != nil {
 		return result, fmt.Errorf("reconstruct: stage final artifact: %w", err)
 	}
-	if err := os.Rename(publishDir, output); err != nil {
+	if err := publishDirectory(ctx, publishDir, output); err != nil {
 		return result, fmt.Errorf("reconstruct: atomically publish final artifact: %w", err)
 	}
 	published = true
