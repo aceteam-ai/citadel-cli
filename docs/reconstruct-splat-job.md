@@ -90,6 +90,13 @@ retained with any later image change. No source metadata is native validation.
 
 ## Acceptance ledger
 
+- Phase 1 source prepared: artifact sizes count the bytes actually hashed;
+  empty final artifacts are refused. Nonfinite tuning, overflowing/impossible
+  quality counts and percentages are rejected; SfM capture is a fixed-size
+  summary-tail ring with full upstream-write consumption. Synthetic regressions
+  cover these boundaries, including retained/lost summaries and hash cancellation.
+  They are NOT locally executed results. No safe publication/path guarantee is
+  inferred from this prerequisite, and the remaining phases are still required.
 - Prepared plan/source phases are not proof of a usable dispatched job.
 - Pending: accepted receipt action/units and paired backend owner; viewer SPZ
   version/axes, converter/tool/dependency pins and confined input limits/policy.
