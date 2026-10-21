@@ -96,7 +96,7 @@ func OpenLegacyPasscodeLockout(baseDir string) *Lockout {
 // lockoutMus serializes lockout read-modify-write per state file within this
 // process. It is keyed by path, not held per handle, because gate callers open a
 // fresh Vault/Lockout per check: a per-handle mutex would not serialize them.
-// Cross-process writers remain best-effort (#1395).
+// Cross-process state mutations additionally hold the persistent OS sidecar lock.
 var lockoutMus sync.Map // path -> *sync.Mutex
 
 func lockoutMutex(path string) *sync.Mutex {
@@ -122,11 +122,12 @@ func (l *Lockout) Attempt(check func() bool) error {
 		return err
 	}
 	if !check() {
-		recordFailureAt(l.path)
+		if err := recordFailureAt(l.path); err != nil {
+			return err
+		}
 		return ErrWrongPIN
 	}
-	recordSuccessAt(l.path)
-	return nil
+	return recordSuccessAt(l.path)
 }
 
 // Status returns the current node-wide lockout state.
@@ -147,7 +148,16 @@ func (l *Lockout) Reset() error {
 	mu := lockoutMutex(l.path)
 	mu.Lock()
 	defer mu.Unlock()
-	return writeLockoutAt(l.path, lockoutState{LastVerifiedAt: readLockoutAt(l.path, time.Now()).LastVerifiedAt, FailureTimes: []time.Time{}})
+	return withLockoutFile(l.path, func() error {
+		s, err := loadLockoutAt(l.path, time.Now())
+		if err != nil {
+			return err
+		}
+		return writeLockoutAt(l.path, lockoutState{
+			LastVerifiedAt: s.LastVerifiedAt,
+			FailureTimes:   []time.Time{},
+		})
+	})
 }
 
 // ResetIfPresent is Reset for a state file that exists; an absent file (no
@@ -182,20 +192,31 @@ func (v *Vault) readLockoutAt(now time.Time) lockoutState {
 }
 
 func readLockoutAt(path string, now time.Time) lockoutState {
+	s, _ := loadLockoutAt(path, now)
+	return s
+}
+
+// Status retains its best-effort snapshot API. Admission and mutations use the
+// error: an unreadable/corrupt counter is not an absent counter and must never
+// be replaced with a clean slate by a cooperating writer.
+func loadLockoutAt(path string, now time.Time) (lockoutState, error) {
 	var s lockoutState
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return normalizeLockout(s, now) // absent = clean slate
+		if errors.Is(err, fs.ErrNotExist) {
+			return normalizeLockout(s, now), nil
+		}
+		return normalizeLockout(s, now), err
 	}
-	_ = yaml.Unmarshal(data, &s)
-	return normalizeLockout(s, now)
+	err = yaml.Unmarshal(data, &s)
+	return normalizeLockout(s, now), err
 }
 
 // normalizeLockout is pure. Reading status never writes/migrates live state.
 // The next existing failure/success write persists the migration once: legacy
 // counts have unknown age, so conservatively seed them at that write's time.
-// Keep the old scalar in sync for older binaries; this does not make mixed-
-// version writers or concurrent processes safe (separate issue #1395).
+// Keep the old scalar in sync for older binaries; mixed-version writers that
+// do not use the OS sidecar lock are still outside the concurrency guarantee.
 func normalizeLockout(s lockoutState, now time.Time) lockoutState {
 	history := make([]time.Time, 0)
 	if s.FailureTimes == nil {
@@ -235,10 +256,9 @@ func writeLockoutAt(path string, s lockoutState) error {
 
 // checkLockedLocked returns ErrLockedOut if a lockout window is active. Read
 // fresh from disk so a lockout set by another process/surface is honored.
-// Caller holds kdfMu; the per-path lockout mutex is taken for the read. The
-// cross-process counter is best-effort node-wide (a benign race can
-// under-count under simultaneous multi-process attack, still bounded by the
-// KDF cost).
+// Caller holds kdfMu; the per-path lockout mutex is taken for the atomic-file
+// snapshot. The subsequent KDF never holds an OS lock. Processes already
+// admitted before another failure may finish; each mutation is serialized.
 func (v *Vault) checkLockedLocked() error {
 	mu := lockoutMutex(v.lockoutPath())
 	mu.Lock()
@@ -246,50 +266,64 @@ func (v *Vault) checkLockedLocked() error {
 	return checkLockedAt(v.lockoutPath())
 }
 
-func (v *Vault) recordFailureLocked() {
+func (v *Vault) recordFailureLocked() error {
 	mu := lockoutMutex(v.lockoutPath())
 	mu.Lock()
 	defer mu.Unlock()
-	recordFailureAt(v.lockoutPath())
+	return recordFailureAt(v.lockoutPath())
 }
 
-func (v *Vault) recordSuccessLocked() {
+func (v *Vault) recordSuccessLocked() error {
 	mu := lockoutMutex(v.lockoutPath())
 	mu.Lock()
 	defer mu.Unlock()
-	recordSuccessAt(v.lockoutPath())
+	return recordSuccessAt(v.lockoutPath())
 }
 
 // checkLockedAt, recordFailureAt and recordSuccessAt are the lockout rules
-// shared by every caller. The caller holds lockoutMutex(path).
+// shared by every caller. Production callers hold lockoutMutex(path).
+// Mutators independently hold the persistent OS lock for their entire RMW.
 func checkLockedAt(path string) error {
-	s := readLockoutAt(path, time.Now())
+	s, err := loadLockoutAt(path, time.Now())
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrLockoutUnavailable, err)
+	}
 	if !s.LockoutUntil.IsZero() && time.Now().Before(s.LockoutUntil) {
 		return &ErrLockedOut{Until: s.LockoutUntil}
 	}
 	return nil
 }
 
-func recordFailureAt(path string) {
-	now := time.Now()
-	s := readLockoutAt(path, now)
-	s.FailureTimes = append(s.FailureTimes, now)
-	s = normalizeLockout(s, now)
-	if s.FailedAttempts >= maxFreeAttempts {
-		if until := now.Add(backoff(s.FailedAttempts)); until.After(s.LockoutUntil) {
-			s.LockoutUntil = until
+func recordFailureAt(path string) error {
+	return withLockoutFile(path, func() error {
+		now := time.Now()
+		s, err := loadLockoutAt(path, now)
+		if err != nil {
+			return err
 		}
-	}
-	_ = writeLockoutAt(path, s)
+		s.FailureTimes = append(s.FailureTimes, now)
+		s = normalizeLockout(s, now)
+		if s.FailedAttempts >= maxFreeAttempts {
+			if until := now.Add(backoff(s.FailedAttempts)); until.After(s.LockoutUntil) {
+				s.LockoutUntil = until
+			}
+		}
+		return writeLockoutAt(path, s)
+	})
 }
 
-func recordSuccessAt(path string) {
+func recordSuccessAt(path string) error {
 	// Refresh the re-prompt anchor only. Recent guesses and any active lockout
 	// survive successes on every PIN surface sharing this persisted state.
-	now := time.Now()
-	s := readLockoutAt(path, now)
-	s.LastVerifiedAt = now
-	_ = writeLockoutAt(path, s)
+	return withLockoutFile(path, func() error {
+		now := time.Now()
+		s, err := loadLockoutAt(path, now)
+		if err != nil {
+			return err
+		}
+		s.LastVerifiedAt = now
+		return writeLockoutAt(path, s)
+	})
 }
 
 // backoff returns the lockout window for the given failure count: geometric

@@ -573,6 +573,14 @@ type WorkerJobHandler interface {
 
 ### Direct-Redis redelivery: XREADGROUP alone never retries anything (citadel #871, #998, #999)
 
+`nodevault.withLockoutFile` owns cross-process lockout state transactions.
+Failure/success/reset updates lock a persistent sidecar, not the atomically
+replaced YAML inode. `Lockout.Attempt` and vault unlock/rotation keep secret
+checks outside that OS lock, and refuse accounting/state-read failures rather
+than grant access without a recorded transaction. Read-only status remains a
+best-effort snapshot. See `docs/nodevault-cross-process-lockout.md` for the
+mixed-version and native-platform boundaries.
+
 `RedisSource.Nack` (`internal/worker/redis_source.go`) deliberately doesn't
 ACK, with a comment that reads "let it retry" -- but `XREADGROUP`'s `>` ID
 hands each message to the consumer group exactly ONCE and never again, not

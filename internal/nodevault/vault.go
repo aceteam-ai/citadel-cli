@@ -169,8 +169,8 @@ type Vault struct {
 	dir string
 
 	// kdfMu serializes Argon2id so N concurrent gate checks don't each spike
-	// 64 MiB simultaneously. Also guards lockout-state read-modify-write within
-	// this process.
+	// 64 MiB simultaneously on this handle. Lockout state mutations also use
+	// per-path mutexes and a persistent cross-process OS lock.
 	kdfMu sync.Mutex
 
 	// paramsOverride, when non-nil, replaces the default Argon2id cost. It is
@@ -290,11 +290,15 @@ func (v *Vault) ChangePIN(oldPIN, newPIN string, policy Policy, ackDataLoss bool
 	}
 	h, dek, err := v.unwrapLocked(oldPIN)
 	if err != nil {
-		v.recordFailureLocked()
+		if recordErr := v.recordFailureLocked(); recordErr != nil {
+			return recordErr
+		}
 		return err
 	}
 	defer zero(dek)
-	v.recordSuccessLocked()
+	if err := v.recordSuccessLocked(); err != nil {
+		return err
+	}
 
 	pepper, err := v.loadPepper()
 	if err != nil {
@@ -354,10 +358,15 @@ func (v *Vault) Unlock(pin string) (*Session, error) {
 	}
 	_, dek, err := v.unwrapLocked(pin)
 	if err != nil {
-		v.recordFailureLocked()
+		if recordErr := v.recordFailureLocked(); recordErr != nil {
+			return nil, recordErr
+		}
 		return nil, err
 	}
-	v.recordSuccessLocked()
+	if err := v.recordSuccessLocked(); err != nil {
+		zero(dek)
+		return nil, err
+	}
 	return newSession(dek), nil
 }
 

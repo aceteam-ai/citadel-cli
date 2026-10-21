@@ -14,7 +14,9 @@ Source-only DRAFT plan; existing PIN thresholds, rolling window, backoff and
    admission reads and the expensive secret check remain outside the OS
    transaction. Propagate transaction errors instead of issuing an unlocked
    session or silently granting a successful credential check after failure.
-   Read-only status remains an atomic-file snapshot and creates no sidecar.
+   Unreadable/corrupt state must refuse admission/mutations, not become a clean
+   slate under another user's UID. Read-only status retains its best-effort
+   atomic-file snapshot API and creates no sidecar.
 3. Add synthetic subprocess contention/count regressions, success/history and
    reset ordering checks, lock failure/refusal cases, and proof that a separate
    descriptor can lock the state while the expensive-check callback runs.
@@ -23,9 +25,11 @@ Source-only DRAFT plan; existing PIN thresholds, rolling window, backoff and
 This does not create globally serialized PIN admission or preempt an already
 running KDF. Concurrent processes admitted before a lockout may finish checks;
 every resulting failure must still be recorded. Uncooperative older writers
-do not use the sidecar and are outside the new guarantee. Existing state YAML
-parsing/read-error behavior, general vault/header rotation concurrency, hostile
-directory owners and remote/NFS lock semantics are not fixed by this slice.
+do not use the sidecar and are outside the new guarantee. General vault/header
+rotation concurrency, hostile directory owners, cross-UID state ownership
+repair and remote/NFS lock semantics are not fixed by this slice. Existing
+unreadable/corrupt state now refuses even a correct secret; recovery needs the
+operator's separate local-authority path, not a silent counter reset.
 Unsupported OSes must refuse mutations, not pretend to hold a kernel lock.
 Review the actual source/tests and exact CI head before claiming acceptance;
 Linux CI and cross-compilation do not establish native Windows/macOS behavior.
