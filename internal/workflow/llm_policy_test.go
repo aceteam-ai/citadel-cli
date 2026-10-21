@@ -67,6 +67,7 @@ func TestLLMPolicyInvalidEndpointsDoNotEchoInput(t *testing.T) {
 		"http://public.example:/private-marker", "http://public.example:0/private-marker",
 		"http://public.example:65536/private-marker", "http://public.example:abc/private-marker",
 		"http://[fe80::1%25eth0]/private-marker", "http://public.example/private marker",
+		"http://2001:4860:4860::8888:80/private-marker",
 		"http://public.example/private\nmarker", "http://public.example/%private-marker",
 		"http://*.example/private-marker", "http://public.example/" + strings.Repeat("x", maxLLMURLBytes),
 	} {

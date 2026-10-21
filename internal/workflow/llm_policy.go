@@ -147,7 +147,7 @@ func canonicalLLMEndpoint(raw string) (*url.URL, error) {
 		return nil, invalid
 	}
 	host, err := canonicalHTTPHost(u.Hostname())
-	if err != nil {
+	if err != nil || (strings.Contains(u.Hostname(), ":") && !strings.HasPrefix(u.Host, "[")) {
 		return nil, invalid
 	}
 	port := u.Port()

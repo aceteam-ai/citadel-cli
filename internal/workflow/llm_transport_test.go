@@ -45,7 +45,9 @@ func TestLLMActualConstructorPinsDNSAndPreservesRequest(t *testing.T) {
 	}))
 	defer server.Close()
 	var proxies atomic.Int32
-	proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { proxies.Add(1) }))
+	proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		proxies.Add(1)
+	}))
 	defer proxy.Close()
 	t.Setenv("HTTP_PROXY", proxy.URL)
 	t.Setenv("HTTPS_PROXY", proxy.URL)
@@ -87,7 +89,9 @@ func TestLLMActualConstructorPinsDNSAndPreservesRequest(t *testing.T) {
 
 func TestLLMZeroPolicyAndPayloadGrantsCannotReachLocalService(t *testing.T) {
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
 	defer server.Close()
 	node := llmTestNode(server.URL + "/api/chat")
 	node.Params["allow"] = []string{server.URL}
@@ -113,7 +117,9 @@ func TestLLMZeroPolicyAndPayloadGrantsCannotReachLocalService(t *testing.T) {
 
 func TestLLMExactLocalGrantRefusesRedirectAndKeepsStatusPrivate(t *testing.T) {
 	var targets atomic.Int32
-	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { targets.Add(1) }))
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targets.Add(1)
+	}))
 	defer target.Close()
 	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target.URL+"/private-marker", http.StatusTemporaryRedirect)
@@ -141,7 +147,9 @@ func TestLLMTransportKeepsTLSVerification(t *testing.T) {
 		t.Fatal("LLM transport weakened pinned routing or normal TLS trust")
 	}
 	var requests atomic.Int32
-	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
 	defer server.Close()
 	endpoint := server.URL + "/api/chat"
 	_, err = (&LLMNodeExecutor{policy: mustLLMPolicy(t, endpoint)}).Execute(context.Background(), llmTestNode(endpoint), map[string]any{"prompt": "private-marker"})
@@ -231,7 +239,9 @@ func TestLLMCallerCancellationDoesNotWaitForDetachedDial(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p := LLMPolicy{
-		resolve: func(context.Context, string) ([]netip.Addr, error) { return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil },
+		resolve: func(context.Context, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+		},
 		dial: func(context.Context, string, string) (net.Conn, error) {
 			close(started)
 			<-release // model net/http's detached connection attempt, no socket
