@@ -49,6 +49,10 @@ func main() {
 		{"film_mp4_self_contained", "cmd/template_builtin_video_compose.go", "binary.BigEndian.Uint32(data[16:20]) != 1", "false && binary.BigEndian.Uint32(data[16:20]) != 1", "./cmd", "TestVideoComposeMP4RejectsExternalReferences"},
 		{"film_probe_container", "cmd/template_builtin_video_compose.go", "if probe.Format.Name != \"mov,mp4,m4a,3gp,3g2,mj2\"", "if false && probe.Format.Name != \"mov,mp4,m4a,3gp,3g2,mj2\"", "./cmd", "TestVideoComposeProbeRejectsWrongContainer"},
 		{"film_poster_decoder", "cmd/template_builtin_video_compose.go", "\"-c:v\", \"png\", \"-i\", poster", "\"-c:v\", \"mjpeg\", \"-i\", poster", "./cmd", "TestVideoComposeReencodeAndPosterOverride"},
+		{"film_required_expectations", "internal/worker/run_job_template.go", "if req.TemplateKey == \"video-compose\" || runner.Handler == \"video-compose\"", "if false && (req.TemplateKey == \"video-compose\" || runner.Handler == \"video-compose\")", "./internal/worker", "TestRunJobTemplate_FilmRequiresEveryInputExpectationBeforeOps"},
+		{"film_expected_digest", "internal/jobs/template_contract.go", "if f.ExpectedSHA256 != \"\" && f.ExpectedSHA256 != digest", "if false && f.ExpectedSHA256 != \"\" && f.ExpectedSHA256 != digest", "./cmd", "TestLiveTemplateRunOps_FilmInputBindingRefusesBeforeBuiltin"},
+		{"film_expected_size", "internal/jobs/template_contract.go", "if f.ExpectedBytes != nil && *f.ExpectedBytes != size", "if false && f.ExpectedBytes != nil && *f.ExpectedBytes != size", "./cmd", "TestLiveTemplateRunOps_FilmInputBindingRefusesBeforeBuiltin"},
+		{"film_duplicate_expectations", "cmd/run_job_template_ops.go", "if err := f.VerifyExpectedContent(digest, size); err != nil", "if err := f.VerifyExpectedContent(digest, size); false && err != nil", "./cmd", "TestLiveTemplateRunOps_FilmInputBindingRefusesBeforeBuiltin"},
 	}
 	for _, m := range mutations {
 		source := filepath.Join(root, m.file)

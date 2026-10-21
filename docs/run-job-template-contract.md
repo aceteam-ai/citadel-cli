@@ -18,7 +18,7 @@ The platform sends string-valued payload fields:
 | `input_schema`, `output_schema` | JSON-encoded schema objects from that version |
 | `runner` | JSON object with exactly `kind` and `handler`, both exact strings |
 | `params` | JSON-encoded object validated against `input_schema`; omission means `{}` |
-| `input_files` | JSON-encoded array of `{path, node_id, node_path}`; omission means `[]` |
+| `input_files` | JSON-encoded array of `{path, node_id, node_path}` with optional `expected_sha256` and `expected_bytes`; omission means `[]` |
 
 The node recomputes SHA256 over `{template_key, version, input_schema, output_schema, runner}`
 using Python `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=True)`
@@ -49,6 +49,19 @@ or dispatched params through a different spelling with the same manifest hash.
 Every input must have `node_id` equal to the locally configured executing node
 and a canonical workspace-relative `node_path`. `path` must be that same relative
 path or `node:<node_id>/<node_path>`, matching platform `FileValue` references.
+The closed reference vocabulary also accepts `expected_sha256`, exactly
+`sha256:` followed by 64 lowercase hexadecimal digits, and `expected_bytes`,
+a nonnegative JSON integer fitting int64 (no strings, floats or exponent form).
+Present expectations are checked against the actual digest and byte count of
+the private staged snapshot before any builtin invocation. A mismatch fails the
+attempt and removes its staging/output namespace. Every repeated reference must
+match the snapshot even when the source path was already staged. Expectations
+remain optional and independently enforced for generic templates; both are
+mandatory on every input when the template key or builtin handler is
+`video-compose`, including `film.json`, every chapter and optional poster.
+The platform adapter must preserve these fields from approval to dispatch;
+recomputing them from a mutable source after approval does not bind approved
+content. A retry stages and checks the source anew using the same expectations.
 The node accepts at most 128 declared inputs and 4 GiB of declared input bytes
 per attempt. Repeated references count repeatedly toward the byte ceiling even
 though their snapshot is staged only once. Both limits are fixed execution
