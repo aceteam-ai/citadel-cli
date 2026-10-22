@@ -38,6 +38,8 @@ import shutil
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
+from load_diagnostics import Stage, bounded_byte_count, safe_exception_label
+
 logger = logging.getLogger(__name__)
 
 # Mirrors diskSafetyMarginBytes in internal/jobs/disk_space.go: headroom
@@ -49,9 +51,9 @@ DEFAULT_DISK_SAFETY_MARGIN_BYTES = 2 * 1024**3  # 2 GiB
 
 class InsufficientDiskSpaceError(RuntimeError):
     """Raised when the preflight confirms a download will not fit. Carries a
-    human-readable required-vs-available message (never just a bare number)
-    so a caller that surfaces the exception message verbatim (as app.py's
-    /generate handler does) still fails loud and clear."""
+    human-readable required-vs-available message for this preflight's callers.
+    The sidecar's load boundary classifies this type into a static disk-space
+    refusal; it does not echo the path-bearing message into HTTP or retries."""
 
 
 @dataclass(frozen=True)
@@ -263,6 +265,12 @@ def plan_disk_preflight(
     margin_bytes = max(margin_bytes, 0)
     needed = required_bytes + margin_bytes
     if available_bytes < needed:
+        logger.warning(
+            "diffusers preflight: disk refusal (stage=%s) required_bytes=%s available_bytes=%s margin_bytes=%s needed_bytes=%s",
+            Stage.DISK_PROBE.value, bounded_byte_count(required_bytes),
+            bounded_byte_count(available_bytes), bounded_byte_count(margin_bytes),
+            bounded_byte_count(needed),
+        )
         raise InsufficientDiskSpaceError(
             f"insufficient disk space at {dir_}: need {_human_bytes(needed)} "
             f"({_human_bytes(required_bytes)} estimated download + {_human_bytes(margin_bytes)} safety margin) "
@@ -436,9 +444,9 @@ def run_preflight(
         )
     except Exception as exc:  # noqa: BLE001 -- deliberate fail-open, see docstring
         logger.warning(
-            "diffusers preflight: could not estimate size for %s (%s) -- proceeding without a disk check",
+            "diffusers preflight: could not estimate size for %s -- proceeding without a disk check (stage=%s exception_class=%s)",
             repo_id,
-            exc,
+            Stage.ESTIMATE.value, safe_exception_label(exc),
         )
         return
 
@@ -453,9 +461,8 @@ def run_preflight(
         available_bytes = available_disk_bytes_fn(cache_dir)
     except Exception as exc:  # noqa: BLE001 -- same fail-open reasoning
         logger.warning(
-            "diffusers preflight: could not determine free disk space at %s (%s) -- proceeding without a disk check",
-            cache_dir,
-            exc,
+            "diffusers preflight: could not determine free disk space -- proceeding without a disk check (stage=%s exception_class=%s)",
+            Stage.DISK_PROBE.value, safe_exception_label(exc),
         )
         return
 
@@ -466,11 +473,10 @@ def run_preflight(
         # subset itself), so a confirmed shortfall here fails CLOSED.
         plan_disk_preflight(cache_dir, required_bytes, available_bytes, margin_bytes)
         logger.info(
-            "diffusers preflight: %s needs ~%s (filtered), %s free at %s -- proceeding",
+            "diffusers preflight: %s needs ~%s (filtered), %s free -- proceeding",
             repo_id,
             _human_bytes(required_bytes),
             _human_bytes(available_bytes),
-            cache_dir,
         )
         return
 
@@ -481,20 +487,18 @@ def run_preflight(
     if available_bytes < needed:
         logger.warning(
             "diffusers preflight: %s full-tree estimate (~%s) exceeds free space "
-            "(~%s free at %s), but no DIFFUSERS_ALLOW_PATTERNS/DIFFUSERS_IGNORE_PATTERNS "
+            "(~%s free), but no DIFFUSERS_ALLOW_PATTERNS/DIFFUSERS_IGNORE_PATTERNS "
             "is set -- from_pretrained only downloads its own component subset of the "
             "repo, which may still fit, so proceeding without refusing. Set one of "
             "those env vars to enable the disk-fill refusal guard for this repo.",
             repo_id,
             _human_bytes(required_bytes),
             _human_bytes(available_bytes),
-            cache_dir,
         )
     else:
         logger.info(
-            "diffusers preflight: %s needs ~%s (full-tree estimate), %s free at %s -- proceeding",
+            "diffusers preflight: %s needs ~%s (full-tree estimate), %s free -- proceeding",
             repo_id,
             _human_bytes(required_bytes),
             _human_bytes(available_bytes),
-            cache_dir,
         )
