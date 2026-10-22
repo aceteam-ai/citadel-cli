@@ -38,6 +38,14 @@ leaf open, and fails closed if the verified procfs FD route is unavailable.
 using owned fixtures, not real devices. This does not settle owner/hard-link
 policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
 
+`workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
+loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
+validation separately from the HTTP node. Both worker entrypoints load once via
+`workflowLLMPolicy`, so policy edits require a worker restart. The default permits
+public endpoints and only the exact built-in Ollama endpoint; other private
+targets require grants, and hard-denied ranges cannot be granted. See
+`docs/workflow-llm-policy.md` for operator configuration and transport limits.
+
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
 advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,
@@ -606,6 +614,17 @@ A gate refusal returned as a `*jobs.ShellRefusal` is terminal on the first
 delivery too (one error event, then Fail with the reason): SHELL_COMMAND, the
 desktop handlers, and WORKFLOW_RUN when its Shell gate refuses at submit. A
 Shell node refused mid-run fails the workflow as an ordinary failure.
+
+`workflow.Executor.Cancel` owns per-run context cancellation; a cancelled
+status records the request, not proof that a Shell process or callback exited.
+`Execution.Done` supplies executor/slot completion, which the workflow handler
+waits for before returning. That is not runner-level fencing:
+`worker.Runner.executeWithDeadline` can return before a normal-lane workflow
+handler exits. `workflowShellCombinedOutput` owns Linux/macOS cancellation
+through the full Wait and output drain; its numeric process-group signal is
+not identity-pinned containment. See `docs/workflow-cancellation.md` for the
+PID/group reuse, escaped-descendant and custody boundaries. Native Windows
+process-tree containment is not implied.
 
 The five desktop handlers (FILE_SCREENSHOT, VNC_SCREENSHOT, VNC_TYPE, VNC_KEYS,
 VNC_ACTIONS) honor the node passcode like SHELL_COMMAND, through
@@ -1576,6 +1595,17 @@ struct reopens the alternate-case bind hole even if today's approved schemas are
 closed.
 
 ## Important Implementation Notes
+
+### Passcode lockout transactions (citadel-cli#1395)
+
+`nodevault.withLockoutFile` owns cross-process lockout state transactions.
+Failure/success/reset updates lock a persistent sidecar, not the atomically
+replaced YAML inode. `Lockout.Attempt` and vault unlock/rotation keep secret
+checks outside that OS lock and refuse unavailable accounting. `Lockout.Status`
+reports unavailable state explicitly; only the local-presence `Lockout.Reset`
+may discard unreadable/corrupt history and its untrusted verification anchor.
+See `docs/nodevault-cross-process-lockout.md` for the mixed-version, ownership,
+publication-review and native-platform boundaries.
 
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,

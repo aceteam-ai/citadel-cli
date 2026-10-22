@@ -169,8 +169,8 @@ type Vault struct {
 	dir string
 
 	// kdfMu serializes Argon2id so N concurrent gate checks don't each spike
-	// 64 MiB simultaneously. Also guards lockout-state read-modify-write within
-	// this process.
+	// 64 MiB simultaneously on this handle. Lockout state mutations also use
+	// per-path mutexes and a persistent cross-process OS lock.
 	kdfMu sync.Mutex
 
 	// paramsOverride, when non-nil, replaces the default Argon2id cost. It is
@@ -290,11 +290,15 @@ func (v *Vault) ChangePIN(oldPIN, newPIN string, policy Policy, ackDataLoss bool
 	}
 	h, dek, err := v.unwrapLocked(oldPIN)
 	if err != nil {
-		v.recordFailureLocked()
+		if recordErr := v.recordFailureLocked(); recordErr != nil {
+			return recordErr
+		}
 		return err
 	}
 	defer zero(dek)
-	v.recordSuccessLocked()
+	if err := v.recordSuccessLocked(); err != nil {
+		return err
+	}
 
 	pepper, err := v.loadPepper()
 	if err != nil {
@@ -354,10 +358,15 @@ func (v *Vault) Unlock(pin string) (*Session, error) {
 	}
 	_, dek, err := v.unwrapLocked(pin)
 	if err != nil {
-		v.recordFailureLocked()
+		if recordErr := v.recordFailureLocked(); recordErr != nil {
+			return nil, recordErr
+		}
 		return nil, err
 	}
-	v.recordSuccessLocked()
+	if err := v.recordSuccessLocked(); err != nil {
+		zero(dek)
+		return nil, err
+	}
 	return newSession(dek), nil
 }
 
@@ -548,6 +557,12 @@ func writeHeaderAtomic(path string, h header) error {
 // writeFileAtomic writes to a temp file in the same dir, fsyncs it, and renames
 // over the target so a crash never leaves a half-written vault or pepper.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomicPrepared(path, data, mode, nil)
+}
+
+// The optional descriptor-only preparation is used only for lockout state.
+// Ordinary vault/header/pepper writers retain their existing nil-preparer path.
+func writeFileAtomicPrepared(path string, data []byte, mode os.FileMode, prepare func(*os.File, string) error) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("nodevault: create dir: %w", err)
@@ -566,6 +581,12 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := f.Chmod(mode); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("nodevault: chmod temp: %w", err)
+	}
+	if prepare != nil {
+		if err := prepare(f, dir); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("nodevault: prepare lockout temp: %w", err)
+		}
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()

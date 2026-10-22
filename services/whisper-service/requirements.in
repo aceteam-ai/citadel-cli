@@ -1,5 +1,9 @@
 # Runtime inputs for the hash-locked requirements.txt. Regenerate with the
 # exact command recorded in requirements.txt.
+# Explicit security pins: see SECURITY-LOCK-1406.md for primary-source evidence
+# and the unresolved full-resolver/native acceptance gates.
+certifi==2026.10.19
+pillow==13.0.0
 faster-whisper==1.2.1
 # faster-whisper 1.2.1 still passes metadata_errors= to av.open. PyAV 19
 # removed that keyword; keep the last compatible release until the merged
