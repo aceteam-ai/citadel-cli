@@ -37,6 +37,9 @@ for MEDIA_GENERATE inputs; its retention helpers never mutate execution data.
 closure so reflected diagnostic wrappers cannot traverse the original error.
 `jobprivacy.DeliveryError` owns pre-kind decoder diagnostic omission;
 `redisapi.decodeWSDelivery` preserves original frame observation capture.
+`redis.mediaACKClassifier` is an unregistered pure Go/Lua retention-parity
+preparation. It contains no Redis calls and is not ACK or deletion authority;
+shared-stream skip/owner semantics must be settled before wiring purge.
 `jobprivacy.CaptureMedia` owns the separate opaque execution/raw-byte copy;
 explicit projections preserve execution types and exact digest input, never
 derive execution authority from the passive delivery observer or raw-only data.

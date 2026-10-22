@@ -184,3 +184,31 @@ legacy compatibility. These tests do not prove actual stream deletion, complete
 wire/log/DLQ boundary coverage, a typed output path, paired API/WS purge or live
 acceptance. Complete the remaining retention audit and phases 4 and 5 before
 minting/dispatch. No handler/task activation is added by this change.
+
+### C2 phase 4 preparation: pure classifier, no deletion wiring
+
+`internal/redis/media_ack_classifier.lua` is an unregistered pure boolean
+retention predicate for an effective kind derived from the original stream
+entry. It contains no Redis calls, does not acknowledge or delete an entry, and
+cannot grant handler execution authority. The existing ACK paths are unchanged.
+
+Its iterative JSON grammar matches the Go private-media classifier, including
+root-only escaped/duplicate `inputs`, malformed/non-object envelopes, strict
+number syntax and the container nesting limit. It does not use cjson coercion
+or decode/retain prompt values. Valid legacy text objects preserve retention,
+including large strings, large valid number lexemes and surrogate spellings.
+These are classification rules, not new execution-parser allowances.
+
+Offline tests run the pinned existing Lua interpreter with only its string
+library. OS, IO, loading, network, cjson and Redis APIs are absent. Property tests
+compare its boolean to the actual Go classifier. The local fuzzer bounds its
+work size only; that is not a production envelope-size policy. This evidence is
+not real-Redis execution, atomicity, queue ownership or purge acceptance.
+
+Deletion wiring awaits the Citadel owner's design call: the current runner ACKs
+wrong-target deliveries on shared streams/per-node consumer groups. A generic
+private-media ACK+XDEL could remove that entry before the addressed node
+consumes it. Confirm the original queue/target and authenticated owner contract
+before wiring deletion; do not add caller-supplied kind/purge flags or infer
+authority from this predicate. Paired API/WS purge, exact composed verification,
+independent review and all ship/minting/native/human gates remain required.
