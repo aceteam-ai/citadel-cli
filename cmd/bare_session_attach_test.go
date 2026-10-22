@@ -30,6 +30,8 @@ func bareAbsentDependencies() bareSessionDependencies {
 
 func runBareNoOwnerFixture(t *testing.T, cmd *cobra.Command, present bool) {
 	t.Helper()
+	// Direct fixture calls do not pass through Cobra Execute's context setup.
+	cmd.SetContext(context.Background())
 	dependencies := bareAbsentDependencies()
 	dependencies.observePresence = func(string) (bool, error) { return present, nil }
 	dependencies.dispatch = dispatchBareCitadel
@@ -63,7 +65,9 @@ func TestBareExistingSessionAttachesBeforeEnrollmentOrStartup(t *testing.T) {
 		}
 		return nil
 	}
-	if err := runBareSessionSelection(&cobra.Command{Use: "citadel"}, nil, dependencies); err != nil || resolutions != 1 || requests != 1 || viewers != 1 {
+	command := &cobra.Command{Use: "citadel"}
+	command.SetContext(context.Background())
+	if err := runBareSessionSelection(command, nil, dependencies); err != nil || resolutions != 1 || requests != 1 || viewers != 1 {
 		t.Fatal("existing-session selection did not remain read-only and single-target")
 	}
 }
@@ -112,7 +116,9 @@ func TestBareSelectionRefusesEveryUnknownWithoutStartup(t *testing.T) {
 					return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body))}, nil
 				}
 			}
-			err := runBareSessionSelection(&cobra.Command{Use: "citadel"}, nil, dependencies)
+			command := &cobra.Command{Use: "citadel"}
+			command.SetContext(context.Background())
+			err := runBareSessionSelection(command, nil, dependencies)
 			if err != errSessionViewUnavailable || strings.Contains(err.Error(), "private-path-or-credential") {
 				t.Fatal("unknown selection did not produce only the fixed refusal")
 			}
@@ -149,6 +155,7 @@ func TestBareNoOwnerUsesCheckedPresenceAndStartsLegacyOncePerInvocation(t *testi
 		sequence = append(sequence, "dispatch")
 	}
 	command := &cobra.Command{Use: "citadel"}
+	command.SetContext(context.Background())
 	for invocation := 0; invocation < 2; invocation++ {
 		if err := runBareSessionSelection(command, nil, dependencies); err != nil {
 			t.Fatal(err)
