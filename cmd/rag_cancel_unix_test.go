@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,22 +24,56 @@ import (
 )
 
 const ragSIGINTHelperEnv = "CITADEL_TEST_RAG_SIGINT_HELPER"
+const ragSIGINTCancelObserved = "CITADEL_TEST_RAG_SOFT_CANCEL_OBSERVED\n"
 
 type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
+	mu             sync.Mutex
+	b              bytes.Buffer
+	cancelObserved chan struct{}
+	cancelOnce     sync.Once
 }
 
 func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.Write(p)
+	n, err := b.b.Write(p)
+	// exec's pipe copier can split the child's acknowledgment across writes.
+	if b.cancelObserved != nil && strings.Contains(b.b.String(), ragSIGINTCancelObserved) {
+		b.cancelOnce.Do(func() { close(b.cancelObserved) })
+	}
+	return n, err
 }
 
 func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.b.String()
+}
+
+func TestRAGSIGINTAcknowledgmentSurvivesSplitWrites(t *testing.T) {
+	observed := make(chan struct{})
+	output := lockedBuffer{cancelObserved: observed}
+	parts := []string{"ordinary child output\n", ragSIGINTCancelObserved[:12], ragSIGINTCancelObserved[12:]}
+	for i, part := range parts {
+		if n, err := output.Write([]byte(part)); err != nil || n != len(part) {
+			t.Fatalf("write %d: n=%d err=%v", i, n, err)
+		}
+		select {
+		case <-observed:
+			if i != len(parts)-1 {
+				t.Fatal("acknowledgment reported before the complete marker")
+			}
+		default:
+			if i == len(parts)-1 {
+				t.Fatal("complete split acknowledgment was not observed")
+			}
+		}
+	}
+	// A repeated marker must not panic by closing the channel twice.
+	_, _ = output.Write([]byte(ragSIGINTCancelObserved))
+	if got, want := output.String(), strings.Join(parts, "")+ragSIGINTCancelObserved; got != want {
+		t.Fatalf("child output changed: got %q, want %q", got, want)
+	}
 }
 
 func TestRunRAGIndexProgrammaticCancellationRemainsHard(t *testing.T) {
@@ -73,6 +108,16 @@ func TestRAGIndexSIGINTHelper(t *testing.T) {
 	}
 	ragJSON = true
 	ragFilePattern = ""
+	notify := ragIndexNotifyContext
+	ragIndexNotifyContext = func(parent context.Context, signals ...os.Signal) (context.Context, context.CancelFunc) {
+		softCtx, stop := notify(parent, signals...)
+		go func() {
+			<-softCtx.Done()
+			_, _ = fmt.Fprint(os.Stdout, ragSIGINTCancelObserved)
+		}()
+		return softCtx, stop
+	}
+	t.Cleanup(func() { ragIndexNotifyContext = notify })
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
 	if err := runRAGIndex(cmd, []string{os.Getenv("CITADEL_WORKSPACE")}); err != nil {
@@ -139,7 +184,8 @@ func TestRAGIndexOwnedChildSIGINTCommitsCurrentFile(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var output lockedBuffer
+	cancelObserved := make(chan struct{})
+	output := lockedBuffer{cancelObserved: cancelObserved}
 	child.Stdout = &output
 	child.Stderr = &output
 	if err := child.Start(); err != nil {
@@ -179,6 +225,17 @@ func TestRAGIndexOwnedChildSIGINTCommitsCurrentFile(t *testing.T) {
 	}
 	if err := child.Process.Signal(os.Interrupt); err != nil {
 		t.Fatalf("signal owned child: %v", err)
+	}
+	// Signal returning only confirms delivery to the process. Keep the first
+	// file's embedding blocked until the actual indexer's soft context is done.
+	select {
+	case <-cancelObserved:
+	case waitErr = <-done:
+		joined = true
+		t.Fatalf("owned child exited before acknowledging cancellation: %v\n%s", waitErr, output.String())
+	case <-ctx.Done():
+		_ = join(true)
+		t.Fatalf("owned child never observed SIGINT cancellation: %v\n%s", ctx.Err(), output.String())
 	}
 	releaseOnce.Do(func() { close(release) })
 	select {
