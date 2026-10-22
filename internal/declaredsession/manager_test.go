@@ -9,11 +9,16 @@ import (
 
 func managerRecordFixture() (State, Hello, procscope.Observation) {
 	state := State{
-		Version: 1, Name: "fixture", Incarnation: strings.Repeat("a", 32),
-		Holder: ProcessIdentity{PID: 42, StartTicks: 99, UID: 1000, BootID: "boot"},
-		Scope: ScopeIdentity{Name: "citadel-sess-fixture.scope", Manager: "user", InvocationID: strings.Repeat("1", 32), ControlGroup: "/user.slice/citadel-sess-fixture.scope"},
-		ProtocolVersion: ProtocolVersion, BinaryVersion: "test-version", DeclarationRevision: digest([]byte("declaration")),
-		Phase: "running", Guarantee: "verified_user_scope",
+		Version:             1,
+		Name:                "fixture",
+		Incarnation:         strings.Repeat("a", 32),
+		Holder:              ProcessIdentity{PID: 42, StartTicks: 99, UID: 1000, BootID: "boot"},
+		Scope:               ScopeIdentity{Name: "citadel-sess-fixture.scope", Manager: "user", InvocationID: strings.Repeat("1", 32), ControlGroup: "/user.slice/citadel-sess-fixture.scope"},
+		ProtocolVersion:     ProtocolVersion,
+		BinaryVersion:       "test-version",
+		DeclarationRevision: digest([]byte("declaration")),
+		Phase:               "running",
+		Guarantee:           "verified_user_scope",
 	}
 	hello := Hello{ProtocolVersion: ProtocolVersion, BinaryVersion: state.BinaryVersion, Name: state.Name, Incarnation: state.Incarnation, Holder: state.Holder, Scope: state.Scope, DeclarationRevision: state.DeclarationRevision, Phase: state.Phase}
 	observation := procscope.Observation{Scope: scopeFromState(state), Active: true, Members: []procscope.ProcessIdentity{processToScope(state.Holder)}}
@@ -26,13 +31,27 @@ func TestManagerRequiresSocketRecordAndLiveScopeIdentityTogether(t *testing.T) {
 		t.Fatal("exact live identity refused")
 	}
 	for _, mutate := range []func(*State, *Hello, *procscope.Observation){
-		func(s *State, h *Hello, o *procscope.Observation) { h.Incarnation = strings.Repeat("b", 32) },
-		func(s *State, h *Hello, o *procscope.Observation) { h.Holder.StartTicks++ },
-		func(s *State, h *Hello, o *procscope.Observation) { h.Scope.InvocationID = strings.Repeat("2", 32) },
-		func(s *State, h *Hello, o *procscope.Observation) { o.Scope.InvocationID = strings.Repeat("2", 32) },
-		func(s *State, h *Hello, o *procscope.Observation) { o.Members = nil },
-		func(s *State, h *Hello, o *procscope.Observation) { s.Holder.UID = 0 },
-		func(s *State, h *Hello, o *procscope.Observation) { h.ProtocolVersion++ },
+		func(s *State, h *Hello, o *procscope.Observation) {
+			h.Incarnation = strings.Repeat("b", 32)
+		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			h.Holder.StartTicks++
+		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			h.Scope.InvocationID = strings.Repeat("2", 32)
+		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			o.Scope.InvocationID = strings.Repeat("2", 32)
+		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			o.Members = nil
+		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			s.Holder.UID = 0
+		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			h.ProtocolVersion++
+		},
 	} {
 		live, peer, observed := managerRecordFixture()
 		mutate(&live, &peer, &observed)

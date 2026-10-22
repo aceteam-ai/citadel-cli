@@ -40,12 +40,12 @@ func (r *replayRing) snapshot() []replayChunk {
 }
 
 type holderViewer struct {
-	id       string
-	ceiling  bool // immutable requested/policy readonly ceiling
-	queue    chan wireFrame
-	cancel   context.CancelFunc
-	cols     uint16
-	rows     uint16
+	id      string
+	ceiling bool // immutable requested/policy readonly ceiling
+	queue   chan wireFrame
+	cancel  context.CancelFunc
+	cols    uint16
+	rows    uint16
 }
 
 type holderRequest struct {

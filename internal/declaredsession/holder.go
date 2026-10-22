@@ -42,9 +42,9 @@ type holderLogs interface {
 }
 
 type cleanupResult struct {
-	exit     Exit
-	err      error
-	noChild  bool
+	exit    Exit
+	err     error
+	noChild bool
 }
 
 type holder struct {

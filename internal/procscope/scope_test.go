@@ -19,8 +19,12 @@ type fakeScopeBackend struct {
 func (b *fakeScopeBackend) ByName(context.Context, string) (ScopeIdentity, bool, error) {
 	return b.identity, true, nil
 }
-func (b *fakeScopeBackend) Pin(context.Context, ScopeIdentity) error   { return b.pinErr }
-func (b *fakeScopeBackend) Check(context.Context, ScopeIdentity) error { return b.checkErr }
+func (b *fakeScopeBackend) Pin(context.Context, ScopeIdentity) error {
+	return b.pinErr
+}
+func (b *fakeScopeBackend) Check(context.Context, ScopeIdentity) error {
+	return b.checkErr
+}
 func (b *fakeScopeBackend) Stop(context.Context, ScopeIdentity) error {
 	b.stopCalls++
 	return b.stopErr
@@ -34,10 +38,21 @@ func scopeFixture() (scopeOps, *fakeScopeBackend, ProcessIdentity) {
 	process := ProcessIdentity{PID: 42, StartTicks: 999, UID: 1000, BootID: "a-boot"}
 	backend := &fakeScopeBackend{identity: ScopeIdentity{Name: "citadel-sess-agent.scope", InvocationID: "11111111111111111111111111111111", ControlGroup: "/user.slice/user-1000.slice/user@1000.service/citadel-sess-agent.scope", UID: 1000}}
 	ops := scopeOps{
-		uid: func() uint32 { return 1000 }, self: func() int { return 42 },
-		process: func(int) (ProcessIdentity, string, error) { return process, backend.identity.ControlGroup, nil },
-		members: func(context.Context, string) ([]ProcessIdentity, error) { return []ProcessIdentity{process}, nil },
-		connect: func(context.Context, uint32) (scopeBackend, error) { return backend, nil },
+		uid: func() uint32 {
+			return 1000
+		},
+		self: func() int {
+			return 42
+		},
+		process: func(int) (ProcessIdentity, string, error) {
+			return process, backend.identity.ControlGroup, nil
+		},
+		members: func(context.Context, string) ([]ProcessIdentity, error) {
+			return []ProcessIdentity{process}, nil
+		},
+		connect: func(context.Context, uint32) (scopeBackend, error) {
+			return backend, nil
+		},
 	}
 	return ops, backend, process
 }
@@ -82,10 +97,20 @@ func TestVerifiedScopeRefusesWorkerDescendantAndIdentityChanges(t *testing.T) {
 	}
 	_ = proof.Close()
 	for _, change := range []func(*scopeOps, *fakeScopeBackend){
-		func(o *scopeOps, b *fakeScopeBackend) { b.identity.ControlGroup = spec.OriginControlGroup + "/" + spec.Unit },
-		func(o *scopeOps, b *fakeScopeBackend) { o.uid = func() uint32 { return 0 } },
-		func(o *scopeOps, b *fakeScopeBackend) { b.pinErr = ErrUnknown },
-		func(o *scopeOps, b *fakeScopeBackend) { b.checkErr = ErrUnknown },
+		func(o *scopeOps, b *fakeScopeBackend) {
+			b.identity.ControlGroup = spec.OriginControlGroup + "/" + spec.Unit
+		},
+		func(o *scopeOps, b *fakeScopeBackend) {
+			o.uid = func() uint32 {
+				return 0
+			}
+		},
+		func(o *scopeOps, b *fakeScopeBackend) {
+			b.pinErr = ErrUnknown
+		},
+		func(o *scopeOps, b *fakeScopeBackend) {
+			b.checkErr = ErrUnknown
+		},
 		func(o *scopeOps, b *fakeScopeBackend) {
 			calls := 0
 			before := o.process
@@ -160,8 +185,12 @@ func TestStopNeedsActualEmptyScopeAndOldBirthGone(t *testing.T) {
 		t.Fatal("exact stop was not attempted once")
 	}
 	ops, backend, self = scopeFixture()
-	ops.members = func(context.Context, string) ([]ProcessIdentity, error) { return nil, nil }
-	ops.process = func(int) (ProcessIdentity, string, error) { return ProcessIdentity{}, "", ErrProcessGone }
+	ops.members = func(context.Context, string) ([]ProcessIdentity, error) {
+		return nil, nil
+	}
+	ops.process = func(int) (ProcessIdentity, string, error) {
+		return ProcessIdentity{}, "", ErrProcessGone
+	}
 	if err := stopExact(context.Background(), backend.identity, self, ops); err != nil {
 		t.Fatal(err)
 	}
@@ -173,15 +202,21 @@ func TestStopNeedsActualEmptyScopeAndOldBirthGone(t *testing.T) {
 func TestAlreadyGoneInvocationNeverFallsBackToNameStop(t *testing.T) {
 	ops, backend, self := scopeFixture()
 	backend.pinErr, backend.checkErr = ErrScopeGone, ErrScopeGone
-	ops.members = func(context.Context, string) ([]ProcessIdentity, error) { return nil, nil }
-	ops.process = func(int) (ProcessIdentity, string, error) { return ProcessIdentity{}, "", ErrProcessGone }
+	ops.members = func(context.Context, string) ([]ProcessIdentity, error) {
+		return nil, nil
+	}
+	ops.process = func(int) (ProcessIdentity, string, error) {
+		return ProcessIdentity{}, "", ErrProcessGone
+	}
 	if err := stopExact(context.Background(), backend.identity, self, ops); err != nil {
 		t.Fatal(err)
 	}
 	if backend.stopCalls != 0 {
 		t.Fatal("gone invocation triggered destructive retry")
 	}
-	ops.process = func(int) (ProcessIdentity, string, error) { return self, "", nil }
+	ops.process = func(int) (ProcessIdentity, string, error) {
+		return self, "", nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if !errors.Is(stopExact(ctx, backend.identity, self, ops), ErrUnknown) {

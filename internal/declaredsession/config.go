@@ -37,11 +37,13 @@ func ValidateName(name string) error {
 
 func defaultDeclaration() Declaration {
 	return Declaration{
-		Mode: "interactive", Enabled: true,
-		Restart: RestartPolicy{Policy: "on-failure", MinSeconds: 1, MaxSeconds: 300, ResetAfter: 600},
-		Attach: AttachPolicy{Local: "interactive", Web: "readonly", MaxViewers: 4},
-		ScrollbackBytes: 262144, Log: LogPolicy{RotateBytes: 16777216, Keep: 5},
-		AceTeam: AceTeamPolicy{Register: true},
+		Mode:            "interactive",
+		Enabled:         true,
+		Restart:         RestartPolicy{Policy: "on-failure", MinSeconds: 1, MaxSeconds: 300, ResetAfter: 600},
+		Attach:          AttachPolicy{Local: "interactive", Web: "readonly", MaxViewers: 4},
+		ScrollbackBytes: 262144,
+		Log:             LogPolicy{RotateBytes: 16777216, Keep: 5},
+		AceTeam:         AceTeamPolicy{Register: true},
 	}
 }
 

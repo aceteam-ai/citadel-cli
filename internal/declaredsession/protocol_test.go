@@ -29,12 +29,24 @@ func (m *memoryConnection) Read(p []byte) (int, error) {
 func (m *memoryConnection) Write(p []byte) (int, error) {
 	return m.output.Write(p)
 }
-func (*memoryConnection) Close() error { return nil }
-func (*memoryConnection) LocalAddr() net.Addr { return memoryAddress{} }
-func (*memoryConnection) RemoteAddr() net.Addr { return memoryAddress{} }
-func (*memoryConnection) SetDeadline(time.Time) error { return nil }
-func (*memoryConnection) SetReadDeadline(time.Time) error { return nil }
-func (*memoryConnection) SetWriteDeadline(time.Time) error { return nil }
+func (*memoryConnection) Close() error {
+	return nil
+}
+func (*memoryConnection) LocalAddr() net.Addr {
+	return memoryAddress{}
+}
+func (*memoryConnection) RemoteAddr() net.Addr {
+	return memoryAddress{}
+}
+func (*memoryConnection) SetDeadline(time.Time) error {
+	return nil
+}
+func (*memoryConnection) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (*memoryConnection) SetWriteDeadline(time.Time) error {
+	return nil
+}
 
 func TestFramingRejectsAmbiguitySizeVersionAndTruncation(t *testing.T) {
 	bad := []string{

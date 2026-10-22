@@ -33,8 +33,12 @@ func fakeBus(t *testing.T) (*userScopeBus, *fakeScopeTransport) {
 	return &userScopeBus{transport: transport, owner: transport.owner, uid: 1000}, transport
 }
 
-func (f *fakeScopeTransport) Context() context.Context { return f.ctx }
-func (f *fakeScopeTransport) Connected() bool          { return f.ctx.Err() == nil }
+func (f *fakeScopeTransport) Context() context.Context {
+	return f.ctx
+}
+func (f *fakeScopeTransport) Connected() bool {
+	return f.ctx.Err() == nil
+}
 func (f *fakeScopeTransport) Close() error {
 	f.cancel()
 	return nil
@@ -44,14 +48,18 @@ func (f *fakeScopeTransport) WatchJobs(_ context.Context, owner string, signals 
 		return nil, ErrUnknown
 	}
 	f.watching, f.signals = true, signals
-	return func() { f.watching = false }, nil
+	return func() {
+		f.watching = false
+	}, nil
 }
 
 func (f *fakeScopeTransport) Call(ctx context.Context, destination string, object dbus.ObjectPath, method string, args ...any) *dbus.Call {
 	if ctx.Err() != nil {
 		return &dbus.Call{Err: ctx.Err()}
 	}
-	reply := func(value any) *dbus.Call { return &dbus.Call{Body: []any{value}} }
+	reply := func(value any) *dbus.Call {
+		return &dbus.Call{Body: []any{value}}
+	}
 	if method == "org.freedesktop.DBus.GetNameOwner" {
 		return reply(f.owner)
 	}

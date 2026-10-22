@@ -37,9 +37,9 @@ type managerSocket struct {
 }
 
 type managerOps struct {
-	inspect func(context.Context, string) (procscope.Observation, error)
-	process func(int) (procscope.ProcessIdentity, error)
-	stop    func(context.Context, procscope.ScopeIdentity, procscope.ProcessIdentity) error
+	inspect      func(context.Context, string) (procscope.Observation, error)
+	process      func(int) (procscope.ProcessIdentity, error)
+	stop         func(context.Context, procscope.ScopeIdentity, procscope.ProcessIdentity) error
 	dial         func(context.Context, *SessionStore) (managerPeer, error)
 	socket       func(*SessionStore) (managerSocket, error)
 	removeSocket func(*SessionStore, managerSocket) error
