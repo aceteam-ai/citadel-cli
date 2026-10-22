@@ -16,13 +16,12 @@ heavy-lane handlers; WORKFLOW_RUN does not declare that lane. The runner can
 publish terminal failure and acknowledge the job before this handler returns.
 This change does not add runner-level exit fencing or alter scheduling lanes.
 
-Linux/macOS Shell commands get a dedicated process group. The current
-CommandContext cancellation hook targets that group, not just `/bin/sh`, while
-the direct shell is still being waited on. There is an unresolved gap: once
-the shell is reaped, an ordinary background child can retain the output pipe
-while the CommandContext watcher has stopped. Cancellation and run timeout do
-not then invoke the group hook. See the repair constraints below; dedicated
-group creation alone is not proof that this case is fixed.
+Linux/macOS Shell commands get a dedicated process group.
+`workflowShellCombinedOutput` owns cancellation through the complete `Cmd.Wait`,
+including the output drain after the direct shell has been reaped. Cancellation
+targets that group, not just `/bin/sh`, so an ordinary background child holding
+the output pipe remains reachable. The built-in CommandContext watcher is
+disabled deliberately; its pre-start cancelled-context check is retained.
 
 Context errors remain failures instead of becoming successful outputs with a
 negative exit code. Normal nonzero command exits preserve their existing
@@ -39,35 +38,36 @@ separate containment/custody design; do not infer their exit from this signal.
 Windows/other platforms retain the existing /bin/sh requirement and parent
 CommandContext behavior; no native Windows process-tree guarantee is added.
 
-## Retained-output cancellation repair constraints
+## Retained-output cancellation and its limits
 
-Any repair must keep cancellation observable through the entire output drain,
-including after the shell exits. An arbitrary pipe wait deadline is not an
-exit proof and would truncate legitimate late background output on normal
-completion. A watcher that signals a numeric process group after reaping its
-leader also needs explicit protection against PID/group reuse.
+The helper starts exactly one `Cmd.Wait` goroutine and watches that result and
+the context in the calling goroutine. A completed Wait is preferred when both
+signals are ready. Otherwise cancellation sends one process-group SIGKILL and
+then waits for the sole Wait result, even if signalling fails. No watcher can
+send a later group signal after the helper returns. A start failure creates no
+Wait goroutine. The shared output buffer is read only after Wait has finished
+its output copying.
 
-The proposed Linux design retains the direct child without reaping it until
-the output pipe has reached EOF, observes exit without reaping through
-`waitid` with `WEXITED` and `WNOWAIT`, joins the cancellation watcher, and only
-then calls the sole `Cmd.Wait`. This preserves the leader's PID while group
-signalling is possible. It requires exclusive wait ownership of that child;
-no global reaper may consume it. Interrupted observations must retry. Start,
-pipe, observer and signal failures need explicit cleanup and custody behavior,
-never a successful fallback that silently loses the identity anchor.
+There is no pipe wait deadline, forced descriptor close or `WaitDelay` that
+would truncate legitimate late output from an uncancelled background writer.
+Nonzero command exits preserve their existing contract. A failed group signal
+does not fabricate completion: the helper can remain blocked in Wait until the
+owned command and its output copying actually finish.
 
-This is a proposal, not implemented behavior. Darwin cannot blindly reuse the
-Linux observer: Go's `os/wait_waitid.go` records a Darwin waitid issue where a
-stopped process can appear waitable. A platform-specific, non-reaping exit
-observer and its registration/exit race need separate review. Neither native
-macOS nor Windows acceptance follows from cross-compilation.
+This is bounded process-group cancellation, not identity-pinned containment.
+A live ordinary group member retains the process-group ID after the shell is
+reaped. Once all original group members are gone, however, that numeric ID can
+be reused. Cancellation racing natural completion can therefore signal a new
+group with the same ID. If a descendant escapes the original group while
+retaining the output pipe, this reuse window can extend for the remaining
+drain. The helper's completed-result preference reduces unnecessary signals
+but does not eliminate this race. No zero-reuse-risk or escaped-child exit
+guarantee is claimed. Stronger containment requires a separate design.
 
-Regressions must include a shell that exits immediately while a same-group
-child retains the output pipe, covering both explicit cancellation and run
-timeout. Observe the original shell's unreaped exited state before triggering
-cancellation; a fixed sleep is not that barrier. Preserve PID and birth-time
-identity for cleanup. A successful uncancelled background writer must retain
-its complete output. Fake ordering tests must verify watcher shutdown before
-reaping, EOF and exit-observation ordering, interrupted observations, and
-start/observer/signal error cleanup without claiming escaped descendants are
-contained.
+Regression fixtures include an original shell observed actually reaped while a
+same-group child retains the output pipe, covering explicit cancellation and
+run timeout. PID and birth-time identity constrain fixture cleanup. A normal
+background writer covers complete delayed output. Fake ordering fixtures cover
+completed-result preference, signal failure and waiting for actual Wait
+completion. These source fixtures are not native macOS or Windows acceptance;
+cross-compilation cannot establish either platform's process behavior.

@@ -153,3 +153,123 @@ func TestExecutorCancelStopsOwnedSleepingShellAndChild(t *testing.T) {
 		})
 	}
 }
+
+func awaitOwnedWorkflowShellReaped(t *testing.T, leader ownedWorkflowProcess, child ownedWorkflowProcess) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current, err := readOwnedWorkflowProcess(leader.pid)
+		if os.IsNotExist(err) || err == nil && current.start != leader.start {
+			background, err := readOwnedWorkflowProcess(child.pid)
+			if err != nil || background.start != child.start || background.group != leader.pid || background.state == "Z" || background.state == "X" {
+				t.Fatal("original pipe-holding background child did not survive shell reap")
+			}
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-timer.C:
+			t.Fatal("owned shell was not actually reaped before cancellation")
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestExecutorCancellationAfterShellReapStopsPipeHoldingChild(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		t.Run(fmt.Sprintf("timeout=%v", timeout), func(t *testing.T) {
+			base := t.TempDir()
+			marker := filepath.Join(base, "owned-pids")
+			release := filepath.Join(base, "release-shell")
+			quote := func(path string) string { return "'" + strings.ReplaceAll(path, "'", "'\\''") + "'" }
+			command := "sleep 60 & printf '%s %s' \"$$\" \"$!\" > " + quote(marker) +
+				"; while [ ! -f " + quote(release) + " ]; do sleep 0.01; done; echo started"
+			e := NewExecutor(ExecutorConfig{
+				DefaultTimeout: 10 * time.Second,
+				Shell:          ShellConfig{Gate: passcodeGate(true), WorkspaceDir: base},
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			run, err := e.Submit(ctx, &RunRequest{Graph: shellGraph(command), Passcode: testPasscode})
+			if err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			var owned []ownedWorkflowProcess
+			t.Cleanup(func() {
+				cancel()
+				for i := len(owned) - 1; i >= 0; i-- {
+					process := owned[i]
+					if current, err := readOwnedWorkflowProcess(process.pid); err == nil && current.start == process.start {
+						_ = syscall.Kill(process.pid, syscall.SIGKILL)
+					}
+				}
+				select {
+				case <-run.Done():
+				case <-time.After(5 * time.Second):
+					t.Error("owned background fixture did not finish cleanup")
+				}
+			})
+			awaitOwnedWorkflowSleeper(t, marker, 2, &owned)
+			if err := os.WriteFile(release, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			awaitOwnedWorkflowShellReaped(t, owned[0], owned[1])
+			select {
+			case <-run.Done():
+				t.Fatal("run completed while the original child still held its output pipe")
+			default:
+			}
+			if !timeout && !e.Cancel(run.ID) {
+				t.Fatal("running pipe-holding child was not cancelled")
+			}
+			wait := 2 * time.Second
+			if timeout {
+				wait = 12 * time.Second
+			}
+			select {
+			case <-run.Done():
+			case <-time.After(wait):
+				t.Fatal("cancel or run timeout did not stop the pipe-holding child")
+			}
+			want := StatusCancelled
+			if timeout {
+				want = StatusFailed
+			}
+			if run.Snapshot().Status != want || e.ActiveCount() != 0 {
+				t.Fatal("cancel/timeout was overwritten or retained its executor slot")
+			}
+			child, err := readOwnedWorkflowProcess(owned[1].pid)
+			if err == nil && child.start == owned[1].start && child.state != "Z" && child.state != "X" {
+				t.Fatal("original background child survived cancellation")
+			}
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestExecutorUncancelledBackgroundWriterKeepsCompleteOutput(t *testing.T) {
+	e := NewExecutor(ExecutorConfig{
+		DefaultTimeout: 10 * time.Second,
+		Shell:          ShellConfig{Gate: passcodeGate(true)},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	run, err := e.Submit(ctx, &RunRequest{
+		Graph: shellGraph("printf 'started-'; (sleep 0.05; printf 'late-output') & exit 0"), Passcode: testPasscode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitWorkflowSignal(t, run.Done())
+	snapshot := run.Snapshot()
+	if snapshot.Status != StatusCompleted || snapshot.Output["stdout"] != "started-late-output" || e.ActiveCount() != 0 {
+		t.Fatal("ordinary background output was truncated or treated as cancelled")
+	}
+}

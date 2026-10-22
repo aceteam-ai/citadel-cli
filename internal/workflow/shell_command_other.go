@@ -12,3 +12,7 @@ func newWorkflowShellCommand(ctx context.Context, command string) *exec.Cmd {
 	// Windows process-tree containment implementation or native acceptance.
 	return exec.CommandContext(ctx, "/bin/sh", "-c", command)
 }
+
+func workflowShellCombinedOutput(_ context.Context, cmd *exec.Cmd) ([]byte, error) {
+	return cmd.CombinedOutput()
+}

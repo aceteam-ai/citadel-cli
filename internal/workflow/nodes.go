@@ -144,7 +144,7 @@ func (e *ShellNodeExecutor) Execute(ctx context.Context, node *Node, input map[s
 	if e.config.WorkspaceDir != "" {
 		cmd.Dir = e.config.WorkspaceDir
 	}
-	output, err := cmd.CombinedOutput()
+	output, err := workflowShellCombinedOutput(ctx, cmd)
 	if contextErr := ctx.Err(); contextErr != nil {
 		return nil, fmt.Errorf("Shell node %q: cancelled or timed out: %w", node.ID, contextErr)
 	}
