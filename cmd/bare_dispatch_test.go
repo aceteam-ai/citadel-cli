@@ -126,7 +126,7 @@ func TestRunBareCitadelUnenrolledUsesExistingGuidedFlow(t *testing.T) {
 		t.Fatal("unenrolled node must not enter the session path")
 	}
 
-	runBareNoOwnerFixture(t, &cobra.Command{Use: "citadel"}, false)
+	runBareCitadel(&cobra.Command{Use: "citadel"}, nil)
 	if called != 1 {
 		t.Fatalf("guided enroll called %d times, want 1", called)
 	}
@@ -146,7 +146,7 @@ func TestRunBareCitadelEnrolledUsesSessionSeamAndPersistedControlURL(t *testing.
 		gotTier, gotURL = tier, controlURL
 	}
 
-	runBareNoOwnerFixture(t, &cobra.Command{Use: "citadel"}, true)
+	runBareCitadel(&cobra.Command{Use: "citadel"}, nil)
 	if gotTier != enrollmentMesh {
 		t.Fatalf("session tier = %q, want %q", gotTier, enrollmentMesh)
 	}

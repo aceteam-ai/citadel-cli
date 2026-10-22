@@ -72,6 +72,10 @@ func (m *Model) Close() {
 
 func (m *Model) Init() tea.Cmd { return m.poll() }
 
+// Unavailable reports the current final display state to the command after the
+// terminal program returns. It does not record a separate historical error.
+func (m *Model) Unavailable() bool { return m.unavailable }
+
 func (m *Model) poll() tea.Cmd {
 	if m.pending || m.stopped || m.unavailable {
 		return nil

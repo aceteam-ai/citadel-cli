@@ -1,14 +1,14 @@
-# Read-only local session viewer (#1118, partial S3)
+# Explicit read-only local session viewer (#1118, partial S3)
 
-`citadel session attach` views an **already-running** S2 session. Interactive,
-zero-argument bare `citadel` also selects that read-only viewer when checked
-discovery returns valid existing-session status. This is not the complete unified
-entrypoint. Legacy `citadel attach` (including its shell option), worker and
-foreground commands, session stop and persistence installation are unchanged.
-Confirmed no-owner bare invocations retain the existing enrollment/foreground
-flow; non-interactive bare invocations retain their status-only dispatch.
+`citadel session attach` views an **already-running** S2 session. This is not the
+complete unified entrypoint. Bare `citadel`, legacy `citadel attach` (including
+its shell option), Control Center, worker and foreground commands, session stop
+and persistence installation retain their existing behavior. In particular,
+bare interactive use does not select this viewer or require its status socket.
+Whether a viewer should replace monitor-only Control Center is a separate
+product decision, not implied by this source child.
 
-This source child follows the founder correction in
+This follows the founder correction in
 [#1109 comment 5769548189](https://github.com/aceteam-ai/citadel-cli/issues/1109#issuecomment-5769548189):
 the viewer is a client of the existing shared local control surface, not a new
 socket, protocol, TUI relay or node owner. It is unrelated to the separate
@@ -16,118 +16,97 @@ declared-session epic #1165 and does not lift that epic's build gates.
 
 ## Source sequence and boundaries
 
-1. Add an explicit expert CLI leaf. Its exact root pre-run exception skips the
-   shared CA/bootstrap, interrupted-binary repair, invocation logging and update
-   hooks. `Execute` still performs ordinary command registration/dispatch; this
-   is not a claim that all imported package initialization is side-effect-free.
-   The original offline stream exception stays first and this expert exception
-   stays second. Only exact zero-argument interactive bare calls defer the same
-   shared startup function into their invocation-local discovery path; expert
-   and non-TTY commands do not receive a blanket startup exemption.
-2. Read status only through a fixed GET of the existing session status route at
-   `LocalAPISocketPath`. The new per-call status client refuses redirects. The
-   existing generic session client's redirect behavior and stop/status commands
-   are unchanged. State-directory resolution still reads its existing local
-   pointer/config inputs. No loopback HTTP fallback, credential authentication
-   flow or token use, new ACL,
-   endpoint or wire field is introduced. Existing Windows pipe permissions
-   remain owner, SYSTEM and Administrators; no new client-side admin check is
-   implied. Permission denial or absence is not authority to launch anything.
-3. Limit each request to three seconds and its body to 16 KiB. Require one UTF-8
-   JSON object, no duplicate root members or trailing value, known mode, explicit
-   connected/version/PID/uptime fields and bounded scalar values. Optional future
-   fields remain compatible. Do not display peer bodies or arbitrary error text.
-4. Render only mode, connection observation, node name, mesh IP, version, PID
-   and uptime in a separate minimal BubbleTea model. It has no ControlCenter
-   collectors or callbacks: no demo/terminal/VNC listener, job source, worker,
-   heartbeat, telemetry, service action, permission/settings edit, chat, peer
-   connect, auth modal or mesh reconnect/disconnect. Text is quoted to literal
-   ASCII before rendering; no styling/color is used, including with NO_COLOR or
-   the global no-color option. It does not load rendering preferences.
-5. Poll sequentially, one request at a time, one second after each success.
-   Error, observed PID/mode change or uptime regression clears all old status
-   fields and stops polling. The screen reports unavailable/changed and asks for
-   explicit detach/reattach. A valid disconnected mesh observation is displayed
-   as offline, not mistaken for loss of the local session. Local request
-   generations ignore late results; they are not a server-side identity fence.
-6. q, Esc or Ctrl-C quits this viewer and cancels only its request context.
-   Terminal exit also closes that context. No stop POST, session socket close,
-   worklock cleanup, node signal or network disconnect callback is reachable.
+1. Add only the explicit expert CLI leaf. Its exact root pre-run exception
+   skips shared CA/bootstrap, interrupted-binary repair, invocation logging and
+   update hooks. The original offline stream exception remains first and this
+   explicit exception second; bare commands keep main's ordinary startup.
+   Skipping those writes is deliberate for this read-only client, not a claim
+   that imported package initialization is universally side-effect-free.
+2. Resolve the destination through the same existing `network.GetStateDir`
+   used by legacy local session commands. There is no separate HOME/SUDO_USER
+   discovery algorithm, state observer, kernel-lock probe or bare startup
+   authorization. Existing pointer/config reads and their legacy fallback
+   semantics are unchanged; this child does not repair those semantics.
+3. Preflight a fixed GET of the existing session status route at
+   `LocalAPISocketPath` before opening a terminal. The per-call status client
+   refuses redirects. The generic session client's redirect behavior and
+   stop/status commands are unchanged. Permission, missing socket, malformed
+   status, HTTP refusal or unknown transport error returns a static error and
+   a next step through Cobra RunE; it never starts or stops a node.
+4. Limit each request to three seconds and its body to 16 KiB. Require one UTF-8
+   JSON object, no duplicate root members or trailing value, known mode,
+   explicit connected/version/PID/uptime fields and bounded scalar values.
+   Optional future fields remain compatible. Peer bodies, paths, parser
+   diagnostics and arbitrary transport or terminal errors are not reflected.
+5. Seed the separate minimal BubbleTea model with the preflight observation.
+   Render only mode, connection observation, node name, mesh IP, version, PID
+   and uptime. No ControlCenter collectors or callbacks are reused: no demo,
+   terminal/VNC listener, job source, worker, heartbeat, telemetry, service
+   action, settings edit, chat, peer connect, auth modal or mesh
+   reconnect/disconnect. Text is quoted to literal ASCII before rendering.
+   No styling/color or rendering-preference reads are used.
+6. Poll sequentially, one request at a time, one second after each success.
+   Error, observed PID/mode change or uptime regression clears old status and
+   stops polling until explicit reattachment. A valid disconnected observation
+   displays offline, not loss of the local session. Local request generations
+   ignore late results; they are not a server-side identity fence. The command
+   checks the model's current final unavailable state after terminal exit and
+   returns a static status error, not a separate historical error latch.
+7. q, Esc or Ctrl-C quits this viewer and cancels only its request context.
+   Terminal exit also closes that context. Terminal-program initialization or
+   runtime errors return a distinct static viewer error with a status-command
+   fallback. No stop POST, session socket close, worklock cleanup, node signal
+   or network disconnect callback is reachable.
 
-## Checked bare discovery (partial S3 Phase A)
+## Legacy behavior and acceptance limits
 
-`network.ObserveStateDir` is a new observational resolver, not a change to legacy
-`GetStateDir`, `HasState` or their callers. Valid-input precedence stays machine
-pointer, the existing ordered config candidates, then owner-home legacy/fresh
-fallback. A valid higher-priority path returns before lower credential config
-or owner-home reads. Missing files or an absent config member may continue;
-unreadable/malformed data, failed owner lookup, explicit invalid/empty/relative
-paths and ambiguous filesystem observations refuse rather than choose another
-directory. Windows unusable system-profile/ProgramData inputs also refuse in
-this observer rather than silently guide enrollment elsewhere. The proposed
-16 KiB pointer and 1 MiB config read caps are refusal bounds for this new bare
-observer only, not ratified global legacy resolver limits.
+A held worker with no usable controller still reaches the old enrolled-session
+dispatch. Control Center's existing lock policy chooses monitor-only on
+contention; its existing instance check retains the `citadel attach --shell`
+guidance for a Control Center already open in another terminal. This change
+does not put permission/unknown/controller errors in front of those paths.
+Presence-mode dispatch is also unchanged.
 
-One selected path is retained for status, lock observation, state inspection and
-the attached viewer. Valid protected S2 status is enough to attach without
-enumerating enrollment files. It is not proof of backend/job readiness. An
-unreadable discovery input cannot reveal an otherwise undiscoverable hidden
-Unix session socket; that invocation refuses rather than assuming absence.
+Existing Windows pipe permissions remain owner, SYSTEM and Administrators. No
+client-side admin check is added or claimed. Whether a non-admin owner should
+be permitted under the historical admin-only-v1 decision remains an owner
+policy question; this source child neither broadens nor narrows the shared
+transport's authority.
 
-Only a typed missing local endpoint (or Unix connection-refused dial), with no
-HTTP response, proceeds to `worklock.ProbeContention`. HTTP errors including
-404, redirects, malformed/TUN status, permission/busy/timeout and unknown errors
-refuse without CA/bootstrap, repair, logs, updater, enrollment or owner startup.
-The new existing-file-only lock probe observes kernel contention independent
-of lock-record PID/liveness. It never creates, reclaims, writes or unlinks a
-lock. Unexpected open/type/identity/probe/unlock/close errors are unknown, not
-unheld; legacy `IsHeld` and `Acquire` remain unchanged.
-
-Only endpoint absence plus an unheld probe plus a successful checked state
-presence observation permits the existing startup function once. Presence uses
-the legacy nonempty-directory predicate, not key validation. Its checked result
-feeds enrollment classification directly, rather than reusing false-on-error
-`HasState`. Readable missing/empty state keeps the existing guided enrollment;
-present state keeps the existing persisted-mode foreground dispatch. The viewer
-is seeded with its validated preflight snapshot so a different observed owner
-at its first poll cannot be silently adopted. No cross-hook context, global
-decision or cached startup authorization is retained between invocations.
-
-These are snapshots, not an ownership lease or a new authentication mechanism.
-A new owner may appear after the probe, and unchanged legacy startup/foreground
-paths may resolve inputs again. The existing foreground `Acquire` remains the
-ownership guard; this slice does not serialize all startup effects against such
-races or promise that a successful observation proves future access/writes.
-Filesystem operations also have no hard deadline guarantee.
+PID plus observed uptime cannot prove an incarnation: a replacement reusing the
+same PID and indistinguishable uptime can evade this observational check.
+There is no generation nonce, authenticated process identity or stronger
+ownership guarantee. Local socket authority is the existing OS policy, not
+the displayed fields.
 
 ## Prepared evidence, not execution
 
-Hermetic source fixtures cover the actual fixed-route request builder with a
-fake RoundTripper (including redirect refusal and unchanged generic-client
-redirect behavior), injected response/request/terminal boundaries, strict
-response parsing and body closure, exact root-leaf early return, and BubbleTea
-messages for detach, sequential polling, late responses, observed owner changes,
-offline observations and hostile terminal text. Bare-selection fixtures inject
-resolver/request/probe/presence/startup/viewer boundaries, including all refusal
-classes, checked presence, cancellation, exact startup deferral and repeated
-invocation independence. Checked-discovery and platform probe fixtures record
-their own source-only evidence separately. They start no terminal, socket,
-listener, Redis process, service, mesh or model. No local candidate test,
-formatter, vet or build has been run for this child. Normal exact-head CI and
+Authored fixtures cover the actual fixed-route request builder with a fake
+RoundTripper, redirect refusal and unchanged generic-client redirect behavior,
+strict bounded response parsing and body closure, initial refusal before
+terminal startup, distinct terminal errors, fixed selected target and seeded
+baseline, exact root-leaf guards, and BubbleTea cancellation/poll/status
+transitions. The actual command's source wiring pins the legacy state resolver,
+fixed status requester and returned RunE error.
+
+Bare-dispatch fixtures retain the original classification/session seam. A
+separate fixture combines that seam with the actual Control Center contention
+helper and a held temporary lock beside absent or unusable Unix controller
+placeholders. It starts no listener or TUI and does not prove real EACCES,
+cross-UID, Windows named-pipe ACL or live Control Center behavior. Source
+comparison preserves bare dispatch and Control Center implementation from
+main; source-shape guards are not claimed as full integration acceptance.
+The root logger fixture stubs terminal detection deterministically.
+
+No local candidate tests, formatter, vet, build, terminal, service, mesh or
+model have been run for this correction. Existing exact-head CI and
 independent source review must be recorded separately after publication.
+Native Unix/Windows ACL, signal, terminal and process behavior remains gated.
 
-## Still outside this child
-
-PID plus observed uptime cannot prove an incarnation: a replacement reusing the
-same PID and indistinguishable uptime can evade this observational check. No
-generation nonce, authenticated process identity or stronger ownership guarantee
-is invented. Local socket authority is the existing OS policy, not the displayed
-fields. Native Unix/Windows ACL, signal, terminal and process behavior is not
-proved by pure fixtures or cross-compilation.
-
-Full #1118 still needs persistent detached start/ownership,
-managed-service selection, activity events and update/reconnect behavior, plus
-the detach/continuous-online and multiple-viewer acceptance. #1119 persistence
-UX/Windows integration, #1120 mode switching and #1121 edge/native acceptance
-remain separate. This source-only draft does not close #1118, start a node,
-install persistence, mint credentials or authorize deployment/native execution.
+Full #1118 still needs an accepted bare-entry preference, persistent detached
+ownership/readiness, managed-service selection, activity events and
+update/reconnect behavior, plus detach/continuous-online and multiple-viewer
+acceptance. #1119 persistence UX/Windows integration, #1120 mode switching and
+#1121 edge/native acceptance remain separate. This source-only draft does not
+close #1118, start a node, install persistence, mint credentials or authorize
+deployment/native execution.

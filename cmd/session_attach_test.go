@@ -104,6 +104,35 @@ func TestSessionViewerStatusAllowsOptionalFutureFields(t *testing.T) {
 	}
 }
 
+func TestExplicitSessionAttachRefusesBeforeTerminalWithNextStep(t *testing.T) {
+	for _, refusal := range []string{"absent", "permission", "unknown", "held-no-socket", "http", "malformed"} {
+		t.Run(refusal, func(t *testing.T) {
+			calls := 0
+			err := runSessionAttach(context.Background(), "selected-legacy-state", func(context.Context, string) (*http.Response, error) {
+				calls++
+				switch refusal {
+				case "absent", "held-no-socket":
+					return nil, os.ErrNotExist
+				case "permission":
+					return nil, os.ErrPermission
+				case "unknown":
+					return nil, errors.New("private transport diagnostic")
+				case "http":
+					return &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader("private denial"))}, nil
+				default:
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("private malformed status"))}, nil
+				}
+			}, func(context.Context, *sessionview.Model) error {
+				t.Fatal("unavailable explicit attach started a terminal")
+				return nil
+			})
+			if err != errSessionViewUnavailable || calls != 1 || !strings.Contains(err.Error(), "citadel session status") || strings.Contains(err.Error(), "private") {
+				t.Fatal("explicit refusal did not propagate a static error and useful next step")
+			}
+		})
+	}
+}
+
 func TestSessionViewerRunnerPropagatesTerminalFailureAndBoundsRequest(t *testing.T) {
 	var requestContext context.Context
 	calls := 0
@@ -119,7 +148,7 @@ func TestSessionViewerRunnerPropagatesTerminalFailureAndBoundsRequest(t *testing
 		model.Update(command()) // No terminal/program, goroutine, or listener.
 		return errors.New("synthetic terminal initialization failure")
 	})
-	if err == nil || calls != 1 || requestContext.Err() != context.Canceled {
+	if err != errSessionViewTerminal || calls != 2 || requestContext.Err() != context.Canceled || strings.Contains(err.Error(), "synthetic") {
 		t.Fatal("terminal failure was lost or the completed request retained its context")
 	}
 }
@@ -147,8 +176,45 @@ func TestObservedSessionRunnerRetainsPreflightTargetAndBaseline(t *testing.T) {
 		}
 		return nil
 	})
-	if err != nil || calls != 1 {
+	if err != errSessionViewUnavailable || calls != 1 {
 		t.Fatal("observed viewer did not use exactly its fixed-target first poll")
+	}
+}
+
+func TestExplicitAttachUsesLegacyResolverAndReturnsActualRunnerError(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "session_attach.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	ast.Inspect(file, func(node ast.Node) bool {
+		value, ok := node.(*ast.ValueSpec)
+		if !ok || len(value.Names) != 1 || value.Names[0].Name != "sessionAttachCmd" {
+			return true
+		}
+		ast.Inspect(value, func(node ast.Node) bool {
+			returned, ok := node.(*ast.ReturnStmt)
+			if !ok || len(returned.Results) != 1 {
+				return true
+			}
+			call, ok := returned.Results[0].(*ast.CallExpr)
+			if !ok || passcodeWiringName(call.Fun) != "runSessionAttach" {
+				return true
+			}
+			if len(call.Args) != 4 || passcodeWiringName(call.Args[2]) != "network.SessionControlStatusRequest" || passcodeWiringName(call.Args[3]) != "runSessionViewProgram" {
+				t.Fatal("actual explicit command lost its fixed status requester or viewer")
+			}
+			resolver, ok := call.Args[1].(*ast.CallExpr)
+			if !ok || len(resolver.Args) != 0 || passcodeWiringName(resolver.Fun) != "network.GetStateDir" {
+				t.Fatal("explicit viewer diverged from the legacy state resolver")
+			}
+			found = true
+			return true
+		})
+		return false
+	})
+	if !found {
+		t.Fatal("explicit RunE no longer propagates the actual viewer/refusal error")
 	}
 }
 
@@ -222,45 +288,21 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 				t.Fatal("startup exemption changed its exact command-leaf scope")
 			}
 		}
-		if len(function.Body.List) != 4 {
-			t.Fatal("root startup must contain only the two exact guards, bare deferral and shared startup")
+		// This is a source boundary, not a live Control Center acceptance test:
+		// only the original offline leaf and explicit viewer return early. Bare
+		// interactive commands retain main's actual startup body below them.
+		for _, statement := range function.Body.List[2:] {
+			if guard, ok := statement.(*ast.IfStmt); ok && len(guard.Body.List) == 1 {
+				if _, returns := guard.Body.List[0].(*ast.ReturnStmt); returns {
+					t.Fatal("a third top-level startup bypass was introduced")
+				}
+			}
 		}
-		bareGuard, ok := function.Body.List[2].(*ast.IfStmt)
-		if !ok || bareGuard.Init != nil || bareGuard.Else != nil || len(bareGuard.Body.List) != 1 {
-			t.Fatal("bare discovery must defer startup before any shared mutator")
-		}
-		if _, ok := bareGuard.Body.List[0].(*ast.ReturnStmt); !ok {
-			t.Fatal("bare discovery guard did not return before mutating startup")
-		}
-		assertInvocationCall(t, bareGuard.Cond, "deferBareStartup")
-		startup, ok := function.Body.List[3].(*ast.ExprStmt)
-		if !ok {
-			t.Fatal("shared startup is no longer the last root hook statement")
-		}
-		assertInvocationCall(t, startup.X, "prepareAgentInvocation")
 		found = true
 		return false
 	})
 	if !found {
 		t.Fatal("shared startup hook was not audited")
-	}
-}
-
-func assertInvocationCall(t *testing.T, expression ast.Expr, name string) {
-	t.Helper()
-	call, ok := expression.(*ast.CallExpr)
-	if !ok || len(call.Args) != 2 {
-		t.Fatal("root invocation boundary call changed shape")
-	}
-	function, ok := call.Fun.(*ast.Ident)
-	if !ok || function.Name != name {
-		t.Fatal("root invocation boundary called a different helper")
-	}
-	for index, expected := range []string{"cmd", "args"} {
-		argument, ok := call.Args[index].(*ast.Ident)
-		if !ok || argument.Name != expected {
-			t.Fatal("root invocation boundary lost the current command or arguments")
-		}
 	}
 }
 

@@ -18,16 +18,19 @@ import (
 
 const sessionViewBodyLimit = 16 * 1024
 
-var errSessionViewUnavailable = errors.New("local session status unavailable; no node was started or stopped")
+var (
+	errSessionViewUnavailable = errors.New("local session status unavailable or changed; use citadel session status to diagnose, then retry citadel session attach; no node was started or stopped")
+	errSessionViewTerminal    = errors.New("session viewer could not run; use citadel session status instead; no node was started or stopped")
+)
 
 type sessionStatusRequester func(context.Context, string) (*http.Response, error)
 
 func runSessionAttach(ctx context.Context, stateDir string, request sessionStatusRequester, run func(context.Context, *sessionview.Model) error) error {
-	model := sessionview.New(ctx, func(ctx context.Context) (sessionview.Snapshot, error) {
-		return loadSessionViewStatus(ctx, stateDir, request)
-	})
-	defer model.Close()
-	return run(ctx, model)
+	status, err := loadSessionViewStatus(ctx, stateDir, request)
+	if err != nil {
+		return err
+	}
+	return runObservedSessionAttach(ctx, stateDir, status, request, run)
 }
 
 func runObservedSessionAttach(ctx context.Context, stateDir string, status sessionview.Snapshot, request sessionStatusRequester, run func(context.Context, *sessionview.Model) error) error {
@@ -35,7 +38,13 @@ func runObservedSessionAttach(ctx context.Context, stateDir string, status sessi
 		return loadSessionViewStatus(ctx, stateDir, request)
 	}, status)
 	defer model.Close()
-	return run(ctx, model)
+	if err := run(ctx, model); err != nil {
+		return errSessionViewTerminal
+	}
+	if model.Unavailable() {
+		return errSessionViewUnavailable
+	}
+	return nil
 }
 
 func runSessionViewProgram(ctx context.Context, model *sessionview.Model) error {
@@ -46,35 +55,20 @@ func runSessionViewProgram(ctx context.Context, model *sessionview.Model) error 
 // loadSessionViewStatus consumes only the existing local status response. It
 // never returns peer bodies, parser details, paths or arbitrary error text.
 func loadSessionViewStatus(ctx context.Context, stateDir string, request sessionStatusRequester) (sessionview.Snapshot, error) {
-	status, absent, err := observeSessionViewStatus(ctx, stateDir, request)
-	if err != nil || absent {
-		return sessionview.Snapshot{}, errSessionViewUnavailable
-	}
-	return status, nil
-}
-
-// Only a typed local dial absence permits the bare path to continue checking
-// whether startup is appropriate. An HTTP refusal, unknown listener or private
-// transport detail is never converted into permission to start an owner.
-func observeSessionViewStatus(ctx context.Context, stateDir string, request sessionStatusRequester) (sessionview.Snapshot, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	response, err := request(ctx, stateDir)
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
 	}
-	if response == nil && err != nil && network.SessionControlEndpointAbsent(err) {
-		return sessionview.Snapshot{}, true, nil
-	}
 	if err != nil || response == nil || response.Body == nil || response.StatusCode != http.StatusOK {
-		return sessionview.Snapshot{}, false, errSessionViewUnavailable
+		return sessionview.Snapshot{}, errSessionViewUnavailable
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, sessionViewBodyLimit+1))
 	if err != nil || len(body) > sessionViewBodyLimit || !utf8.Valid(body) {
-		return sessionview.Snapshot{}, false, errSessionViewUnavailable
+		return sessionview.Snapshot{}, errSessionViewUnavailable
 	}
-	status, err := decodeSessionViewStatus(body)
-	return status, false, err
+	return decodeSessionViewStatus(body)
 }
 
 func decodeSessionViewStatus(body []byte) (sessionview.Snapshot, error) {

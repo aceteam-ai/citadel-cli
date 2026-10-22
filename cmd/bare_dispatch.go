@@ -90,21 +90,9 @@ func bareInvocationIsInteractive() bool {
 // runBareCitadel is the sole implementation of bare `citadel` (S1 of #1109).
 // Expert subcommands keep their own Cobra Run functions and do not pass
 // through here.
-func runBareCitadel(cmd *cobra.Command, args []string) {
-	if deferBareStartup(cmd, args) {
-		if err := runBareSessionSelection(cmd, args, productionBareSessionDependencies()); err != nil {
-			fmt.Fprintln(cmd.ErrOrStderr(), errSessionViewUnavailable)
-		}
-		return
-	}
-	dispatchBareCitadel(cmd, bareInvocationIsInteractive(), bareHasMeshStateFn())
-}
-
-// The interactive discovery path supplies its checked state observation here;
-// it must not discard it and reclassify an inaccessible state as unenrolled.
-func dispatchBareCitadel(cmd *cobra.Command, interactive, hasMeshState bool) {
-	tier := enrollmentTierFor(hasMeshState, bareHasDeviceCredentialsFn())
-	switch bareCommandActionFor(interactive, tier) {
+func runBareCitadel(cmd *cobra.Command, _ []string) {
+	tier := enrollmentTierFor(bareHasMeshStateFn(), bareHasDeviceCredentialsFn())
+	switch bareCommandActionFor(bareInvocationIsInteractive(), tier) {
 	case bareCommandStatus:
 		fmt.Fprintln(cmd.OutOrStdout(), bareCommandStatusLine(tier))
 	case bareCommandGuidedEnroll:
