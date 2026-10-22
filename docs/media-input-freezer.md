@@ -291,6 +291,50 @@ interim execution refusal or changed result contract needs separate review.
 The temporary failing audit probe is not part of the passing regression suite;
 its source path and failure are recorded in the draft's audit receipt.
 
+### C2 follow-up: non-429 WebSocket handshake errors
+
+The independent transport audit found another pre-kind diagnostic carrier:
+the pinned WebSocket dialer passes HTTP response parser errors to `Connect`
+unchanged. Malformed peer header text can consequently reach the reconnect
+debug logger and the worker's initial-connect/retry warning through
+`Client.EnableWebSocket`, before a job kind is known. This is separate from
+the already sanitized established-connection read loop and HTTP consume errors.
+
+The two non-429 handshake failure returns now use the existing opaque
+`DeliveryErrorContext` boundary. Diagnostics retain static connection context
+and the numeric HTTP status when available, without formatting the original
+error. Explicit one-hop unwrapping and `errors.Is`/`errors.As` classification
+remain available; the outer `EnableWebSocket` wrapper is unchanged. A private,
+per-client dial seam defaults to the same local gorilla dialer and ten-second
+timeout, with no exported configuration or production endpoint/auth/TLS change.
+
+The prepared regressions invoke actual `WSClient.Connect`,
+`Client.EnableWebSocket` and the reconnect logger using only synthetic failing
+dial results. They use the real HTTP response parser over an in-memory string,
+no-response/503 cases and an error formatter that must not run. All eight
+Connect/Enable variants and the reconnect log failed their privacy assertions
+in the authorized pre-fix offline Go 1.26.6 race run (`-vet=off -race -p=2
+-count=1`, redisapi 0.014s). No endpoint, classification or seam assertion
+failed. The separately selected 429 compatibility regression did not fail.
+After independent source review, the same three-test selector passed the
+authorized post-fix offline run (`-vet=off -race -p=2 -count=1`, redisapi 1.009s),
+then passed five repetitions (`-v -race -count=5`, redisapi 1.013s). All three
+top-level tests in all five repetitions and all 40 Connect/Enable subcases
+explicitly passed, with no skips. Both runs used the installed Go 1.26.6,
+downloads disabled, the existing shared build cache and a private temporary
+build directory. No fixture made a network connection, bound a listener, used
+a service or started an established-connection background loop. These focused
+receipts are not the full package suite, normal exact-head CI or native acceptance.
+
+The 429 branch and its typed rate-limit/backoff contract are deliberately
+unchanged. Existing `RateLimitError.Body`, `Message` and `Window` can retain
+server strings and require their own reviewed diagnostic/declassification
+policy; this bounded non-429 fix does not close that surface or establish
+complete pre-kind transport privacy. String-identity provenance, C5 successful
+output/publication, authoritative ACK/deletion, paired backend purge and all
+pre-mint/activation gates remain unresolved. No capability is minted, task
+registered or private-media execution activated by this change.
+
 ### C2 phase 4 preparation: pure classifier, no deletion wiring
 
 `internal/redis/media_ack_classifier.lua` is an unregistered pure boolean

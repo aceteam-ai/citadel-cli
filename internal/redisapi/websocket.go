@@ -27,6 +27,11 @@ type WSClient struct {
 	connMu    sync.RWMutex
 	connected bool
 
+	// Private, per-client handshake seam for listener-free transport regressions.
+	// Nil retains the existing gorilla dialer and its ten-second timeout.
+	// Set only before the client is used; production configuration cannot override it.
+	dialContext func(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error)
+
 	// connEstablishedAt is when the current conn was published (connectLocked).
 	// Guarded by connMu, like conn/connected. handleDisconnect reads it against
 	// pongWait to decide whether the connection PROVED itself before it died --
@@ -311,7 +316,11 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	dialContext := c.dialContext
+	if dialContext == nil {
+		dialContext = dialer.DialContext
+	}
+	conn, resp, err := dialContext(ctx, wsURL, headers)
 	if err != nil {
 		if resp != nil {
 			// A rejected upgrade carries the same rate-limit hint the REST
@@ -322,9 +331,9 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 			if resp.StatusCode == http.StatusTooManyRequests {
 				return fmt.Errorf("WebSocket connection failed: %w", rateLimitFromUpgrade(resp))
 			}
-			return fmt.Errorf("WebSocket connection failed with status %d: %w", resp.StatusCode, err)
+			return jobprivacy.DeliveryErrorContext(fmt.Sprintf("WebSocket connection failed with status %d", resp.StatusCode), err)
 		}
-		return fmt.Errorf("WebSocket connection failed: %w", err)
+		return jobprivacy.DeliveryErrorContext("WebSocket connection failed", err)
 	}
 
 	// Arm the keepalive BEFORE publishing the connection (#734).
