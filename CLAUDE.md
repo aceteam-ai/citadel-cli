@@ -533,6 +533,12 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`redisapi.RateLimitError` owns bounded ordinary error/fmt/diagnostic-JSON
+projections without changing original typed metadata or `Wait`. Peer `Body`,
+`Message` and `Window` are explicit-access fields, not diagnostic arguments.
+The actual retry-loop fixtures pin omission of separately supplied raw window
+strings; see `docs/media-input-freezer.md` for the projection and its limits.
+
 The worker (`citadel worker`) is the high-performance job queue mode designed for AceTeam's private GPU cloud infrastructure. Written in Go for maximum concurrency and throughput, it routes inference requests to private vLLM/Ollama/llama.cpp clusters.
 
 **Why Go?** The Citadel worker is intentionally written in Go (not Python) for:

@@ -230,6 +230,12 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 // retry_after honored in full, ctx-aware chunked sleeps -- without its failures
 // reading as control-plane failures in the journal. One scheme, one place.
 func connectWithBackoffLabeled(ctx context.Context, label string, source apiConnector) error {
+	return connectWithBackoffLabeledAndLog(ctx, label, source, Log)
+}
+
+// The per-call logger keeps the actual retry-loop diagnostics testable without
+// opening the CLI's persistent log or changing process-global logging hooks.
+func connectWithBackoffLabeledAndLog(ctx context.Context, label string, source apiConnector, logf func(string, ...interface{})) error {
 	backoff := connectBackoffInitial
 	attempt := 0
 	for {
@@ -241,7 +247,7 @@ func connectWithBackoffLabeled(ctx context.Context, label string, source apiConn
 		err := source.Connect(ctx)
 		if err == nil {
 			if attempt > 1 {
-				Log("connected to %s after %d attempt(s)", label, attempt)
+				logf("connected to %s after %d attempt(s)", label, attempt)
 			}
 			return nil
 		}
@@ -264,8 +270,8 @@ func connectWithBackoffLabeled(ctx context.Context, label string, source apiConn
 				wait = backoff
 			}
 			backoff = connectBackoffInitial
-			Log("%s rate limited (limit=%d window=%q); honoring server backoff of %s before retry: %v",
-				label, rle.Limit, rle.Window, wait, err)
+			logf("%s rate limited (limit=%d); honoring server backoff of %s before retry: %v",
+				label, rle.Limit, wait, err)
 			if !sleepUntilCtx(ctx, time.Now().Add(wait)) {
 				return ctx.Err()
 			}
@@ -274,7 +280,7 @@ func connectWithBackoffLabeled(ctx context.Context, label string, source apiConn
 
 		// Generic transient failure: exponential backoff with jitter.
 		sleep := jitter(backoff)
-		Log("%s connect failed (attempt %d), retrying in %s: %v", label, attempt, sleep, err)
+		logf("%s connect failed (attempt %d), retrying in %s: %v", label, attempt, sleep, err)
 		backoff *= 2
 		if backoff > connectBackoffMax {
 			backoff = connectBackoffMax

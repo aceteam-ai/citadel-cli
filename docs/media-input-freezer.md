@@ -326,14 +326,63 @@ build directory. No fixture made a network connection, bound a listener, used
 a service or started an established-connection background loop. These focused
 receipts are not the full package suite, normal exact-head CI or native acceptance.
 
-The 429 branch and its typed rate-limit/backoff contract are deliberately
-unchanged. Existing `RateLimitError.Body`, `Message` and `Window` can retain
-server strings and require their own reviewed diagnostic/declassification
-policy; this bounded non-429 fix does not close that surface or establish
+That non-429 slice left the 429 branch and typed rate-limit/backoff contract
+unchanged. Its separate diagnostic policy is addressed in the follow-up below;
+the bounded non-429 fix alone does not establish
 complete pre-kind transport privacy. String-identity provenance, C5 successful
 output/publication, authoritative ACK/deletion, paired backend purge and all
 pre-mint/activation gates remain unresolved. No capability is minted, task
 registered or private-media execution activated by this change.
+
+### C2 follow-up: bounded ordinary rate-limit diagnostics
+
+The owner approved a bounded ordinary diagnostic projection while preserving
+the original typed rate-limit metadata. `RateLimitError.Error` emits only a
+static class and finite numeric status/quota/retry values; nil errors have a
+static summary. Value-receiver `Format` and `MarshalJSON` apply the same policy
+to pointers, copied values and ordinary exported/container projections.
+Formatting ignores caller width/precision instead of allocating unbounded
+padding. Diagnostic JSON intentionally contains only `StatusCode`, `Limit` and
+`RetryAfter`; it is not the server wire format or a lossless encoding of the
+error. Reset-time location names and peer `Message`, `Window` and `Body` are
+not ordinary diagnostic output.
+
+The two retry-loop log sites also omit their separately supplied raw `Window`.
+They retain the numeric limit and actual computed server wait. Merely changing
+the error formatter would not protect those direct string arguments. The
+original fields, parse rules, WebSocket rejection-body read/header fallback,
+`Wait`, `AsRateLimitError`, original pointer identity and retry/cancellation
+control remain unchanged. No other HTTP response becomes newly typed as a
+rate-limit error. Explicit typed field reads remain available; callers must
+not forward them to logs or diagnostic maps. Aliases, explicit field copies,
+reflection and enclosing unexported value fields can bypass these methods;
+this is not a claim that arbitrary reflective dumps or retained memory are
+private. Existing input/output, identity, ACK and activation gates still apply.
+
+Before the source change, an authorized listener-free actual Connect/Enable
+audit failed in 0.009 seconds: both entry points retained the synthetic peer
+canary in six ordinary diagnostic projections each. The nested wrapped-error
+`%#v` projection did not leak in that audit. Its original typed fields,
+single-failed-call and 17-second `Wait` assertions passed. This is historical
+RED evidence, not a result for the expanded permanent fixtures.
+
+Prepared regressions exercise actual rejected WS Connect/Enable, HTTP Ping via
+a fake RoundTripper, actual reconnect logging and the command retry loop via a
+per-call logger (production still passes the existing `Log`). Cancellation
+stops the fixtures before a real backoff wait; no listener, connection, service
+or persistent CLI log is needed. Pointer/value/nested/nil formatting and JSON,
+finite formatting widths and exact typed metadata/classification are covered.
+The source author and independent reviewer performed no candidate execution.
+After their frozen-packet reviews, root ran installed Go 1.26.6 with downloads
+disabled, readonly modules, task-local cache/tmp, `-vet=off -race -count=1` and
+explicit listener-free selectors. The new Redis/API diagnostics plus the
+existing pure rate-limit/handshake metadata contracts passed in 1.025 seconds.
+The actual command retry-log fixture passed in 1.039 seconds; its cancellation
+avoids a real 17-second wait. No listener, real Redis, model, service, formatter,
+vet or standalone build ran. Both commands completed before further local
+test execution was held for the coordinator's release window. These targeted
+offline passes are not full-package, native or exact-head CI acceptance;
+fresh normal CI must be recorded separately after publication.
 
 ### C2 phase 4 preparation: pure classifier, no deletion wiring
 

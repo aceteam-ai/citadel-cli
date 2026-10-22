@@ -860,7 +860,7 @@ func (c *WSClient) reconnect() {
 			// authority, not wherever our own doubling had gotten to.
 			if rle, ok := AsRateLimitError(err); ok {
 				if wait := rle.Wait(time.Now()); wait > 0 {
-					c.debug("ws: reconnect: rate limited (limit=%d window=%q), honoring server backoff of %s instead of local schedule", rle.Limit, rle.Window, wait)
+					c.debug("ws: reconnect: rate limited (limit=%d), honoring server backoff of %s instead of local schedule", rle.Limit, wait)
 					if !c.sleepUnlessDoneUntil(time.Now().Add(wait)) {
 						return
 					}
