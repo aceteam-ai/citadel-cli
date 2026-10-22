@@ -600,6 +600,17 @@ delivery too (one error event, then Fail with the reason): SHELL_COMMAND, the
 desktop handlers, and WORKFLOW_RUN when its Shell gate refuses at submit. A
 Shell node refused mid-run fails the workflow as an ordinary failure.
 
+`workflow.Executor.Cancel` owns per-run context cancellation; a cancelled
+status records the request, not proof that a Shell process or callback exited.
+`Execution.Done` supplies executor/slot completion, which the workflow handler
+waits for before returning. That is not runner-level fencing:
+`worker.Runner.executeWithDeadline` can return before a normal-lane workflow
+handler exits. `workflowShellCombinedOutput` owns Linux/macOS cancellation
+through the full Wait and output drain; its numeric process-group signal is
+not identity-pinned containment. See `docs/workflow-cancellation.md` for the
+PID/group reuse, escaped-descendant and custody boundaries. Native Windows
+process-tree containment is not implied.
+
 The five desktop handlers (FILE_SCREENSHOT, VNC_SCREENSHOT, VNC_TYPE, VNC_KEYS,
 VNC_ACTIONS) honor the node passcode like SHELL_COMMAND, through
 `jobs.DesktopGateReason` in `newDesktopLegacyHandlerAdapter`, after the live
