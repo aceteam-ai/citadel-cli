@@ -550,8 +550,13 @@ var errTemplateCopyLimit = errors.New("template copy byte limit exceeded")
 
 type templateCopyLimitError struct{ max int64 }
 
-func (e templateCopyLimitError) Error() string { return fmt.Sprintf("byte limit of %d exceeded", e.max) }
-func (e templateCopyLimitError) Unwrap() error { return errTemplateCopyLimit }
+func (e templateCopyLimitError) Error() string {
+	return fmt.Sprintf("byte limit of %d exceeded", e.max)
+}
+
+func (e templateCopyLimitError) Unwrap() error {
+	return errTemplateCopyLimit
+}
 
 // copyTemplateWithContextLimit refuses before writing the byte that would cross
 // maxBytes. The pre-copy Stat check makes ordinary oversized inputs cheap; this

@@ -96,9 +96,9 @@ func TestCopyTemplateLimitPreservesIOAndCancellation(t *testing.T) {
 func TestResolveTemplateInputsExpectedCopyBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, wantError string
-		expected             *int64
-		global               int64
-		duplicates           int
+		expected              *int64
+		global                int64
+		duplicates            int
 	}{
 		{name: "omitted", body: "abc", global: 3},
 		{name: "zero exact", expected: videoComposeTestInt64(0), global: 3},

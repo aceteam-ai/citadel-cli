@@ -290,8 +290,8 @@ func TestVideoComposeMP4StructuralGuardsIndependently(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name, drefParent string
-		tracks          int
-		mdat, wantOK    bool
+		tracks           int
+		mdat, wantOK     bool
 	}{
 		{name: "one track", tracks: 1, drefParent: "dinf", mdat: true, wantOK: true},
 		{name: "two tracks", tracks: 2, drefParent: "dinf", mdat: true, wantOK: true},
