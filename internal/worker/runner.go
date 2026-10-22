@@ -794,11 +794,15 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// back to the shared stream during a mixed-version rollout, where this pin is
 	// the only thing routing the job.
 	if targetNode, ok := payload["target_node"].(string); job.Type != JobTypeWorkerControl && ok && targetNode != "" && targetNode != r.config.NodeID {
+		// Routing still uses the original projection. A payload-derived string
+		// is not diagnostic authority: malformed media can echo private input
+		// here, just as FILE_FETCH/passcode credentials can be reflected here.
+		diagnosticTarget := jobprivacy.Text(job.Type, job.diagnosticPayload(), targetNode)
 		if r.config.NodeID == "" {
 			r.log("warning", "Declining job %s: addressed to target_node=%s but this node's Headscale ID is unresolved, "+
-				"so it cannot claim addressed work", job.ID, targetNode)
+				"so it cannot claim addressed work", job.ID, diagnosticTarget)
 		} else {
-			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
+			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, diagnosticTarget, r.config.NodeID)
 		}
 		r.source.Ack(ctx, job)
 		return false, nil, startTime

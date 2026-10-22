@@ -216,6 +216,16 @@ chunked-trailer parser over an in-memory string. They bind no listener. These
 source fixtures do not replace exact-head execution evidence or complete the
 remaining carrier/backend/ACK audit and pre-mint gates.
 
+Routing diagnostics also pass the payload-derived target string through the
+existing diagnostic policy. The target filter still compares the original
+execution value, and wrong-node skip ACK/claim behavior is unchanged. A private
+media target string is static in logs; reflected FILE_FETCH/passcode secrets
+use their existing redaction. Ordinary nonsecret/legacy targets retain their
+detail. The direct claim fixture covers matched, mismatched and unresolved
+nodes without polling, transport or handler execution; it also checks exact
+original receipt bytes. This does not resolve shared-stream deletion ownership
+or turn a diagnostic target into an authenticated identity.
+
 ### C2 phase 4 preparation: pure classifier, no deletion wiring
 
 `internal/redis/media_ack_classifier.lua` is an unregistered pure boolean
