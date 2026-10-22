@@ -91,6 +91,41 @@ exercise the classifier without importing those dependencies. They are not
 proof that any particular installed library version exports these classes, or
 that a real gated repository, CUDA allocation or model load succeeds.
 
+An outgoing-generation drain timeout gets a dedicated code-owned static
+`drain_timeout` reason, not a generic filesystem error.
+Known already-loaded HF `LocalEntryNotFoundError`/`EntryNotFoundError` exports
+map to model-file availability before the generic ValueError bucket, including
+their multiple-inheritance form. An arbitrary loader timeout is not evidence
+of a drain failure. Inert class fixtures plus actual fake-manager drain/HTTP
+fixtures cover that distinction without importing HF or ML libraries.
+The diagnostic hardening uses a stdlib-only helper with
+finite literal class-export labels and fixed stages. It compares exact
+exception types with builtins or already-loaded fixed exports, without
+reflecting module/qualname/message, invoking metaclass subclass hooks or adding
+a raw-error flag. Unknown subclasses get `unknown_exception` even if their
+broad failure kind is known. Alias labels name the chosen fixed export, not
+an assertion about the class's actual module or installed-library behavior.
+Original candidate labels are captured before the helper's exception frame
+exits and retained only as strings in failed-attempt diagnostics. An outer
+`raised_exception_class` can name an aggregate wrapper; it is not reported as
+the original candidate cause. Fixed stages distinguish preparation, draining,
+loading, unloading, cleanup and preflight estimate/disk probing. Preflight's
+existing fail-open policy and lifecycle cleanup/unload behavior are unchanged;
+their former raw exception/cache-path warning sinks and lifecycle tracebacks
+are replaced with static diagnostics. This contract describes these targeted
+paths, not every sidecar endpoint or external library's log output.
+Known disk refusals log only bounded plain-integer required/free/margin/needed
+values at the actual decision point; invalid/unbounded counts are unknown, and
+an arbitrary ENOSPC exception cannot invent preflight measurements.
+
+The helper is explicitly copied into the image by the Dockerfile; a hermetic
+source fixture checks that packaging and its stdlib-only imports under the
+existing sidecar CI selector. No image build is requested by the feature push:
+the unchanged image workflow runs only for main/service paths or manual action.
+Class labels still cannot distinguish different kernel/dtype/bitsandbytes
+causes wrapped in the same plain RuntimeError. They do not waive the native
+diagnostic or image-promotion gate.
+
 When the final remaining candidates are skipped for current VRAM after a failed
 attempt, the disposition is the existing `503 insufficient_vram`, not an
 all-candidates-failed 500. This is not `model_warming` and does not change Go's

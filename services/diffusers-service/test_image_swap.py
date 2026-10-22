@@ -6,8 +6,10 @@ tests control exactly when a "cold load" finishes."""
 
 from __future__ import annotations
 
+import ast
 import errno
 import gc
+from pathlib import Path
 import sys
 import threading
 import time
@@ -22,12 +24,82 @@ from image_swap import (
     classify_failure, failure_summary,
 )
 from model_preflight import InsufficientDiskSpaceError
+from load_diagnostics import bounded_byte_count, safe_exception_label
 
 GIB = 1024**3
 SDXL = "stabilityai/sdxl-turbo"
 FLUX = "black-forest-labs/FLUX.2-klein-4B"
 ZIMG = "Tongyi-MAI/Z-Image-Turbo"
 QWEN = "Qwen/Qwen-Image"
+
+
+@pytest.mark.parametrize("cls", [
+    Exception, RuntimeError, NotImplementedError, AttributeError, KeyError,
+    AssertionError, ImportError, ModuleNotFoundError, ValueError, TypeError,
+    MemoryError, OSError, TimeoutError, ConnectionError, FileNotFoundError,
+    PermissionError, BrokenPipeError,
+])
+def test_known_builtin_diagnostic_labels_are_literal_exact_types(cls):
+    assert safe_exception_label(cls("owned-private-detail")) == f"builtins.{cls.__name__}"
+
+
+def test_diagnostic_labels_never_reflect_unknown_class_or_invoke_metaclass_hooks(monkeypatch):
+    class Trap(type):
+        def __instancecheck__(cls, obj):
+            raise AssertionError("labels must use exact identity, not isinstance")
+
+        def __subclasscheck__(cls, other):
+            raise AssertionError("labels must use exact identity, not issubclass")
+
+    class PrivateFailure(RuntimeError, metaclass=Trap):
+        def __str__(self):
+            raise AssertionError("labels must not format exceptions")
+
+    PrivateFailure.__module__ = "owned-private-module"
+    PrivateFailure.__qualname__ = "owned-private-qualname"
+    failure = PrivateFailure("owned-private-detail")
+    assert safe_exception_label(failure) == "unknown_exception"
+    module = types.ModuleType("huggingface_hub.errors")
+    module.LocalEntryNotFoundError = PrivateFailure
+
+    def no_lazy_export(name):
+        raise AssertionError("diagnostics must not resolve lazy exports")
+
+    module.__getattr__ = no_lazy_export
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    assert safe_exception_label(failure) == "huggingface_hub.errors.LocalEntryNotFoundError"
+    class UnknownSubclass(PrivateFailure):
+        pass
+    assert safe_exception_label(UnknownSubclass()) == "unknown_exception"
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0, 0), ((1 << 63) - 1, (1 << 63) - 1), (-1, None),
+    (1 << 63, None), (True, None), ("owned-private-detail", None),
+])
+def test_disk_diagnostic_counts_are_bounded_plain_integers(value, expected):
+    assert bounded_byte_count(value) == expected
+
+
+def test_disk_diagnostics_do_not_format_custom_numeric_objects():
+    class PrivateInteger(int):
+        def __str__(self):
+            raise AssertionError("diagnostic must not format an untrusted number")
+    assert bounded_byte_count(PrivateInteger(10)) is None
+    assert bounded_byte_count(10**5000) is None
+
+
+def test_diagnostic_module_is_packaged_and_has_only_stdlib_imports():
+    root = Path(__file__).parent
+    assert "COPY load_diagnostics.py /app/load_diagnostics.py" in (root / "Dockerfile").read_text()
+    tree = ast.parse((root / "load_diagnostics.py").read_text())
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.add(node.module)
+    assert imports == {"__future__", "sys", "enum"}
 
 
 @pytest.mark.parametrize("failure, expected", [
@@ -39,6 +111,7 @@ QWEN = "Qwen/Qwen-Image"
     (TypeError("owned-private-detail"), FailureKind.API),
     (RuntimeError("owned-private-detail"), FailureKind.RUNTIME),
     (OSError("owned-private-detail"), FailureKind.MODEL_IO),
+    (TimeoutError("owned-private-network-timeout"), FailureKind.MODEL_IO),
     (Exception("owned-private-detail"), FailureKind.LOAD_FAILED),
 ])
 def test_failure_kinds_use_types_not_private_messages(failure, expected):
@@ -86,8 +159,67 @@ def test_cuda_memory_classification_uses_only_loaded_export(monkeypatch, module_
     module.OutOfMemoryError = OutOfMemoryError
     monkeypatch.setitem(sys.modules, module_name, module)
     assert classify_failure(OutOfMemoryError("owned-private-detail")) is FailureKind.CUDA_MEMORY
+    assert safe_exception_label(OutOfMemoryError()) == f"{module_name}.OutOfMemoryError"
     spoof = type("OutOfMemoryError", (RuntimeError,), {"__module__": module_name})
     assert classify_failure(spoof()) is FailureKind.RUNTIME
+
+
+@pytest.mark.parametrize("module_name", ["huggingface_hub.errors", "huggingface_hub.utils._errors"])
+def test_known_hf_cache_miss_multiple_inheritance_is_not_configuration(monkeypatch, module_name):
+    class EntryNotFoundError(FileNotFoundError, ValueError):
+        def __str__(self):
+            raise AssertionError("classification must not format private HF errors")
+
+    class LocalEntryNotFoundError(EntryNotFoundError):
+        pass
+
+    module = types.ModuleType(module_name)
+    module.EntryNotFoundError = EntryNotFoundError
+    module.LocalEntryNotFoundError = LocalEntryNotFoundError
+    monkeypatch.setitem(sys.modules, module_name, module)
+    for cls in (EntryNotFoundError, LocalEntryNotFoundError):
+        assert isinstance(cls(), ValueError) and isinstance(cls(), OSError)
+        assert classify_failure(cls("owned-private-detail")) is FailureKind.MODEL_IO
+    # Name/module spoofing cannot claim the trusted export's classification.
+    spoof = type("LocalEntryNotFoundError", (FileNotFoundError, ValueError), {"__module__": module_name})
+    assert classify_failure(spoof()) is FailureKind.CONFIGURATION
+    assert classify_failure(ValueError("LocalEntryNotFoundError")) is FailureKind.CONFIGURATION
+
+
+@pytest.mark.parametrize("failure_stage", ["idle-unload", "idle-cleanup", "swap-unload"])
+def test_lifecycle_failure_diagnostics_keep_stage_without_traceback_or_private_text(failure_stage, caplog):
+    class PrivateFailure(RuntimeError):
+        def __str__(self):
+            raise AssertionError("lifecycle diagnostics must not format private errors")
+
+    armed = [False]
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                       timer_factory=timers, clock=lambda: timers.now)
+
+    def unload(pipe):
+        if armed[0] and failure_stage != "idle-cleanup":
+            raise PrivateFailure("owned-private-token /owned/private/path")
+
+    def free():
+        if armed[0] and failure_stage == "idle-cleanup":
+            raise PrivateFailure("owned-private-token /owned/private/path")
+
+    mgr._unloader, mgr._free_memory = unload, free
+    mgr.lease(SDXL).release()
+    armed[0] = True
+    if failure_stage == "swap-unload":
+        mgr.lease(FLUX).release()
+        assert mgr.loaded_model() == FLUX
+    else:
+        timers.timers[-1].fire()
+        assert mgr.loaded_model() is None
+        assert mgr.status()["idle_evicting"] is False
+    stage = "cleanup" if failure_stage == "idle-cleanup" else "unload"
+    assert f"stage={stage} exception_class=unknown_exception" in caplog.text
+    for private in ("owned-private-token", "/owned/private/path", "PrivateFailure", "Traceback"):
+        assert private not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_unknown_load_kind_cannot_render_arbitrary_detail():
@@ -623,6 +755,29 @@ def test_swap_waits_for_inflight_generation_to_finish():
     assert mgr.loaded_model() == FLUX
 
 
+def test_drain_timeout_preserves_outgoing_lease_and_reports_busy_not_model_io(caplog):
+    mgr, loader = make(warm_wait=5, drain=0)
+    lease = mgr.lease(SDXL)
+    try:
+        with pytest.raises(ModelLoadFailed) as err:
+            mgr.lease(FLUX)
+        assert err.value.model_id == FLUX
+        assert err.value.kind is FailureKind.DRAIN_TIMEOUT
+        assert err.value.message == "previous model is still busy"
+        assert mgr.loaded_model() == SDXL and lease.pipe == f"pipe:{SDXL}"
+        assert loader.unloaded == []
+        assert [model for model, *_ in loader.loads] == [SDXL]
+        assert "[drain_timeout]: previous model is still busy" in caplog.text
+        assert "model files are unavailable" not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+    finally:
+        lease.release()
+    # The typed failure does not change drain/retry policy or unload A early.
+    mgr.lease(FLUX).release()
+    assert mgr.loaded_model() == FLUX
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
 def test_outgoing_model_accepts_no_new_leases_while_swap_is_pending():
     mgr, loader = make()
     with pytest.raises(ModelWarming):
@@ -971,12 +1126,14 @@ def test_auto_attempts_gpu_first_then_offload_and_clears_partial_references(fail
     assert status["fallback_attempts"] == failures
     assert status["vram_skipped_candidates"] == 0
     assert status["failed_attempts"] == [
-        {"quantization": quant, "cpu_offload": offload != "none", "kind": "model_runtime"}
+        {"quantization": quant, "cpu_offload": offload != "none", "kind": "model_runtime",
+         "exception_class": "builtins.RuntimeError"}
         for quant, offload in order[:failures]
     ]
     assert all(record.exc_info is None for record in caplog.records)
     if failures:
         assert "candidate int8 failed [model_runtime]: model runtime failed" in caplog.text
+        assert "stage=load exception_class=builtins.RuntimeError" in caplog.text
     assert "owned-private-loader-detail" not in caplog.text
     # Even fallback CPU-offloaded weights obey immediate idle cleanup.
     lease.release()
@@ -1004,6 +1161,8 @@ def test_auto_all_candidate_failures_are_bounded_static_and_backed_off(caplog):
     assert "owned-private-loader-detail" not in caplog.text
     for variant in ("int8", "nf4", "none+cpu-offload"):
         assert f"candidate {variant} failed [model_runtime]: model runtime failed" in caplog.text
+    assert "stage=load exception_class=builtins.RuntimeError" in caplog.text
+    assert "stage=load raised_exception_class=image_swap.ModelLoadFailed" in caplog.text
 
 
 @pytest.mark.parametrize("kinds, expected", [

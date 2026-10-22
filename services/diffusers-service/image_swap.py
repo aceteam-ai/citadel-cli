@@ -37,6 +37,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from image_models import GIB, ImageModelSpec, LoadVariant, choose_variant, fitting_variants
+from load_diagnostics import Stage, safe_exception_label
 from model_preflight import InsufficientDiskSpaceError
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ class FailureKind(Enum):
     API = "incompatible_model_api"
     RUNTIME = "model_runtime"
     MODEL_IO = "model_files_unavailable"
+    DRAIN_TIMEOUT = "drain_timeout"
 
 
 _FAILURE_SUMMARIES = {
@@ -98,6 +100,7 @@ _FAILURE_SUMMARIES = {
     FailureKind.API: "model runtime API is incompatible",
     FailureKind.RUNTIME: "model runtime failed",
     FailureKind.MODEL_IO: "model files are unavailable",
+    FailureKind.DRAIN_TIMEOUT: "previous model is still busy",
 }
 _ACTIONABLE_FAILURES = frozenset(_FAILURE_SUMMARIES).difference({
     FailureKind.LOAD_FAILED, FailureKind.ALL_FAILED, FailureKind.RUNTIME,
@@ -124,7 +127,9 @@ def classify_failure(exc: Exception) -> FailureKind:
     ):
         return FailureKind.DISK_SPACE
     for name, kind in (("GatedRepoError", FailureKind.REPO_GATED),
-                       ("RepositoryNotFoundError", FailureKind.REPO_MISSING)):
+                       ("RepositoryNotFoundError", FailureKind.REPO_MISSING),
+                       ("LocalEntryNotFoundError", FailureKind.MODEL_IO),
+                       ("EntryNotFoundError", FailureKind.MODEL_IO)):
         if any(_loaded_exception(exc, module, name) for module in
                ("huggingface_hub.errors", "huggingface_hub.utils._errors")):
             return kind
@@ -551,8 +556,9 @@ class ImageModelManager:
             # All manager, lease and unload-frame references are gone before
             # collection/cache release/host allocator trimming happens.
             self._free_memory()
-        except Exception:
-            logger.exception("diffusers: idle memory cleanup failed")
+        except Exception as exc:
+            logger.warning("diffusers: idle memory cleanup failed (stage=%s exception_class=%s)",
+                           Stage.CLEANUP.value, safe_exception_label(exc))
         finally:
             with self._cond:
                 self._idle_evicting = False
@@ -563,13 +569,15 @@ class ImageModelManager:
         resident.pipe = None
         try:
             self._unloader(pipe)
-        except Exception:
-            logger.exception("diffusers: pipeline unload hook failed")
+        except Exception as exc:
+            logger.warning("diffusers: pipeline unload hook failed (stage=%s exception_class=%s)",
+                           Stage.UNLOAD.value, safe_exception_label(exc))
         finally:
             del pipe
 
     def _run_load(self, load: _Load) -> None:
         spec, variant = load.spec, load.variant
+        stage = Stage.PREPARE
         try:
             candidates = load.candidates or (variant,)
             smallest = min(candidates, key=lambda v: v.est_vram_gb)
@@ -577,10 +585,13 @@ class ImageModelManager:
             # and download, without extending its unpinned idle deadline.
             self._prepare(spec, variant)
             self._enter_replacement_phase(load)
+            stage = Stage.CAPACITY
             self._refuse_if_eviction_cannot_help(spec, smallest.est_vram_gb * GIB)
+            stage = Stage.DRAIN
             self._swap_out_previous(load)
             # Unconditional, so cached blocks left by a previous failed load or
             # an earlier unload never make free VRAM look smaller than it is.
+            stage = Stage.CLEANUP
             self._free_memory()
             started = self._clock()
             attempted = 0
@@ -588,9 +599,11 @@ class ImageModelManager:
             failure_kinds = set()
             skipped_for_vram = 0
             trailing_shortfall = None
+            stage = Stage.LOAD
             for variant in candidates:
                 # Recheck after every failed attempt's cleanup. Other services
                 # can change their allocations while this load is running.
+                stage = Stage.CAPACITY
                 free_before = self._free_vram_bytes()
                 if free_before is not None and variant.est_vram_gb * GIB > free_before:
                     skipped_for_vram += 1
@@ -603,22 +616,26 @@ class ImageModelManager:
                 with self._cond:
                     load.variant = variant
                 attempted += 1
-                loaded, failure_kind = self._attempt_pipeline_load(spec, variant)
+                stage = Stage.LOAD
+                loaded, failure_kind, exception_class = self._attempt_pipeline_load(spec, variant)
                 if loaded is not None:
                     pipe, device = loaded
                     del loaded
                     break
                 # The helper has exited its except block and stack frame.
                 # Collect partial allocations BEFORE another candidate loads;
-                # only an allowlisted enum crosses here, never a raw diagnostic.
+                # only a finite kind/literal label cross, never raw diagnostics.
                 failures.append({"quantization": variant.quant,
                                  "cpu_offload": variant.offload != "none",
-                                 "kind": failure_kind.value})
+                                 "kind": failure_kind.value,
+                                 "exception_class": exception_class})
                 failure_kinds.add(failure_kind)
-                logger.warning("diffusers: %s candidate %s failed [%s]: %s",
+                logger.warning("diffusers: %s candidate %s failed [%s]: %s (stage=%s exception_class=%s)",
                                spec.model_id, variant.label(), failure_kind.value,
-                               failure_summary(failure_kind))
+                               failure_summary(failure_kind), Stage.LOAD.value, exception_class)
+                stage = Stage.CLEANUP
                 self._free_memory()
+                stage = Stage.LOAD
                 if self._quant_mode != "auto":
                     raise ModelLoadFailed(spec.model_id, failure_kind)
             else:
@@ -632,6 +649,7 @@ class ImageModelManager:
                     )
                 raise InsufficientVram(spec.model_id, smallest.est_vram_gb, free_before / GIB)
             elapsed = self._clock() - started
+            stage = Stage.CAPACITY
             free_after = self._free_vram_bytes()
             measured = None
             if free_before is not None and free_after is not None:
@@ -681,10 +699,14 @@ class ImageModelManager:
             else:
                 err = ModelLoadFailed(spec.model_id, classify_failure(exc))
             if isinstance(err, ModelLoadFailed):
-                logger.warning("diffusers: load of %s failed [%s]: %s",
-                               spec.model_id, err.kind.value, err.message)
+                # This is the raised operation/wrapper class, not a claim that
+                # an aggregate wrapper is the original candidate's cause.
+                logger.warning("diffusers: load of %s failed [%s]: %s (stage=%s raised_exception_class=%s)",
+                               spec.model_id, err.kind.value, err.message,
+                               stage.value, safe_exception_label(exc))
             else:
-                logger.warning("diffusers: load of %s refused [insufficient_vram]", spec.model_id)
+                logger.warning("diffusers: load of %s refused [insufficient_vram] (stage=%s raised_exception_class=%s)",
+                               spec.model_id, stage.value, safe_exception_label(exc))
             try:
                 # Preparation can fail while the idle timer is tearing down
                 # the outgoing model. Do not run overlapping memory cleanup.
@@ -692,8 +714,9 @@ class ImageModelManager:
                 # A failed from_pretrained can leave partially allocated CUDA
                 # blocks cached in this process.
                 self._free_memory()
-            except Exception:  # noqa: BLE001
-                logger.warning("diffusers: memory cleanup after a failed load was not confirmed")
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning("diffusers: memory cleanup after a failed load was not confirmed (stage=%s exception_class=%s)",
+                               Stage.CLEANUP.value, safe_exception_label(cleanup_exc))
             with self._cond:
                 self._failures[spec.model_id] = [err, self._clock() + self._failure_backoff, False]
                 load.error = err
@@ -704,17 +727,18 @@ class ImageModelManager:
                 self._cond.notify_all()
 
     def _attempt_pipeline_load(self, spec: ImageModelSpec, variant: LoadVariant):
-        """Return only a safe enum from a failed loader, never its diagnostics.
+        """Return only a safe kind/literal label from a failed loader.
 
         Returning outside the except block and this short-lived frame allows
         the caller's GC/cache cleanup to reclaim partial pipelines before a
         fallback. A successful loader returns its normal (pipeline, device).
         """
         try:
-            return self._loader(spec, variant), None
+            return self._loader(spec, variant), None, None
         except Exception as exc:
             kind = classify_failure(exc)
-        return None, kind
+            label = safe_exception_label(exc)
+        return None, kind, label
 
     def _enter_replacement_phase(self, load: _Load) -> None:
         """End preparation without racing an outgoing model's idle teardown.
@@ -757,17 +781,15 @@ class ImageModelManager:
             load.evicting = True  # stop leasing the outgoing model; it would starve the drain
             drained = self._cond.wait_for(lambda: previous.inflight == 0, timeout=self._drain_timeout)
             if not drained:
-                raise TimeoutError(
-                    f"timed out after {self._drain_timeout:.0f}s waiting for in-flight generations "
-                    f"on {previous.spec.model_id} to finish"
-                )
+                raise ModelLoadFailed(load.spec.model_id, FailureKind.DRAIN_TIMEOUT)
             self._resident = None
             pipe = previous.pipe
             previous.pipe = None
         try:
             self._unloader(pipe)
-        except Exception:  # noqa: BLE001 - best effort; memory is reclaimed below
-            logger.exception("diffusers: unloading %s raised; continuing", previous.spec.model_id)
+        except Exception as exc:  # noqa: BLE001 - best effort; memory is reclaimed below
+            logger.warning("diffusers: unloading %s raised; continuing (stage=%s exception_class=%s)",
+                           previous.spec.model_id, Stage.UNLOAD.value, safe_exception_label(exc))
         finally:
             del pipe
             del previous

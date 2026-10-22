@@ -700,11 +700,40 @@ def test_failed_attempt_followed_by_vram_skips_is_static_503_not_warming(client,
     assert "candidate int8 failed [model_runtime]: model runtime failed" in caplog.text
 
 
+def test_outgoing_drain_timeout_is_static_busy_500_not_model_io(client, monkeypatch, caplog):
+    attempts, unloaded = [], []
+
+    def load(spec, variant):
+        attempts.append(spec.model_id)
+        return object(), "cuda"
+
+    manager = ImageModelManager(
+        app.ALLOWED_IMAGE_MODELS, ZIMG, loader=load, unloader=unloaded.append,
+        warm_wait_seconds=5, drain_timeout_seconds=0,
+        pinned_models=frozenset(app.ALLOWED_IMAGE_MODELS),
+    )
+    monkeypatch.setattr(app, "_manager", manager)
+    lease = manager.lease(ZIMG)
+    try:
+        resp = _post(client, FLUX)
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == f"failed to load model {FLUX}: previous model is still busy"
+        assert "Retry-After" not in resp.headers
+        assert attempts == [ZIMG] and unloaded == []
+        assert manager.loaded_model() == ZIMG
+        assert "[drain_timeout]: previous model is still busy" in caplog.text
+        assert "model files are unavailable" not in resp.text + caplog.text
+    finally:
+        lease.release()
+
+
 @pytest.mark.parametrize("pipeline", ["image", "video"])
 @pytest.mark.parametrize("cause, kind, reason", [
     ("disk", "disk_space", "insufficient disk space for model download"),
     ("gated", "repository_access_denied", "model repository access denied"),
     ("missing", "repository_not_found", "model repository not found or inaccessible"),
+    ("cache-miss", "model_files_unavailable", "model files are unavailable"),
+    ("entry-missing", "model_files_unavailable", "model files are unavailable"),
 ])
 def test_typed_load_refusals_keep_static_actionable_http_context(
     client, monkeypatch, caplog, pipeline, cause, kind, reason,
@@ -717,14 +746,24 @@ def test_typed_load_refusals_keep_static_actionable_http_context(
     class GatedRepoError(RepositoryNotFoundError):
         pass
 
+    class EntryNotFoundError(FileNotFoundError, ValueError):
+        pass
+
+    class LocalEntryNotFoundError(EntryNotFoundError):
+        pass
+
     module = ModuleType("huggingface_hub.errors")
     module.RepositoryNotFoundError = RepositoryNotFoundError
     module.GatedRepoError = GatedRepoError
+    module.EntryNotFoundError = EntryNotFoundError
+    module.LocalEntryNotFoundError = LocalEntryNotFoundError
     monkeypatch.setitem(sys.modules, module.__name__, module)
     failure_class = {
         "disk": app.model_preflight.InsufficientDiskSpaceError,
         "gated": GatedRepoError,
         "missing": RepositoryNotFoundError,
+        "cache-miss": LocalEntryNotFoundError,
+        "entry-missing": EntryNotFoundError,
     }[cause]
     attempts = []
 
