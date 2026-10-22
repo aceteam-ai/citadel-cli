@@ -43,6 +43,40 @@
 // future adapter retain that responsibility. Scope directories are trusted
 // node configuration, not authority supplied by a request.
 //
+// # Strict construction follow-up (#1436, partial)
+//
+// jobs.NewMemoryGitHandler requires a nonnil Engine, live Shell permission
+// callback, strict State callback and the configured node-wide shared throttle.
+// Its fields are private and nil/zero/incomplete handlers refuse execution.
+// Construction does not evaluate live callbacks; each dispatch still applies
+// ShellGateReason's existing runtime refusal order. Legacy passcode callbacks
+// cannot be supplied to this constructor. Neither the generic shell gate nor
+// existing shell/desktop/workflow throttle behavior is changed.
+//
+// A nonnil throttle establishes only dependency presence. The node's future
+// wiring must supply the actual shared configured object; this constructor
+// cannot prove pointer identity across consumers or effective tuning. Existing
+// nonpositive/disabled throttle tuning semantics are not changed or certified.
+// The fixtures use NewPasscodeThrottle with positive defaults and exercise
+// failure-budget sharing through actual shell and memory-git handlers.
+//
+// This is not activation or completion of #1436. The future transport/producer
+// contract must settle metadata keys such as target_node, timeout_ms and rayId;
+// they remain rejected, not silently stripped or accepted here. The adapter
+// must preserve the server-attached passcode until this handler checks it,
+// using the existing plain NewLegacyHandlerAdapter shape, not a desktop-style
+// passcodeGate that deletes the field. No adapter, registration or capability
+// advertisement is added by this follow-up; the unregistered fixture remains.
+// Actual platform node identity, authenticated scope selection and exact-node
+// credential attachment still need their separately reviewed integration.
+//
+// Repository provisioning also remains separate: node ownership/private .git
+// mode, clone/import hardlinks, repacking, metadata-walk bounds and an accepted
+// maintenance/GC policy must be addressed before activation. This slice does
+// not change repository policy, Git configuration, argv, environment or runner.
+// Local candidate tests, builds and native acceptance have not been run for
+// this follow-up; existing GitHub CI is separate evidence, not activation.
+//
 // The first runner supports Linux only and fails closed elsewhere. It requires
 // a node-owned repository with a private .git directory and no metadata
 // symlinks, hardlinks, special files, linked worktrees, alternate object roots

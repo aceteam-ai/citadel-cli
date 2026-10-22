@@ -514,6 +514,13 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`jobs.NewMemoryGitHandler` owns the inactive memory-git construction contract:
+live permission, strict passcode State and the actual shared node throttle are
+required; legacy callbacks and zero-value construction cannot enable it.
+`ShellGateReason` still owns runtime refusal precedence. The partial #1436
+activation gates remain in `internal/memorygit/doc.go`; no registry or
+capability advertises this source.
+
 The worker (`citadel worker`) is the high-performance job queue mode designed for AceTeam's private GPU cloud infrastructure. Written in Go for maximum concurrency and throughput, it routes inference requests to private vLLM/Ollama/llama.cpp clusters.
 
 **Why Go?** The Citadel worker is intentionally written in Go (not Python) for:
