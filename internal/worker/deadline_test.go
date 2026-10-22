@@ -203,6 +203,12 @@ func TestExecuteWithDeadlineUnblocksHungHandler(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("second job never ran; the loop was wedged by the hung handler")
 	}
+	// Handler entry is not terminal completion: cancellation can still win the
+	// watchdog's result delivery. Wait for the real source ACK before shutdown.
+	waitFor(t, func() bool {
+		acked := source.AckedJobs()
+		return len(acked) == 1 && acked[0].ID == "job-2"
+	}, "second job did not reach terminal acknowledgement")
 	cancel()
 	<-runDone
 
