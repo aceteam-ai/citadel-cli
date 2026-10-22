@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -71,7 +72,11 @@ func TestLLMPolicyInvalidEndpointsDoNotEchoInput(t *testing.T) {
 		"http://public.example/private\nmarker", "http://public.example/%private-marker",
 		"http://*.example/private-marker", "http://public.example/" + strings.Repeat("x", maxLLMURLBytes),
 	} {
-		_, _, err := (LLMPolicy{}).resolveURL(context.Background(), raw)
+		p := LLMPolicy{resolve: func(context.Context, string) ([]netip.Addr, error) {
+			t.Error("invalid endpoint reached name resolution")
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+		}}
+		_, _, err := p.resolveURL(context.Background(), raw)
 		if err == nil || strings.Contains(err.Error(), "private-marker") || strings.Contains(err.Error(), "public.example") {
 			t.Fatalf("invalid endpoint accepted or echoed: %v", err)
 		}
@@ -87,9 +92,73 @@ func TestLLMPolicyDefaultDeniesPrivateAndHardRanges(t *testing.T) {
 		"192.0.2.1", "198.18.0.1", "2001:db8::1", "64:ff9b::7f00:1", "64:ff9b:1::a00:1",
 		"2002:7f00:1::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "::ffff:0:7f00:1",
 	} {
-		endpoint := "http://" + net.JoinHostPort(address, "11434") + "/api/chat"
+		endpoint := "http://" + net.JoinHostPort(address, "11435") + "/api/chat"
 		if _, _, err := (LLMPolicy{}).resolveURL(context.Background(), endpoint); err == nil {
 			t.Fatalf("default policy allowed %s", address)
+		}
+	}
+}
+
+func TestLLMPolicyBuiltInDefaultIsExact(t *testing.T) {
+	p := LLMPolicy{resolve: func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}}
+	if _, ip, err := p.resolveURL(context.Background(), defaultLLMEndpoint); err != nil || ip.String() != "127.0.0.1" {
+		t.Fatalf("built-in Ollama endpoint refused: %v", err)
+	}
+	for _, raw := range []string{
+		"http://localhost:11434/api/chat", "http://127.0.0.2:11434/api/chat",
+		"http://127.0.0.1:11435/api/chat", "https://127.0.0.1:11434/api/chat",
+		"http://127.0.0.1:11434/api/delete", "http://127.0.0.1:11434/api/pull",
+		"http://127.0.0.1:11434/api/chat/", "http://127.0.0.1:11434/api/%63hat",
+		"http://127.0.0.1:11434/api/x/../chat", "http://127.0.0.1:11434/api//chat",
+		"http://127.0.0.1:011434/api/chat", "http://[::ffff:127.0.0.1]:11434/api/chat",
+		"http://[::7f00:1]:11434/api/chat",
+	} {
+		if _, _, err := p.resolveURL(context.Background(), raw); err == nil {
+			t.Fatalf("built-in exception authorized another endpoint: %q", raw)
+		}
+	}
+	if _, _, err := (LLMPolicy{}).resolveURL(context.Background(), "https://8.8.8.8/api/chat"); err != nil {
+		t.Fatalf("built-in exception changed public endpoint policy: %v", err)
+	}
+}
+
+func TestLLMPolicyMeshGrantAndEmptyPathEquivalence(t *testing.T) {
+	const mesh = "http://100.64.0.58:11434/api/chat"
+	if _, ip, err := mustLLMPolicy(t, mesh).resolveURL(context.Background(), mesh); err != nil || ip.String() != "100.64.0.58" {
+		t.Fatalf("explicit mesh endpoint refused: %v", err)
+	}
+	for _, grant := range []string{"http://127.0.0.1:11434", "http://127.0.0.1:11434/"} {
+		p := mustLLMPolicy(t, grant)
+		for _, endpoint := range []string{"http://127.0.0.1:11434", "http://127.0.0.1:11434/"} {
+			if u, _, err := p.resolveURL(context.Background(), endpoint); err != nil || u.Path != "/" {
+				t.Fatalf("empty/root path equivalence refused: %v", err)
+			}
+		}
+	}
+}
+
+func TestLLMRequestURLDefaultHostPort(t *testing.T) {
+	for _, tc := range []struct {
+		endpoint string
+		host     string
+	}{
+		{"http://model.example/api/chat", "model.example"},
+		{"http://model.example:80/api/chat", "model.example"},
+		{"https://model.example:443/api/chat", "model.example"},
+		{"http://[2606:4700:4700::1111]:80/api/chat", "[2606:4700:4700::1111]"},
+		{"https://[2606:4700:4700::1111]:443/api/chat", "[2606:4700:4700::1111]"},
+		{defaultLLMEndpoint, "127.0.0.1:11434"},
+	} {
+		u, err := canonicalLLMEndpoint(tc.endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		canonical := u.String()
+		req, err := http.NewRequest(http.MethodPost, llmRequestURL(u).String(), nil)
+		if err != nil || req.Host != tc.host || u.String() != canonical {
+			t.Fatalf("request Host or canonical grant changed for %q: %v", tc.endpoint, err)
 		}
 	}
 }
@@ -173,25 +242,34 @@ func TestLLMPolicyDNSChecksEveryAnswer(t *testing.T) {
 func TestLoadLLMPolicyMissingInvalidAndSymlink(t *testing.T) {
 	dir := t.TempDir()
 	if p := LoadLLMPolicy(dir); p.loadErr != nil || len(p.endpoints) != 0 {
-		t.Fatal("missing policy is not public-only")
+		t.Fatal("missing policy did not retain defaults")
 	}
 	if p := LoadLLMPolicy(filepath.Join(dir, "absent-directory")); p.loadErr != nil {
-		t.Fatal("missing node directory is not public-only")
+		t.Fatal("missing node directory did not retain defaults")
 	}
-	if p := LoadLLMPolicy(""); p.loadErr == nil {
-		t.Fatal("empty config location silently accepted")
+	if p := LoadLLMPolicy(""); p.loadErr == nil || p.loadWhy != "node_directory_missing" {
+		t.Fatal("empty config location accepted or lost its bounded diagnostic")
 	}
 	path := filepath.Join(dir, LLMPolicyFile)
-	for _, data := range []string{"invalid: true", "allow: []\n" + strings.Repeat(" ", maxLLMPolicyBytes)} {
-		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+	for _, tc := range []struct {
+		data   string
+		reason string
+	}{
+		{"invalid: private-marker", "invalid_policy_document"},
+		{"allow: []\n" + strings.Repeat(" ", maxLLMPolicyBytes), "file_too_large"},
+	} {
+		if err := os.WriteFile(path, []byte(tc.data), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		p := LoadLLMPolicy(dir)
-		if p.loadErr == nil {
-			t.Fatal("invalid/oversized policy silently fell back")
+		if p.loadErr == nil || p.loadWhy != tc.reason || strings.Contains(p.loadErr.Error(), "private-marker") {
+			t.Fatal("invalid/oversized policy lost its bounded failure diagnostic")
 		}
 		if _, _, err := p.resolveURL(context.Background(), "http://8.8.8.8/api/chat"); err == nil {
 			t.Fatal("load failure still allowed public traffic")
+		}
+		if _, _, err := p.resolveURL(context.Background(), defaultLLMEndpoint); err == nil {
+			t.Fatal("load failure still allowed built-in Ollama")
 		}
 	}
 	if err := os.WriteFile(path, []byte("allow: [{endpoint: 'http://127.0.0.1:11434/api/chat'}]"), 0o600); err != nil {
@@ -205,7 +283,7 @@ func TestLoadLLMPolicyMissingInvalidAndSymlink(t *testing.T) {
 	if err := os.Symlink(path, filepath.Join(aliasDir, LLMPolicyFile)); err != nil {
 		t.Skipf("symlink unavailable on this test host: %v", err)
 	}
-	if p := LoadLLMPolicy(aliasDir); p.loadErr == nil {
-		t.Fatal("symlinked policy was accepted")
+	if p := LoadLLMPolicy(aliasDir); p.loadErr == nil || p.loadWhy != "file_not_regular" {
+		t.Fatal("symlinked policy was accepted or lost its bounded diagnostic")
 	}
 }

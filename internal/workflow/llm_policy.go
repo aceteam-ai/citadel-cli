@@ -28,6 +28,7 @@ const (
 	maxLLMURLBytes      = 4096
 	llmRequestTimeout   = 5 * time.Minute
 	maxLLMResponseBytes = 10 << 20
+	defaultLLMEndpoint  = "http://127.0.0.1:11434/api/chat"
 )
 
 // ErrLLMResponseTooLarge means no response/result was accepted.
@@ -35,58 +36,68 @@ var ErrLLMResponseTooLarge = errors.New("LLM response exceeds the size limit")
 
 var llmMeshPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
-// LLMPolicy is immutable at construction. Its zero value is public-only. Only
-// machine-local exact endpoints can grant loopback/private access; neither the
-// workflow graph nor HTTPPolicy grants are authority for an LLM request.
+// LLMPolicy is immutable at construction. Its zero value permits public URLs
+// and the exact built-in Ollama endpoint. Other loopback/private endpoints need
+// machine-local exact grants; graphs and HTTPPolicy cannot supply them.
 type LLMPolicy struct {
 	endpoints map[string]bool
 	loadErr   error
+	loadWhy   string // bounded local diagnostic, never raw filesystem/YAML text
 	resolve   func(context.Context, string) ([]netip.Addr, error)
 	dial      func(context.Context, string, string) (net.Conn, error)
 }
 
 // LoadLLMPolicy reads only the explicitly supplied node configuration directory.
-// Missing means public-only. Other errors disable LLM destinations, with one
-// content-free diagnostic, never a fallback to an unrestricted client.
+// Missing means the default policy. Other errors disable all LLM destinations
+// with one content-free diagnostic, never an unrestricted-client fallback.
 func LoadLLMPolicy(nodeConfigDir string) LLMPolicy {
-	refuse := func() LLMPolicy {
-		slog.Warn("workflow LLM policy unreadable or invalid; LLM destinations disabled")
-		return LLMPolicy{loadErr: errors.New("LLM policy unreadable or invalid")}
+	refuse := func(reason string) LLMPolicy {
+		slog.Warn("workflow LLM policy unreadable or invalid; LLM destinations disabled", "reason", reason)
+		return LLMPolicy{loadErr: errors.New("LLM policy unreadable or invalid"), loadWhy: reason}
 	}
 	if nodeConfigDir == "" {
-		return refuse()
+		return refuse("node_directory_missing")
 	}
 	root, err := os.OpenRoot(nodeConfigDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return LLMPolicy{}
 	}
 	if err != nil {
-		return refuse()
+		return refuse(httpPolicyIOReason("directory", err))
 	}
 	defer root.Close()
 	before, err := root.Lstat(LLMPolicyFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return LLMPolicy{}
 	}
-	if err != nil || !before.Mode().IsRegular() || before.Size() > maxLLMPolicyBytes {
-		return refuse()
+	if err != nil {
+		return refuse(httpPolicyIOReason("stat", err))
+	}
+	if !before.Mode().IsRegular() {
+		return refuse("file_not_regular")
+	}
+	if before.Size() > maxLLMPolicyBytes {
+		return refuse("file_too_large")
 	}
 	f, err := root.Open(LLMPolicyFile)
 	if err != nil {
-		return refuse()
+		return refuse(httpPolicyIOReason("open", err))
 	}
 	defer f.Close()
 	after, err := f.Stat()
 	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
-		return refuse()
+		return refuse("file_changed_during_open")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxLLMPolicyBytes+1))
-	if err != nil || len(data) > maxLLMPolicyBytes {
-		return refuse()
+	if err != nil {
+		return refuse(httpPolicyIOReason("read", err))
+	}
+	if len(data) > maxLLMPolicyBytes {
+		return refuse("file_too_large")
 	}
 	policy, err := parseLLMPolicy(data)
 	if err != nil {
-		return refuse()
+		return refuse("invalid_policy_document")
 	}
 	return policy
 }
@@ -201,7 +212,9 @@ func (p LLMPolicy) resolveURL(ctx context.Context, raw string) (*url.URL, netip.
 			return refused("name resolution failed")
 		}
 	}
-	granted := p.endpoints[u.String()]
+	// This exception is intentionally the exact built-in spelling, not any DNS
+	// alias, normalized address spelling, neighboring path or another port.
+	granted := raw == defaultLLMEndpoint || p.endpoints[u.String()]
 	for _, address := range addresses {
 		class, _ := httpAddressClass(address)
 		normalized := normalizeHTTPAddress(address)
@@ -218,4 +231,14 @@ func (p LLMPolicy) resolveURL(ctx context.Context, raw string) (*url.URL, netip.
 
 func (p LLMPolicy) clientFor(u *url.URL, ip netip.Addr) *http.Client {
 	return (HTTPPolicy{dial: p.dial}).clientFor(u, ip, llmRequestTimeout)
+}
+
+// llmRequestURL leaves canonical grant identity intact while avoiding an
+// explicit default port in the wire Host authority (including bracketed IPv6).
+func llmRequestURL(u *url.URL) *url.URL {
+	request := *u
+	if (u.Scheme == "http" && u.Port() == "80") || (u.Scheme == "https" && u.Port() == "443") {
+		request.Host = strings.TrimSuffix(u.Host, ":"+u.Port())
+	}
+	return &request
 }

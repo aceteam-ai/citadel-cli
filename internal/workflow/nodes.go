@@ -50,7 +50,7 @@ func (e *LLMNodeExecutor) Execute(ctx context.Context, node *Node, input map[str
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, llmRequestTimeout)
 	defer cancel()
-	endpoint := stringParam(node.Params, "endpoint", "http://127.0.0.1:11434/api/chat")
+	endpoint := stringParam(node.Params, "endpoint", defaultLLMEndpoint)
 	validatedURL, pinnedIP, err := e.policy.resolveURL(requestCtx, endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("LLM node %q: %w", node.ID, err)
@@ -68,7 +68,7 @@ func (e *LLMNodeExecutor) Execute(ctx context.Context, node *Node, input map[str
 	if err != nil {
 		return nil, fmt.Errorf("LLM node %q: invalid request", node.ID)
 	}
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, validatedURL.String(), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, llmRequestURL(validatedURL).String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("LLM node %q: invalid request", node.ID)
 	}

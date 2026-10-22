@@ -1,103 +1,98 @@
-# Workflow LLM destination policy (#1316)
+# Workflow LLM destination policy
 
-Source-only DRAFT design and implementation plan. #1358 repaired the HTTP node;
-#1316 also requires the LLM node to stop using an unrestricted HTTP client.
-This draft composes the shared address/transport hardening from DRAFT #1401
-with current main, preserving both histories. That dependency still needs its
-own independent review. No deployment, live policy write, local candidate
-execution, undraft or merge is authorized by this document.
+Workflow `LLM` nodes use Ollama's `/api/chat` request/response schema. A graph
+selects an endpoint, but cannot grant itself additional network authority.
+`workflow.LLMPolicy.resolveURL` owns destination validation; the general workflow
+HTTP node has its own independent policy.
 
-## Proposed security and compatibility contract
+## Defaults and exact grants
 
-- An LLM graph chooses a URL, not network authority. The default policy permits
-  only public HTTP(S) destinations. There is no implicit localhost exception.
-- Local Ollama remains an explicitly configurable target, not a blanket bypass.
-  The machine-local `workflow-llm-policy.yaml` can grant an exact full endpoint,
-  including scheme, canonical host, effective port and exact escaped path.
-  Neither a graph, its inputs nor the job payload can supply policy grants.
-- An endpoint grant can permit loopback or private addresses for that endpoint
-  only. It cannot permit link-local/metadata, unspecified, multicast, broadcast,
-  node-local DNS/service, reserved or translated IPv6 ranges. No wildcard,
-  CIDR-wide exception, HTTP-policy inheritance or "allow LAN" switch is added.
-- Validate every DNS result, then pin a numeric connection to one validated
-  address. Disable proxies and redirects. Retain ordinary TLS certificate and
-  hostname verification. Reuse the existing transport, not a second DNS lookup
-  or a custom insecure TLS path. Configured names remain explicit DNS trust;
-  an exact IP endpoint is the narrowest local-service grant.
-- Reject userinfo, query, fragments, scoped addresses, opaque/non-HTTP URLs,
-  malformed hosts/ports and whitespace/control characters. Canonical endpoint
-  matching must not ignore ports, paths or escaped-path distinctions.
-- A single five-minute request context covers DNS, dial, TLS, headers and body,
-  bounded by the caller's earlier deadline/cancellation. Responses are at most
-  10 MiB; an extra byte is a refusal, not silently truncated success. Errors
-  expose static classes/status codes, never raw network errors, URLs, server
-  bodies, prompts or credentials.
-- Policy is immutable at executor construction, just like the HTTP policy.
-  Missing means public-only; unreadable, malformed or oversized means refusal.
-  The file uses a closed YAML schema, at most 64 exact endpoints and 16 KiB;
-  duplicate/unknown keys, aliases and extra documents are invalid. No file is
-  written. Both worker construction sites use the real node config directory.
+Without a policy file, the LLM node permits public HTTP(S) endpoints and the
+exact built-in endpoint `http://127.0.0.1:11434/api/chat`. An omitted `endpoint`
+uses that built-in URL. This is not a blanket loopback exception: `localhost`,
+another IP spelling, another host, another scheme, another port or another path
+needs an explicit grant when it reaches a loopback, LAN or mesh address. Public
+endpoints retain the ordinary public-destination policy, not a grant requirement.
 
-The existing default endpoint is `http://127.0.0.1:11434/api/chat`. Under the
-new policy it is intentionally refused until the node operator explicitly
-grants it. This is a security behavior change, not proof that a default local
-workflow remains compatible. Before any future authorized rollout, review that
-change and let the operator prepare the policy through the normal configuration
-process. This source work does not alter a real node or grant itself an endpoint.
+For other private model services, the node operator can create
+`workflow-llm-policy.yaml` in the machine-local node configuration directory.
+`network.GetNodeConfigDir()` owns the directory choice, the same directory used
+for `workflow-http-policy.yaml`; do not substitute the workspace directory or
+the invocation's user-local CLI configuration directory.
 
-Proposed explicit operator configuration (documentation only):
+For example, these are two separate, exact private-service grants:
 
 ```yaml
 allow:
-  - endpoint: http://127.0.0.1:11434/api/chat
+  - endpoint: http://192.168.1.2:11434/api/chat
+  - endpoint: http://100.64.0.58:11434/api/chat
 ```
 
-This grants only that endpoint to LLM nodes, not `/api/delete`, another port,
-the workflow HTTP node or arbitrary loopback services. It does not bypass the
-workflow's existing caller authorization or Shell gate, grant inference/model
-execution in this development session, or establish model/server trust.
+Use IP literals where possible. A hostname grant trusts that name's DNS for
+loopback/private answers, although hard-denied addresses remain blocked. In
+particular, `localhost` and `127.0.0.1` are separate endpoint identities. A
+`localhost` grant may select `::1`; it will fail if the service only listens on
+IPv4. The client validates every DNS answer, pins the first validated numeric
+address, and does not try the other answers as a connection fallback.
 
-## Phased source work
+The file must be a regular file, not a symlink, at most 16 KiB, with at most 64
+entries in the closed schema above. Unknown or duplicate keys, duplicate
+canonical endpoints, aliases, extra YAML documents and malformed endpoints are
+invalid. `allow: []` adds no grants; it does not remove the built-in endpoint.
+Keep the node configuration directory under the node operator's control. Do not
+set the job workspace to that directory: workspace file-write authority must not
+become policy-write authority.
 
-1. Publish this full plan first. Audit existing LLM request/response behavior,
-   both executor construction sites and shared HTTP address/transport rules.
-   Keep the source/compatibility policy explicitly review-required.
-2. Implement the machine-local policy parser/loader and exact URL resolution,
-   preserving hard-denial and every-answer DNS checking. Prepare hermetic
-   malformed-config, endpoint-confusion, range and rebinding regressions.
-3. Wire the actual LLM executor and both worker entrypoints. Apply bounded
-   request/response and static-error behavior while retaining the existing
-   Ollama request/success-response schema. Update its mock-server test to use
-   the guarded production path rather than a default-client localhost bypass.
-4. Prepare request/redirect/proxy/TLS/cancellation/deadline/body-limit/privacy
-   and real-construction tests, plus source-only operator migration notes.
-   Obtain normal exact-head CI and independent source/security review. Do not
-   assign historical dependency CI to the composed/current head.
+## Loading and updates
 
-## Completion and holds
+`workflow.LoadLLMPolicy` reads the file once at executor construction. Both worker
+entrypoints load from the node directory when the worker starts. After creating,
+editing or removing the policy, restart the worker (`citadel work` service or the
+Control Center-managed worker) through your normal operational procedure. There
+is no hot reload; changing the file does not change an already-running executor.
 
-The issue is not fixed by a parser/helper that the actual LLM executor does not
-use. Both live construction sites and a zero-value executor must enforce the
-policy, and malformed configuration must never silently restore an unrestricted
-client. The HTTP node's security posture must remain unchanged.
+A missing file or missing node directory retains the defaults. An empty directory
+argument, unreadable file, malformed document, oversized file, symlink or file
+replacement during loading disables **all** LLM destinations, including the
+built-in Ollama endpoint. It does not fall back to an unrestricted client. The
+worker emits a static warning with a bounded `reason`, such as
+`invalid_policy_document`, `file_too_large`, `file_not_regular`, or
+`open_permission_denied`. It never logs the policy text, path or raw filesystem
+error. Correct the policy and restart the worker to load it again.
 
-Only existing normal GitHub CI may execute this candidate in this lane. Local
-tests/build/formatter, real network services or LLM calls, model downloads,
-GPU/inference, policy/credential changes and deployment remain held. Source
-approval, compatibility ratification, readiness and native acceptance are
-separate; no automatic merge or node configuration step is included.
+## Endpoint and transport boundaries
 
-Prepared source now wires the actual LLM node and both real worker entrypoints,
-not only a helper. Tests use owned HTTP/TLS fixtures and private resolver/dial
-seams, never a real model server. The old mock-server test explicitly grants
-only its synthetic endpoint through the same production guard. Prepared cases
-cover closed policy/URL schema and limits; every-answer DNS and later rebinding;
-exact local endpoint versus path/port confusion; hard ranges even with grants;
-proxy/redirect/TLS refusal; response limit minus/exact/plus one; static DNS,
-network, server/body/JSON failures; full request and earlier caller deadlines;
-and caller cancellation while DNS, a detached dial or body read is pending.
-These are not locally executed results; fresh normal CI is still required.
+Explicit grants match the canonical full URL: scheme, canonical host, effective
+port and exact escaped path. Host case and a trailing DNS dot normalize; an
+omitted standard port equals `:80` for HTTP or `:443` for HTTPS; an empty path
+equals `/`. Paths otherwise remain distinct: `/api/chat/`, `/api/%63hat`,
+`/api/delete`, `/api/pull` and `/api/x/../chat` are not `/api/chat` grants.
+Canonical address spellings may match an explicit IP grant, but the built-in
+exception only recognizes its exact URL spelling.
 
-Client cancellation is not proof that a model server stopped inference. This
-change neither evicts a service nor establishes native GPU/process-exit custody.
-It does not fix the separately tracked workflow Cancel implementation by itself.
+Grants can allow only loopback or private addresses, including the private mesh
+range. They cannot allow metadata/link-local, unspecified, multicast, broadcast,
+node-local DNS/service, reserved or translated IPv6 addresses. Every DNS answer
+must pass these checks before a connection is made. There are no wildcard or
+CIDR-wide LLM grants, graph/payload grants, HTTP-policy inheritance or unrestricted
+"allow LAN" switch.
+
+Userinfo, queries, fragments, scoped addresses, opaque/non-HTTP(S) URLs, malformed
+hosts/ports and whitespace/control characters are refused. Connections use a
+validated numeric address without a second lookup, no proxy or redirect, and
+ordinary TLS certificate and hostname verification. The wire `Host` omits standard
+`:80`/`:443` ports without changing the canonical grant identity; nonstandard
+ports are retained.
+
+A single five-minute request context covers DNS, dial, TLS, headers and body,
+subject to the caller's earlier deadline or cancellation. Responses larger than
+10 MiB are refused, not truncated into success. Failures expose static classes
+and numeric HTTP status codes, never raw network errors, URLs, response bodies,
+prompts or credentials.
+
+The built-in endpoint and grants do not install, start or trust a model service,
+grant workflow caller authorization or Shell permission, or reserve inference
+capacity. An authorized workflow can request an installed local model through
+the built-in endpoint, which can contend for VRAM. Client cancellation does not
+prove the model server stopped inference, evict a service or establish GPU/process
+exit custody.

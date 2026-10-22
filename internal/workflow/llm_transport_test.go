@@ -102,16 +102,75 @@ func TestLLMZeroPolicyAndPayloadGrantsCannotReachLocalService(t *testing.T) {
 			t.Fatal("zero policy or payload authority bypassed local-service denial")
 		}
 	}
-	// Omitting endpoint does not authorize the legacy local default either.
-	if _, err := (&LLMNodeExecutor{}).Execute(context.Background(), &Node{ID: "llm"}, map[string]any{"prompt": "private"}); err == nil {
-		t.Fatal("legacy localhost default was implicitly allowed")
-	}
 	if requests.Load() != 0 {
 		t.Fatal("refused LLM node contacted the private service")
 	}
 	httpOnly := NewExecutor(ExecutorConfig{HTTP: HTTPPolicy{prefixes: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}}})
 	if _, err := httpOnly.nodeRegistry[NodeTypeLLM].Execute(context.Background(), llmTestNode("http://10.0.0.1:11434/api/chat"), map[string]any{"prompt": "private"}); err == nil {
 		t.Fatal("general HTTP policy granted LLM authority")
+	}
+}
+
+func TestLLMBuiltInDefaultUsesPinnedOwnedFixture(t *testing.T) {
+	var requests, dials atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Host != "127.0.0.1:11434" || r.URL.Path != "/api/chat" {
+			t.Error("built-in request authority or path changed")
+		}
+		_, _ = io.WriteString(w, `{"message":{"content":"synthetic-answer"}}`)
+	}))
+	defer server.Close()
+	p := LLMPolicy{
+		resolve: func(context.Context, string) ([]netip.Addr, error) {
+			t.Error("numeric built-in endpoint reached DNS")
+			return nil, errors.New("unexpected DNS")
+		},
+		dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dials.Add(1)
+			if address != "127.0.0.1:11434" {
+				t.Error("built-in endpoint was not numerically pinned")
+			}
+			// Only our ephemeral fixture is contacted, never a real Ollama port.
+			return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+		},
+	}
+	for _, node := range []*Node{{ID: "llm"}, llmTestNode(defaultLLMEndpoint)} {
+		executor := NewExecutor(ExecutorConfig{LLM: p})
+		output, err := executor.nodeRegistry[NodeTypeLLM].Execute(context.Background(), node, map[string]any{"prompt": "synthetic"})
+		if err != nil || output["response"] != "synthetic-answer" {
+			t.Fatalf("built-in default request failed: %v", err)
+		}
+	}
+	if requests.Load() != 2 || dials.Load() != 2 {
+		t.Fatalf("built-in default did not use the pinned fixture: requests=%d dials=%d", requests.Load(), dials.Load())
+	}
+}
+
+func TestLLMActualRequestOmitsDefaultHostPort(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Host != "model.example" {
+			t.Error("wire Host retained the default port")
+		}
+		_, _ = io.WriteString(w, `{"message":{"content":"synthetic-answer"}}`)
+	}))
+	defer server.Close()
+	p := LLMPolicy{
+		resolve: func(context.Context, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+		},
+		dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if address != "8.8.8.8:80" {
+				t.Error("default port changed numeric pinning")
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+		},
+	}
+	_, err := (&LLMNodeExecutor{policy: p}).Execute(context.Background(), llmTestNode("http://model.example:80/api/chat"), map[string]any{"prompt": "synthetic"})
+	if err != nil || requests.Load() != 1 {
+		t.Fatalf("default-port request failed: %v", err)
 	}
 }
 
