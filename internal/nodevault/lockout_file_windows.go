@@ -10,7 +10,17 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const lockoutStatusSupported = true
+
 func openLockoutFile(path string) (*os.File, error) {
+	return openWindowsLockoutFile(path, windows.OPEN_ALWAYS)
+}
+
+func openExistingLockoutFile(path string) (*os.File, error) {
+	return openWindowsLockoutFile(path, windows.OPEN_EXISTING)
+}
+
+func openWindowsLockoutFile(path string, disposition uint32) (*os.File, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
@@ -19,7 +29,7 @@ func openLockoutFile(path string) (*os.File, error) {
 	// final reparse point; omitting SHARE_DELETE prevents pathname replacement
 	// while any cooperating process owns an open lock handle.
 	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_ALWAYS,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, disposition,
 		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
 		return nil, err

@@ -12,12 +12,13 @@ func prepareLockoutStateFile(file *os.File, dir string) error {
 	return prepareLockoutStateOwner(file, dir, os.Geteuid(), unix.Fchown)
 }
 
-// Read ownership from a pinned, no-follow parent descriptor, then change only
+// Read ownership from a pinned, resolved parent descriptor, then change only
 // the new temporary inode. No existing state or supplied symlink is chowned.
 // The existing node directory and its ancestors must remain trusted; this is
 // not a defense against a malicious directory owner renaming parent entries.
+// A trusted parent symlink is supported, as it is by the sidecar parent stat.
 func prepareLockoutStateOwner(file *os.File, dir string, euid int, chown func(int, int, int) error) error {
-	parentFD, err := unix.Open(dir, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	parentFD, err := unix.Open(dir, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY, 0)
 	if err != nil {
 		return err
 	}

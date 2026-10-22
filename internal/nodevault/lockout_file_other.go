@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+const lockoutStatusSupported = false
+
+func openExistingLockoutFile(string) (*os.File, error) {
+	return nil, ErrLockoutUnavailable
+}
+
 func openLockoutFile(string) (*os.File, error) {
 	return nil, ErrLockoutUnavailable
 }

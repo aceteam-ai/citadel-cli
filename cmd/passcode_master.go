@@ -339,7 +339,7 @@ func runPasscodeStatus(cmd *cobra.Command, args []string) error {
 // legacy node passcode).
 func printLockoutStatus(lo nodevault.LockoutStatus) {
 	if lo.Unavailable {
-		fmt.Println("Lockout: UNAVAILABLE. Passcode checks are denied. Run 'citadel passcode reset-lockout' at the node to recover state.")
+		fmt.Println("Lockout: UNAVAILABLE. Passcode checks are denied. Local 'citadel passcode reset-lockout' can recover unreadable state, not an unusable lock sidecar; inspect node-local ownership and permissions. Never remove a live lock sidecar.")
 	} else if lo.LockedOut {
 		fmt.Printf("Lockout: ACTIVE until %s (%d failed attempts). Run 'citadel passcode reset-lockout' at the node to clear it.\n", lo.LockoutUntil.Format("15:04:05"), lo.FailedAttempts)
 	} else if lo.FailedAttempts > 0 {

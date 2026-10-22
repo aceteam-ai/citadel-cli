@@ -4,7 +4,7 @@ package nodevault
 
 import (
 	"errors"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,6 +12,8 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+const lockoutStatusSupported = true
 
 func openLockoutFile(path string) (*os.File, error) {
 	flags := unix.O_RDWR | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
@@ -32,9 +34,8 @@ func openLockoutFile(path string) (*os.File, error) {
 			return nil, err
 		}
 	}
-	var st, parent unix.Stat_t
-	if unix.Fstat(fd, &st) != nil || unix.Stat(filepath.Dir(path), &parent) != nil ||
-		st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Mode&0o777 != 0o600 {
+	st, parent, err := lockoutFileMetadata(fd, path)
+	if err != nil {
 		_ = file.Close()
 		return nil, ErrLockoutUnavailable
 	}
@@ -45,10 +46,38 @@ func openLockoutFile(path string) (*os.File, error) {
 	}
 	if fallback {
 		lockoutRootOwnerWarning.Do(func() {
-			log.Print("nodevault: lockout sidecar remains root-owned; non-root access requires offline ownership reconciliation after all participating processes stop")
+			slog.Warn("nodevault: lockout sidecar remains root-owned; non-root access requires offline ownership reconciliation after all participating processes stop")
 		})
 	}
 	return file, nil
+}
+
+// Existing-only inspection shares pure validation, never creator assignment,
+// mode repair, warnings or flock acquisition. Parent aliases remain trusted.
+func openExistingLockoutFile(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	state, parent, err := lockoutFileMetadata(fd, path)
+	if err == nil {
+		_, err = existingLockoutFileOwner(state, parent, os.Geteuid())
+	}
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func lockoutFileMetadata(fd int, path string) (unix.Stat_t, unix.Stat_t, error) {
+	var state, parent unix.Stat_t
+	if unix.Fstat(fd, &state) != nil || unix.Stat(filepath.Dir(path), &parent) != nil ||
+		state.Mode&unix.S_IFMT != unix.S_IFREG || state.Nlink != 1 || state.Mode&0o777 != 0o600 {
+		return state, parent, ErrLockoutUnavailable
+	}
+	return state, parent, nil
 }
 
 var lockoutRootOwnerWarning sync.Once
@@ -68,6 +97,11 @@ func checkLockoutFileOwner(fd int, state, parent unix.Stat_t, created bool, euid
 			return false, ownerErr
 		}
 	}
+	return existingLockoutFileOwner(state, parent, euid)
+}
+
+// Pure owner policy shared with status, which must never try assignment.
+func existingLockoutFileOwner(state, parent unix.Stat_t, euid int) (bool, error) {
 	if state.Uid == parent.Uid {
 		return false, nil
 	}

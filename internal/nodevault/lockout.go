@@ -130,8 +130,12 @@ func (l *Lockout) Attempt(check func() bool) error {
 	return recordSuccessAt(l.path)
 }
 
-// Status returns the current node-wide lockout state.
+// Status returns a read-only availability/state snapshot, not a guarantee of
+// future transaction success or a check for current advisory-lock contention.
 func (l *Lockout) Status() LockoutStatus {
+	if err := inspectLockoutSidecar(l.path + ".lock"); err != nil {
+		return LockoutStatus{Unavailable: true}
+	}
 	now := time.Now()
 	s, err := loadLockoutAt(l.path, now)
 	if err != nil {

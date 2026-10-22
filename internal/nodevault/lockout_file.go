@@ -14,6 +14,35 @@ var ErrLockoutUnavailable = errors.New("nodevault: lockout transaction unavailab
 
 const lockoutLockWait = 3 * time.Second
 
+// inspectLockoutSidecar never creates/repairs a file or acquires its lock. A
+// missing sidecar on a supported OS is a healthy snapshot, not proof that it
+// could be created or a later state write could succeed. Filesystem operations
+// have no hard deadline; remote/untrusted filesystem behavior is out of scope.
+func inspectLockoutSidecar(path string) error {
+	if !lockoutStatusSupported {
+		return ErrLockoutUnavailable
+	}
+	before, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil || !before.Mode().IsRegular() {
+		return ErrLockoutUnavailable
+	}
+	file, err := openExistingLockoutFile(path)
+	if err != nil {
+		return ErrLockoutUnavailable
+	}
+	defer file.Close()
+	opened, statErr := file.Stat()
+	after, pathErr := os.Lstat(path)
+	if statErr != nil || pathErr != nil || !after.Mode().IsRegular() ||
+		!os.SameFile(before, opened) || !os.SameFile(opened, after) {
+		return ErrLockoutUnavailable
+	}
+	return nil
+}
+
 // The persistent sidecar is never unlinked: state writes replace the YAML
 // inode, and unlinking a lock would allow different processes to lock different
 // inodes. Only the state transaction belongs here, never a secret check/KDF.

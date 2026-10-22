@@ -95,3 +95,38 @@ All designs assume the existing node directory is trusted: a malicious owner of
 that directory is not defeated by advisory locking or pathname identity checks.
 First creation by root can transiently refuse a concurrent non-root opener until
 ownership is assigned; a refusal never grants authentication authority.
+
+## Trusted parent compatibility and upgrade limits
+
+R1 follow-up plan: allow the trusted node/state parent directory to resolve
+through a symlink, matching the existing sidecar parent-stat contract. Pin the
+resolved directory descriptor with `O_DIRECTORY`, then retain descriptor-only
+ownership validation/assignment for the new temporary state inode. Do not
+relax final-sidecar no-follow, mode, link-count or owner checks. Prepare a real
+legacy Attempt/history/Reset regression through a temporary symlinked node
+directory, while retaining the temporary-name substitution-target protections.
+The root-owner fallback warning uses the existing structured warning sink and
+remains static and once per process. No live ownership recovery is performed.
+
+An old root worker may have left lockout YAML root-owned and unreadable to a
+non-root caller. That caller now reports unavailable and refuses authentication
+rather than interpreting a failed read as a clean slate. A later successful
+root state publication can assign the parent owner; explicit local-presence
+reset can replace unreadable history where the caller has directory authority.
+Neither is an automatic repair guarantee. A root-owned fallback **sidecar** is
+different: non-root reset cannot use it, and ownership reconciliation remains
+offline with all participants stopped. Native macOS/Windows, privileged real
+cross-UID/root-fallback operation and mixed-UID handover remain acceptance gates;
+unprivileged injected fixtures and cross-compilation do not establish them.
+
+L3 status inspection is an existing-only diagnostic snapshot. On supported
+OSes an absent sidecar is healthy without creating it or its parent. A present
+sidecar must satisfy the same current type/link/owner/access contract (0600 on
+Unix; existing ACL/reparse/handle rules on Windows), with descriptor/path
+identity checks before/after opening. An unsupported mutation backend reports
+unavailable even when the sidecar is absent. Inspection never creates,
+chmods/chowns, repairs, acquires/waits for a lock, or emits a fallback warning.
+An existing held lock is not an availability failure. A successful snapshot
+does not prove future write/chown/rename/fsync success, lack of contention or
+stable permissions; filesystem operations have no hard deadline. Status cannot
+authorize access or promise that reset repairs an unusable sidecar.

@@ -74,4 +74,7 @@ func TestPrintLockoutStatusDoesNotPresentUnavailableStateAsClean(t *testing.T) {
 	if !strings.Contains(output, "UNAVAILABLE") || !strings.Contains(output, "reset-lockout") || strings.Contains(output, "ACTIVE") || strings.Contains(output, "99") {
 		t.Fatalf("unavailable status was misleading: %q", output)
 	}
+	if !strings.Contains(output, "not an unusable lock sidecar") || !strings.Contains(output, "Never remove a live lock sidecar") {
+		t.Fatalf("unavailable guidance promised sidecar recovery: %q", output)
+	}
 }
