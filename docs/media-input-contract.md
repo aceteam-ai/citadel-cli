@@ -44,6 +44,14 @@ Each negative has an expected static refusal reason, checked in both Go and
 the independent stdlib Python replay. Both pin the fixture's SHA-256. A wrong
 type for `inputs` is `invalid_inputs`; an array with wrong role/cardinality is
 `invalid_roles` (the parser's structural bounds still apply first).
+The Python replay uses a bounded integer hook: it converts at most 19 decimal
+digits (the signed 64-bit width) and represents longer integer lexemes by a
+fieldless marker. Normal schema/type checks still run first; a numeric marker
+in `size` is `invalid_size`, matching Go's bounded `ParseInt` refusal. This
+does not raise Python's process-wide integer limit, retain the oversized
+lexeme, or construct an unbounded integer. The existing envelope, shape and
+1..16 MiB size limits are unchanged. The shared 4301-digit size negative and
+hook/sign/type-precedence fixtures cover this source-only correction.
 The illustrative hashes and
 capabilities do not identify real images, documents or live credentials. An
 input fixture pin is not proof of image integrity or execution approval.
@@ -94,7 +102,7 @@ The sole shared fixture must be extended and repinned jointly, not forked.
 Main's accepted C1a input-only fixture is SHA-256
 `e386064cb2c371cadc8bdc4eb6475adf78510a14fa9ae9aac450bcd830c185e0`;
 this draft's lexical/refusal follow-ups use
-`6d19921e8d842ecd00dfba709ad073eacc0511dce7f12e9c2107b0e0f8fcca1e`,
+`808f87bb7e1315b2f4d910eb3340257c951fb51cd7ba0f3a4187adce6e77a41e`,
 which is not yet paired platform ratification. Neither pin covers upload/results
 or video activation. No extended parser, new task or live producer is activated.
 
