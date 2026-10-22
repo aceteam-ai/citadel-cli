@@ -64,19 +64,21 @@ Use --shell to instead open an interactive shell on the running control center
 With a NAME, attach to that declared node-local harness session instead.
 The default detach chord is Ctrl+] then d; detaching never stops the harness.
 Use --readonly to forbid input or --take-control for an explicit local takeover.`,
-	Args: validateDeclaredAttach,
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		if len(args) == 1 {
-			return // Named harness attach is intentionally local-only.
-		}
-		rootCmd.PersistentPreRun(cmd, args) // Preserve legacy no-name startup.
-	},
-	RunE:         runAttach,
-	SilenceUsage: true,
+	Args:             validateDeclaredAttach,
+	PersistentPreRun: declaredAttachPreRun,
+	RunE:             runAttach,
+	SilenceUsage:     true,
 	// The no-worker path prints its own friendly guidance and returns
 	// errNoRunningWorker purely to carry a non-zero exit for scripts; silence
 	// cobra's own "Error: ..." line so the guidance is not printed twice.
 	SilenceErrors: true,
+}
+
+func declaredAttachPreRun(cmd *cobra.Command, args []string) {
+	if len(args) == 1 {
+		return // Named harness attach is intentionally local-only.
+	}
+	rootCmd.PersistentPreRun(cmd, args) // Preserve legacy no-name startup.
 }
 
 // errNoRunningWorker is returned (exit 1) when there is nothing to attach to. The

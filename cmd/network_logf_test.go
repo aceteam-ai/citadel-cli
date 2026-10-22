@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -44,14 +45,17 @@ func TestRootPersistentPreRunWiresNetworkLogf(t *testing.T) {
 // Cobra runs only the CLOSEST PersistentPreRun in the chain, not all of them. A
 // subcommand that grows its own would stop inheriting the root's wiring and go
 // back to discarding diagnostics -- with no compile error and no test failure
-// anywhere else. If this fires, the new hook must call
-// rootCmd.PersistentPreRun(cmd, args) itself.
+// anywhere else. The three declared-session entrypoints are intentionally local
+// and must not run root's credential, CA or updater startup. Their exact named
+// hooks are checked separately, including legacy attach delegation. No other
+// hook, error hook, nested command or same-name replacement gets this exception.
 func TestNoSubcommandShadowsRootPersistentPreRun(t *testing.T) {
 	var shadowed []string
 	var walk func(c *cobra.Command)
 	walk = func(c *cobra.Command) {
 		for _, sub := range c.Commands() {
-			if sub.PersistentPreRun != nil || sub.PersistentPreRunE != nil {
+			if (sub.PersistentPreRun != nil || sub.PersistentPreRunE != nil) &&
+				!auditedDeclaredStartupHook(rootCmd, sub) {
 				shadowed = append(shadowed, sub.CommandPath())
 			}
 			walk(sub)
@@ -62,7 +66,58 @@ func TestNoSubcommandShadowsRootPersistentPreRun(t *testing.T) {
 	if len(shadowed) > 0 {
 		t.Errorf("these commands define their own PersistentPreRun, which shadows the root hook "+
 			"and drops the network-logf wiring (#662): %s\n"+
-			"Each must call rootCmd.PersistentPreRun(cmd, args) itself.",
+			"Only the exact audited declared-session startup hooks are exempt.",
 			strings.Join(shadowed, ", "))
+	}
+}
+
+func auditedDeclaredStartupHook(root, command *cobra.Command) bool {
+	if command.Parent() != root || command.PersistentPreRun == nil || command.PersistentPreRunE != nil {
+		return false
+	}
+	want := declaredLocalOnly
+	switch command.Name() {
+	case "sessions", "session-host":
+	case "attach":
+		want = declaredAttachPreRun
+	default:
+		return false
+	}
+	return reflect.ValueOf(command.PersistentPreRun).Pointer() == reflect.ValueOf(want).Pointer()
+}
+
+func TestDeclaredStartupExceptionRejectsOtherHooks(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		hook    func(*cobra.Command, []string)
+		errHook bool
+		nested  bool
+		want    bool
+	}{
+		{name: "sessions", hook: declaredLocalOnly, want: true},
+		{name: "session-host", hook: declaredLocalOnly, want: true},
+		{name: "attach", hook: declaredAttachPreRun, want: true},
+		{name: "other", hook: declaredLocalOnly},
+		{name: "sessions"},
+		{name: "sessions", hook: func(*cobra.Command, []string) {}},
+		{name: "attach", hook: declaredLocalOnly},
+		{name: "sessions", hook: declaredAttachPreRun},
+		{name: "sessions", hook: declaredLocalOnly, errHook: true},
+		{name: "sessions", hook: declaredLocalOnly, nested: true},
+	} {
+		root := &cobra.Command{Use: "fixture"}
+		parent := root
+		if test.nested {
+			parent = &cobra.Command{Use: "nested"}
+			root.AddCommand(parent)
+		}
+		command := &cobra.Command{Use: test.name, PersistentPreRun: test.hook}
+		if test.errHook {
+			command.PersistentPreRunE = func(*cobra.Command, []string) error { return nil }
+		}
+		parent.AddCommand(command)
+		if got := auditedDeclaredStartupHook(root, command); got != test.want {
+			t.Fatalf("name=%s nested=%v error-hook=%v got=%v want=%v", test.name, test.nested, test.errHook, got, test.want)
+		}
 	}
 }

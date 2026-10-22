@@ -81,6 +81,34 @@ func TestDeclaredLifecycleLocalOnly(t *testing.T) {
 	}
 }
 
+func TestDeclaredStartupHooksPreserveLocalIsolationAndLegacyAttach(t *testing.T) {
+	original := rootCmd.PersistentPreRun
+	t.Cleanup(func() { rootCmd.PersistentPreRun = original })
+	calls := 0
+	rootCmd.PersistentPreRun = func(command *cobra.Command, args []string) {
+		calls++
+		if command != attachCmd || len(args) != 0 {
+			t.Fatal("unexpected delegation to root startup")
+		}
+	}
+	for _, command := range []*cobra.Command{
+		newDeclaredSessionsCommand(nil), newDeclaredHostCommand(),
+	} {
+		if command.PersistentPreRun == nil || command.PersistentPreRunE != nil {
+			t.Fatal("local-only startup hook missing or shadowed")
+		}
+		command.PersistentPreRun(command, []string{"fixture"})
+	}
+	attachCmd.PersistentPreRun(attachCmd, []string{"fixture"})
+	if calls != 0 {
+		t.Fatal("local declared-session startup invoked root")
+	}
+	attachCmd.PersistentPreRun(attachCmd, nil)
+	if calls != 1 {
+		t.Fatal("legacy no-name attach did not delegate to root exactly once")
+	}
+}
+
 func TestDeclaredFailureClassificationAndClose(t *testing.T) {
 	want := errors.New("fixture lifecycle refused")
 	fake := &declaredFakeLifecycle{err: want}
