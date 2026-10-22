@@ -99,7 +99,30 @@ func LoadLLMPolicy(nodeConfigDir string) LLMPolicy {
 	if err != nil {
 		return refuse("invalid_policy_document")
 	}
+	warnIneffectiveLLMGrants(policy)
 	return policy
+}
+
+// A valid grant document stays valid even when an IP literal can never be
+// granted. Warn once per load without resolving names or reflecting endpoints.
+func warnIneffectiveLLMGrants(policy LLMPolicy) {
+	for endpoint := range policy.endpoints {
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			continue
+		}
+		ip, err := netip.ParseAddr(u.Hostname())
+		if err != nil {
+			continue
+		}
+		class, _ := httpAddressClass(ip)
+		normalized := normalizeHTTPAddress(ip)
+		private := normalized.IsPrivate() || llmMeshPrefix.Contains(normalized)
+		if class != "" && class != "loopback address" && !(class == "private address" && private) {
+			slog.Warn("workflow LLM policy contains an ineffective literal-IP grant; destination remains denied", "reason", "ineffective_literal_ip_grant")
+			return
+		}
+	}
 }
 
 func parseLLMPolicy(data []byte) (LLMPolicy, error) {
