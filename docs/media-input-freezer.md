@@ -147,6 +147,16 @@ reflection through unexported caller wrappers cannot traverse its closure.
 Original wire carrier DTOs are transport inputs, not diagnostic representations.
 They still require a separate call-site retention audit before C2 completion.
 
+Malformed HTTP consume and WS envelope decoding now uses
+`jobprivacy.DeliveryError` before any job kind is known. It returns static
+diagnostics while preserving explicit `errors.Is`/`errors.As` classification
+behind the same private closure boundary. WS decoding still uses the unchanged
+JSON decoder and captures passive observations from the exact original frame.
+An injected HTTP RoundTripper and direct WS decoder fixtures test this without
+a network listener, DNS lookup or real service. A malformed WS interface-valued
+number fixture proves the original decoder error contains its wire spelling,
+while retained wrapper/log diagnostics do not.
+
 The runner validates explicit execution projection before routing or admission,
 refusing raw-only/invalid captures without handler execution. Routing, explicit
 deadlines, GPU requests/assignment, org and flow attribution use original owned

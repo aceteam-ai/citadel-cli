@@ -35,6 +35,8 @@ So, when adding to this file:
 for MEDIA_GENERATE inputs; its retention helpers never mutate execution data.
 `redactedError.Unwrap` exposes original classification through a private
 closure so reflected diagnostic wrappers cannot traverse the original error.
+`jobprivacy.DeliveryError` owns pre-kind decoder diagnostic omission;
+`redisapi.decodeWSDelivery` preserves original frame observation capture.
 `jobprivacy.CaptureMedia` owns the separate opaque execution/raw-byte copy;
 explicit projections preserve execution types and exact digest input, never
 derive execution authority from the passive delivery observer or raw-only data.

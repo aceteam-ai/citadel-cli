@@ -57,6 +57,16 @@ type redactedError struct {
 	text   string
 }
 
+// DeliveryError hides decoder-owned details before a job kind is known. It
+// preserves explicit errors.Is/As classification without retaining a raw error
+// value in an ordinary reflectable field or calling its diagnostic formatter.
+func DeliveryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &redactedError{unwrap: func() error { return err }, text: "job delivery decode failed"}
+}
+
 func (e *redactedError) Error() string { return e.text }
 
 func (e *redactedError) Unwrap() error {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/gorilla/websocket"
 )
 
@@ -432,13 +433,10 @@ func (c *WSClient) readLoop() {
 		// stays up on its own traffic.
 		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
 
-		var msg WSMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
+		msg, err := decodeWSDelivery(message)
+		if err != nil {
 			c.debug("ws: failed to parse message: %v", err)
 			continue
-		}
-		if msg.Type == "job" {
-			msg.observation = deliverymetadata.CaptureWS(message)
 		}
 
 		c.debug("ws: received message type=%s", msg.Type)
@@ -461,6 +459,19 @@ func (c *WSClient) readLoop() {
 			wildcardHandler(msg)
 		}
 	}
+}
+
+// decodeWSDelivery preserves the unchanged wire decoder and passive observation
+// bytes, while withholding malformed-frame details before its kind is known.
+func decodeWSDelivery(message []byte) (WSMessage, error) {
+	var msg WSMessage
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return WSMessage{}, jobprivacy.DeliveryError(err)
+	}
+	if msg.Type == "job" {
+		msg.observation = deliverymetadata.CaptureWS(message)
+	}
+	return msg, nil
 }
 
 // armKeepalive installs the read deadline and the control-frame handlers on a

@@ -141,3 +141,24 @@ func TestPrivateMediaNeverInvokesOriginalErrorFormatter(t *testing.T) {
 		t.Fatal("private error was not sealed before formatting")
 	}
 }
+
+func TestMediaDeliveryErrorBeforeKindIsKnown(t *testing.T) {
+	if DeliveryError(nil) != nil {
+		t.Fatal("nil delivery error became a failure")
+	}
+	safe := DeliveryError(privatePanicError{})
+	if safe.Error() != "job delivery decode failed" || !errors.Is(safe, context.Canceled) {
+		t.Fatal("delivery error formatter ran or classification changed")
+	}
+	original := privateValueError{detail: mediaFixtureSecret}
+	safe = DeliveryError(original)
+	var projected privateValueError
+	if !errors.As(safe, &projected) || projected.detail != mediaFixtureSecret {
+		t.Fatal("explicit decoder error projection lost original identity")
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d"} {
+		if strings.Contains(fmt.Sprintf(verb, struct{ err error }{safe}), mediaFixtureSecret) {
+			t.Fatal("private wrapper reflected original delivery error")
+		}
+	}
+}
