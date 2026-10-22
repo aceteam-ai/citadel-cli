@@ -34,10 +34,14 @@ class FakeLoader:
         self.events = []
         self.prepare_fail = {}
         self.prepare_gates = {}
+        self.prepare_entered = {}
         self.lock = threading.Lock()
 
     def prepare(self, spec, variant):
         self.events.append(("prepare", spec.model_id))
+        entered = self.prepare_entered.get(spec.model_id)
+        if entered is not None:
+            entered.set()
         gate = self.prepare_gates.get(spec.model_id)
         if gate is not None:
             assert gate.wait(5), "test never released the prepare gate"
@@ -167,10 +171,11 @@ def test_pinned_image_and_video_models_have_no_idle_eviction_timer():
         assert not loader.unloaded
 
 
-def test_idle_cleanup_drops_all_pipeline_references_before_free_memory():
+def test_idle_cleanup_drops_pipeline_references_during_replacement_preparation():
     timers = ManualTimers()
     references = []
     observed = []
+    preparing, gate = threading.Event(), threading.Event()
 
     class Pipeline:
         pass
@@ -180,17 +185,31 @@ def test_idle_cleanup_drops_all_pipeline_references_before_free_memory():
         references.append(weakref.ref(pipe))
         return pipe, "cuda"
 
+    def prepare(spec, variant):
+        if spec.model_id == FLUX:
+            preparing.set()
+            assert gate.wait(5), "test never released the prepare gate"
+
     mgr = ImageModelManager(
-        {SDXL: im.CATALOG[SDXL]}, SDXL, loader=load,
+        {SDXL: im.CATALOG[SDXL], FLUX: im.CATALOG[FLUX]}, SDXL,
+        loader=load, prepare=prepare,
         free_memory=lambda: observed.append([ref() is None for ref in references]),
         warm_wait_seconds=5, idle_unload_seconds=0,
         timer_factory=timers, clock=lambda: timers.now,
     )
     lease = mgr.lease(SDXL)
     lease.release()
-    timers.timers[-1].fire()
-    assert observed[-1] == [True]
-    assert lease.pipe is None
+    mgr._warm_wait = 0
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert preparing.wait(5)
+        timers.timers[-1].fire()
+        assert observed[-1] == [True]
+        assert lease.pipe is None
+    finally:
+        gate.set()
+        assert mgr.wait_for_load(5)
 
 
 def test_failed_swap_resumes_the_outgoing_models_original_idle_deadline():
@@ -208,6 +227,162 @@ def test_failed_swap_resumes_the_outgoing_models_original_idle_deadline():
     timer.fire()
     assert mgr.loaded_model() is None
     assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+@pytest.mark.parametrize("prepare_failure", [False, True])
+def test_idle_deadline_expires_while_replacement_preparation_is_blocked(prepare_failure):
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    released = mgr.lease(SDXL)
+    released.release()
+    deadline = timers.timers[-1]
+    entered, gate = threading.Event(), threading.Event()
+    loader.prepare_entered[FLUX] = entered
+    loader.prepare_gates[FLUX] = gate
+    if prepare_failure:
+        loader.prepare_fail[FLUX] = "owned blocked prepare failure"
+    mgr._warm_wait = 0
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert entered.wait(5)
+        assert not deadline.canceled
+        entry = next(m for m in mgr.status()["allowed_models"] if m["model"] == SDXL)
+        assert entry["evicts_at"] is not None
+        timers.now += 10
+        deadline.fire()
+        assert mgr.loaded_model() is None
+        assert loader.unloaded == [f"pipe:{SDXL}"]
+        assert released.pipe is None and released._resident.pipe is None
+        assert mgr.loading_model() == FLUX
+        assert len(loader.loads) == 1
+    finally:
+        gate.set()
+        assert mgr.wait_for_load(5)
+    if prepare_failure:
+        assert mgr.loaded_model() is None
+        with pytest.raises(ModelLoadFailed):
+            mgr.lease(FLUX)
+    else:
+        assert mgr.loaded_model() == FLUX
+    # Finishing/failing preparation must not unload the expired model twice.
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+def test_new_outgoing_lease_fences_idle_timer_during_blocked_preparation():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    stale = timers.timers[-1]
+    entered, gate = threading.Event(), threading.Event()
+    loader.prepare_entered[FLUX] = entered
+    loader.prepare_gates[FLUX] = gate
+    mgr._warm_wait = 0
+    renewed = None
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert entered.wait(5)
+        renewed = mgr.lease(SDXL)
+        assert stale.canceled
+        timers.now += 11
+        stale.fire()
+        assert not loader.unloaded
+        renewed.release()
+        current = timers.timers[-1]
+        assert current.delay == 10
+        stale.fire()
+        assert not loader.unloaded
+        timers.now += 10
+        current.fire()
+        assert loader.unloaded == [f"pipe:{SDXL}"]
+    finally:
+        if renewed is not None:
+            renewed.release()
+        gate.set()
+        assert mgr.wait_for_load(5)
+
+
+def test_pinned_outgoing_model_stays_resident_during_blocked_preparation():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       pinned_models=frozenset({SDXL}), timer_factory=timers,
+                       clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    entered, gate = threading.Event(), threading.Event()
+    loader.prepare_entered[FLUX] = entered
+    loader.prepare_gates[FLUX] = gate
+    mgr._warm_wait = 0
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert entered.wait(5)
+        timers.now += 1000
+        assert not timers.timers
+        assert mgr.loaded_model() == SDXL
+        assert not loader.unloaded
+    finally:
+        gate.set()
+        assert mgr.wait_for_load(5)
+    assert mgr.loaded_model() == FLUX  # pins still allow explicit swaps
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+@pytest.mark.parametrize("prepare_failure", [False, True])
+def test_finished_preparation_waits_for_idle_teardown_before_memory_work(prepare_failure):
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    entered, prepare_gate = threading.Event(), threading.Event()
+    unloading, unload_gate = threading.Event(), threading.Event()
+    phase_entered = threading.Event()
+    loader.prepare_entered[FLUX] = entered
+    loader.prepare_gates[FLUX] = prepare_gate
+    if prepare_failure:
+        loader.prepare_fail[FLUX] = "owned blocked prepare failure"
+
+    def blocked_unload(pipe):
+        unloading.set()
+        assert unload_gate.wait(5), "test never released the unload gate"
+        loader.unload(pipe)
+
+    enter_phase = mgr._enter_replacement_phase
+
+    def observed_phase(load):
+        phase_entered.set()
+        enter_phase(load)
+
+    mgr._unloader = blocked_unload
+    mgr._enter_replacement_phase = observed_phase
+    mgr._warm_wait = 0
+    worker = None
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert entered.wait(5)
+        before = loader.freed
+        timers.now += 10
+        worker = threading.Thread(target=timers.timers[-1].fire)
+        worker.start()
+        assert unloading.wait(5)
+        prepare_gate.set()
+        assert phase_entered.wait(5)
+        assert mgr._idle_evicting
+        assert not mgr._load.event.is_set()
+        assert len(loader.loads) == 1
+        assert loader.freed == before  # neither load nor failure cleanup may overlap
+    finally:
+        prepare_gate.set()
+        unload_gate.set()
+        if worker is not None:
+            worker.join(5)
+            assert not worker.is_alive()
+        assert mgr.wait_for_load(5)
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+    assert mgr.loaded_model() == (None if prepare_failure else FLUX)
 
 
 def test_idle_cleanup_blocks_new_load_until_memory_release_finishes():

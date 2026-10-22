@@ -12,6 +12,17 @@ cleanup and model replacement cannot load a new pipeline over ongoing cleanup.
 Failed replacement preparation restores the outgoing model's original idle
 deadline rather than extending it indefinitely.
 
+Replacement preparation does not grant residency: while the next model is
+being downloaded/prepared, the outgoing idle model keeps its original eviction
+deadline. A new outgoing-model lease still cancels that timer, and pins remain
+exempt. The replacement thread enters an exclusive replacement phase only
+after preparation: it first waits for any idle teardown to finish, then fences
+further idle callbacks before memory probing, draining, unloading and loading.
+Preparation failures enter the same serialized phase before memory cleanup,
+then restore any still-resident idle model's original deadline. Deterministic
+blocked-preparation tests cover expiration, renewed leases, pins, failure and
+cleanup/load exclusion; they are source/CI tests, not native memory acceptance.
+
 An asynchronous cold load which has not yet served a lease gets at least one
 `Retry-After` interval before idle eviction. This bounded grace prevents zero
 idle time from repeatedly discarding a background load before its warming

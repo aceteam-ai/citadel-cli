@@ -182,8 +182,8 @@ class ImageModelManager:
         self._free_memory = free_memory
         self._free_vram_bytes = free_vram_bytes
         # Disk-side preparation (free-space preflight + weight prefetch). Runs
-        # BEFORE anything is evicted, so a slow or failed download never leaves
-        # the node without a model.
+        # BEFORE replacement eviction. The outgoing model can keep serving,
+        # but an unpinned idle model still expires during a slow download.
         self._prepare = prepare
         self._min_residency = max(min_residency_seconds, 0.0)
         self._failure_backoff = max(failure_backoff_seconds, 0.0)
@@ -374,7 +374,6 @@ class ImageModelManager:
                 candidates=tuple(fitting_variants(spec, self._budget_gb, self._quant_mode)),
             )
             self._load = load
-            self._cancel_idle_locked()
             self._thread = threading.Thread(
                 target=self._run_load, args=(load,), name=f"diffusers-load-{spec.model_id}", daemon=True
             )
@@ -429,7 +428,10 @@ class ImageModelManager:
         resident = self._resident
         idle = resident.idle_since if resident and resident.spec.model_id == model_id else None
         remaining = None
-        if idle is not None and model_id not in self._pinned and self._load is None:
+        if (
+            idle is not None and model_id not in self._pinned
+            and (self._load is None or not self._load.evicting)
+        ):
             remaining = max(self._idle_deadline(resident) - self._clock(), 0.0)
         return {
             "idle_seconds": round(max(self._clock() - idle, 0.0), 2) if idle is not None else None,
@@ -439,7 +441,10 @@ class ImageModelManager:
 
     def _arm_idle_locked(self, resident: _Resident) -> None:
         self._cancel_idle_locked()
-        if resident.inflight or resident.spec.model_id in self._pinned or self._load is not None:
+        if (
+            resident.inflight or resident.spec.model_id in self._pinned
+            or (self._load is not None and self._load.evicting)
+        ):
             return
         token = self._idle_token
         delay = max(self._idle_deadline(resident) - self._clock(), 0.0)
@@ -453,7 +458,7 @@ class ImageModelManager:
             if (
                 token != self._idle_token or self._resident is not resident
                 or resident.inflight or resident.spec.model_id in self._pinned
-                or self._load is not None
+                or (self._load is not None and self._load.evicting)
             ):
                 return
             if self._clock() < self._idle_deadline(resident):
@@ -489,10 +494,10 @@ class ImageModelManager:
         try:
             candidates = load.candidates or (variant,)
             smallest = min(candidates, key=lambda v: v.est_vram_gb)
-            # Disk first: free-space preflight and weight download happen while
-            # the resident model keeps serving, so a slow or failed download
-            # never leaves the node with no model.
+            # Disk first: the resident model can keep serving during preflight
+            # and download, without extending its unpinned idle deadline.
             self._prepare(spec, variant)
+            self._enter_replacement_phase(load)
             self._refuse_if_eviction_cannot_help(spec, smallest.est_vram_gb * GIB)
             self._swap_out_previous(load)
             # Unconditional, so cached blocks left by a previous failed load or
@@ -557,6 +562,9 @@ class ImageModelManager:
                 err = ModelLoadFailed(spec.model_id, str(exc))
             logger.warning("diffusers: load of %s failed: %s", spec.model_id, exc)
             try:
+                # Preparation can fail while the idle timer is tearing down
+                # the outgoing model. Do not run overlapping memory cleanup.
+                self._enter_replacement_phase(load)
                 # A failed from_pretrained can leave partially allocated CUDA
                 # blocks cached in this process.
                 self._free_memory()
@@ -570,6 +578,19 @@ class ImageModelManager:
                     self._arm_idle_locked(self._resident)
                 load.event.set()
                 self._cond.notify_all()
+
+    def _enter_replacement_phase(self, load: _Load) -> None:
+        """End preparation without racing an outgoing model's idle teardown.
+
+        Preparation itself does not extend residency. Once it finishes (or
+        fails), wait for an already-started teardown, then fence future idle
+        callbacks before any memory probe/cleanup or pipeline load. Reentry
+        on the failure path is harmless.
+        """
+        with self._cond:
+            self._cond.wait_for(lambda: not self._idle_evicting)
+            load.evicting = True
+            self._cancel_idle_locked()
 
     def _refuse_if_eviction_cannot_help(self, spec: ImageModelSpec, need_bytes: float) -> None:
         """Do not evict a working model for a load that cannot fit anyway: if
