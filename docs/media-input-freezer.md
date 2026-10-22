@@ -116,3 +116,22 @@ These helpers do not seal `Job.Payload`, `RawPayload` or `RawData`, wire every
 diagnostic path, or delete a Redis entry. Phases 2 through 5 remain required.
 Do not call C2 complete or mint a media capability based on this phase's tests
 or green CI. See the draft for exact-head receipts and independent review.
+
+### C2 phase 2: explicit owned payload boundary
+
+`jobprivacy.CaptureMedia` owns a copied execution map, source metadata and exact
+original wire bytes behind a private closure. Explicit execution projections
+return independent copies with the original Go value types. Original bytes are
+never reserialized, including raw-only, nil and empty inputs. Raw-only captures
+cannot acquire executable fields. The passive delivery observer is unchanged.
+
+Classification examines canonical root `inputs` presence without decoding large
+prompt values. Nonempty invalid/non-object media envelopes fail closed for
+retention; valid legacy text-only objects retain their previous policy. Copying
+accepts only known scalar/container types within depth/value bounds. Unsupported
+or cyclic projections refuse without invoking caller formatting or marshaling.
+
+This foundation does not by itself seal any queue or worker Job. Phase 3 must
+use it at intake and preserve routing, deadlines, GPU selection, receipts and
+handler projection while keeping diagnostic data non-executable. ACK deletion
+and the paired API/WS purge remain required pre-mint gates.
