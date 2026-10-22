@@ -109,7 +109,7 @@ func (f *fakeScopeTransport) Call(ctx context.Context, destination string, objec
 		}
 		job := dbus.ObjectPath("/org/freedesktop/systemd1/job/23")
 		emit := func(path dbus.ObjectPath) {
-			f.signals <- &dbus.Signal{Sender: ":1.7", Path: managerPath, Name: managerInterface+".JobRemoved", Body: []any{uint32(23), path, f.identity.Name, "done"}}
+			f.signals <- &dbus.Signal{Sender: ":1.7", Path: managerPath, Name: managerInterface + ".JobRemoved", Body: []any{uint32(23), path, f.identity.Name, "done"}}
 		}
 		emit("/org/freedesktop/systemd1/job/22")
 		switch f.stopMode {
