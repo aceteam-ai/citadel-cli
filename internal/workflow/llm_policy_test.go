@@ -107,6 +107,7 @@ func TestLLMPolicyBuiltInDefaultIsExact(t *testing.T) {
 		t.Fatalf("built-in Ollama endpoint refused: %v", err)
 	}
 	for _, raw := range []string{
+		"HTTP://127.0.0.1:11434/api/chat", "http://127.0.0.1:11434/API/chat",
 		"http://localhost:11434/api/chat", "http://127.0.0.2:11434/api/chat",
 		"http://127.0.0.1:11435/api/chat", "https://127.0.0.1:11434/api/chat",
 		"http://127.0.0.1:11434/api/delete", "http://127.0.0.1:11434/api/pull",
