@@ -255,7 +255,7 @@ func (s *WSSource) Ack(ctx context.Context, job *Job) error {
 
 // Nack indicates job failure. Updates status but does NOT ack, allowing retry.
 func (s *WSSource) Nack(ctx context.Context, job *Job, err error) error {
-	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, nil))
 	return nil
 }
 
@@ -310,7 +310,7 @@ func (s *WSSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err 
 // failures that will never succeed on retry (e.g. an unsupported job type). The
 // ack mirrors Ack: over WebSocket when connected, falling back to HTTP.
 func (s *WSSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
-	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
+	status := jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 
 	queue := job.SourceQueue
@@ -438,6 +438,7 @@ func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
 	}
 
 	job := &Job{
+		media:       apiJob.PrivateMediaPayload(),
 		observation: msg.DeliveryObservation().WithSource("", s.config.ConsumerGroup, "websocket"),
 		ID:          apiJob.JobID,
 		Type:        apiJob.Type,
@@ -460,6 +461,10 @@ func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
 		}
 	}
 
+	if job.media != nil {
+		job.RayID = privateMediaRayID(job.media)
+	}
+	job.sealMedia()
 	return job, nil
 }
 

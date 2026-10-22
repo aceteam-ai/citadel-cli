@@ -135,3 +135,37 @@ This foundation does not by itself seal any queue or worker Job. Phase 3 must
 use it at intake and preserve routing, deadlines, GPU selection, receipts and
 handler projection while keeping diagnostic data non-executable. ACK deletion
 and the paired API/WS purge remain required pre-mint gates.
+
+### C2 phase 3: parsed intake and trusted control projections
+
+Direct Redis and API parsing now seal input-bearing media before returning a
+parsed Job. Redis, API and WS worker conversion transfer the opaque snapshot,
+not a passive observation or diagnostic map. Public payload fields hold only
+the private marker; raw payload and raw-data fields are cleared. Repeated
+sealing preserves the original capture. Ordinary parsed-job JSON/fmt and
+reflection through unexported caller wrappers cannot traverse its closure.
+Original wire carrier DTOs are transport inputs, not diagnostic representations.
+They still require a separate call-site retention audit before C2 completion.
+
+The runner validates explicit execution projection before routing or admission,
+refusing raw-only/invalid captures without handler execution. Routing, explicit
+deadlines, GPU requests/assignment, org and flow attribution use original owned
+fields. Receipt digest input uses exact original bytes, never a sanitized or
+normalized serialization; nil/empty fallback uses original execution fields.
+Runtime GPU selection cannot be overwritten through the observable marker map.
+
+The legacy adapter explicitly projects original values with its existing
+coercion rules, not new input parsing. Private-media handler logs and failure
+output are static. Arbitrary progress fields and unreviewed structured usage/
+receipt echoes are not retained for these new inputs; C5 must supply a reviewed
+typed output path, rather than re-enable generic map copying. Nonsecret flow
+identity and numeric accounting remain separate from private input content.
+Legacy text, FILE_FETCH, passcode and other job behavior remain unchanged.
+
+Offline mock/parse tests cover Redis/API/WS conversions, exact raw bytes,
+malformed/escaped inputs, wrapper reflection, immutable copies, target routing,
+deadline/GPU/receipt projection, handler failures, retry/terminal usage, and
+legacy compatibility. These tests do not prove actual stream deletion, complete
+wire/log/DLQ boundary coverage, a typed output path, paired API/WS purge or live
+acceptance. Complete the remaining retention audit and phases 4 and 5 before
+minting/dispatch. No handler/task activation is added by this change.

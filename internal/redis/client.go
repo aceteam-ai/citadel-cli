@@ -38,6 +38,7 @@ type StreamEvent struct {
 
 // Job represents a job read from Redis Streams.
 type Job struct {
+	media     *jobprivacy.MediaPayload
 	MessageID string
 	JobID     string
 	Type      string
@@ -600,7 +601,7 @@ func (c *Client) MoveToDLQFromQueue(ctx context.Context, queue string, job *Job,
 	fields := map[string]interface{}{
 		"original_message_id": job.MessageID,
 		"original_queue":      queue,
-		"reason":              jobprivacy.Text(job.Type, job.Payload, reason),
+		"reason":              jobprivacy.Text(job.Type, job.diagnosticPayload(), reason),
 		"moved_at":            time.Now().UTC().Format(time.RFC3339),
 		"worker_id":           c.workerID,
 		"jobId":               job.JobID,
@@ -613,7 +614,7 @@ func (c *Client) MoveToDLQFromQueue(ctx context.Context, queue string, job *Job,
 		fields["enqueuedAt"] = ea
 	}
 
-	if payloadBytes, err := json.Marshal(jobprivacy.Payload(job.Type, job.Payload)); err == nil {
+	if payloadBytes, err := json.Marshal(jobprivacy.Payload(job.Type, job.diagnosticPayload())); err == nil {
 		fields["payload"] = string(payloadBytes)
 	}
 
@@ -654,6 +655,9 @@ func (c *Client) parseMessage(msg redis.XMessage) (*Job, error) {
 	if payloadStr, ok := msg.Values["payload"].(string); ok {
 		var payload map[string]interface{}
 		if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
+			if job.Type == jobprivacy.MediaGenerate {
+				err = jobprivacy.Error(job.Type, jobprivacy.PrivateMediaMarker(), err)
+			}
 			return nil, fmt.Errorf("failed to parse job payload: %w", err)
 		}
 		job.Payload = payload
@@ -672,6 +676,7 @@ func (c *Client) parseMessage(msg redis.XMessage) (*Job, error) {
 		job.RawPayload = bytes.Clone(payloadBytes)
 	}
 
+	job.sealMedia()
 	return job, nil
 }
 
@@ -708,7 +713,7 @@ func (c *Client) MoveToDLQ(ctx context.Context, job *Job, reason string) error {
 	fields := map[string]interface{}{
 		"original_message_id": job.MessageID,
 		"original_queue":      c.queueName,
-		"reason":              jobprivacy.Text(job.Type, job.Payload, reason),
+		"reason":              jobprivacy.Text(job.Type, job.diagnosticPayload(), reason),
 		"moved_at":            time.Now().UTC().Format(time.RFC3339),
 		"worker_id":           c.workerID,
 		"jobId":               job.JobID,
@@ -722,7 +727,7 @@ func (c *Client) MoveToDLQ(ctx context.Context, job *Job, reason string) error {
 	}
 
 	// Include original payload
-	if payloadBytes, err := json.Marshal(jobprivacy.Payload(job.Type, job.Payload)); err == nil {
+	if payloadBytes, err := json.Marshal(jobprivacy.Payload(job.Type, job.diagnosticPayload())); err == nil {
 		fields["payload"] = string(payloadBytes)
 	}
 

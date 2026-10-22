@@ -38,6 +38,10 @@ closure so reflected diagnostic wrappers cannot traverse the original error.
 `jobprivacy.CaptureMedia` owns the separate opaque execution/raw-byte copy;
 explicit projections preserve execution types and exact digest input, never
 derive execution authority from the passive delivery observer or raw-only data.
+Parsed Redis/API Jobs seal before return; worker conversion transfers that
+opaque snapshot. `worker.Job.executionField` owns trusted control projections,
+`rawOrPayload` owns exact receipt digest input and `LegacyHandlerAdapter.Execute`
+owns explicit handler projection. Observable diagnostic maps grant no authority.
 The complete pre-mint privacy/ACK gates remain in
 `docs/media-input-freezer.md`; helper tests alone are not C2 completion.
 

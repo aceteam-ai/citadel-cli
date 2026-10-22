@@ -361,12 +361,16 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 // convertJob converts a redis.Job to a worker.Job.
 func (s *RedisSource) convertJob(rj *redisclient.Job) *Job {
 	job := &Job{
+		media:      rj.PrivateMediaPayload(),
 		ID:         rj.JobID,
 		Type:       rj.Type,
 		Payload:    rj.Payload,
 		RawPayload: bytes.Clone(rj.RawPayload),
 		Source:     "redis",
 		MessageID:  rj.MessageID,
+	}
+	if job.media == nil {
+		job.media = jobprivacy.CaptureMedia(rj.Type, rj.Payload, rj.RawPayload, rj.RawData)
 	}
 	// Extract rayId: check RawData first (top-level stream field), then payload
 	if rayID, ok := rj.RawData["rayId"].(string); ok && rayID != "" {
@@ -376,6 +380,10 @@ func (s *RedisSource) convertJob(rj *redisclient.Job) *Job {
 			job.RayID = rayID
 		}
 	}
+	if job.media != nil {
+		job.RayID = privateMediaRayID(job.media)
+	}
+	job.sealMedia()
 	return job
 }
 
@@ -388,7 +396,7 @@ func (s *RedisSource) Ack(ctx context.Context, job *Job) error {
 // Nack indicates job failure.
 // For Redis, this updates status but does NOT ACK - allowing retry or DLQ.
 func (s *RedisSource) Nack(ctx context.Context, job *Job, err error) error {
-	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, nil))
 	// Don't ACK - let it retry or go to DLQ on next read
 	return nil
 }
@@ -428,7 +436,7 @@ func (s *RedisSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, e
 // failures that will never succeed on retry (e.g. an unsupported job type),
 // preventing the message from being redelivered and re-failing forever.
 func (s *RedisSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
-	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
+	status := jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 	return s.ackDelivery(ctx, job.Type, job.SourceQueue, job.MessageID)
 }

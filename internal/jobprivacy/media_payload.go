@@ -82,6 +82,22 @@ func (p *MediaPayload) ExecutionPayload() (map[string]any, error) {
 	return copy.(map[string]any), nil
 }
 
+// ExecutionField projects one original field for trusted routing/accounting
+// consumers, without copying unrelated credential-bearing fields.
+func (p *MediaPayload) ExecutionField(key string) (any, bool) {
+	record := p.record()
+	if record.invalid || record.payload == nil {
+		return nil, false
+	}
+	value, present := record.payload[key]
+	if !present {
+		return nil, false
+	}
+	budget := 4096
+	copy, err := ownMediaValue(value, 0, &budget)
+	return copy, err == nil
+}
+
 // OriginalPayload returns the exact provided bytes, preserving nil/empty and
 // every number/Unicode/whitespace lexeme. No decoded-map fallback is invented.
 func (p *MediaPayload) OriginalPayload() []byte {

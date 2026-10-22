@@ -23,11 +23,16 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 )
 
 // Job represents a unit of work to be processed.
 // This is the common job format used internally, regardless of source.
 type Job struct {
+	// Owned execution fields, separate from passive delivery observations.
+	media *jobprivacy.MediaPayload
+	// Runtime GPU selection is trusted execution state, not diagnostic input.
+	mediaGPU *int
 	// Passive delivery-scoped wall observations, never scheduling authority.
 	clock *deliveryClock `json:"-"`
 	// Passive original delivery snapshot, not handler execution authority.
