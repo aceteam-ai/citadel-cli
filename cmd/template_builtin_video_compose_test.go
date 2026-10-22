@@ -9,12 +9,67 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 )
 
 const validVideoComposeFilm = `{"title":"Flight Log","subtitle":"A film","intro":{"lines":["AceTeam"],"seconds":4},"outro":{"lines":["Made with AceTeam"],"seconds":5},"theme":"blueprint","chapters":[{"file":"staged-a71f-chapter.mp4","title":"Chapter one","narrator":{"name":"the Ace","line":"Narrated by the Ace, the AI"},"narration_identity":"stock","speaks_as_person":false,"disclosure":null,"stamp":{"label":"SIGNED","by":"founder","at":"2026-10-12"},"card_seconds":2.5}]}`
+
+// The platform merged these values in aceteam#11972 while the node source stayed
+// inactive. Compare complete JSON values so unknown/missing wire fields fail too.
+func TestVideoComposeSharedPlatformFixtures(t *testing.T) {
+	compare := func(t *testing.T, name string, actual []byte) {
+		t.Helper()
+		want, err := os.ReadFile(filepath.Join("testdata", "film_compose", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wantValue, actualValue any
+		if err := json.Unmarshal(want, &wantValue); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(actual, &actualValue); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(actualValue, wantValue) {
+			t.Fatalf("%s differs from merged aceteam#11972 fixture:\n%s", name, actual)
+		}
+	}
+	t.Run("schema", func(t *testing.T) {
+		compare(t, "renderer.film.schema.json", []byte(videoComposeFilmSchema))
+	})
+	t.Run("themes", func(t *testing.T) {
+		reg, err := loadPapercraftSceneV2Registry()
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := make([]string, 0, len(reg.presets))
+		for name := range reg.presets {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		raw, err := json.Marshal(names)
+		if err != nil {
+			t.Fatal(err)
+		}
+		compare(t, "renderer.themes.json", raw)
+	})
+	t.Run("timeline", func(t *testing.T) {
+		inputs := videoComposeTestInputs(t, []byte(validVideoComposeFilm))
+		outDir := t.TempDir()
+		f := &videoComposeFake{t: t, media: map[string]videoComposeMedia{inputs[1]: videoComposeTestMedia(10)}, encodedBytes: videoComposeDefaultMaxBytes}
+		if _, err := runVideoComposeBuiltin(context.Background(), json.RawMessage(`{}`), inputs, outDir, f.deps()); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := os.ReadFile(filepath.Join(outDir, "chapters.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		compare(t, "renderer.chapters.json", raw)
+	})
+}
 
 func videoComposeTestFilm(t *testing.T, edit func(map[string]any)) []byte {
 	t.Helper()

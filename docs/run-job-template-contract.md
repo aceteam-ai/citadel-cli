@@ -164,6 +164,47 @@ Activation is blocked on paper-trail card scenes (#11480) and the vendored v3
 shell (#11296), including a real implementation of the card/disclosure seam.
 The fake renderer in unit tests supplies fixtures only; it is not a card renderer.
 
+The platform source merged in aceteam#11972 at
+`460d7d3ea24d254e572948e7129321d759beffe6` pins the inactive Citadel source
+`7b75c8aed8f2732907a53d9c883aba320125a61a`. The exact platform schema, theme
+list and synthetic timeline are copied into `cmd/testdata/film_compose/`;
+`TestVideoComposeSharedPlatformFixtures` compares all three against the local
+source and fake-media output. This reconciles offline source compatibility,
+without changing the pinned contract or establishing activation readiness.
+
+### Unresolved activation and approval blockers
+
+The following decisions require peer review before changing this provisional
+contract or approving a template:
+
+- Card durations currently accept any positive value up to 60 seconds. The
+  proposed 0.4-second floor is not implemented or agreed by this source refresh;
+  both copies of the shared schema must change together if it is adopted.
+- The probe accepts square-pixel landscape chapters from 1 to 120 fps and even
+  geometry up to 8192 pixels wide, while the existing card capture helper emits
+  30 fps. The core requires the rendered intro to preserve the first chapter's
+  geometry and exact frame-rate spelling. Agree on the canonical geometry and
+  rate/normalization policy before connecting the real renderer.
+- The silent stereo 48 kHz AAC card path is tested with fake capture/encoder
+  dependencies. Continuous AAC tracks and concat compatibility still require
+  actual pinned card media acceptance.
+- The card/disclosure seam has no production implementation. Both the chapter
+  card and every frame of the corresponding chapter must carry the disclosure;
+  synthetic seam invocation does not prove the burn-in. Blocked paper-trail#23
+  and the #11296 v3 shell are not integrated here.
+- The shared schema uses 48 MiB as both default and maximum. The issue specifies
+  the default; the maximum remains a proposed delivery policy requiring review.
+- C4 durable, single-use Film approval admission is not supplied by the expected
+  input hashes. Hash/byte checks bind dispatch to approved snapshot content but
+  do not establish an approval's identity, durable consumption or single use.
+  C4 explicitly blocks template approval until that admission boundary is ready.
+
+This source refresh therefore adds no registry entry or approved manifest,
+leaves `liveVideoComposeDeps().visuals` nil, and performs no node registration,
+template approval, release, live-media acceptance or production operation.
+
+### Inactive source contract
+
 Params are exactly `{}`. Proposed inputs are exactly one `film.json` (at most
 1 MiB), one to 32 chapter MP4s named in it, and an optional `poster.png` override.
 Files must be declared staged regular files with distinct basenames. Each

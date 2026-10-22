@@ -36,6 +36,8 @@ func main() {
 		{"unique_attempt_namespace", "cmd/run_job_template_ops.go", "attempt, err := newTemplateAttemptSegment()", "attempt, err := \"attempt-fixed\", error(nil)", "./cmd", "TestLiveTemplateRunOps_CancelledAttemptCannotOverlapRetryNamespace"},
 		{"cancellable_template_copy", "cmd/run_job_template_ops.go", "if nr > 0 {\n\t\t\tif err := ctx.Err(); err != nil {", "if nr > 0 {\n\t\t\tif err := ctx.Err(); false && err != nil {", "./cmd", "TestCopyTemplateWithContextStopsBetweenChunks"},
 		{"film_closed_schema", "cmd/template_builtin_video_compose.go", "if err := schema.Validate(v); err != nil", "if err := schema.Validate(v); false && err != nil", "./cmd", "TestVideoComposeFilmClosedSchema/unknown_top"},
+		{"film_shared_schema", "cmd/template_builtin_video_compose.go", `"maximum":50331648`, `"maximum":50331649`, "./cmd", "TestVideoComposeSharedPlatformFixtures/schema"},
+		{"film_shared_timeline", "cmd/template_builtin_video_compose.go", `json:"encode_passes"`, `json:"passes"`, "./cmd", "TestVideoComposeSharedPlatformFixtures/timeline"},
 		{"film_disclosure_guard", "cmd/template_builtin_video_compose.go", "ch.SpeaksAsPerson && ch.Disclosure == nil", "false && ch.SpeaksAsPerson && ch.Disclosure == nil", "./cmd", "TestVideoComposeDisclosureGuard"},
 		{"film_mixed_aspect", "cmd/template_builtin_video_compose.go", "i > 0 && !videoComposeSameAspect(media[0], media[i])", "false && i > 0 && !videoComposeSameAspect(media[0], media[i])", "./cmd", "TestVideoComposeMixedAspectRefused"},
 		{"film_delivery_cap", "cmd/template_builtin_video_compose.go", "if info.Size() > film.Delivery.MaxBytes {", "if false && info.Size() > film.Delivery.MaxBytes {", "./cmd", "TestVideoComposeFakeMediaPipeline"},
