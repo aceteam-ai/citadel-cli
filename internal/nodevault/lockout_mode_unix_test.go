@@ -116,30 +116,31 @@ func TestLockoutOwnerPreparationFailureAndForeignOwnerStayRefused(t *testing.T) 
 		t.Fatal(err)
 	}
 	called := false
-	err = checkLockoutFileOwner(int(file.Fd()), state, parent, true, 0, func(fd, uid, gid int) error {
+	_, err = checkLockoutFileOwner(int(file.Fd()), state, parent, true, 0, func(fd, uid, gid int) error {
 		called = true
 		if fd != int(file.Fd()) || uid != int(parent.Uid) || gid != int(parent.Gid) {
 			t.Fatal("new-owner preparation used the wrong inode/identity")
 		}
 		return unix.EPERM
-	})
-	if !called || !errors.Is(err, unix.EPERM) {
+	}, func(int, *unix.Stat_t) error { return unix.EIO })
+	if !called || !errors.Is(err, unix.EIO) {
 		t.Fatalf("failed new-owner preparation was not refused: called=%v err=%v", called, err)
 	}
 	after, err := os.Lstat(file.Name())
 	if err != nil || !os.SameFile(before, after) || after.Mode().Perm() != 0o600 {
 		t.Fatal("owner refusal removed/replaced or changed the created inode")
 	}
-	// The owner policy is always the parent UID, never a creator exception.
-	// Synthetic stat input tests this branch without changing any real UID.
+	// A foreign non-root UID never gains a creator exception. Synthetic stat
+	// input tests this branch without changing any real UID, including root CI.
+	state.Uid = 1001
 	foreignParent := parent
-	foreignParent.Uid = state.Uid ^ 1
+	foreignParent.Uid = 1002
 	for _, created := range []bool{false, true} {
 		called = false
-		err := checkLockoutFileOwner(int(file.Fd()), state, foreignParent, created, 0, func(int, int, int) error {
+		_, err := checkLockoutFileOwner(int(file.Fd()), state, foreignParent, created, 0, func(int, int, int) error {
 			called = true
 			return nil // a reported success is still checked against actual FD metadata
-		})
+		}, func(_ int, got *unix.Stat_t) error { *got = state; return nil })
 		if !errors.Is(err, ErrLockoutUnavailable) || called != created {
 			t.Fatalf("foreign owner accepted or existing owner mutated: created=%v called=%v err=%v", created, called, err)
 		}
@@ -147,5 +148,58 @@ func TestLockoutOwnerPreparationFailureAndForeignOwnerStayRefused(t *testing.T) 
 	final, err := os.Lstat(file.Name())
 	if err != nil || !os.SameFile(before, final) || final.Mode().Perm() != 0o600 {
 		t.Fatal("foreign-owner refusal removed/replaced or changed the inode")
+	}
+}
+
+func TestLockoutRootFallbackIsReusableButNotInheritedByNonRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		created      bool
+		euid         int
+		owner        uint32
+		chownErr     error
+		wantFallback bool
+		wantErr      error
+	}{
+		{"new-root-chown-failed", true, 0, 0, unix.EPERM, true, nil},
+		{"reopen-root-fallback", false, 0, 0, nil, true, nil},
+		{"non-root-cannot-inherit", false, 1001, 0, nil, false, ErrLockoutUnavailable},
+		{"new-parent-owned", true, 0, 1001, nil, false, nil},
+		{"reopen-parent-owned", false, 1001, 1001, nil, false, nil},
+		{"foreign-new-chown-failed", true, 0, 1002, unix.EPERM, false, unix.EPERM},
+		{"foreign-new-chown-lied", true, 0, 1002, nil, false, ErrLockoutUnavailable},
+		{"foreign-existing-root", false, 0, 1002, nil, false, ErrLockoutUnavailable},
+		{"foreign-existing-non-root", false, 1002, 1002, nil, false, ErrLockoutUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var state, parent unix.Stat_t
+			state.Uid = tc.owner
+			parent.Uid, parent.Gid = 1001, 1003
+			chownCalls, statCalls := 0, 0
+			fallback, err := checkLockoutFileOwner(42, state, parent, tc.created, tc.euid, func(fd, uid, gid int) error {
+				chownCalls++
+				if fd != 42 || uid != 1001 || gid != 1003 {
+					t.Fatal("wrong descriptor or target owner")
+				}
+				return tc.chownErr
+			}, func(fd int, got *unix.Stat_t) error {
+				statCalls++
+				if fd != 42 {
+					t.Fatal("wrong descriptor metadata read")
+				}
+				*got = state
+				return nil
+			})
+			if fallback != tc.wantFallback || !errors.Is(err, tc.wantErr) {
+				t.Fatalf("fallback=%v err=%v, want fallback=%v err=%v", fallback, err, tc.wantFallback, tc.wantErr)
+			}
+			wantCalls := 0
+			if tc.created && tc.euid == 0 {
+				wantCalls = 1
+			}
+			if chownCalls != wantCalls || statCalls != wantCalls {
+				t.Fatalf("existing inode changed or new preparation unchecked: chown=%d stat=%d want=%d", chownCalls, statCalls, wantCalls)
+			}
+		})
 	}
 }

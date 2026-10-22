@@ -57,27 +57,40 @@ Source-only corrections, with normal existing GitHub CI and no local execution:
   boolean gate denies unavailable accounting (never log the PIN, path or error
   text); test wrong-PIN plus failed failure-recording for unlock and rotation.
 
-M2 remains an unresolved publication design, not a completed cleanup fix.
+M2 follow-up keeps a persistent inode rather than trying to delete a failed
+publication. The source plan is:
+
+1. Attempt parent uid/gid assignment on a newly root-created lock, then read
+   actual descriptor metadata even when that assignment fails.
+2. If the inode remains root-owned, only effective root may use it, including
+   later opens. Emit one static warning for the process. Parent-owned locks keep
+   the existing contract; other foreign owners remain refused. Existing supplied
+   locks are never chmodded, chowned, removed or replaced by this fallback.
+3. Cover new/reopened root fallback, non-root refusal, normal parent ownership,
+   foreign ownership, reported-success verification and metadata-read failure
+   through injected syscall/stat fixtures. Normal CI only; native acceptance is
+   still held.
+
 The separable mode correction explicitly sets mode 0600 on a newly created
 descriptor regardless of umask; it never chmods an existing supplied file.
 Prepared regressions use disposable child processes with umasks 000/077/0277,
-preserve/refuse an existing bad-mode inode, and inject a root-owner preparation
-failure and foreign-owner refusal. No local candidate execution is authorized.
-These tests do not prove recovery from an orphaned failed-setup inode: failure
-still closes the descriptor without unlinking, loosening ownership or granting
-the creator an exception on this or subsequent opens. Such an exception would
-not repair the parent-owner contract for later non-root callers.
+preserve/refuse an existing bad-mode inode, and inject owner-preparation and
+metadata-read failures. No local candidate execution is authorized.
+The root fallback prevents that creator's subsequent opens from refusing solely
+because parent assignment failed. It does **not** repair mixed-UID handover:
+later non-root callers cannot use a root-owned 0600 inode and must fail closed.
+This exception is only for the advisory lock. Lockout YAML temporary-file
+ownership still requires successful parent assignment before publication; a
+namespace that cannot perform that assignment still refuses state mutations.
+The fallback is not a guarantee that every rootless-container PIN flow works.
+Other setup failures can still leave a persistent refusal; no automatic cleanup
+is claimed. Explicit local-authority ownership reconciliation must first stop
+all participating processes. Never remove or replace a live advisory-lock inode
+while another participant could hold or open it: that creates two independent
+locks and loses serialization. This draft performs no live reconciliation.
 Checking `Lstat`/`SameFile` and then unlinking a final pathname is not an atomic
 compare-and-unlink operation: it can remove a replacement and is not acceptable
-as a hostile-path guarantee. A proposed Unix staging approach initializes and
-validates an owned inode before publishing without replacement. `linkat` can
-provide no-replace publication on Linux/macOS, but exposes a temporary link count
-of two; failed staging unlink can then leave a persistent refusal. Neither
-accepting multiple links nor claiming that failure is harmless is approved.
-Linux `O_TMPFILE`/`AT_EMPTY_PATH` is not a portable macOS fallback. An accepted
-cross-platform publication/cleanup shape must resolve this before M2 is wired;
-the current Unix create path remains known to leave an unusable new sidecar
-after some setup failures. Existing or changed final paths must never be removed.
+as a hostile-path guarantee. No unlink/staging publication algorithm is added.
 All designs assume the existing node directory is trusted: a malicious owner of
 that directory is not defeated by advisory locking or pathname identity checks.
 First creation by root can transiently refuse a concurrent non-root opener until

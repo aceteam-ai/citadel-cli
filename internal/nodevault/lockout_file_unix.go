@@ -4,8 +4,10 @@ package nodevault
 
 import (
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -36,30 +38,43 @@ func openLockoutFile(path string) (*os.File, error) {
 		_ = file.Close()
 		return nil, ErrLockoutUnavailable
 	}
-	if err := checkLockoutFileOwner(fd, st, parent, created, os.Geteuid(), unix.Fchown); err != nil {
+	fallback, err := checkLockoutFileOwner(fd, st, parent, created, os.Geteuid(), unix.Fchown, unix.Fstat)
+	if err != nil {
 		_ = file.Close()
 		return nil, err
+	}
+	if fallback {
+		lockoutRootOwnerWarning.Do(func() {
+			log.Print("nodevault: lockout sidecar remains root-owned; non-root access requires offline ownership reconciliation after all participating processes stop")
+		})
 	}
 	return file, nil
 }
 
-// A root worker assigns only a new inode to its parent owner. Even the creator
-// receives no exception on failed preparation, and existing owners never change.
-// The explicit syscall dependency supports failure tests without privileged or
-// live-node operations; production passes the real effective UID and Fchown.
-func checkLockoutFileOwner(fd int, state, parent unix.Stat_t, created bool, euid int, chown func(int, int, int) error) error {
+var lockoutRootOwnerWarning sync.Once
+
+// A root worker assigns only a new inode to its parent owner. If assignment is
+// unavailable (for example in a user namespace), root may keep using its own
+// inode, including on later opens. No non-root owner exception or existing-inode
+// repair is allowed. The bool reports this mixed-UID handover limitation.
+// Syscall dependencies let tests cover ownership without changing any real UID.
+func checkLockoutFileOwner(fd int, state, parent unix.Stat_t, created bool, euid int, chown func(int, int, int) error, stat func(int, *unix.Stat_t) error) (bool, error) {
 	if created && euid == 0 {
-		if err := chown(fd, int(parent.Uid), int(parent.Gid)); err != nil {
-			return err
+		ownerErr := chown(fd, int(parent.Uid), int(parent.Gid))
+		if err := stat(fd, &state); err != nil {
+			return false, err
 		}
-		if err := unix.Fstat(fd, &state); err != nil {
-			return err
+		if ownerErr != nil && state.Uid != 0 {
+			return false, ownerErr
 		}
 	}
-	if state.Uid != parent.Uid {
-		return ErrLockoutUnavailable
+	if state.Uid == parent.Uid {
+		return false, nil
 	}
-	return nil
+	if euid == 0 && state.Uid == 0 {
+		return true, nil
+	}
+	return false, ErrLockoutUnavailable
 }
 
 func lockLockoutFile(file *os.File, deadline time.Time) error {
