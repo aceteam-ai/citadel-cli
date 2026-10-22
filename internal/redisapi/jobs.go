@@ -59,8 +59,8 @@ func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 	if msg.Data.Payload != "" {
 		var payload map[string]any
 		if err := json.Unmarshal([]byte(msg.Data.Payload), &payload); err != nil {
-			if job.Type == jobprivacy.MediaGenerate {
-				err = jobprivacy.Error(job.Type, jobprivacy.PrivateMediaMarker(), err)
+			if job.Type == "" || job.Type == jobprivacy.MediaGenerate || job.Type == jobprivacy.FileFetch {
+				return nil, jobprivacy.DeliveryErrorContext("failed to parse job payload", err)
 			}
 			return nil, fmt.Errorf("failed to parse job payload: %w", err)
 		}
