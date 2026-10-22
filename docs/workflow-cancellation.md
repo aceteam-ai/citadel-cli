@@ -53,6 +53,11 @@ would truncate legitimate late output from an uncancelled background writer.
 Nonzero command exits preserve their existing contract. A failed group signal
 does not fabricate completion: the helper can remain blocked in Wait until the
 owned command and its output copying actually finish.
+For example, a `setsid`/escaped descendant retaining the output pipe, or a
+group with no signallable remaining member (such as an EPERM refusal), keeps
+`Execution.Done` open and retains the executor slot and WORKFLOW_RUN handler
+goroutine until that pipe holder exits and output copying finishes. This does
+not retain the runner's execution lane or prove that cancellation stopped it.
 
 This is bounded process-group cancellation, not identity-pinned containment.
 A live ordinary group member retains the process-group ID after the shell is
@@ -66,7 +71,10 @@ guarantee is claimed. Stronger containment requires a separate design.
 
 Regression fixtures include an original shell observed actually reaped while a
 same-group child retains the output pipe, covering explicit cancellation and
-run timeout. PID and birth-time identity constrain fixture cleanup. A normal
+run timeout. PID and birth-time identity constrain fixture cleanup. A
+bounded poll tolerates kernel exit/reap observation races and ESRCH while still
+requiring the exact original process to be gone (or a child to be Z/X); the
+direct-shell barrier requires actual reaping before cancellation. A normal
 background writer covers complete delayed output. Fake ordering fixtures cover
 completed-result preference, signal failure and waiting for actual Wait
 completion. These source fixtures are not native macOS or Windows acceptance;

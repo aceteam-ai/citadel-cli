@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,6 +42,36 @@ func readOwnedWorkflowProcess(pid int) (ownedWorkflowProcess, error) {
 		return ownedWorkflowProcess{}, err
 	}
 	return ownedWorkflowProcess{pid, group, fields[19], text[open+1 : close], fields[0]}, nil
+}
+
+func awaitOwnedWorkflowProcessExit(t *testing.T, process ownedWorkflowProcess, allowZombie bool) {
+	t.Helper()
+	if process.pid <= 1 || process.start == "" {
+		t.Fatal("missing captured owned process identity")
+	}
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current, err := readOwnedWorkflowProcess(process.pid)
+		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) || err == nil && current.start != process.start {
+			return // The exact original process is gone, not a reused PID.
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A killed orphan can await init's reap. The direct shell/exec and
+		// the pre-cancellation leader barrier still require actual reaping.
+		if allowZombie && (current.state == "Z" || current.state == "X") {
+			return
+		}
+		select {
+		case <-timer.C:
+			t.Fatal("exact original owned process did not exit/reap before observation deadline")
+		case <-ticker.C:
+		}
+	}
 }
 
 func awaitOwnedWorkflowSleeper(t *testing.T, marker string, count int, owned *[]ownedWorkflowProcess) {
@@ -135,20 +166,7 @@ func TestExecutorCancelStopsOwnedSleepingShellAndChild(t *testing.T) {
 				t.Fatal("shell cancellation was overwritten or kept its run slot")
 			}
 			for i, process := range owned {
-				current, err := readOwnedWorkflowProcess(process.pid)
-				if os.IsNotExist(err) || err == nil && current.start != process.start {
-					continue // Exact original process has been reaped.
-				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				// A child killed together with its shell can briefly await
-				// init's reap. It is dead, not still executing or sleeping.
-				// The direct shell/executable is always reaped by Cmd.Wait.
-				if i > 0 && (current.state == "Z" || current.state == "X") {
-					continue
-				}
-				t.Fatal("owned sleeping process survived cancellation")
+				awaitOwnedWorkflowProcessExit(t, process, i > 0)
 			}
 		})
 	}
@@ -156,27 +174,10 @@ func TestExecutorCancelStopsOwnedSleepingShellAndChild(t *testing.T) {
 
 func awaitOwnedWorkflowShellReaped(t *testing.T, leader ownedWorkflowProcess, child ownedWorkflowProcess) {
 	t.Helper()
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		current, err := readOwnedWorkflowProcess(leader.pid)
-		if os.IsNotExist(err) || err == nil && current.start != leader.start {
-			background, err := readOwnedWorkflowProcess(child.pid)
-			if err != nil || background.start != child.start || background.group != leader.pid || background.state == "Z" || background.state == "X" {
-				t.Fatal("original pipe-holding background child did not survive shell reap")
-			}
-			return
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case <-timer.C:
-			t.Fatal("owned shell was not actually reaped before cancellation")
-		case <-ticker.C:
-		}
+	awaitOwnedWorkflowProcessExit(t, leader, false)
+	background, err := readOwnedWorkflowProcess(child.pid)
+	if err != nil || background.start != child.start || background.group != leader.pid || background.state == "Z" || background.state == "X" {
+		t.Fatal("original pipe-holding background child did not survive shell reap")
 	}
 }
 
@@ -190,7 +191,7 @@ func TestExecutorCancellationAfterShellReapStopsPipeHoldingChild(t *testing.T) {
 			command := "sleep 60 & printf '%s %s' \"$$\" \"$!\" > " + quote(marker) +
 				"; while [ ! -f " + quote(release) + " ]; do sleep 0.01; done; echo started"
 			e := NewExecutor(ExecutorConfig{
-				DefaultTimeout: 10 * time.Second,
+				DefaultTimeout: 2 * time.Second,
 				Shell:          ShellConfig{Gate: passcodeGate(true), WorkspaceDir: base},
 			})
 			ctx, cancel := context.WithCancel(context.Background())
@@ -229,7 +230,7 @@ func TestExecutorCancellationAfterShellReapStopsPipeHoldingChild(t *testing.T) {
 			}
 			wait := 2 * time.Second
 			if timeout {
-				wait = 12 * time.Second
+				wait = 4 * time.Second
 			}
 			select {
 			case <-run.Done():
@@ -243,13 +244,7 @@ func TestExecutorCancellationAfterShellReapStopsPipeHoldingChild(t *testing.T) {
 			if run.Snapshot().Status != want || e.ActiveCount() != 0 {
 				t.Fatal("cancel/timeout was overwritten or retained its executor slot")
 			}
-			child, err := readOwnedWorkflowProcess(owned[1].pid)
-			if err == nil && child.start == owned[1].start && child.state != "Z" && child.state != "X" {
-				t.Fatal("original background child survived cancellation")
-			}
-			if err != nil && !os.IsNotExist(err) {
-				t.Fatal(err)
-			}
+			awaitOwnedWorkflowProcessExit(t, owned[1], true)
 		})
 	}
 }
