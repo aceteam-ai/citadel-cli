@@ -173,8 +173,10 @@ The legacy adapter explicitly projects original values with its existing
 coercion rules, not new input parsing. Private-media handler logs and failure
 output are static. Arbitrary progress fields and unreviewed structured usage/
 receipt echoes are not retained for these new inputs; C5 must supply a reviewed
-typed output path, rather than re-enable generic map copying. Nonsecret flow
-identity and numeric accounting remain separate from private input content.
+typed output path, rather than re-enable generic map copying. Existing string
+identity and receipt attribution remain for compatibility, but their nonsecret
+provenance is not established; see the unresolved identity gate below. Numeric
+accounting remains separate from private input content.
 Legacy text, FILE_FETCH, passcode and other job behavior remain unchanged.
 
 Offline mock/parse tests cover Redis/API/WS conversions, exact raw bytes,
@@ -225,6 +227,53 @@ detail. The direct claim fixture covers matched, mismatched and unresolved
 nodes without polling, transport or handler execution; it also checks exact
 original receipt bytes. This does not resolve shared-stream deletion ownership
 or turn a diagnostic target into an authenticated identity.
+
+### C2 follow-up: non-string attribution and WS confirmations
+
+Private-media usage attribution previously passed arbitrary JSON values through
+the generic `payloadString` formatter. A nested capability-bearing object in
+`flow_run_id`, `flow_node_id`, `delegated_node_id` or `node_uid` consequently
+reached the actual failed-job usage-record hook as formatted text. Offline
+synthetic fixtures reproduced that retention, plus the scalar number/boolean
+coercion. The private-media projection now accepts only explicit string values
+for these four diagnostic identity fields. Ordinary-job coercion, benign string
+attribution, existing receipt-ID semantics, original execution value types and
+exact original receipt-input bytes are unchanged. This is not a new identity
+grammar, authenticated identity binding or job-execution refusal.
+
+The actual registered WS `consuming` and `acked` callbacks also previously logged
+unvalidated server `queues` and `messageId` values. Listener-free fixtures first
+reproduced reflected capability text, an input envelope and oversized detail at
+those diagnostic sinks. Both callbacks now retain static debug confirmations;
+decoded wire fields, event visibility, queue subscription, ACK and reconnect
+behavior are unchanged. The fixtures invoke the same named callbacks registered
+by `Connect`, not a look-alike logger, and check the original wire carrier.
+
+The initial focused offline race run FAILED these two boundary tests as expected
+(worker 0.117s), before the bounded source fix. It also failed a separate temporary
+string-identity audit probe. A second post-fix run of only that temporary probe
+still FAILED (worker 0.035s): passing `mediaPrivacyToken` as a string identity to
+`mediaAttributionUsageFixture` reaches the actual failed-job usage hook unchanged.
+The intentionally failing probe was removed before publication, not skipped or
+declared passing. The permanent regressions cover the concrete non-string and
+confirmation fixes; they do not establish privacy for arbitrary string IDs.
+
+After removing that temporary probe, the new permanent boundary regressions plus
+existing conversion, control/receipt, handler-failure/retry, routing, WS error
+and exact-byte fallback fixtures passed installed Go 1.26.6 offline with
+`-vet=off -race -count=5` (worker 1.245s). Downloads were disabled and the build
+cache was private; no fixture opened a socket/listener or used Redis, a model or
+a real service. This focused receipt does not replace normal exact-head CI or
+independent source review.
+
+**Identity-projection gate remains unresolved.** String-valued flow/node identity,
+receipt identifiers and trace/source identity must have a separately reviewed
+producer/provenance and diagnostic-declassification contract before capability
+minting or private-media activation. Merely being a Go string does not establish
+that a value is nonsecret. The owner's decision is required; do not silently
+suppress every identity, invent UUID authority, change receipt/execution identity
+or call C2 complete. This gate is independent of the successful-output gate below
+and the shared-stream deletion/paired purge ownership gates.
 
 ### C5 boundary still required: successful output is not an error diagnostic
 

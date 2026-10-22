@@ -1789,16 +1789,23 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		DurationMs:  completed.Sub(started).Milliseconds(),
 	}
 
-	// Project only nonsecret attribution fields. A diagnostic marker is never
-	// execution authority, and input-bearing media's requested model/backend
-	// strings are not verified model identity for retained accounting.
+	// Project only explicit string identity scalars for private media, not the
+	// generic payloadString object-formatting fallback. String provenance remains
+	// an unresolved identity-projection gate; these are not verified identities.
+	// Requested model/backend strings remain withheld from retained accounting.
 	attribution := job.Payload
 	if job.media != nil {
 		attribution = make(map[string]any)
-		for _, key := range []string{"flow_run_id", "flow_node_id", "delegated_node_id", "node_uid", "receipt_ids"} {
+		for _, key := range []string{"flow_run_id", "flow_node_id", "delegated_node_id", "node_uid"} {
 			if value, present := job.executionField(key); present {
-				attribution[key] = value
+				if identity, ok := value.(string); ok {
+					attribution[key] = identity
+				}
 			}
+		}
+		// Retain the existing receipt-ID projection contract separately.
+		if value, present := job.executionField("receipt_ids"); present {
+			attribution["receipt_ids"] = value
 		}
 	}
 	if v, ok := attribution["backend"]; ok {

@@ -111,6 +111,15 @@ func (s *WSSource) onServerError(_ redisapi.WSMessage) {
 	s.log("error", "WebSocket server error: server detail omitted")
 }
 
+func (s *WSSource) onServerConsuming(_ redisapi.WSMessage) {
+	// Confirmation fields are untrusted server strings, not diagnostic labels.
+	s.debug("ws_source: server confirmed consuming")
+}
+
+func (s *WSSource) onServerAcked(_ redisapi.WSMessage) {
+	s.debug("ws_source: server confirmed ack")
+}
+
 // Connect enables the WebSocket on the client, registers the job handler,
 // sets up the reconnect callback, and sends the initial consume message.
 func (s *WSSource) Connect(ctx context.Context) error {
@@ -153,14 +162,10 @@ func (s *WSSource) Connect(ctx context.Context) error {
 	ws.OnMessage("error", s.onServerError)
 
 	// Register handler for "consuming" confirmation from the server.
-	ws.OnMessage("consuming", func(msg redisapi.WSMessage) {
-		s.debug("ws_source: server confirmed consuming queues=%v", msg.Queues)
-	})
+	ws.OnMessage("consuming", s.onServerConsuming)
 
 	// Register handler for "acked" confirmation from the server.
-	ws.OnMessage("acked", func(msg redisapi.WSMessage) {
-		s.debug("ws_source: server confirmed ack messageId=%s", msg.MessageID)
-	})
+	ws.OnMessage("acked", s.onServerAcked)
 
 	// Register reconnect callback to re-send consume with current queue list.
 	ws.OnReconnect(func() {
