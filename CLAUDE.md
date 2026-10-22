@@ -298,8 +298,12 @@ manifest-mutating "stop services" command is `citadel stop` (`cmd/stop.go`).
 reuse ControlCenter's collectors or node-owning callbacks for this client.
 `network.SessionControlStatusRequest` owns the fixed local status GET and redirect
 refusal. The exact `session attach` root pre-run exception skips mutating startup
-hooks; neighboring commands keep their existing paths. The model, command and
-status-client fixtures pin these boundaries. See `docs/unified-session-viewer.md`
+hooks. Bare interactive discovery owns per-invocation checked selection before
+the same shared startup, using the new network observation and kernel-only
+worklock probe helpers without changing their legacy APIs. Attach/refusal never
+starts an owner; checked no-owner falls through to existing foreground behavior.
+The model, command, discovery and status-client fixtures pin these boundaries.
+See `docs/unified-session-viewer.md`
 for remaining full-#1118 work and native/ownership limitations.
 
 ### Core Architecture Patterns

@@ -119,106 +119,120 @@ control center. All other subcommands are for scripting and advanced use.`,
 			// no CA/bootstrap, swap repair, update check or invocation log writes.
 			return
 		}
-		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
-		// output there corrupts the stream. Redirect debug to stderr FIRST,
-		// before any Log()/Debug() call in this function -- including
-		// RecoverInterruptedSwap() below (citadel#934: it used to run before
-		// this check, so its Debug()/Log() calls could land on stdout and
-		// corrupt the JSON-RPC stream under `--debug citadel mcp`).
-		if cmd.Name() == "mcp" || isMemoryHookCommand(cmd) {
-			debugToStderr = true
+		if deferBareStartup(cmd, args) {
+			return
 		}
-
-		// Private control-plane trust must be installed before the updater,
-		// device auth, or Tailscale performs the process's first TLS root load.
-		// Go caches that pool, so doing this later cannot repair userspace tsnet.
-		if err := preparePrivateCATrust(cmd); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: configure private CA trust: %v\n", err)
-			os.Exit(1)
-		}
-
-		// citadel#926: repair a Windows binary swap interrupted mid-update
-		// (a kill between atomicReplaceWindows's two renames can leave no
-		// binary at all at the running executable's path). Runs before
-		// anything else (other than the debugToStderr routing above) so a
-		// self-healed binary is what serves the rest of this invocation.
-		// No-op on every other OS and when nothing needs recovering;
-		// best-effort -- a failure here must never block the command the
-		// user actually asked for.
-		if recovered, err := update.RecoverInterruptedSwap(); err != nil {
-			Debug("interrupted update recovery check failed: %v", err)
-		} else if recovered {
-			Log("recovered from an interrupted update")
-		}
-
-		// --runtime overrides container-runtime auto-detection (#636). Export it
-		// so the catalog selector sees it without threading a flag through the
-		// 13 call sites that resolve a runtime.
-		if containerRuntimeFlag != "" {
-			os.Setenv(catalog.RuntimeOverrideEnv, containerRuntimeFlag)
-		}
-
-		// Route the network engine's diagnostics into the CLI log for EVERY
-		// command, not just the two that remembered to ask (#662).
-		//
-		// internal/network's logf defaults to a no-op, so a command that skipped
-		// this discarded backend-state transitions, control-plane auth results
-		// and route/DNS reconfiguration -- the exact lines that turn "Error:
-		// timeout waiting for network connection" into a diagnosis. In #643 that
-		// opaque line was a node parked in NeedsLogin, and `Switching ipn state
-		// NoState -> NeedsLogin` had been generated and thrown away the whole
-		// time.
-		//
-		// Wired here rather than per-command because a checklist of 18 bring-up
-		// sites cannot hold: a missing call is invisible until someone is already
-		// debugging a production problem with no output to read. PersistentPreRun
-		// runs before any command's Run, so this precedes every Connect /
-		// EnsureConnected / VerifyOrReconnect. Note for future commands: if you
-		// ever give a subcommand its OWN PersistentPreRun, cobra runs only the
-		// closest one in the chain and this wiring is lost -- call
-		// rootCmd.PersistentPreRun from it.
-		//
-		// Debug routes to the dated log file always and to the console only under
-		// --debug, so this costs nothing at the terminal.
-		network.SetLogf(Debug)
-		tmux.SetLogf(Debug)
-
-		// Handle global --no-color flag and NO_COLOR env var
-		if noColorGlobal || os.Getenv("NO_COLOR") != "" {
-			color.NoColor = true
-		}
-
-		// Always log the command (Log() handles console output based on --debug)
-		Log("command: %s", invocationSummary(cmd, args))
-
-		// Check for updates (skip for update/version/help commands). A bare
-		// non-interactive invocation has a stable one-line status contract; a
-		// cached update banner before that line would corrupt pipes and scripts.
-		cmdName := cmd.Name()
-		parentName := ""
-		if cmd.Parent() != nil {
-			parentName = cmd.Parent().Name()
-		}
-		bareNonInteractive := cmdName == "citadel" && len(args) == 0 && !bareInvocationIsInteractive()
-		skipUpdateCheck := bareNonInteractive ||
-			cmdName == "update" || parentName == "update" ||
-			cmdName == "version" || cmdName == "help" ||
-			isMemoryHookCommand(cmd) ||
-			autoUpdateOptedOut()
-
-		// Detect if we're about to launch TUI control center
-		// In this case, suppress stdout printing and defer to TUI activity log
-		isTUIContext := cmdName == "citadel" && len(args) == 0 && bareInvocationIsInteractive()
-
-		// MCP uses stdout as transport -- suppress update print to stdout.
-		if cmdName == "mcp" || isMemoryHookCommand(cmd) {
-			isTUIContext = true
-		}
-
-		if !skipUpdateCheck {
-			checkForUpdateOnStartupFn(isTUIContext)
-		}
+		prepareAgentInvocation(cmd, args)
 	},
+}
+
+// deferBareStartup selects no persistent state: the bare Run performs its own
+// checked observation before deciding whether ordinary startup is appropriate.
+func deferBareStartup(cmd *cobra.Command, args []string) bool {
+	return cmd.CommandPath() == "citadel" && len(args) == 0 && bareInvocationIsInteractive()
+}
+
+// prepareAgentInvocation is the existing shared startup sequence. Only exact
+// interactive bare invocations defer it until read-only session discovery has
+// confirmed absence; expert and non-interactive commands retain their ordering.
+func prepareAgentInvocation(cmd *cobra.Command, args []string) {
+	// MCP command uses stdout as JSON-RPC transport -- any non-protocol
+	// output there corrupts the stream. Redirect debug to stderr FIRST,
+	// before any Log()/Debug() call in this function -- including
+	// RecoverInterruptedSwap() below (citadel#934: it used to run before
+	// this check, so its Debug()/Log() calls could land on stdout and
+	// corrupt the JSON-RPC stream under `--debug citadel mcp`).
+	if cmd.Name() == "mcp" || isMemoryHookCommand(cmd) {
+		debugToStderr = true
+	}
+
+	// Private control-plane trust must be installed before the updater,
+	// device auth, or Tailscale performs the process's first TLS root load.
+	// Go caches that pool, so doing this later cannot repair userspace tsnet.
+	if err := preparePrivateCATrust(cmd); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: configure private CA trust: %v\n", err)
+		os.Exit(1)
+	}
+
+	// citadel#926: repair a Windows binary swap interrupted mid-update
+	// (a kill between atomicReplaceWindows's two renames can leave no
+	// binary at all at the running executable's path). Runs before
+	// anything else (other than the debugToStderr routing above) so a
+	// self-healed binary is what serves the rest of this invocation.
+	// No-op on every other OS and when nothing needs recovering;
+	// best-effort -- a failure here must never block the command the
+	// user actually asked for.
+	if recovered, err := update.RecoverInterruptedSwap(); err != nil {
+		Debug("interrupted update recovery check failed: %v", err)
+	} else if recovered {
+		Log("recovered from an interrupted update")
+	}
+
+	// --runtime overrides container-runtime auto-detection (#636). Export it
+	// so the catalog selector sees it without threading a flag through the
+	// 13 call sites that resolve a runtime.
+	if containerRuntimeFlag != "" {
+		os.Setenv(catalog.RuntimeOverrideEnv, containerRuntimeFlag)
+	}
+
+	// Route the network engine's diagnostics into the CLI log for EVERY
+	// command, not just the two that remembered to ask (#662).
+	//
+	// internal/network's logf defaults to a no-op, so a command that skipped
+	// this discarded backend-state transitions, control-plane auth results
+	// and route/DNS reconfiguration -- the exact lines that turn "Error:
+	// timeout waiting for network connection" into a diagnosis. In #643 that
+	// opaque line was a node parked in NeedsLogin, and `Switching ipn state
+	// NoState -> NeedsLogin` had been generated and thrown away the whole
+	// time.
+	//
+	// Wired here rather than per-command because a checklist of 18 bring-up
+	// sites cannot hold: a missing call is invisible until someone is already
+	// debugging a production problem with no output to read. PersistentPreRun
+	// runs before any command's Run, except bare read-only discovery, so this
+	// still precedes every owner Connect / EnsureConnected / VerifyOrReconnect.
+	// Subcommands with their own PersistentPreRun must call the root hook.
+	//
+	// Debug routes to the dated log file always and to the console only under
+	// --debug, so this costs nothing at the terminal.
+	network.SetLogf(Debug)
+	tmux.SetLogf(Debug)
+
+	// Handle global --no-color flag and NO_COLOR env var
+	if noColorGlobal || os.Getenv("NO_COLOR") != "" {
+		color.NoColor = true
+	}
+
+	// Always log the command (Log() handles console output based on --debug)
+	Log("command: %s", invocationSummary(cmd, args))
+
+	// Check for updates (skip for update/version/help commands). A bare
+	// non-interactive invocation has a stable one-line status contract; a
+	// cached update banner before that line would corrupt pipes and scripts.
+	cmdName := cmd.Name()
+	parentName := ""
+	if cmd.Parent() != nil {
+		parentName = cmd.Parent().Name()
+	}
+	bareNonInteractive := cmdName == "citadel" && len(args) == 0 && !bareInvocationIsInteractive()
+	skipUpdateCheck := bareNonInteractive ||
+		cmdName == "update" || parentName == "update" ||
+		cmdName == "version" || cmdName == "help" ||
+		isMemoryHookCommand(cmd) ||
+		autoUpdateOptedOut()
+
+	// Detect if we're about to launch TUI control center
+	// In this case, suppress stdout printing and defer to TUI activity log
+	isTUIContext := cmdName == "citadel" && len(args) == 0 && bareInvocationIsInteractive()
+
+	// MCP uses stdout as transport -- suppress update print to stdout.
+	if cmdName == "mcp" || isMemoryHookCommand(cmd) {
+		isTUIContext = true
+	}
+
+	if !skipUpdateCheck {
+		checkForUpdateOnStartupFn(isTUIContext)
+	}
 }
 
 func isMemoryHookCommand(cmd *cobra.Command) bool {

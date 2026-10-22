@@ -51,6 +51,15 @@ func New(ctx context.Context, fetch Fetch) *Model {
 	return &Model{ctx: ctx, cancel: cancel, fetch: fetch, generation: 1}
 }
 
+// NewObserved retains the caller's validated preflight observation so the
+// first viewer poll cannot silently adopt a different observed owner. It adds
+// no server identity or PID-reuse guarantee to the existing wire fields.
+func NewObserved(ctx context.Context, fetch Fetch, status Snapshot) *Model {
+	model := New(ctx, fetch)
+	model.status, model.haveStatus = status, true
+	return model
+}
+
 // Close cancels viewer-owned work only. The caller must also call it if the
 // terminal program exits through a signal or initialization failure.
 func (m *Model) Close() {

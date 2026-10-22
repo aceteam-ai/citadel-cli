@@ -30,23 +30,51 @@ func runSessionAttach(ctx context.Context, stateDir string, request sessionStatu
 	return run(ctx, model)
 }
 
+func runObservedSessionAttach(ctx context.Context, stateDir string, status sessionview.Snapshot, request sessionStatusRequester, run func(context.Context, *sessionview.Model) error) error {
+	model := sessionview.NewObserved(ctx, func(ctx context.Context) (sessionview.Snapshot, error) {
+		return loadSessionViewStatus(ctx, stateDir, request)
+	}, status)
+	defer model.Close()
+	return run(ctx, model)
+}
+
+func runSessionViewProgram(ctx context.Context, model *sessionview.Model) error {
+	_, err := tea.NewProgram(model, tea.WithContext(ctx), tea.WithAltScreen()).Run()
+	return err
+}
+
 // loadSessionViewStatus consumes only the existing local status response. It
 // never returns peer bodies, parser details, paths or arbitrary error text.
 func loadSessionViewStatus(ctx context.Context, stateDir string, request sessionStatusRequester) (sessionview.Snapshot, error) {
+	status, absent, err := observeSessionViewStatus(ctx, stateDir, request)
+	if err != nil || absent {
+		return sessionview.Snapshot{}, errSessionViewUnavailable
+	}
+	return status, nil
+}
+
+// Only a typed local dial absence permits the bare path to continue checking
+// whether startup is appropriate. An HTTP refusal, unknown listener or private
+// transport detail is never converted into permission to start an owner.
+func observeSessionViewStatus(ctx context.Context, stateDir string, request sessionStatusRequester) (sessionview.Snapshot, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	response, err := request(ctx, stateDir)
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
 	}
+	if response == nil && err != nil && network.SessionControlEndpointAbsent(err) {
+		return sessionview.Snapshot{}, true, nil
+	}
 	if err != nil || response == nil || response.Body == nil || response.StatusCode != http.StatusOK {
-		return sessionview.Snapshot{}, errSessionViewUnavailable
+		return sessionview.Snapshot{}, false, errSessionViewUnavailable
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, sessionViewBodyLimit+1))
 	if err != nil || len(body) > sessionViewBodyLimit || !utf8.Valid(body) {
-		return sessionview.Snapshot{}, errSessionViewUnavailable
+		return sessionview.Snapshot{}, false, errSessionViewUnavailable
 	}
-	return decodeSessionViewStatus(body)
+	status, err := decodeSessionViewStatus(body)
+	return status, false, err
 }
 
 func decodeSessionViewStatus(body []byte) (sessionview.Snapshot, error) {
@@ -122,10 +150,7 @@ var sessionAttachCmd = &cobra.Command{
 		}
 		// This deliberately does not construct ControlCenter: its collectors,
 		// worker, mesh listeners, auth, settings and service actions own state.
-		return runSessionAttach(cmd.Context(), network.GetStateDir(), network.SessionControlStatusRequest, func(ctx context.Context, model *sessionview.Model) error {
-			_, err := tea.NewProgram(model, tea.WithContext(ctx), tea.WithAltScreen()).Run()
-			return err
-		})
+		return runSessionAttach(cmd.Context(), network.GetStateDir(), network.SessionControlStatusRequest, runSessionViewProgram)
 	},
 }
 

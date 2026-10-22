@@ -170,3 +170,38 @@ func TestViewerAllowsObservedOfflineWithoutClaimingNodeExit(t *testing.T) {
 		t.Fatal("valid offline status was confused with lost local control")
 	}
 }
+
+func TestObservedViewerFencesItsFirstPollAgainstPreflight(t *testing.T) {
+	for _, change := range []string{"same", "pid", "mode", "uptime", "error"} {
+		t.Run(change, func(t *testing.T) {
+			baseline := fixtureStatus()
+			status := baseline
+			var failure error
+			switch change {
+			case "same":
+				status.UptimeSec++
+			case "pid":
+				status.PID++
+			case "mode":
+				status.Mode = "presence"
+			case "uptime":
+				status.UptimeSec--
+			case "error":
+				failure = errors.New("private-loader-detail")
+			}
+			model := NewObserved(context.Background(), func(context.Context) (Snapshot, error) { return status, failure }, baseline)
+			defer model.Close()
+			if !model.haveStatus || model.status != baseline {
+				t.Fatal("viewer dropped its validated preflight baseline")
+			}
+			_, next := model.Update(model.Init()())
+			if change == "same" {
+				if model.unavailable || model.status != status || next == nil {
+					t.Fatal("same observed owner could not continue polling")
+				}
+			} else if !model.unavailable || model.haveStatus || model.status != (Snapshot{}) || next != nil || strings.Contains(model.View(), "owned-node") {
+				t.Fatal("first viewer poll silently adopted a changed owner or kept stale fields")
+			}
+		})
+	}
+}

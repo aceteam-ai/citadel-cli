@@ -124,6 +124,34 @@ func TestSessionViewerRunnerPropagatesTerminalFailureAndBoundsRequest(t *testing
 	}
 }
 
+func TestObservedSessionRunnerRetainsPreflightTargetAndBaseline(t *testing.T) {
+	baseline, err := decodeSessionViewStatus([]byte(validSessionView))
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	err = runObservedSessionAttach(context.Background(), "fixed-observed-state", baseline, func(_ context.Context, stateDir string) (*http.Response, error) {
+		calls++
+		if stateDir != "fixed-observed-state" {
+			t.Fatal("viewer resolved a different destination after preflight")
+		}
+		changed := strings.Replace(validSessionView, `"pid":123`, `"pid":456`, 1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(changed))}, nil
+	}, func(_ context.Context, model *sessionview.Model) error {
+		if !strings.Contains(model.View(), "PID: 123") {
+			t.Fatal("runner did not seed the validated observation")
+		}
+		model.Update(model.Init()())
+		if !strings.Contains(model.View(), "unavailable or changed") || strings.Contains(model.View(), "PID: 456") {
+			t.Fatal("runner silently adopted a different first-poll owner")
+		}
+		return nil
+	})
+	if err != nil || calls != 1 {
+		t.Fatal("observed viewer did not use exactly its fixed-target first poll")
+	}
+}
+
 func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 	t.Setenv("CITADEL_AUTH_HOST", "")
 	originalConfig := deviceConfigForCATrustFn
@@ -194,11 +222,45 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 				t.Fatal("startup exemption changed its exact command-leaf scope")
 			}
 		}
+		if len(function.Body.List) != 4 {
+			t.Fatal("root startup must contain only the two exact guards, bare deferral and shared startup")
+		}
+		bareGuard, ok := function.Body.List[2].(*ast.IfStmt)
+		if !ok || bareGuard.Init != nil || bareGuard.Else != nil || len(bareGuard.Body.List) != 1 {
+			t.Fatal("bare discovery must defer startup before any shared mutator")
+		}
+		if _, ok := bareGuard.Body.List[0].(*ast.ReturnStmt); !ok {
+			t.Fatal("bare discovery guard did not return before mutating startup")
+		}
+		assertInvocationCall(t, bareGuard.Cond, "deferBareStartup")
+		startup, ok := function.Body.List[3].(*ast.ExprStmt)
+		if !ok {
+			t.Fatal("shared startup is no longer the last root hook statement")
+		}
+		assertInvocationCall(t, startup.X, "prepareAgentInvocation")
 		found = true
 		return false
 	})
 	if !found {
 		t.Fatal("shared startup hook was not audited")
+	}
+}
+
+func assertInvocationCall(t *testing.T, expression ast.Expr, name string) {
+	t.Helper()
+	call, ok := expression.(*ast.CallExpr)
+	if !ok || len(call.Args) != 2 {
+		t.Fatal("root invocation boundary call changed shape")
+	}
+	function, ok := call.Fun.(*ast.Ident)
+	if !ok || function.Name != name {
+		t.Fatal("root invocation boundary called a different helper")
+	}
+	for index, expected := range []string{"cmd", "args"} {
+		argument, ok := call.Args[index].(*ast.Ident)
+		if !ok || argument.Name != expected {
+			t.Fatal("root invocation boundary lost the current command or arguments")
+		}
 	}
 }
 
