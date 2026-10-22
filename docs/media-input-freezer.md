@@ -135,12 +135,21 @@ receipts. Independent review remains required.
 `coordinatorfetch.Get` owns the closed FILE_FETCH/media-input route set, exact
 HTTPS origin, token syntax, all-answer public-IP/own-interface checks and
 numeric reconnect pinning. It ignores proxies, refuses redirects/compression,
-retains production TLS verification and bounds headers, deadline and transfer
-to declared-limit-plus-one. It streams into an `io.Writer` and returns only
+retains production TLS verification and bounds response headers, the
+network/context-aware transfer deadline and bytes to declared-limit-plus-one.
+It streams into an `io.Writer` and returns only
 byte count/hash or a static refusal. It does not stage files or authenticate
 capability claims; the coordinator still owns signature/purpose/expiry/nonce
 and tenant/object binding. Trusted programmatic hooks are fixture seams, never
 payload/configurable network-policy overrides.
+
+The sink's `Write` is synchronous and need not honor context cancellation. A
+blocked local writer can therefore outlast the request deadline; that deadline
+is not proof of writer exit. Callers retain writer/holder custody until the
+transfer returns and must not add a timeout goroutine that abandons the writer
+or reuse/publish partial bytes. The in-memory inbox sink does not introduce a
+blocking external writer; FILE_FETCH retains its existing local file-write
+behavior and final cancellation/publication checks.
 
 FILE_FETCH reuses that client but keeps its original filesystem and live Files
 boundary, cooperative cancellation, maximum-size (not exact-size) semantics,
@@ -161,5 +170,8 @@ This is source preparation, not C5 activation or complete media acceptance.
 The caller still needs shared holder admission before any redemption, target
 node/deadline/duplicate/cancel and live publication gates, C2 credential privacy,
 C3 withheld storage, D6 upload, a compatible sidecar and reviewed permissions.
-No new fixture bytes/pin, video schema, live token or permission is introduced.
+The transport/freezer adds no further fixture revision beyond its composed
+parent's proposed replay correction; see `media-input-contract.md` for accepted
+versus proposed pins. That composition is not paired platform ratification.
+No video schema, live token or permission is introduced.
 See the stacked draft for exact-head receipts and independent review status.

@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-const fixtureSHA256 = "6d19921e8d842ecd00dfba709ad073eacc0511dce7f12e9c2107b0e0f8fcca1e"
+const fixtureSHA256 = "808f87bb7e1315b2f4d910eb3340257c951fb51cd7ba0f3a4187adce6e77a41e"
 
 type validVector struct {
 	Name  string          `json:"name"`

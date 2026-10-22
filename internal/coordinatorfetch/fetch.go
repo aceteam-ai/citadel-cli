@@ -178,7 +178,10 @@ func Transport(host string, hooks Hooks) *http.Transport {
 
 // Get streams at most maxBytes+1 bytes into a private caller-owned sink. A
 // refusal leaves partial bytes in that sink: they must be discarded, never
-// published. There are no filesystem operations, logging or automatic retries.
+// published. The request deadline bounds network/context-aware transfer, not
+// a synchronous sink.Write that blocks. The caller retains writer/holder
+// custody until Get returns; do not abandon a blocked writer and reuse it.
+// There are no filesystem operations, logging or automatic retries.
 func Get(ctx context.Context, origin string, endpoint Endpoint, token string, maxBytes int64, sink io.Writer, hooks Hooks) (Result, error) {
 	var result Result
 	u, err := Origin(origin)

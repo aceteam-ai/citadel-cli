@@ -13,7 +13,7 @@ import unicodedata
 import unittest
 
 
-FIXTURE_SHA256 = "6d19921e8d842ecd00dfba709ad073eacc0511dce7f12e9c2107b0e0f8fcca1e"
+FIXTURE_SHA256 = "808f87bb7e1315b2f4d910eb3340257c951fb51cd7ba0f3a4187adce6e77a41e"
 FIXTURE = Path(__file__).parent / "testdata" / "media_input_v1.json"
 
 
@@ -32,6 +32,19 @@ def _invalid_number(_):
 
 class _NonInteger(str):
     """Preserve a JSON float's lexical kind without coercing it to an integer."""
+
+
+class _OversizedInteger:
+    """An integer beyond the signed 64-bit decimal width, without its lexeme."""
+
+    __slots__ = ()
+
+
+def _parse_integer(lexeme):
+    digits = len(lexeme) - (1 if lexeme.startswith("-") else 0)
+    if digits > 19:
+        return _OversizedInteger()
+    return int(lexeme)
 
 
 def _shape(value, depth=0, budget=None):
@@ -89,7 +102,7 @@ def validate(task, raw):
     try:
         value = json.loads(
             raw.decode("utf-8", errors="strict"), object_pairs_hook=_object,
-            parse_float=_NonInteger, parse_constant=_invalid_number,
+            parse_int=_parse_integer, parse_float=_NonInteger, parse_constant=_invalid_number,
         )
     except (ValueError, UnicodeError, RecursionError):
         raise ValueError("invalid_schema") from None
@@ -115,7 +128,7 @@ def validate(task, raw):
             raise ValueError("invalid_schema")
         if item["role"] != role:
             raise ValueError("invalid_roles")
-        if isinstance(item["size"], _NonInteger):
+        if isinstance(item["size"], (_NonInteger, _OversizedInteger)):
             raise ValueError("invalid_size")
         if type(item["size"]) is not int:
             raise ValueError("invalid_schema")
@@ -189,6 +202,43 @@ class ContractVectors(unittest.TestCase):
         _shape([[["leaf"]]])
         with self.assertRaisesRegex(ValueError, "^invalid_schema$"):
             _shape([[[["leaf"]]]])
+
+    def test_integer_hook_is_bounded_before_conversion(self):
+        for lexeme, expected in (
+            ("0", 0), ("-0", 0), ("16777216", 16777216),
+            ("9223372036854775807", 9223372036854775807),
+            ("-9223372036854775808", -9223372036854775808),
+            ("9999999999999999999", 9999999999999999999),
+        ):
+            with self.subTest(lexeme=lexeme):
+                self.assertEqual(_parse_integer(lexeme), expected)
+        for digits in (20, 4301):
+            for sign in ("", "-"):
+                with self.subTest(digits=digits, sign=sign):
+                    marker = _parse_integer(sign + "9" * digits)
+                    self.assertIs(type(marker), _OversizedInteger)
+                    self.assertFalse(hasattr(marker, "__dict__"))  # no lexeme storage
+
+    def test_long_integers_preserve_field_type_and_size_precedence(self):
+        base = json.dumps(self.by_name["workspace"]["value"], separators=(",", ":"))
+        for digits in (19, 20, 4301):
+            for sign in ("", "-"):
+                raw = base.replace('"size":1', '"size":' + sign + "9" * digits, 1)
+                with self.subTest(digits=digits, sign=sign):
+                    with self.assertRaisesRegex(ValueError, "^invalid_size$"):
+                        validate("image-to-image", raw.encode())
+        huge = "9" * 4301
+        for old, new, reason in (
+            ('"schema":"media_input.v1"', '"schema":' + huge, "invalid_schema"),
+            ('"role":"source"', '"role":' + huge, "invalid_schema"),
+            ('"path":"fixtures/source.png"', '"path":' + huge, "invalid_schema"),
+        ):
+            with self.subTest(field=old):
+                self.assertIn(old, base)
+                with self.assertRaisesRegex(ValueError, "^" + reason + "$"):
+                    validate("image-to-image", base.replace(old, new, 1).encode())
+        with self.assertRaisesRegex(ValueError, "^invalid_inputs$"):
+            validate("image-to-image", ('{"schema":"media_input.v1","inputs":' + huge + '}').encode())
 
     def test_standalone_path_rule_is_portable_and_byte_bounded(self):
         for name in ("NUL", "con.png", "dir/ordinary file.png", "a" * 255, "é" * 127 + "a"):
