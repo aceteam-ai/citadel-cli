@@ -25,6 +25,7 @@ import (
 
 const videoComposeDefaultMaxBytes int64 = 48 << 20
 const videoComposeMaxFilmJSON = 1 << 20
+const videoComposeMaxFilmSeconds = 600
 
 // Required identity fields repair the omission in #11481's example. Their enum
 // is shared with #11484. Validate exact keys before Go's case-insensitive binder.
@@ -143,7 +144,50 @@ func decodeVideoComposeFilm(raw []byte) (videoComposeFilm, error) {
 			return film, fmt.Errorf("stock narration speaking as a person requires disclosure")
 		}
 	}
+	if _, err := videoComposeCardDuration(film); err != nil {
+		return film, err
+	}
 	return film, nil
+}
+
+// Duration policy uses the same binary64 seconds as the existing probe and
+// timeline contract. Check remaining allowance before addition: there is no
+// overflow, rounding epsilon or extra frame of allowance above the hard cap.
+func videoComposeAddDuration(total, part float64) (float64, error) {
+	if !videoComposeFinite(total) || total < 0 || total > videoComposeMaxFilmSeconds ||
+		!videoComposeFinite(part) || part <= 0 || part > videoComposeMaxFilmSeconds-total {
+		return 0, fmt.Errorf("film must fit within 600 seconds including all title cards")
+	}
+	next := total + part
+	if !videoComposeFinite(next) || next > videoComposeMaxFilmSeconds {
+		return 0, fmt.Errorf("film must fit within 600 seconds including all title cards")
+	}
+	return next, nil
+}
+
+func videoComposeCardDuration(film videoComposeFilm) (float64, error) {
+	total, err := videoComposeAddDuration(0, film.Intro.Seconds)
+	if err != nil {
+		return 0, err
+	}
+	for _, chapter := range film.Chapters {
+		total, err = videoComposeAddDuration(total, chapter.CardSeconds)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return videoComposeAddDuration(total, film.Outro.Seconds)
+}
+
+func videoComposeCheckOutputDuration(actual, timeline, fps float64) error {
+	if _, err := videoComposeAddDuration(0, actual); err != nil {
+		return err
+	}
+	if !videoComposeFinite(timeline) || timeline <= 0 || timeline > videoComposeMaxFilmSeconds ||
+		!videoComposeFinite(fps) || fps <= 0 || math.Abs(actual-timeline) > 1/fps {
+		return fmt.Errorf("film duration disagrees with timeline")
+	}
+	return nil
 }
 
 func videoComposeSafeBasename(name string) bool {
@@ -501,6 +545,10 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		return parseVideoComposeProbe(raw.stdout)
 	}
 	media := make([]videoComposeMedia, len(chapters))
+	projected, err := videoComposeCardDuration(film)
+	if err != nil {
+		return nil, err
+	}
 	for i, path := range chapters {
 		media[i], err = probe(path)
 		if err != nil {
@@ -508,6 +556,10 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		}
 		if i > 0 && !videoComposeSameAspect(media[0], media[i]) {
 			return nil, fmt.Errorf("mixed chapter aspect ratios")
+		}
+		projected, err = videoComposeAddDuration(projected, media[i].Duration)
+		if err != nil {
+			return nil, err
 		}
 	}
 	scratch, err := os.MkdirTemp(outDir, ".video-compose-")
@@ -535,7 +587,11 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		}
 		return nil
 	}
-	timeline := videoComposeTimeline{Duration: reference.Duration}
+	actualDuration, err := videoComposeAddDuration(0, reference.Duration)
+	if err != nil {
+		return nil, err
+	}
+	timeline := videoComposeTimeline{Duration: actualDuration}
 	playlist := "file 'intro.mp4'\n"
 	for i, ch := range film.Chapters {
 		cardName := fmt.Sprintf("card-%02d.mp4", i)
@@ -551,7 +607,10 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 			return nil, fmt.Errorf("card stream parameters do not match intro")
 		}
 		row := videoComposeRow{Index: i + 1, Title: ch.Title, CardStart: timeline.Duration, Narrator: ch.Narrator, Stamp: ch.Stamp, Disclosure: ch.Disclosure}
-		timeline.Duration += card.Duration
+		timeline.Duration, err = videoComposeAddDuration(timeline.Duration, card.Duration)
+		if err != nil {
+			return nil, err
+		}
 		row.Start = timeline.Duration
 		clipName := fmt.Sprintf("clip-%02d.mp4", i)
 		clipPath := filepath.Join(scratch, clipName)
@@ -569,7 +628,10 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		if !videoComposeCopyCompatible(reference, actual) {
 			return nil, fmt.Errorf("prepared chapter stream parameters do not match cards")
 		}
-		timeline.Duration += actual.Duration
+		timeline.Duration, err = videoComposeAddDuration(timeline.Duration, actual.Duration)
+		if err != nil {
+			return nil, err
+		}
 		row.End = timeline.Duration
 		timeline.Chapters = append(timeline.Chapters, row)
 		playlist += "file '" + cardName + "'\nfile '" + clipName + "'\n"
@@ -585,7 +647,10 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 	if !videoComposeCopyCompatible(reference, end) {
 		return nil, fmt.Errorf("outro stream parameters do not match intro")
 	}
-	timeline.Duration += end.Duration
+	timeline.Duration, err = videoComposeAddDuration(timeline.Duration, end.Duration)
+	if err != nil {
+		return nil, err
+	}
 	playlist += "file 'outro.mp4'\n"
 	list := filepath.Join(scratch, "concat.txt")
 	if err := os.WriteFile(list, []byte(playlist), 0o600); err != nil {
@@ -594,6 +659,14 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 	joined := filepath.Join(scratch, "joined.mp4")
 	if err := run([]string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-format_whitelist", "concat,mov", "-f", "concat", "-safe", "1", "-i", list, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", joined}); err != nil {
 		return nil, err
+	}
+	joinedMedia, err := probe(joined)
+	if err != nil {
+		return nil, err
+	}
+	fps, _ := videoComposeFPS(reference.FPS)
+	if err := videoComposeCheckOutputDuration(joinedMedia.Duration, timeline.Duration, fps); err != nil {
+		return nil, fmt.Errorf("joined %w", err)
 	}
 	analysis, err := deps.run(ctx, ffmpeg, videoComposeLoudnormArgs(joined, "", film.Loudness, nil))
 	if err != nil {
@@ -616,6 +689,13 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 	if err != nil {
 		return nil, err
 	}
+	finalMedia, err := probe(filmPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := videoComposeCheckOutputDuration(finalMedia.Duration, timeline.Duration, fps); err != nil {
+		return nil, fmt.Errorf("final %w", err)
+	}
 	if info.Size() > film.Delivery.MaxBytes {
 		capped := filepath.Join(scratch, "capped.mp4")
 		args, err := videoComposeCapArgs(filmPath, capped, timeline.Duration, film.Delivery.MaxBytes)
@@ -636,16 +716,17 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 			return nil, err
 		}
 		timeline.EncodePasses++
-	}
-	finalMedia, err := probe(filmPath)
-	if err != nil {
-		return nil, err
+		finalMedia, err = probe(filmPath)
+		if err != nil {
+			return nil, err
+		}
+		if err := videoComposeCheckOutputDuration(finalMedia.Duration, timeline.Duration, fps); err != nil {
+			return nil, fmt.Errorf("final %w", err)
+		}
 	}
 	// AAC padding and container timebases permit at most one video frame drift.
-	fps, _ := videoComposeFPS(reference.FPS)
-	if math.Abs(finalMedia.Duration-timeline.Duration) > 1/fps {
-		return nil, fmt.Errorf("final film duration disagrees with timeline")
-	}
+	// Both encode paths have independently passed the hard 600-second cap;
+	// the frame tolerance above never extends that maximum.
 	timeline.Bytes = info.Size()
 	posterPath := filepath.Join(outDir, "poster.png")
 	if err := removeStaleBuiltinOutput(posterPath); err != nil {

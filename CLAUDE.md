@@ -1519,6 +1519,11 @@ the engine's own incremental deltas into one final array before returning it.
 `runVideoComposeBuiltin` owns the proposed closed film decoder, declared-basename
 binding and media composition core, but has no registry entry; its live dependency
 set fails before effects until the pinned v3 card/disclosure renderer lands.
+`videoComposeAddDuration` owns the owner-approved total-film duration bound for
+both projected cards/chapters and actual timeline accumulation;
+`videoComposeCheckOutputDuration` separately checks concat and both encode paths
+without turning frame drift tolerance into extra duration allowance. Container
+metadata changes remain a separate reviewed design, not part of that bound.
 `template_builtin_video_compose_command.go` owns its proposed bounded, separate
 stdout/stderr captures and overflow cancellation without changing audio-mix.
 `renderPapercraftLandscapeCard` shares the existing capture lifecycle for one
