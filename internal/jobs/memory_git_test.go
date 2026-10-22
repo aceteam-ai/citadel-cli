@@ -125,7 +125,8 @@ func TestMemoryGitAuthorizedExportAndContext(t *testing.T) {
 	}
 	run := func(args ...string) {
 		t.Helper()
-		argv := append([]string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-C", repo}, args...)
+		// Keep maintenance from racing the fixture metadata-permission walk.
+		argv := append([]string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-C", repo}, args...)
 		cmd := exec.Command(git, argv...)
 		cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + repo, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid"}
 		if out, err := cmd.CombinedOutput(); err != nil {

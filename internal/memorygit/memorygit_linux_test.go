@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -89,11 +91,18 @@ func fixture(t *testing.T) (*Engine, string, string, string) {
 	return engine, repo, old, newSHA
 }
 
-func fixtureGit(t *testing.T, git, repo string, args ...string) string {
-	t.Helper()
-	args = append([]string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-C", repo}, args...)
+func fixtureGitCommand(git, repo string, args ...string) *exec.Cmd {
+	// Automatic maintenance may detach and remove a lock while fixtureGit
+	// normalizes metadata permissions. Keep fixture writes synchronous.
+	args = append([]string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-C", repo}, args...)
 	cmd := exec.Command(git, args...)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + repo, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "LC_ALL=C"}
+	return cmd
+}
+
+func fixtureGit(t *testing.T, git, repo string, args ...string) string {
+	t.Helper()
+	cmd := fixtureGitCommand(git, repo, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("fixture git failed: %v: %s", err, out)
@@ -113,6 +122,51 @@ func fixtureGit(t *testing.T, git, repo string, args ...string) string {
 		t.Fatal(err)
 	}
 	return string(out)
+}
+
+func TestFixtureGitDoesNotStartAutomaticMaintenance(t *testing.T) {
+	e, repo, _, _ := fixture(t)
+	// Repository settings request maintenance. The fixture command must
+	// override them, even for commits that normally spawn maintenance --auto.
+	fixtureGit(t, e.gitPath, repo, "config", "maintenance.auto", "true")
+	fixtureGit(t, e.gitPath, repo, "config", "gc.auto", "1")
+	tracePath := filepath.Join(t.TempDir(), "git-trace.json")
+	cmd := fixtureGitCommand(e.gitPath, repo, "commit", "--allow-empty", "--quiet", "-m", "trace fixture")
+	cmd.Env = append(cmd.Env, "GIT_TRACE2_EVENT="+tracePath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fixture commit: %v %s", err, out)
+	}
+	trace, err := os.Open(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trace.Close()
+	decoder := json.NewDecoder(trace)
+	started := false
+	for {
+		var event struct {
+			Event string   `json:"event"`
+			Argv  []string `json:"argv"`
+		}
+		if err := decoder.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if event.Event == "start" {
+			started = true
+		}
+		if event.Event == "child_start" {
+			for _, arg := range event.Argv {
+				if arg == "maintenance" || arg == "gc" {
+					t.Fatalf("fixture started asynchronous Git maintenance: %v", event.Argv)
+				}
+			}
+		}
+	}
+	if !started {
+		t.Fatal("Git trace did not observe the fixture commit")
+	}
 }
 
 func request(op Operation) Request {
