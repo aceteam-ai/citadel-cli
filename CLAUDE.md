@@ -602,10 +602,13 @@ Shell node refused mid-run fails the workflow as an ordinary failure.
 
 `workflow.Executor.Cancel` owns per-run context cancellation; a cancelled
 status records the request, not proof that a Shell process or callback exited.
-`Execution.Done` supplies actual executor/slot completion, which the worker
-handler waits for before returning. Linux/macOS Shell cancellation targets its
-dedicated process group; detached daemons and native Windows containment are
-not implied. See `docs/workflow-cancellation.md` for the custody boundary.
+`Execution.Done` supplies executor/slot completion, which the workflow handler
+waits for before returning. That is not runner-level fencing:
+`worker.Runner.executeWithDeadline` can return before a normal-lane workflow
+handler exits. The Shell process-group hook also has an unresolved gap after
+the shell is reaped while a background child retains its output pipe. See
+`docs/workflow-cancellation.md` for the repair constraints and custody boundary;
+detached daemons and native Windows containment are not implied.
 
 The five desktop handlers (FILE_SCREENSHOT, VNC_SCREENSHOT, VNC_TYPE, VNC_KEYS,
 VNC_ACTIONS) honor the node passcode like SHELL_COMMAND, through

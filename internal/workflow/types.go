@@ -222,7 +222,9 @@ func (e *Execution) SetStatus(s ExecutionStatus) {
 
 // Done closes only after the executor goroutine exits and releases its run
 // slot. A cancelled status is a request, not evidence that a node has exited.
-// Manually constructed executions outside Submit have no completion signal.
+// Only Submit closes this signal. A NewExecution not submitted stays open;
+// a zero-value or manually constructed Execution may return nil, so receiving
+// from it blocks forever. Snapshots are not live completion handles.
 func (e *Execution) Done() <-chan struct{} { return e.done }
 
 func (e *Execution) Complete(output map[string]any, err error) {
