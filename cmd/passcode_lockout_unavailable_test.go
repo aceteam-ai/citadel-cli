@@ -133,3 +133,62 @@ func TestResetPasscodeLockoutCoreRefusesAbsentStateWithBrokenSidecar(t *testing.
 		})
 	}
 }
+
+func TestResetPasscodeLockoutClearsLegacyDespiteBrokenAbsentMaster(t *testing.T) {
+	dir := t.TempDir()
+	legacy := nodevault.OpenLegacyPasscodeLockout(dir)
+	for attempt := 0; attempt < 5; attempt++ {
+		if err := legacy.Attempt(func() bool { return false }); !errors.Is(err, nodevault.ErrWrongPIN) {
+			t.Fatal("fixture failed to record a legacy wrong-PIN attempt")
+		}
+	}
+	if status := legacy.Status(); status.Unavailable || !status.LockedOut || status.FailedAttempts != 5 {
+		t.Fatal("fixture did not establish an active legacy lockout")
+	}
+	masterState := filepath.Join(dir, "vault", "state.yaml")
+	masterSidecar := masterState + ".lock"
+	if err := os.MkdirAll(masterSidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(masterSidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = resetPasscodeLockoutAt(dir)
+	if !errors.Is(err, nodevault.ErrLockoutUnavailable) || !strings.Contains(err.Error(), "reset master passcode lockout:") || strings.Contains(err.Error(), "reset legacy passcode lockout:") {
+		t.Fatal("partial reset lost its master failure attribution or falsely reported complete success")
+	}
+	if status := legacy.Status(); status.Unavailable || status.LockedOut || status.FailedAttempts != 0 {
+		t.Fatal("master failure skipped the valid legacy reset")
+	}
+	if _, err := os.Lstat(masterState); !os.IsNotExist(err) {
+		t.Fatal("master failure created absent state")
+	}
+	after, err := os.Lstat(masterSidecar)
+	if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+		t.Fatal("partial reset changed the unusable master sidecar")
+	}
+}
+
+func TestResetPasscodeLockoutReportsBothFailures(t *testing.T) {
+	dir := t.TempDir()
+	for _, sidecar := range []string{
+		filepath.Join(dir, "vault", "state.yaml.lock"),
+		filepath.Join(dir, "passcode-lockout.yaml.lock"),
+	} {
+		if err := os.MkdirAll(sidecar, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := resetPasscodeLockoutAt(dir)
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(joined.Unwrap()) != 2 || !errors.Is(err, nodevault.ErrLockoutUnavailable) ||
+		!strings.Contains(err.Error(), "reset master passcode lockout:") || !strings.Contains(err.Error(), "reset legacy passcode lockout:") {
+		t.Fatal("reset did not aggregate both attributed failures")
+	}
+	for _, failure := range joined.Unwrap() {
+		if !errors.Is(failure, nodevault.ErrLockoutUnavailable) {
+			t.Fatal("aggregation lost an original failure classification")
+		}
+	}
+}

@@ -371,12 +371,14 @@ func runPasscodeResetLockout(cmd *cobra.Command, args []string) error {
 // not exist is left absent rather than created.
 func resetPasscodeLockoutAt(nodeConfigDir string) error {
 	v := nodevault.Open(nodeConfigDir)
-	for _, l := range []*nodevault.Lockout{v.Lockout(), v.LegacyPasscodeLockout()} {
-		if err := l.ResetIfPresent(); err != nil {
-			return fmt.Errorf("reset passcode lockout: %w", err)
-		}
+	var masterErr, legacyErr error
+	if err := v.Lockout().ResetIfPresent(); err != nil {
+		masterErr = fmt.Errorf("reset master passcode lockout: %w", err)
 	}
-	return nil
+	if err := v.LegacyPasscodeLockout().ResetIfPresent(); err != nil {
+		legacyErr = fmt.Errorf("reset legacy passcode lockout: %w", err)
+	}
+	return errors.Join(masterErr, legacyErr)
 }
 
 // printBadgeLine reports the entropy-gated end-to-end-encryption badge honestly.
