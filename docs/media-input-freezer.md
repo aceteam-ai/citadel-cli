@@ -226,6 +226,22 @@ nodes without polling, transport or handler execution; it also checks exact
 original receipt bytes. This does not resolve shared-stream deletion ownership
 or turn a diagnostic target into an authenticated identity.
 
+### C5 boundary still required: successful output is not an error diagnostic
+
+An offline synthetic successful legacy handler returning an input echo reaches
+`LegacyHandlerAdapter`'s raw `output` field and `Runner.finishSuccess`'s terminal
+publication unchanged. A direct mock-stream probe reproduced that retention;
+it used no model, network, listener or real queue. Static error/log/progress
+policies and omission from usage records do not protect this successful output.
+
+This is a required C5 integration gate, not an accepted output schema or a claim
+of live exposure. C5 must provide a reviewed typed output/publication projection
+before private input execution can be activated. Do not turn this into an empty
+successful result, silently redact an artifact or infer upload authority. Any
+interim execution refusal or changed result contract needs separate review.
+The temporary failing audit probe is not part of the passing regression suite;
+its source path and failure are recorded in the draft's audit receipt.
+
 ### C2 phase 4 preparation: pure classifier, no deletion wiring
 
 `internal/redis/media_ack_classifier.lua` is an unregistered pure boolean
