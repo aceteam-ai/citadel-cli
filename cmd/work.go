@@ -1659,6 +1659,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// server's AddRouteRegistrar closure and the job handler share a single instance.
 	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
 		HTTP: workflowHTTPPolicy(network.GetNodeConfigDir()),
+		LLM:  workflowLLMPolicy(network.GetNodeConfigDir()),
 		Shell: workflow.ShellConfig{
 			WorkspaceDir: wsDir,
 			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
