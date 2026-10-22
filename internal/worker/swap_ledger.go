@@ -150,16 +150,38 @@ type swapObserver interface {
 	ObserveSwap(rec SwapRecord, stats SwapStats)
 }
 
+// completeSwap publishes accounting before releasing the next rate admission.
+// Optional observer work must not delay done or hold the admission mutex.
+func (m *SwapManager) completeSwap(op *swapOp) {
+	rec := m.swapRecord(op)
+	m.mu.Lock()
+	stats := m.recordSwapLocked(rec)
+	if m.inflight == op {
+		m.inflight = nil
+	}
+	m.mu.Unlock()
+	close(op.done)
+	m.observeSwap(rec, stats)
+}
+
 // recordSwap appends a completed swap to the ledger, prunes anything outside the
 // window (and beyond the retention bound), and hands the record plus the
 // resulting counters to the controller if it observes swaps.
 func (m *SwapManager) recordSwap(rec SwapRecord) {
 	m.mu.Lock()
+	stats := m.recordSwapLocked(rec)
+	m.mu.Unlock()
+	m.observeSwap(rec, stats)
+}
+
+// recordSwapLocked commits the in-memory ledger. Callers hold m.mu.
+func (m *SwapManager) recordSwapLocked(rec SwapRecord) SwapStats {
 	m.swaps = append(m.swaps, rec)
 	m.pruneSwapsLocked(m.now())
-	stats := m.swapStatsLocked(m.now())
-	m.mu.Unlock()
+	return m.swapStatsLocked(m.now())
+}
 
+func (m *SwapManager) observeSwap(rec SwapRecord, stats SwapStats) {
 	if obs, ok := m.ctrl.(swapObserver); ok {
 		obs.ObserveSwap(rec, stats)
 	}
