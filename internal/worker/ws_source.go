@@ -104,6 +104,13 @@ func (s *WSSource) debug(format string, args ...any) {
 	}
 }
 
+func (s *WSSource) onServerError(_ redisapi.WSMessage) {
+	// An error frame has no trusted job kind. Its server-controlled text can
+	// echo an original delivery or capability, so retain the event, not its
+	// body. Do not mutate the original wire carrier or infer execution scope.
+	s.log("error", "WebSocket server error: server detail omitted")
+}
+
 // Connect enables the WebSocket on the client, registers the job handler,
 // sets up the reconnect callback, and sends the initial consume message.
 func (s *WSSource) Connect(ctx context.Context) error {
@@ -143,9 +150,7 @@ func (s *WSSource) Connect(ctx context.Context) error {
 	// missing device_redis:read scope). Without this the client would
 	// silently believe it is consuming while receiving nothing — the
 	// exact failure mode #236/#3924 eliminated on the HTTP path.
-	ws.OnMessage("error", func(msg redisapi.WSMessage) {
-		s.log("error", "WebSocket server error: %s", msg.Error)
-	})
+	ws.OnMessage("error", s.onServerError)
 
 	// Register handler for "consuming" confirmation from the server.
 	ws.OnMessage("consuming", func(msg redisapi.WSMessage) {

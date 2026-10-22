@@ -185,6 +185,23 @@ wire/log/DLQ boundary coverage, a typed output path, paired API/WS purge or live
 acceptance. Complete the remaining retention audit and phases 4 and 5 before
 minting/dispatch. No handler/task activation is added by this change.
 
+The follow-up retention matrix exercises actual single/multi-queue DLQ command
+assembly through a pre-dial hook and HTTP consume responses through a no-dial
+transport. Inbox/workspace, null, wrong-type, escaped/duplicate keys, oversized,
+malformed/non-object and legacy text cases check retained fields, nonsecret
+source identity and exact original-byte projection. Matching stored DLQ XRANGE
+tests are reserved for normal GitHub CI, not local real-Redis execution.
+
+Nested payload decoding can fail before fallback kind discovery. Its unknown,
+MEDIA_GENERATE and FILE_FETCH error paths now retain only trusted static context
+in a single opaque wrapper, preserving the original one-hop decoder error.
+Other known kinds keep their previous diagnostic behavior. Likewise, the actual
+WS server-error callback has no trusted job kind: it retains one observable
+error-level event with static text, not the untrusted server detail, which may
+echo a delivery. Its direct callback fixture binds no listener and leaves the
+original wire carrier unchanged. These boundary fixtures are not a claim that
+all wire carrier call sites or the paired backend have been audited.
+
 ### C2 phase 4 preparation: pure classifier, no deletion wiring
 
 `internal/redis/media_ack_classifier.lua` is an unregistered pure boolean
