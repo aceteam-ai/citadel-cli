@@ -55,6 +55,7 @@ import base64
 import gc
 import inspect
 import io
+import logging
 import math
 import os
 import tempfile
@@ -72,6 +73,8 @@ from image_swap import (
     ModelLoadFailed,
     ModelWarming,
 )
+
+logger = logging.getLogger(__name__)
 
 # Default image model, used when a request omits `model`. FLUX.2-klein-4B is
 # Apache-2.0 and a 4-step distilled model. (Before citadel-cli#1335 this was
@@ -142,7 +145,24 @@ DIFFUSERS_WARM_WAIT_SECONDS = _env_float("DIFFUSERS_WARM_WAIT_SECONDS", 15.0)
 # used it; and a failed load is not retried for this long (both seconds).
 DIFFUSERS_MIN_RESIDENCY_SECONDS = _env_float("DIFFUSERS_MIN_RESIDENCY_SECONDS", 120.0)
 DIFFUSERS_FAILURE_BACKOFF_SECONDS = _env_float("DIFFUSERS_FAILURE_BACKOFF_SECONDS", 30.0)
-DIFFUSERS_IDLE_UNLOAD_SECONDS = max(_env_float("DIFFUSERS_IDLE_UNLOAD_SECONDS", 300.0), 0.0)
+
+
+def _idle_unload_seconds():
+    try:
+        value = float(os.environ.get("DIFFUSERS_IDLE_UNLOAD_SECONDS", 300.0))
+    except ValueError:
+        logger.warning("DIFFUSERS_IDLE_UNLOAD_SECONDS is invalid; using the default idle timeout")
+        return 300.0
+    if not math.isfinite(value):
+        logger.warning("DIFFUSERS_IDLE_UNLOAD_SECONDS is non-finite; using the default idle timeout")
+        return 300.0
+    if value < 0:
+        logger.warning("DIFFUSERS_IDLE_UNLOAD_SECONDS is negative; using immediate idle eviction")
+        return 0.0
+    return value
+
+
+DIFFUSERS_IDLE_UNLOAD_SECONDS = _idle_unload_seconds()
 DIFFUSERS_PINNED_MODELS = frozenset(os.environ.get("DIFFUSERS_PINNED_MODELS", "").replace(",", " ").split())
 # Free disk that must remain AFTER a model's download (replaces the 2 GiB
 # default margin of model_preflight for image models). The node's disk is shared
@@ -152,6 +172,14 @@ DIFFUSERS_DEFAULT_VRAM_GB = _env_float("DIFFUSERS_DEFAULT_VRAM_GB", 8.0)
 ALLOWED_IMAGE_MODELS = image_models.parse_allowlist(
     DIFFUSERS_ALLOWED_MODELS, DIFFUSERS_MODEL, custom_vram_gb=DIFFUSERS_DEFAULT_VRAM_GB
 )
+
+
+def _warn_unknown_pins(pinned_models, allowed_image_models, video_model):
+    if pinned_models.difference(allowed_image_models).difference({video_model}):
+        logger.warning("DIFFUSERS_PINNED_MODELS contains unknown model IDs; unmatched pins have no effect")
+
+
+_warn_unknown_pins(DIFFUSERS_PINNED_MODELS, ALLOWED_IMAGE_MODELS, DIFFUSERS_VIDEO_MODEL)
 
 app = FastAPI(title="citadel-diffusers-service")
 

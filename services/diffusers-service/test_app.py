@@ -28,6 +28,35 @@ from fastapi.testclient import TestClient
 import app
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("-1", 0.0), ("inf", 300.0), ("-inf", 300.0),
+    ("nan", 300.0), ("owned-invalid-setting", 300.0),
+])
+def test_invalid_idle_settings_warn_without_echoing_values(monkeypatch, caplog, raw, expected):
+    monkeypatch.setenv("DIFFUSERS_IDLE_UNLOAD_SECONDS", raw)
+    assert app._idle_unload_seconds() == expected
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "WARNING"
+    assert raw not in caplog.records[0].message
+
+
+@pytest.mark.parametrize("raw, expected", [("0", 0.0), ("12.5", 12.5)])
+def test_valid_idle_settings_have_no_warning(monkeypatch, caplog, raw, expected):
+    monkeypatch.setenv("DIFFUSERS_IDLE_UNLOAD_SECONDS", raw)
+    assert app._idle_unload_seconds() == expected
+    assert not caplog.records
+
+
+def test_pin_validation_warns_once_without_echoing_unknown_ids(caplog):
+    app._warn_unknown_pins(frozenset({"owned/image", "owned/video"}), {"owned/image": None}, "owned/video")
+    assert not caplog.records
+    app._warn_unknown_pins(frozenset({"owned/unknown-secret", "owned/second-secret"}),
+                           {"owned/image": None}, "owned/video")
+    assert len(caplog.records) == 1
+    assert "unknown model IDs" in caplog.records[0].message
+    assert "owned/" not in caplog.records[0].message
+
+
 @pytest.fixture(autouse=True)
 def _reset_lazy_singletons(monkeypatch):
     """Every test gets independent video residency without real pipelines."""

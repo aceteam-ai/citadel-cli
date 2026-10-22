@@ -6,6 +6,7 @@ tests control exactly when a "cold load" finishes."""
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
 import weakref
@@ -426,13 +427,17 @@ def test_pinning_does_not_prevent_an_explicit_image_model_swap():
 
 def test_unclaimed_background_load_has_only_bounded_retry_grace_at_idle_zero():
     timers = ManualTimers()
-    mgr, loader = make(idle_unload_seconds=0, timer_factory=timers,
+    loader = FakeLoader()
+    gate = loader.gates[SDXL] = threading.Event()
+    mgr, loader = make(loader, idle_unload_seconds=0, timer_factory=timers,
                        clock=lambda: timers.now)
     with pytest.raises(ModelWarming):
         mgr.lease(SDXL)
+    mgr._warm_wait = 3
+    gate.set()
     assert mgr.wait_for_load(5)
     timer = timers.timers[-1]
-    assert timer.delay == 7  # make() advertises Retry-After: 7
+    assert timer.delay == 10  # Retry-After: 7 + warm-wait: 3; still bounded
     timers.now += timer.delay
     timer.fire()
     assert mgr.loaded_model() is None
@@ -585,7 +590,8 @@ def test_load_failure_is_reported_once_then_a_retry_loads_fresh():
 
     with pytest.raises(ModelLoadFailed) as err:
         mgr.lease(SDXL)
-    assert "bad repo id" in str(err.value)
+    assert err.value.message == "all eligible pipeline loads failed"
+    assert "bad repo id" not in str(err.value)
     assert mgr.loaded_model() is None
 
     with pytest.raises(ModelWarming):  # failure consumed; this starts a new load
@@ -813,7 +819,7 @@ def test_failed_load_is_not_retried_inside_the_backoff_window():
     clock = Clock()
     loader = FakeLoader()
     loader.fail[ZIMG] = "boom"
-    mgr, _ = make(loader, backoff=30.0, clock=clock)
+    mgr, _ = make(loader, quant="none", backoff=30.0, clock=clock)
     with pytest.raises(ModelWarming):
         mgr.lease(ZIMG)
     mgr.wait_for_load(5)
@@ -844,6 +850,142 @@ def test_prefers_the_budget_choice_when_free_vram_allows():
         assert (lease.variant.quant, lease.variant.offload) == ("int8", "none")
 
 
+@pytest.mark.parametrize("failures", [0, 1, 2])
+def test_auto_attempts_gpu_first_then_offload_and_clears_partial_references(failures):
+    timers = ManualTimers()
+    attempts, references, cleanup = [], [], []
+
+    class Pipeline:
+        pass
+
+    def load(spec, variant):
+        assert all(ref() is None for ref in references)
+        attempts.append((variant.quant, variant.offload))
+        pipe = Pipeline()
+        references.append(weakref.ref(pipe))
+        if len(attempts) <= failures:
+            raise RuntimeError("owned-private-loader-detail")
+        return pipe, "cuda"
+
+    def free():
+        gc.collect()
+        cleanup.append([ref() is None for ref in references])
+
+    mgr, _ = make(budget=12, warm_wait=5, idle_unload_seconds=0,
+                  timer_factory=timers, clock=lambda: timers.now)
+    mgr._loader = load
+    mgr._unloader = lambda pipe: None  # recording a pipe would itself retain it
+    mgr._free_memory = free
+    order = [("int8", "none"), ("nf4", "none"), ("none", "model")]
+    lease = mgr.lease(FLUX)
+    assert attempts == order[:failures + 1]
+    assert (lease.variant.quant, lease.variant.offload) == order[failures]
+    assert all(all(snapshot) for snapshot in cleanup)
+    # Even fallback CPU-offloaded weights obey immediate idle cleanup.
+    lease.release()
+    timers.timers[-1].fire()
+    assert all(ref() is None for ref in references)
+    assert all(cleanup[-1])
+
+
+def test_auto_all_candidate_failures_are_bounded_static_and_backed_off(caplog):
+    attempts = []
+
+    def load(spec, variant):
+        attempts.append((variant.quant, variant.offload))
+        raise RuntimeError("owned-private-loader-detail")
+
+    mgr, _ = make(budget=12, warm_wait=5, backoff=30)
+    mgr._loader = load
+    for _ in range(3):
+        with pytest.raises(ModelLoadFailed) as err:
+            mgr.lease(FLUX)
+        assert err.value.message == "all eligible pipeline loads failed"
+        assert "owned-private-loader-detail" not in str(err.value)
+    assert attempts == [("int8", "none"), ("nf4", "none"), ("none", "model")]
+    assert mgr.loaded_model() is None
+    assert "owned-private-loader-detail" not in caplog.text
+
+
+@pytest.mark.parametrize("quant", ["int8", "none"])
+def test_explicit_quantization_never_retries_after_a_load_exception(quant):
+    attempts = []
+
+    def load(spec, variant):
+        attempts.append((variant.quant, variant.offload))
+        raise RuntimeError("owned-private-loader-detail")
+
+    mgr, _ = make(budget=24, quant=quant, warm_wait=5)
+    mgr._loader = load
+    with pytest.raises(ModelLoadFailed) as err:
+        mgr.lease(FLUX)
+    assert err.value.message == "pipeline load failed"
+    assert attempts == [(quant, "none")]
+
+
+def test_auto_fallback_rechecks_vram_after_failed_candidate_cleanup():
+    attempts = []
+    free = [12 * GIB]
+
+    def load(spec, variant):
+        attempts.append((variant.quant, variant.offload))
+        if variant.quant == "int8":
+            free[0] = 6 * GIB  # another service has claimed the remaining room
+            raise RuntimeError("owned candidate refusal")
+        raise AssertionError("a candidate exceeding current free VRAM must not load")
+
+    mgr, _ = make(budget=12, warm_wait=5)
+    mgr._loader = load
+    mgr._free_vram_bytes = lambda: free[0]
+    with pytest.raises(ModelLoadFailed):
+        mgr.lease(FLUX)
+    assert attempts == [("int8", "none")]
+
+
+def test_concurrent_requests_share_one_serial_fallback_load():
+    first, second = threading.Event(), threading.Event()
+    release_first, release_second = threading.Event(), threading.Event()
+    attempts = []
+    active = [0]
+
+    def load(spec, variant):
+        active[0] += 1
+        try:
+            assert active[0] == 1
+            attempts.append((variant.quant, variant.offload))
+            if variant.quant == "int8":
+                first.set()
+                assert release_first.wait(5)
+                raise RuntimeError("owned int8 refusal")
+            second.set()
+            assert release_second.wait(5)
+            return object(), "cuda"
+        finally:
+            active[0] -= 1
+
+    mgr, _ = make(budget=12)
+    mgr._loader = load
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert first.wait(5)
+        for _ in range(4):
+            with pytest.raises(ModelWarming):
+                mgr.lease(FLUX)
+        release_first.set()
+        assert second.wait(5)
+        for _ in range(4):
+            with pytest.raises(ModelWarming):
+                mgr.lease(FLUX)
+        assert attempts == [("int8", "none"), ("nf4", "none")]
+    finally:
+        release_first.set()
+        release_second.set()
+        assert mgr.wait_for_load(5)
+    assert active[0] == 0
+    assert mgr.loaded_model() == FLUX
+
+
 def test_refuses_only_when_even_the_smallest_variant_does_not_fit():
     mgr, loader = make(budget=12.0, free_gb=5.0)
     with pytest.raises(ModelWarming):
@@ -859,7 +1001,7 @@ def test_old_failure_is_not_delivered_to_a_fresh_request_later():
     clock = Clock()
     loader = FakeLoader()
     loader.fail[ZIMG] = "boom"
-    mgr, _ = make(loader, backoff=30.0, clock=clock)
+    mgr, _ = make(loader, quant="none", backoff=30.0, clock=clock)
     with pytest.raises(ModelWarming):
         mgr.lease(ZIMG)
     mgr.wait_for_load(5)

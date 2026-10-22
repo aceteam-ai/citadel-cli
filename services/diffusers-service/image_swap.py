@@ -419,9 +419,11 @@ class ImageModelManager:
 
     def _idle_deadline(self, resident: _Resident) -> float:
         # A cold background load may finish after the caller got 503. Give
-        # that caller one Retry-After interval to acquire its first lease,
+        # that caller Retry-After plus warm-wait to acquire its first lease,
         # even with idle=0, rather than evicting before it can ever serve.
-        grace = self._idle_unload if resident.served else max(self._idle_unload, self._retry_after)
+        grace = self._idle_unload if resident.served else max(
+            self._idle_unload, self._retry_after + self._warm_wait
+        )
         return resident.idle_since + grace
 
     def _idle_status_locked(self, model_id: str) -> dict[str, Any]:
@@ -503,20 +505,33 @@ class ImageModelManager:
             # Unconditional, so cached blocks left by a previous failed load or
             # an earlier unload never make free VRAM look smaller than it is.
             self._free_memory()
-            free_before = self._free_vram_bytes()
-            if free_before is not None:
-                # The budget picked the preferred variant; what the card has free
-                # right now decides which one actually loads. Fall back to the
-                # next smaller variant that fits before refusing.
-                fitting = [v for v in candidates if v.est_vram_gb * GIB <= free_before]
-                if not fitting:
-                    raise InsufficientVram(spec.model_id, smallest.est_vram_gb, free_before / GIB)
-                variant = fitting[0]
+            started = self._clock()
+            attempted = False
+            for variant in candidates:
+                # Recheck after every failed attempt's cleanup. Other services
+                # can change their allocations while this load is running.
+                free_before = self._free_vram_bytes()
+                if free_before is not None and variant.est_vram_gb * GIB > free_before:
+                    continue
                 with self._cond:
                     load.variant = variant
-
-            started = self._clock()
-            pipe, device = self._loader(spec, variant)
+                attempted = True
+                loaded = self._attempt_pipeline_load(spec, variant)
+                if loaded is not None:
+                    pipe, device = loaded
+                    del loaded
+                    break
+                # The helper has exited its except block and stack frame.
+                # Collect partial allocations BEFORE another candidate loads;
+                # neither retained exceptions nor their messages cross here.
+                self._free_memory()
+                if self._quant_mode != "auto":
+                    raise ModelLoadFailed(spec.model_id, "pipeline load failed")
+                logger.warning("diffusers: AUTO pipeline candidate failed; checking next eligible variant")
+            else:
+                if attempted:
+                    raise ModelLoadFailed(spec.model_id, "all eligible pipeline loads failed")
+                raise InsufficientVram(spec.model_id, smallest.est_vram_gb, free_before / GIB)
             elapsed = self._clock() - started
             free_after = self._free_vram_bytes()
             measured = None
@@ -558,6 +573,8 @@ class ImageModelManager:
             err: Exception
             if isinstance(exc, InsufficientVram):
                 err = exc
+            elif isinstance(exc, ModelLoadFailed):
+                err = ModelLoadFailed(spec.model_id, exc.message)
             else:
                 err = ModelLoadFailed(spec.model_id, str(exc))
             logger.warning("diffusers: load of %s failed: %s", spec.model_id, exc)
@@ -578,6 +595,19 @@ class ImageModelManager:
                     self._arm_idle_locked(self._resident)
                 load.event.set()
                 self._cond.notify_all()
+
+    def _attempt_pipeline_load(self, spec: ImageModelSpec, variant: LoadVariant):
+        """Never retain a failed loader's exception, traceback or message.
+
+        Returning outside the except block and this short-lived frame allows
+        the caller's GC/cache cleanup to reclaim partial pipelines before a
+        fallback. A successful loader returns its normal (pipeline, device).
+        """
+        try:
+            return self._loader(spec, variant)
+        except Exception:
+            pass
+        return None
 
     def _enter_replacement_phase(self, load: _Load) -> None:
         """End preparation without racing an outgoing model's idle teardown.
