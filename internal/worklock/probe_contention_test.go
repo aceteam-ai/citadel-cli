@@ -14,12 +14,29 @@ type contentionProbeInfo struct {
 	mode os.FileMode
 }
 
-func (info contentionProbeInfo) Name() string       { return info.id }
-func (info contentionProbeInfo) Size() int64        { return 0 }
-func (info contentionProbeInfo) Mode() os.FileMode  { return info.mode }
-func (info contentionProbeInfo) ModTime() time.Time { return time.Time{} }
-func (info contentionProbeInfo) IsDir() bool        { return info.mode.IsDir() }
-func (info contentionProbeInfo) Sys() any           { return nil }
+func (info contentionProbeInfo) Name() string {
+	return info.id
+}
+
+func (info contentionProbeInfo) Size() int64 {
+	return 0
+}
+
+func (info contentionProbeInfo) Mode() os.FileMode {
+	return info.mode
+}
+
+func (info contentionProbeInfo) ModTime() time.Time {
+	return time.Time{}
+}
+
+func (info contentionProbeInfo) IsDir() bool {
+	return info.mode.IsDir()
+}
+
+func (info contentionProbeInfo) Sys() any {
+	return nil
+}
 
 type fakeContentionProbeFile struct {
 	info     os.FileInfo
@@ -28,8 +45,14 @@ type fakeContentionProbeFile struct {
 	closed   int
 }
 
-func (file *fakeContentionProbeFile) Stat() (os.FileInfo, error) { return file.info, file.statErr }
-func (file *fakeContentionProbeFile) Fd() uintptr               { return 0 }
+func (file *fakeContentionProbeFile) Stat() (os.FileInfo, error) {
+	return file.info, file.statErr
+}
+
+func (file *fakeContentionProbeFile) Fd() uintptr {
+	return 0
+}
+
 func (file *fakeContentionProbeFile) Close() error {
 	file.closed++
 	return file.closeErr

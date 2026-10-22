@@ -74,7 +74,10 @@ func TestBareSelectionRefusesEveryUnknownWithoutStartup(t *testing.T) {
 			dependencies := bareAbsentDependencies()
 			dependencies.startup = func(*cobra.Command, []string) { t.Fatal("unknown discovery invoked startup") }
 			dependencies.dispatch = func(*cobra.Command, bool, bool) { t.Fatal("unknown discovery invoked enrollment/owner") }
-			dependencies.runViewer = func(context.Context, string, sessionview.Snapshot) error { t.Fatal("unknown discovery attached a viewer"); return nil }
+			dependencies.runViewer = func(context.Context, string, sessionview.Snapshot) error {
+				t.Fatal("unknown discovery attached a viewer")
+				return nil
+			}
 			private := errors.New("private-path-or-credential")
 			switch refusal {
 			case "resolver":
@@ -247,10 +250,16 @@ func TestBareCancellationStopsAtEachDiscoveryBoundary(t *testing.T) {
 				cancel()
 				return false, nil
 			}
-			dependencies.observePresence = func(string) (bool, error) { t.Fatal("cancelled lock observation continued to presence"); return false, nil }
+			dependencies.observePresence = func(string) (bool, error) {
+				t.Fatal("cancelled lock observation continued to presence")
+				return false, nil
+			}
 			dependencies.startup = func(*cobra.Command, []string) { t.Fatal("cancelled discovery entered mutating startup") }
 			dependencies.dispatch = func(*cobra.Command, bool, bool) { t.Fatal("cancelled discovery entered legacy dispatch") }
-			dependencies.runViewer = func(context.Context, string, sessionview.Snapshot) error { t.Fatal("cancelled status entered a terminal viewer"); return nil }
+			dependencies.runViewer = func(context.Context, string, sessionview.Snapshot) error {
+				t.Fatal("cancelled status entered a terminal viewer")
+				return nil
+			}
 			if err := runBareSessionSelection(command, nil, dependencies); err != errSessionViewUnavailable {
 				t.Fatal("cancelled discovery lost its static refusal")
 			}
