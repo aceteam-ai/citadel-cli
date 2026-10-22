@@ -213,6 +213,9 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, files []jobs.Temp
 		rel := filepath.FromSlash(f.NodePath)
 		if digest, ok := stagedHashes[rel]; ok {
 			size := stagedSizes[rel]
+			if err := f.VerifyExpectedContent(digest, size); err != nil {
+				return nil, nil, nil, err
+			}
 			if size > maxBytes-declaredBytes {
 				return nil, nil, nil, fmt.Errorf("declared input bytes exceed %d-byte limit", maxBytes)
 			}
@@ -270,6 +273,9 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, files []jobs.Temp
 			return nil, nil, nil, stageErr
 		}
 		digest := "sha256:" + hex.EncodeToString(h.Sum(nil))
+		if err := f.VerifyExpectedContent(digest, copied); err != nil {
+			return nil, nil, nil, err
+		}
 		stagedHashes[rel] = digest
 		stagedSizes[rel] = copied
 		declaredBytes += copied
