@@ -338,7 +338,9 @@ func runPasscodeStatus(cmd *cobra.Command, args []string) error {
 // printLockoutStatus reports a node-wide failed-attempt state (master PIN or
 // legacy node passcode).
 func printLockoutStatus(lo nodevault.LockoutStatus) {
-	if lo.LockedOut {
+	if lo.Unavailable {
+		fmt.Println("Lockout: UNAVAILABLE. Passcode checks are denied. Run 'citadel passcode reset-lockout' at the node to recover state.")
+	} else if lo.LockedOut {
 		fmt.Printf("Lockout: ACTIVE until %s (%d failed attempts). Run 'citadel passcode reset-lockout' at the node to clear it.\n", lo.LockoutUntil.Format("15:04:05"), lo.FailedAttempts)
 	} else if lo.FailedAttempts > 0 {
 		fmt.Printf("Recent failed attempts (last 24h): %d.\n", lo.FailedAttempts)

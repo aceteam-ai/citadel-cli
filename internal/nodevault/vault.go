@@ -557,6 +557,12 @@ func writeHeaderAtomic(path string, h header) error {
 // writeFileAtomic writes to a temp file in the same dir, fsyncs it, and renames
 // over the target so a crash never leaves a half-written vault or pepper.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomicPrepared(path, data, mode, nil)
+}
+
+// The optional descriptor-only preparation is used only for lockout state.
+// Ordinary vault/header/pepper writers retain their existing nil-preparer path.
+func writeFileAtomicPrepared(path string, data []byte, mode os.FileMode, prepare func(*os.File, string) error) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("nodevault: create dir: %w", err)
@@ -575,6 +581,12 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := f.Chmod(mode); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("nodevault: chmod temp: %w", err)
+	}
+	if prepare != nil {
+		if err := prepare(f, dir); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("nodevault: prepare lockout temp: %w", err)
+		}
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()

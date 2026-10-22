@@ -133,7 +133,10 @@ func (l *Lockout) Attempt(check func() bool) error {
 // Status returns the current node-wide lockout state.
 func (l *Lockout) Status() LockoutStatus {
 	now := time.Now()
-	s := readLockoutAt(l.path, now)
+	s, err := loadLockoutAt(l.path, now)
+	if err != nil {
+		return LockoutStatus{Unavailable: true}
+	}
 	return LockoutStatus{
 		FailedAttempts: s.FailedAttempts,
 		LockedOut:      !s.LockoutUntil.IsZero() && now.Before(s.LockoutUntil),
@@ -143,7 +146,9 @@ func (l *Lockout) Status() LockoutStatus {
 }
 
 // Reset clears the attempt history and lockout window, keeping the
-// verification anchor. It is the local-presence recovery path.
+// verification anchor when the old state is readable and valid. Corrupt or
+// unreadable state loses its untrusted anchor as well as its history. Only this
+// explicit local-presence recovery path may discard a failed state load.
 func (l *Lockout) Reset() error {
 	mu := lockoutMutex(l.path)
 	mu.Lock()
@@ -151,7 +156,7 @@ func (l *Lockout) Reset() error {
 	return withLockoutFile(l.path, func() error {
 		s, err := loadLockoutAt(l.path, time.Now())
 		if err != nil {
-			return err
+			s = lockoutState{}
 		}
 		return writeLockoutAt(l.path, lockoutState{
 			LastVerifiedAt: s.LastVerifiedAt,
@@ -196,9 +201,8 @@ func readLockoutAt(path string, now time.Time) lockoutState {
 	return s
 }
 
-// Status retains its best-effort snapshot API. Admission and mutations use the
-// error: an unreadable/corrupt counter is not an absent counter and must never
-// be replaced with a clean slate by a cooperating writer.
+// Status reports load failure explicitly. Admission and ordinary mutations use
+// the error: only the explicit local-presence Reset may discard a failed load.
 func loadLockoutAt(path string, now time.Time) (lockoutState, error) {
 	var s lockoutState
 	data, err := os.ReadFile(path)
@@ -251,7 +255,7 @@ func writeLockoutAt(path string, s lockoutState) error {
 	if err != nil {
 		return fmt.Errorf("nodevault: marshal lockout state: %w", err)
 	}
-	return writeFileAtomic(path, data, 0o600)
+	return writeFileAtomicPrepared(path, data, 0o600, prepareLockoutStateFile)
 }
 
 // checkLockedLocked returns ErrLockedOut if a lockout window is active. Read
@@ -348,6 +352,7 @@ func backoff(failures int) time.Duration {
 
 // LockoutStatus reports the current attempt/lockout state for surfaces.
 type LockoutStatus struct {
+	Unavailable    bool
 	FailedAttempts int
 	LockedOut      bool
 	LockoutUntil   time.Time

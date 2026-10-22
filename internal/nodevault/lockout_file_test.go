@@ -257,7 +257,6 @@ func TestLockoutCorruptStateIsNotReplacedWithCleanCounter(t *testing.T) {
 	for _, mutation := range []func() error{
 		func() error { return recordFailureAt(l.path) },
 		func() error { return recordSuccessAt(l.path) },
-		l.Reset,
 	} {
 		if err := mutation(); !errors.Is(err, ErrLockoutUnavailable) {
 			t.Fatalf("corrupt state accepted a transaction: %v", err)
@@ -265,6 +264,51 @@ func TestLockoutCorruptStateIsNotReplacedWithCleanCounter(t *testing.T) {
 	}
 	if got, err := os.ReadFile(l.path); err != nil || !bytes.Equal(got, raw) {
 		t.Fatal("refusal replaced the corrupt state")
+	}
+	if status := l.Status(); !status.Unavailable || status.LockedOut || status.FailedAttempts != 0 || !status.LastVerifiedAt.IsZero() {
+		t.Fatalf("corrupt status was presented as available: %+v", status)
+	}
+	if err := l.Reset(); err != nil {
+		t.Fatalf("explicit local recovery refused corrupt state: %v", err)
+	}
+	state, err := loadLockoutAt(l.path, time.Now())
+	if err != nil || state.FailedAttempts != 0 || !state.LockoutUntil.IsZero() || !state.LastVerifiedAt.IsZero() || state.FailureTimes == nil {
+		t.Fatalf("corrupt-state recovery retained untrusted state: %+v %v", state, err)
+	}
+	if status := l.Status(); status.Unavailable {
+		t.Fatal("successful recovery still reports unavailable")
+	}
+	if err := l.Attempt(always(true)); err != nil {
+		t.Fatalf("recovered state did not admit a correct legacy check: %v", err)
+	}
+}
+
+func TestLockoutWrongPINWithUnavailableFailureRecording(t *testing.T) {
+	v := newTestVault(t)
+	mustSet(t, v, "654321")
+	if err := os.Mkdir(v.lockoutPath()+".lock", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(v.headerPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := v.Unlock("000000")
+	if session != nil || !errors.Is(err, ErrLockoutUnavailable) || errors.Is(err, ErrWrongPIN) {
+		t.Fatalf("wrong PIN disclosed a mismatch despite unavailable accounting: %v", err)
+	}
+	if err := v.ChangePIN("000000", "938472", DefaultPolicy(), true); !errors.Is(err, ErrLockoutUnavailable) || errors.Is(err, ErrWrongPIN) {
+		t.Fatalf("rotation disclosed mismatch despite unavailable accounting: %v", err)
+	}
+	if after, err := os.ReadFile(v.headerPath()); err != nil || !bytes.Equal(before, after) {
+		t.Fatal("refused wrong-PIN rotation changed the vault header")
+	}
+	l := OpenLegacyPasscodeLockout(t.TempDir())
+	if err := os.Mkdir(l.path+".lock", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Attempt(always(false)); !errors.Is(err, ErrLockoutUnavailable) || errors.Is(err, ErrWrongPIN) {
+		t.Fatalf("legacy mismatch disclosed despite unavailable accounting: %v", err)
 	}
 }
 
