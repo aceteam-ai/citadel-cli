@@ -51,16 +51,51 @@ func TestSwapCompletionAccountsEvictionBeforeNextAdmission(t *testing.T) {
 	atRecord, releaseRecord := make(chan struct{}), make(chan struct{})
 	var release sync.Once
 	defer release.Do(func() { close(releaseRecord) })
+	type appendObservation struct {
+		locked   bool
+		retained bool
+		recorded bool
+	}
+	atAppend := make(chan appendObservation, 1)
+	releaseAppend := make(chan struct{})
+	var releaseAppended sync.Once
+	defer releaseAppended.Do(func() { close(releaseAppend) })
+	var pauseAppendClock atomic.Bool
+	var first *swapOp
 	m.now = func() time.Time {
 		if pauseClock.CompareAndSwap(true, false) {
 			close(atRecord)
 			<-releaseRecord
+			return clock // Do not consume the post-append gate in this same call.
+		}
+		if pauseAppendClock.CompareAndSwap(true, false) {
+			// recordSwapLocked has appended, before pruning/snapshotting. Main
+			// arms this gate only after its pre-record admission checks, so a
+			// wrong early admission cannot block the test in startOrJoin's clock.
+			observation := appendObservation{}
+			// No other fixture goroutine uses m.mu at this gate. If the
+			// production lock is missing, do not read protected state.
+			if m.mu.TryLock() {
+				m.mu.Unlock()
+			} else {
+				observation.locked = true
+				// The pre-record release publishes first before this read.
+				// This callback executes under the production completion lock,
+				// not an unsynchronized read from the test goroutine.
+				observation.retained = m.inflight == first
+				if len(m.swaps) > 0 {
+					last := m.swaps[len(m.swaps)-1]
+					observation.recorded = last.Backend == first.backend && last.Model == first.model && last.Evicting()
+				}
+			}
+			atAppend <- observation
+			<-releaseAppend
 		}
 		return clock
 	}
 	fillEvictingSwaps(m, m.maxEvictingPerWindow-1, time.Minute)
 
-	first := m.startOrJoin("bonsai", "first")
+	first = m.startOrJoin("bonsai", "first")
 	if first == nil {
 		t.Fatal("first swap did not acquire the slot")
 	}
@@ -86,7 +121,26 @@ func TestSwapCompletionAccountsEvictionBeforeNextAdmission(t *testing.T) {
 	base.freeVRAM = 0
 	base.candidates = []status.PreemptCandidate{{Name: "old-b", VRAMBytes: 23 << 30, Idle: true}}
 	base.mu.Unlock()
+	pauseAppendClock.Store(true)
 	release.Do(func() { close(releaseRecord) })
+	var appended appendObservation
+	select {
+	case appended = <-atAppend:
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal accounting did not reach the post-append gate")
+	}
+	if !appended.locked || !appended.retained || !appended.recorded {
+		t.Fatalf("terminal append did not retain the original slot under its lock: %+v", appended)
+	}
+	// Pin append-before-release, not merely that admission is blocked while
+	// appending: a slot-clear-first split also holds m.mu in its second section.
+	// A ledger-first split retains the slot here and is not that harmful mutant.
+	select {
+	case <-first.done:
+		t.Fatal("completion published before the terminal append lock was released")
+	default:
+	}
+	releaseAppended.Do(func() { close(releaseAppend) })
 	awaitSwapCompletionSignal(t, first.done, "first completion did not publish")
 	if first.err == nil {
 		t.Fatal("first start failure was lost")
