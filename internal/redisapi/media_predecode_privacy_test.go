@@ -27,8 +27,13 @@ func (mediaOpaqueDiagnosticError) Error() string {
 
 type mediaTimeoutDiagnosticError struct{ mediaOpaqueDiagnosticError }
 
-func (mediaTimeoutDiagnosticError) Timeout() bool   { return true }
-func (mediaTimeoutDiagnosticError) Temporary() bool { return false }
+func (mediaTimeoutDiagnosticError) Timeout() bool {
+	return true
+}
+
+func (mediaTimeoutDiagnosticError) Temporary() bool {
+	return false
+}
 
 func TestMediaWSReadErrorRetentionBeforeDecode(t *testing.T) {
 	closeError := &websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: mediaPredecodeSecret}
@@ -95,8 +100,13 @@ func (transport mediaPredecodeTransport) RoundTrip(request *http.Request) (*http
 
 type mediaFailedBody struct{ err error }
 
-func (body mediaFailedBody) Read([]byte) (int, error) { return 0, body.err }
-func (mediaFailedBody) Close() error                 { return nil }
+func (body mediaFailedBody) Read([]byte) (int, error) {
+	return 0, body.err
+}
+
+func (mediaFailedBody) Close() error {
+	return nil
+}
 
 func checkMediaPredecodeError(t *testing.T, err, original error, context string) {
 	t.Helper()
