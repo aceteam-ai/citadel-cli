@@ -41,6 +41,7 @@ func TestHTTPAddressClasses(t *testing.T) {
 		"169.254.169.254", "fe80::1", "224.0.0.1", "ff02::1", "255.255.255.255",
 		"100.100.100.100", "fec0::1", "fe80::1%test",
 		"::ffff:127.0.0.1", "::127.0.0.1", "::ffff:169.254.169.254", "::169.254.169.254",
+		"fd7a:115c:a1e0::53", "64:ff9b::a00:1", "2002:a00:1::1",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			class, hard := httpAddressClass(netip.MustParseAddr(raw))
@@ -52,7 +53,7 @@ func TestHTTPAddressClasses(t *testing.T) {
 	for _, raw := range []string{
 		"10.0.0.1", "172.16.0.1", "192.168.1.1", "100.64.0.1", "198.18.0.1", "fd00::1",
 		"192.0.2.1", "198.51.100.1", "203.0.113.1", "240.0.0.1", "2001:db8::1",
-		"64:ff9b::a00:1", "2002:a00:1::1", "::ffff:10.0.0.1", "::10.0.0.1",
+		"::ffff:10.0.0.1", "::10.0.0.1",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			class, hard := httpAddressClass(netip.MustParseAddr(raw))
