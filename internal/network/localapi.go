@@ -219,12 +219,41 @@ func CloseSessionControl(ln net.Listener, stateDir string) {
 // SessionControlRequest is the client for the session verbs, over the SAME
 // safesocket path. It never falls back to an unauthenticated TCP endpoint.
 func SessionControlRequest(ctx context.Context, stateDir, method, route string) (*http.Response, error) {
+	return sessionControlRequest(ctx, stateDir, method, route, false)
+}
+
+// SessionControlStatusRequest is the read-only viewer's fixed GET. Redirects
+// are returned, not followed to another route, even on the same local socket.
+func SessionControlStatusRequest(ctx context.Context, stateDir string) (*http.Response, error) {
+	return sessionControlRequest(ctx, stateDir, http.MethodGet, "/citadel/session/v1/status", true)
+}
+
+func sessionControlRequest(ctx context.Context, stateDir, method, route string, rejectRedirect bool) (*http.Response, error) {
 	path := LocalAPISocketPath(stateDir)
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return dialLocalControlRaw(ctx, path)
 	}}
 	defer transport.CloseIdleConnections()
+	client := sessionControlHTTPClient(transport, rejectRedirect)
+	if rejectRedirect {
+		return sessionControlStatusRequestWithClient(ctx, client)
+	}
+	return sessionControlRequestWithClient(ctx, client, method, route)
+}
+
+func sessionControlStatusRequestWithClient(ctx context.Context, client *http.Client) (*http.Response, error) {
+	return sessionControlRequestWithClient(ctx, client, http.MethodGet, "/citadel/session/v1/status")
+}
+
+func sessionControlHTTPClient(transport http.RoundTripper, rejectRedirect bool) *http.Client {
 	client := &http.Client{Transport: transport}
+	if rejectRedirect {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	return client
+}
+
+func sessionControlRequestWithClient(ctx context.Context, client *http.Client, method, route string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, "http://citadel.local"+route, nil)
 	if err != nil {
 		return nil, err

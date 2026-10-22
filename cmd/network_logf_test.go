@@ -19,6 +19,9 @@ import (
 // cannot be distinguished from a working one by observing behaviour, so the
 // wiring itself has to be asserted.
 func TestRootPersistentPreRunWiresNetworkLogf(t *testing.T) {
+	resetBareDispatchState(t)
+	bareStdoutIsTTYFn = func() bool { return false }
+	bareStdinIsTTYFn = func() bool { return false }
 	if rootCmd.PersistentPreRun == nil {
 		t.Fatal("rootCmd has no PersistentPreRun, so nothing wires the network logger")
 	}
