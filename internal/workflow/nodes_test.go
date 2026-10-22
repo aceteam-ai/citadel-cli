@@ -158,7 +158,7 @@ func TestLLMNodeExecutor_WithMockServer(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"message": map[string]any{"role": "assistant", "content": "Hello!"}})
 	}))
 	defer server.Close()
-	output, err := (&LLMNodeExecutor{}).Execute(context.Background(), &Node{ID: "llm", Type: NodeTypeLLM, Params: map[string]any{"model": "llama3", "endpoint": server.URL}}, map[string]any{"prompt": "Say hi"})
+	output, err := (&LLMNodeExecutor{policy: mustLLMPolicy(t, server.URL)}).Execute(context.Background(), &Node{ID: "llm", Type: NodeTypeLLM, Params: map[string]any{"model": "llama3", "endpoint": server.URL}}, map[string]any{"prompt": "Say hi"})
 	if err != nil || output["response"] != "Hello!" {
 		t.Fatalf("unexpected: %v %v", output, err)
 	}
