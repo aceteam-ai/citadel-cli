@@ -1589,6 +1589,17 @@ closed.
 
 ## Important Implementation Notes
 
+### Passcode lockout transactions (citadel-cli#1395)
+
+`nodevault.withLockoutFile` owns cross-process lockout state transactions.
+Failure/success/reset updates lock a persistent sidecar, not the atomically
+replaced YAML inode. `Lockout.Attempt` and vault unlock/rotation keep secret
+checks outside that OS lock and refuse unavailable accounting. `Lockout.Status`
+reports unavailable state explicitly; only the local-presence `Lockout.Reset`
+may discard unreadable/corrupt history and its untrusted verification anchor.
+See `docs/nodevault-cross-process-lockout.md` for the mixed-version, ownership,
+publication-review and native-platform boundaries.
+
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,
 not a search path: it reads `<ConfigDir>/config.yaml` for a `node_config_dir` key

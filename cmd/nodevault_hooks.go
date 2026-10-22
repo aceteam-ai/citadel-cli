@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"errors"
+	"log/slog"
+
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
@@ -39,7 +42,9 @@ func init() {
 		if pin == "" {
 			return false, true
 		}
-		return v.VerifyPIN(pin) == nil, true
+		err := v.VerifyPIN(pin)
+		warnPasscodeLockoutUnavailable(err)
+		return err == nil, true
 	}
 	// Legacy bcrypt passcode checks (no master PIN enrolled) get the vault's
 	// node-wide persisted lockout policy (#1398), with state in a sibling file,
@@ -47,6 +52,15 @@ func init() {
 	// gateway's sensitive and cache routes are rate-limited in legacy mode too.
 	config.LegacyPasscodeLockout = func() config.PasscodeAttemptLimiter {
 		return nodevault.OpenLegacyPasscodeLockout(passcodeHookNodeDir())
+	}
+	config.PasscodeAttemptError = warnPasscodeLockoutUnavailable
+}
+
+// Never include the PIN, path or wrapped error text in a boolean gate warning.
+// The typed denial remains distinct internally even though the caller gets false.
+func warnPasscodeLockoutUnavailable(err error) {
+	if errors.Is(err, nodevault.ErrLockoutUnavailable) {
+		slog.Warn("Passcode check denied: lockout state unavailable; inspect node-local passcode status")
 	}
 }
 
