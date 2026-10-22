@@ -58,7 +58,15 @@ Source-only corrections, with normal existing GitHub CI and no local execution:
   text); test wrong-PIN plus failed failure-recording for unlock and rotation.
 
 M2 remains an unresolved publication design, not a completed cleanup fix.
-Creation must explicitly set mode 0600 by descriptor regardless of umask.
+The separable mode correction explicitly sets mode 0600 on a newly created
+descriptor regardless of umask; it never chmods an existing supplied file.
+Prepared regressions use disposable child processes with umasks 000/077/0277,
+preserve/refuse an existing bad-mode inode, and inject a root-owner preparation
+failure and foreign-owner refusal. No local candidate execution is authorized.
+These tests do not prove recovery from an orphaned failed-setup inode: failure
+still closes the descriptor without unlinking, loosening ownership or granting
+the creator an exception on this or subsequent opens. Such an exception would
+not repair the parent-owner contract for later non-root callers.
 Checking `Lstat`/`SameFile` and then unlinking a final pathname is not an atomic
 compare-and-unlink operation: it can remove a replacement and is not acceptable
 as a hostile-path guarantee. A proposed Unix staging approach initializes and
