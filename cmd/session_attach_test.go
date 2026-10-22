@@ -139,7 +139,8 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 	rootCmd.PersistentPreRun(attach, nil)
 
 	// Also pin the ordering against startup writes that have no injected hook:
-	// the exact-leaf guard must be the first branch and return before any call.
+	// the existing offline guard stays first, followed immediately by this
+	// viewer's separate exact-leaf guard, both returning before startup calls.
 	source, err := os.ReadFile("root.go")
 	if err != nil {
 		t.Fatal(err)
@@ -159,15 +160,27 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 			return true
 		}
 		function, ok := field.Value.(*ast.FuncLit)
-		if !ok || len(function.Body.List) == 0 {
+		if !ok || len(function.Body.List) < 2 {
 			t.Fatal("shared startup hook changed shape")
 		}
-		guard, ok := function.Body.List[0].(*ast.IfStmt)
-		if !ok || len(guard.Body.List) != 1 {
-			t.Fatal("viewer exemption is no longer before all shared startup statements")
-		}
-		if _, ok := guard.Body.List[0].(*ast.ReturnStmt); !ok {
-			t.Fatal("viewer exemption does not return before startup work")
+		guards := make([]*ast.IfStmt, 2)
+		for index, literal := range []string{`"citadel stream eval"`, `"citadel session attach"`} {
+			guard, ok := function.Body.List[index].(*ast.IfStmt)
+			if !ok || guard.Init != nil || guard.Else != nil || len(guard.Body.List) != 1 {
+				t.Fatal("offline and viewer exemptions must be the first two narrow guards")
+			}
+			if _, ok := guard.Body.List[0].(*ast.ReturnStmt); !ok {
+				t.Fatal("exact-leaf exemption does not return before startup work")
+			}
+			condition, ok := guard.Cond.(*ast.BinaryExpr)
+			if !ok || condition.Op != token.EQL {
+				t.Fatal("each exemption must retain its separate exact equality")
+			}
+			value, ok := condition.Y.(*ast.BasicLit)
+			if !ok || value.Value != literal {
+				t.Fatal("offline and viewer exemptions changed order or exact leaf")
+			}
+			guards[index] = guard
 		}
 		for path, want := range map[string]bool{
 			"citadel stream eval": true, "citadel session attach": true,
@@ -175,7 +188,9 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 			"citadel session stop": false, "citadel stream serve": false,
 			"citadel session attach-extra": false, "other session attach": false,
 		} {
-			if evalSessionStartupGuard(t, guard.Cond, path) != want {
+			first := evalSessionStartupGuard(t, guards[0].Cond, path)
+			second := evalSessionStartupGuard(t, guards[1].Cond, path)
+			if (first || second) != want {
 				t.Fatal("startup exemption changed its exact command-leaf scope")
 			}
 		}
@@ -195,11 +210,6 @@ func evalSessionStartupGuard(t *testing.T, condition ast.Expr, path string) bool
 	expression, ok := condition.(*ast.BinaryExpr)
 	if !ok {
 		t.Fatal("startup exemption is not an explicit command-path predicate")
-	}
-	if expression.Op == token.LOR {
-		left := evalSessionStartupGuard(t, expression.X, path)
-		right := evalSessionStartupGuard(t, expression.Y, path)
-		return left || right
 	}
 	if expression.Op != token.EQL {
 		t.Fatal("startup exemption no longer uses exact command equality")

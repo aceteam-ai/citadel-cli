@@ -111,7 +111,10 @@ control center. All other subcommands are for scripting and advanced use.`,
 		// binary, touch node state, or contact the fabric before reading files.
 		// Keep this exact leaf exception narrow: stream serve still inherits
 		// the ordinary agent initialization. Covered by stream command tests.
-		if cmd.CommandPath() == "citadel stream eval" || cmd.CommandPath() == "citadel session attach" {
+		if cmd.CommandPath() == "citadel stream eval" {
+			return
+		}
+		if cmd.CommandPath() == "citadel session attach" {
 			// The read-only session viewer uses only the existing local socket:
 			// no CA/bootstrap, swap repair, update check or invocation log writes.
 			return
