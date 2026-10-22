@@ -683,6 +683,18 @@ def _warming_response(exc: ModelWarming) -> JSONResponse:
     return JSONResponse(body, status_code=503, headers={"Retry-After": str(exc.retry_after)})
 
 
+def _load_failure_detail(model_id: str, failure: Exception) -> str:
+    """One trusted model prefix plus a static load-failure classification.
+
+    Neither arbitrary exception text nor an exception's model identity is an
+    HTTP diagnostic authority, even if the exception is ModelLoadFailed.
+    """
+    reason = "pipeline load failed"
+    if isinstance(failure, ModelLoadFailed) and failure.message == "all eligible pipeline loads failed":
+        reason = "all eligible pipeline loads failed"
+    return f"failed to load model {model_id}: {reason}"
+
+
 def _filter_call_kwargs(pipe, kwargs: dict) -> dict:
     """Drops kwargs the pipeline's __call__ does not accept (Flux2KleinPipeline
     has no negative_prompt, for example). A pipeline taking **kwargs, or one
@@ -766,7 +778,7 @@ def generate(req: GenerateRequest):
             status_code=503,
         )
     except Exception as exc:  # model load failure (OOM, bad repo id, auth)
-        raise HTTPException(500, f"failed to load model {spec.model_id}: {exc}") from None
+        raise HTTPException(500, _load_failure_detail(spec.model_id, exc)) from None
 
     result = None
     try:
@@ -825,7 +837,7 @@ def generate_video(req: GenerateVideoRequest):
     except ModelWarming as exc:
         return _warming_response(exc)
     except Exception as exc:  # model load failure (OOM, bad repo id, auth)
-        raise HTTPException(500, f"failed to load model {DIFFUSERS_VIDEO_MODEL}: {exc}")
+        raise HTTPException(500, _load_failure_detail(DIFFUSERS_VIDEO_MODEL, exc)) from None
 
     result = frames = None
     try:

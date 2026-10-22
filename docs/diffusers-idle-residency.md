@@ -66,6 +66,9 @@ There is still one replacement thread and no overlapping candidate loads.
 Fake tests cover first-choice success, failed int8/nf4 falling back to offload,
 all-failed and explicit-quant failures, partial-reference reclamation before
 the next candidate, and concurrent callers sharing one load.
+The image/video HTTP load-error boundary emits one trusted requested/configured
+model prefix with a static failure classification; original loader diagnostics
+and an exception-provided model identity are not returned to clients.
 
 Fallback does not certify bitsandbytes support, output quality, allocator
 behavior or acceptable resource contention. It can use CPU offload only as the

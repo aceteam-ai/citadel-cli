@@ -233,7 +233,8 @@ def test_generate_image_load_failure_is_500(client, monkeypatch):
     monkeypatch.setattr(app, "_get_pipe", _boom)
     resp = client.post("/generate", json={"prompt": "a cat"})
     assert resp.status_code == 500
-    assert app.DIFFUSERS_MODEL in resp.json()["detail"]
+    assert resp.json()["detail"] == f"failed to load model {app.DIFFUSERS_MODEL}: pipeline load failed"
+    assert "out of memory" not in resp.text
 
 
 def test_generate_image_inference_failure_is_500(client, monkeypatch):
@@ -374,7 +375,8 @@ def test_generate_video_load_failure_is_500(client, monkeypatch):
     monkeypatch.setattr(app, "_get_video_pipe", _boom)
     resp = client.post("/generate/video", json={"prompt": "x"})
     assert resp.status_code == 500
-    assert app.DIFFUSERS_VIDEO_MODEL in resp.json()["detail"]
+    assert resp.json()["detail"] == f"failed to load model {app.DIFFUSERS_VIDEO_MODEL}: pipeline load failed"
+    assert "no space left on device" not in resp.text
 
 
 def test_generate_video_inference_failure_is_500(client, monkeypatch):
@@ -671,18 +673,58 @@ def test_insufficient_free_vram_is_503_but_not_warming(client, monkeypatch):
     assert "Retry-After" not in resp.headers
 
 
-def test_load_failure_surfaces_as_500_naming_the_model(client, monkeypatch):
+@pytest.mark.parametrize("pipeline", ["image", "video"])
+def test_load_failure_surfaces_as_static_500_naming_the_trusted_model(client, monkeypatch, caplog, pipeline):
+    model_id = ZIMG if pipeline == "image" else app.DIFFUSERS_VIDEO_MODEL
+    specs = app.ALLOWED_IMAGE_MODELS if pipeline == "image" else {model_id: app._video_spec}
     mgr = ImageModelManager(
-        app.ALLOWED_IMAGE_MODELS,
-        app.DIFFUSERS_MODEL,
-        loader=lambda s, v: (_ for _ in ()).throw(RuntimeError("401 gated")),
+        specs,
+        model_id,
+        loader=lambda s, v: (_ for _ in ()).throw(RuntimeError("401 gated owned-private-loader-detail")),
         vram_budget_gb=24.0,
         warm_wait_seconds=5.0,
     )
-    monkeypatch.setattr(app, "_manager", mgr)
-    resp = _post(client, ZIMG)
+    monkeypatch.setattr(app, "_manager" if pipeline == "image" else "_video_manager", mgr)
+    resp = _post(client, model_id) if pipeline == "image" else client.post(
+        "/generate/video", json={"prompt": "owned-test"},
+    )
     assert resp.status_code == 500
-    assert ZIMG in resp.json()["detail"] and "401 gated" in resp.json()["detail"]
+    assert resp.json()["detail"] == f"failed to load model {model_id}: all eligible pipeline loads failed"
+    assert resp.json()["detail"].count("failed to load model ") == 1
+    assert "401 gated" not in resp.text
+    assert "owned-private-loader-detail" not in resp.text
+    assert "owned-private-loader-detail" not in caplog.text
+
+
+@pytest.mark.parametrize("pipeline", ["image", "video"])
+@pytest.mark.parametrize("failure_kind", ["generic", "foreign-model", "static"])
+def test_http_load_errors_ignore_untrusted_message_and_model_identity(client, monkeypatch, pipeline, failure_kind):
+    class PrivateFailure(RuntimeError):
+        def __str__(self):
+            raise AssertionError("the load-error HTTP boundary must not format an arbitrary exception")
+
+    if failure_kind == "generic":
+        failure = PrivateFailure()
+    else:
+        message = "all eligible pipeline loads failed" if failure_kind == "static" else "owned-private-loader-detail"
+        failure = app.ModelLoadFailed("owned-foreign-model", message)
+
+    def refuse(*args):
+        raise failure
+
+    if pipeline == "image":
+        monkeypatch.setattr(app, "_get_pipe", refuse)
+        model_id = ZIMG
+        resp = _post(client, model_id)
+    else:
+        monkeypatch.setattr(app, "_get_video_pipe", refuse)
+        model_id = app.DIFFUSERS_VIDEO_MODEL
+        resp = client.post("/generate/video", json={"prompt": "owned-test"})
+    reason = "all eligible pipeline loads failed" if failure_kind == "static" else "pipeline load failed"
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == f"failed to load model {model_id}: {reason}"
+    assert "owned-foreign-model" not in resp.text
+    assert "owned-private-loader-detail" not in resp.text
 
 
 def test_health_lists_allowlist_loaded_model_and_warm_vs_cold(client, swap):
