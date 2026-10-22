@@ -204,8 +204,11 @@ func TestMemoryGitStrictPayload(t *testing.T) {
 			t.Fatalf("payload was not refused before repo access: %v", err)
 		}
 	}
-	for _, key := range []string{"command", "target_node", "timeout_ms", "rayId"} {
+	for _, key := range []string{"command", "unknown", "", "Target_node", "target_Node", "Timeout_ms", "timeoutMS", "rayid", "RayId"} {
 		job := memoryGitJob(memoryGitFixtureRequest, "synthetic-window")
+		job.Payload["target_node"] = "node-fixture"
+		job.Payload["timeout_ms"] = "1000"
+		job.Payload["rayId"] = "fixture-ray"
 		job.Payload[key] = "ignored"
 		_, err := h.Execute(JobContext{}, job)
 		var typed *memorygit.Error
@@ -215,6 +218,37 @@ func TestMemoryGitStrictPayload(t *testing.T) {
 	}
 	if _, err := h.Execute(JobContext{}, nil); err == nil {
 		t.Fatal("nil job accepted")
+	}
+}
+
+func TestMemoryGitAcceptsOnlyExactTransportMetadataWithoutAuthority(t *testing.T) {
+	h, err := NewMemoryGitHandler(memoryGitFixtureEngine(t), func() bool { return true }, memoryGitFixtureState, NewPasscodeThrottle())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, keys := range [][]string{{"target_node"}, {"timeout_ms"}, {"rayId"}, {"target_node", "timeout_ms", "rayId"}} {
+		t.Run(strings.Join(keys, "+"), func(t *testing.T) {
+			// A valid but unknown scope reaches the engine's scope check, before
+			// repository access. An invalid_request refusal cannot satisfy this.
+			raw := strings.Replace(memoryGitFixtureRequest, `"scope":"person-fixture"`, `"scope":"unknown-fixture"`, 1)
+			job := memoryGitJob(raw, "synthetic-window")
+			for _, key := range keys {
+				job.Payload[key] = "inert-transport-value"
+			}
+			_, err := h.Execute(JobContext{}, job)
+			var typed *memorygit.Error
+			if !errors.As(err, &typed) || typed.Code != "scope_denied" {
+				t.Fatalf("accepted metadata did not reach unchanged scope authority: %v", err)
+			}
+		})
+	}
+	raw := strings.Replace(memoryGitFixtureRequest, `"node_id":"node-fixture"`, `"node_id":"other-node"`, 1)
+	job := memoryGitJob(raw, "synthetic-window")
+	job.Payload["target_node"] = "node-fixture"
+	_, err = h.Execute(JobContext{}, job)
+	var typed *memorygit.Error
+	if !errors.As(err, &typed) || typed.Code != "node_mismatch" {
+		t.Fatalf("transport target overrode request node identity: %v", err)
 	}
 }
 
@@ -316,6 +350,9 @@ func TestMemoryGitAuthorizedExportAndContext(t *testing.T) {
 	}
 	raw := `{"version":1,"node_id":"node-fixture","scope":"person-fixture","operation":"export","name":"_note","revision":"HEAD"}`
 	job := memoryGitJob(raw, "synthetic-window")
+	job.Payload["target_node"] = "node-fixture"
+	job.Payload["timeout_ms"] = "1000"
+	job.Payload["rayId"] = "fixture-ray"
 	output, err := h.Execute(JobContext{}, job)
 	if err != nil {
 		t.Fatal(err)

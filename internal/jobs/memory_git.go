@@ -48,7 +48,10 @@ func (h *MemoryGitHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, &ShellRefusal{Reason: reason, Message: shellCommandRefusalMessage(reason)}
 	}
 	for key := range job.Payload {
-		if key != "request" && key != ShellPasscodePayloadKey {
+		switch key {
+		case "request", ShellPasscodePayloadKey, "target_node", "timeout_ms", "rayId":
+			// Transport metadata is tolerated, never used as request authority.
+		default:
 			return nil, &memorygit.Error{Code: "invalid_request"}
 		}
 	}

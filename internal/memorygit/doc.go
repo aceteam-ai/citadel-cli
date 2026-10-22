@@ -3,10 +3,14 @@
 //
 // # Wire contract
 //
-// A job payload has exactly two string fields: request (a JSON Request) and
-// passcode (attached by the platform, never an MCP argument). The request's
-// version is 1 and node_id must equal the configured node identity. Scope is
-// an opaque key into the node's allowlist of memory directories. There is no
+// The existing nexus.Job payload is a map of strings. This handler accepts
+// request (a JSON Request), passcode (attached by the platform, never an MCP
+// argument), and the optional transport keys target_node, timeout_ms and rayId;
+// every other top-level key is refused. These three transport values are not
+// parsed into request operands, node/scope authority or a new timeout policy.
+// The incoming context and existing 15-second operation bound still apply.
+// The request's version is 1 and node_id must equal the configured node identity.
+// Scope is an opaque key into the node's allowlist of memory directories. There is no
 // request operand for repository paths, commands, executables or environment.
 //
 // Resolve accepts revision. History accepts name and an explicit limit from
@@ -60,15 +64,18 @@
 // The fixtures use NewPasscodeThrottle with positive defaults and exercise
 // failure-budget sharing through actual shell and memory-git handlers.
 //
-// This is not activation or completion of #1436. The future transport/producer
-// contract must settle metadata keys such as target_node, timeout_ms and rayId;
-// they remain rejected, not silently stripped or accepted here. The adapter
+// This is not activation or completion of #1436. The owner's 2026-10-22 decision
+// accepts exactly target_node, timeout_ms and rayId as optional top-level
+// transport keys; all other extra keys remain invalid_request. The adapter
 // must preserve the server-attached passcode until this handler checks it,
 // using the existing plain NewLegacyHandlerAdapter shape, not a desktop-style
 // passcodeGate that deletes the field. No adapter, registration or capability
 // advertisement is added by this follow-up; the unregistered fixture remains.
 // Actual platform node identity, authenticated scope selection and exact-node
 // credential attachment still need their separately reviewed integration.
+// The companion producer/provisioning contract in aceteam#11997, including
+// credential expiry and one-shot policy, remains held; accepting inert metadata
+// is not acceptance of that integration or authority to dispatch it.
 //
 // Repository provisioning also remains separate: node ownership/private .git
 // mode, clone/import hardlinks, repacking, metadata-walk bounds and an accepted
