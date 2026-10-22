@@ -109,9 +109,21 @@ or draft fixture as ratified. Multi-reference cardinality, ordering, image
 decoding/header/EXIF policy and combined byte/token limits require a new reviewed
 contract. Video inputs and upload/output ratification remain separately gated.
 
-Acquire Files authority for the executing org/node/workspace; validate each
-descriptor before descriptor-relative no-follow opening or authenticated fixed
-route fetch. Freeze actual image bytes into an owned attempt snapshot, hash and
+Retain the existing #1314/C1c scope: every input job needs live media-input
+admission and its existing org/node/job binding. Files authority and a workspace
+are required **only when any input is workspace-origin**; mixed jobs check those
+requirements before redeeming any inbox capability. Inbox-only jobs require
+neither Files nor a workspace: their capability is redeemed only at the trusted
+fixed media-input route under its own authenticated scope, never as a generic
+Files grant. Recheck live media-input admission, conditional Files authority and
+cancellation between acquisitions and before returning a snapshot; retain the
+separate live execution/publication rechecks. This proposal creates no new
+permission or cross-repository admission protocol. See the inactive
+[C1c freezer](https://github.com/aceteam-ai/citadel-cli/blob/9d321d03fbb92af4e215331f872c09ca487fbd06/internal/mediainput/inbox.go)
+and [recorded owner DoR](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290189919).
+Validate each descriptor before descriptor-relative no-follow opening or
+authenticated fixed-route fetch. Freeze actual image bytes into an owned attempt
+snapshot, hash and
 bind source identities, and map only those snapshots to fixed container paths.
 Do not give graph loaders arbitrary workspace traversal or custom model-path
 registries. Parent ownership/link policy remains a prerequisite, not assumed
