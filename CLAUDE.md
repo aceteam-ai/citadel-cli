@@ -31,6 +31,14 @@ So, when adding to this file:
 
 ## Project Overview
 
+`workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
+loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
+validation separately from the HTTP node. Both worker entrypoints load once via
+`workflowLLMPolicy`, so policy edits require a worker restart. The default permits
+public endpoints and only the exact built-in Ollama endpoint; other private
+targets require grants, and hard-denied ranges cannot be granted. See
+`docs/workflow-llm-policy.md` for operator configuration and transport limits.
+
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
 advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,
