@@ -156,6 +156,10 @@ func TestMediaDeliveryErrorBeforeKindIsKnown(t *testing.T) {
 	if !errors.As(safe, &projected) || projected.detail != mediaFixtureSecret {
 		t.Fatal("explicit decoder error projection lost original identity")
 	}
+	contextual := DeliveryErrorContext("POST trusted-fixture returned status 200", original)
+	if errors.Unwrap(contextual) != original || !strings.Contains(contextual.Error(), "status 200") || strings.Contains(contextual.Error(), mediaFixtureSecret) {
+		t.Fatal("contextual diagnostic changed one-hop decoder identity or exposed input")
+	}
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d"} {
 		if strings.Contains(fmt.Sprintf(verb, struct{ err error }{safe}), mediaFixtureSecret) {
 			t.Fatal("private wrapper reflected original delivery error")

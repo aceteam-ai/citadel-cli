@@ -157,6 +157,11 @@ a network listener, DNS lookup or real service. A malformed WS interface-valued
 number fixture proves the original decoder error contains its wire spelling,
 while retained wrapper/log diagnostics do not.
 
+`DeliveryErrorContext` keeps trusted HTTP route/status context in the same
+opaque wrapper, not a second wrapping error. The existing decoder compatibility
+fixture still compares one-hop original type, field, offset, error text and
+partial decoded state unchanged; its injected transport avoids a listener.
+
 The runner validates explicit execution projection before routing or admission,
 refusing raw-only/invalid captures without handler execution. Routing, explicit
 deadlines, GPU requests/assignment, org and flow attribution use original owned

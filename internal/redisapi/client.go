@@ -335,7 +335,8 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 	if result != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, result); err != nil {
 			if path == "/api/fabric/redis/jobs/consume" {
-				return fmt.Errorf("%s %s returned status %d with an unparseable job delivery body: %w", method, path, resp.StatusCode, jobprivacy.DeliveryError(err))
+				prefix := fmt.Sprintf("%s %s returned status %d with an unparseable job delivery body", method, path, resp.StatusCode)
+				return jobprivacy.DeliveryErrorContext(prefix, err)
 			}
 			return fmt.Errorf("%s %s returned status %d with an unparseable body (%s): %w",
 				method, path, resp.StatusCode, truncateBody(diagnosticBody), err)

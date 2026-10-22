@@ -61,10 +61,21 @@ type redactedError struct {
 // preserves explicit errors.Is/As classification without retaining a raw error
 // value in an ordinary reflectable field or calling its diagnostic formatter.
 func DeliveryError(err error) error {
+	return DeliveryErrorContext("", err)
+}
+
+// DeliveryErrorContext adds trusted route/status context without adding another
+// unwrap layer. The prefix must never contain incoming payload/body details.
+// Single-step Unwrap still returns the exact original decoder error.
+func DeliveryErrorContext(prefix string, err error) error {
 	if err == nil {
 		return nil
 	}
-	return &redactedError{unwrap: func() error { return err }, text: "job delivery decode failed"}
+	text := "job delivery decode failed"
+	if prefix != "" {
+		text = prefix + ": " + text
+	}
+	return &redactedError{unwrap: func() error { return err }, text: text}
 }
 
 func (e *redactedError) Error() string { return e.text }
