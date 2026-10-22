@@ -3,10 +3,14 @@
 //
 // # Wire contract
 //
-// A job payload has exactly two string fields: request (a JSON Request) and
-// passcode (attached by the platform, never an MCP argument). The request's
-// version is 1 and node_id must equal the configured node identity. Scope is
-// an opaque key into the node's allowlist of memory directories. There is no
+// The existing nexus.Job payload is a map of strings. This handler accepts
+// request (a JSON Request), passcode (attached by the platform, never an MCP
+// argument), and the optional transport keys target_node, timeout_ms and rayId;
+// every other top-level key is refused. These three transport values are not
+// parsed into request operands, node/scope authority or a new timeout policy.
+// The incoming context and existing 15-second operation bound still apply.
+// The request's version is 1 and node_id must equal the configured node identity.
+// Scope is an opaque key into the node's allowlist of memory directories. There is no
 // request operand for repository paths, commands, executables or environment.
 //
 // Resolve accepts revision. History accepts name and an explicit limit from
@@ -42,6 +46,43 @@
 // the platform actor or escrow binding itself; existing transport and the
 // future adapter retain that responsibility. Scope directories are trusted
 // node configuration, not authority supplied by a request.
+//
+// # Strict construction follow-up (#1436, partial)
+//
+// jobs.NewMemoryGitHandler requires a nonnil Engine, live Shell permission
+// callback, strict State callback and the configured node-wide shared throttle.
+// Its fields are private and nil/zero/incomplete handlers refuse execution.
+// Construction does not evaluate live callbacks; each dispatch still applies
+// ShellGateReason's existing runtime refusal order. Legacy passcode callbacks
+// cannot be supplied to this constructor. Neither the generic shell gate nor
+// existing shell/desktop/workflow throttle behavior is changed.
+//
+// A nonnil throttle establishes only dependency presence. The node's future
+// wiring must supply the actual shared configured object; this constructor
+// cannot prove pointer identity across consumers or effective tuning. Existing
+// nonpositive/disabled throttle tuning semantics are not changed or certified.
+// The fixtures use NewPasscodeThrottle with positive defaults and exercise
+// failure-budget sharing through actual shell and memory-git handlers.
+//
+// This is not activation or completion of #1436. The owner's 2026-10-22 decision
+// accepts exactly target_node, timeout_ms and rayId as optional top-level
+// transport keys; all other extra keys remain invalid_request. The adapter
+// must preserve the server-attached passcode until this handler checks it,
+// using the existing plain NewLegacyHandlerAdapter shape, not a desktop-style
+// passcodeGate that deletes the field. No adapter, registration or capability
+// advertisement is added by this follow-up; the unregistered fixture remains.
+// Actual platform node identity, authenticated scope selection and exact-node
+// credential attachment still need their separately reviewed integration.
+// The companion producer/provisioning contract in aceteam#11997, including
+// credential expiry and one-shot policy, remains held; accepting inert metadata
+// is not acceptance of that integration or authority to dispatch it.
+//
+// Repository provisioning also remains separate: node ownership/private .git
+// mode, clone/import hardlinks, repacking, metadata-walk bounds and an accepted
+// maintenance/GC policy must be addressed before activation. This slice does
+// not change repository policy, Git configuration, argv, environment or runner.
+// Local candidate tests, builds and native acceptance have not been run for
+// this follow-up; existing GitHub CI is separate evidence, not activation.
 //
 // The first runner supports Linux only and fails closed elsewhere. It requires
 // a node-owned repository with a private .git directory and no metadata

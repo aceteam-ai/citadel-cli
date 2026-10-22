@@ -12,31 +12,51 @@ import (
 // MemoryGitHandler is source-only: no production registry or advertised
 // capability constructs it. A future adapter must authenticate/authorize the
 // scope and attach the existing exact-node Agent-window passcode server-side.
-// Engine repository/scopes and Gate are supplied from trusted node config.
+// Repository/scopes and strict passcode dependencies come from trusted node
+// configuration through NewMemoryGitHandler. The zero value refuses execution.
 type MemoryGitHandler struct {
-	Engine *memorygit.Engine
-	Gate   ShellGate
+	engine   *memorygit.Engine
+	enabled  func() bool
+	state    func() (PasscodeState, error)
+	throttle *PasscodeThrottle
+}
+
+// NewMemoryGitHandler requires live permission, strict State and the same
+// configured throttle object used by the node's shell/desktop/workflow gates.
+// It neither invokes the callbacks nor accepts the legacy passcode callbacks.
+// A nonnil pointer establishes wiring presence, not identity or effective
+// throttle tuning; supplying the actual configured shared object is the caller's
+// trusted wiring obligation. This does not register or advertise the handler.
+func NewMemoryGitHandler(engine *memorygit.Engine, liveEnabled func() bool, strictState func() (PasscodeState, error), sharedThrottle *PasscodeThrottle) (*MemoryGitHandler, error) {
+	if engine == nil || liveEnabled == nil || strictState == nil || sharedThrottle == nil {
+		return nil, &memorygit.Error{Code: "invalid_configuration"}
+	}
+	return &MemoryGitHandler{engine: engine, enabled: liveEnabled, state: strictState, throttle: sharedThrottle}, nil
 }
 
 func (h *MemoryGitHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	if job == nil || job.Type != memorygit.JobType {
 		return nil, &memorygit.Error{Code: "invalid_request"}
 	}
-	// Require an explicit live permission callback. Unlike legacy shell's
-	// Disabled=false default, forgetting to wire this gate cannot enable it.
-	if h.Gate.Enabled == nil {
-		return nil, &ShellRefusal{Reason: ReasonShellDisabled, Message: msgShellDisabled}
+	// Do not allow nil/zero-value or incomplete in-package construction to
+	// bypass the same prerequisites required by the constructor.
+	if h == nil || h.engine == nil || h.enabled == nil || h.state == nil || h.throttle == nil {
+		return nil, &memorygit.Error{Code: "invalid_configuration"}
 	}
-	if reason := ShellGateReason(h.Gate, job.Payload[ShellPasscodePayloadKey]); reason != "" {
+	gate := ShellGate{Enabled: h.enabled, State: h.state, Throttle: h.throttle}
+	if reason := ShellGateReason(gate, job.Payload[ShellPasscodePayloadKey]); reason != "" {
 		return nil, &ShellRefusal{Reason: reason, Message: shellCommandRefusalMessage(reason)}
 	}
 	for key := range job.Payload {
-		if key != "request" && key != ShellPasscodePayloadKey {
+		switch key {
+		case "request", ShellPasscodePayloadKey, "target_node", "timeout_ms", "rayId":
+			// Transport metadata is tolerated, never used as request authority.
+		default:
 			return nil, &memorygit.Error{Code: "invalid_request"}
 		}
 	}
 	raw := job.Payload["request"]
-	if len(raw) == 0 || len(raw) > memorygit.MaxRequestBytes || h.Engine == nil {
+	if len(raw) == 0 || len(raw) > memorygit.MaxRequestBytes {
 		return nil, &memorygit.Error{Code: "invalid_request"}
 	}
 	decoder := json.NewDecoder(strings.NewReader(raw))
@@ -82,7 +102,7 @@ func (h *MemoryGitHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	if err := json.Unmarshal(encoded, &request); err != nil {
 		return nil, &memorygit.Error{Code: "invalid_request"}
 	}
-	result, err := h.Engine.Execute(ctx.Context(), request)
+	result, err := h.engine.Execute(ctx.Context(), request)
 	if err != nil {
 		return nil, err
 	}
