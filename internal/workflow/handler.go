@@ -106,6 +106,10 @@ func (h *Handler) Execute(ctx context.Context, job *worker.Job, stream worker.St
 		select {
 		case <-ctx.Done():
 			h.executor.Cancel(exec.ID)
+			// Context cancellation is not actual execution exit. Keep this
+			// handler goroutine until the node and executor have returned.
+			// The runner's normal-lane watchdog can return before this does.
+			<-exec.Done()
 			return &worker.JobResult{
 				Status: worker.JobStatusFailure, Error: ctx.Err(), Duration: time.Since(start),
 			}, ctx.Err()
@@ -121,17 +125,20 @@ func (h *Handler) Execute(ctx context.Context, job *worker.Job, stream worker.St
 			}
 			switch snap.Status {
 			case StatusCompleted:
+				<-exec.Done()
 				return &worker.JobResult{
 					Status: worker.JobStatusSuccess, Duration: time.Since(start),
 					Output: map[string]any{"workflow_id": exec.ID, "output": snap.Output, "metrics": snap.Metrics},
 				}, nil
 			case StatusFailed:
+				<-exec.Done()
 				return &worker.JobResult{
 					Status: worker.JobStatusFailure, Error: fmt.Errorf("workflow failed: %s", snap.Error),
 					Duration: time.Since(start),
 					Output:   map[string]any{"workflow_id": exec.ID, "error": snap.Error},
 				}, fmt.Errorf("workflow failed: %s", snap.Error)
 			case StatusCancelled:
+				<-exec.Done()
 				return &worker.JobResult{
 					Status: worker.JobStatusFailure, Error: fmt.Errorf("workflow cancelled"),
 					Duration: time.Since(start),
