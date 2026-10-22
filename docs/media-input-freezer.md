@@ -202,6 +202,20 @@ echo a delivery. Its direct callback fixture binds no listener and leaves the
 original wire carrier unchanged. These boundary fixtures are not a claim that
 all wire carrier call sites or the paired backend have been audited.
 
+The independent boundary audit also found pre-decoder transport carriers:
+WebSocket close reasons and arbitrary message-type strings, plus HTTP response
+header/body-read errors that can quote malformed incoming header or trailer
+lines. The read loop now logs only a static read-failure event or its existing
+timeout classification, and only exact known worker message types become
+diagnostic labels. Unknown types still use the unchanged dispatch path. Consume
+request/read failures use the same opaque one-hop error wrapper with trusted
+method/path/status context; unrelated HTTP routes retain their old diagnostics.
+Prepared direct-helper/transport fixtures include a peer-controlled CloseError,
+a formatter that must not run, an untrusted type string and the actual Go
+chunked-trailer parser over an in-memory string. They bind no listener. These
+source fixtures do not replace exact-head execution evidence or complete the
+remaining carrier/backend/ACK audit and pre-mint gates.
+
 ### C2 phase 4 preparation: pure classifier, no deletion wiring
 
 `internal/redis/media_ack_classifier.lua` is an unregistered pure boolean

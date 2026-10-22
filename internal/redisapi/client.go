@@ -287,12 +287,19 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if path == "/api/fabric/redis/jobs/consume" {
+			return jobprivacy.DeliveryErrorContext(method+" "+path+" request failed", err)
+		}
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if path == "/api/fabric/redis/jobs/consume" {
+			prefix := fmt.Sprintf("%s %s returned status %d while reading job delivery body", method, path, resp.StatusCode)
+			return jobprivacy.DeliveryErrorContext(prefix, err)
+		}
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
 

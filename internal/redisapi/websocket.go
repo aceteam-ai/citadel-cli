@@ -413,16 +413,7 @@ func (c *WSClient) readLoop() {
 
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				// The read deadline expired: nothing at all arrived for
-				// pongWait, not even a pong for our pings. Before #734 this
-				// case did not exist and the loop simply blocked forever, so a
-				// half-open socket stayed "connected" while nothing flowed.
-				c.debug("ws: no traffic for %v, treating connection as dead", c.pongWait)
-			} else {
-				c.debug("ws: read error: %v", err)
-			}
+			c.debugReadError(err)
 			c.handleDisconnect(conn)
 			continue
 		}
@@ -439,7 +430,7 @@ func (c *WSClient) readLoop() {
 			continue
 		}
 
-		c.debug("ws: received message type=%s", msg.Type)
+		c.debugMessageType(msg.Type)
 
 		// Handle message based on type
 		c.handlersMu.RLock()
@@ -458,6 +449,30 @@ func (c *WSClient) readLoop() {
 		if ok {
 			wildcardHandler(msg)
 		}
+	}
+}
+
+func (c *WSClient) debugReadError(err error) {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		// Keep the existing timeout classification without formatting the
+		// original error. CloseError.Text and other transport details are
+		// peer-controlled even before a JSON job kind can be established.
+		c.debug("ws: no traffic for %v, treating connection as dead", c.pongWait)
+	} else {
+		c.debug("ws: read error: detail omitted")
+	}
+}
+
+func (c *WSClient) debugMessageType(kind string) {
+	// Only the exact types consumed by the worker are useful diagnostics here.
+	// Unknown/custom types still reach their unchanged handlers below, but an
+	// arbitrary wire string is never a diagnostic label or execution authority.
+	switch kind {
+	case "job", "error", "consuming", "acked":
+		c.debug("ws: received message type=%s", kind)
+	default:
+		c.debug("ws: received message type=unknown")
 	}
 }
 
