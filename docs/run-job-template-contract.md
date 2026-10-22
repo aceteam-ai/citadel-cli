@@ -157,6 +157,33 @@ not modify the checkout and require actual regression assertion failures.
 
 ## Proposed video-compose v1 contract (inactive source)
 
+The #1437 source hardening keeps this builtin unregistered. Concat is limited
+to the concat and MOV demuxers. Its proposed command-output policy separates
+ffprobe JSON on stdout from FFmpeg loudnorm JSON on stderr: stdout is capped at
+1 MiB (overflow cancels the child and refuses the run), and stderr retains only
+its last 64 KiB. Loudnorm's existing log-surrounded JSON extractor is unchanged.
+These are new, inactive implementation-policy proposals, not previously ratified
+limits or native compatibility evidence; owner and native acceptance are required
+before activation. Total-film duration and camera/phone metadata/QuickTime-brand
+policy remain undecided; the existing structural and duration refusals remain.
+This restriction is grounded in source, not a local media run: FFmpeg n6.1
+[concat open_file](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavformat/concatdec.c#L327)
+propagates the whitelist to nested opens, and
+[demux admission](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavformat/demux.c#L258)
+checks it. The documented
+[format_whitelist input option](https://ffmpeg.org/ffmpeg-formats.html#Format-Options)
+accepts a comma-separated demuxer list. In contrast,
+[loudnorm JSON](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavfilter/af_loudnorm.c#L786)
+is emitted through the FFmpeg log channel; it must not be parsed from stdout.
+
+Separately, #1437 tightens **generic, already registered RUN_JOB_TEMPLATE input
+staging upon a future release**, not just this inactive builtin. When an
+`expected_bytes` value is supplied, copying writes no more than the lesser of that
+value and the remaining aggregate input allowance, and reads at most one extra
+byte to detect overflow. Omitted expectations retain the aggregate limit. Exact
+snapshot hashing, short-file mismatch checks, duplicate accounting and failure
+cleanup remain in force. This changes no input wire schema or artifact contract.
+
 This is **part of aceteam-ai/aceteam#11481**, not a registered or template-ready
 builtin. `runVideoComposeBuiltin` has no registry entry or approved manifest
 hash. Its live dependency set refuses before tool discovery or output creation.

@@ -234,9 +234,9 @@ func TestVideoComposeRejectsDisguisedDASHBeforeMedia(t *testing.T) {
 	f := &videoComposeFake{t: t, media: map[string]videoComposeMedia{inputs[1]: videoComposeTestMedia(10)}}
 	deps := f.deps()
 	deps.look = func(string) (string, error) { t.Fatal("disguised DASH reached tool discovery"); return "", nil }
-	deps.run = func(context.Context, string, []string) ([]byte, error) {
+	deps.run = func(context.Context, string, []string) (videoComposeCommandOutput, error) {
 		t.Fatal("disguised DASH could consume undeclared media")
-		return nil, nil
+		return videoComposeCommandOutput{}, nil
 	}
 	outDir := t.TempDir()
 	if _, err := runVideoComposeBuiltin(context.Background(), json.RawMessage(`{}`), inputs, outDir, deps); err == nil {
@@ -276,6 +276,47 @@ func TestVideoComposeMP4RejectsExternalReferences(t *testing.T) {
 		if err := validateVideoComposeMP4(path); err == nil {
 			t.Fatal("invalid/fragmented MP4 accepted")
 		}
+	}
+}
+
+func TestVideoComposeMP4StructuralGuardsIndependently(t *testing.T) {
+	dref := videoComposeTestBox("dref", []byte{0, 0, 0, 0, 0, 0, 0, 1}, videoComposeTestBox("url ", []byte{0, 0, 0, 1}))
+	track := func(parent string) []byte {
+		child := dref
+		if parent == "dinf" {
+			child = videoComposeTestBox("dinf", dref)
+		}
+		return videoComposeTestBox("trak", videoComposeTestBox("mdia", videoComposeTestBox("minf", child)))
+	}
+	for _, tc := range []struct {
+		name, drefParent string
+		tracks          int
+		mdat, wantOK    bool
+	}{
+		{name: "one track", tracks: 1, drefParent: "dinf", mdat: true, wantOK: true},
+		{name: "two tracks", tracks: 2, drefParent: "dinf", mdat: true, wantOK: true},
+		{name: "missing mdat", tracks: 2, drefParent: "dinf"},
+		{name: "three tracks", tracks: 3, drefParent: "dinf", mdat: true},
+		{name: "dref directly in minf", tracks: 1, drefParent: "minf", mdat: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tracks := make([][]byte, tc.tracks)
+			for i := range tracks {
+				tracks[i] = track(tc.drefParent)
+			}
+			body := videoComposeTestBox("ftyp", []byte("isom\x00\x00\x00\x00isommp41"))
+			body = append(body, videoComposeTestBox("moov", tracks...)...)
+			if tc.mdat {
+				body = append(body, videoComposeTestBox("mdat", []byte{0})...)
+			}
+			path := filepath.Join(t.TempDir(), "chapter.mp4")
+			if err := os.WriteFile(path, body, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateVideoComposeMP4(path); (err == nil) != tc.wantOK {
+				t.Fatalf("structural guard: err=%v wantOK=%v", err, tc.wantOK)
+			}
+		})
 	}
 }
 
@@ -326,7 +367,7 @@ func TestVideoComposeLocalEncodedMP4(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	probeArgs := append([]string{"-v", "error", "-show_streams", "-show_format", "-show_data_hash", "sha256", "-of", "json"}, videoComposeMP4InputArgs(fixture)...)
-	raw, err := exec.CommandContext(ctx, ffprobe, probeArgs...).CombinedOutput()
+	raw, err := exec.CommandContext(ctx, ffprobe, probeArgs...).Output()
 	if err != nil {
 		t.Fatalf("pinned genuine probe: %v %s", err, raw)
 	}
@@ -355,7 +396,7 @@ func TestVideoComposeLocalEncodedMP4(t *testing.T) {
 		}
 		// With the previous autodetection policy this genuine DASH fixture
 		// supplies plausible H264/AAC metadata via undeclared local segments.
-		baseline, err := exec.CommandContext(ctx, ffprobe, "-v", "error", "-protocol_whitelist", "file,pipe", "-show_streams", "-show_format", "-of", "json", "-i", manifestPath).CombinedOutput()
+		baseline, err := exec.CommandContext(ctx, ffprobe, "-v", "error", "-protocol_whitelist", "file,pipe", "-show_streams", "-show_format", "-of", "json", "-i", manifestPath).Output()
 		if err != nil {
 			t.Fatalf("offline baseline manifest: %v %s", err, baseline)
 		}
@@ -414,9 +455,9 @@ func TestVideoComposeInactiveBeforeEffects(t *testing.T) {
 	outDir := t.TempDir()
 	deps := liveVideoComposeDeps()
 	deps.look = func(string) (string, error) { t.Fatal("inactive runner discovered a media tool"); return "", nil }
-	deps.run = func(context.Context, string, []string) ([]byte, error) {
+	deps.run = func(context.Context, string, []string) (videoComposeCommandOutput, error) {
 		t.Fatal("inactive runner invoked media")
-		return nil, nil
+		return videoComposeCommandOutput{}, nil
 	}
 	if _, err := runVideoComposeBuiltin(context.Background(), json.RawMessage(`{}`), inputs, outDir, deps); err == nil || !strings.Contains(err.Error(), "inactive") {
 		t.Fatalf("missing dependency gate: %v", err)
@@ -482,7 +523,7 @@ func (f *videoComposeFake) BurnDisclosure(_ context.Context, ch videoComposeChap
 	ref.Duration = f.media[input].Duration
 	return f.write(output, ref, 3)
 }
-func (f *videoComposeFake) run(_ context.Context, bin string, args []string) ([]byte, error) {
+func (f *videoComposeFake) run(_ context.Context, bin string, args []string) (videoComposeCommandOutput, error) {
 	f.calls = append(f.calls, append([]string{bin}, args...))
 	if bin == "ffprobe" {
 		if !strings.Contains(strings.Join(args, " "), "-f mov -enable_drefs 0 -use_absolute_path 0 -i ") {
@@ -490,13 +531,13 @@ func (f *videoComposeFake) run(_ context.Context, bin string, args []string) ([]
 		}
 		m, ok := f.media[args[len(args)-1]]
 		if !ok {
-			return nil, fmt.Errorf("no fake probe for %s", args[len(args)-1])
+			return videoComposeCommandOutput{}, fmt.Errorf("no fake probe for %s", args[len(args)-1])
 		}
-		return videoComposeTestProbe(m), nil
+		return videoComposeCommandOutput{stdout: videoComposeTestProbe(m), stderr: []byte("probe warning\n")}, nil
 	}
 	output := args[len(args)-1]
 	if output == "-" {
-		return []byte(`{"input_i":"-20","input_tp":"-5","input_lra":"3","input_thresh":"-30","target_offset":"0.2"}`), nil
+		return videoComposeCommandOutput{stdout: []byte("not loudnorm JSON"), stderr: []byte("ffmpeg log before\n" + `{"input_i":"-20","input_tp":"-5","input_lra":"3","input_thresh":"-30","target_offset":"0.2"}` + "\nffmpeg log after")}, nil
 	}
 	input := ""
 	concat := false
@@ -516,9 +557,12 @@ func (f *videoComposeFake) run(_ context.Context, bin string, args []string) ([]
 	}
 	m := f.media[input]
 	if concat {
+		if !strings.Contains(strings.Join(args, " "), "-format_whitelist concat,mov -f concat -safe 1 -i ") {
+			f.t.Fatal("concat inner demuxers are not restricted")
+		}
 		raw, err := os.ReadFile(input)
 		if err != nil {
-			return nil, err
+			return videoComposeCommandOutput{}, err
 		}
 		m = videoComposeTestMedia(0)
 		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
@@ -537,7 +581,7 @@ func (f *videoComposeFake) run(_ context.Context, bin string, args []string) ([]
 	if filepath.Base(output) == "capped.mp4" {
 		size = f.cappedBytes
 	}
-	return nil, f.write(output, m, size)
+	return videoComposeCommandOutput{}, f.write(output, m, size)
 }
 func (f *videoComposeFake) deps() videoComposeDeps {
 	return videoComposeDeps{look: func(name string) (string, error) { return name, nil }, run: f.run, visuals: f}

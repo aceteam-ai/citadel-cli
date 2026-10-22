@@ -459,12 +459,12 @@ type videoComposeVisuals interface {
 }
 type videoComposeDeps struct {
 	look    func(string) (string, error)
-	run     func(context.Context, string, []string) ([]byte, error)
+	run     func(context.Context, string, []string) (videoComposeCommandOutput, error)
 	visuals videoComposeVisuals
 }
 
 func liveVideoComposeDeps() videoComposeDeps {
-	return videoComposeDeps{look: exec.LookPath, run: liveAudioMixDeps().run}
+	return videoComposeDeps{look: exec.LookPath, run: runVideoComposeCommand}
 }
 
 func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs []string, outDir string, deps videoComposeDeps) (outputs []string, retErr error) {
@@ -498,7 +498,7 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		if err != nil {
 			return videoComposeMedia{}, fmt.Errorf("ffprobe failed: %w", err)
 		}
-		return parseVideoComposeProbe(raw)
+		return parseVideoComposeProbe(raw.stdout)
 	}
 	media := make([]videoComposeMedia, len(chapters))
 	for i, path := range chapters {
@@ -531,7 +531,7 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 	run := func(args []string) error {
 		out, err := deps.run(ctx, ffmpeg, args)
 		if err != nil {
-			return fmt.Errorf("video-compose ffmpeg: %w: %s", err, compactCommandOutput(out))
+			return fmt.Errorf("video-compose ffmpeg: %w: %s", err, compactCommandOutput(out.stderr))
 		}
 		return nil
 	}
@@ -592,14 +592,14 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		return nil, err
 	}
 	joined := filepath.Join(scratch, "joined.mp4")
-	if err := run([]string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-f", "concat", "-safe", "1", "-i", list, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", joined}); err != nil {
+	if err := run([]string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-format_whitelist", "concat,mov", "-f", "concat", "-safe", "1", "-i", list, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", joined}); err != nil {
 		return nil, err
 	}
 	analysis, err := deps.run(ctx, ffmpeg, videoComposeLoudnormArgs(joined, "", film.Loudness, nil))
 	if err != nil {
 		return nil, err
 	}
-	timeline.LoudnessMeasured, err = parseLoudnormStats(analysis)
+	timeline.LoudnessMeasured, err = parseLoudnormStats(analysis.stderr)
 	if err != nil {
 		return nil, err
 	}

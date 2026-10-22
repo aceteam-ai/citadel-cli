@@ -1519,14 +1519,21 @@ the engine's own incremental deltas into one final array before returning it.
 `runVideoComposeBuiltin` owns the proposed closed film decoder, declared-basename
 binding and media composition core, but has no registry entry; its live dependency
 set fails before effects until the pinned v3 card/disclosure renderer lands.
+`template_builtin_video_compose_command.go` owns its proposed bounded, separate
+stdout/stderr captures and overflow cancellation without changing audio-mix.
 `renderPapercraftLandscapeCard` shares the existing capture lifecycle for one
 landscape with silent audio; it does not supply card assets. The proposed contract
 and remaining activation gates are in `docs/run-job-template-contract.md`.
 
 `cmd/run_job_template_ops.go` remains the workspace/hash/receipt adapter;
-`cmd/template_builtin_papercraft.go` and `template_builtin_audio_mix.go` are the
-only production registry entries. Both invoke fixed argv directly, never a
-shell. `papercraft-render` shares Chromium discovery with
+`cmd/template_builtin_papercraft.go`, `template_builtin_audio_mix.go`,
+`template_builtin_papercraft_scene.go` and `template_builtin_papercraft_scene_v2.go`
+own the four production registry entries: `papercraft-render`, `audio-mix`,
+`papercraft-scene-render` and `papercraft-scene-render-v2`. The scene owners
+assemble their separately embedded shells and delegate to the same papercraft
+capture lifecycle; v2 also validates its embedded theme registry. The render and
+audio paths invoke fixed argv directly, never a shell. `papercraft-render` shares
+Chromium discovery with
 `platform.FindChromium` and the persistent request/response CDP transport in
 `internal/cobrowsestream`. `startPapercraftAssetServer` is the browser's
 non-forwarding HTTP proxy: its random route serves declared inputs only, while
@@ -1545,7 +1552,8 @@ a `setsid` descendant cannot escape, and cleanup failure is a run failure. The
 constructor deliberately fails closed on missing systemd launch/cleanup tools
 and on non-Linux systems. The Windows process helper is only a compile stub; it
 is unreachable behind that non-Linux refusal, not a partial taskkill fallback.
-Both builtins additionally apply the independent `renderJobWallTimeout`.
+The shared render and audio paths additionally apply the independent
+`renderJobWallTimeout`.
 Browser cancellation must terminate and wait for the process tree before
 profile removal.
 
