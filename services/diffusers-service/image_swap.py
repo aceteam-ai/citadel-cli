@@ -27,13 +27,17 @@ Concurrency contract:
 
 from __future__ import annotations
 
+import errno
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable
 
 from image_models import GIB, ImageModelSpec, LoadVariant, choose_variant, fitting_variants
+from model_preflight import InsufficientDiskSpaceError
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +68,86 @@ class ModelWarming(Exception):
         super().__init__(f"{model_id} is warming ({reason})")
 
 
+class FailureKind(Enum):
+    LOAD_FAILED = "load_failed"
+    ALL_FAILED = "all_candidates_failed"
+    DISK_SPACE = "disk_space"
+    REPO_GATED = "repository_access_denied"
+    REPO_MISSING = "repository_not_found"
+    GPU_UNAVAILABLE = "gpu_unavailable"
+    CUDA_MEMORY = "cuda_memory"
+    HOST_MEMORY = "host_memory"
+    DEPENDENCY = "dependency_unavailable"
+    CONFIGURATION = "invalid_model_configuration"
+    API = "incompatible_model_api"
+    RUNTIME = "model_runtime"
+    MODEL_IO = "model_files_unavailable"
+
+
+_FAILURE_SUMMARIES = {
+    FailureKind.LOAD_FAILED: "pipeline load failed",
+    FailureKind.ALL_FAILED: "all eligible pipeline loads failed",
+    FailureKind.DISK_SPACE: "insufficient disk space for model download",
+    FailureKind.REPO_GATED: "model repository access denied",
+    FailureKind.REPO_MISSING: "model repository not found or inaccessible",
+    FailureKind.GPU_UNAVAILABLE: "a GPU is required for the selected model variant",
+    FailureKind.CUDA_MEMORY: "GPU memory allocation failed",
+    FailureKind.HOST_MEMORY: "host memory allocation failed",
+    FailureKind.DEPENDENCY: "model runtime dependency is unavailable",
+    FailureKind.CONFIGURATION: "model configuration was refused",
+    FailureKind.API: "model runtime API is incompatible",
+    FailureKind.RUNTIME: "model runtime failed",
+    FailureKind.MODEL_IO: "model files are unavailable",
+}
+_ACTIONABLE_FAILURES = frozenset(_FAILURE_SUMMARIES).difference({
+    FailureKind.LOAD_FAILED, FailureKind.ALL_FAILED, FailureKind.RUNTIME,
+})
+
+
+def failure_summary(kind) -> str:
+    return _FAILURE_SUMMARIES[kind if isinstance(kind, FailureKind) else FailureKind.LOAD_FAILED]
+
+
+def _loaded_exception(exc: Exception, module_name: str, class_name: str) -> bool:
+    # Inspect only fixed exports already loaded by the real operation. Never
+    # import a dependency just to classify an error, or trust an error's name.
+    module = sys.modules.get(module_name)
+    cls = vars(module).get(class_name) if module is not None else None
+    return isinstance(cls, type) and issubclass(cls, Exception) and isinstance(exc, cls)
+
+
+def classify_failure(exc: Exception) -> FailureKind:
+    if isinstance(exc, ModelLoadFailed):
+        return exc.kind if isinstance(exc.kind, FailureKind) else FailureKind.LOAD_FAILED
+    if isinstance(exc, InsufficientDiskSpaceError) or (
+        isinstance(exc, OSError) and exc.errno == errno.ENOSPC
+    ):
+        return FailureKind.DISK_SPACE
+    for name, kind in (("GatedRepoError", FailureKind.REPO_GATED),
+                       ("RepositoryNotFoundError", FailureKind.REPO_MISSING)):
+        if any(_loaded_exception(exc, module, name) for module in
+               ("huggingface_hub.errors", "huggingface_hub.utils._errors")):
+            return kind
+    if any(_loaded_exception(exc, module, "OutOfMemoryError") for module in ("torch", "torch.cuda")):
+        return FailureKind.CUDA_MEMORY
+    for cls, kind in (
+        (MemoryError, FailureKind.HOST_MEMORY), (ImportError, FailureKind.DEPENDENCY),
+        (ValueError, FailureKind.CONFIGURATION), (TypeError, FailureKind.API),
+        (RuntimeError, FailureKind.RUNTIME), (OSError, FailureKind.MODEL_IO),
+    ):
+        if isinstance(exc, cls):
+            return kind
+    return FailureKind.LOAD_FAILED
+
+
 class ModelLoadFailed(RuntimeError):
     """The load itself failed (bad repo id, auth, disk, library error). HTTP 500."""
 
-    def __init__(self, model_id: str, message: str):
+    def __init__(self, model_id: str, kind=FailureKind.LOAD_FAILED):
         self.model_id = model_id
-        self.message = message
-        super().__init__(f"failed to load model {model_id}: {message}")
+        self.kind = kind if isinstance(kind, FailureKind) else FailureKind.LOAD_FAILED
+        self.message = failure_summary(self.kind)
+        super().__init__(f"failed to load model {model_id}: {self.message}")
 
 
 class InsufficientVram(RuntimeError):
@@ -506,31 +583,53 @@ class ImageModelManager:
             # an earlier unload never make free VRAM look smaller than it is.
             self._free_memory()
             started = self._clock()
-            attempted = False
+            attempted = 0
+            failures = []
+            failure_kinds = set()
+            skipped_for_vram = 0
+            trailing_shortfall = None
             for variant in candidates:
                 # Recheck after every failed attempt's cleanup. Other services
                 # can change their allocations while this load is running.
                 free_before = self._free_vram_bytes()
                 if free_before is not None and variant.est_vram_gb * GIB > free_before:
+                    skipped_for_vram += 1
+                    # Keep a coherent observed need/free pair for the smallest
+                    # candidate skipped after the last actual load attempt.
+                    if trailing_shortfall is None or variant.est_vram_gb < trailing_shortfall[0]:
+                        trailing_shortfall = (variant.est_vram_gb, free_before / GIB)
                     continue
+                trailing_shortfall = None
                 with self._cond:
                     load.variant = variant
-                attempted = True
-                loaded = self._attempt_pipeline_load(spec, variant)
+                attempted += 1
+                loaded, failure_kind = self._attempt_pipeline_load(spec, variant)
                 if loaded is not None:
                     pipe, device = loaded
                     del loaded
                     break
                 # The helper has exited its except block and stack frame.
                 # Collect partial allocations BEFORE another candidate loads;
-                # neither retained exceptions nor their messages cross here.
+                # only an allowlisted enum crosses here, never a raw diagnostic.
+                failures.append({"quantization": variant.quant,
+                                 "cpu_offload": variant.offload != "none",
+                                 "kind": failure_kind.value})
+                failure_kinds.add(failure_kind)
+                logger.warning("diffusers: %s candidate %s failed [%s]: %s",
+                               spec.model_id, variant.label(), failure_kind.value,
+                               failure_summary(failure_kind))
                 self._free_memory()
                 if self._quant_mode != "auto":
-                    raise ModelLoadFailed(spec.model_id, "pipeline load failed")
-                logger.warning("diffusers: AUTO pipeline candidate failed; checking next eligible variant")
+                    raise ModelLoadFailed(spec.model_id, failure_kind)
             else:
+                if trailing_shortfall is not None:
+                    raise InsufficientVram(spec.model_id, *trailing_shortfall)
                 if attempted:
-                    raise ModelLoadFailed(spec.model_id, "all eligible pipeline loads failed")
+                    common = next(iter(failure_kinds)) if len(failure_kinds) == 1 else None
+                    raise ModelLoadFailed(
+                        spec.model_id,
+                        common if common in _ACTIONABLE_FAILURES else FailureKind.ALL_FAILED,
+                    )
                 raise InsufficientVram(spec.model_id, smallest.est_vram_gb, free_before / GIB)
             elapsed = self._clock() - started
             free_after = self._free_vram_bytes()
@@ -557,6 +656,12 @@ class ImageModelManager:
                     "cpu_offload": variant.offload != "none",
                     "est_vram_gb": variant.est_vram_gb,
                     "measured_vram_gb": round(measured, 2) if measured is not None else None,
+                    "preferred_quantization": candidates[0].quant,
+                    "preferred_cpu_offload": candidates[0].offload != "none",
+                    "attempt_count": attempted,
+                    "fallback_attempts": max(attempted - 1, 0),
+                    "vram_skipped_candidates": skipped_for_vram,
+                    "failed_attempts": failures,
                 }
                 self._load = None
                 self._arm_idle_locked(self._resident)
@@ -573,11 +678,13 @@ class ImageModelManager:
             err: Exception
             if isinstance(exc, InsufficientVram):
                 err = exc
-            elif isinstance(exc, ModelLoadFailed):
-                err = ModelLoadFailed(spec.model_id, exc.message)
             else:
-                err = ModelLoadFailed(spec.model_id, str(exc))
-            logger.warning("diffusers: load of %s failed: %s", spec.model_id, exc)
+                err = ModelLoadFailed(spec.model_id, classify_failure(exc))
+            if isinstance(err, ModelLoadFailed):
+                logger.warning("diffusers: load of %s failed [%s]: %s",
+                               spec.model_id, err.kind.value, err.message)
+            else:
+                logger.warning("diffusers: load of %s refused [insufficient_vram]", spec.model_id)
             try:
                 # Preparation can fail while the idle timer is tearing down
                 # the outgoing model. Do not run overlapping memory cleanup.
@@ -586,7 +693,7 @@ class ImageModelManager:
                 # blocks cached in this process.
                 self._free_memory()
             except Exception:  # noqa: BLE001
-                logger.exception("diffusers: freeing memory after a failed load raised")
+                logger.warning("diffusers: memory cleanup after a failed load was not confirmed")
             with self._cond:
                 self._failures[spec.model_id] = [err, self._clock() + self._failure_backoff, False]
                 load.error = err
@@ -597,17 +704,17 @@ class ImageModelManager:
                 self._cond.notify_all()
 
     def _attempt_pipeline_load(self, spec: ImageModelSpec, variant: LoadVariant):
-        """Never retain a failed loader's exception, traceback or message.
+        """Return only a safe enum from a failed loader, never its diagnostics.
 
         Returning outside the except block and this short-lived frame allows
         the caller's GC/cache cleanup to reclaim partial pipelines before a
         fallback. A successful loader returns its normal (pipeline, device).
         """
         try:
-            return self._loader(spec, variant)
-        except Exception:
-            pass
-        return None
+            return self._loader(spec, variant), None
+        except Exception as exc:
+            kind = classify_failure(exc)
+        return None, kind
 
     def _enter_replacement_phase(self, load: _Load) -> None:
         """End preparation without racing an outgoing model's idle teardown.

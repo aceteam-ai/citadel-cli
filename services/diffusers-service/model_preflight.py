@@ -49,9 +49,9 @@ DEFAULT_DISK_SAFETY_MARGIN_BYTES = 2 * 1024**3  # 2 GiB
 
 class InsufficientDiskSpaceError(RuntimeError):
     """Raised when the preflight confirms a download will not fit. Carries a
-    human-readable required-vs-available message (never just a bare number)
-    so a caller that surfaces the exception message verbatim (as app.py's
-    /generate handler does) still fails loud and clear."""
+    human-readable required-vs-available message for this preflight's callers.
+    The sidecar's load boundary classifies this type into a static disk-space
+    refusal; it does not echo the path-bearing message into HTTP or retries."""
 
 
 @dataclass(frozen=True)

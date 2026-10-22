@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import base64
 import io
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -673,6 +674,90 @@ def test_insufficient_free_vram_is_503_but_not_warming(client, monkeypatch):
     assert "Retry-After" not in resp.headers
 
 
+def test_failed_attempt_followed_by_vram_skips_is_static_503_not_warming(client, monkeypatch, caplog):
+    free = [12 * 1024**3]
+    attempts = []
+
+    def load(spec, variant):
+        attempts.append(variant.quant)
+        free[0] = 6 * 1024**3
+        raise RuntimeError("owned-private-loader-detail")
+
+    manager = ImageModelManager(
+        app.ALLOWED_IMAGE_MODELS, FLUX, loader=load,
+        free_vram_bytes=lambda: free[0], vram_budget_gb=12, warm_wait_seconds=5,
+    )
+    monkeypatch.setattr(app, "_manager", manager)
+    resp = _post(client, FLUX)
+    assert attempts == ["int8"]
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "insufficient_vram" and body["model"] == FLUX
+    assert (body["need_gb"], body["free_gb"]) == (7.0, 6.0)
+    assert "model_warming" not in resp.text
+    assert "Retry-After" not in resp.headers
+    assert "owned-private-loader-detail" not in resp.text + caplog.text
+    assert "candidate int8 failed [model_runtime]: model runtime failed" in caplog.text
+
+
+@pytest.mark.parametrize("pipeline", ["image", "video"])
+@pytest.mark.parametrize("cause, kind, reason", [
+    ("disk", "disk_space", "insufficient disk space for model download"),
+    ("gated", "repository_access_denied", "model repository access denied"),
+    ("missing", "repository_not_found", "model repository not found or inaccessible"),
+])
+def test_typed_load_refusals_keep_static_actionable_http_context(
+    client, monkeypatch, caplog, pipeline, cause, kind, reason,
+):
+    # These inert exports model already-loaded HF classes, not an HF import or
+    # authorization request. The real disk exception is import-light as well.
+    class RepositoryNotFoundError(RuntimeError):
+        pass
+
+    class GatedRepoError(RepositoryNotFoundError):
+        pass
+
+    module = ModuleType("huggingface_hub.errors")
+    module.RepositoryNotFoundError = RepositoryNotFoundError
+    module.GatedRepoError = GatedRepoError
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    failure_class = {
+        "disk": app.model_preflight.InsufficientDiskSpaceError,
+        "gated": GatedRepoError,
+        "missing": RepositoryNotFoundError,
+    }[cause]
+    attempts = []
+
+    def refuse():
+        raise failure_class("owned-private-loader-detail /owned/private/path hf_private-token")
+
+    def prepare(spec, variant):
+        if pipeline == "image":
+            refuse()
+
+    def load(spec, variant):
+        attempts.append(variant.quant)
+        refuse()  # the video loader contains its preflight in production
+
+    model_id = ZIMG if pipeline == "image" else app.DIFFUSERS_VIDEO_MODEL
+    specs = app.ALLOWED_IMAGE_MODELS if pipeline == "image" else {model_id: app._video_spec}
+    manager = ImageModelManager(
+        specs, model_id, loader=load, prepare=prepare, warm_wait_seconds=5,
+    )
+    monkeypatch.setattr(app, "_manager" if pipeline == "image" else "_video_manager", manager)
+    resp = _post(client, model_id) if pipeline == "image" else client.post(
+        "/generate/video", json={"prompt": "owned-test"},
+    )
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == f"failed to load model {model_id}: {reason}"
+    assert resp.json()["detail"].count("failed to load model ") == 1
+    assert attempts == ([] if pipeline == "image" else ["none"])
+    assert f"[{kind}]: {reason}" in caplog.text
+    for private in ("owned-private-loader-detail", "/owned/private/path", "hf_private-token"):
+        assert private not in resp.text + caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
 @pytest.mark.parametrize("pipeline", ["image", "video"])
 def test_load_failure_surfaces_as_static_500_naming_the_trusted_model(client, monkeypatch, caplog, pipeline):
     model_id = ZIMG if pipeline == "image" else app.DIFFUSERS_VIDEO_MODEL
@@ -694,6 +779,7 @@ def test_load_failure_surfaces_as_static_500_naming_the_trusted_model(client, mo
     assert "401 gated" not in resp.text
     assert "owned-private-loader-detail" not in resp.text
     assert "owned-private-loader-detail" not in caplog.text
+    assert "[model_runtime]: model runtime failed" in caplog.text
 
 
 @pytest.mark.parametrize("pipeline", ["image", "video"])
@@ -706,8 +792,9 @@ def test_http_load_errors_ignore_untrusted_message_and_model_identity(client, mo
     if failure_kind == "generic":
         failure = PrivateFailure()
     else:
-        message = "all eligible pipeline loads failed" if failure_kind == "static" else "owned-private-loader-detail"
-        failure = app.ModelLoadFailed("owned-foreign-model", message)
+        kind = app.FailureKind.ALL_FAILED if failure_kind == "static" else app.FailureKind.LOAD_FAILED
+        failure = app.ModelLoadFailed("owned-foreign-model", kind)
+        failure.message = "owned-private-loader-detail"  # HTTP classification must use only kind
 
     def refuse(*args):
         raise failure

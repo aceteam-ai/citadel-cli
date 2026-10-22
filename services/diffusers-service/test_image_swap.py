@@ -6,21 +6,95 @@ tests control exactly when a "cold load" finishes."""
 
 from __future__ import annotations
 
+import errno
 import gc
+import sys
 import threading
 import time
+import types
 import weakref
 
 import pytest
 
 import image_models as im
-from image_swap import ImageModelManager, InsufficientVram, ModelLoadFailed, ModelWarming
+from image_swap import (
+    FailureKind, ImageModelManager, InsufficientVram, ModelLoadFailed, ModelWarming,
+    classify_failure, failure_summary,
+)
+from model_preflight import InsufficientDiskSpaceError
 
 GIB = 1024**3
 SDXL = "stabilityai/sdxl-turbo"
 FLUX = "black-forest-labs/FLUX.2-klein-4B"
 ZIMG = "Tongyi-MAI/Z-Image-Turbo"
 QWEN = "Qwen/Qwen-Image"
+
+
+@pytest.mark.parametrize("failure, expected", [
+    (InsufficientDiskSpaceError("owned-private-path"), FailureKind.DISK_SPACE),
+    (OSError(errno.ENOSPC, "owned-private-path"), FailureKind.DISK_SPACE),
+    (MemoryError("owned-private-detail"), FailureKind.HOST_MEMORY),
+    (ImportError("owned-private-detail"), FailureKind.DEPENDENCY),
+    (ValueError("owned-private-detail"), FailureKind.CONFIGURATION),
+    (TypeError("owned-private-detail"), FailureKind.API),
+    (RuntimeError("owned-private-detail"), FailureKind.RUNTIME),
+    (OSError("owned-private-detail"), FailureKind.MODEL_IO),
+    (Exception("owned-private-detail"), FailureKind.LOAD_FAILED),
+])
+def test_failure_kinds_use_types_not_private_messages(failure, expected):
+    assert classify_failure(failure) is expected
+    safe = ModelLoadFailed(FLUX, expected)
+    assert safe.message == failure_summary(expected)
+    assert "owned-private" not in str(safe)
+
+
+@pytest.mark.parametrize("module_name", ["huggingface_hub.errors", "huggingface_hub.utils._errors"])
+def test_hf_failure_classification_uses_loaded_class_identity_without_import(monkeypatch, module_name):
+    class RepositoryNotFoundError(RuntimeError):
+        def __str__(self):
+            raise AssertionError("private loader exceptions must not be formatted")
+
+    class GatedRepoError(RepositoryNotFoundError):
+        pass
+
+    module = types.ModuleType(module_name)
+    module.RepositoryNotFoundError = RepositoryNotFoundError
+    module.GatedRepoError = GatedRepoError
+
+    def no_lazy_import(name):
+        raise AssertionError("classification must not resolve lazy dependency exports")
+
+    module.__getattr__ = no_lazy_import
+    monkeypatch.setitem(sys.modules, module_name, module)
+    # A present module with a missing diagnostic export must not call its
+    # lazy __getattr__ or import anything in order to classify the error.
+    monkeypatch.setitem(sys.modules, "torch", module)
+    assert classify_failure(GatedRepoError("owned-private-detail")) is FailureKind.REPO_GATED
+    assert classify_failure(RepositoryNotFoundError("owned-private-detail")) is FailureKind.REPO_MISSING
+    # A matching class name and module string are not the trusted loaded type.
+    spoof = type("GatedRepoError", (RuntimeError,), {"__module__": module_name})
+    assert classify_failure(spoof("owned-private-detail")) is FailureKind.RUNTIME
+    assert classify_failure(RuntimeError("GatedRepoError disk full 401")) is FailureKind.RUNTIME
+
+
+@pytest.mark.parametrize("module_name", ["torch", "torch.cuda"])
+def test_cuda_memory_classification_uses_only_loaded_export(monkeypatch, module_name):
+    class OutOfMemoryError(RuntimeError):
+        pass
+
+    module = types.ModuleType(module_name)
+    module.OutOfMemoryError = OutOfMemoryError
+    monkeypatch.setitem(sys.modules, module_name, module)
+    assert classify_failure(OutOfMemoryError("owned-private-detail")) is FailureKind.CUDA_MEMORY
+    spoof = type("OutOfMemoryError", (RuntimeError,), {"__module__": module_name})
+    assert classify_failure(spoof()) is FailureKind.RUNTIME
+
+
+def test_unknown_load_kind_cannot_render_arbitrary_detail():
+    failure = ModelLoadFailed(FLUX, "owned-private-detail")
+    assert failure.kind is FailureKind.LOAD_FAILED
+    assert failure_summary("owned-private-detail") == "pipeline load failed"
+    assert "owned-private-detail" not in str(failure)
 
 
 class FakeLoader:
@@ -47,7 +121,10 @@ class FakeLoader:
         if gate is not None:
             assert gate.wait(5), "test never released the prepare gate"
         if spec.model_id in self.prepare_fail:
-            raise RuntimeError(self.prepare_fail.pop(spec.model_id))
+            failure = self.prepare_fail.pop(spec.model_id)
+            if isinstance(failure, Exception):
+                raise failure
+            raise RuntimeError(failure)
 
     def load(self, spec, variant):
         self.events.append(("load", spec.model_id))
@@ -751,7 +828,7 @@ def test_download_happens_before_the_resident_model_is_evicted():
 
 def test_failed_download_leaves_the_resident_model_loaded():
     loader = FakeLoader()
-    loader.prepare_fail[FLUX] = "insufficient disk space"
+    loader.prepare_fail[FLUX] = InsufficientDiskSpaceError("insufficient disk space at /owned-private-path")
     mgr, _ = make(loader)
     with pytest.raises(ModelWarming):
         mgr.lease(SDXL)
@@ -763,7 +840,9 @@ def test_failed_download_leaves_the_resident_model_loaded():
     mgr.wait_for_load(5)
     with pytest.raises(ModelLoadFailed) as err:
         mgr.lease(FLUX)
-    assert "insufficient disk space" in str(err.value)
+    assert err.value.kind is FailureKind.DISK_SPACE
+    assert err.value.message == "insufficient disk space for model download"
+    assert "/owned-private-path" not in str(err.value)
     assert mgr.loaded_model() == SDXL
     assert loader.unloaded == []
 
@@ -842,6 +921,11 @@ def test_falls_back_to_a_smaller_variant_that_fits_free_vram():
     with mgr.lease(FLUX) as lease:
         assert lease.variant.quant == "nf4"
     assert loader.loads == [(FLUX, "nf4", "none")]
+    status = mgr.status()["last_load"]
+    assert status["preferred_quantization"] == "int8"
+    assert status["attempt_count"] == 1 and status["fallback_attempts"] == 0
+    assert status["vram_skipped_candidates"] == 1
+    assert status["failed_attempts"] == []
 
 
 def test_prefers_the_budget_choice_when_free_vram_allows():
@@ -851,7 +935,7 @@ def test_prefers_the_budget_choice_when_free_vram_allows():
 
 
 @pytest.mark.parametrize("failures", [0, 1, 2])
-def test_auto_attempts_gpu_first_then_offload_and_clears_partial_references(failures):
+def test_auto_attempts_gpu_first_then_offload_and_clears_partial_references(failures, caplog):
     timers = ManualTimers()
     attempts, references, cleanup = [], [], []
 
@@ -881,6 +965,19 @@ def test_auto_attempts_gpu_first_then_offload_and_clears_partial_references(fail
     assert attempts == order[:failures + 1]
     assert (lease.variant.quant, lease.variant.offload) == order[failures]
     assert all(all(snapshot) for snapshot in cleanup)
+    status = mgr.status()["last_load"]
+    assert status["preferred_quantization"] == "int8" and status["preferred_cpu_offload"] is False
+    assert status["attempt_count"] == failures + 1
+    assert status["fallback_attempts"] == failures
+    assert status["vram_skipped_candidates"] == 0
+    assert status["failed_attempts"] == [
+        {"quantization": quant, "cpu_offload": offload != "none", "kind": "model_runtime"}
+        for quant, offload in order[:failures]
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    if failures:
+        assert "candidate int8 failed [model_runtime]: model runtime failed" in caplog.text
+    assert "owned-private-loader-detail" not in caplog.text
     # Even fallback CPU-offloaded weights obey immediate idle cleanup.
     lease.release()
     timers.timers[-1].fire()
@@ -905,6 +1002,62 @@ def test_auto_all_candidate_failures_are_bounded_static_and_backed_off(caplog):
     assert attempts == [("int8", "none"), ("nf4", "none"), ("none", "model")]
     assert mgr.loaded_model() is None
     assert "owned-private-loader-detail" not in caplog.text
+    for variant in ("int8", "nf4", "none+cpu-offload"):
+        assert f"candidate {variant} failed [model_runtime]: model runtime failed" in caplog.text
+
+
+@pytest.mark.parametrize("kinds, expected", [
+    ([FailureKind.DISK_SPACE] * 3, FailureKind.DISK_SPACE),
+    ([FailureKind.REPO_GATED] * 3, FailureKind.REPO_GATED),
+    ([FailureKind.REPO_MISSING] * 3, FailureKind.REPO_MISSING),
+    ([FailureKind.GPU_UNAVAILABLE] * 3, FailureKind.GPU_UNAVAILABLE),
+    ([FailureKind.DISK_SPACE, FailureKind.DISK_SPACE, FailureKind.REPO_GATED], FailureKind.ALL_FAILED),
+    ([FailureKind.LOAD_FAILED] * 3, FailureKind.ALL_FAILED),
+    ([FailureKind.RUNTIME] * 3, FailureKind.ALL_FAILED),
+])
+def test_auto_aggregate_preserves_only_one_common_actionable_kind(kinds, expected, caplog):
+    attempts = []
+
+    def load(spec, variant):
+        kind = kinds[len(attempts)]
+        attempts.append((variant.quant, variant.offload))
+        failure = ModelLoadFailed("owned-foreign-model", kind)
+        failure.message = "owned-private-detail"
+        raise failure
+
+    mgr, _ = make(budget=12, warm_wait=5)
+    mgr._loader = load
+    with pytest.raises(ModelLoadFailed) as err:
+        mgr.lease(FLUX)
+    assert len(attempts) == 3
+    assert err.value.model_id == FLUX
+    assert err.value.kind is expected
+    assert err.value.message == failure_summary(expected)
+    assert "owned-private-detail" not in str(err.value) + caplog.text
+    assert "owned-foreign-model" not in str(err.value) + caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_fallback_load_seconds_include_failed_attempts_and_cleanup():
+    clock = Clock()
+    attempts = []
+
+    def load(spec, variant):
+        attempts.append(variant.quant)
+        clock.now += 3
+        if variant.quant == "int8":
+            raise RuntimeError("owned-private-detail")
+        return object(), "cuda"
+
+    def free():
+        clock.now += 2
+
+    mgr, _ = make(budget=12, warm_wait=5, clock=clock)
+    mgr._loader = load
+    mgr._free_memory = free
+    mgr.lease(FLUX).release()
+    assert attempts == ["int8", "nf4"]
+    assert mgr.status()["last_load"]["seconds"] == 8  # 3 + failed cleanup 2 + 3
 
 
 @pytest.mark.parametrize("quant", ["int8", "none"])
@@ -919,7 +1072,8 @@ def test_explicit_quantization_never_retries_after_a_load_exception(quant):
     mgr._loader = load
     with pytest.raises(ModelLoadFailed) as err:
         mgr.lease(FLUX)
-    assert err.value.message == "pipeline load failed"
+    assert err.value.kind is FailureKind.RUNTIME
+    assert err.value.message == "model runtime failed"
     assert attempts == [(quant, "none")]
 
 
@@ -937,9 +1091,10 @@ def test_auto_fallback_rechecks_vram_after_failed_candidate_cleanup():
     mgr, _ = make(budget=12, warm_wait=5)
     mgr._loader = load
     mgr._free_vram_bytes = lambda: free[0]
-    with pytest.raises(ModelLoadFailed):
+    with pytest.raises(InsufficientVram) as err:
         mgr.lease(FLUX)
     assert attempts == [("int8", "none")]
+    assert (err.value.need_gb, err.value.free_gb) == (7.0, 6.0)
 
 
 def test_concurrent_requests_share_one_serial_fallback_load():

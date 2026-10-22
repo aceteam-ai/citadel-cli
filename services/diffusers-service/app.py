@@ -68,10 +68,12 @@ from pydantic import BaseModel, Field
 import image_models
 import model_preflight
 from image_swap import (
+    FailureKind,
     ImageModelManager,
     InsufficientVram,
     ModelLoadFailed,
     ModelWarming,
+    failure_summary,
 )
 
 logger = logging.getLogger(__name__)
@@ -293,9 +295,7 @@ def _load_pipeline(spec, variant):
 
     device, dtype = _resolve_device_and_dtype(spec)
     if device == "cpu" and (variant.quant != image_models.QUANT_NONE or variant.offload != "none"):
-        raise RuntimeError(
-            f"{spec.model_id} needs a GPU for its {variant.label()} load variant; none is visible"
-        )
+        raise ModelLoadFailed(spec.model_id, FailureKind.GPU_UNAVAILABLE)
 
     pipeline_cls = getattr(diffusers, spec.pipeline_class) if spec.pipeline_class else diffusers.AutoPipelineForText2Image
     kwargs = {"torch_dtype": dtype}
@@ -690,8 +690,8 @@ def _load_failure_detail(model_id: str, failure: Exception) -> str:
     HTTP diagnostic authority, even if the exception is ModelLoadFailed.
     """
     reason = "pipeline load failed"
-    if isinstance(failure, ModelLoadFailed) and failure.message == "all eligible pipeline loads failed":
-        reason = "all eligible pipeline loads failed"
+    if isinstance(failure, ModelLoadFailed):
+        reason = failure_summary(failure.kind)
     return f"failed to load model {model_id}: {reason}"
 
 

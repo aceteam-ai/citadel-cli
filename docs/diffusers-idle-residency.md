@@ -56,7 +56,7 @@ still constrain the choices. Estimates are not observed GPU/RAM measurements.
 
 AUTO attempts each eligible catalog candidate at most once, in the same
 GPU-first/offload-last order. If a loader raises, the attempt helper discards
-the exception and returns only failure state; it must leave no original
+the exception and returns only an allowlisted failure kind; it must leave no original
 traceback or partial pipeline reference in the retry frame. Garbage/cache/host
 cleanup completes before the next attempt, and actual free VRAM is rechecked
 for each candidate. All failed candidates produce a static `ModelLoadFailed`
@@ -70,6 +70,35 @@ The image/video HTTP load-error boundary emits one trusted requested/configured
 model prefix with a static failure classification; original loader diagnostics
 and an exception-provided model identity are not returned to clients.
 
+The B1/L4/L5 follow-up retains actionable diagnostics without truncating or
+echoing arbitrary exception text. Known exception classes map to finite static
+kinds for disk capacity, gated/missing repository, unavailable GPU/dependency,
+CUDA/host memory, configuration/API, runtime or model-file failures. Unknown
+classes stay generic. HF/CUDA matching uses class identity from already-loaded
+fixed module exports, without importing ML/dependency modules for diagnostics;
+a same-named class is not enough. Failed candidate logs carry the trusted model,
+catalog variant, safe kind and fixed summary, never a traceback, response body,
+reflected path or credential. Logs and retained metadata contain no exception
+object, including when a fallback succeeds. Disk/repository prepare failures
+carry their typed static kind through HTTP 500 rather than masquerading as a
+generic pipeline load; Go still surfaces that safe non-200 body unchanged.
+The video loader includes its own preflight. If all attempted variants fail
+with the same actionable allowlisted kind, that common static kind survives
+aggregation; mixed causes or generic runtime/unknown failures remain
+`all_candidates_failed`. No message-text inference is used.
+The class-identity fixtures install inert fake HF/CUDA module exports; they
+exercise the classifier without importing those dependencies. They are not
+proof that any particular installed library version exports these classes, or
+that a real gated repository, CUDA allocation or model load succeeds.
+
+When the final remaining candidates are skipped for current VRAM after a failed
+attempt, the disposition is the existing `503 insufficient_vram`, not an
+all-candidates-failed 500. This is not `model_warming` and does not change Go's
+existing warming-only retry policy. Successful `/health.last_load` includes
+preferred variant, attempted/fallback counts, capacity-skip count and bounded
+failed-variant safe kinds; `seconds` includes the entire candidate loop and its
+failed-attempt cleanup. These observations cannot certify native load success.
+
 Fallback does not certify bitsandbytes support, output quality, allocator
 behavior or acceptable resource contention. It can use CPU offload only as the
 last AUTO fallback, and those weights must still be idle-evicted fully.
@@ -80,6 +109,9 @@ last AUTO fallback, and those weights must still be idle-evicted fully.
 attribution or the historical peak. It is null if unavailable. Both cold paths
 retain the retryable `503 model_warming`/`Retry-After` contract. Video inference,
 seed setup and export errors release their lease just like successful requests.
+Unlike the former synchronous video singleton, a cold video request may return
+this 503 after warm-wait; the existing Go image/video handler retries it within
+its unchanged request budget. Unclaimed-load grace is Retry-After plus warm-wait.
 
 ## Acceptance still required
 
