@@ -32,6 +32,7 @@ type HTTPPolicy struct {
 	prefixes []netip.Prefix
 	hosts    map[string]bool
 	loadErr  error
+	loadWhy  string // bounded local diagnostic, never raw filesystem/YAML text
 	resolve  func(context.Context, string) ([]netip.Addr, error)
 	dial     func(context.Context, string, string) (net.Conn, error)
 }
@@ -74,6 +75,18 @@ var publicHTTPv6Prefix = netip.MustParsePrefix("2000::/3")
 var siteLocalHTTPPrefix = netip.MustParsePrefix("fec0::/10")
 var zeroHTTPPrefix = netip.MustParsePrefix("0.0.0.0/8")
 var meshLocalHTTPAddress = netip.MustParseAddr("100.100.100.100")
+var meshLocalHTTPv6Address = netip.MustParseAddr("fd7a:115c:a1e0::53")
+
+// These transition formats can route to embedded IPv4 destinations. Do not let
+// host/CIDR exceptions override them: translation is topology-dependent. SIIT's
+// translated prefix is distinct from ordinary IPv4-mapped ::ffff:0:0/96.
+var translatedHTTPPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("::ffff:0:0:0/96"),
+}
 
 func normalizeHTTPAddress(ip netip.Addr) netip.Addr {
 	ip = ip.Unmap()
@@ -89,6 +102,11 @@ func httpAddressClass(ip netip.Addr) (class string, hard bool) {
 		return "invalid address", true
 	}
 	ip = normalizeHTTPAddress(ip)
+	for _, prefix := range translatedHTTPPrefixes {
+		if prefix.Contains(ip) {
+			return "translated IPv6 address", true
+		}
+	}
 	switch {
 	case ip.IsLoopback():
 		return "loopback address", true
@@ -100,7 +118,7 @@ func httpAddressClass(ip netip.Addr) (class string, hard bool) {
 		return "multicast address", true
 	case ip == netip.MustParseAddr("255.255.255.255"):
 		return "broadcast address", true
-	case ip == meshLocalHTTPAddress:
+	case ip == meshLocalHTTPAddress || ip == meshLocalHTTPv6Address:
 		return "node-local service address", true
 	case siteLocalHTTPPrefix.Contains(ip):
 		return "site-local address", true
@@ -149,45 +167,78 @@ func canonicalHTTPHost(host string) (string, error) {
 // Missing means public-only; every other error is retained as a refusal for
 // HTTP nodes, not silently converted into permissive defaults. No file is written.
 func LoadHTTPPolicy(nodeConfigDir string) HTTPPolicy {
-	refuse := func() HTTPPolicy {
-		return HTTPPolicy{loadErr: errors.New("HTTP policy unreadable or invalid")}
+	refuse := func(reason string) HTTPPolicy {
+		return HTTPPolicy{loadErr: errors.New("HTTP policy unreadable or invalid"), loadWhy: reason}
 	}
 	if nodeConfigDir == "" {
-		return refuse()
+		return refuse("node_directory_missing")
 	}
 	root, err := os.OpenRoot(nodeConfigDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return HTTPPolicy{}
 	}
 	if err != nil {
-		return refuse()
+		return refuse(httpPolicyIOReason("directory", err))
 	}
 	defer root.Close()
 	before, err := root.Lstat(HTTPPolicyFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return HTTPPolicy{}
 	}
-	if err != nil || !before.Mode().IsRegular() || before.Size() > maxHTTPPolicyBytes {
-		return refuse()
+	if err != nil {
+		return refuse(httpPolicyIOReason("stat", err))
+	}
+	if !before.Mode().IsRegular() {
+		return refuse("file_not_regular")
+	}
+	if before.Size() > maxHTTPPolicyBytes {
+		return refuse("file_too_large")
 	}
 	f, err := root.Open(HTTPPolicyFile)
 	if err != nil {
-		return refuse()
+		return refuse(httpPolicyIOReason("open", err))
 	}
 	defer f.Close()
 	after, err := f.Stat()
 	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
-		return refuse()
+		return refuse("file_changed_during_open")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxHTTPPolicyBytes+1))
-	if err != nil || len(data) > maxHTTPPolicyBytes {
-		return refuse()
+	if err != nil {
+		return refuse(httpPolicyIOReason("read", err))
+	}
+	if len(data) > maxHTTPPolicyBytes {
+		return refuse("file_too_large")
 	}
 	policy, err := parseHTTPPolicy(data)
 	if err != nil {
-		return refuse()
+		return refuse("invalid_policy_document")
 	}
 	return policy
+}
+
+func httpPolicyIOReason(operation string, err error) string {
+	if errors.Is(err, os.ErrPermission) {
+		return operation + "_permission_denied"
+	}
+	return operation + "_io_failure"
+}
+
+// Never wrap transport errors into run results. net.OpError, url.Error and TLS
+// errors can expose resolved addresses, URL queries or certificate details.
+// Keep only safe cancellation/timeout identity for errors.Is consumers.
+func safeHTTPTransportError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return context.DeadlineExceeded
+	}
+	return errors.New("HTTP transport failure")
 }
 
 func parseHTTPPolicy(data []byte) (HTTPPolicy, error) {

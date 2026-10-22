@@ -203,12 +203,12 @@ func (e *HTTPNodeExecutor) Execute(ctx context.Context, node *Node, input map[st
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP node %q: request failed: %w", node.ID, err)
+		return nil, fmt.Errorf("HTTP node %q: request failed: %w", node.ID, safeHTTPTransportError(err))
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
-		return nil, fmt.Errorf("HTTP node %q: read response: %w", node.ID, err)
+		return nil, fmt.Errorf("HTTP node %q: read response: %w", node.ID, safeHTTPTransportError(err))
 	}
 	result := map[string]any{"status_code": resp.StatusCode, "body": string(respBody)}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.Header.Get("Location") != "" {
