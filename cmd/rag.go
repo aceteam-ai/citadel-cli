@@ -34,6 +34,10 @@ var (
 	ragPathPrefixes []string
 )
 
+// ragIndexNotifyContext lets the owned subprocess test observe the actual
+// signal context used by the indexer. Production uses signal.NotifyContext.
+var ragIndexNotifyContext = signal.NotifyContext
+
 var ragCmd = &cobra.Command{
 	Use:   "rag",
 	Short: "Node-local RAG: index this node's documents and query them locally",
@@ -119,7 +123,7 @@ func runRAGIndex(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	softCtx, stopSoft := signal.NotifyContext(context.Background(), os.Interrupt)
+	softCtx, stopSoft := ragIndexNotifyContext(context.Background(), os.Interrupt)
 	defer stopSoft()
 	fmt.Printf("Indexing %s via %s ...\n", args[0], svc.Model())
 	// Live, throttled progress line while the walk runs (aceteam#10876 C1). Not

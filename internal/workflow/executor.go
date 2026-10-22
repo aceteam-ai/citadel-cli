@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -25,6 +26,13 @@ type Executor struct {
 }
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
+	if cfg.HTTP.loadErr != nil {
+		reason := cfg.HTTP.loadWhy
+		if reason == "" {
+			reason = "unknown_load_failure"
+		}
+		slog.Warn("workflow HTTP policy unavailable", "file", HTTPPolicyFile, "reason", reason)
+	}
 	if cfg.DefaultTimeout == 0 {
 		cfg.DefaultTimeout = defaultTimeout
 	}
