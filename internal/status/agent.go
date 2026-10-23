@@ -9,12 +9,12 @@ import (
 
 // Agent-facing introspection & control endpoints (issue #236).
 //
-// These endpoints are served by the same status HTTP server that already
-// dual-listens on localhost and the tsnet VPN. Crucially, this control path
+// Introspection and worker control endpoints require a coordinator client
+// certificate on the dedicated mTLS control listener. Crucially, this path
 // does NOT depend on the Redis shell-job queue it is meant to debug: an agent
 // can call these even when job consumption is broken (a job dispatched over the
 // per-node stream would hang exactly when you need it). The aceteam MCP server
-// wraps these as the `citadel_*` agent tools over the VPN mesh.
+// wraps these as the `citadel_*` agent tools over the control listener.
 //
 // To keep the status package decoupled from the worker/runner internals, the
 // data and actions are supplied as provider callbacks on ServerConfig, wired up
@@ -107,68 +107,83 @@ type LogQuery struct {
 	Since string // relative duration, e.g. "5m", "1h"
 }
 
-// registerAgentRoutes attaches the agent introspection & control routes to mux.
-// All routes require VPN origin or a valid org token (same posture as the SSH
-// key handler): the aceteam backend reaches them over the mesh after validating
-// org ownership; local callers must present a token.
+// registerAgentRoutes refuses introspection and worker control on plaintext.
+// Gateway exposure retains its separate self-origin policy.
 func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
-	p := s.agent
-	if p == nil {
+	if s.agent == nil {
 		return
 	}
-
-	mux.HandleFunc("/agent/worker-status", s.requireVPNOrAuth(s.handleAgentJSON("worker_status", func(_ *http.Request) (any, error) {
-		if p.WorkerStatus == nil {
-			return nil, errUnavailable
-		}
-		return p.WorkerStatus(), nil
-	})))
-
-	mux.HandleFunc("/agent/node-info", s.requireVPNOrAuth(s.handleAgentJSON("node_info", func(_ *http.Request) (any, error) {
-		if p.NodeInfo == nil {
-			return nil, errUnavailable
-		}
-		return p.NodeInfo(), nil
-	})))
-
-	mux.HandleFunc("/agent/doctor", s.requireVPNOrAuth(s.handleAgentJSON("doctor", func(_ *http.Request) (any, error) {
-		if p.Doctor == nil {
-			return nil, errUnavailable
-		}
-		return p.Doctor(), nil
-	})))
-
-	mux.HandleFunc("/agent/config", s.requireVPNOrAuth(s.handleAgentJSON("config", func(_ *http.Request) (any, error) {
-		if p.Config == nil {
-			return nil, errUnavailable
-		}
-		return p.Config(), nil
-	})))
-
-	mux.HandleFunc("/agent/logs", s.requireVPNOrAuth(s.handleAgentLogs))
-
-	mux.HandleFunc("/agent/vendor-agents", s.requireVPNOrAuth(s.handleVendorAgents))
-
-	// Control endpoints (POST, may be nil -> 503).
-	mux.HandleFunc("/agent/set-log-level", s.requireVPNOrAuth(s.handleSetLogLevel))
-	mux.HandleFunc("/agent/resubscribe", s.requireVPNOrAuth(s.handleAgentAction("resubscribe", func() (any, error) {
-		if p.Resubscribe == nil {
-			return nil, errUnavailable
-		}
-		return p.Resubscribe()
-	})))
-	mux.HandleFunc("/agent/worker-restart", s.requireVPNOrAuth(s.handleAgentAction("worker_restart", func() (any, error) {
-		if p.WorkerRestart == nil {
-			return nil, errUnavailable
-		}
-		return p.WorkerRestart()
-	})))
+	for _, path := range []string{
+		"/agent/worker-status", "/agent/node-info", "/agent/doctor",
+		"/agent/config", "/agent/logs", "/agent/vendor-agents",
+		"/agent/set-log-level", "/agent/resubscribe", "/agent/worker-restart",
+	} {
+		mux.HandleFunc(path, func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "agent endpoint requires coordinator mTLS on the control listener"})
+		})
+	}
 	// Expose/unexpose program the node gateway, so they must not trust mesh
 	// origin (citadel-cli#1318). Their only caller is this node's own
 	// `citadel service expose|unexpose`, which dials the node's own mesh IP;
 	// the platform publishes services through the EXPOSE_SET job instead.
 	mux.HandleFunc("/agent/expose", s.requireSelfOrigin(s.handleAgentExpose))
 	mux.HandleFunc("/agent/unexpose", s.requireSelfOrigin(s.handleAgentUnexpose))
+}
+
+// registerAgentControlRoutes installs only coordinator-gated agent handlers.
+// An absent provider set or gate leaves the routes unregistered.
+func (s *Server) registerAgentControlRoutes(mux *http.ServeMux, requireCoordinator func(http.HandlerFunc) http.HandlerFunc) {
+	p := s.agent
+	if p == nil || requireCoordinator == nil {
+		return
+	}
+
+	mux.HandleFunc("/agent/worker-status", requireCoordinator(s.handleAgentJSON("worker_status", func(_ *http.Request) (any, error) {
+		if p.WorkerStatus == nil {
+			return nil, errUnavailable
+		}
+		return p.WorkerStatus(), nil
+	})))
+
+	mux.HandleFunc("/agent/node-info", requireCoordinator(s.handleAgentJSON("node_info", func(_ *http.Request) (any, error) {
+		if p.NodeInfo == nil {
+			return nil, errUnavailable
+		}
+		return p.NodeInfo(), nil
+	})))
+
+	mux.HandleFunc("/agent/doctor", requireCoordinator(s.handleAgentJSON("doctor", func(_ *http.Request) (any, error) {
+		if p.Doctor == nil {
+			return nil, errUnavailable
+		}
+		return p.Doctor(), nil
+	})))
+
+	mux.HandleFunc("/agent/config", requireCoordinator(s.handleAgentJSON("config", func(_ *http.Request) (any, error) {
+		if p.Config == nil {
+			return nil, errUnavailable
+		}
+		return p.Config(), nil
+	})))
+
+	mux.HandleFunc("/agent/logs", requireCoordinator(s.handleAgentLogs))
+
+	mux.HandleFunc("/agent/vendor-agents", requireCoordinator(s.handleVendorAgents))
+
+	// Control endpoints (POST, may be nil -> 503).
+	mux.HandleFunc("/agent/set-log-level", requireCoordinator(s.handleSetLogLevel))
+	mux.HandleFunc("/agent/resubscribe", requireCoordinator(s.handleAgentAction("resubscribe", func() (any, error) {
+		if p.Resubscribe == nil {
+			return nil, errUnavailable
+		}
+		return p.Resubscribe()
+	})))
+	mux.HandleFunc("/agent/worker-restart", requireCoordinator(s.handleAgentAction("worker_restart", func() (any, error) {
+		if p.WorkerRestart == nil {
+			return nil, errUnavailable
+		}
+		return p.WorkerRestart()
+	})))
 }
 
 // handleAgentUnexpose revokes an exposure on the in-process gateway. POST with
@@ -205,9 +220,8 @@ func (s *Server) handleAgentUnexpose(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAgentExpose programs an exposure on the in-process gateway. POST only,
-// with an ExposeSpec body. Same auth posture as the other control endpoints
-// (VPN origin or a valid org token), so a local operator drives it via the
-// node's own mesh IP and the backend drives it over the mesh.
+// with an ExposeSpec body. The separate self-origin gate admits this node's
+// local operator through the node's own mesh address.
 func (s *Server) handleAgentExpose(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
