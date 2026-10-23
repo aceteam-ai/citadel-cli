@@ -157,6 +157,37 @@ not modify the checkout and require actual regression assertion failures.
 
 ## Proposed video-compose v1 contract (inactive source)
 
+The #1437 source hardening keeps this builtin unregistered. Concat is limited
+to the concat and MOV demuxers. Its proposed command-output policy separates
+ffprobe JSON on stdout from FFmpeg loudnorm JSON on stderr: stdout is capped at
+1 MiB (overflow cancels the child and refuses the run), and stderr retains only
+its last 64 KiB. Loudnorm's existing log-surrounded JSON extractor is unchanged.
+These are new, inactive implementation-policy proposals, not previously ratified
+limits or native compatibility evidence; owner and native acceptance are required
+before activation. The [owner decision](https://github.com/aceteam-ai/citadel-cli/issues/1437#issuecomment-6347292527)
+caps the whole film at 600 seconds including every title card. The source now
+enforces that cap before rendering and against actual prepared/encoded media.
+The same decision brings camera/phone metadata and the QuickTime brand into
+scope, but their bounded parser allowance still needs separate design review;
+this duration-only child leaves every container refusal and whitelist unchanged.
+This restriction is grounded in source, not a local media run: FFmpeg n6.1
+[concat open_file](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavformat/concatdec.c#L327)
+propagates the whitelist to nested opens, and
+[demux admission](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavformat/demux.c#L258)
+checks it. The documented
+[format_whitelist input option](https://ffmpeg.org/ffmpeg-formats.html#Format-Options)
+accepts a comma-separated demuxer list. In contrast,
+[loudnorm JSON](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavfilter/af_loudnorm.c#L786)
+is emitted through the FFmpeg log channel; it must not be parsed from stdout.
+
+Separately, #1437 tightens **generic, already registered RUN_JOB_TEMPLATE input
+staging upon a future release**, not just this inactive builtin. When an
+`expected_bytes` value is supplied, copying writes no more than the lesser of that
+value and the remaining aggregate input allowance, and reads at most one extra
+byte to detect overflow. Omitted expectations retain the aggregate limit. Exact
+snapshot hashing, short-file mismatch checks, duplicate accounting and failure
+cleanup remain in force. This changes no input wire schema or artifact contract.
+
 This is **part of aceteam-ai/aceteam#11481**, not a registered or template-ready
 builtin. `runVideoComposeBuiltin` has no registry entry or approved manifest
 hash. Its live dependency set refuses before tool discovery or output creation.
@@ -270,6 +301,24 @@ landscape inputs, even dimensions up to 8192 pixels wide, 1–120 fps and one vi
 plus one audio stream; mixed aspect, absent audio, extra streams, invalid metadata
 and missing files fail. The current capture helper is still 30 fps; integrating
 other reference frame rates is an activation requirement, not a tested capability.
+Before scratch creation or rendering, the projected total includes the declared
+intro, outro and every chapter card plus every probed chapter duration. Title
+cards alone exceeding the cap refuse during film decoding, before tool discovery.
+`videoComposeAddDuration` owns finite, positive binary64-second accumulation:
+it checks each part against the remaining allowance before adding, refuses
+overflow/non-finite values and has no rounding epsilon above the hard maximum.
+This follows the existing probe/timeline numeric contract, not an exact rational
+duration or a promise about real encoder clocks.
+
+The same cap is rechecked incrementally against the actual intro, chapter cards,
+prepared clips and outro. The concatenated output is probed before loudnorm;
+the normalized output is probed before any optional size-cap encode; the renamed
+capped output is probed again. Every delivered media duration must independently
+stay within the hard maximum and retain the existing one-frame agreement with
+the actual timeline. That frame tolerance never permits a film over 600 seconds.
+The film schema, shared JSON fixtures and producer contract do not change, and
+overlong media is refused rather than silently trimmed.
+
 The single-landscape capture entry point uses the same Chromium/cgroup lifecycle
 as existing papercraft rendering and requests continuous stereo 48 kHz silent
 AAC; the existing public papercraft entry point still renders both formats.
@@ -297,7 +346,13 @@ through `CITADEL_VIDEO_COMPOSE_OFFLINE_FIXTURE` (at most 1 MiB) and optional loc
 DASH fixture through `CITADEL_VIDEO_COMPOSE_OFFLINE_MANIFEST` (at most 64 KiB).
 It bounds local commands to 15 seconds, verifies the genuine MP4's pinned probe
 and copy/re-encode paths, and refuses the disguised manifest. Normal unit tests
-use synthetic container/probe fixtures and invoke no media binaries. The
+use synthetic container/probe fixtures and invoke no media binaries. Added
+duration fixtures cover exact/over-limit projected multi-chapter totals,
+title-card-only refusal before discovery, finite/positive arithmetic boundaries,
+and independent intro/card/clip/outro/concat/normalization/cap output overruns.
+The duration fixtures are authored source only; no local test or media execution
+has been performed for this correction. Existing shared timeline values are
+unchanged. The
 disguised-manifest regression asserts rejection before discovery, subprocesses,
 rendering or output creation, even with a valid undeclared BaseURL target.
 

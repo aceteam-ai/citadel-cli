@@ -14,3 +14,7 @@ They do not approve a Film, register a template, or demonstrate a real render.
 Keep these fixtures synchronized with the platform when a reviewed contract
 changes. In particular, they preserve the provisional positive card durations
 and 48 MiB maximum; neither policy is settled by copying the merged fixture.
+The separate owner-approved total-film duration cap is enforced by runtime
+preflight and actual-media checks without changing these shared JSON values.
+The existing 21.5-second synthetic timeline remains byte-identical; new duration
+boundary fixtures live in `template_builtin_video_duration_test.go`.
