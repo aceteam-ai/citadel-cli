@@ -13,11 +13,17 @@ import (
 func sharedWorkerFixture() status.WorkerDetail {
 	observed := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	return status.WorkerDetail{
-		Mode: "worker", Connected: true, NodeName: "selected-node", MeshIP: "100.64.0.58",
-		Version: "2.201.0", PID: 42, UptimeSec: 120, ObservedAt: observed,
-		Worker: &status.WorkerLiveness{Consuming: true, LastPollAt: &observed, LastJobConsumedAt: &observed, InFlight: 1, Processed: 7, Failed: 2, PubSubTransport: "websocket"},
-		Swap: &status.SwapActivity{SwapsPerHour: 3, EvictingSwapsPerHour: 1, MaxEvictingPerHour: 5},
-		Lanes: []status.LaneActivity{{Lane: "unbounded", Queued: 2, Executing: 1, ExecCapacity: 1, BusySince: &observed}},
+		Mode:       "worker",
+		Connected:  true,
+		NodeName:   "selected-node",
+		MeshIP:     "100.64.0.58",
+		Version:    "2.201.0",
+		PID:        42,
+		UptimeSec:  120,
+		ObservedAt: observed,
+		Worker:     &status.WorkerLiveness{Consuming: true, LastPollAt: &observed, LastJobConsumedAt: &observed, InFlight: 1, Processed: 7, Failed: 2, PubSubTransport: "websocket"},
+		Swap:       &status.SwapActivity{SwapsPerHour: 3, EvictingSwapsPerHour: 1, MaxEvictingPerHour: 5},
+		Lanes:      []status.LaneActivity{{Lane: "unbounded", Queued: 2, Executing: 1, ExecCapacity: 1, BusySince: &observed}},
 	}
 }
 

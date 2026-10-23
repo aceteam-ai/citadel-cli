@@ -12,10 +12,17 @@ func workerDetailFixture() WorkerDetail {
 	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 	pulled := false
 	return WorkerDetail{
-		Mode: "worker", Connected: true, NodeName: "node", MeshIP: "100.64.0.2", Version: "test", PID: 42, UptimeSec: 10, ObservedAt: now,
-		Worker: &WorkerLiveness{Consuming: true, InFlight: 1, Processed: 2, Failed: 3, LastPollAt: &now, LastJobConsumedAt: &now, PubSubTransport: "websocket"},
-		Swap: &SwapActivity{SwapsPerHour: 1, MaxEvictingPerHour: 4, Recent: []SwapRecord{{Backend: "ollama", Model: "model", Evicted: []string{"vllm"}, StartedAt: now, Wait: time.Second, Outcome: "ready", Pulled: &pulled}}},
-		Lanes: []LaneActivity{{Lane: "inference", Queued: 1, Executing: 1, ExecCapacity: 2, BusySince: &now}},
+		Mode:       "worker",
+		Connected:  true,
+		NodeName:   "node",
+		MeshIP:     "100.64.0.2",
+		Version:    "test",
+		PID:        42,
+		UptimeSec:  10,
+		ObservedAt: now,
+		Worker:     &WorkerLiveness{Consuming: true, InFlight: 1, Processed: 2, Failed: 3, LastPollAt: &now, LastJobConsumedAt: &now, PubSubTransport: "websocket"},
+		Swap:       &SwapActivity{SwapsPerHour: 1, MaxEvictingPerHour: 4, Recent: []SwapRecord{{Backend: "ollama", Model: "model", Evicted: []string{"vllm"}, StartedAt: now, Wait: time.Second, Outcome: "ready", Pulled: &pulled}}},
+		Lanes:      []LaneActivity{{Lane: "inference", Queued: 1, Executing: 1, ExecCapacity: 2, BusySince: &now}},
 	}
 }
 
