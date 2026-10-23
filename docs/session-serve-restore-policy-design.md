@@ -33,12 +33,21 @@ No actual profile, state store, credentials or running node was read.
 | Observer ordering | [LocalClient](https://github.com/tailscale/tailscale/blob/v1.100.0/tsnet/tsnet.go#L406-L415), [Up](https://github.com/tailscale/tailscale/blob/v1.100.0/tsnet/tsnet.go#L531-L545) | The exported local-client path starts tsnet before the application can subscribe. Up installs its watcher after this startup too. |
 
 The method name `controlclient.Login` also covers resuming an already authorized
-identity with its existing key. The design must settle whether that exact
-key-preserving control-plane exchange is permitted by the owner's wording.
-It is distinct from browser/auth-key/OAuth/WIF authorization and key creation.
-No exception is silently assumed here; the question is with automated-citadel.
-Without a permitted existing-key exchange, an online restore path is not
-established by this design.
+identity with its existing key. Automated-citadel's **reviewer interpretation of
+the 2026-10-22 owner decision, pending Jason ratification** is:
+
+- Permit control-plane resume/registration presenting the existing persisted
+  node key of an already-authorized identity, with no interaction or new
+  credential. This includes key-preserving `controlclient.Login` reconnect.
+- Refuse browser/interactive auth URLs; auth-key, OAuth or WIF authorization,
+  including ambient auth keys; every node-key mint/rotation/rekey; adoption of
+  an empty/new profile; and any NeedsLogin/expired-key recovery except a clean
+  refusal pointing to `citadel login`.
+
+This interpretation is proposed design guidance, not a newly ratified exception
+or runtime permission. Jason can overrule it. It separates existing-identity
+exchange from new authorization; implementation remains held on ratification
+and the enforcement proof below.
 
 ## Alternative A: immutable existing-identity policy
 
