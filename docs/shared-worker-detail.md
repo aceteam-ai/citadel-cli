@@ -14,9 +14,11 @@ collector, configuring TUI activity telemetry, starting a duplicate ActualState
 emitter, node-state reporting, heartbeat publication and a worker runner. Local
 activity remains visible, including the static owner-change warning. Monitor
 TUI-originated activity is no longer forwarded by a telemetry stream configured
-in this branch. Explicit owner acceptance of that telemetry change is still a
-gate; source preparation does not record it as accepted. The external worker's
-own telemetry and heartbeat contract are unchanged.
+in this branch. Automated-citadel accepted this engineering change on October
+23, 2026: the lock-holding worker remains the node's single telemetry/state
+publisher, while the viewer's local activity stays local. The PR lists this
+behavior change explicitly. Native UI acceptance remains separate. The external
+worker's own telemetry and heartbeat contract are unchanged.
 
 The read-only `GET /citadel/session/v1/worker-detail` uses the same OS-protected
 Unix socket or Windows pipe as existing session status. It adds no listener,
