@@ -809,8 +809,31 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// warning, same as before.
 	job.clock = newDeliveryClock(r.clockNow, r.clockState)
 	stream = r.newStreamWriter(job)
-	if err := retryStreamWrite(ctx, func() error { return stream.WriteClaimed(r.agentVersion) }); err != nil {
+	// Never emit control claims/results over legacy Redis or a missing writer.
+	if job.Type == JobTypeWorkerControl && !authenticatedWorkerControlStream(job, stream) {
+		r.log("warning", "Declining WORKER_CONTROL %s without authenticated control delivery/results", job.ID)
+		return false, nil, startTime
+	}
+	claim := func() error { return stream.WriteClaimed(r.agentVersion) }
+	var claimErr error
+	if job.Type == JobTypeWorkerControl {
+		claimErr = claim()
+	} else {
+		claimErr = retryStreamWrite(ctx, claim)
+	}
+	if err := claimErr; err != nil {
 		r.log("warning", "Failed to publish claimed event for job %s: %v", job.ID, err)
+		if job.Type == JobTypeWorkerControl {
+			if job.controlSession != nil {
+				job.controlSession.Cancel()
+			}
+			if h, ok := r.findHandler(job.Type).(interface{ Abort(*Job) error }); ok {
+				if e := h.Abort(job); e != nil {
+					r.log("error", "WORKER_CONTROL claim cancellation persistence failed: %v", e)
+				}
+			}
+			return false, nil, startTime
+		}
 	}
 
 	// JQS-Core Section 5.6: Check cancellation before processing
@@ -937,6 +960,9 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 // caller passes (false, 0) and executeJob's output is byte-identical to before.
 // Returns jobOK true only on a clean success.
 func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, startTime time.Time, emitLatency bool, queueWaitMs int64) (jobOK bool) {
+	if job.Type == JobTypeWorkerControl && !authenticatedWorkerControlStream(job, stream) {
+		return false
+	}
 	r.state.RecordJobExecuting()
 	defer r.state.RecordJobExecuteDone()
 
@@ -1020,7 +1046,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	}
 
 	// Execute handler (stream writer created at claim time)
-	stream.WriteStart("Job processing started")
+	if job.Type != JobTypeWorkerControl {
+		stream.WriteStart("Job processing started")
+	}
 
 	// Per-job execution deadline (aceteam#6000). When the payload carries a
 	// positive timeout budget, run the handler under a bounded context plus a
@@ -1460,10 +1488,8 @@ func (r *Runner) watchCooperativeCancellation(ctx context.Context, job *Job) (co
 	}
 }
 
-// finishWorkerControl ACKs before reporting acceptance. Scheduling is prepared
-// behind a gate before the accepted event, and the gate opens only after that
-// event has been published. Thus neither an ACK nor scheduling failure can
-// produce an accepted result or initiate a restart.
+// finishWorkerControl verifies the durable logical ACK before preparation and
+// requires a correlated completion permit before opening the local gate.
 func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream StreamWriter, handler JobHandler, result *JobResult, startTime, endTime time.Time) bool {
 	if result == nil {
 		r.source.Nack(ctx, job, errors.New("WORKER_CONTROL returned no result"))
@@ -1485,14 +1511,14 @@ func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream Strea
 		r.publishWorkerControlRefusal(ctx, stream, "ack_failed", "worker restart queue acknowledgment failed")
 		return false
 	}
-	var commit func()
+	var commit, cancel func()
 	if accepted {
 		if !ok {
 			r.publishWorkerControlRefusal(ctx, stream, "schedule_failed", "worker restart scheduler is unavailable")
 			return false
 		}
 		var err error
-		commit, _, err = control.PrepareAfterAck(job)
+		commit, cancel, err = control.PrepareAfterAck(job)
 		if err != nil {
 			r.log("error", "WORKER_CONTROL %s restart preparation failed: %v", job.ID, err)
 			if abortErr := control.Abort(job); abortErr != nil {
@@ -1503,21 +1529,31 @@ func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream Strea
 			return false
 		}
 	}
-	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(result.Output) }); err != nil {
-		r.log("error", "WORKER_CONTROL %s result publish failed with uncertain delivery: %v", job.ID, err)
+	cancelPrepared := func() {
 		if accepted {
-			// A failed publish call may still have delivered the accepted event.
-			// Once publication has been attempted, cancelling the exit would
-			// leave that caller with accepted=true but no restart. Keep the
-			// prepared restart; an unseen result remains unconfirmed upstream.
-			commit()
+			cancel()
+			// Delivery uncertainty is never execution permission. Retain the
+			// reservation and record irreversible local cancellation.
+			if abortErr := control.Abort(job); abortErr != nil {
+				r.log("error", "WORKER_CONTROL %s cancellation persistence failed: %v", job.ID, abortErr)
+			}
 		}
+	}
+	if ctx.Err() != nil {
+		cancelPrepared()
+		return false
+	}
+	if err := stream.WriteEnd(result.Output); err != nil {
+		r.log("error", "WORKER_CONTROL %s result publish failed with uncertain delivery: %v", job.ID, err)
+		cancelPrepared()
 		return false
 	}
 	if accepted {
-		// Acceptance is already visible to the caller. Release the prepared
-		// restart gate before optional usage accounting, which may block or
-		// panic and must not strand an accepted restart.
+		if ctx.Err() != nil || job.controlSession == nil || !job.controlSession.CanCommit() {
+			cancelPrepared()
+			return false
+		}
+		// No optional work may intervene between the permit and the gate.
 		commit()
 	}
 	func() {
@@ -1533,7 +1569,7 @@ func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream Strea
 
 func (r *Runner) publishWorkerControlRefusal(ctx context.Context, stream StreamWriter, code, message string) {
 	output := map[string]any{"action": "restart", "accepted": false, "restarting": false, "code": code, "message": message}
-	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(output) }); err != nil {
+	if err := stream.WriteEnd(output); err != nil {
 		r.log("error", "WORKER_CONTROL refusal publish failed: %v", err)
 	}
 }

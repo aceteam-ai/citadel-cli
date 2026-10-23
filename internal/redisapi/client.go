@@ -262,6 +262,10 @@ func contains404(s string) bool {
 
 // doRequest performs an HTTP request with authentication and JSON handling.
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, result any) error {
+	return c.doRequestUsing(ctx, c.httpClient, method, path, body, result)
+}
+
+func (c *Client) doRequestUsing(ctx context.Context, client *http.Client, method, path string, body any, result any) error {
 	var reqBody io.Reader
 	if body != nil {
 		jsonData, err := json.Marshal(body)
@@ -284,7 +288,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
