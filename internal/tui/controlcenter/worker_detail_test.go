@@ -153,10 +153,11 @@ func TestSharedWorkerModalClearsAnObservationAfterReadFailure(t *testing.T) {
 
 func TestSharedWorkerOwnerChangeShowsRestartHintWithoutOldDetail(t *testing.T) {
 	detail := sharedWorkerFixture()
-	cc := &ControlCenter{
-		inModal: true, sharedWorkerDetailView: tview.NewTextView(), jobsPanel: tview.NewTextView(),
-		data: StatusData{SharedWorker: true, WorkerOwnerChanged: true, WorkerDetail: &detail, WorkerDetailObservedAt: detail.ObservedAt},
-	}
+	cc := &ControlCenter{}
+	cc.inModal = true
+	cc.sharedWorkerDetailView = tview.NewTextView()
+	cc.jobsPanel = tview.NewTextView()
+	cc.data = StatusData{SharedWorker: true, WorkerOwnerChanged: true, WorkerDetail: &detail, WorkerDetailObservedAt: detail.ObservedAt}
 	cc.updateSharedWorkerDetailModal()
 	cc.updateJobsPanel()
 	for _, text := range []string{cc.getJobsText(), cc.sharedWorkerDetailView.GetText(false), cc.jobsPanel.GetText(false)} {
@@ -183,16 +184,19 @@ func TestSharedWorkerOwnerChangeShowsRestartHintWithoutOldDetail(t *testing.T) {
 
 func TestSharedWorkerJobsModalIgnoresStartStopKeys(t *testing.T) {
 	for _, running := range []bool{false, true} {
-		cc := &ControlCenter{
-			app: tview.NewApplication(),
-			data: StatusData{SharedWorker: true, WorkerRunning: running},
-			worker: WorkerCallbacks{
-				Start: func(func(string, string)) error { return nil },
-				Stop: func() error { return nil },
-				IsRunning: func() bool {
-					t.Fatal("shared jobs modal invoked worker controls")
-					return running
-				},
+		cc := &ControlCenter{}
+		cc.app = tview.NewApplication()
+		cc.data = StatusData{SharedWorker: true, WorkerRunning: running}
+		cc.worker = WorkerCallbacks{
+			Start: func(func(string, string)) error {
+				return nil
+			},
+			Stop: func() error {
+				return nil
+			},
+			IsRunning: func() bool {
+				t.Fatal("shared jobs modal invoked worker controls")
+				return running
 			},
 		}
 		cc.showJobsDetailModal()
