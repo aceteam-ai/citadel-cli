@@ -2,6 +2,7 @@ package declaredsession
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 )
@@ -127,9 +128,20 @@ func (s *holderServers) serveAttachment(ctx context.Context, cancel context.Canc
 	if err != nil {
 		return
 	}
-	viewer := &holderViewer{id: id, queue: make(chan wireFrame, viewerQueueSize), cancel: func() { cancel(); _ = f.conn.Close() }}
+	disconnected := make(chan string, 1)
+	viewer := &holderViewer{id: id, queue: make(chan wireFrame, viewerQueueSize), cancel: cancel}
+	viewer.disconnect = func(reason string) {
+		if reason != "viewer_detached" {
+			select {
+			case disconnected <- attachmentDisconnectReason(reason):
+			default:
+			}
+		}
+		cancel()
+	}
 	reply, err := s.ask(ctx, holderRequest{viewer: viewer, frame: attach})
 	if err != nil {
+		sendAttachmentDisconnect(ctx, f, viewerOperationReason(err))
 		return
 	}
 	defer func() {
@@ -144,7 +156,14 @@ func (s *holderServers) serveAttachment(ctx context.Context, cancel context.Canc
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		defer viewer.cancel()
+		defer func() {
+			viewer.cancel()
+			select {
+			case reason := <-disconnected:
+				sendAttachmentDisconnect(ctx, f, reason)
+			default:
+			}
+		}()
 		for _, chunk := range reply.replay {
 			out := frame("output")
 			out.Sequence, out.Data = chunk.sequence, chunk.data
@@ -166,11 +185,32 @@ func (s *holderServers) serveAttachment(ctx context.Context, cancel context.Canc
 	defer func() { viewer.cancel(); <-writerDone }()
 	for {
 		request, err := f.read(ctx, peerReadWait)
-		if err != nil || !validClientFrame(request, true) {
+		if err != nil {
 			return
 		}
-		if _, err := s.ask(ctx, holderRequest{op: "viewer", viewer: viewer, frame: request}); err != nil || request.Op == "detach" {
+		if !validClientFrame(request, true) {
+			viewer.shutdown("protocol_error")
 			return
 		}
+		if _, err := s.ask(ctx, holderRequest{op: "viewer", viewer: viewer, frame: request}); err != nil {
+			viewer.shutdown(viewerOperationReason(err))
+			return
+		}
+		if request.Op == "detach" {
+			return
+		}
+	}
+}
+
+func viewerOperationReason(err error) string {
+	switch {
+	case errors.Is(err, ErrRole):
+		return "controller_required"
+	case errors.Is(err, ErrBusy):
+		return "busy"
+	case errors.Is(err, ErrStopped):
+		return "holder_stopped"
+	default:
+		return "protocol_error"
 	}
 }

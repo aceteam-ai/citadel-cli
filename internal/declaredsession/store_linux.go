@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -202,20 +203,48 @@ func (s *SessionStore) acquire(ctx context.Context, name string) (*fileGuard, er
 	if err != nil {
 		return nil, err
 	}
-	err = unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	err = lockPrivateRecord(ctx, name, func() error { return unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB) })
 	if err != nil {
 		_ = file.Close()
-		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
-			return nil, ErrBusy
-		}
-		return nil, ErrUnavailable
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
 		_ = file.Close()
+		if name == "record.lock" {
+			return nil, ErrBusy
+		}
 		return nil, err
 	}
 	return &fileGuard{file: file, session: s, kind: name}, nil
+}
+
+func lockPrivateRecord(ctx context.Context, name string, tryLock func() error) error {
+	for {
+		if ctx.Err() != nil {
+			return ErrBusy
+		}
+		err := tryLock()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK) {
+			return ErrUnavailable
+		}
+		// Operator/owner guards still reject concurrent ownership immediately.
+		// Short record writers instead wait for normal fsync/rename contention,
+		// with the caller's finite deadline. Exhaustion is busy, not corruption.
+		if name != "record.lock" {
+			return ErrBusy
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ErrBusy
+		}
+	}
 }
 
 func (g *fileGuard) close() error {

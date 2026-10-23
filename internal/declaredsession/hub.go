@@ -40,12 +40,23 @@ func (r *replayRing) snapshot() []replayChunk {
 }
 
 type holderViewer struct {
-	id      string
-	ceiling bool // immutable requested/policy readonly ceiling
-	queue   chan wireFrame
-	cancel  context.CancelFunc
-	cols    uint16
-	rows    uint16
+	id         string
+	ceiling    bool
+	queue      chan wireFrame
+	cancel     context.CancelFunc
+	disconnect func(string)
+	cols       uint16
+	rows       uint16
+}
+
+// ceiling is immutable requested/policy readonly. disconnect, when present,
+// is a nonblocking connection-worker notification, never a socket write.
+func (v *holderViewer) shutdown(reason string) {
+	if v.disconnect != nil {
+		v.disconnect(reason)
+		return
+	}
+	v.cancel()
 }
 
 type holderRequest struct {
@@ -104,7 +115,7 @@ func (h *holder) removeViewer(id, reason string) {
 		return
 	}
 	delete(h.viewers, id)
-	viewer.cancel()
+	viewer.shutdown(reason)
 	if h.controller == id {
 		h.controller = ""
 		h.transfer("")
@@ -132,7 +143,7 @@ func (h *holder) transfer(id string) bool {
 		case viewer.queue <- role:
 		default:
 			delete(h.viewers, viewer.id)
-			viewer.cancel()
+			viewer.shutdown("slow_viewer")
 		}
 	}
 	terminal, epoch, generation := h.terminal, h.epoch, h.state.ChildGeneration

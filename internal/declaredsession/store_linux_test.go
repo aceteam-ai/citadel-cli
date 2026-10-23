@@ -21,7 +21,7 @@ func fixtureStore(t *testing.T) (*Store, *SessionStore) {
 	if os.Geteuid() == 0 {
 		t.Skip("supported storage fixture requires an unprivileged owner")
 	}
-	store, err := OpenStore(t.TempDir())
+	store, err := OpenStore(privateFixtureDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestStoreReadonlyAndUnsafeInputs(t *testing.T) {
 		}
 		return
 	}
-	dir := t.TempDir()
+	dir := privateFixtureDir(t)
 	store, err := OpenStore(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +223,7 @@ func TestEnvFileUnsafeMetadataFailsBeforeExecutableLookup(t *testing.T) {
 	for _, unsafe := range []string{"mode", "symlink", "hardlink"} {
 		t.Run(unsafe, func(t *testing.T) {
 			store, _ := fixtureStore(t)
-			path := filepath.Join(t.TempDir(), "fixture.env")
+			path := filepath.Join(privateFixtureDir(t), "fixture.env")
 			if err := os.WriteFile(path, []byte("TOKEN=synthetic-only\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -341,6 +341,38 @@ func TestStoreIndependentLockLifetimes(t *testing.T) {
 	}
 }
 
+func TestRecordLockRetriesOnlyContentionAndRemainsDeadlineBounded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	attempts := 0
+	if err := lockPrivateRecord(ctx, "record.lock", func() error {
+		attempts++
+		if attempts == 1 {
+			return unix.EWOULDBLOCK
+		}
+		return nil
+	}); err != nil || attempts != 2 {
+		t.Fatal("short record contention did not wait for the next writer", attempts, err)
+	}
+	for _, kind := range []string{"operation.lock", "host.lock"} {
+		attempts = 0
+		if err := lockPrivateRecord(ctx, kind, func() error {
+			attempts++
+			return unix.EWOULDBLOCK
+		}); !errors.Is(err, ErrBusy) || attempts != 1 {
+			t.Fatal("exclusive ownership contention stopped being immediate", kind, attempts, err)
+		}
+	}
+	ended, end := context.WithCancel(context.Background())
+	end()
+	if err := lockPrivateRecord(ended, "record.lock", func() error { return unix.EWOULDBLOCK }); !errors.Is(err, ErrBusy) {
+		t.Fatal("deadline contention was not classified busy", err)
+	}
+	if err := lockPrivateRecord(ctx, "record.lock", func() error { return unix.EIO }); !errors.Is(err, ErrUnavailable) {
+		t.Fatal("actual lock I/O failure was hidden as contention", err)
+	}
+}
+
 func TestStoreRefusesSymlinkAndFIFOWithoutRepair(t *testing.T) {
 	for _, kind := range []string{"symlink", "fifo", "wrong-mode"} {
 		t.Run(kind, func(t *testing.T) {
@@ -348,7 +380,7 @@ func TestStoreRefusesSymlinkAndFIFOWithoutRepair(t *testing.T) {
 			path := session.Paths().State
 			switch kind {
 			case "symlink":
-				if err := os.Symlink(filepath.Join(t.TempDir(), "unwritten"), path); err != nil {
+				if err := os.Symlink(filepath.Join(privateFixtureDir(t), "unwritten"), path); err != nil {
 					t.Fatal(err)
 				}
 			case "fifo":
@@ -428,11 +460,11 @@ func TestStorePublicationFailureAndUncertainDurability(t *testing.T) {
 
 func TestSpawnUsesClosedEnvironmentAndDirectArgv(t *testing.T) {
 	store, _ := fixtureStore(t)
-	binDir := t.TempDir()
+	binDir := privateFixtureDir(t)
 	if err := os.WriteFile(filepath.Join(binDir, "harness"), []byte("never executed"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	envFile := filepath.Join(t.TempDir(), "fixture.env")
+	envFile := filepath.Join(privateFixtureDir(t), "fixture.env")
 	if err := os.WriteFile(envFile, []byte("TOKEN=synthetic-secret\nCHOICE=from-file\n"), 0600); err != nil {
 		t.Fatal(err)
 	}

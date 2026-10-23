@@ -199,6 +199,28 @@ func TestStopNeedsActualEmptyScopeAndOldBirthGone(t *testing.T) {
 	}
 }
 
+func TestStopRefusesResidualMembersEvenWhenOldHolderBirthIsGone(t *testing.T) {
+	ops, backend, old := scopeFixture()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	residual := old
+	residual.PID++
+	residual.StartTicks++
+	ops.members = func(context.Context, string) ([]ProcessIdentity, error) {
+		cancel()
+		return []ProcessIdentity{residual}, nil
+	}
+	ops.process = func(int) (ProcessIdentity, string, error) {
+		return ProcessIdentity{}, "", ErrProcessGone
+	}
+	if err := stopExact(ctx, backend.identity, old, ops); !errors.Is(err, ErrUnknown) {
+		t.Fatal("old holder disappearance hid a remaining scope member", err)
+	}
+	if backend.stopCalls != 1 {
+		t.Fatal("exact invocation stop was not requested once")
+	}
+}
+
 func TestAlreadyGoneInvocationNeverFallsBackToNameStop(t *testing.T) {
 	ops, backend, self := scopeFixture()
 	backend.pinErr, backend.checkErr = ErrScopeGone, ErrScopeGone

@@ -24,15 +24,22 @@ type fakeRecords struct {
 	states []State
 	marker *StopMarker
 	fail   bool
+	busy   bool
 }
 
 func (f *fakeRecords) WriteState(state State) error {
+	if f.busy {
+		return ErrBusy
+	}
 	f.order = append(f.order, "state:"+state.Phase)
 	f.states = append(f.states, state)
 	return nil
 }
 
 func (f *fakeRecords) WriteStopMarker(marker StopMarker) error {
+	if f.busy {
+		return ErrBusy
+	}
 	f.order = append(f.order, "marker")
 	if f.fail {
 		return ErrUnavailable
@@ -48,14 +55,24 @@ func (f fakeConfiguration) LoadConfig() (Snapshot, error) { return f.snapshot, n
 type fakeHolderLogs struct {
 	console []byte
 	events  []Event
+	busy    bool
+	appends int
+	failure error
 }
 
 func (f *fakeHolderLogs) AppendConsole(data []byte) error {
+	if f.busy {
+		return ErrBusy
+	}
+	f.appends++
 	f.console = append(f.console, data...)
-	return nil
+	return f.failure
 }
 
 func (f *fakeHolderLogs) AppendEvent(event Event) error {
+	if f.busy {
+		return ErrBusy
+	}
 	f.events = append(f.events, event)
 	return nil
 }
@@ -207,16 +224,208 @@ func TestSlowViewerIsDisconnectedWithoutClosingChildOrOtherViewer(t *testing.T) 
 }
 
 func TestReadonlyCeilingIsEnforcedAtHolderNotClient(t *testing.T) {
-	h, _ := holderFixture()
-	viewer := testViewer("reader", true)
-	h.viewers[viewer.id] = viewer
-	h.controller = viewer.id // even corrupted role bookkeeping cannot bypass ceiling
 	for _, op := range []string{"input", "resize", "take_control"} {
-		f := frame(op)
-		f.Data, f.Cols, f.Rows = []byte("secret"), 90, 30
-		if reply := h.viewerOperation(holderRequest{viewer: viewer, frame: f}); !errors.Is(reply.err, ErrRole) {
-			t.Fatalf("readonly %s granted", op)
-		}
+		t.Run(op, func(t *testing.T) {
+			h, _ := holderFixture()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			h.ctx = ctx
+			h.child = newFakeChild()
+			// An active fake terminal is essential: a nil terminal would make
+			// this assertion pass even after removing the readonly ceiling.
+			h.terminal = &terminalIO{queue: make(chan inputOperation, viewerQueueSize), done: make(chan struct{}), generation: h.state.ChildGeneration}
+			viewer := testViewer("reader", true)
+			h.viewers[viewer.id] = viewer
+			h.controller = viewer.id // corrupted bookkeeping is not authority
+			f := frame(op)
+			f.Data, f.Cols, f.Rows = []byte("secret"), 90, 30
+			if reply := h.viewerOperation(holderRequest{viewer: viewer, frame: f}); !errors.Is(reply.err, ErrRole) {
+				t.Fatalf("readonly %s granted", op)
+			}
+			if len(h.terminal.queue) != 0 || h.controlPending {
+				t.Fatal("readonly operation reached the active terminal")
+			}
+			if op != "take_control" {
+				viewer.ceiling = false
+				if reply := h.viewerOperation(holderRequest{viewer: viewer, frame: f}); reply.err != nil || len(h.terminal.queue) != 1 {
+					t.Fatal("positive control did not reach the same active terminal")
+				}
+			}
+		})
+	}
+}
+
+func TestReadonlyCeilingRejectsOtherwiseValidControlAcceptance(t *testing.T) {
+	h, _ := holderFixture()
+	h.terminal = &terminalIO{queue: make(chan inputOperation, viewerQueueSize), done: make(chan struct{}), generation: h.state.ChildGeneration}
+	viewer := testViewer("reader", true)
+	viewer.cols, viewer.rows = 90, 30
+	h.viewers[viewer.id] = viewer
+	h.controlPending = true
+	ready := controlReady{viewer: viewer.id, epoch: h.epoch, generation: h.state.ChildGeneration, ok: true}
+	h.acceptControl(ready)
+	if h.controller != "" || len(h.terminal.queue) != 0 || len(viewer.queue) != 0 {
+		t.Fatal("readonly ceiling bypassed by an otherwise valid control barrier")
+	}
+	viewer.ceiling = false
+	h.controlPending = true
+	h.acceptControl(ready)
+	if h.controller != viewer.id || len(h.terminal.queue) != 1 {
+		t.Fatal("positive control did not accept the identical non-readonly viewer")
+	}
+}
+
+func TestConsoleChunksBatchAndBusyPreservesBoundedPendingBytes(t *testing.T) {
+	h, _ := holderFixture()
+	logs := h.logs.(*fakeHolderLogs)
+	if !h.output(outputPart{generation: 1, data: []byte("one")}) || !h.output(outputPart{generation: 1, data: []byte("two")}) || logs.appends != 0 {
+		t.Fatal("small console chunks were not batched")
+	}
+	logs.busy = true
+	if h.flushPending() || h.storageFailed || string(h.consolePending) != "onetwo" {
+		t.Fatal("record contention lost console or became corruption")
+	}
+	logs.busy = false
+	if !h.flushPending() || logs.appends != 1 || string(logs.console) != "onetwo" || len(h.consolePending) != 0 {
+		t.Fatal("record retry did not flush the exact batch once")
+	}
+	logs.busy = true
+	full := make([]byte, maxConsoleBatchBytes)
+	if !h.output(outputPart{generation: 1, data: full}) || len(h.consolePending) != maxConsoleBatchBytes {
+		t.Fatal("full console batch was not retained")
+	}
+	if h.output(outputPart{generation: 1, data: []byte("next")}) || len(h.consolePending) != maxConsoleBatchBytes || h.storageFailed {
+		t.Fatal("busy full console buffer failed to apply bounded backpressure")
+	}
+}
+
+func TestBusyRecordsDeferTerminalPublicationAndStopReply(t *testing.T) {
+	h, records := holderFixture()
+	logs := h.logs.(*fakeHolderLogs)
+	child := newFakeChild()
+	h.child = child
+	h.readEOF, h.stopRequested = true, true
+	reply := make(chan holderReply, 1)
+	h.stopReplies = []holderRequest{{reply: reply}}
+	h.output(outputPart{generation: 1, data: []byte("tail")})
+	logs.busy = true
+	if h.finishCleanup(cleanupResult{exit: Exit{Code: 0}}) || h.storageFailed || h.cleanupPending == nil || len(records.states) != 0 {
+		t.Fatal("busy console claimed durable terminal state or corruption")
+	}
+	select {
+	case <-reply:
+		t.Fatal("stop acknowledged before console flush")
+	default:
+	}
+	logs.busy = false
+	result := *h.cleanupPending
+	h.cleanupPending = nil
+	if !h.finishCleanup(result) || string(logs.console) != "tail" || logs.appends != 1 {
+		t.Fatal("cleanup retry did not publish the retained tail once")
+	}
+	if got := <-reply; got.err != nil || records.states[len(records.states)-1].Phase != "stopped" {
+		t.Fatal("successful stop missing after all records flushed")
+	}
+	if len(child.calls) != 0 {
+		t.Fatal("record contention itself signalled or killed the child")
+	}
+}
+
+func TestBusyCleanMarkerCannotPublishStoppedState(t *testing.T) {
+	h, records := holderFixture()
+	h.readEOF, records.busy = true, true
+	if h.finishCleanup(cleanupResult{exit: Exit{Code: 0}}) || h.storageFailed || !h.exitAfterFlush || h.markerPending == nil || len(records.states) != 0 {
+		t.Fatal("busy marker became corruption or a durable stopped state")
+	}
+	records.busy = false
+	if !h.flushPending() || records.marker == nil || !reflect.DeepEqual(records.order, []string{"marker", "state:stopped_clean"}) {
+		t.Fatal("busy retry did not preserve marker-before-state ordering")
+	}
+}
+
+func TestBusyStateRetriesWithoutKillingHarness(t *testing.T) {
+	h, records := holderFixture()
+	child := newFakeChild()
+	h.child = child
+	records.busy = true
+	if !h.writeState() || h.storageFailed || !h.statePending || len(records.states) != 0 || len(child.calls) != 0 {
+		t.Fatal("busy state write was treated as corruption or durable publication")
+	}
+	records.busy = false
+	if !h.flushPending() || h.statePending || len(records.states) != 1 || len(child.calls) != 0 {
+		t.Fatal("pending state was not retried without touching the harness")
+	}
+}
+
+func TestUncertainConsoleIOIsNotAutomaticallyReplayed(t *testing.T) {
+	h, _ := holderFixture()
+	logs := h.logs.(*fakeHolderLogs)
+	logs.failure = ErrUnavailable // fake append is visible before sync failure
+	h.output(outputPart{generation: 1, data: []byte("uncertain")})
+	if !h.flushPending() || !h.storageFailed || len(h.consolePending) != 0 || logs.appends != 1 {
+		t.Fatal("real console I/O failure was hidden as retryable contention")
+	}
+	h.flushPending()
+	if logs.appends != 1 || string(logs.console) != "uncertain" {
+		t.Fatal("uncertain append was retried and duplicated")
+	}
+}
+
+func TestDueAutomaticSpawnWaitsForPriorGenerationPublication(t *testing.T) {
+	h, records := holderFixture()
+	logs := h.logs.(*fakeHolderLogs)
+	h.readEOF, records.busy, logs.busy = true, true, true
+	if h.finishCleanup(cleanupResult{exit: Exit{Code: 1}}) || h.nextSpawn.IsZero() || !h.statePending || len(h.eventsPending) == 0 {
+		t.Fatal("fixture did not leave prior-generation lifecycle records pending")
+	}
+	// Model the backoff elapsing inside slow record calls without sleeping.
+	h.nextSpawn = time.Unix(1, 0)
+	now := time.Unix(2, 0)
+	spawns := 0
+	h.spawn = func(Declaration, []string, []string, uint64) (holderChild, error) {
+		spawns++
+		return nil, ErrUnavailable // no I/O worker, process or terminal is started
+	}
+	h.startDueChild(now)
+	if spawns != 0 || h.quarantined || h.nextSpawn.IsZero() {
+		t.Fatal("due restart overtook pending records or quarantined benign contention")
+	}
+	records.busy, logs.busy = false, false
+	if !h.flushPending() {
+		t.Fatal("prior-generation records did not flush")
+	}
+	h.startDueChild(now)
+	if spawns != 1 || len(logs.events) != 2 || logs.events[0].Kind != "exit" || logs.events[1].Kind != "restart_scheduled" {
+		t.Fatal("restart did not wait for ordered prior-generation publications")
+	}
+}
+
+func TestDueAutomaticSpawnWaitsForEveryPendingBoundary(t *testing.T) {
+	for _, pending := range []struct {
+		name string
+		set  func(*holder)
+	}{
+		{name: "console", set: func(h *holder) { h.consolePending = []byte("tail") }},
+		{name: "events", set: func(h *holder) { h.eventsPending = []Event{{Kind: "exit"}} }},
+		{name: "marker", set: func(h *holder) { h.markerPending = &StopMarker{} }},
+		{name: "state", set: func(h *holder) { h.statePending = true }},
+		{name: "cleanup", set: func(h *holder) { h.cleanupPending = &cleanupResult{} }},
+		{name: "output", set: func(h *holder) { h.outputPending = &outputPart{} }},
+	} {
+		t.Run(pending.name, func(t *testing.T) {
+			h, _ := holderFixture()
+			h.nextSpawn = time.Unix(1, 0)
+			pending.set(h)
+			spawns := 0
+			h.spawn = func(Declaration, []string, []string, uint64) (holderChild, error) {
+				spawns++
+				return nil, ErrUnavailable
+			}
+			h.startDueChild(time.Unix(2, 0))
+			if spawns != 0 || h.quarantined || h.nextSpawn.IsZero() {
+				t.Fatal("pending publication did not preserve a nonterminal restart wait")
+			}
+		})
 	}
 }
 
@@ -506,7 +715,7 @@ func TestExplicitRestartPreparationDoesNotRequireOriginalExecutable(t *testing.T
 	if runtime.GOOS != "linux" {
 		t.Skip("executable-mode fixture is Linux-only; never executes the file")
 	}
-	dir := t.TempDir()
+	dir := privateFixtureDir(t)
 	resume := filepath.Join(dir, "resume")
 	if os.WriteFile(resume, []byte("fixture, never executed"), 0700) != nil {
 		t.Fatal("fixture file unavailable")

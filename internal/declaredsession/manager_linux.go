@@ -21,6 +21,7 @@ func nativeManagerOps() managerOps {
 		process:      procscope.ObserveProcess,
 		stop:         procscope.StopExact,
 		dial:         func(ctx context.Context, session *SessionStore) (managerPeer, error) { return DialHolder(ctx, session) },
+		attachDial:   DialHolder,
 		socket:       managerSocketIdentity,
 		removeSocket: removeManagerSocket,
 		launch:       launchManagedHolder,
@@ -68,12 +69,12 @@ func launchManagedHolder(ctx context.Context, executable, nodeDir, name, incarna
 	if err != nil {
 		return 0, ErrManager
 	}
-	systemdRun, err := exec.LookPath("systemd-run")
-	if err != nil {
-		return 0, ErrManager
-	}
-	systemdRun, err = filepath.Abs(systemdRun)
-	if err != nil {
+	// This is an isolation boundary, not a PATH-based command lookup. The
+	// fixed system executable must be root-owned, executable and not writable
+	// by group/other. Caller-controlled PATH entries can never provide it.
+	const systemdRun = "/usr/bin/systemd-run"
+	var systemdStat unix.Stat_t
+	if unix.Stat(systemdRun, &systemdStat) != nil || !trustedSystemdRun(systemdStat.Mode, systemdStat.Uid) {
 		return 0, ErrManager
 	}
 	args := []string{"session-host", name, "--node-config-dir=" + nodeDir, "--expected-unit=" + unit, "--launch-id=" + incarnation, "--origin-cgroup=" + origin}
@@ -109,4 +110,8 @@ func launchManagedHolder(ctx context.Context, executable, nodeDir, name, incarna
 	// that durable process actually exits; client cancellation never kills it.
 	go func() { _ = cmd.Wait() }()
 	return pid, nil
+}
+
+func trustedSystemdRun(mode, uid uint32) bool {
+	return uid == 0 && mode&unix.S_IFMT == unix.S_IFREG && mode&0o022 == 0 && mode&0o111 != 0
 }

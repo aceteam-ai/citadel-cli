@@ -30,13 +30,24 @@ type declaredLifecycle interface {
 
 type declaredManagerFactory func(string) (declaredLifecycle, func() error, error)
 
-func selectedDeclaredNodeDir(explicit string) string {
+func refuseDeclaredNodeDirOverride(cmd *cobra.Command) error {
+	flag := cmd.Flag("node-dir")
+	if resolveNodeDirOverride() != "" || (flag != nil && flag.Changed) {
+		return errors.New("declared sessions do not support node-dir or CITADEL_NODE_DIR; unset those overrides and select node-config-dir explicitly")
+	}
+	return nil
+}
+
+func selectedDeclaredNodeDir(cmd *cobra.Command, explicit string) (string, error) {
+	if err := refuseDeclaredNodeDirOverride(cmd); err != nil {
+		return "", err
+	}
 	if explicit != "" {
-		return explicit
+		return explicit, nil
 	}
 	// Resolve the real node directory once, at the CLI boundary. Leaf packages
 	// and source fixtures never consult this global selector.
-	return network.GetNodeConfigDir()
+	return network.GetNodeConfigDir(), nil
 }
 
 func openDeclaredManager(nodeDir string) (*declaredsession.Store, *declaredsession.Manager, error) {
@@ -89,7 +100,11 @@ func newDeclaredSessionsCommand(open declaredManagerFactory) *cobra.Command {
 				if len(names) != 0 && declaredsession.ValidateName(names[0]) != nil {
 					return declaredsession.ErrConfig
 				}
-				manager, closeStore, err := open(selectedDeclaredNodeDir(nodeDir))
+				selected, err := selectedDeclaredNodeDir(cmd, nodeDir)
+				if err != nil {
+					return err
+				}
+				manager, closeStore, err := open(selected)
 				if err != nil {
 					return err
 				}
@@ -127,7 +142,11 @@ func newDeclaredSessionsCommand(open declaredManagerFactory) *cobra.Command {
 			if declaredsession.ValidateName(names[0]) != nil || maxBytes < 1 || maxBytes > 4<<20 {
 				return errors.New("invalid session name or log-tail bound")
 			}
-			store, err := declaredsession.OpenStore(selectedDeclaredNodeDir(nodeDir))
+			selected, err := selectedDeclaredNodeDir(cmd, nodeDir)
+			if err != nil {
+				return err
+			}
+			store, err := declaredsession.OpenStore(selected)
 			if err != nil {
 				return err
 			}
@@ -154,6 +173,10 @@ func newDeclaredSessionsCommand(open declaredManagerFactory) *cobra.Command {
 }
 
 func newDeclaredHostCommand() *cobra.Command {
+	return newDeclaredHostCommandWith(declaredsession.RunHolder)
+}
+
+func newDeclaredHostCommandWith(run func(context.Context, declaredsession.RunHolderOptions) error) *cobra.Command {
 	var opts declaredsession.RunHolderOptions
 	command := &cobra.Command{
 		Use:              "session-host <name>",
@@ -165,14 +188,18 @@ func newDeclaredHostCommand() *cobra.Command {
 			if declaredsession.ValidateName(names[0]) != nil {
 				return declaredsession.ErrConfig
 			}
+			selected, err := selectedDeclaredNodeDir(cmd, opts.NodeDir)
+			if err != nil {
+				return err
+			}
 			opts.Name = names[0]
-			opts.NodeDir = selectedDeclaredNodeDir(opts.NodeDir)
+			opts.NodeDir = selected
 			opts.BinaryVersion = Version
 			// SIGTERM is a holder lifecycle event, unlike viewer EOF. The
 			// holder owns cleanup and durable publication before returning.
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, declaredTerminateSignal())
 			defer cancel()
-			return declaredsession.RunHolder(ctx, opts)
+			return run(ctx, opts)
 		},
 	}
 	command.Flags().StringVar(&opts.NodeDir, "node-config-dir", "", "Selected node configuration directory")
@@ -200,6 +227,9 @@ func validateDeclaredAttach(cmd *cobra.Command, args []string) error {
 	}
 	if declaredsession.ValidateName(args[0]) != nil {
 		return declaredsession.ErrConfig
+	}
+	if err := refuseDeclaredNodeDirOverride(cmd); err != nil {
+		return err
 	}
 	if attachShell {
 		return errors.New("--shell cannot be combined with a declared session name")

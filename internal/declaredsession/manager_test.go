@@ -52,11 +52,39 @@ func TestManagerRequiresSocketRecordAndLiveScopeIdentityTogether(t *testing.T) {
 		func(s *State, h *Hello, o *procscope.Observation) {
 			h.ProtocolVersion++
 		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			s.ProtocolVersion++
+		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			h.BinaryVersion = "different-holder"
+		},
+		func(s *State, h *Hello, o *procscope.Observation) {
+			s.BinaryVersion = "different-holder"
+		},
 	} {
 		live, peer, observed := managerRecordFixture()
 		mutate(&live, &peer, &observed)
 		if sameHolderRecord(stored, peer, live, observed) {
 			t.Fatal("PID file, stale connection or replaced scope supplied authority")
+		}
+	}
+}
+
+func TestAttachmentCompatibilityUsesProtocolNotCLIBinaryVersion(t *testing.T) {
+	stored, hello, observation := managerRecordFixture()
+	declaration := Declaration{Name: stored.Name, Revision: stored.DeclarationRevision}
+	// A CLI update does not change the authenticated old holder's identity.
+	// The holder's release is informational while its protocol remains valid.
+	for _, holderVersion := range []string{"old-release", "current-release", "new-release"} {
+		live := stored
+		live.BinaryVersion, hello.BinaryVersion = holderVersion, holderVersion
+		saved := live
+		if !attachmentMatches(declaration, saved, hello, live, observation) {
+			t.Fatal("compatible old or new holder release was refused")
+		}
+		live.ProtocolVersion++
+		if attachmentMatches(declaration, saved, hello, live, observation) {
+			t.Fatal("an incompatible holder protocol was accepted")
 		}
 	}
 }

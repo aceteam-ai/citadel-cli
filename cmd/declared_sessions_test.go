@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -49,7 +50,7 @@ func (f *declaredFakeLifecycle) Restart(_ context.Context, name string) (declare
 func TestDeclaredLifecycleLocalOnly(t *testing.T) {
 	for _, action := range []string{"list", "status", "start", "stop", "restart"} {
 		t.Run(action, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := declaredCommandTempDir(t)
 			fake := &declaredFakeLifecycle{}
 			opened, closed, rootRuns := 0, 0, 0
 			root := &cobra.Command{Use: "fixture", PersistentPreRun: func(*cobra.Command, []string) { rootRuns++ }}
@@ -119,7 +120,7 @@ func TestDeclaredFailureClassificationAndClose(t *testing.T) {
 	var output bytes.Buffer
 	command.SetOut(&output)
 	command.SetErr(new(bytes.Buffer))
-	command.SetArgs([]string{"--node-config-dir", t.TempDir(), "status", "fixture"})
+	command.SetArgs([]string{"--node-config-dir", declaredCommandTempDir(t), "status", "fixture"})
 	err := command.Execute()
 	if !errors.Is(err, want) || closed != 1 || !strings.Contains(output.String(), `"classification":"unconfirmed"`) {
 		t.Fatalf("err=%v closed=%d output=%q", err, closed, output.String())
@@ -133,7 +134,7 @@ func TestDeclaredBadNameHasNoStorageEffect(t *testing.T) {
 		return nil, nil, errors.New("unexpected storage access")
 	})
 	command.SetErr(new(bytes.Buffer))
-	command.SetArgs([]string{"--node-config-dir", t.TempDir(), "start", "../escape"})
+	command.SetArgs([]string{"--node-config-dir", declaredCommandTempDir(t), "start", "../escape"})
 	if err := command.Execute(); err == nil || opened {
 		t.Fatalf("err=%v opened=%v", err, opened)
 	}
@@ -175,4 +176,91 @@ func TestDeclaredAttachArguments(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeclaredNodeOverrideRefusesBeforeLifecycleOrLogStorage(t *testing.T) {
+	original := nodeDirFlag
+	t.Cleanup(func() { nodeDirFlag = original })
+	for _, test := range []struct {
+		name string
+		flag string
+		env  string
+	}{
+		{name: "environment", env: "/not-this-node"},
+		{name: "flag", flag: "/not-this-node"},
+		{name: "explicit empty flag", flag: ""},
+	} {
+		for _, action := range []string{"list", "status", "start", "stop", "restart", "logs"} {
+			t.Run(test.name+"/"+action, func(t *testing.T) {
+				nodeDirFlag = ""
+				t.Setenv("CITADEL_NODE_DIR", test.env)
+				opened := false
+				root := &cobra.Command{Use: "fixture"}
+				root.PersistentFlags().StringVar(&nodeDirFlag, "node-dir", "", "")
+				root.AddCommand(newDeclaredSessionsCommand(func(string) (declaredLifecycle, func() error, error) {
+					opened = true
+					return nil, nil, errors.New("unexpected lifecycle storage")
+				}))
+				root.SetErr(new(bytes.Buffer))
+				args := []string{"sessions", "--node-config-dir", "/never-open-this", action}
+				if action != "list" {
+					args = append(args, "fixture")
+				}
+				if test.name != "environment" {
+					args = append(args, "--node-dir="+test.flag)
+				}
+				root.SetArgs(args)
+				err := root.Execute()
+				if err == nil || !strings.Contains(err.Error(), "CITADEL_NODE_DIR") || opened {
+					t.Fatalf("override reached storage: err=%v opened=%v", err, opened)
+				}
+			})
+		}
+	}
+}
+
+func TestDeclaredHostAndNamedAttachRefuseNodeOverridesBeforeNativeWork(t *testing.T) {
+	original := nodeDirFlag
+	t.Cleanup(func() { nodeDirFlag = original })
+	nodeDirFlag = ""
+	t.Setenv("CITADEL_NODE_DIR", "/not-this-node")
+	called := false
+	host := newDeclaredHostCommandWith(func(context.Context, declaredsession.RunHolderOptions) error {
+		called = true
+		return errors.New("unexpected fake holder launch")
+	})
+	if err := host.Flags().Set("node-config-dir", declaredCommandTempDir(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.RunE(host, []string{"fixture"}); err == nil || !strings.Contains(err.Error(), "CITADEL_NODE_DIR") || called {
+		t.Fatalf("host failed to reject override before native launch: err=%v called=%v", err, called)
+	}
+	command := declaredAttachArgsFixture()
+	if err := validateDeclaredAttach(command, []string{"fixture"}); err == nil || !strings.Contains(err.Error(), "CITADEL_NODE_DIR") {
+		t.Fatalf("named attach failed to reject override: %v", err)
+	}
+	if err := validateDeclaredAttach(command, nil); err != nil {
+		t.Fatalf("legacy no-name attach behavior changed: %v", err)
+	}
+}
+
+func TestDeclaredExplicitNodeConfigDirectorySelectedWithoutRealNodeLookup(t *testing.T) {
+	original := nodeDirFlag
+	t.Cleanup(func() { nodeDirFlag = original })
+	nodeDirFlag = ""
+	t.Setenv("CITADEL_NODE_DIR", "")
+	dir := declaredCommandTempDir(t)
+	got, err := selectedDeclaredNodeDir(&cobra.Command{}, dir)
+	if err != nil || got != dir {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+}
+
+func declaredCommandTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

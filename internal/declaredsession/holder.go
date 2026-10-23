@@ -2,6 +2,7 @@ package declaredsession
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -47,6 +48,12 @@ type cleanupResult struct {
 	noChild bool
 }
 
+const (
+	maxConsoleBatchBytes = 256 << 10
+	maxPendingEvents     = 128
+	consoleFlushInterval = 50 * time.Millisecond
+)
+
 type holder struct {
 	ctx            context.Context
 	declaration    Declaration
@@ -78,6 +85,13 @@ type holder struct {
 	stopRequested  bool
 	stopReason     string
 	storageFailed  bool
+	consolePending []byte
+	eventsPending  []Event
+	markerPending  *StopMarker
+	statePending   bool
+	outputPending  *outputPart
+	cleanupPending *cleanupResult
+	exitAfterFlush bool
 	stopReplies    []holderRequest
 	spawnAt        time.Time
 	nextSpawn      time.Time
@@ -237,17 +251,107 @@ func essentialEnvironment(lookup func(string) (string, bool)) map[string]string 
 
 func (h *holder) writeState() bool {
 	h.state.UpdatedAt = time.Now().UTC()
-	if h.session.WriteState(h.state) != nil {
+	h.statePending = true
+	if len(h.consolePending) != 0 || len(h.eventsPending) != 0 || h.markerPending != nil {
+		return true // Accepted in memory, not a durable terminal acknowledgment.
+	}
+	err := h.session.WriteState(h.state)
+	if errors.Is(err, ErrBusy) {
+		return true // Retry without killing the harness or claiming corruption.
+	}
+	if err != nil {
 		h.storageFailed = true
 		return false
 	}
+	h.statePending = false
 	return true
 }
 
 func (h *holder) event(kind, reason, viewer, role string) {
-	if h.logs.AppendEvent(Event{Kind: kind, Reason: reason, At: time.Now().UTC(), Incarnation: h.state.Incarnation, ChildGeneration: h.state.ChildGeneration, ViewerID: viewer, Role: role}) != nil {
+	event := Event{Kind: kind, Reason: reason, At: time.Now().UTC(), Incarnation: h.state.Incarnation, ChildGeneration: h.state.ChildGeneration, ViewerID: viewer, Role: role}
+	// Intake pauses at half this cap, leaving room for one actor transition's
+	// bounded viewer-detach fanout and cleanup events. Never grow without bound.
+	if len(h.eventsPending) >= maxPendingEvents {
+		h.quarantined = true
+		h.controller, h.controlPending = "", true
+		h.epoch++
+		if h.terminal != nil {
+			h.terminal.epoch.Store(h.epoch)
+		}
+		h.state.Phase = "cleanup_unconfirmed"
+		h.statePending = true
+		return
+	}
+	if len(h.consolePending) != 0 || len(h.eventsPending) != 0 {
+		h.eventsPending = append(h.eventsPending, event)
+		return
+	}
+	err := h.logs.AppendEvent(event)
+	if errors.Is(err, ErrBusy) {
+		h.eventsPending = append(h.eventsPending, event)
+	} else if err != nil {
 		h.storageFailed = true
 	}
+}
+
+// flushPending is an actor operation. Busy means no writer acquired the lock,
+// so retain the exact bytes/events for a later tick. An actual I/O failure may
+// be a partial append and must never be automatically replayed as durable data.
+func (h *holder) flushPending() bool {
+	if len(h.consolePending) != 0 {
+		err := h.logs.AppendConsole(h.consolePending)
+		if errors.Is(err, ErrBusy) {
+			return false
+		}
+		h.consolePending = nil
+		if err != nil {
+			h.storageFailed = true
+		}
+	}
+	for len(h.eventsPending) != 0 {
+		err := h.logs.AppendEvent(h.eventsPending[0])
+		if errors.Is(err, ErrBusy) {
+			return false
+		}
+		h.eventsPending[0] = Event{}
+		h.eventsPending = h.eventsPending[1:]
+		if err != nil {
+			h.storageFailed = true
+		}
+	}
+	if h.markerPending != nil {
+		err := h.session.WriteStopMarker(*h.markerPending)
+		if errors.Is(err, ErrBusy) {
+			return false
+		}
+		h.markerPending = nil
+		if err != nil {
+			h.storageFailed = true
+		}
+	}
+	if h.statePending {
+		if h.storageFailed && h.exitAfterFlush {
+			h.state.Phase = "error"
+		}
+		err := h.session.WriteState(h.state)
+		if errors.Is(err, ErrBusy) {
+			return false
+		}
+		h.statePending = false
+		if err != nil {
+			h.storageFailed = true
+		}
+	}
+	return true
+}
+
+func (h *holder) finishAfterFlush() bool {
+	h.exitAfterFlush = true
+	if !h.flushPending() {
+		return false
+	}
+	h.finishStopReplies(h.finalError())
+	return true
 }
 
 func (h *holder) hello() Hello {
@@ -305,7 +409,11 @@ func (h *holder) startChild() error {
 		h.beginCleanup(true)
 		return ErrUnavailable
 	}
-	if h.logs.AppendEvent(Event{Kind: "spawn", At: time.Now().UTC(), Incarnation: h.state.Incarnation, ChildGeneration: h.state.ChildGeneration, ResolvedExecutable: executable, EnvironmentHash: h.state.EnvironmentHash}) != nil {
+	event := Event{Kind: "spawn", At: time.Now().UTC(), Incarnation: h.state.Incarnation, ChildGeneration: h.state.ChildGeneration, ResolvedExecutable: executable, EnvironmentHash: h.state.EnvironmentHash}
+	err = h.logs.AppendEvent(event)
+	if errors.Is(err, ErrBusy) {
+		h.eventsPending = append(h.eventsPending, event)
+	} else if err != nil {
 		h.storageFailed = true
 		h.beginCleanup(true)
 		return ErrUnavailable
@@ -316,16 +424,26 @@ func (h *holder) startChild() error {
 func (h *holder) run(caller context.Context) error {
 	callerDone := caller.Done()
 	if h.startChild() != nil && h.child == nil {
+		h.storageFailed = true
 		h.state.Phase = "error"
 		h.writeState()
-		return ErrUnavailable
+		if h.finishAfterFlush() {
+			return ErrUnavailable
+		}
 	}
-	tick := time.NewTicker(50 * time.Millisecond)
+	tick := time.NewTicker(consoleFlushInterval)
 	defer tick.Stop()
 	for {
 		var exited <-chan struct{}
-		if h.child != nil && !h.cleaning && !h.quarantined {
+		if h.child != nil && !h.cleaning && !h.quarantined && !h.exitAfterFlush {
 			exited = h.child.Exited()
+		}
+		parts, requests := h.parts, h.requests
+		if h.outputPending != nil || len(h.consolePending) >= maxConsoleBatchBytes || len(h.eventsPending) >= maxPendingEvents/2 || h.exitAfterFlush {
+			parts = nil // Bounded backpressure, never discard captured PTY output.
+		}
+		if len(h.eventsPending) >= maxPendingEvents/2 || h.exitAfterFlush {
+			requests = nil
 		}
 		select {
 		case <-callerDone:
@@ -334,9 +452,11 @@ func (h *holder) run(caller context.Context) error {
 			h.beginCleanup(true)
 		case <-exited:
 			h.beginCleanup(false)
-		case part := <-h.parts:
-			h.output(part)
-		case request := <-h.requests:
+		case part := <-parts:
+			if !h.output(part) {
+				h.outputPending = &part
+			}
+		case request := <-requests:
 			h.request(request)
 		case control := <-h.controls:
 			h.acceptControl(control)
@@ -345,30 +465,67 @@ func (h *holder) run(caller context.Context) error {
 				return h.finalError()
 			}
 		case <-tick.C:
+			if h.storageFailed && !h.cleaning && !h.quarantined && !h.exitAfterFlush {
+				h.beginCleanup(true)
+			}
+			if !h.flushPending() {
+				continue
+			}
+			if h.exitAfterFlush {
+				h.finishStopReplies(h.finalError())
+				return h.finalError()
+			}
+			if h.outputPending != nil {
+				part := *h.outputPending
+				h.outputPending = nil
+				if !h.output(part) {
+					h.outputPending = &part
+				}
+			}
+			if h.cleanupPending != nil {
+				result := *h.cleanupPending
+				h.cleanupPending = nil
+				if h.finishCleanup(result) {
+					return h.finalError()
+				}
+			}
 			if h.storageFailed && !h.cleaning && !h.quarantined {
 				h.beginCleanup(true)
 			}
-			if !h.nextSpawn.IsZero() && !time.Now().Before(h.nextSpawn) {
-				h.nextSpawn = time.Time{}
-				if h.startChild() != nil && h.child == nil {
-					h.quarantined = true
-					h.state.Phase = "error"
-					h.writeState()
-				}
-			}
+			h.startDueChild(time.Now())
 		}
 	}
 }
 
-func (h *holder) output(part outputPart) {
-	if part.generation != h.state.ChildGeneration {
+func (h *holder) startDueChild(now time.Time) {
+	// Cleanup earlier in this same tick can queue records and consume the
+	// backoff interval while waiting for their locks. A due clock alone never
+	// authorizes the next generation to overtake those lifecycle publications.
+	if h.nextSpawn.IsZero() || now.Before(h.nextSpawn) || h.child != nil || h.cleaning || h.quarantined || h.stopRequested || h.storageFailed || h.exitAfterFlush ||
+		len(h.consolePending) != 0 || len(h.eventsPending) != 0 || h.markerPending != nil || h.statePending || h.cleanupPending != nil || h.outputPending != nil {
 		return
 	}
+	h.nextSpawn = time.Time{}
+	if h.startChild() != nil && h.child == nil {
+		h.quarantined = true
+		h.state.Phase = "cleanup_unconfirmed"
+		h.writeState()
+	}
+}
+
+func (h *holder) output(part outputPart) bool {
+	if part.generation != h.state.ChildGeneration {
+		return true
+	}
 	if len(part.data) != 0 {
-		if h.logs.AppendConsole(part.data) != nil {
-			h.storageFailed = true
+		if len(h.consolePending)+len(part.data) > maxConsoleBatchBytes && !h.flushPending() {
+			return false
 		}
+		h.consolePending = append(h.consolePending, part.data...)
 		h.publishOutput(part.data)
+		if len(h.consolePending) >= maxConsoleBatchBytes {
+			h.flushPending()
+		}
 	}
 	if part.err != nil {
 		h.readEOF = isTerminalEOF(part.err)
@@ -376,6 +533,7 @@ func (h *holder) output(part outputPart) {
 			h.storageFailed = true
 		}
 	}
+	return true
 }
 
 func (h *holder) finalError() error {

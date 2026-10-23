@@ -15,7 +15,7 @@ func (h *holder) beginCleanup(stop bool) {
 			h.stopReason = "operator_stop"
 		}
 	}
-	if h.cleaning || h.quarantined {
+	if h.cleaning || h.quarantined || h.exitAfterFlush {
 		return
 	}
 	h.cleaning = true
@@ -103,8 +103,29 @@ func (h *holder) finishCleanup(result cleanupResult) bool {
 	}
 	// readDone is closed only after the final output/error was enqueued. Drain
 	// the bounded remaining queue before publishing exit or any completion.
+	if h.outputPending != nil {
+		part := *h.outputPending
+		h.outputPending = nil
+		if !h.output(part) {
+			h.outputPending = &part
+			h.cleanupPending = &result
+			h.cleaning = true
+			return false
+		}
+	}
 	for len(h.parts) > 0 {
-		h.output(<-h.parts)
+		part := <-h.parts
+		if !h.output(part) {
+			h.outputPending = &part
+			h.cleanupPending = &result
+			h.cleaning = true
+			return false
+		}
+	}
+	if !h.flushPending() {
+		h.cleanupPending = &result
+		h.cleaning = true
+		return false
 	}
 	if !result.noChild && h.state.ChildGeneration != 0 && !h.readEOF {
 		h.storageFailed = true
@@ -125,20 +146,22 @@ func (h *holder) finishCleanup(result cleanupResult) bool {
 		if h.storageFailed {
 			h.state.Phase = "error"
 		}
-		h.writeState() // after the last synchronous console/event fsync
-		h.finishStopReplies(h.finalError())
-		return true
+		h.writeState() // queued state cannot pass pending console/event durability
+		return h.finishAfterFlush()
 	}
 	clean := result.exit.Code == 0 && result.exit.Signal == 0
 	if clean && h.declaration.Restart.Policy == "on-failure" {
 		// Marker first, state second; YAML is never rewritten. The marker is a
 		// per-name execution veto even if config changed while the child ran.
 		marker := StopMarker{Version: 1, Name: h.state.Name, Incarnation: h.state.Incarnation, DeclarationRevision: h.state.DeclarationRevision, StoppedAt: time.Now().UTC()}
-		if h.session.WriteStopMarker(marker) != nil {
+		err := h.session.WriteStopMarker(marker)
+		if err == ErrBusy {
+			h.markerPending = &marker
+		} else if err != nil {
 			h.storageFailed = true
 			h.state.Phase = "error"
 			h.writeState()
-			return true
+			return h.finishAfterFlush()
 		}
 		h.state.Phase = "stopped_clean"
 		if snapshot, err := h.store.LoadConfig(); err != nil {
@@ -147,12 +170,12 @@ func (h *holder) finishCleanup(result cleanupResult) bool {
 			h.state.Phase = "config_conflict"
 		}
 		h.writeState()
-		return true
+		return h.finishAfterFlush()
 	}
 	if h.declaration.Restart.Policy == "never" {
 		h.state.Phase = "stopped"
 		h.writeState()
-		return true
+		return h.finishAfterFlush()
 	}
 	// Failed or always-policy exits retain the same holder/viewers. Configuration
 	// is an immutable snapshot; Reload reports drift but never applies it.
@@ -182,7 +205,7 @@ func (h *holder) finishCleanup(result cleanupResult) bool {
 		h.storageFailed = true
 		h.state.Phase = "error"
 		h.writeState()
-		return true
+		return h.finishAfterFlush()
 	}
 	h.nextSpawn = time.Now().Add(restartDelay(h.backoff, maximum, random[0]))
 	h.writeState()

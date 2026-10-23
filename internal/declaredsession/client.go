@@ -126,7 +126,13 @@ func (c *Client) Attach(ctx context.Context, opts AttachOptions) (*Attachment, e
 		return nil, ErrProtocol
 	}
 	reply, err := c.framed.read(ctx, operationWait)
-	if err != nil || reply.Op != "role" {
+	if err != nil {
+		return nil, ErrProtocol
+	}
+	if reply.Op == "error" {
+		return nil, &attachmentDisconnectError{reason: attachmentDisconnectReason(reply.Reason)}
+	}
+	if reply.Op != "role" {
 		return nil, ErrProtocol
 	}
 	c.stream = true
@@ -166,6 +172,8 @@ func (a *Attachment) Next(ctx context.Context) (AttachEvent, error) {
 			return AttachEvent{}, err
 		}
 		switch f.Op {
+		case "error":
+			return AttachEvent{}, &attachmentDisconnectError{reason: attachmentDisconnectReason(f.Reason)}
 		case "pong":
 			continue
 		case "output":

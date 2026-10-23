@@ -41,6 +41,7 @@ type managerOps struct {
 	process      func(int) (procscope.ProcessIdentity, error)
 	stop         func(context.Context, procscope.ScopeIdentity, procscope.ProcessIdentity) error
 	dial         func(context.Context, *SessionStore) (managerPeer, error)
+	attachDial   func(context.Context, *SessionStore) (*Client, error)
 	socket       func(*SessionStore) (managerSocket, error)
 	removeSocket func(*SessionStore, managerSocket) error
 	launch       func(context.Context, string, string, string, string, string, bool) (int, error)
@@ -114,7 +115,8 @@ func sameHolderRecord(stored State, hello Hello, live State, scope procscope.Obs
 	return validProcessIdentity(live.Holder) && stored.Incarnation == hello.Incarnation && stored.Incarnation == live.Incarnation &&
 		stored.Name == hello.Name && stored.Name == live.Name && stored.Holder == hello.Holder && stored.Holder == live.Holder &&
 		stored.Scope == hello.Scope && stored.Scope == live.Scope && stored.DeclarationRevision == hello.DeclarationRevision && stored.DeclarationRevision == live.DeclarationRevision &&
-		hello.ProtocolVersion == ProtocolVersion && live.ProtocolVersion == ProtocolVersion &&
+		stored.ProtocolVersion == ProtocolVersion && hello.ProtocolVersion == ProtocolVersion && live.ProtocolVersion == ProtocolVersion &&
+		stored.BinaryVersion == hello.BinaryVersion && stored.BinaryVersion == live.BinaryVersion &&
 		scope.Scope == scopeFromState(live) && containsScopeProcess(scope.Members, live.Holder)
 }
 
@@ -199,6 +201,9 @@ func (m *Manager) observe(ctx context.Context, declaration Declaration, session 
 		result.Classification = "disabled"
 	} else if haveState {
 		result.Classification = "stopped"
+		if stored.Phase == "isolation_unavailable" {
+			result.Classification = "isolation_unavailable"
+		}
 		if stored.Phase == "starting" {
 			// A launcher may not have reached its scope yet. Losing the caller
 			// or its readiness deadline is not evidence that it cannot exec.
@@ -333,7 +338,16 @@ func (m *Manager) change(ctx context.Context, name string, restart bool) (Manage
 	}
 	pid, err := m.ops.launch(ctx, m.executable, m.store.NodeDir(), name, incarnation, m.version, restart)
 	if err != nil {
-		return ManagedStatus{Name: name, Classification: "isolation_unavailable", State: pending}, ErrManager
+		// The native launcher returns zero only when no child was started.
+		// Retire that reservation only after corroborating the exact pending
+		// record and empty scope. A positive PID, changed record or unknown
+		// observation retains custody in starting instead of allowing retry.
+		if pid == 0 {
+			if failed, retireErr := m.retireUnlaunched(ctx, session, pending); retireErr == nil {
+				return ManagedStatus{Name: name, Classification: "isolation_unavailable", State: failed}, ErrManager
+			}
+		}
+		return ManagedStatus{Name: name, Classification: "starting", State: pending}, ErrManager
 	}
 	launcher, launcherErr := m.ops.process(pid)
 	if launcherErr != nil || launcher.PID != pid || recordManagerLaunch(session, incarnation, launcher) != nil {
@@ -356,6 +370,35 @@ func (m *Manager) change(ctx context.Context, name string, restart bool) (Manage
 		case <-ticker.C:
 		}
 	}
+}
+
+func (m *Manager) retireUnlaunched(ctx context.Context, session *SessionStore, expected State) (State, error) {
+	// Finish the bounded no-launch proof even if the operator cancelled just
+	// before exec. Cancellation alone never proves that a process is absent.
+	proofCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), operationWait)
+	defer cancel()
+	observation, err := m.ops.inspect(proofCtx, expected.Scope.Name)
+	if err != nil || observation.Scope != (procscope.ScopeIdentity{}) || len(observation.Members) != 0 {
+		return State{}, ErrManager
+	}
+	var retired State
+	err = session.withRecord(func() error {
+		current, present, err := session.ReadState()
+		if err != nil || !present || current.Incarnation != expected.Incarnation || current.Name != expected.Name ||
+			current.Scope != expected.Scope || current.DeclarationRevision != expected.DeclarationRevision || current.FileRevision != expected.FileRevision ||
+			current.ProtocolVersion != expected.ProtocolVersion || current.BinaryVersion != expected.BinaryVersion || current.Phase != "starting" ||
+			current.Guarantee != "unconfirmed" || current.Holder != (ProcessIdentity{}) || current.Child != (ProcessIdentity{}) ||
+			current.Scope.InvocationID != "" || current.Scope.ControlGroup != "" {
+			return ErrManager
+		}
+		current.Phase, current.UpdatedAt = "isolation_unavailable", time.Now()
+		if err := session.writeJSON("state.json", current, MaxStateBytes); err != nil {
+			return ErrManager
+		}
+		retired = current
+		return nil
+	})
+	return retired, err
 }
 
 // The record lock serializes this one transition with the holder's own state
@@ -408,19 +451,25 @@ func (m *Manager) Dial(ctx context.Context, name string) (*Client, error) {
 	}
 	// Production Dial returns a concrete Client so the CLI can attach; the
 	// operation does not expose the manager's injected test-peer abstraction.
-	client, err := DialHolder(ctx, session)
+	client, err := m.ops.attachDial(ctx, session)
 	if err != nil {
 		return nil, err
 	}
 	live, statusErr := client.Status(ctx)
 	unit, _ := ScopeName(name)
 	observation, observeErr := m.ops.inspect(ctx, unit)
-	if statusErr != nil || observeErr != nil || !sameHolderRecord(stored, client.Hello(), live, observation) ||
-		live.DeclarationRevision != declaration.Revision || live.BinaryVersion != m.version || live.Guarantee != "verified_user_scope" {
+	if statusErr != nil || observeErr != nil || !attachmentMatches(declaration, stored, client.Hello(), live, observation) {
 		_ = client.Close()
 		return nil, ErrManager
 	}
 	return client, nil
+}
+
+// A newer CLI can attach to an older holder that speaks this protocol. Binary
+// versions must still corroborate the same holder across disk/hello/live state;
+// they are not compared to the CLI release. Status reports holder_outdated.
+func attachmentMatches(declaration Declaration, stored State, hello Hello, live State, observation procscope.Observation) bool {
+	return sameHolderRecord(stored, hello, live, observation) && live.DeclarationRevision == declaration.Revision && live.Guarantee == "verified_user_scope"
 }
 
 func (m *Manager) Stop(ctx context.Context, name string) (ManagedStatus, error) {
@@ -458,7 +507,8 @@ func (m *Manager) stopLocked(ctx context.Context, session *SessionStore, declara
 		return ErrManager
 	}
 	if !validProcessIdentity(stored.Holder) {
-		if status.Classification == "stopped" || status.Classification == "stopped_clean" || status.Classification == "config_conflict" {
+		if status.Classification == "stopped" || status.Classification == "stopped_clean" || status.Classification == "config_conflict" ||
+			status.Classification == "isolation_unavailable" && stored.Phase == "isolation_unavailable" && stored.Holder == (ProcessIdentity{}) {
 			return nil
 		}
 		return ErrManager
@@ -495,22 +545,29 @@ func (m *Manager) stopLocked(ctx context.Context, session *SessionStore, declara
 			_ = peer.Close()
 			return ErrManager
 		}
-		if restarting {
-			err = peer.PrepareRestart(ctx, stored.Incarnation)
+		if live.Phase == "cleanup_unconfirmed" {
+			// An authenticated quarantined holder cannot promise graceful
+			// child cleanup. Explicit local stop/restart proceeds only through
+			// the same saved exact invocation, without a flush/ACK claim.
+			_ = peer.Close()
 		} else {
-			err = peer.Stop(ctx, stored.Incarnation)
+			if restarting {
+				err = peer.PrepareRestart(ctx, stored.Incarnation)
+			} else {
+				err = peer.Stop(ctx, stored.Incarnation)
+			}
+			_ = peer.Close()
+			if err != nil {
+				return ErrManager
+			}
+			// The holder ACKs only after synchronous log/state durability and child
+			// cleanup. Still wait for this exact process birth to disappear; killing
+			// the scope immediately after an ACK could interrupt holder teardown.
+			if m.waitGracefulExit(ctx, session, stored) != nil {
+				return ErrManager
+			}
+			graceful = true
 		}
-		_ = peer.Close()
-		if err != nil {
-			return ErrManager
-		}
-		// The holder ACKs only after synchronous log/state durability and child
-		// cleanup. Still wait for this exact process birth to disappear; killing
-		// the scope immediately after an ACK could interrupt holder teardown.
-		if m.waitGracefulExit(ctx, session, stored) != nil {
-			return ErrManager
-		}
-		graceful = true
 	}
 	// Lost-holder recovery is forced exact-scope cleanup, not evidence of log
 	// flush. A healthy holder is never forced before its completion is confirmed.

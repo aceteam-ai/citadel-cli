@@ -24,7 +24,6 @@ type SessionStore struct {
 	store *Store
 	dir   *os.File
 	paths Paths
-	mu    sync.Mutex
 }
 
 type OperationGuard struct {
@@ -191,9 +190,11 @@ func (g *OwnerGuard) Close() error {
 }
 
 func (s *SessionStore) withRecord(write func() error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	guard, err := s.acquire(context.Background(), "record.lock")
+	ctx, cancel := context.WithTimeout(context.Background(), operationWait)
+	defer cancel()
+	// Each acquisition opens an independent file description, so flock also
+	// serializes callers sharing this SessionStore without an unbounded mutex.
+	guard, err := s.acquire(ctx, "record.lock")
 	if err != nil {
 		return err
 	}

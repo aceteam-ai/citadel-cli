@@ -3,8 +3,9 @@
 Refs #1175 and the settled #1165 definition of ready. This is source preparation
 for a **draft**, not native acceptance, activation or rollout permission.
 The operator authorized source work and ordinary GitHub CI on 2026-10-22.
-Local candidate execution, PTYs/sockets/systemd experiments, service changes,
-fleet migration, undraft and merge remain held.
+This preparation lane does not perform local candidate execution,
+PTY/socket/systemd experiments, service changes, fleet migration, undraft or
+merge. Source verification does not satisfy the separate native acceptance gate.
 
 ## What this slice owns
 
@@ -15,11 +16,19 @@ instance shell. No-argument `citadel attach`, `--shell`, `citadel session attach
 and existing tmux sessions retain their existing behavior. This implementation
 does not replace or modify `internal/tmux`.
 
+`citadel attach NAME` now assigns meaning to the formerly ignored positional
+argument: it selects an exact declared session. Omit NAME for the legacy worker
+status view, or use `attach --shell` for the existing instance shell.
+
 The new local-only commands deliberately bypass agent startup using their own
 Cobra hook. They do not add a third exception to the root startup guard, log in,
 mint a node key, repair credentials, install CA trust or auto-update. Configuration
 is selected once at the CLI boundary; leaf packages receive an explicit path.
 `--node-config-dir` selects an existing trusted node configuration directory.
+The new named-session commands explicitly refuse the legacy `--node-dir` and
+nonempty `CITADEL_NODE_DIR` overrides, including when `--node-config-dir` is also
+given. They never silently fall back to the real node after an unsupported
+override. The no-name legacy attach path keeps its existing selection behavior.
 
 Only canonical lowercase lease names are accepted:
 `[a-z0-9][a-z0-9._-]{0,63}`. There is no trimming, case folding or lossy scope
@@ -40,6 +49,19 @@ creating session storage, binding a socket or launching a harness. A launcher's
 `Start` returning successfully does not prove scope ownership or holder readiness.
 Readiness requires authenticated local hello, exact reserved incarnation, process
 birth, declaration revision and independently observed scope membership.
+
+The launcher uses the fixed, metadata-validated system executable
+`/usr/bin/systemd-run`, never the caller's PATH. A pre-exec failure retires its
+pending reservation only after proving the same untouched reservation has no
+captured holder and the exact named scope is empty. Unknown observations,
+changed records or a positive launcher PID remain held as `starting`; a timeout
+alone never authorizes a second launch. A proven unlaunched
+`isolation_unavailable` record permits another explicit start/restart attempt.
+
+An old live holder can still be attached after a CLI update when its protocol is
+compatible. The saved record, authenticated hello and live state must corroborate
+the same holder binary identity; it need not equal the new CLI's release.
+`holder_outdated` remains an informational status, not a restart instruction.
 
 Stored PID files are observations, not signalling authority. Destructive cleanup
 uses a pinned private user-bus manager and the saved nonzero invocation ID, never
@@ -92,6 +114,10 @@ Operator, holder-lifetime and short record locks are distinct. A holder does not
 take the operator lock while a manager waits for its stop/readiness response.
 Record writes sync a private staging file, rename, then sync the directory. A
 post-rename sync failure is uncertainty, not rollback or durable success.
+Record-lock contention gets a bounded retry rather than being mistaken for
+corrupt storage. Console writes are batched within fixed memory/time ceilings;
+normal terminal completion still waits for pending logs/events and final state
+to be durably published. An uncertain append is not automatically replayed.
 
 ## Attachment, custody and logs
 
@@ -107,6 +133,16 @@ example override. A mismatched prefix is forwarded unchanged. The detach chord
 and following bytes in the same read are not forwarded. Read-only clients still
 recognize detach. Client EOF/cancellation closes that viewer only, never the
 harness. Terminal state/status flags and reader lifetime are restored/joined.
+The client opens validated independent terminal file descriptions rather than
+changing shared `O_NONBLOCK` flags. Normal exits restore raw terminal state;
+SIGKILL, power loss and other uncatchable termination cannot restore shared
+termios state, so native interruption acceptance remains required.
+
+Output is event-driven with a bounded ready-frame burst, not limited to one frame
+per stdin poll. A holder-side EOF, operation refusal or slow-viewer disconnect is
+a nonzero client result. Diagnostic reasons come from a fixed allowlist and never
+reflect arbitrary peer text or terminal bytes. Explicit local detach remains a
+successful viewer-only action.
 
 Replay snapshot and live registration share one actor-owned boundary. Whole
 output chunks are retained within the ring budget. Each viewer has a bounded
@@ -121,6 +157,9 @@ The holder retains process-group identity until descendant cleanup and scope
 proof, reaps the leader once, and does not close/reuse PTY descriptors while I/O
 is in flight. Unknown survivors or uncertain cleanup quarantine the holder;
 they never authorize another writer or an automatic replacement.
+An explicit local stop/restart can recover an authenticated quarantined holder
+through its saved exact invocation scope. This forced path is labelled
+`forced_cleanup_no_flush`, not a graceful completion or proof of log durability.
 
 Raw `console.log` is sensitive local history. `events.jsonl` accepts finite
 lifecycle fields and static reasons, not console text or arbitrary errors.
