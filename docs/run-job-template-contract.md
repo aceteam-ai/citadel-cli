@@ -167,9 +167,9 @@ limits or native compatibility evidence; owner and native acceptance are require
 before activation. The [owner decision](https://github.com/aceteam-ai/citadel-cli/issues/1437#issuecomment-6347292527)
 caps the whole film at 600 seconds including every title card. The source now
 enforces that cap before rendering and against actual prepared/encoded media.
-The same decision brings camera/phone metadata and the QuickTime brand into
-scope, but their bounded parser allowance still needs separate design review;
-this duration-only child leaves every container refusal and whitelist unchanged.
+The same decision brings a bounded camera/phone metadata subset and the
+QuickTime brand into scope. The source grammar below implements that subset;
+real encoded camera acceptance remains required before activation.
 This restriction is grounded in source, not a local media run: FFmpeg n6.1
 [concat open_file](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavformat/concatdec.c#L327)
 propagates the whitelist to nested opens, and
@@ -219,6 +219,11 @@ contract or approving a template:
 - The silent stereo 48 kHz AAC card path is tested with fake capture/encoder
   dependencies. Continuous AAC tracks and concat compatibility still require
   actual pinned card media acceptance.
+- AAC concat padding has no additional allowance beyond the current one-video-
+  frame duration tolerance. Frame rates of 48 fps or above may be refused at the
+  joined stage. A measured fixture and separately reviewed policy are required
+  before accepting that case; this source adds no frame-rate ceiling, trimming
+  or relaxation of the 600-second cap.
 - The card/disclosure seam has no production implementation. Both the chapter
   card and every frame of the corresponding chapter must carry the disclosure;
   synthetic seam invocation does not prove the burn-in. Blocked paper-trail#23
@@ -248,13 +253,15 @@ Chapter names use ASCII letters/digits/underscore/hyphen/dot, end in `.mp4`, and
 cannot start with a dot or hyphen.
 
 An `.mp4` suffix is not a container guarantee. Before tool discovery, chapter
-preflight requires a normal self-contained, non-fragmented ISO-BMFF MP4:
-initial `ftyp` with a supported MP4 brand, one `moov`, local `mdat`, and one or
+preflight requires a self-contained, non-fragmented ISO-BMFF MP4 or the accepted
+QuickTime subset: initial `ftyp` with a supported MP4 or `qt  ` major brand,
+one `moov`, local `mdat`, and one or
 two tracks whose `dref` is exactly a self-contained `url ` entry. Reference/
 compressed movies, external data references, unsupported top-level boxes and
 fragmented containers are refused. Box traversal is capped at 4096 boxes, six
 levels and a 16 MiB movie box, without reading media payloads. The preflight is
-not a codec validator. Every MP4 probe and decode additionally forces the MOV
+not a codec validator or a complete role validator for ordinary movie
+descendants. Every MP4 probe and decode additionally forces the MOV
 demuxer and MOV format whitelist with `enable_drefs=0` and
 `use_absolute_path=0`; returned container metadata must match the MOV family.
 Future disclosure rendering must use the same pinned input options. The
@@ -262,6 +269,31 @@ supplied-poster path forces `image2pipe` and the PNG decoder. A file protocol
 allowlist alone does not prevent a disguised manifest from reading undeclared
 local bytes. FFmpeg documents the external-track controls in its
 [MOV demuxer options](https://ffmpeg.org/ffmpeg-formats.html#mov_002fmp4_002f3gp).
+
+Metadata has a separate closed grammar, because FFmpeg's
+[MOV dispatcher](https://github.com/FFmpeg/FFmpeg/blob/n6.1.1/libavformat/mov.c#L7470-L7486)
+can interpret recognized atoms inside metadata containers. `meta` and `udta`
+are accepted only at the file, movie or track level, with bounded nesting inside
+`udta`. Each serialized metadata box is at most 1 MiB, including its header;
+disjoint outer metadata regions together are at most 4 MiB per file. Nested
+bytes count once toward that total. These are implementation policy limits.
+`meta` permits a zero FullBox word or the bare QuickTime layout, followed first
+by `hdlr` (`mdta` or `mdir`). A single non-track `mdta` table per file may supply
+UTF-8 `mdta` keys followed by indexed `ilst` items, each with exactly one `data`
+child. `mdir` items and direct `udta` leaves use only the reviewed text types
+listed by `videoComposeMP4TextMetadata`. Artwork, custom/vendor containers,
+reference/location containers, nested media and unknown metadata roles refuse.
+This does not accept arbitrary phone/camera exports.
+
+Top-level UUID metadata permits only XMP
+`be7acfcb-97a9-42e8-9c71-999491e3afac` and Google spherical-video v1
+`ffcc8263-f855-4a93-8814-587a02521fdd`, with a nonempty bounded body. Unknown,
+ISML and nested UUIDs return `unsupported_uuid_box`; a truncated UUID namespace
+or empty approved body returns `invalid_uuid_box`. Preflight does not parse allowed UUID bodies;
+[FFmpeg still interprets the Google namespace](https://github.com/FFmpeg/FFmpeg/blob/n6.1.1/libavformat/mov.c#L5852).
+Malformed metadata, unsupported roles, per-box overflow and total overflow have
+distinct refusal reasons. Synthetic fixtures cover supported layouts and hostile
+references, nesting, budgets and UUIDs; they do not establish native compatibility.
 
 `videoComposeFilmSchema` owns the proposed closed film schema. Exact keys are
 checked at every object level; duplicate keys, trailing JSON and invalid Unicode
@@ -327,7 +359,9 @@ The source core copies chapter streams only when the inspected stream parameters
 match the rendered intro reference; otherwise it requests libx264 CRF 17,
 yuv420p and AAC 192k normalization. Prepared clips/cards are probed again and
 must match before the safe concat demuxer consumes a node-written list of fixed
-scratch basenames. These subprocesses use the existing limited-command runner,
+scratch basenames. Concat uses `-xerror` so demux errors fail the operation; an
+independent duration check also refuses a nonempty truncated join before any
+loudness analysis, normalization or publication. These subprocesses use the existing limited-command runner,
 minimal child environment and process-tree cleanup; no shell, NVENC, provider,
 or credential path is introduced. Input protocols are limited to file/pipe.
 
@@ -350,10 +384,8 @@ use synthetic container/probe fixtures and invoke no media binaries. Added
 duration fixtures cover exact/over-limit projected multi-chapter totals,
 title-card-only refusal before discovery, finite/positive arithmetic boundaries,
 and independent intro/card/clip/outro/concat/normalization/cap output overruns.
-The duration fixtures are authored source only; no local test or media execution
-has been performed for this correction. Existing shared timeline values are
-unchanged. The
-disguised-manifest regression asserts rejection before discovery, subprocesses,
+Existing shared timeline values are unchanged. The disguised-manifest regression
+asserts rejection before discovery, subprocesses,
 rendering or output creation, even with a valid undeclared BaseURL target.
 
 Proposed outputs are `film.mp4`, `poster.png`, and `chapters.json`. The poster is

@@ -55,6 +55,60 @@ func TestVideoComposeDurationAccumulatorBoundaries(t *testing.T) {
 	}
 }
 
+func TestVideoComposeInvalidDurationHasPreciseReason(t *testing.T) {
+	for _, duration := range []float64{0, -1, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := videoComposeAddDuration(0, duration); err == nil || err.Error() != "media duration must be finite and positive" {
+			t.Fatalf("invalid part %v: %v", duration, err)
+		}
+		if _, err := parseVideoComposeProbe(videoComposeTestProbe(videoComposeTestMedia(duration))); err == nil || err.Error() != "media duration must be finite and positive" {
+			t.Fatalf("invalid probe duration %v: %v", duration, err)
+		}
+	}
+	for _, total := range []float64{-1, math.NaN(), math.Inf(1)} {
+		if _, err := videoComposeAddDuration(total, 1); err == nil || err.Error() != "accumulated film duration must be finite and nonnegative" {
+			t.Fatalf("invalid total %v: %v", total, err)
+		}
+	}
+}
+
+func TestVideoComposeShortJoinedOutputRefusesBeforeLoudnorm(t *testing.T) {
+	inputs := videoComposeTestInputs(t, []byte(validVideoComposeFilm))
+	outDir := t.TempDir()
+	fake := &videoComposeFake{t: t, media: map[string]videoComposeMedia{inputs[1]: videoComposeTestMedia(10)}, encodedBytes: 3}
+	deps := fake.deps()
+	joinedWritten := false
+	deps.run = func(ctx context.Context, bin string, args []string) (videoComposeCommandOutput, error) {
+		output, err := fake.run(ctx, bin, args)
+		last := args[len(args)-1]
+		if err == nil && bin == "ffmpeg" && filepath.Base(last) == "joined.mp4" {
+			// A failed nested concat open can leave a nonempty truncated output
+			// even with exit status zero. Duration is an independent backstop.
+			media := fake.media[last]
+			media.Duration -= 5
+			fake.media[last] = media
+			joinedWritten = true
+		}
+		return output, err
+	}
+	outputs, err := runVideoComposeBuiltin(context.Background(), json.RawMessage(`{}`), inputs, outDir, deps)
+	if err == nil || !strings.Contains(err.Error(), "joined film duration disagrees with timeline") || len(outputs) != 0 {
+		t.Fatalf("short concat output accepted: outputs=%v err=%v", outputs, err)
+	}
+	if !joinedWritten {
+		t.Fatal("short-output regression never reached concat")
+	}
+	for _, call := range fake.ffmpegCalls() {
+		if strings.Contains(strings.Join(call, " "), "loudnorm=") {
+			t.Fatal("short concat output reached loudness analysis or normalization")
+		}
+	}
+	for _, name := range []string{"film.mp4", "poster.png", "chapters.json"} {
+		if _, err := os.Stat(filepath.Join(outDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("short concat output published %s: %v", name, err)
+		}
+	}
+}
+
 func TestVideoComposeCardsAloneRefuseBeforeToolDiscovery(t *testing.T) {
 	raw := videoComposeTestFilm(t, func(value map[string]any) {
 		value["intro"].(map[string]any)["seconds"] = 60
