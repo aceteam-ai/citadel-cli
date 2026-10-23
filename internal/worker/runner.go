@@ -763,6 +763,17 @@ func (r *Runner) exitJob(jobOK bool) {
 // fully handled the job (Ack + any terminal event) and the caller must stop.
 func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream StreamWriter, startTime time.Time) {
 	startTime = time.Now()
+	job.sealMedia()
+	payload, projectionErr := job.executionPayload()
+	if projectionErr != nil {
+		// An opaque/raw-only capture must never bypass routing or become a
+		// handler input. Fail this delivery without acquiring execution state.
+		stream = r.newStreamWriter(job)
+		_ = stream.WriteError(projectionErr, false)
+		_ = r.source.Fail(ctx, job, projectionErr, nil)
+		r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, projectionErr))
+		return false, nil, startTime
+	}
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
 
 	// Target-node filter: when per-node consumer groups are used, every node
@@ -782,12 +793,16 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// streams (aceteam#6889) remove most of the blast radius, but it still falls
 	// back to the shared stream during a mixed-version rollout, where this pin is
 	// the only thing routing the job.
-	if targetNode, ok := job.Payload["target_node"].(string); job.Type != JobTypeWorkerControl && ok && targetNode != "" && targetNode != r.config.NodeID {
+	if targetNode, ok := payload["target_node"].(string); job.Type != JobTypeWorkerControl && ok && targetNode != "" && targetNode != r.config.NodeID {
+		// Routing still uses the original projection. A payload-derived string
+		// is not diagnostic authority: malformed media can echo private input
+		// here, just as FILE_FETCH/passcode credentials can be reflected here.
+		diagnosticTarget := jobprivacy.Text(job.Type, job.diagnosticPayload(), targetNode)
 		if r.config.NodeID == "" {
 			r.log("warning", "Declining job %s: addressed to target_node=%s but this node's Headscale ID is unresolved, "+
-				"so it cannot claim addressed work", job.ID, targetNode)
+				"so it cannot claim addressed work", job.ID, diagnosticTarget)
 		} else {
-			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
+			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, diagnosticTarget, r.config.NodeID)
 		}
 		r.source.Ack(ctx, job)
 		return false, nil, startTime
@@ -977,7 +992,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	gpuIndex := -1
 	if r.gpuTracker != nil && needsGPUSlot(job.Type) {
 		// Check if job requests a specific GPU
-		if targetGpu, ok := job.Payload["targetGpu"]; ok {
+		if targetGpu, ok := job.executionField("targetGpu"); ok {
 			if idx, ok := targetGpu.(float64); ok {
 				gpuIdx := int(idx)
 				if !r.gpuTracker.AcquireSpecific(gpuIdx) {
@@ -1016,7 +1031,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		defer r.gpuTracker.Release(gpuIndex)
 		r.log("info", "Job %s assigned to GPU %d", job.ID, gpuIndex)
 		// Store GPU index in job payload for handler to use
-		job.Payload["_gpuIndex"] = gpuIndex
+		job.setGPUIndex(gpuIndex)
 	}
 
 	// Execute handler (stream writer created at claim time)
@@ -1051,9 +1066,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	cancelled := stopCancellationWatch()
 	// Sanitize before any generic failure logging, usage record or retry/status
 	// publication. The handler still receives the original in-flight payload.
-	err = jobprivacy.Error(job.Type, job.Payload, err)
+	err = jobprivacy.Error(job.Type, job.diagnosticPayload(), err)
 	if result != nil {
-		result.Error = jobprivacy.Error(job.Type, job.Payload, result.Error)
+		result.Error = jobprivacy.Error(job.Type, job.diagnosticPayload(), result.Error)
 	}
 
 	endTime := time.Now()
@@ -1575,7 +1590,8 @@ func (r *Runner) finishSuccess(ctx context.Context, job *Job, stream StreamWrite
 // whole in-lane life has been queue wait). Returns true (a warming answer is a
 // clean, Acked success from the node's bookkeeping perspective).
 func (r *Runner) finishQueueWaitExceeded(ctx context.Context, job *Job, stream StreamWriter, queueStart time.Time) bool {
-	model, _ := job.Payload["model"].(string)
+	modelValue, _ := job.executionField("model")
+	model, _ := modelValue.(string)
 	now := time.Now()
 	queueWaitMs := now.Sub(queueStart).Milliseconds()
 	r.log("info", "Job %s exceeded the inference queue-wait budget (%s); returning model_warming backpressure signal",
@@ -1773,13 +1789,31 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		DurationMs:  completed.Sub(started).Milliseconds(),
 	}
 
-	// Extract backend and model from job payload
-	if v, ok := job.Payload["backend"]; ok {
+	// Project only explicit string identity scalars for private media, not the
+	// generic payloadString object-formatting fallback. String provenance remains
+	// an unresolved identity-projection gate; these are not verified identities.
+	// Requested model/backend strings remain withheld from retained accounting.
+	attribution := job.Payload
+	if job.media != nil {
+		attribution = make(map[string]any)
+		for _, key := range []string{"flow_run_id", "flow_node_id", "delegated_node_id", "node_uid"} {
+			if value, present := job.executionField(key); present {
+				if identity, ok := value.(string); ok {
+					attribution[key] = identity
+				}
+			}
+		}
+		// Retain the existing receipt-ID projection contract separately.
+		if value, present := job.executionField("receipt_ids"); present {
+			attribution["receipt_ids"] = value
+		}
+	}
+	if v, ok := attribution["backend"]; ok {
 		if s, ok := v.(string); ok {
 			r.Backend = s
 		}
 	}
-	if v, ok := job.Payload["model"]; ok {
+	if v, ok := attribution["model"]; ok {
 		if s, ok := v.(string); ok {
 			r.Model = s
 		}
@@ -1790,11 +1824,11 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 	// producer spellings match the aceteam backend (flow_run_id / flow_node_id /
 	// delegated_node_id / node_uid / receipt_ids). These are read from the decoded
 	// payload; absent keys leave the record field empty.
-	r.FlowRunID = payloadString(job.Payload, "flow_run_id")
-	r.FlowNodeID = payloadString(job.Payload, "flow_node_id")
-	r.DelegatedNodeID = payloadString(job.Payload, "delegated_node_id")
-	r.NodeUID = payloadString(job.Payload, "node_uid")
-	r.ReceiptIDs = payloadStringSlice(job.Payload, "receipt_ids")
+	r.FlowRunID = payloadString(attribution, "flow_run_id")
+	r.FlowNodeID = payloadString(attribution, "flow_node_id")
+	r.DelegatedNodeID = payloadString(attribution, "delegated_node_id")
+	r.NodeUID = payloadString(attribution, "node_uid")
+	r.ReceiptIDs = payloadStringSlice(attribution, "receipt_ids")
 
 	// Extract usage metrics from result output (_usage_* keys). These are set
 	// directly on Output by NATIVE worker handlers (e.g. llm_inference).
@@ -1812,27 +1846,31 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 		// aceteam#10876 C7); decode it and carry it onto the record. This is the
 		// "usage key fix": without it a FILE_INDEX/embedding job records zero
 		// tokens/bytes and no work attribution.
-		applyNestedUsage(&r, result.Output)
-		// A NATIVE handler (llm_inference, citadel-cli#1287) carries its `usage`
-		// object as a TOP-LEVEL map (not wrapped as a string). The runner-signed
-		// work-receipt path merges attribution into that same map, so decode it
-		// here too to carry origin/action/org_id/units/manifest onto the record.
-		if usg, ok := result.Output["usage"].(map[string]any); ok {
-			applyUsageMap(&r, usg)
-		}
+		if job.media == nil {
+			applyNestedUsage(&r, result.Output)
+			// A NATIVE handler (llm_inference, citadel-cli#1287) carries its `usage`
+			// object as a TOP-LEVEL map (not wrapped as a string). The runner-signed
+			// work-receipt path merges attribution into that same map, so decode it
+			// here too to carry origin/action/org_id/units/manifest onto the record.
+			if usg, ok := result.Output["usage"].(map[string]any); ok {
+				applyUsageMap(&r, usg)
+			}
 
-		// Signed work-receipt BODIES (aceteam#11146 / citadel-cli#1291): carry the
-		// full v2 AEP receipt maps the handler/runner already produced onto the
-		// record so central's verify_and_store_work_receipt() has the bytes to
-		// attest. Collected here (inside buildUsageRecord) so EVERY terminal branch
-		// — success, failed, retry, cancelled — is covered uniformly, with no
-		// per-branch wiring; in practice only a success carries receipts.
-		receipts := collectWorkReceipts(result.Output)
-		r.Receipts, r.ReceiptsTruncated = boundWorkReceipts(receipts)
+			// Signed work-receipt BODIES (aceteam#11146 / citadel-cli#1291): carry the
+			// full v2 AEP receipt maps the handler/runner already produced onto the
+			// record so central's verify_and_store_work_receipt() has the bytes to
+			// attest. Collected here (inside buildUsageRecord) so EVERY terminal branch
+			// (success, failed, retry, cancelled) is covered uniformly, with no
+			// per-branch wiring; in practice only a success carries receipts.
+			receipts := collectWorkReceipts(result.Output)
+			r.Receipts, r.ReceiptsTruncated = boundWorkReceipts(receipts)
+		}
+		// Input-bearing media has no reviewed typed receipt/usage output path
+		// yet. C5 must add it, not retain arbitrary handler maps or echo bodies.
 	}
 
 	if err != nil {
-		msg := err.Error()
+		msg := jobprivacy.Error(job.Type, job.diagnosticPayload(), err).Error()
 		if len(msg) > 1024 {
 			msg = msg[:1024]
 		}

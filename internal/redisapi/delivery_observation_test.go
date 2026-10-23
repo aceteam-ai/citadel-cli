@@ -131,9 +131,8 @@ func TestDeliveryObservationHTTPDecoderCompatibility(t *testing.T) {
 			}
 			want, got := seed(), seed()
 			wantErr := json.Unmarshal([]byte(body), &want)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, body) }))
-			defer srv.Close()
-			c := NewClient(ClientConfig{BaseURL: srv.URL})
+			c := NewClient(ClientConfig{BaseURL: "https://fixture.invalid"})
+			c.httpClient.Transport = mediaResponseTransport{body: body}
 			defer c.Close()
 			gotErr := c.doRequest(context.Background(), http.MethodPost, "/api/fabric/redis/jobs/consume", ConsumeRequest{}, &got)
 			wantWire, _ := json.Marshal(want)

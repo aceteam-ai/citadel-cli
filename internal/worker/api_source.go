@@ -439,6 +439,7 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 // convertJob converts an API job to a worker.Job.
 func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 	job := &Job{
+		media:       aj.PrivateMediaPayload(),
 		observation: aj.DeliveryObservation(),
 		ID:          aj.JobID,
 		Type:        aj.Type,
@@ -446,6 +447,9 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 		RawPayload:  bytes.Clone(aj.RawPayload),
 		Source:      "redis-api",
 		MessageID:   aj.MessageID,
+	}
+	if job.media == nil {
+		job.media = jobprivacy.CaptureMedia(aj.Type, aj.Payload, aj.RawPayload, aj.RawData)
 	}
 	// Extract rayId: check RawData first, then payload
 	if aj.RawData != nil {
@@ -458,6 +462,10 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 			job.RayID = rayID
 		}
 	}
+	if job.media != nil {
+		job.RayID = privateMediaRayID(job.media)
+	}
+	job.sealMedia()
 	return job
 }
 
@@ -480,7 +488,7 @@ func (s *APISource) Ack(ctx context.Context, job *Job) error {
 // Nack indicates job failure.
 // For the API, this updates status but does NOT ACK - allowing retry.
 func (s *APISource) Nack(ctx context.Context, job *Job, err error) error {
-	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, nil))
 	// Don't ACK - let it retry
 	return nil
 }
@@ -523,7 +531,7 @@ func (s *APISource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err
 // ACK the message so it is removed from the consumer group's PEL. Used for
 // failures that will never succeed on retry (e.g. an unsupported job type).
 func (s *APISource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
-	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
+	status := jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 	queue := job.SourceQueue
 	if queue == "" {

@@ -104,6 +104,22 @@ func (s *WSSource) debug(format string, args ...any) {
 	}
 }
 
+func (s *WSSource) onServerError(_ redisapi.WSMessage) {
+	// An error frame has no trusted job kind. Its server-controlled text can
+	// echo an original delivery or capability, so retain the event, not its
+	// body. Do not mutate the original wire carrier or infer execution scope.
+	s.log("error", "WebSocket server error: server detail omitted")
+}
+
+func (s *WSSource) onServerConsuming(_ redisapi.WSMessage) {
+	// Confirmation fields are untrusted server strings, not diagnostic labels.
+	s.debug("ws_source: server confirmed consuming")
+}
+
+func (s *WSSource) onServerAcked(_ redisapi.WSMessage) {
+	s.debug("ws_source: server confirmed ack")
+}
+
 // Connect enables the WebSocket on the client, registers the job handler,
 // sets up the reconnect callback, and sends the initial consume message.
 func (s *WSSource) Connect(ctx context.Context) error {
@@ -143,19 +159,13 @@ func (s *WSSource) Connect(ctx context.Context) error {
 	// missing device_redis:read scope). Without this the client would
 	// silently believe it is consuming while receiving nothing — the
 	// exact failure mode #236/#3924 eliminated on the HTTP path.
-	ws.OnMessage("error", func(msg redisapi.WSMessage) {
-		s.log("error", "WebSocket server error: %s", msg.Error)
-	})
+	ws.OnMessage("error", s.onServerError)
 
 	// Register handler for "consuming" confirmation from the server.
-	ws.OnMessage("consuming", func(msg redisapi.WSMessage) {
-		s.debug("ws_source: server confirmed consuming queues=%v", msg.Queues)
-	})
+	ws.OnMessage("consuming", s.onServerConsuming)
 
 	// Register handler for "acked" confirmation from the server.
-	ws.OnMessage("acked", func(msg redisapi.WSMessage) {
-		s.debug("ws_source: server confirmed ack messageId=%s", msg.MessageID)
-	})
+	ws.OnMessage("acked", s.onServerAcked)
 
 	// Register reconnect callback to re-send consume with current queue list.
 	ws.OnReconnect(func() {
@@ -255,7 +265,7 @@ func (s *WSSource) Ack(ctx context.Context, job *Job) error {
 
 // Nack indicates job failure. Updates status but does NOT ack, allowing retry.
 func (s *WSSource) Nack(ctx context.Context, job *Job, err error) error {
-	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, nil))
 	return nil
 }
 
@@ -310,7 +320,7 @@ func (s *WSSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err 
 // failures that will never succeed on retry (e.g. an unsupported job type). The
 // ack mirrors Ack: over WebSocket when connected, falling back to HTTP.
 func (s *WSSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
-	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
+	status := jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 
 	queue := job.SourceQueue
@@ -438,6 +448,7 @@ func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
 	}
 
 	job := &Job{
+		media:       apiJob.PrivateMediaPayload(),
 		observation: msg.DeliveryObservation().WithSource("", s.config.ConsumerGroup, "websocket"),
 		ID:          apiJob.JobID,
 		Type:        apiJob.Type,
@@ -460,6 +471,10 @@ func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
 		}
 	}
 
+	if job.media != nil {
+		job.RayID = privateMediaRayID(job.media)
+	}
+	job.sealMedia()
 	return job, nil
 }
 
