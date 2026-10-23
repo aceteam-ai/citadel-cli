@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"errors"
-	"log/slog"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -32,7 +31,8 @@ func init() {
 		return nodevault.Open(passcodeHookNodeDir()).IsConfigured()
 	}
 	config.VaultVerify = func(pin string) (ok bool, handled bool) {
-		v := nodevault.Open(passcodeHookNodeDir())
+		nodeDir := passcodeHookNodeDir()
+		v := nodevault.Open(nodeDir)
 		if !v.IsConfigured() {
 			return false, false // no master PIN: fall back to legacy bcrypt
 		}
@@ -43,7 +43,7 @@ func init() {
 			return false, true
 		}
 		err := v.VerifyPIN(pin)
-		warnPasscodeLockoutUnavailable(err)
+		warnPasscodeLockoutUnavailableFor(passcodeWarningMaster, nodeDir, err)
 		return err == nil, true
 	}
 	// Legacy bcrypt passcode checks (no master PIN enrolled) get the vault's
@@ -56,11 +56,11 @@ func init() {
 	config.PasscodeAttemptError = warnPasscodeLockoutUnavailable
 }
 
-// Never include the PIN, path or wrapped error text in a boolean gate warning.
-// The typed denial remains distinct internally even though the caller gets false.
+// The legacy callback contract remains error-only. A healthy attempt does not
+// reset the reminder or claim recovery; availability is a separate snapshot.
 func warnPasscodeLockoutUnavailable(err error) {
 	if errors.Is(err, nodevault.ErrLockoutUnavailable) {
-		slog.Warn("Passcode check denied: lockout state unavailable; inspect node-local passcode status")
+		warnPasscodeLockoutUnavailableFor(passcodeWarningLegacy, passcodeHookNodeDir(), err)
 	}
 }
 

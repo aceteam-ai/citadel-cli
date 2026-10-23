@@ -18,7 +18,7 @@ The platform sends string-valued payload fields:
 | `input_schema`, `output_schema` | JSON-encoded schema objects from that version |
 | `runner` | JSON object with exactly `kind` and `handler`, both exact strings |
 | `params` | JSON-encoded object validated against `input_schema`; omission means `{}` |
-| `input_files` | JSON-encoded array of `{path, node_id, node_path}`; omission means `[]` |
+| `input_files` | JSON-encoded array of `{path, node_id, node_path}` with optional `expected_sha256` and `expected_bytes`; omission means `[]` |
 
 The node recomputes SHA256 over `{template_key, version, input_schema, output_schema, runner}`
 using Python `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=True)`
@@ -49,6 +49,19 @@ or dispatched params through a different spelling with the same manifest hash.
 Every input must have `node_id` equal to the locally configured executing node
 and a canonical workspace-relative `node_path`. `path` must be that same relative
 path or `node:<node_id>/<node_path>`, matching platform `FileValue` references.
+The closed reference vocabulary also accepts `expected_sha256`, exactly
+`sha256:` followed by 64 lowercase hexadecimal digits, and `expected_bytes`,
+a nonnegative JSON integer fitting int64 (no strings, floats or exponent form).
+Present expectations are checked against the actual digest and byte count of
+the private staged snapshot before any builtin invocation. A mismatch fails the
+attempt and removes its staging/output namespace. Every repeated reference must
+match the snapshot even when the source path was already staged. Expectations
+remain optional and independently enforced for generic templates; both are
+mandatory on every input when the template key or builtin handler is
+`video-compose`, including `film.json`, every chapter and optional poster.
+The platform adapter must preserve these fields from approval to dispatch;
+recomputing them from a mutable source after approval does not bind approved
+content. A retry stages and checks the source anew using the same expectations.
 The node accepts at most 128 declared inputs and 4 GiB of declared input bytes
 per attempt. Repeated references count repeatedly toward the byte ceiling even
 though their snapshot is staged only once. Both limits are fixed execution
@@ -141,3 +154,228 @@ Regression tests include the four independent review probes at original head
 `e6375a723be5894e392f98cfb19f52c386aa3a5c`. Run the guard-removal suite with
 `go run ./scripts/test_job_template_mutations.go`; its temporary Go overlays do
 not modify the checkout and require actual regression assertion failures.
+
+## Proposed video-compose v1 contract (inactive source)
+
+The #1437 source hardening keeps this builtin unregistered. Concat is limited
+to the concat and MOV demuxers. Its proposed command-output policy separates
+ffprobe JSON on stdout from FFmpeg loudnorm JSON on stderr: stdout is capped at
+1 MiB (overflow cancels the child and refuses the run), and stderr retains only
+its last 64 KiB. Loudnorm's existing log-surrounded JSON extractor is unchanged.
+These are new, inactive implementation-policy proposals, not previously ratified
+limits or native compatibility evidence; owner and native acceptance are required
+before activation. The [owner decision](https://github.com/aceteam-ai/citadel-cli/issues/1437#issuecomment-6347292527)
+caps the whole film at 600 seconds including every title card. The source now
+enforces that cap before rendering and against actual prepared/encoded media.
+The same decision brings camera/phone metadata and the QuickTime brand into
+scope, but their bounded parser allowance still needs separate design review;
+this duration-only child leaves every container refusal and whitelist unchanged.
+This restriction is grounded in source, not a local media run: FFmpeg n6.1
+[concat open_file](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavformat/concatdec.c#L327)
+propagates the whitelist to nested opens, and
+[demux admission](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavformat/demux.c#L258)
+checks it. The documented
+[format_whitelist input option](https://ffmpeg.org/ffmpeg-formats.html#Format-Options)
+accepts a comma-separated demuxer list. In contrast,
+[loudnorm JSON](https://github.com/FFmpeg/FFmpeg/blob/n6.1/libavfilter/af_loudnorm.c#L786)
+is emitted through the FFmpeg log channel; it must not be parsed from stdout.
+
+Separately, #1437 tightens **generic, already registered RUN_JOB_TEMPLATE input
+staging upon a future release**, not just this inactive builtin. When an
+`expected_bytes` value is supplied, copying writes no more than the lesser of that
+value and the remaining aggregate input allowance, and reads at most one extra
+byte to detect overflow. Omitted expectations retain the aggregate limit. Exact
+snapshot hashing, short-file mismatch checks, duplicate accounting and failure
+cleanup remain in force. This changes no input wire schema or artifact contract.
+
+This is **part of aceteam-ai/aceteam#11481**, not a registered or template-ready
+builtin. `runVideoComposeBuiltin` has no registry entry or approved manifest
+hash. Its live dependency set refuses before tool discovery or output creation.
+Activation is blocked on paper-trail card scenes (#11480) and the vendored v3
+shell (#11296), including a real implementation of the card/disclosure seam.
+The fake renderer in unit tests supplies fixtures only; it is not a card renderer.
+
+The platform source merged in aceteam#11972 at
+`460d7d3ea24d254e572948e7129321d759beffe6` pins the inactive Citadel source
+`7b75c8aed8f2732907a53d9c883aba320125a61a`. The exact platform schema, theme
+list and synthetic timeline are copied into `cmd/testdata/film_compose/`;
+`TestVideoComposeSharedPlatformFixtures` compares all three against the local
+source and fake-media output. This reconciles offline source compatibility,
+without changing the pinned contract or establishing activation readiness.
+
+### Unresolved activation and approval blockers
+
+The following decisions require peer review before changing this provisional
+contract or approving a template:
+
+- Card durations currently accept any positive value up to 60 seconds. The
+  proposed 0.4-second floor is not implemented or agreed by this source refresh;
+  both copies of the shared schema must change together if it is adopted.
+- The probe accepts square-pixel landscape chapters from 1 to 120 fps and even
+  geometry up to 8192 pixels wide, while the existing card capture helper emits
+  30 fps. The core requires the rendered intro to preserve the first chapter's
+  geometry and exact frame-rate spelling. Agree on the canonical geometry and
+  rate/normalization policy before connecting the real renderer.
+- The silent stereo 48 kHz AAC card path is tested with fake capture/encoder
+  dependencies. Continuous AAC tracks and concat compatibility still require
+  actual pinned card media acceptance.
+- The card/disclosure seam has no production implementation. Both the chapter
+  card and every frame of the corresponding chapter must carry the disclosure;
+  synthetic seam invocation does not prove the burn-in. Blocked paper-trail#23
+  and the #11296 v3 shell are not integrated here.
+- The shared schema uses 48 MiB as both default and maximum. The issue specifies
+  the default; the maximum remains a proposed delivery policy requiring review.
+- C4 durable, single-use Film approval admission is not supplied by the expected
+  input hashes. Hash/byte checks bind dispatch to approved snapshot content but
+  do not establish an approval's identity, durable consumption or single use.
+  C4 explicitly blocks template approval until that admission boundary is ready.
+
+This source refresh therefore adds no registry entry or approved manifest,
+leaves `liveVideoComposeDeps().visuals` nil, and performs no node registration,
+template approval, release, live-media acceptance or production operation.
+
+### Inactive source contract
+
+Params are exactly `{}`. Proposed inputs are exactly one `film.json` (at most
+1 MiB), one to 32 chapter MP4s named in it, and an optional `poster.png` override.
+Files must be declared staged regular files with distinct basenames. Each
+chapter's `file` is the exact final staged basename, including the unique name
+returned by FILE_FETCH/NodeFileWrite. S3 (#11483) must stage first, assemble the
+final film.json from those returned names, then obtain human approval over those
+final inputs. No implicit `ch1.mp4` rename, case folding, directory traversal,
+external URL, unlisted file lookup, extra input, or music `bed` is supported.
+Chapter names use ASCII letters/digits/underscore/hyphen/dot, end in `.mp4`, and
+cannot start with a dot or hyphen.
+
+An `.mp4` suffix is not a container guarantee. Before tool discovery, chapter
+preflight requires a normal self-contained, non-fragmented ISO-BMFF MP4:
+initial `ftyp` with a supported MP4 brand, one `moov`, local `mdat`, and one or
+two tracks whose `dref` is exactly a self-contained `url ` entry. Reference/
+compressed movies, external data references, unsupported top-level boxes and
+fragmented containers are refused. Box traversal is capped at 4096 boxes, six
+levels and a 16 MiB movie box, without reading media payloads. The preflight is
+not a codec validator. Every MP4 probe and decode additionally forces the MOV
+demuxer and MOV format whitelist with `enable_drefs=0` and
+`use_absolute_path=0`; returned container metadata must match the MOV family.
+Future disclosure rendering must use the same pinned input options. The
+supplied-poster path forces `image2pipe` and the PNG decoder. A file protocol
+allowlist alone does not prevent a disguised manifest from reading undeclared
+local bytes. FFmpeg documents the external-track controls in its
+[MOV demuxer options](https://ffmpeg.org/ffmpeg-formats.html#mov_002fmp4_002f3gp).
+
+`videoComposeFilmSchema` owns the proposed closed film schema. Exact keys are
+checked at every object level; duplicate keys, trailing JSON and invalid Unicode
+are refused before struct binding. Top-level fields are `title`, `subtitle`,
+`intro`, `outro`, `theme`, `chapters`, optional `loudness`, and optional `delivery`.
+Intro/outro contain `lines` and positive `seconds` up to 60. Chapters require
+`file`, `title`, `narrator: {name,line}`, `stamp: {label,by,at}`, positive
+`card_seconds` up to 60, nullable `disclosure`, `narration_identity`, and
+`speaks_as_person`. The identity enum is `stock|consented_clone|own_recording`
+(#11484). These last two required fields repair their omission in #11481's JSON
+example: `stock` plus `speaks_as_person:true` without a nonblank disclosure must
+fail closed. A stamp requires `label:"SIGNED"`, a nonblank `by`, and a valid
+`at` calendar date in `YYYY-MM-DD` form. The future renderer must place disclosure
+on the card and burn it for the chapter's entire duration. Text/card-count limits are pinned by the
+source schema; theme names currently use the exact existing v2 preset registry
+and must be reconciled with the pinned v3 registry before activation.
+
+For example, a chapter must now include:
+
+```json
+{
+  "file": "staged-a71f-chapter.mp4",
+  "title": "I signed my own homework",
+  "narrator": {"name": "the Ace", "line": "Narrated by the Ace, the AI"},
+  "narration_identity": "stock",
+  "speaks_as_person": false,
+  "disclosure": null,
+  "stamp": {"label": "SIGNED", "by": "founder", "at": "2026-10-12"},
+  "card_seconds": 2.5
+}
+```
+
+Fixed ffprobe argv inspect every chapter before rendering, recording dimensions,
+rational frame rate, pixel format, codec profile/level/time base/extradata,
+audio codec/rate/channels/extradata and duration. Proposed v1 supports square-pixel
+landscape inputs, even dimensions up to 8192 pixels wide, 1–120 fps and one video
+plus one audio stream; mixed aspect, absent audio, extra streams, invalid metadata
+and missing files fail. The current capture helper is still 30 fps; integrating
+other reference frame rates is an activation requirement, not a tested capability.
+Before scratch creation or rendering, the projected total includes the declared
+intro, outro and every chapter card plus every probed chapter duration. Title
+cards alone exceeding the cap refuse during film decoding, before tool discovery.
+`videoComposeAddDuration` owns finite, positive binary64-second accumulation:
+it checks each part against the remaining allowance before adding, refuses
+overflow/non-finite values and has no rounding epsilon above the hard maximum.
+This follows the existing probe/timeline numeric contract, not an exact rational
+duration or a promise about real encoder clocks.
+
+The same cap is rechecked incrementally against the actual intro, chapter cards,
+prepared clips and outro. The concatenated output is probed before loudnorm;
+the normalized output is probed before any optional size-cap encode; the renamed
+capped output is probed again. Every delivered media duration must independently
+stay within the hard maximum and retain the existing one-frame agreement with
+the actual timeline. That frame tolerance never permits a film over 600 seconds.
+The film schema, shared JSON fixtures and producer contract do not change, and
+overlong media is refused rather than silently trimmed.
+
+The single-landscape capture entry point uses the same Chromium/cgroup lifecycle
+as existing papercraft rendering and requests continuous stereo 48 kHz silent
+AAC; the existing public papercraft entry point still renders both formats.
+
+The source core copies chapter streams only when the inspected stream parameters
+match the rendered intro reference; otherwise it requests libx264 CRF 17,
+yuv420p and AAC 192k normalization. Prepared clips/cards are probed again and
+must match before the safe concat demuxer consumes a node-written list of fixed
+scratch basenames. These subprocesses use the existing limited-command runner,
+minimal child environment and process-tree cleanup; no shell, NVENC, provider,
+or credential path is introduced. Input protocols are limited to file/pipe.
+
+Audio uses measured two-pass loudnorm, defaulting to -14 LUFS, -2 dBTP and LRA 11.
+An explicit complete `loudness: {i,tp,lra}` can choose -16 LUFS instead.
+`delivery.max_bytes` defaults to 48 MiB (50331648 bytes), including when delivery
+is `{}`. **Proposed conservative v1 policy:** 48 MiB is also its maximum pending
+S5, preserving the current upload ceiling; this upper bound needs contract
+review because #11481 specifies the default but does not explicitly spell out
+the maximum. Only an oversized result triggers one x264 bitrate cap pass; it
+reserves mux/audio headroom, copies the normalized audio, and fails if actual
+bytes still exceed the limit. Both final encode paths request `+faststart`.
+No node performance measurement or full-film media validation has been performed.
+The opt-in `TestVideoComposeLocalEncodedMP4` accepts a disposable encoded MP4
+through `CITADEL_VIDEO_COMPOSE_OFFLINE_FIXTURE` (at most 1 MiB) and optional local
+DASH fixture through `CITADEL_VIDEO_COMPOSE_OFFLINE_MANIFEST` (at most 64 KiB).
+It bounds local commands to 15 seconds, verifies the genuine MP4's pinned probe
+and copy/re-encode paths, and refuses the disguised manifest. Normal unit tests
+use synthetic container/probe fixtures and invoke no media binaries. Added
+duration fixtures cover exact/over-limit projected multi-chapter totals,
+title-card-only refusal before discovery, finite/positive arithmetic boundaries,
+and independent intro/card/clip/outro/concat/normalization/cap output overruns.
+The duration fixtures are authored source only; no local test or media execution
+has been performed for this correction. Existing shared timeline values are
+unchanged. The
+disguised-manifest regression asserts rejection before discovery, subprocesses,
+rendering or output creation, even with a valid undeclared BaseURL target.
+
+Proposed outputs are `film.mp4`, `poster.png`, and `chapters.json`. The poster is
+the frame immediately after the intro or a decoded/re-encoded supplied override.
+The timeline is an object with `chapters: [{index,title,start_s,end_s,card_start_s,
+narrator,stamp,disclosure}]`, `duration_s`, `bytes`, `loudness_measured` (the first
+loudnorm pass's input statistics), `loudness_measured_stage:"pre_normalization"`,
+and `encode_passes` (one audio-normalization
+encode, plus one if the delivery cap ran). Chapter indices start at one;
+start/end exclude the chapter card, card_start includes its start. Times are
+accumulated from prepared media durations, including intro/outro, and final
+duration must agree within one frame. `chapters.json` is an output file: no fields
+are added to the adapter's `outputs/duration_ms/input_hashes/receipt` envelope.
+The five loudness statistic values remain strings; they describe the input
+analysis and must never be presented as measurements of delivered loudness.
+
+Before activation: integrate pinned real card/disclosure assets, reconcile the
+reference format/rate/stream normalization with them, run real media acceptance
+and the capped ten-minute CPU timing on the target node, then review the final
+closed schema and registration manifest/hash. The independent render wall
+timeout is two hours; RunNodeJob currently caps a supplied timeout at 1800 s.
+Coordinate the eventual release with FILE_FETCH (#11482); source presence or a
+version number alone does not establish node capability. Jason owns the eventual
+template registration and approval on node 1795, after the release routed through
+automated-citadel. This source change performs none of those actions.
