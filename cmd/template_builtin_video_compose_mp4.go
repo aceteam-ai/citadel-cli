@@ -32,6 +32,11 @@ type videoComposeMP4Walker struct {
 	haveMDTA      bool
 }
 
+type videoComposeMP4Track struct {
+	handler  string
+	haveSTSD bool
+}
+
 // This bounded preflight is not a codec parser or arbitrary camera guarantee.
 // Metadata uses its own closed role grammar because FFmpeg's MOV dispatcher
 // recursively interprets recognized atoms even inside meta/udta/ilst. Forced
@@ -50,7 +55,7 @@ func validateVideoComposeMP4(path string) (retErr error) {
 		return fmt.Errorf("not a self-contained MP4")
 	}
 	w := videoComposeMP4Walker{reader: f}
-	if err := w.movie(0, info.Size(), "", 0, false); err != nil {
+	if err := w.movie(0, info.Size(), "", 0, nil); err != nil {
 		return err
 	}
 	if w.moovs != 1 || w.mdats == 0 || w.tracks < 1 || w.tracks > 2 {
@@ -109,7 +114,7 @@ func (w *videoComposeMP4Walker) metadataBox(box videoComposeMP4Box, root bool) e
 	return nil
 }
 
-func (w *videoComposeMP4Walker) movie(start, end int64, parent string, depth int, inTrack bool) error {
+func (w *videoComposeMP4Walker) movie(start, end int64, parent string, depth int, track *videoComposeMP4Track) error {
 	if depth > 6 {
 		return fmt.Errorf("MP4 nesting exceeds limit")
 	}
@@ -149,13 +154,21 @@ func (w *videoComposeMP4Walker) movie(start, end int64, parent string, depth int
 			}
 		}
 		switch box.kind {
-		case "moov", "trak", "mdia", "minf", "dinf":
-			parents := map[string]string{"moov": "", "trak": "moov", "mdia": "trak", "minf": "mdia", "dinf": "minf"}
+		case "moov", "trak", "mdia", "minf", "dinf", "stbl", "edts", "tref":
+			// FFmpeg n6.1 dispatches recognized atoms inside all these
+			// containers, including sample tables, edit lists and references.
+			// They cannot be treated as opaque merely because metadata is not
+			// normally placed there.
+			parents := map[string]string{"moov": "", "trak": "moov", "mdia": "trak", "minf": "mdia", "dinf": "minf", "stbl": "minf", "edts": "trak", "tref": "trak"}
 			if parent != parents[box.kind] {
 				return fmt.Errorf("unexpected MP4 container %q", box.kind)
 			}
 			before := w.drefs
-			if err := w.movie(box.payload, box.end, box.kind, depth+1, inTrack || box.kind == "trak"); err != nil {
+			childTrack := track
+			if box.kind == "trak" {
+				childTrack = &videoComposeMP4Track{}
+			}
+			if err := w.movie(box.payload, box.end, box.kind, depth+1, childTrack); err != nil {
 				return err
 			}
 			if box.kind == "trak" {
@@ -163,6 +176,25 @@ func (w *videoComposeMP4Walker) movie(start, end int64, parent string, depth int
 				if w.drefs-before != 1 {
 					return fmt.Errorf("MP4 track requires one self-contained data reference")
 				}
+			}
+		case "hdlr":
+			if err := w.mediaHandler(box, parent, track); err != nil {
+				return err
+			}
+		case "stsd":
+			if parent != "stbl" || track == nil || track.handler == "" || track.haveSTSD {
+				return fmt.Errorf("unsupported_sample_description")
+			}
+			track.haveSTSD = true
+			if err := w.sampleDescriptions(box, depth+1, track); err != nil {
+				return err
+			}
+		case "wave":
+			if parent != "sample-entry" || track == nil || track.handler != "soun" {
+				return fmt.Errorf("unsupported MP4 container %q", box.kind)
+			}
+			if err := w.wave(box, depth, track); err != nil {
+				return err
 			}
 		case "dref":
 			if parent != "dinf" || box.end-box.payload != 20 {
@@ -178,11 +210,33 @@ func (w *videoComposeMP4Walker) movie(start, end int64, parent string, depth int
 			w.drefs++
 		case "cmov", "rmra", "rmda", "rdrf":
 			return fmt.Errorf("compressed/reference movie containers are unsupported")
+		case "moof", "mvex", "traf", "sinf", "schi", "hoov":
+			// Fragment/encryption containers and the legacy hoov alias are
+			// also dispatched by MOV. This self-contained, non-fragmented
+			// grammar does not support them at any depth.
+			return fmt.Errorf("unsupported MP4 container %q", box.kind)
+		case "wfex":
+			// ff_get_wav_header changes the current stream to audio even
+			// outside an audio sample entry. That can change a later stsd
+			// header/extension boundary independently of its mdia handler.
+			// This alternate WAVEFORMATEX form is not in the grammar.
+			return fmt.Errorf("unsupported_sample_description")
+		case "ftyp", "mdat", "wide":
+			if parent != "" {
+				return fmt.Errorf("unexpected MP4 container %q", box.kind)
+			}
+		case "url ", "urn ":
+			// The only accepted reference entry is the exact self-contained
+			// url checked inside dref above, never a separately dispatched atom.
+			return fmt.Errorf("external or unsupported MP4 data reference")
+		case "ilst", "keys":
+			// These are accepted only by the closed metadata-role walker.
+			return fmt.Errorf("unsupported_metadata_box")
 		case "meta", "udta":
 			if parent != "" && parent != "moov" && parent != "trak" {
 				return fmt.Errorf("unsupported_metadata_box")
 			}
-			if err := w.metadata(box, depth+1, inTrack, true); err != nil {
+			if err := w.metadata(box, depth+1, track != nil, true); err != nil {
 				return err
 			}
 		case "uuid":
@@ -196,6 +250,141 @@ func (w *videoComposeMP4Walker) movie(start, end int64, parent string, depth int
 		offset = box.end
 	}
 	return nil
+}
+
+func (w *videoComposeMP4Walker) mediaHandler(box videoComposeMP4Box, parent string, track *videoComposeMP4Track) error {
+	if track == nil || box.end-box.payload < 24 {
+		return fmt.Errorf("unsupported_sample_description")
+	}
+	var header [12]byte
+	if _, err := w.reader.ReadAt(header[:], box.payload); err != nil {
+		return err
+	}
+	if binary.BigEndian.Uint32(header[:4]) != 0 {
+		return fmt.Errorf("unsupported_sample_description")
+	}
+	handler := string(header[8:12])
+	// QuickTime may include a separate minf data handler. These subtypes do
+	// not alter FFmpeg's media type; never accept vide/soun in this role.
+	if parent == "minf" && string(header[4:8]) == "dhlr" && (handler == "url " || handler == "alis") {
+		return nil
+	}
+	if parent != "mdia" || track.handler != "" || (handler != "vide" && handler != "soun") {
+		return fmt.Errorf("unsupported_sample_description")
+	}
+	track.handler = handler
+	return nil
+}
+
+func (w *videoComposeMP4Walker) sampleDescriptions(box videoComposeMP4Box, depth int, track *videoComposeMP4Track) error {
+	if depth > 6 {
+		return fmt.Errorf("MP4 nesting exceeds limit")
+	}
+	if box.end-box.payload < 8 {
+		return fmt.Errorf("invalid_sample_description")
+	}
+	var header [8]byte
+	if _, err := w.reader.ReadAt(header[:], box.payload); err != nil {
+		return err
+	}
+	count := binary.BigEndian.Uint32(header[4:])
+	// Version zero gives a single, unambiguous QuickTime audio version
+	// branch in n6.1, independent of the file's compatible brands.
+	if binary.BigEndian.Uint32(header[:4]) != 0 || count == 0 || count > 1024 || uint64(count) > uint64((box.end-box.payload-8)/16) {
+		return fmt.Errorf("invalid_sample_description")
+	}
+	offset := box.payload + 8
+	for i := uint32(0); i < count; i++ {
+		entry, err := w.box(offset, box.end)
+		if err != nil {
+			return err
+		}
+		var size [4]byte
+		if _, err := w.reader.ReadAt(size[:], entry.start); err != nil {
+			return err
+		}
+		// Unlike regular atoms, FFmpeg reads sample-entry size as an
+		// ordinary uint32: no zero-to-end or extended-size encoding.
+		if entry.header != 8 || binary.BigEndian.Uint32(size[:]) < 16 || entry.end-entry.payload < 8 {
+			return fmt.Errorf("invalid_sample_description")
+		}
+		var common [8]byte
+		if _, err := w.reader.ReadAt(common[:], entry.payload); err != nil {
+			return err
+		}
+		if common != [8]byte{0, 0, 0, 0, 0, 0, 0, 1} {
+			return fmt.Errorf("external or unsupported MP4 data reference")
+		}
+		switch entry.kind {
+		case "encv", "enca", "mebx", "tmcd":
+			return fmt.Errorf("unsupported_sample_description")
+		}
+		prefix := int64(78)
+		if track.handler == "soun" {
+			prefix = 28
+			if entry.end-entry.payload < prefix {
+				return fmt.Errorf("invalid_sample_description")
+			}
+			var version [2]byte
+			if _, err := w.reader.ReadAt(version[:], entry.payload+8); err != nil {
+				return err
+			}
+			switch binary.BigEndian.Uint16(version[:]) {
+			case 0:
+			case 1:
+				prefix += 16
+			case 2:
+				prefix += 36
+			default:
+				return fmt.Errorf("unsupported_sample_description")
+			}
+		}
+		if entry.end-entry.payload < prefix {
+			return fmt.Errorf("invalid_sample_description")
+		}
+		if track.handler == "vide" {
+			var depth [2]byte
+			if _, err := w.reader.ReadAt(depth[:], entry.payload+74); err != nil {
+				return err
+			}
+			// qtpalette can consume a variable color table even for a
+			// familiar codec tag. That is not the fixed camera layout.
+			switch binary.BigEndian.Uint16(depth[:]) & 31 {
+			case 1, 2, 4, 8:
+				return fmt.Errorf("unsupported_sample_description")
+			}
+		}
+		// stsd/entry and the optional single wave are finite roles, not
+		// extra levels of arbitrary movie/metadata recursion. Keep the
+		// depth-six bound and shared box budget for their dispatched atoms.
+		if err := w.movie(entry.payload+prefix, entry.end, "sample-entry", depth, track); err != nil {
+			return err
+		}
+		offset = entry.end
+	}
+	if offset != box.end {
+		return fmt.Errorf("invalid_sample_description")
+	}
+	return nil
+}
+
+func (w *videoComposeMP4Walker) wave(box videoComposeMP4Box, depth int, track *videoComposeMP4Track) error {
+	if box.end-box.payload < 12 {
+		return fmt.Errorf("unsupported_sample_description")
+	}
+	var first [12]byte
+	if _, err := w.reader.ReadAt(first[:], box.payload); err != nil {
+		return err
+	}
+	// n6.1's ALAC compatibility path may otherwise consume eight bytes
+	// before invoking the global dispatcher. This exact first frma forces
+	// its rewind branch whenever that path applies. Other audio codecs
+	// either use this same aligned dispatcher or consume wave opaquely;
+	// we conservatively require the structured form for all of them.
+	if binary.BigEndian.Uint32(first[:4]) != 12 || string(first[4:8]) != "frma" {
+		return fmt.Errorf("unsupported_sample_description")
+	}
+	return w.movie(box.payload, box.end, "wave", depth, track)
 }
 
 func (w *videoComposeMP4Walker) uuid(box videoComposeMP4Box) error {
@@ -420,10 +609,13 @@ func (w *videoComposeMP4Walker) items(box videoComposeMP4Box, depth int, mode st
 
 func videoComposeMP4TextMetadata(kind string) bool {
 	// These are known MOV string leaves, not global movie/reference parsers.
+	// In particular, n6.1's udta string reader treats swr/enc as encoder,
+	// mak/mod as device strings and xyz as location text. Android's writer
+	// serializes xyz as ISO-6709 coordinates, not a dereferenceable location.
 	// Do not accept arbitrary copyright-prefixed names, artwork, URLs or
 	// unreviewed vendor structures merely because their payload looks like text.
 	switch kind {
-	case "\xa9nam", "\xa9ART", "\xa9alb", "\xa9day", "\xa9too", "\xa9cmt", "\xa9gen", "cprt", "desc":
+	case "\xa9nam", "\xa9ART", "\xa9alb", "\xa9day", "\xa9too", "\xa9cmt", "\xa9gen", "\xa9swr", "\xa9mak", "\xa9mod", "\xa9enc", "\xa9xyz", "cprt", "desc":
 		return true
 	default:
 		return false

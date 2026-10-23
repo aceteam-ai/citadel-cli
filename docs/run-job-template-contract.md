@@ -260,8 +260,10 @@ two tracks whose `dref` is exactly a self-contained `url ` entry. Reference/
 compressed movies, external data references, unsupported top-level boxes and
 fragmented containers are refused. Box traversal is capped at 4096 boxes, six
 levels and a 16 MiB movie box, without reading media payloads. The preflight is
-not a codec validator or a complete role validator for ordinary movie
-descendants. Every MP4 probe and decode additionally forces the MOV
+not a codec bitstream validator. The walker enters dispatched sample-table,
+edit-list and track-reference containers (`stbl`, `edts`, `tref`), and refuses
+unsupported fragment/encryption/compressed-container roles rather than treating
+their children as opaque. Every MP4 probe and decode additionally forces the MOV
 demuxer and MOV format whitelist with `enable_drefs=0` and
 `use_absolute_path=0`; returned container metadata must match the MOV family.
 Future disclosure rendering must use the same pinned input options. The
@@ -271,7 +273,7 @@ local bytes. FFmpeg documents the external-track controls in its
 [MOV demuxer options](https://ffmpeg.org/ffmpeg-formats.html#mov_002fmp4_002f3gp).
 
 Metadata has a separate closed grammar, because FFmpeg's
-[MOV dispatcher](https://github.com/FFmpeg/FFmpeg/blob/n6.1.1/libavformat/mov.c#L7470-L7486)
+[reviewed n6.1 MOV dispatcher](https://github.com/FFmpeg/FFmpeg/blob/d4ff0020b40b524a490cf62eccbd3a318f4c0e58/libavformat/mov.c#L7852-L7959)
 can interpret recognized atoms inside metadata containers. `meta` and `udta`
 are accepted only at the file, movie or track level, with bounded nesting inside
 `udta`. Each serialized metadata box is at most 1 MiB, including its header;
@@ -284,6 +286,35 @@ child. `mdir` items and direct `udta` leaves use only the reviewed text types
 listed by `videoComposeMP4TextMetadata`. Artwork, custom/vendor containers,
 reference/location containers, nested media and unknown metadata roles refuse.
 This does not accept arbitrary phone/camera exports.
+
+Sample-description extension atoms also enter that same role-aware walker.
+An explicit, correctly placed preceding `mdia/hdlr` selects `vide` or `soun`;
+ordinary version-zero `stsd` entries require local data-reference index one.
+The accepted structural layouts follow the pinned
+[sample-entry dispatch](https://github.com/FFmpeg/FFmpeg/blob/d4ff0020b40b524a490cf62eccbd3a318f4c0e58/libavformat/mov.c#L2707-L2782):
+non-paletted visual entries and QuickTime audio versions zero, one and two.
+This is generic structural coverage, not a codec allowlist: ProRes, PCM and
+other tags can reach the normal probe when their framing fits. Finite sample
+and audio `wave` roles share the 4096-box counter and depth-six movie bound.
+Structured audio `wave` requires an exact first `frma` atom to align the
+[ALAC compatibility branch](https://github.com/FFmpeg/FFmpeg/blob/d4ff0020b40b524a490cf62eccbd3a318f4c0e58/libavformat/mov.c#L2053-L2103);
+nested waves and opaque compatibility forms refuse. Palette layouts, data and
+subtitle handler roles, encrypted entries, and `mebx`/`tmcd` descriptions refuse.
+`wfex` also refuses: its
+[WAV helper changes the media type](https://github.com/FFmpeg/FFmpeg/blob/d4ff0020b40b524a490cf62eccbd3a318f4c0e58/libavformat/riffdec.c#L94-L107)
+and would otherwise invalidate the extension offset proof. These refusals do
+not claim that the underlying codecs are unsafe; their layouts are outside
+this reviewed preflight grammar.
+
+The reviewed bounded opaque text leaves include `©swr`, `©mak`, `©mod`, `©enc`
+and `©xyz`. The latter is location text, including Android's
+[ISO-6709 writer](https://android.googlesource.com/platform/frameworks/av/+/10ef7f7514bdf6d9c38c93d9bb0194c0920d152f/media/libstagefright/MPEG4Writer.cpp#2607),
+not an external reference. Text admission does not validate or interpret the
+coordinates. Apple's
+[`mebx` timed-metadata description](https://developer.apple.com/documentation/quicktime-file-format/timed_metadata_sample_descriptions)
+is outside the accepted media roles. iPhone recordings carrying that third
+timed-metadata track are refused today; the existing two-track contract is
+unchanged. Real camera-corpus compatibility remains required before activation.
 
 Top-level UUID metadata permits only XMP
 `be7acfcb-97a9-42e8-9c71-999491e3afac` and Google spherical-video v1
