@@ -1179,6 +1179,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	} else {
 		Log("network not configured (no saved state)")
 	}
+	// Publish one immutable provider bundle after transport selection, before
+	// session control can read it. Heartbeat and optional status consumers below
+	// reuse these exact function values; later runner/swap initialization is
+	// observed through the existing atomic pointers rather than callback writes.
+	sessionProviders := newWorkSessionProviders(workerState, &nodeSwapManager, &nodeRunner, pubSubTransportFn)
+	workerLivenessFn, swapStatsFn, laneActivityFn := sessionProviders.Worker, sessionProviders.Swap, sessionProviders.Lanes
+
 	// Publish S2 session status/stop only from the process that owns the
 	// single-instance worker lock. The machine-wide TUN socket belongs to
 	// ipnserver and must never be replaced by this controller.
@@ -1190,7 +1197,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Restart=on-failure does NOT restart -- so a failure to bind the
 		// auxiliary control socket (realistically EACCES on a root-owned state
 		// dir) would silently and permanently stop an otherwise-healthy worker.
-		if stopSessionControl, err := startNodeSessionControl(workSessionMode, cancel); err != nil {
+		if stopSessionControl, err := startNodeSessionControl(workSessionMode, cancel, sessionProviders); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: node session control unavailable (continuing without it): %v\n", err)
 			Log("node session control unavailable (continuing without it): %v", err)
 		} else {
@@ -1486,35 +1493,6 @@ func runWork(cmd *cobra.Command, args []string) {
 		workStatusPort = 8080
 	}
 
-	// Live worker consume-loop liveness for the heartbeat (issue #548). Reads the
-	// same *WorkerState the runner updates, so the heartbeat can surface a
-	// "green but wedged" node (heartbeating from a separate goroutine while the
-	// consume loop is blocked and draining nothing).
-	workerLivenessFn := func() *status.WorkerLiveness {
-		live := workerLivenessFrom(workerState.Snapshot())
-		// Pub/sub transport is read live off the API client rather than mirrored
-		// through WorkerState: it can flip at any moment (background retry
-		// succeeds, connection drops) and a snapshot field would go stale.
-		if pubSubTransportFn != nil {
-			live.PubSubTransport = pubSubTransportFn()
-		}
-		return live
-	}
-
-	// Model-hotswap swap-activity stats for the heartbeat (citadel-cli#717): "is
-	// this node thrashing?" without shell access. nodeSwapManager.Store is called
-	// below at the buildNodeJobHandlers call site, from status-publisher
-	// goroutines that are already running by then (Load() is what makes that
-	// safe); nil here (before the store) or under the hotswap break-glass
-	// disable means no Swap block on the heartbeat.
-	swapStatsFn := func() *status.SwapActivity {
-		mgr := nodeSwapManager.Load()
-		if mgr == nil {
-			return nil
-		}
-		return swapStatsFrom(mgr.SwapStats())
-	}
-
 	// Full-wipe-guard refusal state for the heartbeat (citadel-cli#742): "is
 	// this node's reconcile pass currently being refused?" without shell
 	// access to the journal. nodeReconcileHealth.Store is called below at the
@@ -1544,20 +1522,6 @@ func runWork(cmd *cobra.Command, args []string) {
 			return nil
 		}
 		return reservationsFrom(list)
-	}
-
-	// Live bounded-execution-lane activity for the heartbeat (citadel-cli#908):
-	// "how loaded is this node right now" so a dispatcher can avoid targeting a
-	// saturated node. nodeRunner.Store is called below at the runner's
-	// construction site, from a point where these status-publisher goroutines are
-	// already running (Load() is what makes that safe); nil here (before the
-	// store) leaves the Lanes field omitted from the heartbeat.
-	laneActivityFn := func() []status.LaneActivity {
-		rn := nodeRunner.Load()
-		if rn == nil {
-			return nil
-		}
-		return laneActivityFrom(rn.LaneSnapshots())
 	}
 
 	jobTypesFn := func() []string {
