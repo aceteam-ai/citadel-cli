@@ -294,7 +294,9 @@ func TestVideoComposeCameraMetadataRequiresClosedFramedRoles(t *testing.T) {
 			cameraMP4RequireReason(t, cameraMP4Fixture("isom", "top", test.metadata), want)
 		})
 	}
-	unknownItem := cameraMP4MDIR(videoComposeTestBox("\xa9xyz", cameraMP4Data([]byte("not an approved text item"))))
+	// xyz is now an explicitly reviewed location-text leaf. Keep this
+	// refusal oracle on an unapproved namespace; xyz has positive fixtures.
+	unknownItem := cameraMP4MDIR(videoComposeTestBox("\xa9zzz", cameraMP4Data([]byte("not an approved text item"))))
 	cameraMP4RequireReason(t, cameraMP4Fixture("isom", "top", unknownItem), "unsupported_metadata_box")
 }
 
