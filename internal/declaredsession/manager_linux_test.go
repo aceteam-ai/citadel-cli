@@ -348,10 +348,17 @@ func TestManagerRemainingScopeBlocksReplacementAfterOldBirthGone(t *testing.T) {
 }
 
 func TestManagerExplicitStopCanForceExactQuarantinedScope(t *testing.T) {
+	for _, phase := range []string{"cleanup_unconfirmed", "spawn_failed", "event_queue_overflow"} {
+		t.Run(phase, func(t *testing.T) { checkManagerQuarantinedStop(t, phase) })
+	}
+}
+
+func checkManagerQuarantinedStop(t *testing.T, phase string) {
+	t.Helper()
 	store, session := fixtureStore(t)
 	writeManagerDeclarationFixture(t, store)
 	state, hello, observation := managerRecordFixture()
-	state.Phase, hello.Phase = "cleanup_unconfirmed", "cleanup_unconfirmed"
+	state.Phase, hello.Phase = phase, phase
 	if err := session.WriteState(state); err != nil {
 		t.Fatal(err)
 	}

@@ -50,14 +50,15 @@ func (*memoryConnection) SetWriteDeadline(time.Time) error {
 
 func TestFramingRejectsAmbiguitySizeVersionAndTruncation(t *testing.T) {
 	bad := []string{
-		`{"version":1,"op":"status","op":"stop"}`,
-		`{"version":1,"op":"status","unknown":"private"}`,
-		`{"version":2,"op":"status"}`,
-		`{"version":1,"op":"status"} {}`,
-		`{"version":1,"op":"input","data":"not*base64"}`,
-		`{"version":1,"op":"status","hello":{"name":"a","name":"b"}}`,
-		`{"version":1,"op":"status","state":` + strings.Repeat("[", 18) + `0` + strings.Repeat("]", 18) + `}`,
-		"{\"version\":1,\"op\":\"status\",\"reason\":\"\xff\"}",
+		`{"version":2,"op":"status","op":"stop"}`,
+		`{"version":2,"op":"status","unknown":"private"}`,
+		`{"version":1,"op":"status"}`,
+		`{"version":3,"op":"status"}`,
+		`{"version":2,"op":"status"} {}`,
+		`{"version":2,"op":"input","data":"not*base64"}`,
+		`{"version":2,"op":"status","hello":{"name":"a","name":"b"}}`,
+		`{"version":2,"op":"status","state":` + strings.Repeat("[", 18) + `0` + strings.Repeat("]", 18) + `}`,
+		"{\"version\":2,\"op\":\"status\",\"reason\":\"\xff\"}",
 	}
 	for _, raw := range bad {
 		if _, err := decodeFrame([]byte(raw)); err == nil {
@@ -95,23 +96,23 @@ func TestFrameRoundTripUsesBoundedTypedBinarySafeOutput(t *testing.T) {
 
 func TestFrameKeysRejectCaseFoldAndUnicodeAliasesAtEveryDepth(t *testing.T) {
 	for _, raw := range []string{
-		`{"version":1,"op":"status","OP":"stop"}`,
-		`{"version":1,"op":"attach","readonly":true,"READONLY":false}`,
-		`{"version":1,"op":"status","state":{"holder":{"pid":1,"PID":2}}}`,
-		`{"version":1,"op":"status","state":{},"ſtate":{"phase":"running"}}`,
-		`{"version":1,"op":"attach","take_control":false,"taKe_control":true}`,
-		`{"version":1,"op":"status","state":{"holder":{"ſtart_ticks":1}}}`,
+		`{"version":2,"op":"status","OP":"stop"}`,
+		`{"version":2,"op":"attach","readonly":true,"READONLY":false}`,
+		`{"version":2,"op":"status","state":{"holder":{"pid":1,"PID":2}}}`,
+		`{"version":2,"op":"status","state":{},"ſtate":{"phase":"running"}}`,
+		`{"version":2,"op":"attach","take_control":false,"taKe_control":true}`,
+		`{"version":2,"op":"status","state":{"holder":{"ſtart_ticks":1}}}`,
 	} {
 		if _, err := decodeFrame([]byte(raw)); !errors.Is(err, ErrProtocol) {
 			t.Fatal("noncanonical field alias accepted")
 		}
 	}
 	// Canonical lowercase underscore keys retain their existing typed meaning.
-	attach, err := decodeFrame([]byte(`{"version":1,"op":"attach","incarnation":"0123456789abcdef0123456789abcdef","readonly":false,"take_control":true,"cols":80,"rows":24}`))
+	attach, err := decodeFrame([]byte(`{"version":2,"op":"attach","incarnation":"0123456789abcdef0123456789abcdef","readonly":false,"take_control":true,"cols":80,"rows":24}`))
 	if err != nil || !validClientFrame(attach, false) || !attach.TakeControl {
 		t.Fatal("canonical attach control fields rejected")
 	}
-	status, err := decodeFrame([]byte(`{"version":1,"op":"status","state":{"holder":{"pid":7,"start_ticks":9,"uid":1000,"boot_id":"boot"}}}`))
+	status, err := decodeFrame([]byte(`{"version":2,"op":"status","state":{"holder":{"pid":7,"start_ticks":9,"uid":1000,"boot_id":"boot"}}}`))
 	if err != nil || status.State == nil || status.State.Holder.PID != 7 || status.State.Holder.StartTicks != 9 {
 		t.Fatal("canonical nested state fields rejected")
 	}

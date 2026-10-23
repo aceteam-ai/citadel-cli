@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Store pins the already-selected, trusted node config directory. Configured
@@ -24,6 +25,9 @@ type SessionStore struct {
 	store *Store
 	dir   *os.File
 	paths Paths
+	// recordWait is selected before this SessionStore is published to holder
+	// goroutines. Zero retains the manager's ordinary operation deadline.
+	recordWait time.Duration
 }
 
 type OperationGuard struct {
@@ -190,7 +194,7 @@ func (g *OwnerGuard) Close() error {
 }
 
 func (s *SessionStore) withRecord(write func() error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), operationWait)
+	ctx, cancel := context.WithTimeout(context.Background(), s.recordLockWait())
 	defer cancel()
 	// Each acquisition opens an independent file description, so flock also
 	// serializes callers sharing this SessionStore without an unbounded mutex.
@@ -204,6 +208,13 @@ func (s *SessionStore) withRecord(write func() error) error {
 		return writeErr
 	}
 	return closeErr
+}
+
+func (s *SessionStore) recordLockWait() time.Duration {
+	if s.recordWait > 0 {
+		return s.recordWait
+	}
+	return operationWait
 }
 
 func (s *SessionStore) writeJSON(name string, value any, max int) error {
@@ -291,7 +302,7 @@ func validIncarnation(value string) bool {
 }
 
 func (s *SessionStore) validateState(state State) error {
-	if state.Version != 1 || state.Name != s.paths.Name || !validIncarnation(state.Incarnation) || !validDigest(state.DeclarationRevision) || !oneOf(state.Phase, "starting", "running", "restart_wait", "restarting", "stopping", "stopped", "stopped_clean", "disabled", "config_drift", "config_error", "config_conflict", "holder_lost", "holder_outdated", "isolation_unavailable", "name_conflict", "cleanup_unconfirmed", "crashloop", "error") {
+	if state.Version != 1 || state.Name != s.paths.Name || !validIncarnation(state.Incarnation) || !validDigest(state.DeclarationRevision) || !oneOf(state.Phase, "starting", "running", "restart_wait", "restarting", "stopping", "stopped", "stopped_clean", "disabled", "config_drift", "config_error", "config_conflict", "holder_lost", "holder_outdated", "isolation_unavailable", "name_conflict", "cleanup_unconfirmed", "spawn_failed", "event_queue_overflow", "crashloop", "error") {
 		return ErrUnsafe
 	}
 	if state.Scope.Name != "" && state.Scope.Name != "citadel-sess-"+s.paths.Name+".scope" {
