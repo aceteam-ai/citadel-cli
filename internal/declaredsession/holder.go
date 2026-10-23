@@ -52,6 +52,7 @@ const (
 	maxConsoleBatchBytes = 256 << 10
 	maxPendingEvents     = 128
 	consoleFlushInterval = 50 * time.Millisecond
+	holderRecordWait     = 50 * time.Millisecond
 )
 
 type holder struct {
@@ -144,6 +145,10 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	if err != nil {
 		return err
 	}
+	// This handle belongs only to the holder and is not published yet. Keep
+	// actor record-lock contention to one flush interval, retaining exact
+	// pending records on ErrBusy. This does not bound filesystem or fsync I/O.
+	session.recordWait = holderRecordWait
 	defer func() {
 		if session.Close() != nil {
 			result = ErrUnavailable
@@ -278,7 +283,7 @@ func (h *holder) event(kind, reason, viewer, role string) {
 		if h.terminal != nil {
 			h.terminal.epoch.Store(h.epoch)
 		}
-		h.state.Phase = "cleanup_unconfirmed"
+		h.state.Phase = "event_queue_overflow"
 		h.statePending = true
 		return
 	}
@@ -508,7 +513,7 @@ func (h *holder) startDueChild(now time.Time) {
 	h.nextSpawn = time.Time{}
 	if h.startChild() != nil && h.child == nil {
 		h.quarantined = true
-		h.state.Phase = "cleanup_unconfirmed"
+		h.state.Phase = "spawn_failed"
 		h.writeState()
 	}
 }

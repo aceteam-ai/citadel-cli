@@ -286,6 +286,13 @@ func (m *Manager) change(ctx context.Context, name string, restart bool) (Manage
 		}
 		status, _, observeErr = m.observe(ctx, declaration, session)
 	}
+	// A stop marker may have become durable immediately before a recovery
+	// state write failed. Only an explicit Stop retry may finish retiring this
+	// reservation; Start must not clear its veto while a late launcher can
+	// still recognize the old starting record.
+	if status.State.Phase == "starting" && !validProcessIdentity(status.State.Holder) {
+		return status, ErrManager
+	}
 	if observeErr != nil {
 		return status, observeErr
 	}
@@ -507,6 +514,12 @@ func (m *Manager) stopLocked(ctx context.Context, session *SessionStore, declara
 		return ErrManager
 	}
 	if !validProcessIdentity(stored.Holder) {
+		if stored.Phase == "starting" {
+			if restarting {
+				return ErrManager // Recovery is explicit Stop, followed by Start.
+			}
+			return m.retireHolderlessStarting(ctx, session, stored)
+		}
 		if status.Classification == "stopped" || status.Classification == "stopped_clean" || status.Classification == "config_conflict" ||
 			status.Classification == "isolation_unavailable" && stored.Phase == "isolation_unavailable" && stored.Holder == (ProcessIdentity{}) {
 			return nil
@@ -545,7 +558,7 @@ func (m *Manager) stopLocked(ctx context.Context, session *SessionStore, declara
 			_ = peer.Close()
 			return ErrManager
 		}
-		if live.Phase == "cleanup_unconfirmed" {
+		if live.Phase == "cleanup_unconfirmed" || live.Phase == "spawn_failed" || live.Phase == "event_queue_overflow" {
 			// An authenticated quarantined holder cannot promise graceful
 			// child cleanup. Explicit local stop/restart proceeds only through
 			// the same saved exact invocation, without a flush/ACK claim.
@@ -599,6 +612,71 @@ func (m *Manager) stopLocked(ctx context.Context, session *SessionStore, declara
 		current.Phase, current.Guarantee, current.UpdatedAt = "stopped", "forced_cleanup_no_flush", time.Now()
 		return session.writeJSON("state.json", current, MaxStateBytes)
 	})
+}
+
+// The caller retains OperationGuard. OwnerGuard is acquired BEFORE inspecting
+// the exact saved scope, fencing a delayed holder's own owner-lock/publication
+// path. A scope/PID filename alone never authorizes retirement or signalling.
+func (m *Manager) retireHolderlessStarting(ctx context.Context, session *SessionStore, expected State) (retErr error) {
+	if !emptyHolderStartingReservation(expected) || ctx.Err() != nil {
+		return ErrManager
+	}
+	owner, err := session.AcquireOwner(ctx)
+	if err != nil {
+		return ErrManager
+	}
+	defer func() {
+		if owner.Close() != nil {
+			retErr = ErrManager
+		}
+	}()
+	observation, err := m.ops.inspect(ctx, expected.Scope.Name)
+	if err != nil || ctx.Err() != nil || observation.Scope != (procscope.ScopeIdentity{}) || len(observation.Members) != 0 {
+		return ErrManager
+	}
+	// No legitimate delayed holder can publish a socket while OwnerGuard is
+	// held. An unexplained existing socket is retained rather than unlinked.
+	socket, err := m.ops.socket(session)
+	if err != nil || socket.Present || ctx.Err() != nil {
+		return ErrManager
+	}
+	return session.withRecord(func() error {
+		current, present, err := session.ReadState()
+		if err != nil || !present || ctx.Err() != nil || !sameEmptyStartingReservation(current, expected) {
+			return ErrManager
+		}
+		marker, haveMarker, err := session.ReadStopMarker()
+		if err != nil || haveMarker && (marker.Incarnation != expected.Incarnation || marker.DeclarationRevision != expected.DeclarationRevision) {
+			return ErrManager
+		}
+		if !haveMarker {
+			marker = StopMarker{Version: 1, Name: current.Name, DeclarationRevision: current.DeclarationRevision, Incarnation: current.Incarnation, StoppedAt: time.Now()}
+			// The same-name veto is durable first. A failure before the terminal
+			// record leaves starting held; retrying Stop completes this sequence.
+			if session.writeJSON("stop.json", marker, MaxStateBytes) != nil {
+				return ErrManager
+			}
+		}
+		current.Phase, current.Guarantee, current.UpdatedAt = "stopped", "forced_cleanup_no_flush", time.Now()
+		return session.writeJSON("state.json", current, MaxStateBytes)
+	})
+}
+
+func emptyHolderStartingReservation(state State) bool {
+	return state.Version == 1 && ValidateName(state.Name) == nil && validIncarnation(state.Incarnation) &&
+		validDigest(state.DeclarationRevision) && validDigest(state.FileRevision) && state.ProtocolVersion == ProtocolVersion &&
+		state.BinaryVersion != "" && len(state.BinaryVersion) <= 128 && state.Phase == "starting" && state.Guarantee == "unconfirmed" &&
+		state.Scope == (ScopeIdentity{Name: "citadel-sess-" + state.Name + ".scope", Manager: "user"}) &&
+		state.Holder == (ProcessIdentity{}) && state.Child == (ProcessIdentity{}) && state.RestartCount == 0 && state.ChildGeneration == 0 &&
+		state.LastExit == nil && state.ResolvedExecutable == "" && state.EnvironmentHash == "" && !state.StartedAt.IsZero() && !state.UpdatedAt.IsZero()
+}
+
+func sameEmptyStartingReservation(current, expected State) bool {
+	return emptyHolderStartingReservation(current) && emptyHolderStartingReservation(expected) &&
+		current.Incarnation == expected.Incarnation && current.Name == expected.Name && current.Scope == expected.Scope &&
+		current.DeclarationRevision == expected.DeclarationRevision && current.FileRevision == expected.FileRevision &&
+		current.ProtocolVersion == expected.ProtocolVersion && current.BinaryVersion == expected.BinaryVersion &&
+		current.StartedAt.Equal(expected.StartedAt) && current.UpdatedAt.Equal(expected.UpdatedAt)
 }
 
 func (m *Manager) waitGracefulExit(ctx context.Context, session *SessionStore, expected State) error {

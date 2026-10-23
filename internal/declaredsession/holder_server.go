@@ -193,12 +193,52 @@ func (s *holderServers) serveAttachment(ctx context.Context, cancel context.Canc
 			return
 		}
 		if _, err := s.ask(ctx, holderRequest{op: "viewer", viewer: viewer, frame: request}); err != nil {
+			if dropRefusedAttachmentInput(request.Op, err) {
+				// The actor refused this frame before queue admission. Do not
+				// retry or buffer it across a later role/child generation.
+				continue
+			}
 			viewer.shutdown(viewerOperationReason(err))
 			return
 		}
 		if request.Op == "detach" {
 			return
 		}
+	}
+}
+
+func dropRefusedAttachmentInput(op string, err error) bool {
+	if op != "input" && op != "resize" {
+		return false
+	}
+	return onlyInputRefusal(err, 0)
+}
+
+// Only these actor refusals are transient frame drops. Wrapped/joined errors
+// must contain no additional failure, and malformed wrapper chains fail closed.
+func onlyInputRefusal(err error, depth int) bool {
+	if err == ErrRole || err == ErrBusy {
+		return true
+	}
+	if err == nil || depth >= 8 {
+		return false
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		causes := wrapped.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, inner := range causes {
+			if !onlyInputRefusal(inner, depth+1) {
+				return false
+			}
+		}
+		return true
+	case interface{ Unwrap() error }:
+		return onlyInputRefusal(wrapped.Unwrap(), depth+1)
+	default:
+		return false
 	}
 }
 
