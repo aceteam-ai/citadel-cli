@@ -175,6 +175,12 @@ func (f WorkspaceFreezer) read(ctx context.Context, root *os.Root, input Descrip
 	if ctx.Err() != nil {
 		return frozenInput{}, refuse("cancelled_or_timeout")
 	}
+	return freezeImageData(data, input)
+}
+
+// Both acquisition paths verify retained bytes using the same image guards and
+// private reader factory. Readers capture no descriptor, path or capability.
+func freezeImageData(data []byte, input Descriptor) (frozenInput, error) {
 	sum := sha256.Sum256(data)
 	if hex.EncodeToString(sum[:]) != input.SHA256 {
 		return frozenInput{}, refuse("sha256_mismatch")
