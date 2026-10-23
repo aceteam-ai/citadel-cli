@@ -70,13 +70,21 @@ the stop veto, then retires that reservation without claiming log flush. A late
 holder refuses the veto or terminal phase. Unknown scope observations, a live
 owner or a changed reservation still refuse. If persistence is interrupted after
 the veto but before retirement, repeat Stop; Start cannot clear that partially
-completed holderless-start recovery. A captured holder instead uses the existing
+completed holderless-start recovery. Status labels the known intermediate record
+`recovery_incomplete`; status/start/restart give the explicit Stop-then-Start
+command hint. A captured holder instead uses the existing
 exact process-birth/scope cleanup, with the same Stop-then-Start recovery.
 
 An old live holder can still be attached after a CLI update when its protocol is
 compatible. The saved record, authenticated hello and live state must corroborate
 the same holder binary identity; it need not equal the new CLI's release.
 `holder_outdated` remains an informational status, not a restart instruction.
+This slice uses protocol version 2 for the new failure phases. Version 1 and 2
+clients/holders do not attach across versions; a downgrade cannot interpret the
+new phases as a compatible live session. Prefer an explicit stop with the matching
+CLI before changing versions. A new CLI may explicitly retire only the known
+holderless `starting` record shapes from versions 1 and 2 under the same exact
+empty-scope/owner-lock/veto checks; unknown protocol records remain held.
 
 Stored PID files are observations, not signalling authority. Destructive cleanup
 uses a pinned private user-bus manager and the saved nonzero invocation ID, never
@@ -130,9 +138,11 @@ take the operator lock while a manager waits for its stop/readiness response.
 Record writes sync a private staging file, rename, then sync the directory. A
 post-rename sync failure is uncertainty, not rollback or durable success.
 Record-lock contention gets a bounded retry rather than being mistaken for
-corrupt storage. Holder-owned record writes wait at most 50 ms to acquire that
-lock, then retain their exact pending data for retry on busy; ordinary manager
-record operations retain the five-second acquisition budget. This bounds only
+corrupt storage. Initial holder publication retains the five-second acquisition
+budget because it is fatal on failure and may race the manager's launch record.
+Only after that publication, before sharing the handle, actor record writes use
+at most 50 ms to acquire the lock and retain exact pending data for retry on busy.
+Ordinary manager record operations retain the five-second budget. This bounds only
 lock contention, not filesystem open, write or fsync latency. Console writes are batched within fixed memory/time ceilings;
 normal terminal completion still waits for pending logs/events and final state
 to be durably published. An uncertain append is not automatically replayed.
@@ -168,10 +178,14 @@ queue; a slow viewer is disconnected without blocking the harness. Controller
 transfer fences queued/in-flight old input before a new grant. Resize requests
 and input are checked against current controller and child generation.
 If a valid input or resize frame loses its controller grant, arrives during
-restart wait or encounters a full input queue, only that refused frame is
+restart wait, only that role-refused frame is
 dropped. The attachment remains connected for output, role changes and heartbeat;
 the frame is not acknowledged, queued for replay or automatically retried. A
-refused take-control operation, malformed frame, stopped holder or slow viewer
+busy input/resize queue instead disconnects with the static `busy` reason: the
+same connection cannot forward later paste chunks after dropping a middle chunk.
+This does not add delivery acknowledgements or make prior queued bytes atomic.
+A read-only role transition displays a static local notice that input is no
+longer forwarded. A refused take-control operation, malformed frame, stopped holder or slow viewer
 keeps the existing disconnect behavior. Real role-transfer and saturated-paste
 behavior still require native acceptance.
 Child cleanup revokes every viewer to read-only. S1 does not implicitly restore

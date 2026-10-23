@@ -214,10 +214,12 @@ func dropRefusedAttachmentInput(op string, err error) bool {
 	return onlyInputRefusal(err, 0)
 }
 
-// Only these actor refusals are transient frame drops. Wrapped/joined errors
+// Only role refusals are transient frame drops. A busy queue disconnects so
+// later chunks of a paste cannot continue after an omitted middle chunk.
+// Wrapped/joined errors
 // must contain no additional failure, and malformed wrapper chains fail closed.
 func onlyInputRefusal(err error, depth int) bool {
-	if err == ErrRole || err == ErrBusy {
+	if err == ErrRole {
 		return true
 	}
 	if err == nil || depth >= 8 {

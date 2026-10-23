@@ -246,6 +246,7 @@ const declaredAttachBurst = 64
 func pumpDeclaredAttachment(ctx context.Context, attachment declaredAttachment, decoder *declaredDetachDecoder,
 	results <-chan declaredAttachResult, inputs <-chan declaredAttachInput, resizes <-chan os.Signal,
 	writeOutput func([]byte) error, terminalSize func() (uint16, uint16, error)) error {
+	readOnlyNoticeShown := false
 	forward := func(data []byte) error {
 		if len(data) == 0 || attachment.ReadOnly() {
 			return nil
@@ -340,7 +341,15 @@ func pumpDeclaredAttachment(ctx context.Context, attachment declaredAttachment, 
 				return true, errors.New("declared session holder disconnected")
 			}
 		case "role":
-			if !result.event.ReadOnly {
+			if result.event.ReadOnly {
+				if !readOnlyNoticeShown {
+					if err := writeOutput([]byte("\r\n[Citadel session is read-only; input is not forwarded.]\r\n")); err != nil {
+						return true, err
+					}
+				}
+				readOnlyNoticeShown = true
+			} else {
+				readOnlyNoticeShown = false
 				if err := resize(); err != nil {
 					return true, err
 				}

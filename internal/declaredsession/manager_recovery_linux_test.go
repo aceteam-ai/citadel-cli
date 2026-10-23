@@ -5,6 +5,7 @@ package declaredsession
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -284,7 +285,10 @@ func TestManagerHolderlessRecoveryRetriesDurableMarkerBeforeStateCommit(t *testi
 	}
 	// This is the durable intermediate state if the manager dies after marker
 	// publication but before replacing starting. Start/Restart cannot clear it.
-	if _, err := m.Start(context.Background(), pending.Name); !errors.Is(err, ErrManager) {
+	if status, err := m.Status(context.Background(), pending.Name); err != nil || status.Classification != "recovery_incomplete" || !status.StopMarker {
+		t.Fatal("durable partial recovery was reported as completed", status, err)
+	}
+	if status, err := m.Start(context.Background(), pending.Name); !errors.Is(err, ErrManager) || status.Classification != "recovery_incomplete" {
 		t.Fatal("Start cleared a marker before retiring its starting reservation", err)
 	}
 	if _, err := m.Restart(context.Background(), pending.Name); !errors.Is(err, ErrManager) {
@@ -296,6 +300,31 @@ func TestManagerHolderlessRecoveryRetriesDurableMarkerBeforeStateCommit(t *testi
 	retained, present, err := session.ReadStopMarker()
 	if err != nil || !present || !retained.StoppedAt.Equal(marker.StoppedAt) || retained.Incarnation != marker.Incarnation {
 		t.Fatal("retry rewrote or lost the original durable veto", retained, err)
+	}
+}
+
+func TestHolderlessStartingRecoverySupportsOnlyKnownProtocolRecordShapes(t *testing.T) {
+	for _, version := range []int{1, ProtocolVersion, 0, ProtocolVersion + 1} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			m, session, pending := holderlessRecoveryFixture(t)
+			pending.ProtocolVersion = version
+			if err := session.WriteState(pending); err != nil {
+				t.Fatal(err)
+			}
+			status, err := m.Stop(context.Background(), pending.Name)
+			if version == 1 || version == ProtocolVersion {
+				if err != nil || status.Classification != "stopped" || status.State.ProtocolVersion != version {
+					t.Fatal("known holderless record could not be retired without rewriting its protocol", status, err)
+				}
+			} else {
+				if !errors.Is(err, ErrManager) {
+					t.Fatal("unknown holderless record protocol was retired", status, err)
+				}
+				if _, present, markerErr := session.ReadStopMarker(); markerErr != nil || present {
+					t.Fatal("unknown protocol received a stop veto", markerErr)
+				}
+			}
+		})
 	}
 }
 

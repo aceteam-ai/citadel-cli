@@ -2,7 +2,9 @@ package declaredsession
 
 import (
 	"errors"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -12,6 +14,29 @@ func TestHolderRecordWaitDoesNotChangeManagerDeadline(t *testing.T) {
 	holderSession := &SessionStore{recordWait: holderRecordWait}
 	if manager.recordLockWait() != 5*time.Second || holderSession.recordLockWait() != 50*time.Millisecond {
 		t.Fatal("holder budget changed manager deadline or exceeds one flush interval")
+	}
+}
+
+func TestRunHolderKeepsStartupRecordBudgetUntilPublication(t *testing.T) {
+	raw, err := os.ReadFile("holder.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	start := strings.Index(source, "func RunHolder(")
+	if start < 0 {
+		t.Fatal("cannot locate production holder startup")
+	}
+	end := strings.Index(source[start:], "\nfunc ")
+	if end < 0 {
+		t.Fatal("cannot locate production holder startup")
+	}
+	source = source[start : start+end]
+	write := strings.Index(source, "if session.WriteState(state) != nil {")
+	budget := strings.Index(source, "session.recordWait = holderRecordWait")
+	listen := strings.Index(source, "listener, err := listenHolder(session)")
+	if write < 0 || budget <= write || listen <= budget || strings.Count(source, "session.recordWait = holderRecordWait") != 1 {
+		t.Fatal("startup must publish with the ordinary deadline before selecting the actor budget and publishing the handle")
 	}
 }
 

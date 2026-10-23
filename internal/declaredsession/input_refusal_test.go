@@ -20,8 +20,8 @@ func TestOnlyTransientInputAndResizeRefusalsAreDropped(t *testing.T) {
 			err  error
 			soft bool
 		}{
-			{ErrRole, true}, {ErrBusy, true}, {fmt.Errorf("wrapped: %w", ErrRole), true},
-			{errors.Join(ErrRole, ErrBusy), true}, {ErrStopped, false}, {ErrProtocol, false},
+			{ErrRole, true}, {ErrBusy, false}, {fmt.Errorf("wrapped: %w", ErrRole), true},
+			{errors.Join(ErrRole, ErrRole), true}, {errors.Join(ErrRole, ErrBusy), false}, {ErrStopped, false}, {ErrProtocol, false},
 			{ErrPeer, false}, {errChildIO, false}, {ErrUnavailable, false}, {nil, false},
 			{errors.New("declared session controller required"), false},
 			{errors.Join(ErrRole, ErrStopped), false}, {errors.Join(ErrBusy, ErrProtocol), false},
@@ -133,7 +133,7 @@ type refusalObservation struct {
 }
 
 func TestAttachmentDropsRefusedFramesButPreservesRoleOutputPingAndFreshInput(t *testing.T) {
-	for _, reason := range []string{"role_transfer", "restart_wait", "busy_paste"} {
+	for _, reason := range []string{"role_transfer", "restart_wait"} {
 		for _, op := range []string{"input", "resize"} {
 			t.Run(reason+"/"+op, func(t *testing.T) {
 				h, _ := holderFixture()
@@ -170,8 +170,6 @@ func TestAttachmentDropsRefusedFramesButPreservesRoleOutputPingAndFreshInput(t *
 									h.controlPending = true
 								case "restart_wait":
 									h.state.Phase = "restart_wait"
-								case "busy_paste":
-									h.terminal.queue <- inputOperation{data: []byte("already-admitted")}
 								}
 								request.reply <- holderReply{frame: frame("role")}
 								continue
@@ -231,11 +229,7 @@ func TestAttachmentDropsRefusedFramesButPreservesRoleOutputPingAndFreshInput(t *
 				case <-time.After(time.Second):
 					t.Fatal("actor did not examine refused frame")
 				}
-				want := ErrRole
-				if reason == "busy_paste" {
-					want = ErrBusy
-				}
-				if !errors.Is(refusal.err, want) || !refusal.unchanged {
+				if !errors.Is(refusal.err, ErrRole) || !refusal.unchanged {
 					t.Fatalf("frame was not refused before admission/ownership/dimensions: %+v", refusal)
 				}
 				nextRefusalFrame(t, conn, "role")
@@ -292,6 +286,8 @@ func TestAttachmentStillDisconnectsForHardRefusalsAndMalformedFrames(t *testing.
 		reason string
 	}{
 		{"stopped input", "input", ErrStopped, "holder_stopped"},
+		{"busy input", "input", ErrBusy, "busy"},
+		{"busy resize", "resize", ErrBusy, "busy"},
 		{"role takeover", "take_control", ErrRole, "controller_required"},
 		{"busy takeover", "take_control", ErrBusy, "busy"},
 		{"malformed input", "input", nil, "protocol_error"},
@@ -344,11 +340,18 @@ func TestAttachmentStillDisconnectsForHardRefusalsAndMalformedFrames(t *testing.
 				request := frame(test.op)
 				if request.Op == "input" {
 					request.Data = []byte("never-authorized")
+				} else if request.Op == "resize" {
+					request.Cols, request.Rows = 80, 24
 				}
 				if test.name == "malformed input" {
 					request.Reason = "untrusted extra field"
 				}
 				sendRefusalFrame(t, conn, request)
+				if test.name == "busy input" {
+					later := frame("input")
+					later.Data = []byte("later-paste-chunk-must-not-run")
+					sendRefusalFrame(t, conn, later)
+				}
 			}
 			if refusal := nextRefusalFrame(t, conn, "error"); refusal.Reason != test.reason || len(refusal.Data) != 0 {
 				t.Fatal("hard refusal lost its static finite disconnect", refusal)

@@ -145,10 +145,6 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	if err != nil {
 		return err
 	}
-	// This handle belongs only to the holder and is not published yet. Keep
-	// actor record-lock contention to one flush interval, retaining exact
-	// pending records on ErrBusy. This does not bound filesystem or fsync I/O.
-	session.recordWait = holderRecordWait
 	defer func() {
 		if session.Close() != nil {
 			result = ErrUnavailable
@@ -188,6 +184,12 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	if session.WriteState(state) != nil {
 		return ErrUnavailable
 	}
+	// Startup publication is fatal on failure and keeps the ordinary manager
+	// budget while recordManagerLaunch may still own the record lock. Only
+	// subsequent actor writes retain pending records on ErrBusy. Select their
+	// short budget before this handle is published to any holder goroutine.
+	// This bounds lock contention, not filesystem or fsync I/O.
+	session.recordWait = holderRecordWait
 	listener, err := listenHolder(session)
 	if err != nil {
 		return err

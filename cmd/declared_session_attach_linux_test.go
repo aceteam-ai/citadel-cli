@@ -68,6 +68,34 @@ func TestDeclaredAttachPumpDrainsBurstWithoutInputPoll(t *testing.T) {
 	}
 }
 
+func TestDeclaredAttachReadOnlyTransitionNoticeIsStaticAndDoesNotReplayInput(t *testing.T) {
+	results := make(chan declaredAttachResult, 3)
+	results <- declaredAttachResult{event: declaredsession.AttachEvent{Kind: "role", ReadOnly: true, Reason: "untrusted-test-text"}}
+	results <- declaredAttachResult{event: declaredsession.AttachEvent{Kind: "role", ReadOnly: true}}
+	results <- declaredAttachResult{event: declaredsession.AttachEvent{Kind: "stopped"}}
+	inputs := make(chan declaredAttachInput, 1)
+	inputs <- declaredAttachInput{data: []byte("must-not-reach-child")}
+	decoder, err := newDeclaredDetachDecoder(defaultDeclaredDetach)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment := &fakeDeclaredAttachment{readonly: true}
+	var output bytes.Buffer
+	err = pumpDeclaredAttachment(context.Background(), attachment, decoder, results, inputs, nil,
+		func(data []byte) error {
+			_, err := output.Write(data)
+			return err
+		},
+		func() (uint16, uint16, error) {
+			t.Fatal("read-only role requested resize")
+			return 0, 0, nil
+		})
+	const notice = "\r\n[Citadel session is read-only; input is not forwarded.]\r\n"
+	if err != nil || output.String() != notice || len(attachment.input) != 0 || attachment.resizes != 0 {
+		t.Fatalf("read-only transition was silent, repeated, reflected peer text or forwarded input: err=%v output=%q input=%q", err, output.String(), attachment.input)
+	}
+}
+
 func TestDeclaredAttachBurstBudgetAndCancellation(t *testing.T) {
 	results := make(chan declaredAttachResult, 2*declaredAttachBurst)
 	for i := 0; i < cap(results); i++ {

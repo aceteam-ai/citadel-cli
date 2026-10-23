@@ -191,6 +191,9 @@ func (m *Manager) observe(ctx context.Context, declaration Declaration, session 
 	}
 	if haveMarker {
 		result.Classification = "stopped"
+		if haveState && emptyHolderStartingReservation(stored) && marker.Incarnation == stored.Incarnation && marker.DeclarationRevision == stored.DeclarationRevision {
+			result.Classification = "recovery_incomplete"
+		}
 		if stored.Phase == "stopped_clean" {
 			result.Classification = "stopped_clean"
 		}
@@ -664,7 +667,7 @@ func (m *Manager) retireHolderlessStarting(ctx context.Context, session *Session
 
 func emptyHolderStartingReservation(state State) bool {
 	return state.Version == 1 && ValidateName(state.Name) == nil && validIncarnation(state.Incarnation) &&
-		validDigest(state.DeclarationRevision) && validDigest(state.FileRevision) && state.ProtocolVersion == ProtocolVersion &&
+		validDigest(state.DeclarationRevision) && validDigest(state.FileRevision) && (state.ProtocolVersion == 1 || state.ProtocolVersion == ProtocolVersion) &&
 		state.BinaryVersion != "" && len(state.BinaryVersion) <= 128 && state.Phase == "starting" && state.Guarantee == "unconfirmed" &&
 		state.Scope == (ScopeIdentity{Name: "citadel-sess-" + state.Name + ".scope", Manager: "user"}) &&
 		state.Holder == (ProcessIdentity{}) && state.Child == (ProcessIdentity{}) && state.RestartCount == 0 && state.ChildGeneration == 0 &&
