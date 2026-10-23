@@ -1,6 +1,6 @@
 services:
   transcribe:
-    image: ghcr.io/aceteam-ai/whisper-service:latest
+    image: ghcr.io/aceteam-ai/whisper-service:6fad6be3951e28d6a4ad34a6e39e8c90113328ae@sha256:becb1051fcbc1fbd0fc5cc34b2099a7915411311350e9e2a1c28fda283c07f66
     container_name: citadel-transcribe
     # Loopback-only publish (127.0.0.1) by default (aceteam-ai/citadel-cli#1060,
     # completing the aceteam-ai/aceteam#9523 sweep): the whisper sidecar has NO

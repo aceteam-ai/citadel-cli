@@ -107,6 +107,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"6e6ac50fcc5b911e08931759f0e4a0f5b622b66c5d034e065adb6461e2b9daa7": true,
 		// citadel-cli#522: gated speaker diarization with retryable fallback.
 		"b5d09243cf6183c8eaae38caa0746fdf4990c0a79c5bc32502e29a14935eb82b": true,
+		// aceteam-ai/aceteam#12088: reviewed Whisper OCI index digest pin.
+		"5eafdf06a843f09636c15642e3590774df6b4b064d9962d928d20470571b9ea6": true,
 	},
 	"diffusers": {
 		"3f2059400959adcc0f55ea8134cb492530ca65d4faf51778a68f35d0d5d9c93a": true,
@@ -141,6 +143,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 	},
 	"kokoro": {
 		"3ce764e232b286c75f776872bb3554e15b2e03b229863abce271324a815ab777": true,
+		// aceteam-ai/aceteam#12088: reviewed Kokoro OCI index digest pin.
+		"584f4f21e627ec4869bab8ec4263eaba5275d3e50bac8b69e4b320bdaac89575": true,
 	},
 	"tei": {
 		"274a82d682918124ae2472413b3a2246cd99c706b225cd6c4806505a230d44ca": true,
