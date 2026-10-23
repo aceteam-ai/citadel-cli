@@ -110,3 +110,8 @@ acceptance. #1119 persistence UX/Windows integration, #1120 mode switching and
 #1121 edge/native acceptance remain separate. This source-only draft does not
 close #1118, start a node, install persistence, mint credentials or authorize
 deployment/native execution.
+
+The proposed mode-preserving `session serve` path remains held on the
+[B1 restore-only dependency design](session-serve-restore-policy-design.md).
+That comparison preserves the owner no-login/no-node-key invariant; it adds
+neither the command nor a dependency patch.
