@@ -10,6 +10,23 @@ import (
 	"github.com/rivo/tview"
 )
 
+// SharedWorkerOwnerChangedMessage contains no peer-controlled identity or error.
+const SharedWorkerOwnerChangedMessage = "Worker owner changed; restart the Control Center monitor to observe the new worker."
+
+func sharedWorkerStatusText(data StatusData, now time.Time) string {
+	if data.SharedWorker && data.WorkerOwnerChanged {
+		return "External worker (shared status)\n" + SharedWorkerOwnerChangedMessage + "\nConsumption, swaps and lanes unknown.\n"
+	}
+	return sharedWorkerDetailText(data.WorkerDetail, data.WorkerDetailObservedAt, now)
+}
+
+func renderSharedWorkerStatus(data StatusData, now time.Time) string {
+	if data.SharedWorker && data.WorkerOwnerChanged {
+		return tview.Escape(sharedWorkerStatusText(data, now))
+	}
+	return renderSharedWorkerDetail(data.WorkerDetail, data.WorkerDetailObservedAt, now)
+}
+
 // renderSharedWorkerDetail is a pure projection of an already observed owner.
 // Quote peer text to literal ASCII, then escape the whole result for tview:
 // terminal control bytes, bidi and styling markup never become instructions.
@@ -99,9 +116,9 @@ func (cc *ControlCenter) updateSharedWorkerDetailModal() {
 	if !cc.inModal || cc.sharedWorkerDetailView == nil {
 		return
 	}
-	detail, receivedAt := cc.data.WorkerDetail, cc.data.WorkerDetailObservedAt
+	data := cc.data
 	if !cc.data.SharedWorker {
-		detail, receivedAt = nil, time.Time{}
+		data.WorkerDetail, data.WorkerDetailObservedAt, data.WorkerOwnerChanged = nil, time.Time{}, false
 	}
-	cc.sharedWorkerDetailView.SetText(renderSharedWorkerDetail(detail, receivedAt, time.Now()) + "\n[gray]Esc: close this monitor view[-]")
+	cc.sharedWorkerDetailView.SetText(renderSharedWorkerStatus(data, time.Now()) + "\n[gray]Esc: close this monitor view[-]")
 }

@@ -1409,13 +1409,7 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	data.WorkerRunning = ccWorkerRunning
 	data.WorkerQueue = ccWorkerQueue
 	ccWorkerMu.Unlock()
-	data.SharedWorker, data.WorkerDetail, data.WorkerDetailObservedAt = controlCenterWorkerDetailSnapshot()
-	if data.SharedWorker {
-		// The local monitor goroutine is not the selected worker's consume loop.
-		// Missing detail stays unavailable, never a green local running flag.
-		data.WorkerRunning = data.WorkerDetail != nil && data.WorkerDetail.Worker != nil && data.WorkerDetail.Worker.Consuming
-		data.WorkerQueue = ""
-	}
+	applyControlCenterWorkerDetail(&data)
 
 	// Demo server URL (always running when control center is active)
 	data.DemoServerURL = fmt.Sprintf("http://localhost:%d", ccDemoPort)

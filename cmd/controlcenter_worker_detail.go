@@ -7,37 +7,50 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
 )
 
 const controlCenterWorkerDetailInterval = 5 * time.Second
 
 // These observations belong to the monitor, never to this process's consume
-// loop. ccWorkerMu protects all three values and the existing worker state.
+// loop. ccWorkerMu protects these values and the existing worker state.
 var (
-	ccSharedWorkerMonitor    bool
-	ccSharedWorkerDetail     *status.WorkerDetail
-	ccSharedWorkerObservedAt time.Time
+	ccSharedWorkerMonitor      bool
+	ccSharedWorkerOwnerChanged bool
+	ccSharedWorkerDetail       *status.WorkerDetail
+	ccSharedWorkerObservedAt   time.Time
 )
 
 func resetControlCenterWorkerDetail() {
 	ccWorkerMu.Lock()
 	defer ccWorkerMu.Unlock()
 	ccSharedWorkerMonitor = false
+	ccSharedWorkerOwnerChanged = false
 	ccSharedWorkerDetail = nil
 	ccSharedWorkerObservedAt = time.Time{}
 }
 
-func controlCenterWorkerDetailSnapshot() (bool, *status.WorkerDetail, time.Time) {
+func controlCenterWorkerDetailSnapshot() (bool, *status.WorkerDetail, time.Time, bool) {
 	ccWorkerMu.Lock()
 	defer ccWorkerMu.Unlock()
 	if ccSharedWorkerDetail == nil {
-		return ccSharedWorkerMonitor, nil, time.Time{}
+		return ccSharedWorkerMonitor, nil, time.Time{}, ccSharedWorkerOwnerChanged
 	}
 	copy, err := status.CloneWorkerDetail(*ccSharedWorkerDetail)
 	if err != nil {
-		return ccSharedWorkerMonitor, nil, time.Time{}
+		return ccSharedWorkerMonitor, nil, time.Time{}, ccSharedWorkerOwnerChanged
 	}
-	return ccSharedWorkerMonitor, &copy, ccSharedWorkerObservedAt
+	return ccSharedWorkerMonitor, &copy, ccSharedWorkerObservedAt, ccSharedWorkerOwnerChanged
+}
+
+func applyControlCenterWorkerDetail(data *controlcenter.StatusData) {
+	data.SharedWorker, data.WorkerDetail, data.WorkerDetailObservedAt, data.WorkerOwnerChanged = controlCenterWorkerDetailSnapshot()
+	if data.SharedWorker {
+		// The local monitor goroutine is not the selected worker's consume loop.
+		// Missing detail stays unavailable, never a green local running flag.
+		data.WorkerRunning = !data.WorkerOwnerChanged && data.WorkerDetail != nil && data.WorkerDetail.Worker != nil && data.WorkerDetail.Worker.Consuming
+		data.WorkerQueue = ""
+	}
 }
 
 // loadSessionWorkerDetail never exposes peer-controlled error bodies. A legacy
@@ -81,14 +94,14 @@ func (observer *sessionWorkerDetailObserver) accept(detail *status.WorkerDetail)
 		return false
 	}
 	if observer.owner != nil && (detail.Mode != observer.owner.Mode || detail.Version != observer.owner.Version ||
-		detail.NodeName != observer.owner.NodeName || detail.UptimeSec < observer.lastAlive) {
+		detail.UptimeSec < observer.lastAlive) {
 		observer.changed = true
 		return false
 	}
-	// Mesh IP and connectivity may change during reconnect without replacing
-	// this observed worker. They are displayed data, not owner identity proofs.
+	// Node name, mesh IP and connectivity may change during reconnect or rename
+	// without replacing this worker. They are display data, not identity proofs.
 	if observer.owner == nil {
-		observer.owner = &status.WorkerDetail{Mode: detail.Mode, Version: detail.Version, NodeName: detail.NodeName}
+		observer.owner = &status.WorkerDetail{Mode: detail.Mode, Version: detail.Version}
 	}
 	observer.lastAlive = detail.UptimeSec
 	return true
@@ -97,15 +110,18 @@ func (observer *sessionWorkerDetailObserver) accept(detail *status.WorkerDetail)
 func runControlCenterWorkerMonitor(ctx context.Context, stateDir string, workerPID int, request sessionStatusRequester) error {
 	ccWorkerMu.Lock()
 	ccSharedWorkerMonitor = true
+	ccSharedWorkerOwnerChanged = false
 	ccSharedWorkerDetail = nil
 	ccSharedWorkerObservedAt = time.Time{}
+	activityFn := ccActivityFn
 	ccWorkerMu.Unlock()
 	defer resetControlCenterWorkerDetail()
 
-	publish := func(detail *status.WorkerDetail, observedAt time.Time) {
+	publish := func(detail *status.WorkerDetail, observedAt time.Time, ownerChanged bool) {
 		ccWorkerMu.Lock()
 		defer ccWorkerMu.Unlock()
 		ccSharedWorkerDetail, ccSharedWorkerObservedAt = detail, observedAt
+		ccSharedWorkerOwnerChanged = ownerChanged
 	}
 	wait := func(ctx context.Context) bool {
 		timer := time.NewTimer(controlCenterWorkerDetailInterval)
@@ -117,16 +133,21 @@ func runControlCenterWorkerMonitor(ctx context.Context, stateDir string, workerP
 			return true
 		}
 	}
-	return observeControlCenterWorker(ctx, stateDir, workerPID, request, publish, wait, time.Now)
+	ownerChanged := func() {
+		if activityFn != nil {
+			activityFn("warning", controlcenter.SharedWorkerOwnerChangedMessage)
+		}
+	}
+	return observeControlCenterWorker(ctx, stateDir, workerPID, request, publish, wait, time.Now, ownerChanged)
 }
 
 // Dependencies make cancellation, sequential requests and stale clearing
 // verifiable with fake transports and ticks, without a socket or real timer.
 func observeControlCenterWorker(ctx context.Context, stateDir string, workerPID int, request sessionStatusRequester,
-	publish func(*status.WorkerDetail, time.Time), wait func(context.Context) bool, now func() time.Time) error {
+	publish func(*status.WorkerDetail, time.Time, bool), wait func(context.Context) bool, now func() time.Time, ownerChanged func()) error {
 	observer := sessionWorkerDetailObserver{pid: workerPID}
-	publish(nil, time.Time{})
-	defer publish(nil, time.Time{})
+	publish(nil, time.Time{}, false)
+	defer publish(nil, time.Time{}, false)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -137,9 +158,12 @@ func observeControlCenterWorker(ctx context.Context, stateDir string, workerPID 
 				return ctx.Err()
 			}
 			if err != nil || !observer.accept(detail) {
-				publish(nil, time.Time{})
+				publish(nil, time.Time{}, observer.changed)
+				if observer.changed && ownerChanged != nil {
+					ownerChanged()
+				}
 			} else {
-				publish(detail, now())
+				publish(detail, now(), false)
 			}
 		}
 		if !wait(ctx) {

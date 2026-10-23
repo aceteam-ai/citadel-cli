@@ -7,6 +7,17 @@ heartbeat publisher or node-state reporter. The standalone worker branch and
 unrelated host/service panels retain their existing behavior. This is one part
 of #1118's shared-status work, not completion of the unified entrypoint.
 
+In that monitor branch the early return also skips pending-update startup
+reconciliation, loading device configuration or requiring a device token,
+constructing an API source and WebSocket, starting the clock monitor and status
+collector, configuring TUI activity telemetry, starting a duplicate ActualState
+emitter, node-state reporting, heartbeat publication and a worker runner. Local
+activity remains visible, including the static owner-change warning. Monitor
+TUI-originated activity is no longer forwarded by a telemetry stream configured
+in this branch. Explicit owner acceptance of that telemetry change is still a
+gate; source preparation does not record it as accepted. The external worker's
+own telemetry and heartbeat contract are unchanged.
+
 The read-only `GET /citadel/session/v1/worker-detail` uses the same OS-protected
 Unix socket or Windows pipe as existing session status. It adds no listener,
 credential, enrollment or ownership mechanism. The default status GET and
@@ -21,7 +32,10 @@ before publishing the controller, then reuses those function values for
 heartbeat and optional status collection. Existing atomic runner and swap
 pointers supply initialization without replacing callbacks. Providers read
 in-memory state; the detail route starts no collector, queue subscription or
-GPU/model/service probe. This is not an atomic cross-subsystem snapshot.
+GPU/model/service probe. Before the runner exists, these providers return a nil
+worker block: the optional `/worker` and `/status` routes omit `worker` during
+startup/handler construction. Heartbeat publication starts after runner
+initialization. This is not an atomic cross-subsystem snapshot.
 
 Missing providers and providers not yet initialized are unknown. A nil worker
 or swap block, or nil lane list, is never interpreted as healthy idle work.
@@ -56,10 +70,12 @@ transport failure clears the monitor's retained observation and receipt time.
 The jobs panel, copied jobs text and open detail modal show unavailable on the
 next ordinary UI refresh; no old healthy worker snapshot is retained as a
 fallback. A transport failure may recover only to the same observed owner.
-The initially selected worklock PID and the first validated mode/version/node
-name are pinned; changed identity or decreasing observed uptime latches
-unavailable until an explicit monitor restart. Mesh IP and connectivity may
-change during reconnect without selecting a different owner. Cancellation
+The initially selected worklock PID and the first validated mode/version are
+pinned; changed identity or decreasing observed uptime latches a distinct static
+owner-changed message until an explicit monitor restart. The first latch adds
+one local activity warning. Node name, mesh IP and connectivity are display
+data and may change or be absent during reconnect without selecting a different
+owner. Cancellation
 clears observations and cancels only monitor-owned requests, never the worker.
 
 PID and uptime remain observations, not authenticated incarnation evidence.
@@ -67,6 +83,8 @@ PID reuse with identical observable fields is indistinguishable. This child
 does not invent an identity fence or silently take over a replacement worker.
 Ordinary Control Center start/stop callbacks retain their existing semantics;
 the shared-status display does not acquire a new worker-control operation.
+The shared jobs modal ignores its start/stop key, so that key cannot cancel the
+local monitor or imply control of the external worker.
 
 ## Source evidence and remaining gates
 
@@ -77,6 +95,9 @@ redirect refusal and body closure, sequential reads, cancellation, selected
 owner replacement, reconnect and stale clearing, and literal rendering of
 unknown/false/true states. Source wiring guards pin the held-worker return
 before worker-owned constructors and shared heartbeat provider reuse.
+Additional fixtures cover blank/restored/renamed display names, distinct
+replacement reporting, valid detail JSON under failed HTTP statuses, observed
+consumption overriding the local monitor flag, and ignored modal control keys.
 
 These fixtures are source preparation; normal GitHub CI and independent source
 review are recorded on the draft PR. Local candidate execution, native

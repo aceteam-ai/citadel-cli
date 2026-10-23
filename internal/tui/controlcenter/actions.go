@@ -1636,7 +1636,7 @@ func (cc *ControlCenter) showJobsDetailModal() {
 	updateContent := func() {
 		if cc.data.SharedWorker {
 			cc.sharedWorkerDetailView = textView
-			textView.SetText(renderSharedWorkerDetail(cc.data.WorkerDetail, cc.data.WorkerDetailObservedAt, time.Now()) + "\n[gray]Esc: close this monitor view[-]")
+			textView.SetText(renderSharedWorkerStatus(cc.data, time.Now()) + "\n[gray]Esc: close this monitor view[-]")
 			return
 		}
 		var sb strings.Builder
@@ -1754,6 +1754,9 @@ func (cc *ControlCenter) showJobsDetailModal() {
 		case tcell.KeyRune:
 			switch event.Rune() {
 			case 's', 'S':
+				if cc.data.SharedWorker {
+					return nil
+				}
 				if cc.data.WorkerRunning {
 					cc.stopWorker()
 				} else {

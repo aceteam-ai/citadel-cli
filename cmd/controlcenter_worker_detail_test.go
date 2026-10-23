@@ -6,11 +6,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
 )
 
 func controlCenterDetailFixture() status.WorkerDetail {
@@ -74,12 +76,15 @@ func TestControlCenterWorkerDetailFailuresStayUnavailable(t *testing.T) {
 		}
 	}
 	for _, code := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusFound, http.StatusServiceUnavailable} {
-		body := &sessionViewBody{Reader: strings.NewReader("private-peer-diagnostic")}
-		detail, err := loadSessionWorkerDetail(context.Background(), "fixture", func(context.Context, string) (*http.Response, error) {
-			return &http.Response{StatusCode: code, Body: body}, nil
-		})
-		if detail != nil || err != status.ErrWorkerDetailUnavailable || !body.closed || strings.Contains(err.Error(), "private-peer-diagnostic") {
-			t.Fatal("HTTP or legacy-route refusal leaked peer text or looked healthy")
+		// A syntactically valid detail must still be refused on a failed status.
+		for _, rawBody := range []string{"private-peer-diagnostic", raw} {
+			body := &sessionViewBody{Reader: strings.NewReader(rawBody)}
+			detail, err := loadSessionWorkerDetail(context.Background(), "fixture", func(context.Context, string) (*http.Response, error) {
+				return &http.Response{StatusCode: code, Body: body}, nil
+			})
+			if detail != nil || err != status.ErrWorkerDetailUnavailable || !body.closed {
+				t.Fatalf("HTTP refusal code=%d leaked or accepted its body: detail=%v err=%v closed=%v", code, detail, err, body.closed)
+			}
 		}
 	}
 	for _, response := range []*http.Response{nil, {StatusCode: http.StatusOK}, {StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(raw))}} {
@@ -125,7 +130,6 @@ func TestControlCenterWorkerObserverPinsOwnerWithoutAdoptingReplacement(t *testi
 		func(detail *status.WorkerDetail) { detail.PID++ },
 		func(detail *status.WorkerDetail) { detail.Mode = "presence" },
 		func(detail *status.WorkerDetail) { detail.Version = "replacement" },
-		func(detail *status.WorkerDetail) { detail.NodeName = "replacement" },
 		func(detail *status.WorkerDetail) { detail.UptimeSec-- },
 	} {
 		observer := sessionWorkerDetailObserver{pid: first.PID}
@@ -152,6 +156,26 @@ func TestControlCenterWorkerObserverPinsOwnerWithoutAdoptingReplacement(t *testi
 	reconnected.MeshIP, reconnected.Connected, reconnected.UptimeSec = "100.64.0.8", false, first.UptimeSec+1
 	if !observer.accept(&reconnected) {
 		t.Fatal("same-owner reconnect became an owner replacement")
+	}
+}
+
+func TestControlCenterWorkerObserverAcceptsDisplayNameChanges(t *testing.T) {
+	for _, names := range [][2]string{{"", "selected-node"}, {"selected-node", ""}, {"selected-node", "renamed-node"}} {
+		first := controlCenterDetailFixture()
+		first.NodeName = names[0]
+		observer := sessionWorkerDetailObserver{pid: first.PID}
+		if !observer.accept(&first) {
+			t.Fatal("first observation refused")
+		}
+		changed := first
+		changed.NodeName, changed.UptimeSec = names[1], first.UptimeSec+5
+		if !observer.accept(&changed) || observer.changed {
+			t.Fatalf("display-name change %q -> %q replaced the same owner", names[0], names[1])
+		}
+		changed.NodeName, changed.UptimeSec = names[0], first.UptimeSec+10
+		if !observer.accept(&changed) || observer.changed {
+			t.Fatal("same owner stayed unavailable after display-name recovery")
+		}
 	}
 }
 
@@ -183,7 +207,10 @@ func TestControlCenterWorkerMonitorClearsAndRecoversSameOwnerSequentially(t *tes
 	var snapshots []*status.WorkerDetail
 	var receipts []time.Time
 	observedAt := first.ObservedAt.Add(time.Second)
-	publish := func(detail *status.WorkerDetail, receipt time.Time) {
+	publish := func(detail *status.WorkerDetail, receipt time.Time, changed bool) {
+		if changed {
+			t.Fatal("transient failure latched an owner change")
+		}
 		snapshots = append(snapshots, detail)
 		receipts = append(receipts, receipt)
 	}
@@ -198,7 +225,9 @@ func TestControlCenterWorkerMonitorClearsAndRecoversSameOwnerSequentially(t *tes
 		}
 		return true
 	}
-	err := observeControlCenterWorker(ctx, "fixture", first.PID, request, publish, wait, func() time.Time { return observedAt })
+	err := observeControlCenterWorker(ctx, "fixture", first.PID, request, publish, wait, func() time.Time { return observedAt }, func() {
+		t.Fatal("transient failure emitted an owner-change activity")
+	})
 	if err != context.Canceled || calls != 3 || len(snapshots) != 5 || snapshots[0] != nil || snapshots[1] == nil || snapshots[2] != nil || snapshots[3] == nil || snapshots[4] != nil {
 		t.Fatalf("monitor did not clear then recover the same owner: err=%v calls=%d snapshots=%v", err, calls, snapshots)
 	}
@@ -220,6 +249,8 @@ func TestControlCenterWorkerMonitorStopsReadingChangedOwner(t *testing.T) {
 	replacement.PID++
 	calls, waits := 0, 0
 	var last *status.WorkerDetail
+	var changedStates []bool
+	activities := 0
 	request := func(context.Context, string) (*http.Response, error) {
 		calls++
 		detail := first
@@ -230,15 +261,24 @@ func TestControlCenterWorkerMonitorStopsReadingChangedOwner(t *testing.T) {
 	}
 	wait := func(context.Context) bool {
 		waits++
+		if waits >= 2 && (last != nil || !changedStates[len(changedStates)-1] || activities != 1) {
+			t.Fatal("latched monitor did not retain its distinct unavailable state and one activity")
+		}
 		if waits == 3 {
 			cancel()
 			return false
 		}
 		return true
 	}
-	err := observeControlCenterWorker(ctx, "fixture", first.PID, request, func(detail *status.WorkerDetail, _ time.Time) { last = detail }, wait, time.Now)
-	if err != context.Canceled || calls != 2 || last != nil {
-		t.Fatalf("replacement kept being polled/adopted: err=%v calls=%d last=%v", err, calls, last)
+	err := observeControlCenterWorker(ctx, "fixture", first.PID, request, func(detail *status.WorkerDetail, receipt time.Time, changed bool) {
+		last = detail
+		changedStates = append(changedStates, changed)
+		if changed && (detail != nil || !receipt.IsZero()) {
+			t.Fatal("owner-change state retained old detail or receipt")
+		}
+	}, wait, time.Now, func() { activities++ })
+	if err != context.Canceled || calls != 2 || last != nil || activities != 1 || len(changedStates) != 4 || changedStates[3] {
+		t.Fatalf("replacement kept being polled/adopted or exit retained latch: err=%v calls=%d last=%v activities=%d states=%v", err, calls, last, activities, changedStates)
 	}
 }
 
@@ -249,8 +289,8 @@ func TestControlCenterWorkerDetailSnapshotsHaveIndependentOwnership(t *testing.T
 	ccWorkerMu.Lock()
 	ccSharedWorkerMonitor, ccSharedWorkerDetail, ccSharedWorkerObservedAt = true, &detail, receipt
 	ccWorkerMu.Unlock()
-	monitor, snapshot, observedAt := controlCenterWorkerDetailSnapshot()
-	if !monitor || snapshot == nil || !observedAt.Equal(receipt) {
+	monitor, snapshot, observedAt, changed := controlCenterWorkerDetailSnapshot()
+	if !monitor || snapshot == nil || !observedAt.Equal(receipt) || changed {
 		t.Fatal("monitor snapshot unavailable")
 	}
 	snapshot.Worker.Consuming = false
@@ -258,13 +298,80 @@ func TestControlCenterWorkerDetailSnapshotsHaveIndependentOwnership(t *testing.T
 	snapshot.Swap.Recent[0].Evicted[0] = "mutated"
 	*snapshot.Swap.Recent[0].Pulled = true
 	*snapshot.Lanes[0].BusySince = time.Time{}
-	_, fresh, _ := controlCenterWorkerDetailSnapshot()
+	_, fresh, _, _ := controlCenterWorkerDetailSnapshot()
 	if fresh == nil || !fresh.Worker.Consuming || fresh.Worker.LastPollAt.IsZero() || fresh.Swap.Recent[0].Evicted[0] == "mutated" || *fresh.Swap.Recent[0].Pulled || fresh.Lanes[0].BusySince.IsZero() {
 		t.Fatal("consumer mutated monitor-owned nested observations")
 	}
+	ccWorkerMu.Lock()
+	ccSharedWorkerDetail, ccSharedWorkerObservedAt, ccSharedWorkerOwnerChanged = nil, time.Time{}, true
+	ccWorkerMu.Unlock()
+	monitor, snapshot, observedAt, changed = controlCenterWorkerDetailSnapshot()
+	if !monitor || snapshot != nil || !observedAt.IsZero() || !changed {
+		t.Fatal("snapshot lost the distinct owner-change latch")
+	}
 	resetControlCenterWorkerDetail()
-	monitor, snapshot, observedAt = controlCenterWorkerDetailSnapshot()
-	if monitor || snapshot != nil || !observedAt.IsZero() {
+	monitor, snapshot, observedAt, changed = controlCenterWorkerDetailSnapshot()
+	if monitor || snapshot != nil || !observedAt.IsZero() || changed {
 		t.Fatal("monitor exit retained stale state")
+	}
+}
+
+func TestControlCenterSharedWorkerRunningUsesObservedConsumption(t *testing.T) {
+	defer resetControlCenterWorkerDetail()
+	for _, test := range []struct {
+		name   string
+		local  bool
+		detail *status.WorkerDetail
+		want   bool
+	}{
+		{name: "unavailable clears local monitor flag", local: true},
+		{name: "unknown consumption clears local monitor flag", local: true, detail: &status.WorkerDetail{}},
+		{name: "not polling clears local monitor flag", local: true, detail: &status.WorkerDetail{Worker: &status.WorkerLiveness{Consuming: false}}},
+		{name: "polling overrides local stopped flag", detail: &status.WorkerDetail{Worker: &status.WorkerLiveness{Consuming: true}}, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var detail *status.WorkerDetail
+			if test.detail != nil {
+				fixture := controlCenterDetailFixture()
+				fixture.Worker = test.detail.Worker
+				detail = &fixture
+			}
+			ccWorkerMu.Lock()
+			ccSharedWorkerMonitor, ccSharedWorkerDetail = true, detail
+			ccWorkerMu.Unlock()
+			data := controlcenter.StatusData{WorkerRunning: test.local, WorkerQueue: "stale-local-queue"}
+			applyControlCenterWorkerDetail(&data)
+			if !data.SharedWorker || data.WorkerRunning != test.want || data.WorkerQueue != "" {
+				t.Fatalf("shared consume state came from the local monitor: %+v", data)
+			}
+		})
+	}
+	resetControlCenterWorkerDetail()
+	data := controlcenter.StatusData{WorkerRunning: true, WorkerQueue: "owned-queue"}
+	applyControlCenterWorkerDetail(&data)
+	if data.SharedWorker || !data.WorkerRunning || data.WorkerQueue != "owned-queue" {
+		t.Fatal("shared projection changed the locally owned worker")
+	}
+}
+
+func TestControlCenterGatherProjectsSharedWorkerConsumption(t *testing.T) {
+	source, err := os.ReadFile("controlcenter.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "func gatherControlCenterData(")
+	if start < 0 {
+		t.Fatal("gather entrypoint missing")
+	}
+	body := string(source[start:])
+	end := strings.Index(body, "\n}\n")
+	if end < 0 {
+		t.Fatal("gather body missing")
+	}
+	body = body[:end]
+	local := strings.Index(body, "data.WorkerRunning = ccWorkerRunning")
+	shared := strings.Index(body, "applyControlCenterWorkerDetail(&data)")
+	if local < 0 || shared < local || strings.Contains(body[shared:], "data.WorkerRunning =") {
+		t.Fatal("gather bypasses or overwrites the tested shared-consumption projection")
 	}
 }

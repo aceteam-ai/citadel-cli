@@ -141,6 +141,7 @@ type StatusData struct {
 	// SharedWorker selects observations from the external worker's shared
 	// control surface. A nil detail is unavailable, never a healthy zero.
 	SharedWorker           bool
+	WorkerOwnerChanged     bool // Latched until the local monitor is restarted.
 	WorkerDetail           *status.WorkerDetail
 	WorkerDetailObservedAt time.Time // Local successful receipt, not peer clock.
 
@@ -2463,7 +2464,7 @@ func (cc *ControlCenter) updateServicesView() {
 
 func (cc *ControlCenter) updateJobsPanel() {
 	if cc.data.SharedWorker {
-		cc.jobsPanel.SetText(renderSharedWorkerDetail(cc.data.WorkerDetail, cc.data.WorkerDetailObservedAt, time.Now()))
+		cc.jobsPanel.SetText(renderSharedWorkerStatus(cc.data, time.Now()))
 		return
 	}
 	var sb strings.Builder
@@ -3282,7 +3283,7 @@ func (cc *ControlCenter) getVitalsText() string {
 // getJobsText returns plain text representation of jobs panel
 func (cc *ControlCenter) getJobsText() string {
 	if cc.data.SharedWorker {
-		return sharedWorkerDetailText(cc.data.WorkerDetail, cc.data.WorkerDetailObservedAt, time.Now())
+		return sharedWorkerStatusText(cc.data, time.Now())
 	}
 	var sb strings.Builder
 	if cc.data.WorkerRunning {

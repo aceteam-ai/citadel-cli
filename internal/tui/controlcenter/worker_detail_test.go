@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
@@ -99,7 +100,7 @@ func TestSharedWorkerPeerTextIsLiteralAndMarkupEscaped(t *testing.T) {
 	if !strings.Contains(plain, `"[red]\x1b[2J\n\u202e"`) || !strings.Contains(plain, `"[green]\tweight"`) {
 		t.Fatal("peer text not rendered as literal ASCII", plain)
 	}
-	styled := renderSharedWorkerDetail(&detail, detail.ObservedAt, detail.ObservedAt)
+	styled := renderSharedWorkerStatus(StatusData{SharedWorker: true, WorkerDetail: &detail, WorkerDetailObservedAt: detail.ObservedAt}, detail.ObservedAt)
 	if strings.ContainsAny(styled, "\x1b\t\u202e") || strings.Contains(styled, "[red]") || strings.Contains(styled, "[green]") {
 		t.Fatal("peer control/styling escaped the literal display", styled)
 	}
@@ -107,7 +108,7 @@ func TestSharedWorkerPeerTextIsLiteralAndMarkupEscaped(t *testing.T) {
 		t.Fatal("peer tview tags were dropped instead of escaped", styled)
 	}
 	detail.Version = strings.Repeat("sensitive", 40)
-	text := renderSharedWorkerDetail(&detail, detail.ObservedAt, detail.ObservedAt)
+	text := renderSharedWorkerStatus(StatusData{SharedWorker: true, WorkerDetail: &detail, WorkerDetailObservedAt: detail.ObservedAt}, detail.ObservedAt)
 	if !strings.Contains(text, "Worker detail unavailable") || strings.Contains(text, "sensitive") || strings.Contains(text, "selected-node") {
 		t.Fatal("invalid detail was rendered or leaked", text)
 	}
@@ -147,5 +148,67 @@ func TestSharedWorkerModalClearsAnObservationAfterReadFailure(t *testing.T) {
 	cc.updateSharedWorkerDetailModal()
 	if text := cc.sharedWorkerDetailView.GetText(false); strings.Contains(text, "selected-node") {
 		t.Fatal("closed monitor displayed an old owner in its still-open modal", text)
+	}
+}
+
+func TestSharedWorkerOwnerChangeShowsRestartHintWithoutOldDetail(t *testing.T) {
+	detail := sharedWorkerFixture()
+	cc := &ControlCenter{
+		inModal: true, sharedWorkerDetailView: tview.NewTextView(), jobsPanel: tview.NewTextView(),
+		data: StatusData{SharedWorker: true, WorkerOwnerChanged: true, WorkerDetail: &detail, WorkerDetailObservedAt: detail.ObservedAt},
+	}
+	cc.updateSharedWorkerDetailModal()
+	cc.updateJobsPanel()
+	for _, text := range []string{cc.getJobsText(), cc.sharedWorkerDetailView.GetText(false), cc.jobsPanel.GetText(false)} {
+		if !strings.Contains(text, SharedWorkerOwnerChangedMessage) || !strings.Contains(text, "unknown") {
+			t.Fatal("permanent owner change did not explain how to restart observation", text)
+		}
+		for _, stale := range []string{"selected-node", "polling recently", "Worker detail unavailable"} {
+			if strings.Contains(text, stale) {
+				t.Fatal("owner-change view retained an observation or transient-failure message", text)
+			}
+		}
+	}
+	cc.data.WorkerOwnerChanged, cc.data.WorkerDetail = false, nil
+	cc.updateSharedWorkerDetailModal()
+	if text := cc.sharedWorkerDetailView.GetText(false); strings.Contains(text, SharedWorkerOwnerChangedMessage) || !strings.Contains(text, "Worker detail unavailable") {
+		t.Fatal("transient read failure looked like a permanent owner change", text)
+	}
+	cc.data.WorkerOwnerChanged, cc.data.SharedWorker = true, false
+	cc.updateSharedWorkerDetailModal()
+	if text := cc.sharedWorkerDetailView.GetText(false); strings.Contains(text, SharedWorkerOwnerChangedMessage) {
+		t.Fatal("closed monitor retained the owner-change hint", text)
+	}
+}
+
+func TestSharedWorkerJobsModalIgnoresStartStopKeys(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		cc := &ControlCenter{
+			app: tview.NewApplication(),
+			data: StatusData{SharedWorker: true, WorkerRunning: running},
+			worker: WorkerCallbacks{
+				Start: func(func(string, string)) error { return nil },
+				Stop: func() error { return nil },
+				IsRunning: func() bool {
+					t.Fatal("shared jobs modal invoked worker controls")
+					return running
+				},
+			},
+		}
+		cc.showJobsDetailModal()
+		view, ok := cc.app.GetFocus().(*tview.TextView)
+		if !ok || view.GetInputCapture() == nil {
+			t.Fatal("shared jobs modal did not expose its actual key handler")
+		}
+		capture := view.GetInputCapture()
+		for _, key := range []rune{'s', 'S'} {
+			if event := capture(tcell.NewEventKey(tcell.KeyRune, key, tcell.ModNone)); event != nil {
+				t.Fatal("start/stop key was not consumed in shared mode")
+			}
+		}
+		other := tcell.NewEventKey(tcell.KeyRune, 'x', tcell.ModNone)
+		if capture(other) != other || !cc.inModal || cc.data.WorkerRunning != running || len(cc.activities) != 0 || cc.app.GetFocus() != view {
+			t.Fatal("ignored shared-worker control changed monitor state or other key handling")
+		}
 	}
 }
