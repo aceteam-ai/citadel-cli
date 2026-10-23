@@ -1634,6 +1634,11 @@ func (cc *ControlCenter) showJobsDetailModal() {
 
 	// Update function to rebuild content
 	updateContent := func() {
+		if cc.data.SharedWorker {
+			cc.sharedWorkerDetailView = textView
+			textView.SetText(renderSharedWorkerDetail(cc.data.WorkerDetail, cc.data.WorkerDetailObservedAt, time.Now()) + "\n[gray]Esc: close this monitor view[-]")
+			return
+		}
 		var sb strings.Builder
 
 		sb.WriteString("[yellow::b]Worker & Queue Information[-:-:-]\n\n")
@@ -1742,6 +1747,7 @@ func (cc *ControlCenter) showJobsDetailModal() {
 		switch event.Key() {
 		case tcell.KeyEsc:
 			cc.inModal = false
+			cc.sharedWorkerDetailView = nil
 			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 			return nil

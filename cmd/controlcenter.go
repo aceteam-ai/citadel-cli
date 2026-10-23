@@ -1409,6 +1409,13 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	data.WorkerRunning = ccWorkerRunning
 	data.WorkerQueue = ccWorkerQueue
 	ccWorkerMu.Unlock()
+	data.SharedWorker, data.WorkerDetail, data.WorkerDetailObservedAt = controlCenterWorkerDetailSnapshot()
+	if data.SharedWorker {
+		// The local monitor goroutine is not the selected worker's consume loop.
+		// Missing detail stays unavailable, never a green local running flag.
+		data.WorkerRunning = data.WorkerDetail != nil && data.WorkerDetail.Worker != nil && data.WorkerDetail.Worker.Consuming
+		data.WorkerQueue = ""
+	}
 
 	// Demo server URL (always running when control center is active)
 	data.DemoServerURL = fmt.Sprintf("http://localhost:%d", ccDemoPort)
@@ -2012,6 +2019,7 @@ func ccStartWorker(activityFn func(level, msg string)) error {
 	// Start worker in goroutine
 	go func() {
 		defer func() {
+			resetControlCenterWorkerDetail()
 			ccWorkerMu.Lock()
 			ccWorkerRunning = false
 			ccWorkerConsuming = false
@@ -2067,8 +2075,6 @@ func acquireControlCenterWorkerLock(stateDir string, logf func(string, ...any)) 
 
 // runTUIWorker runs the worker for the TUI (simplified version of runWork)
 func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error {
-	clockMonitor, stopClockMonitor := startClockMonitor(ctx)
-	defer stopClockMonitor()
 	activity := func(level, msg string) {
 		if activityFn != nil {
 			activityFn(level, msg)
@@ -2088,14 +2094,6 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			override)
 	}
 
-	// Construction-time gates use this immutable snapshot. Heartbeats compare
-	// it with current persisted intent so restart-bound changes remain pending
-	// until a new worker confirms them after startup.
-	ccAppliedPermissions := loadNodePermissions()
-
-	// Load device config from file
-	deviceConfig := getDeviceConfigFromFile()
-
 	// Acquire the same single-instance lock as `citadel work`. If a dedicated
 	// worker already holds it (issues #443/#435/#455), the control center
 	// MUST NOT compete for this node's jobs: two consumers in the same consumer
@@ -2103,8 +2101,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// privileged jobs (WHATSAPP_PROVISION, AGENT_UPDATE) were randomly grabbed by
 	// the control-center worker and failed with "no handler" even though the real
 	// worker's binary handles them (the competing-consumer incident). When a worker
-	// is present the control center stays a read-only monitor (heartbeat/telemetry
-	// only) and lets the real worker own all job consumption.
+	// is present this worker branch becomes a read-only shared-status monitor;
+	// the real worker owns consumption, collection and publishing.
 	//
 	// Hold this lease through runner and updater shutdown, so a later work
 	// invocation cannot become a second consumer, automatic installer, or
@@ -2127,6 +2125,21 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	ccWorkerMu.Lock()
 	ccWorkerConsuming = ccWorkerLock != nil
 	ccWorkerMu.Unlock()
+	if workerHeld {
+		// The existing owner supplies worker observations. This branch must stay
+		// before clock, device/API source, collector and publisher construction:
+		// the monitor owns no queue, heartbeat, enrollment or replacement worker.
+		activity("info", "Reading dedicated worker status over the shared local control surface")
+		return runControlCenterWorkerMonitor(ctx, network.GetStateDir(), workerPID, network.SessionControlWorkerDetailRequest)
+	}
+
+	clockMonitor, stopClockMonitor := startClockMonitor(ctx)
+	defer stopClockMonitor()
+	// Construction-time gates use this immutable snapshot. Heartbeats compare
+	// it with current persisted intent so restart-bound changes remain pending
+	// until a new worker confirms them after startup.
+	ccAppliedPermissions := loadNodePermissions()
+	deviceConfig := getDeviceConfigFromFile()
 
 	// Heartbeat auto_update telemetry (citadel-cli#1134), the control-center's
 	// worker-owned startup path. Mirrors runWork: a cache created before the
@@ -2452,16 +2465,6 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 				}
 			}
 		}
-	}
-
-	// If a dedicated worker holds the lock, the control center does NOT run a
-	// job-consuming runner (that is the whole point of the fix). Heartbeat and
-	// telemetry are already wired above; block here in monitor-only mode until the
-	// TUI context is cancelled, letting the real worker own all job consumption.
-	if workerHeld {
-		activity("success", "Monitor mode active (dedicated worker owns jobs)")
-		<-ctx.Done()
-		return ctx.Err()
 	}
 
 	// This control center holds the worker lock, so it
