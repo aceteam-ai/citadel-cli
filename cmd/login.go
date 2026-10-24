@@ -264,9 +264,7 @@ func runNonInteractiveLogin() {
 	}
 
 	// Try to reclaim stale node with the same hostname
-	if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-		reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
-	}
+	reclaimEnrollmentNodes(false, nil, nodeName)
 
 	// Connect to the network with animated spinner
 	spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)
@@ -457,16 +455,10 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 	// Try to reclaim a stale node registered under the SERVING identity so the
 	// coordination server does not suffix the new one (node-<uid>-1), which
 	// would break the verifier's exact-match rule.
-	if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-		reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, servingHostname)
-		// When we just switched this node's serving identity to node-<uid>,
-		// also sweep the prior registration under the display hostname so it
-		// is not orphaned (scoped to CSR-enrolled login: servingHostname
-		// differs from nodeName only then).
-		if servingHostname != nodeName {
-			reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
-		}
-	}
+	// A current grant is the authority even when its save failed. Force-new
+	// attempts must not reclaim the old identity using either current or saved
+	// credentials; replacement authorization belongs to platform approval.
+	reclaimEnrollmentNodes(loginNewDevice, deviceEnrollment, servingHostname, nodeName)
 
 	// Connect using tsnet with animated spinner
 	spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)

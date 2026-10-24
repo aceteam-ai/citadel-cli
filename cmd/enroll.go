@@ -117,7 +117,7 @@ just run 'citadel enroll' and scan.`,
 
 		// Reclaim any stale registration with the same hostname so the node
 		// does not appear twice in the Fabric dashboard after re-installs.
-		reclaimStaleNodeByHostname(result.Token.DeviceAPIToken, nodeName)
+		reclaimEnrollmentNodes(enrollNewDevice, result, nodeName)
 
 		// Honor the org's authoritative nexus from the device-auth token when
 		// --nexus was not explicitly set (citadel-cli#1122), so a QR-enroll

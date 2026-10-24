@@ -268,7 +268,7 @@ and system user configuration (requires sudo).`,
 
 			// Reclaim stale node with the same hostname before registering.
 			// This prevents duplicate nodes in the dashboard after live ISO reboots.
-			reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+			reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
 			if err := connectToNetwork(nodeName, deviceAuthResult.Token.Authkey); err != nil {
@@ -298,9 +298,7 @@ and system user configuration (requires sudo).`,
 			}
 
 			// Try to reclaim stale node using saved device config (if available)
-			if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-				reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
-			}
+			reclaimEnrollmentNodes(initNewDevice, nil, nodeName)
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
 			if err := connectToNetwork(nodeName, key); err != nil {
@@ -398,8 +396,8 @@ and system user configuration (requires sudo).`,
 
 			if authkeyToUse != "" {
 				// Reclaim stale node before registering (if we have a device API token)
-				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
-					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+				if deviceAuthResult != nil {
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 				}
 
 				fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
@@ -609,8 +607,8 @@ and system user configuration (requires sudo).`,
 
 			if authKey != "" {
 				// Reclaim stale node before registering (if we have a device API token)
-				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
-					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+				if deviceAuthResult != nil {
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 				}
 
 				fmt.Println("--- 🌐 Joining network ---")

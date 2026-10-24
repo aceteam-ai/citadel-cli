@@ -4,6 +4,7 @@ package controlcenter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -1289,6 +1290,10 @@ func buildDeviceAuthContent(config *DeviceAuthConfig, completeURL, status string
 
 // showDeviceAuthModal displays the device authorization code and polls for completion
 func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
+	if config == nil || config.ExpiresIn <= 0 || int64(config.ExpiresIn) > int64(maxDeviceAuthDuration/time.Second) {
+		cc.AddActivity("error", "Invalid device authorization expiry")
+		return
+	}
 	cc.inModal = true
 
 	// Create a flex layout for the modal
@@ -1343,17 +1348,13 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 	bodyLines := len(strings.Split(buildDeviceAuthContent(config, completeURL, "waiting", expiresAt), "\n"))
 	flex.AddItem(contentView, bodyLines+2, 0, true)
 
-	// Channel to signal completion
-	doneChan := make(chan struct{})
-	var pollCancel context.CancelFunc
+	// Initialize cancellation before installing callbacks or starting the poller.
+	ctx, pollCancel := context.WithCancel(context.Background())
 
 	// Input capture for escape, B, and C keys
 	contentView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc {
-			if pollCancel != nil {
-				pollCancel()
-			}
-			close(doneChan)
+			pollCancel()
 			cc.inModal = false
 			cc.app.SetRoot(cc.rootView, true)
 			cc.app.SetFocus(cc.servicesView)
@@ -1388,101 +1389,100 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 
 	// Start polling in background
 	go func() {
-		ctx, cancel := context.WithCancel(context.Background())
-		pollCancel = cancel
-		defer cancel()
+		defer pollCancel()
 
 		// Start countdown ticker
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
-		// Poll interval
-		pollInterval := time.Duration(config.Interval) * time.Second
-		if pollInterval < 5*time.Second {
-			pollInterval = 5 * time.Second
+		wait := func(ctx context.Context, delay time.Duration) error {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-timer.C:
+					return nil
+				case <-ticker.C:
+					if err := deviceAuthPollValid(ctx, time.Now(), expiresAt); err != nil {
+						return err
+					}
+					cc.app.QueueUpdateDraw(func() {
+						if cc.inModal {
+							updateContent("waiting")
+						}
+					})
+				}
+			}
 		}
-		pollTicker := time.NewTicker(pollInterval)
-		defer pollTicker.Stop()
-
-		for {
-			select {
-			case <-doneChan:
+		authkey, err := pollDeviceAuthorization(ctx, config, expiresAt, cc.deviceAuth.PollToken, wait, time.Now)
+		if err == nil {
+			err = deviceAuthPollValid(ctx, time.Now(), expiresAt)
+		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
 				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// Update countdown
-				cc.app.QueueUpdateDraw(func() {
-					if cc.inModal {
-						updateContent("waiting")
-					}
-				})
-				// Check if expired
-				if time.Now().After(expiresAt) {
-					cc.app.QueueUpdateDraw(func() {
-						cc.inModal = false
-						cc.app.SetRoot(cc.rootView, true)
-						cc.app.SetFocus(cc.servicesView)
-					})
-					cc.AddActivity("error", "Device authorization expired")
-					return
-				}
-			case <-pollTicker.C:
-				// Poll for token
-				if cc.deviceAuth.PollToken == nil {
-					continue
-				}
-
-				authkey, err := cc.deviceAuth.PollToken(config.DeviceCode, config.Interval)
-				if err != nil {
-					// Check if it's a pending error (keep polling)
-					if strings.Contains(err.Error(), "pending") {
-						continue
-					}
-					// Real error
-					cc.app.QueueUpdateDraw(func() {
-						updateContent("error:" + err.Error())
-					})
-					time.Sleep(2 * time.Second)
-					cc.app.QueueUpdateDraw(func() {
-						cc.inModal = false
-						cc.app.SetRoot(cc.rootView, true)
-						cc.app.SetFocus(cc.servicesView)
-					})
-					cc.AddActivity("error", fmt.Sprintf("Authorization failed: %v", err))
-					return
-				}
-
-				cc.AddActivity("info", "Connecting to network...")
-				if runtime.GOOS == "darwin" {
-					cc.AddActivity("info", "macOS may prompt for network access - click 'Allow'")
-				}
-				// Success display and worker startup share this gate: Connect must
-				// register AND link the same grant that was just approved.
-				if err := completeDeviceEnrollment(authkey, config.DeviceCode, cc.deviceAuth.Connect, func() {
-					cc.app.QueueUpdateDraw(func() { updateContent("success") })
-					cc.AddActivity("success", "Connected to AceTeam Network")
-					cc.refresh()
-					if cc.onConnect != nil {
-						cc.onConnect(cc.AddActivity)
-					}
-					cc.ShowChat()
-					cc.deviceURL = cc.authServiceURL + "/fabric"
-					cc.AddActivity("info", fmt.Sprintf("View your device: %s", cc.deviceURL))
-					cc.AddActivity("info", "Press [V] to open in browser")
-				}); err != nil {
-					cc.AddActivity("error", fmt.Sprintf("Enrollment incomplete: %v", err))
-				}
-
-				time.Sleep(time.Second)
+			}
+			if errors.Is(err, errDeviceAuthExpired) {
 				cc.app.QueueUpdateDraw(func() {
 					cc.inModal = false
 					cc.app.SetRoot(cc.rootView, true)
 					cc.app.SetFocus(cc.servicesView)
 				})
+				cc.AddActivity("error", "Device authorization expired")
 				return
 			}
+			cc.app.QueueUpdateDraw(func() { updateContent("error:" + err.Error()) })
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+			cc.app.QueueUpdateDraw(func() {
+				cc.inModal = false
+				cc.app.SetRoot(cc.rootView, true)
+				cc.app.SetFocus(cc.servicesView)
+			})
+			cc.AddActivity("error", fmt.Sprintf("Authorization failed: %v", err))
+			return
 		}
+		cc.AddActivity("info", "Connecting to network...")
+		if runtime.GOOS == "darwin" {
+			cc.AddActivity("info", "macOS may prompt for network access - click 'Allow'")
+		}
+		// Registration and linking still gate all success and worker startup.
+		connect := func(key, code string) error {
+			return connectCurrentDeviceAuthorization(ctx, expiresAt, time.Now, cc.deviceAuth.Connect, key, code)
+		}
+		if err := completeDeviceEnrollment(authkey, config.DeviceCode, connect, func() {
+			cc.app.QueueUpdateDraw(func() { updateContent("success") })
+			cc.AddActivity("success", "Connected to AceTeam Network")
+			cc.refresh()
+			if cc.onConnect != nil {
+				cc.onConnect(cc.AddActivity)
+			}
+			cc.ShowChat()
+			cc.deviceURL = cc.authServiceURL + "/fabric"
+			cc.AddActivity("info", fmt.Sprintf("View your device: %s", cc.deviceURL))
+			cc.AddActivity("info", "Press [V] to open in browser")
+		}); err != nil {
+			cc.AddActivity("error", fmt.Sprintf("Enrollment incomplete: %v", err))
+		}
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		cc.app.QueueUpdateDraw(func() {
+			cc.inModal = false
+			cc.app.SetRoot(cc.rootView, true)
+			cc.app.SetFocus(cc.servicesView)
+		})
 	}()
 }
 

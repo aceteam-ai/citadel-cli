@@ -1889,7 +1889,7 @@ func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
 	}
 	ccTokenServerErrors.Delete(deviceCode)
 	if token == nil || token.Authkey == "" {
-		return "", fmt.Errorf("authorization_pending")
+		return "", &nexus.TokenError{ErrorCode: "authorization_pending"}
 	}
 
 	ccEnrollmentTokens.Store(deviceCode, token)
@@ -1908,7 +1908,7 @@ func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
 var ccTokenServerErrors sync.Map
 
 // ccTokenPollError keeps the Control Center modal polling through a bounded run
-// of 5xx answers (the modal only continues on a "pending" error), matching the
+// of 5xx answers (the modal only continues on typed retry answers), matching the
 // CLI's nexus.PollForTokenWithCSR. Any other error, or too many 5xx in a row,
 // is returned unchanged and ends the modal.
 func ccTokenPollError(deviceCode string, err error) error {
@@ -1926,7 +1926,7 @@ func ccTokenPollError(deviceCode string, err error) error {
 		return err
 	}
 	ccTokenServerErrors.Store(deviceCode, n)
-	return fmt.Errorf("authorization_pending (server error %d, retrying)", serverErr.StatusCode)
+	return &nexus.TokenError{ErrorCode: "authorization_pending", ErrorDescription: fmt.Sprintf("server error %d, retrying", serverErr.StatusCode)}
 }
 
 // ccConnectWithAuthkey registers and links the grant approved by this modal.
@@ -1950,9 +1950,6 @@ func ccConnectWithAuthkey(authkey, deviceCode string) error {
 		AuthKey:    authkey,
 	}
 
-	// A registration ID left by an earlier enroll in this process must not
-	// stand in for this connection's node (citadel-cli#1356).
-	setRegisteredNodeID("")
 	err := ccConnectDeviceEnrollmentWith(authkey, deviceCode, func() error {
 		_, err := network.Connect(ctx, config)
 		return err
