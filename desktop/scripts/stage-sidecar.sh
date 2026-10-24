@@ -15,11 +15,13 @@ else
   target="$1"
 fi
 
+output_suffix=''
 case "$target" in
   aarch64-apple-darwin) go_os=darwin; go_arch=arm64 ;;
   x86_64-apple-darwin) go_os=darwin; go_arch=amd64 ;;
   x86_64-unknown-linux-gnu) go_os=linux; go_arch=amd64 ;;
   aarch64-unknown-linux-gnu) go_os=linux; go_arch=arm64 ;;
+  x86_64-pc-windows-msvc) go_os=windows; go_arch=amd64; output_suffix=.exe ;;
   *) echo "Unsupported Citadel desktop helper target: ${target:-<empty>}" >&2; exit 2 ;;
 esac
 
@@ -33,7 +35,7 @@ if [[ -z "$version" ]]; then
   exit 1
 fi
 
-output="$repo_dir/desktop/src-tauri/binaries/citadel-$target"
+output="$repo_dir/desktop/src-tauri/binaries/citadel-$target$output_suffix"
 mkdir -p "$(dirname "$output")"
 (
   cd "$repo_dir"
