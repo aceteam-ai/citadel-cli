@@ -445,4 +445,6 @@ assert_contains "$readme" \
   'The repository-root `build-dmg.sh` builds only through the reviewed Tauri entrypoint.' \
   'README headline rejects a second builder'
 
+"$script_dir/stage-sidecar-test.sh"
+
 echo "macOS DMG entrypoint tests passed ($tests_run assertions)"
