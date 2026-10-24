@@ -150,7 +150,8 @@ assert_success() {
   local target="$1"
   local go_os="$2"
   local go_arch="$3"
-  local output="$fake_repo/desktop/src-tauri/binaries/citadel-$target"
+  local suffix="$4"
+  local output="$fake_repo/desktop/src-tauri/binaries/citadel-$target$suffix"
   assert_equals called "$(cat "$record/go.calls")" 'one Go invocation'
   assert_equals "$fake_repo" "$(cat "$record/go.cwd")" 'Go build uses repository cwd'
   assert_equals 6 "$(cat "$record/go.argc")" 'Go argv retains one ldflags argument'
@@ -175,35 +176,43 @@ assert_success() {
     exit 1
   fi
   assert_equals 'inert helper data' "$(cat "$output")" 'output comes from inert Go shim'
+  assert_absent "$output.exe" 'no extra executable suffix is appended'
+  if [[ -n "$suffix" ]]; then
+    assert_absent "$fake_repo/desktop/src-tauri/binaries/citadel-$target" \
+      'Windows helper has no suffixless twin'
+  fi
   assert_absent "$case_dir/forbidden-helper" 'environment cannot redirect helper output'
   assert_equals "Staged bundled Citadel helper for $target" \
     "$(cat "$case_dir/stdout")" 'success is announced after build and chmod'
 }
 
 for target in aarch64-apple-darwin x86_64-apple-darwin \
-  x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+  x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+  expected_suffix=''
   case "$target" in
     aarch64-apple-darwin) expected_os=darwin; expected_arch=arm64 ;;
     x86_64-apple-darwin) expected_os=darwin; expected_arch=amd64 ;;
     x86_64-unknown-linux-gnu) expected_os=linux; expected_arch=amd64 ;;
     aarch64-unknown-linux-gnu) expected_os=linux; expected_arch=arm64 ;;
+    x86_64-pc-windows-msvc) expected_os=windows; expected_arch=amd64; expected_suffix=.exe ;;
   esac
   prepare_case
   run_stage 0 "$target"
-  assert_success "$target" "$expected_os" "$expected_arch"
+  assert_success "$target" "$expected_os" "$expected_arch" "$expected_suffix"
   assert_absent "$record/rustc.calls" 'explicit target does not probe Rust host'
 
   prepare_case
   fake_rust_target="$target"
   run_stage 0
-  assert_success "$target" "$expected_os" "$expected_arch"
+  assert_success "$target" "$expected_os" "$expected_arch" "$expected_suffix"
   assert_equals called "$(cat "$record/rustc.calls")" 'default target probes Rust once'
   assert_equals 2 "$(cat "$record/rustc.argc")" 'Rust host probe argc'
   assert_equals "$(printf '%s\n' --print host-tuple)" \
     "$(cat "$record/rustc.argv")" 'Rust host probe argv'
 done
 
-for target in '' x86_64-unknown-linux-musl x86_64-pc-windows-msvc \
+for target in '' x86_64-unknown-linux-musl x86_64-pc-windows-gnu \
+  aarch64-pc-windows-msvc i686-pc-windows-msvc \
   universal-apple-darwin amd64 --output '../escape'; do
   prepare_case
   run_stage 2 "$target"
@@ -268,5 +277,53 @@ run_stage 31 aarch64-unknown-linux-gnu
 assert_equals called "$(cat "$record/go.calls")" 'chmod failure follows a build'
 assert_equals called "$(cat "$record/chmod.calls")" 'chmod failure was exercised'
 assert_equals '' "$(cat "$case_dir/stdout")" 'chmod failure is not announced as staged'
+
+prepare_case
+run_stage 2 x86_64-pc-windows-msvc extra
+assert_no_build
+assert_absent "$record/rustc.calls" 'Windows extra args refuse before host lookup'
+assert_absent "$record/git.calls" 'Windows extra args refuse before provenance query'
+
+for mode in failed empty; do
+  prepare_case
+  case "$mode" in
+    failed) fake_git_exit=19 ;;
+    empty) fake_git_version='' ;;
+  esac
+  run_stage 1 x86_64-pc-windows-msvc
+  assert_no_build
+  assert_equals called "$(cat "$record/git.calls")" 'Windows provenance failure was exercised'
+  assert_absent "$record/rustc.calls" 'explicit Windows target needs no Rust'
+done
+
+prepare_case
+fake_go_exit=23
+run_stage 23 x86_64-pc-windows-msvc
+assert_equals called "$(cat "$record/go.calls")" 'Windows build failure was exercised'
+assert_absent "$record/chmod.calls" 'failed Windows build is never made executable'
+assert_absent "$fake_repo/desktop/src-tauri/binaries/citadel-x86_64-pc-windows-msvc" \
+  'failed Windows build has no suffixless output'
+assert_absent "$fake_repo/desktop/src-tauri/binaries/citadel-x86_64-pc-windows-msvc.exe.exe" \
+  'failed Windows build has no doubled suffix'
+assert_equals '' "$(cat "$case_dir/stdout")" 'failed Windows build is not announced as staged'
+tests_run=$((tests_run + 1))
+if [[ -x "$fake_repo/desktop/src-tauri/binaries/citadel-x86_64-pc-windows-msvc.exe" ]]; then
+  echo 'Failed Windows build left an executable fake output' >&2
+  exit 1
+fi
+
+prepare_case
+fake_chmod_exit=31
+run_stage 31 x86_64-pc-windows-msvc
+assert_equals called "$(cat "$record/go.calls")" 'Windows chmod failure follows a build'
+assert_equals called "$(cat "$record/chmod.calls")" 'Windows chmod failure was exercised'
+assert_equals "$(printf '%s\n' 755 \
+  "$fake_repo/desktop/src-tauri/binaries/citadel-x86_64-pc-windows-msvc.exe")" \
+  "$(cat "$record/chmod.argv")" 'Windows chmod selects the suffixed output'
+assert_absent "$fake_repo/desktop/src-tauri/binaries/citadel-x86_64-pc-windows-msvc" \
+  'Windows chmod failure has no suffixless output'
+assert_absent "$fake_repo/desktop/src-tauri/binaries/citadel-x86_64-pc-windows-msvc.exe.exe" \
+  'Windows chmod failure has no doubled suffix'
+assert_equals '' "$(cat "$case_dir/stdout")" 'Windows chmod failure is not announced as staged'
 
 echo "Sidecar staging source tests passed ($tests_run assertions)"
