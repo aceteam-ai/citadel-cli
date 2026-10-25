@@ -16,7 +16,7 @@ func TestControlCenterEnrollmentRequiresCurrentGrantLink(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var events []string
 			refused := errors.New("reservation proof does not match registered node")
-			err := ccConnectDeviceEnrollmentWith("current-registration-key", "current-modal-grant", func() error {
+			err := ccConnectDeviceEnrollmentWith(&nexus.TokenResponse{Authkey: "current-registration-key"}, "current-modal-grant", func() error {
 				events = append(events, "register")
 				return nil
 			}, func(result *DeviceAuthResult) error {
@@ -50,7 +50,7 @@ func TestControlCenterEnrollmentRequiresCurrentGrantLink(t *testing.T) {
 
 func TestControlCenterEnrollmentNeverLinksSavedCredentialsWithoutCurrentRegistration(t *testing.T) {
 	for _, args := range [][2]string{{"", "current-grant"}, {"current-registration-key", ""}} {
-		err := ccConnectDeviceEnrollmentWith(args[0], args[1], func() error {
+		err := ccConnectDeviceEnrollmentWith(&nexus.TokenResponse{Authkey: args[0]}, args[1], func() error {
 			t.Fatal("missing current authorization must fail before connecting")
 			return nil
 		}, func(*DeviceAuthResult) error {
@@ -65,7 +65,7 @@ func TestControlCenterEnrollmentNeverLinksSavedCredentialsWithoutCurrentRegistra
 		}
 	}
 	connectErr := errors.New("registration failed")
-	err := ccConnectDeviceEnrollmentWith("current-key", "current-grant", func() error { return connectErr }, func(*DeviceAuthResult) error {
+	err := ccConnectDeviceEnrollmentWith(&nexus.TokenResponse{Authkey: "current-key"}, "current-grant", func() error { return connectErr }, func(*DeviceAuthResult) error {
 		t.Fatal("failed registration must never link a previous node")
 		return nil
 	}, func() error {
@@ -91,7 +91,7 @@ func TestControlCenterEnrollmentResetsPreviousNodeBeforeInjectedConnect(t *testi
 			connectErr := errors.New("fixture connect failed")
 			linkErr := errors.New("fixture registration missing")
 			links, disconnects := 0, 0
-			err := ccConnectDeviceEnrollmentWith("fixture-key", "fixture-grant", func() error {
+			err := ccConnectDeviceEnrollmentWith(&nexus.TokenResponse{Authkey: "fixture-key"}, "fixture-grant", func() error {
 				if readID() != "" {
 					t.Fatal("previous registration survived into connect")
 				}

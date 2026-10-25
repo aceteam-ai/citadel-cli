@@ -22,8 +22,8 @@ func TestDeviceAuthorizationPollBackoffPersistsAcrossPending(t *testing.T) {
 		&nexus.TokenError{ErrorCode: "slow_down"},
 		nil,
 	}
-	key, err := pollDeviceAuthorization(context.Background(), &DeviceAuthConfig{DeviceCode: "fixture-grant", Interval: 5}, expiresAt,
-		func(code string, interval int) (string, error) {
+	token, err := pollDeviceAuthorization(context.Background(), &DeviceAuthConfig{DeviceCode: "fixture-grant", Interval: 5}, expiresAt,
+		func(code string, interval int) (*nexus.TokenResponse, error) {
 			if code != "fixture-grant" {
 				t.Fatal("poll changed the grant")
 			}
@@ -33,15 +33,15 @@ func TestDeviceAuthorizationPollBackoffPersistsAcrossPending(t *testing.T) {
 			// Response time must not count toward the next required wait.
 			at = at.Add(20 * time.Second)
 			if err == nil {
-				return "fixture-key", nil
+				return &nexus.TokenResponse{Authkey: "fixture-key"}, nil
 			}
-			return "", err
+			return nil, err
 		}, func(_ context.Context, delay time.Duration) error {
 			waits = append(waits, delay)
 			at = at.Add(delay)
 			return nil
 		}, func() time.Time { return at })
-	if err != nil || key != "fixture-key" {
+	if err != nil || token == nil || token.Authkey != "fixture-key" {
 		t.Fatal("poll did not finish the original fixture grant")
 	}
 	if !reflect.DeepEqual(waits, []time.Duration{5 * time.Second, 10 * time.Second, 10 * time.Second, 15 * time.Second}) ||
@@ -97,8 +97,8 @@ func TestDeviceAuthorizationPollStopsAtExpiryWithoutRequest(t *testing.T) {
 	at := time.Unix(1000, 0)
 	expiresAt := at.Add(2 * time.Second)
 	waits := 0
-	key, err := pollDeviceAuthorization(context.Background(), &DeviceAuthConfig{Interval: 5}, expiresAt,
-		func(string, int) (string, error) { t.Fatal("expired grant was polled"); return "", nil },
+	token, err := pollDeviceAuthorization(context.Background(), &DeviceAuthConfig{Interval: 5}, expiresAt,
+		func(string, int) (*nexus.TokenResponse, error) { t.Fatal("expired grant was polled"); return nil, nil },
 		func(_ context.Context, delay time.Duration) error {
 			waits++
 			if delay != 2*time.Second {
@@ -107,7 +107,7 @@ func TestDeviceAuthorizationPollStopsAtExpiryWithoutRequest(t *testing.T) {
 			at = at.Add(delay)
 			return nil
 		}, func() time.Time { return at })
-	if key != "" || !errors.Is(err, errDeviceAuthExpired) || waits != 1 {
+	if token != nil || !errors.Is(err, errDeviceAuthExpired) || waits != 1 {
 		t.Fatal("expiry did not end polling before another request")
 	}
 }
@@ -123,15 +123,15 @@ func TestDeviceAuthorizationPollRejectsCancelledOrExpiredResult(t *testing.T) {
 				cancel()
 			}
 			polls := 0
-			key, err := pollDeviceAuthorization(ctx, &DeviceAuthConfig{Interval: 5}, expiresAt,
-				func(string, int) (string, error) {
+			token, err := pollDeviceAuthorization(ctx, &DeviceAuthConfig{Interval: 5}, expiresAt,
+				func(string, int) (*nexus.TokenResponse, error) {
 					polls++
 					if phase == "during-poll" {
 						cancel()
 					} else {
 						at = expiresAt
 					}
-					return "late-fixture-key", nil
+					return &nexus.TokenResponse{Authkey: "late-fixture-key", DeviceAPIToken: "late-fixture-bearer"}, nil
 				}, func(_ context.Context, delay time.Duration) error {
 					at = at.Add(delay)
 					if phase == "during-wait" {
@@ -143,7 +143,7 @@ func TestDeviceAuthorizationPollRejectsCancelledOrExpiredResult(t *testing.T) {
 			if phase == "expired-result" {
 				want = errDeviceAuthExpired
 			}
-			if key != "" || !errors.Is(err, want) {
+			if token != nil || !errors.Is(err, want) {
 				t.Fatal("late or cancelled registration key escaped the poll fence")
 			}
 			if (phase == "before-wait" || phase == "during-wait") && polls != 0 {
@@ -160,11 +160,13 @@ func TestDeviceAuthorizationConnectionChecksAfterPollAndUIWork(t *testing.T) {
 			defer cancel()
 			at := time.Unix(1000, 0)
 			expiresAt := at.Add(time.Minute)
-			key, err := pollDeviceAuthorization(ctx, &DeviceAuthConfig{DeviceCode: "fixture-grant", Interval: 5}, expiresAt,
-				func(string, int) (string, error) { return "fixture-key", nil },
+			token, err := pollDeviceAuthorization(ctx, &DeviceAuthConfig{DeviceCode: "fixture-grant", Interval: 5}, expiresAt,
+				func(string, int) (*nexus.TokenResponse, error) {
+					return &nexus.TokenResponse{Authkey: "fixture-key"}, nil
+				},
 				func(_ context.Context, delay time.Duration) error { at = at.Add(delay); return nil },
 				func() time.Time { return at })
-			if err != nil || key == "" {
+			if err != nil || token == nil {
 				t.Fatal("fixture did not reach the post-poll UI boundary")
 			}
 			if phase == "cancelled-after-poll" {
@@ -173,13 +175,13 @@ func TestDeviceAuthorizationConnectionChecksAfterPollAndUIWork(t *testing.T) {
 				at = expiresAt
 			}
 			calls := 0
-			err = connectCurrentDeviceAuthorization(ctx, expiresAt, func() time.Time { return at }, func(gotKey, code string) error {
+			err = connectCurrentDeviceAuthorization(ctx, expiresAt, func() time.Time { return at }, func(gotToken *nexus.TokenResponse, code string) error {
 				calls++
-				if gotKey != "fixture-key" || code != "fixture-grant" {
+				if gotToken.Authkey != "fixture-key" || code != "fixture-grant" {
 					t.Fatal("connection changed the approved grant")
 				}
 				return nil
-			}, key, "fixture-grant")
+			}, token, "fixture-grant")
 			switch phase {
 			case "current":
 				if err != nil || calls != 1 {

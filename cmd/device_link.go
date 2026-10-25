@@ -219,20 +219,6 @@ func writeConfigFileAtomic(path string, data []byte) error {
 	return os.Rename(tmpName, path)
 }
 
-// ccEnrollmentTokens carries the token Control Center's poll received (and may
-// have saved) to its connect step, keyed by device code, so a fatal refusal can
-// roll back exactly that enrollment's credentials.
-var ccEnrollmentTokens sync.Map
-
-func ccEnrollmentTokenFor(deviceCode, authkey string) *nexus.TokenResponse {
-	if v, ok := ccEnrollmentTokens.LoadAndDelete(deviceCode); ok {
-		if token, ok := v.(*nexus.TokenResponse); ok && token != nil && token.Authkey == authkey {
-			return token
-		}
-	}
-	return &nexus.TokenResponse{Authkey: authkey}
-}
-
 // deviceLinkEnforced reports whether the server version is at or above
 // deviceLinkEnforcedFrom. ok is false when the version does not parse.
 func deviceLinkEnforced(version string) (enforced, ok bool) {
@@ -271,17 +257,18 @@ func linkDeviceEnrollmentWith(ctx context.Context, result *DeviceAuthResult, nod
 // ccConnectDeviceEnrollmentWith keeps the modal's current grant across network
 // registration. A refused link disconnects and reaches the UI as an error,
 // preventing its success callback from starting a worker for an unlinked grant.
-func ccConnectDeviceEnrollmentWith(authkey, deviceCode string, connect func() error, link func(*DeviceAuthResult) error, disconnect func() error) error {
-	if authkey == "" || deviceCode == "" {
+func ccConnectDeviceEnrollmentWith(token *nexus.TokenResponse, deviceCode string, connect func() error, link func(*DeviceAuthResult) error, disconnect func() error) error {
+	if token == nil || token.Authkey == "" || deviceCode == "" {
 		return deviceEnrollmentRecoveryError(fmt.Errorf("current device authorization is missing"))
 	}
+	current := *token
 	// A prior enroll in this process is not this modal's current registration.
 	// Reset at the injected connect boundary so ordering is directly testable.
 	setRegisteredNodeID("")
 	if err := connect(); err != nil {
 		return err
 	}
-	if err := link(&DeviceAuthResult{DeviceCode: deviceCode, Token: ccEnrollmentTokenFor(deviceCode, authkey)}); err != nil {
+	if err := link(&DeviceAuthResult{DeviceCode: deviceCode, Token: &current}); err != nil {
 		_ = disconnect()
 		return err
 	}
