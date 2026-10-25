@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/gorilla/websocket"
 )
 
@@ -25,6 +26,11 @@ type WSClient struct {
 	conn      *websocket.Conn
 	connMu    sync.RWMutex
 	connected bool
+
+	// Private, per-client handshake seam for listener-free transport regressions.
+	// Nil retains the existing gorilla dialer and its ten-second timeout.
+	// Set only before the client is used; production configuration cannot override it.
+	dialContext func(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error)
 
 	// connEstablishedAt is when the current conn was published (connectLocked).
 	// Guarded by connMu, like conn/connected. handleDisconnect reads it against
@@ -310,7 +316,11 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	dialContext := c.dialContext
+	if dialContext == nil {
+		dialContext = dialer.DialContext
+	}
+	conn, resp, err := dialContext(ctx, wsURL, headers)
 	if err != nil {
 		if resp != nil {
 			// A rejected upgrade carries the same rate-limit hint the REST
@@ -321,9 +331,9 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 			if resp.StatusCode == http.StatusTooManyRequests {
 				return fmt.Errorf("WebSocket connection failed: %w", rateLimitFromUpgrade(resp))
 			}
-			return fmt.Errorf("WebSocket connection failed with status %d: %w", resp.StatusCode, err)
+			return jobprivacy.DeliveryErrorContext(fmt.Sprintf("WebSocket connection failed with status %d", resp.StatusCode), err)
 		}
-		return fmt.Errorf("WebSocket connection failed: %w", err)
+		return jobprivacy.DeliveryErrorContext("WebSocket connection failed", err)
 	}
 
 	// Arm the keepalive BEFORE publishing the connection (#734).
@@ -412,16 +422,7 @@ func (c *WSClient) readLoop() {
 
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				// The read deadline expired: nothing at all arrived for
-				// pongWait, not even a pong for our pings. Before #734 this
-				// case did not exist and the loop simply blocked forever, so a
-				// half-open socket stayed "connected" while nothing flowed.
-				c.debug("ws: no traffic for %v, treating connection as dead", c.pongWait)
-			} else {
-				c.debug("ws: read error: %v", err)
-			}
+			c.debugReadError(err)
 			c.handleDisconnect(conn)
 			continue
 		}
@@ -432,16 +433,13 @@ func (c *WSClient) readLoop() {
 		// stays up on its own traffic.
 		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
 
-		var msg WSMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
+		msg, err := decodeWSDelivery(message)
+		if err != nil {
 			c.debug("ws: failed to parse message: %v", err)
 			continue
 		}
-		if msg.Type == "job" {
-			msg.observation = deliverymetadata.CaptureWS(message)
-		}
 
-		c.debug("ws: received message type=%s", msg.Type)
+		c.debugMessageType(msg.Type)
 
 		// Handle message based on type
 		c.handlersMu.RLock()
@@ -461,6 +459,43 @@ func (c *WSClient) readLoop() {
 			wildcardHandler(msg)
 		}
 	}
+}
+
+func (c *WSClient) debugReadError(err error) {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		// Keep the existing timeout classification without formatting the
+		// original error. CloseError.Text and other transport details are
+		// peer-controlled even before a JSON job kind can be established.
+		c.debug("ws: no traffic for %v, treating connection as dead", c.pongWait)
+	} else {
+		c.debug("ws: read error: detail omitted")
+	}
+}
+
+func (c *WSClient) debugMessageType(kind string) {
+	// Only the exact types consumed by the worker are useful diagnostics here.
+	// Unknown/custom types still reach their unchanged handlers below, but an
+	// arbitrary wire string is never a diagnostic label or execution authority.
+	switch kind {
+	case "job", "error", "consuming", "acked":
+		c.debug("ws: received message type=%s", kind)
+	default:
+		c.debug("ws: received message type=unknown")
+	}
+}
+
+// decodeWSDelivery preserves the unchanged wire decoder and passive observation
+// bytes, while withholding malformed-frame details before its kind is known.
+func decodeWSDelivery(message []byte) (WSMessage, error) {
+	var msg WSMessage
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return WSMessage{}, jobprivacy.DeliveryError(err)
+	}
+	if msg.Type == "job" {
+		msg.observation = deliverymetadata.CaptureWS(message)
+	}
+	return msg, nil
 }
 
 // armKeepalive installs the read deadline and the control-frame handlers on a
@@ -825,7 +860,7 @@ func (c *WSClient) reconnect() {
 			// authority, not wherever our own doubling had gotten to.
 			if rle, ok := AsRateLimitError(err); ok {
 				if wait := rle.Wait(time.Now()); wait > 0 {
-					c.debug("ws: reconnect: rate limited (limit=%d window=%q), honoring server backoff of %s instead of local schedule", rle.Limit, rle.Window, wait)
+					c.debug("ws: reconnect: rate limited (limit=%d), honoring server backoff of %s instead of local schedule", rle.Limit, wait)
 					if !c.sleepUnlessDoneUntil(time.Now().Add(wait)) {
 						return
 					}

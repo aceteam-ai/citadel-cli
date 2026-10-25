@@ -31,6 +31,25 @@ So, when adding to this file:
 
 ## Project Overview
 
+`jobprivacy.IsPrivateMedia` owns the malformed-safe diagnostic classification
+for MEDIA_GENERATE inputs; its retention helpers never mutate execution data.
+`redactedError.Unwrap` exposes original classification through a private
+closure so reflected diagnostic wrappers cannot traverse the original error.
+`jobprivacy.DeliveryError` owns pre-kind decoder diagnostic omission;
+`redisapi.decodeWSDelivery` preserves original frame observation capture.
+`redis.mediaACKClassifier` is an unregistered pure Go/Lua retention-parity
+preparation. It contains no Redis calls and is not ACK or deletion authority;
+shared-stream skip/owner semantics must be settled before wiring purge.
+`jobprivacy.CaptureMedia` owns the separate opaque execution/raw-byte copy;
+explicit projections preserve execution types and exact digest input, never
+derive execution authority from the passive delivery observer or raw-only data.
+Parsed Redis/API Jobs seal before return; worker conversion transfers that
+opaque snapshot. `worker.Job.executionField` owns trusted control projections,
+`rawOrPayload` owns exact receipt digest input and `LegacyHandlerAdapter.Execute`
+owns explicit handler projection. Observable diagnostic maps grant no authority.
+The complete pre-mint privacy/ACK gates remain in
+`docs/media-input-freezer.md`; helper tests alone are not C2 completion.
+
 `workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
 loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
 validation separately from the HTTP node. Both worker entrypoints load once via
@@ -536,6 +555,12 @@ required; legacy callbacks and zero-value construction cannot enable it.
 `ShellGateReason` still owns runtime refusal precedence. The partial #1436
 activation gates remain in `internal/memorygit/doc.go`; no registry or
 capability advertises this source.
+
+`redisapi.RateLimitError` owns bounded ordinary error/fmt/diagnostic-JSON
+projections without changing original typed metadata or `Wait`. Peer `Body`,
+`Message` and `Window` are explicit-access fields, not diagnostic arguments.
+The actual retry-loop fixtures pin omission of separately supplied raw window
+strings; see `docs/media-input-freezer.md` for the projection and its limits.
 
 The worker (`citadel worker`) is the high-performance job queue mode designed for AceTeam's private GPU cloud infrastructure. Written in Go for maximum concurrency and throughput, it routes inference requests to private vLLM/Ollama/llama.cpp clusters.
 

@@ -45,26 +45,50 @@ func AsAuthorizationError(err error) (*AuthorizationError, bool) {
 type RateLimitError struct {
 	// StatusCode is the HTTP status (always 429 for this type).
 	StatusCode int
-	// Message is the human-readable error from the body ("Rate limit exceeded").
+	// Message is the original peer error, available for explicit typed access.
+	// Ordinary diagnostics intentionally omit it.
 	Message string
 	// Limit is the quota ceiling (e.g. 50000), 0 if not reported.
 	Limit int
-	// Window is the quota window (e.g. "day"), empty if not reported.
+	// Window is the original quota window, empty if not reported. It is not a
+	// trusted diagnostic label: peers can put arbitrary text here.
 	Window string
 	// RetryAfter is the server-requested wait before retrying. Zero if the
 	// body did not include a usable hint.
 	RetryAfter time.Duration
 	// ResetAt is when the quota resets. Zero if not reported.
 	ResetAt time.Time
-	// Body is the raw response body for logging/debugging.
+	// Body is the original response for explicit typed access, not logging.
 	Body string
 }
 
 func (e *RateLimitError) Error() string {
-	if e.RetryAfter > 0 {
-		return fmt.Sprintf("rate limited (status %d): %s (retry after %s)", e.StatusCode, e.Message, e.RetryAfter)
+	if e == nil {
+		return "rate limited (details unavailable)"
 	}
-	return fmt.Sprintf("rate limited (status %d): %s", e.StatusCode, e.Message)
+	return e.diagnosticSummary()
+}
+
+func (e RateLimitError) diagnosticSummary() string {
+	return fmt.Sprintf("rate limited (status %d, limit %d, retry after %s; peer details omitted)", e.StatusCode, e.Limit, e.RetryAfter)
+}
+
+// Format covers both pointer and copied-value ordinary formatting, including
+// %#v. Ignore width/precision rather than allocating caller-sized padding.
+// Explicit field access, aliases and reflection are not a privacy boundary.
+func (e RateLimitError) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, e.diagnosticSummary())
+}
+
+// MarshalJSON is a diagnostic projection, not a lossless rate-limit wire
+// encoding. Keep the original fields and retry behavior available through the
+// typed error while excluding peer text from pointer/value/container JSON.
+func (e RateLimitError) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		StatusCode int
+		Limit      int
+		RetryAfter time.Duration
+	}{e.StatusCode, e.Limit, e.RetryAfter})
 }
 
 // Wait returns how long the caller should sleep before retrying, given the
