@@ -152,6 +152,7 @@ func runStandardStatus() {
 // worker, and enriches the line with the recorded PID / version. Read-only: it
 // never touches the lock (IsHeld probes on a separate fd and unlocks immediately).
 func printWorkerInfo(w io.Writer) {
+	printDeviceLinkDiagnostic(w, getDeviceConfigFromFile())
 	stateDir := network.GetStateDir()
 	held, pid := worklock.IsHeld(stateDir)
 	if !held {
@@ -437,6 +438,10 @@ func runInteractiveDashboard() {
 func gatherStatusData() (dashboard.StatusData, error) {
 	data := dashboard.StatusData{
 		Version: Version,
+	}
+	if detail := deviceLinkDiagnostic(getDeviceConfigFromFile()); detail != "" {
+		data.DeviceLinkState = "unverified"
+		data.DeviceLinkDetail = detail
 	}
 
 	// Load manifest

@@ -139,6 +139,10 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// Refusal bodies can echo credentials. Do not read or retain them.
+		return &AuthorizationError{StatusCode: resp.StatusCode}
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		// A 429 carries a structured rate-limit hint (retry_after/reset_at).
@@ -290,6 +294,16 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 	}
 	defer resp.Body.Close()
 
+	// Keep consume status provenance even when authorization refuses before
+	// reading the body. This is the HTTP answer, not inferred linkage state.
+	if strings.Contains(path, "/jobs/consume") {
+		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		c.debug("response: %d - <authorization refusal body omitted>", resp.StatusCode)
+		return &AuthorizationError{StatusCode: resp.StatusCode}
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
@@ -304,16 +318,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 	}
 	c.debug("response: %d - %s", resp.StatusCode, string(diagnosticBody))
 
-	// Record the consume HTTP status for worker introspection (issue #236).
-	// This is the single signal that would have surfaced the pre-fix #3924
-	// 400s, which otherwise only appeared as a generic "consume failed" error.
-	if strings.Contains(path, "/jobs/consume") {
-		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
-	}
-
 	// Handle error responses.
 	//
-	// Every error here carries method, path, HTTP status and the (truncated)
+	// Non-authorization errors carry method, path, HTTP status and the (truncated)
 	// response body, because the callers of this package deliberately no longer
 	// second-guess a 2xx (see pubsub.go): this error string is the ONLY record of
 	// why a call failed. Issue #721 was slow to diagnose precisely because the

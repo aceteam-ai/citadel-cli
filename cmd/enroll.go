@@ -59,7 +59,8 @@ just run 'citadel enroll' and scan.`,
 		if network.IsGlobalConnected() {
 			nodeName, _ := getNodeName()
 			ip, _ := network.GetGlobalIPv4()
-			fmt.Printf("✅ This node is already enrolled as '%s'.\n", nodeName)
+			fmt.Printf("✅ This node is already connected to the mesh as '%s'.\n", nodeName)
+			printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
 			if ip != "" {
 				fmt.Printf("   IP: %s\n", ip)
 			}

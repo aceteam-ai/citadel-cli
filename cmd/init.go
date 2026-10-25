@@ -357,6 +357,9 @@ and system user configuration (requires sudo).`,
 						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
 						os.Exit(1)
 					}
+				} else {
+					// Do not mistake a saved bearer for a completed current-key link.
+					printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
 				}
 
 				// Get node name from network status

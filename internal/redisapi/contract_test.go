@@ -56,7 +56,7 @@ func TestPublishAcceptsRoutePublishedField(t *testing.T) {
 	}
 }
 
-func TestPublishErrorCarriesStatusAndBody(t *testing.T) {
+func TestPublishAuthorizationErrorIsTypedAndOmitsPeerBody(t *testing.T) {
 	// The 403 the route returns when the device key lacks device_redis:pubsub.
 	srv, _ := newContractServer(t, http.StatusForbidden,
 		`{"error":"Unauthorized - requires device_redis:pubsub scope"}`)
@@ -66,10 +66,13 @@ func TestPublishErrorCarriesStatusAndBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("Publish should error on 403")
 	}
-	msg := err.Error()
-	for _, want := range []string{"403", "/api/fabric/redis/pubsub/publish", "device_redis:pubsub"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("error %q should contain %q so one log line is enough to diagnose it", msg, want)
+	denied, ok := AsAuthorizationError(err)
+	if !ok || denied.StatusCode != http.StatusForbidden {
+		t.Fatalf("Publish must preserve typed 403: %v", err)
+	}
+	for _, private := range []string{srv.URL, "/api/fabric/redis/pubsub/publish", "device_redis:pubsub", "test-token"} {
+		if strings.Contains(err.Error(), private) {
+			t.Errorf("authorization error retained private response/request data: %q", err)
 		}
 	}
 }

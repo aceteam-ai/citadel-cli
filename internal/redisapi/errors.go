@@ -11,6 +11,26 @@ import (
 	"time"
 )
 
+// AuthorizationError is an HTTP 401/403 refusal, not proof that a device is
+// unlinked, revoked or expired. It retains no response body, URL or credential.
+type AuthorizationError struct {
+	StatusCode int
+}
+
+func (e *AuthorizationError) Error() string {
+	return fmt.Sprintf("request denied (HTTP %d); device linkage/permissions not confirmed; if enrollment is incomplete, use 'citadel logout && citadel init' for fresh browser approval", e.StatusCode)
+}
+
+// AsAuthorizationError extracts a typed refusal through ordinary error wraps.
+// It does not infer authorization state by parsing arbitrary error strings.
+func AsAuthorizationError(err error) (*AuthorizationError, bool) {
+	var denied *AuthorizationError
+	if errors.As(err, &denied) && denied != nil && (denied.StatusCode == http.StatusUnauthorized || denied.StatusCode == http.StatusForbidden) {
+		return denied, true
+	}
+	return nil, false
+}
+
 // RateLimitError is returned when the API responds with HTTP 429 (Too Many
 // Requests). It carries the structured hint from the response body so callers
 // can honor the server's backoff request instead of hammering the endpoint.
