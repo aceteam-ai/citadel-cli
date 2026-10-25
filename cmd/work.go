@@ -827,6 +827,11 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
+	// Keep persisted identity separate from worker-config queue fallbacks.
+	localControlOrgID := ""
+	if deviceConfig != nil {
+		localControlOrgID = deviceConfig.OrgID
+	}
 	if deviceConfig != nil {
 		Debug("config loaded: device_api_token present=%t, api_base_url present=%t, redis_url present=%t",
 			deviceConfig.DeviceAPIToken != "",
@@ -2885,6 +2890,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Shared with the control-center TUI via registerPrivilegedNodeJobHandlers so a
 	// control-center-only node handles the same privileged set.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	if workerLockHeld {
+		defer startWorkerControl(ctx, source, localControlOrgID, nodeJobOpts)()
+	}
 	// Publish only after every handler is registered so heartbeats expose one
 	// complete immutable set, never a partial capability advertisement.
 	startStatusPublisherAfterRunner(&nodeRunner, runner, startStatusPublisher)
