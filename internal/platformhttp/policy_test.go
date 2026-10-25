@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -53,6 +54,23 @@ func TestOpaqueDefaultTransportIsNotReplacedWithNetworkAccess(t *testing.T) {
 	}
 	if _, err := tr.RoundTrip(req); err == nil || err.Error() != "synthetic transport" {
 		t.Fatal("explicit opaque default transport was bypassed")
+	}
+}
+
+func TestFreshDialDiagnosticsAreDebugOnly(t *testing.T) {
+	f := newSwapFixture(t, false)
+	f.request(t, "/normal")
+	if f.diagnostic() != "" {
+		t.Fatal("ordinary fresh dial printed over normal/TUI output")
+	}
+	var debug []string
+	f.transport.debugf = func(format string, args ...any) {
+		debug = append(debug, fmt.Sprintf(format, args...))
+	}
+	f.client.CloseIdleConnections()
+	f.request(t, "/debug")
+	if len(debug) != 1 || !strings.Contains(debug[0], "fresh dial remote_ip=127.0.0.1 reason=initial") || f.diagnostic() != "" {
+		t.Fatal("fresh-dial metadata did not stay on the opt-in debug path")
 	}
 }
 

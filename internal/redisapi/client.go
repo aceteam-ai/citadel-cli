@@ -82,7 +82,7 @@ func NewClient(cfg ClientConfig) *Client {
 		token:   cfg.Token,
 		httpClient: &http.Client{
 			Timeout:   cfg.Timeout,
-			Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{}),
+			Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{Debugf: cfg.DebugFunc}),
 		},
 		workerID:  fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
 		debugFunc: cfg.DebugFunc,

@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	MaxConnectionAge = 10 * time.Minute
-	IdleConnTimeout  = 90 * time.Second
-	FailureThreshold = 3
-	maxErrorSample   = 4096
+	MaxConnectionAge        = 10 * time.Minute
+	IdleConnTimeout         = 90 * time.Second
+	FailureThreshold        = 3
+	FailureRotationCooldown = time.Minute
+	maxErrorSample          = 4096
 )
 
 type Options struct {
@@ -28,30 +29,37 @@ type Options struct {
 	IdleTimeout      time.Duration
 	FailureThreshold int
 	Logf             func(string, ...any)
-	Now              func() time.Time
+	// Debugf receives per-dial diagnostics. Nil keeps normal/TUI output quiet.
+	Debugf func(string, ...any)
+	Now    func() time.Time
 }
 
 type generation struct {
-	pool   *http.Transport
-	born   time.Time
-	failed int
-	remote string
-	reason string
+	pool          *http.Transport
+	born          time.Time
+	failed        int
+	firstPath     string
+	distinctPaths bool
+	remote        string
+	reason        string
 }
 
 // Transport rotates the whole pool before a request once its age is reached.
 // Unlike idle eviction alone, this also stops new HTTP/2 streams from selecting
 // an old, continuously busy connection. Existing requests are allowed to finish.
 type Transport struct {
-	mu          sync.Mutex
-	current     *generation
-	passthrough http.RoundTripper
-	template    *http.Transport
-	origin      string
-	maxAge      time.Duration
-	threshold   int
-	logf        func(string, ...any)
-	now         func() time.Time
+	mu                  sync.Mutex
+	current             *generation
+	lastFailureRotation time.Time
+	hasFailureRotation  bool
+	passthrough         http.RoundTripper
+	template            *http.Transport
+	origin              string
+	maxAge              time.Duration
+	threshold           int
+	logf                func(string, ...any)
+	debugf              func(string, ...any)
+	now                 func() time.Time
 }
 
 // WithTransport preserves client policy in a private value copy. An explicit
@@ -68,7 +76,7 @@ func WithTransport(baseURL string, client *http.Client) *http.Client {
 		copy.Transport = New(baseURL, Options{BaseTransport: base})
 	case *Transport:
 		if base.template != nil && base.origin != configuredOrigin(baseURL) {
-			copy.Transport = New(baseURL, Options{BaseTransport: base.template, MaxAge: base.maxAge, FailureThreshold: base.threshold, Logf: base.logf, Now: base.now})
+			copy.Transport = New(baseURL, Options{BaseTransport: base.template, MaxAge: base.maxAge, FailureThreshold: base.threshold, Logf: base.logf, Debugf: base.debugf, Now: base.now})
 		}
 	}
 	return &copy
@@ -104,10 +112,13 @@ func New(baseURL string, opts Options) *Transport {
 	if opts.Logf == nil {
 		opts.Logf = log.Printf
 	}
+	if opts.Debugf == nil {
+		opts.Debugf = func(string, ...any) {}
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	t := &Transport{template: template, origin: configuredOrigin(baseURL), maxAge: opts.MaxAge, threshold: opts.FailureThreshold, logf: opts.Logf, now: opts.Now}
+	t := &Transport{template: template, origin: configuredOrigin(baseURL), maxAge: opts.MaxAge, threshold: opts.FailureThreshold, logf: opts.Logf, debugf: opts.Debugf, now: opts.Now}
 	t.current = t.fresh("initial")
 	return t
 }
@@ -144,6 +155,10 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		t.redial("max_connection_age", retiredIP)
 	}
 	tracked := req.URL.Scheme+"://"+req.URL.Host == t.origin
+	path := req.URL.Path // Query changes do not turn one endpoint into two.
+	if path == "" {
+		path = "/"
+	}
 
 	// The trace composes with an existing caller trace. Keep only an IP, never
 	// a URL/query, device token, response body or peer-supplied error message.
@@ -160,7 +175,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			t.mu.Unlock()
 		}
 		if tracked && !info.Reused {
-			t.logf("platform API fresh dial remote_ip=%s reason=%s", ip, g.reason)
+			t.debugf("platform API fresh dial remote_ip=%s reason=%s", ip, g.reason)
 		}
 	}}
 	request := req.Clone(httptrace.WithClientTrace(req.Context(), trace))
@@ -170,7 +185,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	peerMu.Unlock()
 	if err != nil {
 		if tracked && req.Context().Err() == nil {
-			t.observe(g, true, "network_failure", ip)
+			t.observe(g, true, "network_failure", ip, path)
 		}
 		return resp, err
 	}
@@ -178,18 +193,23 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return resp, nil // Redirects/secondary hosts retain caller policy.
 	}
 	failed := resp.StatusCode == http.StatusNotFound || (resp.StatusCode >= 500 && resp.StatusCode < 600)
-	rotated := false
-	if failed {
-		rotated = t.observe(g, true, "http_"+strconv.Itoa(resp.StatusCode), ip)
+	serverError := resp.StatusCode >= 500 && resp.StatusCode < 600
+	if serverError || (failed && resp.Body == nil) {
+		t.observe(g, true, "http_"+strconv.Itoa(resp.StatusCode), ip, path)
 	} else if resp.StatusCode < 400 || resp.StatusCode == 401 || resp.StatusCode == 403 {
-		t.observe(g, false, "", ip)
+		t.observe(g, false, "", ip, path)
 	}
 	// Authorization-refusal bodies are deliberately never read or retained by
 	// this layer. Other error bodies are sampled only while the caller reads;
 	// there is no prefetch, additional read, content substitution or retry.
-	if resp.StatusCode >= 400 && resp.StatusCode != 401 && resp.StatusCode != 403 && resp.Body != nil {
+	// A 5xx already contributed at headers. Delay 404 observation until the
+	// caller reads/closes its body so a mismatch gets exactly one reason/log.
+	if resp.StatusCode >= 400 && resp.StatusCode != 401 && resp.StatusCode != 403 && !serverError && resp.Body != nil {
 		resp.Body = &observedBody{ReadCloser: resp.Body, finish: func(sample []byte, complete bool) {
 			if !complete && len(sample) == 0 {
+				if failed {
+					t.observe(g, true, "http_404", ip, path)
+				}
 				return
 			}
 			mismatch := !platformError(sample)
@@ -197,13 +217,10 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			if !complete && mismatch && !json.Valid(sample) {
 				reason = "unclassified_error_body"
 			}
-			if failed {
-				if mismatch && rotated {
-					t.redial(reason, ip)
-				}
-				return // A response contributes at most one failure.
+			if failed && !mismatch {
+				reason = "http_404"
 			}
-			t.observe(g, mismatch, reason, ip)
+			t.observe(g, failed || mismatch, reason, ip, path)
 		}}
 	}
 	return resp, nil
@@ -211,7 +228,10 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // observe ignores late responses from retired pools, so one old in-flight
 // request cannot reset or rotate the replacement generation's failure streak.
-func (t *Transport) observe(g *generation, failed bool, reason, remote string) bool {
+// The cooldown belongs to Transport, not generation: rebuilding a pool must
+// not reset it. Keep one path plus a diversity bit, rather than an unbounded
+// set of endpoint strings, and cap the failure counter during an outage.
+func (t *Transport) observe(g *generation, failed bool, reason, remote, path string) bool {
 	t.mu.Lock()
 	if t.current != g {
 		t.mu.Unlock()
@@ -219,15 +239,27 @@ func (t *Transport) observe(g *generation, failed bool, reason, remote string) b
 	}
 	if !failed {
 		g.failed = 0
+		g.firstPath = ""
+		g.distinctPaths = false
 		t.mu.Unlock()
 		return false
 	}
-	g.failed++
 	if g.failed < t.threshold {
+		g.failed++
+	}
+	if g.firstPath == "" {
+		g.firstPath = path
+	} else if g.firstPath != path {
+		g.distinctPaths = true
+	}
+	now := t.now()
+	if g.failed < t.threshold || !g.distinctPaths || (t.hasFailureRotation && now.Sub(t.lastFailureRotation) < FailureRotationCooldown) {
 		t.mu.Unlock()
 		return false
 	}
 	t.current = t.fresh(reason)
+	t.lastFailureRotation = now
+	t.hasFailureRotation = true
 	t.mu.Unlock()
 	g.pool.CloseIdleConnections()
 	t.redial(reason, remote)
