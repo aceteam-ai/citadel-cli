@@ -1917,8 +1917,8 @@ func ccPollDeviceAuthTokenWith(deviceCode string, check func(string) (*nexus.Tok
 	if token == nil || token.Authkey == "" {
 		return nil, &nexus.TokenError{ErrorCode: "authorization_pending"}
 	}
-	copy := *token
-	return &copy, nil
+	clonedToken := *token
+	return &clonedToken, nil
 }
 
 // ccTokenServerErrors counts consecutive 5xx token answers per device code.

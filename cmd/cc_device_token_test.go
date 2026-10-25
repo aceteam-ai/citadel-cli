@@ -1,16 +1,21 @@
 package cmd
 
 import (
+	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"gopkg.in/yaml.v3"
 )
 
-// These helpers inject only synchronous, inert fetch/save/continuation calls.
-// They do not call the real token endpoint, config writer, or network connect.
+// Fixtures inject synchronous fetch/registration continuations and never call
+// the real token endpoint or network connect. The persistence regression alone
+// uses the real config writer with explicit temporary path/ownership seams.
 func TestControlCenterStartDeadlineUsesRequestEntry(t *testing.T) {
 	started := time.Unix(1000, 0)
 	at := started
@@ -85,6 +90,68 @@ func TestControlCenterPollOnlyReturnsOwnedResponse(t *testing.T) {
 	token.DeviceAPIToken = "replacement"
 	if *got != want {
 		t.Fatal("fetch result aliases the endpoint's response")
+	}
+}
+
+func TestControlCenterPollDoesNotPersistAndAcceptedTokenUsesSandboxWriter(t *testing.T) {
+	// Redirect the exact production write seam before fetching. If polling ever
+	// calls saveDeviceConfigToFile again, it can change only this owned file.
+	dir := t.TempDir()
+	withHookOverrides(t, dir, func() {})
+	// The writer also reads the legacy platform config for operator fields.
+	// Seed HOME's config so root resolution cannot fall through to a system path.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacy := filepath.Join(home, ".citadel-cli")
+	if err := os.MkdirAll(legacy, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "config.yaml"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	before := []byte("# exact sentinel formatting must survive polling\ndevice_api_token: previous-bearer\norg_id: previous-org\naceteam_api_key: operator-kept\n")
+	if err := os.WriteFile(path, before, 0600); err != nil {
+		t.Fatal(err)
+	}
+	const grant = "fixture-no-poll-persistence"
+	t.Cleanup(func() { ccEndDeviceAuthFlow(grant) })
+	want := ccFixtureDeviceToken()
+	token, err := ccPollDeviceAuthTokenWith(grant, func(string) (*nexus.TokenResponse, error) { return want, nil })
+	if err != nil || token == nil || *token != *want {
+		t.Fatal("fixture did not fetch the complete current token")
+	}
+	afterPoll, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterPoll, before) {
+		t.Fatal("token polling changed credential config before acceptance")
+	}
+	connects := 0
+	err = ccAcceptDeviceTokenWith(token, grant, saveDeviceConfigToFile, func(current *nexus.TokenResponse, code string) error {
+		connects++
+		if *current != *want || code != grant {
+			t.Fatal("acceptance substituted another response")
+		}
+		saved, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed map[string]any
+		if err := yaml.Unmarshal(saved, &parsed); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Equal(saved, before) || parsed["device_api_token"] != want.DeviceAPIToken || parsed["org_id"] != want.OrgID || parsed["aceteam_api_key"] != "operator-kept" {
+			t.Fatal("accepted real sandbox writer did not persist before registration or lost operator config")
+		}
+		if loaded := getDeviceConfigFromFile(); loaded == nil || loaded.DeviceAPIToken != want.DeviceAPIToken || loaded.OrgID != want.OrgID {
+			t.Fatal("cmd credential reader did not follow the same temporary path as its writer")
+		}
+		return nil
+	})
+	if err != nil || connects != 1 {
+		t.Fatal("healthy acceptance did not use the real sandbox writer and continue exactly once")
 	}
 }
 

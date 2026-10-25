@@ -19,7 +19,6 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
-	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/recommend"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
@@ -1415,14 +1414,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 				}
 			}
 		}
-		token, err := func() (*nexus.TokenResponse, error) {
-			if cc.deviceAuth.EndFlow != nil {
-				// Cleanup follows the last synchronous fetch, before later UI
-				// work can block. A late fetch cannot recreate retry state.
-				defer cc.deviceAuth.EndFlow(config.DeviceCode)
-			}
-			return pollDeviceAuthorization(ctx, config, expiresAt, cc.deviceAuth.PollToken, wait, time.Now)
-		}()
+		token, err := pollDeviceAuthorizationWithCleanup(ctx, config, expiresAt, cc.deviceAuth, wait, time.Now)
 		if err == nil {
 			err = deviceAuthPollValid(ctx, time.Now(), expiresAt)
 		}

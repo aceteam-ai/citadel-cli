@@ -136,6 +136,23 @@ func nextDeviceAuthPollInterval(current time.Duration, err error) (time.Duration
 	}
 }
 
+// pollDeviceAuthorizationWithCleanup owns the lifetime of one synchronous poll
+// flow. Cleanup runs after its last fetch returns, even if that return is late,
+// and before callers can block on later UI or connection work. Captured values
+// keep cleanup bound to the same grant that was actually polled.
+func pollDeviceAuthorizationWithCleanup(ctx context.Context, config *DeviceAuthConfig, expiresAt time.Time,
+	callbacks DeviceAuthCallbacks, wait func(context.Context, time.Duration) error,
+	now func() time.Time) (*nexus.TokenResponse, error) {
+	if config == nil {
+		return nil, errors.New("device authorization polling is unavailable")
+	}
+	flow := *config
+	if callbacks.EndFlow != nil {
+		defer callbacks.EndFlow(flow.DeviceCode)
+	}
+	return pollDeviceAuthorization(ctx, &flow, expiresAt, callbacks.PollToken, wait, now)
+}
+
 // pollDeviceAuthorization schedules from each completed response, so slow
 // requests cannot leave queued ticker events that bypass a new backoff. The
 // callback fetches only; a late result is discarded before any local credential
