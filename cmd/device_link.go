@@ -270,6 +270,9 @@ func ccConnectDeviceEnrollmentWith(authkey, deviceCode string, connect func() er
 	if authkey == "" || deviceCode == "" {
 		return deviceEnrollmentRecoveryError(fmt.Errorf("current device authorization is missing"))
 	}
+	// A prior enroll in this process is not this modal's current registration.
+	// Reset at the injected connect boundary so ordering is directly testable.
+	setRegisteredNodeID("")
 	if err := connect(); err != nil {
 		return err
 	}
