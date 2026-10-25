@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // TokenInfo contains the validated token information
@@ -46,7 +48,8 @@ func NewHTTPTokenValidator(baseURL string) *HTTPTokenValidator {
 	return &HTTPTokenValidator{
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout:   10 * time.Second,
+			Transport: platformhttp.New(baseURL, platformhttp.Options{}),
 		},
 	}
 }
@@ -147,7 +150,7 @@ func NewCachingTokenValidator(baseURL, orgID, apiToken string, refreshInterval t
 		baseURL:          baseURL,
 		orgID:            orgID,
 		apiToken:         apiToken,
-		httpClient:       &http.Client{Timeout: 10 * time.Second},
+		httpClient:       &http.Client{Timeout: 10 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{})},
 		cache:            make(map[string]*CachedTokenEntry),
 		previousCache:    make(map[string]*previousHashEntry),
 		refreshInterval:  refreshInterval,
