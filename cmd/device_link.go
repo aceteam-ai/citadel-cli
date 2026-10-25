@@ -116,11 +116,11 @@ func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Con
 			return fatal
 		}
 		if ok {
-			deviceLinkWarnFn("⚠️  Device link is unverified on this older server; continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
+			deviceLinkWarnFn("⚠️  Device link is unverified on this older server (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
 			return nil
 		}
 	}
-	deviceLinkWarnFn("⚠️  Device link is unverified and the server version could not be verified; continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
+	deviceLinkWarnFn("⚠️  Device link is unverified and the server version could not be verified (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
 	return nil
 }
 
@@ -233,8 +233,8 @@ func deviceLinkEnforced(version string) (enforced, ok bool) {
 // without rendering arbitrary transport, server, or grant-bearing error text.
 type deviceEnrollmentRecoveryFailure struct{ cause error }
 
-func (*deviceEnrollmentRecoveryFailure) Error() string {
-	return "device enrollment link was not confirmed; saved credentials do not complete device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again"
+func (e *deviceEnrollmentRecoveryFailure) Error() string {
+	return "device enrollment link was not confirmed (" + nexus.DeviceLinkDiagnostic(e.cause) + "); saved credentials do not complete device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again"
 }
 
 func (e *deviceEnrollmentRecoveryFailure) Unwrap() error { return e.cause }
@@ -245,11 +245,11 @@ func deviceEnrollmentRecoveryError(err error) error {
 
 func linkDeviceEnrollmentWith(ctx context.Context, result *DeviceAuthResult, nodeID func(context.Context) string, link func(context.Context, string, string) error) error {
 	if result == nil || result.Token == nil || result.DeviceCode == "" || result.Token.Authkey == "" {
-		return fmt.Errorf("device enrollment cannot be linked without its current authorization")
+		return nexus.NewDeviceLinkFailure(nexus.DeviceLinkLocalPrecondition, 0)
 	}
 	id := nodeID(ctx)
 	if id == "" {
-		return fmt.Errorf("device enrollment cannot be linked before network registration")
+		return nexus.NewDeviceLinkFailure(nexus.DeviceLinkLocalPrecondition, 0)
 	}
 	return link(ctx, result.DeviceCode, id)
 }
@@ -259,7 +259,7 @@ func linkDeviceEnrollmentWith(ctx context.Context, result *DeviceAuthResult, nod
 // preventing its success callback from starting a worker for an unlinked grant.
 func ccConnectDeviceEnrollmentWith(token *nexus.TokenResponse, deviceCode string, connect func() error, link func(*DeviceAuthResult) error, disconnect func() error) error {
 	if token == nil || token.Authkey == "" || deviceCode == "" {
-		return deviceEnrollmentRecoveryError(fmt.Errorf("current device authorization is missing"))
+		return deviceEnrollmentRecoveryError(nexus.NewDeviceLinkFailure(nexus.DeviceLinkLocalPrecondition, 0))
 	}
 	current := *token
 	// A prior enroll in this process is not this modal's current registration.

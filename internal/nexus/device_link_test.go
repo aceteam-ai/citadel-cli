@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -122,5 +123,175 @@ func TestServerVersionUnreadableIsAnError(t *testing.T) {
 				t.Fatalf("unreadable version must be an error, got %q", v)
 			}
 		})
+	}
+}
+
+type deviceLinkDiagnosticTransport func(*http.Request) (*http.Response, error)
+
+func (f deviceLinkDiagnosticTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type deviceLinkDiagnosticOpaqueError struct{ rendered bool }
+
+func (e *deviceLinkDiagnosticOpaqueError) Error() string {
+	e.rendered = true
+	panic("private-grant private-token must never be rendered")
+}
+
+type deviceLinkDiagnosticBody struct {
+	reader  io.Reader
+	readErr error
+	reads   int
+	closes  int
+}
+
+func (b *deviceLinkDiagnosticBody) Read(p []byte) (int, error) {
+	b.reads++
+	if b.readErr != nil {
+		return 0, b.readErr
+	}
+	return b.reader.Read(p)
+}
+
+func (b *deviceLinkDiagnosticBody) Close() error {
+	b.closes++
+	return nil
+}
+
+func TestDeviceLinkHTTPDiagnosticsUseOnlyStatusAndNeverReadErrorBodies(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		kind    DeviceLinkFailureKind
+		refused bool
+	}{
+		{http.StatusForbidden, DeviceLinkRefused, true},
+		{http.StatusGone, DeviceLinkRefused, true},
+		{http.StatusServiceUnavailable, DeviceLinkHTTPServer, false},
+		{http.StatusBadGateway, DeviceLinkHTTPServer, false},
+		{http.StatusCreated, DeviceLinkHTTPStatus, false},
+		{http.StatusTemporaryRedirect, DeviceLinkHTTPStatus, false},
+	} {
+		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
+			opaque := &deviceLinkDiagnosticOpaqueError{}
+			body := &deviceLinkDiagnosticBody{readErr: opaque}
+			client := NewDeviceAuthClient("https://private-origin.invalid")
+			client.httpClient.Transport = deviceLinkDiagnosticTransport(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: body, Request: r}, nil
+			})
+			err := client.LinkRegisteredNode(context.Background(), "private-grant", "42")
+			kind, status := DeviceLinkFailureDetails(err)
+			var refusal *DeviceLinkRefusedError
+			if err == nil || kind != tc.kind || status != tc.status || errors.As(err, &refusal) != tc.refused {
+				t.Fatal("HTTP status lost its safe category or changed definite-refusal authority")
+			}
+			if body.reads != 0 || body.closes != 1 || opaque.rendered || errors.Unwrap(err) != nil {
+				t.Fatal("HTTP failure read, rendered, retained, or failed to close its opaque body")
+			}
+			text := err.Error()
+			if !strings.Contains(text, fmt.Sprintf("HTTP %d", tc.status)) || strings.Contains(text, "private-") {
+				t.Fatal("status diagnostic was missing or exposed an opaque server value")
+			}
+		})
+	}
+}
+
+func TestDeviceLinkTransportAndMalformedDiagnosticsDiscardOpaqueErrors(t *testing.T) {
+	for _, malformed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("body-read-error-%t", malformed), func(t *testing.T) {
+			opaque := &deviceLinkDiagnosticOpaqueError{}
+			body := &deviceLinkDiagnosticBody{readErr: opaque}
+			client := NewDeviceAuthClient("https://private-origin.invalid")
+			client.httpClient.Transport = deviceLinkDiagnosticTransport(func(r *http.Request) (*http.Response, error) {
+				if !malformed {
+					return nil, opaque
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: r}, nil
+			})
+			err := client.LinkRegisteredNode(context.Background(), "private-grant", "42")
+			wantKind, wantStatus := DeviceLinkTransport, 0
+			if malformed {
+				wantKind, wantStatus = DeviceLinkMalformedResponse, http.StatusOK
+			}
+			kind, status := DeviceLinkFailureDetails(err)
+			if err == nil || kind != wantKind || status != wantStatus || strings.Contains(err.Error(), "private-") || opaque.rendered || errors.Unwrap(err) != nil {
+				t.Fatal("opaque transport/body failure was rendered, retained, or misclassified")
+			}
+			if malformed && (body.reads != 1 || body.closes != 1) {
+				t.Fatal("malformed response did not close its bounded reader")
+			}
+		})
+	}
+}
+
+func TestDeviceLinkResponseCategoriesPreserveConfirmationContract(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		kind DeviceLinkFailureKind
+	}{
+		{`{"success":false}`, DeviceLinkRefused},
+		{`{"success":"private-token"}`, DeviceLinkMalformedResponse},
+		{`{}`, DeviceLinkMalformedResponse},
+		{`{"success":true} {}`, DeviceLinkMalformedResponse},
+		{`{"success":true}` + strings.Repeat(" ", maxDeviceAuthResponseBytes), DeviceLinkMalformedResponse},
+	} {
+		client := NewDeviceAuthClient("https://private-origin.invalid")
+		body := &deviceLinkDiagnosticBody{reader: strings.NewReader(tc.body)}
+		client.httpClient.Transport = deviceLinkDiagnosticTransport(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: r}, nil
+		})
+		err := client.LinkRegisteredNode(context.Background(), "private-grant", "42")
+		kind, status := DeviceLinkFailureDetails(err)
+		if err == nil || kind != tc.kind || status != http.StatusOK || body.closes != 1 || strings.Contains(err.Error(), "private-") {
+			t.Fatal("response category changed confirmation, size, or single-JSON requirements")
+		}
+	}
+}
+
+func TestDeviceLinkDiagnosticValidatesKindsStatusesAndLocalPreconditions(t *testing.T) {
+	opaque := &deviceLinkDiagnosticOpaqueError{}
+	var nilFailure *DeviceLinkFailure
+	var nilRefusal *DeviceLinkRefusedError
+	for _, err := range []error{
+		nil, opaque, nilFailure, nilRefusal,
+		NewDeviceLinkFailure(DeviceLinkFailureKind("private-grant"), 503),
+		NewDeviceLinkFailure(DeviceLinkHTTPServer, 403),
+		NewDeviceLinkFailure(DeviceLinkTransport, 503),
+		NewDeviceLinkFailure(DeviceLinkRefused, http.StatusForbidden),
+		&DeviceLinkFailure{kind: DeviceLinkFailureKind("private-token"), statusCode: 503},
+		&DeviceLinkFailure{kind: DeviceLinkRefused, statusCode: http.StatusForbidden},
+		&DeviceLinkFailure{kind: DeviceLinkHTTPServer, statusCode: 999},
+		&DeviceLinkRefusedError{StatusCode: 503},
+	} {
+		kind, status := DeviceLinkFailureDetails(err)
+		if kind != DeviceLinkUnconfirmed || status != 0 || DeviceLinkDiagnostic(err) != "category=unconfirmed" || opaque.rendered {
+			t.Fatal("unrecognized diagnostic authority escaped the closed vocabulary")
+		}
+		switch err.(type) {
+		case *DeviceLinkFailure, *DeviceLinkRefusedError:
+			if text := err.Error(); strings.Contains(text, "private-") || strings.Contains(text, "HTTP") {
+				t.Fatal("typed error rendering bypassed validation of kind/status fields")
+			}
+		}
+	}
+	for _, tc := range []struct {
+		base  string
+		grant string
+		node  string
+	}{
+		{"https://example.invalid", "", "42"},
+		{"https://example.invalid", "private-grant", "hostname"},
+		{"://private-origin", "private-grant", "42"},
+	} {
+		client := NewDeviceAuthClient(tc.base)
+		client.httpClient.Transport = deviceLinkDiagnosticTransport(func(*http.Request) (*http.Response, error) {
+			t.Fatal("invalid local preconditions must fail before transport")
+			return nil, nil
+		})
+		err := client.LinkRegisteredNode(context.Background(), tc.grant, tc.node)
+		kind, status := DeviceLinkFailureDetails(err)
+		if err == nil || kind != DeviceLinkLocalPrecondition || status != 0 || strings.Contains(err.Error(), "private-") {
+			t.Fatal("local failure was mislabeled as transport or exposed input")
+		}
 	}
 }

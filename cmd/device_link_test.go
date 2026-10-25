@@ -39,6 +39,9 @@ func TestDeviceEnrollmentLinkRefusesMissingCurrentAuthorization(t *testing.T) {
 		if err == nil {
 			t.Fatal("missing current authorization must fail")
 		}
+		if kind, status := nexus.DeviceLinkFailureDetails(err); kind != nexus.DeviceLinkLocalPrecondition || status != 0 {
+			t.Fatal("missing current authorization must be a static local precondition, not a transport failure")
+		}
 	}
 	result := &DeviceAuthResult{DeviceCode: "grant", Token: &nexus.TokenResponse{Authkey: "registration-key"}}
 	err := linkDeviceEnrollmentWith(context.Background(), result, func(context.Context) string { return "" }, func(context.Context, string, string) error {
@@ -47,6 +50,9 @@ func TestDeviceEnrollmentLinkRefusesMissingCurrentAuthorization(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("missing registered identity must fail")
+	}
+	if kind, status := nexus.DeviceLinkFailureDetails(err); kind != nexus.DeviceLinkLocalPrecondition || status != 0 {
+		t.Fatal("missing current node must be a static local precondition, not a transport failure")
 	}
 }
 
@@ -344,6 +350,100 @@ func TestDeviceLinkSuccessDoesNotConsultVersion(t *testing.T) {
 	obs := runLinkGate(t, l)
 	if obs.err != nil || obs.rolledBack != nil || len(obs.warnings) != 0 || l.versionCalls != 0 {
 		t.Fatalf("a confirmed link needs no version gate: %+v calls=%d", obs, l.versionCalls)
+	}
+}
+
+// A recognized cause can be wrapped by a caller whose Error would leak a
+// credential. Diagnostic classification must traverse types, never render it.
+type wrappedDeviceLinkDiagnostic struct {
+	cause    error
+	rendered bool
+}
+
+func (e *wrappedDeviceLinkDiagnostic) Error() string {
+	e.rendered = true
+	panic("private-grant registration-key device-bearer must not be rendered")
+}
+
+func (e *wrappedDeviceLinkDiagnostic) Unwrap() error { return e.cause }
+
+func TestDeviceLinkRecoveryProjectsTypedCauseWithoutRenderingWrapper(t *testing.T) {
+	cause := nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPServer, http.StatusServiceUnavailable)
+	wrapped := &wrappedDeviceLinkDiagnostic{cause: cause}
+	err := deviceEnrollmentRecoveryError(wrapped)
+	if !errors.Is(err, cause) || !strings.Contains(err.Error(), "category=http_server, HTTP 503") || wrapped.rendered {
+		t.Fatal("recovery must retain typed cause inspection while rendering only validated static fields")
+	}
+	var typed *nexus.DeviceLinkFailure
+	if !errors.As(err, &typed) || typed != cause {
+		t.Fatal("recovery hid the typed link failure from callers")
+	}
+}
+
+func TestDeviceLinkStaticCategoriesPreserveRetryRollbackAndCompatibility(t *testing.T) {
+	for _, version := range []string{"1.520.0", "1.519.0", ""} {
+		for _, tc := range []struct {
+			name         string
+			cause        error
+			diagnostic   string
+			wantLinks    int
+			wantRollback bool
+		}{
+			{"transport", nexus.NewDeviceLinkFailure(nexus.DeviceLinkTransport, 0), "category=transport", 2, false},
+			{"server503", nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPServer, http.StatusServiceUnavailable), "category=http_server, HTTP 503", 2, false},
+			{"unexpected201", nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPStatus, http.StatusCreated), "category=http_status, HTTP 201", 2, false},
+			{"malformed200", nexus.NewDeviceLinkFailure(nexus.DeviceLinkMalformedResponse, http.StatusOK), "category=malformed_response, HTTP 200", 2, false},
+			{"refused403", &nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}, "category=refused, HTTP 403", 1, true},
+			{"local", nexus.NewDeviceLinkFailure(nexus.DeviceLinkLocalPrecondition, 0), "category=local_precondition", 2, false},
+			{"opaque", &opaqueDeviceLinkError{}, "category=unconfirmed", 2, false},
+		} {
+			t.Run(version+"/"+tc.name, func(t *testing.T) {
+				client := &scriptedDeviceLinker{linkErrors: []error{tc.cause}, version: version}
+				obs := runLinkGate(t, client)
+				modern := version == "1.520.0"
+				if len(client.grants) != tc.wantLinks || client.versionCalls != 1 || (obs.rolledBack != nil) != (modern && tc.wantRollback) {
+					t.Fatal("diagnostic categorization changed retry count, version lookup, or rollback authority")
+				}
+				var text string
+				if modern {
+					if obs.err == nil || !errors.Is(obs.err, tc.cause) || len(obs.warnings) != 0 {
+						t.Fatal("modern failure lost its cause or gained a compatibility continuation")
+					}
+					text = obs.err.Error()
+				} else {
+					if obs.err != nil || len(obs.warnings) != 1 {
+						t.Fatal("older or unreadable server lost its compatibility warning")
+					}
+					text = obs.warnings[0]
+				}
+				if !strings.Contains(text, tc.diagnostic) || !strings.Contains(text, "fresh browser approval") {
+					t.Fatal("safe category/status or existing recovery guidance was lost")
+				}
+				if opaque, ok := tc.cause.(*opaqueDeviceLinkError); ok && opaque.rendered {
+					t.Fatal("opaque failure was rendered while classifying it")
+				}
+			})
+		}
+	}
+}
+
+func TestDeviceLinkTypedServerUncertaintyStillPreventsLaterRefusalRollback(t *testing.T) {
+	content := "device_api_token: device-bearer\norg_id: current-org\naceteam_api_key: operator-key\n"
+	path := writeRollbackFixture(t, content)
+	refused := &nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}
+	client := &scriptedDeviceLinker{
+		linkErrors: []error{nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPServer, http.StatusServiceUnavailable), refused},
+		version:    "1.520.0",
+	}
+	obs := runLinkGateWithRollback(t, client, func(token *nexus.TokenResponse) error {
+		return rollbackEnrollmentCredentials(path, token)
+	})
+	data, readErr := os.ReadFile(path)
+	if obs.err == nil || !errors.Is(obs.err, refused) || obs.rolledBack != nil || len(client.grants) != 2 || client.versionCalls != 1 || readErr != nil || string(data) != content {
+		t.Fatal("typed server failure followed by refusal changed uncertain-commit ownership or saved bytes")
+	}
+	if !strings.Contains(obs.err.Error(), "category=refused, HTTP 403") {
+		t.Fatal("diagnostic must describe the final typed response without erasing earlier uncertainty")
 	}
 }
 
