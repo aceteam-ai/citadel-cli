@@ -70,7 +70,13 @@ func TestPublishAuthorizationErrorIsTypedAndOmitsPeerBody(t *testing.T) {
 	if !ok || denied.StatusCode != http.StatusForbidden {
 		t.Fatalf("Publish must preserve typed 403: %v", err)
 	}
-	for _, private := range []string{srv.URL, "/api/fabric/redis/pubsub/publish", "device_redis:pubsub", "test-token"} {
+	if denied.Method != http.MethodPost || denied.Path != "/api/fabric/redis/pubsub/publish" || !strings.Contains(err.Error(), "POST /api/fabric/redis/pubsub/publish") {
+		t.Fatal("403 lost its safe pubsub route diagnostic")
+	}
+	if !strings.Contains(err.Error(), "check device permissions/scopes and organization access") || strings.Contains(err.Error(), "logout") {
+		t.Fatal("403 needs permission/access guidance without prescribing fresh enrollment")
+	}
+	for _, private := range []string{srv.URL, "device_redis:pubsub", "test-token"} {
 		if strings.Contains(err.Error(), private) {
 			t.Errorf("authorization error retained private response/request data: %q", err)
 		}

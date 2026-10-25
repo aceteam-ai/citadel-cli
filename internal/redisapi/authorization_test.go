@@ -39,13 +39,24 @@ func (body *authorizationBody) Close() error {
 
 func TestAuthorizationErrorIsTypedSanitizedAndActionable(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
-		original := &AuthorizationError{StatusCode: status}
+		original := newAuthorizationError(status, http.MethodGet, "/api/fabric/redis/ping")
 		wrapped := fmt.Errorf("outer operation failed: %w", original)
 		denied, ok := AsAuthorizationError(wrapped)
 		if !ok || denied != original || denied.StatusCode != status {
 			t.Fatalf("typed refusal not preserved through wrap: %v", wrapped)
 		}
-		for _, required := range []string{fmt.Sprintf("HTTP %d", status), "linkage/permissions not confirmed", "if enrollment is incomplete", "citadel logout && citadel init", "fresh browser approval"} {
+		requiredText := []string{fmt.Sprintf("HTTP %d", status), "GET /api/fabric/redis/ping"}
+		if status == http.StatusUnauthorized {
+			requiredText = append(requiredText, "linkage/permissions not confirmed", "if enrollment is incomplete", "citadel logout && citadel init", "fresh browser approval")
+		} else {
+			requiredText = append(requiredText, "check device permissions/scopes and organization access", "this response alone does not establish the cause")
+			for _, unwanted := range []string{"logout", "fresh browser approval", "missing scope", "unlinked"} {
+				if strings.Contains(original.Error(), unwanted) {
+					t.Fatalf("403 inferred an enrollment cause or prescribed re-enrollment: %v", original)
+				}
+			}
+		}
+		for _, required := range requiredText {
 			if !strings.Contains(original.Error(), required) {
 				t.Fatalf("static refusal lacks %q: %v", required, original)
 			}
@@ -64,7 +75,7 @@ func TestHTTPAuthorizationRefusalNeverReadsOrLogsPeerBody(t *testing.T) {
 	const baseURL = "https://private-origin.invalid/hidden-base"
 	const responseBody = `{"error":"private-device-token-canary https://private-origin.invalid/hidden-base private-response-body-canary"}`
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
-		for _, operation := range []string{"ping", "worker-config", "consume"} {
+		for _, operation := range []string{"ping", "worker-config", "consume", "pubsub"} {
 			for _, failRead := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%d/%s/read-fails-%t", status, operation, failRead), func(t *testing.T) {
 					body := &authorizationBody{reader: strings.NewReader(responseBody), failRead: failRead}
@@ -89,15 +100,30 @@ func TestHTTPAuthorizationRefusalNeverReadsOrLogsPeerBody(t *testing.T) {
 					case "consume":
 						var response ConsumeResponse
 						err = client.doRequest(context.Background(), http.MethodPost, "/api/fabric/redis/jobs/consume", ConsumeRequest{Queue: "q", Group: "g", Consumer: "c", Count: 1}, &response)
+					case "pubsub":
+						err = client.Publish(context.Background(), "fixture-channel", map[string]any{"private": token})
 					}
 					denied, ok := AsAuthorizationError(err)
 					if !ok || denied.StatusCode != status {
 						t.Fatalf("HTTP refusal lost its type/status: %v", err)
 					}
+					wantMethod := http.MethodPost
+					wantPath := "/api/fabric/redis/jobs/consume"
+					switch operation {
+					case "ping":
+						wantMethod, wantPath = http.MethodGet, "/api/fabric/redis/ping"
+					case "worker-config":
+						wantMethod, wantPath = http.MethodGet, "/api/fabric/worker-config"
+					case "pubsub":
+						wantPath = "/api/fabric/redis/pubsub/publish"
+					}
+					if denied.Method != wantMethod || denied.Path != wantPath || !strings.Contains(err.Error(), wantMethod+" "+wantPath) {
+						t.Fatalf("refusal lost its safe request context: %#v", denied)
+					}
 					if calls != 1 || body.reads != 0 || body.closes != 1 {
 						t.Fatalf("refusal should close without reading/retrying: calls%d reads%d closes%d", calls, body.reads, body.closes)
 					}
-					for _, private := range []string{token, baseURL, "private-response-body-canary", "private-refusal-read-error", "/api/fabric/"} {
+					for _, private := range []string{token, baseURL, "private-response-body-canary", "private-refusal-read-error"} {
 						if strings.Contains(err.Error(), private) {
 							t.Fatalf("authorization error retained private response/request data: %v", err)
 						}

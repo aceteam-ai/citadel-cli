@@ -141,7 +141,7 @@ func (c *Client) Ping(ctx context.Context) error {
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		// Refusal bodies can echo credentials. Do not read or retain them.
-		return &AuthorizationError{StatusCode: resp.StatusCode}
+		return newAuthorizationError(resp.StatusCode, http.MethodGet, "/api/fabric/redis/ping")
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -273,9 +273,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 			return fmt.Errorf("failed to marshal request body: %w", err)
 		}
 		reqBody = bytes.NewReader(jsonData)
-		c.debug("request: %s %s - body: %s", method, path, string(jsonData))
+		// Request data and query values may contain credentials or job payloads.
+		// Emit the same closed diagnostic labels used by authorization errors.
+		c.debug("request: %s %s - body omitted", authorizationMethod(method), authorizationPath(path))
 	} else {
-		c.debug("request: %s %s", method, path)
+		c.debug("request: %s %s", authorizationMethod(method), authorizationPath(path))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
@@ -301,7 +303,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		c.debug("response: %d - <authorization refusal body omitted>", resp.StatusCode)
-		return &AuthorizationError{StatusCode: resp.StatusCode}
+		return newAuthorizationError(resp.StatusCode, method, path)
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
