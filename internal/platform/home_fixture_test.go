@@ -8,6 +8,7 @@ import (
 )
 
 func TestHomeFixtureIgnoresEnvironmentAndAccountLookup(t *testing.T) {
+	resolverCapturedBeforeSetup := UserHomeDir
 	home := t.TempDir()
 	restore, err := OverrideHomeDirectoryForTesting(home)
 	if err != nil {
@@ -29,6 +30,9 @@ func TestHomeFixtureIgnoresEnvironmentAndAccountLookup(t *testing.T) {
 		if got, err := DefaultNodeDir(name); err != nil || got != filepath.Join(home, "citadel-node") {
 			t.Fatalf("node fallback escaped the explicit fixture: %q, %v", got, err)
 		}
+	}
+	if got, err := resolverCapturedBeforeSetup(); err != nil || got != home {
+		t.Fatal("saved home resolver bypassed the later fixture installation")
 	}
 	// Readers share an immutable provider; no scope mutation runs in parallel.
 	var readers sync.WaitGroup

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // State represents the persistent update state stored in state.json
@@ -147,13 +149,13 @@ func getUserHomeDir() string {
 		if v := os.Getenv("APPDATA"); v != "" {
 			return v
 		}
-		if home, err := os.UserHomeDir(); err == nil {
+		if home, err := platform.UserHomeDir(); err == nil {
 			return home
 		}
 		return os.Getenv("USERPROFILE")
 	}
 
-	baseDir, err := os.UserHomeDir()
+	baseDir, err := platform.UserHomeDir()
 	if err != nil {
 		baseDir = os.Getenv("HOME")
 	}

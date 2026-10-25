@@ -147,7 +147,7 @@ func workspaceDir() string {
 	if dir := os.Getenv("CITADEL_WORKSPACE"); dir != "" {
 		return dir
 	}
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return ""
 	}

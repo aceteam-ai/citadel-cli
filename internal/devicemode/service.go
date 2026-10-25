@@ -15,6 +15,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 const (
@@ -127,7 +129,7 @@ func UninstallService() error {
 }
 
 func launchdPlistPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("determine home directory: %w", err)
 	}
@@ -135,7 +137,7 @@ func launchdPlistPath() (string, error) {
 }
 
 func systemdUnitPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("determine home directory: %w", err)
 	}
@@ -143,7 +145,7 @@ func systemdUnitPath() (string, error) {
 }
 
 func installLaunchd(execPath string) error {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("determine home directory: %w", err)
 	}

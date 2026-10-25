@@ -20,6 +20,23 @@ also use it. A source audit test prevents reintroducing direct OS-home calls in
 the command/default-log files. Cache and workspace path selection is separated
 from directory creation so tests can check the destination before writing.
 
+Internal packages now use `platform.UserHomeDir`, a function with the same
+signature as the OS resolver that delegates to the scoped `HomeDir` seam. A
+saved function reference consults the current provider when called; it does not
+capture a path during package initialization. This covers jobs, app/instance
+state, cache accounting, device services, network fallback, SSH sync, storage,
+RAG, updater state and the remaining internal OS-home callers. The sole direct
+OS-home call is the production fallback inside `platform.HomeDir`.
+
+The internal source audit parses every production Go file, including platform
+variants, and rejects raw OS-home calls or saved function references through
+normal or aliased imports. It allows only that central fallback and tests its
+own detection on synthetic source. Package fixtures and a command-level table
+check owned defaults before reads/writes under changed HOME/USERPROFILE. App,
+instance and SSH-sync tests exercise real temporary-file writes; SSH sync uses
+only an explicit loopback `httptest` server with synthetic entries. Device
+service tests resolve paths without installing or starting anything.
+
 The podman provenance marker has its own scoped directory input. Production
 still uses `/etc/citadel/rootless-worker-user`; fixtures choose an existing owned
 directory before marker reads or writes. Root ownership, directory mode,
@@ -83,9 +100,11 @@ readers. They use synthetic temporary data, never a real enrolled node.
 Optional Chromium/ffmpeg/bash/process tests still exist. A child process does not
 inherit Go's in-memory overrides. Whole-command local execution therefore remains
 held pending independent review and the separate explicit native opt-in and
-host-reader inventory work in #1468. Other packages' direct OS/environment/account
-lookups and explicit paths are not intercepted by the home seam; this bounded
-command/default-log slice does not qualify every transitive reader. Native OS
-roots and optional processes remain outside this slice. This draft does not
+host-reader inventory work in #1468. Raw environment overrides (including
+HF/XDG/Windows app-data paths), named account/UID lookups outside `HomeDir`,
+explicit caller paths, native OS roots and optional processes are not
+intercepted by the home seam. Their existing production precedence is retained;
+tests must explicitly own their inputs. This change does not qualify all host
+I/O or make the command suite safe for local execution. This draft does not
 authorize real node configuration inspection/restoration, service operation,
 model work or activation.

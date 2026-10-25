@@ -29,6 +29,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // ErrTmuxNotFound indicates no usable tmux binary could be located on the node.
@@ -111,7 +113,7 @@ func ManagedBinaryPath() string {
 	if runtime.GOOS == "windows" {
 		name = "tmux.exe"
 	}
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil || home == "" {
 		// Fall back to a relative path; callers that need an absolute path can
 		// still test for existence and will simply miss the managed binary.
