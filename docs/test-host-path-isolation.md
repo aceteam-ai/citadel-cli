@@ -32,6 +32,16 @@ Command `TestMain` creates private fixtures, installs both providers, then wires
 credential/passcode hooks and constructs the diagnostic registry. On exit it
 closes the CLI log handle, restores providers and removes the root. If provider
 restoration fails, it retains the directories and exits unsuccessfully.
+It first refuses a non-nil diagnostic registry, so a direct `init` assignment
+cannot be hidden by later once-only construction.
+
+The network package's `TestMain` independently installs owned node/machine
+directories for its existing default-getter/state tests. Before running tests it
+checks pointer and state selection, before any test can write through them.
+Positive-control tests likewise check computed paths before invoking pointer
+writes or state creation/deletion. The command tripwire seeds the pointer file
+directly in its known fixture directory rather than trusting the writer under
+test to choose that directory.
 
 The legacy diagnostic registry no longer reads permissions or captures an index
 path in package `init`. Its once-only construction happens at diagnostic job

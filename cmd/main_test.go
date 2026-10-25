@@ -25,6 +25,12 @@ var wiredLegacyPasscodeLockout func() config.PasscodeAttemptLimiter
 // fixtures must install their own scoped override. No native execution is authorized by
 // this setup. Legacy passcode lockout is unwired unless explicitly reinstalled.
 func TestMain(m *testing.M) {
+	// A direct init-time assignment would otherwise be overwritten by the
+	// Once below, masking its pre-fixture reads and captured paths.
+	if jobHandlers != nil {
+		fmt.Fprintln(os.Stderr, "TestMain: diagnostic registry initialized before fixture selection")
+		os.Exit(1)
+	}
 	dir, err := os.MkdirTemp("", "citadel-cmd-fixtures-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "TestMain: temp dir: %v\n", err)

@@ -37,7 +37,9 @@ func TestCommandPathFixtureSurvivesChangedHomeAndHostPointer(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := network.WriteMachineStatePointer(foreign); err != nil {
+	// Seed only the explicitly owned path. Calling the production pointer
+	// writer here would itself be unsafe if its directory seam regressed.
+	if err := os.WriteFile(filepath.Join(home, "machine-config", "state-dir"), []byte(foreign+"\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	// Unlike useCmdFixtureHome, these mutations intentionally do NOT select a

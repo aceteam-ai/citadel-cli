@@ -65,11 +65,11 @@ func TestStateFixturePointerAndClearStayInOwnedDirectories(t *testing.T) {
 	if err := os.WriteFile(sentinel, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteMachineStatePointer(foreign); err != nil {
-		t.Fatal(err)
-	}
 	if got := machineStatePointerPath(); got != filepath.Join(machine, machineStatePointerFile) {
 		t.Fatalf("pointer escaped fixture: %q", got)
+	}
+	if err := WriteMachineStatePointer(foreign); err != nil {
+		t.Fatal(err)
 	}
 	if got := readMachineStatePointer(); got != foreign {
 		t.Fatal("positive control did not write the fixture pointer")
@@ -86,6 +86,10 @@ func TestStateFixturePointerAndClearStayInOwnedDirectories(t *testing.T) {
 	if got := getHostnameForReconnect(); got != "owned-fixture-hostname" {
 		t.Fatalf("reconnect followed a foreign manifest: %q", got)
 	}
+	expectedState := filepath.Join(node, "network")
+	if got := GetStateDir(); got != expectedState {
+		t.Fatalf("state creation would escape fixture: %q", got)
+	}
 	state, err := EnsureStateDir()
 	if err != nil || state != filepath.Join(node, "network") {
 		t.Fatalf("ensure fixture state = %q, %v", state, err)
@@ -95,6 +99,9 @@ func TestStateFixturePointerAndClearStayInOwnedDirectories(t *testing.T) {
 	}
 	if !HasState() {
 		t.Fatal("positive control did not create fixture state")
+	}
+	if got := GetStateDir(); got != expectedState {
+		t.Fatalf("state clearing would escape fixture: %q", got)
 	}
 	if err := ClearState(); err != nil {
 		t.Fatal(err)
