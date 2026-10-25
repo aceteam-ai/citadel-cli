@@ -305,6 +305,21 @@ func (r *Runner) BeginDrain() func() {
 	}
 }
 
+// TryIdleRestart fences pickup and waits for the current poll/claim to settle
+// before checking all admitted work. Another drain owner or active job vetoes
+// the exit. action must only exit the process (or be an inert test callback).
+func (r *Runner) TryIdleRestart(action func()) bool {
+	release := r.BeginDrain()
+	defer release()
+	r.drainMu.Lock()
+	defer r.drainMu.Unlock()
+	if r.permanentDrain || r.drainScopes != 1 || atomic.LoadInt64(&r.activeJobs) != 0 || r.dispatchingJobs != 0 || r.pendingJob != nil {
+		return false
+	}
+	action()
+	return true
+}
+
 // isDraining reports whether any drain remains active.
 func (r *Runner) isDraining() bool {
 	r.drainMu.Lock()

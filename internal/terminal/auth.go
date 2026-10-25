@@ -145,12 +145,16 @@ type CachingTokenValidator struct {
 }
 
 // NewCachingTokenValidator creates a new caching token validator
-func NewCachingTokenValidator(baseURL, orgID, apiToken string, refreshInterval time.Duration) *CachingTokenValidator {
+func NewCachingTokenValidator(baseURL, orgID, apiToken string, refreshInterval time.Duration, observers ...platformhttp.Observer) *CachingTokenValidator {
+	var observe platformhttp.Observer
+	if len(observers) > 0 {
+		observe = observers[0]
+	}
 	return &CachingTokenValidator{
 		baseURL:          baseURL,
 		orgID:            orgID,
 		apiToken:         apiToken,
-		httpClient:       &http.Client{Timeout: 10 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{})},
+		httpClient:       &http.Client{Timeout: 10 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{Observe: observe})},
 		cache:            make(map[string]*CachedTokenEntry),
 		previousCache:    make(map[string]*previousHashEntry),
 		refreshInterval:  refreshInterval,
@@ -161,6 +165,8 @@ func NewCachingTokenValidator(baseURL, orgID, apiToken string, refreshInterval t
 		refreshRateLimit: 10 * time.Second, // Limit on-demand refresh to once per 10 seconds
 	}
 }
+
+func (v *CachingTokenValidator) RedialPlatformConnections() { platformhttp.RedialClient(v.httpClient) }
 
 // SetLogFn sets the logging callback. If set, warnings will be routed through
 // this callback instead of printing to stdout. Use this for TUI mode.

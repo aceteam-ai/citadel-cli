@@ -68,7 +68,8 @@ type ClientConfig struct {
 	Timeout time.Duration
 
 	// DebugFunc is an optional callback for debug logging
-	DebugFunc func(format string, args ...any)
+	DebugFunc        func(format string, args ...any)
+	PlatformObserver platformhttp.Observer
 }
 
 // NewClient creates a new Redis API client.
@@ -82,7 +83,7 @@ func NewClient(cfg ClientConfig) *Client {
 		token:   cfg.Token,
 		httpClient: &http.Client{
 			Timeout:   cfg.Timeout,
-			Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{Debugf: cfg.DebugFunc}),
+			Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{Debugf: cfg.DebugFunc, Observe: cfg.PlatformObserver}),
 		},
 		workerID:  fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
 		debugFunc: cfg.DebugFunc,
@@ -112,6 +113,8 @@ func (c *Client) debug(format string, args ...any) {
 func (c *Client) BaseURL() string {
 	return c.baseURL
 }
+
+func (c *Client) RedialPlatformConnections() { platformhttp.RedialClient(c.httpClient) }
 
 // WorkerID returns the unique worker identifier.
 func (c *Client) WorkerID() string {

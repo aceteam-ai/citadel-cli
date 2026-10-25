@@ -937,6 +937,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// (job counts, poll time) and the status server's /agent/* endpoints, which
 	// answer over the tsnet mesh even when Redis job consumption is broken.
 	workerState := worker.NewWorkerState()
+	var platformRedials []func()
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
@@ -986,13 +987,14 @@ func runWork(cmd *cobra.Command, args []string) {
 		apiQueueNames := queueResult.Queues
 
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
-			BaseURL:       apiBaseURL,
-			Token:         deviceConfig.DeviceAPIToken,
-			QueueNames:    apiQueueNames,
-			ConsumerGroup: workGroup,
-			BlockMs:       workPollMs,
-			MaxAttempts:   workMaxRetries,
-			DebugFunc:     Debug,
+			BaseURL:          apiBaseURL,
+			Token:            deviceConfig.DeviceAPIToken,
+			QueueNames:       apiQueueNames,
+			ConsumerGroup:    workGroup,
+			BlockMs:          workPollMs,
+			MaxAttempts:      workMaxRetries,
+			DebugFunc:        Debug,
+			PlatformObserver: workerState.ObservePlatform,
 			// Route the source's info logs (subscribed queues, consumer group,
 			// per-node AddQueue) through Log() so they land in latest.log. The
 			// default sink is stdout, which the worker's log file does not
@@ -1054,6 +1056,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// blip left pub/sub on the (broken) HTTP fallback for the whole process
 		// lifetime, with only a Debug line to show for it (issue #723).
 		apiClient := apiSource.Client()
+		platformRedials = append(platformRedials, apiClient.RedialPlatformConnections)
 		wsRetryDone = enableWebSocketWithRetry(ctx, wsConnector{client: apiClient}, workerWSLog)
 		pubSubTransportFn = apiClient.PubSubTransport
 
@@ -2398,7 +2401,9 @@ func runWork(cmd *cobra.Command, args []string) {
 					orgID,
 					termAPIToken,
 					termConfig.TokenRefreshInterval,
+					workerState.ObservePlatform,
 				)
+				platformRedials = append(platformRedials, cachingAuth.RedialPlatformConnections)
 
 				termServer := terminal.NewServer(termConfig, cachingAuth)
 
@@ -2910,6 +2915,17 @@ func runWork(cmd *cobra.Command, args []string) {
 	// shared workerState and, on a clear loss of forward progress, exits non-zero
 	// so systemd restarts the process clean. No-op if disabled (WORKER_SELF_HEAL).
 	if monitor := worker.NewLivenessMonitor(workerState, runner.IsDraining, func(level, msg string) { Log("%s", msg) }); monitor != nil {
+		if useAPIMode {
+			monitor.SetPlatformRecovery(func() {
+				for _, redial := range platformRedials {
+					redial()
+				}
+			}, func(exit func()) bool {
+				// Match the remote-restart posture: exiting is recovery only
+				// when a service manager will bring this worker back.
+				return managedByServiceManager() && runner.TryIdleRestart(exit)
+			})
+		}
 		go monitor.Run(ctx)
 	}
 
@@ -3574,13 +3590,17 @@ func nodeIsServingModels(ctx context.Context) bool {
 // silently loses a field when one side gains one.
 func workerLivenessFrom(snap worker.WorkerSnapshot) *status.WorkerLiveness {
 	return &status.WorkerLiveness{
-		Consuming:          snap.Consuming,
-		LastJobConsumedAt:  snap.LastJobAt,
-		LastPollAt:         snap.LastPollAt,
-		InFlight:           snap.InFlight,
-		Processed:          snap.Processed,
-		Failed:             snap.Failed,
-		IdentityUnresolved: snap.IdentityUnresolved,
+		Consuming:              snap.Consuming,
+		LastJobConsumedAt:      snap.LastJobAt,
+		LastPollAt:             snap.LastPollAt,
+		PlatformOKAt:           snap.PlatformOKAt,
+		PlatformFailingSince:   snap.PlatformFailingSince,
+		PlatformLastOutcome:    string(snap.PlatformLastOutcome),
+		PlatformLastHTTPStatus: snap.PlatformLastHTTPStatus,
+		InFlight:               snap.InFlight,
+		Processed:              snap.Processed,
+		Failed:                 snap.Failed,
+		IdentityUnresolved:     snap.IdentityUnresolved,
 	}
 }
 
