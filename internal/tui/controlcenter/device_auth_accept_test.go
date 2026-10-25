@@ -245,7 +245,10 @@ func TestDeviceAuthorizationAcceptanceRequiresCompleteCurrentInput(t *testing.T)
 		{token: &nexus.TokenResponse{Authkey: "fixture-key"}},
 	} {
 		err := connectCurrentDeviceAuthorization(context.Background(), time.Unix(2000, 0), func() time.Time { return time.Unix(1000, 0) },
-			func(*nexus.TokenResponse, string) error { t.Fatal("incomplete current input entered acceptance"); return nil }, input.token, input.code)
+			func(*nexus.TokenResponse, string) error {
+				t.Fatal("incomplete current input entered acceptance")
+				return nil
+			}, input.token, input.code)
 		if err == nil {
 			t.Fatal("incomplete current input was accepted")
 		}

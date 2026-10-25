@@ -161,7 +161,9 @@ func TestDeviceAuthorizationConnectionChecksAfterPollAndUIWork(t *testing.T) {
 			at := time.Unix(1000, 0)
 			expiresAt := at.Add(time.Minute)
 			token, err := pollDeviceAuthorization(ctx, &DeviceAuthConfig{DeviceCode: "fixture-grant", Interval: 5}, expiresAt,
-				func(string, int) (*nexus.TokenResponse, error) { return &nexus.TokenResponse{Authkey: "fixture-key"}, nil },
+				func(string, int) (*nexus.TokenResponse, error) {
+					return &nexus.TokenResponse{Authkey: "fixture-key"}, nil
+				},
 				func(_ context.Context, delay time.Duration) error { at = at.Add(delay); return nil },
 				func() time.Time { return at })
 			if err != nil || token == nil {
