@@ -845,6 +845,9 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 		r.drainMu.Unlock()
 		return
 	}
+	// Claim dispatch is synchronous. Reserve ordering before spawning, so the
+	// scheduler cannot let a later goroutine enter the execution slot first.
+	ticket := l.reserveExecTicket()
 	if job.Type == JobTypeFineTuneStart {
 		for _, handler := range r.handlers {
 			if pending, ok := handler.(interface{ MarkPendingFineTune(string) }); ok {
@@ -870,7 +873,7 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 			r.exitJob(jobOK)
 			l.releaseAdmit()
 		}()
-		jobOK = r.runLaneJob(ctx, l, j, s, st)
+		jobOK = r.runLaneJob(ctx, l, j, s, st, ticket)
 	}(job, stream, startTime)
 }
 
@@ -884,36 +887,75 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 //     the existing model_warming backpressure signal (a SUCCESS the platform
 //     already retries), never a silent Nack (aceteam#8254 §3a). This is the
 //     queue-on-full that replaces the bare #825 Nack for inference under load.
-func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream StreamWriter, startTime time.Time) (jobOK bool) {
-	queueStart := time.Now()
-
-	if l.hasExecWait {
-		timer := time.NewTimer(r.inferenceQueueWait)
-		defer timer.Stop()
-		select {
-		case l.exec <- struct{}{}:
-			timer.Stop()
-		case <-timer.C:
-			// Queue-wait exceeded: return the model_warming signal through the
-			// SAME success-path terminal publish a normal completion uses, so
-			// there is exactly one terminal-publish implementation (never a
-			// silent Nack that reintroduces the #559 no-terminal-event bug).
-			return r.finishQueueWaitExceeded(ctx, job, stream, queueStart)
-		case <-ctx.Done():
-			// Cancelled/shutting down while queued: never executed. Nack for
-			// redelivery so shutdown can't deadlock on a queued job.
-			r.source.Nack(ctx, job, ctx.Err())
-			return false
+func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream StreamWriter, startTime time.Time, ticket *laneExecTicket) (jobOK bool) {
+	ownsExec := false
+	releaseWaitingAuthority := func() {
+		if ownsExec {
+			<-l.exec
+			ownsExec = false
 		}
-	} else {
-		select {
-		case l.exec <- struct{}{}:
-		case <-ctx.Done():
-			r.source.Nack(ctx, job, ctx.Err())
-			return false
-		}
+		l.releaseExecTicket(ticket)
 	}
-	defer func() { <-l.exec }()
+	defer releaseWaitingAuthority()
+	queueStart := time.Now()
+	var timer *time.Timer
+	var expiry <-chan time.Time
+	var deadline time.Time
+	if l.hasExecWait {
+		deadline = queueStart.Add(r.inferenceQueueWait)
+		timer = time.NewTimer(r.inferenceQueueWait)
+		expiry = timer.C
+		defer timer.Stop()
+	}
+	finishWait := func(expired bool) (bool, bool) {
+		// Cancellation wins when multiple readiness signals are already set.
+		if err := ctx.Err(); err != nil {
+			releaseWaitingAuthority()
+			r.source.Nack(ctx, job, err)
+			return true, false
+		}
+		if expired || (l.hasExecWait && !time.Now().Before(deadline)) {
+			releaseWaitingAuthority()
+			// Keep the existing model_warming terminal path, never a silent Nack.
+			return true, r.finishQueueWaitExceeded(ctx, job, stream, queueStart)
+		}
+		return false, false
+	}
+	if finished, ok := finishWait(false); finished {
+		return ok
+	}
+	expired := false
+	select {
+	case <-ticket.ready:
+	case <-expiry:
+		expired = true
+	case <-ctx.Done():
+		releaseWaitingAuthority()
+		r.source.Nack(ctx, job, ctx.Err())
+		return false
+	}
+	if finished, ok := finishWait(expired); finished {
+		return ok
+	}
+	select {
+	case l.exec <- struct{}{}:
+		ownsExec = true
+	case <-expiry:
+		expired = true
+	case <-ctx.Done():
+		releaseWaitingAuthority()
+		r.source.Nack(ctx, job, ctx.Err())
+		return false
+	}
+	// A ready slot can win select alongside cancel/expiry. Return it before
+	// beginExec in that case; an expired or canceled waiter never runs a handler.
+	if finished, ok := finishWait(expired); finished {
+		return ok
+	}
+	if timer != nil {
+		timer.Stop()
+	}
+	l.releaseExecTicket(ticket)
 	l.beginExec()
 	defer l.endExec()
 
