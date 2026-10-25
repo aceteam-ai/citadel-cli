@@ -66,18 +66,16 @@ func TestUnread404CloseContributesExactlyOnce(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				body, ok := resp.Body.(*observedBody)
-				if resp.StatusCode != http.StatusNotFound || !ok {
+				if resp.StatusCode != http.StatusNotFound {
 					resp.Body.Close()
-					t.Fatal("fixture did not return an observable 404")
+					t.Fatal("fixture did not return a 404")
 				}
-				body.mu.Lock()
-				unread := len(body.sample) == 0 && !body.finished
-				body.mu.Unlock()
 				// Never call Read: Close must record the status without peeking
 				// at the body, and a repeated Close must not count it again.
-				firstClose, secondClose := body.Close(), body.Close()
-				if !unread || firstClose != nil || secondClose != nil {
+				// Exercise the actual http.Client body, including its timeout
+				// wrapper, rather than asserting the transport's concrete type.
+				firstClose, secondClose := resp.Body.Close(), resp.Body.Close()
+				if firstClose != nil || secondClose != nil {
 					t.Fatal("unread 404 closure changed caller behavior")
 				}
 				f.transport.mu.Lock()
