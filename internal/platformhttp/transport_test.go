@@ -244,6 +244,8 @@ func TestSuccessfulResponseClearsDistinctEndpointHistory(t *testing.T) {
 	f := newSwapFixture(t, false)
 	f.failure.Store(404)
 	f.request(t, "/old-path")
+	// Seed the diversity bit without reaching the three-failure threshold.
+	f.request(t, "/other-old-path")
 	f.failure.Store(0)
 	f.request(t, "/healthy")
 	f.failure.Store(404)
