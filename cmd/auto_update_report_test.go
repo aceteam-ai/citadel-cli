@@ -77,7 +77,7 @@ func TestAutoUpdateReportFrom(t *testing.T) {
 // is isolated (never the operator's real ~/citadel-node/update/state.json).
 func withAutoUpdateEnv(t *testing.T, version string) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_AUTO_UPDATE", "")
 	t.Setenv("CITADEL_NO_AUTO_UPDATE", "")
 	t.Setenv("CITADEL_AUTO_UPDATE_INTERVAL", "")

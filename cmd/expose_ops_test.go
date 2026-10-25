@@ -25,7 +25,7 @@ import (
 func setupExposeOpsTest(t *testing.T) *gateway.Server {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	useCmdFixtureHome(t, dir)
 	originalMeshIP := exposeMeshIP
 	exposeMeshIP = func() string { return "" }
 

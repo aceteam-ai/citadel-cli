@@ -127,6 +127,9 @@ func ChownR(path, owner string) error {
 // is preferred over /etc/citadel so that configs written by `citadel init`
 // as the normal user are found by `sudo citadel work`.
 func ConfigDir() string {
+	if fixture := configDirectoryForTests.Load(); fixture != nil {
+		return *fixture
+	}
 	return resolveConfigDir(IsRoot(), IsWindows(), IsLinux(), IsDarwin())
 }
 
@@ -203,6 +206,9 @@ func resolveConfigDir(isRoot, isWindows, isLinux, isDarwin bool) string {
 // config dir, only which directories are worth checking. The current
 // process's own ConfigDir() is always first.
 func ConfigDirCandidates() []string {
+	if fixture := configDirectoryForTests.Load(); fixture != nil {
+		return []string{*fixture}
+	}
 	return configDirCandidates(IsRoot(), IsWindows(), IsLinux(), IsDarwin())
 }
 

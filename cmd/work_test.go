@@ -54,7 +54,7 @@ func TestResolveAutoUpdateEnabled(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir()) // isolate the on-disk update state
+			useCmdFixtureHome(t, t.TempDir()) // isolate the on-disk update state
 			t.Setenv("CITADEL_AUTO_UPDATE", tc.env)
 			t.Setenv("CITADEL_NO_AUTO_UPDATE", tc.noAutoEn)
 			ver := tc.version

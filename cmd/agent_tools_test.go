@@ -90,7 +90,7 @@ func TestAgentConfigRedacts(t *testing.T) {
 func TestAgentTailLogsFilters(t *testing.T) {
 	// Point HOME at a temp dir with a synthetic log file.
 	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
+	useCmdFixtureHome(t, tmp)
 	logDir := filepath.Join(tmp, ".citadel-cli", "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -144,7 +144,7 @@ func TestAgentTailLogsFilters(t *testing.T) {
 // drop a following final line that has no trailing newline.
 func TestAgentTailLogsLongLine(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
+	useCmdFixtureHome(t, tmp)
 	logDir := filepath.Join(tmp, ".citadel-cli", "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		t.Fatal(err)

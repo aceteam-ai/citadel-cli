@@ -21,7 +21,7 @@ import (
 )
 
 func TestDownloadAndApplyManualCleansPrivateAttemptBeforeReturn(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	originalNew := newUpdateAttemptFn
 	originalDownload := downloadReleaseFn
 	originalApply := applyReleaseFn
@@ -58,7 +58,7 @@ func TestDownloadAndApplyManualCleansPrivateAttemptBeforeReturn(t *testing.T) {
 func TestDownloadAndApplyManualCleansPrivateAttemptOnErrors(t *testing.T) {
 	for _, phase := range []string{"download", "apply"} {
 		t.Run(phase, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			useCmdFixtureHome(t, t.TempDir())
 			originalNew := newUpdateAttemptFn
 			originalDownload := downloadReleaseFn
 			originalApply := applyReleaseFn
