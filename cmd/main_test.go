@@ -39,7 +39,7 @@ func TestMain(m *testing.M) {
 	nodeDir := filepath.Join(dir, "node")
 	passcodeDir := filepath.Join(dir, "passcodes")
 	legacyDir := filepath.Join(home, ".citadel-cli")
-	for _, child := range []string{home, nodeDir, passcodeDir, legacyDir, filepath.Join(dir, "tmp")} {
+	for _, child := range []string{home, nodeDir, passcodeDir, legacyDir} {
 		if err := os.MkdirAll(child, 0700); err != nil {
 			failSetup(err)
 		}
@@ -63,9 +63,6 @@ func TestMain(m *testing.M) {
 		{"XDG_STATE_HOME", filepath.Join(dir, "xdg-state")},
 		{"XDG_CACHE_HOME", filepath.Join(dir, "xdg-cache")},
 		{"XDG_RUNTIME_DIR", filepath.Join(dir, "xdg-runtime")},
-		{"TMPDIR", filepath.Join(dir, "tmp")},
-		{"TMP", filepath.Join(dir, "tmp")},
-		{"TEMP", filepath.Join(dir, "tmp")},
 	} {
 		if err := os.MkdirAll(setting.value, 0700); err != nil {
 			failSetup(err)
