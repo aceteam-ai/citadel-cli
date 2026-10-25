@@ -19,6 +19,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/recommend"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
@@ -1290,8 +1291,9 @@ func buildDeviceAuthContent(config *DeviceAuthConfig, completeURL, status string
 
 // showDeviceAuthModal displays the device authorization code and polls for completion
 func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
-	if config == nil || config.ExpiresIn <= 0 || int64(config.ExpiresIn) > int64(maxDeviceAuthDuration/time.Second) {
-		cc.AddActivity("error", "Invalid device authorization expiry")
+	expiresAt, expiryErr := deviceAuthDeadline(config, time.Now())
+	if expiryErr != nil {
+		cc.AddActivity("error", "Device authorization is expired or has an invalid expiry")
 		return
 	}
 	cc.inModal = true
@@ -1303,9 +1305,6 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 	contentView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-
-	// Calculate expiry
-	expiresAt := time.Now().Add(time.Duration(config.ExpiresIn) * time.Second)
 
 	// Build the complete verification URL. This is the exact enrollment payload
 	// encoded in the QR code (verification_uri_complete + &v=1), so the QR, the
@@ -1349,7 +1348,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 	flex.AddItem(contentView, bodyLines+2, 0, true)
 
 	// Initialize cancellation before installing callbacks or starting the poller.
-	ctx, pollCancel := context.WithCancel(context.Background())
+	ctx, pollCancel := deviceAuthPollContext(cc.stopChan)
 
 	// Input capture for escape, B, and C keys
 	contentView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -1416,7 +1415,14 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 				}
 			}
 		}
-		authkey, err := pollDeviceAuthorization(ctx, config, expiresAt, cc.deviceAuth.PollToken, wait, time.Now)
+		token, err := func() (*nexus.TokenResponse, error) {
+			if cc.deviceAuth.EndFlow != nil {
+				// Cleanup follows the last synchronous fetch, before later UI
+				// work can block. A late fetch cannot recreate retry state.
+				defer cc.deviceAuth.EndFlow(config.DeviceCode)
+			}
+			return pollDeviceAuthorization(ctx, config, expiresAt, cc.deviceAuth.PollToken, wait, time.Now)
+		}()
 		if err == nil {
 			err = deviceAuthPollValid(ctx, time.Now(), expiresAt)
 		}
@@ -1455,9 +1461,12 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 		}
 		// Registration and linking still gate all success and worker startup.
 		connect := func(key, code string) error {
-			return connectCurrentDeviceAuthorization(ctx, expiresAt, time.Now, cc.deviceAuth.Connect, key, code)
+			if token == nil || token.Authkey != key {
+				return errors.New("current device authorization is missing")
+			}
+			return connectCurrentDeviceAuthorization(ctx, expiresAt, time.Now, cc.deviceAuth.Connect, token, code)
 		}
-		if err := completeDeviceEnrollment(authkey, config.DeviceCode, connect, func() {
+		if err := completeDeviceEnrollment(token.Authkey, config.DeviceCode, connect, func() {
 			cc.app.QueueUpdateDraw(func() { updateContent("success") })
 			cc.AddActivity("success", "Connected to AceTeam Network")
 			cc.refresh()

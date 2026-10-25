@@ -257,7 +257,8 @@ func runControlCenter() {
 		DeviceAuth: controlcenter.DeviceAuthCallbacks{
 			StartFlow:  ccStartDeviceAuthFlow,
 			PollToken:  ccPollDeviceAuthToken,
-			Connect:    ccConnectWithAuthkey,
+			Connect:    ccConnectWithDeviceToken,
+			EndFlow:    ccEndDeviceAuthFlow,
 			Disconnect: ccDisconnect,
 		},
 		Worker: controlcenter.WorkerCallbacks{
@@ -1866,10 +1867,24 @@ func ccGetConfiguredServices() []string {
 // ccStartDeviceAuthFlow starts the device authorization flow and returns the config
 func ccStartDeviceAuthFlow() (*controlcenter.DeviceAuthConfig, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
+	return ccStartDeviceAuthFlowWith(func() (*nexus.DeviceCodeResponse, error) {
+		return client.StartFlow(nil)
+	}, time.Now)
+}
 
-	resp, err := client.StartFlow(nil)
+func ccStartDeviceAuthFlowWith(start func() (*nexus.DeviceCodeResponse, error), now func() time.Time) (*controlcenter.DeviceAuthConfig, error) {
+	if start == nil || now == nil {
+		return nil, errors.New("device authorization is unavailable")
+	}
+	// Anchor the original grant deadline before the request, not when a slow
+	// response arrives or when a later token response supplies its own expiry.
+	startedAt := now()
+	resp, err := start()
 	if err != nil {
 		return nil, err
+	}
+	if resp == nil || resp.ExpiresIn <= 0 || int64(resp.ExpiresIn) > int64(time.Duration(1<<63-1)/time.Second) {
+		return nil, errors.New("invalid device authorization expiry")
 	}
 
 	return &controlcenter.DeviceAuthConfig{
@@ -1877,38 +1892,43 @@ func ccStartDeviceAuthFlow() (*controlcenter.DeviceAuthConfig, error) {
 		VerificationURI: resp.VerificationURI,
 		DeviceCode:      resp.DeviceCode,
 		ExpiresIn:       resp.ExpiresIn,
+		ExpiresAt:       startedAt.Add(time.Duration(resp.ExpiresIn) * time.Second),
 		Interval:        resp.Interval,
 	}, nil
 }
 
-// ccPollDeviceAuthToken polls for device authorization token (single check)
-func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
+// ccPollDeviceAuthToken only fetches a token. The UI rejects late results before
+// admitting any local persistence or registration effects.
+func ccPollDeviceAuthToken(deviceCode string, interval int) (*nexus.TokenResponse, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
+	return ccPollDeviceAuthTokenWith(deviceCode, client.CheckToken)
+}
 
+func ccPollDeviceAuthTokenWith(deviceCode string, check func(string) (*nexus.TokenResponse, error)) (*nexus.TokenResponse, error) {
+	if check == nil {
+		return nil, errors.New("device authorization polling is unavailable")
+	}
 	// Use checkToken for single poll (not blocking PollForToken)
-	token, err := client.CheckToken(deviceCode)
+	token, err := check(deviceCode)
 	if err != nil {
-		return "", ccTokenPollError(deviceCode, err)
+		return nil, ccTokenPollError(deviceCode, err)
 	}
 	ccTokenServerErrors.Delete(deviceCode)
 	if token == nil || token.Authkey == "" {
-		return "", &nexus.TokenError{ErrorCode: "authorization_pending"}
+		return nil, &nexus.TokenError{ErrorCode: "authorization_pending"}
 	}
-
-	ccEnrollmentTokens.Store(deviceCode, token)
-	// Save the device config including user info when auth succeeds
-	if token.DeviceAPIToken != "" || token.UserEmail != "" {
-		if err := saveDeviceConfigToFile(token); err != nil {
-			// Log but don't fail - we have the authkey
-			Debug("failed to save device config: %v", err)
-		}
-	}
-
-	return token.Authkey, nil
+	copy := *token
+	return &copy, nil
 }
 
 // ccTokenServerErrors counts consecutive 5xx token answers per device code.
 var ccTokenServerErrors sync.Map
+
+// ccEndDeviceAuthFlow runs after the modal's synchronous poll has returned, so no late
+// answer can recreate a retry entry after cleanup.
+func ccEndDeviceAuthFlow(deviceCode string) {
+	ccTokenServerErrors.Delete(deviceCode)
+}
 
 // ccTokenPollError keeps the Control Center modal polling through a bounded run
 // of 5xx answers (the modal only continues on typed retry answers), matching the
@@ -1932,9 +1952,31 @@ func ccTokenPollError(deviceCode string, err error) error {
 	return &nexus.TokenError{ErrorCode: "authorization_pending", ErrorDescription: fmt.Sprintf("server error %d, retrying", serverErr.StatusCode)}
 }
 
-// ccConnectWithAuthkey registers and links the grant approved by this modal.
+// ccConnectWithDeviceToken persists, registers and links the exact response
+// admitted by the modal's original-deadline/cancellation fence. An admitted
+// synchronous operation is not rolled back if cancellation arrives later.
 // Saved device credentials alone do not establish a completed device binding.
-func ccConnectWithAuthkey(authkey, deviceCode string) error {
+func ccConnectWithDeviceToken(token *nexus.TokenResponse, deviceCode string) error {
+	return ccAcceptDeviceTokenWith(token, deviceCode, saveDeviceConfigToFile, ccRegisterDeviceToken)
+}
+
+func ccAcceptDeviceTokenWith(token *nexus.TokenResponse, deviceCode string, save func(*nexus.TokenResponse) error, connect func(*nexus.TokenResponse, string) error) error {
+	if token == nil || token.Authkey == "" || deviceCode == "" || save == nil || connect == nil {
+		return deviceEnrollmentRecoveryError(errors.New("current device authorization is missing"))
+	}
+	accepted := *token
+	if accepted.DeviceAPIToken != "" || accepted.UserEmail != "" {
+		persisted := accepted
+		if err := save(&persisted); err != nil {
+			// Preserve the existing nonfatal persistence policy: registration
+			// still has this exact current response, including its authkey.
+			Debug("failed to save device config: %v", err)
+		}
+	}
+	return connect(&accepted, deviceCode)
+}
+
+func ccRegisterDeviceToken(token *nexus.TokenResponse, deviceCode string) error {
 	// Get node name from manifest or hostname
 	nodeName := ""
 	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
@@ -1950,10 +1992,10 @@ func ccConnectWithAuthkey(authkey, deviceCode string) error {
 	config := network.ServerConfig{
 		Hostname:   nodeName,
 		ControlURL: nexusURL,
-		AuthKey:    authkey,
+		AuthKey:    token.Authkey,
 	}
 
-	err := ccConnectDeviceEnrollmentWith(authkey, deviceCode, func() error {
+	err := ccConnectDeviceEnrollmentWith(token, deviceCode, func() error {
 		_, err := network.Connect(ctx, config)
 		return err
 	}, linkDeviceEnrollment, network.Disconnect)

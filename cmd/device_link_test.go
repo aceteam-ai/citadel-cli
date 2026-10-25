@@ -438,17 +438,42 @@ func TestRollbackEnrollmentCredentialsRedisMode(t *testing.T) {
 }
 
 func TestControlCenterLinkUsesPolledToken(t *testing.T) {
-	token := &nexus.TokenResponse{Authkey: "key", DeviceAPIToken: "bearer"}
-	ccEnrollmentTokens.Store("grant", token)
-	if got := ccEnrollmentTokenFor("grant", "key"); got != token {
-		t.Fatal("connect must roll back with the token its poll saved")
+	registeredNodeID.Lock()
+	previousID := registeredNodeID.id
+	registeredNodeID.Unlock()
+	t.Cleanup(func() { setRegisteredNodeID(previousID) })
+	token := &nexus.TokenResponse{Authkey: "key", DeviceAPIToken: "bearer", OrgID: "current-org", NodeUID: "current-node"}
+	want := *token
+	links := 0
+	err := ccConnectDeviceEnrollmentWith(token, "grant", func() error {
+		// Registration must not leave the later link aliased to its caller.
+		token.Authkey = "replacement-key"
+		token.DeviceAPIToken = "replacement-bearer"
+		return nil
+	}, func(result *DeviceAuthResult) error {
+		links++
+		if result.DeviceCode != "grant" || result.Token == token || *result.Token != want {
+			t.Fatal("link lost the complete current response or retained its mutable alias")
+		}
+		return nil
+	}, func() error { t.Fatal("successful link must not disconnect"); return nil })
+	if err != nil || links != 1 {
+		t.Fatal("direct current response did not link exactly once")
 	}
-	if got := ccEnrollmentTokenFor("grant", "key"); got == token || got.DeviceAPIToken != "" {
-		t.Fatal("the stored token is consumed once")
-	}
-	ccEnrollmentTokens.Store("grant", token)
-	if got := ccEnrollmentTokenFor("grant", "other-key"); got == token {
-		t.Fatal("a token for a different authorization must not be used")
+}
+
+func TestControlCenterLinkNeverSubstitutesAMissingToken(t *testing.T) {
+	for _, token := range []*nexus.TokenResponse{nil, {}, {DeviceAPIToken: "saved-bearer-alone"}} {
+		err := ccConnectDeviceEnrollmentWith(token, "grant", func() error {
+			t.Fatal("missing current response must fail before registration")
+			return nil
+		}, func(*DeviceAuthResult) error {
+			t.Fatal("must not synthesize a token or inherit another enrollment")
+			return nil
+		}, func() error { t.Fatal("nothing was connected"); return nil })
+		if err == nil {
+			t.Fatal("missing current token was accepted")
+		}
 	}
 }
 

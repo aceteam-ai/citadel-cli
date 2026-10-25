@@ -17,6 +17,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/session"
@@ -664,14 +665,25 @@ type DeviceAuthConfig struct {
 	DeviceCode      string
 	ExpiresIn       int
 	Interval        int
+
+	// ExpiresAt is captured at the authorization request's entry, before any
+	// network or UI delay. Presentation and token responses never renew it.
+	ExpiresAt time.Time
 }
 
 // DeviceAuthCallbacks holds callbacks for device authorization flow
 type DeviceAuthCallbacks struct {
-	StartFlow  func() (*DeviceAuthConfig, error)                                 // Start device auth flow, returns codes
-	PollToken  func(deviceCode string, interval int) (authkey string, err error) // Poll for token
-	Connect    func(authkey, deviceCode string) error                            // Register and link this current grant before returning success
-	Disconnect func() error                                                      // Disconnect from network
+	StartFlow func() (*DeviceAuthConfig, error) // Start device auth flow, returns codes
+
+	// PollToken fetches only. It must not persist credentials or retain a token
+	// in shared state; acceptance belongs to the fenced Connect admission.
+	PollToken func(deviceCode string, interval int) (*nexus.TokenResponse, error)
+
+	// Connect admits persistence, registration and linking of this exact token.
+	// Once admitted, cancellation does not undo its synchronous effects.
+	Connect    func(token *nexus.TokenResponse, deviceCode string) error
+	EndFlow    func(deviceCode string) // Optional cleanup after the last synchronous poll returns
+	Disconnect func() error            // Disconnect from network
 }
 
 // WorkerCallbacks holds callbacks for worker management
