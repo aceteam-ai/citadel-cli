@@ -28,11 +28,17 @@ state, cache accounting, device services, network fallback, SSH sync, storage,
 RAG, updater state and the remaining internal OS-home callers. The sole direct
 OS-home call is the production fallback inside `platform.HomeDir`.
 
-The internal source audit parses every production Go file, including platform
-variants, and rejects raw OS-home calls or saved function references through
-normal or aliased imports. It allows only that central fallback and tests its
-own detection on synthetic source. Package fixtures and a command-level table
-check owned defaults before reads/writes under changed HOME/USERPROFILE. App,
+The repository source audit parses production Go files from the root and all
+top-level packages, including `services/`, `cmd/`, `internal/` and platform
+variants. It excludes `_test.go`, `testdata/`, `vendor/`, `node_modules/` and
+hidden directories; checked-in Go source in the patched dependency modules
+remains included. It rejects raw OS-home calls or saved function references
+through normal or aliased imports, allowing only the fallback in
+`internal/platform/platform.go`'s `HomeDir`. Coverage checks require the command,
+internal and services trees, and a synthetic tree proves root/new-package
+bypasses are caught and included parse errors fail. Package fixtures and a
+command-level table check owned defaults before reads/writes under changed
+HOME/USERPROFILE. App,
 instance and SSH-sync tests exercise real temporary-file writes; SSH sync uses
 only an explicit loopback `httptest` server with synthetic entries. Device
 service tests resolve paths without installing or starting anything.
@@ -108,3 +114,14 @@ tests must explicitly own their inputs. This change does not qualify all host
 I/O or make the command suite safe for local execution. This draft does not
 authorize real node configuration inspection/restoration, service operation,
 model work or activation.
+
+`internal/network/state.go` and `internal/update/state.go` retain matching
+`getUserHomeDir` error fallbacks. On Unix, a failed `platform.UserHomeDir()` call
+falls back to a raw `HOME` read. On Windows, non-empty `LOCALAPPDATA`, then
+`APPDATA`, take precedence; only then is the shared home resolver attempted,
+and an error falls back to raw `USERPROFILE`. These reads are outside the AST
+audit's raw `os.UserHomeDir` rule and preserve production selection policy.
+An installed, validated home fixture returns successfully, so it avoids the
+HOME/USERPROFILE error branches, but does not override the earlier Windows
+app-data selectors. Tests of those branches must explicitly own all environment
+paths; these seams alone do not qualify them for local execution.
