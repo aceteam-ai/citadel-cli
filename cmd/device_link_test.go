@@ -56,6 +56,9 @@ func TestDeviceEnrollmentRefusalExplainsFreshRegistrationRecovery(t *testing.T) 
 	if !errors.Is(err, refused) || !strings.Contains(err.Error(), "saved credentials do not complete device binding") || !strings.Contains(err.Error(), "citadel logout && citadel init") {
 		t.Fatal("link refusal must preserve its cause and explain explicit fresh-registration recovery")
 	}
+	if strings.Contains(err.Error(), refused.Error()) {
+		t.Fatal("recovery diagnostic must not render its arbitrary cause")
+	}
 }
 
 // linkGateServer stands in for an aceteam auth service. linkStatuses are the
@@ -99,19 +102,34 @@ var linkGateToken = &nexus.TokenResponse{Authkey: "registration-key", DeviceAPIT
 
 func runLinkGate(t *testing.T, client deviceLinker) linkGateObservation {
 	t.Helper()
+	return runLinkGateWithRollback(t, client, nil)
+}
+
+func runLinkGateWithRollback(t *testing.T, client deviceLinker, rollback func(*nexus.TokenResponse) error) linkGateObservation {
+	t.Helper()
 	var obs linkGateObservation
 	prevRollback, prevWarn, prevDelay := enrollmentRollbackFn, deviceLinkWarnFn, deviceLinkRetryDelay
 	t.Cleanup(func() {
 		enrollmentRollbackFn, deviceLinkWarnFn, deviceLinkRetryDelay = prevRollback, prevWarn, prevDelay
 	})
-	enrollmentRollbackFn = func(token *nexus.TokenResponse) error { obs.rolledBack = token; return nil }
+	enrollmentRollbackFn = func(token *nexus.TokenResponse) error {
+		obs.rolledBack = token
+		if rollback != nil {
+			return rollback(token)
+		}
+		return nil
+	}
 	deviceLinkWarnFn = func(msg string) { obs.warnings = append(obs.warnings, msg) }
 	deviceLinkRetryDelay = 0
 	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: linkGateToken}
 	obs.err = linkDeviceEnrollmentGated(result, func(context.Context) string { return "42" }, client)
-	for _, w := range obs.warnings {
+	diagnostics := append([]string(nil), obs.warnings...)
+	if obs.err != nil {
+		diagnostics = append(diagnostics, obs.err.Error())
+	}
+	for _, w := range diagnostics {
 		if strings.Contains(w, "private-grant") || strings.Contains(w, "registration-key") || strings.Contains(w, "device-bearer") {
-			t.Fatalf("warning exposes enrollment secrets: %q", w)
+			t.Fatalf("diagnostic exposes enrollment secrets: %q", w)
 		}
 	}
 	return obs
@@ -159,12 +177,148 @@ func TestDeviceLinkRefusalWithUnreadableVersionContinues(t *testing.T) {
 	}
 }
 
-func TestDeviceLinkTransientFailureRetriesOnceThenContinues(t *testing.T) {
+func TestDeviceLinkTransientFailureFromEnforcingServerFailsWithoutRollback(t *testing.T) {
 	links, versions := 0, 0
 	srv := linkGateServer(t, "1.520.0", []int{502}, &links, &versions)
 	obs := runLinkGate(t, nexus.NewDeviceAuthClient(srv.URL))
-	if obs.err != nil || obs.rolledBack != nil || len(obs.warnings) != 1 || links != 2 || versions != 0 {
-		t.Fatalf("a 5xx is not a refusal, even on v1.520+: retry once, then warn: %+v links=%d versions=%d", obs, links, versions)
+	if obs.err == nil || obs.rolledBack != nil || len(obs.warnings) != 0 || links != 2 || versions != 1 {
+		t.Fatalf("unconfirmed v1.520+ link must fail after one retry and retain credentials: %+v links=%d versions=%d", obs, links, versions)
+	}
+}
+
+type scriptedDeviceLinker struct {
+	linkErrors   []error
+	version      string
+	versionError error
+	grants       []string
+	nodeIDs      []string
+	versionCalls int
+}
+
+func (l *scriptedDeviceLinker) LinkRegisteredNode(_ context.Context, grant, nodeID string) error {
+	l.grants = append(l.grants, grant)
+	l.nodeIDs = append(l.nodeIDs, nodeID)
+	return l.linkErrors[min(len(l.grants)-1, len(l.linkErrors)-1)]
+}
+
+func (l *scriptedDeviceLinker) ServerVersion(context.Context) (string, error) {
+	l.versionCalls++
+	return l.version, l.versionError
+}
+
+// No diagnostic may call Error on an opaque cause: it may contain credentials,
+// grant-bearing URLs, or unsafe terminal text supplied by a transport.
+type opaqueDeviceLinkError struct{ rendered bool }
+
+func (e *opaqueDeviceLinkError) Error() string {
+	e.rendered = true
+	panic("opaque link error must not be rendered")
+}
+
+func TestDeviceLinkFinalOutcomeUsesVersionWithoutReplayingExpiredGrants(t *testing.T) {
+	opaque := &opaqueDeviceLinkError{}
+	expired := &nexus.DeviceLinkRefusedError{StatusCode: http.StatusGone}
+	for _, tt := range []struct {
+		name         string
+		version      string
+		versionError error
+		linkErrors   []error
+		wantFailure  bool
+		wantRollback bool
+		wantLinks    int
+	}{
+		{name: "modern transport", version: "1.520.0", linkErrors: []error{opaque}, wantFailure: true, wantLinks: 2},
+		{name: "modern expired grant", version: "1.520.0", linkErrors: []error{expired}, wantFailure: true, wantRollback: true, wantLinks: 1},
+		{name: "modern transport then refusal", version: "1.521.0", linkErrors: []error{opaque, expired}, wantFailure: true, wantLinks: 2},
+		{name: "old transport", version: "1.519.9", linkErrors: []error{opaque}, wantLinks: 2},
+		{name: "old expired grant", version: "1.519.9", linkErrors: []error{expired}, wantLinks: 1},
+		{name: "unknown transport", versionError: opaque, linkErrors: []error{opaque}, wantLinks: 2},
+		{name: "unknown expired grant", versionError: opaque, linkErrors: []error{expired}, wantLinks: 1},
+		{name: "unrecognized private version", version: "private-grant registration-key device-bearer", linkErrors: []error{opaque}, wantLinks: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &scriptedDeviceLinker{linkErrors: tt.linkErrors, version: tt.version, versionError: tt.versionError}
+			obs := runLinkGate(t, client)
+			if opaque.rendered {
+				t.Fatal("link and version causes must never be rendered, even by a formatter that recovers panics")
+			}
+			if (obs.err != nil) != tt.wantFailure || (obs.rolledBack != nil) != tt.wantRollback || len(client.grants) != tt.wantLinks || client.versionCalls != 1 {
+				t.Fatalf("unexpected final outcome: failed=%v rollback=%v links=%d versions=%d", obs.err != nil, obs.rolledBack != nil, len(client.grants), client.versionCalls)
+			}
+			for i, grant := range client.grants {
+				if grant != "private-grant" || client.nodeIDs[i] != "42" {
+					t.Fatal("link must use only the current grant and current registered identity")
+				}
+			}
+			if tt.wantFailure {
+				if len(obs.warnings) != 0 || !errors.Is(obs.err, tt.linkErrors[len(tt.linkErrors)-1]) || !strings.Contains(obs.err.Error(), "fresh browser approval") {
+					t.Fatal("modern failure must preserve its typed cause and require fresh approval without a compatibility warning")
+				}
+			} else if len(obs.warnings) != 1 || !strings.Contains(obs.warnings[0], "unverified") || !strings.Contains(obs.warnings[0], "citadel logout && citadel init") || !strings.Contains(obs.warnings[0], "fresh browser approval") {
+				t.Fatal("compatibility must explicitly report unverified binding and fresh-registration recovery")
+			}
+		})
+	}
+}
+
+func TestDeviceLinkUncertaintyRetainsSavedCredentialBytes(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		linkErrors []error
+	}{
+		{name: "uncertain twice", linkErrors: []error{&opaqueDeviceLinkError{}}},
+		{name: "uncertain then expired", linkErrors: []error{&opaqueDeviceLinkError{}, &nexus.DeviceLinkRefusedError{StatusCode: http.StatusGone}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "device_api_token: device-bearer\norg_id: current-org\naceteam_api_key: operator-key\n"
+			path := writeRollbackFixture(t, content)
+			client := &scriptedDeviceLinker{linkErrors: tt.linkErrors, version: "1.520.0"}
+			obs := runLinkGateWithRollback(t, client, func(token *nexus.TokenResponse) error {
+				return rollbackEnrollmentCredentials(path, token)
+			})
+			if obs.err == nil || obs.rolledBack != nil || len(client.grants) != 2 || client.versionCalls != 1 {
+				t.Fatal("uncertain modern link must fail after its bounded retry without attempting credential removal")
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != content {
+				t.Fatal("a later refusal cannot disprove an earlier server commit; saved credentials must remain byte-for-byte unchanged")
+			}
+		})
+	}
+}
+
+func TestDeviceLinkDefiniteRefusalRollsBackOnlyCurrentCredential(t *testing.T) {
+	for _, bearer := range []string{"device-bearer", "replacement-bearer"} {
+		t.Run(bearer, func(t *testing.T) {
+			path := writeRollbackFixture(t, "device_api_token: "+bearer+"\naceteam_api_key: operator-key\n")
+			client := &scriptedDeviceLinker{linkErrors: []error{&nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}}, version: "1.520.0"}
+			obs := runLinkGateWithRollback(t, client, func(token *nexus.TokenResponse) error {
+				return rollbackEnrollmentCredentials(path, token)
+			})
+			if obs.err == nil || obs.rolledBack != linkGateToken {
+				t.Fatal("definite modern refusal must attempt current-enrollment rollback")
+			}
+			got := readRollbackFixture(t, path)
+			if got["aceteam_api_key"] != "operator-key" {
+				t.Fatal("rollback must preserve the operator credential")
+			}
+			if bearer == "device-bearer" {
+				if _, ok := got["device_api_token"]; ok {
+					t.Fatal("refused current credential must be removed")
+				}
+			} else if got["device_api_token"] != bearer {
+				t.Fatal("refusal must not remove a replacement credential")
+			}
+		})
+	}
+}
+
+func TestDeviceLinkRollbackFailureDiagnosticIsRedacted(t *testing.T) {
+	client := &scriptedDeviceLinker{linkErrors: []error{&nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}}, version: "1.520.0"}
+	opaque := &opaqueDeviceLinkError{}
+	obs := runLinkGateWithRollback(t, client, func(*nexus.TokenResponse) error { return opaque })
+	if obs.err == nil || opaque.rendered || !strings.Contains(obs.err.Error(), "removing this enrollment's saved credentials also failed") {
+		t.Fatal("rollback failure must remain visible without rendering its opaque cause")
 	}
 }
 

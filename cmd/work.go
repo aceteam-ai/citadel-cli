@@ -232,6 +232,7 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 func connectWithBackoffLabeled(ctx context.Context, label string, source apiConnector) error {
 	backoff := connectBackoffInitial
 	attempt := 0
+	authReported := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -249,6 +250,19 @@ func connectWithBackoffLabeled(ctx context.Context, label string, source apiConn
 		// If the context was cancelled mid-connect, this is a clean shutdown.
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// Log() is console-visible only with --debug. Surface the first
+		// authenticated API refusal on the default path too, while keeping the
+		// established in-process retry policy (including 429/offline recovery).
+		// Only the typed, fixed-text error is rendered, never an arbitrary
+		// wrapping error, response body, URL, or credential.
+		if authErr, ok := redisapi.AsAuthorizationError(err); ok {
+			if !authReported {
+				fmt.Fprintln(os.Stderr, "API authorization:", authErr)
+				authReported = true
+			}
+			err = authErr
 		}
 
 		// Decide how long to wait before the next attempt.
@@ -926,6 +940,7 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
+		printDeviceLinkDiagnostic(os.Stderr, deviceConfig)
 		Debug("using API mode (device_api_token found)")
 		useAPIMode = true
 

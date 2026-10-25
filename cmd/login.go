@@ -231,6 +231,7 @@ reusable secret should prefer --authkey-stdin so the key never appears in argv.`
 func runNonInteractiveLogin() {
 	// Check if already connected
 	if network.IsGlobalConnected() {
+		printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
 		fmt.Println("Already connected to the AceTeam Network.")
 		return
 	}
@@ -335,6 +336,7 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 	switch choice {
 	case nexus.NetChoiceVerified:
 		// The GetNetworkChoice function already printed a success message.
+		printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
 		return
 	case nexus.NetChoiceSkip:
 		fmt.Println("Login skipped.")
@@ -501,10 +503,11 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 				fmt.Fprintf(os.Stderr, "Error: fabric credentials were saved, but enrollment state could not be persisted: %v\n", persistErr)
 				os.Exit(1)
 			}
-			fmt.Fprintln(os.Stderr, "\n⚠️  Fabric enrollment completed, but the mesh connection failed.")
+			fmt.Fprintln(os.Stderr, "\n⚠️  Fabric credentials were saved, but mesh connection and device linking did not complete.")
 			fmt.Fprintf(os.Stderr, "   Credentials are saved for %s.\n", persistedCreds.transportName())
+			fmt.Fprintln(os.Stderr, "   To complete enrollment, run 'citadel logout && citadel init' for fresh browser approval.")
 			if sessionCfg.Mode == nodesession.Worker {
-				fmt.Fprintln(os.Stderr, "   Worker mode is active; the node can serve fabric jobs without the mesh.")
+				fmt.Fprintln(os.Stderr, "   Worker mode remains active; fabric access still depends on server authorization.")
 				fmt.Fprintln(os.Stderr, "   The worker will retry the mesh when it starts.")
 			} else {
 				fmt.Fprintln(os.Stderr, "   Existing presence-only mode was preserved; run 'citadel work' explicitly to serve jobs.")

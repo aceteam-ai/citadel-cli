@@ -396,6 +396,9 @@ func runControlCenter() {
 
 		// Try to reconnect if we have saved state
 		if network.HasState() {
+			if detail := deviceLinkDiagnostic(getDeviceConfigFromFile()); detail != "" {
+				cc.AddActivity("warning", "Device link: "+detail)
+			}
 			cc.AddActivity("info", "Reconnecting to network...")
 			connected, err := network.VerifyOrReconnect(ctx)
 			if err != nil && errors.Is(err, network.ErrStaleState) {

@@ -33,7 +33,7 @@ var enrollmentRollbackFn = func(token *nexus.TokenResponse) error {
 // deviceLinkRetryDelay spaces the single retry after a transport error or 5xx.
 var deviceLinkRetryDelay = 2 * time.Second
 
-// deviceLinkWarnFn reports a refusal that was not fatal.
+// deviceLinkWarnFn reports an unverified link that was not fatal.
 var deviceLinkWarnFn = func(msg string) { fmt.Fprintln(os.Stderr, msg) }
 
 // deviceLinker is the slice of the device-auth client enrollment linking uses.
@@ -77,14 +77,14 @@ func enrollmentNodeID(ctx context.Context) string {
 }
 
 // linkDeviceEnrollmentGated links the enrollment and decides whether a failure
-// is fatal. Only a definite refusal (nexus.DeviceLinkRefusedError) from a server
-// that reports v1.520.0 or later fails enrollment; that server is the first
-// whose refusal applies to this enrollment rather than to a missing wizard
-// configuration. A transport error or 5xx is retried once and then reported,
-// as is a refusal from an older server or one whose version cannot be read;
-// enrollment then goes on as it did before linking existed (#1350 tracks
-// linking such a node later). A fatal refusal also removes the credentials
-// this enrollment saved, and nothing else.
+// is fatal. A server reporting v1.520.0 or later must confirm the link before
+// enrollment reports success. Transport errors and 5xx are retried once; if
+// confirmation remains unavailable, credentials are retained because the server
+// may already have committed the link. Only a definite refusal with no earlier
+// uncertain attempt removes this enrollment's saved credentials. A retry's
+// refusal cannot disprove an earlier commit. Older or unknown versions retain the
+// compatibility path, with an explicit unverified-link recovery warning. No
+// grant is persisted or replayed for later recovery.
 func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Context) string, client deviceLinker) error {
 	attempt := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -92,19 +92,15 @@ func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Con
 		return linkDeviceEnrollmentWith(ctx, result, nodeID, client.LinkRegisteredNode)
 	}
 	linkErr := attempt()
-	if linkErr != nil && !isDeviceLinkRefusal(linkErr) {
+	uncertainAttempt := linkErr != nil && !isDeviceLinkRefusal(linkErr)
+	if uncertainAttempt {
 		time.Sleep(deviceLinkRetryDelay)
 		linkErr = attempt()
 	}
 	if linkErr == nil {
 		return nil
 	}
-	if !isDeviceLinkRefusal(linkErr) {
-		deviceLinkWarnFn(fmt.Sprintf("⚠️  Device link could not be completed (%v); continuing without a completed device link.", linkErr))
-		return nil
-	}
-
-	// A fresh budget: a slow refusal must not starve the version read.
+	// A fresh budget: a slow link attempt must not starve the version read.
 	vctx, vcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer vcancel()
 	version, versionErr := client.ServerVersion(vctx)
@@ -112,20 +108,19 @@ func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Con
 		enforced, ok := deviceLinkEnforced(version)
 		if ok && enforced {
 			fatal := deviceEnrollmentRecoveryError(linkErr)
-			if result != nil {
+			if !uncertainAttempt && isDeviceLinkRefusal(linkErr) && result != nil {
 				if err := enrollmentRollbackFn(result.Token); err != nil {
-					return fmt.Errorf("%w (removing this enrollment's saved credentials also failed: %v)", fatal, err)
+					return fmt.Errorf("%w (removing this enrollment's saved credentials also failed)", fatal)
 				}
 			}
 			return fatal
 		}
 		if ok {
-			deviceLinkWarnFn(fmt.Sprintf("⚠️  Device link not completed (%v). The server reports v%s, older than v%s, which cannot link this enrollment; continuing without a completed device link.", linkErr, strings.TrimPrefix(strings.TrimSpace(version), "v"), deviceLinkEnforcedFrom))
+			deviceLinkWarnFn("⚠️  Device link is unverified on this older server; continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
 			return nil
 		}
-		versionErr = fmt.Errorf("unrecognized server version")
 	}
-	deviceLinkWarnFn(fmt.Sprintf("⚠️  Device link not completed (%v), and the server version could not be read (%v); continuing without a completed device link.", linkErr, versionErr))
+	deviceLinkWarnFn("⚠️  Device link is unverified and the server version could not be verified; continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
 	return nil
 }
 
@@ -248,8 +243,18 @@ func deviceLinkEnforced(version string) (enforced, ok bool) {
 	return v.GreaterThanOrEqual(deviceLinkEnforcedFrom), true
 }
 
+// deviceEnrollmentRecoveryFailure keeps a cause available to typed callers
+// without rendering arbitrary transport, server, or grant-bearing error text.
+type deviceEnrollmentRecoveryFailure struct{ cause error }
+
+func (*deviceEnrollmentRecoveryFailure) Error() string {
+	return "device enrollment link was not confirmed; saved credentials do not complete device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again"
+}
+
+func (e *deviceEnrollmentRecoveryFailure) Unwrap() error { return e.cause }
+
 func deviceEnrollmentRecoveryError(err error) error {
-	return fmt.Errorf("%w; saved credentials do not complete device binding. Run 'citadel logout && citadel init' to register with a fresh authorization", err)
+	return &deviceEnrollmentRecoveryFailure{cause: err}
 }
 
 func linkDeviceEnrollmentWith(ctx context.Context, result *DeviceAuthResult, nodeID func(context.Context) string, link func(context.Context, string, string) error) error {
