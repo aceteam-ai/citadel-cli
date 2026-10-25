@@ -1,5 +1,5 @@
 // Package clilog provides citadel-cli's always-on, date-based, append-only
-// file logging. It is a small dependency-free sink shared by the cobra
+// file logging. It is a small sink shared by the cobra
 // commands (package cmd) and the control-center TUI (package
 // internal/tui/controlcenter) so that every activity entry is persisted to
 // disk as it happens — not only when the operator presses a key.
@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 var (
@@ -40,7 +42,7 @@ func Dir() string {
 	if dirOverride != "" {
 		return dirOverride
 	}
-	home, err := os.UserHomeDir()
+	home, err := platform.HomeDir("")
 	if err != nil {
 		return ""
 	}

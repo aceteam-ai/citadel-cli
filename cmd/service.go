@@ -111,12 +111,11 @@ func removeLegacyCitadelProject(name string) {
 
 // prepareCacheDirectories creates the cache directories for all services.
 func prepareCacheDirectories() error {
-	homeDir, err := os.UserHomeDir()
+	cacheBase, err := cacheBaseDirectory()
 	if err != nil {
 		return fmt.Errorf("could not find user home directory: %w", err)
 	}
 
-	cacheBase := filepath.Join(homeDir, "citadel-cache")
 	// A list of all potential cache directories our services might use.
 	dirsToCreate := []string{
 		filepath.Join(cacheBase, "ollama"),
@@ -143,6 +142,15 @@ func prepareCacheDirectories() error {
 
 	fmt.Println("✅ Cache directories are ready.")
 	return nil
+}
+
+// Resolve without creating anything so fixtures can assert custody before I/O.
+func cacheBaseDirectory() (string, error) {
+	home, err := platform.HomeDir("")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "citadel-cache"), nil
 }
 
 // startService starts a docker-based service using docker compose.
@@ -678,7 +686,7 @@ func startNativeService(serviceName, configDir string) error {
 	}
 
 	// Get log directory
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := platform.HomeDir("")
 	if err != nil {
 		return fmt.Errorf("could not find home directory: %w", err)
 	}

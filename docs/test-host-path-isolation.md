@@ -12,6 +12,22 @@ does not look up or chown to a real service account.
 
 `platform.OverrideConfigDirectoryForTesting` similarly redirects `ConfigDir`
 and its candidate enumeration to one fixture, before root/sudo/Windows discovery.
+`platform.OverrideHomeDirectoryForTesting` redirects `HomeDir`, including named
+and sudo-user lookups, before consulting environment variables or the account
+database. The command package's former direct `os.UserHomeDir` callers and the
+CLI log sink use this seam. Platform home fallbacks (including desktop paths)
+also use it. A source audit test prevents reintroducing direct OS-home calls in
+the command/default-log files. Cache and workspace path selection is separated
+from directory creation so tests can check the destination before writing.
+
+The podman provenance marker has its own scoped directory input. Production
+still uses `/etc/citadel/rootless-worker-user`; fixtures choose an existing owned
+directory before marker reads or writes. Root ownership, directory mode,
+exclusive creation and marker-content checks remain unchanged. The fixture
+writer test supplies a verifier for its temporary directory; production always
+uses the original root/mode verifier. Provenance tests use a read-only core
+separate from the native account/group/sudo audit and never provision users.
+
 There is no environment switch. With no explicit override, existing production
 resolution, pointer precedence and ownership behavior are unchanged.
 
@@ -28,8 +44,9 @@ restoring a scope or deleting its directories. Nested scopes restore in reverse
 order. Restoration is idempotent; an out-of-order restore fails and leaves the
 current provider installed. A failed installation leaves the previous provider.
 
-Command `TestMain` creates private fixtures, installs both providers, then wires
-credential/passcode hooks and constructs the diagnostic registry. On exit it
+Command `TestMain` creates private fixtures, installs state/config/home/marker
+providers and checks their selected paths before any default-path effect, then
+wires credential/passcode hooks and constructs the diagnostic registry. On exit it
 closes the CLI log handle, restores providers and removes the root. If provider
 restoration fails, it retains the directories and exits unsuccessfully.
 It first refuses a non-nil diagnostic registry, so a direct `init` assignment
@@ -49,7 +66,8 @@ execution, or explicitly after fixture setup in `TestMain`. Handler construction
 takes permission/index inputs explicitly; live shell permission and strict
 passcode callbacks retain their per-job behavior.
 
-Tests that need a different HOME use `useCmdFixtureHome` to install scoped paths.
+Tests that need a different HOME use `useCmdFixtureHome` to install all four
+scoped paths.
 Changing HOME alone cannot disable the process guard. The helper deliberately
 does not create `~/citadel-node`: manifest tests must retain their absence oracle
 for an explicitly selected alternate node. Logs close before scope restoration
@@ -65,5 +83,9 @@ readers. They use synthetic temporary data, never a real enrolled node.
 Optional Chromium/ffmpeg/bash/process tests still exist. A child process does not
 inherit Go's in-memory overrides. Whole-command local execution therefore remains
 held pending independent review and the separate explicit native opt-in and
-host-reader inventory work in #1468. This draft does not authorize real node
-configuration inspection/restoration, service operation, model work or activation.
+host-reader inventory work in #1468. Other packages' direct OS/environment/account
+lookups and explicit paths are not intercepted by the home seam; this bounded
+command/default-log slice does not qualify every transitive reader. Native OS
+roots and optional processes remain outside this slice. This draft does not
+authorize real node configuration inspection/restoration, service operation,
+model work or activation.

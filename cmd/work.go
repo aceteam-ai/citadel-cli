@@ -3401,16 +3401,9 @@ func getRedisURLFromConfig() string {
 // Priority: --workspace flag > CITADEL_WORKSPACE env > ~/citadel-node/workspace default.
 // Returns empty string if the directory cannot be resolved or created.
 func resolveWorkspaceDir() string {
-	dir := workWorkspaceDir
+	dir := workspaceDirPath()
 	if dir == "" {
-		dir = os.Getenv("CITADEL_WORKSPACE")
-	}
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return ""
-		}
-		dir = filepath.Join(home, "citadel-node", "workspace")
+		return ""
 	}
 	// Ensure the directory exists.
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -3423,6 +3416,23 @@ func resolveWorkspaceDir() string {
 		return dir
 	}
 	return abs
+}
+
+// workspaceDirPath preserves flag/env/default precedence without filesystem
+// effects, allowing fixture selection to be checked before directory creation.
+func workspaceDirPath() string {
+	dir := workWorkspaceDir
+	if dir == "" {
+		dir = os.Getenv("CITADEL_WORKSPACE")
+	}
+	if dir == "" {
+		home, err := platform.HomeDir("")
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, "citadel-node", "workspace")
+	}
+	return dir
 }
 
 // newAutoStopReconciler builds the config-gated auto-stop-when-idle reconciler

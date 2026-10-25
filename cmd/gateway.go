@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 )
 
@@ -84,7 +85,7 @@ func runGateway(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set up ledger
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := platform.HomeDir("")
 	if err != nil {
 		return fmt.Errorf("get home dir: %w", err)
 	}
