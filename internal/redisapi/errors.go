@@ -6,19 +6,90 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
 
 // AuthorizationError is an HTTP 401/403 refusal, not proof that a device is
-// unlinked, revoked or expired. It retains no response body, URL or credential.
+// unlinked, revoked or expired. Method and Path contain only closed diagnostic
+// labels in production; no response body, origin, query or credential is kept.
 type AuthorizationError struct {
 	StatusCode int
+	Method     string
+	Path       string
 }
 
 func (e *AuthorizationError) Error() string {
-	return fmt.Sprintf("request denied (HTTP %d); device linkage/permissions not confirmed; if enrollment is incomplete, use 'citadel logout && citadel init' for fresh browser approval", e.StatusCode)
+	// These fields are public for typed callers. Reapply the same allowlists
+	// when formatting, even if a caller constructed or changed them directly.
+	context := fmt.Sprintf("%s %s request denied (HTTP %d)", authorizationMethod(e.Method), authorizationPath(e.Path), e.StatusCode)
+	if e.StatusCode == http.StatusForbidden {
+		return context + "; check device permissions/scopes and organization access; this response alone does not establish the cause"
+	}
+	if e.StatusCode == http.StatusUnauthorized {
+		return context + "; device linkage/permissions not confirmed; if enrollment is incomplete, use 'citadel logout && citadel init' for fresh browser approval"
+	}
+	return context + "; authorization state is not confirmed"
+}
+
+func newAuthorizationError(status int, method, path string) *AuthorizationError {
+	return &AuthorizationError{StatusCode: status, Method: authorizationMethod(method), Path: authorizationPath(path)}
+}
+
+func authorizationMethod(method string) string {
+	switch method {
+	case http.MethodGet:
+		return http.MethodGet
+	case http.MethodPost:
+		return http.MethodPost
+	case http.MethodPut:
+		return http.MethodPut
+	case http.MethodPatch:
+		return http.MethodPatch
+	case http.MethodDelete:
+		return http.MethodDelete
+	case http.MethodHead:
+		return http.MethodHead
+	case http.MethodOptions:
+		return http.MethodOptions
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// authorizationPath emits only constants. Query/fragment values, URL origins
+// and dynamic job IDs never become diagnostic labels, even for public fields.
+func authorizationPath(path string) string {
+	parsed, err := url.Parse(path)
+	if err != nil || parsed.Opaque != "" || (parsed.Scheme != "" && parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "<unknown-route>"
+	}
+	switch parsed.Path {
+	case "/api/fabric/redis/ping":
+		return "/api/fabric/redis/ping"
+	case "/api/fabric/worker-config":
+		return "/api/fabric/worker-config"
+	case "/api/fabric/redis/jobs/consume":
+		return "/api/fabric/redis/jobs/consume"
+	case "/api/fabric/redis/jobs/acknowledge":
+		return "/api/fabric/redis/jobs/acknowledge"
+	case "/api/fabric/redis/pubsub/publish":
+		return "/api/fabric/redis/pubsub/publish"
+	case "/api/fabric/redis/kv":
+		return "/api/fabric/redis/kv"
+	case "/api/fabric/redis/streams/add":
+		return "/api/fabric/redis/streams/add"
+	}
+	const prefix = "/api/fabric/redis/finetune/"
+	if strings.HasPrefix(parsed.Path, prefix) {
+		id := strings.TrimPrefix(parsed.Path, prefix)
+		if id != "" && !strings.Contains(id, "/") {
+			return "/api/fabric/redis/finetune/{jobId}"
+		}
+	}
+	return "<unknown-route>"
 }
 
 // AsAuthorizationError extracts a typed refusal through ordinary error wraps.
