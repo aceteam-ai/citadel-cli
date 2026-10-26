@@ -235,6 +235,12 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 				// running agent (persisted/env) is reflected even on a cycle that
 				// installs nothing (citadel-cli#1134).
 				a.refresh()
+				// Corrupt or unreadable state is a visible pause, even with a flag
+				// or env enable. Do not guess preferences or overwrite evidence.
+				if _, corrupt := ReadStateForReport(); corrupt {
+					a.cfg.Log("auto-update: state file unreadable, auto-update paused; run 'citadel update enable' to repair")
+					return
+				}
 				// Re-check the toggle every tick so it can be flipped on a running
 				// agent without a restart.
 				if a.cfg.Enabled != nil && !a.cfg.Enabled() {

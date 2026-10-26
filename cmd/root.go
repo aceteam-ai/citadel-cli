@@ -279,14 +279,16 @@ func checkForUpdateOnStartup(silent bool) {
 			client := update.NewClientWithTimeout(Version, 5*time.Second)
 			release, err := client.CheckForUpdate()
 
-			// Update state regardless of result
-			update.UpdateLastCheck(state)
-			if err == nil && release != nil {
-				state.AvailableUpdate = release.TagName
-			} else if err == nil {
-				state.AvailableUpdate = "" // Clear if on latest
-			}
-			_ = update.SaveState(state)
+			// Re-read under the cross-process transaction after the network call;
+			// a preference may have changed while the check was in flight.
+			_ = update.MutateState(func(state *update.State) {
+				update.UpdateLastCheck(state)
+				if err == nil && release != nil {
+					state.AvailableUpdate = release.TagName
+				} else if err == nil {
+					state.AvailableUpdate = ""
+				}
+			})
 		}()
 	}
 }

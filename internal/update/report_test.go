@@ -12,7 +12,10 @@ import (
 // so writes don't leak between tests.
 func isolateState(t *testing.T) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(key, root)
+	}
 }
 
 func TestReadStateForReport(t *testing.T) {

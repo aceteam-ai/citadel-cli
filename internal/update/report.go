@@ -20,10 +20,7 @@
 package update
 
 import (
-	"encoding/json"
-	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -46,29 +43,13 @@ const (
 	ResultRestartPending       = "restart_pending"        // applied/staged; not yet proven running
 	ResultRestartFailed        = "restart_failed"         // swap applied but the restart call failed
 	ResultManualUpdateRequired = "manual_update_required" // homebrew/desktop-managed; can't self-swap
-	ResultUnknown              = "unknown"                // state unreadable/corrupt; degrade, don't guess
+	ResultStateCorrupt         = "state_corrupt"          // persisted state unreadable/corrupt; paused until explicit repair
+	ResultUnknown              = "unknown"                // historical/otherwise unclassified result
 )
 
-// stateMu serializes the load-modify-save of state.json so a preference write
-// (`citadel update enable/disable`) and a telemetry result write never clobber
-// one another. A result write only ever touches the telemetry fields; each
-// load-modify-save preserves every other field it read.
-var stateMu sync.Mutex
-
-// mutateState atomically loads state.json, applies mutate, and saves it, under
-// stateMu. A missing or unreadable file degrades to a fresh default before
-// mutate runs. Best-effort: the error is returned for tests, but production
-// callers ignore it — telemetry must never interrupt the worker.
-func mutateState(mutate func(*State)) error {
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	state, err := LoadState()
-	if err != nil || state == nil {
-		state = defaultState()
-	}
-	mutate(state)
-	return SaveState(state)
-}
+// mutateState keeps result writers on the same cross-process transaction as
+// explicit preference changes. Errors leave unreadable/corrupt state untouched.
+func mutateState(mutate func(*State)) error { return MutateState(mutate) }
 
 // RecordCheckResult atomically records one auto-update attempt outcome into
 // state.json, preserving the preference fields (AutoUpdate/Channel). checked
@@ -142,21 +123,10 @@ func ReconcilePendingOnStartup(now time.Time, runningVersion string) error {
 // a corrupt/unreadable file (corrupt=true, so the caller reports "unknown"
 // rather than a confident disabled) from a cleanly-absent one (corrupt=false,
 // default-off state — auto-update is opt-in, so an absent file legitimately
-// means disabled). Unlike LoadState it does not swallow a corrupt file into a
-// default, and it never writes or repairs the file.
+// means disabled). It shares LoadState's strict decoding and never writes or repairs the file.
 func ReadStateForReport() (state *State, corrupt bool) {
-	data, err := os.ReadFile(GetStateFilePath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return defaultState(), false
-		}
-		return nil, true
-	}
-	var st State
-	if err := json.Unmarshal(data, &st); err != nil {
-		return nil, true
-	}
-	return &st, false
+	state, err := LoadState()
+	return state, err != nil
 }
 
 // VersionsEqual compares two version strings ignoring a leading "v" and

@@ -436,7 +436,7 @@ type ReconcileHealth struct {
 //     current release lookup.
 //   - LastResult is one of update's bounded result codes (never_checked/
 //     up_to_date/check_failed/download_failed/drain_deferred/apply_failed/
-//     restart_pending/restart_failed/manual_update_required/unknown) — never a
+//     restart_pending/restart_failed/manual_update_required/state_corrupt/unknown) — never a
 //     raw URL, path, log line, or secret.
 //   - The outer heartbeat timestamp remains the observation-freshness signal;
 //     LastCheckAt/LastResultAt are RFC3339 UTC, matching that encoding.

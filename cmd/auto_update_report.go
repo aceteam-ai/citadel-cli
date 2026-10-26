@@ -15,9 +15,13 @@ import (
 // CITADEL_AUTO_UPDATE env > persisted preference > default-off — so the two can
 // never disagree on the effective bool (resolveAutoUpdateEnabled delegates
 // here). The source is the extra telemetry: persisted|env|flag|dev|opt-out|
-// unknown. A corrupt/unreadable persisted preference resolves to
+// unknown. Corrupt/unreadable state vetoes every enable source and resolves to
 // (false, "unknown") rather than a confident disabled.
 func resolveAutoUpdatePolicy(inputs autoUpdatePolicyInputs) (effective bool, source string) {
+	state, corrupt := update.ReadStateForReport()
+	if corrupt || state == nil {
+		return false, "unknown"
+	}
 	if autoUpdateOptedOut() {
 		return false, "opt-out"
 	}
@@ -32,10 +36,6 @@ func resolveAutoUpdatePolicy(inputs autoUpdatePolicyInputs) (effective bool, sou
 		return true, "env"
 	case "0", "false", "no", "off":
 		return false, "env"
-	}
-	state, corrupt := update.ReadStateForReport()
-	if corrupt || state == nil {
-		return false, "unknown"
 	}
 	return state.AutoUpdate, "persisted"
 }
@@ -61,7 +61,7 @@ func autoUpdateIntervalSeconds(inputs autoUpdatePolicyInputs) int {
 // state read.
 //
 // Degradation rules (do not turn a corrupt state into a confident report):
-//   - unreadable/corrupt state -> configured_enabled=null, last_result=unknown,
+//   - unreadable/corrupt state -> configured_enabled=null, last_result=state_corrupt,
 //     pending not computed;
 //   - absent state -> default-off (auto-update is opt-in), last_result=
 //     never_checked;
@@ -83,7 +83,10 @@ func buildAutoUpdateSnapshot(inputs autoUpdatePolicyInputs, mode string) update.
 	if corrupt || state == nil {
 		// Unknown preference, unknown result; never a confident disabled.
 		snap.ConfiguredEnabled = nil
-		snap.LastResult = update.ResultUnknown
+		disabled := false
+		snap.EffectiveEnabled = &disabled
+		snap.PolicySource = "unknown"
+		snap.LastResult = update.ResultStateCorrupt
 		return snap
 	}
 

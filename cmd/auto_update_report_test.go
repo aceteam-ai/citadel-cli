@@ -77,7 +77,10 @@ func TestAutoUpdateReportFrom(t *testing.T) {
 // is isolated (never the operator's real ~/citadel-node/update/state.json).
 func withAutoUpdateEnv(t *testing.T, version string) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(key, home)
+	}
 	t.Setenv("CITADEL_AUTO_UPDATE", "")
 	t.Setenv("CITADEL_NO_AUTO_UPDATE", "")
 	t.Setenv("CITADEL_AUTO_UPDATE_INTERVAL", "")
@@ -167,8 +170,8 @@ func TestBuildAutoUpdateSnapshot(t *testing.T) {
 		if snap.PolicySource != "unknown" {
 			t.Errorf("policy_source = %q, want unknown", snap.PolicySource)
 		}
-		if snap.LastResult != update.ResultUnknown {
-			t.Errorf("last_result = %q, want unknown", snap.LastResult)
+		if snap.LastResult != update.ResultStateCorrupt {
+			t.Errorf("last_result = %q, want state_corrupt", snap.LastResult)
 		}
 	})
 
@@ -240,5 +243,35 @@ func TestAutoUpdateSnapshotNextProcessClearsPending(t *testing.T) {
 	}
 	if after.LastResult != update.ResultUpToDate {
 		t.Errorf("matching startup must clear restart_failed to up_to_date, got %q", after.LastResult)
+	}
+}
+
+func TestCorruptUpdateStateVetoesOverridesAndClearsHeartbeatClaims(t *testing.T) {
+	withAutoUpdateEnv(t, "v2.200.0")
+	t.Setenv("CITADEL_AUTO_UPDATE", "on")
+	if err := update.EnsureUpdateDir(); err != nil {
+		t.Fatal(err)
+	}
+	broken := []byte("{\"auto_update\":true,\"current_version\":\"v9.0.0\"}}")
+	if err := os.WriteFile(update.GetStateFilePath(), broken, 0600); err != nil {
+		t.Fatal(err)
+	}
+	inputs := autoUpdatePolicyInputs{force: true}
+	if enabled, source := resolveAutoUpdatePolicy(inputs); enabled || source != "unknown" {
+		t.Fatalf("override bypassed corrupt state: enabled=%t source=%s", enabled, source)
+	}
+	snapshot := buildAutoUpdateSnapshot(inputs, "periodic")
+	if snapshot.ConfiguredEnabled != nil || snapshot.EffectiveEnabled == nil || *snapshot.EffectiveEnabled ||
+		snapshot.LastResult != update.ResultStateCorrupt || snapshot.PolicySource != "unknown" ||
+		snapshot.PendingVersion != "" || snapshot.RestartRequired || snapshot.LastResultAt != nil {
+		t.Fatalf("corrupt heartbeat inferred state fields: %+v", snapshot)
+	}
+	if err := update.SetAutoUpdate(true); err != nil {
+		t.Fatal(err)
+	}
+	repaired := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+	if repaired.ConfiguredEnabled == nil || !*repaired.ConfiguredEnabled ||
+		repaired.EffectiveEnabled == nil || !*repaired.EffectiveEnabled || repaired.LastResult == update.ResultStateCorrupt {
+		t.Fatalf("explicit repair did not clear the pause/report: %+v", repaired)
 	}
 }
