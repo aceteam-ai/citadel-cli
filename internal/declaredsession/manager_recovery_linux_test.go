@@ -343,7 +343,7 @@ func TestManagerHolderlessRecoveryRetainsConflictingNameVeto(t *testing.T) {
 				// Keep the marker equal to the CURRENT declaration so the
 				// later config_conflict classification cannot mask a missing
 				// marker-to-stored-revision check.
-				pending.DeclarationRevision = strings.Repeat("c", 64)
+				pending.DeclarationRevision = digest([]byte("older declaration fixture"))
 				if err := session.WriteState(pending); err != nil {
 					t.Fatal(err)
 				}
