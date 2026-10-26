@@ -184,8 +184,10 @@ the frame is not acknowledged, queued for replay or automatically retried. A
 busy input/resize queue instead disconnects with the static `busy` reason: the
 same connection cannot forward later paste chunks after dropping a middle chunk.
 This does not add delivery acknowledgements or make prior queued bytes atomic.
-A read-only role transition displays a static local notice that input is no
-longer forwarded. A refused take-control operation, malformed frame, stopped holder or slow viewer
+A locally discarded input displays one static read-only notice per read-only
+period, even when no role event was sent. A writable role resets the notice;
+the ordinary read-only-to-writable grant sequence does not display it.
+A refused take-control operation, malformed frame, stopped holder or slow viewer
 keeps the existing disconnect behavior. Real role-transfer and saturated-paste
 behavior still require native acceptance.
 Child cleanup revokes every viewer to read-only. S1 does not implicitly restore

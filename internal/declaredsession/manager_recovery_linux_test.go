@@ -329,20 +329,42 @@ func TestHolderlessStartingRecoverySupportsOnlyKnownProtocolRecordShapes(t *test
 }
 
 func TestManagerHolderlessRecoveryRetainsConflictingNameVeto(t *testing.T) {
-	m, session, pending := holderlessRecoveryFixture(t)
-	marker := StopMarker{Version: 1, Name: pending.Name, DeclarationRevision: pending.DeclarationRevision, Incarnation: strings.Repeat("b", 32), StoppedAt: pending.UpdatedAt}
-	if err := session.WriteStopMarker(marker); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.Stop(context.Background(), pending.Name); !errors.Is(err, ErrManager) {
-		t.Fatal("conflicting durable marker became recovery authority", err)
-	}
-	current, _, err := session.ReadState()
-	if err != nil || !sameEmptyStartingReservation(current, pending) {
-		t.Fatal("conflicting marker caused retirement", err)
-	}
-	retained, present, err := session.ReadStopMarker()
-	if err != nil || !present || retained.Incarnation != marker.Incarnation {
-		t.Fatal("recovery overwrote another incarnation's name veto", err)
+	for _, conflict := range []string{"incarnation", "revision"} {
+		t.Run(conflict, func(t *testing.T) {
+			root := privateFixtureDir(t)
+			for _, key := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
+				t.Setenv(key, root)
+			}
+			m, session, pending := holderlessRecoveryFixture(t)
+			marker := StopMarker{Version: 1, Name: pending.Name, DeclarationRevision: pending.DeclarationRevision, Incarnation: pending.Incarnation, StoppedAt: pending.UpdatedAt}
+			if conflict == "incarnation" {
+				marker.Incarnation = strings.Repeat("b", 32)
+			} else {
+				// Keep the marker equal to the CURRENT declaration so the
+				// later config_conflict classification cannot mask a missing
+				// marker-to-stored-revision check.
+				pending.DeclarationRevision = strings.Repeat("c", 64)
+				if err := session.WriteState(pending); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := session.WriteStopMarker(marker); err != nil {
+				t.Fatal(err)
+			}
+			if status, err := m.Status(context.Background(), pending.Name); err != nil || status.Classification == "recovery_incomplete" {
+				t.Fatal("conflicting marker acquired a misleading stop-then-start hint", status.Classification, err)
+			}
+			if _, err := m.Stop(context.Background(), pending.Name); !errors.Is(err, ErrManager) {
+				t.Fatal("conflicting durable marker became recovery authority", err)
+			}
+			current, _, err := session.ReadState()
+			if err != nil || !sameEmptyStartingReservation(current, pending) {
+				t.Fatal("conflicting marker caused retirement", err)
+			}
+			retained, present, err := session.ReadStopMarker()
+			if err != nil || !present || retained.Incarnation != marker.Incarnation || retained.DeclarationRevision != marker.DeclarationRevision {
+				t.Fatal("recovery overwrote another reservation's name veto", err)
+			}
+		})
 	}
 }

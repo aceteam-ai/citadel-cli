@@ -20,6 +20,8 @@ type fakeDeclaredAttachment struct {
 	readonly bool
 	input    []byte
 	resizes  int
+	inputErr error
+	calls    int
 }
 
 func (*fakeDeclaredAttachment) Next(context.Context) (declaredsession.AttachEvent, error) {
@@ -28,6 +30,10 @@ func (*fakeDeclaredAttachment) Next(context.Context) (declaredsession.AttachEven
 
 func (f *fakeDeclaredAttachment) ReadOnly() bool { return f.readonly }
 func (f *fakeDeclaredAttachment) Input(_ context.Context, data []byte) error {
+	f.calls++
+	if f.inputErr != nil {
+		return f.inputErr
+	}
 	f.input = append(f.input, data...)
 	return nil
 }
@@ -68,7 +74,16 @@ func TestDeclaredAttachPumpDrainsBurstWithoutInputPoll(t *testing.T) {
 	}
 }
 
-func TestDeclaredAttachReadOnlyTransitionNoticeIsStaticAndDoesNotReplayInput(t *testing.T) {
+func isolateDeclaredAttachEnvironment(t *testing.T) {
+	t.Helper()
+	root := declaredCommandTempDir(t)
+	for _, key := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(key, root)
+	}
+}
+
+func TestDeclaredAttachReadOnlyDiscardNoticeIsStaticAndDoesNotReplayInput(t *testing.T) {
+	isolateDeclaredAttachEnvironment(t)
 	results := make(chan declaredAttachResult, 3)
 	results <- declaredAttachResult{event: declaredsession.AttachEvent{Kind: "role", ReadOnly: true, Reason: "untrusted-test-text"}}
 	results <- declaredAttachResult{event: declaredsession.AttachEvent{Kind: "role", ReadOnly: true}}
@@ -92,7 +107,113 @@ func TestDeclaredAttachReadOnlyTransitionNoticeIsStaticAndDoesNotReplayInput(t *
 		})
 	const notice = "\r\n[Citadel session is read-only; input is not forwarded.]\r\n"
 	if err != nil || output.String() != notice || len(attachment.input) != 0 || attachment.resizes != 0 {
-		t.Fatalf("read-only transition was silent, repeated, reflected peer text or forwarded input: err=%v output=%q input=%q", err, output.String(), attachment.input)
+		t.Fatalf("read-only discard was silent, repeated, reflected peer text or forwarded input: err=%v output=%q input=%q", err, output.String(), attachment.input)
+	}
+}
+
+func TestDeclaredAttachGrantSequenceDoesNotReportDiscardedInput(t *testing.T) {
+	isolateDeclaredAttachEnvironment(t)
+	results := make(chan declaredAttachResult, 3)
+	results <- declaredAttachResult{event: declaredsession.AttachEvent{Kind: "role", ReadOnly: true}}
+	results <- declaredAttachResult{event: declaredsession.AttachEvent{Kind: "role", ReadOnly: false}}
+	results <- declaredAttachResult{event: declaredsession.AttachEvent{Kind: "stopped"}}
+	decoder, err := newDeclaredDetachDecoder(defaultDeclaredDetach)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A non-ceiling attachment receiving the ordinary attach/take-control
+	// grant sequence has not discarded any input.
+	attachment := &fakeDeclaredAttachment{}
+	var output bytes.Buffer
+	err = pumpDeclaredAttachment(context.Background(), attachment, decoder, results, nil, nil,
+		func(data []byte) error { _, err := output.Write(data); return err },
+		func() (uint16, uint16, error) { return 80, 24, nil })
+	if err != nil || output.Len() != 0 || len(attachment.input) != 0 || attachment.resizes != 1 {
+		t.Fatalf("normal grant falsely reported discarded input: err=%v output=%q resizes=%d", err, output.String(), attachment.resizes)
+	}
+}
+
+func TestDeclaredAttachRoleRefusedInputShowsStaticNoticeWithoutReplay(t *testing.T) {
+	for _, failOutput := range []bool{false, true} {
+		isolateDeclaredAttachEnvironment(t)
+		inputs := make(chan declaredAttachInput, 3)
+		inputs <- declaredAttachInput{data: []byte("first")}
+		inputs <- declaredAttachInput{data: []byte("second")}
+		inputs <- declaredAttachInput{eof: true}
+		decoder, err := newDeclaredDetachDecoder(defaultDeclaredDetach)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attachment := &fakeDeclaredAttachment{inputErr: declaredsession.ErrRole}
+		notices := 0
+		outputErr := errors.New("fixture output unavailable")
+		err = pumpDeclaredAttachment(context.Background(), attachment, decoder, nil, inputs, nil,
+			func(data []byte) error {
+				if string(data) != "\r\n[Citadel session is read-only; input is not forwarded.]\r\n" {
+					t.Fatal("role-refused input reflected data instead of a static notice")
+				}
+				notices++
+				if failOutput {
+					return outputErr
+				}
+				return nil
+			},
+			func() (uint16, uint16, error) { t.Fatal("discard resized"); return 0, 0, nil })
+		wantCalls := 2
+		if failOutput {
+			wantCalls = 1
+		}
+		if (err != nil) != failOutput || failOutput && !errors.Is(err, outputErr) ||
+			notices != 1 || attachment.calls != wantCalls || len(attachment.input) != 0 {
+			t.Fatalf("role refusal replayed input or lost notice failure: err=%v notices=%d calls=%d", err, notices, attachment.calls)
+		}
+	}
+}
+
+func TestDeclaredAttachDiscardNoticeResetsOnlyAfterWritableRole(t *testing.T) {
+	isolateDeclaredAttachEnvironment(t)
+	results := make(chan declaredAttachResult, 9)
+	for _, event := range []declaredsession.AttachEvent{
+		{Kind: "output", Data: []byte("drop-first")},
+		{Kind: "output", Data: []byte("drop-again")},
+		{Kind: "output", Data: []byte("grant")},
+		{Kind: "role", ReadOnly: false},
+		{Kind: "output", Data: []byte("deliver")},
+		{Kind: "output", Data: []byte("revoke")},
+		{Kind: "role", ReadOnly: true},
+		{Kind: "output", Data: []byte("drop-later")},
+		{Kind: "stopped"},
+	} {
+		results <- declaredAttachResult{event: event}
+	}
+	inputs := make(chan declaredAttachInput, 1)
+	attachment := &fakeDeclaredAttachment{readonly: true}
+	decoder, err := newDeclaredDetachDecoder(defaultDeclaredDetach)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notices := 0
+	err = pumpDeclaredAttachment(context.Background(), attachment, decoder, results, inputs, nil,
+		func(data []byte) error {
+			switch string(data) {
+			case "drop-first", "drop-again", "drop-later":
+				inputs <- declaredAttachInput{data: append([]byte(nil), data...)}
+			case "grant":
+				attachment.readonly = false
+			case "deliver":
+				inputs <- declaredAttachInput{data: []byte("delivered")}
+			case "revoke":
+				attachment.readonly = true
+			case "\r\n[Citadel session is read-only; input is not forwarded.]\r\n":
+				notices++
+			default:
+				t.Fatal("unexpected fixture output")
+			}
+			return nil
+		},
+		func() (uint16, uint16, error) { return 80, 24, nil })
+	if err != nil || notices != 2 || string(attachment.input) != "delivered" || attachment.resizes != 1 {
+		t.Fatalf("discard/restore/revoke sequence: err=%v notices=%d input=%q resizes=%d", err, notices, attachment.input, attachment.resizes)
 	}
 }
 
@@ -191,12 +312,15 @@ func TestDeclaredAttachPumpExplicitDetachAndInputEOFRemainSuccessful(t *testing.
 		readonly bool
 		pending  bool
 		want     []byte
+		notice   bool
 	}{
 		{name: "detach", input: declaredAttachInput{data: []byte{'x', 0x1d, 'd', 'z'}}, want: []byte{'x'}},
-		{name: "readonly detach", input: declaredAttachInput{data: []byte{'x', 0x1d, 'd', 'z'}}, readonly: true},
+		{name: "readonly detach", input: declaredAttachInput{data: []byte{'x', 0x1d, 'd', 'z'}}, readonly: true, notice: true},
+		{name: "readonly chord only", input: declaredAttachInput{data: []byte{0x1d, 'd'}}, readonly: true},
 		{name: "input EOF", input: declaredAttachInput{eof: true}, pending: true, want: []byte{0x1d}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			isolateDeclaredAttachEnvironment(t)
 			inputs := make(chan declaredAttachInput, 1)
 			inputs <- test.input
 			decoder, err := newDeclaredDetachDecoder(defaultDeclaredDetach)
@@ -205,17 +329,25 @@ func TestDeclaredAttachPumpExplicitDetachAndInputEOFRemainSuccessful(t *testing.
 			}
 			decoder.pending = test.pending
 			attachment := &fakeDeclaredAttachment{readonly: test.readonly}
+			notices := 0
 			err = pumpDeclaredAttachment(context.Background(), attachment, decoder, nil, inputs, nil,
-				func([]byte) error {
-					t.Fatal("local detach wrote output")
+				func(data []byte) error {
+					if !test.notice || string(data) != "\r\n[Citadel session is read-only; input is not forwarded.]\r\n" {
+						t.Fatal("local detach wrote unexpected output")
+					}
+					notices++
 					return nil
 				},
 				func() (uint16, uint16, error) {
 					t.Fatal("local detach resized")
 					return 0, 0, nil
 				})
-			if err != nil || !bytes.Equal(attachment.input, test.want) {
-				t.Fatalf("err=%v forwarded=%q want=%q", err, attachment.input, test.want)
+			wantNotices := 0
+			if test.notice {
+				wantNotices = 1
+			}
+			if err != nil || !bytes.Equal(attachment.input, test.want) || notices != wantNotices {
+				t.Fatalf("err=%v forwarded=%q want=%q notices=%d want=%d", err, attachment.input, test.want, notices, wantNotices)
 			}
 		})
 	}
