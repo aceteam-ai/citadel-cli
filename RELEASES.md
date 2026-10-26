@@ -3287,3 +3287,30 @@ Auto-generated log of every release.
   - feat(worker): desktop job handlers honor the node passcode like SHELL_COMMAND (#1369)
 
 
+---
+
+## v2.202.0 — 2026-10-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 13 |
+| Files changed | 151 |
+| Lines added | +17648 |
+
+**Changes:**
+
+  - test(api): cover cooldown rebuild and unread 404 edges (#1478)
+  - fix(worker): self-heal sustained platform wrong answers (#1479)
+  - fix(api): re-dial stale platform connections after cutovers (#1477)
+  - fix(auth): restore safe denial and enrollment diagnostics (#1467)
+  - fix(auth): discard late device tokens before persistence (#1465)
+  - fix(enrollment): expose unconfirmed device linking safely (#1463)
+  - fix(enrollment): fence retries, registration and managed unit repair (#1462)
+  - fix(worker): acquire lane execution slots in claim order (#1464)
+  - test(worker): fence deadline lane checks on actual retirement (#1461)
+  - docs: reconcile agents wake design with the governed-lane MVP (#1451)
+  - docs: session serve restore-only dependency policy design (#1450)
+  - ci: publish :latest only from main (#1439)
+  - feat(sessions): native declared session holder S1 (#1443)
+
+
