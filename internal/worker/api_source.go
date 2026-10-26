@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
@@ -71,7 +72,8 @@ type APISourceConfig struct {
 	MaxAttempts int
 
 	// DebugFunc is an optional callback for debug logging
-	DebugFunc func(format string, args ...any)
+	DebugFunc        func(format string, args ...any)
+	PlatformObserver platformhttp.Observer
 
 	// LogFn is an optional callback for logging (if nil, prints to stdout)
 	LogFn func(level, msg string)
@@ -136,9 +138,10 @@ func (s *APISource) Connect(ctx context.Context) error {
 	}
 
 	client := redisapi.NewClient(redisapi.ClientConfig{
-		BaseURL:   s.config.BaseURL,
-		Token:     s.config.Token,
-		DebugFunc: s.config.DebugFunc,
+		BaseURL:          s.config.BaseURL,
+		Token:            s.config.Token,
+		DebugFunc:        s.config.DebugFunc,
+		PlatformObserver: s.config.PlatformObserver,
 	})
 
 	// Verify connection before retaining the client.

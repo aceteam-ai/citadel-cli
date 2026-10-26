@@ -3,6 +3,7 @@
 package platformhttp
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -30,8 +31,9 @@ type Options struct {
 	FailureThreshold int
 	Logf             func(string, ...any)
 	// Debugf receives per-dial diagnostics. Nil keeps normal/TUI output quiet.
-	Debugf func(string, ...any)
-	Now    func() time.Time
+	Debugf  func(string, ...any)
+	Now     func() time.Time
+	Observe Observer
 }
 
 type generation struct {
@@ -59,6 +61,7 @@ type Transport struct {
 	threshold           int
 	logf                func(string, ...any)
 	debugf              func(string, ...any)
+	observer            Observer
 	now                 func() time.Time
 }
 
@@ -76,7 +79,7 @@ func WithTransport(baseURL string, client *http.Client) *http.Client {
 		copy.Transport = New(baseURL, Options{BaseTransport: base})
 	case *Transport:
 		if base.template != nil && base.origin != configuredOrigin(baseURL) {
-			copy.Transport = New(baseURL, Options{BaseTransport: base.template, MaxAge: base.maxAge, FailureThreshold: base.threshold, Logf: base.logf, Debugf: base.debugf, Now: base.now})
+			copy.Transport = New(baseURL, Options{BaseTransport: base.template, MaxAge: base.maxAge, FailureThreshold: base.threshold, Logf: base.logf, Debugf: base.debugf, Now: base.now, Observe: base.observer})
 		}
 	}
 	return &copy
@@ -118,7 +121,7 @@ func New(baseURL string, opts Options) *Transport {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	t := &Transport{template: template, origin: configuredOrigin(baseURL), maxAge: opts.MaxAge, threshold: opts.FailureThreshold, logf: opts.Logf, debugf: opts.Debugf, now: opts.Now}
+	t := &Transport{template: template, origin: configuredOrigin(baseURL), maxAge: opts.MaxAge, threshold: opts.FailureThreshold, logf: opts.Logf, debugf: opts.Debugf, now: opts.Now, observer: opts.Observe}
 	t.current = t.fresh("initial")
 	return t
 }
@@ -180,10 +183,14 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}}
 	request := req.Clone(httptrace.WithClientTrace(req.Context(), trace))
 	resp, err := g.pool.RoundTrip(request)
+	observedAt := t.now()
 	peerMu.Lock()
 	ip := peer
 	peerMu.Unlock()
 	if err != nil {
+		if tracked && req.Context().Err() != context.Canceled {
+			t.notify(g, Observation{At: observedAt, Outcome: HTTPUnavailable})
+		}
 		if tracked && req.Context().Err() == nil {
 			t.observe(g, true, "network_failure", ip, path)
 		}
@@ -194,9 +201,18 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	failed := resp.StatusCode == http.StatusNotFound || (resp.StatusCode >= 500 && resp.StatusCode < 600)
 	serverError := resp.StatusCode >= 500 && resp.StatusCode < 600
+	if resp.StatusCode == http.StatusTooManyRequests {
+		t.notify(g, Observation{At: observedAt, Outcome: HTTPOther, Status: resp.StatusCode})
+	}
 	if serverError || (failed && resp.Body == nil) {
+		t.notify(g, Observation{At: observedAt, Outcome: HTTPWrongAnswer, Status: resp.StatusCode})
 		t.observe(g, true, "http_"+strconv.Itoa(resp.StatusCode), ip, path)
 	} else if resp.StatusCode < 400 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+		outcome := HTTPOther
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			outcome = HTTPHealthy
+		}
+		t.notify(g, Observation{At: observedAt, Outcome: outcome, Status: resp.StatusCode})
 		t.observe(g, false, "", ip, path)
 	}
 	// Authorization-refusal bodies are deliberately never read or retained by
@@ -208,7 +224,10 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp.Body = &observedBody{ReadCloser: resp.Body, finish: func(sample []byte, complete bool) {
 			if !complete && len(sample) == 0 {
 				if failed {
+					t.notify(g, Observation{At: observedAt, Outcome: HTTPWrongAnswer, Status: resp.StatusCode})
 					t.observe(g, true, "http_404", ip, path)
+				} else if resp.StatusCode != http.StatusTooManyRequests {
+					t.notify(g, Observation{At: observedAt, Outcome: HTTPOther, Status: resp.StatusCode})
 				}
 				return
 			}
@@ -220,10 +239,60 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			if failed && !mismatch {
 				reason = "http_404"
 			}
+			outcome := HTTPOther
+			if failed || mismatch {
+				outcome = HTTPWrongAnswer
+			}
+			if resp.StatusCode != http.StatusTooManyRequests {
+				t.notify(g, Observation{At: observedAt, Outcome: outcome, Status: resp.StatusCode})
+			}
 			t.observe(g, failed || mismatch, reason, ip, path)
 		}}
 	}
 	return resp, nil
+}
+
+func (t *Transport) notify(g *generation, o Observation) {
+	if t.observer == nil {
+		return
+	}
+	if o.Outcome == HTTPWrongAnswer {
+		t.mu.Lock()
+		current := t.current == g
+		t.mu.Unlock()
+		if !current {
+			return
+		} // Retired responses cannot prove a fresh pool failed.
+	}
+	t.observer(o)
+}
+
+// ForceRedial is the first self-heal action. Like ordinary rotation it retires
+// the pool, including busy HTTP/2 reuse, without cancelling or replaying work.
+func (t *Transport) ForceRedial() {
+	if t.passthrough != nil {
+		t.CloseIdleConnections()
+		return
+	}
+	t.mu.Lock()
+	old := t.current
+	remote := old.remoteIP()
+	t.current = t.fresh("self_heal_platform_failure")
+	t.hasFailureRotation, t.lastFailureRotation = true, t.now()
+	t.mu.Unlock()
+	old.pool.CloseIdleConnections()
+	t.redial("self_heal_platform_failure", remote)
+}
+
+func RedialClient(client *http.Client) {
+	if client == nil {
+		return
+	}
+	if t, ok := client.Transport.(*Transport); ok {
+		t.ForceRedial()
+		return
+	}
+	client.CloseIdleConnections()
 }
 
 // observe ignores late responses from retired pools, so one old in-flight
