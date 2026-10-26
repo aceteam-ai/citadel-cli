@@ -56,6 +56,11 @@ var statusCmd = &cobra.Command{
 It checks network connectivity, system vitals (CPU, RAM, Disk), GPU status,
 and the state of all managed services.
 
+Device-link verification is display-only and uses one bounded API observation.
+Servers without this capability or access to their coordination server remain
+unverified. Credentials issued before verification require fresh enrollment
+to become verifiable; no grants are repaired automatically.
+
 The Backend: line reports whether this node's durable heartbeat write is
 reaching the AceTeam control plane (reachable/degraded/DOWN/unknown). Note:
 in direct-Redis mode this measures reachability of redis.aceteam.ai, not the
@@ -89,7 +94,7 @@ backend.`,
 
 // runJSONStatus outputs status data as JSON
 func runJSONStatus() {
-	data, err := gatherStatusData()
+	data, err := gatherInitialStatusData()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to gather status: %v\n", err)
 		os.Exit(1)
@@ -134,6 +139,9 @@ func runStandardStatus() {
 
 	headerColor.Fprintln(w, "\n🌐 NETWORK STATUS")
 	printNetworkInfo(w, manifest)
+	// Reuse the existing network probe's live identity; the warning lookup
+	// itself never reconnects or reads saved identity as proof.
+	printDeviceLinkDiagnostic(w, getDeviceConfigFromFile())
 	printPeerInfo(w)
 
 	// Only show Job Queue section if configured
@@ -152,7 +160,6 @@ func runStandardStatus() {
 // worker, and enriches the line with the recorded PID / version. Read-only: it
 // never touches the lock (IsHeld probes on a separate fd and unlocks immediately).
 func printWorkerInfo(w io.Writer) {
-	printDeviceLinkDiagnostic(w, getDeviceConfigFromFile())
 	stateDir := network.GetStateDir()
 	held, pid := worklock.IsHeld(stateDir)
 	if !held {
@@ -425,13 +432,26 @@ func parsePubSubTransport(body []byte) (string, pubSubProbeState) {
 // runInteractiveDashboard runs the interactive TUI dashboard
 func runInteractiveDashboard() {
 	// Gather initial data
-	data, _ := gatherStatusData()
+	data, _ := gatherInitialStatusData()
 
 	// Run the tview dashboard with refresh callback
 	if err := dashboard.RunTviewDashboard(data, gatherStatusData); err != nil {
 		fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// Initial status observes once, immediately before returning this render's
+// data. Refreshes keep using the offline collector and do not reuse proof.
+func gatherInitialStatusData() (dashboard.StatusData, error) {
+	data, err := gatherStatusData()
+	if err == nil {
+		data.DeviceLinkState, data.DeviceLinkDetail = "", ""
+		if detail := observeDeviceLinkDiagnostic(context.Background(), getDeviceConfigFromFile(), defaultDeviceLinkObservation()); detail != "" {
+			data.DeviceLinkState, data.DeviceLinkDetail = "unverified", detail
+		}
+	}
+	return data, err
 }
 
 // gatherStatusData collects all status data for the dashboard

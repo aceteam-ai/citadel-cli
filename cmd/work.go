@@ -941,7 +941,6 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
-		printDeviceLinkDiagnostic(os.Stderr, deviceConfig)
 		Debug("using API mode (device_api_token found)")
 		useAPIMode = true
 
@@ -1197,12 +1196,18 @@ func runWork(cmd *cobra.Command, args []string) {
 	} else {
 		Log("network not configured (no saved state)")
 	}
+	// Display only, once after live mesh identity resolution; never on the
+	// heartbeat/retry path and never a condition for starting the worker.
+	if useAPIMode {
+		printDeviceLinkDiagnosticContext(ctx, os.Stderr, deviceConfig)
+	}
 	// Publish one immutable provider bundle after transport selection, before
 	// session control can read it. Heartbeat and optional status consumers below
 	// reuse these exact function values; later runner/swap initialization is
 	// observed through the existing atomic pointers rather than callback writes.
 	sessionProviders := newWorkSessionProviders(workerState, &nodeSwapManager, &nodeRunner, pubSubTransportFn)
 	workerLivenessFn, swapStatsFn, laneActivityFn := sessionProviders.Worker, sessionProviders.Swap, sessionProviders.Lanes
+
 
 	// Publish S2 session status/stop only from the process that owns the
 	// single-instance worker lock. The machine-wide TUN socket belongs to
