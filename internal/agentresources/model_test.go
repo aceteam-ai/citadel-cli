@@ -43,6 +43,134 @@ func requireNoPlan(t *testing.T, plan Plan, err error, reason HoldReason) *Hold 
 	return requireHold(t, err, reason)
 }
 
+func TestContextMustBindSnapshotEvenWhenDiskEvidenceAgrees(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*Context)
+	}{
+		{"older revision", func(c *Context) { c.Revision-- }},
+		{"future revision", func(c *Context) { c.Revision++ }},
+		{"empty round", func(c *Context) { c.Round = "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy, snapshot, context, evidence := fixture()
+			if err := EvaluateDisk(policy, snapshot, context, evidence); err != nil {
+				t.Fatal("valid context control refused", err)
+			}
+			test.change(&context)
+			// Keep the request and evidence identical: the evidence equality
+			// guard cannot hide a missing snapshot-revision or round check.
+			evidence.Context = context
+			requireHold(t, EvaluateDisk(policy, snapshot, context, evidence), StaleEvidence)
+			plan, err := PlanReserve(policy, snapshot, context, evidence, WorktreeRef{ID: "tree-b", Filesystem: "worktree-fs"})
+			requireNoPlan(t, plan, err, StaleEvidence)
+		})
+	}
+}
+
+func TestReserveRefusesOccupiedWorktreeWithSpareCapacity(t *testing.T) {
+	for _, phase := range []Phase{Reserved, Creating, CreateUnknown, Idle, InUse, CleanupPending, CleanupUnknown} {
+		t.Run(string(phase), func(t *testing.T) {
+			policy, snapshot, context, evidence := fixture()
+			snapshot.Allocations[0].Phase = phase
+			if phase == InUse {
+				snapshot.Allocations[0].Custody = Active
+			}
+			if phase == CleanupPending || phase == CleanupUnknown {
+				snapshot.Allocations[0].CleanupAttempt = snapshot.Revision
+			}
+			// One allocation in a two-slot pool: PoolFull must not mask the
+			// occupied-reference guard, including while custody is active.
+			control, err := PlanReserve(policy, snapshot, context, evidence, WorktreeRef{ID: "tree-b", Filesystem: "worktree-fs"})
+			if err != nil || len(control.Next.Allocations) != 2 {
+				t.Fatal("distinct worktree control refused despite spare capacity", err)
+			}
+			plan, err := PlanReserve(policy, snapshot, context, evidence, snapshot.Allocations[0].Worktree)
+			requireNoPlan(t, plan, err, InvalidTransition)
+		})
+	}
+}
+
+func TestReserveRefusesForeignFilesystemWithOtherwiseValidReference(t *testing.T) {
+	policy, snapshot, context, evidence := fixture()
+	worktree := WorktreeRef{ID: "tree-b", Filesystem: policy.Filesystems.Worktree}
+	if _, err := PlanReserve(policy, snapshot, context, evidence, worktree); err != nil {
+		t.Fatal("configured filesystem control refused", err)
+	}
+	worktree.Filesystem = "foreign-fs"
+	plan, err := PlanReserve(policy, snapshot, context, evidence, worktree)
+	requireNoPlan(t, plan, err, InvalidTransition)
+}
+
+func TestSnapshotRequiresSortedDistinctAllocationIDs(t *testing.T) {
+	policy, snapshot, context, evidence := fixture()
+	snapshot.NextAllocationID = 3
+	snapshot.Allocations = append(snapshot.Allocations, Allocation{
+		ID: 2, Worktree: WorktreeRef{ID: "tree-b", Filesystem: "worktree-fs"}, Phase: Idle, Custody: Inactive,
+	})
+	if err := Validate(policy, snapshot); err != nil {
+		t.Fatal("sorted distinct ID control refused", err)
+	}
+	// IDs and worktrees remain unique and below the counter; only ordering
+	// is invalid. A duplicate-ID fixture cannot isolate this guard.
+	snapshot.Allocations[0], snapshot.Allocations[1] = snapshot.Allocations[1], snapshot.Allocations[0]
+	requireHold(t, Validate(policy, snapshot), InvalidSnapshot)
+	plan, err := PlanReserve(policy, snapshot, context, evidence, WorktreeRef{ID: "tree-c", Filesystem: "worktree-fs"})
+	requireNoPlan(t, plan, err, InvalidSnapshot)
+}
+
+func TestSnapshotRefusesCleanupAttemptFromFutureRevision(t *testing.T) {
+	for _, phase := range []Phase{CleanupPending, CleanupUnknown} {
+		t.Run(string(phase), func(t *testing.T) {
+			policy, snapshot, context, evidence := fixture()
+			snapshot.Allocations[0].Phase = phase
+			snapshot.Allocations[0].CleanupAttempt = snapshot.Revision
+			if err := Validate(policy, snapshot); err != nil {
+				t.Fatal("current cleanup attempt control refused", err)
+			}
+			snapshot.Allocations[0].CleanupAttempt++
+			requireHold(t, Validate(policy, snapshot), InvalidSnapshot)
+			plan, err := PlanReserve(policy, snapshot, context, evidence, WorktreeRef{ID: "tree-b", Filesystem: "worktree-fs"})
+			requireNoPlan(t, plan, err, InvalidSnapshot)
+		})
+	}
+}
+
+func TestCleanupUncertaintyMustMatchExactPendingAttempt(t *testing.T) {
+	policy, snapshot, context, _ := fixture()
+	pending, err := PlanBeginCleanup(policy, snapshot, context, cleanupProof(snapshot, context))
+	if err != nil {
+		t.Fatal("fixture could not begin cleanup", err)
+	}
+	context.Revision = pending.Next.Revision
+	allocation := pending.Next.Allocations[0]
+	for _, attempt := range []uint64{0, allocation.CleanupAttempt - 1, allocation.CleanupAttempt + 1} {
+		plan, err := PlanCleanupUncertain(policy, pending.Next, context, allocation.ID, attempt)
+		requireNoPlan(t, plan, err, InvalidTransition)
+		if pending.Next.Allocations[0] != allocation {
+			t.Fatal("mismatched attempt changed the pending allocation")
+		}
+	}
+	control, err := PlanCleanupUncertain(policy, pending.Next, context, allocation.ID, allocation.CleanupAttempt)
+	if err != nil || len(control.Next.Allocations) != 1 || control.Next.Allocations[0].Phase != CleanupUnknown ||
+		control.Next.Allocations[0].CleanupAttempt != allocation.CleanupAttempt {
+		t.Fatal("exact pending attempt control lost custody or was refused", err)
+	}
+}
+
+func TestIDsRefuseSeparatorsAndLeadingDotsButPermitOpaqueColons(t *testing.T) {
+	for _, value := range []string{"/", "..", ".hidden", "tree/path"} {
+		if validID(value) {
+			t.Fatalf("invalid opaque ID accepted: %q", value)
+		}
+	}
+	for _, value := range []string{"tree-a", "a.b_c-d", "host:pool", "C:stream"} {
+		if !validID(value) {
+			t.Fatalf("valid opaque ID refused: %q", value)
+		}
+	}
+}
+
 func TestFloorRequiresExplicitUnitsAndCheckedFortyOrGreaterAmount(t *testing.T) {
 	for _, test := range []struct {
 		floor Floor

@@ -12,6 +12,10 @@ It is not a committed reservation or permission to perform a native action.
 `Policy` requires exact, bounded host/pool/configuration IDs, a positive finite
 pool cap and all three repository/worktree/state filesystem IDs. IDs have one
 case-sensitive ASCII representation; they are opaque references, not paths.
+IDs must never be joined into filesystem paths. A non-leading `:` is allowed
+in an ID, including values that resemble Windows drive or alternate-stream
+syntax; validation does not make them safe path components. A future native
+adapter must separately prove real path ownership, containment and symlink safety.
 The model does not establish physical identity, canonical filesystem aliases,
 ownership or the truth of a supplied configuration. Those need separate adapters.
 
