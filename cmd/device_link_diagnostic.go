@@ -95,6 +95,9 @@ func observeDeviceLinkDiagnostic(parent context.Context, dc *DeviceConfig, obser
 	if observation.config == nil || observation.liveMesh == nil || observation.controlURL == nil || observation.defaultURL == nil || observation.lookup == nil {
 		return deviceLinkUnverified
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
 	ctx, cancel := context.WithTimeout(parent, nexus.CurrentDeviceBindingTimeout)
 	defer cancel()
 	captured := *dc

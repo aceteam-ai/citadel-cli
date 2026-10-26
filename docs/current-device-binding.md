@@ -86,6 +86,17 @@ evidence for the eventual draft head. The paired server's independent review
 must settle its wire contract before the client push. Source review/CI do not
 prove deployment, live fleet acceptance, server availability or native safety.
 
+## Remaining platform namespace limitation
+
+The local control URL is not bound to the platform that issued the device
+credential. For example, after logout and a separate authkey login to another
+Headscale, the retained platform bearer and a coincidentally equal numeric node
+ID can still suppress the warning. Live-versus-resolved URL agreement does not
+close that cross-platform gap. The server must echo a control-plane identity in
+the confirmed response, and the client must compare it with the captured live
+namespace. That paired contract change is follow-up work to Aceteam #12443.
+This display observation remains unsuitable as authorization evidence.
+
 ## Release ordering
 
 Ship this client only after Aceteam #12443 is live. Old middleware may return 403

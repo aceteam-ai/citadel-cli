@@ -170,6 +170,19 @@ func TestDeviceBindingRequiresLiveAndResolvedControlPlaneAgreementBeforeHTTP(t *
 	}
 }
 
+func TestDeviceBindingDiagnosticAcceptsNilCommandContext(t *testing.T) {
+	dc, observation, calls := deviceBindingObservationFixture(t)
+	command := &cobra.Command{}
+	if command.Context() != nil {
+		t.Fatal("direct Run fixture unexpectedly has a context")
+	}
+	var output bytes.Buffer
+	printDeviceLinkDiagnosticWith(command.Context(), &output, dc, observation)
+	if output.Len() != 0 || *calls != 1 {
+		t.Fatal("nil command context lost the bounded verified observation")
+	}
+}
+
 func TestDeviceBindingDiagnosticUsesCancelledCommandContext(t *testing.T) {
 	dc, observation, calls := deviceBindingObservationFixture(t)
 	command := &cobra.Command{}
