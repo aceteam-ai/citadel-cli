@@ -123,6 +123,11 @@ func (w *videoComposeMP4Walker) movie(start, end int64, parent string, depth int
 		if err != nil {
 			return err
 		}
+		// Chapter references can change a track's role after sample parsing.
+		// Refuse the dispatched leaf at every movie/sample/wave depth.
+		if box.kind == "chap" {
+			return fmt.Errorf("unsupported_chapter_reference")
+		}
 		if parent == "" {
 			if offset == 0 && box.kind != "ftyp" {
 				return fmt.Errorf("chapter must start with MP4 ftyp, not a manifest")

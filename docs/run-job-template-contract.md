@@ -263,7 +263,11 @@ levels and a 16 MiB movie box, without reading media payloads. The preflight is
 not a codec bitstream validator. The walker enters dispatched sample-table,
 edit-list and track-reference containers (`stbl`, `edts`, `tref`), and refuses
 unsupported fragment/encryption/compressed-container roles rather than treating
-their children as opaque. Every MP4 probe and decode additionally forces the MOV
+their children as opaque. Dispatched containers are closed: each is walked at
+its legal parent or refused. Ordinary opaque leaves retain their existing
+handling. The role-changing leaves `wfex` and `chap` are explicitly refused;
+chapter-reference `chap` is refused at every movie, sample-entry and wave depth.
+Every MP4 probe and decode additionally forces the MOV
 demuxer and MOV format whitelist with `enable_drefs=0` and
 `use_absolute_path=0`; returned container metadata must match the MOV family.
 Future disclosure rendering must use the same pinned input options. The

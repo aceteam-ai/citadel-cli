@@ -70,6 +70,59 @@ func TestVideoComposeCameraMetadataCannotHideInDispatchedContainers(t *testing.T
 	}
 }
 
+func TestVideoComposeCameraRejectsChapterReferencesAtEveryWalkedRole(t *testing.T) {
+	root := t.TempDir()
+	for _, key := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"} {
+		t.Setenv(key, root)
+	}
+	// A complete 12-byte chapter-reference leaf pointing at track one.
+	// These are structural fixtures, not encoded or playable camera media.
+	chap := videoComposeTestBox("chap", []byte{0, 0, 0, 1})
+	for _, parent := range []string{"mdia", "minf", "dinf", "stbl", "edts", "tref"} {
+		t.Run(parent, func(t *testing.T) {
+			if err := cameraMP4Validate(t, cameraMP4OrdinaryContainerFixture(t, parent)); err != nil {
+				t.Fatal("ordinary-container control refused before chapter reference", err)
+			}
+			cameraMP4RequireReason(t, cameraMP4OrdinaryContainerFixture(t, parent, chap), "unsupported_chapter_reference")
+		})
+	}
+	for _, parent := range []string{"top", "moov", "trak"} {
+		t.Run(parent, func(t *testing.T) {
+			if err := cameraMP4Validate(t, cameraMP4Fixture("qt  ", parent)); err != nil {
+				t.Fatal("movie-role control refused before chapter reference", err)
+			}
+			cameraMP4RequireReason(t, cameraMP4Fixture("qt  ", parent, chap), "unsupported_chapter_reference")
+		})
+	}
+	for _, handler := range []string{"vide", "soun"} {
+		t.Run(handler+" sample entry", func(t *testing.T) {
+			entry := func(children ...[]byte) []byte { return cameraMP4VisualEntry("avc1", children...) }
+			if handler == "soun" {
+				entry = func(children ...[]byte) []byte { return cameraMP4AudioEntry("mp4a", 0, children...) }
+			}
+			if err := cameraMP4Validate(t, cameraMP4SampleFixture(handler, cameraMP4STSD(entry()))); err != nil {
+				t.Fatal("sample-entry control refused before chapter reference", err)
+			}
+			cameraMP4RequireReason(t, cameraMP4SampleFixture(handler, cameraMP4STSD(entry(chap))), "unsupported_chapter_reference")
+		})
+	}
+	t.Run("audio wave", func(t *testing.T) {
+		frma := videoComposeTestBox("frma", []byte("mp4a"))
+		baseline := cameraMP4SampleFixture("soun", cameraMP4STSD(cameraMP4AudioEntry("mp4a", 0, videoComposeTestBox("wave", frma))))
+		if err := cameraMP4Validate(t, baseline); err != nil {
+			t.Fatal("aligned wave control refused before chapter reference", err)
+		}
+		poisoned := cameraMP4SampleFixture("soun", cameraMP4STSD(cameraMP4AudioEntry("mp4a", 0, videoComposeTestBox("wave", frma, chap))))
+		cameraMP4RequireReason(t, poisoned, "unsupported_chapter_reference")
+	})
+	// Opaque text payloads are not dispatched box lists. This guard rejects
+	// structural roles, without byte-scanning harmless lookalike text.
+	text := videoComposeTestBox("udta", videoComposeTestBox("\xa9mak", chap))
+	if err := cameraMP4Validate(t, cameraMP4Fixture("qt  ", "moov", text)); err != nil {
+		t.Fatal("opaque reviewed text was scanned for chapter-reference bytes", err)
+	}
+}
+
 func TestVideoComposeCameraMetadataParentGateCoversEveryWalkedTrackRole(t *testing.T) {
 	for _, parent := range []string{"mdia", "minf", "dinf"} {
 		for _, kind := range []string{"meta", "udta"} {
