@@ -109,6 +109,79 @@ func tenInactive(t *testing.T) (Policy, Snapshot) {
 	return policy, snapshot
 }
 
+func TestRoundMustAdvanceEvenWhenAllObservationBindingsAgree(t *testing.T) {
+	for _, round := range []uint64{1, 2} {
+		policy, snapshot := fixture()
+		snapshot.LastRound = 2
+		ctx := contextFor(snapshot, 0)
+		if _, err := PlanReserve(policy, snapshot, ctx, "a"); err != nil {
+			t.Fatal("fresh round control refused", err)
+		}
+		ctx.Binding.Round = round
+		ctx.Clock.Binding, ctx.Store.Binding = ctx.Binding, ctx.Binding
+		// Revision, scope, epoch and continuity remain current. Neither
+		// observation equality nor the zero-round check can mask this guard.
+		plan, err := PlanReserve(policy, snapshot, ctx, "a")
+		reject(t, plan, err, HoldBinding)
+	}
+}
+
+func TestCanonicalIDsRejectDotAndDotDotWithoutPathNormalization(t *testing.T) {
+	for _, id := range []string{".", ".."} {
+		if canonicalID(id) {
+			t.Fatalf("dot-only identifier accepted: %q", id)
+		}
+	}
+	// These are opaque IDs, not safe path components or command arguments.
+	// Their currently permitted spelling must not be silently normalized.
+	for _, id := range []string{"...", "-lane", "host-a"} {
+		if !canonicalID(id) {
+			t.Fatalf("permitted opaque identifier refused: %q", id)
+		}
+	}
+}
+
+func TestUncertainAndStopTransitionsRejectMismatchedReservations(t *testing.T) {
+	for _, transition := range []struct {
+		name      string
+		stopping  bool
+		plan      func(Policy, Snapshot, Context, Reservation) (Plan, error)
+		wantPhase Phase
+	}{
+		{"attempt uncertain", false, PlanAttemptUncertain, AttemptUnknown},
+		{"stop uncertain", true, PlanStopUncertain, StopUnknown},
+		{"request stop", false, PlanRequestStop, Stopping},
+	} {
+		t.Run(transition.name, func(t *testing.T) {
+			policy, snapshot := fixture()
+			ref := Reservation{LaneID: "a", ReservationID: 1}
+			snapshot = attempt(t, policy, reserve(t, policy, snapshot, 0, "a"), 0, ref)
+			if transition.stopping {
+				snapshot = stop(t, policy, snapshot, 0, ref)
+			}
+			ctx := contextFor(snapshot, 0)
+			before := snapshot.Lanes[0].Charges[0]
+			for _, bad := range []Reservation{
+				{LaneID: "missing", ReservationID: ref.ReservationID},
+				{LaneID: "b", ReservationID: ref.ReservationID},
+				{LaneID: "a", ReservationID: snapshot.NextID},
+				{LaneID: "a", ReservationID: 0},
+			} {
+				plan, err := transition.plan(policy, snapshot, ctx, bad)
+				reject(t, plan, err, HoldReservation)
+				if snapshot.Lanes[0].Charges[0] != before {
+					t.Fatal("reservation mismatch changed another turn's custody")
+				}
+			}
+			plan, err := transition.plan(policy, snapshot, ctx, ref)
+			next := accept(t, policy, snapshot, plan, err)
+			if next.Lanes[0].Charges[0].Phase != transition.wantPhase {
+				t.Fatal("exact reservation control did not make the intended transition")
+			}
+		})
+	}
+}
+
 func TestChargePrecedesOneShotAttemptAndUncertaintyNeverRefunds(t *testing.T) {
 	policy, snapshot := fixture()
 	charged := reserve(t, policy, snapshot, 0, "a")

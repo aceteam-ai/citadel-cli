@@ -10,6 +10,15 @@ does not complete the governed-lane supervisor.
 
 ## One aggregate and explicit policy
 
+The current [#1442 scope, item 2](https://github.com/aceteam-ai/citadel-cli/issues/1442)
+states: "at most 10 automatic turns per day per lane, 30 minutes per turn, one
+turn at a time;". This model applies rolling quota and occupied custody per lane
+within one host/pool record. It does not impose a separate host-wide ten-turn
+cap or serialize native turns across different lanes. With 64 enabled lanes,
+up to 640 reservations can be charged across the pool in a rolling day. That
+accounting bound is not native execution authority; a stronger host-wide
+serialization policy would require separately reviewed design and integration.
+
 All lanes share one host/pool-wide snapshot, revision and monotonic ID counter.
 The future canonical storage key must be **host plus pool only**. Configuration,
 lane, clock epoch and restart identity must never select a fresh ledger. Exact
