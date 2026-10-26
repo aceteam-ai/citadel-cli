@@ -143,6 +143,7 @@ func (s *APISource) Connect(ctx context.Context) error {
 
 	// Verify connection before retaining the client.
 	if err := client.Ping(ctx); err != nil {
+		_ = client.Close()
 		return fmt.Errorf("failed to connect to Redis API: %w", err)
 	}
 	s.client = client

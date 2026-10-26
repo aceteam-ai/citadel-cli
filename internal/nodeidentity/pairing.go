@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // PairingStartRequest is the additive-cert-aware body posted to
@@ -87,7 +89,7 @@ func (s *Store) StoreLeafFromStatus(resp *PairingStatusResponse) (stored bool, e
 // on the pairing/init path must treat any error here as non-fatal.
 func (s *Store) FetchCAChain(ctx context.Context, baseURL string, client *http.Client) error {
 	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+		client = &http.Client{Timeout: 15 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{})}
 	}
 	url := baseURL + "/api/fabric/ca/chain"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
