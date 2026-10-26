@@ -2879,17 +2879,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// shared workerState and, on a clear loss of forward progress, exits non-zero
 	// so systemd restarts the process clean. No-op if disabled (WORKER_SELF_HEAL).
 	if monitor := worker.NewLivenessMonitor(workerState, runner.IsDraining, func(level, msg string) { Log("%s", msg) }); monitor != nil {
-		if useAPIMode {
-			monitor.SetPlatformRecovery(func() {
-				for _, redial := range platformRedials {
-					redial()
-				}
-			}, func(exit func()) bool {
-				// Match the remote-restart posture: exiting is recovery only
-				// when a service manager will bring this worker back.
-				return managedByServiceManager() && runner.TryIdleRestart(exit)
-			})
-		}
+		bindWorkPlatformRecovery(useAPIMode, monitor, platformRedials, runner.TryIdleRestart)
 		go monitor.Run(ctx)
 	}
 
