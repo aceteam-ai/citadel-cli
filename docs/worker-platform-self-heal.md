@@ -54,6 +54,9 @@ or offline/refusal response after the monitor decision also vetoes exit. The new
 process-exit path also requires the same systemd INVOCATION_ID evidence used
 by remote restart; foreground workers can re-dial without exiting into an
 unmanaged dead process. Existing service Restart=on-failure handles exit 1.
+launchd does not set INVOCATION_ID: macOS workers therefore only re-dial and
+fail safe without a platform-triggered process exit. This does not add launchd
+restart support or alter the existing STALL/STUCK policy.
 
 The local /worker endpoint and heartbeat worker block add platform_ok_at,
 platform_failing_since, platform_last_outcome and platform_last_http_status.

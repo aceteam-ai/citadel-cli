@@ -60,6 +60,88 @@ func TestHealthRequiresTwoFreshWindowsAndBoundedBackoff(t *testing.T) {
 	}
 }
 
+func TestHealthSecondWindowCannotArmBackoffEarly(t *testing.T) {
+	base := time.Unix(1700000000, 0)
+	window := 15 * time.Minute
+	var h Health
+	observeAt(&h, base, HTTPWrongAnswer)
+	observeAt(&h, base.Add(window), HTTPWrongAnswer)
+	if got := h.NextAction(base.Add(window), window, time.Minute); got != RedialPlatform {
+		t.Fatalf("first window: got %v, want redial", got)
+	}
+	// These are NEW responses from after the redial, but none has earned
+	// another full window. Checking only at 2*window hides this distinction.
+	for _, elapsed := range []time.Duration{window + 5*time.Second, window + 65*time.Second, 2*window - time.Nanosecond} {
+		now := base.Add(elapsed)
+		observeAt(&h, now, HTTPWrongAnswer)
+		if got := h.NextAction(now, window, time.Minute); got != NoRecovery {
+			t.Fatalf("at %s: got %v before the second window ended", elapsed, got)
+		}
+		if !h.restartAfter.IsZero() {
+			t.Fatalf("at %s: partial second window armed backoff for %v", elapsed, h.restartAfter)
+		}
+	}
+	secondWindow := base.Add(2 * window)
+	observeAt(&h, secondWindow, HTTPWrongAnswer)
+	if got := h.NextAction(secondWindow, window, time.Minute); got != NoRecovery {
+		t.Fatalf("second window skipped backoff: %v", got)
+	}
+	due := base.Add(31 * time.Minute)
+	if !h.restartAfter.Equal(due) {
+		t.Fatalf("restart deadline = %v, want the 31-minute bound %v", h.restartAfter, due)
+	}
+	observeAt(&h, due.Add(-time.Nanosecond), HTTPWrongAnswer)
+	if got := h.NextAction(due.Add(-time.Nanosecond), window, time.Minute); got != NoRecovery {
+		t.Fatalf("restart before 31 minutes: %v", got)
+	}
+	observeAt(&h, due, HTTPWrongAnswer)
+	if got := h.NextAction(due, window, time.Minute); got != RestartWorker {
+		t.Fatalf("full two windows and backoff: got %v, want restart", got)
+	}
+}
+
+func TestHealthSuccessRequiresNewRedialAtEveryEscalationStage(t *testing.T) {
+	for _, stage := range []string{"redial", "backoff", "decision", "committed"} {
+		t.Run(stage, func(t *testing.T) {
+			base := time.Unix(1700000000, 0)
+			window := 15 * time.Minute
+			var h Health
+			observeAt(&h, base, HTTPWrongAnswer)
+			observeAt(&h, base.Add(window), HTTPWrongAnswer)
+			if h.NextAction(base.Add(window), window, time.Minute) != RedialPlatform {
+				t.Fatal("fixture did not arm redial")
+			}
+			if stage != "redial" {
+				observeAt(&h, base.Add(2*window), HTTPWrongAnswer)
+				if h.NextAction(base.Add(2*window), window, time.Minute) != NoRecovery || h.restartAfter.IsZero() {
+					t.Fatal("fixture did not arm backoff")
+				}
+			}
+			if stage == "decision" || stage == "committed" {
+				due := base.Add(2*window + time.Minute)
+				observeAt(&h, due, HTTPWrongAnswer)
+				if h.NextAction(due, window, time.Minute) != RestartWorker {
+					t.Fatal("fixture did not reserve restart")
+				}
+				if stage == "committed" && !h.CommitRestart(due, func() {}) {
+					t.Fatal("fixture did not commit inert restart")
+				}
+			}
+			reset := base.Add(40 * time.Minute)
+			observeAt(&h, reset, HTTPHealthy)
+			start := reset.Add(time.Second)
+			observeAt(&h, start, HTTPWrongAnswer)
+			if got := h.NextAction(start, window, time.Minute); got != NoRecovery {
+				t.Fatalf("new streak inherited old escalation: %v", got)
+			}
+			observeAt(&h, start.Add(window), HTTPWrongAnswer)
+			if got := h.NextAction(start.Add(window), window, time.Minute); got != RedialPlatform {
+				t.Fatalf("new full window after success: got %v, want a new redial", got)
+			}
+		})
+	}
+}
+
 func TestHealthSuccessOfflineAndOtherHTTPClearEscalation(t *testing.T) {
 	base := time.Unix(1700000000, 0)
 	window := 15 * time.Minute
