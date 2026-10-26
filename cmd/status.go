@@ -77,24 +77,24 @@ backend.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// JSON output mode
 		if statusJSON {
-			runJSONStatus()
+			runJSONStatus(cmd.Context())
 			return
 		}
 
 		// Check if interactive mode requested and available
 		if interactiveUI && tui.ShouldUseInteractive(true, color.NoColor) {
-			runInteractiveDashboard()
+			runInteractiveDashboard(cmd.Context())
 			return
 		}
 
 		// Fall back to standard tabwriter output
-		runStandardStatus()
+		runStandardStatus(cmd.Context())
 	},
 }
 
 // runJSONStatus outputs status data as JSON
-func runJSONStatus() {
-	data, err := gatherInitialStatusData()
+func runJSONStatus(commandCtx context.Context) {
+	data, err := gatherInitialStatusData(commandCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to gather status: %v\n", err)
 		os.Exit(1)
@@ -108,7 +108,7 @@ func runJSONStatus() {
 }
 
 // runStandardStatus displays status using the traditional tabwriter format
-func runStandardStatus() {
+func runStandardStatus(commandCtx context.Context) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	defer w.Flush()
 
@@ -141,7 +141,7 @@ func runStandardStatus() {
 	printNetworkInfo(w, manifest)
 	// Reuse the existing network probe's live identity; the warning lookup
 	// itself never reconnects or reads saved identity as proof.
-	printDeviceLinkDiagnostic(w, getDeviceConfigFromFile())
+	printDeviceLinkDiagnosticContext(commandCtx, w, getDeviceConfigFromFile())
 	printPeerInfo(w)
 
 	// Only show Job Queue section if configured
@@ -430,9 +430,9 @@ func parsePubSubTransport(body []byte) (string, pubSubProbeState) {
 }
 
 // runInteractiveDashboard runs the interactive TUI dashboard
-func runInteractiveDashboard() {
+func runInteractiveDashboard(commandCtx context.Context) {
 	// Gather initial data
-	data, _ := gatherInitialStatusData()
+	data, _ := gatherInitialStatusData(commandCtx)
 
 	// Run the tview dashboard with refresh callback
 	if err := dashboard.RunTviewDashboard(data, gatherStatusData); err != nil {
@@ -443,11 +443,11 @@ func runInteractiveDashboard() {
 
 // Initial status observes once, immediately before returning this render's
 // data. Refreshes keep using the offline collector and do not reuse proof.
-func gatherInitialStatusData() (dashboard.StatusData, error) {
+func gatherInitialStatusData(commandCtx context.Context) (dashboard.StatusData, error) {
 	data, err := gatherStatusData()
 	if err == nil {
 		data.DeviceLinkState, data.DeviceLinkDetail = "", ""
-		if detail := observeDeviceLinkDiagnostic(context.Background(), getDeviceConfigFromFile(), defaultDeviceLinkObservation()); detail != "" {
+		if detail := observeDeviceLinkDiagnostic(commandCtx, getDeviceConfigFromFile(), defaultDeviceLinkObservation()); detail != "" {
 			data.DeviceLinkState, data.DeviceLinkDetail = "unverified", detail
 		}
 	}

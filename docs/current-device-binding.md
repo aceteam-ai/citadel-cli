@@ -9,17 +9,21 @@ grant repair or credential replacement.
 ## One request and independent comparison inputs
 
 The client captures the selected bearer, saved organization, API origin/base
-path and control-plane setting, plus the numeric Headscale ID from live mesh
-status. A hostname, IP, fabric node ID, saved diagnostic identity or earlier
-registration result cannot substitute for live mesh identity. Missing identity
+path and control-plane setting, plus the numeric Headscale ID and ControlURL
+from the same live mesh status sample. The normalized live ControlURL must match
+network.ResolveControlURL() before sending the lookup and again afterwards.
+Normalization trims surrounding whitespace and one trailing slash; host, scheme
+and path differences remain mismatches. A hostname, IP, fabric node ID, saved
+diagnostic identity or earlier registration result cannot substitute for live mesh identity. Missing identity
 keeps the warning without sending the lookup.
 
 GET /api/fabric/device-auth/current-binding has no query, body or caller-selected
 identity parameters. It sends only the current bearer, accepts JSON, requests
 no-store and refuses redirects. A dedicated fresh HTTP/1 transport avoids
 reused-connection replay and platform-transport refusal-body inspection. The
-client performs no retry. The complete observation has a five-second context
-deadline, including input capture and rechecks; HTTP also has a five-second cap.
+client performs no retry. Diagnostic calls inherit their command context so
+cancellation can stop the request. The complete observation has a five-second
+context deadline, including input capture and rechecks; HTTP also has a five-second cap.
 
 Only a bounded 200 application/json response with no-store may be decoded.
 Confirmed requires exactly state, org_id, node and observed_at; node requires
@@ -33,7 +37,9 @@ trailing fields, HTML and responses larger than 4096 bytes remain unknown.
 observed_at must have the server's UTC millisecond shape, but is informational.
 No acceptance decision compares it with the host wall clock or starts a cached
 freshness interval from it. After HTTP, current credential digests, org, origin,
-base path, control-plane setting and live mesh identity are rechecked. Any
+base path and control-plane setting are rechecked, along with the paired live
+mesh ID/ControlURL and freshly resolved control URL. Neither live nor resolved
+control plane may change from the captured namespace. Any
 missing, changed, cancelled or over-budget input keeps the warning.
 
 This is the accepted stateless comparison, not an all-writer transaction or
@@ -49,7 +55,8 @@ credential predating server verification needs fresh browser enrollment, while
 missing permissions or membership can also prevent verification. Per D1,
 existing credentials receive no scope/path backfill and keep the warning until
 re-enrollment. 404/405 report absent server capability. 429, 5xx, redirects,
-transport errors and malformed observations stay unknown. No response bodies,
+transport errors and malformed observations stay unknown. A refused response can
+also mean that the server has not shipped verification yet; re-enrollment cannot add that missing server capability. No response bodies,
 credentials, endpoint values or identity values are added to diagnostic output.
 
 The check runs once for a standard/JSON status invocation after its existing
@@ -78,3 +85,12 @@ Local candidate execution remains held; normal GitHub CI provides execution
 evidence for the eventual draft head. The paired server's independent review
 must settle its wire contract before the client push. Source review/CI do not
 prove deployment, live fleet acceptance, server availability or native safety.
+
+## Release ordering
+
+Ship this client only after Aceteam #12443 is live. Old middleware may return 403
+for the unmapped route before routing, so an old server cannot reliably be
+distinguished from a missing grant by status alone. The display remains
+fail-closed either way; the ordering makes re-enrollment guidance actionable.
+Source review or a merged server PR does not establish that deployment occurred.
+No deployment or live acceptance is authorized by this source change.

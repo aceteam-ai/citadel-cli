@@ -1208,7 +1208,6 @@ func runWork(cmd *cobra.Command, args []string) {
 	sessionProviders := newWorkSessionProviders(workerState, &nodeSwapManager, &nodeRunner, pubSubTransportFn)
 	workerLivenessFn, swapStatsFn, laneActivityFn := sessionProviders.Worker, sessionProviders.Swap, sessionProviders.Lanes
 
-
 	// Publish S2 session status/stop only from the process that owns the
 	// single-instance worker lock. The machine-wide TUN socket belongs to
 	// ipnserver and must never be replaced by this controller.

@@ -54,6 +54,41 @@ func (b *bindingTrackedBody) Read(p []byte) (int, error) {
 }
 func (b *bindingTrackedBody) Close() error { b.closed = true; return nil }
 
+type bindingLargeStream struct {
+	remaining int
+	readBytes int
+	closed    bool
+}
+
+func (b *bindingLargeStream) Read(p []byte) (int, error) {
+	if b.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), b.remaining)
+	for i := range p[:n] {
+		p[i] = ' '
+	}
+	b.remaining -= n
+	b.readBytes += n
+	return n, nil
+}
+
+func (b *bindingLargeStream) Close() error { b.closed = true; return nil }
+
+func TestCurrentBindingStopsReadingLargeStreamAtMemoryBound(t *testing.T) {
+	isolateCurrentBindingHome(t)
+	body := &bindingLargeStream{remaining: 1 << 20}
+	client := &http.Client{Transport: bindingRoundTripper(func(*http.Request) (*http.Response, error) {
+		return bindingResponse(200, body), nil
+	})}
+	if lookupCurrentDeviceBinding(context.Background(), bindingRequest(), client) != BindingUnknown {
+		t.Fatal("oversized generated response was accepted")
+	}
+	if body.readBytes != 4097 || !body.closed || body.remaining == 0 {
+		t.Fatalf("body read was not bounded before allocation: bytes=%d remaining=%d closed=%t", body.readBytes, body.remaining, body.closed)
+	}
+}
+
 func bindingResponse(status int, body io.ReadCloser) *http.Response {
 	return &http.Response{
 		StatusCode: status, Body: body,

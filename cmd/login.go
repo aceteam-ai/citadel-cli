@@ -216,22 +216,22 @@ reusable secret should prefer --authkey-stdin so the key never appears in argv.`
 
 		// Non-interactive mode when authkey is provided
 		if loginAuthkey != "" {
-			runNonInteractiveLogin()
+			runNonInteractiveLogin(cmd.Context())
 			return
 		}
 
 		// Interactive mode. Thread whether --nexus was explicitly set so the
 		// device-auth path can honor the token's nexus when it was not
 		// (citadel-cli#1122).
-		runInteractiveLogin(flagChanged(cmd, "nexus"))
+		runInteractiveLogin(cmd.Context(), flagChanged(cmd, "nexus"))
 	},
 }
 
 // runNonInteractiveLogin handles login with --authkey flag (formerly 'citadel join')
-func runNonInteractiveLogin() {
+func runNonInteractiveLogin(commandCtx context.Context) {
 	// Check if already connected
 	if network.IsGlobalConnected() {
-		printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
+		printDeviceLinkDiagnosticContext(commandCtx, os.Stderr, getDeviceConfigFromFile())
 		fmt.Println("Already connected to the AceTeam Network.")
 		return
 	}
@@ -311,7 +311,7 @@ func runNonInteractiveLogin() {
 // runInteractiveLogin handles the interactive login flow. nexusFlagChanged
 // reports whether --nexus was explicitly set, so the device-auth path can honor
 // the token's nexus when it was not (citadel-cli#1122).
-func runInteractiveLogin(nexusFlagChanged bool) {
+func runInteractiveLogin(commandCtx context.Context, nexusFlagChanged bool) {
 	choice, key, err := selectLoginNetworkChoice(loginNewDevice, nexus.GetNetworkChoice)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
@@ -336,7 +336,7 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 	switch choice {
 	case nexus.NetChoiceVerified:
 		// The GetNetworkChoice function already printed a success message.
-		printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
+		printDeviceLinkDiagnosticContext(commandCtx, os.Stderr, getDeviceConfigFromFile())
 		return
 	case nexus.NetChoiceSkip:
 		fmt.Println("Login skipped.")

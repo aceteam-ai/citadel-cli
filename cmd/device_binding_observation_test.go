@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/spf13/cobra"
 )
 
 func deviceBindingObservationFixture(t *testing.T) (*DeviceConfig, deviceLinkObservation, *int) {
@@ -28,8 +29,11 @@ func deviceBindingObservationFixture(t *testing.T) (*DeviceConfig, deviceLinkObs
 	}
 	calls := 0
 	observation := deviceLinkObservation{
-		config:     func() *DeviceConfig { value := *dc; return &value },
-		liveNodeID: func(context.Context) string { return "42" },
+		config: func() *DeviceConfig { value := *dc; return &value },
+		liveMesh: func(context.Context) deviceLinkMeshIdentity {
+			return deviceLinkMeshIdentity{NodeID: "42", ControlURL: "https://mesh.invalid"}
+		},
+		controlURL: func() string { return "https://mesh.invalid" },
 		defaultURL: func() string { return "https://default.invalid" },
 		lookup: func(ctx context.Context, input nexus.DeviceBindingRequest) nexus.DeviceBindingState {
 			calls++
@@ -57,7 +61,7 @@ func TestDeviceBindingOnlyVerifiedObservationSuppressesWarning(t *testing.T) {
 			return state
 		}
 		var output bytes.Buffer
-		printDeviceLinkDiagnosticWith(&output, dc, observation)
+		printDeviceLinkDiagnosticWith(context.Background(), &output, dc, observation)
 		if (output.Len() == 0) != (state == nexus.BindingConfirmed) || *calls != 1 {
 			t.Fatalf("state=%v warning=%t calls=%d", state, output.Len() != 0, *calls)
 		}
@@ -85,10 +89,26 @@ func TestDeviceBindingLateInputChangesCannotSuppressWarning(t *testing.T) {
 		{"control plane changed", func(dc *DeviceConfig, _ *deviceLinkObservation) { dc.NexusURL = "https://other-mesh.invalid" }},
 		{"credential removed", func(_ *DeviceConfig, o *deviceLinkObservation) { o.config = func() *DeviceConfig { return nil } }},
 		{"live mesh changed", func(_ *DeviceConfig, o *deviceLinkObservation) {
-			o.liveNodeID = func(context.Context) string { return "43" }
+			o.liveMesh = func(context.Context) deviceLinkMeshIdentity {
+				return deviceLinkMeshIdentity{NodeID: "43", ControlURL: "https://mesh.invalid"}
+			}
 		}},
 		{"live mesh lost", func(_ *DeviceConfig, o *deviceLinkObservation) {
-			o.liveNodeID = func(context.Context) string { return "" }
+			o.liveMesh = func(context.Context) deviceLinkMeshIdentity { return deviceLinkMeshIdentity{} }
+		}},
+		{"live control plane changed with same ID", func(_ *DeviceConfig, o *deviceLinkObservation) {
+			o.liveMesh = func(context.Context) deviceLinkMeshIdentity {
+				return deviceLinkMeshIdentity{NodeID: "42", ControlURL: "https://other-mesh.invalid"}
+			}
+		}},
+		{"resolved control plane changed", func(_ *DeviceConfig, o *deviceLinkObservation) {
+			o.controlURL = func() string { return "https://other-mesh.invalid" }
+		}},
+		{"both control planes changed with same ID", func(_ *DeviceConfig, o *deviceLinkObservation) {
+			o.controlURL = func() string { return "https://other-mesh.invalid" }
+			o.liveMesh = func(context.Context) deviceLinkMeshIdentity {
+				return deviceLinkMeshIdentity{NodeID: "42", ControlURL: "https://other-mesh.invalid"}
+			}
 		}},
 		{"default origin changed", func(_ *DeviceConfig, o *deviceLinkObservation) {
 			o.defaultURL = func() string { return "https://new-default.invalid" }
@@ -110,7 +130,8 @@ func TestDeviceBindingLateInputChangesCannotSuppressWarning(t *testing.T) {
 			// observer itself receives a stable copy of its dependencies.
 			dynamic := observation
 			dynamic.config = func() *DeviceConfig { return observation.config() }
-			dynamic.liveNodeID = func(ctx context.Context) string { return observation.liveNodeID(ctx) }
+			dynamic.liveMesh = func(ctx context.Context) deviceLinkMeshIdentity { return observation.liveMesh(ctx) }
+			dynamic.controlURL = func() string { return observation.controlURL() }
 			dynamic.defaultURL = func() string { return observation.defaultURL() }
 			if detail := observeDeviceLinkDiagnostic(context.Background(), &initial, dynamic); detail == "" || *calls != 1 {
 				t.Fatalf("late %s change retained confirmation or retried lookup", change.name)
@@ -119,10 +140,53 @@ func TestDeviceBindingLateInputChangesCannotSuppressWarning(t *testing.T) {
 	}
 }
 
+func TestDeviceBindingRequiresLiveAndResolvedControlPlaneAgreementBeforeHTTP(t *testing.T) {
+	for _, test := range []struct {
+		name, live, resolved string
+		verified             bool
+	}{
+		{"matching", "https://mesh.invalid", "https://mesh.invalid", true},
+		{"normalized", "  https://mesh.invalid/ ", "https://mesh.invalid", true},
+		{"different namespace same numeric ID", "https://other-mesh.invalid", "https://mesh.invalid", false},
+		{"missing live URL", "", "https://mesh.invalid", false},
+		{"missing resolved URL", "https://mesh.invalid", "", false},
+		{"invalid URLs", "not-a-url", "not-a-url", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dc, observation, calls := deviceBindingObservationFixture(t)
+			observation.liveMesh = func(context.Context) deviceLinkMeshIdentity {
+				return deviceLinkMeshIdentity{NodeID: "42", ControlURL: test.live}
+			}
+			observation.controlURL = func() string { return test.resolved }
+			detail := observeDeviceLinkDiagnostic(context.Background(), dc, observation)
+			wantCalls := 0
+			if test.verified {
+				wantCalls = 1
+			}
+			if (detail == "") != test.verified || *calls != wantCalls {
+				t.Fatalf("control-plane check: verified=%t calls=%d want=%d", detail == "", *calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestDeviceBindingDiagnosticUsesCancelledCommandContext(t *testing.T) {
+	dc, observation, calls := deviceBindingObservationFixture(t)
+	command := &cobra.Command{}
+	ctx, cancel := context.WithCancel(context.Background())
+	command.SetContext(ctx)
+	cancel()
+	var output bytes.Buffer
+	printDeviceLinkDiagnosticWith(command.Context(), &output, dc, observation)
+	if output.Len() == 0 || *calls != 0 {
+		t.Fatal("cancelled command lost warning or started a lookup")
+	}
+}
+
 func TestDeviceBindingMissingLiveMeshCannotBorrowSavedFabricIdentity(t *testing.T) {
 	dc, observation, calls := deviceBindingObservationFixture(t)
 	dc.FabricNodeID = "42"
-	observation.liveNodeID = func(context.Context) string { return "" }
+	observation.liveMesh = func(context.Context) deviceLinkMeshIdentity { return deviceLinkMeshIdentity{} }
 	if observeDeviceLinkDiagnostic(context.Background(), dc, observation) == "" || *calls != 0 {
 		t.Fatal("saved fabric identity substituted for a missing live mesh identity")
 	}
