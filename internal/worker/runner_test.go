@@ -253,7 +253,8 @@ func TestRunnerClockClaimBeforeRealLaneWaitAndImmutablePublicationRetry(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	done := make(chan struct{})
-	go func() { defer close(done); r.runLaneJob(ctx, l, job, stream, start) }()
+	ticket := l.reserveExecTicket()
+	go func() { defer close(done); r.runLaneJob(ctx, l, job, stream, start, ticket) }()
 	now.Store(200) // queued delivery's claim must not move to admission/execution.
 	<-l.exec
 	select {
@@ -3015,17 +3016,17 @@ func TestRunnerGPUBoundJobDoesNotBlockOtherJobs(t *testing.T) {
 		t.Error("expected a terminal WriteEnd for the inference job after it completed")
 	}
 
-	if snap := state.Snapshot(); snap.InFlight != 0 {
-		t.Errorf("WorkerState.InFlight = %d, want 0 after both jobs finished", snap.InFlight)
-	}
-
-	// Both jobs are done; cancel rather than wait out the full 5s timeout so
-	// the test doesn't need to sit through it just to observe clean shutdown.
+	// ACK happens inside executeJob, before the dispatch goroutine retires its
+	// in-flight ownership. Join Run before asserting that final accounting.
+	// Cancel rather than wait out the full 5s timeout for clean shutdown.
 	cancel()
 	select {
 	case <-runDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run() did not return after the context was cancelled")
+	}
+	if snap := state.Snapshot(); snap.InFlight != 0 {
+		t.Errorf("WorkerState.InFlight = %d, want 0 after both jobs retired", snap.InFlight)
 	}
 }
 

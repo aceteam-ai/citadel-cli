@@ -219,12 +219,55 @@ func CloseSessionControl(ln net.Listener, stateDir string) {
 // SessionControlRequest is the client for the session verbs, over the SAME
 // safesocket path. It never falls back to an unauthenticated TCP endpoint.
 func SessionControlRequest(ctx context.Context, stateDir, method, route string) (*http.Response, error) {
+	return sessionControlRequest(ctx, stateDir, method, route, false)
+}
+
+// SessionControlStatusRequest is the read-only viewer's fixed GET. Redirects
+// are returned, not followed to another route, even on the same local socket.
+func SessionControlStatusRequest(ctx context.Context, stateDir string) (*http.Response, error) {
+	return sessionControlRequest(ctx, stateDir, http.MethodGet, "/citadel/session/v1/status", true)
+}
+
+// SessionControlWorkerDetailRequest opts into the bounded worker projection on
+// the same protected local control socket. Redirects are never followed.
+func SessionControlWorkerDetailRequest(ctx context.Context, stateDir string) (*http.Response, error) {
+	return sessionControlRequest(ctx, stateDir, http.MethodGet, "/citadel/session/v1/worker-detail", true)
+}
+
+func sessionControlRequest(ctx context.Context, stateDir, method, route string, rejectRedirect bool) (*http.Response, error) {
 	path := LocalAPISocketPath(stateDir)
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return dialLocalControlRaw(ctx, path)
 	}}
 	defer transport.CloseIdleConnections()
+	return sessionControlRequestWithTransport(ctx, transport, method, route, rejectRedirect)
+}
+
+func sessionControlRequestWithTransport(ctx context.Context, transport http.RoundTripper, method, route string, rejectRedirect bool) (*http.Response, error) {
+	client := sessionControlHTTPClient(transport, rejectRedirect)
+	if rejectRedirect {
+		return sessionControlReadRequestWithClient(ctx, client, route)
+	}
+	return sessionControlRequestWithClient(ctx, client, method, route)
+}
+
+func sessionControlStatusRequestWithClient(ctx context.Context, client *http.Client) (*http.Response, error) {
+	return sessionControlReadRequestWithClient(ctx, client, "/citadel/session/v1/status")
+}
+
+func sessionControlReadRequestWithClient(ctx context.Context, client *http.Client, route string) (*http.Response, error) {
+	return sessionControlRequestWithClient(ctx, client, http.MethodGet, route)
+}
+
+func sessionControlHTTPClient(transport http.RoundTripper, rejectRedirect bool) *http.Client {
 	client := &http.Client{Transport: transport}
+	if rejectRedirect {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	return client
+}
+
+func sessionControlRequestWithClient(ctx context.Context, client *http.Client, method, route string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, "http://citadel.local"+route, nil)
 	if err != nil {
 		return nil, err

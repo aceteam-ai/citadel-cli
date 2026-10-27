@@ -201,6 +201,8 @@ func TestRunnerHeavyLaneDoesNotBlockFetchLoop(t *testing.T) {
 type deadlineHeldHeavyHandler struct {
 	fileIndexCapsDecl
 	started        atomic.Int32
+	active         atomic.Int32
+	overlapped     atomic.Bool
 	firstCancelled chan struct{}
 	releaseFirst   chan struct{}
 	secondStarted  chan struct{}
@@ -211,6 +213,10 @@ type deadlineHeldHeavyHandler struct {
 func (h *deadlineHeldHeavyHandler) CanHandle(jt string) bool { return jt == JobTypeFileIndex }
 
 func (h *deadlineHeldHeavyHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	if h.active.Add(1) != 1 {
+		h.overlapped.Store(true)
+	}
+	defer h.active.Add(-1)
 	if h.started.Add(1) == 1 {
 		<-ctx.Done()
 		h.firstOnce.Do(func() { close(h.firstCancelled) })
@@ -221,6 +227,21 @@ func (h *deadlineHeldHeavyHandler) Execute(ctx context.Context, _ *Job, _ Stream
 	return &JobResult{Status: JobStatusSuccess}, nil
 }
 
+// Hold ordinary success publication after its handler has returned. The mock's
+// ExecutedJobs records entry, so it cannot fence the runner's executing counter.
+type deadlineHeldOrdinaryStream struct {
+	NoOpStreamWriter
+	terminalStarted chan struct{}
+	release         chan struct{}
+	startOnce       sync.Once
+}
+
+func (s *deadlineHeldOrdinaryStream) WriteEnd(map[string]any) error {
+	s.startOnce.Do(func() { close(s.terminalStarted) })
+	<-s.release
+	return nil
+}
+
 func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T) {
 	h := &deadlineHeldHeavyHandler{
 		firstCancelled: make(chan struct{}),
@@ -228,6 +249,10 @@ func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T)
 		secondStarted:  make(chan struct{}),
 	}
 	ordinary := NewMockJobHandler(JobTypeFileReadBytes, false)
+	ordinaryStream := &deadlineHeldOrdinaryStream{
+		terminalStarted: make(chan struct{}),
+		release:         make(chan struct{}),
+	}
 	source := NewMockJobSource("test", []*Job{
 		{ID: "index-1", Type: JobTypeFileIndex, Payload: map[string]any{"timeout_ms": float64(20)}},
 		{ID: "index-2", Type: JobTypeFileIndex, Payload: map[string]any{"timeout_ms": float64(20)}},
@@ -235,22 +260,60 @@ func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T)
 	})
 	state := NewWorkerState()
 	r := NewRunner(source, []JobHandler{h, ordinary}, RunnerConfig{WorkerID: "test", MaxConcurrency: 1, State: state, ActivityFn: func(string, string) {}})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	r.WithStreamWriterFactory(func(job *Job) StreamWriter {
+		if job.ID == "ordinary" {
+			return ordinaryStream
+		}
+		return &NoOpStreamWriter{}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan struct{})
+	var heavyReleaseOnce, ordinaryReleaseOnce sync.Once
+	releaseHeavy := func() { heavyReleaseOnce.Do(func() { close(h.releaseFirst) }) }
+	releaseOrdinary := func() { ordinaryReleaseOnce.Do(func() { close(ordinaryStream.release) }) }
+	t.Cleanup(func() {
+		cancel()
+		releaseHeavy()
+		releaseOrdinary()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Error("runner cleanup did not join released handlers")
+		}
+	})
 	go func() { _ = r.Run(ctx); close(runDone) }()
 	select {
 	case <-h.firstCancelled:
 	case <-time.After(time.Second):
 		t.Fatal("first heavy handler did not reach deadline")
 	}
-	if !laneWaitFor(time.Second, func() bool { return len(ordinary.ExecutedJobs()) == 1 }) {
-		t.Fatal("ordinary lane work did not complete while heavy writer was joined")
+	select {
+	case <-ordinaryStream.terminalStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ordinary handler did not reach success publication while heavy writer was joined")
+	}
+	if len(ordinary.ExecutedJobs()) != 1 {
+		t.Fatal("ordinary handler entry was not recorded")
 	}
 	select {
 	case <-h.secondStarted:
 		t.Fatal("second heavy writer overlapped the deadline-held first writer")
 	case <-time.After(50 * time.Millisecond):
+	}
+	// This is a legal Executing==2: one held heavy writer and the ordinary
+	// job's pending publication. It must not be diagnosed as writer overlap.
+	if snap := state.Snapshot(); snap.Executing != 2 || snap.InFlight != 3 || snap.Processed != 0 {
+		t.Fatalf("state before ordinary retirement = %+v, want executing=2 in_flight=3 processed=0", snap)
+	}
+	if h.started.Load() != 1 || h.overlapped.Load() {
+		t.Fatal("heavy writers overlapped while ordinary publication was held")
+	}
+	releaseOrdinary()
+	// Processed increments after executeJob's deferred executing decrement and
+	// exitJob's in-flight decrement. Only the ordinary job can complete while
+	// the first heavy handler is held, so this is a positive retirement fence.
+	if !laneWaitFor(time.Second, func() bool { return state.Snapshot().Processed == 1 }) {
+		t.Fatal("ordinary job did not retire while heavy writer was joined")
 	}
 	if snap := state.Snapshot(); snap.Executing != 1 || snap.InFlight < 2 {
 		t.Fatalf("state while held = %+v, want one executing heavy and queued in-flight work", snap)
@@ -264,7 +327,10 @@ func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T)
 	if heavy.Executing != 1 || heavy.Queued < 1 {
 		t.Fatalf("heavy lane while held = %+v, want executing=1 queued>=1", heavy)
 	}
-	close(h.releaseFirst)
+	if h.overlapped.Load() {
+		t.Fatal("heavy writers overlapped before the held writer was released")
+	}
+	releaseHeavy()
 	select {
 	case <-h.secondStarted:
 	case <-time.After(time.Second):
@@ -275,6 +341,12 @@ func TestRunnerHeavyDeadlineRetainsLaneAndExecutingUntilActualExit(t *testing.T)
 	case <-runDone:
 	case <-time.After(time.Second):
 		t.Fatal("runner did not stop")
+	}
+	if h.overlapped.Load() || h.active.Load() != 0 || h.started.Load() != 2 {
+		t.Fatalf("heavy handler lifecycle: overlapped=%v active=%d started=%d", h.overlapped.Load(), h.active.Load(), h.started.Load())
+	}
+	if snap := state.Snapshot(); snap.Executing != 0 || snap.InFlight != 0 {
+		t.Fatalf("state after actual handler exit = %+v, want executing=0 in_flight=0", snap)
 	}
 }
 

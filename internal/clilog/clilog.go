@@ -149,6 +149,20 @@ func Write(level, msg string) {
 	}
 }
 
+// Close releases the current log handle, if any. It is idempotent and does not
+// disable logging: a later Write lazily reopens the dated file for appending.
+func Close() error {
+	mu.Lock()
+	defer mu.Unlock()
+	current := file
+	file = nil
+	fileDate = ""
+	if current == nil {
+		return nil
+	}
+	return current.Close()
+}
+
 // Writef is a printf-style convenience wrapper around Write.
 func Writef(level, format string, args ...interface{}) {
 	Write(level, fmt.Sprintf(format, args...))

@@ -114,6 +114,10 @@ control center. All other subcommands are for scripting and advanced use.`,
 		if cmd.CommandPath() == "citadel stream eval" {
 			return
 		}
+		if cmd.CommandPath() == "citadel session attach" {
+			// Explicit read-only viewing skips mutating agent startup only.
+			return
+		}
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr FIRST,
 		// before any Log()/Debug() call in this function -- including
