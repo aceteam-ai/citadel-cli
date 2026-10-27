@@ -91,18 +91,19 @@ func RecordStagedUpdate(now time.Time, newVersion string) error {
 
 // ReconcilePendingOnStartup reconciles a persisted restart-pending state with
 // the compiled running version at worker startup. When the staged
-// CurrentVersion now equals the running binary, the restart succeeded, so a
+// CurrentVersion is equal to or older than the running binary, a
 // lingering restart_pending/restart_failed result is cleared to up_to_date (the
-// staged version is now current). When they differ (restart failed, still on
-// the old binary), nothing is cleared — pending_version/restart_required remain
-// computed from the mismatch by the snapshot builder. Best-effort; corrupt
+// staged version is no longer pending). A strictly newer staged version retains
+// its restart result. Invalid version metadata is never proof of recovery.
+// Best-effort; corrupt
 // state is left untouched (never repaired into a confident report).
 func ReconcilePendingOnStartup(now time.Time, runningVersion string) error {
 	state, corrupt := ReadStateForReport()
 	if corrupt || state == nil {
 		return nil
 	}
-	if state.CurrentVersion == "" || !VersionsEqual(state.CurrentVersion, runningVersion) {
+	relation, err := CompareReleaseVersions(state.CurrentVersion, runningVersion)
+	if err != nil || relation == TargetNewer {
 		return nil
 	}
 	if state.LastResult != ResultRestartPending && state.LastResult != ResultRestartFailed {
@@ -111,7 +112,8 @@ func ReconcilePendingOnStartup(now time.Time, runningVersion string) error {
 	now = now.UTC()
 	return mutateState(func(s *State) {
 		// Re-check under the lock: a concurrent write may have changed things.
-		if VersionsEqual(s.CurrentVersion, runningVersion) &&
+		relation, err := CompareReleaseVersions(s.CurrentVersion, runningVersion)
+		if err == nil && relation != TargetNewer &&
 			(s.LastResult == ResultRestartPending || s.LastResult == ResultRestartFailed) {
 			s.LastResult = ResultUpToDate
 			s.LastResultAt = now
@@ -133,6 +135,14 @@ func ReadStateForReport() (state *State, corrupt bool) {
 // surrounding whitespace, matching agentNodeInfo's #923 pending-version check.
 func VersionsEqual(a, b string) bool {
 	return strings.TrimPrefix(strings.TrimSpace(a), "v") == strings.TrimPrefix(strings.TrimSpace(b), "v")
+}
+
+// StagedVersionIsNewer reports a pending release only when both identities
+// have valid SemVer metadata and the staged release is strictly newer. A stale
+// state file from another install must not demand a restart onto an older binary.
+func StagedVersionIsNewer(staged, running string) bool {
+	relation, err := CompareReleaseVersions(staged, running)
+	return err == nil && relation == TargetNewer
 }
 
 // ReportSnapshot is the source-of-truth shape of the heartbeat auto_update

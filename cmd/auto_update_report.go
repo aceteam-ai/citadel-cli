@@ -91,10 +91,9 @@ func buildAutoUpdateSnapshot(inputs autoUpdatePolicyInputs, mode string) update.
 	configured := state.AutoUpdate
 	snap.ConfiguredEnabled = &configured
 
-	// pending_version/restart_required: the staged CurrentVersion differs from
-	// the running binary (apply succeeded, restart not yet proven). Reuses
-	// agentNodeInfo's #923 rule.
-	if state.CurrentVersion != "" && !update.VersionsEqual(state.CurrentVersion, Version) {
+	// Only a strictly newer staged release can require a restart. A stale file
+	// from an older install is not pending. Shared with agentNodeInfo.
+	if update.StagedVersionIsNewer(state.CurrentVersion, Version) {
 		snap.PendingVersion = state.CurrentVersion
 		snap.RestartRequired = true
 	}

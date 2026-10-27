@@ -266,10 +266,10 @@ func agentNodeInfo(nodeName, headscaleNodeID, orgID string, startedAt time.Time)
 	// ApplyUpdate succeeded but Restart() failed -- or an external installer
 	// swapped the binary without restarting -- state.json's CurrentVersion is
 	// the STAGED/on-disk version while Version (above) is still the RUNNING
-	// one. Surface the mismatch so the platform can prompt a restart; a
-	// missing/corrupt state.json (no update ever recorded) or an equal
+	// one. Surface only a strictly newer staged release so the platform can
+	// prompt a restart; missing/corrupt state.json or an older/equal
 	// version adds neither field, leaving the payload unchanged from today.
-	if st, err := loadUpdateState(); err == nil && st.CurrentVersion != "" && strings.TrimPrefix(st.CurrentVersion, "v") != strings.TrimPrefix(Version, "v") {
+	if st, err := loadUpdateState(); err == nil && update.StagedVersionIsNewer(st.CurrentVersion, Version) {
 		info["pending_version"] = st.CurrentVersion
 		info["restart_required"] = true
 	}

@@ -367,3 +367,31 @@ func TestCorruptUpdateStatusNamesBothRepairCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestAutoUpdateSnapshotRejectsStalePendingVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name, recorded string
+		pending        bool
+	}{
+		{"old install", "v2.97.0", false},
+		{"equal", "2.202.0", false},
+		{"equal precedence", "v2.202.0+another", false},
+		{"newer staged", "v2.203.0", true},
+		{"malformed", "broken", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withAutoUpdateEnv(t, "v2.202.0")
+			if err := update.SaveState(&update.State{CurrentVersion: tc.recorded, AutoUpdate: true, Channel: "stable"}); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+			want := ""
+			if tc.pending {
+				want = tc.recorded
+			}
+			if snapshot.PendingVersion != want || snapshot.RestartRequired != tc.pending {
+				t.Fatalf("pending=%q restart=%t, want %q/%t", snapshot.PendingVersion, snapshot.RestartRequired, want, tc.pending)
+			}
+		})
+	}
+}
