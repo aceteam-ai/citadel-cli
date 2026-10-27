@@ -152,6 +152,21 @@ func TestCDPDiscoveryNullEntriesCountTowardLimit(t *testing.T) {
 	}
 }
 
+func TestCDPDiscoveryLimitsPrecedeJSONDecoding(t *testing.T) {
+	for _, fixture := range []struct {
+		data, reason string
+	}{
+		{"!" + strings.Repeat(" ", 64*1024), "64 KiB"},
+		{"[" + discoveryPage + strings.Repeat(",{}", 63) + ",123]", "64 targets"},
+	} {
+		body := &discoveryBody{source: strings.NewReader(fixture.data)}
+		got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
+		if err == nil || got != "" || !strings.Contains(err.Error(), fixture.reason) || body.closes != 1 {
+			t.Fatalf("parser ran before its admission bound: result=%q error=%v closes=%d", got, err, body.closes)
+		}
+	}
+}
+
 func TestCDPDiscoveryDoesNotFollowRedirectOrMutateClient(t *testing.T) {
 	calls, sharedRedirects := 0, 0
 	body := &discoveryBody{source: strings.NewReader("[" + discoveryPage + "]")}
@@ -184,7 +199,7 @@ func (discoveryFaultReader) Read([]byte) (int, error) {
 }
 
 func TestCDPDiscoveryRejectsMalformedSuffixAndReadFailures(t *testing.T) {
-	for _, data := range []string{"null", `{}`, `[]`, `[`, "[" + discoveryPage + ",", "[" + discoveryPage + ",123]", "[" + discoveryPage + "] []", "[" + discoveryPage + "] trailing"} {
+	for _, data := range []string{"null", `{}`, `[]`, `[`, "[" + discoveryPage, "[" + discoveryPage + ",", "[" + discoveryPage + ",123]", "[" + discoveryPage + "] []", "[" + discoveryPage + "] trailing"} {
 		body := &discoveryBody{source: strings.NewReader(data)}
 		got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
 		if err == nil || got != "" || body.closes != 1 {
