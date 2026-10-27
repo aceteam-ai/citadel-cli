@@ -67,7 +67,7 @@ func autoUpdateIntervalSeconds(inputs autoUpdatePolicyInputs) int {
 //     never_checked;
 //   - older state missing the telemetry fields -> never_checked / zero times,
 //     which read as absent in the projection.
-func buildAutoUpdateSnapshot(inputs autoUpdatePolicyInputs, mode string) update.ReportSnapshot {
+func buildAutoUpdateSnapshot(inputs autoUpdatePolicyInputs, mode string, capability update.SelfUpdateCapability) update.ReportSnapshot {
 	effective, source := resolveAutoUpdatePolicy(inputs)
 	snap := update.ReportSnapshot{
 		SchemaVersion:    update.AutoUpdateReportSchemaVersion,
@@ -78,6 +78,11 @@ func buildAutoUpdateSnapshot(inputs autoUpdatePolicyInputs, mode string) update.
 		RunningVersion:   Version,
 		LastResult:       update.ResultNeverChecked,
 	}
+	if capability.State == "" {
+		capability.State = update.SelfUpdateUnknown
+	}
+	snap.SelfUpdate, snap.InstallDirectory = capability.State, capability.Directory
+	snap.BinaryOwner, snap.WorkerUser = capability.BinaryOwner, capability.WorkerUser
 
 	state, corrupt := update.ReadStateForReport()
 	if corrupt || state == nil {
@@ -136,5 +141,9 @@ func autoUpdateReportFrom(s *update.ReportSnapshot) *status.AutoUpdateReport {
 		LatestVersion:     s.LatestVersion,
 		LastResultAt:      s.LastResultAt,
 		LastResult:        s.LastResult,
+		SelfUpdate:        s.SelfUpdate,
+		InstallDirectory:  s.InstallDirectory,
+		BinaryOwner:       s.BinaryOwner,
+		WorkerUser:        s.WorkerUser,
 	}
 }

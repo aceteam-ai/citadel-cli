@@ -118,7 +118,7 @@ func openMutationLock(path string, identity installedIdentity, allowCreate bool)
 		return nil, err
 	}
 	if !lockCreationOwnerAllowed(os.Geteuid(), identity.uid) {
-		return nil, fmt.Errorf("first lock creation requires installed executable owner")
+		return nil, fmt.Errorf("first lock creation requires installed executable owner: binary owner %q, worker user %q; run the installer as the binary owner or explicitly configure a self-updating install owned by the worker user", unixUserLabel(identity.uid), unixUserLabel(uint32(os.Geteuid())))
 	}
 
 	fd, err = unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)

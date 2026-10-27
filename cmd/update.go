@@ -293,6 +293,9 @@ func finishManualNoOp(result update.ApplyResult, out io.Writer) bool {
 // downloadAndApplyManual is returning so its deferred private-attempt cleanup
 // always completes before the Cobra wrapper can call os.Exit.
 func downloadAndApplyManual(client *update.Client, release *update.Release, onDownloaded func()) (update.ApplyResult, error) {
+	if capability := manualUpdateCapabilityFn(); capability.State != update.SelfUpdateAvailable {
+		return update.ApplyResult{}, fmt.Errorf("update preflight refused before download: %s", capability.Message())
+	}
 	attempt, err := newUpdateAttemptFn()
 	if err != nil {
 		return update.ApplyResult{}, fmt.Errorf("create private update attempt: %w", err)
@@ -306,6 +309,8 @@ func downloadAndApplyManual(client *update.Client, release *update.Release, onDo
 	}
 	return applyReleaseFn(context.Background(), attempt.Candidate, "", release.TagName, update.Latest)
 }
+
+var manualUpdateCapabilityFn = update.InspectSelfUpdateCapability
 
 // refreshManagedServiceUnits runs the idempotent managed-unit refresh and
 // reports the result to out. It is the single call site for the unit-refresh,

@@ -109,7 +109,7 @@ func TestBuildAutoUpdateSnapshot(t *testing.T) {
 		if err := update.SaveState(&update.State{AutoUpdate: true, Channel: "stable"}); err != nil {
 			t.Fatalf("SaveState: %v", err)
 		}
-		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 		if snap.SchemaVersion != update.AutoUpdateReportSchemaVersion {
 			t.Errorf("schema_version = %d", snap.SchemaVersion)
 		}
@@ -138,7 +138,7 @@ func TestBuildAutoUpdateSnapshot(t *testing.T) {
 		if err := update.SaveState(&update.State{AutoUpdate: true, Channel: "stable"}); err != nil {
 			t.Fatalf("SaveState: %v", err)
 		}
-		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 		boolVal(t, snap.ConfiguredEnabled, true, "configured_enabled") // persisted pref unchanged
 		boolVal(t, snap.EffectiveEnabled, false, "effective_enabled")  // env vetoes it
 		if snap.PolicySource != "env" {
@@ -151,7 +151,7 @@ func TestBuildAutoUpdateSnapshot(t *testing.T) {
 		if err := update.SaveState(&update.State{AutoUpdate: true, Channel: "stable"}); err != nil {
 			t.Fatalf("SaveState: %v", err)
 		}
-		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 		boolVal(t, snap.ConfiguredEnabled, true, "configured_enabled")
 		boolVal(t, snap.EffectiveEnabled, false, "effective_enabled")
 		if snap.PolicySource != "dev" {
@@ -167,7 +167,7 @@ func TestBuildAutoUpdateSnapshot(t *testing.T) {
 		if err := os.WriteFile(update.GetStateFilePath(), []byte("{broken"), 0644); err != nil {
 			t.Fatalf("write corrupt: %v", err)
 		}
-		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 		if snap.ConfiguredEnabled != nil {
 			t.Errorf("configured_enabled = %v, want nil (unknown) on corrupt state", *snap.ConfiguredEnabled)
 		}
@@ -184,7 +184,7 @@ func TestBuildAutoUpdateSnapshot(t *testing.T) {
 		if err := update.SaveState(&update.State{CurrentVersion: "v9.9.9", AutoUpdate: true, Channel: "stable"}); err != nil {
 			t.Fatalf("SaveState: %v", err)
 		}
-		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 		if snap.PendingVersion != "v9.9.9" || !snap.RestartRequired {
 			t.Errorf("pending=%q restart_required=%v, want v9.9.9/true", snap.PendingVersion, snap.RestartRequired)
 		}
@@ -199,7 +199,7 @@ func TestBuildAutoUpdateSnapshot(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("SaveState: %v", err)
 		}
-		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 		if snap.LastResult != update.ResultUpToDate {
 			t.Errorf("last_result = %q", snap.LastResult)
 		}
@@ -228,7 +228,7 @@ func TestAutoUpdateSnapshotNextProcessClearsPending(t *testing.T) {
 		t.Fatalf("SaveState: %v", err)
 	}
 
-	before := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+	before := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 	if before.PendingVersion != "v2.0.0" || !before.RestartRequired {
 		t.Fatalf("restart error must retain pending new version: pending=%q restart=%v", before.PendingVersion, before.RestartRequired)
 	}
@@ -241,7 +241,7 @@ func TestAutoUpdateSnapshotNextProcessClearsPending(t *testing.T) {
 	if err := update.ReconcilePendingOnStartup(time.Now(), Version); err != nil {
 		t.Fatalf("ReconcilePendingOnStartup: %v", err)
 	}
-	after := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+	after := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 	if after.PendingVersion != "" || after.RestartRequired {
 		t.Errorf("matching startup must clear pending: pending=%q restart=%v", after.PendingVersion, after.RestartRequired)
 	}
@@ -278,7 +278,7 @@ func TestCorruptUpdateStateKeepsPolicyPrecedenceAndClearsHeartbeatClaims(t *test
 			if enabled, source := resolveAutoUpdatePolicy(inputs); enabled != tc.enabled || source != tc.source {
 				t.Fatalf("policy mismatch: enabled=%t source=%s", enabled, source)
 			}
-			snapshot := buildAutoUpdateSnapshot(inputs, "periodic")
+			snapshot := buildAutoUpdateSnapshot(inputs, "periodic", update.SelfUpdateCapability{})
 			if snapshot.ConfiguredEnabled != nil || snapshot.EffectiveEnabled == nil || *snapshot.EffectiveEnabled != tc.enabled ||
 				snapshot.LastResult != update.ResultStateCorrupt || snapshot.PolicySource != tc.source ||
 				snapshot.PendingVersion != "" || snapshot.RestartRequired || snapshot.LastResultAt != nil || snapshot.LastCheckAt != nil || snapshot.LatestVersion != "" {
@@ -290,7 +290,7 @@ func TestCorruptUpdateStateKeepsPolicyPrecedenceAndClearsHeartbeatClaims(t *test
 	if err := update.SetAutoUpdate(true); err != nil {
 		t.Fatal(err)
 	}
-	repaired := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+	repaired := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 	if repaired.ConfiguredEnabled == nil || !*repaired.ConfiguredEnabled ||
 		repaired.EffectiveEnabled == nil || !*repaired.EffectiveEnabled || repaired.LastResult == update.ResultStateCorrupt {
 		t.Fatalf("explicit repair did not clear the pause/report: %+v", repaired)
@@ -329,7 +329,9 @@ func TestCorruptUpdateStateEnvOnStillChecksAndReportsCorruption(t *testing.T) {
 	var last update.ReportSnapshot
 	done := startWorkerAutoUpdater(ctx, true, autoUpdatePolicyInputs{}, &updaterTestWorker{}, func(string, ...any) {}, autoUpdateRuntime{
 		checker: checker, ticks: ticks, afterTick: cancel,
-		refresh: func() { last = buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic") },
+		refresh: func() {
+			last = buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
+		},
 		apply:   func(string) error { applies++; return nil },
 		restart: func() error { restarts++; return nil },
 	})
@@ -384,7 +386,7 @@ func TestAutoUpdateSnapshotRejectsStalePendingVersion(t *testing.T) {
 			if err := update.SaveState(&update.State{CurrentVersion: tc.recorded, AutoUpdate: true, Channel: "stable"}); err != nil {
 				t.Fatal(err)
 			}
-			snapshot := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic")
+			snapshot := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
 			want := ""
 			if tc.pending {
 				want = tc.recorded
@@ -393,5 +395,22 @@ func TestAutoUpdateSnapshotRejectsStalePendingVersion(t *testing.T) {
 				t.Fatalf("pending=%q restart=%t, want %q/%t", snapshot.PendingVersion, snapshot.RestartRequired, want, tc.pending)
 			}
 		})
+	}
+}
+
+func TestAutoUpdateSnapshotReportsPrivilegedCapabilityWithoutFailureWhenOptedOut(t *testing.T) {
+	withAutoUpdateEnv(t, "v2.202.0")
+	t.Setenv("CITADEL_NO_AUTO_UPDATE", "1")
+	if err := update.SaveState(&update.State{AutoUpdate: false, Channel: "stable"}); err != nil {
+		t.Fatal(err)
+	}
+	capability := update.SelfUpdateCapability{State: update.SelfUpdatePrivileged, Directory: "/fixture/privileged", BinaryOwner: "root", WorkerUser: "fixture-worker"}
+	snapshot := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", capability)
+	if snapshot.EffectiveEnabled == nil || *snapshot.EffectiveEnabled || snapshot.PolicySource != "opt-out" || snapshot.LastResult != update.ResultNeverChecked || snapshot.SelfUpdate != update.SelfUpdatePrivileged {
+		t.Fatalf("intentional privilege separation reported as failed update: %+v", snapshot)
+	}
+	report := autoUpdateReportFrom(&snapshot)
+	if report.SelfUpdate != capability.State || report.InstallDirectory != capability.Directory || report.BinaryOwner != capability.BinaryOwner || report.WorkerUser != capability.WorkerUser {
+		t.Fatalf("capability lost in heartbeat projection: %+v", report)
 	}
 }

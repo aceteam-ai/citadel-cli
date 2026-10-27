@@ -40,6 +40,7 @@ const (
 	ResultDownloadFailed       = "download_failed"        // download or checksum verification failed
 	ResultDrainDeferred        = "drain_deferred"         // could not reach idle to swap this cycle
 	ResultApplyFailed          = "apply_failed"           // the in-place binary swap failed
+	ResultApplyNotPermitted    = "apply_not_permitted"    // install authority/capability preflight refused
 	ResultRestartPending       = "restart_pending"        // applied/staged; not yet proven running
 	ResultRestartFailed        = "restart_failed"         // swap applied but the restart call failed
 	ResultManualUpdateRequired = "manual_update_required" // homebrew/desktop-managed; can't self-swap
@@ -63,6 +64,20 @@ func RecordCheckResult(now time.Time, result string, checked bool, latest string
 		s.LastResultAt = now
 		if checked {
 			s.LastCheckAt = now
+		}
+		if latest != "" {
+			s.LatestVersion = latest
+		}
+	})
+}
+
+func RecordApplyNotPermitted(now time.Time, capability SelfUpdateCapability, checked bool, latest string) error {
+	return mutateState(func(s *State) {
+		s.LastResult = ResultApplyNotPermitted
+		s.LastResultAt = now.UTC()
+		s.LastApplyCapability = &capability
+		if checked {
+			s.LastCheckAt = now.UTC()
 		}
 		if latest != "" {
 			s.LatestVersion = latest
@@ -164,6 +179,10 @@ type ReportSnapshot struct {
 	LatestVersion     string     `json:"latest_version,omitempty"`
 	LastResultAt      *time.Time `json:"last_result_at,omitempty"`
 	LastResult        string     `json:"last_result"`
+	SelfUpdate        string     `json:"self_update,omitempty"`
+	InstallDirectory  string     `json:"install_directory,omitempty"`
+	BinaryOwner       string     `json:"binary_owner,omitempty"`
+	WorkerUser        string     `json:"worker_user,omitempty"`
 }
 
 // ReportCache holds the latest ReportSnapshot behind an atomic pointer so the

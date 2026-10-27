@@ -4097,6 +4097,16 @@ only that last preference with unknown. Explicit enables still run, while
 telemetry writes preserve the broken bytes. `SetAutoUpdate` alone repairs malformed
 JSON and first attempts a private UTC-stamped `state.json.corrupt-*` backup.
 
+`update.InspectSelfUpdateCapability` owns current-process install authority and a
+same-directory probe, without provisioning locks or changing the binary. Worker
+startup/refresh observes it for the cached report, independently of preference.
+Periodic and remote/manual update paths consult it before download. Deliberately
+privileged installs remain supported: auto-update off reports capability rather
+than a failed update. `RecordApplyNotPermitted` owns refusal persistence, and the
+updater's refusal notice is emitted only when the observed condition changes.
+See `docs/update-install-capability.md` for the wire contract and remaining
+service/installer and native acceptance scope.
+
 **Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
 The update state file resolves from HOME (`getUserHomeDir`), and the shipped
 `citadel.service` is a systemd USER unit (HOME=/home/jason), so that file is the

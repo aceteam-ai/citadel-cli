@@ -30,10 +30,11 @@ type State struct {
 	// older state.json files lack them and read as zero (degraded to
 	// "unknown"/"never_checked" by the report builder), keeping this struct
 	// JSON-compatible with every pre-#1134 state file.
-	LastCheckAt   time.Time `json:"last_check_at,omitzero"`   // last release check actually attempted
-	LatestVersion string    `json:"latest_version,omitempty"` // last release observed by this node
-	LastResultAt  time.Time `json:"last_result_at,omitzero"`  // when LastResult was recorded
-	LastResult    string    `json:"last_result,omitempty"`    // bounded result code (see report.go)
+	LastCheckAt         time.Time             `json:"last_check_at,omitzero"`   // last release check actually attempted
+	LatestVersion       string                `json:"latest_version,omitempty"` // last release observed by this node
+	LastResultAt        time.Time             `json:"last_result_at,omitzero"`  // when LastResult was recorded
+	LastResult          string                `json:"last_result,omitempty"`    // bounded result code (see report.go)
+	LastApplyCapability *SelfUpdateCapability `json:"last_apply_capability,omitempty"`
 }
 
 // DefaultCheckInterval is the minimum time between update checks
