@@ -46,7 +46,7 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 		nodeRegistry: map[string]NodeExecutor{
 			NodeTypeInput:     &InputNodeExecutor{},
 			NodeTypeOutput:    &OutputNodeExecutor{},
-			NodeTypeLLM:       &LLMNodeExecutor{},
+			NodeTypeLLM:       &LLMNodeExecutor{policy: cfg.LLM},
 			NodeTypeShell:     NewShellNodeExecutor(cfg.Shell),
 			NodeTypeHTTP:      &HTTPNodeExecutor{policy: cfg.HTTP},
 			NodeTypeTransform: &TransformNodeExecutor{},
@@ -77,6 +77,20 @@ func (e *Executor) Submit(ctx context.Context, req *RunRequest) (*Execution, err
 		timeout = time.Duration(req.Timeout) * time.Second
 	}
 	exec := NewExecution(req.Graph, req.Input)
+	// Publish cancellation before the run becomes visible or its goroutine is
+	// scheduled, so an immediate Cancel cannot be lost at startup.
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	if shellAuthorized {
+		runCtx = withShellAuthorized(runCtx)
+	}
+	exec.cancel = cancel
+	finish := func() {
+		cancel()
+		exec.mu.Lock()
+		exec.cancel = nil
+		exec.mu.Unlock()
+		close(exec.done)
+	}
 	e.mu.Lock()
 	e.runs[exec.ID] = exec
 	e.mu.Unlock()
@@ -84,15 +98,13 @@ func (e *Executor) Submit(ctx context.Context, req *RunRequest) (*Execution, err
 	case e.sem <- struct{}{}:
 	default:
 		exec.Complete(nil, errors.New("max concurrent workflow runs exceeded"))
+		finish()
 		return exec, nil
 	}
 	go func() {
+		// Defer order matters: Done proves that the slot was released too.
+		defer finish()
 		defer func() { <-e.sem }()
-		runCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		if shellAuthorized {
-			runCtx = withShellAuthorized(runCtx)
-		}
 		e.executeGraph(runCtx, exec)
 	}()
 	return exec, nil
@@ -148,13 +160,19 @@ func (e *Executor) Cancel(id string) bool {
 		return false
 	}
 	exec.mu.Lock()
-	defer exec.mu.Unlock()
 	if exec.Status == StatusRunning || exec.Status == StatusPending {
 		now := time.Now()
 		exec.Status = StatusCancelled
 		exec.EndedAt = &now
+		cancel := exec.cancel
+		exec.mu.Unlock()
+		// Never invoke context callbacks under the execution mutex.
+		if cancel != nil {
+			cancel()
+		}
 		return true
 	}
+	exec.mu.Unlock()
 	return false
 }
 

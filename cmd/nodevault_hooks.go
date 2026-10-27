@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"errors"
+
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
@@ -29,7 +31,8 @@ func init() {
 		return nodevault.Open(passcodeHookNodeDir()).IsConfigured()
 	}
 	config.VaultVerify = func(pin string) (ok bool, handled bool) {
-		v := nodevault.Open(passcodeHookNodeDir())
+		nodeDir := passcodeHookNodeDir()
+		v := nodevault.Open(nodeDir)
 		if !v.IsConfigured() {
 			return false, false // no master PIN: fall back to legacy bcrypt
 		}
@@ -39,7 +42,9 @@ func init() {
 		if pin == "" {
 			return false, true
 		}
-		return v.VerifyPIN(pin) == nil, true
+		err := v.VerifyPIN(pin)
+		warnPasscodeLockoutUnavailableFor(passcodeWarningMaster, nodeDir, err)
+		return err == nil, true
 	}
 	// Legacy bcrypt passcode checks (no master PIN enrolled) get the vault's
 	// node-wide persisted lockout policy (#1398), with state in a sibling file,
@@ -47,6 +52,15 @@ func init() {
 	// gateway's sensitive and cache routes are rate-limited in legacy mode too.
 	config.LegacyPasscodeLockout = func() config.PasscodeAttemptLimiter {
 		return nodevault.OpenLegacyPasscodeLockout(passcodeHookNodeDir())
+	}
+	config.PasscodeAttemptError = warnPasscodeLockoutUnavailable
+}
+
+// The legacy callback contract remains error-only. A healthy attempt does not
+// reset the reminder or claim recovery; availability is a separate snapshot.
+func warnPasscodeLockoutUnavailable(err error) {
+	if errors.Is(err, nodevault.ErrLockoutUnavailable) {
+		warnPasscodeLockoutUnavailableFor(passcodeWarningLegacy, passcodeHookNodeDir(), err)
 	}
 }
 

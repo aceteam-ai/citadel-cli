@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/google/uuid"
 )
 
@@ -67,7 +68,8 @@ type ClientConfig struct {
 	Timeout time.Duration
 
 	// DebugFunc is an optional callback for debug logging
-	DebugFunc func(format string, args ...any)
+	DebugFunc        func(format string, args ...any)
+	PlatformObserver platformhttp.Observer
 }
 
 // NewClient creates a new Redis API client.
@@ -80,7 +82,8 @@ func NewClient(cfg ClientConfig) *Client {
 		baseURL: cfg.BaseURL,
 		token:   cfg.Token,
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
+			Timeout:   cfg.Timeout,
+			Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{Debugf: cfg.DebugFunc, Observe: cfg.PlatformObserver}),
 		},
 		workerID:  fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
 		debugFunc: cfg.DebugFunc,
@@ -111,6 +114,8 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
+func (c *Client) RedialPlatformConnections() { platformhttp.RedialClient(c.httpClient) }
+
 // WorkerID returns the unique worker identifier.
 func (c *Client) WorkerID() string {
 	return c.workerID
@@ -139,6 +144,10 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// Refusal bodies can echo credentials. Do not read or retain them.
+		return newAuthorizationError(resp.StatusCode, http.MethodGet, "/api/fabric/redis/ping")
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		// A 429 carries a structured rate-limit hint (retry_after/reset_at).
@@ -156,6 +165,9 @@ func (c *Client) Ping(ctx context.Context) error {
 // Close closes the HTTP client and WebSocket if connected.
 func (c *Client) Close() error {
 	c.closed.Store(true)
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
 	if c.wsClient != nil {
 		return c.wsClient.Close()
 	}
@@ -262,6 +274,10 @@ func contains404(s string) bool {
 
 // doRequest performs an HTTP request with authentication and JSON handling.
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, result any) error {
+	return c.doRequestWithClient(c.httpClient, ctx, method, path, body, result)
+}
+
+func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, method, path string, body any, result any) error {
 	var reqBody io.Reader
 	if body != nil {
 		jsonData, err := json.Marshal(body)
@@ -269,9 +285,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 			return fmt.Errorf("failed to marshal request body: %w", err)
 		}
 		reqBody = bytes.NewReader(jsonData)
-		c.debug("request: %s %s - body: %s", method, path, string(jsonData))
+		// Request data and query values may contain credentials or job payloads.
+		// Emit the same closed diagnostic labels used by authorization errors.
+		c.debug("request: %s %s - body omitted", authorizationMethod(method), authorizationPath(path))
 	} else {
-		c.debug("request: %s %s", method, path)
+		c.debug("request: %s %s", authorizationMethod(method), authorizationPath(path))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
@@ -284,11 +302,21 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Keep consume status provenance even when authorization refuses before
+	// reading the body. This is the HTTP answer, not inferred linkage state.
+	if strings.Contains(path, "/jobs/consume") {
+		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		c.debug("response: %d - <authorization refusal body omitted>", resp.StatusCode)
+		return newAuthorizationError(resp.StatusCode, method, path)
+	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -304,16 +332,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 	}
 	c.debug("response: %d - %s", resp.StatusCode, string(diagnosticBody))
 
-	// Record the consume HTTP status for worker introspection (issue #236).
-	// This is the single signal that would have surfaced the pre-fix #3924
-	// 400s, which otherwise only appeared as a generic "consume failed" error.
-	if strings.Contains(path, "/jobs/consume") {
-		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
-	}
-
 	// Handle error responses.
 	//
-	// Every error here carries method, path, HTTP status and the (truncated)
+	// Non-authorization errors carry method, path, HTTP status and the (truncated)
 	// response body, because the callers of this package deliberately no longer
 	// second-guess a 2xx (see pubsub.go): this error string is the ONLY record of
 	// why a call failed. Issue #721 was slow to diagnose precisely because the

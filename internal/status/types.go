@@ -302,7 +302,11 @@ type WorkerLiveness struct {
 	// LastJobConsumedAt is when a job was most recently pulled off the queue.
 	LastJobConsumedAt *time.Time `json:"last_job_consumed_at,omitempty"`
 	// LastPollAt is when the consume loop last completed a poll (job or empty).
-	LastPollAt *time.Time `json:"last_poll_at,omitempty"`
+	LastPollAt             *time.Time `json:"last_poll_at,omitempty"`
+	PlatformOKAt           *time.Time `json:"platform_ok_at,omitempty"`
+	PlatformFailingSince   *time.Time `json:"platform_failing_since,omitempty"`
+	PlatformLastOutcome    string     `json:"platform_last_outcome,omitempty"`
+	PlatformLastHTTPStatus int        `json:"platform_last_http_status,omitempty"`
 	// InFlight is the number of jobs currently executing in a handler.
 	InFlight int64 `json:"in_flight"`
 	// Processed / Failed are cumulative since worker start (diagnostic context).
