@@ -53,7 +53,12 @@ preferences.
 On Linux, manual update restart detection uses `DiscoverActiveWorkers` instead of
 a fixed unit-name list. It inspects the system manager and the caller's user
 manager, accepting a literal `work` invocation of the same resolved executable.
-Backing files must agree with loaded state (`NeedDaemonReload=no`). Shell wrappers,
+Every inspected active unit's backing files must agree with loaded state
+(`NeedDaemonReload=no`) before its contents can exclude a worker. Literal worker
+candidates with an unresolved account, dynamic identity or unverified root/mount
+mapping refuse discovery rather than disappearing from the candidate set. Empty
+mapping assignments reset the corresponding setting. Read-only hardening remains
+supported; discovery does not interpret service filesystem namespaces. Shell wrappers,
 unknown expansion syntax, incomplete inspection and ambiguous matches are left
 for manual inspection. It does not enter another user's service manager. Discovery
 has bounded output, candidate count and elapsed time, and never exports unit

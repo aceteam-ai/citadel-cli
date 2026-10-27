@@ -110,6 +110,7 @@ type discoveryFixture struct {
 	list      map[bool]string
 	units     map[string]string
 	reload    string
+	reloads   map[string]string
 	listError map[bool]bool
 	catError  bool
 }
@@ -136,6 +137,9 @@ func (f discoveryFixture) capture(t *testing.T) func(context.Context, ...string)
 			}
 			return []byte(f.units[args[len(args)-1]]), nil
 		case "show":
+			if reload, ok := f.reloads[args[len(args)-1]]; ok {
+				return []byte(reload), nil
+			}
 			return []byte(f.reload), nil
 		default:
 			t.Fatalf("discovery attempted unexpected command %q", args[0])
@@ -184,7 +188,10 @@ func TestWorkerUnitIdentityHonorsSectionsQuotesAndDropInResets(t *testing.T) {
 		{"unknown escape", "[Service]\nExecStart=/fixture/space\\sdir/citadel work\n", "", false},
 		{"continuation", "[Service]\nExecStart=/fixture/citadel \\\n work\n", "", false},
 		{"unclosed quote", "[Service]\nExecStart=\"/fixture/citadel work\n", "", false},
-		{"dynamic identity", "[Service]\nDynamicUser=yes\nExecStart=/fixture/citadel work\n", "", false},
+		{"dynamic identity", "[Service]\nDynamicUser=yes\nExecStart=/fixture/citadel work\n", "/fixture/citadel", false},
+		{"identity reset", "[Service]\nDynamicUser=yes\nUser=%i\nDynamicUser=no\nUser=fixture-worker\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
+		{"mapping reset", "[Service]\nRootDirectory=/fixture/root\nRootDirectory=\nBindPaths=/other:/fixture\nBindPaths=\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
+		{"read-only hardening", "[Service]\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=/fixture\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path, _, known := workerUnitIdentity(tc.content)
@@ -215,6 +222,86 @@ func TestDiscoverActiveWorkersRefusesStaleOrUnknownLoadedConfiguration(t *testin
 		if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical); err == nil || len(workers) != 0 {
 			t.Fatalf("stale manager admitted restart target: %+v %v", workers, err)
 		}
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesHiddenIdentityCandidates(t *testing.T) {
+	for _, setting := range []string{
+		"DynamicUser=yes", "User=%i", "RootDirectory=/fixture/root", "RootImage=/fixture/root.raw",
+		"BindPaths=/foreign:/fixture", "BindReadOnlyPaths=/foreign:/fixture",
+		"TemporaryFileSystem=/fixture", "MountImages=/fixture/image:/fixture",
+		"ExtensionImages=/fixture/extension.raw", "ExtensionDirectories=/fixture/extension",
+		"PrivateTmp=yes", "PrivateTmp=disconnected", "PrivateDevices=yes", "ProtectHome=yes", "ProtectHome=tmpfs",
+	} {
+		for _, hiddenFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/hidden_first=%t", setting, hiddenFirst), func(t *testing.T) {
+				hidden, ordinary := "z.service", "a.service"
+				if hiddenFirst {
+					hidden, ordinary = ordinary, hidden
+				}
+				f := discoveryFixture{
+					list: map[bool]string{false: hidden + " loaded active running Hidden\n" + ordinary + " loaded active running Worker\n"},
+					units: map[string]string{
+						hidden:   "[Service]\n" + setting + "\nExecStart=/fixture/citadel work\n",
+						ordinary: "[Service]\nExecStart=/fixture/citadel work\n",
+					}, reload: "no",
+				}
+				if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical); err == nil || len(workers) != 0 {
+					t.Fatalf("unverified identity became a unique restart target: workers=%+v error=%v", workers, err)
+				}
+			})
+		}
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesMappedForeignLiteralBeforeHostResolution(t *testing.T) {
+	f := discoveryFixture{
+		list:   map[bool]string{false: "mapped.service loaded active running Worker\n"},
+		units:  map[string]string{"mapped.service": "[Service]\nRootDirectory=/fixture/root\nExecStart=/inside/citadel work\n"},
+		reload: "no",
+	}
+	canonical := func(path string) (string, error) {
+		if path != "/fixture/citadel" {
+			t.Fatal("service namespace path was interpreted in the host namespace")
+		}
+		return path, nil
+	}
+	if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), canonical); err == nil || len(workers) != 0 {
+		t.Fatalf("mapped path was excluded using host resolution: workers=%+v error=%v", workers, err)
+	}
+}
+
+func TestWorkerUnitIdentityMappingAndAccountResets(t *testing.T) {
+	for _, key := range []string{"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories", "PrivateTmp", "PrivateDevices", "ProtectHome"} {
+		t.Run(key, func(t *testing.T) {
+			path, account, known := workerUnitIdentity("[Service]\n" + key + "=/fixture/unverified\n" + key + "=\nDynamicUser=yes\nDynamicUser=\nUser=%i\nUser=fixture-worker\nExecStart=/fixture/citadel work\n")
+			if !known || path != "/fixture/citadel" || account != "fixture-worker" {
+				t.Fatalf("effective reset did not clear prior uncertainty: path=%q account=%q known=%t", path, account, known)
+			}
+		})
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesStaleNonmatchingBackingFile(t *testing.T) {
+	for _, staleFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stale_first=%t", staleFirst), func(t *testing.T) {
+			stale, ordinary := "z.service", "a.service"
+			if staleFirst {
+				stale, ordinary = ordinary, stale
+			}
+			f := discoveryFixture{
+				list: map[bool]string{false: stale + " loaded active running Stale\n" + ordinary + " loaded active running Worker\n"},
+				units: map[string]string{
+					// Loaded ExecStart may still be /fixture/citadel; disk alone
+					// cannot exclude this active unit before checking freshness.
+					stale:    "[Service]\nExecStart=/foreign/citadel work\n",
+					ordinary: "[Service]\nExecStart=/fixture/citadel work\n",
+				}, reload: "no", reloads: map[string]string{stale: "yes"},
+			}
+			if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical); err == nil || len(workers) != 0 {
+				t.Fatalf("stale disk nonmatch hid a loaded worker: workers=%+v error=%v", workers, err)
+			}
+		})
 	}
 }
 

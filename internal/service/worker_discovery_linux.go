@@ -122,18 +122,24 @@ func discoverActiveWorkers(ctx context.Context, executable string, capture func(
 			if len(content) > maxWorkerDiscoveryOutput {
 				return nil, errWorkerDiscoveryBound
 			}
+			// cat reads backing files, not the manager's loaded configuration.
+			// A stale nonmatching file could hide another loaded worker, so this
+			// check must precede exclusion as well as selection of a candidate.
+			showArgs := append(append([]string{}, prefix...), "show", "--no-pager", "--property=NeedDaemonReload", "--value", "--", name)
+			reload, err := capture(ctx, showArgs...)
+			if err != nil || len(reload) > 16 || strings.TrimSpace(string(reload)) != "no" {
+				return nil, errors.New("active service unit is not verified against the loaded manager")
+			}
 			path, account, known := workerUnitIdentity(string(content))
-			if !known {
+			if path == "" {
 				continue
+			}
+			if !known {
+				return nil, errors.New("active worker executable or account identity requires manual inspection")
 			}
 			resolved, err := canonical(path)
 			if err != nil || resolved != expected {
 				continue
-			}
-			showArgs := append(append([]string{}, prefix...), "show", "--no-pager", "--property=NeedDaemonReload", "--value", "--", name)
-			reload, err := capture(ctx, showArgs...)
-			if err != nil || len(reload) > 16 || strings.TrimSpace(string(reload)) != "no" {
-				return nil, errors.New("matching worker unit is not verified against the loaded manager")
 			}
 			if account == "" && !userMode {
 				account = "root"
@@ -162,10 +168,14 @@ func safeServiceName(name string) bool {
 
 // This accepts a literal command and common quoting, not shell evaluation or
 // systemd specifier/environment expansion. Unknown syntax is left for manual
-// inspection. Empty ExecStart resets the list, including across drop-ins.
+// inspection. A nonempty path with known=false is a literal worker whose
+// account or filesystem mapping cannot be verified; it must not be hidden by
+// filtering. Empty ExecStart resets the list, including across drop-ins.
 func workerUnitIdentity(content string) (path, account string, known bool) {
 	section := ""
 	var commands []string
+	dynamicUser := ""
+	mappings := map[string]bool{}
 	for _, raw := range strings.Split(content, "\n") {
 		line := strings.Trim(raw, " \t\r")
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
@@ -194,14 +204,18 @@ func workerUnitIdentity(content string) (path, account string, known bool) {
 				commands = append(commands, value)
 			}
 		case "User":
-			if strings.ContainsAny(value, "\"'\\%$ \t") {
-				return "", "", false
-			}
 			account = value
 		case "DynamicUser":
-			if value != "no" && value != "false" && value != "off" && value != "0" {
-				return "", "", false
-			}
+			dynamicUser = value
+		case "RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories":
+			// Do not map a service namespace's literal path onto the host's
+			// path. Empty assignments clear scalar and list mappings alike.
+			mappings[key] = value != ""
+		case "PrivateTmp", "PrivateDevices":
+			mappings[key] = value != "" && value != "no" && value != "false" && value != "off" && value != "0"
+		case "ProtectHome":
+			// read-only preserves the host files, unlike yes or tmpfs.
+			mappings[key] = value != "" && value != "read-only" && value != "no" && value != "false" && value != "off" && value != "0"
 		}
 	}
 	if len(commands) != 1 {
@@ -216,6 +230,14 @@ func workerUnitIdentity(content string) (path, account string, known bool) {
 		return "", "", false
 	}
 	if words[1] == "work" || len(words) >= 3 && words[1] == "--no-auto-update" && words[2] == "work" {
+		if strings.ContainsAny(account, "\"'\\%$ \t") || dynamicUser != "" && dynamicUser != "no" && dynamicUser != "false" && dynamicUser != "off" && dynamicUser != "0" {
+			return path, "", false
+		}
+		for _, mapped := range mappings {
+			if mapped {
+				return path, account, false
+			}
+		}
 		return path, account, true
 	}
 	return "", "", false
