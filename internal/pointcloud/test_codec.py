@@ -104,6 +104,29 @@ class SequenceTests(unittest.TestCase):
                 writer.finish()
             self.assert_invalid(attempt)
 
+    def test_binary32_normalization_precedes_binary16_midpoint_rounding(self):
+        # Each binary64 input is just off a binary16 midpoint but rounds to
+        # that exact midpoint in binary32. Direct binary64-to-binary16
+        # conversion instead produces the different, odd record pinned here.
+        cases = (
+            (1 + 2**-11 + 2**-25, 0x3C00, 0x3C01, 1),
+            (1 + 3 * 2**-11 - 2**-25, 0x3C02, 0x3C01, 1 + 2**-9),
+            (-(1 + 2**-11 + 2**-25), 0xBC00, 0xBC01, -1),
+            (-(1 + 3 * 2**-11 - 2**-25), 0xBC02, 0xBC01, -(1 + 2**-9)),
+        )
+        for value, expected_bits, direct_bits, decoded in cases:
+            with self.subTest(expected_bits=expected_bits):
+                self.assertEqual(struct.pack("<e", value), struct.pack("<H", direct_bits))
+                stream = io.BytesIO()
+                writer = codec.Writer(stream, 1, 15, 1)
+                writer.append_frame([(value, 0, 0, 1, 2, 3)])
+                summary = writer.finish()
+                expected_record = struct.pack("<H", expected_bits) + bytes(4) + bytes((1, 2, 3))
+                self.assertEqual(stream.getvalue()[codec.HEADER.size + 16:], expected_record)
+                self.assertEqual(summary["bounds"], [[decoded, 0, 0], [decoded, 0, 0]])
+                self.assertEqual(codec.Reader(stream, summary["size"]).frame(0),
+                                 [(decoded, 0, 0, 1, 2, 3)])
+
     def test_per_frame_cap_and_empty_rational_fps_sequence(self):
         count = codec.MAX_FRAME_POINTS + 1
         raw = codec.HEADER.pack(codec.MAGIC, 1, codec.HEADER.size, 2, count, 15, 1)

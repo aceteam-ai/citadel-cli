@@ -188,6 +188,99 @@ func (f *failedWriteFile) Write(data []byte) (int, error) {
 	return f.File.Write(data)
 }
 
+type nilErrorShortWriteFile struct {
+	*os.File
+	calls, failAt int
+}
+
+func (f *nilErrorShortWriteFile) Write(data []byte) (int, error) {
+	f.calls++
+	if f.calls == f.failAt {
+		return f.File.Write(data[:len(data)-1])
+	}
+	return f.File.Write(data)
+}
+
+func TestWriterRejectsNilErrorShortWritesAndKeepsFailureSticky(t *testing.T) {
+	for index, name := range []string{"initial header", "frame record", "final header"} {
+		t.Run(name, func(t *testing.T) {
+			file := &nilErrorShortWriteFile{File: ownedFile(t), failAt: index + 1}
+			writer, err := NewWriter(file, 1, FPS{15, 1})
+			if index == 0 {
+				if err != ErrInvalid || writer != nil || file.calls != 1 {
+					t.Fatal("nil-error short initial write was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = writer.AppendFrame([]Point{{Z: -1}})
+			if index == 2 {
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = writer.Finish()
+			}
+			if err != ErrInvalid || file.calls != file.failAt {
+				t.Fatal("nil-error short write did not fail at its own stage")
+			}
+			if writer.AppendFrame(nil) != ErrInvalid {
+				t.Fatal("short-write failure allowed another frame")
+			}
+			if summary, err := writer.Finish(); err != ErrInvalid || !reflect.DeepEqual(summary, Summary{}) {
+				t.Fatal("short-write failure exposed a publishable summary")
+			}
+			if file.calls != file.failAt {
+				t.Fatal("poisoned writer performed another destination write")
+			}
+		})
+	}
+}
+
+func TestWriterRoundsBinary16MidpointsToEven(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		x    float32
+		bits uint16
+		want float32
+	}{
+		{"even lower", 1 + 1.0/2048, 0x3c00, 1},
+		{"even upper", 1 + 3.0/2048, 0x3c02, 1 + 1.0/512},
+		{"negative even lower", -(1 + 1.0/2048), 0xbc00, -1},
+		{"negative even upper", -(1 + 3.0/2048), 0xbc02, -(1 + 1.0/512)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file := ownedFile(t)
+			writer, err := NewWriter(file, 1, FPS{15, 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.AppendFrame([]Point{{X: test.x, R: 1, G: 2, B: 3}}); err != nil {
+				t.Fatal(err)
+			}
+			summary, err := writer.Finish()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record [PointBytes]byte
+			if _, err := file.ReadAt(record[:], HeaderBytes+16); err != nil {
+				t.Fatal(err)
+			}
+			var expected [PointBytes]byte
+			binary.LittleEndian.PutUint16(expected[:], test.bits)
+			expected[6], expected[7], expected[8] = 1, 2, 3
+			if record != expected {
+				t.Fatal("binary16 midpoint did not round to the pinned even record")
+			}
+			wantBounds := Bounds{Min: [3]float32{test.want, 0, 0}, Max: [3]float32{test.want, 0, 0}}
+			if summary.Bounds == nil || *summary.Bounds != wantBounds {
+				t.Fatal("bounds did not describe the quantized midpoint")
+			}
+		})
+	}
+}
+
 func TestWriterIsCreateOnlyBoundedAndPermanentlyFailsClosed(t *testing.T) {
 	file := ownedFile(t)
 	if _, err := file.Write([]byte("existing owned bytes")); err != nil {
