@@ -57,7 +57,8 @@ Every inspected active unit's backing files must agree with loaded state
 (`NeedDaemonReload=no`) before its contents can exclude a worker. Literal worker
 candidates with an unresolved account, dynamic identity or unverified root/mount
 mapping refuse discovery rather than disappearing from the candidate set. Empty
-mapping assignments reset the corresponding setting. Read-only hardening remains
+root/path mapping assignments reset the corresponding setting. Empty boolean or
+enum assignments remain unverified; they are not resets. Read-only hardening remains
 supported; discovery does not interpret service filesystem namespaces. Shell wrappers,
 unknown expansion syntax, incomplete inspection and ambiguous matches are left
 for manual inspection. It does not enter another user's service manager. Discovery

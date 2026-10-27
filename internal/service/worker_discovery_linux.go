@@ -207,15 +207,21 @@ func workerUnitIdentity(content string) (path, account string, known bool) {
 			account = value
 		case "DynamicUser":
 			dynamicUser = value
+			if value == "" {
+				// Unlike paths/lists, this boolean has no empty reset.
+				dynamicUser = "unverified"
+			}
 		case "RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories":
 			// Do not map a service namespace's literal path onto the host's
 			// path. Empty assignments clear scalar and list mappings alike.
 			mappings[key] = value != ""
 		case "PrivateTmp", "PrivateDevices":
-			mappings[key] = value != "" && value != "no" && value != "false" && value != "off" && value != "0"
+			// Empty boolean/enum assignments are invalid, not path resets.
+			// Refuse rather than erase a previously enabled namespace.
+			mappings[key] = value != "no" && value != "false" && value != "off" && value != "0"
 		case "ProtectHome":
 			// read-only preserves the host files, unlike yes or tmpfs.
-			mappings[key] = value != "" && value != "read-only" && value != "no" && value != "false" && value != "off" && value != "0"
+			mappings[key] = value != "read-only" && value != "no" && value != "false" && value != "off" && value != "0"
 		}
 	}
 	if len(commands) != 1 {

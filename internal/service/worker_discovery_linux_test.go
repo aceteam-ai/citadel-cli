@@ -232,6 +232,7 @@ func TestDiscoverActiveWorkersRefusesHiddenIdentityCandidates(t *testing.T) {
 		"TemporaryFileSystem=/fixture", "MountImages=/fixture/image:/fixture",
 		"ExtensionImages=/fixture/extension.raw", "ExtensionDirectories=/fixture/extension",
 		"PrivateTmp=yes", "PrivateTmp=disconnected", "PrivateDevices=yes", "ProtectHome=yes", "ProtectHome=tmpfs",
+		"DynamicUser=yes\nDynamicUser=", "PrivateTmp=yes\nPrivateTmp=", "PrivateDevices=yes\nPrivateDevices=", "ProtectHome=tmpfs\nProtectHome=",
 	} {
 		for _, hiddenFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/hidden_first=%t", setting, hiddenFirst), func(t *testing.T) {
@@ -272,9 +273,9 @@ func TestDiscoverActiveWorkersRefusesMappedForeignLiteralBeforeHostResolution(t 
 }
 
 func TestWorkerUnitIdentityMappingAndAccountResets(t *testing.T) {
-	for _, key := range []string{"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories", "PrivateTmp", "PrivateDevices", "ProtectHome"} {
+	for _, key := range []string{"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories"} {
 		t.Run(key, func(t *testing.T) {
-			path, account, known := workerUnitIdentity("[Service]\n" + key + "=/fixture/unverified\n" + key + "=\nDynamicUser=yes\nDynamicUser=\nUser=%i\nUser=fixture-worker\nExecStart=/fixture/citadel work\n")
+			path, account, known := workerUnitIdentity("[Service]\n" + key + "=/fixture/unverified\n" + key + "=\nDynamicUser=yes\nDynamicUser=no\nPrivateTmp=yes\nPrivateTmp=no\nPrivateDevices=yes\nPrivateDevices=no\nProtectHome=tmpfs\nProtectHome=read-only\nUser=%i\nUser=fixture-worker\nExecStart=/fixture/citadel work\n")
 			if !known || path != "/fixture/citadel" || account != "fixture-worker" {
 				t.Fatalf("effective reset did not clear prior uncertainty: path=%q account=%q known=%t", path, account, known)
 			}
