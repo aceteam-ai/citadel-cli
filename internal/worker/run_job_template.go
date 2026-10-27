@@ -229,8 +229,18 @@ func ValidateTemplateRunRequest(req TemplateRunRequest, nodeID string) (jobs.Tem
 	if err := jobs.ValidateTemplateParams(req.Params, req.InputSchema, req.OutputSchema); err != nil {
 		return empty, err
 	}
-	if _, err := jobs.ParseTemplateInputFiles(req.InputFiles, nodeID); err != nil {
+	files, err := jobs.ParseTemplateInputFiles(req.InputFiles, nodeID)
+	if err != nil {
 		return empty, err
+	}
+	// Bind Film inputs even if a manifest uses an alias for either the key or
+	// the handler. Existing generic templates may omit expectations.
+	if req.TemplateKey == "video-compose" || runner.Handler == "video-compose" {
+		for _, file := range files {
+			if file.ExpectedSHA256 == "" || file.ExpectedBytes == nil {
+				return empty, fmt.Errorf("video-compose input %q requires expected_sha256 and expected_bytes", file.NodePath)
+			}
+		}
 	}
 	return runner, nil
 }

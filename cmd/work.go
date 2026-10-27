@@ -232,6 +232,7 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 func connectWithBackoffLabeled(ctx context.Context, label string, source apiConnector) error {
 	backoff := connectBackoffInitial
 	attempt := 0
+	authReported := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -249,6 +250,19 @@ func connectWithBackoffLabeled(ctx context.Context, label string, source apiConn
 		// If the context was cancelled mid-connect, this is a clean shutdown.
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// Log() is console-visible only with --debug. Surface the first
+		// authenticated API refusal on the default path too, while keeping the
+		// established in-process retry policy (including 429/offline recovery).
+		// Only the typed, fixed-text error is rendered, never an arbitrary
+		// wrapping error, response body, URL, or credential.
+		if authErr, ok := redisapi.AsAuthorizationError(err); ok {
+			if !authReported {
+				fmt.Fprintln(os.Stderr, "API authorization:", authErr)
+				authReported = true
+			}
+			err = authErr
 		}
 
 		// Decide how long to wait before the next attempt.
@@ -923,9 +937,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	// (job counts, poll time) and the status server's /agent/* endpoints, which
 	// answer over the tsnet mesh even when Redis job consumption is broken.
 	workerState := worker.NewWorkerState()
+	var platformRedials []func()
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
+		printDeviceLinkDiagnostic(os.Stderr, deviceConfig)
 		Debug("using API mode (device_api_token found)")
 		useAPIMode = true
 
@@ -971,13 +987,14 @@ func runWork(cmd *cobra.Command, args []string) {
 		apiQueueNames := queueResult.Queues
 
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
-			BaseURL:       apiBaseURL,
-			Token:         deviceConfig.DeviceAPIToken,
-			QueueNames:    apiQueueNames,
-			ConsumerGroup: workGroup,
-			BlockMs:       workPollMs,
-			MaxAttempts:   workMaxRetries,
-			DebugFunc:     Debug,
+			BaseURL:          apiBaseURL,
+			Token:            deviceConfig.DeviceAPIToken,
+			QueueNames:       apiQueueNames,
+			ConsumerGroup:    workGroup,
+			BlockMs:          workPollMs,
+			MaxAttempts:      workMaxRetries,
+			DebugFunc:        Debug,
+			PlatformObserver: workerState.ObservePlatform,
 			// Route the source's info logs (subscribed queues, consumer group,
 			// per-node AddQueue) through Log() so they land in latest.log. The
 			// default sink is stdout, which the worker's log file does not
@@ -1039,6 +1056,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// blip left pub/sub on the (broken) HTTP fallback for the whole process
 		// lifetime, with only a Debug line to show for it (issue #723).
 		apiClient := apiSource.Client()
+		platformRedials = append(platformRedials, apiClient.RedialPlatformConnections)
 		wsRetryDone = enableWebSocketWithRetry(ctx, wsConnector{client: apiClient}, workerWSLog)
 		pubSubTransportFn = apiClient.PubSubTransport
 
@@ -1179,6 +1197,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	} else {
 		Log("network not configured (no saved state)")
 	}
+	// Publish one immutable provider bundle after transport selection, before
+	// session control can read it. Heartbeat and optional status consumers below
+	// reuse these exact function values; later runner/swap initialization is
+	// observed through the existing atomic pointers rather than callback writes.
+	sessionProviders := newWorkSessionProviders(workerState, &nodeSwapManager, &nodeRunner, pubSubTransportFn)
+	workerLivenessFn, swapStatsFn, laneActivityFn := sessionProviders.Worker, sessionProviders.Swap, sessionProviders.Lanes
+
 	// Publish S2 session status/stop only from the process that owns the
 	// single-instance worker lock. The machine-wide TUN socket belongs to
 	// ipnserver and must never be replaced by this controller.
@@ -1190,7 +1215,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Restart=on-failure does NOT restart -- so a failure to bind the
 		// auxiliary control socket (realistically EACCES on a root-owned state
 		// dir) would silently and permanently stop an otherwise-healthy worker.
-		if stopSessionControl, err := startNodeSessionControl(workSessionMode, cancel); err != nil {
+		if stopSessionControl, err := startNodeSessionControl(workSessionMode, cancel, sessionProviders); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: node session control unavailable (continuing without it): %v\n", err)
 			Log("node session control unavailable (continuing without it): %v", err)
 		} else {
@@ -1486,35 +1511,6 @@ func runWork(cmd *cobra.Command, args []string) {
 		workStatusPort = 8080
 	}
 
-	// Live worker consume-loop liveness for the heartbeat (issue #548). Reads the
-	// same *WorkerState the runner updates, so the heartbeat can surface a
-	// "green but wedged" node (heartbeating from a separate goroutine while the
-	// consume loop is blocked and draining nothing).
-	workerLivenessFn := func() *status.WorkerLiveness {
-		live := workerLivenessFrom(workerState.Snapshot())
-		// Pub/sub transport is read live off the API client rather than mirrored
-		// through WorkerState: it can flip at any moment (background retry
-		// succeeds, connection drops) and a snapshot field would go stale.
-		if pubSubTransportFn != nil {
-			live.PubSubTransport = pubSubTransportFn()
-		}
-		return live
-	}
-
-	// Model-hotswap swap-activity stats for the heartbeat (citadel-cli#717): "is
-	// this node thrashing?" without shell access. nodeSwapManager.Store is called
-	// below at the buildNodeJobHandlers call site, from status-publisher
-	// goroutines that are already running by then (Load() is what makes that
-	// safe); nil here (before the store) or under the hotswap break-glass
-	// disable means no Swap block on the heartbeat.
-	swapStatsFn := func() *status.SwapActivity {
-		mgr := nodeSwapManager.Load()
-		if mgr == nil {
-			return nil
-		}
-		return swapStatsFrom(mgr.SwapStats())
-	}
-
 	// Full-wipe-guard refusal state for the heartbeat (citadel-cli#742): "is
 	// this node's reconcile pass currently being refused?" without shell
 	// access to the journal. nodeReconcileHealth.Store is called below at the
@@ -1544,20 +1540,6 @@ func runWork(cmd *cobra.Command, args []string) {
 			return nil
 		}
 		return reservationsFrom(list)
-	}
-
-	// Live bounded-execution-lane activity for the heartbeat (citadel-cli#908):
-	// "how loaded is this node right now" so a dispatcher can avoid targeting a
-	// saturated node. nodeRunner.Store is called below at the runner's
-	// construction site, from a point where these status-publisher goroutines are
-	// already running (Load() is what makes that safe); nil here (before the
-	// store) leaves the Lanes field omitted from the heartbeat.
-	laneActivityFn := func() []status.LaneActivity {
-		rn := nodeRunner.Load()
-		if rn == nil {
-			return nil
-		}
-		return laneActivityFrom(rn.LaneSnapshots())
 	}
 
 	jobTypesFn := func() []string {
@@ -1659,6 +1641,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// server's AddRouteRegistrar closure and the job handler share a single instance.
 	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
 		HTTP: workflowHTTPPolicy(network.GetNodeConfigDir()),
+		LLM:  workflowLLMPolicy(network.GetNodeConfigDir()),
 		Shell: workflow.ShellConfig{
 			WorkspaceDir: wsDir,
 			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
@@ -2382,7 +2365,9 @@ func runWork(cmd *cobra.Command, args []string) {
 					orgID,
 					termAPIToken,
 					termConfig.TokenRefreshInterval,
+					workerState.ObservePlatform,
 				)
+				platformRedials = append(platformRedials, cachingAuth.RedialPlatformConnections)
 
 				termServer := terminal.NewServer(termConfig, cachingAuth)
 
@@ -2894,6 +2879,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// shared workerState and, on a clear loss of forward progress, exits non-zero
 	// so systemd restarts the process clean. No-op if disabled (WORKER_SELF_HEAL).
 	if monitor := worker.NewLivenessMonitor(workerState, runner.IsDraining, func(level, msg string) { Log("%s", msg) }); monitor != nil {
+		bindWorkPlatformRecovery(useAPIMode, monitor, platformRedials, runner.TryIdleRestart)
 		go monitor.Run(ctx)
 	}
 
@@ -3558,13 +3544,17 @@ func nodeIsServingModels(ctx context.Context) bool {
 // silently loses a field when one side gains one.
 func workerLivenessFrom(snap worker.WorkerSnapshot) *status.WorkerLiveness {
 	return &status.WorkerLiveness{
-		Consuming:          snap.Consuming,
-		LastJobConsumedAt:  snap.LastJobAt,
-		LastPollAt:         snap.LastPollAt,
-		InFlight:           snap.InFlight,
-		Processed:          snap.Processed,
-		Failed:             snap.Failed,
-		IdentityUnresolved: snap.IdentityUnresolved,
+		Consuming:              snap.Consuming,
+		LastJobConsumedAt:      snap.LastJobAt,
+		LastPollAt:             snap.LastPollAt,
+		PlatformOKAt:           snap.PlatformOKAt,
+		PlatformFailingSince:   snap.PlatformFailingSince,
+		PlatformLastOutcome:    string(snap.PlatformLastOutcome),
+		PlatformLastHTTPStatus: snap.PlatformLastHTTPStatus,
+		InFlight:               snap.InFlight,
+		Processed:              snap.Processed,
+		Failed:                 snap.Failed,
+		IdentityUnresolved:     snap.IdentityUnresolved,
 	}
 }
 

@@ -69,6 +69,11 @@ type StatusData struct {
 	BackendLastAttemptAt       time.Time `json:"backendLastAttemptAt,omitempty"`
 	BackendConsecutiveFailures int       `json:"backendConsecutiveFailures,omitempty"`
 	BackendLastError           string    `json:"backendLastError,omitempty"`
+
+	// Link state is a separate local observation, never inferred from a
+	// successful heartbeat, mesh connection, or stored credential.
+	DeviceLinkState  string `json:"deviceLinkState,omitempty"`
+	DeviceLinkDetail string `json:"deviceLinkDetail,omitempty"`
 }
 
 // GPUInfo holds GPU information

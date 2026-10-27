@@ -171,6 +171,39 @@ def test_plan_disk_preflight_error_names_required_and_available():
     assert "/citadel-cache/huggingface" in message
 
 
+def test_disk_refusal_logs_actual_bounded_counts_without_cache_path(caplog):
+    with pytest.raises(mp.InsufficientDiskSpaceError):
+        mp.plan_disk_preflight("/owned/private/cache", 100, 5, 20)
+    assert "stage=disk_probe" in caplog.text
+    for field in ("required_bytes=100", "available_bytes=5", "margin_bytes=20", "needed_bytes=120"):
+        assert field in caplog.text
+    assert "/owned/private/cache" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("stage", ["estimate", "disk_probe"])
+def test_preflight_failure_warnings_are_static_without_exception_formatting(stage, caplog):
+    class PrivateFailure(RuntimeError):
+        def __str__(self):
+            raise AssertionError("preflight diagnostics must not format private errors")
+
+    def refuse(*args, **kwargs):
+        raise PrivateFailure("owned-private-token /owned/private/cache")
+
+    mp.run_preflight(
+        "owned/test", "/owned/private/cache",
+        list_repo_files_fn=refuse if stage == "estimate" else lambda *args, **kwargs: [
+            mp.RepoFileInfo(path="model.bin", size=100),
+        ],
+        available_disk_bytes_fn=refuse,
+    )  # existing fail-open semantics, without network or native imports
+    assert f"stage={stage} exception_class=unknown_exception" in caplog.text
+    assert "proceeding without a disk check" in caplog.text
+    for private in ("owned-private-token", "/owned/private/cache", "PrivateFailure", "Traceback"):
+        assert private not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # prefetch_filtered_weights -- the real file-selection guard. from_pretrained
 # itself does NOT honor allow_patterns/ignore_patterns kwargs (verified

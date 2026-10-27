@@ -1,6 +1,8 @@
 package clilog
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,5 +146,56 @@ func TestWriteRestrictsExistingLogs(t *testing.T) {
 		if got := info.Mode().Perm(); got != want {
 			t.Errorf("%s mode = %o, want %o", path, got, want)
 		}
+	}
+}
+
+func TestCloseReleasesHandleAndLaterWriteAppends(t *testing.T) {
+	day := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
+	reset(t, day)
+	Write("", "before close")
+	mu.Lock()
+	opened := file
+	mu.Unlock()
+	if opened == nil {
+		t.Fatal("fixture did not open the temporary log handle")
+	}
+	before, err := os.ReadFile(Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.Write([]byte("closed handle must not write\n")); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("old handle remained writable after Close: %v", err)
+	}
+	mu.Lock()
+	closedFile, closedDate := file, fileDate
+	mu.Unlock()
+	if closedFile != nil || closedDate != "" {
+		t.Fatal("Close retained the old handle or date")
+	}
+	if err := Close(); err != nil {
+		t.Fatalf("second Close was not idempotent: %v", err)
+	}
+	Write("warning", "after close")
+	mu.Lock()
+	reopened := file
+	mu.Unlock()
+	if reopened == nil || reopened == opened {
+		t.Fatal("later Write did not reopen a fresh log handle")
+	}
+	if err := Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(after, before) || !strings.Contains(string(after[len(before):]), "[warning] after close") || strings.Contains(string(after), "closed handle must not write") {
+		t.Fatal("reopening replaced previous log content or accepted a closed-handle write")
+	}
+	if strings.Count(string(after), "Session started") != 1 {
+		t.Fatal("Close reset the process session header")
 	}
 }

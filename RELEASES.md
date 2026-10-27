@@ -3241,3 +3241,76 @@ Auto-generated log of every release.
   - fix(enrollment): reset the registered node ID in Control Center, pin record-before-disconnect order (#1356) (#1361)
 
 
+---
+
+## v2.201.0 — 2026-10-23
+
+| Metric | Value |
+|--------|-------|
+| Commits | 32 |
+| Files changed | 247 |
+| Lines added | +35334 |
+
+**Changes:**
+
+  - fix(video-compose): activation hardening and 600s total film cap (#1440)
+  - docs: wake-on-inbox supervisor design of record (#1444)
+  - fix(memorygit): require strict passcode wiring and accept standard transport keys (#1438)
+  - feat(session): add read-only local session attach viewer (#1430)
+  - fix(nodevault): refuse false lockout reset success (#1429)
+  - feat: prepare inactive video-compose source (#1434)
+  - feat(memorygit): prepare inactive MEMORY_GIT_V1 source (#1435)
+  - fix(workflow): complete bounded LLM policy diagnostics (#1428)
+  - test(worker): await terminal ACK before deadline fixture shutdown (#1432)
+  - fix(diffusers): unload idle image and video pipelines unless pinned (#1403)
+  - fix(worker): account swaps before releasing rate admission (#1424)
+  - fix(nodevault): serialize lockout state across processes (#1408)
+  - fix(workflow): guard LLM destinations with explicit local endpoint grants (#1412)
+  - fix(workflow): cancel run contexts and await actual node exit (#1410)
+  - fix(workflow): hard-deny translated IPv6 and sanitize HTTP failures (#1401)
+  - fix(nvr): pin repaired init image and preserve cached start (#1409)
+  - fix(whisper): refresh certifi and Pillow security pins (#1407)
+  - test(rag): acknowledge SIGINT cancellation before embedding release (#1402)
+  - fix(desktop): fence auth work to its originating login (#1332)
+  - fix(passcode): apply the node-wide lockout to legacy passcode checks (#1400)
+  - docs(design): engine, model and module licensing (#1368)
+  - test(stream): share strict parser and artifact refusal vectors (#1382)
+  - fix(nodevault): retain time-decayed PIN failures across successful unlocks (#1397)
+  - fix(passcode): use strict diagnostic state and pin worker gate wiring (#1399)
+  - fix(nvr): keep the Frigate MQTT config private and support env-sourced credentials (#1394)
+  - feat(mediainput): inactive workspace freezer and bounded image headers (C1b) (#1393)
+  - feat(mediainput): strict inactive v1 input contract and shared vectors (C1a) (#1390)
+  - fix(workflow): SSRF policy for the HTTP node (#1388)
+  - fix(jobs): release panicked passcode checks and report busy capacity (#1389)
+  - feat(jobs): shared node passcode attempt throttle (SHELL_COMMAND, WORKFLOW_RUN, desktop) (#1370)
+  - feat(stream): build ST1 offline Sigma evaluator (#1364)
+  - feat(worker): desktop job handlers honor the node passcode like SHELL_COMMAND (#1369)
+
+
+---
+
+## v2.202.0 — 2026-10-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 13 |
+| Files changed | 151 |
+| Lines added | +17648 |
+
+**Changes:**
+
+  - test(api): cover cooldown rebuild and unread 404 edges (#1478)
+  - fix(worker): self-heal sustained platform wrong answers (#1479)
+  - fix(api): re-dial stale platform connections after cutovers (#1477)
+  - fix(auth): restore safe denial and enrollment diagnostics (#1467)
+  - fix(auth): discard late device tokens before persistence (#1465)
+  - fix(enrollment): expose unconfirmed device linking safely (#1463)
+  - fix(enrollment): fence retries, registration and managed unit repair (#1462)
+  - fix(worker): acquire lane execution slots in claim order (#1464)
+  - test(worker): fence deadline lane checks on actual retirement (#1461)
+  - docs: reconcile agents wake design with the governed-lane MVP (#1451)
+  - docs: session serve restore-only dependency policy design (#1450)
+  - ci: publish :latest only from main (#1439)
+  - feat(sessions): native declared session holder S1 (#1443)
+
+

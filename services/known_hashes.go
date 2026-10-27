@@ -126,6 +126,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"93385effc412fe5dbb7e8d321f5a35dc11d59a6dd30a2dc0771941243fa07a34": true,
 		// citadel-cli#1346: image pinned by digest instead of the floating :latest.
 		"4e96fcad81ed6e11534f3300de593db0ac47d385cba4aae5149c5d83ade41b9f": true,
+		// citadel-cli#1383: idle-unload and explicit image/video pin environment.
+		"f64ec83ab86d0070f289a39d93e30d9a1c841cfb4d7dae831986e8dd6d2225b1": true,
 	},
 	"bonsai": {
 		"124af757f45e93b689bc6a59f08187d48f59c0e62eb2d10c6a006c8ac4d24609": true,
