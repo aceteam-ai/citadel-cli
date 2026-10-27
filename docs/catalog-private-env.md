@@ -11,8 +11,10 @@ Base: `dc139d1de01239fc4d432990bef415d59f6b4e33`.
 `internal/catalog/install.go:485` ends `writeEnvFile` with
 `os.WriteFile(path, content, 0600)`. That mode applies to creation, not an
 existing inode. A pre-existing `nvr.env` at 0644 stays broadly readable when the
-installer writes MQTT/Wyze credentials into it. Fresh-file creation is already
-private. No live environment file was inspected or exposure established.
+installer writes MQTT/Wyze credentials into it. Newly created Unix inodes request
+mode 0600 before umask; that does not establish checked parent, pathname or owner
+authority, or protected Windows DACL privacy. No live environment file was
+inspected or exposure established.
 
 Two existing read paths also affect a safe fix:
 
