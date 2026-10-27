@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -50,6 +51,7 @@ func (f *fakeExecutor) Calls() []recordedInvocation {
 
 func TestRunVideoPipelinePublishesOnlyReferenceAndHash(t *testing.T) {
 	t.Parallel()
+	requireLinuxPublication(t)
 	root := t.TempDir()
 	video := filepath.Join(root, "orbit clip.mp4")
 	if err := os.WriteFile(video, []byte("fake video"), 0o600); err != nil {
@@ -134,6 +136,7 @@ func TestRunVideoPipelinePublishesOnlyReferenceAndHash(t *testing.T) {
 
 func TestRunFrameFolderSkipsFFmpeg(t *testing.T) {
 	t.Parallel()
+	requireLinuxPublication(t)
 	root := t.TempDir()
 	frames := filepath.Join(root, "frames")
 	if err := os.Mkdir(frames, 0o700); err != nil {
@@ -162,6 +165,7 @@ func TestRunFrameFolderSkipsFFmpeg(t *testing.T) {
 
 func TestRunAcceptsCompletedNonMetricSFMVerdict(t *testing.T) {
 	t.Parallel()
+	requireLinuxPublication(t)
 	root := t.TempDir()
 	frames := filepath.Join(root, "frames")
 	if err := os.Mkdir(frames, 0o700); err != nil {
@@ -351,6 +355,9 @@ func TestSFMLogCaptureRetainsOnlyBoundedTail(t *testing.T) {
 func TestRunBoundedSFMLogRequiresFinalParseableSummary(t *testing.T) {
 	for _, retainSummary := range []bool{false, true} {
 		t.Run(fmt.Sprintf("retained=%v", retainSummary), func(t *testing.T) {
+			if retainSummary {
+				requireLinuxPublication(t)
+			}
 			root := t.TempDir()
 			frames := filepath.Join(root, "frames")
 			if err := os.Mkdir(frames, 0o700); err != nil {
@@ -422,6 +429,15 @@ func TestHashFileCountsActualBytesAndCancelsWithoutMetadata(t *testing.T) {
 	digest, size, err = hashFile(ctx, path)
 	if !errors.Is(err, context.Canceled) || digest != "" || size != 0 {
 		t.Fatal("cancelled hash exposed success metadata")
+	}
+}
+
+// Successful publication requires Linux's atomic no-replace primitive. Keep
+// parser, quality-gate, cancellation, hash and buffer cases portable.
+func requireLinuxPublication(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("create-only publication requires the supported Linux container")
 	}
 }
 
