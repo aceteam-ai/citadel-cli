@@ -48,6 +48,10 @@ func legacyPermissionRefusal(jobType string) *jobs.ShellRefusal {
 func (g *registrationRefusals) RefusalFor(jobType string) *jobs.ShellRefusal {
 	o := g.opts
 	switch jobType {
+	case JobTypeIOSBuild:
+		if g.goos != "darwin" {
+			return &jobs.ShellRefusal{Reason: "platform_unsupported", Message: "IOS_BUILD requires macOS and xcodebuild; use a supported macOS node"}
+		}
 	case JobTypeShellCommand:
 		if g.goos == "windows" {
 			return &jobs.ShellRefusal{Reason: "platform_unsupported", Message: "SHELL_COMMAND requires a Unix shell and is unavailable on native Windows; use a supported Unix node"}

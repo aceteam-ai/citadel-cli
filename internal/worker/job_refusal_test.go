@@ -19,6 +19,8 @@ func TestGatedJobRefusalIsTerminalFromFirstAttempt(t *testing.T) {
 		{"shell snapshot disabled", JobTypeShellCommand, "shell_disabled", "enable Shell", LegacyHandlerOpts{GOOS: "linux", ShellDisabled: true}},
 		{"shell live disabled", JobTypeShellCommand, "shell_disabled", "enable Shell", LegacyHandlerOpts{GOOS: "linux", ShellEnabled: func() bool { return false }}},
 		{"native windows", JobTypeShellCommand, "platform_unsupported", "native Windows", LegacyHandlerOpts{GOOS: "windows", ShellEnabled: func() bool { return true }}},
+		{"ios build on linux", JobTypeIOSBuild, "platform_unsupported", "macOS", LegacyHandlerOpts{GOOS: "linux"}},
+		{"ios build on windows", JobTypeIOSBuild, "platform_unsupported", "macOS", LegacyHandlerOpts{GOOS: "windows"}},
 		{"desktop disabled", JobTypeVNCActions, "desktop_disabled", "enable Desktop", LegacyHandlerOpts{DesktopDisabled: true}},
 		{"desktop live disabled", JobTypeFileScreenshot, "desktop_disabled", "enable Desktop", LegacyHandlerOpts{DesktopEnabled: func() bool { return false }}},
 		{"files disabled", JobTypeFileRead, "files_disabled", "enable Files", LegacyHandlerOpts{WorkspaceDir: "fixture", FilesDisabled: true}},
@@ -65,6 +67,24 @@ func TestGatedJobRefusalIsTerminalFromFirstAttempt(t *testing.T) {
 			data := source.FailedData()[0]
 			if data["reason"] != tc.reason || data["refused"] != true || data["known_to_build"] != true || data["unsupported_job_type"] != false || data["job_type"] != tc.jobType || data["agent_version"] != "v2.201.0" || data["unregistered_reason"] != refusal.Message {
 				t.Fatalf("gate metadata wrong: %+v", data)
+			}
+		})
+	}
+}
+
+func TestIOSBuildPlatformRefusalPreservesDarwinRegistration(t *testing.T) {
+	for _, goos := range []string{"linux", "windows", "darwin"} {
+		t.Run(goos, func(t *testing.T) {
+			opts := LegacyHandlerOpts{GOOS: goos, MeetingEnabled: func() bool { return false }}
+			inventory := &registrationRefusals{goos: goos, opts: opts}
+			refusal := inventory.RefusalFor(JobTypeIOSBuild)
+			runner := NewRunner(NewMockJobSource("fake", nil), CreateLegacyHandlersWithOpts(opts), RunnerConfig{})
+			if goos == "darwin" {
+				if refusal != nil || !runner.CanHandle(JobTypeIOSBuild) {
+					t.Fatal("platform refusal suppressed the supported macOS handler")
+				}
+			} else if refusal == nil || refusal.Reason != "platform_unsupported" || !strings.Contains(refusal.Message, "macOS") || runner.CanHandle(JobTypeIOSBuild) {
+				t.Fatalf("unsupported platform lost its explicit refusal: %v", refusal)
 			}
 		})
 	}
