@@ -1,8 +1,12 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -246,9 +250,8 @@ func TestAutoUpdateSnapshotNextProcessClearsPending(t *testing.T) {
 	}
 }
 
-func TestCorruptUpdateStateVetoesOverridesAndClearsHeartbeatClaims(t *testing.T) {
+func TestCorruptUpdateStateKeepsPolicyPrecedenceAndClearsHeartbeatClaims(t *testing.T) {
 	withAutoUpdateEnv(t, "v2.200.0")
-	t.Setenv("CITADEL_AUTO_UPDATE", "on")
 	if err := update.EnsureUpdateDir(); err != nil {
 		t.Fatal(err)
 	}
@@ -256,16 +259,34 @@ func TestCorruptUpdateStateVetoesOverridesAndClearsHeartbeatClaims(t *testing.T)
 	if err := os.WriteFile(update.GetStateFilePath(), broken, 0600); err != nil {
 		t.Fatal(err)
 	}
-	inputs := autoUpdatePolicyInputs{force: true}
-	if enabled, source := resolveAutoUpdatePolicy(inputs); enabled || source != "unknown" {
-		t.Fatalf("override bypassed corrupt state: enabled=%t source=%s", enabled, source)
+	for _, tc := range []struct {
+		name, env, optOut, version, source string
+		force, enabled                     bool
+	}{
+		{name: "unknown", version: "v2.200.0", source: "unknown"},
+		{name: "env on", env: "on", version: "v2.200.0", source: "env", enabled: true},
+		{name: "env off", env: "off", version: "v2.200.0", source: "env"},
+		{name: "flag before env", env: "off", force: true, version: "v2.200.0", source: "flag", enabled: true},
+		{name: "opt out before flag", env: "on", force: true, optOut: "1", version: "v2.200.0", source: "opt-out"},
+		{name: "dev before flag", env: "on", force: true, version: "dev", source: "dev"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CITADEL_AUTO_UPDATE", tc.env)
+			t.Setenv("CITADEL_NO_AUTO_UPDATE", tc.optOut)
+			Version = tc.version
+			inputs := autoUpdatePolicyInputs{force: tc.force}
+			if enabled, source := resolveAutoUpdatePolicy(inputs); enabled != tc.enabled || source != tc.source {
+				t.Fatalf("policy mismatch: enabled=%t source=%s", enabled, source)
+			}
+			snapshot := buildAutoUpdateSnapshot(inputs, "periodic")
+			if snapshot.ConfiguredEnabled != nil || snapshot.EffectiveEnabled == nil || *snapshot.EffectiveEnabled != tc.enabled ||
+				snapshot.LastResult != update.ResultStateCorrupt || snapshot.PolicySource != tc.source ||
+				snapshot.PendingVersion != "" || snapshot.RestartRequired || snapshot.LastResultAt != nil || snapshot.LastCheckAt != nil || snapshot.LatestVersion != "" {
+				t.Fatalf("corrupt heartbeat lost explicit policy or inferred file fields: %+v", snapshot)
+			}
+		})
 	}
-	snapshot := buildAutoUpdateSnapshot(inputs, "periodic")
-	if snapshot.ConfiguredEnabled != nil || snapshot.EffectiveEnabled == nil || *snapshot.EffectiveEnabled ||
-		snapshot.LastResult != update.ResultStateCorrupt || snapshot.PolicySource != "unknown" ||
-		snapshot.PendingVersion != "" || snapshot.RestartRequired || snapshot.LastResultAt != nil {
-		t.Fatalf("corrupt heartbeat inferred state fields: %+v", snapshot)
-	}
+	Version = "v2.200.0"
 	if err := update.SetAutoUpdate(true); err != nil {
 		t.Fatal(err)
 	}
@@ -273,5 +294,76 @@ func TestCorruptUpdateStateVetoesOverridesAndClearsHeartbeatClaims(t *testing.T)
 	if repaired.ConfiguredEnabled == nil || !*repaired.ConfiguredEnabled ||
 		repaired.EffectiveEnabled == nil || !*repaired.EffectiveEnabled || repaired.LastResult == update.ResultStateCorrupt {
 		t.Fatalf("explicit repair did not clear the pause/report: %+v", repaired)
+	}
+}
+
+type corruptStateReleaseChecker struct{ checks, downloads int }
+
+func (c *corruptStateReleaseChecker) CheckForUpdate() (*update.Release, error) {
+	c.checks++
+	return &update.Release{TagName: "v2.201.0"}, nil
+}
+
+func (c *corruptStateReleaseChecker) DownloadAndVerify(*update.Release, string) error {
+	c.downloads++
+	return nil
+}
+
+// Exercise the actual worker wiring rather than only policy/report helpers.
+func TestCorruptUpdateStateEnvOnStillChecksAndReportsCorruption(t *testing.T) {
+	withAutoUpdateEnv(t, "v2.200.0")
+	t.Setenv("CITADEL_AUTO_UPDATE", "on")
+	if err := update.EnsureUpdateDir(); err != nil {
+		t.Fatal(err)
+	}
+	broken := []byte("{broken}")
+	if err := os.WriteFile(update.GetStateFilePath(), broken, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ticks := make(chan time.Time, 1)
+	ticks <- time.Unix(1, 0)
+	checker := &corruptStateReleaseChecker{}
+	applies, restarts := 0, 0
+	var last update.ReportSnapshot
+	done := startWorkerAutoUpdater(ctx, true, autoUpdatePolicyInputs{}, &updaterTestWorker{}, func(string, ...any) {}, autoUpdateRuntime{
+		checker: checker, ticks: ticks, afterTick: cancel,
+		refresh: func() { last = buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic") },
+		apply:   func(string) error { applies++; return nil },
+		restart: func() error { restarts++; return nil },
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture updater did not stop")
+	}
+	if checker.checks != 1 || checker.downloads != 1 || applies != 1 || restarts != 1 {
+		t.Fatalf("explicit env did not complete fake update: checks=%d downloads=%d applies=%d restarts=%d", checker.checks, checker.downloads, applies, restarts)
+	}
+	if last.EffectiveEnabled == nil || !*last.EffectiveEnabled || last.PolicySource != "env" || last.LastResult != update.ResultStateCorrupt || last.ConfiguredEnabled != nil {
+		t.Fatalf("forced update lost corrupt telemetry: %+v", last)
+	}
+	if got, err := os.ReadFile(update.GetStateFilePath()); err != nil || !bytes.Equal(got, broken) {
+		t.Fatal("forced check overwrote corrupt evidence")
+	}
+}
+
+func TestCorruptUpdateStatusNamesBothRepairCommands(t *testing.T) {
+	withAutoUpdateEnv(t, "v2.200.0")
+	if err := update.EnsureUpdateDir(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(update.GetStateFilePath(), []byte("null"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if state, err := loadUpdateStateForStatus(&out); state != nil || !errors.Is(err, update.ErrStateCorrupt) {
+		t.Fatalf("corrupt status loaded defaults: state=%v err=%v", state, err)
+	}
+	for _, command := range []string{"citadel update enable", "citadel update disable"} {
+		if !strings.Contains(out.String(), command) {
+			t.Fatalf("status omitted repair command %q: %s", command, &out)
+		}
 	}
 }

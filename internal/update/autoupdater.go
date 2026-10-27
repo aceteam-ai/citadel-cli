@@ -65,6 +65,12 @@ type AutoUpdaterConfig struct {
 	// tick honors it without a restart. If nil, the updater is always enabled.
 	Enabled func() bool
 
+	// Policy, when supplied, replaces Enabled and returns the same effective
+	// decision plus its source. The owner uses "unknown" for an unreadable
+	// file preference, distinct from an intentional opt-out, so a paused
+	// corrupt-state notice does not tell opted-out nodes to enable updates.
+	Policy func() (enabled bool, source string)
+
 	// ActiveJobs reports the number of in-flight jobs. When it returns 0 the
 	// updater considers the node idle and safe to restart. If nil, the node is
 	// always considered idle (best-effort).
@@ -235,15 +241,24 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 				// running agent (persisted/env) is reflected even on a cycle that
 				// installs nothing (citadel-cli#1134).
 				a.refresh()
-				// Corrupt or unreadable state is a visible pause, even with a flag
-				// or env enable. Do not guess preferences or overwrite evidence.
+				// Decide effective policy first. An unreadable file cannot override
+				// an explicit flag/env value, but its damage stays visible.
+				enabled, source := true, ""
+				if a.cfg.Policy != nil {
+					enabled, source = a.cfg.Policy()
+				} else if a.cfg.Enabled != nil {
+					enabled = a.cfg.Enabled()
+				}
 				if _, corrupt := ReadStateForReport(); corrupt {
-					a.cfg.Log("auto-update: state file unreadable, auto-update paused; run 'citadel update enable' to repair")
-					return
+					if enabled {
+						a.cfg.Log("auto-update: state file unreadable, continuing under explicit policy; repair with 'citadel update enable' or 'citadel update disable'")
+					} else if source == "unknown" {
+						a.cfg.Log("auto-update: state file unreadable, auto-update paused; repair with 'citadel update enable' or 'citadel update disable'")
+					}
 				}
 				// Re-check the toggle every tick so it can be flipped on a running
 				// agent without a restart.
-				if a.cfg.Enabled != nil && !a.cfg.Enabled() {
+				if !enabled {
 					return
 				}
 				// runOnce never panics; guard anyway so a bug here can never take

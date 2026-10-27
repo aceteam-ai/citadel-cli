@@ -5,6 +5,7 @@ package update
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -133,6 +134,12 @@ func SetAutoUpdate(enabled bool) error {
 }
 
 func changeState(repair bool, mutate func(*State)) error {
+	return changeStateWithBackup(repair, mutate, backupCorruptState)
+}
+
+// The backup callback permits deterministic IO-failure fixtures without
+// weakening the production transaction or relying on root-sensitive modes.
+func changeStateWithBackup(repair bool, mutate func(*State), backup func(string, time.Time) error) error {
 	if mutate == nil {
 		return errors.New("missing update state mutation")
 	}
@@ -143,11 +150,59 @@ func changeState(repair bool, mutate func(*State)) error {
 			if !repair || !errors.Is(err, ErrStateCorrupt) {
 				return err
 			}
+			// Preserve the malformed bytes before publishing fresh defaults.
+			// Evidence capture is best-effort and must not prevent an explicit
+			// repair when the backup itself cannot be written.
+			_ = backup(path, time.Now())
 			state = defaultState()
 		}
 		mutate(state)
 		return writeStateFile(path, state, defaultStateFileOps())
 	})
+}
+
+// backupCorruptState is called only under the state lock. CreateTemp keeps
+// collisions from overwriting an earlier repair's evidence, even if the clock
+// repeats. The UTC timestamp is filename-safe on Windows as well as Unix.
+func backupCorruptState(path string, now time.Time) error {
+	input, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("corrupt update state is not a regular file")
+	}
+	prefix := filepath.Base(path) + ".corrupt-" + now.UTC().Format("20060102T150405.000000000Z") + "-*"
+	copy, err := os.CreateTemp(filepath.Dir(path), prefix)
+	if err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		_ = copy.Close()
+		if !complete {
+			_ = os.Remove(copy.Name())
+		}
+	}()
+	if err := keepStateOwner(copy, path); err != nil {
+		return err
+	}
+	if _, err := io.Copy(copy, input); err != nil {
+		return err
+	}
+	if err := copy.Sync(); err != nil {
+		return err
+	}
+	if err := copy.Close(); err != nil {
+		return err
+	}
+	complete = true
+	return syncStateDir(filepath.Dir(path))
 }
 
 // ShouldCheck returns true if enough time has passed since the last check

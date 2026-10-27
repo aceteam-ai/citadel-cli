@@ -376,9 +376,8 @@ func rollbackUpdate() {
 }
 
 func showUpdateStatus() {
-	state, err := update.LoadState()
+	state, err := loadUpdateStateForStatus(os.Stderr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading update state: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -417,6 +416,16 @@ func showUpdateStatus() {
 		fmt.Printf("Update available: %s\n", release.TagName)
 		fmt.Println("\nRun 'citadel update install' to update.")
 	}
+}
+
+// Keep the error path testable without invoking os.Exit or a release lookup.
+func loadUpdateStateForStatus(errOut io.Writer) (*update.State, error) {
+	state, err := update.LoadState()
+	if err != nil {
+		fmt.Fprintf(errOut, "Error loading update state: %v\n", err)
+		fmt.Fprintln(errOut, "Repair malformed state with 'citadel update enable' or 'citadel update disable'. Unreadable state requires correcting file access first.")
+	}
+	return state, err
 }
 
 func setAutoUpdate(enabled bool) {

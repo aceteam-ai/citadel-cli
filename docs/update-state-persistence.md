@@ -40,15 +40,26 @@ non-regular state paths also remain unverified. Ordinary telemetry and lifecycle
 writes preserve that evidence rather than replacing it with default preferences.
 There is no automatic salvage of an initial JSON object.
 
-Every periodic tick with unreadable or corrupt state pauses before consulting the
-release checker, even if a flag or environment value requests auto-update. It
-logs one static repair notice per tick. Heartbeat reports configured_enabled=null,
-effective_enabled=false, policy_source=unknown and last_result=state_corrupt.
-Pending versions and timestamps are not guessed from the broken file. This
-result is derived for the report; it is not written into the corrupt JSON.
+Corruption replaces only the file-sourced preference with unknown. The effective
+policy still follows opt-out/dev veto, then flag, then environment, then the
+persisted preference. An explicit flag or environment enable therefore keeps
+running release checks and updates. Heartbeat reports configured_enabled=null
+and last_result=state_corrupt while retaining that effective policy and source.
+Pending versions and timestamps are not guessed from the broken file. This result
+is derived for the report; it is not written into the corrupt JSON.
+
+When the file is the only policy source, each corrupt tick logs a paused repair
+notice. An explicitly enabled tick logs that it is continuing under explicit
+policy instead. Explicit opt-out, environment-off and development-build vetoes
+do not emit a misleading repair/enable notice. Both repair commands are named in
+the notices and in `citadel update status` error output.
 
 An explicit `citadel update enable` or `citadel update disable` repairs malformed
 JSON under the same lock using fresh defaults and the requested preference.
+Before replacement it attempts a 0600, owner-preserving sibling copy named
+`state.json.corrupt-<UTC timestamp>-<random suffix>`. Backup failures do not block
+the requested repair; incomplete copies are removed, and prior copies are never
+overwritten. No backup is created for an ordinary telemetry write or valid state.
 Unreadable files are refused rather than replaced. Valid state retains its
 other fields. No source change repairs a live node or enables updates by itself.
 
@@ -63,5 +74,6 @@ file cleanup. Corrupt-tick fixtures use an in-memory checker and manual ticks;
 heartbeat fixtures check the pause and explicit repair. No real updater, network
 release lookup, binary apply, restart or live host-state operation is involved.
 
-Local candidate execution is held. Normal GitHub CI supplies execution evidence;
+Focused offline fixtures use isolated HOME/XDG, with no release service, binary
+apply or restart. Normal GitHub CI supplies broader suite and cross-build evidence;
 source review and CI do not establish crash or native fleet acceptance.
