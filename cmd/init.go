@@ -360,7 +360,7 @@ and system user configuration (requires sudo).`,
 					}
 				} else {
 					// Do not mistake a saved bearer for a completed current-key link.
-					printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
+					printDeviceLinkDiagnosticContext(cmd.Context(), os.Stderr, getDeviceConfigFromFile())
 				}
 
 				// Get node name from network status
