@@ -38,6 +38,16 @@ on force-new enrollment; a saved node ID does not confer predecessor deletion
 authority. See `docs/enrollment-service-recovery.md` for #1356's repair reach,
 start-limit behavior, source references and remaining migration/acceptance gates.
 
+`worker.registrationRefusals` owns non-executable evidence for withheld job
+types; it follows the same live permission callbacks and static registration
+inputs as `CreateLegacyHandlersWithOpts`. `Runner.unavailableJobRefusal` prefers
+that evidence, then the fallback gate catalog, then a known-but-unregistered
+refusal. Only types absent from `allKnownJobTypes` receive an update-node hint.
+`LegacyHandlerAdapter.Execute` rechecks the live gate and returns the shared
+typed refusal so a revocation after selection is terminal on its first attempt.
+The refusal inventory never advertises or executes a job. Focused coverage is
+in `internal/worker/job_refusal_test.go`.
+
 `workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
 loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
 validation separately from the HTTP node. Both worker entrypoints load once via
