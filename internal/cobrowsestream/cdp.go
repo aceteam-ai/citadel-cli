@@ -1,6 +1,7 @@
 package cobrowsestream
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -17,6 +18,9 @@ import (
 // cannot hang a viewer connection forever.
 var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
+const maxCDPDiscoveryBytes = 64 << 10
+const maxCDPDiscoveryTargets = 64
+
 // cdpTargetURL resolves a debug port to the page target's DevTools WebSocket URL.
 // It is a package var so tests can point the CDP client at a fake Chrome
 // (httptest WebSocket) without launching a real browser -- the same injection
@@ -26,26 +30,71 @@ var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
 var cdpTargetURL = defaultCDPTargetURL
 
 func defaultCDPTargetURL(debugPort int) (string, error) {
-	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
+	return discoverCDPTargetURL(debugPort, cdpHTTPClient)
+}
+
+func discoverCDPTargetURL(debugPort int, client *http.Client) (string, error) {
+	// The probe is local. A redirect must not turn discovery into a request to
+	// another origin. Copy the client so the shared timeout/transport stay intact.
+	probe := *client
+	probe.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := probe.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+	}
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("CDP target discovery request failed")
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("CDP target discovery requires HTTP 200")
+	}
+	if resp.ContentLength > maxCDPDiscoveryBytes {
+		return "", fmt.Errorf("CDP target discovery exceeds 64 KiB")
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCDPDiscoveryBytes+1))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("CDP target discovery body read failed")
 	}
-	var targets []struct {
-		Type                 string `json:"type"`
-		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	if len(body) > maxCDPDiscoveryBytes {
+		return "", fmt.Errorf("CDP target discovery exceeds 64 KiB")
 	}
-	if err := json.Unmarshal(body, &targets); err != nil {
-		return "", err
+	return decodeCDPDiscoveryTargets(body, debugPort)
+}
+
+func decodeCDPDiscoveryTargets(body []byte, debugPort int) (string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('[') {
+		return "", fmt.Errorf("CDP target discovery requires a JSON array")
 	}
-	for _, t := range targets {
-		if t.Type == "page" && t.WebSocketDebuggerURL != "" {
-			return t.WebSocketDebuggerURL, nil
+	selected := ""
+	count := 0
+	for decoder.More() {
+		if count == maxCDPDiscoveryTargets {
+			return "", fmt.Errorf("CDP target discovery exceeds 64 targets")
 		}
+		var target struct {
+			Type                 string `json:"type"`
+			WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+		}
+		if err := decoder.Decode(&target); err != nil {
+			return "", fmt.Errorf("CDP target discovery contains invalid target JSON")
+		}
+		count++
+		if selected == "" && target.Type == "page" && target.WebSocketDebuggerURL != "" {
+			selected = target.WebSocketDebuggerURL
+		}
+	}
+	if closing, err := decoder.Token(); err != nil || closing != json.Delim(']') {
+		return "", fmt.Errorf("CDP target discovery has an incomplete array")
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return "", fmt.Errorf("CDP target discovery has trailing JSON")
+	}
+	// Validate the complete array and target count before exposing its first
+	// page. A useful prefix must not hide a malformed or oversized suffix.
+	if selected != "" {
+		return selected, nil
 	}
 	return "", fmt.Errorf("no page target found on CDP port %d", debugPort)
 }
