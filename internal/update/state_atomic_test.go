@@ -100,6 +100,52 @@ func TestStateWriteFailureBoundaries(t *testing.T) {
 	}
 }
 
+func TestStateCloseFailurePreservesPreviousValidAndCorruptBytes(t *testing.T) {
+	for _, previous := range []string{`{"auto_update":true,"channel":"old"}`, `{"auto_update":true`} {
+		t.Run(strconv.Itoa(len(previous)), func(t *testing.T) {
+			isolateState(t)
+			if err := EnsureUpdateDir(); err != nil {
+				t.Fatal(err)
+			}
+			path := GetStateFilePath()
+			if err := os.WriteFile(path, []byte(previous), 0600); err != nil {
+				t.Fatal(err)
+			}
+			ops := defaultStateFileOps()
+			closed, renamed := false, false
+			ops.syncFile = func(file *os.File) error {
+				if err := file.Sync(); err != nil {
+					return err
+				}
+				// Close only this test-owned temporary file. The writer's actual
+				// final Close must now fail, before it can publish by rename.
+				if err := file.Close(); err != nil {
+					return err
+				}
+				closed = true
+				return nil
+			}
+			rename := ops.rename
+			ops.rename = func(oldPath, newPath string) error {
+				renamed = true
+				return rename(oldPath, newPath)
+			}
+			err := withStateLock(path, func() error { return writeStateFile(path, &State{Channel: "new"}, ops) })
+			if err == nil || !closed || renamed {
+				t.Fatalf("close failure crossed the publication boundary: closed=%t renamed=%t error=%v", closed, renamed, err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || string(got) != previous {
+				t.Fatalf("failed close discarded previous bytes: got=%q error=%v", got, err)
+			}
+			leftovers, err := filepath.Glob(filepath.Join(GetUpdateDir(), ".state.json.tmp-*"))
+			if err != nil || len(leftovers) != 0 {
+				t.Fatalf("failed close leaked temporary state: %v error=%v", leftovers, err)
+			}
+		})
+	}
+}
+
 func TestCorruptStateNeedsExplicitPreferenceRepair(t *testing.T) {
 	for _, broken := range []string{"{\"auto_update\":true}}", "null", ""} {
 		t.Run(strconv.Itoa(len(broken)), func(t *testing.T) {
