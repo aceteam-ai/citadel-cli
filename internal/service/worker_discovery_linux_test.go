@@ -6,11 +6,52 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestDiscoveryOutputBoundsCopyWithoutWriterTo(t *testing.T) {
+	// Command stdout is copied with io.Copy. Hiding WriterTo exercises its
+	// destination fast path, rather than only calling Write directly.
+	reader := struct{ io.Reader }{strings.NewReader(strings.Repeat("x", maxWorkerDiscoveryOutput+1))}
+	var output discoveryOutput
+	if _, err := io.Copy(&output, reader); !errors.Is(err, errWorkerDiscoveryBound) {
+		t.Fatalf("copy escaped output limit: bytes=%d error=%v", output.Len(), err)
+	}
+	if output.Len() > maxWorkerDiscoveryOutput {
+		t.Fatal("output retained bytes beyond its bound")
+	}
+}
+
+func TestDiscoveryOutputBoundsStdoutPipeCopy(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer writer.Close()
+		_, _ = writer.Write([]byte(strings.Repeat("x", maxWorkerDiscoveryOutput+1)))
+	}()
+	var output discoveryOutput
+	_, copyErr := io.Copy(&output, reader)
+	_ = reader.Close() // Release a writer if copying refused before its final byte.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture pipe writer did not stop")
+	}
+	if !errors.Is(copyErr, errWorkerDiscoveryBound) || output.Len() > maxWorkerDiscoveryOutput {
+		t.Fatalf("stdout pipe copy escaped output limit: bytes=%d error=%v", output.Len(), copyErr)
+	}
+}
 
 type discoveryFixture struct {
 	list      map[bool]string

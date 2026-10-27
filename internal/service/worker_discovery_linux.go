@@ -19,13 +19,18 @@ const maxWorkerDiscoveryUnits = 512
 
 var errWorkerDiscoveryBound = errors.New("service discovery output exceeded its bound")
 
-type discoveryOutput struct{ bytes.Buffer }
+// Keep the buffer named: embedding it promotes ReadFrom, which lets io.Copy
+// bypass Write's bound when os/exec copies a command's stdout pipe.
+type discoveryOutput struct{ buffer bytes.Buffer }
+
+func (b *discoveryOutput) Len() int      { return b.buffer.Len() }
+func (b *discoveryOutput) Bytes() []byte { return b.buffer.Bytes() }
 
 func (b *discoveryOutput) Write(data []byte) (int, error) {
 	if len(data) > maxWorkerDiscoveryOutput-b.Len() {
 		return 0, errWorkerDiscoveryBound
 	}
-	return b.Buffer.Write(data)
+	return b.buffer.Write(data)
 }
 
 func captureSystemctl(ctx context.Context, args ...string) ([]byte, error) {
