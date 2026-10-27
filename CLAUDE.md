@@ -31,6 +31,20 @@ So, when adding to this file:
 
 ## Project Overview
 
+`mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
+descriptor acquisition: it checks a no-follow leaf pin before any readable
+leaf open, and fails closed if the verified procfs FD route is unavailable.
+`workspace_linux_test.go` covers ordering, replacement, refusal and cleanup
+using owned fixtures, not real devices. This does not settle owner/hard-link
+policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
+
+`coordinatorfetch.Get` owns the shared fixed-route, bounded HTTPS transfer used
+by FILE_FETCH and the inactive media inbox freezer. Caller packages retain
+permission, exact-size/hash and publication policy; the client grants none.
+`mediainput.Freezer` adds live media-input checks and conditional Files checks
+for mixed snapshots, without registering a task or reserving the future C5
+holder admission. See `docs/media-input-freezer.md` for the activation gates.
+
 `workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
 loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
 validation separately from the HTTP node. Both worker entrypoints load once via
