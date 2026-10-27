@@ -50,13 +50,37 @@ another installation cannot demand a restart. Startup reconciliation clears stal
 restart results only with valid version metadata, preserving other outcomes and
 preferences.
 
-This is the first source slice for #1487. The follow-up still needs ExecStart-based
-service discovery, a failing restart request when no unit is found, doctor checks
-against the actual unit user, and installer/unit preservation for both intentional
-privilege separation and self-updating layouts. Native elevated owner transitions,
-Windows ACL/share behavior and live fleet acceptance are separate gates. This
-source work performs no installation, service change or deployment.
+On Linux, manual update restart detection uses `DiscoverActiveWorkers` instead of
+a fixed unit-name list. It inspects the system manager and the caller's user
+manager, accepting a literal `work` invocation of the same resolved executable.
+Backing files must agree with loaded state (`NeedDaemonReload=no`). Shell wrappers,
+unknown expansion syntax, incomplete inspection and ambiguous matches are left
+for manual inspection. It does not enter another user's service manager. Discovery
+has bounded output, candidate count and elapsed time, and never exports unit
+environment values. Existing unit rematerialization keeps its narrower file list.
+
+An explicit `update install --restart` fails nonzero when no single verified active
+target is found, including on already-latest and superseded-update paths. After the
+existing bounded job drain it rechecks the unit, binary and configured account;
+changes refuse restart. An unrequested restart remains unrequested.
+
+`doctor` and successful returning manual installs report read-only install-layout
+evidence for each observed worker, using its configured account rather than the
+CLI invoker. They flag binary-owner mismatches and Unix directory mode bits that
+lack write/search access. Unknown identity/metadata stays unverified. A matching
+owner and permissive mode are not proof of effective authority: ACLs, capabilities,
+mounts and the service namespace may differ. The worker's own probe remains the
+authority. Deliberate privilege separation is advisory and does not fail doctor's
+health exit code. Neither diagnostic creates a probe or changes ownership.
+
+Installer ownership and executable-directory write grants still need the explicit
+self-update-intent decision for new installs; this slice does not migrate existing
+privilege-separated layouts. The refresh regression pins `User=`, `Group=`, the
+auto-update opt-out and existing environment/write paths. Native elevated owner
+transitions, Windows ACL/share behavior and live fleet acceptance are separate
+gates. This source work performs no installation, service change or deployment.
 
 A read-only filesystem refusal also reports `requires_privileged_install`, including
 a systemd `ProtectSystem=strict` sandbox. It does not authorize changing the
 mount, service protection or installed binary ownership.
+

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -121,14 +122,91 @@ func TestFinishManualNoOpRefreshesManagedUnitsWithoutUpdateState(t *testing.T) {
 		return nil, nil
 	}
 	var out strings.Builder
-	if !finishManualNoOp(update.ApplyResult{Disposition: update.Superseded, InstalledAfter: "v2.0.0"}, &out) {
+	if !finishManualNoOp(update.ApplyResult{Disposition: update.Superseded, InstalledAfter: "v2.0.0"}, &out, false, func() { t.Fatal("no restart was requested") }) {
 		t.Fatal("superseded manual apply was not handled as no-op")
 	}
 	if called != 1 {
 		t.Fatalf("managed-unit refresh calls = %d, want 1", called)
 	}
-	if finishManualNoOp(update.ApplyResult{Disposition: update.Applied}, &out) {
+	if finishManualNoOp(update.ApplyResult{Disposition: update.Applied}, &out, false, func() { t.Fatal("no restart was requested") }) {
 		t.Fatal("applied update handled as no-op")
+	}
+}
+
+func TestFinishManualNoOpHonorsExplicitRestart(t *testing.T) {
+	original := rematerializeManagedUnitsFn
+	t.Cleanup(func() { rematerializeManagedUnitsFn = original })
+	for _, disposition := range []update.ApplyDisposition{update.AlreadyCurrent, update.Superseded, update.Applied} {
+		for _, requested := range []bool{false, true} {
+			var order []string
+			rematerializeManagedUnitsFn = func(func(string, ...any)) ([]string, error) { order = append(order, "refresh"); return nil, nil }
+			var out bytes.Buffer
+			handled := finishManualNoOp(update.ApplyResult{Disposition: disposition}, &out, requested, func() { order = append(order, "restart") })
+			if disposition == update.Applied {
+				if handled || len(order) != 0 {
+					t.Fatalf("applied result was handled twice: %v %v", handled, order)
+				}
+			} else {
+				want := []string{"refresh"}
+				if requested {
+					want = append(want, "restart")
+				}
+				if !handled || !reflect.DeepEqual(order, want) {
+					t.Fatalf("explicit no-swap restart not honored: result=%v requested=%t order=%v", disposition, requested, order)
+				}
+			}
+		}
+	}
+}
+
+func TestManagedWorkerRestartRevalidatesAfterDrain(t *testing.T) {
+	worker := service.ManagedWorker{Unit: service.ManagedUnit{Name: "citadel-work"}, Executable: "/fixture/citadel", User: "fixture-user"}
+	for _, tc := range []struct {
+		name    string
+		fresh   []service.ManagedWorker
+		err     error
+		success bool
+	}{
+		{name: "same worker", fresh: []service.ManagedWorker{worker}, success: true},
+		{name: "worker disappeared"},
+		{name: "ambiguous", fresh: []service.ManagedWorker{worker, worker}},
+		{name: "different unit", fresh: []service.ManagedWorker{{Unit: service.ManagedUnit{Name: "other"}, Executable: worker.Executable, User: worker.User}}},
+		{name: "different executable", fresh: []service.ManagedWorker{{Unit: worker.Unit, Executable: "/foreign/citadel", User: worker.User}}},
+		{name: "different user", fresh: []service.ManagedWorker{{Unit: worker.Unit, Executable: worker.Executable, User: "other-user"}}},
+		{name: "unavailable", err: errors.New("synthetic lookup failure")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			drained, restarted := false, false
+			target, found := managedServiceTargetFromWorkers([]service.ManagedWorker{worker}, func() ([]service.ManagedWorker, error) {
+				if !drained {
+					t.Fatal("revalidation ran before draining")
+				}
+				return tc.fresh, tc.err
+			}, func(got service.ManagedUnit) error {
+				restarted = true
+				if got != worker.Unit {
+					t.Fatal("restarted another unit")
+				}
+				return nil
+			})
+			if !found {
+				t.Fatal("verified custom worker was not offered as target")
+			}
+			var out, errOut bytes.Buffer
+			code := runManagedServiceGate(true, func() (managedServiceTarget, bool) { return target, true }, func(io.Writer) { drained = true }, &out, &errOut)
+			if restarted != tc.success || (code == 0) != tc.success {
+				t.Fatalf("stale/ambiguous worker restart result: code=%d restarted=%t error=%s", code, restarted, &errOut)
+			}
+		})
+	}
+}
+
+func TestManagedWorkerRestartRequiresOneInitialMatch(t *testing.T) {
+	worker := service.ManagedWorker{Unit: service.ManagedUnit{Name: "citadel-work"}, Executable: "/fixture/citadel"}
+	for _, workers := range [][]service.ManagedWorker{nil, {worker, worker}} {
+		if _, found := managedServiceTargetFromWorkers(workers, func() ([]service.ManagedWorker, error) { t.Fatal("unverified target was refreshed"); return nil, nil }, func(service.ManagedUnit) error { t.Fatal("unverified target was restarted"); return nil }); found {
+			t.Fatal("non-unique restart target was accepted")
+		}
 	}
 }
 
@@ -270,10 +348,11 @@ func TestRunManagedServiceGate_TableDriven(t *testing.T) {
 			wantExitCode: 0,
 		},
 		{
-			name:         "not managed even with --restart requested: still a no-op",
-			resolve:      func(*bool) func() (managedServiceTarget, bool) { return notFoundResolver },
-			doRestart:    true,
-			wantExitCode: 0,
+			name:          "restart requested without verified unit: fails loudly",
+			resolve:       func(*bool) func() (managedServiceTarget, bool) { return notFoundResolver },
+			doRestart:     true,
+			wantExitCode:  1,
+			wantErrSubstr: "no service was restarted",
 		},
 		{
 			name: "managed, default (no --restart): warns loudly, does not restart",

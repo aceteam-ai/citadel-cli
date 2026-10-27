@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -174,6 +175,13 @@ func checkForUpdate() {
 }
 
 func installUpdate() {
+	// Observe the unit's account after every successful returning path, also
+	// when already latest. Never mistake this CLI's sudo privileges for the
+	// worker's ability to update its binary later.
+	defer func() {
+		checks, note := currentManagedUpdateDiagnostics()
+		reportManagedUpdateWarnings(os.Stderr, checks, note)
+	}()
 	// citadel#926: self-heal before attempting a new swap, in case a prior
 	// update was interrupted mid-swap (also checked in PersistentPreRun, but
 	// checked again here so `citadel update install` is a reliable manual
@@ -203,11 +211,9 @@ func installUpdate() {
 		// so a node deployed by a pre-#444 binary never gets the restart-storm
 		// hardening. RematerializeManagedUnits is idempotent (a unit already
 		// current is a clean no-op), so running it here is safe on every call.
-		// We do NOT run warnOrRestartManagedService: the binary is unchanged, so
-		// there is no old-vs-new split-brain to warn about -- the only live
-		// consequence is the rewritten unit, which the refresh itself reports
-		// applies on the next restart.
-		refreshManagedServiceUnits(os.Stdout)
+		// An explicit restart request still applies when this CLI is current:
+		// a separately running worker can remain on an older process image.
+		finishManualNoOp(update.ApplyResult{Disposition: update.AlreadyCurrent}, os.Stdout, updateInstallRestart, func() { warnOrRestartManagedService(true) })
 		return
 	}
 
@@ -249,7 +255,7 @@ func installUpdate() {
 		os.Exit(1)
 	}
 
-	if finishManualNoOp(applyResult, os.Stdout) {
+	if finishManualNoOp(applyResult, os.Stdout, updateInstallRestart, func() { warnOrRestartManagedService(true) }) {
 		installSpinner.StopWithSuccess(fmt.Sprintf("You are running the latest version (%s)", applyResult.InstalledAfter))
 		return
 	}
@@ -282,11 +288,14 @@ func installUpdate() {
 	warnOrRestartManagedService(updateInstallRestart)
 }
 
-func finishManualNoOp(result update.ApplyResult, out io.Writer) bool {
+func finishManualNoOp(result update.ApplyResult, out io.Writer, doRestart bool, restart func()) bool {
 	if result.Disposition == update.Applied {
 		return false
 	}
 	refreshManagedServiceUnits(out)
+	if doRestart {
+		restart()
+	}
 	return true
 }
 
@@ -459,17 +468,10 @@ type managedServiceTarget struct {
 
 // resolveManagedServiceRestartTarget decides whether citadel is currently
 // running as a managed service that needs restarting to load a just-installed
-// binary, and if so, how. It layers two signals:
-//
-//  1. service.ActiveManagedUnit -- a direct systemd-unit scan (Linux only, a
-//     no-op stub elsewhere). This is the ONLY signal that sees the
-//     install.sh/packer fleet unit (citadel-worker.service), which is how
-//     citadel actually ships on most nodes and is a completely different unit
-//     from the one service.Manager below manages.
-//  2. service.NewManager().Status() -- the cross-platform abstraction behind
-//     `citadel service install/start/stop/status`. This is the only signal on
-//     macOS (launchd) and Windows (SCM), and also covers a Linux node set up
-//     via `citadel service install` rather than install.sh.
+// binary. Linux discovers active units by their literal effective ExecStart
+// and resolved binary path, without relying on the unit name. Exactly one
+// verified match is required and is checked again after the job drain. Other
+// platforms use the existing launchd/SCM Manager status abstraction.
 //
 // Deliberately NOT used: this process's own environment (CITADEL_SERVICE,
 // INVOCATION_ID -- see managedByServiceManager in cmd/agent_tools.go). Those
@@ -481,12 +483,17 @@ type managedServiceTarget struct {
 // worker exists on this host -- checking it would make the detection silently
 // never fire in exactly the scenario citadel#454 reported.
 func resolveManagedServiceRestartTarget() (managedServiceTarget, bool) {
-	if unit, ok := service.ActiveManagedUnit(); ok {
-		return managedServiceTarget{
-			Description: unit.Description(),
-			RestartCmd:  unit.RestartCommand(),
-			Restart:     unit.Restart,
-		}, true
+	if runtime.GOOS == "linux" {
+		executable, err := update.GetCurrentBinaryPath()
+		if err != nil {
+			return managedServiceTarget{}, false
+		}
+		refresh := func() ([]service.ManagedWorker, error) { return service.DiscoverActiveWorkers(executable) }
+		workers, err := refresh()
+		if err != nil {
+			return managedServiceTarget{}, false
+		}
+		return managedServiceTargetFromWorkers(workers, refresh, func(unit service.ManagedUnit) error { return unit.Restart() })
 	}
 
 	mgr := service.NewManager()
@@ -495,6 +502,25 @@ func resolveManagedServiceRestartTarget() (managedServiceTarget, bool) {
 		return managedServiceTarget{}, false
 	}
 	return managedServiceTargetFromManagerStatus(st, mgr)
+}
+
+func managedServiceTargetFromWorkers(workers []service.ManagedWorker, refresh func() ([]service.ManagedWorker, error), restart func(service.ManagedUnit) error) (managedServiceTarget, bool) {
+	if len(workers) != 1 {
+		return managedServiceTarget{}, false
+	}
+	worker := workers[0]
+	return managedServiceTarget{
+		Description: worker.Unit.Description(), RestartCmd: worker.Unit.RestartCommand(),
+		Restart: func() error {
+			// The in-flight-job drain can take minutes. Revalidate the target
+			// after it, rather than restarting a stale or now-ambiguous unit.
+			fresh, err := refresh()
+			if err != nil || len(fresh) != 1 || fresh[0] != worker {
+				return fmt.Errorf("managed worker changed or could not be reverified; no service was restarted")
+			}
+			return restart(worker.Unit)
+		},
+	}, true
 }
 
 // managedServiceTargetFromManagerStatus is the pure decision given a
@@ -550,6 +576,10 @@ func formatManagedServiceWarning(target managedServiceTarget) string {
 func runManagedServiceGate(doRestart bool, resolve func() (managedServiceTarget, bool), drain func(out io.Writer), out, errOut io.Writer) int {
 	target, found := resolve()
 	if !found {
+		if doRestart {
+			fmt.Fprintln(errOut, "Could not verify a unique active managed Citadel worker; no service was restarted. Verify its service unit and restart the worker manually.")
+			return 1
+		}
 		return 0
 	}
 
@@ -697,6 +727,17 @@ func warnOrRestartManagedService(doRestart bool) {
 	code := runManagedServiceGate(doRestart, resolveManagedServiceRestartTarget, drain, os.Stdout, os.Stderr)
 	if code != 0 {
 		os.Exit(code)
+	}
+}
+
+func reportManagedUpdateWarnings(out io.Writer, checks []service.WorkerUpdateDiagnostic, note string) {
+	if note != "" {
+		fmt.Fprintf(out, "Worker update permissions unverified: %s\n", note)
+	}
+	for _, check := range checks {
+		if check.Warning {
+			fmt.Fprintf(out, "Worker update capability: %s runs as %q; binary owner %q, install directory %q: %s\n", check.Unit, check.WorkerUser, check.BinaryOwner, check.Directory, check.Detail)
+		}
 	}
 }
 
