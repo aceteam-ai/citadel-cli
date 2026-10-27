@@ -29,13 +29,14 @@ uncertain. It does not convert an unprivileged unit into a root unit.
 `rematerializeManagedUnits` backs up and writes eligible changed files, then
 requests the appropriate system or caller-user `daemon-reload`. An unchanged
 file needs no write or reload. An unprivileged system-file repair reports the
-root remediation instead of writing. Read, backup, write and reload failures
-are reported per candidate. The returned list of rewritten files is not proof
-that every candidate was repaired or that every manager reload succeeded.
+root remediation instead of writing. Read, backup and write failures are
+reported per candidate; reload failures are reported per affected manager after
+the candidate loop. The returned list of rewritten files is not proof that
+every candidate was repaired or that every manager reload succeeded.
 
 The CLI entry point is [`runSvcRefreshUnit`](../cmd/service_cmd.go), exposed as
 `citadel service refresh-unit`. Manual update and worker startup also call the
-managed-unit refresh. These calls do not issue a worker restart or
+managed-unit refresh. The refresh itself does not issue a worker restart or
 `reset-failed`; there is no explicit start-counter reset in this source path.
 A change that affects the worker's process takes effect when the service is
 subsequently started or restarted.
@@ -62,7 +63,7 @@ runtime CA, TLS or pointer-lock state. Those paths and their ownership,
 conflict, offline and locking rules remain the separate unratified
 [runtime-state migration design](design-enrollment-runtime-state.md).
 
-## Stale node selectors do not grant replacement authority
+## Enrollment reclaim selects a credential and sends a hostname
 
 [`reclaimEnrollmentNodesWith`](../cmd/enrollment_reclaim.go) owns enrollment's
 credential selection and force-new behavior:
@@ -82,21 +83,31 @@ is logged at debug level and does not itself stop enrollment. A reclaim attempt
 or a continuing enrollment is not proof that an old registration was removed.
 
 The original #1356 request to include a saved Headscale ID remains a selector
-proposal, not permission to delete a predecessor. The paired backend now binds
-deregistration to the calling device credential as well as the organization.
-An ID or matching hostname cannot substitute for that binding. A freshly
-approved replacement credential does not inherit the old credential's delete
-authority. Reusing a hostname can therefore leave a distinct old registration
-in place instead of silently replacing it.
+proposal, not permission to delete a predecessor. For a node with durable
+configuration, the paired backend anchors deregistration to the configured
+device credential and organization. An ID or matching hostname cannot replace
+that binding. A freshly approved replacement credential does not inherit a
+durably linked predecessor's delete authority.
 
-After force-new enrollment, predecessor removal needs a separately approved
-platform operation. Do not interpret force-new as that approval or use it to
-recover an old bearer token. No node-ID reclaim implementation or platform replacement
-protocol is introduced here. The current selection tests are in
+The backend retains a distinct legacy path for nodes without durable
+configuration. It can authorize reclaim using the exact authenticated credential
+in the node's organization and that credential's original hostname; a hostname
+alone is insufficient.
+During that legacy reclaim, a new unlinked enrollment credential is preserved
+so it can link afterward. This describes the existing backend compatibility
+path, not a new replacement grant or a proposed expansion of its authority.
+
+The CLI's force-new case still skips reclaim unconditionally, independently of
+that backend legacy exception. Any later predecessor removal is a separate
+platform operation requiring its own authority. Do not interpret force-new as
+that authority or use it to recover an old bearer token. No node-ID reclaim
+implementation or platform replacement protocol is introduced here. The current
+selection tests are in
 [`enrollment_reclaim_test.go`](../cmd/enrollment_reclaim_test.go).
 
 Backend source reference for this audit: Aceteam main
 `5981274b1557c952bdd676bee9818993f0dc8737`,
-[`device-auth/deregister`](https://github.com/aceteam-ai/aceteam/blob/5981274b1557c952bdd676bee9818993f0dc8737/app/api/fabric/device-auth/deregister/route.ts).
+[`device-auth/deregister`](https://github.com/aceteam-ai/aceteam/blob/5981274b1557c952bdd676bee9818993f0dc8737/app/api/fabric/device-auth/deregister/route.ts)
+and its [credential-revocation helper](https://github.com/aceteam-ai/aceteam/blob/5981274b1557c952bdd676bee9818993f0dc8737/utils/deviceApiKeys.ts).
 This is source evidence, not proof of a deployed version or successful live
 replacement. #1356 remains open for its separate migration and acceptance gates.
