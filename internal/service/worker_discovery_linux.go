@@ -21,16 +21,33 @@ var errWorkerDiscoveryBound = errors.New("service discovery output exceeded its 
 
 // Keep the buffer named: embedding it promotes ReadFrom, which lets io.Copy
 // bypass Write's bound when os/exec copies a command's stdout pipe.
-type discoveryOutput struct{ buffer bytes.Buffer }
+type discoveryOutput struct {
+	buffer   bytes.Buffer
+	exceeded bool
+}
 
 func (b *discoveryOutput) Len() int      { return b.buffer.Len() }
 func (b *discoveryOutput) Bytes() []byte { return b.buffer.Bytes() }
 
 func (b *discoveryOutput) Write(data []byte) (int, error) {
-	if len(data) > maxWorkerDiscoveryOutput-b.Len() {
+	if b.exceeded || len(data) > maxWorkerDiscoveryOutput-b.Len() {
+		b.exceeded = true
 		return 0, errWorkerDiscoveryBound
 	}
 	return b.buffer.Write(data)
+}
+
+func (b *discoveryOutput) result(runErr error) ([]byte, error) {
+	// Cmd.Wait can prefer the child's exit error over a stdout copy error.
+	// Keep overflow as an independent observation, never an unavailable-manager
+	// error that would let discovery use an incomplete set of workers.
+	if b.exceeded {
+		return nil, errWorkerDiscoveryBound
+	}
+	if runErr != nil {
+		return nil, runErr
+	}
+	return b.Bytes(), nil
 }
 
 func captureSystemctl(ctx context.Context, args ...string) ([]byte, error) {
@@ -38,10 +55,7 @@ func captureSystemctl(ctx context.Context, args ...string) ([]byte, error) {
 	command.WaitDelay = 500 * time.Millisecond
 	var output discoveryOutput
 	command.Stdout, command.Stderr = &output, io.Discard
-	if err := command.Run(); err != nil {
-		return nil, err
-	}
-	return output.Bytes(), nil
+	return output.result(command.Run())
 }
 
 // DiscoverActiveWorkers examines the system manager and the caller's user
@@ -70,6 +84,9 @@ func discoverActiveWorkers(ctx context.Context, executable string, capture func(
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
+			}
+			if errors.Is(err, errWorkerDiscoveryBound) {
+				return nil, errWorkerDiscoveryBound
 			}
 			continue // A host need not have both a system and a user manager.
 		}

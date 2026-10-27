@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -50,6 +51,58 @@ func TestDiscoveryOutputBoundsStdoutPipeCopy(t *testing.T) {
 	}
 	if !errors.Is(copyErr, errWorkerDiscoveryBound) || output.Len() > maxWorkerDiscoveryOutput {
 		t.Fatalf("stdout pipe copy escaped output limit: bytes=%d error=%v", output.Len(), copyErr)
+	}
+}
+
+func TestDiscoverActiveWorkersRejectsCollectorOverflowInEitherManager(t *testing.T) {
+	for _, overflowUser := range []bool{false, true} {
+		t.Run(fmt.Sprintf("overflow_user=%t", overflowUser), func(t *testing.T) {
+			f := discoveryFixture{
+				list:   map[bool]string{!overflowUser: "worker.service loaded active running Worker\n"},
+				units:  map[string]string{"worker.service": "[Service]\nExecStart=/fixture/citadel work\n"},
+				reload: "no",
+			}
+			base := f.capture(t)
+			capture := func(ctx context.Context, args ...string) ([]byte, error) {
+				userMode, command := len(args) > 0 && args[0] == "--user", args[0]
+				if userMode {
+					command = args[1]
+				}
+				if command == "list-units" && userMode == overflowUser {
+					return nil, fmt.Errorf("fixture capture: %w", errWorkerDiscoveryBound)
+				}
+				return base(ctx, args...)
+			}
+			workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", capture, fixtureCanonical)
+			if !errors.Is(err, errWorkerDiscoveryBound) || len(workers) != 0 {
+				t.Fatalf("overflow hid a manager and admitted partial discovery: workers=%+v error=%v", workers, err)
+			}
+		})
+	}
+}
+
+func TestDiscoveryCapturePreservesOverflowOverCommandFailure(t *testing.T) {
+	for _, runErr := range []error{nil, errors.New("fixture command failure"), &exec.ExitError{}} {
+		var output discoveryOutput
+		if _, err := output.Write(make([]byte, maxWorkerDiscoveryOutput+1)); !errors.Is(err, errWorkerDiscoveryBound) {
+			t.Fatal("fixture did not overflow")
+		}
+		body, err := output.result(runErr)
+		if body != nil || !errors.Is(err, errWorkerDiscoveryBound) {
+			t.Fatalf("process error hid overflow: body bytes=%d error type=%T", len(body), err)
+		}
+		if _, err := output.Write([]byte("later")); !errors.Is(err, errWorkerDiscoveryBound) {
+			t.Fatal("overflow observation was reset by a later write")
+		}
+	}
+	var output discoveryOutput
+	_, _ = output.Write([]byte("fixture"))
+	processErr := errors.New("fixture manager unavailable")
+	if body, err := output.result(processErr); body != nil || err != processErr {
+		t.Fatal("ordinary command failure was reclassified")
+	}
+	if body, err := output.result(nil); err != nil || string(body) != "fixture" {
+		t.Fatal("bounded successful output was dropped")
 	}
 }
 
