@@ -85,7 +85,7 @@ func startWorkerAutoUpdater(ctx context.Context, ownsWorker bool, inputs autoUpd
 		Interval:   interval,
 		Ticks:      runtime.ticks,
 		AfterTick:  runtime.afterTick,
-		Enabled:    func() bool { return resolveAutoUpdateEnabled(inputs) },
+		Policy:     func() (bool, string) { return resolveAutoUpdatePolicy(inputs) },
 		ActiveJobs: runner.ActiveJobs,
 		BeginDrain: runner.BeginDrain,
 		Apply:      runtime.apply,

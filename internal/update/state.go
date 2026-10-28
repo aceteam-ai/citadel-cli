@@ -4,6 +4,8 @@ package update
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -72,9 +74,26 @@ func EnsureUpdateDir() error {
 }
 
 // LoadState reads the update state from disk
-// Returns default state if file doesn't exist
+// Returns default state only if the file does not exist. Malformed or
+// unreadable state returns an error and is never implicitly repaired.
 func LoadState() (*State, error) {
-	statePath := GetStateFilePath()
+	return loadStateFile(GetStateFilePath())
+}
+
+// ErrStateCorrupt requires an explicit preference repair, never a telemetry write.
+var ErrStateCorrupt = errors.New("update state is corrupt")
+
+func loadStateFile(statePath string) (*State, error) {
+	info, err := os.Lstat(statePath)
+	if os.IsNotExist(err) {
+		return defaultState(), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("update state is not a regular file")
+	}
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -83,26 +102,107 @@ func LoadState() (*State, error) {
 		return nil, err
 	}
 
-	var state State
+	var state *State
 	if err := json.Unmarshal(data, &state); err != nil {
-		return defaultState(), nil
+		return nil, ErrStateCorrupt
 	}
-
-	return &state, nil
+	if state == nil {
+		return nil, ErrStateCorrupt
+	}
+	return state, nil
 }
 
-// SaveState writes the update state to disk
+// SaveState atomically replaces a full snapshot under the cross-process lock.
+// Load/modify/save callers must use MutateState to avoid saving stale fields.
 func SaveState(state *State) error {
-	if err := EnsureUpdateDir(); err != nil {
-		return err
-	}
+	path := GetStateFilePath()
+	return withStateLock(path, func() error { return writeStateFile(path, state, defaultStateFileOps()) })
+}
 
-	data, err := json.MarshalIndent(state, "", "  ")
+// MutateState serializes the complete transaction across processes. The callback
+// must be short and must not call another state writer. Unreadable or corrupt
+// state is preserved rather than silently resetting preferences or results.
+func MutateState(mutate func(*State)) error {
+	return changeState(false, mutate)
+}
+
+// SetAutoUpdate is the explicit preference operation and the only automatic-
+// updater API that repairs malformed JSON. No prior fields are guessed or
+// salvaged; unreadable files still return an error.
+func SetAutoUpdate(enabled bool) error {
+	return changeState(true, func(state *State) { state.AutoUpdate = enabled })
+}
+
+func changeState(repair bool, mutate func(*State)) error {
+	return changeStateWithBackup(repair, mutate, backupCorruptState)
+}
+
+// The backup callback permits deterministic IO-failure fixtures without
+// weakening the production transaction or relying on root-sensitive modes.
+func changeStateWithBackup(repair bool, mutate func(*State), backup func(string, time.Time) error) error {
+	if mutate == nil {
+		return errors.New("missing update state mutation")
+	}
+	path := GetStateFilePath()
+	return withStateLock(path, func() error {
+		state, err := loadStateFile(path)
+		if err != nil {
+			if !repair || !errors.Is(err, ErrStateCorrupt) {
+				return err
+			}
+			// Preserve the malformed bytes before publishing fresh defaults.
+			// Evidence capture is best-effort and must not prevent an explicit
+			// repair when the backup itself cannot be written.
+			_ = backup(path, time.Now())
+			state = defaultState()
+		}
+		mutate(state)
+		return writeStateFile(path, state, defaultStateFileOps())
+	})
+}
+
+// backupCorruptState is called only under the state lock. CreateTemp keeps
+// collisions from overwriting an earlier repair's evidence, even if the clock
+// repeats. The UTC timestamp is filename-safe on Windows as well as Unix.
+func backupCorruptState(path string, now time.Time) error {
+	input, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-
-	return os.WriteFile(GetStateFilePath(), data, 0644)
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("corrupt update state is not a regular file")
+	}
+	prefix := filepath.Base(path) + ".corrupt-" + now.UTC().Format("20060102T150405.000000000Z") + "-*"
+	copy, err := os.CreateTemp(filepath.Dir(path), prefix)
+	if err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		_ = copy.Close()
+		if !complete {
+			_ = os.Remove(copy.Name())
+		}
+	}()
+	if err := keepStateOwner(copy, path); err != nil {
+		return err
+	}
+	if _, err := io.Copy(copy, input); err != nil {
+		return err
+	}
+	if err := copy.Sync(); err != nil {
+		return err
+	}
+	if err := copy.Close(); err != nil {
+		return err
+	}
+	complete = true
+	return syncStateDir(filepath.Dir(path))
 }
 
 // ShouldCheck returns true if enough time has passed since the last check

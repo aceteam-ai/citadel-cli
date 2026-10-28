@@ -219,14 +219,11 @@ func NewAgentUpdateHandler(cfg AgentUpdateConfig) *AgentUpdateHandler {
 	}
 	if cfg.RecordState == nil {
 		cfg.RecordState = func(oldVersion, newVersion string) {
-			state, err := update.LoadState()
-			if err != nil {
-				return
-			}
-			update.RecordUpdate(state, oldVersion, newVersion)
-			state.AvailableUpdate = ""
-			update.UpdateLastCheck(state)
-			_ = update.SaveState(state)
+			_ = update.MutateState(func(state *update.State) {
+				update.RecordUpdate(state, oldVersion, newVersion)
+				state.AvailableUpdate = ""
+				update.UpdateLastCheck(state)
+			})
 		}
 	}
 	return &AgentUpdateHandler{cfg: cfg}

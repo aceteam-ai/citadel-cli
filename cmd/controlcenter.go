@@ -397,9 +397,6 @@ func runControlCenter() {
 
 		// Try to reconnect if we have saved state
 		if network.HasState() {
-			if detail := deviceLinkDiagnostic(getDeviceConfigFromFile()); detail != "" {
-				cc.AddActivity("warning", "Device link: "+detail)
-			}
 			cc.AddActivity("info", "Reconnecting to network...")
 			connected, err := network.VerifyOrReconnect(ctx)
 			if err != nil && errors.Is(err, network.ErrStaleState) {
@@ -432,6 +429,12 @@ func runControlCenter() {
 				cc.AddActivity("success", "Connected to AceTeam Network")
 				networkConnected = true
 			}
+		}
+
+		// One startup display observation after the live mesh check, never
+		// from refresh, heartbeat or automatic reconnect retry loops.
+		if detail := observeDeviceLinkDiagnostic(ctx, getDeviceConfigFromFile(), defaultDeviceLinkObservation()); detail != "" {
+			cc.AddActivity("warning", "Device link: "+detail)
 		}
 
 		// Gather initial data after network check

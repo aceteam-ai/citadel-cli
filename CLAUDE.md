@@ -31,6 +31,13 @@ So, when adding to this file:
 
 ## Project Overview
 
+`service.RematerializeManagedUnits` owns the bounded base-file refresh and
+reload request, not worker restart or failed-unit counter recovery.
+`cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
+on force-new enrollment; a saved node ID does not confer predecessor deletion
+authority. See `docs/enrollment-service-recovery.md` for #1356's repair reach,
+start-limit behavior, source references and remaining migration/acceptance gates.
+
 `workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
 loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
 validation separately from the HTTP node. Both worker entrypoints load once via
@@ -4086,8 +4093,12 @@ via `AutoUpdaterConfig.Refresh` (threaded through `autoUpdateRuntime.refresh`);
 `buildAutoUpdateSnapshot` reuses agentNodeInfo's #923 `CurrentVersion!=running`
 rule for pending_version/restart_required. pending clears only when the running
 binary matches the staged version (`ReconcilePendingOnStartup`). Corrupt state
-degrades to `configured_enabled=null`/`last_result=unknown`, never a confident
-disabled.
+degrades to `configured_enabled=null`/`last_result=state_corrupt` and never supplies
+pending versions or timestamps. `resolveAutoUpdatePolicy` keeps opt-out/dev veto,
+then flag, then environment ahead of the file preference; corruption replaces
+only that last preference with unknown. Explicit enables still run, while
+telemetry writes preserve the broken bytes. `SetAutoUpdate` alone repairs malformed
+JSON and first attempts a private UTC-stamped `state.json.corrupt-*` backup.
 
 **Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
 The update state file resolves from HOME (`getUserHomeDir`), and the shipped

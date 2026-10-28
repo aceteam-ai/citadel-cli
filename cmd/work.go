@@ -941,7 +941,6 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
-		printDeviceLinkDiagnostic(os.Stderr, deviceConfig)
 		Debug("using API mode (device_api_token found)")
 		useAPIMode = true
 
@@ -1196,6 +1195,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		Log("network connected")
 	} else {
 		Log("network not configured (no saved state)")
+	}
+	// Display only, once after live mesh identity resolution; never on the
+	// heartbeat/retry path and never a condition for starting the worker.
+	if useAPIMode {
+		printDeviceLinkDiagnosticContext(ctx, os.Stderr, deviceConfig)
 	}
 	// Publish one immutable provider bundle after transport selection, before
 	// session control can read it. Heartbeat and optional status consumers below
