@@ -44,6 +44,14 @@ func (w *RedisStreamWriter) WriteChunk(content string, index int) error {
 	return w.client.PublishChunk(w.ctx, w.jobID, w.rayID, content, index)
 }
 
+// WriteReasoningChunk keeps reasoning out of the answer-content stream.
+func (w *RedisStreamWriter) WriteReasoningChunk(content string, index int) error {
+	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "chunk", map[string]any{
+		"reasoning_content": content,
+		"index":             index,
+	})
+}
+
 // WriteEnd signals successful job completion with final result.
 func (w *RedisStreamWriter) WriteEnd(result map[string]any) error {
 	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "end", w.clock.data(map[string]any{"result": result}, true))
@@ -117,6 +125,14 @@ func (w *APIStreamWriter) WriteChunk(content string, index int) error {
 	return w.client.PublishChunk(w.ctx, w.jobID, w.rayID, content, index)
 }
 
+// WriteReasoningChunk keeps reasoning out of the answer-content stream.
+func (w *APIStreamWriter) WriteReasoningChunk(content string, index int) error {
+	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "chunk", map[string]any{
+		"reasoning_content": content,
+		"index":             index,
+	})
+}
+
 // WriteEnd signals successful job completion with final result.
 func (w *APIStreamWriter) WriteEnd(result map[string]any) error {
 	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "end", w.clock.data(map[string]any{"result": result}, true))
@@ -158,6 +174,16 @@ func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(j
 type clockStreamWriter struct {
 	StreamWriter
 	clock *deliveryClock
+}
+
+// Preserve optional reasoning delivery through the runner's clock wrapper.
+// Without this forwarding method, the LLM handler sees only the wrapper and
+// drops reasoning chunks even when the underlying writer supports them.
+func (w *clockStreamWriter) WriteReasoningChunk(content string, index int) error {
+	if writer, ok := w.StreamWriter.(reasoningChunkWriter); ok {
+		return writer.WriteReasoningChunk(content, index)
+	}
+	return nil
 }
 
 func observeStream(writer StreamWriter, clock *deliveryClock) StreamWriter {
