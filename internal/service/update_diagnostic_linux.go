@@ -24,8 +24,15 @@ func DiagnoseWorkerUpdate(worker ManagedWorker) WorkerUpdateDiagnostic {
 	return diagnoseWorkerUpdate(worker, os.Stat, lookup, func(account *user.User) ([]string, error) { return account.GroupIds() })
 }
 
-func diagnoseWorkerUpdate(worker ManagedWorker, stat func(string) (os.FileInfo, error), lookup func(string) (*user.User, error), groups func(*user.User) ([]string, error)) WorkerUpdateDiagnostic {
-	d := WorkerUpdateDiagnostic{Unit: worker.Unit.Description(), WorkerUser: worker.User, Directory: filepath.Dir(worker.Executable), Warning: true, Detail: "update permissions could not be verified; inspect the worker account and its install directory"}
+func diagnoseWorkerUpdate(worker ManagedWorker, stat func(string) (os.FileInfo, error), lookup func(string) (*user.User, error), groups func(*user.User) ([]string, error)) (d WorkerUpdateDiagnostic) {
+	d = WorkerUpdateDiagnostic{Unit: worker.Unit.Description(), WorkerUser: worker.User, Directory: filepath.Dir(worker.Executable), Warning: true, Detail: "update permissions could not be verified; inspect the worker account and its install directory"}
+	defer func() {
+		if worker.AutoUpdateDisabled {
+			d.AutoUpdateDisabled = true
+			d.Warning = false
+			d.Detail = "automatic updates deliberately disabled; " + d.Detail
+		}
+	}()
 	if worker.User == "" || worker.Executable == "" {
 		return d
 	}

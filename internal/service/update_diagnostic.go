@@ -5,6 +5,7 @@ package service
 // filesystem namespace can differ from the CLI's view. Only the worker-side
 // preflight can establish effective update authority.
 type WorkerUpdateDiagnostic struct {
+	AutoUpdateDisabled                       bool
 	Unit, WorkerUser, BinaryOwner, Directory string
 	Warning                                  bool
 	Detail                                   string

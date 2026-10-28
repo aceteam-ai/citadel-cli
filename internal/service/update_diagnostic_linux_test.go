@@ -141,3 +141,11 @@ func TestDiagnoseWorkerUpdateUnknownIsNeverWritable(t *testing.T) {
 		})
 	}
 }
+
+func TestDeliberatelyDisabledAutoUpdateIsInfoEvenForPrivilegedLayout(t *testing.T) {
+	worker := ManagedWorker{Unit: ManagedUnit{Name: "fixture"}, Executable: "/fixture/citadel", User: "unit-worker", AutoUpdateDisabled: true}
+	d := diagnoseWorkerUpdate(worker, func(string) (os.FileInfo, error) { return updateFixtureInfo{0755, 0, 0}, nil }, func(string) (*user.User, error) { return &user.User{Uid: "9001"}, nil }, func(*user.User) ([]string, error) { t.Fatal("policy diagnosis changed owner checks"); return nil, nil })
+	if d.Warning || !d.AutoUpdateDisabled || d.BinaryOwner != "uid 0" || !strings.Contains(d.Detail, "deliberately disabled") || !strings.Contains(d.Detail, "owners differ") {
+		t.Fatalf("manual policy was misreported as warning or writable authority: %+v", d)
+	}
+}

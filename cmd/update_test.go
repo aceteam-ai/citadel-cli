@@ -826,3 +826,46 @@ func (f *fakeManager) Stop() error {
 func (f *fakeManager) Status() (*service.ServiceStatus, error) {
 	return &service.ServiceStatus{Installed: true, Running: true}, nil
 }
+
+func TestManagedServiceDiscoveryFailuresAreNotNoWorker(t *testing.T) {
+	for _, phase := range []string{"executable", "discovery", "multiple workers"} {
+		for _, requested := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/restart=%t", phase, requested), func(t *testing.T) {
+				cause := errors.New("fixture loaded unit is stale")
+				target, found := resolveManagedWorkersTarget(func() (string, error) {
+					if phase == "executable" {
+						return "", cause
+					}
+					return "/fixture/citadel", nil
+				}, func(path string) ([]service.ManagedWorker, error) {
+					if phase == "executable" {
+						t.Fatal("discovery ran after executable failure")
+					}
+					if path != "/fixture/citadel" {
+						t.Fatal("wrong executable")
+					}
+					if phase == "discovery" {
+						return nil, cause
+					}
+					return []service.ManagedWorker{{}, {}}, nil
+				})
+				if found || target.DiscoveryErr == nil {
+					t.Fatal("failure became a successful no-worker observation")
+				}
+				var out, diagnostics bytes.Buffer
+				code := runManagedServiceGate(requested, func() (managedServiceTarget, bool) { return target, found }, func(io.Writer) { t.Fatal("unverified target was drained") }, &out, &diagnostics)
+				if (code != 0) != requested || !strings.Contains(diagnostics.String(), "discovery failed:") || !strings.Contains(diagnostics.String(), target.DiscoveryErr.Error()) {
+					t.Fatalf("discovery cause or exit lost: code=%d output=%q diagnostics=%q", code, out.String(), diagnostics.String())
+				}
+				if !requested && !strings.Contains(diagnostics.String(), "may still be on the old binary") {
+					t.Fatal("applied swap lost its stale-worker warning")
+				}
+			})
+		}
+	}
+	var out, diagnostics bytes.Buffer
+	target, found := resolveManagedWorkersTarget(func() (string, error) { return "/fixture/citadel", nil }, func(string) ([]service.ManagedWorker, error) { return nil, nil })
+	if found || target.DiscoveryErr != nil || runManagedServiceGate(false, func() (managedServiceTarget, bool) { return target, found }, nil, &out, &diagnostics) != 0 || out.Len() != 0 || diagnostics.Len() != 0 {
+		t.Fatal("verified worker absence made unsolicited noise")
+	}
+}

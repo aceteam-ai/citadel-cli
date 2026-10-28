@@ -543,3 +543,36 @@ func TestRenderDoctorReport_DarwinDockerOptional(t *testing.T) {
 		}
 	}
 }
+
+func TestManualInstallSuppressesUnrequestedDiagnosticNotes(t *testing.T) {
+	for _, note := range []string{"managed worker install-layout inspection is only available on Linux", "no active managed worker using this executable was verified"} {
+		var out bytes.Buffer
+		reportManualManagedUpdateDiagnostics(&out, nil, note, false)
+		if out.Len() != 0 {
+			t.Fatalf("unrequested install diagnostic: %q", out.String())
+		}
+		reportManualManagedUpdateDiagnostics(&out, nil, note, true)
+		if !strings.Contains(out.String(), note) {
+			t.Fatal("explicit diagnostics lost the note")
+		}
+		out.Reset()
+		renderDoctorReport(&out, doctorReport{updateDiagnosisNote: note})
+		if !strings.Contains(out.String(), "[UNVERIFIED] "+note) {
+			t.Fatal("doctor lost explicit unknown evidence")
+		}
+	}
+}
+
+func TestIntentionalManualUpdatePolicyIsInformational(t *testing.T) {
+	check := service.WorkerUpdateDiagnostic{Unit: "fixture", WorkerUser: "9001", BinaryOwner: "uid 0", Directory: "/fixture", AutoUpdateDisabled: true, Detail: "automatic updates deliberately disabled"}
+	var out bytes.Buffer
+	reportManualManagedUpdateDiagnostics(&out, []service.WorkerUpdateDiagnostic{check}, "", false)
+	if !strings.Contains(out.String(), "[INFO]") || strings.Contains(out.String(), "[WARN]") || !strings.Contains(out.String(), check.Detail) {
+		t.Fatalf("manual policy not informational: %q", out.String())
+	}
+	out.Reset()
+	renderDoctorReport(&out, doctorReport{updateDiagnostics: []service.WorkerUpdateDiagnostic{check}})
+	if !strings.Contains(out.String(), "[INFO] fixture") || strings.Contains(out.String(), "[WARN] fixture") {
+		t.Fatalf("doctor policy not informational: %q", out.String())
+	}
+}

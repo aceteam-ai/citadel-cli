@@ -160,7 +160,7 @@ func TestDiscoverActiveWorkersUsesExecutableInsteadOfUnitName(t *testing.T) {
 		}, reload: "no\n",
 	}
 	workers, err := discoverActiveWorkers(context.Background(), "/fixture/bin/citadel", fixture.capture(t), fixtureCanonical)
-	want := []ManagedWorker{{Unit: ManagedUnit{Name: "citadel-work"}, Executable: "/fixture/bin/citadel", User: "fixture-worker"}}
+	want := []ManagedWorker{{Unit: ManagedUnit{Name: "citadel-work"}, Executable: "/fixture/bin/citadel", User: "fixture-worker", AutoUpdateDisabled: true}}
 	if err != nil || !reflect.DeepEqual(workers, want) {
 		t.Fatalf("custom worker not discovered or foreign binary selected: %+v %v", workers, err)
 	}
@@ -180,9 +180,9 @@ func TestWorkerUnitIdentityHonorsSectionsQuotesAndDropInResets(t *testing.T) {
 		{"root opt-out", "[Service]\nExecStart=/fixture/citadel --no-auto-update work\n", "/fixture/citadel", true},
 		{"drop-in reset", "[Service]\nExecStart=/foreign/citadel work\n# drop-in\n[Service]\nExecStart=\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
 		{"multiple commands", "[Service]\nExecStart=/fixture/citadel work\nExecStart=/foreign/citadel work\n", "", false},
-		{"wrong section", "[Unit]\nExecStart=/fixture/citadel work\n", "", false},
+		{"wrong section", "[Unit]\nExecStart=/fixture/citadel work\n", "", true},
 		{"shell wrapper", "[Service]\nExecStart=/bin/sh -c '/fixture/citadel work'\n", "", false},
-		{"different subcommand", "[Service]\nExecStart=/fixture/citadel worker\n", "", false},
+		{"different subcommand", "[Service]\nExecStart=/fixture/citadel worker\n", "", true},
 		{"specifier", "[Service]\nExecStart=%h/citadel work\n", "", false},
 		{"environment expansion", "[Service]\nExecStart=$EXECUTABLE work\n", "", false},
 		{"unknown escape", "[Service]\nExecStart=/fixture/space\\sdir/citadel work\n", "", false},
@@ -345,5 +345,63 @@ func TestDiscoverActiveWorkersCancellationBeforeAnyObservation(t *testing.T) {
 	}
 	if _, err := discoverActiveWorkers(ctx, "/fixture/citadel", capture, fixtureCanonical); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled observation not refused: %v", err)
+	}
+}
+
+func TestUserManagerDefaultAccountMatchesInspectedBus(t *testing.T) {
+	f := discoveryFixture{list: map[bool]string{true: "worker.service loaded active running Worker\n"}, units: map[string]string{"worker.service": "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no"}
+	workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001)
+	if err != nil || len(workers) != 1 || workers[0].User != "9001" || !workers[0].Unit.UserMode {
+		t.Fatalf("user manager identity lost: %+v %v", workers, err)
+	}
+	want := []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "XDG_RUNTIME_DIR=/run/user/9001", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/9001/bus"}
+	if got := discoveryManagerEnvironment(true, 9001); !reflect.DeepEqual(got, want) {
+		t.Fatalf("user bus not pinned to attributed account: %q", got)
+	}
+	if got := discoveryManagerEnvironment(false, 9001); !reflect.DeepEqual(got, want[:3]) {
+		t.Fatalf("system manager inherited a user bus: %q", got)
+	}
+}
+
+func TestUnparsedActiveInvocationCannotHideSecondWorker(t *testing.T) {
+	for _, command := range []string{"+/fixture/citadel work", "@/fixture/citadel worker-name work", "!/fixture/citadel work", "/fixture/citadel --unknown work", "/fixture/citadel \\\n work"} {
+		for _, hiddenFirst := range []bool{false, true} {
+			name, ordinary := "z.service", "a.service"
+			if hiddenFirst {
+				name, ordinary = ordinary, name
+			}
+			f := discoveryFixture{list: map[bool]string{false: name + " loaded active running Hidden\n" + ordinary + " loaded active running Worker\n"}, units: map[string]string{name: "[Service]\nExecStart=" + command + "\n", ordinary: "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no"}
+			if workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001); err == nil || len(workers) != 0 {
+				t.Fatalf("unparsed invocation became unique target: command=%q workers=%+v error=%v", command, workers, err)
+			}
+		}
+	}
+}
+
+func TestUnitAutoUpdatePolicyRespectsResetsAndUncertainty(t *testing.T) {
+	for _, tc := range []struct {
+		name, content string
+		disabled      bool
+	}{
+		{"literal environment", "Environment=CITADEL_NO_AUTO_UPDATE=1\nExecStart=/fixture/citadel work", true},
+		{"quoted environment", "Environment=\"CITADEL_NO_AUTO_UPDATE=1\"\nExecStart=/fixture/citadel work", true},
+		{"environment reset", "Environment=CITADEL_NO_AUTO_UPDATE=1\nEnvironment=\nExecStart=/fixture/citadel work", false},
+		{"last assignment", "Environment=CITADEL_NO_AUTO_UPDATE=1\nEnvironment=CITADEL_NO_AUTO_UPDATE=0\nExecStart=/fixture/citadel work", false},
+		{"unset before assignment", "UnsetEnvironment=CITADEL_NO_AUTO_UPDATE\nEnvironment=CITADEL_NO_AUTO_UPDATE=1\nExecStart=/fixture/citadel work", false},
+		{"unset reset", "UnsetEnvironment=CITADEL_NO_AUTO_UPDATE\nEnvironment=CITADEL_NO_AUTO_UPDATE=1\nUnsetEnvironment=\nExecStart=/fixture/citadel work", true},
+		{"unknown env file", "Environment=CITADEL_NO_AUTO_UPDATE=1\nEnvironmentFile=-/fixture/not-read\nExecStart=/fixture/citadel work", false},
+		{"env file reset", "EnvironmentFile=/fixture/not-read\nEnvironmentFile=\nEnvironment=CITADEL_NO_AUTO_UPDATE=1\nExecStart=/fixture/citadel work", true},
+		{"global flag", "ExecStart=/fixture/citadel --no-auto-update work", true},
+		{"worker flag", "ExecStart=/fixture/citadel work --no-auto-update", true},
+		{"false flag", "ExecStart=/fixture/citadel work --no-auto-update=false", false},
+		{"flag reset", "ExecStart=/fixture/citadel work --no-auto-update\nExecStart=\nExecStart=/fixture/citadel work", false},
+		{"not an argument", "ExecStart=/fixture/citadel work -- --no-auto-update", false},
+		{"different section", "ExecStart=/fixture/citadel work\n[Unit]\nEnvironment=CITADEL_NO_AUTO_UPDATE=1", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unitAutoUpdateDisabled("[Service]\n" + tc.content); got != tc.disabled {
+				t.Fatalf("policy=%t want %t", got, tc.disabled)
+			}
+		})
 	}
 }

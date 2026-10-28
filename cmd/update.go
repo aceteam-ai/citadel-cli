@@ -180,7 +180,7 @@ func installUpdate() {
 	// worker's ability to update its binary later.
 	defer func() {
 		checks, note := currentManagedUpdateDiagnostics()
-		reportManagedUpdateWarnings(os.Stderr, checks, note)
+		reportManualManagedUpdateDiagnostics(os.Stderr, checks, note, updateInstallRestart)
 	}()
 	// citadel#926: self-heal before attempting a new swap, in case a prior
 	// update was interrupted mid-swap (also checked in PersistentPreRun, but
@@ -461,9 +461,10 @@ func setAutoUpdate(enabled bool) {
 // running process has not yet picked up a just-installed binary, plus how to
 // restart it.
 type managedServiceTarget struct {
-	Description string
-	RestartCmd  string
-	Restart     func() error
+	DiscoveryErr error
+	Description  string
+	RestartCmd   string
+	Restart      func() error
 }
 
 // resolveManagedServiceRestartTarget decides whether citadel is currently
@@ -484,29 +485,36 @@ type managedServiceTarget struct {
 // never fire in exactly the scenario citadel#454 reported.
 func resolveManagedServiceRestartTarget() (managedServiceTarget, bool) {
 	if runtime.GOOS == "linux" {
-		executable, err := update.GetCurrentBinaryPath()
-		if err != nil {
-			return managedServiceTarget{}, false
-		}
-		refresh := func() ([]service.ManagedWorker, error) { return service.DiscoverActiveWorkers(executable) }
-		workers, err := refresh()
-		if err != nil {
-			return managedServiceTarget{}, false
-		}
-		return managedServiceTargetFromWorkers(workers, refresh, func(unit service.ManagedUnit) error { return unit.Restart() })
+		return resolveManagedWorkersTarget(update.GetCurrentBinaryPath, service.DiscoverActiveWorkers)
 	}
 
 	mgr := service.NewManager()
 	st, err := mgr.Status()
 	if err != nil {
-		return managedServiceTarget{}, false
+		return managedServiceTarget{DiscoveryErr: err}, false
 	}
 	return managedServiceTargetFromManagerStatus(st, mgr)
 }
 
+func resolveManagedWorkersTarget(executable func() (string, error), discover func(string) ([]service.ManagedWorker, error)) (managedServiceTarget, bool) {
+	path, err := executable()
+	if err != nil {
+		return managedServiceTarget{DiscoveryErr: err}, false
+	}
+	refresh := func() ([]service.ManagedWorker, error) { return discover(path) }
+	workers, err := refresh()
+	if err != nil {
+		return managedServiceTarget{DiscoveryErr: err}, false
+	}
+	return managedServiceTargetFromWorkers(workers, refresh, func(unit service.ManagedUnit) error { return unit.Restart() })
+}
+
 func managedServiceTargetFromWorkers(workers []service.ManagedWorker, refresh func() ([]service.ManagedWorker, error), restart func(service.ManagedUnit) error) (managedServiceTarget, bool) {
-	if len(workers) != 1 {
+	if len(workers) == 0 {
 		return managedServiceTarget{}, false
+	}
+	if len(workers) != 1 {
+		return managedServiceTarget{DiscoveryErr: fmt.Errorf("multiple active managed workers use this executable")}, false
 	}
 	worker := workers[0]
 	return managedServiceTarget{
@@ -575,6 +583,15 @@ func formatManagedServiceWarning(target managedServiceTarget) string {
 // byte-identical to the pre-#887 immediate-restart behavior.
 func runManagedServiceGate(doRestart bool, resolve func() (managedServiceTarget, bool), drain func(out io.Writer), out, errOut io.Writer) int {
 	target, found := resolve()
+	if target.DiscoveryErr != nil {
+		if doRestart {
+			fmt.Fprintf(errOut, "Could not verify a managed restart target: discovery failed: %v; no service was restarted. Inspect its unit and restart the worker manually.\n", target.DiscoveryErr)
+			return 1
+		}
+		fmt.Fprintf(errOut, "Warning: managed worker discovery failed: %v. The binary was replaced, but a running worker may still be on the old binary; inspect and restart it manually.\n", target.DiscoveryErr)
+		return 0
+	}
+
 	if !found {
 		if doRestart {
 			fmt.Fprintln(errOut, "Could not verify a unique active managed Citadel worker; no service was restarted. Verify its service unit and restart the worker manually.")
@@ -730,12 +747,21 @@ func warnOrRestartManagedService(doRestart bool) {
 	}
 }
 
+func reportManualManagedUpdateDiagnostics(out io.Writer, checks []service.WorkerUpdateDiagnostic, note string, explicit bool) {
+	if !explicit {
+		note = ""
+	}
+	reportManagedUpdateWarnings(out, checks, note)
+}
+
 func reportManagedUpdateWarnings(out io.Writer, checks []service.WorkerUpdateDiagnostic, note string) {
 	if note != "" {
 		fmt.Fprintf(out, "Worker update permissions unverified: %s\n", note)
 	}
 	for _, check := range checks {
-		if check.Warning {
+		if check.AutoUpdateDisabled {
+			fmt.Fprintf(out, "[INFO] Worker update policy: %s runs as %q; binary owner %q, install directory %q: %s\n", check.Unit, check.WorkerUser, check.BinaryOwner, check.Directory, check.Detail)
+		} else if check.Warning {
 			fmt.Fprintf(out, "Worker update capability: %s runs as %q; binary owner %q, install directory %q: %s\n", check.Unit, check.WorkerUser, check.BinaryOwner, check.Directory, check.Detail)
 		}
 	}

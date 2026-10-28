@@ -7,9 +7,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -52,6 +54,7 @@ func (b *discoveryOutput) result(runErr error) ([]byte, error) {
 
 func captureSystemctl(ctx context.Context, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "systemctl", args...)
+	command.Env = discoveryManagerEnvironment(len(args) > 0 && args[0] == "--user", os.Geteuid())
 	command.WaitDelay = 500 * time.Millisecond
 	var output discoveryOutput
 	command.Stdout, command.Stderr = &output, io.Discard
@@ -68,6 +71,10 @@ func DiscoverActiveWorkers(executable string) ([]ManagedWorker, error) {
 }
 
 func discoverActiveWorkers(ctx context.Context, executable string, capture func(context.Context, ...string) ([]byte, error), canonical func(string) (string, error)) ([]ManagedWorker, error) {
+	return discoverActiveWorkersForUID(ctx, executable, capture, canonical, os.Geteuid())
+}
+
+func discoverActiveWorkersForUID(ctx context.Context, executable string, capture func(context.Context, ...string) ([]byte, error), canonical func(string) (string, error), managerUID int) ([]ManagedWorker, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -131,20 +138,24 @@ func discoverActiveWorkers(ctx context.Context, executable string, capture func(
 				return nil, errors.New("active service unit is not verified against the loaded manager")
 			}
 			path, account, known := workerUnitIdentity(string(content))
-			if path == "" {
-				continue
-			}
 			if !known {
 				return nil, errors.New("active worker executable or account identity requires manual inspection")
+			}
+			if path == "" {
+				continue
 			}
 			resolved, err := canonical(path)
 			if err != nil || resolved != expected {
 				continue
 			}
-			if account == "" && !userMode {
-				account = "root"
+			if account == "" {
+				if userMode {
+					account = strconv.Itoa(managerUID)
+				} else {
+					account = "root"
+				}
 			}
-			workers = append(workers, ManagedWorker{Unit: ManagedUnit{Name: strings.TrimSuffix(name, ".service"), UserMode: userMode}, Executable: resolved, User: account})
+			workers = append(workers, ManagedWorker{Unit: ManagedUnit{Name: strings.TrimSuffix(name, ".service"), UserMode: userMode}, Executable: resolved, User: account, AutoUpdateDisabled: unitAutoUpdateDisabled(string(content))})
 		}
 	}
 	if managers == 0 {
@@ -170,7 +181,9 @@ func safeServiceName(name string) bool {
 // systemd specifier/environment expansion. Unknown syntax is left for manual
 // inspection. A nonempty path with known=false is a literal worker whose
 // account or filesystem mapping cannot be verified; it must not be hidden by
-// filtering. Empty ExecStart resets the list, including across drop-ins.
+// filtering. Empty path with known=true is a verified non-worker; any
+// known=false observation refuses complete discovery. Empty ExecStart resets
+// the list, including across drop-ins.
 func workerUnitIdentity(content string) (path, account string, known bool) {
 	section := ""
 	var commands []string
@@ -224,6 +237,9 @@ func workerUnitIdentity(content string) (path, account string, known bool) {
 			mappings[key] = value != "read-only" && value != "no" && value != "false" && value != "off" && value != "0"
 		}
 	}
+	if len(commands) == 0 {
+		return "", "", true
+	}
 	if len(commands) != 1 {
 		return "", "", false
 	}
@@ -235,7 +251,11 @@ func workerUnitIdentity(content string) (path, account string, known bool) {
 	if !filepath.IsAbs(path) || strings.ContainsAny(path, "%$\x00\r\n\t") {
 		return "", "", false
 	}
-	if words[1] == "work" || len(words) >= 3 && words[1] == "--no-auto-update" && words[2] == "work" {
+	workIndex := 1
+	if len(words) >= 3 && (words[1] == "--no-auto-update" || strings.HasPrefix(words[1], "--no-auto-update=")) {
+		workIndex = 2
+	}
+	if words[workIndex] == "work" {
 		if strings.ContainsAny(account, "\"'\\%$ \t") || dynamicUser != "" && dynamicUser != "no" && dynamicUser != "false" && dynamicUser != "off" && dynamicUser != "0" {
 			return path, "", false
 		}
@@ -246,7 +266,113 @@ func workerUnitIdentity(content string) (path, account string, known bool) {
 		}
 		return path, account, true
 	}
-	return "", "", false
+	for _, word := range words[1:] {
+		if word == "work" {
+			return path, account, false
+		}
+	}
+	switch filepath.Base(path) {
+	case "sh", "bash", "dash", "zsh", "fish", "env":
+		return "", "", false
+	}
+	return "", "", true
+}
+
+// The inspected user bus is pinned to the same effective UID carried on each
+// observed user unit. Do not inherit a different user's bus address from sudo.
+func discoveryManagerEnvironment(userMode bool, uid int) []string {
+	environment := []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
+	if userMode {
+		runtimeDir := "/run/user/" + strconv.Itoa(uid)
+		environment = append(environment, "XDG_RUNTIME_DIR="+runtimeDir, "DBUS_SESSION_BUS_ADDRESS=unix:path="+runtimeDir+"/bus")
+	}
+	return environment
+}
+
+// Only literal unit policy is evidence. Never read EnvironmentFile contents or
+// infer policy from this CLI's own environment. Unset/reset precedence matters.
+func unitAutoUpdateDisabled(content string) bool {
+	section, disabled, unknownFile := "", false, false
+	var commands, unsetRules []string
+	unknownUnset := false
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = line[1 : len(line)-1]
+			continue
+		}
+		if section != "Service" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		switch key {
+		case "EnvironmentFile":
+			unknownFile = value != ""
+		case "Environment":
+			if value == "" {
+				disabled = false
+				continue
+			}
+			words, known := literalUnitWords(value)
+			if !known {
+				disabled = false
+				continue
+			}
+			for _, word := range words {
+				name, setting, assigned := strings.Cut(word, "=")
+				if assigned && name == "CITADEL_NO_AUTO_UPDATE" {
+					disabled = setting == "1"
+				}
+			}
+		case "UnsetEnvironment":
+			if value == "" {
+				unsetRules, unknownUnset = nil, false
+				continue
+			}
+			words, known := literalUnitWords(value)
+			if !known {
+				unknownUnset = true
+			}
+			unsetRules = append(unsetRules, words...)
+		case "ExecStart":
+			if value == "" {
+				commands = nil
+			} else {
+				commands = append(commands, value)
+			}
+		}
+	}
+	if len(commands) == 1 {
+		words, known := literalUnitWords(commands[0])
+		if known {
+			for index, word := range words {
+				if word == "--" {
+					break
+				}
+				if index == 1 || index == 2 && words[1] == "work" {
+					if word == "--no-auto-update" {
+						return true
+					}
+					if strings.HasPrefix(word, "--no-auto-update=") {
+						flag, err := strconv.ParseBool(strings.TrimPrefix(word, "--no-auto-update="))
+						if err == nil && flag {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, rule := range unsetRules {
+		if rule == "CITADEL_NO_AUTO_UPDATE" || rule == "CITADEL_NO_AUTO_UPDATE=1" {
+			disabled = false
+		}
+	}
+	return disabled && !unknownFile && !unknownUnset
 }
 
 func literalUnitWords(line string) ([]string, bool) {

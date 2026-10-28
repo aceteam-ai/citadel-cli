@@ -63,12 +63,19 @@ supported; discovery does not interpret service filesystem namespaces. Shell wra
 unknown expansion syntax, incomplete inspection and ambiguous matches are left
 for manual inspection. It does not enter another user's service manager. Discovery
 has bounded output, candidate count and elapsed time, and never exports unit
-environment values. Existing unit rematerialization keeps its narrower file list.
+environment values. The user bus is pinned to the inspecting process's effective
+UID; a user unit without `User=` carries that manager UID into diagnostics.
+Unsupported ExecStart prefixes, continuations and unparsed flags before `work`
+refuse incomplete discovery instead of hiding a second candidate. Existing unit
+rematerialization keeps its narrower file list.
 
 An explicit `update install --restart` fails nonzero when no single verified active
 target is found, including on already-latest and superseded-update paths. After the
 existing bounded job drain it rechecks the unit, binary and configured account;
-changes refuse restart. An unrequested restart remains unrequested.
+changes refuse restart. Discovery failure stays distinct from verified worker
+absence: after a binary swap it warns that the running worker may still use the
+old binary, and a requested restart fails with the cause. An unrequested restart
+remains unrequested.
 
 `doctor` and successful returning manual installs report read-only install-layout
 evidence for each observed worker, using its configured account rather than the
@@ -77,7 +84,12 @@ lack write/search access. Unknown identity/metadata stays unverified. A matching
 owner and permissive mode are not proof of effective authority: ACLs, capabilities,
 mounts and the service namespace may differ. The worker's own probe remains the
 authority. Deliberate privilege separation is advisory and does not fail doctor's
-health exit code. Neither diagnostic creates a probe or changes ownership.
+health exit code. A literal unit opt-out (`CITADEL_NO_AUTO_UPDATE=1` or a verified
+`--no-auto-update` argument) is informational and retains the observed ownership
+limitations. Environment resets and unsets are respected; an unread environment
+file never proves opt-out policy. Ordinary installs suppress platform/no-worker
+notes unless restart was requested; doctor retains explicit unknown evidence.
+Neither diagnostic creates a probe or changes ownership.
 
 Installer ownership and executable-directory write grants still need the explicit
 self-update-intent decision for new installs; this slice does not migrate existing
