@@ -664,10 +664,27 @@ func (r *Runner) clockNow() time.Time {
 // newStreamWriter builds the per-job stream writer, falling back to a no-op
 // writer when no factory is configured (e.g. Nexus HTTP source).
 func (r *Runner) newStreamWriter(job *Job) StreamWriter {
+	var raw StreamWriter = &NoOpStreamWriter{}
 	if r.streamWriterFactory != nil {
-		return observeStream(r.streamWriterFactory(job), job.clock)
+		raw = r.streamWriterFactory(job)
 	}
-	return observeStream(&NoOpStreamWriter{}, job.clock)
+	if job.delivery != nil {
+		if api, ok := raw.(*APIStreamWriter); ok {
+			copy := *api
+			copy.ctx, copy.durable = job.delivery().lost, true
+			raw = &copy
+		}
+	}
+	raw = observeStream(raw, job.clock)
+	if job.delivery == nil {
+		return raw
+	}
+	job.delivery().mu.Lock()
+	if job.delivery().raw == nil {
+		job.delivery().raw = raw
+	}
+	job.delivery().mu.Unlock()
+	return &durableStream{StreamWriter: raw, delivery: job.delivery()}
 }
 
 // streamWriteRetryAttempts / streamWriteRetryBackoff bound the retry
@@ -779,6 +796,10 @@ func (r *Runner) exitJob(jobOK bool) {
 func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream StreamWriter, startTime time.Time) {
 	startTime = time.Now()
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
+	if job.delivery != nil {
+		job.clock = newDeliveryClock(r.clockNow, r.clockState)
+		stream = r.newStreamWriter(job)
+	}
 
 	// Target-node filter: when per-node consumer groups are used, every node
 	// sees every message on the shared org queue. If the job specifies a
@@ -804,7 +825,19 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 		} else {
 			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
 		}
-		r.source.Ack(ctx, job)
+		if job.delivery != nil {
+			code := "target_mismatch"
+			if r.config.NodeID == "" {
+				code = "target_unresolved"
+			}
+			_ = r.source.Fail(ctx, job, errors.New(code), map[string]any{"reason": code})
+		} else {
+			r.source.Ack(ctx, job)
+		}
+		return false, nil, startTime
+	}
+	if job.delivery != nil && r.config.NodeID == "" {
+		_ = r.source.Fail(ctx, job, errors.New("target_unresolved"), map[string]any{"reason": "target_unresolved"})
 		return false, nil, startTime
 	}
 
@@ -822,8 +855,10 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// publish never landed. retryStreamWrite gives it a couple of quick extra
 	// chances before this still falls back to a log-and-proceed non-fatal
 	// warning, same as before.
-	job.clock = newDeliveryClock(r.clockNow, r.clockState)
-	stream = r.newStreamWriter(job)
+	if stream == nil {
+		job.clock = newDeliveryClock(r.clockNow, r.clockState)
+		stream = r.newStreamWriter(job)
+	}
 	if err := retryStreamWrite(ctx, func() error { return stream.WriteClaimed(r.agentVersion) }); err != nil {
 		r.log("warning", "Failed to publish claimed event for job %s: %v", job.ID, err)
 	}
@@ -903,6 +938,11 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 //     already retries), never a silent Nack (aceteam#8254 §3a). This is the
 //     queue-on-full that replaces the bare #825 Nack for inference under load.
 func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream StreamWriter, startTime time.Time, ticket *laneExecTicket) (jobOK bool) {
+	if job.delivery != nil {
+		var release func()
+		ctx, release = job.delivery().bind(ctx)
+		defer release()
+	}
 	ownsExec := false
 	releaseWaitingAuthority := func() {
 		if ownsExec {
@@ -926,7 +966,7 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 		// Cancellation wins when multiple readiness signals are already set.
 		if err := ctx.Err(); err != nil {
 			releaseWaitingAuthority()
-			r.source.Nack(ctx, job, err)
+			r.cancelWaitingDelivery(ctx, job, stream, err)
 			return true, false
 		}
 		if expired || (l.hasExecWait && !time.Now().Before(deadline)) {
@@ -946,7 +986,7 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 		expired = true
 	case <-ctx.Done():
 		releaseWaitingAuthority()
-		r.source.Nack(ctx, job, ctx.Err())
+		r.cancelWaitingDelivery(ctx, job, stream, ctx.Err())
 		return false
 	}
 	if finished, ok := finishWait(expired); finished {
@@ -959,7 +999,7 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 		expired = true
 	case <-ctx.Done():
 		releaseWaitingAuthority()
-		r.source.Nack(ctx, job, ctx.Err())
+		r.cancelWaitingDelivery(ctx, job, stream, ctx.Err())
 		return false
 	}
 	// A ready slot can win select alongside cancel/expiry. Return it before
@@ -994,6 +1034,20 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 // caller passes (false, 0) and executeJob's output is byte-identical to before.
 // Returns jobOK true only on a clean success.
 func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, startTime time.Time, emitLatency bool, queueWaitMs int64) (jobOK bool) {
+	if job.delivery != nil {
+		var release func()
+		ctx, release = job.delivery().bind(ctx)
+		defer release()
+		defer job.delivery().stop()
+		if !job.delivery().valid() {
+			return false
+		}
+		if ctx.Err() != nil {
+			_ = stream.WriteCancelled("Job cancelled before execution")
+			_ = r.source.Ack(ctx, job)
+			return false
+		}
+	}
 	r.state.RecordJobExecuting()
 	defer r.state.RecordJobExecuteDone()
 
@@ -1100,12 +1154,15 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	// job-type sets are disjoint).
 	handlerCtx, stopCoopCancelWatch := r.watchCooperativeCancellation(handlerCtx, job)
 	if timeout, ok := r.resolveJobTimeout(job); ok {
-		result, err = r.executeWithDeadline(handlerCtx, handler, job, stream, timeout)
+		result, err = r.executeWithDeadline(handlerCtx, handler, job, handlerDeliveryStream(job, stream), timeout)
 	} else {
-		result, err = handler.Execute(handlerCtx, job, stream)
+		result, err = handler.Execute(handlerCtx, job, handlerDeliveryStream(job, stream))
 	}
 	stopCoopCancelWatch()
 	cancelled := stopCancellationWatch()
+	if job.delivery != nil && !job.delivery().valid() {
+		return false
+	}
 	// Sanitize before any generic failure logging, usage record or retry/status
 	// publication. The handler still receives the original in-flight payload.
 	err = jobprivacy.Error(job.Type, job.Payload, err)
@@ -1119,6 +1176,11 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	job.clock.finish(r.clockNow())
 	job.clock.populate(result)
 	duration := endTime.Sub(startTime)
+	if job.delivery != nil && (cancelled || ctx.Err() != nil || (result != nil && result.Status == JobStatusCancelled)) {
+		_ = stream.WriteCancelled("Job cancelled")
+		_ = r.source.Ack(ctx, job)
+		return false
+	}
 	if cancelled {
 		if errors.Is(err, jobs.ErrHuddleTerminalOwned) {
 			r.log("info", "Huddle job %s terminal is coordinator-owned", job.ID)
@@ -1363,7 +1425,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		return r.finishWorkerControl(ctx, job, stream, handler, result, startTime, endTime)
 	}
 	r.finishSuccess(ctx, job, stream, result, startTime, endTime)
-	return true
+	return job.delivery == nil || job.delivery().isCommitted()
 }
 
 type huddleTeardownDeferrer interface {
@@ -1603,6 +1665,10 @@ func (r *Runner) publishWorkerControlRefusal(ctx context.Context, stream StreamW
 // duplicating it -- duplicating it is how a "queued" job would end up Acked with
 // no terminal event, reintroducing the #559 bug this design exists to avoid.
 func (r *Runner) finishSuccess(ctx context.Context, job *Job, stream StreamWriter, result *JobResult, startTime, endTime time.Time) {
+	if job.delivery != nil && result != nil && result.Output["status"] == "model_warming" {
+		_ = r.source.Nack(ctx, job, errors.New("model_warming"))
+		return
+	}
 	job.clock.finish(r.clockNow())
 	job.clock.populate(result)
 	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
@@ -1648,7 +1714,7 @@ func (r *Runner) finishQueueWaitExceeded(ctx context.Context, job *Job, stream S
 	}
 	result := &JobResult{Status: JobStatusSuccess, Output: output}
 	r.finishSuccess(ctx, job, stream, result, queueStart, now)
-	return true
+	return job.delivery == nil || job.delivery().isCommitted()
 }
 
 // attachLatencyMetrics adds per-request timing to an inference job's output
@@ -1788,12 +1854,7 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 	// Publish a terminal error event so the streaming dispatch path stops
 	// waiting on a terminal event that would otherwise never arrive. Marked
 	// non-recoverable: retrying an unsupported type on the same node is futile.
-	var stream StreamWriter
-	if r.streamWriterFactory != nil {
-		stream = observeStream(r.streamWriterFactory(job), job.clock)
-	} else {
-		stream = observeStream(&NoOpStreamWriter{}, job.clock)
-	}
+	stream := r.newStreamWriter(job)
 	if werr := stream.WriteError(err, false); werr != nil {
 		r.log("warning", "Failed to publish unsupported-type error for job %s: %v", job.ID, werr)
 	}

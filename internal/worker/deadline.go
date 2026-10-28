@@ -524,7 +524,7 @@ func (r *Runner) executeWithDeadline(
 	// (citadel-cli#1287 — was the heavyLaneJobTypes allowlist). Read from the
 	// handler in hand, not r.handlers, so a caller that passes the handler
 	// directly (tests) resolves the same as production.
-	heavy := capabilitiesOf(handler, job.Type).Lane == jobs.LaneHeavy
+	heavy := capabilitiesOf(handler, job.Type).Lane == jobs.LaneHeavy || job.delivery != nil
 
 	type handlerResult struct {
 		result *JobResult

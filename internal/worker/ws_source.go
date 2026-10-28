@@ -416,6 +416,9 @@ func (s *WSSource) snapshotQueues() []string {
 // The server sends: { type: "job", queue: "...", id: "1234567890-0", data: { jobId, type, payload, enqueuedAt } }
 // The data fields mirror StreamMessageData, so we reuse ParseStreamMessage.
 func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
+	if hasDurableCarrier(msg.Data) {
+		return nil, redisapi.ErrDurableDelivery
+	}
 	if msg.Data == nil {
 		return nil, fmt.Errorf("job message has nil data")
 	}

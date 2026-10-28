@@ -3,7 +3,9 @@ package redisapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 	"maps"
 	"net/http"
 	"time"
@@ -19,10 +21,34 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 	reqCtx, cancel := context.WithTimeout(ctx, blockTimeout)
 	defer cancel()
 
+	if req.Protocol != "" && req.Protocol != DurableResultsProtocol {
+		return nil, ErrDurableDelivery
+	}
+	if cached, ok := c.consumeProtocols.Load(req.Queue); ok && req.Protocol == "" && cached.(bool) {
+		req.Protocol = DurableResultsProtocol
+	}
+	originalGroup := req.Group
 	var resp ConsumeResponse
-	err := c.doRequestWithTimeout(reqCtx, http.MethodPost, "/api/fabric/redis/jobs/consume", req, &resp, blockTimeout)
-	if err != nil {
-		return nil, err
+	for attempt := 0; attempt < 2; attempt++ {
+		if req.Protocol == DurableResultsProtocol {
+			req.Group = DurableConsumerGroup
+		} else {
+			req.Group = originalGroup
+		}
+		resp = ConsumeResponse{}
+		err := c.doRequestWithTimeout(reqCtx, http.MethodPost, "/api/fabric/redis/jobs/consume", req, &resp, blockTimeout)
+		if err == nil {
+			c.consumeProtocols.Store(req.Queue, req.Protocol == DurableResultsProtocol)
+			break
+		}
+		if !errors.Is(err, errQueueProtocolMismatch) || attempt == 1 {
+			return nil, err
+		}
+		if req.Protocol == DurableResultsProtocol {
+			req.Protocol = ""
+		} else {
+			req.Protocol = DurableResultsProtocol
+		}
 	}
 
 	if len(resp.Messages) == 0 {
@@ -32,7 +58,26 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 	// Convert the first StreamMessage to a Job
 	msg := resp.Messages[0]
 	msg.Data.observation = msg.Data.observation.WithSource(req.Queue, req.Group, "redis-api")
-	return ParseStreamMessage(msg)
+	job, err := ParseStreamMessage(msg)
+	if err != nil {
+		return nil, err
+	}
+	// Repeated containers can erase the final decoded data object. The whole
+	// response's refusal marker must survive even when that object is absent.
+	job.durableMetadata = msg.Data.observation.State() != deliverymetadata.Absent
+	if msg.Data.deliveryMetadata != nil {
+		job.durableMetadata = job.durableMetadata || msg.Data.deliveryMetadata().present
+	}
+	if req.Protocol == DurableResultsProtocol {
+		if len(resp.Messages) != 1 {
+			return nil, ErrDurableDelivery
+		}
+		job.delivery, err = adoptHTTPClaim(msg, req)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return job, nil
 }
 
 // ParseStreamMessage converts a StreamMessage to a Job.

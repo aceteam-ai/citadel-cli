@@ -10,6 +10,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
 // maskRedisURL masks the password in a Redis URL for safe logging.
@@ -261,6 +262,10 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 		return nil, nil
 	}
 
+	if hasDurableCarrier(redisJob.RawData) {
+		return nil, redisapi.ErrDurableDelivery
+	}
+
 	// Check delivery count for DLQ handling
 	deliveryCount, deliveryCountErr := s.client.GetDeliveryCount(ctx, redisJob.MessageID)
 	if int(deliveryCount) >= s.client.MaxAttempts() {
@@ -331,6 +336,10 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 
 	if redisJob == nil {
 		return nil, nil
+	}
+
+	if hasDurableCarrier(redisJob.RawData) {
+		return nil, redisapi.ErrDurableDelivery
 	}
 
 	// Check delivery count for DLQ handling
