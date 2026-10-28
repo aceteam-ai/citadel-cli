@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -70,9 +72,6 @@ func decodeCDPDiscoveryTargets(body []byte, debugPort int) (string, error) {
 	selected := ""
 	count := 0
 	for decoder.More() {
-		if count == maxCDPDiscoveryTargets {
-			return "", fmt.Errorf("CDP target discovery exceeds 64 targets")
-		}
 		var target struct {
 			Type                 string `json:"type"`
 			WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
@@ -80,9 +79,14 @@ func decodeCDPDiscoveryTargets(body []byte, debugPort int) (string, error) {
 		if err := decoder.Decode(&target); err != nil {
 			return "", fmt.Errorf("CDP target discovery contains invalid target JSON")
 		}
-		count++
-		if selected == "" && target.Type == "page" && target.WebSocketDebuggerURL != "" {
-			selected = target.WebSocketDebuggerURL
+		if target.Type == "page" {
+			count++
+			if count > maxCDPDiscoveryTargets {
+				return "", fmt.Errorf("CDP target discovery exceeds 64 page targets")
+			}
+			if selected == "" && target.WebSocketDebuggerURL != "" {
+				selected = target.WebSocketDebuggerURL
+			}
 		}
 	}
 	if closing, err := decoder.Token(); err != nil || closing != json.Delim(']') {
@@ -94,7 +98,15 @@ func decodeCDPDiscoveryTargets(body []byte, debugPort int) (string, error) {
 	// Validate the complete array and target count before exposing its first
 	// page. A useful prefix must not hide a malformed or oversized suffix.
 	if selected != "" {
-		return selected, nil
+		target, err := url.Parse(selected)
+		if err != nil || target == nil || (target.Scheme != "ws" && target.Scheme != "wss") || target.Hostname() == "" || target.User != nil || target.Fragment != "" {
+			return "", fmt.Errorf("CDP target discovery returned an invalid debugger URL")
+		}
+		// Discovery is over plain HTTP to the selected local debug port. The
+		// advertised authority is not permission to connect anywhere else.
+		target.Scheme = "ws"
+		target.Host = "127.0.0.1:" + strconv.Itoa(debugPort)
+		return target.String(), nil
 	}
 	return "", fmt.Errorf("no page target found on CDP port %d", debugPort)
 }

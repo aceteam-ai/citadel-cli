@@ -115,7 +115,7 @@ func TestCDPDiscoveryTargetCountValidatesEntireArray(t *testing.T) {
 		for _, pageFirst := range []bool{false, true} {
 			entries := make([]string, count)
 			for i := range entries {
-				entries[i] = `{"type":"browser"}`
+				entries[i] = `{"type":"page"}`
 			}
 			index := count - 1
 			if pageFirst {
@@ -124,7 +124,7 @@ func TestCDPDiscoveryTargetCountValidatesEntireArray(t *testing.T) {
 			entries[index] = discoveryPage
 			body := &discoveryBody{source: strings.NewReader("[" + strings.Join(entries, ",") + "]")}
 			got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
-			if count == 64 && (err != nil || got == "") || count == 65 && (err == nil || got != "" || !strings.Contains(err.Error(), "64 targets")) {
+			if count == 64 && (err != nil || got == "") || count == 65 && (err == nil || got != "" || !strings.Contains(err.Error(), "64 page targets")) {
 				t.Fatalf("target ceiling or complete-array check lost: count=%d first=%t result=%q error=%v", count, pageFirst, got, err)
 			}
 			if body.closes != 1 {
@@ -144,26 +144,46 @@ func TestCDPDiscoveryFailedStatusCannotSelectPageOrReadBody(t *testing.T) {
 	}
 }
 
-func TestCDPDiscoveryNullEntriesCountTowardLimit(t *testing.T) {
-	body := &discoveryBody{source: strings.NewReader("[" + discoveryPage + strings.Repeat(",null", 64) + "]")}
-	got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
-	if err == nil || got != "" || !strings.Contains(err.Error(), "64 targets") || body.closes != 1 {
-		t.Fatalf("null entries escaped the target budget: result=%q error=%v closes=%d", got, err, body.closes)
+func TestCDPDiscoveryNonPageEntriesDoNotConsumePageBudget(t *testing.T) {
+	for _, entry := range []string{`null`, `{"type":"iframe"}`, `{"type":"worker"}`, `{"type":"browser"}`} {
+		body := &discoveryBody{source: strings.NewReader("[" + discoveryPage + strings.Repeat(","+entry, 128) + "]")}
+		got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
+		if err != nil || got != "ws://127.0.0.1:9222/devtools/page/first" || body.closes != 1 {
+			t.Fatalf("non-page entries consumed the page budget: entry=%s result=%q error=%v closes=%d", entry, got, err, body.closes)
+		}
 	}
 }
 
-func TestCDPDiscoveryLimitsPrecedeJSONDecoding(t *testing.T) {
-	for _, fixture := range []struct {
-		data, reason string
-	}{
-		{"!" + strings.Repeat(" ", 64*1024), "64 KiB"},
-		{"[" + discoveryPage + strings.Repeat(",{}", 63) + ",123]", "64 targets"},
+func TestCDPDiscoveryPinsAdvertisedDebuggerAuthority(t *testing.T) {
+	for _, advertised := range []string{
+		"ws://example.invalid:443/devtools/page/first",
+		"wss://example.invalid/devtools/page/first",
+		"ws://[::1]:1234/devtools/page/first",
+		"ws://127.0.0.1:1/devtools/page/first",
 	} {
-		body := &discoveryBody{source: strings.NewReader(fixture.data)}
+		body := &discoveryBody{source: strings.NewReader(`[{"type":"page","webSocketDebuggerUrl":"` + advertised + `"}]`)}
 		got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
-		if err == nil || got != "" || !strings.Contains(err.Error(), fixture.reason) || body.closes != 1 {
-			t.Fatalf("parser ran before its admission bound: result=%q error=%v closes=%d", got, err, body.closes)
+		if err != nil || got != "ws://127.0.0.1:9222/devtools/page/first" || body.closes != 1 {
+			t.Fatalf("debugger authority escaped the selected local endpoint: result=%q error=%v", got, err)
 		}
+	}
+}
+
+func TestCDPDiscoveryRejectsInvalidDebuggerURL(t *testing.T) {
+	for _, advertised := range []string{"relative", "http://example.invalid/page", "ws:///page", "ws://user:password@example.invalid/page", "ws://example.invalid/page#fragment", "ws://[invalid/page"} {
+		body := &discoveryBody{source: strings.NewReader(`[{"type":"page","webSocketDebuggerUrl":"` + advertised + `"}]`)}
+		got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
+		if err == nil || got != "" || strings.Contains(err.Error(), advertised) || body.closes != 1 {
+			t.Fatalf("invalid debugger URL was not safely refused: result=%q error=%v", got, err)
+		}
+	}
+}
+
+func TestCDPDiscoveryByteLimitPrecedesJSONDecoding(t *testing.T) {
+	body := &discoveryBody{source: strings.NewReader("!" + strings.Repeat(" ", 64*1024))}
+	got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
+	if err == nil || got != "" || !strings.Contains(err.Error(), "64 KiB") || body.closes != 1 {
+		t.Fatalf("parser ran before its byte bound: result=%q error=%v closes=%d", got, err, body.closes)
 	}
 }
 

@@ -5,15 +5,18 @@ Refs #1386 and [the accepted shared-scene revision 2](https://github.com/aceteam
 The shared CDP transport's HTTP target probe requests `/json` from the selected
 IPv4 loopback debug port. It retains the existing five-second client timeout and
 chooses the first page with a nonempty debugger URL, after validating the entire
-reply. Additive target fields remain compatible. This source affects existing
+reply. The selected debugger URL is parsed and rewritten to plain WebSocket at
+the selected IPv4 loopback port. Non-WebSocket URLs, userinfo and fragments are
+refused without exposing their values. Additive target fields remain compatible. This source affects existing
 cobrowse and render callers; it is not an inactive renderer registration.
 
 The complete response may contain at most 64 KiB of JSON, including whitespace,
-and at most 64 target entries, including non-page and null entries. An oversized
+and at most 64 page targets. Non-page and null entries do not consume the page
+budget, while the complete response byte bound applies to every entry. An oversized
 declared length is refused before reading. An absent or understated length does
 not remove the streaming bound: a limit reader admits at most 65,537 bytes and
 refuses overflow before constructing a JSON decoder. The decoder processes one
-target at a time and refuses before decoding a sixty-fifth entry. It does not
+target at a time and refuses a sixty-fifth page, including a page with no URL. It does not
 materialize an unbounded target slice.
 
 Only HTTP 200 is accepted. Redirects are returned without following them, then
@@ -32,8 +35,8 @@ normal GitHub CI must verify the published source. Fixture preparation is not a
 passing-test claim.
 
 This is separate from #1455's WebSocket-message and screenshot guards. It does
-not implement aggregate pending-command/JSON memory accounting, authorize a
-debugger URL, pin the browser identity, change the scene artifact or launch
+not implement aggregate pending-command/JSON memory accounting, pin the browser
+process identity, change the scene artifact or launch
 Chromium. Range/PCM transport, sandbox/software-WebGL proof, sixty native
 stamped captures, MP4 output, registration and live acceptance remain open.
 No native execution, SQL, deployment, merge or undraft is included.
