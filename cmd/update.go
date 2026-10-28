@@ -84,8 +84,8 @@ service), swapping the binary on disk does NOT restart the already-running
 process -- it keeps executing the old code until something restarts it.
 This command detects that and warns loudly by default; pass
 --restart to have it restart the managed service for you.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		installUpdate()
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return installUpdate()
 	},
 }
 
@@ -174,7 +174,7 @@ func checkForUpdate() {
 	fmt.Println("\nRun 'citadel update install' to update.")
 }
 
-func installUpdate() {
+func installUpdate() error {
 	// Observe the unit's account after every successful returning path, also
 	// when already latest. Never mistake this CLI's sudo privileges for the
 	// worker's ability to update its binary later.
@@ -200,7 +200,7 @@ func installUpdate() {
 	release, err := client.CheckForUpdate()
 	if err != nil {
 		checkSpinner.StopWithError(fmt.Sprintf("Error checking for updates: %v", err))
-		os.Exit(1)
+		return err
 	}
 
 	if release == nil {
@@ -213,8 +213,8 @@ func installUpdate() {
 		// current is a clean no-op), so running it here is safe on every call.
 		// An explicit restart request still applies when this CLI is current:
 		// a separately running worker can remain on an older process image.
-		finishManualNoOp(update.ApplyResult{Disposition: update.AlreadyCurrent}, os.Stdout, updateInstallRestart, func() { warnOrRestartManagedService(true) })
-		return
+		_, err := finishManualNoOp(update.ApplyResult{Disposition: update.AlreadyCurrent}, os.Stdout, updateInstallRestart, func() error { return warnOrRestartManagedService(true) })
+		return err
 	}
 
 	checkSpinner.StopWithSuccess(fmt.Sprintf("Update available: %s -> %s", Version, release.TagName))
@@ -233,7 +233,7 @@ func installUpdate() {
 		fmt.Println()
 		fmt.Println("If a managed launchd service is running, restart it afterward to load the")
 		fmt.Println("new binary:  citadel service stop && citadel service start")
-		return
+		return nil
 	}
 
 	// Download update
@@ -252,12 +252,12 @@ func installUpdate() {
 		} else {
 			dlSpinner.StopWithError(fmt.Sprintf("Error downloading update: %v", err))
 		}
-		os.Exit(1)
+		return err
 	}
 
-	if finishManualNoOp(applyResult, os.Stdout, updateInstallRestart, func() { warnOrRestartManagedService(true) }) {
+	if handled, restartErr := finishManualNoOp(applyResult, os.Stdout, updateInstallRestart, func() error { return warnOrRestartManagedService(true) }); handled {
 		installSpinner.StopWithSuccess(fmt.Sprintf("You are running the latest version (%s)", applyResult.InstalledAfter))
-		return
+		return restartErr
 	}
 
 	// Update state
@@ -285,18 +285,18 @@ func installUpdate() {
 	// never restarts anything ("the update flow handles restart on its own
 	// terms"); this is that "own terms" for the manual CLI path: warn loudly by
 	// default, or restart when the operator explicitly opted in via --restart.
-	warnOrRestartManagedService(updateInstallRestart)
+	return warnOrRestartManagedService(updateInstallRestart)
 }
 
-func finishManualNoOp(result update.ApplyResult, out io.Writer, doRestart bool, restart func()) bool {
+func finishManualNoOp(result update.ApplyResult, out io.Writer, doRestart bool, restart func() error) (bool, error) {
 	if result.Disposition == update.Applied {
-		return false
+		return false, nil
 	}
 	refreshManagedServiceUnits(out)
 	if doRestart {
-		restart()
+		return true, restart()
 	}
-	return true
+	return true, nil
 }
 
 // downloadAndApplyManual is returning so its deferred private-attempt cleanup
@@ -737,14 +737,15 @@ func drainManagedServiceBeforeRestart(fetch workerInFlightFetcher, timeout, poll
 // drainManagedServiceBeforeRestart (citadel#887) with the package-level
 // timeout/poll-interval vars above; runManagedServiceGate only invokes it on
 // the doRestart==true, found==true path.
-func warnOrRestartManagedService(doRestart bool) {
+func warnOrRestartManagedService(doRestart bool) error {
 	drain := func(out io.Writer) {
 		drainManagedServiceBeforeRestart(defaultWorkerInFlightFetcher, managedServiceDrainTimeout, managedServiceDrainPollInterval, out)
 	}
 	code := runManagedServiceGate(doRestart, resolveManagedServiceRestartTarget, drain, os.Stdout, os.Stderr)
 	if code != 0 {
-		os.Exit(code)
+		return fmt.Errorf("managed service restart refused or failed (exit %d)", code)
 	}
+	return nil
 }
 
 func reportManualManagedUpdateDiagnostics(out io.Writer, checks []service.WorkerUpdateDiagnostic, note string, explicit bool) {

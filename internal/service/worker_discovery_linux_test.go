@@ -186,7 +186,7 @@ func TestWorkerUnitIdentityHonorsSectionsQuotesAndDropInResets(t *testing.T) {
 		{"specifier", "[Service]\nExecStart=%h/citadel work\n", "", false},
 		{"environment expansion", "[Service]\nExecStart=$EXECUTABLE work\n", "", false},
 		{"unknown escape", "[Service]\nExecStart=/fixture/space\\sdir/citadel work\n", "", false},
-		{"continuation", "[Service]\nExecStart=/fixture/citadel \\\n work\n", "", false},
+		{"continuation", "[Service]\nExecStart=/fixture/citadel \\\n work\n", "/fixture/citadel", true},
 		{"unclosed quote", "[Service]\nExecStart=\"/fixture/citadel work\n", "", false},
 		{"dynamic identity", "[Service]\nDynamicUser=yes\nExecStart=/fixture/citadel work\n", "/fixture/citadel", false},
 		{"identity reset", "[Service]\nDynamicUser=yes\nUser=%i\nDynamicUser=no\nUser=fixture-worker\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
@@ -351,7 +351,7 @@ func TestDiscoverActiveWorkersCancellationBeforeAnyObservation(t *testing.T) {
 func TestUserManagerDefaultAccountMatchesInspectedBus(t *testing.T) {
 	f := discoveryFixture{list: map[bool]string{true: "worker.service loaded active running Worker\n"}, units: map[string]string{"worker.service": "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no"}
 	workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001)
-	if err != nil || len(workers) != 1 || workers[0].User != "9001" || !workers[0].Unit.UserMode {
+	if err != nil || len(workers) != 1 || workers[0].User != "9001" || workers[0].Unit.ManagerUID != "9001" || !workers[0].Unit.UserMode {
 		t.Fatalf("user manager identity lost: %+v %v", workers, err)
 	}
 	want := []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "XDG_RUNTIME_DIR=/run/user/9001", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/9001/bus"}
@@ -371,7 +371,7 @@ func TestUnparsedActiveInvocationCannotHideSecondWorker(t *testing.T) {
 				name, ordinary = ordinary, name
 			}
 			f := discoveryFixture{list: map[bool]string{false: name + " loaded active running Hidden\n" + ordinary + " loaded active running Worker\n"}, units: map[string]string{name: "[Service]\nExecStart=" + command + "\n", ordinary: "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no"}
-			if workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001); err == nil || len(workers) != 0 {
+			if workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001); err == nil && len(workers) != 2 {
 				t.Fatalf("unparsed invocation became unique target: command=%q workers=%+v error=%v", command, workers, err)
 			}
 		}
@@ -403,5 +403,130 @@ func TestUnitAutoUpdatePolicyRespectsResetsAndUncertainty(t *testing.T) {
 				t.Fatalf("policy=%t want %t", got, tc.disabled)
 			}
 		})
+	}
+}
+
+func TestDiscoverActiveWorkersWithStockHostUnits(t *testing.T) {
+	units := map[string]string{
+		"systemd-journald.service":  "[Service]\nExecStart=/usr/lib/systemd/systemd-journald\nPrivateDevices=yes\n",
+		"systemd-logind.service":    "[Service]\nExecStart=/usr/lib/systemd/systemd-logind\n",
+		"systemd-udevd.service":     "[Service]\nExecStart=/usr/lib/systemd/systemd-udevd\n",
+		"containerd.service":        "[Service]\nExecStart=/usr/bin/containerd\n",
+		"snapd.service":             "[Service]\nExecStart=/usr/lib/snapd/snapd\n",
+		"dbus.service":              "[Service]\nExecStart=@/usr/bin/dbus-daemon dbus-daemon --system --address=systemd: --nofork\n",
+		"systemd-networkd.service":  "[Service]\nUser=systemd-network\nExecStart=!!/usr/lib/systemd/systemd-networkd\n",
+		"systemd-resolved.service":  "[Service]\nUser=systemd-resolve\nExecStart=!!/usr/lib/systemd/systemd-resolved\n",
+		"systemd-timesyncd.service": "[Service]\nExecStart=!!/usr/lib/systemd/systemd-timesyncd\n",
+		"accounts-daemon.service":   "[Service]\nExecStart=/usr/libexec/accounts-daemon\nReadWritePaths=/var/lib/AccountsService \\\n /run\n",
+		"k3s-agent.service":         "[Service]\nExecStart=/usr/local/bin/k3s \\\n agent \\\n --node-label=fixture=yes\n",
+		"wrapped.service":           "[Service]\nExecStart=/usr/bin/env NAME=fixture /bin/sh -c 'echo fixture'\n",
+		"unknown-escape.service":    "[Service]\nExecStart=/fixture/space\\sdir/unrelated\n",
+		"citadel-worker.service":    "[Service]\nExecStart=/fixture/citadel work\n",
+	}
+	var list strings.Builder
+	for name := range units {
+		fmt.Fprintf(&list, "%s loaded active running Fixture\n", name)
+	}
+	f := discoveryFixture{list: map[bool]string{false: list.String()}, units: units, reload: "no"}
+	workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001)
+	if err != nil || len(workers) != 1 || workers[0].Unit.Name != "citadel-worker" {
+		t.Fatalf("stock units obscured worker: %+v %v", workers, err)
+	}
+}
+
+func TestWorkerCommandPrefixesAndContinuations(t *testing.T) {
+	for _, command := range []string{
+		"+/fixture/citadel work", "!/fixture/citadel work", "!!/fixture/citadel work", "-:+/fixture/citadel work",
+		"@/fixture/citadel alternate-argv0 work", "-@:/fixture/citadel alternate-argv0 work",
+		"/fixture/citadel \\\n # ignored comment during continuation\n ; another comment\n work",
+	} {
+		t.Run(command, func(t *testing.T) {
+			path, _, known := workerUnitIdentity("[Service]\nExecStart=" + command + "\n")
+			if !known || path != "/fixture/citadel" {
+				t.Fatalf("valid worker syntax lost: %q %t", path, known)
+			}
+		})
+	}
+	for _, content := range []string{
+		"[Service]\nExecStart=@/fixture/citadel work\n",
+		"[Service]\nExecStart=/fixture/citadel \\\n",
+		"[Service]\nUser=worker\nExecStart=+/fixture/citadel work\n",
+	} {
+		path, _, known := workerUnitIdentity(content)
+		if known && path != "" {
+			t.Fatalf("ambiguous worker account/invocation was accepted: %q", content)
+		}
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesOpaquePlausibleWorker(t *testing.T) {
+	for _, command := range []string{"/bin/sh -c '/fixture/citadel work'", "/usr/bin/env MODE=fixture /fixture/citadel work", "/fixture/citadel --unknown work", "\"/fixture/citadel work", "%h/citadel work"} {
+		f := discoveryFixture{list: map[bool]string{false: "opaque.service loaded active running Fixture\n"}, units: map[string]string{"opaque.service": "[Service]\nExecStart=" + command + "\n"}, reload: "no"}
+		if workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001); err == nil || len(workers) != 0 {
+			t.Fatalf("plausible opaque worker hidden: %q %+v %v", command, workers, err)
+		}
+	}
+}
+
+func TestDiscoverActiveWorkersReportsMissingEitherManager(t *testing.T) {
+	for _, unavailableUser := range []bool{false, true} {
+		f := discoveryFixture{list: map[bool]string{!unavailableUser: "worker.service loaded active running Worker\n"}, units: map[string]string{"worker.service": "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no", listError: map[bool]bool{unavailableUser: true}}
+		workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001)
+		if err == nil || len(workers) != 0 || !strings.Contains(err.Error(), "incomplete") {
+			t.Fatalf("unavailable manager was silently complete: %+v %v", workers, err)
+		}
+	}
+}
+
+func TestManagedRestartUsesVerifiedManagerEnvironment(t *testing.T) {
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/fixture/foreign-bus")
+	t.Setenv("XDG_RUNTIME_DIR", "/fixture/foreign-runtime")
+	for _, userMode := range []bool{false, true} {
+		uid, managerUID := 0, ""
+		if userMode {
+			uid, managerUID = 9001, "9001"
+		}
+		unit := ManagedUnit{Name: "worker", UserMode: userMode, ManagerUID: managerUID}
+		command, err := managedUnitRestartCommand(context.Background(), unit, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(command.Env, discoveryManagerEnvironment(userMode, uid)) {
+			t.Fatalf("restart bus differs from inspection: %q", command.Env)
+		}
+		want := append([]string{"systemctl"}, append(systemctlArgs(userMode), "restart", "worker")...)
+		if !reflect.DeepEqual(command.Args, want) {
+			t.Fatalf("restart arguments: %q", command.Args)
+		}
+	}
+	for _, unit := range []ManagedUnit{{Name: "worker"}, {Name: "worker", UserMode: true, ManagerUID: "8001"}, {Name: "../foreign", UserMode: true, ManagerUID: "9001"}} {
+		if command, err := managedUnitRestartCommand(context.Background(), unit, 9001); err == nil || command != nil {
+			t.Fatal("unverified restart target admitted")
+		}
+	}
+}
+
+func TestManagedRestartWiringUsesInspectedBusWithoutExecution(t *testing.T) {
+	original := runManagedRestartCommand
+	t.Cleanup(func() { runManagedRestartCommand = original })
+	calls := 0
+	cause := errors.New("fixture restart failure")
+	runManagedRestartCommand = func(command *exec.Cmd) error {
+		calls++
+		if !reflect.DeepEqual(command.Env, discoveryManagerEnvironment(true, os.Geteuid())) {
+			t.Fatalf("Restart inherited an unverified bus: %q", command.Env)
+		}
+		if !reflect.DeepEqual(command.Args, []string{"systemctl", "--user", "restart", "fixture-worker"}) {
+			t.Fatalf("wrong restart target: %q", command.Args)
+		}
+		return cause
+	}
+	unit := ManagedUnit{Name: "fixture-worker", UserMode: true, ManagerUID: fmt.Sprint(os.Geteuid())}
+	if err := unit.Restart(); !errors.Is(err, cause) || calls != 1 {
+		t.Fatalf("Restart did not propagate the inspected command outcome: %v %d", err, calls)
+	}
+	unit.ManagerUID = "changed"
+	if err := unit.Restart(); err == nil || calls != 1 {
+		t.Fatal("changed manager reached the runner")
 	}
 }

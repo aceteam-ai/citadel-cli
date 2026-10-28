@@ -84,6 +84,7 @@ func discoverActiveWorkersForUID(ctx context.Context, executable string, capture
 	}
 	var workers []ManagedWorker
 	managers := 0
+	var unavailable []string
 	for _, userMode := range []bool{false, true} {
 		prefix := systemctlArgs(userMode)
 		listArgs := append(append([]string{}, prefix...), "list-units", "--type=service", "--state=active", "--no-legend", "--no-pager", "--plain")
@@ -95,7 +96,12 @@ func discoverActiveWorkersForUID(ctx context.Context, executable string, capture
 			if errors.Is(err, errWorkerDiscoveryBound) {
 				return nil, errWorkerDiscoveryBound
 			}
-			continue // A host need not have both a system and a user manager.
+			manager := "system"
+			if userMode {
+				manager = "user"
+			}
+			unavailable = append(unavailable, manager)
+			continue
 		}
 		managers++
 		if len(listed) > maxWorkerDiscoveryOutput {
@@ -139,7 +145,12 @@ func discoverActiveWorkersForUID(ctx context.Context, executable string, capture
 			}
 			path, account, known := workerUnitIdentity(string(content))
 			if !known {
-				return nil, errors.New("active worker executable or account identity requires manual inspection")
+				// Unsupported syntax in an unrelated daemon cannot hide this
+				// executable. A plausible worker still requires inspection.
+				if unitCouldRunExecutable(string(content), executable, expected) {
+					return nil, errors.New("active worker executable or account identity requires manual inspection")
+				}
+				continue
 			}
 			if path == "" {
 				continue
@@ -155,11 +166,18 @@ func discoverActiveWorkersForUID(ctx context.Context, executable string, capture
 					account = "root"
 				}
 			}
-			workers = append(workers, ManagedWorker{Unit: ManagedUnit{Name: strings.TrimSuffix(name, ".service"), UserMode: userMode}, Executable: resolved, User: account, AutoUpdateDisabled: unitAutoUpdateDisabled(string(content))})
+			unit := ManagedUnit{Name: strings.TrimSuffix(name, ".service"), UserMode: userMode}
+			if userMode {
+				unit.ManagerUID = strconv.Itoa(managerUID)
+			}
+			workers = append(workers, ManagedWorker{Unit: unit, Executable: resolved, User: account, AutoUpdateDisabled: unitAutoUpdateDisabled(string(content))})
 		}
 	}
 	if managers == 0 {
 		return nil, errors.New("no service manager could be inspected")
+	}
+	if len(unavailable) != 0 {
+		return nil, errors.New("service discovery incomplete: could not inspect " + strings.Join(unavailable, " and ") + " manager")
 	}
 	return workers, nil
 }
@@ -182,20 +200,21 @@ func safeServiceName(name string) bool {
 // inspection. A nonempty path with known=false is a literal worker whose
 // account or filesystem mapping cannot be verified; it must not be hidden by
 // filtering. Empty path with known=true is a verified non-worker; any
-// known=false observation refuses complete discovery. Empty ExecStart resets
+// known=false observation of a plausible worker refuses discovery. Empty ExecStart resets
 // the list, including across drop-ins.
 func workerUnitIdentity(content string) (path, account string, known bool) {
 	section := ""
 	var commands []string
 	dynamicUser := ""
 	mappings := map[string]bool{}
-	for _, raw := range strings.Split(content, "\n") {
+	lines, complete := unitLogicalLines(content)
+	if !complete {
+		return "", "", false
+	}
+	for _, raw := range lines {
 		line := strings.Trim(raw, " \t\r")
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
-		}
-		if strings.HasSuffix(line, "\\") {
-			return "", "", false
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = line[1 : len(line)-1]
@@ -243,19 +262,25 @@ func workerUnitIdentity(content string) (path, account string, known bool) {
 	if len(commands) != 1 {
 		return "", "", false
 	}
-	words, ok := literalUnitWords(commands[0])
-	if !ok || len(words) < 2 {
+	words, privileged, ok := unitCommandWords(commands[0])
+	if !ok || len(words) == 0 {
 		return "", "", false
 	}
-	path = strings.TrimPrefix(words[0], "-")
+	path = words[0]
 	if !filepath.IsAbs(path) || strings.ContainsAny(path, "%$\x00\r\n\t") {
 		return "", "", false
+	}
+	if len(words) == 1 {
+		return "", "", true
 	}
 	workIndex := 1
 	if len(words) >= 3 && (words[1] == "--no-auto-update" || strings.HasPrefix(words[1], "--no-auto-update=")) {
 		workIndex = 2
 	}
 	if words[workIndex] == "work" {
+		if privileged && account != "" {
+			return path, "", false
+		}
 		if strings.ContainsAny(account, "\"'\\%$ \t") || dynamicUser != "" && dynamicUser != "no" && dynamicUser != "false" && dynamicUser != "off" && dynamicUser != "0" {
 			return path, "", false
 		}
@@ -295,7 +320,11 @@ func unitAutoUpdateDisabled(content string) bool {
 	section, disabled, unknownFile := "", false, false
 	var commands, unsetRules []string
 	unknownUnset := false
-	for _, raw := range strings.Split(content, "\n") {
+	lines, complete := unitLogicalLines(content)
+	if !complete {
+		return false
+	}
+	for _, raw := range lines {
 		line := strings.TrimSpace(raw)
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = line[1 : len(line)-1]
@@ -347,7 +376,7 @@ func unitAutoUpdateDisabled(content string) bool {
 		}
 	}
 	if len(commands) == 1 {
-		words, known := literalUnitWords(commands[0])
+		words, _, known := unitCommandWords(commands[0])
 		if known {
 			for index, word := range words {
 				if word == "--" {
@@ -425,4 +454,65 @@ func literalUnitWords(line string) ([]string, bool) {
 		words = append(words, word.String())
 	}
 	return words, true
+}
+
+// systemd folds a continuation into one space and skips intervening comments.
+// Preserve unsupported escapes for the literal parser to refuse, not evaluate.
+func unitLogicalLines(content string) ([]string, bool) {
+	var lines []string
+	pending := ""
+	continuing := false
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if line == "" && continuing {
+			continue
+		}
+		slashes := len(line) - len(strings.TrimRight(line, "\\"))
+		if slashes%2 == 1 {
+			pending += strings.TrimSuffix(line, "\\") + " "
+			continuing = true
+			continue
+		}
+		lines = append(lines, pending+line)
+		pending, continuing = "", false
+	}
+	return lines, !continuing
+}
+
+// Prefixes modify execution, not the executable path. With @ the next word
+// supplies argv[0], so the subcommand follows that word.
+func unitCommandWords(command string) ([]string, bool, bool) {
+	words, ok := literalUnitWords(command)
+	if !ok || len(words) == 0 {
+		return nil, false, false
+	}
+	prefixEnd := 0
+	for prefixEnd < len(words[0]) && strings.ContainsRune("-@:+!", rune(words[0][prefixEnd])) {
+		prefixEnd++
+	}
+	prefix := words[0][:prefixEnd]
+	words[0] = words[0][prefixEnd:]
+	if words[0] == "" {
+		return nil, false, false
+	}
+	if strings.Contains(prefix, "@") {
+		if len(words) < 2 {
+			return nil, false, false
+		}
+		words = append(words[:1], words[2:]...)
+	}
+	return words, strings.ContainsAny(prefix, "+!"), true
+}
+
+func unitCouldRunExecutable(content string, paths ...string) bool {
+	for _, path := range paths {
+		base := filepath.Base(path)
+		if path != "" && (strings.Contains(content, path) || base != "." && strings.Contains(content, base)) {
+			return true
+		}
+	}
+	return false
 }

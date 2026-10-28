@@ -65,14 +65,21 @@ for manual inspection. It does not enter another user's service manager. Discove
 has bounded output, candidate count and elapsed time, and never exports unit
 environment values. The user bus is pinned to the inspecting process's effective
 UID; a user unit without `User=` carries that manager UID into diagnostics.
-Unsupported ExecStart prefixes, continuations and unparsed flags before `work`
-refuse incomplete discovery instead of hiding a second candidate. Existing unit
-rematerialization keeps its narrower file list.
+Systemd command prefixes and continuation lines are parsed, including the
+alternate argv0 supplied by the at-sign prefix. Single-command daemons and
+unrelated opaque wrappers do not obscure a worker. Unsupported syntax still
+refuses discovery when the unit mentions the executable path or basename; an
+unresolved worker account or namespace is not silently excluded. An unavailable
+system or current-user manager reports incomplete inspection, even if the other
+manager yielded a worker. Existing unit rematerialization keeps its narrower
+file list.
 
 An explicit `update install --restart` fails nonzero when no single verified active
 target is found, including on already-latest and superseded-update paths. After the
 existing bounded job drain it rechecks the unit, binary and configured account;
-changes refuse restart. Discovery failure stays distinct from verified worker
+changes refuse restart. Restart uses the same minimal manager environment and
+pinned user bus as inspection, and refuses a changed manager UID. Restart errors
+return through Cobra so deferred diagnostics still run. Discovery failure stays distinct from verified worker
 absence: after a binary swap it warns that the running worker may still use the
 old binary, and a requested restart fails with the cause. An unrequested restart
 remains unrequested.

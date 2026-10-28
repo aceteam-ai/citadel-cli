@@ -3,11 +3,13 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ManagedUnit identifies a citadel-managed systemd unit found ACTIVE on this
@@ -23,8 +25,9 @@ import (
 // (citadel#454: the binary swap succeeded but the separately-running managed
 // worker process kept executing the pre-swap code indefinitely).
 type ManagedUnit struct {
-	Name     string // unit name without ".service", e.g. "citadel-worker", "citadel"
-	UserMode bool
+	Name       string // unit name without ".service", e.g. "citadel-worker", "citadel"
+	UserMode   bool
+	ManagerUID string // inspected user manager; empty for legacy callers
 }
 
 // Description returns a human-readable label for warnings/logs.
@@ -48,11 +51,35 @@ func (u ManagedUnit) RestartCommand() string {
 // picks up the just-installed binary. System units require root, matching
 // every other systemd.go mutation (Start/Stop/Install).
 func (u ManagedUnit) Restart() error {
-	if !u.UserMode && os.Geteuid() != 0 {
-		return fmt.Errorf("restarting %s requires root; run: %s", u.Name, u.RestartCommand())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command, err := managedUnitRestartCommand(ctx, u, os.Geteuid())
+	if err != nil {
+		return err
 	}
-	ctl := systemctlArgs(u.UserMode)
-	return runCmd("systemctl", append(ctl, "restart", u.Name)...)
+	command.Stdout, command.Stderr = os.Stdout, os.Stderr
+	return runManagedRestartCommand(command)
+}
+
+// The runner seam lets fixtures inspect the actual Restart wiring without
+// contacting a service manager or starting a child process.
+var runManagedRestartCommand = func(command *exec.Cmd) error { return command.Run() }
+
+// Build the mutation using the same pinned manager environment as discovery.
+// Never accept an inherited bus or change the account that was inspected.
+func managedUnitRestartCommand(ctx context.Context, u ManagedUnit, uid int) (*exec.Cmd, error) {
+	if !safeServiceName(u.Name + ".service") {
+		return nil, fmt.Errorf("invalid managed service name")
+	}
+	if !u.UserMode && uid != 0 {
+		return nil, fmt.Errorf("restarting %s requires root; run: %s", u.Name, u.RestartCommand())
+	}
+	if u.UserMode && u.ManagerUID != "" && u.ManagerUID != fmt.Sprint(uid) {
+		return nil, fmt.Errorf("inspected user manager account changed; no service was restarted")
+	}
+	command := exec.CommandContext(ctx, "systemctl", append(systemctlArgs(u.UserMode), "restart", u.Name)...)
+	command.Env = discoveryManagerEnvironment(u.UserMode, uid)
+	return command, nil
 }
 
 // EnableNowCommand returns the exact shell command that enables the unit and
