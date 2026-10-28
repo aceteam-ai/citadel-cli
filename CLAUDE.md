@@ -1580,7 +1580,12 @@ capture lifecycle; v2 also validates its embedded theme registry. The render and
 audio paths invoke fixed argv directly, never a shell. `papercraft-render` shares
 Chromium discovery with
 `platform.FindChromium` and the persistent request/response CDP transport in
-`internal/cobrowsestream`. `startPapercraftAssetServer` is the browser's
+`internal/cobrowsestream`. Its HTTP target discovery accepts only a complete
+512 KiB/64-page reply, pins the debugger WebSocket to the probed loopback port,
+refuses redirects and unsuccessful statuses, and closes
+the response before returning. See `docs/cdp-target-discovery-bounds.md`; these
+limits do not prove aggregate capture memory or native browser acceptance.
+`startPapercraftAssetServer` is the browser's
 non-forwarding HTTP proxy: its random route serves declared inputs only, while
 every other HTTP/HTTPS/WebSocket request fails there and CDP blocks `file://`,
 `data:`, `blob:`, WebSocket, and FTP before navigation. Keep Chromium's
