@@ -1571,7 +1571,8 @@ audio paths invoke fixed argv directly, never a shell. `papercraft-render` share
 Chromium discovery with
 `platform.FindChromium` and the persistent request/response CDP transport in
 `internal/cobrowsestream`. Its HTTP target discovery accepts only a complete
-64 KiB/64-target reply, refuses redirects and unsuccessful statuses, and closes
+512 KiB/64-page reply, pins the debugger WebSocket to the probed loopback port,
+refuses redirects and unsuccessful statuses, and closes
 the response before returning. See `docs/cdp-target-discovery-bounds.md`; these
 limits do not prove aggregate capture memory or native browser acceptance.
 `startPapercraftAssetServer` is the browser's

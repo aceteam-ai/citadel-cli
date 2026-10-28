@@ -20,8 +20,10 @@ import (
 // cannot hang a viewer connection forever.
 var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-const maxCDPDiscoveryBytes = 64 << 10
-const maxCDPDiscoveryTargets = 64
+// Chrome pretty-prints discovery and may include dozens of ad iframe targets
+// with multi-KiB URLs. 512 KiB admits those replies while keeping a hard bound.
+const maxCDPDiscoveryBytes = 512 << 10
+const maxCDPDiscoveryPages = 64
 
 // cdpTargetURL resolves a debug port to the page target's DevTools WebSocket URL.
 // It is a package var so tests can point the CDP client at a fake Chrome
@@ -51,14 +53,14 @@ func discoverCDPTargetURL(debugPort int, client *http.Client) (string, error) {
 		return "", fmt.Errorf("CDP target discovery requires HTTP 200")
 	}
 	if resp.ContentLength > maxCDPDiscoveryBytes {
-		return "", fmt.Errorf("CDP target discovery exceeds 64 KiB")
+		return "", fmt.Errorf("CDP target discovery exceeds 512 KiB")
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCDPDiscoveryBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("CDP target discovery body read failed")
 	}
 	if len(body) > maxCDPDiscoveryBytes {
-		return "", fmt.Errorf("CDP target discovery exceeds 64 KiB")
+		return "", fmt.Errorf("CDP target discovery exceeds 512 KiB")
 	}
 	return decodeCDPDiscoveryTargets(body, debugPort)
 }
@@ -81,7 +83,7 @@ func decodeCDPDiscoveryTargets(body []byte, debugPort int) (string, error) {
 		}
 		if target.Type == "page" {
 			count++
-			if count > maxCDPDiscoveryTargets {
+			if count > maxCDPDiscoveryPages {
 				return "", fmt.Errorf("CDP target discovery exceeds 64 page targets")
 			}
 			if selected == "" && target.WebSocketDebuggerURL != "" {

@@ -10,11 +10,13 @@ the selected IPv4 loopback port. Non-WebSocket URLs, userinfo and fragments are
 refused without exposing their values. Additive target fields remain compatible. This source affects existing
 cobrowse and render callers; it is not an inactive renderer registration.
 
-The complete response may contain at most 64 KiB of JSON, including whitespace,
-and at most 64 page targets. Non-page and null entries do not consume the page
+The complete response may contain at most 512 KiB of JSON, including whitespace,
+and at most 64 page targets. Chrome pretty-prints discovery and ad-heavy pages can
+include dozens of iframe entries with multi-KiB URLs; the 512 KiB ceiling admits
+those replies while retaining a fixed memory bound. Non-page and null entries do not consume the page
 budget, while the complete response byte bound applies to every entry. An oversized
 declared length is refused before reading. An absent or understated length does
-not remove the streaming bound: a limit reader admits at most 65,537 bytes and
+not remove the streaming bound: a limit reader admits at most 524,289 bytes and
 refuses overflow before constructing a JSON decoder. The decoder processes one
 target at a time and refuses a sixty-fifth page, including a page with no URL. It does not
 materialize an unbounded target slice.

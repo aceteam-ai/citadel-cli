@@ -76,7 +76,7 @@ func TestCDPDiscoveryPreservesFirstPageAndAdditiveFields(t *testing.T) {
 }
 
 func TestCDPDiscoveryResponseByteBoundaryBeforeParsing(t *testing.T) {
-	const budget = 64 * 1024 // Accepted R2 ceiling, independent of implementation constants.
+	const budget = 512 * 1024 // Reviewed discovery ceiling, independent of implementation constants.
 	for _, extra := range []int{0, 1, 4096} {
 		t.Run("extra="+strconv.Itoa(extra), func(t *testing.T) {
 			prefix := "[" + discoveryPage + "]"
@@ -87,7 +87,7 @@ func TestCDPDiscoveryResponseByteBoundaryBeforeParsing(t *testing.T) {
 				if err != nil || got == "" || body.nbytes != budget {
 					t.Fatalf("exact byte ceiling rejected: result=%q error=%v bytes=%d", got, err, body.nbytes)
 				}
-			} else if err == nil || !strings.Contains(err.Error(), "64 KiB") || got != "" || body.nbytes != budget+1 {
+			} else if err == nil || !strings.Contains(err.Error(), "512 KiB") || got != "" || body.nbytes != budget+1 {
 				t.Fatalf("oversize JSON escaped bounded reading: result=%q error=%v bytes=%d", got, err, body.nbytes)
 			}
 			if body.closes != 1 {
@@ -98,13 +98,13 @@ func TestCDPDiscoveryResponseByteBoundaryBeforeParsing(t *testing.T) {
 }
 
 func TestCDPDiscoveryDeclaredLengthCannotReplaceStreamingBound(t *testing.T) {
-	for _, declared := range []int64{1, 64*1024 + 1} {
-		body := &discoveryBody{source: strings.NewReader("[" + discoveryPage + "]" + strings.Repeat(" ", 64*1024)), maxOut: 64*1024 + 1, caller: t}
+	for _, declared := range []int64{1, 512*1024 + 1} {
+		body := &discoveryBody{source: strings.NewReader("[" + discoveryPage + "]" + strings.Repeat(" ", 512*1024)), maxOut: 512*1024 + 1, caller: t}
 		got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, declared))
-		if err == nil || !strings.Contains(err.Error(), "64 KiB") || got != "" || body.closes != 1 {
+		if err == nil || !strings.Contains(err.Error(), "512 KiB") || got != "" || body.closes != 1 {
 			t.Fatalf("declared/actual size refusal lost: result=%q error=%v closes=%d", got, err, body.closes)
 		}
-		if declared > 64*1024 && body.nbytes != 0 || declared == 1 && body.nbytes != 64*1024+1 {
+		if declared > 512*1024 && body.nbytes != 0 || declared == 1 && body.nbytes != 512*1024+1 {
 			t.Fatalf("declared-length preflight or streaming bound lost: declared=%d read=%d", declared, body.nbytes)
 		}
 	}
@@ -180,9 +180,9 @@ func TestCDPDiscoveryRejectsInvalidDebuggerURL(t *testing.T) {
 }
 
 func TestCDPDiscoveryByteLimitPrecedesJSONDecoding(t *testing.T) {
-	body := &discoveryBody{source: strings.NewReader("!" + strings.Repeat(" ", 64*1024))}
+	body := &discoveryBody{source: strings.NewReader("!" + strings.Repeat(" ", 512*1024))}
 	got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
-	if err == nil || got != "" || !strings.Contains(err.Error(), "64 KiB") || body.closes != 1 {
+	if err == nil || got != "" || !strings.Contains(err.Error(), "512 KiB") || body.closes != 1 {
 		t.Fatalf("parser ran before its byte bound: result=%q error=%v closes=%d", got, err, body.closes)
 	}
 }
@@ -235,5 +235,24 @@ func TestCDPDiscoveryRejectsMalformedSuffixAndReadFailures(t *testing.T) {
 	})}
 	if got, err := discoverCDPTargetURL(9222, client); err == nil || got != "" || strings.Contains(err.Error(), "private fixture") {
 		t.Fatalf("transport failure was not safely refused: result=%q error=%v", got, err)
+	}
+}
+
+func TestCDPDiscoveryAdIframeReplyAboveOldByteCeiling(t *testing.T) {
+	entries := []string{discoveryPage}
+	for i := 0; i < 25; i++ {
+		entries = append(entries, `{
+  "type": "iframe",
+  "url": "https://example.invalid/ad?`+strings.Repeat("x", 6*1024)+`"
+}`)
+	}
+	data := "[\n" + strings.Join(entries, ",\n") + "\n]"
+	if len(data) <= 150*1024 || len(data) >= 512*1024 {
+		t.Fatalf("fixture does not exercise realistic discovery headroom: %d", len(data))
+	}
+	body := &discoveryBody{source: strings.NewReader(data)}
+	got, err := discoverCDPTargetURL(9222, fakeDiscoveryClient(t, body, http.StatusOK, -1))
+	if err != nil || got != "ws://127.0.0.1:9222/devtools/page/first" || body.closes != 1 {
+		t.Fatalf("ad iframe discovery reply rejected: result=%q error=%v closes=%d", got, err, body.closes)
 	}
 }
