@@ -8,6 +8,8 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+
+	"golang.org/x/sys/unix"
 )
 
 func unixUserLabel(uid uint32) string {
@@ -19,6 +21,10 @@ func unixUserLabel(uid uint32) string {
 }
 
 func inspectSelfUpdatePath(destination string) SelfUpdateCapability {
+	return inspectSelfUpdatePathWithStage(destination, createSwapStage)
+}
+
+func inspectSelfUpdatePathWithStage(destination string, stage func(string, installedIdentity) (*os.File, string, error)) SelfUpdateCapability {
 	c := SelfUpdateCapability{State: SelfUpdateUnknown, Directory: filepath.Dir(destination), WorkerUser: unixUserLabel(uint32(os.Geteuid()))}
 	identity, err := statInstalledIdentity(destination)
 	if err != nil {
@@ -29,7 +35,7 @@ func inspectSelfUpdatePath(destination string) SelfUpdateCapability {
 	if err == nil {
 		_ = lock.Close()
 	} else if !os.IsNotExist(err) {
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS) {
 			c.State = SelfUpdatePrivileged
 		}
 		return c
@@ -37,9 +43,9 @@ func inspectSelfUpdatePath(destination string) SelfUpdateCapability {
 		c.State = SelfUpdatePrivileged
 		return c
 	}
-	probe, path, err := createSwapStage(destination, identity)
+	probe, path, err := stage(destination, identity)
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS) {
 			c.State = SelfUpdatePrivileged
 		}
 		return c

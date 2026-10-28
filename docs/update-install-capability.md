@@ -35,7 +35,7 @@ authority before allocating a download attempt. The owner-preserving swap path
 remains authoritative; no ownership policy is relaxed.
 
 The Aceteam result consumer needs the paired change in
-aceteam-ai/aceteam#12595 to render this new refusal as manual-update guidance.
+aceteam-ai/aceteam#12595 and its implementation aceteam-ai/aceteam#12606 to render this new refusal as manual-update guidance.
 An older consumer calls the unfamiliar reason unsupported. This is an integration
 requirement, not a reason to disguise the result as Homebrew or claim an update.
 
@@ -56,3 +56,7 @@ against the actual unit user, and installer/unit preservation for both intention
 privilege separation and self-updating layouts. Native elevated owner transitions,
 Windows ACL/share behavior and live fleet acceptance are separate gates. This
 source work performs no installation, service change or deployment.
+
+A read-only filesystem refusal also reports `requires_privileged_install`, including
+a systemd `ProtectSystem=strict` sandbox. It does not authorize changing the
+mount, service protection or installed binary ownership.

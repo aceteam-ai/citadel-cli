@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestSelfUpdateCapabilityProbePreservesInstalledFileAndCreatesNoLock(t *testing.T) {
@@ -92,5 +94,32 @@ func TestFirstLockOwnerRefusalNamesBothIdentitiesWithoutCreatingLock(t *testing.
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatal("foreign-owner refusal created a lock")
+	}
+}
+
+func TestSelfUpdateCapabilityReadOnlySwapStageRequiresPrivilege(t *testing.T) {
+	isolateState(t)
+	dir := t.TempDir()
+	destination := filepath.Join(dir, "citadel")
+	before := []byte("synthetic installed bytes")
+	if err := os.WriteFile(destination, before, 0755); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	capability := inspectSelfUpdatePathWithStage(destination, func(path string, identity installedIdentity) (*os.File, string, error) {
+		calls++
+		if path != destination {
+			t.Fatal("probe targeted a different installation")
+		}
+		return nil, "", &os.PathError{Op: "open", Path: path, Err: unix.EROFS}
+	})
+	if calls != 1 || capability.State != SelfUpdatePrivileged || capability.Directory != dir {
+		t.Fatalf("read-only sandbox was not classified as privileged: calls=%d capability=%+v", calls, capability)
+	}
+	if after, err := os.ReadFile(destination); err != nil || !bytes.Equal(after, before) {
+		t.Fatal("read-only preflight changed the installed file")
+	}
+	if _, err := os.Lstat(destination + ".citadel-update.lock"); !os.IsNotExist(err) {
+		t.Fatal("read-only preflight provisioned an update lock")
 	}
 }
