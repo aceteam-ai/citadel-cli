@@ -2190,7 +2190,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		return autoUpdateReportFrom(ccAutoUpdateReport.Load())
 	}
 	_ = update.ReconcilePendingOnStartup(time.Now(), Version)
-	ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "unavailable"))
+	ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "unavailable", update.InspectSelfUpdateCapability()))
 
 	// Determine job source mode
 	var source worker.JobSource
@@ -2639,7 +2639,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	return runWorkerWithAutoUpdater(ctx, ccWorkerLock, autoUpdatePolicyInputs{}, runner,
 		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) }, autoUpdateRuntime{
 			refresh: func() {
-				ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic"))
+				ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.InspectSelfUpdateCapability()))
 			},
 		})
 }

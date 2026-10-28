@@ -120,6 +120,10 @@ type AutoUpdaterConfig struct {
 	// on Linux/Windows it is always false, so this is a no-op there.
 	HomebrewManaged func() bool
 
+	// Capability checks current install authority before allocating/downloading.
+	// Apply retains its final lock/identity checks. Injectable for fake fixtures.
+	Capability func() SelfUpdateCapability
+
 	// PendingPath is where the downloaded binary is staged.
 	// Defaults to GetPendingBinaryPath().
 	PendingPath string
@@ -141,7 +145,8 @@ type AutoUpdaterConfig struct {
 
 // AutoUpdater periodically checks for and applies updates.
 type AutoUpdater struct {
-	cfg AutoUpdaterConfig
+	cfg              AutoUpdaterConfig
+	lastApplyRefusal *SelfUpdateCapability
 }
 
 // ClampInterval applies the updater's interval rules — zero/negative uses
@@ -190,6 +195,9 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 	}
 	if cfg.HomebrewManaged == nil {
 		cfg.HomebrewManaged = CurrentBinaryIsHomebrewManaged
+	}
+	if cfg.Capability == nil {
+		cfg.Capability = InspectSelfUpdateCapability
 	}
 	if cfg.NewAttempt == nil {
 		if cfg.PendingPath != "" || legacyApplySeam {
@@ -294,6 +302,22 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	if ctx.Err() != nil {
 		return false
 	}
+	capability := a.cfg.Capability()
+	if capability.State != SelfUpdateAvailable {
+		if capability.State == "homebrew_managed" || capability.State == "desktop_managed" {
+			a.record(ResultManualUpdateRequired, false, "")
+			return false
+		}
+		if a.lastApplyRefusal == nil || *a.lastApplyRefusal != capability {
+			a.cfg.Log("auto-update: %s (download skipped)", capability.Message())
+		}
+		a.lastApplyRefusal = &capability
+		_ = RecordApplyNotPermitted(a.cfg.Now(), capability, false, "")
+		a.refresh()
+		return false
+	}
+	a.lastApplyRefusal = nil
+
 	release, err := a.cfg.Checker.CheckForUpdate()
 	if err != nil {
 		a.cfg.Log("auto-update: check failed: %v", err)
@@ -368,7 +392,7 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	// failure internally).
 	applyResult, err := a.cfg.ApplyRelease(ctx, attempt.Candidate, "", release.TagName, Latest)
 	if err != nil {
-		a.cfg.Log("auto-update: apply failed (kept current version): %v", err)
+		a.cfg.Log("auto-update: apply failed: %v", err)
 		a.record(ResultApplyFailed, true, release.TagName)
 		return false
 	}

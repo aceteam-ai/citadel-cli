@@ -4101,15 +4101,26 @@ can't drift), `autoUpdateReportFrom` (the hand projection, pinned by
 ReconcilePendingOnStartup,ReadStateForReport}` (the atomic, preference-preserving
 state writes under `update.stateMu`). The periodic updater refreshes the cache
 via `AutoUpdaterConfig.Refresh` (threaded through `autoUpdateRuntime.refresh`);
-`buildAutoUpdateSnapshot` reuses agentNodeInfo's #923 `CurrentVersion!=running`
-rule for pending_version/restart_required. pending clears only when the running
-binary matches the staged version (`ReconcilePendingOnStartup`). Corrupt state
+`buildAutoUpdateSnapshot` and `agentNodeInfo` use `update.StagedVersionIsNewer`
+for pending_version/restart_required. `ReconcilePendingOnStartup` clears stale
+restart results only when valid staged metadata is equal to or older than the
+running release. Invalid metadata is not proof of recovery. Corrupt state
 degrades to `configured_enabled=null`/`last_result=state_corrupt` and never supplies
 pending versions or timestamps. `resolveAutoUpdatePolicy` keeps opt-out/dev veto,
 then flag, then environment ahead of the file preference; corruption replaces
 only that last preference with unknown. Explicit enables still run, while
 telemetry writes preserve the broken bytes. `SetAutoUpdate` alone repairs malformed
 JSON and first attempts a private UTC-stamped `state.json.corrupt-*` backup.
+
+`update.InspectSelfUpdateCapability` owns current-process install authority and a
+same-directory probe, without provisioning locks or changing the binary. Worker
+startup/refresh observes it for the cached report, independently of preference.
+Periodic and remote/manual update paths consult it before download. Deliberately
+privileged installs remain supported: auto-update off reports capability rather
+than a failed update. `RecordApplyNotPermitted` owns refusal persistence, and the
+updater's refusal notice is emitted only when the observed condition changes.
+See `docs/update-install-capability.md` for the wire contract and remaining
+service/installer and native acceptance scope.
 
 **Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
 The update state file resolves from HOME (`getUserHomeDir`), and the shipped

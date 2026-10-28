@@ -208,3 +208,53 @@ func TestReconcilePendingOnStartup(t *testing.T) {
 		}
 	})
 }
+
+func TestStagedVersionIsNewer(t *testing.T) {
+	for _, tc := range []struct {
+		name, staged, running string
+		want                  bool
+	}{
+		{"newer", "v2.203.0", "2.202.0", true},
+		{"older", "v2.97.0", "v2.202.0", false},
+		{"equal", "2.202.0", "v2.202.0", false},
+		{"build metadata is not newer", "v2.202.0+other", "v2.202.0+running", false},
+		{"older prerelease", "v2.202.0-rc.1", "v2.202.0", false},
+		{"newer release", "v2.202.0", "v2.202.0-rc.1", true},
+		{"invalid staged", "not-a-release", "v2.202.0", false},
+		{"invalid running", "v2.203.0", "dev", false},
+		{"missing staged", "", "v2.202.0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := StagedVersionIsNewer(tc.staged, tc.running); got != tc.want {
+				t.Fatalf("pending=%t, want %t for %q vs %q", got, tc.want, tc.staged, tc.running)
+			}
+		})
+	}
+}
+
+func TestReconcileOlderStagedVersionClearsOnlyRestartResult(t *testing.T) {
+	for _, result := range []string{ResultRestartPending, ResultRestartFailed, ResultApplyFailed} {
+		t.Run(result, func(t *testing.T) {
+			isolateState(t)
+			originalTime := time.Unix(10, 0).UTC()
+			if err := SaveState(&State{CurrentVersion: "v2.97.0", AutoUpdate: true, Channel: "stable", LastResult: result, LastResultAt: originalTime}); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Unix(3000, 0).UTC()
+			if err := ReconcilePendingOnStartup(now, "v2.202.0"); err != nil {
+				t.Fatal(err)
+			}
+			state, err := LoadState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantResult, wantTime := ResultUpToDate, now
+			if result == ResultApplyFailed {
+				wantResult, wantTime = result, originalTime
+			}
+			if state.LastResult != wantResult || !state.LastResultAt.Equal(wantTime) || !state.AutoUpdate || state.Channel != "stable" || state.CurrentVersion != "v2.97.0" {
+				t.Fatalf("stale reconciliation lost unrelated state or retained a restart claim: %+v", state)
+			}
+		})
+	}
+}
