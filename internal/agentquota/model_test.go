@@ -7,9 +7,9 @@ import (
 
 func fixture() (Policy, Snapshot) {
 	scope := Scope{HostID: "host-a", PoolID: "pool-a", ConfigID: "config-a"}
-	policy := Policy{Scope: scope, Lanes: []LanePolicy{
-		{LaneID: "a", Enabled: true, MaxTurns: 10, MaxTurnMillis: MaxTurnMillis},
-		{LaneID: "b", Enabled: true, MaxTurns: 10, MaxTurnMillis: MaxTurnMillis},
+	policy := Policy{Scope: scope, Harnesses: DefaultHarnessConfig(), Lanes: []LanePolicy{
+		{LaneID: "a", Harness: HarnessClaudeCode, Enabled: true, MaxTurns: 10, MaxTurnMillis: MaxTurnMillis},
+		{LaneID: "b", Harness: HarnessClaudeCode, Enabled: true, MaxTurns: 10, MaxTurnMillis: MaxTurnMillis},
 	}}
 	snapshot := Snapshot{
 		Scope: scope, Complete: true, Revision: 1, NextID: 1,
@@ -99,7 +99,7 @@ func inactive(t *testing.T, policy Policy, snapshot Snapshot, now uint64, ref Re
 func tenInactive(t *testing.T) (Policy, Snapshot) {
 	t.Helper()
 	policy, snapshot := fixture()
-	for i := 0; i < MaxTurnsPerWindow; i++ {
+	for i := 0; i < MaxClaudeTurnsPerWindow; i++ {
 		id := snapshot.NextID
 		snapshot = reserve(t, policy, snapshot, 0, "a")
 		ref := Reservation{LaneID: "a", ReservationID: id}
@@ -526,12 +526,13 @@ func TestNoSilentGenesisAndBoundedCorruptStateRefusals(t *testing.T) {
 	policy, _ := fixture()
 	plan, err := PlanReserve(policy, Snapshot{}, Context{}, "a")
 	reject(t, plan, err, HoldState)
-	// Eleven recent, nonactive, otherwise valid charges exceed the hard maximum.
+	// The structural bound accommodates prior Codex debt after policy lowering.
+	// One beyond that bound is invalid even when every charge is inactive.
 	policy, snapshot := fixture()
-	for i := uint64(0); i < 11; i++ {
+	for i := uint64(0); i < MaxTurnsPerWindow+1; i++ {
 		snapshot.Lanes[0].Charges = append(snapshot.Lanes[0].Charges, Charge{ReservationID: i*2 + 1, StopID: i*2 + 2, TurnLimitMillis: MaxTurnMillis, Phase: Inactive})
 	}
-	snapshot.NextID = 23
+	snapshot.NextID = 2*(MaxTurnsPerWindow+1) + 1
 	plan, err = PlanReserve(policy, snapshot, contextFor(snapshot, 0), "b")
 	reject(t, plan, err, HoldState)
 }
@@ -556,7 +557,7 @@ func TestInvalidPolicyIsNotDefaultedOrMigrated(t *testing.T) {
 		{"too many lanes", func(p *Policy) {
 			for i := 0; i < MaxLanes-1; i++ {
 				id := string([]byte{'l', '-', '0' + byte(i/10), '0' + byte(i%10)})
-				p.Lanes = append(p.Lanes, LanePolicy{LaneID: id, Enabled: true, MaxTurns: 10, MaxTurnMillis: MaxTurnMillis})
+				p.Lanes = append(p.Lanes, LanePolicy{LaneID: id, Harness: HarnessClaudeCode, Enabled: true, MaxTurns: 10, MaxTurnMillis: MaxTurnMillis})
 			}
 		}, HoldPolicy},
 	}

@@ -10,12 +10,15 @@ does not complete the governed-lane supervisor.
 
 ## One aggregate and explicit policy
 
-The current [#1442 scope, item 2](https://github.com/aceteam-ai/citadel-cli/issues/1442)
-states: "at most 10 automatic turns per day per lane, 30 minutes per turn, one
-turn at a time;". This model applies rolling quota and occupied custody per lane
-within one host/pool record. It does not impose a separate host-wide ten-turn
-cap or serialize native turns across different lanes. With 64 enabled lanes,
-up to 640 reservations can be charged across the pool in a rolling day. That
+Jason's October 29 decision on [Aceteam #12838](https://github.com/aceteam-ai/aceteam/issues/12838),
+carried into [#1442 scope, item 2](https://github.com/aceteam-ai/citadel-cli/issues/1442),
+sets per-harness defaults: **Codex 48** and **Claude Code 10** automatic turns per
+lane per rolling 24 hours, **30 minutes** per turn and **one active turn** per lane.
+This model applies rolling quota and occupied custody per lane within one
+host/pool record. It does not impose a separate host-wide turn cap or serialize
+native turns across different lanes. With 64 enabled Codex lanes, up to 3,072
+reservations can be charged across the pool in a rolling day (640 for all Claude
+Code lanes at their defaults). That
 accounting bound is not native execution authority; a stronger host-wide
 serialization policy would require separately reviewed design and integration.
 
@@ -33,19 +36,33 @@ file-only policy assertions. Opt-out and cap edits must bump that shared
 revision without discarding charges or custody; file-only edits cannot provide
 this fence. No real policy-edit operation or adapter is supplied here.
 
-Every configured lane declares its enabled state, a positive cap no greater
-than ten turns per rolling 24 hours and a positive limit no greater than 30
-minutes per turn. There are no activating defaults. A missing policy collection
+`DefaultHarnessConfig()` returns only the approved limits; it installs no config,
+creates no lanes and enables none. `Policy.Harnesses` must explicitly contain
+valid limits for both harnesses. Those limits may be lowered, but cannot exceed
+48 for Codex, 10 for Claude Code, 30 minutes or one active turn. A zero or missing
+configuration holds. Every configured lane declares its harness (`codex` or
+`claude-code`), enabled state, positive turn cap within that harness's approved
+maximum and positive duration no greater than 30 minutes. Missing or unknown
+harnesses hold; names are never guessed or promoted to Codex. Admission applies
+the smaller of the lane and current harness limits, including a recheck before
+attempting an already charged reservation. A harness change or cap reduction
+retains all earlier debt and custody. The future trusted outer CAS must bind the
+harness assertion to the actual lane as well as the current policy; the enum
+alone is not native identity evidence.
+
+There are no activating defaults. A missing policy collection
 holds; an explicitly empty collection disables admission for every lane. A
 stored lane removed from policy remains in the aggregate and can still be
 stopped and released with exact evidence. A new lane without existing state
 holds; no genesis, migration, deletion, repair or reset API is supplied.
 
-`Validate` bounds the aggregate to 64 lanes and eleven retained charges per
+`Validate` bounds the aggregate to 64 lanes and 49 retained charges per
 lane before copying, rejects incomplete/malformed collections and unknown
 phases, checks globally distinct issued IDs and allows at most one occupied
-custody slot per lane. Eleven recent charges are invalid even if none is
-active. A lower current cap can leave more recent debt than that cap; this is
+custody slot per lane. More than 48 recent charges are invalid even if none is
+active. This structural bound is independent of the current harness so historical
+Codex debt remains valid after a lane changes to Claude Code. A lower current
+cap can leave more recent debt than that cap; this is
 retained debt, not an empty ledger or corrupt-state repair opportunity.
 
 ## Clock and store are separate trust inputs
