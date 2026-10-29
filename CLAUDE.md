@@ -31,6 +31,14 @@ So, when adding to this file:
 
 ## Project Overview
 
+`reconstruct.Runner` is the trusted-operator engine, not a registered dispatched
+job. `publishDirectory` owns its create-only Linux bundle rename; unsupported
+publication primitives fail closed. The remaining workspace, SPZ, container
+custody and signed-event boundaries for #1381 are tracked in
+`docs/reconstruct-splat-job.md`; helper source or historical GPU acceptance
+does not prove those boundaries. `publish_linux_test.go` pins late collisions
+and competing publishers with synthetic fake executors.
+
 `service.RematerializeManagedUnits` owns the bounded base-file refresh and
 reload request, not worker restart or failed-unit counter recovery.
 `cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
