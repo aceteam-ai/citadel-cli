@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -10,7 +11,6 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
-	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
 // maskRedisURL masks the password in a Redis URL for safe logging.
@@ -35,6 +35,7 @@ func maskRedisURL(redisURL string) string {
 // This is the job source for AceTeam's private GPU cloud infrastructure.
 // Supports consuming from multiple queues simultaneously for tag-based routing.
 type RedisSource struct {
+	deliveryRefusals
 	client *redisclient.Client
 	config RedisSourceConfig
 
@@ -241,18 +242,29 @@ func (s *RedisSource) snapshotQueues() []string {
 
 // nextSingle reads from a single queue (original behavior).
 func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int) (*Job, error) {
+	defer func() { s.recordN(s.client.DrainDurableRefusals(), s.log) }()
 	// Reclaim a stale pending entry (issue #871) before doing a normal read.
 	// This is the ONLY thing that ever redelivers a Nacked-but-unacked
 	// message in direct-Redis mode -- see StalePendingReclaimMinIdle's doc
 	// comment. Best-effort: a reclaim error never fails the poll, it just
 	// falls through to the ordinary read.
 	redisJob, err := s.client.ReclaimStalePendingOnQueue(ctx, queue)
+	if errors.Is(err, redisclient.ErrDurableControlRequired) {
+		redisJob, err = nil, nil
+	}
+	if redisJob != nil && hasDurableCarrier(redisJob.RawData) {
+		s.record(s.log)
+		redisJob = nil
+	}
 	if err != nil {
 		s.log("warning", "   - Failed to reclaim stale pending job on %s: %v", queue, err)
 		redisJob = nil
 	}
 	if redisJob == nil {
 		redisJob, err = s.client.ReadJobBlock(ctx, blockMs)
+		if errors.Is(err, redisclient.ErrDurableControlRequired) {
+			return nil, nil
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to read job from Redis: %w", err)
 		}
@@ -263,7 +275,8 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 	}
 
 	if hasDurableCarrier(redisJob.RawData) {
-		return nil, redisapi.ErrDurableDelivery
+		s.record(s.log)
+		return nil, nil
 	}
 
 	// Check delivery count for DLQ handling
@@ -308,6 +321,7 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 
 // nextMulti reads from multiple queues simultaneously.
 func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs int) (*Job, error) {
+	defer func() { s.recordN(s.client.DrainDurableRefusals(), s.log) }()
 	// Reclaim a stale pending entry (issue #871) on any of the subscribed
 	// queues before doing a normal read. See nextSingle's comment and
 	// StalePendingReclaimMinIdle's doc comment for why this is needed at all.
@@ -315,6 +329,13 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 	var sourceQueue string
 	for _, q := range queues {
 		reclaimed, err := s.client.ReclaimStalePendingOnQueue(ctx, q)
+		if errors.Is(err, redisclient.ErrDurableControlRequired) {
+			continue
+		}
+		if reclaimed != nil && hasDurableCarrier(reclaimed.RawData) {
+			s.record(s.log)
+			continue
+		}
 		if err != nil {
 			s.log("warning", "   - Failed to reclaim stale pending job on %s: %v", q, err)
 			continue
@@ -329,6 +350,9 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 	if redisJob == nil {
 		var err error
 		redisJob, sourceQueue, err = s.client.ReadJobMultiBlock(ctx, queues, blockMs)
+		if errors.Is(err, redisclient.ErrDurableControlRequired) {
+			return nil, nil
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to read job from Redis: %w", err)
 		}
@@ -339,7 +363,8 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 	}
 
 	if hasDurableCarrier(redisJob.RawData) {
-		return nil, redisapi.ErrDurableDelivery
+		s.record(s.log)
+		return nil, nil
 	}
 
 	// Check delivery count for DLQ handling

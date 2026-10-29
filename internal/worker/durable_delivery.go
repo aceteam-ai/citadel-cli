@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"math/bits"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
@@ -29,6 +32,7 @@ type durableDelivery struct {
 	deadline        time.Time
 	renewAt         time.Time
 	live, committed bool
+	renewPaused     bool
 	intent          []byte // frozen once, including after an ambiguous commit response
 	terminal        *deliveryTerminal
 	raw             StreamWriter
@@ -55,7 +59,7 @@ func (d *durableDelivery) renew(ctx context.Context) error {
 	start := d.now() // monotonic sample BEFORE the HTTP request; latency is charged.
 	d.mu.Lock()
 	previous := d.deadline
-	refused := d.loop.Err() != nil || d.committed || (!previous.IsZero() && !d.live)
+	refused := d.renewPaused || d.loop.Err() != nil || d.committed || (!previous.IsZero() && !d.live)
 	d.mu.Unlock()
 	if refused {
 		return redisapi.ErrDurableDelivery
@@ -75,7 +79,7 @@ func (d *durableDelivery) renew(ctx context.Context) error {
 	d.mu.Lock()
 	// Completion owns the receipt barrier now. Cancelling an overlapping renew
 	// must not cancel the post-receipt wake publisher as though the lease was lost.
-	if d.committed {
+	if d.committed || d.renewPaused {
 		d.mu.Unlock()
 		return redisapi.ErrDurableDelivery
 	}
@@ -102,6 +106,24 @@ func (d *durableDelivery) renew(ctx context.Context) error {
 	})
 	d.mu.Unlock()
 	return nil
+}
+
+// pauseRenewal stops future/in-flight renewals without discarding the original
+// deadline. A finished result may still commit within that already-held lease.
+// The independent expiry timer remains active and can still lose the claim.
+func (d *durableDelivery) pauseRenewal() {
+	d.mu.Lock()
+	d.renewPaused = true
+	d.mu.Unlock()
+	d.stopLoop()
+}
+
+func (d *durableDelivery) followShutdown(ctx context.Context) {
+	stopRoot := context.AfterFunc(ctx, d.pauseRenewal)
+	context.AfterFunc(d.lost, func() { stopRoot() })
+	if ctx.Err() != nil {
+		d.pauseRenewal()
+	}
 }
 
 func (d *durableDelivery) keepAlive() {
@@ -155,6 +177,7 @@ func (d *durableDelivery) isCommitted() bool {
 	return d.committed
 }
 func (d *durableDelivery) bind(ctx context.Context) (context.Context, func()) {
+	d.followShutdown(ctx)
 	bound, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(d.lost, cancel)
 	if !d.valid() {
@@ -221,11 +244,15 @@ func (d *durableDelivery) finish(ctx context.Context, fallback error, code strin
 		}
 		d.terminal = terminal
 	}
+	// Stop renewal before asking for completion. Cancellation of an overlapping
+	// renewal is a pause, not evidence that this still-held lease was lost.
+	d.renewPaused = true
+	d.stopLoop()
 	envelope := bytes.Clone(d.intent)
 	remaining := d.deadline.Sub(d.now())
 	d.mu.Unlock()
-	// Worker cancellation still owes a cancelled terminal. Preserve request values,
-	// but bound this HTTP-only operation by the currently held lease, never a new one.
+	// A verified job cancellation or an already-finished result may still commit
+	// after worker shutdown. Bound control by the original lease, never a new one.
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), remaining)
 	defer cancel()
 	if err := d.control.CompleteDelivery(commitCtx, d.claim, envelope); err != nil {
@@ -348,11 +375,59 @@ func hasDurableCarrier[M ~map[string]V, V any](data M) bool {
 	return false
 }
 
-func (r *Runner) cancelWaitingDelivery(ctx context.Context, job *Job, stream StreamWriter, err error) {
-	if job.delivery != nil && job.delivery().valid() {
-		_ = stream.WriteCancelled("Job cancelled while queued")
-		_ = r.source.Ack(ctx, job)
-		return
-	}
+func (r *Runner) cancelWaitingDelivery(ctx context.Context, job *Job, _ StreamWriter, err error) {
+	// The lane context is the worker lifetime, not proof of a producer cancel.
+	// Queued shutdown work has no finished terminal to preserve.
 	_ = r.source.Nack(ctx, job, err)
 }
+
+// Only MEDIA_GENERATE has this legacy structured backpressure contract. Shell
+// stdout and other arbitrary output text cannot turn completed work into retry.
+func (r *Runner) durableModelWarming(job *Job, result *JobResult) bool {
+	if result == nil {
+		return false
+	}
+	if result.Output["status"] == "model_warming" {
+		return true
+	}
+	if job.Type != JobTypeMediaGenerate {
+		return false
+	}
+	if _, ok := r.findHandler(job.Type).(*LegacyHandlerAdapter); !ok {
+		return false
+	}
+	encoded, ok := result.Output["output"].(string)
+	if !ok {
+		return false
+	}
+	var reply struct {
+		Status string `json:"status"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(encoded))
+	if decoder.Decode(&reply) != nil || reply.Status != "model_warming" {
+		return false
+	}
+	_, err := decoder.Token()
+	return err == io.EOF
+}
+
+// A refused delivery remains pending for an authenticated recovery path. Count
+// it separately from fetch failures: it must not feed the runner's error backoff.
+// Coalesce warnings at powers of two without logging identity or claim material.
+type deliveryRefusals struct{ count atomic.Uint64 }
+
+func (r *deliveryRefusals) record(log func(string, string, ...interface{})) {
+	r.recordN(1, log)
+}
+func (r *deliveryRefusals) recordN(count uint64, log func(string, string, ...interface{})) {
+	if count == 0 {
+		return
+	}
+	n := r.count.Add(count)
+	// Also warn when a batch crosses a power of two.
+	previous := n - count
+	if previous == 0 || bits.Len64(n) > bits.Len64(previous) {
+		log("warning", "Unsupported durable delivery skipped; count=%d; authenticated HTTP control required", n)
+	}
+}
+func (r *deliveryRefusals) RefusedDeliveries() uint64 { return r.count.Load() }

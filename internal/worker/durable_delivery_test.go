@@ -279,7 +279,7 @@ func TestDurableTerminalMappings(t *testing.T) {
 				_ = r.executeJob(ctx, f.job, stream, start, false, 0)
 			}
 			switch name {
-			case "warming", "retry", "generic-failure":
+			case "cancel-during", "warming", "retry", "generic-failure":
 				if len(f.envelopes) != 0 || w.ends+w.errs+w.cancels != 0 || f.job.delivery().valid() {
 					t.Fatal("retry became terminal", f.order)
 				}
@@ -501,11 +501,11 @@ func TestDurableImmediateRenewalFailureNeverAdmitsOrAcknowledges(t *testing.T) {
 			source.client = redisapi.NewClient(redisapi.ClientConfig{BaseURL: "https://fake.invalid", Token: "synthetic-device"})
 			defer source.Close()
 			job, err := source.nextSingle(context.Background(), "jobs:v1:tag:fixture", 1)
-			if err == nil || job != nil || len(f.envelopes) != 0 {
+			if err != nil || job != nil || source.RefusedDeliveries() != 1 || len(f.envelopes) != 0 {
 				t.Fatal("unrenewed or unsupported delivery admitted")
 			}
 			if name == "denied" || name == "zero-budget" {
-				if f.renews != 1 {
+				if f.renewalCount() != 1 {
 					t.Fatal("first renewal was not immediate")
 				}
 			}
@@ -530,7 +530,7 @@ func TestDurableRealLaneWaitRenewsAndLeaseLossDoesNotStartHandler(t *testing.T) 
 		done := make(chan bool, 1)
 		go func() { done <- r.runLaneJob(context.Background(), lane, f.job, stream, start, ticket) }()
 		time.Sleep(600 * time.Millisecond)
-		if f.renews < 2 || started.Load() {
+		if f.renewalCount() < 2 || started.Load() {
 			t.Fatal("waiting delivery failed to renew or overlapped lane owner")
 		}
 		f.mu.Lock()
@@ -577,29 +577,28 @@ func TestDurableClockBudgetAndEpochCannotBeRefreshedAfterLoss(t *testing.T) {
 	f := newDeliveryFixture(t, "CLOCK_FIXTURE", `{}`)
 	d := f.job.delivery()
 	d.stop()
-	before := f.renews
+	before := f.renewalCount()
 	var called atomic.Bool
 	d.control = fakeDeliveryControl{renew: func(context.Context) (time.Duration, error) { called.Store(true); return time.Second, nil }}
 	if err := d.renew(context.Background()); err == nil || d.valid() {
 		t.Fatal("lost original claim was renewed")
 	}
 	// A locally lost claim must not even ask the server to restore authority.
-	if f.renews != before || called.Load() {
+	if f.renewalCount() != before || called.Load() {
 		t.Fatal("reacquisition attempted after loss")
 	}
 	f.check(t)
 }
 
-func TestDurableRealAPIWriterCommitsCancelledOnLiveControlContext(t *testing.T) {
+func TestDurableRealAPIWriterCommitsVerifiedJobCancellation(t *testing.T) {
 	f := newDeliveryFixture(t, "CLOCK_FIXTURE", `{}`)
 	root, cancel := context.WithCancel(context.Background())
 	h := &clockFixtureHandler{run: func(ctx context.Context, _ *Job, s StreamWriter) (*JobResult, error) {
 		_ = s.WriteProgress(map[string]any{"count": 1})
 		_ = s.WriteEnd(map[string]any{"early": true})
-		cancel()
-		<-ctx.Done()
-		return nil, ctx.Err()
+		return &JobResult{Status: JobStatusCancelled}, nil
 	}}
+	defer cancel()
 	r, _ := f.runner(h)
 	r.WithStreamWriterFactory(CreateAPIStreamWriterFactory(root, f.source))
 	_, stream, start := r.claimJob(root, f.job)
@@ -612,7 +611,7 @@ func TestDurableRealAPIWriterCommitsCancelledOnLiveControlContext(t *testing.T) 
 	f.check(t)
 }
 
-func TestDurableQueuedWorkerCancellationCommitsBeforePublishing(t *testing.T) {
+func TestDurableQueuedWorkerShutdownLapsesWithoutTerminal(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newDeliveryFixture(t, "CLOCK_FIXTURE", `{}`)
 		r, w := f.runner(nil)
@@ -628,8 +627,8 @@ func TestDurableQueuedWorkerCancellationCommitsBeforePublishing(t *testing.T) {
 			t.Fatal("cancelled waiter succeeded")
 		}
 		<-lane.exec
-		if w.cancels != 1 || len(f.envelopes) != 1 || !reflect.DeepEqual(f.order, []string{"commit", "cancelled"}) {
-			t.Fatal("queued cancellation lost terminal", f.order)
+		if w.ends+w.errs+w.cancels != 0 || len(f.envelopes) != 0 || f.job.delivery().valid() {
+			t.Fatal("worker shutdown became a queued terminal", f.order)
 		}
 		f.check(t)
 	})
@@ -663,8 +662,8 @@ func TestDurableDirectRedisRefusalLeavesPendingAndNeverDeadLetters(t *testing.T)
 			} else {
 				job, err = source.nextSingle(ctx, queue, -1)
 			}
-			if err == nil || job != nil {
-				t.Fatal("durable direct entry was executed or disposed")
+			if err != nil || job != nil || source.RefusedDeliveries() != 1 {
+				t.Fatal("durable refusal became a fetch error or execution")
 			}
 			pending, err := redis.XPending(ctx, queue, "fixture-workers").Result()
 			if err != nil || pending.Count != 1 {
@@ -823,3 +822,5 @@ func TestDurableLegacyCooperativeCancellationCommitsCancelled(t *testing.T) {
 		f.check(t)
 	})
 }
+
+func (f *deliveryFixture) renewalCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.renews }

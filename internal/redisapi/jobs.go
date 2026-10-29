@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 	"maps"
 	"net/http"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 )
 
 // ConsumeJob reads the next available job from the queue.
@@ -58,16 +59,19 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 	// Convert the first StreamMessage to a Job
 	msg := resp.Messages[0]
 	msg.Data.observation = msg.Data.observation.WithSource(req.Queue, req.Group, "redis-api")
+	metadata := msg.Data.observation.State() != deliverymetadata.Absent
+	if msg.Data.deliveryMetadata != nil {
+		metadata = metadata || msg.Data.deliveryMetadata().present
+	}
 	job, err := ParseStreamMessage(msg)
 	if err != nil {
+		if metadata || req.Protocol == DurableResultsProtocol {
+			return nil, ErrDurableDelivery
+		}
 		return nil, err
 	}
-	// Repeated containers can erase the final decoded data object. The whole
-	// response's refusal marker must survive even when that object is absent.
-	job.durableMetadata = msg.Data.observation.State() != deliverymetadata.Absent
-	if msg.Data.deliveryMetadata != nil {
-		job.durableMetadata = job.durableMetadata || msg.Data.deliveryMetadata().present
-	}
+	// Repeated containers cannot erase the whole-response refusal marker.
+	job.durableMetadata = metadata
 	if req.Protocol == DurableResultsProtocol {
 		if len(resp.Messages) != 1 {
 			return nil, ErrDurableDelivery

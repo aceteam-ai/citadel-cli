@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -15,6 +16,7 @@ import (
 // This is the secure alternative to direct Redis connections.
 // Supports consuming from multiple queues by round-robining across them.
 type APISource struct {
+	deliveryRefusals
 	client *redisapi.Client
 	config APISourceConfig
 
@@ -263,6 +265,10 @@ func (s *APISource) nextSingle(ctx context.Context, queue string, blockMs int) (
 		Count:    1,
 		BlockMs:  blockMs,
 	})
+	if errors.Is(err, redisapi.ErrDurableDelivery) {
+		s.record(s.log)
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to consume job from API: %w", err)
 	}
@@ -271,7 +277,12 @@ func (s *APISource) nextSingle(ctx context.Context, queue string, blockMs int) (
 		return nil, nil
 	}
 
-	return s.adoptDelivery(ctx, apiJob, queue)
+	job, err := s.adoptDelivery(ctx, apiJob, queue)
+	if errors.Is(err, redisapi.ErrDurableDelivery) {
+		s.record(s.log)
+		return nil, nil
+	}
+	return job, err
 }
 
 // Block-timeout tuning for the multi-queue rotation. Deliberately fixed: there
@@ -383,6 +394,12 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 			Count:    1,
 			BlockMs:  blockMs,
 		})
+		if errors.Is(err, redisapi.ErrDurableDelivery) {
+			s.record(s.log)
+			succeeded[queue] = struct{}{}
+			delete(failed, queue)
+			return nil, false
+		}
 		if err != nil {
 			// Skip this queue so one rejected queue can't block the others.
 			// We deliberately do NOT log per-queue here: a transient consume
@@ -402,6 +419,10 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 			return nil, false
 		}
 		job, adoptErr := s.adoptDelivery(ctx, apiJob, queue)
+		if errors.Is(adoptErr, redisapi.ErrDurableDelivery) {
+			s.record(s.log)
+			return nil, false
+		}
 		if adoptErr != nil {
 			delete(succeeded, queue)
 			failed[queue] = struct{}{}

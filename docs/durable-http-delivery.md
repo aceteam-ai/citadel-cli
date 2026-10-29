@@ -35,10 +35,16 @@ response publishes nothing and lets server disposition handle the record.
 Terminal wake publication is bounded and retried only after the receipt; a
 failed wake cannot cause another execution.
 
-Cancellation commits an error with code `cancelled`. Permanent failures retain
-a reason code. An unresolved local node ID commits `target_unresolved`. Retry,
+A verified job cancellation (producer marker, cooperative/huddle flag or explicit
+cancelled result) commits an error with code `cancelled`. Worker shutdown is a
+retry path: unfinished and queued work stops renewing and publishes no terminal.
+An already finished success may still commit within its original live lease;
+completion first pauses renewal without extending that deadline. Permanent
+failures retain a reason code. An unresolved local node ID commits `target_unresolved`. Retry,
 GPU/lane admission saturation and `model_warming` stop renewal without a
-terminal. Lease loss cancels the handler and retains its lane/executing bracket
+terminal. Generic handler errors also Nack and lapse: the server may re-execute
+the job up to its attempt cap. A mismatched target lapses pending server-side
+claim-time refusal; it does not commit a permanent error. Lease loss cancels the handler and retains its lane/executing bracket
 until actual exit, including handlers that ignore cancellation. Their late
 results and terminal writer calls cannot escape the lost epoch.
 
@@ -46,7 +52,9 @@ Unsupported sources refuse top-level durable metadata before execution or
 legacy disposition. Direct Redis keeps the entry pending and never ACKs or
 moves it to a dead-letter queue. WebSocket delivery also refuses; WebSocket
 wake publication does not confer execution authority. Malformed or partial
-metadata cannot silently become a legacy execution.
+metadata cannot silently become a legacy execution. Refusals are counted
+separately and warned at coalesced intervals; they never enter the shared fetch
+failure backoff. Reclaimed unsupported entries do not block fresh legacy reads.
 
 WORKER_CONTROL remains refused under v1 pending S3b's commit/restart gate and
 restart persistence. HUDDLE_JOIN also remains refused under v1: its current

@@ -797,6 +797,11 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	startTime = time.Now()
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
 	if job.delivery != nil {
+		job.delivery().followShutdown(ctx)
+		if ctx.Err() != nil {
+			_ = r.source.Nack(ctx, job, ctx.Err())
+			return false, nil, startTime
+		}
 		job.clock = newDeliveryClock(r.clockNow, r.clockState)
 		stream = r.newStreamWriter(job)
 	}
@@ -826,11 +831,11 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
 		}
 		if job.delivery != nil {
-			code := "target_mismatch"
 			if r.config.NodeID == "" {
-				code = "target_unresolved"
+				_ = r.source.Fail(ctx, job, errors.New("target_unresolved"), map[string]any{"reason": "target_unresolved"})
+			} else {
+				_ = r.source.Nack(ctx, job, errors.New("target mismatch; awaiting claim-time refusal"))
 			}
-			_ = r.source.Fail(ctx, job, errors.New(code), map[string]any{"reason": code})
 		} else {
 			r.source.Ack(ctx, job)
 		}
@@ -1043,6 +1048,11 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 			return false
 		}
 		if ctx.Err() != nil {
+			_ = r.source.Nack(ctx, job, ctx.Err())
+			return false
+		}
+		// A job may have been cancelled while waiting for its execution slot.
+		if r.source.IsJobCancelled(ctx, job.ID) {
 			_ = stream.WriteCancelled("Job cancelled before execution")
 			_ = r.source.Ack(ctx, job)
 			return false
@@ -1184,9 +1194,14 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	job.clock.finish(r.clockNow())
 	job.clock.populate(result)
 	duration := endTime.Sub(startTime)
-	if job.delivery != nil && (cancelled || ctx.Err() != nil || (result != nil && result.Status == JobStatusCancelled)) {
+	if job.delivery != nil && (cancelled || (result != nil && result.Status == JobStatusCancelled)) {
 		_ = stream.WriteCancelled("Job cancelled")
 		_ = r.source.Ack(ctx, job)
+		return false
+	}
+	var hardDeadline *deadlineExceededError
+	if job.delivery != nil && ctx.Err() != nil && !errors.As(err, &hardDeadline) && (err != nil || result == nil || result.Status != JobStatusSuccess) {
+		_ = r.source.Nack(ctx, job, ctx.Err())
 		return false
 	}
 	if cancelled {
@@ -1673,7 +1688,7 @@ func (r *Runner) publishWorkerControlRefusal(ctx context.Context, stream StreamW
 // duplicating it -- duplicating it is how a "queued" job would end up Acked with
 // no terminal event, reintroducing the #559 bug this design exists to avoid.
 func (r *Runner) finishSuccess(ctx context.Context, job *Job, stream StreamWriter, result *JobResult, startTime, endTime time.Time) {
-	if job.delivery != nil && result != nil && result.Output["status"] == "model_warming" {
+	if job.delivery != nil && r.durableModelWarming(job, result) {
 		_ = r.source.Nack(ctx, job, errors.New("model_warming"))
 		return
 	}

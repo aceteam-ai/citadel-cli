@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -14,6 +15,7 @@ import (
 // server-pushed job delivery. Instead of HTTP polling, the server runs a
 // persistent XREADGROUP BLOCK loop and pushes "job" messages to the client.
 type WSSource struct {
+	deliveryRefusals
 	client *redisapi.Client
 	config WSSourceConfig
 
@@ -125,6 +127,10 @@ func (s *WSSource) Connect(ctx context.Context) error {
 	// continuously from its XREADGROUP BLOCK loop.
 	ws.OnMessage("job", func(msg redisapi.WSMessage) {
 		job, err := s.convertWSJob(msg)
+		if errors.Is(err, redisapi.ErrDurableDelivery) {
+			s.record(s.log)
+			return
+		}
 		if err != nil {
 			s.debug("ws_source: failed to convert job message: %v", err)
 			return

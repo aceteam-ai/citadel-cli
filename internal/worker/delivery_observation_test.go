@@ -90,8 +90,8 @@ func TestDeliveryObservationAPIActualConsumeConversion(t *testing.T) {
 	job, err := source.nextSingle(context.Background(), "actual-request-queue", 1)
 	// S3a refuses legacy-negotiated v1 metadata; a passive observation is not
 	// an authenticated, renewed execution claim.
-	if err == nil || job != nil {
-		t.Fatal("passive API metadata acquired execution authority")
+	if err != nil || job != nil || source.RefusedDeliveries() != 1 {
+		t.Fatal("passive API metadata acquired execution authority or fetch backoff")
 	}
 	if req["queue"] != "actual-request-queue" || req["group"] != "citadel-workers" || req["consumer"] != source.client.WorkerID() || req["protocol"] != nil || len(req) != 5 {
 		t.Fatal("request negotiation changed")
@@ -150,8 +150,8 @@ func TestDeliveryObservationWSActualConsumeConversion(t *testing.T) {
 	defer srv.Close()
 	client := redisapi.NewClient(redisapi.ClientConfig{BaseURL: srv.URL, Token: "test-only"})
 	defer client.Close()
-	source := NewWSSource(WSSourceConfig{Client: client, QueueName: "requested-queue", LogFn: func(string, string) {}, DebugFunc: func(format string, _ ...any) {
-		if strings.Contains(format, "failed to convert job message") {
+	source := NewWSSource(WSSourceConfig{Client: client, QueueName: "requested-queue", LogFn: func(level, msg string) {
+		if level == "warning" && strings.Contains(msg, "Unsupported durable delivery skipped") {
 			select {
 			case refused <- struct{}{}:
 			default:
@@ -169,6 +169,9 @@ func TestDeliveryObservationWSActualConsumeConversion(t *testing.T) {
 	case <-refused:
 	case <-ctx.Done():
 		t.Fatal("v1 WebSocket delivery was not refused")
+	}
+	if source.RefusedDeliveries() != 1 {
+		t.Fatal("WS refusal not counted")
 	}
 	select {
 	case req := <-requests:
