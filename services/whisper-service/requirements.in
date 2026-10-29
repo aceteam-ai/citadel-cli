@@ -7,6 +7,8 @@ pillow==13.0.0
 # #1510: GHSA-xcq7-p3pf-p88h. SDK and semantic-convention exact API
 # constraints are updated together in the targeted lock; see SECURITY-LOCK-1510.md.
 opentelemetry-api==1.45.1
+# Current audit: 13 filelock advisories; all fixed in 4.2.1.
+filelock==4.2.1
 faster-whisper==1.2.1
 # faster-whisper 1.2.1 still passes metadata_errors= to av.open. PyAV 19
 # removed that keyword; keep the last compatible release until the merged

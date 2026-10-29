@@ -51,3 +51,26 @@ image rebuild/digest update remain separate gates. No package installation into
 the host, model/image download, inference, running-service change, publication,
 deployment, SQL, credential change, undraft or merge is performed by this source
 patch. It does not repair an already-published image or a running node.
+
+## Follow-up from the current audit
+
+Original CI 40895617876 passed all 14 hermetic Whisper tests and stopped reporting
+the API advisory. Its audit reported 13 advisories on filelock 4.0.12 and
+GHSA-xmj3-9gf7-h52w on setuptools 81.0.0. The source is not audit-green.
+
+[Filelock 4.2.1 publisher metadata](https://pypi.org/pypi/filelock/4.2.1/json)
+supplies two non-yanked hashes and Python >=3.11, compatible with this image.
+The old release's publisher advisory records identify 4.2.1 as fixed for all 13
+findings. This correction pins it directly and updates only that additional lock
+entry. Huggingface-hub 1.33.0 requires filelock >=3.10.0; pyannote-pipeline 4.0.0
+requires >=3.17.0. The preserved CPU Torch wheel requires filelock without an
+upper bound. These constraints admit 4.2.1.
+
+Setuptools remains held. Its publisher metadata identifies 84.1.0 as fixed for
+the new finding, but metadata for the exact preserved Torch 2.11.0+cpu CPython
+3.12 wheel requires setuptools <82. A mechanical 84.1.0 edit would create an
+incompatible lock. The exact CPU artifact and ABI are not changed, and no
+advisory suppression or dependency-resolution bypass is added. A separately
+reviewed compatible CPU pair or publisher-supported backport needs an owner
+decision before the remaining audit can pass. No runtime reachability exemption
+is claimed for the new advisory.
