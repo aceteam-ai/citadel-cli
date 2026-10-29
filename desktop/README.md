@@ -19,6 +19,51 @@ The stage script builds the Go helper into `src-tauri/binaries/citadel-<target-t
 
 The bundled helper is copied to a private, content-versioned directory under `~/Library/Application Support/ai.aceteam.citadel/helpers/`; launchd points at that copy. At every app start, the current helper is staged and an existing desktop-managed user LaunchAgent is repointed and restarted once if its helper changed. No enrollment is repeated. An unrelated or manually installed service is left untouched. Reconciliation failures are shown in the app; the node helper never replaces itself.
 
+## Linux helper staging source
+
+The same sidecar staging script also maps the exact `x86_64-unknown-linux-gnu`
+and `aarch64-unknown-linux-gnu` targets to Go `linux/amd64` and `linux/arm64`.
+The two macOS target mappings remain supported. With no argument, it uses the
+Rust host tuple; explicit empty, unsupported or extra arguments refuse. The
+helper path remains `src-tauri/binaries/citadel-<target-triple>`, with no output
+override. A checked, nonempty Git version is embedded before reporting success.
+
+This is the first #618 staging source slice in the shared Tauri codebase, not
+a Linux application/package readiness claim. It adds no Linux launcher,
+installer or service behavior. Debian/AppImage packaging, actual Tauri/native
+builds, Secret Service availability and credential behavior, service supervision,
+installation and both architecture acceptance remain gated. Existing Cargo
+Secret Service features alone do not establish native acceptance.
+
+`scripts/stage-sidecar-test.sh` prepares the actual script in a disposable fake
+repository with recording Go/Git/Rust shims; it requires no real compiler,
+Tauri or Mac tool. The existing DMG source test suite invokes it. These fixtures
+check source command construction and failure paths; they do not prove a native
+binary or distribution artifact. No local candidate script/test/build execution
+accompanied this source change.
+
+## Windows helper staging source
+
+The shared script accepts exactly `x86_64-pc-windows-msvc` for the first #619
+build-input slice, selecting Go `windows/amd64` and the fixed output
+`src-tauri/binaries/citadel-x86_64-pc-windows-msvc.exe`. This follows Tauri's
+[target-suffixed external binary naming](https://v2.tauri.app/develop/sidecar/),
+including the Windows `.exe` extension. Darwin and Linux output names stay
+suffixless. Other Windows targets, including GNU, 32-bit and ARM64, refuse.
+
+The existing inert fixture suite covers explicit and default-host Windows
+selection, exact Go argv/environment/output naming, rejected inputs and
+provenance/build/chmod failures. It runs the shared Bash stager with fake tools
+on Unix; it does not prove Windows shell compatibility, a real PE binary or
+native Tauri bundling. This slice builds no Windows app or installer and adds
+no new workflow, runtime, permission, authentication or service behavior.
+
+Windows native build and onboarding/credential acceptance, user-level
+supervision without elevation, signed installer/winget packaging and
+distribution remain open under #619. The existing Administrator/LocalSystem
+SCM service path is not the accepted user-level v1 supervisor. Do not infer
+full Windows support from a staged helper or from generic CLI cross-compiles.
+
 ## Build an unsigned DMG
 
 The distribution entrypoint accepts one exact macOS target at a time. It stages the matching Go helper, asks Tauri to create the DMG, and verifies that both the desktop executable and bundled helper are thin Mach-O binaries for the requested architecture. It also requires exactly one nonempty DMG in the target-specific Tauri output directory.
