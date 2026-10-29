@@ -18,6 +18,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/alicebob/miniredis/v2"
 	goredis "github.com/redis/go-redis/v9"
@@ -771,5 +773,53 @@ func TestDurableCommittedReceiptOwnsOverlappingRenewalCancellation(t *testing.T)
 		if revoked {
 			t.Fatal("overlapping renewal revoked an already committed terminal publisher")
 		}
+	})
+}
+
+// Use the real legacy adapter: cooperative handlers return a successful byte
+// result with partial counts rather than JobStatusCancelled.
+type deliveryCooperativeLegacy struct {
+	run func(jobs.JobContext) ([]byte, error)
+}
+
+func (h deliveryCooperativeLegacy) Execute(ctx jobs.JobContext, _ *nexus.Job) ([]byte, error) {
+	return h.run(ctx)
+}
+func (h deliveryCooperativeLegacy) Capabilities() jobs.JobCapabilities {
+	return jobs.JobCapabilities{CooperativeCancel: true}
+}
+func TestDurableLegacyCooperativeCancellationCommitsCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newDeliveryFixture(t, "CLOCK_FIXTURE", `{}`)
+		partialCommitted := false
+		legacy := deliveryCooperativeLegacy{run: func(ctx jobs.JobContext) ([]byte, error) {
+			f.mu.Lock()
+			f.cancelled = true
+			f.mu.Unlock()
+			for !ctx.CancelRequestedNow() {
+				time.Sleep(time.Millisecond)
+			}
+			if ctx.Context().Err() != nil {
+				t.Error("graceful cancellation aborted the current file")
+			}
+			partialCommitted = true
+			return []byte(`{"status":"cancelled","files_indexed":1}`), nil
+		}}
+		adapter := NewLegacyHandlerAdapter("CLOCK_FIXTURE", legacy)
+		r, w := f.runner(adapter)
+		r.coopCancelPoll = time.Millisecond
+		_, stream, start := r.claimJob(context.Background(), f.job)
+		if r.executeJob(context.Background(), f.job, stream, start, false, 0) {
+			t.Error("graceful cancellation reported a successful durable result")
+		}
+		if !partialCommitted || len(f.envelopes) != 1 || w.cancels != 1 || w.ends != 0 {
+			t.Fatal("cooperative cancellation lost partial-file custody or terminal mapping", f.order)
+		}
+		var envelope map[string]map[string]any
+		_ = json.Unmarshal(f.envelopes[0], &envelope)
+		if envelope["error"]["code"] != "cancelled" {
+			t.Fatal("cooperative cancellation did not commit cancelled", envelope)
+		}
+		f.check(t)
 	})
 }

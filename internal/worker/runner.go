@@ -1160,6 +1160,14 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	}
 	stopCoopCancelWatch()
 	cancelled := stopCancellationWatch()
+	// Cooperative legacy handlers finish their current unit and return partial
+	// success-shaped bytes. Use the runner-owned cancellation observation, never
+	// payload/output text, to preserve the v1 cancelled terminal mapping.
+	if job.delivery != nil {
+		if requested := jobs.CancelRequestedFrom(handlerCtx); requested != nil && requested() {
+			cancelled = true
+		}
+	}
 	if job.delivery != nil && !job.delivery().valid() {
 		return false
 	}
