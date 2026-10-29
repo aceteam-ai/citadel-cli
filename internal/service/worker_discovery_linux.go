@@ -54,27 +54,81 @@ func (b *discoveryOutput) result(runErr error) ([]byte, error) {
 
 func captureSystemctl(ctx context.Context, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "systemctl", args...)
-	command.Env = discoveryManagerEnvironment(len(args) > 0 && args[0] == "--user", os.Geteuid())
+	uid := os.Geteuid()
+	if pinned, ok := ctx.Value(workerManagerUIDKey{}).(int); ok {
+		uid = pinned
+	}
+	command.Env = discoveryManagerEnvironment(len(args) > 0 && args[0] == "--user", uid)
 	command.WaitDelay = 500 * time.Millisecond
 	var output discoveryOutput
 	command.Stdout, command.Stderr = &output, io.Discard
-	return output.result(command.Run())
+	return output.result(runWorkerDiscoveryCommand(command))
 }
 
+// A fixture runner inspects the actual command without starting a process.
+var runWorkerDiscoveryCommand = func(command *exec.Cmd) error { return command.Run() }
+
 // DiscoverActiveWorkers examines the system manager and the caller's user
-// manager. It never changes a unit or falls back to a fixed service-name list.
+// manager, including the existing invoking-user manager under sudo. It never changes a unit or falls back to a fixed service-name list.
 // Backing files must agree with the loaded manager (NeedDaemonReload=no).
 func DiscoverActiveWorkers(executable string) ([]ManagedWorker, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return discoverActiveWorkers(ctx, executable, captureSystemctl, filepath.EvalSymlinks)
+	return discoverActiveWorkersForProcess(ctx, executable, captureSystemctl, filepath.EvalSymlinks, os.Geteuid(), os.Getenv("SUDO_UID"), func(uid int) (bool, error) {
+		info, err := os.Stat("/run/user/" + strconv.Itoa(uid))
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil || !info.IsDir() {
+			return false, errors.New("sudo user manager presence could not be verified")
+		}
+		return true, nil
+	})
 }
 
 func discoverActiveWorkers(ctx context.Context, executable string, capture func(context.Context, ...string) ([]byte, error), canonical func(string) (string, error)) ([]ManagedWorker, error) {
 	return discoverActiveWorkersForUID(ctx, executable, capture, canonical, os.Geteuid())
 }
 
+type workerManagerUIDKey struct{}
+type workerManagerScope struct {
+	user     bool
+	uid      int
+	required bool
+}
+
+// The root user manager is optional: sudo does not start one. The invoking
+// user's existing manager remains required so its worker cannot be hidden.
+func discoverActiveWorkersForProcess(ctx context.Context, executable string, capture func(context.Context, ...string) ([]byte, error), canonical func(string) (string, error), euid int, sudoUID string, exists func(int) (bool, error)) ([]ManagedWorker, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	scopes := []workerManagerScope{{false, euid, true}, {true, euid, euid != 0}}
+	if euid == 0 && sudoUID != "" {
+		uid, err := strconv.Atoi(sudoUID)
+		if err != nil || uid < 0 || strconv.Itoa(uid) != sudoUID {
+			return nil, errors.New("sudo user manager identity could not be verified")
+		}
+		if uid != 0 {
+			present, err := exists(uid)
+			if err != nil {
+				return nil, errors.New("service discovery incomplete: sudo user manager presence could not be verified")
+			}
+			if present {
+				scopes = append(scopes, workerManagerScope{true, uid, true})
+			}
+		}
+	}
+	return discoverActiveWorkersInManagers(ctx, executable, capture, canonical, scopes)
+}
+
+// Retain the explicit two-manager fixture entrypoint; real process discovery
+// uses the root/sudo-aware planner above, with its presence probe injected.
 func discoverActiveWorkersForUID(ctx context.Context, executable string, capture func(context.Context, ...string) ([]byte, error), canonical func(string) (string, error), managerUID int) ([]ManagedWorker, error) {
+	return discoverActiveWorkersInManagers(ctx, executable, capture, canonical, []workerManagerScope{{false, managerUID, true}, {true, managerUID, true}})
+}
+
+func discoverActiveWorkersInManagers(ctx context.Context, executable string, capture func(context.Context, ...string) ([]byte, error), canonical func(string) (string, error), scopes []workerManagerScope) ([]ManagedWorker, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -85,10 +139,12 @@ func discoverActiveWorkersForUID(ctx context.Context, executable string, capture
 	var workers []ManagedWorker
 	managers := 0
 	var unavailable []string
-	for _, userMode := range []bool{false, true} {
+	for _, scope := range scopes {
+		userMode, managerUID := scope.user, scope.uid
+		managerCtx := context.WithValue(ctx, workerManagerUIDKey{}, managerUID)
 		prefix := systemctlArgs(userMode)
 		listArgs := append(append([]string{}, prefix...), "list-units", "--type=service", "--state=active", "--no-legend", "--no-pager", "--plain")
-		listed, err := capture(ctx, listArgs...)
+		listed, err := capture(managerCtx, listArgs...)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -100,7 +156,9 @@ func discoverActiveWorkersForUID(ctx context.Context, executable string, capture
 			if userMode {
 				manager = "user"
 			}
-			unavailable = append(unavailable, manager)
+			if scope.required {
+				unavailable = append(unavailable, manager)
+			}
 			continue
 		}
 		managers++
@@ -128,7 +186,7 @@ func discoverActiveWorkersForUID(ctx context.Context, executable string, capture
 				return nil, err
 			}
 			catArgs := append(append([]string{}, prefix...), "cat", "--no-pager", "--", name)
-			content, err := capture(ctx, catArgs...)
+			content, err := capture(managerCtx, catArgs...)
 			if err != nil {
 				return nil, errors.New("could not inspect an active service unit")
 			}
@@ -139,7 +197,7 @@ func discoverActiveWorkersForUID(ctx context.Context, executable string, capture
 			// A stale nonmatching file could hide another loaded worker, so this
 			// check must precede exclusion as well as selection of a candidate.
 			showArgs := append(append([]string{}, prefix...), "show", "--no-pager", "--property=NeedDaemonReload", "--value", "--", name)
-			reload, err := capture(ctx, showArgs...)
+			reload, err := capture(managerCtx, showArgs...)
 			if err != nil || len(reload) > 16 || strings.TrimSpace(string(reload)) != "no" {
 				return nil, errors.New("active service unit is not verified against the loaded manager")
 			}
@@ -464,10 +522,19 @@ func unitLogicalLines(content string) ([]string, bool) {
 	continuing := false
 	for _, raw := range strings.Split(content, "\n") {
 		line := strings.TrimSpace(raw)
-		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		// Blank lines and systemctl cat file headers end a logical line; an
+		// ordinary intervening comment may still be skipped within a continuation.
+		if line == "" || strings.HasPrefix(line, "# /") {
+			if continuing {
+				lines = append(lines, pending)
+				pending, continuing = "", false
+			}
+			if line == "" {
+				lines = append(lines, "")
+			}
 			continue
 		}
-		if line == "" && continuing {
+		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 		slashes := len(line) - len(strings.TrimRight(line, "\\"))

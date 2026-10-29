@@ -70,8 +70,10 @@ var (
 )
 
 var updateInstallCmd = &cobra.Command{
-	Use:   "install",
-	Short: "Download and install the latest version",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	Use:           "install",
+	Short:         "Download and install the latest version",
 	Long: `Downloads the latest version from GitHub, verifies the checksum,
 backs up the current version, and installs the new binary.
 

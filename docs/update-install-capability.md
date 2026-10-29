@@ -53,6 +53,10 @@ preferences.
 On Linux, manual update restart detection uses `DiscoverActiveWorkers` instead of
 a fixed unit-name list. It inspects the system manager and the caller's user
 manager, accepting a literal `work` invocation of the same resolved executable.
+Under sudo, a missing root user manager is optional. A canonical nonzero
+`SUDO_UID` adds the invoking user's manager when its runtime directory exists;
+unverifiable presence or an existing manager that cannot be inspected refuses
+discovery. An absent invoking-user manager does not hide a system worker.
 Every inspected active unit's backing files must agree with loaded state
 (`NeedDaemonReload=no`) before its contents can exclude a worker. Literal worker
 candidates with an unresolved account, dynamic identity or unverified root/mount
@@ -61,17 +65,20 @@ root/path mapping assignments reset the corresponding setting. Empty boolean or
 enum assignments remain unverified; they are not resets. Read-only hardening remains
 supported; discovery does not interpret service filesystem namespaces. Shell wrappers,
 unknown expansion syntax, incomplete inspection and ambiguous matches are left
-for manual inspection. It does not enter another user's service manager. Discovery
+for manual inspection. A non-root caller never borrows `SUDO_UID`; root may
+inspect only the explicitly identified invoking manager in addition to its own. Discovery
 has bounded output, candidate count and elapsed time, and never exports unit
-environment values. The user bus is pinned to the inspecting process's effective
-UID; a user unit without `User=` carries that manager UID into diagnostics.
+environment values. The user bus is pinned to the inspected manager's UID,
+including across a root restart of the invoking user's unit. A user unit without
+`User=` carries that manager UID into diagnostics.
 Systemd command prefixes and continuation lines are parsed, including the
-alternate argv0 supplied by the at-sign prefix. Single-command daemons and
+alternate argv0 supplied by the at-sign prefix. Blank lines and systemctl file
+headers end a continuation; ordinary comments may be skipped. Single-command daemons and
 unrelated opaque wrappers do not obscure a worker. Unsupported syntax still
 refuses discovery when the unit mentions the executable path or basename; an
 unresolved worker account or namespace is not silently excluded. An unavailable
-system or current-user manager reports incomplete inspection, even if the other
-manager yielded a worker. Existing unit rematerialization keeps its narrower
+system, non-root current-user, or existing invoking-user manager reports
+incomplete inspection, even if another manager yielded a worker. Existing unit rematerialization keeps its narrower
 file list.
 
 An explicit `update install --restart` fails nonzero when no single verified active

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -74,11 +75,16 @@ func managedUnitRestartCommand(ctx context.Context, u ManagedUnit, uid int) (*ex
 	if !u.UserMode && uid != 0 {
 		return nil, fmt.Errorf("restarting %s requires root; run: %s", u.Name, u.RestartCommand())
 	}
-	if u.UserMode && u.ManagerUID != "" && u.ManagerUID != fmt.Sprint(uid) {
-		return nil, fmt.Errorf("inspected user manager account changed; no service was restarted")
+	managerUID := uid
+	if u.UserMode && u.ManagerUID != "" {
+		pinned, err := strconv.Atoi(u.ManagerUID)
+		if err != nil || pinned < 0 || strconv.Itoa(pinned) != u.ManagerUID || (uid != 0 && pinned != uid) {
+			return nil, fmt.Errorf("inspected user manager account changed; no service was restarted")
+		}
+		managerUID = pinned
 	}
 	command := exec.CommandContext(ctx, "systemctl", append(systemctlArgs(u.UserMode), "restart", u.Name)...)
-	command.Env = discoveryManagerEnvironment(u.UserMode, uid)
+	command.Env = discoveryManagerEnvironment(u.UserMode, managerUID)
 	return command, nil
 }
 
