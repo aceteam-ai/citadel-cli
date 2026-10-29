@@ -33,6 +33,10 @@ const maxCDPDiscoveryPages = 64
 // first tab (a documented, inherited limitation).
 var cdpTargetURL = defaultCDPTargetURL
 
+// A 32 MiB PNG occupies 44,739,244 base64 bytes; this fixed message budget
+// leaves room for its CDP envelope. It is not an aggregate memory bound.
+const maxCDPMessageBytes int64 = 64 << 20
+
 func defaultCDPTargetURL(debugPort int) (string, error) {
 	return discoverCDPTargetURL(debugPort, cdpHTTPClient)
 }
@@ -186,16 +190,39 @@ func (c *Client) Close() { c.client.Close() }
 // dialCDP resolves the page target for debugPort and opens a persistent CDP
 // WebSocket. onFrame receives every screencast frame once startScreencast runs.
 func dialCDP(debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
+	return dialCDPWithReadLimit(debugPort, onFrame, maxCDPMessageBytes)
+}
+
+// The private smaller-limit seam lets source fixtures exercise the same dial
+// and first-read path without allocating full-size messages. Production uses
+// the fixed ceiling above; no caller may disable or increase it here.
+func dialCDPWithReadLimit(debugPort int, onFrame func(screencastFrame), readLimit int64) (*cdpClient, error) {
+	if readLimit <= 0 || readLimit > maxCDPMessageBytes {
+		return nil, fmt.Errorf("CDP read limit is invalid")
+	}
 	wsURL, err := cdpTargetURL(debugPort)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	// Gorilla's read limit counts compressed payload bytes, not expanded data.
+	// Pin compression off without changing the shared DefaultDialer or its other
+	// behavior, so fragmented uncompressed messages share one finite budget.
+	dialer := *websocket.DefaultDialer
+	dialer.EnableCompression = false
+	conn, response, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("CDP dial: %w", err)
 	}
+	// The pinned Gorilla dialer accepts an unsolicited compression response
+	// even when it made no offer. Refuse every extension response (including
+	// empty or duplicate fields) before a reader can expand its first message.
+	if response == nil || len(response.Header.Values("Sec-WebSocket-Extensions")) != 0 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("CDP extensions are not allowed")
+	}
+	conn.SetReadLimit(readLimit)
 	c := &cdpClient{conn: conn, onFrame: onFrame, done: make(chan struct{}), pending: make(map[int]chan cdpResponse)}
 	go c.readLoop()
 	return c, nil

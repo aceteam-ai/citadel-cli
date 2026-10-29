@@ -823,12 +823,52 @@ func (p *chromiumRenderPage) CapturePNG(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	encoded, _ := res["data"].(string)
+	return decodePapercraftScreenshot(encoded, papercraftMaxPNG)
+}
+
+var errPapercraftScreenshotTooLarge = errors.New("screenshot exceeds byte limit")
+
+// Size refusal precedes base64 decoding. DecodeString may reserve at most two
+// rounding bytes beyond maxBytes; this is not an exact allocation guarantee.
+// The smaller private limit is for fixtures, never an increased runtime option.
+func decodePapercraftScreenshot(encoded string, maxBytes int) ([]byte, error) {
+	if maxBytes <= 0 || maxBytes > papercraftMaxPNG {
+		return nil, fmt.Errorf("screenshot byte limit is invalid")
+	}
 	if encoded == "" {
 		return nil, fmt.Errorf("Page.captureScreenshot returned no data")
+	}
+	if len(encoded) > base64.StdEncoding.EncodedLen(maxBytes) {
+		return nil, errPapercraftScreenshotTooLarge
+	}
+	// Preserve DecodeString's CR/LF acceptance within the encoded-byte ceiling.
+	// Padding reduces actual decoded length: using raw DecodedLen alone would
+	// reject valid exact-limit data ending in '=' or '=='.
+	chars := 0
+	var previous, last byte
+	for i := 0; i < len(encoded); i++ {
+		if encoded[i] == '\r' || encoded[i] == '\n' {
+			continue
+		}
+		chars++
+		previous, last = last, encoded[i]
+	}
+	decodedLength := base64.StdEncoding.DecodedLen(chars)
+	if chars != 0 && chars%4 == 0 && last == '=' {
+		decodedLength--
+		if previous == '=' {
+			decodedLength--
+		}
+	}
+	if decodedLength > maxBytes {
+		return nil, errPapercraftScreenshotTooLarge
 	}
 	b, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("decode screenshot: %w", err)
+	}
+	if len(b) > maxBytes {
+		return nil, errPapercraftScreenshotTooLarge
 	}
 	return b, nil
 }
