@@ -135,6 +135,46 @@ assert_equals "$dmg_dir/Citadel_arm64.dmg" "$(single_dmg "$dmg_dir")" 'single DM
 printf 'dmg\n' > "$dmg_dir/Citadel_other.dmg"
 assert_fails 'ambiguous DMG output is rejected' single_dmg "$dmg_dir"
 
+rm "$dmg_dir/Citadel_arm64.dmg" "$dmg_dir/Citadel_other.dmg"
+mkdir "$dmg_dir/directory.dmg"
+printf 'keep\n' > "$dmg_dir/directory.dmg/contents"
+assert_fails 'nonempty directory with a DMG suffix is rejected' single_dmg "$dmg_dir"
+rm -rf "$dmg_dir/directory.dmg"
+
+outside_dmg="$fixture_root/outside.dmg"
+printf 'keep\n' > "$outside_dmg"
+ln -s "$outside_dmg" "$dmg_dir/linked.dmg"
+assert_fails 'DMG symlink to a valid nonempty regular file is rejected' single_dmg "$dmg_dir"
+assert_equals keep "$(sed -n '1p' "$outside_dmg")" 'DMG refusal preserves the symlink target'
+rm "$dmg_dir/linked.dmg"
+ln -s "$dmg_dir" "$fixture_root/linked-dmg-directory"
+printf 'dmg\n' > "$dmg_dir/valid.dmg"
+assert_fails 'symlinked DMG output directory is rejected' single_dmg "$fixture_root/linked-dmg-directory"
+
+real_executable="$fixture_root/real-executable"
+make_executable "$real_executable" arm64
+ln -s "$real_executable" "$fixture_root/linked-executable"
+assert_fails 'architecture inspection refuses a symlink to a regular executable' \
+  validate_macho_arch "$fixture_root/linked-executable" arm64 'Fixture executable'
+
+for link_kind in app contents macos plist desktop helper; do
+  linked_app="$fixture_root/linked-$link_kind/Citadel.app"
+  linked_target="$fixture_root/linked-$link_kind-target"
+  make_bundle "$linked_app" arm64 arm64
+  case "$link_kind" in
+    app) linked_path="$linked_app" ;;
+    contents) linked_path="$linked_app/Contents" ;;
+    macos) linked_path="$linked_app/Contents/MacOS" ;;
+    plist) linked_path="$linked_app/Contents/Info.plist" ;;
+    desktop) linked_path="$linked_app/Contents/MacOS/citadel-desktop" ;;
+    helper) linked_path="$linked_app/Contents/MacOS/citadel" ;;
+  esac
+  mv "$linked_path" "$linked_target"
+  ln -s "$linked_target" "$linked_path"
+  assert_fails "app validation rejects a valid-target $link_kind symlink" \
+    validate_app_bundle "$linked_app" aarch64-apple-darwin
+done
+
 fake_repo="$fixture_root/repo"
 target=aarch64-apple-darwin
 target_root="$fake_repo/desktop/src-tauri/target/$target/release/bundle"
@@ -235,6 +275,127 @@ assert_equals keep "$(sed -n '1p' "$sidecar_escape/outside-helper")" \
 
 assert_fails 'reset rejects unsupported target independently' \
   reset_bundle_output "$fake_repo" universal-apple-darwin
+
+# All commands below are filesystem fakes. This does not execute Tauri, Go,
+# npm, macOS tools or Mach-O/DMG parsing. A valid-target link must fail because
+# it is a link, and a late parent replacement must fail before lipo can follow it.
+exercise_output_case() (
+  local scenario="$1"
+  local case_target="$2"
+  local case_repo="$3"
+  local case_outside="$4"
+  local case_record="$5"
+  local expected_arch
+  expected_arch="$(target_arch "$case_target")" || return
+
+  host_os() { printf '%s\n' Darwin; }
+  lipo() {
+    printf '%s\n' "$2" >> "$case_record.lipo" || return
+    sed -n 's/^arch=//p' "$2"
+  }
+  stage_sidecar() {
+    make_executable "$1/desktop/src-tauri/binaries/citadel-$2" "$expected_arch" || return
+    if [[ "$scenario" == stage-parent ]]; then
+      mv "$1/desktop/src-tauri/binaries" "$case_outside/binaries" || return
+      ln -s "$case_outside/binaries" "$1/desktop/src-tauri/binaries" || return
+    fi
+    printf 'staged\n' > "$case_record.stage"
+  }
+  run_tauri_build() {
+    local bundle="$1/desktop/src-tauri/target/$2/release/bundle"
+    local app="$bundle/macos/Citadel.app"
+    make_bundle "$app" "$expected_arch" "$expected_arch" || return
+    mkdir -p "$bundle/dmg" || return
+    case "$scenario" in
+      dmg-directory)
+        mkdir "$bundle/dmg/Citadel.dmg" || return
+        printf 'keep\n' > "$bundle/dmg/Citadel.dmg/contents" || return
+        ;;
+      dmg-link)
+        printf 'keep\n' > "$case_outside/Citadel.dmg" || return
+        ln -s "$case_outside/Citadel.dmg" "$bundle/dmg/Citadel.dmg" || return
+        ;;
+      *) printf 'dmg\n' > "$bundle/dmg/Citadel.dmg" || return ;;
+    esac
+    case "$scenario" in
+      bundle-parent)
+        mv "$bundle" "$case_outside/bundle" || return
+        ln -s "$case_outside/bundle" "$bundle" || return
+        ;;
+      app-link)
+        mv "$app" "$case_outside/Citadel.app" || return
+        ln -s "$case_outside/Citadel.app" "$app" || return
+        ;;
+      contents-link)
+        mv "$app/Contents" "$case_outside/Contents" || return
+        ln -s "$case_outside/Contents" "$app/Contents" || return
+        ;;
+      macos-link)
+        mv "$app/Contents/MacOS" "$case_outside/MacOS" || return
+        ln -s "$case_outside/MacOS" "$app/Contents/MacOS" || return
+        ;;
+      plist-link)
+        mv "$app/Contents/Info.plist" "$case_outside/Info.plist" || return
+        ln -s "$case_outside/Info.plist" "$app/Contents/Info.plist" || return
+        ;;
+      desktop-link|helper-link)
+        local executable=citadel
+        if [[ "$scenario" == desktop-link ]]; then executable=citadel-desktop; fi
+        mv "$app/Contents/MacOS/$executable" "$case_outside/$executable" || return
+        ln -s "$case_outside/$executable" "$app/Contents/MacOS/$executable" || return
+        ;;
+    esac
+    printf 'built\n' > "$case_record.tauri"
+  }
+  build_macos_dmg "$case_repo" "$case_target"
+)
+
+capture_output_case() {
+  local output_file="$1"
+  shift
+  exercise_output_case "$@" > "$output_file"
+}
+
+for case_target in aarch64-apple-darwin x86_64-apple-darwin; do
+  for scenario in valid stage-parent bundle-parent app-link contents-link macos-link plist-link desktop-link helper-link dmg-directory dmg-link; do
+    case_root="$fixture_root/output fixtures/$case_target/$scenario"
+    case_repo="$case_root/repo"
+    case_outside="$case_root/outside"
+    case_record="$case_root/record"
+    mkdir -p "$case_repo/desktop/scripts" "$case_repo/desktop/src-tauri/binaries" "$case_outside"
+    printf '#!/usr/bin/env bash\n' > "$case_repo/desktop/scripts/stage-sidecar.sh"
+    if [[ "$scenario" == valid ]]; then
+      output="$(exercise_output_case "$scenario" "$case_target" "$case_repo" "$case_outside" "$case_record")"
+      assert_equals \
+        "Unsigned Tauri DMG: $case_repo/desktop/src-tauri/target/$case_target/release/bundle/dmg/Citadel.dmg
+Required distribution gates: Developer ID signing and Apple notarization" \
+        "$output" "valid $case_target output still reports the exact unsigned artifact"
+      assert_equals 3 "$(wc -l < "$case_record.lipo" | tr -d ' ')" \
+        'valid build inspects the staged helper and both app executables'
+    else
+      assert_fails "$case_target refuses $scenario output" \
+        capture_output_case "$case_record.stdout" \
+        "$scenario" "$case_target" "$case_repo" "$case_outside" "$case_record"
+      assert_fails 'refused fake build never announces an unsigned artifact' \
+        grep -q 'Unsigned Tauri DMG:' "$case_record.stdout"
+    fi
+    assert_equals staged "$(sed -n '1p' "$case_record.stage")" 'the fake stage completed'
+    if [[ "$scenario" == stage-parent ]]; then
+      assert_absent "$case_record.lipo" 'changed staging parent is rejected before architecture inspection'
+      assert_absent "$case_record.tauri" 'changed staging parent is rejected before Tauri'
+    else
+      assert_equals built "$(sed -n '1p' "$case_record.tauri")" 'the fake Tauri build completed'
+      if [[ "$scenario" != valid && "$scenario" != dmg-directory && "$scenario" != dmg-link ]]; then
+        assert_equals 1 "$(wc -l < "$case_record.lipo" | tr -d ' ')" \
+          'changed app or parent is rejected before any app architecture inspection'
+      fi
+      if [[ "$scenario" == dmg-link ]]; then
+        assert_equals keep "$(sed -n '1p' "$case_outside/Citadel.dmg")" \
+          'rejected output symlink preserves its external fixture target'
+      fi
+    fi
+  done
+done
 
 repo_root="$(cd -P "$script_dir/../.." && pwd -P)"
 dispatcher_source="$repo_root/build-dmg.sh"

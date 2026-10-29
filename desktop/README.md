@@ -34,6 +34,15 @@ From the repository root, `./build-dmg.sh` is a compatibility dispatcher to that
 
 The two artifacts remain separate. Universal binaries and mixed-architecture bundles are rejected. Both entrypoints intentionally pass `--no-sign`; their output is not distributable until the Developer ID signing, Apple notarization, stapling, native installer acceptance, and publishing gates are implemented and accepted. There is no legacy Terminal-launcher packaging path.
 
+The builder rechecks derived paths after helper staging and again after Tauri,
+before inspecting or reporting the generated artifacts. The required app
+directories, plist and executables must not be symlinks; executables must be
+regular executable files, and the sole DMG must be a nonempty regular file.
+This is path-based output validation, not atomic custody against concurrent
+writers or hardlinks, a parser for DMG/plist contents, or native/signing proof.
+The hermetic entrypoint fixtures substitute filesystem data and architecture
+probes; they do not build or launch the native app or verify a real disk image.
+
 ## Native acceptance gate
 
 Pull requests run the frontend build on a hosted runner. Before this workflow lands on the default branch, GitHub cannot dispatch its manual native job. A maintainer must review the exact pull request head and run `desktop/scripts/native-head-gate.sh <PR number> <full head SHA>` on a trusted Mac with no signing identities or production credentials. The script checks the current same-repository PR head, builds an isolated checkout at that exact SHA, and leaves the unsigned bundle for inspection. After the workflow lands on the default branch, maintainers may dispatch `Citadel desktop macOS` with the PR number and full head SHA. Configure its `desktop-macos-native` environment with required reviewers.
