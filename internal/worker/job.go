@@ -390,8 +390,9 @@ var allKnownJobTypes = []string{
 //     `desktop` permission, also default-DENY.
 //   - config dir: SERVICE_START/SERVICE_STOP/SERVICE_STATUS register only when
 //     ConfigDir != "" (a resolved citadel.yaml manifest directory).
-//   - meeting: MEETING_JOIN registers only when WorkspaceDir != "" and the
-//     node's meeting capability is enabled (config.LoadMeeting(...).MeetingEnabled,
+//   - meeting: MEETING_JOIN is dispatchable only when WorkspaceDir != "" and the
+//     node's live meeting capability is enabled (MeetingEnabled, falling back to
+//     config.LoadMeeting(...).MeetingEnabled,
 //     default-on). HUDDLE_JOIN does not need a workspace, but it is gated by the
 //     same meeting-capability toggle.
 //

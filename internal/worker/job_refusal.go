@@ -35,9 +35,9 @@ func legacyPermissionRefusal(jobType string) *jobs.ShellRefusal {
 	case JobTypeShellCommand:
 		return jobs.WorkflowShellRefusal(jobs.ReasonShellDisabled)
 	case JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions:
-		return &jobs.ShellRefusal{Reason: "desktop_disabled", Message: "desktop permission is disabled on this node; enable Desktop in the AceTeam control center"}
-	case JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2, JobTypeFileWrite, JobTypeFileEdit, JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch, JobTypeFileFetch:
-		return &jobs.ShellRefusal{Reason: "files_disabled", Message: "files permission is disabled on this node; enable Files in the AceTeam control center"}
+		return &jobs.ShellRefusal{Reason: "desktop_disabled", Message: "desktop permission is disabled on this node; enable Desktop in the AceTeam control center or use citadel_set_desktop_permission with enabled=true and confirm=true, then retry"}
+	case JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2, JobTypeFileWrite, JobTypeFileWriteBytes, JobTypeFileEdit, JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch, JobTypeFileFetch:
+		return &jobs.ShellRefusal{Reason: "files_disabled", Message: "files permission is disabled on this node; enable Files in the AceTeam control center or use citadel_set_files_permission with enabled=true and confirm=true, then retry"}
 	case JobTypeHuddleJoin, JobTypeMeetingJoin:
 		return &jobs.ShellRefusal{Reason: "meeting_disabled", Message: "meeting capability is disabled on this node; enable it before dispatching new joins"}
 	default:
