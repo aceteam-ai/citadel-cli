@@ -524,7 +524,7 @@ func (r *Runner) executeWithDeadline(
 	// (citadel-cli#1287 — was the heavyLaneJobTypes allowlist). Read from the
 	// handler in hand, not r.handlers, so a caller that passes the handler
 	// directly (tests) resolves the same as production.
-	heavy := capabilitiesOf(handler, job.Type).Lane == jobs.LaneHeavy
+	heavy := capabilitiesOf(handler, job.Type).Lane == jobs.LaneHeavy || job.delivery != nil
 
 	type handlerResult struct {
 		result *JobResult
@@ -541,6 +541,12 @@ func (r *Runner) executeWithDeadline(
 
 	select {
 	case hr := <-done:
+		if durableSuccessDuringShutdown(job, ctx, execCtx, hr.result, hr.err) {
+			return hr.result, nil
+		}
+		if job.delivery != nil && durableShutdown(ctx, execCtx) {
+			return nil, ctx.Err()
+		}
 		return completedHandlerResult(heavy, execCtx.Err(), timeout, hr.result, hr.err)
 	case <-execCtx.Done():
 		if heavy {
@@ -548,7 +554,13 @@ func (r *Runner) executeWithDeadline(
 			// goroutine really exits. An uncooperative handler intentionally holds
 			// this call (and runner shutdown) fail-closed rather than overlapping
 			// a second writer after an arbitrary escape timer.
-			<-done
+			hr := <-done
+			if durableSuccessDuringShutdown(job, ctx, execCtx, hr.result, hr.err) {
+				return hr.result, nil
+			}
+		}
+		if job.delivery != nil && durableShutdown(ctx, execCtx) {
+			return nil, ctx.Err()
 		}
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			r.log("error", "Job %s abandoned: exceeded execution deadline of %s", job.ID, timeout)
@@ -576,4 +588,28 @@ func (r *Runner) executeWithDeadline(
 		// the loop unwinds without misreporting a deadline breach.
 		return nil, execCtx.Err()
 	}
+}
+
+// A root stop racing an already successful return must not erase its terminal.
+// Lease loss is checked separately by executeJob; an earlier job watchdog
+// deadline still wins and retains the same actual-exit custody.
+func durableSuccessDuringShutdown(job *Job, parent, execution context.Context, result *JobResult, err error) bool {
+	if job.delivery == nil || parent.Err() == nil || err != nil || result == nil || result.Status != JobStatusSuccess {
+		return false
+	}
+	return durableShutdown(parent, execution)
+}
+
+// An execution deadline inherited from the worker lifetime is shutdown. A
+// shorter, independently elapsed job watchdog remains a fatal job deadline.
+func durableShutdown(parent, execution context.Context) bool {
+	if parent.Err() == nil {
+		return false
+	}
+	if !errors.Is(execution.Err(), context.DeadlineExceeded) {
+		return true
+	}
+	parentDeadline, ok := parent.Deadline()
+	executionDeadline, _ := execution.Deadline()
+	return ok && parentDeadline.Equal(executionDeadline)
 }
