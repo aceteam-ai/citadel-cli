@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Point-cloud capture source fixture</title>
+<style>
+html, body { margin: 0; padding: 0; width: 320px; height: 180px; overflow: hidden; }
+canvas { display: block; width: 320px; height: 180px; }
+</style>
+<canvas id="capture" width="320" height="180"></canvas>
+<script>
+"use strict";
+(() => {
+  // Test-only scene/stamp. This is not the shared production scene or a loader.
+  const W = 320, H = 180, MODE = "angle-swiftshader-webgl2";
+  const canvas = document.getElementById("capture");
+  let gl = null, program = null, run = null, next = 0, renderer = "";
+  const refuse = () => { throw new Error("synthetic capture unavailable"); };
+
+  function shader(type, source) {
+    const object = gl.createShader(type);
+    if (!object) refuse();
+    gl.shaderSource(object, source);
+    gl.compileShader(object);
+    if (!gl.getShaderParameter(object, gl.COMPILE_STATUS)) refuse();
+    return object;
+  }
+
+  function initialize() {
+    if (window.devicePixelRatio !== 1 || window.innerWidth !== W || window.innerHeight !== H) refuse();
+    gl = canvas.getContext("webgl2", {
+      preserveDrawingBuffer: true, antialias: false, alpha: false,
+      depth: false, stencil: false, premultipliedAlpha: false
+    });
+    if (!gl || gl.isContextLost()) refuse();
+    const attributes = gl.getContextAttributes();
+    if (!attributes || !attributes.preserveDrawingBuffer || attributes.antialias) refuse();
+    const debug = gl.getExtension("WEBGL_debug_renderer_info");
+    if (!debug) refuse();
+    renderer = gl.getParameter(debug.UNMASKED_RENDERER_WEBGL);
+    if (typeof renderer !== "string" || renderer.length > 256 || !renderer.includes("ANGLE") || !renderer.includes("SwiftShader")) refuse();
+    const vertex = shader(gl.VERTEX_SHADER, `#version 300 es
+      layout(location = 0) in vec3 position;
+      uniform float phase;
+      void main() {
+        gl_Position = vec4(position.x + phase * 0.1, position.yz, 1.0);
+        gl_PointSize = 5.0;
+      }`);
+    const fragment = shader(gl.FRAGMENT_SHADER, `#version 300 es
+      precision highp float;
+      out vec4 color;
+      void main() { color = vec4(0.0, 1.0, 1.0, 1.0); }`);
+    program = gl.createProgram();
+    if (!program) refuse();
+    gl.attachShader(program, vertex);
+    gl.attachShader(program, fragment);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) refuse();
+    const vertices = gl.createBuffer();
+    if (!vertices) refuse();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -0.5, -0.4, 0.0, 0.0, 0.3, -0.2, 0.4, -0.1, 0.2
+    ]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.DITHER);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.STENCIL_TEST);
+    gl.viewport(0, 0, W, H);
+  }
+
+  function ack(frame) {
+    return {
+      kind: "pointcloudcapture.synthetic.v1", run, frame, ready: true,
+      width: W, height: H, scale: 1, mode: MODE, renderer
+    };
+  }
+
+  function draw(frame) {
+    if (gl.isContextLost()) refuse();
+    gl.disable(gl.SCISSOR_TEST);
+    gl.clearColor(0.0, 0.0, 0.0, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(program);
+    gl.uniform1f(gl.getUniformLocation(program, "phase"), frame / 60);
+    gl.drawArrays(gl.POINTS, 0, 3);
+    // Top strip in PNG coordinates: GL scissor uses a bottom-left origin.
+    // 18 eight-pixel cells: 11, six LSB-first bits, their inverses, 0100.
+    const cells = [1, 1];
+    for (let bit = 0; bit < 6; bit++) cells.push((frame >>> bit) & 1);
+    for (let bit = 0; bit < 6; bit++) cells.push(1 - ((frame >>> bit) & 1));
+    cells.push(0, 1, 0, 0);
+    gl.enable(gl.SCISSOR_TEST);
+    for (let cell = 0; cell < 18; cell++) {
+      const value = cells[cell];
+      gl.scissor(cell * 8, H - 8, 8, 8);
+      gl.clearColor(value, value, value, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    gl.disable(gl.SCISSOR_TEST);
+    gl.finish();
+    if (gl.isContextLost() || gl.getError() !== gl.NO_ERROR) refuse();
+  }
+
+  Object.defineProperty(window, "CitadelPointcloudCaptureTest", {
+    value: Object.freeze({
+      init(identity) {
+        if (run !== null || typeof identity !== "string" || !/^[0-9a-f]{32}$/.test(identity)) refuse();
+        initialize();
+        run = identity;
+        return Promise.resolve(ack(-1));
+      },
+      step(identity, frame) {
+        if (identity !== run || run === null || !Number.isInteger(frame) || frame !== next || frame < 0 || frame >= 60) refuse();
+        draw(frame);
+        next++;
+        // No later task/animation mutates pixels before the host screenshot.
+        return Promise.resolve(ack(frame));
+      }
+    }),
+    writable: false, configurable: false
+  });
+})();
+</script>
+</html>
