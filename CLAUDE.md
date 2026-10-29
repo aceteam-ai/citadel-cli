@@ -39,6 +39,23 @@ custody and signed-event boundaries for #1381 are tracked in
 does not prove those boundaries. `publish_linux_test.go` pins late collisions
 and competing publishers with synthetic fake executors.
 
+`service.RematerializeManagedUnits` owns the bounded base-file refresh and
+reload request, not worker restart or failed-unit counter recovery.
+`cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
+on force-new enrollment; a saved node ID does not confer predecessor deletion
+authority. See `docs/enrollment-service-recovery.md` for #1356's repair reach,
+start-limit behavior, source references and remaining migration/acceptance gates.
+
+`worker.registrationRefusals` owns non-executable evidence for withheld job
+types; it follows the same live permission callbacks and static registration
+inputs as `CreateLegacyHandlersWithOpts`. `Runner.unavailableJobRefusal` prefers
+that evidence, then the fallback gate catalog, then a known-but-unregistered
+refusal. Only types absent from `allKnownJobTypes` receive an update-node hint.
+`LegacyHandlerAdapter.Execute` rechecks the live gate and returns the shared
+typed refusal so a revocation after selection is terminal on its first attempt.
+The refusal inventory never advertises or executes a job. Focused coverage is
+in `internal/worker/job_refusal_test.go`.
+
 `workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
 loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
 validation separately from the HTTP node. Both worker entrypoints load once via
@@ -1571,7 +1588,12 @@ capture lifecycle; v2 also validates its embedded theme registry. The render and
 audio paths invoke fixed argv directly, never a shell. `papercraft-render` shares
 Chromium discovery with
 `platform.FindChromium` and the persistent request/response CDP transport in
-`internal/cobrowsestream`. `startPapercraftAssetServer` is the browser's
+`internal/cobrowsestream`. Its HTTP target discovery accepts only a complete
+512 KiB/64-page reply, pins the debugger WebSocket to the probed loopback port,
+refuses redirects and unsuccessful statuses, and closes
+the response before returning. See `docs/cdp-target-discovery-bounds.md`; these
+limits do not prove aggregate capture memory or native browser acceptance.
+`startPapercraftAssetServer` is the browser's
 non-forwarding HTTP proxy: its random route serves declared inputs only, while
 every other HTTP/HTTPS/WebSocket request fails there and CDP blocks `file://`,
 `data:`, `blob:`, WebSocket, and FTP before navigation. Keep Chromium's
@@ -4087,11 +4109,26 @@ can't drift), `autoUpdateReportFrom` (the hand projection, pinned by
 ReconcilePendingOnStartup,ReadStateForReport}` (the atomic, preference-preserving
 state writes under `update.stateMu`). The periodic updater refreshes the cache
 via `AutoUpdaterConfig.Refresh` (threaded through `autoUpdateRuntime.refresh`);
-`buildAutoUpdateSnapshot` reuses agentNodeInfo's #923 `CurrentVersion!=running`
-rule for pending_version/restart_required. pending clears only when the running
-binary matches the staged version (`ReconcilePendingOnStartup`). Corrupt state
-degrades to `configured_enabled=null`/`last_result=unknown`, never a confident
-disabled.
+`buildAutoUpdateSnapshot` and `agentNodeInfo` use `update.StagedVersionIsNewer`
+for pending_version/restart_required. `ReconcilePendingOnStartup` clears stale
+restart results only when valid staged metadata is equal to or older than the
+running release. Invalid metadata is not proof of recovery. Corrupt state
+degrades to `configured_enabled=null`/`last_result=state_corrupt` and never supplies
+pending versions or timestamps. `resolveAutoUpdatePolicy` keeps opt-out/dev veto,
+then flag, then environment ahead of the file preference; corruption replaces
+only that last preference with unknown. Explicit enables still run, while
+telemetry writes preserve the broken bytes. `SetAutoUpdate` alone repairs malformed
+JSON and first attempts a private UTC-stamped `state.json.corrupt-*` backup.
+
+`update.InspectSelfUpdateCapability` owns current-process install authority and a
+same-directory probe, without provisioning locks or changing the binary. Worker
+startup/refresh observes it for the cached report, independently of preference.
+Periodic and remote/manual update paths consult it before download. Deliberately
+privileged installs remain supported: auto-update off reports capability rather
+than a failed update. `RecordApplyNotPermitted` owns refusal persistence, and the
+updater's refusal notice is emitted only when the observed condition changes.
+See `docs/update-install-capability.md` for the wire contract and remaining
+service/installer and native acceptance scope.
 
 **Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
 The update state file resolves from HOME (`getUserHomeDir`), and the shipped

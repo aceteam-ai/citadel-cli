@@ -246,6 +246,15 @@ func TestAgentNodeInfoNoPendingUpdate(t *testing.T) {
 		{"versions equal with staged tag prefix", "1.0.0", func() (*update.State, error) {
 			return &update.State{CurrentVersion: "v1.0.0"}, nil
 		}},
+		{"older recorded install", "v2.202.0", func() (*update.State, error) {
+			return &update.State{CurrentVersion: "v2.97.0"}, nil
+		}},
+		{"equal precedence with build metadata", "v2.202.0+running", func() (*update.State, error) {
+			return &update.State{CurrentVersion: "v2.202.0+other"}, nil
+		}},
+		{"invalid recorded version", "v2.202.0", func() (*update.State, error) {
+			return &update.State{CurrentVersion: "broken"}, nil
+		}},
 		{"no state recorded", "v1.0.0", func() (*update.State, error) {
 			return &update.State{}, nil
 		}},

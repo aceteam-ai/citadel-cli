@@ -897,7 +897,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// version (clears it only when they now match), then seed the cache. Both
 	// are best-effort: telemetry must never interrupt or delay the worker.
 	_ = update.ReconcilePendingOnStartup(time.Now(), Version)
-	nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "unavailable"))
+	nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "unavailable", update.InspectSelfUpdateCapability()))
 	// nodeReconcileHealth is the desired-state PULL reconcile loop's
 	// full-wipe-guard HealthTracker (citadel-cli#742), same atomic-pointer
 	// reasoning as nodeSwapManager above: the status-publisher goroutines that
@@ -941,7 +941,6 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
-		printDeviceLinkDiagnostic(os.Stderr, deviceConfig)
 		Debug("using API mode (device_api_token found)")
 		useAPIMode = true
 
@@ -1196,6 +1195,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		Log("network connected")
 	} else {
 		Log("network not configured (no saved state)")
+	}
+	// Display only, once after live mesh identity resolution; never on the
+	// heartbeat/retry path and never a condition for starting the worker.
+	if useAPIMode {
+		printDeviceLinkDiagnosticContext(ctx, os.Stderr, deviceConfig)
 	}
 	// Publish one immutable provider bundle after transport selection, before
 	// session control can read it. Heartbeat and optional status consumers below
@@ -2889,7 +2893,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// updater (worker lock held), so a non-owner keeps the seeded "unavailable".
 	if err := runWorkerWithAutoUpdater(ctx, workerLock, workAutoUpdatePolicyInputs(), runner, workAutoUpdateLog, autoUpdateRuntime{
 		refresh: func() {
-			nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "periodic"))
+			nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "periodic", update.InspectSelfUpdateCapability()))
 		},
 	}); err != nil {
 		if err != context.Canceled {

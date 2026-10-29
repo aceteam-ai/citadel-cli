@@ -52,6 +52,7 @@ type autoUpdateRunner interface {
 // autoUpdateRuntime is an injection seam for tests. Production uses the
 // AutoUpdater's existing checksum, apply, restart, and Homebrew defaults.
 type autoUpdateRuntime struct {
+	capability  func() update.SelfUpdateCapability
 	checker     update.ReleaseChecker
 	ticks       <-chan time.Time
 	apply       func(string) error
@@ -82,10 +83,11 @@ func startWorkerAutoUpdater(ctx context.Context, ownsWorker bool, inputs autoUpd
 	}
 	updater := update.NewAutoUpdater(update.AutoUpdaterConfig{
 		Checker:    checker,
+		Capability: runtime.capability,
 		Interval:   interval,
 		Ticks:      runtime.ticks,
 		AfterTick:  runtime.afterTick,
-		Enabled:    func() bool { return resolveAutoUpdateEnabled(inputs) },
+		Policy:     func() (bool, string) { return resolveAutoUpdatePolicy(inputs) },
 		ActiveJobs: runner.ActiveJobs,
 		BeginDrain: runner.BeginDrain,
 		Apply:      runtime.apply,

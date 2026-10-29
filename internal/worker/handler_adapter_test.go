@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 
 	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
@@ -401,7 +400,8 @@ func TestApplyDeviceConfigUpdatesLiveExecutionAndCapabilities(t *testing.T) {
 		t.Fatalf("revoked permissions remain advertised: %v", runner.SupportedJobTypes())
 	}
 	_, err := fileRead.Execute(context.Background(), &Job{ID: "read", Type: JobTypeFileRead}, &NoOpStreamWriter{})
-	if err == nil || !strings.Contains(err.Error(), "disabled by current node permissions") {
+	var refusal *jobs.ShellRefusal
+	if !errors.As(err, &refusal) || refusal.Reason != "files_disabled" {
 		t.Fatalf("revoked file execution did not fail closed: %v", err)
 	}
 }
