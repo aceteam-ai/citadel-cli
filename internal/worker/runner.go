@@ -305,6 +305,21 @@ func (r *Runner) BeginDrain() func() {
 	}
 }
 
+// TryIdleRestart fences pickup and waits for the current poll/claim to settle
+// before checking all admitted work. Another drain owner or active job vetoes
+// the exit. action must only exit the process (or be an inert test callback).
+func (r *Runner) TryIdleRestart(action func()) bool {
+	release := r.BeginDrain()
+	defer release()
+	r.drainMu.Lock()
+	defer r.drainMu.Unlock()
+	if r.permanentDrain || r.drainScopes != 1 || atomic.LoadInt64(&r.activeJobs) != 0 || r.dispatchingJobs != 0 || r.pendingJob != nil {
+		return false
+	}
+	action()
+	return true
+}
+
 // isDraining reports whether any drain remains active.
 func (r *Runner) isDraining() bool {
 	r.drainMu.Lock()
@@ -845,6 +860,9 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 		r.drainMu.Unlock()
 		return
 	}
+	// Claim dispatch is synchronous. Reserve ordering before spawning, so the
+	// scheduler cannot let a later goroutine enter the execution slot first.
+	ticket := l.reserveExecTicket()
 	if job.Type == JobTypeFineTuneStart {
 		for _, handler := range r.handlers {
 			if pending, ok := handler.(interface{ MarkPendingFineTune(string) }); ok {
@@ -870,7 +888,7 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 			r.exitJob(jobOK)
 			l.releaseAdmit()
 		}()
-		jobOK = r.runLaneJob(ctx, l, j, s, st)
+		jobOK = r.runLaneJob(ctx, l, j, s, st, ticket)
 	}(job, stream, startTime)
 }
 
@@ -884,36 +902,75 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 //     the existing model_warming backpressure signal (a SUCCESS the platform
 //     already retries), never a silent Nack (aceteam#8254 §3a). This is the
 //     queue-on-full that replaces the bare #825 Nack for inference under load.
-func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream StreamWriter, startTime time.Time) (jobOK bool) {
-	queueStart := time.Now()
-
-	if l.hasExecWait {
-		timer := time.NewTimer(r.inferenceQueueWait)
-		defer timer.Stop()
-		select {
-		case l.exec <- struct{}{}:
-			timer.Stop()
-		case <-timer.C:
-			// Queue-wait exceeded: return the model_warming signal through the
-			// SAME success-path terminal publish a normal completion uses, so
-			// there is exactly one terminal-publish implementation (never a
-			// silent Nack that reintroduces the #559 no-terminal-event bug).
-			return r.finishQueueWaitExceeded(ctx, job, stream, queueStart)
-		case <-ctx.Done():
-			// Cancelled/shutting down while queued: never executed. Nack for
-			// redelivery so shutdown can't deadlock on a queued job.
-			r.source.Nack(ctx, job, ctx.Err())
-			return false
+func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream StreamWriter, startTime time.Time, ticket *laneExecTicket) (jobOK bool) {
+	ownsExec := false
+	releaseWaitingAuthority := func() {
+		if ownsExec {
+			<-l.exec
+			ownsExec = false
 		}
-	} else {
-		select {
-		case l.exec <- struct{}{}:
-		case <-ctx.Done():
-			r.source.Nack(ctx, job, ctx.Err())
-			return false
-		}
+		l.releaseExecTicket(ticket)
 	}
-	defer func() { <-l.exec }()
+	defer releaseWaitingAuthority()
+	queueStart := time.Now()
+	var timer *time.Timer
+	var expiry <-chan time.Time
+	var deadline time.Time
+	if l.hasExecWait {
+		deadline = queueStart.Add(r.inferenceQueueWait)
+		timer = time.NewTimer(r.inferenceQueueWait)
+		expiry = timer.C
+		defer timer.Stop()
+	}
+	finishWait := func(expired bool) (bool, bool) {
+		// Cancellation wins when multiple readiness signals are already set.
+		if err := ctx.Err(); err != nil {
+			releaseWaitingAuthority()
+			r.source.Nack(ctx, job, err)
+			return true, false
+		}
+		if expired || (l.hasExecWait && !time.Now().Before(deadline)) {
+			releaseWaitingAuthority()
+			// Keep the existing model_warming terminal path, never a silent Nack.
+			return true, r.finishQueueWaitExceeded(ctx, job, stream, queueStart)
+		}
+		return false, false
+	}
+	if finished, ok := finishWait(false); finished {
+		return ok
+	}
+	expired := false
+	select {
+	case <-ticket.ready:
+	case <-expiry:
+		expired = true
+	case <-ctx.Done():
+		releaseWaitingAuthority()
+		r.source.Nack(ctx, job, ctx.Err())
+		return false
+	}
+	if finished, ok := finishWait(expired); finished {
+		return ok
+	}
+	select {
+	case l.exec <- struct{}{}:
+		ownsExec = true
+	case <-expiry:
+		expired = true
+	case <-ctx.Done():
+		releaseWaitingAuthority()
+		r.source.Nack(ctx, job, ctx.Err())
+		return false
+	}
+	// A ready slot can win select alongside cancel/expiry. Return it before
+	// beginExec in that case; an expired or canceled waiter never runs a handler.
+	if finished, ok := finishWait(expired); finished {
+		return ok
+	}
+	if timer != nil {
+		timer.Stop()
+	}
+	l.releaseExecTicket(ticket)
 	l.beginExec()
 	defer l.endExec()
 
@@ -1683,11 +1740,12 @@ func willRetry(job *Job) bool {
 // The error text distinguishes two causes that used to collapse into one
 // misleading "(update the node)" message (aceteam#9962): a type this build
 // genuinely does not know (allKnownJobTypes) really does need an update, but
-// a type in gatedJobTypeReasons is known to the build and simply not
+// a known type is refused with current registration-gate evidence and simply not
 // registered this run -- typically a default-DENY permission (files/desktop)
 // or a missing config directory. Telling an operator to "update the node" for
 // the second case sends them chasing a binary upgrade that fixes nothing; the
 // real fix is a permission toggle or provisioning step named in the message.
+// Refusal evidence is not a capability grant and never makes a handler runnable.
 func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime time.Time) {
 	agentVersion := r.agentVersion
 	if agentVersion == "" {
@@ -1695,19 +1753,21 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 	}
 
 	var err error
-	gateReason, gated := gatedJobTypeReasons[job.Type]
+	refusal := r.unavailableJobRefusal(job.Type)
+	gated := refusal != nil
 	if gated {
-		err = fmt.Errorf(
-			"job type %q is supported by this node's build but not currently registered: %s",
-			job.Type, gateReason,
-		)
+		err = refusal
 	} else {
 		err = fmt.Errorf(
 			"unsupported job type %q: node %s has no handler for it (update the node)",
 			job.Type, agentVersion,
 		)
 	}
-	r.log("error", "Unsupported job type: %v", err)
+	if gated {
+		r.log("warning", "Refused job type %s: %v", job.Type, err)
+	} else {
+		r.log("error", "Unsupported job type: %v", err)
+	}
 
 	data := map[string]any{
 		"unsupported_job_type": true,
@@ -1716,8 +1776,11 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 		"supported_types":      r.SupportedJobTypes(),
 	}
 	if gated {
+		data["unsupported_job_type"] = false
+		data["refused"] = true
+		data["reason"] = refusal.Reason
 		data["known_to_build"] = true
-		data["unregistered_reason"] = gateReason
+		data["unregistered_reason"] = refusal.Message
 	}
 
 	r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))

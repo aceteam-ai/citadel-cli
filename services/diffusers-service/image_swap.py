@@ -27,13 +27,18 @@ Concurrency contract:
 
 from __future__ import annotations
 
+import errno
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable
 
 from image_models import GIB, ImageModelSpec, LoadVariant, choose_variant, fitting_variants
+from load_diagnostics import Stage, safe_exception_label
+from model_preflight import InsufficientDiskSpaceError
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +69,90 @@ class ModelWarming(Exception):
         super().__init__(f"{model_id} is warming ({reason})")
 
 
+class FailureKind(Enum):
+    LOAD_FAILED = "load_failed"
+    ALL_FAILED = "all_candidates_failed"
+    DISK_SPACE = "disk_space"
+    REPO_GATED = "repository_access_denied"
+    REPO_MISSING = "repository_not_found"
+    GPU_UNAVAILABLE = "gpu_unavailable"
+    CUDA_MEMORY = "cuda_memory"
+    HOST_MEMORY = "host_memory"
+    DEPENDENCY = "dependency_unavailable"
+    CONFIGURATION = "invalid_model_configuration"
+    API = "incompatible_model_api"
+    RUNTIME = "model_runtime"
+    MODEL_IO = "model_files_unavailable"
+    DRAIN_TIMEOUT = "drain_timeout"
+
+
+_FAILURE_SUMMARIES = {
+    FailureKind.LOAD_FAILED: "pipeline load failed",
+    FailureKind.ALL_FAILED: "all eligible pipeline loads failed",
+    FailureKind.DISK_SPACE: "insufficient disk space for model download",
+    FailureKind.REPO_GATED: "model repository access denied",
+    FailureKind.REPO_MISSING: "model repository not found or inaccessible",
+    FailureKind.GPU_UNAVAILABLE: "a GPU is required for the selected model variant",
+    FailureKind.CUDA_MEMORY: "GPU memory allocation failed",
+    FailureKind.HOST_MEMORY: "host memory allocation failed",
+    FailureKind.DEPENDENCY: "model runtime dependency is unavailable",
+    FailureKind.CONFIGURATION: "model configuration was refused",
+    FailureKind.API: "model runtime API is incompatible",
+    FailureKind.RUNTIME: "model runtime failed",
+    FailureKind.MODEL_IO: "model files are unavailable",
+    FailureKind.DRAIN_TIMEOUT: "previous model is still busy",
+}
+_ACTIONABLE_FAILURES = frozenset(_FAILURE_SUMMARIES).difference({
+    FailureKind.LOAD_FAILED, FailureKind.ALL_FAILED, FailureKind.RUNTIME,
+})
+
+
+def failure_summary(kind) -> str:
+    return _FAILURE_SUMMARIES[kind if isinstance(kind, FailureKind) else FailureKind.LOAD_FAILED]
+
+
+def _loaded_exception(exc: Exception, module_name: str, class_name: str) -> bool:
+    # Inspect only fixed exports already loaded by the real operation. Never
+    # import a dependency just to classify an error, or trust an error's name.
+    module = sys.modules.get(module_name)
+    cls = vars(module).get(class_name) if module is not None else None
+    return isinstance(cls, type) and issubclass(cls, Exception) and isinstance(exc, cls)
+
+
+def classify_failure(exc: Exception) -> FailureKind:
+    if isinstance(exc, ModelLoadFailed):
+        return exc.kind if isinstance(exc.kind, FailureKind) else FailureKind.LOAD_FAILED
+    if isinstance(exc, InsufficientDiskSpaceError) or (
+        isinstance(exc, OSError) and exc.errno == errno.ENOSPC
+    ):
+        return FailureKind.DISK_SPACE
+    for name, kind in (("GatedRepoError", FailureKind.REPO_GATED),
+                       ("RepositoryNotFoundError", FailureKind.REPO_MISSING),
+                       ("LocalEntryNotFoundError", FailureKind.MODEL_IO),
+                       ("EntryNotFoundError", FailureKind.MODEL_IO)):
+        if any(_loaded_exception(exc, module, name) for module in
+               ("huggingface_hub.errors", "huggingface_hub.utils._errors")):
+            return kind
+    if any(_loaded_exception(exc, module, "OutOfMemoryError") for module in ("torch", "torch.cuda")):
+        return FailureKind.CUDA_MEMORY
+    for cls, kind in (
+        (MemoryError, FailureKind.HOST_MEMORY), (ImportError, FailureKind.DEPENDENCY),
+        (ValueError, FailureKind.CONFIGURATION), (TypeError, FailureKind.API),
+        (RuntimeError, FailureKind.RUNTIME), (OSError, FailureKind.MODEL_IO),
+    ):
+        if isinstance(exc, cls):
+            return kind
+    return FailureKind.LOAD_FAILED
+
+
 class ModelLoadFailed(RuntimeError):
     """The load itself failed (bad repo id, auth, disk, library error). HTTP 500."""
 
-    def __init__(self, model_id: str, message: str):
+    def __init__(self, model_id: str, kind=FailureKind.LOAD_FAILED):
         self.model_id = model_id
-        self.message = message
-        super().__init__(f"failed to load model {model_id}: {message}")
+        self.kind = kind if isinstance(kind, FailureKind) else FailureKind.LOAD_FAILED
+        self.message = failure_summary(self.kind)
+        super().__init__(f"failed to load model {model_id}: {self.message}")
 
 
 class InsufficientVram(RuntimeError):
@@ -100,6 +182,7 @@ class _Resident:
     # min_residency_seconds) a different model may not evict it, so two clients
     # alternating models cannot evict each other's fresh load before it serves.
     served: bool = False
+    idle_since: float | None = None
 
 
 @dataclass
@@ -133,6 +216,9 @@ class Lease:
     def release(self) -> None:
         if not self._released:
             self._released = True
+            # A released Lease may outlive its request. It must not retain
+            # model weights after the manager evicts the resident pipeline.
+            self.pipe = None
             self._manager._release(self._resident)
 
     def __enter__(self) -> "Lease":
@@ -167,6 +253,9 @@ class ImageModelManager:
         drain_timeout_seconds: float = 600.0,
         retry_after_seconds: int = 5,
         clock: Callable[[], float] = time.monotonic,
+        idle_unload_seconds: float = 300.0,
+        pinned_models: frozenset[str] = frozenset(),
+        timer_factory: Callable = threading.Timer,
     ):
         self._specs = specs
         self._default_model = default_model
@@ -175,8 +264,8 @@ class ImageModelManager:
         self._free_memory = free_memory
         self._free_vram_bytes = free_vram_bytes
         # Disk-side preparation (free-space preflight + weight prefetch). Runs
-        # BEFORE anything is evicted, so a slow or failed download never leaves
-        # the node without a model.
+        # BEFORE replacement eviction. The outgoing model can keep serving,
+        # but an unpinned idle model still expires during a slow download.
         self._prepare = prepare
         self._min_residency = max(min_residency_seconds, 0.0)
         self._failure_backoff = max(failure_backoff_seconds, 0.0)
@@ -186,6 +275,12 @@ class ImageModelManager:
         self._drain_timeout = drain_timeout_seconds
         self._retry_after = max(int(retry_after_seconds), 1)
         self._clock = clock
+        self._idle_unload = max(idle_unload_seconds, 0.0)
+        self._pinned = frozenset(pinned_models)
+        self._timer_factory = timer_factory
+        self._idle_timer = None
+        self._idle_token = 0
+        self._idle_evicting = False
 
         self._cond = threading.Condition()
         self._resident: _Resident | None = None
@@ -279,6 +374,9 @@ class ImageModelManager:
                         "est_vram_gb": variant.est_vram_gb if variant else None,
                         "fits_vram_budget": variant is not None,
                         "est_disk_gb": spec.est_disk_gb or None,
+                        "resident": spec.model_id == resident_id,
+                        "pinned": spec.model_id in self._pinned,
+                        **self._idle_status_locked(spec.model_id),
                     }
                 )
             return {
@@ -288,6 +386,7 @@ class ImageModelManager:
                 "vram_budget_gb": self._budget_gb,
                 "quant_mode": self._quant_mode,
                 "last_load": dict(self._last_load) if self._last_load else None,
+                "idle_evicting": self._idle_evicting,
             }
 
     # -- internals ----------------------------------------------------------
@@ -299,6 +398,8 @@ class ImageModelManager:
             return None
 
     def _try_locked(self, spec: ImageModelSpec) -> "Lease | _Load":
+        if self._idle_evicting:
+            raise self._warming_locked(spec, "busy")
         entry = self._failures.get(spec.model_id)
         if entry is not None:
             err, not_before, reported = entry
@@ -323,6 +424,8 @@ class ImageModelManager:
         ):
             resident.served = True
             resident.inflight += 1
+            resident.idle_since = None
+            self._cancel_idle_locked()
             return Lease(
                 pipe=resident.pipe,
                 device=resident.device,
@@ -385,37 +488,168 @@ class ImageModelManager:
         with self._cond:
             if resident.inflight > 0:
                 resident.inflight -= 1
+                if resident.inflight == 0 and self._resident is resident:
+                    resident.idle_since = self._clock()
+                    self._arm_idle_locked(resident)
             self._cond.notify_all()
+
+    def _cancel_idle_locked(self) -> None:
+        self._idle_token += 1
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _idle_deadline(self, resident: _Resident) -> float:
+        # A cold background load may finish after the caller got 503. Give
+        # that caller Retry-After plus warm-wait to acquire its first lease,
+        # even with idle=0, rather than evicting before it can ever serve.
+        grace = self._idle_unload if resident.served else max(
+            self._idle_unload, self._retry_after + self._warm_wait
+        )
+        return resident.idle_since + grace
+
+    def _idle_status_locked(self, model_id: str) -> dict[str, Any]:
+        resident = self._resident
+        idle = resident.idle_since if resident and resident.spec.model_id == model_id else None
+        remaining = None
+        if (
+            idle is not None and model_id not in self._pinned
+            and (self._load is None or not self._load.evicting)
+        ):
+            remaining = max(self._idle_deadline(resident) - self._clock(), 0.0)
+        return {
+            "idle_seconds": round(max(self._clock() - idle, 0.0), 2) if idle is not None else None,
+            # Epoch seconds, not a process-local monotonic clock reading.
+            "evicts_at": time.time() + remaining if remaining is not None else None,
+        }
+
+    def _arm_idle_locked(self, resident: _Resident) -> None:
+        self._cancel_idle_locked()
+        if (
+            resident.inflight or resident.spec.model_id in self._pinned
+            or (self._load is not None and self._load.evicting)
+        ):
+            return
+        token = self._idle_token
+        delay = max(self._idle_deadline(resident) - self._clock(), 0.0)
+        timer = self._timer_factory(delay, lambda: self._evict_idle(resident, token))
+        timer.daemon = True
+        self._idle_timer = timer
+        timer.start()
+
+    def _evict_idle(self, resident: _Resident, token: int) -> None:
+        with self._cond:
+            if (
+                token != self._idle_token or self._resident is not resident
+                or resident.inflight or resident.spec.model_id in self._pinned
+                or (self._load is not None and self._load.evicting)
+            ):
+                return
+            if self._clock() < self._idle_deadline(resident):
+                self._arm_idle_locked(resident)
+                return
+            self._cancel_idle_locked()
+            self._resident = None
+            self._idle_evicting = True
+        try:
+            self._drop_pipeline(resident)
+            # All manager, lease and unload-frame references are gone before
+            # collection/cache release/host allocator trimming happens.
+            self._free_memory()
+        except Exception as exc:
+            logger.warning("diffusers: idle memory cleanup failed (stage=%s exception_class=%s)",
+                           Stage.CLEANUP.value, safe_exception_label(exc))
+        finally:
+            with self._cond:
+                self._idle_evicting = False
+                self._cond.notify_all()
+
+    def _drop_pipeline(self, resident: _Resident) -> None:
+        pipe = resident.pipe
+        resident.pipe = None
+        try:
+            self._unloader(pipe)
+        except Exception as exc:
+            logger.warning("diffusers: pipeline unload hook failed (stage=%s exception_class=%s)",
+                           Stage.UNLOAD.value, safe_exception_label(exc))
+        finally:
+            del pipe
 
     def _run_load(self, load: _Load) -> None:
         spec, variant = load.spec, load.variant
+        stage = Stage.PREPARE
         try:
             candidates = load.candidates or (variant,)
             smallest = min(candidates, key=lambda v: v.est_vram_gb)
-            # Disk first: free-space preflight and weight download happen while
-            # the resident model keeps serving, so a slow or failed download
-            # never leaves the node with no model.
+            # Disk first: the resident model can keep serving during preflight
+            # and download, without extending its unpinned idle deadline.
             self._prepare(spec, variant)
+            self._enter_replacement_phase(load)
+            stage = Stage.CAPACITY
             self._refuse_if_eviction_cannot_help(spec, smallest.est_vram_gb * GIB)
+            stage = Stage.DRAIN
             self._swap_out_previous(load)
             # Unconditional, so cached blocks left by a previous failed load or
             # an earlier unload never make free VRAM look smaller than it is.
+            stage = Stage.CLEANUP
             self._free_memory()
-            free_before = self._free_vram_bytes()
-            if free_before is not None:
-                # The budget picked the preferred variant; what the card has free
-                # right now decides which one actually loads. Fall back to the
-                # next smaller variant that fits before refusing.
-                fitting = [v for v in candidates if v.est_vram_gb * GIB <= free_before]
-                if not fitting:
-                    raise InsufficientVram(spec.model_id, smallest.est_vram_gb, free_before / GIB)
-                variant = fitting[0]
+            started = self._clock()
+            attempted = 0
+            failures = []
+            failure_kinds = set()
+            skipped_for_vram = 0
+            trailing_shortfall = None
+            stage = Stage.LOAD
+            for variant in candidates:
+                # Recheck after every failed attempt's cleanup. Other services
+                # can change their allocations while this load is running.
+                stage = Stage.CAPACITY
+                free_before = self._free_vram_bytes()
+                if free_before is not None and variant.est_vram_gb * GIB > free_before:
+                    skipped_for_vram += 1
+                    # Keep a coherent observed need/free pair for the smallest
+                    # candidate skipped after the last actual load attempt.
+                    if trailing_shortfall is None or variant.est_vram_gb < trailing_shortfall[0]:
+                        trailing_shortfall = (variant.est_vram_gb, free_before / GIB)
+                    continue
+                trailing_shortfall = None
                 with self._cond:
                     load.variant = variant
-
-            started = self._clock()
-            pipe, device = self._loader(spec, variant)
+                attempted += 1
+                stage = Stage.LOAD
+                loaded, failure_kind, exception_class = self._attempt_pipeline_load(spec, variant)
+                if loaded is not None:
+                    pipe, device = loaded
+                    del loaded
+                    break
+                # The helper has exited its except block and stack frame.
+                # Collect partial allocations BEFORE another candidate loads;
+                # only a finite kind/literal label cross, never raw diagnostics.
+                failures.append({"quantization": variant.quant,
+                                 "cpu_offload": variant.offload != "none",
+                                 "kind": failure_kind.value,
+                                 "exception_class": exception_class})
+                failure_kinds.add(failure_kind)
+                logger.warning("diffusers: %s candidate %s failed [%s]: %s (stage=%s exception_class=%s)",
+                               spec.model_id, variant.label(), failure_kind.value,
+                               failure_summary(failure_kind), Stage.LOAD.value, exception_class)
+                stage = Stage.CLEANUP
+                self._free_memory()
+                stage = Stage.LOAD
+                if self._quant_mode != "auto":
+                    raise ModelLoadFailed(spec.model_id, failure_kind)
+            else:
+                if trailing_shortfall is not None:
+                    raise InsufficientVram(spec.model_id, *trailing_shortfall)
+                if attempted:
+                    common = next(iter(failure_kinds)) if len(failure_kinds) == 1 else None
+                    raise ModelLoadFailed(
+                        spec.model_id,
+                        common if common in _ACTIONABLE_FAILURES else FailureKind.ALL_FAILED,
+                    )
+                raise InsufficientVram(spec.model_id, smallest.est_vram_gb, free_before / GIB)
             elapsed = self._clock() - started
+            stage = Stage.CAPACITY
             free_after = self._free_vram_bytes()
             measured = None
             if free_before is not None and free_after is not None:
@@ -430,7 +664,9 @@ class ImageModelManager:
                     loaded_at=self._clock(),
                     load_seconds=elapsed,
                     measured_vram_gb=measured,
+                    idle_since=self._clock(),
                 )
+                del pipe
                 self._last_load = {
                     "model": spec.model_id,
                     "seconds": round(elapsed, 2),
@@ -438,8 +674,15 @@ class ImageModelManager:
                     "cpu_offload": variant.offload != "none",
                     "est_vram_gb": variant.est_vram_gb,
                     "measured_vram_gb": round(measured, 2) if measured is not None else None,
+                    "preferred_quantization": candidates[0].quant,
+                    "preferred_cpu_offload": candidates[0].offload != "none",
+                    "attempt_count": attempted,
+                    "fallback_attempts": max(attempted - 1, 0),
+                    "vram_skipped_candidates": skipped_for_vram,
+                    "failed_attempts": failures,
                 }
                 self._load = None
+                self._arm_idle_locked(self._resident)
                 load.event.set()
                 self._cond.notify_all()
             logger.info(
@@ -454,20 +697,61 @@ class ImageModelManager:
             if isinstance(exc, InsufficientVram):
                 err = exc
             else:
-                err = ModelLoadFailed(spec.model_id, str(exc))
-            logger.warning("diffusers: load of %s failed: %s", spec.model_id, exc)
+                err = ModelLoadFailed(spec.model_id, classify_failure(exc))
+            if isinstance(err, ModelLoadFailed):
+                # This is the raised operation/wrapper class, not a claim that
+                # an aggregate wrapper is the original candidate's cause.
+                logger.warning("diffusers: load of %s failed [%s]: %s (stage=%s raised_exception_class=%s)",
+                               spec.model_id, err.kind.value, err.message,
+                               stage.value, safe_exception_label(exc))
+            else:
+                logger.warning("diffusers: load of %s refused [insufficient_vram] (stage=%s raised_exception_class=%s)",
+                               spec.model_id, stage.value, safe_exception_label(exc))
             try:
+                # Preparation can fail while the idle timer is tearing down
+                # the outgoing model. Do not run overlapping memory cleanup.
+                self._enter_replacement_phase(load)
                 # A failed from_pretrained can leave partially allocated CUDA
                 # blocks cached in this process.
                 self._free_memory()
-            except Exception:  # noqa: BLE001
-                logger.exception("diffusers: freeing memory after a failed load raised")
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning("diffusers: memory cleanup after a failed load was not confirmed (stage=%s exception_class=%s)",
+                               Stage.CLEANUP.value, safe_exception_label(cleanup_exc))
             with self._cond:
                 self._failures[spec.model_id] = [err, self._clock() + self._failure_backoff, False]
                 load.error = err
                 self._load = None
+                if self._resident is not None and self._resident.inflight == 0:
+                    self._arm_idle_locked(self._resident)
                 load.event.set()
                 self._cond.notify_all()
+
+    def _attempt_pipeline_load(self, spec: ImageModelSpec, variant: LoadVariant):
+        """Return only a safe kind/literal label from a failed loader.
+
+        Returning outside the except block and this short-lived frame allows
+        the caller's GC/cache cleanup to reclaim partial pipelines before a
+        fallback. A successful loader returns its normal (pipeline, device).
+        """
+        try:
+            return self._loader(spec, variant), None, None
+        except Exception as exc:
+            kind = classify_failure(exc)
+            label = safe_exception_label(exc)
+        return None, kind, label
+
+    def _enter_replacement_phase(self, load: _Load) -> None:
+        """End preparation without racing an outgoing model's idle teardown.
+
+        Preparation itself does not extend residency. Once it finishes (or
+        fails), wait for an already-started teardown, then fence future idle
+        callbacks before any memory probe/cleanup or pipeline load. Reentry
+        on the failure path is harmless.
+        """
+        with self._cond:
+            self._cond.wait_for(lambda: not self._idle_evicting)
+            load.evicting = True
+            self._cancel_idle_locked()
 
     def _refuse_if_eviction_cannot_help(self, spec: ImageModelSpec, need_bytes: float) -> None:
         """Do not evict a working model for a load that cannot fit anyway: if
@@ -497,17 +781,15 @@ class ImageModelManager:
             load.evicting = True  # stop leasing the outgoing model; it would starve the drain
             drained = self._cond.wait_for(lambda: previous.inflight == 0, timeout=self._drain_timeout)
             if not drained:
-                raise TimeoutError(
-                    f"timed out after {self._drain_timeout:.0f}s waiting for in-flight generations "
-                    f"on {previous.spec.model_id} to finish"
-                )
+                raise ModelLoadFailed(load.spec.model_id, FailureKind.DRAIN_TIMEOUT)
             self._resident = None
             pipe = previous.pipe
             previous.pipe = None
         try:
             self._unloader(pipe)
-        except Exception:  # noqa: BLE001 - best effort; memory is reclaimed below
-            logger.exception("diffusers: unloading %s raised; continuing", previous.spec.model_id)
+        except Exception as exc:  # noqa: BLE001 - best effort; memory is reclaimed below
+            logger.warning("diffusers: unloading %s raised; continuing (stage=%s exception_class=%s)",
+                           previous.spec.model_id, Stage.UNLOAD.value, safe_exception_label(exc))
         finally:
             del pipe
             del previous

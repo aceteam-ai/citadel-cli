@@ -65,6 +65,9 @@ func bareCommandActionFor(isTTY bool, tier enrollmentTier) bareCommandAction {
 // start/attach is intentionally deferred to S2/S3, so S1 reports only the
 // enrollment fact it can establish locally.
 func bareCommandStatusLine(tier enrollmentTier) string {
+	if tier == enrollmentPlatform {
+		return fmt.Sprintf("Citadel enrollment: %s (local credentials present; device link %s)", tier, deviceLinkUnverified)
+	}
 	return fmt.Sprintf("Citadel enrollment: %s", tier)
 }
 

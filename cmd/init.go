@@ -21,6 +21,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -268,7 +269,7 @@ and system user configuration (requires sudo).`,
 
 			// Reclaim stale node with the same hostname before registering.
 			// This prevents duplicate nodes in the dashboard after live ISO reboots.
-			reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+			reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
 			if err := connectToNetwork(nodeName, deviceAuthResult.Token.Authkey); err != nil {
@@ -298,9 +299,7 @@ and system user configuration (requires sudo).`,
 			}
 
 			// Try to reclaim stale node using saved device config (if available)
-			if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-				reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
-			}
+			reclaimEnrollmentNodes(initNewDevice, nil, nodeName)
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
 			if err := connectToNetwork(nodeName, key); err != nil {
@@ -359,6 +358,9 @@ and system user configuration (requires sudo).`,
 						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
 						os.Exit(1)
 					}
+				} else {
+					// Do not mistake a saved bearer for a completed current-key link.
+					printDeviceLinkDiagnosticContext(cmd.Context(), os.Stderr, getDeviceConfigFromFile())
 				}
 
 				// Get node name from network status
@@ -398,8 +400,8 @@ and system user configuration (requires sudo).`,
 
 			if authkeyToUse != "" {
 				// Reclaim stale node before registering (if we have a device API token)
-				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
-					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+				if deviceAuthResult != nil {
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 				}
 
 				fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
@@ -609,8 +611,8 @@ and system user configuration (requires sudo).`,
 
 			if authKey != "" {
 				// Reclaim stale node before registering (if we have a device API token)
-				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
-					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+				if deviceAuthResult != nil {
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 				}
 
 				fmt.Println("--- 🌐 Joining network ---")
@@ -2005,7 +2007,7 @@ func ensureNodeIdentityWithStore(store *nodeidentity.Store, baseURL string) {
 	// stalls the init happy path. 503 (CA not activated) degrades silently.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{})}
 	if err := store.FetchCAChain(ctx, baseURL, client); err != nil {
 		Debug("fabric CA chain fetch skipped (non-fatal): %v", err)
 		return

@@ -19,7 +19,9 @@ does NOT require torch/diffusers/accelerate/imageio.)
 from __future__ import annotations
 
 import base64
-from types import SimpleNamespace
+import io
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,14 +29,45 @@ from fastapi.testclient import TestClient
 import app
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("-1", 0.0), ("inf", 300.0), ("-inf", 300.0),
+    ("nan", 300.0), ("owned-invalid-setting", 300.0),
+])
+def test_invalid_idle_settings_warn_without_echoing_values(monkeypatch, caplog, raw, expected):
+    monkeypatch.setenv("DIFFUSERS_IDLE_UNLOAD_SECONDS", raw)
+    assert app._idle_unload_seconds() == expected
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "WARNING"
+    assert raw not in caplog.records[0].message
+
+
+@pytest.mark.parametrize("raw, expected", [("0", 0.0), ("12.5", 12.5)])
+def test_valid_idle_settings_have_no_warning(monkeypatch, caplog, raw, expected):
+    monkeypatch.setenv("DIFFUSERS_IDLE_UNLOAD_SECONDS", raw)
+    assert app._idle_unload_seconds() == expected
+    assert not caplog.records
+
+
+def test_pin_validation_warns_once_without_echoing_unknown_ids(caplog):
+    app._warn_unknown_pins(frozenset({"owned/image", "owned/video"}), {"owned/image": None}, "owned/video")
+    assert not caplog.records
+    app._warn_unknown_pins(frozenset({"owned/unknown-secret", "owned/second-secret"}),
+                           {"owned/image": None}, "owned/video")
+    assert len(caplog.records) == 1
+    assert "unknown model IDs" in caplog.records[0].message
+    assert "owned/" not in caplog.records[0].message
+
+
 @pytest.fixture(autouse=True)
 def _reset_lazy_singletons(monkeypatch):
-    """Every test gets a clean slate: app.py's lazy _pipe/_video_pipe globals
-    must not leak a fake object set by one test into the next (in particular,
-    into /health's *_loaded assertions)."""
+    """Every test gets independent video residency without real pipelines."""
     monkeypatch.setattr(app, "_device", None)
-    monkeypatch.setattr(app, "_video_pipe", None)
     monkeypatch.setattr(app, "_video_device", None)
+    monkeypatch.setattr(app, "_video_manager", app.ImageModelManager(
+        {app.DIFFUSERS_VIDEO_MODEL: app._video_spec}, app.DIFFUSERS_VIDEO_MODEL,
+        loader=lambda spec, variant: (object(), "cuda"), warm_wait_seconds=5,
+        pinned_models=frozenset({app.DIFFUSERS_VIDEO_MODEL}),
+    ))
 
 
 @pytest.fixture
@@ -88,10 +121,9 @@ def test_health_reports_both_models_unloaded(client):
 
 def test_health_video_loaded_state_is_independent_of_image_state(client, monkeypatch):
     """Loading the video pipe must not report the image pipe as loaded, and
-    vice versa -- the two lazy singletons are independent (citadel #958's
+    vice versa -- the two residency managers are independent (citadel #958's
     coexistence requirement)."""
-    monkeypatch.setattr(app, "_video_pipe", object())
-    monkeypatch.setattr(app, "_video_device", "cuda")
+    app._video_manager.lease(app.DIFFUSERS_VIDEO_MODEL).release()
 
     resp = client.get("/health")
     body = resp.json()
@@ -99,6 +131,73 @@ def test_health_video_loaded_state_is_independent_of_image_state(client, monkeyp
     assert body["video_device"] == "cuda"
     assert body["model_loaded"] is False  # image pipe untouched
     assert body["device"] is None
+
+
+@pytest.mark.parametrize("failure", [None, "inference", "export"])
+def test_video_requests_release_real_lease_on_success_and_failure(client, monkeypatch, failure):
+    callbacks = []
+
+    def timer_factory(delay, callback):
+        callbacks.append(callback)
+        return SimpleNamespace(start=lambda: None, cancel=lambda: None)
+
+    class Pipe(_FakePipe):
+        def __call__(self, **kwargs):
+            if failure == "inference":
+                raise RuntimeError("owned inference refusal")
+            return super().__call__(**kwargs)
+
+    manager = app.ImageModelManager(
+        {app.DIFFUSERS_VIDEO_MODEL: app._video_spec}, app.DIFFUSERS_VIDEO_MODEL,
+        loader=lambda spec, variant: (Pipe(frames=[["owned-frame"]]), "cpu"),
+        warm_wait_seconds=5, idle_unload_seconds=0, timer_factory=timer_factory,
+    )
+    monkeypatch.setattr(app, "_video_manager", manager)
+    monkeypatch.setattr(app, "_host_rss_bytes", lambda: 123456)
+
+    def export(frames, fps):
+        if failure == "export":
+            raise RuntimeError("owned export refusal")
+        return b"owned-video"
+
+    monkeypatch.setattr(app, "_export_video_bytes", export)
+    response = client.post("/generate/video", json={"prompt": "owned-test"})
+    assert response.status_code == (200 if failure is None else 500)
+    assert manager._resident.inflight == 0
+    callbacks[-1]()  # release timer, not the superseded initial-load timer
+    assert manager.loaded_model() is None
+    health = client.get("/health").json()
+    assert health["host_rss_bytes"] == 123456
+    assert health["pipeline_residency"]["video"][0]["resident"] is False
+
+
+def test_video_cold_load_uses_the_existing_retryable_warming_response(client, monkeypatch):
+    def warming():
+        raise app.ModelWarming(app.DIFFUSERS_VIDEO_MODEL, eta_seconds=120, retry_after=5, reason="loading")
+
+    monkeypatch.setattr(app, "_get_video_pipe", warming)
+    response = client.post("/generate/video", json={"prompt": "owned-test"})
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "5"
+    assert response.json()["status"] == "model_warming"
+
+
+def test_health_rss_reads_current_resident_pages_not_peak(monkeypatch):
+    def statm(path, **kwargs):
+        assert path == "/proc/self/statm"
+        return io.StringIO("10000 17 4 0 0 0 0\n")
+
+    monkeypatch.setattr("builtins.open", statm)
+    monkeypatch.setattr(app.os, "sysconf", lambda name: 4096)
+    assert app._host_rss_bytes() == 17 * 4096
+
+
+def test_health_rss_unavailable_is_unknown_not_a_peak_fallback(monkeypatch):
+    def missing(*args, **kwargs):
+        raise OSError("owned missing proc fixture")
+
+    monkeypatch.setattr("builtins.open", missing)
+    assert app._host_rss_bytes() is None
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +234,8 @@ def test_generate_image_load_failure_is_500(client, monkeypatch):
     monkeypatch.setattr(app, "_get_pipe", _boom)
     resp = client.post("/generate", json={"prompt": "a cat"})
     assert resp.status_code == 500
-    assert app.DIFFUSERS_MODEL in resp.json()["detail"]
+    assert resp.json()["detail"] == f"failed to load model {app.DIFFUSERS_MODEL}: pipeline load failed"
+    assert "out of memory" not in resp.text
 
 
 def test_generate_image_inference_failure_is_500(client, monkeypatch):
@@ -276,7 +376,8 @@ def test_generate_video_load_failure_is_500(client, monkeypatch):
     monkeypatch.setattr(app, "_get_video_pipe", _boom)
     resp = client.post("/generate/video", json={"prompt": "x"})
     assert resp.status_code == 500
-    assert app.DIFFUSERS_VIDEO_MODEL in resp.json()["detail"]
+    assert resp.json()["detail"] == f"failed to load model {app.DIFFUSERS_VIDEO_MODEL}: pipeline load failed"
+    assert "no space left on device" not in resp.text
 
 
 def test_generate_video_inference_failure_is_500(client, monkeypatch):
@@ -573,18 +674,183 @@ def test_insufficient_free_vram_is_503_but_not_warming(client, monkeypatch):
     assert "Retry-After" not in resp.headers
 
 
-def test_load_failure_surfaces_as_500_naming_the_model(client, monkeypatch):
+def test_failed_attempt_followed_by_vram_skips_is_static_503_not_warming(client, monkeypatch, caplog):
+    free = [12 * 1024**3]
+    attempts = []
+
+    def load(spec, variant):
+        attempts.append(variant.quant)
+        free[0] = 6 * 1024**3
+        raise RuntimeError("owned-private-loader-detail")
+
+    manager = ImageModelManager(
+        app.ALLOWED_IMAGE_MODELS, FLUX, loader=load,
+        free_vram_bytes=lambda: free[0], vram_budget_gb=12, warm_wait_seconds=5,
+    )
+    monkeypatch.setattr(app, "_manager", manager)
+    resp = _post(client, FLUX)
+    assert attempts == ["int8"]
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["status"] == "insufficient_vram" and body["model"] == FLUX
+    assert (body["need_gb"], body["free_gb"]) == (7.0, 6.0)
+    assert "model_warming" not in resp.text
+    assert "Retry-After" not in resp.headers
+    assert "owned-private-loader-detail" not in resp.text + caplog.text
+    assert "candidate int8 failed [model_runtime]: model runtime failed" in caplog.text
+
+
+def test_outgoing_drain_timeout_is_static_busy_500_not_model_io(client, monkeypatch, caplog):
+    attempts, unloaded = [], []
+
+    def load(spec, variant):
+        attempts.append(spec.model_id)
+        return object(), "cuda"
+
+    manager = ImageModelManager(
+        app.ALLOWED_IMAGE_MODELS, ZIMG, loader=load, unloader=unloaded.append,
+        warm_wait_seconds=5, drain_timeout_seconds=0,
+        pinned_models=frozenset(app.ALLOWED_IMAGE_MODELS),
+    )
+    monkeypatch.setattr(app, "_manager", manager)
+    lease = manager.lease(ZIMG)
+    try:
+        resp = _post(client, FLUX)
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == f"failed to load model {FLUX}: previous model is still busy"
+        assert "Retry-After" not in resp.headers
+        assert attempts == [ZIMG] and unloaded == []
+        assert manager.loaded_model() == ZIMG
+        assert "[drain_timeout]: previous model is still busy" in caplog.text
+        assert "model files are unavailable" not in resp.text + caplog.text
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("pipeline", ["image", "video"])
+@pytest.mark.parametrize("cause, kind, reason", [
+    ("disk", "disk_space", "insufficient disk space for model download"),
+    ("gated", "repository_access_denied", "model repository access denied"),
+    ("missing", "repository_not_found", "model repository not found or inaccessible"),
+    ("cache-miss", "model_files_unavailable", "model files are unavailable"),
+    ("entry-missing", "model_files_unavailable", "model files are unavailable"),
+])
+def test_typed_load_refusals_keep_static_actionable_http_context(
+    client, monkeypatch, caplog, pipeline, cause, kind, reason,
+):
+    # These inert exports model already-loaded HF classes, not an HF import or
+    # authorization request. The real disk exception is import-light as well.
+    class RepositoryNotFoundError(RuntimeError):
+        pass
+
+    class GatedRepoError(RepositoryNotFoundError):
+        pass
+
+    class EntryNotFoundError(FileNotFoundError, ValueError):
+        pass
+
+    class LocalEntryNotFoundError(EntryNotFoundError):
+        pass
+
+    module = ModuleType("huggingface_hub.errors")
+    module.RepositoryNotFoundError = RepositoryNotFoundError
+    module.GatedRepoError = GatedRepoError
+    module.EntryNotFoundError = EntryNotFoundError
+    module.LocalEntryNotFoundError = LocalEntryNotFoundError
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    failure_class = {
+        "disk": app.model_preflight.InsufficientDiskSpaceError,
+        "gated": GatedRepoError,
+        "missing": RepositoryNotFoundError,
+        "cache-miss": LocalEntryNotFoundError,
+        "entry-missing": EntryNotFoundError,
+    }[cause]
+    attempts = []
+
+    def refuse():
+        raise failure_class("owned-private-loader-detail /owned/private/path hf_private-token")
+
+    def prepare(spec, variant):
+        if pipeline == "image":
+            refuse()
+
+    def load(spec, variant):
+        attempts.append(variant.quant)
+        refuse()  # the video loader contains its preflight in production
+
+    model_id = ZIMG if pipeline == "image" else app.DIFFUSERS_VIDEO_MODEL
+    specs = app.ALLOWED_IMAGE_MODELS if pipeline == "image" else {model_id: app._video_spec}
+    manager = ImageModelManager(
+        specs, model_id, loader=load, prepare=prepare, warm_wait_seconds=5,
+    )
+    monkeypatch.setattr(app, "_manager" if pipeline == "image" else "_video_manager", manager)
+    resp = _post(client, model_id) if pipeline == "image" else client.post(
+        "/generate/video", json={"prompt": "owned-test"},
+    )
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == f"failed to load model {model_id}: {reason}"
+    assert resp.json()["detail"].count("failed to load model ") == 1
+    assert attempts == ([] if pipeline == "image" else ["none"])
+    assert f"[{kind}]: {reason}" in caplog.text
+    for private in ("owned-private-loader-detail", "/owned/private/path", "hf_private-token"):
+        assert private not in resp.text + caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("pipeline", ["image", "video"])
+def test_load_failure_surfaces_as_static_500_naming_the_trusted_model(client, monkeypatch, caplog, pipeline):
+    model_id = ZIMG if pipeline == "image" else app.DIFFUSERS_VIDEO_MODEL
+    specs = app.ALLOWED_IMAGE_MODELS if pipeline == "image" else {model_id: app._video_spec}
     mgr = ImageModelManager(
-        app.ALLOWED_IMAGE_MODELS,
-        app.DIFFUSERS_MODEL,
-        loader=lambda s, v: (_ for _ in ()).throw(RuntimeError("401 gated")),
+        specs,
+        model_id,
+        loader=lambda s, v: (_ for _ in ()).throw(RuntimeError("401 gated owned-private-loader-detail")),
         vram_budget_gb=24.0,
         warm_wait_seconds=5.0,
     )
-    monkeypatch.setattr(app, "_manager", mgr)
-    resp = _post(client, ZIMG)
+    monkeypatch.setattr(app, "_manager" if pipeline == "image" else "_video_manager", mgr)
+    resp = _post(client, model_id) if pipeline == "image" else client.post(
+        "/generate/video", json={"prompt": "owned-test"},
+    )
     assert resp.status_code == 500
-    assert ZIMG in resp.json()["detail"] and "401 gated" in resp.json()["detail"]
+    assert resp.json()["detail"] == f"failed to load model {model_id}: all eligible pipeline loads failed"
+    assert resp.json()["detail"].count("failed to load model ") == 1
+    assert "401 gated" not in resp.text
+    assert "owned-private-loader-detail" not in resp.text
+    assert "owned-private-loader-detail" not in caplog.text
+    assert "[model_runtime]: model runtime failed" in caplog.text
+
+
+@pytest.mark.parametrize("pipeline", ["image", "video"])
+@pytest.mark.parametrize("failure_kind", ["generic", "foreign-model", "static"])
+def test_http_load_errors_ignore_untrusted_message_and_model_identity(client, monkeypatch, pipeline, failure_kind):
+    class PrivateFailure(RuntimeError):
+        def __str__(self):
+            raise AssertionError("the load-error HTTP boundary must not format an arbitrary exception")
+
+    if failure_kind == "generic":
+        failure = PrivateFailure()
+    else:
+        kind = app.FailureKind.ALL_FAILED if failure_kind == "static" else app.FailureKind.LOAD_FAILED
+        failure = app.ModelLoadFailed("owned-foreign-model", kind)
+        failure.message = "owned-private-loader-detail"  # HTTP classification must use only kind
+
+    def refuse(*args):
+        raise failure
+
+    if pipeline == "image":
+        monkeypatch.setattr(app, "_get_pipe", refuse)
+        model_id = ZIMG
+        resp = _post(client, model_id)
+    else:
+        monkeypatch.setattr(app, "_get_video_pipe", refuse)
+        model_id = app.DIFFUSERS_VIDEO_MODEL
+        resp = client.post("/generate/video", json={"prompt": "owned-test"})
+    reason = "all eligible pipeline loads failed" if failure_kind == "static" else "pipeline load failed"
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == f"failed to load model {model_id}: {reason}"
+    assert "owned-foreign-model" not in resp.text
+    assert "owned-private-loader-detail" not in resp.text
 
 
 def test_health_lists_allowlist_loaded_model_and_warm_vs_cold(client, swap):
@@ -611,8 +877,7 @@ def test_health_lists_allowlist_loaded_model_and_warm_vs_cold(client, swap):
 
 
 def test_health_still_reports_the_video_pipeline_independently(client, swap, monkeypatch):
-    monkeypatch.setattr(app, "_video_pipe", object())
-    monkeypatch.setattr(app, "_video_device", "cuda")
+    app._video_manager.lease(app.DIFFUSERS_VIDEO_MODEL).release()
     body = client.get("/health").json()
     assert body["video_model_loaded"] is True and body["model_loaded"] is False
 
