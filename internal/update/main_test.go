@@ -27,7 +27,7 @@ func TestMain(m *testing.M) {
 	if err := os.Mkdir(fixtureCacheDir, 0o700); err != nil {
 		panic(err)
 	}
-	for _, k := range []string{"HOME", "LOCALAPPDATA", "APPDATA", "USERPROFILE"} {
+	for _, k := range []string{"HOME", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
 		_ = os.Setenv(k, dir)
 	}
 	// A test may replace HOME with its own t.TempDir. Keep Go's module and build

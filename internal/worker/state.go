@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // WorkerState is a concurrency-safe snapshot of the running worker's live
@@ -19,7 +21,8 @@ import (
 // (reads). Counters use atomics; the queue slice and string fields are guarded
 // by mu.
 type WorkerState struct {
-	mu sync.RWMutex
+	mu       sync.RWMutex
+	platform platformhttp.Health
 
 	workerID      string
 	consumerGroup string
@@ -108,6 +111,14 @@ type WorkerState struct {
 func NewWorkerState() *WorkerState {
 	s := &WorkerState{startedAt: time.Now()}
 	return s
+}
+
+// ObservePlatform accepts only actual transport evidence, not poll attempts or
+// method-level success. It is shared with heartbeat and token refresh clients.
+func (s *WorkerState) ObservePlatform(o platformhttp.Observation) {
+	if s != nil {
+		s.platform.Observe(o)
+	}
 }
 
 // SetIdentity records the static identity/config of the worker. Safe to call
@@ -259,13 +270,17 @@ type WorkerSnapshot struct {
 	// will do: with no identity it declines every target_node-addressed job
 	// (citadel-cli#654). Untargeted work still runs, so the node looks healthy
 	// on every other signal -- this is the field that explains the timeouts.
-	IdentityUnresolved bool       `json:"identity_unresolved,omitempty"`
-	OrgID              string     `json:"org_id,omitempty"`
-	Consuming          bool       `json:"consuming"`
-	StartedAt          time.Time  `json:"started_at"`
-	UptimeSeconds      int64      `json:"uptime_seconds"`
-	LastPollAt         *time.Time `json:"last_poll_at,omitempty"`
-	LastJobAt          *time.Time `json:"last_job_at,omitempty"`
+	IdentityUnresolved     bool                 `json:"identity_unresolved,omitempty"`
+	OrgID                  string               `json:"org_id,omitempty"`
+	Consuming              bool                 `json:"consuming"`
+	StartedAt              time.Time            `json:"started_at"`
+	UptimeSeconds          int64                `json:"uptime_seconds"`
+	LastPollAt             *time.Time           `json:"last_poll_at,omitempty"`
+	LastJobAt              *time.Time           `json:"last_job_at,omitempty"`
+	PlatformOKAt           *time.Time           `json:"platform_ok_at,omitempty"`
+	PlatformFailingSince   *time.Time           `json:"platform_failing_since,omitempty"`
+	PlatformLastOutcome    platformhttp.Outcome `json:"platform_last_outcome,omitempty"`
+	PlatformLastHTTPStatus int                  `json:"platform_last_http_status,omitempty"`
 	// OldestInFlightAt is when the CURRENT in-flight streak began (nil when
 	// InFlight==0) -- see WorkerState.oldestInFlightUnixNano for why this is
 	// distinct from LastJobAt once more than one job can be in flight (#489's
@@ -310,6 +325,9 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 	}
 	snap.IdentityUnresolved = s.headscaleID == ""
 	s.mu.RUnlock()
+	health := s.platform.Snapshot()
+	snap.PlatformOKAt, snap.PlatformFailingSince = health.OKAt, health.FailingSince
+	snap.PlatformLastOutcome, snap.PlatformLastHTTPStatus = health.LastOutcome, health.LastStatus
 
 	snap.UptimeSeconds = int64(time.Since(snap.StartedAt).Seconds())
 	snap.LastConsumeStatus = int(atomic.LoadInt32(&s.lastConsumeStatus))

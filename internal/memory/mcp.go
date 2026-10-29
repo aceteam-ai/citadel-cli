@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // mcpProtocolVersion is the MCP protocol version advertised in initialize.
@@ -41,7 +43,8 @@ func NewMCPClient(url, apiKey string, timeout time.Duration) *MCPClient {
 		url:    url,
 		apiKey: apiKey,
 		http: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: platformhttp.New(url, platformhttp.Options{}),
 			// Never replay the bearer to a redirect target. Endpoint moves must
 			// be explicit in the trusted local configuration.
 			CheckRedirect: func(*http.Request, []*http.Request) error {

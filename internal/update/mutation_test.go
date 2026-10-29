@@ -5,6 +5,7 @@ package update
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -386,5 +387,48 @@ func TestMutationLockFirstCreationFailsInReadOnlyParent(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	if _, err := acquireMutationLock(context.Background(), destination, true); err == nil {
 		t.Fatal("first lock creation unexpectedly succeeded in read-only parent")
+	}
+}
+
+func TestApplyReleaseRollbackOnlyAfterInstalledPathChanges(t *testing.T) {
+	for _, changed := range []bool{false, true} {
+		t.Run(fmt.Sprint(changed), func(t *testing.T) {
+			setAttemptTestHome(t)
+			dir := t.TempDir()
+			installed, candidate := filepath.Join(dir, "citadel"), filepath.Join(dir, "candidate")
+			buildCitadelFixture(t, installed, "v2.0.0")
+			buildCitadelFixture(t, candidate, "v2.1.0")
+			originalResolver, originalCommit, originalRollback := resolveInstalledPath, commitSwapStage, rollbackRelease
+			t.Cleanup(func() {
+				resolveInstalledPath, commitSwapStage, rollbackRelease = originalResolver, originalCommit, originalRollback
+			})
+			resolveInstalledPath = func() (string, error) { return installed, nil }
+			rollbacks := 0
+			commitSwapStage = func(_ *os.File, stage, destination string, _ installedIdentity, _ string) error {
+				if changed {
+					if err := os.Rename(stage, destination); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return errors.New("synthetic replacement failure")
+			}
+			rollbackRelease = func(string, installedIdentity) error { rollbacks++; return errors.New("synthetic rollback failure") }
+			_, err := ApplyRelease(context.Background(), candidate, "", "v2.1.0", Latest)
+			if err == nil {
+				t.Fatal("replacement failure was reported as success")
+			}
+			if changed {
+				if rollbacks != 1 || !strings.Contains(err.Error(), "rollback failed") {
+					t.Fatalf("changed path did not attempt/report recovery: calls=%d err=%v", rollbacks, err)
+				}
+			} else {
+				if rollbacks != 0 || !strings.Contains(err.Error(), "no rollback needed") || strings.Contains(err.Error(), "rollback failed") {
+					t.Fatalf("unchanged install reported fictitious rollback: calls=%d err=%v", rollbacks, err)
+				}
+				if meta, readErr := ReadExecutableVersion(installed); readErr != nil || meta.Version != "v2.0.0" {
+					t.Fatalf("original not retained: %+v %v", meta, readErr)
+				}
+			}
+		})
 	}
 }

@@ -246,9 +246,23 @@ const declaredAttachBurst = 64
 func pumpDeclaredAttachment(ctx context.Context, attachment declaredAttachment, decoder *declaredDetachDecoder,
 	results <-chan declaredAttachResult, inputs <-chan declaredAttachInput, resizes <-chan os.Signal,
 	writeOutput func([]byte) error, terminalSize func() (uint16, uint16, error)) error {
-	forward := func(data []byte) error {
-		if len(data) == 0 || attachment.ReadOnly() {
+	readOnlyNoticeShown := false
+	noticeDiscard := func() error {
+		if readOnlyNoticeShown {
 			return nil
+		}
+		if err := writeOutput([]byte("\r\n[Citadel session is read-only; input is not forwarded.]\r\n")); err != nil {
+			return err
+		}
+		readOnlyNoticeShown = true
+		return nil
+	}
+	forward := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		if attachment.ReadOnly() {
+			return noticeDiscard()
 		}
 		// A held prefix plus an entire new read can be one byte larger than
 		// the wire input ceiling. Split only between frames, never drop it.
@@ -259,7 +273,7 @@ func pumpDeclaredAttachment(ctx context.Context, attachment declaredAttachment, 
 			}
 			if err := attachment.Input(ctx, data[:n]); err != nil {
 				if errors.Is(err, declaredsession.ErrRole) {
-					return nil
+					return noticeDiscard()
 				}
 				if err := ctx.Err(); err != nil {
 					return err
@@ -341,6 +355,7 @@ func pumpDeclaredAttachment(ctx context.Context, attachment declaredAttachment, 
 			}
 		case "role":
 			if !result.event.ReadOnly {
+				readOnlyNoticeShown = false
 				if err := resize(); err != nil {
 					return true, err
 				}

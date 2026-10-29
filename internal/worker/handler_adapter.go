@@ -23,6 +23,7 @@ type LegacyHandlerAdapter struct {
 	handler         jobs.JobHandler
 	logFn           func(level, msg string)
 	enabled         func() bool
+	refusal         func() *jobs.ShellRefusal
 	backgroundOwner bool
 	// passcodeGate, when set, is evaluated after the permission check and
 	// before the handler runs. On such an adapter the payload passcode key is
@@ -102,7 +103,12 @@ func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
 func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	start := time.Now()
 	if a.enabled != nil && !a.enabled() {
-		err := fmt.Errorf("job type %s is disabled by current node permissions", job.Type)
+		err := legacyPermissionRefusal(a.jobType)
+		if a.refusal != nil {
+			if specific := a.refusal(); specific != nil {
+				err = specific
+			}
+		}
 		return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
 	}
 
@@ -652,10 +658,14 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 
 	// Convert to []JobHandler.
 	result := make([]JobHandler, len(handlers))
+	refusals := &registrationRefusals{opts: opts, goos: goos}
+	refusals.opts.MeetingEnabled = meetingEnabled
 	for i, h := range handlers {
+		jobType := h.jobType
+		h.refusal = func() *jobs.ShellRefusal { return refusals.RefusalFor(jobType) }
 		result[i] = h
 	}
-	return result
+	return append(result, refusals)
 }
 
 // newMeetingJoinHandler wires opts.MeetingProfileDir into the handler so a
