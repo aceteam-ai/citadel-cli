@@ -659,6 +659,7 @@ def health():
             "video": [{key: model[key] for key in residency_fields} for model in video["allowed_models"]],
         },
         "pipeline_cleanup": {"image": image["idle_evicting"], "video": video["idle_evicting"]},
+        "last_idle_cleanup": {"image": image["last_idle_cleanup"], "video": video["last_idle_cleanup"]},
         "host_rss_bytes": _host_rss_bytes(),
         "idle_unload_seconds": DIFFUSERS_IDLE_UNLOAD_SECONDS,
     }

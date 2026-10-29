@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import errno
 import gc
+import json
 from pathlib import Path
 import sys
 import threading
@@ -304,6 +305,132 @@ class ManualTimers:
         timer = Timer()
         timer.delay = delay
         return timer
+
+
+@pytest.mark.parametrize("model_id", [SDXL, "owned/video"])
+@pytest.mark.parametrize("failures", [(), ("unload",), ("cleanup",), ("unload", "cleanup")])
+def test_last_idle_cleanup_records_callback_outcomes_without_private_diagnostics(model_id, failures):
+    class PrivateFailure(RuntimeError):
+        def __str__(self):
+            raise AssertionError("cleanup observations must not format private exceptions")
+
+    timers = ManualTimers()
+    loader = FakeLoader()
+    spec = im.CATALOG[SDXL] if model_id == SDXL else im.ImageModelSpec(
+        model_id=model_id, license="test", permissive=False, pipeline_class=None,
+        torch_dtype=None, variants=(im.LoadVariant("none", "none", 0),),
+    )
+    mgr = ImageModelManager(
+        {model_id: spec}, model_id, loader=loader.load, unloader=loader.unload,
+        free_memory=loader.free, warm_wait_seconds=5, idle_unload_seconds=0,
+        timer_factory=timers, clock=lambda: timers.now,
+    )
+    assert mgr.status()["last_idle_cleanup"] == {
+        "outcome": "not_attempted", "failed_stages": [], "interrupted_stage": None,
+    }
+    mgr.lease(model_id).release()
+    calls = []
+
+    def unload(pipe):
+        calls.append("unload")
+        assert mgr.status()["last_idle_cleanup"] == {
+            "outcome": "running", "failed_stages": [], "interrupted_stage": None,
+        }
+        loader.unload(pipe)
+        if "unload" in failures:
+            raise PrivateFailure("owned-private-token /owned/private/path")
+
+    def free():
+        calls.append("cleanup")
+        loader.free()
+        if "cleanup" in failures:
+            raise PrivateFailure("owned-private-token /owned/private/path")
+
+    mgr._unloader, mgr._free_memory = unload, free
+    timers.timers[-1].fire()
+    assert calls == ["unload", "cleanup"]  # unload failure must not skip cache cleanup
+    assert mgr.loaded_model() is None
+    assert mgr.status()["idle_evicting"] is False
+    snapshot = mgr.status()["last_idle_cleanup"]
+    assert snapshot == {
+        "outcome": "callback_error" if failures else "callbacks_returned",
+        "failed_stages": list(failures), "interrupted_stage": None,
+    }
+    encoded = json.dumps(snapshot)
+    for private in ("owned-private-token", "/owned/private/path", "PrivateFailure", "traceback"):
+        assert private not in encoded
+    snapshot["outcome"] = "owned-mutation"
+    snapshot["failed_stages"].append("owned-mutation")
+    assert mgr.status()["last_idle_cleanup"] == {
+        "outcome": "callback_error" if failures else "callbacks_returned",
+        "failed_stages": list(failures), "interrupted_stage": None,
+    }
+
+
+@pytest.mark.parametrize("interrupt_stage, earlier_failure", [
+    ("unload", False), ("cleanup", False), ("cleanup", True),
+])
+def test_interrupted_idle_cleanup_never_claims_callback_return(interrupt_stage, earlier_failure):
+    class PrivateInterruption(BaseException):
+        def __str__(self):
+            raise AssertionError("interruption observations must not format private exceptions")
+
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    calls = []
+
+    def unload(pipe):
+        calls.append("unload")
+        if interrupt_stage == "unload":
+            raise PrivateInterruption("owned-private-interruption")
+        if earlier_failure:
+            raise RuntimeError("owned-private-error")
+        loader.unload(pipe)
+
+    def free():
+        calls.append("cleanup")
+        raise PrivateInterruption("owned-private-interruption")
+
+    mgr._unloader, mgr._free_memory = unload, free
+    with pytest.raises(PrivateInterruption):
+        timers.timers[-1].fire()
+    assert calls == (["unload"] if interrupt_stage == "unload" else ["unload", "cleanup"])
+    assert mgr.status()["idle_evicting"] is False
+    assert mgr.status()["last_idle_cleanup"] == {
+        "outcome": "interrupted", "failed_stages": ["unload"] if earlier_failure else [],
+        "interrupted_stage": interrupt_stage,
+    }
+    assert "owned-private" not in json.dumps(mgr.status()["last_idle_cleanup"])
+
+
+def test_last_idle_cleanup_survives_loads_and_stale_timers_until_next_actual_attempt():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    old_timer = timers.timers[-1]
+    old_timer.fire()
+    returned = {"outcome": "callbacks_returned", "failed_stages": [], "interrupted_stage": None}
+    assert mgr.status()["last_idle_cleanup"] == returned
+    mgr.lease(SDXL).release()
+    assert mgr.status()["last_idle_cleanup"] == returned
+    new_timer = timers.timers[-1]
+    assert new_timer is not old_timer
+
+    def fail_unload(pipe):
+        loader.unload(pipe)
+        raise RuntimeError("owned-private-unload")
+
+    mgr._unloader = fail_unload
+    new_timer.fire()
+    failed = {"outcome": "callback_error", "failed_stages": ["unload"], "interrupted_stage": None}
+    assert mgr.status()["last_idle_cleanup"] == failed
+    old_timer.fire()
+    new_timer.fire()
+    assert mgr.status()["last_idle_cleanup"] == failed
+    assert loader.unloaded == [f"pipe:{SDXL}", f"pipe:{SDXL}"]
 
 
 @pytest.mark.parametrize("model_id", [SDXL, "owned/video"])
@@ -612,6 +739,10 @@ def test_idle_cleanup_blocks_new_load_until_memory_release_finishes():
     worker.start()
     try:
         assert entered.wait(5)
+        running = {"outcome": "running", "failed_stages": [], "interrupted_stage": None}
+        assert mgr.status()["last_idle_cleanup"] == running
+        timers.timers[-1].fire()  # duplicate callback cannot overwrite the running attempt
+        assert mgr.status()["last_idle_cleanup"] == running
         with pytest.raises(ModelWarming) as err:
             mgr.lease(FLUX)
         assert err.value.reason == "busy"
@@ -620,6 +751,9 @@ def test_idle_cleanup_blocks_new_load_until_memory_release_finishes():
         release.set()
         worker.join(5)
         assert not worker.is_alive()
+    assert mgr.status()["last_idle_cleanup"] == {
+        "outcome": "callbacks_returned", "failed_stages": [], "interrupted_stage": None,
+    }
 
 
 def test_pinning_does_not_prevent_an_explicit_image_model_swap():

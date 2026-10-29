@@ -148,6 +148,23 @@ Unlike the former synchronous video singleton, a cold video request may return
 this 503 after warm-wait; the existing Go image/video handler retries it within
 its unchanged request budget. Unclaimed-load grace is Retry-After plus warm-wait.
 
+`/health.last_idle_cleanup` separately snapshots the image and video manager's
+last accepted idle-cleanup attempt. Its closed `outcome` is `not_attempted`,
+`running`, `callbacks_returned`, `callback_error` or `interrupted`. The bounded
+`failed_stages` list contains only `unload` and/or `cleanup`, in execution order;
+`interrupted_stage` is null except when an uncaught interruption stopped one of
+those stages. No exception object, text, class, traceback or model reference is
+retained in this observation. Callback return is not resource-release proof:
+the real cache-cleanup callback itself tolerates some unavailable CUDA actions.
+A stale/cancelled timer that does no work leaves the last actual attempt intact.
+Starting another real idle attempt replaces that observation; a model load or
+explicit swap alone does not erase it. Snapshots copy their stage lists under
+the manager's condition and terminal publication clears the progress flag in
+that same critical section. The image and video managers remain independent;
+this is not host-wide serialization, persistent history, a cleanup retry, a
+new admission hold or evidence of measured RSS/VRAM recovery. The existing
+`pipeline_cleanup` progress booleans and eviction/pinning policies are unchanged.
+
 ## Acceptance still required
 
 Normal existing Python CI covers faked lifecycle/HTTP behavior without torch.
