@@ -76,7 +76,7 @@ incompatible lock. The exact CPU artifact and ABI are not changed. The current
 publisher CPU indexes have no newer stable paired release for this exact
 CPython 3.12/manylinux_2_28/x86_64 target that admits the fixed setuptools version.
 
-Under the October 29 exception decision relayed by automated-aceteam, the Whisper
+Under [Jason's October 29 exception decision, recorded by the coordinator](https://github.com/aceteam-ai/citadel-cli/pull/1511#issuecomment-6511274734), the Whisper
 runtime-lock audit temporarily ignores **only GHSA-xmj3-9gf7-h52w** in addition
 to its two pre-existing exceptions. No other advisory, package, service or audit
 is exempted, and the audit still fails for other findings. This accepts the
