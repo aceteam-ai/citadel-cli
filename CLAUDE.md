@@ -4394,12 +4394,13 @@ weights INSIDE the first `/transcribe` call — a short clip with `medium` would
 otherwise abort at the 2-min floor mid-download. `modelSize==""` reduces to
 exactly the base budget (existing tests unchanged).
 
-**Rebuild + pull required for the sensor half.** The compose pins
-`whisper-service:latest` (a FLOATING tag), so a `SERVICE_START`/`up` alone won't
-upgrade it (the #718 lesson). CI (`.github/workflows/build-whisper-service.yml`)
-rebuilds+pushes on any `services/whisper-service/**` change to main; a node must
-then `docker compose pull` transcribe to get the per-segment signals AND the
-`duration` field. Until it does, the Go guard still runs but reports
+**A reviewed image bump is required for the sensor half.** The embedded compose
+pins Whisper by source tag and OCI digest (see
+`docs/2026-10-sidecar-image-pins.md`), so a new main build does not silently
+change it. CI (`.github/workflows/build-whisper-service.yml`) rebuilds and
+publishes on changes to `services/whisper-service/**`; the compose pin must
+then be reviewed and updated, and the node must restart transcribe to receive
+the new per-segment signals and `duration` field. Until it does, the Go guard reports
 `signals_available:false` and relies only on the checks that need neither
 (text-repetition, empty-transcript, and — since `language_probability` already
 existed — uncertain-language). The low-speech-coverage check needs the new
