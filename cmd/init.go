@@ -269,10 +269,10 @@ and system user configuration (requires sudo).`,
 
 			// Reclaim stale node with the same hostname before registering.
 			// This prevents duplicate nodes in the dashboard after live ISO reboots.
-			reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
+			reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, deviceEnrollmentHostname(deviceAuthResult, nodeName))
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
-			if err := connectToNetwork(nodeName, deviceAuthResult.Token.Authkey); err != nil {
+			if err := connectToNetworkAs(nodeName, deviceEnrollmentHostname(deviceAuthResult, nodeName), deviceAuthResult.Token.Authkey); err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 				os.Exit(1)
 			}
@@ -401,11 +401,15 @@ and system user configuration (requires sudo).`,
 			if authkeyToUse != "" {
 				// Reclaim stale node before registering (if we have a device API token)
 				if deviceAuthResult != nil {
-					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, deviceEnrollmentHostname(deviceAuthResult, nodeName))
 				}
 
 				fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
-				if err := connectToNetwork(nodeName, authkeyToUse); err != nil {
+				servingName := nodeName
+				if choice == nexus.NetChoiceDevice {
+					servingName = deviceEnrollmentHostname(deviceAuthResult, nodeName)
+				}
+				if err := connectToNetworkAs(nodeName, servingName, authkeyToUse); err != nil {
 					fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 					os.Exit(1)
 				}
@@ -602,21 +606,16 @@ and system user configuration (requires sudo).`,
 
 		// Join the network if we have an authkey and haven't connected early
 		if !earlyNetworkConnected {
-			var authKey string
 			if choice == nexus.NetChoiceDevice {
-				authKey = deviceAuthResult.Token.Authkey
-			} else if key != "" {
-				authKey = key
-			}
-
-			if authKey != "" {
-				// Reclaim stale node before registering (if we have a device API token)
-				if deviceAuthResult != nil {
-					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
-				}
-
+				reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, deviceEnrollmentHostname(deviceAuthResult, nodeName))
 				fmt.Println("--- 🌐 Joining network ---")
-				loginArgs := []string{"login", "--authkey", authKey, "--node-name", nodeName}
+				if err := connectDeviceEnrollmentAsWith(deviceAuthResult, nodeName, connectToNetworkAs, linkDeviceEnrollment, network.Disconnect); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
+					os.Exit(1)
+				}
+			} else if key != "" {
+				fmt.Println("--- 🌐 Joining network ---")
+				loginArgs := []string{"login", "--authkey", key, "--node-name", nodeName}
 				loginCmdString := fmt.Sprintf("%s %s", executablePath, strings.Join(loginArgs, " "))
 				loginCmd := exec.Command("sudo", "sh", "-c", loginCmdString)
 				loginCmd.Stdout = os.Stdout
@@ -1857,6 +1856,11 @@ func configureNvidiaDocker() error {
 // Only overwrites the OS hostname when the current hostname is generic (live ISO,
 // fresh install). User-chosen hostnames are preserved.
 func connectToNetwork(nodeName, authKey string) error {
+	return connectToNetworkAs(nodeName, nodeName, authKey)
+}
+
+// Keep the operator's display/OS hostname separate from the verified mesh name.
+func connectToNetworkAs(nodeName, servingName, authKey string) error {
 	// Record the pre-registration OS hostname (once) so it can be restored
 	// later via 'citadel rename'. saveOriginalHostnameToConfig is a no-op if an
 	// original hostname has already been recorded.
@@ -1875,7 +1879,7 @@ func connectToNetwork(nodeName, authKey string) error {
 			Debug("system hostname set to %s", nodeName)
 		}
 	} else {
-		Debug("preserving existing OS hostname %q (registering as %q on network)", current, nodeName)
+		Debug("preserving existing OS hostname %q (registering as %q on network)", current, servingName)
 	}
 
 	// Persist the hostname to config so re-runs are stable
@@ -1887,7 +1891,7 @@ func connectToNetwork(nodeName, authKey string) error {
 	defer cancel()
 
 	config := network.ServerConfig{
-		Hostname:   nodeName,
+		Hostname:   servingName,
 		ControlURL: nexusURL, // From root.go
 		AuthKey:    authKey,
 	}

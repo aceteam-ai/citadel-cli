@@ -89,11 +89,11 @@ func TestLoginFlow_SecondLoginKeepsSameNodeUID(t *testing.T) {
 
 // TestRunDeviceAuthFlow_LegacyNoCSRInBody pins that the legacy entry point sends
 // NO csr_pem (init/enroll/control-center byte-compat).
-func TestRunDeviceAuthFlow_LegacyNoCSRInBody(t *testing.T) {
+func TestRunDeviceAuthFlowWithCSR_EmptyOmitsField(t *testing.T) {
 	mock := nexus.StartMockDeviceAuthServer(1)
 	defer mock.Close()
 
-	if _, err := runDeviceAuthFlow(mock.URL(), false); err != nil {
+	if _, err := runDeviceAuthFlowWithCSR(mock.URL(), false, ""); err != nil {
 		t.Fatalf("runDeviceAuthFlow: %v", err)
 	}
 	for i, body := range mock.TokenRequestBodies() {

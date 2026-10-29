@@ -15,6 +15,8 @@ import (
 type DeviceAuthResult struct {
 	Token      *nexus.TokenResponse
 	DeviceCode string // The device code used during auth (for config lookup)
+	// Set only after this grant's CSR bundle and persisted serving identity validate.
+	identityNodeUID string
 }
 
 // runDeviceAuthFlow executes the OAuth 2.0 device authorization flow
@@ -26,13 +28,23 @@ type DeviceAuthResult struct {
 // When no TTY is available (e.g. SSH without -t, CI, pipes), the device code
 // and URL are printed as plain text and the flow polls without bubbletea.
 func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult, error) {
-	return runDeviceAuthFlowWithCSR(authServiceURL, forceNew, "")
+	attempt := prepareDeviceAuthIdentity()
+	result, err := deviceAuthorizationWithCSR(authServiceURL, forceNew, attempt.csr)
+	if err == nil && result != nil {
+		copied := *result
+		if result.Token != nil {
+			token := *result.Token
+			copied.Token = &token
+		}
+		copied.identityNodeUID = attempt.accept(copied.Token)
+		result = &copied
+	}
+	return result, err
 }
 
 // runDeviceAuthFlowWithCSR is runDeviceAuthFlow plus an optional PEM CSR
-// (citadel-cli#1062). Only interactive device-grant `citadel login` passes a
-// non-empty csrPEM; every other caller (init/enroll/control-center) goes through
-// runDeviceAuthFlow, which delegates here with "" — a byte-identical legacy flow.
+// (citadel-cli#1062). Init/enroll and login submit a convergent-key CSR.
+// An empty CSR still omits the optional field for legacy fallback.
 //
 // The csrPEM is bound into ONE poll closure BEFORE the TTY branch, so the SAME
 // CSR is sent on every retry regardless of which UI path (bubbletea vs plain)

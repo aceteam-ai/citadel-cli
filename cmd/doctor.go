@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
@@ -47,6 +48,8 @@ import (
 //     in the node manifest. Unlike job routing, this is a standalone observable
 //     and therefore does affect the exit code.
 type doctorReport struct {
+	certificate *nodeidentity.CertificateStatus
+
 	dockerHealth platform.DockerHealth
 	doctor       map[string]any
 	cgroupHealth platform.CgroupDelegationHealth
@@ -145,7 +148,10 @@ func runPodmanGPUProbe(rt catalog.ContainerRuntime, lookPath func(string) (strin
 // from doctorRunE so tests can exercise rendering/exit-code logic against a
 // hand-built doctorReport without touching a real docker/podman install.
 func runDoctorChecks() doctorReport {
-	return runDoctorChecksFor(platform.IsDarwin(), currentManagedServiceHealth)
+	report := runDoctorChecksFor(platform.IsDarwin(), currentManagedServiceHealth)
+	certificate := readNodeCertificateStatus()
+	report.certificate = &certificate
+	return report
 }
 
 // runDoctorChecksFor is the seam runDoctorChecks wraps: isDarwin is passed in so
@@ -179,6 +185,7 @@ func runDoctorChecksFor(isDarwin bool, serviceHealthFn func() ([]managedServiceH
 // renderDoctorReport prints a human-readable report to w.
 func renderDoctorReport(w io.Writer, r doctorReport) {
 	headerColor.Fprintln(w, "--- 🩺 Citadel Doctor ---")
+	renderNodeCertificateStatus(w, r.certificate)
 
 	headerColor.Fprintln(w, "\nDOCKER / ENGINE")
 	switch {
