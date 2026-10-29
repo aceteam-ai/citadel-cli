@@ -41,8 +41,9 @@ check, not a proof of full installation or runtime behavior.
 This follows the targeted source-edit convention in SECURITY-LOCK-1406.md. It
 is not a new full uv resolution and does not claim to have run the recorded
 compile command. Preserve every unrelated lock entry, the exact Torch and
-torchaudio CPU URLs/hashes and ABI, the current audit ignore list, workflows,
-image digests and application behavior.
+torchaudio CPU URLs/hashes and ABI, image digests and application behavior.
+The single additional audit exception below is the only audit-policy change;
+the existing two exceptions and all other workflow steps remain unchanged.
 
 Require the original normal exact-head hermetic Whisper tests and dependency
 audit, plus independent source/security review. Full resolver reconciliation,
@@ -66,11 +67,26 @@ entry. Huggingface-hub 1.33.0 requires filelock >=3.10.0; pyannote-pipeline 4.0.
 requires >=3.17.0. The preserved CPU Torch wheel requires filelock without an
 upper bound. These constraints admit 4.2.1.
 
-Setuptools remains held. Its publisher metadata identifies 84.1.0 as fixed for
+## Temporary setuptools audit exception
+
+Setuptools remains at **81.0.0**. Its publisher metadata identifies 84.1.0 as fixed for
 the new finding, but metadata for the exact preserved Torch 2.11.0+cpu CPython
 3.12 wheel requires setuptools <82. A mechanical 84.1.0 edit would create an
-incompatible lock. The exact CPU artifact and ABI are not changed, and no
-advisory suppression or dependency-resolution bypass is added. A separately
-reviewed compatible CPU pair or publisher-supported backport needs an owner
-decision before the remaining audit can pass. No runtime reachability exemption
-is claimed for the new advisory.
+incompatible lock. The exact CPU artifact and ABI are not changed. The current
+publisher CPU indexes have no newer stable paired release for this exact
+CPython 3.12/manylinux_2_28/x86_64 target that admits the fixed setuptools version.
+
+Under the October 29 exception decision relayed by automated-aceteam, the Whisper
+runtime-lock audit temporarily ignores **only GHSA-xmj3-9gf7-h52w** in addition
+to its two pre-existing exceptions. No other advisory, package, service or audit
+is exempted, and the audit still fails for other findings. This accepts the
+remaining finding; it does not patch setuptools, establish runtime
+unreachability, prove safety or authorize deployment. The package's original
+hashes remain pinned and dependency constraints are not bypassed.
+
+Removal trigger: when the matching CPU Torch constraint admits a patched
+setuptools release (currently 84.1.0), or the vendor supplies a supported backport
+fixing this advisory, pin the compatible fixed artifact and remove this one
+exception in the same reviewed change. Relaxing `<82` alone is insufficient if
+the selected version is still affected. Track that follow-up under #1510; full
+resolver and installed/native/model acceptance remain separate gates.
