@@ -37,6 +37,13 @@ import (
 // enabled but has no passcode set fails CLOSED (access denied) — enablement
 // without a passcode never silently opens the surface.
 type Permissions struct {
+	// ContainerHost is a separate owner-granted capability, never implied by Shell or Files.
+	ContainerHost bool `yaml:"container_host" json:"container_host"`
+	// Runtime is operator configuration, never a container job argument.
+	ContainerRuntime string `yaml:"container_runtime,omitempty" json:"container_runtime,omitempty"`
+	// Egress proxy is node-owned configuration, never a job or device grant value.
+	ContainerEgressProxyURL string `yaml:"container_egress_proxy_url,omitempty" json:"container_egress_proxy_url,omitempty"`
+
 	Console   bool `yaml:"console" json:"console"`     // Terminal WebSocket access (default-deny, opt-in)
 	Desktop   bool `yaml:"desktop" json:"desktop"`     // VNC, screenshots, actions (default-deny, opt-in)
 	Files     bool `yaml:"files" json:"files"`         // File browser API (default-deny, opt-in)
