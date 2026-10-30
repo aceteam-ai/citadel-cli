@@ -8,6 +8,8 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // wiredLegacyPasscodeLockout is the production config.LegacyPasscodeLockout
@@ -17,19 +19,32 @@ var wiredLegacyPasscodeLockout func() config.PasscodeAttemptLimiter
 
 // TestMain redirects the cmd credential reader/writer and passcode hooks, plus
 // default invoker-scoped config, into owned temporary paths. This is not a
-// sandbox for direct network.GetNodeConfigDir/GetStateDir or machine pointer
-// access: those fixed machine paths bypass HOME and remain outside this guard.
-// Tests that deliberately replace HOME or other selectors must still redirect
-// every relevant seam themselves. No native command execution is authorized by
+// sandbox for arbitrary paths or native operations. Network state, machine
+// pointer and platform config discovery are explicitly redirected before tests
+// run, independently of later HOME changes. Tests that need different config
+// fixtures must install their own scoped override. No native execution is authorized by
 // this setup. Legacy passcode lockout is unwired unless explicitly reinstalled.
 func TestMain(m *testing.M) {
+	// A direct init-time assignment would otherwise be overwritten by the
+	// Once below, masking its pre-fixture reads and captured paths.
+	if jobHandlers != nil {
+		fmt.Fprintln(os.Stderr, "TestMain: diagnostic registry initialized before fixture selection")
+		os.Exit(1)
+	}
 	dir, err := os.MkdirTemp("", "citadel-cmd-fixtures-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "TestMain: temp dir: %v\n", err)
 		os.Exit(1)
 	}
+	var restorePaths func() error
 	failSetup := func(err error) {
 		fmt.Fprintf(os.Stderr, "TestMain: fixture setup: %v\n", err)
+		if restorePaths != nil {
+			if restoreErr := restorePaths(); restoreErr != nil {
+				fmt.Fprintf(os.Stderr, "TestMain: path restoration: %v\n", restoreErr)
+				os.Exit(1) // Keep directories while a scope still owns them.
+			}
+		}
 		if cleanupErr := os.RemoveAll(dir); cleanupErr != nil {
 			fmt.Fprintf(os.Stderr, "TestMain: fixture cleanup: %v\n", cleanupErr)
 		}
@@ -38,11 +53,16 @@ func TestMain(m *testing.M) {
 	home := filepath.Join(dir, "home")
 	nodeDir := filepath.Join(dir, "node")
 	passcodeDir := filepath.Join(dir, "passcodes")
+	machineDir := filepath.Join(dir, "machine")
 	legacyDir := filepath.Join(home, ".citadel-cli")
-	for _, child := range []string{home, nodeDir, passcodeDir, legacyDir} {
+	for _, child := range []string{home, nodeDir, passcodeDir, machineDir, legacyDir} {
 		if err := os.MkdirAll(child, 0700); err != nil {
 			failSetup(err)
 		}
+	}
+	restorePaths, err = installCmdPathFixtures(nodeDir, machineDir, legacyDir)
+	if err != nil {
+		failSetup(err)
 	}
 	// platform.ConfigDir's root branch needs an existing HOME config; HOME
 	// alone otherwise falls through to the system-wide config directory.
@@ -76,22 +96,85 @@ func TestMain(m *testing.M) {
 			failSetup(err)
 		}
 	}
-	nodeConfigDirFn = func() string { return nodeDir }
+	nodeConfigDirFn = network.GetNodeConfigDir
 	fixStatePermissionsFn = func() {}
 	passcodeHookNodeDir = func() string { return passcodeDir }
 	wiredLegacyPasscodeLockout = config.LegacyPasscodeLockout
 	config.LegacyPasscodeLockout = nil
+	// The diagnostic registry used to read/capture host paths in init(), before
+	// TestMain. Construct it only after all path providers are installed.
+	ensureDiagnosticJobHandlers()
 	code := m.Run()
 	// Windows does not allow deleting a directory containing an open log file.
 	if err := clilog.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "TestMain: log cleanup: %v\n", err)
 		code = 1
 	}
-	if err := os.RemoveAll(dir); err != nil {
+	if err := restorePaths(); err != nil {
+		fmt.Fprintf(os.Stderr, "TestMain: path restoration: %v\n", err)
+		code = 1 // Do not remove fixtures still owned by another scope.
+	} else if err := os.RemoveAll(dir); err != nil {
 		fmt.Fprintf(os.Stderr, "TestMain: fixture cleanup: %v\n", err)
 		code = 1
 	}
 	os.Exit(code)
+}
+
+// installCmdPathFixtures changes only default path discovery, not explicit
+// paths passed by tests. The caller owns the directories and must join their
+// users, close handles, restore this scope, then delete the fixtures.
+func installCmdPathFixtures(nodeDir, machineDir, configDir string) (func() error, error) {
+	restoreNetwork, err := network.OverrideStateDirectoriesForTesting(nodeDir, machineDir)
+	if err != nil {
+		return nil, err
+	}
+	restorePlatform, err := platform.OverrideConfigDirectoryForTesting(configDir)
+	if err != nil {
+		if restoreErr := restoreNetwork(); restoreErr != nil {
+			return restoreNetwork, fmt.Errorf("platform fixture: %v; network restoration: %w", err, restoreErr)
+		}
+		return nil, err
+	}
+	return func() error {
+		if err := restorePlatform(); err != nil {
+			return err
+		}
+		return restoreNetwork()
+	}, nil
+}
+
+// useCmdFixtureHome makes a per-test HOME fixture explicit to both path
+// providers. Changing HOME alone must never disable TestMain's host guard.
+// Like t.Setenv, this helper must not be used by parallel tests.
+func useCmdFixtureHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	// Do not pre-create the production fallback home/citadel-node: manifest
+	// tests use its absence to prove an explicit node override was honored.
+	node := filepath.Join(home, "network-node-fixture")
+	machine := filepath.Join(home, "machine-config")
+	configDir := filepath.Join(home, ".citadel-cli")
+	for _, dir := range []string{node, machine, configDir} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := clilog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restore, err := installCmdPathFixtures(node, machine, configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := clilog.Close(); err != nil {
+			t.Error(err)
+		}
+		if err := restore(); err != nil {
+			t.Error(err)
+		}
+	})
 }
 
 // useWiredLegacyLockout installs the production passcode hooks against a fresh

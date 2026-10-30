@@ -101,7 +101,7 @@ func TestControlCenterPollDoesNotPersistAndAcceptedTokenUsesSandboxWriter(t *tes
 	// The writer also reads the legacy platform config for operator fields.
 	// Seed HOME's config so root resolution cannot fall through to a system path.
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 	legacy := filepath.Join(home, ".citadel-cli")
 	if err := os.MkdirAll(legacy, 0700); err != nil {
 		t.Fatal(err)
