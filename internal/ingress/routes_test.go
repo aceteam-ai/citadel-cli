@@ -49,10 +49,10 @@ func TestHostRoutesDecodeIndependentlyAndResolveExact(t *testing.T) {
 	}
 	c := NewClient(ClientConfig{Source: &fakeSource{}})
 	c.current.Store(m)
-	if got, ok := c.ResolveHost("demo.example.net"); !ok || got.MeshIP.String() != "100.64.0.21" {
+	if got, ok, fresh := c.ResolveHost("demo.example.net"); !ok || !fresh || got.MeshIP.String() != "100.64.0.21" {
 		t.Fatalf("exact host: %+v %v", got, ok)
 	}
-	if _, ok := c.ResolveHost("other.demo.example.net"); ok {
+	if _, ok, _ := c.ResolveHost("other.demo.example.net"); ok {
 		t.Fatal("wildcard host resolved")
 	}
 	if base, ok := c.HostCertBase("supabase.demo.example.net"); !ok || base != "demo.example.net" {

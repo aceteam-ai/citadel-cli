@@ -51,7 +51,7 @@ type cookieNamesCtxKey struct{}
 type hostRouteCtxKey struct{}
 
 type HostResolver interface {
-	ResolveHost(host string) (HostRoute, bool)
+	ResolveHost(host string) (HostRoute, bool, bool)
 }
 
 // Proxy is the per-request reverse proxy handler. It resolves the host to a
@@ -143,9 +143,8 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 			if hostRoute, ok := req.Context().Value(hostRouteCtxKey{}).(HostRoute); ok && hostRoute.UpstreamHost != "" {
 				req.Host = hostRoute.UpstreamHost
 			}
-			// req.Host is deliberately left as the public host so the pod sees
-			// the hostname the client used (standard ingress behavior). It is
-			// pinned by TestProxy_PreservesPublicHost.
+			// The public Host is preserved unless the admitted host route has an
+			// explicit upstream override.
 		},
 		Transport: transport,
 		// -1 flushes each write immediately so SSE and chunked streaming reach
@@ -191,8 +190,8 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := hostWithoutPort(r.Host)
 	if hosts, ok := p.resolver.(HostResolver); ok {
-		if hostRoute, found := hosts.ResolveHost(host); found {
-			p.serveHost(w, r, hostRoute)
+		if hostRoute, found, fresh := hosts.ResolveHost(host); found {
+			p.serveHost(w, r, hostRoute, fresh)
 			return
 		}
 	}
@@ -302,8 +301,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
 }
 
-func (p *Proxy) serveHost(w http.ResponseWriter, r *http.Request, hostRoute HostRoute) {
-	if !p.resolver.Fresh() {
+func (p *Proxy) serveHost(w http.ResponseWriter, r *http.Request, hostRoute HostRoute, fresh bool) {
+	if !fresh {
 		serviceUnavailable(w)
 		return
 	}

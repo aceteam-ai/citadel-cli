@@ -309,14 +309,15 @@ func decodeHostRoute(host, appsDomain string, e hostEntry) (HostRoute, bool) {
 		UpstreamHost: e.UpstreamHost, MeshIP: ip, Port: uint16(e.Port), Online: *e.Online}, true
 }
 
-// ResolveHost only consults the current map. Hosts never use slug on-miss I/O.
-func (c *Client) ResolveHost(host string) (HostRoute, bool) {
+// ResolveHost returns membership and freshness from one immutable snapshot.
+// Hosts never use slug on-miss I/O.
+func (c *Client) ResolveHost(host string) (HostRoute, bool, bool) {
 	m := c.current.Load()
 	if m == nil {
-		return HostRoute{}, false
+		return HostRoute{}, false, false
 	}
 	r, ok := m.hosts[host]
-	return r, ok
+	return r, ok, m.fresh(c.now(), c.maxAge)
 }
 
 // HostCertBase returns the mounted certificate set for a published host.

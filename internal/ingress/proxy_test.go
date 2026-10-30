@@ -128,17 +128,21 @@ func TestReservedIngressPath(t *testing.T) {
 // --- test doubles -----------------------------------------------------------
 
 type fakeResolver struct {
-	routes  map[string]Route
-	hosts   map[string]HostRoute
-	login   string
-	cookies []string
-	stale   bool // when true, Fresh() reports not-fresh (config-absent / expired)
-	err     error
+	routes    map[string]Route
+	hosts     map[string]HostRoute
+	login     string
+	cookies   []string
+	stale     bool  // when true, Fresh() reports not-fresh (config-absent / expired)
+	hostFresh *bool // may differ from Fresh when the map swaps between reads
+	err       error
 }
 
-func (f *fakeResolver) ResolveHost(host string) (HostRoute, bool) {
+func (f *fakeResolver) ResolveHost(host string) (HostRoute, bool, bool) {
 	r, ok := f.hosts[host]
-	return r, ok
+	if f.hostFresh != nil {
+		return r, ok, *f.hostFresh
+	}
+	return r, ok, !f.stale
 }
 
 func (f *fakeResolver) Resolve(_ context.Context, slug string) (Route, bool, error) {
@@ -364,6 +368,20 @@ func TestProxy_ExactHostUsesExplicitUpstreamHost(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestProxy_HostSnapshotFreshnessPreventsDial(t *testing.T) {
+	stale := false
+	res := &fakeResolver{hosts: map[string]HostRoute{"demo.example.net": {
+		Host: "demo.example.net", MeshIP: netip.MustParseAddr("100.64.0.22"), Port: 80,
+		Kind: "control_plane", Online: true,
+	}}, hostFresh: &stale}
+	ts, d := startProxy(t, res, nil, "127.0.0.1:1")
+	resp := get(t, ts, "demo.example.net", "/", nil)
+	resp.Body.Close()
+	if resp.StatusCode != 503 || atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatalf("status=%d dials=%d", resp.StatusCode, d.calls)
 	}
 }
 
