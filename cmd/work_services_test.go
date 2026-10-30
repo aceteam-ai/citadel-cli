@@ -17,7 +17,7 @@ func writeManifestWithServices(t *testing.T, services []Service) string {
 	t.Helper()
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 
 	configDir := filepath.Join(home, ".citadel-cli")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -53,7 +53,7 @@ func writeManifestWithServices(t *testing.T, services []Service) string {
 // helper returns immediately with nothing started — service startup must never
 // block or fail the worker just because no manifest exists.
 func TestStartManagedServicesNoManifest(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // isolated HOME with no global config / manifest
+	useCmdFixtureHome(t, t.TempDir()) // isolated HOME with no global config / manifest
 
 	started := startManagedServices(context.Background())
 	if started != nil {

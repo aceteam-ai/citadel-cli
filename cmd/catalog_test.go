@@ -75,7 +75,7 @@ func TestCatalogInstalledModuleNoLongerReinstallsOnRetarget(t *testing.T) {
 // minimal and intentional (no stray ref/commit/images for a catalog source).
 func TestRecordCatalogModuleLockEntryShape(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 
 	recordCatalogModuleLock("ollama", map[string]string{"K": "V"}, true, "")
 

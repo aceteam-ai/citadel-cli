@@ -468,7 +468,7 @@ func TestFindAndReadManifest_NodeDirOverride_BypassesHome(t *testing.T) {
 	// "Real" $HOME: has its own global config + manifest, deliberately never
 	// read while the override is active.
 	realHome := t.TempDir()
-	t.Setenv("HOME", realHome)
+	useCmdFixtureHome(t, realHome)
 	realConfigDir := filepath.Join(realHome, ".citadel-cli")
 	if err := os.MkdirAll(realConfigDir, 0o755); err != nil {
 		t.Fatalf("mkdir real config dir: %v", err)
@@ -576,7 +576,7 @@ func TestFindAndReadManifest_NodeDirOverride_MissingManifestErrors(t *testing.T)
 // -- an override is a one-off target, not a new permanent default.
 func TestFindOrCreateManifest_NodeDirOverride_BootstrapsThereNotHome(t *testing.T) {
 	realHome := t.TempDir()
-	t.Setenv("HOME", realHome)
+	useCmdFixtureHome(t, realHome)
 
 	overrideDir := filepath.Join(t.TempDir(), "isolated-node")
 	setNodeDirOverrideForTest(t, overrideDir)
@@ -618,7 +618,7 @@ func TestLocalServiceConfigDirRejectsAmbiguousGlobalPointer(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
-			t.Setenv("HOME", home)
+			useCmdFixtureHome(t, home)
 			t.Setenv("CITADEL_NODE_DIR", "")
 			path := filepath.Join(home, ".citadel-cli", "config.yaml")
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -648,7 +648,7 @@ func TestLocalServiceConfigDirRejectsAmbiguousGlobalPointer(t *testing.T) {
 
 func TestFindOrCreateManifestNoPointerBootstrapsDefault(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 	t.Setenv("CITADEL_NODE_DIR", "")
 	dir, err := localServiceConfigDir()
 	if err != nil || dir != filepath.Join(home, "citadel-node") {

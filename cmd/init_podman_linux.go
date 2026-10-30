@@ -17,7 +17,6 @@ import (
 )
 
 const podmanDelegateUnit = "[Service]\nDelegate=cpu memory pids\n"
-const podmanUserMarker = "/etc/citadel/rootless-worker-user"
 
 const nvidiaCDIRefreshScript = `#!/bin/sh
 set -eu
@@ -247,6 +246,7 @@ func classifyExistingPodmanWorker(
 }
 
 func ensureDedicatedPodmanUser() error {
+	markerPath := podmanUserMarkerPath()
 	owner, err := user.Lookup(podmanServiceUser)
 	created := false
 	if err != nil {
@@ -263,27 +263,41 @@ func ensureDedicatedPodmanUser() error {
 		return fmt.Errorf("lookup dedicated worker user: %w", err)
 	}
 	if created {
-		if err := os.MkdirAll(filepath.Dir(podmanUserMarker), 0755); err != nil {
+		if err := writePodmanUserMarkerAt(markerPath, owner.Uid, verifyPodmanMarkerDirAt); err != nil {
 			return err
-		}
-		if err := verifyPodmanMarkerDir(); err != nil {
-			return err
-		}
-		marker, err := os.OpenFile(podmanUserMarker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-		if err != nil {
-			return fmt.Errorf("create dedicated worker provenance marker: %w", err)
-		}
-		_, writeErr := marker.WriteString(owner.Uid + "\n")
-		closeErr := marker.Close()
-		if writeErr != nil || closeErr != nil {
-			return fmt.Errorf("record dedicated worker provenance: %v %v", writeErr, closeErr)
 		}
 	}
 	return verifyDedicatedPodmanUser(owner)
 }
 
+// The explicit path and verifier let fixtures exercise the actual exclusive
+// file write without account creation, chown, privilege repair or subprocesses.
+// Production always supplies the root-ownership/mode verifier below.
+func writePodmanUserMarkerAt(path, uid string, verifyDir func(string) error) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	if err := verifyDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	marker, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("create dedicated worker provenance marker: %w", err)
+	}
+	_, writeErr := marker.WriteString(uid + "\n")
+	closeErr := marker.Close()
+	if writeErr != nil || closeErr != nil {
+		return fmt.Errorf("record dedicated worker provenance: %v %v", writeErr, closeErr)
+	}
+	return nil
+}
+
 func verifyPodmanMarkerDir() error {
-	info, err := os.Lstat(filepath.Dir(podmanUserMarker))
+	return verifyPodmanMarkerDirAt(filepath.Dir(podmanUserMarkerPath()))
+}
+
+func verifyPodmanMarkerDirAt(dir string) error {
+	info, err := os.Lstat(dir)
 	if err != nil {
 		return fmt.Errorf("inspect dedicated worker marker directory: %w", err)
 	}
@@ -299,23 +313,12 @@ func validPodmanUserMarker(data []byte, mode os.FileMode, ownerUID uint32, expec
 }
 
 func verifyDedicatedPodmanUser(owner *user.User) error {
+	markerPath := podmanUserMarkerPath()
 	if owner.Uid == "0" || owner.HomeDir != "/home/citadel" {
 		return fmt.Errorf("dedicated %s account must be unprivileged with home /home/citadel", podmanServiceUser)
 	}
-	if err := verifyPodmanMarkerDir(); err != nil {
+	if err := verifyPodmanUserMarkerAt(markerPath, owner.Uid); err != nil {
 		return err
-	}
-	info, err := os.Lstat(podmanUserMarker)
-	if err != nil {
-		return fmt.Errorf("dedicated %s account has no trusted provisioning marker: %w", podmanServiceUser, err)
-	}
-	marker, err := os.ReadFile(podmanUserMarker)
-	if err != nil {
-		return err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !validPodmanUserMarker(marker, info.Mode(), stat.Uid, owner.Uid) {
-		return fmt.Errorf("dedicated %s account has invalid provisioning marker", podmanServiceUser)
 	}
 	groups, err := exec.Command("id", "-nG", podmanServiceUser).Output()
 	if err != nil {
@@ -338,6 +341,27 @@ func verifyDedicatedPodmanUser(owner *user.User) error {
 		}
 	} else if !isExecutableNotFound(err) {
 		return fmt.Errorf("inspect sudo availability: %w", err)
+	}
+	return nil
+}
+
+// Provenance validation is separate from the native group/sudo audit, so
+// malformed fixture tests cannot accidentally invoke real account commands.
+func verifyPodmanUserMarkerAt(path, expectedUID string) error {
+	if err := verifyPodmanMarkerDirAt(filepath.Dir(path)); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("dedicated %s account has no trusted provisioning marker: %w", podmanServiceUser, err)
+	}
+	marker, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !validPodmanUserMarker(marker, info.Mode(), stat.Uid, expectedUID) {
+		return fmt.Errorf("dedicated %s account has invalid provisioning marker", podmanServiceUser)
 	}
 	return nil
 }

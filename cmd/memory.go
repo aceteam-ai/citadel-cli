@@ -528,7 +528,7 @@ func userHomeDir() string {
 			}
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil {
+	if home, err := platform.HomeDir(""); err == nil {
 		return home
 	}
 	return os.Getenv("HOME")
