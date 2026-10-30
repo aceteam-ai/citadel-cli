@@ -34,6 +34,9 @@ func TestMain(m *testing.M) {
 				_, _ = os.Stdout.Write(bytes.Repeat([]byte("x"), MaxOutputBytes))
 			}
 		case "env-git":
+			if os.Getenv("GIT_NO_LAZY_FETCH") != "1" {
+				os.Exit(14)
+			}
 			for _, v := range os.Environ() {
 				if strings.Contains(v, "fixture-secret") {
 					os.Exit(12)
@@ -331,7 +334,7 @@ func TestChildEnvironmentAndSanitizedErrors(t *testing.T) {
 	r := request(Resolve)
 	r.Name = ""
 	r.Revision = "HEAD"
-	for _, name := range []string{"GIT_DIR", "GIT_CONFIG_COUNT", "LD_PRELOAD", "AWS_SECRET_ACCESS_KEY", "HOME"} {
+	for _, name := range []string{"GIT_DIR", "GIT_CONFIG_COUNT", "GIT_NO_LAZY_FETCH", "LD_PRELOAD", "AWS_SECRET_ACCESS_KEY", "HOME"} {
 		t.Setenv(name, "fixture-secret")
 	}
 	e.gitPath, _ = helper(t, "env-git")
