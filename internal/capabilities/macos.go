@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // detectXcode checks for Xcode installation via xcode-select and returns the
@@ -55,7 +57,7 @@ func detectAndroidSDK() string {
 		}
 	}
 	// Check default macOS paths
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := platform.UserHomeDir()
 	if err != nil {
 		return ""
 	}

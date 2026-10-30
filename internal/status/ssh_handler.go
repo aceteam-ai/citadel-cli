@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -161,7 +162,7 @@ func keyMaterial(line string) string {
 // deduplicating against existing keys. Returns counts of added, skipped,
 // and total keys in the file after the operation.
 func deploySSHKeys(keys []string) (*sshAuthorizedKeysResponse, error) {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := platform.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get home directory: %w", err)
 	}

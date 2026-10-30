@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 var durableSystemExecPath = "/usr/local/bin/citadel"
-var userHomeDirForExec = os.UserHomeDir
+var userHomeDirForExec = platform.UserHomeDir
 
 const tmpfsMagic = 0x01021994
 

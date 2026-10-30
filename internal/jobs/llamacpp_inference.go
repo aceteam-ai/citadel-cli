@@ -149,6 +149,6 @@ func getUserHomeDir() string {
 			return homeDir
 		}
 	}
-	homeDir, _ := os.UserHomeDir()
+	homeDir, _ := platform.UserHomeDir()
 	return homeDir
 }

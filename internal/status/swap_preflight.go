@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/shirou/gopsutil/v3/disk"
 	"gopkg.in/yaml.v3"
@@ -307,7 +308,7 @@ func defaultEngineWeightsPresent(name string) bool {
 var citadelCacheBaseDirFn = defaultCitadelCacheBaseDir
 
 func defaultCitadelCacheBaseDir() string {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return "citadel-cache"
 	}

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // CredentialKind discriminates the auth mechanism a Credential carries.
@@ -155,7 +157,7 @@ type FileProvider struct {
 // ~/citadel-node/credentials/. Kept separate from the catalog/config dir so the
 // node's git secrets have a single, locked-down home.
 func DefaultCredentialsDir() string {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil || home == "" {
 		// Fall back to a relative path rather than a guessable absolute one; the
 		// caller will fail to read and fall back to NoCredential.
