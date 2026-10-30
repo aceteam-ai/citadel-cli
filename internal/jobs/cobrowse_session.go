@@ -22,8 +22,11 @@ package jobs
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
@@ -50,6 +53,7 @@ const (
 	// or touch "pin" at all, since they operate on an already-running session.
 	CobrowseSessionActionNavigate   = "navigate"
 	CobrowseSessionActionScreenshot = "screenshot"
+	CobrowseSessionActionRecord     = "record"
 	CobrowseSessionActionClick      = "click"
 	CobrowseSessionActionType       = "type"
 	CobrowseSessionActionExtract    = "extract"
@@ -61,10 +65,12 @@ const (
 
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
 // CobrowseSessionManager singleton.
-type CobrowseSessionHandler struct{}
+type CobrowseSessionHandler struct{ WorkspaceDir string }
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
-func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
+func NewCobrowseSessionHandler(workspace string) *CobrowseSessionHandler {
+	return &CobrowseSessionHandler{WorkspaceDir: workspace}
+}
 
 func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	action := job.Payload["action"]
@@ -152,6 +158,57 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 			"format": "png",
 			"driver": string(st.Driver),
 			"url":    st.URL,
+		})
+		return out, nil
+
+	case CobrowseSessionActionRecord:
+		id := job.Payload["session_id"]
+		if id == "" {
+			return nil, fmt.Errorf("record requires a 'session_id' field")
+		}
+		seconds, err := strconv.Atoi(job.Payload["seconds"])
+		if err != nil || seconds < 1 || seconds > 30 {
+			return nil, fmt.Errorf("record requires 'seconds' from 1 to 30")
+		}
+		if h.WorkspaceDir == "" {
+			return nil, fmt.Errorf("record requires a configured workspace")
+		}
+		captureDir := filepath.Join(h.WorkspaceDir, "captures")
+		if err := os.MkdirAll(captureDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create capture directory: %w", err)
+		}
+		dirInfo, err := os.Lstat(captureDir)
+		if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("capture directory must be a real directory")
+		}
+		temp, err := os.CreateTemp(captureDir, ".cobrowse-*.webm")
+		if err != nil {
+			return nil, fmt.Errorf("create recording file: %w", err)
+		}
+		tempPath := temp.Name()
+		_ = temp.Close()
+		defer os.Remove(tempPath)
+		err = mgr.WithDrivablePort(id, func(port int) error {
+			return cobrowsestream.RecordWebM(ctx.Context(), port, tempPath, time.Duration(seconds)*time.Second)
+		})
+		if err != nil {
+			return nil, err
+		}
+		info, err := os.Stat(tempPath)
+		if err != nil {
+			return nil, fmt.Errorf("inspect recording: %w", err)
+		}
+		if info.Size() > 24*1024*1024 {
+			return nil, fmt.Errorf("recording exceeds the 24 MiB export limit")
+		}
+		name := strings.TrimPrefix(filepath.Base(tempPath), ".")
+		finalPath := filepath.Join(captureDir, name)
+		if err := os.Rename(tempPath, finalPath); err != nil {
+			return nil, fmt.Errorf("publish recording: %w", err)
+		}
+		out, _ := json.Marshal(map[string]any{
+			"path":   filepath.ToSlash(filepath.Join("captures", name)),
+			"format": "webm", "bytes": info.Size(), "duration_s": seconds,
 		})
 		return out, nil
 

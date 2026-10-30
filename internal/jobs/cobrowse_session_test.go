@@ -10,7 +10,7 @@ import (
 
 func runSession(t *testing.T, payload map[string]string) ([]byte, error) {
 	t.Helper()
-	h := NewCobrowseSessionHandler()
+	h := NewCobrowseSessionHandler("")
 	return h.Execute(JobContext{}, &nexus.Job{ID: "test", Type: "COBROWSE_SESSION", Payload: payload})
 }
 
@@ -86,6 +86,19 @@ func TestCobrowseSession_StopRequiresID(t *testing.T) {
 	_, err := runSession(t, map[string]string{"action": CobrowseSessionActionStop})
 	if err == nil {
 		t.Fatal("expected error when stop has no session_id")
+	}
+}
+
+func TestCobrowseSession_RecordRequiresBoundedDurationAndSession(t *testing.T) {
+	for _, payload := range []map[string]string{
+		{"action": CobrowseSessionActionRecord, "seconds": "1"},
+		{"action": CobrowseSessionActionRecord, "session_id": "cb-nope", "seconds": "0"},
+		{"action": CobrowseSessionActionRecord, "session_id": "cb-nope", "seconds": "31"},
+		{"action": CobrowseSessionActionRecord, "session_id": "cb-nope", "seconds": "NaN"},
+	} {
+		if _, err := runSession(t, payload); err == nil {
+			t.Fatalf("accepted invalid record payload: %v", payload)
+		}
 	}
 }
 
@@ -376,7 +389,7 @@ func TestCobrowseSession_PinNeverLoggedForNewActions(t *testing.T) {
 			}
 
 			var logged []string
-			h := NewCobrowseSessionHandler()
+			h := NewCobrowseSessionHandler("")
 			ctx := JobContext{LogFn: func(level, msg string) {
 				logged = append(logged, msg)
 			}}
