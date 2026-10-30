@@ -203,6 +203,13 @@ func needsSerializedLane(jobType string) bool {
 // applies. ok=false means "run unbounded" (no watchdog), preserving the exact
 // prior behavior for that path.
 func (r *Runner) resolveJobTimeout(job *Job) (time.Duration, bool) {
+	if job != nil && job.Type == JobTypeMeetingJoin {
+		_, d, ok, err := r.resolveExecutionBudget(context.Background(), r.findHandler(job.Type), job)
+		if err != nil {
+			return 0, true
+		} // refused, never an unbounded fallback
+		return d, ok
+	}
 	if d, ok := jobExecTimeout(job); ok {
 		return d, true // explicit backend budget always wins
 	}
@@ -525,6 +532,7 @@ func (r *Runner) executeWithDeadline(
 	// handler in hand, not r.handlers, so a caller that passes the handler
 	// directly (tests) resolves the same as production.
 	heavy := capabilitiesOf(handler, job.Type).Lane == jobs.LaneHeavy || job.delivery != nil
+	retainActualExit := heavy || job.Type == JobTypeMeetingJoin
 
 	type handlerResult struct {
 		result *JobResult
@@ -535,26 +543,32 @@ func (r *Runner) executeWithDeadline(
 	// blocked on the channel forever.
 	done := make(chan handlerResult, 1)
 	go func() {
-		result, err := handler.Execute(execCtx, job, stream)
+		result, err := r.executeObserved(execCtx, handler, job, stream)
 		done <- handlerResult{result: result, err: err}
 	}()
 
 	select {
 	case hr := <-done:
+		if job.Type == JobTypeMeetingJoin && errors.Is(hr.err, jobs.ErrMeetingTeardownUnconfirmed) {
+			return nil, hr.err
+		}
 		if durableSuccessDuringShutdown(job, ctx, execCtx, hr.result, hr.err) {
 			return hr.result, nil
 		}
 		if job.delivery != nil && durableShutdown(ctx, execCtx) {
 			return nil, ctx.Err()
 		}
-		return completedHandlerResult(heavy, execCtx.Err(), timeout, hr.result, hr.err)
+		return completedHandlerResult(retainActualExit, execCtx.Err(), timeout, hr.result, hr.err)
 	case <-execCtx.Done():
-		if heavy {
+		if retainActualExit {
 			// A heavy handler owns the single dispatched-writer slot until its
 			// goroutine really exits. An uncooperative handler intentionally holds
 			// this call (and runner shutdown) fail-closed rather than overlapping
 			// a second writer after an arbitrary escape timer.
 			hr := <-done
+			if job.Type == JobTypeMeetingJoin && errors.Is(hr.err, jobs.ErrMeetingTeardownUnconfirmed) {
+				return nil, hr.err
+			}
 			if durableSuccessDuringShutdown(job, ctx, execCtx, hr.result, hr.err) {
 				return hr.result, nil
 			}

@@ -256,6 +256,30 @@ func typeJS(selector, text string) string {
 //     exception comes back as a normal result, so without this a throwing click
 //     on a missing selector would masquerade as success — the worst outcome for
 //     the human tuning selectors against a live Meet.
+func cdpEvaluateContext(ctx context.Context, debugPort int, expression string) (any, error) {
+	return cdpEvalValue(cdpCommandContext(ctx, debugPort, "Runtime.evaluate", runtimeEvalParams(expression)))
+}
+
+func (b *MeetingBrowser) lockMeetingContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !b.mu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
 func cdpEvaluate(debugPort int, expression string) (any, error) {
 	return cdpEvalValue(cdpCommand(debugPort, "Runtime.evaluate", runtimeEvalParams(expression)))
 }
@@ -533,12 +557,18 @@ func (b *MeetingBrowser) ProfileDir() string {
 // whose Google session expired gets redirected to accounts.google.com instead
 // of landing on the Meet pre-join page.
 func (b *MeetingBrowser) CurrentURL() (string, error) {
-	b.mu.Lock()
+	return b.CurrentURLContext(context.Background())
+}
+
+func (b *MeetingBrowser) CurrentURLContext(ctx context.Context) (string, error) {
+	if err := b.lockMeetingContext(ctx); err != nil {
+		return "", err
+	}
 	defer b.mu.Unlock()
 	if b.cmd == nil {
 		return "", fmt.Errorf("meeting browser not started")
 	}
-	t, err := pickTarget(b.debugPort)
+	t, err := pickTargetContext(ctx, b.debugPort)
 	if err != nil {
 		return "", err
 	}
@@ -736,12 +766,18 @@ func (b *MeetingBrowser) Start() error {
 
 // Navigate drives the browser to a URL over CDP.
 func (b *MeetingBrowser) Navigate(url string) error {
-	b.mu.Lock()
+	return b.NavigateContext(context.Background(), url)
+}
+
+func (b *MeetingBrowser) NavigateContext(ctx context.Context, url string) error {
+	if err := b.lockMeetingContext(ctx); err != nil {
+		return err
+	}
 	defer b.mu.Unlock()
 	if b.cmd == nil {
 		return fmt.Errorf("meeting browser not started")
 	}
-	_, err := cdpCommand(b.debugPort, "Page.navigate", map[string]any{"url": url})
+	_, err := cdpCommandContext(ctx, b.debugPort, "Page.navigate", map[string]any{"url": url})
 	return err
 }
 
@@ -759,24 +795,36 @@ func (b *MeetingBrowser) Click(selector string) error {
 // Type sets the value of the first element matching selector, erroring if none
 // matches.
 func (b *MeetingBrowser) Type(selector, text string) error {
-	b.mu.Lock()
+	return b.TypeContext(context.Background(), selector, text)
+}
+
+func (b *MeetingBrowser) TypeContext(ctx context.Context, selector, text string) error {
+	if err := b.lockMeetingContext(ctx); err != nil {
+		return err
+	}
 	defer b.mu.Unlock()
 	if b.cmd == nil {
 		return fmt.Errorf("meeting browser not started")
 	}
-	_, err := cdpEvaluate(b.debugPort, typeJS(selector, text))
+	_, err := cdpEvaluateContext(ctx, b.debugPort, typeJS(selector, text))
 	return err
 }
 
 // Evaluate runs a JS expression and returns its by-value result. A JS throw is
 // returned as a Go error (see cdpEvaluate).
 func (b *MeetingBrowser) Evaluate(expression string) (any, error) {
-	b.mu.Lock()
+	return b.EvaluateContext(context.Background(), expression)
+}
+
+func (b *MeetingBrowser) EvaluateContext(ctx context.Context, expression string) (any, error) {
+	if err := b.lockMeetingContext(ctx); err != nil {
+		return nil, err
+	}
 	defer b.mu.Unlock()
 	if b.cmd == nil {
 		return nil, fmt.Errorf("meeting browser not started")
 	}
-	return cdpEvaluate(b.debugPort, expression)
+	return cdpEvaluateContext(ctx, b.debugPort, expression)
 }
 
 // Close tears down the browser, its Xvfb, and its throwaway profile. Safe to call

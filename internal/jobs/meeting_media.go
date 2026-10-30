@@ -402,20 +402,20 @@ func (m *containerMedia) StartContext(ctx context.Context) (*platform.CDPBrowser
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+		if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
 		}
 		return nil, err
 	}
 	br := platform.NewCDPBrowser(m.cdpPort)
 	if err := br.ReadyContext(ctx, meetingContainerCDPTimeout); err != nil {
-		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+		if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
 		}
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+		if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
 		}
 		return nil, err
@@ -437,7 +437,7 @@ func (m *containerMedia) createSessionContext(ctx context.Context) error {
 	if err != nil {
 		primary := fmt.Errorf("meetingd create session: %w", err)
 		if status == http.StatusCreated {
-			return m.cleanupAmbiguousCreatedSession(primary)
+			return m.cleanupAmbiguousCreatedSession(ctx, primary)
 		}
 		return primary
 	}
@@ -448,14 +448,14 @@ func (m *containerMedia) createSessionContext(ctx context.Context) error {
 		// deterministic id, so clear it and retry once; a DIFFERENT meeting's
 		// orphan we cannot address (meetingd has no list/clear endpoint) and it is
 		// a legitimate busy state, so we surface a clear error below.
-		if cleanupErr := m.deleteSessionContext(ctx); cleanupErr != nil {
+		if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 			return fmt.Errorf("clear stale meetingd session: %w", cleanupErr)
 		}
 		respBody, status, err = m.postJSONContext(ctx, "/sessions", body)
 		if err != nil {
 			primary := fmt.Errorf("meetingd create session (after clearing stale): %w", err)
 			if status == http.StatusCreated {
-				return m.cleanupAmbiguousCreatedSession(primary)
+				return m.cleanupAmbiguousCreatedSession(ctx, primary)
 			}
 			return primary
 		}
@@ -464,7 +464,7 @@ func (m *containerMedia) createSessionContext(ctx context.Context) error {
 	case http.StatusCreated:
 		var sr meetingSessionResponse
 		if err := json.Unmarshal(respBody, &sr); err != nil {
-			return m.cleanupAmbiguousCreatedSession(fmt.Errorf("parse meetingd session response: %w", err))
+			return m.cleanupAmbiguousCreatedSession(ctx, fmt.Errorf("parse meetingd session response: %w", err))
 		}
 		if sr.SessionID != "" {
 			m.sessionID = sr.SessionID
@@ -480,13 +480,20 @@ func (m *containerMedia) createSessionContext(ctx context.Context) error {
 	}
 }
 
-func (m *containerMedia) cleanupAmbiguousCreatedSession(primary error) error {
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), meetingContainerHTTPTimeout)
-	defer cancel()
-	if cleanupErr := m.deleteSessionContext(cleanupCtx); cleanupErr != nil {
+func (m *containerMedia) cleanupAmbiguousCreatedSession(ctx context.Context, primary error) error {
+	if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 		return fmt.Errorf("%w (session cleanup also failed: %v)", primary, cleanupErr)
 	}
 	return primary
+}
+
+func (m *containerMedia) cleanupDuringStart(ctx context.Context) error {
+	if cleanup := MeetingCleanupFrom(ctx); cleanup != nil {
+		return cleanup.Run(ctx, m.deleteSessionContext)
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), meetingContainerHTTPTimeout)
+	defer cancel()
+	return m.deleteSessionContext(cleanupCtx)
 }
 
 func (m *containerMedia) StartRecording() error {
@@ -501,7 +508,11 @@ func (m *containerMedia) StartRecording() error {
 }
 
 func (m *containerMedia) StopRecording() (string, error) {
-	respBody, status, err := m.postJSON(m.sessionPath("/record/stop"), nil)
+	return m.StopRecordingContext(context.Background())
+}
+
+func (m *containerMedia) StopRecordingContext(ctx context.Context) (string, error) {
+	respBody, status, err := m.postJSONContext(ctx, m.sessionPath("/record/stop"), nil)
 	if err != nil {
 		return m.wavAbsPath, fmt.Errorf("meetingd stop recording: %w", err)
 	}

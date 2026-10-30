@@ -2764,7 +2764,9 @@ func TestRunnerLongSessionJobDoesNotBlockOtherJobs(t *testing.T) {
 	streams := newKeyedStreamWriterFactory()
 	runner.WithStreamWriterFactory(streams.factory)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// A short caller deadline is now correctly refused before a meeting starts.
+	// This fixture has explicit per-step waits and cancels its worker at exit.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	runDone := make(chan struct{})

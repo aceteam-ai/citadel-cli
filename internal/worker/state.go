@@ -21,8 +21,10 @@ import (
 // (reads). Counters use atomics; the queue slice and string fields are guarded
 // by mu.
 type WorkerState struct {
-	mu       sync.RWMutex
-	platform platformhttp.Health
+	executionMu sync.Mutex
+	executions  map[*executionTicket]struct{}
+	mu          sync.RWMutex
+	platform    platformhttp.Health
 
 	workerID      string
 	consumerGroup string

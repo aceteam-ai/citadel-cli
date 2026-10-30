@@ -368,10 +368,10 @@ func TestResolveJobTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("long tier for a session job type", func(t *testing.T) {
+	t.Run("meeting uses its separate finite execution profile", func(t *testing.T) {
 		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeMeetingJoin})
-		if !ok || d != defaultLongJobTimeoutSeconds*time.Second {
-			t.Fatalf("got (%s, %v), want (%ds, true)", d, ok, defaultLongJobTimeoutSeconds)
+		if !ok || d != 29280*time.Second {
+			t.Fatalf("got (%s, %v), want the ratified ad hoc profile", d, ok)
 		}
 	})
 

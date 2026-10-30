@@ -23,8 +23,10 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 	"os"
 	"path/filepath"
 	"time"
@@ -54,13 +56,23 @@ const (
 // stopped. Deferred on every interactive-loop exit path. Bounded because the
 // caller's next step (the end-of-call batch transcribe) must always run — a stuck
 // final pass is contained by transcribeMu, not by blocking Execute forever here.
-func (h *MeetingJoinHandler) stopRolling(ctx JobContext, stop chan struct{}, done <-chan struct{}) {
+func (h *MeetingJoinHandler) stopRolling(ctx JobContext, stop chan struct{}, done <-chan struct{}) bool {
 	close(stop)
-	select {
-	case <-done:
-	case <-time.After(rollingShutdownGrace):
-		ctx.Log("warn", "     - rolling transcriber did not stop within %s; proceeding to batch transcribe (transcribeMu still serializes)", rollingShutdownGrace)
+	cleanup := MeetingCleanupFrom(ctx.Context())
+	if cleanup == nil {
+		cleanup = NewMeetingCleanup(time.Duration(meetingpolicy.Default().Cleanup) * time.Second)
 	}
+	err := cleanup.Run(ctx.Context(), func(c context.Context) error {
+		c, cancel := context.WithTimeout(c, rollingShutdownGrace)
+		defer cancel()
+		select {
+		case <-done:
+			return nil
+		case <-c.Done():
+			return ErrMeetingTeardownUnconfirmed
+		}
+	})
+	return err == nil
 }
 
 // meetPage is the browser surface the interactive session drives via page JS:
@@ -77,10 +89,12 @@ type meetPage interface {
 // and wake-phrase instructions). It feeds the additive fields of the MEETING_JOIN
 // result.
 type interactiveOutcome struct {
-	endReason        string
-	chat             []MeetChatMessage
-	streamedSegments int
-	recognized       []RecognizedCommand
+	disclosurePosted  bool
+	teardownUncertain bool
+	endReason         string
+	chat              []MeetChatMessage
+	streamedSegments  int
+	recognized        []RecognizedCommand
 	// notes are timestamped NOTE/ACTION entries appended by the in-call `/ace
 	// note` and `/ace action` commands, surfaced in the MEETING_JOIN result.
 	notes []string
@@ -112,17 +126,41 @@ func (h *MeetingJoinHandler) streamingWindow() time.Duration {
 // would read its own message back and immediately leave the call. Seeding
 // unconditionally means the guard is in place BEFORE the chat-post selectors are
 // live-tuned to actually work (when the echo first appears).
-func (h *MeetingJoinHandler) announceOnAdmission(ctx JobContext, page meetPage, botMessages map[string]struct{}) {
-	botMessages[normalizeChatText(meetAnnouncementText)] = struct{}{}
+func (h *MeetingJoinHandler) announceOnAdmission(ctx JobContext, page meetPage, botMessages map[string]struct{}, params ...meetingJoinParams) bool {
+	text := meetAnnouncementText
+	if len(params) > 0 {
+		text = meetingpolicy.Announcement(params[0].BotDisplayName, params[0].OwnerDisplayName)
+	}
+	botMessages[normalizeChatText(text)] = struct{}{}
 
 	if err := openMeetChat(page); err != nil {
 		ctx.Log("warn", "     - could not open Meet chat to announce (non-fatal, selector may be stale): %v", err)
 	}
-	if err := postMeetChat(page, meetAnnouncementText); err != nil {
-		ctx.Log("warn", "     - could not post self-announcement to chat (non-fatal, selector may be stale): %v", err)
-		return
+	before, readErr := readMeetChat(page)
+	lastIndex := -1
+	for _, m := range before {
+		if m.Index > lastIndex {
+			lastIndex = m.Index
+		}
 	}
-	ctx.Log("info", "     - posted self-announcement to Meet chat")
+	if err := postMeetChat(page, text); err != nil {
+		ctx.Log("warn", "     - could not post self-announcement to chat (non-fatal, selector may be stale): %v", err)
+		return false
+	}
+	if readErr != nil || ctx.Context().Err() != nil {
+		return false
+	}
+	after, err := readMeetChat(page)
+	if err != nil || ctx.Context().Err() != nil {
+		return false
+	}
+	for _, m := range after {
+		if m.Index > lastIndex && normalizeChatText(m.Text) == normalizeChatText(text) {
+			ctx.Log("info", "     - confirmed self-announcement in Meet chat")
+			return true
+		}
+	}
+	return false
 }
 
 // waitForMeetingEndInteractive runs the during-call interactive loop until the
@@ -149,7 +187,7 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 	pollInterval time.Duration,
 	botMessages map[string]struct{},
 	media MeetingMedia,
-) (interactiveOutcome, error) {
+) (out interactiveOutcome, resultErr error) {
 	segCh := make(chan TranscriptSegment, 64)
 	stop := make(chan struct{})
 	rollingDone := make(chan struct{})
@@ -189,9 +227,13 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 	// pathologically slow final pass can never wedge the terminal outcome —
 	// transcribeMu still serializes the batch transcribe for correctness if the
 	// grace trips.
-	defer h.stopRolling(ctx, stop, rollingDone)
+	defer func() {
+		if !h.stopRolling(ctx, stop, rollingDone) {
+			out.teardownUncertain = true
+		}
+	}()
 
-	out := interactiveOutcome{endReason: "max_duration_reached"}
+	out = interactiveOutcome{endReason: "max_duration_reached"}
 	seenChat := make(map[int]struct{})
 	var leaveRequested bool
 
@@ -243,10 +285,10 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 	// select below, so this degrades safely rather than false-positiving.
 	recorderDead := media.RecordingAlive()
 
-	started := time.Now()
+	started := p.recordingStart()
 	deadline := started.Add(p.maxDuration())
 	endState := meetingEndTracker{recordingStartedAt: started}
-	for time.Now().Before(deadline) {
+	for h.meetingNow().Before(deadline) {
 		// 1. Drain newly-stabilized transcript segments (non-blocking).
 		h.drainSegments(segCh, &out, transcript, handleLine)
 
@@ -306,7 +348,7 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 			ctx.Log("info", "     - meeting wait for %s cancelled (shutdown/drain): %v", p.MeetingID, err)
 			out.endReason = "cancelled"
 			return out, err
-		case <-time.After(pollInterval):
+		case <-time.After(meetingPollRemaining(deadline, h.meetingNow(), pollInterval)):
 		}
 	}
 	ctx.Log("info", "     - max meeting duration (%s) reached; leaving", p.maxDuration())
@@ -358,7 +400,9 @@ func (h *MeetingJoinHandler) drainSegments(segCh <-chan TranscriptSegment, out *
 // buffer. This is cosmetic — the STORED transcript is the untouched end-of-call
 // batch pass, and garbled text won't match an `/ace` token.
 func (h *MeetingJoinHandler) transcribeSegments(ctx JobContext, meetingID, wavPath string) ([]TranscriptSegment, error) {
-	h.transcribeMu.Lock()
+	if err := h.lockMeetingTranscriber(ctx.Context()); err != nil {
+		return nil, err
+	}
 	defer h.transcribeMu.Unlock()
 
 	transcribePath := wavPath

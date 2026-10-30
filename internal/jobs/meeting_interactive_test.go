@@ -262,7 +262,7 @@ func TestAnnounceOnAdmission_PostsAnnouncement(t *testing.T) {
 		t.Fatalf("expected exactly one chat post (the announcement), got %d", len(page.posted))
 	}
 	// The announcement text must be embedded (json-escaped) in the send JS.
-	if !strings.Contains(page.posted[0], "recording this call") {
+	if !strings.Contains(page.posted[0], "recording audio") {
 		t.Errorf("posted JS did not carry the announcement text; got: %s", page.posted[0])
 	}
 }

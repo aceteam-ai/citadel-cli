@@ -123,8 +123,10 @@ func (b *CDPBrowser) NavigateContext(ctx context.Context, rawURL string) error {
 
 // CurrentURL returns the active page's URL. The /json listing is fetched through
 // the published port (forwarded), so no ws rewrite is needed here.
-func (b *CDPBrowser) CurrentURL() (string, error) {
-	t, err := pickTarget(b.debugPort)
+func (b *CDPBrowser) CurrentURL() (string, error) { return b.CurrentURLContext(context.Background()) }
+
+func (b *CDPBrowser) CurrentURLContext(ctx context.Context) (string, error) {
+	t, err := pickTargetContext(ctx, b.debugPort)
 	if err != nil {
 		return "", err
 	}
@@ -144,7 +146,11 @@ func (b *CDPBrowser) EvaluateContext(ctx context.Context, expression string) (an
 // Type sets the value of the first element matching selector, erroring if none
 // matches (same throwing typeJS the host browser uses).
 func (b *CDPBrowser) Type(selector, text string) error {
-	_, err := cdpEvaluatePublished(b.debugPort, typeJS(selector, text))
+	return b.TypeContext(context.Background(), selector, text)
+}
+
+func (b *CDPBrowser) TypeContext(ctx context.Context, selector, text string) error {
+	_, err := cdpEvaluatePublishedContext(ctx, b.debugPort, typeJS(selector, text))
 	return err
 }
 
