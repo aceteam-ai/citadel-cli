@@ -51,17 +51,40 @@ Readiness requires authenticated local hello, exact reserved incarnation, proces
 birth, declaration revision and independently observed scope membership.
 
 The launcher uses the fixed, metadata-validated system executable
-`/usr/bin/systemd-run`, never the caller's PATH. A pre-exec failure retires its
+`/usr/bin/systemd-run`, never the caller's PATH. Hosts with systemd-run only in
+another location, including NixOS-style layouts, report `isolation_unavailable`;
+this slice supplies no alternate-path lookup or fallback. A pre-exec failure retires its
 pending reservation only after proving the same untouched reservation has no
 captured holder and the exact named scope is empty. Unknown observations,
 changed records or a positive launcher PID remain held as `starting`; a timeout
 alone never authorizes a second launch. A proven unlaunched
 `isolation_unavailable` record permits another explicit start/restart attempt.
 
+If the CLI or launcher exits while a reservation is still `starting`, Start
+does not automatically launch another holder. Recover explicitly with
+`citadel sessions stop NAME`, then `citadel sessions start NAME`; do not delete
+`state.json` by hand. For a holderless reservation, Stop must first own the
+existing operation and holder guards and prove the exact named scope entirely
+absent. It rechecks the unchanged reservation under the record lock, persists
+the stop veto, then retires that reservation without claiming log flush. A late
+holder refuses the veto or terminal phase. Unknown scope observations, a live
+owner or a changed reservation still refuse. If persistence is interrupted after
+the veto but before retirement, repeat Stop; Start cannot clear that partially
+completed holderless-start recovery. Status labels the known intermediate record
+`recovery_incomplete`; status/start/restart give the explicit Stop-then-Start
+command hint. A captured holder instead uses the existing
+exact process-birth/scope cleanup, with the same Stop-then-Start recovery.
+
 An old live holder can still be attached after a CLI update when its protocol is
 compatible. The saved record, authenticated hello and live state must corroborate
 the same holder binary identity; it need not equal the new CLI's release.
 `holder_outdated` remains an informational status, not a restart instruction.
+This slice uses protocol version 2 for the new failure phases. Version 1 and 2
+clients/holders do not attach across versions; a downgrade cannot interpret the
+new phases as a compatible live session. Prefer an explicit stop with the matching
+CLI before changing versions. A new CLI may explicitly retire only the known
+holderless `starting` record shapes from versions 1 and 2 under the same exact
+empty-scope/owner-lock/veto checks; unknown protocol records remain held.
 
 Stored PID files are observations, not signalling authority. Destructive cleanup
 uses a pinned private user-bus manager and the saved nonzero invocation ID, never
@@ -115,7 +138,12 @@ take the operator lock while a manager waits for its stop/readiness response.
 Record writes sync a private staging file, rename, then sync the directory. A
 post-rename sync failure is uncertainty, not rollback or durable success.
 Record-lock contention gets a bounded retry rather than being mistaken for
-corrupt storage. Console writes are batched within fixed memory/time ceilings;
+corrupt storage. Initial holder publication retains the five-second acquisition
+budget because it is fatal on failure and may race the manager's launch record.
+Only after that publication, before sharing the handle, actor record writes use
+at most 50 ms to acquire the lock and retain exact pending data for retry on busy.
+Ordinary manager record operations retain the five-second budget. This bounds only
+lock contention, not filesystem open, write or fsync latency. Console writes are batched within fixed memory/time ceilings;
 normal terminal completion still waits for pending logs/events and final state
 to be durably published. An uncertain append is not automatically replayed.
 
@@ -139,7 +167,7 @@ SIGKILL, power loss and other uncatchable termination cannot restore shared
 termios state, so native interruption acceptance remains required.
 
 Output is event-driven with a bounded ready-frame burst, not limited to one frame
-per stdin poll. A holder-side EOF, operation refusal or slow-viewer disconnect is
+per stdin poll. A holder-side EOF, fatal operation refusal or slow-viewer disconnect is
 a nonzero client result. Diagnostic reasons come from a fixed allowlist and never
 reflect arbitrary peer text or terminal bytes. Explicit local detach remains a
 successful viewer-only action.
@@ -149,6 +177,19 @@ output chunks are retained within the ring budget. Each viewer has a bounded
 queue; a slow viewer is disconnected without blocking the harness. Controller
 transfer fences queued/in-flight old input before a new grant. Resize requests
 and input are checked against current controller and child generation.
+If a valid input or resize frame loses its controller grant, arrives during
+restart wait, only that role-refused frame is
+dropped. The attachment remains connected for output, role changes and heartbeat;
+the frame is not acknowledged, queued for replay or automatically retried. A
+busy input/resize queue instead disconnects with the static `busy` reason: the
+same connection cannot forward later paste chunks after dropping a middle chunk.
+This does not add delivery acknowledgements or make prior queued bytes atomic.
+A locally discarded input displays one static read-only notice per read-only
+period, even when no role event was sent. A writable role resets the notice;
+the ordinary read-only-to-writable grant sequence does not display it.
+A refused take-control operation, malformed frame, stopped holder or slow viewer
+keeps the existing disconnect behavior. Real role-transfer and saturated-paste
+behavior still require native acceptance.
 Child cleanup revokes every viewer to read-only. S1 does not implicitly restore
 a controller after a child restart; an eligible operator can detach and explicitly
 reattach with `--take-control` to obtain a fresh-generation grant.
@@ -160,6 +201,11 @@ they never authorize another writer or an automatic replacement.
 An explicit local stop/restart can recover an authenticated quarantined holder
 through its saved exact invocation scope. This forced path is labelled
 `forced_cleanup_no_flush`, not a graceful completion or proof of log durability.
+Status uses `cleanup_unconfirmed` for uncertain child cleanup, `spawn_failed`
+for a failed automatic respawn with no child, and `event_queue_overflow` for
+exhausted pending event capacity. All three retain quarantine and custody; none
+authorizes automatic relaunch or a graceful flush acknowledgement. The explicit
+manager recovery path remains exact-scope cleanup with no flush claim.
 
 Raw `console.log` is sensitive local history. `events.jsonl` accepts finite
 lifecycle fields and static reasons, not console text or arbitrary errors.

@@ -1165,8 +1165,9 @@ func TestRunnerUnsupportedJobTypePublishesTerminalError(t *testing.T) {
 		t.Fatal("expected a non-nil error on the published terminal event")
 	}
 	msg := stream.erroredErr.Error()
-	if !strings.Contains(msg, "COBROWSE") || !strings.Contains(msg, "v2.46.0") {
-		t.Errorf("error message = %q, want it to mention the job type and node version", msg)
+	var refusal *jobhandlers.ShellRefusal
+	if !errors.As(stream.erroredErr, &refusal) || refusal.Reason != "handler_unavailable" || strings.Contains(msg, "update the node") {
+		t.Errorf("known COBROWSE without a handler must be a typed unavailable refusal: %q", msg)
 	}
 	if stream.ended {
 		t.Error("WriteEnd should not be called for an unsupported job type")

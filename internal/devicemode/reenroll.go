@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // ReenrollResult is the reenroll service's success payload.
@@ -70,6 +71,8 @@ func reenrollWithRoots(
 			},
 		},
 	}
+	client = platformhttp.WithTransport(reenrollURL, client)
+	defer client.CloseIdleConnections()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reenrollURL, nil)
 	if err != nil {

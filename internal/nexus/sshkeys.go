@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 const (
@@ -57,7 +58,8 @@ func NewSSHKeysClient(baseURL string) *SSHKeysClient {
 	return &SSHKeysClient{
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: platformhttp.New(baseURL, platformhttp.Options{}),
 		},
 	}
 }

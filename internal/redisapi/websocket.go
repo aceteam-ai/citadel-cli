@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/gorilla/websocket"
 )
 
@@ -31,6 +32,10 @@ type WSClient struct {
 	// pongWait to decide whether the connection PROVED itself before it died --
 	// see the #746 note on reconnectBackoff below. Zero when conn is nil.
 	connEstablishedAt time.Time
+	// Protected by connMu. Expiry uses the existing disconnect/reconnect funnel,
+	// so subscriptions, single-reader ownership and retry policy stay intact.
+	connectionAgeTimer *time.Timer
+	maxConnectionAge   time.Duration
 
 	// writeMu serializes gorilla "write methods" (WriteMessage,
 	// SetWriteDeadline) on conn. gorilla supports exactly ONE concurrent
@@ -257,6 +262,7 @@ func NewWSClient(cfg WSClientConfig) *WSClient {
 		writeTimeout:     defaultWriteTimeout,
 		pingInterval:     defaultPingInterval,
 		pongWait:         defaultPongWait,
+		maxConnectionAge: platformhttp.MaxConnectionAge,
 		jitterFrac:       rand.Float64,
 		debugFunc:        cfg.DebugFunc,
 	}
@@ -274,6 +280,11 @@ func (c *WSClient) Connect(ctx context.Context) error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
+	select {
+	case <-c.done:
+		return ErrClientClosed
+	default:
+	}
 	if c.connected {
 		return nil
 	}
@@ -293,6 +304,11 @@ func (c *WSClient) Connect(ctx context.Context) error {
 
 // connectLocked establishes connection (caller must hold connMu lock)
 func (c *WSClient) connectLocked(ctx context.Context) error {
+	select {
+	case <-c.done:
+		return ErrClientClosed
+	default:
+	}
 	// Convert HTTP URL to WebSocket URL
 	wsURL, err := c.getWSURL()
 	if err != nil {
@@ -325,6 +341,14 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 		}
 		return fmt.Errorf("WebSocket connection failed: %w", err)
 	}
+	// Close publishes done before waiting for connMu; never publish a dial that
+	// completed after shutdown began, even when the handshake itself succeeded.
+	select {
+	case <-c.done:
+		_ = conn.Close()
+		return ErrClientClosed
+	default:
+	}
 
 	// Arm the keepalive BEFORE publishing the connection (#734).
 	//
@@ -346,8 +370,23 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 	// assignment safe against nextReconnectDelay running in a reconnect
 	// goroutine (#728).
 	c.connEstablishedAt = time.Now()
+	if c.connectionAgeTimer != nil {
+		c.connectionAgeTimer.Stop()
+	}
+	if c.maxConnectionAge > 0 {
+		c.connectionAgeTimer = time.AfterFunc(c.maxConnectionAge, func() {
+			c.connMu.RLock()
+			current := c.connected && c.conn == conn
+			c.connMu.RUnlock()
+			if current {
+				platformhttp.LogRedial("websocket_max_connection_age", conn.RemoteAddr())
+				c.debug("ws: re-dialing remote_ip=%s reason=max_connection_age", platformhttp.RemoteIP(conn.RemoteAddr()))
+				c.handleDisconnect(conn)
+			}
+		})
+	}
 
-	c.debug("ws: connected successfully")
+	c.debug("ws: connected successfully remote_ip=%s reason=fresh_dial", platformhttp.RemoteIP(conn.RemoteAddr()))
 
 	// Restore subscriptions if any
 	c.subscriptionsMu.RLock()
@@ -561,6 +600,10 @@ func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 		return
 	}
 	c.connected = false
+	if c.connectionAgeTimer != nil {
+		c.connectionAgeTimer.Stop()
+		c.connectionAgeTimer = nil
+	}
 	if c.conn != nil {
 		// #746: reset the backoff schedule here, on teardown, and only for a
 		// connection that PROVED itself -- never unconditionally on dial
@@ -1089,6 +1132,10 @@ func (c *WSClient) Close() error {
 	defer c.connMu.Unlock()
 
 	c.connected = false
+	if c.connectionAgeTimer != nil {
+		c.connectionAgeTimer.Stop()
+		c.connectionAgeTimer = nil
+	}
 	if c.conn != nil {
 		// Bound the close-handshake write: WriteMessage has no deadline by
 		// default, so on a half-dead connection (e.g. after macOS sleep or a

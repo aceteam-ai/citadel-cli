@@ -119,15 +119,9 @@ func (c *Client) SetJobProgress(ctx context.Context, jobID string, event map[str
 
 // doRequestWithTimeout is like doRequest but with a custom timeout.
 func (c *Client) doRequestWithTimeout(ctx context.Context, method, path string, body any, result any, timeout time.Duration) error {
-	// Create a new HTTP client with custom timeout for this request
-	client := &http.Client{
-		Timeout: timeout,
-	}
-
-	// Temporarily swap the client
-	origClient := c.httpClient
-	c.httpClient = client
-	defer func() { c.httpClient = origClient }()
-
-	return c.doRequest(ctx, method, path, body, result)
+	// A value copy preserves the same bounded transport and redirect/auth
+	// policy, without racing other requests by replacing c.httpClient.
+	client := *c.httpClient
+	client.Timeout = timeout
+	return c.doRequestWithClient(&client, ctx, method, path, body, result)
 }
