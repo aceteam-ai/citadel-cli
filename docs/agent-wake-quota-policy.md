@@ -152,6 +152,10 @@ the same revision are alternatives, not two reservations. This package has no
 CAS or persistence implementation and cannot prove process-exit custody,
 clock continuity, storage rollback resistance or exactly-once launch.
 
+The [atomic reservation proposal](agent-wake-atomic-reservation.md) scopes a
+possible pure composition slice for independent review. It changes none of
+these models and authorizes no transaction, adapter or activation.
+
 The resource model proposed in DRAFT #1453 is not a dependency or import here.
 Future quota/resource composition must use one outer host/pool envelope and
 one atomic commit of both decisions, not separate per-lane stores or sequential
