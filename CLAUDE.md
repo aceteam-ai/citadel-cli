@@ -648,6 +648,11 @@ delivery too (one error event, then Fail with the reason): SHELL_COMMAND, the
 desktop handlers, and WORKFLOW_RUN when its Shell gate refuses at submit. A
 Shell node refused mid-run fails the workflow as an ordinary failure.
 
+Files/Desktop permission refusals retain static tool names and enable/confirm
+hints, including the direct `FILE_WRITE_BYTES` classifier. `MEETING_JOIN` and
+`HUDDLE_JOIN` share one live meeting gate for dispatch and refusal; re-enabling
+joins does not rebuild handlers or remove exact-attempt huddle teardown.
+
 `workflow.Executor.Cancel` owns per-run context cancellation; a cancelled
 status records the request, not proof that a Shell process or callback exited.
 `Execution.Done` supplies executor/slot completion, which the workflow handler

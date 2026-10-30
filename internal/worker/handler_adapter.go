@@ -376,6 +376,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	if goos == "" {
 		goos = runtime.GOOS
 	}
+	meetingEnabled := opts.MeetingEnabled
+	if meetingEnabled == nil {
+		meetingEnabled = func() bool {
+			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
+		}
+	}
 
 	// Embedding handler as fail-closed dispatched work when a signer is wired
 	// (aceteam#10876 C7). Without a signer (legacy/diagnostic paths) it stays
@@ -605,15 +611,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// per-meeting null sink, then transcribes it via the handler above. Needs
 		// the workspace both to write the recording and to validate the audio path
 		// for transcription, so it lives inside this workspace gate. Gated on the
-		// persisted meeting toggle (default-on, the house opt-out convention) so
-		// the handler registers unless the operator has explicitly opted out —
-		// matching the `meeting` capability advertisement gate in
-		// internal/capabilities.
-		if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
-			handlers = append(handlers,
-				NewLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts)),
-			)
-		}
+		// live meeting toggle shared with HUDDLE_JOIN and registration refusals.
+		// Retain the adapter while disabled so enabling new joins does not need
+		// a worker restart; CanHandle and Execute both recheck the same gate.
+		handlers = append(handlers,
+			newGatedLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts), meetingEnabled),
+		)
 	}
 
 	// Native-huddle agent join (aceteam#7081). Part of the SAME default-on meeting
@@ -628,12 +631,6 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	huddleHandler := jobs.NewHuddleJoinHandler(opts.WorkspaceDir)
 	huddleTeardown := NewLegacyHandlerAdapter(JobTypeHuddleTeardown, huddleHandler)
 	huddleTeardown.backgroundOwner = false
-	meetingEnabled := opts.MeetingEnabled
-	if meetingEnabled == nil {
-		meetingEnabled = func() bool {
-			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
-		}
-	}
 	handlers = append(handlers,
 		newGatedLegacyHandlerAdapter(JobTypeHuddleJoin, huddleHandler, meetingEnabled),
 		huddleTeardown,
