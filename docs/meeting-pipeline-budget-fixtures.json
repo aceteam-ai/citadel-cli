@@ -1,0 +1,44 @@
+{
+  "purpose": "Ratified numeric test fixtures for #1505 / aceteam#12965; not wire fields or a source-expiry protocol.",
+  "decision": "https://github.com/aceteam-ai/citadel-cli/issues/1505#issuecomment-6525494676",
+  "phases_seconds": {
+    "setup": 120,
+    "admission_default": 180,
+    "admission_max": 600,
+    "recording_default": 14400,
+    "recording_min": 60,
+    "recording_max": 21600,
+    "transcription": 14400,
+    "cleanup_total": 180,
+    "preclaim_queue": 300,
+    "claim_handoff": 30,
+    "stuck_recovery": 300,
+    "final_receipt": 60
+  },
+  "cases": [
+    {
+      "name": "default_adhoc",
+      "admission_seconds": 180,
+      "recording_seconds": 14400,
+      "execution_seconds": 29280,
+      "stuck_after_seconds": 29580,
+      "producer_wait_seconds": 29970
+    },
+    {
+      "name": "scheduled_default",
+      "admission_seconds": 600,
+      "recording_seconds": 14400,
+      "execution_seconds": 29700,
+      "stuck_after_seconds": 30000,
+      "producer_wait_seconds": 30390
+    },
+    {
+      "name": "scheduled_maximum",
+      "admission_seconds": 600,
+      "recording_seconds": 21600,
+      "execution_seconds": 36900,
+      "stuck_after_seconds": 37200,
+      "producer_wait_seconds": 37590
+    }
+  ]
+}

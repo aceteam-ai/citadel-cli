@@ -24,6 +24,7 @@
 package jobs
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -196,10 +197,16 @@ var teamsContinueWithoutAudioLabels = []string{
 // join and admission are fatal. Selectors VERIFIED against a live light-meetings
 // anon join (2026-08-01) — see the VERIFIED block above.
 func (h *MeetingJoinHandler) runTeamsJoinFlow(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
+	parentCtx, rawBrowser := ctx, br
+	ctx, cancel := setupMeetingContext(ctx, p)
+	defer cancel()
+	br = phaseMeetingBrowser{meetingBrowser: br, ctx: ctx.Context()}
 	if err := br.Navigate(p.MeetingURL); err != nil {
 		return fmt.Errorf("navigate to teams meeting url: %w", err)
 	}
-	time.Sleep(teamsPageSettle)
+	if err := meetingSleep(ctx.Context(), teamsPageSettle); err != nil {
+		return err
+	}
 
 	// Fatal: the Teams meeting is refusing an anonymous/guest web join and has
 	// redirected to a Microsoft sign-in wall (login.microsoftonline.com). The
@@ -227,7 +234,7 @@ func (h *MeetingJoinHandler) runTeamsJoinFlow(ctx JobContext, br meetingBrowser,
 	}
 
 	// Fatal: wait until admitted (in-call toolbar appears) or the lobby timeout.
-	return h.waitUntilTeamsAdmitted(ctx, br, p)
+	return h.waitUntilTeamsAdmitted(parentCtx, rawBrowser, p)
 }
 
 // pollForTeamsJoinClick repeatedly (1) checks whether the bot is already in-call,
@@ -318,6 +325,9 @@ func pollForTeamsJoinClick(ctx JobContext, page joinPage, botDisplayName, passco
 func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
 	timeout := p.admissionTimeout()
 	deadline := time.Now().Add(timeout)
+	probeCtx, cancel := context.WithDeadline(ctx.Context(), deadline)
+	defer cancel()
+	br = phaseMeetingBrowser{meetingBrowser: br, ctx: probeCtx}
 	for time.Now().Before(deadline) {
 		// Best-effort: dismiss the "Are you sure you don't want audio or video?"
 		// confirmation Teams raises right after "Join now" on a device-less bot —

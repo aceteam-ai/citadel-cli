@@ -2883,6 +2883,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// shared workerState and, on a clear loss of forward progress, exits non-zero
 	// so systemd restarts the process clean. No-op if disabled (WORKER_SELF_HEAL).
 	if monitor := worker.NewLivenessMonitor(workerState, runner.IsDraining, func(level, msg string) { Log("%s", msg) }); monitor != nil {
+		monitor.SetRestartFence(runner.FenceIntakeForRecovery)
 		bindWorkPlatformRecovery(useAPIMode, monitor, platformRedials, runner.TryIdleRestart)
 		go monitor.Run(ctx)
 	}

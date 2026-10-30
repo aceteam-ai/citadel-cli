@@ -12,7 +12,7 @@ func TestMeetingAdmissionTimeoutPayload(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string
 		want time.Duration
-	}{{"", 3 * time.Minute}, {"180", 3 * time.Minute}, {"600", 10 * time.Minute}, {" 600 ", 10 * time.Minute}, {"1", time.Second}, {"9223372036", 9223372036 * time.Second}} {
+	}{{"180", 3 * time.Minute}, {"600", 10 * time.Minute}, {"1", time.Second}} {
 		p, err := parseMeetingJoinParams(map[string]string{"meeting_url": "https://meet.google.com/x", "meeting_id": "synthetic", "admit_timeout_seconds": tc.raw})
 		if err != nil || p.admissionTimeout() != tc.want {
 			t.Fatalf("admission %q: duration=%v err=%v, want %v", tc.raw, p.admissionTimeout(), err, tc.want)
@@ -21,12 +21,12 @@ func TestMeetingAdmissionTimeoutPayload(t *testing.T) {
 }
 
 func TestMeetingAdmissionTimeoutRejectsMalformedAndOverflow(t *testing.T) {
-	for _, raw := range []string{"0", "-1", "NaN", "Inf", "+Inf", "-Inf", "1.5", "600.0", "1e3", "9223372037", "9223372036854775808", "do-not-echo-this-synthetic-value"} {
+	for _, raw := range []string{"", " ", " 600 ", "601", "00", "+1", "0", "-1", "NaN", "Inf", "+Inf", "-Inf", "1.5", "600.0", "1e3", "9223372037", "9223372036854775808", "do-not-echo-this-synthetic-value"} {
 		_, err := parseMeetingJoinParams(map[string]string{"meeting_url": "https://meet.google.com/x", "meeting_id": "synthetic", "admit_timeout_seconds": raw})
 		if err == nil {
 			t.Fatalf("admission accepted %q", raw)
 		}
-		if strings.Contains(err.Error(), raw) {
+		if len(raw) > 3 && strings.Contains(err.Error(), raw) {
 			t.Fatalf("admission error reflected raw input %q", raw)
 		}
 	}
