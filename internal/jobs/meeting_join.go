@@ -325,7 +325,8 @@ type meetingJoinParams struct {
 	MeetingURL         string
 	MeetingID          string
 	BotDisplayName     string
-	MaxDurationSeconds int // 0 means "unset"; the handler applies defaultMeetingMaxDuration
+	MaxDurationSeconds int           // 0 means "unset"; the handler applies defaultMeetingMaxDuration
+	AdmitTimeout       time.Duration // 0 keeps the existing three-minute admission wait
 	// Platform is the conferencing platform detected from MeetingURL. Selects
 	// the pre-join flow in runJoinFlow.
 	Platform meetingPlatform
@@ -374,7 +375,31 @@ func parseMeetingJoinParams(payload map[string]string) (meetingJoinParams, error
 		}
 		p.MaxDurationSeconds = secs
 	}
+	if raw := strings.TrimSpace(payload["admit_timeout_seconds"]); raw != "" {
+		// The paired producer sends whole seconds encoded as a string. Check
+		// representability before multiplication; the parent job deadline remains
+		// authoritative and is never extended by this admission-only budget.
+		seconds, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || seconds <= 0 || seconds > int64((1<<63-1)/time.Second) {
+			return meetingJoinParams{}, fmt.Errorf("invalid 'admit_timeout_seconds': positive, representable whole seconds required")
+		}
+		p.AdmitTimeout = time.Duration(seconds) * time.Second
+	}
 	return p, nil
+}
+
+func (p meetingJoinParams) admissionTimeout() time.Duration {
+	if p.AdmitTimeout > 0 {
+		return p.AdmitTimeout
+	}
+	return admitTimeout
+}
+
+func meetingAdmissionPollDelay(deadline time.Time) time.Duration {
+	if remaining := time.Until(deadline); remaining < meetingPollInterval {
+		return remaining
+	}
+	return meetingPollInterval
 }
 
 // parsePositiveSeconds parses a duration-in-seconds field that may arrive as an
@@ -911,10 +936,17 @@ func pollForJoinClick(ctx JobContext, page joinPage, botDisplayName string, time
 // admitTimeout — the caller's deferred media.Close() then tears down the
 // browser/Xvfb/sink instead of leaking them to a SIGKILL.
 func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
-	deadline := time.Now().Add(admitTimeout)
+	timeout := p.admissionTimeout()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if v, err := br.Evaluate(meetIsAdmittedJS); err == nil {
 			if b, ok := v.(bool); ok && b {
+				if err := ctx.Context().Err(); err != nil {
+					return fmt.Errorf("meeting cancelled while waiting for admission: %w", err)
+				}
+				if !time.Now().Before(deadline) {
+					break
+				}
 				ctx.Log("info", "     - admitted to meeting %s", p.MeetingID)
 				return nil
 			}
@@ -926,10 +958,10 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 			err := fmt.Errorf("meeting cancelled while waiting for admission: %w", ctx.Context().Err())
 			ctx.Log("info", "     - admission wait for meeting %s cancelled (shutdown/drain): %v", p.MeetingID, err)
 			return err
-		case <-time.After(meetingPollInterval):
+		case <-time.After(meetingAdmissionPollDelay(deadline)):
 		}
 	}
-	return fmt.Errorf("not admitted to meeting within %s (host did not let the bot in, or admission selector is stale)", admitTimeout)
+	return fmt.Errorf("not admitted to meeting within %s (host did not let the bot in, or admission selector is stale)", timeout)
 }
 
 // waitForMeetingEnd blocks until the call ends (end heuristic true, or the bot is

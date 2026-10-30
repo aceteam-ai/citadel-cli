@@ -316,7 +316,8 @@ func pollForTeamsJoinClick(ctx JobContext, page joinPage, botDisplayName, passco
 // in-call, the lobby timeout elapses, or the job context is cancelled (worker
 // shutdown/drain, citadel#488 — mirrors waitUntilAdmitted for Meet).
 func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
-	deadline := time.Now().Add(admitTimeout)
+	timeout := p.admissionTimeout()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		// Best-effort: dismiss the "Are you sure you don't want audio or video?"
 		// confirmation Teams raises right after "Join now" on a device-less bot —
@@ -326,6 +327,12 @@ func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBr
 		}
 		if v, err := br.Evaluate(teamsIsAdmittedJS); err == nil {
 			if b, ok := v.(bool); ok && b {
+				if err := ctx.Context().Err(); err != nil {
+					return fmt.Errorf("Teams meeting cancelled while waiting for admission: %w", err)
+				}
+				if !time.Now().Before(deadline) {
+					break
+				}
 				ctx.Log("info", "     - admitted to Teams meeting %s", p.MeetingID)
 				return nil
 			}
@@ -337,10 +344,10 @@ func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBr
 			err := fmt.Errorf("Teams meeting cancelled while waiting for admission: %w", ctx.Context().Err())
 			ctx.Log("info", "     - admission wait for Teams meeting %s cancelled (shutdown/drain): %v", p.MeetingID, err)
 			return err
-		case <-time.After(meetingPollInterval):
+		case <-time.After(meetingAdmissionPollDelay(deadline)):
 		}
 	}
-	return fmt.Errorf("not admitted to Teams meeting within %s (host did not let the bot in, or the admission selector is stale — re-tune teamsIsAdmittedJS)", admitTimeout)
+	return fmt.Errorf("not admitted to Teams meeting within %s (host did not let the bot in, or the admission selector is stale; re-tune teamsIsAdmittedJS)", timeout)
 }
 
 // checkTeamsMeetingEnded runs the Teams end heuristic (the "you left / removed /
