@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // Fixed, citadel-owned LOCAL paths (relative to the node owner's home) that the
@@ -33,7 +35,7 @@ func ConfigDir() (string, error) { return homeJoin(localConfigRel) }
 func MediaDir() (string, error) { return homeJoin(localMediaRel) }
 
 func homeJoin(rel string) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("nvr: resolve home dir: %w", err)
 	}

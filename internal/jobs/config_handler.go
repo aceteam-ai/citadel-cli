@@ -220,7 +220,7 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	// worker entry points must always pass the resolved directory.
 	configDir := h.ConfigDir
 	if configDir == "" {
-		homeDir, err := os.UserHomeDir()
+		homeDir, err := platform.UserHomeDir()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get home directory: %w", err)
 		}

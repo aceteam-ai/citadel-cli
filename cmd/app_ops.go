@@ -52,7 +52,7 @@ var (
 // the runner is otherwise stateless, so one instance is shared.
 func appPodRunner() *jobs.AppPodRunner {
 	appRunnerOnce.Do(func() {
-		homeDir, _ := os.UserHomeDir()
+		homeDir, _ := platform.HomeDir("")
 		appRunnerRef = jobs.NewAppPodRunner(catalog.SelectContainerRuntime(), homeDir, Log)
 	})
 	return appRunnerRef

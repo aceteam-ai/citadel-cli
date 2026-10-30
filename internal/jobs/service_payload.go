@@ -463,7 +463,7 @@ func sortedKeys(m map[string]string) []string {
 // extended SERVICE_START payload and records it in the instance store so
 // SERVICE_STOP / SERVICE_STATUS can find it later.
 func (h *ServiceHandler) serviceStartPayload(ctx JobContext, job *nexus.Job) ([]byte, error) {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := platform.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("cannot resolve home directory for payload launch: %w", err)
 	}

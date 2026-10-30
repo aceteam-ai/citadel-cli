@@ -43,6 +43,11 @@ const machineStatePointerFile = "state-dir"
 //  4. Fresh fallback: the owner-consistent home path (SUDO_USER-resolved home,
 //     NOT the invoker's $HOME).
 func GetStateDir() string {
+	// Check before constructing inputs: production discovery performs I/O even
+	// when resolveStateDir would subsequently choose a different input.
+	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+		return filepath.Join(fixture.node, "network")
+	}
 	return resolveStateDir(stateDirInputs{
 		pointerDir:        readMachineStatePointer(),
 		configNodeDir:     getNodeConfigDirFromGlobalConfig(),
@@ -270,13 +275,13 @@ func getUserHomeDir() string {
 		if v := os.Getenv("APPDATA"); v != "" {
 			return v
 		}
-		if home, err := os.UserHomeDir(); err == nil {
+		if home, err := platform.UserHomeDir(); err == nil {
 			return home
 		}
 		return os.Getenv("USERPROFILE")
 	}
 
-	baseDir, err := os.UserHomeDir()
+	baseDir, err := platform.UserHomeDir()
 	if err != nil {
 		baseDir = os.Getenv("HOME")
 	}
@@ -294,6 +299,9 @@ func getUserHomeDir() string {
 // init writes) resolves to ~/.citadel-cli when non-root, which the machine-wide
 // /etc/citadel read alone would miss — a source of the state-dir divergence.
 func getNodeConfigDirFromGlobalConfig() string {
+	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+		return fixture.node
+	}
 	candidates := []string{
 		filepath.Join(getGlobalConfigDirForState(), "config.yaml"),
 	}
@@ -341,6 +349,9 @@ func candidateOwnerHomes() []string {
 
 // getGlobalConfigDirForState returns the global config directory path
 func getGlobalConfigDirForState() string {
+	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+		return fixture.machine
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return "/usr/local/etc/citadel"
@@ -449,6 +460,11 @@ func resolveChownTargetWith(currentUID int, sudoUser string, lookupFn func(strin
 // because the parent may also have been created by root and the non-root user
 // needs traverse permission (the dir is mode 0700).
 func fixStateDirOwnership(stateDir string) {
+	// Fixture ownership belongs to the test invoker. Do not resolve/chown to a
+	// real service account when a root-run test creates disposable state.
+	if stateDirectoriesForTests.Load() != nil {
+		return
+	}
 	uid, gid, ok := resolveChownTarget()
 	if !ok {
 		return
