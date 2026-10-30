@@ -1871,9 +1871,40 @@ func ccGetConfiguredServices() []string {
 // ccStartDeviceAuthFlow starts the device authorization flow and returns the config
 func ccStartDeviceAuthFlow() (*controlcenter.DeviceAuthConfig, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
-	return ccStartDeviceAuthFlowWith(func() (*nexus.DeviceCodeResponse, error) {
-		return client.StartFlow(nil)
-	}, time.Now)
+	return ccStartDeviceAuthIdentityFlowWith(func() (*nexus.DeviceCodeResponse, error) { return client.StartFlow(nil) }, time.Now, client.CheckTokenWithCSR,
+		func(token *nexus.TokenResponse, code, uid string) error {
+			return ccAcceptDeviceTokenWith(token, code, saveDeviceConfigToFile, func(accepted *nexus.TokenResponse, grant string) error {
+				return ccRegisterDeviceTokenAs(accepted, grant, uid)
+			})
+		})
+}
+
+func ccStartDeviceAuthIdentityFlowWith(start func() (*nexus.DeviceCodeResponse, error), now func() time.Time,
+	check func(string, string) (*nexus.TokenResponse, error), connect func(*nexus.TokenResponse, string, string) error) (*controlcenter.DeviceAuthConfig, error) {
+	if check == nil || connect == nil {
+		return nil, errors.New("device identity authorization is unavailable")
+	}
+	config, err := ccStartDeviceAuthFlowWith(start, now)
+	if err != nil {
+		return nil, err
+	}
+	if config.DeviceCode == "" {
+		return nil, errors.New("device authorization grant is missing")
+	}
+	attempt := prepareDeviceAuthIdentity()
+	grant := config.DeviceCode
+	poll := nexus.NewCSRTokenPoller(grant, attempt.csr, check)
+	config.PollToken = func(code string, _ int) (*nexus.TokenResponse, error) { return ccPollDeviceAuthTokenWith(code, poll) }
+	config.Connect = func(token *nexus.TokenResponse, code string) error {
+		// The UI admits this callback only after its current/expiry/cancel fence.
+		if token == nil || token.Authkey == "" || code != grant || connect == nil {
+			return errors.New("current device authorization is missing")
+		}
+		accepted := *token
+		uid := attempt.accept(&accepted)
+		return connect(&accepted, code, uid)
+	}
+	return config, nil
 }
 
 func ccStartDeviceAuthFlowWith(start func() (*nexus.DeviceCodeResponse, error), now func() time.Time) (*controlcenter.DeviceAuthConfig, error) {
@@ -1981,6 +2012,10 @@ func ccAcceptDeviceTokenWith(token *nexus.TokenResponse, deviceCode string, save
 }
 
 func ccRegisterDeviceToken(token *nexus.TokenResponse, deviceCode string) error {
+	return ccRegisterDeviceTokenAs(token, deviceCode, "")
+}
+
+func ccRegisterDeviceTokenAs(token *nexus.TokenResponse, deviceCode, identityNodeUID string) error {
 	// Get node name from manifest or hostname
 	nodeName := ""
 	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
@@ -1994,7 +2029,7 @@ func ccRegisterDeviceToken(token *nexus.TokenResponse, deviceCode string) error 
 	defer cancel()
 
 	config := network.ServerConfig{
-		Hostname:   nodeName,
+		Hostname:   servingIdentityHostname(identityNodeUID, nodeName),
 		ControlURL: nexusURL,
 		AuthKey:    token.Authkey,
 	}
