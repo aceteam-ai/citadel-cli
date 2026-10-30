@@ -223,38 +223,50 @@ const (
 	JobTypeServiceStatus      = "SERVICE_STATUS"       // Check if a service is running
 	JobTypeSandboxSuspend     = "SANDBOX_SUSPEND"      // Pause a Docker container (sandbox suspend)
 	JobTypeSandboxResume      = "SANDBOX_RESUME"       // Unpause a Docker container (sandbox resume)
-	JobTypeModelCachePull     = "MODEL_CACHE_PULL"     // Pull model weights into local cache
-	JobTypeModelCacheEvict    = "MODEL_CACHE_EVICT"    // Evict model weights from local cache
-	JobTypeIOSBuild           = "IOS_BUILD"            // Build an iOS app via xcodebuild (macOS only)
-	JobTypeAndroidBuild       = "ANDROID_BUILD"        // Build an Android app via the Gradle wrapper
-	JobTypeGomobileBuild      = "GOMOBILE_BUILD"       // Cross-compile a Go package via gomobile bind
-	JobTypeFileScreenshot     = "FILE_SCREENSHOT"      // Capture the node's display, return base64 PNG (issue #4179)
-	JobTypeVNCScreenshot      = "VNC_SCREENSHOT"       // Capture the node's display via the VNC tool path (issue #4179)
-	JobTypeVNCType            = "VNC_TYPE"             // Type text on the node's display (issue #4179)
-	JobTypeVNCKeys            = "VNC_KEYS"             // Send a key combo to the node's display (issue #4179)
-	JobTypeVNCActions         = "VNC_ACTIONS"          // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
-	JobTypeCobrowse           = "COBROWSE"             // Human-in-the-loop co-browse over CDP (#4079)
-	JobTypeCobrowseSession    = "COBROWSE_SESSION"     // Isolated, concurrent interactive browser sessions (start/status/stop) (#793)
-	JobTypeTranscribeAudio    = "TRANSCRIBE_AUDIO"     // Transcribe workspace audio node-locally via the faster-whisper sidecar
-	JobTypeSynthesizeSpeech   = "SYNTHESIZE_SPEECH"    // Synthesize speech node-locally via the kokoro TTS sidecar (aceteam#6104)
-	JobTypeMediaGenerate      = "MEDIA_GENERATE"       // Generate an image or video node-locally via the diffusers sidecar (issue #968/#970)
-	JobTypeAgentUpdate        = "AGENT_UPDATE"         // Remotely update + restart this node's own citadel agent (aceteam#4427)
-	JobTypeWorkerControl      = "WORKER_CONTROL"       // Acknowledged, node-targeted worker restart (aceteam#9974)
-	JobTypeWhatsAppProvision  = "WHATSAPP_PROVISION"   // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
-	JobTypeResourceSnapshot   = "RESOURCE_SNAPSHOT"    // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
-	JobTypeInstanceMessage    = "INSTANCE_MESSAGE"     // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
-	JobTypeModuleSet          = "MODULE_SET"           // Set the desired state of a single module on this node (interim, aceteam#5280)
-	JobTypeFineTuneStart      = "FINETUNE_START"       // Train a node-local adapter on the pinned GPU node
-	JobTypeExposeSet          = "EXPOSE_SET"           // Expose a local service on the gateway with private/org/link visibility (issue #598)
-	JobTypeExposeList         = "EXPOSE_LIST"          // Read back this node's durable exposure inventory (issue #944)
-	JobTypeUnexpose           = "UNEXPOSE"             // Remotely revoke a gateway exposure (issue #944)
-	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
-	JobTypeHuddleJoin         = "HUDDLE_JOIN"          // Join a native AceTeam huddle AS the agent (headless bot page) + confirm presence (aceteam#7081)
-	JobTypeHuddleTeardown     = "HUDDLE_TEARDOWN"      // Exact-attempt meetingd cleanup; always routable for durable lifecycle recovery
-	JobTypeDocumentRasterize  = "document_rasterize"   // Render selected PDF pages to images on this node so a scan can reach an OCR model (issue #675)
-	JobTypeShowPairingCode    = "SHOW_PAIRING_CODE"    // Render a node:exec pairing code on this node's console (issue #659)
-	JobTypeClearPairingCode   = "CLEAR_PAIRING_CODE"   // Clear a displayed node:exec pairing code (issue #659)
-	JobTypeVoiceManage        = "VOICE_MANAGE"         // Enroll/list/delete consented voices on the local voice-clone module (issue #1248). Per-node stream only, fail closed.
+	JobTypeContainerCreate    = "CONTAINER_CREATE"
+	JobTypeContainerStart     = "CONTAINER_START"
+	JobTypeContainerStop      = "CONTAINER_STOP"
+	JobTypeContainerExec      = "CONTAINER_EXEC"
+	JobTypeContainerFileList  = "CONTAINER_FILE_LIST"
+	JobTypeContainerFileRead  = "CONTAINER_FILE_READ"
+	JobTypeContainerFileWrite = "CONTAINER_FILE_WRITE"
+	JobTypeContainerUsage     = "CONTAINER_USAGE"
+	JobTypeContainerExport    = "CONTAINER_EXPORT_CHUNK"
+	JobTypeContainerImport    = "CONTAINER_IMPORT_CHUNK"
+	JobTypeContainerDestroy   = "CONTAINER_DESTROY"
+
+	JobTypeModelCachePull    = "MODEL_CACHE_PULL"   // Pull model weights into local cache
+	JobTypeModelCacheEvict   = "MODEL_CACHE_EVICT"  // Evict model weights from local cache
+	JobTypeIOSBuild          = "IOS_BUILD"          // Build an iOS app via xcodebuild (macOS only)
+	JobTypeAndroidBuild      = "ANDROID_BUILD"      // Build an Android app via the Gradle wrapper
+	JobTypeGomobileBuild     = "GOMOBILE_BUILD"     // Cross-compile a Go package via gomobile bind
+	JobTypeFileScreenshot    = "FILE_SCREENSHOT"    // Capture the node's display, return base64 PNG (issue #4179)
+	JobTypeVNCScreenshot     = "VNC_SCREENSHOT"     // Capture the node's display via the VNC tool path (issue #4179)
+	JobTypeVNCType           = "VNC_TYPE"           // Type text on the node's display (issue #4179)
+	JobTypeVNCKeys           = "VNC_KEYS"           // Send a key combo to the node's display (issue #4179)
+	JobTypeVNCActions        = "VNC_ACTIONS"        // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
+	JobTypeCobrowse          = "COBROWSE"           // Human-in-the-loop co-browse over CDP (#4079)
+	JobTypeCobrowseSession   = "COBROWSE_SESSION"   // Isolated, concurrent interactive browser sessions (start/status/stop) (#793)
+	JobTypeTranscribeAudio   = "TRANSCRIBE_AUDIO"   // Transcribe workspace audio node-locally via the faster-whisper sidecar
+	JobTypeSynthesizeSpeech  = "SYNTHESIZE_SPEECH"  // Synthesize speech node-locally via the kokoro TTS sidecar (aceteam#6104)
+	JobTypeMediaGenerate     = "MEDIA_GENERATE"     // Generate an image or video node-locally via the diffusers sidecar (issue #968/#970)
+	JobTypeAgentUpdate       = "AGENT_UPDATE"       // Remotely update + restart this node's own citadel agent (aceteam#4427)
+	JobTypeWorkerControl     = "WORKER_CONTROL"     // Acknowledged, node-targeted worker restart (aceteam#9974)
+	JobTypeWhatsAppProvision = "WHATSAPP_PROVISION" // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
+	JobTypeResourceSnapshot  = "RESOURCE_SNAPSHOT"  // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
+	JobTypeInstanceMessage   = "INSTANCE_MESSAGE"   // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
+	JobTypeModuleSet         = "MODULE_SET"         // Set the desired state of a single module on this node (interim, aceteam#5280)
+	JobTypeFineTuneStart     = "FINETUNE_START"     // Train a node-local adapter on the pinned GPU node
+	JobTypeExposeSet         = "EXPOSE_SET"         // Expose a local service on the gateway with private/org/link visibility (issue #598)
+	JobTypeExposeList        = "EXPOSE_LIST"        // Read back this node's durable exposure inventory (issue #944)
+	JobTypeUnexpose          = "UNEXPOSE"           // Remotely revoke a gateway exposure (issue #944)
+	JobTypeMeetingJoin       = "MEETING_JOIN"       // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
+	JobTypeHuddleJoin        = "HUDDLE_JOIN"        // Join a native AceTeam huddle AS the agent (headless bot page) + confirm presence (aceteam#7081)
+	JobTypeHuddleTeardown    = "HUDDLE_TEARDOWN"    // Exact-attempt meetingd cleanup; always routable for durable lifecycle recovery
+	JobTypeDocumentRasterize = "document_rasterize" // Render selected PDF pages to images on this node so a scan can reach an OCR model (issue #675)
+	JobTypeShowPairingCode   = "SHOW_PAIRING_CODE"  // Render a node:exec pairing code on this node's console (issue #659)
+	JobTypeClearPairingCode  = "CLEAR_PAIRING_CODE" // Clear a displayed node:exec pairing code (issue #659)
+	JobTypeVoiceManage       = "VOICE_MANAGE"       // Enroll/list/delete consented voices on the local voice-clone module (issue #1248). Per-node stream only, fail closed.
 
 	// Hosted-app pod-per-app runner (CRAM slice A1, aceteam#9672). Privileged in
 	// the EXPOSE_SET sense: honored only on the per-node stream, fail closed on
@@ -319,6 +331,17 @@ var allKnownJobTypes = []string{
 	JobTypeServiceStatus,
 	JobTypeSandboxSuspend,
 	JobTypeSandboxResume,
+	JobTypeContainerCreate,
+	JobTypeContainerStart,
+	JobTypeContainerStop,
+	JobTypeContainerExec,
+	JobTypeContainerFileList,
+	JobTypeContainerFileRead,
+	JobTypeContainerFileWrite,
+	JobTypeContainerUsage,
+	JobTypeContainerExport,
+	JobTypeContainerImport,
+	JobTypeContainerDestroy,
 	JobTypeModelCachePull,
 	JobTypeModelCacheEvict,
 	JobTypeIOSBuild,

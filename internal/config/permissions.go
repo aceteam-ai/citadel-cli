@@ -37,13 +37,17 @@ import (
 // enabled but has no passcode set fails CLOSED (access denied) — enablement
 // without a passcode never silently opens the surface.
 type Permissions struct {
-	Console   bool `yaml:"console" json:"console"`     // Terminal WebSocket access (default-deny, opt-in)
-	Desktop   bool `yaml:"desktop" json:"desktop"`     // VNC, screenshots, actions (default-deny, opt-in)
-	Files     bool `yaml:"files" json:"files"`         // File browser API (default-deny, opt-in)
-	Services  bool `yaml:"services" json:"services"`   // Service list/management (default-on, opt-out)
-	SSH       bool `yaml:"ssh" json:"ssh"`             // SSH authorized_keys sync (default-on, opt-out)
-	Provision bool `yaml:"provision" json:"provision"` // Container provisioning API (default-on, opt-out)
-	Shell     bool `yaml:"shell" json:"shell"`         // SHELL_COMMAND job execution (default-deny, opt-in)
+	// ContainerHost is a separate owner-granted capability, never implied by Shell or Files.
+	ContainerHost bool `yaml:"container_host" json:"container_host"`
+	// Runtime is operator configuration, never a container job argument.
+	ContainerRuntime string `yaml:"container_runtime,omitempty" json:"container_runtime,omitempty"`
+	Console          bool   `yaml:"console" json:"console"`     // Terminal WebSocket access (default-deny, opt-in)
+	Desktop          bool   `yaml:"desktop" json:"desktop"`     // VNC, screenshots, actions (default-deny, opt-in)
+	Files            bool   `yaml:"files" json:"files"`         // File browser API (default-deny, opt-in)
+	Services         bool   `yaml:"services" json:"services"`   // Service list/management (default-on, opt-out)
+	SSH              bool   `yaml:"ssh" json:"ssh"`             // SSH authorized_keys sync (default-on, opt-out)
+	Provision        bool   `yaml:"provision" json:"provision"` // Container provisioning API (default-on, opt-out)
+	Shell            bool   `yaml:"shell" json:"shell"`         // SHELL_COMMAND job execution (default-deny, opt-in)
 
 	// PasscodeHash is the bcrypt hash of the per-node passcode that gates the
 	// sensitive remote-access surfaces (console/desktop/files). It is never the
