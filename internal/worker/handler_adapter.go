@@ -71,7 +71,7 @@ func (a *LegacyHandlerAdapter) SetLogFn(logFn func(level, msg string)) {
 
 // CanHandle returns true if this adapter handles the given job type.
 func (a *LegacyHandlerAdapter) CanHandle(jobType string) bool {
-	return a.jobType == jobType && (a.enabled == nil || a.enabled())
+	return a.jobType == jobType && (a.enabled == nil || a.enabled()) && a.meetingReadiness() == nil
 }
 
 // DeclaredCapabilities forwards the wrapped legacy handler's capability
@@ -684,6 +684,7 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 	// capability itself). The config accessors clamp non-positive cadence values
 	// to sane defaults.
 	m := config.LoadMeeting(platform.ConfigDir())
+	h.Timing, h.TimingError = m.TimingProfile()
 	h.StreamingEnabled = m.StreamingEnabled
 	h.StreamingInterval = m.StreamingInterval()
 	h.StreamingWindow = m.StreamingWindow()

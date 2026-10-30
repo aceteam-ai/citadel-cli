@@ -781,11 +781,15 @@ func pickTargetContext(ctx context.Context, debugPort int) (cdpTarget, error) {
 // cdpCommand opens a WebSocket to the page target, sends one CDP method, and
 // returns the "result" object. id is fixed to 1 since the socket is per-call.
 func cdpCommand(debugPort int, method string, params map[string]any) (map[string]any, error) {
-	target, err := pickTarget(debugPort)
+	return cdpCommandContext(context.Background(), debugPort, method, params)
+}
+
+func cdpCommandContext(ctx context.Context, debugPort int, method string, params map[string]any) (map[string]any, error) {
+	target, err := pickTargetContext(ctx, debugPort)
 	if err != nil {
 		return nil, err
 	}
-	return cdpDialAndSend(target.WebSocketDebuggerURL, method, params)
+	return cdpDialAndSendContext(ctx, target.WebSocketDebuggerURL, method, params)
 }
 
 // cdpDialAndSend opens a WebSocket to wsURL, sends one CDP method, and returns
