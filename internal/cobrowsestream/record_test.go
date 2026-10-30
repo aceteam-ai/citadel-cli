@@ -15,6 +15,17 @@ import (
 	"time"
 )
 
+func newRecordOutput(t *testing.T) (*os.File, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "capture.webm")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	return file, path
+}
+
 func TestRecordWebMConsumesBrowserFrames(t *testing.T) {
 	f := newFakeChrome()
 	defer f.close()
@@ -24,12 +35,12 @@ func TestRecordWebMConsumesBrowserFrames(t *testing.T) {
 	// therefore contain browser frames, not merely an empty file made by ffmpeg.
 	bin := t.TempDir()
 	encoder := filepath.Join(bin, "ffmpeg")
-	if err := os.WriteFile(encoder, []byte("#!/bin/sh\nfor arg do out=$arg; done\ncat > \"$out\"\n"), 0o755); err != nil {
+	if err := os.WriteFile(encoder, []byte("#!/bin/sh\ncat\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	out := filepath.Join(t.TempDir(), "capture.webm")
-	if err := RecordWebM(context.Background(), 9222, out, time.Second); err != nil {
+	file, out := newRecordOutput(t)
+	if err := RecordWebM(context.Background(), 9222, file, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(out)
@@ -64,8 +75,8 @@ func TestRecordWebMProducesPlayableVideo(t *testing.T) {
 	}
 	f.jpeg = frame.Bytes()
 	withFakeCDP(t, f)
-	out := filepath.Join(t.TempDir(), "capture.webm")
-	if err := RecordWebM(context.Background(), 9222, out, time.Second); err != nil {
+	file, out := newRecordOutput(t)
+	if err := RecordWebM(context.Background(), 9222, file, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	probe, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1", out).Output()
@@ -76,7 +87,8 @@ func TestRecordWebMProducesPlayableVideo(t *testing.T) {
 
 func TestRecordWebMRejectsUnboundedDuration(t *testing.T) {
 	for _, duration := range []time.Duration{0, 31 * time.Second} {
-		if err := RecordWebM(context.Background(), 9222, filepath.Join(t.TempDir(), "capture.webm"), duration); err == nil {
+		file, _ := newRecordOutput(t)
+		if err := RecordWebM(context.Background(), 9222, file, duration); err == nil {
 			t.Fatalf("duration %v accepted", duration)
 		}
 	}
@@ -96,7 +108,8 @@ func TestRecordWebMStalledEncoderReleasesAtDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	start := time.Now()
-	err := recordWebMWithGrace(ctx, 9222, filepath.Join(t.TempDir(), "capture.webm"), time.Second, 200*time.Millisecond)
+	file, _ := newRecordOutput(t)
+	err := recordWebMWithGrace(ctx, 9222, file, time.Second, 200*time.Millisecond)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("stalled encoder returned %v, want deadline", err)
 	}

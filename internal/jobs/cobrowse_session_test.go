@@ -2,11 +2,115 @@ package jobs
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
+
+func TestSaveCobrowseRecordingStaysInWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	out, err := saveCobrowseRecording(workspace, 1, func(file *os.File) error {
+		_, err := file.Write([]byte("synthetic webm"))
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(out, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(receipt.Path, "captures/cobrowse-") {
+		t.Fatalf("unexpected workspace path %q", receipt.Path)
+	}
+	data, err := os.ReadFile(filepath.Join(workspace, receipt.Path))
+	if err != nil || string(data) != "synthetic webm" {
+		t.Fatalf("published content = %q, err=%v", data, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(workspace, "captures"))
+	if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(receipt.Path) {
+		t.Fatalf("capture entries = %v, err=%v", entries, err)
+	}
+}
+
+func TestSaveCobrowseRecordingRejectsDirectoryReplacement(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	captures := filepath.Join(workspace, "captures")
+	parked := filepath.Join(workspace, "parked")
+	_, err := saveCobrowseRecording(workspace, 1, func(file *os.File) error {
+		entries, err := os.ReadDir(captures)
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("temporary capture entry = %v, err=%v", entries, err)
+		}
+		tempName := entries[0].Name()
+		finalName := strings.TrimPrefix(tempName, ".")
+		for _, name := range []string{tempName, finalName} {
+			if err := os.WriteFile(filepath.Join(outside, name), []byte("outside sentinel"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Rename(captures, parked); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, captures); err != nil {
+			t.Fatal(err)
+		}
+		_, err = file.Write([]byte("synthetic webm"))
+		return err
+	})
+	if err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("directory replacement returned %v, want refusal", err)
+	}
+	entries, err := os.ReadDir(outside)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("outside entries = %v, err=%v", entries, err)
+	}
+	for _, entry := range entries {
+		data, err := os.ReadFile(filepath.Join(outside, entry.Name()))
+		if err != nil || string(data) != "outside sentinel" {
+			t.Fatalf("outside %s = %q, err=%v", entry.Name(), data, err)
+		}
+	}
+	parkedEntries, err := os.ReadDir(parked)
+	if err != nil || len(parkedEntries) != 0 {
+		t.Fatalf("owned temporary file was not cleaned: %v, err=%v", parkedEntries, err)
+	}
+}
+
+func TestSaveCobrowseRecordingRejectsSymlinkAndExistingPublication(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(workspace, "captures")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := saveCobrowseRecording(workspace, 1, func(*os.File) error { t.Fatal("capture called"); return nil }); err == nil {
+		t.Fatal("accepted symlinked capture directory")
+	}
+	if err := os.Remove(filepath.Join(workspace, "captures")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := saveCobrowseRecording(workspace, 1, func(file *os.File) error {
+		entries, err := os.ReadDir(filepath.Join(workspace, "captures"))
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("temporary capture entry = %v, err=%v", entries, err)
+		}
+		finalName := strings.TrimPrefix(entries[0].Name(), ".")
+		if err := os.WriteFile(filepath.Join(workspace, "captures", finalName), []byte("existing"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err = file.Write([]byte("synthetic webm"))
+		return err
+	})
+	if err == nil || !strings.Contains(err.Error(), "publish") {
+		t.Fatalf("existing publication returned %v, want refusal", err)
+	}
+}
 
 func runSession(t *testing.T, payload map[string]string) ([]byte, error) {
 	t.Helper()
