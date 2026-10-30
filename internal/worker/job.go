@@ -395,11 +395,11 @@ var allKnownJobTypes = []string{
 //     default-on). HUDDLE_JOIN does not need a workspace, but it is gated by the
 //     same meeting-capability toggle.
 //
-// A type absent from this map but also absent from a node's registered
-// handlers is either genuinely unsupported by this build (not in
-// allKnownJobTypes at all) or unconditionally registered and thus never
-// reaches failUnsupportedJobType in a gated state.
+// Current registrationRefusals take precedence over this fallback catalog.
+// Any other known type with no runnable handler is a handler_unavailable
+// refusal. Only a type absent from allKnownJobTypes receives the update hint.
 var gatedJobTypeReasons = map[string]string{
+	JobTypeShellCommand:       "shell execution requires a supported Unix platform and the node's Shell permission; enable Shell in the AceTeam control center on a supported node",
 	JobTypeFileRead:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileReadBytes:      "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileReadRangeV1:    "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",

@@ -55,6 +55,23 @@ func TestDownloadAndApplyManualCleansPrivateAttemptBeforeReturn(t *testing.T) {
 	}
 }
 
+func TestManualUpdatePermissionPreflightBeforeDownloadOrAttempt(t *testing.T) {
+	withAutoUpdateEnv(t, "v2.202.0")
+	originalCapability, originalNew, originalDownload := manualUpdateCapabilityFn, newUpdateAttemptFn, downloadReleaseFn
+	t.Cleanup(func() {
+		manualUpdateCapabilityFn, newUpdateAttemptFn, downloadReleaseFn = originalCapability, originalNew, originalDownload
+	})
+	capability := update.SelfUpdateCapability{State: update.SelfUpdatePrivileged, Directory: "/fixture/privileged", BinaryOwner: "root", WorkerUser: "fixture-worker"}
+	manualUpdateCapabilityFn = func() update.SelfUpdateCapability { return capability }
+	calls := 0
+	newUpdateAttemptFn = func() (*update.UpdateAttempt, error) { calls++; return nil, errors.New("unexpected fixture attempt") }
+	downloadReleaseFn = func(*update.Client, *update.Release, string) error { calls++; return nil }
+	_, err := downloadAndApplyManual(update.NewClient("v2.202.0"), &update.Release{TagName: "v2.203.0"}, nil)
+	if err == nil || calls != 0 || !strings.Contains(err.Error(), capability.BinaryOwner) || !strings.Contains(err.Error(), capability.WorkerUser) || !strings.Contains(err.Error(), "before download") {
+		t.Fatalf("manual preflight downloaded or omitted remediation: calls=%d err=%v", calls, err)
+	}
+}
+
 func TestDownloadAndApplyManualCleansPrivateAttemptOnErrors(t *testing.T) {
 	for _, phase := range []string{"download", "apply"} {
 		t.Run(phase, func(t *testing.T) {

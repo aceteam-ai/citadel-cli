@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/google/uuid"
 )
 
@@ -67,7 +68,8 @@ type ClientConfig struct {
 	Timeout time.Duration
 
 	// DebugFunc is an optional callback for debug logging
-	DebugFunc func(format string, args ...any)
+	DebugFunc        func(format string, args ...any)
+	PlatformObserver platformhttp.Observer
 }
 
 // NewClient creates a new Redis API client.
@@ -80,7 +82,8 @@ func NewClient(cfg ClientConfig) *Client {
 		baseURL: cfg.BaseURL,
 		token:   cfg.Token,
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
+			Timeout:   cfg.Timeout,
+			Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{Debugf: cfg.DebugFunc, Observe: cfg.PlatformObserver}),
 		},
 		workerID:  fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
 		debugFunc: cfg.DebugFunc,
@@ -110,6 +113,8 @@ func (c *Client) debug(format string, args ...any) {
 func (c *Client) BaseURL() string {
 	return c.baseURL
 }
+
+func (c *Client) RedialPlatformConnections() { platformhttp.RedialClient(c.httpClient) }
 
 // WorkerID returns the unique worker identifier.
 func (c *Client) WorkerID() string {
@@ -160,6 +165,9 @@ func (c *Client) Ping(ctx context.Context) error {
 // Close closes the HTTP client and WebSocket if connected.
 func (c *Client) Close() error {
 	c.closed.Store(true)
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
 	if c.wsClient != nil {
 		return c.wsClient.Close()
 	}
@@ -266,6 +274,10 @@ func contains404(s string) bool {
 
 // doRequest performs an HTTP request with authentication and JSON handling.
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, result any) error {
+	return c.doRequestWithClient(c.httpClient, ctx, method, path, body, result)
+}
+
+func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, method, path string, body any, result any) error {
 	var reqBody io.Reader
 	if body != nil {
 		jsonData, err := json.Marshal(body)
@@ -290,7 +302,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}

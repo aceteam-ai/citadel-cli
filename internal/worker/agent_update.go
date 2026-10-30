@@ -66,6 +66,10 @@ import (
 // dependency is injectable so the handler can be unit-tested without touching
 // the network, the filesystem, or the running process.
 type AgentUpdateConfig struct {
+	// Capability observes install authority before any remote release lookup,
+	// exact-target lock provisioning or download. Apply still rechecks.
+	Capability         func() update.SelfUpdateCapability
+	RecordApplyRefusal func(update.SelfUpdateCapability)
 	// Version is the currently-running agent version (e.g. "v2.46.0"). Reported
 	// back as old_version and used to decide "already latest".
 	Version string
@@ -156,6 +160,14 @@ type AgentUpdateHandler struct {
 // dependencies (Drain, ActiveJobs) must be set by the caller after the runner
 // exists — see cmd/work.go.
 func NewAgentUpdateHandler(cfg AgentUpdateConfig) *AgentUpdateHandler {
+	if cfg.Capability == nil {
+		cfg.Capability = update.InspectSelfUpdateCapability
+	}
+	if cfg.RecordApplyRefusal == nil {
+		cfg.RecordApplyRefusal = func(capability update.SelfUpdateCapability) {
+			_ = update.RecordApplyNotPermitted(time.Now(), capability, false, "")
+		}
+	}
 	if cfg.GetRelease == nil {
 		cfg.GetRelease = func(target string) (*update.Release, error) {
 			client := update.NewClientWithTimeout(cfg.Version, 60*time.Second)
@@ -219,14 +231,11 @@ func NewAgentUpdateHandler(cfg AgentUpdateConfig) *AgentUpdateHandler {
 	}
 	if cfg.RecordState == nil {
 		cfg.RecordState = func(oldVersion, newVersion string) {
-			state, err := update.LoadState()
-			if err != nil {
-				return
-			}
-			update.RecordUpdate(state, oldVersion, newVersion)
-			state.AvailableUpdate = ""
-			update.UpdateLastCheck(state)
-			_ = update.SaveState(state)
+			_ = update.MutateState(func(state *update.State) {
+				update.RecordUpdate(state, oldVersion, newVersion)
+				state.AvailableUpdate = ""
+				update.UpdateLastCheck(state)
+			})
 		}
 	}
 	return &AgentUpdateHandler{cfg: cfg}
@@ -256,6 +265,25 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 			"old_version": h.cfg.Version,
 			"new_version": h.cfg.Version,
 		}), nil
+	}
+	capability := h.cfg.Capability()
+	if capability.State == update.SelfUpdatePrivileged {
+		h.cfg.RecordApplyRefusal(capability)
+		return h.success(map[string]any{
+			"updated": false, "reason": capability.State,
+			"binary_owner": capability.BinaryOwner, "worker_user": capability.WorkerUser,
+			"install_directory": capability.Directory, "remediation": capability.Message(),
+			"old_version": h.cfg.Version, "new_version": h.cfg.Version,
+		}), nil
+	}
+	if capability.State == "homebrew_managed" || capability.State == "desktop_managed" {
+		return h.success(map[string]any{
+			"updated": false, "reason": capability.State,
+			"old_version": h.cfg.Version, "new_version": h.cfg.Version,
+		}), nil
+	}
+	if capability.State != update.SelfUpdateAvailable {
+		return h.terminalFailure(fmt.Errorf("update preflight refused before download: %s", capability.Message())), nil
 	}
 
 	target := payloadString(job.Payload, "target_version")
@@ -342,9 +370,9 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 	}
 	applyResult, err := h.cfg.ApplyRelease(ctx, attempt.Candidate, canonicalTarget, release.TagName, intent)
 	if err != nil {
-		// Apply validates the new binary and rolls back internally on failure, so
-		// the current version keeps running.
-		wrapped := fmt.Errorf("install failed for %s (kept current release): %w", release.TagName, err)
+		// The transaction reports whether replacement/rollback occurred. Do not
+		// promise that the original binary is intact after every kind of error.
+		wrapped := fmt.Errorf("install failed for %s: %w", release.TagName, err)
 		if update.IsDeterministicUpdateError(err) {
 			return h.terminalFailure(wrapped), nil
 		}

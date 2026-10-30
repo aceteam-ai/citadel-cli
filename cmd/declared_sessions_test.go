@@ -16,14 +16,19 @@ import (
 // These fixtures use only an explicit directory and fake lifecycle. Executing
 // them must not inspect real node config, systemd, sockets, PTYs or credentials.
 type declaredFakeLifecycle struct {
-	action string
-	name   string
-	err    error
+	action         string
+	name           string
+	err            error
+	classification string
 }
 
 func (f *declaredFakeLifecycle) result(action, name string) (declaredsession.ManagedStatus, error) {
 	f.action, f.name = action, name
-	return declaredsession.ManagedStatus{Name: name, Classification: "unconfirmed"}, f.err
+	classification := f.classification
+	if classification == "" {
+		classification = "unconfirmed"
+	}
+	return declaredsession.ManagedStatus{Name: name, Classification: classification}, f.err
 }
 
 func (f *declaredFakeLifecycle) Inventory(context.Context) ([]declaredsession.ManagedStatus, error) {
@@ -124,6 +129,31 @@ func TestDeclaredFailureClassificationAndClose(t *testing.T) {
 	err := command.Execute()
 	if !errors.Is(err, want) || closed != 1 || !strings.Contains(output.String(), `"classification":"unconfirmed"`) {
 		t.Fatalf("err=%v closed=%d output=%q", err, closed, output.String())
+	}
+}
+
+func TestDeclaredPartialRecoveryHasExplicitStopThenStartHint(t *testing.T) {
+	for _, action := range []string{"status", "start", "restart"} {
+		t.Run(action, func(t *testing.T) {
+			fake := &declaredFakeLifecycle{classification: "recovery_incomplete", err: declaredsession.ErrManager}
+			closed := 0
+			dir := declaredCommandTempDir(t) + "/selected node fixture"
+			command := newDeclaredSessionsCommand(func(selected string) (declaredLifecycle, func() error, error) {
+				if selected != dir {
+					t.Fatal("recovery guidance changed the explicitly selected node directory")
+				}
+				return fake, func() error { closed++; return nil }, nil
+			})
+			var output bytes.Buffer
+			command.SetOut(&output)
+			command.SetErr(new(bytes.Buffer))
+			command.SetArgs([]string{"--node-config-dir", dir, action, "fixture"})
+			err := command.Execute()
+			if !errors.Is(err, declaredsession.ErrManager) || closed != 1 || !strings.Contains(output.String(), `"classification":"recovery_incomplete"`) ||
+				!strings.Contains(err.Error(), "citadel sessions stop, then citadel sessions start with the same session name and node-config-dir selection") || fake.action != action {
+				t.Fatalf("partial recovery did not retain classification/refusal and local guidance: err=%v closed=%d output=%q", err, closed, output.String())
+			}
+		})
 	}
 }
 

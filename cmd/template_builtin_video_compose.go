@@ -6,7 +6,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,8 +153,13 @@ func decodeVideoComposeFilm(raw []byte) (videoComposeFilm, error) {
 // timeline contract. Check remaining allowance before addition: there is no
 // overflow, rounding epsilon or extra frame of allowance above the hard cap.
 func videoComposeAddDuration(total, part float64) (float64, error) {
-	if !videoComposeFinite(total) || total < 0 || total > videoComposeMaxFilmSeconds ||
-		!videoComposeFinite(part) || part <= 0 || part > videoComposeMaxFilmSeconds-total {
+	if !videoComposeFinite(total) || total < 0 {
+		return 0, fmt.Errorf("accumulated film duration must be finite and nonnegative")
+	}
+	if !videoComposeFinite(part) || part <= 0 {
+		return 0, fmt.Errorf("media duration must be finite and positive")
+	}
+	if total > videoComposeMaxFilmSeconds || part > videoComposeMaxFilmSeconds-total {
 		return 0, fmt.Errorf("film must fit within 600 seconds including all title cards")
 	}
 	next := total + part
@@ -251,136 +255,6 @@ func videoComposeInputs(inputs []string) (videoComposeFilm, []string, string, er
 	return film, chapters, poster, nil
 }
 
-// This is a bounded container preflight, not a codec parser. Reject manifests
-// disguised as MP4 before handing bytes to any media tool. Walk only the normal
-// non-fragmented MP4 hierarchy and require self-contained data references.
-// Forced MOV demuxing with external references disabled remains mandatory even
-// after this check; a file/pipe protocol allowlist alone permits local-file SSRF.
-func validateVideoComposeMP4(path string) (retErr error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { retErr = errors.Join(retErr, f.Close()) }()
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() || info.Size() < 32 {
-		return fmt.Errorf("not a self-contained MP4")
-	}
-	boxes, moovs, mdats, tracks, drefs := 0, 0, 0, 0, 0
-	var walk func(int64, int64, string, int) error
-	walk = func(start, end int64, parent string, depth int) error {
-		if depth > 6 {
-			return fmt.Errorf("MP4 nesting exceeds limit")
-		}
-		for offset := start; offset < end; {
-			boxes++
-			if boxes > 4096 || end-offset < 8 {
-				return fmt.Errorf("invalid or excessive MP4 boxes")
-			}
-			var header [16]byte
-			if _, err := f.ReadAt(header[:8], offset); err != nil {
-				return err
-			}
-			size, headerSize := int64(binary.BigEndian.Uint32(header[:4])), int64(8)
-			kind := string(header[4:8])
-			if size == 1 {
-				if end-offset < 16 {
-					return fmt.Errorf("truncated MP4 extended box")
-				}
-				if _, err := f.ReadAt(header[8:], offset+8); err != nil {
-					return err
-				}
-				extended := binary.BigEndian.Uint64(header[8:])
-				if extended > uint64(end-offset) {
-					return fmt.Errorf("MP4 box exceeds parent")
-				}
-				size, headerSize = int64(extended), 16
-			} else if size == 0 {
-				size = end - offset
-			}
-			if size < headerSize || size > end-offset {
-				return fmt.Errorf("invalid MP4 box size")
-			}
-			payload, boxEnd := offset+headerSize, offset+size
-			if parent == "" {
-				if offset == 0 && kind != "ftyp" {
-					return fmt.Errorf("chapter must start with MP4 ftyp, not a manifest")
-				}
-				switch kind {
-				case "ftyp":
-					if offset != 0 || size-headerSize < 8 || size-headerSize > 1024 || (size-headerSize)%4 != 0 {
-						return fmt.Errorf("invalid MP4 ftyp")
-					}
-					var brand [4]byte
-					if _, err := f.ReadAt(brand[:], payload); err != nil {
-						return err
-					}
-					switch string(brand[:]) {
-					case "isom", "iso2", "iso3", "iso4", "iso5", "iso6", "mp41", "mp42", "avc1":
-					default:
-						return fmt.Errorf("unsupported MP4 brand")
-					}
-				case "moov":
-					moovs++
-					if moovs != 1 || size > 16<<20 {
-						return fmt.Errorf("invalid or excessive MP4 moov")
-					}
-				case "mdat":
-					mdats++
-				case "free", "skip", "wide":
-				default:
-					return fmt.Errorf("unsupported MP4 top-level box %q", kind)
-				}
-			}
-			switch kind {
-			case "moov", "trak", "mdia", "minf", "dinf":
-				parents := map[string]string{"moov": "", "trak": "moov", "mdia": "trak", "minf": "mdia", "dinf": "minf"}
-				if parent != parents[kind] {
-					return fmt.Errorf("unexpected MP4 container %q", kind)
-				}
-				before := drefs
-				if err := walk(payload, boxEnd, kind, depth+1); err != nil {
-					return err
-				}
-				if kind == "trak" {
-					tracks++
-					if drefs-before != 1 {
-						return fmt.Errorf("MP4 track requires one self-contained data reference")
-					}
-				}
-			case "dref":
-				// FullBox version/flags=0, entry_count=1, one 12-byte url
-				// FullBox with flag=1 (self-contained) and no external location.
-				if parent != "dinf" || size-headerSize != 20 {
-					return fmt.Errorf("external or unsupported MP4 data reference")
-				}
-				var data [20]byte
-				if _, err := f.ReadAt(data[:], payload); err != nil {
-					return err
-				}
-				if binary.BigEndian.Uint32(data[:4]) != 0 || binary.BigEndian.Uint32(data[4:8]) != 1 || binary.BigEndian.Uint32(data[8:12]) != 12 || string(data[12:16]) != "url " || binary.BigEndian.Uint32(data[16:20]) != 1 {
-					return fmt.Errorf("MP4 data reference must be self-contained")
-				}
-				drefs++
-			case "cmov", "rmra", "rmda", "rdrf":
-				return fmt.Errorf("compressed/reference movie containers are unsupported")
-			}
-			offset = boxEnd
-		}
-		return nil
-	}
-	if err := walk(0, info.Size(), "", 0); err != nil {
-		return err
-	}
-	if moovs != 1 || mdats == 0 || tracks < 1 || tracks > 2 {
-		return fmt.Errorf("MP4 requires local movie, tracks and media data")
-	}
-	return nil
-}
-
 // Every MP4 consumer must use these input options, including future disclosure
 // rendering. Never let ffprobe/ffmpeg autodetect an untrusted chapter basename.
 func videoComposeMP4InputArgs(input string) []string {
@@ -441,9 +315,12 @@ func parseVideoComposeProbe(raw []byte) (videoComposeMedia, error) {
 		}
 	}
 	duration, err := strconv.ParseFloat(probe.Format.Duration, 64)
+	if err != nil || !videoComposeFinite(duration) || duration <= 0 {
+		return m, fmt.Errorf("media duration must be finite and positive")
+	}
 	fps, fpsErr := videoComposeFPS(m.FPS)
 	sampleRate, sampleErr := strconv.Atoi(m.SampleRate)
-	if err != nil || !videoComposeFinite(duration) || duration <= 0 || duration > 33*papercraftMaxDuration || video != 1 || audio != 1 || m.Width <= m.Height || m.Width > 8192 || m.Height < 2 || m.Width%2 != 0 || m.Height%2 != 0 || fpsErr != nil || fps < 1 || fps > 120 || m.VideoCodec == "" || m.AudioCodec == "" || sampleErr != nil || sampleRate < 8000 || sampleRate > 192000 || m.Channels < 1 || m.Channels > 8 || m.SampleAspect != "1:1" {
+	if duration > 33*papercraftMaxDuration || video != 1 || audio != 1 || m.Width <= m.Height || m.Width > 8192 || m.Height < 2 || m.Width%2 != 0 || m.Height%2 != 0 || fpsErr != nil || fps < 1 || fps > 120 || m.VideoCodec == "" || m.AudioCodec == "" || sampleErr != nil || sampleRate < 8000 || sampleRate > 192000 || m.Channels < 1 || m.Channels > 8 || m.SampleAspect != "1:1" {
 		return m, fmt.Errorf("unsupported or invalid landscape chapter stream metadata")
 	}
 	m.Duration = duration
@@ -657,7 +534,7 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 		return nil, err
 	}
 	joined := filepath.Join(scratch, "joined.mp4")
-	if err := run([]string{"-hide_banner", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-format_whitelist", "concat,mov", "-f", "concat", "-safe", "1", "-i", list, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", joined}); err != nil {
+	if err := run([]string{"-hide_banner", "-nostdin", "-y", "-xerror", "-protocol_whitelist", "file,pipe", "-format_whitelist", "concat,mov", "-f", "concat", "-safe", "1", "-i", list, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", joined}); err != nil {
 		return nil, err
 	}
 	joinedMedia, err := probe(joined)
@@ -724,7 +601,9 @@ func runVideoComposeBuiltin(ctx context.Context, params json.RawMessage, inputs 
 			return nil, fmt.Errorf("final %w", err)
 		}
 	}
-	// AAC padding and container timebases permit at most one video frame drift.
+	// Policy permits at most one video frame drift, including AAC padding.
+	// This may refuse otherwise valid high-frame-rate AAC concatenations; any
+	// padding allowance requires a separately measured fixture and policy.
 	// Both encode paths have independently passed the hard 600-second cap;
 	// the frame tolerance above never extends that maximum.
 	timeline.Bytes = info.Size()

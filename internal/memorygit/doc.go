@@ -80,9 +80,20 @@
 // Repository provisioning also remains separate: node ownership/private .git
 // mode, clone/import hardlinks, repacking, metadata-walk bounds and an accepted
 // maintenance/GC policy must be addressed before activation. This slice does
-// not change repository policy, Git configuration, argv, environment or runner.
+// not change repository policy, Git configuration or argv.
 // Local candidate tests, builds and native acceptance have not been run for
 // this follow-up; existing GitHub CI is separate evidence, not activation.
+//
+// # Lazy object fetch defense (#1436, partial)
+//
+// The inactive descriptor runner supplies GIT_NO_LAZY_FETCH=1 in its fixed child
+// environment, alongside the existing protocol.allow=never argument. Caller
+// environment cannot unset or override it. The fake child environment fixture
+// rejects a missing or different value. This is prepared source evidence, not
+// proof that an installed Git version implements the variable or native
+// partial-clone acceptance. See https://git-scm.com/docs/git for its contract.
+// Provisioning, attribute-source policy, paired identity and activation remain
+// separately reviewed gates. No lazy fetch is run to validate this source.
 //
 // The first runner supports Linux only and fails closed elsewhere. It requires
 // a node-owned repository with a private .git directory and no metadata

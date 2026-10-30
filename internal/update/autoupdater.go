@@ -65,6 +65,12 @@ type AutoUpdaterConfig struct {
 	// tick honors it without a restart. If nil, the updater is always enabled.
 	Enabled func() bool
 
+	// Policy, when supplied, replaces Enabled and returns the same effective
+	// decision plus its source. The owner uses "unknown" for an unreadable
+	// file preference, distinct from an intentional opt-out, so a paused
+	// corrupt-state notice does not tell opted-out nodes to enable updates.
+	Policy func() (enabled bool, source string)
+
 	// ActiveJobs reports the number of in-flight jobs. When it returns 0 the
 	// updater considers the node idle and safe to restart. If nil, the node is
 	// always considered idle (best-effort).
@@ -114,6 +120,10 @@ type AutoUpdaterConfig struct {
 	// on Linux/Windows it is always false, so this is a no-op there.
 	HomebrewManaged func() bool
 
+	// Capability checks current install authority before allocating/downloading.
+	// Apply retains its final lock/identity checks. Injectable for fake fixtures.
+	Capability func() SelfUpdateCapability
+
 	// PendingPath is where the downloaded binary is staged.
 	// Defaults to GetPendingBinaryPath().
 	PendingPath string
@@ -135,7 +145,8 @@ type AutoUpdaterConfig struct {
 
 // AutoUpdater periodically checks for and applies updates.
 type AutoUpdater struct {
-	cfg AutoUpdaterConfig
+	cfg              AutoUpdaterConfig
+	lastApplyRefusal *SelfUpdateCapability
 }
 
 // ClampInterval applies the updater's interval rules — zero/negative uses
@@ -184,6 +195,9 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 	}
 	if cfg.HomebrewManaged == nil {
 		cfg.HomebrewManaged = CurrentBinaryIsHomebrewManaged
+	}
+	if cfg.Capability == nil {
+		cfg.Capability = InspectSelfUpdateCapability
 	}
 	if cfg.NewAttempt == nil {
 		if cfg.PendingPath != "" || legacyApplySeam {
@@ -235,9 +249,24 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 				// running agent (persisted/env) is reflected even on a cycle that
 				// installs nothing (citadel-cli#1134).
 				a.refresh()
+				// Decide effective policy first. An unreadable file cannot override
+				// an explicit flag/env value, but its damage stays visible.
+				enabled, source := true, ""
+				if a.cfg.Policy != nil {
+					enabled, source = a.cfg.Policy()
+				} else if a.cfg.Enabled != nil {
+					enabled = a.cfg.Enabled()
+				}
+				if _, corrupt := ReadStateForReport(); corrupt {
+					if enabled {
+						a.cfg.Log("auto-update: state file unreadable, continuing under explicit policy; repair with 'citadel update enable' or 'citadel update disable'")
+					} else if source == "unknown" {
+						a.cfg.Log("auto-update: state file unreadable, auto-update paused; repair with 'citadel update enable' or 'citadel update disable'")
+					}
+				}
 				// Re-check the toggle every tick so it can be flipped on a running
 				// agent without a restart.
-				if a.cfg.Enabled != nil && !a.cfg.Enabled() {
+				if !enabled {
 					return
 				}
 				// runOnce never panics; guard anyway so a bug here can never take
@@ -273,6 +302,22 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	if ctx.Err() != nil {
 		return false
 	}
+	capability := a.cfg.Capability()
+	if capability.State != SelfUpdateAvailable {
+		if capability.State == "homebrew_managed" || capability.State == "desktop_managed" {
+			a.record(ResultManualUpdateRequired, false, "")
+			return false
+		}
+		if a.lastApplyRefusal == nil || *a.lastApplyRefusal != capability {
+			a.cfg.Log("auto-update: %s (download skipped)", capability.Message())
+		}
+		a.lastApplyRefusal = &capability
+		_ = RecordApplyNotPermitted(a.cfg.Now(), capability, false, "")
+		a.refresh()
+		return false
+	}
+	a.lastApplyRefusal = nil
+
 	release, err := a.cfg.Checker.CheckForUpdate()
 	if err != nil {
 		a.cfg.Log("auto-update: check failed: %v", err)
@@ -347,7 +392,7 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	// failure internally).
 	applyResult, err := a.cfg.ApplyRelease(ctx, attempt.Candidate, "", release.TagName, Latest)
 	if err != nil {
-		a.cfg.Log("auto-update: apply failed (kept current version): %v", err)
+		a.cfg.Log("auto-update: apply failed: %v", err)
 		a.record(ResultApplyFailed, true, release.TagName)
 		return false
 	}

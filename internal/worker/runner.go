@@ -305,6 +305,21 @@ func (r *Runner) BeginDrain() func() {
 	}
 }
 
+// TryIdleRestart fences pickup and waits for the current poll/claim to settle
+// before checking all admitted work. Another drain owner or active job vetoes
+// the exit. action must only exit the process (or be an inert test callback).
+func (r *Runner) TryIdleRestart(action func()) bool {
+	release := r.BeginDrain()
+	defer release()
+	r.drainMu.Lock()
+	defer r.drainMu.Unlock()
+	if r.permanentDrain || r.drainScopes != 1 || atomic.LoadInt64(&r.activeJobs) != 0 || r.dispatchingJobs != 0 || r.pendingJob != nil {
+		return false
+	}
+	action()
+	return true
+}
+
 // isDraining reports whether any drain remains active.
 func (r *Runner) isDraining() bool {
 	r.drainMu.Lock()
@@ -1725,11 +1740,12 @@ func willRetry(job *Job) bool {
 // The error text distinguishes two causes that used to collapse into one
 // misleading "(update the node)" message (aceteam#9962): a type this build
 // genuinely does not know (allKnownJobTypes) really does need an update, but
-// a type in gatedJobTypeReasons is known to the build and simply not
+// a known type is refused with current registration-gate evidence and simply not
 // registered this run -- typically a default-DENY permission (files/desktop)
 // or a missing config directory. Telling an operator to "update the node" for
 // the second case sends them chasing a binary upgrade that fixes nothing; the
 // real fix is a permission toggle or provisioning step named in the message.
+// Refusal evidence is not a capability grant and never makes a handler runnable.
 func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime time.Time) {
 	agentVersion := r.agentVersion
 	if agentVersion == "" {
@@ -1737,19 +1753,21 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 	}
 
 	var err error
-	gateReason, gated := gatedJobTypeReasons[job.Type]
+	refusal := r.unavailableJobRefusal(job.Type)
+	gated := refusal != nil
 	if gated {
-		err = fmt.Errorf(
-			"job type %q is supported by this node's build but not currently registered: %s",
-			job.Type, gateReason,
-		)
+		err = refusal
 	} else {
 		err = fmt.Errorf(
 			"unsupported job type %q: node %s has no handler for it (update the node)",
 			job.Type, agentVersion,
 		)
 	}
-	r.log("error", "Unsupported job type: %v", err)
+	if gated {
+		r.log("warning", "Refused job type %s: %v", job.Type, err)
+	} else {
+		r.log("error", "Unsupported job type: %v", err)
+	}
 
 	data := map[string]any{
 		"unsupported_job_type": true,
@@ -1758,8 +1776,11 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 		"supported_types":      r.SupportedJobTypes(),
 	}
 	if gated {
+		data["unsupported_job_type"] = false
+		data["refused"] = true
+		data["reason"] = refusal.Reason
 		data["known_to_build"] = true
-		data["unregistered_reason"] = gateReason
+		data["unregistered_reason"] = refusal.Message
 	}
 
 	r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))

@@ -198,8 +198,11 @@ func openWindowsMutationLock(path string, identity installedIdentity, allowCreat
 	}
 	defer token.Close()
 	user, err := token.GetTokenUser()
-	if err != nil || !user.User.Sid.Equals(identity.owner) {
-		return 0, fmt.Errorf("first lock creation requires installed executable owner")
+	if err != nil {
+		return 0, err
+	}
+	if !user.User.Sid.Equals(identity.owner) {
+		return 0, fmt.Errorf("first lock creation requires installed executable owner: binary owner %q, worker user %q; run the installer as the binary owner or explicitly configure a self-updating install owned by the worker user", identity.owner.String(), user.User.Sid.String())
 	}
 	sddl := windowsSecuritySDDL(identity.owner, true)
 	sd, err := windows.SecurityDescriptorFromString(sddl)
