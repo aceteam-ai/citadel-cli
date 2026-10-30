@@ -78,6 +78,9 @@ before the pod ever sees the request.
 Wildcard TLS is served from either a mounted, already-issued certificate
 (recommended for the first single ingress -- avoids every instance racing to
 issue the same wildcard) or via ACME DNS-01 against a delegated challenge zone.
+For exact hostname sets in static mode, CITADEL_INGRESS_HOST_CERT_DIR holds
+one <base-host>.crt and <base-host>.key pair per published group. Mounted
+certificate renewals are loaded on the next TLS handshake.
 
 The node must already be logged in ('citadel login' or 'citadel init'); pass
 --authkey for a first-boot mesh join. Configuration is entirely via flags and
@@ -184,11 +187,6 @@ func resolveIngressOptions(_ context.Context) (ingressOptions, error) {
 			poll, ingress.RouteMaxAge/2, ingress.RouteMaxAge)
 	}
 
-	cert, err := resolveIngressCertProvider(appsDomain)
-	if err != nil {
-		return ingressOptions{}, err
-	}
-
 	src := ingress.NewHTTPRoutesSource(routesURL, token, nil)
 	routes := ingress.NewClient(ingress.ClientConfig{
 		Source:       src,
@@ -196,6 +194,14 @@ func resolveIngressOptions(_ context.Context) (ingressOptions, error) {
 		AppsDomain:   appsDomain,
 		Logf:         Log,
 	})
+	cert, err := resolveIngressCertProvider(appsDomain)
+	if err != nil {
+		return ingressOptions{}, err
+	}
+	if static, ok := cert.(*ingress.StaticFileCertProvider); ok {
+		static.CertDir = os.Getenv("CITADEL_INGRESS_HOST_CERT_DIR")
+		static.HostCertBase = routes.HostCertBase
+	}
 
 	authzURL, err := ingress.DeriveAuthzURL(routesURL)
 	if err != nil {
