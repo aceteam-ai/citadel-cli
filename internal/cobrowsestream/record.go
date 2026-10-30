@@ -5,26 +5,37 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"time"
 )
+
+// MaxRecordBytes is the largest recording the backend upload path accepts.
+const MaxRecordBytes int64 = 24 * 1024 * 1024
 
 // RecordWebM captures one bounded CDP screencast directly into a WebM file.
 // Frames are coalesced and sampled at ten per second, so a busy page cannot
 // grow an unbounded queue or make the encoder run faster than real time.
 func RecordWebM(ctx context.Context, debugPort int, outputPath string, duration time.Duration) error {
+	return recordWebMWithGrace(ctx, debugPort, outputPath, duration, 5*time.Second)
+}
+
+func recordWebMWithGrace(ctx context.Context, debugPort int, outputPath string, duration, grace time.Duration) error {
 	if duration < time.Second || duration > 30*time.Second {
 		return fmt.Errorf("record duration must be between 1 and 30 seconds")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	encoderCtx, cancel := context.WithCancel(ctx)
+	// This envelope includes setup, frame writes, encoder finalization and cleanup.
+	// A stopped encoder cannot hold the session's driver lock indefinitely.
+	encoderCtx, cancel := context.WithTimeout(ctx, duration+grace)
 	defer cancel()
 	cmd := exec.CommandContext(encoderCtx, "ffmpeg",
 		"-hide_banner", "-loglevel", "error", "-y",
 		"-f", "mjpeg", "-framerate", "10", "-i", "pipe:0",
 		"-an", "-c:v", "libvpx-vp9", "-deadline", "realtime",
-		"-cpu-used", "8", "-b:v", "1M", outputPath)
+		"-cpu-used", "8", "-b:v", "1M",
+		"-fs", strconv.FormatInt(MaxRecordBytes, 10), outputPath)
 	pipe, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("open video encoder input: %w", err)
@@ -42,12 +53,16 @@ func RecordWebM(ctx context.Context, debugPort int, outputPath string, duration 
 	}()
 
 	holder := newFrameHolder()
-	cdp, err := dialCDP(debugPort, func(frame screencastFrame) { holder.set(frame.jpeg) })
+	cdp, err := dialCDPContext(encoderCtx, debugPort, func(frame screencastFrame) { holder.set(frame.jpeg) })
 	if err != nil {
 		return fmt.Errorf("attach browser screencast: %w", err)
 	}
-	defer cdp.Close()
-	defer cdp.stopScreencast()
+	defer func() {
+		// Closing the socket interrupts a concurrent CDP write before Close
+		// waits for the read loop. Detaching also stops the screencast.
+		_ = cdp.conn.Close()
+		cdp.Close()
+	}()
 	if err := cdp.startScreencast(60, 1280, 720, 1); err != nil {
 		return fmt.Errorf("start browser screencast: %w", err)
 	}
@@ -61,8 +76,8 @@ func RecordWebM(ctx context.Context, debugPort int, outputPath string, duration 
 		return fmt.Errorf("browser screencast produced no frames")
 	case <-cdp.Done():
 		return fmt.Errorf("browser closed before recording started")
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-encoderCtx.Done():
+		return encoderCtx.Err()
 	}
 	last := holder.take()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -77,9 +92,15 @@ func RecordWebM(ctx context.Context, debugPort int, outputPath string, duration 
 		case <-ticker.C:
 			if len(last) > 0 {
 				if _, err := pipe.Write(last); err != nil {
+					if encoderCtx.Err() != nil {
+						return encoderCtx.Err()
+					}
 					return fmt.Errorf("write video frame: %w", err)
 				}
 				frames++
+			}
+			if info, err := os.Stat(outputPath); err == nil && info.Size() > MaxRecordBytes {
+				return fmt.Errorf("recording exceeds the 24 MiB export limit")
 			}
 		case <-deadline.C:
 			if frames == 0 {
@@ -91,17 +112,23 @@ func RecordWebM(ctx context.Context, debugPort int, outputPath string, duration 
 			err := cmd.Wait()
 			waited = true
 			if err != nil {
+				if encoderCtx.Err() != nil {
+					return encoderCtx.Err()
+				}
 				return fmt.Errorf("encode WebM: %w", err)
 			}
 			info, err := os.Stat(outputPath)
 			if err != nil || info.Size() == 0 {
 				return fmt.Errorf("video encoder produced no WebM output")
 			}
+			if info.Size() > MaxRecordBytes {
+				return fmt.Errorf("recording exceeds the 24 MiB export limit")
+			}
 			return nil
 		case <-cdp.Done():
 			return fmt.Errorf("browser closed during recording")
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-encoderCtx.Done():
+			return encoderCtx.Err()
 		}
 	}
 }

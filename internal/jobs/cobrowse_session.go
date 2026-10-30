@@ -198,7 +198,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		if err != nil {
 			return nil, fmt.Errorf("inspect recording: %w", err)
 		}
-		if info.Size() > 24*1024*1024 {
+		if info.Size() > cobrowsestream.MaxRecordBytes {
 			return nil, fmt.Errorf("recording exceeds the 24 MiB export limit")
 		}
 		name := strings.TrimPrefix(filepath.Base(tempPath), ".")
