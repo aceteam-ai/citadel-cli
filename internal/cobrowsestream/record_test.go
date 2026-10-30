@@ -3,6 +3,7 @@ package cobrowsestream
 import (
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -78,5 +79,28 @@ func TestRecordWebMRejectsUnboundedDuration(t *testing.T) {
 		if err := RecordWebM(context.Background(), 9222, filepath.Join(t.TempDir(), "capture.webm"), duration); err == nil {
 			t.Fatalf("duration %v accepted", duration)
 		}
+	}
+}
+
+func TestRecordWebMStalledEncoderReleasesAtDeadline(t *testing.T) {
+	f := newFakeChrome()
+	defer f.close()
+	f.jpeg = bytes.Repeat([]byte{0xff}, 2<<20)
+	f.totalFrames = 1
+	withFakeCDP(t, f)
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ffmpeg"), []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := recordWebMWithGrace(ctx, 9222, filepath.Join(t.TempDir(), "capture.webm"), time.Second, 200*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled encoder returned %v, want deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2500*time.Millisecond {
+		t.Fatalf("stalled encoder held session custody for %v", elapsed)
 	}
 }
