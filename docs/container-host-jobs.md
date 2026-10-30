@@ -14,6 +14,40 @@ registration. A malformed permission file, unsupported platform/runtime or
 missing permission directory refuses. Local `container_runtime` accepts the
 Docker default (empty) or `runsc`; jobs cannot override it.
 
+`container_egress_proxy_url` in the same node-local `permissions.yaml` is an
+optional explicit HTTP forward proxy endpoint. It is empty by default
+and is not an `APPLY_DEVICE_CONFIG` grant field or a job argument. For example,
+the S5 host template can explicitly select:
+
+```yaml
+container_host: true
+container_runtime: runsc
+container_egress_proxy_url: http://host.docker.internal:3128
+```
+
+V1 pins the authority to `host.docker.internal:3128`, the S5 host-local proxy;
+arbitrary hosts, numeric addresses, other ports and HTTPS proxy URLs refuse.
+The S5 Squid template serves HTTP on that port, including CONNECT for HTTPS
+destination traffic. Thus both HTTP_PROXY and HTTPS_PROXY use the HTTP endpoint;
+this does not assume a TLS listener exists on the proxy itself.
+
+When set, container create adds `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy` and
+`https_proxy` with that exact node-configured URL; `NO_PROXY` and `no_proxy` are
+fixed to `localhost,127.0.0.1,::1`. It also adds exactly
+`host.docker.internal:host-gateway`. When unset, create adds neither proxy
+environment variables nor a host mapping. Worker environment variables and
+extra job fields do not select a proxy. Credentials, query/fragment tokens,
+non-HTTP schemes, invalid ports and non-root URL paths refuse without reflecting
+the URL. Changing the policy affects later creates; it does not mutate existing
+containers or their network configuration.
+
+This supplies the S3 client contract, not egress enforcement. A named bridge is
+still required for connectivity; an absent network remains `none` even with a
+proxy configured. S5 must bind the proxy to the mapped host endpoint and permit
+only that destination/port through its default-deny firewall. The proxy owns
+domain allowlisting; `NO_PROXY` cannot bypass the firewall. This source does not
+start a proxy or alter firewall rules.
+
 The native adapter pins Docker CLI and exec API traffic to the local Unix socket.
 `Engine.Run` acquires its process-safe host lock, rechecks permission and checks
 container/volume ownership plus the container's actual attached volume. Lifecycle
@@ -29,6 +63,14 @@ without formatting them, including imported or preserved disks. `OpenVolume`
 verifies the expected filesystem and exact loop backing image before file access
 or container start. An unmounted host directory is refused. Host boot/mount
 restoration belongs to the operator host setup; this change installs no service.
+After formatting and mounting a new volume, provisioning sets only its mounted
+root to UID/GID `10001:10001`, the pinned S5 workspace image's `ace` identity,
+before Docker volume registration. Mount or ownership failure refuses registration.
+The private host image parent stays worker-owned. Existing volumes and imported
+file trees are never recursively chowned or reformatted by this ownership step.
+This root assignment does not resolve ownership of later privileged host-written
+files or imported entries. That source follow-up is tracked in citadel-cli#1521;
+full non-root workspace file/import acceptance stays held until it is resolved.
 Container create applies CPU, memory, equal memory-swap, pids, dropped capabilities
 and no-new-privileges. Writable layer sizing is requested where the storage driver
 supports it; an unsupported option fails rather than weakening the request.

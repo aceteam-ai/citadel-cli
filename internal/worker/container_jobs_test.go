@@ -110,3 +110,28 @@ func TestContainerWorkerTypeInventoryMatchesWireFamily(t *testing.T) {
 		t.Fatal("heartbeat inventory drift", found)
 	}
 }
+
+func TestContainerWorkerProxyConfigurationNeverGrantsContainerHost(t *testing.T) {
+	dir := t.TempDir()
+	handlers := containerJobHandlersWithReadiness(dir, "linux", true)
+	p := config.DefaultPermissions()
+	p.ContainerEgressProxyURL = "http://host.docker.internal:3128"
+	check := func(want bool) {
+		t.Helper()
+		if err := config.SavePermissions(dir, p); err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range handlers {
+			if h.CanHandle(h.(*ContainerJobHandler).kind) != want {
+				t.Fatal("proxy policy changed host authority or admitted malformed proxy")
+			}
+		}
+	}
+	check(false)
+	p.ContainerHost = true
+	check(true)
+	p.ContainerEgressProxyURL = "http://user:secret@proxy.invalid:3128"
+	check(false)
+	p.ContainerEgressProxyURL = ""
+	check(true)
+}

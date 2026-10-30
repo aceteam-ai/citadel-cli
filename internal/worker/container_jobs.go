@@ -67,16 +67,16 @@ func containerJobHandlersWithReadiness(dir, goos string, supported bool) []JobHa
 			return false
 		}
 		p, err := config.LoadPermissionsStrict(dir)
-		return err == nil && p.ContainerHost && (p.ContainerRuntime == "" || p.ContainerRuntime == "runsc")
+		return err == nil && p.ContainerHost && (p.ContainerRuntime == "" || p.ContainerRuntime == "runsc") && containerjobs.ValidEgressProxyURL(p.ContainerEgressProxyURL)
 	}
-	runtime := func() string {
+	policy := func() (containerjobs.HostPolicy, error) {
 		p, err := config.LoadPermissionsStrict(dir)
 		if err != nil {
-			return "invalid"
+			return containerjobs.HostPolicy{}, containerjobs.ErrUnavailable
 		}
-		return p.ContainerRuntime
+		return containerjobs.HostPolicy{Runtime: p.ContainerRuntime, EgressProxyURL: p.ContainerEgressProxyURL}, nil
 	}
-	engine := &containerjobs.Engine{Runtime: containerjobs.NewNative(filepath.Join(dir, "container-volumes"), runtime), Transport: containerjobs.NewHTTPTransport(), Authorize: enabled}
+	engine := &containerjobs.Engine{Runtime: containerjobs.NewNativeWithPolicy(filepath.Join(dir, "container-volumes"), policy), Transport: containerjobs.NewHTTPTransport(), Authorize: enabled}
 	handlers := make([]JobHandler, 0, len(containerjobs.Types))
 	for _, kind := range containerjobs.Types {
 		handlers = append(handlers, &ContainerJobHandler{kind: kind, engine: engine, enabled: enabled})

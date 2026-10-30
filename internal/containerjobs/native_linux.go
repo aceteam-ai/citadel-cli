@@ -19,13 +19,23 @@ import (
 
 type Native struct {
 	root        string
-	runtime     func() string
+	policy      func() (HostPolicy, error)
 	command     commandFunc
 	execControl execControl
 }
 
 func NewNative(root string, runtime func() string) *Native {
-	return &Native{root: root, runtime: runtime, command: runCommand, execControl: newDockerExecClient()}
+	return NewNativeWithPolicy(root, func() (HostPolicy, error) {
+		p := HostPolicy{}
+		if runtime != nil {
+			p.Runtime = runtime()
+		}
+		return p, nil
+	})
+}
+
+func NewNativeWithPolicy(root string, policy func() (HostPolicy, error)) *Native {
+	return &Native{root: root, policy: policy, command: runCommand, execControl: newDockerExecClient()}
 }
 
 // Quota provisioning needs a privileged Linux worker and installed host tools.
@@ -34,7 +44,7 @@ func NativeSupported() bool {
 	if os.Geteuid() != 0 {
 		return false
 	}
-	for _, bin := range []string{"docker", "mkfs.ext4", "mount", "umount"} {
+	for _, bin := range []string{"docker", "mkfs.ext4", "mount", "umount", "chown"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			return false
 		}
@@ -211,6 +221,12 @@ func (n *Native) CreateVolume(ctx context.Context, r Request) error {
 	if _, err = n.do(ctx, "mount", "-t", "ext4", "-o", "loop,nodev,nosuid", image, mount); err != nil {
 		return err
 	}
+	// Only the freshly created volume root changes ownership. Never recursively
+	// rewrite imported or preserved data, or chown the private host image parent.
+	owner := strconv.Itoa(WorkspaceUID) + ":" + strconv.Itoa(WorkspaceGID)
+	if _, err = n.do(ctx, "chown", "--no-dereference", "--", owner, mount); err != nil {
+		return err
+	}
 	_, err = n.do(ctx, "docker", "volume", "create", "--driver", "local", "--opt", "type=none", "--opt", "o=bind", "--opt", "device="+mount,
 		"--label", "aceteam.org_id="+r.OrgID, "--label", "aceteam.quota_bytes="+strconv.FormatInt(r.QuotaBytes, 10), r.VolumeRef)
 	if err != nil {
@@ -223,12 +239,16 @@ func (n *Native) CreateVolume(ctx context.Context, r Request) error {
 	return nil
 }
 func (n *Native) CreateContainer(ctx context.Context, r Request) error {
-	runtime := ""
-	if n.runtime != nil {
-		runtime = n.runtime()
+	policy := HostPolicy{}
+	if n.policy != nil {
+		var err error
+		policy, err = n.policy()
+		if err != nil {
+			return ErrUnavailable
+		}
 	}
-	if runtime != "" && runtime != "runsc" {
-		return ErrInvalid
+	if err := policy.validate(); err != nil {
+		return err
 	}
 	volume, err := n.Volume(ctx, r.VolumeRef)
 	if err != nil || volume.OrgID != r.OrgID || volume.QuotaBytes != r.QuotaBytes {
@@ -285,7 +305,11 @@ func (n *Native) CreateContainer(ctx context.Context, r Request) error {
 			return ErrOwnership
 		}
 	}
-	if _, err = n.do(ctx, "docker", createArguments(r, runtime, layerLimit)...); err != nil {
+	args, err := createArguments(r, policy, layerLimit)
+	if err != nil {
+		return err
+	}
+	if _, err = n.do(ctx, "docker", args...); err != nil {
 		return err
 	}
 	state, err := n.Container(ctx, r.ContainerRef)

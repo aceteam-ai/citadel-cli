@@ -20,7 +20,10 @@ func TestContainerNativeMandatoryLimitsAndArgv(t *testing.T) {
 	r.CPUs = 1
 	r.MemoryBytes = 2 << 30
 	r.PidsLimit = 256
-	args := createArguments(r, "runsc", true)
+	args, err := createArguments(r, HostPolicy{Runtime: "runsc"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, pair := range [][2]string{{"--name", testContainer}, {"--cpus", "1"}, {"--memory", "2147483648"}, {"--memory-swap", "2147483648"}, {"--pids-limit", "256"}, {"--cap-drop", "ALL"}, {"--security-opt", "no-new-privileges:true"}, {"--runtime", "runsc"}, {"--network", "none"}, {"--storage-opt", "size=4G"}, {"--mount", "type=volume,src=" + testVolume + ",dst=/workspace"}} {
 		found := false
 		for i := 0; i < len(args)-1; i++ {
@@ -32,7 +35,8 @@ func TestContainerNativeMandatoryLimitsAndArgv(t *testing.T) {
 			t.Fatal("missing mandatory limit", pair[0])
 		}
 	}
-	if strings.Contains(strings.Join(createArguments(r, "", false), " "), "storage-opt") {
+	plain, err := createArguments(r, HostPolicy{}, false)
+	if err != nil || strings.Contains(strings.Join(plain, " "), "storage-opt") {
 		t.Fatal("unsupported layer option applied")
 	}
 }
@@ -354,12 +358,15 @@ func TestContainerNativeCommandPinsLocalEngineAndDropsCredentials(t *testing.T) 
 	t.Setenv("DOCKER_CONTEXT", "foreign-context")
 	t.Setenv("ACETEAM_API_KEY", "synthetic-private-value")
 	t.Setenv("SSH_AUTH_SOCK", "/synthetic/private/socket")
+	t.Setenv("HTTP_PROXY", "http://ambient.invalid:3128")
+	t.Setenv("HTTPS_PROXY", "http://ambient.invalid:3128")
+	t.Setenv("NO_PROXY", "*")
 	cmd := nativeCommand(context.Background(), "docker", "info")
 	if len(cmd.Args) < 3 || cmd.Args[1] != "--host=unix:///var/run/docker.sock" {
 		t.Fatal("Docker host was caller/ambient selected")
 	}
 	for _, entry := range cmd.Env {
-		if strings.HasPrefix(entry, "DOCKER_HOST=") || strings.HasPrefix(entry, "DOCKER_CONTEXT=") || strings.HasPrefix(entry, "ACETEAM_API_KEY=") || strings.HasPrefix(entry, "SSH_AUTH_SOCK=") {
+		if strings.HasPrefix(entry, "DOCKER_HOST=") || strings.HasPrefix(entry, "DOCKER_CONTEXT=") || strings.HasPrefix(entry, "ACETEAM_API_KEY=") || strings.HasPrefix(entry, "SSH_AUTH_SOCK=") || strings.HasPrefix(entry, "HTTP_PROXY=") || strings.HasPrefix(entry, "HTTPS_PROXY=") || strings.HasPrefix(entry, "NO_PROXY=") {
 			t.Fatal("unnecessary credential/context inherited")
 		}
 	}

@@ -9,9 +9,10 @@ import (
 
 type Native struct{}
 
-func NewNative(string, func() string) *Native        { return &Native{} }
-func NativeSupported() bool                          { return false }
-func (*Native) Lock(context.Context) (func(), error) { return nil, ErrUnavailable }
+func NewNative(string, func() string) *Native                        { return &Native{} }
+func NewNativeWithPolicy(string, func() (HostPolicy, error)) *Native { return &Native{} }
+func NativeSupported() bool                                          { return false }
+func (*Native) Lock(context.Context) (func(), error)                 { return nil, ErrUnavailable }
 func (*Native) Container(context.Context, string) (ContainerState, error) {
 	return ContainerState{}, ErrUnavailable
 }

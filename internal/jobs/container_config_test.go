@@ -13,10 +13,11 @@ func TestContainerDevicePermissionPersistsWithoutNativeConfigEffects(t *testing.
 	dir := t.TempDir()
 	p := config.DefaultPermissions()
 	p.ContainerRuntime = "runsc"
+	p.ContainerEgressProxyURL = "http://host.docker.internal:3128"
 	if config.SavePermissions(dir, p) != nil {
 		t.Fatal("fixture")
 	}
-	for _, body := range []string{`{"containerHostEnabled":true}`, `{}`, `{"containerHostEnabled":false}`} {
+	for _, body := range []string{`{"containerHostEnabled":true}`, `{"containerEgressProxyURL":"http://device-controlled.invalid:3128"}`, `{}`, `{"containerHostEnabled":false}`} {
 		var value DeviceConfig
 		if json.Unmarshal([]byte(body), &value) != nil {
 			t.Fatal("fixture")
@@ -25,7 +26,7 @@ func TestContainerDevicePermissionPersistsWithoutNativeConfigEffects(t *testing.
 			t.Fatal(err)
 		}
 		p = config.LoadPermissions(dir)
-		if p.ContainerRuntime != "runsc" || p.Files || p.Shell {
+		if p.ContainerRuntime != "runsc" || p.ContainerEgressProxyURL != "http://host.docker.internal:3128" || p.Files || p.Shell {
 			t.Fatal("unrelated authority changed")
 		}
 		if body == `{}` && !p.ContainerHost {
