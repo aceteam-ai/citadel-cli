@@ -40,7 +40,7 @@ func TestHostRoutesDecodeIndependentlyAndResolveExact(t *testing.T) {
 		"bad-upstream.example.net":   bad(func(e *hostEntry) { e.UpstreamHost = "http://evil.example" }),
 	}
 	now := time.Now()
-	m, err := applyRoutesResponse(nil, 200, "hosts-etag", mustBody(t, routesPayload{AppsDomain: "apps.example.com", Hosts: hostEntries(hosts)}), now)
+	m, err := applyRoutesResponse(nil, 200, "hosts-etag", mustBody(t, routesPayload{AppsDomain: "apps.example.com", Hosts: hostEntries(hosts)}), now, "apps.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,11 +62,11 @@ func TestHostRoutesDecodeIndependentlyAndResolveExact(t *testing.T) {
 		t.Fatal("unknown SNI admitted")
 	}
 	malformed := []byte(`{"apps_domain":"apps.example.com","routes":{"slug":{"mesh_ip":"100.64.0.2","port":80,"visibility":"public"}},"hosts":{"demo.example.net":{"mesh_ip":"100.64.0.21","port":80,"scheme":"http","kind":"control_plane","visibility":"public","group":"demo","online":true},"bad.example.net":{"port":"not-an-int"}}}`)
-	partial, err := applyRoutesResponse(m, 200, "partial", malformed, now)
+	partial, err := applyRoutesResponse(m, 200, "partial", malformed, now, "apps.example.com")
 	if err != nil || len(partial.hosts) != 1 || len(partial.routes) != 1 {
 		t.Fatalf("malformed host rejected valid feed: hosts=%v routes=%v err=%v", partial.hosts, partial.routes, err)
 	}
-	refreshed, err := applyRoutesResponse(m, 304, "", nil, now.Add(time.Second))
+	refreshed, err := applyRoutesResponse(m, 304, "", nil, now.Add(time.Second), "apps.example.com")
 	if err != nil || len(refreshed.hosts) != 2 {
 		t.Fatalf("304 lost hosts: %v %v", refreshed, err)
 	}
@@ -78,7 +78,7 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 
 	// 304 re-stamps last-good fresh: a NEW map sharing prev's routes/etag with
 	// fetchedAt advanced to now (so a healthy 304 feed does not expire).
-	got, err := applyRoutesResponse(prev, 304, "", nil, now)
+	got, err := applyRoutesResponse(prev, 304, "", nil, now, "")
 	if err != nil {
 		t.Fatalf("304: unexpected err %v", err)
 	}
@@ -93,13 +93,13 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 	}
 
 	// 5xx keeps last-good UNCHANGED (no re-stamp) and returns an error.
-	got, err = applyRoutesResponse(prev, 503, "", []byte("nope"), now)
+	got, err = applyRoutesResponse(prev, 503, "", []byte("nope"), now, "")
 	if err == nil || got != prev {
 		t.Fatalf("5xx: got=%v err=%v, want prev + error", got, err)
 	}
 
 	// Malformed JSON keeps last-good and returns an error.
-	got, err = applyRoutesResponse(prev, 200, "e1", []byte("{"), now)
+	got, err = applyRoutesResponse(prev, 200, "e1", []byte("{"), now, "")
 	if err == nil || got != prev {
 		t.Fatalf("malformed: got=%v err=%v, want prev + error", got, err)
 	}
@@ -118,7 +118,7 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 		LoginURL:       "https://login.example.com",
 		SessionCookies: []string{"sess"},
 	})
-	got, err = applyRoutesResponse(prev, 200, "e2", body, now)
+	got, err = applyRoutesResponse(prev, 200, "e2", body, now, "")
 	if err != nil {
 		t.Fatalf("200: unexpected err %v", err)
 	}
@@ -720,7 +720,7 @@ func TestDecodeRoute_UnknownVisibilityDefaultsGated(t *testing.T) {
 		"public": {MeshIP: "100.64.0.3", Port: 8080, Visibility: "public"},
 		"gated":  {MeshIP: "100.64.0.4", Port: 8080, Visibility: "GATED"}, // case-insensitive
 	}})
-	m, err := applyRoutesResponse(nil, 200, "e", body, now)
+	m, err := applyRoutesResponse(nil, 200, "e", body, now, "")
 	if err != nil {
 		t.Fatal(err)
 	}

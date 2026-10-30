@@ -1256,6 +1256,59 @@ func TestProxy_GatedDeny403(t *testing.T) {
 	}
 }
 
+func TestProxy_AppsNamespaceCannotBecomeExactPublicHost(t *testing.T) {
+	for _, feedDomain := range []string{"crossed.example.net", "apps.example.com"} {
+		t.Run(feedDomain, func(t *testing.T) {
+			online := true
+			entry := hostEntry{MeshIP: "100.64.0.21", Port: 80, Scheme: "http", Kind: "control_plane", Visibility: "public", Group: "app", Online: &online}
+			feed := mustBody(t, routesPayload{
+				AppsDomain: feedDomain,
+				Routes:     map[string]routeEntry{"app": {MeshIP: "100.64.0.10", Port: 8080, Visibility: "gated"}},
+				Hosts: hostEntries{
+					"apps.example.com":            entry,
+					"app.apps.example.com":        entry,
+					"nested.app.apps.example.com": entry,
+				},
+			})
+			src := &fakeSource{fetchFn: func(context.Context, string) (int, string, []byte, error) { return 200, "h1", feed, nil }}
+			client := NewClient(ClientConfig{Source: src, AppsDomain: "apps.example.com"})
+			client.pollOnce(context.Background())
+			if got := len(client.current.Load().hosts); got != 0 {
+				t.Fatalf("admitted %d hosts in configured apps namespace", got)
+			}
+			authz := &fakeAuthorizer{allow: false}
+			ts, dialer := startProxy(t, client, authz, "127.0.0.1:1")
+			resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": AppCredentialCookieName + "=secret"})
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden || atomic.LoadInt32(&authz.calls) != 1 || atomic.LoadInt32(&dialer.calls) != 0 {
+				t.Fatalf("gated host: status=%d authz=%d dials=%d", resp.StatusCode, authz.calls, dialer.calls)
+			}
+			for _, host := range []string{"apps.example.com", "nested.app.apps.example.com"} {
+				resp := get(t, ts, host, "/", nil)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusNotFound || atomic.LoadInt32(&dialer.calls) != 0 {
+					t.Fatalf("host %q: status=%d dials=%d", host, resp.StatusCode, dialer.calls)
+				}
+			}
+		})
+	}
+
+	// Request routing must also hold if a resolver supplies a legacy or malformed map.
+	res := &fakeResolver{
+		routes: map[string]Route{"app": gatedRoute()},
+		hosts: map[string]HostRoute{"app.apps.example.com": {
+			Host: "app.apps.example.com", MeshIP: netip.MustParseAddr("100.64.0.21"), Port: 80, Kind: "control_plane", Online: true,
+		}},
+	}
+	authz := &fakeAuthorizer{allow: false}
+	ts, dialer := startProxy(t, res, authz, "127.0.0.1:1")
+	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": AppCredentialCookieName + "=secret"})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || atomic.LoadInt32(&authz.calls) != 1 || atomic.LoadInt32(&dialer.calls) != 0 {
+		t.Fatalf("legacy map: status=%d authz=%d dials=%d", resp.StatusCode, authz.calls, dialer.calls)
+	}
+}
+
 func TestProxy_GatedAllowSetsSubjectAndStripsSpoof(t *testing.T) {
 	var sawSubject string
 	var sawCookie string

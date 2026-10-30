@@ -72,7 +72,7 @@ func TestHTTPSourcesRejectRedirectsWithoutForwardingSecrets(t *testing.T) {
 			if gotStatus != status {
 				t.Fatalf("Fetch() status = %d, want original redirect %d", gotStatus, status)
 			}
-			if _, err := applyRoutesResponse(nil, gotStatus, etag, body, time.Now()); err == nil {
+			if _, err := applyRoutesResponse(nil, gotStatus, etag, body, time.Now(), ""); err == nil {
 				t.Fatalf("redirect status %d was accepted as a routes response", status)
 			}
 			oneStatus, _, err := source.FetchOne(context.Background(), "redirected")

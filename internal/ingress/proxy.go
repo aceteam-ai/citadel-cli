@@ -117,7 +117,7 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 		cfg.DefaultCookieNames,
 	)
 	p := &Proxy{
-		appsDomain:         strings.ToLower(cfg.AppsDomain),
+		appsDomain:         strings.TrimSuffix(strings.ToLower(cfg.AppsDomain), "."),
 		resolver:           cfg.Resolver,
 		authorizer:         cfg.Authorizer,
 		exchanger:          cfg.Exchanger,
@@ -189,10 +189,13 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 // ServeHTTP is the ingress request path.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := hostWithoutPort(r.Host)
-	if hosts, ok := p.resolver.(HostResolver); ok {
-		if hostRoute, found, fresh := hosts.ResolveHost(host); found {
-			p.serveHost(w, r, hostRoute, fresh)
-			return
+	if !hostInAppsNamespace(host, p.appsDomain) {
+		hosts, ok := p.resolver.(HostResolver)
+		if ok {
+			if hostRoute, found, fresh := hosts.ResolveHost(host); found {
+				p.serveHost(w, r, hostRoute, fresh)
+				return
+			}
 		}
 	}
 

@@ -240,7 +240,7 @@ type routeEntry struct {
 // It never returns a nil map together with a nil error on a non-200: last-good
 // is preserved so the ingress keeps serving through a control-plane outage,
 // bounded by RouteMaxAge.
-func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, now time.Time) (*RouteMap, error) {
+func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, now time.Time, configuredAppsDomain string) (*RouteMap, error) {
 	switch {
 	case status == 304:
 		return prev.refreshed(now), nil
@@ -266,7 +266,7 @@ func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, n
 			next.routes[slug] = r
 		}
 		for host, e := range p.Hosts {
-			if r, ok := decodeHostRoute(host, p.AppsDomain, e); ok {
+			if r, ok := decodeHostRoute(host, p.AppsDomain, configuredAppsDomain, e); ok {
 				next.hosts[host] = r
 			}
 		}
@@ -292,8 +292,13 @@ func validFQDN(host string) bool {
 	return true
 }
 
-func decodeHostRoute(host, appsDomain string, e hostEntry) (HostRoute, bool) {
-	if !validFQDN(host) || !validFQDN(appsDomain) || host == appsDomain || strings.HasSuffix(host, "."+appsDomain) ||
+func hostInAppsNamespace(host, appsDomain string) bool {
+	return appsDomain != "" && (host == appsDomain || strings.HasSuffix(host, "."+appsDomain))
+}
+
+func decodeHostRoute(host, appsDomain, configuredAppsDomain string, e hostEntry) (HostRoute, bool) {
+	if !validFQDN(host) || !validFQDN(appsDomain) || hostInAppsNamespace(host, appsDomain) ||
+		(configuredAppsDomain != "" && (!validFQDN(configuredAppsDomain) || hostInAppsNamespace(host, configuredAppsDomain))) ||
 		!hostLabel.MatchString(e.Group) || e.Scheme != "http" || e.Visibility != "public" ||
 		(e.Kind != "pod" && e.Kind != "control_plane") || e.Online == nil {
 		return HostRoute{}, false
@@ -594,7 +599,7 @@ func NewClient(cfg ClientConfig) *Client {
 	c := &Client{
 		src:          cfg.Source,
 		pollInterval: poll,
-		appsDomain:   strings.TrimSpace(cfg.AppsDomain),
+		appsDomain:   strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.AppsDomain)), "."),
 		logf:         logf,
 		now:          time.Now,
 		maxAge:       maxAge,
@@ -643,7 +648,7 @@ func (c *Client) pollOnce(ctx context.Context) {
 		c.noteFailure(fmt.Sprintf("routes fetch failed: %v", err))
 		return
 	}
-	next, aerr := applyRoutesResponse(prev, status, etag, body, requestStartedAt)
+	next, aerr := applyRoutesResponse(prev, status, etag, body, requestStartedAt, c.appsDomain)
 	if aerr != nil {
 		c.warnAppsDomainMismatch(prev)
 		c.noteFailure(fmt.Sprintf("routes response rejected: %v", aerr))
