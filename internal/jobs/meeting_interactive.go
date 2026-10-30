@@ -243,7 +243,9 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 	// select below, so this degrades safely rather than false-positiving.
 	recorderDead := media.RecordingAlive()
 
-	deadline := time.Now().Add(p.maxDuration())
+	started := time.Now()
+	deadline := started.Add(p.maxDuration())
+	endState := meetingEndTracker{recordingStartedAt: started}
 	for time.Now().Before(deadline) {
 		// 1. Drain newly-stabilized transcript segments (non-blocking).
 		h.drainSegments(segCh, &out, transcript, handleLine)
@@ -279,13 +281,13 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 		}
 
 		// 4. Existing end heuristics (call ended / bot alone).
-		if reason, ended := checkMeetingEnded(page); ended {
+		if reason, ended := endState.check(page, time.Now()); ended {
 			out.endReason = reason
 			return out, nil
 		}
 
 		// 5. Recorder-death watch (citadel#490), alongside the normal poll wait.
-		// checkMeetingEnded above already runs first each iteration, so a
+		// The end-state check above already runs first each iteration, so a
 		// simultaneous natural end and recorder death favors reporting the
 		// normal end reason.
 		select {
@@ -326,25 +328,6 @@ func (h *MeetingJoinHandler) drainSegments(segCh <-chan TranscriptSegment, out *
 			return
 		}
 	}
-}
-
-// checkMeetingEnded runs the two shared end heuristics: the "you left / call
-// ended" text scan and the bot-alone participant-count signal. Both are
-// best-guess (see meeting_join.go's LIVE-TUNING block); a read error is treated
-// as "not ended" so a transient DOM glitch never ends the call early. Shared by
-// the plain and interactive wait loops.
-func checkMeetingEnded(page meetPage) (string, bool) {
-	if v, err := page.Evaluate(meetIsEndedJS); err == nil {
-		if b, ok := v.(bool); ok && b {
-			return "call_ended", true
-		}
-	}
-	if v, err := page.Evaluate(meetParticipantCountJS); err == nil {
-		if n, ok := toInt(v); ok && n >= 0 && n <= 1 {
-			return "alone_in_call", true
-		}
-	}
-	return "", false
 }
 
 // transcribeSegments transcribes the recent TAIL of the growing recording and

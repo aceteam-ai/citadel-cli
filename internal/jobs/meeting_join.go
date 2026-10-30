@@ -945,10 +945,12 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 // checkMeetingEndedFor call (which never fires again once the browser side is
 // otherwise healthy) or the duration cap.
 func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser, p meetingJoinParams, media MeetingMedia) (string, error) {
-	deadline := time.Now().Add(p.maxDuration())
+	started := time.Now()
+	deadline := started.Add(p.maxDuration())
+	endState := meetingEndTracker{recordingStartedAt: started}
 	recorderDead := media.RecordingAlive()
 	for time.Now().Before(deadline) {
-		if reason, ended := checkMeetingEndedFor(p.Platform, br); ended {
+		if reason, ended := checkMeetingEndedFor(p.Platform, br, &endState); ended {
 			return reason, nil
 		}
 		select {
@@ -969,14 +971,14 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser
 
 // checkMeetingEndedFor dispatches the end heuristic by platform so a Teams call
 // ends on its own end/removed signal (best-guess, see meeting_join_teams.go)
-// rather than always running to the max_duration cap. Meet keeps the shared
-// checkMeetingEnded. The interactive (streaming) loop remains Meet-coupled and
+// rather than always running to the max_duration cap. Meet uses its shared
+// end-state tracker. The interactive loop remains Meet-coupled and
 // out of Teams MVP scope — Teams runs the plain record→transcribe path.
-func checkMeetingEndedFor(plat meetingPlatform, page meetPage) (string, bool) {
+func checkMeetingEndedFor(plat meetingPlatform, page meetPage, endState *meetingEndTracker) (string, bool) {
 	if plat == platformTeams {
 		return checkTeamsMeetingEnded(page)
 	}
-	return checkMeetingEnded(page)
+	return endState.check(page, time.Now())
 }
 
 // syntheticTranscribeJob builds the in-process TRANSCRIBE_AUDIO job used to reuse
