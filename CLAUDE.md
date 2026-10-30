@@ -547,6 +547,14 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`meetingcapacity.Capacity` owns the inactive #1505 meeting-intake custody
+model: one shared reservation, exact incarnation/job binding, uncertain-read
+quarantine and post-executor-exit resource confirmation. It has no wire or
+native adapters, and no current JobSource invokes it. Its fake intake proofs
+do not establish API/Redis/WS pre-claim admission or authorize activation.
+aceteam-ai/aceteam#12916 blocks the paired routing, old-reader exclusion and
+credit contract before transport wiring; the internal types are not wire fields.
+
 `jobs.NewMemoryGitHandler` owns the inactive memory-git construction contract:
 live permission, strict passcode State and the actual shared node throttle are
 required; legacy callbacks and zero-value construction cannot enable it.
