@@ -119,6 +119,30 @@ func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, 
 	return s, nil
 }
 
+// WithDrivablePort keeps the session's driver arbitration stable during a
+// bounded recording. A concurrent human handoff or stop waits for the capture
+// to finish instead of allowing the recording to follow a human-driven page.
+func (m *CobrowseSessionManager) WithDrivablePort(id string, action func(int) error) error {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.proc == nil {
+		return ErrNotStarted
+	}
+	select {
+	case <-s.proc.exited:
+		return ErrNotStarted
+	default:
+	}
+	if s.humanDrivingLocked() {
+		return ErrHandedOff
+	}
+	return action(s.proc.debugPort)
+}
+
 // Navigate drives one session's browser to a URL. Refused while the session is
 // handed off to a human (ErrHandedOff).
 func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus, error) {

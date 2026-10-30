@@ -106,6 +106,24 @@ func TestCobrowseSessionActions_HandoffRefusesWrites(t *testing.T) {
 	}
 }
 
+func TestCobrowseSessionActions_RecordRefusesHumanDriver(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err = m.WithDrivablePort(st.ID, func(int) error { called = true; return nil })
+	if !errors.Is(err, ErrHandedOff) || called {
+		t.Fatalf("record while handed off: err=%v, callback called=%v", err, called)
+	}
+}
+
 func TestCobrowseSessionActions_ResumeRestoresAIControl(t *testing.T) {
 	// Fixed, unused port: after resume the action reaches the CDP call and
 	// fails with a connection error -- the point is that it is NOT ErrHandedOff.

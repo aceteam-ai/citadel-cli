@@ -213,7 +213,7 @@ func init() {
 		"ANDROID_BUILD":        jobs.NewAndroidBuildHandler(""),
 		"GOMOBILE_BUILD":       jobs.NewGomobileBuildHandler(""),
 		"COBROWSE":             jobs.NewCobrowseHandler(),
-		"COBROWSE_SESSION":     jobs.NewCobrowseSessionHandler(),
+		"COBROWSE_SESSION":     jobs.NewCobrowseSessionHandler(""),
 		"FILE_INDEX":           fileIndexHandler,
 		"FILE_SEMANTIC_SEARCH": fileSemanticSearchHandler,
 		"HTTP_PROXY":           &jobs.HTTPProxyHandler{},
