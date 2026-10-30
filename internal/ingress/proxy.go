@@ -48,6 +48,11 @@ type Resolver interface {
 
 type routeCtxKey struct{}
 type cookieNamesCtxKey struct{}
+type hostRouteCtxKey struct{}
+
+type HostResolver interface {
+	ResolveHost(host string) (HostRoute, bool)
+}
 
 // Proxy is the per-request reverse proxy handler. It resolves the host to a
 // slug, the slug to a mesh pod, enforces gated authz, strips inbound trust
@@ -135,6 +140,9 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 			route, _ := req.Context().Value(routeCtxKey{}).(Route)
 			req.URL.Scheme = "http"
 			req.URL.Host = net.JoinHostPort(route.MeshIP.String(), strconv.Itoa(int(route.Port)))
+			if hostRoute, ok := req.Context().Value(hostRouteCtxKey{}).(HostRoute); ok && hostRoute.UpstreamHost != "" {
+				req.Host = hostRoute.UpstreamHost
+			}
 			// req.Host is deliberately left as the public host so the pod sees
 			// the hostname the client used (standard ingress behavior). It is
 			// pinned by TestProxy_PreservesPublicHost.
@@ -144,6 +152,9 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 		// the client as they arrive (same as internal/gateway/chat_route.go).
 		FlushInterval: -1,
 		ModifyResponse: func(resp *http.Response) error {
+			if hostRoute, ok := resp.Request.Context().Value(hostRouteCtxKey{}).(HostRoute); ok && hostRoute.Kind == "control_plane" {
+				return nil
+			}
 			if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
 				augment, _ := resp.Request.Context().Value(cookieNamesCtxKey{}).([]string)
 				resp.Header.Del("Set-Cookie")
@@ -157,6 +168,11 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if hostRoute, ok := r.Context().Value(hostRouteCtxKey{}).(HostRoute); ok && hostRoute.Kind == "control_plane" {
+				p.logf("[ingress] control plane upstream error host=%q mesh=%s: %v", hostRoute.Host, hostRoute.MeshIP, err)
+				hostOffline(w, http.StatusBadGateway, hostRoute.Kind)
+				return
+			}
 			status := http.StatusBadGateway
 			if errors.Is(err, context.DeadlineExceeded) {
 				status = http.StatusGatewayTimeout
@@ -174,6 +190,12 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 // ServeHTTP is the ingress request path.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := hostWithoutPort(r.Host)
+	if hosts, ok := p.resolver.(HostResolver); ok {
+		if hostRoute, found := hosts.ResolveHost(host); found {
+			p.serveHost(w, r, hostRoute)
+			return
+		}
+	}
 
 	if host == p.appsDomain {
 		// Bare apps domain: a small static 404. No default backend.
@@ -278,6 +300,70 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := context.WithValue(r.Context(), routeCtxKey{}, route)
 	ctx = context.WithValue(ctx, cookieNamesCtxKey{}, augment)
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func (p *Proxy) serveHost(w http.ResponseWriter, r *http.Request, hostRoute HostRoute) {
+	if !p.resolver.Fresh() {
+		serviceUnavailable(w)
+		return
+	}
+	if !hostRoute.Online {
+		hostOffline(w, http.StatusServiceUnavailable, hostRoute.Kind)
+		return
+	}
+	if hostRoute.Kind == "control_plane" {
+		for key := range r.Header {
+			if isTrustHeader(key) {
+				r.Header.Del(key)
+			}
+		}
+		sanitizeControlPlaneConnection(r.Header)
+		setForwardHeaders(r, hostRoute.Host, "")
+		if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			r.Header.Set("X-Real-Ip", ip)
+		}
+	} else {
+		augment := p.cookieNames()
+		p.stripFn(r, augment)
+		if outboundSessionCookieLeaked(r, augment) {
+			sessionIsolationFailed(w)
+			return
+		}
+		setForwardHeaders(r, hostRoute.Host, "")
+	}
+	route := Route{MeshIP: hostRoute.MeshIP, Port: hostRoute.Port, Visibility: VisibilityPublic}
+	ctx := context.WithValue(r.Context(), routeCtxKey{}, route)
+	ctx = context.WithValue(ctx, hostRouteCtxKey{}, hostRoute)
+	ctx = context.WithValue(ctx, cookieNamesCtxKey{}, p.cookieNames())
+	p.rp.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func sanitizeControlPlaneConnection(h http.Header) {
+	values := h.Values("Connection")
+	h.Del("Connection")
+	for _, value := range values {
+		var kept []string
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token != "" && !isTrustHeader(token) && !strings.EqualFold(token, "Cookie") {
+				kept = append(kept, token)
+			}
+		}
+		if len(kept) > 0 {
+			h.Add("Connection", strings.Join(kept, ", "))
+		}
+	}
+}
+
+func hostOffline(w http.ResponseWriter, status int, kind string) {
+	title := "Host offline"
+	if kind == "control_plane" {
+		title = "Control plane offline"
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Retry-After", "5")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte("<!doctype html><title>" + title + "</title><h1>" + title + "</h1><p>Please try again shortly.</p>"))
 }
 
 // authzResult is the shared value singleflight passes to every in-flight waiter.

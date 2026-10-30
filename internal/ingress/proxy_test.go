@@ -129,10 +129,16 @@ func TestReservedIngressPath(t *testing.T) {
 
 type fakeResolver struct {
 	routes  map[string]Route
+	hosts   map[string]HostRoute
 	login   string
 	cookies []string
 	stale   bool // when true, Fresh() reports not-fresh (config-absent / expired)
 	err     error
+}
+
+func (f *fakeResolver) ResolveHost(host string) (HostRoute, bool) {
+	r, ok := f.hosts[host]
+	return r, ok
 }
 
 func (f *fakeResolver) Resolve(_ context.Context, slug string) (Route, bool, error) {
@@ -238,6 +244,128 @@ func get(t *testing.T, ts *httptest.Server, host, path string, headers map[strin
 }
 
 // --- integration tests ------------------------------------------------------
+
+func TestProxy_ExactControlPlaneHostPreservesCookiesAndRejectsOffline(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "demo.example.net" {
+			t.Errorf("Host = %q", r.Host)
+		}
+		if got := r.Header.Get("Cookie"); got != "sb-token=secret; sess=platform" {
+			t.Errorf("Cookie = %q", got)
+		}
+		if got := r.Header.Get("X-Forwarded-Proto"); got != "https" {
+			t.Errorf("proto = %q", got)
+		}
+		if got := r.Header.Get("X-Forwarded-Host"); got != "demo.example.net" {
+			t.Errorf("forwarded host = %q", got)
+		}
+		if got := r.Header.Get("X-Real-Ip"); got == "" || got == "spoof" {
+			t.Errorf("real ip = %q", got)
+		}
+		if got := r.Header.Get("X-Forwarded-For"); got == "spoof" || got == "" {
+			t.Errorf("forwarded for = %q", got)
+		}
+		w.Header().Add("Set-Cookie", "sb-token=renewed; Domain=.example.net; Path=/")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	online := true
+	feed := mustBody(t, routesPayload{AppsDomain: "apps.example.com", Hosts: hostEntries{
+		"demo.example.net": {MeshIP: "100.64.0.21", Port: 80, Scheme: "http", Kind: "control_plane", Visibility: "public", Group: "demo", Online: &online},
+	}})
+	src := &fakeSource{fetchFn: func(context.Context, string) (int, string, []byte, error) { return 200, "h1", feed, nil }}
+	client := NewClient(ClientConfig{Source: src})
+	client.pollOnce(context.Background())
+	ts, dialer := startProxy(t, client, nil, strings.TrimPrefix(upstream.URL, "http://"))
+	resp := get(t, ts, "demo.example.net", "/", map[string]string{
+		"Cookie": "sb-token=secret; sess=platform", "X-Forwarded-For": "spoof", "X-Real-Ip": "spoof",
+		"X-Forwarded-Host": "spoof", "X-Forwarded-Proto": "http", "Connection": "Cookie, X-Forwarded-Host",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("host status=%d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Set-Cookie"); got != "sb-token=renewed; Domain=.example.net; Path=/" {
+		t.Fatalf("Set-Cookie changed: %q", got)
+	}
+	if atomic.LoadInt32(&dialer.calls) != 1 {
+		t.Fatalf("dials=%d", dialer.calls)
+	}
+	unknown := get(t, ts, "other.demo.example.net", "/", nil)
+	unknown.Body.Close()
+	if unknown.StatusCode != 404 || atomic.LoadInt32(&dialer.calls) != 1 {
+		t.Fatal("unknown host dialed")
+	}
+	upstream.Close()
+	badGateway := get(t, ts, "demo.example.net", "/", nil)
+	badGateway.Body.Close()
+	if badGateway.StatusCode != 502 || !strings.Contains(badGateway.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("control plane error status=%d", badGateway.StatusCode)
+	}
+	dialed := atomic.LoadInt32(&dialer.calls)
+	current := client.current.Load()
+	copyMap := *current
+	copyMap.hosts = map[string]HostRoute{"demo.example.net": {Host: "demo.example.net", MeshIP: netip.MustParseAddr("100.64.0.21"), Port: 80, Kind: "control_plane", Online: false}}
+	client.current.Store(&copyMap)
+	offline := get(t, ts, "demo.example.net", "/", nil)
+	offline.Body.Close()
+	if offline.StatusCode != 503 || offline.Header.Get("Retry-After") == "" || atomic.LoadInt32(&dialer.calls) != dialed {
+		t.Fatalf("offline status=%d dials=%d", offline.StatusCode, dialer.calls)
+	}
+	client.current.Store(&RouteMap{hosts: copyMap.hosts, fetchedAt: time.Now().Add(-2 * RouteMaxAge)})
+	stale := get(t, ts, "demo.example.net", "/", nil)
+	stale.Body.Close()
+	if stale.StatusCode != 503 || atomic.LoadInt32(&dialer.calls) != dialed {
+		t.Fatalf("stale status=%d dials=%d", stale.StatusCode, dialer.calls)
+	}
+}
+
+func TestProxy_ExactPodHostKeepsSlugHygiene(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "pod.example.net" {
+			t.Errorf("Host=%q", r.Host)
+		}
+		if got := r.Header.Get("Cookie"); got != "theme=dark" {
+			t.Errorf("Cookie=%q", got)
+		}
+		w.Header().Set("Set-Cookie", "theme=light; Domain=.example.net; Path=/")
+	}))
+	defer upstream.Close()
+	res := &fakeResolver{hosts: map[string]HostRoute{"pod.example.net": {
+		Host: "pod.example.net", MeshIP: netip.MustParseAddr("100.64.0.22"), Port: 80, Kind: "pod", Online: true,
+	}}}
+	ts, d := startProxy(t, res, nil, strings.TrimPrefix(upstream.URL, "http://"))
+	resp := get(t, ts, "pod.example.net", "/", map[string]string{"Cookie": "sess=platform; theme=dark"})
+	resp.Body.Close()
+	if resp.StatusCode != 200 || atomic.LoadInt32(&d.calls) != 1 {
+		t.Fatalf("status=%d dials=%d", resp.StatusCode, d.calls)
+	}
+	if got := resp.Header.Get("Set-Cookie"); strings.Contains(got, "Domain=") || !strings.Contains(got, "Secure") {
+		t.Fatalf("Set-Cookie=%q", got)
+	}
+}
+
+func TestProxy_ExactHostUsesExplicitUpstreamHost(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "box.internal.example" {
+			t.Errorf("upstream Host=%q", r.Host)
+		}
+		if r.Header.Get("X-Forwarded-Host") != "demo.example.net" {
+			t.Errorf("forwarded host=%q", r.Header.Get("X-Forwarded-Host"))
+		}
+	}))
+	defer upstream.Close()
+	res := &fakeResolver{hosts: map[string]HostRoute{"demo.example.net": {
+		Host: "demo.example.net", MeshIP: netip.MustParseAddr("100.64.0.22"), Port: 80,
+		Kind: "control_plane", Online: true, UpstreamHost: "box.internal.example",
+	}}}
+	ts, _ := startProxy(t, res, nil, strings.TrimPrefix(upstream.URL, "http://"))
+	resp := get(t, ts, "demo.example.net", "/", nil)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
 
 func TestProxy_UnknownSlug404NoDial(t *testing.T) {
 	res := &fakeResolver{routes: map[string]Route{}} // nothing resolves
