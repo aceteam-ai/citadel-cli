@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -178,10 +179,12 @@ func TestInteractive_EndsWhenCallEnds(t *testing.T) {
 
 func TestInteractive_AloneInCall(t *testing.T) {
 	h := newTestInteractiveHandler()
-	page := &fakeMeetPage{participant: float64(1)}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	page := &graceSequenceBrowser{page: &fakeMeetPage{}, counts: []float64{2, 1}, afterLast: cancel}
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{Ctx: ctx}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 	if out.endReason != "alone_in_call" {
 		t.Errorf("endReason = %q, want alone_in_call", out.endReason)
 	}
