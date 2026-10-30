@@ -15,13 +15,19 @@ const MaxRecordBytes int64 = 24 * 1024 * 1024
 // RecordWebM captures one bounded CDP screencast directly into a WebM file.
 // Frames are coalesced and sampled at ten per second, so a busy page cannot
 // grow an unbounded queue or make the encoder run faster than real time.
-func RecordWebM(ctx context.Context, debugPort int, outputPath string, duration time.Duration) error {
-	return recordWebMWithGrace(ctx, debugPort, outputPath, duration, 5*time.Second)
+func RecordWebM(ctx context.Context, debugPort int, output *os.File, duration time.Duration) error {
+	return recordWebMWithGrace(ctx, debugPort, output, duration, 5*time.Second)
 }
 
-func recordWebMWithGrace(ctx context.Context, debugPort int, outputPath string, duration, grace time.Duration) error {
+func recordWebMWithGrace(ctx context.Context, debugPort int, output *os.File, duration, grace time.Duration) error {
 	if duration < time.Second || duration > 30*time.Second {
 		return fmt.Errorf("record duration must be between 1 and 30 seconds")
+	}
+	if output == nil {
+		return fmt.Errorf("record output file is required")
+	}
+	if info, err := output.Stat(); err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
+		return fmt.Errorf("record output must be a new regular file")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -35,7 +41,10 @@ func recordWebMWithGrace(ctx context.Context, debugPort int, outputPath string, 
 		"-f", "mjpeg", "-framerate", "10", "-i", "pipe:0",
 		"-an", "-c:v", "libvpx-vp9", "-deadline", "realtime",
 		"-cpu-used", "8", "-b:v", "1M",
-		"-fs", strconv.FormatInt(MaxRecordBytes, 10), outputPath)
+		"-fs", strconv.FormatInt(MaxRecordBytes, 10), "-f", "webm", "pipe:1")
+	// The encoder inherits this already-open file. A directory replacement
+	// cannot redirect its output to a different path.
+	cmd.Stdout = output
 	pipe, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("open video encoder input: %w", err)
@@ -99,7 +108,7 @@ func recordWebMWithGrace(ctx context.Context, debugPort int, outputPath string, 
 				}
 				frames++
 			}
-			if info, err := os.Stat(outputPath); err == nil && info.Size() > MaxRecordBytes {
+			if info, err := output.Stat(); err == nil && info.Size() > MaxRecordBytes {
 				return fmt.Errorf("recording exceeds the 24 MiB export limit")
 			}
 		case <-deadline.C:
@@ -117,7 +126,7 @@ func recordWebMWithGrace(ctx context.Context, debugPort int, outputPath string, 
 				}
 				return fmt.Errorf("encode WebM: %w", err)
 			}
-			info, err := os.Stat(outputPath)
+			info, err := output.Stat()
 			if err != nil || info.Size() == 0 {
 				return fmt.Errorf("video encoder produced no WebM output")
 			}
