@@ -57,3 +57,25 @@ func (h uncooperativeHandler) Execute(context.Context, *Job, StreamWriter) (*Job
 	<-h.block
 	return &JobResult{Status: JobStatusSuccess}, nil
 }
+
+// Worker shutdown (root ctx cancelled, e.g. SIGTERM) is not caller
+// cancellation: it must never publish "Meeting cancelled".
+func TestMeetingWorkerShutdownIsNotCallerCancellation(t *testing.T) {
+	meetingTestEnvironment(t)
+	h := meetingTimingHandler{profile: meetingpolicy.Default(), run: func(c context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+		<-c.Done()
+		return nil, c.Err()
+	}}
+	source := NewMockJobSource("fake", nil)
+	r := NewRunner(source, []JobHandler{h}, RunnerConfig{})
+	stream := &meetingCancellationWriter{}
+	ctx, shutdown := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); shutdown() }()
+	r.executeJob(ctx, &Job{ID: "synthetic", Type: JobTypeMeetingJoin}, stream, time.Now(), false, 0)
+	if stream.message == "Meeting cancelled" || stream.cancelled {
+		t.Fatal("worker shutdown was reported as caller cancellation")
+	}
+	if len(source.FailedJobs()) != 1 || len(source.AckedJobs()) != 0 {
+		t.Fatalf("shutdown-interrupted meeting not failed terminally: failed=%d acked=%d", len(source.FailedJobs()), len(source.AckedJobs()))
+	}
+}

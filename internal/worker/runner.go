@@ -1222,6 +1222,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		r.log("warning", "Meeting teardown remains unconfirmed; retaining source ownership")
 		return false
 	}
+	// Observe worker shutdown BEFORE the publication allowance replaces ctx
+	// with an uncancellable one; every shutdown decision below reads this.
+	rootErr := ctx.Err()
 	if cleanup := jobs.MeetingCleanupFrom(handlerCtx); cleanup != nil && budgetErr == nil {
 		publicationCtx, finish, e := cleanup.Begin(ctx)
 		if e != nil {
@@ -1255,15 +1258,15 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		return false
 	}
 	var hardDeadline *deadlineExceededError
-	if job.delivery != nil && ctx.Err() != nil && !errors.As(err, &hardDeadline) && (err != nil || result == nil || result.Status != JobStatusSuccess) {
-		_ = r.source.Nack(ctx, job, ctx.Err())
+	if job.delivery != nil && rootErr != nil && !errors.As(err, &hardDeadline) && (err != nil || result == nil || result.Status != JobStatusSuccess) {
+		_ = r.source.Nack(ctx, job, rootErr)
 		return false
 	}
 	// Caller cancellation (the platform's durable marker, or a handler-local
 	// cancel while the worker is alive) is distinct from worker shutdown: a
 	// shutdown-interrupted meeting falls through to the ordinary terminal
 	// failure path below, never "Meeting cancelled".
-	if cancelled || job.Type == JobTypeMeetingJoin && errors.Is(err, context.Canceled) && ctx.Err() == nil {
+	if cancelled || job.Type == JobTypeMeetingJoin && errors.Is(err, context.Canceled) && rootErr == nil {
 		if job.Type == JobTypeMeetingJoin {
 			r.recordJob(buildUsageRecord(job, "cancelled", startTime, endTime, result, context.Canceled))
 			if e := stream.WriteCancelled("Meeting cancelled"); e != nil {

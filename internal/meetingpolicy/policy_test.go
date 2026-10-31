@@ -124,15 +124,12 @@ func TestMeetingNamesArePresentationAndBounded(t *testing.T) {
 }
 
 func TestNameAllowsJoinersButRejectsBidiControls(t *testing.T) {
-	for _, ok := range []string{"می‌خواهم", "👩‍💻 Dev"} {
+	for _, ok := range []string{"Mi\u200cKhwaham", "Dev \U0001F469\u200d\U0001F4BB"} {
 		if got := Name(ok, OwnerFallback); got != ok {
 			t.Fatalf("%q fell back to %q", ok, got)
 		}
 	}
-	for _, bad := range []string{"Bob‮evil", "Bob⁦x⁩", "a​b­"} {
-		if strings.ContainsRune(bad, '​') {
-			continue // ZWSP/SHY policy is unchanged; only joiners were widened
-		}
+	for _, bad := range []string{"Bob\u202eevil", "Bob\u2066x\u2069", "a\u00adb"} {
 		if got := Name(bad, OwnerFallback); got != OwnerFallback {
 			t.Fatalf("%q was accepted as %q", bad, got)
 		}

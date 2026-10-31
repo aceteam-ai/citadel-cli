@@ -45,6 +45,7 @@ import (
 // reasons unrelated to the code under test.
 var (
 	acquireMeetingProfileSetupLockFn = platform.AcquireMeetingProfileSetupLock
+	chromiumAvailableFn              = platform.ChromiumAvailable
 	markMeetingProfileOwnedFn        = platform.MarkMeetingProfileOwned
 	clearMeetingProfilePlaceholderFn = platform.ClearMeetingProfilePlaceholder
 	reapOrphanedMeetingSinksFn       = platform.ReapOrphanedMeetingSinks
@@ -149,6 +150,11 @@ func (m *hostMedia) Start() (meetingBrowser, error) {
 	// must clean up its own lock hold, not rely on Close() to do it). On
 	// success, ownership moves to m.releaseProfileLock, released by Close()
 	// only once the browser itself has been torn down.
+	// A missing browser is known before anything is created; refuse cleanly
+	// rather than discovering it after mark-owned and LoadSink.
+	if !chromiumAvailableFn() {
+		return nil, fmt.Errorf("%w: no Chromium/Chrome browser found on this node", ErrMeetingStartRefused)
+	}
 	profileDir, release, err := acquireMeetingProfileSetupLockFn(m.profileDir)
 	if err != nil {
 		if errors.Is(err, platform.ErrMeetingProfileBusy) {

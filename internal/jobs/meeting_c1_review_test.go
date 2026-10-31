@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 type refusingMedia struct {
@@ -89,5 +92,51 @@ func TestMeetingAudioBackupDoesNotSpendCleanupAllowance(t *testing.T) {
 		t.Fatal("backup exhausted the cleanup allowance needed for publication")
 	} else {
 		_ = finish()
+	}
+}
+
+// The real classifiers, not an injected wrapped error: host busy profile,
+// missing Chromium, and meetingd busy/not ready/4xx all refuse cleanly; a
+// meetingd 5xx and a failed stale-session clear stay unclassified.
+func TestMeetingStartRefusalClassifiers(t *testing.T) {
+	prevLock, prevChrome := acquireMeetingProfileSetupLockFn, chromiumAvailableFn
+	t.Cleanup(func() { acquireMeetingProfileSetupLockFn, chromiumAvailableFn = prevLock, prevChrome })
+
+	chromiumAvailableFn = func() bool { return true }
+	acquireMeetingProfileSetupLockFn = func(string) (string, func(), error) {
+		return "", nil, fmt.Errorf("meeting profile busy: %w", platform.ErrMeetingProfileBusy)
+	}
+	if _, err := newHostMedia("m", t.TempDir(), "x.wav").Start(); !errors.Is(err, ErrMeetingStartRefused) {
+		t.Fatalf("busy host profile not a definite refusal: %v", err)
+	}
+	locked := false
+	acquireMeetingProfileSetupLockFn = func(string) (string, func(), error) { locked = true; return "", func() {}, nil }
+	chromiumAvailableFn = func() bool { return false }
+	if _, err := newHostMedia("m", t.TempDir(), "x.wav").Start(); !errors.Is(err, ErrMeetingStartRefused) || locked {
+		t.Fatalf("missing Chromium must refuse before any setup: %v locked=%v", err, locked)
+	}
+
+	for _, tc := range []struct {
+		post, del int
+		refused   bool
+	}{
+		{http.StatusConflict, http.StatusOK, true},
+		{http.StatusServiceUnavailable, http.StatusOK, true},
+		{http.StatusUnprocessableEntity, http.StatusOK, true},
+		{http.StatusInternalServerError, http.StatusOK, false},
+		{http.StatusConflict, http.StatusInternalServerError, false},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				w.WriteHeader(tc.post)
+				return
+			}
+			w.WriteHeader(tc.del)
+		}))
+		err := newTestContainerMedia(srv.URL).createSession()
+		srv.Close()
+		if err == nil || errors.Is(err, ErrMeetingStartRefused) != tc.refused {
+			t.Fatalf("POST %d / DELETE %d: refused=%v, err=%v", tc.post, tc.del, tc.refused, err)
+		}
 	}
 }
