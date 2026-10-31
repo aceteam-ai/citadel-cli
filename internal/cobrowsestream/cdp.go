@@ -1,18 +1,15 @@
 package cobrowsestream
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
-	"strconv"
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
 	"github.com/gorilla/websocket"
 )
 
@@ -20,17 +17,7 @@ import (
 // cannot hang a viewer connection forever.
 var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-// Chrome pretty-prints discovery and may include dozens of ad iframe targets
-// with multi-KiB URLs. 512 KiB admits those replies while keeping a hard bound.
-const maxCDPDiscoveryBytes = 512 << 10
-const maxCDPDiscoveryPages = 64
-
-// cdpTargetURL resolves a debug port to the page target's DevTools WebSocket URL.
-// It is a package var so tests can point the CDP client at a fake Chrome
-// (httptest WebSocket) without launching a real browser -- the same injection
-// seam pattern the platform launchers use. Like the existing screenshot path it
-// grabs the FIRST page target, so a session that opens a second tab streams the
-// first tab (a documented, inherited limitation).
+// cdpTargetURL remains an injection seam for fake Chrome WebSockets.
 var cdpTargetURL = defaultCDPTargetURL
 
 func defaultCDPTargetURL(debugPort int) (string, error) {
@@ -38,79 +25,11 @@ func defaultCDPTargetURL(debugPort int) (string, error) {
 }
 
 func discoverCDPTargetURL(debugPort int, client *http.Client) (string, error) {
-	// The probe is local. A redirect must not turn discovery into a request to
-	// another origin. Copy the client so the shared timeout/transport stay intact.
-	probe := *client
-	probe.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := probe.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
-	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
-	}
+	target, err := cdpdiscovery.Discover(context.Background(), debugPort, client)
 	if err != nil {
-		return "", fmt.Errorf("CDP target discovery request failed")
+		return "", err
 	}
-	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("CDP target discovery requires HTTP 200")
-	}
-	if resp.ContentLength > maxCDPDiscoveryBytes {
-		return "", fmt.Errorf("CDP target discovery exceeds 512 KiB")
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCDPDiscoveryBytes+1))
-	if err != nil {
-		return "", fmt.Errorf("CDP target discovery body read failed")
-	}
-	if len(body) > maxCDPDiscoveryBytes {
-		return "", fmt.Errorf("CDP target discovery exceeds 512 KiB")
-	}
-	return decodeCDPDiscoveryTargets(body, debugPort)
-}
-
-func decodeCDPDiscoveryTargets(body []byte, debugPort int) (string, error) {
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	opening, err := decoder.Token()
-	if err != nil || opening != json.Delim('[') {
-		return "", fmt.Errorf("CDP target discovery requires a JSON array")
-	}
-	selected := ""
-	count := 0
-	for decoder.More() {
-		var target struct {
-			Type                 string `json:"type"`
-			WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-		}
-		if err := decoder.Decode(&target); err != nil {
-			return "", fmt.Errorf("CDP target discovery contains invalid target JSON")
-		}
-		if target.Type == "page" {
-			count++
-			if count > maxCDPDiscoveryPages {
-				return "", fmt.Errorf("CDP target discovery exceeds 64 page targets")
-			}
-			if selected == "" && target.WebSocketDebuggerURL != "" {
-				selected = target.WebSocketDebuggerURL
-			}
-		}
-	}
-	if closing, err := decoder.Token(); err != nil || closing != json.Delim(']') {
-		return "", fmt.Errorf("CDP target discovery has an incomplete array")
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return "", fmt.Errorf("CDP target discovery has trailing JSON")
-	}
-	// Validate the complete array and target count before exposing its first
-	// page. A useful prefix must not hide a malformed or oversized suffix.
-	if selected != "" {
-		target, err := url.Parse(selected)
-		if err != nil || target == nil || (target.Scheme != "ws" && target.Scheme != "wss") || target.Hostname() == "" || target.User != nil || target.Fragment != "" {
-			return "", fmt.Errorf("CDP target discovery returned an invalid debugger URL")
-		}
-		// Discovery is over plain HTTP to the selected local debug port. The
-		// advertised authority is not permission to connect anywhere else.
-		target.Scheme = "ws"
-		target.Host = "127.0.0.1:" + strconv.Itoa(debugPort)
-		return target.String(), nil
-	}
-	return "", fmt.Errorf("no page target found on CDP port %d", debugPort)
+	return target.WebSocketDebuggerURL, nil
 }
 
 // screencastFrame is one decoded CDP Page.screencastFrame event.
