@@ -3340,3 +3340,26 @@ Auto-generated log of every release.
   - feat(controlcenter): read bounded shared worker detail (#1448)
 
 
+---
+
+## v2.204.0 — 2026-10-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 79 |
+| Lines added | +6503 |
+
+**Changes:**
+
+  - fix(worker): fence durable HTTP delivery before terminal publish (#1504)
+  - feat(worker): prepare fenced meeting intake custody (#1515)
+  - fix(cdp): share bounded page discovery across browser paths (#1507)
+  - fix(worker): restore permission hints and live meeting gates (#1509)
+  - Support exact ingress host routes and mounted cert sets (#1517)
+  - fix(whisper): align patched OpenTelemetry API and SDK pins (#1511)
+  - fix(agentquota): configure wake caps per harness (#1512)
+  - fix(update): preflight install authority and report manual-update capability (#1490)
+  - fix(cdp): bound HTTP target discovery before selecting a page (#1494)
+
+
