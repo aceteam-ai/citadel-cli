@@ -41,6 +41,7 @@ func writeFakeExecutable(t *testing.T, dir, name, body string) {
 // sweep) precedes the `load-module` call (LoadSink creating the current
 // meeting's sink).
 func TestHostMediaStart_SweepsSinksBeforeLoadSink(t *testing.T) {
+	assumeChromiumAvailable(t)
 	fakeBin := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "pactl.log")
 
@@ -149,6 +150,7 @@ esac
 // with no prior MarkMeetingProfileOwned): "sweep" appears in the recorded
 // call order before "mark", or "mark" is absent entirely.
 func TestHostMediaStart_MarksProfileOwnedBeforeSinkSweep(t *testing.T) {
+	assumeChromiumAvailable(t)
 	var calls []string
 
 	prevAcquire := acquireMeetingProfileSetupLockFn
@@ -250,6 +252,7 @@ func TestHostMediaStart_MarksProfileOwnedBeforeSinkSweep(t *testing.T) {
 // seam or a hand-constructed MeetingBrowser, never a real hostMedia.Start()
 // call) unaffected.
 func TestHostMediaStart_HandsOffProfileLockRatherThanReleasingBeforeBrowserStart(t *testing.T) {
+	assumeChromiumAvailable(t)
 	var calls []string
 
 	profileDir := t.TempDir()
@@ -321,4 +324,13 @@ esac
 			"instead produce [acquire mark sweep release clear], with release BEFORE the deferred "+
 			"clear", calls, wantOrder)
 	}
+}
+
+// assumeChromiumAvailable lets these call-order tests reach the setup phase on
+// a CI runner with no browser installed (the preflight refuses otherwise).
+func assumeChromiumAvailable(t *testing.T) {
+	t.Helper()
+	prev := chromiumAvailableFn
+	chromiumAvailableFn = func() bool { return true }
+	t.Cleanup(func() { chromiumAvailableFn = prev })
 }
