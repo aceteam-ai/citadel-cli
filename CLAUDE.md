@@ -3429,6 +3429,10 @@ or invalidation hook. `deliverymetadata.Observation` stores its immutable record
 behind an opaque function: Go's nested bad-verb formatting can bypass Formatters
 and print secret-bearing private pointer fields. Its formatting/shape tests pin
 that boundary. These observations do not enable durable execution or ACKs.
+Authenticated HTTP-only durable claims, renewal, commit-before-publish and
+shutdown/refusal behavior are documented in
+[docs/durable-http-delivery.md](docs/durable-http-delivery.md). That source path
+remains inactive until the paired canary and activation gates are satisfied.
 
 `Runner.Run`'s fetch loop no longer conflates "claim a job" with "execute it"
 (this is what `processJob` used to do inline, blocking `source.Next()` for the
