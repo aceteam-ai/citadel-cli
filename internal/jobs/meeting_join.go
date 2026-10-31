@@ -20,16 +20,17 @@ package jobs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -325,7 +326,12 @@ type meetingJoinParams struct {
 	MeetingURL         string
 	MeetingID          string
 	BotDisplayName     string
-	MaxDurationSeconds int // 0 means "unset"; the handler applies defaultMeetingMaxDuration
+	OwnerDisplayName   string
+	timing             meetingpolicy.Budget
+	setupDeadline      time.Time
+	recordingStartedAt time.Time
+	MaxDurationSeconds int           // 0 means "unset"; the handler applies defaultMeetingMaxDuration
+	AdmitTimeout       time.Duration // 0 keeps the existing three-minute admission wait
 	// Platform is the conferencing platform detected from MeetingURL. Selects
 	// the pre-join flow in runJoinFlow.
 	Platform meetingPlatform
@@ -336,12 +342,17 @@ type meetingJoinParams struct {
 
 // parseMeetingJoinParams validates and normalizes the raw string payload. Payload
 // values arrive as strings (the worker adapter coerces JSON numbers via
-// fmt.Sprint), so numeric fields are parsed tolerantly.
+// fmt.Sprint); timing fields require bounded canonical whole seconds.
 func parseMeetingJoinParams(payload map[string]string) (meetingJoinParams, error) {
+	return parseMeetingJoinParamsWithProfile(payload, meetingpolicy.Default())
+}
+
+func parseMeetingJoinParamsWithProfile(payload map[string]string, profile meetingpolicy.Profile) (meetingJoinParams, error) {
 	p := meetingJoinParams{
-		MeetingURL:     strings.TrimSpace(payload["meeting_url"]),
-		MeetingID:      strings.TrimSpace(payload["meeting_id"]),
-		BotDisplayName: strings.TrimSpace(payload["bot_display_name"]),
+		MeetingURL:       strings.TrimSpace(payload["meeting_url"]),
+		MeetingID:        strings.TrimSpace(payload["meeting_id"]),
+		BotDisplayName:   meetingpolicy.Name(payload["bot_display_name"], meetingpolicy.BotFallback),
+		OwnerDisplayName: meetingpolicy.Name(payload["owner_display_name"], meetingpolicy.OwnerFallback),
 	}
 	if p.MeetingURL == "" {
 		return meetingJoinParams{}, fmt.Errorf("job payload missing required 'meeting_url' field")
@@ -364,37 +375,45 @@ func parseMeetingJoinParams(payload map[string]string) (meetingJoinParams, error
 	p.MeetingURL = normalized
 	p.Platform = parsed.Platform
 	p.Passcode = parsed.Passcode
-	if p.BotDisplayName == "" {
-		p.BotDisplayName = defaultBotDisplayName
-	}
-	if raw := strings.TrimSpace(payload["max_duration_seconds"]); raw != "" {
+	if raw, present := payload["max_duration_seconds"]; present {
 		secs, err := parsePositiveSeconds(raw)
 		if err != nil {
 			return meetingJoinParams{}, fmt.Errorf("invalid 'max_duration_seconds': %w", err)
 		}
 		p.MaxDurationSeconds = secs
 	}
+	a, ap := payload["admit_timeout_seconds"]
+	r, rp := payload["max_duration_seconds"]
+	p.timing, err = profile.Budget(a, ap, r, rp)
+	if err != nil {
+		return meetingJoinParams{}, err
+	}
+	p.AdmitTimeout = p.timing.Admission()
 	return p, nil
 }
 
-// parsePositiveSeconds parses a duration-in-seconds field that may arrive as an
-// int string ("300") or a float string ("300.0", from a JSON number coerced by
-// fmt.Sprint). Rejects non-positive values.
+func (p meetingJoinParams) admissionTimeout() time.Duration {
+	if p.AdmitTimeout > 0 {
+		return p.AdmitTimeout
+	}
+	return admitTimeout
+}
+
+func meetingAdmissionPollDelay(deadline time.Time) time.Duration {
+	if remaining := time.Until(deadline); remaining < meetingPollInterval {
+		return remaining
+	}
+	return meetingPollInterval
+}
+
+// parsePositiveSeconds refuses fractional, nonfinite and noncanonical values
+// before narrowing to the bounded recording range.
 func parsePositiveSeconds(raw string) (int, error) {
-	if n, err := strconv.Atoi(raw); err == nil {
-		if n <= 0 {
-			return 0, fmt.Errorf("must be positive, got %d", n)
-		}
-		return n, nil
+	n, ok := meetingpolicy.Decimal(raw)
+	if !ok || n > meetingpolicy.Default().RecordingMax {
+		return 0, fmt.Errorf("bounded canonical whole seconds required")
 	}
-	f, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return 0, fmt.Errorf("not a number: %q", raw)
-	}
-	if f <= 0 {
-		return 0, fmt.Errorf("must be positive, got %v", f)
-	}
-	return int(f), nil
+	return int(n), nil
 }
 
 // maxDuration resolves the effective hard cap for a run.
@@ -402,7 +421,17 @@ func (p meetingJoinParams) maxDuration() time.Duration {
 	if p.MaxDurationSeconds > 0 {
 		return time.Duration(p.MaxDurationSeconds) * time.Second
 	}
+	if p.timing.Recording() > 0 {
+		return p.timing.Recording()
+	}
 	return defaultMeetingMaxDuration
+}
+
+func (p meetingJoinParams) recordingStart() time.Time {
+	if !p.recordingStartedAt.IsZero() {
+		return p.recordingStartedAt
+	}
+	return time.Now()
 }
 
 // sanitizeMeetingFilename keeps only filename-safe characters so a meeting id
@@ -461,7 +490,7 @@ func (h *MeetingJoinHandler) defaultSelectMedia(p meetingJoinParams) MeetingMedi
 			p.MeetingID,
 			meetingWavRelPath(p.MeetingID),
 			meetingWavPath(h.WorkspaceDir, p.MeetingID),
-			p.maxDuration(),
+			p.mediaLifetime(),
 		)
 	}
 	return newHostMedia(p.MeetingID, h.ProfileDir, meetingWavPath(h.WorkspaceDir, p.MeetingID))
@@ -480,7 +509,13 @@ func (h *MeetingJoinHandler) containerMediaHealthy() bool {
 // MeetingJoinHandler handles MEETING_JOIN jobs. It reuses the transcribe handler
 // (same workspace) to turn the recording into a transcript node-locally.
 type MeetingJoinHandler struct {
-	WorkspaceDir string
+	transcribeFinal func(JobContext, *nexus.Job, string) ([]byte, error)
+	now             func() time.Time
+	WorkspaceDir    string
+	// Timing is resolved once from persisted node configuration and shared with
+	// the worker deadline/readiness boundary. Invalid config never runs media.
+	Timing      meetingpolicy.Profile
+	TimingError error
 	// ProfileDir overrides the persistent, signed-in bot Chrome profile
 	// directory (issue #5122). Empty means "use platform's default
 	// resolution" — EnvMeetingProfileDir, then ConfigDir()/meeting-profile.
@@ -490,8 +525,8 @@ type MeetingJoinHandler struct {
 	transcriber *TranscribeAudioHandler
 
 	// StreamingEnabled turns on the DURING-call interactive layer (issue #5435):
-	// rolling transcription, the in-call `/ace` command monitor, chat capture,
-	// and the self-announcement. Default false (zero value) so the plain
+	// rolling transcription, the full in-call `/ace` command monitor and chat
+	// capture. Both modes attempt disclosure and honor typed standalone leave. Default false (zero value) so the plain
 	// NewMeetingJoinHandler constructor and the existing batch pipeline are
 	// unchanged; the worker sets it from the persisted meeting config
 	// (config.Meeting.StreamingEnabled, default-on). The whole interactive layer
@@ -547,6 +582,24 @@ type MeetingJoinHandler struct {
 	diskPressureFn   func(dir string) bool
 }
 
+func (h *MeetingJoinHandler) meetingNow() time.Time {
+	if h.now != nil {
+		return h.now()
+	}
+	return time.Now()
+}
+
+func (h *MeetingJoinHandler) MeetingProfile() (meetingpolicy.Profile, error) {
+	if h.TimingError != nil {
+		return meetingpolicy.Profile{}, h.TimingError
+	}
+	p := h.Timing
+	if p == (meetingpolicy.Profile{}) {
+		p = meetingpolicy.Default()
+	}
+	return p, p.Validate()
+}
+
 // NewMeetingJoinHandler constructs a handler rooted at the node workspace.
 func NewMeetingJoinHandler(workspace string) *MeetingJoinHandler {
 	return &MeetingJoinHandler{
@@ -583,12 +636,35 @@ func (h *MeetingJoinHandler) ConfigDir() string {
 // Execute runs the full join → record → transcribe lifecycle and returns a JSON
 // document (transcript + wav path + status). The browser and null sink are torn
 // down on every exit path, including errors.
-func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []byte, resultErr error) {
+	executionStarted := meetingExecutionStart(ctx.Context())
 	if h.WorkspaceDir == "" {
 		return nil, fmt.Errorf("MEETING_JOIN requires a configured workspace directory")
 	}
-	p, err := parseMeetingJoinParams(job.Payload)
+	profile, err := h.MeetingProfile()
 	if err != nil {
+		return nil, err
+	}
+	p, err := parseMeetingJoinParamsWithProfile(job.Payload, profile)
+	if err != nil {
+		return nil, err
+	}
+	raw, timeoutPresent := job.Payload["timeout_ms"]
+	if err := p.timing.CheckAuthority(raw, timeoutPresent, "", ""); err != nil {
+		return nil, err
+	}
+	execCtx, cancelExecution := context.WithTimeout(ctx.Context(), p.timing.Execution())
+	defer cancelExecution()
+	ctx.Ctx = execCtx
+	cleanup := MeetingCleanupFrom(execCtx)
+	if cleanup == nil {
+		cleanup = NewMeetingCleanup(time.Duration(profile.Cleanup) * time.Second)
+		ctx.Ctx = WithMeetingCleanup(execCtx, cleanup)
+	}
+	p.setupDeadline = executionStarted.Add(time.Duration(profile.Setup) * time.Second)
+	setupCtx, cancelSetup := setupMeetingContext(ctx, p)
+	defer cancelSetup()
+	if err := setupCtx.Context().Err(); err != nil {
 		return nil, err
 	}
 
@@ -601,7 +677,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// reaches this far (every real construction goes through
 	// NewMeetingJoinHandler).
 	if h.transcriber != nil {
-		if err := checkVRAMPreflight(ctx, job.Payload, h.transcriber.collectStatusForDiagnosis); err != nil {
+		if err := checkVRAMPreflight(setupCtx, job.Payload, h.transcriber.collectStatusForDiagnosis); err != nil {
 			return nil, err
 		}
 	}
@@ -611,19 +687,63 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// Pick the media backend for this run: the containerized meeting module when
 	// it is installed and healthy on this node, else the in-process host stack
 	// (#514). media.Start brings up the browser + audio capture and returns the
-	// CDP-driven browser; on failure it cleans up what it partially started, so
-	// Close is deferred only after Start succeeds.
-	media := h.selectMedia(p)
-	br, err := media.Start()
-	if err != nil {
+	// CDP-driven browser. Cleanup is attempted after any start attempt; an
+	// ambiguous start result retains custody even if a later close returns.
+	var media MeetingMedia
+	if err := checkMeetingPhase(setupCtx.Context(), func() error { media = h.selectMedia(p); return nil }); err != nil {
 		return nil, err
 	}
-	defer func() { _ = media.Close() }()
+	closed := false
+	startAttempted := false
+	closeMedia := func() error {
+		if closed || !startAttempted {
+			return nil
+		}
+		err := cleanup.Run(ctx.Context(), func(c context.Context) error {
+			if native, ok := media.(interface{ CloseContext(context.Context) error }); ok {
+				return native.CloseContext(c)
+			}
+			return checkMeetingPhase(c, media.Close)
+		})
+		if err == nil {
+			closed = true
+		}
+		return err
+	}
+	defer func() {
+		if e := closeMedia(); e != nil {
+			result = nil
+			resultErr = errors.Join(resultErr, ErrMeetingTeardownUnconfirmed)
+		}
+	}()
+	var br meetingBrowser
+	err = checkMeetingPhase(setupCtx.Context(), func() error {
+		startAttempted = true
+		var startErr error
+		if native, ok := media.(*containerMedia); ok {
+			br, startErr = native.StartContext(setupCtx.Context())
+		} else {
+			br, startErr = media.Start()
+		}
+		return startErr
+	})
+	if err != nil {
+		if !startAttempted {
+			return nil, err
+		}
+		if errors.Is(err, ErrMeetingStartRefused) {
+			// Nothing was created, so there is nothing to close or retain.
+			startAttempted = false
+			return nil, err
+		}
+		return nil, errors.Join(err, ErrMeetingTeardownUnconfirmed)
+	}
 
 	// Run the (unverified) Meet join flow.
 	if err := h.runJoinFlow(ctx, br, p); err != nil {
 		return nil, fmt.Errorf("meeting join flow: %w", err)
 	}
+	cancelSetup()
 
 	// Admitted: begin recording. Ensure the meetings/ dir exists first — the host
 	// ffmpeg's -y does NOT create parent directories (the container's meetingd
@@ -638,17 +758,18 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// The rolling-window transcription scratch clip (meeting_transcribe_window.go)
 	// is a per-pass temp; remove it on exit so it does not linger in the workspace.
 	defer func() { _ = os.Remove(meetingWindowWavPath(h.WorkspaceDir, p.MeetingID)) }()
-	if err := media.StartRecording(); err != nil {
+	if err := checkMeetingPhase(ctx.Context(), media.StartRecording); err != nil {
 		return nil, fmt.Errorf("start recording: %w", err)
 	}
+	p.recordingStartedAt = h.meetingNow()
 	ctx.Log("info", "     - [Job %s] recording meeting to %s", job.ID, wavPath)
 
 	// Stay in the call until it ends or the hard cap trips. When the interactive
-	// layer is enabled (issue #5435) this additionally announces the bot, runs
-	// rolling transcription + the in-call `/ace` command monitor, and captures
+	// layer is enabled (issue #5435) this additionally runs rolling
+	// transcription + the full in-call `/ace` command monitor, and captures
 	// Meet chat — all best-effort, so a stale live selector degrades to the batch
 	// behavior rather than regressing the recording. Otherwise the plain
-	// record-until-end loop runs exactly as the shipped batch notetaker. A
+	// record-until-end loop attempts disclosure and supports typed leave. A
 	// non-nil recorderErr means the recording process itself died mid-call
 	// (citadel#490) — the WAV on disk is truncated or empty, and this is
 	// reported as a job failure below rather than a silent "completed" result.
@@ -659,21 +780,57 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// the path from StopRecording so we transcribe exactly what was written. Safe
 	// to call even after a recorderErr: the process has already exited, so this
 	// is just cleanup (unloading the sink / finalizing session state).
-	recordedPath, stopErr := media.StopRecording()
+	var recordedPath string
+	stopErr := cleanup.Run(ctx.Context(), func(c context.Context) error {
+		var e error
+		if native, ok := media.(*containerMedia); ok {
+			recordedPath, e = native.StopRecordingContext(c)
+		} else {
+			e = checkMeetingPhase(c, func() error { recordedPath, e = media.StopRecording(); return e })
+		}
+		return e
+	})
 	if stopErr != nil {
 		ctx.Log("warn", "     - [Job %s] recorder stop reported: %v", job.ID, stopErr)
 	}
 	if recordedPath == "" {
 		recordedPath = wavPath
 	}
+	if e := closeMedia(); e != nil {
+		return nil, errors.Join(e, ErrMeetingTeardownUnconfirmed)
+	}
+	if stopErr != nil {
+		if _, container := media.(*containerMedia); container && !errors.Is(stopErr, ErrMeetingTeardownUnconfirmed) {
+			// The confirmed session DELETE above removed meetingd's recorder and
+			// browser, so a failed /record/stop (typically after the recorder
+			// already died) leaves nothing owned. Report the recording failure
+			// honestly instead of retaining custody forever.
+			if recorderErr == nil {
+				recorderErr = fmt.Errorf("finalize recording: %w", stopErr)
+			}
+			stopErr = nil
+		}
+	}
+	if stopErr != nil || outcome.teardownUncertain {
+		return nil, errors.Join(stopErr, ErrMeetingTeardownUnconfirmed)
+	}
 
-	// Sovereign audio backup + retention (aceteam#5097). Runs HERE — after the
-	// WAV is finalized but BEFORE transcription — so the backend still receives
-	// the audio even when transcription fails (the failure path returns early
-	// below, and the backup is MOST valuable exactly then). Fully best-effort:
-	// it never returns an error and never touches the meeting result. Runs even
-	// on a recorderErr: whatever partial audio exists is still worth backing up.
-	h.backupAndPrune(ctx, job, p, recordedPath)
+	// The finite transcription phase (T) starts here and also bounds the
+	// sovereign audio backup (aceteam#5097). The backup never spends the
+	// teardown/publication allowance (C): a slow transcode or upload must not
+	// starve the later result publication.
+	transcriptionCtx, cancelTranscription := context.WithTimeout(ctx.Context(), time.Duration(profile.Transcription)*time.Second)
+	defer cancelTranscription()
+
+	// Backup runs after the WAV is finalized but BEFORE transcription, so the
+	// backend still receives the audio even when transcription fails (the
+	// failure path returns early below, and the backup is MOST valuable exactly
+	// then). Fully best-effort: it never returns an error and never touches the
+	// meeting result. Runs even on a recorderErr: partial audio is still worth
+	// backing up.
+	backupCtx := ctx
+	backupCtx.Ctx = transcriptionCtx
+	h.backupAndPrune(backupCtx, job, p, recordedPath)
 
 	if recorderErr != nil {
 		// end_reason "cancelled" (citadel#488) means the job's context was
@@ -693,12 +850,21 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// Transcribe node-locally by reusing the transcribe handler in-process. This
 	// end-of-call batch pass remains the SOURCE OF TRUTH for the stored
 	// transcript; rolling transcription during the call was additive.
-	transcript, tErr := h.transcribe(ctx, job, recordedPath)
+	transcribeCtx := ctx
+	transcribeCtx.Ctx = transcriptionCtx
+	transcript, tErr := h.transcribe(transcribeCtx, job, recordedPath)
+	if transcriptionCtx.Err() != nil {
+		tErr = transcriptionCtx.Err()
+	}
+	if ctx.Context().Err() != nil {
+		return nil, ctx.Context().Err()
+	}
 	if tErr != nil {
 		// Return a structured partial result rather than failing outright: the
 		// recording succeeded and is on disk; transcription can be retried.
 		out, _ := json.Marshal(map[string]any{
 			"status":              "recorded_transcription_failed",
+			"disclosure_posted":   outcome.disclosurePosted,
 			"meeting_id":          p.MeetingID,
 			"audio_path":          recordedPath,
 			"end_reason":          outcome.endReason,
@@ -714,6 +880,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 
 	out, _ := json.Marshal(map[string]any{
 		"status":              "completed",
+		"disclosure_posted":   outcome.disclosurePosted,
 		"meeting_id":          p.MeetingID,
 		"audio_path":          recordedPath,
 		"end_reason":          outcome.endReason,
@@ -728,8 +895,8 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 
 // runMeetingLoop chooses the interactive during-call loop (issue #5435) when
 // streaming is enabled, else the plain record-until-end loop. In both cases it
-// returns an interactiveOutcome; the plain path fills only endReason so the
-// result shape is uniform (chat/recognized_commands come back empty). Splitting
+// returns an interactiveOutcome; the plain path fills endReason and disclosure
+// so the result shape is uniform (chat/recognized_commands come back empty). Splitting
 // here keeps Execute's happy path readable and the streaming gate in one place.
 //
 // media is threaded through so BOTH paths can watch the recorder's own death
@@ -751,6 +918,14 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 // existing deferred teardown in Execute (media.Close, StopRecording) still
 // runs.
 func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p meetingJoinParams, wavPath string, media MeetingMedia) (interactiveOutcome, error) {
+	recordingCtx, cancelRecording := context.WithDeadline(ctx.Context(), p.recordingStart().Add(p.maxDuration()))
+	defer cancelRecording()
+	br = phaseMeetingBrowser{meetingBrowser: br, ctx: recordingCtx}
+	botMessages := make(map[string]struct{})
+	posted := false
+	if p.Platform != platformTeams {
+		posted = h.announceOnAdmission(ctx, br, botMessages, p)
+	}
 	// The interactive during-call layer (announce / rolling `/ace` commands /
 	// chat capture) is Meet-coupled (issue #5435) and explicitly OUT of the Teams
 	// MVP scope (#7000: join + record + transcribe, no in-call chat). Route Teams
@@ -758,23 +933,30 @@ func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p
 	// end-detection (checkMeetingEndedFor). Wiring the interactive layer for Teams
 	// is a documented follow-up once its DOM is live-tuned.
 	if !h.StreamingEnabled || p.Platform == platformTeams {
-		reason, err := h.waitForMeetingEnd(ctx, br, p, media)
-		return interactiveOutcome{endReason: reason}, err
+		reason, err := h.waitForMeetingEnd(ctx, br, p, media, botMessages)
+		return interactiveOutcome{endReason: reason, disclosurePosted: posted}, err
 	}
 
 	// botMessages tracks the normalized text of messages the bot itself posts, so
 	// the poll loop never scans its own echoed chat for commands (the
 	// announcement contains "/ace leave"). Seeded by announceOnAdmission.
-	botMessages := make(map[string]struct{})
-
-	// Capability 4: announce on admittance (best-effort, never fatal).
-	h.announceOnAdmission(ctx, br, botMessages)
 
 	// Build the production rolling-transcription pass over the growing wav.
+	// The rolling pass gets its own cancel so stopping it aborts an in-flight
+	// sidecar request instead of waiting for it (a pass holds only that HTTP
+	// call, no media resource).
+	passCtx, cancelPasses := context.WithCancel(recordingCtx)
+	defer cancelPasses()
 	transcribe := func() ([]TranscriptSegment, error) {
-		return h.transcribeSegments(ctx, p.MeetingID, wavPath)
+		rollingCtx := ctx
+		rollingCtx.Ctx = passCtx
+		return h.transcribeSegments(rollingCtx, p.MeetingID, wavPath)
 	}
-	return h.waitForMeetingEndInteractive(ctx, br, p, transcribe, meetingPollInterval, botMessages, media)
+	loopCtx := ctx
+	loopCtx.Ctx = context.WithValue(ctx.Context(), rollingCancelKey{}, cancelPasses)
+	out, err := h.waitForMeetingEndInteractive(loopCtx, br, p, transcribe, meetingPollInterval, botMessages, media)
+	out.disclosurePosted = posted
+	return out, err
 }
 
 // runJoinFlow dispatches to the platform-specific pre-join sequence based on the
@@ -799,10 +981,16 @@ func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br meetingBrowser, p me
 // see the LIVE-TUNING block). Non-fatal steps (permission dismissals, name entry
 // when signed in) log and continue; the join click and admission are fatal.
 func (h *MeetingJoinHandler) runMeetJoinFlow(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
+	parentCtx, rawBrowser := ctx, br
+	ctx, cancel := setupMeetingContext(ctx, p)
+	defer cancel()
+	br = phaseMeetingBrowser{meetingBrowser: br, ctx: ctx.Context()}
 	if err := br.Navigate(p.MeetingURL); err != nil {
 		return fmt.Errorf("navigate to meeting url: %w", err)
 	}
-	time.Sleep(meetPageSettle)
+	if err := meetingSleep(ctx.Context(), meetPageSettle); err != nil {
+		return err
+	}
 
 	// Fatal: the persistent bot profile's Google session may have expired
 	// (cookie expiry, revoked session, forced re-auth). Rather than silently
@@ -834,7 +1022,7 @@ func (h *MeetingJoinHandler) runMeetJoinFlow(ctx JobContext, br meetingBrowser, 
 	}
 
 	// Fatal: wait until admitted (in-call toolbar appears) or timeout.
-	return h.waitUntilAdmitted(ctx, br, p)
+	return h.waitUntilAdmitted(parentCtx, rawBrowser, p)
 }
 
 // joinPage is the slice of platform.MeetingBrowser that pollForJoinClick needs,
@@ -911,10 +1099,20 @@ func pollForJoinClick(ctx JobContext, page joinPage, botDisplayName string, time
 // admitTimeout — the caller's deferred media.Close() then tears down the
 // browser/Xvfb/sink instead of leaking them to a SIGKILL.
 func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
-	deadline := time.Now().Add(admitTimeout)
+	timeout := p.admissionTimeout()
+	deadline := time.Now().Add(timeout)
+	probeCtx, cancel := context.WithDeadline(ctx.Context(), deadline)
+	defer cancel()
+	br = phaseMeetingBrowser{meetingBrowser: br, ctx: probeCtx}
 	for time.Now().Before(deadline) {
 		if v, err := br.Evaluate(meetIsAdmittedJS); err == nil {
 			if b, ok := v.(bool); ok && b {
+				if err := ctx.Context().Err(); err != nil {
+					return fmt.Errorf("meeting cancelled while waiting for admission: %w", err)
+				}
+				if !time.Now().Before(deadline) {
+					break
+				}
 				ctx.Log("info", "     - admitted to meeting %s", p.MeetingID)
 				return nil
 			}
@@ -926,10 +1124,10 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 			err := fmt.Errorf("meeting cancelled while waiting for admission: %w", ctx.Context().Err())
 			ctx.Log("info", "     - admission wait for meeting %s cancelled (shutdown/drain): %v", p.MeetingID, err)
 			return err
-		case <-time.After(meetingPollInterval):
+		case <-time.After(meetingAdmissionPollDelay(deadline)):
 		}
 	}
-	return fmt.Errorf("not admitted to meeting within %s (host did not let the bot in, or admission selector is stale)", admitTimeout)
+	return fmt.Errorf("not admitted to meeting within %s (host did not let the bot in, or admission selector is stale)", timeout)
 }
 
 // waitForMeetingEnd blocks until the call ends (end heuristic true, or the bot is
@@ -944,12 +1142,34 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 // so death is caught within one poll tick rather than only at the next
 // checkMeetingEndedFor call (which never fires again once the browser side is
 // otherwise healthy) or the duration cap.
-func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser, p meetingJoinParams, media MeetingMedia) (string, error) {
-	deadline := time.Now().Add(p.maxDuration())
+func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser, p meetingJoinParams, media MeetingMedia, ownMessages ...map[string]struct{}) (string, error) {
+	started := p.recordingStart()
+	deadline := started.Add(p.maxDuration())
+	endState := meetingEndTracker{recordingStartedAt: started}
 	recorderDead := media.RecordingAlive()
-	for time.Now().Before(deadline) {
-		if reason, ended := checkMeetingEndedFor(p.Platform, br); ended {
+	seenChat := make(map[int]struct{})
+	for h.meetingNow().Before(deadline) {
+		if reason, ended := checkMeetingEndedFor(p.Platform, br, &endState); ended {
 			return reason, nil
+		}
+		if p.Platform != platformTeams && len(ownMessages) > 0 {
+			messages, _ := readMeetChat(br)
+			for _, m := range messages {
+				if _, seen := seenChat[m.Index]; seen {
+					continue
+				}
+				seenChat[m.Index] = struct{}{}
+				if _, own := ownMessages[0][normalizeChatText(m.Text)]; own {
+					continue
+				}
+				if normalizeChatText(m.Text) == "/ace leave" {
+					_, _ = br.Evaluate(meetLeaveCallJS)
+					return "ace_command_leave", nil
+				}
+			}
+		}
+		if !h.meetingNow().Before(deadline) {
+			break
 		}
 		select {
 		case <-recorderDead:
@@ -960,7 +1180,7 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser
 			err := fmt.Errorf("meeting cancelled: %w", ctx.Context().Err())
 			ctx.Log("info", "     - meeting wait for %s cancelled (shutdown/drain): %v", p.MeetingID, err)
 			return "cancelled", err
-		case <-time.After(meetingPollInterval):
+		case <-time.After(meetingPollRemaining(deadline, h.meetingNow(), meetingPollInterval)):
 		}
 	}
 	ctx.Log("info", "     - max meeting duration (%s) reached; leaving", p.maxDuration())
@@ -969,14 +1189,14 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser
 
 // checkMeetingEndedFor dispatches the end heuristic by platform so a Teams call
 // ends on its own end/removed signal (best-guess, see meeting_join_teams.go)
-// rather than always running to the max_duration cap. Meet keeps the shared
-// checkMeetingEnded. The interactive (streaming) loop remains Meet-coupled and
+// rather than always running to the max_duration cap. Meet uses its shared
+// end-state tracker. The interactive loop remains Meet-coupled and
 // out of Teams MVP scope — Teams runs the plain record→transcribe path.
-func checkMeetingEndedFor(plat meetingPlatform, page meetPage) (string, bool) {
+func checkMeetingEndedFor(plat meetingPlatform, page meetPage, endState *meetingEndTracker) (string, bool) {
 	if plat == platformTeams {
 		return checkTeamsMeetingEnded(page)
 	}
-	return checkMeetingEnded(page)
+	return endState.check(page, time.Now())
 }
 
 // syntheticTranscribeJob builds the in-process TRANSCRIBE_AUDIO job used to reuse
@@ -1007,8 +1227,13 @@ func syntheticTranscribeJob(id, wavPath string) *nexus.Job {
 // transcribeMu with any in-flight rolling pass so the two never hit the whisper
 // sidecar or read the recording concurrently.
 func (h *MeetingJoinHandler) transcribe(ctx JobContext, job *nexus.Job, wavPath string) ([]byte, error) {
-	h.transcribeMu.Lock()
+	if err := h.lockMeetingTranscriber(ctx.Context()); err != nil {
+		return nil, err
+	}
 	defer h.transcribeMu.Unlock()
+	if h.transcribeFinal != nil {
+		return h.transcribeFinal(ctx, job, wavPath)
+	}
 	return h.transcriber.Execute(ctx, syntheticTranscribeJob(job.ID+"-transcribe", wavPath))
 }
 

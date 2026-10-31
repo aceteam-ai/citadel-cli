@@ -24,6 +24,7 @@
 package jobs
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -196,10 +197,16 @@ var teamsContinueWithoutAudioLabels = []string{
 // join and admission are fatal. Selectors VERIFIED against a live light-meetings
 // anon join (2026-08-01) — see the VERIFIED block above.
 func (h *MeetingJoinHandler) runTeamsJoinFlow(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
+	parentCtx, rawBrowser := ctx, br
+	ctx, cancel := setupMeetingContext(ctx, p)
+	defer cancel()
+	br = phaseMeetingBrowser{meetingBrowser: br, ctx: ctx.Context()}
 	if err := br.Navigate(p.MeetingURL); err != nil {
 		return fmt.Errorf("navigate to teams meeting url: %w", err)
 	}
-	time.Sleep(teamsPageSettle)
+	if err := meetingSleep(ctx.Context(), teamsPageSettle); err != nil {
+		return err
+	}
 
 	// Fatal: the Teams meeting is refusing an anonymous/guest web join and has
 	// redirected to a Microsoft sign-in wall (login.microsoftonline.com). The
@@ -227,7 +234,7 @@ func (h *MeetingJoinHandler) runTeamsJoinFlow(ctx JobContext, br meetingBrowser,
 	}
 
 	// Fatal: wait until admitted (in-call toolbar appears) or the lobby timeout.
-	return h.waitUntilTeamsAdmitted(ctx, br, p)
+	return h.waitUntilTeamsAdmitted(parentCtx, rawBrowser, p)
 }
 
 // pollForTeamsJoinClick repeatedly (1) checks whether the bot is already in-call,
@@ -316,7 +323,11 @@ func pollForTeamsJoinClick(ctx JobContext, page joinPage, botDisplayName, passco
 // in-call, the lobby timeout elapses, or the job context is cancelled (worker
 // shutdown/drain, citadel#488 — mirrors waitUntilAdmitted for Meet).
 func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
-	deadline := time.Now().Add(admitTimeout)
+	timeout := p.admissionTimeout()
+	deadline := time.Now().Add(timeout)
+	probeCtx, cancel := context.WithDeadline(ctx.Context(), deadline)
+	defer cancel()
+	br = phaseMeetingBrowser{meetingBrowser: br, ctx: probeCtx}
 	for time.Now().Before(deadline) {
 		// Best-effort: dismiss the "Are you sure you don't want audio or video?"
 		// confirmation Teams raises right after "Join now" on a device-less bot —
@@ -326,6 +337,12 @@ func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBr
 		}
 		if v, err := br.Evaluate(teamsIsAdmittedJS); err == nil {
 			if b, ok := v.(bool); ok && b {
+				if err := ctx.Context().Err(); err != nil {
+					return fmt.Errorf("Teams meeting cancelled while waiting for admission: %w", err)
+				}
+				if !time.Now().Before(deadline) {
+					break
+				}
 				ctx.Log("info", "     - admitted to Teams meeting %s", p.MeetingID)
 				return nil
 			}
@@ -337,10 +354,10 @@ func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBr
 			err := fmt.Errorf("Teams meeting cancelled while waiting for admission: %w", ctx.Context().Err())
 			ctx.Log("info", "     - admission wait for Teams meeting %s cancelled (shutdown/drain): %v", p.MeetingID, err)
 			return err
-		case <-time.After(meetingPollInterval):
+		case <-time.After(meetingAdmissionPollDelay(deadline)):
 		}
 	}
-	return fmt.Errorf("not admitted to Teams meeting within %s (host did not let the bot in, or the admission selector is stale — re-tune teamsIsAdmittedJS)", admitTimeout)
+	return fmt.Errorf("not admitted to Teams meeting within %s (host did not let the bot in, or the admission selector is stale; re-tune teamsIsAdmittedJS)", timeout)
 }
 
 // checkTeamsMeetingEnded runs the Teams end heuristic (the "you left / removed /

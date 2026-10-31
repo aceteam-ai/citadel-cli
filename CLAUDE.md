@@ -751,6 +751,12 @@ finite floor can be proven safe against it, so this falls back to
 `StalePendingReclaimFloorFallback` (4h, deliberately kept in sync with
 `internal/redis`'s own construction-time default by
 `TestStalePendingReclaimFloorFallbackMatchesRedisDefault`).
+MEETING_JOIN has its own finite #1505 budget instead of the long tier, so the
+resolved floor is also never below `meetingReclaimFloor` (the largest valid
+meeting STUCK point plus the margin; `TestResolveStalePendingReclaimFloor`
+pins it). A redelivered MEETING_JOIN (delivery count above 1) is refused
+terminally rather than rejoined. Consequence: a crashed node's pending jobs
+now wait roughly 10.5h, not 4h10m, before a self-claim.
 
 With this in place: every job type with a BOUNDED per-job watchdog is
 always ACKed out of the PEL by its own watchdog abandon (routes to
@@ -820,8 +826,8 @@ builds -- `unboundedJobTypes`) that legitimately runs past the resolved
 floor on the SAME process it started on is still a self-owned candidate, so
 #999's fix does not change its self-claim eligibility: it is still reclaimed
 by its own still-alive process, and if it keeps running past roughly
-`(MaxAttempts-1) x floor` (~8h at today's defaults: `MaxAttempts` 3, floor
-~4h10m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
+`(MaxAttempts-1) x floor` (~21h at today's defaults: `MaxAttempts` 3, floor
+~10h30m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
 + `Ack`. That is NOT merely "re-dispatched" -- the message is permanently
 removed from the PEL and reported as a dead/failed job to the DLQ consumer,
 even though the original execution may still be legitimately in progress.
