@@ -3363,3 +3363,18 @@ Auto-generated log of every release.
   - fix(cdp): bound HTTP target discovery before selecting a page (#1494)
 
 
+---
+
+## v2.205.0 — 2026-10-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 43 |
+| Lines added | +3161 |
+
+**Changes:**
+
+  - fix(meeting): unattended-join safety (#1505 C1), with #1514 review fixes (#1522)
+
+
