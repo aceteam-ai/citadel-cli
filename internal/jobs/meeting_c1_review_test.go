@@ -110,7 +110,13 @@ func TestMeetingStartRefusalClassifiers(t *testing.T) {
 		t.Fatalf("busy host profile not a definite refusal: %v", err)
 	}
 	locked := false
-	acquireMeetingProfileSetupLockFn = func(string) (string, func(), error) { locked = true; return "", func() {}, nil }
+	// If a regression ever passes the preflight, never touch the real profile
+	// or this box's live meeting sinks.
+	prevMark := markMeetingProfileOwnedFn
+	t.Cleanup(func() { markMeetingProfileOwnedFn = prevMark })
+	markMeetingProfileOwnedFn = func(string) (string, bool, error) { return "", false, errors.New("synthetic stop") }
+	sandbox := t.TempDir()
+	acquireMeetingProfileSetupLockFn = func(string) (string, func(), error) { locked = true; return sandbox, func() {}, nil }
 	chromiumAvailableFn = func() bool { return false }
 	if _, err := newHostMedia("m", t.TempDir(), "x.wav").Start(); !errors.Is(err, ErrMeetingStartRefused) || locked {
 		t.Fatalf("missing Chromium must refuse before any setup: %v locked=%v", err, locked)

@@ -480,7 +480,7 @@ func TestDurableCommitIntentIsImmutableUnderCallerMutation(t *testing.T) {
 }
 
 func TestDurableImmediateRenewalFailureNeverAdmitsOrAcknowledges(t *testing.T) {
-	for _, name := range []string{"denied", "zero-budget", "worker-control", "huddle"} {
+	for _, name := range []string{"denied", "zero-budget", "worker-control", "huddle", "meeting"} {
 		t.Run(name, func(t *testing.T) {
 			// Set up the fake transport without asking the fixture helper to admit a job.
 			f := &deliveryFixture{t: t, jobType: "CLOCK_FIXTURE", payload: `{}`, budget: 300000}
@@ -493,6 +493,8 @@ func TestDurableImmediateRenewalFailureNeverAdmitsOrAcknowledges(t *testing.T) {
 				f.jobType = JobTypeWorkerControl
 			case "huddle":
 				f.jobType = JobTypeHuddleJoin
+			case "meeting":
+				f.jobType = JobTypeMeetingJoin
 			}
 			old := http.DefaultTransport
 			http.DefaultTransport = deliveryHTTP(f.request)

@@ -682,8 +682,11 @@ func (s *APISource) adoptDelivery(ctx context.Context, apiJob *redisapi.Job, que
 	}
 	claim := apiJob.ClaimedDelivery()
 	// Worker control needs restart persistence; huddle terminals are currently
-	// coordinator-owned and bypass StreamWriter. Neither may silently use v1.
-	if claim == nil || job.Type == JobTypeWorkerControl || job.Type == JobTypeHuddleJoin {
+	// coordinator-owned and bypass StreamWriter. A meeting join must never be
+	// redelivered (#1505: no automatic rejoin), but v1 lapses and Nacks on
+	// shutdown and carries no delivery count the rejoin guard can read. None
+	// may silently use v1.
+	if claim == nil || job.Type == JobTypeWorkerControl || job.Type == JobTypeHuddleJoin || job.Type == JobTypeMeetingJoin {
 		return nil, redisapi.ErrDurableDelivery
 	}
 	// Install source ownership BEFORE starting the loop, so Close cannot miss it.
