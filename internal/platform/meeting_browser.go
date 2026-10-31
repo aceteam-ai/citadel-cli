@@ -27,6 +27,7 @@ package platform
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -435,6 +436,10 @@ func meetingProfileLockFor(dir string) *sync.Mutex {
 	return l
 }
 
+// ErrMeetingProfileBusy marks a definite refusal: another meeting holds the
+// profile, and this attempt created no sink, display or browser process.
+var ErrMeetingProfileBusy = errors.New("meeting bot profile already in use")
+
 // acquireMeetingProfileLock claims the process-wide guard for profileDir. It
 // is a TryLock, never a blocking Lock: a second MEETING_JOIN whose browser
 // wants a profile another meeting is actively using must fail FAST with a
@@ -457,8 +462,8 @@ func acquireMeetingProfileLock(profileDir string) (release func(), err error) {
 	lock := meetingProfileLockFor(profileDir)
 	if !lock.TryLock() {
 		return nil, fmt.Errorf(
-			"meeting bot profile already in use — this node's bot can only be in one meeting at a time (profile: %s)",
-			profileDir,
+			"%w — this node's bot can only be in one meeting at a time (profile: %s)",
+			ErrMeetingProfileBusy, profileDir,
 		)
 	}
 	var once sync.Once

@@ -1154,6 +1154,12 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	}
 
 	handlerCtx, timeout, bounded, budgetErr := r.resolveExecutionBudget(ctx, handler, job)
+	if budgetErr == nil && job.Type == JobTypeMeetingJoin && job.Metadata.Attempts > 1 {
+		// A redelivered join (a stale-pending reclaim) is never re-executed: the
+		// original attempt may still own, or may have just abandoned, a live
+		// session under the same deterministic id. Fail it terminally instead.
+		budgetErr = errMeetingRedelivered
+	}
 	var ticket *executionTicket
 	if budgetErr == nil {
 		executionStarted := time.Now()

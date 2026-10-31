@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -150,6 +151,11 @@ func (m *hostMedia) Start() (meetingBrowser, error) {
 	// only once the browser itself has been torn down.
 	profileDir, release, err := acquireMeetingProfileSetupLockFn(m.profileDir)
 	if err != nil {
+		if errors.Is(err, platform.ErrMeetingProfileBusy) {
+			// Nothing was created: the lock precedes mark-owned, the sink
+			// sweep, LoadSink and every launch.
+			return nil, fmt.Errorf("%w: %w", ErrMeetingStartRefused, err)
+		}
 		return nil, err
 	}
 	lockOwnedHere := true
@@ -471,11 +477,17 @@ func (m *containerMedia) createSessionContext(ctx context.Context) error {
 		}
 		return nil
 	case http.StatusConflict:
-		return fmt.Errorf("meeting module is busy with another active session on this node " +
-			"(one meeting per node); retry after it ends, or restart the meeting module to clear it")
+		// Reached only after our own same-id stale session was cleared
+		// successfully, so the busy session belongs to another meeting and
+		// this attempt holds nothing.
+		return fmt.Errorf("%w: meeting module is busy with another active session on this node "+
+			"(one meeting per node); retry after it ends, or restart the meeting module to clear it", ErrMeetingStartRefused)
 	case http.StatusServiceUnavailable:
-		return fmt.Errorf("meeting module not ready to start a session: %s", string(respBody))
+		return fmt.Errorf("%w: meeting module not ready to start a session: %s", ErrMeetingStartRefused, string(respBody))
 	default:
+		if status >= 400 && status < 500 {
+			return fmt.Errorf("%w: meetingd POST /sessions returned status %d: %s", ErrMeetingStartRefused, status, string(respBody))
+		}
 		return fmt.Errorf("meetingd POST /sessions returned status %d: %s", status, string(respBody))
 	}
 }

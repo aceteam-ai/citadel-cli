@@ -11,6 +11,11 @@ import (
 
 var ErrMeetingTeardownUnconfirmed = errors.New("meeting teardown or owned operation remains unconfirmed")
 
+// ErrMeetingStartRefused marks a definite media-start refusal that created no
+// owned resource (profile busy, meetingd busy/not ready, a meetingd 4xx). It is
+// an ordinary terminal failure, never teardown uncertainty.
+var ErrMeetingStartRefused = errors.New("meeting media start refused")
+
 // MeetingCleanup accounts one allowance across stop/flush, rolling shutdown,
 // teardown, backup and terminal publication. It never replenishes on a phase
 // transition or parent cancellation. A cancelled execution may still clean up.

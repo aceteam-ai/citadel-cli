@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 )
 
 // Fallback per-job execution budgets (issue #548). PR #552 added an OPT-IN
@@ -317,12 +318,30 @@ const StalePendingReclaimFloorFallback = 4 * time.Hour
 // unbounded job that legitimately runs longer than that remains the
 // documented residual exposure (see CLAUDE.md's Direct-Redis redelivery
 // section), not something this function can close.
+//
+// MEETING_JOIN no longer uses the long tier: its finite #1505 budget can run
+// past it. The floor therefore never drops below meetingReclaimFloor, so a
+// healthy meeting's own budget and STUCK recovery both elapse before any
+// self-claim can redeliver it.
 func ResolveStalePendingReclaimFloor() time.Duration {
-	d, ok := envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
-	if !ok {
-		return StalePendingReclaimFloorFallback
+	floor := StalePendingReclaimFloorFallback
+	if d, ok := envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds); ok {
+		floor = d + ReclaimFloorMargin
 	}
-	return d + ReclaimFloorMargin
+	if meeting := meetingReclaimFloor(); meeting > floor {
+		floor = meeting
+	}
+	return floor
+}
+
+// meetingReclaimFloor is the largest meeting STUCK point any valid profile can
+// produce (Validate caps every phase at the ratified defaults), plus the margin.
+func meetingReclaimFloor() time.Duration {
+	maximum, err := meetingpolicy.Default().Maximum()
+	if err != nil {
+		return 0
+	}
+	return maximum.StuckAfter() + ReclaimFloorMargin
 }
 
 // ConsumerDeadAfterMargin is the safety margin added on top of the resolved
@@ -572,6 +591,11 @@ func (r *Runner) executeWithDeadline(
 			if durableSuccessDuringShutdown(job, ctx, execCtx, hr.result, hr.err) {
 				return hr.result, nil
 			}
+		} else if ticket, ok := execCtx.Value(executionTicketKey{}).(*executionTicket); ok {
+			// An ordinary abandoned handler keeps the pre-#1505 contract: the
+			// watchdog releases it, so a leaked goroutine never holds a ticket
+			// that suppresses STALL or forces a STUCK restart mid-meeting.
+			ticket.handlerFinished(false)
 		}
 		if job.delivery != nil && durableShutdown(ctx, execCtx) {
 			return nil, ctx.Err()

@@ -56,8 +56,13 @@ const (
 // stopped. Deferred on every interactive-loop exit path. Bounded because the
 // caller's next step (the end-of-call batch transcribe) must always run — a stuck
 // final pass is contained by transcribeMu, not by blocking Execute forever here.
+type rollingCancelKey struct{}
+
 func (h *MeetingJoinHandler) stopRolling(ctx JobContext, stop chan struct{}, done <-chan struct{}) bool {
 	close(stop)
+	if cancel, ok := ctx.Context().Value(rollingCancelKey{}).(context.CancelFunc); ok {
+		cancel()
+	}
 	cleanup := MeetingCleanupFrom(ctx.Context())
 	if cleanup == nil {
 		cleanup = NewMeetingCleanup(time.Duration(meetingpolicy.Default().Cleanup) * time.Second)

@@ -192,10 +192,21 @@ func Milliseconds(value any) (int64, bool) {
 	return n, ok && n <= int64(math.MaxInt64/time.Millisecond)
 }
 
+// unusableNameRune bans controls, line/paragraph separators and format
+// characters, except ZWNJ/ZWJ, which ordinary Persian and emoji names need.
+// Bidi embeddings, overrides and isolates (all Cf) stay banned: they can
+// visually reorder the disclosure text around the name.
+func unusableNameRune(r rune) bool {
+	if r == '\u200c' || r == '\u200d' {
+		return false
+	}
+	return unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp)
+}
+
 // Name is presentation only. Unusable input never becomes an identifier/email
 // lookup, and invalid names use the exact ratified generic fallback.
 func Name(raw, fallback string) string {
-	if !utf8.ValidString(raw) || len(raw) > 128*utf8.UTFMax || strings.IndexFunc(raw, func(r rune) bool { return unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) }) >= 0 {
+	if !utf8.ValidString(raw) || len(raw) > 128*utf8.UTFMax || strings.IndexFunc(raw, unusableNameRune) >= 0 {
 		return fallback
 	}
 	n := strings.Join(strings.Fields(raw), " ")

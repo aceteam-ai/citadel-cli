@@ -731,6 +731,11 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 		if !startAttempted {
 			return nil, err
 		}
+		if errors.Is(err, ErrMeetingStartRefused) {
+			// Nothing was created, so there is nothing to close or retain.
+			startAttempted = false
+			return nil, err
+		}
 		return nil, errors.Join(err, ErrMeetingTeardownUnconfirmed)
 	}
 
@@ -794,22 +799,38 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	if e := closeMedia(); e != nil {
 		return nil, errors.Join(e, ErrMeetingTeardownUnconfirmed)
 	}
+	if stopErr != nil {
+		if _, container := media.(*containerMedia); container && !errors.Is(stopErr, ErrMeetingTeardownUnconfirmed) {
+			// The confirmed session DELETE above removed meetingd's recorder and
+			// browser, so a failed /record/stop (typically after the recorder
+			// already died) leaves nothing owned. Report the recording failure
+			// honestly instead of retaining custody forever.
+			if recorderErr == nil {
+				recorderErr = fmt.Errorf("finalize recording: %w", stopErr)
+			}
+			stopErr = nil
+		}
+	}
 	if stopErr != nil || outcome.teardownUncertain {
 		return nil, errors.Join(stopErr, ErrMeetingTeardownUnconfirmed)
 	}
 
-	// Sovereign audio backup + retention (aceteam#5097). Runs HERE — after the
-	// WAV is finalized but BEFORE transcription — so the backend still receives
-	// the audio even when transcription fails (the failure path returns early
-	// below, and the backup is MOST valuable exactly then). Fully best-effort:
-	// it never returns an error and never touches the meeting result. Runs even
-	// on a recorderErr: whatever partial audio exists is still worth backing up.
-	_ = cleanup.Run(ctx.Context(), func(c context.Context) error {
-		backupCtx := ctx
-		backupCtx.Ctx = c
-		h.backupAndPrune(backupCtx, job, p, recordedPath)
-		return c.Err()
-	})
+	// The finite transcription phase (T) starts here and also bounds the
+	// sovereign audio backup (aceteam#5097). The backup never spends the
+	// teardown/publication allowance (C): a slow transcode or upload must not
+	// starve the later result publication.
+	transcriptionCtx, cancelTranscription := context.WithTimeout(ctx.Context(), time.Duration(profile.Transcription)*time.Second)
+	defer cancelTranscription()
+
+	// Backup runs after the WAV is finalized but BEFORE transcription, so the
+	// backend still receives the audio even when transcription fails (the
+	// failure path returns early below, and the backup is MOST valuable exactly
+	// then). Fully best-effort: it never returns an error and never touches the
+	// meeting result. Runs even on a recorderErr: partial audio is still worth
+	// backing up.
+	backupCtx := ctx
+	backupCtx.Ctx = transcriptionCtx
+	h.backupAndPrune(backupCtx, job, p, recordedPath)
 
 	if recorderErr != nil {
 		// end_reason "cancelled" (citadel#488) means the job's context was
@@ -829,8 +850,6 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// Transcribe node-locally by reusing the transcribe handler in-process. This
 	// end-of-call batch pass remains the SOURCE OF TRUTH for the stored
 	// transcript; rolling transcription during the call was additive.
-	transcriptionCtx, cancelTranscription := context.WithTimeout(ctx.Context(), time.Duration(profile.Transcription)*time.Second)
-	defer cancelTranscription()
 	transcribeCtx := ctx
 	transcribeCtx.Ctx = transcriptionCtx
 	transcript, tErr := h.transcribe(transcribeCtx, job, recordedPath)
@@ -923,12 +942,19 @@ func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p
 	// announcement contains "/ace leave"). Seeded by announceOnAdmission.
 
 	// Build the production rolling-transcription pass over the growing wav.
+	// The rolling pass gets its own cancel so stopping it aborts an in-flight
+	// sidecar request instead of waiting for it (a pass holds only that HTTP
+	// call, no media resource).
+	passCtx, cancelPasses := context.WithCancel(recordingCtx)
+	defer cancelPasses()
 	transcribe := func() ([]TranscriptSegment, error) {
 		rollingCtx := ctx
-		rollingCtx.Ctx = recordingCtx
+		rollingCtx.Ctx = passCtx
 		return h.transcribeSegments(rollingCtx, p.MeetingID, wavPath)
 	}
-	out, err := h.waitForMeetingEndInteractive(ctx, br, p, transcribe, meetingPollInterval, botMessages, media)
+	loopCtx := ctx
+	loopCtx.Ctx = context.WithValue(ctx.Context(), rollingCancelKey{}, cancelPasses)
+	out, err := h.waitForMeetingEndInteractive(loopCtx, br, p, transcribe, meetingPollInterval, botMessages, media)
 	out.disclosurePosted = posted
 	return out, err
 }

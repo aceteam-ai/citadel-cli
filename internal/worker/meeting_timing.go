@@ -25,8 +25,12 @@ func (a *LegacyHandlerAdapter) MeetingProfile() (meetingpolicy.Profile, error) {
 	return meetingpolicy.Default(), nil
 }
 
+// errMeetingRedelivered refuses a MEETING_JOIN delivery that is not its first
+// (#1505: no automatic rejoin).
+var errMeetingRedelivered = errors.New("meeting join was redelivered; automatic rejoin is disabled")
+
 func meetingAuthority(b meetingpolicy.Budget, raw any, present bool) error {
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv(selfHealEnabledEnvVar))); v == "false" || v == "0" {
+	if !selfHealEnabled() {
 		return fmt.Errorf("meeting timing requires the configured self-heal backstop")
 	}
 	return b.CheckAuthority(raw, present, strings.TrimSpace(os.Getenv(jobTimeoutLongEnvVar)), strings.TrimSpace(os.Getenv(selfHealStuckEnvVar)))

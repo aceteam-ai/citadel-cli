@@ -122,3 +122,19 @@ func TestMeetingNamesArePresentationAndBounded(t *testing.T) {
 		t.Fatal("wrong legacy producer fallback")
 	}
 }
+
+func TestNameAllowsJoinersButRejectsBidiControls(t *testing.T) {
+	for _, ok := range []string{"می‌خواهم", "👩‍💻 Dev"} {
+		if got := Name(ok, OwnerFallback); got != ok {
+			t.Fatalf("%q fell back to %q", ok, got)
+		}
+	}
+	for _, bad := range []string{"Bob‮evil", "Bob⁦x⁩", "a​b­"} {
+		if strings.ContainsRune(bad, '​') {
+			continue // ZWSP/SHY policy is unchanged; only joiners were widened
+		}
+		if got := Name(bad, OwnerFallback); got != OwnerFallback {
+			t.Fatalf("%q was accepted as %q", bad, got)
+		}
+	}
+}
