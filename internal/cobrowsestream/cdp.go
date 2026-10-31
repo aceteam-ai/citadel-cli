@@ -105,11 +105,18 @@ func (c *Client) Close() { c.client.Close() }
 // dialCDP resolves the page target for debugPort and opens a persistent CDP
 // WebSocket. onFrame receives every screencast frame once startScreencast runs.
 func dialCDP(debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
+	return dialCDPContext(context.Background(), debugPort, onFrame)
+}
+
+func dialCDPContext(parent context.Context, debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
 	wsURL, err := cdpTargetURL(debugPort)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 	defer cancel()
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
