@@ -4214,16 +4214,12 @@ the worker being restarted — using it (or a `CITADEL_SERVICE` env check) from
 `citadel update install` would read the operator's own SSH shell, which never
 inherited the worker's environment, so the gate would silently never fire in
 exactly the scenario #454 reported. `resolveManagedServiceRestartTarget`
-(`cmd/update.go`) layers `ActiveManagedUnit` (the only signal that sees the
-install.sh/packer fleet unit, `citadel-worker.service` — how citadel actually
-ships on most nodes) with the cross-platform `service.Manager.Status()` (the
-only signal on macOS/Windows, and for a `citadel service install`-managed
-Linux node). **This means macOS/Windows detection is already covered, not a
-gap**: `service.Manager.Status()` (`launchd.go`/`windows.go`) is implemented
-on every platform, so a managed launchd/SCM service still gets the warn-vs-
-restart gate even though `ActiveManagedUnit` itself only ever fires on Linux
-(citadel#887 verified this rather than assuming it — read the code before
-concluding the macOS/Windows half of that issue is still open).
+(`cmd/update.go`) instead uses `service.DiscoverActiveWorkers` on Linux for
+the manual update restart path. It inspects arbitrary active service names,
+matches the resolved binary and literal `work` command, and requires one
+verified target. The target is revalidated after draining. It does not expand
+the fixed list of unit files that rematerialization may rewrite. macOS and
+Windows retain `service.Manager.Status()` (`launchd.go`/`windows.go`).
 
 `citadel update install` now warns loudly by default when a managed service is
 detected, and restarts it only with an explicit `--restart` flag.
@@ -4237,8 +4233,9 @@ seam for tests, and also driving the new `citadel service refresh-unit`). Before
 this, `sudo citadel update install` on an up-to-date node exited at "You are
 running the latest version" without ever re-materializing the unit, so a node
 deployed by a pre-#444 binary never received the restart-storm hardening (seen on
-node 1314). The already-latest branch deliberately skips `warnOrRestartManagedService`
-(the binary is unchanged, so there is no old-vs-new split-brain). Separately, the
+node 1314). `finishManualNoOp` also honors an explicit `--restart`: a managed
+worker may still run an older image even when the CLI is already current. A
+requested restart without a verified active target exits nonzero. Separately, the
 unprivileged-system-unit remediation (`service.rootRemediationCommand`) resolves
 `os.Executable()` to an ABSOLUTE path and targets the network-free
 `service refresh-unit`, because a bare `sudo citadel …` is "command not found"

@@ -18,6 +18,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -67,6 +68,8 @@ type doctorReport struct {
 	serviceExecWarnings []string
 	serviceHealth       []managedServiceHealth
 	servicesChecked     bool
+	updateDiagnostics   []service.WorkerUpdateDiagnostic
+	updateDiagnosisNote string
 }
 
 // ok reports whether doctor found a problem worth a non-zero exit. Engine
@@ -145,7 +148,35 @@ func runPodmanGPUProbe(rt catalog.ContainerRuntime, lookPath func(string) (strin
 // from doctorRunE so tests can exercise rendering/exit-code logic against a
 // hand-built doctorReport without touching a real docker/podman install.
 func runDoctorChecks() doctorReport {
-	return runDoctorChecksFor(platform.IsDarwin(), currentManagedServiceHealth)
+	r := runDoctorChecksFor(platform.IsDarwin(), currentManagedServiceHealth)
+	r.updateDiagnostics, r.updateDiagnosisNote = currentManagedUpdateDiagnostics()
+	return r
+}
+
+func currentManagedUpdateDiagnostics() ([]service.WorkerUpdateDiagnostic, string) {
+	if !platform.IsLinux() {
+		return nil, "managed worker install-layout inspection is only available on Linux"
+	}
+	return managedUpdateDiagnostics(update.GetCurrentBinaryPath, service.DiscoverActiveWorkers, service.DiagnoseWorkerUpdate)
+}
+
+func managedUpdateDiagnostics(executable func() (string, error), discover func(string) ([]service.ManagedWorker, error), diagnose func(service.ManagedWorker) service.WorkerUpdateDiagnostic) ([]service.WorkerUpdateDiagnostic, string) {
+	path, err := executable()
+	if err != nil {
+		return nil, "could not resolve this executable; managed worker update permissions are unverified"
+	}
+	workers, err := discover(path)
+	if err != nil {
+		return nil, "active managed workers could not be fully inspected; update permissions are unverified"
+	}
+	if len(workers) == 0 {
+		return nil, "no active managed worker using this executable was verified"
+	}
+	var checks []service.WorkerUpdateDiagnostic
+	for _, worker := range workers {
+		checks = append(checks, diagnose(worker))
+	}
+	return checks, ""
 }
 
 // runDoctorChecksFor is the seam runDoctorChecks wraps: isDarwin is passed in so
@@ -284,6 +315,23 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 		for _, warning := range r.serviceExecWarnings {
 			fmt.Fprintf(w, "  %s %s\n", warnColor.Sprint("[WARN]"), warning)
 		}
+	}
+
+	headerColor.Fprintln(w, "\nWORKER UPDATE INSTALL")
+	fmt.Fprintln(w, "  (informational: privilege-separated installs are supported; effective permissions require the worker's own preflight)")
+	if len(r.updateDiagnostics) == 0 {
+		note := r.updateDiagnosisNote
+		if note == "" {
+			note = "managed worker update permissions were not inspected"
+		}
+		fmt.Fprintf(w, "  [UNVERIFIED] %s\n", note)
+	}
+	for _, check := range r.updateDiagnostics {
+		label := "[INFO]"
+		if check.Warning {
+			label = "[WARN]"
+		}
+		fmt.Fprintf(w, "  %s %s: worker %q, binary owner %q, install directory %q: %s\n", label, check.Unit, check.WorkerUser, check.BinaryOwner, check.Directory, check.Detail)
 	}
 
 	fmt.Fprintln(w)

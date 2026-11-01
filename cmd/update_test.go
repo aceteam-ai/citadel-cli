@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -121,14 +122,94 @@ func TestFinishManualNoOpRefreshesManagedUnitsWithoutUpdateState(t *testing.T) {
 		return nil, nil
 	}
 	var out strings.Builder
-	if !finishManualNoOp(update.ApplyResult{Disposition: update.Superseded, InstalledAfter: "v2.0.0"}, &out) {
+	if handled, err := finishManualNoOp(update.ApplyResult{Disposition: update.Superseded, InstalledAfter: "v2.0.0"}, &out, false, func() error { t.Fatal("no restart was requested"); return nil }); !handled || err != nil {
 		t.Fatal("superseded manual apply was not handled as no-op")
 	}
 	if called != 1 {
 		t.Fatalf("managed-unit refresh calls = %d, want 1", called)
 	}
-	if finishManualNoOp(update.ApplyResult{Disposition: update.Applied}, &out) {
+	if handled, err := finishManualNoOp(update.ApplyResult{Disposition: update.Applied}, &out, false, func() error { t.Fatal("no restart was requested"); return nil }); handled || err != nil {
 		t.Fatal("applied update handled as no-op")
+	}
+}
+
+func TestFinishManualNoOpHonorsExplicitRestart(t *testing.T) {
+	original := rematerializeManagedUnitsFn
+	t.Cleanup(func() { rematerializeManagedUnitsFn = original })
+	for _, disposition := range []update.ApplyDisposition{update.AlreadyCurrent, update.Superseded, update.Applied} {
+		for _, requested := range []bool{false, true} {
+			var order []string
+			rematerializeManagedUnitsFn = func(func(string, ...any)) ([]string, error) { order = append(order, "refresh"); return nil, nil }
+			var out bytes.Buffer
+			handled, err := finishManualNoOp(update.ApplyResult{Disposition: disposition}, &out, requested, func() error { order = append(order, "restart"); return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if disposition == update.Applied {
+				if handled || len(order) != 0 {
+					t.Fatalf("applied result was handled twice: %v %v", handled, order)
+				}
+			} else {
+				want := []string{"refresh"}
+				if requested {
+					want = append(want, "restart")
+				}
+				if !handled || !reflect.DeepEqual(order, want) {
+					t.Fatalf("explicit no-swap restart not honored: result=%v requested=%t order=%v", disposition, requested, order)
+				}
+			}
+		}
+	}
+}
+
+func TestManagedWorkerRestartRevalidatesAfterDrain(t *testing.T) {
+	worker := service.ManagedWorker{Unit: service.ManagedUnit{Name: "citadel-work"}, Executable: "/fixture/citadel", User: "fixture-user"}
+	for _, tc := range []struct {
+		name    string
+		fresh   []service.ManagedWorker
+		err     error
+		success bool
+	}{
+		{name: "same worker", fresh: []service.ManagedWorker{worker}, success: true},
+		{name: "worker disappeared"},
+		{name: "ambiguous", fresh: []service.ManagedWorker{worker, worker}},
+		{name: "different unit", fresh: []service.ManagedWorker{{Unit: service.ManagedUnit{Name: "other"}, Executable: worker.Executable, User: worker.User}}},
+		{name: "different executable", fresh: []service.ManagedWorker{{Unit: worker.Unit, Executable: "/foreign/citadel", User: worker.User}}},
+		{name: "different user", fresh: []service.ManagedWorker{{Unit: worker.Unit, Executable: worker.Executable, User: "other-user"}}},
+		{name: "unavailable", err: errors.New("synthetic lookup failure")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			drained, restarted := false, false
+			target, found := managedServiceTargetFromWorkers([]service.ManagedWorker{worker}, func() ([]service.ManagedWorker, error) {
+				if !drained {
+					t.Fatal("revalidation ran before draining")
+				}
+				return tc.fresh, tc.err
+			}, func(got service.ManagedUnit) error {
+				restarted = true
+				if got != worker.Unit {
+					t.Fatal("restarted another unit")
+				}
+				return nil
+			})
+			if !found {
+				t.Fatal("verified custom worker was not offered as target")
+			}
+			var out, errOut bytes.Buffer
+			code := runManagedServiceGate(true, func() (managedServiceTarget, bool) { return target, true }, func(io.Writer) { drained = true }, &out, &errOut)
+			if restarted != tc.success || (code == 0) != tc.success {
+				t.Fatalf("stale/ambiguous worker restart result: code=%d restarted=%t error=%s", code, restarted, &errOut)
+			}
+		})
+	}
+}
+
+func TestManagedWorkerRestartRequiresOneInitialMatch(t *testing.T) {
+	worker := service.ManagedWorker{Unit: service.ManagedUnit{Name: "citadel-work"}, Executable: "/fixture/citadel"}
+	for _, workers := range [][]service.ManagedWorker{nil, {worker, worker}} {
+		if _, found := managedServiceTargetFromWorkers(workers, func() ([]service.ManagedWorker, error) { t.Fatal("unverified target was refreshed"); return nil, nil }, func(service.ManagedUnit) error { t.Fatal("unverified target was restarted"); return nil }); found {
+			t.Fatal("non-unique restart target was accepted")
+		}
 	}
 }
 
@@ -270,10 +351,11 @@ func TestRunManagedServiceGate_TableDriven(t *testing.T) {
 			wantExitCode: 0,
 		},
 		{
-			name:         "not managed even with --restart requested: still a no-op",
-			resolve:      func(*bool) func() (managedServiceTarget, bool) { return notFoundResolver },
-			doRestart:    true,
-			wantExitCode: 0,
+			name:          "restart requested without verified unit: fails loudly",
+			resolve:       func(*bool) func() (managedServiceTarget, bool) { return notFoundResolver },
+			doRestart:     true,
+			wantExitCode:  1,
+			wantErrSubstr: "no service was restarted",
 		},
 		{
 			name: "managed, default (no --restart): warns loudly, does not restart",
@@ -746,4 +828,66 @@ func (f *fakeManager) Stop() error {
 
 func (f *fakeManager) Status() (*service.ServiceStatus, error) {
 	return &service.ServiceStatus{Installed: true, Running: true}, nil
+}
+
+func TestManagedServiceDiscoveryFailuresAreNotNoWorker(t *testing.T) {
+	for _, phase := range []string{"executable", "discovery", "multiple workers"} {
+		for _, requested := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/restart=%t", phase, requested), func(t *testing.T) {
+				cause := errors.New("fixture loaded unit is stale")
+				target, found := resolveManagedWorkersTarget(func() (string, error) {
+					if phase == "executable" {
+						return "", cause
+					}
+					return "/fixture/citadel", nil
+				}, func(path string) ([]service.ManagedWorker, error) {
+					if phase == "executable" {
+						t.Fatal("discovery ran after executable failure")
+					}
+					if path != "/fixture/citadel" {
+						t.Fatal("wrong executable")
+					}
+					if phase == "discovery" {
+						return nil, cause
+					}
+					return []service.ManagedWorker{{}, {}}, nil
+				})
+				if found || target.DiscoveryErr == nil {
+					t.Fatal("failure became a successful no-worker observation")
+				}
+				var out, diagnostics bytes.Buffer
+				code := runManagedServiceGate(requested, func() (managedServiceTarget, bool) { return target, found }, func(io.Writer) { t.Fatal("unverified target was drained") }, &out, &diagnostics)
+				if (code != 0) != requested || !strings.Contains(diagnostics.String(), "discovery failed:") || !strings.Contains(diagnostics.String(), target.DiscoveryErr.Error()) {
+					t.Fatalf("discovery cause or exit lost: code=%d output=%q diagnostics=%q", code, out.String(), diagnostics.String())
+				}
+				if !requested && !strings.Contains(diagnostics.String(), "may still be on the old binary") {
+					t.Fatal("applied swap lost its stale-worker warning")
+				}
+			})
+		}
+	}
+	var out, diagnostics bytes.Buffer
+	target, found := resolveManagedWorkersTarget(func() (string, error) { return "/fixture/citadel", nil }, func(string) ([]service.ManagedWorker, error) { return nil, nil })
+	if found || target.DiscoveryErr != nil || runManagedServiceGate(false, func() (managedServiceTarget, bool) { return target, found }, nil, &out, &diagnostics) != 0 || out.Len() != 0 || diagnostics.Len() != 0 {
+		t.Fatal("verified worker absence made unsolicited noise")
+	}
+}
+
+func TestFinishManualNoOpReturnsRestartErrorAfterDeferredCleanup(t *testing.T) {
+	original := rematerializeManagedUnitsFn
+	t.Cleanup(func() { rematerializeManagedUnitsFn = original })
+	rematerializeManagedUnitsFn = func(func(string, ...any)) ([]string, error) { return nil, nil }
+	cause := errors.New("fixture restart refused")
+	cleaned := false
+	invoke := func() error {
+		defer func() { cleaned = true }()
+		handled, err := finishManualNoOp(update.ApplyResult{Disposition: update.AlreadyCurrent}, io.Discard, true, func() error { return cause })
+		if !handled {
+			t.Fatal("current update not handled")
+		}
+		return err
+	}
+	if err := invoke(); !errors.Is(err, cause) || !cleaned {
+		t.Fatalf("restart error lost or deferred cleanup skipped: %v %t", err, cleaned)
+	}
 }
