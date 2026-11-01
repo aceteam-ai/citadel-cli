@@ -28,7 +28,7 @@ var meetingEndReasons = map[string]bool{
 	"call_ended": true, "alone_in_call": true, "nobody_joined": true,
 	"max_duration_reached": true, "ace_command_leave": true, "recorder_died": true,
 	"cancelled": true, MeetingEndDenied: true, MeetingEndAdmitTimeout: true,
-	MeetingEndStoppedByUser: true, "join_failed": true,
+	MeetingEndStoppedByUser: true, "join_failed": true, "recording_failed": true,
 }
 
 var (
@@ -79,13 +79,14 @@ func joinEndReason(err error) string {
 	return "join_failed"
 }
 
-// Denial probes match only explicit refusal wording. An unknown or unreadable
+// Denial probes match only explicit refusal wording ("can't join this call"
+// is deliberately excluded: Meet also shows it for removal and policy blocks). An unknown or unreadable
 // page keeps waiting, so a miss degrades to admit_timeout, never a false denial.
 // Selectors are English-only and untuned against live pages.
 const (
 	meetDeniedJS = `(function(){` +
 		`var t=(document.body&&document.body.innerText||'').toLowerCase();` +
-		`return t.indexOf('denied your request to join')>=0||t.indexOf("you can't join this call")>=0||t.indexOf('you can’t join this call')>=0;` +
+		`return t.indexOf('denied your request to join')>=0;` +
 		`})()`
 	teamsDeniedJS = `(function(){` +
 		`var t=(document.body&&document.body.innerText||'').toLowerCase();` +

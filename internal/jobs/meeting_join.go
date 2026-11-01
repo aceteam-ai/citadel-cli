@@ -689,6 +689,11 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// (#514). media.Start brings up the browser + audio capture and returns the
 	// CDP-driven browser. Cleanup is attempted after any start attempt; an
 	// ambiguous start result retains custody even if a later close returns.
+	// A Stop that arrived before setup is honored before anything launches.
+	if ctx.CancelRequestedNow() {
+		meetingEnded(ctx, MeetingEndStoppedByUser)
+		return nil, errMeetingStopped
+	}
 	var media MeetingMedia
 	if err := checkMeetingPhase(setupCtx.Context(), func() error { media = h.selectMedia(p); return nil }); err != nil {
 		return nil, err
@@ -761,6 +766,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// is a per-pass temp; remove it on exit so it does not linger in the workspace.
 	defer func() { _ = os.Remove(meetingWindowWavPath(h.WorkspaceDir, p.MeetingID)) }()
 	if err := checkMeetingPhase(ctx.Context(), media.StartRecording); err != nil {
+		meetingEnded(ctx, "recording_failed")
 		return nil, fmt.Errorf("start recording: %w", err)
 	}
 	p.recordingStartedAt = h.meetingNow()

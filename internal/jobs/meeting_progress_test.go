@@ -164,3 +164,45 @@ func TestMeetingCapabilitiesKeepMeetingBudgetAndLane(t *testing.T) {
 		t.Fatalf("capabilities %+v", c)
 	}
 }
+
+// Every pre-recording loop honors Stop on its own, not only via a later loop.
+func TestMeetingStopHonoredByEachPreRecordingLoop(t *testing.T) {
+	stopped := JobContext{CancelRequested: func() bool { return true }}
+	h := NewMeetingJoinHandler(t.TempDir())
+	p := meetingJoinParams{MeetingID: "synthetic", AdmitTimeout: time.Minute}
+	page := &lobbyBrowser{}
+	for name, err := range map[string]error{
+		"meet join click":  pollForJoinClick(stopped, page, "Recorder", time.Minute, time.Millisecond),
+		"meet admission":   h.waitUntilAdmitted(stopped, page, p),
+		"teams join click": pollForTeamsJoinClick(stopped, page, "Recorder", "", time.Minute, time.Millisecond),
+		"teams admission":  h.waitUntilTeamsAdmitted(stopped, page, p),
+	} {
+		if !errors.Is(err, errMeetingStopped) {
+			t.Fatalf("%s ignored Stop: %v", name, err)
+		}
+	}
+}
+
+// The interactive loop (the production default) leaves on Stop.
+func TestMeetingInteractiveLoopLeavesOnStop(t *testing.T) {
+	h := NewMeetingJoinHandler(t.TempDir())
+	page := &disclosureBrowser{}
+	p := meetingJoinParams{MeetingID: "synthetic", recordingStartedAt: time.Now()}
+	ctx := JobContext{CancelRequested: func() bool { return true }}
+	out, err := h.waitForMeetingEndInteractive(ctx, page, p, func() ([]TranscriptSegment, error) { return nil, nil },
+		time.Millisecond, map[string]struct{}{}, &pipelineMedia{})
+	if err != nil || out.endReason != MeetingEndStoppedByUser || !page.leave {
+		t.Fatalf("interactive Stop: reason=%q err=%v left=%v", out.endReason, err, page.leave)
+	}
+}
+
+// A Stop that arrived before setup launches nothing.
+func TestMeetingStopBeforeSetupLaunchesNothing(t *testing.T) {
+	h := NewMeetingJoinHandler(t.TempDir())
+	launched := false
+	h.newMedia = func(meetingJoinParams) MeetingMedia { launched = true; return &pipelineMedia{} }
+	_, err := h.Execute(JobContext{CancelRequested: func() bool { return true }}, c1Job())
+	if !errors.Is(err, context.Canceled) || launched {
+		t.Fatalf("pre-setup Stop: err=%v launched=%v", err, launched)
+	}
+}
