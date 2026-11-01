@@ -2,12 +2,16 @@
 package cmd
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
@@ -242,6 +246,15 @@ func TestAgentNodeInfoNoPendingUpdate(t *testing.T) {
 		{"versions equal with staged tag prefix", "1.0.0", func() (*update.State, error) {
 			return &update.State{CurrentVersion: "v1.0.0"}, nil
 		}},
+		{"older recorded install", "v2.202.0", func() (*update.State, error) {
+			return &update.State{CurrentVersion: "v2.97.0"}, nil
+		}},
+		{"equal precedence with build metadata", "v2.202.0+running", func() (*update.State, error) {
+			return &update.State{CurrentVersion: "v2.202.0+other"}, nil
+		}},
+		{"invalid recorded version", "v2.202.0", func() (*update.State, error) {
+			return &update.State{CurrentVersion: "broken"}, nil
+		}},
 		{"no state recorded", "v1.0.0", func() (*update.State, error) {
 			return &update.State{}, nil
 		}},
@@ -268,6 +281,21 @@ func TestAgentNodeInfoNoPendingUpdate(t *testing.T) {
 // service-managed (systemd sets INVOCATION_ID), a remote restart schedules a
 // non-zero process exit and returns a restarting acknowledgement (issue #548).
 func TestAgentWorkerRestartServiceManaged(t *testing.T) {
+	root := t.TempDir()
+	for _, key := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(key, filepath.Join(root, key))
+	}
+	outbound := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("synthetic wrong edge"))
+	}))
+	defer outbound.Close()
+	state := worker.NewWorkerState()
+	client := redisapi.NewClient(redisapi.ClientConfig{BaseURL: outbound.URL, Token: "synthetic-device", PlatformObserver: state.ObservePlatform})
+	defer client.Close()
+	if err := client.Ping(context.Background()); err == nil || state.Snapshot().PlatformFailingSince == nil {
+		t.Fatal("fixture did not establish failed outbound platform calls")
+	}
 	t.Setenv("INVOCATION_ID", "test-unit-123")
 	exited := make(chan int, 1)
 	origExit, origDelay := processExiter, serviceRestartDelay
@@ -275,7 +303,7 @@ func TestAgentWorkerRestartServiceManaged(t *testing.T) {
 	serviceRestartDelay = 1 * time.Millisecond
 	defer func() { processExiter, serviceRestartDelay = origExit, origDelay }()
 
-	res, err := agentWorkerRestart()
+	res, err := buildAgentProviders(context.Background(), agentProviderDeps{state: state}).WorkerRestart()
 	if err != nil {
 		t.Fatalf("agentWorkerRestart() error = %v", err)
 	}

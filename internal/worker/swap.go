@@ -407,17 +407,10 @@ func (m *SwapManager) startOrJoin(backend, model string) *swapOp {
 
 // runSwap performs the actual eviction + start + wait-ready in the background,
 // with its own bounded context (independent of any job context). It closes
-// op.done when finished and clears the single-flight slot.
+// op.done when finished, after committing its ledger entry and releasing the
+// single-flight slot atomically for the next rate-limit admission.
 func (m *SwapManager) runSwap(op *swapOp) {
-	defer func() {
-		close(op.done)
-		m.mu.Lock()
-		if m.inflight == op {
-			m.inflight = nil
-		}
-		m.mu.Unlock()
-		m.recordSwap(m.swapRecord(op))
-	}()
+	defer m.completeSwap(op)
 
 	ctx, cancel := context.WithTimeout(context.Background(), m.backgroundMax)
 	defer cancel()

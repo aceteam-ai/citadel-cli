@@ -6,19 +6,227 @@ tests control exactly when a "cold load" finishes."""
 
 from __future__ import annotations
 
+import ast
+import errno
+import gc
+from pathlib import Path
+import sys
 import threading
 import time
+import types
+import weakref
 
 import pytest
 
 import image_models as im
-from image_swap import ImageModelManager, InsufficientVram, ModelLoadFailed, ModelWarming
+from image_swap import (
+    FailureKind, ImageModelManager, InsufficientVram, ModelLoadFailed, ModelWarming,
+    classify_failure, failure_summary,
+)
+from model_preflight import InsufficientDiskSpaceError
+from load_diagnostics import bounded_byte_count, safe_exception_label
 
 GIB = 1024**3
 SDXL = "stabilityai/sdxl-turbo"
 FLUX = "black-forest-labs/FLUX.2-klein-4B"
 ZIMG = "Tongyi-MAI/Z-Image-Turbo"
 QWEN = "Qwen/Qwen-Image"
+
+
+@pytest.mark.parametrize("cls", [
+    Exception, RuntimeError, NotImplementedError, AttributeError, KeyError,
+    AssertionError, ImportError, ModuleNotFoundError, ValueError, TypeError,
+    MemoryError, OSError, TimeoutError, ConnectionError, FileNotFoundError,
+    PermissionError, BrokenPipeError,
+])
+def test_known_builtin_diagnostic_labels_are_literal_exact_types(cls):
+    assert safe_exception_label(cls("owned-private-detail")) == f"builtins.{cls.__name__}"
+
+
+def test_diagnostic_labels_never_reflect_unknown_class_or_invoke_metaclass_hooks(monkeypatch):
+    class Trap(type):
+        def __instancecheck__(cls, obj):
+            raise AssertionError("labels must use exact identity, not isinstance")
+
+        def __subclasscheck__(cls, other):
+            raise AssertionError("labels must use exact identity, not issubclass")
+
+    class PrivateFailure(RuntimeError, metaclass=Trap):
+        def __str__(self):
+            raise AssertionError("labels must not format exceptions")
+
+    PrivateFailure.__module__ = "owned-private-module"
+    PrivateFailure.__qualname__ = "owned-private-qualname"
+    failure = PrivateFailure("owned-private-detail")
+    assert safe_exception_label(failure) == "unknown_exception"
+    module = types.ModuleType("huggingface_hub.errors")
+    module.LocalEntryNotFoundError = PrivateFailure
+
+    def no_lazy_export(name):
+        raise AssertionError("diagnostics must not resolve lazy exports")
+
+    module.__getattr__ = no_lazy_export
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    assert safe_exception_label(failure) == "huggingface_hub.errors.LocalEntryNotFoundError"
+    class UnknownSubclass(PrivateFailure):
+        pass
+    assert safe_exception_label(UnknownSubclass()) == "unknown_exception"
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0, 0), ((1 << 63) - 1, (1 << 63) - 1), (-1, None),
+    (1 << 63, None), (True, None), ("owned-private-detail", None),
+])
+def test_disk_diagnostic_counts_are_bounded_plain_integers(value, expected):
+    assert bounded_byte_count(value) == expected
+
+
+def test_disk_diagnostics_do_not_format_custom_numeric_objects():
+    class PrivateInteger(int):
+        def __str__(self):
+            raise AssertionError("diagnostic must not format an untrusted number")
+    assert bounded_byte_count(PrivateInteger(10)) is None
+    assert bounded_byte_count(10**5000) is None
+
+
+def test_diagnostic_module_is_packaged_and_has_only_stdlib_imports():
+    root = Path(__file__).parent
+    assert "COPY load_diagnostics.py /app/load_diagnostics.py" in (root / "Dockerfile").read_text()
+    tree = ast.parse((root / "load_diagnostics.py").read_text())
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.add(node.module)
+    assert imports == {"__future__", "sys", "enum"}
+
+
+@pytest.mark.parametrize("failure, expected", [
+    (InsufficientDiskSpaceError("owned-private-path"), FailureKind.DISK_SPACE),
+    (OSError(errno.ENOSPC, "owned-private-path"), FailureKind.DISK_SPACE),
+    (MemoryError("owned-private-detail"), FailureKind.HOST_MEMORY),
+    (ImportError("owned-private-detail"), FailureKind.DEPENDENCY),
+    (ValueError("owned-private-detail"), FailureKind.CONFIGURATION),
+    (TypeError("owned-private-detail"), FailureKind.API),
+    (RuntimeError("owned-private-detail"), FailureKind.RUNTIME),
+    (OSError("owned-private-detail"), FailureKind.MODEL_IO),
+    (TimeoutError("owned-private-network-timeout"), FailureKind.MODEL_IO),
+    (Exception("owned-private-detail"), FailureKind.LOAD_FAILED),
+])
+def test_failure_kinds_use_types_not_private_messages(failure, expected):
+    assert classify_failure(failure) is expected
+    safe = ModelLoadFailed(FLUX, expected)
+    assert safe.message == failure_summary(expected)
+    assert "owned-private" not in str(safe)
+
+
+@pytest.mark.parametrize("module_name", ["huggingface_hub.errors", "huggingface_hub.utils._errors"])
+def test_hf_failure_classification_uses_loaded_class_identity_without_import(monkeypatch, module_name):
+    class RepositoryNotFoundError(RuntimeError):
+        def __str__(self):
+            raise AssertionError("private loader exceptions must not be formatted")
+
+    class GatedRepoError(RepositoryNotFoundError):
+        pass
+
+    module = types.ModuleType(module_name)
+    module.RepositoryNotFoundError = RepositoryNotFoundError
+    module.GatedRepoError = GatedRepoError
+
+    def no_lazy_import(name):
+        raise AssertionError("classification must not resolve lazy dependency exports")
+
+    module.__getattr__ = no_lazy_import
+    monkeypatch.setitem(sys.modules, module_name, module)
+    # A present module with a missing diagnostic export must not call its
+    # lazy __getattr__ or import anything in order to classify the error.
+    monkeypatch.setitem(sys.modules, "torch", module)
+    assert classify_failure(GatedRepoError("owned-private-detail")) is FailureKind.REPO_GATED
+    assert classify_failure(RepositoryNotFoundError("owned-private-detail")) is FailureKind.REPO_MISSING
+    # A matching class name and module string are not the trusted loaded type.
+    spoof = type("GatedRepoError", (RuntimeError,), {"__module__": module_name})
+    assert classify_failure(spoof("owned-private-detail")) is FailureKind.RUNTIME
+    assert classify_failure(RuntimeError("GatedRepoError disk full 401")) is FailureKind.RUNTIME
+
+
+@pytest.mark.parametrize("module_name", ["torch", "torch.cuda"])
+def test_cuda_memory_classification_uses_only_loaded_export(monkeypatch, module_name):
+    class OutOfMemoryError(RuntimeError):
+        pass
+
+    module = types.ModuleType(module_name)
+    module.OutOfMemoryError = OutOfMemoryError
+    monkeypatch.setitem(sys.modules, module_name, module)
+    assert classify_failure(OutOfMemoryError("owned-private-detail")) is FailureKind.CUDA_MEMORY
+    assert safe_exception_label(OutOfMemoryError()) == f"{module_name}.OutOfMemoryError"
+    spoof = type("OutOfMemoryError", (RuntimeError,), {"__module__": module_name})
+    assert classify_failure(spoof()) is FailureKind.RUNTIME
+
+
+@pytest.mark.parametrize("module_name", ["huggingface_hub.errors", "huggingface_hub.utils._errors"])
+def test_known_hf_cache_miss_multiple_inheritance_is_not_configuration(monkeypatch, module_name):
+    class EntryNotFoundError(FileNotFoundError, ValueError):
+        def __str__(self):
+            raise AssertionError("classification must not format private HF errors")
+
+    class LocalEntryNotFoundError(EntryNotFoundError):
+        pass
+
+    module = types.ModuleType(module_name)
+    module.EntryNotFoundError = EntryNotFoundError
+    module.LocalEntryNotFoundError = LocalEntryNotFoundError
+    monkeypatch.setitem(sys.modules, module_name, module)
+    for cls in (EntryNotFoundError, LocalEntryNotFoundError):
+        assert isinstance(cls(), ValueError) and isinstance(cls(), OSError)
+        assert classify_failure(cls("owned-private-detail")) is FailureKind.MODEL_IO
+    # Name/module spoofing cannot claim the trusted export's classification.
+    spoof = type("LocalEntryNotFoundError", (FileNotFoundError, ValueError), {"__module__": module_name})
+    assert classify_failure(spoof()) is FailureKind.CONFIGURATION
+    assert classify_failure(ValueError("LocalEntryNotFoundError")) is FailureKind.CONFIGURATION
+
+
+@pytest.mark.parametrize("failure_stage", ["idle-unload", "idle-cleanup", "swap-unload"])
+def test_lifecycle_failure_diagnostics_keep_stage_without_traceback_or_private_text(failure_stage, caplog):
+    class PrivateFailure(RuntimeError):
+        def __str__(self):
+            raise AssertionError("lifecycle diagnostics must not format private errors")
+
+    armed = [False]
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                       timer_factory=timers, clock=lambda: timers.now)
+
+    def unload(pipe):
+        if armed[0] and failure_stage != "idle-cleanup":
+            raise PrivateFailure("owned-private-token /owned/private/path")
+
+    def free():
+        if armed[0] and failure_stage == "idle-cleanup":
+            raise PrivateFailure("owned-private-token /owned/private/path")
+
+    mgr._unloader, mgr._free_memory = unload, free
+    mgr.lease(SDXL).release()
+    armed[0] = True
+    if failure_stage == "swap-unload":
+        mgr.lease(FLUX).release()
+        assert mgr.loaded_model() == FLUX
+    else:
+        timers.timers[-1].fire()
+        assert mgr.loaded_model() is None
+        assert mgr.status()["idle_evicting"] is False
+    stage = "cleanup" if failure_stage == "idle-cleanup" else "unload"
+    assert f"stage={stage} exception_class=unknown_exception" in caplog.text
+    for private in ("owned-private-token", "/owned/private/path", "PrivateFailure", "Traceback"):
+        assert private not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_unknown_load_kind_cannot_render_arbitrary_detail():
+    failure = ModelLoadFailed(FLUX, "owned-private-detail")
+    assert failure.kind is FailureKind.LOAD_FAILED
+    assert failure_summary("owned-private-detail") == "pipeline load failed"
+    assert "owned-private-detail" not in str(failure)
 
 
 class FakeLoader:
@@ -33,15 +241,22 @@ class FakeLoader:
         self.events = []
         self.prepare_fail = {}
         self.prepare_gates = {}
+        self.prepare_entered = {}
         self.lock = threading.Lock()
 
     def prepare(self, spec, variant):
         self.events.append(("prepare", spec.model_id))
+        entered = self.prepare_entered.get(spec.model_id)
+        if entered is not None:
+            entered.set()
         gate = self.prepare_gates.get(spec.model_id)
         if gate is not None:
             assert gate.wait(5), "test never released the prepare gate"
         if spec.model_id in self.prepare_fail:
-            raise RuntimeError(self.prepare_fail.pop(spec.model_id))
+            failure = self.prepare_fail.pop(spec.model_id)
+            if isinstance(failure, Exception):
+                raise failure
+            raise RuntimeError(failure)
 
     def load(self, spec, variant):
         self.events.append(("load", spec.model_id))
@@ -61,6 +276,381 @@ class FakeLoader:
     def free(self):
         self.events.append(("free", None))
         self.freed += 1
+
+
+class ManualTimers:
+    """No sleeps or real timer threads; fire even canceled callbacks to race-test fencing."""
+
+    def __init__(self):
+        self.now = 100.0
+        self.timers = []
+
+    def __call__(self, delay, callback):
+        owner = self
+
+        class Timer:
+            daemon = False
+            canceled = False
+
+            def start(self):
+                owner.timers.append(self)
+
+            def cancel(self):
+                self.canceled = True
+
+            def fire(self):
+                callback()
+
+        timer = Timer()
+        timer.delay = delay
+        return timer
+
+
+@pytest.mark.parametrize("model_id", [SDXL, "owned/video"])
+@pytest.mark.parametrize("idle", [0, 300])
+def test_idle_eviction_clears_image_and_video_leases_and_cold_loads_again(model_id, idle):
+    timers = ManualTimers()
+    loader = FakeLoader()
+    spec = im.CATALOG[SDXL] if model_id == SDXL else im.ImageModelSpec(
+        model_id=model_id, license="test", permissive=False, pipeline_class=None,
+        torch_dtype=None, variants=(im.LoadVariant("none", "none", 0),),
+    )
+    mgr = ImageModelManager(
+        {model_id: spec}, model_id, loader=loader.load, unloader=loader.unload,
+        free_memory=loader.free, warm_wait_seconds=5, idle_unload_seconds=idle,
+        timer_factory=timers, clock=lambda: timers.now,
+    )
+    lease = mgr.lease(model_id)
+    lease.release()
+    assert lease.pipe is None  # keeping the Lease cannot keep weights alive
+    timer = timers.timers[-1]
+    assert timer.delay == idle
+    timers.now += idle
+    timer.fire()
+    assert mgr.loaded_model() is None
+    assert loader.unloaded == [f"pipe:{model_id}"]
+    assert loader.events[-2:] == [("unload", f"pipe:{model_id}"), ("free", None)]
+    # A later cold request uses the same retryable warming contract.
+    mgr._warm_wait = 0
+    gate = loader.gates[model_id] = threading.Event()
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(model_id)
+    finally:
+        gate.set()
+        assert mgr.wait_for_load(5)
+
+
+def test_new_lease_cancels_idle_timer_and_inflight_work_cannot_be_evicted():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    first = mgr.lease(SDXL)
+    first.release()
+    stale = timers.timers[-1]
+    second = mgr.lease(SDXL)
+    third = mgr.lease(SDXL)
+    assert stale.canceled
+    timers.now += 20
+    stale.fire()
+    second.release()
+    stale.fire()
+    assert not loader.unloaded  # third still holds the resident model
+    third.release()
+    current = timers.timers[-1]
+    timers.now += 10
+    current.fire()
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+def test_pinned_image_and_video_models_have_no_idle_eviction_timer():
+    for model_id in (SDXL, "owned/video"):
+        timers = ManualTimers()
+        mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                           pinned_models=frozenset({model_id}),
+                           timer_factory=timers, clock=lambda: timers.now)
+        if model_id not in mgr._specs:
+            mgr._specs[model_id] = im.ImageModelSpec(
+                model_id=model_id, license="test", permissive=False, pipeline_class=None,
+                torch_dtype=None, variants=(im.LoadVariant("none", "none", 0),),
+            )
+        mgr.lease(model_id).release()
+        assert not timers.timers
+        entry = next(m for m in mgr.status()["allowed_models"] if m["model"] == model_id)
+        assert entry["resident"] and entry["pinned"] and entry["evicts_at"] is None
+        assert not loader.unloaded
+
+
+def test_idle_cleanup_drops_pipeline_references_during_replacement_preparation():
+    timers = ManualTimers()
+    references = []
+    observed = []
+    preparing, gate = threading.Event(), threading.Event()
+
+    class Pipeline:
+        pass
+
+    def load(spec, variant):
+        pipe = Pipeline()
+        references.append(weakref.ref(pipe))
+        return pipe, "cuda"
+
+    def prepare(spec, variant):
+        if spec.model_id == FLUX:
+            preparing.set()
+            assert gate.wait(5), "test never released the prepare gate"
+
+    mgr = ImageModelManager(
+        {SDXL: im.CATALOG[SDXL], FLUX: im.CATALOG[FLUX]}, SDXL,
+        loader=load, prepare=prepare,
+        free_memory=lambda: observed.append([ref() is None for ref in references]),
+        warm_wait_seconds=5, idle_unload_seconds=0,
+        timer_factory=timers, clock=lambda: timers.now,
+    )
+    lease = mgr.lease(SDXL)
+    lease.release()
+    mgr._warm_wait = 0
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert preparing.wait(5)
+        timers.timers[-1].fire()
+        assert observed[-1] == [True]
+        assert lease.pipe is None
+    finally:
+        gate.set()
+        assert mgr.wait_for_load(5)
+
+
+def test_failed_swap_resumes_the_outgoing_models_original_idle_deadline():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    timers.now += 3
+    loader.prepare_fail[FLUX] = "owned prepare failure"
+    with pytest.raises(ModelLoadFailed):
+        mgr.lease(FLUX)
+    timer = timers.timers[-1]
+    assert timer.delay == 7
+    timers.now += 7
+    timer.fire()
+    assert mgr.loaded_model() is None
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+@pytest.mark.parametrize("prepare_failure", [False, True])
+def test_idle_deadline_expires_while_replacement_preparation_is_blocked(prepare_failure):
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    released = mgr.lease(SDXL)
+    released.release()
+    deadline = timers.timers[-1]
+    entered, gate = threading.Event(), threading.Event()
+    loader.prepare_entered[FLUX] = entered
+    loader.prepare_gates[FLUX] = gate
+    if prepare_failure:
+        loader.prepare_fail[FLUX] = "owned blocked prepare failure"
+    mgr._warm_wait = 0
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert entered.wait(5)
+        assert not deadline.canceled
+        entry = next(m for m in mgr.status()["allowed_models"] if m["model"] == SDXL)
+        assert entry["evicts_at"] is not None
+        timers.now += 10
+        deadline.fire()
+        assert mgr.loaded_model() is None
+        assert loader.unloaded == [f"pipe:{SDXL}"]
+        assert released.pipe is None and released._resident.pipe is None
+        assert mgr.loading_model() == FLUX
+        assert len(loader.loads) == 1
+    finally:
+        gate.set()
+        assert mgr.wait_for_load(5)
+    if prepare_failure:
+        assert mgr.loaded_model() is None
+        with pytest.raises(ModelLoadFailed):
+            mgr.lease(FLUX)
+    else:
+        assert mgr.loaded_model() == FLUX
+    # Finishing/failing preparation must not unload the expired model twice.
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+def test_new_outgoing_lease_fences_idle_timer_during_blocked_preparation():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    stale = timers.timers[-1]
+    entered, gate = threading.Event(), threading.Event()
+    loader.prepare_entered[FLUX] = entered
+    loader.prepare_gates[FLUX] = gate
+    mgr._warm_wait = 0
+    renewed = None
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert entered.wait(5)
+        renewed = mgr.lease(SDXL)
+        assert stale.canceled
+        timers.now += 11
+        stale.fire()
+        assert not loader.unloaded
+        renewed.release()
+        current = timers.timers[-1]
+        assert current.delay == 10
+        stale.fire()
+        assert not loader.unloaded
+        timers.now += 10
+        current.fire()
+        assert loader.unloaded == [f"pipe:{SDXL}"]
+    finally:
+        if renewed is not None:
+            renewed.release()
+        gate.set()
+        assert mgr.wait_for_load(5)
+
+
+def test_pinned_outgoing_model_stays_resident_during_blocked_preparation():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       pinned_models=frozenset({SDXL}), timer_factory=timers,
+                       clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    entered, gate = threading.Event(), threading.Event()
+    loader.prepare_entered[FLUX] = entered
+    loader.prepare_gates[FLUX] = gate
+    mgr._warm_wait = 0
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert entered.wait(5)
+        timers.now += 1000
+        assert not timers.timers
+        assert mgr.loaded_model() == SDXL
+        assert not loader.unloaded
+    finally:
+        gate.set()
+        assert mgr.wait_for_load(5)
+    assert mgr.loaded_model() == FLUX  # pins still allow explicit swaps
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
+@pytest.mark.parametrize("prepare_failure", [False, True])
+def test_finished_preparation_waits_for_idle_teardown_before_memory_work(prepare_failure):
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=10,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    entered, prepare_gate = threading.Event(), threading.Event()
+    unloading, unload_gate = threading.Event(), threading.Event()
+    phase_entered = threading.Event()
+    loader.prepare_entered[FLUX] = entered
+    loader.prepare_gates[FLUX] = prepare_gate
+    if prepare_failure:
+        loader.prepare_fail[FLUX] = "owned blocked prepare failure"
+
+    def blocked_unload(pipe):
+        unloading.set()
+        assert unload_gate.wait(5), "test never released the unload gate"
+        loader.unload(pipe)
+
+    enter_phase = mgr._enter_replacement_phase
+
+    def observed_phase(load):
+        phase_entered.set()
+        enter_phase(load)
+
+    mgr._unloader = blocked_unload
+    mgr._enter_replacement_phase = observed_phase
+    mgr._warm_wait = 0
+    worker = None
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert entered.wait(5)
+        before = loader.freed
+        timers.now += 10
+        worker = threading.Thread(target=timers.timers[-1].fire)
+        worker.start()
+        assert unloading.wait(5)
+        prepare_gate.set()
+        assert phase_entered.wait(5)
+        assert mgr._idle_evicting
+        assert not mgr._load.event.is_set()
+        assert len(loader.loads) == 1
+        assert loader.freed == before  # neither load nor failure cleanup may overlap
+    finally:
+        prepare_gate.set()
+        unload_gate.set()
+        if worker is not None:
+            worker.join(5)
+            assert not worker.is_alive()
+        assert mgr.wait_for_load(5)
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+    assert mgr.loaded_model() == (None if prepare_failure else FLUX)
+
+
+def test_idle_cleanup_blocks_new_load_until_memory_release_finishes():
+    timers = ManualTimers()
+    entered, release = threading.Event(), threading.Event()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                       timer_factory=timers, clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+
+    def blocked_unload(pipe):
+        entered.set()
+        assert release.wait(5)
+        loader.unload(pipe)
+
+    mgr._unloader = blocked_unload
+    worker = threading.Thread(target=timers.timers[-1].fire)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(ModelWarming) as err:
+            mgr.lease(FLUX)
+        assert err.value.reason == "busy"
+        assert len(loader.loads) == 1
+    finally:
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+
+
+def test_pinning_does_not_prevent_an_explicit_image_model_swap():
+    timers = ManualTimers()
+    mgr, loader = make(warm_wait=5, idle_unload_seconds=0,
+                       pinned_models=frozenset({SDXL}), timer_factory=timers,
+                       clock=lambda: timers.now)
+    mgr.lease(SDXL).release()
+    assert not timers.timers
+    mgr.lease(FLUX).release()
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+    assert mgr.loaded_model() == FLUX
+
+
+def test_unclaimed_background_load_has_only_bounded_retry_grace_at_idle_zero():
+    timers = ManualTimers()
+    loader = FakeLoader()
+    gate = loader.gates[SDXL] = threading.Event()
+    mgr, loader = make(loader, idle_unload_seconds=0, timer_factory=timers,
+                       clock=lambda: timers.now)
+    with pytest.raises(ModelWarming):
+        mgr.lease(SDXL)
+    mgr._warm_wait = 3
+    gate.set()
+    assert mgr.wait_for_load(5)
+    timer = timers.timers[-1]
+    assert timer.delay == 10  # Retry-After: 7 + warm-wait: 3; still bounded
+    timers.now += timer.delay
+    timer.fire()
+    assert mgr.loaded_model() is None
+    assert loader.unloaded == [f"pipe:{SDXL}"]
 
 
 def make(loader=None, *, budget=24.0, quant="auto", free_gb=None, warm_wait=0.0, drain=5.0,
@@ -165,6 +755,29 @@ def test_swap_waits_for_inflight_generation_to_finish():
     assert mgr.loaded_model() == FLUX
 
 
+def test_drain_timeout_preserves_outgoing_lease_and_reports_busy_not_model_io(caplog):
+    mgr, loader = make(warm_wait=5, drain=0)
+    lease = mgr.lease(SDXL)
+    try:
+        with pytest.raises(ModelLoadFailed) as err:
+            mgr.lease(FLUX)
+        assert err.value.model_id == FLUX
+        assert err.value.kind is FailureKind.DRAIN_TIMEOUT
+        assert err.value.message == "previous model is still busy"
+        assert mgr.loaded_model() == SDXL and lease.pipe == f"pipe:{SDXL}"
+        assert loader.unloaded == []
+        assert [model for model, *_ in loader.loads] == [SDXL]
+        assert "[drain_timeout]: previous model is still busy" in caplog.text
+        assert "model files are unavailable" not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+    finally:
+        lease.release()
+    # The typed failure does not change drain/retry policy or unload A early.
+    mgr.lease(FLUX).release()
+    assert mgr.loaded_model() == FLUX
+    assert loader.unloaded == [f"pipe:{SDXL}"]
+
+
 def test_outgoing_model_accepts_no_new_leases_while_swap_is_pending():
     mgr, loader = make()
     with pytest.raises(ModelWarming):
@@ -209,7 +822,8 @@ def test_load_failure_is_reported_once_then_a_retry_loads_fresh():
 
     with pytest.raises(ModelLoadFailed) as err:
         mgr.lease(SDXL)
-    assert "bad repo id" in str(err.value)
+    assert err.value.message == "all eligible pipeline loads failed"
+    assert "bad repo id" not in str(err.value)
     assert mgr.loaded_model() is None
 
     with pytest.raises(ModelWarming):  # failure consumed; this starts a new load
@@ -369,7 +983,7 @@ def test_download_happens_before_the_resident_model_is_evicted():
 
 def test_failed_download_leaves_the_resident_model_loaded():
     loader = FakeLoader()
-    loader.prepare_fail[FLUX] = "insufficient disk space"
+    loader.prepare_fail[FLUX] = InsufficientDiskSpaceError("insufficient disk space at /owned-private-path")
     mgr, _ = make(loader)
     with pytest.raises(ModelWarming):
         mgr.lease(SDXL)
@@ -381,7 +995,9 @@ def test_failed_download_leaves_the_resident_model_loaded():
     mgr.wait_for_load(5)
     with pytest.raises(ModelLoadFailed) as err:
         mgr.lease(FLUX)
-    assert "insufficient disk space" in str(err.value)
+    assert err.value.kind is FailureKind.DISK_SPACE
+    assert err.value.message == "insufficient disk space for model download"
+    assert "/owned-private-path" not in str(err.value)
     assert mgr.loaded_model() == SDXL
     assert loader.unloaded == []
 
@@ -437,7 +1053,7 @@ def test_failed_load_is_not_retried_inside_the_backoff_window():
     clock = Clock()
     loader = FakeLoader()
     loader.fail[ZIMG] = "boom"
-    mgr, _ = make(loader, backoff=30.0, clock=clock)
+    mgr, _ = make(loader, quant="none", backoff=30.0, clock=clock)
     with pytest.raises(ModelWarming):
         mgr.lease(ZIMG)
     mgr.wait_for_load(5)
@@ -454,18 +1070,234 @@ def test_failed_load_is_not_retried_inside_the_backoff_window():
 
 
 def test_falls_back_to_a_smaller_variant_that_fits_free_vram():
-    # Budget 12 prefers FLUX bf16+offload (9 GB); only 8 GB is actually free,
+    # Budget 12 prefers FLUX int8 on GPU (9.5 GB); only 8 GB is actually free,
     # so nf4 (7 GB) loads instead of refusing.
     mgr, loader = make(budget=12.0, free_gb=8.0, warm_wait=5.0)
     with mgr.lease(FLUX) as lease:
         assert lease.variant.quant == "nf4"
     assert loader.loads == [(FLUX, "nf4", "none")]
+    status = mgr.status()["last_load"]
+    assert status["preferred_quantization"] == "int8"
+    assert status["attempt_count"] == 1 and status["fallback_attempts"] == 0
+    assert status["vram_skipped_candidates"] == 1
+    assert status["failed_attempts"] == []
 
 
 def test_prefers_the_budget_choice_when_free_vram_allows():
     mgr, loader = make(budget=12.0, free_gb=30.0, warm_wait=5.0)
     with mgr.lease(FLUX) as lease:
-        assert (lease.variant.quant, lease.variant.offload) == ("none", "model")
+        assert (lease.variant.quant, lease.variant.offload) == ("int8", "none")
+
+
+@pytest.mark.parametrize("failures", [0, 1, 2])
+def test_auto_attempts_gpu_first_then_offload_and_clears_partial_references(failures, caplog):
+    timers = ManualTimers()
+    attempts, references, cleanup = [], [], []
+
+    class Pipeline:
+        pass
+
+    def load(spec, variant):
+        assert all(ref() is None for ref in references)
+        attempts.append((variant.quant, variant.offload))
+        pipe = Pipeline()
+        references.append(weakref.ref(pipe))
+        if len(attempts) <= failures:
+            raise RuntimeError("owned-private-loader-detail")
+        return pipe, "cuda"
+
+    def free():
+        gc.collect()
+        cleanup.append([ref() is None for ref in references])
+
+    mgr, _ = make(budget=12, warm_wait=5, idle_unload_seconds=0,
+                  timer_factory=timers, clock=lambda: timers.now)
+    mgr._loader = load
+    mgr._unloader = lambda pipe: None  # recording a pipe would itself retain it
+    mgr._free_memory = free
+    order = [("int8", "none"), ("nf4", "none"), ("none", "model")]
+    lease = mgr.lease(FLUX)
+    assert attempts == order[:failures + 1]
+    assert (lease.variant.quant, lease.variant.offload) == order[failures]
+    assert all(all(snapshot) for snapshot in cleanup)
+    status = mgr.status()["last_load"]
+    assert status["preferred_quantization"] == "int8" and status["preferred_cpu_offload"] is False
+    assert status["attempt_count"] == failures + 1
+    assert status["fallback_attempts"] == failures
+    assert status["vram_skipped_candidates"] == 0
+    assert status["failed_attempts"] == [
+        {"quantization": quant, "cpu_offload": offload != "none", "kind": "model_runtime",
+         "exception_class": "builtins.RuntimeError"}
+        for quant, offload in order[:failures]
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    if failures:
+        assert "candidate int8 failed [model_runtime]: model runtime failed" in caplog.text
+        assert "stage=load exception_class=builtins.RuntimeError" in caplog.text
+    assert "owned-private-loader-detail" not in caplog.text
+    # Even fallback CPU-offloaded weights obey immediate idle cleanup.
+    lease.release()
+    timers.timers[-1].fire()
+    assert all(ref() is None for ref in references)
+    assert all(cleanup[-1])
+
+
+def test_auto_all_candidate_failures_are_bounded_static_and_backed_off(caplog):
+    attempts = []
+
+    def load(spec, variant):
+        attempts.append((variant.quant, variant.offload))
+        raise RuntimeError("owned-private-loader-detail")
+
+    mgr, _ = make(budget=12, warm_wait=5, backoff=30)
+    mgr._loader = load
+    for _ in range(3):
+        with pytest.raises(ModelLoadFailed) as err:
+            mgr.lease(FLUX)
+        assert err.value.message == "all eligible pipeline loads failed"
+        assert "owned-private-loader-detail" not in str(err.value)
+    assert attempts == [("int8", "none"), ("nf4", "none"), ("none", "model")]
+    assert mgr.loaded_model() is None
+    assert "owned-private-loader-detail" not in caplog.text
+    for variant in ("int8", "nf4", "none+cpu-offload"):
+        assert f"candidate {variant} failed [model_runtime]: model runtime failed" in caplog.text
+    assert "stage=load exception_class=builtins.RuntimeError" in caplog.text
+    assert "stage=load raised_exception_class=image_swap.ModelLoadFailed" in caplog.text
+
+
+@pytest.mark.parametrize("kinds, expected", [
+    ([FailureKind.DISK_SPACE] * 3, FailureKind.DISK_SPACE),
+    ([FailureKind.REPO_GATED] * 3, FailureKind.REPO_GATED),
+    ([FailureKind.REPO_MISSING] * 3, FailureKind.REPO_MISSING),
+    ([FailureKind.GPU_UNAVAILABLE] * 3, FailureKind.GPU_UNAVAILABLE),
+    ([FailureKind.DISK_SPACE, FailureKind.DISK_SPACE, FailureKind.REPO_GATED], FailureKind.ALL_FAILED),
+    ([FailureKind.LOAD_FAILED] * 3, FailureKind.ALL_FAILED),
+    ([FailureKind.RUNTIME] * 3, FailureKind.ALL_FAILED),
+])
+def test_auto_aggregate_preserves_only_one_common_actionable_kind(kinds, expected, caplog):
+    attempts = []
+
+    def load(spec, variant):
+        kind = kinds[len(attempts)]
+        attempts.append((variant.quant, variant.offload))
+        failure = ModelLoadFailed("owned-foreign-model", kind)
+        failure.message = "owned-private-detail"
+        raise failure
+
+    mgr, _ = make(budget=12, warm_wait=5)
+    mgr._loader = load
+    with pytest.raises(ModelLoadFailed) as err:
+        mgr.lease(FLUX)
+    assert len(attempts) == 3
+    assert err.value.model_id == FLUX
+    assert err.value.kind is expected
+    assert err.value.message == failure_summary(expected)
+    assert "owned-private-detail" not in str(err.value) + caplog.text
+    assert "owned-foreign-model" not in str(err.value) + caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_fallback_load_seconds_include_failed_attempts_and_cleanup():
+    clock = Clock()
+    attempts = []
+
+    def load(spec, variant):
+        attempts.append(variant.quant)
+        clock.now += 3
+        if variant.quant == "int8":
+            raise RuntimeError("owned-private-detail")
+        return object(), "cuda"
+
+    def free():
+        clock.now += 2
+
+    mgr, _ = make(budget=12, warm_wait=5, clock=clock)
+    mgr._loader = load
+    mgr._free_memory = free
+    mgr.lease(FLUX).release()
+    assert attempts == ["int8", "nf4"]
+    assert mgr.status()["last_load"]["seconds"] == 8  # 3 + failed cleanup 2 + 3
+
+
+@pytest.mark.parametrize("quant", ["int8", "none"])
+def test_explicit_quantization_never_retries_after_a_load_exception(quant):
+    attempts = []
+
+    def load(spec, variant):
+        attempts.append((variant.quant, variant.offload))
+        raise RuntimeError("owned-private-loader-detail")
+
+    mgr, _ = make(budget=24, quant=quant, warm_wait=5)
+    mgr._loader = load
+    with pytest.raises(ModelLoadFailed) as err:
+        mgr.lease(FLUX)
+    assert err.value.kind is FailureKind.RUNTIME
+    assert err.value.message == "model runtime failed"
+    assert attempts == [(quant, "none")]
+
+
+def test_auto_fallback_rechecks_vram_after_failed_candidate_cleanup():
+    attempts = []
+    free = [12 * GIB]
+
+    def load(spec, variant):
+        attempts.append((variant.quant, variant.offload))
+        if variant.quant == "int8":
+            free[0] = 6 * GIB  # another service has claimed the remaining room
+            raise RuntimeError("owned candidate refusal")
+        raise AssertionError("a candidate exceeding current free VRAM must not load")
+
+    mgr, _ = make(budget=12, warm_wait=5)
+    mgr._loader = load
+    mgr._free_vram_bytes = lambda: free[0]
+    with pytest.raises(InsufficientVram) as err:
+        mgr.lease(FLUX)
+    assert attempts == [("int8", "none")]
+    assert (err.value.need_gb, err.value.free_gb) == (7.0, 6.0)
+
+
+def test_concurrent_requests_share_one_serial_fallback_load():
+    first, second = threading.Event(), threading.Event()
+    release_first, release_second = threading.Event(), threading.Event()
+    attempts = []
+    active = [0]
+
+    def load(spec, variant):
+        active[0] += 1
+        try:
+            assert active[0] == 1
+            attempts.append((variant.quant, variant.offload))
+            if variant.quant == "int8":
+                first.set()
+                assert release_first.wait(5)
+                raise RuntimeError("owned int8 refusal")
+            second.set()
+            assert release_second.wait(5)
+            return object(), "cuda"
+        finally:
+            active[0] -= 1
+
+    mgr, _ = make(budget=12)
+    mgr._loader = load
+    try:
+        with pytest.raises(ModelWarming):
+            mgr.lease(FLUX)
+        assert first.wait(5)
+        for _ in range(4):
+            with pytest.raises(ModelWarming):
+                mgr.lease(FLUX)
+        release_first.set()
+        assert second.wait(5)
+        for _ in range(4):
+            with pytest.raises(ModelWarming):
+                mgr.lease(FLUX)
+        assert attempts == [("int8", "none"), ("nf4", "none")]
+    finally:
+        release_first.set()
+        release_second.set()
+        assert mgr.wait_for_load(5)
+    assert active[0] == 0
+    assert mgr.loaded_model() == FLUX
 
 
 def test_refuses_only_when_even_the_smallest_variant_does_not_fit():
@@ -483,7 +1315,7 @@ def test_old_failure_is_not_delivered_to_a_fresh_request_later():
     clock = Clock()
     loader = FakeLoader()
     loader.fail[ZIMG] = "boom"
-    mgr, _ = make(loader, backoff=30.0, clock=clock)
+    mgr, _ = make(loader, quant="none", backoff=30.0, clock=clock)
     with pytest.raises(ModelWarming):
         mgr.lease(ZIMG)
     mgr.wait_for_load(5)

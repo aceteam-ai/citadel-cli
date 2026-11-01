@@ -226,7 +226,25 @@ func NormalizeTemplateParams(raw json.RawMessage) (json.RawMessage, error) {
 	return b.Bytes(), nil
 }
 
-type TemplateInputFile struct{ Path, NodeID, NodePath string }
+type TemplateInputFile struct {
+	Path, NodeID, NodePath string
+	// Expectations bind an approved reference to the private snapshot consumed
+	// by a builtin. A pointer distinguishes an omitted size from an empty file.
+	ExpectedSHA256 string
+	ExpectedBytes  *int64
+}
+
+// VerifyExpectedContent compares expectations with the bytes actually staged,
+// never a preliminary stat or a separate read of the mutable source path.
+func (f TemplateInputFile) VerifyExpectedContent(digest string, size int64) error {
+	if f.ExpectedSHA256 != "" && f.ExpectedSHA256 != digest {
+		return fmt.Errorf("input %q does not match expected_sha256", f.NodePath)
+	}
+	if f.ExpectedBytes != nil && *f.ExpectedBytes != size {
+		return fmt.Errorf("input %q does not match expected_bytes", f.NodePath)
+	}
+	return nil
+}
 
 // MaxTemplateInputFiles is the node-edge cap on declared template inputs. It is
 // intentionally code-owned rather than operator-tunable: the approved builtin
@@ -259,7 +277,7 @@ func ParseTemplateInputFiles(raw json.RawMessage, nodeID string) ([]TemplateInpu
 			return nil, fmt.Errorf("input_files entry must be an object")
 		}
 		for k := range m {
-			if k != "path" && k != "node_id" && k != "node_path" {
+			if k != "path" && k != "node_id" && k != "node_path" && k != "expected_sha256" && k != "expected_bytes" {
 				return nil, fmt.Errorf("noncanonical input_files key %q", k)
 			}
 		}
@@ -275,6 +293,23 @@ func ParseTemplateInputFiles(raw json.RawMessage, nodeID string) ([]TemplateInpu
 		}
 		if f.Path != f.NodePath && f.Path != "node:"+f.NodeID+"/"+f.NodePath {
 			return nil, fmt.Errorf("input_files path %q disagrees with node_id/node_path", f.Path)
+		}
+		if value, present := m["expected_sha256"]; present {
+			f.ExpectedSHA256, ok = value.(string)
+			if !ok || len(f.ExpectedSHA256) != len("sha256:")+64 || !strings.HasPrefix(f.ExpectedSHA256, "sha256:") || strings.Trim(f.ExpectedSHA256[len("sha256:"):], "0123456789abcdef") != "" {
+				return nil, fmt.Errorf("input_files expected_sha256 must be sha256: followed by 64 lowercase hex digits")
+			}
+		}
+		if value, present := m["expected_bytes"]; present {
+			number, ok := value.(json.Number)
+			if !ok {
+				return nil, fmt.Errorf("input_files expected_bytes must be a nonnegative integer")
+			}
+			size, err := number.Int64()
+			if err != nil || size < 0 || number.String() != strconv.FormatInt(size, 10) {
+				return nil, fmt.Errorf("input_files expected_bytes must be a nonnegative integer fitting int64")
+			}
+			f.ExpectedBytes = &size
 		}
 		files = append(files, f)
 	}
