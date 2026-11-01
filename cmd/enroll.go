@@ -118,7 +118,7 @@ just run 'citadel enroll' and scan.`,
 
 		// Reclaim any stale registration with the same hostname so the node
 		// does not appear twice in the Fabric dashboard after re-installs.
-		reclaimEnrollmentNodes(enrollNewDevice, result, nodeName)
+		reclaimEnrollmentNodes(enrollNewDevice, result, deviceEnrollmentHostname(result, nodeName))
 
 		// Honor the org's authoritative nexus from the device-auth token when
 		// --nexus was not explicitly set (citadel-cli#1122), so a QR-enroll
@@ -128,7 +128,7 @@ just run 'citadel enroll' and scan.`,
 
 		fmt.Println("\n--- 🌐 Joining your org's Fabric ---")
 		fmt.Printf("Connecting as '%s'...\n", nodeName)
-		if err := connectToNetwork(nodeName, result.Token.Authkey); err != nil {
+		if err := connectToNetworkAs(nodeName, deviceEnrollmentHostname(result, nodeName), result.Token.Authkey); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to join the Fabric: %v\n", err)
 			os.Exit(1)
 		}
