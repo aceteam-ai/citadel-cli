@@ -11,6 +11,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/artifact"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -102,6 +103,7 @@ func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
 // Execute processes the job using the wrapped legacy handler.
 func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	start := time.Now()
+	job.sealMedia()
 	if a.enabled != nil && !a.enabled() {
 		err := legacyPermissionRefusal(a.jobType)
 		if a.refusal != nil {
@@ -110,6 +112,10 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 			}
 		}
 		return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
+	}
+	payload, projectionErr := job.executionPayload()
+	if projectionErr != nil {
+		return &JobResult{Status: JobStatusFailure, Error: projectionErr, Duration: time.Since(start)}, projectionErr
 	}
 
 	// Convert worker.Job to nexus.Job for the legacy handler
@@ -129,9 +135,9 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	// fmt.Sprint'd: fmt.Sprint on a map yields the unparseable Go form
 	// "map[K:v]", which loses the structure. This is a shared chokepoint for
 	// every legacy handler, so the change is deliberately limited to maps/slices.
-	if job.Payload != nil {
+	if payload != nil {
 		nexusJob.Payload = make(map[string]string)
-		for k, v := range job.Payload {
+		for k, v := range payload {
 			// FILE_FETCH's bounded integer may arrive as a JSON number. Preserve
 			// its decimal form instead of fmt.Sprint's scientific notation for
 			// large float64s. The handler rejects fractions, non-finite values
@@ -178,7 +184,7 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	// is inert unless the handler calls ctx.EmitProgress (FILE_INDEX today). A
 	// dropped progress publish never fails the job.
 	var progress func(jobs.ProgressEvent)
-	if stream != nil {
+	if stream != nil && job.media == nil {
 		progress = jobs.NewThrottledProgress(func(m map[string]any) {
 			if err := stream.WriteProgress(m); err != nil && a.logFn != nil {
 				a.logFn("debug", fmt.Sprintf("progress publish for job %s failed: %v", job.ID, err))
@@ -192,8 +198,24 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	// CancelRequested carries the cooperative (graceful) cancel predicate the
 	// runner's mid-job watch sets on ctx for cooperative-cancel job types; nil for
 	// every other job (aceteam#10876 C1).
+	logFn := a.logFn
+	if job.media != nil {
+		logFn = func(level, message string) {
+			safe := jobprivacy.Text(job.Type, job.diagnosticPayload(), message)
+			switch level {
+			case "trace", "debug", "info", "warn", "warning", "error":
+			default:
+				level = "info"
+			}
+			if a.logFn != nil {
+				a.logFn(level, safe)
+			} else {
+				fmt.Println(safe)
+			}
+		}
+	}
 	jobCtx := jobs.JobContext{
-		LogFn:           a.logFn,
+		LogFn:           logFn,
 		Ctx:             ctx,
 		Progress:        progress,
 		CancelRequested: jobs.CancelRequestedFrom(ctx),
@@ -203,14 +225,16 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	duration := time.Since(start)
 
 	if err != nil {
+		err = jobprivacy.Error(job.Type, job.diagnosticPayload(), err)
+		failureOutput := map[string]any{"error": err.Error(), "output": string(output)}
+		if job.media != nil {
+			failureOutput = map[string]any{"error": err.Error()}
+		}
 		return &JobResult{
 			Status:   JobStatusFailure,
 			Error:    err,
 			Duration: duration,
-			Output: map[string]any{
-				"error":  err.Error(),
-				"output": string(output),
-			},
+			Output:   failureOutput,
 		}, err
 	}
 

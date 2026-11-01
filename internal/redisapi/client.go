@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/google/uuid"
 )
@@ -306,6 +307,9 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if path == "/api/fabric/redis/jobs/consume" {
+			return jobprivacy.DeliveryErrorContext(method+" "+path+" request failed", err)
+		}
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -322,6 +326,10 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if path == "/api/fabric/redis/jobs/consume" {
+			prefix := fmt.Sprintf("%s %s returned status %d while reading job delivery body", method, path, resp.StatusCode)
+			return jobprivacy.DeliveryErrorContext(prefix, err)
+		}
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
@@ -368,7 +376,8 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 	if result != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, result); err != nil {
 			if path == "/api/fabric/redis/jobs/consume" {
-				return fmt.Errorf("%s %s returned status %d with an unparseable job delivery body: %w", method, path, resp.StatusCode, err)
+				prefix := fmt.Sprintf("%s %s returned status %d with an unparseable job delivery body", method, path, resp.StatusCode)
+				return jobprivacy.DeliveryErrorContext(prefix, err)
 			}
 			return fmt.Errorf("%s %s returned status %d with an unparseable body (%s): %w",
 				method, path, resp.StatusCode, truncateBody(diagnosticBody), err)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 )
 
 // ConsumeJob reads the next available job from the queue.
@@ -106,6 +107,9 @@ func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 	if msg.Data.Payload != "" {
 		var payload map[string]any
 		if err := json.Unmarshal([]byte(msg.Data.Payload), &payload); err != nil {
+			if job.Type == "" || job.Type == jobprivacy.MediaGenerate || job.Type == jobprivacy.FileFetch {
+				return nil, jobprivacy.DeliveryErrorContext("failed to parse job payload", err)
+			}
 			return nil, fmt.Errorf("failed to parse job payload: %w", err)
 		}
 		job.Payload = payload
@@ -119,6 +123,7 @@ func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 		}
 	}
 
+	job.sealMedia()
 	return job, nil
 }
 
