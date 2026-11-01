@@ -4037,6 +4037,22 @@ convenience with improved failure modes, not isolation.
 override) rather than caching an overridden node's identity into the real
 machine's cache file.
 
+### Meeting progress, denial and Stop (citadel-cli#1506, S4a)
+
+`jobs.MeetingJoinHandler.Capabilities` owns MEETING_JOIN's declaration: a
+cooperative (graceful) Stop and the progress stages in `meeting_progress.go`
+(joining, waiting_admission, admitted, ended with a closed-set `reason`,
+transcribing). The platform cancel marker therefore no longer hard-cancels a
+meeting. Every join, admission and recording loop polls `CancelRequestedNow`.
+A Stop before recording returns `errMeetingStopped` (wraps `context.Canceled`,
+reported as "Meeting cancelled"); a Stop while recording leaves the call, then
+backs up and transcribes, and the result is `status: stopped`, never
+`completed`. A Stop during setup waits for the setup phase to finish. Denial
+probes match explicit refusal wording only and run after the admitted probe
+fails, so an unknown page degrades to `admit_timeout`, never a false
+`denied`; the selectors are English-only and untuned live. Ctx cancellation
+(shutdown/deadline) remains the hard abort described below.
+
 ### Meeting-bot wait-loop cancellation (citadel#488, cancellation half)
 
 Every poll loop in the MEETING_JOIN join/wait chain now `select`s on

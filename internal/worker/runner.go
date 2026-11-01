@@ -1191,12 +1191,13 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	var result *JobResult
 	var err error
 	handlerCtx, stopCancellationWatch := r.watchHuddleCancellation(handlerCtx, job)
-	// Cooperative (graceful) mid-job cancel watch for cooperativeCancelJobTypes
-	// (FILE_INDEX): polls job:cancelled:<id> and sets a flag the handler reads via
-	// JobContext.CancelRequested, WITHOUT cancelling handlerCtx — so the current
-	// file finishes and commits before the walk stops (aceteam#10876 C1). A no-op
-	// for every other job type, and harmless alongside the huddle watch (their
-	// job-type sets are disjoint).
+	// Cooperative (graceful) mid-job cancel watch for job types declaring
+	// CooperativeCancel (FILE_INDEX, MEETING_JOIN): polls job:cancelled:<id> and
+	// sets a flag the handler reads via JobContext.CancelRequested, WITHOUT
+	// cancelling handlerCtx, so FILE_INDEX commits its current file and a meeting
+	// leaves and still transcribes (aceteam#10876 C1, #1506). A no-op for every
+	// other job type; never combined with the hard huddle watch (HUDDLE_JOIN
+	// declares no cooperative cancel).
 	handlerCtx, stopCoopCancelWatch := r.watchCooperativeCancellation(handlerCtx, job)
 	if budgetErr != nil {
 		err = budgetErr
@@ -1588,11 +1589,12 @@ func (r *Runner) deferHuddleTeardown(ctx context.Context, job *Job, err error) {
 }
 
 // watchHuddleCancellation turns the platform's durable cancellation marker
-// into hard execution cancellation for HUDDLE_JOIN and MEETING_JOIN. Only the
-// observation is shared; their terminal authority and teardown handling differ.
+// into hard execution cancellation for HUDDLE_JOIN. MEETING_JOIN instead
+// declares a cooperative (graceful) Stop: it leaves the call and still records
+// and transcribes what was captured (#1506).
 // Other job types retain the existing pre-execution-only cancellation check.
 func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context.Context, func() bool) {
-	if job.Type != JobTypeHuddleJoin && job.Type != JobTypeMeetingJoin {
+	if job.Type != JobTypeHuddleJoin {
 		return ctx, func() bool { return false }
 	}
 	execCtx, cancelExec := context.WithCancel(ctx)
@@ -1633,14 +1635,14 @@ func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context
 }
 
 // watchCooperativeCancellation turns the platform's durable cancellation marker
-// into a GRACEFUL stop signal for cooperativeCancelJobTypes (FILE_INDEX). Unlike
+// into a GRACEFUL stop signal for job types declaring CooperativeCancel (FILE_INDEX, MEETING_JOIN). Unlike
 // watchHuddleCancellation it does NOT cancel the handler context: it polls
 // job:cancelled:<id> and, on cancel, sets a flag the handler reads via
 // JobContext.CancelRequested (threaded through the returned context). The handler
 // finishes the current unit (file), commits it, and returns `cancelled` with
 // partial counts — "cancel commits the current file" (aceteam#10876 C1).
 //
-// For any job type NOT in cooperativeCancelJobTypes this returns ctx unchanged
+// For any job type that does not declare CooperativeCancel this returns ctx unchanged
 // and a no-op stop, so it is inert for every other job. The returned stop func
 // halts the poll goroutine (call it once execution is done).
 func (r *Runner) watchCooperativeCancellation(ctx context.Context, job *Job) (context.Context, func()) {

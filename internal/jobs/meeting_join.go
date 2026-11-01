@@ -689,6 +689,11 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// (#514). media.Start brings up the browser + audio capture and returns the
 	// CDP-driven browser. Cleanup is attempted after any start attempt; an
 	// ambiguous start result retains custody even if a later close returns.
+	// A Stop that arrived before setup is honored before anything launches.
+	if ctx.CancelRequestedNow() {
+		meetingEnded(ctx, MeetingEndStoppedByUser)
+		return nil, errMeetingStopped
+	}
 	var media MeetingMedia
 	if err := checkMeetingPhase(setupCtx.Context(), func() error { media = h.selectMedia(p); return nil }); err != nil {
 		return nil, err
@@ -740,7 +745,9 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	}
 
 	// Run the (unverified) Meet join flow.
+	meetingStage(ctx, MeetingStageJoining)
 	if err := h.runJoinFlow(ctx, br, p); err != nil {
+		meetingEnded(ctx, joinEndReason(err))
 		return nil, fmt.Errorf("meeting join flow: %w", err)
 	}
 	cancelSetup()
@@ -759,9 +766,11 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// is a per-pass temp; remove it on exit so it does not linger in the workspace.
 	defer func() { _ = os.Remove(meetingWindowWavPath(h.WorkspaceDir, p.MeetingID)) }()
 	if err := checkMeetingPhase(ctx.Context(), media.StartRecording); err != nil {
+		meetingEnded(ctx, "recording_failed")
 		return nil, fmt.Errorf("start recording: %w", err)
 	}
 	p.recordingStartedAt = h.meetingNow()
+	meetingStage(ctx, MeetingStageAdmitted)
 	ctx.Log("info", "     - [Job %s] recording meeting to %s", job.ID, wavPath)
 
 	// Stay in the call until it ends or the hard cap trips. When the interactive
@@ -774,6 +783,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// (citadel#490) — the WAV on disk is truncated or empty, and this is
 	// reported as a job failure below rather than a silent "completed" result.
 	outcome, recorderErr := h.runMeetingLoop(ctx, br, p, wavPath, media)
+	meetingEnded(ctx, outcome.endReason)
 
 	// Finalize the recording (host: SIGINT ffmpeg + unload the sink; container:
 	// POST /record/stop). media.Close (deferred) then tears the browser down. Take
@@ -850,6 +860,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// Transcribe node-locally by reusing the transcribe handler in-process. This
 	// end-of-call batch pass remains the SOURCE OF TRUTH for the stored
 	// transcript; rolling transcription during the call was additive.
+	meetingStage(ctx, MeetingStageTranscribing)
 	transcribeCtx := ctx
 	transcribeCtx.Ctx = transcriptionCtx
 	transcript, tErr := h.transcribe(transcribeCtx, job, recordedPath)
@@ -878,8 +889,19 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 		return out, nil
 	}
 
+	status := "completed"
+	if outcome.endReason != MeetingEndStoppedByUser && ctx.CancelRequestedNow() {
+		// Jason, 2026-11-01: a Stop after the call ended does not abort the
+		// final transcript; the result stays completed.
+		ctx.Log("info", "     - [Job %s] stop arrived after the call ended; keeping the completed transcript", job.ID)
+	}
+	if outcome.endReason == MeetingEndStoppedByUser {
+		// A Stop is honored with the partial transcript, but is never reported
+		// as completed work (#1505 DoR, #1506).
+		status = "stopped"
+	}
 	out, _ := json.Marshal(map[string]any{
-		"status":              "completed",
+		"status":              status,
 		"disclosure_posted":   outcome.disclosurePosted,
 		"meeting_id":          p.MeetingID,
 		"audio_path":          recordedPath,
@@ -1051,6 +1073,9 @@ type joinPage interface {
 func pollForJoinClick(ctx JobContext, page joinPage, botDisplayName string, timeout, interval time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if ctx.CancelRequestedNow() {
+			return errMeetingStopped
+		}
 		// Already in the call (host auto-admit path): success, no join button
 		// needed. runJoinFlow's waitUntilAdmitted re-checks this idempotently.
 		if v, err := page.Evaluate(meetIsAdmittedJS); err == nil {
@@ -1104,7 +1129,11 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 	probeCtx, cancel := context.WithDeadline(ctx.Context(), deadline)
 	defer cancel()
 	br = phaseMeetingBrowser{meetingBrowser: br, ctx: probeCtx}
+	meetingStage(ctx, MeetingStageWaitingAdmission)
 	for time.Now().Before(deadline) {
+		if ctx.CancelRequestedNow() {
+			return errMeetingStopped
+		}
 		if v, err := br.Evaluate(meetIsAdmittedJS); err == nil {
 			if b, ok := v.(bool); ok && b {
 				if err := ctx.Context().Err(); err != nil {
@@ -1119,6 +1148,11 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 		} else {
 			ctx.Log("warn", "     - admission check errored (retrying): %v", err)
 		}
+		// Checked only when not admitted, so an admitted page always wins.
+		if meetingDenied(br, meetDeniedJS) {
+			ctx.Log("info", "     - host denied the join request for meeting %s", p.MeetingID)
+			return ErrMeetingDenied
+		}
 		select {
 		case <-ctx.Context().Done():
 			err := fmt.Errorf("meeting cancelled while waiting for admission: %w", ctx.Context().Err())
@@ -1127,7 +1161,7 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 		case <-time.After(meetingAdmissionPollDelay(deadline)):
 		}
 	}
-	return fmt.Errorf("not admitted to meeting within %s (host did not let the bot in, or admission selector is stale)", timeout)
+	return fmt.Errorf("%w: not admitted to meeting within %s (host did not let the bot in, or admission selector is stale)", errMeetingAdmitTimeout, timeout)
 }
 
 // waitForMeetingEnd blocks until the call ends (end heuristic true, or the bot is
@@ -1149,6 +1183,15 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser
 	recorderDead := media.RecordingAlive()
 	seenChat := make(map[int]struct{})
 	for h.meetingNow().Before(deadline) {
+		if ctx.CancelRequestedNow() {
+			ctx.Log("info", "     - stop requested; leaving meeting %s", p.MeetingID)
+			leaveJS := meetLeaveCallJS
+			if p.Platform == platformTeams {
+				leaveJS = teamsLeaveJS
+			}
+			_, _ = br.Evaluate(leaveJS)
+			return MeetingEndStoppedByUser, nil
+		}
 		if reason, ended := checkMeetingEndedFor(p.Platform, br, &endState); ended {
 			return reason, nil
 		}

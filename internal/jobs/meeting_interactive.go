@@ -317,7 +317,18 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 			}
 		}
 
-		// 3. Act on a recognized /ace leave (the only auto-executed command).
+		// 3. A Stop request leaves like /ace leave, then records/transcribes
+		// what was captured (#1506).
+		if ctx.CancelRequestedNow() {
+			ctx.Log("info", "     - stop requested; leaving the call gracefully")
+			if _, err := page.Evaluate(meetLeaveCallJS); err != nil {
+				ctx.Log("warn", "     - graceful leave click errored (non-fatal, teardown closes the browser): %v", err)
+			}
+			out.endReason = MeetingEndStoppedByUser
+			return out, nil
+		}
+
+		// 4. Act on a recognized /ace leave (the only auto-executed command).
 		if leaveRequested {
 			ctx.Log("info", "     - /ace leave recognized; leaving the call gracefully")
 			if _, err := page.Evaluate(meetLeaveCallJS); err != nil {
