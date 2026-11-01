@@ -84,7 +84,9 @@ func managedUnitRestartCommand(ctx context.Context, u ManagedUnit, uid int) (*ex
 		managerUID = pinned
 	}
 	command := exec.CommandContext(ctx, "systemctl", append(systemctlArgs(u.UserMode), "restart", u.Name)...)
-	command.Env = discoveryManagerEnvironment(u.UserMode, managerUID)
+	if err := applyWorkerManagerIdentity(command, u.UserMode, managerUID, uid); err != nil {
+		return nil, err
+	}
 	return command, nil
 }
 

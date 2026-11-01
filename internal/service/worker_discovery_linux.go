@@ -54,11 +54,13 @@ func (b *discoveryOutput) result(runErr error) ([]byte, error) {
 
 func captureSystemctl(ctx context.Context, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "systemctl", args...)
-	uid := os.Geteuid()
+	uid := workerManagerEffectiveUID()
 	if pinned, ok := ctx.Value(workerManagerUIDKey{}).(int); ok {
 		uid = pinned
 	}
-	command.Env = discoveryManagerEnvironment(len(args) > 0 && args[0] == "--user", uid)
+	if err := applyWorkerManagerIdentity(command, len(args) > 0 && args[0] == "--user", uid, workerManagerEffectiveUID()); err != nil {
+		return nil, err
+	}
 	command.WaitDelay = 500 * time.Millisecond
 	var output discoveryOutput
 	command.Stdout, command.Stderr = &output, io.Discard

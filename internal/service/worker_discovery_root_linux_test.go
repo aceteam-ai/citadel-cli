@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"os/user"
 	"reflect"
 	"strings"
 	"testing"
@@ -67,6 +68,7 @@ func TestRootDiscoveryMissingOwnUserManagerKeepsSystemWorker(t *testing.T) {
 	}
 }
 func TestRootDiscoveryUsesExistingSudoManagerAndPinnedRestart(t *testing.T) {
+	useWorkerManagerAccountFixture(t)
 	f := &rootManagerFixture{user: map[int]string{9001: rootWorkerFixture}, unavailable: map[int]bool{0: true}}
 	workers, err := discoverActiveWorkersForProcess(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 0, "9001", func(uid int) (bool, error) {
 		if uid != 9001 {
@@ -81,6 +83,7 @@ func TestRootDiscoveryUsesExistingSudoManagerAndPinnedRestart(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(command.Env, discoveryManagerEnvironment(true, 9001)) {
 		t.Fatal("root restart used a different bus", command, err)
 	}
+	assertSudoManagerCredential(t, command)
 	if _, err := managedUnitRestartCommand(context.Background(), workers[0].Unit, 8001); err == nil {
 		t.Fatal("nonroot caller inherited sudo manager authority")
 	}
@@ -142,18 +145,79 @@ func TestNonRootDiscoveryDoesNotBorrowSudoIdentity(t *testing.T) {
 	}
 }
 func TestDiscoveryCaptureUsesPinnedSudoBusWithoutExec(t *testing.T) {
+	useWorkerManagerAccountFixture(t)
 	old := runWorkerDiscoveryCommand
 	defer func() { runWorkerDiscoveryCommand = old }()
 	runWorkerDiscoveryCommand = func(command *exec.Cmd) error {
 		if !reflect.DeepEqual(command.Env, discoveryManagerEnvironment(true, 9001)) || len(command.Args) < 2 || command.Args[1] != "--user" {
 			t.Fatal("capture ignored manager UID", command.Env, command.Args)
 		}
+		assertSudoManagerCredential(t, command)
 		_, err := command.Stdout.Write([]byte("fixture"))
 		return err
 	}
-	body, err := captureSystemctl(context.WithValue(context.Background(), workerManagerUIDKey{}, 9001), "--user", "list-units")
-	if err != nil || string(body) != "fixture" {
-		t.Fatal("capture fixture failed", string(body), err)
+	for _, operation := range []string{"list-units", "cat", "show"} {
+		body, err := captureSystemctl(context.WithValue(context.Background(), workerManagerUIDKey{}, 9001), "--user", operation)
+		if err != nil || string(body) != "fixture" {
+			t.Fatal("capture fixture failed", string(body), err)
+		}
+	}
+}
+
+func useWorkerManagerAccountFixture(t *testing.T) {
+	t.Helper()
+	oldUID, oldLookup := workerManagerEffectiveUID, lookupWorkerManagerUser
+	t.Cleanup(func() { workerManagerEffectiveUID, lookupWorkerManagerUser = oldUID, oldLookup })
+	workerManagerEffectiveUID = func() int { return 0 }
+	lookupWorkerManagerUser = func(uid string) (*user.User, error) {
+		if uid != "9001" {
+			return nil, errors.New("fixture unknown account")
+		}
+		return &user.User{Uid: "9001", Gid: "9002", HomeDir: "/fixture/manager-home"}, nil
+	}
+}
+
+func assertSudoManagerCredential(t *testing.T, command *exec.Cmd) {
+	t.Helper()
+	if command.SysProcAttr == nil || command.SysProcAttr.Credential == nil {
+		t.Fatal("sudo manager command did not drop its OS account")
+	}
+	credential := command.SysProcAttr.Credential
+	if credential.Uid != 9001 || credential.Gid != 9002 || len(credential.Groups) != 0 || credential.NoSetGroups || command.Dir != "/fixture/manager-home" {
+		t.Fatal("sudo manager command retained the wrong identity or directory")
+	}
+}
+
+func TestWorkerManagerIdentityPreservesOwnAndSystemScopes(t *testing.T) {
+	useWorkerManagerAccountFixture(t)
+	lookupWorkerManagerUser = func(string) (*user.User, error) {
+		t.Fatal("own/system scope looked up another account")
+		return nil, nil
+	}
+	for _, scope := range []struct {
+		user               bool
+		manager, effective int
+	}{{true, 0, 0}, {true, 9001, 9001}, {false, 0, 0}} {
+		command := exec.CommandContext(context.Background(), "systemctl", "list-units")
+		if err := applyWorkerManagerIdentity(command, scope.user, scope.manager, scope.effective); err != nil || command.SysProcAttr != nil || command.Dir != "" {
+			t.Fatal("own/system manager unexpectedly changed identity", err)
+		}
+	}
+}
+
+func TestWorkerManagerIdentityRefusesUnverifiedAccountBeforeRunner(t *testing.T) {
+	useWorkerManagerAccountFixture(t)
+	oldRunner := runWorkerDiscoveryCommand
+	t.Cleanup(func() { runWorkerDiscoveryCommand = oldRunner })
+	runWorkerDiscoveryCommand = func(*exec.Cmd) error { t.Fatal("unverified account reached runner"); return nil }
+	for _, account := range []*user.User{nil, {Uid: "8001", Gid: "9002", HomeDir: "/fixture/home"}, {Uid: "9001", Gid: "-1", HomeDir: "/fixture/home"}, {Uid: "9001", Gid: "09002", HomeDir: "/fixture/home"}, {Uid: "9001", Gid: "4294967296", HomeDir: "/fixture/home"}, {Uid: "9001", Gid: "9002", HomeDir: "relative"}} {
+		lookupWorkerManagerUser = func(string) (*user.User, error) { return account, nil }
+		if _, err := captureSystemctl(context.WithValue(context.Background(), workerManagerUIDKey{}, 9001), "--user", "cat"); err == nil {
+			t.Fatal("unverified account accepted")
+		}
+		if command, err := managedUnitRestartCommand(context.Background(), ManagedUnit{Name: "worker", UserMode: true, ManagerUID: "9001"}, 0); err == nil || command != nil {
+			t.Fatal("unverified restart account accepted")
+		}
 	}
 }
 func TestWorkerContinuationEndsAtBlankOrFileHeader(t *testing.T) {
