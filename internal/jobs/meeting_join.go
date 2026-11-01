@@ -765,6 +765,13 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// The rolling-window transcription scratch clip (meeting_transcribe_window.go)
 	// is a per-pass temp; remove it on exit so it does not linger in the workspace.
 	defer func() { _ = os.Remove(meetingWindowWavPath(h.WorkspaceDir, p.MeetingID)) }()
+	// The shared Meet/Teams recording boundary: a Stop seen at any point before
+	// recording starts (including during the final admission probe) records
+	// nothing and is a cancellation; the deferred close still tears down media.
+	if ctx.CancelRequestedNow() {
+		meetingEnded(ctx, MeetingEndStoppedByUser)
+		return nil, errMeetingStopped
+	}
 	if err := checkMeetingPhase(ctx.Context(), media.StartRecording); err != nil {
 		meetingEnded(ctx, "recording_failed")
 		return nil, fmt.Errorf("start recording: %w", err)
