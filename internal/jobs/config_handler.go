@@ -130,7 +130,8 @@ type DeviceConfig struct {
 	// (together with a NodePasscode) to enable it. Even enabled, shell stays
 	// fail-closed until a passcode is set AND presented per SHELL_COMMAND, exactly
 	// like console/desktop/files.
-	ShellEnabled *bool `json:"shellEnabled,omitempty"`
+	ShellEnabled         *bool `json:"shellEnabled,omitempty"`
+	ContainerHostEnabled *bool `json:"containerHostEnabled,omitempty"`
 
 	// EnergySampling is the programmatic opt-IN for the per-request energy receipt
 	// (aceteam#6635). Pointer for the same absent(nil)-vs-explicit reason as the
@@ -210,6 +211,10 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	var config DeviceConfig
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config JSON: %w", err)
+	}
+	// Refuse a remote enable before path discovery or any unrelated config effect.
+	if config.ContainerHostEnabled != nil && *config.ContainerHostEnabled {
+		return nil, fmt.Errorf("container hosting can only be enabled locally by the node owner")
 	}
 
 	// Determine config directory
@@ -377,6 +382,13 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 				result += "\nNote: a sensitive surface is enabled but no passcode is set — access stays denied until a passcode is set"
 			}
 		}
+	}
+
+	if config.ContainerHostEnabled != nil {
+		if err := persistContainerHostPermission(h.PermissionsDir, config.ContainerHostEnabled); err != nil {
+			return nil, err
+		}
+		result += fmt.Sprintf("\nContainer hosting %s", enabledLabel(*config.ContainerHostEnabled))
 	}
 
 	// Start services if autoStartServices is enabled
@@ -718,3 +730,23 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 
 // Ensure ConfigHandler implements JobHandler
 var _ JobHandler = (*ConfigHandler)(nil)
+
+// persistContainerHostPermission deliberately has no invoker-home fallback:
+// this owner capability belongs to the enrolled machine configuration.
+func persistContainerHostPermission(dir string, enabled *bool) error {
+	if enabled == nil {
+		return nil
+	}
+	if *enabled {
+		return fmt.Errorf("container hosting can only be enabled locally by the node owner")
+	}
+	if dir == "" {
+		return fmt.Errorf("container hosting requires a configured permission directory")
+	}
+	p, err := citadelconfig.LoadPermissionsStrict(dir)
+	if err != nil {
+		return fmt.Errorf("container hosting permission could not be read")
+	}
+	p.ContainerHost = *enabled
+	return citadelconfig.SavePermissions(dir, p)
+}

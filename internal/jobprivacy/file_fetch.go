@@ -6,10 +6,10 @@ import "strings"
 const FileFetch = "FILE_FETCH"
 
 // Payload is for retention/diagnostics only, never execution or redispatch.
-// It drops a FILE_FETCH payload entirely and removes the node passcode field
-// from every other job type.
+// It drops FILE_FETCH and CONTAINER_* payloads entirely, and removes the node
+// passcode field from every other job type.
 func Payload(kind string, payload map[string]any) map[string]any {
-	if kind == FileFetch {
+	if kind == FileFetch || strings.HasPrefix(kind, "CONTAINER_") {
 		return nil
 	}
 	return WithoutPasscode(payload)
@@ -18,6 +18,9 @@ func Payload(kind string, payload map[string]any) map[string]any {
 // Text removes a reflected delivery credential or node passcode while
 // preserving safe reasons.
 func Text(kind string, payload map[string]any, text string) string {
+	if strings.HasPrefix(kind, "CONTAINER_") {
+		return "typed container operation failed"
+	}
 	if kind == FileFetch {
 		if token, ok := payload["capability"].(string); ok && token != "" {
 			text = replaceAll(text, token)
@@ -56,7 +59,7 @@ func FailureData(kind string, payload map[string]any, err error, data map[string
 		message = Error(kind, payload, err).Error()
 	}
 	fields := map[string]any{"error": message}
-	if kind != FileFetch {
+	if kind != FileFetch && !strings.HasPrefix(kind, "CONTAINER_") {
 		for key, value := range data {
 			fields[key] = value
 		}
