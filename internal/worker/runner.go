@@ -1588,11 +1588,12 @@ func (r *Runner) deferHuddleTeardown(ctx context.Context, job *Job, err error) {
 }
 
 // watchHuddleCancellation turns the platform's durable cancellation marker
-// into hard execution cancellation for HUDDLE_JOIN and MEETING_JOIN. Only the
-// observation is shared; their terminal authority and teardown handling differ.
+// into hard execution cancellation for HUDDLE_JOIN. MEETING_JOIN instead
+// declares a cooperative (graceful) Stop: it leaves the call and still records
+// and transcribes what was captured (#1506).
 // Other job types retain the existing pre-execution-only cancellation check.
 func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context.Context, func() bool) {
-	if job.Type != JobTypeHuddleJoin && job.Type != JobTypeMeetingJoin {
+	if job.Type != JobTypeHuddleJoin {
 		return ctx, func() bool { return false }
 	}
 	execCtx, cancelExec := context.WithCancel(ctx)

@@ -254,6 +254,9 @@ func (h *MeetingJoinHandler) runTeamsJoinFlow(ctx JobContext, br meetingBrowser,
 func pollForTeamsJoinClick(ctx JobContext, page joinPage, botDisplayName, passcode string, timeout, interval time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if ctx.CancelRequestedNow() {
+			return errMeetingStopped
+		}
 		// Already admitted / in the call: success, no join button needed.
 		if v, err := page.Evaluate(teamsIsAdmittedJS); err == nil {
 			if b, ok := v.(bool); ok && b {
@@ -328,7 +331,11 @@ func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBr
 	probeCtx, cancel := context.WithDeadline(ctx.Context(), deadline)
 	defer cancel()
 	br = phaseMeetingBrowser{meetingBrowser: br, ctx: probeCtx}
+	meetingStage(ctx, MeetingStageWaitingAdmission)
 	for time.Now().Before(deadline) {
+		if ctx.CancelRequestedNow() {
+			return errMeetingStopped
+		}
 		// Best-effort: dismiss the "Are you sure you don't want audio or video?"
 		// confirmation Teams raises right after "Join now" on a device-less bot —
 		// it can sit between the click and the lobby/call, so clear it each pass.
@@ -349,6 +356,11 @@ func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBr
 		} else {
 			ctx.Log("warn", "     - Teams admission check errored (retrying): %v", err)
 		}
+		// Checked only when not admitted, so an admitted page always wins.
+		if meetingDenied(br, teamsDeniedJS) {
+			ctx.Log("info", "     - host denied the join request for Teams meeting %s", p.MeetingID)
+			return ErrMeetingDenied
+		}
 		select {
 		case <-ctx.Context().Done():
 			err := fmt.Errorf("Teams meeting cancelled while waiting for admission: %w", ctx.Context().Err())
@@ -357,7 +369,7 @@ func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBr
 		case <-time.After(meetingAdmissionPollDelay(deadline)):
 		}
 	}
-	return fmt.Errorf("not admitted to Teams meeting within %s (host did not let the bot in, or the admission selector is stale; re-tune teamsIsAdmittedJS)", timeout)
+	return fmt.Errorf("%w: not admitted to Teams meeting within %s (host did not let the bot in, or the admission selector is stale; re-tune teamsIsAdmittedJS)", errMeetingAdmitTimeout, timeout)
 }
 
 // checkTeamsMeetingEnded runs the Teams end heuristic (the "you left / removed /

@@ -46,6 +46,9 @@ func (p admissionProbeBrowser) Evaluate(expression string) (any, error) {
 		}
 		return p.admitted, p.probeErr
 	}
+	if expression == meetDeniedJS || expression == teamsDeniedJS {
+		return false, nil // an undecided lobby is never a denial
+	}
 	return true, nil // The Teams pre-admission dialog dismissal is synthetic.
 }
 

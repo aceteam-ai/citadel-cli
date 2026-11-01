@@ -95,12 +95,20 @@ func TestMeetingCancellationDoesNotUseHuddleTerminalAuthority(t *testing.T) {
 	meetingTestEnvironment(t)
 	source := NewMockJobSource("fake", nil)
 	source.cancelledJobs = map[string]bool{"synthetic": true}
-	h := meetingTimingHandler{profile: meetingpolicy.Default(), run: func(c context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
-		<-c.Done()
-		return nil, jobs.ErrHuddleTerminalOwned
-	}}
+	// A pre-recording Stop is graceful: the handler observes the cooperative
+	// flag (never a hard ctx cancel) and returns a caller cancellation.
+	h := coopMeetingHandler{meetingTimingHandler{profile: meetingpolicy.Default(), run: func(c context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+		requested := jobs.CancelRequestedFrom(c)
+		for requested == nil || !requested() {
+			if c.Err() != nil {
+				return nil, c.Err()
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return nil, errors.Join(context.Canceled, jobs.ErrHuddleTerminalOwned)
+	}}}
 	r := NewRunner(source, []JobHandler{h}, RunnerConfig{})
-	r.huddleCancelPoll = time.Millisecond
+	r.coopCancelPoll = time.Millisecond
 	stream := &meetingCancellationWriter{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -320,4 +328,12 @@ func TestMeetingRecoveryFenceStopsPickupWithoutWaitingPoll(t *testing.T) {
 	if !r.IsDraining() || !cancelled.Load() {
 		t.Fatal("recovery did not fence and cancel pickup")
 	}
+}
+
+// coopMeetingHandler declares the production meeting capability: a graceful
+// cooperative Stop rather than a hard cancel.
+type coopMeetingHandler struct{ meetingTimingHandler }
+
+func (coopMeetingHandler) DeclaredCapabilities(jobType string) (jobs.JobCapabilities, bool) {
+	return jobs.JobCapabilities{CooperativeCancel: true}, jobType == JobTypeMeetingJoin
 }
