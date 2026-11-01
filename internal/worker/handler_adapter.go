@@ -24,6 +24,7 @@ type LegacyHandlerAdapter struct {
 	handler         jobs.JobHandler
 	logFn           func(level, msg string)
 	enabled         func() bool
+	refusal         func() *jobs.ShellRefusal
 	backgroundOwner bool
 	// passcodeGate, when set, is evaluated after the permission check and
 	// before the handler runs. On such an adapter the payload passcode key is
@@ -71,7 +72,7 @@ func (a *LegacyHandlerAdapter) SetLogFn(logFn func(level, msg string)) {
 
 // CanHandle returns true if this adapter handles the given job type.
 func (a *LegacyHandlerAdapter) CanHandle(jobType string) bool {
-	return a.jobType == jobType && (a.enabled == nil || a.enabled())
+	return a.jobType == jobType && (a.enabled == nil || a.enabled()) && a.meetingReadiness() == nil
 }
 
 // DeclaredCapabilities forwards the wrapped legacy handler's capability
@@ -104,7 +105,12 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	start := time.Now()
 	job.sealMedia()
 	if a.enabled != nil && !a.enabled() {
-		err := fmt.Errorf("job type %s is disabled by current node permissions", job.Type)
+		err := legacyPermissionRefusal(a.jobType)
+		if a.refusal != nil {
+			if specific := a.refusal(); specific != nil {
+				err = specific
+			}
+		}
 		return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
 	}
 	payload, projectionErr := job.executionPayload()
@@ -394,6 +400,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	if goos == "" {
 		goos = runtime.GOOS
 	}
+	meetingEnabled := opts.MeetingEnabled
+	if meetingEnabled == nil {
+		meetingEnabled = func() bool {
+			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
+		}
+	}
 
 	// Embedding handler as fail-closed dispatched work when a signer is wired
 	// (aceteam#10876 C7). Without a signer (legacy/diagnostic paths) it stays
@@ -623,15 +635,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// per-meeting null sink, then transcribes it via the handler above. Needs
 		// the workspace both to write the recording and to validate the audio path
 		// for transcription, so it lives inside this workspace gate. Gated on the
-		// persisted meeting toggle (default-on, the house opt-out convention) so
-		// the handler registers unless the operator has explicitly opted out —
-		// matching the `meeting` capability advertisement gate in
-		// internal/capabilities.
-		if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
-			handlers = append(handlers,
-				NewLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts)),
-			)
-		}
+		// live meeting toggle shared with HUDDLE_JOIN and registration refusals.
+		// Retain the adapter while disabled so enabling new joins does not need
+		// a worker restart; CanHandle and Execute both recheck the same gate.
+		handlers = append(handlers,
+			newGatedLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts), meetingEnabled),
+		)
 	}
 
 	// Native-huddle agent join (aceteam#7081). Part of the SAME default-on meeting
@@ -646,12 +655,6 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	huddleHandler := jobs.NewHuddleJoinHandler(opts.WorkspaceDir)
 	huddleTeardown := NewLegacyHandlerAdapter(JobTypeHuddleTeardown, huddleHandler)
 	huddleTeardown.backgroundOwner = false
-	meetingEnabled := opts.MeetingEnabled
-	if meetingEnabled == nil {
-		meetingEnabled = func() bool {
-			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
-		}
-	}
 	handlers = append(handlers,
 		newGatedLegacyHandlerAdapter(JobTypeHuddleJoin, huddleHandler, meetingEnabled),
 		huddleTeardown,
@@ -676,10 +679,14 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 
 	// Convert to []JobHandler.
 	result := make([]JobHandler, len(handlers))
+	refusals := &registrationRefusals{opts: opts, goos: goos}
+	refusals.opts.MeetingEnabled = meetingEnabled
 	for i, h := range handlers {
+		jobType := h.jobType
+		h.refusal = func() *jobs.ShellRefusal { return refusals.RefusalFor(jobType) }
 		result[i] = h
 	}
-	return result
+	return append(result, refusals)
 }
 
 // newMeetingJoinHandler wires opts.MeetingProfileDir into the handler so a
@@ -698,6 +705,7 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 	// capability itself). The config accessors clamp non-positive cadence values
 	// to sane defaults.
 	m := config.LoadMeeting(platform.ConfigDir())
+	h.Timing, h.TimingError = m.TimingProfile()
 	h.StreamingEnabled = m.StreamingEnabled
 	h.StreamingInterval = m.StreamingInterval()
 	h.StreamingWindow = m.StreamingWindow()

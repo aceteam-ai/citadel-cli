@@ -3287,3 +3287,94 @@ Auto-generated log of every release.
   - feat(worker): desktop job handlers honor the node passcode like SHELL_COMMAND (#1369)
 
 
+---
+
+## v2.202.0 — 2026-10-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 13 |
+| Files changed | 151 |
+| Lines added | +17648 |
+
+**Changes:**
+
+  - test(api): cover cooldown rebuild and unread 404 edges (#1478)
+  - fix(worker): self-heal sustained platform wrong answers (#1479)
+  - fix(api): re-dial stale platform connections after cutovers (#1477)
+  - fix(auth): restore safe denial and enrollment diagnostics (#1467)
+  - fix(auth): discard late device tokens before persistence (#1465)
+  - fix(enrollment): expose unconfirmed device linking safely (#1463)
+  - fix(enrollment): fence retries, registration and managed unit repair (#1462)
+  - fix(worker): acquire lane execution slots in claim order (#1464)
+  - test(worker): fence deadline lane checks on actual retirement (#1461)
+  - docs: reconcile agents wake design with the governed-lane MVP (#1451)
+  - docs: session serve restore-only dependency policy design (#1450)
+  - ci: publish :latest only from main (#1439)
+  - feat(sessions): native declared session holder S1 (#1443)
+
+
+---
+
+## v2.203.0 — 2026-10-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 12 |
+| Files changed | 95 |
+| Lines added | +10516 |
+
+**Changes:**
+
+  - fix(worker): report terminal gate refusals for known withheld jobs (#1492)
+  - docs(enrollment): clarify refresh and stale-node recovery boundaries (#1493)
+  - fix(memorygit): disable lazy fetching in the child environment (#1495)
+  - fix(update): atomically persist state and expose corrupt-state pauses (#1482)
+  - feat(auth): verify current-key binding before suppressing link warnings (#1480)
+  - test(worker): cover service-manager platform recovery wiring (#1485)
+  - chore(deps): declare godbus as a direct requirement (#1484)
+  - fix(sessions): recover abandoned starts and retain refused viewers (#1449)
+  - fix(video-compose): bound camera metadata preflight (#1446)
+  - feat(agents): prepare inactive wake quota model (#1454)
+  - feat(agents): prepare disk and worktree policy model (#1453)
+  - feat(controlcenter): read bounded shared worker detail (#1448)
+
+
+---
+
+## v2.204.0 — 2026-10-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 79 |
+| Lines added | +6503 |
+
+**Changes:**
+
+  - fix(worker): fence durable HTTP delivery before terminal publish (#1504)
+  - feat(worker): prepare fenced meeting intake custody (#1515)
+  - fix(cdp): share bounded page discovery across browser paths (#1507)
+  - fix(worker): restore permission hints and live meeting gates (#1509)
+  - Support exact ingress host routes and mounted cert sets (#1517)
+  - fix(whisper): align patched OpenTelemetry API and SDK pins (#1511)
+  - fix(agentquota): configure wake caps per harness (#1512)
+  - fix(update): preflight install authority and report manual-update capability (#1490)
+  - fix(cdp): bound HTTP target discovery before selecting a page (#1494)
+
+
+---
+
+## v2.205.0 — 2026-10-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 43 |
+| Lines added | +3161 |
+
+**Changes:**
+
+  - fix(meeting): unattended-join safety (#1505 C1), with #1514 review fixes (#1522)
+
+

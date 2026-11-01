@@ -14,6 +14,7 @@ import (
 
 // ConsumeRequest is the request body for POST /api/fabric/redis/jobs/consume
 type ConsumeRequest struct {
+	Protocol string `json:"protocol,omitempty"`
 	Queue    string `json:"queue"`
 	Group    string `json:"group"`
 	Consumer string `json:"consumer"`
@@ -40,7 +41,8 @@ type StreamMessageData struct {
 	EnqueuedAt string `json:"enqueuedAt"`
 	RayID      string `json:"rayId"`
 
-	observation *deliverymetadata.Observation `json:"-"`
+	observation      *deliverymetadata.Observation `json:"-"`
+	deliveryMetadata func() deliveryMetadata
 }
 
 // Job represents a parsed job ready for processing
@@ -54,7 +56,9 @@ type Job struct {
 	RawPayload []byte         `json:"-"`
 	RawData    map[string]any `json:"raw_data,omitempty"`
 
-	observation *deliverymetadata.Observation `json:"-"`
+	observation     *deliverymetadata.Observation `json:"-"`
+	delivery        *DeliveryClaim
+	durableMetadata bool
 }
 
 // DeliveryObservation returns an opaque copy, not a claim credential or authority.

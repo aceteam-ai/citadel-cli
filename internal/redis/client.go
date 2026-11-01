@@ -17,8 +17,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
@@ -35,6 +37,10 @@ type StreamEvent struct {
 	Timestamp string                 `json:"timestamp"`
 	Data      map[string]interface{} `json:"data,omitempty"`
 }
+
+// ErrDurableControlRequired leaves unsupported deliveries pending. Direct Redis
+// has no authenticated original-claim completion/renewal authority.
+var ErrDurableControlRequired = errors.New("durable delivery requires authenticated HTTP control")
 
 // Job represents a job read from Redis Streams.
 type Job struct {
@@ -57,13 +63,14 @@ type NodeMeta struct {
 
 // Client wraps Redis operations for the job queue system.
 type Client struct {
-	client        *redis.Client
-	workerID      string
-	queueName     string
-	consumerGroup string
-	blockMs       int
-	maxAttempts   int
-	nodeMeta      *NodeMeta
+	durableRefusals atomic.Uint64
+	client          *redis.Client
+	workerID        string
+	queueName       string
+	consumerGroup   string
+	blockMs         int
+	maxAttempts     int
+	nodeMeta        *NodeMeta
 
 	// reclaimMinIdle is the effective floor ReclaimStalePendingOnQueue uses.
 	// Defaults to the package var StalePendingReclaimMinIdle at construction
@@ -349,6 +356,9 @@ func (c *Client) ReadJobMultiBlock(ctx context.Context, queues []string, blockMs
 	for _, stream := range streams {
 		if len(stream.Messages) > 0 {
 			job, err := c.parseMessage(stream.Messages[0])
+			if errors.Is(err, ErrDurableControlRequired) {
+				continue
+			}
 			if err != nil {
 				return nil, "", err
 			}
@@ -626,6 +636,15 @@ func (c *Client) MoveToDLQFromQueue(ctx context.Context, queue string, job *Job,
 
 // parseMessage converts a Redis stream message to a Job.
 func (c *Client) parseMessage(msg redis.XMessage) (*Job, error) {
+	for name := range msg.Values {
+		for _, field := range []string{"protocol", "dispatchId", "requestDigest", "claimToken", "leaseEpoch"} {
+			if strings.EqualFold(name, field) {
+				c.durableRefusals.Add(1)
+				return nil, ErrDurableControlRequired
+			}
+		}
+	}
+
 	job := &Job{
 		MessageID: msg.ID,
 		RawData:   make(map[string]interface{}),
@@ -944,3 +963,9 @@ func (c *Client) MaxAttempts() int {
 func (c *Client) SetNodeMeta(nodeID, nodeName string) {
 	c.nodeMeta = &NodeMeta{NodeID: nodeID, NodeName: nodeName}
 }
+
+// DrainDurableRefusals transfers direct-read refusal telemetry to the owning
+// source. It never changes pending entries, execution authority or disposition.
+// A multi-stream read can skip an unsupported entry and still return a legacy
+// job from another stream in the same batch, without losing this count.
+func (c *Client) DrainDurableRefusals() uint64 { return c.durableRefusals.Swap(0) }

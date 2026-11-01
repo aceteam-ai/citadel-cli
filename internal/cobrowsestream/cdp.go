@@ -5,11 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
 	"github.com/gorilla/websocket"
 )
 
@@ -17,37 +17,19 @@ import (
 // cannot hang a viewer connection forever.
 var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-// cdpTargetURL resolves a debug port to the page target's DevTools WebSocket URL.
-// It is a package var so tests can point the CDP client at a fake Chrome
-// (httptest WebSocket) without launching a real browser -- the same injection
-// seam pattern the platform launchers use. Like the existing screenshot path it
-// grabs the FIRST page target, so a session that opens a second tab streams the
-// first tab (a documented, inherited limitation).
+// cdpTargetURL remains an injection seam for fake Chrome WebSockets.
 var cdpTargetURL = defaultCDPTargetURL
 
 func defaultCDPTargetURL(debugPort int) (string, error) {
-	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
+	return discoverCDPTargetURL(debugPort, cdpHTTPClient)
+}
+
+func discoverCDPTargetURL(debugPort int, client *http.Client) (string, error) {
+	target, err := cdpdiscovery.Discover(context.Background(), debugPort, client)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	var targets []struct {
-		Type                 string `json:"type"`
-		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-	}
-	if err := json.Unmarshal(body, &targets); err != nil {
-		return "", err
-	}
-	for _, t := range targets {
-		if t.Type == "page" && t.WebSocketDebuggerURL != "" {
-			return t.WebSocketDebuggerURL, nil
-		}
-	}
-	return "", fmt.Errorf("no page target found on CDP port %d", debugPort)
+	return target.WebSocketDebuggerURL, nil
 }
 
 // screencastFrame is one decoded CDP Page.screencastFrame event.

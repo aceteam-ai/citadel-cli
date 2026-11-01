@@ -19,7 +19,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/netip"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,6 +78,17 @@ type Route struct {
 	Visibility Visibility
 }
 
+// HostRoute is an exact public hostname admitted by the same fresh feed as
+// slug routes. Only validated mesh targets are stored in a RouteMap.
+type HostRoute struct {
+	Host, Group, Kind, Scheme, UpstreamHost string
+	MeshIP                                  netip.Addr
+	Port                                    uint16
+	Online                                  bool
+}
+
+var hostLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
 // RouteMap is an immutable snapshot of the control-plane routes feed plus the
 // payload-level fields the ingress needs (login URL for gated 401 redirects,
 // the session-cookie names to strip before the pod sees a request). It is
@@ -83,6 +96,7 @@ type Route struct {
 type RouteMap struct {
 	etag        string
 	routes      map[string]Route
+	hosts       map[string]HostRoute
 	appsDomain  string
 	loginURL    string
 	cookieNames []string
@@ -161,9 +175,42 @@ func (m *RouteMap) CookieNames() []string {
 // minimal subset the ingress needs.
 type routesPayload struct {
 	Routes         map[string]routeEntry `json:"routes"`
+	Hosts          hostEntries           `json:"hosts"`
 	AppsDomain     string                `json:"apps_domain"`
 	LoginURL       string                `json:"login_url"`
 	SessionCookies []string              `json:"session_cookies"`
+}
+
+// hostEntries isolates a malformed host entry from the rest of the feed.
+// Even a malformed optional hosts block must leave slug routes usable.
+type hostEntries map[string]hostEntry
+
+func (entries *hostEntries) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		*entries = nil
+		return nil
+	}
+	decoded := make(hostEntries, len(raw))
+	for host, body := range raw {
+		var entry hostEntry
+		if json.Unmarshal(body, &entry) == nil {
+			decoded[host] = entry
+		}
+	}
+	*entries = decoded
+	return nil
+}
+
+type hostEntry struct {
+	MeshIP       string `json:"mesh_ip"`
+	Port         int    `json:"port"`
+	Scheme       string `json:"scheme"`
+	Kind         string `json:"kind"`
+	Visibility   string `json:"visibility"`
+	Group        string `json:"group"`
+	Online       *bool  `json:"online"`
+	UpstreamHost string `json:"upstream_host"`
 }
 
 type routeEntry struct {
@@ -193,7 +240,7 @@ type routeEntry struct {
 // It never returns a nil map together with a nil error on a non-200: last-good
 // is preserved so the ingress keeps serving through a control-plane outage,
 // bounded by RouteMaxAge.
-func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, now time.Time) (*RouteMap, error) {
+func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, now time.Time, configuredAppsDomain string) (*RouteMap, error) {
 	switch {
 	case status == 304:
 		return prev.refreshed(now), nil
@@ -205,6 +252,7 @@ func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, n
 		next := &RouteMap{
 			etag:        etag,
 			routes:      make(map[string]Route, len(p.Routes)),
+			hosts:       make(map[string]HostRoute, len(p.Hosts)),
 			appsDomain:  p.AppsDomain,
 			loginURL:    p.LoginURL,
 			cookieNames: p.SessionCookies,
@@ -217,10 +265,84 @@ func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, n
 			}
 			next.routes[slug] = r
 		}
+		for host, e := range p.Hosts {
+			if r, ok := decodeHostRoute(host, p.AppsDomain, configuredAppsDomain, e); ok {
+				next.hosts[host] = r
+			}
+		}
 		return next, nil
 	default:
 		return prev, fmt.Errorf("routes: unexpected status %d", status)
 	}
+}
+
+func validFQDN(host string) bool {
+	if host == "" || len(host) > 253 || host != strings.ToLower(host) || net.ParseIP(host) != nil {
+		return false
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !hostLabel.MatchString(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func hostInAppsNamespace(host, appsDomain string) bool {
+	return appsDomain != "" && (host == appsDomain || strings.HasSuffix(host, "."+appsDomain))
+}
+
+func decodeHostRoute(host, appsDomain, configuredAppsDomain string, e hostEntry) (HostRoute, bool) {
+	if !validFQDN(host) || !validFQDN(appsDomain) || hostInAppsNamespace(host, appsDomain) ||
+		(configuredAppsDomain != "" && (!validFQDN(configuredAppsDomain) || hostInAppsNamespace(host, configuredAppsDomain))) ||
+		!hostLabel.MatchString(e.Group) || e.Scheme != "http" || e.Visibility != "public" ||
+		(e.Kind != "pod" && e.Kind != "control_plane") || e.Online == nil {
+		return HostRoute{}, false
+	}
+	ip, err := netip.ParseAddr(e.MeshIP)
+	if err != nil || !meshPrefix.Contains(ip) || e.Port < 1 || e.Port > 65535 {
+		return HostRoute{}, false
+	}
+	if e.UpstreamHost != "" && !validFQDN(e.UpstreamHost) {
+		return HostRoute{}, false
+	}
+	return HostRoute{Host: host, Group: e.Group, Kind: e.Kind, Scheme: e.Scheme,
+		UpstreamHost: e.UpstreamHost, MeshIP: ip, Port: uint16(e.Port), Online: *e.Online}, true
+}
+
+// ResolveHost returns membership and freshness from one immutable snapshot.
+// Hosts never use slug on-miss I/O.
+func (c *Client) ResolveHost(host string) (HostRoute, bool, bool) {
+	m := c.current.Load()
+	if m == nil {
+		return HostRoute{}, false, false
+	}
+	r, ok := m.hosts[host]
+	return r, ok, m.fresh(c.now(), c.maxAge)
+}
+
+// HostCertBase returns the mounted certificate set for a published host.
+// A group must publish its base name as well as any child names.
+func (c *Client) HostCertBase(host string) (string, bool) {
+	m := c.current.Load()
+	if m == nil {
+		return "", false
+	}
+	r, ok := m.hosts[host]
+	if !ok {
+		return "", false
+	}
+	for candidate, member := range m.hosts {
+		if member.Group == r.Group && strings.HasPrefix(candidate, r.Group+".") &&
+			(host == candidate || strings.HasSuffix(host, "."+candidate)) {
+			return candidate, true
+		}
+	}
+	return "", false
 }
 
 // decodeRoute validates and normalizes a single wire entry. ok=false means the
@@ -477,7 +599,7 @@ func NewClient(cfg ClientConfig) *Client {
 	c := &Client{
 		src:          cfg.Source,
 		pollInterval: poll,
-		appsDomain:   strings.TrimSpace(cfg.AppsDomain),
+		appsDomain:   strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.AppsDomain)), "."),
 		logf:         logf,
 		now:          time.Now,
 		maxAge:       maxAge,
@@ -526,7 +648,7 @@ func (c *Client) pollOnce(ctx context.Context) {
 		c.noteFailure(fmt.Sprintf("routes fetch failed: %v", err))
 		return
 	}
-	next, aerr := applyRoutesResponse(prev, status, etag, body, requestStartedAt)
+	next, aerr := applyRoutesResponse(prev, status, etag, body, requestStartedAt, c.appsDomain)
 	if aerr != nil {
 		c.warnAppsDomainMismatch(prev)
 		c.noteFailure(fmt.Sprintf("routes response rejected: %v", aerr))

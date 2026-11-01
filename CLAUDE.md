@@ -50,6 +50,23 @@ owns explicit handler projection. Observable diagnostic maps grant no authority.
 The complete pre-mint privacy/ACK gates remain in
 `docs/media-input-freezer.md`; helper tests alone are not C2 completion.
 
+`service.RematerializeManagedUnits` owns the bounded base-file refresh and
+reload request, not worker restart or failed-unit counter recovery.
+`cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
+on force-new enrollment; a saved node ID does not confer predecessor deletion
+authority. See `docs/enrollment-service-recovery.md` for #1356's repair reach,
+start-limit behavior, source references and remaining migration/acceptance gates.
+
+`worker.registrationRefusals` owns non-executable evidence for withheld job
+types; it follows the same live permission callbacks and static registration
+inputs as `CreateLegacyHandlersWithOpts`. `Runner.unavailableJobRefusal` prefers
+that evidence, then the fallback gate catalog, then a known-but-unregistered
+refusal. Only types absent from `allKnownJobTypes` receive an update-node hint.
+`LegacyHandlerAdapter.Execute` rechecks the live gate and returns the shared
+typed refusal so a revocation after selection is terminal on its first attempt.
+The refusal inventory never advertises or executes a job. Focused coverage is
+in `internal/worker/job_refusal_test.go`.
+
 `workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
 loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
 validation separately from the HTTP node. Both worker entrypoints load once via
@@ -549,6 +566,14 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`meetingcapacity.Capacity` owns the inactive #1505 meeting-intake custody
+model: one shared reservation, exact incarnation/job binding, uncertain-read
+quarantine and post-executor-exit resource confirmation. It has no wire or
+native adapters, and no current JobSource invokes it. Its fake intake proofs
+do not establish API/Redis/WS pre-claim admission or authorize activation.
+aceteam-ai/aceteam#12916 blocks the paired routing, old-reader exclusion and
+credit contract before transport wiring; the internal types are not wire fields.
+
 `jobs.NewMemoryGitHandler` owns the inactive memory-git construction contract:
 live permission, strict passcode State and the actual shared node throttle are
 required; legacy callbacks and zero-value construction cannot enable it.
@@ -656,6 +681,11 @@ delivery too (one error event, then Fail with the reason): SHELL_COMMAND, the
 desktop handlers, and WORKFLOW_RUN when its Shell gate refuses at submit. A
 Shell node refused mid-run fails the workflow as an ordinary failure.
 
+Files/Desktop permission refusals retain static tool names and enable/confirm
+hints, including the direct `FILE_WRITE_BYTES` classifier. `MEETING_JOIN` and
+`HUDDLE_JOIN` share one live meeting gate for dispatch and refusal; re-enabling
+joins does not rebuild handlers or remove exact-attempt huddle teardown.
+
 `workflow.Executor.Cancel` owns per-run context cancellation; a cancelled
 status records the request, not proof that a Shell process or callback exited.
 `Execution.Done` supplies executor/slot completion, which the workflow handler
@@ -746,6 +776,12 @@ finite floor can be proven safe against it, so this falls back to
 `StalePendingReclaimFloorFallback` (4h, deliberately kept in sync with
 `internal/redis`'s own construction-time default by
 `TestStalePendingReclaimFloorFallbackMatchesRedisDefault`).
+MEETING_JOIN has its own finite #1505 budget instead of the long tier, so the
+resolved floor is also never below `meetingReclaimFloor` (the largest valid
+meeting STUCK point plus the margin; `TestResolveStalePendingReclaimFloor`
+pins it). A redelivered MEETING_JOIN (delivery count above 1) is refused
+terminally rather than rejoined. Consequence: a crashed node's pending jobs
+now wait roughly 10.5h, not 4h10m, before a self-claim.
 
 With this in place: every job type with a BOUNDED per-job watchdog is
 always ACKed out of the PEL by its own watchdog abandon (routes to
@@ -815,8 +851,8 @@ builds -- `unboundedJobTypes`) that legitimately runs past the resolved
 floor on the SAME process it started on is still a self-owned candidate, so
 #999's fix does not change its self-claim eligibility: it is still reclaimed
 by its own still-alive process, and if it keeps running past roughly
-`(MaxAttempts-1) x floor` (~8h at today's defaults: `MaxAttempts` 3, floor
-~4h10m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
+`(MaxAttempts-1) x floor` (~21h at today's defaults: `MaxAttempts` 3, floor
+~10h30m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
 + `Ack`. That is NOT merely "re-dispatched" -- the message is permanently
 removed from the PEL and reported as a dead/failed job to the DLQ consumer,
 even though the original execution may still be legitimately in progress.
@@ -1588,7 +1624,12 @@ capture lifecycle; v2 also validates its embedded theme registry. The render and
 audio paths invoke fixed argv directly, never a shell. `papercraft-render` shares
 Chromium discovery with
 `platform.FindChromium` and the persistent request/response CDP transport in
-`internal/cobrowsestream`. `startPapercraftAssetServer` is the browser's
+`internal/cobrowsestream`. Its HTTP target discovery accepts only a complete
+512 KiB/64-page reply, pins the debugger WebSocket to the probed loopback port,
+refuses redirects and unsuccessful statuses, and closes
+the response before returning. See `docs/cdp-target-discovery-bounds.md`; these
+limits do not prove aggregate capture memory or native browser acceptance.
+`startPapercraftAssetServer` is the browser's
 non-forwarding HTTP proxy: its random route serves declared inputs only, while
 every other HTTP/HTTPS/WebSocket request fails there and CDP blocks `file://`,
 `data:`, `blob:`, WebSocket, and FTP before navigation. Keep Chromium's
@@ -3419,6 +3460,10 @@ or invalidation hook. `deliverymetadata.Observation` stores its immutable record
 behind an opaque function: Go's nested bad-verb formatting can bypass Formatters
 and print secret-bearing private pointer fields. Its formatting/shape tests pin
 that boundary. These observations do not enable durable execution or ACKs.
+Authenticated HTTP-only durable claims, renewal, commit-before-publish and
+shutdown/refusal behavior are documented in
+[docs/durable-http-delivery.md](docs/durable-http-delivery.md). That source path
+remains inactive until the paired canary and activation gates are satisfied.
 
 `Runner.Run`'s fetch loop no longer conflates "claim a job" with "execute it"
 (this is what `processJob` used to do inline, blocking `source.Next()` for the
@@ -4017,6 +4062,22 @@ convenience with improved failure modes, not isolation.
 override) rather than caching an overridden node's identity into the real
 machine's cache file.
 
+### Meeting progress, denial and Stop (citadel-cli#1506, S4a)
+
+`jobs.MeetingJoinHandler.Capabilities` owns MEETING_JOIN's declaration: a
+cooperative (graceful) Stop and the progress stages in `meeting_progress.go`
+(joining, waiting_admission, admitted, ended with a closed-set `reason`,
+transcribing). The platform cancel marker therefore no longer hard-cancels a
+meeting. Every join, admission and recording loop polls `CancelRequestedNow`.
+A Stop before recording returns `errMeetingStopped` (wraps `context.Canceled`,
+reported as "Meeting cancelled"); a Stop while recording leaves the call, then
+backs up and transcribes, and the result is `status: stopped`, never
+`completed`. A Stop during setup waits for the setup phase to finish. Denial
+probes match explicit refusal wording only and run after the admitted probe
+fails, so an unknown page degrades to `admit_timeout`, never a false
+`denied`; the selectors are English-only and untuned live. Ctx cancellation
+(shutdown/deadline) remains the hard abort described below.
+
 ### Meeting-bot wait-loop cancellation (citadel#488, cancellation half)
 
 Every poll loop in the MEETING_JOIN join/wait chain now `select`s on
@@ -4104,11 +4165,26 @@ can't drift), `autoUpdateReportFrom` (the hand projection, pinned by
 ReconcilePendingOnStartup,ReadStateForReport}` (the atomic, preference-preserving
 state writes under `update.stateMu`). The periodic updater refreshes the cache
 via `AutoUpdaterConfig.Refresh` (threaded through `autoUpdateRuntime.refresh`);
-`buildAutoUpdateSnapshot` reuses agentNodeInfo's #923 `CurrentVersion!=running`
-rule for pending_version/restart_required. pending clears only when the running
-binary matches the staged version (`ReconcilePendingOnStartup`). Corrupt state
-degrades to `configured_enabled=null`/`last_result=unknown`, never a confident
-disabled.
+`buildAutoUpdateSnapshot` and `agentNodeInfo` use `update.StagedVersionIsNewer`
+for pending_version/restart_required. `ReconcilePendingOnStartup` clears stale
+restart results only when valid staged metadata is equal to or older than the
+running release. Invalid metadata is not proof of recovery. Corrupt state
+degrades to `configured_enabled=null`/`last_result=state_corrupt` and never supplies
+pending versions or timestamps. `resolveAutoUpdatePolicy` keeps opt-out/dev veto,
+then flag, then environment ahead of the file preference; corruption replaces
+only that last preference with unknown. Explicit enables still run, while
+telemetry writes preserve the broken bytes. `SetAutoUpdate` alone repairs malformed
+JSON and first attempts a private UTC-stamped `state.json.corrupt-*` backup.
+
+`update.InspectSelfUpdateCapability` owns current-process install authority and a
+same-directory probe, without provisioning locks or changing the binary. Worker
+startup/refresh observes it for the cached report, independently of preference.
+Periodic and remote/manual update paths consult it before download. Deliberately
+privileged installs remain supported: auto-update off reports capability rather
+than a failed update. `RecordApplyNotPermitted` owns refusal persistence, and the
+updater's refusal notice is emitted only when the observed condition changes.
+See `docs/update-install-capability.md` for the wire contract and remaining
+service/installer and native acceptance scope.
 
 **Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
 The update state file resolves from HOME (`getUserHomeDir`), and the shipped

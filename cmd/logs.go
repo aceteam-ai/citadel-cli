@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
 )
@@ -228,7 +229,7 @@ func runRemoteLogs(serviceName, tailLines string) error {
 
 	fmt.Printf("--- Fetching logs for service '%s' from node '%s' ---\n", serviceName, logsNode)
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := &http.Client{Timeout: 30 * time.Second, Transport: platformhttp.New(apiBaseURL, platformhttp.Options{})}
 
 	if logsFollow {
 		return pollRemoteLogs(httpClient, req, serviceName)

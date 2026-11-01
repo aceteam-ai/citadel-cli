@@ -15,7 +15,7 @@ import (
 
 // These are proposed S1 implementation ceilings, not native acceptance results.
 const (
-	ProtocolVersion = 1
+	ProtocolVersion = 2
 	maxFrameBytes   = 64 << 10
 	maxInputBytes   = 8 << 10
 	outputChunkSize = 16 << 10

@@ -159,9 +159,7 @@ func checkForUpdate() {
 	}
 
 	// Update last check time
-	state, _ := update.LoadState()
-	update.UpdateLastCheck(state)
-	_ = update.SaveState(state)
+	_ = update.MutateState(update.UpdateLastCheck)
 
 	if release == nil {
 		spinner.StopWithSuccess(fmt.Sprintf("You are running the latest version (%s)", Version))
@@ -257,10 +255,10 @@ func installUpdate() {
 	}
 
 	// Update state
-	state, _ := update.LoadState()
-	update.RecordUpdate(state, applyResult.InstalledBefore, applyResult.InstalledAfter)
-	update.UpdateLastCheck(state)
-	_ = update.SaveState(state)
+	_ = update.MutateState(func(state *update.State) {
+		update.RecordUpdate(state, applyResult.InstalledBefore, applyResult.InstalledAfter)
+		update.UpdateLastCheck(state)
+	})
 
 	installSpinner.StopWithSuccess(fmt.Sprintf("Successfully updated to %s", release.TagName))
 	fmt.Println("Previous version saved for rollback.")
@@ -295,6 +293,9 @@ func finishManualNoOp(result update.ApplyResult, out io.Writer) bool {
 // downloadAndApplyManual is returning so its deferred private-attempt cleanup
 // always completes before the Cobra wrapper can call os.Exit.
 func downloadAndApplyManual(client *update.Client, release *update.Release, onDownloaded func()) (update.ApplyResult, error) {
+	if capability := manualUpdateCapabilityFn(); capability.State != update.SelfUpdateAvailable {
+		return update.ApplyResult{}, fmt.Errorf("update preflight refused before download: %s", capability.Message())
+	}
 	attempt, err := newUpdateAttemptFn()
 	if err != nil {
 		return update.ApplyResult{}, fmt.Errorf("create private update attempt: %w", err)
@@ -308,6 +309,8 @@ func downloadAndApplyManual(client *update.Client, release *update.Release, onDo
 	}
 	return applyReleaseFn(context.Background(), attempt.Candidate, "", release.TagName, update.Latest)
 }
+
+var manualUpdateCapabilityFn = update.InspectSelfUpdateCapability
 
 // refreshManagedServiceUnits runs the idempotent managed-unit refresh and
 // reports the result to out. It is the single call site for the unit-refresh,
@@ -367,20 +370,19 @@ func rollbackUpdate() {
 	}
 
 	// Update state
-	state, _ := update.LoadState()
-	if state.PreviousVersion != "" {
-		state.CurrentVersion, state.PreviousVersion = state.PreviousVersion, state.CurrentVersion
-		_ = update.SaveState(state)
-	}
+	_ = update.MutateState(func(state *update.State) {
+		if state.PreviousVersion != "" {
+			state.CurrentVersion, state.PreviousVersion = state.PreviousVersion, state.CurrentVersion
+		}
+	})
 
 	fmt.Println("\nRollback complete.")
 	fmt.Println("Run 'citadel version' to verify.")
 }
 
 func showUpdateStatus() {
-	state, err := update.LoadState()
+	state, err := loadUpdateStateForStatus(os.Stderr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading update state: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -421,15 +423,18 @@ func showUpdateStatus() {
 	}
 }
 
-func setAutoUpdate(enabled bool) {
+// Keep the error path testable without invoking os.Exit or a release lookup.
+func loadUpdateStateForStatus(errOut io.Writer) (*update.State, error) {
 	state, err := update.LoadState()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading update state: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(errOut, "Error loading update state: %v\n", err)
+		fmt.Fprintln(errOut, "Repair malformed state with 'citadel update enable' or 'citadel update disable'. Unreadable state requires correcting file access first.")
 	}
+	return state, err
+}
 
-	state.AutoUpdate = enabled
-	if err := update.SaveState(state); err != nil {
+func setAutoUpdate(enabled bool) {
+	if err := update.SetAutoUpdate(enabled); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving update state: %v\n", err)
 		os.Exit(1)
 	}
@@ -707,8 +712,7 @@ func CheckForUpdateInBackground() {
 	release, err := client.CheckForUpdate()
 
 	// Update last check time regardless of result
-	update.UpdateLastCheck(state)
-	_ = update.SaveState(state)
+	_ = update.MutateState(update.UpdateLastCheck)
 
 	if err != nil || release == nil {
 		return

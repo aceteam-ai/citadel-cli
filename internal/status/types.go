@@ -302,7 +302,11 @@ type WorkerLiveness struct {
 	// LastJobConsumedAt is when a job was most recently pulled off the queue.
 	LastJobConsumedAt *time.Time `json:"last_job_consumed_at,omitempty"`
 	// LastPollAt is when the consume loop last completed a poll (job or empty).
-	LastPollAt *time.Time `json:"last_poll_at,omitempty"`
+	LastPollAt             *time.Time `json:"last_poll_at,omitempty"`
+	PlatformOKAt           *time.Time `json:"platform_ok_at,omitempty"`
+	PlatformFailingSince   *time.Time `json:"platform_failing_since,omitempty"`
+	PlatformLastOutcome    string     `json:"platform_last_outcome,omitempty"`
+	PlatformLastHTTPStatus int        `json:"platform_last_http_status,omitempty"`
 	// InFlight is the number of jobs currently executing in a handler.
 	InFlight int64 `json:"in_flight"`
 	// Processed / Failed are cumulative since worker start (diagnostic context).
@@ -431,11 +435,14 @@ type ReconcileHealth struct {
 //   - LatestVersion is the last release THIS node observed, not the platform's
 //     current release lookup.
 //   - LastResult is one of update's bounded result codes (never_checked/
-//     up_to_date/check_failed/download_failed/drain_deferred/apply_failed/
-//     restart_pending/restart_failed/manual_update_required/unknown) — never a
+//     up_to_date/check_failed/download_failed/drain_deferred/apply_failed/apply_not_permitted/
+//     restart_pending/restart_failed/manual_update_required/state_corrupt/unknown) — never a
 //     raw URL, path, log line, or secret.
 //   - The outer heartbeat timestamp remains the observation-freshness signal;
 //     LastCheckAt/LastResultAt are RFC3339 UTC, matching that encoding.
+//   - SelfUpdate observes install authority independently of preference. An
+//     intentionally privileged install may be healthy with auto-update off;
+//     the directory and user identities explain its manual-update requirement.
 type AutoUpdateReport struct {
 	SchemaVersion     int        `json:"schema_version"`
 	ConfiguredEnabled *bool      `json:"configured_enabled"`
@@ -450,6 +457,10 @@ type AutoUpdateReport struct {
 	LatestVersion     string     `json:"latest_version,omitempty"`
 	LastResultAt      *time.Time `json:"last_result_at,omitempty"`
 	LastResult        string     `json:"last_result"`
+	SelfUpdate        string     `json:"self_update,omitempty"`
+	InstallDirectory  string     `json:"install_directory,omitempty"`
+	BinaryOwner       string     `json:"binary_owner,omitempty"`
+	WorkerUser        string     `json:"worker_user,omitempty"`
 }
 
 // AppInfo contains information about an installed catalog app.

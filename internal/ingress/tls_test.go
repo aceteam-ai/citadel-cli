@@ -3,6 +3,7 @@ package ingress
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"os"
@@ -65,6 +66,63 @@ func TestStaticFileCertProvider_LoadsMountedWildcard(t *testing.T) {
 	}
 	if c, err := p.TLSConfig().GetCertificate(nil); err != nil || c == nil {
 		t.Fatalf("GetCertificate: %v", err)
+	}
+}
+
+func writeTestPair(t *testing.T, certPath, keyPath, domain string) {
+	t.Helper()
+	cert, err := generateSelfSigned(domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey.(*ecdsa.PrivateKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaticFileCertProvider_MultiSetReloadAndUnknownSNI(t *testing.T) {
+	dir := t.TempDir()
+	appsCert, appsKey := filepath.Join(dir, "apps.crt"), filepath.Join(dir, "apps.key")
+	hostCert, hostKey := filepath.Join(dir, "demo.example.net.crt"), filepath.Join(dir, "demo.example.net.key")
+	writeTestPair(t, appsCert, appsKey, "apps.example.com")
+	writeTestPair(t, hostCert, hostKey, "demo.example.net")
+	p := &StaticFileCertProvider{CertFile: appsCert, KeyFile: appsKey, CertDir: dir,
+		HostCertBase: func(host string) (string, bool) {
+			return "demo.example.net", host == "demo.example.net" || host == "supabase.demo.example.net"
+		},
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	get := func(name string) (*tls.Certificate, error) {
+		return p.TLSConfig().GetCertificate(&tls.ClientHelloInfo{ServerName: name})
+	}
+	first, err := get("supabase.demo.example.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstLeaf, _ := x509.ParseCertificate(first.Certificate[0])
+	writeTestPair(t, hostCert, hostKey, "demo.example.net")
+	second, err := get("supabase.demo.example.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondLeaf, _ := x509.ParseCertificate(second.Certificate[0])
+	if firstLeaf.SerialNumber.Cmp(secondLeaf.SerialNumber) == 0 {
+		t.Fatal("mounted certificate did not reload")
+	}
+	if _, err := get("unknown.example.net"); err == nil {
+		t.Fatal("unknown SNI accepted")
+	}
+	if _, err := get("slug.apps.example.com"); err != nil {
+		t.Fatalf("apps wildcard lost: %v", err)
 	}
 }
 

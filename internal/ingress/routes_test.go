@@ -24,13 +24,61 @@ func mustBody(t *testing.T, v any) []byte {
 	return b
 }
 
+func TestHostRoutesDecodeIndependentlyAndResolveExact(t *testing.T) {
+	online := true
+	entry := hostEntry{MeshIP: "100.64.0.21", Port: 80, Scheme: "http", Kind: "control_plane", Visibility: "public", Group: "demo", Online: &online}
+	bad := func(change func(*hostEntry)) hostEntry { copy := entry; change(&copy); return copy }
+	hosts := map[string]hostEntry{
+		"demo.example.net":           entry,
+		"supabase.demo.example.net":  entry,
+		"bad.apps.example.com":       entry,
+		"UPPER.example.net":          entry,
+		"no-mesh.example.net":        bad(func(e *hostEntry) { e.MeshIP = "10.0.0.1" }),
+		"bad-kind.example.net":       bad(func(e *hostEntry) { e.Kind = "unknown" }),
+		"gated.example.net":          bad(func(e *hostEntry) { e.Visibility = "gated" }),
+		"missing-online.example.net": bad(func(e *hostEntry) { e.Online = nil }),
+		"bad-upstream.example.net":   bad(func(e *hostEntry) { e.UpstreamHost = "http://evil.example" }),
+	}
+	now := time.Now()
+	m, err := applyRoutesResponse(nil, 200, "hosts-etag", mustBody(t, routesPayload{AppsDomain: "apps.example.com", Hosts: hostEntries(hosts)}), now, "apps.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.hosts) != 2 || m.ETag() != "hosts-etag" {
+		t.Fatalf("decoded hosts=%v etag=%q", m.hosts, m.ETag())
+	}
+	c := NewClient(ClientConfig{Source: &fakeSource{}})
+	c.current.Store(m)
+	if got, ok, fresh := c.ResolveHost("demo.example.net"); !ok || !fresh || got.MeshIP.String() != "100.64.0.21" {
+		t.Fatalf("exact host: %+v %v", got, ok)
+	}
+	if _, ok, _ := c.ResolveHost("other.demo.example.net"); ok {
+		t.Fatal("wildcard host resolved")
+	}
+	if base, ok := c.HostCertBase("supabase.demo.example.net"); !ok || base != "demo.example.net" {
+		t.Fatalf("cert base %q %v", base, ok)
+	}
+	if _, ok := c.HostCertBase("other.demo.example.net"); ok {
+		t.Fatal("unknown SNI admitted")
+	}
+	malformed := []byte(`{"apps_domain":"apps.example.com","routes":{"slug":{"mesh_ip":"100.64.0.2","port":80,"visibility":"public"}},"hosts":{"demo.example.net":{"mesh_ip":"100.64.0.21","port":80,"scheme":"http","kind":"control_plane","visibility":"public","group":"demo","online":true},"bad.example.net":{"port":"not-an-int"}}}`)
+	partial, err := applyRoutesResponse(m, 200, "partial", malformed, now, "apps.example.com")
+	if err != nil || len(partial.hosts) != 1 || len(partial.routes) != 1 {
+		t.Fatalf("malformed host rejected valid feed: hosts=%v routes=%v err=%v", partial.hosts, partial.routes, err)
+	}
+	refreshed, err := applyRoutesResponse(m, 304, "", nil, now.Add(time.Second), "apps.example.com")
+	if err != nil || len(refreshed.hosts) != 2 {
+		t.Fatalf("304 lost hosts: %v %v", refreshed, err)
+	}
+}
+
 func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 	now := time.Unix(1000, 0)
 	prev := &RouteMap{etag: "old", routes: map[string]Route{"old": {Slug: "old"}}, appsDomain: "old.example.com", fetchedAt: time.Unix(500, 0)}
 
 	// 304 re-stamps last-good fresh: a NEW map sharing prev's routes/etag with
 	// fetchedAt advanced to now (so a healthy 304 feed does not expire).
-	got, err := applyRoutesResponse(prev, 304, "", nil, now)
+	got, err := applyRoutesResponse(prev, 304, "", nil, now, "")
 	if err != nil {
 		t.Fatalf("304: unexpected err %v", err)
 	}
@@ -45,13 +93,13 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 	}
 
 	// 5xx keeps last-good UNCHANGED (no re-stamp) and returns an error.
-	got, err = applyRoutesResponse(prev, 503, "", []byte("nope"), now)
+	got, err = applyRoutesResponse(prev, 503, "", []byte("nope"), now, "")
 	if err == nil || got != prev {
 		t.Fatalf("5xx: got=%v err=%v, want prev + error", got, err)
 	}
 
 	// Malformed JSON keeps last-good and returns an error.
-	got, err = applyRoutesResponse(prev, 200, "e1", []byte("{"), now)
+	got, err = applyRoutesResponse(prev, 200, "e1", []byte("{"), now, "")
 	if err == nil || got != prev {
 		t.Fatalf("malformed: got=%v err=%v, want prev + error", got, err)
 	}
@@ -70,7 +118,7 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 		LoginURL:       "https://login.example.com",
 		SessionCookies: []string{"sess"},
 	})
-	got, err = applyRoutesResponse(prev, 200, "e2", body, now)
+	got, err = applyRoutesResponse(prev, 200, "e2", body, now, "")
 	if err != nil {
 		t.Fatalf("200: unexpected err %v", err)
 	}
@@ -672,7 +720,7 @@ func TestDecodeRoute_UnknownVisibilityDefaultsGated(t *testing.T) {
 		"public": {MeshIP: "100.64.0.3", Port: 8080, Visibility: "public"},
 		"gated":  {MeshIP: "100.64.0.4", Port: 8080, Visibility: "GATED"}, // case-insensitive
 	}})
-	m, err := applyRoutesResponse(nil, 200, "e", body, now)
+	m, err := applyRoutesResponse(nil, 200, "e", body, now, "")
 	if err != nil {
 		t.Fatal(err)
 	}
