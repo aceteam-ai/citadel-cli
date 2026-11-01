@@ -11,6 +11,8 @@ import (
 )
 
 const (
+	// Host storage is independent of any invoker-writable node configuration.
+	HostRoot         = "/var/lib/citadel/container-volumes"
 	WorkspaceUID     = 10001
 	WorkspaceGID     = 10001
 	proxyHostMapping = "host.docker.internal:host-gateway"
@@ -24,6 +26,7 @@ const (
 type HostPolicy struct {
 	Runtime        string
 	EgressProxyURL string
+	Limits         HostLimits
 }
 
 func ValidEgressProxyURL(raw string) bool {
@@ -75,10 +78,14 @@ type commandResult struct {
 type commandFunc func(context.Context, string, ...string) (commandResult, error)
 
 func nativeCommand(ctx context.Context, bin string, args ...string) *exec.Cmd {
+	program := nativeProgramPath(bin)
+	if program == "" {
+		return nil
+	}
 	if bin == "docker" {
 		args = append([]string{"--host=unix:///var/run/docker.sock"}, args...)
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, program, args...)
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
 		if key == "PATH" || key == "LANG" || key == "LC_ALL" || key == "TZ" || bin == "docker" && (key == "HOME" || key == "DOCKER_CONFIG") {
@@ -93,6 +100,9 @@ func nativeCommand(ctx context.Context, bin string, args ...string) *exec.Cmd {
 }
 func runCommand(ctx context.Context, bin string, args ...string) (commandResult, error) {
 	cmd := nativeCommand(ctx, bin, args...)
+	if cmd == nil {
+		return commandResult{}, ErrUnavailable
+	}
 	out := &boundedOutput{}
 	cmd.Stdout = out
 	cmd.Stderr = out
@@ -111,8 +121,14 @@ func runCommand(ctx context.Context, bin string, args ...string) (commandResult,
 var _ io.Writer = (*boundedOutput)(nil)
 
 func createArguments(r Request, policy HostPolicy, layerLimit bool) ([]string, error) {
+	if r.Network != "" && r.Network != "none" {
+		return nil, ErrInvalid
+	}
 	if err := policy.validate(); err != nil {
 		return nil, err
+	}
+	if !layerLimit {
+		return nil, ErrUnavailable
 	}
 	args := []string{"create", "--name", r.ContainerRef, "--label", "aceteam.org_id=" + r.OrgID, "--label", "aceteam.volume_ref=" + r.VolumeRef,
 		"--cpus", strconv.FormatFloat(r.CPUs, 'f', -1, 64), "--memory", strconv.FormatInt(r.MemoryBytes, 10), "--memory-swap", strconv.FormatInt(r.MemoryBytes, 10),

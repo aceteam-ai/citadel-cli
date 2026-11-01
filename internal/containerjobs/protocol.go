@@ -3,9 +3,11 @@
 package containerjobs
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"net/url"
 	"path"
@@ -40,8 +42,8 @@ var ErrInvalid = errors.New("invalid typed container request")
 var ErrOwnership = errors.New("container or volume ownership does not match")
 var ErrUnavailable = errors.New("container host operation unavailable or unconfirmed")
 var ErrBounds = errors.New("container operation exceeds its bounds")
-var containerPattern = regexp.MustCompile(`^sandbox-[0-9a-f]{8}$`)
-var volumePattern = regexp.MustCompile(`^aceteam-vol-[0-9a-f]{8}$`)
+var containerPattern = regexp.MustCompile(`^sandbox-([0-9a-f]{8}|[0-9a-f]{32})$`)
+var volumePattern = regexp.MustCompile(`^aceteam-vol-([0-9a-f]{8}|[0-9a-f]{32})$`)
 var hashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // The same flat JSON schema is used by the paired server dispatcher. Transport
@@ -147,7 +149,12 @@ func validQuota(n int64) bool { return n >= 16<<20 && n <= math.MaxInt64-(16<<20
 
 func Parse(kind string, raw []byte) (Request, error) {
 	var r Request
-	if !IsType(kind) || len(raw) > ((FileLimit+2)/3*4)+(2<<20) || json.Unmarshal(raw, &r) != nil {
+	if !IsType(kind) || len(raw) > ((FileLimit+2)/3*4)+(2<<20) {
+		return r, ErrInvalid
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if decoder.Decode(&r) != nil || decoder.Decode(new(any)) != io.EOF {
 		return r, ErrInvalid
 	}
 	if !canonicalUUID(r.OrgID) || r.ContainerRef != "" && !containerPattern.MatchString(r.ContainerRef) || r.VolumeRef != "" && !volumePattern.MatchString(r.VolumeRef) {
@@ -158,7 +165,7 @@ func Parse(kind string, raw []byte) (Request, error) {
 	if needsVolume && r.VolumeRef == "" || needsContainer && r.ContainerRef == "" {
 		return r, ErrInvalid
 	}
-	if kind == Create && (!validImage(r.Image) || !validQuota(r.QuotaBytes) || math.IsNaN(r.CPUs) || math.IsInf(r.CPUs, 0) || r.CPUs <= 0 || r.CPUs > float64(math.MaxInt32) || r.MemoryBytes <= 0 || r.PidsLimit <= 0 || r.PidsLimit > math.MaxInt32 || r.Network != "" && r.Network != "aceteam-net-"+strings.TrimPrefix(r.ContainerRef, "sandbox-")) {
+	if kind == Create && (!validImage(r.Image) || !validQuota(r.QuotaBytes) || math.IsNaN(r.CPUs) || math.IsInf(r.CPUs, 0) || r.CPUs <= 0 || r.CPUs > float64(math.MaxInt32) || r.MemoryBytes <= 0 || r.PidsLimit <= 0 || r.PidsLimit > math.MaxInt32 || r.Network != "" && r.Network != "none") {
 		return r, ErrInvalid
 	}
 	if kind == Exec {

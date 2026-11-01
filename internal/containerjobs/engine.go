@@ -37,6 +37,8 @@ type Runtime interface {
 	Start(context.Context, string) error
 	Stop(context.Context, string) error
 	Exec(context.Context, string, []string) (ExecResult, error)
+	// ClaimExecution is persistent and create-only. Uncertainty spends the ID.
+	ClaimExecution(context.Context, string, string) error
 	OpenVolume(context.Context, string) (*os.Root, error)
 	Usage(context.Context, string) (int64, int64, error)
 	DestroyContainer(context.Context, string) error
@@ -48,13 +50,24 @@ type Transport interface {
 }
 type Engine struct {
 	Authorize func() bool
-	Runtime   Runtime
-	Transport Transport
+	// EnrolledOrg is fresh node configuration, never a request-supplied label.
+	EnrolledOrg func() string
+	Runtime     Runtime
+	Transport   Transport
 }
 
 func (e *Engine) Run(ctx context.Context, kind string, r Request) (Result, error) {
+	return e.RunDelivery(ctx, kind, r, "")
+}
+
+// RunDelivery uses an original source job ID, never a new transport field.
+// Only EXEC requires it; a missing/replayed ID cannot authorize a new process.
+func (e *Engine) RunDelivery(ctx context.Context, kind string, r Request, jobID string) (Result, error) {
 	out := Result{ContainerRef: r.ContainerRef, VolumeRef: r.VolumeRef}
 	if e == nil || e.Runtime == nil || ctx.Err() != nil {
+		return out, ErrUnavailable
+	}
+	if e.EnrolledOrg == nil || !canonicalUUID(r.OrgID) || e.EnrolledOrg() != r.OrgID {
 		return out, ErrUnavailable
 	}
 	unlock, err := e.Runtime.Lock(ctx)
@@ -62,6 +75,9 @@ func (e *Engine) Run(ctx context.Context, kind string, r Request) (Result, error
 		return out, ErrUnavailable
 	}
 	defer unlock()
+	if e.EnrolledOrg() != r.OrgID {
+		return out, ErrUnavailable
+	}
 	if ctx.Err() != nil {
 		return out, ErrUnavailable
 	}
@@ -124,6 +140,12 @@ func (e *Engine) Run(ctx context.Context, kind string, r Request) (Result, error
 		err = rt.Stop(ctx, r.ContainerRef)
 		out.Running = boolPointer(err != nil)
 	case Exec:
+		if !validText(jobID, 256) || jobID == "" {
+			return out, ErrUnavailable
+		}
+		if err := rt.ClaimExecution(ctx, r.OrgID, jobID); err != nil {
+			return out, ErrUnavailable
+		}
 		c, cancel := context.WithTimeout(ctx, time.Duration(r.TimeoutSeconds)*time.Second)
 		defer cancel()
 		var execution ExecResult

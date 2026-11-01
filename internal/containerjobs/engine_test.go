@@ -32,6 +32,7 @@ type fakeRuntime struct {
 	effects    []string
 	execResult ExecResult
 	afterLock  func()
+	attempts   map[string]bool
 }
 
 func newFake(t *testing.T) *fakeRuntime {
@@ -52,6 +53,17 @@ func (f *fakeRuntime) Lock(ctx context.Context) (func(), error) {
 }
 func (f *fakeRuntime) Container(context.Context, string) (ContainerState, error) {
 	return ContainerState{OrgID: f.org, VolumeRef: testVolume, Running: f.running}, nil
+}
+func (f *fakeRuntime) ClaimExecution(_ context.Context, org, jobID string) error {
+	if f.attempts == nil {
+		f.attempts = map[string]bool{}
+	}
+	key := org + "/" + jobID
+	if f.attempts[key] {
+		return ErrUnavailable
+	}
+	f.attempts[key] = true
+	return nil
 }
 func (f *fakeRuntime) Volume(_ context.Context, ref string) (VolumeState, error) {
 	org, ok := f.volumes[ref]
@@ -145,7 +157,7 @@ func TestContainerEveryOperationRefusesForeignLabels(t *testing.T) {
 				} else {
 					f.org = otherOrg
 				}
-				_, err := (&Engine{Runtime: f}).Run(context.Background(), kind, r)
+				_, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), kind, r)
 				if !errors.Is(err, ErrOwnership) || len(f.effects) != 0 {
 					t.Fatal("foreign labels reached an effect", err, f.effects)
 				}
@@ -157,18 +169,18 @@ func TestContainerVolumeBindingAndPostLockPermission(t *testing.T) {
 	f := newFake(t)
 	r := baseRequest()
 	r.VolumeRef = newVolume
-	if _, err := (&Engine{Runtime: f}).Run(context.Background(), Usage, r); !errors.Is(err, ErrOwnership) {
+	if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), Usage, r); !errors.Is(err, ErrOwnership) {
 		t.Fatal("volume binding ignored", err)
 	}
 	allowed := true
 	f.afterLock = func() { allowed = false }
-	if _, err := (&Engine{Runtime: f, Authorize: func() bool { return allowed }}).Run(context.Background(), Stop, baseRequest()); !errors.Is(err, ErrOwnership) || len(f.effects) != 0 {
+	if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f, Authorize: func() bool { return allowed }}).Run(context.Background(), Stop, baseRequest()); !errors.Is(err, ErrOwnership) || len(f.effects) != 0 {
 		t.Fatal("revoked gate ignored after lock")
 	}
 }
 func TestContainerStoppedFilesAndExplicitPurge(t *testing.T) {
 	f := newFake(t)
-	e := &Engine{Runtime: f}
+	e := &Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}
 	r := baseRequest()
 	r.Path = "note.txt"
 	r.ContentB64 = base64.StdEncoding.EncodeToString([]byte("file bytes"))
@@ -209,7 +221,7 @@ func TestContainerRootConfinementPreservesOutsideSentinel(t *testing.T) {
 	r.Path = "escape"
 	r.ContentB64 = base64.StdEncoding.EncodeToString([]byte("overwrite"))
 	for _, kind := range []string{FileRead, FileWrite} {
-		if _, err := (&Engine{Runtime: f}).Run(context.Background(), kind, r); err == nil {
+		if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), kind, r); err == nil {
 			t.Fatal("symlink escaped volume")
 		}
 	}
@@ -222,7 +234,7 @@ func TestContainerRootConfinementPreservesOutsideSentinel(t *testing.T) {
 	}
 	for _, p := range []string{"../sentinel", "/etc/passwd", "a/../b", `a\b`} {
 		r.Path = p
-		if _, err := (&Engine{Runtime: f}).Run(context.Background(), FileWrite, r); err == nil {
+		if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), FileWrite, r); err == nil {
 			t.Fatal("path escaped", p)
 		}
 	}
@@ -240,17 +252,17 @@ func TestContainerReadAndExecOutputBounds(t *testing.T) {
 	file.Close()
 	r := baseRequest()
 	r.Path = "large"
-	if _, err := (&Engine{Runtime: f}).Run(context.Background(), FileRead, r); !errors.Is(err, ErrBounds) {
+	if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), FileRead, r); !errors.Is(err, ErrBounds) {
 		t.Fatal("oversized read accepted", err)
 	}
 	f.execResult = ExecResult{Output: make([]byte, OutputLimit+1)}
 	r.TimeoutSeconds = 1
 	r.Argv = []string{"fixture"}
-	if _, err := (&Engine{Runtime: f}).Run(context.Background(), Exec, r); !errors.Is(err, ErrBounds) {
+	if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).RunDelivery(context.Background(), Exec, r, "fixture-exec-1"); !errors.Is(err, ErrBounds) {
 		t.Fatal("oversized exec output accepted", err)
 	}
 	f.execResult = ExecResult{TimedOut: true, ExitCode: 124}
-	out, err := (&Engine{Runtime: f}).Run(context.Background(), Exec, r)
+	out, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).RunDelivery(context.Background(), Exec, r, "fixture-exec-2")
 	if err != nil || !out.ExecTimedOut || out.Running == nil || *out.Running || out.ExitCode != 124 || out.Message != "exec timed out; container stopped, files kept, it restarts on next use" {
 		t.Fatal(out, err)
 	}
@@ -266,7 +278,7 @@ func TestContainerEncryptedRoundTripAndFreshNonces(t *testing.T) {
 		t.Fatal("fixture")
 	}
 	tr := &fakeTransport{objects: map[string][]byte{}}
-	e := &Engine{Runtime: f, Transport: tr}
+	e := &Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f, Transport: tr}
 	r := transferRequest()
 	exported, err := e.Run(context.Background(), Export, r)
 	if err != nil {
@@ -332,7 +344,7 @@ func TestContainerImportRefusesTraversalDigestAndGCMIndependently(t *testing.T) 
 			if mode == "manifest" {
 				r.ManifestSHA256 = strings.Repeat("0", 64)
 			}
-			_, err := (&Engine{Runtime: f, Transport: &fakeTransport{objects: map[string][]byte{r.ChunkURLs[0]: b}}}).Run(context.Background(), Import, r)
+			_, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f, Transport: &fakeTransport{objects: map[string][]byte{r.ChunkURLs[0]: b}}}).Run(context.Background(), Import, r)
 			if err == nil {
 				t.Fatal("unsafe import succeeded")
 			}
@@ -345,7 +357,7 @@ func TestContainerImportRefusesTraversalDigestAndGCMIndependently(t *testing.T) 
 func TestContainerExportRequiresStoppedContainer(t *testing.T) {
 	f := newFake(t)
 	f.running = true
-	if _, err := (&Engine{Runtime: f, Transport: &fakeTransport{objects: map[string][]byte{}}}).Run(context.Background(), Export, transferRequest()); err == nil || len(f.effects) != 0 {
+	if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f, Transport: &fakeTransport{objects: map[string][]byte{}}}).Run(context.Background(), Export, transferRequest()); err == nil || len(f.effects) != 0 {
 		t.Fatal("live container exported")
 	}
 }
@@ -397,7 +409,7 @@ func TestContainerImplicitVolumeStillRequiresOrgConfinement(t *testing.T) {
 		f.volumes[testVolume] = otherOrg
 		r := baseRequest()
 		r.VolumeRef = ""
-		if _, err := (&Engine{Runtime: f}).Run(context.Background(), kind, r); !errors.Is(err, ErrOwnership) || len(f.effects) != 0 {
+		if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), kind, r); !errors.Is(err, ErrOwnership) || len(f.effects) != 0 {
 			t.Fatal("implicit volume label was not checked", kind, err)
 		}
 	}
@@ -413,7 +425,7 @@ func TestContainerStandaloneOwnedVolumePurgeIsExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal("standalone explicit purge refused", err)
 	}
-	if _, err = (&Engine{Runtime: f}).Run(context.Background(), Destroy, parsed); err != nil || strings.Join(f.effects, ",") != "destroy-volume" {
+	if _, err = (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), Destroy, parsed); err != nil || strings.Join(f.effects, ",") != "destroy-volume" {
 		t.Fatal("volume-only purge touched a container", err, f.effects)
 	}
 	r.PurgeVolume = false
@@ -458,7 +470,7 @@ func TestContainerImportRejectsNoncanonicalPathEvenWithinRoot(t *testing.T) {
 	digest := sha256.Sum256(b)
 	r.Manifest = &Manifest{Version: 1, OrgID: r.OrgID, TransferID: r.TransferID, Chunks: []Chunk{{Index: 0, PlaintextBytes: int64(plain.Len()), SHA256: hex.EncodeToString(digest[:])}}}
 	r.ManifestSHA256 = manifestDigest(r.Manifest)
-	_, err := (&Engine{Runtime: f, Transport: &fakeTransport{objects: map[string][]byte{r.ChunkURLs[0]: b}}}).Run(context.Background(), Import, r)
+	_, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f, Transport: &fakeTransport{objects: map[string][]byte{r.ChunkURLs[0]: b}}}).Run(context.Background(), Import, r)
 	if err == nil {
 		t.Fatal("noncanonical archive path was normalized and accepted")
 	}
@@ -475,7 +487,7 @@ func TestContainerTransferPreservesSafeLinksAndRefusesOutsideLinks(t *testing.T)
 	}
 	r := transferRequest()
 	tr := &fakeTransport{objects: map[string][]byte{}}
-	e := &Engine{Runtime: f, Transport: tr}
+	e := &Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f, Transport: tr}
 	out, err := e.Run(context.Background(), Export, r)
 	if err != nil {
 		t.Fatal(err)
@@ -515,7 +527,7 @@ func TestContainerCreateReusesOwnedImportedDiskWithoutFormatting(t *testing.T) {
 	}
 	r := baseRequest()
 	r.QuotaBytes = 16 << 20
-	if _, err := (&Engine{Runtime: f}).Run(context.Background(), Create, r); err != nil || strings.Join(f.effects, ",") != "create-container" {
+	if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), Create, r); err != nil || strings.Join(f.effects, ",") != "create-container" {
 		t.Fatal("owned disk was recreated", err, f.effects)
 	}
 	b, _ := os.ReadFile(sentinel)
@@ -524,7 +536,7 @@ func TestContainerCreateReusesOwnedImportedDiskWithoutFormatting(t *testing.T) {
 	}
 	f.volumes[testVolume] = otherOrg
 	f.effects = nil
-	if _, err := (&Engine{Runtime: f}).Run(context.Background(), Create, r); !errors.Is(err, ErrOwnership) || len(f.effects) != 0 {
+	if _, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).Run(context.Background(), Create, r); !errors.Is(err, ErrOwnership) || len(f.effects) != 0 {
 		t.Fatal("foreign disk reused")
 	}
 }
@@ -535,8 +547,10 @@ func TestContainerNormalExecDoesNotInventPostExecutionRunningState(t *testing.T)
 	r := baseRequest()
 	r.TimeoutSeconds = 1
 	r.Argv = []string{"fixture"}
-	out, err := (&Engine{Runtime: f}).Run(context.Background(), Exec, r)
+	out, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: f}).RunDelivery(context.Background(), Exec, r, "fixture-exec-3")
 	if err != nil || out.Running != nil {
 		t.Fatal("stale pre-exec state was published as post-exec state", err)
 	}
 }
+
+func fixtureEnrolledOrg() string { return testOrg }

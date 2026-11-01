@@ -43,6 +43,13 @@ type Permissions struct {
 	ContainerRuntime string `yaml:"container_runtime,omitempty" json:"container_runtime,omitempty"`
 	// Egress proxy is node-owned configuration, never a job or device grant value.
 	ContainerEgressProxyURL string `yaml:"container_egress_proxy_url,omitempty" json:"container_egress_proxy_url,omitempty"`
+	// Mandatory owner-local ceilings; absent values keep the native host inactive.
+	ContainerMaxQuotaBytes  int64   `yaml:"container_max_quota_bytes,omitempty" json:"container_max_quota_bytes,omitempty"`
+	ContainerMaxVolumes     int     `yaml:"container_max_volumes,omitempty" json:"container_max_volumes,omitempty"`
+	ContainerMaxMemoryBytes int64   `yaml:"container_max_memory_bytes,omitempty" json:"container_max_memory_bytes,omitempty"`
+	ContainerMaxPids        int64   `yaml:"container_max_pids,omitempty" json:"container_max_pids,omitempty"`
+	ContainerMaxCPUs        float64 `yaml:"container_max_cpus,omitempty" json:"container_max_cpus,omitempty"`
+	ContainerMinFreeBytes   int64   `yaml:"container_min_free_bytes,omitempty" json:"container_min_free_bytes,omitempty"`
 
 	Console   bool `yaml:"console" json:"console"`     // Terminal WebSocket access (default-deny, opt-in)
 	Desktop   bool `yaml:"desktop" json:"desktop"`     // VNC, screenshots, actions (default-deny, opt-in)

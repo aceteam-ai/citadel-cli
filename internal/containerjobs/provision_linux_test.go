@@ -14,7 +14,7 @@ import (
 func TestContainerVolumeRootOwnerPrecedesDockerRegistration(t *testing.T) {
 	for _, fail := range []string{"", "mount", "chown"} {
 		t.Run("failure_"+fail, func(t *testing.T) {
-			n := NewNative(t.TempDir(), nil)
+			n := nativeProvisionFixture(t)
 			r := baseRequest()
 			r.QuotaBytes = 16 << 20
 			_, image, mount, _ := n.volumePaths(r.VolumeRef)

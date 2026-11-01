@@ -212,6 +212,10 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config JSON: %w", err)
 	}
+	// Refuse a remote enable before path discovery or any unrelated config effect.
+	if config.ContainerHostEnabled != nil && *config.ContainerHostEnabled {
+		return nil, fmt.Errorf("container hosting can only be enabled locally by the node owner")
+	}
 
 	// Determine config directory
 	//
@@ -732,6 +736,9 @@ var _ JobHandler = (*ConfigHandler)(nil)
 func persistContainerHostPermission(dir string, enabled *bool) error {
 	if enabled == nil {
 		return nil
+	}
+	if *enabled {
+		return fmt.Errorf("container hosting can only be enabled locally by the node owner")
 	}
 	if dir == "" {
 		return fmt.Errorf("container hosting requires a configured permission directory")

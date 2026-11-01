@@ -29,7 +29,7 @@ func TestContainerEgressProxyIsAbsentByDefaultAndIgnoresAmbientOrJobValues(t *te
 	r := baseRequest()
 	r.Image = "ghcr.io/aceteam-ai/workspace:v1"
 	r.QuotaBytes, r.CPUs, r.MemoryBytes, r.PidsLimit = 16<<20, 1, 1<<30, 128
-	r.Network = "aceteam-net-" + strings.TrimPrefix(r.ContainerRef, "sandbox-")
+	r.Network = "none"
 	b, err := json.Marshal(r)
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +46,7 @@ func TestContainerEgressProxyIsAbsentByDefaultAndIgnoresAmbientOrJobValues(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	args, err := createArguments(r, HostPolicy{}, false)
+	args, err := createArguments(r, HostPolicy{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,8 +61,8 @@ func TestContainerEgressProxyArgumentsUseOnlyExplicitNodePolicy(t *testing.T) {
 		t.Run(proxy, func(t *testing.T) {
 			r := baseRequest()
 			r.Image = "ghcr.io/aceteam-ai/workspace:v1"
-			r.Network = "aceteam-net-" + strings.TrimPrefix(r.ContainerRef, "sandbox-")
-			args, err := createArguments(r, HostPolicy{Runtime: "runsc", EgressProxyURL: proxy}, false)
+			r.Network = "none"
+			args, err := createArguments(r, HostPolicy{Runtime: "runsc", EgressProxyURL: proxy}, true)
 			if err != nil {
 				t.Fatal(err)
 			}

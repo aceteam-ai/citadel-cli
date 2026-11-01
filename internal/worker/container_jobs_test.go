@@ -15,6 +15,7 @@ import (
 
 func TestContainerWorkerDefaultDenyLiveAdvertisementAndRevocation(t *testing.T) {
 	dir := t.TempDir()
+	containerEnrollmentFixture(t, dir)
 	handlers := containerJobHandlersWithReadiness(dir, "linux", true)
 	if len(handlers) != len(containerjobs.Types) {
 		t.Fatal("incomplete typed family")
@@ -27,6 +28,7 @@ func TestContainerWorkerDefaultDenyLiveAdvertisementAndRevocation(t *testing.T) 
 		}
 	}
 	p := config.DefaultPermissions()
+	containerLimitsFixture(p)
 	p.ContainerHost = true
 	if err := config.SavePermissions(dir, p); err != nil {
 		t.Fatal(err)
@@ -62,7 +64,9 @@ func TestContainerWorkerDefaultDenyLiveAdvertisementAndRevocation(t *testing.T) 
 }
 func TestContainerWorkerUnreadableAndUnsupportedHostFailClosed(t *testing.T) {
 	dir := t.TempDir()
+	containerEnrollmentFixture(t, dir)
 	p := config.DefaultPermissions()
+	containerLimitsFixture(p)
 	p.ContainerHost = true
 	p.ContainerRuntime = "unreviewed-runtime"
 	if config.SavePermissions(dir, p) != nil {
@@ -113,8 +117,10 @@ func TestContainerWorkerTypeInventoryMatchesWireFamily(t *testing.T) {
 
 func TestContainerWorkerProxyConfigurationNeverGrantsContainerHost(t *testing.T) {
 	dir := t.TempDir()
+	containerEnrollmentFixture(t, dir)
 	handlers := containerJobHandlersWithReadiness(dir, "linux", true)
 	p := config.DefaultPermissions()
+	containerLimitsFixture(p)
 	p.ContainerEgressProxyURL = "http://host.docker.internal:3128"
 	check := func(want bool) {
 		t.Helper()
@@ -134,4 +140,53 @@ func TestContainerWorkerProxyConfigurationNeverGrantsContainerHost(t *testing.T)
 	check(false)
 	p.ContainerEgressProxyURL = ""
 	check(true)
+}
+
+func containerLimitsFixture(p *config.Permissions) {
+	p.ContainerMaxQuotaBytes = 10 << 30
+	p.ContainerMaxVolumes = 4
+	p.ContainerMaxMemoryBytes = 2 << 30
+	p.ContainerMaxPids = 256
+	p.ContainerMaxCPUs = 1
+	p.ContainerMinFreeBytes = 2 << 30
+}
+
+func containerEnrollmentFixture(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("device_api_token: synthetic-device\norg_id: "+containerFixtureOrg+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestContainerWorkerRequiresEveryLocalCeilingAndEnrolledOrg(t *testing.T) {
+	dir := t.TempDir()
+	p := config.DefaultPermissions()
+	p.ContainerHost = true
+	handlers := containerJobHandlersWithReadiness(dir, "linux", true)
+	assertAdvertised := func(want bool) {
+		t.Helper()
+		if config.SavePermissions(dir, p) != nil {
+			t.Fatal("fixture")
+		}
+		for _, h := range handlers {
+			if h.CanHandle(h.(*ContainerJobHandler).kind) != want {
+				t.Fatal("missing local budget or enrollment granted a native host")
+			}
+		}
+	}
+	assertAdvertised(false)
+	containerEnrollmentFixture(t, dir)
+	assertAdvertised(false)
+	containerLimitsFixture(p)
+	assertAdvertised(true)
+	for _, change := range []func(*config.Permissions){func(p *config.Permissions) { p.ContainerMaxQuotaBytes = 0 }, func(p *config.Permissions) { p.ContainerMaxVolumes = 0 }, func(p *config.Permissions) { p.ContainerMaxMemoryBytes = 0 }, func(p *config.Permissions) { p.ContainerMaxPids = 0 }, func(p *config.Permissions) { p.ContainerMaxCPUs = 0 }, func(p *config.Permissions) { p.ContainerMinFreeBytes = 0 }} {
+		containerLimitsFixture(p)
+		change(p)
+		assertAdvertised(false)
+	}
+	containerLimitsFixture(p)
+	if os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("device_api_token: synthetic-device\norg_id: invalid\n"), 0600) != nil {
+		t.Fatal("fixture")
+	}
+	assertAdvertised(false)
 }

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,10 +17,13 @@ import (
 )
 
 type Native struct {
-	root        string
-	policy      func() (HostPolicy, error)
-	command     commandFunc
-	execControl execControl
+	root          string
+	policy        func() (HostPolicy, error)
+	command       commandFunc
+	execControl   execControl
+	openHostRoot  func(string) (*os.File, error)
+	syncJournal   func(*os.File) error
+	freeHostBytes func(*os.File) (uint64, error)
 }
 
 func NewNative(root string, runtime func() string) *Native {
@@ -35,7 +37,7 @@ func NewNative(root string, runtime func() string) *Native {
 }
 
 func NewNativeWithPolicy(root string, policy func() (HostPolicy, error)) *Native {
-	return &Native{root: root, policy: policy, command: runCommand, execControl: newDockerExecClient()}
+	return &Native{root: root, policy: policy, command: runCommand, execControl: newDockerExecClient(), openHostRoot: openContainerHostRoot}
 }
 
 // Quota provisioning needs a privileged Linux worker and installed host tools.
@@ -45,7 +47,8 @@ func NativeSupported() bool {
 		return false
 	}
 	for _, bin := range []string{"docker", "mkfs.ext4", "mount", "umount", "chown"} {
-		if _, err := exec.LookPath(bin); err != nil {
+		info, err := os.Stat(nativeProgramPath(bin))
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 			return false
 		}
 	}
@@ -62,27 +65,26 @@ func (n *Native) Lock(ctx context.Context) (func(), error) {
 	if !filepath.IsAbs(n.root) || ctx.Err() != nil {
 		return nil, ErrUnavailable
 	}
-	if err := os.MkdirAll(n.root, 0700); err != nil {
-		return nil, ErrUnavailable
+	opener := n.openHostRoot
+	if opener == nil {
+		opener = openContainerHostRoot
 	}
-	st, err := os.Lstat(n.root)
-	if err != nil || !st.IsDir() || st.Mode().Perm()&0077 != 0 {
-		return nil, ErrUnavailable
-	}
-	if stat, ok := st.Sys().(*syscall.Stat_t); ok && stat.Uid != uint32(os.Geteuid()) {
-		return nil, ErrUnavailable
-	}
-	root, err := os.OpenRoot(n.root)
+	root, err := opener(n.root)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
 	defer root.Close()
-	f, err := root.OpenFile("host.lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
+	fd, err := unix.Openat(int(root.Fd()), "host.lock", unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
+	f := os.NewFile(uintptr(fd), "container host lock")
 	fi, err := f.Stat()
 	if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm()&0077 != 0 {
+		f.Close()
+		return nil, ErrUnavailable
+	}
+	if stat, ok := fi.Sys().(*syscall.Stat_t); !ok || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
 		f.Close()
 		return nil, ErrUnavailable
 	}
@@ -193,6 +195,16 @@ func (n *Native) CreateVolume(ctx context.Context, r Request) error {
 	if err != nil || !canonicalUUID(r.OrgID) || !validQuota(r.QuotaBytes) {
 		return ErrInvalid
 	}
+	policy, err := n.currentPolicy()
+	if err != nil {
+		return err
+	}
+	if err := policy.Limits.checkRequest(r, false); err != nil {
+		return err
+	}
+	if err := n.hostCapacity(r.QuotaBytes, policy.Limits); err != nil {
+		return err
+	}
 	b, err := n.do(ctx, "docker", "volume", "ls", "--filter", "name=^"+r.VolumeRef+"$", "--format", "{{.Name}}")
 	if err != nil || strings.TrimSpace(string(b)) != "" {
 		return ErrUnavailable
@@ -211,6 +223,9 @@ func (n *Native) CreateVolume(ctx context.Context, r Request) error {
 	closeErr := f.Close()
 	if err != nil || closeErr != nil {
 		return ErrUnavailable
+	}
+	if err := n.syncVolumeReservation(dir); err != nil {
+		return err
 	}
 	if _, err = n.do(ctx, "mkfs.ext4", "-q", "-F", "-m", "0", "-E", "lazy_itable_init=0,lazy_journal_init=0", image); err != nil {
 		return err
@@ -239,6 +254,9 @@ func (n *Native) CreateVolume(ctx context.Context, r Request) error {
 	return nil
 }
 func (n *Native) CreateContainer(ctx context.Context, r Request) error {
+	if r.Network != "" && r.Network != "none" {
+		return ErrInvalid
+	}
 	policy := HostPolicy{}
 	if n.policy != nil {
 		var err error
@@ -248,6 +266,9 @@ func (n *Native) CreateContainer(ctx context.Context, r Request) error {
 		}
 	}
 	if err := policy.validate(); err != nil {
+		return err
+	}
+	if err := policy.Limits.checkRequest(r, true); err != nil {
 		return err
 	}
 	volume, err := n.Volume(ctx, r.VolumeRef)
@@ -280,31 +301,10 @@ func (n *Native) CreateContainer(ctx context.Context, r Request) error {
 			layerLimit = true
 		}
 	}
-	if r.Network != "" {
-		if r.Network != "aceteam-net-"+strings.TrimPrefix(r.ContainerRef, "sandbox-") {
-			return ErrInvalid
-		}
-		networks, err := n.do(ctx, "docker", "network", "ls", "--filter", "name=^"+r.Network+"$", "--format", "{{.Name}}")
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(string(networks)) == "" {
-			if _, err = n.do(ctx, "docker", "network", "create", "--driver", "bridge", "--opt", "com.docker.network.bridge.enable_icc=false", "--label", "aceteam.org_id="+r.OrgID, "--label", "aceteam.container_ref="+r.ContainerRef, r.Network); err != nil {
-				return err
-			}
-		}
-		b, err := n.do(ctx, "docker", "network", "inspect", r.Network)
-		if err != nil {
-			return err
-		}
-		var rows []struct {
-			Driver          string
-			Labels, Options map[string]string
-		}
-		if json.Unmarshal(b, &rows) != nil || len(rows) != 1 || rows[0].Driver != "bridge" || rows[0].Labels["aceteam.org_id"] != r.OrgID || rows[0].Labels["aceteam.container_ref"] != r.ContainerRef || rows[0].Options["com.docker.network.bridge.enable_icc"] != "false" {
-			return ErrOwnership
-		}
+	if !layerLimit {
+		return ErrUnavailable
 	}
+
 	args, err := createArguments(r, policy, layerLimit)
 	if err != nil {
 		return err
@@ -366,7 +366,7 @@ func (n *Native) Exec(ctx context.Context, ref string, argv []string) (ExecResul
 	// execution authority. Refuse unless its actual exit can be inspected.
 	for _, previous := range before.ExecIDs {
 		state, err := n.execControl.Inspect(ctx, previous)
-		if err != nil || state.Running || state.ContainerID != before.ID {
+		if err != nil || state.Running || state.ExitUnknown || state.ContainerID != before.ID {
 			return ExecResult{}, ErrUnavailable
 		}
 	}
@@ -401,7 +401,7 @@ func (n *Native) Exec(ctx context.Context, ref string, argv []string) (ExecResul
 		if err == nil && state.ContainerID == before.ID && state.Running {
 			startObserved = true
 		}
-		if err == nil && state.ContainerID == before.ID && !state.Running && startObserved {
+		if err == nil && state.ContainerID == before.ID && !state.Running && !state.ExitUnknown && startObserved {
 			if ctx.Err() != nil {
 				break
 			}

@@ -36,8 +36,8 @@ func TestContainerNativeMandatoryLimitsAndArgv(t *testing.T) {
 		}
 	}
 	plain, err := createArguments(r, HostPolicy{}, false)
-	if err != nil || strings.Contains(strings.Join(plain, " "), "storage-opt") {
-		t.Fatal("unsupported layer option applied")
+	if !errors.Is(err, ErrUnavailable) || plain != nil {
+		t.Fatal("unbounded writable layer admitted")
 	}
 }
 func nativeState(running bool) []byte {
@@ -122,7 +122,7 @@ func TestContainerNativeExecRefusesUnconfirmedStop(t *testing.T) {
 	}
 }
 func TestContainerNativeQuotaImageIsExactAndNeverOverwritten(t *testing.T) {
-	n := NewNative(t.TempDir(), nil)
+	n := nativeProvisionFixture(t)
 	r := baseRequest()
 	r.QuotaBytes = 16 << 20
 	_, _, mount, _ := n.volumePaths(r.VolumeRef)
@@ -175,6 +175,17 @@ func TestContainerNativeHostLockRejectsSymlinkAndCancelsWait(t *testing.T) {
 		t.Fatal("symlink host root accepted")
 	}
 	n := NewNative(filepath.Join(root, "private"), nil)
+	// The host policy refuses /tmp. Exercise lock lifetime separately using an
+	// explicitly owned fixture FD, without relaxing production ancestry checks.
+	n.openHostRoot = func(path string) (*os.File, error) {
+		if path != filepath.Join(root, "private") {
+			t.Fatal("fixture escaped owned root")
+		}
+		if err := os.Mkdir(path, 0700); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+		return os.Open(path)
+	}
 	unlock, err := n.Lock(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -368,6 +379,24 @@ func TestContainerNativeCommandPinsLocalEngineAndDropsCredentials(t *testing.T) 
 	for _, entry := range cmd.Env {
 		if strings.HasPrefix(entry, "DOCKER_HOST=") || strings.HasPrefix(entry, "DOCKER_CONTEXT=") || strings.HasPrefix(entry, "ACETEAM_API_KEY=") || strings.HasPrefix(entry, "SSH_AUTH_SOCK=") || strings.HasPrefix(entry, "HTTP_PROXY=") || strings.HasPrefix(entry, "HTTPS_PROXY=") || strings.HasPrefix(entry, "NO_PROXY=") {
 			t.Fatal("unnecessary credential/context inherited")
+		}
+	}
+}
+
+func TestContainerNativeProgramExceptionHasClosedTrustedPaths(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	for _, name := range []string{"docker", "mkfs.ext4", "mount", "umount", "chown"} {
+		command := nativeCommand(context.Background(), name, "fixture")
+		if command == nil || command.Path != nativeProgramPath(name) || !filepath.IsAbs(command.Path) {
+			t.Fatal("privileged binary followed ambient PATH")
+		}
+	}
+	for _, name := range []string{"sh", "/bin/sh", "env", "unknown"} {
+		if nativeCommand(context.Background(), name, "fixture") != nil {
+			t.Fatal("unregistered native program admitted")
+		}
+		if _, err := runCommand(context.Background(), name, "fixture"); !errors.Is(err, ErrUnavailable) {
+			t.Fatal("unknown program reached execution")
 		}
 	}
 }

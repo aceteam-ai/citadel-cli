@@ -15,8 +15,10 @@ import (
 // Exec completion is authoritative only after inspect reports Running=false.
 // A closed attach connection or an exited Docker client is not that evidence.
 type execState struct {
-	Running     bool
-	ExitCode    int
+	Running  bool
+	ExitCode int
+	// Docker reports null before an exec starts. It is not an exit code of zero.
+	ExitUnknown bool
 	ContainerID string
 }
 type execControl interface {
@@ -142,10 +144,10 @@ func (d *dockerExecClient) Inspect(ctx context.Context, id string) (execState, e
 		ExitCode    *int
 		ContainerID string
 	}
-	if decodeDocker(response, http.StatusOK, &value) != nil || value.ID != id || value.Running == nil || !hashPattern.MatchString(value.ContainerID) || !*value.Running && value.ExitCode == nil {
+	if decodeDocker(response, http.StatusOK, &value) != nil || value.ID != id || value.Running == nil || !hashPattern.MatchString(value.ContainerID) {
 		return execState{}, ErrUnavailable
 	}
-	state := execState{Running: *value.Running, ContainerID: value.ContainerID}
+	state := execState{Running: *value.Running, ContainerID: value.ContainerID, ExitUnknown: value.ExitCode == nil}
 	if value.ExitCode != nil {
 		state.ExitCode = *value.ExitCode
 	}

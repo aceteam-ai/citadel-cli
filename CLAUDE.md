@@ -4736,3 +4736,14 @@ PYTHON=~/.venvs/winrm/bin/python3 ./scripts/windows-e2e-test.sh \
 - Packages using `.zip` instead of `.tar.gz`
 - Cross-compilation: `GOOS=windows GOARCH=amd64 go build -o citadel.exe`
 - Release artifacts: `citadel_VERSION_windows_amd64.zip`
+
+### Typed container host source boundaries
+
+`ContainerJobHandler` owns per-node/original-byte intake;
+`containerjobs.Engine.RunDelivery` owns enrolled-org rechecks and host-lock
+custody. `HostLimits` owns mandatory local ceilings, and
+`openContainerHostRoot` refuses unsafe ancestry before effects.
+`Native.ClaimExecution` spends original source job IDs durably before EXEC;
+its journal refuses replay, uncertainty and exhaustion rather than pruning.
+See `docs/container-host-jobs.md` for the Docker-only runtime exception and
+remaining native/activation gates. No device-config push can enable hosting.

@@ -90,11 +90,26 @@ func TestContainerExecMuxBoundsAndMalformedFraming(t *testing.T) {
 }
 func TestContainerExecInspectMissingStateCannotProveExit(t *testing.T) {
 	id := strings.Repeat("e", 64)
-	for _, body := range []string{`{}`, `{"ID":"` + id + `","ContainerID":"` + strings.Repeat("c", 64) + `","ExitCode":0}`, `{"ID":"` + id + `","ContainerID":"` + strings.Repeat("c", 64) + `","Running":false}`} {
+	for _, body := range []string{`{}`, `{"ID":"` + id + `","ContainerID":"` + strings.Repeat("c", 64) + `","ExitCode":0}`} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, body) }))
 		d := &dockerExecClient{base: srv.URL, version: "/v1.51", client: srv.Client()}
 		if _, err := d.Inspect(context.Background(), id); err == nil {
 			t.Fatal("missing state proved exit")
+		}
+		srv.Close()
+	}
+}
+
+func TestContainerExecNullExitIsUnstartedNotSuccess(t *testing.T) {
+	id := strings.Repeat("e", 64)
+	for _, field := range []string{``, `,"ExitCode":null`} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, `{"ID":"`+id+`","ContainerID":"`+strings.Repeat("c", 64)+`","Running":false`+field+`}`)
+		}))
+		d := &dockerExecClient{base: srv.URL, version: "/v1.51", client: srv.Client()}
+		state, err := d.Inspect(context.Background(), id)
+		if err != nil || state.Running || !state.ExitUnknown {
+			t.Fatal("null exit was refused or fabricated as success", err, state)
 		}
 		srv.Close()
 	}

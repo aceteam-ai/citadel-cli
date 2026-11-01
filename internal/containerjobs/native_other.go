@@ -26,6 +26,7 @@ func (*Native) Stop(context.Context, string) error             { return ErrUnava
 func (*Native) Exec(context.Context, string, []string) (ExecResult, error) {
 	return ExecResult{}, ErrUnavailable
 }
+func (*Native) ClaimExecution(context.Context, string, string) error { return ErrUnavailable }
 
 func (*Native) OpenVolume(context.Context, string) (*os.Root, error) { return nil, ErrUnavailable }
 func (*Native) Usage(context.Context, string) (int64, int64, error)  { return 0, 0, ErrUnavailable }
