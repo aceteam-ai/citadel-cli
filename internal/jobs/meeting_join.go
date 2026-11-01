@@ -890,6 +890,11 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	}
 
 	status := "completed"
+	if outcome.endReason != MeetingEndStoppedByUser && ctx.CancelRequestedNow() {
+		// Jason, 2026-11-01: a Stop after the call ended does not abort the
+		// final transcript; the result stays completed.
+		ctx.Log("info", "     - [Job %s] stop arrived after the call ended; keeping the completed transcript", job.ID)
+	}
 	if outcome.endReason == MeetingEndStoppedByUser {
 		// A Stop is honored with the partial transcript, but is never reported
 		// as completed work (#1505 DoR, #1506).
