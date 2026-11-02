@@ -131,7 +131,7 @@ func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
 		DesktopEnabled:       func() bool { return true },
 		DesktopPasscodeState: passcodeState(true),
 	})
-	for _, jobType := range []string{JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions} {
+	for _, jobType := range []string{JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions, JobTypeAMTKVM} {
 		var h JobHandler
 		for _, candidate := range handlers {
 			if candidate.CanHandle(jobType) {
@@ -147,6 +147,51 @@ func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
 		if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeInvalid {
 			t.Fatalf("%s without the passcode: err = %v, want passcode_invalid", jobType, err)
 		}
+	}
+}
+
+func TestAMTAdapterPasscodeBeforeCredentialRetrieval(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		DesktopEnabled:       func() bool { return true },
+		DesktopPasscodeState: passcodeState(true),
+	})
+	var handler JobHandler
+	for _, candidate := range handlers {
+		if candidate.CanHandle(JobTypeAMTKVM) {
+			handler = candidate
+			break
+		}
+	}
+	if handler == nil {
+		t.Fatal("AMT_KVM handler not registered")
+	}
+	for _, tc := range []struct {
+		name     string
+		passcode string
+		want     string
+	}{
+		{"missing", "", jobs.ReasonPasscodeInvalid},
+		{"wrong", "0000", jobs.ReasonPasscodeInvalid},
+		{"valid", testNodePasscode, "AMT binding unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := handler.Execute(context.Background(), &Job{ID: tc.name, Type: JobTypeAMTKVM, Payload: map[string]any{
+				"host": "invalid", "operation": "status", "passcode": tc.passcode,
+			}}, nil)
+			if err == nil {
+				t.Fatal("AMT job unexpectedly succeeded")
+			}
+			if tc.name == "valid" {
+				if err.Error() != tc.want {
+					t.Fatalf("valid passcode did not reach AMT binding check: %v", err)
+				}
+			} else if shellRefusalReason(t, err) != tc.want {
+				t.Fatalf("passcode refusal = %v, want %s", err, tc.want)
+			}
+			if result == nil || result.Status != JobStatusFailure {
+				t.Fatalf("result = %+v, want failure", result)
+			}
+		})
 	}
 }
 

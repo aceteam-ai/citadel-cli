@@ -413,7 +413,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, configHandler),
 		NewLegacyHandlerAdapter(JobTypeExtraction, &jobs.ExtractionHandler{}),
 		NewLegacyHandlerAdapter(JobTypeHTTPProxy, &jobs.HTTPProxyHandler{}),
-		newGatedLegacyHandlerAdapter(JobTypeAMTKVM, &jobs.AMTKVMHandler{Origin: func() string {
+		newDesktopLegacyHandlerAdapter(JobTypeAMTKVM, &jobs.AMTKVMHandler{Origin: func() string {
 			if opts.FileFetchOrigin != nil {
 				return opts.FileFetchOrigin()
 			}
@@ -423,7 +423,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 				return opts.DesktopEnabled()
 			}
 			return !opts.DesktopDisabled
-		}),
+		}, jobs.DesktopGate{Load: opts.DesktopPasscodeState, Throttle: opts.PasscodeThrottle}),
 		// WEB_FETCH is the SSRF-guarded successor to HTTP_PROXY (aceteam#5995).
 		// HTTP_PROXY stays registered for WeChat provisioning + fleet back-compat;
 		// new consumers (youtube egress, web tools) use WEB_FETCH.
