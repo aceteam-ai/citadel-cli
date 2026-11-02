@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 	"unicode"
@@ -26,6 +26,11 @@ const (
 	MaxEnvelopeBytes = 10 << 10
 	MaxTokenBytes    = 4096
 )
+
+// MaxPathComponentBytes is a UTF-8 byte limit, shared across host platforms.
+const MaxPathComponentBytes = 255
+
+const maxJSONLevels = 4
 
 // Descriptor identifies the exact bytes to acquire later. It is not a verified
 // snapshot and must not be passed to a model without acquisition and validation.
@@ -125,11 +130,14 @@ func Parse(task string, raw []byte) (Contract, error) {
 		return Contract{}, invalid
 	}
 	items, ok := root["inputs"].([]any)
+	if !ok {
+		return Contract{}, refuse("invalid_inputs")
+	}
 	want := 1
 	if task == TaskInpaint {
 		want = 2
 	}
-	if !ok || len(items) != want {
+	if len(items) != want {
 		return Contract{}, refuse("invalid_roles")
 	}
 	inputs := make([]Descriptor, 0, want)
@@ -180,7 +188,7 @@ func Parse(task string, raw []byte) (Contract, error) {
 		switch input.Origin {
 		case "workspace":
 			input.Path = m["path"].(string)
-			if !validPath(input.Path) {
+			if !ValidPath(input.Path) {
 				return Contract{}, refuse("invalid_input_path")
 			}
 		case "inbox":
@@ -197,10 +205,27 @@ func Parse(task string, raw []byte) (Contract, error) {
 	return Contract{inputs: inputs}, nil
 }
 
-func validPath(path string) bool {
-	return path != "." && filepath.IsLocal(path) && !strings.ContainsAny(path, "\\:\x00") &&
-		filepath.ToSlash(filepath.Clean(path)) == path && norm.NFC.IsNormalString(path) &&
-		strings.IndexFunc(path, unicode.IsControl) < 0
+// ValidPath checks platform-independent slash-only workspace-relative syntax.
+// It grants no filesystem authority and proves neither existence nor safe
+// opening. Filesystem/device names (including Windows-reserved names) are not
+// interpreted here; acquisition must separately enforce its platform policy.
+func ValidPath(name string) bool {
+	if name == "" || name == "." || !utf8.ValidString(name) || path.IsAbs(name) ||
+		path.Clean(name) != name || strings.ContainsAny(name, "\\:\x00") || !norm.NFC.IsNormalString(name) {
+		return false
+	}
+	if strings.IndexFunc(name, func(c rune) bool {
+		return unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || unicode.Is(unicode.Zl, c) ||
+			unicode.Is(unicode.Zp, c) || c == '\u00a0' || c == '\uff0e'
+	}) >= 0 {
+		return false
+	}
+	for _, component := range strings.Split(name, "/") {
+		if component == ".." || len(component) > MaxPathComponentBytes {
+			return false
+		}
+	}
+	return true
 }
 
 func validCapability(token string) bool {
@@ -231,7 +256,7 @@ func exactKeys(m map[string]any, keys ...string) bool {
 // are compared before insertion, so escaped duplicates cannot overwrite values.
 func readValue(d *json.Decoder, depth int, budget *int) (any, error) {
 	*budget -= 1
-	if depth > 4 || *budget < 0 {
+	if depth >= maxJSONLevels || *budget < 0 {
 		return nil, refuse("invalid_schema")
 	}
 	token, err := d.Token()

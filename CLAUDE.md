@@ -31,6 +31,13 @@ So, when adding to this file:
 
 ## Project Overview
 
+`mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
+descriptor acquisition: it checks a no-follow leaf pin before any readable
+leaf open, and fails closed if the verified procfs FD route is unavailable.
+`workspace_linux_test.go` covers ordering, replacement, refusal and cleanup
+using owned fixtures, not real devices. This does not settle owner/hard-link
+policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
+
 `service.RematerializeManagedUnits` owns the bounded base-file refresh and
 reload request, not worker restart or failed-unit counter recovery.
 `cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
