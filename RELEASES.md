@@ -3394,3 +3394,44 @@ Auto-generated log of every release.
   - feat(meeting): live progress, denial vs timeout, graceful Stop (#1506) (#1523)
 
 
+---
+
+## v2.207.0 — 2026-11-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 27 |
+| Files changed | 130 |
+| Lines added | +7798 |
+
+**Changes:**
+
+  - Merge pull request #1473 from aceteam-ai/fix/1468-repository-home-audit
+  - Merge pull request #1472 from aceteam-ai/fix/1468-internal-home-isolation
+  - Merge pull request #1471 from aceteam-ai/fix/1468-home-marker-isolation
+  - Merge pull request #1469 from aceteam-ai/fix/1468-network-test-paths
+  - fix(reconstruct): bound operator pipeline and create-only publication (#1411)
+  - feat(desktop): stage Windows x64 helpers in the shared shell (#1460)
+  - docs: propose bounded Harness2 runtime for #1380 (#1415)
+  - feat(desktop): stage Linux helpers in the shared Tauri shell (#1459)
+  - docs: propose atomic wake policy reservation (#1516)
+  - docs: propose PersonaPlex duplex voice feasibility (#1216) (#1425)
+  - docs(design): propose per-service drain and reservation custody (#1419)
+  - docs(design): headless ComfyUI engine with approved workflows (#1418)
+  - docs(catalog): plan private module environment publication (#1417)
+  - fix(desktop): reject invalid and symlinked DMG build outputs (#1458)
+  - fix(diffusers): retain idle cleanup callback outcomes (#1457)
+  - feat: add inactive synthetic point-cloud capture slice (#1456)
+  - fix(cdp): bound messages before reading and screenshots before decoding (#1455)
+  - fix(mediainput): align portable paths and exact refusal reasons (#1404)
+  - Merge refreshed isolation stack into repository audit draft
+  - Merge refreshed prerequisites into internal home-isolation draft
+  - Merge refreshed host-state prerequisites into home-isolation draft
+  - Merge main into host-state isolation draft
+  - test: audit home resolver bypasses across the repository
+  - fix(testing): route internal home defaults through fixture seam
+  - fix(testing): isolate command home and podman marker paths
+  - test: verify fixture custody before host-state effects
+  - fix(testing): isolate command host-state discovery before fixtures run
+
+
