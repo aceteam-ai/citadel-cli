@@ -3378,3 +3378,19 @@ Auto-generated log of every release.
   - fix(meeting): unattended-join safety (#1505 C1), with #1514 review fixes (#1522)
 
 
+---
+
+## v2.206.0 — 2026-11-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +551 |
+
+**Changes:**
+
+  - fix(meeting): honor Stop at the admission-to-recording boundary (#1524)
+  - feat(meeting): live progress, denial vs timeout, graceful Stop (#1506) (#1523)
+
+
