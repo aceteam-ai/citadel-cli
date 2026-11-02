@@ -330,7 +330,7 @@ func TestFineTuneConfiguredNodeManifestFailureNeverFallsBack(t *testing.T) {
 	for _, manifestState := range []string{"missing", "malformed"} {
 		t.Run(manifestState, func(t *testing.T) {
 			home := t.TempDir()
-			t.Setenv("HOME", home)
+			useCmdFixtureHome(t, home)
 			t.Setenv("CITADEL_NODE_DIR", "")
 			configDir := filepath.Join(home, "configured-node")
 			defaultDir := filepath.Join(home, "citadel-node")

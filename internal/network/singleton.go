@@ -485,6 +485,10 @@ func getHostnameForReconnect() string {
 
 // getManifestLocations returns possible locations for citadel.yaml
 func getManifestLocations() []string {
+	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+		// Do not enumerate CWD, HOME or a pointer supplied by another fixture.
+		return []string{filepath.Join(fixture.node, "citadel.yaml")}
+	}
 	var locations []string
 
 	// First, try the global config to find node config dir
@@ -512,6 +516,9 @@ func getManifestLocations() []string {
 
 // getGlobalConfigDir returns the global config directory path
 func getGlobalConfigDir() string {
+	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+		return fixture.machine
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return "/usr/local/etc/citadel"
