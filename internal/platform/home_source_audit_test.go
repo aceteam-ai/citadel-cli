@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -52,19 +53,21 @@ func rawHomeSelectors(file *ast.File, allowHomeDir bool) (bad []token.Pos, allow
 	return bad, allowed
 }
 
-func TestInternalHomeCallersUseFixtureResolver(t *testing.T) {
-	root, err := filepath.Abs("..")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolver := filepath.Join(root, "platform", "platform.go")
-	files, allowed := 0, 0
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+type homeSourceAudit struct {
+	files, allowed int
+	bypasses       []token.Position
+	byTopLevel     map[string]int
+}
+
+func auditHomeSources(root string) (homeSourceAudit, error) {
+	result := homeSourceAudit{byTopLevel: map[string]int{}}
+	resolver := filepath.Join(root, "internal", "platform", "platform.go")
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() {
-			if path != root && (entry.Name() == "testdata" || entry.Name() == "vendor" || strings.HasPrefix(entry.Name(), ".")) {
+			if path != root && (entry.Name() == "testdata" || entry.Name() == "vendor" || entry.Name() == "node_modules" || strings.HasPrefix(entry.Name(), ".")) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -77,19 +80,89 @@ func TestInternalHomeCallersUseFixtureResolver(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		files++
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		result.files++
+		result.byTopLevel[strings.Split(filepath.ToSlash(rel), "/")[0]]++
 		bad, n := rawHomeSelectors(file, path == resolver)
-		allowed += n
+		result.allowed += n
 		for _, pos := range bad {
-			t.Errorf("%s: use platform.UserHomeDir, not the raw OS resolver", set.Position(pos))
+			result.bypasses = append(result.bypasses, set.Position(pos))
 		}
 		return nil
 	})
+	return result, err
+}
+
+func TestRepositoryHomeCallersUseFixtureResolver(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if files == 0 || allowed != 1 {
-		t.Fatalf("audit must inspect internal source and exactly one central OS fallback: files=%d, fallbacks=%d", files, allowed)
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		t.Fatal("repository root not found:", err)
+	}
+	result, err := auditHomeSources(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pos := range result.bypasses {
+		t.Errorf("%s: use platform.UserHomeDir, not the raw OS resolver", pos)
+	}
+	for _, name := range []string{"cmd", "internal", "services"} {
+		if result.byTopLevel[name] == 0 {
+			t.Errorf("audit did not inspect %s production files", name)
+		}
+	}
+	if result.files == 0 || result.allowed != 1 {
+		t.Fatalf("audit must inspect repository source and exactly one central OS fallback: files=%d, fallbacks=%d", result.files, result.allowed)
+	}
+}
+
+func TestHomeSourceAuditWalksRootAndTopLevelPackages(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"internal/platform/platform.go": `package platform; import "os"; func HomeDir() { os.UserHomeDir() }`,
+		"services/ports.go":             `package services; import sys "os"; var home = sys.UserHomeDir`,
+		"cmd/tool.go":                   `package cmd; import "os"; func f() { os.UserHomeDir() }`,
+		"tools.go":                      `package tools; import "os"; func HomeDir() { os.UserHomeDir() }`,
+		"newpackage/home.go":            `package newpackage; import "os"; var home = os.UserHomeDir`,
+		"services/fixture_test.go":      `package services; import "os"; var fixture = os.UserHomeDir`,
+		"testdata/invalid.go":           "not Go source",
+		"vendor/invalid.go":             "not Go source",
+		"node_modules/invalid.go":       "not Go source",
+		".git/invalid.go":               "not Go source",
+	}
+	for rel, source := range files {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := auditHomeSources(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.files != 5 || result.allowed != 1 || len(result.bypasses) != 4 {
+		t.Fatalf("top-level audit coverage lost: files=%d fallback=%d bypasses=%d", result.files, result.allowed, len(result.bypasses))
+	}
+	for _, name := range []string{"internal", "services", "cmd", "tools.go", "newpackage"} {
+		if result.byTopLevel[name] != 1 {
+			t.Fatalf("audit did not inspect %s exactly once", name)
+		}
+	}
+	// Syntax errors in included source must fail rather than disappear from
+	// the audit. Only owned synthetic files are ever written here.
+	if err := os.WriteFile(filepath.Join(root, "services", "broken.go"), []byte("not Go source"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditHomeSources(root); err == nil {
+		t.Fatal("audit ignored an included source parse error")
 	}
 }
 
