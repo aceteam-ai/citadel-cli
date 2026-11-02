@@ -59,6 +59,13 @@ func HomeDir(username string) (string, error) {
 	return u.HomeDir, nil
 }
 
+// UserHomeDir has the OS resolver's function signature, so callers can pass or
+// retain it as a dependency without capturing a path before test fixture setup.
+// HomeDir applies the explicit test scope; production still calls os.UserHomeDir.
+func UserHomeDir() (string, error) {
+	return HomeDir("")
+}
+
 // GetSudoUser returns the original username when running with sudo
 func GetSudoUser() string {
 	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {

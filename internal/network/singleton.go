@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"gopkg.in/yaml.v3"
 )
 
@@ -507,7 +508,7 @@ func getManifestLocations() []string {
 	locations = append(locations, filepath.Join(globalConfigDir, "citadel.yaml"))
 
 	// User home directory
-	if homeDir, err := os.UserHomeDir(); err == nil {
+	if homeDir, err := platform.UserHomeDir(); err == nil {
 		locations = append(locations, filepath.Join(homeDir, "citadel-node", "citadel.yaml"))
 	}
 
