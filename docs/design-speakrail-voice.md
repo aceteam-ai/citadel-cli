@@ -248,7 +248,7 @@ live audio or exactly-once arbitrary tools. Recovery cannot rerun completed
 inference, inherit old credential authority, or fabricate missing audio. The
 exact new session/checkpoint retention protocol remains a reviewed cross-repo gate.
 
-## 6. Comparison and measurement acceptance — NOT RUN
+## 6. Comparison and measurement acceptance: NOT RUN
 
 | Path | Source-level fit | Unproven cost / gate |
 | --- | --- | --- |
