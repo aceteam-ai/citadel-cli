@@ -717,3 +717,26 @@ func TestAllKnownJobTypesCoversRegisteredHandlers(t *testing.T) {
 		}
 	}
 }
+
+func TestAMTKVMCapabilityAdvertisementFollowsDesktopPermission(t *testing.T) {
+	desktopEnabled := true
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		DesktopEnabled: func() bool { return desktopEnabled },
+	})
+	runner := NewRunner(nil, handlers, RunnerConfig{})
+	advertisesAMT := func() bool {
+		for _, jobType := range runner.SupportedJobTypes() {
+			if jobType == JobTypeAMTKVM {
+				return true
+			}
+		}
+		return false
+	}
+	if !advertisesAMT() {
+		t.Fatal("enabled AMT handler missing from runner supported job types")
+	}
+	desktopEnabled = false
+	if advertisesAMT() {
+		t.Fatal("disabled AMT handler remains advertised")
+	}
+}
