@@ -5,11 +5,17 @@ import "strings"
 
 const FileFetch = "FILE_FETCH"
 
+// OmitPayload identifies envelopes whose diagnostic forms must omit decoded
+// payloads, original bytes and raw source fields. It never changes execution.
+func OmitPayload(kind string) bool {
+	return kind == FileFetch || strings.HasPrefix(kind, "CONTAINER_")
+}
+
 // Payload is for retention/diagnostics only, never execution or redispatch.
 // It drops FILE_FETCH and CONTAINER_* payloads entirely, and removes the node
 // passcode field from every other job type.
 func Payload(kind string, payload map[string]any) map[string]any {
-	if kind == FileFetch || strings.HasPrefix(kind, "CONTAINER_") {
+	if OmitPayload(kind) {
 		return nil
 	}
 	return WithoutPasscode(payload)
@@ -59,7 +65,7 @@ func FailureData(kind string, payload map[string]any, err error, data map[string
 		message = Error(kind, payload, err).Error()
 	}
 	fields := map[string]any{"error": message}
-	if kind != FileFetch && !strings.HasPrefix(kind, "CONTAINER_") {
+	if !OmitPayload(kind) {
 		for key, value := range data {
 			fields[key] = value
 		}
