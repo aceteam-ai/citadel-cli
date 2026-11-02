@@ -42,6 +42,28 @@ check source command construction and failure paths; they do not prove a native
 binary or distribution artifact. No local candidate script/test/build execution
 accompanied this source change.
 
+## Windows helper staging source
+
+The shared script accepts exactly `x86_64-pc-windows-msvc` for the first #619
+build-input slice, selecting Go `windows/amd64` and the fixed output
+`src-tauri/binaries/citadel-x86_64-pc-windows-msvc.exe`. This follows Tauri's
+[target-suffixed external binary naming](https://v2.tauri.app/develop/sidecar/),
+including the Windows `.exe` extension. Darwin and Linux output names stay
+suffixless. Other Windows targets, including GNU, 32-bit and ARM64, refuse.
+
+The existing inert fixture suite covers explicit and default-host Windows
+selection, exact Go argv/environment/output naming, rejected inputs and
+provenance/build/chmod failures. It runs the shared Bash stager with fake tools
+on Unix; it does not prove Windows shell compatibility, a real PE binary or
+native Tauri bundling. This slice builds no Windows app or installer and adds
+no new workflow, runtime, permission, authentication or service behavior.
+
+Windows native build and onboarding/credential acceptance, user-level
+supervision without elevation, signed installer/winget packaging and
+distribution remain open under #619. The existing Administrator/LocalSystem
+SCM service path is not the accepted user-level v1 supervisor. Do not infer
+full Windows support from a staged helper or from generic CLI cross-compiles.
+
 ## Build an unsigned DMG
 
 The distribution entrypoint accepts one exact macOS target at a time. It stages the matching Go helper, asks Tauri to create the DMG, and verifies that both the desktop executable and bundled helper are thin Mach-O binaries for the requested architecture. It also requires exactly one nonempty DMG in the target-specific Tauri output directory.
