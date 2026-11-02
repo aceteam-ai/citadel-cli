@@ -293,7 +293,7 @@ func resolveNodeConfigDirReadOnly() (string, nodeDirSource, error) {
 	if !os.IsNotExist(err) {
 		return "", nodeDirPointer, fmt.Errorf("inspect global config %s: %w", globalPath, err)
 	}
-	home, err := os.UserHomeDir()
+	home, err := platform.HomeDir("")
 	if err != nil {
 		return "", nodeDirDefault, err
 	}

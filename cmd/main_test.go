@@ -54,14 +54,20 @@ func TestMain(m *testing.M) {
 	nodeDir := filepath.Join(dir, "node")
 	passcodeDir := filepath.Join(dir, "passcodes")
 	machineDir := filepath.Join(dir, "machine")
+	markerDir := filepath.Join(dir, "podman-marker")
 	legacyDir := filepath.Join(home, ".citadel-cli")
-	for _, child := range []string{home, nodeDir, passcodeDir, machineDir, legacyDir} {
+	for _, child := range []string{home, nodeDir, passcodeDir, machineDir, legacyDir, markerDir} {
 		if err := os.MkdirAll(child, 0700); err != nil {
 			failSetup(err)
 		}
 	}
-	restorePaths, err = installCmdPathFixtures(nodeDir, machineDir, legacyDir)
+	restorePaths, err = installCmdPathFixtures(home, nodeDir, machineDir, legacyDir, markerDir)
 	if err != nil {
+		failSetup(err)
+	}
+	// Preflight path selection before any logger, credential or test helper can
+	// create files. Do not use a production writer to establish this oracle.
+	if err := checkCmdPathFixtures(home, nodeDir, legacyDir, markerDir); err != nil {
 		failSetup(err)
 	}
 	// platform.ConfigDir's root branch needs an existing HOME config; HOME
@@ -123,7 +129,7 @@ func TestMain(m *testing.M) {
 // installCmdPathFixtures changes only default path discovery, not explicit
 // paths passed by tests. The caller owns the directories and must join their
 // users, close handles, restore this scope, then delete the fixtures.
-func installCmdPathFixtures(nodeDir, machineDir, configDir string) (func() error, error) {
+func installCmdPathFixtures(home, nodeDir, machineDir, configDir, markerDir string) (func() error, error) {
 	restoreNetwork, err := network.OverrideStateDirectoriesForTesting(nodeDir, machineDir)
 	if err != nil {
 		return nil, err
@@ -135,7 +141,42 @@ func installCmdPathFixtures(nodeDir, machineDir, configDir string) (func() error
 		}
 		return nil, err
 	}
+	restoreHome, err := platform.OverrideHomeDirectoryForTesting(home)
+	if err != nil {
+		cleanup := func() error {
+			if err := restorePlatform(); err != nil {
+				return err
+			}
+			return restoreNetwork()
+		}
+		if restoreErr := cleanup(); restoreErr != nil {
+			return cleanup, fmt.Errorf("home fixture: %v; path restoration: %w", err, restoreErr)
+		}
+		return nil, err
+	}
+	restoreMarker, err := overridePodmanMarkerDirectoryForTesting(markerDir)
+	if err != nil {
+		cleanup := func() error {
+			if err := restoreHome(); err != nil {
+				return err
+			}
+			if err := restorePlatform(); err != nil {
+				return err
+			}
+			return restoreNetwork()
+		}
+		if restoreErr := cleanup(); restoreErr != nil {
+			return cleanup, fmt.Errorf("marker fixture: %v; path restoration: %w", err, restoreErr)
+		}
+		return nil, err
+	}
 	return func() error {
+		if err := restoreMarker(); err != nil {
+			return err
+		}
+		if err := restoreHome(); err != nil {
+			return err
+		}
 		if err := restorePlatform(); err != nil {
 			return err
 		}
@@ -155,7 +196,8 @@ func useCmdFixtureHome(t *testing.T, home string) {
 	node := filepath.Join(home, "network-node-fixture")
 	machine := filepath.Join(home, "machine-config")
 	configDir := filepath.Join(home, ".citadel-cli")
-	for _, dir := range []string{node, machine, configDir} {
+	markerDir := filepath.Join(home, "podman-marker")
+	for _, dir := range []string{node, machine, configDir, markerDir} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -163,7 +205,7 @@ func useCmdFixtureHome(t *testing.T, home string) {
 	if err := clilog.Close(); err != nil {
 		t.Fatal(err)
 	}
-	restore, err := installCmdPathFixtures(node, machine, configDir)
+	restore, err := installCmdPathFixtures(home, node, machine, configDir, markerDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,6 +217,29 @@ func useCmdFixtureHome(t *testing.T, home string) {
 			t.Error(err)
 		}
 	})
+	if err := checkCmdPathFixtures(home, node, configDir, markerDir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// checkCmdPathFixtures compares strings only. Its expected inputs come from
+// explicitly created fixtures, not from another default-path getter.
+func checkCmdPathFixtures(home, node, configDir, markerDir string) error {
+	for _, name := range []string{"", "fixture-account-that-must-not-be-looked-up"} {
+		if got, err := platform.HomeDir(name); err != nil || got != home {
+			return fmt.Errorf("home fixture not selected for %q", name)
+		}
+	}
+	if network.GetNodeConfigDir() != node || network.GetStateDir() != filepath.Join(node, "network") {
+		return fmt.Errorf("network fixture not selected")
+	}
+	if platform.ConfigDir() != configDir || clilog.Dir() != filepath.Join(home, ".citadel-cli", "logs") {
+		return fmt.Errorf("config/log fixture not selected")
+	}
+	if podmanUserMarkerPath() != filepath.Join(markerDir, "rootless-worker-user") {
+		return fmt.Errorf("podman marker fixture not selected")
+	}
+	return nil
 }
 
 // useWiredLegacyLockout installs the production passcode hooks against a fresh
