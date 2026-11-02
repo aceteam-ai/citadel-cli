@@ -210,6 +210,7 @@ const (
 	JobTypeApplyDeviceConfig  = "APPLY_DEVICE_CONFIG"  // Device config from onboarding
 	JobTypeExtraction         = "GLINER_EXTRACTION"    // Entity/relation extraction via GLiNER2
 	JobTypeHTTPProxy          = "HTTP_PROXY"           // Proxy HTTP requests through the local node
+	JobTypeAMTKVM             = "AMT_KVM"              // Intel AMT control from this node's LAN
 	JobTypeWebFetch           = "WEB_FETCH"            // Native HTTP fetch from node egress with SSRF guards (aceteam#5995)
 	JobTypeFileRead           = "FILE_READ"            // Read a file from the workspace
 	JobTypeFileReadBytes      = "FILE_READ_BYTES"      // Read a file as raw base64-encoded bytes (binary-safe)
