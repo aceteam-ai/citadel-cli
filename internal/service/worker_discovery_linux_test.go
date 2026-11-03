@@ -1,0 +1,532 @@
+//go:build linux
+
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestDiscoveryOutputBoundsCopyWithoutWriterTo(t *testing.T) {
+	// Command stdout is copied with io.Copy. Hiding WriterTo exercises its
+	// destination fast path, rather than only calling Write directly.
+	reader := struct{ io.Reader }{strings.NewReader(strings.Repeat("x", maxWorkerDiscoveryOutput+1))}
+	var output discoveryOutput
+	if _, err := io.Copy(&output, reader); !errors.Is(err, errWorkerDiscoveryBound) {
+		t.Fatalf("copy escaped output limit: bytes=%d error=%v", output.Len(), err)
+	}
+	if output.Len() > maxWorkerDiscoveryOutput {
+		t.Fatal("output retained bytes beyond its bound")
+	}
+}
+
+func TestDiscoveryOutputBoundsStdoutPipeCopy(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer writer.Close()
+		_, _ = writer.Write([]byte(strings.Repeat("x", maxWorkerDiscoveryOutput+1)))
+	}()
+	var output discoveryOutput
+	_, copyErr := io.Copy(&output, reader)
+	_ = reader.Close() // Release a writer if copying refused before its final byte.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture pipe writer did not stop")
+	}
+	if !errors.Is(copyErr, errWorkerDiscoveryBound) || output.Len() > maxWorkerDiscoveryOutput {
+		t.Fatalf("stdout pipe copy escaped output limit: bytes=%d error=%v", output.Len(), copyErr)
+	}
+}
+
+func TestDiscoverActiveWorkersRejectsCollectorOverflowInEitherManager(t *testing.T) {
+	for _, overflowUser := range []bool{false, true} {
+		t.Run(fmt.Sprintf("overflow_user=%t", overflowUser), func(t *testing.T) {
+			f := discoveryFixture{
+				list:   map[bool]string{!overflowUser: "worker.service loaded active running Worker\n"},
+				units:  map[string]string{"worker.service": "[Service]\nExecStart=/fixture/citadel work\n"},
+				reload: "no",
+			}
+			base := f.capture(t)
+			capture := func(ctx context.Context, args ...string) ([]byte, error) {
+				userMode, command := len(args) > 0 && args[0] == "--user", args[0]
+				if userMode {
+					command = args[1]
+				}
+				if command == "list-units" && userMode == overflowUser {
+					return nil, fmt.Errorf("fixture capture: %w", errWorkerDiscoveryBound)
+				}
+				return base(ctx, args...)
+			}
+			workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", capture, fixtureCanonical)
+			if !errors.Is(err, errWorkerDiscoveryBound) || len(workers) != 0 {
+				t.Fatalf("overflow hid a manager and admitted partial discovery: workers=%+v error=%v", workers, err)
+			}
+		})
+	}
+}
+
+func TestDiscoveryCapturePreservesOverflowOverCommandFailure(t *testing.T) {
+	for _, runErr := range []error{nil, errors.New("fixture command failure"), &exec.ExitError{}} {
+		var output discoveryOutput
+		if _, err := output.Write(make([]byte, maxWorkerDiscoveryOutput+1)); !errors.Is(err, errWorkerDiscoveryBound) {
+			t.Fatal("fixture did not overflow")
+		}
+		body, err := output.result(runErr)
+		if body != nil || !errors.Is(err, errWorkerDiscoveryBound) {
+			t.Fatalf("process error hid overflow: body bytes=%d error type=%T", len(body), err)
+		}
+		if _, err := output.Write([]byte("later")); !errors.Is(err, errWorkerDiscoveryBound) {
+			t.Fatal("overflow observation was reset by a later write")
+		}
+	}
+	var output discoveryOutput
+	_, _ = output.Write([]byte("fixture"))
+	processErr := errors.New("fixture manager unavailable")
+	if body, err := output.result(processErr); body != nil || err != processErr {
+		t.Fatal("ordinary command failure was reclassified")
+	}
+	if body, err := output.result(nil); err != nil || string(body) != "fixture" {
+		t.Fatal("bounded successful output was dropped")
+	}
+}
+
+type discoveryFixture struct {
+	list      map[bool]string
+	units     map[string]string
+	reload    string
+	reloads   map[string]string
+	listError map[bool]bool
+	catError  bool
+}
+
+func (f discoveryFixture) capture(t *testing.T) func(context.Context, ...string) ([]byte, error) {
+	t.Helper()
+	return func(_ context.Context, args ...string) ([]byte, error) {
+		userMode := len(args) > 0 && args[0] == "--user"
+		if userMode {
+			args = args[1:]
+		}
+		if len(args) == 0 {
+			t.Fatal("empty discovery command")
+		}
+		switch args[0] {
+		case "list-units":
+			if f.listError[userMode] {
+				return nil, errors.New("fixture manager unavailable")
+			}
+			return []byte(f.list[userMode]), nil
+		case "cat":
+			if f.catError {
+				return nil, errors.New("fixture unit unavailable")
+			}
+			return []byte(f.units[args[len(args)-1]]), nil
+		case "show":
+			if reload, ok := f.reloads[args[len(args)-1]]; ok {
+				return []byte(reload), nil
+			}
+			return []byte(f.reload), nil
+		default:
+			t.Fatalf("discovery attempted unexpected command %q", args[0])
+			return nil, nil
+		}
+	}
+}
+
+func fixtureCanonical(path string) (string, error) { return filepath.Clean(path), nil }
+
+func TestDiscoverActiveWorkersUsesExecutableInsteadOfUnitName(t *testing.T) {
+	fixture := discoveryFixture{
+		list: map[bool]string{false: "citadel-work.service loaded active running Custom worker\nforeign.service loaded active running Foreign\n", true: "another.service loaded active running Another\n"},
+		units: map[string]string{
+			"citadel-work.service": "[Unit]\nDescription=GPU worker\n[Service]\nUser=fixture-worker\nExecStart=/fixture/bin/citadel work\nEnvironment=CITADEL_NO_AUTO_UPDATE=1\nEnvironment=PRIVATE_FIXTURE_VALUE=synthetic-only\n",
+			"foreign.service":      "[Service]\nExecStart=/foreign/bin/citadel work\n",
+			"another.service":      "[Service]\nExecStart=/fixture/bin/citadel status\n",
+		}, reload: "no\n",
+	}
+	workers, err := discoverActiveWorkers(context.Background(), "/fixture/bin/citadel", fixture.capture(t), fixtureCanonical)
+	want := []ManagedWorker{{Unit: ManagedUnit{Name: "citadel-work"}, Executable: "/fixture/bin/citadel", User: "fixture-worker", AutoUpdateDisabled: true}}
+	if err != nil || !reflect.DeepEqual(workers, want) {
+		t.Fatalf("custom worker not discovered or foreign binary selected: %+v %v", workers, err)
+	}
+	if strings.Contains(fmt.Sprint(workers), "PRIVATE_FIXTURE_VALUE") {
+		t.Fatal("discovery exported unit environment")
+	}
+}
+
+func TestWorkerUnitIdentityHonorsSectionsQuotesAndDropInResets(t *testing.T) {
+	for _, tc := range []struct {
+		name, content, path string
+		known               bool
+	}{
+		{"literal", "[Service]\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
+		{"quoted path", "[Service]\nExecStart=\"/fixture/space dir/citadel\" work\n", "/fixture/space dir/citadel", true},
+		{"ignore-failure prefix", "[Service]\nExecStart=-/fixture/citadel work\n", "/fixture/citadel", true},
+		{"root opt-out", "[Service]\nExecStart=/fixture/citadel --no-auto-update work\n", "/fixture/citadel", true},
+		{"drop-in reset", "[Service]\nExecStart=/foreign/citadel work\n# drop-in\n[Service]\nExecStart=\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
+		{"multiple commands", "[Service]\nExecStart=/fixture/citadel work\nExecStart=/foreign/citadel work\n", "", false},
+		{"wrong section", "[Unit]\nExecStart=/fixture/citadel work\n", "", true},
+		{"shell wrapper", "[Service]\nExecStart=/bin/sh -c '/fixture/citadel work'\n", "", false},
+		{"different subcommand", "[Service]\nExecStart=/fixture/citadel worker\n", "", true},
+		{"specifier", "[Service]\nExecStart=%h/citadel work\n", "", false},
+		{"environment expansion", "[Service]\nExecStart=$EXECUTABLE work\n", "", false},
+		{"unknown escape", "[Service]\nExecStart=/fixture/space\\sdir/citadel work\n", "", false},
+		{"continuation", "[Service]\nExecStart=/fixture/citadel \\\n work\n", "/fixture/citadel", true},
+		{"unclosed quote", "[Service]\nExecStart=\"/fixture/citadel work\n", "", false},
+		{"dynamic identity", "[Service]\nDynamicUser=yes\nExecStart=/fixture/citadel work\n", "/fixture/citadel", false},
+		{"identity reset", "[Service]\nDynamicUser=yes\nUser=%i\nDynamicUser=no\nUser=fixture-worker\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
+		{"mapping reset", "[Service]\nRootDirectory=/fixture/root\nRootDirectory=\nBindPaths=/other:/fixture\nBindPaths=\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
+		{"read-only hardening", "[Service]\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=/fixture\nExecStart=/fixture/citadel work\n", "/fixture/citadel", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, _, known := workerUnitIdentity(tc.content)
+			if path != tc.path || known != tc.known {
+				t.Fatalf("identity=%q/%t, want %q/%t", path, known, tc.path, tc.known)
+			}
+		})
+	}
+}
+
+func TestDiscoverActiveWorkersResolvesAliasAndPreservesManager(t *testing.T) {
+	f := discoveryFixture{list: map[bool]string{true: "custom.service loaded active running Worker\n"}, units: map[string]string{"custom.service": "[Service]\nExecStart=/fixture/symlink work\n"}, reload: "no"}
+	canonical := func(path string) (string, error) {
+		if path == "/fixture/symlink" {
+			return "/fixture/citadel", nil
+		}
+		return filepath.Clean(path), nil
+	}
+	workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), canonical)
+	if err != nil || len(workers) != 1 || !workers[0].Unit.UserMode || workers[0].Unit.Name != "custom" {
+		t.Fatalf("user-manager alias not resolved: %+v %v", workers, err)
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesStaleOrUnknownLoadedConfiguration(t *testing.T) {
+	for _, reload := range []string{"yes", "", "unknown"} {
+		f := discoveryFixture{list: map[bool]string{false: "custom.service loaded active running Worker\n"}, units: map[string]string{"custom.service": "[Service]\nExecStart=/fixture/citadel work\n"}, reload: reload}
+		if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical); err == nil || len(workers) != 0 {
+			t.Fatalf("stale manager admitted restart target: %+v %v", workers, err)
+		}
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesHiddenIdentityCandidates(t *testing.T) {
+	for _, setting := range []string{
+		"DynamicUser=yes", "User=%i", "RootDirectory=/fixture/root", "RootImage=/fixture/root.raw",
+		"BindPaths=/foreign:/fixture", "BindReadOnlyPaths=/foreign:/fixture",
+		"TemporaryFileSystem=/fixture", "MountImages=/fixture/image:/fixture",
+		"ExtensionImages=/fixture/extension.raw", "ExtensionDirectories=/fixture/extension",
+		"PrivateTmp=yes", "PrivateTmp=disconnected", "PrivateDevices=yes", "ProtectHome=yes", "ProtectHome=tmpfs",
+		"DynamicUser=yes\nDynamicUser=", "PrivateTmp=yes\nPrivateTmp=", "PrivateDevices=yes\nPrivateDevices=", "ProtectHome=tmpfs\nProtectHome=",
+	} {
+		for _, hiddenFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/hidden_first=%t", setting, hiddenFirst), func(t *testing.T) {
+				hidden, ordinary := "z.service", "a.service"
+				if hiddenFirst {
+					hidden, ordinary = ordinary, hidden
+				}
+				f := discoveryFixture{
+					list: map[bool]string{false: hidden + " loaded active running Hidden\n" + ordinary + " loaded active running Worker\n"},
+					units: map[string]string{
+						hidden:   "[Service]\n" + setting + "\nExecStart=/fixture/citadel work\n",
+						ordinary: "[Service]\nExecStart=/fixture/citadel work\n",
+					}, reload: "no",
+				}
+				if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical); err == nil || len(workers) != 0 {
+					t.Fatalf("unverified identity became a unique restart target: workers=%+v error=%v", workers, err)
+				}
+			})
+		}
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesMappedForeignLiteralBeforeHostResolution(t *testing.T) {
+	f := discoveryFixture{
+		list:   map[bool]string{false: "mapped.service loaded active running Worker\n"},
+		units:  map[string]string{"mapped.service": "[Service]\nRootDirectory=/fixture/root\nExecStart=/inside/citadel work\n"},
+		reload: "no",
+	}
+	canonical := func(path string) (string, error) {
+		if path != "/fixture/citadel" {
+			t.Fatal("service namespace path was interpreted in the host namespace")
+		}
+		return path, nil
+	}
+	if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), canonical); err == nil || len(workers) != 0 {
+		t.Fatalf("mapped path was excluded using host resolution: workers=%+v error=%v", workers, err)
+	}
+}
+
+func TestWorkerUnitIdentityMappingAndAccountResets(t *testing.T) {
+	for _, key := range []string{"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "TemporaryFileSystem", "MountImages", "ExtensionImages", "ExtensionDirectories"} {
+		t.Run(key, func(t *testing.T) {
+			path, account, known := workerUnitIdentity("[Service]\n" + key + "=/fixture/unverified\n" + key + "=\nDynamicUser=yes\nDynamicUser=no\nPrivateTmp=yes\nPrivateTmp=no\nPrivateDevices=yes\nPrivateDevices=no\nProtectHome=tmpfs\nProtectHome=read-only\nUser=%i\nUser=fixture-worker\nExecStart=/fixture/citadel work\n")
+			if !known || path != "/fixture/citadel" || account != "fixture-worker" {
+				t.Fatalf("effective reset did not clear prior uncertainty: path=%q account=%q known=%t", path, account, known)
+			}
+		})
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesStaleNonmatchingBackingFile(t *testing.T) {
+	for _, staleFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stale_first=%t", staleFirst), func(t *testing.T) {
+			stale, ordinary := "z.service", "a.service"
+			if staleFirst {
+				stale, ordinary = ordinary, stale
+			}
+			f := discoveryFixture{
+				list: map[bool]string{false: stale + " loaded active running Stale\n" + ordinary + " loaded active running Worker\n"},
+				units: map[string]string{
+					// Loaded ExecStart may still be /fixture/citadel; disk alone
+					// cannot exclude this active unit before checking freshness.
+					stale:    "[Service]\nExecStart=/foreign/citadel work\n",
+					ordinary: "[Service]\nExecStart=/fixture/citadel work\n",
+				}, reload: "no", reloads: map[string]string{stale: "yes"},
+			}
+			if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical); err == nil || len(workers) != 0 {
+				t.Fatalf("stale disk nonmatch hid a loaded worker: workers=%+v error=%v", workers, err)
+			}
+		})
+	}
+}
+
+func TestDiscoverActiveWorkersIgnoresInactiveUnitsAndUnsafeNames(t *testing.T) {
+	f := discoveryFixture{list: map[bool]string{false: "inactive.service loaded inactive dead Stopped\n../other.service loaded active running Invalid\n-bad.service loaded active running Invalid\n"}, units: map[string]string{"inactive.service": "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no"}
+	workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical)
+	if err != nil || len(workers) != 0 {
+		t.Fatalf("inactive/unsafe unit was selected: %+v %v", workers, err)
+	}
+}
+
+func TestDiscoverActiveWorkersBoundsAndUnknownManagers(t *testing.T) {
+	var many strings.Builder
+	for i := 0; i <= maxWorkerDiscoveryUnits; i++ {
+		fmt.Fprintf(&many, "worker%d.service loaded active running Worker\n", i)
+	}
+	for _, f := range []discoveryFixture{
+		{list: map[bool]string{false: strings.Repeat("x", maxWorkerDiscoveryOutput+1)}},
+		{list: map[bool]string{false: many.String()}},
+		{listError: map[bool]bool{false: true, true: true}},
+		{list: map[bool]string{false: "worker.service loaded active running Worker\n"}, catError: true},
+		{list: map[bool]string{false: "worker.service loaded active running Worker\n"}, units: map[string]string{"worker.service": strings.Repeat("x", maxWorkerDiscoveryOutput+1)}},
+	} {
+		if workers, err := discoverActiveWorkers(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical); err == nil || len(workers) != 0 {
+			t.Fatalf("incomplete/bounded discovery selected a target: %+v %v", workers, err)
+		}
+	}
+	var output discoveryOutput
+	if _, err := output.Write(make([]byte, maxWorkerDiscoveryOutput+1)); !errors.Is(err, errWorkerDiscoveryBound) {
+		t.Fatal("command output writer did not enforce its bound")
+	}
+}
+
+func TestDiscoverActiveWorkersCancellationBeforeAnyObservation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	capture := func(context.Context, ...string) ([]byte, error) {
+		t.Fatal("cancelled discovery performed IO")
+		return nil, nil
+	}
+	if _, err := discoverActiveWorkers(ctx, "/fixture/citadel", capture, fixtureCanonical); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled observation not refused: %v", err)
+	}
+}
+
+func TestUserManagerDefaultAccountMatchesInspectedBus(t *testing.T) {
+	f := discoveryFixture{list: map[bool]string{true: "worker.service loaded active running Worker\n"}, units: map[string]string{"worker.service": "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no"}
+	workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001)
+	if err != nil || len(workers) != 1 || workers[0].User != "9001" || workers[0].Unit.ManagerUID != "9001" || !workers[0].Unit.UserMode {
+		t.Fatalf("user manager identity lost: %+v %v", workers, err)
+	}
+	want := []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "XDG_RUNTIME_DIR=/run/user/9001", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/9001/bus"}
+	if got := discoveryManagerEnvironment(true, 9001); !reflect.DeepEqual(got, want) {
+		t.Fatalf("user bus not pinned to attributed account: %q", got)
+	}
+	if got := discoveryManagerEnvironment(false, 9001); !reflect.DeepEqual(got, want[:3]) {
+		t.Fatalf("system manager inherited a user bus: %q", got)
+	}
+}
+
+func TestUnparsedActiveInvocationCannotHideSecondWorker(t *testing.T) {
+	for _, command := range []string{"+/fixture/citadel work", "@/fixture/citadel worker-name work", "!/fixture/citadel work", "/fixture/citadel --unknown work", "/fixture/citadel \\\n work"} {
+		for _, hiddenFirst := range []bool{false, true} {
+			name, ordinary := "z.service", "a.service"
+			if hiddenFirst {
+				name, ordinary = ordinary, name
+			}
+			f := discoveryFixture{list: map[bool]string{false: name + " loaded active running Hidden\n" + ordinary + " loaded active running Worker\n"}, units: map[string]string{name: "[Service]\nExecStart=" + command + "\n", ordinary: "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no"}
+			if workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001); err == nil && len(workers) != 2 {
+				t.Fatalf("unparsed invocation became unique target: command=%q workers=%+v error=%v", command, workers, err)
+			}
+		}
+	}
+}
+
+func TestUnitAutoUpdatePolicyRespectsResetsAndUncertainty(t *testing.T) {
+	for _, tc := range []struct {
+		name, content string
+		disabled      bool
+	}{
+		{"literal environment", "Environment=CITADEL_NO_AUTO_UPDATE=1\nExecStart=/fixture/citadel work", true},
+		{"quoted environment", "Environment=\"CITADEL_NO_AUTO_UPDATE=1\"\nExecStart=/fixture/citadel work", true},
+		{"environment reset", "Environment=CITADEL_NO_AUTO_UPDATE=1\nEnvironment=\nExecStart=/fixture/citadel work", false},
+		{"last assignment", "Environment=CITADEL_NO_AUTO_UPDATE=1\nEnvironment=CITADEL_NO_AUTO_UPDATE=0\nExecStart=/fixture/citadel work", false},
+		{"unset before assignment", "UnsetEnvironment=CITADEL_NO_AUTO_UPDATE\nEnvironment=CITADEL_NO_AUTO_UPDATE=1\nExecStart=/fixture/citadel work", false},
+		{"unset reset", "UnsetEnvironment=CITADEL_NO_AUTO_UPDATE\nEnvironment=CITADEL_NO_AUTO_UPDATE=1\nUnsetEnvironment=\nExecStart=/fixture/citadel work", true},
+		{"unknown env file", "Environment=CITADEL_NO_AUTO_UPDATE=1\nEnvironmentFile=-/fixture/not-read\nExecStart=/fixture/citadel work", false},
+		{"env file reset", "EnvironmentFile=/fixture/not-read\nEnvironmentFile=\nEnvironment=CITADEL_NO_AUTO_UPDATE=1\nExecStart=/fixture/citadel work", true},
+		{"global flag", "ExecStart=/fixture/citadel --no-auto-update work", true},
+		{"worker flag", "ExecStart=/fixture/citadel work --no-auto-update", true},
+		{"false flag", "ExecStart=/fixture/citadel work --no-auto-update=false", false},
+		{"flag reset", "ExecStart=/fixture/citadel work --no-auto-update\nExecStart=\nExecStart=/fixture/citadel work", false},
+		{"not an argument", "ExecStart=/fixture/citadel work -- --no-auto-update", false},
+		{"different section", "ExecStart=/fixture/citadel work\n[Unit]\nEnvironment=CITADEL_NO_AUTO_UPDATE=1", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unitAutoUpdateDisabled("[Service]\n" + tc.content); got != tc.disabled {
+				t.Fatalf("policy=%t want %t", got, tc.disabled)
+			}
+		})
+	}
+}
+
+func TestDiscoverActiveWorkersWithStockHostUnits(t *testing.T) {
+	units := map[string]string{
+		"systemd-journald.service":  "[Service]\nExecStart=/usr/lib/systemd/systemd-journald\nPrivateDevices=yes\n",
+		"systemd-logind.service":    "[Service]\nExecStart=/usr/lib/systemd/systemd-logind\n",
+		"systemd-udevd.service":     "[Service]\nExecStart=/usr/lib/systemd/systemd-udevd\n",
+		"containerd.service":        "[Service]\nExecStart=/usr/bin/containerd\n",
+		"snapd.service":             "[Service]\nExecStart=/usr/lib/snapd/snapd\n",
+		"dbus.service":              "[Service]\nExecStart=@/usr/bin/dbus-daemon dbus-daemon --system --address=systemd: --nofork\n",
+		"systemd-networkd.service":  "[Service]\nUser=systemd-network\nExecStart=!!/usr/lib/systemd/systemd-networkd\n",
+		"systemd-resolved.service":  "[Service]\nUser=systemd-resolve\nExecStart=!!/usr/lib/systemd/systemd-resolved\n",
+		"systemd-timesyncd.service": "[Service]\nExecStart=!!/usr/lib/systemd/systemd-timesyncd\n",
+		"accounts-daemon.service":   "[Service]\nExecStart=/usr/libexec/accounts-daemon\nReadWritePaths=/var/lib/AccountsService \\\n /run\n",
+		"k3s-agent.service":         "[Service]\nExecStart=/usr/local/bin/k3s \\\n agent \\\n --node-label=fixture=yes\n",
+		"wrapped.service":           "[Service]\nExecStart=/usr/bin/env NAME=fixture /bin/sh -c 'echo fixture'\n",
+		"unknown-escape.service":    "[Service]\nExecStart=/fixture/space\\sdir/unrelated\n",
+		"citadel-worker.service":    "[Service]\nExecStart=/fixture/citadel work\n",
+	}
+	var list strings.Builder
+	for name := range units {
+		fmt.Fprintf(&list, "%s loaded active running Fixture\n", name)
+	}
+	f := discoveryFixture{list: map[bool]string{false: list.String()}, units: units, reload: "no"}
+	workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001)
+	if err != nil || len(workers) != 1 || workers[0].Unit.Name != "citadel-worker" {
+		t.Fatalf("stock units obscured worker: %+v %v", workers, err)
+	}
+}
+
+func TestWorkerCommandPrefixesAndContinuations(t *testing.T) {
+	for _, command := range []string{
+		"+/fixture/citadel work", "!/fixture/citadel work", "!!/fixture/citadel work", "-:+/fixture/citadel work",
+		"@/fixture/citadel alternate-argv0 work", "-@:/fixture/citadel alternate-argv0 work",
+		"/fixture/citadel \\\n # ignored comment during continuation\n ; another comment\n work",
+	} {
+		t.Run(command, func(t *testing.T) {
+			path, _, known := workerUnitIdentity("[Service]\nExecStart=" + command + "\n")
+			if !known || path != "/fixture/citadel" {
+				t.Fatalf("valid worker syntax lost: %q %t", path, known)
+			}
+		})
+	}
+	for _, content := range []string{
+		"[Service]\nExecStart=@/fixture/citadel work\n",
+		"[Service]\nExecStart=/fixture/citadel \\\n",
+		"[Service]\nUser=worker\nExecStart=+/fixture/citadel work\n",
+	} {
+		path, _, known := workerUnitIdentity(content)
+		if known && path != "" {
+			t.Fatalf("ambiguous worker account/invocation was accepted: %q", content)
+		}
+	}
+}
+
+func TestDiscoverActiveWorkersRefusesOpaquePlausibleWorker(t *testing.T) {
+	for _, command := range []string{"/bin/sh -c '/fixture/citadel work'", "/usr/bin/env MODE=fixture /fixture/citadel work", "/fixture/citadel --unknown work", "\"/fixture/citadel work", "%h/citadel work"} {
+		f := discoveryFixture{list: map[bool]string{false: "opaque.service loaded active running Fixture\n"}, units: map[string]string{"opaque.service": "[Service]\nExecStart=" + command + "\n"}, reload: "no"}
+		if workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001); err == nil || len(workers) != 0 {
+			t.Fatalf("plausible opaque worker hidden: %q %+v %v", command, workers, err)
+		}
+	}
+}
+
+func TestDiscoverActiveWorkersReportsMissingEitherManager(t *testing.T) {
+	for _, unavailableUser := range []bool{false, true} {
+		f := discoveryFixture{list: map[bool]string{!unavailableUser: "worker.service loaded active running Worker\n"}, units: map[string]string{"worker.service": "[Service]\nExecStart=/fixture/citadel work\n"}, reload: "no", listError: map[bool]bool{unavailableUser: true}}
+		workers, err := discoverActiveWorkersForUID(context.Background(), "/fixture/citadel", f.capture(t), fixtureCanonical, 9001)
+		if err == nil || len(workers) != 0 || !strings.Contains(err.Error(), "incomplete") {
+			t.Fatalf("unavailable manager was silently complete: %+v %v", workers, err)
+		}
+	}
+}
+
+func TestManagedRestartUsesVerifiedManagerEnvironment(t *testing.T) {
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/fixture/foreign-bus")
+	t.Setenv("XDG_RUNTIME_DIR", "/fixture/foreign-runtime")
+	for _, userMode := range []bool{false, true} {
+		uid, managerUID := 0, ""
+		if userMode {
+			uid, managerUID = 9001, "9001"
+		}
+		unit := ManagedUnit{Name: "worker", UserMode: userMode, ManagerUID: managerUID}
+		command, err := managedUnitRestartCommand(context.Background(), unit, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(command.Env, discoveryManagerEnvironment(userMode, uid)) {
+			t.Fatalf("restart bus differs from inspection: %q", command.Env)
+		}
+		want := append([]string{"systemctl"}, append(systemctlArgs(userMode), "restart", "worker")...)
+		if !reflect.DeepEqual(command.Args, want) {
+			t.Fatalf("restart arguments: %q", command.Args)
+		}
+	}
+	for _, unit := range []ManagedUnit{{Name: "worker"}, {Name: "worker", UserMode: true, ManagerUID: "8001"}, {Name: "../foreign", UserMode: true, ManagerUID: "9001"}} {
+		if command, err := managedUnitRestartCommand(context.Background(), unit, 9001); err == nil || command != nil {
+			t.Fatal("unverified restart target admitted")
+		}
+	}
+}
+
+func TestManagedRestartWiringUsesInspectedBusWithoutExecution(t *testing.T) {
+	original := runManagedRestartCommand
+	t.Cleanup(func() { runManagedRestartCommand = original })
+	calls := 0
+	cause := errors.New("fixture restart failure")
+	runManagedRestartCommand = func(command *exec.Cmd) error {
+		calls++
+		if !reflect.DeepEqual(command.Env, discoveryManagerEnvironment(true, os.Geteuid())) {
+			t.Fatalf("Restart inherited an unverified bus: %q", command.Env)
+		}
+		if !reflect.DeepEqual(command.Args, []string{"systemctl", "--user", "restart", "fixture-worker"}) {
+			t.Fatalf("wrong restart target: %q", command.Args)
+		}
+		return cause
+	}
+	unit := ManagedUnit{Name: "fixture-worker", UserMode: true, ManagerUID: fmt.Sprint(os.Geteuid())}
+	if err := unit.Restart(); !errors.Is(err, cause) || calls != 1 {
+		t.Fatalf("Restart did not propagate the inspected command outcome: %v %d", err, calls)
+	}
+	unit.ManagerUID = "changed"
+	if err := unit.Restart(); err == nil || calls != 1 {
+		t.Fatal("changed manager reached the runner")
+	}
+}
