@@ -3435,3 +3435,19 @@ Auto-generated log of every release.
   - fix(testing): isolate command host-state discovery before fixtures run
 
 
+---
+
+## v2.208.0 — 2026-11-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 20 |
+| Lines added | +2560 |
+
+**Changes:**
+
+  - fix(update): verify managed restarts and diagnose worker install layouts (#1491)
+  - docs: source-first Speakrail full-duplex voice proposal (#1376) (#1423)
+
+
