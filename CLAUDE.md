@@ -31,6 +31,13 @@ So, when adding to this file:
 
 ## Project Overview
 
+`mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
+descriptor acquisition: it checks a no-follow leaf pin before any readable
+leaf open, and fails closed if the verified procfs FD route is unavailable.
+`workspace_linux_test.go` covers ordering, replacement, refusal and cleanup
+using owned fixtures, not real devices. This does not settle owner/hard-link
+policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
+
 `service.RematerializeManagedUnits` owns the bounded base-file refresh and
 reload request, not worker restart or failed-unit counter recovery.
 `cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
@@ -55,6 +62,14 @@ validation separately from the HTTP node. Both worker entrypoints load once via
 public endpoints and only the exact built-in Ollama endpoint; other private
 targets require grants, and hard-denied ranges cannot be granted. See
 `docs/workflow-llm-policy.md` for operator configuration and transport limits.
+
+`reconstruct.Runner` is the trusted-operator engine, not a registered dispatched
+job. `publishDirectory` owns its create-only Linux bundle rename; unsupported
+publication primitives fail closed. The remaining workspace, SPZ, container
+custody and signed-event boundaries for #1381 are tracked in
+`docs/reconstruct-splat-job.md`; helper source or historical GPU acceptance
+does not prove those boundaries. `publish_linux_test.go` pins late collisions
+and competing publishers with synthetic fake executors.
 
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
@@ -547,6 +562,14 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`meetingcapacity.Capacity` owns the inactive #1505 meeting-intake custody
+model: one shared reservation, exact incarnation/job binding, uncertain-read
+quarantine and post-executor-exit resource confirmation. It has no wire or
+native adapters, and no current JobSource invokes it. Its fake intake proofs
+do not establish API/Redis/WS pre-claim admission or authorize activation.
+aceteam-ai/aceteam#12916 blocks the paired routing, old-reader exclusion and
+credit contract before transport wiring; the internal types are not wire fields.
+
 `jobs.NewMemoryGitHandler` owns the inactive memory-git construction contract:
 live permission, strict passcode State and the actual shared node throttle are
 required; legacy callbacks and zero-value construction cannot enable it.
@@ -648,6 +671,11 @@ delivery too (one error event, then Fail with the reason): SHELL_COMMAND, the
 desktop handlers, and WORKFLOW_RUN when its Shell gate refuses at submit. A
 Shell node refused mid-run fails the workflow as an ordinary failure.
 
+Files/Desktop permission refusals retain static tool names and enable/confirm
+hints, including the direct `FILE_WRITE_BYTES` classifier. `MEETING_JOIN` and
+`HUDDLE_JOIN` share one live meeting gate for dispatch and refusal; re-enabling
+joins does not rebuild handlers or remove exact-attempt huddle teardown.
+
 `workflow.Executor.Cancel` owns per-run context cancellation; a cancelled
 status records the request, not proof that a Shell process or callback exited.
 `Execution.Done` supplies executor/slot completion, which the workflow handler
@@ -738,6 +766,12 @@ finite floor can be proven safe against it, so this falls back to
 `StalePendingReclaimFloorFallback` (4h, deliberately kept in sync with
 `internal/redis`'s own construction-time default by
 `TestStalePendingReclaimFloorFallbackMatchesRedisDefault`).
+MEETING_JOIN has its own finite #1505 budget instead of the long tier, so the
+resolved floor is also never below `meetingReclaimFloor` (the largest valid
+meeting STUCK point plus the margin; `TestResolveStalePendingReclaimFloor`
+pins it). A redelivered MEETING_JOIN (delivery count above 1) is refused
+terminally rather than rejoined. Consequence: a crashed node's pending jobs
+now wait roughly 10.5h, not 4h10m, before a self-claim.
 
 With this in place: every job type with a BOUNDED per-job watchdog is
 always ACKed out of the PEL by its own watchdog abandon (routes to
@@ -807,8 +841,8 @@ builds -- `unboundedJobTypes`) that legitimately runs past the resolved
 floor on the SAME process it started on is still a self-owned candidate, so
 #999's fix does not change its self-claim eligibility: it is still reclaimed
 by its own still-alive process, and if it keeps running past roughly
-`(MaxAttempts-1) x floor` (~8h at today's defaults: `MaxAttempts` 3, floor
-~4h10m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
+`(MaxAttempts-1) x floor` (~21h at today's defaults: `MaxAttempts` 3, floor
+~10h30m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
 + `Ack`. That is NOT merely "re-dispatched" -- the message is permanently
 removed from the PEL and reported as a dead/failed job to the DLQ consumer,
 even though the original execution may still be legitimately in progress.
@@ -3416,6 +3450,10 @@ or invalidation hook. `deliverymetadata.Observation` stores its immutable record
 behind an opaque function: Go's nested bad-verb formatting can bypass Formatters
 and print secret-bearing private pointer fields. Its formatting/shape tests pin
 that boundary. These observations do not enable durable execution or ACKs.
+Authenticated HTTP-only durable claims, renewal, commit-before-publish and
+shutdown/refusal behavior are documented in
+[docs/durable-http-delivery.md](docs/durable-http-delivery.md). That source path
+remains inactive until the paired canary and activation gates are satisfied.
 
 `Runner.Run`'s fetch loop no longer conflates "claim a job" with "execute it"
 (this is what `processJob` used to do inline, blocking `source.Next()` for the
@@ -4013,6 +4051,22 @@ convenience with improved failure modes, not isolation.
 (which lives at the REAL machine's `network.GetNodeConfigDir()`, not the
 override) rather than caching an overridden node's identity into the real
 machine's cache file.
+
+### Meeting progress, denial and Stop (citadel-cli#1506, S4a)
+
+`jobs.MeetingJoinHandler.Capabilities` owns MEETING_JOIN's declaration: a
+cooperative (graceful) Stop and the progress stages in `meeting_progress.go`
+(joining, waiting_admission, admitted, ended with a closed-set `reason`,
+transcribing). The platform cancel marker therefore no longer hard-cancels a
+meeting. Every join, admission and recording loop polls `CancelRequestedNow`.
+A Stop before recording returns `errMeetingStopped` (wraps `context.Canceled`,
+reported as "Meeting cancelled"); a Stop while recording leaves the call, then
+backs up and transcribes, and the result is `status: stopped`, never
+`completed`. A Stop during setup waits for the setup phase to finish. Denial
+probes match explicit refusal wording only and run after the admitted probe
+fails, so an unknown page degrades to `admit_timeout`, never a false
+`denied`; the selectors are English-only and untuned live. Ctx cancellation
+(shutdown/deadline) remains the hard abort described below.
 
 ### Meeting-bot wait-loop cancellation (citadel#488, cancellation half)
 

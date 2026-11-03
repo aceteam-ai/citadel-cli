@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,6 +18,10 @@ import (
 // toggles, default opted-in, with a Control Center opt-out and a programmatic
 // path (APPLY_DEVICE_CONFIG) that writes this same persisted value.
 type Meeting struct {
+	// Safety contains optional canonical decimal second overrides. Missing keys
+	// use Jason's #1505 defaults; malformed or expanded limits refuse readiness.
+	Safety          meetingpolicy.Config `yaml:"safety,omitempty" json:"safety,omitempty"`
+	safetyReadError error
 	// MeetingEnabled gates the `meeting` capability. When true (and the node's
 	// audio/browser deps are present) the node advertises the `meeting` tag and
 	// registers the MEETING_JOIN handler. When false the node stays out of the
@@ -66,6 +71,16 @@ type Meeting struct {
 	// positive; the accessor clamps a non-positive persisted value to the
 	// default.
 	AudioRetentionDays int `yaml:"audio_retention_days" json:"audio_retention_days"`
+}
+
+func (m *Meeting) TimingProfile() (meetingpolicy.Profile, error) {
+	if m == nil {
+		return meetingpolicy.Config(nil).Resolve()
+	}
+	if m.safetyReadError != nil {
+		return meetingpolicy.Profile{}, m.safetyReadError
+	}
+	return m.Safety.Resolve()
 }
 
 // StreamingInterval returns the rolling-transcription cadence as a Duration,
@@ -139,12 +154,17 @@ func LoadMeeting(configDir string) *Meeting {
 
 	data, err := os.ReadFile(filepath.Join(configDir, meetingFile))
 	if err != nil {
+		if !os.IsNotExist(err) {
+			m.safetyReadError = fmt.Errorf("meeting timing configuration is unreadable")
+		}
 		return m
 	}
 
 	// yaml.Unmarshal only overwrites keys present in the file, so an absent
 	// key keeps its default (true) value.
-	_ = yaml.Unmarshal(data, m)
+	if err := yaml.Unmarshal(data, m); err != nil {
+		m.safetyReadError = fmt.Errorf("meeting timing configuration is malformed")
+	}
 	return m
 }
 
@@ -153,6 +173,12 @@ func LoadMeeting(configDir string) *Meeting {
 // flag, and the APPLY_DEVICE_CONFIG handler calls it when the platform pushes
 // an explicit value.
 func SaveMeeting(configDir string, m *Meeting) error {
+	if m == nil {
+		return fmt.Errorf("missing meeting configuration")
+	}
+	if _, err := m.Safety.Resolve(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}

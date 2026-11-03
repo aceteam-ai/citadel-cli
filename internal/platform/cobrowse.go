@@ -28,9 +28,7 @@ package platform
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -39,6 +37,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
 	"github.com/gorilla/websocket"
 )
 
@@ -737,11 +736,7 @@ func (m *CobrowseManager) Screenshot() (string, error) {
 // mirroring td_step.py's connect-act-disconnect model.
 // ---------------------------------------------------------------------------
 
-type cdpTarget struct {
-	Type                 string `json:"type"`
-	URL                  string `json:"url"`
-	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-}
+type cdpTarget = cdpdiscovery.Target
 
 // cdpHTTPClient bounds the CDP HTTP probe so a hung DevTools endpoint cannot
 // block the manager mutex (and thus every subsequent co-browse job) forever.
@@ -753,39 +748,21 @@ func pickTarget(debugPort int) (cdpTarget, error) {
 }
 
 func pickTargetContext(ctx context.Context, debugPort int) (cdpTarget, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json", debugPort), nil)
-	if err != nil {
-		return cdpTarget{}, err
-	}
-	resp, err := cdpHTTPClient.Do(req)
-	if err != nil {
-		return cdpTarget{}, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return cdpTarget{}, err
-	}
-	var targets []cdpTarget
-	if err := json.Unmarshal(body, &targets); err != nil {
-		return cdpTarget{}, err
-	}
-	for _, t := range targets {
-		if t.Type == "page" && t.WebSocketDebuggerURL != "" {
-			return t, nil
-		}
-	}
-	return cdpTarget{}, fmt.Errorf("no page target found on CDP port %d", debugPort)
+	return cdpdiscovery.Discover(ctx, debugPort, cdpHTTPClient)
 }
 
 // cdpCommand opens a WebSocket to the page target, sends one CDP method, and
 // returns the "result" object. id is fixed to 1 since the socket is per-call.
 func cdpCommand(debugPort int, method string, params map[string]any) (map[string]any, error) {
-	target, err := pickTarget(debugPort)
+	return cdpCommandContext(context.Background(), debugPort, method, params)
+}
+
+func cdpCommandContext(ctx context.Context, debugPort int, method string, params map[string]any) (map[string]any, error) {
+	target, err := pickTargetContext(ctx, debugPort)
 	if err != nil {
 		return nil, err
 	}
-	return cdpDialAndSend(target.WebSocketDebuggerURL, method, params)
+	return cdpDialAndSendContext(ctx, target.WebSocketDebuggerURL, method, params)
 }
 
 // cdpDialAndSend opens a WebSocket to wsURL, sends one CDP method, and returns

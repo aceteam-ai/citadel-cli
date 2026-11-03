@@ -104,6 +104,12 @@ func NewThrottledProgress(emit func(map[string]any), now func() time.Time) func(
 				m["eta_seconds"] = int(float64(projectedTotal-ev.Done) / rate)
 			}
 		}
+		if ev.Reason != "" {
+			m["reason"] = ev.Reason
+		}
+		if ev.NotifyOwner {
+			m["notify_owner"] = true
+		}
 		if len(ev.Counts) > 0 {
 			counts := make(map[string]any, len(ev.Counts))
 			for k, v := range ev.Counts {
