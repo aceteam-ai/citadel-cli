@@ -136,12 +136,8 @@ func TestCobrowseSessionActions_ResumeRestoresAIControl(t *testing.T) {
 	}
 }
 
-// TestCobrowseSessionActions_MarkAttachedRefusesWrites pins the #978 interop
-// rule's PRESENCE half: a viewer attaching (the #794 screencast hook,
-// MarkAttached) alone -- with NO separate explicit handoff call -- already
-// refuses agent-scripted writes, satisfying "an agent write must be refused
-// while a human is attached" literally.
-func TestCobrowseSessionActions_MarkAttachedRefusesWrites(t *testing.T) {
+// A viewer may observe without taking control or blocking agent actions.
+func TestCobrowseSessionActions_MarkAttachedAllowsAgentWrites(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -157,11 +153,14 @@ func TestCobrowseSessionActions_MarkAttachedRefusesWrites(t *testing.T) {
 	if got.State != SessionAttached {
 		t.Fatalf("expected attached state, got %q", got.State)
 	}
-	if got.Driver != DriverHuman {
-		t.Errorf("an attached viewer should report driver=human, got %q", got.Driver)
+	if got.Driver != DriverAI {
+		t.Errorf("an observing viewer should report driver=ai, got %q", got.Driver)
 	}
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Errorf("type while a viewer is attached: got %v, want ErrHandedOff", err)
+	if m.ViewerHasControl(st.ID) {
+		t.Error("observing viewer has input control")
+	}
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Errorf("type while observing was blocked: %v", err)
 	}
 }
 
@@ -181,8 +180,8 @@ func TestCobrowseSessionActions_DetachWithoutExplicitHandoffRestoresAIControl(t 
 		t.Fatalf("start: %v", err)
 	}
 	m.MarkAttached(st.ID)
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Fatalf("type while attached: got %v, want ErrHandedOff", err)
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Fatalf("type while observing was blocked: %v", err)
 	}
 
 	if !m.MarkDetached(st.ID) {
@@ -243,11 +242,8 @@ func TestCobrowseSessionActions_ExplicitHandoffSurvivesDetach(t *testing.T) {
 	}
 }
 
-// TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused
-// checks resume only releases the EXPLICIT bit: while a viewer is STILL
-// attached, resume succeeds (idempotent, no error) but writes remain refused
-// until that viewer also detaches -- resume does not evict a live viewer.
-func TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused(t *testing.T) {
+// Resume restores the agent and revokes viewer input with the tab still open.
+func TestCobrowseSessionActions_ResumeWhileStillAttachedRestoresAgent(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -257,21 +253,29 @@ func TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused(t *te
 		t.Fatalf("start: %v", err)
 	}
 	m.MarkAttached(st.ID)
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatalf("handoff: %v", err)
+	}
+	if !m.ViewerHasControl(st.ID) {
+		t.Fatal("viewer should have control after explicit handoff")
+	}
 	resumed, err := m.Resume(st.ID)
 	if err != nil {
 		t.Fatalf("resume while attached should succeed (idempotent): %v", err)
 	}
-	if resumed.Driver != DriverHuman {
-		t.Errorf("driver while a viewer is still attached = %q, want %q (resume does not evict a viewer)", resumed.Driver, DriverHuman)
+	if resumed.Driver != DriverAI {
+		t.Errorf("driver after resume with viewer attached = %q, want %q", resumed.Driver, DriverAI)
 	}
 	if resumed.State != SessionAttached {
 		t.Errorf("resume must not change the attach/view state, got %q", resumed.State)
 	}
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Errorf("type while still attached (post-resume): got %v, want ErrHandedOff", err)
+	if m.ViewerHasControl(st.ID) {
+		t.Error("viewer retained input control after resume")
+	}
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Errorf("type after resume was blocked: %v", err)
 	}
 
-	// Detaching the viewer is what finally allows writes again.
 	m.MarkDetached(st.ID)
 	got, _ := m.SessionStatus(st.ID)
 	if got.Driver != DriverAI {

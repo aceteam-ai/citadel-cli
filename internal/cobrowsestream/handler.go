@@ -137,7 +137,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if mt == websocket.TextMessage {
-				if m, ok := parseInputMessage(data); ok {
+				if m, ok := parseInputMessage(data); ok && s.session.ViewerHasControl(id) {
 					s.dispatchInput(cdp, m)
 				}
 			}

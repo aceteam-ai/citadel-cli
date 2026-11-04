@@ -1,53 +1,8 @@
-// internal/platform/cobrowse_session_actions.go
-//
-// Session-scoped CDP actions (issue #978): navigate / screenshot / click / type /
-// extract, plus per-session driver arbitration (handoff / resume), addressed by
-// session_id against the multi-session CobrowseSessionManager (cobrowse_session.go).
-//
-// This mirrors the singleton CobrowseManager's action set (cobrowse.go) rather than
-// reinventing CDP interaction: navigate uses the same Page.navigate call, screenshot
-// the same Page.captureScreenshot + base64 validation, and the driver-arbitration
-// refusal reuses the exact same ErrHandedOff / ErrNotStarted sentinels and the same
-// "refuse read-only actions too, not just writes" rule the singleton's Screenshot
-// already enforces. click/type/extract have no singleton analog (the old COBROWSE job
-// never grew them) and are new here, built on the same connect-act-disconnect
-// cdpCommand/cdpDialAndSend plumbing (cobrowse.go) plus Runtime.evaluate for
-// selector-based DOM interaction.
-//
-// Design choice, stated explicitly because the issue's own text guessed the opposite:
-// screenshot and extract are READ-ONLY but are still refused while a human is
-// attached, exactly like navigate/click/type. This mirrors the singleton's actual
-// behavior (CobrowseManager.Screenshot refuses ErrHandedOff, not just Navigate) --
-// not the issue text's "likely allowed during attach" guess, which turned out to be
-// wrong once the singleton's code was read. A CDP round trip into a live page a human
-// is driving is not a passive read from the human's point of view, so extract is held
-// to the same rule for consistency.
-//
-// Driver arbitration is TWO independent bits, not one flag flipped by both halves of
-// the interop pair:
-//   - state == SessionAttached: a viewer is CURRENTLY connected (the #794 screencast
-//     hook's MarkAttached/MarkDetached calls; server.go documents these as a
-//     symmetric presence pair tied to the WebSocket connection's lifetime, and
-//     cobrowsestream/handler.go calls them as `MarkAttached; defer MarkDetached`).
-//     This bit is ephemeral: it clears itself the moment the viewer disconnects, with
-//     NO change to cobrowse_session.go's setAttached (byte-identical to before #978).
-//   - explicitHandoff: set by the `handoff` action, cleared by `resume`. This bit is
-//     STICKY across a transient viewer disconnect -- the mid-2FA case: a network blip
-//     dropping the viewer's WebSocket must not silently resume agent scripting on a
-//     session the human explicitly claimed.
-//
-// humanDrivingLocked ORs them: an agent-scripted action is refused if EITHER a viewer
-// is attached right now OR an explicit handoff is outstanding. This is why merely
-// attaching (a passive watch-along) already satisfies "an agent write must be refused
-// while a human is attached" and "a human can grab a live scripted session mid-run and
-// hand it back" -- attach blocks, detach un-blocks -- with `handoff`/`resume` as the
-// separate, sticky mechanism for a hold that must survive a reconnect. Collapsing
-// these into one flag (making MarkAttached itself set a persistent "human driver" flag
-// that only an explicit resume could clear) was tried and reverted: it would make ANY
-// viewer connection -- including a passive watch-along with no intent to drive --
-// permanently kill agent scripting until someone remembered to call `resume`, and the
-// #8131/#8133 agents have no way to observe a viewer disconnect to know when that is
-// safe.
+// Session-scoped CDP actions and driver arbitration for co-browse sessions.
+// An attached viewer observes the browser without stopping agent actions.
+// Explicit handoff gives the human control and blocks all agent CDP actions,
+// including screenshot and extract. Resume returns control to the agent while
+// the viewer remains attached. The handoff survives a viewer disconnect.
 package platform
 
 import (
@@ -68,11 +23,24 @@ type ExtractResult struct {
 	Attrs map[string]string `json:"attrs,omitempty"`
 }
 
-// humanDrivingLocked reports whether the session's driver-arbitration state
-// currently blocks agent-scripted actions -- see the package doc comment above
-// for why this is two bits ORed together rather than one flag. Caller holds s.mu.
+// humanDrivingLocked reports whether a human explicitly took control. A viewer
+// may observe a live session without blocking the agent. Caller holds s.mu.
 func (s *cobrowseSession) humanDrivingLocked() bool {
-	return s.explicitHandoff || s.state == SessionAttached
+	return s.explicitHandoff
+}
+
+// ViewerHasControl gates input arriving over the stream. The check is repeated
+// for every input message so handback takes effect with the viewer still open.
+func (m *CobrowseSessionManager) ViewerHasControl(id string) bool {
+	m.mu.Lock()
+	s := m.sessions[id]
+	m.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state == SessionAttached && s.explicitHandoff
 }
 
 // driverFor projects humanDrivingLocked's bool onto the reported CobrowseDriver
@@ -253,12 +221,8 @@ func (m *CobrowseSessionManager) Handoff(id string) (CobrowseSessionStatus, erro
 	return s.status(), nil
 }
 
-// Resume clears one session's sticky explicit-handoff bit. Idempotent. Note
-// this does NOT by itself guarantee agent-scripted actions are allowed
-// afterward: if a viewer is STILL attached (state == SessionAttached),
-// humanDrivingLocked remains true on that bit alone and writes stay refused
-// until the viewer disconnects too -- resume only releases an explicit claim,
-// it does not evict a live viewer. Mirrors CobrowseManager.Resume.
+// Resume clears the explicit handoff and restores agent actions even when a
+// viewer remains attached. The viewer can continue observing. Idempotent.
 func (m *CobrowseSessionManager) Resume(id string) (CobrowseSessionStatus, error) {
 	s, err := m.sessionForAction(id)
 	if err != nil {
