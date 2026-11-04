@@ -4648,7 +4648,10 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 
 ### GPU Support Notes
 
-**Linux**: Full NVIDIA GPU support via NVIDIA Container Toolkit. Compose files use `driver: nvidia` specification.
+**Linux**: `platform.NvidiaGPUCountForCompose` owns the bounded tri-state observation.
+`services.SelectComposeForHost` chooses the supported CPU variant only on proven
+NVIDIA absence; unknown evidence preserves an existing flavor. `services.ComposeMapForRefresh`
+withholds uncertain variants from boot refresh. See `docs/cpu-compose-selection.md`.
 
 **macOS — no GPU in containers, and the nvidia reservation is NOT ignored (citadel-cli#1048, corrects a stale claim this section made).**
 Docker Desktop for macOS exposes **no GPU to Linux containers** at all — Metal is not passed through to the Linux VM, and there is no nvidia device driver, on Apple Silicon or Intel. The previous claim here ("Metal GPU support in containers", "`driver: nvidia` is ignored", "services still run") was wrong on all three counts: Docker Compose v2 honors `deploy.resources.reservations.devices` outside swarm, so a mandatory `driver: nvidia` reservation makes `docker compose up` **fail container creation** with `could not select device driver "nvidia" with capabilities: [[gpu]]`.
