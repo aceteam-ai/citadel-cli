@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
@@ -615,7 +616,8 @@ func containsTag(tags []string, tag string) bool {
 }
 
 // ensureComposeFile ensures the compose file exists in the services directory.
-// If it doesn't exist, it extracts the embedded compose file from the binary.
+// If absent, it extracts the host-selected embedded compose. On Linux, known
+// Ollama/llama.cpp templates also track CPU/GPU changes on subsequent starts.
 //
 // citadel#860: under an active --node-dir/CITADEL_NODE_DIR override, the
 // materialized file's `container_name: citadel-<serviceName>` line is
@@ -627,8 +629,19 @@ func containsTag(tags []string, tag string) bool {
 // why the "file already exists, leave it alone" fast path below cannot skip
 // it.
 func ensureComposeFile(configDir, serviceName string) error {
+	return ensureComposeFileForHost(configDir, serviceName, runtime.GOOS, platform.GetGPUCountSimple)
+}
+
+func ensureComposeFileForHost(configDir, serviceName, goos string, gpuCount func() int) error {
 	servicesDir := filepath.Join(configDir, "services")
 	destPath := filepath.Join(servicesDir, serviceName+".yml")
+
+	content, embedded := services.ComposeForHost(serviceName, goos, gpuCount)
+	if embedded && goos == "linux" {
+		if _, err := compose.ReconcileCPUComposeOnDisk(destPath, serviceName, content, resolveNodeDirOverride()); err != nil {
+			return fmt.Errorf("reconcile host compose for %q: %w", serviceName, err)
+		}
+	}
 
 	// Check if file already exists
 	if _, err := os.Stat(destPath); err == nil {
@@ -652,8 +665,7 @@ func ensureComposeFile(configDir, serviceName string) error {
 	}
 
 	// Get content from embedded services
-	content, ok := services.ServiceMap[serviceName]
-	if !ok {
+	if !embedded {
 		return fmt.Errorf("unknown service: %s", serviceName)
 	}
 
@@ -764,4 +776,16 @@ func healStaleGPUReservationOnDisk(destPath, serviceName string) error {
 		return fmt.Errorf("heal stale GPU reservation for %q: %w", serviceName, err)
 	}
 	return nil
+}
+
+// reconcileHostComposeForStart covers existing manifest/module start paths.
+// It never creates files or changes a custom compose path.
+func reconcileHostComposeForStart(name, path string, gpuCount func() int) error {
+	if runtime.GOOS != "linux" || !services.HasCPUComposeVariant(name) ||
+		filepath.Base(path) != name+".yml" || filepath.Base(filepath.Dir(path)) != "services" {
+		return nil
+	}
+	content, _ := services.ComposeForHost(name, runtime.GOOS, gpuCount)
+	_, err := compose.ReconcileCPUComposeOnDisk(path, name, content, resolveNodeDirOverride())
+	return err
 }

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -95,6 +96,9 @@ type manifestService struct {
 type ServiceHandler struct {
 	// ConfigDir is the absolute path to the directory containing citadel.yaml.
 	ConfigDir string
+	// gpuCount overrides host GPU detection for compose materialization tests.
+	// Production uses platform.GetGPUCountSimple when this is nil.
+	gpuCount func() int
 	// WorkspaceDir is the absolute node workspace root. It is exported to
 	// docker compose as CITADEL_WORKSPACE so compose files that bind-mount the
 	// workspace (e.g. the transcribe sidecar) resolve to an absolute path even
@@ -471,6 +475,9 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// See maybeAdoptExternalEngine / adoptedExternalEngine.
 		if out, adopted := h.maybeAdoptExternalEngine(ctx, svc, model, kind); adopted {
 			return out, nil
+		}
+		if err := h.prepareEmbeddedComposeForStart(svc); err != nil {
+			return nil, err
 		}
 		modelChanged := false
 		if model != "" {
@@ -1594,8 +1601,26 @@ func (h *ServiceHandler) materializeEmbeddedService(name string) (manifestServic
 	return svc, nil
 }
 
+// prepareEmbeddedComposeForStart covers services already present in a manifest.
+// Only the canonical embedded path participates; custom compose paths remain
+// operator-owned. Native and adopted external engines bypass this docker step.
+func (h *ServiceHandler) prepareEmbeddedComposeForStart(svc manifestService) error {
+	if runtime.GOOS != "linux" || !embeddedservices.HasCPUComposeVariant(svc.Name) {
+		return nil
+	}
+	path, err := h.resolveComposePath(svc)
+	if err != nil {
+		return err
+	}
+	if path != filepath.Join(h.ConfigDir, "services", svc.Name+".yml") {
+		return nil
+	}
+	return h.ensureEmbeddedComposeFile(svc.Name)
+}
+
 // ensureEmbeddedComposeFile writes the embedded compose file for name into
-// ConfigDir/services/<name>.yml if it does not already exist. Mirrors
+// ConfigDir/services/<name>.yml, reconciling the CPU/GPU flavor of known Linux
+// Ollama/llama.cpp files even when they already exist. Mirrors
 // cmd.ensureComposeFile (kept here to avoid a jobs -> cmd import).
 //
 // citadel#860: under an active CITADEL_NODE_DIR override, the materialized
@@ -1617,13 +1642,22 @@ func (h *ServiceHandler) materializeEmbeddedService(name string) (manifestServic
 // cmd/work.go). This check is a defensive mirror of cmd.ensureComposeFile
 // for when/if that refusal is ever narrowed to something override-compatible.
 func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
-	content, ok := embeddedservices.ServiceMap[name]
+	gpuCount := h.gpuCount
+	if gpuCount == nil {
+		gpuCount = platform.GetGPUCountSimple
+	}
+	content, ok := embeddedservices.ComposeForHost(name, runtime.GOOS, gpuCount)
 	if !ok {
 		return fmt.Errorf("unknown embedded service: %s", name)
 	}
 	servicesDir := filepath.Join(h.ConfigDir, "services")
 	destPath := filepath.Join(servicesDir, name+".yml")
 	override := strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR"))
+	if runtime.GOOS == "linux" {
+		if _, err := compose.ReconcileCPUComposeOnDisk(destPath, name, content, override); err != nil {
+			return fmt.Errorf("reconcile host compose for %q: %w", name, err)
+		}
+	}
 	if _, err := os.Stat(destPath); err == nil {
 		// citadel-cli#1069: on darwin, heal a stale embedded-engine compose that
 		// still carries the pre-#1064 nvidia GPU reservation the current darwin
