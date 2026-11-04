@@ -46,6 +46,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // defaultNotifyPath is the assumed backend route (see package doc / aceteam#4219).
@@ -123,7 +125,7 @@ func NewClient(cfg Config) *Client {
 	}
 	hc := cfg.HTTPClient
 	if hc == nil {
-		hc = &http.Client{Timeout: 15 * time.Second}
+		hc = &http.Client{Timeout: 15 * time.Second, Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{})}
 	}
 	return &Client{
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),

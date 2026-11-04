@@ -4,6 +4,7 @@ package nodevault
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -41,6 +42,9 @@ func TestLockoutStatusRefusesUnsafeExistingSidecarWithoutRepair(t *testing.T) {
 			}
 			if status := l.Status(); !status.Unavailable {
 				t.Fatalf("unsafe %s sidecar reported healthy", kind)
+			}
+			if err := l.ResetIfPresent(); !errors.Is(err, ErrLockoutUnavailable) {
+				t.Fatalf("absent-state reset reported success with unsafe %s sidecar", kind)
 			}
 			after, err := os.Lstat(path)
 			if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {

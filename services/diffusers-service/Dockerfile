@@ -34,6 +34,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py /app/app.py
 COPY image_models.py /app/image_models.py
 COPY image_swap.py /app/image_swap.py
+COPY load_diagnostics.py /app/load_diagnostics.py
 COPY model_preflight.py /app/model_preflight.py
 
 # 7860 is the diffusers contract port (aceteam #4468). The node compose file

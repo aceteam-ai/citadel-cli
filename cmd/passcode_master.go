@@ -339,7 +339,16 @@ func runPasscodeStatus(cmd *cobra.Command, args []string) error {
 // legacy node passcode).
 func printLockoutStatus(lo nodevault.LockoutStatus) {
 	if lo.Unavailable {
-		fmt.Println("Lockout: UNAVAILABLE. Passcode checks are denied. Local 'citadel passcode reset-lockout' can recover unreadable state, not an unusable lock sidecar; inspect node-local ownership and permissions. Never remove a live lock sidecar.")
+		switch lo.UnavailableReason {
+		case nodevault.LockoutStateUnavailable:
+			fmt.Println("Lockout: UNAVAILABLE (state). Passcode checks are denied. Local 'citadel passcode reset-lockout' can replace unreadable or corrupt history if the lock sidecar is usable. Never remove a live lock sidecar.")
+		case nodevault.LockoutSidecarUnavailable:
+			fmt.Println("Lockout: UNAVAILABLE (lock sidecar). Passcode checks are denied. 'citadel passcode reset-lockout' cannot recover an unusable lock sidecar; inspect node-local ownership and permissions with all participating processes stopped. Never remove a live lock sidecar.")
+		case nodevault.LockoutBackendUnavailable:
+			fmt.Println("Lockout: UNAVAILABLE (unsupported backend). Passcode checks are denied. This platform cannot provide the required lockout transaction. 'citadel passcode reset-lockout' cannot recover an unsupported backend. Never remove a live lock sidecar.")
+		default:
+			fmt.Println("Lockout: UNAVAILABLE. Passcode checks are denied. Local 'citadel passcode reset-lockout' can recover unreadable state, not an unusable lock sidecar; inspect node-local ownership and permissions. Never remove a live lock sidecar.")
+		}
 	} else if lo.LockedOut {
 		fmt.Printf("Lockout: ACTIVE until %s (%d failed attempts). Run 'citadel passcode reset-lockout' at the node to clear it.\n", lo.LockoutUntil.Format("15:04:05"), lo.FailedAttempts)
 	} else if lo.FailedAttempts > 0 {
@@ -362,12 +371,14 @@ func runPasscodeResetLockout(cmd *cobra.Command, args []string) error {
 // not exist is left absent rather than created.
 func resetPasscodeLockoutAt(nodeConfigDir string) error {
 	v := nodevault.Open(nodeConfigDir)
-	for _, l := range []*nodevault.Lockout{v.Lockout(), v.LegacyPasscodeLockout()} {
-		if err := l.ResetIfPresent(); err != nil {
-			return fmt.Errorf("reset passcode lockout: %w", err)
-		}
+	var masterErr, legacyErr error
+	if err := v.Lockout().ResetIfPresent(); err != nil {
+		masterErr = fmt.Errorf("reset master passcode lockout: %w", err)
 	}
-	return nil
+	if err := v.LegacyPasscodeLockout().ResetIfPresent(); err != nil {
+		legacyErr = fmt.Errorf("reset legacy passcode lockout: %w", err)
+	}
+	return errors.Join(masterErr, legacyErr)
 }
 
 // printBadgeLine reports the entropy-gated end-to-end-encryption badge honestly.

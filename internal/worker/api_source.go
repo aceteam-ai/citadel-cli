@@ -3,10 +3,12 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
@@ -14,6 +16,7 @@ import (
 // This is the secure alternative to direct Redis connections.
 // Supports consuming from multiple queues by round-robining across them.
 type APISource struct {
+	deliveryRefusals
 	client *redisapi.Client
 	config APISourceConfig
 
@@ -27,7 +30,9 @@ type APISource struct {
 	// wake, when set (via EnableWake), makes Next return immediately on a
 	// per-node Pub/Sub nudge delivered over the WebSocket, instead of waiting out
 	// the HTTP consume block (issue #7270). Nil for the normal poll-only path.
-	wake *wakePump
+	wake       *wakePump
+	deliveries map[*durableDelivery]struct{}
+	closed     bool
 }
 
 // apiWakeDrainBlockMs is the (short) block used for the wake-triggered drain in
@@ -71,7 +76,8 @@ type APISourceConfig struct {
 	MaxAttempts int
 
 	// DebugFunc is an optional callback for debug logging
-	DebugFunc func(format string, args ...any)
+	DebugFunc        func(format string, args ...any)
+	PlatformObserver platformhttp.Observer
 
 	// LogFn is an optional callback for logging (if nil, prints to stdout)
 	LogFn func(level, msg string)
@@ -136,13 +142,15 @@ func (s *APISource) Connect(ctx context.Context) error {
 	}
 
 	client := redisapi.NewClient(redisapi.ClientConfig{
-		BaseURL:   s.config.BaseURL,
-		Token:     s.config.Token,
-		DebugFunc: s.config.DebugFunc,
+		BaseURL:          s.config.BaseURL,
+		Token:            s.config.Token,
+		DebugFunc:        s.config.DebugFunc,
+		PlatformObserver: s.config.PlatformObserver,
 	})
 
 	// Verify connection before retaining the client.
 	if err := client.Ping(ctx); err != nil {
+		_ = client.Close()
 		return fmt.Errorf("failed to connect to Redis API: %w", err)
 	}
 	s.client = client
@@ -257,6 +265,10 @@ func (s *APISource) nextSingle(ctx context.Context, queue string, blockMs int) (
 		Count:    1,
 		BlockMs:  blockMs,
 	})
+	if errors.Is(err, redisapi.ErrDurableDelivery) {
+		s.record(s.log)
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to consume job from API: %w", err)
 	}
@@ -265,9 +277,12 @@ func (s *APISource) nextSingle(ctx context.Context, queue string, blockMs int) (
 		return nil, nil
 	}
 
-	job := s.convertJob(apiJob)
-	job.SourceQueue = queue
-	return job, nil
+	job, err := s.adoptDelivery(ctx, apiJob, queue)
+	if errors.Is(err, redisapi.ErrDurableDelivery) {
+		s.record(s.log)
+		return nil, nil
+	}
+	return job, err
 }
 
 // Block-timeout tuning for the multi-queue rotation. Deliberately fixed: there
@@ -379,6 +394,12 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 			Count:    1,
 			BlockMs:  blockMs,
 		})
+		if errors.Is(err, redisapi.ErrDurableDelivery) {
+			s.record(s.log)
+			succeeded[queue] = struct{}{}
+			delete(failed, queue)
+			return nil, false
+		}
 		if err != nil {
 			// Skip this queue so one rejected queue can't block the others.
 			// We deliberately do NOT log per-queue here: a transient consume
@@ -397,8 +418,17 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 		if apiJob == nil {
 			return nil, false
 		}
-		job := s.convertJob(apiJob)
-		job.SourceQueue = queue
+		job, adoptErr := s.adoptDelivery(ctx, apiJob, queue)
+		if errors.Is(adoptErr, redisapi.ErrDurableDelivery) {
+			s.record(s.log)
+			return nil, false
+		}
+		if adoptErr != nil {
+			delete(succeeded, queue)
+			failed[queue] = struct{}{}
+			lastErr, lastQueue = adoptErr, queue
+			return nil, false
+		}
 		return job, true
 	}
 
@@ -463,6 +493,9 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 
 // Ack acknowledges successful job completion.
 func (s *APISource) Ack(ctx context.Context, job *Job) error {
+	if job.delivery != nil {
+		return job.delivery().finish(ctx, nil, "")
+	}
 	s.client.SetJobStatus(ctx, job.ID, "completed", nil)
 	queue := job.SourceQueue
 	if queue == "" {
@@ -480,6 +513,10 @@ func (s *APISource) Ack(ctx context.Context, job *Job) error {
 // Nack indicates job failure.
 // For the API, this updates status but does NOT ACK - allowing retry.
 func (s *APISource) Nack(ctx context.Context, job *Job, err error) error {
+	if job.delivery != nil {
+		job.delivery().stop()
+		return nil
+	}
 	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
 	// Don't ACK - let it retry
 	return nil
@@ -490,6 +527,10 @@ func (s *APISource) DeferHuddleTeardown(ctx context.Context, job *Job, err error
 }
 
 func (s *APISource) AckHuddleCoordinatorTerminal(ctx context.Context, job *Job) error {
+	if job.delivery != nil {
+		job.delivery().stop()
+		return redisapi.ErrDurableDelivery
+	}
 	queue := job.SourceQueue
 	if queue == "" {
 		if qs := s.snapshotQueues(); len(qs) > 0 {
@@ -502,6 +543,10 @@ func (s *APISource) AckHuddleCoordinatorTerminal(ctx context.Context, job *Job) 
 }
 
 func (s *APISource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err error) error {
+	if job.delivery != nil {
+		job.delivery().stop()
+		return redisapi.ErrDurableDelivery
+	}
 	if statusErr := s.client.SetJobStatus(ctx, job.ID, "retry", map[string]any{
 		"reason": "huddle_terminal_intent_pending",
 		"error":  err.Error(),
@@ -523,6 +568,18 @@ func (s *APISource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err
 // ACK the message so it is removed from the consumer group's PEL. Used for
 // failures that will never succeed on retry (e.g. an unsupported job type).
 func (s *APISource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
+	if job.delivery != nil {
+		code, _ := data["reason"].(string)
+		if code == "" {
+			for _, key := range []string{"deadline_exceeded", "unsupported_job_type", "fine_tune_preemption_unconfirmed", "terminal_failure"} {
+				if present, _ := data[key].(bool); present {
+					code = key
+					break
+				}
+			}
+		}
+		return job.delivery().finish(ctx, err, code)
+	}
 	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 	queue := job.SourceQueue
@@ -540,6 +597,16 @@ func (s *APISource) Fail(ctx context.Context, job *Job, err error, data map[stri
 
 // Close cleanly disconnects from the API.
 func (s *APISource) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	var deliveries []*durableDelivery
+	for d := range s.deliveries {
+		deliveries = append(deliveries, d)
+	}
+	s.mu.Unlock()
+	for _, d := range deliveries {
+		d.stop()
+	}
 	if s.client != nil {
 		return s.client.Close()
 	}
@@ -604,3 +671,43 @@ func (s *APISource) IsJobCancelled(ctx context.Context, jobID string) bool {
 
 // Ensure APISource implements JobSource
 var _ JobSource = (*APISource)(nil)
+
+// adoptDelivery is the only execution-authority boundary. A v1 entry without
+// an original HTTP candidate is refused, never downgraded to legacy handling.
+func (s *APISource) adoptDelivery(ctx context.Context, apiJob *redisapi.Job, queue string) (*Job, error) {
+	job := s.convertJob(apiJob)
+	job.SourceQueue = queue
+	if !apiJob.HasDurableMetadata() {
+		return job, nil
+	}
+	claim := apiJob.ClaimedDelivery()
+	// Worker control needs restart persistence; huddle terminals are currently
+	// coordinator-owned and bypass StreamWriter. A meeting join must never be
+	// redelivered (#1505: no automatic rejoin), but v1 lapses and Nacks on
+	// shutdown and carries no delivery count the rejoin guard can read. None
+	// may silently use v1.
+	if claim == nil || job.Type == JobTypeWorkerControl || job.Type == JobTypeHuddleJoin || job.Type == JobTypeMeetingJoin {
+		return nil, redisapi.ErrDurableDelivery
+	}
+	// Install source ownership BEFORE starting the loop, so Close cannot miss it.
+	// The first renewal is synchronous and still uses the consume context.
+	d := newDurableDelivery(s.client, claim)
+	d.onStop = func() { s.mu.Lock(); delete(s.deliveries, d); s.mu.Unlock() }
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		d.stop()
+		return nil, redisapi.ErrDurableDelivery
+	}
+	if s.deliveries == nil {
+		s.deliveries = make(map[*durableDelivery]struct{})
+	}
+	s.deliveries[d] = struct{}{}
+	s.mu.Unlock()
+	if err := d.renew(ctx); err != nil {
+		return nil, err
+	}
+	job.delivery = func() *durableDelivery { return d }
+	go d.keepAlive()
+	return job, nil
+}

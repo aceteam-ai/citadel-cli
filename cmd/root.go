@@ -114,6 +114,10 @@ control center. All other subcommands are for scripting and advanced use.`,
 		if cmd.CommandPath() == "citadel stream eval" {
 			return
 		}
+		if cmd.CommandPath() == "citadel session attach" {
+			// Explicit read-only viewing skips mutating agent startup only.
+			return
+		}
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr FIRST,
 		// before any Log()/Debug() call in this function -- including
@@ -275,14 +279,16 @@ func checkForUpdateOnStartup(silent bool) {
 			client := update.NewClientWithTimeout(Version, 5*time.Second)
 			release, err := client.CheckForUpdate()
 
-			// Update state regardless of result
-			update.UpdateLastCheck(state)
-			if err == nil && release != nil {
-				state.AvailableUpdate = release.TagName
-			} else if err == nil {
-				state.AvailableUpdate = "" // Clear if on latest
-			}
-			_ = update.SaveState(state)
+			// Re-read under the cross-process transaction after the network call;
+			// a preference may have changed while the check was in flight.
+			_ = update.MutateState(func(state *update.State) {
+				update.UpdateLastCheck(state)
+				if err == nil && release != nil {
+					state.AvailableUpdate = release.TagName
+				} else if err == nil {
+					state.AvailableUpdate = ""
+				}
+			})
 		}()
 	}
 }

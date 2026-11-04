@@ -8,6 +8,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
 	"os"
+	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -16,6 +17,16 @@ import (
 
 // A map to hold all our registered job handlers.
 var jobHandlers map[string]jobs.JobHandler
+
+var diagnosticJobHandlersOnce sync.Once
+
+// Path and permission discovery must happen at command execution, never during
+// package initialization (which runs before tests can select fixture paths).
+func ensureDiagnosticJobHandlers() {
+	diagnosticJobHandlersOnce.Do(func() {
+		jobHandlers = buildDiagnosticJobHandlers(loadNodePermissions().Shell, jobs.IndexesDirFor(network.GetNodeConfigDir()))
+	})
+}
 
 // nodePasscodeVerifier verifies a presented passcode against the node's persisted
 // bcrypt passcode (aceteam#6524). It reloads permissions on every call so a
@@ -133,6 +144,7 @@ func nodeFilesEnabled() bool {
 
 // executeJob finds the right handler and runs a job.
 func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
+	ensureDiagnosticJobHandlers()
 	var output []byte
 	var err error
 	var status string
@@ -170,13 +182,15 @@ func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 	return status, err
 }
 
-func init() {
+// buildDiagnosticJobHandlers only constructs handlers from explicit inputs.
+// Runtime permission/passcode callbacks still reload current policy per job.
+func buildDiagnosticJobHandlers(shellEnabled bool, indexesDir string) map[string]jobs.JobHandler {
 	// Honor the same default-deny kill-switch as the worker path: SHELL_COMMAND
 	// is refused unless the node has explicitly opted in via the persisted
 	// `shell` permission. Without this the legacy Nexus/diagnostic path would
 	// run commands as root regardless of the permission (aceteam #6149, Phase 0).
 	shellHandler := jobs.NewShellCommandHandler("")
-	shellHandler.Disabled = !loadNodePermissions().Shell
+	shellHandler.Disabled = !shellEnabled
 	shellHandler.Enabled = nodeShellEnabled
 	// Even on this legacy Nexus/diagnostic path an enabled shell is passcode-gated
 	// (aceteam#6524): executeJob polls remote jobs and reports back, so leaving the
@@ -189,14 +203,13 @@ func init() {
 	// Per-org index namespaces (aceteam#10876 C2): point the FILE_INDEX /
 	// FILE_SEMANTIC_SEARCH handlers at the machine-convergent indexes dir so a
 	// payload `index` namespace resolves here too, not just on the worker path.
-	indexesDir := jobs.IndexesDirFor(network.GetNodeConfigDir())
 	fileIndexHandler := jobs.NewFileIndexHandler("", "")
 	fileIndexHandler.IndexesDir = indexesDir
 	fileSemanticSearchHandler := jobs.NewFileSemanticSearchHandler("", "")
 	fileSemanticSearchHandler.IndexesDir = indexesDir
 
 	// Register all job handlers for test command
-	jobHandlers = map[string]jobs.JobHandler{
+	return map[string]jobs.JobHandler{
 		"SHELL_COMMAND":        shellHandler,
 		"TMUX_SESSION":         jobs.NewTmuxSessionHandler(""),
 		"DOWNLOAD_MODEL":       &jobs.DownloadModelHandler{},

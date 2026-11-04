@@ -133,13 +133,16 @@ func (l *Lockout) Attempt(check func() bool) error {
 // Status returns a read-only availability/state snapshot, not a guarantee of
 // future transaction success or a check for current advisory-lock contention.
 func (l *Lockout) Status() LockoutStatus {
+	if !lockoutStatusSupported {
+		return LockoutStatus{Unavailable: true, UnavailableReason: LockoutBackendUnavailable}
+	}
 	if err := inspectLockoutSidecar(l.path + ".lock"); err != nil {
-		return LockoutStatus{Unavailable: true}
+		return LockoutStatus{Unavailable: true, UnavailableReason: LockoutSidecarUnavailable}
 	}
 	now := time.Now()
 	s, err := loadLockoutAt(l.path, now)
 	if err != nil {
-		return LockoutStatus{Unavailable: true}
+		return LockoutStatus{Unavailable: true, UnavailableReason: LockoutStateUnavailable}
 	}
 	return LockoutStatus{
 		FailedAttempts: s.FailedAttempts,
@@ -170,11 +173,13 @@ func (l *Lockout) Reset() error {
 }
 
 // ResetIfPresent is Reset for a state file that exists; an absent file (no
-// failure ever recorded) is left absent. Any other stat error is returned.
+// failure ever recorded) is left absent, but its existing sidecar must still
+// pass read-only inspection. No lock is acquired or file created on that path.
+// An unusable sidecar is not recovered by an absent-state no-op.
 func (l *Lockout) ResetIfPresent() error {
 	if _, err := os.Stat(l.path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil
+			return inspectLockoutSidecar(l.path + ".lock")
 		}
 		return fmt.Errorf("nodevault: stat lockout state: %w", err)
 	}
@@ -354,6 +359,16 @@ func backoff(failures int) time.Duration {
 	return d
 }
 
+// LockoutUnavailableReason is a bounded diagnostic category, not permission to
+// repair files or a guarantee that a later transaction can succeed.
+type LockoutUnavailableReason string
+
+const (
+	LockoutBackendUnavailable LockoutUnavailableReason = "unsupported_backend"
+	LockoutSidecarUnavailable LockoutUnavailableReason = "sidecar_unavailable"
+	LockoutStateUnavailable   LockoutUnavailableReason = "state_unavailable"
+)
+
 // LockoutStatus reports the current attempt/lockout state for surfaces.
 type LockoutStatus struct {
 	Unavailable    bool
@@ -361,6 +376,8 @@ type LockoutStatus struct {
 	LockedOut      bool
 	LockoutUntil   time.Time
 	LastVerifiedAt time.Time
+
+	UnavailableReason LockoutUnavailableReason
 }
 
 // LockoutStatus returns the current node-wide lockout state.

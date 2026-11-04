@@ -73,6 +73,10 @@ services:
       - DIFFUSERS_QUANT=${DIFFUSERS_QUANT:-auto}
       # Seconds a request waits for a cold load before the warming response.
       - DIFFUSERS_WARM_WAIT_SECONDS=${DIFFUSERS_WARM_WAIT_SECONDS:-15}
+      # Idle image/video models unload fully unless explicitly pinned.
+      # 0 releases residency immediately after the final in-flight job.
+      - DIFFUSERS_IDLE_UNLOAD_SECONDS=${DIFFUSERS_IDLE_UNLOAD_SECONDS:-300}
+      - DIFFUSERS_PINNED_MODELS=${DIFFUSERS_PINNED_MODELS:-}
       # A freshly loaded model is kept this long unless its requester used it,
       # and a failed load is not retried for DIFFUSERS_FAILURE_BACKOFF_SECONDS.
       - DIFFUSERS_MIN_RESIDENCY_SECONDS=${DIFFUSERS_MIN_RESIDENCY_SECONDS:-120}

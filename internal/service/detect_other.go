@@ -13,8 +13,9 @@ import "fmt"
 // rather than nil/"" so a future caller that DOES construct one directly does
 // not get a silent, do-nothing "success".
 type ManagedUnit struct {
-	Name     string
-	UserMode bool
+	Name       string
+	UserMode   bool
+	ManagerUID string
 }
 
 func (u ManagedUnit) Description() string { return u.Name }

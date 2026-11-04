@@ -216,21 +216,22 @@ reusable secret should prefer --authkey-stdin so the key never appears in argv.`
 
 		// Non-interactive mode when authkey is provided
 		if loginAuthkey != "" {
-			runNonInteractiveLogin()
+			runNonInteractiveLogin(cmd.Context())
 			return
 		}
 
 		// Interactive mode. Thread whether --nexus was explicitly set so the
 		// device-auth path can honor the token's nexus when it was not
 		// (citadel-cli#1122).
-		runInteractiveLogin(flagChanged(cmd, "nexus"))
+		runInteractiveLogin(cmd.Context(), flagChanged(cmd, "nexus"))
 	},
 }
 
 // runNonInteractiveLogin handles login with --authkey flag (formerly 'citadel join')
-func runNonInteractiveLogin() {
+func runNonInteractiveLogin(commandCtx context.Context) {
 	// Check if already connected
 	if network.IsGlobalConnected() {
+		printDeviceLinkDiagnosticContext(commandCtx, os.Stderr, getDeviceConfigFromFile())
 		fmt.Println("Already connected to the AceTeam Network.")
 		return
 	}
@@ -264,9 +265,7 @@ func runNonInteractiveLogin() {
 	}
 
 	// Try to reclaim stale node with the same hostname
-	if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-		reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
-	}
+	reclaimEnrollmentNodes(false, nil, nodeName)
 
 	// Connect to the network with animated spinner
 	spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)
@@ -312,7 +311,7 @@ func runNonInteractiveLogin() {
 // runInteractiveLogin handles the interactive login flow. nexusFlagChanged
 // reports whether --nexus was explicitly set, so the device-auth path can honor
 // the token's nexus when it was not (citadel-cli#1122).
-func runInteractiveLogin(nexusFlagChanged bool) {
+func runInteractiveLogin(commandCtx context.Context, nexusFlagChanged bool) {
 	choice, key, err := selectLoginNetworkChoice(loginNewDevice, nexus.GetNetworkChoice)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
@@ -337,6 +336,7 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 	switch choice {
 	case nexus.NetChoiceVerified:
 		// The GetNetworkChoice function already printed a success message.
+		printDeviceLinkDiagnosticContext(commandCtx, os.Stderr, getDeviceConfigFromFile())
 		return
 	case nexus.NetChoiceSkip:
 		fmt.Println("Login skipped.")
@@ -457,16 +457,10 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 	// Try to reclaim a stale node registered under the SERVING identity so the
 	// coordination server does not suffix the new one (node-<uid>-1), which
 	// would break the verifier's exact-match rule.
-	if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-		reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, servingHostname)
-		// When we just switched this node's serving identity to node-<uid>,
-		// also sweep the prior registration under the display hostname so it
-		// is not orphaned (scoped to CSR-enrolled login: servingHostname
-		// differs from nodeName only then).
-		if servingHostname != nodeName {
-			reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
-		}
-	}
+	// A current grant is the authority even when its save failed. Force-new
+	// attempts must not reclaim the old identity using either current or saved
+	// credentials; replacement authorization belongs to platform approval.
+	reclaimEnrollmentNodes(loginNewDevice, deviceEnrollment, servingHostname, nodeName)
 
 	// Connect using tsnet with animated spinner
 	spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)
@@ -509,10 +503,11 @@ func runInteractiveLogin(nexusFlagChanged bool) {
 				fmt.Fprintf(os.Stderr, "Error: fabric credentials were saved, but enrollment state could not be persisted: %v\n", persistErr)
 				os.Exit(1)
 			}
-			fmt.Fprintln(os.Stderr, "\n⚠️  Fabric enrollment completed, but the mesh connection failed.")
+			fmt.Fprintln(os.Stderr, "\n⚠️  Fabric credentials were saved, but mesh connection and device linking did not complete.")
 			fmt.Fprintf(os.Stderr, "   Credentials are saved for %s.\n", persistedCreds.transportName())
+			fmt.Fprintln(os.Stderr, "   To complete enrollment, run 'citadel logout && citadel init' for fresh browser approval.")
 			if sessionCfg.Mode == nodesession.Worker {
-				fmt.Fprintln(os.Stderr, "   Worker mode is active; the node can serve fabric jobs without the mesh.")
+				fmt.Fprintln(os.Stderr, "   Worker mode remains active; fabric access still depends on server authorization.")
 				fmt.Fprintln(os.Stderr, "   The worker will retry the mesh when it starts.")
 			} else {
 				fmt.Fprintln(os.Stderr, "   Existing presence-only mode was preserved; run 'citadel work' explicitly to serve jobs.")

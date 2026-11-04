@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +51,7 @@ func (f *fakeExecutor) Calls() []recordedInvocation {
 
 func TestRunVideoPipelinePublishesOnlyReferenceAndHash(t *testing.T) {
 	t.Parallel()
+	requireLinuxPublication(t)
 	root := t.TempDir()
 	video := filepath.Join(root, "orbit clip.mp4")
 	if err := os.WriteFile(video, []byte("fake video"), 0o600); err != nil {
@@ -104,7 +107,8 @@ func TestRunVideoPipelinePublishesOnlyReferenceAndHash(t *testing.T) {
 		t.Fatal("artifact is nil")
 	}
 	wantHash := fmt.Sprintf("sha256:%x", sha256.Sum256(plyBytes))
-	if result.Artifact.Path != filepath.Join(output, "splat.ply") || result.Artifact.SHA256 != wantHash {
+	if result.Artifact.Path != filepath.Join(output, "splat.ply") || result.Artifact.SHA256 != wantHash ||
+		result.Artifact.Size != int64(len(plyBytes)) {
 		t.Fatalf("artifact = %+v, want path %q hash %q", result.Artifact, filepath.Join(output, "splat.ply"), wantHash)
 	}
 	entries, err := os.ReadDir(output)
@@ -132,6 +136,7 @@ func TestRunVideoPipelinePublishesOnlyReferenceAndHash(t *testing.T) {
 
 func TestRunFrameFolderSkipsFFmpeg(t *testing.T) {
 	t.Parallel()
+	requireLinuxPublication(t)
 	root := t.TempDir()
 	frames := filepath.Join(root, "frames")
 	if err := os.Mkdir(frames, 0o700); err != nil {
@@ -160,6 +165,7 @@ func TestRunFrameFolderSkipsFFmpeg(t *testing.T) {
 
 func TestRunAcceptsCompletedNonMetricSFMVerdict(t *testing.T) {
 	t.Parallel()
+	requireLinuxPublication(t)
 	root := t.TempDir()
 	frames := filepath.Join(root, "frames")
 	if err := os.Mkdir(frames, 0o700); err != nil {
@@ -270,6 +276,168 @@ func TestParseQualitySignalResultFallback(t *testing.T) {
 	}
 	if signal.RegisteredPercent != 73 || signal.MeanReprojectionPX != 1.25 {
 		t.Fatalf("signal = %+v", signal)
+	}
+}
+
+func TestRunRejectsNonfiniteTuningBeforeAnyExecutorCall(t *testing.T) {
+	root := t.TempDir()
+	frames := filepath.Join(root, "frames")
+	if err := os.Mkdir(frames, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fields := []struct {
+		name string
+		set  func(*Request, float64)
+	}{
+		{"fps", func(r *Request, v float64) { r.FrameFPS = v }},
+		{"registered", func(r *Request, v float64) { r.MinRegisteredPercent = v }},
+		{"reprojection", func(r *Request, v float64) { r.MaxMeanReprojectionPX = v }},
+	}
+	for _, field := range fields {
+		for i, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+			t.Run(fmt.Sprintf("%s-%d", field.name, i), func(t *testing.T) {
+				output := filepath.Join(root, fmt.Sprintf("%s-%d", field.name, i))
+				request := Request{InputPath: frames, OutputDir: output}
+				field.set(&request, value)
+				fake := successfulFake(t, []byte("synthetic-ply"))
+				result, err := (Runner{Executor: fake}).Run(context.Background(), request)
+				if err == nil || result.Artifact != nil || len(fake.Calls()) != 0 {
+					t.Fatal("nonfinite tuning reached execution or publication")
+				}
+				assertNoPublishedOrPartial(t, output)
+			})
+		}
+	}
+}
+
+func TestParseQualitySignalRejectsOverflowAndImpossibleCounts(t *testing.T) {
+	huge := strings.Repeat("9", 400)
+	cases := []string{
+		"Registered: 11/10 images\nReprojection error: mean 0.5 px",
+		"Registered: 0/0 images\nReprojection error: mean 0.5 px",
+		"Registered: " + huge + "/" + huge + " images\nReprojection error: mean 0.5 px",
+		"Registered: 1/1 images\nReprojection error: mean " + huge + " px",
+		"RESULT: OK -- 101% registered, 0.5 px mean reprojection",
+		"RESULT: OK -- " + huge + "% registered, 0.5 px mean reprojection",
+		"RESULT: OK -- 100% registered, " + huge + " px mean reprojection",
+	}
+	for i, output := range cases {
+		t.Run(fmt.Sprintf("invalid-summary-%d", i), func(t *testing.T) {
+			if _, err := ParseQualitySignal(output); err == nil {
+				t.Fatal("invalid counts/overflow accepted as a training signal")
+			}
+		})
+	}
+}
+
+func TestSFMLogCaptureRetainsOnlyBoundedTail(t *testing.T) {
+	var capture synchronizedBuffer
+	var expected string
+	for _, chunk := range []string{
+		"", "first", strings.Repeat("x", maxSFMLogBytes/3),
+		strings.Repeat("y", maxSFMLogBytes-7), "wrap",
+		strings.Repeat("z", 2*maxSFMLogBytes), "summary",
+	} {
+		n, err := capture.Write([]byte(chunk))
+		if err != nil || n != len(chunk) {
+			t.Fatal("bounded capture must consume the whole upstream write")
+		}
+		expected += chunk
+		if len(expected) > maxSFMLogBytes {
+			expected = expected[len(expected)-maxSFMLogBytes:]
+		}
+		if got := capture.String(); got != expected || len(got) > maxSFMLogBytes {
+			t.Fatal("capture did not retain the exact bounded tail")
+		}
+	}
+}
+
+func TestRunBoundedSFMLogRequiresFinalParseableSummary(t *testing.T) {
+	for _, retainSummary := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retained=%v", retainSummary), func(t *testing.T) {
+			if retainSummary {
+				requireLinuxPublication(t)
+			}
+			root := t.TempDir()
+			frames := filepath.Join(root, "frames")
+			if err := os.Mkdir(frames, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			output := filepath.Join(root, "result")
+			fake := successfulFake(t, []byte("synthetic-ply"))
+			original := fake.run
+			fake.run = func(ctx context.Context, invocation Invocation, index int) error {
+				if invocation.Args[0] != "sfm" {
+					return original(ctx, invocation, index)
+				}
+				noise := strings.Repeat("x", 2*maxSFMLogBytes)
+				if retainSummary {
+					_, _ = io.WriteString(invocation.Stdout, noise)
+					return original(ctx, invocation, index)
+				}
+				if err := original(ctx, invocation, index); err != nil {
+					return err
+				}
+				_, _ = io.WriteString(invocation.Stderr, noise)
+				return nil
+			}
+			result, err := (Runner{Executor: fake}).Run(context.Background(), Request{
+				InputPath: frames, OutputDir: output, Iterations: 3,
+			})
+			if retainSummary {
+				if err != nil || result.Artifact == nil || result.Artifact.Size != int64(len("synthetic-ply")) {
+					t.Fatalf("bounded valid summary failed: %v", err)
+				}
+			} else {
+				if err == nil || result.Artifact != nil || len(fake.Calls()) != 1 {
+					t.Fatal("missing summary reached training or publication")
+				}
+				assertNoPublishedOrPartial(t, output)
+			}
+		})
+	}
+}
+
+func TestEmptyFinalArtifactIsNotPublished(t *testing.T) {
+	root := t.TempDir()
+	frames := filepath.Join(root, "frames")
+	if err := os.Mkdir(frames, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "result")
+	result, err := (Runner{Executor: successfulFake(t, nil)}).Run(context.Background(), Request{
+		InputPath: frames, OutputDir: output, Iterations: 3,
+	})
+	if err == nil || result.Artifact != nil {
+		t.Fatal("empty artifact was published as a reconstruction")
+	}
+	assertNoPublishedOrPartial(t, output)
+}
+
+func TestHashFileCountsActualBytesAndCancelsWithoutMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "synthetic.ply")
+	raw := []byte("synthetic-ply")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, size, err := hashFile(context.Background(), path)
+	if err != nil || size != int64(len(raw)) || digest != fmt.Sprintf("%x", sha256.Sum256(raw)) {
+		t.Fatalf("hash/size differs from actual bytes: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	digest, size, err = hashFile(ctx, path)
+	if !errors.Is(err, context.Canceled) || digest != "" || size != 0 {
+		t.Fatal("cancelled hash exposed success metadata")
+	}
+}
+
+// Successful publication requires Linux's atomic no-replace primitive. Keep
+// parser, quality-gate, cancellation, hash and buffer cases portable.
+func requireLinuxPublication(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("create-only publication requires the supported Linux container")
 	}
 }
 

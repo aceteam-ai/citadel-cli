@@ -257,7 +257,8 @@ func runControlCenter() {
 		DeviceAuth: controlcenter.DeviceAuthCallbacks{
 			StartFlow:  ccStartDeviceAuthFlow,
 			PollToken:  ccPollDeviceAuthToken,
-			Connect:    ccConnectWithAuthkey,
+			Connect:    ccConnectWithDeviceToken,
+			EndFlow:    ccEndDeviceAuthFlow,
 			Disconnect: ccDisconnect,
 		},
 		Worker: controlcenter.WorkerCallbacks{
@@ -428,6 +429,12 @@ func runControlCenter() {
 				cc.AddActivity("success", "Connected to AceTeam Network")
 				networkConnected = true
 			}
+		}
+
+		// One startup display observation after the live mesh check, never
+		// from refresh, heartbeat or automatic reconnect retry loops.
+		if detail := observeDeviceLinkDiagnostic(ctx, getDeviceConfigFromFile(), defaultDeviceLinkObservation()); detail != "" {
+			cc.AddActivity("warning", "Device link: "+detail)
 		}
 
 		// Gather initial data after network check
@@ -1409,6 +1416,7 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	data.WorkerRunning = ccWorkerRunning
 	data.WorkerQueue = ccWorkerQueue
 	ccWorkerMu.Unlock()
+	applyControlCenterWorkerDetail(&data)
 
 	// Demo server URL (always running when control center is active)
 	data.DemoServerURL = fmt.Sprintf("http://localhost:%d", ccDemoPort)
@@ -1863,10 +1871,24 @@ func ccGetConfiguredServices() []string {
 // ccStartDeviceAuthFlow starts the device authorization flow and returns the config
 func ccStartDeviceAuthFlow() (*controlcenter.DeviceAuthConfig, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
+	return ccStartDeviceAuthFlowWith(func() (*nexus.DeviceCodeResponse, error) {
+		return client.StartFlow(nil)
+	}, time.Now)
+}
 
-	resp, err := client.StartFlow(nil)
+func ccStartDeviceAuthFlowWith(start func() (*nexus.DeviceCodeResponse, error), now func() time.Time) (*controlcenter.DeviceAuthConfig, error) {
+	if start == nil || now == nil {
+		return nil, errors.New("device authorization is unavailable")
+	}
+	// Anchor the original grant deadline before the request, not when a slow
+	// response arrives or when a later token response supplies its own expiry.
+	startedAt := now()
+	resp, err := start()
 	if err != nil {
 		return nil, err
+	}
+	if resp == nil || resp.ExpiresIn <= 0 || int64(resp.ExpiresIn) > int64(time.Duration(1<<63-1)/time.Second) {
+		return nil, errors.New("invalid device authorization expiry")
 	}
 
 	return &controlcenter.DeviceAuthConfig{
@@ -1874,41 +1896,46 @@ func ccStartDeviceAuthFlow() (*controlcenter.DeviceAuthConfig, error) {
 		VerificationURI: resp.VerificationURI,
 		DeviceCode:      resp.DeviceCode,
 		ExpiresIn:       resp.ExpiresIn,
+		ExpiresAt:       startedAt.Add(time.Duration(resp.ExpiresIn) * time.Second),
 		Interval:        resp.Interval,
 	}, nil
 }
 
-// ccPollDeviceAuthToken polls for device authorization token (single check)
-func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
+// ccPollDeviceAuthToken only fetches a token. The UI rejects late results before
+// admitting any local persistence or registration effects.
+func ccPollDeviceAuthToken(deviceCode string, interval int) (*nexus.TokenResponse, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
+	return ccPollDeviceAuthTokenWith(deviceCode, client.CheckToken)
+}
 
+func ccPollDeviceAuthTokenWith(deviceCode string, check func(string) (*nexus.TokenResponse, error)) (*nexus.TokenResponse, error) {
+	if check == nil {
+		return nil, errors.New("device authorization polling is unavailable")
+	}
 	// Use checkToken for single poll (not blocking PollForToken)
-	token, err := client.CheckToken(deviceCode)
+	token, err := check(deviceCode)
 	if err != nil {
-		return "", ccTokenPollError(deviceCode, err)
+		return nil, ccTokenPollError(deviceCode, err)
 	}
 	ccTokenServerErrors.Delete(deviceCode)
 	if token == nil || token.Authkey == "" {
-		return "", fmt.Errorf("authorization_pending")
+		return nil, &nexus.TokenError{ErrorCode: "authorization_pending"}
 	}
-
-	ccEnrollmentTokens.Store(deviceCode, token)
-	// Save the device config including user info when auth succeeds
-	if token.DeviceAPIToken != "" || token.UserEmail != "" {
-		if err := saveDeviceConfigToFile(token); err != nil {
-			// Log but don't fail - we have the authkey
-			Debug("failed to save device config: %v", err)
-		}
-	}
-
-	return token.Authkey, nil
+	clonedToken := *token
+	return &clonedToken, nil
 }
 
 // ccTokenServerErrors counts consecutive 5xx token answers per device code.
 var ccTokenServerErrors sync.Map
 
+// ccEndDeviceAuthFlow runs after the modal's synchronous poll has returned, so no late
+// answer can recreate a retry entry after cleanup.
+func ccEndDeviceAuthFlow(deviceCode string) {
+	ccTokenServerErrors.Delete(deviceCode)
+}
+
 // ccTokenPollError keeps the Control Center modal polling through a bounded run
-// of 5xx answers (the modal only continues on a "pending" error), matching the
+// of 5xx answers (the modal only continues on typed retry answers), matching the
 // CLI's nexus.PollForTokenWithCSR. Any other error, or too many 5xx in a row,
 // is returned unchanged and ends the modal.
 func ccTokenPollError(deviceCode string, err error) error {
@@ -1926,12 +1953,34 @@ func ccTokenPollError(deviceCode string, err error) error {
 		return err
 	}
 	ccTokenServerErrors.Store(deviceCode, n)
-	return fmt.Errorf("authorization_pending (server error %d, retrying)", serverErr.StatusCode)
+	return &nexus.TokenError{ErrorCode: "authorization_pending", ErrorDescription: fmt.Sprintf("server error %d, retrying", serverErr.StatusCode)}
 }
 
-// ccConnectWithAuthkey registers and links the grant approved by this modal.
+// ccConnectWithDeviceToken persists, registers and links the exact response
+// admitted by the modal's original-deadline/cancellation fence. An admitted
+// synchronous operation is not rolled back if cancellation arrives later.
 // Saved device credentials alone do not establish a completed device binding.
-func ccConnectWithAuthkey(authkey, deviceCode string) error {
+func ccConnectWithDeviceToken(token *nexus.TokenResponse, deviceCode string) error {
+	return ccAcceptDeviceTokenWith(token, deviceCode, saveDeviceConfigToFile, ccRegisterDeviceToken)
+}
+
+func ccAcceptDeviceTokenWith(token *nexus.TokenResponse, deviceCode string, save func(*nexus.TokenResponse) error, connect func(*nexus.TokenResponse, string) error) error {
+	if token == nil || token.Authkey == "" || deviceCode == "" || save == nil || connect == nil {
+		return deviceEnrollmentRecoveryError(errors.New("current device authorization is missing"))
+	}
+	accepted := *token
+	if accepted.DeviceAPIToken != "" || accepted.UserEmail != "" {
+		persisted := accepted
+		if err := save(&persisted); err != nil {
+			// Preserve the existing nonfatal persistence policy: registration
+			// still has this exact current response, including its authkey.
+			Debug("failed to save device config: %v", err)
+		}
+	}
+	return connect(&accepted, deviceCode)
+}
+
+func ccRegisterDeviceToken(token *nexus.TokenResponse, deviceCode string) error {
 	// Get node name from manifest or hostname
 	nodeName := ""
 	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
@@ -1947,13 +1996,10 @@ func ccConnectWithAuthkey(authkey, deviceCode string) error {
 	config := network.ServerConfig{
 		Hostname:   nodeName,
 		ControlURL: nexusURL,
-		AuthKey:    authkey,
+		AuthKey:    token.Authkey,
 	}
 
-	// A registration ID left by an earlier enroll in this process must not
-	// stand in for this connection's node (citadel-cli#1356).
-	setRegisteredNodeID("")
-	err := ccConnectDeviceEnrollmentWith(authkey, deviceCode, func() error {
+	err := ccConnectDeviceEnrollmentWith(token, deviceCode, func() error {
 		_, err := network.Connect(ctx, config)
 		return err
 	}, linkDeviceEnrollment, network.Disconnect)
@@ -2012,6 +2058,7 @@ func ccStartWorker(activityFn func(level, msg string)) error {
 	// Start worker in goroutine
 	go func() {
 		defer func() {
+			resetControlCenterWorkerDetail()
 			ccWorkerMu.Lock()
 			ccWorkerRunning = false
 			ccWorkerConsuming = false
@@ -2067,8 +2114,6 @@ func acquireControlCenterWorkerLock(stateDir string, logf func(string, ...any)) 
 
 // runTUIWorker runs the worker for the TUI (simplified version of runWork)
 func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error {
-	clockMonitor, stopClockMonitor := startClockMonitor(ctx)
-	defer stopClockMonitor()
 	activity := func(level, msg string) {
 		if activityFn != nil {
 			activityFn(level, msg)
@@ -2088,14 +2133,6 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			override)
 	}
 
-	// Construction-time gates use this immutable snapshot. Heartbeats compare
-	// it with current persisted intent so restart-bound changes remain pending
-	// until a new worker confirms them after startup.
-	ccAppliedPermissions := loadNodePermissions()
-
-	// Load device config from file
-	deviceConfig := getDeviceConfigFromFile()
-
 	// Acquire the same single-instance lock as `citadel work`. If a dedicated
 	// worker already holds it (issues #443/#435/#455), the control center
 	// MUST NOT compete for this node's jobs: two consumers in the same consumer
@@ -2103,8 +2140,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// privileged jobs (WHATSAPP_PROVISION, AGENT_UPDATE) were randomly grabbed by
 	// the control-center worker and failed with "no handler" even though the real
 	// worker's binary handles them (the competing-consumer incident). When a worker
-	// is present the control center stays a read-only monitor (heartbeat/telemetry
-	// only) and lets the real worker own all job consumption.
+	// is present this worker branch becomes a read-only shared-status monitor;
+	// the real worker owns consumption, collection and publishing.
 	//
 	// Hold this lease through runner and updater shutdown, so a later work
 	// invocation cannot become a second consumer, automatic installer, or
@@ -2127,6 +2164,21 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	ccWorkerMu.Lock()
 	ccWorkerConsuming = ccWorkerLock != nil
 	ccWorkerMu.Unlock()
+	if workerHeld {
+		// The existing owner supplies worker observations. This branch must stay
+		// before clock, device/API source, collector and publisher construction:
+		// the monitor owns no queue, heartbeat, enrollment or replacement worker.
+		activity("info", "Reading dedicated worker status over the shared local control surface")
+		return runControlCenterWorkerMonitor(ctx, network.GetStateDir(), workerPID, network.SessionControlWorkerDetailRequest)
+	}
+
+	clockMonitor, stopClockMonitor := startClockMonitor(ctx)
+	defer stopClockMonitor()
+	// Construction-time gates use this immutable snapshot. Heartbeats compare
+	// it with current persisted intent so restart-bound changes remain pending
+	// until a new worker confirms them after startup.
+	ccAppliedPermissions := loadNodePermissions()
+	deviceConfig := getDeviceConfigFromFile()
 
 	// Heartbeat auto_update telemetry (citadel-cli#1134), the control-center's
 	// worker-owned startup path. Mirrors runWork: a cache created before the
@@ -2138,7 +2190,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		return autoUpdateReportFrom(ccAutoUpdateReport.Load())
 	}
 	_ = update.ReconcilePendingOnStartup(time.Now(), Version)
-	ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "unavailable"))
+	ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "unavailable", update.InspectSelfUpdateCapability()))
 
 	// Determine job source mode
 	var source worker.JobSource
@@ -2454,16 +2506,6 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		}
 	}
 
-	// If a dedicated worker holds the lock, the control center does NOT run a
-	// job-consuming runner (that is the whole point of the fix). Heartbeat and
-	// telemetry are already wired above; block here in monitor-only mode until the
-	// TUI context is cancelled, letting the real worker own all job consumption.
-	if workerHeld {
-		activity("success", "Monitor mode active (dedicated worker owns jobs)")
-		<-ctx.Done()
-		return ctx.Err()
-	}
-
 	// This control center holds the worker lock, so it
 	// must handle the FULL node-job set (legacy + workflow + AGENT_UPDATE +
 	// WHATSAPP_PROVISION), not a subset. Build handlers via the shared helper so the
@@ -2597,7 +2639,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	return runWorkerWithAutoUpdater(ctx, ccWorkerLock, autoUpdatePolicyInputs{}, runner,
 		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) }, autoUpdateRuntime{
 			refresh: func() {
-				ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic"))
+				ccAutoUpdateReport.Store(buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.InspectSelfUpdateCapability()))
 			},
 		})
 }

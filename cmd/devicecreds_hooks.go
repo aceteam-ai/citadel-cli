@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
-	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
@@ -33,7 +32,9 @@ func init() {
 //
 // getDeviceConfigFromFile (cmd/work.go) and config.LoadDeviceCredsConverged
 // (via the hook above) both resolve through this single function, so cmd/ and
-// internal/worker agree on the search order.
+// internal/worker agree on the search order. The preferred path uses the same
+// nodeConfigDirFn seam as credential writers; its production default remains
+// network.GetNodeConfigDir, while tests can redirect both without host reads.
 func deviceConfigDirs() []string {
-	return []string{network.GetNodeConfigDir(), platform.ConfigDir()}
+	return []string{nodeConfigDirFn(), platform.ConfigDir()}
 }

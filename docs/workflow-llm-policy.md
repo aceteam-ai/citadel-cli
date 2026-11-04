@@ -39,6 +39,9 @@ The file must be a regular file, not a symlink, at most 16 KiB, with at most 64
 entries in the closed schema above. Unknown or duplicate keys, duplicate
 canonical endpoints, aliases, extra YAML documents and malformed endpoints are
 invalid. `allow: []` adds no grants; it does not remove the built-in endpoint.
+To keep the defaults, leave the policy absent or use `allow: []`; do not create
+an empty file. An empty or whitespace-only file is an invalid policy and
+disables all LLM destinations, including the built-in endpoint.
 Keep the node configuration directory under the node operator's control. Do not
 set the job workspace to that directory: workspace file-write authority must not
 become policy-write authority.
@@ -59,6 +62,13 @@ worker emits a static warning with a bounded `reason`, such as
 `invalid_policy_document`, `file_too_large`, `file_not_regular`, or
 `open_permission_denied`. It never logs the policy text, path or raw filesystem
 error. Correct the policy and restart the worker to load it again.
+
+A valid file containing an IP-literal grant for an always-denied destination
+produces one static warning per load with reason `ineffective_literal_ip_grant`.
+The grant remains ineffective; the document is not rejected and its other grants
+and defaults are unchanged. Loading does not resolve hostname grants, whose
+answers are checked only at request time. The warning includes no endpoint or
+policy content.
 
 ## Endpoint and transport boundaries
 
