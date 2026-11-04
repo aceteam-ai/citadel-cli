@@ -157,8 +157,17 @@ by `ace`. Final symlinks and multiply linked files refuse before truncation.
 The final open uses a rooted parent directory descriptor and kernel
 `O_NOFOLLOW`, since `os.Root.OpenFile` resolves final symlinks itself.
 
-Import hands off every new directory and regular file before writing its data;
-it changes the symlink itself after creation, never its target. Archive UID/GID
+Import first makes its fresh root worker-owned and inaccessible to the workspace
+identity. It stays private through directory creation, reopen, data extraction and
+archive authentication. This protects directory creation from entry replacement
+even after individual child ownership handoffs. Only the verified completed import
+hands the root back to `ace`. Failed or uncertain operations refuse success and
+retain the volume for explicit operator handling.
+
+New directories and regular files receive descriptor handoff before file data is
+written. Symlinks use a no-follow `O_PATH` descriptor and `fchownat` with an empty
+path, `AT_EMPTY_PATH` and `AT_SYMLINK_NOFOLLOW`, so replacement of the checked name
+cannot redirect ownership to another inode or the link target. Archive UID/GID
 values are ignored. A hardlink may refer only to a regular inode created and
 handed off by this import, so it inherits that ownership without another chown.
 An existing empty system-directory header is preserved without changing its

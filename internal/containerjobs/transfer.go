@@ -281,6 +281,9 @@ func (e *Engine) importVolume(ctx context.Context, r Request) (Result, error) {
 		return out, ErrUnavailable
 	}
 	defer root.Close()
+	if e.Runtime.PrepareImportRoot(root) != nil {
+		return out, ErrUnavailable
+	}
 	reader := &chunkReader{ctx: ctx, transport: e.Transport, request: r, gcm: gcm}
 	tr := tar.NewReader(reader)
 	seen := map[string]bool{}
@@ -413,6 +416,9 @@ func (e *Engine) importVolume(ctx context.Context, r Request) (Result, error) {
 	}
 	if reader.total != total || ctx.Err() != nil {
 		return out, ErrInvalid
+	}
+	if e.Runtime.PublishImportRoot(root) != nil {
+		return out, ErrUnavailable
 	}
 	out.Bytes = total
 	out.Manifest = r.Manifest

@@ -176,3 +176,74 @@ func TestImportCannotHandoffOrLinkPreexistingEntries(t *testing.T) {
 		})
 	}
 }
+
+func TestImportKeepsNewEntryParentsPrivateUntilAuthenticatedPublication(t *testing.T) {
+	for _, failure := range []string{"none", "prepare", "publish", "trailing"} {
+		t.Run(failure, func(t *testing.T) {
+			runtime := newFake(t)
+			private, published := false, false
+			runtime.prepareImport = func(*os.Root) error {
+				if failure == "prepare" {
+					return errors.New("fake stage refusal")
+				}
+				private = true
+				return nil
+			}
+			runtime.fileHandoff = func(*os.File) error {
+				if !private || published {
+					t.Fatal("entry created outside private custody")
+				}
+				return nil
+			}
+			runtime.linkHandoff = func(*os.Root, string) error {
+				if !private || published {
+					t.Fatal("symlink handed off outside private custody")
+				}
+				return nil
+			}
+			runtime.publishImport = func(root *os.Root) error {
+				if !private {
+					t.Fatal("publication before staging")
+				}
+				if failure == "publish" {
+					return errors.New("fake publish refusal")
+				}
+				if failure == "trailing" {
+					t.Fatal("publication before final archive authentication")
+				}
+				if got, err := root.ReadFile("dir/file"); err != nil || string(got) != "x" {
+					t.Fatal("published before file data", err)
+				}
+				published = true
+				return nil
+			}
+			req, transport := ownershipImportFixture(t, []*tar.Header{{Name: "dir/file", Typeflag: tar.TypeReg, Mode: 0600, Size: 1}, {Name: "link", Typeflag: tar.TypeSymlink, Linkname: "dir/file"}})
+			if failure == "trailing" {
+				g, err := transferCipher(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cipher := transport.objects[req.ChunkURLs[0]]
+				plain, err := g.Open(nil, cipher[:12], cipher[12:], chunkAAD(req.OrgID, req.TransferID, 0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				plain = append(plain, 1)
+				cipher = g.Seal(bytes.Clone(cipher[:12]), cipher[:12], plain, chunkAAD(req.OrgID, req.TransferID, 0))
+				transport.objects[req.ChunkURLs[0]] = cipher
+				req.Manifest.Chunks[0].PlaintextBytes = int64(len(plain))
+				digest := sha256.Sum256(cipher)
+				req.Manifest.Chunks[0].SHA256 = hex.EncodeToString(digest[:])
+				req.ManifestSHA256 = manifestDigest(req.Manifest)
+			}
+			out, err := (&Engine{EnrolledOrg: fixtureEnrolledOrg, Runtime: runtime, Transport: transport}).Run(context.Background(), Import, req)
+			if failure == "none" {
+				if err != nil || !published || out.Manifest == nil {
+					t.Fatal("publication missing", err)
+				}
+			} else if err == nil || published || out.Manifest != nil || out.Bytes != 0 {
+				t.Fatal("failed private import reported success", failure, err)
+			}
+		})
+	}
+}

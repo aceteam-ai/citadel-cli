@@ -35,3 +35,6 @@ func (*Native) DestroyVolume(context.Context, string) error          { return Er
 
 func (*Native) HandoffWorkspaceFile(*os.File) error            { return ErrUnavailable }
 func (*Native) HandoffWorkspaceSymlink(*os.Root, string) error { return ErrUnavailable }
+
+func (*Native) PrepareImportRoot(*os.Root) error { return ErrUnavailable }
+func (*Native) PublishImportRoot(*os.Root) error { return ErrUnavailable }

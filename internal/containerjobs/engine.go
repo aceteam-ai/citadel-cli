@@ -43,10 +43,16 @@ type Runtime interface {
 	// Ownership operations use pinned workspace IDs, never request/header IDs.
 	HandoffWorkspaceFile(*os.File) error
 	HandoffWorkspaceSymlink(*os.Root, string) error
+	PrepareImportRoot(*os.Root) error
+	PublishImportRoot(*os.Root) error
 	Usage(context.Context, string) (int64, int64, error)
 	DestroyContainer(context.Context, string) error
 	DestroyVolume(context.Context, string) error
 }
+
+// Keep unsupported-platform stubs aligned with the privileged runtime contract.
+var _ Runtime = (*Native)(nil)
+
 type Transport interface {
 	Put(context.Context, string, []byte) error
 	Get(context.Context, string, int64) ([]byte, error)
