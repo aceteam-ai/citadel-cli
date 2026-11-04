@@ -178,7 +178,7 @@ func runSingleService(serviceName string) {
 		fmt.Fprintf(os.Stderr, "❌ Failed to resolve configuration: %v\n", err)
 		os.Exit(1)
 	}
-	if err := runSingleServiceApply(configDir, serviceName, startService); err != nil {
+	if err := runSingleServiceApply(configDir, serviceName, func(name, path string) error { return startService(name, path) }); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to start service '%s': %v\n", serviceName, err)
 		os.Exit(1)
 	}

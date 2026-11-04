@@ -2939,7 +2939,21 @@ type startedService struct {
 // that must not gate job-stream subscription on service readiness should invoke
 // it from a background goroutine (see runWork). The old blocking behavior is
 // still available via --wait-services.
-func startManagedServices(ctx context.Context) []startedService {
+func startManagedServices(ctx context.Context, gpuCount ...func() int) []startedService {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	sampled, count := false, -1
+	once := func() int {
+		if !sampled {
+			if probe != nil {
+				count = probe()
+			}
+			sampled = true
+		}
+		return count
+	}
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		// No manifest found - this is fine, just skip service startup
@@ -2983,6 +2997,13 @@ func startManagedServices(ctx context.Context) []startedService {
 			continue
 		}
 
+		if serviceType == internalServices.ServiceTypeDocker {
+			if reason := services.CUDAStartRefusal(service.Name, runtime.GOOS, once); reason != "" {
+				fmt.Printf("   - %s\n", reason)
+				continue
+			}
+		}
+
 		if serviceType == internalServices.ServiceTypeNative {
 			fmt.Printf("   - Starting %s (native)...\n", service.Name)
 			warnIfOllamaPolicyIgnoredNative(service)
@@ -3002,7 +3023,7 @@ func startManagedServices(ctx context.Context) []startedService {
 			}
 			fmt.Printf("   - Starting %s...\n", service.Name)
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
-				return startService(service.Name, fullComposePath)
+				return startService(service.Name, fullComposePath, once)
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
 				continue

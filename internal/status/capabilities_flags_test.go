@@ -157,7 +157,7 @@ func TestCapabilityFlagsJSONContract(t *testing.T) {
 // comparing to GetAvailableServices() (which would be circular).
 func TestPopulateServicesAdvertisesRunnableSet(t *testing.T) {
 	caps := &NodeCapabilities{}
-	populateServices(caps)
+	populateServices(caps, "linux", func() int { return 1 })
 
 	if len(caps.AvailableServices) == 0 {
 		t.Fatal("AvailableServices should be populated, got empty")
@@ -247,5 +247,24 @@ func TestNodeStatusCapabilitiesKeyPresent(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"capabilities":`) {
 		t.Errorf("NodeStatus JSON missing capabilities key; got %s", string(b))
+	}
+}
+
+func TestPopulateServicesWithholdsCUDAOnlyOnPositiveAbsence(t *testing.T) {
+	for _, count := range []int{0, 1, -1} {
+		caps := &NodeCapabilities{}
+		populateServices(caps, "linux", func() int { return count })
+		set := map[string]bool{}
+		for _, name := range caps.AvailableServices {
+			set[name] = true
+		}
+		for _, name := range []string{"bonsai", "unlimited-ocr", "vllm", "sglang", "diffusers", "omnivoice"} {
+			if set[name] != (count != 0) {
+				t.Fatal("heartbeat advertised wrong host set", name, count)
+			}
+		}
+		if !set["ollama"] || !set["llamacpp"] {
+			t.Fatal("CPU variants missing")
+		}
 	}
 }

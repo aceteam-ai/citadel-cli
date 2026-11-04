@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -242,15 +243,17 @@ func runControlCenter() {
 	startDemoServer()
 
 	cfg := controlcenter.Config{
-		Version:            Version,
-		AuthServiceURL:     authServiceURL,
-		NexusURL:           nexusURL,
-		RefreshFn:          gatherControlCenterData,
-		StartServiceFn:     ccStartService,
-		StopServiceFn:      ccStopService,
-		RestartServiceFn:   ccRestartService,
-		AddServiceFn:       ccAddService,
-		GetServicesFn:      services.GetAvailableServices,
+		Version:          Version,
+		AuthServiceURL:   authServiceURL,
+		NexusURL:         nexusURL,
+		RefreshFn:        gatherControlCenterData,
+		StartServiceFn:   ccStartService,
+		StopServiceFn:    ccStopService,
+		RestartServiceFn: ccRestartService,
+		AddServiceFn:     ccAddService,
+		GetServicesFn: func() []string {
+			return services.AvailableServicesForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose)
+		},
 		GetConfiguredFn:    ccGetConfiguredServices,
 		GetServiceDetailFn: ccGetServiceDetail,
 		GetServiceLogsFn:   ccGetServiceLogs,

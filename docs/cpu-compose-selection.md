@@ -38,3 +38,12 @@ changing its version or peers. A stamp error remains an error even if the
 compose rename succeeded; a repeat can repair that hash. Atomic renames do not
 promise crash durability across both updates. Existing reservation and
 fine-tune admission guards remain authoritative.
+
+`services.AvailableServicesForHost` filters the live heartbeat and Control
+Center list using the same tri-state observation. On positively GPU-less Linux,
+CUDA-only engines are withheld. `CUDAStartRefusal` owns the common reason used
+by worker, CLI and device-config starts; boot skips each unsupported engine
+with that reason and samples GPU evidence once. Positive or unknown evidence
+retains the normal attempt, including driver failures on NVIDIA hardware.
+The CPU-capable engines and existing Darwin policy are unchanged. Static CLI
+help still describes the compiled registry; live scheduling uses host policy.
