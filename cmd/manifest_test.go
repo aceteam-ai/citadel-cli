@@ -154,14 +154,9 @@ func TestEnsureComposeFile_NoOverrideWritesVerbatim(t *testing.T) {
 	}
 }
 
-// TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged pins that the
-// citadel-cli#1069 darwin GPU-reservation heal is a no-op on the linux CI host:
-// an already-materialized nvidia-reserving ollama.yml (the exact state a Mac at
-// v2.150-v2.160 has on disk, and the current linux template here) must be left
-// byte-identical when ensureComposeFile takes its create-once fast path. The
-// heal only fires on a darwin build, where ServiceMap["ollama"] is the
-// no-nvidia darwin variant.
-func TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged(t *testing.T) {
+// A Linux host with an NVIDIA GPU keeps its current embedded GPU bytes.
+// The detector is injected so this assertion does not depend on CI hardware.
+func TestEnsureComposeFile_LinuxGPUKeepsNvidiaReservingFileUnchanged(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skipf("linux-only byte-identity assertion; GOOS=%s", runtime.GOOS)
 	}
@@ -178,7 +173,7 @@ func TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged(t *testing.T)
 		t.Fatalf("seed: %v", err)
 	}
 
-	if err := ensureComposeFile(tmpDir, "ollama"); err != nil {
+	if err := ensureComposeFileForHost(tmpDir, "ollama", "linux", func() int { return 1 }); err != nil {
 		t.Fatalf("ensureComposeFile() error = %v", err)
 	}
 
@@ -187,7 +182,7 @@ func TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged(t *testing.T)
 		t.Fatalf("read back: %v", err)
 	}
 	if string(got) != seed {
-		t.Fatal("nvidia-reserving ollama.yml was rewritten on linux; the #1069 heal must be darwin-only")
+		t.Fatal("nvidia-reserving ollama.yml was rewritten on a Linux GPU host")
 	}
 }
 
@@ -468,7 +463,7 @@ func TestFindAndReadManifest_NodeDirOverride_BypassesHome(t *testing.T) {
 	// "Real" $HOME: has its own global config + manifest, deliberately never
 	// read while the override is active.
 	realHome := t.TempDir()
-	t.Setenv("HOME", realHome)
+	useCmdFixtureHome(t, realHome)
 	realConfigDir := filepath.Join(realHome, ".citadel-cli")
 	if err := os.MkdirAll(realConfigDir, 0o755); err != nil {
 		t.Fatalf("mkdir real config dir: %v", err)
@@ -576,7 +571,7 @@ func TestFindAndReadManifest_NodeDirOverride_MissingManifestErrors(t *testing.T)
 // -- an override is a one-off target, not a new permanent default.
 func TestFindOrCreateManifest_NodeDirOverride_BootstrapsThereNotHome(t *testing.T) {
 	realHome := t.TempDir()
-	t.Setenv("HOME", realHome)
+	useCmdFixtureHome(t, realHome)
 
 	overrideDir := filepath.Join(t.TempDir(), "isolated-node")
 	setNodeDirOverrideForTest(t, overrideDir)
@@ -618,7 +613,7 @@ func TestLocalServiceConfigDirRejectsAmbiguousGlobalPointer(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
-			t.Setenv("HOME", home)
+			useCmdFixtureHome(t, home)
 			t.Setenv("CITADEL_NODE_DIR", "")
 			path := filepath.Join(home, ".citadel-cli", "config.yaml")
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -648,7 +643,7 @@ func TestLocalServiceConfigDirRejectsAmbiguousGlobalPointer(t *testing.T) {
 
 func TestFindOrCreateManifestNoPointerBootstrapsDefault(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 	t.Setenv("CITADEL_NODE_DIR", "")
 	dir, err := localServiceConfigDir()
 	if err != nil || dir != filepath.Join(home, "citadel-node") {

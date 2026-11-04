@@ -608,7 +608,7 @@ func dashboardServiceStatus(check managedServiceHealth) dashboard.ServiceStatus 
 // `citadel work`) -- back-compat here is behavioral (human-facing tabwriter
 // text, no machine consumer to preserve), not schema-bound.
 func printCacheInfo(w *tabwriter.Writer) {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := platform.HomeDir("")
 	if err != nil {
 		fmt.Fprintf(w, "  %s\n", badColor.Sprintf("Could not determine home directory: %v", err))
 		return

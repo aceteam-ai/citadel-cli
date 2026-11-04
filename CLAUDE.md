@@ -70,6 +70,14 @@ public endpoints and only the exact built-in Ollama endpoint; other private
 targets require grants, and hard-denied ranges cannot be granted. See
 `docs/workflow-llm-policy.md` for operator configuration and transport limits.
 
+`reconstruct.Runner` is the trusted-operator engine, not a registered dispatched
+job. `publishDirectory` owns its create-only Linux bundle rename; unsupported
+publication primitives fail closed. The remaining workspace, SPZ, container
+custody and signed-event boundaries for #1381 are tracked in
+`docs/reconstruct-splat-job.md`; helper source or historical GPU acceptance
+does not prove those boundaries. `publish_linux_test.go` pins late collisions
+and competing publishers with synthetic fake executors.
+
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
 advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,
@@ -4228,16 +4236,12 @@ the worker being restarted — using it (or a `CITADEL_SERVICE` env check) from
 `citadel update install` would read the operator's own SSH shell, which never
 inherited the worker's environment, so the gate would silently never fire in
 exactly the scenario #454 reported. `resolveManagedServiceRestartTarget`
-(`cmd/update.go`) layers `ActiveManagedUnit` (the only signal that sees the
-install.sh/packer fleet unit, `citadel-worker.service` — how citadel actually
-ships on most nodes) with the cross-platform `service.Manager.Status()` (the
-only signal on macOS/Windows, and for a `citadel service install`-managed
-Linux node). **This means macOS/Windows detection is already covered, not a
-gap**: `service.Manager.Status()` (`launchd.go`/`windows.go`) is implemented
-on every platform, so a managed launchd/SCM service still gets the warn-vs-
-restart gate even though `ActiveManagedUnit` itself only ever fires on Linux
-(citadel#887 verified this rather than assuming it — read the code before
-concluding the macOS/Windows half of that issue is still open).
+(`cmd/update.go`) instead uses `service.DiscoverActiveWorkers` on Linux for
+the manual update restart path. It inspects arbitrary active service names,
+matches the resolved binary and literal `work` command, and requires one
+verified target. The target is revalidated after draining. It does not expand
+the fixed list of unit files that rematerialization may rewrite. macOS and
+Windows retain `service.Manager.Status()` (`launchd.go`/`windows.go`).
 
 `citadel update install` now warns loudly by default when a managed service is
 detected, and restarts it only with an explicit `--restart` flag.
@@ -4251,8 +4255,9 @@ seam for tests, and also driving the new `citadel service refresh-unit`). Before
 this, `sudo citadel update install` on an up-to-date node exited at "You are
 running the latest version" without ever re-materializing the unit, so a node
 deployed by a pre-#444 binary never received the restart-storm hardening (seen on
-node 1314). The already-latest branch deliberately skips `warnOrRestartManagedService`
-(the binary is unchanged, so there is no old-vs-new split-brain). Separately, the
+node 1314). `finishManualNoOp` also honors an explicit `--restart`: a managed
+worker may still run an older image even when the CLI is already current. A
+requested restart without a verified active target exits nonzero. Separately, the
 unprivileged-system-unit remediation (`service.rootRemediationCommand`) resolves
 `os.Executable()` to an ABSOLUTE path and targets the network-free
 `service refresh-unit`, because a bare `sudo citadel …` is "command not found"
@@ -4650,7 +4655,10 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 
 ### GPU Support Notes
 
-**Linux**: Full NVIDIA GPU support via NVIDIA Container Toolkit. Compose files use `driver: nvidia` specification.
+**Linux**: `platform.NvidiaGPUCountForCompose` owns the bounded tri-state observation.
+`services.SelectComposeForHost` chooses the supported CPU variant only on proven
+NVIDIA absence; unknown evidence preserves an existing flavor. `services.ComposeMapForRefresh`
+withholds uncertain variants from boot refresh. See `docs/cpu-compose-selection.md`.
 
 **macOS — no GPU in containers, and the nvidia reservation is NOT ignored (citadel-cli#1048, corrects a stale claim this section made).**
 Docker Desktop for macOS exposes **no GPU to Linux containers** at all — Metal is not passed through to the Linux VM, and there is no nvidia device driver, on Apple Silicon or Intel. The previous claim here ("Metal GPU support in containers", "`driver: nvidia` is ignored", "services still run") was wrong on all three counts: Docker Compose v2 honors `deploy.resources.reservations.devices` outside swarm, so a mandatory `driver: nvidia` reservation makes `docker compose up` **fail container creation** with `could not select device driver "nvidia" with capabilities: [[gpu]]`.

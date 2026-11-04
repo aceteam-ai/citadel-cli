@@ -206,3 +206,51 @@ func TestMeetingStopBeforeSetupLaunchesNothing(t *testing.T) {
 		t.Fatalf("pre-setup Stop: err=%v launched=%v", err, launched)
 	}
 }
+
+// stopOnAdmitBrowser raises Stop inside the final, successful admission probe.
+// The first probe (join-click) reports "not yet admitted"; the second, final
+// probe inside the admission wait admits and raises Stop at the same moment,
+// so no later loop check can see it.
+type stopOnAdmitBrowser struct {
+	disclosureBrowser
+	stop   *bool
+	probes int
+}
+
+func (b *stopOnAdmitBrowser) Evaluate(js string) (any, error) {
+	switch js {
+	case meetIsAdmittedJS:
+		b.probes++
+		if b.probes == 1 {
+			return false, nil
+		}
+		*b.stop = true
+		return true, nil
+	case meetDeniedJS:
+		return false, nil
+	case clickButtonByTextOptionalJS(meetJoinButtonLabels):
+		return "Ask to join", nil
+	}
+	return b.disclosureBrowser.Evaluate(js)
+}
+
+// A Stop observed at the admission-to-recording boundary is a cancellation:
+// recording never starts and nothing is transcribed (Jason's #1506 decision).
+func TestMeetingStopAtRecordingBoundaryRecordsNothing(t *testing.T) {
+	workspace := t.TempDir()
+	h := NewMeetingJoinHandler(workspace)
+	h.diskPressureFn = func(string) bool { return false }
+	stop := false
+	media := &pipelineMedia{browser: &stopOnAdmitBrowser{stop: &stop}, path: filepath.Join(workspace, "meetings", "synthetic.wav")}
+	h.newMedia = func(meetingJoinParams) MeetingMedia { return media }
+	transcribed := false
+	h.transcribeFinal = func(JobContext, *nexus.Job, string) ([]byte, error) { transcribed = true; return nil, nil }
+	got, progress := progressRecorder()
+	_, err := h.Execute(JobContext{Progress: progress, CancelRequested: func() bool { return stop }}, c1Job())
+	if !errors.Is(err, context.Canceled) || media.stopped || transcribed || !media.closed {
+		t.Fatalf("boundary Stop: err=%v recorded=%v transcribed=%v closed=%v", err, media.stopped, transcribed, media.closed)
+	}
+	if e := endedReason(t, *got); e["reason"] != MeetingEndStoppedByUser {
+		t.Fatalf("ended event %v", e)
+	}
+}

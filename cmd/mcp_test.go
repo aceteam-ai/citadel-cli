@@ -907,7 +907,7 @@ func TestGetAPIKeyFromConfig(t *testing.T) {
 // comment) resolves to "", never a placeholder. Uses t.Setenv("HOME", ...)
 // so this never reads a real node's config.yaml/identity.json.
 func TestResolveNodeIDForMCPHeaderEmptyWithoutConfig(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 
 	if got := resolveNodeIDForMCPHeader(); got != "" {
 		t.Errorf("expected empty node id with no config present, got %q", got)
