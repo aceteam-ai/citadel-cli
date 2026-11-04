@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -360,7 +361,7 @@ and system user configuration (requires sudo).`,
 					}
 				} else {
 					// Do not mistake a saved bearer for a completed current-key link.
-					printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
+					printDeviceLinkDiagnosticContext(cmd.Context(), os.Stderr, getDeviceConfigFromFile())
 				}
 
 				// Get node name from network status
@@ -1500,7 +1501,7 @@ func generateCitadelConfig(user, nodeName, serviceName, orgID string) (string, e
 	}
 
 	// Always write all available service definitions to allow for easy switching later.
-	for name, content := range services.ServiceMap {
+	for name, content := range services.ComposeMapForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose) {
 		filePath := filepath.Join(servicesDir, name+".yml")
 		if err := os.WriteFile(filePath, []byte(content), 0600); err != nil {
 			return "", err

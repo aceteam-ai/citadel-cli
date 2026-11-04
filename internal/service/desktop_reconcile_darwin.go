@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // ReconcileBundledDesktopHelper is intentionally callable only from the
@@ -25,7 +27,7 @@ func ReconcileBundledDesktopHelper() (DesktopReconcileStatus, error) {
 	if !bundledDesktopHelper(source) {
 		return DesktopStageFailed, fmt.Errorf("desktop helper must run from the app bundle")
 	}
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return DesktopStageFailed, err
 	}

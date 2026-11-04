@@ -69,6 +69,7 @@ func runReconnect() {
 			fmt.Printf("  Hostname: %s\n", status.Hostname)
 			fmt.Printf("  IP:       %s\n", status.IPv4)
 		}
+		printDeviceLinkDiagnosticContext(ctx, os.Stderr, getDeviceConfigFromFile())
 		return
 	}
 
@@ -115,6 +116,7 @@ func runReconnect() {
 			fmt.Printf("  Hostname: %s\n", status.Hostname)
 			fmt.Printf("  IP:       %s\n", status.IPv4)
 		}
+		printDeviceLinkDiagnosticContext(ctx, os.Stderr, deviceConfig)
 		_ = network.Disconnect()
 	} else {
 		fmt.Fprintln(os.Stderr, "VPN recovery failed.")

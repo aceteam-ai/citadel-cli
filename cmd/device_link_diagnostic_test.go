@@ -17,14 +17,14 @@ import (
 func TestDeviceLinkDiagnosticReportsUncertaintyWithoutCredentials(t *testing.T) {
 	for _, dc := range []*DeviceConfig{nil, {}, {RedisURL: "redis://legacy-secret@invalid"}} {
 		var out bytes.Buffer
-		printDeviceLinkDiagnostic(&out, dc)
+		printDeviceLinkDiagnosticContext(context.Background(), &out, dc)
 		if out.Len() != 0 {
 			t.Fatalf("non-API configuration acquired a device-link claim: %q", out.String())
 		}
 	}
 	dc := &DeviceConfig{DeviceAPIToken: "device-secret", APIBaseURL: "https://private-origin.invalid", OrgID: "private-org"}
 	var out bytes.Buffer
-	printDeviceLinkDiagnostic(&out, dc)
+	printDeviceLinkDiagnosticContext(context.Background(), &out, dc)
 	got := out.String()
 	for _, want := range []string{"Device link: unverified", "saved credentials do not prove", "citadel logout && citadel init", "fresh browser approval"} {
 		if !strings.Contains(got, want) {
@@ -53,7 +53,7 @@ func TestDeviceLinkDiagnosticPreservesPreferredCredentialAndFiles(t *testing.T) 
 		t.Fatal("preferred credential was not selected")
 	}
 	var out bytes.Buffer
-	printDeviceLinkDiagnostic(&out, dc)
+	printDeviceLinkDiagnosticContext(context.Background(), &out, dc)
 	if !strings.Contains(out.String(), "unverified") {
 		t.Fatal("saved credential was silently treated as proof of a link")
 	}

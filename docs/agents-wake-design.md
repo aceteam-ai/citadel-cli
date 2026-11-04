@@ -26,7 +26,9 @@ remains intact: no retry, reconstruction, retargeting or native attempt.
 - `citadel agents wake` is the supervisor in platform `auto` mode; child worker
   lanes use platform `supervised` mode. These are governed-lane roles, not
   permission to bypass Codex approvals or a Codex command-line auto flag.
-- Each lane opts in. Maximum ten automatic turns per rolling twenty-four hours,
+- Each lane opts in. Per-harness defaults, updated by Jason on October 29 in
+  [Aceteam #12838](https://github.com/aceteam-ai/aceteam/issues/12838): Codex at most
+  48 and Claude Code at most 10 automatic turns per lane per rolling 24 hours,
   thirty minutes per turn, one active turn per lane; a lane may lower those caps.
 - At most one automatic native submission per prepared message. Ambiguous
   outcomes hold and are not retried, including via a different adapter.

@@ -88,18 +88,23 @@ func TestDeliveryObservationAPIActualConsumeConversion(t *testing.T) {
 	source.client = redisapi.NewClient(redisapi.ClientConfig{BaseURL: srv.URL, Token: "test-only"})
 	defer source.Close()
 	job, err := source.nextSingle(context.Background(), "actual-request-queue", 1)
-	if err != nil {
-		t.Fatal(err)
+	// S3a refuses legacy-negotiated v1 metadata; a passive observation is not
+	// an authenticated, renewed execution claim.
+	if err != nil || job != nil || source.RefusedDeliveries() != 1 {
+		t.Fatal("passive API metadata acquired execution authority or fetch backoff")
 	}
 	if req["queue"] != "actual-request-queue" || req["group"] != "citadel-workers" || req["consumer"] != source.client.WorkerID() || req["protocol"] != nil || len(req) != 5 {
 		t.Fatal("request negotiation changed")
 	}
 	source.queueNames[0] = "changed"
-	assertDeliveryJob(t, job, "actual-request-queue", "redis-api")
 	apiJob, err := source.client.ConsumeJob(context.Background(), redisapi.ConsumeRequest{Queue: "original", Group: "citadel-workers", Count: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !apiJob.HasDurableMetadata() || apiJob.ClaimedDelivery() != nil {
+		t.Fatal("passive consume minted or dropped claim provenance")
+	}
+	assertDeliveryJob(t, source.convertJob(apiJob), "original", "redis-api")
 	apiJob.JobID = "replacement"
 	apiJob.Type = "replacement"
 	apiJob.MessageID = "replacement"
@@ -116,6 +121,7 @@ func TestDeliveryObservationAPIActualConsumeConversion(t *testing.T) {
 func TestDeliveryObservationWSActualConsumeConversion(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	requests := make(chan map[string]any, 1)
+	refused := make(chan struct{}, 1)
 	finish := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !websocket.IsWebSocketUpgrade(r) {
@@ -144,7 +150,14 @@ func TestDeliveryObservationWSActualConsumeConversion(t *testing.T) {
 	defer srv.Close()
 	client := redisapi.NewClient(redisapi.ClientConfig{BaseURL: srv.URL, Token: "test-only"})
 	defer client.Close()
-	source := NewWSSource(WSSourceConfig{Client: client, QueueName: "requested-queue", LogFn: func(string, string) {}})
+	source := NewWSSource(WSSourceConfig{Client: client, QueueName: "requested-queue", LogFn: func(level, msg string) {
+		if level == "warning" && strings.Contains(msg, "Unsupported durable delivery skipped") {
+			select {
+			case refused <- struct{}{}:
+			default:
+			}
+		}
+	}})
 	defer source.Close()
 	defer close(finish)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -152,9 +165,13 @@ func TestDeliveryObservationWSActualConsumeConversion(t *testing.T) {
 	if err := source.Connect(ctx); err != nil {
 		t.Fatal(err)
 	}
-	job, err := source.Next(ctx)
-	if err != nil {
-		t.Fatal(err)
+	select {
+	case <-refused:
+	case <-ctx.Done():
+		t.Fatal("v1 WebSocket delivery was not refused")
+	}
+	if source.RefusedDeliveries() != 1 {
+		t.Fatal("WS refusal not counted")
 	}
 	select {
 	case req := <-requests:
@@ -165,7 +182,6 @@ func TestDeliveryObservationWSActualConsumeConversion(t *testing.T) {
 		t.Fatal("consume not sent")
 	}
 	source.queueNames[0] = "changed"
-	assertDeliveryJob(t, job, "wire-queue", "websocket")
 	select {
 	case <-source.jobs:
 		t.Fatal("disposition acquired job authority")
@@ -182,11 +198,12 @@ func TestDeliveryObservationUnknownManualAndStaticContract(t *testing.T) {
 	json.Unmarshal([]byte(deliveryData()), &data)
 	source := NewWSSource(WSSourceConfig{})
 	job, err := source.convertWSJob(redisapi.WSMessage{Type: "job", ID: "1-0", Queue: "q", Data: data})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || job != nil {
+		t.Fatal("manual v1 WS map acquired execution authority")
 	}
-	if job.observation.State() != deliverymetadata.Unknown {
-		t.Fatal("complete manual WS map provenance invented")
+	job, err = source.convertWSJob(redisapi.WSMessage{Type: "job", ID: "1-0", Queue: "q", Data: map[string]string{"jobId": "legacy", "payload": "{}"}})
+	if err != nil || job.observation.State() != deliverymetadata.Unknown {
+		t.Fatal("manual legacy WS provenance invented", err)
 	}
 	field, ok := reflect.TypeFor[Job]().FieldByName("observation")
 	if !ok || field.PkgPath == "" || field.Type.Kind() != reflect.Pointer || field.Tag.Get("json") != "-" {

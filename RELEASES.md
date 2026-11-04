@@ -3314,3 +3314,156 @@ Auto-generated log of every release.
   - feat(sessions): native declared session holder S1 (#1443)
 
 
+---
+
+## v2.203.0 — 2026-10-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 12 |
+| Files changed | 95 |
+| Lines added | +10516 |
+
+**Changes:**
+
+  - fix(worker): report terminal gate refusals for known withheld jobs (#1492)
+  - docs(enrollment): clarify refresh and stale-node recovery boundaries (#1493)
+  - fix(memorygit): disable lazy fetching in the child environment (#1495)
+  - fix(update): atomically persist state and expose corrupt-state pauses (#1482)
+  - feat(auth): verify current-key binding before suppressing link warnings (#1480)
+  - test(worker): cover service-manager platform recovery wiring (#1485)
+  - chore(deps): declare godbus as a direct requirement (#1484)
+  - fix(sessions): recover abandoned starts and retain refused viewers (#1449)
+  - fix(video-compose): bound camera metadata preflight (#1446)
+  - feat(agents): prepare inactive wake quota model (#1454)
+  - feat(agents): prepare disk and worktree policy model (#1453)
+  - feat(controlcenter): read bounded shared worker detail (#1448)
+
+
+---
+
+## v2.204.0 — 2026-10-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 79 |
+| Lines added | +6503 |
+
+**Changes:**
+
+  - fix(worker): fence durable HTTP delivery before terminal publish (#1504)
+  - feat(worker): prepare fenced meeting intake custody (#1515)
+  - fix(cdp): share bounded page discovery across browser paths (#1507)
+  - fix(worker): restore permission hints and live meeting gates (#1509)
+  - Support exact ingress host routes and mounted cert sets (#1517)
+  - fix(whisper): align patched OpenTelemetry API and SDK pins (#1511)
+  - fix(agentquota): configure wake caps per harness (#1512)
+  - fix(update): preflight install authority and report manual-update capability (#1490)
+  - fix(cdp): bound HTTP target discovery before selecting a page (#1494)
+
+
+---
+
+## v2.205.0 — 2026-10-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 43 |
+| Lines added | +3161 |
+
+**Changes:**
+
+  - fix(meeting): unattended-join safety (#1505 C1), with #1514 review fixes (#1522)
+
+
+---
+
+## v2.206.0 — 2026-11-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +551 |
+
+**Changes:**
+
+  - fix(meeting): honor Stop at the admission-to-recording boundary (#1524)
+  - feat(meeting): live progress, denial vs timeout, graceful Stop (#1506) (#1523)
+
+
+---
+
+## v2.207.0 — 2026-11-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 27 |
+| Files changed | 130 |
+| Lines added | +7798 |
+
+**Changes:**
+
+  - Merge pull request #1473 from aceteam-ai/fix/1468-repository-home-audit
+  - Merge pull request #1472 from aceteam-ai/fix/1468-internal-home-isolation
+  - Merge pull request #1471 from aceteam-ai/fix/1468-home-marker-isolation
+  - Merge pull request #1469 from aceteam-ai/fix/1468-network-test-paths
+  - fix(reconstruct): bound operator pipeline and create-only publication (#1411)
+  - feat(desktop): stage Windows x64 helpers in the shared shell (#1460)
+  - docs: propose bounded Harness2 runtime for #1380 (#1415)
+  - feat(desktop): stage Linux helpers in the shared Tauri shell (#1459)
+  - docs: propose atomic wake policy reservation (#1516)
+  - docs: propose PersonaPlex duplex voice feasibility (#1216) (#1425)
+  - docs(design): propose per-service drain and reservation custody (#1419)
+  - docs(design): headless ComfyUI engine with approved workflows (#1418)
+  - docs(catalog): plan private module environment publication (#1417)
+  - fix(desktop): reject invalid and symlinked DMG build outputs (#1458)
+  - fix(diffusers): retain idle cleanup callback outcomes (#1457)
+  - feat: add inactive synthetic point-cloud capture slice (#1456)
+  - fix(cdp): bound messages before reading and screenshots before decoding (#1455)
+  - fix(mediainput): align portable paths and exact refusal reasons (#1404)
+  - Merge refreshed isolation stack into repository audit draft
+  - Merge refreshed prerequisites into internal home-isolation draft
+  - Merge refreshed host-state prerequisites into home-isolation draft
+  - Merge main into host-state isolation draft
+  - test: audit home resolver bypasses across the repository
+  - fix(testing): route internal home defaults through fixture seam
+  - fix(testing): isolate command home and podman marker paths
+  - test: verify fixture custody before host-state effects
+  - fix(testing): isolate command host-state discovery before fixtures run
+
+
+---
+
+## v2.208.0 — 2026-11-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 20 |
+| Lines added | +2560 |
+
+**Changes:**
+
+  - fix(update): verify managed restarts and diagnose worker install layouts (#1491)
+  - docs: source-first Speakrail full-duplex voice proposal (#1376) (#1423)
+
+
+---
+
+## v2.209.0 — 2026-11-04
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 31 |
+| Lines added | +1474 |
+
+**Changes:**
+
+  - fix(services): select CPU compose on GPU-less Linux nodes (#1535)
+  - fix(update): disclose the effective startup auto-update policy (#1534)
+
+

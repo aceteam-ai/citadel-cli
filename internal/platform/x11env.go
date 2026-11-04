@@ -79,7 +79,7 @@ func findXAuthority(display string) string {
 		filepath.Join("/run/user", itoa(uid), "gdm", "Xauthority"),
 		filepath.Join("/run/user", itoa(uid), ".mutter-Xwaylandauth"),
 	}
-	if home, err := os.UserHomeDir(); err == nil {
+	if home, err := HomeDir(""); err == nil {
 		candidates = append(candidates, filepath.Join(home, ".Xauthority"))
 	}
 	for _, c := range candidates {
