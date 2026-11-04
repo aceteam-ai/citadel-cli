@@ -15,7 +15,7 @@ func TestComposeForHostSelectsOnlySupportedLinuxCPUEngines(t *testing.T) {
 			probes := 0
 			got, ok := ComposeForHost(name, "linux", func() int { probes++; return count })
 			want := string(cpu)
-			if count > 0 {
+			if count != 0 {
 				want = ServiceMap[name]
 			}
 			if !ok || got != want || probes != 1 {
@@ -68,4 +68,33 @@ func TestComposeMapForHostSamplesOnceAndDoesNotMutateStaticMap(t *testing.T) {
 		t.Fatalf("GPU map sampled %d times", probes)
 	}
 	ComposeMapForHost("windows", func() int { t.Fatal("non-Linux map probed host"); return 0 })
+}
+
+func TestUnknownGPUSelectionPreservesExistingFlavorAndWithholdsRefresh(t *testing.T) {
+	for _, probe := range []func() int{nil, func() int { return -1 }} {
+		for _, name := range []string{"ollama", "llamacpp"} {
+			selected := SelectComposeForHost(name, "linux", probe)
+			if !selected.Embedded || !selected.PreserveExisting || selected.Content != ServiceMap[name] {
+				t.Fatal("unknown evidence selected a CPU flip", name)
+			}
+		}
+		refresh := ComposeMapForRefresh("linux", probe)
+		if _, ok := refresh["ollama"]; ok {
+			t.Fatal("unknown Ollama flavor entered sweep")
+		}
+		if _, ok := refresh["llamacpp"]; ok {
+			t.Fatal("unknown llama.cpp flavor entered sweep")
+		}
+		if refresh["vllm"] != ServiceMap["vllm"] {
+			t.Fatal("unrelated engine changed")
+		}
+	}
+	for _, count := range []int{0, 1} {
+		calls := 0
+		selected := ComposeMapForRefresh("linux", func() int { calls++; return count })
+		if calls != 1 || len(selected) != len(ServiceMap) {
+			t.Fatal("refresh must sample once and include known variants")
+		}
+	}
+	ComposeMapForRefresh("darwin", func() int { t.Fatal("Darwin probed NVIDIA"); return 0 })
 }

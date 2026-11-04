@@ -15,26 +15,51 @@ var llamacppCPUCompose string
 // HasCPUComposeVariant limits CPU selection to engines with a supported image.
 func HasCPUComposeVariant(name string) bool { return name == "ollama" || name == "llamacpp" }
 
-// ComposeForHost selects a template without probing unrelated engines or OSes.
-// gpuCount is injected; production callers supply platform.GetGPUCountSimple.
-func ComposeForHost(name, goos string, gpuCount func() int) (string, bool) {
+// HostComposeSelection records a template and whether existing bytes must stay.
+// gpuCount is injected: zero proves absence, a positive count proves presence,
+// and a negative count (or nil detector) is unknown.
+type HostComposeSelection struct {
+	Content          string
+	Embedded         bool
+	PreserveExisting bool
+}
+
+func SelectComposeForHost(name, goos string, gpuCount func() int) HostComposeSelection {
 	content, ok := ServiceMap[name]
+	selected := HostComposeSelection{Content: content, Embedded: ok}
 	if !ok || goos != "linux" || !HasCPUComposeVariant(name) {
-		return content, ok
+		return selected
 	}
-	if gpuCount != nil && gpuCount() > 0 {
-		return content, true
+	count := -1
+	if gpuCount != nil {
+		count = gpuCount()
+	}
+	if count < 0 {
+		selected.PreserveExisting = true
+		return selected
+	}
+	if count > 0 {
+		return selected
 	}
 	if name == "ollama" {
-		return ollamaCPUCompose, true
+		selected.Content = ollamaCPUCompose
+	} else {
+		selected.Content = llamacppCPUCompose
 	}
-	return llamacppCPUCompose, true
+	return selected
+}
+
+// ComposeForHost provides the initial template. Callers reconciling existing
+// files must honor SelectComposeForHost's PreserveExisting on unknown evidence.
+func ComposeForHost(name, goos string, gpuCount func() int) (string, bool) {
+	selected := SelectComposeForHost(name, goos, gpuCount)
+	return selected.Content, selected.Embedded
 }
 
 // ComposeMapForHost returns a fresh map and samples the detector at most once.
 func ComposeMapForHost(goos string, gpuCount func() int) map[string]string {
 	result := make(map[string]string, len(ServiceMap))
-	count, sampled := 0, false
+	count, sampled := -1, false
 	once := func() int {
 		if !sampled {
 			if gpuCount != nil {
@@ -53,4 +78,19 @@ func ComposeMapForHost(goos string, gpuCount func() int) map[string]string {
 // ComposeDeclaresNvidiaReservation inspects only known embedded templates.
 func ComposeDeclaresNvidiaReservation(content string) bool {
 	return composeDeclaresNvidiaReservation(content)
+}
+
+// ComposeMapForRefresh withholds uncertain CPU/GPU selections from a sweep,
+// so even a version upgrade cannot flip the existing flavor on probe failure.
+func ComposeMapForRefresh(goos string, gpuCount func() int) map[string]string {
+	count := -1
+	if goos == "linux" && gpuCount != nil {
+		count = gpuCount()
+	}
+	selected := ComposeMapForHost(goos, func() int { return count })
+	if goos == "linux" && count < 0 {
+		delete(selected, "ollama")
+		delete(selected, "llamacpp")
+	}
+	return selected
 }

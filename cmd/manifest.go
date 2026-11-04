@@ -629,16 +629,17 @@ func containsTag(tags []string, tag string) bool {
 // why the "file already exists, leave it alone" fast path below cannot skip
 // it.
 func ensureComposeFile(configDir, serviceName string) error {
-	return ensureComposeFileForHost(configDir, serviceName, runtime.GOOS, platform.GetGPUCountSimple)
+	return ensureComposeFileForHost(configDir, serviceName, runtime.GOOS, platform.NvidiaGPUCountForCompose)
 }
 
 func ensureComposeFileForHost(configDir, serviceName, goos string, gpuCount func() int) error {
 	servicesDir := filepath.Join(configDir, "services")
 	destPath := filepath.Join(servicesDir, serviceName+".yml")
 
-	content, embedded := services.ComposeForHost(serviceName, goos, gpuCount)
-	if embedded && goos == "linux" {
-		if _, err := compose.ReconcileCPUComposeOnDisk(destPath, serviceName, content, resolveNodeDirOverride()); err != nil {
+	selection := services.SelectComposeForHost(serviceName, goos, gpuCount)
+	content, embedded := selection.Content, selection.Embedded
+	if embedded && goos == "linux" && !selection.PreserveExisting {
+		if _, err := compose.ReconcileCPUComposeOnDisk(destPath, serviceName, content, resolveNodeDirOverride(), Log); err != nil {
 			return fmt.Errorf("reconcile host compose for %q: %w", serviceName, err)
 		}
 	}
@@ -785,7 +786,10 @@ func reconcileHostComposeForStart(name, path string, gpuCount func() int) error 
 		filepath.Base(path) != name+".yml" || filepath.Base(filepath.Dir(path)) != "services" {
 		return nil
 	}
-	content, _ := services.ComposeForHost(name, runtime.GOOS, gpuCount)
-	_, err := compose.ReconcileCPUComposeOnDisk(path, name, content, resolveNodeDirOverride())
+	selection := services.SelectComposeForHost(name, runtime.GOOS, gpuCount)
+	if selection.PreserveExisting {
+		return nil
+	}
+	_, err := compose.ReconcileCPUComposeOnDisk(path, name, selection.Content, resolveNodeDirOverride(), Log)
 	return err
 }

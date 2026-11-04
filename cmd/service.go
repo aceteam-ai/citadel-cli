@@ -181,7 +181,7 @@ func startService(serviceName, composeFilePath string) error {
 
 	// Module starts and manifest boot starts can bypass ensureComposeFile.
 	// Reconcile only the canonical embedded file, before the running shortcut.
-	if err := reconcileHostComposeForStart(serviceName, composeFilePath, platform.GetGPUCountSimple); err != nil {
+	if err := reconcileHostComposeForStart(serviceName, composeFilePath, platform.NvidiaGPUCountForCompose); err != nil {
 		return err
 	}
 

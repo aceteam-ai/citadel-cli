@@ -8,7 +8,7 @@ import (
 )
 
 // ReplaceManagedCompose publishes an already-validated template under the
-// caller's service mutation lock. Recheck the bytes before replacement, then
+// caller's serialization, where provided. Recheck bytes before replacement, then
 // repair an existing ownership stamp without changing its version or peers.
 // A stamp error is returned even after the compose rename; retrying the selected
 // template repairs that metadata. Atomic rename does not promise crash durability.

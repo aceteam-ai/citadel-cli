@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,4 +134,26 @@ func rewriteHostVariantNameForTest(t *testing.T, content, name, override string)
 		t.Fatal(err)
 	}
 	return got
+}
+
+func TestCPUFlavorFlipIsLoggedExactlyWhenChanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ollama.yml")
+	if err := os.WriteFile(path, []byte(services.ServiceMap["ollama"]), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cpu, _ := services.ComposeForHost("ollama", "linux", func() int { return 0 })
+	calls := 0
+	log := func(format string, args ...any) {
+		calls++
+		if !strings.Contains(fmt.Sprintf(format, args...), "ollama switched to CPU") {
+			t.Fatal("missing flip evidence")
+		}
+	}
+	if changed, err := ReconcileCPUComposeOnDisk(path, "ollama", cpu, "", log); err != nil || !changed || calls != 1 {
+		t.Fatal("flip was not logged", err, calls)
+	}
+	if changed, err := ReconcileCPUComposeOnDisk(path, "ollama", cpu, "", log); err != nil || changed || calls != 1 {
+		t.Fatal("unchanged flavor logged again", err, calls)
+	}
 }

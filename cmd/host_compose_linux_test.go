@@ -89,3 +89,45 @@ func TestBootRefreshUsesSelectedHostMap(t *testing.T) {
 		t.Fatal("boot sweep not invoked")
 	}
 }
+
+func TestUnknownGPUKeepsBothExistingFlavorsAndSkipsBootRewrite(t *testing.T) {
+	t.Setenv("CITADEL_NODE_DIR", "")
+	for _, name := range []string{"ollama", "llamacpp"} {
+		for _, count := range []int{0, 1} {
+			dir := t.TempDir()
+			if err := ensureComposeFileForHost(dir, name, "linux", func() int { return count }); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "services", name+".yml")
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ensureComposeFileForHost(dir, name, "linux", func() int { return -1 }); err != nil {
+				t.Fatal(err)
+			}
+			if err := reconcileHostComposeForStart(name, path, func() int { return -1 }); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != string(before) {
+				t.Fatal("unknown GPU observation changed existing flavor", err)
+			}
+		}
+	}
+	dir := writeManifestWithServices(t, nil)
+	t.Setenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE", "1")
+	called := false
+	refreshManagedComposeFilesWithSweep(dir, func(opts composerefresh.Options) (composerefresh.Result, error) {
+		called = true
+		for _, name := range []string{"ollama", "llamacpp"} {
+			if _, ok := opts.Embedded[name]; ok {
+				t.Fatal("unknown flavor was offered to sweep", name)
+			}
+		}
+		return composerefresh.Result{}, nil
+	}, func() int { return -1 })
+	if !called {
+		t.Fatal("sweep seam was not called")
+	}
+}

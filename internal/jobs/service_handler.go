@@ -18,6 +18,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -97,7 +98,7 @@ type ServiceHandler struct {
 	// ConfigDir is the absolute path to the directory containing citadel.yaml.
 	ConfigDir string
 	// gpuCount overrides host GPU detection for compose materialization tests.
-	// Production uses platform.GetGPUCountSimple when this is nil.
+	// Production uses platform.NvidiaGPUCountForCompose when this is nil.
 	gpuCount func() int
 	// WorkspaceDir is the absolute node workspace root. It is exported to
 	// docker compose as CITADEL_WORKSPACE so compose files that bind-mount the
@@ -1644,17 +1645,18 @@ func (h *ServiceHandler) prepareEmbeddedComposeForStart(svc manifestService) err
 func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
 	gpuCount := h.gpuCount
 	if gpuCount == nil {
-		gpuCount = platform.GetGPUCountSimple
+		gpuCount = platform.NvidiaGPUCountForCompose
 	}
-	content, ok := embeddedservices.ComposeForHost(name, runtime.GOOS, gpuCount)
+	selection := embeddedservices.SelectComposeForHost(name, runtime.GOOS, gpuCount)
+	content, ok := selection.Content, selection.Embedded
 	if !ok {
 		return fmt.Errorf("unknown embedded service: %s", name)
 	}
 	servicesDir := filepath.Join(h.ConfigDir, "services")
 	destPath := filepath.Join(servicesDir, name+".yml")
 	override := strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR"))
-	if runtime.GOOS == "linux" {
-		if _, err := compose.ReconcileCPUComposeOnDisk(destPath, name, content, override); err != nil {
+	if runtime.GOOS == "linux" && !selection.PreserveExisting {
+		if _, err := compose.ReconcileCPUComposeOnDisk(destPath, name, content, override, func(format string, args ...any) { clilog.Writef("info", format, args...) }); err != nil {
 			return fmt.Errorf("reconcile host compose for %q: %w", name, err)
 		}
 	}

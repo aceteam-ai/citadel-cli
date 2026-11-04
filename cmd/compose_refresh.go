@@ -45,7 +45,7 @@ import (
 // binary version is unchanged it is a cheap no-op. Failures are logged and never
 // abort startup -- a refresh problem must not stop the node from serving jobs.
 func refreshManagedComposeFiles(configDir string) {
-	refreshManagedComposeFilesWithSweep(configDir, composerefresh.Sweep, platform.GetGPUCountSimple)
+	refreshManagedComposeFilesWithSweep(configDir, composerefresh.Sweep, platform.NvidiaGPUCountForCompose)
 }
 
 func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composerefresh.Options) (composerefresh.Result, error), gpuCount func() int) {
@@ -70,7 +70,7 @@ func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composeref
 		res, sweepErr = sweep(composerefresh.Options{
 			ServicesDir:           servicesDir,
 			Version:               Version,
-			Embedded:              services.ComposeMapForHost(runtime.GOOS, gpuCount),
+			Embedded:              services.ComposeMapForRefresh(runtime.GOOS, gpuCount),
 			PortManaged:           services.ServiceHostPorts,
 			KnownHistoricalHashes: services.KnownComposeHashes,
 			Recreator:             recreator,

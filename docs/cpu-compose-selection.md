@@ -1,27 +1,40 @@
 # CPU compose selection
 
-On Linux, Citadel samples its existing NVIDIA detector when it materializes or
-starts the embedded Ollama and llama.cpp services. A positive GPU count keeps
-the existing GPU compose bytes. A zero count, including a failed detector,
-selects the existing CPU template also used on macOS. llama.cpp uses the
-`:server` image instead of `:server-cuda`; both CPU templates omit the NVIDIA
-device reservation. Ports, volumes, model interpolation and environment policy
-stay the same. CUDA-only engines such as vLLM and SGLang retain their templates.
+`platform.NvidiaGPUCountForCompose` owns a bounded observation for embedded
+Ollama and llama.cpp compose selection. A positive count selects the GPU
+variant. CPU selection requires no usable query result, a successful negative
+hardware inventory and an absent NVIDIA control device. Missing hardware
+inventory, inaccessible device evidence and timed-out probes are unknown.
+Both commands share `ComposeGPUProbeTimeout`; no serialized start waits on an
+unbounded driver query.
 
-This selection also applies at initial configuration and the versioned boot
-refresh. Existing manifest and module starts recheck the selected flavor before
-an already-running shortcut. The file change itself never restarts a container;
-the normal start or refresh path still owns runtime actions.
+`services.SelectComposeForHost` preserves an existing flavor on unknown
+evidence. A fresh file uses the embedded default until absence is proven.
+`services.ComposeMapForRefresh` withholds uncertain variants from boot refresh,
+so an upgrade cannot silently flip a GPU or CPU file after a failed probe.
+The historical `.darwin.yml` filenames now contain shared CPU templates;
+`TestDarwinComposeVariantsOnlyDropGPU` owns their allowed image/reservation
+changes. CUDA-only engines remain outside this selection.
 
-A later start can change a known Citadel compose from GPU to CPU or back. The
-start path only replaces the GPU flavor of a byte-recognized embedded template,
-including this node-directory override's expected container name. Operator edits
-and foreign namespaces are preserved. Same-flavor historical upgrades remain
-the versioned refresh sweep's job. Custom manifest paths are left alone.
+Initial configuration, CLI/module starts, worker starts and device-config
+materialization use this selection. Device-config starts reconcile before the
+runtime preflight. Changes are logged, but file replacement itself never
+restarts a container; the existing start or refresh path owns runtime actions.
 
-Replacements use an atomic rename with mode 0600 and update an existing managed
-stamp's service hash without changing its version or other services. An error
-updating the stamp is returned even if the compose rename succeeded; a repeat
-with the already-selected template can repair that hash. This does not claim
-crash durability across the two file updates. Existing service reservation and
+`compose.ReconcileCPUComposeOnDisk` replaces only a known embedded template's
+GPU flavor, including the current node-directory namespace. Operator edits,
+foreign namespaces, custom paths and same-flavor historical templates are
+preserved. CLI callers use their service mutation lock; worker calls use the
+serialized job lane. The byte recheck is not an interprocess lock.
+
+`composerefresh.writeCompose` owns atomic publication and restrictive file mode.
+It preserves an existing file's owner; a new file inherits the services
+directory's owner. Failure to keep the owner refuses publication. Its pure
+ownership decision follows the existing permissions-save policy for a group
+change with the same owning user. The same writer publishes managed stamps.
+
+`ReplaceManagedCompose` repairs an existing stamp's service hash without
+changing its version or peers. A stamp error remains an error even if the
+compose rename succeeded; a repeat can repair that hash. Atomic renames do not
+promise crash durability across both updates. Existing reservation and
 fine-tune admission guards remain authoritative.
