@@ -49,7 +49,7 @@ func TestWorkerAutoUpdaterOwnershipPolicyAndTicks(t *testing.T) {
 		{name: "work without ownership lock", inputs: autoUpdatePolicyInputs{force: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
+			useCmdFixtureHome(t, t.TempDir())
 			t.Setenv("CITADEL_AUTO_UPDATE", "")
 			t.Setenv("CITADEL_NO_AUTO_UPDATE", "")
 			oldVersion, oldOptOut := Version, noAutoUpdate
@@ -102,7 +102,7 @@ func TestWorkerAutoUpdaterOwnershipPolicyAndTicks(t *testing.T) {
 }
 
 func TestWorkerAutoUpdaterPersistedToggleAndShutdown(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_AUTO_UPDATE", "")
 	t.Setenv("CITADEL_NO_AUTO_UPDATE", "")
 	oldVersion, oldOptOut := Version, noAutoUpdate

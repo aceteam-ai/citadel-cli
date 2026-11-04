@@ -4,6 +4,8 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -18,7 +20,15 @@ type deviceAuthIdentityAttempt struct {
 	public *ecdsa.PublicKey
 }
 
+// Inert until a separately approved rollout explicitly opts in. This gate is
+// sampled once per grant and returns before reading or creating identity state.
+const deviceCertificateEnrollmentEnv = "CITADEL_ENROLLMENT_CERTIFICATES_ENABLED"
+
 func prepareDeviceAuthIdentity() *deviceAuthIdentityAttempt {
+	enabled := strings.TrimSpace(os.Getenv(deviceCertificateEnrollmentEnv))
+	if !strings.EqualFold(enabled, "true") && enabled != "1" {
+		return &deviceAuthIdentityAttempt{}
+	}
 	attempt := &deviceAuthIdentityAttempt{store: loginIdentityStore()}
 	csr, public, err := generateLoginCSR(attempt.store)
 	if err != nil {
@@ -33,32 +43,22 @@ func prepareDeviceAuthIdentity() *deviceAuthIdentityAttempt {
 // invalid, partial or unavailable bundles never fail the device authorization.
 // No filesystem error or key path is included in its diagnostics.
 func (attempt *deviceAuthIdentityAttempt) accept(token *nexus.TokenResponse) string {
-	if token == nil {
+	if attempt == nil || attempt.store == nil || attempt.public == nil || token == nil {
 		return ""
 	}
 	outcome, err := persistLoginIdentityBundle(attempt.store, attempt.public, token.LeafPem, token.ChainPem, token.NodeUID)
-	uid := ""
 	if err != nil {
 		Debug("device identity bundle rejected (non-fatal)")
-	} else {
-		uid = outcome.NodeUID
+		return ""
 	}
-	if uid != "" {
-		if saveLoginNodeUID(uid) != nil {
-			Debug("device serving identity could not be saved (non-fatal)")
-			return ""
-		}
-	} else if clearLoginNodeUID() != nil {
-		Debug("previous device serving identity could not be cleared (non-fatal)")
-	}
-	return uid
+	// Do not write login_node_uid: the legacy worker/rename/logout readers use
+	// that value as a mesh hostname, contrary to device enrollment's policy.
+	return outcome.NodeUID
 }
 
-func deviceEnrollmentHostname(result *DeviceAuthResult, displayName string) string {
-	if result == nil {
-		return displayName
-	}
-	return servingIdentityHostname(result.identityNodeUID, displayName)
+// The certificate UID is identity metadata, never the operator's mesh name.
+func deviceEnrollmentHostname(_ *DeviceAuthResult, displayName string) string {
+	return displayName
 }
 
 // The post-provisioning path must finish the current device grant in-process.

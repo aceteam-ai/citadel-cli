@@ -2015,7 +2015,7 @@ func ccRegisterDeviceToken(token *nexus.TokenResponse, deviceCode string) error 
 	return ccRegisterDeviceTokenAs(token, deviceCode, "")
 }
 
-func ccRegisterDeviceTokenAs(token *nexus.TokenResponse, deviceCode, identityNodeUID string) error {
+func ccRegisterDeviceTokenAs(token *nexus.TokenResponse, deviceCode, _ string) error {
 	// Get node name from manifest or hostname
 	nodeName := ""
 	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
@@ -2029,7 +2029,7 @@ func ccRegisterDeviceTokenAs(token *nexus.TokenResponse, deviceCode, identityNod
 	defer cancel()
 
 	config := network.ServerConfig{
-		Hostname:   servingIdentityHostname(identityNodeUID, nodeName),
+		Hostname:   deviceEnrollmentHostname(nil, nodeName),
 		ControlURL: nexusURL,
 		AuthKey:    token.Authkey,
 	}

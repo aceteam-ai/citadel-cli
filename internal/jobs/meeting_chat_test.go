@@ -165,7 +165,7 @@ func TestPostAndOpenMeetChat_PropagateErrors(t *testing.T) {
 func TestMeetAnnouncementText_MentionsCommands(t *testing.T) {
 	// The announcement is the consent + control surface; it must disclose
 	// recording and how to invoke the bot.
-	for _, want := range []string{"recording", "/ace leave", "/ace <command>"} {
+	for _, want := range []string{"recording audio", "transcribing", "the meeting owner", "/ace leave", "host can remove me"} {
 		if !strings.Contains(meetAnnouncementText, want) {
 			t.Errorf("announcement missing %q; got: %q", want, meetAnnouncementText)
 		}

@@ -1,9 +1,16 @@
 # Enrollment certificates
 
-The init, enroll, login and Control Center device-auth paths request a fabric CA
-leaf for the node's existing convergent signing key. They generate one CSR per
-authorization attempt, retain its exact public key and submit that same CSR while
-polling. No alternate signing identity or raw public-key registration is added.
+The added init, enroll and Control Center certificate enrollment is inactive by
+default. It returns before opening or creating any identity state, submits no CSR,
+and ignores unsolicited certificate bundles. Existing login's CSR path is
+unchanged. Ordinary device authorization still completes with its current grant.
+
+`CITADEL_ENROLLMENT_CERTIFICATES_ENABLED=true` (or `1`) opts the added paths in
+for a separately approved testbed rollout. Do not set it until the native
+acceptance and activation holds are cleared. It is sampled once for each grant,
+not a new authorization or credential. With the opt-in, those paths request a
+fabric CA leaf for the existing convergent signing key. They generate one CSR per
+authorization attempt and retain its exact public key while polling.
 
 `runDeviceAuthFlow` supplies the shared init/enroll path. Login retains its
 existing CSR-aware flow. Control Center binds polling and acceptance callbacks to
@@ -29,14 +36,14 @@ CSR or certificate failures are nonfatal to enrollment. Unavailable identity
 state and rejected bundles use static diagnostics without key paths, PEMs or
 credentials. An unvalidated response UID cannot select a serving name.
 
-The validated UID selects the deterministic mesh serving name through
-`servingIdentityHostname`. Init/enroll keep the operator's display and OS hostname
-separate through `connectToNetworkAs`; Control Center uses the same validated UID
-for registration. The persisted UID remains bound to the local key and leaf on
-later reads. Friendly display names do not establish certificate identity.
-The post-provisioning init path completes its current device grant in-process,
-preserving the validated serving name and link instead of invoking an
-authkey-only child login.
+The operator's display hostname remains the mesh registration and reclaim name,
+including when an opted-in grant returns a valid certificate UID. The UID stays
+in the identity/certificate state and never renames these device-enrollment
+paths. The new paths do not write `login_node_uid`, which legacy worker, rename
+and logout readers otherwise use as a serving name. Init/enroll and Control
+Center use the same display-name policy. The
+post-provisioning init path completes its captured device grant in-process,
+retaining the current authorization and link without an authkey-only child login.
 
 ## Local diagnostics
 

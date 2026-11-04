@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,10 +20,11 @@ import (
 
 // Client provides HTTP-based access to the AceTeam Redis API proxy.
 type Client struct {
-	baseURL    string
-	token      string
-	httpClient *http.Client
-	workerID   string
+	consumeProtocols sync.Map
+	baseURL          string
+	token            string
+	httpClient       *http.Client
+	workerID         string
 
 	// wsClient is the WebSocket client for real-time pub/sub. It is built once
 	// in NewClient and NEVER reassigned or nil'd afterwards.
@@ -321,6 +323,17 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// This exact authenticated route response negotiates the registered queue
+	// protocol before any delivery is read. Never match a generic 409 or echo body.
+	if path == "/api/fabric/redis/jobs/consume" && resp.StatusCode == http.StatusConflict && len(respBody) <= durableControlReplyLimit {
+		if object, parseErr := closedControlObject(respBody, "error"); parseErr == nil {
+			var reason string
+			if json.Unmarshal(object["error"], &reason) == nil && reason == "Queue protocol mismatch" {
+				return errQueueProtocolMismatch
+			}
+		}
 	}
 
 	// Consume bodies can carry in-flight job credentials, including malformed

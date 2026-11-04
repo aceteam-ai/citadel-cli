@@ -3,9 +3,11 @@
 package agentquota
 
 const (
-	WindowMillis      uint64 = 24 * 60 * 60 * 1000
-	MaxTurnMillis     uint64 = 30 * 60 * 1000
-	MaxTurnsPerWindow        = 10
+	WindowMillis  uint64 = 24 * 60 * 60 * 1000
+	MaxTurnMillis uint64 = 30 * 60 * 1000
+	// Structural history bounds retain Codex-sized debt even if the current
+	// policy lowers a cap or changes a lane to Claude. They are not defaults.
+	MaxTurnsPerWindow        = MaxCodexTurnsPerWindow
 	MaxLanes                 = 64
 	MaxChargesPerLane        = MaxTurnsPerWindow + 1
 	maxCounter        uint64 = ^uint64(0)
@@ -21,6 +23,7 @@ type Scope struct {
 
 type LanePolicy struct {
 	LaneID        string
+	Harness       Harness
 	Enabled       bool
 	MaxTurns      uint32
 	MaxTurnMillis uint64
@@ -31,8 +34,9 @@ type LanePolicy struct {
 // Its content must be a trusted current input; ConfigID alone proves no policy
 // freshness. Future outer CAS must bind policy edits and quota/resources alike.
 type Policy struct {
-	Scope Scope
-	Lanes []LanePolicy
+	Scope     Scope
+	Harnesses HarnessConfig
+	Lanes     []LanePolicy
 }
 
 type Phase string
@@ -205,11 +209,11 @@ func validScope(s Scope) bool {
 // Validate bounds supplied typed state before cloning. It cannot establish
 // durable completeness, canonical physical identity, freshness or no rollback.
 func Validate(policy Policy, snapshot Snapshot) error {
-	if !validScope(policy.Scope) || policy.Lanes == nil || len(policy.Lanes) > MaxLanes {
+	if !validScope(policy.Scope) || !policy.Harnesses.valid() || policy.Lanes == nil || len(policy.Lanes) > MaxLanes {
 		return held(HoldPolicy)
 	}
 	for i, lane := range policy.Lanes {
-		if !canonicalID(lane.LaneID) || lane.MaxTurns == 0 || lane.MaxTurns > MaxTurnsPerWindow || lane.MaxTurnMillis == 0 || lane.MaxTurnMillis > MaxTurnMillis {
+		if !canonicalID(lane.LaneID) || lane.MaxTurns == 0 || lane.MaxTurns > harnessMaximum(lane.Harness) || lane.MaxTurnMillis == 0 || lane.MaxTurnMillis > MaxTurnMillis {
 			return held(HoldPolicy)
 		}
 		for _, prior := range policy.Lanes[:i] {
@@ -373,14 +377,8 @@ func PlanReserve(policy Policy, snapshot Snapshot, ctx Context, laneID string) (
 	if err := validateContext(policy, snapshot, ctx); err != nil {
 		return Plan{}, err
 	}
-	var lanePolicy *LanePolicy
-	for i := range policy.Lanes {
-		if policy.Lanes[i].LaneID == laneID {
-			lanePolicy = &policy.Lanes[i]
-			break
-		}
-	}
-	if lanePolicy == nil || !lanePolicy.Enabled {
+	lanePolicy, found := policy.effectiveLane(laneID)
+	if !found || !lanePolicy.Enabled {
 		return Plan{}, held(HoldLane)
 	}
 	if err := admissionDeadline(snapshot, laneID, ctx.Clock.ElapsedMillis, lanePolicy.MaxTurnMillis); err != nil {
@@ -421,14 +419,8 @@ func PlanAttempt(policy Policy, snapshot Snapshot, ctx Context, ref Reservation)
 	if snapshot.Lanes[i].Charges[j].Phase != Reserved {
 		return Plan{}, held(HoldPhase)
 	}
-	var lanePolicy *LanePolicy
-	for k := range policy.Lanes {
-		if policy.Lanes[k].LaneID == ref.LaneID {
-			lanePolicy = &policy.Lanes[k]
-			break
-		}
-	}
-	if lanePolicy == nil || !lanePolicy.Enabled {
+	lanePolicy, found := policy.effectiveLane(ref.LaneID)
+	if !found || !lanePolicy.Enabled {
 		return Plan{}, held(HoldLane)
 	}
 	if err := admissionDeadline(snapshot, ref.LaneID, ctx.Clock.ElapsedMillis, lanePolicy.MaxTurnMillis); err != nil {

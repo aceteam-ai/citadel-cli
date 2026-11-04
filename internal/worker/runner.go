@@ -19,6 +19,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
@@ -282,6 +283,18 @@ func (r *Runner) Drain() {
 
 // NodeID is the local identity used by the runner's target filter.
 func (r *Runner) NodeID() string { return r.config.NodeID }
+
+// FenceIntakeForRecovery stops pickup before STUCK restart without waiting for
+// the possibly uncooperative poll that recovery is intended to terminate.
+func (r *Runner) FenceIntakeForRecovery() {
+	r.drainMu.Lock()
+	r.permanentDrain = true
+	cancel := r.pollCancel
+	r.drainMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
 
 // BeginDrain stops fetching jobs until its returned release function is called.
 // Each scope owns only its own pause; release is safe to call more than once.
@@ -664,10 +677,27 @@ func (r *Runner) clockNow() time.Time {
 // newStreamWriter builds the per-job stream writer, falling back to a no-op
 // writer when no factory is configured (e.g. Nexus HTTP source).
 func (r *Runner) newStreamWriter(job *Job) StreamWriter {
+	var raw StreamWriter = &NoOpStreamWriter{}
 	if r.streamWriterFactory != nil {
-		return observeStream(r.streamWriterFactory(job), job.clock)
+		raw = r.streamWriterFactory(job)
 	}
-	return observeStream(&NoOpStreamWriter{}, job.clock)
+	if job.delivery != nil {
+		if api, ok := raw.(*APIStreamWriter); ok {
+			copy := *api
+			copy.ctx, copy.durable = job.delivery().lost, true
+			raw = &copy
+		}
+	}
+	raw = observeStream(raw, job.clock)
+	if job.delivery == nil {
+		return raw
+	}
+	job.delivery().mu.Lock()
+	if job.delivery().raw == nil {
+		job.delivery().raw = raw
+	}
+	job.delivery().mu.Unlock()
+	return &durableStream{StreamWriter: raw, delivery: job.delivery()}
 }
 
 // streamWriteRetryAttempts / streamWriteRetryBackoff bound the retry
@@ -779,6 +809,15 @@ func (r *Runner) exitJob(jobOK bool) {
 func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream StreamWriter, startTime time.Time) {
 	startTime = time.Now()
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
+	if job.delivery != nil {
+		job.delivery().followShutdown(ctx)
+		if ctx.Err() != nil {
+			_ = r.source.Nack(ctx, job, ctx.Err())
+			return false, nil, startTime
+		}
+		job.clock = newDeliveryClock(r.clockNow, r.clockState)
+		stream = r.newStreamWriter(job)
+	}
 
 	// Target-node filter: when per-node consumer groups are used, every node
 	// sees every message on the shared org queue. If the job specifies a
@@ -804,7 +843,19 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 		} else {
 			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
 		}
-		r.source.Ack(ctx, job)
+		if job.delivery != nil {
+			if r.config.NodeID == "" {
+				_ = r.source.Fail(ctx, job, errors.New("target_unresolved"), map[string]any{"reason": "target_unresolved"})
+			} else {
+				_ = r.source.Nack(ctx, job, errors.New("target mismatch; awaiting claim-time refusal"))
+			}
+		} else {
+			r.source.Ack(ctx, job)
+		}
+		return false, nil, startTime
+	}
+	if job.delivery != nil && r.config.NodeID == "" {
+		_ = r.source.Fail(ctx, job, errors.New("target_unresolved"), map[string]any{"reason": "target_unresolved"})
 		return false, nil, startTime
 	}
 
@@ -822,8 +873,10 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// publish never landed. retryStreamWrite gives it a couple of quick extra
 	// chances before this still falls back to a log-and-proceed non-fatal
 	// warning, same as before.
-	job.clock = newDeliveryClock(r.clockNow, r.clockState)
-	stream = r.newStreamWriter(job)
+	if stream == nil {
+		job.clock = newDeliveryClock(r.clockNow, r.clockState)
+		stream = r.newStreamWriter(job)
+	}
 	if err := retryStreamWrite(ctx, func() error { return stream.WriteClaimed(r.agentVersion) }); err != nil {
 		r.log("warning", "Failed to publish claimed event for job %s: %v", job.ID, err)
 	}
@@ -903,6 +956,11 @@ func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream Str
 //     already retries), never a silent Nack (aceteam#8254 §3a). This is the
 //     queue-on-full that replaces the bare #825 Nack for inference under load.
 func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream StreamWriter, startTime time.Time, ticket *laneExecTicket) (jobOK bool) {
+	if job.delivery != nil {
+		var release func()
+		ctx, release = job.delivery().bind(ctx)
+		defer release()
+	}
 	ownsExec := false
 	releaseWaitingAuthority := func() {
 		if ownsExec {
@@ -926,7 +984,7 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 		// Cancellation wins when multiple readiness signals are already set.
 		if err := ctx.Err(); err != nil {
 			releaseWaitingAuthority()
-			r.source.Nack(ctx, job, err)
+			r.cancelWaitingDelivery(ctx, job, stream, err)
 			return true, false
 		}
 		if expired || (l.hasExecWait && !time.Now().Before(deadline)) {
@@ -946,7 +1004,7 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 		expired = true
 	case <-ctx.Done():
 		releaseWaitingAuthority()
-		r.source.Nack(ctx, job, ctx.Err())
+		r.cancelWaitingDelivery(ctx, job, stream, ctx.Err())
 		return false
 	}
 	if finished, ok := finishWait(expired); finished {
@@ -959,7 +1017,7 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 		expired = true
 	case <-ctx.Done():
 		releaseWaitingAuthority()
-		r.source.Nack(ctx, job, ctx.Err())
+		r.cancelWaitingDelivery(ctx, job, stream, ctx.Err())
 		return false
 	}
 	// A ready slot can win select alongside cancel/expiry. Return it before
@@ -994,6 +1052,25 @@ func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream Strea
 // caller passes (false, 0) and executeJob's output is byte-identical to before.
 // Returns jobOK true only on a clean success.
 func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, startTime time.Time, emitLatency bool, queueWaitMs int64) (jobOK bool) {
+	if job.delivery != nil {
+		var release func()
+		ctx, release = job.delivery().bind(ctx)
+		defer release()
+		defer job.delivery().stop()
+		if !job.delivery().valid() {
+			return false
+		}
+		if ctx.Err() != nil {
+			_ = r.source.Nack(ctx, job, ctx.Err())
+			return false
+		}
+		// A job may have been cancelled while waiting for its execution slot.
+		if r.source.IsJobCancelled(ctx, job.ID) {
+			_ = stream.WriteCancelled("Job cancelled before execution")
+			_ = r.source.Ack(ctx, job)
+			return false
+		}
+	}
 	r.state.RecordJobExecuting()
 	defer r.state.RecordJobExecuteDone()
 
@@ -1076,8 +1153,30 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		job.Payload["_gpuIndex"] = gpuIndex
 	}
 
-	// Execute handler (stream writer created at claim time)
-	stream.WriteStart("Job processing started")
+	handlerCtx, timeout, bounded, budgetErr := r.resolveExecutionBudget(ctx, handler, job)
+	if budgetErr == nil && job.Type == JobTypeMeetingJoin && job.Metadata.Attempts > 1 {
+		// A redelivered join (a stale-pending reclaim) is never re-executed: the
+		// original attempt may still own, or may have just abandoned, a live
+		// session under the same deterministic id. Fail it terminally instead.
+		budgetErr = errMeetingRedelivered
+	}
+	var ticket *executionTicket
+	if budgetErr == nil {
+		executionStarted := time.Now()
+		if job.Type == JobTypeMeetingJoin {
+			deadlineCtx, cancelDeadline := context.WithDeadline(handlerCtx, executionStarted.Add(timeout))
+			defer cancelDeadline()
+			handlerCtx = jobs.WithMeetingExecutionStart(deadlineCtx, executionStarted)
+		}
+		var specific time.Duration
+		if b, ok := handlerCtx.Value(meetingBudgetKey{}).(meetingpolicy.Budget); ok {
+			specific = b.StuckAfter()
+		}
+		ticket = r.state.beginExecution(job.Type, executionStarted, specific)
+		handlerCtx = context.WithValue(handlerCtx, executionTicketKey{}, ticket)
+		defer ticket.pipelineFinished()
+		stream.WriteStart("Job processing started")
+	}
 
 	// Per-job execution deadline (aceteam#6000). When the payload carries a
 	// positive timeout budget, run the handler under a bounded context plus a
@@ -1091,21 +1190,56 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	execStart := time.Now()
 	var result *JobResult
 	var err error
-	handlerCtx, stopCancellationWatch := r.watchHuddleCancellation(ctx, job)
-	// Cooperative (graceful) mid-job cancel watch for cooperativeCancelJobTypes
-	// (FILE_INDEX): polls job:cancelled:<id> and sets a flag the handler reads via
-	// JobContext.CancelRequested, WITHOUT cancelling handlerCtx — so the current
-	// file finishes and commits before the walk stops (aceteam#10876 C1). A no-op
-	// for every other job type, and harmless alongside the huddle watch (their
-	// job-type sets are disjoint).
+	handlerCtx, stopCancellationWatch := r.watchHuddleCancellation(handlerCtx, job)
+	// Cooperative (graceful) mid-job cancel watch for job types declaring
+	// CooperativeCancel (FILE_INDEX, MEETING_JOIN): polls job:cancelled:<id> and
+	// sets a flag the handler reads via JobContext.CancelRequested, WITHOUT
+	// cancelling handlerCtx, so FILE_INDEX commits its current file and a meeting
+	// leaves and still transcribes (aceteam#10876 C1, #1506). A no-op for every
+	// other job type; never combined with the hard huddle watch (HUDDLE_JOIN
+	// declares no cooperative cancel).
 	handlerCtx, stopCoopCancelWatch := r.watchCooperativeCancellation(handlerCtx, job)
-	if timeout, ok := r.resolveJobTimeout(job); ok {
-		result, err = r.executeWithDeadline(handlerCtx, handler, job, stream, timeout)
+	if budgetErr != nil {
+		err = budgetErr
+	} else if bounded {
+		result, err = r.executeWithDeadline(handlerCtx, handler, job, handlerDeliveryStream(job, stream), timeout)
 	} else {
-		result, err = handler.Execute(handlerCtx, job, stream)
+		result, err = r.executeObserved(handlerCtx, handler, job, handlerDeliveryStream(job, stream))
 	}
 	stopCoopCancelWatch()
 	cancelled := stopCancellationWatch()
+	// Cooperative legacy handlers finish their current unit and return partial
+	// success-shaped bytes. Use the runner-owned cancellation observation, never
+	// payload/output text, to preserve the v1 cancelled terminal mapping.
+	if job.delivery != nil {
+		if requested := jobs.CancelRequestedFrom(handlerCtx); requested != nil && requested() {
+			cancelled = true
+		}
+	}
+	if job.delivery != nil && !job.delivery().valid() {
+		return false
+	}
+	if job.Type == JobTypeMeetingJoin && errors.Is(err, jobs.ErrMeetingTeardownUnconfirmed) {
+		r.log("warning", "Meeting teardown remains unconfirmed; retaining source ownership")
+		return false
+	}
+	// Observe worker shutdown BEFORE the publication allowance replaces ctx
+	// with an uncancellable one; every shutdown decision below reads this.
+	rootErr := ctx.Err()
+	if cleanup := jobs.MeetingCleanupFrom(handlerCtx); cleanup != nil && budgetErr == nil {
+		publicationCtx, finish, e := cleanup.Begin(ctx)
+		if e != nil {
+			ticket.handlerFinished(true)
+			r.log("warning", "Meeting publication allowance exhausted; retaining source ownership")
+			return false
+		}
+		ctx = publicationCtx
+		defer func() {
+			if finish() != nil {
+				ticket.handlerFinished(true)
+			}
+		}()
+	}
 	// Sanitize before any generic failure logging, usage record or retry/status
 	// publication. The handler still receives the original in-flight payload.
 	err = jobprivacy.Error(job.Type, job.Payload, err)
@@ -1119,7 +1253,29 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	job.clock.finish(r.clockNow())
 	job.clock.populate(result)
 	duration := endTime.Sub(startTime)
-	if cancelled {
+	if job.delivery != nil && (cancelled || (result != nil && result.Status == JobStatusCancelled)) {
+		_ = stream.WriteCancelled("Job cancelled")
+		_ = r.source.Ack(ctx, job)
+		return false
+	}
+	var hardDeadline *deadlineExceededError
+	if job.delivery != nil && rootErr != nil && !errors.As(err, &hardDeadline) && (err != nil || result == nil || result.Status != JobStatusSuccess) {
+		_ = r.source.Nack(ctx, job, rootErr)
+		return false
+	}
+	// Caller cancellation (the platform's durable marker, or a handler-local
+	// cancel while the worker is alive) is distinct from worker shutdown: a
+	// shutdown-interrupted meeting falls through to the ordinary terminal
+	// failure path below, never "Meeting cancelled".
+	if cancelled || job.Type == JobTypeMeetingJoin && errors.Is(err, context.Canceled) && rootErr == nil {
+		if job.Type == JobTypeMeetingJoin {
+			r.recordJob(buildUsageRecord(job, "cancelled", startTime, endTime, result, context.Canceled))
+			if e := stream.WriteCancelled("Meeting cancelled"); e != nil {
+				r.log("warning", "Failed to publish meeting cancellation")
+			}
+			r.source.Ack(ctx, job)
+			return false
+		}
 		if errors.Is(err, jobs.ErrHuddleTerminalOwned) {
 			r.log("info", "Huddle job %s terminal is coordinator-owned", job.ID)
 			r.ackHuddleCoordinatorTerminal(ctx, job)
@@ -1260,6 +1416,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		var gateRefusal *jobs.ShellRefusal
 		isGateRefusal := errors.As(actualErr, &gateRefusal)
 		isHuddleJoin := job.Type == JobTypeHuddleJoin
+		isMeetingJoin := job.Type == JobTypeMeetingJoin
 
 		// Exactly one terminal event per job id (issue #826). A generic failure
 		// that will be retried (Nack path, another attempt still within budget)
@@ -1274,12 +1431,16 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// publishes, so a job that exhausts its retries still reports failure
 		// exactly once. Mirrors the reasoning #822/#559 already applied to the
 		// JobStatusRetry and no-GPU-slot Nack paths below/above.
-		if isDeadlineExceeded || isFilesDisabled || isReceiptSigningUnavailable || isSandboxedModuleUnavailable || isGateRefusal || isHuddleJoin || !willRetry(job) {
+		if isDeadlineExceeded || isFilesDisabled || isReceiptSigningUnavailable || isSandboxedModuleUnavailable || isGateRefusal || isHuddleJoin || isMeetingJoin || !willRetry(job) {
 			if werr := stream.WriteError(actualErr, false); werr != nil {
 				r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
 			}
 		}
 
+		if isMeetingJoin && !isGateRefusal {
+			r.source.Fail(ctx, job, actualErr, map[string]any{"reason": "meeting_failed_no_automatic_rejoin"})
+			return false
+		}
 		if isDeadlineExceeded {
 			r.source.Fail(ctx, job, actualErr, map[string]any{
 				"deadline_exceeded":  true,
@@ -1363,7 +1524,7 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		return r.finishWorkerControl(ctx, job, stream, handler, result, startTime, endTime)
 	}
 	r.finishSuccess(ctx, job, stream, result, startTime, endTime)
-	return true
+	return job.delivery == nil || job.delivery().isCommitted()
 }
 
 type huddleTeardownDeferrer interface {
@@ -1428,13 +1589,16 @@ func (r *Runner) deferHuddleTeardown(ctx context.Context, job *Job, err error) {
 }
 
 // watchHuddleCancellation turns the platform's durable cancellation marker
-// into the execution context cancellation resident HUDDLE_JOIN handlers need.
+// into hard execution cancellation for HUDDLE_JOIN. MEETING_JOIN instead
+// declares a cooperative (graceful) Stop: it leaves the call and still records
+// and transcribes what was captured (#1506).
 // Other job types retain the existing pre-execution-only cancellation check.
 func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context.Context, func() bool) {
 	if job.Type != JobTypeHuddleJoin {
 		return ctx, func() bool { return false }
 	}
 	execCtx, cancelExec := context.WithCancel(ctx)
+	watchCtx, cancelWatch := context.WithCancel(ctx)
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	var cancelled atomic.Bool
@@ -1453,7 +1617,7 @@ func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if r.source.IsJobCancelled(ctx, job.ID) {
+				if r.source.IsJobCancelled(watchCtx, job.ID) {
 					cancelled.Store(true)
 					cancelExec()
 					return
@@ -1462,6 +1626,7 @@ func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context
 		}
 	}()
 	return execCtx, func() bool {
+		cancelWatch()
 		close(stop)
 		<-done
 		cancelExec()
@@ -1470,14 +1635,14 @@ func (r *Runner) watchHuddleCancellation(ctx context.Context, job *Job) (context
 }
 
 // watchCooperativeCancellation turns the platform's durable cancellation marker
-// into a GRACEFUL stop signal for cooperativeCancelJobTypes (FILE_INDEX). Unlike
+// into a GRACEFUL stop signal for job types declaring CooperativeCancel (FILE_INDEX, MEETING_JOIN). Unlike
 // watchHuddleCancellation it does NOT cancel the handler context: it polls
 // job:cancelled:<id> and, on cancel, sets a flag the handler reads via
 // JobContext.CancelRequested (threaded through the returned context). The handler
 // finishes the current unit (file), commits it, and returns `cancelled` with
 // partial counts — "cancel commits the current file" (aceteam#10876 C1).
 //
-// For any job type NOT in cooperativeCancelJobTypes this returns ctx unchanged
+// For any job type that does not declare CooperativeCancel this returns ctx unchanged
 // and a no-op stop, so it is inert for every other job. The returned stop func
 // halts the poll goroutine (call it once execution is done).
 func (r *Runner) watchCooperativeCancellation(ctx context.Context, job *Job) (context.Context, func()) {
@@ -1603,6 +1768,10 @@ func (r *Runner) publishWorkerControlRefusal(ctx context.Context, stream StreamW
 // duplicating it -- duplicating it is how a "queued" job would end up Acked with
 // no terminal event, reintroducing the #559 bug this design exists to avoid.
 func (r *Runner) finishSuccess(ctx context.Context, job *Job, stream StreamWriter, result *JobResult, startTime, endTime time.Time) {
+	if job.delivery != nil && r.durableModelWarming(job, result) {
+		_ = r.source.Nack(ctx, job, errors.New("model_warming"))
+		return
+	}
 	job.clock.finish(r.clockNow())
 	job.clock.populate(result)
 	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
@@ -1648,7 +1817,7 @@ func (r *Runner) finishQueueWaitExceeded(ctx context.Context, job *Job, stream S
 	}
 	result := &JobResult{Status: JobStatusSuccess, Output: output}
 	r.finishSuccess(ctx, job, stream, result, queueStart, now)
-	return true
+	return job.delivery == nil || job.delivery().isCommitted()
 }
 
 // attachLatencyMetrics adds per-request timing to an inference job's output
@@ -1788,12 +1957,7 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 	// Publish a terminal error event so the streaming dispatch path stops
 	// waiting on a terminal event that would otherwise never arrive. Marked
 	// non-recoverable: retrying an unsupported type on the same node is futile.
-	var stream StreamWriter
-	if r.streamWriterFactory != nil {
-		stream = observeStream(r.streamWriterFactory(job), job.clock)
-	} else {
-		stream = observeStream(&NoOpStreamWriter{}, job.clock)
-	}
+	stream := r.newStreamWriter(job)
 	if werr := stream.WriteError(err, false); werr != nil {
 		r.log("warning", "Failed to publish unsupported-type error for job %s: %v", job.ID, werr)
 	}

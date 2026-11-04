@@ -31,6 +31,13 @@ So, when adding to this file:
 
 ## Project Overview
 
+`mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
+descriptor acquisition: it checks a no-follow leaf pin before any readable
+leaf open, and fails closed if the verified procfs FD route is unavailable.
+`workspace_linux_test.go` covers ordering, replacement, refusal and cleanup
+using owned fixtures, not real devices. This does not settle owner/hard-link
+policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
+
 `service.RematerializeManagedUnits` owns the bounded base-file refresh and
 reload request, not worker restart or failed-unit counter recovery.
 `cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
@@ -55,6 +62,14 @@ validation separately from the HTTP node. Both worker entrypoints load once via
 public endpoints and only the exact built-in Ollama endpoint; other private
 targets require grants, and hard-denied ranges cannot be granted. See
 `docs/workflow-llm-policy.md` for operator configuration and transport limits.
+
+`reconstruct.Runner` is the trusted-operator engine, not a registered dispatched
+job. `publishDirectory` owns its create-only Linux bundle rename; unsupported
+publication primitives fail closed. The remaining workspace, SPZ, container
+custody and signed-event boundaries for #1381 are tracked in
+`docs/reconstruct-splat-job.md`; helper source or historical GPU acceptance
+does not prove those boundaries. `publish_linux_test.go` pins late collisions
+and competing publishers with synthetic fake executors.
 
 `jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
 is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
@@ -547,6 +562,14 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`meetingcapacity.Capacity` owns the inactive #1505 meeting-intake custody
+model: one shared reservation, exact incarnation/job binding, uncertain-read
+quarantine and post-executor-exit resource confirmation. It has no wire or
+native adapters, and no current JobSource invokes it. Its fake intake proofs
+do not establish API/Redis/WS pre-claim admission or authorize activation.
+aceteam-ai/aceteam#12916 blocks the paired routing, old-reader exclusion and
+credit contract before transport wiring; the internal types are not wire fields.
+
 `jobs.NewMemoryGitHandler` owns the inactive memory-git construction contract:
 live permission, strict passcode State and the actual shared node throttle are
 required; legacy callbacks and zero-value construction cannot enable it.
@@ -648,6 +671,11 @@ delivery too (one error event, then Fail with the reason): SHELL_COMMAND, the
 desktop handlers, and WORKFLOW_RUN when its Shell gate refuses at submit. A
 Shell node refused mid-run fails the workflow as an ordinary failure.
 
+Files/Desktop permission refusals retain static tool names and enable/confirm
+hints, including the direct `FILE_WRITE_BYTES` classifier. `MEETING_JOIN` and
+`HUDDLE_JOIN` share one live meeting gate for dispatch and refusal; re-enabling
+joins does not rebuild handlers or remove exact-attempt huddle teardown.
+
 `workflow.Executor.Cancel` owns per-run context cancellation; a cancelled
 status records the request, not proof that a Shell process or callback exited.
 `Execution.Done` supplies executor/slot completion, which the workflow handler
@@ -738,6 +766,12 @@ finite floor can be proven safe against it, so this falls back to
 `StalePendingReclaimFloorFallback` (4h, deliberately kept in sync with
 `internal/redis`'s own construction-time default by
 `TestStalePendingReclaimFloorFallbackMatchesRedisDefault`).
+MEETING_JOIN has its own finite #1505 budget instead of the long tier, so the
+resolved floor is also never below `meetingReclaimFloor` (the largest valid
+meeting STUCK point plus the margin; `TestResolveStalePendingReclaimFloor`
+pins it). A redelivered MEETING_JOIN (delivery count above 1) is refused
+terminally rather than rejoined. Consequence: a crashed node's pending jobs
+now wait roughly 10.5h, not 4h10m, before a self-claim.
 
 With this in place: every job type with a BOUNDED per-job watchdog is
 always ACKed out of the PEL by its own watchdog abandon (routes to
@@ -807,8 +841,8 @@ builds -- `unboundedJobTypes`) that legitimately runs past the resolved
 floor on the SAME process it started on is still a self-owned candidate, so
 #999's fix does not change its self-claim eligibility: it is still reclaimed
 by its own still-alive process, and if it keeps running past roughly
-`(MaxAttempts-1) x floor` (~8h at today's defaults: `MaxAttempts` 3, floor
-~4h10m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
+`(MaxAttempts-1) x floor` (~21h at today's defaults: `MaxAttempts` 3, floor
+~10h30m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
 + `Ack`. That is NOT merely "re-dispatched" -- the message is permanently
 removed from the PEL and reported as a dead/failed job to the DLQ consumer,
 even though the original execution may still be legitimately in progress.
@@ -2585,10 +2619,11 @@ store-injected `ensureNodeIdentityWithStore` so its smoke test stays hermetic
 with `/etc/citadel/config.yaml`). `LLMInferenceHandler.WithSigner` remains the
 override seam for tests.
 
-Device-auth enrollment uses `runDeviceAuthFlow` and the grant-bound callbacks
-from `ccStartDeviceAuthIdentityFlowWith` to request the convergent key's leaf.
-`persistLoginIdentityBundle` owns validation; `servingIdentityHostname` owns the
-validated mesh name independently of display labels. `Store.InspectCertificate`
+`prepareDeviceAuthIdentity` owns the default-off certificate opt-in shared by
+`runDeviceAuthFlow` and `ccStartDeviceAuthIdentityFlowWith`; it opens no identity
+state without that opt-in. `persistLoginIdentityBundle` owns bundle validation.
+`deviceEnrollmentHostname` keeps the operator display name for these enrollment
+and reclaim paths even when a certificate UID is accepted. `Store.InspectCertificate`
 reports local presence/SPKI evidence, not remote verification. See
 [docs/enrollment-certificates.md](docs/enrollment-certificates.md) for fallback,
 current-token admission and the still-open leafless bootstrap requirement.
@@ -3424,6 +3459,10 @@ or invalidation hook. `deliverymetadata.Observation` stores its immutable record
 behind an opaque function: Go's nested bad-verb formatting can bypass Formatters
 and print secret-bearing private pointer fields. Its formatting/shape tests pin
 that boundary. These observations do not enable durable execution or ACKs.
+Authenticated HTTP-only durable claims, renewal, commit-before-publish and
+shutdown/refusal behavior are documented in
+[docs/durable-http-delivery.md](docs/durable-http-delivery.md). That source path
+remains inactive until the paired canary and activation gates are satisfied.
 
 `Runner.Run`'s fetch loop no longer conflates "claim a job" with "execute it"
 (this is what `processJob` used to do inline, blocking `source.Next()` for the
@@ -4022,6 +4061,22 @@ convenience with improved failure modes, not isolation.
 override) rather than caching an overridden node's identity into the real
 machine's cache file.
 
+### Meeting progress, denial and Stop (citadel-cli#1506, S4a)
+
+`jobs.MeetingJoinHandler.Capabilities` owns MEETING_JOIN's declaration: a
+cooperative (graceful) Stop and the progress stages in `meeting_progress.go`
+(joining, waiting_admission, admitted, ended with a closed-set `reason`,
+transcribing). The platform cancel marker therefore no longer hard-cancels a
+meeting. Every join, admission and recording loop polls `CancelRequestedNow`.
+A Stop before recording returns `errMeetingStopped` (wraps `context.Canceled`,
+reported as "Meeting cancelled"); a Stop while recording leaves the call, then
+backs up and transcribes, and the result is `status: stopped`, never
+`completed`. A Stop during setup waits for the setup phase to finish. Denial
+probes match explicit refusal wording only and run after the admitted probe
+fails, so an unknown page degrades to `admit_timeout`, never a false
+`denied`; the selectors are English-only and untuned live. Ctx cancellation
+(shutdown/deadline) remains the hard abort described below.
+
 ### Meeting-bot wait-loop cancellation (citadel#488, cancellation half)
 
 Every poll loop in the MEETING_JOIN join/wait chain now `select`s on
@@ -4183,16 +4238,12 @@ the worker being restarted — using it (or a `CITADEL_SERVICE` env check) from
 `citadel update install` would read the operator's own SSH shell, which never
 inherited the worker's environment, so the gate would silently never fire in
 exactly the scenario #454 reported. `resolveManagedServiceRestartTarget`
-(`cmd/update.go`) layers `ActiveManagedUnit` (the only signal that sees the
-install.sh/packer fleet unit, `citadel-worker.service` — how citadel actually
-ships on most nodes) with the cross-platform `service.Manager.Status()` (the
-only signal on macOS/Windows, and for a `citadel service install`-managed
-Linux node). **This means macOS/Windows detection is already covered, not a
-gap**: `service.Manager.Status()` (`launchd.go`/`windows.go`) is implemented
-on every platform, so a managed launchd/SCM service still gets the warn-vs-
-restart gate even though `ActiveManagedUnit` itself only ever fires on Linux
-(citadel#887 verified this rather than assuming it — read the code before
-concluding the macOS/Windows half of that issue is still open).
+(`cmd/update.go`) instead uses `service.DiscoverActiveWorkers` on Linux for
+the manual update restart path. It inspects arbitrary active service names,
+matches the resolved binary and literal `work` command, and requires one
+verified target. The target is revalidated after draining. It does not expand
+the fixed list of unit files that rematerialization may rewrite. macOS and
+Windows retain `service.Manager.Status()` (`launchd.go`/`windows.go`).
 
 `citadel update install` now warns loudly by default when a managed service is
 detected, and restarts it only with an explicit `--restart` flag.
@@ -4206,8 +4257,9 @@ seam for tests, and also driving the new `citadel service refresh-unit`). Before
 this, `sudo citadel update install` on an up-to-date node exited at "You are
 running the latest version" without ever re-materializing the unit, so a node
 deployed by a pre-#444 binary never received the restart-storm hardening (seen on
-node 1314). The already-latest branch deliberately skips `warnOrRestartManagedService`
-(the binary is unchanged, so there is no old-vs-new split-brain). Separately, the
+node 1314). `finishManualNoOp` also honors an explicit `--restart`: a managed
+worker may still run an older image even when the CLI is already current. A
+requested restart without a verified active target exits nonzero. Separately, the
 unprivileged-system-unit remediation (`service.rootRemediationCommand`) resolves
 `os.Executable()` to an ABSOLUTE path and targets the network-free
 `service refresh-unit`, because a bare `sudo citadel …` is "command not found"
@@ -4605,7 +4657,10 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 
 ### GPU Support Notes
 
-**Linux**: Full NVIDIA GPU support via NVIDIA Container Toolkit. Compose files use `driver: nvidia` specification.
+**Linux**: `platform.NvidiaGPUCountForCompose` owns the bounded tri-state observation.
+`services.SelectComposeForHost` chooses the supported CPU variant only on proven
+NVIDIA absence; unknown evidence preserves an existing flavor. `services.ComposeMapForRefresh`
+withholds uncertain variants from boot refresh. See `docs/cpu-compose-selection.md`.
 
 **macOS — no GPU in containers, and the nvidia reservation is NOT ignored (citadel-cli#1048, corrects a stale claim this section made).**
 Docker Desktop for macOS exposes **no GPU to Linux containers** at all — Metal is not passed through to the Linux VM, and there is no nvidia device driver, on Apple Silicon or Intel. The previous claim here ("Metal GPU support in containers", "`driver: nvidia` is ignored", "services still run") was wrong on all three counts: Docker Compose v2 honors `deploy.resources.reservations.devices` outside swarm, so a mandatory `driver: nvidia` reservation makes `docker compose up` **fail container creation** with `could not select device driver "nvidia" with capabilities: [[gpu]]`.

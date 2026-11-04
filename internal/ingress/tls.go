@@ -10,6 +10,9 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"math/big"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -100,7 +103,14 @@ func generateSelfSigned(appsDomain string) (*tls.Certificate, error) {
 type StaticFileCertProvider struct {
 	CertFile string
 	KeyFile  string
-	cert     *tls.Certificate
+	// CertDir contains <base-host>.crt and <base-host>.key for each host set.
+	CertDir string
+	// HostCertBase authorizes SNI against the current route feed and returns
+	// the base host whose mounted pair covers this exact name.
+	HostCertBase func(host string) (string, bool)
+	mu           sync.RWMutex
+	cert         *tls.Certificate
+	hostCerts    map[string]*tls.Certificate
 }
 
 // Start loads and validates the cert/key pair.
@@ -110,18 +120,68 @@ func (p *StaticFileCertProvider) Start(_ context.Context) error {
 		return fmt.Errorf("ingress: load wildcard cert: %w", err)
 	}
 	p.cert = &cert
+	p.hostCerts = make(map[string]*tls.Certificate)
 	return nil
 }
 
 // TLSConfig serves the loaded cert for every SNI.
 func (p *StaticFileCertProvider) TLSConfig() *tls.Config {
-	c := p.cert
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return c, nil
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			name := ""
+			if hello != nil {
+				name = strings.ToLower(hello.ServerName)
+			}
+			certFile, keyFile := p.CertFile, p.KeyFile
+			if name != "" && p.HostCertBase != nil {
+				if base, ok := p.HostCertBase(name); ok {
+					if p.CertDir == "" {
+						return nil, fmt.Errorf("ingress: no host cert directory")
+					}
+					certFile = filepath.Join(p.CertDir, base+".crt")
+					keyFile = filepath.Join(p.CertDir, base+".key")
+				} else if !p.appsCertCovers(name) {
+					return nil, fmt.Errorf("ingress: unknown SNI %q", name)
+				}
+			}
+			// Reload from mounted paths on each handshake. A half-written renewal
+			// retains the last valid pair; an unseen pair fails the handshake.
+			loaded, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err == nil && name != "" {
+				leaf, parseErr := x509.ParseCertificate(loaded.Certificate[0])
+				if parseErr != nil {
+					err = parseErr
+				} else {
+					err = leaf.VerifyHostname(name)
+				}
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if err == nil {
+				p.hostCerts[certFile] = &loaded
+				return &loaded, nil
+			}
+			if old := p.hostCerts[certFile]; old != nil {
+				return old, nil
+			}
+			if certFile == p.CertFile && p.cert != nil {
+				return p.cert, nil
+			}
+			return nil, fmt.Errorf("ingress: load cert for %q: %w", name, err)
 		},
 	}
+}
+
+func (p *StaticFileCertProvider) appsCertCovers(name string) bool {
+	p.mu.RLock()
+	cert := p.cert
+	p.mu.RUnlock()
+	if cert == nil || len(cert.Certificate) == 0 {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	return err == nil && leaf.VerifyHostname(name) == nil
 }
 
 // --- ACME DNS-01 provider (certmagic) ---------------------------------------

@@ -15,7 +15,7 @@ import (
 type DeviceAuthResult struct {
 	Token      *nexus.TokenResponse
 	DeviceCode string // The device code used during auth (for config lookup)
-	// Set only after this grant's CSR bundle and persisted serving identity validate.
+	// Set only after this grant's CSR bundle validates; never used as the mesh name.
 	identityNodeUID string
 }
 
@@ -43,7 +43,8 @@ func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult,
 }
 
 // runDeviceAuthFlowWithCSR is runDeviceAuthFlow plus an optional PEM CSR
-// (citadel-cli#1062). Init/enroll and login submit a convergent-key CSR.
+// (citadel-cli#1062). Login submits its existing convergent-key CSR; other
+// enrollment paths do so only after an explicit certificate-rollout opt-in.
 // An empty CSR still omits the optional field for legacy fallback.
 //
 // The csrPEM is bound into ONE poll closure BEFORE the TTY branch, so the SAME

@@ -291,9 +291,13 @@ jobs:
         working-directory: services/whisper-service
         run: |
           python -m pip install pip-audit==2.9.0
+          # #1510: exact CPU Torch requires setuptools<82. Temporary, advisory-only
+          # exception; remove with a compatible patched pin/vendor backport.
+          # Scope and remaining risk: services/whisper-service/SECURITY-LOCK-1510.md.
           pip-audit -r requirements.txt --no-deps --disable-pip \
             --ignore-vuln GHSA-rrmf-rvhw-rf47 \
-            --ignore-vuln GHSA-h35f-9h28-mq5c
+            --ignore-vuln GHSA-h35f-9h28-mq5c \
+            --ignore-vuln GHSA-xmj3-9gf7-h52w
           grep -F 'torch-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=f82e2ae20c1545bb03997d1cc3143d94e14b800038669ee1aca45808a9acc338' requirements.in requirements.txt
           grep -F 'torchaudio-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=2354248848d06a9ae1e7a12165f800f0dda7df60ecac9fca892322b722b922c0' requirements.in requirements.txt
           if grep -F 'torch==2.8.0' requirements.in requirements.txt; then

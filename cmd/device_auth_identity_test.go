@@ -50,6 +50,7 @@ func assertEnrollmentCSRMatchesSigner(t *testing.T, store *nodeidentity.Store, c
 }
 
 func TestSharedEnrollmentCarriesSignerCSRToActualTokenEndpoint(t *testing.T) {
+	t.Setenv(deviceCertificateEnrollmentEnv, "true")
 	store := enrollmentIdentityFixture(t)
 	mock := nexus.StartMockDeviceAuthServer(1)
 	defer mock.Close()
@@ -70,6 +71,7 @@ func TestSharedEnrollmentCarriesSignerCSRToActualTokenEndpoint(t *testing.T) {
 }
 
 func TestSharedEnrollmentValidatesAdditiveIdentityAndPreservesCredentials(t *testing.T) {
+	t.Setenv(deviceCertificateEnrollmentEnv, "true")
 	for _, name := range []string{"issued", "legacy", "bad-leaf", "partial", "unexpected-uid", "auth-failure"} {
 		t.Run(name, func(t *testing.T) {
 			store := enrollmentIdentityFixture(t)
@@ -114,7 +116,7 @@ func TestSharedEnrollmentValidatesAdditiveIdentityAndPreservesCredentials(t *tes
 				t.Fatal("accepted enrollment aliases producer token")
 			}
 			if name == "issued" {
-				if !store.HasLeaf() || deviceEnrollmentHostname(result, "display-name") != "node-uid-abc" || loadLoginNodeUID() != "uid-abc" {
+				if !store.HasLeaf() || deviceEnrollmentHostname(result, "display-name") != "display-name" || loadLoginNodeUID() != "" {
 					t.Fatal("validated identity was not persisted and selected")
 				}
 			} else if store.HasLeaf() || deviceEnrollmentHostname(result, "display-name") != "display-name" || result.identityNodeUID != "" {
@@ -125,6 +127,7 @@ func TestSharedEnrollmentValidatesAdditiveIdentityAndPreservesCredentials(t *tes
 }
 
 func TestSharedEnrollmentCSRFailureIsNonfatalAndNeverTrustsUnsolicitedLeaf(t *testing.T) {
+	t.Setenv(deviceCertificateEnrollmentEnv, "true")
 	store := enrollmentIdentityFixture(t)
 	parent := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(parent, []byte("fixture"), 0600); err != nil {
@@ -145,6 +148,7 @@ func TestSharedEnrollmentCSRFailureIsNonfatalAndNeverTrustsUnsolicitedLeaf(t *te
 }
 
 func TestControlCenterEnrollmentBindsCSRAndDefersLeafUntilAccepted(t *testing.T) {
+	t.Setenv(deviceCertificateEnrollmentEnv, "true")
 	store := enrollmentIdentityFixture(t)
 	key, err := store.GetOrCreateKey()
 	if err != nil {
@@ -216,6 +220,7 @@ func TestCertificateDiagnosticsRenderWithoutClaimingRemoteVerification(t *testin
 }
 
 func TestSharedEnrollmentKeepsKnownGoodLeafOnBadBundle(t *testing.T) {
+	t.Setenv(deviceCertificateEnrollmentEnv, "true")
 	store := enrollmentIdentityFixture(t)
 	key, err := store.GetOrCreateKey()
 	if err != nil {
@@ -244,14 +249,14 @@ func TestSharedEnrollmentKeepsKnownGoodLeafOnBadBundle(t *testing.T) {
 	}
 }
 
-func TestDeviceEnrollmentHostnameRequiresValidatedGrantIdentity(t *testing.T) {
+func TestDeviceEnrollmentHostnameAlwaysKeepsDisplayName(t *testing.T) {
 	raw := &DeviceAuthResult{Token: &nexus.TokenResponse{NodeUID: "unvalidated-node"}}
 	if deviceEnrollmentHostname(raw, "friendly") != "friendly" || deviceEnrollmentHostname(nil, "friendly") != "friendly" {
 		t.Fatal("raw server UID replaced display/serving name")
 	}
 	raw.identityNodeUID = "uid-abc"
-	if deviceEnrollmentHostname(raw, "friendly") != "node-uid-abc" {
-		t.Fatal("validated serving identity was dropped")
+	if deviceEnrollmentHostname(raw, "friendly") != "friendly" {
+		t.Fatal("validated certificate UID changed the mesh hostname")
 	}
 }
 
@@ -261,8 +266,8 @@ func TestPostProvisionDeviceEnrollmentPreservesIdentityAndCurrentGrant(t *testin
 	var steps []string
 	err := connectDeviceEnrollmentAsWith(result, "friendly", func(display, serving, authkey string) error {
 		steps = append(steps, "connect")
-		if display != "friendly" || serving != "node-uid-abc" || authkey != "fixture-authkey" {
-			t.Fatal("post-provisioning registration lost its validated serving identity")
+		if display != "friendly" || serving != "friendly" || authkey != "fixture-authkey" {
+			t.Fatal("post-provisioning registration changed the display name or grant")
 		}
 		// Link must use the captured grant, even if its caller changes state.
 		result.DeviceCode = "another-grant"
@@ -313,5 +318,112 @@ func TestPostProvisionDeviceEnrollmentDisconnectsOnRefusedLink(t *testing.T) {
 	}, func(*DeviceAuthResult) error { return want }, func() error { disconnected = true; return nil })
 	if !errors.Is(err, want) || !disconnected {
 		t.Fatal("refused link was reported as successful or left connected")
+	}
+}
+
+func TestDisabledEnrollmentCertificatesNeverOpenIdentityState(t *testing.T) {
+	for _, value := range []string{"", "false", "0", "not-an-opt-in"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(deviceCertificateEnrollmentEnv, value)
+			store := enrollmentIdentityFixture(t)
+			reads := 0
+			loginIdentityStore = func() *nodeidentity.Store { reads++; return store }
+			unsolicited := &nexus.TokenResponse{Authkey: "fixture-authkey", DeviceAPIToken: "fixture-device", NodeUID: "unsolicited-uid", LeafPem: "unsolicited-leaf", ChainPem: "unsolicited-chain"}
+			deviceAuthorizationWithCSR = func(_ string, _ bool, csr string) (*DeviceAuthResult, error) {
+				if csr != "" {
+					t.Fatal("disabled enrollment submitted a CSR")
+				}
+				return &DeviceAuthResult{Token: unsolicited, DeviceCode: "fixture-grant"}, nil
+			}
+			result, err := runDeviceAuthFlow("https://fixture.invalid", false)
+			if err != nil || result == nil || result.Token.Authkey != unsolicited.Authkey || result.Token.DeviceAPIToken != unsolicited.DeviceAPIToken || result.identityNodeUID != "" {
+				t.Fatal("default enrollment changed its grant or accepted an unsolicited certificate")
+			}
+			connected := false
+			config, err := ccStartDeviceAuthIdentityFlowWith(func() (*nexus.DeviceCodeResponse, error) {
+				return &nexus.DeviceCodeResponse{DeviceCode: "fixture-grant", ExpiresIn: 60, Interval: 1}, nil
+			}, time.Now,
+				func(grant, csr string) (*nexus.TokenResponse, error) {
+					if grant != "fixture-grant" || csr != "" {
+						t.Fatal("disabled Control Center changed its grant or submitted a CSR")
+					}
+					return unsolicited, nil
+				},
+				func(token *nexus.TokenResponse, grant, uid string) error {
+					connected = true
+					if token.Authkey != unsolicited.Authkey || grant != "fixture-grant" || uid != "" {
+						t.Fatal("disabled Control Center changed grant or persisted identity")
+					}
+					return nil
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			token, err := config.PollToken("fixture-grant", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := config.Connect(token, "fixture-grant"); err != nil {
+				t.Fatal(err)
+			}
+			if !connected || reads != 0 {
+				t.Fatalf("disabled certificate path touched identity state: connected=%v reads=%d", connected, reads)
+			}
+			entries, err := os.ReadDir(nodeConfigDirFn())
+			if err != nil || len(entries) != 0 {
+				t.Fatal("disabled certificate path created local identity/config files", err)
+			}
+		})
+	}
+}
+
+func TestDefaultEnrollmentOmitsCSRAtActualTokenEndpoint(t *testing.T) {
+	t.Setenv(deviceCertificateEnrollmentEnv, "")
+	enrollmentIdentityFixture(t)
+	mock := nexus.StartMockDeviceAuthServer(1)
+	defer mock.Close()
+	result, err := runDeviceAuthFlow(mock.URL(), false)
+	if err != nil || result == nil || result.Token == nil {
+		t.Fatal("default enrollment no longer completes", err)
+	}
+	csrs := mock.TokenRequestCSRs()
+	if len(csrs) == 0 {
+		t.Fatal("no token poll observed")
+	}
+	for _, csr := range csrs {
+		if csr != "" {
+			t.Fatal("ordinary enrollment sent csr_pem without an opt-in")
+		}
+	}
+}
+
+func TestSharedEnrollmentCertificateDoesNotSetWorkerServingName(t *testing.T) {
+	t.Setenv(deviceCertificateEnrollmentEnv, "true")
+	store := enrollmentIdentityFixture(t)
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, chain := testLoginChain(t, key, 108)
+	oldName := workNodeName
+	workNodeName = "friendly"
+	t.Cleanup(func() { workNodeName = oldName })
+	deviceAuthorizationWithCSR = func(_ string, _ bool, csr string) (*DeviceAuthResult, error) {
+		assertEnrollmentCSRMatchesSigner(t, store, csr)
+		return &DeviceAuthResult{Token: &nexus.TokenResponse{Authkey: "fixture-authkey", NodeUID: "uid-abc", LeafPem: leaf, ChainPem: chain}}, nil
+	}
+	result, err := runDeviceAuthFlow("https://fixture.invalid", false)
+	if err != nil || result == nil || result.identityNodeUID != "uid-abc" || !store.HasLeaf() {
+		t.Fatal("opted-in enrollment lost its validated certificate", err)
+	}
+	if loadLoginNodeUID() != "" || getWorkHostname() != "friendly" {
+		t.Fatal("certificate enrollment changed a later worker reconnect hostname")
+	}
+	data, err := os.ReadFile(filepath.Join(nodeConfigDirFn(), "config.yaml"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("login_node_uid")) {
+		t.Fatal("certificate UID leaked into serving-name configuration")
 	}
 }
