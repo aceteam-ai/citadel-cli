@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // httpRoutesSource is the production RoutesSource: it fetches the routes map (and
@@ -28,7 +30,7 @@ func NewHTTPRoutesSource(routesURL, token string, client *http.Client) RoutesSou
 	return &httpRoutesSource{
 		baseURL: routesURL,
 		token:   token,
-		client:  clientWithoutRedirects(client, 15*time.Second),
+		client:  platformhttp.WithTransport(routesURL, clientWithoutRedirects(client, 15*time.Second)),
 	}
 }
 
@@ -90,7 +92,7 @@ func NewHTTPAuthorizer(authzURL, token string, client *http.Client) Authorizer {
 	return &httpAuthorizer{
 		authzURL: authzURL,
 		token:    token,
-		client:   clientWithoutRedirects(client, 10*time.Second),
+		client:   platformhttp.WithTransport(authzURL, clientWithoutRedirects(client, 10*time.Second)),
 	}
 }
 

@@ -5,11 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
 	"github.com/gorilla/websocket"
 )
 
@@ -17,37 +17,23 @@ import (
 // cannot hang a viewer connection forever.
 var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-// cdpTargetURL resolves a debug port to the page target's DevTools WebSocket URL.
-// It is a package var so tests can point the CDP client at a fake Chrome
-// (httptest WebSocket) without launching a real browser -- the same injection
-// seam pattern the platform launchers use. Like the existing screenshot path it
-// grabs the FIRST page target, so a session that opens a second tab streams the
-// first tab (a documented, inherited limitation).
+// cdpTargetURL remains an injection seam for fake Chrome WebSockets.
 var cdpTargetURL = defaultCDPTargetURL
 
+// A 32 MiB PNG occupies 44,739,244 base64 bytes; this fixed message budget
+// leaves room for its CDP envelope. It is not an aggregate memory bound.
+const maxCDPMessageBytes int64 = 64 << 20
+
 func defaultCDPTargetURL(debugPort int) (string, error) {
-	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
+	return discoverCDPTargetURL(debugPort, cdpHTTPClient)
+}
+
+func discoverCDPTargetURL(debugPort int, client *http.Client) (string, error) {
+	target, err := cdpdiscovery.Discover(context.Background(), debugPort, client)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	var targets []struct {
-		Type                 string `json:"type"`
-		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-	}
-	if err := json.Unmarshal(body, &targets); err != nil {
-		return "", err
-	}
-	for _, t := range targets {
-		if t.Type == "page" && t.WebSocketDebuggerURL != "" {
-			return t.WebSocketDebuggerURL, nil
-		}
-	}
-	return "", fmt.Errorf("no page target found on CDP port %d", debugPort)
+	return target.WebSocketDebuggerURL, nil
 }
 
 // screencastFrame is one decoded CDP Page.screencastFrame event.
@@ -123,16 +109,39 @@ func (c *Client) Close() { c.client.Close() }
 // dialCDP resolves the page target for debugPort and opens a persistent CDP
 // WebSocket. onFrame receives every screencast frame once startScreencast runs.
 func dialCDP(debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
+	return dialCDPWithReadLimit(debugPort, onFrame, maxCDPMessageBytes)
+}
+
+// The private smaller-limit seam lets source fixtures exercise the same dial
+// and first-read path without allocating full-size messages. Production uses
+// the fixed ceiling above; no caller may disable or increase it here.
+func dialCDPWithReadLimit(debugPort int, onFrame func(screencastFrame), readLimit int64) (*cdpClient, error) {
+	if readLimit <= 0 || readLimit > maxCDPMessageBytes {
+		return nil, fmt.Errorf("CDP read limit is invalid")
+	}
 	wsURL, err := cdpTargetURL(debugPort)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	// Gorilla's read limit counts compressed payload bytes, not expanded data.
+	// Pin compression off without changing the shared DefaultDialer or its other
+	// behavior, so fragmented uncompressed messages share one finite budget.
+	dialer := *websocket.DefaultDialer
+	dialer.EnableCompression = false
+	conn, response, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("CDP dial: %w", err)
 	}
+	// The pinned Gorilla dialer accepts an unsolicited compression response
+	// even when it made no offer. Refuse every extension response (including
+	// empty or duplicate fields) before a reader can expand its first message.
+	if response == nil || len(response.Header.Values("Sec-WebSocket-Extensions")) != 0 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("CDP extensions are not allowed")
+	}
+	conn.SetReadLimit(readLimit)
 	c := &cdpClient{conn: conn, onFrame: onFrame, done: make(chan struct{}), pending: make(map[int]chan cdpResponse)}
 	go c.readLoop()
 	return c, nil

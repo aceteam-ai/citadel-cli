@@ -38,6 +38,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 const (
@@ -198,7 +199,7 @@ func (h *MeetingJoinHandler) uploadAudioBackup(ctx JobContext, job *nexus.Job, p
 	}
 	client := h.backupHTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: meetingUploadTimeout}
+		client = &http.Client{Timeout: meetingUploadTimeout, Transport: platformhttp.New(baseURL, platformhttp.Options{})}
 	}
 	uctx, ucancel := context.WithTimeout(ctx.Context(), meetingUploadTimeout)
 	defer ucancel()

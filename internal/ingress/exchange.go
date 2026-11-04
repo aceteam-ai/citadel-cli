@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 const exchangeResponseMaxBytes = 64 << 10
@@ -47,7 +49,7 @@ type exchangeRequest struct {
 // endpoint. The supplied client is cloned so its redirect policy is never
 // mutated; exchange requests always stop at the first redirect response.
 func NewHTTPExchanger(exchangeURL, token string, client *http.Client) Exchanger {
-	exchangeClient := clientWithoutRedirects(client, 10*time.Second)
+	exchangeClient := platformhttp.WithTransport(exchangeURL, clientWithoutRedirects(client, 10*time.Second))
 	// The handoff contract is a hard ten-second ceiling, including when callers
 	// supply a shared client with no timeout or a more permissive one. Preserve a
 	// shorter caller timeout, but never let exchange traffic wait longer.

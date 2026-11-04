@@ -181,6 +181,8 @@ type DeviceConfig struct {
 // ConfigHandler handles APPLY_DEVICE_CONFIG jobs.
 // It implements the jobs.JobHandler interface.
 type ConfigHandler struct {
+	// gpuCount is an isolated test seam; production uses the bounded tri-state probe.
+	gpuCount func() int
 	// ConfigDir is the directory where citadel configuration is stored.
 	// If empty, defaults to ~/citadel-node
 	ConfigDir string
@@ -220,7 +222,7 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	// worker entry points must always pass the resolved directory.
 	configDir := h.ConfigDir
 	if configDir == "" {
-		homeDir, err := os.UserHomeDir()
+		homeDir, err := platform.UserHomeDir()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get home directory: %w", err)
 		}
@@ -569,12 +571,10 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 			continue // Skip unknown services
 		}
 
-		// Write service compose file (0600 to protect any sensitive env vars)
-		composeFile := filepath.Join(servicesDir, svcName+".yml")
-		if content, ok := services.ServiceMap[svcName]; ok {
-			if err := os.WriteFile(composeFile, []byte(content), 0600); err != nil {
-				return fmt.Errorf("failed to write compose file for %s: %w", svcName, err)
-			}
+		// Reuse the worker's host selection, known-file replacement and stamp
+		// repair. A config save must not reset a working CPU compose to GPU.
+		if err := h.materializeServiceCompose(configDir, svcName); err != nil {
+			return fmt.Errorf("failed to materialize compose for %s: %w", svcName, err)
 		}
 
 		if existing[svcName] {
@@ -612,6 +612,19 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 // startServices starts the configured services using docker compose.
 func (h *ConfigHandler) startServices(configDir string, serviceNames []string) error {
 	servicesDir := filepath.Join(configDir, "services")
+	// Reconcile existing embedded CPU/GPU files before any runtime probe or up.
+	// This also covers callers that did not just run updateManifest.
+	for _, name := range serviceNames {
+		if !serviceNamePattern.MatchString(name) || !services.HasCPUComposeVariant(name) {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(servicesDir, name+".yml")); err != nil {
+			continue
+		}
+		if err := h.materializeServiceCompose(configDir, name); err != nil {
+			return err
+		}
+	}
 
 	// Preflight (citadel #767): this is the FRESH-NODE FIRST START path
 	// (citadel init -> onboarding wizard -> autoStartServices), the exact
@@ -718,3 +731,9 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 
 // Ensure ConfigHandler implements JobHandler
 var _ JobHandler = (*ConfigHandler)(nil)
+
+func (h *ConfigHandler) materializeServiceCompose(configDir, name string) error {
+	handler := NewServiceHandler(configDir)
+	handler.gpuCount = h.gpuCount
+	return handler.ensureEmbeddedComposeFile(name)
+}

@@ -3,6 +3,7 @@ package redisapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -204,6 +205,28 @@ func TestWorkerControlConsumeDuplicateDiscriminatorsRejected(t *testing.T) {
 			var got ConsumeResponse
 			if json.Unmarshal([]byte(body), &got) == nil {
 				t.Fatal("control consume discriminator escaped strict decoding")
+			}
+		})
+	}
+}
+
+func TestWorkerControlStrictDecoderRefusesMixedDurableMetadata(t *testing.T) {
+	for _, field := range []string{"protocol", "Protocol", "claimToken", "leaseEpoch"} {
+		t.Run(field, func(t *testing.T) {
+			f := controltest.Load()
+			d := f.Data()
+			data := map[string]string{"jobId": d.JobID, "type": d.Type, "payload": d.Payload, "worker_control": d.WorkerControl}
+			data[field] = DurableResultsProtocol
+			raw, err := json.Marshal(map[string]any{"messages": []any{map[string]any{"id": f.Deliveries["A"].MessageID, "data": data}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := NewClient(ClientConfig{BaseURL: "https://fake.invalid", Token: "synthetic-token"})
+			defer c.Close()
+			c.httpClient.Transport = durableRoundTripper(func(*http.Request) (*http.Response, error) { return controlResponse(string(raw)), nil })
+			job, err := c.ConsumeJob(context.Background(), ConsumeRequest{Queue: f.Identity.Queue, Group: wc.Protocol, BlockMs: 1})
+			if job != nil || !errors.Is(err, wc.ErrInvalid) {
+				t.Fatalf("mixed control/durable delivery must be refused: job=%v err=%v", job != nil, err)
 			}
 		})
 	}

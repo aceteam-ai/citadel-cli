@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"gopkg.in/yaml.v3"
 )
 
@@ -485,6 +486,10 @@ func getHostnameForReconnect() string {
 
 // getManifestLocations returns possible locations for citadel.yaml
 func getManifestLocations() []string {
+	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+		// Do not enumerate CWD, HOME or a pointer supplied by another fixture.
+		return []string{filepath.Join(fixture.node, "citadel.yaml")}
+	}
 	var locations []string
 
 	// First, try the global config to find node config dir
@@ -503,7 +508,7 @@ func getManifestLocations() []string {
 	locations = append(locations, filepath.Join(globalConfigDir, "citadel.yaml"))
 
 	// User home directory
-	if homeDir, err := os.UserHomeDir(); err == nil {
+	if homeDir, err := platform.UserHomeDir(); err == nil {
 		locations = append(locations, filepath.Join(homeDir, "citadel-node", "citadel.yaml"))
 	}
 
@@ -512,6 +517,9 @@ func getManifestLocations() []string {
 
 // getGlobalConfigDir returns the global config directory path
 func getGlobalConfigDir() string {
+	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+		return fixture.machine
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return "/usr/local/etc/citadel"

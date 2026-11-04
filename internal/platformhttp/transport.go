@@ -1,0 +1,446 @@
+// Package platformhttp owns bounded connection reuse for platform API clients.
+// It never retries requests or changes authentication, redirect or job policy.
+package platformhttp
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httptrace"
+	"net/url"
+	"strconv"
+	"sync"
+	"time"
+)
+
+const (
+	MaxConnectionAge        = 10 * time.Minute
+	IdleConnTimeout         = 90 * time.Second
+	FailureThreshold        = 3
+	FailureRotationCooldown = time.Minute
+	maxErrorSample          = 4096
+)
+
+type Options struct {
+	BaseTransport    *http.Transport
+	MaxAge           time.Duration
+	IdleTimeout      time.Duration
+	FailureThreshold int
+	Logf             func(string, ...any)
+	// Debugf receives per-dial diagnostics. Nil keeps normal/TUI output quiet.
+	Debugf  func(string, ...any)
+	Now     func() time.Time
+	Observe Observer
+}
+
+type generation struct {
+	pool          *http.Transport
+	born          time.Time
+	failed        int
+	firstPath     string
+	distinctPaths bool
+	remote        string
+	reason        string
+}
+
+// Transport rotates the whole pool before a request once its age is reached.
+// Unlike idle eviction alone, this also stops new HTTP/2 streams from selecting
+// an old, continuously busy connection. Existing requests are allowed to finish.
+type Transport struct {
+	mu                  sync.Mutex
+	current             *generation
+	lastFailureRotation time.Time
+	hasFailureRotation  bool
+	passthrough         http.RoundTripper
+	template            *http.Transport
+	origin              string
+	maxAge              time.Duration
+	threshold           int
+	logf                func(string, ...any)
+	debugf              func(string, ...any)
+	observer            Observer
+	now                 func() time.Time
+}
+
+// WithTransport preserves client policy in a private value copy. An explicit
+// non-standard RoundTripper is left intact (test fixtures or caller custody).
+func WithTransport(baseURL string, client *http.Client) *http.Client {
+	if client == nil {
+		client = &http.Client{}
+	}
+	copy := *client
+	switch base := client.Transport.(type) {
+	case nil:
+		copy.Transport = New(baseURL, Options{})
+	case *http.Transport:
+		copy.Transport = New(baseURL, Options{BaseTransport: base})
+	case *Transport:
+		if base.template != nil && base.origin != configuredOrigin(baseURL) {
+			copy.Transport = New(baseURL, Options{BaseTransport: base.template, MaxAge: base.maxAge, FailureThreshold: base.threshold, Logf: base.logf, Debugf: base.debugf, Now: base.now, Observe: base.observer})
+		}
+	}
+	return &copy
+}
+
+// New builds a private pool without changing HTTP client policy. Opaque caller
+// transports remain owned by that caller and cannot be aged by this helper.
+func New(baseURL string, opts Options) *Transport {
+	base := opts.BaseTransport
+	if base == nil {
+		var standard bool
+		base, standard = http.DefaultTransport.(*http.Transport)
+		if !standard {
+			// A caller-installed opaque default is an explicit policy boundary,
+			// not permission to substitute an unrestricted network transport.
+			return &Transport{origin: configuredOrigin(baseURL), passthrough: http.DefaultTransport}
+		}
+	}
+	template := base.Clone()
+	if opts.IdleTimeout <= 0 {
+		opts.IdleTimeout = IdleConnTimeout
+	}
+	if template.IdleConnTimeout > 0 && template.IdleConnTimeout < opts.IdleTimeout {
+		opts.IdleTimeout = template.IdleConnTimeout
+	}
+	template.IdleConnTimeout = opts.IdleTimeout
+	if opts.MaxAge <= 0 {
+		opts.MaxAge = MaxConnectionAge
+	}
+	if opts.FailureThreshold <= 0 {
+		opts.FailureThreshold = FailureThreshold
+	}
+	if opts.Logf == nil {
+		opts.Logf = log.Printf
+	}
+	if opts.Debugf == nil {
+		opts.Debugf = func(string, ...any) {}
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	t := &Transport{template: template, origin: configuredOrigin(baseURL), maxAge: opts.MaxAge, threshold: opts.FailureThreshold, logf: opts.Logf, debugf: opts.Debugf, now: opts.Now, observer: opts.Observe}
+	t.current = t.fresh("initial")
+	return t
+}
+
+func configuredOrigin(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil || u == nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func (t *Transport) fresh(reason string) *generation {
+	return &generation{pool: t.template.Clone(), born: t.now(), reason: reason}
+}
+
+func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.passthrough != nil {
+		return t.passthrough.RoundTrip(req)
+	}
+	t.mu.Lock()
+	g := t.current
+	var retired *generation
+	retiredIP := "unknown"
+	if t.now().Sub(g.born) >= t.maxAge {
+		retired = g
+		retiredIP = g.remoteIP()
+		t.current = t.fresh("max_connection_age")
+		g = t.current
+	}
+	t.mu.Unlock()
+	if retired != nil {
+		retired.pool.CloseIdleConnections()
+		t.redial("max_connection_age", retiredIP)
+	}
+	tracked := req.URL.Scheme+"://"+req.URL.Host == t.origin
+	path := req.URL.Path // Query changes do not turn one endpoint into two.
+	if path == "" {
+		path = "/"
+	}
+
+	// The trace composes with an existing caller trace. Keep only an IP, never
+	// a URL/query, device token, response body or peer-supplied error message.
+	var peerMu sync.Mutex
+	peer := "unknown"
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		ip := RemoteIP(info.Conn.RemoteAddr())
+		peerMu.Lock()
+		peer = ip
+		peerMu.Unlock()
+		if tracked {
+			t.mu.Lock()
+			g.remote = ip
+			t.mu.Unlock()
+		}
+		if tracked && !info.Reused {
+			t.debugf("platform API fresh dial remote_ip=%s reason=%s", ip, g.reason)
+		}
+	}}
+	request := req.Clone(httptrace.WithClientTrace(req.Context(), trace))
+	resp, err := g.pool.RoundTrip(request)
+	observedAt := t.now()
+	peerMu.Lock()
+	ip := peer
+	peerMu.Unlock()
+	if err != nil {
+		if tracked && req.Context().Err() != context.Canceled {
+			t.notify(g, Observation{At: observedAt, Outcome: HTTPUnavailable})
+		}
+		if tracked && req.Context().Err() == nil {
+			t.observe(g, true, "network_failure", ip, path)
+		}
+		return resp, err
+	}
+	if !tracked {
+		return resp, nil // Redirects/secondary hosts retain caller policy.
+	}
+	failed := resp.StatusCode == http.StatusNotFound || (resp.StatusCode >= 500 && resp.StatusCode < 600)
+	serverError := resp.StatusCode >= 500 && resp.StatusCode < 600
+	if resp.StatusCode == http.StatusTooManyRequests {
+		t.notify(g, Observation{At: observedAt, Outcome: HTTPOther, Status: resp.StatusCode})
+	}
+	if serverError || (failed && resp.Body == nil) {
+		t.notify(g, Observation{At: observedAt, Outcome: HTTPWrongAnswer, Status: resp.StatusCode})
+		t.observe(g, true, "http_"+strconv.Itoa(resp.StatusCode), ip, path)
+	} else if resp.StatusCode < 400 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+		outcome := HTTPOther
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			outcome = HTTPHealthy
+		}
+		t.notify(g, Observation{At: observedAt, Outcome: outcome, Status: resp.StatusCode})
+		t.observe(g, false, "", ip, path)
+	}
+	// Authorization-refusal bodies are deliberately never read or retained by
+	// this layer. Other error bodies are sampled only while the caller reads;
+	// there is no prefetch, additional read, content substitution or retry.
+	// A 5xx already contributed at headers. Delay 404 observation until the
+	// caller reads/closes its body so a mismatch gets exactly one reason/log.
+	if resp.StatusCode >= 400 && resp.StatusCode != 401 && resp.StatusCode != 403 && !serverError && resp.Body != nil {
+		resp.Body = &observedBody{ReadCloser: resp.Body, finish: func(sample []byte, complete bool) {
+			if !complete && len(sample) == 0 {
+				if failed {
+					t.notify(g, Observation{At: observedAt, Outcome: HTTPWrongAnswer, Status: resp.StatusCode})
+					t.observe(g, true, "http_404", ip, path)
+				} else if resp.StatusCode != http.StatusTooManyRequests {
+					t.notify(g, Observation{At: observedAt, Outcome: HTTPOther, Status: resp.StatusCode})
+				}
+				return
+			}
+			mismatch := !platformError(sample)
+			reason := "upstream mismatch"
+			if !complete && mismatch && !json.Valid(sample) {
+				reason = "unclassified_error_body"
+			}
+			if failed && !mismatch {
+				reason = "http_404"
+			}
+			outcome := HTTPOther
+			if failed || mismatch {
+				outcome = HTTPWrongAnswer
+			}
+			if resp.StatusCode != http.StatusTooManyRequests {
+				t.notify(g, Observation{At: observedAt, Outcome: outcome, Status: resp.StatusCode})
+			}
+			t.observe(g, failed || mismatch, reason, ip, path)
+		}}
+	}
+	return resp, nil
+}
+
+func (t *Transport) notify(g *generation, o Observation) {
+	if t.observer == nil {
+		return
+	}
+	if o.Outcome == HTTPWrongAnswer {
+		t.mu.Lock()
+		current := t.current == g
+		t.mu.Unlock()
+		if !current {
+			return
+		} // Retired responses cannot prove a fresh pool failed.
+	}
+	t.observer(o)
+}
+
+// ForceRedial is the first self-heal action. Like ordinary rotation it retires
+// the pool, including busy HTTP/2 reuse, without cancelling or replaying work.
+func (t *Transport) ForceRedial() {
+	if t.passthrough != nil {
+		t.CloseIdleConnections()
+		return
+	}
+	t.mu.Lock()
+	old := t.current
+	remote := old.remoteIP()
+	t.current = t.fresh("self_heal_platform_failure")
+	t.hasFailureRotation, t.lastFailureRotation = true, t.now()
+	t.mu.Unlock()
+	old.pool.CloseIdleConnections()
+	t.redial("self_heal_platform_failure", remote)
+}
+
+func RedialClient(client *http.Client) {
+	if client == nil {
+		return
+	}
+	if t, ok := client.Transport.(*Transport); ok {
+		t.ForceRedial()
+		return
+	}
+	client.CloseIdleConnections()
+}
+
+// observe ignores late responses from retired pools, so one old in-flight
+// request cannot reset or rotate the replacement generation's failure streak.
+// The cooldown belongs to Transport, not generation: rebuilding a pool must
+// not reset it. Keep one path plus a diversity bit, rather than an unbounded
+// set of endpoint strings, and cap the failure counter during an outage.
+func (t *Transport) observe(g *generation, failed bool, reason, remote, path string) bool {
+	t.mu.Lock()
+	if t.current != g {
+		t.mu.Unlock()
+		return false
+	}
+	if !failed {
+		g.failed = 0
+		g.firstPath = ""
+		g.distinctPaths = false
+		t.mu.Unlock()
+		return false
+	}
+	if g.failed < t.threshold {
+		g.failed++
+	}
+	if g.firstPath == "" {
+		g.firstPath = path
+	} else if g.firstPath != path {
+		g.distinctPaths = true
+	}
+	now := t.now()
+	if g.failed < t.threshold || !g.distinctPaths || (t.hasFailureRotation && now.Sub(t.lastFailureRotation) < FailureRotationCooldown) {
+		t.mu.Unlock()
+		return false
+	}
+	t.current = t.fresh(reason)
+	t.lastFailureRotation = now
+	t.hasFailureRotation = true
+	t.mu.Unlock()
+	g.pool.CloseIdleConnections()
+	t.redial(reason, remote)
+	return true
+}
+
+func (g *generation) remoteIP() string {
+	if g.remote == "" {
+		return "unknown"
+	}
+	return g.remote
+}
+
+func (t *Transport) redial(reason, remote string) {
+	t.logf("platform API %s: re-dialing remote_ip=%s", reason, remote)
+}
+
+// LogRedial is shared with upgraded WebSocket lifecycle rotation, which cannot
+// use an HTTP RoundTripper after its handshake.
+func LogRedial(reason string, remote net.Addr) {
+	log.Printf("platform API %s: re-dialing remote_ip=%s", reason, RemoteIP(remote))
+}
+
+func (t *Transport) CloseIdleConnections() {
+	if t.passthrough != nil {
+		if closer, ok := t.passthrough.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+		return
+	}
+	t.mu.Lock()
+	pool := t.current.pool
+	t.mu.Unlock()
+	pool.CloseIdleConnections()
+}
+
+// RemoteIP reports the actual connected TCP peer, including a configured proxy
+// if present. Unparseable addresses never become untrusted diagnostic text.
+func RemoteIP(addr net.Addr) string {
+	if addr == nil {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return "unknown"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "unknown"
+	}
+	return ip.String()
+}
+
+func platformError(body []byte) bool {
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	var message string
+	if json.Unmarshal(envelope.Error, &message) == nil {
+		return message != ""
+	}
+	var rpc struct {
+		Code    *int   `json:"code"`
+		Message string `json:"message"`
+	}
+	return json.Unmarshal(envelope.Error, &rpc) == nil && rpc.Code != nil && rpc.Message != ""
+}
+
+type observedBody struct {
+	io.ReadCloser
+	mu       sync.Mutex
+	sample   []byte
+	complete bool
+	finished bool
+	finish   func([]byte, bool)
+}
+
+func (b *observedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.mu.Lock()
+	if !b.finished && len(b.sample) <= maxErrorSample {
+		remaining := maxErrorSample + 1 - len(b.sample)
+		b.sample = append(b.sample, p[:min(n, remaining)]...)
+	}
+	if err == io.EOF {
+		b.complete = len(b.sample) <= maxErrorSample
+	}
+	b.mu.Unlock()
+	if err == io.EOF {
+		b.done()
+	}
+	return n, err
+}
+
+func (b *observedBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.done()
+	return err
+}
+
+func (b *observedBody) done() {
+	b.mu.Lock()
+	if b.finished {
+		b.mu.Unlock()
+		return
+	}
+	b.finished = true
+	sample, complete := b.sample, b.complete
+	b.sample = nil
+	b.mu.Unlock()
+	b.finish(sample, complete)
+}

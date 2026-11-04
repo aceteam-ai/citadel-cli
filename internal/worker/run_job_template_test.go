@@ -162,6 +162,46 @@ func TestRunJobTemplate_UnknownHandlerIsTerminal(t *testing.T) {
 	}
 }
 
+func TestRunJobTemplate_FilmRequiresEveryInputExpectationBeforeOps(t *testing.T) {
+	for _, identity := range []struct{ key, handler string }{{"video-compose", "audio-mix"}, {"other-key", "video-compose"}} {
+		for _, missing := range []string{"expected_sha256", "expected_bytes", "neither"} {
+			t.Run(identity.key+"/"+identity.handler+"/"+missing, func(t *testing.T) {
+				payload := tmplPayload(t, `{"kind":"builtin","handler":"`+identity.handler+`"}`, tmplInSchema, tmplOutSchema)
+				payload["template_key"] = identity.key
+				hash, err := jobs.ComputeTemplateManifestHash(identity.key, tmplVersion, json.RawMessage(tmplInSchema), json.RawMessage(tmplOutSchema), json.RawMessage(payload["runner"].(string)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload["content_hash"] = hash
+				entries := []map[string]any{}
+				for _, name := range []string{"film.json", "chapter.mp4", "poster.png"} {
+					entries = append(entries, map[string]any{"path": name, "node_id": "1008", "node_path": name, "expected_sha256": "sha256:" + strings.Repeat("a", 64), "expected_bytes": 1})
+				}
+				if missing != "neither" {
+					delete(entries[2], missing)
+				}
+				raw, err := json.Marshal(entries)
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload["input_files"] = string(raw)
+				ops := &fakeTemplateOps{result: &TemplateRunResult{}}
+				res, err := tmplRunJob(ops, tmplPerNodeQueue, payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if missing == "neither" {
+					if res.Status != JobStatusSuccess || !ops.called {
+						t.Fatalf("complete input refs refused: %+v called=%v", res, ops.called)
+					}
+				} else if res.Status != JobStatusFailure || ops.called || !strings.Contains(jobErrText(res), "requires expected_sha256 and expected_bytes") {
+					t.Fatalf("missing Film expectation reached ops: %+v called=%v", res, ops.called)
+				}
+			})
+		}
+	}
+}
+
 func TestRunJobTemplate_TransientRetries(t *testing.T) {
 	ops := &fakeTemplateOps{err: ErrTemplateTransient}
 	res, err := tmplRunJob(ops, tmplPerNodeQueue, tmplPayload(t, tmplBuiltinRunner, tmplInSchema, tmplOutSchema))

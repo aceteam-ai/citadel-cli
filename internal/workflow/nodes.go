@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
@@ -36,7 +35,9 @@ func (e *OutputNodeExecutor) Execute(_ context.Context, _ *Node, input map[strin
 	return input, nil
 }
 
-type LLMNodeExecutor struct{}
+type LLMNodeExecutor struct {
+	policy LLMPolicy
+}
 
 func (e *LLMNodeExecutor) Execute(ctx context.Context, node *Node, input map[string]any) (map[string]any, error) {
 	model := stringParam(node.Params, "model", "llama3")
@@ -46,6 +47,13 @@ func (e *LLMNodeExecutor) Execute(ctx context.Context, node *Node, input map[str
 	maxTokens := intParam(node.Params, "max_tokens", 2048)
 	if prompt == "" {
 		return nil, fmt.Errorf("LLM node %q: missing 'prompt' input", node.ID)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, llmRequestTimeout)
+	defer cancel()
+	endpoint := stringParam(node.Params, "endpoint", defaultLLMEndpoint)
+	validatedURL, pinnedIP, err := e.policy.resolveURL(requestCtx, endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("LLM node %q: %w", node.ID, err)
 	}
 	messages := []map[string]string{}
 	if systemPrompt != "" {
@@ -58,30 +66,42 @@ func (e *LLMNodeExecutor) Execute(ctx context.Context, node *Node, input map[str
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("LLM node %q: marshal request: %w", node.ID, err)
+		return nil, fmt.Errorf("LLM node %q: invalid request", node.ID)
 	}
-	endpoint := stringParam(node.Params, "endpoint", "http://127.0.0.1:11434/api/chat")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, llmRequestURL(validatedURL).String(), bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("LLM node %q: create request: %w", node.ID, err)
+		return nil, fmt.Errorf("LLM node %q: invalid request", node.ID)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := e.policy.clientFor(validatedURL, pinnedIP)
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("LLM node %q: request failed: %w", node.ID, err)
+		if err := requestCtx.Err(); err != nil {
+			return nil, fmt.Errorf("LLM node %q: %w", node.ID, err)
+		}
+		return nil, fmt.Errorf("LLM node %q: request failed", node.ID)
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("LLM node %q: read response: %w", node.ID, err)
-	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("LLM node %q: server returned %d: %s", node.ID, resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("LLM node %q: server returned HTTP %d", node.ID, resp.StatusCode)
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxLLMResponseBytes+1))
+	if err != nil {
+		if err := requestCtx.Err(); err != nil {
+			return nil, fmt.Errorf("LLM node %q: %w", node.ID, err)
+		}
+		return nil, fmt.Errorf("LLM node %q: read response failed", node.ID)
+	}
+	if len(respBody) > maxLLMResponseBytes {
+		return nil, fmt.Errorf("LLM node %q: %w", node.ID, ErrLLMResponseTooLarge)
+	}
+	if err := requestCtx.Err(); err != nil {
+		return nil, fmt.Errorf("LLM node %q: %w", node.ID, err)
 	}
 	var result map[string]any
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("LLM node %q: parse response: %w", node.ID, err)
+		return nil, fmt.Errorf("LLM node %q: invalid response", node.ID)
 	}
 	content := ""
 	if msg, ok := result["message"].(map[string]any); ok {
@@ -140,11 +160,14 @@ func (e *ShellNodeExecutor) Execute(ctx context.Context, node *Node, input map[s
 			return nil, fmt.Errorf("Shell node %q: command not in allow list", node.ID)
 		}
 	}
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	cmd := newWorkflowShellCommand(ctx, command)
 	if e.config.WorkspaceDir != "" {
 		cmd.Dir = e.config.WorkspaceDir
 	}
-	output, err := cmd.CombinedOutput()
+	output, err := workflowShellCombinedOutput(ctx, cmd)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return nil, fmt.Errorf("Shell node %q: cancelled or timed out: %w", node.ID, contextErr)
+	}
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -203,12 +226,12 @@ func (e *HTTPNodeExecutor) Execute(ctx context.Context, node *Node, input map[st
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP node %q: request failed: %w", node.ID, err)
+		return nil, fmt.Errorf("HTTP node %q: request failed: %w", node.ID, safeHTTPTransportError(err))
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
-		return nil, fmt.Errorf("HTTP node %q: read response: %w", node.ID, err)
+		return nil, fmt.Errorf("HTTP node %q: read response: %w", node.ID, safeHTTPTransportError(err))
 	}
 	result := map[string]any{"status_code": resp.StatusCode, "body": string(respBody)}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.Header.Get("Location") != "" {

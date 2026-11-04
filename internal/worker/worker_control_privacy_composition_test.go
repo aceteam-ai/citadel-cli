@@ -41,9 +41,18 @@ func TestWorkerControlFailureCannotFallBackToGenericStatusAfterPrivacyCompositio
 			// A malformed/unmatched control delivery has no claim/permit. Its
 			// Nack must keep it pending; Fail cannot use generic status or ACK.
 			job := &Job{ID: "owned-control", Type: JobTypeWorkerControl, MessageID: "1-0"}
+			// Composing durable delivery must not bypass the dedicated control
+			// claim and permit check, even if a job has both local bindings.
+			job.delivery = func() *durableDelivery {
+				t.Fatal("control outcome entered the ordinary durable-delivery path")
+				return nil
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			failure := errors.New("owned private control failure")
+			if err := source.Ack(ctx, job); !errors.Is(err, workercontrol.ErrDenied) {
+				t.Fatalf("unmatched control Ack = %v, want denied", err)
+			}
 			if err := source.Nack(ctx, job, failure); err != nil {
 				t.Fatalf("control Nack: %v", err)
 			}

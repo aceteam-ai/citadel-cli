@@ -263,6 +263,11 @@ type PasscodeAttemptLimiter interface {
 // checks are unlimited, as before #1398.
 var LegacyPasscodeLockout func() PasscodeAttemptLimiter
 
+// PasscodeAttemptError reports an operational failure from a boolean passcode
+// gate. Package cmd wires the typed unavailable check and static warning; this
+// leaf package must not resolve node paths or print arbitrary error contents.
+var PasscodeAttemptError func(error)
+
 // VerifyLegacyPasscode checks pin against the legacy bcrypt passcode hash only,
 // never the master-PIN hooks. It fails closed on an unset hash or empty pin, and
 // is subject to the node-wide lockout when LegacyPasscodeLockout is wired.
@@ -271,7 +276,11 @@ func (p *Permissions) VerifyLegacyPasscode(pin string) bool {
 	if LegacyPasscodeLockout != nil {
 		lim = LegacyPasscodeLockout()
 	}
-	return p.CheckLegacyPasscode(pin, lim) == nil
+	err := p.CheckLegacyPasscode(pin, lim)
+	if err != nil && PasscodeAttemptError != nil {
+		PasscodeAttemptError(err)
+	}
+	return err == nil
 }
 
 // CheckLegacyPasscode is VerifyLegacyPasscode with an explicit limiter and the

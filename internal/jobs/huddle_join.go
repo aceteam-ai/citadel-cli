@@ -56,6 +56,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/google/uuid"
 )
 
@@ -642,7 +643,7 @@ func (h *HuddleJoinHandler) mint(ctx context.Context, apiBase *url.URL, deviceTo
 	if h.mintToken != nil {
 		return h.mintToken(ctx, apiBase, deviceToken, p)
 	}
-	return mintHuddleBotToken(ctx, &http.Client{Timeout: huddleTokenHTTPTimeout}, apiBase, deviceToken, p)
+	return mintHuddleBotToken(ctx, &http.Client{Timeout: huddleTokenHTTPTimeout, Transport: platformhttp.New(apiBase.String(), platformhttp.Options{})}, apiBase, deviceToken, p)
 }
 
 // mintHuddleBotToken POSTs to {apiBase}/api/huddle-bot/token with the enrolled
@@ -726,14 +727,14 @@ func (h *HuddleJoinHandler) ready(ctx context.Context, apiBase *url.URL, tok hud
 	if h.acknowledgeReady != nil {
 		return h.acknowledgeReady(ctx, apiBase, tok, final)
 	}
-	return acknowledgeHuddleReady(ctx, &http.Client{Timeout: huddleTokenHTTPTimeout}, apiBase, tok, final)
+	return acknowledgeHuddleReady(ctx, &http.Client{Timeout: huddleTokenHTTPTimeout, Transport: platformhttp.New(apiBase.String(), platformhttp.Options{})}, apiBase, tok, final)
 }
 
 func (h *HuddleJoinHandler) terminal(ctx context.Context, apiBase *url.URL, tok huddleToken, status, detail string) error {
 	if h.reportTerminal != nil {
 		return h.reportTerminal(ctx, apiBase, tok, status, detail)
 	}
-	return reportHuddleTerminal(ctx, &http.Client{Timeout: huddleTokenHTTPTimeout}, apiBase, tok, status, detail)
+	return reportHuddleTerminal(ctx, &http.Client{Timeout: huddleTokenHTTPTimeout, Transport: platformhttp.New(apiBase.String(), platformhttp.Options{})}, apiBase, tok, status, detail)
 }
 
 // acknowledgeHuddleReady sends the server-required boolean ACK only after the
@@ -867,7 +868,8 @@ func postHuddleDeviceLifecycle(ctx context.Context, apiBase *url.URL, deviceToke
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+deviceToken)
 	client := &http.Client{
-		Timeout: huddleTokenHTTPTimeout,
+		Timeout:   huddleTokenHTTPTimeout,
+		Transport: platformhttp.New(apiBase.String(), platformhttp.Options{}),
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

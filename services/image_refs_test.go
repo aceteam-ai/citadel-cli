@@ -104,3 +104,32 @@ func TestOwnSidecarImagesArePinnedByDigest(t *testing.T) {
 		}
 	}
 }
+
+// The NVR module includes third-party images outside #1396's scope, so apply
+// the own-sidecar contract only to its init service, not every module service.
+func TestNVRConfigInitImageIsPinnedAndCacheUsable(t *testing.T) {
+	var doc struct {
+		Services map[string]struct {
+			Image      string `yaml:"image"`
+			PullPolicy string `yaml:"pull_policy"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(nvrComposeYAML, &doc); err != nil {
+		t.Fatal(err)
+	}
+	init, exists := doc.Services["nvr-config"]
+	if !exists {
+		t.Fatal("NVR init service is missing")
+	}
+	// Verified registry/CI evidence and the native/catalog gates are documented
+	// in docs/nvr-config-image-pin.md. Syntax alone cannot establish provenance.
+	const source = "2241cf4d5a171a0b11b733b84ec06035f185ab85"
+	const digest = "dcbe4f783eb14c7979d93db68ae9239eada5fec09f71d5966aa733b20b2eebba"
+	want := "ghcr.io/aceteam-ai/nvr-config:" + source + "@sha256:" + digest
+	if !digestPinnedImageRef.MatchString(init.Image) || init.Image != want {
+		t.Fatal("NVR init image is not the reviewed security-repair commit/digest")
+	}
+	if init.PullPolicy != "missing" {
+		t.Fatal("NVR init image must reuse the pinned cache without a mandatory refresh")
+	}
+}

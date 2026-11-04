@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
@@ -203,6 +204,12 @@ func TestExecuteWithDeadlineUnblocksHungHandler(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("second job never ran; the loop was wedged by the hung handler")
 	}
+	// Handler entry is not terminal completion: cancellation can still win the
+	// watchdog's result delivery. Wait for the real source ACK before shutdown.
+	waitFor(t, func() bool {
+		acked := source.AckedJobs()
+		return len(acked) == 1 && acked[0].ID == "job-2"
+	}, "second job did not reach terminal acknowledgement")
 	cancel()
 	<-runDone
 
@@ -362,10 +369,10 @@ func TestResolveJobTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("long tier for a session job type", func(t *testing.T) {
+	t.Run("meeting uses its separate finite execution profile", func(t *testing.T) {
 		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeMeetingJoin})
-		if !ok || d != defaultLongJobTimeoutSeconds*time.Second {
-			t.Fatalf("got (%s, %v), want (%ds, true)", d, ok, defaultLongJobTimeoutSeconds)
+		if !ok || d != 29280*time.Second {
+			t.Fatalf("got (%s, %v), want the ratified ad hoc profile", d, ok)
 		}
 	})
 
@@ -438,41 +445,46 @@ func TestResolveJobTimeout(t *testing.T) {
 // still-healthy bounded job (MEETING_JOIN/COBROWSE) reclaim-eligible before
 // its own watchdog would have already ACKed it out of the PEL.
 func TestResolveStalePendingReclaimFloor(t *testing.T) {
-	t.Run("default: matches the default long-tier timeout plus margin", func(t *testing.T) {
+	maximum, err := meetingpolicy.Default().Maximum()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meetingFloor := maximum.StuckAfter() + ReclaimFloorMargin
+
+	t.Run("default: covers the largest meeting budget and its STUCK recovery", func(t *testing.T) {
 		got := ResolveStalePendingReclaimFloor()
-		want := defaultLongJobTimeoutSeconds*time.Second + ReclaimFloorMargin
-		if got != want {
-			t.Fatalf("got %s, want %s", got, want)
+		if got != meetingFloor {
+			t.Fatalf("got %s, want the meeting floor %s", got, meetingFloor)
 		}
-		// Must be STRICTLY greater than the watchdog ceiling it is derived
-		// from, not merely equal -- see ReclaimFloorMargin's doc comment for
-		// why equality alone is unsafe.
-		if got <= defaultLongJobTimeoutSeconds*time.Second {
-			t.Fatalf("floor %s is not strictly greater than the watchdog ceiling %ds", got, defaultLongJobTimeoutSeconds)
+		// Both the long-tier watchdog and every valid meeting budget must
+		// elapse STRICTLY before a self-claim can redeliver (#998, #1505).
+		if got <= defaultLongJobTimeoutSeconds*time.Second || got <= maximum.Execution() || got <= maximum.StuckAfter() {
+			t.Fatalf("floor %s does not exceed long tier %ds, meeting E %s and STUCK %s",
+				got, defaultLongJobTimeoutSeconds, maximum.Execution(), maximum.StuckAfter())
 		}
 	})
 
-	t.Run("env-aware: an operator-raised WORKER_JOB_TIMEOUT_LONG_SECONDS raises the floor too", func(t *testing.T) {
-		// A watchdog raised ABOVE the old hardcoded 4h constant is exactly
-		// the scenario the review flagged: the floor must track it, or a
-		// healthy long-session job becomes deterministically stealable at
-		// the old fixed 4h mark.
+	t.Run("env-aware: a long tier raised above the meeting floor raises the floor too", func(t *testing.T) {
+		t.Setenv(jobTimeoutLongEnvVar, "50000")
+		got := ResolveStalePendingReclaimFloor()
+		want := 50000*time.Second + ReclaimFloorMargin
+		if got != want {
+			t.Fatalf("got %s, want %s", got, want)
+		}
+	})
+
+	t.Run("a long tier below the meeting floor cannot lower it", func(t *testing.T) {
 		t.Setenv(jobTimeoutLongEnvVar, "21600") // 6h
-		got := ResolveStalePendingReclaimFloor()
-		want := 6*time.Hour + ReclaimFloorMargin
-		if got != want {
-			t.Fatalf("got %s, want %s", got, want)
-		}
-		if got <= 6*time.Hour {
-			t.Fatalf("floor %s is not strictly greater than the raised watchdog ceiling 6h", got)
+		if got := ResolveStalePendingReclaimFloor(); got != meetingFloor {
+			t.Fatalf("got %s, want the meeting floor %s", got, meetingFloor)
 		}
 	})
 
-	t.Run("unbounded long-tier watchdog falls back to a large sane default", func(t *testing.T) {
+	t.Run("unbounded long-tier watchdog still keeps the meeting floor", func(t *testing.T) {
 		t.Setenv(jobTimeoutLongEnvVar, "0")
 		got := ResolveStalePendingReclaimFloor()
-		if got != StalePendingReclaimFloorFallback {
-			t.Fatalf("got %s, want the fallback %s", got, StalePendingReclaimFloorFallback)
+		if got != meetingFloor || got < StalePendingReclaimFloorFallback {
+			t.Fatalf("got %s, want the meeting floor %s (above fallback %s)", got, meetingFloor, StalePendingReclaimFloorFallback)
 		}
 	})
 }

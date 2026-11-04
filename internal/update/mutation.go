@@ -33,6 +33,8 @@ type ApplyResult struct {
 var resolveInstalledPath = GetCurrentBinaryPath
 var beforeFinalInstalledCheck = func(string) {}
 var preserveSwapStageOwner = setStageOwner
+var commitSwapStage = replaceValidatedStageLocked
+var rollbackRelease = rollbackLocked
 
 // CheckExactTarget performs the locked, installed-disk preflight for an exact
 // remote update. It never holds the lock across release lookup or download.
@@ -205,8 +207,15 @@ func ApplyRelease(ctx context.Context, candidatePath, requestedTarget, fetchedTa
 	if err := backupCurrentLocked(destination); err != nil {
 		return ApplyResult{}, fmt.Errorf("backup installed executable: %w", err)
 	}
-	if err := replaceValidatedStageLocked(stage, stagePath, destination, lock.identity, expected); err != nil {
-		if rollbackErr := rollbackLocked(destination, lock.identity); rollbackErr != nil {
+	originalIdentity, err := installedFileIdentity(destination)
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("inspect installed executable before replacement: %w", err)
+	}
+	if err := commitSwapStage(stage, stagePath, destination, lock.identity, expected); err != nil {
+		if installedFileUnchanged(destination, originalIdentity) {
+			return ApplyResult{}, fmt.Errorf("replace failed; installed path still names the original file, no rollback needed: %w", err)
+		}
+		if rollbackErr := rollbackRelease(destination, lock.identity); rollbackErr != nil {
 			return ApplyResult{}, fmt.Errorf("replace failed (%w) and rollback failed (%v)", err, rollbackErr)
 		}
 		return ApplyResult{}, fmt.Errorf("replace failed, rolled back: %w", err)
@@ -214,7 +223,7 @@ func ApplyRelease(ctx context.Context, candidatePath, requestedTarget, fetchedTa
 	keepStage = runtime.GOOS == "windows"
 	installedAfter, err := ReadExecutableVersion(destination)
 	if err != nil || !ExactVersionIdentityEqual(installedAfter.Version, expected) {
-		if rollbackErr := rollbackLocked(destination, lock.identity); rollbackErr != nil {
+		if rollbackErr := rollbackRelease(destination, lock.identity); rollbackErr != nil {
 			return ApplyResult{}, fmt.Errorf("post-install validation failed and rollback failed: %v", rollbackErr)
 		}
 		return ApplyResult{}, fmt.Errorf("post-install validation failed; rolled back")
@@ -222,6 +231,27 @@ func ApplyRelease(ctx context.Context, candidatePath, requestedTarget, fetchedTa
 	result.Disposition = Applied
 	result.InstalledAfter = installedAfter.Version
 	return result, nil
+}
+
+func installedFileIdentity(path string) (fileIdentity, error) {
+	file, err := openRegularNoFollow(path)
+	if err != nil {
+		return fileIdentity{}, err
+	}
+	defer file.Close()
+	return captureFileIdentity(file)
+}
+
+// Inspect after closing the original handle so Windows replacement is not
+// blocked by our observer. An absent, replaced or uninspectable path is never
+// treated as proof that rollback is unnecessary.
+func installedFileUnchanged(path string, original fileIdentity) bool {
+	file, err := openRegularNoFollow(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	return validateCapturedFileIdentity(file, original) == nil
 }
 
 func installedMetadataError(intent ApplyIntent) error {

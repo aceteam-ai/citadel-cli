@@ -205,13 +205,14 @@ func TestPrivateConfigCreatesDirectoryAndCleansFailedRename(t *testing.T) {
 	}
 }
 
-func TestComposeSuppliesFrigateCredentialsAndRefreshesInitImage(t *testing.T) {
+func TestComposeSuppliesFrigateCredentialsAndPinsCachedInitImage(t *testing.T) {
 	data, err := os.ReadFile("../../services/nvr-service/compose.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var compose struct {
 		Services map[string]struct {
+			Image       string   `yaml:"image"`
 			User        string   `yaml:"user"`
 			PullPolicy  string   `yaml:"pull_policy"`
 			Environment []string `yaml:"environment"`
@@ -220,8 +221,17 @@ func TestComposeSuppliesFrigateCredentialsAndRefreshesInitImage(t *testing.T) {
 	if err := yaml.Unmarshal(data, &compose); err != nil {
 		t.Fatal(err)
 	}
-	if compose.Services["nvr-config"].PullPolicy != "always" {
-		t.Error("approved module start/update must refresh the floating init image")
+	// The former always-refresh assertion protected a floating image. #1396
+	// replaces it with this verified immutable security-repair image; do not
+	// allow the cache policy to conceal an older/unpinned init binary.
+	const source = "2241cf4d5a171a0b11b733b84ec06035f185ab85"
+	const digest = "dcbe4f783eb14c7979d93db68ae9239eada5fec09f71d5966aa733b20b2eebba"
+	const reviewedImage = "ghcr.io/aceteam-ai/nvr-config:" + source + "@sha256:" + digest
+	if compose.Services["nvr-config"].Image != reviewedImage {
+		t.Error("compose must pin the reviewed security-repair init image")
+	}
+	if compose.Services["nvr-config"].PullPolicy != "missing" {
+		t.Error("the exact pinned init image must start from cache without mandatory refresh")
 	}
 	for _, service := range []string{"nvr-config", "frigate"} {
 		if compose.Services[service].User != "" {

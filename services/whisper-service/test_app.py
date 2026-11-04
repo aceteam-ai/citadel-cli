@@ -1,6 +1,7 @@
 """Hermetic contract tests for the transcription and diarization boundary."""
 
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -11,6 +12,49 @@ import pytest
 from fastapi import HTTPException
 
 import app
+
+
+@pytest.mark.parametrize(
+    "name,version,hash_count,target_wheel_hash",
+    [
+        (
+            "certifi",
+            "2026.10.19",
+            2,
+            "42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b",
+        ),
+        (
+            "pillow",
+            "13.0.0",
+            83,
+            "42d63be3af4f9b951b199b0a9d23365d37ab14687e6d77b74940432c8515c4ca",
+        ),
+    ],
+)
+def test_security_lock_pins_match_reviewed_target_wheel(
+    name, version, hash_count, target_wheel_hash
+):
+    """Offline source regression only, not an install/resolver/runtime test."""
+    service_dir = Path(__file__).resolve().parent
+    inputs = (service_dir / "requirements.in").read_text(encoding="utf-8")
+    lines = (service_dir / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    pin = f"{name}=={version}"
+    assert inputs.splitlines().count(pin) == 1
+    entries = [i for i, line in enumerate(lines) if line.startswith(f"{name}==")]
+    assert len(entries) == 1
+    start = entries[0]
+    assert lines[start].split() == [pin, "\\"]
+    hashes = []
+    for line in lines[start + 1 :]:
+        field = line.strip().removesuffix("\\").rstrip()
+        if not field.startswith("--hash=sha256:"):
+            break
+        digest = field.removeprefix("--hash=sha256:")
+        assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+        hashes.append(digest)
+    assert len(hashes) == hash_count
+    assert len(set(hashes)) == hash_count
+    assert target_wheel_hash in hashes
 
 
 @pytest.fixture(autouse=True)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -16,9 +17,10 @@ import (
 // server-pushed job delivery. Instead of HTTP polling, the server runs a
 // persistent XREADGROUP BLOCK loop and pushes "job" messages to the client.
 type WSSource struct {
-	control *workerControlBinding
+	deliveryRefusals
 	client  *redisapi.Client
 	config  WSSourceConfig
+	control *workerControlBinding
 
 	// mu guards queueNames which may be mutated by AddQueue at runtime.
 	mu         sync.RWMutex
@@ -133,6 +135,10 @@ func (s *WSSource) Connect(ctx context.Context) error {
 	// continuously from its XREADGROUP BLOCK loop.
 	ws.OnMessage("job", func(msg redisapi.WSMessage) {
 		job, err := s.convertWSJob(msg)
+		if errors.Is(err, redisapi.ErrDurableDelivery) {
+			s.record(s.log)
+			return
+		}
 		if err != nil {
 			s.debug("ws_source: failed to convert job message: %v", err)
 			return
@@ -447,6 +453,9 @@ func (s *WSSource) snapshotQueues() []string {
 // The server sends: { type: "job", queue: "...", id: "1234567890-0", data: { jobId, type, payload, enqueuedAt } }
 // The data fields mirror StreamMessageData, so we reuse ParseStreamMessage.
 func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
+	if hasDurableCarrier(msg.Data) {
+		return nil, redisapi.ErrDurableDelivery
+	}
 	if msg.Data == nil {
 		return nil, fmt.Errorf("job message has nil data")
 	}

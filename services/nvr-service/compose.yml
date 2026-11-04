@@ -39,7 +39,9 @@
 # entrypoint both use container root; neither service overrides user here. That
 # shared uid can read 0600/0700. Non-root/userns overrides need matching ownership,
 # not broader modes. The :stable tag is floating, NOT a verified digest pin;
-# exact-image/uid acceptance remains an operator-owned rollout gate.
+# exact-image/uid acceptance remains an operator-owned rollout gate for Frigate.
+# The nvr-config pin/provenance is recorded in docs/nvr-config-image-pin.md;
+# registry metadata is not live UID/mount or offline-start acceptance.
 # Environment substitution reference (MQTT user/password and RTSP supported):
 # https://docs.frigate.video/configuration/config/#environment-variable-substitution
 # https://github.com/blakeblackshear/frigate/blob/v0.17.0/frigate/config/mqtt.py
@@ -85,10 +87,11 @@ services:
     restart: unless-stopped
 
   nvr-config:
-    image: ghcr.io/aceteam-ai/nvr-config:latest
-    # Fetch security fixes for this floating init image on an approved module
-    # start/update, even when an older :latest is cached locally (#1357).
-    pull_policy: always
+    image: ghcr.io/aceteam-ai/nvr-config:2241cf4d5a171a0b11b733b84ec06035f185ab85@sha256:dcbe4f783eb14c7979d93db68ae9239eada5fec09f71d5966aa733b20b2eebba
+    # #1396: the reviewed security-repair image is immutable. Reuse this exact
+    # cached digest without a mandatory registry refresh; a missing image still
+    # needs an approved pull. Future security updates require a reviewed new pin.
+    pull_policy: missing
     container_name: citadel-nvr-config
     # An init step, not a long-running service: it writes config.yml + verifies the
     # nas mount, then exits. frigate waits for it to complete successfully.

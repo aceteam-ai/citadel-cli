@@ -30,6 +30,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // DefaultCoordinatorSAN is the SAN URI a node allowlists by default so the
@@ -89,7 +91,7 @@ func EnsureFabricCABundle(baseURL, configDir string) (string, error) {
 // fetchCAChain GETs the public CA chain and validates it parses as >=1 cert.
 func fetchCAChain(baseURL string) ([]byte, error) {
 	url := strings.TrimRight(baseURL, "/") + caChainPath
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 15 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{})}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", url, err)

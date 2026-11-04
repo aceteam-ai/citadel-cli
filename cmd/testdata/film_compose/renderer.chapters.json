@@ -1,0 +1,25 @@
+{
+  "chapters": [
+    {
+      "index": 1,
+      "title": "Chapter one",
+      "start_s": 6.5,
+      "end_s": 16.5,
+      "card_start_s": 4,
+      "narrator": {"name": "the Ace", "line": "Narrated by the Ace, the AI"},
+      "stamp": {"label": "SIGNED", "by": "founder", "at": "2026-10-12"},
+      "disclosure": null
+    }
+  ],
+  "duration_s": 21.5,
+  "bytes": 50331648,
+  "loudness_measured": {
+    "input_i": "-20",
+    "input_tp": "-5",
+    "input_lra": "3",
+    "input_thresh": "-30",
+    "target_offset": "0.2"
+  },
+  "loudness_measured_stage": "pre_normalization",
+  "encode_passes": 1
+}

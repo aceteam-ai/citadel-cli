@@ -17,9 +17,11 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/session"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -137,6 +139,12 @@ type StatusData struct {
 	WorkerQueue   string
 	Queues        []QueueInfo // All subscribed queues
 	RecentJobs    []JobRecord // Last N jobs processed
+	// SharedWorker selects observations from the external worker's shared
+	// control surface. A nil detail is unavailable, never a healthy zero.
+	SharedWorker           bool
+	WorkerOwnerChanged     bool // Latched until the local monitor is restarted.
+	WorkerDetail           *status.WorkerDetail
+	WorkerDetailObservedAt time.Time // Local successful receipt, not peer clock.
 
 	// Heartbeat status
 	HeartbeatActive bool
@@ -567,6 +575,10 @@ type ControlCenter struct {
 	statusBar    *tview.TextView
 	helpBar      *tview.TextView
 
+	// An open external-worker modal refreshes with the ordinary panels so a
+	// failed observation clears it too, rather than freezing a healthy snapshot.
+	sharedWorkerDetailView *tview.TextView
+
 	// State
 	activities     []ActivityEntry
 	activityMu     sync.Mutex
@@ -664,14 +676,25 @@ type DeviceAuthConfig struct {
 	DeviceCode      string
 	ExpiresIn       int
 	Interval        int
+
+	// ExpiresAt is captured at the authorization request's entry, before any
+	// network or UI delay. Presentation and token responses never renew it.
+	ExpiresAt time.Time
 }
 
 // DeviceAuthCallbacks holds callbacks for device authorization flow
 type DeviceAuthCallbacks struct {
-	StartFlow  func() (*DeviceAuthConfig, error)                                 // Start device auth flow, returns codes
-	PollToken  func(deviceCode string, interval int) (authkey string, err error) // Poll for token
-	Connect    func(authkey, deviceCode string) error                            // Register and link this current grant before returning success
-	Disconnect func() error                                                      // Disconnect from network
+	StartFlow func() (*DeviceAuthConfig, error) // Start device auth flow, returns codes
+
+	// PollToken fetches only. It must not persist credentials or retain a token
+	// in shared state; acceptance belongs to the fenced Connect admission.
+	PollToken func(deviceCode string, interval int) (*nexus.TokenResponse, error)
+
+	// Connect admits persistence, registration and linking of this exact token.
+	// Once admitted, cancellation does not undo its synchronous effects.
+	Connect    func(token *nexus.TokenResponse, deviceCode string) error
+	EndFlow    func(deviceCode string) // Optional cleanup after the last synchronous poll returns
+	Disconnect func() error            // Disconnect from network
 }
 
 // WorkerCallbacks holds callbacks for worker management
@@ -2057,6 +2080,7 @@ func (cc *ControlCenter) updateAllPanels() {
 	cc.updatePeersView()
 	cc.updateActivityView()
 	cc.updateStatusBar()
+	cc.updateSharedWorkerDetailModal()
 }
 
 // Action definitions for the actions table
@@ -2203,7 +2227,7 @@ func (cc *ControlCenter) updateNodePanel() {
 			agoStr = fmt.Sprintf("%dm ago", int(ago.Minutes()))
 		}
 		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [green]%s[-] %s\n", Glyph(MarkerActive), agoStr))
-	} else if cc.data.WorkerRunning {
+	} else if cc.data.WorkerRunning && !cc.data.SharedWorker {
 		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [gray]%s[-] starting...\n", Glyph(MarkerInactive)))
 	}
 
@@ -2451,6 +2475,10 @@ func (cc *ControlCenter) updateServicesView() {
 }
 
 func (cc *ControlCenter) updateJobsPanel() {
+	if cc.data.SharedWorker {
+		cc.jobsPanel.SetText(renderSharedWorkerStatus(cc.data, time.Now()))
+		return
+	}
 	var sb strings.Builder
 
 	// Worker status - prominent at top
@@ -2746,7 +2774,7 @@ func (cc *ControlCenter) getContextualSuggestion() string {
 	}
 
 	// Worker not running but connected - suggest starting worker
-	if cc.data.Connected && !cc.data.WorkerRunning {
+	if cc.data.Connected && !cc.data.WorkerRunning && !cc.data.SharedWorker {
 		return "Worker not running - jobs won't be processed on this node"
 	}
 
@@ -3266,6 +3294,9 @@ func (cc *ControlCenter) getVitalsText() string {
 
 // getJobsText returns plain text representation of jobs panel
 func (cc *ControlCenter) getJobsText() string {
+	if cc.data.SharedWorker {
+		return sharedWorkerStatusText(cc.data, time.Now())
+	}
 	var sb strings.Builder
 	if cc.data.WorkerRunning {
 		sb.WriteString("Worker: ACTIVE\n")

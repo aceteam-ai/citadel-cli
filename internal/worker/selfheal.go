@@ -2,10 +2,13 @@ package worker
 
 import (
 	"context"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // LivenessMonitor is the self-heal backstop for a consumption-wedged worker
@@ -42,17 +45,26 @@ type LivenessMonitor struct {
 	// be misread as "never polled" and trigger a restart loop (issue #548).
 	startedAt time.Time
 
-	isDraining func() bool
-	onWedge    func(reason string) // default: log + os.Exit(1)
-	log        func(level, msg string)
+	isDraining      func() bool
+	onWedge         func(reason string) // default: log + os.Exit(1)
+	log             func(level, msg string)
+	platformWindow  time.Duration
+	platformBackoff time.Duration
+	redialPlatform  func()
+	idleRestart     func(func()) bool
+	platformRestart bool
+	beforeRestart   func()
+	now             func() time.Time
 }
 
 // Self-heal tuning. Following the SERVICE_* env convention already used in the
 // repo. WORKER_SELF_HEAL=false disables the monitor entirely.
 const (
-	selfHealEnabledEnvVar = "WORKER_SELF_HEAL"
-	selfHealStallEnvVar   = "WORKER_SELF_HEAL_STALL_SECONDS"
-	selfHealStuckEnvVar   = "WORKER_SELF_HEAL_STUCK_SECONDS"
+	selfHealEnabledEnvVar          = "WORKER_SELF_HEAL"
+	selfHealStallEnvVar            = "WORKER_SELF_HEAL_STALL_SECONDS"
+	selfHealStuckEnvVar            = "WORKER_SELF_HEAL_STUCK_SECONDS"
+	selfHealPlatformEnvVar         = "WORKER_SELF_HEAL_PLATFORM_FAIL_SECONDS"
+	defaultSelfHealPlatformSeconds = 900
 
 	// defaultSelfHealStallSeconds: 10min. Far above the source block timeout and
 	// the max consume backoff, so a healthy loop never trips it.
@@ -91,14 +103,17 @@ func NewLivenessMonitor(state *WorkerState, isDraining func() bool, log func(lev
 		log = func(string, string) {}
 	}
 	return &LivenessMonitor{
-		state:         state,
-		startedAt:     time.Now(), // re-stamped when Run begins
-		stallTimeout:  envSecondsOrDefault(selfHealStallEnvVar, defaultSelfHealStallSeconds),
-		stuckTimeout:  envSecondsOrDefault(selfHealStuckEnvVar, defaultSelfHealStuckSeconds),
-		checkInterval: defaultSelfHealCheckInterval,
-		graceStart:    defaultSelfHealGrace,
-		isDraining:    isDraining,
-		log:           log,
+		state:           state,
+		startedAt:       time.Now(), // re-stamped when Run begins
+		stallTimeout:    envSecondsOrDefault(selfHealStallEnvVar, defaultSelfHealStallSeconds),
+		stuckTimeout:    envSecondsOrDefault(selfHealStuckEnvVar, defaultSelfHealStuckSeconds),
+		checkInterval:   defaultSelfHealCheckInterval,
+		graceStart:      defaultSelfHealGrace,
+		isDraining:      isDraining,
+		log:             log,
+		platformWindow:  envSecondsOrDefault(selfHealPlatformEnvVar, defaultSelfHealPlatformSeconds),
+		platformBackoff: time.Minute + time.Duration(rand.Int64N(int64(4*time.Minute)+1)),
+		now:             time.Now,
 		onWedge: func(reason string) {
 			// Exit non-zero so systemd (Restart=on-failure) restarts the
 			// process clean -- clearing any leaked/wedged goroutines that an
@@ -106,6 +121,23 @@ func NewLivenessMonitor(state *WorkerState, isDraining func() bool, log func(lev
 			os.Exit(1)
 		},
 	}
+}
+
+// SetRestartFence runs before non-idle recovery and must never wait for a
+// potentially stuck poll. The platform-idle recovery already owns its fence.
+func (m *LivenessMonitor) SetRestartFence(fence func()) {
+	if m != nil {
+		m.beforeRestart = fence
+	}
+}
+
+// SetPlatformRecovery enables the HTTP backstop only for an API-mode worker.
+// Configure before Run. The guard fences job admission before process exit.
+func (m *LivenessMonitor) SetPlatformRecovery(redial func(), idleRestart func(func()) bool) {
+	if m == nil {
+		return
+	}
+	m.redialPlatform, m.idleRestart = redial, idleRestart
 }
 
 // envSecondsOrDefault reads a seconds-valued env var. A value <= 0 disables that
@@ -140,33 +172,78 @@ func (m *LivenessMonitor) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if reason, wedged := m.check(time.Now()); wedged {
-				m.log("error", "Self-heal: "+reason+"; restarting worker process")
-				m.onWedge(reason)
-				return
+			now := time.Now()
+			if reason, wedged := m.check(now); wedged {
+				if m.handleWedge(reason, now) {
+					return
+				}
 			}
 		}
 	}
+}
+
+func (m *LivenessMonitor) handleWedge(reason string, now time.Time) bool {
+	exit := func() {
+		m.log("error", "Self-heal: "+reason+"; restarting worker process")
+		m.onWedge(reason)
+	}
+	if m.platformRestart {
+		committed := false
+		currentTime := func() time.Time {
+			if m.now != nil {
+				return m.now()
+			}
+			return now
+		}
+		if m.idleRestart == nil || !m.idleRestart(func() { committed = m.state.platform.CommitRestart(currentTime(), exit) }) || !committed {
+			m.state.platform.Suspend(currentTime())
+			return false
+		}
+		return true
+	}
+	if m.beforeRestart != nil {
+		m.beforeRestart()
+	}
+	exit()
+	return true
 }
 
 // check evaluates the current state at time now and returns a non-empty reason
 // with wedged=true when the worker should be restarted. Split out from Run so it
 // is unit-testable without a real ticker or process exit.
 func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
+	m.platformRestart = false
 	if m.isDraining() {
+		m.state.platform.Suspend(now)
 		return "", false // intentional pause (auto-update): not a wedge
 	}
 	snap := m.state.Snapshot()
+	tracked, executionStuck := m.state.trackedExecutionState(now, m.stuckTimeout)
 
 	// Respect a startup grace period, measured from when the MONITOR started (see
 	// startedAt), so the slow work before the consume loop begins is never
 	// mistaken for a wedge and cannot trigger a restart loop.
 	if now.Sub(m.startedAt) < m.graceStart {
+		m.state.platform.Suspend(now)
 		return "", false
+	}
+	if m.redialPlatform != nil && m.platformWindow > 0 {
+		if tracked || snap.InFlight > 0 || snap.Executing > 0 {
+			m.state.platform.Suspend(now)
+		} else {
+			switch m.state.platform.NextAction(now, m.platformWindow, m.platformBackoff) {
+			case platformhttp.RedialPlatform:
+				m.log("warning", "Self-heal: sustained platform wrong answers; re-dialing before restart backoff")
+				m.redialPlatform()
+			case platformhttp.RestartWorker:
+				m.platformRestart = true
+				return "sustained platform wrong answers after two fresh-failure windows and bounded backoff", true
+			}
+		}
 	}
 
 	// STALL: loop not polling while nothing is running.
-	if snap.InFlight == 0 && m.stallTimeout > 0 {
+	if !tracked && snap.InFlight == 0 && m.stallTimeout > 0 {
 		if snap.LastPollAt == nil {
 			// Up past grace, nothing in flight, and never a single poll: the
 			// loop never started consuming.
@@ -194,7 +271,10 @@ func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
 	//      marks when the current EXECUTING streak began and is nil while every
 	//      in-flight job is still queued, so only a handler that has genuinely
 	//      run past the ceiling trips this.
-	if snap.Executing > 0 && m.stuckTimeout > 0 && snap.OldestExecutingAt != nil {
+	if executionStuck {
+		return "job stuck beyond its execution-specific self-heal ceiling", true
+	}
+	if !tracked && snap.Executing > 0 && m.stuckTimeout > 0 && snap.OldestExecutingAt != nil {
 		if held := now.Sub(*snap.OldestExecutingAt); held > m.stuckTimeout {
 			return "job stuck in handler for " + held.Truncate(time.Second).String() + " (exceeds self-heal ceiling)", true
 		}

@@ -111,10 +111,14 @@ func TestDesktopAdapterHonorsNodePasscode(t *testing.T) {
 
 func TestDesktopAdapterPermissionGateRunsFirst(t *testing.T) {
 	handler := &recordingDesktopHandler{}
-	a := newDesktopLegacyHandlerAdapter(JobTypeVNCKeys, handler, func() bool { return false }, passcodeGate(true))
+	gate := jobs.DesktopGate{Load: func() (jobs.PasscodeState, error) {
+		t.Fatal("disabled desktop permission reached the passcode gate")
+		return jobs.PasscodeState{}, nil
+	}}
+	a := newDesktopLegacyHandlerAdapter(JobTypeVNCKeys, handler, func() bool { return false }, gate)
 	_, err := a.Execute(context.Background(), &Job{ID: "d2", Type: JobTypeVNCKeys, Payload: map[string]any{"passcode": testNodePasscode}}, nil)
 	var refusal *jobs.ShellRefusal
-	if err == nil || errors.As(err, &refusal) {
+	if !errors.As(err, &refusal) || refusal.Reason != "desktop_disabled" {
 		t.Fatalf("a disabled desktop permission must refuse before the passcode gate, got %v", err)
 	}
 	if len(handler.calls()) != 0 {

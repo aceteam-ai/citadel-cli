@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -109,8 +110,11 @@ func TestRunBareCitadelNonTTYIsObservational(t *testing.T) {
 	cmd := &cobra.Command{Use: "citadel"}
 	cmd.SetOut(&out)
 	runBareCitadel(cmd, nil)
-	if got, want := out.String(), "Citadel enrollment: platform-enrolled\n"; got != want {
-		t.Fatalf("non-TTY output = %q, want %q", got, want)
+	got := out.String()
+	for _, want := range []string{"Citadel enrollment: platform-enrolled", "local credentials present", "device link unverified", "citadel logout && citadel init"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("non-TTY output = %q, missing %q", got, want)
+		}
 	}
 }
 

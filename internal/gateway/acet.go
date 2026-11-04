@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // PricingTier defines ACET cost per 1K tokens for a model size range.
@@ -91,7 +93,8 @@ func NewACETClient(baseURL, apiToken string) *ACETClient {
 		baseURL:  baseURL,
 		apiToken: apiToken,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout:   10 * time.Second,
+			Transport: platformhttp.New(baseURL, platformhttp.Options{}),
 		},
 	}
 }
