@@ -2,6 +2,7 @@ package cobrowsestream
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,12 @@ func TestParseInputMessage(t *testing.T) {
 	}{
 		{"mouse", `{"type":"mouse","event":"mousePressed","x":0.5,"y":0.25,"button":"left"}`, true, InputTypeMouse},
 		{"key", `{"type":"key","keyEvent":"keyDown","key":"a","text":"a"}`, true, InputTypeKey},
+		{"paste", `{"type":"paste","text":"synthetic\ntext 🌏"}`, true, "paste"},
+		{"empty paste", `{"type":"paste","text":""}`, false, ""},
+		{"max-size paste", `{"type":"paste","text":"` + strings.Repeat("x", 4096) + `"}`, true, "paste"},
+		{"multibyte max-size paste", `{"type":"paste","text":"` + strings.Repeat("🌏", 1024) + `"}`, true, "paste"},
+		{"oversized paste", `{"type":"paste","text":"` + strings.Repeat("x", 4097) + `"}`, false, ""},
+		{"multibyte oversized paste", `{"type":"paste","text":"` + strings.Repeat("🌏", 1025) + `"}`, false, ""},
 		{"unknown type", `{"type":"scroll"}`, false, ""},
 		{"no type", `{"x":0.5}`, false, ""},
 		{"garbage", `not json`, false, ""},
