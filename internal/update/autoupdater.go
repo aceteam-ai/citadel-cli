@@ -222,7 +222,22 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 // interval. It never returns an error: failures are logged and retried on the
 // next tick so the agent keeps running regardless.
 func (a *AutoUpdater) Run(ctx context.Context) {
-	a.cfg.Log("auto-update: monitoring (interval %s)", a.cfg.Interval)
+	// Disclose the same effective policy the next tick will consult. This
+	// startup snapshot is for logging only; ticks still resolve policy afresh.
+	enabled, source := true, "default"
+	if a.cfg.Policy != nil {
+		enabled, source = a.cfg.Policy()
+	} else if a.cfg.Enabled != nil {
+		enabled, source = a.cfg.Enabled(), "callback"
+	}
+	if source == "" {
+		source = "unspecified"
+	}
+	if enabled {
+		a.cfg.Log("auto-update: enabled (%s), checking every %s", source, a.cfg.Interval)
+	} else {
+		a.cfg.Log("auto-update: disabled (%s); loop will re-check the policy every %s", source, a.cfg.Interval)
+	}
 	// Publish the heartbeat snapshot (periodic mode + current policy) promptly,
 	// before the first tick fires up to an interval later (citadel-cli#1134).
 	a.refresh()

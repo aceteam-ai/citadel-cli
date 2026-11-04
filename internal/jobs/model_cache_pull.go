@@ -16,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -213,7 +214,7 @@ const (
 // than a second hardcoded "bonsai" literal, so this and
 // services/caches_test.go's compose-mount check can never disagree.
 func bonsaiCacheDir() string {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return filepath.Join("citadel-cache", services.BonsaiCacheDirName)
 	}
@@ -292,7 +293,7 @@ var llamaCppCacheDirFn = defaultLlamaCppCacheDir
 // reports (llamacpp routed through pullHuggingFace, writing into
 // ~/citadel-cache/huggingface instead).
 func defaultLlamaCppCacheDir() string {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return filepath.Join("citadel-cache", services.LlamaCppCacheDirName)
 	}
@@ -675,7 +676,7 @@ func resolveHFDownloader() (string, error) {
 // it is not on PATH. Includes a glob for uv's per-interpreter layout
 // (~/.uv/python/*/bin) since that dir has no single stable name.
 func hfBinDirs() []string {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil || home == "" {
 		return []string{"/usr/local/bin"}
 	}
@@ -1004,7 +1005,7 @@ func runDiskPreflight(ctx JobContext, modelName string, allowPatterns, ignorePat
 // engine's compose mount (asserted by services/caches_test.go) can never
 // disagree.
 func canonicalHFCacheDir() string {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return filepath.Join("citadel-cache", services.HFHubCacheDirName)
 	}
@@ -1087,7 +1088,7 @@ func buildHFPullCommand(bin, modelName string, allowPatterns, ignorePatterns []s
 // legacyHFCacheDir is the pre-fix host default `hf download` used to write
 // into before citadel #682 -- a directory no engine container ever mounts.
 func legacyHFCacheDir() string {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return ""
 	}

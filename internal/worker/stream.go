@@ -83,11 +83,12 @@ func CreateRedisStreamWriterFactory(ctx context.Context, source *RedisSource) fu
 // APIStreamWriter implements StreamWriter using the Redis API proxy.
 // This enables real-time streaming of job output via the secure API.
 type APIStreamWriter struct {
-	clock  *deliveryClock
-	client *redisapi.Client
-	jobID  string
-	rayID  string
-	ctx    context.Context
+	durable bool
+	clock   *deliveryClock
+	client  *redisapi.Client
+	jobID   string
+	rayID   string
+	ctx     context.Context
 }
 
 // NewAPIStreamWriter creates a new API-backed stream writer.
@@ -108,7 +109,9 @@ func (w *APIStreamWriter) WriteClaimed(agentVersion string) error {
 
 // WriteStart signals the beginning of job processing.
 func (w *APIStreamWriter) WriteStart(message string) error {
-	w.client.SetJobStatus(w.ctx, w.jobID, "processing", nil)
+	if !w.durable {
+		w.client.SetJobStatus(w.ctx, w.jobID, "processing", nil)
+	}
 	return w.client.PublishStart(w.ctx, w.jobID, w.rayID, message)
 }
 
@@ -129,7 +132,9 @@ func (w *APIStreamWriter) WriteError(err error, recoverable bool) error {
 
 // WriteCancelled signals job cancellation.
 func (w *APIStreamWriter) WriteCancelled(reason string) error {
-	w.client.SetJobStatus(w.ctx, w.jobID, "cancelled", nil)
+	if !w.durable {
+		w.client.SetJobStatus(w.ctx, w.jobID, "cancelled", nil)
+	}
 	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "cancelled", w.clock.data(map[string]any{"reason": reason}, true))
 }
 
@@ -137,7 +142,9 @@ func (w *APIStreamWriter) WriteCancelled(reason string) error {
 // mirrors the latest snapshot into the bounded job:<id>:progress key. The mirror
 // is best-effort; the pub/sub event is the primary path.
 func (w *APIStreamWriter) WriteProgress(event map[string]any) error {
-	_ = w.client.SetJobProgress(w.ctx, w.jobID, event)
+	if !w.durable {
+		_ = w.client.SetJobProgress(w.ctx, w.jobID, event)
+	}
 	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "progress", event)
 }
 
