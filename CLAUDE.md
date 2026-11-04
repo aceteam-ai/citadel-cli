@@ -38,6 +38,13 @@ leaf open, and fails closed if the verified procfs FD route is unavailable.
 using owned fixtures, not real devices. This does not settle owner/hard-link
 policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
 
+`coordinatorfetch.Get` owns the shared fixed-route, bounded HTTPS transfer used
+by FILE_FETCH and the inactive media inbox freezer. Caller packages retain
+permission, exact-size/hash and publication policy; the client grants none.
+`mediainput.Freezer` adds live media-input checks and conditional Files checks
+for mixed snapshots, without registering a task or reserving the future C5
+holder admission. See `docs/media-input-freezer.md` for the activation gates.
+
 `service.RematerializeManagedUnits` owns the bounded base-file refresh and
 reload request, not worker restart or failed-unit counter recovery.
 `cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
