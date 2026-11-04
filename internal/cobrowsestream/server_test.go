@@ -283,6 +283,79 @@ func TestViewerInputForwardedToCDP(t *testing.T) {
 	}
 }
 
+func TestViewerNativeSelectUsesPageInsteadOfPopupClicks(t *testing.T) {
+	f := newFakeChrome()
+	f.evaluateValue = func(expr string) any {
+		if strings.Contains(expr, `"probe" === "probe"`) {
+			return map[string]any{"type": "select_options", "options": []map[string]any{{"value": "VT", "label": "Vermont", "disabled": false}}}
+		}
+		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, `dispatchEvent(new Event("change"`) {
+			t.Errorf("selection did not update page state: %s", expr)
+		}
+		return map[string]any{"type": "select_result", "value": "VT"}
+	}
+	defer f.close()
+	ts := newHarness(t, &fakeSession{port: 9222, attachable: true}, f)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.5, Y: 0.25}); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["type"] == "select_options" {
+			break
+		}
+	}
+	if len(got["options"].([]any)) != 1 {
+		t.Fatalf("options = %#v", got)
+	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelect, X: 0.5, Y: 0.25, Value: "VT"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["type"] == "select_result" {
+			break
+		}
+	}
+	if got["value"] != "VT" {
+		t.Fatalf("selection = %#v", got)
+	}
+}
+
 // TestTeardownOnBrowserStop: the browser (session) going away tears the viewer
 // down and detaches the session -- the "teardown on session stop" acceptance.
 func TestTeardownOnBrowserStop(t *testing.T) {

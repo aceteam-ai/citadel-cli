@@ -366,6 +366,53 @@ func (c *cdpClient) dispatchKey(m InputMessage) error {
 	return c.send("Input.dispatchKeyEvent", params)
 }
 
+// selectAt probes or updates a native select at the viewport point. Browser
+// popup menus live outside the page and ignore forwarded mouse clicks, so the
+// viewer presents options in its own UI and applies the choice through the DOM.
+func (c *cdpClient) selectAt(m InputMessage) (map[string]any, error) {
+	c.metaMu.Lock()
+	w, h := c.lastW, c.lastH
+	c.metaMu.Unlock()
+	if w <= 0 || h <= 0 {
+		return nil, nil
+	}
+	valueJSON, _ := json.Marshal(m.Value)
+	mode := "probe"
+	if m.Type == InputTypeSelect {
+		mode = "select"
+	}
+	expr := fmt.Sprintf(`(function(){
+		const el = document.elementFromPoint(%f, %f);
+		if (!(el instanceof HTMLSelectElement)) return null;
+		if (%q === "probe") return {type: "select_options", options: Array.from(el.options).map(o => ({value: o.value, label: o.label, disabled: o.disabled || o.parentElement?.disabled || false}))};
+		const option = Array.from(el.options).find(o => o.value === %s);
+		if (!option || option.disabled || option.parentElement?.disabled) return {type: "select_error", message: "Option unavailable"};
+		Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(el, option.value);
+		el.dispatchEvent(new Event("input", {bubbles: true}));
+		el.dispatchEvent(new Event("change", {bubbles: true}));
+		return {type: "select_result", value: el.value};
+	})()`, clamp01(m.X)*w, clamp01(m.Y)*h, mode, string(valueJSON))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	res, err := c.command(ctx, "Runtime.evaluate", map[string]any{"expression": expr, "returnByValue": true})
+	if err != nil {
+		return nil, err
+	}
+	if res["exceptionDetails"] != nil {
+		return nil, fmt.Errorf("select script failed")
+	}
+	remote, ok := res["result"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("select returned no result")
+	}
+	value, ok := remote["value"].(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+	value["x"], value["y"] = m.X, m.Y
+	return value, nil
+}
+
 // mouseButton defaults an empty/unknown button to "none" so a bare mouseMoved
 // (no button) is valid CDP.
 func mouseButton(b string) string {

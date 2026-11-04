@@ -34,6 +34,8 @@ func TestParseInputMessage(t *testing.T) {
 	}{
 		{"mouse", `{"type":"mouse","event":"mousePressed","x":0.5,"y":0.25,"button":"left"}`, true, InputTypeMouse},
 		{"key", `{"type":"key","keyEvent":"keyDown","key":"a","text":"a"}`, true, InputTypeKey},
+		{"select probe", `{"type":"select_probe","x":0.5,"y":0.25}`, true, InputTypeSelectProbe},
+		{"select", `{"type":"select","x":0.5,"y":0.25,"value":"VT"}`, true, InputTypeSelect},
 		{"unknown type", `{"type":"scroll"}`, false, ""},
 		{"no type", `{"x":0.5}`, false, ""},
 		{"garbage", `not json`, false, ""},

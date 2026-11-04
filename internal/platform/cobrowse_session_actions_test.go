@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -575,6 +576,47 @@ func TestCobrowseSessionActions_TypeSendsInsertText(t *testing.T) {
 	}
 	if calls[0].Params["text"] != "hello world" {
 		t.Errorf("insertText text = %v, want %q", calls[0].Params["text"], "hello world")
+	}
+}
+
+func TestCobrowseSessionActions_SelectUsesPageSetterAndReportsValue(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, "dispatchEvent(new Event(\"change\"") {
+			t.Errorf("select must set the native value and fire change, got %q", expr)
+		}
+		return map[string]any{"value": "VT", "label": "Vermont"}
+	}
+	f.mu.Unlock()
+	got, err := m.Select(st.ID, "#state", "VT", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Value != "VT" || got.Label != "Vermont" {
+		t.Fatalf("selected = %#v", got)
+	}
+	if len(f.callsFor("Input.dispatchMouseEvent")) != 0 {
+		t.Fatal("native select must not click the popup")
+	}
+}
+
+func TestCobrowseSessionActions_KeyAndScrollSendRealInput(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	if _, err := m.Key(st.ID, "ArrowDown"); err != nil {
+		t.Fatal(err)
+	}
+	keys := f.callsFor("Input.dispatchKeyEvent")
+	if len(keys) != 2 || keys[0].Params["type"] != "rawKeyDown" || keys[1].Params["type"] != "keyUp" {
+		t.Fatalf("key events = %#v", keys)
+	}
+	x, y := 10.0, 20.0
+	if _, err := m.Scroll(st.ID, "", &x, &y, 0, 180); err != nil {
+		t.Fatal(err)
+	}
+	mouse := f.callsFor("Input.dispatchMouseEvent")
+	if len(mouse) != 1 || mouse[0].Params["type"] != "mouseWheel" || mouse[0].Params["deltaY"] != float64(180) {
+		t.Fatalf("wheel = %#v", mouse)
 	}
 }
 

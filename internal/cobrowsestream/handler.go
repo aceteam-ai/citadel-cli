@@ -121,6 +121,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	uiMessages := make(chan map[string]any, 4)
 	// Reader goroutine: viewer input -> CDP. Also detects viewer disconnect and
 	// keeps the read deadline fresh via pong, so a dead viewer flips the session
 	// out of "attached" within pongWait. It never writes to the viewer socket.
@@ -138,7 +139,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			if mt == websocket.TextMessage {
 				if m, ok := parseInputMessage(data); ok {
-					s.dispatchInput(cdp, m)
+					if m.Type == InputTypeSelectProbe || m.Type == InputTypeSelect {
+						result, err := cdp.selectAt(m)
+						if err != nil {
+							s.logger.Printf("viewer select failed: %v", err)
+						}
+						if result != nil {
+							select {
+							case uiMessages <- result:
+							default:
+							}
+						}
+					} else {
+						s.dispatchInput(cdp, m)
+					}
 				}
 			}
 		}
@@ -151,6 +165,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		select {
+		case msg := <-uiMessages:
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteJSON(msg); err != nil {
+				return
+			}
 		case <-ctx.Done():
 			return
 		case <-cdp.Done():
