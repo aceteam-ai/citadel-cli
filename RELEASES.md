@@ -3451,3 +3451,19 @@ Auto-generated log of every release.
   - docs: source-first Speakrail full-duplex voice proposal (#1376) (#1423)
 
 
+---
+
+## v2.209.0 — 2026-11-04
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 31 |
+| Lines added | +1474 |
+
+**Changes:**
+
+  - fix(services): select CPU compose on GPU-less Linux nodes (#1535)
+  - fix(update): disclose the effective startup auto-update policy (#1534)
+
+
