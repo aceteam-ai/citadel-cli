@@ -8,7 +8,7 @@ import (
 	"sort"
 )
 
-func files(ctx context.Context, root *os.Root, kind string, r Request, out Result) (Result, error) {
+func files(ctx context.Context, root *os.Root, runtime Runtime, kind string, r Request, out Result) (Result, error) {
 	if ctx.Err() != nil || !relative(r.Path, kind == FileList) {
 		return out, ErrInvalid
 	}
@@ -34,16 +34,21 @@ func files(ctx context.Context, root *os.Root, kind string, r Request, out Resul
 		if err != nil || len(b) > FileLimit {
 			return out, ErrBounds
 		}
-		// Root.OpenFile follows only symlinks whose targets stay within this root.
-		// O_NONBLOCK in the native helper prevents an existing FIFO from wedging.
-		f, err := openWrite(root, r.Path)
+		// Exclusive creation identifies new files for ownership handoff. The
+		// native helper refuses final symlinks and never truncates before validation.
+		f, created, err := openWrite(root, r.Path)
 		if err != nil {
 			return out, ErrUnavailable
 		}
 		defer f.Close()
 		st, err := f.Stat()
-		if err != nil || !st.Mode().IsRegular() {
+		if err != nil || !st.Mode().IsRegular() || !singleFileLink(st) {
 			return out, ErrInvalid
+		}
+		if created {
+			if err := runtime.HandoffWorkspaceFile(f); err != nil {
+				return out, ErrUnavailable
+			}
 		}
 		if err = f.Truncate(0); err != nil {
 			return out, ErrUnavailable

@@ -281,9 +281,14 @@ func (e *Engine) importVolume(ctx context.Context, r Request) (Result, error) {
 		return out, ErrUnavailable
 	}
 	defer root.Close()
+	if e.Runtime.PrepareImportRoot(root) != nil {
+		return out, ErrUnavailable
+	}
 	reader := &chunkReader{ctx: ctx, transport: e.Transport, request: r, gcm: gcm}
 	tr := tar.NewReader(reader)
 	seen := map[string]bool{}
+	createdDirs := map[string]bool{}
+	regularFiles := map[string]bool{}
 	names := 0
 	written := int64(0)
 	var symlinks [][2]string
@@ -303,8 +308,29 @@ func (e *Engine) importVolume(ctx context.Context, r Request) (Result, error) {
 		seen[name] = true
 		switch h.Typeflag {
 		case tar.TypeDir:
-			if err = root.MkdirAll(name, 0700); err != nil {
-				return out, ErrUnavailable
+			if !createdDirs[name] {
+				if info, err := root.Lstat(name); err == nil {
+					// A freshly formatted volume may contain an empty system
+					// directory. Preserve it without chown or descendant writes.
+					if !info.IsDir() {
+						return out, ErrInvalid
+					}
+					dir, err := openImportDirectory(root, name)
+					if err != nil {
+						return out, ErrUnavailable
+					}
+					entries, readErr := dir.ReadDir(1)
+					closeErr := dir.Close()
+					if len(entries) != 0 || (readErr != nil && readErr != io.EOF) || closeErr != nil {
+						return out, ErrInvalid
+					}
+					continue
+				} else if !os.IsNotExist(err) {
+					return out, ErrUnavailable
+				}
+			}
+			if err = mkdirImportDirs(root, name, createdDirs, e.Runtime); err != nil {
+				return out, err
 			}
 		case tar.TypeReg, tar.TypeRegA:
 			if h.Size < 0 || written > r.QuotaBytes-h.Size {
@@ -313,12 +339,16 @@ func (e *Engine) importVolume(ctx context.Context, r Request) (Result, error) {
 			written += h.Size
 			parent := strings.LastIndex(name, "/")
 			if parent >= 0 {
-				if root.MkdirAll(name[:parent], 0700) != nil {
+				if mkdirImportDirs(root, name[:parent], createdDirs, e.Runtime) != nil {
 					return out, ErrUnavailable
 				}
 			}
 			f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, os.FileMode(h.Mode)&0777)
 			if err != nil {
+				return out, ErrUnavailable
+			}
+			if err := e.Runtime.HandoffWorkspaceFile(f); err != nil {
+				f.Close()
 				return out, ErrUnavailable
 			}
 			_, copyErr := io.CopyN(f, &contextReader{ctx: ctx, r: tr}, h.Size)
@@ -327,6 +357,7 @@ func (e *Engine) importVolume(ctx context.Context, r Request) (Result, error) {
 			if copyErr != nil || syncErr != nil || closeErr != nil {
 				return out, ErrUnavailable
 			}
+			regularFiles[name] = true
 		case tar.TypeSymlink:
 			names += len(h.Linkname)
 			if names > 8<<20 || h.Size != 0 || !archiveLink(name, h.Linkname) {
@@ -339,19 +370,25 @@ func (e *Engine) importVolume(ctx context.Context, r Request) (Result, error) {
 				return out, ErrInvalid
 			}
 			target, err := root.Lstat(h.Linkname)
-			if err != nil || !target.Mode().IsRegular() {
+			if err != nil || !target.Mode().IsRegular() || !regularFiles[h.Linkname] {
 				return out, ErrInvalid
 			}
-			if root.MkdirAll(path.Dir(name), 0700) != nil || root.Link(h.Linkname, name) != nil {
+			if mkdirImportDirs(root, path.Dir(name), createdDirs, e.Runtime) != nil || root.Link(h.Linkname, name) != nil {
 				return out, ErrUnavailable
 			}
+			regularFiles[name] = true
 		default:
 			return out, ErrInvalid
 		}
 	}
 	// Install symlinks after file extraction, so they cannot redirect writes.
 	for _, link := range symlinks {
-		if ctx.Err() != nil || root.MkdirAll(path.Dir(link[0]), 0700) != nil || root.Symlink(link[1], link[0]) != nil {
+		if ctx.Err() != nil || mkdirImportDirs(root, path.Dir(link[0]), createdDirs, e.Runtime) != nil || root.Symlink(link[1], link[0]) != nil {
+			return out, ErrUnavailable
+		}
+	}
+	for _, link := range symlinks {
+		if e.Runtime.HandoffWorkspaceSymlink(root, link[0]) != nil {
 			return out, ErrUnavailable
 		}
 	}
@@ -379,6 +416,9 @@ func (e *Engine) importVolume(ctx context.Context, r Request) (Result, error) {
 	}
 	if reader.total != total || ctx.Err() != nil {
 		return out, ErrInvalid
+	}
+	if e.Runtime.PublishImportRoot(root) != nil {
+		return out, ErrUnavailable
 	}
 	out.Bytes = total
 	out.Manifest = r.Manifest
@@ -424,4 +464,37 @@ func archiveLink(name, target string) bool {
 		return false
 	}
 	return relative(path.Join(path.Dir(name), target), true)
+}
+
+// Only directories created by this import can receive new descendants. Existing
+// paths are never recursively chowned or repurposed as extraction parents.
+func mkdirImportDirs(root *os.Root, name string, created map[string]bool, runtime Runtime) error {
+	if name == "." {
+		return nil
+	}
+	prefix := ""
+	for _, part := range strings.Split(name, "/") {
+		if prefix == "" {
+			prefix = part
+		} else {
+			prefix += "/" + part
+		}
+		if created[prefix] {
+			continue
+		}
+		if err := root.Mkdir(prefix, 0700); err != nil {
+			return ErrInvalid
+		}
+		dir, err := openImportDirectory(root, prefix)
+		if err != nil {
+			return ErrUnavailable
+		}
+		handoffErr := runtime.HandoffWorkspaceFile(dir)
+		closeErr := dir.Close()
+		if handoffErr != nil || closeErr != nil {
+			return ErrUnavailable
+		}
+		created[prefix] = true
+	}
+	return nil
 }

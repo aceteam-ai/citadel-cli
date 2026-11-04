@@ -32,3 +32,9 @@ func (*Native) OpenVolume(context.Context, string) (*os.Root, error) { return ni
 func (*Native) Usage(context.Context, string) (int64, int64, error)  { return 0, 0, ErrUnavailable }
 func (*Native) DestroyContainer(context.Context, string) error       { return ErrUnavailable }
 func (*Native) DestroyVolume(context.Context, string) error          { return ErrUnavailable }
+
+func (*Native) HandoffWorkspaceFile(*os.File) error            { return ErrUnavailable }
+func (*Native) HandoffWorkspaceSymlink(*os.Root, string) error { return ErrUnavailable }
+
+func (*Native) PrepareImportRoot(*os.Root) error { return ErrUnavailable }
+func (*Native) PublishImportRoot(*os.Root) error { return ErrUnavailable }
