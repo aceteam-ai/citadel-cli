@@ -24,6 +24,9 @@ type Native struct {
 	openHostRoot  func(string) (*os.File, error)
 	syncJournal   func(*os.File) error
 	freeHostBytes func(*os.File) (uint64, error)
+	// Tests replace only these syscalls; no native chown runs in fake proofs.
+	chownFile func(*os.File, int, int) error
+	chownLink func(*os.Root, string, int, int) error
 }
 
 func NewNative(root string, runtime func() string) *Native {
@@ -577,6 +580,39 @@ func (n *Native) DestroyVolume(ctx context.Context, ref string) error {
 	// Keep the private directory as a tombstone. Never reuse a partially removed
 	// volume ref, and never recursively delete a path that might still be mounted.
 	if os.Remove(image) != nil || os.Remove(mount) != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+// HandoffWorkspaceFile changes only an already-open new file/directory inode.
+// No request can choose IDs and no path lookup can redirect this operation.
+func (n *Native) HandoffWorkspaceFile(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil || (!info.IsDir() && (!info.Mode().IsRegular() || !singleFileLink(info))) {
+		return ErrInvalid
+	}
+	change := n.chownFile
+	if change == nil {
+		change = func(file *os.File, uid, gid int) error { return file.Chown(uid, gid) }
+	}
+	if err := change(file, WorkspaceUID, WorkspaceGID); err != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+// Lchown is rooted and never follows the final symlink into its referent.
+func (n *Native) HandoffWorkspaceSymlink(root *os.Root, name string) error {
+	info, err := root.Lstat(name)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return ErrInvalid
+	}
+	change := n.chownLink
+	if change == nil {
+		change = func(root *os.Root, name string, uid, gid int) error { return root.Lchown(name, uid, gid) }
+	}
+	if err := change(root, name, WorkspaceUID, WorkspaceGID); err != nil {
 		return ErrUnavailable
 	}
 	return nil

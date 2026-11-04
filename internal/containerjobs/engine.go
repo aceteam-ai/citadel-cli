@@ -40,6 +40,9 @@ type Runtime interface {
 	// ClaimExecution is persistent and create-only. Uncertainty spends the ID.
 	ClaimExecution(context.Context, string, string) error
 	OpenVolume(context.Context, string) (*os.Root, error)
+	// Ownership operations use pinned workspace IDs, never request/header IDs.
+	HandoffWorkspaceFile(*os.File) error
+	HandoffWorkspaceSymlink(*os.Root, string) error
 	Usage(context.Context, string) (int64, int64, error)
 	DestroyContainer(context.Context, string) error
 	DestroyVolume(context.Context, string) error
@@ -167,7 +170,7 @@ func (e *Engine) RunDelivery(ctx context.Context, kind string, r Request, jobID 
 		root, err = rt.OpenVolume(ctx, r.VolumeRef)
 		if err == nil {
 			defer root.Close()
-			out, err = files(ctx, root, kind, r, out)
+			out, err = files(ctx, root, rt, kind, r, out)
 		}
 	case Usage:
 		out.UsedBytes, out.QuotaBytes, err = rt.Usage(ctx, r.VolumeRef)

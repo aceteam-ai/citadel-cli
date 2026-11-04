@@ -24,15 +24,18 @@ const testVolume = "aceteam-vol-1234abcd"
 const newVolume = "aceteam-vol-5678abcd"
 
 type fakeRuntime struct {
-	root       string
-	org        string
-	running    bool
-	volumes    map[string]string
-	mu         sync.Mutex
-	effects    []string
-	execResult ExecResult
-	afterLock  func()
-	attempts   map[string]bool
+	root              string
+	org               string
+	running           bool
+	volumes           map[string]string
+	mu                sync.Mutex
+	effects           []string
+	execResult        ExecResult
+	afterLock         func()
+	attempts          map[string]bool
+	fileHandoff       func(*os.File) error
+	linkHandoff       func(*os.Root, string) error
+	afterCreateVolume func(string)
 }
 
 func newFake(t *testing.T) *fakeRuntime {
@@ -80,6 +83,9 @@ func (f *fakeRuntime) CreateVolume(_ context.Context, r Request) error {
 	if err := os.Mkdir(filepath.Join(f.root, r.VolumeRef), 0700); err != nil {
 		return err
 	}
+	if f.afterCreateVolume != nil {
+		f.afterCreateVolume(filepath.Join(f.root, r.VolumeRef))
+	}
 	f.volumes[r.VolumeRef] = r.OrgID
 	return nil
 }
@@ -104,6 +110,18 @@ func (f *fakeRuntime) Exec(context.Context, string, []string) (ExecResult, error
 func (f *fakeRuntime) OpenVolume(_ context.Context, ref string) (*os.Root, error) {
 	f.effects = append(f.effects, "open")
 	return os.OpenRoot(filepath.Join(f.root, ref))
+}
+func (f *fakeRuntime) HandoffWorkspaceFile(file *os.File) error {
+	if f.fileHandoff != nil {
+		return f.fileHandoff(file)
+	}
+	return nil
+}
+func (f *fakeRuntime) HandoffWorkspaceSymlink(root *os.Root, name string) error {
+	if f.linkHandoff != nil {
+		return f.linkHandoff(root, name)
+	}
+	return nil
 }
 func (f *fakeRuntime) Usage(context.Context, string) (int64, int64, error) {
 	return 4096, 16 << 20, nil

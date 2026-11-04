@@ -93,9 +93,9 @@ root to UID/GID `10001:10001`, the pinned S5 workspace image's `ace` identity,
 before Docker volume registration. Mount or ownership failure refuses registration.
 The private host image parent stays worker-owned. Existing volumes and imported
 file trees are never recursively chowned or reformatted by this ownership step.
-This root assignment does not resolve ownership of later privileged host-written
-files or imported entries. That source follow-up is tracked in citadel-cli#1521;
-full non-root workspace file/import acceptance stays held until it is resolved.
+New privileged file writes and fresh import entries also receive the pinned
+ownership handoff described below (#1521). Full non-root workspace file/import
+acceptance remains held pending an operator's native proof.
 Container create applies CPU, memory, equal memory-swap, pids, dropped capabilities
 and no-new-privileges. A bounded 4 GiB writable layer is mandatory: an unsupported storage driver or
 rejected storage option refuses container creation. Network creation is absent;
@@ -147,6 +147,25 @@ volume, authenticates every chunk, checks canonical paths, and installs symlinks
 after file extraction so they cannot redirect writes. Partial imports remain
 owned, never successful or automatically purged. An explicit volume-only purge
 is available after confirming no container is attached.
+
+For `FILE_WRITE`, exclusive creation identifies a new inode. Before writing
+bytes, the native runtime hands its open descriptor to `ace` UID/GID
+`10001:10001`; failure refuses the operation. An existing regular file keeps its
+inode, owner and mode, including legacy worker-owned files. This is not a repair
+of old ownership or a guarantee that an existing restrictive mode is readable
+by `ace`. Final symlinks and multiply linked files refuse before truncation.
+The final open uses a rooted parent directory descriptor and kernel
+`O_NOFOLLOW`, since `os.Root.OpenFile` resolves final symlinks itself.
+
+Import hands off every new directory and regular file before writing its data;
+it changes the symlink itself after creation, never its target. Archive UID/GID
+values are ignored. A hardlink may refer only to a regular inode created and
+handed off by this import, so it inherits that ownership without another chown.
+An existing empty system-directory header is preserved without changing its
+owner or mode; it cannot become an extraction parent. Other pre-existing entry
+reuse refuses. There is no recursive ownership repair. A failed handoff cannot
+report success; any partial entries remain in the owned volume for explicit
+operator handling, and a new import requires a fresh volume reference.
 
 Transfer objects contain a fresh 12-byte nonce and AES-256-GCM ciphertext/tag.
 Associated data binds protocol, org, transfer and chunk index. Manifest chunk
