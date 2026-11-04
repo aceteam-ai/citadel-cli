@@ -384,9 +384,9 @@ func (c *cdpClient) selectAt(m InputMessage) (map[string]any, error) {
 	expr := fmt.Sprintf(`(function(){
 		const el = document.elementFromPoint(%f, %f);
 		if (!(el instanceof HTMLSelectElement)) return null;
-		if (%q === "probe") return {type: "select_options", options: Array.from(el.options).map(o => ({value: o.value, label: o.label, disabled: o.disabled || o.parentElement?.disabled || false}))};
+		if (%q === "probe") return {type: "select_options", options: Array.from(el.options).map(o => ({value: o.value, label: o.label, disabled: el.disabled || o.disabled || o.parentElement?.disabled || false}))};
 		const option = Array.from(el.options).find(o => o.value === %s);
-		if (!option || option.disabled || option.parentElement?.disabled) return {type: "select_error", message: "Option unavailable"};
+		if (el.disabled || !option || option.disabled || option.parentElement?.disabled) return {type: "select_error", message: "Option unavailable"};
 		Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(el, option.value);
 		el.dispatchEvent(new Event("input", {bubbles: true}));
 		el.dispatchEvent(new Event("change", {bubbles: true}));

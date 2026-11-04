@@ -586,6 +586,9 @@ func TestCobrowseSessionActions_SelectUsesPageSetterAndReportsValue(t *testing.T
 		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, "dispatchEvent(new Event(\"change\"") {
 			t.Errorf("select must set the native value and fire change, got %q", expr)
 		}
+		if !strings.Contains(expr, "if (el.disabled || !option") {
+			t.Errorf("select must reject a disabled control, got %q", expr)
+		}
 		return map[string]any{"value": "VT", "label": "Vermont"}
 	}
 	f.mu.Unlock()
