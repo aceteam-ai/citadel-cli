@@ -1614,6 +1614,10 @@ func extractUptime(status string) string {
 
 // ccStartService starts a service by name
 func ccStartService(name string) error {
+	return ccStartServiceForHost(name, platform.NvidiaGPUCountForCompose)
+}
+
+func ccStartServiceForHost(name string, gpuCount func() int) error {
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		return err
@@ -1621,6 +1625,12 @@ func ccStartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// Existing manifest entries need the same host checks as CLI starts.
+			// Refuse unsupported CUDA engines and reconcile CPU-capable compose
+			// before runtime effects or clearing the durable stopped marker.
+			if reason := services.CUDAStartRefusal(name, runtime.GOOS, gpuCount); reason != "" {
+				return fmt.Errorf("cannot start %s", reason)
+			}
 			// Preflight (citadel #767): this is the literal repro from the
 			// issue (TUI "Starting ollama..." -> "Failed to start ollama:
 			// exec: \"docker\": executable file not found in $PATH") --
@@ -1648,6 +1658,10 @@ func ccStartService(name string) error {
 			// just found it), so a failure here is unexpected but must not block
 			// the start.
 			return withLocalServiceStartGuard(configDir, name, func() error {
+				// Keep compose publication under the existing pointer/reservation locks.
+				if err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
+					return err
+				}
 				_ = setServiceDesiredStatus(configDir, name, "")
 				// Transitional (#528): drop any container still under the legacy
 				// "citadel-<name>" project so the no-`-p` up below does not conflict
@@ -1721,6 +1735,10 @@ func ccStopService(name string) error {
 
 // ccRestartService restarts a service by name
 func ccRestartService(name string) error {
+	return ccRestartServiceForHost(name, platform.NvidiaGPUCountForCompose)
+}
+
+func ccRestartServiceForHost(name string, gpuCount func() int) error {
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		return err
@@ -1728,6 +1746,12 @@ func ccRestartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// Existing manifest entries need the same host checks as CLI starts.
+			// Refuse unsupported CUDA engines and reconcile CPU-capable compose
+			// before runtime effects or clearing the durable stopped marker.
+			if reason := services.CUDAStartRefusal(name, runtime.GOOS, gpuCount); reason != "" {
+				return fmt.Errorf("cannot start %s", reason)
+			}
 			// Preflight (citadel #767): same warn-and-proceed rationale as
 			// ccStartService above.
 			rt := catalog.SelectContainerRuntime()
@@ -1739,6 +1763,10 @@ func ccRestartService(name string) error {
 			// A restart expresses "keep this running": clear any durable stopped
 			// marker so the service also starts on the next boot. Best-effort.
 			return withLocalServiceStartGuard(configDir, name, func() error {
+				// Keep compose publication under the existing pointer/reservation locks.
+				if err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
+					return err
+				}
 				_ = setServiceDesiredStatus(configDir, name, "")
 				// Transitional (#528): a container still under the legacy
 				// "citadel-<name>" project is invisible to a no-`-p` `compose restart`

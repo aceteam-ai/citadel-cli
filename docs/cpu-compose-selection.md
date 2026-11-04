@@ -47,3 +47,9 @@ with that reason and samples GPU evidence once. Positive or unknown evidence
 retains the normal attempt, including driver failures on NVIDIA hardware.
 The CPU-capable engines and existing Darwin policy are unchanged. Static CLI
 help still describes the compiled registry; live scheduling uses host policy.
+
+Control Center Start and Restart apply the same CUDA refusal to services already
+in the manifest. CPU compose reconciliation runs under the existing node-pointer
+and reservation locks before clearing the stopped marker or launching compose.
+The new command wiring regressions use a synthetic engine in GitHub CI; local
+verification compiles them without executing the command package.
