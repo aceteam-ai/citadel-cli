@@ -99,8 +99,16 @@ func (f *fakeChrome) serve(conn *websocket.Conn) {
 		case "Page.startScreencast":
 			f.mu.Lock()
 			f.started = true
+			total := f.totalFrames
 			f.mu.Unlock()
-			f.sendFrame(conn, 1)
+			if total > 0 {
+				f.sendFrame(conn, 1)
+			}
+		case "Page.captureScreenshot":
+			_ = conn.WriteJSON(map[string]any{
+				"id":     msg.ID,
+				"result": map[string]any{"data": base64.StdEncoding.EncodeToString(f.jpeg)},
+			})
 		case "Page.screencastFrameAck":
 			f.mu.Lock()
 			f.acks++

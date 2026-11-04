@@ -162,6 +162,31 @@ func TestViewerReceivesInitThenFrameAndMarksAttached(t *testing.T) {
 	waitDetached(t, sess, 1)
 }
 
+func TestIdleStaticPageGetsFirstFrameWithoutRefresh(t *testing.T) {
+	f := newFakeChrome()
+	f.totalFrames = 0 // CDP sends no screencast event for this static page.
+	defer f.close()
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-static")
+	if err != nil {
+		t.Fatalf("dial viewer: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	mt, _, err := conn.ReadMessage()
+	if err != nil || mt != websocket.TextMessage {
+		t.Fatalf("init: type=%d err=%v", mt, err)
+	}
+	mt, frame, err := conn.ReadMessage()
+	if err != nil || mt != websocket.BinaryMessage {
+		t.Fatalf("first frame: type=%d err=%v", mt, err)
+	}
+	if string(frame) != string(f.jpeg) {
+		t.Fatalf("fallback screenshot bytes mismatch")
+	}
+}
+
 // TestUnknownSessionRefused: an unattachable session is rejected and never
 // touches attach state.
 func TestUnknownSessionRefused(t *testing.T) {

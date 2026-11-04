@@ -313,6 +313,28 @@ func (c *cdpClient) startScreencast(quality, maxWidth, maxHeight, everyNth int) 
 	})
 }
 
+// captureFirstFrame asks Chrome for one current JPEG when an idle page has not
+// produced a Page.screencastFrame event after stream attach. The caller supplies
+// a deadline so a wedged page cannot hold the viewer open indefinitely.
+func (c *cdpClient) captureFirstFrame(ctx context.Context, quality int) ([]byte, error) {
+	result, err := c.command(ctx, "Page.captureScreenshot", map[string]any{
+		"format":  "jpeg",
+		"quality": quality,
+	})
+	if err != nil {
+		return nil, err
+	}
+	encoded, ok := result["data"].(string)
+	if !ok || len(encoded) == 0 || len(encoded) > 8*1024*1024 {
+		return nil, fmt.Errorf("CDP screenshot missing or too large")
+	}
+	jpeg, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(jpeg) == 0 {
+		return nil, fmt.Errorf("CDP screenshot invalid JPEG data")
+	}
+	return jpeg, nil
+}
+
 // stopScreencast asks Chrome to stop emitting frames. Best-effort politeness:
 // Chrome also detaches when the CDP socket closes, so Close() is the real no-leak
 // guarantee, not this call.
