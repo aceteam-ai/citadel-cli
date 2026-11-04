@@ -165,6 +165,8 @@ func TestViewerReceivesInitThenFrameAndMarksAttached(t *testing.T) {
 func TestIdleStaticPageGetsFirstFrameWithoutRefresh(t *testing.T) {
 	f := newFakeChrome()
 	f.totalFrames = 0 // CDP sends no screencast event for this static page.
+	f.cssViewportWidth = 400
+	f.cssViewportHeight = 300
 	defer f.close()
 	sess := &fakeSession{port: 9222, attachable: true}
 	ts := newHarness(t, sess, f)
@@ -184,6 +186,29 @@ func TestIdleStaticPageGetsFirstFrameWithoutRefresh(t *testing.T) {
 	}
 	if string(frame) != string(f.jpeg) {
 		t.Fatalf("fallback screenshot bytes mismatch")
+	}
+	input, _ := json.Marshal(InputMessage{
+		Type: InputTypeMouse, Event: "mousePressed", X: 0.5, Y: 0.5,
+		Button: "left", ClickCount: 1,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, input); err != nil {
+		t.Fatalf("send fallback input: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		f.mu.Lock()
+		mouse := append([]map[string]any(nil), f.mouse...)
+		f.mu.Unlock()
+		if len(mouse) > 0 {
+			if mouse[0]["x"] != 200.0 || mouse[0]["y"] != 150.0 {
+				t.Fatalf("fallback click = (%v, %v), want CSS center (200, 150)", mouse[0]["x"], mouse[0]["y"])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fallback frame did not enable mouse input")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
