@@ -427,3 +427,76 @@ func TestSharedEnrollmentCertificateDoesNotSetWorkerServingName(t *testing.T) {
 		t.Fatal("certificate UID leaked into serving-name configuration")
 	}
 }
+
+func TestDeviceEnrollmentRetiresStaleLoginServingName(t *testing.T) {
+	for _, mode := range []string{"init-or-enroll", "control-center", "refused-link"} {
+		t.Run(mode, func(t *testing.T) {
+			store := enrollmentIdentityFixture(t)
+			key, err := store.GetOrCreateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaf, chain := testLoginChain(t, key, 109)
+			if _, err := persistLoginIdentityBundle(store, &key.PublicKey, leaf, chain, "uid-abc"); err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(nodeConfigDirFn(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte("hostname: display-name\ndevice_api_token: preserved\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := saveLoginNodeUID("uid-abc"); err != nil {
+				t.Fatal(err)
+			}
+			oldName := workNodeName
+			workNodeName = "display-name"
+			t.Cleanup(func() { workNodeName = oldName })
+			if got := getWorkHostname(); got != "node-uid-abc" {
+				t.Fatalf("stale worker hostname before device transition = %q", got)
+			}
+
+			linkErr := errors.New("fixture link refused")
+			linked := false
+			link := func(result *DeviceAuthResult) error {
+				linked = true
+				if result == nil || result.DeviceCode != "current-grant" || result.Token.Authkey != "fixture-key" {
+					t.Fatal("device transition did not retain its current grant")
+				}
+				if mode == "refused-link" {
+					return linkErr
+				}
+				return nil
+			}
+			finish := func(result *DeviceAuthResult) error {
+				return finishDeviceEnrollmentLink(result, link)
+			}
+			var transitionErr error
+			if mode == "init-or-enroll" {
+				transitionErr = finish(&DeviceAuthResult{DeviceCode: "current-grant", Token: &nexus.TokenResponse{Authkey: "fixture-key"}})
+			} else {
+				transitionErr = ccConnectDeviceEnrollmentWith(&nexus.TokenResponse{Authkey: "fixture-key"}, "current-grant", func() error { return nil }, finish, func() error { return nil })
+			}
+			if !linked {
+				t.Fatal("device transition did not link its current grant")
+			}
+			if mode == "refused-link" {
+				if !errors.Is(transitionErr, linkErr) || getWorkHostname() != "node-uid-abc" {
+					t.Fatal("refused device link retired the prior login identity")
+				}
+				return
+			}
+			if transitionErr != nil {
+				t.Fatal(transitionErr)
+			}
+			if got := getWorkHostname(); got != "display-name" {
+				t.Fatalf("worker reconnected under %q after device transition", got)
+			}
+			data, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(data, []byte("login_node_uid")) || !bytes.Contains(data, []byte("device_api_token: preserved")) {
+				t.Fatal("device transition did not reconcile the login UID without altering credentials")
+			}
+		})
+	}
+}
