@@ -547,6 +547,45 @@ func TestCobrowseSessionActions_ClickBySelectorResolvesCenterThenClicks(t *testi
 	}
 }
 
+func TestCobrowseSessionActions_ClickSelectorRefusesHandoffDuringSettle(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	settling := make(chan struct{})
+	release := make(chan struct{})
+	f.mu.Lock()
+	f.evaluateValue = func(string) any {
+		close(settling)
+		<-release
+		return map[string]any{"x": 111.0, "y": 222.0}
+	}
+	f.mu.Unlock()
+
+	clicked := make(chan error, 1)
+	go func() {
+		_, err := m.Click(st.ID, "#submit", nil, nil)
+		clicked <- err
+	}()
+	select {
+	case <-settling:
+	case <-time.After(5 * time.Second):
+		t.Fatal("selector evaluation did not begin")
+	}
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatalf("handoff during selector evaluation: %v", err)
+	}
+	close(release)
+	select {
+	case err := <-clicked:
+		if !errors.Is(err, ErrHandedOff) {
+			t.Fatalf("click after handoff = %v, want ErrHandedOff", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("selector click did not finish after handoff")
+	}
+	if calls := f.callsFor("Input.dispatchMouseEvent"); len(calls) != 0 {
+		t.Fatalf("handoff during selector evaluation dispatched %d mouse events", len(calls))
+	}
+}
+
 func TestCobrowseSessionActions_ClickSelectorCoveredPointDoesNotClick(t *testing.T) {
 	m, st, f := startSessionOnFakeCDP(t)
 	f.mu.Lock()
@@ -561,6 +600,23 @@ func TestCobrowseSessionActions_ClickSelectorCoveredPointDoesNotClick(t *testing
 	if calls := f.callsFor("Input.dispatchMouseEvent"); len(calls) != 0 {
 		t.Fatalf("covered target dispatched %d mouse events", len(calls))
 	}
+}
+
+func evaluatePinnedCDPTarget(ctx context.Context, wsURL, expr string) (any, error) {
+	res, err := cdpDialAndSendContext(ctx, wsURL, "Runtime.evaluate", map[string]any{
+		"expression": expr, "returnByValue": true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if exc := res["exceptionDetails"]; exc != nil {
+		return nil, fmt.Errorf("script error: %v", exc)
+	}
+	remote, ok := res["result"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("evaluate returned no result")
+	}
+	return remote["value"], nil
 }
 
 func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
@@ -584,7 +640,7 @@ func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(chrome, "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--remote-allow-origins=*", fmt.Sprintf("--remote-debugging-port=%d", port), "--user-data-dir="+profile, page.URL)
+	cmd := exec.Command(chrome, "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--remote-allow-origins=*", fmt.Sprintf("--remote-debugging-port=%d", port), "--user-data-dir="+profile, "about:blank")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -599,18 +655,41 @@ func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
 		}
 	})
 
-	var initial map[string]any
-	deadline := time.Now().Add(10 * time.Second)
-	// Chrome may expose an about:blank target before processing its command-line
-	// URL. Navigate the same target selected by the production CDP discovery path.
-	for time.Now().Before(deadline) {
-		if _, err := cdpCommand(port, "Page.navigate", map[string]any{"url": page.URL}); err == nil {
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStartup()
+	// Pin the page target selected by the production discovery path. Chrome may
+	// expose several pages, and a fresh discovery for every startup command can
+	// navigate one while evaluating another.
+	var wsURL string
+	for startupCtx.Err() == nil {
+		target, err := pickTargetContext(startupCtx, port)
+		if err == nil {
+			wsURL = target.WebSocketDebuggerURL
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	for time.Now().Before(deadline) {
-		value, err := runtimeEvaluate(port, `(function(){ var el = document.querySelector("#submit"); return el ? {href: location.href, below: el.getBoundingClientRect().top > innerHeight, smooth: getComputedStyle(document.documentElement).scrollBehavior === "smooth"} : null; })()`)
+	if wsURL == "" {
+		t.Fatalf("no CDP page target before startup deadline: %v", startupCtx.Err())
+	}
+	var navigateErr error
+	for startupCtx.Err() == nil {
+		attemptCtx, cancel := context.WithTimeout(startupCtx, 2*time.Second)
+		_, navigateErr = cdpDialAndSendContext(attemptCtx, wsURL, "Page.navigate", map[string]any{"url": page.URL})
+		cancel()
+		if navigateErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if navigateErr != nil {
+		t.Fatalf("selected CDP page navigation failed before startup deadline: %v", navigateErr)
+	}
+	var initial map[string]any
+	for startupCtx.Err() == nil {
+		attemptCtx, cancel := context.WithTimeout(startupCtx, time.Second)
+		value, err := evaluatePinnedCDPTarget(attemptCtx, wsURL, `(function(){ var el = document.querySelector("#submit"); return el ? {href: location.href, below: el.getBoundingClientRect().top > innerHeight, smooth: getComputedStyle(document.documentElement).scrollBehavior === "smooth"} : null; })()`)
+		cancel()
 		if err == nil {
 			initial, _ = value.(map[string]any)
 			if initial != nil && initial["href"] == page.URL+"/" {
@@ -632,11 +711,11 @@ func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
 	if err := clickAtPoint(port, x, y); err != nil {
 		t.Fatal(err)
 	}
-	value, err := runtimeEvaluate(port, `window.clicked || 0`)
+	value, err := evaluatePinnedCDPTarget(context.Background(), wsURL, `window.clicked || 0`)
 	if err != nil || value != float64(1) {
 		t.Fatalf("button click count = %v, error = %v", value, err)
 	}
-	_, err = runtimeEvaluate(port, `(function(){ var cover = document.createElement("div"); cover.style.cssText = "position:fixed;inset:0;z-index:99999"; document.body.appendChild(cover); })()`)
+	_, err = evaluatePinnedCDPTarget(context.Background(), wsURL, `(function(){ var cover = document.createElement("div"); cover.style.cssText = "position:fixed;inset:0;z-index:99999"; document.body.appendChild(cover); })()`)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -170,6 +170,15 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 		return CobrowseSessionStatus{}, fmt.Errorf("click requires a 'selector' or both 'x' and 'y'")
 	}
 
+	// Selector settling awaits page JavaScript, during which a human can take
+	// control. Check the live driver again before sending any mouse event.
+	currentPort, err := s.requireDrivablePort()
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	if currentPort != port {
+		return CobrowseSessionStatus{}, ErrNotStarted
+	}
 	if err := clickAtPoint(port, cx, cy); err != nil {
 		return CobrowseSessionStatus{}, err
 	}
