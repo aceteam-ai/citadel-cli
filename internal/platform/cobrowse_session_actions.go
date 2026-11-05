@@ -9,6 +9,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strings"
 )
 
 // ExtractResult is the outcome of a session `extract` action: the matched
@@ -21,6 +23,11 @@ type ExtractResult struct {
 	// Element.getAttribute's null-to-caller contract), not a missing key --
 	// so a caller can distinguish "asked for, absent" from "never asked for".
 	Attrs map[string]string `json:"attrs,omitempty"`
+}
+
+type SelectResult struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
 }
 
 // humanDrivingLocked reports whether a human explicitly took control. A viewer
@@ -182,6 +189,142 @@ func (m *CobrowseSessionManager) Type(id, text string) (CobrowseSessionStatus, e
 		return CobrowseSessionStatus{}, err
 	}
 	if _, err := cdpCommand(port, "Input.insertText", map[string]any{"text": text}); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	return s.status(), nil
+}
+
+// Select changes a native select through the page DOM. Native popup windows do
+// not receive forwarded CDP mouse clicks, so mouse coordinates cannot choose
+// an option reliably. The native setter and bubbling events update React forms.
+func (m *CobrowseSessionManager) Select(id, selector, value, label string) (SelectResult, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return SelectResult{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return SelectResult{}, err
+	}
+	expr := fmt.Sprintf(`(function(){
+		const el = document.querySelector(%s);
+		if (!(el instanceof HTMLSelectElement)) return {error: "selector does not match a select"};
+		const options = Array.from(el.options);
+		const option = options.find(o => %s !== "" ? o.value === %s : o.label === %s);
+		if (el.matches(":disabled") || !option || option.disabled || option.parentElement?.disabled) return {error: "enabled option not found"};
+		const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set;
+		setter.call(el, option.value);
+		el.dispatchEvent(new Event("input", {bubbles: true}));
+		el.dispatchEvent(new Event("change", {bubbles: true}));
+		return {value: el.value, label: el.selectedOptions[0]?.label || ""};
+	})()`, jsStringLiteral(selector), jsStringLiteral(value), jsStringLiteral(value), jsStringLiteral(label))
+	result, err := runtimeEvaluate(port, expr)
+	if err != nil {
+		return SelectResult{}, err
+	}
+	obj, ok := result.(map[string]any)
+	if !ok {
+		return SelectResult{}, fmt.Errorf("select returned no result")
+	}
+	if problem, _ := obj["error"].(string); problem != "" {
+		return SelectResult{}, fmt.Errorf("select: %s", problem)
+	}
+	selected, ok := obj["value"].(string)
+	if !ok {
+		return SelectResult{}, fmt.Errorf("select returned no value")
+	}
+	selectedLabel, _ := obj["label"].(string)
+	return SelectResult{Value: selected, Label: selectedLabel}, nil
+}
+
+// Key sends a real key press and release. Text is never logged by the job
+// handler; the MCP audit records only the action name.
+func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	code, vk, produced, ok := browserKey(key)
+	if !ok {
+		return CobrowseSessionStatus{}, fmt.Errorf("unsupported key")
+	}
+	kind := "rawKeyDown"
+	if produced != "" {
+		kind = "keyDown"
+	}
+	params := map[string]any{"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk}
+	if produced != "" {
+		params["text"] = produced
+	}
+	if _, err := cdpCommand(port, "Input.dispatchKeyEvent", params); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	if _, err := cdpCommand(port, "Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk}); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	return s.status(), nil
+}
+
+func browserKey(key string) (string, int, string, bool) {
+	special := map[string]struct {
+		code string
+		vk   int
+	}{
+		"Tab": {"Tab", 9}, "Enter": {"Enter", 13}, "Escape": {"Escape", 27},
+		"ArrowUp": {"ArrowUp", 38}, "ArrowDown": {"ArrowDown", 40},
+		"ArrowLeft": {"ArrowLeft", 37}, "ArrowRight": {"ArrowRight", 39},
+		"Home": {"Home", 36}, "End": {"End", 35}, "PageUp": {"PageUp", 33},
+		"PageDown": {"PageDown", 34}, "Backspace": {"Backspace", 8}, "Delete": {"Delete", 46},
+	}
+	if s, ok := special[key]; ok {
+		return s.code, s.vk, "", true
+	}
+	if len(key) == 1 {
+		ch := key[0]
+		if ch >= 'a' && ch <= 'z' {
+			return "Key" + strings.ToUpper(key), int(ch - 'a' + 'A'), key, true
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			return "Key" + key, int(ch), key, true
+		}
+		if ch >= '0' && ch <= '9' {
+			return "Digit" + key, int(ch), key, true
+		}
+		if ch == ' ' {
+			return "Space", 32, key, true
+		}
+	}
+	return "", 0, "", false
+}
+
+func (m *CobrowseSessionManager) Scroll(id, selector string, x, y *float64, dx, dy float64) (CobrowseSessionStatus, error) {
+	if math.IsNaN(dx) || math.IsInf(dx, 0) || math.IsNaN(dy) || math.IsInf(dy, 0) {
+		return CobrowseSessionStatus{}, fmt.Errorf("scroll deltas must be finite")
+	}
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	var cx, cy float64
+	if selector != "" {
+		cx, cy, err = resolveSelectorCenter(port, selector)
+	} else if x != nil && y != nil {
+		cx, cy = *x, *y
+	} else {
+		return CobrowseSessionStatus{}, fmt.Errorf("scroll requires selector or x and y")
+	}
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	if _, err := cdpCommand(port, "Input.dispatchMouseEvent", map[string]any{"type": "mouseWheel", "x": cx, "y": cy, "deltaX": dx, "deltaY": dy}); err != nil {
 		return CobrowseSessionStatus{}, err
 	}
 	return s.status(), nil

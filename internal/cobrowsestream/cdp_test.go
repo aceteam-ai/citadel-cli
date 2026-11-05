@@ -33,12 +33,13 @@ type fakeChrome struct {
 	cssViewportHeight float64
 	jpeg              []byte // raw bytes each frame carries (base64 on the wire)
 
-	mu      sync.Mutex
-	acks    int
-	mouse   []map[string]any
-	keys    []map[string]any
-	conns   []*websocket.Conn
-	started bool
+	mu            sync.Mutex
+	acks          int
+	mouse         []map[string]any
+	keys          []map[string]any
+	conns         []*websocket.Conn
+	started       bool
+	evaluateValue func(string) any
 
 	// connReg is signaled once per accepted CDP conn, AFTER it has been appended
 	// to conns. dialCDP returns to the test the instant the client sees the 101
@@ -156,9 +157,13 @@ func (f *fakeChrome) serve(conn *websocket.Conn) {
 			f.keys = append(f.keys, msg.Params)
 			f.mu.Unlock()
 		case "Runtime.evaluate":
+			value := any(12.5)
+			if f.evaluateValue != nil {
+				value = f.evaluateValue(msg.Params["expression"].(string))
+			}
 			_ = conn.WriteJSON(map[string]any{
 				"id":     msg.ID,
-				"result": map[string]any{"result": map[string]any{"value": 12.5}},
+				"result": map[string]any{"result": map[string]any{"value": value}},
 			})
 		}
 	}
