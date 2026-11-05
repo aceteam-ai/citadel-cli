@@ -456,6 +456,124 @@ func TestViewerPasteRequiresCurrentHumanControl(t *testing.T) {
 	}
 }
 
+func TestViewerNativeSelectUsesPageInsteadOfPopupClicks(t *testing.T) {
+	f := newFakeChrome()
+	probes := 0
+	f.evaluateValue = func(expr string) any {
+		if strings.Contains(expr, `"probe" === "probe"`) {
+			probes++
+			if probes == 2 {
+				return nil
+			}
+			if !strings.Contains(expr, `disabled: el.matches(":disabled") || o.disabled`) {
+				t.Errorf("probe must report options of an effectively disabled select as disabled: %s", expr)
+			}
+			return map[string]any{"type": "select_options", "options": []map[string]any{{"value": "VT", "label": "Vermont", "disabled": false}}}
+		}
+		if !strings.Contains(expr, `if (el.matches(":disabled") || !option`) {
+			t.Errorf("selection must reject an effectively disabled select: %s", expr)
+		}
+		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, `dispatchEvent(new Event("change"`) {
+			t.Errorf("selection did not update page state: %s", expr)
+		}
+		return map[string]any{"type": "select_result", "value": "VT"}
+	}
+	defer f.close()
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.5, Y: 0.25, ProbeID: "observing"}); err != nil {
+		t.Fatal(err)
+	}
+	sess.waitInputChecks(t, 1)
+	if probes != 0 {
+		t.Fatalf("observing viewer probed %d controls", probes)
+	}
+	sess.setHumanControl(true)
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.5, Y: 0.25, ProbeID: "probe-one"}); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["type"] == "select_options" {
+			break
+		}
+	}
+	if len(got["options"].([]any)) != 1 {
+		t.Fatalf("options = %#v", got)
+	}
+	if got["probe_id"] != "probe-one" {
+		t.Fatalf("probe correlation = %#v", got)
+	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.75, Y: 0.25, ProbeID: "probe-two"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["type"] == "select_error" {
+			break
+		}
+	}
+	if got["probe_id"] != "probe-two" {
+		t.Fatalf("miss correlation = %#v", got)
+	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelect, X: 0.5, Y: 0.25, Value: "VT"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["type"] == "select_result" {
+			break
+		}
+	}
+	if got["value"] != "VT" {
+		t.Fatalf("selection = %#v", got)
+	}
+}
+
 // TestTeardownOnBrowserStop: the browser (session) going away tears the viewer
 // down and detaches the session -- the "teardown on session stop" acceptance.
 func TestTeardownOnBrowserStop(t *testing.T) {
