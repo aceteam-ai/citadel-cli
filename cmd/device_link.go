@@ -46,7 +46,22 @@ type deviceLinker interface {
 // network actually registered. Never fall back to saved credentials/hostname/IP:
 // a stale reservation or a previously connected node must fail at the server.
 func linkDeviceEnrollment(result *DeviceAuthResult) error {
-	return linkDeviceEnrollmentGated(result, enrollmentNodeID, nexus.NewDeviceAuthClient(authServiceURL))
+	return finishDeviceEnrollmentLink(result, func(current *DeviceAuthResult) error {
+		return linkDeviceEnrollmentGated(current, enrollmentNodeID, nexus.NewDeviceAuthClient(authServiceURL))
+	})
+}
+
+// A completed device grant uses the operator's display hostname. Retire a
+// prior CSR login's serving-name override only after this grant has linked,
+// including the Control Center path that calls linkDeviceEnrollment.
+func finishDeviceEnrollmentLink(result *DeviceAuthResult, link func(*DeviceAuthResult) error) error {
+	if err := link(result); err != nil {
+		return err
+	}
+	if err := clearLoginNodeUID(); err != nil {
+		return fmt.Errorf("clear stale login serving name: %w", err)
+	}
+	return nil
 }
 
 // registeredNodeID holds the Headscale node ID that this process's most recent

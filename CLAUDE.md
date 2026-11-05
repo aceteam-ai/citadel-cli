@@ -2634,6 +2634,15 @@ store-injected `ensureNodeIdentityWithStore` so its smoke test stays hermetic
 with `/etc/citadel/config.yaml`). `LLMInferenceHandler.WithSigner` remains the
 override seam for tests.
 
+`prepareDeviceAuthIdentity` owns the default-off certificate opt-in shared by
+`runDeviceAuthFlow` and `ccStartDeviceAuthIdentityFlowWith`; it opens no identity
+state without that opt-in. `persistLoginIdentityBundle` owns bundle validation.
+`deviceEnrollmentHostname` keeps the operator display name for these enrollment
+and reclaim paths even when a certificate UID is accepted. `Store.InspectCertificate`
+reports local presence/SPKI evidence, not remote verification. See
+[docs/enrollment-certificates.md](docs/enrollment-certificates.md) for fallback,
+current-token admission and the still-open leafless bootstrap requirement.
+
 **Residual, documented (not closed here):** the legacy read-through SOURCE is
 still invoker-scoped (`platform.ConfigDir()`), so a systemd-root `citadel work`
 whose `ConfigDir()` (`/etc/citadel`) holds no key, running with signing enabled
