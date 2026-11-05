@@ -38,6 +38,9 @@ type Session interface {
 	MarkAttached(id string) bool
 	// MarkDetached returns the session to running when the viewer disconnects.
 	MarkDetached(id string) bool
+	// ViewerHasControl is true only after explicit handoff. It is checked on
+	// every input frame so resume can revoke control while the stream stays open.
+	ViewerHasControl(id string) bool
 }
 
 // Logger matches the deskstream/VNC/terminal server logger interface.
