@@ -118,7 +118,7 @@ const (
 	// this is a no-op there; on a device-equipped node they default ON and we click
 	// to turn them off. State reads from .checked / aria-checked; we click only
 	// when currently ON and enabled, so we never accidentally re-enable. Returns
-	// the count toggled (informational). Never throws on no-match.
+	// the count toggled; a quiet pass is required before Join. Never throws on no-match.
 	teamsMuteMicCamJS = `(function(){` +
 		`var sels=['input[data-tid="toggle-mute"]','input[data-tid="toggle-video"]',` +
 		`'button[data-tid="toggle-mute"]','button[data-tid="toggle-video"]'];` +
@@ -240,9 +240,9 @@ func (h *MeetingJoinHandler) runTeamsJoinFlow(ctx JobContext, br meetingBrowser,
 // pollForTeamsJoinClick repeatedly (1) checks whether the bot is already in-call,
 // (2) best-effort dismisses the "Continue on this browser" interstitial, (3)
 // best-effort types the passcode (for /meet/<id>?p= links), (4) best-effort types
-// the guest display name, (5) best-effort mutes mic/camera, and (6) tries the
-// "Join now" button — until admitted or the button is clicked, or timeout. Steps
-// 2–5 are non-fatal every pass (a control not rendered yet is normal); only
+// the guest display name, (5) selects audio and mutes mic/camera, and (6) tries
+// "Join now" only after a pass with no audio or device changes. Steps 2–5
+// retry non-fatally (a control not rendered yet is normal); only
 // reaching the timeout with neither admission nor a join click is fatal. Params
 // mirror pollForJoinClick so tests can run it in milliseconds. Selectors VERIFIED
 // against a live light-meetings anon join (2026-08-01).
@@ -287,31 +287,45 @@ func pollForTeamsJoinClick(ctx JobContext, page joinPage, botDisplayName, passco
 		// Best-effort: select "Computer audio" so the meeting's audio routes into
 		// the browser (and thus the recording sink) — a capture bot must hear the
 		// room. No-op if the radio is absent or already selected.
-		if _, err := page.Evaluate(teamsSelectComputerAudioJS); err != nil {
+		audioSettled := false
+		if v, err := page.Evaluate(teamsSelectComputerAudioJS); err != nil {
 			ctx.Log("warn", "     - Teams select-computer-audio errored (non-fatal): %v", err)
+		} else if clicked, ok := v.(bool); ok {
+			audioSettled = !clicked
 		}
 
-		// Mute after selecting audio: changing the audio mode can recreate
-		// device controls in their enabled state. Keep speakers for capture.
-		if _, err := page.Evaluate(teamsMuteMicCamJS); err != nil {
+		// Audio selection can asynchronously recreate enabled device controls.
+		// Require a quiet pass after any audio selection or mute click before
+		// Join, so the next poll observes the resulting device posture.
+		devicesSettled := false
+		if v, err := page.Evaluate(teamsMuteMicCamJS); err != nil {
 			ctx.Log("warn", "     - Teams mute mic/cam errored (non-fatal): %v", err)
+		} else {
+			switch toggled := v.(type) {
+			case float64: // CDP JSON numbers.
+				devicesSettled = toggled == 0
+			case int: // Fake pages.
+				devicesSettled = toggled == 0
+			}
 		}
 
-		// Try the join button by VERIFIED data-tid first, then fall back to the
-		// visible-text labels; a non-empty/true return means it was clicked.
-		if v, err := page.Evaluate(teamsClickJoinJS); err == nil {
-			if clicked, ok := v.(bool); ok && clicked {
-				ctx.Log("info", "     - clicked Teams join button (data-tid=prejoin-join-button)")
+		if audioSettled && devicesSettled {
+			// Try the join button by VERIFIED data-tid first, then fall back to the
+			// visible-text labels; a non-empty/true return means it was clicked.
+			if v, err := page.Evaluate(teamsClickJoinJS); err == nil {
+				if clicked, ok := v.(bool); ok && clicked {
+					ctx.Log("info", "     - clicked Teams join button (data-tid=prejoin-join-button)")
+					return nil
+				}
+			} else {
+				ctx.Log("warn", "     - Teams join-by-tid probe errored (falling back to labels): %v", err)
+			}
+			if v, err := page.Evaluate(clickButtonByTextOptionalJS(teamsJoinButtonLabels)); err != nil {
+				ctx.Log("warn", "     - Teams join-button probe errored (retrying): %v", err)
+			} else if label, ok := v.(string); ok && label != "" {
+				ctx.Log("info", "     - clicked Teams join button (matched label %q)", label)
 				return nil
 			}
-		} else {
-			ctx.Log("warn", "     - Teams join-by-tid probe errored (falling back to labels): %v", err)
-		}
-		if v, err := page.Evaluate(clickButtonByTextOptionalJS(teamsJoinButtonLabels)); err != nil {
-			ctx.Log("warn", "     - Teams join-button probe errored (retrying): %v", err)
-		} else if label, ok := v.(string); ok && label != "" {
-			ctx.Log("info", "     - clicked Teams join button (matched label %q)", label)
-			return nil
 		}
 
 		select {
