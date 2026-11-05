@@ -211,7 +211,7 @@ func (m *CobrowseSessionManager) Select(id, selector, value, label string) (Sele
 		if (!(el instanceof HTMLSelectElement)) return {error: "selector does not match a select"};
 		const options = Array.from(el.options);
 		const option = options.find(o => %s !== "" ? o.value === %s : o.label === %s);
-		if (el.disabled || !option || option.disabled || option.parentElement?.disabled) return {error: "enabled option not found"};
+		if (el.matches(":disabled") || !option || option.disabled || option.parentElement?.disabled) return {error: "enabled option not found"};
 		const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set;
 		setter.call(el, option.value);
 		el.dispatchEvent(new Event("input", {bubbles: true}));

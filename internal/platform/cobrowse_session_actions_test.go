@@ -18,15 +18,21 @@
 package platform
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -590,8 +596,8 @@ func TestCobrowseSessionActions_SelectUsesPageSetterAndReportsValue(t *testing.T
 		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, "dispatchEvent(new Event(\"change\"") {
 			t.Errorf("select must set the native value and fire change, got %q", expr)
 		}
-		if !strings.Contains(expr, "if (el.disabled || !option") {
-			t.Errorf("select must reject a disabled control, got %q", expr)
+		if !strings.Contains(expr, `if (el.matches(":disabled") || !option`) {
+			t.Errorf("select must reject effective disabled state, including fieldset inheritance, got %q", expr)
 		}
 		return map[string]any{"value": "VT", "label": "Vermont"}
 	}
@@ -605,6 +611,58 @@ func TestCobrowseSessionActions_SelectUsesPageSetterAndReportsValue(t *testing.T
 	}
 	if len(f.callsFor("Input.dispatchMouseEvent")) != 0 {
 		t.Fatal("native select must not click the popup")
+	}
+}
+
+func TestCobrowseSessionActions_SelectRespectsFieldsetDisabledState(t *testing.T) {
+	chrome, err := exec.LookPath("google-chrome")
+	if err != nil {
+		chrome, err = exec.LookPath("chromium")
+	}
+	if err != nil {
+		t.Skip("local Chromium is unavailable")
+	}
+
+	m, st, f := startSessionOnFakeCDP(t)
+	var expressions []string
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		expressions = append(expressions, expr)
+		return map[string]any{"value": "VT", "label": "Vermont"}
+	}
+	f.mu.Unlock()
+	for _, selector := range []string{"#blocked", "#allowed"} {
+		if _, err := m.Select(st.ID, selector, "VT", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(expressions) != 2 {
+		t.Fatalf("captured %d select expressions, want 2", len(expressions))
+	}
+
+	page := fmt.Sprintf(`<html><body>
+	<fieldset disabled>
+	  <legend><select id="allowed"><option value="NY">New York</option><option value="VT">Vermont</option></select></legend>
+	  <select id="blocked"><option value="NY">New York</option><option value="VT">Vermont</option></select>
+	</fieldset>
+	<script>
+	const blocked = %s;
+	const allowed = %s;
+	document.body.dataset.testResult = [blocked.error || "", allowed.value || "", document.getElementById("blocked").value, document.getElementById("allowed").value].join("|");
+	</script></body></html>`, expressions[0], expressions[1])
+	path := filepath.Join(t.TempDir(), "select.html")
+	if err := os.WriteFile(path, []byte(page), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pageURL := (&url.URL{Scheme: "file", Path: path}).String()
+	output, err := exec.CommandContext(ctx, chrome, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--dump-dom", pageURL).CombinedOutput()
+	if err != nil {
+		t.Fatalf("local Chromium failed: %v: %s", err, output)
+	}
+	if !strings.Contains(string(output), `data-test-result="enabled option not found|VT|NY|VT"`) {
+		t.Fatalf("fieldset-disabled select changed or first-legend select was blocked: %s", output)
 	}
 }
 

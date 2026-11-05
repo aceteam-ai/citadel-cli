@@ -410,13 +410,13 @@ func TestViewerNativeSelectUsesPageInsteadOfPopupClicks(t *testing.T) {
 			if probes == 2 {
 				return nil
 			}
-			if !strings.Contains(expr, "disabled: el.disabled || o.disabled") {
-				t.Errorf("probe must report options of a disabled select as disabled: %s", expr)
+			if !strings.Contains(expr, `disabled: el.matches(":disabled") || o.disabled`) {
+				t.Errorf("probe must report options of an effectively disabled select as disabled: %s", expr)
 			}
 			return map[string]any{"type": "select_options", "options": []map[string]any{{"value": "VT", "label": "Vermont", "disabled": false}}}
 		}
-		if !strings.Contains(expr, "if (el.disabled || !option") {
-			t.Errorf("selection must reject a disabled select: %s", expr)
+		if !strings.Contains(expr, `if (el.matches(":disabled") || !option`) {
+			t.Errorf("selection must reject an effectively disabled select: %s", expr)
 		}
 		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, `dispatchEvent(new Event("change"`) {
 			t.Errorf("selection did not update page state: %s", expr)
