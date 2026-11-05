@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -527,6 +528,9 @@ func TestCobrowseSessionActions_ClickBySelectorResolvesCenterThenClicks(t *testi
 	if len(evalCalls) != 1 {
 		t.Fatalf("expected exactly 1 Runtime.evaluate call, got %d", len(evalCalls))
 	}
+	if evalCalls[0].Params["awaitPromise"] != true {
+		t.Fatal("selector resolution must wait for scrolling to settle")
+	}
 
 	mouseCalls := f.callsFor("Input.dispatchMouseEvent")
 	if len(mouseCalls) != 3 {
@@ -540,6 +544,96 @@ func TestCobrowseSessionActions_ClickBySelectorResolvesCenterThenClicks(t *testi
 		if c.Params["x"] != 111.0 || c.Params["y"] != 222.0 {
 			t.Errorf("mouse event %d coords = (%v,%v), want (111,222)", i, c.Params["x"], c.Params["y"])
 		}
+	}
+}
+
+func TestCobrowseSessionActions_ClickSelectorCoveredPointDoesNotClick(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		return map[string]any{"error": "another element covers the click point"}
+	}
+	f.mu.Unlock()
+
+	if _, err := m.Click(st.ID, "#submit", nil, nil); err == nil {
+		t.Fatal("expected a blocked target error")
+	}
+	if calls := f.callsFor("Input.dispatchMouseEvent"); len(calls) != 0 {
+		t.Fatalf("covered target dispatched %d mouse events", len(calls))
+	}
+}
+
+func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
+	chrome := os.Getenv("COBROWSE_TEST_CHROME")
+	if chrome == "" {
+		t.Skip("set COBROWSE_TEST_CHROME to run the browser regression")
+	}
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<style>html { scroll-behavior: smooth }</style><div style="height: 2400px"></div><button id="submit" onclick="window.clicked = (window.clicked || 0) + 1">Continue</button>`)
+	}))
+	defer page.Close()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	profile, err := os.MkdirTemp("", "cobrowse-browser-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(chrome, "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--remote-allow-origins=*", fmt.Sprintf("--remote-debugging-port=%d", port), "--user-data-dir="+profile, page.URL)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		for i := 0; i < 10; i++ {
+			if os.RemoveAll(profile) == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+
+	var initial map[string]any
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		value, err := runtimeEvaluate(port, `(function(){ var el = document.querySelector("#submit"); return el ? {below: el.getBoundingClientRect().top > innerHeight, smooth: getComputedStyle(document.documentElement).scrollBehavior === "smooth"} : null; })()`)
+		if err == nil {
+			initial, _ = value.(map[string]any)
+			if initial != nil {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if initial == nil {
+		t.Fatal("browser page did not load")
+	}
+	if initial["below"] != true || initial["smooth"] != true {
+		t.Fatalf("test page must start offscreen with smooth scrolling: %v", initial)
+	}
+	x, y, err := resolveSelectorCenter(port, "#submit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clickAtPoint(port, x, y); err != nil {
+		t.Fatal(err)
+	}
+	value, err := runtimeEvaluate(port, `window.clicked || 0`)
+	if err != nil || value != float64(1) {
+		t.Fatalf("button click count = %v, error = %v", value, err)
+	}
+	_, err = runtimeEvaluate(port, `(function(){ var cover = document.createElement("div"); cover.style.cssText = "position:fixed;inset:0;z-index:99999"; document.body.appendChild(cover); })()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveSelectorCenter(port, "#submit"); err == nil {
+		t.Fatal("covered button must fail the hit test")
 	}
 }
 
