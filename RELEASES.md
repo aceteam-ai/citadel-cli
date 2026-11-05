@@ -3467,3 +3467,27 @@ Auto-generated log of every release.
   - fix(update): disclose the effective startup auto-update policy (#1534)
 
 
+---
+
+## v2.210.0 — 2026-11-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 10 |
+| Files changed | 45 |
+| Lines added | +5604 |
+
+**Changes:**
+
+  - fix(services): register the PAW compile host port (#1470)
+  - feat(cobrowse): insert pasted text under live human control (#1547)
+  - feat(metrics): prepare inactive bounded store app candidate (#1551)
+  - feat(metrics): prepare bounded inactive host and job collector (#1550)
+  - Add native select and keyboard cobrowse actions (#1544)
+  - Gate co-browse viewer input on explicit handoff (#1542)
+  - Ensure co-browse viewers get an idle page first frame (#1540)
+  - docs: propose sovereign agent connection and runtime boundaries (#1433)
+  - feat(depth): prepare bounded point-cloud sequence contract and codecs (#1405)
+  - feat(mediainput): prepare shared pinned HTTPS inbox acquisition (#1413)
+
+
