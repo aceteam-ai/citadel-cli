@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -63,7 +64,8 @@ type cdpClient struct {
 	// not block for long (it feeds the coalescing single-slot holder).
 	onFrame func(screencastFrame)
 
-	// metaMu guards the last frame's device dimensions, read by the input path.
+	// metaMu guards CSS viewport dimensions used by the input path. A
+	// screencast event or the idle-page fallback supplies them.
 	metaMu sync.Mutex
 	lastW  float64
 	lastH  float64
@@ -313,13 +315,53 @@ func (c *cdpClient) startScreencast(quality, maxWidth, maxHeight, everyNth int) 
 	})
 }
 
+// captureFirstFrame asks Chrome for one current JPEG and its CSS viewport
+// dimensions when an idle page has not produced a screencast frame. Input
+// uses CSS coordinates, so JPEG pixel dimensions are not a safe substitute.
+func (c *cdpClient) captureFirstFrame(ctx context.Context, quality int) ([]byte, error) {
+	result, err := c.command(ctx, "Page.captureScreenshot", map[string]any{
+		"format":  "jpeg",
+		"quality": quality,
+	})
+	if err != nil {
+		return nil, err
+	}
+	encoded, ok := result["data"].(string)
+	if !ok || len(encoded) == 0 || len(encoded) > 8*1024*1024 {
+		return nil, fmt.Errorf("CDP screenshot missing or too large")
+	}
+	jpeg, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(jpeg) == 0 {
+		return nil, fmt.Errorf("CDP screenshot invalid JPEG data")
+	}
+	metrics, err := c.command(ctx, "Page.getLayoutMetrics", nil)
+	if err != nil {
+		return nil, err
+	}
+	viewport, ok := metrics["cssVisualViewport"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("CDP CSS viewport unavailable")
+	}
+	w, wOK := viewport["clientWidth"].(float64)
+	h, hOK := viewport["clientHeight"].(float64)
+	if !wOK || !hOK || w <= 0 || h <= 0 || w > 16384 || h > 16384 || math.IsNaN(w) || math.IsNaN(h) || math.IsInf(w, 0) || math.IsInf(h, 0) {
+		return nil, fmt.Errorf("CDP CSS viewport invalid")
+	}
+	c.metaMu.Lock()
+	if c.lastW <= 0 || c.lastH <= 0 {
+		c.lastW, c.lastH = w, h
+	}
+	c.metaMu.Unlock()
+	return jpeg, nil
+}
+
 // stopScreencast asks Chrome to stop emitting frames. Best-effort politeness:
 // Chrome also detaches when the CDP socket closes, so Close() is the real no-leak
 // guarantee, not this call.
 func (c *cdpClient) stopScreencast() { _ = c.send("Page.stopScreencast", nil) }
 
 // dispatchMouse maps a viewer mouse event (normalized coords) to CDP viewport
-// CSS pixels using the latest frame's device dimensions, then dispatches it.
+// CSS pixels using the latest viewport dimensions, then dispatches it.
 func (c *cdpClient) dispatchMouse(m InputMessage) error {
 	c.metaMu.Lock()
 	w, h := c.lastW, c.lastH

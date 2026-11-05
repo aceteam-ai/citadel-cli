@@ -38,6 +38,13 @@ leaf open, and fails closed if the verified procfs FD route is unavailable.
 using owned fixtures, not real devices. This does not settle owner/hard-link
 policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
 
+`coordinatorfetch.Get` owns the shared fixed-route, bounded HTTPS transfer used
+by FILE_FETCH and the inactive media inbox freezer. Caller packages retain
+permission, exact-size/hash and publication policy; the client grants none.
+`mediainput.Freezer` adds live media-input checks and conditional Files checks
+for mixed snapshots, without registering a task or reserving the future C5
+holder admission. See `docs/media-input-freezer.md` for the activation gates.
+
 `service.RematerializeManagedUnits` owns the bounded base-file refresh and
 reload request, not worker restart or failed-unit counter recovery.
 `cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
@@ -2250,6 +2257,14 @@ shaped like:
 ```
 The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
 single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
+
+### Depth point-cloud sequence proposal (citadel-cli#1385)
+
+The separate #1385 depth-service proposal is not a registered engine/job.
+`internal/pointcloud` owns its inactive packed-sequence reference codec and
+synthetic camera-distance projection, not model calibration, Files authority or
+artifact publication. `docs/pointcloud-depth-service.md` owns the proposed wire
+layout and unresolved runtime/consumer acceptance gates.
 
 ### Diffusers sidecar: per-request model selection (citadel-cli#1335)
 

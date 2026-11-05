@@ -14,11 +14,13 @@ import (
 
 // fakeSession is an in-memory Session for handler tests.
 type fakeSession struct {
-	mu         sync.Mutex
-	port       int
-	attachable bool
-	attached   int
-	detached   int
+	mu           sync.Mutex
+	port         int
+	attachable   bool
+	attached     int
+	detached     int
+	humanControl bool
+	inputChecks  int
 }
 
 func (s *fakeSession) AttachTarget(id string) (int, bool) {
@@ -39,6 +41,36 @@ func (s *fakeSession) MarkDetached(id string) bool {
 	defer s.mu.Unlock()
 	s.detached++
 	return true
+}
+
+func (s *fakeSession) ViewerHasControl(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inputChecks++
+	return s.humanControl
+}
+
+func (s *fakeSession) setHumanControl(enabled bool) {
+	s.mu.Lock()
+	s.humanControl = enabled
+	s.mu.Unlock()
+}
+
+func (s *fakeSession) waitInputChecks(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.Lock()
+		checks := s.inputChecks
+		s.mu.Unlock()
+		if checks >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("input gate checked %d times, want %d", checks, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (s *fakeSession) counts() (attached, detached int) {
@@ -162,6 +194,68 @@ func TestViewerReceivesInitThenFrameAndMarksAttached(t *testing.T) {
 	waitDetached(t, sess, 1)
 }
 
+func TestIdleStaticPageGetsFirstFrameWithoutRefresh(t *testing.T) {
+	f := newFakeChrome()
+	f.totalFrames = 0 // CDP sends no screencast event for this static page.
+	f.cssViewportWidth = 400
+	f.cssViewportHeight = 300
+	defer f.close()
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-static")
+	if err != nil {
+		t.Fatalf("dial viewer: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	mt, _, err := conn.ReadMessage()
+	if err != nil || mt != websocket.TextMessage {
+		t.Fatalf("init: type=%d err=%v", mt, err)
+	}
+	mt, frame, err := conn.ReadMessage()
+	if err != nil || mt != websocket.BinaryMessage {
+		t.Fatalf("first frame: type=%d err=%v", mt, err)
+	}
+	if string(frame) != string(f.jpeg) {
+		t.Fatalf("fallback screenshot bytes mismatch")
+	}
+	input, _ := json.Marshal(InputMessage{
+		Type: InputTypeMouse, Event: "mousePressed", X: 0.5, Y: 0.5,
+		Button: "left", ClickCount: 1,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, input); err != nil {
+		t.Fatalf("send observing input: %v", err)
+	}
+	sess.waitInputChecks(t, 1)
+	f.mu.Lock()
+	observedMouse := len(f.mouse)
+	f.mu.Unlock()
+	if observedMouse != 0 {
+		t.Fatalf("observing viewer sent %d mouse events to CDP", observedMouse)
+	}
+
+	sess.setHumanControl(true)
+	if err := conn.WriteMessage(websocket.TextMessage, input); err != nil {
+		t.Fatalf("send fallback input after handoff: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		f.mu.Lock()
+		mouse := append([]map[string]any(nil), f.mouse...)
+		f.mu.Unlock()
+		if len(mouse) > 0 {
+			if mouse[0]["x"] != 200.0 || mouse[0]["y"] != 150.0 {
+				t.Fatalf("fallback click = (%v, %v), want CSS center (200, 150)", mouse[0]["x"], mouse[0]["y"])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fallback frame did not enable mouse input")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestUnknownSessionRefused: an unattachable session is rejected and never
 // touches attach state.
 func TestUnknownSessionRefused(t *testing.T) {
@@ -245,7 +339,8 @@ func TestSecondViewerRefused(t *testing.T) {
 	}
 }
 
-// TestViewerInputForwardedToCDP: a key input from the viewer reaches CDP.
+// TestViewerInputForwardedToCDP verifies observation is read only, explicit
+// handoff enables input, and resume revokes input without closing the viewer.
 func TestViewerInputForwardedToCDP(t *testing.T) {
 	f := newFakeChrome()
 	defer f.close()
@@ -267,6 +362,18 @@ func TestViewerInputForwardedToCDP(t *testing.T) {
 	if err := conn.WriteMessage(websocket.TextMessage, in); err != nil {
 		t.Fatalf("write input: %v", err)
 	}
+	sess.waitInputChecks(t, 1)
+	f.mu.Lock()
+	observedKeys := len(f.keys)
+	f.mu.Unlock()
+	if observedKeys != 0 {
+		t.Fatalf("observing viewer sent %d keys to CDP", observedKeys)
+	}
+
+	sess.setHumanControl(true)
+	if err := conn.WriteMessage(websocket.TextMessage, in); err != nil {
+		t.Fatalf("write after handoff: %v", err)
+	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -274,12 +381,23 @@ func TestViewerInputForwardedToCDP(t *testing.T) {
 		n := len(f.keys)
 		f.mu.Unlock()
 		if n > 0 {
-			return
+			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("key input never reached CDP")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	sess.setHumanControl(false)
+	if err := conn.WriteMessage(websocket.TextMessage, in); err != nil {
+		t.Fatalf("write after resume: %v", err)
+	}
+	sess.waitInputChecks(t, 3)
+	f.mu.Lock()
+	finalKeys := len(f.keys)
+	f.mu.Unlock()
+	if finalKeys != 1 {
+		t.Fatalf("viewer sent %d keys after resume, want 1 total", finalKeys)
 	}
 }
 
@@ -306,7 +424,8 @@ func TestViewerNativeSelectUsesPageInsteadOfPopupClicks(t *testing.T) {
 		return map[string]any{"type": "select_result", "value": "VT"}
 	}
 	defer f.close()
-	ts := newHarness(t, &fakeSession{port: 9222, attachable: true}, f)
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
 	conn, _, err := dialViewer(t, ts, "cb-1")
 	if err != nil {
 		t.Fatal(err)
@@ -320,6 +439,14 @@ func TestViewerNativeSelectUsesPageInsteadOfPopupClicks(t *testing.T) {
 	if _, _, err := conn.ReadMessage(); err != nil {
 		t.Fatal(err)
 	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.5, Y: 0.25, ProbeID: "observing"}); err != nil {
+		t.Fatal(err)
+	}
+	sess.waitInputChecks(t, 1)
+	if probes != 0 {
+		t.Fatalf("observing viewer probed %d controls", probes)
+	}
+	sess.setHumanControl(true)
 	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.5, Y: 0.25, ProbeID: "probe-one"}); err != nil {
 		t.Fatal(err)
 	}
