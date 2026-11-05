@@ -10,9 +10,9 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-// Classify from the original stream entry, not a caller-supplied type. Only
-// FILE_FETCH is disposable on ACK; other job streams retain existing semantics.
-var acknowledgeFileFetch = goredis.NewScript(`
+// Classify from the original stream entry, not a caller-supplied type. These
+// credential-bearing deliveries are disposable on terminal ACK.
+var acknowledgeSensitiveJob = goredis.NewScript(`
 local entries = redis.call('XRANGE', KEYS[1], ARGV[2], ARGV[2])
 local kind = ''
 if #entries > 0 then
@@ -28,16 +28,21 @@ if #entries > 0 then
   end
 end
 local acknowledged = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
-if acknowledged == 1 and kind == 'FILE_FETCH' then redis.call('XDEL', KEYS[1], ARGV[2]) end
+if acknowledged == 1 and (kind == 'FILE_FETCH' or kind == 'AMT_KVM') then redis.call('XDEL', KEYS[1], ARGV[2]) end
 return acknowledged
 `)
 
-// AckFileFetchJob atomically acknowledges and removes a FILE_FETCH delivery.
-func (c *Client) AckFileFetchJob(ctx context.Context, queue, messageID string) error {
+// AckSensitiveJob atomically acknowledges and removes a credential-bearing delivery.
+func (c *Client) AckSensitiveJob(ctx context.Context, queue, messageID string) error {
 	if queue == "" {
 		queue = c.queueName
 	}
-	return acknowledgeFileFetch.Run(ctx, c.client, []string{queue}, c.consumerGroup, messageID).Err()
+	return acknowledgeSensitiveJob.Run(ctx, c.client, []string{queue}, c.consumerGroup, messageID).Err()
+}
+
+// AckFileFetchJob preserves the existing FILE_FETCH call site contract.
+func (c *Client) AckFileFetchJob(ctx context.Context, queue, messageID string) error {
+	return c.AckSensitiveJob(ctx, queue, messageID)
 }
 
 // MarshalJSON omits credential-bearing fields from retained job envelopes.

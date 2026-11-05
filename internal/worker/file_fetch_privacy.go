@@ -10,8 +10,8 @@ import (
 )
 
 func (s *RedisSource) ackDelivery(ctx context.Context, kind, queue, messageID string) error {
-	if kind == JobTypeFileFetch {
-		return s.client.AckFileFetchJob(ctx, queue, messageID)
+	if jobprivacy.OmitPayload(kind) {
+		return s.client.AckSensitiveJob(ctx, queue, messageID)
 	}
 	if queue != "" {
 		return s.client.AckJobOnQueue(ctx, queue, messageID)
