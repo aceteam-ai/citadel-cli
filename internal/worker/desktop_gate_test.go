@@ -142,7 +142,12 @@ func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
 		if h == nil {
 			t.Fatalf("%s is not registered with desktop enabled", jobType)
 		}
-		_, err := h.Execute(context.Background(), &Job{ID: "g-" + jobType, Type: jobType, Payload: map[string]any{}}, nil)
+		job := &Job{ID: "g-" + jobType, Type: jobType, Payload: map[string]any{}}
+		if jobType == JobTypeAMTKVM {
+			// AMT must pass the per-node stream gate before this passcode assertion.
+			job.SourceQueue = "jobs:v1:shell:org_fixture:node:123"
+		}
+		_, err := h.Execute(context.Background(), job, nil)
 		var refusal *jobs.ShellRefusal
 		if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeInvalid {
 			t.Fatalf("%s without the passcode: err = %v, want passcode_invalid", jobType, err)
