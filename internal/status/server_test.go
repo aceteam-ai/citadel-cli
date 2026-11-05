@@ -2,6 +2,9 @@ package status
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -9,12 +12,159 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
+
+// The missing-prerequisite cases inspect actual registration without starting a
+// listener. Control startup uses the same controlEnabled predicate.
+func TestAgentControlDisabledWithoutPrerequisites(t *testing.T) {
+	calls := 0
+	s, coord, _ := newAgentControlServer(t, agentSpyProviders(&calls))
+	verifier, cert := s.caVerifier, s.controlServerCert
+	for _, tc := range []struct {
+		name string
+		v    *FabricCAVerifier
+		cert *tls.Certificate
+	}{
+		{"no verifier", nil, cert},
+		{"no server certificate", verifier, nil},
+		{"neither prerequisite", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s.caVerifier, s.controlServerCert = tc.v, tc.cert
+			if s.controlEnabled() {
+				t.Fatal("control must remain disabled")
+			}
+			for _, route := range agentControlCases {
+				for _, tc := range []struct {
+					mux  *http.ServeMux
+					want int
+				}{
+					{s.buildMux(), http.StatusForbidden},
+					{s.buildControlMux(), http.StatusNotFound},
+				} {
+					w := httptest.NewRecorder()
+					tc.mux.ServeHTTP(w, agentCoordinatorReq(route.method, route.path, coord))
+					if w.Code != tc.want || calls != 0 {
+						t.Fatalf("%s: code=%d want=%d calls=%d", route.path, w.Code, tc.want, calls)
+					}
+				}
+			}
+		})
+	}
+	// A caller cannot accidentally install unwrapped handlers without a gate.
+	mux := http.NewServeMux()
+	s.registerAgentControlRoutes(mux, nil)
+	for _, route := range agentControlCases {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, agentCoordinatorReq(route.method, route.path, coord))
+		if w.Code != http.StatusNotFound || calls != 0 {
+			t.Fatalf("absent gate %s: code=%d calls=%d", route.path, w.Code, calls)
+		}
+	}
+}
+
+// Unlike injected request metadata, these cases perform synthetic TLS
+// handshakes against the actual control mux and existing verifier configuration.
+// Every provider is inert: no doctor, vendor executable, queue or process exit.
+func TestAgentControlSyntheticTLSHandshakes(t *testing.T) {
+	ca := newTestCA(t, "agent-handshake-ca")
+	otherCA := newTestCA(t, "agent-untrusted-ca")
+	v, err := NewFabricCAVerifier(writeBundle(t, ca.certPEM), []string{DefaultCoordinatorSAN})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCert := ca.issueLeaf(t, "node-server")
+	coord := ca.issueLeaf(t, "coordinator", DefaultCoordinatorSAN)
+	peer := ca.issueLeaf(t, "peer", "aceteam:node:peer", "aceteam:org:other")
+	untrusted := otherCA.issueLeaf(t, "untrusted", DefaultCoordinatorSAN)
+	resign := func(leaf tls.Certificate, expired bool) tls.Certificate {
+		t.Helper()
+		tmpl := *leaf.Leaf
+		if expired {
+			tmpl.NotBefore, tmpl.NotAfter = time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour)
+		} else {
+			tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		}
+		der, err := x509.CreateCertificate(rand.Reader, &tmpl, ca.cert, tmpl.PublicKey, ca.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf.Certificate = [][]byte{der}
+		leaf.Leaf, err = x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return leaf
+	}
+	expired, wrongEKU := resign(coord, true), resign(coord, false)
+	var calls atomic.Int32
+	read := func() any { calls.Add(1); return map[string]any{"ok": true} }
+	action := func() (any, error) { return read(), nil }
+	p := &AgentProviders{
+		WorkerStatus: read, NodeInfo: read, Doctor: read, Config: read,
+		Logs:         func(LogQuery) (string, error) { calls.Add(1); return "synthetic log", nil },
+		VendorAgents: func(bool) (any, error) { return action() },
+		SetLogLevel:  func(bool) any { return read() },
+		Resubscribe:  action, WorkerRestart: action,
+	}
+	s := NewServer(ServerConfig{Agent: p, CAVerifier: v, ControlServerCert: &serverCert}, NewCollector(CollectorConfig{NodeName: "test-node"}))
+	ts := httptest.NewUnstartedServer(s.buildControlMux())
+	ts.TLS = v.ServerTLSConfig(serverCert)
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	for _, tc := range []struct {
+		name      string
+		cert      *tls.Certificate
+		handshake bool
+		want      int
+	}{
+		{"absent certificate", nil, false, 0},
+		{"untrusted certificate", &untrusted, false, 0},
+		{"expired certificate", &expired, false, 0},
+		{"wrong client EKU", &wrongEKU, false, 0},
+		{"fabric node identity", &peer, true, http.StatusForbidden},
+		{"trusted coordinator", &coord, true, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := clientWithCert(ts, tc.cert)
+			t.Cleanup(client.CloseIdleConnections)
+			for _, route := range agentControlCases {
+				calls.Store(0)
+				req, err := http.NewRequest(route.method, ts.URL+route.path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp, err := client.Do(req)
+				if !tc.handshake {
+					if resp != nil {
+						resp.Body.Close()
+					}
+					if err == nil || calls.Load() != 0 {
+						t.Fatalf("%s: expected handshake refusal and zero calls; err=%v calls=%d", route.path, err, calls.Load())
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("%s: %v", route.path, err)
+				}
+				resp.Body.Close()
+				wantCalls := int32(0)
+				if tc.want == http.StatusOK {
+					wantCalls = 1
+				}
+				if resp.StatusCode != tc.want || calls.Load() != wantCalls {
+					t.Fatalf("%s: code=%d want=%d calls=%d want=%d", route.path, resp.StatusCode, tc.want, calls.Load(), wantCalls)
+				}
+			}
+		})
+	}
+}
 
 // mockTokenValidator is a test double for terminal.TokenValidator.
 type mockTokenValidator struct {
