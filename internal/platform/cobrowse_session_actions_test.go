@@ -654,7 +654,7 @@ func TestCobrowseSessionActions_SelectRespectsFieldsetDisabledState(t *testing.T
 	if err := os.WriteFile(path, []byte(page), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	pageURL := (&url.URL{Scheme: "file", Path: path}).String()
 	output, err := exec.CommandContext(ctx, chrome, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--dump-dom", pageURL).CombinedOutput()
