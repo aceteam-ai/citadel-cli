@@ -18,12 +18,26 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
 type AMTKVMHandler struct{ Origin func() string }
+
+// A fixed lock set bounds memory while serializing every operation to the
+// same AMT host. Hash collisions only serialize unrelated hosts.
+var amtTargetLocks [64]sync.Mutex
+
+func amtTargetLock(host string) *sync.Mutex {
+	hash := uint64(14695981039346656037)
+	for i := 0; i < len(host); i++ {
+		hash ^= uint64(host[i])
+		hash *= 1099511628211
+	}
+	return &amtTargetLocks[hash%uint64(len(amtTargetLocks))]
+}
 
 type amtCredential struct {
 	Host     string `json:"host"`
@@ -80,6 +94,12 @@ func (h *AMTKVMHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	if op != "status" && op != "screenshot" && op != "keys" && op != "type" && op != "power" {
 		return nil, errors.New("unsupported AMT operation")
 	}
+	if op == "power" && (job.Payload["confirm_target"] == "" || job.Payload["confirm_target"] != job.Payload["host"] || job.Payload["confirm_action"] != job.Payload["action"]) {
+		return nil, errors.New("AMT power requires explicit target and action confirmation")
+	}
+	lock := amtTargetLock(job.Payload["host"])
+	lock.Lock()
+	defer lock.Unlock()
 	credential, err := h.credential(ctx.Context(), job)
 	if err != nil {
 		return nil, err
