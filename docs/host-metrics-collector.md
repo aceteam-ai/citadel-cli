@@ -45,6 +45,9 @@ Native GPU adapter wiring and other OS adapters remain explicit acceptance work.
 `JobBinding` ties an exact job ID to slot plus generation; old or late callbacks
 cannot mutate a replacement, including a retry using the same job ID. Optional
 CPU/RSS usage stays absent until actually attributed by trusted lifecycle code.
+An unknown CPU interval hides the current sample but preserves the last known
+counter floor for that generation. A fresh generation starts with no inherited
+floor.
 The tracker never divides host totals among active jobs. Private mappings are
 local correlation data, not an API response, public display, or Prometheus label.
 Historical run correlation needs the existing private job receipts; this slice

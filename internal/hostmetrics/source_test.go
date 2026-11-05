@@ -256,3 +256,42 @@ func TestSameJobIDReplacementStillRequiresCurrentGeneration(t *testing.T) {
 		t.Fatal("replacement lost its identity")
 	}
 }
+
+func TestJobCPUHighWaterSurvivesAnUnknownObservation(t *testing.T) {
+	tracker, _ := NewJobTracker(1)
+	binding, _ := tracker.Begin("same-job", "inference", "inference")
+	initial := 100.0
+	if e := tracker.Observe(binding, &initial, nil); e != nil {
+		t.Fatal(e)
+	}
+	if e := tracker.Observe(binding, nil, nil); e != nil {
+		t.Fatal(e)
+	}
+	group, _ := tracker.Snapshot()
+	for _, reading := range group.Readings {
+		if reading.Metric == JobCPUSeconds {
+			t.Fatal("unknown CPU must stay absent from the exported samples")
+		}
+	}
+	lower := 1.0
+	if e := tracker.Observe(binding, &lower, nil); e == nil {
+		t.Fatal("unknown interval erased the CPU counter high-water mark")
+	}
+	group, _ = tracker.Snapshot()
+	for _, reading := range group.Readings {
+		if reading.Metric == JobCPUSeconds {
+			t.Fatal("rejected counter fabricated a current CPU sample")
+		}
+	}
+	next := 101.0
+	if e := tracker.Observe(binding, &next, nil); e != nil {
+		t.Fatal(e)
+	}
+	if e := tracker.End(binding); e != nil {
+		t.Fatal(e)
+	}
+	replacement, _ := tracker.Begin("same-job", "inference", "inference")
+	if e := tracker.Observe(replacement, &lower, nil); e != nil {
+		t.Fatal("a new job generation inherited the old counter floor", e)
+	}
+}

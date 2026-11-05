@@ -19,6 +19,8 @@ type jobSlot struct {
 	id, kind, lane string
 	generation     uint64
 	cpu, rss       *float64
+	lastCPU        float64
+	cpuSeen        bool
 }
 
 // JobBinding is private local correlation data, deliberately separate from the
@@ -82,7 +84,7 @@ func (j *JobTracker) Observe(b JobBinding, cpuSeconds, residentBytes *float64) e
 		}
 	}
 	s := &j.slots[b.Slot]
-	if s.cpu != nil && cpuSeconds != nil && *cpuSeconds < *s.cpu {
+	if s.cpuSeen && cpuSeconds != nil && *cpuSeconds < s.lastCPU {
 		return errors.New("job CPU counter moved backwards")
 	}
 	clone := func(n *float64) *float64 {
@@ -91,6 +93,10 @@ func (j *JobTracker) Observe(b JobBinding, cpuSeconds, residentBytes *float64) e
 		}
 		v := *n
 		return &v
+	}
+	if cpuSeconds != nil {
+		// An unknown export must not erase validation history for this generation.
+		s.lastCPU, s.cpuSeen = *cpuSeconds, true
 	}
 	s.cpu, s.rss = clone(cpuSeconds), clone(residentBytes)
 	return nil
