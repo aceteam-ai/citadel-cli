@@ -601,18 +601,26 @@ func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
 
 	var initial map[string]any
 	deadline := time.Now().Add(10 * time.Second)
+	// Chrome may expose an about:blank target before processing its command-line
+	// URL. Navigate the same target selected by the production CDP discovery path.
 	for time.Now().Before(deadline) {
-		value, err := runtimeEvaluate(port, `(function(){ var el = document.querySelector("#submit"); return el ? {below: el.getBoundingClientRect().top > innerHeight, smooth: getComputedStyle(document.documentElement).scrollBehavior === "smooth"} : null; })()`)
+		if _, err := cdpCommand(port, "Page.navigate", map[string]any{"url": page.URL}); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for time.Now().Before(deadline) {
+		value, err := runtimeEvaluate(port, `(function(){ var el = document.querySelector("#submit"); return el ? {href: location.href, below: el.getBoundingClientRect().top > innerHeight, smooth: getComputedStyle(document.documentElement).scrollBehavior === "smooth"} : null; })()`)
 		if err == nil {
 			initial, _ = value.(map[string]any)
-			if initial != nil {
+			if initial != nil && initial["href"] == page.URL+"/" {
 				break
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if initial == nil {
-		t.Fatal("browser page did not load")
+	if initial == nil || initial["href"] != page.URL+"/" {
+		t.Fatalf("selected CDP page did not load the fixture: %v", initial)
 	}
 	if initial["below"] != true || initial["smooth"] != true {
 		t.Fatalf("test page must start offscreen with smooth scrolling: %v", initial)
