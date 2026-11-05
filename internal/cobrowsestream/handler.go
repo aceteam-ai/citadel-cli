@@ -144,11 +144,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 						if err != nil {
 							s.logger.Printf("viewer select failed: %v", err)
 						}
-						if result != nil {
-							select {
-							case uiMessages <- result:
-							default:
-							}
+						if result == nil {
+							result = map[string]any{"type": "select_error", "message": "No selectable control at this point"}
+						}
+						if m.Type == InputTypeSelectProbe {
+							result["probe_id"] = m.ProbeID
+						}
+						select {
+						case uiMessages <- result:
+						case <-ctx.Done():
+							return
 						}
 					} else {
 						s.dispatchInput(cdp, m)

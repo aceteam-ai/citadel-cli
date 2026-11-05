@@ -84,6 +84,7 @@ type InputMessage struct {
 	KeyCode   int    `json:"keyCode,omitempty"`   // windowsVirtualKeyCode
 	Modifiers int    `json:"modifiers,omitempty"` // CDP modifiers bitmask (alt=1,ctrl=2,meta=4,shift=8)
 	Value     string `json:"value,omitempty"`     // native select option value (select only)
+	ProbeID   string `json:"probe_id,omitempty"`  // viewer correlation for select_probe replies
 }
 
 // parseInputMessage decodes a viewer TEXT frame. It returns ok=false when the
