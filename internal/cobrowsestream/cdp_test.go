@@ -26,10 +26,12 @@ import (
 type fakeChrome struct {
 	server *httptest.Server
 
-	totalFrames  int     // frames to emit across the session
-	deviceWidth  float64 // advertised frame width
-	deviceHeight float64 // advertised frame height
-	jpeg         []byte  // raw bytes each frame carries (base64 on the wire)
+	totalFrames       int     // frames to emit across the session
+	deviceWidth       float64 // advertised frame width
+	deviceHeight      float64 // advertised frame height
+	cssViewportWidth  float64
+	cssViewportHeight float64
+	jpeg              []byte // raw bytes each frame carries (base64 on the wire)
 
 	mu      sync.Mutex
 	acks    int
@@ -48,11 +50,13 @@ type fakeChrome struct {
 
 func newFakeChrome() *fakeChrome {
 	f := &fakeChrome{
-		totalFrames:  3,
-		deviceWidth:  800,
-		deviceHeight: 600,
-		jpeg:         []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0x03}, // JPEG-ish
-		connReg:      make(chan struct{}, 16),
+		totalFrames:       3,
+		deviceWidth:       800,
+		deviceHeight:      600,
+		cssViewportWidth:  800,
+		cssViewportHeight: 600,
+		jpeg:              []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0x03}, // JPEG-ish
+		connReg:           make(chan struct{}, 16),
 	}
 	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	mux := http.NewServeMux()
@@ -74,6 +78,23 @@ func newFakeChrome() *fakeChrome {
 	})
 	f.server = httptest.NewServer(mux)
 	return f
+}
+
+func TestCaptureFirstFrameRejectsInvalidCSSViewport(t *testing.T) {
+	f := newFakeChrome()
+	f.cssViewportWidth = 0
+	defer f.close()
+	withFakeCDP(t, f)
+	cdp, err := dialCDP(9222, nil)
+	if err != nil {
+		t.Fatalf("dial CDP: %v", err)
+	}
+	defer cdp.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := cdp.captureFirstFrame(ctx, 60); err == nil {
+		t.Fatal("invalid CSS viewport must not publish a fallback frame")
+	}
 }
 
 // wsURL returns the DevTools WebSocket URL cdpTargetURL should resolve to.
@@ -99,8 +120,24 @@ func (f *fakeChrome) serve(conn *websocket.Conn) {
 		case "Page.startScreencast":
 			f.mu.Lock()
 			f.started = true
+			total := f.totalFrames
 			f.mu.Unlock()
-			f.sendFrame(conn, 1)
+			if total > 0 {
+				f.sendFrame(conn, 1)
+			}
+		case "Page.captureScreenshot":
+			_ = conn.WriteJSON(map[string]any{
+				"id":     msg.ID,
+				"result": map[string]any{"data": base64.StdEncoding.EncodeToString(f.jpeg)},
+			})
+		case "Page.getLayoutMetrics":
+			_ = conn.WriteJSON(map[string]any{
+				"id": msg.ID,
+				"result": map[string]any{"cssVisualViewport": map[string]any{
+					"clientWidth":  f.cssViewportWidth,
+					"clientHeight": f.cssViewportHeight,
+				}},
+			})
 		case "Page.screencastFrameAck":
 			f.mu.Lock()
 			f.acks++

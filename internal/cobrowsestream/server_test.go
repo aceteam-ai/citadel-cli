@@ -162,6 +162,56 @@ func TestViewerReceivesInitThenFrameAndMarksAttached(t *testing.T) {
 	waitDetached(t, sess, 1)
 }
 
+func TestIdleStaticPageGetsFirstFrameWithoutRefresh(t *testing.T) {
+	f := newFakeChrome()
+	f.totalFrames = 0 // CDP sends no screencast event for this static page.
+	f.cssViewportWidth = 400
+	f.cssViewportHeight = 300
+	defer f.close()
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-static")
+	if err != nil {
+		t.Fatalf("dial viewer: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	mt, _, err := conn.ReadMessage()
+	if err != nil || mt != websocket.TextMessage {
+		t.Fatalf("init: type=%d err=%v", mt, err)
+	}
+	mt, frame, err := conn.ReadMessage()
+	if err != nil || mt != websocket.BinaryMessage {
+		t.Fatalf("first frame: type=%d err=%v", mt, err)
+	}
+	if string(frame) != string(f.jpeg) {
+		t.Fatalf("fallback screenshot bytes mismatch")
+	}
+	input, _ := json.Marshal(InputMessage{
+		Type: InputTypeMouse, Event: "mousePressed", X: 0.5, Y: 0.5,
+		Button: "left", ClickCount: 1,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, input); err != nil {
+		t.Fatalf("send fallback input: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		f.mu.Lock()
+		mouse := append([]map[string]any(nil), f.mouse...)
+		f.mu.Unlock()
+		if len(mouse) > 0 {
+			if mouse[0]["x"] != 200.0 || mouse[0]["y"] != 150.0 {
+				t.Fatalf("fallback click = (%v, %v), want CSS center (200, 150)", mouse[0]["x"], mouse[0]["y"])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fallback frame did not enable mouse input")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestUnknownSessionRefused: an unattachable session is rejected and never
 // touches attach state.
 func TestUnknownSessionRefused(t *testing.T) {
