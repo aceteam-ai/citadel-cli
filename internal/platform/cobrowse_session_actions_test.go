@@ -113,6 +113,69 @@ func TestCobrowseSessionActions_HandoffRefusesWrites(t *testing.T) {
 	}
 }
 
+func TestCobrowseSessionActions_RecordRefusesHumanDriver(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err = m.WithDrivablePort(st.ID, func(int) error { called = true; return nil })
+	if !errors.Is(err, ErrHandedOff) || called {
+		t.Fatalf("record while handed off: err=%v, callback called=%v", err, called)
+	}
+}
+
+func TestCobrowseSessionActions_RecordReleasesDriverCustody(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	recorded := make(chan error, 1)
+	go func() {
+		recorded <- m.WithDrivablePort(st.ID, func(int) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+	handedOff := make(chan error, 1)
+	go func() { _, err := m.Handoff(st.ID); handedOff <- err }()
+	select {
+	case err := <-handedOff:
+		t.Fatalf("handoff took driver custody before recording ended: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-recorded:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recording did not release driver custody")
+	}
+	select {
+	case err := <-handedOff:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff stayed blocked after recording ended")
+	}
+}
+
 func TestCobrowseSessionActions_ResumeRestoresAIControl(t *testing.T) {
 	// Fixed, unused port: after resume the action reaches the CDP call and
 	// fails with a connection error -- the point is that it is NOT ErrHandedOff.
