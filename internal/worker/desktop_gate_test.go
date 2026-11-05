@@ -175,7 +175,7 @@ func TestAMTAdapterPasscodeBeforeCredentialRetrieval(t *testing.T) {
 		{"valid", testNodePasscode, "AMT binding unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := handler.Execute(context.Background(), &Job{ID: tc.name, Type: JobTypeAMTKVM, Payload: map[string]any{
+			result, err := handler.Execute(context.Background(), &Job{ID: tc.name, Type: JobTypeAMTKVM, SourceQueue: "jobs:v1:shell:org_fixture:node:123", Payload: map[string]any{
 				"host": "invalid", "operation": "status", "passcode": tc.passcode,
 			}}, nil)
 			if err == nil {
@@ -204,11 +204,32 @@ func TestAMTAdapterRefusesWhenNodeHasNoPasscode(t *testing.T) {
 		if !handler.CanHandle(JobTypeAMTKVM) {
 			continue
 		}
-		_, err := handler.Execute(context.Background(), &Job{ID: "no-node-passcode", Type: JobTypeAMTKVM, Payload: map[string]any{
+		_, err := handler.Execute(context.Background(), &Job{ID: "no-node-passcode", Type: JobTypeAMTKVM, SourceQueue: "jobs:v1:shell:org_fixture:node:123", Payload: map[string]any{
 			"host": "invalid", "operation": "status", "passcode": testNodePasscode,
 		}}, nil)
 		if shellRefusalReason(t, err) != jobs.ReasonPasscodeNotSet {
 			t.Fatalf("AMT without configured node passcode = %v", err)
+		}
+		return
+	}
+	t.Fatal("AMT_KVM handler not registered")
+}
+
+func TestAMTAdapterRefusesSharedStreamBeforeCredentialRetrieval(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		DesktopEnabled:       func() bool { return true },
+		DesktopPasscodeState: passcodeState(true),
+	})
+	for _, handler := range handlers {
+		if !handler.CanHandle(JobTypeAMTKVM) {
+			continue
+		}
+		_, err := handler.Execute(context.Background(), &Job{ID: "shared-amt", Type: JobTypeAMTKVM,
+			SourceQueue: "jobs:v1:shell:org_fixture", Payload: map[string]any{
+				"host": "invalid", "operation": "status", "passcode": testNodePasscode,
+			}}, nil)
+		if err == nil || err.Error() != "AMT control requires per-node stream delivery" {
+			t.Fatalf("shared-stream AMT request reached handler: %v", err)
 		}
 		return
 	}

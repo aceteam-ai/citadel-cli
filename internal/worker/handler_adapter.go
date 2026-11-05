@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -113,6 +114,10 @@ func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
 // Execute processes the job using the wrapped legacy handler.
 func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	start := time.Now()
+	if a.jobType == JobTypeAMTKVM && !isPerNodeStream(job.SourceQueue) {
+		err := errors.New("AMT control requires per-node stream delivery")
+		return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
+	}
 	if a.enabled != nil && !a.enabled() {
 		err := legacyPermissionRefusal(a.jobType)
 		if a.refusal != nil {
