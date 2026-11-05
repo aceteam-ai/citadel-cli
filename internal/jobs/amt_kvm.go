@@ -94,8 +94,14 @@ func (h *AMTKVMHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	if op != "status" && op != "screenshot" && op != "keys" && op != "type" && op != "power" {
 		return nil, errors.New("unsupported AMT operation")
 	}
-	if op == "power" && (job.Payload["confirm_target"] == "" || job.Payload["confirm_target"] != job.Payload["host"] || job.Payload["confirm_action"] != job.Payload["action"]) {
-		return nil, errors.New("AMT power requires explicit target and action confirmation")
+	if op == "power" {
+		action := job.Payload["action"]
+		if action != "on" && action != "off" && action != "cycle" && action != "reset" && action != "boot_to_setup" {
+			return nil, errors.New("unsupported AMT power action")
+		}
+		if job.Payload["confirm_target"] == "" || job.Payload["confirm_target"] != job.Payload["host"] || job.Payload["confirm_action"] == "" || job.Payload["confirm_action"] != action {
+			return nil, errors.New("AMT power requires explicit target and action confirmation")
+		}
 	}
 	lock := amtTargetLock(job.Payload["host"])
 	lock.Lock()

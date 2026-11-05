@@ -30,12 +30,23 @@ func TestAMTPowerRequiresExplicitTargetAndActionConfirmation(t *testing.T) {
 			t.Fatalf("power fields %#v reached credential lookup: %v", fields, err)
 		}
 	}
-	_, err := h.Execute(JobContext{Ctx: context.Background()}, &nexus.Job{Payload: map[string]string{
-		"host": "192.168.2.10", "operation": "power", "action": "reset",
-		"confirm_target": "192.168.2.10", "confirm_action": "reset",
-	}})
-	if err == nil || err.Error() != "AMT credential origin unavailable" {
-		t.Fatalf("confirmed power did not reach credential validation: %v", err)
+	for _, action := range []string{"", "force_off", "unknown"} {
+		_, err := h.Execute(JobContext{Ctx: context.Background()}, &nexus.Job{Payload: map[string]string{
+			"host": "192.168.2.10", "operation": "power", "action": action,
+			"confirm_target": "192.168.2.10", "confirm_action": action,
+		}})
+		if err == nil || err.Error() != "unsupported AMT power action" {
+			t.Fatalf("unsupported action %q reached credential validation: %v", action, err)
+		}
+	}
+	for _, action := range []string{"reset", "boot_to_setup"} {
+		_, err := h.Execute(JobContext{Ctx: context.Background()}, &nexus.Job{Payload: map[string]string{
+			"host": "192.168.2.10", "operation": "power", "action": action,
+			"confirm_target": "192.168.2.10", "confirm_action": action,
+		}})
+		if err == nil || err.Error() != "AMT credential origin unavailable" {
+			t.Fatalf("confirmed %s did not reach credential validation: %v", action, err)
+		}
 	}
 }
 
