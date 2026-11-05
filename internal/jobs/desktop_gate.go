@@ -55,6 +55,29 @@ func DesktopGateReason(g DesktopGate, presentedPasscode string) string {
 	return checkPasscode(g.Throttle, state.Check, presentedPasscode)
 }
 
+// AMTGateReason requires an actual configured node passcode. Desktop capture
+// may run without one, but AMT can change power and firmware state on the LAN.
+func AMTGateReason(g DesktopGate, presentedPasscode string) string {
+	if g.Load == nil {
+		return ReasonPasscodeUnavailable
+	}
+	state, err := g.Load()
+	if err != nil {
+		return ReasonPasscodeUnavailable
+	}
+	if !state.Set {
+		return ReasonPasscodeNotSet
+	}
+	return checkPasscode(g.Throttle, state.Check, presentedPasscode)
+}
+
+func AMTRefusal(reason string) *ShellRefusal {
+	if reason == ReasonPasscodeNotSet {
+		return &ShellRefusal{Reason: reason, Message: "AMT control requires a configured node passcode"}
+	}
+	return DesktopRefusal(reason)
+}
+
 // DesktopRefusal builds the typed refusal for a desktop job that failed
 // DesktopGateReason. It reuses ShellRefusal so the platform parses the same
 // {"reason","message"} shape for every passcode-gated surface.

@@ -195,6 +195,26 @@ func TestAMTAdapterPasscodeBeforeCredentialRetrieval(t *testing.T) {
 	}
 }
 
+func TestAMTAdapterRefusesWhenNodeHasNoPasscode(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		DesktopEnabled:       func() bool { return true },
+		DesktopPasscodeState: passcodeState(false),
+	})
+	for _, handler := range handlers {
+		if !handler.CanHandle(JobTypeAMTKVM) {
+			continue
+		}
+		_, err := handler.Execute(context.Background(), &Job{ID: "no-node-passcode", Type: JobTypeAMTKVM, Payload: map[string]any{
+			"host": "invalid", "operation": "status", "passcode": testNodePasscode,
+		}}, nil)
+		if shellRefusalReason(t, err) != jobs.ReasonPasscodeNotSet {
+			t.Fatalf("AMT without configured node passcode = %v", err)
+		}
+		return
+	}
+	t.Fatal("AMT_KVM handler not registered")
+}
+
 func TestCreateLegacyHandlersDesktopFailsClosedWithoutPasscodeWiring(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{DesktopEnabled: func() bool { return true }})
 	for _, candidate := range handlers {

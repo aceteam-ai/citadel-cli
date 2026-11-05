@@ -55,6 +55,17 @@ func newDesktopLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, ena
 	return a
 }
 
+func newAMTLegacyHandlerAdapter(handler jobs.JobHandler, enabled func() bool, gate jobs.DesktopGate) *LegacyHandlerAdapter {
+	a := newGatedLegacyHandlerAdapter(JobTypeAMTKVM, handler, enabled)
+	a.passcodeGate = func(presented string) error {
+		if reason := jobs.AMTGateReason(gate, presented); reason != "" {
+			return jobs.AMTRefusal(reason)
+		}
+		return nil
+	}
+	return a
+}
+
 // NewLegacyHandlerAdapter creates an adapter for an existing job handler.
 func NewLegacyHandlerAdapter(jobType string, handler jobs.JobHandler) *LegacyHandlerAdapter {
 	return &LegacyHandlerAdapter{
@@ -413,7 +424,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, configHandler),
 		NewLegacyHandlerAdapter(JobTypeExtraction, &jobs.ExtractionHandler{}),
 		NewLegacyHandlerAdapter(JobTypeHTTPProxy, &jobs.HTTPProxyHandler{}),
-		newDesktopLegacyHandlerAdapter(JobTypeAMTKVM, &jobs.AMTKVMHandler{Origin: func() string {
+		newAMTLegacyHandlerAdapter(&jobs.AMTKVMHandler{Origin: func() string {
 			if opts.FileFetchOrigin != nil {
 				return opts.FileFetchOrigin()
 			}
