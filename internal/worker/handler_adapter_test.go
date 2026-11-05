@@ -718,10 +718,11 @@ func TestAllKnownJobTypesCoversRegisteredHandlers(t *testing.T) {
 	}
 }
 
-func TestAMTKVMCapabilityAdvertisementFollowsDesktopPermission(t *testing.T) {
-	desktopEnabled := true
+func TestAMTKVMCapabilityAdvertisementRequiresSeparatePermission(t *testing.T) {
+	amtEnabled := false
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
-		DesktopEnabled: func() bool { return desktopEnabled },
+		DesktopEnabled: func() bool { return true },
+		AMTEnabled:     func() bool { return amtEnabled },
 	})
 	runner := NewRunner(nil, handlers, RunnerConfig{})
 	advertisesAMT := func() bool {
@@ -732,11 +733,15 @@ func TestAMTKVMCapabilityAdvertisementFollowsDesktopPermission(t *testing.T) {
 		}
 		return false
 	}
-	if !advertisesAMT() {
-		t.Fatal("enabled AMT handler missing from runner supported job types")
-	}
-	desktopEnabled = false
 	if advertisesAMT() {
-		t.Fatal("disabled AMT handler remains advertised")
+		t.Fatal("desktop permission alone advertised AMT control")
+	}
+	amtEnabled = true
+	if !advertisesAMT() {
+		t.Fatal("separately enabled AMT handler missing from runner supported job types")
+	}
+	amtEnabled = false
+	if advertisesAMT() {
+		t.Fatal("revoked AMT permission remains advertised")
 	}
 }

@@ -119,6 +119,7 @@ type DeviceConfig struct {
 	// `true` here (together with a NodePasscode) to actually enable a surface.
 	ConsoleEnabled *bool `json:"consoleEnabled,omitempty"`
 	DesktopEnabled *bool `json:"desktopEnabled,omitempty"`
+	AMTEnabled     *bool `json:"amtEnabled,omitempty"`
 	FilesEnabled   *bool `json:"filesEnabled,omitempty"`
 
 	// ShellEnabled is the programmatic opt-IN for remote shell command execution
@@ -316,7 +317,7 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	// platform.ConfigDir(): that path is invoker-scoped and can diverge between a
 	// system service and an interactive command. Only fields the platform set are
 	// touched; nil pointers leave the persisted value intact.
-	if config.ConsoleEnabled != nil || config.DesktopEnabled != nil || config.FilesEnabled != nil || config.ShellEnabled != nil || config.NodePasscode != nil {
+	if config.ConsoleEnabled != nil || config.DesktopEnabled != nil || config.AMTEnabled != nil || config.FilesEnabled != nil || config.ShellEnabled != nil || config.NodePasscode != nil {
 		permissionsDir := h.PermissionsDir
 		if permissionsDir == "" {
 			permissionsDir = platform.ConfigDir()
@@ -327,6 +328,9 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 		}
 		if config.DesktopEnabled != nil {
 			perms.Desktop = *config.DesktopEnabled
+		}
+		if config.AMTEnabled != nil {
+			perms.AMT = *config.AMTEnabled
 		}
 		if config.FilesEnabled != nil {
 			perms.Files = *config.FilesEnabled
@@ -356,6 +360,9 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			}
 			if config.DesktopEnabled != nil {
 				result += fmt.Sprintf("\nDesktop (screen/VNC) access %s", enabledLabel(*config.DesktopEnabled))
+			}
+			if config.AMTEnabled != nil {
+				result += fmt.Sprintf("\nIntel AMT control %s", enabledLabel(*config.AMTEnabled))
 			}
 			if config.FilesEnabled != nil {
 				result += fmt.Sprintf("\nFiles (browse/host) access %s", enabledLabel(*config.FilesEnabled))

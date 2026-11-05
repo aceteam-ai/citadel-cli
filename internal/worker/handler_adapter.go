@@ -30,6 +30,7 @@ type LegacyHandlerAdapter struct {
 	// before the handler runs. On such an adapter the payload passcode key is
 	// removed, so the handler never sees it.
 	passcodeGate func(presented string) error
+	queueMatches func(string) bool
 }
 
 // newGatedLegacyHandlerAdapter creates an adapter whose dispatchability follows
@@ -56,8 +57,9 @@ func newDesktopLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, ena
 	return a
 }
 
-func newAMTLegacyHandlerAdapter(handler jobs.JobHandler, enabled func() bool, gate jobs.DesktopGate) *LegacyHandlerAdapter {
+func newAMTLegacyHandlerAdapter(handler jobs.JobHandler, enabled func() bool, gate jobs.DesktopGate, orgID, nodeID string) *LegacyHandlerAdapter {
 	a := newGatedLegacyHandlerAdapter(JobTypeAMTKVM, handler, enabled)
+	a.queueMatches = func(queue string) bool { return workerControlQueueMatches(queue, orgID, nodeID) }
 	a.passcodeGate = func(presented string) error {
 		if reason := jobs.AMTGateReason(gate, presented); reason != "" {
 			return jobs.AMTRefusal(reason)
@@ -114,8 +116,8 @@ func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
 // Execute processes the job using the wrapped legacy handler.
 func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	start := time.Now()
-	if a.jobType == JobTypeAMTKVM && !isPerNodeStream(job.SourceQueue) {
-		err := errors.New("AMT control requires per-node stream delivery")
+	if a.jobType == JobTypeAMTKVM && (a.queueMatches == nil || !a.queueMatches(job.SourceQueue)) {
+		err := errors.New("AMT control requires this node's per-node stream delivery")
 		return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
 	}
 	if a.enabled != nil && !a.enabled() {
@@ -244,6 +246,9 @@ var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 
 // LegacyHandlerOpts configures optional behaviour for CreateLegacyHandlers.
 type LegacyHandlerOpts struct {
+	// AMT jobs must arrive on the exact stream for this worker identity.
+	OrgID  string
+	NodeID string
 	// LogFn routes job log output through a callback instead of stdout.
 	LogFn func(level, msg string)
 	// WorkspaceDir is the sandbox root for file-operation handlers.
@@ -319,6 +324,9 @@ type LegacyHandlerOpts struct {
 	// desktop handlers stay registered behind a per-dispatch fail-closed gate so
 	// APPLY_DEVICE_CONFIG changes take effect without restarting the worker.
 	DesktopEnabled func() bool
+	// AMTEnabled is an independent, live, default-deny operator permission.
+	// Enabling desktop capture alone never admits AMT control.
+	AMTEnabled func() bool
 	// DesktopPasscodeState reads the node's passcode state once per desktop job
 	// (jobs.DesktopGate.Load). It must return an error, never Set=false, when the
 	// state cannot be read. Required whenever desktop handlers are registered:
@@ -435,11 +443,8 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			}
 			return config.LoadDeviceCredsConverged().APIBaseURL
 		}}, func() bool {
-			if opts.DesktopEnabled != nil {
-				return opts.DesktopEnabled()
-			}
-			return !opts.DesktopDisabled
-		}, jobs.DesktopGate{Load: opts.DesktopPasscodeState, Throttle: opts.PasscodeThrottle}),
+			return opts.AMTEnabled != nil && opts.AMTEnabled()
+		}, jobs.DesktopGate{Load: opts.DesktopPasscodeState, Throttle: opts.PasscodeThrottle}, opts.OrgID, opts.NodeID),
 		// WEB_FETCH is the SSRF-guarded successor to HTTP_PROXY (aceteam#5995).
 		// HTTP_PROXY stays registered for WeChat provisioning + fleet back-compat;
 		// new consumers (youtube egress, web tools) use WEB_FETCH.

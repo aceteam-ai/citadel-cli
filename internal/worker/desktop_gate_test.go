@@ -128,7 +128,9 @@ func TestDesktopAdapterPermissionGateRunsFirst(t *testing.T) {
 
 func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		OrgID: "fixture", NodeID: "123",
 		DesktopEnabled:       func() bool { return true },
+		AMTEnabled:           func() bool { return true },
 		DesktopPasscodeState: passcodeState(true),
 	})
 	for _, jobType := range []string{JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions, JobTypeAMTKVM} {
@@ -157,7 +159,9 @@ func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
 
 func TestAMTAdapterPasscodeBeforeCredentialRetrieval(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		OrgID: "fixture", NodeID: "123",
 		DesktopEnabled:       func() bool { return true },
+		AMTEnabled:           func() bool { return true },
 		DesktopPasscodeState: passcodeState(true),
 	})
 	var handler JobHandler
@@ -202,7 +206,9 @@ func TestAMTAdapterPasscodeBeforeCredentialRetrieval(t *testing.T) {
 
 func TestAMTAdapterRefusesWhenNodeHasNoPasscode(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		OrgID: "fixture", NodeID: "123",
 		DesktopEnabled:       func() bool { return true },
+		AMTEnabled:           func() bool { return true },
 		DesktopPasscodeState: passcodeState(false),
 	})
 	for _, handler := range handlers {
@@ -220,21 +226,29 @@ func TestAMTAdapterRefusesWhenNodeHasNoPasscode(t *testing.T) {
 	t.Fatal("AMT_KVM handler not registered")
 }
 
-func TestAMTAdapterRefusesSharedStreamBeforeCredentialRetrieval(t *testing.T) {
+func TestAMTAdapterRefusesNonLocalStreamBeforeCredentialRetrieval(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		OrgID: "fixture", NodeID: "123",
 		DesktopEnabled:       func() bool { return true },
+		AMTEnabled:           func() bool { return true },
 		DesktopPasscodeState: passcodeState(true),
 	})
 	for _, handler := range handlers {
 		if !handler.CanHandle(JobTypeAMTKVM) {
 			continue
 		}
-		_, err := handler.Execute(context.Background(), &Job{ID: "shared-amt", Type: JobTypeAMTKVM,
-			SourceQueue: "jobs:v1:shell:org_fixture", Payload: map[string]any{
-				"host": "invalid", "operation": "status", "passcode": testNodePasscode,
-			}}, nil)
-		if err == nil || err.Error() != "AMT control requires per-node stream delivery" {
-			t.Fatalf("shared-stream AMT request reached handler: %v", err)
+		for _, queue := range []string{
+			"jobs:v1:shell:org_fixture",
+			"jobs:v1:shell:org_fixture:node:other",
+			"jobs:v1:shell:org_other:node:123",
+		} {
+			_, err := handler.Execute(context.Background(), &Job{ID: "wrong-route-amt", Type: JobTypeAMTKVM,
+				SourceQueue: queue, Payload: map[string]any{
+					"host": "invalid", "operation": "status", "passcode": testNodePasscode,
+				}}, nil)
+			if err == nil || err.Error() != "AMT control requires this node's per-node stream delivery" {
+				t.Fatalf("AMT job from %q reached handler: %v", queue, err)
+			}
 		}
 		return
 	}
