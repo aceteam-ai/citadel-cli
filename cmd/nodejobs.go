@@ -73,6 +73,7 @@ type nodeJobHandlerOpts struct {
 	// DesktopEnabled reloads the persisted desktop permission for each routing
 	// decision so configuration pushes take effect without a restart.
 	DesktopEnabled func() bool
+	AMTEnabled     func() bool
 	// DesktopPasscodeState gates desktop jobs on the node passcode, like
 	// SHELL_COMMAND. Required whenever desktop is enabled; nil refuses.
 	DesktopPasscodeState func() (jobs.PasscodeState, error)
@@ -118,6 +119,8 @@ type nodeJobHandlerOpts struct {
 // it through themselves; see cmd/work.go's nodeSwapManager/swapStatsFn.
 func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker.SwapManager) {
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
+		OrgID:                     opts.OrgID,
+		NodeID:                    opts.NodeID,
 		LogFn:                     opts.LogFn,
 		WorkspaceDir:              opts.WorkspaceDir,
 		ConfigDir:                 opts.ConfigDir,
@@ -133,6 +136,7 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 		ShellVerifyPasscode:       opts.ShellVerifyPasscode,
 		DesktopDisabled:           opts.DesktopDisabled,
 		DesktopEnabled:            opts.DesktopEnabled,
+		AMTEnabled:                opts.AMTEnabled,
 		DesktopPasscodeState:      opts.DesktopPasscodeState,
 		ShellPasscodeState:        opts.ShellPasscodeState,
 		PasscodeThrottle:          opts.PasscodeThrottle,

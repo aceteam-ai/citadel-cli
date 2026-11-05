@@ -128,10 +128,12 @@ func TestDesktopAdapterPermissionGateRunsFirst(t *testing.T) {
 
 func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
 	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		OrgID: "fixture", NodeID: "123",
 		DesktopEnabled:       func() bool { return true },
+		AMTEnabled:           func() bool { return true },
 		DesktopPasscodeState: passcodeState(true),
 	})
-	for _, jobType := range []string{JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions} {
+	for _, jobType := range []string{JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions, JobTypeAMTKVM} {
 		var h JobHandler
 		for _, candidate := range handlers {
 			if candidate.CanHandle(jobType) {
@@ -142,12 +144,115 @@ func TestCreateLegacyHandlersGatesEveryDesktopJobOnPasscode(t *testing.T) {
 		if h == nil {
 			t.Fatalf("%s is not registered with desktop enabled", jobType)
 		}
-		_, err := h.Execute(context.Background(), &Job{ID: "g-" + jobType, Type: jobType, Payload: map[string]any{}}, nil)
+		job := &Job{ID: "g-" + jobType, Type: jobType, Payload: map[string]any{}}
+		if jobType == JobTypeAMTKVM {
+			// AMT must pass the per-node stream gate before this passcode assertion.
+			job.SourceQueue = "jobs:v1:shell:org_fixture:node:123"
+		}
+		_, err := h.Execute(context.Background(), job, nil)
 		var refusal *jobs.ShellRefusal
 		if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeInvalid {
 			t.Fatalf("%s without the passcode: err = %v, want passcode_invalid", jobType, err)
 		}
 	}
+}
+
+func TestAMTAdapterPasscodeBeforeCredentialRetrieval(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		OrgID: "fixture", NodeID: "123",
+		DesktopEnabled:       func() bool { return true },
+		AMTEnabled:           func() bool { return true },
+		DesktopPasscodeState: passcodeState(true),
+	})
+	var handler JobHandler
+	for _, candidate := range handlers {
+		if candidate.CanHandle(JobTypeAMTKVM) {
+			handler = candidate
+			break
+		}
+	}
+	if handler == nil {
+		t.Fatal("AMT_KVM handler not registered")
+	}
+	for _, tc := range []struct {
+		name     string
+		passcode string
+		want     string
+	}{
+		{"missing", "", jobs.ReasonPasscodeInvalid},
+		{"wrong", "0000", jobs.ReasonPasscodeInvalid},
+		{"valid", testNodePasscode, "AMT binding unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := handler.Execute(context.Background(), &Job{ID: tc.name, Type: JobTypeAMTKVM, SourceQueue: "jobs:v1:shell:org_fixture:node:123", Payload: map[string]any{
+				"host": "invalid", "operation": "status", "passcode": tc.passcode,
+			}}, nil)
+			if err == nil {
+				t.Fatal("AMT job unexpectedly succeeded")
+			}
+			if tc.name == "valid" {
+				if err.Error() != tc.want {
+					t.Fatalf("valid passcode did not reach AMT binding check: %v", err)
+				}
+			} else if shellRefusalReason(t, err) != tc.want {
+				t.Fatalf("passcode refusal = %v, want %s", err, tc.want)
+			}
+			if result == nil || result.Status != JobStatusFailure {
+				t.Fatalf("result = %+v, want failure", result)
+			}
+		})
+	}
+}
+
+func TestAMTAdapterRefusesWhenNodeHasNoPasscode(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		OrgID: "fixture", NodeID: "123",
+		DesktopEnabled:       func() bool { return true },
+		AMTEnabled:           func() bool { return true },
+		DesktopPasscodeState: passcodeState(false),
+	})
+	for _, handler := range handlers {
+		if !handler.CanHandle(JobTypeAMTKVM) {
+			continue
+		}
+		_, err := handler.Execute(context.Background(), &Job{ID: "no-node-passcode", Type: JobTypeAMTKVM, SourceQueue: "jobs:v1:shell:org_fixture:node:123", Payload: map[string]any{
+			"host": "invalid", "operation": "status", "passcode": testNodePasscode,
+		}}, nil)
+		if shellRefusalReason(t, err) != jobs.ReasonPasscodeNotSet {
+			t.Fatalf("AMT without configured node passcode = %v", err)
+		}
+		return
+	}
+	t.Fatal("AMT_KVM handler not registered")
+}
+
+func TestAMTAdapterRefusesNonLocalStreamBeforeCredentialRetrieval(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		OrgID: "fixture", NodeID: "123",
+		DesktopEnabled:       func() bool { return true },
+		AMTEnabled:           func() bool { return true },
+		DesktopPasscodeState: passcodeState(true),
+	})
+	for _, handler := range handlers {
+		if !handler.CanHandle(JobTypeAMTKVM) {
+			continue
+		}
+		for _, queue := range []string{
+			"jobs:v1:shell:org_fixture",
+			"jobs:v1:shell:org_fixture:node:other",
+			"jobs:v1:shell:org_other:node:123",
+		} {
+			_, err := handler.Execute(context.Background(), &Job{ID: "wrong-route-amt", Type: JobTypeAMTKVM,
+				SourceQueue: queue, Payload: map[string]any{
+					"host": "invalid", "operation": "status", "passcode": testNodePasscode,
+				}}, nil)
+			if err == nil || err.Error() != "AMT control requires this node's per-node stream delivery" {
+				t.Fatalf("AMT job from %q reached handler: %v", queue, err)
+			}
+		}
+		return
+	}
+	t.Fatal("AMT_KVM handler not registered")
 }
 
 func TestCreateLegacyHandlersDesktopFailsClosedWithoutPasscodeWiring(t *testing.T) {

@@ -20,7 +20,7 @@ func TestDeviceConfig_SensitivePermsUnmarshal(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"deviceName":"n"}`), &c); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if c.ConsoleEnabled != nil || c.DesktopEnabled != nil || c.FilesEnabled != nil || c.NodePasscode != nil {
+	if c.ConsoleEnabled != nil || c.DesktopEnabled != nil || c.AMTEnabled != nil || c.FilesEnabled != nil || c.NodePasscode != nil {
 		t.Errorf("absent sensitive fields must be nil, got %+v", c)
 	}
 
@@ -199,7 +199,7 @@ func TestApplyDeviceConfig_UsesWorkerPermissionDirectory(t *testing.T) {
 
 	h := NewConfigHandler(workerDir)
 	h.PermissionsDir = workerDir
-	payload, _ := json.Marshal(map[string]any{"shellEnabled": true})
+	payload, _ := json.Marshal(map[string]any{"shellEnabled": true, "amtEnabled": true})
 	job := &nexus.Job{Type: "APPLY_DEVICE_CONFIG", Payload: map[string]string{"config": string(payload)}}
 	if _, err := h.Execute(JobContext{}, job); err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -207,6 +207,9 @@ func TestApplyDeviceConfig_UsesWorkerPermissionDirectory(t *testing.T) {
 
 	if !citadelconfig.LoadPermissions(workerDir).Shell {
 		t.Fatal("worker permission directory was not updated")
+	}
+	if !citadelconfig.LoadPermissions(workerDir).AMT {
+		t.Fatal("separate AMT permission was not updated")
 	}
 	if citadelconfig.LoadPermissions(legacyDir).Shell {
 		t.Fatal("invoker-scoped permission directory must remain untouched")

@@ -138,6 +138,10 @@ func nodeDesktopEnabled() bool {
 	return loadNodePermissions().Desktop
 }
 
+func nodeAMTEnabled() bool {
+	return loadNodePermissions().AMT
+}
+
 func nodeFilesEnabled() bool {
 	return loadNodePermissions().Files
 }

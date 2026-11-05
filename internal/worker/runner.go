@@ -1369,6 +1369,24 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 			r.deferHuddleTeardown(ctx, job, actualErr)
 			return false
 		}
+		// AMT capabilities are single use, and a timed-out mutating call may
+		// already have changed the target. Never redeliver the same action.
+		if job.Type == JobTypeAMTKVM {
+			reason := "amt_failed_no_automatic_retry"
+			if operation := payloadString(job.Payload, "operation"); operation == "power" || operation == "keys" || operation == "type" {
+				actualErr = errors.New("AMT action outcome unknown; verify the target before another command")
+				reason = "amt_outcome_unknown"
+			}
+			r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
+			r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
+			if werr := stream.WriteError(actualErr, false); werr != nil {
+				r.log("warning", "Failed to publish terminal AMT error for job %s: %v", job.ID, werr)
+			}
+			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": reason}); ferr != nil {
+				r.log("warning", "Failed to close AMT job %s: %v", job.ID, ferr)
+			}
+			return false
+		}
 		r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
 		r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
 
