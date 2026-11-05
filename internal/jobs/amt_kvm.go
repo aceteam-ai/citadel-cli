@@ -21,10 +21,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
-type AMTKVMHandler struct{ Origin func() string }
+type AMTKVMHandler struct {
+	Origin      func() string
+	DeviceCreds func() config.DeviceCreds
+	HTTPClient  *http.Client
+}
 
 // A fixed lock set bounds memory while serializing every operation to the
 // same AMT host. Hash collisions only serialize unrelated hosts.
@@ -66,12 +71,24 @@ func (h *AMTKVMHandler) credential(ctx context.Context, job *nexus.Job) (amtCred
 			return credential, errors.New("AMT credential capability unavailable")
 		}
 	}
+	loadCreds := h.DeviceCreds
+	if loadCreds == nil {
+		loadCreds = config.LoadDeviceCredsConverged
+	}
+	creds := loadCreds()
+	if creds.Token == "" || strings.TrimRight(creds.APIBaseURL, "/") != configured {
+		return credential, errors.New("AMT enrolled device identity unavailable")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return credential, errors.New("AMT credential request unavailable")
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req.Header.Set("Authorization", "Bearer "+creds.Token)
+	req.Header.Set("X-AMT-Capability", token)
+	client := h.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return credential, errors.New("AMT credential delivery failed")

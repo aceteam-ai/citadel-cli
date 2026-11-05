@@ -9,8 +9,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
+
+func TestAMTCredentialRequiresEnrolledDeviceAndSendsBothProofs(t *testing.T) {
+	const capability = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	requests := 0
+	const origin = "https://aceteam.test"
+	client := &http.Client{Transport: amtRoundTrip(func(r *http.Request) (*http.Response, error) {
+		requests++
+		if r.URL.Path != "/api/fabric/amt/credential" || r.Header.Get("Authorization") != "Bearer act_synthetic_device" || r.Header.Get("X-AMT-Capability") != capability {
+			t.Errorf("credential request did not carry enrolled device and capability")
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"host":"192.168.2.10","username":"admin","password":"synthetic"}`)), Header: make(http.Header)}, nil
+	})}
+	h := &AMTKVMHandler{Origin: func() string { return origin }, HTTPClient: client}
+	job := &nexus.Job{Payload: map[string]string{
+		"host": "192.168.2.10", "credential_url": origin + "/api/fabric/amt/credential", "credential_token": capability,
+	}}
+	if _, err := h.credential(context.Background(), job); err == nil {
+		t.Fatal("unenrolled device reached credential endpoint")
+	}
+	if requests != 0 {
+		t.Fatal("unenrolled device sent a request")
+	}
+	h.DeviceCreds = func() config.DeviceCreds {
+		return config.DeviceCreds{Token: "act_synthetic_device", APIBaseURL: origin}
+	}
+	credential, err := h.credential(context.Background(), job)
+	if err != nil || credential.Password != "synthetic" || requests != 1 {
+		t.Fatalf("enrolled request failed: credential=%+v requests=%d err=%v", credential, requests, err)
+	}
+}
 
 func TestAMTPowerRequiresExplicitTargetAndActionConfirmation(t *testing.T) {
 	h := &AMTKVMHandler{Origin: func() string { return "" }}
