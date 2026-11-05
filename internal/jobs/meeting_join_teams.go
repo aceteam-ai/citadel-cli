@@ -284,16 +284,17 @@ func pollForTeamsJoinClick(ctx JobContext, page joinPage, botDisplayName, passco
 			ctx.Log("warn", "     - could not set Teams bot name (non-fatal, may not be rendered yet): %v", err)
 		}
 
-		// Best-effort: mute mic + camera before joining.
-		if _, err := page.Evaluate(teamsMuteMicCamJS); err != nil {
-			ctx.Log("warn", "     - Teams mute mic/cam errored (non-fatal): %v", err)
-		}
-
 		// Best-effort: select "Computer audio" so the meeting's audio routes into
 		// the browser (and thus the recording sink) — a capture bot must hear the
 		// room. No-op if the radio is absent or already selected.
 		if _, err := page.Evaluate(teamsSelectComputerAudioJS); err != nil {
 			ctx.Log("warn", "     - Teams select-computer-audio errored (non-fatal): %v", err)
+		}
+
+		// Mute after selecting audio: changing the audio mode can recreate
+		// device controls in their enabled state. Keep speakers for capture.
+		if _, err := page.Evaluate(teamsMuteMicCamJS); err != nil {
+			ctx.Log("warn", "     - Teams mute mic/cam errored (non-fatal): %v", err)
 		}
 
 		// Try the join button by VERIFIED data-tid first, then fall back to the
