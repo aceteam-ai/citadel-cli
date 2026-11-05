@@ -21,6 +21,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
 	"github.com/alicebob/miniredis/v2"
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -503,8 +504,17 @@ func TestDurableImmediateRenewalFailureNeverAdmitsOrAcknowledges(t *testing.T) {
 			source.client = redisapi.NewClient(redisapi.ClientConfig{BaseURL: "https://fake.invalid", Token: "synthetic-device"})
 			defer source.Close()
 			job, err := source.nextSingle(context.Background(), "jobs:v1:tag:fixture", 1)
-			if err != nil || job != nil || source.RefusedDeliveries() != 1 || len(f.envelopes) != 0 {
+			if job != nil || len(f.envelopes) != 0 {
 				t.Fatal("unrenewed or unsupported delivery admitted")
+			}
+			if name == "worker-control" {
+				// Control has its own strict wire decoder. Mixed metadata is
+				// rejected there, before ordinary durable adoption or renewal.
+				if !errors.Is(err, workercontrol.ErrInvalid) || source.RefusedDeliveries() != 0 {
+					t.Fatalf("mixed control delivery escaped strict refusal: %v", err)
+				}
+			} else if err != nil || source.RefusedDeliveries() != 1 {
+				t.Fatalf("durable delivery was not refused: %v", err)
 			}
 			if name == "denied" || name == "zero-budget" {
 				if f.renewalCount() != 1 {
