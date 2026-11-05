@@ -1,59 +1,16 @@
-// internal/platform/cobrowse_session_actions.go
-//
-// Session-scoped CDP actions (issue #978): navigate / screenshot / click / type /
-// extract, plus per-session driver arbitration (handoff / resume), addressed by
-// session_id against the multi-session CobrowseSessionManager (cobrowse_session.go).
-//
-// This mirrors the singleton CobrowseManager's action set (cobrowse.go) rather than
-// reinventing CDP interaction: navigate uses the same Page.navigate call, screenshot
-// the same Page.captureScreenshot + base64 validation, and the driver-arbitration
-// refusal reuses the exact same ErrHandedOff / ErrNotStarted sentinels and the same
-// "refuse read-only actions too, not just writes" rule the singleton's Screenshot
-// already enforces. click/type/extract have no singleton analog (the old COBROWSE job
-// never grew them) and are new here, built on the same connect-act-disconnect
-// cdpCommand/cdpDialAndSend plumbing (cobrowse.go) plus Runtime.evaluate for
-// selector-based DOM interaction.
-//
-// Design choice, stated explicitly because the issue's own text guessed the opposite:
-// screenshot and extract are READ-ONLY but are still refused while a human is
-// attached, exactly like navigate/click/type. This mirrors the singleton's actual
-// behavior (CobrowseManager.Screenshot refuses ErrHandedOff, not just Navigate) --
-// not the issue text's "likely allowed during attach" guess, which turned out to be
-// wrong once the singleton's code was read. A CDP round trip into a live page a human
-// is driving is not a passive read from the human's point of view, so extract is held
-// to the same rule for consistency.
-//
-// Driver arbitration is TWO independent bits, not one flag flipped by both halves of
-// the interop pair:
-//   - state == SessionAttached: a viewer is CURRENTLY connected (the #794 screencast
-//     hook's MarkAttached/MarkDetached calls; server.go documents these as a
-//     symmetric presence pair tied to the WebSocket connection's lifetime, and
-//     cobrowsestream/handler.go calls them as `MarkAttached; defer MarkDetached`).
-//     This bit is ephemeral: it clears itself the moment the viewer disconnects, with
-//     NO change to cobrowse_session.go's setAttached (byte-identical to before #978).
-//   - explicitHandoff: set by the `handoff` action, cleared by `resume`. This bit is
-//     STICKY across a transient viewer disconnect -- the mid-2FA case: a network blip
-//     dropping the viewer's WebSocket must not silently resume agent scripting on a
-//     session the human explicitly claimed.
-//
-// humanDrivingLocked ORs them: an agent-scripted action is refused if EITHER a viewer
-// is attached right now OR an explicit handoff is outstanding. This is why merely
-// attaching (a passive watch-along) already satisfies "an agent write must be refused
-// while a human is attached" and "a human can grab a live scripted session mid-run and
-// hand it back" -- attach blocks, detach un-blocks -- with `handoff`/`resume` as the
-// separate, sticky mechanism for a hold that must survive a reconnect. Collapsing
-// these into one flag (making MarkAttached itself set a persistent "human driver" flag
-// that only an explicit resume could clear) was tried and reverted: it would make ANY
-// viewer connection -- including a passive watch-along with no intent to drive --
-// permanently kill agent scripting until someone remembered to call `resume`, and the
-// #8131/#8133 agents have no way to observe a viewer disconnect to know when that is
-// safe.
+// Session-scoped CDP actions and driver arbitration for co-browse sessions.
+// An attached viewer observes the browser without stopping agent actions.
+// Explicit handoff gives the human control and blocks all agent CDP actions,
+// including screenshot and extract. Resume returns control to the agent while
+// the viewer remains attached. The handoff survives a viewer disconnect.
 package platform
 
 import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strings"
 )
 
 // ExtractResult is the outcome of a session `extract` action: the matched
@@ -68,11 +25,29 @@ type ExtractResult struct {
 	Attrs map[string]string `json:"attrs,omitempty"`
 }
 
-// humanDrivingLocked reports whether the session's driver-arbitration state
-// currently blocks agent-scripted actions -- see the package doc comment above
-// for why this is two bits ORed together rather than one flag. Caller holds s.mu.
+type SelectResult struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+// humanDrivingLocked reports whether a human explicitly took control. A viewer
+// may observe a live session without blocking the agent. Caller holds s.mu.
 func (s *cobrowseSession) humanDrivingLocked() bool {
-	return s.explicitHandoff || s.state == SessionAttached
+	return s.explicitHandoff
+}
+
+// ViewerHasControl gates input arriving over the stream. The check is repeated
+// for every input message so handback takes effect with the viewer still open.
+func (m *CobrowseSessionManager) ViewerHasControl(id string) bool {
+	m.mu.Lock()
+	s := m.sessions[id]
+	m.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state == SessionAttached && s.explicitHandoff
 }
 
 // driverFor projects humanDrivingLocked's bool onto the reported CobrowseDriver
@@ -219,6 +194,142 @@ func (m *CobrowseSessionManager) Type(id, text string) (CobrowseSessionStatus, e
 	return s.status(), nil
 }
 
+// Select changes a native select through the page DOM. Native popup windows do
+// not receive forwarded CDP mouse clicks, so mouse coordinates cannot choose
+// an option reliably. The native setter and bubbling events update React forms.
+func (m *CobrowseSessionManager) Select(id, selector, value, label string) (SelectResult, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return SelectResult{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return SelectResult{}, err
+	}
+	expr := fmt.Sprintf(`(function(){
+		const el = document.querySelector(%s);
+		if (!(el instanceof HTMLSelectElement)) return {error: "selector does not match a select"};
+		const options = Array.from(el.options);
+		const option = options.find(o => %s !== "" ? o.value === %s : o.label === %s);
+		if (el.matches(":disabled") || !option || option.disabled || option.parentElement?.disabled) return {error: "enabled option not found"};
+		const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set;
+		setter.call(el, option.value);
+		el.dispatchEvent(new Event("input", {bubbles: true}));
+		el.dispatchEvent(new Event("change", {bubbles: true}));
+		return {value: el.value, label: el.selectedOptions[0]?.label || ""};
+	})()`, jsStringLiteral(selector), jsStringLiteral(value), jsStringLiteral(value), jsStringLiteral(label))
+	result, err := runtimeEvaluate(port, expr)
+	if err != nil {
+		return SelectResult{}, err
+	}
+	obj, ok := result.(map[string]any)
+	if !ok {
+		return SelectResult{}, fmt.Errorf("select returned no result")
+	}
+	if problem, _ := obj["error"].(string); problem != "" {
+		return SelectResult{}, fmt.Errorf("select: %s", problem)
+	}
+	selected, ok := obj["value"].(string)
+	if !ok {
+		return SelectResult{}, fmt.Errorf("select returned no value")
+	}
+	selectedLabel, _ := obj["label"].(string)
+	return SelectResult{Value: selected, Label: selectedLabel}, nil
+}
+
+// Key sends a real key press and release. Text is never logged by the job
+// handler; the MCP audit records only the action name.
+func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	code, vk, produced, ok := browserKey(key)
+	if !ok {
+		return CobrowseSessionStatus{}, fmt.Errorf("unsupported key")
+	}
+	kind := "rawKeyDown"
+	if produced != "" {
+		kind = "keyDown"
+	}
+	params := map[string]any{"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk}
+	if produced != "" {
+		params["text"] = produced
+	}
+	if _, err := cdpCommand(port, "Input.dispatchKeyEvent", params); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	if _, err := cdpCommand(port, "Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk}); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	return s.status(), nil
+}
+
+func browserKey(key string) (string, int, string, bool) {
+	special := map[string]struct {
+		code string
+		vk   int
+	}{
+		"Tab": {"Tab", 9}, "Enter": {"Enter", 13}, "Escape": {"Escape", 27},
+		"ArrowUp": {"ArrowUp", 38}, "ArrowDown": {"ArrowDown", 40},
+		"ArrowLeft": {"ArrowLeft", 37}, "ArrowRight": {"ArrowRight", 39},
+		"Home": {"Home", 36}, "End": {"End", 35}, "PageUp": {"PageUp", 33},
+		"PageDown": {"PageDown", 34}, "Backspace": {"Backspace", 8}, "Delete": {"Delete", 46},
+	}
+	if s, ok := special[key]; ok {
+		return s.code, s.vk, "", true
+	}
+	if len(key) == 1 {
+		ch := key[0]
+		if ch >= 'a' && ch <= 'z' {
+			return "Key" + strings.ToUpper(key), int(ch - 'a' + 'A'), key, true
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			return "Key" + key, int(ch), key, true
+		}
+		if ch >= '0' && ch <= '9' {
+			return "Digit" + key, int(ch), key, true
+		}
+		if ch == ' ' {
+			return "Space", 32, key, true
+		}
+	}
+	return "", 0, "", false
+}
+
+func (m *CobrowseSessionManager) Scroll(id, selector string, x, y *float64, dx, dy float64) (CobrowseSessionStatus, error) {
+	if math.IsNaN(dx) || math.IsInf(dx, 0) || math.IsNaN(dy) || math.IsInf(dy, 0) {
+		return CobrowseSessionStatus{}, fmt.Errorf("scroll deltas must be finite")
+	}
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	var cx, cy float64
+	if selector != "" {
+		cx, cy, err = resolveSelectorCenter(port, selector)
+	} else if x != nil && y != nil {
+		cx, cy = *x, *y
+	} else {
+		return CobrowseSessionStatus{}, fmt.Errorf("scroll requires selector or x and y")
+	}
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	if _, err := cdpCommand(port, "Input.dispatchMouseEvent", map[string]any{"type": "mouseWheel", "x": cx, "y": cy, "deltaX": dx, "deltaY": dy}); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	return s.status(), nil
+}
+
 // Extract reads the text content (and, optionally, named attribute values) of
 // the first element matching selector in one session's browser.
 func (m *CobrowseSessionManager) Extract(id, selector string, attrs []string) (ExtractResult, error) {
@@ -253,12 +364,8 @@ func (m *CobrowseSessionManager) Handoff(id string) (CobrowseSessionStatus, erro
 	return s.status(), nil
 }
 
-// Resume clears one session's sticky explicit-handoff bit. Idempotent. Note
-// this does NOT by itself guarantee agent-scripted actions are allowed
-// afterward: if a viewer is STILL attached (state == SessionAttached),
-// humanDrivingLocked remains true on that bit alone and writes stay refused
-// until the viewer disconnects too -- resume only releases an explicit claim,
-// it does not evict a live viewer. Mirrors CobrowseManager.Resume.
+// Resume clears the explicit handoff and restores agent actions even when a
+// viewer remains attached. The viewer can continue observing. Idempotent.
 func (m *CobrowseSessionManager) Resume(id string) (CobrowseSessionStatus, error) {
 	s, err := m.sessionForAction(id)
 	if err != nil {

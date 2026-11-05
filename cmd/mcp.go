@@ -20,6 +20,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/spf13/cobra"
 )
 
@@ -228,7 +229,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		mcpServer:   mcpServer,
 		endpointURL: selectMCPEndpoint(mcpEndpointURL, memoryCfg),
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout:   120 * time.Second,
+			Transport: platformhttp.New(apiURL, platformhttp.Options{}),
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},

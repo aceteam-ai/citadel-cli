@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // APIError is a non-2xx response from the Team Chat API. It preserves the
@@ -66,7 +68,7 @@ func NewClient(cfg ClientConfig) *Client {
 	return &Client{
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		token:      cfg.Token,
-		httpClient: &http.Client{Timeout: cfg.Timeout},
+		httpClient: &http.Client{Timeout: cfg.Timeout, Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{})},
 	}
 }
 

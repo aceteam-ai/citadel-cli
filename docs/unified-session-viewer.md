@@ -8,6 +8,10 @@ bare interactive use does not select this viewer or require its status socket.
 Whether a viewer should replace monitor-only Control Center is a separate
 product decision, not implied by this source child.
 
+The later [shared worker-detail child](shared-worker-detail.md) changes only
+Control Center's held-worker status path. It does not select this explicit
+viewer as the bare-command default or enlarge its status-response contract.
+
 This follows the founder correction in
 [#1109 comment 5769548189](https://github.com/aceteam-ai/citadel-cli/issues/1109#issuecomment-5769548189):
 the viewer is a client of the existing shared local control surface, not a new

@@ -228,21 +228,35 @@ func SessionControlStatusRequest(ctx context.Context, stateDir string) (*http.Re
 	return sessionControlRequest(ctx, stateDir, http.MethodGet, "/citadel/session/v1/status", true)
 }
 
+// SessionControlWorkerDetailRequest opts into the bounded worker projection on
+// the same protected local control socket. Redirects are never followed.
+func SessionControlWorkerDetailRequest(ctx context.Context, stateDir string) (*http.Response, error) {
+	return sessionControlRequest(ctx, stateDir, http.MethodGet, "/citadel/session/v1/worker-detail", true)
+}
+
 func sessionControlRequest(ctx context.Context, stateDir, method, route string, rejectRedirect bool) (*http.Response, error) {
 	path := LocalAPISocketPath(stateDir)
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return dialLocalControlRaw(ctx, path)
 	}}
 	defer transport.CloseIdleConnections()
+	return sessionControlRequestWithTransport(ctx, transport, method, route, rejectRedirect)
+}
+
+func sessionControlRequestWithTransport(ctx context.Context, transport http.RoundTripper, method, route string, rejectRedirect bool) (*http.Response, error) {
 	client := sessionControlHTTPClient(transport, rejectRedirect)
 	if rejectRedirect {
-		return sessionControlStatusRequestWithClient(ctx, client)
+		return sessionControlReadRequestWithClient(ctx, client, route)
 	}
 	return sessionControlRequestWithClient(ctx, client, method, route)
 }
 
 func sessionControlStatusRequestWithClient(ctx context.Context, client *http.Client) (*http.Response, error) {
-	return sessionControlRequestWithClient(ctx, client, http.MethodGet, "/citadel/session/v1/status")
+	return sessionControlReadRequestWithClient(ctx, client, "/citadel/session/v1/status")
+}
+
+func sessionControlReadRequestWithClient(ctx context.Context, client *http.Client, route string) (*http.Response, error) {
+	return sessionControlRequestWithClient(ctx, client, http.MethodGet, route)
 }
 
 func sessionControlHTTPClient(transport http.RoundTripper, rejectRedirect bool) *http.Client {

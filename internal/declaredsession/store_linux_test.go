@@ -81,6 +81,65 @@ func TestStoreReadonlyAndUnsafeInputs(t *testing.T) {
 	}
 }
 
+func TestHolderRecordContentionRetainsStateMarkerAndLogsForRetry(t *testing.T) {
+	_, session := fixtureStore(t)
+	initial := fixtureState()
+	if err := session.WriteState(initial); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := session.acquire(context.Background(), "record.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.close()
+	// The holder configures its private handle before any reader/actor starts.
+	session.recordWait = holderRecordWait
+	logs, err := session.OpenLogs(defaultDeclaration().Log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := initial
+	changed.Phase = "stopped_clean"
+	marker := StopMarker{Version: 1, Name: initial.Name, Incarnation: initial.Incarnation, DeclarationRevision: initial.DeclarationRevision, StoppedAt: time.Unix(1, 0)}
+	event := Event{Kind: "stop", At: time.Unix(1, 0), Incarnation: initial.Incarnation, Reason: "operator_stop"}
+	writers := []func() error{
+		func() error { return session.WriteState(changed) },
+		func() error { return session.WriteStopMarker(marker) },
+		func() error { return logs.AppendConsole([]byte("exact console bytes")) },
+		func() error { return logs.AppendEvent(event) },
+	}
+	for _, write := range writers {
+		if err := write(); !errors.Is(err, ErrBusy) {
+			t.Fatal("held record lock was not retryable contention", err)
+		}
+	}
+	if stored, present, err := session.ReadState(); err != nil || !present || stored.Phase != "running" {
+		t.Fatal("busy holder write replaced the prior state", stored, err)
+	}
+	if _, present, err := session.ReadStopMarker(); err != nil || present {
+		t.Fatal("busy marker append appeared durable", err)
+	}
+	for _, kind := range []LogKind{ConsoleLog, EventsLog} {
+		if raw, err := session.ReadLogTail(kind, 1024); err != nil || len(raw) != 0 {
+			t.Fatal("busy holder append wrote log bytes", kind, err)
+		}
+	}
+	if err := guard.close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, write := range writers {
+		if err := write(); err != nil {
+			t.Fatal("released record lock did not accept exact retry", err)
+		}
+	}
+	if raw, err := session.ReadLogTail(ConsoleLog, 1024); err != nil || string(raw) != "exact console bytes" {
+		t.Fatal("console retry changed or duplicated bytes", string(raw), err)
+	}
+	if raw, err := session.ReadLogTail(EventsLog, 1024); err != nil || bytes.Count(raw, []byte("\n")) != 1 {
+		t.Fatal("event retry duplicated or omitted an event", string(raw), err)
+	}
+}
+
 func TestPrivateMetadataOwnerTypeLinkAndMode(t *testing.T) {
 	good := unix.Stat_t{Mode: unix.S_IFREG | 0600, Uid: 123, Nlink: 1}
 	if !privateFileStat(good, 123) {

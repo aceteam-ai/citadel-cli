@@ -139,7 +139,7 @@ func runGit(ctx context.Context, gitPath string, repo *os.File, args ...string) 
 	cmd.WaitDelay = time.Second
 	// No inherited GIT_*, loader variables, credentials, HOME config, pager,
 	// PATH lookup or caller-provided environment enters the child.
-	cmd.Env = []string{"LC_ALL=C", "LANG=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_NO_REPLACE_OBJECTS=1", "GIT_ATTR_NOSYSTEM=1"}
+	cmd.Env = []string{"LC_ALL=C", "LANG=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_NO_REPLACE_OBJECTS=1", "GIT_ATTR_NOSYSTEM=1", "GIT_NO_LAZY_FETCH=1"}
 	var out limitedOutput
 	var exceeded bool
 	// stdout/stderr may be copied concurrently. Stderr is discarded and never

@@ -52,6 +52,7 @@ const (
 	maxConsoleBatchBytes = 256 << 10
 	maxPendingEvents     = 128
 	consoleFlushInterval = 50 * time.Millisecond
+	holderRecordWait     = 50 * time.Millisecond
 )
 
 type holder struct {
@@ -183,6 +184,12 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	if session.WriteState(state) != nil {
 		return ErrUnavailable
 	}
+	// Startup publication is fatal on failure and keeps the ordinary manager
+	// budget while recordManagerLaunch may still own the record lock. Only
+	// subsequent actor writes retain pending records on ErrBusy. Select their
+	// short budget before this handle is published to any holder goroutine.
+	// This bounds lock contention, not filesystem or fsync I/O.
+	session.recordWait = holderRecordWait
 	listener, err := listenHolder(session)
 	if err != nil {
 		return err
@@ -278,7 +285,7 @@ func (h *holder) event(kind, reason, viewer, role string) {
 		if h.terminal != nil {
 			h.terminal.epoch.Store(h.epoch)
 		}
-		h.state.Phase = "cleanup_unconfirmed"
+		h.state.Phase = "event_queue_overflow"
 		h.statePending = true
 		return
 	}
@@ -508,7 +515,7 @@ func (h *holder) startDueChild(now time.Time) {
 	h.nextSpawn = time.Time{}
 	if h.startChild() != nil && h.child == nil {
 		h.quarantined = true
-		h.state.Phase = "cleanup_unconfirmed"
+		h.state.Phase = "spawn_failed"
 		h.writeState()
 	}
 }

@@ -18,14 +18,21 @@
 package platform
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -136,12 +143,8 @@ func TestCobrowseSessionActions_ResumeRestoresAIControl(t *testing.T) {
 	}
 }
 
-// TestCobrowseSessionActions_MarkAttachedRefusesWrites pins the #978 interop
-// rule's PRESENCE half: a viewer attaching (the #794 screencast hook,
-// MarkAttached) alone -- with NO separate explicit handoff call -- already
-// refuses agent-scripted writes, satisfying "an agent write must be refused
-// while a human is attached" literally.
-func TestCobrowseSessionActions_MarkAttachedRefusesWrites(t *testing.T) {
+// A viewer may observe without taking control or blocking agent actions.
+func TestCobrowseSessionActions_MarkAttachedAllowsAgentWrites(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -157,11 +160,14 @@ func TestCobrowseSessionActions_MarkAttachedRefusesWrites(t *testing.T) {
 	if got.State != SessionAttached {
 		t.Fatalf("expected attached state, got %q", got.State)
 	}
-	if got.Driver != DriverHuman {
-		t.Errorf("an attached viewer should report driver=human, got %q", got.Driver)
+	if got.Driver != DriverAI {
+		t.Errorf("an observing viewer should report driver=ai, got %q", got.Driver)
 	}
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Errorf("type while a viewer is attached: got %v, want ErrHandedOff", err)
+	if m.ViewerHasControl(st.ID) {
+		t.Error("observing viewer has input control")
+	}
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Errorf("type while observing was blocked: %v", err)
 	}
 }
 
@@ -181,8 +187,8 @@ func TestCobrowseSessionActions_DetachWithoutExplicitHandoffRestoresAIControl(t 
 		t.Fatalf("start: %v", err)
 	}
 	m.MarkAttached(st.ID)
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Fatalf("type while attached: got %v, want ErrHandedOff", err)
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Fatalf("type while observing was blocked: %v", err)
 	}
 
 	if !m.MarkDetached(st.ID) {
@@ -243,11 +249,8 @@ func TestCobrowseSessionActions_ExplicitHandoffSurvivesDetach(t *testing.T) {
 	}
 }
 
-// TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused
-// checks resume only releases the EXPLICIT bit: while a viewer is STILL
-// attached, resume succeeds (idempotent, no error) but writes remain refused
-// until that viewer also detaches -- resume does not evict a live viewer.
-func TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused(t *testing.T) {
+// Resume restores the agent and revokes viewer input with the tab still open.
+func TestCobrowseSessionActions_ResumeWhileStillAttachedRestoresAgent(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -257,21 +260,29 @@ func TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused(t *te
 		t.Fatalf("start: %v", err)
 	}
 	m.MarkAttached(st.ID)
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatalf("handoff: %v", err)
+	}
+	if !m.ViewerHasControl(st.ID) {
+		t.Fatal("viewer should have control after explicit handoff")
+	}
 	resumed, err := m.Resume(st.ID)
 	if err != nil {
 		t.Fatalf("resume while attached should succeed (idempotent): %v", err)
 	}
-	if resumed.Driver != DriverHuman {
-		t.Errorf("driver while a viewer is still attached = %q, want %q (resume does not evict a viewer)", resumed.Driver, DriverHuman)
+	if resumed.Driver != DriverAI {
+		t.Errorf("driver after resume with viewer attached = %q, want %q", resumed.Driver, DriverAI)
 	}
 	if resumed.State != SessionAttached {
 		t.Errorf("resume must not change the attach/view state, got %q", resumed.State)
 	}
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Errorf("type while still attached (post-resume): got %v, want ErrHandedOff", err)
+	if m.ViewerHasControl(st.ID) {
+		t.Error("viewer retained input control after resume")
+	}
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Errorf("type after resume was blocked: %v", err)
 	}
 
-	// Detaching the viewer is what finally allows writes again.
 	m.MarkDetached(st.ID)
 	got, _ := m.SessionStatus(st.ID)
 	if got.Driver != DriverAI {
@@ -575,6 +586,102 @@ func TestCobrowseSessionActions_TypeSendsInsertText(t *testing.T) {
 	}
 	if calls[0].Params["text"] != "hello world" {
 		t.Errorf("insertText text = %v, want %q", calls[0].Params["text"], "hello world")
+	}
+}
+
+func TestCobrowseSessionActions_SelectUsesPageSetterAndReportsValue(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, "dispatchEvent(new Event(\"change\"") {
+			t.Errorf("select must set the native value and fire change, got %q", expr)
+		}
+		if !strings.Contains(expr, `if (el.matches(":disabled") || !option`) {
+			t.Errorf("select must reject effective disabled state, including fieldset inheritance, got %q", expr)
+		}
+		return map[string]any{"value": "VT", "label": "Vermont"}
+	}
+	f.mu.Unlock()
+	got, err := m.Select(st.ID, "#state", "VT", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Value != "VT" || got.Label != "Vermont" {
+		t.Fatalf("selected = %#v", got)
+	}
+	if len(f.callsFor("Input.dispatchMouseEvent")) != 0 {
+		t.Fatal("native select must not click the popup")
+	}
+}
+
+func TestCobrowseSessionActions_SelectRespectsFieldsetDisabledState(t *testing.T) {
+	chrome, err := exec.LookPath("google-chrome")
+	if err != nil {
+		chrome, err = exec.LookPath("chromium")
+	}
+	if err != nil {
+		t.Skip("local Chromium is unavailable")
+	}
+
+	m, st, f := startSessionOnFakeCDP(t)
+	var expressions []string
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		expressions = append(expressions, expr)
+		return map[string]any{"value": "VT", "label": "Vermont"}
+	}
+	f.mu.Unlock()
+	for _, selector := range []string{"#blocked", "#allowed"} {
+		if _, err := m.Select(st.ID, selector, "VT", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(expressions) != 2 {
+		t.Fatalf("captured %d select expressions, want 2", len(expressions))
+	}
+
+	page := fmt.Sprintf(`<html><body>
+	<fieldset disabled>
+	  <legend><select id="allowed"><option value="NY">New York</option><option value="VT">Vermont</option></select></legend>
+	  <select id="blocked"><option value="NY">New York</option><option value="VT">Vermont</option></select>
+	</fieldset>
+	<script>
+	const blocked = %s;
+	const allowed = %s;
+	document.body.dataset.testResult = [blocked.error || "", allowed.value || "", document.getElementById("blocked").value, document.getElementById("allowed").value].join("|");
+	</script></body></html>`, expressions[0], expressions[1])
+	path := filepath.Join(t.TempDir(), "select.html")
+	if err := os.WriteFile(path, []byte(page), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pageURL := (&url.URL{Scheme: "file", Path: path}).String()
+	output, err := exec.CommandContext(ctx, chrome, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--dump-dom", pageURL).CombinedOutput()
+	if err != nil {
+		t.Fatalf("local Chromium failed: %v: %s", err, output)
+	}
+	if !strings.Contains(string(output), `data-test-result="enabled option not found|VT|NY|VT"`) {
+		t.Fatalf("fieldset-disabled select changed or first-legend select was blocked: %s", output)
+	}
+}
+
+func TestCobrowseSessionActions_KeyAndScrollSendRealInput(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	if _, err := m.Key(st.ID, "ArrowDown"); err != nil {
+		t.Fatal(err)
+	}
+	keys := f.callsFor("Input.dispatchKeyEvent")
+	if len(keys) != 2 || keys[0].Params["type"] != "rawKeyDown" || keys[1].Params["type"] != "keyUp" {
+		t.Fatalf("key events = %#v", keys)
+	}
+	x, y := 10.0, 20.0
+	if _, err := m.Scroll(st.ID, "", &x, &y, 0, 180); err != nil {
+		t.Fatal(err)
+	}
+	mouse := f.callsFor("Input.dispatchMouseEvent")
+	if len(mouse) != 1 || mouse[0].Params["type"] != "mouseWheel" || mouse[0].Params["deltaY"] != float64(180) {
+		t.Fatalf("wheel = %#v", mouse)
 	}
 }
 

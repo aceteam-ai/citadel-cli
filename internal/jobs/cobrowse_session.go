@@ -52,6 +52,9 @@ const (
 	CobrowseSessionActionScreenshot = "screenshot"
 	CobrowseSessionActionClick      = "click"
 	CobrowseSessionActionType       = "type"
+	CobrowseSessionActionSelect     = "select"
+	CobrowseSessionActionKey        = "key"
+	CobrowseSessionActionScroll     = "scroll"
 	CobrowseSessionActionExtract    = "extract"
 	// Driver arbitration actions (issue #978): hand a session's scripting
 	// control to the human, or return it to the agent.
@@ -184,6 +187,55 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 			return nil, fmt.Errorf("type requires a 'text' field")
 		}
 		st, err := mgr.Type(id, text)
+		if err != nil {
+			return nil, err
+		}
+		return sessionStatusResult(st)
+
+	case CobrowseSessionActionSelect:
+		id, selector := job.Payload["session_id"], job.Payload["selector"]
+		value, label := job.Payload["value"], job.Payload["label"]
+		if id == "" || selector == "" || (value == "" && label == "") || (value != "" && label != "") {
+			return nil, fmt.Errorf("select requires session_id, selector, and exactly one of value or label")
+		}
+		selected, err := mgr.Select(id, selector, value, label)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(selected)
+
+	case CobrowseSessionActionKey:
+		id, key := job.Payload["session_id"], job.Payload["key"]
+		if id == "" || key == "" {
+			return nil, fmt.Errorf("key requires session_id and key")
+		}
+		st, err := mgr.Key(id, key)
+		if err != nil {
+			return nil, err
+		}
+		return sessionStatusResult(st)
+
+	case CobrowseSessionActionScroll:
+		id := job.Payload["session_id"]
+		if id == "" {
+			return nil, fmt.Errorf("scroll requires session_id")
+		}
+		dx, err := strconv.ParseFloat(job.Payload["dx"], 64)
+		if err != nil {
+			return nil, fmt.Errorf("scroll requires numeric dx: %w", err)
+		}
+		dy, err := strconv.ParseFloat(job.Payload["dy"], 64)
+		if err != nil {
+			return nil, fmt.Errorf("scroll requires numeric dy: %w", err)
+		}
+		x, y, hasCoords, err := parseClickCoords(job.Payload)
+		if err != nil {
+			return nil, err
+		}
+		if job.Payload["selector"] == "" && !hasCoords {
+			return nil, fmt.Errorf("scroll requires selector or both x and y")
+		}
+		st, err := mgr.Scroll(id, job.Payload["selector"], x, y, dx, dy)
 		if err != nil {
 			return nil, err
 		}

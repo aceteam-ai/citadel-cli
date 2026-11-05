@@ -20,10 +20,7 @@
 package update
 
 import (
-	"encoding/json"
-	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -43,32 +40,17 @@ const (
 	ResultDownloadFailed       = "download_failed"        // download or checksum verification failed
 	ResultDrainDeferred        = "drain_deferred"         // could not reach idle to swap this cycle
 	ResultApplyFailed          = "apply_failed"           // the in-place binary swap failed
+	ResultApplyNotPermitted    = "apply_not_permitted"    // install authority/capability preflight refused
 	ResultRestartPending       = "restart_pending"        // applied/staged; not yet proven running
 	ResultRestartFailed        = "restart_failed"         // swap applied but the restart call failed
 	ResultManualUpdateRequired = "manual_update_required" // homebrew/desktop-managed; can't self-swap
-	ResultUnknown              = "unknown"                // state unreadable/corrupt; degrade, don't guess
+	ResultStateCorrupt         = "state_corrupt"          // persisted state unreadable/corrupt; paused until explicit repair
+	ResultUnknown              = "unknown"                // historical/otherwise unclassified result
 )
 
-// stateMu serializes the load-modify-save of state.json so a preference write
-// (`citadel update enable/disable`) and a telemetry result write never clobber
-// one another. A result write only ever touches the telemetry fields; each
-// load-modify-save preserves every other field it read.
-var stateMu sync.Mutex
-
-// mutateState atomically loads state.json, applies mutate, and saves it, under
-// stateMu. A missing or unreadable file degrades to a fresh default before
-// mutate runs. Best-effort: the error is returned for tests, but production
-// callers ignore it — telemetry must never interrupt the worker.
-func mutateState(mutate func(*State)) error {
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	state, err := LoadState()
-	if err != nil || state == nil {
-		state = defaultState()
-	}
-	mutate(state)
-	return SaveState(state)
-}
+// mutateState keeps result writers on the same cross-process transaction as
+// explicit preference changes. Errors leave unreadable/corrupt state untouched.
+func mutateState(mutate func(*State)) error { return MutateState(mutate) }
 
 // RecordCheckResult atomically records one auto-update attempt outcome into
 // state.json, preserving the preference fields (AutoUpdate/Channel). checked
@@ -82,6 +64,20 @@ func RecordCheckResult(now time.Time, result string, checked bool, latest string
 		s.LastResultAt = now
 		if checked {
 			s.LastCheckAt = now
+		}
+		if latest != "" {
+			s.LatestVersion = latest
+		}
+	})
+}
+
+func RecordApplyNotPermitted(now time.Time, capability SelfUpdateCapability, checked bool, latest string) error {
+	return mutateState(func(s *State) {
+		s.LastResult = ResultApplyNotPermitted
+		s.LastResultAt = now.UTC()
+		s.LastApplyCapability = &capability
+		if checked {
+			s.LastCheckAt = now.UTC()
 		}
 		if latest != "" {
 			s.LatestVersion = latest
@@ -110,18 +106,19 @@ func RecordStagedUpdate(now time.Time, newVersion string) error {
 
 // ReconcilePendingOnStartup reconciles a persisted restart-pending state with
 // the compiled running version at worker startup. When the staged
-// CurrentVersion now equals the running binary, the restart succeeded, so a
+// CurrentVersion is equal to or older than the running binary, a
 // lingering restart_pending/restart_failed result is cleared to up_to_date (the
-// staged version is now current). When they differ (restart failed, still on
-// the old binary), nothing is cleared — pending_version/restart_required remain
-// computed from the mismatch by the snapshot builder. Best-effort; corrupt
+// staged version is no longer pending). A strictly newer staged version retains
+// its restart result. Invalid version metadata is never proof of recovery.
+// Best-effort; corrupt
 // state is left untouched (never repaired into a confident report).
 func ReconcilePendingOnStartup(now time.Time, runningVersion string) error {
 	state, corrupt := ReadStateForReport()
 	if corrupt || state == nil {
 		return nil
 	}
-	if state.CurrentVersion == "" || !VersionsEqual(state.CurrentVersion, runningVersion) {
+	relation, err := CompareReleaseVersions(state.CurrentVersion, runningVersion)
+	if err != nil || relation == TargetNewer {
 		return nil
 	}
 	if state.LastResult != ResultRestartPending && state.LastResult != ResultRestartFailed {
@@ -130,7 +127,8 @@ func ReconcilePendingOnStartup(now time.Time, runningVersion string) error {
 	now = now.UTC()
 	return mutateState(func(s *State) {
 		// Re-check under the lock: a concurrent write may have changed things.
-		if VersionsEqual(s.CurrentVersion, runningVersion) &&
+		relation, err := CompareReleaseVersions(s.CurrentVersion, runningVersion)
+		if err == nil && relation != TargetNewer &&
 			(s.LastResult == ResultRestartPending || s.LastResult == ResultRestartFailed) {
 			s.LastResult = ResultUpToDate
 			s.LastResultAt = now
@@ -142,27 +140,24 @@ func ReconcilePendingOnStartup(now time.Time, runningVersion string) error {
 // a corrupt/unreadable file (corrupt=true, so the caller reports "unknown"
 // rather than a confident disabled) from a cleanly-absent one (corrupt=false,
 // default-off state — auto-update is opt-in, so an absent file legitimately
-// means disabled). Unlike LoadState it does not swallow a corrupt file into a
-// default, and it never writes or repairs the file.
+// means disabled). It shares LoadState's strict decoding and never writes or repairs the file.
 func ReadStateForReport() (state *State, corrupt bool) {
-	data, err := os.ReadFile(GetStateFilePath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return defaultState(), false
-		}
-		return nil, true
-	}
-	var st State
-	if err := json.Unmarshal(data, &st); err != nil {
-		return nil, true
-	}
-	return &st, false
+	state, err := LoadState()
+	return state, err != nil
 }
 
 // VersionsEqual compares two version strings ignoring a leading "v" and
 // surrounding whitespace, matching agentNodeInfo's #923 pending-version check.
 func VersionsEqual(a, b string) bool {
 	return strings.TrimPrefix(strings.TrimSpace(a), "v") == strings.TrimPrefix(strings.TrimSpace(b), "v")
+}
+
+// StagedVersionIsNewer reports a pending release only when both identities
+// have valid SemVer metadata and the staged release is strictly newer. A stale
+// state file from another install must not demand a restart onto an older binary.
+func StagedVersionIsNewer(staged, running string) bool {
+	relation, err := CompareReleaseVersions(staged, running)
+	return err == nil && relation == TargetNewer
 }
 
 // ReportSnapshot is the source-of-truth shape of the heartbeat auto_update
@@ -184,6 +179,10 @@ type ReportSnapshot struct {
 	LatestVersion     string     `json:"latest_version,omitempty"`
 	LastResultAt      *time.Time `json:"last_result_at,omitempty"`
 	LastResult        string     `json:"last_result"`
+	SelfUpdate        string     `json:"self_update,omitempty"`
+	InstallDirectory  string     `json:"install_directory,omitempty"`
+	BinaryOwner       string     `json:"binary_owner,omitempty"`
+	WorkerUser        string     `json:"worker_user,omitempty"`
 }
 
 // ReportCache holds the latest ReportSnapshot behind an atomic pointer so the

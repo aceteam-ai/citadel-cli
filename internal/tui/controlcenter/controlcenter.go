@@ -21,6 +21,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/session"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -138,6 +139,12 @@ type StatusData struct {
 	WorkerQueue   string
 	Queues        []QueueInfo // All subscribed queues
 	RecentJobs    []JobRecord // Last N jobs processed
+	// SharedWorker selects observations from the external worker's shared
+	// control surface. A nil detail is unavailable, never a healthy zero.
+	SharedWorker           bool
+	WorkerOwnerChanged     bool // Latched until the local monitor is restarted.
+	WorkerDetail           *status.WorkerDetail
+	WorkerDetailObservedAt time.Time // Local successful receipt, not peer clock.
 
 	// Heartbeat status
 	HeartbeatActive bool
@@ -567,6 +574,10 @@ type ControlCenter struct {
 	peersView    *tview.Table
 	statusBar    *tview.TextView
 	helpBar      *tview.TextView
+
+	// An open external-worker modal refreshes with the ordinary panels so a
+	// failed observation clears it too, rather than freezing a healthy snapshot.
+	sharedWorkerDetailView *tview.TextView
 
 	// State
 	activities     []ActivityEntry
@@ -2069,6 +2080,7 @@ func (cc *ControlCenter) updateAllPanels() {
 	cc.updatePeersView()
 	cc.updateActivityView()
 	cc.updateStatusBar()
+	cc.updateSharedWorkerDetailModal()
 }
 
 // Action definitions for the actions table
@@ -2215,7 +2227,7 @@ func (cc *ControlCenter) updateNodePanel() {
 			agoStr = fmt.Sprintf("%dm ago", int(ago.Minutes()))
 		}
 		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [green]%s[-] %s\n", Glyph(MarkerActive), agoStr))
-	} else if cc.data.WorkerRunning {
+	} else if cc.data.WorkerRunning && !cc.data.SharedWorker {
 		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [gray]%s[-] starting...\n", Glyph(MarkerInactive)))
 	}
 
@@ -2463,6 +2475,10 @@ func (cc *ControlCenter) updateServicesView() {
 }
 
 func (cc *ControlCenter) updateJobsPanel() {
+	if cc.data.SharedWorker {
+		cc.jobsPanel.SetText(renderSharedWorkerStatus(cc.data, time.Now()))
+		return
+	}
 	var sb strings.Builder
 
 	// Worker status - prominent at top
@@ -2758,7 +2774,7 @@ func (cc *ControlCenter) getContextualSuggestion() string {
 	}
 
 	// Worker not running but connected - suggest starting worker
-	if cc.data.Connected && !cc.data.WorkerRunning {
+	if cc.data.Connected && !cc.data.WorkerRunning && !cc.data.SharedWorker {
 		return "Worker not running - jobs won't be processed on this node"
 	}
 
@@ -3278,6 +3294,9 @@ func (cc *ControlCenter) getVitalsText() string {
 
 // getJobsText returns plain text representation of jobs panel
 func (cc *ControlCenter) getJobsText() string {
+	if cc.data.SharedWorker {
+		return sharedWorkerStatusText(cc.data, time.Now())
+	}
 	var sb strings.Builder
 	if cc.data.WorkerRunning {
 		sb.WriteString("Worker: ACTIVE\n")

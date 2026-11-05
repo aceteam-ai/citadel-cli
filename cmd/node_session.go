@@ -13,14 +13,25 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/spf13/cobra"
 )
 
 const (
-	sessionStatusRoute = "/citadel/session/v1/status"
-	sessionStopRoute   = "/citadel/session/v1/stop"
+	sessionStatusRoute       = "/citadel/session/v1/status"
+	sessionStopRoute         = "/citadel/session/v1/stop"
+	sessionWorkerDetailRoute = "/citadel/session/v1/worker-detail"
 )
+
+// The function values are fixed before the controller is published and shared
+// with the worker's existing heartbeat collector. They read live in-memory state
+// only; a nil provider/result remains unknown. No collector is constructed here.
+type nodeSessionWorkerProviders struct {
+	Worker func() *status.WorkerLiveness
+	Swap   func() *status.SwapActivity
+	Lanes  func() []status.LaneActivity
+}
 
 type nodeSessionStatus struct {
 	Mode      nodesession.Mode `json:"mode"`
@@ -32,11 +43,11 @@ type nodeSessionStatus struct {
 	UptimeSec int64            `json:"uptime_seconds"`
 }
 
-// startNodeSessionControl serves only two S2 verbs over the exact existing
+// startNodeSessionControl serves S2 verbs over the exact existing
 // localapi path. The OS-enforced 0600 socket / admin-only Windows named pipe is
 // the authority boundary; no unauthenticated loopback or mesh HTTP listener is
 // added. S3 will add client attach; S5 will add mode changes.
-func startNodeSessionControl(mode nodesession.Mode, cancel context.CancelFunc) (func(), error) {
+func startNodeSessionControl(mode nodesession.Mode, cancel context.CancelFunc, providers ...nodeSessionWorkerProviders) (func(), error) {
 	mesh := network.Global()
 	if mesh == nil || mesh.Mode() != network.ModeUserspace {
 		return nil, errors.New("node session control requires an owned userspace mesh; machine-wide TUN is separate")
@@ -51,16 +62,21 @@ func startNodeSessionControl(mode nodesession.Mode, cancel context.CancelFunc) (
 			status.MeshIP = ip
 		}
 		return status
-	})
+	}, providers...)
 }
 
-func serveNodeSessionControl(stateDir string, mode nodesession.Mode, cancel context.CancelFunc, liveStatus func(context.Context) nodeSessionStatus) (func(), error) {
+func serveNodeSessionControl(stateDir string, mode nodesession.Mode, cancel context.CancelFunc, liveStatus func(context.Context) nodeSessionStatus, providers ...nodeSessionWorkerProviders) (func(), error) {
 	ln, err := network.ListenSessionControl(stateDir)
 	if err != nil {
 		return nil, err
 	}
 	started := time.Now()
+	var workerProviders nodeSessionWorkerProviders
+	if len(providers) > 0 {
+		workerProviders = providers[0]
+	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+sessionWorkerDetailRoute, nodeSessionWorkerDetailHandler(mode, liveStatus, workerProviders, started, time.Now))
 	mux.HandleFunc("GET "+sessionStatusRoute, func(w http.ResponseWriter, r *http.Request) {
 		status := liveStatus(r.Context())
 		status.Mode, status.Version, status.PID, status.UptimeSec = mode, Version, os.Getpid(), int64(time.Since(started).Seconds())
@@ -90,6 +106,39 @@ func serveNodeSessionControl(stateDir string, mode nodesession.Mode, cancel cont
 	// The caller closes the controller before dropping its worklock and mesh
 	// holder, so a TUN process cannot seize the endpoint during cleanup.
 	return stop, nil
+}
+
+// The full detail is validated and serialized before writing any success bytes.
+// Overflow or invalid provider data cannot become a partial healthy response.
+func nodeSessionWorkerDetailHandler(mode nodesession.Mode, liveStatus func(context.Context) nodeSessionStatus, providers nodeSessionWorkerProviders, started time.Time, now func() time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		identity := liveStatus(r.Context())
+		observed := now()
+		detail := status.WorkerDetail{
+			Mode: string(mode), Connected: identity.Connected,
+			NodeName: identity.NodeName, MeshIP: identity.MeshIP,
+			Version: Version, PID: os.Getpid(),
+			UptimeSec: int64(observed.Sub(started).Seconds()), ObservedAt: observed.UTC(),
+		}
+		if providers.Worker != nil {
+			detail.Worker = providers.Worker()
+		}
+		if providers.Swap != nil {
+			detail.Swap = providers.Swap()
+		}
+		if providers.Lanes != nil {
+			detail.Lanes = providers.Lanes()
+		}
+		raw, err := status.EncodeWorkerDetail(detail)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("{\"error\":\"worker detail unavailable\"}"))
+			return
+		}
+		_, _ = w.Write(raw)
+	}
 }
 
 // runPresence is structurally unable to subscribe a queue: it only takes the

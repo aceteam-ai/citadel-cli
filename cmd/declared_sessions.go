@@ -125,6 +125,9 @@ func newDeclaredSessionsCommand(open declaredManagerFactory) *cobra.Command {
 				case "restart":
 					result, err = manager.Restart(ctx, names[0])
 				}
+				if status, ok := result.(declaredsession.ManagedStatus); ok && status.Classification == "recovery_incomplete" {
+					err = errors.Join(err, errors.New("session recovery is incomplete; use citadel sessions stop, then citadel sessions start with the same session name and node-config-dir selection"))
+				}
 				// Failed observations still carry useful static classifications.
 				writeErr := json.NewEncoder(cmd.OutOrStdout()).Encode(result)
 				return errors.Join(err, writeErr, closeStore())

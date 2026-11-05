@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // ErrAPIUnreachable is returned when the AceTeam API cannot be reached.
@@ -42,7 +43,9 @@ func CheckAPIReachable(baseURL string) error {
 		return fmt.Errorf("%w: %v", ErrAPIUnreachable, err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := platformhttp.WithTransport(baseURL, http.DefaultClient)
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		return classifyNetworkError(err, baseURL)
 	}
@@ -282,7 +285,8 @@ func NewDeviceAuthClient(baseURL string) *DeviceAuthClient {
 	return &DeviceAuthClient{
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout:   15 * time.Second,
+			Transport: platformhttp.New(baseURL, platformhttp.Options{}),
 			// Device codes authorize credential minting and must not be replayed
 			// to a redirect target. Endpoint changes must be explicit.
 			CheckRedirect: func(*http.Request, []*http.Request) error {

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // ReclaimResult holds the outcome of a node reclamation attempt.
@@ -52,7 +54,7 @@ func ReclaimStaleNode(ctx context.Context, baseURL, apiToken, hostname string) (
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpClient := &http.Client{Timeout: 15 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{})}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)

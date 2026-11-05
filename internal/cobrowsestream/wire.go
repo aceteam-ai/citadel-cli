@@ -47,8 +47,10 @@ func (m InitMessage) Marshal() ([]byte, error) { return json.Marshal(m) }
 
 // Input message "type" values a viewer sends as TEXT JSON frames.
 const (
-	InputTypeMouse = "mouse"
-	InputTypeKey   = "key"
+	InputTypeMouse       = "mouse"
+	InputTypeKey         = "key"
+	InputTypeSelectProbe = "select_probe"
+	InputTypeSelect      = "select"
 )
 
 // InputMessage is a TEXT frame the viewer sends to drive the session. Unknown
@@ -81,6 +83,8 @@ type InputMessage struct {
 	Text      string `json:"text,omitempty"`      // text produced (for keyDown/char)
 	KeyCode   int    `json:"keyCode,omitempty"`   // windowsVirtualKeyCode
 	Modifiers int    `json:"modifiers,omitempty"` // CDP modifiers bitmask (alt=1,ctrl=2,meta=4,shift=8)
+	Value     string `json:"value,omitempty"`     // native select option value (select only)
+	ProbeID   string `json:"probe_id,omitempty"`  // viewer correlation for select_probe replies
 }
 
 // parseInputMessage decodes a viewer TEXT frame. It returns ok=false when the
@@ -91,7 +95,7 @@ func parseInputMessage(data []byte) (InputMessage, bool) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return InputMessage{}, false
 	}
-	if m.Type != InputTypeMouse && m.Type != InputTypeKey {
+	if m.Type != InputTypeMouse && m.Type != InputTypeKey && m.Type != InputTypeSelectProbe && m.Type != InputTypeSelect {
 		return InputMessage{}, false
 	}
 	return m, true

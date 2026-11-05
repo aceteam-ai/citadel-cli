@@ -557,6 +557,15 @@ func (f *videoComposeFake) run(_ context.Context, bin string, args []string) (vi
 	}
 	m := f.media[input]
 	if concat {
+		xerror := false
+		for _, arg := range args {
+			if arg == "-xerror" {
+				xerror = true
+			}
+		}
+		if !xerror {
+			f.t.Fatal("concat must fail on demux errors instead of returning truncated success")
+		}
 		if !strings.Contains(strings.Join(args, " "), "-format_whitelist concat,mov -f concat -safe 1 -i ") {
 			f.t.Fatal("concat inner demuxers are not restricted")
 		}

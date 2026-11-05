@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -359,7 +361,7 @@ and system user configuration (requires sudo).`,
 					}
 				} else {
 					// Do not mistake a saved bearer for a completed current-key link.
-					printDeviceLinkDiagnostic(os.Stderr, getDeviceConfigFromFile())
+					printDeviceLinkDiagnosticContext(cmd.Context(), os.Stderr, getDeviceConfigFromFile())
 				}
 
 				// Get node name from network status
@@ -1499,7 +1501,7 @@ func generateCitadelConfig(user, nodeName, serviceName, orgID string) (string, e
 	}
 
 	// Always write all available service definitions to allow for easy switching later.
-	for name, content := range services.ServiceMap {
+	for name, content := range services.ComposeMapForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose) {
 		filePath := filepath.Join(servicesDir, name+".yml")
 		if err := os.WriteFile(filePath, []byte(content), 0600); err != nil {
 			return "", err
@@ -2006,7 +2008,7 @@ func ensureNodeIdentityWithStore(store *nodeidentity.Store, baseURL string) {
 	// stalls the init happy path. 503 (CA not activated) degrades silently.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{})}
 	if err := store.FetchCAChain(ctx, baseURL, client); err != nil {
 		Debug("fabric CA chain fetch skipped (non-fatal): %v", err)
 		return

@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // authkeyResponse is the JSON body returned by POST /api/fabric/authkey/generate.
@@ -73,7 +75,9 @@ func FetchFreshAuthkey(ctx context.Context, apiBaseURL, deviceAPIToken string) (
 	req.Header.Set("Authorization", "Bearer "+deviceAPIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := platformhttp.WithTransport(apiBaseURL, http.DefaultClient)
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		// Classify the network error for clearer diagnostics
 		if isConnectivityError(err) {
