@@ -506,7 +506,8 @@ type NodeCapabilities struct {
 	//
 	// This is distinct from Engines above:
 	//   - AvailableServices = embedded services runnable under host policy,
-	//     including unknown GPU evidence. Sorted for deterministic output.
+	//     including unknown GPU evidence and an already-serving adoptable vLLM.
+	//     Sorted for deterministic output.
 	//   - Engines = engines currently detected/running on the node.
 	// Both can overlap in value (e.g. "vllm"); they answer different questions.
 	// Emitted under the "available_services" key so it never collides with the

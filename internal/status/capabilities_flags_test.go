@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -266,5 +267,36 @@ func TestPopulateServicesWithholdsCUDAOnlyOnPositiveAbsence(t *testing.T) {
 		if !set["ollama"] || !set["llamacpp"] {
 			t.Fatal("CPU variants missing")
 		}
+	}
+}
+
+func TestPopulateServicesRetainsOnlyLiveServingVLLM(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		service ServiceInfo
+		want    bool
+	}{
+		{name: "serving", service: ServiceInfo{Name: "vllm", Status: ServiceStatusRunning, Health: HealthStatusOK, Port: 58000}, want: true},
+		{name: "stopped", service: ServiceInfo{Name: "vllm", Status: "stopped", Health: HealthStatusOK, Port: 58000}},
+		{name: "starting", service: ServiceInfo{Name: "vllm", Status: ServiceStatusRunning, Health: HealthStatusStarting, Port: 58000}},
+		{name: "unconfirmed", service: ServiceInfo{Name: "vllm", Status: ServiceStatusRunning, Port: 58000}},
+		{name: "no endpoint", service: ServiceInfo{Name: "vllm", Status: ServiceStatusRunning, Health: HealthStatusOK}},
+		{name: "not adoptable", service: ServiceInfo{Name: "sglang", Status: ServiceStatusRunning, Health: HealthStatusOK, Port: 58000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			caps := &NodeCapabilities{Engines: []string{"vllm"}}
+			populateServices(caps, "linux", func() int { return 0 }, tc.service)
+			if slices.Contains(caps.AvailableServices, "vllm") != tc.want {
+				t.Fatal("wrong live adoption advertisement", caps.AvailableServices)
+			}
+			if slices.Contains(caps.AvailableServices, "sglang") {
+				t.Fatal("non-adoptable service advertised")
+			}
+		})
+	}
+	caps := &NodeCapabilities{Engines: []string{"vllm"}}
+	populateServices(caps, "linux", func() int { return 0 })
+	if slices.Contains(caps.AvailableServices, "vllm") {
+		t.Fatal("cached engine was treated as serving")
 	}
 }

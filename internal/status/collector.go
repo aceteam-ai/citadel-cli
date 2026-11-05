@@ -523,7 +523,7 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// Advertise the serving services this build can deploy (embedded ServiceMap
 	// keys) so the fabric can schedule engine-specific deploys only to capable
 	// nodes (aceteam#4483).
-	populateServices(status.Capabilities, runtime.GOOS, platform.NvidiaGPUCountForCompose)
+	populateServices(status.Capabilities, runtime.GOOS, platform.NvidiaGPUCountForCompose, status.Services...)
 
 	// Advertise the live registered handler set rather than a static version or
 	// platform matrix. The provider is wired only after permission/configuration
@@ -618,8 +618,16 @@ func (c *Collector) WorkerLivenessSnapshot() *WorkerLiveness {
 
 // populateServices advertises the runnable host set without confusing unknown
 // GPU evidence with absence. It does not limit the set to configured services.
-func populateServices(caps *NodeCapabilities, goos string, gpuCount func() int) {
-	caps.AvailableServices = services.AvailableServicesForHost(goos, gpuCount)
+func populateServices(caps *NodeCapabilities, goos string, gpuCount func() int, observed ...ServiceInfo) {
+	var serving []string
+	for _, svc := range observed {
+		// Reuse this heartbeat's successful readiness observation. Cached
+		// Engines/configuration and an unready container are not adoption proof.
+		if svc.Name == "vllm" && svc.Status == ServiceStatusRunning && svc.Health == HealthStatusOK && svc.Port > 0 {
+			serving = append(serving, svc.Name)
+		}
+	}
+	caps.AvailableServices = services.AvailableServicesForHost(goos, gpuCount, serving...)
 }
 
 // CollectCompact returns a minimal status suitable for heartbeats.

@@ -2,6 +2,7 @@ package services
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -65,5 +66,17 @@ func TestCUDAAvailabilityOtherOSUnknownAndSampleCount(t *testing.T) {
 	}
 	if CUDAStartRefusal("custom", "linux", func() int { t.Fatal("custom service probed GPU"); return 0 }) != "" {
 		t.Fatal("custom engine refused")
+	}
+}
+
+func TestCUDAAvailabilityPreservesOnlyServingAdoptableEngine(t *testing.T) {
+	got := AvailableServicesForHost("linux", func() int { return 0 }, cudaOnlyFixture...)
+	for _, name := range cudaOnlyFixture {
+		if slices.Contains(got, name) != (name == "vllm") {
+			t.Fatal("wrong external adoption availability", name, got)
+		}
+	}
+	if !slices.IsSorted(got) {
+		t.Fatal("availability order changed", got)
 	}
 }
