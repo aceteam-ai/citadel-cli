@@ -224,7 +224,19 @@ func TestIdleStaticPageGetsFirstFrameWithoutRefresh(t *testing.T) {
 		Button: "left", ClickCount: 1,
 	})
 	if err := conn.WriteMessage(websocket.TextMessage, input); err != nil {
-		t.Fatalf("send fallback input: %v", err)
+		t.Fatalf("send observing input: %v", err)
+	}
+	sess.waitInputChecks(t, 1)
+	f.mu.Lock()
+	observedMouse := len(f.mouse)
+	f.mu.Unlock()
+	if observedMouse != 0 {
+		t.Fatalf("observing viewer sent %d mouse events to CDP", observedMouse)
+	}
+
+	sess.setHumanControl(true)
+	if err := conn.WriteMessage(websocket.TextMessage, input); err != nil {
+		t.Fatalf("send fallback input after handoff: %v", err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for {
