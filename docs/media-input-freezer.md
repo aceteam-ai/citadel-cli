@@ -3,9 +3,11 @@
 `internal/mediainput.WorkspaceFreezer` consumes the strict C1a contract and
 returns a job-private, in-memory snapshot. This source-only foundation does not
 register edit tasks or handlers, advertise support, start a service, redeem a
-capability or invoke a model. Inbox and mixed-origin contracts currently refuse
-with `inbox_unavailable`; the shared pinned HTTPS acquisition adapter is still
-required. `media-input-contract.md` describes the descriptor boundary.
+capability or invoke a model. That workspace-only primitive refuses inbox and
+mixed-origin contracts with `inbox_unavailable`. `media-input-contract.md`
+describes the descriptor boundary. The separately prepared `Freezer` composes the
+workspace primitive with the shared pinned inbox client; neither is a live
+handler or an execution-authority boundary by itself.
 
 On Linux, each read requires a non-nil live Files predicate. Parent resolution
 uses `os.Root`; `openWorkspaceInput` pins the leaf against that parent with
@@ -91,3 +93,85 @@ and all live C1b/C5 acquisition,
 publication and activation gates remain unresolved. The O_PATH change does
 not establish that an accepted regular inode has no outside-workspace hard
 links, nor does it restrict owner UID.
+
+## #1314 C1c: shared inbox acquisition plan
+
+This next source slice is stacked on the #1404 path/type hardening draft. It
+does not complete C5 or enable a media task. The accepted input route and
+lifecycle come from the [shared DoR](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290142842),
+as overridden by [Jason's recorded decisions](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290189919).
+
+1. Extract FILE_FETCH's fixed-origin, public-IP-pinned HTTPS GET policy into
+   an internal shared client with a closed endpoint set and an `io.Writer`
+   sink. Preserve the existing origin/URL, token, proxy, redirect, compression,
+   TLS, DNS/all-answer/own-address, timeout, body-size and static-error rules.
+   FILE_FETCH keeps its live Files checks, cooperative cancellation, anonymous
+   staging, expected-hash verification, sync and create-only publication. Its
+   existing tests and wire fixture must not change.
+2. Prepare an inactive media freezer supporting workspace, inbox and mixed
+   v1 inputs. Inbox uses only `/api/shared/media-input`, declared-size-plus-one
+   bounded memory, exact size/hash and the existing image/header/mask guards.
+   A live media-input predicate is mandatory; workspace inputs additionally
+   require live Files. Inbox-only jobs require no workspace or Files grant.
+   Preserve snapshot privacy and independent readers; no input disk staging,
+   mount, task registration, permission mutation or capability minting.
+3. Verify shared-client policy and every acquisition/permission/cancellation/
+   privacy boundary with owned offline Go/Python fixtures. Use no real token,
+   public network, model or service. Normal existing CI verifies FILE_FETCH
+   compatibility and composed exact-head source. No local formatter/vet or
+   standalone build is authorized by this plan.
+
+The future C5 caller must acquire the shared node-wide holder admission before
+any redemption, then enforce target-node/deadline/cancel, live publication and
+upload gates. This library does not create a competing holder pool. C2 token
+privacy must land before minting/dispatch; D6 upload and C3 withheld lifecycle
+remain prerequisites. In particular, this does not expose #1374's unratified
+video extension or settle owner/hard-link policy. The following prepared source
+implements the acquisition phase; consult the PR for current exact-head test
+receipts. Independent review remains required.
+
+### Prepared C1c source
+
+`coordinatorfetch.Get` owns the closed FILE_FETCH/media-input route set, exact
+HTTPS origin, token syntax, all-answer public-IP/own-interface checks and
+numeric reconnect pinning. It ignores proxies, refuses redirects/compression,
+retains production TLS verification and bounds response headers, the
+network/context-aware transfer deadline and bytes to declared-limit-plus-one.
+It streams into an `io.Writer` and returns only
+byte count/hash or a static refusal. It does not stage files or authenticate
+capability claims; the coordinator still owns signature/purpose/expiry/nonce
+and tenant/object binding. Trusted programmatic hooks are fixture seams, never
+payload/configurable network-policy overrides.
+
+The sink's `Write` is synchronous and need not honor context cancellation. A
+blocked local writer can therefore outlast the request deadline; that deadline
+is not proof of writer exit. Callers retain writer/holder custody until the
+transfer returns and must not add a timeout goroutine that abandons the writer
+or reuse/publish partial bytes. The in-memory inbox sink does not introduce a
+blocking external writer; FILE_FETCH retains its existing local file-write
+behavior and final cancellation/publication checks.
+
+FILE_FETCH reuses that client but keeps its original filesystem and live Files
+boundary, cooperative cancellation, maximum-size (not exact-size) semantics,
+expected SHA, sync and create-only publication. Its existing tests and shared
+wire fixture remain unchanged. No media permission is added to FILE_FETCH.
+
+The new inactive `mediainput.Freezer` requires a non-nil live
+`MediaInputsEnabled` predicate for every input. If any input is workspace-origin,
+live Files and a workspace are also required, checked before **any** capability
+redemption and again between inputs and before returning. Inbox-only snapshots
+need neither Files nor a workspace. The trusted origin is sampled/validated
+once per freeze; the job cannot select a URL or endpoint. Input memory reserves
+only the declared bytes plus the over-limit probe, and exact size/hash and the
+same existing image/mask guards apply. Both origins share the private reader
+factory; partial snapshots never escape on failure/revocation/cancellation.
+
+This is source preparation, not C5 activation or complete media acceptance.
+The caller still needs shared holder admission before any redemption, target
+node/deadline/duplicate/cancel and live publication gates, C2 credential privacy,
+C3 withheld storage, D6 upload, a compatible sidecar and reviewed permissions.
+The transport/freezer adds no further fixture revision beyond its composed
+parent's proposed replay correction; see `media-input-contract.md` for accepted
+versus proposed pins. That composition is not paired platform ratification.
+No video schema, live token or permission is introduced.
+See the stacked draft for exact-head receipts and independent review status.

@@ -154,14 +154,9 @@ func TestEnsureComposeFile_NoOverrideWritesVerbatim(t *testing.T) {
 	}
 }
 
-// TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged pins that the
-// citadel-cli#1069 darwin GPU-reservation heal is a no-op on the linux CI host:
-// an already-materialized nvidia-reserving ollama.yml (the exact state a Mac at
-// v2.150-v2.160 has on disk, and the current linux template here) must be left
-// byte-identical when ensureComposeFile takes its create-once fast path. The
-// heal only fires on a darwin build, where ServiceMap["ollama"] is the
-// no-nvidia darwin variant.
-func TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged(t *testing.T) {
+// A Linux host with an NVIDIA GPU keeps its current embedded GPU bytes.
+// The detector is injected so this assertion does not depend on CI hardware.
+func TestEnsureComposeFile_LinuxGPUKeepsNvidiaReservingFileUnchanged(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skipf("linux-only byte-identity assertion; GOOS=%s", runtime.GOOS)
 	}
@@ -178,7 +173,7 @@ func TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged(t *testing.T)
 		t.Fatalf("seed: %v", err)
 	}
 
-	if err := ensureComposeFile(tmpDir, "ollama"); err != nil {
+	if err := ensureComposeFileForHost(tmpDir, "ollama", "linux", func() int { return 1 }); err != nil {
 		t.Fatalf("ensureComposeFile() error = %v", err)
 	}
 
@@ -187,7 +182,7 @@ func TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged(t *testing.T)
 		t.Fatalf("read back: %v", err)
 	}
 	if string(got) != seed {
-		t.Fatal("nvidia-reserving ollama.yml was rewritten on linux; the #1069 heal must be darwin-only")
+		t.Fatal("nvidia-reserving ollama.yml was rewritten on a Linux GPU host")
 	}
 }
 

@@ -582,14 +582,14 @@ func TestFineTuneHeldComposeRefreshDefersBeforeRewrite(t *testing.T) {
 		called++
 		return composerefresh.Result{}, nil
 	}
-	refreshManagedComposeFilesWithSweep(configDir, sweep)
+	refreshManagedComposeFilesWithSweep(configDir, sweep, func() int { return 1 })
 	if called != 0 {
 		t.Fatal("compose refresh rewrote under fine-tune hold")
 	}
 	if err := os.Remove(finetunesafety.Path(configDir)); err != nil {
 		t.Fatal(err)
 	}
-	refreshManagedComposeFilesWithSweep(configDir, sweep)
+	refreshManagedComposeFilesWithSweep(configDir, sweep, func() int { return 1 })
 	if called != 1 {
 		t.Fatalf("compose refresh did not resume after hold: %d", called)
 	}
