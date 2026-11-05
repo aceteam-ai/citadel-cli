@@ -73,6 +73,32 @@ func TestFileFetchJobDiagnosticsOmitCredentials(t *testing.T) {
 	}
 }
 
+func TestAMTJobDiagnosticsOmitCapabilities(t *testing.T) {
+	const token = "synthetic-amt-capability"
+	const endpoint = "https://example.test/api/fabric/amt/credential"
+	payload := map[string]any{"credential_token": token, "credential_url": endpoint, "host": "192.168.1.20"}
+	raw, _ := json.Marshal(payload)
+	for _, job := range []any{
+		&Job{Type: JobTypeAMTKVM, Payload: payload, RawPayload: raw},
+		&redisclient.Job{Type: JobTypeAMTKVM, Payload: payload, RawPayload: raw, RawData: map[string]any{"payload": string(raw)}},
+		&redisapi.Job{Type: JobTypeAMTKVM, Payload: payload, RawPayload: raw, RawData: map[string]any{"payload": string(raw)}},
+	} {
+		encoded, err := json.Marshal(job)
+		if err != nil || strings.Contains(string(encoded), token) || strings.Contains(string(encoded), endpoint) {
+			t.Fatal("retained AMT job envelope contains a capability")
+		}
+		for _, format := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d"} {
+			text := fmt.Sprintf(format, job)
+			if strings.Contains(text, token) || strings.Contains(text, endpoint) {
+				t.Fatal("AMT job diagnostic contains a capability")
+			}
+		}
+	}
+	if payload["credential_token"] != token {
+		t.Fatal("diagnostics mutated AMT execution authority")
+	}
+}
+
 // This starts an isolated real Redis process with no TCP listener or persistence.
 // It never contacts a node or an operator's Redis instance.
 func fileFetchDisposableRedis(t *testing.T) (*goredis.Client, string) {
