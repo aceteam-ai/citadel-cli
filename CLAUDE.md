@@ -38,6 +38,13 @@ leaf open, and fails closed if the verified procfs FD route is unavailable.
 using owned fixtures, not real devices. This does not settle owner/hard-link
 policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
 
+`coordinatorfetch.Get` owns the shared fixed-route, bounded HTTPS transfer used
+by FILE_FETCH and the inactive media inbox freezer. Caller packages retain
+permission, exact-size/hash and publication policy; the client grants none.
+`mediainput.Freezer` adds live media-input checks and conditional Files checks
+for mixed snapshots, without registering a task or reserving the future C5
+holder admission. See `docs/media-input-freezer.md` for the activation gates.
+
 `service.RematerializeManagedUnits` owns the bounded base-file refresh and
 reload request, not worker restart or failed-unit counter recovery.
 `cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
@@ -2250,6 +2257,14 @@ shaped like:
 ```
 The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
 single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
+
+### Depth point-cloud sequence proposal (citadel-cli#1385)
+
+The separate #1385 depth-service proposal is not a registered engine/job.
+`internal/pointcloud` owns its inactive packed-sequence reference codec and
+synthetic camera-distance projection, not model calibration, Files authority or
+artifact publication. `docs/pointcloud-depth-service.md` owns the proposed wire
+layout and unresolved runtime/consumer acceptance gates.
 
 ### Diffusers sidecar: per-request model selection (citadel-cli#1335)
 
@@ -4648,7 +4663,10 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 
 ### GPU Support Notes
 
-**Linux**: Full NVIDIA GPU support via NVIDIA Container Toolkit. Compose files use `driver: nvidia` specification.
+**Linux**: `platform.NvidiaGPUCountForCompose` owns the bounded tri-state observation.
+`services.SelectComposeForHost` chooses the supported CPU variant only on proven
+NVIDIA absence; unknown evidence preserves an existing flavor. `services.ComposeMapForRefresh`
+withholds uncertain variants from boot refresh. See `docs/cpu-compose-selection.md`.
 
 **macOS — no GPU in containers, and the nvidia reservation is NOT ignored (citadel-cli#1048, corrects a stale claim this section made).**
 Docker Desktop for macOS exposes **no GPU to Linux containers** at all — Metal is not passed through to the Linux VM, and there is no nvidia device driver, on Apple Silicon or Intel. The previous claim here ("Metal GPU support in containers", "`driver: nvidia` is ignored", "services still run") was wrong on all three counts: Docker Compose v2 honors `deploy.resources.reservations.devices` outside swarm, so a mandatory `driver: nvidia` reservation makes `docker compose up` **fail container creation** with `could not select device driver "nvidia" with capabilities: [[gpu]]`.

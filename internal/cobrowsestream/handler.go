@@ -106,7 +106,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	holder := newFrameHolder()
-	cdp, err := dialCDP(debugPort, func(f screencastFrame) { holder.set(f.jpeg) })
+	var sawScreencastFrame atomic.Bool
+	cdp, err := dialCDP(debugPort, func(f screencastFrame) {
+		sawScreencastFrame.Store(true)
+		holder.set(f.jpeg)
+	})
 	if err != nil {
 		s.logger.Printf("CDP attach failed for session=%s: %v", id, err)
 		return
@@ -148,6 +152,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// concurrent writes, so no other goroutine writes to this socket.
 	ping := time.NewTicker(pingPeriod)
 	defer ping.Stop()
+	firstFrameFallback := time.NewTimer(750 * time.Millisecond)
+	defer firstFrameFallback.Stop()
 
 	for {
 		select {
@@ -156,6 +162,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-cdp.Done():
 			// Browser/session went away: tear the viewer down.
 			return
+		case <-firstFrameFallback.C:
+			if !sawScreencastFrame.Load() {
+				// Chrome may not emit a screencast event for a static page. Ask
+				// for its current image once, without blocking the stream writer.
+				go func() {
+					captureCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+					defer stop()
+					image, err := cdp.captureFirstFrame(captureCtx, s.cfg.Quality)
+					if err == nil && !sawScreencastFrame.Load() && ctx.Err() == nil {
+						holder.set(image)
+					}
+				}()
+			}
 		case <-holder.signal:
 			frame := holder.take()
 			if frame == nil {
