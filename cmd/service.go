@@ -154,7 +154,14 @@ func cacheBaseDirectory() (string, error) {
 }
 
 // startService starts a docker-based service using docker compose.
-func startService(serviceName, composeFilePath string) error {
+func startService(serviceName, composeFilePath string, gpuCount ...func() int) error {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	if reason := svcports.CUDAStartRefusal(serviceName, runtime.GOOS, probe); reason != "" {
+		return fmt.Errorf("cannot start %s", reason)
+	}
 	if err := refuseManagedVLLMStart(serviceName); err != nil {
 		return err
 	}
