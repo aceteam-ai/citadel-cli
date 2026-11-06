@@ -45,6 +45,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -608,7 +609,7 @@ func verifyFilesUnder(base string, files []string) bool {
 // UserHomeDir failure rather than erroring, mirroring those functions'
 // identical fallback, so ReconcileScan always has a concrete path to walk.
 func DefaultCacheRoot() string {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil || home == "" {
 		return "citadel-cache"
 	}

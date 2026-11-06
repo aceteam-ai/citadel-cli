@@ -82,7 +82,8 @@ func TestAutoUpdateReportFrom(t *testing.T) {
 func withAutoUpdateEnv(t *testing.T, version string) {
 	t.Helper()
 	home := t.TempDir()
-	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
+	useCmdFixtureHome(t, home)
+	for _, key := range []string{"APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
 		t.Setenv(key, home)
 	}
 	t.Setenv("CITADEL_AUTO_UPDATE", "")
