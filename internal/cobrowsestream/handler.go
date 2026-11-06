@@ -224,6 +224,10 @@ func (s *Server) dispatchInput(cdp *cdpClient, m InputMessage) {
 		_ = cdp.dispatchMouse(m)
 	case InputTypeKey:
 		_ = cdp.dispatchKey(m)
+	case InputTypePaste:
+		// The reader's live ViewerHasControl gate applies before this dispatch.
+		// Insert literal text without consulting either browser's clipboard.
+		_ = cdp.send("Input.insertText", map[string]any{"text": m.Text})
 	}
 }
 
