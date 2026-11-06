@@ -87,12 +87,14 @@ func (r *Runner) runnerSigns(caps jobs.JobCapabilities) bool {
 // the runner uses to sign a work receipt for a runner-signed job. OrgID is read
 // from the job envelope (org_id) for attribution.
 func (r *Runner) newRunnerWorkReceiptConfig(job *Job) jobs.WorkReceiptConfig {
+	orgValue, _ := job.executionField("org_id")
+	orgID, _ := orgValue.(string)
 	return jobs.WorkReceiptConfig{
 		Signer:     r.workReceiptSigner,
 		NodeID:     r.workReceiptNodeID,
 		Dispatched: true,
 		Origin:     jobs.OriginDispatched,
-		OrgID:      payloadString(job.Payload, "org_id"),
+		OrgID:      orgID,
 	}
 }
 
@@ -124,6 +126,13 @@ func (r *Runner) attachRunnerWorkReceipt(job *Job, result *JobResult) error {
 // delivered payload) as a string, falling back to the decoded payload map. Used
 // as the opaque input manifest for a runner-signed receipt.
 func rawOrPayload(job *Job) any {
+	if job.media != nil {
+		if raw := job.media.OriginalPayload(); len(raw) > 0 {
+			return string(raw)
+		}
+		payload, _ := job.executionPayload()
+		return payload
+	}
 	if len(job.RawPayload) > 0 {
 		return string(job.RawPayload)
 	}
