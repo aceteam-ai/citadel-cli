@@ -24,8 +24,15 @@ func composeEnvForStrictServiceStart(serviceName string, service Service, bindEn
 	if _, err := svcports.OllamaMaxLoadedModelsComposeEnv(nil, serviceName, service.OllamaMaxLoadedModels); err != nil {
 		return nil, err
 	}
+	if _, err := svcports.OllamaKeepAliveComposeEnv(nil, serviceName, service.OllamaKeepAlive); err != nil {
+		return nil, err
+	}
 	env := append(composeEnv(), bindEnvEntries(bindEnv)...)
-	env, err := svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, service.OllamaMaxLoadedModels)
+	env, err := svcports.OllamaKeepAliveComposeEnv(env, serviceName, service.OllamaKeepAlive)
+	if err != nil {
+		return nil, err
+	}
+	env, err = svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, service.OllamaMaxLoadedModels)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +50,14 @@ func composeEnvForStrictServiceStart(serviceName string, service Service, bindEn
 // take effect (pin `type: docker` to apply it), rather than silent unlimited
 // residency on a memory-tight node.
 func warnIfOllamaPolicyIgnoredNative(service Service) {
+	warnIfOllamaKeepAliveIgnoredNative(service)
 	if service.Name == "ollama" && service.OllamaMaxLoadedModels != nil {
 		fmt.Printf("   ⚠️  ollama_max_loaded_models is set but %s resolved to native (no compose to inject into); pin `type: docker` in citadel.yaml to apply OLLAMA_MAX_LOADED_MODELS\n", service.Name)
+	}
+}
+
+func warnIfOllamaKeepAliveIgnoredNative(service Service) {
+	if service.Name == "ollama" && service.OllamaKeepAlive != nil {
+		fmt.Println("   ollama_keep_alive is set but the engine is native; configure its service environment or use type: docker to apply OLLAMA_KEEP_ALIVE")
 	}
 }

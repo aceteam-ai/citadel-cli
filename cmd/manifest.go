@@ -69,6 +69,9 @@ type Service struct {
 	// here (and in internal/jobs' two manifest structs) so a cmd-package manifest
 	// rewrite does not silently drop it -- the #528/#850 field-drop failure mode.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// OllamaKeepAlive sets the embedded engine residency duration; -1 keeps
+	// models loaded. Nil preserves the engine default through explicit empty env.
+	OllamaKeepAlive *string `yaml:"ollama_keep_alive,omitempty"`
 	// Threads is the aceteam-ai/citadel-cli#1269 per-service CPU thread opt-in for
 	// the embedded tei embedding service: the MKL/OMP/RAYON thread count injected
 	// as CITADEL_TEI_NUM_THREADS at `docker compose up`. A *int so nil (unset,

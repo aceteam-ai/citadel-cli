@@ -141,6 +141,11 @@ func TestOllamaComposeExplicitEmptyDefeatsEnvFile(t *testing.T) {
 
 func renderOllamaPolicy(t *testing.T, docker, dir, composePath, envFile string, env []string) string {
 	t.Helper()
+	return renderOllamaEnvironmentValue(t, docker, dir, composePath, envFile, env, EnvOllamaMaxLoadedModels)
+}
+
+func renderOllamaEnvironmentValue(t *testing.T, docker, dir, composePath, envFile string, env []string, key string) string {
+	t.Helper()
 	args := []string{"compose", "--project-directory", dir}
 	if envFile != "" {
 		args = append(args, "--env-file", envFile)
@@ -163,9 +168,9 @@ func renderOllamaPolicy(t *testing.T, docker, dir, composePath, envFile string, 
 	if err := json.Unmarshal(out, &cfg); err != nil {
 		t.Fatalf("decode compose config: %v\n%s", err, out)
 	}
-	value, ok := cfg.Services["ollama"].Environment[EnvOllamaMaxLoadedModels]
+	value, ok := cfg.Services["ollama"].Environment[key]
 	if !ok || value == nil {
-		t.Fatalf("rendered environment lacks %s: %s", EnvOllamaMaxLoadedModels, out)
+		t.Fatalf("rendered environment lacks %s: %s", key, out)
 	}
 	return *value
 }
@@ -180,6 +185,11 @@ func TestOllamaPolicyNormalizerWiredIntoEveryComposeUp(t *testing.T) {
 	}{
 		{"../cmd/service.go", "func startService(", "composeEnvForStrictServiceStart"},
 		{"../cmd/service_ollama.go", "func composeEnvForStrictServiceStart(", "OllamaMaxLoadedModelsComposeEnv"},
+		{"../cmd/service_ollama.go", "func composeEnvForStrictServiceStart(", "OllamaKeepAliveComposeEnv"},
+		{"../cmd/service_bind.go", "func composeEnvForServiceValues(", "OllamaKeepAliveComposeEnv"},
+		{"../internal/jobs/service_handler.go", "func (h *ServiceHandler) composeEnvForEngineStart(", "OllamaKeepAliveComposeEnv"},
+		{"../internal/jobs/service_handler.go", "func (h *ServiceHandler) serviceStart(", "OllamaKeepAliveComposeEnv"},
+		{"../internal/jobs/ollama_policy.go", "func composeEnvForAppliedService(", "OllamaKeepAliveComposeEnv"},
 		{"../cmd/service_bind.go", "func composeEnvForServiceValues(", "OllamaMaxLoadedModelsComposeEnv"},
 		{"../internal/jobs/service_handler.go", "func (h *ServiceHandler) composeEnvForEngineStart(", "OllamaMaxLoadedModelsComposeEnv"},
 		{"../internal/jobs/service_handler.go", "func (h *ServiceHandler) serviceStart(", "OllamaMaxLoadedModelsComposeEnv"},

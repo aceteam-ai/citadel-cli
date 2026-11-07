@@ -684,3 +684,19 @@ func writeYAMLFile(t *testing.T, path string, v interface{}) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+func TestManifestServiceKeepAliveRoundTrip(t *testing.T) {
+	value := "60m"
+	source := CitadelManifest{Services: []Service{{Name: "ollama", OllamaKeepAlive: &value}}}
+	data, err := yaml.Marshal(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded CitadelManifest
+	if err := yaml.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Services) != 1 || decoded.Services[0].OllamaKeepAlive == nil || *decoded.Services[0].OllamaKeepAlive != value {
+		t.Fatal("manifest rewrite dropped keep-alive")
+	}
+}

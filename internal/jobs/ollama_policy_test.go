@@ -15,12 +15,12 @@ import (
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
-// TestOllamaMaxLoadedModelsFromFile pins the #1209 best-effort manifest reader
+// TestOllamaResidencyFromFile pins the #1209 best-effort manifest reader
 // the APPLY_DEVICE_CONFIG compose-up (config_handler.go) uses to thread an
 // operator's ollama_max_loaded_models policy into the shared compose-env
 // normalizer. Hermetic: it reads a manifest written into t.TempDir(), never
 // network.GetNodeConfigDir().
-func TestOllamaMaxLoadedModelsFromFile(t *testing.T) {
+func TestOllamaResidencyFromFile(t *testing.T) {
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "citadel.yaml")
 	manifest := `node:
@@ -36,16 +36,16 @@ services:
 		t.Fatalf("seed manifest: %v", err)
 	}
 
-	if got := ollamaMaxLoadedModelsFromFile(manifestPath, "ollama"); got == nil || *got != 1 {
+	if got, _ := ollamaResidencyFromFile(manifestPath, "ollama"); got == nil || *got != 1 {
 		t.Errorf("ollama policy = %v, want 1", got)
 	}
-	if got := ollamaMaxLoadedModelsFromFile(manifestPath, "vllm"); got != nil {
+	if got, _ := ollamaResidencyFromFile(manifestPath, "vllm"); got != nil {
 		t.Errorf("vllm policy (unset) = %v, want nil", got)
 	}
-	if got := ollamaMaxLoadedModelsFromFile(manifestPath, "absent"); got != nil {
+	if got, _ := ollamaResidencyFromFile(manifestPath, "absent"); got != nil {
 		t.Errorf("absent service policy = %v, want nil", got)
 	}
-	if got := ollamaMaxLoadedModelsFromFile(filepath.Join(dir, "nope.yaml"), "ollama"); got != nil {
+	if got, _ := ollamaResidencyFromFile(filepath.Join(dir, "nope.yaml"), "ollama"); got != nil {
 		t.Errorf("policy from missing file = %v, want nil", got)
 	}
 }
@@ -77,10 +77,10 @@ func TestComposeEnvForAppliedServiceNormalizesPolicy(t *testing.T) {
 		want      []string
 		wantError bool
 	}{
-		{"valid", validPath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "=1"}, false},
-		{"missing", filepath.Join(dir, "missing.yaml"), "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "="}, false},
-		{"invalid yaml", invalidPath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "="}, false},
-		{"negative", negativePath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "="}, true},
+		{"valid", validPath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaKeepAlive + "=", services.EnvOllamaMaxLoadedModels + "=1"}, false},
+		{"missing", filepath.Join(dir, "missing.yaml"), "ollama", []string{"UNRELATED=keep", services.EnvOllamaKeepAlive + "=", services.EnvOllamaMaxLoadedModels + "="}, false},
+		{"invalid yaml", invalidPath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaKeepAlive + "=", services.EnvOllamaMaxLoadedModels + "="}, false},
+		{"negative", negativePath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaKeepAlive + "=", services.EnvOllamaMaxLoadedModels + "="}, true},
 		{"non ollama unchanged", validPath, "vllm", base, false},
 	}
 	for _, tc := range cases {
@@ -116,7 +116,7 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 	}
 
 	one := 1
-	env, err := h.composeEnvForEngineStart("ollama", "", &one, nil)
+	env, err := h.composeEnvForEngineStart("ollama", "", &one, nil, nil)
 	if err != nil {
 		t.Fatalf("set: unexpected error: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 		t.Errorf("set: policy entry must be last (so it wins), got %q", env[len(env)-1])
 	}
 
-	envNil, err := h.composeEnvForEngineStart("ollama", "", nil, nil)
+	envNil, err := h.composeEnvForEngineStart("ollama", "", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unset: unexpected error: %v", err)
 	}
@@ -139,13 +139,13 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 	}
 
 	neg := -1
-	if _, err := h.composeEnvForEngineStart("ollama", "", &neg, nil); err == nil {
+	if _, err := h.composeEnvForEngineStart("ollama", "", &neg, nil, nil); err == nil {
 		t.Errorf("negative: want a hard error, got nil")
 	}
 
 	// A non-ollama engine remains byte-for-byte outside this policy authority;
 	// the hostile inherited value therefore remains present and unchanged.
-	envVLLM, err := h.composeEnvForEngineStart("vllm", "", &one, nil)
+	envVLLM, err := h.composeEnvForEngineStart("vllm", "", &one, nil, nil)
 	if err != nil {
 		t.Fatalf("vllm: unexpected error: %v", err)
 	}

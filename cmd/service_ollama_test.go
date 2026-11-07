@@ -123,3 +123,24 @@ func envContains(env []string, want string) bool {
 	}
 	return false
 }
+
+func TestStrictAndBestEffortOllamaKeepAlive(t *testing.T) {
+	useCmdFixtureHome(t, t.TempDir())
+	t.Setenv(svcports.EnvOllamaKeepAlive, "hostile")
+	for _, value := range []string{"60m", "-1", "0"} {
+		service := Service{Name: "ollama", OllamaKeepAlive: &value}
+		strict, err := composeEnvForStrictServiceStart("ollama", service, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, env := range [][]string{strict, composeEnvForServiceValues("ollama", service)} {
+			if !envContains(env, svcports.EnvOllamaKeepAlive+"="+value) {
+				t.Fatal("manifest keep-alive not injected")
+			}
+		}
+	}
+	bad := "-2"
+	if _, err := composeEnvForStrictServiceStart("ollama", Service{OllamaKeepAlive: &bad}, nil); err == nil {
+		t.Fatal("invalid keep-alive accepted")
+	}
+}

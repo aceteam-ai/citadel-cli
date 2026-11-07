@@ -96,6 +96,10 @@ func composeEnvForServiceValues(serviceName string, svc Service) []string {
 	// Normalize the #1209 Ollama policy LAST. Even nil/unreadable/invalid
 	// best-effort policy becomes an explicit empty entry for ollama so neither an
 	// inherited shell value nor Compose .env fallback can become node policy.
+	env, keepAliveErr := svcports.OllamaKeepAliveComposeEnv(env, serviceName, svc.OllamaKeepAlive)
+	if keepAliveErr != nil {
+		Log("ollama policy: %s: %v; using engine default", serviceName, keepAliveErr)
+	}
 	env, policyErr := svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, svc.OllamaMaxLoadedModels)
 	if policyErr != nil {
 		Log("ollama policy: %s: %v; using engine default", serviceName, policyErr)

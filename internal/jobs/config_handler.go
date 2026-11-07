@@ -499,6 +499,8 @@ type ManifestService struct {
 	// so a field missing here is silently DROPPED on every APPLY_DEVICE_CONFIG --
 	// the policy would vanish on the next dashboard config save.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// Keep the manifest residency duration through device-config rewrites.
+	OllamaKeepAlive *string `yaml:"ollama_keep_alive,omitempty"`
 	// Threads mirrors cmd/manifest.go Service.Threads: the aceteam-ai/citadel-cli#1269
 	// per-service CPU thread opt-in for the tei embedding service
 	// (CITADEL_TEI_NUM_THREADS). A *int so nil (unset) is distinguishable from an
