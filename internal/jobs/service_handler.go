@@ -82,6 +82,9 @@ type manifestService struct {
 	// See
 	// services/ollama_policy.go.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// OllamaKeepAlive sets the embedded engine residency duration; -1 keeps
+	// models loaded. Nil preserves the engine default through explicit empty env.
+	OllamaKeepAlive *string `yaml:"ollama_keep_alive,omitempty"`
 	// Threads mirrors cmd/manifest.go Service.Threads: the aceteam-ai/citadel-cli#1269
 	// per-service CPU thread opt-in for the tei embedding service, injected as
 	// CITADEL_TEI_NUM_THREADS at `docker compose up` via services.TEIComposeEnv. A
@@ -399,6 +402,9 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// compose env to inject into, so an OLLAMA_MAX_LOADED_MODELS policy cannot
 		// take effect. Warn rather than silently no-op (the exact OOM this policy
 		// exists to prevent on a memory-tight node): pin `type: docker` to apply it.
+		if svc.Name == "ollama" && svc.OllamaKeepAlive != nil {
+			ctx.Log("warn", "ollama_keep_alive is set but the engine is native; configure its service environment or use type: docker to apply OLLAMA_KEEP_ALIVE")
+		}
 		if svc.Name == "ollama" && svc.OllamaMaxLoadedModels != nil {
 			ctx.Log("warn", "     - %s: ollama_max_loaded_models is set but the service resolved to native (no compose to inject into); pin `type: docker` in citadel.yaml to apply OLLAMA_MAX_LOADED_MODELS", svc.Name)
 		}
@@ -451,6 +457,10 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// serviceStart; this guard promises no engine-side effects, not zero
 		// manifest intent writes.
 		if _, policyErr := embeddedservices.OllamaMaxLoadedModelsComposeEnv(nil, svc.Name, svc.OllamaMaxLoadedModels); policyErr != nil {
+			err = fmt.Errorf("docker compose up failed: %s", policyErr)
+			break
+		}
+		if _, policyErr := embeddedservices.OllamaKeepAliveComposeEnv(nil, svc.Name, svc.OllamaKeepAlive); policyErr != nil {
 			err = fmt.Errorf("docker compose up failed: %s", policyErr)
 			break
 		}
@@ -655,7 +665,7 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 			// ollama_max_loaded_models:) so the compose substitution/passthrough
 			// resolve. An invalid value fails the start loudly rather than
 			// silently falling through to the compose/engine default.
-			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels, svc.Threads); bindErr != nil {
+			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels, svc.Threads, svc.OllamaKeepAlive); bindErr != nil {
 				err = fmt.Errorf("docker compose up failed: %s", bindErr)
 			} else {
 				cmd.Env = env
@@ -2299,7 +2309,7 @@ func (h *ServiceHandler) composeEnv() []string {
 // cannot become policy while Ollama retains automatic concurrency. An invalid
 // bind or negative policy value is a hard error the caller surfaces as a start
 // failure. The policy entry is the final, sole copy of its key.
-func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int, threads *int) ([]string, error) {
+func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int, threads *int, keepAlive *string) ([]string, error) {
 	entry, inject, err := embeddedservices.BindEnv(serviceName, bind)
 	if err != nil {
 		return nil, err
@@ -2307,6 +2317,10 @@ func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, olla
 	env := h.composeEnv()
 	if inject {
 		env = append(env, entry)
+	}
+	env, err = embeddedservices.OllamaKeepAliveComposeEnv(env, serviceName, keepAlive)
+	if err != nil {
+		return nil, err
 	}
 	env, err = embeddedservices.OllamaMaxLoadedModelsComposeEnv(env, serviceName, ollamaMaxLoaded)
 	if err != nil {

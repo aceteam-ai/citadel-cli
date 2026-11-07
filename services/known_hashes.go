@@ -12,6 +12,10 @@ package services
 // KnownComposeHashes is the historical-template allowlist (see file header).
 var KnownComposeHashes = map[string]map[string]bool{
 	"ollama": {
+		// #1560: manifest-controlled keep-alive passthrough, GPU and CPU variants.
+		"45b581bdc3bcaf293afe0184e565cc69dbc810024d32eead7dad5066a53ab3e5": true,
+		"76096f861bd95564147bc22baf1f3214c8ee1e0b092e17e2b6942adc4d20a781": true,
+
 		// #1531 shared CPU template documentation, Linux and Darwin.
 		"b2bb8d68c3a7638a6cf534ed8527466928888bfd8c7c09e9e8226db20f4d014c": true,
 		"423edb3435749d6b1c4047b9bfdd2851be733e42e28f189a913701b0aa491e97": true,

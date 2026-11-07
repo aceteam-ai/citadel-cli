@@ -10,43 +10,47 @@
 package jobs
 
 import (
+	"errors"
 	"os"
 
 	"github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
 )
 
-// ollamaMaxLoadedModelsFromFile reads the manifest at manifestPath (best-effort)
-// and returns the #1209 `ollama_max_loaded_models:` value for serviceName, or nil
+// ollamaResidencyFromFile reads both residency settings from a private manifest
+// path (best-effort), or returns nil settings
 // when the file is unreadable/unparseable, the service is absent, or the field is
 // unset. The caller normalizes nil to explicit empty so Compose cannot fall
 // back to a hostile shell or env-file value.
-func ollamaMaxLoadedModelsFromFile(manifestPath, serviceName string) *int {
+func ollamaResidencyFromFile(manifestPath, serviceName string) (*int, *string) {
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	var doc struct {
 		Services []struct {
-			Name                  string `yaml:"name"`
-			OllamaMaxLoadedModels *int   `yaml:"ollama_max_loaded_models"`
+			Name                  string  `yaml:"name"`
+			OllamaMaxLoadedModels *int    `yaml:"ollama_max_loaded_models"`
+			OllamaKeepAlive       *string `yaml:"ollama_keep_alive"`
 		} `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return nil
+		return nil, nil
 	}
 	for _, s := range doc.Services {
 		if s.Name == serviceName {
-			return s.OllamaMaxLoadedModels
+			return s.OllamaMaxLoadedModels, s.OllamaKeepAlive
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // composeEnvForAppliedService is the hermetic core of APPLY_DEVICE_CONFIG's
 // compose-process environment policy. It deliberately accepts the manifest
 // path so tests can use a private fixture rather than the live node config.
 func composeEnvForAppliedService(env []string, manifestPath, serviceName string) ([]string, error) {
-	return services.OllamaMaxLoadedModelsComposeEnv(
-		env, serviceName, ollamaMaxLoadedModelsFromFile(manifestPath, serviceName))
+	maxLoaded, keepAlive := ollamaResidencyFromFile(manifestPath, serviceName)
+	env, keepErr := services.OllamaKeepAliveComposeEnv(env, serviceName, keepAlive)
+	env, maxErr := services.OllamaMaxLoadedModelsComposeEnv(env, serviceName, maxLoaded)
+	return env, errors.Join(maxErr, keepErr)
 }

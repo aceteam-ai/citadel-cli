@@ -37,6 +37,7 @@ services:
     # reservation (TestDarwinComposeVariantsOnlyDropGPU).
     environment:
       - OLLAMA_MAX_LOADED_MODELS
+      - OLLAMA_KEEP_ALIVE
     volumes:
       # Mount a user-accessible directory for Ollama models
       - ~/citadel-cache/ollama:/root/.ollama
