@@ -34,6 +34,7 @@ func TestBuildChromeArgs_LinuxArgsUnchanged(t *testing.T) {
 		"--lang=en-US",
 		"--disable-features=Translate",
 		"--disable-gpu",
+		"--",
 		"http://example.test/",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -293,5 +294,59 @@ func TestVerifyCDPBrowserIDRejectsImpostor(t *testing.T) {
 	}
 	if err := verifyCDPBrowserID(port, "other-id"); err != nil {
 		t.Fatalf("matching id: %v", err)
+	}
+}
+
+// recordingRunner records whether Launch was reached.
+type recordingRunner struct {
+	xvfbRunner
+	launched *bool
+}
+
+func (r recordingRunner) Launch(string, string, LaunchOptions) (*cobrowseProc, error) {
+	*r.launched = true
+	return nil, errors.New("not launched in tests")
+}
+
+func TestDefaultLaunchValidatesStartURLBeforeAnyRunner(t *testing.T) {
+	prev := activeBrowserRunner
+	t.Cleanup(func() { activeBrowserRunner = prev })
+	for _, bad := range []string{"--remote-allow-origins=*", "-x", "file:///etc/passwd", "javascript:alert(1)", "http://a.test/ x"} {
+		launched := false
+		activeBrowserRunner = recordingRunner{launched: &launched}
+		if _, err := defaultLaunchCobrowseProc(t.TempDir(), bad, LaunchOptions{ProxyServer: "http://127.0.0.1:1", Quiet: true}); !errors.Is(err, ErrCobrowseURLNotAllowed) {
+			t.Errorf("%q: want ErrCobrowseURLNotAllowed, got %v", bad, err)
+		}
+		if launched {
+			t.Errorf("%q reached the runner", bad)
+		}
+	}
+	launched := false
+	activeBrowserRunner = recordingRunner{launched: &launched}
+	_, _ = defaultLaunchCobrowseProc(t.TempDir(), "about:blank", LaunchOptions{})
+	if !launched {
+		t.Fatal("about:blank must reach the runner")
+	}
+}
+
+// TestBuildChromeArgs_TerminatorLastWithAllOptions pins that every option,
+// including the local-mode proxy and quiet flags, comes before the "--"
+// switch terminator, and the start URL is the only thing after it.
+func TestBuildChromeArgs_TerminatorLastWithAllOptions(t *testing.T) {
+	args := buildChromeArgs(cobrowseLaunchOptions{
+		debugPort: 0, profileDir: "/p", startURL: "https://a.test/", stealth: true, userAgent: "UA",
+		headless: true, windowSize: "1280,720", proxyServer: "http://127.0.0.1:9", quiet: true,
+		softwareGL: true, passwordStoreBasic: true, autoplayNoUserGesture: true,
+	})
+	if n := len(args); n < 2 || args[n-2] != "--" || args[n-1] != "https://a.test/" {
+		t.Fatalf("want ... -- <url> at the end, got %v", args)
+	}
+	for _, a := range args[:len(args)-2] {
+		if a == "--" {
+			t.Fatalf("a second terminator before the end: %v", args)
+		}
+	}
+	if args := buildChromeArgs(cobrowseLaunchOptions{profileDir: "/p", headless: true}); containsArg(args, "--") {
+		t.Fatalf("no URL, no terminator: %v", args)
 	}
 }

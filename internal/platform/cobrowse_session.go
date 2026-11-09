@@ -541,6 +541,11 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 // cobrowse_runner.go): the managed-Xvfb runner on Linux, the headless Job
 // Object runner on Windows.
 func defaultLaunchCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
+	// Every runner (Xvfb, Windows headless) is reached only through here, so
+	// the start-URL gate holds even for a caller that skips the manager's.
+	if err := ValidateCobrowseURL(startURL); err != nil {
+		return nil, err
+	}
 	return activeBrowserRunner.Launch(profileDir, startURL, lo)
 }
 

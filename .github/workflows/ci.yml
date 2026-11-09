@@ -120,7 +120,7 @@ jobs:
       - name: Unit tests (Windows-portable subset)
         run: >-
           go test ./internal/platform/ -count=1 -run
-          '^(TestWindows|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
+          '^(TestWindows|TestDefaultLaunch|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
 
       - name: Real browser via discovery
         env:
