@@ -331,8 +331,26 @@ func TestOpencodePathsAndBlock(t *testing.T) {
 	if got := oc.path(env); !strings.HasSuffix(got, "opencode.jsonc") {
 		t.Fatalf("an existing .jsonc must be used: %s", got)
 	}
-	if oc.unverified(env) != "" || oc.unverified(harnessEnv{goos: "windows"}) == "" {
-		t.Fatal("only the Windows location is unverified")
+	if oc.unverified(env) != "" || oc.unverified(harnessEnv{goos: "windows"}) != "" {
+		t.Fatal("the opencode location is confirmed on every OS")
+	}
+	// Env overrides: OPENCODE_CONFIG_DIR beats XDG_CONFIG_HOME beats ~/.config.
+	for _, c := range []struct {
+		env  harnessEnv
+		want string
+	}{
+		{harnessEnv{goos: "windows", home: "/u"}, filepath.Join("/u", ".config", "opencode", "opencode.json")},
+		{harnessEnv{home: "/h", xdgConfig: "/x"}, filepath.Join("/x", "opencode", "opencode.json")},
+		{harnessEnv{home: "/h", xdgConfig: "/x", opencodeDir: "/o"}, filepath.Join("/o", "opencode.json")},
+	} {
+		if got := oc.path(c.env); got != c.want {
+			t.Fatalf("path %+v: %s want %s", c.env, got, c.want)
+		}
+	}
+	// opencode.jsonc wins over opencode.json when both exist.
+	_ = os.WriteFile(filepath.Join(home, ".config", "opencode", "opencode.json"), []byte("{}"), 0o600)
+	if got := oc.path(env); !strings.HasSuffix(got, "opencode.jsonc") {
+		t.Fatalf("jsonc must take precedence: %s", got)
 	}
 	// Windows path quoting: backslashes survive JSON encoding and round-trip.
 	var doc struct {
@@ -492,5 +510,62 @@ func TestDetectOpencode(t *testing.T) {
 		if s := status(); !s.Found || s.Points {
 			t.Fatalf("must not count: %s -> %+v", bad, s)
 		}
+	}
+}
+
+func TestOpencodeFlatLayoutDetection(t *testing.T) {
+	h, _ := findHarness("opencode")
+	now := time.Now()
+	no := func(string) bool { return false }
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.json")
+	for _, ok := range []string{
+		`{"mcp":{"timeout":{"startup":1}}}`,
+		`{"mcp":{"servers":null}}`,
+		`{"mcp":{"servers":null,"timeout":{"startup":1}}}`,
+		`{"mcp":{}}`,
+	} {
+		_ = os.WriteFile(path, []byte(ok), 0o600)
+		if _, err := mergeHarnessConfig(h, path, winExe, no, now); err != nil {
+			t.Fatalf("%s must merge: %v", ok, err)
+		}
+	}
+	_ = os.WriteFile(path, []byte(`{"mcp":{"x":{"type":"local","command":["a"]}}}`), 0o600)
+	if _, err := mergeHarnessConfig(h, path, winExe, no, now); err == nil {
+		t.Fatal("V1 flat entries must be refused")
+	}
+}
+
+func TestDetectOpencodeHonorsEnvAndDisabled(t *testing.T) {
+	home := t.TempDir()
+	exe := filepath.Join(home, "bin", "citadel")
+	_ = os.MkdirAll(filepath.Dir(exe), 0o700)
+	_ = os.WriteFile(exe, []byte("x"), 0o700)
+	cfgDir := filepath.Join(home, "custom")
+	_ = os.MkdirAll(cfgDir, 0o700)
+	h, _ := findHarness("opencode")
+	env := harnessEnv{goos: "linux", home: home, opencodeDir: cfgDir}
+	get := func() harnessConfigStatus {
+		for _, s := range detectHarnessConfigs(env) {
+			if s.Harness == "opencode" {
+				return s
+			}
+		}
+		return harnessConfigStatus{}
+	}
+	_ = os.WriteFile(filepath.Join(cfgDir, "opencode.json"), []byte(renderBlock(h, exe)), 0o600)
+	if s := get(); !s.Points || s.Path != filepath.Join(cfgDir, "opencode.json") {
+		t.Fatalf("OPENCODE_CONFIG_DIR: %+v", s)
+	}
+	// A present .jsonc takes precedence, so the .json entry no longer counts.
+	_ = os.WriteFile(filepath.Join(cfgDir, "opencode.jsonc"), []byte(`{}`), 0o600)
+	if s := get(); s.Points || !strings.HasSuffix(s.Path, "opencode.jsonc") {
+		t.Fatalf("jsonc precedence: %+v", s)
+	}
+	_ = os.Remove(filepath.Join(cfgDir, "opencode.jsonc"))
+	disabled := `{"mcp":{"servers":{"citadel":{"type":"local","command":["` + exe + `","local","mcp"],"disabled":true}}}}`
+	_ = os.WriteFile(filepath.Join(cfgDir, "opencode.json"), []byte(disabled), 0o600)
+	if s := get(); !s.Found || s.Points {
+		t.Fatalf("disabled entry must not count: %+v", s)
 	}
 }

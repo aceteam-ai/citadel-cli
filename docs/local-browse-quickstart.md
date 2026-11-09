@@ -127,9 +127,9 @@ For opencode, the entry goes under `mcp.servers` and the command is one list
 }
 ```
 
-opencode's documentation lists `~/.config/opencode/opencode.json` (or
-`opencode.jsonc`) and gives no Windows-specific user folder, so `local config`
-marks that path as unverified on Windows. `--write` only edits plain JSON: a
+This needs opencode V2. The file is `opencode.jsonc` if it exists, otherwise
+`opencode.json`, in `$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`,
+else `~/.config/opencode`. `--write` only edits plain JSON: a
 file with comments or trailing commas, or one using opencode's older flat `mcp`
 layout, is left alone and you add the entry by hand. opencode can use any
 OpenAI-compatible endpoint as its model provider, including one you run

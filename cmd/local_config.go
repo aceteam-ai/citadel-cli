@@ -12,13 +12,15 @@
 //   - claude-desktop: %APPDATA%\Claude\claude_desktop_config.json (Windows),
 //     ~/Library/Application Support/Claude/... (macOS); the Linux path is
 //     unofficial. {"mcpServers": {name: {"command", "args"}}}
-//   - opencode: ~/.config/opencode/opencode.json (or an existing opencode.jsonc),
+//   - opencode: $OPENCODE_CONFIG_DIR, else $XDG_CONFIG_HOME/opencode, else
+//     ~/.config/opencode (all OSes), file opencode.jsonc if it exists else
+//     opencode.json,
 //     {"mcp": {"servers": {name: {"type": "local", "command": [exe, "local",
 //     "mcp"]}}}} per https://opencode.ai/docs/mcp-servers/ and
 //     https://opencode.ai/docs/config/ (the "V2 (latest)" docs; the older
 //     flat "mcp": {name: ...} shape is refused, not rewritten). The docs name
-//     no env override and no Windows user path, so the Windows location is
-//     marked unverified. A server connects unless "disabled": true.
+//     Windows user path; the location follows opencode's own source
+//     (packages/util/src/global-roots.ts). Needs opencode V2. A server connects unless "disabled": true.
 //   - codex: $CODEX_HOME/config.toml (default ~/.codex),
 //     [mcp_servers.<name>] command = ..., args = [...]
 package cmd
@@ -65,11 +67,13 @@ type harnessSpec struct {
 
 // harnessEnv is the injected view of the machine harness paths depend on.
 type harnessEnv struct {
-	goos       string
-	home       string
-	appData    string // %APPDATA% on Windows
-	codexHome  string // $CODEX_HOME
-	copilotDir string // $COPILOT_HOME
+	goos        string
+	home        string
+	appData     string // %APPDATA% on Windows
+	codexHome   string // $CODEX_HOME
+	copilotDir  string // $COPILOT_HOME
+	xdgConfig   string // $XDG_CONFIG_HOME
+	opencodeDir string // $OPENCODE_CONFIG_DIR
 }
 
 func systemHarnessEnv() harnessEnv {
@@ -77,6 +81,7 @@ func systemHarnessEnv() harnessEnv {
 	return harnessEnv{
 		goos: runtime.GOOS, home: home, appData: os.Getenv("APPDATA"),
 		codexHome: os.Getenv("CODEX_HOME"), copilotDir: os.Getenv("COPILOT_HOME"),
+		xdgConfig: os.Getenv("XDG_CONFIG_HOME"), opencodeDir: os.Getenv("OPENCODE_CONFIG_DIR"),
 	}
 }
 
@@ -125,24 +130,21 @@ var harnesses = []harnessSpec{
 		jsonKeys: []string{"mcp", "servers"},
 		path: func(e harnessEnv) string {
 			dir := filepath.Join(e.home, ".config", "opencode")
-			// opencode accepts opencode.json or opencode.jsonc; keep using the
-			// one that exists (json wins when both do).
-			if _, err := os.Stat(filepath.Join(dir, "opencode.json")); err != nil {
-				if _, err := os.Stat(filepath.Join(dir, "opencode.jsonc")); err == nil {
-					return filepath.Join(dir, "opencode.jsonc")
-				}
+			if e.opencodeDir != "" {
+				dir = e.opencodeDir
+			} else if e.xdgConfig != "" {
+				dir = filepath.Join(e.xdgConfig, "opencode")
+			}
+			// opencode.jsonc takes precedence over opencode.json when present.
+			if _, err := os.Stat(filepath.Join(dir, "opencode.jsonc")); err == nil {
+				return filepath.Join(dir, "opencode.jsonc")
 			}
 			return filepath.Join(dir, "opencode.json")
 		},
 		entry: func(exe string) map[string]any {
 			return map[string]any{"type": "local", "command": append([]string{exe}, localArgs...)}
 		},
-		unverified: func(e harnessEnv) string {
-			if e.goos == "windows" {
-				return "opencode's docs give ~/.config/opencode/ and no Windows user path; this assumes the same folder under your user profile"
-			}
-			return ""
-		},
+		unverified: func(harnessEnv) string { return "" },
 	},
 	{
 		name: "codex", title: "Codex", format: "toml",
@@ -311,6 +313,25 @@ func jsonEqual(a, b []byte) bool {
 	return da.Decode(&x) == nil && db.Decode(&y) == nil && reflect.DeepEqual(x, y)
 }
 
+// hasFlatServerEntries reports whether an opencode "mcp" object holds V1-style
+// server entries. "timeout" and "servers" are V2 keys, never entries.
+func hasFlatServerEntries(mcp *orderedObject) bool {
+	for i, k := range mcp.keys {
+		if k == "timeout" || k == "servers" {
+			continue
+		}
+		if o, err := parseOrderedObject(mcp.vals[i]); err == nil {
+			if _, ok := o.get("type"); ok {
+				return true
+			}
+			if _, ok := o.get("command"); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // mergeJSON returns old with the citadel entry set under the nested object
 // path keys, preserving every other key, value and order.
 func mergeJSON(path string, old []byte, keys []string, want map[string]any, confirm func(string) bool) ([]byte, error) {
@@ -330,10 +351,10 @@ func mergeJSON(path string, old []byte, keys []string, want map[string]any, conf
 			if next, err = parseOrderedObject(raw); err != nil {
 				return nil, fmt.Errorf("%s has a %q value that is not an object; paste the block by hand", path, k)
 			}
-		} else if k == "servers" && i > 0 && keys[i-1] == "mcp" && len(chain[i].keys) > 0 {
-			// opencode's older flat layout ("mcp": {name: ...}) is a
+		} else if k == "servers" && i > 0 && keys[i-1] == "mcp" && hasFlatServerEntries(chain[i]) {
+			// opencode V1's flat layout ("mcp": {name: {type, ...}}) is a
 			// different schema; adding "servers" beside real entries would
-			// corrupt it.
+			// break V1 binaries only.
 			return nil, fmt.Errorf("%s uses an mcp layout without a \"servers\" object; add the entry by hand", path)
 		}
 		chain = append(chain, next)
@@ -653,6 +674,9 @@ func detectHarnessConfigs(env harnessEnv) []harnessConfigStatus {
 		}
 		for _, v := range servers {
 			e, _ := v.(map[string]any)
+			if d, _ := e["disabled"].(bool); d {
+				continue // a disabled server never connects
+			}
 			cmd, _ := e["command"].(string)
 			args := stringList(e["args"])
 			if list, ok := e["command"].([]any); ok && len(list) > 0 {
