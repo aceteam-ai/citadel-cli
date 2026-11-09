@@ -781,3 +781,24 @@ func TestCobrowseSessionActions_PageStateRefusedWhileHandedOff(t *testing.T) {
 		t.Fatalf("page state must be refused while handed off, got %v", err)
 	}
 }
+
+func TestCobrowseSessionActions_NavigateAsHumanValidatesURL(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	before := len(f.calls)
+	f.mu.Unlock()
+	for _, bad := range []string{"file:///etc/passwd", "javascript:alert(1)", "-x", "chrome://settings"} {
+		if _, err := m.NavigateAsHuman(st.ID, bad); !errors.Is(err, ErrCobrowseURLNotAllowed) {
+			t.Errorf("%q: want ErrCobrowseURLNotAllowed, got %v", bad, err)
+		}
+	}
+	f.mu.Lock()
+	after := len(f.calls)
+	f.mu.Unlock()
+	if after != before {
+		t.Fatal("a refused URL reached CDP")
+	}
+}

@@ -135,6 +135,9 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 // off, and it requires the handoff: the explicit-handoff bit stays set, so the
 // agent stays blocked throughout.
 func (m *CobrowseSessionManager) NavigateAsHuman(id, url string) (CobrowseSessionStatus, error) {
+	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
 	s, err := m.sessionForAction(id)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
