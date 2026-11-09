@@ -207,7 +207,7 @@
   async function pollActivity() {
     if (!selected) return;
     try {
-      const r = await fetch("/api/activity?session=" + encodeURIComponent(selected), { credentials: "same-origin" });
+      const r = await fetch("/api/activity?session=" + encodeURIComponent(selected), { credentials: "same-origin", headers: { "X-Citadel-CSRF": csrf } });
       if (!r.ok) return;
       const recs = (await r.json()).records || [];
       const ol = $("activity");

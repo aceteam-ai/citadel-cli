@@ -365,7 +365,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.withCookie(s.withCSRF(s.handleState)))
 	mux.HandleFunc("POST /api/sessions/{id}/{action}", s.withCookie(s.withCSRF(s.handleAction)))
 	mux.HandleFunc("GET /api/stream", s.withCookie(s.handleStream))
-	mux.HandleFunc("GET /api/activity", s.withCookie(s.handleActivity))
+	mux.HandleFunc("GET /api/activity", s.withCookie(s.withCSRF(s.handleActivity)))
 	mux.HandleFunc("POST /api/mint", s.handleMint)
 	return s.guard(mux)
 }

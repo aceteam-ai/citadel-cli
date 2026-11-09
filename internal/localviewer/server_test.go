@@ -357,7 +357,10 @@ func TestActivityEndpoint(t *testing.T) {
 	if r := h.do(t, "GET", "/api/activity?session=cb-9", nil, false); r.StatusCode != http.StatusForbidden {
 		t.Fatalf("activity needs the cookie: %d", r.StatusCode)
 	}
-	r := h.do(t, "GET", "/api/activity?session=cb-9", nil, true)
+	if r := h.do(t, "GET", "/api/activity?session=cb-9", nil, true); r.StatusCode != http.StatusForbidden {
+		t.Fatalf("activity needs the viewer token too: %d", r.StatusCode)
+	}
+	r := h.do(t, "GET", "/api/activity?session=cb-9", map[string]string{csrfHeader: h.srv.bearer}, true)
 	body, _ := io.ReadAll(r.Body)
 	if r.StatusCode != 200 || !strings.Contains(string(body), `"session_id":"cb-9"`) {
 		t.Fatalf("activity: %d %s", r.StatusCode, body)

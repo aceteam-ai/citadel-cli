@@ -18,14 +18,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
+
+// ensureDir creates or verifies the owner-only audit dir (a protected
+// owner-only DACL on Windows).
+var ensureDir = platform.EnsurePrivateDir
 
 // DirName is the audit directory under the node config dir.
 const DirName = "cobrowse-audit"
@@ -47,9 +56,13 @@ type Record struct {
 	IntendedAction string `json:"intended_action"`
 	Class          string `json:"class"`
 	Goal           string `json:"goal,omitempty"`
-	URL            string `json:"url,omitempty"`
-	Selector       string `json:"selector,omitempty"`
-	TextLen        int    `json:"text_len,omitempty"`
+	// URL is the target's scheme and host only; PathHash is the first 16 hex
+	// characters of the SHA-256 of its path, so the same page can be
+	// recognized without recording tokens a path or query may carry.
+	URL      string `json:"url,omitempty"`
+	PathHash string `json:"path_hash,omitempty"`
+	Selector string `json:"selector,omitempty"`
+	TextLen  int    `json:"text_len,omitempty"`
 	// ResultingAction is the outcome: ok, refused, error, or a lifecycle note.
 	ResultingAction string `json:"resulting_action"`
 	Error           string `json:"error,omitempty"`
@@ -57,33 +70,65 @@ type Record struct {
 	Hash            string `json:"hash"`
 }
 
-// hashRecord is the SHA-256 of the record's JSON with Hash empty. Field order
-// is the struct's, so the encoding is deterministic.
+// hashRecord is the SHA-256 of the record's RFC 8785 (JCS) canonical JSON with
+// Hash empty, via the same canonicalizer as AEP receipts, so a server-side
+// verifier in any language can recompute it.
 func hashRecord(r Record) string {
 	r.Hash = ""
-	b, _ := json.Marshal(r)
+	b, err := aep.CanonicalizeJCS(r)
+	if err != nil {
+		b, _ = json.Marshal(r)
+	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
-// SanitizeURL drops userinfo, query and fragment, which can carry tokens.
-func SanitizeURL(raw string) string {
+// RedactURL returns the URL's scheme and host, and a hash of its path. A URL
+// with no host (data:, javascript:, about:, a malformed string) keeps only its
+// scheme, so nothing an opaque URL carries is recorded.
+func RedactURL(raw string) (origin, pathHash string) {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return ""
+		return "", ""
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" {
-		if len(raw) > 200 {
-			raw = raw[:200]
-		}
-		return strings.SplitN(strings.SplitN(raw, "?", 2)[0], "#", 2)[0]
+		return "invalid", ""
 	}
-	u.User = nil
-	u.RawQuery = ""
-	u.ForceQuery = false
-	u.Fragment = ""
-	u.RawFragment = ""
-	return u.String()
+	scheme := strings.ToLower(u.Scheme)
+	if u.Host == "" {
+		if scheme == "about" && strings.EqualFold(u.Opaque, "blank") {
+			return "about:blank", ""
+		}
+		return scheme + ":", ""
+	}
+	origin = scheme + "://" + strings.ToLower(u.Host)
+	if p := u.EscapedPath(); p != "" && p != "/" {
+		sum := sha256.Sum256([]byte(p))
+		pathHash = hex.EncodeToString(sum[:8])
+	}
+	return origin, pathHash
+}
+
+var urlInText = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*:(//)?[^\s"'<>]+`)
+
+// SanitizeError keeps an error's text but replaces every URL in it with its
+// redacted form, and bounds its length.
+func SanitizeError(msg string) string {
+	msg = urlInText.ReplaceAllStringFunc(msg, func(m string) string {
+		if !strings.Contains(m, "/") && !strings.HasPrefix(strings.ToLower(m), "data:") && !strings.HasPrefix(strings.ToLower(m), "javascript:") {
+			return m // "approval_required:" and similar labels
+		}
+		o, h := RedactURL(m)
+		if h != "" {
+			return o + "/#" + h
+		}
+		return o
+	})
+	if len(msg) > 300 {
+		msg = msg[:300] + "..."
+	}
+	return msg
 }
 
 // Log is an open audit log.
@@ -92,9 +137,67 @@ type Log struct {
 	retention time.Duration
 	now       func() time.Time
 
-	mu   sync.Mutex
-	seq  int64
-	prev string
+	mu     sync.Mutex
+	seq    int64
+	prev   string
+	anchor Anchor
+}
+
+// Anchor is kept beside the log: the newest record, and the last record that
+// retention removed, so a missing head or tail is detectable.
+type Anchor struct {
+	HeadSeq         int64  `json:"head_seq"`
+	HeadHash        string `json:"head_hash"`
+	PrunedSeq       int64  `json:"pruned_through_seq,omitempty"`
+	PrunedHash      string `json:"pruned_through_hash,omitempty"`
+	PrunedThroughAt string `json:"pruned_through_month,omitempty"`
+}
+
+const anchorFile = "anchor.json"
+
+func readAnchor(dir string) (Anchor, error) {
+	var a Anchor
+	data, err := os.ReadFile(filepath.Join(dir, anchorFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return a, nil
+	}
+	if err != nil {
+		return a, fmt.Errorf("read audit anchor: %w", err)
+	}
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&a); err != nil {
+		return a, fmt.Errorf("audit anchor is unreadable: %w", err)
+	}
+	return a, nil
+}
+
+func writeAnchor(dir string, a Anchor) error {
+	data, _ := json.Marshal(a)
+	tmp := filepath.Join(dir, anchorFile+".tmp")
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, anchorFile))
+}
+
+// quarantineTornTail moves an incomplete final line (no trailing newline, as
+// a short write or a crash leaves) out of the log into a side file, so the
+// chain can resume. It returns the side file's path, or "".
+func quarantineTornTail(path string, now time.Time) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 || data[len(data)-1] == '\n' {
+		return "", err
+	}
+	cut := strings.LastIndexByte(string(data), '\n') + 1
+	side := fmt.Sprintf("%s.torn-%s", path, now.UTC().Format("20060102T150405Z"))
+	if err := os.WriteFile(side, data[cut:], 0o600); err != nil {
+		return "", fmt.Errorf("quarantine torn audit line: %w", err)
+	}
+	if err := os.Truncate(path, int64(cut)); err != nil {
+		return "", fmt.Errorf("quarantine torn audit line: %w", err)
+	}
+	return side, nil
 }
 
 // Open opens (creating) the audit dir, applies retention, and resumes the
@@ -107,8 +210,8 @@ func Open(dir string, retention time.Duration, now func() time.Time) (*Log, erro
 	if now == nil {
 		now = time.Now
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create audit dir %s: %w", dir, err)
+	if err := ensureDir(dir); err != nil {
+		return nil, fmt.Errorf("audit dir %s: %w", dir, err)
 	}
 	l := &Log{dir: dir, retention: retention, now: now}
 	// Resume the chain head BEFORE retention, so pruning every old month never
@@ -116,6 +219,12 @@ func Open(dir string, retention time.Duration, now func() time.Time) (*Log, erro
 	files, err := monthFiles(dir)
 	if err != nil {
 		return nil, err
+	}
+	var repaired string
+	if len(files) > 0 {
+		if repaired, err = quarantineTornTail(files[len(files)-1], now()); err != nil {
+			return nil, err
+		}
 	}
 	for i := len(files) - 1; i >= 0; i-- {
 		last, ok, err := lastRecord(files[i])
@@ -127,8 +236,29 @@ func Open(dir string, retention time.Duration, now func() time.Time) (*Log, erro
 			break
 		}
 	}
+	// The chain head must match the anchor (one record ahead is allowed: a
+	// crash between the record and the anchor write).
+	a, aerr := readAnchor(dir)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if a.HeadSeq != 0 || l.seq != 0 {
+		ok := (a.HeadSeq == l.seq && a.HeadHash == l.prev) || a.HeadSeq == l.seq-1
+		if !ok {
+			return nil, fmt.Errorf("audit log %s does not match its anchor (head seq %d, anchor seq %d): records were removed or edited; keep a copy, then move the directory aside to start a new log", dir, l.seq, a.HeadSeq)
+		}
+	}
+	l.anchor = a
+	// Retention is housekeeping: a file a reader or antivirus holds open must
+	// not stop co-browse.
 	if err := l.prune(); err != nil {
-		return nil, err
+		log.Printf("[local audit] retention skipped: %v", err)
+	}
+	if repaired != "" {
+		if _, err := l.Append(Record{Actor: "citadel", IntendedAction: "repair", Class: "L",
+			ResultingAction: "torn_tail_quarantined", Error: "an incomplete final line was moved to " + filepath.Base(repaired)}); err != nil {
+			return nil, err
+		}
 	}
 	return l, nil
 }
@@ -145,7 +275,8 @@ func (l *Log) Append(r Record) (Record, error) {
 	r.Source = "local"
 	r.Seq = l.seq + 1
 	r.CreatedAt = now.Format(time.RFC3339Nano)
-	r.URL = SanitizeURL(r.URL)
+	r.URL, r.PathHash = RedactURL(r.URL)
+	r.Error = SanitizeError(r.Error)
 	r.PrevHash = l.prev
 	r.Hash = hashRecord(r)
 	line, err := json.Marshal(r)
@@ -165,6 +296,10 @@ func (l *Log) Append(r Record) (Record, error) {
 		return Record{}, fmt.Errorf("sync audit log: %w", err)
 	}
 	l.seq, l.prev = r.Seq, r.Hash
+	l.anchor.HeadSeq, l.anchor.HeadHash = r.Seq, r.Hash
+	if err := writeAnchor(l.dir, l.anchor); err != nil {
+		return r, fmt.Errorf("write audit anchor: %w", err)
+	}
 	return r, nil
 }
 
@@ -181,6 +316,22 @@ func (l *Log) prune() error {
 			continue
 		}
 		if month.AddDate(0, 1, 0).Before(cutoff) {
+			last, ok, err := lastRecord(f)
+			if err != nil {
+				return fmt.Errorf("apply audit retention to %s: %w", filepath.Base(f), err)
+			}
+			if ok {
+				l.mu.Lock()
+				prev := l.anchor
+				l.anchor.PrunedSeq, l.anchor.PrunedHash = last.Seq, last.Hash
+				l.anchor.PrunedThroughAt = month.Format("2006-01")
+				if err := writeAnchor(l.dir, l.anchor); err != nil {
+					l.anchor = prev
+					l.mu.Unlock()
+					return fmt.Errorf("apply audit retention: %w", err)
+				}
+				l.mu.Unlock()
+			}
 			if err := os.Remove(f); err != nil {
 				return fmt.Errorf("apply audit retention: %w", err)
 			}
@@ -229,7 +380,9 @@ func eachRecord(path string, fn func(line int, r Record, raw []byte) error) erro
 			continue
 		}
 		var r Record
-		if err := json.Unmarshal(raw, &r); err != nil {
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&r); err != nil {
 			return fmt.Errorf("%s:%d: not a valid record: %w", filepath.Base(path), n, err)
 		}
 		if err := fn(n, r, raw); err != nil {
@@ -254,16 +407,22 @@ type VerifyResult struct {
 	Records  int
 	FirstSeq int64
 	LastSeq  int64
-	// Truncated is true when the oldest retained record is not seq 1, i.e.
-	// earlier months were removed by retention.
+	// Truncated is true when the oldest retained record is not seq 1 and the
+	// gap is exactly what retention recorded in the anchor.
 	Truncated bool
 }
 
-// Verify recomputes every hash and link. It returns the first break found,
-// naming the file and line.
+// Verify recomputes every hash and link, and checks both ends of the chain
+// against the anchor: the newest record must be the anchored head, and a
+// missing start must be exactly the months retention removed. It returns the
+// first problem found, naming the file and line.
 func Verify(dir string) (VerifyResult, error) {
 	var res VerifyResult
 	files, err := monthFiles(dir)
+	if err != nil {
+		return res, err
+	}
+	a, err := readAnchor(dir)
 	if err != nil {
 		return res, err
 	}
@@ -276,9 +435,15 @@ func Verify(dir string) (VerifyResult, error) {
 			}
 			if res.Records == 0 {
 				res.FirstSeq = r.Seq
-				res.Truncated = r.Seq != 1
-				if r.Seq == 1 && r.PrevHash != "" {
-					return fmt.Errorf("%s: first record links to a missing predecessor", where)
+				switch {
+				case r.Seq == 1:
+					if r.PrevHash != "" {
+						return fmt.Errorf("%s: first record links to a missing predecessor", where)
+					}
+				case a.PrunedSeq == r.Seq-1 && a.PrunedHash == r.PrevHash && line == 1:
+					res.Truncated = true
+				default:
+					return fmt.Errorf("%s: records before this one are missing and were not removed by retention", where)
 				}
 			} else {
 				if r.PrevHash != prev {
@@ -296,6 +461,12 @@ func Verify(dir string) (VerifyResult, error) {
 		if err != nil {
 			return res, err
 		}
+	}
+	switch {
+	case res.Records == 0 && a.HeadSeq != 0:
+		return res, fmt.Errorf("the log is empty but its anchor records %d entries: records were removed", a.HeadSeq)
+	case res.Records > 0 && a.HeadSeq != 0 && !(a.HeadSeq == res.LastSeq && a.HeadHash == prev) && a.HeadSeq != res.LastSeq-1:
+		return res, fmt.Errorf("the newest record (seq %d) is not the anchored head (seq %d): records were removed from the end", res.LastSeq, a.HeadSeq)
 	}
 	return res, nil
 }

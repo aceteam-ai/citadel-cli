@@ -67,8 +67,12 @@ func TestLocalAuditRecordsEveryCallWithoutSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, user, refused := 0, 0, 0
+	agent, user, refused, pending := 0, 0, 0, 0
 	for _, r := range recs {
+		if r.ResultingAction == "pending" {
+			pending++
+			continue
+		}
 		switch r.Actor {
 		case "agent":
 			agent++
@@ -88,15 +92,22 @@ func TestLocalAuditRecordsEveryCallWithoutSecrets(t *testing.T) {
 	if agent != agentCalls || user != 1 {
 		t.Fatalf("want one record per call (%d agent, 1 user), got %d agent, %d user", agentCalls, agent, user)
 	}
-	if refused != 2 {
-		t.Errorf("want the 2 refusals recorded, got %d", refused)
+	// The four writes that ran (type, navigate, click, key) each have a
+	// pending record written before they reached the browser.
+	if pending != 4 {
+		t.Fatalf("want 4 pending records before writes, got %d", pending)
+	}
+	// Refused: type before approval, screenshot while the user drives, and
+	// the agent's resume (only the user hands back).
+	if refused != 3 {
+		t.Errorf("want the 3 refusals recorded, got %d", refused)
 	}
 
 	// Typed text and URL secrets never reach the log.
 	files, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	for _, f := range files {
 		b, _ := os.ReadFile(f)
-		for _, secret := range []string{auditSentinel, "abc123"} {
+		for _, secret := range []string{auditSentinel, "abc123", "/login", "/orders"} {
 			if bytes.Contains(b, []byte(secret)) {
 				t.Fatalf("%q leaked into %s", secret, f)
 			}
@@ -118,6 +129,29 @@ func TestLocalAuditRecordsEveryCallWithoutSecrets(t *testing.T) {
 	}
 	if err := runLocalAudit(dir, localAuditOptions{verify: true}, &out); err == nil || !strings.Contains(err.Error(), "modified") {
 		t.Fatalf("edit must be detected, got %v", err)
+	}
+}
+
+func TestLocalAuditArgumentRefusalsAreRecorded(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	// Tool calls run concurrently, so send them one at a time.
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+	runLocalBridge(t, rt, nil, call(2, "local_cobrowse_click", map[string]any{"session_id": "cb-1"}))
+	runLocalBridge(t, rt, nil, call(3, "local_cobrowse_screenshot", map[string]any{}))
+	recs, _ := localaudit.Read(filepath.Join(ownerDir, localaudit.DirName), localaudit.Filter{})
+	var click, shot bool
+	for _, r := range recs {
+		if r.IntendedAction == "click" && r.ResultingAction == "refused" {
+			click = true
+		}
+		if r.IntendedAction == "screenshot" && r.ResultingAction == "refused" {
+			shot = true
+		}
+	}
+	if !click || !shot {
+		t.Fatalf("argument refusals must be audited: %+v", recs)
 	}
 }
 
@@ -144,5 +178,39 @@ func TestLocalAuditWriteFailureTurnsCobrowseOff(t *testing.T) {
 	content, isErr := toolResult(t, resp["3"])
 	if !isErr || !strings.Contains(firstText(content), "audit log") {
 		t.Fatalf("co-browse must refuse once the audit log cannot be written: %v", resp["3"])
+	}
+	// The user's safety controls still work.
+	if err := rt.svc.HumanTakeControl("cb-1"); err != nil {
+		t.Fatalf("take control after an audit failure: %v", err)
+	}
+	if err := rt.svc.HumanStop("cb-1"); err != nil {
+		t.Fatalf("stop after an audit failure: %v", err)
+	}
+}
+
+func TestLocalAuditPendingFailureBlocksTheWrite(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	ownerDir := t.TempDir()
+	fb := newCmdFakeBrowser()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: fb, policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+	_ = rt.svc.Approve("cb-1", 0)
+	dir := filepath.Join(ownerDir, localaudit.DirName)
+	files, _ := filepath.Glob(filepath.Join(dir, "*"))
+	for _, f := range files {
+		_ = os.Chmod(f, 0o400)
+	}
+	_ = os.Chmod(dir, 0o500)
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	fb.clicks = 0
+	resp := runLocalBridge(t, rt, nil, call(2, "local_cobrowse_click", map[string]any{"session_id": "cb-1", "selector": "#x"}))
+	if _, isErr := toolResult(t, resp["2"]); !isErr {
+		t.Fatalf("a write whose pending record cannot be written must be refused: %v", resp["2"])
+	}
+	if fb.clicks != 0 {
+		t.Fatal("the write reached the browser without a record")
 	}
 }

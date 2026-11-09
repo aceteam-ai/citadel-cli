@@ -11,6 +11,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -116,6 +117,27 @@ func (rt *localCobrowseRuntime) recordEvent(ev localcobrowse.Event) {
 	}
 }
 
+// recordPending appends the pending record for a write about to run. If it
+// cannot be written the write is refused and co-browse turns off.
+func (rt *localCobrowseRuntime) recordPending(ev localcobrowse.Event) error {
+	rt.mu.Lock()
+	log := rt.audit
+	rt.mu.Unlock()
+	if log == nil {
+		return nil
+	}
+	if _, err := log.Append(auditRecordFor(ev)); err != nil {
+		rt.mu.Lock()
+		if rt.auditErr == nil {
+			rt.auditErr = fmt.Errorf("the local audit log in %s cannot be written (%v); co-browse is off until Citadel restarts. You can still stop or take over sessions in the viewer", log.Dir(), err)
+		}
+		e := rt.auditErr
+		rt.mu.Unlock()
+		return e
+	}
+	return nil
+}
+
 func (rt *localCobrowseRuntime) auditPrecheck() error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -173,7 +195,10 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 				opts.onEvent(ev)
 			}
 		},
-		Precheck:   rt.auditPrecheck,
+		Precheck: rt.auditPrecheck,
+		BeforeAction: func(ev localcobrowse.Event) error {
+			return rt.recordPending(ev)
+		},
 		ViewerNote: viewerNote,
 		AcquireOwner: func() error {
 			if opts.ownerDir == nil {
@@ -326,12 +351,18 @@ func jsonText(v any) (string, error) {
 	return string(b), nil
 }
 
+// argError marks a call refused for its arguments before it reached the
+// service, so the tool wrapper can still audit it.
+type argError struct{ error }
+
+func (e argError) Unwrap() error { return e.error }
+
 func decodeArgs(args json.RawMessage, into any) error {
 	if len(args) == 0 {
 		return nil
 	}
 	if err := json.Unmarshal(args, into); err != nil {
-		return fmt.Errorf("invalid arguments: %w", err)
+		return argError{fmt.Errorf("invalid arguments: %w", err)}
 	}
 	return nil
 }
@@ -339,9 +370,22 @@ func decodeArgs(args json.RawMessage, into any) error {
 func requireSession(id string) (string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return "", fmt.Errorf("'session_id' is required (from local_cobrowse_start)")
+		return "", argError{fmt.Errorf("'session_id' is required (from local_cobrowse_start)")}
 	}
 	return id, nil
+}
+
+// recordArgRefusal audits a call refused for its arguments.
+func recordArgRefusal(s *localcobrowse.Service, tool string, args json.RawMessage, err error) {
+	var ae argError
+	if !errors.As(err, &ae) {
+		return
+	}
+	var in struct {
+		SessionID string `json:"session_id"`
+	}
+	_ = json.Unmarshal(args, &in)
+	s.RecordRefusal(strings.TrimSpace(in.SessionID), strings.TrimPrefix(tool, "local_cobrowse_"), "", err)
 }
 
 func strProp(desc string) map[string]any {
@@ -384,6 +428,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				}
 				v, err := do(ctx, s, args)
 				if err != nil {
+					recordArgRefusal(s, name, args, err)
 					return "", err
 				}
 				return jsonText(v)
@@ -469,7 +514,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 					return nil, err
 				}
 				if in.Selector == "" && (in.X == nil || in.Y == nil) {
-					return nil, fmt.Errorf("click requires 'selector' or both 'x' and 'y'")
+					return nil, argError{fmt.Errorf("click requires 'selector' or both 'x' and 'y'")}
 				}
 				return s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal)
 			}),
@@ -589,10 +634,12 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 					Goal      string `json:"goal"`
 				}
 				if err := decodeArgs(args, &in); err != nil {
+					recordArgRefusal(s, "local_cobrowse_screenshot", args, err)
 					return nil, err
 				}
 				id, err := requireSession(in.SessionID)
 				if err != nil {
+					recordArgRefusal(s, "local_cobrowse_screenshot", args, err)
 					return nil, err
 				}
 				png, err := s.Screenshot(ctx, id, in.Goal)

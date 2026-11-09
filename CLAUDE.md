@@ -131,14 +131,17 @@ one-time launch file (`writeLaunchFile`), never on a command line.
 `TestOpenKeepsTheCodeOffTheCommandLine` pin the boundary.
 
 `localaudit.Log` owns the local co-browse audit chain under
-`<node config dir>/cobrowse-audit`, one JSONL file per UTC month. `Open`
-resumes the chain head before applying retention, and `Verify` names the first
-broken record. Only the co-browse owner writes, so each chain has one writer.
-`cmd.localCobrowseRuntime.recordEvent` maps every service event, refusals and
-viewer actions included, to one record. A failed write turns co-browse off
-through `Config.Precheck`. Events carry only a typed-text length, and URLs lose
-their query and fragment (`SanitizeURL`).
-`TestLocalAuditRecordsEveryCallWithoutSecrets` greps the log for a sentinel.
+`<node config dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
+month. Each record's hash is over its RFC 8785 form (`aep.CanonicalizeJCS`).
+`anchor.json` holds the head and what retention removed, so `Verify` catches a
+missing tail or an unretained missing head. `Open` quarantines a torn final line,
+and a failed prune is not fatal. Only the co-browse owner writes, so each chain
+has one writer. A write gets a pending record before it runs
+(`Config.BeforeAction`); if that write fails the action is refused and
+co-browse turns off. The human's Stop and Take control bypass that precheck.
+URLs are kept as origin plus a path hash (`RedactURL`), and error text is
+sanitized. `TestLocalAuditRecordsEveryCallWithoutSecrets` greps the log for a
+sentinel.
 
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
