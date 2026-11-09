@@ -3491,3 +3491,18 @@ Auto-generated log of every release.
   - feat(mediainput): prepare shared pinned HTTPS inbox acquisition (#1413)
 
 
+---
+
+## v2.211.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +126 |
+
+**Changes:**
+
+  - fix(cobrowse): restrict session URLs to http(s) and terminate browser switches (#1575)
+
+
