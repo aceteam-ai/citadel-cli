@@ -12,6 +12,15 @@
 //   - claude-desktop: %APPDATA%\Claude\claude_desktop_config.json (Windows),
 //     ~/Library/Application Support/Claude/... (macOS); the Linux path is
 //     unofficial. {"mcpServers": {name: {"command", "args"}}}
+//   - opencode: $OPENCODE_CONFIG_DIR, else $XDG_CONFIG_HOME/opencode, else
+//     ~/.config/opencode (all OSes), file opencode.jsonc if it exists else
+//     opencode.json,
+//     {"mcp": {"servers": {name: {"type": "local", "command": [exe, "local",
+//     "mcp"]}}}} per https://opencode.ai/docs/mcp-servers/ and
+//     https://opencode.ai/docs/config/ (the "V2 (latest)" docs; the older
+//     flat "mcp": {name: ...} shape is refused, not rewritten). The docs name
+//     Windows user path; the location follows opencode's own source
+//     (packages/util/src/global-roots.ts). Needs opencode V2. A server connects unless "disabled": true.
 //   - codex: $CODEX_HOME/config.toml (default ~/.codex),
 //     [mcp_servers.<name>] command = ..., args = [...]
 package cmd
@@ -47,19 +56,24 @@ type harnessSpec struct {
 	name   string
 	title  string
 	format string // "json" or "toml"
-	path   func(env harnessEnv) string
-	entry  func(exe string) map[string]any
+	// jsonKeys is the nested object path holding the servers (JSON only);
+	// nil means ["mcpServers"].
+	jsonKeys []string
+	path     func(env harnessEnv) string
+	entry    func(exe string) map[string]any
 	// unverified explains why a location could not be confirmed for env, or "".
 	unverified func(env harnessEnv) string
 }
 
 // harnessEnv is the injected view of the machine harness paths depend on.
 type harnessEnv struct {
-	goos       string
-	home       string
-	appData    string // %APPDATA% on Windows
-	codexHome  string // $CODEX_HOME
-	copilotDir string // $COPILOT_HOME
+	goos        string
+	home        string
+	appData     string // %APPDATA% on Windows
+	codexHome   string // $CODEX_HOME
+	copilotDir  string // $COPILOT_HOME
+	xdgConfig   string // $XDG_CONFIG_HOME
+	opencodeDir string // $OPENCODE_CONFIG_DIR
 }
 
 func systemHarnessEnv() harnessEnv {
@@ -67,6 +81,7 @@ func systemHarnessEnv() harnessEnv {
 	return harnessEnv{
 		goos: runtime.GOOS, home: home, appData: os.Getenv("APPDATA"),
 		codexHome: os.Getenv("CODEX_HOME"), copilotDir: os.Getenv("COPILOT_HOME"),
+		xdgConfig: os.Getenv("XDG_CONFIG_HOME"), opencodeDir: os.Getenv("OPENCODE_CONFIG_DIR"),
 	}
 }
 
@@ -109,6 +124,27 @@ var harnesses = []harnessSpec{
 			}
 			return ""
 		},
+	},
+	{
+		name: "opencode", title: "opencode", format: "json",
+		jsonKeys: []string{"mcp", "servers"},
+		path: func(e harnessEnv) string {
+			dir := filepath.Join(e.home, ".config", "opencode")
+			if e.opencodeDir != "" {
+				dir = e.opencodeDir
+			} else if e.xdgConfig != "" {
+				dir = filepath.Join(e.xdgConfig, "opencode")
+			}
+			// opencode.jsonc takes precedence over opencode.json when present.
+			if _, err := os.Stat(filepath.Join(dir, "opencode.jsonc")); err == nil {
+				return filepath.Join(dir, "opencode.jsonc")
+			}
+			return filepath.Join(dir, "opencode.json")
+		},
+		entry: func(exe string) map[string]any {
+			return map[string]any{"type": "local", "command": append([]string{exe}, localArgs...)}
+		},
+		unverified: func(harnessEnv) string { return "" },
 	},
 	{
 		name: "codex", title: "Codex", format: "toml",
@@ -160,8 +196,20 @@ func renderBlock(h harnessSpec, exe string) string {
 		}
 		return fmt.Sprintf("[mcp_servers.%s]\ncommand = %s\nargs = [%s]\n", localServerName, tomlString(exe), strings.Join(args, ", "))
 	}
-	b, _ := marshalNoEscape(map[string]any{"mcpServers": map[string]any{localServerName: h.entry(exe)}}, "  ")
+	var doc any = map[string]any{localServerName: h.entry(exe)}
+	keys := h.keyPath()
+	for i := len(keys) - 1; i >= 0; i-- {
+		doc = map[string]any{keys[i]: doc}
+	}
+	b, _ := marshalNoEscape(doc, "  ")
 	return string(b) + "\n"
+}
+
+func (h harnessSpec) keyPath() []string {
+	if len(h.jsonKeys) > 0 {
+		return h.jsonKeys
+	}
+	return []string{"mcpServers"}
 }
 
 func marshalNoEscape(v any, indent string) ([]byte, error) {
@@ -265,23 +313,53 @@ func jsonEqual(a, b []byte) bool {
 	return da.Decode(&x) == nil && db.Decode(&y) == nil && reflect.DeepEqual(x, y)
 }
 
-// mergeJSON returns old with mcpServers.citadel set to want, preserving every
-// other key, value and order.
-func mergeJSON(path string, old []byte, want map[string]any, confirm func(string) bool) ([]byte, error) {
+// hasFlatServerEntries reports whether an opencode "mcp" object holds V1-style
+// server entries. "timeout" and "servers" are V2 keys, never entries.
+func hasFlatServerEntries(mcp *orderedObject) bool {
+	for i, k := range mcp.keys {
+		if k == "timeout" || k == "servers" {
+			continue
+		}
+		if o, err := parseOrderedObject(mcp.vals[i]); err == nil {
+			if _, ok := o.get("type"); ok {
+				return true
+			}
+			if _, ok := o.get("command"); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mergeJSON returns old with the citadel entry set under the nested object
+// path keys, preserving every other key, value and order.
+func mergeJSON(path string, old []byte, keys []string, want map[string]any, confirm func(string) bool) ([]byte, error) {
 	root := &orderedObject{}
 	if len(bytes.TrimSpace(old)) > 0 {
 		var err error
 		if root, err = parseOrderedObject(old); err != nil {
-			return nil, fmt.Errorf("%s is not valid JSON (%v); fix it or paste the block by hand", path, err)
+			return nil, fmt.Errorf("%s is not strict JSON (%v). Comments and trailing commas are not rewritten safely; paste the block by hand", path, err)
 		}
 	}
-	servers := &orderedObject{}
-	if raw, ok := root.get("mcpServers"); ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		var err error
-		if servers, err = parseOrderedObject(raw); err != nil {
-			return nil, fmt.Errorf("%s has an mcpServers value that is not an object; paste the block by hand", path)
+	// chain[i] is the object at keys[:i]; chain[0] is root.
+	chain := []*orderedObject{root}
+	for i, k := range keys {
+		next := &orderedObject{}
+		if raw, ok := chain[i].get(k); ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			var err error
+			if next, err = parseOrderedObject(raw); err != nil {
+				return nil, fmt.Errorf("%s has a %q value that is not an object; paste the block by hand", path, k)
+			}
+		} else if k == "servers" && i > 0 && keys[i-1] == "mcp" && hasFlatServerEntries(chain[i]) {
+			// opencode V1's flat layout ("mcp": {name: {type, ...}}) is a
+			// different schema; adding "servers" beside real entries would
+			// break V1 binaries only.
+			return nil, fmt.Errorf("%s uses an mcp layout without a \"servers\" object; add the entry by hand", path)
 		}
+		chain = append(chain, next)
 	}
+	servers := chain[len(keys)]
 	wantRaw, err := marshalNoEscape(want, "")
 	if err != nil {
 		return nil, err
@@ -295,7 +373,9 @@ func mergeJSON(path string, old []byte, want map[string]any, confirm func(string
 		}
 	}
 	servers.set(localServerName, wantRaw)
-	root.set("mcpServers", servers.marshal())
+	for i := len(keys) - 1; i >= 0; i-- {
+		chain[i].set(keys[i], chain[i+1].marshal())
+	}
 	var out bytes.Buffer
 	if err := json.Indent(&out, root.marshal(), "", "  "); err != nil {
 		return nil, err
@@ -413,7 +493,7 @@ func mergeHarnessConfig(h harnessSpec, path, exe string, confirm func(string) bo
 	if h.format == "toml" {
 		next, err = mergeTOML(path, old, h, exe)
 	} else {
-		next, err = mergeJSON(path, old, h.entry(exe), confirm)
+		next, err = mergeJSON(path, old, h.keyPath(), h.entry(exe), confirm)
 	}
 	if err != nil {
 		return "", err
@@ -583,17 +663,28 @@ func detectHarnessConfigs(env harnessEnv) []harnessConfigStatus {
 				servers, _ = doc["mcp_servers"].(map[string]any)
 			}
 		} else {
-			var doc struct {
-				MCPServers map[string]any `json:"mcpServers"`
-			}
+			var doc map[string]any
 			if json.Unmarshal(data, &doc) == nil {
-				servers = doc.MCPServers
+				cur := doc
+				for _, k := range h.keyPath() {
+					cur, _ = cur[k].(map[string]any)
+				}
+				servers = cur
 			}
 		}
 		for _, v := range servers {
 			e, _ := v.(map[string]any)
+			if d, _ := e["disabled"].(bool); d {
+				continue // a disabled server never connects
+			}
 			cmd, _ := e["command"].(string)
-			if entryPoints(cmd, stringList(e["args"]), exists) {
+			args := stringList(e["args"])
+			if list, ok := e["command"].([]any); ok && len(list) > 0 {
+				// opencode: command is [exe, args...].
+				all := stringList(list)
+				cmd, args = all[0], all[1:]
+			}
+			if entryPoints(cmd, args, exists) {
 				st.Points, st.Command = true, cmd
 				break
 			}

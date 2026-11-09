@@ -72,8 +72,19 @@ func (c *Client) Publish(ctx context.Context, channel string, message any) error
 
 // PublishStreamEvent publishes a streaming event to Redis Pub/Sub.
 func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType string, data map[string]any) error {
-	streamName := fmt.Sprintf("stream:v1:%s", jobID)
+	return c.PublishEvent(ctx, c.BuildStreamEvent(jobID, rayID, eventType, data))
+}
 
+// PublishEvent publishes an envelope built by BuildStreamEvent on the job's
+// stream:v1 channel.
+func (c *Client) PublishEvent(ctx context.Context, event StreamEvent) error {
+	return c.Publish(ctx, fmt.Sprintf("stream:v1:%s", event.JobID), event)
+}
+
+// BuildStreamEvent builds the exact stream:v1 envelope PublishStreamEvent
+// publishes, including the node identity metadata. A caller that both
+// publishes and retains an event uses it so the two copies are identical.
+func (c *Client) BuildStreamEvent(jobID, rayID, eventType string, data map[string]any) StreamEvent {
 	// Inject node identity metadata into every event for operator attribution
 	if c.nodeMeta != nil {
 		if data == nil {
@@ -82,7 +93,7 @@ func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType
 		data["meta"] = c.nodeMeta
 	}
 
-	event := StreamEvent{
+	return StreamEvent{
 		Version:   "1.0",
 		Type:      eventType,
 		JobID:     jobID,
@@ -90,8 +101,6 @@ func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data:      data,
 	}
-
-	return c.Publish(ctx, streamName, event)
 }
 
 // PublishClaimed publishes a "claimed" event for a job, emitted the moment the
