@@ -14,9 +14,10 @@ Windows comes first. See the
 - **`citadel local mcp`.** A stdio MCP server that serves only local tools,
   including the new `local_cobrowse_*` tools: start, status, navigate, click,
   type, select, key, scroll, extract, screenshot, handoff, resume, stop and
-  wait. It never reads an API key or device token, and it makes no network
-  calls of its own (no update check, no telemetry), apart from DNS lookups for
-  the addresses the agent asks to open.
+  wait. It never reads an API key or device token, and Citadel makes no calls of
+  its own (no update check, no telemetry). The co-browse browser connects only
+  to public internet addresses, through a guard inside Citadel, with its own
+  background updates and syncing turned off.
 - **Windows browser runner.** Uses the installed Microsoft Edge or Google
   Chrome in a hidden (headless) window, so it never takes over your screen. A
   Windows Job Object ties the browser to the Citadel process, so no browser

@@ -9,13 +9,13 @@ the same computer, with you in charge:
   you type.
 - **Approvals and an audit trail.** The agent can look at pages without
   asking, but it needs your approval in the viewer before it clicks, types or
-  navigates. Every action is recorded on this computer, and `citadel local
-  audit` shows it.
+  navigates. Every action is recorded on this computer, and
+  `citadel.exe local audit` shows it.
 - **It stays on your computer.** There is no AceTeam account. Docker and admin
-  rights are not needed. Local mode makes no network calls of its own (no
-  update check and no telemetry), apart from DNS lookups for the addresses the
-  agent asks to open. The browser itself loads the pages you and the agent
-  visit.
+  rights are not needed. Citadel makes no calls of its own: no update check
+  and no telemetry. The co-browse browser's connections go through a guard
+  inside Citadel that only connects to public internet addresses, and the
+  browser's own background updates and syncing are turned off.
 
 Citadel is source-available under the Elastic License 2.0, and free to use and
 self-host. This page covers Windows 10 and 11 first. macOS and Linux are coming.
@@ -24,9 +24,10 @@ self-host. This page covers Windows 10 and 11 first. macOS and Linux are coming.
 
 - Windows 10 or 11 (x64).
 - Microsoft Edge, which comes with Windows, or Google Chrome, version 109 or
-  newer. `citadel local doctor` checks this.
+  newer. `citadel.exe local doctor` checks this.
 - One MCP-capable agent app. These are covered below:
-  - GitHub Copilot (the Copilot CLI, or VS Code with Copilot);
+  - the GitHub Copilot CLI (VS Code keeps its MCP servers in its own
+    `mcp.json` file, which this guide does not cover);
   - Claude Desktop;
   - Codex.
 
@@ -53,6 +54,13 @@ and allow it; signed releases are planned.
 & "$env:LOCALAPPDATA\Citadel\citadel.exe" local doctor
 ```
 
+To save typing in the steps below, keep the path in a variable for this
+PowerShell window:
+
+```powershell
+$citadel = "$env:LOCALAPPDATA\Citadel\citadel.exe"
+```
+
 Each line is `ok`, `note` or `FAIL`, and every `FAIL` names a fix. The checks
 are:
 
@@ -70,9 +78,9 @@ Print the entry for your app. It contains the full path to `citadel.exe`,
 because apps started from the Start menu may not see an updated `PATH`.
 
 ```powershell
-citadel local config copilot          # GitHub Copilot: ~\.copilot\mcp-config.json
-citadel local config claude-desktop   # %APPDATA%\Claude\claude_desktop_config.json
-citadel local config codex            # ~\.codex\config.toml
+& $citadel local config copilot          # Copilot CLI: ~\.copilot\mcp-config.json
+& $citadel local config claude-desktop   # %APPDATA%\Claude\claude_desktop_config.json
+& $citadel local config codex            # ~\.codex\config.toml (or $env:CODEX_HOME)
 ```
 
 Add `--write` to have Citadel merge the entry into that file for you. It asks
@@ -125,10 +133,11 @@ orders, let me log in, then list my last three orders."
 5. **Stop.** When the agent calls `local_cobrowse_stop`, or you press **End
    session**, the browser's cookies and logins for that session are deleted.
 
-If you close the viewer tab, reopen it with:
+If you close the viewer tab, reopen it (in a PowerShell window where you set
+`$citadel` as above) with:
 
 ```powershell
-citadel local viewer
+& $citadel local viewer
 ```
 
 The command opens a fresh one-time link.
@@ -151,13 +160,13 @@ The command opens a fresh one-time link.
 |---|---|
 | "no supported browser found" | Install Microsoft Edge or Google Chrome. The message lists every place Citadel looked. |
 | "organization policy blocks automation" | A work or school computer can forbid browser automation. Use a personal computer or a per-user Chrome install. |
-| "exited during headless launch" | Run `citadel local doctor`. If it repeats, restart the computer. |
-| The viewer says "No agent connected" | The agent app has not started Citadel. Check its config with `citadel local doctor`, then restart the app. |
+| "exited during headless launch" | Run `& $citadel local doctor`. If it repeats, restart the computer. |
+| The viewer says "No agent connected" | The agent app has not started Citadel. Check its config with `& $citadel local doctor`, then restart the app. |
 | "another Citadel process already owns co-browse" | Another agent app is using co-browse. Close it, or use that one. |
 | `approval_denied` / `approval_expired` / `approval_revoked` | The agent was told your answer. Approve again in the viewer if you want it to continue. |
 | "navigation refused" | The agent tried a local, private or non-web address. This is deliberate. |
 | `rate_limited` | The agent is acting too fast. It should slow down. |
-| The viewer link "expired or was already used" | Run `citadel local viewer`. |
+| The viewer link "expired or was already used" | Run `& $citadel local viewer`. |
 | A sign-in popup or a second tab does not show | Popups and extra tabs are not shown in the viewer yet. Use a site's email-and-password login. |
 
 ## What it protects, and what it does not
@@ -175,7 +184,7 @@ account, including an agent app with shell access that decides to misbehave.
 Such a program can already read your files. This is the same boundary as any
 local agent tool.
 
-`citadel local audit --verify` checks that the audit log was not edited. That
+`& $citadel local audit --verify` checks that the audit log was not edited. That
 detects tampering. It does not prove anything against a program running as
 your account.
 

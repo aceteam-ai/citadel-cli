@@ -37,6 +37,8 @@ type localDoctorDeps struct {
 	owner      func() error
 	audit      func() (localaudit.VerifyResult, error)
 	harnesses  []harnessConfigStatus
+	// exe is how fix lines refer to citadel (the full path, quoted if needed).
+	exe string
 }
 
 func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
@@ -65,10 +67,15 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 			return localaudit.Verify(filepath.Join(nodeDir, localaudit.DirName))
 		},
 		harnesses: detectHarnessConfigs(systemHarnessEnv()),
+		exe:       "citadel",
+	}
+	if exe, err := citadelExecutable(); err == nil {
+		d.exe = quoteExe(exe)
 	}
 	if !skipLaunch {
 		d.launchTest = func() (string, string, error) {
 			m := platform.NewCobrowseSessionManager(platform.DefaultCobrowseSessionsBaseDir(), 1)
+			m.SetLaunchOptions(platform.LaunchOptions{Quiet: true})
 			st, err := m.StartSession("about:blank")
 			if err != nil {
 				return "", "", err
@@ -180,16 +187,16 @@ func runLocalDoctor(d localDoctorDeps, out io.Writer) error {
 		switch {
 		case h.Points:
 			pointed++
-			ok("Harness", fmt.Sprintf("%s: %s points at citadel local mcp", h.Harness, h.Path))
+			ok("Harness", fmt.Sprintf("%s: %s runs %s local mcp", h.Harness, h.Path, h.Command))
 		case h.Found:
-			warn("Harness", fmt.Sprintf("%s: %s exists but has no citadel entry. Fix: citadel local config %s", h.Harness, h.Path, h.Harness))
+			warn("Harness", fmt.Sprintf("%s: %s has no working citadel entry. Fix: %s local config %s --write", h.Harness, h.Path, d.exe, h.Harness))
 		}
 	}
 	if pointed == 0 {
-		warn("Harness", "no agent app is configured yet. Fix: citadel local config copilot (or claude-desktop, codex)")
+		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-desktop, codex)", d.exe))
 	}
 
-	ok("Network", "local mode makes no network calls of its own (no account, no update check, no telemetry), apart from DNS lookups for addresses the agent asks to open")
+	ok("Network", "Citadel makes no calls of its own (no account, no update check, no telemetry). The co-browse browser connects only to public addresses, through Citadel's local guard, with background updates off")
 
 	if failed {
 		return errLocalDoctorFailed
