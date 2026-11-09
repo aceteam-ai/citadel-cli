@@ -1,0 +1,27 @@
+:root { font-family: system-ui, "Segoe UI", sans-serif; color: #1d1d1f; background: #f6f6f7; }
+body { margin: 0; }
+.top { display: flex; gap: .5rem; align-items: baseline; padding: .6rem 1rem; background: #fff; border-bottom: 1px solid #ddd; }
+.right { margin-left: auto; }
+.muted { color: #666; }
+#tabs { display: flex; gap: .25rem; padding: .4rem 1rem; }
+#tabs button { border: 1px solid #ccc; background: #fff; border-radius: 6px; padding: .25rem .6rem; cursor: pointer; }
+#tabs button.sel { border-color: #2457d6; color: #2457d6; }
+main { padding: 0 1rem 1rem; }
+.empty { padding: 2rem 1rem; color: #555; }
+.task { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: .6rem .8rem; margin: .4rem 0; }
+.goal { font-weight: 600; margin-bottom: .3rem; }
+.facts { display: flex; gap: .8rem; flex-wrap: wrap; align-items: center; }
+.pill { border-radius: 999px; padding: .1rem .6rem; background: #e8eefc; color: #2457d6; font-size: .9em; }
+.pill.human { background: #fdecc8; color: #8a5300; }
+.banner { background: #fdecc8; border: 1px solid #e3b65c; border-radius: 8px; padding: .5rem .8rem; margin: .4rem 0; font-weight: 600; }
+.card { background: #fff; border: 2px solid #2457d6; border-radius: 8px; padding: .6rem .8rem; margin: .4rem 0; }
+.controls { display: flex; gap: .5rem; align-items: center; margin: .5rem 0; }
+#address { flex: 1; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 6px; }
+#address:disabled { background: #f0f0f0; color: #777; }
+button { padding: .35rem .8rem; border-radius: 6px; border: 1px solid #bbb; background: #fff; cursor: pointer; }
+button.primary { background: #2457d6; border-color: #2457d6; color: #fff; }
+button.quiet { border-color: transparent; background: transparent; color: #555; }
+button.danger { color: #b3261e; }
+#screen-wrap { background: #222; border-radius: 6px; outline: none; display: flex; justify-content: center; }
+#screen-wrap.driving { box-shadow: 0 0 0 3px #e3b65c; }
+#screen { max-width: 100%; height: auto; user-select: none; }

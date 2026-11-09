@@ -118,6 +118,16 @@ fallthrough, and `isLocalModeCommand` skips the root pre-run's CA trust and
 update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
 user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
 
+`localviewer.Server` owns the local-mode loopback viewer. `guard` checks Host
+and Origin, `withCookie` and `withCSRF` gate the rest, and `handleOpen` is the
+only place the viewer cookie is issued, in exchange for a single-use code. The
+code goes only into the URL opened in the user's default browser and never
+over MCP. `cobrowsestream.NewStreamHandler` mounts the screencast behind those
+checks; the unauthenticated mesh server is not started in local mode.
+`citadel local viewer` gets a fresh link through `RequestLink`, using the
+per-launch bearer in `local-viewer.json`. `TestGuardsReturn403` and
+`TestCookieOnlyFromSingleUseCode` pin the boundary.
+
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
 **Key Components:**
