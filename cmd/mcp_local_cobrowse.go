@@ -12,11 +12,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
+	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -27,11 +31,14 @@ import (
 type localCobrowseRuntime struct {
 	svc *localcobrowse.Service
 
-	mu     sync.Mutex
-	owner  *localcobrowse.Owner
-	guard  *localcobrowse.EgressGuard
-	viewer *localviewer.Server
-	stop   chan struct{}
+	mu       sync.Mutex
+	owner    *localcobrowse.Owner
+	guard    *localcobrowse.EgressGuard
+	viewer   *localviewer.Server
+	audit    *localaudit.Log
+	auditErr error
+	auditDir string
+	stop     chan struct{}
 
 	// viewerFactory builds the loopback viewer on first need; nil disables it.
 	viewerFactory func() (*localviewer.Server, error)
@@ -53,6 +60,66 @@ type localCobrowseOptions struct {
 	// default-browser opener (tests).
 	viewer  bool
 	openURL func(string) error
+	// auditRetention overrides the audit retention (default 90 days, or
+	// CITADEL_LOCAL_AUDIT_RETENTION_DAYS).
+	auditRetention time.Duration
+}
+
+// localAuditRetention reads CITADEL_LOCAL_AUDIT_RETENTION_DAYS (1 to 3650).
+func localAuditRetention() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("CITADEL_LOCAL_AUDIT_RETENTION_DAYS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 3650 {
+			return time.Duration(n) * 24 * time.Hour
+		}
+	}
+	return localaudit.DefaultRetention
+}
+
+// auditRecordFor maps a service event to an audit record. Typed text never
+// reaches here: the event carries only its length.
+func auditRecordFor(ev localcobrowse.Event) localaudit.Record {
+	actor := "agent"
+	if ev.Class == "H" {
+		actor = "user"
+	}
+	return localaudit.Record{
+		SessionID:       ev.SessionID,
+		Actor:           actor,
+		Agent:           ev.Agent,
+		IntendedAction:  ev.Action,
+		Class:           ev.Class,
+		Goal:            ev.Goal,
+		URL:             ev.URL,
+		Selector:        ev.Selector,
+		TextLen:         ev.TextLen,
+		ResultingAction: ev.Outcome,
+		Error:           ev.Error,
+	}
+}
+
+// recordEvent appends ev to the audit log. Only the owner writes (one writer
+// per chain). A failed write turns co-browse off: Precheck refuses every later
+// call, so nothing runs unaudited.
+func (rt *localCobrowseRuntime) recordEvent(ev localcobrowse.Event) {
+	rt.mu.Lock()
+	log := rt.audit
+	rt.mu.Unlock()
+	if log == nil {
+		return
+	}
+	if _, err := log.Append(auditRecordFor(ev)); err != nil {
+		rt.mu.Lock()
+		if rt.auditErr == nil {
+			rt.auditErr = fmt.Errorf("the local audit log in %s cannot be written (%v); co-browse is off until Citadel restarts", log.Dir(), err)
+		}
+		rt.mu.Unlock()
+	}
+}
+
+func (rt *localCobrowseRuntime) auditPrecheck() error {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.auditErr
 }
 
 func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
@@ -73,6 +140,12 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 		}
 		rt.viewerFactory = func() (*localviewer.Server, error) {
 			cfg := localviewer.Config{Service: rt.svc, OpenURL: openURL}
+			if opts.ownerDir != nil {
+				dir := filepath.Join(opts.ownerDir(), localaudit.DirName)
+				cfg.Activity = func(session string, limit int) ([]localaudit.Record, error) {
+					return localaudit.Read(dir, localaudit.Filter{SessionID: session, Limit: limit})
+				}
+			}
 			if manager != nil {
 				cfg.Stream = cobrowsestream.NewManagerSessionFrom(manager)
 			}
@@ -94,16 +167,36 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 		URLPolicy:   opts.policy,
 		ViewerPorts: viewerPorts,
 		OnAttention: onAttention,
-		OnEvent:     opts.onEvent,
-		ViewerNote:  viewerNote,
+		OnEvent: func(ev localcobrowse.Event) {
+			rt.recordEvent(ev)
+			if opts.onEvent != nil {
+				opts.onEvent(ev)
+			}
+		},
+		Precheck:   rt.auditPrecheck,
+		ViewerNote: viewerNote,
 		AcquireOwner: func() error {
 			if opts.ownerDir == nil {
 				return nil
 			}
-			o, err := localcobrowse.AcquireOwner(opts.ownerDir())
+			dir := opts.ownerDir()
+			o, err := localcobrowse.AcquireOwner(dir)
 			if err != nil {
 				return err
 			}
+			retention := opts.auditRetention
+			if retention <= 0 {
+				retention = localAuditRetention()
+			}
+			auditDir := filepath.Join(dir, localaudit.DirName)
+			log, err := localaudit.Open(auditDir, retention, nil)
+			if err != nil {
+				o.Release()
+				return fmt.Errorf("co-browse needs its local audit log, which cannot be opened in %s: %w", auditDir, err)
+			}
+			rt.mu.Lock()
+			rt.audit, rt.auditDir = log, auditDir
+			rt.mu.Unlock()
 			if manager != nil {
 				// Every connection of the real browser goes through the
 				// egress guard. If it cannot start, co-browse refuses: the

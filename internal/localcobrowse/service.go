@@ -90,6 +90,8 @@ type Event struct {
 	TextLen   int // type: length only, never the text
 	Outcome   string
 	Error     string
+	// Agent is the connected MCP client's name at the time of the call.
+	Agent string
 }
 
 // Config configures a Service. Zero values take the local-mode defaults.
@@ -108,6 +110,9 @@ type Config struct {
 	ViewerPorts func() []int
 	// Now is the clock; nil uses time.Now.
 	Now func() time.Time
+	// Precheck runs before every co-browse call; an error refuses the call.
+	// The owner uses it to fail closed when the audit log cannot be written.
+	Precheck func() error
 	// AcquireOwner is called before the first session starts. A non-nil error
 	// (another process already owns co-browse for this user) refuses every
 	// local_cobrowse_* call. Nil means no single-instance check.
@@ -213,6 +218,9 @@ func (s *Service) notifyLocked() {
 }
 
 func (s *Service) emit(ev Event) {
+	if ev.Agent == "" {
+		ev.Agent = s.Agent()
+	}
 	if s.cfg.OnEvent != nil {
 		s.cfg.OnEvent(ev)
 	}
@@ -227,6 +235,11 @@ func (s *Service) attention(id, reason string) {
 // ensureOwner acquires the single-instance owner lock once.
 func (s *Service) ensureOwner() error {
 	// ownerMu, not mu: AcquireOwner may call back into the service (Agent).
+	if s.cfg.Precheck != nil {
+		if err := s.cfg.Precheck(); err != nil {
+			return err
+		}
+	}
 	s.ownerMu.Lock()
 	defer s.ownerMu.Unlock()
 	if s.owned {

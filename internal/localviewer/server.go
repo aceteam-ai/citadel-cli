@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
+	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -83,6 +84,9 @@ type Config struct {
 	TokenDir string
 	// Now is the clock; nil uses time.Now.
 	Now func() time.Time
+	// Activity reads the newest audit records for the Activity panel; nil
+	// hides the panel.
+	Activity func(sessionID string, limit int) ([]localaudit.Record, error)
 }
 
 // Server is the loopback viewer.
@@ -361,6 +365,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.withCookie(s.withCSRF(s.handleState)))
 	mux.HandleFunc("POST /api/sessions/{id}/{action}", s.withCookie(s.withCSRF(s.handleAction)))
 	mux.HandleFunc("GET /api/stream", s.withCookie(s.handleStream))
+	mux.HandleFunc("GET /api/activity", s.withCookie(s.handleActivity))
 	mux.HandleFunc("POST /api/mint", s.handleMint)
 	return s.guard(mux)
 }
@@ -508,6 +513,23 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		Sessions: s.cfg.Service.Sessions(""),
 		Now:      s.cfg.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// handleActivity serves the Activity panel: the session's newest audit records.
+func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Activity == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"records": []localaudit.Record{}})
+		return
+	}
+	recs, err := s.cfg.Activity(r.URL.Query().Get("session"), 50)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "the audit log could not be read"})
+		return
+	}
+	if recs == nil {
+		recs = []localaudit.Record{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"records": recs})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

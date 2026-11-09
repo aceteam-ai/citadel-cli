@@ -130,6 +130,16 @@ one-time launch file (`writeLaunchFile`), never on a command line.
 `TestGuardsReturn403`, `TestCookieOnlyFromSingleUseCode` and
 `TestOpenKeepsTheCodeOffTheCommandLine` pin the boundary.
 
+`localaudit.Log` owns the local co-browse audit chain under
+`<node config dir>/cobrowse-audit`, one JSONL file per UTC month. `Open`
+resumes the chain head before applying retention, and `Verify` names the first
+broken record. Only the co-browse owner writes, so each chain has one writer.
+`cmd.localCobrowseRuntime.recordEvent` maps every service event, refusals and
+viewer actions included, to one record. A failed write turns co-browse off
+through `Config.Precheck`. Events carry only a typed-text length, and URLs lose
+their query and fragment (`SanitizeURL`).
+`TestLocalAuditRecordsEveryCallWithoutSecrets` greps the log for a sentinel.
+
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
 **Key Components:**
