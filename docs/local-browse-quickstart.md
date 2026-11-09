@@ -12,8 +12,10 @@ the same computer, with you in charge:
   navigates. Every action is recorded on this computer, and `citadel local
   audit` shows it.
 - **It stays on your computer.** There is no AceTeam account. Docker and admin
-  rights are not needed. Local mode makes no network calls of its own: no
-  update check and no telemetry.
+  rights are not needed. Local mode makes no network calls of its own (no
+  update check and no telemetry), apart from DNS lookups for the addresses the
+  agent asks to open. The browser itself loads the pages you and the agent
+  visit.
 
 Citadel is source-available under the Elastic License 2.0, and free to use and
 self-host. This page covers Windows 10 and 11 first. macOS and Linux are coming.
@@ -21,7 +23,8 @@ self-host. This page covers Windows 10 and 11 first. macOS and Linux are coming.
 ## What you need
 
 - Windows 10 or 11 (x64).
-- Microsoft Edge, which comes with Windows, or Google Chrome.
+- Microsoft Edge, which comes with Windows, or Google Chrome, version 109 or
+  newer. `citadel local doctor` checks this.
 - One MCP-capable agent app. These are covered below:
   - GitHub Copilot (the Copilot CLI, or VS Code with Copilot);
   - Claude Desktop;

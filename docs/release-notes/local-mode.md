@@ -15,7 +15,8 @@ Windows comes first. See the
   including the new `local_cobrowse_*` tools: start, status, navigate, click,
   type, select, key, scroll, extract, screenshot, handoff, resume, stop and
   wait. It never reads an API key or device token, and it makes no network
-  calls of its own (no update check, no telemetry).
+  calls of its own (no update check, no telemetry), apart from DNS lookups for
+  the addresses the agent asks to open.
 - **Windows browser runner.** Uses the installed Microsoft Edge or Google
   Chrome in a hidden (headless) window, so it never takes over your screen. A
   Windows Job Object ties the browser to the Citadel process, so no browser

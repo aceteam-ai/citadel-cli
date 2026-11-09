@@ -156,7 +156,7 @@ func TestLocalDoctor(t *testing.T) {
 		discover: func() (platform.BrowserInfo, error) {
 			return platform.BrowserInfo{Path: `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`, Kind: "edge"}, nil
 		},
-		launchTest: func() (string, error) { return "edge", nil },
+		launchTest: func() (string, string, error) { return "edge", "Edg/131.0.2903.70", nil },
 		bindTest:   func() error { return nil },
 		vault:      func() (bool, error) { return false, nil },
 		owner:      func() error { return nil },
@@ -166,7 +166,7 @@ func TestLocalDoctor(t *testing.T) {
 	if err := runLocalDoctor(base, &out); err != nil {
 		t.Fatalf("healthy doctor failed: %v\n%s", err, out.String())
 	}
-	for _, want := range []string{"Microsoft Edge at C:\\Program Files (x86)", "started hidden", "127.0.0.1", "no network calls", "citadel local config copilot"} {
+	for _, want := range []string{"Microsoft Edge at C:\\Program Files (x86)", "(Edg/131.0.2903.70) started hidden", "127.0.0.1", "no network calls", "DNS lookups", "citadel local config copilot"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("doctor output missing %q:\n%s", want, out.String())
 		}
@@ -182,9 +182,19 @@ func TestLocalDoctor(t *testing.T) {
 	}
 
 	blocked := base
-	blocked.launchTest = func() (string, error) { return "", platform.ErrBrowserAutomationBlocked }
+	blocked.launchTest = func() (string, string, error) { return "", "", platform.ErrBrowserAutomationBlocked }
 	out.Reset()
 	if err := runLocalDoctor(blocked, &out); err == nil || !strings.Contains(out.String(), "per-user") {
 		t.Fatalf("policy-blocked launch must name the fix:\n%s", out.String())
+	}
+
+	old := base
+	old.launchTest = func() (string, string, error) { return "edge", "Edg/101.0.1210.53", nil }
+	out.Reset()
+	if err := runLocalDoctor(old, &out); err == nil || !strings.Contains(out.String(), "too old") {
+		t.Fatalf("a browser older than 109 must fail with an update fix:\n%s", out.String())
+	}
+	if browserMajor("HeadlessChrome/131.0.6778.86") != 131 || browserMajor("") != 0 {
+		t.Fatal("browserMajor")
 	}
 }

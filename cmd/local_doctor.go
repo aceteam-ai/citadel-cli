@@ -5,12 +5,17 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
@@ -21,10 +26,12 @@ import (
 )
 
 type localDoctorDeps struct {
-	goos       string
-	runner     string
-	discover   func() (platform.BrowserInfo, error)
-	launchTest func() (string, error) // returns the launched browser kind
+	goos     string
+	runner   string
+	discover func() (platform.BrowserInfo, error)
+	// launchTest returns the launched browser's kind and its /json/version
+	// "Browser" string (e.g. "HeadlessChrome/131.0.0.0").
+	launchTest func() (kind, version string, err error)
 	bindTest   func() error
 	vault      func() (bool, error)
 	owner      func() error
@@ -60,13 +67,14 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 		harnesses: detectHarnessConfigs(systemHarnessEnv()),
 	}
 	if !skipLaunch {
-		d.launchTest = func() (string, error) {
+		d.launchTest = func() (string, string, error) {
 			m := platform.NewCobrowseSessionManager(platform.DefaultCobrowseSessionsBaseDir(), 1)
 			st, err := m.StartSession("about:blank")
 			if err != nil {
-				return "", err
+				return "", "", err
 			}
-			return st.Browser, m.Stop(st.ID)
+			version := cdpBrowserVersion(st.DebugPort)
+			return st.Browser, version, m.Stop(st.ID)
 		}
 	}
 	return d
@@ -116,7 +124,7 @@ func runLocalDoctor(d localDoctorDeps, out io.Writer) error {
 	case err != nil:
 		fail("Test launch", "skipped: no browser")
 	default:
-		if kind, lerr := d.launchTest(); lerr != nil {
+		if kind, version, lerr := d.launchTest(); lerr != nil {
 			fix := "run `citadel local doctor` again; if it repeats, restart the computer"
 			if errors.Is(lerr, platform.ErrBrowserAutomationBlocked) {
 				fix = "use a personal (per-user) Chrome install or a computer without that policy"
@@ -125,8 +133,14 @@ func runLocalDoctor(d localDoctorDeps, out io.Writer) error {
 				fix = "install Xvfb (e.g. apt-get install xvfb); a headless Linux runner is planned"
 			}
 			fail("Test launch", fmt.Sprintf("%v. Fix: %s", lerr, fix))
+		} else if major := browserMajor(version); major > 0 && major < minHeadlessMajor {
+			fail("Test launch", fmt.Sprintf("%s %s is too old for hidden sessions (needs %d or newer). Fix: update the browser (Edge: Settings, About Microsoft Edge)", browserTitle(kind), version, minHeadlessMajor))
 		} else {
-			ok("Test launch", fmt.Sprintf("%s started hidden (%s runner) and stopped cleanly", browserTitle(kind), d.runner))
+			v := version
+			if v == "" {
+				v = "version unknown"
+			}
+			ok("Test launch", fmt.Sprintf("%s (%s) started hidden (%s runner) and stopped cleanly", browserTitle(kind), v, d.runner))
 		}
 	}
 
@@ -175,12 +189,46 @@ func runLocalDoctor(d localDoctorDeps, out io.Writer) error {
 		warn("Harness", "no agent app is configured yet. Fix: citadel local config copilot (or claude-desktop, codex)")
 	}
 
-	ok("Network", "local mode makes no network calls of its own (no account, no update check, no telemetry)")
+	ok("Network", "local mode makes no network calls of its own (no account, no update check, no telemetry), apart from DNS lookups for addresses the agent asks to open")
 
 	if failed {
 		return errLocalDoctorFailed
 	}
 	return nil
+}
+
+// minHeadlessMajor is the first Chromium release with --headless=new.
+const minHeadlessMajor = 109
+
+// cdpBrowserVersion reads the "Browser" field of the loopback CDP
+// /json/version endpoint, or "" if it cannot.
+func cdpBrowserVersion(port int) string {
+	if port <= 0 {
+		return ""
+	}
+	c := &http.Client{Timeout: 3 * time.Second}
+	resp, err := c.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var v struct {
+		Browser string `json:"Browser"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v) != nil {
+		return ""
+	}
+	return v.Browser
+}
+
+// browserMajor parses the major version from "Name/131.0.1.2", or 0.
+func browserMajor(v string) int {
+	i := strings.LastIndex(v, "/")
+	if i < 0 {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.SplitN(v[i+1:], ".", 2)[0])
+	return n
 }
 
 func browserTitle(kind string) string {
