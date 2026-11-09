@@ -3,6 +3,7 @@ module github.com/aceteam-ai/citadel-cli
 go 1.26.6
 
 require (
+	github.com/BurntSushi/toml v1.5.0
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/aceteam-ai/fabric-protocol v0.0.0-20260902143942-795c2cf81e47
@@ -52,7 +53,6 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
-	github.com/BurntSushi/toml v1.5.0 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect

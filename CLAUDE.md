@@ -144,10 +144,12 @@ sanitized. `TestLocalAuditRecordsEveryCallWithoutSecrets` greps the log for a
 sentinel.
 
 `cmd.harnesses` owns each agent app's MCP config location and entry shape for
-`citadel local config`. The locations were checked against each harness's docs
-when added; change them there, not in `docs/local-browse-quickstart.md`.
-`mergeHarnessConfig` merges JSON structurally, appends the Codex TOML table only
-when absent, and keeps a timestamped backup. `runLocalDoctor` owns the
+`citadel local config`. Change them there, not in
+`docs/local-browse-quickstart.md`. Locations that could not be confirmed from
+the harness's own docs, such as Claude Desktop on Linux, carry an `unverified`
+note that the command prints. `mergeHarnessConfig` parses TOML and merges JSON
+without loss. A re-run with the same entry is a no-op. It writes through
+symlinks and keeps a timestamped backup. `runLocalDoctor` owns the
 first-run checks, and the windows CI job runs the built binary's
 `citadel local doctor`.
 
