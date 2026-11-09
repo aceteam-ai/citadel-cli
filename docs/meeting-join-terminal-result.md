@@ -24,7 +24,10 @@ the default node transport) does not retain yet; see "API mode" below.
 | Job types | `MEETING_JOIN` only | `worker.retainsTerminalResult` |
 
 The value is a string holding one envelope, the same shape the backend already
-parses from Pub/Sub:
+parses from Pub/Sub. MEETING_JOIN runs through `LegacyHandlerAdapter`, so on an
+`end` event `data.result` is `{"output": "<string>"}`, and that `output` string
+is itself JSON (the handler's result object). The reader must decode twice:
+once for the envelope, then again for `data.result.output`.
 
 ```json
 {
@@ -33,18 +36,24 @@ parses from Pub/Sub:
   "jobId": "<job_id>",
   "rayId": "<ray_id>",
   "timestamp": "2026-11-09T12:00:00Z",
-  "data": {"result": {"status": "completed", "transcript": "..."}, "meta": {"node_id": "...", "node_name": "..."}}
+  "data": {
+    "result": {"output": "{\"status\":\"completed\",\"meeting_id\":\"...\",\"transcript\":\"...\"}"},
+    "meta": {"node_id": "...", "node_name": "..."}
+  }
 }
 ```
 
-`data` carries whatever the published event carried, including node metadata
-and delivery-clock fields when present.
+An `error` event carries `data.error` and `data.recoverable`; a `cancelled`
+event carries `data.reason`. `data` carries whatever the published event
+carried, including node metadata and delivery-clock fields when present.
 
 ## Write semantics
 
 - **First writer wins.** `SET key value NX EX 259200`. A later terminal write
   for the same job id, whether a retried publish or the terminal refusal of a
-  redelivered MEETING_JOIN, never replaces the stored result.
+  redelivered MEETING_JOIN, never replaces the stored result. When a publish
+  is retried, the stored copy comes from the first attempt, so its `timestamp`
+  (and any delivery-clock fields) can differ from the publish that succeeded.
 - **Never blocks the publish.** The publish happens first. Retention runs after
   it whatever its outcome, with a 5-second bound and a context detached from
   job cancellation, so a shutdown that ends the meeting still leaves a result.
