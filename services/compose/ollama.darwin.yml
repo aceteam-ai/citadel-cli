@@ -37,8 +37,8 @@ services:
     # reservation (TestDarwinComposeVariantsOnlyDropGPU).
     environment:
       - OLLAMA_MAX_LOADED_MODELS
-      # citadel-cli#1560: manifest ollama_keep_alive (-1 or a duration); injected
-      # only when set. See services/ollama_keepalive.go.
+      # citadel-cli#1560: manifest ollama_keep_alive (-1 or a duration); explicit
+      # empty when unset. See services/ollama_keepalive.go.
       - OLLAMA_KEEP_ALIVE
     volumes:
       # Mount a user-accessible directory for Ollama models

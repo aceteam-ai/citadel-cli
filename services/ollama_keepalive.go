@@ -6,8 +6,8 @@
 // default 5 minute keep_alive. Mirrors ollama_policy.go (#1209): a dedicated
 // typed manifest field normalized into the compose process env by one function
 // on every compose-up path; the compose files declare the key-only form
-// `environment: [OLLAMA_KEEP_ALIVE]`. Unlike #1209, unset leaves the env
-// byte-identical (no injected entry), per the #1560 requirement.
+// `environment: [OLLAMA_KEEP_ALIVE]`. Like #1209, unset becomes an explicit
+// empty value.
 package services
 
 import (
@@ -40,18 +40,21 @@ func ValidateOllamaKeepAlive(v string) error {
 }
 
 // OllamaKeepAliveComposeEnv returns env with exactly one OLLAMA_KEEP_ALIVE
-// entry at the end when the manifest sets a valid ollama_keep_alive for the
-// ollama service (any inherited duplicate is removed first). When the field is
-// unset the env is returned UNCHANGED (byte-identical to pre-#1560 behavior, so
-// an operator's own ambient OLLAMA_KEEP_ALIVE still reaches the key-only compose
-// passthrough); an invalid value also returns env unchanged plus an error.
-// Other services get env unchanged. It does not mutate env.
+// entry at the end for the ollama service: the manifest value when valid, else
+// an explicit empty value (unset or invalid; invalid also returns an error).
+// The empty value mirrors #1209 and shields the key-only compose passthrough
+// from an ambient shell or .env OLLAMA_KEEP_ALIVE. Other services get env
+// unchanged. It does not mutate env.
 func OllamaKeepAliveComposeEnv(env []string, service string, keepAlive *string) ([]string, error) {
-	if service != "ollama" || keepAlive == nil {
+	if service != "ollama" {
 		return env, nil
 	}
-	if err := ValidateOllamaKeepAlive(*keepAlive); err != nil {
-		return env, err
+	value := ""
+	var err error
+	if keepAlive != nil {
+		if err = ValidateOllamaKeepAlive(*keepAlive); err == nil {
+			value = *keepAlive
+		}
 	}
 	out := make([]string, 0, len(env)+1)
 	for _, entry := range env {
@@ -60,7 +63,7 @@ func OllamaKeepAliveComposeEnv(env []string, service string, keepAlive *string) 
 			out = append(out, entry)
 		}
 	}
-	return append(out, EnvOllamaKeepAlive+"="+*keepAlive), nil
+	return append(out, EnvOllamaKeepAlive+"="+value), err
 }
 
 // Preload bounds.

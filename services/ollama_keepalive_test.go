@@ -32,14 +32,14 @@ func TestOllamaKeepAliveComposeEnv(t *testing.T) {
 	if err != nil || env[len(env)-1] != "OLLAMA_KEEP_ALIVE=24h" || slices.Contains(env, "OLLAMA_KEEP_ALIVE=hostile") {
 		t.Fatalf("set: %v %v", env, err)
 	}
-	// Unset: byte-identical.
+	// Unset: explicit empty, shields ambient value.
 	env, err = OllamaKeepAliveComposeEnv(base, "ollama", nil)
-	if err != nil || !slices.Equal(env, base) {
+	if err != nil || env[len(env)-1] != "OLLAMA_KEEP_ALIVE=" || slices.Contains(env, "OLLAMA_KEEP_ALIVE=hostile") {
 		t.Fatalf("unset: %v %v", env, err)
 	}
-	// Invalid: error, env unchanged.
+	// Invalid: error AND explicit empty.
 	env, err = OllamaKeepAliveComposeEnv(base, "ollama", sp("bogus"))
-	if err == nil || !slices.Equal(env, base) {
+	if err == nil || env[len(env)-1] != "OLLAMA_KEEP_ALIVE=" {
 		t.Fatalf("invalid: %v %v", env, err)
 	}
 	// Non-ollama: byte-identical, input not mutated.

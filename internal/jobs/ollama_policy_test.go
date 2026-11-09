@@ -78,10 +78,10 @@ func TestComposeEnvForAppliedServiceNormalizesPolicy(t *testing.T) {
 		want      []string
 		wantError bool
 	}{
-		{"valid", validPath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "=1"}, false},
-		{"missing", filepath.Join(dir, "missing.yaml"), "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "="}, false},
-		{"invalid yaml", invalidPath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "="}, false},
-		{"negative", negativePath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "="}, true},
+		{"valid", validPath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "=1", "OLLAMA_KEEP_ALIVE="}, false},
+		{"missing", filepath.Join(dir, "missing.yaml"), "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "=", "OLLAMA_KEEP_ALIVE="}, false},
+		{"invalid yaml", invalidPath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "=", "OLLAMA_KEEP_ALIVE="}, false},
+		{"negative", negativePath, "ollama", []string{"UNRELATED=keep", services.EnvOllamaMaxLoadedModels + "=", "OLLAMA_KEEP_ALIVE="}, true},
 		{"non ollama unchanged", validPath, "vllm", base, false},
 	}
 	for _, tc := range cases {
@@ -124,8 +124,8 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 	if got := countPrefix(env); got != 1 {
 		t.Errorf("set: want exactly 1 OLLAMA_MAX_LOADED_MODELS entry, got %d", got)
 	}
-	if env[len(env)-1] != services.EnvOllamaMaxLoadedModels+"=1" {
-		t.Errorf("set: policy entry must be last (so it wins), got %q", env[len(env)-1])
+	if env[len(env)-2] != services.EnvOllamaMaxLoadedModels+"=1" {
+		t.Errorf("set: policy entry must precede keep_alive (so it wins), got %q", env[len(env)-2])
 	}
 
 	envNil, err := h.composeEnvForEngineStart("ollama", "", nil, nil, nil)
@@ -135,8 +135,8 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 	if got := countPrefix(envNil); got != 1 {
 		t.Errorf("unset: want exactly 1 OLLAMA_MAX_LOADED_MODELS entry, got %d", got)
 	}
-	if envNil[len(envNil)-1] != "OLLAMA_MAX_LOADED_MODELS=" {
-		t.Errorf("unset: policy entry must be explicit empty and last, got %q", envNil[len(envNil)-1])
+	if envNil[len(envNil)-2] != "OLLAMA_MAX_LOADED_MODELS=" {
+		t.Errorf("unset: policy entry must be explicit empty, got %q", envNil[len(envNil)-2])
 	}
 
 	neg := -1
@@ -273,18 +273,16 @@ func TestOllamaKeepAliveRoundTripAndAppliedEnv(t *testing.T) {
 	bad := "services:\n  - name: ollama\n    ollama_keep_alive: nope\n"
 	os.WriteFile(path, []byte(bad), 0o644)
 	env, err = composeEnvForAppliedService(nil, path, "ollama")
-	if err == nil || slices.Contains(env, "OLLAMA_KEEP_ALIVE=nope") {
-		t.Fatalf("invalid must error and not inject: %v %v", env, err)
+	if err == nil || !slices.Contains(env, "OLLAMA_KEEP_ALIVE=") {
+		t.Fatalf("invalid must error + explicit empty: %v %v", env, err)
 	}
 	h := &ServiceHandler{ConfigDir: t.TempDir()}
 	if _, err := h.composeEnvForEngineStart("ollama", "", nil, sp("bogus"), nil); err == nil {
 		t.Error("engine start must refuse invalid keep_alive")
 	}
 	env, err = h.composeEnvForEngineStart("ollama", "", nil, nil, nil)
-	if err != nil || slices.ContainsFunc(env, func(e string) bool {
-		return strings.HasPrefix(e, "OLLAMA_KEEP_ALIVE=") && os.Getenv("OLLAMA_KEEP_ALIVE") == ""
-	}) {
-		t.Errorf("unset must not inject: %v %v", env, err)
+	if err != nil || env[len(env)-1] != "OLLAMA_KEEP_ALIVE=" {
+		t.Errorf("unset must be explicit empty and last: %v %v", env, err)
 	}
 }
 
