@@ -27,7 +27,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -80,42 +79,14 @@ func (r windowsHeadlessRunner) Launch(profileDir, startURL string, lo LaunchOpti
 	// binary) and pass it as --user-agent. An explicit EnvCobrowseUserAgent
 	// still wins, and with stealth off the browser's own UA is left alone.
 	ua := os.Getenv(EnvCobrowseUserAgent)
-	derive := ua == "" && stealthEnabled()
-	if derive {
+	if ua == "" && stealthEnabled() {
+		// Probes only ever load about:blank in a throwaway dir. The session
+		// itself launches exactly once, so its start URL (which may be a
+		// one-time link) is never loaded twice and no discarded visit leaves
+		// state in an encrypted profile.
 		ua = headedUserAgent(info, filepath.Dir(profileDir))
 	}
-	proc, err := startHeadless(info, profileDir, startURL, ua, lo)
-	if err != nil || !derive || ua != "" {
-		return proc, err
-	}
-	// The probe failed (for example it timed out on a slow first launch), so
-	// this session would report "HeadlessChrome". It is now running, so read
-	// its UA, cache the derived one, and relaunch once with it. If anything
-	// here fails, keep the running session rather than failing the start.
-	raw, verr := browserDefaultUserAgent(proc.debugPort)
-	if verr != nil || !strings.Contains(raw, "Headless") {
-		return proc, nil
-	}
-	derived := deheadlessUserAgent(raw)
-	rememberUserAgent(info, derived)
-	_ = proc.stop()
-	again, err := startHeadless(info, profileDir, startURL, derived, lo)
-	if err != nil {
-		log.Printf("[cobrowse] relaunch with the derived user agent failed (%v); starting without it", err)
-		return startHeadless(info, profileDir, startURL, "", lo)
-	}
-	return again, nil
-}
-
-// rememberUserAgent caches a derived UA for info's binary, replacing a cached
-// probe failure.
-func rememberUserAgent(info BrowserInfo, ua string) {
-	key := uaCacheKey(info)
-	e := &uaEntry{done: make(chan struct{}), ua: ua, at: time.Now()}
-	close(e.done)
-	uaCacheMu.Lock()
-	uaCache[key] = e
-	uaCacheMu.Unlock()
+	return startHeadless(info, profileDir, startURL, ua, lo)
 }
 
 func uaCacheKey(info BrowserInfo) string {
@@ -240,10 +211,12 @@ func headedUserAgent(info BrowserInfo, baseDir string) string {
 	key := uaCacheKey(info)
 	uaCacheMu.Lock()
 	e, ok := uaCache[key]
-	if ok && e.err != nil {
+	if ok {
+		// Read e.err only after e.done is closed (the prober writes it before
+		// closing), never while a probe is still running.
 		select {
 		case <-e.done:
-			if time.Since(e.at) >= uaProbeRetryAfter {
+			if e.err != nil && time.Since(e.at) >= uaProbeRetryAfter {
 				ok = false
 			}
 		default:
@@ -254,6 +227,12 @@ func headedUserAgent(info BrowserInfo, baseDir string) string {
 		uaCache[key] = e
 		uaCacheMu.Unlock()
 		e.ua, e.err = probeUserAgent(info, baseDir)
+		if e.err != nil {
+			// One immediate retry: a cold first launch on a slow machine can
+			// time out where a second, warm one succeeds. A machine where the
+			// browser cannot run at all pays this only once per retry window.
+			e.ua, e.err = probeUserAgent(info, baseDir)
+		}
 		e.at = time.Now()
 		if e.err != nil {
 			log.Printf("[cobrowse] could not derive %s's user agent (%v); the session uses the browser's own", info.Kind, e.err)

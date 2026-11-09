@@ -482,6 +482,7 @@ func TestHeadedUserAgentFallbackCacheAndSingleflight(t *testing.T) {
 		<-release
 		return "", errors.New("policy blocked")
 	}
+	// Each probe round is the probe plus one immediate retry.
 	info := BrowserInfo{Path: filepath.Join(t.TempDir(), "msedge.exe"), Kind: "edge"}
 	results := make(chan string, 3)
 	for i := 0; i < 3; i++ {
@@ -494,11 +495,11 @@ func TestHeadedUserAgentFallbackCacheAndSingleflight(t *testing.T) {
 			t.Fatalf("a failed probe must fall back to the browser's own UA, got %q", ua)
 		}
 	}
-	if n := calls.Load(); n != 1 {
-		t.Fatalf("concurrent callers should share one probe, got %d", n)
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("concurrent callers should share one probe round (probe + retry), got %d", n)
 	}
 	_ = headedUserAgent(info, base)
-	if n := calls.Load(); n != 1 {
+	if n := calls.Load(); n != 2 {
 		t.Fatalf("a failed probe should be cached, got %d probes", n)
 	}
 	uaProbeRetryAfter = 0
@@ -511,28 +512,50 @@ func TestHeadedUserAgentFallbackCacheAndSingleflight(t *testing.T) {
 	}
 }
 
-// TestWindowsRealBrowserUAWhenProbeFails forces the user-agent probe to fail
-// and checks the session still does not report a headless user agent.
-func TestWindowsRealBrowserUAWhenProbeFails(t *testing.T) {
+// TestWindowsRealBrowserProbeRetryAndSingleLaunch makes the first probe fail
+// and checks the immediate retry still yields a non-headless user agent, with
+// the session's start URL loaded exactly once.
+func TestWindowsRealBrowserProbeRetryAndSingleLaunch(t *testing.T) {
 	requireBrowserIT(t)
 	prevLaunch := uaProbeLaunch
 	uaCacheMu.Lock()
 	uaCache = map[string]*uaEntry{}
 	uaCacheMu.Unlock()
-	uaProbeLaunch = func(BrowserInfo, string) (string, error) { return "", errors.New("forced probe failure") }
+	var probes atomic.Int32
+	uaProbeLaunch = func(info BrowserInfo, dir string) (string, error) {
+		if probes.Add(1) == 1 {
+			return "", errors.New("forced first-probe failure")
+		}
+		return prevLaunch(info, dir)
+	}
 	t.Cleanup(func() {
 		uaProbeLaunch = prevLaunch
 		uaCacheMu.Lock()
 		uaCache = map[string]*uaEntry{}
 		uaCacheMu.Unlock()
 	})
-	srv := fixtureServer(t)
+	var loads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/once" {
+			loads.Add(1)
+		}
+		fixtureUA.Store(r.UserAgent())
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<!doctype html><h1 id="t">Fixture page one</h1>`)
+	}))
+	defer srv.Close()
 	m := newCobrowseSessionManager(filepath.Join(t.TempDir(), "cobrowse-sessions"), 2)
-	st, err := m.StartSession(srv.URL + "/")
+	st, err := m.StartSession(srv.URL + "/once")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() { _ = m.StopAll() })
 	waitExtract(t, m, st.ID, "#t", "Fixture page one")
 	assertNotHeadlessUA(t, st.DebugPort)
+	if n := probes.Load(); n != 2 {
+		t.Fatalf("want one failed probe and one retry, got %d probes", n)
+	}
+	if n := loads.Load(); n != 1 {
+		t.Fatalf("the start URL must be loaded exactly once, got %d", n)
+	}
 }
