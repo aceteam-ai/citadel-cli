@@ -21,6 +21,19 @@ This single command:
 
 Get an authkey from [aceteam.ai/fabric](https://aceteam.ai/fabric). The script is idempotent and safe to run multiple times.
 
+## Local Browse: Let an Agent on This Computer Drive a Browser
+
+No account needed. An MCP agent app on your computer drives a hidden browser.
+You watch and approve its actions in a local viewer, and you take over to log in
+yourself, so the agent never sees your password. Every action is recorded on
+the device. Windows first; see the
+[local browse quickstart](docs/local-browse-quickstart.md).
+
+```powershell
+citadel local doctor
+citadel local config copilot   # or claude-desktop, codex
+```
+
 ## AI Tool Integration (MCP)
 
 Connect your GPU infrastructure to Claude Code, Cursor, or any MCP-compatible AI tool:

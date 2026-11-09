@@ -124,12 +124,26 @@ jobs:
         run: go test ./internal/cobrowsestream/ -count=1 -run '^TestMounted'
 
       - name: citadel local mcp (stdio JSON-RPC)
-        run: go test ./cmd/ -count=1 -run '^(TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide)'
+        run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide)'
 
       - name: Unit tests (Windows-portable subset)
         run: >-
           go test ./internal/platform/ -count=1 -run
           '^(TestWindows|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
+
+      # The shipped binary, end to end: discovery, a hidden test launch, the
+      # loopback bind and the audit/owner checks, plus the stdio server's
+      # initialize/tools/list. The runner's own profile is throwaway.
+      - name: citadel local doctor and local mcp (built binary)
+        shell: pwsh
+        run: |
+          go build -o citadel.exe ./cmd/citadel
+          ./citadel.exe local doctor
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $in = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"ci"}}}' + "`n" + '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+          $out = $in | ./citadel.exe local mcp
+          $out
+          if (-not ($out -match 'local_cobrowse_start')) { Write-Error "tools/list did not list local_cobrowse_start"; exit 1 }
 
       - name: Real browser via discovery
         env:

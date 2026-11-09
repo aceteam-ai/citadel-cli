@@ -143,6 +143,14 @@ URLs are kept as origin plus a path hash (`RedactURL`), and error text is
 sanitized. `TestLocalAuditRecordsEveryCallWithoutSecrets` greps the log for a
 sentinel.
 
+`cmd.harnesses` owns each agent app's MCP config location and entry shape for
+`citadel local config`. The locations were checked against each harness's docs
+when added; change them there, not in `docs/local-browse-quickstart.md`.
+`mergeHarnessConfig` merges JSON structurally, appends the Codex TOML table only
+when absent, and keeps a timestamped backup. `runLocalDoctor` owns the
+first-run checks, and the windows CI job runs the built binary's
+`citadel local doctor`.
+
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
 **Key Components:**
