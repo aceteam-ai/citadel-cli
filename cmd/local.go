@@ -63,7 +63,7 @@ func runLocalViewer(ctx context.Context, dir string, printOnly bool, open func(s
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	link, err := localviewer.RequestLink(ctx, dir, nil)
+	link, file, err := localviewer.RequestLaunch(ctx, dir, nil)
 	if err != nil {
 		return err
 	}
@@ -71,7 +71,14 @@ func runLocalViewer(ctx context.Context, dir string, printOnly bool, open func(s
 		fmt.Fprintln(out, link)
 		return nil
 	}
-	if err := open(link); err != nil {
+	// Open the one-time launch file, never the link itself, so the code does
+	// not appear on a command line other local users can read.
+	if file == "" {
+		fmt.Fprintln(out, "Open this link in your browser (it works once, for two minutes):")
+		fmt.Fprintln(out, link)
+		return nil
+	}
+	if err := open(file); err != nil {
 		fmt.Fprintln(out, "Could not open a browser; open this link (it works once, for two minutes):")
 		fmt.Fprintln(out, link)
 		return nil

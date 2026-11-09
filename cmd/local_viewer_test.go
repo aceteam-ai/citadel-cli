@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -29,10 +30,15 @@ func TestLocalStartOpensViewerWithoutLeakingTheCode(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(opened) != 1 || !strings.HasPrefix(opened[0], "http://127.0.0.1:") {
-		t.Fatalf("start should open the viewer on 127.0.0.1, opened %v", opened)
+	if len(opened) != 1 || !strings.HasSuffix(opened[0], ".html") || strings.Contains(opened[0], "code=") {
+		t.Fatalf("start should open the viewer through a launch file, opened %v", opened)
 	}
-	code := opened[0][strings.Index(opened[0], "code=")+5:]
+	launch, err := os.ReadFile(opened[0])
+	if err != nil || !strings.Contains(string(launch), "http://127.0.0.1:") {
+		t.Fatalf("launch file: %v", err)
+	}
+	code := string(launch)[strings.Index(string(launch), "code=")+5:]
+	code = code[:strings.IndexByte(code, '"')]
 	if strings.Contains(text, code) || strings.Contains(text, "/open?") {
 		t.Fatal("the one-time viewer code must never be returned over MCP")
 	}

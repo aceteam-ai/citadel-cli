@@ -3,7 +3,7 @@
 "use strict";
 
 (function () {
-  const csrf = document.querySelector('meta[name="csrf"]').content;
+  const csrf = sessionStorage.getItem("citadelViewerToken") || "";
   const $ = (id) => document.getElementById(id);
   let state = { agent: "", sessions: [] };
   let selected = null;
@@ -29,8 +29,11 @@
 
   async function poll() {
     try {
-      const r = await fetch("/api/state", { credentials: "same-origin" });
-      if (!r.ok) { $("hint").textContent = "This viewer link has expired. Run citadel local viewer for a new one."; return; }
+      const r = await fetch("/api/state", { credentials: "same-origin", headers: { "X-Citadel-CSRF": csrf } });
+      if (!r.ok) {
+        $("agent-line").textContent = "This viewer tab is no longer connected. Run citadel local viewer to open a new one.";
+        return;
+      }
       state = await r.json();
       render();
     } catch (e) {

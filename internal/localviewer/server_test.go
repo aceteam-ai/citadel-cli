@@ -5,8 +5,9 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -78,7 +79,7 @@ func TestGuardsReturn403(t *testing.T) {
 	h := newHarness(t)
 	st, _ := h.svc.Start(context.Background(), "", "g", "")
 	approve := "/api/sessions/" + st.SessionID + "/approve"
-	good := map[string]string{"Origin": h.origin(), csrfHeader: h.srv.csrf}
+	good := map[string]string{"Origin": h.origin(), csrfHeader: h.srv.bearer}
 
 	cases := []struct {
 		name   string
@@ -87,17 +88,18 @@ func TestGuardsReturn403(t *testing.T) {
 		hdr    map[string]string
 		cookie bool
 	}{
+		{"state without the viewer token", "GET", "/api/state", nil, true},
 		{"wrong host (localhost)", "GET", "/api/state", map[string]string{"Host": "localhost:" + strconv.Itoa(h.srv.Port())}, true},
 		{"wrong host (rebinding name)", "GET", "/api/state", map[string]string{"Host": "attacker.test:" + strconv.Itoa(h.srv.Port())}, true},
 		{"foreign origin GET", "GET", "/api/state", map[string]string{"Origin": "http://attacker.test"}, true},
-		{"foreign origin POST", "POST", approve, map[string]string{"Origin": "http://attacker.test", csrfHeader: h.srv.csrf}, true},
-		{"cross-site fetch", "POST", approve, map[string]string{"Origin": h.origin(), csrfHeader: h.srv.csrf, "Sec-Fetch-Site": "cross-site"}, true},
+		{"foreign origin POST", "POST", approve, map[string]string{"Origin": "http://attacker.test", csrfHeader: h.srv.bearer}, true},
+		{"cross-site fetch", "POST", approve, map[string]string{"Origin": h.origin(), csrfHeader: h.srv.bearer, "Sec-Fetch-Site": "cross-site"}, true},
 		{"missing cookie page", "GET", "/", nil, false},
 		{"missing cookie state", "GET", "/api/state", nil, false},
 		{"missing cookie POST", "POST", approve, good, false},
 		{"missing CSRF", "POST", approve, map[string]string{"Origin": h.origin()}, true},
 		{"wrong CSRF", "POST", approve, map[string]string{"Origin": h.origin(), csrfHeader: "nope"}, true},
-		{"POST without origin", "POST", approve, map[string]string{csrfHeader: h.srv.csrf}, true},
+		{"POST without origin", "POST", approve, map[string]string{csrfHeader: h.srv.bearer}, true},
 		{"stream without csrf", "GET", "/api/stream?id=" + st.SessionID, map[string]string{"Origin": h.origin()}, true},
 		{"mint from a browser", "POST", "/api/mint", map[string]string{"Origin": h.origin(), "Authorization": "Bearer " + h.srv.mint}, false},
 		{"mint without token", "POST", "/api/mint", nil, false},
@@ -124,8 +126,11 @@ func TestGuardsReturn403(t *testing.T) {
 	}
 	resp := h.do(t, "GET", "/", nil, true)
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 || !strings.Contains(string(body), h.srv.csrf) {
-		t.Fatalf("index: %d", resp.StatusCode)
+	if resp.StatusCode != 200 || strings.Contains(string(body), h.srv.bearer) {
+		t.Fatalf("index must load with the cookie but never carry the viewer token: %d", resp.StatusCode)
+	}
+	if r := h.do(t, "GET", "/api/state", map[string]string{csrfHeader: h.srv.bearer}, true); r.StatusCode != 200 {
+		t.Fatalf("state with cookie and token: %d", r.StatusCode)
 	}
 	if !strings.Contains(resp.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
 		t.Error("index must forbid framing")
@@ -140,6 +145,7 @@ func TestCookieOnlyFromSingleUseCode(t *testing.T) {
 			t.Errorf("%s: want 403 and no cookie, got %d %v", path, resp.StatusCode, resp.Cookies())
 		}
 	}
+	oldCookie, oldBearer := h.srv.secrets()
 	link := h.srv.MintURL()
 	u, _ := url.Parse(link)
 	if u.Host != "127.0.0.1:"+strconv.Itoa(h.srv.Port()) {
@@ -147,15 +153,28 @@ func TestCookieOnlyFromSingleUseCode(t *testing.T) {
 	}
 	resp := h.do(t, "GET", u.RequestURI(), nil, false)
 	cs := resp.Cookies()
-	if resp.StatusCode != http.StatusSeeOther || len(cs) != 1 || !cs[0].HttpOnly || cs[0].SameSite != http.SameSiteStrictMode {
+	body, _ := io.ReadAll(resp.Body)
+	newCookie, newBearer := h.srv.secrets()
+	if resp.StatusCode != http.StatusOK || len(cs) != 1 || !cs[0].HttpOnly || cs[0].SameSite != http.SameSiteStrictMode {
 		t.Fatalf("exchange: %d %+v", resp.StatusCode, cs)
+	}
+	if cs[0].Value != newCookie || newCookie == oldCookie || newBearer == oldBearer {
+		t.Fatal("each exchange must rotate the cookie and the viewer token")
+	}
+	if !strings.Contains(string(body), newBearer) {
+		t.Fatal("the /open page must carry the new viewer token")
+	}
+	stale := &http.Cookie{Name: h.srv.cookieName(), Value: oldCookie}
+	req, _ := http.NewRequest("GET", h.base+"/", nil)
+	req.AddCookie(stale)
+	if r, _ := http.DefaultClient.Do(req); r.StatusCode != http.StatusForbidden {
+		t.Fatalf("the previous cookie must stop working: %d", r.StatusCode)
 	}
 	again := h.do(t, "GET", u.RequestURI(), nil, false)
 	if again.StatusCode != http.StatusForbidden || len(again.Cookies()) != 0 {
 		t.Fatalf("a code must work once: %d %v", again.StatusCode, again.Cookies())
 	}
 
-	// An expired code is refused too.
 	now := time.Now()
 	h.srv.cfg.Now = func() time.Time { return now }
 	old := h.srv.MintURL()
@@ -164,15 +183,52 @@ func TestCookieOnlyFromSingleUseCode(t *testing.T) {
 	if r := h.do(t, "GET", ou.RequestURI(), nil, false); r.StatusCode != http.StatusForbidden || len(r.Cookies()) != 0 {
 		t.Fatalf("expired code: %d", r.StatusCode)
 	}
+	h.srv.cfg.Now = time.Now
 
-	// The cookie from a real exchange works through a jar.
-	jar, _ := cookiejar.New(nil)
-	c := &http.Client{Jar: jar}
-	r, err := c.Get(h.srv.MintURL())
-	if err != nil || r.StatusCode != 200 {
-		t.Fatalf("follow link: %v %v", err, r)
+	// The launch-file path: the navigation comes from a file: page, so it is
+	// cross-site; /open alone accepts that.
+	nav := h.do(t, "GET", mustRequestURI(t, h.srv.MintURL()), map[string]string{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}, false)
+	if nav.StatusCode != http.StatusOK {
+		t.Fatalf("launch-file navigation: %d", nav.StatusCode)
 	}
-	r.Body.Close()
+}
+
+func mustRequestURI(t *testing.T, link string) string {
+	t.Helper()
+	u, err := url.Parse(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.RequestURI()
+}
+
+func TestOpenKeepsTheCodeOffTheCommandLine(t *testing.T) {
+	h := newHarness(t)
+	if err := h.srv.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.opened) != 1 {
+		t.Fatalf("opened %v", h.opened)
+	}
+	arg := h.opened[0]
+	if strings.Contains(arg, "code=") || !strings.HasSuffix(arg, ".html") {
+		t.Fatalf("the browser must be opened on a launch file, not the link: %q", arg)
+	}
+	data, err := os.ReadFile(arg)
+	if err != nil || !strings.Contains(string(data), "/open?code=") {
+		t.Fatalf("launch file: %v", err)
+	}
+	if fi, err := os.Stat(arg); err == nil && runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Fatalf("launch file mode %o", fi.Mode().Perm())
+	}
+	code := string(data)[strings.Index(string(data), "code=")+5:]
+	code = code[:strings.IndexByte(code, '"')]
+	if r := h.do(t, "GET", "/open?code="+code, nil, false); r.StatusCode != 200 {
+		t.Fatalf("exchange: %d", r.StatusCode)
+	}
+	if _, err := os.Stat(arg); !os.IsNotExist(err) {
+		t.Fatal("the launch file must be removed once its code is used")
+	}
 }
 
 func TestApproveUnblocksWait(t *testing.T) {
@@ -191,7 +247,7 @@ func TestApproveUnblocksWait(t *testing.T) {
 		done <- r
 	}()
 	time.Sleep(50 * time.Millisecond)
-	resp := h.do(t, "POST", "/api/sessions/"+st.SessionID+"/approve", map[string]string{"Origin": h.origin(), csrfHeader: h.srv.csrf}, true)
+	resp := h.do(t, "POST", "/api/sessions/"+st.SessionID+"/approve", map[string]string{"Origin": h.origin(), csrfHeader: h.srv.bearer}, true)
 	if resp.StatusCode != 200 {
 		t.Fatalf("approve: %d", resp.StatusCode)
 	}
@@ -212,7 +268,7 @@ func TestTakeControlHandBackAndAddressBar(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	st, _ := h.svc.Start(ctx, "", "g", "")
-	hdr := map[string]string{"Origin": h.origin(), csrfHeader: h.srv.csrf}
+	hdr := map[string]string{"Origin": h.origin(), csrfHeader: h.srv.bearer}
 	if r := h.do(t, "POST", "/api/sessions/"+st.SessionID+"/navigate", hdr, true); r.StatusCode != http.StatusConflict {
 		t.Fatalf("address bar must be read-only while the agent drives: %d", r.StatusCode)
 	}
@@ -225,7 +281,7 @@ func TestTakeControlHandBackAndAddressBar(t *testing.T) {
 	}
 	req, _ := http.NewRequest("POST", h.base+"/api/sessions/"+st.SessionID+"/navigate", strings.NewReader(`{"url":"https://example.test/"}`))
 	req.Header.Set("Origin", h.origin())
-	req.Header.Set(csrfHeader, h.srv.csrf)
+	req.Header.Set(csrfHeader, h.srv.bearer)
 	req.AddCookie(&http.Cookie{Name: h.srv.cookieName(), Value: h.srv.cookie})
 	if r, err := http.DefaultClient.Do(req); err != nil || r.StatusCode != 200 {
 		t.Fatalf("navigate while driving: %v %v", err, r)
@@ -243,7 +299,7 @@ func TestMintAndAttention(t *testing.T) {
 		t.Fatalf("request link: %q %v", link, err)
 	}
 	h.srv.Attention("cb-1", "start")
-	if len(h.opened) != 1 {
+	if len(h.opened) != 1 || !strings.HasSuffix(h.opened[0], ".html") {
 		t.Fatalf("attention should open the viewer once, opened %d", len(h.opened))
 	}
 	h.srv.Attention("cb-1", "approval")

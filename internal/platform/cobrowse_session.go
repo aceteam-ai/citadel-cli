@@ -753,3 +753,10 @@ func sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
 	}
 	_ = pidKiller(pid)
 }
+
+// EnsurePrivateDir creates dir private to the current user, or verifies an
+// existing one, with the same rules as the co-browse session base dir: owner
+// only and not group/other-writable on Unix; owned by the user with a
+// protected owner-only DACL on Windows. An existing dir that fails is refused,
+// never repaired. Local mode keeps its viewer token and audit log in such dirs.
+func EnsurePrivateDir(dir string) error { return ensureCobrowseBaseDir(dir) }

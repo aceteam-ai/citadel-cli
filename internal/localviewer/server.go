@@ -39,6 +39,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 //go:embed assets/*
@@ -48,11 +49,18 @@ var assets embed.FS
 // running owner for a fresh link.
 const TokenFile = "local-viewer.json"
 
+// PrivateDirName is the owner-only subdir of the node config dir holding
+// TokenFile and the one-time launch files.
+const PrivateDirName = "local-viewer"
+
 const (
-	codeTTL        = 2 * time.Minute
-	csrfHeader     = "X-Citadel-CSRF"
-	pageActiveFor  = 4 * time.Second
-	reopenThrottle = 15 * time.Second
+	codeTTL    = 2 * time.Minute
+	csrfHeader = "X-Citadel-CSRF"
+	// A page that polled within pageActiveFor is treated as open, so the
+	// owner does not open another tab. Background tabs poll slowly (browsers
+	// throttle their timers), hence the generous window.
+	pageActiveFor  = 90 * time.Second
+	reopenThrottle = 2 * time.Minute
 )
 
 // TokenInfo is the content of TokenFile.
@@ -70,7 +78,8 @@ type Config struct {
 	Stream cobrowsestream.Session
 	// OpenURL opens a URL in the user's default browser.
 	OpenURL func(string) error
-	// TokenDir is where TokenFile is written; empty writes none.
+	// TokenDir is the node config dir. TokenFile and the launch files live in
+	// its owner-only PrivateDirName subdir. Empty disables Open (tests).
 	TokenDir string
 	// Now is the clock; nil uses time.Now.
 	Now func() time.Time
@@ -78,19 +87,27 @@ type Config struct {
 
 // Server is the loopback viewer.
 type Server struct {
-	cfg    Config
-	cookie string // cookie value
-	csrf   string
-	mint   string // bearer token for /api/mint
+	cfg  Config
+	mint string // bearer token for /api/mint
 
-	mu       sync.Mutex
-	codes    map[string]time.Time
-	port     int
-	lastPoll time.Time
-	lastOpen time.Time
-	ln       net.Listener
-	http     *http.Server
-	stream   *cobrowsestream.StreamHandler
+	// cookie and bearer are rotated on every code exchange. The bearer is
+	// returned only in the /open response, where the page keeps it in
+	// sessionStorage (scoped to this origin, so this port), and every data
+	// request must carry it. The cookie alone, which a browser also sends to
+	// other 127.0.0.1 ports, unlocks nothing but the static page.
+	cookie string
+	bearer string
+
+	mu    sync.Mutex
+	codes map[string]time.Time
+	// launchFiles maps a code to the one-time launch file that carries it.
+	launchFiles map[string]string
+	port        int
+	lastPoll    time.Time
+	lastOpen    time.Time
+	ln          net.Listener
+	http        *http.Server
+	stream      *cobrowsestream.StreamHandler
 }
 
 func randHex(n int) string {
@@ -106,7 +123,7 @@ func New(cfg Config) *Server {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Server{cfg: cfg, cookie: randHex(32), csrf: randHex(32), mint: randHex(32), codes: map[string]time.Time{}}
+	return &Server{cfg: cfg, cookie: randHex(32), bearer: randHex(32), mint: randHex(32), codes: map[string]time.Time{}, launchFiles: map[string]string{}}
 }
 
 // Start listens on an ephemeral 127.0.0.1 port and serves.
@@ -165,23 +182,72 @@ func (s *Server) Close() {
 		_ = srv.Shutdown(ctx)
 	}
 	if s.cfg.TokenDir != "" {
-		_ = os.Remove(filepath.Join(s.cfg.TokenDir, TokenFile))
+		_ = os.Remove(filepath.Join(s.privateDir(), TokenFile))
+		s.mu.Lock()
+		for code := range s.launchFiles {
+			s.removeLaunchFileLocked(code)
+		}
+		s.mu.Unlock()
 	}
 }
+
+func (s *Server) privateDir() string { return filepath.Join(s.cfg.TokenDir, PrivateDirName) }
 
 func (s *Server) writeTokenFile() error {
 	if s.cfg.TokenDir == "" {
 		return nil
 	}
-	if err := os.MkdirAll(s.cfg.TokenDir, 0o700); err != nil {
-		return err
+	if err := platform.EnsurePrivateDir(s.privateDir()); err != nil {
+		return fmt.Errorf("viewer token dir: %w", err)
 	}
 	data, _ := json.Marshal(TokenInfo{Port: s.Port(), Token: s.mint, PID: os.Getpid()})
-	tmp := filepath.Join(s.cfg.TokenDir, TokenFile+".tmp")
+	tmp := filepath.Join(s.privateDir(), TokenFile+".tmp")
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(s.cfg.TokenDir, TokenFile))
+	return os.Rename(tmp, filepath.Join(s.privateDir(), TokenFile))
+}
+
+// writeLaunchFile writes a one-time HTML file that forwards the browser to
+// link, so the code never appears on a command line (where another local user
+// could read it from the process list). The file is in the owner-only dir and
+// removed once the code is used or expires.
+func (s *Server) writeLaunchFile(code, link string) (string, error) {
+	if s.cfg.TokenDir == "" {
+		return "", errors.New("no private directory for the viewer launch file")
+	}
+	if err := platform.EnsurePrivateDir(s.privateDir()); err != nil {
+		return "", fmt.Errorf("viewer launch dir: %w", err)
+	}
+	path := filepath.Join(s.privateDir(), "open-"+randHex(8)+".html")
+	page := `<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer">` +
+		`<meta http-equiv="refresh" content="0;url=` + link + `"><title>Opening the Citadel viewer</title>` +
+		`<p>Opening the Citadel viewer&hellip; <a href="` + link + `">Continue</a></p>`
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(page); err != nil {
+		f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	s.mu.Lock()
+	s.launchFiles[code] = path
+	s.mu.Unlock()
+	return path, nil
+}
+
+// removeLaunchFileLocked deletes the launch file for code. Caller holds s.mu.
+func (s *Server) removeLaunchFileLocked(code string) {
+	if p, ok := s.launchFiles[code]; ok {
+		_ = os.Remove(p)
+		delete(s.launchFiles, code)
+	}
 }
 
 func (s *Server) origin() string { return "http://127.0.0.1:" + strconv.Itoa(s.Port()) }
@@ -189,28 +255,47 @@ func (s *Server) host() string   { return "127.0.0.1:" + strconv.Itoa(s.Port()) 
 
 // MintURL returns a fresh single-use link that sets the viewer cookie.
 func (s *Server) MintURL() string {
-	code := randHex(24)
+	_, link := s.mint2()
+	return link
+}
+
+func (s *Server) mint2() (code, link string) {
+	code = randHex(24)
 	s.mu.Lock()
 	now := s.cfg.Now()
 	for c, exp := range s.codes {
 		if now.After(exp) {
 			delete(s.codes, c)
+			s.removeLaunchFileLocked(c)
 		}
 	}
 	s.codes[code] = now.Add(codeTTL)
 	s.mu.Unlock()
-	return s.origin() + "/open?code=" + code
+	return code, s.origin() + "/open?code=" + code
 }
 
-// Open opens a fresh link in the user's default browser.
+// MintLaunchFile returns a fresh one-time launch file path (to open in the
+// default browser) and the link it forwards to.
+func (s *Server) MintLaunchFile() (path, link string, err error) {
+	code, link := s.mint2()
+	path, err = s.writeLaunchFile(code, link)
+	return path, link, err
+}
+
+// Open opens the viewer in the user's default browser through a one-time
+// launch file; the command line carries only the file's path.
 func (s *Server) Open() error {
 	if s.cfg.OpenURL == nil {
 		return errors.New("no browser opener configured")
 	}
+	path, _, err := s.MintLaunchFile()
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.lastOpen = s.cfg.Now()
 	s.mu.Unlock()
-	return s.cfg.OpenURL(s.MintURL())
+	return s.cfg.OpenURL(path)
 }
 
 // Attention is the service's OnAttention hook. If a viewer page is already
@@ -250,9 +335,21 @@ func setSecurityHeaders(w http.ResponseWriter, origin string) {
 
 func (s *Server) cookieName() string { return "citadel_viewer_" + strconv.Itoa(s.Port()) }
 
+func (s *Server) secrets() (cookie, bearer string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cookie, s.bearer
+}
+
 func (s *Server) hasCookie(r *http.Request) bool {
+	want, _ := s.secrets()
 	c, err := r.Cookie(s.cookieName())
-	return err == nil && subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.cookie)) == 1
+	return err == nil && subtle.ConstantTimeCompare([]byte(c.Value), []byte(want)) == 1
+}
+
+func (s *Server) bearerOK(got string) bool {
+	_, want := s.secrets()
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 // Handler is the full, guarded mux.
@@ -261,7 +358,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /open", s.handleOpen)
 	mux.HandleFunc("GET /{$}", s.withCookie(s.handleIndex))
 	mux.HandleFunc("GET /assets/{file}", s.withCookie(s.handleAsset))
-	mux.HandleFunc("GET /api/state", s.withCookie(s.handleState))
+	mux.HandleFunc("GET /api/state", s.withCookie(s.withCSRF(s.handleState)))
 	mux.HandleFunc("POST /api/sessions/{id}/{action}", s.withCookie(s.withCSRF(s.handleAction)))
 	mux.HandleFunc("GET /api/stream", s.withCookie(s.handleStream))
 	mux.HandleFunc("POST /api/mint", s.handleMint)
@@ -282,8 +379,13 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			return
 		}
 		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
-			forbid(w, "cross-site request")
-			return
+			// The one exception: the top-level navigation from the one-time
+			// launch file (a file: page) to /open. The code is its auth.
+			openNav := r.Method == http.MethodGet && r.URL.Path == "/open" && r.Header.Get("Sec-Fetch-Mode") == "navigate"
+			if !openNav {
+				forbid(w, "cross-site request")
+				return
+			}
 		}
 		stateChanging := r.Method != http.MethodGet && r.Method != http.MethodHead
 		isWS := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
@@ -307,34 +409,50 @@ func (s *Server) withCookie(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) withCSRF(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get(csrfHeader)), []byte(s.csrf)) != 1 {
-			forbid(w, "missing or wrong CSRF token")
+		if !s.bearerOK(r.Header.Get(csrfHeader)) {
+			forbid(w, "missing or wrong viewer token")
 			return
 		}
 		next(w, r)
 	}
 }
 
-// handleOpen exchanges a single-use code for the viewer cookie. A cookie is
-// never issued without a valid, unused, unexpired code.
+// handleOpen exchanges a single-use code for a fresh viewer cookie and a fresh
+// bearer, invalidating the previous ones. A cookie is never issued without a
+// valid, unused, unexpired code. The bearer goes only into this response's
+// page, which stores it in sessionStorage and moves to "/" by script (a
+// same-origin navigation, so the SameSite=Strict cookie is sent).
 func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	s.mu.Lock()
 	exp, ok := s.codes[code]
 	delete(s.codes, code)
+	s.removeLaunchFileLocked(code)
+	valid := code != "" && ok && !s.cfg.Now().After(exp)
+	var cookie, bearer string
+	if valid {
+		s.cookie, s.bearer = randHex(32), randHex(32)
+		cookie, bearer = s.cookie, s.bearer
+	}
 	s.mu.Unlock()
-	if code == "" || !ok || s.cfg.Now().After(exp) {
+	if !valid {
 		forbid(w, "This Citadel viewer link has expired or was already used. Run `citadel local viewer` for a new one.")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     s.cookieName(),
-		Value:    s.cookie,
+		Value:    cookie,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	page, err := assets.ReadFile("assets/open.html")
+	if err != nil {
+		http.Error(w, "missing page", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(bytes.ReplaceAll(page, []byte("{{BEARER}}"), []byte(bearer)))
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -343,7 +461,6 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing page", http.StatusInternalServerError)
 		return
 	}
-	page = bytes.ReplaceAll(page, []byte("{{CSRF}}"), []byte(s.csrf))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(page)
 }
@@ -352,7 +469,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("file")
 	var ctype string
 	switch name {
-	case "app.js":
+	case "app.js", "open.js":
 		ctype = "text/javascript; charset=utf-8"
 	case "app.css":
 		ctype = "text/css; charset=utf-8"
@@ -434,8 +551,8 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
-	if subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("csrf")), []byte(s.csrf)) != 1 {
-		forbid(w, "missing or wrong CSRF token")
+	if !s.bearerOK(r.URL.Query().Get("csrf")) {
+		forbid(w, "missing or wrong viewer token")
 		return
 	}
 	if r.Header.Get("Origin") != s.origin() {
@@ -465,23 +582,35 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		forbid(w, "bad token")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"url": s.MintURL()})
+	path, link, err := s.MintLaunchFile()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]string{"url": link})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": link, "file": path})
 }
 
 // RequestLink asks a running viewer (described by the TokenFile in dir) for a
 // fresh single-use link. Loopback only.
 func RequestLink(ctx context.Context, dir string, client *http.Client) (string, error) {
-	data, err := os.ReadFile(filepath.Join(dir, TokenFile))
+	link, _, err := RequestLaunch(ctx, dir, client)
+	return link, err
+}
+
+// RequestLaunch is RequestLink that also returns the one-time launch file to
+// open (empty if the viewer could not write one).
+func RequestLaunch(ctx context.Context, dir string, client *http.Client) (link, file string, err error) {
+	data, err := os.ReadFile(filepath.Join(dir, PrivateDirName, TokenFile))
 	if err != nil {
-		return "", fmt.Errorf("no Citadel local co-browse is running on this computer (start a session from your agent first)")
+		return "", "", fmt.Errorf("no Citadel local co-browse is running on this computer (start a session from your agent first)")
 	}
 	var info TokenInfo
 	if err := json.Unmarshal(data, &info); err != nil || info.Port <= 0 || info.Token == "" {
-		return "", fmt.Errorf("the viewer token file is unreadable; restart your agent app")
+		return "", "", fmt.Errorf("the viewer token file is unreadable; restart your agent app")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(info.Port)+"/api/mint", nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+info.Token)
 	if client == nil {
@@ -489,17 +618,18 @@ func RequestLink(ctx context.Context, dir string, client *http.Client) (string, 
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("the Citadel process that owned co-browse is no longer running (start a session from your agent first)")
+		return "", "", fmt.Errorf("the Citadel process that owned co-browse is no longer running (start a session from your agent first)")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("the running viewer refused the request (%s)", resp.Status)
+		return "", "", fmt.Errorf("the running viewer refused the request (%s)", resp.Status)
 	}
 	var out struct {
-		URL string `json:"url"`
+		URL  string `json:"url"`
+		File string `json:"file"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.URL == "" {
-		return "", fmt.Errorf("unexpected viewer response")
+		return "", "", fmt.Errorf("unexpected viewer response")
 	}
-	return out.URL, nil
+	return out.URL, out.File, nil
 }
