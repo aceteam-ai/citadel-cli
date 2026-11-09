@@ -510,3 +510,29 @@ func TestHeadedUserAgentFallbackCacheAndSingleflight(t *testing.T) {
 		t.Fatalf("retry after the window: %q", ua)
 	}
 }
+
+// TestWindowsRealBrowserUAWhenProbeFails forces the user-agent probe to fail
+// and checks the session still does not report a headless user agent.
+func TestWindowsRealBrowserUAWhenProbeFails(t *testing.T) {
+	requireBrowserIT(t)
+	prevLaunch := uaProbeLaunch
+	uaCacheMu.Lock()
+	uaCache = map[string]*uaEntry{}
+	uaCacheMu.Unlock()
+	uaProbeLaunch = func(BrowserInfo, string) (string, error) { return "", errors.New("forced probe failure") }
+	t.Cleanup(func() {
+		uaProbeLaunch = prevLaunch
+		uaCacheMu.Lock()
+		uaCache = map[string]*uaEntry{}
+		uaCacheMu.Unlock()
+	})
+	srv := fixtureServer(t)
+	m := newCobrowseSessionManager(filepath.Join(t.TempDir(), "cobrowse-sessions"), 2)
+	st, err := m.StartSession(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.StopAll() })
+	waitExtract(t, m, st.ID, "#t", "Fixture page one")
+	assertNotHeadlessUA(t, st.DebugPort)
+}

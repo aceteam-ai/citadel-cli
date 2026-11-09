@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -79,10 +80,50 @@ func (r windowsHeadlessRunner) Launch(profileDir, startURL string, lo LaunchOpti
 	// binary) and pass it as --user-agent. An explicit EnvCobrowseUserAgent
 	// still wins, and with stealth off the browser's own UA is left alone.
 	ua := os.Getenv(EnvCobrowseUserAgent)
-	if ua == "" && stealthEnabled() {
+	derive := ua == "" && stealthEnabled()
+	if derive {
 		ua = headedUserAgent(info, filepath.Dir(profileDir))
 	}
-	return startHeadless(info, profileDir, startURL, ua, lo)
+	proc, err := startHeadless(info, profileDir, startURL, ua, lo)
+	if err != nil || !derive || ua != "" {
+		return proc, err
+	}
+	// The probe failed (for example it timed out on a slow first launch), so
+	// this session would report "HeadlessChrome". It is now running, so read
+	// its UA, cache the derived one, and relaunch once with it. If anything
+	// here fails, keep the running session rather than failing the start.
+	raw, verr := browserDefaultUserAgent(proc.debugPort)
+	if verr != nil || !strings.Contains(raw, "Headless") {
+		return proc, nil
+	}
+	derived := deheadlessUserAgent(raw)
+	rememberUserAgent(info, derived)
+	_ = proc.stop()
+	again, err := startHeadless(info, profileDir, startURL, derived, lo)
+	if err != nil {
+		log.Printf("[cobrowse] relaunch with the derived user agent failed (%v); starting without it", err)
+		return startHeadless(info, profileDir, startURL, "", lo)
+	}
+	return again, nil
+}
+
+// rememberUserAgent caches a derived UA for info's binary, replacing a cached
+// probe failure.
+func rememberUserAgent(info BrowserInfo, ua string) {
+	key := uaCacheKey(info)
+	e := &uaEntry{done: make(chan struct{}), ua: ua, at: time.Now()}
+	close(e.done)
+	uaCacheMu.Lock()
+	uaCache[key] = e
+	uaCacheMu.Unlock()
+}
+
+func uaCacheKey(info BrowserInfo) string {
+	key := info.Path
+	if fi, err := os.Stat(info.Path); err == nil {
+		key = fmt.Sprintf("%s|%d|%d", info.Path, fi.Size(), fi.ModTime().UnixNano())
+	}
+	return key
 }
 
 // startHeadless launches one headless browser in a kill-on-close job and waits
@@ -196,10 +237,7 @@ var (
 // it once, headless, in a throwaway profile under baseDir; concurrent callers
 // wait for that one probe without holding the cache lock.
 func headedUserAgent(info BrowserInfo, baseDir string) string {
-	key := info.Path
-	if fi, err := os.Stat(info.Path); err == nil {
-		key = fmt.Sprintf("%s|%d|%d", info.Path, fi.Size(), fi.ModTime().UnixNano())
-	}
+	key := uaCacheKey(info)
 	uaCacheMu.Lock()
 	e, ok := uaCache[key]
 	if ok && e.err != nil {
