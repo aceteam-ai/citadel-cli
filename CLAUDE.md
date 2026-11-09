@@ -91,6 +91,68 @@ the platform supplies a unique staging destination and receives that exact
 relative path in the receipt. See `docs/file-fetch.md` for
 the contract.
 
+`platform.browserRunner` owns the per-OS half of a co-browse session:
+discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
+`xvfbRunner` is the historical managed-Xvfb path, and its argument list is pinned
+by `TestBuildChromeArgs_LinuxArgsUnchanged`. `windowsHeadlessRunner` launches
+Chrome or Edge headless inside a kill-on-close Job Object, and
+`discoverWindowsBrowser` owns the search order. On Windows the sweep never kills
+by PID: it removes only dirs whose owner PID plus creation time no longer
+match. The session base dir there requires an owner-only, protected DACL
+(`validateCobrowseBaseDirPerms`), and a launch refuses without one. The
+windows-latest CI job runs the real-browser tests against both browsers.
+
+`localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
+per-session write grant (default deny, 24h maximum), the abuse limits, the
+idle lifetime and `local_cobrowse_wait`. `localcobrowse.NewURLPolicy` owns the
+navigation address filter, and its host parsing matches a browser's.
+`localcobrowse.EgressGuard` is the local-mode browser's `--proxy-server`
+(`platform.LaunchOptions`). It resolves and dials each destination itself and
+refuses non-public addresses, so the policy also covers redirects,
+subresources and DNS rebinding. Budgets are owner-wide and count reads, and
+only the human can hand control back (`ErrOnlyUserHandsBack`). Grants
+come only from the human-side methods (Approve, Deny, Revoke), which no MCP
+tool reaches. `citadel local mcp` (`newLocalOnlyBridge`) never reads a key or
+token. An unserved method or tool gets -32601 rather than the backend
+fallthrough, and `isLocalModeCommand` skips the root pre-run's CA trust and
+update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
+user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
+
+`localviewer.Server` owns the local-mode loopback viewer. `guard` checks Host
+and Origin. The only cross-site request it admits is the top-level navigation
+to `/open`. `handleOpen` is the only place a cookie and bearer are issued, in
+exchange for a single-use code, and it rotates both. The bearer appears only in
+the `/open` page, which keeps it in sessionStorage. Every data request and the
+WebSocket need it as well as the cookie: browsers send the cookie to any
+127.0.0.1 port. Codes reach the user's browser only through an owner-only
+one-time launch file (`writeLaunchFile`), never on a command line.
+`cobrowsestream.NewStreamHandler` mounts the screencast behind these checks.
+`TestGuardsReturn403`, `TestCookieOnlyFromSingleUseCode` and
+`TestOpenKeepsTheCodeOffTheCommandLine` pin the boundary.
+
+`localaudit.Log` owns the local co-browse audit chain under
+`<node config dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
+month. Each record's hash is over its RFC 8785 form (`aep.CanonicalizeJCS`).
+`anchor.json` holds the head and what retention removed, so `Verify` catches a
+missing tail or an unretained missing head. `Open` quarantines a torn final line,
+and a failed prune is not fatal. Only the co-browse owner writes, so each chain
+has one writer. A write gets a pending record before it runs
+(`Config.BeforeAction`); if that write fails the action is refused and
+co-browse turns off. The human's Stop and Take control bypass that precheck.
+URLs are kept as origin plus a path hash (`RedactURL`), and error text is
+sanitized. `TestLocalAuditRecordsEveryCallWithoutSecrets` greps the log for a
+sentinel.
+
+`cmd.harnesses` owns each agent app's MCP config location and entry shape for
+`citadel local config`. Change them there, not in
+`docs/local-browse-quickstart.md`. Locations that could not be confirmed from
+the harness's own docs, such as Claude Desktop on Linux, carry an `unverified`
+note that the command prints. `mergeHarnessConfig` parses TOML and merges JSON
+without loss. A re-run with the same entry is a no-op. It writes through
+symlinks and keeps a timestamped backup. `runLocalDoctor` owns the
+first-run checks, and the windows CI job runs the built binary's
+`citadel local doctor`.
+
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
 **Key Components:**
