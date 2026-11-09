@@ -131,8 +131,11 @@ one-time launch file (`writeLaunchFile`), never on a command line.
 `TestOpenKeepsTheCodeOffTheCommandLine` pin the boundary.
 
 `localaudit.Log` owns the local co-browse audit chain under
-`<node config dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
-month. Each record's hash is over its RFC 8785 form (`aep.CanonicalizeJCS`).
+`<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
+month. `cmd.localStateDir` owns where local mode keeps its owner lock, audit
+log and viewer token: the invoking user's config dir, never the
+machine-convergent node config dir, which on an enrolled machine belongs to
+the node's account (#1592). Each record's hash is over its RFC 8785 form (`aep.CanonicalizeJCS`).
 `anchor.json` holds the head and what retention removed, so `Verify` catches a
 missing tail or an unretained missing head. `Open` quarantines a torn final line,
 and a failed prune is not fatal. Only the co-browse owner writes, so each chain

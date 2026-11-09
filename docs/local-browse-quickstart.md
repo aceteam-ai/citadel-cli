@@ -215,8 +215,10 @@ detects tampering. It does not prove anything against a program running as
 your account.
 
 Local mode keeps its state (the co-browse lock, the audit log and the viewer's
-link file) in `%LOCALAPPDATA%\Citadel\local`, separately for each Windows
-user, even on a computer that also runs an AceTeam node.
+link file) in `%LOCALAPPDATA%\Citadel\local` (`~/.citadel-cli/local` on
+macOS and Linux), separately for each user, even on a computer that also runs
+an AceTeam node. Audit records written by v2.212.0 and v2.213.0 stay in the
+older location and `local audit` no longer shows them.
 
 ## Later: connect to AceTeam
 

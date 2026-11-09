@@ -1,5 +1,5 @@
 // Package localaudit is Citadel local mode's co-browse audit log (aceteam#13503
-// design section 2.6): append-only JSONL under <node config dir>/cobrowse-audit,
+// design section 2.6): append-only JSONL under <local state dir>/cobrowse-audit,
 // one file per UTC month, each record carrying the SHA-256 of the record before
 // it so an edited, removed or reordered record is detectable.
 //
@@ -36,7 +36,7 @@ import (
 // owner-only DACL on Windows).
 var ensureDir = platform.EnsurePrivateDir
 
-// DirName is the audit directory under the node config dir.
+// DirName is the audit directory under the local-mode state dir (cmd.localStateDir).
 const DirName = "cobrowse-audit"
 
 // DefaultRetention is how long monthly files are kept.
