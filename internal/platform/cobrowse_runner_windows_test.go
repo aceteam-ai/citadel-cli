@@ -179,13 +179,15 @@ func TestWindowsBaseDirIsOwnerOnly(t *testing.T) {
 		t.Fatalf("re-validate fresh dir: %v", err)
 	}
 
-	// A plain dir inherits its parent's ACL and must be refused, not repaired.
+	// A plain dir inherits its parent's ACL (and, for an elevated process, is
+	// owned by Administrators); either way it must be refused, not repaired.
 	plain := filepath.Join(t.TempDir(), "plain")
 	if err := os.MkdirAll(plain, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureCobrowseBaseDir(plain); err == nil || !strings.Contains(err.Error(), "inherits") {
-		t.Fatalf("inherited-ACL dir must be refused, got %v", err)
+	if err := ensureCobrowseBaseDir(plain); err == nil ||
+		!(strings.Contains(err.Error(), "inherits") || strings.Contains(err.Error(), "is owned by")) {
+		t.Fatalf("plain dir must be refused, got %v", err)
 	}
 
 	// An extra grant to Everyone must be refused.
