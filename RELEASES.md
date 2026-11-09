@@ -3567,3 +3567,18 @@ Auto-generated log of every release.
   - fix(services): materialize fresh compose on unknown GPU evidence (#1562)
 
 
+---
+
+## v2.214.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 11 |
+| Lines added | +123 |
+
+**Changes:**
+
+  - fix(local): keep local-mode state in the invoking user's config dir (#1593)
+
+
