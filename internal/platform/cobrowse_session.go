@@ -683,7 +683,17 @@ func ensureCobrowseBaseDir(dir string) error {
 				_ = os.Remove(dir)
 				return err
 			}
-			return nil
+			// MkdirAll also succeeds if another process created the dir in
+			// the meantime, with whatever mode or owner it chose, so check
+			// what is actually there before trusting it.
+			info, err = os.Lstat(dir)
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("cobrowse base dir %s exists and is not a directory", dir)
+			}
+			return validateCobrowseBaseDirPerms(dir, info)
 		}
 		return err
 	}

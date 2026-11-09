@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -348,5 +349,25 @@ func TestBuildChromeArgs_TerminatorLastWithAllOptions(t *testing.T) {
 	}
 	if args := buildChromeArgs(cobrowseLaunchOptions{profileDir: "/p", headless: true}); containsArg(args, "--") {
 		t.Fatalf("no URL, no terminator: %v", args)
+	}
+}
+
+func TestEnsurePrivateDirRechecksAfterCreate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("covered by TestWindowsBaseDirIsOwnerOnly")
+	}
+	dir := filepath.Join(t.TempDir(), "priv")
+	if err := EnsurePrivateDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("mode %o", fi.Mode().Perm())
+	}
+	// A dir someone else left group-writable is refused, not adopted.
+	loose := filepath.Join(t.TempDir(), "loose")
+	_ = os.Mkdir(loose, 0o777)
+	_ = os.Chmod(loose, 0o777)
+	if err := EnsurePrivateDir(loose); err == nil {
+		t.Fatal("a group/other-writable dir must be refused")
 	}
 }

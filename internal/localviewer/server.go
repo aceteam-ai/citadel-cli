@@ -430,11 +430,17 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 	s.removeLaunchFileLocked(code)
 	valid := code != "" && ok && !s.cfg.Now().After(exp)
 	var cookie, bearer string
+	stream := s.stream
 	if valid {
 		s.cookie, s.bearer = randHex(32), randHex(32)
 		cookie, bearer = s.cookie, s.bearer
 	}
 	s.mu.Unlock()
+	if valid && stream != nil {
+		// The old tab's stream holds the single-viewer claim and its token is
+		// now revoked: drop it, so the new tab can attach right away.
+		stream.CloseViewers()
+	}
 	if !valid {
 		forbid(w, "This Citadel viewer link has expired or was already used. Run `citadel local viewer` for a new one.")
 		return

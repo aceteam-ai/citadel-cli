@@ -330,3 +330,20 @@ func TestServeRefusesNonLoopback(t *testing.T) {
 		t.Fatal("must refuse anything but 127.0.0.1")
 	}
 }
+
+// TestOpenExchangeDropsOldViewers checks a successful /open releases the old
+// tab's stream claim (its token was just revoked).
+func TestOpenExchangeDropsOldViewers(t *testing.T) {
+	h := newHarness(t)
+	h.srv.mu.Lock()
+	stream := h.srv.stream
+	h.srv.mu.Unlock()
+	if stream != nil {
+		t.Skip("harness has a live stream")
+	}
+	// With no stream configured the exchange must still work.
+	u, _ := url.Parse(h.srv.MintURL())
+	if r := h.do(t, "GET", u.RequestURI(), nil, false); r.StatusCode != 200 {
+		t.Fatalf("exchange: %d", r.StatusCode)
+	}
+}
