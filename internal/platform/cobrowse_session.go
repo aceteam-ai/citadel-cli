@@ -239,6 +239,12 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 // lock can leak — a missed Close is structurally impossible because every cleanup
 // path routes through teardown().
 func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
+	if err := ValidateCobrowseURL(startURL); err != nil {
+		if profile != nil {
+			profile.Close()
+		}
+		return CobrowseSessionStatus{}, err
+	}
 	// Reap orphans from a prior crashed process before the first launch of this one.
 	m.sweepOnce.Do(m.sweep)
 

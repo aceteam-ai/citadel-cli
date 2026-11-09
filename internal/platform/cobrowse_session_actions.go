@@ -97,6 +97,9 @@ func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, 
 // Navigate drives one session's browser to a URL. Refused while the session is
 // handed off to a human (ErrHandedOff).
 func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus, error) {
+	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
 	s, err := m.sessionForAction(id)
 	if err != nil {
 		return CobrowseSessionStatus{}, err

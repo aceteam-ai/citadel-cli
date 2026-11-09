@@ -228,7 +228,8 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 	}
 
 	if opts.startURL != "" {
-		args = append(args, opts.startURL)
+		// "--" ends switch parsing, so the URL can never be read as a flag.
+		args = append(args, "--", opts.startURL)
 	}
 	return args
 }
@@ -462,6 +463,9 @@ func (m *CobrowseManager) isRunningLocked() bool {
 // session is reused -- co-browse is single-session-per-node by design;
 // multi-session is left as future work. startURL may be empty.
 func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (CobrowseStatus, error) {
+	if err := ValidateCobrowseURL(startURL); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -703,6 +707,9 @@ func (m *CobrowseManager) statusLocked() CobrowseStatus {
 
 // Navigate drives the browser to a URL. Refused while handed off to the human.
 func (m *CobrowseManager) Navigate(url string) (CobrowseStatus, error) {
+	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {
