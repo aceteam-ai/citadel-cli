@@ -13,6 +13,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/services"
+	"gopkg.in/yaml.v3"
 )
 
 // TestOllamaMaxLoadedModelsFromFile pins the #1209 best-effort manifest reader
@@ -116,7 +117,7 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 	}
 
 	one := 1
-	env, err := h.composeEnvForEngineStart("ollama", "", &one, nil)
+	env, err := h.composeEnvForEngineStart("ollama", "", &one, nil, nil)
 	if err != nil {
 		t.Fatalf("set: unexpected error: %v", err)
 	}
@@ -127,7 +128,7 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 		t.Errorf("set: policy entry must be last (so it wins), got %q", env[len(env)-1])
 	}
 
-	envNil, err := h.composeEnvForEngineStart("ollama", "", nil, nil)
+	envNil, err := h.composeEnvForEngineStart("ollama", "", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unset: unexpected error: %v", err)
 	}
@@ -139,13 +140,13 @@ func TestComposeEnvForEngineStart_InjectsOllamaPolicyOnlyWhenSet(t *testing.T) {
 	}
 
 	neg := -1
-	if _, err := h.composeEnvForEngineStart("ollama", "", &neg, nil); err == nil {
+	if _, err := h.composeEnvForEngineStart("ollama", "", &neg, nil, nil); err == nil {
 		t.Errorf("negative: want a hard error, got nil")
 	}
 
 	// A non-ollama engine remains byte-for-byte outside this policy authority;
 	// the hostile inherited value therefore remains present and unchanged.
-	envVLLM, err := h.composeEnvForEngineStart("vllm", "", &one, nil)
+	envVLLM, err := h.composeEnvForEngineStart("vllm", "", &one, nil, nil)
 	if err != nil {
 		t.Fatalf("vllm: unexpected error: %v", err)
 	}
@@ -222,3 +223,69 @@ func TestServiceStartRejectsNegativeOllamaPolicyBeforeEngineSideEffects(t *testi
 		t.Fatalf("invalid policy mutated config dir: before=%v after=%v", before, after)
 	}
 }
+
+// citadel-cli#1560: keep_alive/preload survive the APPLY_DEVICE_CONFIG manifest
+// round-trip and reach the compose env on the applied-service path.
+func TestOllamaKeepAliveRoundTripAndAppliedEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/citadel.yaml"
+	src := "node:\n  name: n\nservices:\n  - name: ollama\n    compose_file: ./services/ollama.yml\n    ollama_keep_alive: 24h\n    ollama_preload: [qwen3.5:4b, llama3]\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		Services []manifestService `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(src), &m); err != nil {
+		t.Fatal(err)
+	}
+	out, err := yaml.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back struct {
+		Services []manifestService `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(out, &back); err != nil {
+		t.Fatal(err)
+	}
+	s := back.Services[0]
+	if s.OllamaKeepAlive == nil || *s.OllamaKeepAlive != "24h" || !slices.Equal(s.OllamaPreload, []string{"qwen3.5:4b", "llama3"}) {
+		t.Fatalf("manifestService dropped fields: %+v", s)
+	}
+	var cm CitadelManifest
+	if err := yaml.Unmarshal([]byte(src), &cm); err != nil {
+		t.Fatal(err)
+	}
+	cout, _ := yaml.Marshal(cm)
+	var cback CitadelManifest
+	if err := yaml.Unmarshal(cout, &cback); err != nil {
+		t.Fatal(err)
+	}
+	cs := cback.Services[0]
+	if cs.OllamaKeepAlive == nil || *cs.OllamaKeepAlive != "24h" || len(cs.OllamaPreload) != 2 {
+		t.Fatalf("ManifestService (APPLY_DEVICE_CONFIG) dropped fields: %+v", cs)
+	}
+	env, err := composeEnvForAppliedService(nil, path, "ollama")
+	if err != nil || !slices.Contains(env, "OLLAMA_KEEP_ALIVE=24h") {
+		t.Fatalf("applied env: %v %v", env, err)
+	}
+	bad := "services:\n  - name: ollama\n    ollama_keep_alive: nope\n"
+	os.WriteFile(path, []byte(bad), 0o644)
+	env, err = composeEnvForAppliedService(nil, path, "ollama")
+	if err == nil || slices.Contains(env, "OLLAMA_KEEP_ALIVE=nope") {
+		t.Fatalf("invalid must error and not inject: %v %v", env, err)
+	}
+	h := &ServiceHandler{ConfigDir: t.TempDir()}
+	if _, err := h.composeEnvForEngineStart("ollama", "", nil, sp("bogus"), nil); err == nil {
+		t.Error("engine start must refuse invalid keep_alive")
+	}
+	env, err = h.composeEnvForEngineStart("ollama", "", nil, nil, nil)
+	if err != nil || slices.ContainsFunc(env, func(e string) bool {
+		return strings.HasPrefix(e, "OLLAMA_KEEP_ALIVE=") && os.Getenv("OLLAMA_KEEP_ALIVE") == ""
+	}) {
+		t.Errorf("unset must not inject: %v %v", env, err)
+	}
+}
+
+func sp(s string) *string { return &s }

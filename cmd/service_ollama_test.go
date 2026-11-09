@@ -3,6 +3,7 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -122,4 +123,26 @@ func envContains(env []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// citadel-cli#1560: strict start refuses an invalid keep_alive before any side
+// effect, injects a valid one, and unset leaves an explicit-empty entry.
+func TestComposeEnvForStrictServiceStart_OllamaKeepAlive(t *testing.T) {
+	bad := "soon"
+	if _, err := composeEnvForStrictServiceStart("ollama", Service{OllamaKeepAlive: &bad}, nil); err == nil {
+		t.Fatal("invalid ollama_keep_alive must refuse the start")
+	}
+	ok := "-1"
+	env, err := composeEnvForStrictServiceStart("ollama", Service{OllamaKeepAlive: &ok}, nil)
+	if err != nil || !slices.Contains(env, "OLLAMA_KEEP_ALIVE=-1") {
+		t.Fatalf("set: %v %v", env, err)
+	}
+	env, err = composeEnvForStrictServiceStart("ollama", Service{}, nil)
+	if err != nil || slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, "OLLAMA_KEEP_ALIVE=") }) {
+		t.Fatalf("unset must not inject: %v %v", env, err)
+	}
+	env, _ = composeEnvForStrictServiceStart("vllm", Service{OllamaKeepAlive: &ok}, nil)
+	if slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, "OLLAMA_KEEP_ALIVE=") }) {
+		t.Error("non-ollama env touched")
+	}
 }

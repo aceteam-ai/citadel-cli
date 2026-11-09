@@ -39,6 +39,9 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// (linux + darwin); semantic policy change is in the Go env builder.
 		"bd7bc9fc5e040e41ec2b85dadd8b9e28f6a6d570d2fb5eb27cf905dfbfb3e28e": true,
 		"75c1ac0a8b3af9d8cf8e344c389ebe2ef7289148296e03d70013eb9bb8df81e8": true,
+		// citadel-cli#1560: key-only OLLAMA_KEEP_ALIVE environment entry (linux + darwin).
+		"60c43dcd797714e608018b1aad518408d004934c05a925883ce41c6476dba389": true,
+		"6c1aa9cfe49461a8447d8875268b3021cf0472f2f21d3d70ec2ee8bb5d3b4cc8": true,
 	},
 	"vllm": {
 		"07588f4ef245f011396874bcdd7c6aa0c463a356c5f6601618c3b4e213be812a": true,
