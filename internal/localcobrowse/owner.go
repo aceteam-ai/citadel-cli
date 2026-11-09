@@ -2,6 +2,7 @@ package localcobrowse
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,6 +53,9 @@ type Owner struct {
 // AcquireOwner takes the per-user owner lock, keeping its marker files in dir.
 func AcquireOwner(dir string) (*Owner, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return nil, ownerErrorFrom(dir)
+		}
 		return nil, fmt.Errorf("create %s: %w", dir, err)
 	}
 	release, err := acquireOSLock(dir)

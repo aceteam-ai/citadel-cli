@@ -17,6 +17,11 @@ const ownerLockFile = "local-cobrowse.lock"
 func acquireOSLock(dir string) (func(), error) {
 	f, err := os.OpenFile(filepath.Join(dir, ownerLockFile), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			// Another account's process created the lock file: it owns
+			// co-browse in this directory.
+			return nil, ownerErrorFrom(dir)
+		}
 		return nil, fmt.Errorf("open owner lock: %w", err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {

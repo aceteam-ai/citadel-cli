@@ -27,6 +27,7 @@ type localCobrowseRuntime struct {
 
 	mu    sync.Mutex
 	owner *localcobrowse.Owner
+	guard *localcobrowse.EgressGuard
 	stop  chan struct{}
 }
 
@@ -47,8 +48,10 @@ type localCobrowseOptions struct {
 func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	rt := &localCobrowseRuntime{stop: make(chan struct{})}
 	browser := opts.browser
+	var manager *platform.CobrowseSessionManager
 	if browser == nil {
-		browser = platform.NewCobrowseSessionManager(platform.DefaultCobrowseSessionsBaseDir(), localcobrowse.DefaultMaxSessions)
+		manager = platform.NewCobrowseSessionManager(platform.DefaultCobrowseSessionsBaseDir(), localcobrowse.DefaultMaxSessions)
+		browser = manager
 	}
 	rt.svc = localcobrowse.New(localcobrowse.Config{
 		Browser:     browser,
@@ -63,6 +66,20 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			o, err := localcobrowse.AcquireOwner(opts.ownerDir())
 			if err != nil {
 				return err
+			}
+			if manager != nil {
+				// Every connection of the real browser goes through the
+				// egress guard. If it cannot start, co-browse refuses: the
+				// URL filter alone does not see redirects or subresources.
+				g, gerr := localcobrowse.StartEgressGuard(nil, nil)
+				if gerr != nil {
+					o.Release()
+					return gerr
+				}
+				manager.SetLaunchOptions(platform.LaunchOptions{ProxyServer: g.ProxyURL(), Quiet: true})
+				rt.mu.Lock()
+				rt.guard = g
+				rt.mu.Unlock()
 			}
 			if agent := rt.svc.Agent(); agent != "" {
 				o.SetClient(agent)
@@ -109,9 +126,12 @@ func (rt *localCobrowseRuntime) close() {
 	}
 	_ = rt.svc.Close()
 	rt.mu.Lock()
-	o := rt.owner
-	rt.owner = nil
+	o, g := rt.owner, rt.guard
+	rt.owner, rt.guard = nil, nil
 	rt.mu.Unlock()
+	if g != nil {
+		g.Close()
+	}
 	if o != nil {
 		o.Release()
 	}
@@ -418,7 +438,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				}
 				return s.Handoff(ctx, id, in.Reason, in.Goal)
 			}),
-		writeTool("local_cobrowse_resume", "Take control back from the user. Normally the user presses Hand back in the viewer instead; use this only when they ask you to continue.",
+		writeTool("local_cobrowse_resume", "Confirm the browser is back with you. Only the user can hand control back (Hand back to agent in the viewer); while they have control this is refused, so call local_cobrowse_wait with until=resumed instead.",
 			map[string]any{"session_id": strProp(descSession)}, []string{"session_id"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {

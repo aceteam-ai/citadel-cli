@@ -19,6 +19,10 @@ type fakeBrowser struct {
 	n        int
 	sessions map[string]*fakeSession
 	calls    []string
+	// startLandsOn simulates a start URL that redirects.
+	startLandsOn string
+	// clickNavigatesTo simulates a link click that loads another page.
+	clickNavigatesTo string
 }
 
 type fakeSession struct {
@@ -59,7 +63,11 @@ func (f *fakeBrowser) StartSession(u string) (platform.CobrowseSessionStatus, er
 	defer f.mu.Unlock()
 	f.n++
 	id := fmt.Sprintf("cb-%d", f.n)
-	f.sessions[id] = &fakeSession{url: u}
+	land := u
+	if f.startLandsOn != "" {
+		land = f.startLandsOn
+	}
+	f.sessions[id] = &fakeSession{url: land}
 	f.record("start " + u)
 	return f.statusLocked(id), nil
 }
@@ -112,7 +120,11 @@ func (f *fakeBrowser) NavigateAsHuman(id, u string) (platform.CobrowseSessionSta
 	return f.statusLocked(id), nil
 }
 func (f *fakeBrowser) Click(id, sel string, x, y *float64) (platform.CobrowseSessionStatus, error) {
-	return f.act(id, "click "+sel, nil)
+	return f.act(id, "click "+sel, func(s *fakeSession) {
+		if f.clickNavigatesTo != "" {
+			s.url = f.clickNavigatesTo
+		}
+	})
 }
 func (f *fakeBrowser) Type(id, text string) (platform.CobrowseSessionStatus, error) {
 	return f.act(id, "type", nil)
@@ -368,7 +380,8 @@ func TestWaitApprovedAndResumed(t *testing.T) {
 func TestLimits(t *testing.T) {
 	svc, _, _ := newTestService(t, func(c *Config) {
 		c.WritesPerMinute = 3
-		c.NavigationsPerHour = 2
+		c.NavigationsPerHour = 3
+		c.ReadsPerMinute = 4
 	})
 	a, _ := svc.Start(ctx, "", "g", "")
 	if _, err := svc.Start(ctx, "", "g", ""); err != nil {
@@ -386,22 +399,101 @@ func TestLimits(t *testing.T) {
 	if _, err := svc.Key(ctx, a.SessionID, "a", "g"); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("write rate: %v", err)
 	}
-
-	b, _ := svc.Start(ctx, "http://one.test/", "g", "") // counts one navigation
-	if b.SessionID != "" {
-		t.Fatal("cap should still refuse while two are open")
-	}
+	// Stopping and restarting does not reset the owner-wide budget.
 	_ = svc.Stop(ctx, a.SessionID)
-	b, err := svc.Start(ctx, "http://one.test/", "g", "")
+	b, err := svc.Start(ctx, "", "g", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = svc.Approve(b.SessionID, 0)
-	if _, err := svc.Navigate(ctx, b.SessionID, "http://two.test/", "g"); err != nil {
+	if _, err := svc.Key(ctx, b.SessionID, "a", "g"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("budget must survive a new session: %v", err)
+	}
+	// Reads are budgeted too.
+	for i := 0; i < 4; i++ {
+		if _, err := svc.Extract(ctx, b.SessionID, "h1", nil, 0, "g"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := svc.Screenshot(ctx, b.SessionID, "g"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("read rate: %v", err)
+	}
+}
+
+func TestNavigationBudgetCountsStartsAndLinkClicks(t *testing.T) {
+	svc, fb, _ := newTestService(t, func(c *Config) { c.NavigationsPerHour = 2 })
+	st, _ := svc.Start(ctx, "http://one.test/", "g", "") // 1
+	_ = svc.Approve(st.SessionID, 0)
+	fb.clickNavigatesTo = "http://two.test/"
+	if res, err := svc.Click(ctx, st.SessionID, "a", nil, nil, "g"); err != nil || !res.Navigated {
+		t.Fatalf("link click: %+v %v", res, err) // 2
+	}
+	if _, err := svc.Navigate(ctx, st.SessionID, "http://three.test/", "g"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("a link-click navigation must count: %v", err)
+	}
+}
+
+func TestStartRedirectToRefusedAddressClosesSession(t *testing.T) {
+	svc, fb, _ := newTestService(t, func(c *Config) {
+		c.URLPolicy = NewURLPolicy(fixedResolver(map[string][]string{"public.test": {"203.0.113.10"}}), nil)
+	})
+	fb.startLandsOn = "http://169.254.169.254/latest/"
+	if _, err := svc.Start(ctx, "http://public.test/redirect", "g", ""); !errors.Is(err, ErrNavigationRefused) {
+		t.Fatalf("start redirect: %v", err)
+	}
+	if len(fb.sessions) != 0 || len(svc.Sessions("")) != 0 {
+		t.Fatal("the session must be closed")
+	}
+}
+
+func TestReadRefusedWhenPageMovedToRefusedAddress(t *testing.T) {
+	svc, fb, _ := newTestService(t, func(c *Config) {
+		c.URLPolicy = NewURLPolicy(fixedResolver(map[string][]string{"public.test": {"203.0.113.10"}}), nil)
+	})
+	st, err := svc.Start(ctx, "http://public.test/", "g", "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Navigate(ctx, b.SessionID, "http://three.test/", "g"); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("navigation budget: %v", err)
+	fb.mu.Lock()
+	fb.sessions[st.SessionID].url = "http://192.168.1.1/" // a script moved it
+	fb.mu.Unlock()
+	if _, err := svc.Extract(ctx, st.SessionID, "body", nil, 0, "g"); !errors.Is(err, ErrNavigationRefused) {
+		t.Fatalf("read on a refused page: %v", err)
+	}
+	if fb.sessions[st.SessionID].url != "about:blank" {
+		t.Fatal("the refused page should be closed")
+	}
+}
+
+func TestAgentCannotResumeWhileUserDrives(t *testing.T) {
+	svc, _, _ := newTestService(t, nil)
+	st, _ := svc.Start(ctx, "", "g", "")
+	_, _ = svc.Handoff(ctx, st.SessionID, "log in", "g")
+	if _, err := svc.Resume(ctx, st.SessionID); !errors.Is(err, ErrOnlyUserHandsBack) {
+		t.Fatalf("agent resume while handed off: %v", err)
+	}
+	if v := svc.Sessions(st.SessionID); v[0].Driver != "human" {
+		t.Fatal("the user must keep control")
+	}
+	_ = svc.HumanHandBack(st.SessionID)
+	if _, err := svc.Resume(ctx, st.SessionID); err != nil {
+		t.Fatalf("resume once back with the agent: %v", err)
+	}
+}
+
+func TestStatusRedactsURLWhileUserDrives(t *testing.T) {
+	svc, fb, _ := newTestService(t, nil)
+	st, _ := svc.Start(ctx, "", "g", "")
+	_, _ = svc.Handoff(ctx, st.SessionID, "log in", "g")
+	fb.mu.Lock()
+	fb.sessions[st.SessionID].url = "https://login.test/callback?code=SECRET123"
+	fb.mu.Unlock()
+	views, _ := svc.Status(ctx, st.SessionID)
+	if views[0].URL != "https://login.test/" {
+		t.Fatalf("agent status must show only the origin: %q", views[0].URL)
+	}
+	if v := svc.Sessions(st.SessionID); v[0].URL != "https://login.test/callback?code=SECRET123" {
+		t.Fatalf("the viewer keeps the full URL: %q", v[0].URL)
 	}
 }
 

@@ -38,6 +38,7 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("2001:db8::/32"),  // documentation
 	netip.MustParsePrefix("2002::/16"),      // 6to4 (embeds an IPv4 address)
 	netip.MustParsePrefix("2001::/32"),      // Teredo (embeds an IPv4 address)
+	netip.MustParsePrefix("::/96"),          // IPv4-compatible (deprecated), embeds an IPv4 address
 	netip.MustParsePrefix("::ffff:0:0/96"),  // IPv4-mapped (checked after unmapping too)
 	netip.MustParsePrefix("100::/64"),       // discard-only
 	netip.MustParsePrefix("ff00::/8"),       // multicast

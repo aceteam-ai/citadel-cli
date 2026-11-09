@@ -105,7 +105,12 @@ windows-latest CI job runs the real-browser tests against both browsers.
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
 per-session write grant (default deny, 24h maximum), the abuse limits, the
 idle lifetime and `local_cobrowse_wait`. `localcobrowse.NewURLPolicy` owns the
-navigation address filter, and its host parsing matches a browser's. Grants
+navigation address filter, and its host parsing matches a browser's.
+`localcobrowse.EgressGuard` is the local-mode browser's `--proxy-server`
+(`platform.LaunchOptions`). It resolves and dials each destination itself and
+refuses non-public addresses, so the policy also covers redirects,
+subresources and DNS rebinding. Budgets are owner-wide and count reads, and
+only the human can hand control back (`ErrOnlyUserHandsBack`). Grants
 come only from the human-side methods (Approve, Deny, Revoke), which no MCP
 tool reaches. `citadel local mcp` (`newLocalOnlyBridge`) never reads a key or
 token. An unserved method or tool gets -32601 rather than the backend

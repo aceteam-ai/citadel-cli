@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ const (
 	DefaultMaxSessions        = 2
 	DefaultWritesPerMinute    = 120
 	DefaultNavigationsPerHour = 600
+	DefaultReadsPerMinute     = 120
 	DefaultIdleLifetime       = 8 * time.Hour
 	DefaultGrantDuration      = 24 * time.Hour
 	// MaxWait caps one local_cobrowse_wait call so it stays inside common
@@ -96,6 +98,7 @@ type Config struct {
 	MaxSessions        int
 	WritesPerMinute    int
 	NavigationsPerHour int
+	ReadsPerMinute     int
 	IdleLifetime       time.Duration
 	GrantDuration      time.Duration
 	// URLPolicy decides which URLs may be opened. Nil uses NewURLPolicy with the
@@ -131,8 +134,6 @@ type session struct {
 	grant         grantState
 	handoffAt     time.Time
 	handoffReason string
-	writes        []time.Time
-	navs          []time.Time
 	stoppedReason string
 }
 
@@ -145,6 +146,11 @@ type Service struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+	// Budgets are owner-wide, so stopping and restarting sessions never
+	// resets them (design section 4 abuse limits).
+	writes []time.Time
+	navs   []time.Time
+	reads  []time.Time
 	// changed is closed and replaced on every consent, driver or lifecycle
 	// change, waking local_cobrowse_wait callers.
 	changed chan struct{}
@@ -161,6 +167,9 @@ func New(cfg Config) *Service {
 	}
 	if cfg.NavigationsPerHour <= 0 {
 		cfg.NavigationsPerHour = DefaultNavigationsPerHour
+	}
+	if cfg.ReadsPerMinute <= 0 {
+		cfg.ReadsPerMinute = DefaultReadsPerMinute
 	}
 	if cfg.IdleLifetime <= 0 {
 		cfg.IdleLifetime = DefaultIdleLifetime
@@ -308,11 +317,29 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 	s.mu.Lock()
 	ss := &session{id: st.ID, goal: goal, startedAt: now, lastActive: now}
 	if startURL != "about:blank" {
-		ss.navs = append(ss.navs, now)
+		s.navs = append(s.navs, now)
 	}
 	s.sessions[st.ID] = ss
 	s.notifyLocked()
 	s.mu.Unlock()
+	// A start URL can redirect. Check where the browser landed before any
+	// read can see it.
+	if startURL != "about:blank" {
+		res := s.settle(ctx, st.ID, "")
+		landed := res.URL
+		if landed == "" {
+			landed = s.currentURL(st.ID)
+		}
+		if landed != "" && !strings.EqualFold(landed, "about:blank") {
+			if err := s.cfg.URLPolicy(ctx, landed); err != nil {
+				_ = s.stop(st.ID, "start url refused")
+				return StartResult{}, fmt.Errorf("the start page redirected to a refused address, so the session was closed: %w", err)
+			}
+		}
+		if cur, ok := s.cfg.Browser.SessionStatus(st.ID); ok {
+			st.URL = cur.URL
+		}
+	}
 	s.attention(st.ID, "start")
 	return StartResult{
 		SessionID: st.ID,
@@ -347,7 +374,7 @@ func (s *Service) finish(ev Event, err error) {
 
 func isRefusal(err error) bool {
 	for _, e := range []error{ErrApprovalRequired, ErrApprovalDenied, ErrApprovalExpired, ErrApprovalRevoked,
-		ErrHumanDriving, ErrRateLimited, ErrTooManySessions, ErrNavigationRefused, ErrProfileNotReady,
+		ErrHumanDriving, ErrOnlyUserHandsBack, ErrRateLimited, ErrTooManySessions, ErrNavigationRefused, ErrProfileNotReady,
 		platform.ErrHandedOff, platform.ErrPasswordValue} {
 		if errors.Is(err, e) {
 			return true
@@ -407,21 +434,21 @@ func (s *Service) gateWrite(id string, navigation bool) error {
 		gateErr = ErrApprovalExpired
 	}
 	if gateErr == nil {
-		ss.writes = pruneBefore(ss.writes, now.Add(-time.Minute))
-		if len(ss.writes) >= s.cfg.WritesPerMinute {
-			gateErr = fmt.Errorf("%w: at most %d actions per minute in one session; slow down", ErrRateLimited, s.cfg.WritesPerMinute)
+		s.writes = pruneBefore(s.writes, now.Add(-time.Minute))
+		if len(s.writes) >= s.cfg.WritesPerMinute {
+			gateErr = fmt.Errorf("%w: at most %d actions per minute; slow down", ErrRateLimited, s.cfg.WritesPerMinute)
 		}
 	}
 	if gateErr == nil && navigation {
-		ss.navs = pruneBefore(ss.navs, now.Add(-time.Hour))
-		if len(ss.navs) >= s.cfg.NavigationsPerHour {
-			gateErr = fmt.Errorf("%w: at most %d navigations per hour in one session", ErrRateLimited, s.cfg.NavigationsPerHour)
+		s.navs = pruneBefore(s.navs, now.Add(-time.Hour))
+		if len(s.navs) >= s.cfg.NavigationsPerHour {
+			gateErr = fmt.Errorf("%w: at most %d page loads per hour", ErrRateLimited, s.cfg.NavigationsPerHour)
 		}
 	}
 	if gateErr == nil {
-		ss.writes = append(ss.writes, now)
+		s.writes = append(s.writes, now)
 		if navigation {
-			ss.navs = append(ss.navs, now)
+			s.navs = append(s.navs, now)
 		}
 	}
 	s.mu.Unlock()
@@ -439,13 +466,31 @@ func pruneBefore(ts []time.Time, cutoff time.Time) []time.Time {
 	return ts[i:]
 }
 
-// gateRead checks the session exists and the user is not driving.
-func (s *Service) gateRead(id string) error {
+// gateRead checks the session exists, the user is not driving, the owner-wide
+// read budget, and that the page the agent is about to read is still on an
+// allowed address (a script or delayed redirect may have moved it after the
+// last check).
+func (s *Service) gateRead(ctx context.Context, id string) error {
 	if _, err := s.lookup(id); err != nil {
 		return err
 	}
 	if s.humanDriving(id) {
 		return ErrHumanDriving
+	}
+	now := s.cfg.Now()
+	s.mu.Lock()
+	s.reads = pruneBefore(s.reads, now.Add(-time.Minute))
+	if len(s.reads) >= s.cfg.ReadsPerMinute {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: at most %d reads per minute; slow down", ErrRateLimited, s.cfg.ReadsPerMinute)
+	}
+	s.reads = append(s.reads, now)
+	s.mu.Unlock()
+	if u := s.currentURL(id); u != "" && !strings.EqualFold(u, "about:blank") {
+		if err := s.cfg.URLPolicy(ctx, u); err != nil {
+			_, _ = s.cfg.Browser.Navigate(id, "about:blank")
+			return fmt.Errorf("the page moved to a refused address and was closed: %w", err)
+		}
 	}
 	return nil
 }
@@ -612,6 +657,11 @@ func (s *Service) writeAction(ctx context.Context, id string, do func() error) (
 		return ActionResult{}, err
 	}
 	res := s.settle(ctx, id, before)
+	if res.Navigated {
+		s.mu.Lock()
+		s.navs = append(pruneBefore(s.navs, s.cfg.Now().Add(-time.Hour)), s.cfg.Now())
+		s.mu.Unlock()
+	}
 	return res, s.enforceLanding(ctx, id, res)
 }
 
@@ -625,7 +675,7 @@ func (s *Service) Extract(ctx context.Context, id, selector string, attrs []stri
 		maxChars = MaxExtractChars
 	}
 	var res platform.ExtractResult
-	err := s.gateRead(id)
+	err := s.gateRead(ctx, id)
 	if err == nil {
 		res, err = s.cfg.Browser.ExtractBounded(id, selector, attrs, maxChars)
 	}
@@ -637,7 +687,7 @@ func (s *Service) Extract(ctx context.Context, id, selector string, attrs []stri
 func (s *Service) Screenshot(ctx context.Context, id, goal string) (string, error) {
 	ev := Event{SessionID: id, Action: "screenshot", Class: "R", Goal: goal}
 	var png string
-	err := s.gateRead(id)
+	err := s.gateRead(ctx, id)
 	if err == nil {
 		png, err = s.cfg.Browser.Screenshot(id)
 	}
@@ -659,6 +709,24 @@ type SessionView struct {
 	HandoffSince   string `json:"handoff_since,omitempty"`
 	HandoffReason  string `json:"handoff_reason,omitempty"`
 	Lifetime       string `json:"lifetime"`
+}
+
+// redactWhileHuman reduces a URL to its origin. While the user drives, the
+// path and query can carry one-time codes and tokens the agent must not see.
+func redactWhileHuman(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host + "/"
+}
+
+func (s *Service) agentViewLocked(ss *session, st platform.CobrowseSessionStatus, now time.Time) SessionView {
+	v := s.viewLocked(ss, st, now)
+	if st.Driver == platform.DriverHuman {
+		v.URL = redactWhileHuman(v.URL)
+	}
+	return v
 }
 
 func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now time.Time) SessionView {
@@ -708,7 +776,13 @@ func (s *Service) status(id string) ([]SessionView, error) {
 	} else if err := s.ensureOwner(); err != nil {
 		return nil, err
 	}
-	return s.Sessions(id), nil
+	views := s.Sessions(id)
+	for i := range views {
+		if views[i].Driver == string(platform.DriverHuman) {
+			views[i].URL = redactWhileHuman(views[i].URL)
+		}
+	}
+	return views, nil
 }
 
 // Sessions returns session views without auditing; the viewer uses it.
@@ -750,10 +824,23 @@ func (s *Service) Handoff(ctx context.Context, id, reason, goal string) (Session
 	return v, err
 }
 
-// Resume returns control to the agent (L).
+// ErrOnlyUserHandsBack refuses an agent resume while the user has control: a
+// prompt-injected agent must not take the browser back mid-login.
+var ErrOnlyUserHandsBack = errors.New("only_user_hands_back: the user has control and is the only one who can hand it back (Hand back to agent in the Citadel viewer); call local_cobrowse_wait with until=resumed")
+
+// Resume reports whether control is back with the agent (L). The agent can no
+// longer take control back itself; it is refused while the user drives.
 func (s *Service) Resume(ctx context.Context, id string) (SessionView, error) {
 	ev := Event{SessionID: id, Action: "resume", Class: "L"}
-	v, err := s.setDriver(id, false, "")
+	v, err := func() (SessionView, error) {
+		if _, err := s.lookup(id); err != nil {
+			return SessionView{}, err
+		}
+		if s.humanDriving(id) {
+			return SessionView{}, ErrOnlyUserHandsBack
+		}
+		return s.setDriver(id, false, "")
+	}()
 	s.finish(ev, err)
 	return v, err
 }
@@ -784,7 +871,7 @@ func (s *Service) setDriver(id string, human bool, reason string) (SessionView, 
 		ss.handoffReason = ""
 	}
 	s.notifyLocked()
-	return s.viewLocked(ss, st, s.cfg.Now()), nil
+	return s.agentViewLocked(ss, st, s.cfg.Now()), nil
 }
 
 // Stop ends a session and deletes its throwaway profile (L).
