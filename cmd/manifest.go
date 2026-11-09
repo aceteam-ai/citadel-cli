@@ -779,17 +779,14 @@ func healStaleGPUReservationOnDisk(destPath, serviceName string) error {
 	return nil
 }
 
-// reconcileHostComposeForStart covers existing manifest/module start paths.
-// It never creates files or changes a custom compose path.
+// reconcileHostComposeForStart covers canonical manifest/module start paths.
+// Missing files get the initial template even when GPU evidence is unknown;
+// existing flavors retain the same preservation policy as explicit starts.
+// Custom compose paths never acquire embedded-file ownership.
 func reconcileHostComposeForStart(name, path string, gpuCount func() int) error {
 	if runtime.GOOS != "linux" || !services.HasCPUComposeVariant(name) ||
 		filepath.Base(path) != name+".yml" || filepath.Base(filepath.Dir(path)) != "services" {
 		return nil
 	}
-	selection := services.SelectComposeForHost(name, runtime.GOOS, gpuCount)
-	if selection.PreserveExisting {
-		return nil
-	}
-	_, err := compose.ReconcileCPUComposeOnDisk(path, name, selection.Content, resolveNodeDirOverride(), Log)
-	return err
+	return ensureComposeFileForHost(filepath.Dir(filepath.Dir(path)), name, runtime.GOOS, gpuCount)
 }
