@@ -193,7 +193,7 @@ func runLocalDoctor(d localDoctorDeps, out io.Writer) error {
 		}
 	}
 	if pointed == 0 {
-		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-desktop, codex)", d.exe))
+		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-desktop, codex, opencode)", d.exe))
 	}
 
 	ok("Network", "Citadel makes no calls of its own (no account, no update check, no telemetry). The co-browse browser connects only to public addresses, through Citadel's local guard, with background updates off")

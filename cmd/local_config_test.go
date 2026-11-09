@@ -315,3 +315,182 @@ func TestLocalDoctor(t *testing.T) {
 		t.Fatal("browserMajor")
 	}
 }
+
+func TestOpencodePathsAndBlock(t *testing.T) {
+	oc, ok := findHarness("opencode")
+	if !ok {
+		t.Fatal("opencode harness missing")
+	}
+	home := t.TempDir()
+	env := harnessEnv{goos: "linux", home: home}
+	if got := oc.path(env); got != filepath.Join(home, ".config", "opencode", "opencode.json") {
+		t.Fatalf("default path: %s", got)
+	}
+	_ = os.MkdirAll(filepath.Join(home, ".config", "opencode"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".config", "opencode", "opencode.jsonc"), []byte("{}"), 0o600)
+	if got := oc.path(env); !strings.HasSuffix(got, "opencode.jsonc") {
+		t.Fatalf("an existing .jsonc must be used: %s", got)
+	}
+	if oc.unverified(env) != "" || oc.unverified(harnessEnv{goos: "windows"}) == "" {
+		t.Fatal("only the Windows location is unverified")
+	}
+	// Windows path quoting: backslashes survive JSON encoding and round-trip.
+	var doc struct {
+		MCP struct {
+			Servers map[string]struct {
+				Type    string   `json:"type"`
+				Command []string `json:"command"`
+			} `json:"servers"`
+		} `json:"mcp"`
+	}
+	block := renderBlock(oc, winExe)
+	if !strings.Contains(block, `C:\\Users\\demo`) {
+		t.Fatalf("backslashes must be escaped in JSON: %s", block)
+	}
+	if err := json.Unmarshal([]byte(block), &doc); err != nil {
+		t.Fatal(err)
+	}
+	e := doc.MCP.Servers["citadel"]
+	if e.Type != "local" || len(e.Command) != 3 || e.Command[0] != winExe || e.Command[1] != "local" || e.Command[2] != "mcp" {
+		t.Fatalf("entry: %+v", e)
+	}
+}
+
+func TestMergeOpencode(t *testing.T) {
+	h, _ := findHarness("opencode")
+	now := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	no := func(string) bool { return false }
+	read := func(p string) string { b, _ := os.ReadFile(p); return string(b) }
+
+	// Fresh file in a missing directory.
+	dir := t.TempDir()
+	fresh := filepath.Join(dir, "new", "opencode.json")
+	if _, err := mergeHarnessConfig(h, fresh, winExe, no, now); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(read(fresh), `"servers"`) || !strings.Contains(read(fresh), `"type": "local"`) {
+		t.Fatalf("fresh: %s", read(fresh))
+	}
+	// Identical re-run is a no-op and writes no backup.
+	if _, err := mergeHarnessConfig(h, fresh, winExe, no, now); !errors.Is(err, errAlreadyConfigured) {
+		t.Fatalf("rerun: %v", err)
+	}
+	if m, _ := filepath.Glob(fresh + ".bak-*"); len(m) != 0 {
+		t.Fatalf("no-op wrote a backup: %v", m)
+	}
+
+	// Existing file with other servers and settings.
+	path := filepath.Join(dir, "opencode.jsonc")
+	orig := `{"$schema":"https://opencode.ai/config.json","model":"a/b","mcp":{"timeout":{"startup":45000},"servers":{"other":{"type":"remote","url":"https://x.example/mcp"}}}}`
+	_ = os.WriteFile(path, []byte(orig), 0o600)
+	if _, err := mergeHarnessConfig(h, path, winExe, no, now); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	_ = json.Unmarshal([]byte(read(path)), &doc)
+	mcp := doc["mcp"].(map[string]any)
+	servers := mcp["servers"].(map[string]any)
+	if doc["model"] != "a/b" || mcp["timeout"] == nil || servers["other"] == nil || servers["citadel"] == nil {
+		t.Fatalf("merge lost settings: %s", read(path))
+	}
+	if read(path+".bak-20261109T100000Z") != orig {
+		t.Fatal("backup missing or wrong")
+	}
+
+	// A different citadel entry is refused unless confirmed.
+	_ = os.WriteFile(path, []byte(`{"mcp":{"servers":{"citadel":{"type":"local","command":["old"]}}}}`), 0o600)
+	if _, err := mergeHarnessConfig(h, path, winExe, no, now); !errors.Is(err, errWriteDeclined) {
+		t.Fatalf("conflict: %v", err)
+	}
+	if !strings.Contains(read(path), `"old"`) {
+		t.Fatal("declined replace must not write")
+	}
+
+	// JSONC with comments or trailing commas is refused, untouched.
+	for _, jc := range []string{"{\n // c\n \"model\": \"x\"\n}", `{"model":"x",}`} {
+		_ = os.WriteFile(path, []byte(jc), 0o600)
+		if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return true }, now); err == nil || !strings.Contains(err.Error(), "strict JSON") {
+			t.Fatalf("jsonc must be refused: %v", err)
+		}
+		if read(path) != jc {
+			t.Fatal("refused file was modified")
+		}
+	}
+
+	// The older flat mcp layout is refused, not corrupted.
+	flat := `{"mcp":{"playwright":{"type":"local","command":["x"],"enabled":true}}}`
+	_ = os.WriteFile(path, []byte(flat), 0o600)
+	if _, err := mergeHarnessConfig(h, path, winExe, no, now); err == nil {
+		t.Fatal("flat mcp layout must be refused")
+	}
+	if read(path) != flat {
+		t.Fatal("flat layout was modified")
+	}
+	// Non-object mcp is refused.
+	_ = os.WriteFile(path, []byte(`{"mcp":[]}`), 0o600)
+	if _, err := mergeHarnessConfig(h, path, winExe, no, now); err == nil {
+		t.Fatal("non-object mcp must be refused")
+	}
+}
+
+func TestMergeOpencodeWritesThroughSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	dir := t.TempDir()
+	real := filepath.Join(dir, "dotfiles", "opencode.json")
+	_ = os.MkdirAll(filepath.Dir(real), 0o700)
+	_ = os.WriteFile(real, []byte(`{"model":"a/b"}`), 0o640)
+	link := filepath.Join(dir, "opencode.json")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := findHarness("opencode")
+	written, err := mergeHarnessConfig(h, link, winExe, nil, time.Now())
+	if err != nil || written != real {
+		t.Fatalf("write-through: %q %v", written, err)
+	}
+	if fi, _ := os.Lstat(link); fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the symlink must stay a symlink")
+	}
+	if fi, _ := os.Stat(real); fi.Mode().Perm() != 0o640 {
+		t.Fatalf("mode: %o", fi.Mode().Perm())
+	}
+	if b, _ := os.ReadFile(real); !strings.Contains(string(b), `"citadel"`) || !strings.Contains(string(b), `"model"`) {
+		t.Fatalf("target: %s", b)
+	}
+}
+
+func TestDetectOpencode(t *testing.T) {
+	home := t.TempDir()
+	env := harnessEnv{goos: "linux", home: home}
+	exe := filepath.Join(home, "bin", "citadel")
+	_ = os.MkdirAll(filepath.Dir(exe), 0o700)
+	_ = os.WriteFile(exe, []byte("x"), 0o700)
+	cfg := filepath.Join(home, ".config", "opencode", "opencode.json")
+	_ = os.MkdirAll(filepath.Dir(cfg), 0o700)
+	h, _ := findHarness("opencode")
+	status := func() harnessConfigStatus {
+		for _, s := range detectHarnessConfigs(env) {
+			if s.Harness == "opencode" {
+				return s
+			}
+		}
+		return harnessConfigStatus{}
+	}
+	_ = os.WriteFile(cfg, []byte(renderBlock(h, exe)), 0o600)
+	if s := status(); !s.Points || s.Command != exe {
+		t.Fatalf("configured: %+v", s)
+	}
+	for _, bad := range []string{
+		`{"mcp":{"servers":{"c":{"type":"local","command":["` + exe + `","local","mcp","--x"]}}}}`,
+		`{"mcp":{"servers":{"c":{"type":"local","command":["` + exe + `"]}}}}`,
+		`{"mcp":{"servers":{"c":{"type":"local","command":["` + filepath.Join(home, "gone") + `","local","mcp"]}}}}`,
+		`{"mcpServers":{"c":{"command":"` + exe + `","args":["local","mcp"]}}}`,
+	} {
+		_ = os.WriteFile(cfg, []byte(bad), 0o600)
+		if s := status(); !s.Found || s.Points {
+			t.Fatalf("must not count: %s -> %+v", bad, s)
+		}
+	}
+}

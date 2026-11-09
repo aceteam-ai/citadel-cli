@@ -29,7 +29,8 @@ self-host. This page covers Windows 10 and 11 first. macOS and Linux are coming.
   - the GitHub Copilot CLI (VS Code keeps its MCP servers in its own
     `mcp.json` file, which this guide does not cover);
   - Claude Desktop;
-  - Codex.
+  - Codex;
+  - opencode.
 
 ## 1. Install
 
@@ -81,6 +82,7 @@ because apps started from the Start menu may not see an updated `PATH`.
 & $citadel local config copilot          # Copilot CLI: ~\.copilot\mcp-config.json
 & $citadel local config claude-desktop   # %APPDATA%\Claude\claude_desktop_config.json
 & $citadel local config codex            # ~\.codex\config.toml (or $env:CODEX_HOME)
+& $citadel local config opencode         # ~\.config\opencode\opencode.json
 ```
 
 Add `--write` to have Citadel merge the entry into that file for you. It asks
@@ -108,6 +110,30 @@ For Codex, the entry is TOML:
 command = 'C:\Users\YOU\AppData\Local\Citadel\citadel.exe'
 args = ['local', 'mcp']
 ```
+
+For opencode, the entry goes under `mcp.servers` and the command is one list
+(the executable, then its arguments):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "citadel": {
+        "type": "local",
+        "command": ["C:\\Users\\YOU\\AppData\\Local\\Citadel\\citadel.exe", "local", "mcp"]
+      }
+    }
+  }
+}
+```
+
+opencode's documentation lists `~/.config/opencode/opencode.json` (or
+`opencode.jsonc`) and gives no Windows-specific user folder, so `local config`
+marks that path as unverified on Windows. `--write` only edits plain JSON: a
+file with comments or trailing commas, or one using opencode's older flat `mcp`
+layout, is left alone and you add the entry by hand. opencode can use any
+OpenAI-compatible endpoint as its model provider, including one you run
+yourself.
 
 Restart the agent app after changing its config.
 
