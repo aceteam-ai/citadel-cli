@@ -3,7 +3,6 @@ package redisapi
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -221,50 +220,6 @@ func (c *Client) SetKey(ctx context.Context, key string, value any, ttl int) err
 	}
 
 	return nil
-}
-
-// KVMaxTTL and KVMaxValueBytes are the limits POST /api/fabric/redis/kv
-// enforces (ttl at most 86400 seconds, value at most 1 MiB). A request beyond
-// either is refused with a 400, so callers clamp or skip before sending.
-const (
-	KVMaxTTL        = 24 * time.Hour
-	KVMaxValueBytes = 1024 * 1024
-)
-
-// ErrValueTooLarge reports a value the KV route would refuse for size.
-var ErrValueTooLarge = errors.New("value exceeds the Redis API proxy KV limit")
-
-// RetainTerminalEvent stores eventJSON under key through the KV route, first
-// writer wins, and reports whether this call stored it (citadel-cli#1553).
-//
-// The route has no conditional SET, so this reads the key first and writes only
-// when it is absent; a read failure writes nothing. One node owns a job's
-// terminal writes, so the read-then-write gap has no competing writer. The TTL
-// is clamped to KVMaxTTL, and a value over KVMaxValueBytes is refused locally
-// with ErrValueTooLarge (byte length is at least the UTF-16 length the route
-// measures, so the local check is never looser than the route's).
-func (c *Client) RetainTerminalEvent(ctx context.Context, key string, eventJSON []byte, ttl time.Duration) (bool, error) {
-	if len(eventJSON) > KVMaxValueBytes {
-		return false, fmt.Errorf("%w: %d bytes", ErrValueTooLarge, len(eventJSON))
-	}
-	if ttl > KVMaxTTL {
-		ttl = KVMaxTTL
-	}
-	seconds := int(ttl / time.Second)
-	if seconds < 1 {
-		seconds = 1
-	}
-	_, existingTTL, err := c.GetKey(ctx, key)
-	if err != nil {
-		return false, fmt.Errorf("check retained terminal event: %w", err)
-	}
-	if existingTTL != -2 {
-		return false, nil
-	}
-	if err := c.SetKey(ctx, key, string(eventJSON), seconds); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // DeleteKey removes a key from Redis KV storage.

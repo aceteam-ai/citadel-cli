@@ -13,13 +13,14 @@ coordinator can read when it starts.
 
 ## Contract
 
+Retention is live in **direct Redis mode only**. API mode (the Redis API proxy,
+the default node transport) does not retain yet; see "API mode" below.
+
 | Item | Value | Owner |
 |------|-------|-------|
 | Key | `job:<job_id>:result` | `worker.TerminalResultKey` |
-| Value | The exact JSON envelope published on `stream:v1:<job_id>` for the job's first terminal event (`type` is `end`, `error` or `cancelled`) | `RedisStreamWriter.publishTerminal`, `APIStreamWriter.publishTerminal` |
-| TTL, direct Redis | 72 hours | `worker.TerminalResultTTL` |
-| TTL, Redis API proxy | 24 hours (`TerminalResultTTL` clamped to the KV route maximum) | `redisapi.KVMaxTTL` |
-| Size limit, Redis API proxy | 1 MiB; a larger envelope is not retained (the publish is unaffected) and the node logs it | `redisapi.KVMaxValueBytes` |
+| Value | The exact JSON envelope published on `stream:v1:<job_id>` for the job's first terminal event (`type` is `end`, `error` or `cancelled`) | `RedisStreamWriter.publishTerminal` |
+| TTL | 72 hours | `worker.TerminalResultTTL` |
 | Job types | `MEETING_JOIN` only | `worker.retainsTerminalResult` |
 
 The value is a string holding one envelope, the same shape the backend already
@@ -41,32 +42,36 @@ and delivery-clock fields when present.
 
 ## Write semantics
 
-- **First writer wins.** Direct Redis uses `SET key value NX EX 259200`. The API
-  proxy KV route has no conditional set, so the node reads the key and writes
-  only when it is absent. A later terminal write for the same job id, whether a
-  retried publish or the terminal refusal of a redelivered MEETING_JOIN, never
-  replaces the stored result.
+- **First writer wins.** `SET key value NX EX 259200`. A later terminal write
+  for the same job id, whether a retried publish or the terminal refusal of a
+  redelivered MEETING_JOIN, never replaces the stored result.
 - **Never blocks the publish.** The publish happens first. Retention runs after
   it whatever its outcome, with a 5-second bound and a context detached from
   job cancellation, so a shutdown that ends the meeting still leaves a result.
   A retention failure is logged and is never returned to the publish retry.
-- **Durable HTTP deliveries** (inactive, see `docs/durable-http-delivery.md`)
-  commit the terminal envelope through the delivery itself and do not retain.
 
 ## Reading it
 
 Read `job:<job_id>:result` for each non-terminal session whose job id is known,
 parse the value as the Pub/Sub envelope, and apply it through the same
 idempotent terminal path as a live event. A missing key means no terminal event
-was produced, it expired, or it exceeded the API proxy size limit.
+was produced, it expired, or the node runs in API mode.
 
-## Known limits (API mode)
+## API mode: pending a scoped endpoint
 
-The API proxy KV route (`POST /api/fabric/redis/kv`) caps TTL at 24 hours and
-values at 1 MiB. Its `job:` prefix is not scoped to the job's org or assigned
-node for either read or write, so any device key with `device_redis:write`
-that knows a job id can write that key, and the envelope's own fields
-(including `data.meta`) are writer-supplied and prove nothing about origin.
-Until the proxy binds the key to the job's assigned node, treat an API-mode
-value as unauthenticated. The requested proxy change is recorded on
-citadel-cli#1553.
+API-mode nodes do not write `job:<id>:result`. The generic
+`POST /api/fabric/redis/kv` route is not scoped to the job's org or assigned
+node for read or write, caps TTL at 24 hours and values at 1 MiB, so it is not
+used for transcripts. Retention will switch on when the proxy exposes a scoped
+endpoint, requested on citadel-cli#1553:
+
+`POST /api/fabric/redis/jobs/{jobId}/result`, device key with
+`device_redis:write`, body `{"envelope": "<terminal event JSON>", "ttl": 259200}`,
+refused unless the caller is the job's assigned node, stored with `SET NX EX`,
+response `{"stored": true|false}`.
+
+The node-side seam is `worker.apiTerminalRetainer`: it returns nil today; it
+will return a `redisapi` client method implementing `terminalRetainer` against
+that endpoint. Durable HTTP deliveries (inactive, see
+`docs/durable-http-delivery.md`) commit the terminal envelope through the
+delivery itself and do not retain.

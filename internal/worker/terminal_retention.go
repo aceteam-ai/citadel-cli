@@ -9,8 +9,8 @@ import (
 
 // TerminalResultTTL is how long a retained terminal MEETING_JOIN event lives
 // in Redis (citadel-cli#1553). The coordinator reads it at startup to recover
-// a result that was published while no replica was subscribed. API mode clamps
-// it to the proxy KV limit (redisapi.KVMaxTTL).
+// a result that was published while no replica was subscribed. Direct Redis
+// only for now; see apiTerminalRetainer for API mode.
 const TerminalResultTTL = 72 * time.Hour
 
 // terminalRetainTimeout bounds the retained write so it cannot stall the
@@ -34,8 +34,8 @@ func retainsTerminalResult(jobType string) bool {
 // capture it.
 var retentionLogf = log.Printf
 
-// terminalRetainer is the client half of retention, implemented by the direct
-// Redis client and the Redis API proxy client.
+// terminalRetainer is the client half of retention. The direct Redis client
+// implements it; an API-proxy implementation plugs in via apiTerminalRetainer.
 type terminalRetainer interface {
 	RetainTerminalEvent(ctx context.Context, key string, eventJSON []byte, ttl time.Duration) (bool, error)
 }

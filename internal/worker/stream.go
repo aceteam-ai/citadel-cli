@@ -115,9 +115,12 @@ type APIStreamWriter struct {
 	jobID   string
 	rayID   string
 	ctx     context.Context
-	// retain also stores terminal events under TerminalResultKey. A durable
-	// delivery commits its terminal envelope itself, so it never retains.
-	retain bool
+	// retainer, when set, stores terminal events under TerminalResultKey. It is
+	// nil in production: the generic KV route is not scoped to the job's org or
+	// node, so API-mode retention waits for the scoped
+	// POST /api/fabric/redis/jobs/{jobId}/result endpoint (citadel-cli#1553).
+	// A durable delivery commits its terminal envelope itself and never retains.
+	retainer terminalRetainer
 }
 
 // NewAPIStreamWriter creates a new API-backed stream writer.
@@ -167,17 +170,17 @@ func (w *APIStreamWriter) WriteCancelled(reason string) error {
 	return w.publishTerminal("cancelled", w.clock.data(map[string]any{"reason": reason}, true))
 }
 
-// publishTerminal publishes a terminal event and, for a retaining non-durable
-// writer, then stores the same envelope under TerminalResultKey through the KV
-// route. Only the publish error is returned.
+// publishTerminal publishes a terminal event and, for a non-durable writer with
+// a retainer, then stores the same envelope under TerminalResultKey. Only the
+// publish error is returned.
 func (w *APIStreamWriter) publishTerminal(eventType string, data map[string]any) error {
 	event := w.client.BuildStreamEvent(w.jobID, w.rayID, eventType, data)
 	publishErr := w.client.PublishEvent(w.ctx, event)
-	if w.retain && !w.durable {
+	if w.retainer != nil && !w.durable {
 		if eventJSON, err := json.Marshal(event); err != nil {
 			retentionLogf("job %s: retaining terminal result failed (publish unaffected): %v", w.jobID, err)
 		} else {
-			retainTerminalEvent(w.ctx, w.client, w.jobID, eventJSON)
+			retainTerminalEvent(w.ctx, w.retainer, w.jobID, eventJSON)
 		}
 	}
 	return publishErr
@@ -204,13 +207,21 @@ func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(j
 	}
 }
 
-// apiStreamWriterFor builds a job's API-proxy writer, retaining terminal
-// events for the job types retainsTerminalResult names.
+// apiStreamWriterFor builds a job's API-proxy writer. API-mode retention is
+// off: apiTerminalRetainer returns nil until the scoped result endpoint exists.
 func apiStreamWriterFor(ctx context.Context, client *redisapi.Client, job *Job) *APIStreamWriter {
 	w := NewAPIStreamWriter(ctx, client, job.ID, job.RayID)
-	w.retain = retainsTerminalResult(job.Type)
+	if retainsTerminalResult(job.Type) {
+		w.retainer = apiTerminalRetainer(client)
+	}
 	return w
 }
+
+// apiTerminalRetainer is the API-mode retention seam. It returns nil, so API
+// mode does not retain. When the proxy exposes the scoped
+// POST /api/fabric/redis/jobs/{jobId}/result endpoint (node-bound, SET NX EX),
+// return a redisapi client method implementing terminalRetainer here.
+var apiTerminalRetainer = func(*redisapi.Client) terminalRetainer { return nil }
 
 // clockStreamWriter observes existing carriers without creating any event or
 // changing the handler/client interface. Test/custom writers still see exactly

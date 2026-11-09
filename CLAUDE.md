@@ -4149,13 +4149,14 @@ fails, so an unknown page degrades to `admit_timeout`, never a false
 
 `worker.retainsTerminalResult` decides which job types also store their first
 terminal stream:v1 envelope under `worker.TerminalResultKey`, so a coordinator
-that was restarting during the publish can recover it (aceteam#13175). Both
-stream writers' `publishTerminal` publish first, then retain first-writer-wins
-(direct `SET NX EX`, API-proxy GET-then-SET), and never return a retention
-error to the publish retry: a refused redelivery must not overwrite a good
-transcript. API mode inherits the KV route's 24h/1 MiB limits
-(`redisapi.KVMaxTTL`/`KVMaxValueBytes`). Key, TTL and limits for the backend
-reader are in `docs/meeting-join-terminal-result.md`; tests in
+that was restarting during the publish can recover it (aceteam#13175). Direct
+Redis only: `RedisStreamWriter.publishTerminal` publishes first, then
+`SET NX EX` (first writer wins, so a refused redelivery cannot overwrite a good
+transcript), and never returns a retention error to the publish retry. API mode
+does NOT retain: the generic KV route is not org/node scoped, so
+`worker.apiTerminalRetainer` returns nil until a scoped result endpoint exists.
+Do not route retention through `/api/fabric/redis/kv`. Contract for the backend
+reader: `docs/meeting-join-terminal-result.md`; tests in
 `internal/worker/terminal_retention_test.go`.
 
 ### Meeting-bot wait-loop cancellation (citadel#488, cancellation half)

@@ -149,15 +149,14 @@ func TestNonMeetingJobTerminalNotRetained(t *testing.T) {
 	}
 }
 
-// fakeKVProxy is a minimal Redis API proxy: pub/sub publish plus the KV route
-// with its real ttl and size limits.
+// fakeKVProxy is a minimal Redis API proxy: pub/sub publish plus the KV route,
+// recording any KV write so tests can prove API mode makes none.
 type fakeKVProxy struct {
-	mu        sync.Mutex
-	kv        map[string]string
-	ttl       map[string]int
-	posts     int
-	published []string
-	failKV    bool
+	mu         sync.Mutex
+	kv         map[string]string
+	ttl        map[string]int
+	postedKeys []string
+	published  []string
 }
 
 func newFakeKVProxy(t *testing.T) (*fakeKVProxy, *redisapi.Client) {
@@ -168,6 +167,17 @@ func newFakeKVProxy(t *testing.T) (*fakeKVProxy, *redisapi.Client) {
 	client := redisapi.NewClient(redisapi.ClientConfig{BaseURL: srv.URL, Token: "synthetic-token"})
 	t.Cleanup(func() { client.Close() })
 	return p, client
+}
+
+// resultPosts counts KV writes to a job:<id>:result key; the caller holds p.mu.
+func (p *fakeKVProxy) resultPosts() int {
+	n := 0
+	for _, k := range p.postedKeys {
+		if strings.HasSuffix(k, ":result") {
+			n++
+		}
+	}
+	return n
 }
 
 func (p *fakeKVProxy) serve(w http.ResponseWriter, r *http.Request) {
@@ -189,17 +199,13 @@ func (p *fakeKVProxy) serve(w http.ResponseWriter, r *http.Request) {
 		out, _ := json.Marshal(map[string]any{"key": key, "value": v, "ttl": p.ttl[key]})
 		_, _ = w.Write(out)
 	case strings.HasSuffix(r.URL.Path, "/redis/kv") && r.Method == http.MethodPost:
-		p.posts++
 		var body struct {
 			Key   string `json:"key"`
 			Value string `json:"value"`
 			TTL   int    `json:"ttl"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if p.failKV {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
+		p.postedKeys = append(p.postedKeys, body.Key)
 		if body.TTL > 86400 || len(body.Value) > 1024*1024 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -211,54 +217,90 @@ func (p *fakeKVProxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func TestMeetingJoinTerminalResultRetainedAPIMode(t *testing.T) {
+// TestMeetingJoinTerminalResultNotRetainedAPIMode pins that API mode writes
+// nothing through the generic KV route: that route is not scoped to the job's
+// org or node, so retention waits for the scoped result endpoint.
+func TestMeetingJoinTerminalResultNotRetainedAPIMode(t *testing.T) {
 	proxy, client := newFakeKVProxy(t)
 	ctx := context.Background()
 	runMeetingToTerminal(t, "meeting-3", func(job *Job) StreamWriter { return apiStreamWriterFor(ctx, client, job) })
 
 	proxy.mu.Lock()
 	defer proxy.mu.Unlock()
-	key := TerminalResultKey("meeting-3")
-	raw, ok := proxy.kv[key]
-	if !ok {
-		t.Fatalf("retained key missing; kv = %v", proxy.kv)
+	if proxy.resultPosts() != 0 {
+		t.Fatalf("API mode wrote a result key through the KV route: kv=%v", proxy.kv)
 	}
-	assertRetainedEnd(t, raw, "meeting-3")
-	if proxy.ttl[key] != 86400 {
-		t.Fatalf("ttl = %d, want the proxy maximum 86400", proxy.ttl[key])
+	var sawEnd bool
+	for _, m := range proxy.published {
+		sawEnd = sawEnd || strings.Contains(m, `"type":"end"`)
 	}
-	// The retained value is the envelope the HTTP publish sent.
+	if !sawEnd {
+		t.Fatal("terminal end event was not published")
+	}
+}
+
+// recordingRetainer stands in for the future scoped-endpoint client.
+type recordingRetainer struct {
+	mu    sync.Mutex
+	keys  []string
+	vals  []string
+	ttls  []time.Duration
+	fail  error
+	calls int
+}
+
+func (r *recordingRetainer) RetainTerminalEvent(_ context.Context, key string, eventJSON []byte, ttl time.Duration) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if r.fail != nil {
+		return false, r.fail
+	}
+	r.keys, r.vals, r.ttls = append(r.keys, key), append(r.vals, string(eventJSON)), append(r.ttls, ttl)
+	return true, nil
+}
+
+func withAPIRetainer(t *testing.T, r terminalRetainer) {
+	t.Helper()
+	orig := apiTerminalRetainer
+	apiTerminalRetainer = func(*redisapi.Client) terminalRetainer { return r }
+	t.Cleanup(func() { apiTerminalRetainer = orig })
+}
+
+// TestAPIRetentionSeamReceivesPublishedEnvelope pins the seam the scoped
+// endpoint will plug into: it gets the published envelope, key and 72h TTL.
+func TestAPIRetentionSeamReceivesPublishedEnvelope(t *testing.T) {
+	proxy, client := newFakeKVProxy(t)
+	rec := &recordingRetainer{}
+	withAPIRetainer(t, rec)
+	ctx := context.Background()
+	runMeetingToTerminal(t, "meeting-4", func(job *Job) StreamWriter { return apiStreamWriterFor(ctx, client, job) })
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.calls != 1 || rec.keys[0] != "job:meeting-4:result" || rec.ttls[0] != 72*time.Hour {
+		t.Fatalf("seam calls=%d keys=%v ttls=%v", rec.calls, rec.keys, rec.ttls)
+	}
+	assertRetainedEnd(t, rec.vals[0], "meeting-4")
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
 	var published string
 	for _, m := range proxy.published {
 		if strings.Contains(m, `"type":"end"`) {
 			published = m
 		}
 	}
-	if published != raw {
-		t.Fatalf("retained value differs from published end event:\npublished %s\nretained  %s", published, raw)
+	if published != rec.vals[0] {
+		t.Fatalf("seam value differs from published end event:\npublished %s\nretained  %s", published, rec.vals[0])
 	}
-}
-
-func TestSecondTerminalWriteKeepsFirstRetainedResultAPIMode(t *testing.T) {
-	proxy, client := newFakeKVProxy(t)
-	w := apiStreamWriterFor(context.Background(), client, &Job{ID: "meeting-4", RayID: "ray-1", Type: JobTypeMeetingJoin})
-	if err := w.WriteEnd(meetingOutput()); err != nil {
-		t.Fatal(err)
+	if proxy.resultPosts() != 0 {
+		t.Fatal("seam path still wrote a result key through the KV route")
 	}
-	if err := w.WriteError(errMeetingRedelivered, false); err != nil {
-		t.Fatal(err)
-	}
-	proxy.mu.Lock()
-	defer proxy.mu.Unlock()
-	if proxy.posts != 1 {
-		t.Fatalf("kv posts = %d, want 1", proxy.posts)
-	}
-	assertRetainedEnd(t, proxy.kv[TerminalResultKey("meeting-4")], "meeting-4")
 }
 
 func TestRetentionFailureDoesNotFailTerminalPublishAPIMode(t *testing.T) {
 	proxy, client := newFakeKVProxy(t)
-	proxy.failKV = true
+	withAPIRetainer(t, &recordingRetainer{fail: errors.New("synthetic retain failure")})
 	var logged []string
 	orig := retentionLogf
 	retentionLogf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
@@ -279,27 +321,13 @@ func TestRetentionFailureDoesNotFailTerminalPublishAPIMode(t *testing.T) {
 }
 
 func TestDurableAPIWriterDoesNotRetain(t *testing.T) {
-	proxy, client := newFakeKVProxy(t)
+	_, client := newFakeKVProxy(t)
+	rec := &recordingRetainer{}
+	withAPIRetainer(t, rec)
 	w := apiStreamWriterFor(context.Background(), client, &Job{ID: "meeting-6", Type: JobTypeMeetingJoin})
 	w.durable = true
 	_ = w.WriteEnd(meetingOutput())
-	proxy.mu.Lock()
-	defer proxy.mu.Unlock()
-	if proxy.posts != 0 {
-		t.Fatalf("durable writer retained (%d posts)", proxy.posts)
-	}
-}
-
-func TestAPIRetainRefusesOversizeValueLocally(t *testing.T) {
-	proxy, client := newFakeKVProxy(t)
-	big := []byte(`"` + strings.Repeat("x", redisapi.KVMaxValueBytes) + `"`)
-	stored, err := client.RetainTerminalEvent(context.Background(), TerminalResultKey("meeting-7"), big, TerminalResultTTL)
-	if stored || !errors.Is(err, redisapi.ErrValueTooLarge) {
-		t.Fatalf("stored=%v err=%v", stored, err)
-	}
-	proxy.mu.Lock()
-	defer proxy.mu.Unlock()
-	if proxy.posts != 0 {
-		t.Fatal("oversize value was sent to the proxy")
+	if rec.calls != 0 {
+		t.Fatalf("durable writer retained (%d calls)", rec.calls)
 	}
 }
