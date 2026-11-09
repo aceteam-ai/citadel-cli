@@ -233,10 +233,24 @@ The release script handles:
 2. Running `go test ./...` and `go vet ./...`
 3. Cross-platform builds (linux/darwin/windows, amd64/arm64)
 4. **Generating `checksums.txt`** (sha256sum of all archives — required by auto-updater)
-5. Creating annotated git tag and pushing
-6. Creating GitHub Release with all binaries + checksums attached
+5. **Signing it as `checksums.txt.sig`** with the offline release key (`CITADEL_RELEASE_SIGNING_KEY`)
+6. Creating annotated git tag and pushing
+7. Creating GitHub Release with all binaries + checksums + signature attached
 
 **Why this matters:** The `citadel update` auto-updater downloads `checksums.txt` to verify binary integrity. If checksums are missing, nodes see `checksum fetch failed with status: 404 Not Found` and can't update.
+
+**Signed releases (aceteam#12089).** `update.Client.DownloadAndVerify`, the one
+download path behind auto-update, `citadel update install` and AGENT_UPDATE,
+refuses a release unless `checksums.txt.sig` verifies against the compiled key
+set in `internal/releasesig` and the signed entries all name archives of the
+requested tag. A release without the signature can never be installed by a
+verifying binary. Releases created since immutable releases were enabled
+(2026-11-09) cannot gain or lose assets, so the signature cannot be added
+later, and nobody can delete it to block updates; v2.212.0 and earlier are
+still mutable. So `hook_preflight` fails the release before tagging when the
+key is unusable, and `hook_pre_publish` refuses to publish without a verifying
+signature. The root `release.sh` is retired (it cannot sign) and only exits 1.
+Format, transition and key rotation: [docs/release-signing.md](docs/release-signing.md).
 
 ### Testing
 ```bash
