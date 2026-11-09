@@ -3548,3 +3548,22 @@ Auto-generated log of every release.
   - feat(cobrowse): Windows headless browser runner behind a runner interface
 
 
+---
+
+## v2.213.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 50 |
+| Lines added | +3550 |
+
+**Changes:**
+
+  - fix(update): verify ed25519-signed release checksums (aceteam#12089) (#1589)
+  - feat(worker): retain terminal MEETING_JOIN result in Redis with a TTL (#1588)
+  - feat(local): add opencode harness to local config (#1587)
+  - feat(ollama): ollama_keep_alive and ollama_preload manifest settings (#1586)
+  - fix(services): materialize fresh compose on unknown GPU evidence (#1562)
+
+
