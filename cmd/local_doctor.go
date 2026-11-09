@@ -42,7 +42,9 @@ type localDoctorDeps struct {
 }
 
 func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
+	// The vault is the node's passphrase vault; co-browse state is per user.
 	nodeDir := network.GetNodeConfigDir()
+	stateDir := localStateDir()
 	d := localDoctorDeps{
 		goos:     runtime.GOOS,
 		runner:   platform.CobrowseRunnerName(),
@@ -56,7 +58,7 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 		},
 		vault: func() (bool, error) { return nodevault.Open(nodeDir).Configured() },
 		owner: func() error {
-			o, err := localcobrowse.AcquireOwner(nodeDir)
+			o, err := localcobrowse.AcquireOwner(stateDir)
 			if err != nil {
 				return err
 			}
@@ -64,7 +66,7 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 			return nil
 		},
 		audit: func() (localaudit.VerifyResult, error) {
-			return localaudit.Verify(filepath.Join(nodeDir, localaudit.DirName))
+			return localaudit.Verify(filepath.Join(stateDir, localaudit.DirName))
 		},
 		harnesses: detectHarnessConfigs(systemHarnessEnv()),
 		exe:       "citadel",
@@ -169,7 +171,7 @@ func runLocalDoctor(d localDoctorDeps, out io.Writer) error {
 	if err := d.owner(); errors.As(err, &oe) {
 		warn("Agent apps", oe.Error())
 	} else if err != nil {
-		fail("Agent apps", fmt.Sprintf("cannot use the co-browse owner lock: %v", err))
+		fail("Agent apps", fmt.Sprintf("cannot use the co-browse owner lock: %v. This account must be able to create and write that folder", err))
 	} else {
 		ok("Agent apps", "no other agent app is using co-browse right now")
 	}

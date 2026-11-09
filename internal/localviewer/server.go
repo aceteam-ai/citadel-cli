@@ -50,7 +50,7 @@ var assets embed.FS
 // running owner for a fresh link.
 const TokenFile = "local-viewer.json"
 
-// PrivateDirName is the owner-only subdir of the node config dir holding
+// PrivateDirName is the owner-only subdir of the local-mode state dir holding
 // TokenFile and the one-time launch files.
 const PrivateDirName = "local-viewer"
 
@@ -79,7 +79,7 @@ type Config struct {
 	Stream cobrowsestream.Session
 	// OpenURL opens a URL in the user's default browser.
 	OpenURL func(string) error
-	// TokenDir is the node config dir. TokenFile and the launch files live in
+	// TokenDir is the local-mode state dir (cmd.localStateDir). TokenFile and the launch files live in
 	// its owner-only PrivateDirName subdir. Empty disables Open (tests).
 	TokenDir string
 	// Now is the clock; nil uses time.Now.

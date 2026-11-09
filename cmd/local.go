@@ -17,7 +17,6 @@ import (
 	"syscall"
 
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
-	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 )
@@ -55,7 +54,7 @@ fresh one-time viewer link and opens it in your default browser. The link
 works once and expires after two minutes. Use --print to show it instead.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runLocalViewer(cmd.Context(), network.GetNodeConfigDir(), localViewerPrint, platform.OpenURL, cmd.OutOrStdout())
+		return runLocalViewer(cmd.Context(), localStateDir(), localViewerPrint, platform.OpenURL, cmd.OutOrStdout())
 	},
 }
 
@@ -126,7 +125,7 @@ func newLocalOnlyBridge(tools []localMCPTool, rt *localCobrowseRuntime, in io.Re
 
 func runLocalMCP(cmd *cobra.Command, args []string) error {
 	debugToStderr = true
-	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: network.GetNodeConfigDir, viewer: true})
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: localStateDir, viewer: true})
 	defer rt.close()
 
 	// A harness usually stops its MCP server by closing stdin, which ends run.
