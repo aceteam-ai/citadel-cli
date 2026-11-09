@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 )
 
@@ -50,7 +51,7 @@ type harnessEnv struct {
 }
 
 func systemHarnessEnv() harnessEnv {
-	home, _ := os.UserHomeDir()
+	home, _ := platform.UserHomeDir()
 	return harnessEnv{goos: runtime.GOOS, home: home, appData: os.Getenv("APPDATA")}
 }
 
