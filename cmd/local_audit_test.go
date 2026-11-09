@@ -93,9 +93,29 @@ func TestLocalAuditRecordsEveryCallWithoutSecrets(t *testing.T) {
 		t.Fatalf("want one record per call (%d agent, 1 user), got %d agent, %d user", agentCalls, agent, user)
 	}
 	// The four writes that ran (type, navigate, click, key) each have a
-	// pending record written before they reached the browser.
+	// pending record written before they reached the browser, and each
+	// outcome links back to it.
 	if pending != 4 {
 		t.Fatalf("want 4 pending records before writes, got %d", pending)
+	}
+	pendingAt := map[int64]localaudit.Record{}
+	for _, r := range recs {
+		if r.ResultingAction == "pending" {
+			pendingAt[r.Seq] = r
+		}
+	}
+	linked := 0
+	for _, r := range recs {
+		if r.PendingSeq != 0 {
+			p, ok := pendingAt[r.PendingSeq]
+			if !ok || p.IntendedAction != r.IntendedAction || r.Seq <= p.Seq {
+				t.Fatalf("outcome %d links to a wrong pending record %d", r.Seq, r.PendingSeq)
+			}
+			linked++
+		}
+	}
+	if linked != 4 {
+		t.Fatalf("want 4 outcomes linked to their pending records, got %d", linked)
 	}
 	// Refused: type before approval, screenshot while the user drives, and
 	// the agent's resume (only the user hands back).

@@ -65,22 +65,25 @@ type Record struct {
 	TextLen  int    `json:"text_len,omitempty"`
 	// ResultingAction is the outcome: ok, refused, error, or a lifecycle note.
 	ResultingAction string `json:"resulting_action"`
-	Error           string `json:"error,omitempty"`
-	PrevHash        string `json:"prev_hash"`
-	Hash            string `json:"hash"`
+	// PendingSeq links a write's outcome to the pending record written
+	// before the write ran.
+	PendingSeq int64  `json:"pending_seq,omitempty"`
+	Error      string `json:"error,omitempty"`
+	PrevHash   string `json:"prev_hash"`
+	Hash       string `json:"hash"`
 }
 
 // hashRecord is the SHA-256 of the record's RFC 8785 (JCS) canonical JSON with
 // Hash empty, via the same canonicalizer as AEP receipts, so a server-side
 // verifier in any language can recompute it.
-func hashRecord(r Record) string {
+func hashRecord(r Record) (string, error) {
 	r.Hash = ""
 	b, err := aep.CanonicalizeJCS(r)
 	if err != nil {
-		b, _ = json.Marshal(r)
+		return "", fmt.Errorf("canonicalize audit record: %w", err)
 	}
 	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // RedactURL returns the URL's scheme and host, and a hash of its path. A URL
@@ -141,6 +144,7 @@ type Log struct {
 	seq    int64
 	prev   string
 	anchor Anchor
+	failed error
 }
 
 // Anchor is kept beside the log: the newest record, and the last record that
@@ -179,6 +183,28 @@ func writeAnchor(dir string, a Anchor) error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(dir, anchorFile))
+}
+
+// anchorHeld reports whether the log still contains the anchored head: the
+// newest record is at or after it, and the record at the anchored seq has the
+// anchored hash (or retention already removed it, as the anchor records).
+func anchorHeld(files []string, a Anchor, newest int64) bool {
+	if newest < a.HeadSeq {
+		return false
+	}
+	if a.HeadSeq <= a.PrunedSeq {
+		return true
+	}
+	found := false
+	for _, f := range files {
+		_ = eachRecord(f, func(_ int, r Record, _ []byte) error {
+			if r.Seq == a.HeadSeq && r.Hash == a.HeadHash {
+				found = true
+			}
+			return nil
+		})
+	}
+	return found
 }
 
 // quarantineTornTail moves an incomplete final line (no trailing newline, as
@@ -242,10 +268,14 @@ func Open(dir string, retention time.Duration, now func() time.Time) (*Log, erro
 	if aerr != nil {
 		return nil, aerr
 	}
-	if a.HeadSeq != 0 || l.seq != 0 {
-		ok := (a.HeadSeq == l.seq && a.HeadHash == l.prev) || a.HeadSeq == l.seq-1
-		if !ok {
-			return nil, fmt.Errorf("audit log %s does not match its anchor (head seq %d, anchor seq %d): records were removed or edited; keep a copy, then move the directory aside to start a new log", dir, l.seq, a.HeadSeq)
+	switch {
+	case l.seq == 0 && a.HeadSeq != 0 && a.PrunedSeq == a.HeadSeq && a.PrunedHash == a.HeadHash:
+		// Retention removed every month file: continue the chain from the
+		// anchor rather than restarting it.
+		l.seq, l.prev = a.HeadSeq, a.HeadHash
+	case a.HeadSeq != 0:
+		if !anchorHeld(files, a, l.seq) {
+			return nil, fmt.Errorf("audit log %s does not match its anchor (newest seq %d, anchored seq %d): records were removed or edited; keep a copy, then move the directory aside to start a new log", dir, l.seq, a.HeadSeq)
 		}
 	}
 	l.anchor = a
@@ -267,9 +297,33 @@ func Open(dir string, retention time.Duration, now func() time.Time) (*Log, erro
 func (l *Log) Dir() string { return l.dir }
 
 // Append fills in the chain fields and writes r durably.
+// appendFile is the slice of *os.File Append uses; a seam so tests can
+// simulate a disk filling up mid-write.
+type appendFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+var openAppendFile = func(path string) (appendFile, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+}
+
+// ErrLogFailed is returned by Append after a write failed: the log refuses
+// further records in this process, so a sequence number is never reused and
+// nothing is chained onto a record that may not be on disk. Reopening (a new
+// Citadel process) resumes from what is on disk.
+var ErrLogFailed = errors.New("the audit log stopped after a failed write")
+
+// Append fills in the chain fields and writes r durably. If the write or sync
+// fails, the file is truncated back to its size before the write (so no
+// partial record remains) and the log stops accepting records.
 func (l *Log) Append(r Record) (Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.failed != nil {
+		return Record{}, fmt.Errorf("%w: %v", ErrLogFailed, l.failed)
+	}
 	now := l.now().UTC()
 	r.V = 1
 	r.Source = "local"
@@ -278,26 +332,48 @@ func (l *Log) Append(r Record) (Record, error) {
 	r.URL, r.PathHash = RedactURL(r.URL)
 	r.Error = SanitizeError(r.Error)
 	r.PrevHash = l.prev
-	r.Hash = hashRecord(r)
+	h, err := hashRecord(r)
+	if err != nil {
+		return Record{}, err
+	}
+	r.Hash = h
 	line, err := json.Marshal(r)
 	if err != nil {
 		return Record{}, err
 	}
 	path := filepath.Join(l.dir, now.Format("2006-01")+".jsonl")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	var before int64
+	if fi, err := os.Stat(path); err == nil {
+		before = fi.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Record{}, fmt.Errorf("stat audit log: %w", err)
+	}
+	f, err := openAppendFile(path)
 	if err != nil {
 		return Record{}, fmt.Errorf("open audit log: %w", err)
 	}
-	defer f.Close()
+	fail := func(what string, cause error) (Record, error) {
+		_ = f.Close()
+		if terr := os.Truncate(path, before); terr != nil {
+			cause = fmt.Errorf("%v; and could not remove the partial record: %v", cause, terr)
+		}
+		l.failed = fmt.Errorf("%s: %w", what, cause)
+		return Record{}, l.failed
+	}
 	if _, err := f.Write(append(line, '\n')); err != nil {
-		return Record{}, fmt.Errorf("write audit log: %w", err)
+		return fail("write audit log", err)
 	}
 	if err := f.Sync(); err != nil {
-		return Record{}, fmt.Errorf("sync audit log: %w", err)
+		return fail("sync audit log", err)
+	}
+	if err := f.Close(); err != nil {
+		return fail("close audit log", err)
 	}
 	l.seq, l.prev = r.Seq, r.Hash
 	l.anchor.HeadSeq, l.anchor.HeadHash = r.Seq, r.Hash
 	if err := writeAnchor(l.dir, l.anchor); err != nil {
+		// The record is durable; a stale anchor only lags it, which Open and
+		// Verify accept.
 		return r, fmt.Errorf("write audit anchor: %w", err)
 	}
 	return r, nil
@@ -427,11 +503,19 @@ func Verify(dir string) (VerifyResult, error) {
 		return res, err
 	}
 	prev := ""
+	anchorSeen := false
 	for _, f := range files {
 		err := eachRecord(f, func(line int, r Record, _ []byte) error {
 			where := fmt.Sprintf("%s:%d (seq %d)", filepath.Base(f), line, r.Seq)
-			if got := hashRecord(r); got != r.Hash {
+			got, herr := hashRecord(r)
+			if herr != nil {
+				return fmt.Errorf("%s: %v", where, herr)
+			}
+			if got != r.Hash {
 				return fmt.Errorf("%s: record was modified (hash mismatch)", where)
+			}
+			if r.Seq == a.HeadSeq && r.Hash == a.HeadHash {
+				anchorSeen = true
 			}
 			if res.Records == 0 {
 				res.FirstSeq = r.Seq
@@ -463,10 +547,16 @@ func Verify(dir string) (VerifyResult, error) {
 		}
 	}
 	switch {
-	case res.Records == 0 && a.HeadSeq != 0:
-		return res, fmt.Errorf("the log is empty but its anchor records %d entries: records were removed", a.HeadSeq)
-	case res.Records > 0 && a.HeadSeq != 0 && !(a.HeadSeq == res.LastSeq && a.HeadHash == prev) && a.HeadSeq != res.LastSeq-1:
-		return res, fmt.Errorf("the newest record (seq %d) is not the anchored head (seq %d): records were removed from the end", res.LastSeq, a.HeadSeq)
+	case a.HeadSeq == 0:
+	case res.Records == 0:
+		if !(a.PrunedSeq == a.HeadSeq && a.PrunedHash == a.HeadHash) {
+			return res, fmt.Errorf("the log is empty but its anchor records %d entries: records were removed", a.HeadSeq)
+		}
+		res.Truncated = true
+	case res.LastSeq < a.HeadSeq:
+		return res, fmt.Errorf("the newest record (seq %d) is older than the anchored head (seq %d): records were removed from the end", res.LastSeq, a.HeadSeq)
+	case a.HeadSeq > a.PrunedSeq && !anchorSeen:
+		return res, fmt.Errorf("the anchored record (seq %d) is missing or was changed", a.HeadSeq)
 	}
 	return res, nil
 }

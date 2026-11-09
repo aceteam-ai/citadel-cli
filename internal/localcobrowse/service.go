@@ -92,6 +92,9 @@ type Event struct {
 	Error     string
 	// Agent is the connected MCP client's name at the time of the call.
 	Agent string
+	// PendingSeq is the audit seq of this write's pending record, set on
+	// the outcome event.
+	PendingSeq int64
 }
 
 // Config configures a Service. Zero values take the local-mode defaults.
@@ -113,7 +116,7 @@ type Config struct {
 	// BeforeAction is called after a write passes its gates and before it
 	// reaches the browser; an error refuses the write. The owner records a
 	// pending audit record here, so a write never runs unrecorded.
-	BeforeAction func(Event) error
+	BeforeAction func(Event) (pendingSeq int64, err error)
 	// Precheck runs before every co-browse call; an error refuses the call.
 	// The owner uses it to fail closed when the audit log cannot be written.
 	Precheck func() error
@@ -613,7 +616,7 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 		if err := s.gateWrite(id, true); err != nil {
 			return ActionResult{}, err
 		}
-		if err := s.beforeAction(ev); err != nil {
+		if err := s.beforeAction(&ev); err != nil {
 			return ActionResult{}, err
 		}
 		before := s.currentURL(id)
@@ -633,7 +636,7 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 // Click clicks an element or a viewport point (W).
 func (s *Service) Click(ctx context.Context, id, selector string, x, y *float64, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "click", Class: "W", Goal: goal, Selector: selector}
-	res, err := s.writeAction(ctx, ev, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		_, err := s.cfg.Browser.Click(id, selector, x, y)
 		return err
 	})
@@ -644,7 +647,7 @@ func (s *Service) Click(ctx context.Context, id, selector string, x, y *float64,
 // Type inserts text into the focused element (W). Only its length is audited.
 func (s *Service) Type(ctx context.Context, id, text, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "type", Class: "W", Goal: goal, TextLen: len([]rune(text))}
-	res, err := s.writeAction(ctx, ev, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		_, err := s.cfg.Browser.Type(id, text)
 		return err
 	})
@@ -656,7 +659,7 @@ func (s *Service) Type(ctx context.Context, id, text, goal string) (ActionResult
 func (s *Service) Select(ctx context.Context, id, selector, value, label, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "select", Class: "W", Goal: goal, Selector: selector}
 	var picked platform.SelectResult
-	res, err := s.writeAction(ctx, ev, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		var err error
 		picked, err = s.cfg.Browser.Select(id, selector, value, label)
 		return err
@@ -669,7 +672,7 @@ func (s *Service) Select(ctx context.Context, id, selector, value, label, goal s
 // Key presses one key (W).
 func (s *Service) Key(ctx context.Context, id, key, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "key", Class: "W", Goal: goal}
-	res, err := s.writeAction(ctx, ev, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		_, err := s.cfg.Browser.Key(id, key)
 		return err
 	})
@@ -680,7 +683,7 @@ func (s *Service) Key(ctx context.Context, id, key, goal string) (ActionResult, 
 // Scroll scrolls at an element or point (W).
 func (s *Service) Scroll(ctx context.Context, id, selector string, x, y *float64, dx, dy float64, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "scroll", Class: "W", Goal: goal, Selector: selector}
-	res, err := s.writeAction(ctx, ev, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		_, err := s.cfg.Browser.Scroll(id, selector, x, y, dx, dy)
 		return err
 	})
@@ -688,18 +691,26 @@ func (s *Service) Scroll(ctx context.Context, id, selector string, x, y *float64
 	return res, err
 }
 
-func (s *Service) beforeAction(ev Event) error {
+// beforeAction records the pending event and stores its seq on ev, so the
+// outcome record links back to it.
+func (s *Service) beforeAction(ev *Event) error {
 	if s.cfg.BeforeAction == nil {
 		return nil
 	}
-	ev.Outcome = "pending"
-	if ev.Agent == "" {
-		ev.Agent = s.Agent()
+	pending := *ev
+	pending.Outcome = "pending"
+	if pending.Agent == "" {
+		pending.Agent = s.Agent()
 	}
-	return s.cfg.BeforeAction(ev)
+	seq, err := s.cfg.BeforeAction(pending)
+	if err != nil {
+		return err
+	}
+	ev.PendingSeq = seq
+	return nil
 }
 
-func (s *Service) writeAction(ctx context.Context, ev Event, do func() error) (ActionResult, error) {
+func (s *Service) writeAction(ctx context.Context, ev *Event, do func() error) (ActionResult, error) {
 	id := ev.SessionID
 	if err := s.gateWrite(id, false); err != nil {
 		return ActionResult{}, err

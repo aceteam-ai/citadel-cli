@@ -94,6 +94,7 @@ func auditRecordFor(ev localcobrowse.Event) localaudit.Record {
 		Selector:        ev.Selector,
 		TextLen:         ev.TextLen,
 		ResultingAction: ev.Outcome,
+		PendingSeq:      ev.PendingSeq,
 		Error:           ev.Error,
 	}
 }
@@ -119,23 +120,24 @@ func (rt *localCobrowseRuntime) recordEvent(ev localcobrowse.Event) {
 
 // recordPending appends the pending record for a write about to run. If it
 // cannot be written the write is refused and co-browse turns off.
-func (rt *localCobrowseRuntime) recordPending(ev localcobrowse.Event) error {
+func (rt *localCobrowseRuntime) recordPending(ev localcobrowse.Event) (int64, error) {
 	rt.mu.Lock()
 	log := rt.audit
 	rt.mu.Unlock()
 	if log == nil {
-		return nil
+		return 0, nil
 	}
-	if _, err := log.Append(auditRecordFor(ev)); err != nil {
+	rec, err := log.Append(auditRecordFor(ev))
+	if err != nil {
 		rt.mu.Lock()
 		if rt.auditErr == nil {
 			rt.auditErr = fmt.Errorf("the local audit log in %s cannot be written (%v); co-browse is off until Citadel restarts. You can still stop or take over sessions in the viewer", log.Dir(), err)
 		}
 		e := rt.auditErr
 		rt.mu.Unlock()
-		return e
+		return 0, e
 	}
-	return nil
+	return rec.Seq, nil
 }
 
 func (rt *localCobrowseRuntime) auditPrecheck() error {
@@ -195,11 +197,9 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 				opts.onEvent(ev)
 			}
 		},
-		Precheck: rt.auditPrecheck,
-		BeforeAction: func(ev localcobrowse.Event) error {
-			return rt.recordPending(ev)
-		},
-		ViewerNote: viewerNote,
+		Precheck:     rt.auditPrecheck,
+		BeforeAction: rt.recordPending,
+		ViewerNote:   viewerNote,
 		AcquireOwner: func() error {
 			if opts.ownerDir == nil {
 				return nil
@@ -228,6 +228,11 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 				// URL filter alone does not see redirects or subresources.
 				g, gerr := localcobrowse.StartEgressGuard(nil, nil)
 				if gerr != nil {
+					// Drop the log before the lock: once released, another
+					// process may own (and write) this chain.
+					rt.mu.Lock()
+					rt.audit = nil
+					rt.mu.Unlock()
 					o.Release()
 					return gerr
 				}
