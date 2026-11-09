@@ -3506,3 +3506,45 @@ Auto-generated log of every release.
   - fix(cobrowse): restrict session URLs to http(s) and terminate browser switches (#1575)
 
 
+---
+
+## v2.212.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 28 |
+| Files changed | 59 |
+| Lines added | +11409 |
+
+**Changes:**
+
+  - Merge pull request #1574 from aceteam-ai/feat/local-mode-s6-first-run
+  - Merge pull request #1573 from aceteam-ai/feat/local-mode-s5-audit
+  - Merge pull request #1572 from aceteam-ai/feat/local-mode-s4-viewer
+  - Merge pull request #1570 from aceteam-ai/feat/local-mode-s3-local-mcp
+  - Merge pull request #1569 from aceteam-ai/feat/local-mode-s1-windows-runner
+  - chore(local): make BurntSushi/toml a direct dependency; correct the harness-location note in CLAUDE.md
+  - fix(local): parse harness configs properly and make the first-run docs honest
+  - fix(local): resolve the harness home through platform.UserHomeDir
+  - fix(local): doctor reports the browser version and refuses one older than 109; clarify DNS in the no-network wording
+  - feat(local): citadel local doctor, citadel local config, quickstart and release notes
+  - fix(local): roll back a failed audit write, accept a lagging anchor, link pending records
+  - fix(local): record writes before they run and make the audit chain tamper-evident at both ends
+  - feat(local): hash-chained local co-browse audit log, Activity panel, citadel local audit
+  - fix(local): drop the old viewer stream on re-open and recheck a newly created private dir
+  - fix(cobrowse): validate the address-bar URL in NavigateAsHuman
+  - fix(local): keep viewer codes off the command line and the token out of the cookie
+  - fix(local): guard where the browser connects, start-page landing, resume and budgets
+  - test(local): retry viewer clicks until they take effect in the real-browser page test
+  - test(local): use documentation-range addresses in the address-filter tests
+  - feat(local): loopback co-browse viewer with approval card and take control
+  - feat(local): citadel local mcp and the local_cobrowse_* tools
+  - fix(cobrowse): never relaunch a session for its user agent; fix a probe-cache race
+  - fix(cobrowse): never fall back to a headless user agent when the UA probe fails
+  - fix(cobrowse): gate every runner launch on ValidateCobrowseURL
+  - fix(cobrowse): harden the Windows runner's debug port, UA probe and headed paths
+  - fix(cobrowse): send the browser's real user agent from Windows headless sessions
+  - test(cobrowse): accept ownership refusal for a plain dir on elevated Windows runners
+  - feat(cobrowse): Windows headless browser runner behind a runner interface
+
+
