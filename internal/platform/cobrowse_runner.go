@@ -20,10 +20,14 @@
 package platform
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -214,6 +218,35 @@ func launchXvfbCobrowseProc(profileDir, startURL string) (*cobrowseProc, error) 
 		return nil, fmt.Errorf("browser launched but CDP not ready: %w", err)
 	}
 	return proc, nil
+}
+
+// deheadlessUserAgent turns a headless browser's default user agent into the
+// one the same browser sends in a normal window: new headless mode reports
+// "HeadlessChrome/<v>" where a headed browser reports "Chrome/<v>". The rest
+// (OS, Edge's "Edg/<v>" suffix, versions) is kept exactly, so nothing is
+// hardcoded and the UA always matches the installed binary.
+func deheadlessUserAgent(ua string) string {
+	return strings.TrimSpace(strings.ReplaceAll(ua, "HeadlessChrome/", "Chrome/"))
+}
+
+// browserDefaultUserAgent reads the "User-Agent" field of a running browser's
+// loopback /json/version endpoint.
+func browserDefaultUserAgent(debugPort int) (string, error) {
+	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", debugPort))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("/json/version: %s", resp.Status)
+	}
+	var v struct {
+		UserAgent string `json:"User-Agent"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v); err != nil {
+		return "", err
+	}
+	return v.UserAgent, nil
 }
 
 // removeAllRetry removes dir, retrying briefly. On Windows a just-terminated

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -285,9 +286,13 @@ func requireBrowserIT(t *testing.T) {
 	}
 }
 
+// fixtureUA records the User-Agent header of the last fixture request.
+var fixtureUA atomic.Value
+
 func fixtureServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fixtureUA.Store(r.UserAgent())
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		switch r.URL.Path {
 		case "/two":
@@ -326,6 +331,7 @@ func TestWindowsRealBrowserSession(t *testing.T) {
 	assertDebugPortLoopbackOnly(t, st.DebugPort)
 
 	waitExtract(t, m, st.ID, "#t", "Fixture page one")
+	assertNotHeadlessUA(t, st.DebugPort)
 	png, err := m.Screenshot(st.ID)
 	if err != nil {
 		t.Fatalf("screenshot: %v", err)
@@ -383,6 +389,30 @@ func TestWindowsRealBrowserOwnerKilled(t *testing.T) {
 	if _, err := os.Stat(staleDir); !os.IsNotExist(err) {
 		t.Fatalf("stale session dir was not swept on the next start: %v", err)
 	}
+}
+
+// assertNotHeadlessUA checks the stealth default: neither navigator.userAgent
+// nor the User-Agent the page was requested with says "Headless". The client
+// hint brands are logged (not asserted): --user-agent does not change them.
+func assertNotHeadlessUA(t *testing.T, port int) {
+	t.Helper()
+	ua, err := runtimeEvaluate(port, "navigator.userAgent")
+	if err != nil {
+		t.Fatalf("read navigator.userAgent: %v", err)
+	}
+	t.Logf("navigator.userAgent: %v", ua)
+	if s, _ := ua.(string); s == "" || strings.Contains(s, "Headless") {
+		t.Fatalf("navigator.userAgent must not say Headless: %q", ua)
+	}
+	header, _ := fixtureUA.Load().(string)
+	if header == "" || strings.Contains(header, "Headless") {
+		t.Fatalf("request User-Agent must not say Headless: %q", header)
+	}
+	if ua != header {
+		t.Errorf("navigator.userAgent %q differs from the request header %q", ua, header)
+	}
+	brands, _ := runtimeEvaluate(port, "JSON.stringify(navigator.userAgentData ? navigator.userAgentData.brands : null)")
+	t.Logf("navigator.userAgentData.brands: %v", brands)
 }
 
 func waitExtract(t *testing.T, m *CobrowseSessionManager, id, sel, want string) {

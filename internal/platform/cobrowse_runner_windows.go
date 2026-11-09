@@ -73,6 +73,24 @@ func (r windowsHeadlessRunner) Launch(profileDir, startURL string) (*cobrowsePro
 	if err != nil {
 		return nil, err
 	}
+	// Stealth is on by default (founder decision for local mode). New headless
+	// mode reports "HeadlessChrome" in its user agent, so derive this
+	// browser's real UA from a short probe launch (cached per installed
+	// binary) and pass it as --user-agent. An explicit EnvCobrowseUserAgent
+	// still wins, and with stealth off the browser's own UA is left alone.
+	ua := os.Getenv(EnvCobrowseUserAgent)
+	if ua == "" && stealthEnabled() {
+		ua, err = headedUserAgent(info, filepath.Dir(profileDir))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return startHeadless(info, profileDir, startURL, ua)
+}
+
+// startHeadless launches one headless browser in a kill-on-close job and waits
+// for its CDP endpoint.
+func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string) (*cobrowseProc, error) {
 	debugPort, err := findFreeDebugPort()
 	if err != nil {
 		return nil, err
@@ -82,7 +100,7 @@ func (r windowsHeadlessRunner) Launch(profileDir, startURL string) (*cobrowsePro
 		profileDir: profileDir,
 		startURL:   startURL,
 		stealth:    stealthEnabled(),
-		userAgent:  os.Getenv(EnvCobrowseUserAgent),
+		userAgent:  userAgent,
 		headless:   true,
 		windowSize: defaultHeadlessWindowSize,
 	})
@@ -129,6 +147,49 @@ func (r windowsHeadlessRunner) Launch(profileDir, startURL string) (*cobrowsePro
 			"try a per-user Chrome install or a personal computer", ErrBrowserAutomationBlocked, info.Kind, debugPort, windowsCDPReadyTimeout)
 	}
 	return proc, nil
+}
+
+// uaCache maps an installed browser binary (path, size, mtime) to its derived
+// non-headless user agent. A browser update replaces the binary, which changes
+// the key, so the version in the UA never goes stale.
+var (
+	uaCacheMu sync.Mutex
+	uaCache   = map[string]string{}
+)
+
+// headedUserAgent returns the user agent this browser would send outside
+// headless mode. The first call for a binary launches it once, headless, in a
+// throwaway profile under baseDir, reads /json/version, and stops it.
+func headedUserAgent(info BrowserInfo, baseDir string) (string, error) {
+	key := info.Path
+	if fi, err := os.Stat(info.Path); err == nil {
+		key = fmt.Sprintf("%s|%d|%d", info.Path, fi.Size(), fi.ModTime().UnixNano())
+	}
+	uaCacheMu.Lock()
+	defer uaCacheMu.Unlock()
+	if ua, ok := uaCache[key]; ok {
+		return ua, nil
+	}
+	probeDir := filepath.Join(baseDir, "ua-probe-"+newSessionID())
+	if err := os.MkdirAll(probeDir, 0o700); err != nil {
+		return "", fmt.Errorf("create user-agent probe dir: %w", err)
+	}
+	defer removeSessionDir(probeDir)
+	proc, err := startHeadless(info, probeDir, "about:blank", "")
+	if err != nil {
+		return "", err
+	}
+	raw, verr := browserDefaultUserAgent(proc.debugPort)
+	_ = proc.stop()
+	if verr != nil {
+		return "", fmt.Errorf("read %s user agent: %w", info.Kind, verr)
+	}
+	ua := deheadlessUserAgent(raw)
+	if ua == "" {
+		return "", fmt.Errorf("read %s user agent: empty", info.Kind)
+	}
+	uaCache[key] = ua
+	return ua, nil
 }
 
 // waitForCDPOrExit polls the CDP endpoint until it answers, the browser exits,

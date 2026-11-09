@@ -236,3 +236,16 @@ type refusingRunner struct{ xvfbRunner }
 
 func (refusingRunner) PrepareBaseDir(string) error { return errors.New("base dir not private") }
 func (refusingRunner) SweepOrphans(string)         {}
+
+func TestDeheadlessUserAgent(t *testing.T) {
+	cases := map[string]string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/131.0.0.0 Safari/537.36":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36":                                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+	}
+	for in, want := range cases {
+		if got := deheadlessUserAgent(in); got != want {
+			t.Errorf("got %q\nwant %q", got, want)
+		}
+	}
+}
