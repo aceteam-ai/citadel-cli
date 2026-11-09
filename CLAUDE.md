@@ -91,6 +91,17 @@ the platform supplies a unique staging destination and receives that exact
 relative path in the receipt. See `docs/file-fetch.md` for
 the contract.
 
+`platform.browserRunner` owns the per-OS half of a co-browse session:
+discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
+`xvfbRunner` is the historical managed-Xvfb path, and its argument list is pinned
+by `TestBuildChromeArgs_LinuxArgsUnchanged`. `windowsHeadlessRunner` launches
+Chrome or Edge headless inside a kill-on-close Job Object, and
+`discoverWindowsBrowser` owns the search order. On Windows the sweep never kills
+by PID: it removes only dirs whose owner PID plus creation time no longer
+match. The session base dir there requires an owner-only, protected DACL
+(`validateCobrowseBaseDirPerms`), and a launch refuses without one. The
+windows-latest CI job runs the real-browser tests against both browsers.
+
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
 **Key Components:**

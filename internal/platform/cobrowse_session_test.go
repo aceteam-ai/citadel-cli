@@ -268,10 +268,17 @@ func TestCobrowseSession_Attach(t *testing.T) {
 func trustedBaseDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			t.Fatalf("chmod base dir: %v", err)
+	if runtime.GOOS == "windows" {
+		// Windows trusts only an owner-only, non-inherited DACL, which
+		// ensureCobrowseBaseDir applies when it creates the dir.
+		dir = filepath.Join(dir, "sessions")
+		if err := ensureCobrowseBaseDir(dir); err != nil {
+			t.Fatalf("create trusted base dir: %v", err)
 		}
+		return dir
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod base dir: %v", err)
 	}
 	return dir
 }
@@ -288,7 +295,7 @@ func TestCobrowseSession_SweepReapsOrphans(t *testing.T) {
 		t.Fatalf("mkdir orphan: %v", err)
 	}
 	// Owner PID 424241 is a dead process (unused), so the dir is a real orphan.
-	writeSessionPidfile(orphan, 424241, 424242, 424243)
+	writeSessionPidfile(orphan, 424241, 424242, 424243, 0)
 
 	var killed []int
 	prevKiller := pidKiller
@@ -317,7 +324,7 @@ func TestCobrowseSession_SweepReapsOrphans(t *testing.T) {
 // TestCobrowseSession_PidfileRoundTrip pins the pidfile format the sweep depends on.
 func TestCobrowseSession_PidfileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	writeSessionPidfile(dir, 111, 222, 333)
+	writeSessionPidfile(dir, 111, 222, 333, 0)
 	o, b, x := readSessionPidfile(dir)
 	if o != 111 || b != 222 || x != 333 {
 		t.Errorf("pidfile round-trip mismatch: got (%d,%d,%d) want (111,222,333)", o, b, x)
@@ -342,7 +349,7 @@ func TestCobrowseSession_SweepSkipsLiveOwner(t *testing.T) {
 	// Use the parent process PID as the owner: it is alive for the duration of the
 	// test and differs from our own PID, so it models a live SIBLING worker (the
 	// sweep deliberately does not skip its own PID, only other live processes).
-	writeSessionPidfile(live, os.Getppid(), 515151, 515152)
+	writeSessionPidfile(live, os.Getppid(), 515151, 515152, 0)
 
 	var killed []int
 	prevKiller := pidKiller
@@ -432,7 +439,7 @@ func TestCobrowseSession_SweepVerifiesIdentityBeforeKill(t *testing.T) {
 	// in for "recycled to some unrelated process" (e.g. sshd) since the reboot.
 	const recycledBrowserPID = 909001
 	const recycledXvfbPID = 909002
-	writeSessionPidfile(orphan, 424241, recycledBrowserPID, recycledXvfbPID)
+	writeSessionPidfile(orphan, 424241, recycledBrowserPID, recycledXvfbPID, 0)
 
 	var killed []int
 	prevKiller := pidKiller
@@ -474,7 +481,7 @@ func TestCobrowseSession_SweepSkipsKillWhenCmdlineUnreadable(t *testing.T) {
 	if err := os.MkdirAll(orphan, 0o700); err != nil {
 		t.Fatalf("mkdir orphan: %v", err)
 	}
-	writeSessionPidfile(orphan, 424241, 909003, 909004)
+	writeSessionPidfile(orphan, 424241, 909003, 909004, 0)
 
 	var killed []int
 	prevKiller := pidKiller
@@ -560,7 +567,7 @@ func TestCobrowseSession_SweepRefusesUntrustedBaseDir(t *testing.T) {
 	if err := os.MkdirAll(orphan, 0o700); err != nil {
 		t.Fatalf("mkdir orphan: %v", err)
 	}
-	writeSessionPidfile(orphan, 424241, 909005, 909006)
+	writeSessionPidfile(orphan, 424241, 909005, 909006, 0)
 	installMatchingCmdlineReader(t) // would match/kill if sweep got this far
 
 	var killed []int

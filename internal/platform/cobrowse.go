@@ -118,6 +118,14 @@ type cobrowseLaunchOptions struct {
 	// and record the other participants. Left false for co-browse (a human drives
 	// it and supplies the gesture).
 	autoplayNoUserGesture bool
+	// headless runs Chrome/Edge in new headless mode (--headless=new) with a
+	// fixed window size instead of a maximized headed window. Used by the
+	// Windows runner so a session never takes over the user's screen or focus;
+	// the screencast viewer shows it instead. Left false on the Linux Xvfb path,
+	// whose argument list is unchanged.
+	headless bool
+	// windowSize is "W,H" for --window-size, applied only when headless.
+	windowSize string
 }
 
 // stealthEnabled resolves whether stealth launch flags should be applied,
@@ -172,7 +180,14 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		"--user-data-dir=" + opts.profileDir,
 		"--no-first-run",
 		"--no-default-browser-check",
-		"--start-maximized",
+	}
+	if opts.headless {
+		args = append(args, "--headless=new")
+		if opts.windowSize != "" {
+			args = append(args, "--window-size="+opts.windowSize)
+		}
+	} else {
+		args = append(args, "--start-maximized")
 	}
 
 	if opts.stealth {
@@ -313,9 +328,14 @@ func GetCobrowseManager() *CobrowseManager {
 	return cobrowseManager
 }
 
-// findChromium returns the first available Chromium/Chrome binary, reusing the
-// same preference order as platform.OpenURL.
-func findChromium() (string, error) {
+// findChromium returns the first available Chromium/Chrome binary. On Linux and
+// macOS it reuses the same PATH preference order as platform.OpenURL
+// (findChromiumOnPath); on Windows it runs the install-location discovery in
+// cobrowse_discovery.go, because Chrome and Edge are rarely on PATH there.
+func findChromium() (string, error) { return findChromiumForOS() }
+
+// findChromiumOnPath is the historical PATH-only lookup.
+func findChromiumOnPath() (string, error) {
 	for _, name := range []string{"google-chrome", "chromium", "chromium-browser", "chrome"} {
 		if isCommandAvailable(name) {
 			return name, nil
