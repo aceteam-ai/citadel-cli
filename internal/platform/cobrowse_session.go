@@ -683,7 +683,17 @@ func ensureCobrowseBaseDir(dir string) error {
 				_ = os.Remove(dir)
 				return err
 			}
-			return nil
+			// MkdirAll also succeeds if another process created the dir in
+			// the meantime, with whatever mode or owner it chose, so check
+			// what is actually there before trusting it.
+			info, err = os.Lstat(dir)
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("cobrowse base dir %s exists and is not a directory", dir)
+			}
+			return validateCobrowseBaseDirPerms(dir, info)
 		}
 		return err
 	}
@@ -753,3 +763,10 @@ func sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
 	}
 	_ = pidKiller(pid)
 }
+
+// EnsurePrivateDir creates dir private to the current user, or verifies an
+// existing one, with the same rules as the co-browse session base dir: owner
+// only and not group/other-writable on Unix; owned by the user with a
+// protected owner-only DACL on Windows. An existing dir that fails is refused,
+// never repaired. Local mode keeps its viewer token and audit log in such dirs.
+func EnsurePrivateDir(dir string) error { return ensureCobrowseBaseDir(dir) }

@@ -16,7 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
+	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
@@ -25,10 +27,14 @@ import (
 type localCobrowseRuntime struct {
 	svc *localcobrowse.Service
 
-	mu    sync.Mutex
-	owner *localcobrowse.Owner
-	guard *localcobrowse.EgressGuard
-	stop  chan struct{}
+	mu     sync.Mutex
+	owner  *localcobrowse.Owner
+	guard  *localcobrowse.EgressGuard
+	viewer *localviewer.Server
+	stop   chan struct{}
+
+	// viewerFactory builds the loopback viewer on first need; nil disables it.
+	viewerFactory func() (*localviewer.Server, error)
 }
 
 // localCobrowseOptions customizes the runtime; zero values are production.
@@ -43,6 +49,10 @@ type localCobrowseOptions struct {
 	viewerPorts func() []int
 	onAttention func(id, reason string)
 	onEvent     func(localcobrowse.Event)
+	// viewer enables the loopback viewer (production). openURL overrides the
+	// default-browser opener (tests).
+	viewer  bool
+	openURL func(string) error
 }
 
 func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
@@ -52,13 +62,40 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	if browser == nil {
 		manager = platform.NewCobrowseSessionManager(platform.DefaultCobrowseSessionsBaseDir(), localcobrowse.DefaultMaxSessions)
 		browser = manager
+	} else if m, ok := browser.(*platform.CobrowseSessionManager); ok {
+		manager = m
+	}
+	viewerPorts, onAttention, viewerNote := opts.viewerPorts, opts.onAttention, ""
+	if opts.viewer {
+		openURL := opts.openURL
+		if openURL == nil {
+			openURL = platform.OpenURL
+		}
+		rt.viewerFactory = func() (*localviewer.Server, error) {
+			cfg := localviewer.Config{Service: rt.svc, OpenURL: openURL}
+			if manager != nil {
+				cfg.Stream = cobrowsestream.NewManagerSessionFrom(manager)
+			}
+			if opts.ownerDir != nil {
+				cfg.TokenDir = opts.ownerDir()
+			}
+			v := localviewer.New(cfg)
+			if err := v.Start(); err != nil {
+				return nil, err
+			}
+			return v, nil
+		}
+		viewerPorts = rt.viewerPorts
+		onAttention = rt.attention
+		viewerNote = "The Citadel viewer opens in the user's default browser, where they watch, approve and take control. If it is closed, they can run `citadel local viewer`."
 	}
 	rt.svc = localcobrowse.New(localcobrowse.Config{
 		Browser:     browser,
 		URLPolicy:   opts.policy,
-		ViewerPorts: opts.viewerPorts,
-		OnAttention: opts.onAttention,
+		ViewerPorts: viewerPorts,
+		OnAttention: onAttention,
 		OnEvent:     opts.onEvent,
+		ViewerNote:  viewerNote,
 		AcquireOwner: func() error {
 			if opts.ownerDir == nil {
 				return nil
@@ -105,6 +142,54 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	return rt
 }
 
+// ensureViewer starts the loopback viewer once.
+func (rt *localCobrowseRuntime) ensureViewer() *localviewer.Server {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.viewer != nil || rt.viewerFactory == nil {
+		return rt.viewer
+	}
+	select {
+	case <-rt.stop:
+		return nil
+	default:
+	}
+	v, err := rt.viewerFactory()
+	if err != nil {
+		Debug("local viewer failed to start: %v", err)
+		return nil
+	}
+	rt.viewer = v
+	return v
+}
+
+// attention is the service's OnAttention hook: start the viewer if needed and
+// show it to the user.
+func (rt *localCobrowseRuntime) attention(id, reason string) {
+	if v := rt.ensureViewer(); v != nil {
+		v.Attention(id, reason)
+	}
+}
+
+// viewerPorts reports the viewer's port so the address filter refuses it.
+func (rt *localCobrowseRuntime) viewerPorts() []int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.viewer == nil {
+		return nil
+	}
+	return []int{rt.viewer.Port()}
+}
+
+// openViewer opens a fresh viewer link (starting the viewer if needed).
+func (rt *localCobrowseRuntime) openViewer() error {
+	v := rt.ensureViewer()
+	if v == nil {
+		return fmt.Errorf("the local viewer is not available")
+	}
+	return v.Open()
+}
+
 // setAgent records the MCP client name from initialize.
 func (rt *localCobrowseRuntime) setAgent(name string) {
 	rt.svc.SetAgent(name)
@@ -126,9 +211,12 @@ func (rt *localCobrowseRuntime) close() {
 	}
 	_ = rt.svc.Close()
 	rt.mu.Lock()
-	o, g := rt.owner, rt.guard
-	rt.owner, rt.guard = nil, nil
+	o, g, v := rt.owner, rt.guard, rt.viewer
+	rt.owner, rt.guard, rt.viewer = nil, nil, nil
 	rt.mu.Unlock()
+	if v != nil {
+		v.Close()
+	}
 	if g != nil {
 		g.Close()
 	}

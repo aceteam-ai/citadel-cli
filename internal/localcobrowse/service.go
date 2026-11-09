@@ -117,6 +117,9 @@ type Config struct {
 	OnAttention func(sessionID, reason string)
 	// OnEvent receives every call outcome, including refusals.
 	OnEvent func(Event)
+	// ViewerNote is returned in local_cobrowse_start's "viewer" field: where
+	// the user watches and approves. It never contains a secret.
+	ViewerNote string
 }
 
 // grantState is one session's consent record.
@@ -127,11 +130,14 @@ type grantState struct {
 }
 
 type session struct {
-	id            string
-	goal          string
-	startedAt     time.Time
-	lastActive    time.Time
-	grant         grantState
+	id         string
+	goal       string
+	startedAt  time.Time
+	lastActive time.Time
+	grant      grantState
+	// approvalAsked is set when a write was refused for lack of a grant, so
+	// the viewer shows the approval card; any human answer clears it.
+	approvalAsked bool
 	handoffAt     time.Time
 	handoffReason string
 	stoppedReason string
@@ -349,6 +355,7 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 		Browser:   st.Browser,
 		Lifetime:  LifetimePolicy,
 		Writes:    "navigate, click, type, select, key and scroll need the user's approval in the Citadel viewer",
+		Viewer:    s.cfg.ViewerNote,
 	}, nil
 }
 
@@ -453,6 +460,12 @@ func (s *Service) gateWrite(id string, navigation bool) error {
 	}
 	s.mu.Unlock()
 	if errors.Is(gateErr, ErrApprovalRequired) || errors.Is(gateErr, ErrApprovalExpired) {
+		s.mu.Lock()
+		if !ss.approvalAsked {
+			ss.approvalAsked = true
+			s.notifyLocked()
+		}
+		s.mu.Unlock()
 		s.attention(id, "approval")
 	}
 	return gateErr
@@ -697,14 +710,16 @@ func (s *Service) Screenshot(ctx context.Context, id, goal string) (string, erro
 
 // SessionView is one session's status.
 type SessionView struct {
-	SessionID      string `json:"session_id"`
-	State          string `json:"state"`
-	Driver         string `json:"driver"`
-	URL            string `json:"url,omitempty"`
-	Browser        string `json:"browser,omitempty"`
-	Goal           string `json:"goal,omitempty"`
-	StartedAt      string `json:"started_at"`
-	Approval       string `json:"approval"`
+	SessionID string `json:"session_id"`
+	State     string `json:"state"`
+	Driver    string `json:"driver"`
+	URL       string `json:"url,omitempty"`
+	Browser   string `json:"browser,omitempty"`
+	Goal      string `json:"goal,omitempty"`
+	StartedAt string `json:"started_at"`
+	Approval  string `json:"approval"`
+	// ApprovalAsked is true while an agent write is waiting for an answer.
+	ApprovalAsked  bool   `json:"approval_asked,omitempty"`
 	GrantExpiresAt string `json:"grant_expires_at,omitempty"`
 	HandoffSince   string `json:"handoff_since,omitempty"`
 	HandoffReason  string `json:"handoff_reason,omitempty"`
@@ -731,14 +746,15 @@ func (s *Service) agentViewLocked(ss *session, st platform.CobrowseSessionStatus
 
 func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now time.Time) SessionView {
 	v := SessionView{
-		SessionID: ss.id,
-		State:     string(st.State),
-		Driver:    string(st.Driver),
-		URL:       st.URL,
-		Browser:   st.Browser,
-		Goal:      ss.goal,
-		StartedAt: ss.startedAt.UTC().Format(time.RFC3339),
-		Lifetime:  LifetimePolicy,
+		SessionID:     ss.id,
+		State:         string(st.State),
+		Driver:        string(st.Driver),
+		URL:           st.URL,
+		Browser:       st.Browser,
+		Goal:          ss.goal,
+		StartedAt:     ss.startedAt.UTC().Format(time.RFC3339),
+		Lifetime:      LifetimePolicy,
+		ApprovalAsked: ss.approvalAsked,
 	}
 	switch g := ss.grant; {
 	case g.denied:
@@ -1030,6 +1046,7 @@ func (s *Service) setGrant(id, action string, f func(*grantState, time.Time)) er
 	ss, ok := s.sessions[id]
 	if ok {
 		f(&ss.grant, s.cfg.Now())
+		ss.approvalAsked = false
 		s.notifyLocked()
 	}
 	s.mu.Unlock()

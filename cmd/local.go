@@ -7,6 +7,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +16,9 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 )
 
@@ -42,9 +45,53 @@ Point your harness at it with the absolute path to citadel, for example:
 	RunE: runLocalMCP,
 }
 
+var localViewerPrint bool
+
+var localViewerCmd = &cobra.Command{
+	Use:   "viewer",
+	Short: "Open the local co-browse viewer in your default browser",
+	Long: `Asks the running Citadel local co-browse (started by your agent app) for a
+fresh one-time viewer link and opens it in your default browser. The link
+works once and expires after two minutes. Use --print to show it instead.`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runLocalViewer(cmd.Context(), network.GetNodeConfigDir(), localViewerPrint, platform.OpenURL, cmd.OutOrStdout())
+	},
+}
+
+func runLocalViewer(ctx context.Context, dir string, printOnly bool, open func(string) error, out io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	link, file, err := localviewer.RequestLaunch(ctx, dir, nil)
+	if err != nil {
+		return err
+	}
+	if printOnly {
+		fmt.Fprintln(out, link)
+		return nil
+	}
+	// Open the one-time launch file, never the link itself, so the code does
+	// not appear on a command line other local users can read.
+	if file == "" {
+		fmt.Fprintln(out, "Open this link in your browser (it works once, for two minutes):")
+		fmt.Fprintln(out, link)
+		return nil
+	}
+	if err := open(file); err != nil {
+		fmt.Fprintln(out, "Could not open a browser; open this link (it works once, for two minutes):")
+		fmt.Fprintln(out, link)
+		return nil
+	}
+	fmt.Fprintln(out, "Opened the Citadel viewer in your default browser.")
+	return nil
+}
+
 func init() {
 	rootCmd.AddCommand(localCmd)
 	localCmd.AddCommand(localMCPCmd)
+	localViewerCmd.Flags().BoolVar(&localViewerPrint, "print", false, "print the one-time link instead of opening it")
+	localCmd.AddCommand(localViewerCmd)
 }
 
 // errLocalModeNoBackend is what the local-only bridge's HTTP client returns if
@@ -79,7 +126,7 @@ func newLocalOnlyBridge(tools []localMCPTool, rt *localCobrowseRuntime, in io.Re
 
 func runLocalMCP(cmd *cobra.Command, args []string) error {
 	debugToStderr = true
-	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: network.GetNodeConfigDir})
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: network.GetNodeConfigDir, viewer: true})
 	defer rt.close()
 
 	// A harness usually stops its MCP server by closing stdin, which ends run.
