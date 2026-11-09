@@ -23,10 +23,10 @@ func fixedResolver(m map[string][]string) Resolver {
 
 func TestURLPolicy(t *testing.T) {
 	policy := NewURLPolicy(fixedResolver(map[string][]string{
-		"public.test":   {"93.184.216.34"},
-		"mixed.test":    {"93.184.216.34", "10.1.2.3"},
+		"public.test":   {"203.0.113.10"},
+		"mixed.test":    {"203.0.113.10", "10.1.2.3"},
 		"rebind.test":   {"127.0.0.1"},
-		"v6public.test": {"2606:2800:220:1::1"},
+		"v6public.test": {"2a01:4f8::1"},
 		"v6ula.test":    {"fd00::1"},
 	}), func() []int { return []int{43117} })
 
@@ -35,8 +35,8 @@ func TestURLPolicy(t *testing.T) {
 		"http://public.test:8080/path?q=1",
 		"https://v6public.test/",
 		"about:blank",
-		"http://93.184.216.34/",
-		"https://[2606:2800:220:1::1]/",
+		"http://203.0.113.10/",
+		"https://[2a01:4f8::1]/",
 	}
 	for _, u := range allowed {
 		if err := policy(context.Background(), u); err != nil {
