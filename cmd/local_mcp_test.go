@@ -18,10 +18,11 @@ import (
 
 // cmdFakeBrowser is a minimal localcobrowse.Browser for bridge tests.
 type cmdFakeBrowser struct {
-	mu    sync.Mutex
-	n     int
-	human map[string]bool
-	live  map[string]bool
+	mu     sync.Mutex
+	clicks int
+	n      int
+	human  map[string]bool
+	live   map[string]bool
 }
 
 func newCmdFakeBrowser() *cmdFakeBrowser {
@@ -84,7 +85,13 @@ func (f *cmdFakeBrowser) NavigateAsHuman(id, _ string) (platform.CobrowseSession
 	return f.st(id), nil
 }
 func (f *cmdFakeBrowser) Click(id, _ string, _, _ *float64) (platform.CobrowseSessionStatus, error) {
-	return f.ok(id)
+	st, err := f.ok(id)
+	if err == nil {
+		f.mu.Lock()
+		f.clicks++
+		f.mu.Unlock()
+	}
+	return st, err
 }
 func (f *cmdFakeBrowser) Type(id, _ string) (platform.CobrowseSessionStatus, error) { return f.ok(id) }
 func (f *cmdFakeBrowser) Select(id, _, v, l string) (platform.SelectResult, error) {

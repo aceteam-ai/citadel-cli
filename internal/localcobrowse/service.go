@@ -90,6 +90,11 @@ type Event struct {
 	TextLen   int // type: length only, never the text
 	Outcome   string
 	Error     string
+	// Agent is the connected MCP client's name at the time of the call.
+	Agent string
+	// PendingSeq is the audit seq of this write's pending record, set on
+	// the outcome event.
+	PendingSeq int64
 }
 
 // Config configures a Service. Zero values take the local-mode defaults.
@@ -108,6 +113,13 @@ type Config struct {
 	ViewerPorts func() []int
 	// Now is the clock; nil uses time.Now.
 	Now func() time.Time
+	// BeforeAction is called after a write passes its gates and before it
+	// reaches the browser; an error refuses the write. The owner records a
+	// pending audit record here, so a write never runs unrecorded.
+	BeforeAction func(Event) (pendingSeq int64, err error)
+	// Precheck runs before every co-browse call; an error refuses the call.
+	// The owner uses it to fail closed when the audit log cannot be written.
+	Precheck func() error
 	// AcquireOwner is called before the first session starts. A non-nil error
 	// (another process already owns co-browse for this user) refuses every
 	// local_cobrowse_* call. Nil means no single-instance check.
@@ -213,6 +225,9 @@ func (s *Service) notifyLocked() {
 }
 
 func (s *Service) emit(ev Event) {
+	if ev.Agent == "" {
+		ev.Agent = s.Agent()
+	}
 	if s.cfg.OnEvent != nil {
 		s.cfg.OnEvent(ev)
 	}
@@ -225,8 +240,18 @@ func (s *Service) attention(id, reason string) {
 }
 
 // ensureOwner acquires the single-instance owner lock once.
-func (s *Service) ensureOwner() error {
+func (s *Service) ensureOwner() error { return s.ensureOwnerFor(false) }
+
+// ensureOwnerFor skips Precheck for the human's safety controls (stop, take
+// control): an audit failure must never leave the user unable to stop or take
+// over a live session.
+func (s *Service) ensureOwnerFor(humanSafety bool) error {
 	// ownerMu, not mu: AcquireOwner may call back into the service (Agent).
+	if s.cfg.Precheck != nil && !humanSafety {
+		if err := s.cfg.Precheck(); err != nil {
+			return err
+		}
+	}
 	s.ownerMu.Lock()
 	defer s.ownerMu.Unlock()
 	if s.owned {
@@ -392,8 +417,10 @@ func isRefusal(err error) bool {
 }
 
 // lookup returns a tracked session, reaping idle ones first and touching it.
-func (s *Service) lookup(id string) (*session, error) {
-	if err := s.ensureOwner(); err != nil {
+func (s *Service) lookup(id string) (*session, error) { return s.lookupFor(id, false) }
+
+func (s *Service) lookupFor(id string, humanSafety bool) (*session, error) {
+	if err := s.ensureOwnerFor(humanSafety); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -589,6 +616,9 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 		if err := s.gateWrite(id, true); err != nil {
 			return ActionResult{}, err
 		}
+		if err := s.beforeAction(&ev); err != nil {
+			return ActionResult{}, err
+		}
 		before := s.currentURL(id)
 		if _, err := s.cfg.Browser.Navigate(id, url); err != nil {
 			return ActionResult{}, err
@@ -606,7 +636,7 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 // Click clicks an element or a viewport point (W).
 func (s *Service) Click(ctx context.Context, id, selector string, x, y *float64, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "click", Class: "W", Goal: goal, Selector: selector}
-	res, err := s.writeAction(ctx, id, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		_, err := s.cfg.Browser.Click(id, selector, x, y)
 		return err
 	})
@@ -617,7 +647,7 @@ func (s *Service) Click(ctx context.Context, id, selector string, x, y *float64,
 // Type inserts text into the focused element (W). Only its length is audited.
 func (s *Service) Type(ctx context.Context, id, text, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "type", Class: "W", Goal: goal, TextLen: len([]rune(text))}
-	res, err := s.writeAction(ctx, id, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		_, err := s.cfg.Browser.Type(id, text)
 		return err
 	})
@@ -629,7 +659,7 @@ func (s *Service) Type(ctx context.Context, id, text, goal string) (ActionResult
 func (s *Service) Select(ctx context.Context, id, selector, value, label, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "select", Class: "W", Goal: goal, Selector: selector}
 	var picked platform.SelectResult
-	res, err := s.writeAction(ctx, id, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		var err error
 		picked, err = s.cfg.Browser.Select(id, selector, value, label)
 		return err
@@ -642,7 +672,7 @@ func (s *Service) Select(ctx context.Context, id, selector, value, label, goal s
 // Key presses one key (W).
 func (s *Service) Key(ctx context.Context, id, key, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "key", Class: "W", Goal: goal}
-	res, err := s.writeAction(ctx, id, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		_, err := s.cfg.Browser.Key(id, key)
 		return err
 	})
@@ -653,7 +683,7 @@ func (s *Service) Key(ctx context.Context, id, key, goal string) (ActionResult, 
 // Scroll scrolls at an element or point (W).
 func (s *Service) Scroll(ctx context.Context, id, selector string, x, y *float64, dx, dy float64, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "scroll", Class: "W", Goal: goal, Selector: selector}
-	res, err := s.writeAction(ctx, id, func() error {
+	res, err := s.writeAction(ctx, &ev, func() error {
 		_, err := s.cfg.Browser.Scroll(id, selector, x, y, dx, dy)
 		return err
 	})
@@ -661,8 +691,31 @@ func (s *Service) Scroll(ctx context.Context, id, selector string, x, y *float64
 	return res, err
 }
 
-func (s *Service) writeAction(ctx context.Context, id string, do func() error) (ActionResult, error) {
+// beforeAction records the pending event and stores its seq on ev, so the
+// outcome record links back to it.
+func (s *Service) beforeAction(ev *Event) error {
+	if s.cfg.BeforeAction == nil {
+		return nil
+	}
+	pending := *ev
+	pending.Outcome = "pending"
+	if pending.Agent == "" {
+		pending.Agent = s.Agent()
+	}
+	seq, err := s.cfg.BeforeAction(pending)
+	if err != nil {
+		return err
+	}
+	ev.PendingSeq = seq
+	return nil
+}
+
+func (s *Service) writeAction(ctx context.Context, ev *Event, do func() error) (ActionResult, error) {
+	id := ev.SessionID
 	if err := s.gateWrite(id, false); err != nil {
+		return ActionResult{}, err
+	}
+	if err := s.beforeAction(ev); err != nil {
 		return ActionResult{}, err
 	}
 	before := s.currentURL(id)
@@ -862,7 +915,11 @@ func (s *Service) Resume(ctx context.Context, id string) (SessionView, error) {
 }
 
 func (s *Service) setDriver(id string, human bool, reason string) (SessionView, error) {
-	ss, err := s.lookup(id)
+	return s.setDriverFor(id, human, reason, false)
+}
+
+func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety bool) (SessionView, error) {
+	ss, err := s.lookupFor(id, humanSafety)
 	if err != nil {
 		return SessionView{}, err
 	}
@@ -898,8 +955,10 @@ func (s *Service) Stop(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *Service) stop(id, reason string) error {
-	if _, err := s.lookup(id); err != nil {
+func (s *Service) stop(id, reason string) error { return s.stopFor(id, reason, false) }
+
+func (s *Service) stopFor(id, reason string, humanSafety bool) error {
+	if _, err := s.lookupFor(id, humanSafety); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -1018,6 +1077,15 @@ func (s *Service) wait(ctx context.Context, id, until string, timeout time.Durat
 	}
 }
 
+// RecordRefusal records a call refused before it reached the service, such as
+// malformed tool arguments, so every refusal is audited.
+func (s *Service) RecordRefusal(sessionID, action, class string, err error) {
+	if err == nil {
+		return
+	}
+	s.emit(Event{SessionID: sessionID, Action: action, Class: class, Outcome: "refused", Error: err.Error()})
+}
+
 // --- Human side. Only the local viewer calls these; they are never reachable
 // through the MCP tool path.
 
@@ -1061,7 +1129,7 @@ func (s *Service) setGrant(id, action string, f func(*grantState, time.Time)) er
 
 // HumanTakeControl gives the user the browser (viewer "Take control").
 func (s *Service) HumanTakeControl(id string) error {
-	_, err := s.setDriver(id, true, "taken by the user")
+	_, err := s.setDriverFor(id, true, "taken by the user", true)
 	s.finish(Event{SessionID: id, Action: "take_control", Class: "H"}, err)
 	return err
 }
@@ -1075,7 +1143,7 @@ func (s *Service) HumanHandBack(id string) error {
 
 // HumanStop ends a session from the viewer.
 func (s *Service) HumanStop(id string) error {
-	err := s.stop(id, "stopped by the user")
+	err := s.stopFor(id, "stopped by the user", true)
 	s.finish(Event{SessionID: id, Action: "stop", Class: "H"}, err)
 	return err
 }

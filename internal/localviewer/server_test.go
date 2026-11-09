@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse/fakebrowser"
 )
@@ -345,5 +346,23 @@ func TestOpenExchangeDropsOldViewers(t *testing.T) {
 	u, _ := url.Parse(h.srv.MintURL())
 	if r := h.do(t, "GET", u.RequestURI(), nil, false); r.StatusCode != 200 {
 		t.Fatalf("exchange: %d", r.StatusCode)
+	}
+}
+
+func TestActivityEndpoint(t *testing.T) {
+	h := newHarness(t)
+	h.srv.cfg.Activity = func(session string, limit int) ([]localaudit.Record, error) {
+		return []localaudit.Record{{Seq: 1, SessionID: session, Actor: "agent", IntendedAction: "click", ResultingAction: "ok"}}, nil
+	}
+	if r := h.do(t, "GET", "/api/activity?session=cb-9", nil, false); r.StatusCode != http.StatusForbidden {
+		t.Fatalf("activity needs the cookie: %d", r.StatusCode)
+	}
+	if r := h.do(t, "GET", "/api/activity?session=cb-9", nil, true); r.StatusCode != http.StatusForbidden {
+		t.Fatalf("activity needs the viewer token too: %d", r.StatusCode)
+	}
+	r := h.do(t, "GET", "/api/activity?session=cb-9", map[string]string{csrfHeader: h.srv.bearer}, true)
+	body, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 || !strings.Contains(string(body), `"session_id":"cb-9"`) {
+		t.Fatalf("activity: %d %s", r.StatusCode, body)
 	}
 }

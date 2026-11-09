@@ -200,6 +200,41 @@
     }
   });
 
+  function hostPath(u) {
+    try { const x = new URL(u); return x.host + x.pathname; } catch (e) { return u || ""; }
+  }
+
+  async function pollActivity() {
+    if (!selected) return;
+    try {
+      const r = await fetch("/api/activity?session=" + encodeURIComponent(selected), { credentials: "same-origin", headers: { "X-Citadel-CSRF": csrf } });
+      if (!r.ok) return;
+      const recs = (await r.json()).records || [];
+      const ol = $("activity");
+      ol.replaceChildren();
+      for (const rec of recs.slice().reverse()) {
+        const li = document.createElement("li");
+        const t = document.createElement("span");
+        t.className = "t";
+        t.textContent = new Date(rec.created_at).toLocaleTimeString();
+        const who = document.createElement("span");
+        who.className = "who";
+        who.textContent = rec.actor === "user" ? "You" : (rec.agent || "Agent");
+        const what = document.createElement("span");
+        let detail = rec.url ? hostPath(rec.url) : (rec.selector || "");
+        if (rec.text_len) detail = rec.text_len + " characters";
+        what.textContent = rec.intended_action + (detail ? " " + detail : "");
+        const out = document.createElement("span");
+        out.textContent = rec.resulting_action + (rec.error ? ": " + rec.error : "");
+        if (rec.resulting_action === "refused" || rec.resulting_action === "error") out.className = "refused";
+        li.append(t, who, what, out);
+        ol.appendChild(li);
+      }
+    } catch (e) { /* owner gone; poll shows it */ }
+  }
+
   poll();
   setInterval(poll, 1000);
+  pollActivity();
+  setInterval(pollActivity, 2000);
 })();
