@@ -306,7 +306,8 @@ func fixtureServer(t *testing.T) *httptest.Server {
 		case "/two":
 			fmt.Fprint(w, `<!doctype html><title>two</title><h1 id="t">Fixture page two</h1>`)
 		default:
-			fmt.Fprint(w, `<!doctype html><title>one</title><h1 id="t">Fixture page one</h1><a id="next" href="/two">next</a>`)
+			fmt.Fprint(w, `<!doctype html><title>one</title><h1 id="t">Fixture page one</h1><a id="next" href="/two">next</a>`+
+				`<input id="pw" type="password" value="fixture-secret"><p id="long">`+strings.Repeat("x", 500)+`</p>`)
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -347,6 +348,16 @@ func TestWindowsRealBrowserSession(t *testing.T) {
 	raw, err := base64.StdEncoding.DecodeString(png)
 	if err != nil || !bytes.HasPrefix(raw, []byte("\x89PNG")) {
 		t.Fatalf("screenshot is not a PNG (err %v)", err)
+	}
+	if _, err := m.ExtractBounded(st.ID, "#pw", []string{"value"}, 100); !errors.Is(err, ErrPasswordValue) {
+		t.Fatalf("password value must be refused by a real browser, got %v", err)
+	}
+	long, err := m.ExtractBounded(st.ID, "#long", nil, 50)
+	if err != nil || len(long.Text) != 50 || !long.Truncated {
+		t.Fatalf("bounded extract: len=%d truncated=%v err=%v", len(long.Text), long.Truncated, err)
+	}
+	if ps, err := m.PageState(st.ID); err != nil || ps.ReadyState != "complete" {
+		t.Fatalf("page state: %+v %v", ps, err)
 	}
 	if _, err := m.Navigate(st.ID, srv.URL+"/two"); err != nil {
 		t.Fatalf("navigate: %v", err)

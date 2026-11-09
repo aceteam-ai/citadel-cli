@@ -115,7 +115,13 @@ jobs:
           cache: true
 
       - name: go vet (local-mode packages)
-        run: go vet ./internal/platform/
+        run: go vet ./internal/platform/ ./internal/localcobrowse/
+
+      - name: Local co-browse service and owner lock
+        run: go test ./internal/localcobrowse/ -count=1
+
+      - name: citadel local mcp (stdio JSON-RPC)
+        run: go test ./cmd/ -count=1 -run '^(TestLocalMCP|TestLocalMode|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide)'
 
       - name: Unit tests (Windows-portable subset)
         run: >-
