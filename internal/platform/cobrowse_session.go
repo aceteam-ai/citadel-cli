@@ -199,6 +199,17 @@ func GetCobrowseSessionManager() *CobrowseSessionManager {
 	return cobrowseSessionManager
 }
 
+// NewCobrowseSessionManager returns an isolated manager (not the process-wide
+// singleton) rooted at baseDir with its own session cap. Local mode
+// (internal/localcobrowse) uses it so its stricter cap does not depend on
+// EnvCobrowseMaxSessions.
+func NewCobrowseSessionManager(baseDir string, maxSessions int) *CobrowseSessionManager {
+	return newCobrowseSessionManager(baseDir, maxSessions)
+}
+
+// DefaultCobrowseSessionsBaseDir is the per-OS parent of session working dirs.
+func DefaultCobrowseSessionsBaseDir() string { return defaultCobrowseSessionsBaseDir() }
+
 // newCobrowseSessionManager constructs a manager rooted at baseDir with the given
 // cap. Split out so tests get an isolated manager (own temp baseDir) instead of
 // mutating the process-wide singleton and clobbering the operator's real sessions.

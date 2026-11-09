@@ -737,3 +737,68 @@ func TestCobrowseSessionActions_SelectorEmbeddingIsSafe(t *testing.T) {
 		t.Errorf("round-trip mismatch: got %q, want %q", decoded, tricky)
 	}
 }
+
+func TestCobrowseSessionActions_ExtractBoundedPasswordAndTruncation(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	var lastExpr string
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		lastExpr = expr
+		return map[string]any{"password": true}
+	}
+	f.mu.Unlock()
+	if _, err := m.ExtractBounded(st.ID, "#pw", []string{"value"}, 100); !errors.Is(err, ErrPasswordValue) {
+		t.Fatalf("password value must be refused, got %v", err)
+	}
+	if !strings.Contains(lastExpr, `"password"`) || !strings.Contains(lastExpr, "var max = 100;") {
+		t.Fatalf("bounded extract script missing the password guard or the limit: %s", lastExpr)
+	}
+
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		return map[string]any{"text": "abc", "attrs": map[string]any{}, "truncated": true}
+	}
+	f.mu.Unlock()
+	got, err := m.ExtractBounded(st.ID, "main", nil, 3)
+	if err != nil || got.Text != "abc" || !got.Truncated {
+		t.Fatalf("bounded extract: %+v err %v", got, err)
+	}
+}
+
+func TestCobrowseSessionActions_PageStateRefusedWhileHandedOff(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any { return map[string]any{"url": "http://x.test/", "ready": "complete"} }
+	f.mu.Unlock()
+	ps, err := m.PageState(st.ID)
+	if err != nil || ps.URL != "http://x.test/" || ps.ReadyState != "complete" {
+		t.Fatalf("page state: %+v err %v", ps, err)
+	}
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.PageState(st.ID); !errors.Is(err, ErrHandedOff) {
+		t.Fatalf("page state must be refused while handed off, got %v", err)
+	}
+}
+
+func TestCobrowseSessionActions_NavigateAsHumanValidatesURL(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	before := len(f.calls)
+	f.mu.Unlock()
+	for _, bad := range []string{"file:///etc/passwd", "javascript:alert(1)", "-x", "chrome://settings"} {
+		if _, err := m.NavigateAsHuman(st.ID, bad); !errors.Is(err, ErrCobrowseURLNotAllowed) {
+			t.Errorf("%q: want ErrCobrowseURLNotAllowed, got %v", bad, err)
+		}
+	}
+	f.mu.Lock()
+	after := len(f.calls)
+	f.mu.Unlock()
+	if after != before {
+		t.Fatal("a refused URL reached CDP")
+	}
+}

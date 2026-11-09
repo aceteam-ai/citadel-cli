@@ -131,6 +131,18 @@ control center. All other subcommands are for scripting and advanced use.`,
 		// Private control-plane trust must be installed before the updater,
 		// device auth, or Tailscale performs the process's first TLS root load.
 		// Go caches that pool, so doing this later cannot repair userspace tsnet.
+		// `citadel local ...` makes no outbound calls by default (aceteam#13503
+		// decision 4): no CA trust preparation, no interrupted-update repair,
+		// no update check. Debug output still goes to stderr above.
+		if isLocalModeCommand(cmd) {
+			network.SetLogf(Debug)
+			if noColorGlobal || os.Getenv("NO_COLOR") != "" {
+				color.NoColor = true
+			}
+			Log("command: %s", invocationSummary(cmd, args))
+			return
+		}
+
 		if err := preparePrivateCATrust(cmd); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: configure private CA trust: %v\n", err)
 			os.Exit(1)
@@ -218,6 +230,17 @@ control center. All other subcommands are for scripting and advanced use.`,
 			checkForUpdateOnStartupFn(isTUIContext)
 		}
 	},
+}
+
+// isLocalModeCommand reports whether cmd is `citadel local` or one of its
+// subcommands.
+func isLocalModeCommand(cmd *cobra.Command) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		if c.Name() == "local" && c.Parent() != nil && c.Parent().Parent() == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func isMemoryHookCommand(cmd *cobra.Command) bool {
