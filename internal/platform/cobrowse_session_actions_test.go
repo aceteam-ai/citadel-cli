@@ -43,7 +43,7 @@ import (
 func installFixedPortLauncher(t *testing.T, port int) {
 	t.Helper()
 	prev := launchCobrowseProc
-	launchCobrowseProc = func(profileDir, startURL string) (*cobrowseProc, error) {
+	launchCobrowseProc = func(profileDir, startURL string, _ LaunchOptions) (*cobrowseProc, error) {
 		exited := make(chan struct{})
 		return &cobrowseProc{
 			debugPort: port,

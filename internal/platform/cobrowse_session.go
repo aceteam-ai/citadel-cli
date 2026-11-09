@@ -91,6 +91,8 @@ type CobrowseSessionStatus struct {
 	// Driver reports human only after explicit handoff. An attached viewer
 	// without handoff observes while the agent continues to act.
 	Driver CobrowseDriver `json:"driver,omitempty"`
+	// Browser is the launched browser's kind ("chrome", "edge", "chromium").
+	Browser string `json:"browser,omitempty"`
 }
 
 // cobrowseProc is the running-process bundle for one session: the browser and its
@@ -98,8 +100,11 @@ type CobrowseSessionStatus struct {
 // browser exits, and a bounded teardown closure. Returned by launchCobrowseProc so
 // the spawn is injectable in tests without launching a real browser.
 type cobrowseProc struct {
-	debugPort  int
-	display    string
+	debugPort int
+	display   string
+	// browser is the launched browser's kind ("chrome", "edge", "chromium"),
+	// reported in status so a user can see which installed browser was used.
+	browser    string
 	browserPID int
 	xvfbPID    int
 	// exited is closed by the reaper when the browser process terminates, so status
@@ -117,6 +122,14 @@ type cobrowseProc struct {
 // never collide on one virtual display.
 var launchCobrowseProc = defaultLaunchCobrowseProc
 
+// SetLaunchOptions sets the launch options for this manager's future
+// sessions. Local mode sets a guarding proxy and quiet mode.
+func (m *CobrowseSessionManager) SetLaunchOptions(lo LaunchOptions) {
+	m.mu.Lock()
+	m.launchOpts = lo
+	m.mu.Unlock()
+}
+
 // CobrowseSessionManager owns the map of concurrent, isolated browser sessions. Safe
 // for concurrent use.
 type CobrowseSessionManager struct {
@@ -125,6 +138,7 @@ type CobrowseSessionManager struct {
 	maxSessions int
 	baseDir     string
 	sweepOnce   sync.Once
+	launchOpts  LaunchOptions
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
@@ -178,7 +192,7 @@ var (
 func GetCobrowseSessionManager() *CobrowseSessionManager {
 	cobrowseSessionManagerOnce.Do(func() {
 		cobrowseSessionManager = newCobrowseSessionManager(
-			filepath.Join(os.TempDir(), cobrowseSessionsDirName),
+			defaultCobrowseSessionsBaseDir(),
 			resolveMaxCobrowseSessions(),
 		)
 	})
@@ -315,6 +329,11 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 // Returns the running proc so the caller can tear it down if the session was stopped
 // during launch.
 func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*cobrowseProc, error) {
+	// A runner that needs a trusted, private parent (Windows: owner-only DACL)
+	// refuses here before any profile data is written beneath it.
+	if err := activeBrowserRunner.PrepareBaseDir(m.baseDir); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(s.profile, 0o700); err != nil {
 		return nil, fmt.Errorf("create session profile dir: %w", err)
 	}
@@ -331,14 +350,17 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 			return nil, fmt.Errorf("materialize encrypted profile: %w", err)
 		}
 	}
-	proc, err := launchCobrowseProc(s.profile, startURL)
+	m.mu.Lock()
+	lo := m.launchOpts
+	m.mu.Unlock()
+	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
 		return nil, err
 	}
 	// Best-effort pidfile so a future process can reap this browser + Xvfb if THIS
 	// process is SIGKILLed before graceful teardown. A write failure is non-fatal:
 	// the session still runs and graceful stop still reaps it in-process.
-	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID)
+	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID, currentProcessStartToken())
 
 	s.mu.Lock()
 	s.proc = proc
@@ -465,7 +487,7 @@ func (s *cobrowseSession) teardown() error {
 	// cookies (and no throwaway state) behind. The pidfile lives under it and goes
 	// too. For a persistent profile the durable state now lives only as ciphertext.
 	if profile != "" {
-		_ = os.RemoveAll(profile)
+		removeSessionDir(profile)
 	}
 	return err
 }
@@ -494,6 +516,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 	if s.proc != nil {
 		st.DebugPort = s.proc.debugPort
 		st.Display = s.proc.display
+		st.Browser = s.proc.browser
 		select {
 		case <-s.proc.exited:
 			// The browser died while we still track it: terminal state.
@@ -514,81 +537,16 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 	return st
 }
 
-// defaultLaunchCobrowseProc is the real browser launcher: a headless-by-default
-// Chromium on a fresh dedicated Xvfb display with an isolated profile and CDP port.
-// Mirrors MeetingBrowser.Start's teardown-on-partial-failure, but the profile is
-// throwaway so a failed launch removal is handled by the caller.
-func defaultLaunchCobrowseProc(profileDir, startURL string) (*cobrowseProc, error) {
-	chrome, err := findChromium()
-	if err != nil {
+// defaultLaunchCobrowseProc launches through this OS's browser runner (see
+// cobrowse_runner.go): the managed-Xvfb runner on Linux, the headless Job
+// Object runner on Windows.
+func defaultLaunchCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
+	// Every runner (Xvfb, Windows headless) is reached only through here, so
+	// the start-URL gate holds even for a caller that skips the manager's.
+	if err := ValidateCobrowseURL(startURL); err != nil {
 		return nil, err
 	}
-
-	debugPort, err := findFreeDebugPort()
-	if err != nil {
-		return nil, err
-	}
-
-	// startManagedXvfb serializes display allocation internally, so concurrent
-	// launches never collide on one virtual display.
-	xvfb, display, err := startManagedXvfb(xvfbResolution())
-	if err != nil {
-		return nil, err
-	}
-
-	// A managed Xvfb has no GPU, so force software rendering (matches the sibling
-	// launchers). stealthEnabled() keeps parity with the other browser launches.
-	args := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:  debugPort,
-		profileDir: profileDir,
-		startURL:   startURL,
-		stealth:    stealthEnabled(),
-		userAgent:  os.Getenv(EnvCobrowseUserAgent),
-		softwareGL: true,
-	})
-
-	cmd := exec.Command(chrome, args...)
-	cmd.Env = withDisplay(os.Environ(), display)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if err := cmd.Start(); err != nil {
-		if xvfb.Process != nil {
-			_ = xvfb.Process.Kill()
-		}
-		return nil, fmt.Errorf("launch browser: %w", err)
-	}
-
-	// Reap each child so a crash is observable (exited) and no zombie is left. stop
-	// signals the kill and waits on these channels; it never calls Wait directly.
-	exited := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(exited)
-	}()
-	xvfbExited := make(chan struct{})
-	go func() {
-		_ = xvfb.Wait()
-		close(xvfbExited)
-	}()
-
-	proc := &cobrowseProc{
-		debugPort:  debugPort,
-		display:    display,
-		browserPID: pidOf(cmd),
-		xvfbPID:    pidOf(xvfb),
-		exited:     exited,
-		stop: func() error {
-			return stopBrowserProc(cmd, exited, xvfb, xvfbExited)
-		},
-	}
-
-	if err := waitForCDPReady(debugPort, 20*time.Second); err != nil {
-		// Best-effort teardown so a browser that launched but never exposed CDP does
-		// not leak a process or display.
-		_ = proc.stop()
-		return nil, fmt.Errorf("browser launched but CDP not ready: %w", err)
-	}
-	return proc, nil
+	return activeBrowserRunner.Launch(profileDir, startURL, lo)
 }
 
 // stopBrowserProc kills the browser first, then the Xvfb (so the browser is never
@@ -636,9 +594,17 @@ func pidOf(cmd *exec.Cmd) int {
 // Xvfb if the owner dies before graceful teardown -- while leaving sessions of a
 // still-live sibling process (e.g. the control-center worker running beside
 // `citadel work`) untouched.
-func writeSessionPidfile(profileDir string, ownerPID, browserPID, xvfbPID int) {
+//
+// ownerStart is an OS-specific identity token for the owner process (on Windows,
+// its creation time) so a later sweep can tell the recorded owner apart from an
+// unrelated process that reused its PID. Zero means "not recorded" and keeps the
+// historical three-line format byte-for-byte.
+func writeSessionPidfile(profileDir string, ownerPID, browserPID, xvfbPID int, ownerStart int64) {
 	path := filepath.Join(profileDir, sessionPidfileName)
 	content := fmt.Sprintf("%d\n%d\n%d\n", ownerPID, browserPID, xvfbPID)
+	if ownerStart != 0 {
+		content += fmt.Sprintf("%d\n", ownerStart)
+	}
 	_ = os.WriteFile(path, []byte(content), 0o600)
 }
 
@@ -663,6 +629,24 @@ func readSessionPidfile(profileDir string) (ownerPID, browserPID, xvfbPID int) {
 	return ownerPID, browserPID, xvfbPID
 }
 
+// readSessionOwnerStart returns the owner identity token from the pidfile's
+// optional fourth line, or 0 when absent or malformed.
+func readSessionOwnerStart(profileDir string) int64 {
+	data, err := os.ReadFile(filepath.Join(profileDir, sessionPidfileName))
+	if err != nil {
+		return 0
+	}
+	lines := strings.Fields(string(data))
+	if len(lines) < 4 {
+		return 0
+	}
+	v, err := strconv.ParseInt(lines[3], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
 // ensureCobrowseBaseDir makes sure the session base dir exists, is owned by the
 // current user, and is not group/other-writable -- creating it (0o700) when absent so
 // the normal, no-prior-state path always passes. sweep() must call this BEFORE it
@@ -677,7 +661,18 @@ func ensureCobrowseBaseDir(dir string) error {
 	info, err := os.Lstat(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return os.MkdirAll(dir, 0o700)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return err
+			}
+			// Windows: replace the inherited ACL with an explicit owner-only DACL.
+			// A dir that cannot be secured is removed again so the next call
+			// does not trust an inherited, possibly shared ACL. No-op on Unix,
+			// where MkdirAll's 0o700 already is the owner-only guarantee.
+			if err := secureNewCobrowseBaseDir(dir); err != nil {
+				_ = os.Remove(dir)
+				return err
+			}
+			return nil
 		}
 		return err
 	}
@@ -705,12 +700,15 @@ func ensureCobrowseBaseDir(dir string) error {
 //  2. processMatchesRole confirms, PID by PID, that the specific PID we are about to
 //     SIGKILL is STILL the browser/Xvfb it was recorded as, via /proc/<pid>/cmdline.
 //     A PID that fails this check is never killed -- only the stale dir is cleaned up.
-func (m *CobrowseSessionManager) sweep() {
-	if err := ensureCobrowseBaseDir(m.baseDir); err != nil {
-		log.Printf("[cobrowse] refusing session sweep of %s: %v", m.baseDir, err)
+func (m *CobrowseSessionManager) sweep() { activeBrowserRunner.SweepOrphans(m.baseDir) }
+
+// sweepXvfbSessions is the Linux runner's orphan sweep; see sweep above.
+func sweepXvfbSessions(baseDir string) {
+	if err := ensureCobrowseBaseDir(baseDir); err != nil {
+		log.Printf("[cobrowse] refusing session sweep of %s: %v", baseDir, err)
 		return
 	}
-	entries, err := os.ReadDir(m.baseDir)
+	entries, err := os.ReadDir(baseDir)
 	if err != nil {
 		return // no parent dir yet: nothing to reap
 	}
@@ -718,15 +716,15 @@ func (m *CobrowseSessionManager) sweep() {
 		if !e.IsDir() {
 			continue
 		}
-		dir := filepath.Join(m.baseDir, e.Name())
+		dir := filepath.Join(baseDir, e.Name())
 		ownerPID, browserPID, xvfbPID := readSessionPidfile(dir)
 		// Skip a dir whose owning process is still alive: it is not an orphan, and its
 		// browser belongs to a live sibling worker.
 		if ownerPID > 0 && ownerPID != os.Getpid() && pidAlive(ownerPID) {
 			continue
 		}
-		m.sweepKillIfVerified(browserPID, roleCobrowseBrowser, "browser")
-		m.sweepKillIfVerified(xvfbPID, roleCobrowseXvfb, "Xvfb")
+		sweepKillIfVerified(browserPID, roleCobrowseBrowser, "browser")
+		sweepKillIfVerified(xvfbPID, roleCobrowseXvfb, "Xvfb")
 		_ = os.RemoveAll(dir)
 	}
 }
@@ -734,7 +732,7 @@ func (m *CobrowseSessionManager) sweep() {
 // sweepKillIfVerified kills pid only when processMatchesRole confirms it is still the
 // process sweep recorded it as for role. A mismatch or unverifiable PID is logged and
 // left alone -- fail closed, never kill on doubt.
-func (m *CobrowseSessionManager) sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
+func sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
 	if pid <= 0 || pid == os.Getpid() {
 		return
 	}
