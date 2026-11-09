@@ -131,5 +131,6 @@ It does not protect against compromise of a trusted signing key, of the
 machine that runs the release flow, or of the source tree before a release is
 built. Downgrade refusal is a separate check in the install transaction
 (`update.ApplyRelease`), which refuses a release older than the installed one
-on every path. Installers that fetch the first binary outside the updater (the shell and
-PowerShell installers, the Homebrew tap) are covered separately.
+on every path. Installers that fetch the first binary outside the updater (the
+shell and PowerShell installers, the Homebrew tap) are outside this verifier
+and still check only the unsigned checksums.
