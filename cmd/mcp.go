@@ -240,7 +240,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	if memoryCfg == nil {
 		// The enrolled bridge also serves local_cobrowse_* for THIS machine,
 		// alongside the remote cobrowse_* tools that take a node_id.
-		cobrowseRT = newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: network.GetNodeConfigDir, viewer: true})
+		cobrowseRT = newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: localStateDir, viewer: true})
 		defer cobrowseRT.close()
 		deps.cobrowse = cobrowseRT
 	}

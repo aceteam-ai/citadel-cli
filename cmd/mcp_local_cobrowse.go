@@ -47,8 +47,9 @@ type localCobrowseRuntime struct {
 
 // localCobrowseOptions customizes the runtime; zero values are production.
 type localCobrowseOptions struct {
-	// ownerDir resolves where the owner marker lives (the node config dir in
-	// production). Resolved only when co-browse is first used.
+	// ownerDir resolves where the owner marker, audit log and viewer token
+	// live (localStateDir in production). Resolved only when co-browse is
+	// first used.
 	ownerDir func() string
 	browser  localcobrowse.Browser
 	policy   localcobrowse.URLPolicy

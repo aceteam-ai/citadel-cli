@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
-	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/spf13/cobra"
 )
 
@@ -38,7 +37,7 @@ Records older than 90 days are removed (set CITADEL_LOCAL_AUDIT_RETENTION_DAYS
 in the agent app's environment to change it).`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dir := filepath.Join(network.GetNodeConfigDir(), localaudit.DirName)
+		dir := filepath.Join(localStateDir(), localaudit.DirName)
 		return runLocalAudit(dir, localAuditOpts, cmd.OutOrStdout())
 	},
 }

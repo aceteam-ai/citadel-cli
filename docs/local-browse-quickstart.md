@@ -214,6 +214,10 @@ local agent tool.
 detects tampering. It does not prove anything against a program running as
 your account.
 
+Local mode keeps its state (the co-browse lock, the audit log and the viewer's
+link file) in `%LOCALAPPDATA%\Citadel\local`, separately for each Windows
+user, even on a computer that also runs an AceTeam node.
+
 ## Later: connect to AceTeam
 
 Local mode does not need AceTeam. If you later run `citadel init` to connect
