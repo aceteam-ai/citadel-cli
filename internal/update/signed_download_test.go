@@ -373,3 +373,76 @@ func TestAutoUpdaterRecordsSignatureInvalid(t *testing.T) {
 	}
 	assertResult(t, ResultSignatureInvalid)
 }
+
+func TestDownloadAndVerifyBoundsArchiveSize(t *testing.T) {
+	old := maxArchiveSize
+	maxArchiveSize = 1024
+	t.Cleanup(func() { maxArchiveSize = old })
+
+	big := bytes.Repeat([]byte("x"), 4096)
+	sum := sha256.Sum256(big)
+	sums := []byte(fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), platformArchiveName("v2.300.0")))
+	s := newTestSigner(t)
+
+	// Advertised Content-Length over the cap.
+	f := newFakeReleaseServer(t)
+	f.publish("v2.300.0", big, sums, s.sign(t, sums))
+	c := f.client("v2.299.0")
+	c.trustedKeys = s.keys
+	dest := candidatePath(t)
+	if err := c.DownloadAndVerify(&Release{TagName: "v2.300.0"}, dest); !errors.Is(err, ErrArchiveTooLarge) {
+		t.Fatalf("content-length: err = %v, want ErrArchiveTooLarge", err)
+	}
+
+	// No Content-Length (streamed): the copy itself must stop at the cap.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/checksums.txt"):
+			_, _ = w.Write(sums)
+		case strings.HasSuffix(r.URL.Path, "/checksums.txt.sig"):
+			_, _ = w.Write(s.sign(t, sums))
+		default:
+			fl := w.(http.Flusher)
+			for i := 0; i < 64; i++ {
+				_, _ = w.Write(big)
+				fl.Flush()
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c = NewClient("v2.299.0").WithBaseURLs(srv.URL, srv.URL)
+	c.trustedKeys = s.keys
+	dest = candidatePath(t)
+	if err := c.DownloadAndVerify(&Release{TagName: "v2.300.0"}, dest); !errors.Is(err, ErrArchiveTooLarge) {
+		t.Fatalf("streamed: err = %v, want ErrArchiveTooLarge", err)
+	}
+	if _, err := os.Stat(dest + ".archive"); !os.IsNotExist(err) {
+		t.Fatalf("oversized partial archive left behind: %v", err)
+	}
+}
+
+func TestDownloadAndVerifyPlatformNotPublishedIsTerminal(t *testing.T) {
+	f := newFakeReleaseServer(t)
+	s := newTestSigner(t)
+	other := "other_os"
+	if runtime.GOOS == other {
+		t.Skip()
+	}
+	sums := []byte(strings.Repeat("a", 64) + "  citadel_v2.300.0_" + other + "_amd64.tar.gz\n")
+	f.publish("v2.300.0", []byte("unused"), sums, s.sign(t, sums))
+	c := f.client("v2.299.0")
+	c.trustedKeys = s.keys
+	err := c.DownloadAndVerify(&Release{TagName: "v2.300.0"}, candidatePath(t))
+	if !errors.Is(err, ErrPlatformNotPublished) || !IsTerminalReleaseError(err) || IsReleaseSignatureError(err) {
+		t.Fatalf("err = %v, want terminal ErrPlatformNotPublished", err)
+	}
+	if got := DownloadFailureResult(err); got != ResultPlatformNotPublished {
+		t.Fatalf("result = %s, want %s", got, ResultPlatformNotPublished)
+	}
+	if n := f.archiveHits("v2.300.0"); n != 0 {
+		t.Fatalf("archive fetched %d times", n)
+	}
+	if IsTerminalReleaseError(fmt.Errorf("x: %w", ErrArchiveTooLarge)) || IsTerminalReleaseError(errors.New("connection reset")) {
+		t.Fatal("transient failures must stay retryable")
+	}
+}

@@ -76,7 +76,8 @@ hook_preflight() {
 }
 
 hook_pre_publish() {
-  # Releases are immutable: assets cannot be added after creation. Refuse to
+  # Releases created since immutable releases were enabled cannot gain assets
+  # later, so the signature must be attached at creation. Refuse to
   # publish unless the signature is present and verifies for this tag.
   local version
   version=$(read_state "target_version")

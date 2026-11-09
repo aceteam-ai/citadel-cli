@@ -361,10 +361,10 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 	h.cfg.Log("AGENT_UPDATE: downloading %s", release.TagName)
 	if err := h.cfg.Download(release, attempt.Candidate); err != nil {
 		wrapped := fmt.Errorf("download/verify failed for %s: %w", release.TagName, err)
-		// A release-signature refusal is terminal on the first delivery:
-		// releases are immutable, so a retry presents the same unsigned or
-		// badly signed release and cannot pass.
-		if update.IsReleaseSignatureError(err) {
+		// A signature refusal, or a signed release with no archive for this
+		// platform, is terminal on the first delivery: a retry fetches the
+		// same release assets and cannot pass.
+		if update.IsTerminalReleaseError(err) {
 			return h.terminalFailure(wrapped), nil
 		}
 		return h.failure(wrapped), nil

@@ -41,6 +41,7 @@ const (
 	ResultDownloadFailed       = "download_failed"        // download or checksum verification failed
 	ResultSignatureMissing     = "signature_missing"      // release publishes no checksums signature; refused
 	ResultSignatureInvalid     = "signature_invalid"      // checksums signature malformed, untrusted, wrong, or for another release; refused
+	ResultPlatformNotPublished = "platform_not_published" // signed release has no archive for this OS/arch
 	ResultDrainDeferred        = "drain_deferred"         // could not reach idle to swap this cycle
 	ResultApplyFailed          = "apply_failed"           // the in-place binary swap failed
 	ResultApplyNotPermitted    = "apply_not_permitted"    // install authority/capability preflight refused
@@ -60,6 +61,8 @@ func DownloadFailureResult(err error) string {
 		return ResultSignatureMissing
 	case errors.Is(err, ErrReleaseSignature):
 		return ResultSignatureInvalid
+	case errors.Is(err, ErrPlatformNotPublished):
+		return ResultPlatformNotPublished
 	default:
 		return ResultDownloadFailed
 	}

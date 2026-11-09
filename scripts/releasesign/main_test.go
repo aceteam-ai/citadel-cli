@@ -7,7 +7,9 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -83,5 +85,30 @@ func TestVerifyRefusesMissingAndForeignSignatures(t *testing.T) {
 	_ = os.WriteFile(bogus, []byte(`{"v":1,"key_id":"0000000000000000","sig":"`+strings.Repeat("A", 86)+`=="}`), 0o644)
 	if err := run([]string{"verify", "--tag", "v1.0.0", "--in", in, "--sig", bogus}); err == nil {
 		t.Fatal("verify with a foreign signature succeeded")
+	}
+}
+
+// TestLegacyRootReleaseScriptRefuses pins that the retired root release.sh,
+// which could not sign, refuses to run and never publishes.
+func TestLegacyRootReleaseScriptRefuses(t *testing.T) {
+	script := filepath.Join("..", "..", "release.sh")
+	data, err := os.ReadFile(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "gh release") || strings.Contains(string(data), "git tag") {
+		t.Fatal("retired release.sh still contains release or tag commands")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	out, err := exec.Command(bash, script, "-v", "v9.9.9", "-y").CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("release.sh exit = %v, want 1 (output %q)", err, out)
+	}
+	if !strings.Contains(string(out), "scripts/release.sh") {
+		t.Fatalf("refusal does not point at scripts/release.sh: %q", out)
 	}
 }

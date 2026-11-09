@@ -72,6 +72,8 @@ func TestAgentUpdateSignatureRefusalIsTerminal(t *testing.T) {
 	}{
 		"missing":   {fmt.Errorf("v2.47.0: %w", update.ErrUnsignedRelease), JobStatusTerminalFailure},
 		"invalid":   {fmt.Errorf("%w: v2.47.0: bad", update.ErrReleaseSignature), JobStatusTerminalFailure},
+		"platform":  {fmt.Errorf("%w: v2.47.0", update.ErrPlatformNotPublished), JobStatusTerminalFailure},
+		"oversize":  {fmt.Errorf("%w (limit 1)", update.ErrArchiveTooLarge), JobStatusFailure},
 		"transient": {errors.New("connection reset"), JobStatusFailure},
 	}
 	for name, tc := range cases {

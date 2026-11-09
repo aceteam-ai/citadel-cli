@@ -60,9 +60,12 @@ optional pre-release suffix before they are used in any URL.
    not bind to the release tag and self-verifies the result against the
    compiled trusted set.
 3. `hook_pre_publish` runs immediately before `gh release create` and refuses
-   to publish unless `checksums.txt.sig` exists and verifies. Releases are
-   immutable, so a release published without its signature could never be
-   fixed.
+   to publish unless `checksums.txt.sig` exists and verifies. A release
+   published without its signature could never be fixed (see "Immutable
+   releases" below).
+
+The legacy `release.sh` at the repository root cannot sign and refuses to
+run.
 
 The key path is `CITADEL_RELEASE_SIGNING_KEY`, defaulting to
 `$HOME/.config/citadel-release/release-signing-ed25519.pem` (PKCS#8 PEM,
@@ -82,15 +85,34 @@ handler. Before fetching the archive it:
 4. only then downloads the archive and compares its SHA-256.
 
 Any failure is fatal: `update.ErrUnsignedRelease` when no signature is
-published, `update.ErrReleaseSignature` for anything else. Nothing is
-extracted or installed.
+published, `update.ErrReleaseSignature` for anything else. A validly signed
+release that lists no archive for this platform fails with
+`update.ErrPlatformNotPublished`. The archive download is capped at
+`update.MaxArchiveSize` (512 MiB), so an oversized response is abandoned
+before it can fill the disk. Nothing is extracted or installed on any of
+these failures.
 
-Releases are immutable, so a signature refusal never succeeds on retry
-(`update.IsReleaseSignatureError`). An `AGENT_UPDATE` job that hits one is a
-terminal failure on its first delivery. The periodic updater records it as
-`signature_missing` or `signature_invalid` (`update.DownloadFailureResult`)
-rather than `download_failed`, and the heartbeat `auto_update.last_result`
-reports the same code.
+Retrying the same release cannot change any of these outcomes
+(`update.IsTerminalReleaseError`), so an `AGENT_UPDATE` job that hits one is
+a terminal failure on its first delivery. The periodic updater records
+`signature_missing`, `signature_invalid` or `platform_not_published`
+(`update.DownloadFailureResult`) rather than `download_failed`, and the
+heartbeat `auto_update.last_result` reports the same code.
+
+## Immutable releases
+
+GitHub immutable releases were enabled on this repository on 2026-11-09.
+Only releases created after that date are immutable: their assets cannot be
+added, replaced or deleted. v2.212.0 and earlier remain mutable.
+
+This matters in two ways:
+
+- A release must carry its signature when it is created, because the
+  signature cannot be attached later. The pre-publish check exists for this.
+- Nobody can delete `checksums.txt.sig` from an immutable release to block
+  updates to it. On a mutable release, removing the signature would make
+  every verifying node refuse that release. Since all signed releases are
+  created after immutability was enabled, signed releases are immutable.
 
 ## Transition
 

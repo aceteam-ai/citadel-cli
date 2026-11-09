@@ -76,13 +76,35 @@ var (
 	// signed by an untrusted key, does not verify, or the signed checksums do
 	// not belong to the requested release.
 	ErrReleaseSignature = errors.New("release signature verification failed; refusing to install")
+	// ErrPlatformNotPublished means the release's validly signed checksums
+	// list no archive for this OS/architecture.
+	ErrPlatformNotPublished = errors.New("release publishes no archive for this platform")
+	// ErrArchiveTooLarge means the archive download exceeded
+	// MaxArchiveSize and was abandoned before its digest was checked.
+	ErrArchiveTooLarge = errors.New("release archive exceeds the maximum download size")
 )
 
+// MaxArchiveSize bounds an archive download so a hostile or broken server
+// cannot fill the disk before the signed digest is checked. Real archives are
+// tens of MiB.
+const MaxArchiveSize = 512 << 20
+
+// maxArchiveSize is MaxArchiveSize; a variable only so in-package tests can
+// exercise the bound without serving half a gigabyte.
+var maxArchiveSize int64 = MaxArchiveSize
+
 // IsReleaseSignatureError reports whether err is a release-signature refusal
-// (ErrUnsignedRelease or ErrReleaseSignature). Releases are immutable, so a
-// retry of the same release cannot succeed.
+// (ErrUnsignedRelease or ErrReleaseSignature).
 func IsReleaseSignatureError(err error) bool {
 	return errors.Is(err, ErrUnsignedRelease) || errors.Is(err, ErrReleaseSignature)
+}
+
+// IsTerminalReleaseError reports whether retrying the same release cannot
+// change the outcome: a signature refusal, or a validly signed release that
+// does not publish this platform. Retrying would only fetch the same release
+// assets again.
+func IsTerminalReleaseError(err error) bool {
+	return IsReleaseSignatureError(err) || errors.Is(err, ErrPlatformNotPublished)
 }
 
 // NewClient creates a new update client with default timeout (30s)
@@ -235,11 +257,20 @@ func (c *Client) DownloadAndVerify(release *Release, destPath string) error {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
 
-	_, err = io.Copy(outFile, resp.Body)
+	if resp.ContentLength > maxArchiveSize {
+		outFile.Close()
+		os.Remove(archivePath)
+		return fmt.Errorf("%w (%d bytes advertised, limit %d)", ErrArchiveTooLarge, resp.ContentLength, maxArchiveSize)
+	}
+	written, err := io.Copy(outFile, io.LimitReader(resp.Body, maxArchiveSize+1))
 	outFile.Close()
 	if err != nil {
 		os.Remove(archivePath)
 		return fmt.Errorf("failed to write file: %w", err)
+	}
+	if written > maxArchiveSize {
+		os.Remove(archivePath)
+		return fmt.Errorf("%w (limit %d bytes)", ErrArchiveTooLarge, maxArchiveSize)
 	}
 
 	// Verify the signed digest before extracting.
@@ -556,7 +587,7 @@ func (c *Client) signedArchiveChecksum(release *Release) (string, error) {
 	binaryName := c.getBinaryArchiveName(release)
 	expected, ok := digests[binaryName]
 	if !ok {
-		return "", fmt.Errorf("checksum not found for %s", binaryName)
+		return "", fmt.Errorf("%w: %s: checksum not found for %s", ErrPlatformNotPublished, release.TagName, binaryName)
 	}
 	return expected, nil
 }
