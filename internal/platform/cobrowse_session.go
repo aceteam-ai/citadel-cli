@@ -122,6 +122,14 @@ type cobrowseProc struct {
 // never collide on one virtual display.
 var launchCobrowseProc = defaultLaunchCobrowseProc
 
+// SetLaunchOptions sets the launch options for this manager's future
+// sessions. Local mode sets a guarding proxy and quiet mode.
+func (m *CobrowseSessionManager) SetLaunchOptions(lo LaunchOptions) {
+	m.mu.Lock()
+	m.launchOpts = lo
+	m.mu.Unlock()
+}
+
 // CobrowseSessionManager owns the map of concurrent, isolated browser sessions. Safe
 // for concurrent use.
 type CobrowseSessionManager struct {
@@ -130,6 +138,7 @@ type CobrowseSessionManager struct {
 	maxSessions int
 	baseDir     string
 	sweepOnce   sync.Once
+	launchOpts  LaunchOptions
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
@@ -341,7 +350,10 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 			return nil, fmt.Errorf("materialize encrypted profile: %w", err)
 		}
 	}
-	proc, err := launchCobrowseProc(s.profile, startURL)
+	m.mu.Lock()
+	lo := m.launchOpts
+	m.mu.Unlock()
+	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
 		return nil, err
 	}
@@ -528,8 +540,8 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 // defaultLaunchCobrowseProc launches through this OS's browser runner (see
 // cobrowse_runner.go): the managed-Xvfb runner on Linux, the headless Job
 // Object runner on Windows.
-func defaultLaunchCobrowseProc(profileDir, startURL string) (*cobrowseProc, error) {
-	return activeBrowserRunner.Launch(profileDir, startURL)
+func defaultLaunchCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
+	return activeBrowserRunner.Launch(profileDir, startURL, lo)
 }
 
 // stopBrowserProc kills the browser first, then the Xvfb (so the browser is never

@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -126,6 +127,12 @@ type cobrowseLaunchOptions struct {
 	headless bool
 	// windowSize is "W,H" for --window-size, applied only when headless.
 	windowSize string
+	// proxyServer routes every browser connection through this HTTP proxy,
+	// including loopback ("<-loopback>" removes Chrome's implicit bypass), and
+	// forbids WebRTC UDP that would bypass it. See LaunchOptions.ProxyServer.
+	proxyServer string
+	// quiet disables background networking and component updates.
+	quiet bool
 }
 
 // stealthEnabled resolves whether stealth launch flags should be applied,
@@ -206,6 +213,16 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 
 	// Emit the merged disable-features exactly once (see note above).
 	args = append(args, "--disable-features="+strings.Join(disableFeatures, ","))
+
+	if opts.proxyServer != "" {
+		args = append(args,
+			"--proxy-server="+opts.proxyServer,
+			"--proxy-bypass-list=<-loopback>",
+			"--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+	}
+	if opts.quiet {
+		args = append(args, "--disable-background-networking", "--disable-component-update")
+	}
 
 	if opts.softwareGL {
 		// Dedicated Xvfb has no GPU/GLX; force the software path so the GPU
@@ -326,6 +343,17 @@ func GetCobrowseManager() *CobrowseManager {
 		}
 	})
 	return cobrowseManager
+}
+
+// ErrHeadedBrowserUnsupported refuses the headed, display-bound browser paths
+// on an OS that has no managed display for them.
+var ErrHeadedBrowserUnsupported = fmt.Errorf("headed browser sessions are not supported on this OS")
+
+func refuseHeadedOnThisOS(what string) error {
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("%w: %s needs an X display; use co-browse sessions (COBROWSE_SESSION or citadel local mcp) on Windows", ErrHeadedBrowserUnsupported, what)
+	}
+	return nil
 }
 
 // findChromium returns the first available Chromium/Chrome binary. On Linux and
@@ -488,6 +516,13 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// The legacy single-session browser is headed on an X display, with no
+	// Job Object tying it to this process. Windows uses only the session
+	// manager's headless runner.
+	if err := refuseHeadedOnThisOS("the legacy co-browse browser"); err != nil {
+		return CobrowseStatus{}, err
+	}
 
 	if m.isRunningLocked() {
 		// Reuse the existing browser; optionally navigate if a URL was given

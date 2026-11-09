@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -264,9 +265,16 @@ func TestWindowsSweepRemovesOnlyDeadOwners(t *testing.T) {
 	// No pidfile yet and fresh: a sibling mid-launch, kept.
 	launchingDir := mk("cb-launching")
 
+	// Our own PID but another start time: a dead predecessor whose PID we
+	// reused, swept. Our own PID and start time: ours, kept.
+	selfReusedDir := mk("cb-self-reused")
+	writeSessionPidfile(selfReusedDir, os.Getpid(), 0, 0, currentProcessStartToken()-1)
+	selfDir := mk("cb-self")
+	writeSessionPidfile(selfDir, os.Getpid(), 0, 0, currentProcessStartToken())
+
 	sweepWindowsSessions(base)
 
-	for dir, wantExists := range map[string]bool{deadDir: false, liveDir: true, reusedDir: false, launchingDir: true} {
+	for dir, wantExists := range map[string]bool{deadDir: false, liveDir: true, reusedDir: false, launchingDir: true, selfReusedDir: false, selfDir: true} {
 		_, err := os.Stat(dir)
 		if exists := err == nil; exists != wantExists {
 			t.Errorf("%s: exists=%v want %v", filepath.Base(dir), exists, wantExists)
@@ -453,4 +461,52 @@ func assertDebugPortLoopbackOnly(t *testing.T, port int) {
 		}
 	}
 	t.Logf("CDP port %d refused on %d non-loopback address(es)", port, checked)
+}
+
+func TestHeadedUserAgentFallbackCacheAndSingleflight(t *testing.T) {
+	prevLaunch, prevRetry := uaProbeLaunch, uaProbeRetryAfter
+	t.Cleanup(func() {
+		uaProbeLaunch, uaProbeRetryAfter = prevLaunch, prevRetry
+		uaCacheMu.Lock()
+		uaCache = map[string]*uaEntry{}
+		uaCacheMu.Unlock()
+	})
+	base := filepath.Join(t.TempDir(), "s")
+	if err := ensureCobrowseBaseDir(base); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	release := make(chan struct{})
+	uaProbeLaunch = func(BrowserInfo, string) (string, error) {
+		calls.Add(1)
+		<-release
+		return "", errors.New("policy blocked")
+	}
+	info := BrowserInfo{Path: filepath.Join(t.TempDir(), "msedge.exe"), Kind: "edge"}
+	results := make(chan string, 3)
+	for i := 0; i < 3; i++ {
+		go func() { results <- headedUserAgent(info, base) }()
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	for i := 0; i < 3; i++ {
+		if ua := <-results; ua != "" {
+			t.Fatalf("a failed probe must fall back to the browser's own UA, got %q", ua)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("concurrent callers should share one probe, got %d", n)
+	}
+	_ = headedUserAgent(info, base)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("a failed probe should be cached, got %d probes", n)
+	}
+	uaProbeRetryAfter = 0
+	uaProbeLaunch = func(BrowserInfo, string) (string, error) {
+		calls.Add(1)
+		return "Mozilla/5.0 HeadlessChrome/150.0.0.0 Safari/537.36", nil
+	}
+	if ua := headedUserAgent(info, base); ua != "Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36" {
+		t.Fatalf("retry after the window: %q", ua)
+	}
 }

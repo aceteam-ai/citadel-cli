@@ -31,7 +31,7 @@ type fakeLauncher struct {
 func (f *fakeLauncher) install(t *testing.T) {
 	t.Helper()
 	prev := launchCobrowseProc
-	launchCobrowseProc = func(profileDir, startURL string) (*cobrowseProc, error) {
+	launchCobrowseProc = func(profileDir, startURL string, _ LaunchOptions) (*cobrowseProc, error) {
 		if f.gate != nil {
 			<-f.gate
 		}

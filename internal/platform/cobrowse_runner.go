@@ -27,6 +27,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -67,10 +69,89 @@ type browserRunner interface {
 	PrepareBaseDir(baseDir string) error
 	// Launch starts one isolated browser with profileDir and blocks until its CDP
 	// endpoint is ready.
-	Launch(profileDir, startURL string) (*cobrowseProc, error)
+	Launch(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error)
 	// SweepOrphans reclaims session dirs (and, where the OS lets it be done
 	// safely, processes) left behind by an owner process that no longer exists.
 	SweepOrphans(baseDir string)
+}
+
+// LaunchOptions are per-manager browser launch settings.
+type LaunchOptions struct {
+	// ProxyServer, when set, sends every browser connection (loopback
+	// included, and no direct WebRTC UDP) through this HTTP proxy, so a
+	// destination policy is enforced where the browser connects, not only on
+	// the URL the agent asked for. Local mode sets it (aceteam#13503).
+	ProxyServer string
+	// Quiet turns off the browser's own background networking and component
+	// updates, so a session only makes the connections its pages need.
+	Quiet bool
+}
+
+// devToolsActivePortFile is where a browser launched with
+// --remote-debugging-port=0 writes its chosen port and browser id.
+const devToolsActivePortFile = "DevToolsActivePort"
+
+// errCDPImpostor reports a debug endpoint whose browser id does not match the
+// one our browser wrote to its own profile dir.
+var errCDPImpostor = errors.New("debug endpoint is not the browser this session launched")
+
+// parseDevToolsActivePort reads "<port>\n/devtools/browser/<id>\n".
+func parseDevToolsActivePort(data []byte) (int, string, error) {
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 2 {
+		return 0, "", errors.New("incomplete DevToolsActivePort")
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil || port <= 0 || port > 65535 {
+		return 0, "", fmt.Errorf("bad DevToolsActivePort port %q", lines[0])
+	}
+	path := strings.TrimSpace(lines[1])
+	const prefix = "/devtools/browser/"
+	if !strings.HasPrefix(path, prefix) || len(path) == len(prefix) {
+		return 0, "", fmt.Errorf("bad DevToolsActivePort path %q", path)
+	}
+	return port, strings.TrimPrefix(path, prefix), nil
+}
+
+// waitForDevToolsActivePort waits for the browser to report its debug port.
+func waitForDevToolsActivePort(profileDir string, timeout time.Duration, exited <-chan struct{}) (int, string, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error = errors.New("DevToolsActivePort not written")
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(filepath.Join(profileDir, devToolsActivePortFile)); err == nil {
+			port, id, perr := parseDevToolsActivePort(data)
+			if perr == nil {
+				return port, id, nil
+			}
+			lastErr = perr
+		}
+		select {
+		case <-exited:
+			return 0, "", fmt.Errorf("browser exited before reporting its debug port: %v", lastErr)
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	return 0, "", lastErr
+}
+
+// verifyCDPBrowserID checks the endpoint on port is the browser whose id was
+// read from its own profile dir.
+func verifyCDPBrowserID(port int, browserID string) error {
+	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var v struct {
+		WS string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v); err != nil {
+		return err
+	}
+	if !strings.HasSuffix(v.WS, "/devtools/browser/"+browserID) {
+		return errCDPImpostor
+	}
+	return nil
 }
 
 // activeBrowserRunner is the runner for this OS. A package var so tests can
@@ -136,8 +217,8 @@ func (xvfbRunner) Discover() (BrowserInfo, error) {
 // refuses to read pidfiles from an untrusted parent (unchanged behavior).
 func (xvfbRunner) PrepareBaseDir(string) error { return nil }
 
-func (xvfbRunner) Launch(profileDir, startURL string) (*cobrowseProc, error) {
-	return launchXvfbCobrowseProc(profileDir, startURL)
+func (xvfbRunner) Launch(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
+	return launchXvfbCobrowseProc(profileDir, startURL, lo)
 }
 
 func (xvfbRunner) SweepOrphans(baseDir string) { sweepXvfbSessions(baseDir) }
@@ -146,7 +227,7 @@ func (xvfbRunner) SweepOrphans(baseDir string) { sweepXvfbSessions(baseDir) }
 // Chromium on a fresh dedicated Xvfb display with an isolated profile and CDP port.
 // Mirrors MeetingBrowser.Start's teardown-on-partial-failure, but the profile is
 // throwaway so a failed launch removal is handled by the caller.
-func launchXvfbCobrowseProc(profileDir, startURL string) (*cobrowseProc, error) {
+func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
 	chrome, err := findChromium()
 	if err != nil {
 		return nil, err
@@ -167,12 +248,14 @@ func launchXvfbCobrowseProc(profileDir, startURL string) (*cobrowseProc, error) 
 	// A managed Xvfb has no GPU, so force software rendering (matches the sibling
 	// launchers). stealthEnabled() keeps parity with the other browser launches.
 	args := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:  debugPort,
-		profileDir: profileDir,
-		startURL:   startURL,
-		stealth:    stealthEnabled(),
-		userAgent:  os.Getenv(EnvCobrowseUserAgent),
-		softwareGL: true,
+		debugPort:   debugPort,
+		profileDir:  profileDir,
+		startURL:    startURL,
+		stealth:     stealthEnabled(),
+		userAgent:   os.Getenv(EnvCobrowseUserAgent),
+		softwareGL:  true,
+		proxyServer: lo.ProxyServer,
+		quiet:       lo.Quiet,
 	})
 
 	cmd := exec.Command(chrome, args...)

@@ -68,7 +68,7 @@ func (windowsHeadlessRunner) PrepareBaseDir(baseDir string) error {
 
 func (windowsHeadlessRunner) SweepOrphans(baseDir string) { sweepWindowsSessions(baseDir) }
 
-func (r windowsHeadlessRunner) Launch(profileDir, startURL string) (*cobrowseProc, error) {
+func (r windowsHeadlessRunner) Launch(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
 	info, err := r.Discover()
 	if err != nil {
 		return nil, err
@@ -80,29 +80,29 @@ func (r windowsHeadlessRunner) Launch(profileDir, startURL string) (*cobrowsePro
 	// still wins, and with stealth off the browser's own UA is left alone.
 	ua := os.Getenv(EnvCobrowseUserAgent)
 	if ua == "" && stealthEnabled() {
-		ua, err = headedUserAgent(info, filepath.Dir(profileDir))
-		if err != nil {
-			return nil, err
-		}
+		ua = headedUserAgent(info, filepath.Dir(profileDir))
 	}
-	return startHeadless(info, profileDir, startURL, ua)
+	return startHeadless(info, profileDir, startURL, ua, lo)
 }
 
 // startHeadless launches one headless browser in a kill-on-close job and waits
-// for its CDP endpoint.
-func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string) (*cobrowseProc, error) {
-	debugPort, err := findFreeDebugPort()
-	if err != nil {
-		return nil, err
-	}
+// for its CDP endpoint. The browser picks its own debug port
+// (--remote-debugging-port=0) and reports it in DevToolsActivePort inside the
+// owner-only profile dir, so there is no probe-then-bind window in which
+// another local process could take the port first. The endpoint is then
+// checked against the browser id from that file before it is trusted.
+func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo LaunchOptions) (*cobrowseProc, error) {
+	_ = os.Remove(filepath.Join(profileDir, devToolsActivePortFile))
 	args := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:  debugPort,
-		profileDir: profileDir,
-		startURL:   startURL,
-		stealth:    stealthEnabled(),
-		userAgent:  userAgent,
-		headless:   true,
-		windowSize: defaultHeadlessWindowSize,
+		debugPort:   0,
+		profileDir:  profileDir,
+		startURL:    startURL,
+		stealth:     stealthEnabled(),
+		userAgent:   userAgent,
+		headless:    true,
+		windowSize:  defaultHeadlessWindowSize,
+		proxyServer: lo.ProxyServer,
+		quiet:       lo.Quiet,
 	})
 	cmd := exec.Command(info.Path, args...)
 	cmd.Stdout = nil
@@ -121,7 +121,6 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string) (*c
 	var once sync.Once
 	var stopErr error
 	proc := &cobrowseProc{
-		debugPort:  debugPort,
 		browser:    info.Kind,
 		browserPID: pidOf(cmd),
 		exited:     exited,
@@ -131,7 +130,7 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string) (*c
 		},
 	}
 
-	if err := waitForCDPOrExit(debugPort, windowsCDPReadyTimeout, exited); err != nil {
+	fail := func(cause error) (*cobrowseProc, error) {
 		_ = proc.stop()
 		select {
 		case <-exited:
@@ -142,53 +141,110 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string) (*c
 			return nil, fmt.Errorf("%s exited during headless launch (exit code %d); run `citadel local doctor`", info.Kind, code)
 		default:
 		}
-		return nil, fmt.Errorf("%w: %s started but never opened its automation port on 127.0.0.1:%d within %s. "+
+		if errors.Is(cause, errCDPImpostor) {
+			return nil, fmt.Errorf("%s debug port answered as a different browser; refusing the session: %w", info.Kind, cause)
+		}
+		return nil, fmt.Errorf("%w: %s started but never opened its automation port within %s. "+
 			"On a managed (work or school) computer this is usually a policy that disables remote debugging; "+
-			"try a per-user Chrome install or a personal computer", ErrBrowserAutomationBlocked, info.Kind, debugPort, windowsCDPReadyTimeout)
+			"try a per-user Chrome install or a personal computer", ErrBrowserAutomationBlocked, info.Kind, windowsCDPReadyTimeout)
+	}
+
+	port, browserID, err := waitForDevToolsActivePort(profileDir, windowsCDPReadyTimeout, exited)
+	if err != nil {
+		return fail(err)
+	}
+	proc.debugPort = port
+	if err := verifyCDPBrowserID(port, browserID); err != nil {
+		return fail(err)
+	}
+	if err := waitForCDPOrExit(port, windowsCDPReadyTimeout, exited); err != nil {
+		return fail(err)
 	}
 	return proc, nil
 }
 
+// uaEntry is one binary's derived user agent, computed at most once at a time.
+type uaEntry struct {
+	done chan struct{}
+	ua   string
+	err  error
+	at   time.Time
+}
+
 // uaCache maps an installed browser binary (path, size, mtime) to its derived
 // non-headless user agent. A browser update replaces the binary, which changes
-// the key, so the version in the UA never goes stale.
+// the key, so the version in the UA never goes stale. A failed probe is cached
+// for uaProbeRetryAfter so a machine that cannot run the probe does not pay
+// for it on every session start.
 var (
-	uaCacheMu sync.Mutex
-	uaCache   = map[string]string{}
+	uaCacheMu         sync.Mutex
+	uaCache           = map[string]*uaEntry{}
+	uaProbeRetryAfter = 10 * time.Minute
+	uaProbeLaunch     = func(info BrowserInfo, dir string) (string, error) {
+		proc, err := startHeadless(info, dir, "about:blank", "", LaunchOptions{Quiet: true})
+		if err != nil {
+			return "", err
+		}
+		defer proc.stop()
+		return browserDefaultUserAgent(proc.debugPort)
+	}
 )
 
 // headedUserAgent returns the user agent this browser would send outside
-// headless mode. The first call for a binary launches it once, headless, in a
-// throwaway profile under baseDir, reads /json/version, and stops it.
-func headedUserAgent(info BrowserInfo, baseDir string) (string, error) {
+// headless mode, or "" (the browser's own) when it cannot be derived: a
+// failed probe never fails the session. The first call for a binary launches
+// it once, headless, in a throwaway profile under baseDir; concurrent callers
+// wait for that one probe without holding the cache lock.
+func headedUserAgent(info BrowserInfo, baseDir string) string {
 	key := info.Path
 	if fi, err := os.Stat(info.Path); err == nil {
 		key = fmt.Sprintf("%s|%d|%d", info.Path, fi.Size(), fi.ModTime().UnixNano())
 	}
 	uaCacheMu.Lock()
-	defer uaCacheMu.Unlock()
-	if ua, ok := uaCache[key]; ok {
-		return ua, nil
+	e, ok := uaCache[key]
+	if ok && e.err != nil {
+		select {
+		case <-e.done:
+			if time.Since(e.at) >= uaProbeRetryAfter {
+				ok = false
+			}
+		default:
+		}
 	}
+	if !ok {
+		e = &uaEntry{done: make(chan struct{})}
+		uaCache[key] = e
+		uaCacheMu.Unlock()
+		e.ua, e.err = probeUserAgent(info, baseDir)
+		e.at = time.Now()
+		if e.err != nil {
+			log.Printf("[cobrowse] could not derive %s's user agent (%v); the session uses the browser's own", info.Kind, e.err)
+		}
+		close(e.done)
+	} else {
+		uaCacheMu.Unlock()
+		<-e.done
+	}
+	if e.err != nil {
+		return ""
+	}
+	return e.ua
+}
+
+func probeUserAgent(info BrowserInfo, baseDir string) (string, error) {
 	probeDir := filepath.Join(baseDir, "ua-probe-"+newSessionID())
 	if err := os.MkdirAll(probeDir, 0o700); err != nil {
 		return "", fmt.Errorf("create user-agent probe dir: %w", err)
 	}
 	defer removeSessionDir(probeDir)
-	proc, err := startHeadless(info, probeDir, "about:blank", "")
+	raw, err := uaProbeLaunch(info, probeDir)
 	if err != nil {
 		return "", err
 	}
-	raw, verr := browserDefaultUserAgent(proc.debugPort)
-	_ = proc.stop()
-	if verr != nil {
-		return "", fmt.Errorf("read %s user agent: %w", info.Kind, verr)
-	}
 	ua := deheadlessUserAgent(raw)
 	if ua == "" {
-		return "", fmt.Errorf("read %s user agent: empty", info.Kind)
+		return "", errors.New("empty user agent")
 	}
-	uaCache[key] = ua
 	return ua, nil
 }
 
@@ -388,9 +444,11 @@ func sweepWindowsSessions(baseDir string) {
 			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) < windowsSweepGrace {
 				continue
 			}
-		} else if owner == self {
+		} else if owner == self && (start == 0 || start == currentProcessStartToken()) {
+			// Ours. A matching PID with a different start time is a dead
+			// predecessor whose PID this process reused: swept below.
 			continue
-		} else if processAliveWithStart(owner, start) {
+		} else if owner != self && processAliveWithStart(owner, start) {
 			continue
 		}
 		if err := removeAllRetry(dir, 10, 200*time.Millisecond); err != nil {

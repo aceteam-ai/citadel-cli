@@ -2,6 +2,10 @@ package platform
 
 import (
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -214,7 +218,7 @@ func TestSessionManager_PrepareBaseDirFailureRefusesLaunch(t *testing.T) {
 	t.Cleanup(func() { activeBrowserRunner = prev })
 	called := false
 	prevLaunch := launchCobrowseProc
-	launchCobrowseProc = func(string, string) (*cobrowseProc, error) {
+	launchCobrowseProc = func(string, string, LaunchOptions) (*cobrowseProc, error) {
 		called = true
 		return nil, errors.New("must not launch")
 	}
@@ -247,5 +251,47 @@ func TestDeheadlessUserAgent(t *testing.T) {
 		if got := deheadlessUserAgent(in); got != want {
 			t.Errorf("got %q\nwant %q", got, want)
 		}
+	}
+}
+
+func TestParseDevToolsActivePort(t *testing.T) {
+	port, id, err := parseDevToolsActivePort([]byte("51234\n/devtools/browser/0b5d1c2e-aaaa-bbbb-cccc-1234567890ab\n"))
+	if err != nil || port != 51234 || id != "0b5d1c2e-aaaa-bbbb-cccc-1234567890ab" {
+		t.Fatalf("got %d %q %v", port, id, err)
+	}
+	for _, bad := range []string{"", "51234\n", "x\n/devtools/browser/a", "0\n/devtools/browser/a", "51234\n/devtools/page/a", "51234\n/devtools/browser/"} {
+		if _, _, err := parseDevToolsActivePort([]byte(bad)); err == nil {
+			t.Errorf("%q should not parse", bad)
+		}
+	}
+}
+
+func TestBuildChromeArgs_ProxyAndQuiet(t *testing.T) {
+	args := buildChromeArgs(cobrowseLaunchOptions{debugPort: 0, profileDir: "/p", headless: true, proxyServer: "http://127.0.0.1:4000", quiet: true})
+	for _, want := range []string{
+		"--remote-debugging-port=0",
+		"--proxy-server=http://127.0.0.1:4000",
+		"--proxy-bypass-list=<-loopback>",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--disable-background-networking",
+		"--disable-component-update",
+	} {
+		if !containsArg(args, want) {
+			t.Errorf("missing %s in %v", want, args)
+		}
+	}
+}
+
+func TestVerifyCDPBrowserIDRejectsImpostor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/browser/other-id"}`)
+	}))
+	defer srv.Close()
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	if err := verifyCDPBrowserID(port, "our-id"); !errors.Is(err, errCDPImpostor) {
+		t.Fatalf("want impostor, got %v", err)
+	}
+	if err := verifyCDPBrowserID(port, "other-id"); err != nil {
+		t.Fatalf("matching id: %v", err)
 	}
 }
