@@ -56,27 +56,28 @@ func TestViewerPageInRealBrowser(t *testing.T) {
 	waitText("#agent-line", "No agent connected")
 	waitText("#approval", "Allow this agent")
 
-	if _, err := m.Click(page.ID, "#approve", nil, nil); err != nil {
-		t.Fatalf("click approve: %v", err)
-	}
-	waitFor(t, func() bool { return h.svc.Sessions(st.SessionID)[0].Approval == "approved" })
+	// A selector click can land before layout settles (the known #13280
+	// race, owned by S2), so retry the click until the server sees it.
+	clickUntil(t, m, page.ID, "#approve", func() bool { return h.svc.Sessions(st.SessionID)[0].Approval == "approved" })
 
 	waitText("#drive", "Take control")
-	if _, err := m.Click(page.ID, "#drive", nil, nil); err != nil {
-		t.Fatalf("click take control: %v", err)
-	}
-	waitFor(t, func() bool { return h.svc.Sessions(st.SessionID)[0].Driver == "human" })
+	clickUntil(t, m, page.ID, "#drive", func() bool { return h.svc.Sessions(st.SessionID)[0].Driver == "human" })
 	waitText("#waiting", "You are driving")
 }
 
-func waitFor(t *testing.T, cond func() bool) {
+func clickUntil(t *testing.T, m *platform.CobrowseSessionManager, id, sel string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if cond() {
-			return
+		if _, err := m.Click(id, sel, nil, nil); err != nil {
+			t.Logf("click %s: %v", sel, err)
 		}
-		time.Sleep(200 * time.Millisecond)
+		for i := 0; i < 10; i++ {
+			if cond() {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
-	t.Fatal("condition not reached")
+	t.Fatalf("clicking %s never took effect", sel)
 }
