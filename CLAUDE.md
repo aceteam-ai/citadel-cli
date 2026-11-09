@@ -4145,6 +4145,19 @@ fails, so an unknown page degrades to `admit_timeout`, never a false
 `denied`; the selectors are English-only and untuned live. Ctx cancellation
 (shutdown/deadline) remains the hard abort described below.
 
+### Retained MEETING_JOIN terminal result (citadel-cli#1553)
+
+`worker.retainsTerminalResult` decides which job types also store their first
+terminal stream:v1 envelope under `worker.TerminalResultKey`, so a coordinator
+that was restarting during the publish can recover it (aceteam#13175). Both
+stream writers' `publishTerminal` publish first, then retain first-writer-wins
+(direct `SET NX EX`, API-proxy GET-then-SET), and never return a retention
+error to the publish retry: a refused redelivery must not overwrite a good
+transcript. API mode inherits the KV route's 24h/1 MiB limits
+(`redisapi.KVMaxTTL`/`KVMaxValueBytes`). Key, TTL and limits for the backend
+reader are in `docs/meeting-join-terminal-result.md`; tests in
+`internal/worker/terminal_retention_test.go`.
+
 ### Meeting-bot wait-loop cancellation (citadel#488, cancellation half)
 
 Every poll loop in the MEETING_JOIN join/wait chain now `select`s on

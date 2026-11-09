@@ -3,6 +3,7 @@ package redisapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -72,8 +73,19 @@ func (c *Client) Publish(ctx context.Context, channel string, message any) error
 
 // PublishStreamEvent publishes a streaming event to Redis Pub/Sub.
 func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType string, data map[string]any) error {
-	streamName := fmt.Sprintf("stream:v1:%s", jobID)
+	return c.PublishEvent(ctx, c.BuildStreamEvent(jobID, rayID, eventType, data))
+}
 
+// PublishEvent publishes an envelope built by BuildStreamEvent on the job's
+// stream:v1 channel.
+func (c *Client) PublishEvent(ctx context.Context, event StreamEvent) error {
+	return c.Publish(ctx, fmt.Sprintf("stream:v1:%s", event.JobID), event)
+}
+
+// BuildStreamEvent builds the exact stream:v1 envelope PublishStreamEvent
+// publishes, including the node identity metadata. A caller that both
+// publishes and retains an event uses it so the two copies are identical.
+func (c *Client) BuildStreamEvent(jobID, rayID, eventType string, data map[string]any) StreamEvent {
 	// Inject node identity metadata into every event for operator attribution
 	if c.nodeMeta != nil {
 		if data == nil {
@@ -82,7 +94,7 @@ func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType
 		data["meta"] = c.nodeMeta
 	}
 
-	event := StreamEvent{
+	return StreamEvent{
 		Version:   "1.0",
 		Type:      eventType,
 		JobID:     jobID,
@@ -90,8 +102,6 @@ func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data:      data,
 	}
-
-	return c.Publish(ctx, streamName, event)
 }
 
 // PublishClaimed publishes a "claimed" event for a job, emitted the moment the
@@ -211,6 +221,50 @@ func (c *Client) SetKey(ctx context.Context, key string, value any, ttl int) err
 	}
 
 	return nil
+}
+
+// KVMaxTTL and KVMaxValueBytes are the limits POST /api/fabric/redis/kv
+// enforces (ttl at most 86400 seconds, value at most 1 MiB). A request beyond
+// either is refused with a 400, so callers clamp or skip before sending.
+const (
+	KVMaxTTL        = 24 * time.Hour
+	KVMaxValueBytes = 1024 * 1024
+)
+
+// ErrValueTooLarge reports a value the KV route would refuse for size.
+var ErrValueTooLarge = errors.New("value exceeds the Redis API proxy KV limit")
+
+// RetainTerminalEvent stores eventJSON under key through the KV route, first
+// writer wins, and reports whether this call stored it (citadel-cli#1553).
+//
+// The route has no conditional SET, so this reads the key first and writes only
+// when it is absent; a read failure writes nothing. One node owns a job's
+// terminal writes, so the read-then-write gap has no competing writer. The TTL
+// is clamped to KVMaxTTL, and a value over KVMaxValueBytes is refused locally
+// with ErrValueTooLarge (byte length is at least the UTF-16 length the route
+// measures, so the local check is never looser than the route's).
+func (c *Client) RetainTerminalEvent(ctx context.Context, key string, eventJSON []byte, ttl time.Duration) (bool, error) {
+	if len(eventJSON) > KVMaxValueBytes {
+		return false, fmt.Errorf("%w: %d bytes", ErrValueTooLarge, len(eventJSON))
+	}
+	if ttl > KVMaxTTL {
+		ttl = KVMaxTTL
+	}
+	seconds := int(ttl / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	_, existingTTL, err := c.GetKey(ctx, key)
+	if err != nil {
+		return false, fmt.Errorf("check retained terminal event: %w", err)
+	}
+	if existingTTL != -2 {
+		return false, nil
+	}
+	if err := c.SetKey(ctx, key, string(eventJSON), seconds); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // DeleteKey removes a key from Redis KV storage.
