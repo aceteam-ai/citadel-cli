@@ -435,7 +435,8 @@ type ReconcileHealth struct {
 //   - LatestVersion is the last release THIS node observed, not the platform's
 //     current release lookup.
 //   - LastResult is one of update's bounded result codes (never_checked/
-//     up_to_date/check_failed/download_failed/drain_deferred/apply_failed/apply_not_permitted/
+//     up_to_date/check_failed/download_failed/signature_missing/signature_invalid/
+//     drain_deferred/apply_failed/apply_not_permitted/
 //     restart_pending/restart_failed/manual_update_required/state_corrupt/unknown) — never a
 //     raw URL, path, log line, or secret.
 //   - The outer heartbeat timestamp remains the observation-freshness signal;

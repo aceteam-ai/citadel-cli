@@ -85,6 +85,13 @@ Any failure is fatal: `update.ErrUnsignedRelease` when no signature is
 published, `update.ErrReleaseSignature` for anything else. Nothing is
 extracted or installed.
 
+Releases are immutable, so a signature refusal never succeeds on retry
+(`update.IsReleaseSignatureError`). An `AGENT_UPDATE` job that hits one is a
+terminal failure on its first delivery. The periodic updater records it as
+`signature_missing` or `signature_invalid` (`update.DownloadFailureResult`)
+rather than `download_failed`, and the heartbeat `auto_update.last_result`
+reports the same code.
+
 ## Transition
 
 Releases published before signing was introduced have no `checksums.txt.sig`.

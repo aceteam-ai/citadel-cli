@@ -78,6 +78,13 @@ var (
 	ErrReleaseSignature = errors.New("release signature verification failed; refusing to install")
 )
 
+// IsReleaseSignatureError reports whether err is a release-signature refusal
+// (ErrUnsignedRelease or ErrReleaseSignature). Releases are immutable, so a
+// retry of the same release cannot succeed.
+func IsReleaseSignatureError(err error) bool {
+	return errors.Is(err, ErrUnsignedRelease) || errors.Is(err, ErrReleaseSignature)
+}
+
 // NewClient creates a new update client with default timeout (30s)
 func NewClient(currentVersion string) *Client {
 	return NewClientWithTimeout(currentVersion, 30*time.Second)

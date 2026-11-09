@@ -20,6 +20,7 @@
 package update
 
 import (
+	"errors"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,8 @@ const (
 	ResultUpToDate             = "up_to_date"             // check succeeded, already current
 	ResultCheckFailed          = "check_failed"           // the release lookup failed (offline etc.)
 	ResultDownloadFailed       = "download_failed"        // download or checksum verification failed
+	ResultSignatureMissing     = "signature_missing"      // release publishes no checksums signature; refused
+	ResultSignatureInvalid     = "signature_invalid"      // checksums signature malformed, untrusted, wrong, or for another release; refused
 	ResultDrainDeferred        = "drain_deferred"         // could not reach idle to swap this cycle
 	ResultApplyFailed          = "apply_failed"           // the in-place binary swap failed
 	ResultApplyNotPermitted    = "apply_not_permitted"    // install authority/capability preflight refused
@@ -47,6 +50,20 @@ const (
 	ResultStateCorrupt         = "state_corrupt"          // persisted state unreadable/corrupt; paused until explicit repair
 	ResultUnknown              = "unknown"                // historical/otherwise unclassified result
 )
+
+// DownloadFailureResult maps a DownloadAndVerify error to its bounded result
+// code: a release-signature refusal is reported distinctly from an ordinary
+// (possibly transient) download failure.
+func DownloadFailureResult(err error) string {
+	switch {
+	case errors.Is(err, ErrUnsignedRelease):
+		return ResultSignatureMissing
+	case errors.Is(err, ErrReleaseSignature):
+		return ResultSignatureInvalid
+	default:
+		return ResultDownloadFailed
+	}
+}
 
 // mutateState keeps result writers on the same cross-process transaction as
 // explicit preference changes. Errors leave unreadable/corrupt state untouched.

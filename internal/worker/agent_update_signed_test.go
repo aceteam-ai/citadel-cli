@@ -3,11 +3,13 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
@@ -46,8 +48,8 @@ func TestAgentUpdateRefusesUnsignedRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if res.Status != JobStatusFailure {
-		t.Fatalf("status = %v, want failure", res.Status)
+	if res.Status != JobStatusTerminalFailure {
+		t.Fatalf("status = %v, want terminal failure", res.Status)
 	}
 	if !errors.Is(downloadErr, update.ErrUnsignedRelease) {
 		t.Fatalf("download err = %v, want ErrUnsignedRelease", downloadErr)
@@ -57,5 +59,63 @@ func TestAgentUpdateRefusesUnsignedRelease(t *testing.T) {
 	}
 	if n := archiveHits.Load(); n != 0 {
 		t.Fatalf("archive fetched %d times for an unsigned release", n)
+	}
+}
+
+// TestAgentUpdateSignatureRefusalIsTerminal pins the classification: every
+// release-signature refusal is terminal (no retry), while an ordinary
+// download failure stays retryable.
+func TestAgentUpdateSignatureRefusalIsTerminal(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want JobStatus
+	}{
+		"missing":   {fmt.Errorf("v2.47.0: %w", update.ErrUnsignedRelease), JobStatusTerminalFailure},
+		"invalid":   {fmt.Errorf("%w: v2.47.0: bad", update.ErrReleaseSignature), JobStatusTerminalFailure},
+		"transient": {errors.New("connection reset"), JobStatusFailure},
+	}
+	for name, tc := range cases {
+		h := newTestHandler(t, func(c *AgentUpdateConfig) {
+			c.NewAttempt = func() (*update.UpdateAttempt, error) {
+				return &update.UpdateAttempt{Candidate: t.TempDir() + "/candidate"}, nil
+			}
+			c.Download = func(*update.Release, string) error { return tc.err }
+		})
+		res, err := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, nil), &NoOpStreamWriter{})
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", name, err)
+		}
+		if res.Status != tc.want {
+			t.Errorf("%s: status = %v, want %v", name, res.Status, tc.want)
+		}
+	}
+}
+
+// TestRunnerAgentUpdateSignatureRefusalFailsWithoutRetry drives the refusal
+// through the runner: one terminal error event and source.Fail on the first
+// delivery, never Nack.
+func TestRunnerAgentUpdateSignatureRefusalFailsWithoutRetry(t *testing.T) {
+	h := newTestHandler(t, func(c *AgentUpdateConfig) {
+		c.NewAttempt = func() (*update.UpdateAttempt, error) {
+			return &update.UpdateAttempt{Candidate: t.TempDir() + "/candidate"}, nil
+		}
+		c.Download = func(*update.Release, string) error {
+			return fmt.Errorf("v2.47.0: %w", update.ErrUnsignedRelease)
+		}
+	})
+	source := NewMockJobSource("test", nil)
+	runner := NewRunner(source, []JobHandler{h}, RunnerConfig{WorkerID: "test-worker"})
+	stream := &MockStreamWriter{}
+	job := agentUpdateJob(perNodeQueue, nil)
+	job.Metadata = JobMetadata{Attempts: 1, MaxAttempts: 3}
+
+	if runner.executeJob(context.Background(), job, stream, time.Now(), false, 0) {
+		t.Fatal("a signature refusal must not report success")
+	}
+	if stream.errorCount != 1 || stream.endCount != 0 || stream.erroredRecover {
+		t.Fatalf("want one non-recoverable error: errors=%d ends=%d recoverable=%v", stream.errorCount, stream.endCount, stream.erroredRecover)
+	}
+	if len(source.FailedJobs()) != 1 || len(source.NackedJobs()) != 0 || len(source.AckedJobs()) != 0 {
+		t.Fatalf("want source.Fail only: failed=%d nacked=%d acked=%d", len(source.FailedJobs()), len(source.NackedJobs()), len(source.AckedJobs()))
 	}
 }

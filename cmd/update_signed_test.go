@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
@@ -58,5 +59,24 @@ func TestManualUpdateRefusesUnsignedRelease(t *testing.T) {
 	}
 	if n := archiveHits.Load(); n != 0 {
 		t.Fatalf("archive fetched %d times for an unsigned release", n)
+	}
+}
+
+// TestAutoUpdateHeartbeatMirrorsSignatureResult pins that a signature refusal
+// recorded by the updater reaches the heartbeat auto_update block verbatim.
+func TestAutoUpdateHeartbeatMirrorsSignatureResult(t *testing.T) {
+	for _, result := range []string{update.ResultSignatureMissing, update.ResultSignatureInvalid} {
+		withAutoUpdateEnv(t, "v2.299.0")
+		if err := update.SaveState(&update.State{AutoUpdate: true, Channel: "stable"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := update.RecordCheckResult(time.Now(), result, true, "v2.300.0"); err != nil {
+			t.Fatal(err)
+		}
+		snap := buildAutoUpdateSnapshot(autoUpdatePolicyInputs{}, "periodic", update.SelfUpdateCapability{})
+		report := autoUpdateReportFrom(&snap)
+		if snap.LastResult != result || report == nil || report.LastResult != result {
+			t.Fatalf("last_result = %q / %+v, want %q", snap.LastResult, report, result)
+		}
 	}
 }

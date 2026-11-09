@@ -371,7 +371,7 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	// and does not require an idle node.
 	if err := a.cfg.Checker.DownloadAndVerify(release, attempt.Candidate); err != nil {
 		a.cfg.Log("auto-update: download/verify failed: %v", err)
-		a.record(ResultDownloadFailed, true, release.TagName)
+		a.record(DownloadFailureResult(err), true, release.TagName)
 		return false
 	}
 	if ctx.Err() != nil {

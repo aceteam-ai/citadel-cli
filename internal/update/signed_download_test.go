@@ -320,4 +320,56 @@ func TestAutoUpdaterRefusesUnsignedRelease(t *testing.T) {
 	if n := f.archiveHits("v9.9.9"); n != 0 {
 		t.Fatalf("archive fetched %d times for an unsigned release", n)
 	}
+	assertResult(t, ResultSignatureMissing)
+}
+
+func TestDownloadFailureResultClassifiesSignatureRefusals(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want string
+	}{
+		"missing":   {fmt.Errorf("v1.2.3: %w", ErrUnsignedRelease), ResultSignatureMissing},
+		"bad sig":   {fmt.Errorf("%w: v1.2.3: %w", ErrReleaseSignature, releasesig.ErrBadSignature), ResultSignatureInvalid},
+		"unknown":   {fmt.Errorf("%w: v1.2.3: %w", ErrReleaseSignature, releasesig.ErrUnknownKey), ResultSignatureInvalid},
+		"transient": {errors.New("connection reset"), ResultDownloadFailed},
+		"mismatch":  {errors.New("checksum mismatch: expected a, got b"), ResultDownloadFailed},
+	}
+	for name, tc := range cases {
+		if got := DownloadFailureResult(tc.err); got != tc.want {
+			t.Errorf("%s: %s, want %s", name, got, tc.want)
+		}
+		if got := IsReleaseSignatureError(tc.err); got != (tc.want != ResultDownloadFailed) {
+			t.Errorf("%s: IsReleaseSignatureError = %v", name, got)
+		}
+	}
+}
+
+// TestAutoUpdaterRecordsSignatureInvalid covers a present-but-bad signature
+// (here, a signed checksums file replayed under a newer tag).
+func TestAutoUpdaterRecordsSignatureInvalid(t *testing.T) {
+	isolateState(t)
+	f := newFakeReleaseServer(t)
+	f.latest = "v9.9.9"
+	s := newTestSigner(t)
+	archive := testArchive(t, []byte("old"))
+	oldSums := checksumsFor("v9.9.8", archive)
+	f.mu.Lock()
+	f.assets["v9.9.9/"+platformArchiveName("v9.9.9")] = archive
+	f.assets["v9.9.9/checksums.txt"] = oldSums
+	f.assets["v9.9.9/checksums.txt.sig"] = s.sign(t, oldSums)
+	f.mu.Unlock()
+
+	c := f.client("v1.0.0")
+	c.trustedKeys = s.keys
+	applied := false
+	u := NewAutoUpdater(AutoUpdaterConfig{
+		Checker:    c,
+		Apply:      func(string) error { applied = true; return nil },
+		Restart:    func() error { return nil },
+		BeginDrain: func() func() { return func() {} },
+	})
+	if u.runOnce(context.Background()) || applied {
+		t.Fatal("a replayed signed checksums file reached apply")
+	}
+	assertResult(t, ResultSignatureInvalid)
 }
