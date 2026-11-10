@@ -460,6 +460,27 @@ func writeExclusive(path string, data []byte, mode os.FileMode) error {
 	return f.Close()
 }
 
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// splitBOM separates a leading UTF-8 byte order mark (Windows PowerShell 5.1
+// writes one) from the content. Other encodings are refused by name, because
+// parsing them as UTF-8 would fail confusingly or corrupt the file.
+func splitBOM(path string, data []byte) (content []byte, bom bool, err error) {
+	switch {
+	case bytes.HasPrefix(data, []byte{0xFF, 0xFE, 0x00, 0x00}):
+		return nil, false, fmt.Errorf("%s is encoded as UTF-32 (little endian); re-save it as UTF-8 or paste the block by hand", path)
+	case bytes.HasPrefix(data, []byte{0x00, 0x00, 0xFE, 0xFF}):
+		return nil, false, fmt.Errorf("%s is encoded as UTF-32 (big endian); re-save it as UTF-8 or paste the block by hand", path)
+	case bytes.HasPrefix(data, []byte{0xFF, 0xFE}):
+		return nil, false, fmt.Errorf("%s is encoded as UTF-16 (little endian); re-save it as UTF-8 or paste the block by hand", path)
+	case bytes.HasPrefix(data, []byte{0xFE, 0xFF}):
+		return nil, false, fmt.Errorf("%s is encoded as UTF-16 (big endian); re-save it as UTF-8 or paste the block by hand", path)
+	case bytes.HasPrefix(data, utf8BOM):
+		return data[len(utf8BOM):], true, nil
+	}
+	return data, false, nil
+}
+
 // mergeHarnessConfig writes the entry into the harness file, keeping every
 // other setting. A symlinked config (dotfile managers) is written through to
 // its target, and the file's mode is kept. A backup of the previous file is
@@ -489,14 +510,22 @@ func mergeHarnessConfig(h harnessSpec, path, exe string, confirm func(string) bo
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("read %s: %w", target, err)
 	}
+	content, hadBOM, err := splitBOM(path, old)
+	if err != nil {
+		return "", err
+	}
 	var next []byte
 	if h.format == "toml" {
-		next, err = mergeTOML(path, old, h, exe)
+		next, err = mergeTOML(path, content, h, exe)
 	} else {
-		next, err = mergeJSON(path, old, h.keyPath(), h.entry(exe), confirm)
+		next, err = mergeJSON(path, content, h.keyPath(), h.entry(exe), confirm)
 	}
 	if err != nil {
 		return "", err
+	}
+	if hadBOM {
+		// Keep the file's own choice; the backup below stays the original bytes.
+		next = append(append([]byte{}, utf8BOM...), next...)
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return "", err
@@ -656,6 +685,9 @@ func detectHarnessConfigs(env harnessEnv) []harnessConfigStatus {
 			continue
 		}
 		st.Found = true
+		if c, _, err := splitBOM(st.Path, data); err == nil {
+			data = c
+		}
 		var servers map[string]any
 		if h.format == "toml" {
 			var doc map[string]any
