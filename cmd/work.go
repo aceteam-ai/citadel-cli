@@ -371,6 +371,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		runHPCWork(cmd, args)
 		return
 	}
+	if set := hpcFlagsOutsideProfile(cmd.Flags()); len(set) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: %s only apply with --profile hpc.\n", strings.Join(set, ", "))
+		os.Exit(2)
+	}
 	// citadel#853: --node-dir/CITADEL_NODE_DIR redirects manifest resolution
 	// but NOT the module lockfile (catalog.LockfilePath, still hardcoded to
 	// platform.ConfigDir()). liveModuleOps.Install/Uninstall -- the reconcile

@@ -1804,6 +1804,14 @@ two-allocation subprocess test pins that no resolved path leaves the job root.
 separate positive list (`newHPCRunner`, `hpcQueueNames`), not gates inside
 `runWork`. `hpc_work_tripwire_test.go` lists the entry points it must never
 reference, and `hpcTemplateBuiltinPolicy` owns which template builtins run.
+`cmd.enrollHPCNode` owns non-interactive enrollment (aceteam#12717): it
+resolves labels with `hpc.ResolveLabels` (the platform's strict label schema,
+so a missing Slurm value refuses before the token is read), then
+`hpc.ReadTokenFile` (owner-only regular file, removed after reading), and
+persists the response into the job-local `config.yaml` and identity store.
+`hpcShutdown` owns exit ordering: on the drain signal (SIGUSR1) stop claiming,
+wait up to `--hpc-drain-timeout`, deregister, cancel; SIGTERM deregisters at
+once. Deregistration runs once on every exit path after enrollment.
 
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,

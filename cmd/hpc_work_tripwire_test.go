@@ -15,6 +15,10 @@ import (
 var hpcProfileSourceFiles = []string{
 	"hpc_work.go",
 	"profile.go",
+	"hpc_enroll.go",
+	"hpc_shutdown.go",
+	"../internal/hpc/enroll.go",
+	"../internal/hpc/labels.go",
 	"../internal/hpc/layout.go",
 	"../internal/hpcscope/scope.go",
 }
