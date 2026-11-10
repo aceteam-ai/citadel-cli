@@ -365,6 +365,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 const workSessionMode = nodesession.Worker
 
 func runWork(cmd *cobra.Command, args []string) {
+	// The hpc profile (aceteam#12715) has its own entry point built from a
+	// positive list of parts; nothing below this line runs under it.
+	if hpcProfileActive() {
+		runHPCWork(cmd, args)
+		return
+	}
 	// citadel#853: --node-dir/CITADEL_NODE_DIR redirects manifest resolution
 	// but NOT the module lockfile (catalog.LockfilePath, still hardcoded to
 	// platform.ConfigDir()). liveModuleOps.Install/Uninstall -- the reconcile

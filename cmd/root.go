@@ -118,6 +118,17 @@ control center. All other subcommands are for scripting and advanced use.`,
 			// Explicit read-only viewing skips mutating agent startup only.
 			return
 		}
+		// A run profile (the hpc profile, aceteam#12715) is selected and
+		// validated right after the two exact-leaf exemptions above (which do
+		// no startup work) and before every other startup step, so no path
+		// under it reads host config, repairs or checks for an update, or
+		// contacts the fabric with host state.
+		if handled, err := applyRunProfile(cmd, args); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(2)
+		} else if handled {
+			return
+		}
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr FIRST,
 		// before any Log()/Debug() call in this function -- including
@@ -320,6 +331,10 @@ func checkForUpdateOnStartup(silent bool) {
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	hideAdvancedCommands()
+	if err := hpcEarlyRefusal(rootCmd, os.Args[1:], os.Getenv); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
 	err := rootCmd.Execute()
 	if err != nil {
 		os.Exit(1)
