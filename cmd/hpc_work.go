@@ -350,6 +350,18 @@ func runHPCWorkProcess(parent context.Context, layout hpc.Layout, opts hpcWorkOp
 	ctx, cancel := context.WithCancel(contextOrBackground(parent))
 	defer cancel()
 
+	// Register first: SIGUSR1's default action terminates the process, so a
+	// drain forwarded while the lock or enrollment is still in progress must
+	// already have a handler.
+	termSigs := make(chan os.Signal, 1)
+	signal.Notify(termSigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(termSigs)
+	drainSigs := make(chan os.Signal, 1)
+	if len(hpcDrainSignals) > 0 {
+		signal.Notify(drainSigs, hpcDrainSignals...)
+		defer signal.Stop(drainSigs)
+	}
+
 	// One worker per job root. The lock lives under the job's own network
 	// state dir, so concurrent allocations never contend with each other.
 	lock, err := worklock.Acquire(network.GetStateDir(), Version, Log)
@@ -384,14 +396,7 @@ func runHPCWorkProcess(parent context.Context, layout hpc.Layout, opts hpcWorkOp
 	}
 	defer func() { _ = shutdown.deregisterOnce() }()
 
-	termSigs := make(chan os.Signal, 1)
-	signal.Notify(termSigs, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(termSigs)
-	drainSigs := make(chan os.Signal, 1)
-	if len(hpcDrainSignals) > 0 {
-		signal.Notify(drainSigs, hpcDrainSignals...)
-		defer signal.Stop(drainSigs)
-	}
+	// Signals buffered during the lock and enrollment are handled here.
 	go watchHPCSignals(ctx, termSigs, drainSigs, shutdown)
 
 	state := worker.NewWorkerState()
