@@ -3600,3 +3600,39 @@ Auto-generated log of every release.
   - fix(meetings): select Teams audio before muting devices (#1549)
 
 
+---
+
+## v2.216.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 22 |
+| Files changed | 56 |
+| Lines added | +7119 |
+
+**Changes:**
+
+  - Merge pull request #1608 from aceteam-ai/feat/hpc-launch
+  - Merge pull request #1607 from aceteam-ai/feat/hpc-enroll
+  - Merge pull request #1606 from aceteam-ai/feat/hpc-profile
+  - merge feat/hpc-enroll
+  - merge feat/hpc-profile
+  - test(hpc): make privateTempDir available on every platform
+  - merge feat/hpc-enroll
+  - test(hpc): explicit private temp dir for enroll fixtures
+  - merge feat/hpc-profile
+  - test(hpc): drop the cmd-wide umask, use explicit private temp dirs for hpc fixtures
+  - style(hpc): gofmt
+  - fix(hpc): harden vLLM flags, readiness owner check, caches, GPU forms and exit codes
+  - merge origin/feat/hpc-enroll
+  - fix(hpc): deregister on SIGTERM during drain and on partial enroll failure, harden token and leaf handling
+  - merge origin/feat/hpc-profile
+  - fix(hpc): reject group-writable job bases, gate every command, route llm_inference to the job engine only
+  - fix(hpc): require an explicit --auth-service on launch; test the child worker argv
+  - feat(hpc): login-node launcher and in-job supervisor (aceteam#12718)
+  - fix(hpc): register drain and terminate handlers before the lock and enrollment
+  - feat(hpc): non-interactive HPC enrollment, drain and deregister (aceteam#12717)
+  - fix(hpc): keep exact-leaf exemptions first and accept inherited global flags
+  - feat(hpc): job-scoped --profile hpc with an API-only worker (aceteam#12715)
+
+
