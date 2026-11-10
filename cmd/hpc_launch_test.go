@@ -192,3 +192,25 @@ func TestNormalizeHPCRunSpec(t *testing.T) {
 		t.Fatal("a --host override was accepted inside the job")
 	}
 }
+
+// TestHPCWorkerChildArgvIsAccepted parses the exact child command line the
+// job body runs through the cobra tree and the profile's flag check.
+func TestHPCWorkerChildArgvIsAccepted(t *testing.T) {
+	spec := hpc.JobSpec{TokenFile: "/t", DrainTimeout: 2 * time.Minute, AuthService: "https://platform.example",
+		StateRoot: "/scratch/s", CACert: "/etc/ssl/site-ca.pem"}
+	argv, _ := hpcWorkerCommand("/opt/citadel", spec, 40123, nil)
+	c, rest, err := rootCmd.Find(argv[1:])
+	if err != nil || c.Name() != "work" {
+		t.Fatalf("find: %v %v", c, err)
+	}
+	resetParsedFlags(t, c.Flags(), rootCmd.PersistentFlags())
+	if err := c.ParseFlags(rest); err != nil {
+		t.Fatal(err)
+	}
+	if got := hpcRefusedWorkFlags(c.Flags(), c.InheritedFlags()); len(got) != 0 {
+		t.Fatalf("the job body's own worker command is refused: %v", got)
+	}
+	if hpcTokenFileFlag != "/t" || hpcDrainTimeoutFlag != 2*time.Minute {
+		t.Fatalf("flags not parsed: %q %v", hpcTokenFileFlag, hpcDrainTimeoutFlag)
+	}
+}

@@ -252,6 +252,11 @@ var hpcLaunchCmd = &cobra.Command{
 			fail(err)
 		}
 		spec.Runtime = rt
+		// The token is consumed by whichever platform the job contacts, so the
+		// platform must be named explicitly rather than taken from the default.
+		if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
+			fail(errors.New("pass --auth-service (the platform that minted the enrollment token)"))
+		}
 		spec.AuthService = authServiceURL
 		spec.CACert = caCertPath
 		spec.StateRoot = hpcStateRootFlag
