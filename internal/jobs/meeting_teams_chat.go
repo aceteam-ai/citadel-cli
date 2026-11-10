@@ -3,6 +3,7 @@ package jobs
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 )
@@ -93,21 +94,38 @@ func postTeamsChat(page chatEvaluator, text string) error {
 	return nil
 }
 
+// teamsReadbackDelay is the pause before the single read-back retry; Teams can
+// take a moment to render a just-sent message. A var so tests can shorten it.
+var teamsReadbackDelay = time.Second
+
+// teamsChatKey identifies a chat row by index plus normalized text, so a
+// re-render that shifts indices does not resurface an old row as new.
+func teamsChatKey(m MeetChatMessage) string {
+	return fmt.Sprintf("%d|%s", m.Index, normalizeChatText(m.Text))
+}
+
 // announceTeamsOnAdmission posts the owner disclosure in Teams chat. The
 // announcement text is registered in botMessages BEFORE posting so its own
 // "/ace leave" is never mistaken for a command. Returns true only when the
-// post is read back in the chat; any failure returns false and recording
-// continues.
-func (h *MeetingJoinHandler) announceTeamsOnAdmission(ctx JobContext, page chatEvaluator, botMessages map[string]struct{}, p meetingJoinParams) bool {
+// post is read back in the chat (two tries, about a second apart); any failure
+// returns false and recording continues. seen is seeded with every row present
+// at admission plus the bot's own post: Teams chat persists across sessions of
+// the same meeting, so an old or pre-admission "/ace leave" must not count.
+func (h *MeetingJoinHandler) announceTeamsOnAdmission(ctx JobContext, page chatEvaluator, botMessages map[string]struct{}, seen map[string]struct{}, p meetingJoinParams) bool {
 	text := meetingpolicy.Announcement(p.BotDisplayName, p.OwnerDisplayName)
-	botMessages[normalizeChatText(text)] = struct{}{}
+	want := normalizeChatText(text)
+	botMessages[want] = struct{}{}
 
 	if err := openTeamsChat(page); err != nil {
 		ctx.Log("warn", "     - could not open Teams chat to announce (non-fatal, selector unverified): %v", err)
 	}
 	before, readErr := readTeamsChat(page)
+	if readErr != nil {
+		ctx.Log("warn", "     - could not read Teams chat at admission (non-fatal): %v", readErr)
+	}
 	lastIndex := -1
 	for _, m := range before {
+		seen[teamsChatKey(m)] = struct{}{}
 		if m.Index > lastIndex {
 			lastIndex = m.Index
 		}
@@ -116,17 +134,30 @@ func (h *MeetingJoinHandler) announceTeamsOnAdmission(ctx JobContext, page chatE
 		ctx.Log("warn", "     - could not post disclosure to Teams chat (non-fatal, selector unverified): %v", err)
 		return false
 	}
-	if readErr != nil || ctx.Context().Err() != nil {
+	if readErr != nil {
 		return false
 	}
-	after, err := readTeamsChat(page)
-	if err != nil || ctx.Context().Err() != nil {
-		return false
-	}
-	for _, m := range after {
-		if m.Index > lastIndex && normalizeChatText(m.Text) == normalizeChatText(text) {
-			ctx.Log("info", "     - confirmed disclosure in Teams chat")
-			return true
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Context().Done():
+				return false
+			case <-time.After(teamsReadbackDelay):
+			}
+		}
+		if ctx.Context().Err() != nil {
+			return false
+		}
+		after, err := readTeamsChat(page)
+		if err != nil {
+			continue
+		}
+		for _, m := range after {
+			if m.Index > lastIndex && normalizeChatText(m.Text) == want {
+				seen[teamsChatKey(m)] = struct{}{}
+				ctx.Log("info", "     - confirmed disclosure in Teams chat")
+				return true
+			}
 		}
 	}
 	return false
@@ -134,17 +165,19 @@ func (h *MeetingJoinHandler) announceTeamsOnAdmission(ctx JobContext, page chatE
 
 // teamsLeaveRequested scans new Teams chat messages for a standalone `/ace
 // leave` (exact normalized message, never a substring), skipping the bot's own
-// messages. seen is updated. Fails soft: a read error means no leave.
-func teamsLeaveRequested(page chatEvaluator, seen map[int]struct{}, own map[string]struct{}) bool {
+// messages. seen (index plus text keys) is updated. Fails soft: a read error
+// means no leave.
+func teamsLeaveRequested(page chatEvaluator, seen map[string]struct{}, own map[string]struct{}) bool {
 	msgs, err := readTeamsChat(page)
 	if err != nil {
 		return false
 	}
 	for _, m := range msgs {
-		if _, ok := seen[m.Index]; ok {
+		k := teamsChatKey(m)
+		if _, ok := seen[k]; ok {
 			continue
 		}
-		seen[m.Index] = struct{}{}
+		seen[k] = struct{}{}
 		norm := normalizeChatText(m.Text)
 		if _, isOwn := own[norm]; isOwn {
 			continue

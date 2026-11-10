@@ -69,7 +69,7 @@ func TestTeamsDisclosurePostedOnAdmission(t *testing.T) {
 	page := &teamsChatPage{}
 	own := map[string]struct{}{}
 	h := &MeetingJoinHandler{}
-	ok := h.announceTeamsOnAdmission(JobContext{Ctx: context.Background()}, page, own, teamsTestParams())
+	ok := h.announceTeamsOnAdmission(JobContext{Ctx: context.Background()}, page, own, map[string]struct{}{}, teamsTestParams())
 	if !ok || len(page.posted) != 1 {
 		t.Fatalf("ok=%v posted=%v", ok, page.posted)
 	}
@@ -86,7 +86,7 @@ func TestTeamsDisclosureFailedPostReportsFalse(t *testing.T) {
 	h := &MeetingJoinHandler{}
 	own := map[string]struct{}{}
 	page := &teamsChatPage{postErr: errors.New("no composer")}
-	if h.announceTeamsOnAdmission(JobContext{Ctx: context.Background()}, page, own, teamsTestParams()) {
+	if h.announceTeamsOnAdmission(JobContext{Ctx: context.Background()}, page, own, map[string]struct{}{}, teamsTestParams()) {
 		t.Fatal("failed post must report false")
 	}
 	if len(own) != 1 {
@@ -94,7 +94,7 @@ func TestTeamsDisclosureFailedPostReportsFalse(t *testing.T) {
 	}
 	// post succeeds but never shows up in chat: not confirmed
 	page = &teamsChatPage{noEcho: true}
-	if h.announceTeamsOnAdmission(JobContext{Ctx: context.Background()}, page, map[string]struct{}{}, teamsTestParams()) {
+	if h.announceTeamsOnAdmission(JobContext{Ctx: context.Background()}, page, map[string]struct{}{}, map[string]struct{}{}, teamsTestParams()) {
 		t.Fatal("unconfirmed post must report false")
 	}
 }
@@ -105,7 +105,7 @@ func TestTeamsLeaveOnStandaloneCommandOnly(t *testing.T) {
 		{Index: 0, Text: meetingpolicy.Announcement("Notetaker", "Pat")}, // own echo
 		{Index: 1, Text: "please type /ace leave to remove it"},          // substring
 	}}
-	seen := map[int]struct{}{}
+	seen := map[string]struct{}{}
 	if teamsLeaveRequested(page, seen, own) {
 		t.Fatal("echo/substring must not leave")
 	}
@@ -114,7 +114,7 @@ func TestTeamsLeaveOnStandaloneCommandOnly(t *testing.T) {
 		t.Fatal("standalone command must leave")
 	}
 	page.readErr = errors.New("stale")
-	if teamsLeaveRequested(page, map[int]struct{}{}, own) {
+	if teamsLeaveRequested(page, map[string]struct{}{}, own) {
 		t.Fatal("read failure must fail soft")
 	}
 }
@@ -140,11 +140,69 @@ func TestTeamsWaitCancellationStillPrompt(t *testing.T) {
 	}
 }
 
-func TestRunMeetingLoopTeamsRecordsAfterFailedDisclosure(t *testing.T) {
-	page := &teamsChatPage{postErr: errors.New("no composer"), msgs: []MeetChatMessage{{Index: 0, Text: "/ace leave"}}}
-	h := &MeetingJoinHandler{StreamingEnabled: true}
-	out, err := h.runMeetingLoop(JobContext{Ctx: context.Background()}, page, teamsTestParams(), "/ws/m.wav", deathTestMedia{})
-	if err != nil || out.disclosurePosted || out.endReason != "ace_command_leave" {
-		t.Fatalf("out=%+v err=%v", out, err)
+func TestTeamsPreexistingLeaveIgnoredNewOneLeaves(t *testing.T) {
+	page := &teamsChatPage{msgs: []MeetChatMessage{{Index: 0, Sender: "Sam", Text: "/ace leave"}}}
+	h := &MeetingJoinHandler{}
+	own, seen := map[string]struct{}{}, map[string]struct{}{}
+	jc := JobContext{Ctx: context.Background()}
+	if !h.announceTeamsOnAdmission(jc, page, own, seen, teamsTestParams()) {
+		t.Fatal("disclosure should be confirmed")
 	}
+	if teamsLeaveRequested(page, seen, own) {
+		t.Fatal("pre-existing /ace leave must not leave")
+	}
+	page.msgs = append(page.msgs, MeetChatMessage{Index: len(page.msgs), Sender: "Sam", Text: "/ace leave"})
+	if !teamsLeaveRequested(page, seen, own) {
+		t.Fatal("new /ace leave after admission must leave")
+	}
+}
+
+func TestTeamsDisclosureReadbackRetries(t *testing.T) {
+	old := teamsReadbackDelay
+	teamsReadbackDelay = time.Millisecond
+	defer func() { teamsReadbackDelay = old }()
+	page := &teamsDelayedEchoPage{}
+	h := &MeetingJoinHandler{}
+	if !h.announceTeamsOnAdmission(JobContext{Ctx: context.Background()}, page, map[string]struct{}{}, map[string]struct{}{}, teamsTestParams()) {
+		t.Fatal("echo appearing on the second read must be confirmed")
+	}
+	// never appears: bounded, reports false
+	page = &teamsDelayedEchoPage{never: true}
+	if h.announceTeamsOnAdmission(JobContext{Ctx: context.Background()}, page, map[string]struct{}{}, map[string]struct{}{}, teamsTestParams()) {
+		t.Fatal("missing echo must report false")
+	}
+	if page.reads > 4 {
+		t.Fatalf("too many reads: %d", page.reads)
+	}
+}
+
+// teamsDelayedEchoPage renders the bot's post only from the second read after
+// posting.
+type teamsDelayedEchoPage struct {
+	teamsChatPage
+	never          bool
+	pending        string
+	readsSincePost int
+	reads          int
+}
+
+func (p *teamsDelayedEchoPage) Evaluate(js string) (any, error) {
+	if js == teamsChatReadJS() {
+		p.reads++
+		if p.pending != "" {
+			p.readsSincePost++
+			if p.readsSincePost >= 2 && !p.never {
+				p.msgs = append(p.msgs, MeetChatMessage{Index: len(p.msgs), Text: p.pending})
+				p.pending = ""
+			}
+		}
+		return p.teamsChatPage.Evaluate(js)
+	}
+	if strings.Contains(js, "teams chat input not found") {
+		p.noEcho = true
+		_, err := p.teamsChatPage.Evaluate(js)
+		p.pending = p.posted[len(p.posted)-1]
+		return true, err
+	}
+	return p.teamsChatPage.Evaluate(js)
 }
