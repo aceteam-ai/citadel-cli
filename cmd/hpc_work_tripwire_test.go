@@ -17,6 +17,9 @@ var hpcProfileSourceFiles = []string{
 	"profile.go",
 	"hpc_enroll.go",
 	"hpc_shutdown.go",
+	"hpc_launch.go",
+	"../internal/hpc/launch.go",
+	"../internal/hpc/venv.go",
 	"../internal/hpc/enroll.go",
 	"../internal/hpc/labels.go",
 	"../internal/hpc/layout.go",
@@ -81,5 +84,35 @@ func TestHPCEntryPointReferencesNoDisabledSurface(t *testing.T) {
 			}
 			return true
 		})
+	}
+}
+
+// TestHPCSupervisorListensOnlyOnLoopback pins that the job body's one
+// listener (the transient port probe) binds a 127.0.0.1 literal.
+func TestHPCSupervisorListensOnlyOnLoopback(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filepath.Clean("../internal/hpc/supervise.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Listen" {
+			return true
+		}
+		found++
+		lit, ok := call.Args[len(call.Args)-1].(*ast.BasicLit)
+		if !ok || !strings.HasPrefix(lit.Value, `"127.0.0.1:`) {
+			t.Errorf("%s: Listen must bind a 127.0.0.1 literal", fset.Position(call.Pos()))
+		}
+		return true
+	})
+	if found != 1 {
+		t.Fatalf("expected exactly one Listen call in supervise.go, found %d", found)
 	}
 }

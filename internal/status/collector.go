@@ -45,6 +45,7 @@ type Collector struct {
 	cacheReport      func() *CacheReport               // live cache-index attribution (citadel #682 P3), optional
 	jobTypes         func() []string                   // live registered worker job types (aceteam #9962), optional
 	permissions      func() *config.Permissions        // authoritative node permission policy, optional
+	visibleGPUs      []string                          // nil = all devices
 	appPods          func() []AppInfo                  // live hosted-app pod entries (CRAM A1, aceteam#9672), optional
 	sandboxedModules func() *SandboxedModuleCapability // generic sandboxed-module runtime availability (citadel-cli#1288), optional
 	nvrHealth        func() *NVRHealth                 // nvr module per-camera self-heal state (citadel-cli#1295), optional
@@ -120,6 +121,11 @@ type CollectorConfig struct {
 	// capability-aware dispatch. nil or an empty result leaves job_types omitted
 	// until the live runner is fully registered.
 	JobTypes func() []string
+	// VisibleGPUs, when non-nil, limits GPU metrics to these device indexes
+	// (CUDA_VISIBLE_DEVICES entries). A batch allocation reports only the GPUs
+	// its scheduler gave it; an empty non-nil slice reports none. nil (every
+	// ordinary node) reports all devices.
+	VisibleGPUs []string
 	// PermissionsProvider returns the authoritative node permission policy for
 	// capability advertisement. It is deliberately a provider, rather than a
 	// ConfigDir resolved inside status: a worker may run as root while a status
@@ -172,6 +178,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		cacheReport:      cfg.CacheReport,
 		jobTypes:         cfg.JobTypes,
 		permissions:      cfg.PermissionsProvider,
+		visibleGPUs:      cfg.VisibleGPUs,
 		appPods:          cfg.AppPods,
 		sandboxedModules: cfg.SandboxedModules,
 		nvrHealth:        cfg.NVRHealth,
@@ -769,7 +776,7 @@ func (c *Collector) collectGPUMetrics() []GPUMetrics {
 		gpuMetrics = append(gpuMetrics, metrics)
 	}
 
-	return gpuMetrics
+	return filterVisibleGPUs(gpuMetrics, c.visibleGPUs)
 }
 
 // collectServiceStatus gathers status for all configured services.
@@ -996,4 +1003,24 @@ func InferServicePort(serviceName string) int {
 	}
 
 	return 0
+}
+
+// filterVisibleGPUs keeps the metrics whose device index is listed. visible
+// nil keeps everything. Entries that are not indexes (UUIDs) match nothing,
+// so an unmappable list under-reports rather than over-reports.
+func filterVisibleGPUs(metrics []GPUMetrics, visible []string) []GPUMetrics {
+	if visible == nil {
+		return metrics
+	}
+	keep := make(map[string]bool, len(visible))
+	for _, v := range visible {
+		keep[strings.TrimSpace(v)] = true
+	}
+	out := make([]GPUMetrics, 0, len(metrics))
+	for _, m := range metrics {
+		if keep[strconv.Itoa(m.Index)] {
+			out = append(out, m)
+		}
+	}
+	return out
 }

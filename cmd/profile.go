@@ -70,7 +70,7 @@ func hpcProfileAllowsCommand(path string) bool {
 	case "citadel work", "citadel version":
 		return true
 	}
-	return isHPCSubcommand(path)
+	return isHPCSubcommand(path) && !isHPCLoginCommand(path)
 }
 
 // isHPCSubcommand reports whether path is `citadel hpc` or below it.
@@ -139,7 +139,7 @@ func applyRunProfile(cmd *cobra.Command, args []string) (bool, error) {
 		return false, err
 	}
 	// The hpc subtree always runs under the hpc profile.
-	if isHPCSubcommand(cmd.CommandPath()) && profile == "" {
+	if isHPCSubcommand(cmd.CommandPath()) && !isHPCLoginCommand(cmd.CommandPath()) && profile == "" {
 		profile = hpc.Profile
 	}
 	if profile == "" {

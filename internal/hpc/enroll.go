@@ -40,25 +40,8 @@ var ErrTokenUnavailable = errors.New("enrollment token unavailable (already used
 // refused. A token that was read is never left on disk: if removal fails the
 // read fails too.
 func ReadTokenFile(path string, uid int) (string, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return "", fmt.Errorf("enrollment token file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", errors.New("enrollment token file must be a regular file, not a symlink or device")
-	}
-	owner, err := ownerUID(info)
-	if err != nil {
+	if err := CheckTokenFile(path, uid); err != nil {
 		return "", err
-	}
-	if owner != uid {
-		return "", fmt.Errorf("enrollment token file is owned by uid %d, not %d", owner, uid)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return "", fmt.Errorf("enrollment token file has group or other permissions (%#o); expected 0600", info.Mode().Perm())
-	}
-	if info.Size() > maxTokenFileBytes {
-		return "", errors.New("enrollment token file is too large")
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -77,6 +60,32 @@ func ReadTokenFile(path string, uid int) (string, error) {
 		return "", errors.New("enrollment token file does not hold a single token")
 	}
 	return token, nil
+}
+
+// CheckTokenFile applies ReadTokenFile's custody checks without reading or
+// removing the file, so a launcher can refuse early on a login node.
+func CheckTokenFile(path string, uid int) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("enrollment token file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("enrollment token file must be a regular file, not a symlink or device")
+	}
+	owner, err := ownerUID(info)
+	if err != nil {
+		return err
+	}
+	if owner != uid {
+		return fmt.Errorf("enrollment token file is owned by uid %d, not %d", owner, uid)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("enrollment token file has group or other permissions (%#o); expected 0600", info.Mode().Perm())
+	}
+	if info.Size() > maxTokenFileBytes {
+		return errors.New("enrollment token file is too large")
+	}
+	return nil
 }
 
 // EnrollResponse is the platform's 200 body.

@@ -1812,6 +1812,16 @@ persists the response into the job-local `config.yaml` and identity store.
 `hpcShutdown` owns exit ordering: on the drain signal (SIGUSR1) stop claiming,
 wait up to `--hpc-drain-timeout`, deregister, cancel; SIGTERM deregisters at
 once. Deregistration runs once on every exit path after enrollment.
+The launcher (aceteam#12718): `hpc.JobSpec.Normalize` validates every value
+`hpc.RenderSbatch` writes (golden in `internal/hpc/testdata`), and `citadel hpc
+launch`/`setup` run on a login node with no profile. `hpc.Supervisor` owns the
+job body `citadel hpc run`: engine on a per-job 127.0.0.1 port in its own
+process group, `/v1/models` readiness, then the worker as a child
+`citadel work --profile hpc` with `CITADEL_VLLM_HOST_PORT` set (that env var,
+resolved at process init by `services.resolveVLLMHostPort`, is the adoption
+seam; the adoption record needs a numeric node id). Signals forward to the
+worker; the engine group is stopped on every exit path. Only `--runtime venv`
+runs; `hpc.ParseRuntime` refuses the reserved ones.
 
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,
