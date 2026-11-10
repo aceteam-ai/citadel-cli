@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
+	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -182,7 +184,9 @@ func buildHPCJobHandlers(o hpcHandlerOpts) ([]worker.JobHandler, error) {
 	if err := o.Policy.validate(); err != nil {
 		return nil, err
 	}
-	llm := worker.NewLLMInferenceHandler()
+	// Route only to the explicitly adopted job engine. No default-port
+	// fallback: on a shared node another user could bind a default port first.
+	llm := worker.NewLLMInferenceHandler().WithOnlyBackends(hpcEngineBackends(os.Getenv))
 	if o.Signer != nil {
 		llm = llm.WithSigner(o.Signer)
 	}
@@ -191,6 +195,20 @@ func buildHPCJobHandlers(o hpcHandlerOpts) ([]worker.JobHandler, error) {
 		llm = llm.WithFabricNodeIDResolver(func() string { return nodeID })
 	}
 	return []worker.JobHandler{llm}, nil
+}
+
+// hpcEngineBackends is the HPC profile's complete llm_inference routing table:
+// the job's own vLLM at 127.0.0.1 on the port named by CITADEL_VLLM_HOST_PORT,
+// and nothing when that variable is unset or invalid. The launcher (or the
+// operator who started a model server for this job) sets it; the profile never
+// guesses a port.
+func hpcEngineBackends(getenv func(string) string) map[string]string {
+	raw := strings.TrimSpace(getenv(services.EnvVLLMHostPort))
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1024 || port > 65535 {
+		return map[string]string{}
+	}
+	return map[string]string{"vllm": fmt.Sprintf("http://127.0.0.1:%d", port)}
 }
 
 // registerHPCRunnerHandlers adds RUN_JOB_TEMPLATE, which needs the runner's
@@ -425,8 +443,11 @@ func runHPCWorkProcess(parent context.Context, layout hpc.Layout, opts hpcWorkOp
 		WebSocketProxy:   http.ProxyFromEnvironment,
 	})
 	if err := connectWithBackoff(ctx, source); err != nil {
-		Log("worker connect aborted: %v", err)
-		return nil
+		if ctx.Err() != nil {
+			Log("worker connect aborted: %v", err)
+			return nil
+		}
+		return fmt.Errorf("connect to the API: %w", err)
 	}
 	client := source.Client()
 	client.SetNodeMeta(creds.NodeID, creds.NodeID)

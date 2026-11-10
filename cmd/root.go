@@ -333,6 +333,10 @@ func checkForUpdateOnStartup(silent bool) {
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	hideAdvancedCommands()
+	if err := hpcEarlyRefusal(rootCmd, os.Args[1:], os.Getenv); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
 	err := rootCmd.Execute()
 	if err != nil {
 		os.Exit(1)

@@ -71,8 +71,9 @@ func (s *hpcShutdown) deregisterOnce() error {
 	return s.deregErr
 }
 
-// drain is the response to the early drain signal (SIGUSR1).
-func (s *hpcShutdown) drain() {
+// drain is the response to the early drain signal (SIGUSR1). A cancelled
+// drainCtx (SIGTERM during the drain) ends the wait at once.
+func (s *hpcShutdown) drain(drainCtx context.Context) {
 	s.mu.Lock()
 	target := s.target
 	s.mu.Unlock()
@@ -85,7 +86,16 @@ func (s *hpcShutdown) drain() {
 		}
 		deadline := time.Now().Add(s.drainTimeout)
 		for target.ActiveJobs() > 0 && time.Now().Before(deadline) {
-			time.Sleep(poll)
+			select {
+			case <-drainCtx.Done():
+				s.logf("hpc: drain interrupted by a termination signal")
+				_ = s.deregisterOnce()
+				if s.cancel != nil {
+					s.cancel()
+				}
+				return
+			case <-time.After(poll):
+			}
 		}
 		if n := target.ActiveJobs(); n > 0 {
 			s.logf("hpc: drain timeout with %d job(s) still running", n)
@@ -106,8 +116,10 @@ func (s *hpcShutdown) terminate() {
 	}
 }
 
-// watchHPCSignals dispatches the first terminate or drain signal to the
-// shutdown sequence and returns. It also returns when ctx ends.
+// watchHPCSignals dispatches terminate and drain signals to the shutdown
+// sequence and returns when it has finished or ctx ends. A terminate signal
+// that arrives while a drain is waiting deregisters immediately: Slurm follows
+// SIGTERM with SIGKILL after a short grace, and a drain can run for minutes.
 func watchHPCSignals(ctx context.Context, term, drain <-chan os.Signal, s *hpcShutdown) {
 	select {
 	case <-term:
@@ -115,7 +127,24 @@ func watchHPCSignals(ctx context.Context, term, drain <-chan os.Signal, s *hpcSh
 		s.terminate()
 	case <-drain:
 		fmt.Println("\n   - Received drain signal...")
-		s.drain()
+		drainCtx, stopDrain := context.WithCancel(ctx)
+		defer stopDrain()
+		done := make(chan struct{})
+		go func() {
+			s.drain(drainCtx)
+			close(done)
+		}()
+		select {
+		case <-term:
+			fmt.Println("\n   - Received shutdown signal during drain, deregistering...")
+			stopDrain()
+			s.terminate()
+			<-done
+		case <-done:
+		case <-ctx.Done():
+			stopDrain()
+			<-done
+		}
 	case <-ctx.Done():
 	}
 }

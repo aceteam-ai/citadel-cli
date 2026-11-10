@@ -123,6 +123,32 @@ func TestPrepareRefusals(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+	t.Run("group writable base without sticky bit", func(t *testing.T) {
+		for _, mode := range []os.FileMode{0o770, 0o775, 0o770 | os.ModeSetgid} {
+			base := t.TempDir()
+			if err := os.Chmod(base, mode); err != nil {
+				t.Fatal(err)
+			}
+			l, _ := ResolveLayout(Inputs{JobID: "1", TmpDir: base})
+			if err := Prepare(l, os.Getuid()); err == nil || !strings.Contains(err.Error(), "sticky") {
+				t.Fatalf("mode %v: err = %v", mode, err)
+			}
+		}
+	})
+	t.Run("group writable ancestor without sticky bit", func(t *testing.T) {
+		parent := t.TempDir()
+		base := filepath.Join(parent, "scratch")
+		if err := os.Mkdir(base, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(parent, 0o770); err != nil {
+			t.Fatal(err)
+		}
+		l, _ := ResolveLayout(Inputs{JobID: "1", TmpDir: base})
+		if err := Prepare(l, os.Getuid()); err == nil || !strings.Contains(err.Error(), "sticky") {
+			t.Fatalf("err = %v", err)
+		}
+	})
 	t.Run("world writable base with sticky bit", func(t *testing.T) {
 		base := t.TempDir()
 		if err := os.Chmod(base, 0o777|os.ModeSticky); err != nil {

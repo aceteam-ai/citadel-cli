@@ -4,9 +4,15 @@ package hpc
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +20,7 @@ import (
 	"reflect"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -209,5 +216,51 @@ func TestHTTPClientHonorsProxyEnvironment(t *testing.T) {
 	}
 	if reflect.ValueOf(tr.Proxy).Pointer() != reflect.ValueOf(http.ProxyFromEnvironment).Pointer() {
 		t.Fatal("the enroll client does not use the environment proxy")
+	}
+}
+
+func TestReadTokenFileRefusesFIFOWithoutBlocking(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(p, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := ReadTokenFile(p, os.Getuid()); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("err = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ReadTokenFile blocked on a FIFO")
+	}
+	if _, err := os.Lstat(p); err != nil {
+		t.Fatal("a refused file must be left in place")
+	}
+}
+
+func TestVerifyLeafKey(t *testing.T) {
+	mk := func() (*ecdsa.PrivateKey, string) {
+		k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &k.PublicKey, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	}
+	k1, leaf1 := mk()
+	k2, _ := mk()
+	if err := VerifyLeafKey(leaf1, &k1.PublicKey); err != nil {
+		t.Fatalf("matching leaf refused: %v", err)
+	}
+	if err := VerifyLeafKey(leaf1, &k2.PublicKey); err == nil {
+		t.Fatal("a leaf for another key was accepted")
+	}
+	if err := VerifyLeafKey("", &k1.PublicKey); err == nil {
+		t.Fatal("an empty leaf was accepted")
+	}
+	if err := VerifyLeafKey("not pem", &k1.PublicKey); err == nil {
+		t.Fatal("garbage was accepted")
 	}
 }

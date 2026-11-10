@@ -2981,3 +2981,17 @@ func TestApplyTrustEngine_DetectorChecksRegistered(t *testing.T) {
 		}
 	})
 }
+
+func TestLLMInferenceOnlyBackendsRefusesUnlistedAndDefaultPorts(t *testing.T) {
+	h := NewLLMInferenceHandler().WithOnlyBackends(map[string]string{})
+	for _, backend := range []string{"vllm", "ollama", "llamacpp", "sglang", "bonsai", "unlimited-ocr"} {
+		job := &Job{ID: "j", Payload: map[string]any{"backend": backend, "model": "m", "prompt": "hi"}}
+		res, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res == nil || res.Status != JobStatusFailure || !strings.Contains(res.Error.Error(), "not available") {
+			t.Fatalf("%s: expected a refusal, got %+v", backend, res)
+		}
+	}
+}
