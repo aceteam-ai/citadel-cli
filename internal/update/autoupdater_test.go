@@ -533,10 +533,52 @@ func TestResolveMaxDefer(t *testing.T) {
 	}
 }
 
-func TestRestartProcessRunsHook(t *testing.T) {
-	var got string
-	SetBeforeRestartHook(func(d string) { got = d })
+func TestMaxDeferNotResetByNewRelease(t *testing.T) {
+	now := time.Now()
+	var applied, restarted int
+	var logs []string
+	u := deferTestUpdater(func() (bool, string) { return true, "handoff outstanding" }, time.Hour, &now, &applied, &restarted, &logs)
+	u.runOnce(context.Background())
+	now = now.Add(40 * time.Minute)
+	u.cfg.Checker.(*fakeChecker).release = &Release{TagName: "v9.9.10"} // a newer release
+	if u.runOnce(context.Background()) {
+		t.Fatal("still inside the bound")
+	}
+	now = now.Add(30 * time.Minute) // 70m after the FIRST deferral
+	if !u.runOnce(context.Background()) || applied != 1 {
+		t.Fatal("a new release tag must not restart the max-defer clock")
+	}
+}
+
+func TestBusyClearsStreak(t *testing.T) {
+	now := time.Now()
+	var applied, restarted int
+	var logs []string
+	busy := true
+	u := deferTestUpdater(func() (bool, string) { return busy, "viewer attached" }, time.Hour, &now, &applied, &restarted, &logs)
+	u.runOnce(context.Background())
+	busy = false
+	u.cfg.BeginDrain = nil
+	// not busy: proceeds and the streak is cleared
+	if !u.runOnce(context.Background()) {
+		t.Fatal("expected update when idle")
+	}
+	if !u.deferFirst.IsZero() {
+		t.Fatal("streak must clear when not busy")
+	}
+}
+
+func TestRestartHookRuns(t *testing.T) {
+	var gotReason, gotDetail string
+	calls := 0
+	SetBeforeRestartHook(func(r, d string) { calls++; gotReason, gotDetail = r, d })
 	defer SetBeforeRestartHook(nil)
-	runBeforeRestart()
-	_ = got // detail is empty without staged state; the hook ran without panicking
+	runBeforeRestart(RestartReasonNodeUpdate)
+	if calls != 1 || gotReason != "node_update" {
+		t.Fatalf("hook calls=%d reason=%q detail=%q", calls, gotReason, gotDetail)
+	}
+	runBeforeRestart("external_engine_change")
+	if calls != 2 || gotReason != "external_engine_change" || gotDetail != "" {
+		t.Fatalf("hook calls=%d reason=%q detail=%q", calls, gotReason, gotDetail)
+	}
 }

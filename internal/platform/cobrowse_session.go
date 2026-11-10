@@ -305,7 +305,7 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		startedAt:  time.Now(),
 		state:      SessionLaunching,
 		encProfile: profile,
-		regDir:     m.registryDir(),
+		regDir:     m.sessionRegDir(),
 		generation: 1,
 	}
 	m.sessions[id] = s
@@ -753,7 +753,6 @@ func (m *CobrowseSessionManager) sweep() {
 	// otherwise reap them as orphans (citadel-cli#1546).
 	m.recoverSessions()
 	activeBrowserRunner.SweepOrphans(m.baseDir)
-	m.pruneEnded()
 }
 
 // sweepXvfbSessions is the Linux runner's orphan sweep; see sweep above.

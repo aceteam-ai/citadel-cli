@@ -161,7 +161,7 @@ type AutoUpdaterConfig struct {
 type AutoUpdater struct {
 	cfg              AutoUpdaterConfig
 	lastApplyRefusal *SelfUpdateCapability
-	deferFirst       map[string]time.Time // target tag -> first deferral
+	deferFirst       time.Time // first deferral of the current busy streak; zero when not busy
 	deferLogAt       time.Time
 	deferLogReason   string
 }
@@ -194,18 +194,16 @@ func (a *AutoUpdater) deferForBusy(tag string) bool {
 	}
 	busy, reason := a.cfg.Busy()
 	if !busy {
-		delete(a.deferFirst, tag)
+		a.deferFirst = time.Time{}
 		return false
 	}
 	now := a.cfg.Now()
-	if a.deferFirst == nil {
-		a.deferFirst = map[string]time.Time{}
+	// One clock for the whole busy streak, not per release: a new tag must not
+	// restart the bound, or an abandoned handoff could defer updates forever.
+	if a.deferFirst.IsZero() {
+		a.deferFirst = now
 	}
-	first, seen := a.deferFirst[tag]
-	if !seen {
-		first = now
-		a.deferFirst[tag] = now
-	}
+	first := a.deferFirst
 	if a.cfg.MaxDefer > 0 && now.Sub(first) >= a.cfg.MaxDefer {
 		a.cfg.Log("auto-update: deferred %s for %s (%s); proceeding anyway", tag, a.cfg.MaxDefer, reason)
 		return false

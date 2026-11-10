@@ -4398,9 +4398,12 @@ only if owner, browser and Xvfb start times, role, CDP identity and dir all
 verify, BEFORE the orphan sweep (which treats a dir owned by our own PID as
 stale). A live record that fails becomes `expired` with its `ended_reason`, never
 a silent delete; suspended records are never touched. Adoption is Linux only
-(`adoptionSupported`); elsewhere `PrepareSelfRestart` stops sessions cleanly.
-A re-adopted persistent-profile session has lost its unlocked key, so its later
-stop cannot re-seal the profile. A full service restart (control-group kill)
+(`adoptionSupported`); elsewhere it stops sessions cleanly.
+Only the node-wide manager adopts, and only a record whose owner is this very
+process (same PID and start time, as after exec); local mode and a live sibling's
+records are never adopted or modified. Persistent-profile sessions are sealed and
+stopped by `prepareSelfRestart` on every OS, and ended reasons are recorded on
+every OS. A full service restart (control-group kill)
 still kills browsers; detaching them is separate work.
 
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op

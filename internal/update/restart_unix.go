@@ -10,12 +10,12 @@ import (
 	"syscall"
 )
 
-// RestartProcess re-execs the current process onto the freshly-installed binary
+// restartProcess re-execs the current process onto the freshly-installed binary
 // using execve(2). The PID is preserved and the new binary takes over the
 // process image, so this works both for foreground runs and under a supervisor
 // (systemd Restart=always). On success this call does not return.
-func RestartProcess() error {
-	runBeforeRestart()
+func restartProcess(reason string) error {
+	runBeforeRestart(reason)
 	path, err := GetCurrentBinaryPath()
 	if err != nil {
 		return fmt.Errorf("resolve current binary: %w", err)

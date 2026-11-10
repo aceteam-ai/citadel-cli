@@ -36,26 +36,6 @@ func (e *SessionEndedError) Error() string {
 	return fmt.Sprintf("browser session %q ended: ended_reason=%s%s", e.ID, e.Reason, d)
 }
 
-// MarkLiveSessionsEnded stamps every live session's registry record with the
-// reason it will end if it does not survive the coming restart. It stops
-// nothing. A session that is re-adopted rewrites its record and drops the stamp.
-func (m *CobrowseSessionManager) MarkLiveSessionsEnded(reason, detail string) error {
-	m.mu.Lock()
-	all := make([]*cobrowseSession, 0, len(m.sessions))
-	for _, s := range m.sessions {
-		all = append(all, s)
-	}
-	m.mu.Unlock()
-	at := time.Now().UTC().Format(time.RFC3339)
-	for _, s := range all {
-		s.mu.Lock()
-		s.pendingEnd = &EndedSession{Reason: reason, Detail: detail, At: at}
-		s.mu.Unlock()
-		s.persistRecord()
-	}
-	return nil
-}
-
 // EndedSession looks up a session that ended with a recorded reason.
 func (m *CobrowseSessionManager) EndedSession(id string) (EndedSession, bool) {
 	if !sessionIDPattern.MatchString(id) {
@@ -74,9 +54,6 @@ func (m *CobrowseSessionManager) EndedSession(id string) (EndedSession, bool) {
 	}
 	return EndedSession{ID: id, Reason: rec.EndedReason, Detail: rec.EndedDetail, At: rec.EndedAt}, true
 }
-
-// pruneEnded is retained by the sweep hook; expiry is handled in recoverSessions.
-func (m *CobrowseSessionManager) pruneEnded() {}
 
 // BusySession names a session that should not be interrupted by a restart.
 type BusySession struct{ ID, Why string }
@@ -118,16 +95,62 @@ func CobrowseBusy() (bool, string) {
 	return false, ""
 }
 
-// PrepareSelfRestart runs just before the process replaces itself for an
-// update. It records why live sessions may end. On platforms that can re-adopt
-// sessions it leaves them running; elsewhere it stops them cleanly first, as a
-// normal shutdown does, so no logged-in browser is orphaned.
-func PrepareSelfRestart(detail string) {
-	m := GetCobrowseSessionManager()
-	_ = m.MarkLiveSessionsEnded(EndedReasonNodeUpdate, detail)
-	if adoptionSupported {
+// PrepareSelfRestart runs just before the process replaces itself. It records
+// why sessions may end (see prepareSelfRestart) and, where nothing can be
+// re-adopted, stops the legacy single browser too so none is orphaned.
+func PrepareSelfRestart(reason, detail string) {
+	GetCobrowseSessionManager().prepareSelfRestart(reason, detail)
+	if !adoptionSupported {
+		_ = GetCobrowseManager().Stop()
+	}
+}
+
+// prepareSelfRestart decides each session's fate across the restart.
+//   - Persistent (encrypted profile) sessions are sealed and stopped on EVERY OS
+//     while their key is still unlocked: the single-session lock is in memory,
+//     so a surviving one would let a second session open the same profile.
+//   - Where adoption is unsupported every session is stopped cleanly.
+//   - Other sessions are left running with their record stamped with the reason
+//     they will end for if they do not survive.
+//
+// Every stopped session is recorded as ended with the reason, on every OS.
+func (m *CobrowseSessionManager) prepareSelfRestart(reason, detail string) {
+	m.mu.Lock()
+	all := make([]*cobrowseSession, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		all = append(all, s)
+	}
+	m.mu.Unlock()
+	for _, s := range all {
+		s.mu.Lock()
+		stop := !adoptionSupported || s.persistent || s.encProfile != nil
+		s.mu.Unlock()
+		if !stop {
+			_ = m.MarkSessionEnding(s, reason, detail)
+			continue
+		}
+		_ = m.Stop(s.id) // seals a persistent profile, closes its lock, removes the dir
+		m.recordEnded(s.id, reason, detail)
+	}
+}
+
+// MarkSessionEnding stamps one live session's record with its pending end.
+func (m *CobrowseSessionManager) MarkSessionEnding(s *cobrowseSession, reason, detail string) error {
+	s.mu.Lock()
+	s.pendingEnd = &EndedSession{Reason: reason, Detail: detail, At: time.Now().UTC().Format(time.RFC3339)}
+	s.mu.Unlock()
+	s.persistRecord()
+	return nil
+}
+
+// recordEnded writes an expired record so status can say why a stopped session
+// is gone. Works on every OS; a no-op for managers without a registry.
+func (m *CobrowseSessionManager) recordEnded(id, reason, detail string) {
+	if !m.useResolver {
 		return
 	}
-	_ = GetCobrowseManager().Stop()
-	_ = m.StopAll()
+	_ = saveRecord(m.registryDir(), sessionRecord{
+		Version: sessionRecordVersion, ID: id, State: RecordExpired,
+		EndedReason: reason, EndedDetail: detail, EndedAt: time.Now().UTC().Format(time.RFC3339),
+	})
 }

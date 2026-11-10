@@ -23,6 +23,7 @@ package platform
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -73,6 +74,18 @@ func (m *CobrowseSessionManager) registryDir() string {
 	}
 	return filepath.Clean(m.baseDir) + registryDirSuffix
 }
+
+// sessionRegDir is the registry dir for new sessions: only the node-wide
+// manager keeps records. Local mode and other isolated managers never do, so
+// nothing can adopt their browsers (their proxy guard dies with their process).
+func (m *CobrowseSessionManager) sessionRegDir() string {
+	if !m.useResolver {
+		return ""
+	}
+	return m.registryDir()
+}
+
+var errCDPCheck = errors.New("debug endpoint check failed")
 
 var sessionIDPattern = regexp.MustCompile(`^cb-[0-9a-f]+$`)
 
@@ -261,6 +274,12 @@ func listRecords(regDir string) []sessionRecord {
 	}
 	var out []sessionRecord
 	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > 10*time.Minute {
+				_ = os.Remove(filepath.Join(regDir, e.Name())) // crash leftover
+			}
+			continue
+		}
 		id := strings.TrimSuffix(e.Name(), ".json")
 		if e.IsDir() || id == e.Name() || !sessionIDPattern.MatchString(id) {
 			continue
@@ -326,13 +345,13 @@ func verifyAdoptable(baseDir, dir string, rec sessionRecord) error {
 	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
 		return fmt.Errorf("session dir is not a plain directory")
 	}
-	// Owner: either this very process (exec keeps PID and start time) or one
-	// that is gone. A live different owner is a sibling worker; leave it.
-	if rec.OwnerPID > 0 {
-		st, alive, err := procIdentity(rec.OwnerPID)
-		if err == nil && alive && st == rec.OwnerStart && rec.OwnerPID != os.Getpid() {
-			return fmt.Errorf("owned by live process %d", rec.OwnerPID)
-		}
+	// Only the exec case: the record's owner is THIS process (same PID and
+	// start time, both unchanged by exec). Anything else is not ours to take.
+	if rec.OwnerPID != os.Getpid() || rec.OwnerStart == 0 || rec.OwnerStart != currentOwnerIdentity() {
+		return fmt.Errorf("record was not written by this process")
+	}
+	if rec.Persistent {
+		return fmt.Errorf("persistent profile sessions are sealed, not adopted")
 	}
 	if rec.BrowserStart == 0 {
 		return fmt.Errorf("browser start time not recorded")
@@ -355,7 +374,7 @@ func verifyAdoptable(baseDir, dir string, rec sessionRecord) error {
 		return fmt.Errorf("bad debug port")
 	}
 	if err := adoptCDPCheck(rec.DebugPort, dir); err != nil {
-		return fmt.Errorf("debug endpoint check failed: %w", err)
+		return fmt.Errorf("%w: %v", errCDPCheck, err)
 	}
 	return nil
 }
@@ -423,7 +442,9 @@ func adoptedProc(rec sessionRecord) *cobrowseProc {
 // record that does not is marked expired (never silently deleted); suspended
 // records are left alone; expired ones are kept for expiredRetention.
 func (m *CobrowseSessionManager) recoverSessions() {
-	if !adoptionSupported {
+	// Only the node-wide manager recovers. Local mode and isolated managers
+	// fall through to the plain orphan sweep.
+	if !m.useResolver {
 		return
 	}
 	if err := ensureCobrowseBaseDir(m.baseDir); err != nil {
@@ -447,8 +468,23 @@ func (m *CobrowseSessionManager) recoverSessions() {
 		default:
 			continue
 		}
+		if !adoptionSupported {
+			continue
+		}
+		// A live record owned by ANOTHER running process is theirs: leave it
+		// exactly as it is (a monitor or second invocation must not touch it).
+		if rec.OwnerPID != os.Getpid() && rec.OwnerStart != 0 {
+			if st, alive, err := procIdentity(rec.OwnerPID); err == nil && alive && st == rec.OwnerStart {
+				continue
+			}
+		}
 		dir := filepath.Join(m.baseDir, rec.ID)
-		if err := verifyAdoptable(m.baseDir, dir, rec); err != nil {
+		err := verifyAdoptable(m.baseDir, dir, rec)
+		if errors.Is(err, errCDPCheck) { // a slow endpoint must not expire a healthy session
+			time.Sleep(500 * time.Millisecond)
+			err = verifyAdoptable(m.baseDir, dir, rec)
+		}
+		if err != nil {
 			log.Printf("[cobrowse] not adopting session %s: %v", rec.ID, err)
 			rec.State = RecordExpired
 			rec.EndedReason, rec.EndedDetail = endedReasonLost, ""
@@ -467,7 +503,6 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			regDir:          regDir,
 			state:           SessionRunning,
 			proc:            adoptedProc(rec),
-			persistent:      rec.Persistent,
 			explicitHandoff: rec.Handoff,
 			generation:      rec.Generation + 1,
 		}
@@ -480,12 +515,10 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			m.sessions[rec.ID] = s
 		}
 		m.mu.Unlock()
-		// Re-own: pidfile (the sweep's view) and record now name this process.
 		writeSessionPidfile(dir, os.Getpid(), rec.BrowserPID, rec.XvfbPID, currentProcessStartToken())
 		s.persistRecord()
 		log.Printf("[cobrowse] re-adopted session %s (generation %d)", rec.ID, s.generation)
 	}
-	// Bound the expired set.
 	if len(expired) > expiredMaxRecords {
 		sort.Slice(expired, func(i, j int) bool { return expired[i].EndedAt > expired[j].EndedAt })
 		for _, r := range expired[expiredMaxRecords:] {

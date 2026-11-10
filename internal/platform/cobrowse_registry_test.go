@@ -61,10 +61,17 @@ func newAdoptEnv(t *testing.T) *adoptEnv {
 	return e
 }
 
+// adoptMgr is a node-wide-style manager: the only kind that keeps records or adopts.
+func adoptMgr(base string) *CobrowseSessionManager {
+	m := newCobrowseSessionManager(base, 4)
+	m.useResolver = true
+	return m
+}
+
 func startOne(t *testing.T, base string) string {
 	t.Helper()
 	(&fakeLauncher{}).install(t)
-	m := newCobrowseSessionManager(base, 4)
+	m := adoptMgr(base)
 	st, err := m.StartSession("https://a.example")
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +88,7 @@ func TestRestartReadoptsSameSessionID(t *testing.T) {
 	id := startOne(t, base)
 
 	// "Restart": a brand new manager over the same base dir, no memory.
-	m2 := newCobrowseSessionManager(base, 4)
+	m2 := adoptMgr(base)
 	st, ok := m2.SessionStatus(id)
 	if !ok {
 		t.Fatal("session was not re-adopted")
@@ -128,21 +135,32 @@ func TestRestartDoesNotAdoptUnverifiable(t *testing.T) {
 				mut(env)
 			} else {
 				// Another live process owns the session.
-				reg := newCobrowseSessionManager(base, 4).registryDir()
+				reg := adoptMgr(base).registryDir()
 				rec, _ := loadRecord(reg, id)
 				rec.OwnerPID = 4242
 				rec.OwnerStart = 5
 				env.procs[4242] = fakeProc{5, true}
 				_ = saveRecord(reg, rec)
 			}
-			m2 := newCobrowseSessionManager(base, 4)
+			m2 := adoptMgr(base)
 			if _, ok := m2.SessionStatus(id); ok {
 				t.Fatal("adopted a session that failed verification")
 			}
-			_, err := os.Stat(filepath.Join(base, id))
-			// (The sibling-owner case only asserts non-adoption: the real pidAlive
-			// used by the sweep knows nothing of the fake process table.)
-			if name != "live other owner" && err == nil {
+			rec, rerr := loadRecord(m2.registryDir(), id)
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if name == "live other owner" {
+				// A running sibling's record is untouched: not expired, not rewritten.
+				if rec.State != RecordLive || rec.OwnerPID != 4242 {
+					t.Fatalf("sibling's live record was modified: %+v", rec)
+				}
+				return
+			}
+			if rec.State != RecordExpired {
+				t.Fatalf("unverifiable record state = %q, want expired", rec.State)
+			}
+			if _, err := os.Stat(filepath.Join(base, id)); err == nil {
 				t.Fatal("unverifiable session was not swept")
 			}
 		})
@@ -154,14 +172,14 @@ func TestUnadoptableLiveRecordBecomesExpiredWithReason(t *testing.T) {
 	base := trustedBaseDir(t)
 	id := startOne(t, base)
 
-	m1 := newCobrowseSessionManager(base, 4)
+	m1 := adoptMgr(base)
 	m1.Recover() // pre-restart view, adopts the live record
-	if err := m1.MarkLiveSessionsEnded(EndedReasonNodeUpdate, "to v9.9.9"); err != nil {
+	if err := func() error { m1.prepareSelfRestart(EndedReasonNodeUpdate, "to v9.9.9"); return nil }(); err != nil {
 		t.Fatal(err)
 	}
 	// The restart killed the browser.
 	env.procs[100001] = fakeProc{11, false}
-	m2 := newCobrowseSessionManager(base, 4)
+	m2 := adoptMgr(base)
 	if _, ok := m2.SessionStatus(id); ok {
 		t.Fatal("dead session must not be adopted")
 	}
@@ -188,7 +206,7 @@ func TestDeadLiveRecordWithoutIntentIsExpiredAsGone(t *testing.T) {
 	base := trustedBaseDir(t)
 	id := startOne(t, base)
 	env.procs[100001] = fakeProc{11, false}
-	m := newCobrowseSessionManager(base, 4)
+	m := adoptMgr(base)
 	m.Recover()
 	if e, ok := m.EndedSession(id); !ok || e.Reason != endedReasonLost {
 		t.Fatalf("ended = %+v %v", e, ok)
@@ -199,7 +217,7 @@ func TestSuspendedRecordSurvivesSweep(t *testing.T) {
 	newAdoptEnv(t)
 	base := trustedBaseDir(t)
 	id := startOne(t, base)
-	m := newCobrowseSessionManager(base, 4)
+	m := adoptMgr(base)
 	reg := m.registryDir()
 	rec, _ := loadRecord(reg, id)
 	rec.State = RecordSuspended
@@ -221,7 +239,7 @@ func TestStopDeletesRecord(t *testing.T) {
 	newAdoptEnv(t)
 	base := trustedBaseDir(t)
 	(&fakeLauncher{}).install(t)
-	m := newCobrowseSessionManager(base, 4)
+	m := adoptMgr(base)
 	st, _ := m.StartSession("https://a.example")
 	if err := m.Stop(st.ID); err != nil {
 		t.Fatal(err)
@@ -237,7 +255,7 @@ func TestStopDeletesRecord(t *testing.T) {
 func TestExpiredRetentionAndCap(t *testing.T) {
 	newAdoptEnv(t)
 	base := trustedBaseDir(t)
-	m := newCobrowseSessionManager(base, 4)
+	m := adoptMgr(base)
 	reg := m.registryDir()
 	mk := func(i int, age time.Duration) {
 		rec := sessionRecord{Version: 1, ID: fmt.Sprintf("cb-%04x", i), State: RecordExpired,
@@ -285,8 +303,8 @@ func TestResolverChoosesRegistryDirOnlyForSingleton(t *testing.T) {
 
 func TestNoSessionsNoRecordsNoBusy(t *testing.T) {
 	base := trustedBaseDir(t)
-	m := newCobrowseSessionManager(base, 4)
-	_ = m.MarkLiveSessionsEnded(EndedReasonNodeUpdate, "")
+	m := adoptMgr(base)
+	m.prepareSelfRestart(EndedReasonNodeUpdate, "")
 	if _, err := os.Stat(m.registryDir()); err == nil {
 		t.Fatal("registry dir created with no live sessions")
 	}
@@ -299,7 +317,7 @@ func TestBusyOnHandoff(t *testing.T) {
 	newAdoptEnv(t)
 	base := trustedBaseDir(t)
 	id := startOne(t, base)
-	m := newCobrowseSessionManager(base, 4)
+	m := adoptMgr(base)
 	m.Recover()
 	if len(m.BusySessions()) != 0 {
 		t.Fatal("plain running session must not be busy")
@@ -311,7 +329,7 @@ func TestBusyOnHandoff(t *testing.T) {
 		t.Fatalf("busy = %+v", b)
 	}
 	// Handoff survives a restart.
-	m3 := newCobrowseSessionManager(base, 4)
+	m3 := adoptMgr(base)
 	if b := m3.BusySessions(); len(b) != 0 {
 		t.Fatal("not recovered until first use")
 	}
@@ -329,5 +347,172 @@ func TestParseProcStat(t *testing.T) {
 	}
 	if _, alive, _ := parseProcStat(strings.Replace(line, ") S ", ") Z ", 1)); alive {
 		t.Fatal("zombie must not be alive")
+	}
+}
+
+func TestDeadOwnerRecordSweptNotAdopted(t *testing.T) {
+	env := newAdoptEnv(t)
+	base := trustedBaseDir(t)
+	id := startOne(t, base)
+	m := adoptMgr(base)
+	rec, _ := loadRecord(m.registryDir(), id)
+	rec.OwnerPID, rec.OwnerStart = 4343, 9 // a crashed predecessor
+	_ = saveRecord(m.registryDir(), rec)
+	_ = env
+	if _, ok := m.SessionStatus(id); ok {
+		t.Fatal("a record written by another (dead) process must not be adopted")
+	}
+	got, _ := loadRecord(m.registryDir(), id)
+	if got.State != RecordExpired {
+		t.Fatalf("state = %q", got.State)
+	}
+	if _, err := os.Stat(filepath.Join(base, id)); err == nil {
+		t.Fatal("dead owner's session dir must be swept")
+	}
+}
+
+func TestSelfPIDWithoutOwnerStartNotAdopted(t *testing.T) {
+	newAdoptEnv(t)
+	base := trustedBaseDir(t)
+	id := startOne(t, base)
+	m := adoptMgr(base)
+	rec, _ := loadRecord(m.registryDir(), id)
+	rec.OwnerStart = 0
+	_ = saveRecord(m.registryDir(), rec)
+	if _, ok := m.SessionStatus(id); ok {
+		t.Fatal("owner identity must be non-zero and match")
+	}
+}
+
+func TestLocalModeNeverAdopts(t *testing.T) {
+	newAdoptEnv(t)
+	base := trustedBaseDir(t)
+	id := startOne(t, base)                     // a node-wide manager left a live record
+	local := newCobrowseSessionManager(base, 4) // local mode: isolated, no resolver
+	if _, ok := local.SessionStatus(id); ok {
+		t.Fatal("local mode adopted a browser it did not launch")
+	}
+	rec, err := loadRecord(local.registryDir(), id)
+	if err != nil || rec.State != RecordLive {
+		t.Fatalf("local mode must not touch records: %+v %v", rec, err)
+	}
+	// And a local-mode session writes no record at all.
+	(&fakeLauncher{}).install(t)
+	st, err := local.StartSession("https://a.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(recordFile(local.registryDir(), st.ID)); err == nil {
+		t.Fatal("local mode session wrote a registry record")
+	}
+}
+
+type lockingProfile struct {
+	mu                sync.Mutex
+	locked, persisted bool
+}
+
+func (p *lockingProfile) Materialize(string) error { return nil }
+func (p *lockingProfile) Persist(string) error {
+	p.mu.Lock()
+	p.persisted = true
+	p.mu.Unlock()
+	return nil
+}
+func (p *lockingProfile) Close() error { p.mu.Lock(); p.locked = false; p.mu.Unlock(); return nil }
+func (p *lockingProfile) open() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.locked {
+		return errors.New("profile in use")
+	}
+	p.locked = true
+	return nil
+}
+
+func TestPersistentSessionSealedAndStoppedBeforeRestart(t *testing.T) {
+	newAdoptEnv(t)
+	base := trustedBaseDir(t)
+	(&fakeLauncher{}).install(t)
+	m := adoptMgr(base)
+	prof := &lockingProfile{}
+	if err := prof.open(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := m.StartSessionWithProfile("https://a.example", prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, _ := m.StartSession("https://b.example")
+
+	m.prepareSelfRestart(EndedReasonNodeUpdate, "to v9")
+
+	if !prof.persisted {
+		t.Fatal("persistent profile was not sealed")
+	}
+	if err := prof.open(); err != nil {
+		t.Fatalf("a later open must succeed once the lock is released: %v", err)
+	}
+	if _, ok := m.SessionStatus(st.ID); ok {
+		t.Fatal("persistent session must be stopped, not left for adoption")
+	}
+	if e, ok := m.EndedSession(st.ID); !ok || e.Reason != "node_update" {
+		t.Fatalf("ended = %+v %v", e, ok)
+	}
+	if _, ok := m.SessionStatus(plain.ID); !ok {
+		t.Fatal("throwaway session should stay running for re-adoption")
+	}
+}
+
+func TestPersistentRecordIsNotAdopted(t *testing.T) {
+	newAdoptEnv(t)
+	base := trustedBaseDir(t)
+	id := startOne(t, base)
+	m := adoptMgr(base)
+	rec, _ := loadRecord(m.registryDir(), id)
+	rec.Persistent = true
+	_ = saveRecord(m.registryDir(), rec)
+	if _, ok := m.SessionStatus(id); ok {
+		t.Fatal("persistent sessions must not be adopted")
+	}
+}
+
+func TestEndedReasonRecordedWhereAdoptionUnsupported(t *testing.T) {
+	newAdoptEnv(t)
+	adoptionSupported = false // Windows or macOS behavior
+	base := trustedBaseDir(t)
+	(&fakeLauncher{}).install(t)
+	m := adoptMgr(base)
+	st, _ := m.StartSession("https://a.example")
+	m.prepareSelfRestart(EndedReasonNodeUpdate, "to v9")
+	if _, ok := m.SessionStatus(st.ID); ok {
+		t.Fatal("sessions must be stopped where adoption is unsupported")
+	}
+	e, ok := m.EndedSession(st.ID)
+	if !ok || e.Reason != "node_update" || e.Detail != "to v9" {
+		t.Fatalf("ended = %+v %v", e, ok)
+	}
+	_, err := m.Handoff(st.ID)
+	var se *SessionEndedError
+	if !errors.As(err, &se) {
+		t.Fatalf("want typed ended error, got %v", err)
+	}
+}
+
+func TestStaleTmpFilesCleaned(t *testing.T) {
+	newAdoptEnv(t)
+	base := trustedBaseDir(t)
+	m := adoptMgr(base)
+	reg := m.registryDir()
+	if err := ensureCobrowseBaseDir(reg); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(reg, ".tmp-old")
+	_ = os.WriteFile(old, []byte("x"), 0o600)
+	past := time.Now().Add(-time.Hour)
+	_ = os.Chtimes(old, past, past)
+	listRecords(reg)
+	if _, err := os.Stat(old); err == nil {
+		t.Fatal("stale temp file kept")
 	}
 }

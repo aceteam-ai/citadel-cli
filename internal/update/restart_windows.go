@@ -17,13 +17,13 @@ import (
 	"os/exec"
 )
 
-// RestartProcess relaunches the agent onto the new binary. It spawns a fresh
+// restartProcess relaunches the agent onto the new binary. It spawns a fresh
 // detached process from the (now-replaced) binary path with the same arguments
 // and then exits the current process. Under the Windows service manager the
 // service will be restarted regardless; the spawned process covers the
 // foreground case. On success this call does not return.
-func RestartProcess() error {
-	runBeforeRestart()
+func restartProcess(reason string) error {
+	runBeforeRestart(reason)
 	path, err := GetCurrentBinaryPath()
 	if err != nil {
 		// Fall back to a clean exit so a supervisor can relaunch us.
