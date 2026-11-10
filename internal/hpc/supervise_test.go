@@ -171,8 +171,8 @@ func TestSupervisorWorkerIgnoringDrainIsKilled(t *testing.T) {
 	h.ready <- nil
 	waitFor(t, h.started.Load)
 	h.sigs <- syscall.SIGUSR1
-	if code, _ := waitResult(t, res); code != 0 {
-		t.Fatalf("code %d", code)
+	if code, err := waitResult(t, res); code != 1 || err == nil {
+		t.Fatalf("a killed worker must be a failure, got code %d err %v", code, err)
 	}
 	if h.stopCall.Load() != 1 {
 		t.Fatal("engine not stopped")
@@ -181,6 +181,52 @@ func TestSupervisorWorkerIgnoringDrainIsKilled(t *testing.T) {
 	defer h.worker.mu.Unlock()
 	if len(h.worker.signals) != 2 || h.worker.signals[1] != syscall.SIGKILL {
 		t.Fatalf("worker signals %v", h.worker.signals)
+	}
+}
+
+// TestSupervisorTermDuringDrainKeepsDrainDeadline: a SIGTERM after the drain
+// signal is forwarded but must not shorten the wait to TermWait. The worker
+// here needs 300ms after SIGTERM (longer than TermWait, shorter than
+// DrainWait); it must not be killed.
+func TestSupervisorTermDuringDrainKeepsDrainDeadline(t *testing.T) {
+	h := newHarness()
+	h.worker.onSignal = func(s os.Signal) (bool, error) {
+		if s == syscall.SIGTERM {
+			go func() { time.Sleep(300 * time.Millisecond); h.worker.exit(nil) }()
+		}
+		return false, nil
+	}
+	res := runAsync(h.supervisor())
+	h.ready <- nil
+	waitFor(t, h.started.Load)
+	h.sigs <- syscall.SIGUSR1
+	time.Sleep(20 * time.Millisecond)
+	h.sigs <- syscall.SIGTERM
+	code, err := waitResult(t, res)
+	if code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	h.worker.mu.Lock()
+	defer h.worker.mu.Unlock()
+	for _, sig := range h.worker.signals {
+		if sig == syscall.SIGKILL {
+			t.Fatalf("the worker was killed inside the drain deadline: %v", h.worker.signals)
+		}
+	}
+	if len(h.worker.signals) != 2 || h.worker.signals[1] != syscall.SIGTERM {
+		t.Fatalf("worker signals %v, want USR1 then TERM", h.worker.signals)
+	}
+}
+
+func TestSupervisorWorkerErrorDuringDrainIsFailure(t *testing.T) {
+	h := newHarness()
+	h.worker.onSignal = func(os.Signal) (bool, error) { return true, errors.New("exit status 3") }
+	res := runAsync(h.supervisor())
+	h.ready <- nil
+	waitFor(t, h.started.Load)
+	h.sigs <- syscall.SIGUSR1
+	if code, err := waitResult(t, res); code != 1 || err == nil {
+		t.Fatalf("code %d err %v", code, err)
 	}
 }
 
@@ -269,12 +315,40 @@ func TestWaitModelsReady(t *testing.T) {
 	}
 }
 
-func TestEngineCommandBindsLoopback(t *testing.T) {
-	argv, env := EngineSpec{VenvDir: "/v", Model: "m", HFHome: "/hf", DownloadDir: "/w", TensorParallel: 2, Args: []string{"--max-model-len=4096"}}.Command(40001)
-	want := []string{"/v/bin/python", "-m", "vllm.entrypoints.openai.api_server", "--host", "127.0.0.1", "--port", "40001",
-		"--model", "m", "--download-dir", "/w", "--tensor-parallel-size", "2", "--max-model-len=4096"}
-	if !reflect.DeepEqual(argv, want) || env["HF_HOME"] != "/hf" {
-		t.Fatalf("argv %v env %v", argv, env)
+func TestEngineCommandBindsLoopbackAndFixedFlagsComeLast(t *testing.T) {
+	argv, env := EngineSpec{VenvDir: "/v", Model: "m", HFHome: "/hf", DownloadDir: "/w", TensorParallel: 2,
+		Args: []string{"--max-model-len=4096"}, CacheRoot: "/scratch/c"}.Command(40001)
+	want := []string{"/v/bin/python", "-m", "vllm.entrypoints.openai.api_server", "--tensor-parallel-size", "2",
+		"--max-model-len=4096", "--host", "127.0.0.1", "--port", "40001", "--model", "m", "--download-dir", "/w"}
+	if !reflect.DeepEqual(argv, want) {
+		t.Fatalf("argv %v\nwant %v", argv, want)
+	}
+	wantEnv := map[string]string{
+		"HF_HOME": "/hf", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1",
+		"VLLM_CACHE_ROOT": "/scratch/c/vllm", "TRITON_CACHE_DIR": "/scratch/c/triton",
+		"TORCHINDUCTOR_CACHE_DIR": "/scratch/c/inductor", "XDG_CACHE_HOME": "/scratch/c/xdg",
+	}
+	if !reflect.DeepEqual(env, wantEnv) {
+		t.Fatalf("env %v", env)
+	}
+	// Even a hostile argument is followed by the fixed bind.
+	argv, _ = EngineSpec{VenvDir: "/v", Model: "m", DownloadDir: "/w", Args: []string{"--host=0.0.0.0"}}.Command(1)
+	if argv[len(argv)-8] != "--host" || argv[len(argv)-7] != "127.0.0.1" {
+		t.Fatalf("the fixed host does not come last: %v", argv)
+	}
+}
+
+func TestTensorParallelFor(t *testing.T) {
+	for _, c := range []struct {
+		cvd, slurm string
+		want       int
+	}{
+		{"0,1", "", 2}, {"GPU-aaaa,GPU-bbbb,GPU-cccc", "", 3}, {"MIG-x/1/0", "4", 1},
+		{"", "4", 4}, {"", "a100:2", 2}, {"", "", 1}, {"NoDevFiles", "2", 2}, {"", "junk", 1},
+	} {
+		if got := TensorParallelFor(c.cvd, c.slurm); got != c.want {
+			t.Errorf("TensorParallelFor(%q,%q) = %d, want %d", c.cvd, c.slurm, got, c.want)
+		}
 	}
 }
 

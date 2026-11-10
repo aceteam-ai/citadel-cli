@@ -72,7 +72,7 @@ func TestVenvSetupUVPath(t *testing.T) {
 	}
 	py := filepath.Join(dir, "bin", "python")
 	if !reflect.DeepEqual(f.calls[:2], [][]string{
-		{"/usr/bin/uv", "venv", "--python", "python3", dir},
+		{"/usr/bin/uv", "venv", "--allow-existing", "--python", "python3", dir},
 		{"/usr/bin/uv", "pip", "install", "--python", py, "vllm==0.11.0"},
 	}) {
 		t.Fatalf("argv = %v", f.calls)
@@ -117,5 +117,12 @@ func TestVenvSetupRefusals(t *testing.T) {
 	f = &fakeVenvExec{dir: dir, failOn: "vllm=="}
 	if _, err := (VenvSetup{Dir: dir, Exec: f.run, LookPath: noUV}).Run(context.Background()); err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("install failure: %v", err)
+	}
+}
+
+func TestVenvSetupEnvKeepsCachesBesideVenvAndNeverDownloadsPython(t *testing.T) {
+	env := VenvSetup{Dir: "/scratch/lab/venv"}.Env()
+	if env["UV_CACHE_DIR"] != "/scratch/lab/venv.cache/uv" || env["PIP_CACHE_DIR"] != "/scratch/lab/venv.cache/pip" || env["UV_PYTHON_DOWNLOADS"] != "never" {
+		t.Fatalf("env = %v", env)
 	}
 }

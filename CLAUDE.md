@@ -1831,7 +1831,14 @@ job body `citadel hpc run`: engine on a per-job 127.0.0.1 port in its own
 process group, `/v1/models` readiness, then the worker as a child
 `citadel work --profile hpc` with `CITADEL_VLLM_HOST_PORT` set (that env var,
 resolved at process init by `services.resolveVLLMHostPort`, is the adoption
-seam; the adoption record needs a numeric node id). Signals forward to the
+seam; the adoption record needs a numeric node id). `hpc.reservedFlag` owns
+the vLLM flag refusal (abbreviations, underscore spellings, `--config`), and
+`EngineSpec.Command` appends the fixed flags last. `hpc.WaitModelsReadyOwned`
+with `hpc.CheckListenerOwner` refuses a port held by another uid before any
+probe. `Supervisor.Run` keeps the first signal's deadline and exits non-zero
+for a worker error or kill. `status.filterVisibleGPUsWithUUIDs` maps UUID and
+MIG entries through `nvidia-smi -L`; `hpc.TensorParallelFor` falls back to
+`SLURM_GPUS_ON_NODE`. The venv pin is partial (vLLM only). Signals forward to the
 worker; the engine group is stopped on every exit path. Only `--runtime venv`
 runs; `hpc.ParseRuntime` refuses the reserved ones.
 

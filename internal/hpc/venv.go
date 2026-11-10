@@ -44,7 +44,7 @@ func (v VenvSetup) CreatePlan(uvPath string) [][]string {
 	pin := "vllm==" + v.VLLMVersion
 	if uvPath != "" {
 		return [][]string{
-			{uvPath, "venv", "--python", v.Python, v.Dir},
+			{uvPath, "venv", "--allow-existing", "--python", v.Python, v.Dir},
 			{uvPath, "pip", "install", "--python", py, pin},
 		}
 	}
@@ -52,6 +52,19 @@ func (v VenvSetup) CreatePlan(uvPath string) [][]string {
 		{v.Python, "-m", "venv", v.Dir},
 		{py, "-m", "pip", "install", "--upgrade", "pip"},
 		{py, "-m", "pip", "install", pin},
+	}
+}
+
+// Env is the extra environment for every setup command. Caches live beside
+// the venv (on the same scratch filesystem), not in a small home quota, and
+// uv never downloads an interpreter: the pin covers vLLM only, so the Python
+// it runs on is the cluster's own.
+func (v VenvSetup) Env() map[string]string {
+	cache := v.Dir + ".cache"
+	return map[string]string{
+		"UV_CACHE_DIR":        filepath.Join(cache, "uv"),
+		"PIP_CACHE_DIR":       filepath.Join(cache, "pip"),
+		"UV_PYTHON_DOWNLOADS": "never",
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,11 +31,16 @@ type EngineSpec struct {
 	DownloadDir    string
 	TensorParallel int
 	Args           []string
+	// CacheRoot is a directory on job scratch for runtime caches (vLLM,
+	// Triton, generic XDG). Empty leaves the caches where they default, which
+	// on many sites is a small home quota.
+	CacheRoot string
 }
 
 // Command returns the argv and the extra environment for the engine bound to
-// 127.0.0.1:port. The bind address is fixed; reserved flags are refused at
-// spec validation.
+// 127.0.0.1:port. The fixed flags are appended LAST: vLLM's parser keeps the
+// final value of a repeated flag, so nothing a user passes can override them
+// (spec validation also refuses reserved flags and their abbreviations).
 func (e EngineSpec) Command(port int) ([]string, map[string]string) {
 	tp := e.TensorParallel
 	if tp < 1 {
@@ -42,14 +48,57 @@ func (e EngineSpec) Command(port int) ([]string, map[string]string) {
 	}
 	argv := []string{
 		VenvPython(e.VenvDir), "-m", "vllm.entrypoints.openai.api_server",
+		"--tensor-parallel-size", strconv.Itoa(tp),
+	}
+	argv = append(argv, e.Args...)
+	argv = append(argv,
 		"--host", "127.0.0.1",
 		"--port", strconv.Itoa(port),
 		"--model", e.Model,
 		"--download-dir", e.DownloadDir,
-		"--tensor-parallel-size", strconv.Itoa(tp),
+	)
+	env := map[string]string{
+		"HF_HOME":             e.HFHome,
+		"VLLM_NO_USAGE_STATS": "1",
+		"DO_NOT_TRACK":        "1",
 	}
-	argv = append(argv, e.Args...)
-	return argv, map[string]string{"HF_HOME": e.HFHome}
+	if e.CacheRoot != "" {
+		env["VLLM_CACHE_ROOT"] = filepath.Join(e.CacheRoot, "vllm")
+		env["TRITON_CACHE_DIR"] = filepath.Join(e.CacheRoot, "triton")
+		env["TORCHINDUCTOR_CACHE_DIR"] = filepath.Join(e.CacheRoot, "inductor")
+		env["XDG_CACHE_HOME"] = filepath.Join(e.CacheRoot, "xdg")
+	}
+	return argv, env
+}
+
+// TensorParallelFor is the tensor-parallel size for an allocation: the
+// number of devices in CUDA_VISIBLE_DEVICES (indexes, UUIDs or MIG ids), else
+// SLURM_GPUS_ON_NODE, else 1.
+func TensorParallelFor(cudaVisible, slurmGPUsOnNode string) int {
+	if n := len(VisibleGPUs(cudaVisible)); n > 0 {
+		return n
+	}
+	v := strings.TrimSpace(slurmGPUsOnNode)
+	if i := strings.LastIndexByte(v, ':'); i >= 0 {
+		v = v[i+1:]
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return n
+	}
+	return 1
+}
+
+// EnsureCacheDirs creates the runtime cache directories (owner-only).
+func (e EngineSpec) EnsureCacheDirs() error {
+	if e.CacheRoot == "" {
+		return nil
+	}
+	for _, d := range []string{"vllm", "triton", "inductor", "xdg"} {
+		if err := os.MkdirAll(filepath.Join(e.CacheRoot, d), 0o700); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // LoopbackNoProxy appends the loopback names to a NO_PROXY value so a local
@@ -85,16 +134,37 @@ func PickLoopbackPort() (int, error) {
 // WaitModelsReady polls baseURL/v1/models until it answers 200 with an
 // OpenAI-shaped list, ctx ends, or engineDone fires.
 func WaitModelsReady(ctx context.Context, baseURL string, interval time.Duration, engineDone <-chan error) error {
+	return WaitModelsReadyOwned(ctx, baseURL, interval, engineDone, nil)
+}
+
+// ListenerCheck inspects who owns the listening socket. listening reports
+// whether anything listens yet; a non-nil error is fatal (a foreign owner).
+type ListenerCheck func() (listening bool, err error)
+
+// WaitModelsReadyOwned is WaitModelsReady with an ownership check run before
+// every probe: the port is free while the engine starts and visible to other
+// users, so a server that is not this user's must never be accepted (or sent
+// the enrollment token later). A nil check skips it.
+func WaitModelsReadyOwned(ctx context.Context, baseURL string, interval time.Duration, engineDone <-chan error, check ListenerCheck) error {
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
 	for {
+		listening := true
+		if check != nil {
+			var err error
+			if listening, err = check(); err != nil {
+				return err
+			}
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/v1/models", nil)
 		if err != nil {
 			return err
 		}
-		if resp, err := client.Do(req); err == nil {
+		if !listening {
+			// Nothing is bound yet; do not probe (nothing to ask).
+		} else if resp, err := client.Do(req); err == nil {
 			var body struct {
 				Data []json.RawMessage `json:"data"`
 			}
@@ -191,12 +261,11 @@ func (s Supervisor) Run(ctx context.Context) (int, error) {
 	}
 
 	var deadline <-chan time.Time
-	draining := false
 	for {
 		select {
 		case err := <-worker.Done():
 			stopEngine()
-			if err != nil && !draining {
+			if err != nil {
 				return 1, fmt.Errorf("worker exited: %w", err)
 			}
 			return 0, nil
@@ -206,22 +275,27 @@ func (s Supervisor) Run(ctx context.Context) (int, error) {
 			s.waitOrKill(worker, s.TermWait)
 			return 1, errors.New("model server exited while serving")
 		case sig := <-s.Signals:
-			wait := s.TermWait
+			// The first signal sets the deadline; a later one is forwarded (the
+			// worker deregisters at once on SIGTERM) but never shortens it,
+			// so a SIGTERM during a drain does not get the worker killed
+			// before it has finished and deregistered.
 			if s.IsDrain != nil && s.IsDrain(sig) {
-				wait = s.DrainWait
-				draining = true
 				s.logf("drain signal: asking the worker to finish and deregister")
+				if deadline == nil {
+					deadline = time.After(s.DrainWait)
+				}
 			} else {
-				draining = true
 				s.logf("received %v: asking the worker to deregister and exit", sig)
+				if deadline == nil {
+					deadline = time.After(s.TermWait)
+				}
 			}
 			_ = worker.Signal(sig)
-			deadline = time.After(wait)
 		case <-deadline:
 			s.logf("worker did not exit in time; killing it")
 			_ = worker.Signal(syscall.SIGKILL)
 			<-worker.Done()
-			return 0, nil
+			return 1, errors.New("the worker did not exit in time and was killed; it may not have deregistered")
 		}
 	}
 }

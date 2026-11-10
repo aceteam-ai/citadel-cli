@@ -81,12 +81,36 @@ var (
 	slurmValuePattern = regexp.MustCompile(`^[A-Za-z0-9._:+-]{1,128}$`)
 	wallTimePattern   = regexp.MustCompile(`^(?:(\d{1,3})-)?(\d{1,3})(?::(\d{2}))?(?::(\d{2}))?$`)
 	memoryPattern     = regexp.MustCompile(`^[0-9]{1,7}[KMGT]?$`)
-	modelPattern      = regexp.MustCompile(`^[A-Za-z0-9._/:-]{1,256}$`)
+	// A model id may not start with '-' so it can never read as a flag.
+	modelPattern = regexp.MustCompile(`^[A-Za-z0-9._/:][A-Za-z0-9._/:-]{0,255}$`)
 )
 
 // reservedVLLMArgs are set by the job body and may not be overridden: the
 // bind address and port keep the model server on a per-job loopback port.
-var reservedVLLMArgs = []string{"--host", "--port", "--model", "--download-dir", "--uds", "--ssl-keyfile", "--ssl-certfile"}
+//
+// vLLM's parser accepts unambiguous prefixes ("--hos"), maps "_" to "-", and
+// merges a --config YAML, so reservedFlag compares the normalized name, refuses
+// any prefix of a reserved flag, and --config is refused outright.
+var reservedVLLMArgs = []string{"--host", "--port", "--model", "--download-dir", "--uds", "--ssl-keyfile", "--ssl-certfile", "--config"}
+
+// reservedFlag returns the reserved flag arg would set, or "". arg is one
+// --vllm-arg value; only values that look like long flags are judged.
+func reservedFlag(arg string) string {
+	if !strings.HasPrefix(arg, "--") {
+		return ""
+	}
+	name := arg
+	if i := strings.IndexByte(arg, '='); i >= 0 {
+		name = arg[:i]
+	}
+	name = "--" + strings.ReplaceAll(name[2:], "_", "-")
+	for _, r := range reservedVLLMArgs {
+		if strings.HasPrefix(r, name) {
+			return r
+		}
+	}
+	return ""
+}
 
 // ParseWallTime converts a Slurm --time value to a duration. It accepts
 // minutes, MM:SS, HH:MM:SS, D-HH, D-HH:MM and D-HH:MM:SS.
@@ -198,11 +222,12 @@ func (s JobSpec) Normalize() (JobSpec, error) {
 		if strings.ContainsAny(a, "\n\r\x00") {
 			problems = append(problems, "--vllm-arg must not contain control characters")
 		}
-		for _, r := range reservedVLLMArgs {
-			if a == r || strings.HasPrefix(a, r+"=") {
-				problems = append(problems, "--vllm-arg may not set "+r)
-			}
+		if r := reservedFlag(a); r != "" {
+			problems = append(problems, "--vllm-arg may not set "+r+" (or an abbreviation or underscore spelling of it)")
 		}
+	}
+	if s.DrainTimeout < 0 || s.ReadyTimeout < 0 || s.DrainLead < 0 {
+		problems = append(problems, "--drain-timeout, --ready-timeout and --drain-lead must be positive")
 	}
 	if s.DrainTimeout+drainMargin > s.DrainLead {
 		problems = append(problems, fmt.Sprintf("--drain-lead (%s) must exceed --drain-timeout (%s) by at least %s", s.DrainLead, s.DrainTimeout, drainMargin))

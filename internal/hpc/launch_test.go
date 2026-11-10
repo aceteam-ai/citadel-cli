@@ -92,6 +92,16 @@ func TestJobSpecNormalizeRefusals(t *testing.T) {
 		"drain lead too short":   func(s *JobSpec) { s.DrainLead = 90 * time.Second },
 		"drain lead beyond wall": func(s *JobSpec) { s.WallTime = "4"; s.DrainLead = 5 * time.Minute },
 		"bad memory":             func(s *JobSpec) { s.Memory = "lots" },
+		"abbreviated host":       func(s *JobSpec) { s.VLLMArgs = []string{"--hos=0.0.0.0"} },
+		"abbreviated host again": func(s *JobSpec) { s.VLLMArgs = []string{"--h", "0.0.0.0"} },
+		"underscore ssl keyfile": func(s *JobSpec) { s.VLLMArgs = []string{"--ssl_keyfile=/k"} },
+		"underscore download":    func(s *JobSpec) { s.VLLMArgs = []string{"--download_dir=/tmp/x"} },
+		"config file":            func(s *JobSpec) { s.VLLMArgs = []string{"--config=/x.yaml"} },
+		"abbreviated config":     func(s *JobSpec) { s.VLLMArgs = []string{"--conf", "/x.yaml"} },
+		"bare separator":         func(s *JobSpec) { s.VLLMArgs = []string{"--"} },
+		"negative drain timeout": func(s *JobSpec) { s.DrainTimeout = -time.Second },
+		"negative ready timeout": func(s *JobSpec) { s.ReadyTimeout = -time.Second },
+		"model reads as a flag":  func(s *JobSpec) { s.Model = "--trust-remote-code" },
 	}
 	for name, mutate := range cases {
 		spec := testJobSpec()
@@ -129,6 +139,14 @@ func TestParseWallTime(t *testing.T) {
 	for _, bad := range []string{"", "0", "2h", "1:2:3:4", "-1"} {
 		if _, err := ParseWallTime(bad); err == nil {
 			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+func TestReservedFlagAllowsOrdinaryVLLMFlags(t *testing.T) {
+	for _, ok := range []string{"--max-model-len=4096", "--max_model_len=4096", "--gpu-memory-utilization=0.9", "--model-impl=auto", "--dtype", "4096", "--served-model-name=x"} {
+		if r := reservedFlag(ok); r != "" {
+			t.Errorf("%q wrongly refused as %s", ok, r)
 		}
 	}
 }

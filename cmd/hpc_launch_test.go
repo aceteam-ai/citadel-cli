@@ -214,3 +214,36 @@ func TestHPCWorkerChildArgvIsAccepted(t *testing.T) {
 		t.Fatalf("flags not parsed: %q %v", hpcTokenFileFlag, hpcDrainTimeoutFlag)
 	}
 }
+
+func TestHPCRunAndLaunchRequireAnExplicitAuthService(t *testing.T) {
+	t.Setenv("CITADEL_AUTH_HOST", "")
+	for _, c := range []*cobra.Command{hpcRunCmd, hpcLaunchCmd} {
+		if err := rootCmd.ParseFlags(nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := requireExplicitAuthService(c); err == nil {
+			t.Fatalf("%s: the production default was accepted", c.Name())
+		}
+	}
+	t.Setenv("CITADEL_AUTH_HOST", "https://platform.example")
+	if err := requireExplicitAuthService(hpcRunCmd); err != nil {
+		t.Fatalf("env var refused: %v", err)
+	}
+}
+
+func TestHPCEngineCacheEnvStaysUnderJobScratch(t *testing.T) {
+	root := t.TempDir()
+	spec := hpc.EngineSpec{VenvDir: "/v", Model: "m", HFHome: "/hf", DownloadDir: "/w", CacheRoot: filepath.Join(root, "cache")}
+	if err := spec.EnsureCacheDirs(); err != nil {
+		t.Fatal(err)
+	}
+	_, env := spec.Command(1)
+	for _, k := range []string{"VLLM_CACHE_ROOT", "TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR", "XDG_CACHE_HOME"} {
+		if !strings.HasPrefix(env[k], root) {
+			t.Errorf("%s=%q is outside the job scratch", k, env[k])
+		}
+		if _, err := os.Stat(env[k]); err != nil {
+			t.Errorf("%s dir missing: %v", k, err)
+		}
+	}
+}

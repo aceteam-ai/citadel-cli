@@ -191,8 +191,13 @@ func hpcJobBodySupervisor(spec hpc.JobSpec, layout hpc.Layout, self string, sigs
 		Model:          spec.Model,
 		HFHome:         spec.HFHome,
 		DownloadDir:    spec.DownloadDir,
-		TensorParallel: len(hpc.VisibleGPUs(os.Getenv(hpc.EnvVisibleGPUs))),
+		TensorParallel: hpc.TensorParallelFor(os.Getenv(hpc.EnvVisibleGPUs), os.Getenv("SLURM_GPUS_ON_NODE")),
 		Args:           spec.VLLMArgs,
+		CacheRoot:      filepath.Join(layout.Root, "cache"),
+	}
+	if err := engine.EnsureCacheDirs(); err != nil {
+		logFile.Close()
+		return hpc.Supervisor{}, nil, err
 	}
 	logf := func(format string, args ...any) { Log(format, args...); fmt.Printf("   - "+format+"\n", args...) }
 	sup := hpc.Supervisor{
@@ -202,7 +207,7 @@ func hpcJobBodySupervisor(spec hpc.JobSpec, layout hpc.Layout, self string, sigs
 			return hpc.StartProcess(argv, hpcEngineEnv(os.Environ(), extra), logFile, true)
 		},
 		WaitReady: func(ctx context.Context, port int, done <-chan error) error {
-			return hpc.WaitModelsReady(ctx, "http://127.0.0.1:"+strconv.Itoa(port), 2*time.Second, done)
+			return hpc.WaitModelsReadyOwned(ctx, "http://127.0.0.1:"+strconv.Itoa(port), 2*time.Second, done, hpc.CheckListenerOwner(port, os.Geteuid()))
 		},
 		StartWorker: func(port int) (hpc.Process, error) {
 			argv, env := hpcWorkerCommand(self, spec, port, os.Environ())
@@ -254,8 +259,8 @@ var hpcLaunchCmd = &cobra.Command{
 		spec.Runtime = rt
 		// The token is consumed by whichever platform the job contacts, so the
 		// platform must be named explicitly rather than taken from the default.
-		if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
-			fail(errors.New("pass --auth-service (the platform that minted the enrollment token)"))
+		if err := requireExplicitAuthService(cmd); err != nil {
+			fail(err)
 		}
 		spec.AuthService = authServiceURL
 		spec.CACert = caCertPath
@@ -290,7 +295,12 @@ var hpcRunCmd = &cobra.Command{
 	Long: `Runs inside a Slurm allocation (from the generated batch script, or by hand
 in an interactive allocation). Starts vLLM on a per-job loopback port, waits
 for it, then enrolls and runs the worker under the hpc profile. SIGUSR1
-drains, deregisters, stops vLLM and exits 0.`,
+drains, deregisters, stops vLLM and exits 0; a worker that errors or has to be
+killed exits non-zero.
+
+HF_HOME is set to job scratch, so a token saved by 'hf login' in your home is
+not seen: export HF_TOKEN before submitting if the model is gated. Runtime
+caches (vLLM, Triton, XDG) also live on job scratch.`,
 	Args: cobra.NoArgs,
 	Run: func(cmd *cobra.Command, _ []string) {
 		spec := hpcRunSpec
@@ -299,6 +309,9 @@ drains, deregisters, stops vLLM and exits 0.`,
 			fail(err)
 		}
 		spec.Runtime = rt
+		if err := requireExplicitAuthService(cmd); err != nil {
+			fail(err)
+		}
 		spec.AuthService = authServiceURL
 		spec.CACert = caCertPath
 		spec.StateRoot = hpcStateRootFlag
@@ -331,17 +344,39 @@ drains, deregisters, stops vLLM and exits 0.`,
 var hpcSetupCmd = &cobra.Command{
 	Use:   "setup",
 	Short: "Build or check the pinned vLLM virtualenv used by hpc jobs",
+	Long: `Builds a virtualenv with the requested vLLM version, or checks one. The pin is
+partial: it fixes the vLLM release only, and its dependencies (torch and the
+rest) resolve to whatever is current when the venv is built. Rebuild rather
+than reuse a venv across sites. uv never downloads an interpreter, and package
+caches are kept beside the venv.`,
 	Args:  cobra.NoArgs,
 	Run: func(cmd *cobra.Command, _ []string) {
-		version, err := hpc.VenvSetup{
+		setup := hpc.VenvSetup{
 			Dir: hpcSetupVenv, VLLMVersion: hpcSetupVersion, Python: hpcSetupPython, CheckOnly: hpcSetupCheck,
-			Exec: execCombined, LookPath: exec.LookPath,
-		}.Run(contextOrBackground(cmd.Context()))
+			LookPath: exec.LookPath,
+		}
+		env := setup.Env()
+		setup.Exec = func(ctx context.Context, argv []string) ([]byte, error) {
+			c := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			c.Env = mergeEnv(os.Environ(), env)
+			return c.CombinedOutput()
+		}
+		version, err := setup.Run(contextOrBackground(cmd.Context()))
 		if err != nil {
 			fail(err)
 		}
 		fmt.Printf("vLLM %s ready in %s\n", version, hpcSetupVenv)
 	},
+}
+
+// requireExplicitAuthService refuses to fall back to the production default:
+// the single-use token is spent at whichever platform the job contacts, so
+// the platform must be named by --auth-service or CITADEL_AUTH_HOST.
+func requireExplicitAuthService(cmd *cobra.Command) error {
+	if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
+		return errors.New("pass --auth-service (the platform that minted the enrollment token)")
+	}
+	return nil
 }
 
 func fail(err error) {

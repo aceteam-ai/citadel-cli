@@ -2,6 +2,7 @@ package status
 
 import (
 	"context"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -776,7 +777,7 @@ func (c *Collector) collectGPUMetrics() []GPUMetrics {
 		gpuMetrics = append(gpuMetrics, metrics)
 	}
 
-	return filterVisibleGPUs(gpuMetrics, c.visibleGPUs)
+	return filterVisibleGPUsWithUUIDs(gpuMetrics, c.visibleGPUs, nvidiaSMIUUIDIndex)
 }
 
 // collectServiceStatus gathers status for all configured services.
@@ -1006,15 +1007,45 @@ func InferServicePort(serviceName string) int {
 }
 
 // filterVisibleGPUs keeps the metrics whose device index is listed. visible
-// nil keeps everything. Entries that are not indexes (UUIDs) match nothing,
-// so an unmappable list under-reports rather than over-reports.
+// nil keeps everything. Entries that are not indexes and cannot be mapped
+// match nothing, so an unmappable list under-reports rather than over-reports.
 func filterVisibleGPUs(metrics []GPUMetrics, visible []string) []GPUMetrics {
+	return filterVisibleGPUsWithUUIDs(metrics, visible, nil)
+}
+
+// filterVisibleGPUsWithUUIDs is filterVisibleGPUs that also understands the
+// UUID and MIG forms CUDA_VISIBLE_DEVICES may carry. lookup maps a device or
+// MIG UUID to its GPU index; it is called only when a non-index entry exists.
+func filterVisibleGPUsWithUUIDs(metrics []GPUMetrics, visible []string, lookup func() map[string]int) []GPUMetrics {
 	if visible == nil {
 		return metrics
 	}
 	keep := make(map[string]bool, len(visible))
+	var uuids map[string]int
 	for _, v := range visible {
-		keep[strings.TrimSpace(v)] = true
+		v = strings.TrimSpace(v)
+		if _, err := strconv.Atoi(v); err == nil {
+			keep[v] = true
+			continue
+		}
+		if lookup == nil {
+			continue
+		}
+		if uuids == nil {
+			uuids = lookup()
+		}
+		// A MIG id may carry a "/gi/ci" suffix and a "MIG-" prefix that the
+		// listing spells differently; try the plausible spellings.
+		base := v
+		if i := strings.IndexByte(base, '/'); i >= 0 {
+			base = base[:i]
+		}
+		for _, cand := range []string{v, base, strings.TrimPrefix(base, "MIG-")} {
+			if idx, ok := uuids[cand]; ok {
+				keep[strconv.Itoa(idx)] = true
+				break
+			}
+		}
 	}
 	out := make([]GPUMetrics, 0, len(metrics))
 	for _, m := range metrics {
@@ -1023,4 +1054,50 @@ func filterVisibleGPUs(metrics []GPUMetrics, visible []string) []GPUMetrics {
 		}
 	}
 	return out
+}
+
+// parseGPUUUIDIndex reads `nvidia-smi -L` output and maps every GPU and MIG
+// device UUID to the index of the GPU it belongs to:
+//
+//	GPU 0: <name> (UUID: GPU-...)
+//	  MIG 1g.5gb Device 0: (UUID: MIG-...)
+func parseGPUUUIDIndex(out string) map[string]int {
+	m := map[string]int{}
+	current := -1
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "GPU ") {
+			rest := strings.TrimPrefix(trimmed, "GPU ")
+			if i := strings.IndexByte(rest, ':'); i > 0 {
+				if n, err := strconv.Atoi(rest[:i]); err == nil {
+					current = n
+				}
+			}
+		}
+		if current < 0 {
+			continue
+		}
+		if i := strings.Index(trimmed, "UUID: "); i >= 0 {
+			id := trimmed[i+len("UUID: "):]
+			if j := strings.IndexByte(id, ')'); j >= 0 {
+				id = id[:j]
+			}
+			if id = strings.TrimSpace(id); id != "" {
+				m[id] = current
+			}
+		}
+	}
+	return m
+}
+
+// nvidiaSMIUUIDIndex lists the node's GPUs with `nvidia-smi -L`. Best effort:
+// on any failure it returns an empty map, so UUID entries match nothing.
+func nvidiaSMIUUIDIndex() map[string]int {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "nvidia-smi", "-L").Output()
+	if err != nil {
+		return map[string]int{}
+	}
+	return parseGPUUUIDIndex(string(out))
 }
