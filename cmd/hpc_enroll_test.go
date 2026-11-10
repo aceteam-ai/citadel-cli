@@ -105,7 +105,7 @@ func newFakeEnrollServer(t *testing.T) *fakeEnrollServer {
 
 func testEnrollLayout(t *testing.T) hpc.Layout {
 	t.Helper()
-	l, err := hpc.ResolveLayout(hpc.Inputs{JobID: "4242", TmpDir: t.TempDir()})
+	l, err := hpc.ResolveLayout(hpc.Inputs{JobID: "4242", TmpDir: privateTempDir(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
