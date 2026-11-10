@@ -140,18 +140,18 @@ func TestHPCRefusedWorkFlags(t *testing.T) {
 	for _, name := range []string{"poll-ms", "max-retries", "max-concurrency", "gateway", "terminal", "status-port", "debug-redis-url", "egress-relay", "queue", "workspace"} {
 		fs.String(name, "", "")
 	}
-	if got := hpcRefusedWorkFlags(fs); len(got) != 0 {
+	if got := hpcRefusedWorkFlags(fs, nil); len(got) != 0 {
 		t.Fatalf("no flags changed, got %v", got)
 	}
 	_ = fs.Set("max-concurrency", "2")
 	_ = fs.Set("poll-ms", "1000")
-	if got := hpcRefusedWorkFlags(fs); len(got) != 0 {
+	if got := hpcRefusedWorkFlags(fs, nil); len(got) != 0 {
 		t.Fatalf("allowed flags refused: %v", got)
 	}
 	_ = fs.Set("gateway", "true")
 	_ = fs.Set("status-port", "8080")
 	_ = fs.Set("queue", "jobs:v1:gpu-general")
-	got := hpcRefusedWorkFlags(fs)
+	got := hpcRefusedWorkFlags(fs, nil)
 	want := []string{"--gateway", "--queue", "--status-port"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("refused = %v, want %v", got, want)
@@ -164,7 +164,7 @@ func TestHPCRefusedWorkFlags(t *testing.T) {
 		probe := pflag.NewFlagSet("probe", pflag.ContinueOnError)
 		probe.String(f.Name, "", "")
 		_ = probe.Set(f.Name, "x")
-		if len(hpcRefusedWorkFlags(probe)) != 1 {
+		if len(hpcRefusedWorkFlags(probe, nil)) != 1 {
 			t.Errorf("--%s is not refused", f.Name)
 		}
 	})
@@ -365,5 +365,44 @@ func TestHPCProfileFilesAreUnixOnlyAtRuntime(t *testing.T) {
 		if _, err := resolveHPCActivation("citadel work", runtime.GOOS, 1000, "", os.Getenv); !errors.Is(err, hpc.ErrUnsupportedPlatform) {
 			t.Fatalf("windows activation: %v", err)
 		}
+	}
+}
+
+// resetParsedFlags restores flags a real ParseFlags call changed, so the
+// shared command tree does not leak state into other tests.
+func resetParsedFlags(t *testing.T, fs ...*pflag.FlagSet) {
+	t.Cleanup(func() {
+		for _, set := range fs {
+			set.VisitAll(func(f *pflag.Flag) {
+				if f.Changed {
+					_ = f.Value.Set(f.DefValue)
+					f.Changed = false
+				}
+			})
+		}
+	})
+}
+
+// TestHPCRefusedWorkFlagsRealArgv parses a real `citadel work --profile hpc`
+// command line through the cobra tree: the global options it inherits must
+// never be refused, while a disabled surface still is.
+func TestHPCRefusedWorkFlagsRealArgv(t *testing.T) {
+	c, rest, err := rootCmd.Find([]string{"work", "--profile", "hpc", "--auth-service", "https://platform.example",
+		"--hpc-state-root", "/scratch/s", "--debug", "--max-concurrency", "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resetParsedFlags(t, c.Flags(), rootCmd.PersistentFlags())
+	if err := c.ParseFlags(rest); err != nil {
+		t.Fatal(err)
+	}
+	if got := hpcRefusedWorkFlags(c.Flags(), c.InheritedFlags()); len(got) != 0 {
+		t.Fatalf("inherited or allowed flags refused: %v", got)
+	}
+	if err := c.ParseFlags([]string{"--gateway"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := hpcRefusedWorkFlags(c.Flags(), c.InheritedFlags()); !reflect.DeepEqual(got, []string{"--gateway"}) {
+		t.Fatalf("refused = %v, want [--gateway]", got)
 	}
 }

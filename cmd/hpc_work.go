@@ -90,10 +90,17 @@ var hpcWorkFlagsAllowed = map[string]bool{
 	"max-concurrency": true,
 }
 
-// hpcRefusedWorkFlags returns the changed local flags the profile refuses.
-func hpcRefusedWorkFlags(fs *pflag.FlagSet) []string {
+// hpcRefusedWorkFlags returns the changed `citadel work` flags the profile
+// refuses. fs is the parsed command's Flags(), which cobra merges with the
+// root's persistent flags; names found in inherited (the command's
+// InheritedFlags()) are global options such as --profile and are not judged
+// here.
+func hpcRefusedWorkFlags(fs, inherited *pflag.FlagSet) []string {
 	var refused []string
 	fs.Visit(func(f *pflag.Flag) {
+		if inherited != nil && inherited.Lookup(f.Name) != nil {
+			return
+		}
 		if !hpcWorkFlagsAllowed[f.Name] {
 			refused = append(refused, "--"+f.Name)
 		}
@@ -291,7 +298,7 @@ func hpcHeartbeatCollector(nodeID string, runner *atomic.Pointer[worker.Runner],
 
 // runHPCWork is `citadel work` under the HPC profile.
 func runHPCWork(cmd *cobra.Command, _ []string) {
-	if refused := hpcRefusedWorkFlags(cmd.Flags()); len(refused) > 0 {
+	if refused := hpcRefusedWorkFlags(cmd.Flags(), cmd.InheritedFlags()); len(refused) > 0 {
 		fmt.Fprintf(os.Stderr, "Error: %s not available in the hpc profile (it runs API-only, with no listeners, services, mesh or updates).\n", strings.Join(refused, ", "))
 		os.Exit(2)
 	}

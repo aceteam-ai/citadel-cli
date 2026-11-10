@@ -107,16 +107,6 @@ control center. All other subcommands are for scripting and advanced use.`,
 	Version: Version,
 	Run:     runBareCitadel,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		// A run profile (the hpc profile, aceteam#12715) is selected and
-		// validated before every other startup step, including the narrow
-		// exceptions below, so no path under it reads host config, repairs or
-		// checks for an update, or contacts the fabric with host state.
-		if handled, err := applyRunProfile(cmd, args); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(2)
-		} else if handled {
-			return
-		}
 		// Offline pack evaluation must not install CA trust, repair/update a
 		// binary, touch node state, or contact the fabric before reading files.
 		// Keep this exact leaf exception narrow: stream serve still inherits
@@ -126,6 +116,17 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 		if cmd.CommandPath() == "citadel session attach" {
 			// Explicit read-only viewing skips mutating agent startup only.
+			return
+		}
+		// A run profile (the hpc profile, aceteam#12715) is selected and
+		// validated right after the two exact-leaf exemptions above (which do
+		// no startup work) and before every other startup step, so no path
+		// under it reads host config, repairs or checks for an update, or
+		// contacts the fabric with host state.
+		if handled, err := applyRunProfile(cmd, args); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(2)
+		} else if handled {
 			return
 		}
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
