@@ -12,11 +12,14 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/redact"
 )
 
 // defaultHTTPProxyLocalPorts are the only ports HTTP_PROXY may reach on the
@@ -120,6 +123,22 @@ func newGuardedHTTPClient(localPorts map[int]bool) (*http.Client, error) {
 	}, nil
 }
 
+// logHTTPProxyRequest logs the request line with credentials fingerprinted
+// (see package redact). Header names are sorted for stable output. The body
+// is never logged.
+func logHTTPProxyRequest(ctx JobContext, jobID, method, rawURL string, headers map[string]string) {
+	names := make([]string, 0, len(headers))
+	for k := range headers {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	pairs := make([]string, 0, len(names))
+	for _, k := range names {
+		pairs = append(pairs, k+"="+redact.Header(k, headers[k]))
+	}
+	ctx.Log("info", "     - [Job %s] HTTP %s %s headers=[%s]", jobID, method, redact.URL(rawURL), strings.Join(pairs, ", "))
+}
+
 func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	rawURL, ok := job.Payload["url"]
 	if !ok {
@@ -143,8 +162,6 @@ func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, fmt.Errorf("%w: url has no host", errHTTPProxyDestinationBlocked)
 	}
 
-	ctx.Log("info", "     - [Job %s] HTTP %s %s", job.ID, method, rawURL)
-
 	var bodyReader io.Reader
 	if body, ok := job.Payload["body"]; ok && body != "" {
 		bodyReader = bytes.NewBufferString(body)
@@ -155,15 +172,18 @@ func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	var headers map[string]string
 	if headersJSON, ok := job.Payload["headers"]; ok && headersJSON != "" {
-		var headers map[string]string
 		if err := json.Unmarshal([]byte(headersJSON), &headers); err != nil {
+			// Still record the redacted target; never log the raw headers.
+			logHTTPProxyRequest(ctx, job.ID, method, rawURL, nil)
 			return nil, fmt.Errorf("failed to parse headers: %w", err)
 		}
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
 	}
+	logHTTPProxyRequest(ctx, job.ID, method, rawURL, headers)
 
 	if req.Header.Get("Content-Type") == "" && bodyReader != nil {
 		req.Header.Set("Content-Type", "application/json")
