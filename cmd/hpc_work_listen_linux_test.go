@@ -128,7 +128,7 @@ func TestHPCWorkProcessOpensNoNewListener(t *testing.T) {
 	before := listeningSockets(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- runHPCWorkProcess(ctx, layout) }()
+	go func() { errCh <- runHPCWorkProcess(ctx, layout, hpcWorkOptions{}) }()
 	time.Sleep(1500 * time.Millisecond)
 	after := listeningSockets(t)
 	cancel()

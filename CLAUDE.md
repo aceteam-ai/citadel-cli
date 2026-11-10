@@ -1807,9 +1807,22 @@ two-allocation subprocess test pins that no resolved path leaves the job root.
 `runWork` hands off to `runHPCWork` before anything else; the HPC worker is a
 separate positive list (`newHPCRunner`, `hpcQueueNames`), not gates inside
 `runWork`. `llm_inference` routes only through `hpcEngineBackends` (the job's
-own engine port, no default-port fallback). `hpc_work_tripwire_test.go` lists the entry points it must never
-reference (it follows the named `work.go` helpers and resolves import aliases),
-`hpc_work_listen_linux_test.go` asserts the production entry opens no listener, and `hpcTemplateBuiltinPolicy` owns which template builtins run.
+own engine port, no default-port fallback). `hpc_work_tripwire_test.go` lists
+the entry points it must never reference (it follows the named `work.go`
+helpers and resolves import aliases), `hpc_work_listen_linux_test.go` asserts
+the production entry opens no listener, and `hpcTemplateBuiltinPolicy` owns
+which template builtins run.
+`cmd.enrollHPCNode` owns non-interactive enrollment (aceteam#12717): it
+resolves labels with `hpc.ResolveLabels` (the platform's strict label schema,
+so a missing Slurm value refuses before the token is read), generates the
+job key and CSR, then `hpc.ReadTokenFile` (opened O_NOFOLLOW and non-blocking,
+judged on the descriptor, removed only if the path still names it), and
+persists the response into the job-local `config.yaml` and identity store.
+`hpc.VerifyLeafKey` requires a leaf for the job key; any local failure after
+the server accepted the token makes a bounded best-effort deregister.
+`hpcShutdown` owns exit ordering: on the drain signal (SIGUSR1) stop claiming,
+wait up to `--hpc-drain-timeout`, deregister, cancel; SIGTERM, including one
+that arrives during the drain wait, deregisters at once. Deregistration runs once on every exit path after enrollment.
 
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,

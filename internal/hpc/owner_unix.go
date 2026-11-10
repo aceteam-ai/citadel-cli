@@ -3,6 +3,7 @@
 package hpc
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -16,3 +17,12 @@ func ownerUID(info os.FileInfo) (int, error) {
 	}
 	return int(st.Uid), nil
 }
+
+// openNoFollow opens path read-only without following a final symlink and
+// without blocking on a FIFO. The caller must fstat the result.
+func openNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+}
+
+// isSymlinkOpenError reports whether err is the O_NOFOLLOW refusal.
+func isSymlinkOpenError(err error) bool { return errors.Is(err, syscall.ELOOP) }

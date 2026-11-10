@@ -407,6 +407,25 @@ func TestHPCRefusedWorkFlagsRealArgv(t *testing.T) {
 	}
 }
 
+func TestHPCOnlyFlagsRefusedOutsideProfile(t *testing.T) {
+	fs := pflag.NewFlagSet("work", pflag.ContinueOnError)
+	for _, name := range hpcOnlyWorkFlags {
+		fs.String(name, "", "")
+	}
+	if got := hpcFlagsOutsideProfile(fs); len(got) != 0 {
+		t.Fatalf("unset flags reported: %v", got)
+	}
+	_ = fs.Set("hpc-token-file", "/x")
+	if got := hpcFlagsOutsideProfile(fs); !reflect.DeepEqual(got, []string{"--hpc-token-file"}) {
+		t.Fatalf("got %v", got)
+	}
+	for _, name := range hpcOnlyWorkFlags {
+		if workCmd.Flags().Lookup(name) == nil || !hpcWorkFlagsAllowed[name] {
+			t.Fatalf("--%s must exist on work and be allowed under the profile", name)
+		}
+	}
+}
+
 func TestHPCEarlyRefusalCoversCommandsWithTheirOwnPreRun(t *testing.T) {
 	env := func(v string) func(string) string {
 		return func(k string) string {

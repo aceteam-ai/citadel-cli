@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
@@ -87,9 +88,27 @@ func hpcQueueNames(orgID, nodeID string) []string {
 // Redis, queues, egress relay, workspace, ...) names a surface the profile
 // turns off, so it is refused instead of silently ignored.
 var hpcWorkFlagsAllowed = map[string]bool{
-	"poll-ms":         true,
-	"max-retries":     true,
-	"max-concurrency": true,
+	"poll-ms":           true,
+	"max-retries":       true,
+	"max-concurrency":   true,
+	"hpc-token-file":    true,
+	"hpc-wall-time-end": true,
+	"hpc-drain-timeout": true,
+}
+
+// hpcOnlyWorkFlags are the `citadel work` flags that mean nothing outside the
+// hpc profile; an ordinary worker refuses them rather than ignoring them.
+var hpcOnlyWorkFlags = []string{"hpc-token-file", "hpc-wall-time-end", "hpc-drain-timeout"}
+
+// hpcFlagsOutsideProfile returns the hpc-only flags set on an ordinary run.
+func hpcFlagsOutsideProfile(fs *pflag.FlagSet) []string {
+	var out []string
+	for _, name := range hpcOnlyWorkFlags {
+		if f := fs.Lookup(name); f != nil && f.Changed {
+			out = append(out, "--"+name)
+		}
+	}
+	return out
 }
 
 // hpcRefusedWorkFlags returns the changed `citadel work` flags the profile
@@ -321,19 +340,45 @@ func runHPCWork(cmd *cobra.Command, _ []string) {
 		os.Exit(2)
 	}
 	layout := currentHPCLayout()
-	if err := runHPCWorkProcess(cmd.Context(), layout); err != nil {
+	opts := hpcWorkOptions{DrainTimeout: hpcDrainTimeoutFlag}
+	if hpcTokenFileFlag != "" {
+		enroll := productionHPCEnrollOptions(hpcTokenFileFlag, hpcWallTimeEndFlag)
+		opts.Enroll = &enroll
+	}
+	if err := runHPCWorkProcess(cmd.Context(), layout, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// runHPCWorkProcess wires the production edges and runs the worker.
-func runHPCWorkProcess(parent context.Context, layout hpc.Layout) error {
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, cancel := context.WithCancel(parent)
+// hpcWorkOptions are the per-run choices of the HPC worker process.
+type hpcWorkOptions struct {
+	// Enroll, when set, enrolls first if the job root is not enrolled yet.
+	Enroll *hpcEnrollOptions
+	// DrainTimeout bounds in-flight work after the drain signal.
+	DrainTimeout time.Duration
+	// Ready, when set, is called once the worker is serving. The launcher
+	// uses it; it is optional.
+	Ready func(creds hpcCredentials)
+}
+
+// runHPCWorkProcess wires the production edges and runs the worker. Every
+// return path after a successful enrollment deregisters the node.
+func runHPCWorkProcess(parent context.Context, layout hpc.Layout, opts hpcWorkOptions) error {
+	ctx, cancel := context.WithCancel(contextOrBackground(parent))
 	defer cancel()
+
+	// Register first: SIGUSR1's default action terminates the process, so a
+	// drain forwarded while the lock or enrollment is still in progress must
+	// already have a handler.
+	termSigs := make(chan os.Signal, 1)
+	signal.Notify(termSigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(termSigs)
+	drainSigs := make(chan os.Signal, 1)
+	if len(hpcDrainSignals) > 0 {
+		signal.Notify(drainSigs, hpcDrainSignals...)
+		defer signal.Stop(drainSigs)
+	}
 
 	// One worker per job root. The lock lives under the job's own network
 	// state dir, so concurrent allocations never contend with each other.
@@ -343,22 +388,34 @@ func runHPCWorkProcess(parent context.Context, layout hpc.Layout) error {
 	}
 	defer lock.Release()
 
-	creds, err := hpcCredentialsFrom(getDeviceConfigFromFile())
+	creds, err := readHPCCredentials(layout.NodeDir)
+	if err != nil && opts.Enroll != nil {
+		creds, err = enrollHPCNode(ctx, layout, *opts.Enroll)
+		if err == nil {
+			fmt.Printf("   - Enrolled node %s\n", creds.NodeID)
+		}
+	}
 	if err != nil {
 		return err
 	}
 
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigs)
-	go func() {
-		select {
-		case <-sigs:
-			fmt.Println("\n   - Received shutdown signal...")
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+	drainTimeout := opts.DrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = defaultHPCDrainTimeout
+	}
+	enrollClient := hpc.Client{HTTP: hpc.NewHTTPClient()}
+	shutdown := &hpcShutdown{
+		deregister: func(ctx context.Context) error {
+			return enrollClient.Deregister(ctx, creds.APIBaseURL, creds.Token, creds.NodeID)
+		},
+		cancel:       cancel,
+		drainTimeout: drainTimeout,
+		log:          func(format string, args ...any) { Log(format, args...); fmt.Printf("   - "+format+"\n", args...) },
+	}
+	defer func() { _ = shutdown.deregisterOnce() }()
+
+	// Signals buffered during the lock and enrollment are handled here.
+	go watchHPCSignals(ctx, termSigs, drainSigs, shutdown)
 
 	state := worker.NewWorkerState()
 	source := worker.NewAPISource(worker.APISourceConfig{
@@ -436,6 +493,10 @@ func runHPCWorkProcess(parent context.Context, layout hpc.Layout) error {
 		State:          state,
 		Log:            func(format string, args ...any) { Log(format, args...) },
 		OnRunner: func(ctx context.Context, runner *worker.Runner) {
+			shutdown.setTarget(runner)
+			if opts.Ready != nil {
+				opts.Ready(creds)
+			}
 			startStatusPublisherAfterRunner(&nodeRunner, runner, func() {
 				go func() {
 					if err := publisher.Start(ctx); err != nil && err != context.Canceled {
