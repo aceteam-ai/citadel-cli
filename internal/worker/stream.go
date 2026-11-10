@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"strings"
+	"time"
 
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
@@ -115,10 +117,8 @@ type APIStreamWriter struct {
 	jobID   string
 	rayID   string
 	ctx     context.Context
-	// retainer, when set, stores terminal events under TerminalResultKey. It is
-	// nil in production: the generic KV route is not scoped to the job's org or
-	// node, so API-mode retention waits for the scoped
-	// POST /api/fabric/redis/jobs/{jobId}/result endpoint (citadel-cli#1553).
+	// retainer, when set, stores terminal events through the scoped
+	// POST /api/fabric/redis/jobs/{jobId}/result route (citadel-cli#1553).
 	// A durable delivery commits its terminal envelope itself and never retains.
 	retainer terminalRetainer
 }
@@ -208,7 +208,7 @@ func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(j
 }
 
 // apiStreamWriterFor builds a job's API-proxy writer. API-mode retention is
-// off: apiTerminalRetainer returns nil until the scoped result endpoint exists.
+// on for the job types retainsTerminalResult names.
 func apiStreamWriterFor(ctx context.Context, client *redisapi.Client, job *Job) *APIStreamWriter {
 	w := NewAPIStreamWriter(ctx, client, job.ID, job.RayID)
 	if retainsTerminalResult(job.Type) {
@@ -217,11 +217,19 @@ func apiStreamWriterFor(ctx context.Context, client *redisapi.Client, job *Job) 
 	return w
 }
 
-// apiTerminalRetainer is the API-mode retention seam. It returns nil, so API
-// mode does not retain. When the proxy exposes the scoped
-// POST /api/fabric/redis/jobs/{jobId}/result endpoint (node-bound, SET NX EX),
-// return a redisapi client method implementing terminalRetainer here.
-var apiTerminalRetainer = func(*redisapi.Client) terminalRetainer { return nil }
+// apiTerminalRetainer is the API-mode retention seam: it posts the terminal
+// envelope to the scoped POST /api/fabric/redis/jobs/{jobId}/result route
+// through the node's existing proxy client. A package var so tests can swap it.
+var apiTerminalRetainer = func(c *redisapi.Client) terminalRetainer { return apiResultRetainer{c} }
+
+// apiResultRetainer adapts redisapi.Client to terminalRetainer. The interface
+// carries the direct-mode key, so the job id is recovered from it.
+type apiResultRetainer struct{ client *redisapi.Client }
+
+func (r apiResultRetainer) RetainTerminalEvent(ctx context.Context, key string, eventJSON []byte, ttl time.Duration) (bool, error) {
+	jobID := strings.TrimSuffix(strings.TrimPrefix(key, "job:"), ":result")
+	return r.client.RetainTerminalResult(ctx, jobID, eventJSON, ttl)
+}
 
 // clockStreamWriter observes existing carriers without creating any event or
 // changing the handler/client interface. Test/custom writers still see exactly
