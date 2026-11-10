@@ -67,6 +67,11 @@ func Header(name, value string) string {
 		if !found {
 			return Fingerprint(value)
 		}
+		// The tail of a base64 user:password pair decodes to the end of the
+		// password, so Basic gets no fingerprint at all.
+		if strings.EqualFold(scheme, "basic") {
+			return scheme + " <redacted>"
+		}
 		return scheme + " " + Fingerprint(strings.TrimSpace(rest))
 	}
 	if IsSensitiveName(name) {
@@ -85,14 +90,24 @@ func URL(raw string) string {
 	}
 	// url.URL.String() percent-escapes the fingerprint characters; the output
 	// is for humans, so the readable form is restored at the end.
-	var restore []string
+	var restore []string // pairs of escaped, readable
 	if u.User != nil {
-		if pw, ok := u.User.Password(); ok {
+		name := u.User.Username()
+		pw, hasPw := u.User.Password()
+		// A long username is often the credential itself (a token before
+		// the @), so it is fingerprinted; short ones stay as plain names.
+		if len([]rune(name)) >= fingerprintMinLen {
+			fp := Fingerprint(name)
+			restore = append(restore, url.User(fp).String(), fp)
+			name = fp
+		}
+		if hasPw {
 			fp := Fingerprint(pw)
-			u.User = url.UserPassword(u.User.Username(), fp)
-			if esc := (&url.URL{User: url.UserPassword("", fp)}).String(); strings.HasPrefix(esc, "//:") {
-				restore = append(restore, strings.TrimSuffix(strings.TrimPrefix(esc, "//:"), "@"), fp)
-			}
+			restore = append(restore, strings.TrimPrefix(url.UserPassword("", fp).String(), ":"), fp)
+			pw = fp
+			u.User = url.UserPassword(name, pw)
+		} else {
+			u.User = url.User(name)
 		}
 	}
 	if u.RawQuery != "" {
@@ -121,8 +136,8 @@ func URL(raw string) string {
 		u.RawFragment = ""
 	}
 	out := u.String()
-	if len(restore) == 2 {
-		out = strings.Replace(out, restore[0], restore[1], 1)
+	for i := 0; i+1 < len(restore); i += 2 {
+		out = strings.Replace(out, restore[i], restore[i+1], 1)
 	}
 	return out
 }
