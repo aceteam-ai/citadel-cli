@@ -92,6 +92,19 @@ func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Con
 		return linkDeviceEnrollmentWith(ctx, result, nodeID, client.LinkRegisteredNode)
 	}
 	linkErr := attempt()
+	if kind, _ := nexus.DeviceLinkFailureDetails(linkErr); linkErr != nil && kind == nexus.DeviceLinkLocalPrecondition {
+		// No node identity could be resolved, so no link request was sent. The
+		// device key stays unlinked and expires within the hour, so reporting
+		// success (or a compatibility warning) would hide a node that silently
+		// drops off later. Fail on every server version and remove this
+		// enrollment's saved credentials so the next init re-enrolls.
+		if result != nil {
+			if err := enrollmentRollbackFn(result.Token); err != nil {
+				return fmt.Errorf("%w (removing this enrollment's saved credentials also failed)", deviceEnrollmentRecoveryError(linkErr))
+			}
+		}
+		return deviceEnrollmentRecoveryError(linkErr)
+	}
 	uncertainAttempt := linkErr != nil && !isDeviceLinkRefusal(linkErr)
 	if uncertainAttempt {
 		time.Sleep(deviceLinkRetryDelay)
@@ -273,4 +286,21 @@ func ccConnectDeviceEnrollmentWith(token *nexus.TokenResponse, deviceCode string
 		return err
 	}
 	return nil
+}
+
+// reregisterWithGrant registers the already-reconnected node under the freshly
+// approved grant. The server gives every grant its own registration reservation
+// and the link route only accepts a node that used that grant's registration
+// key, so a node that merely reconnected from preserved state cannot be linked
+// to the new device key. Disconnect (keeping tsnet state, so the machine key and
+// IP survive), then register with the grant's key; connectToNetwork records the
+// resulting node ID for the link that follows.
+func reregisterWithGrant(token *nexus.TokenResponse, nodeName string, disconnect func() error, connect func(name, authKey string) error) error {
+	if token == nil || token.Authkey == "" {
+		return deviceEnrollmentRecoveryError(nexus.NewDeviceLinkFailure(nexus.DeviceLinkLocalPrecondition, 0))
+	}
+	if err := disconnect(); err != nil {
+		return fmt.Errorf("disconnect before re-registering: %w", err)
+	}
+	return connect(nodeName, token.Authkey)
 }

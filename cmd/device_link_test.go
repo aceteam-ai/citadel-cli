@@ -394,7 +394,6 @@ func TestDeviceLinkStaticCategoriesPreserveRetryRollbackAndCompatibility(t *test
 			{"unexpected201", nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPStatus, http.StatusCreated), "category=http_status, HTTP 201", 2, false},
 			{"malformed200", nexus.NewDeviceLinkFailure(nexus.DeviceLinkMalformedResponse, http.StatusOK), "category=malformed_response, HTTP 200", 2, false},
 			{"refused403", &nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}, "category=refused, HTTP 403", 1, true},
-			{"local", nexus.NewDeviceLinkFailure(nexus.DeviceLinkLocalPrecondition, 0), "category=local_precondition", 2, false},
 			{"opaque", &opaqueDeviceLinkError{}, "category=unconfirmed", 2, false},
 		} {
 			t.Run(version+"/"+tc.name, func(t *testing.T) {
@@ -644,5 +643,50 @@ func TestControlCenterTokenPollRetriesServerErrorsBounded(t *testing.T) {
 	other := errors.New("access denied")
 	if err := ccTokenPollError("grant", other); err != other {
 		t.Fatalf("non-5xx errors pass through unchanged, got %v", err)
+	}
+}
+
+// init --relogin reconnects from preserved state, but the new grant's
+// reservation only links a node registered with that grant's key. The node must
+// be disconnected and re-registered with the new key, in that order.
+func TestReregisterWithGrantDisconnectsThenRegistersWithGrantKey(t *testing.T) {
+	var calls []string
+	token := &nexus.TokenResponse{Authkey: "grant-registration-key"}
+	err := reregisterWithGrant(token, "node-a",
+		func() error { calls = append(calls, "disconnect"); return nil },
+		func(name, key string) error { calls = append(calls, "connect:"+name+":"+key); return nil })
+	if err != nil || strings.Join(calls, ",") != "disconnect,connect:node-a:grant-registration-key" {
+		t.Fatalf("err=%v calls=%v", err, calls)
+	}
+}
+
+func TestReregisterWithGrantRefusesMissingKeyAndDisconnectFailure(t *testing.T) {
+	never := func(string, string) error { t.Fatal("must not connect"); return nil }
+	err := reregisterWithGrant(&nexus.TokenResponse{}, "n", func() error { t.Fatal("must not disconnect"); return nil }, never)
+	if kind, _ := nexus.DeviceLinkFailureDetails(err); err == nil || kind != nexus.DeviceLinkLocalPrecondition {
+		t.Fatalf("missing key must be a local precondition failure: %v", err)
+	}
+	if err := reregisterWithGrant(&nexus.TokenResponse{Authkey: "k"}, "n", func() error { return errors.New("busy") }, never); err == nil {
+		t.Fatal("disconnect failure must fail")
+	}
+}
+
+// An enrollment with no node ID sends nothing and leaves the key unlinked, so
+// it must fail on every server version, not warn and report success.
+func TestDeviceLinkMissingNodeIDIsFatalOnEveryServerVersion(t *testing.T) {
+	for _, version := range []string{"1.520.0", "1.519.0", ""} {
+		t.Run(version, func(t *testing.T) {
+			client := &scriptedDeviceLinker{linkErrors: []error{nexus.NewDeviceLinkFailure(nexus.DeviceLinkLocalPrecondition, 0)}, version: version}
+			obs := runLinkGate(t, client)
+			if obs.err == nil || len(obs.warnings) != 0 {
+				t.Fatalf("missing node ID must fail loudly: %+v", obs)
+			}
+			if len(client.grants) != 1 || client.versionCalls != 0 || obs.rolledBack != linkGateToken {
+				t.Fatal("missing node ID must not retry, consult the version, or keep the unlinked credentials")
+			}
+			if !strings.Contains(obs.err.Error(), "citadel logout && citadel init") || !strings.Contains(obs.err.Error(), "category=local_precondition") {
+				t.Fatalf("recovery guidance missing: %v", obs.err)
+			}
+		})
 	}
 }

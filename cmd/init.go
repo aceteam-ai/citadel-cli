@@ -351,9 +351,20 @@ and system user configuration (requires sudo).`,
 							fmt.Fprintf(os.Stderr, "⚠️  Could not save config: %v\n", err)
 						}
 					}
-					// A fresh grant does not authorize the already-connected node.
-					// Refusal requires explicit logout + init so registration uses
-					// the new reservation; a saved bearer is not a completed link.
+					// A fresh grant does not authorize the already-connected node:
+					// the link route only accepts a node registered with this
+					// grant's key. Re-register the node under it (tsnet state is
+					// kept, so the machine key and IP survive) before linking, or
+					// the new device key stays unlinked and expires in an hour.
+					if nodeName == "" {
+						nodeName, _ = getNodeName()
+					}
+					if err := reregisterWithGrant(deviceAuthResult.Token, nodeName, network.Disconnect, connectToNetwork); err != nil {
+						_ = rollbackEnrollmentCredentials(filepath.Join(nodeConfigDirFn(), "config.yaml"), deviceAuthResult.Token)
+						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
+						os.Exit(1)
+					}
+					// A saved bearer is not a completed link.
 					if err := linkDeviceEnrollment(deviceAuthResult); err != nil {
 						_ = network.Disconnect()
 						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
