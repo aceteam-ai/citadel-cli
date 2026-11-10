@@ -13,13 +13,13 @@ coordinator can read when it starts.
 
 ## Contract
 
-Retention is live in **direct Redis mode only**. API mode (the Redis API proxy,
-the default node transport) does not retain yet; see "API mode" below.
+Retention is live in direct Redis mode and in API mode (the Redis API proxy,
+the default node transport); see "API mode" below.
 
 | Item | Value | Owner |
 |------|-------|-------|
 | Key | `job:<job_id>:result` | `worker.TerminalResultKey` |
-| Value | The exact JSON envelope published on `stream:v1:<job_id>` for the job's first terminal event (`type` is `end`, `error` or `cancelled`) | `RedisStreamWriter.publishTerminal` |
+| Value | The exact JSON envelope published on `stream:v1:<job_id>` for the job's first terminal event (`type` is `end`, `error` or `cancelled`) | `RedisStreamWriter.publishTerminal`, `APIStreamWriter.publishTerminal` |
 | TTL | 72 hours | `worker.TerminalResultTTL` |
 | Job types | `MEETING_JOIN` only | `worker.retainsTerminalResult` |
 
@@ -64,23 +64,25 @@ carried, including node metadata and delivery-clock fields when present.
 Read `job:<job_id>:result` for each non-terminal session whose job id is known,
 parse the value as the Pub/Sub envelope, and apply it through the same
 idempotent terminal path as a live event. A missing key means no terminal event
-was produced, it expired, or the node runs in API mode.
+was produced, it expired, the node is an older version, or the envelope exceeded the API-mode size cap.
 
-## API mode: pending a scoped endpoint
+## API mode
 
-API-mode nodes do not write `job:<id>:result`. The generic
-`POST /api/fabric/redis/kv` route is not scoped to the job's org or assigned
-node for read or write, caps TTL at 24 hours and values at 1 MiB, so it is not
-used for transcripts. Retention will switch on when the proxy exposes a scoped
-endpoint, requested on citadel-cli#1553:
+API-mode nodes store the same envelope through the scoped proxy route, not the
+generic `/api/fabric/redis/kv` route (which is not job-scoped, caps TTL at 24
+hours and values at 1 MiB):
 
 `POST /api/fabric/redis/jobs/{jobId}/result`, device key with
-`device_redis:write`, body `{"envelope": "<terminal event JSON>", "ttl": 259200}`,
-refused unless the caller is the job's assigned node, stored with `SET NX EX`,
-response `{"stored": true|false}`.
+`device_redis:write`, body `{"envelope": "<terminal event JSON>", "ttl_seconds": 259200}`.
+The server stores it with `SET NX EX` only for the job's assigned node in the
+same org, accepts terminal events only, and answers `{"stored": true|false}`.
 
-The node-side seam is `worker.apiTerminalRetainer`: it returns nil today; it
-will return a `redisapi` client method implementing `terminalRetainer` against
-that endpoint. Durable HTTP deliveries (inactive, see
+The node posts after the terminal publish, once, with the same 5-second bound
+and detached context as direct mode. Any failure (4xx, 5xx, timeout) is logged
+without credentials and never fails or retries the publish. The server caps an
+envelope at 5 MiB; a larger one is skipped with a log line, never truncated
+(`redisapi.MaxTerminalResultBytes`). The node-side owners are
+`worker.apiTerminalRetainer` and `redisapi.Client.RetainTerminalResult`.
+Durable HTTP deliveries (inactive, see
 `docs/durable-http-delivery.md`) commit the terminal envelope through the
 delivery itself and do not retain.

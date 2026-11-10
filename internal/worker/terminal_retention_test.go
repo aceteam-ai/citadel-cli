@@ -157,6 +157,12 @@ type fakeKVProxy struct {
 	ttl        map[string]int
 	postedKeys []string
 	published  []string
+	// result route recording
+	resultPaths []string
+	resultBody  []string
+	resultAuth  []string
+	resultCode  int
+	resultDelay time.Duration
 }
 
 func newFakeKVProxy(t *testing.T) (*fakeKVProxy, *redisapi.Client) {
@@ -184,6 +190,28 @@ func (p *fakeKVProxy) serve(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	switch {
+	case strings.HasSuffix(r.URL.Path, "/result") && r.Method == http.MethodPost:
+		var body struct {
+			Envelope string `json:"envelope"`
+			TTL      int    `json:"ttl_seconds"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		p.resultPaths = append(p.resultPaths, r.URL.Path)
+		p.resultBody = append(p.resultBody, body.Envelope)
+		p.resultAuth = append(p.resultAuth, r.Header.Get("Authorization"))
+		if p.resultDelay > 0 {
+			time.Sleep(p.resultDelay)
+		}
+		if p.resultCode != 0 {
+			w.WriteHeader(p.resultCode)
+			_, _ = w.Write([]byte(`{"error":"synthetic"}`))
+			return
+		}
+		if body.TTL != 259200 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"stored":true}`))
 	case strings.HasSuffix(r.URL.Path, "/pubsub/publish"):
 		var body struct{ Message string }
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -217,10 +245,9 @@ func (p *fakeKVProxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// TestMeetingJoinTerminalResultNotRetainedAPIMode pins that API mode writes
-// nothing through the generic KV route: that route is not scoped to the job's
-// org or node, so retention waits for the scoped result endpoint.
-func TestMeetingJoinTerminalResultNotRetainedAPIMode(t *testing.T) {
+// TestMeetingJoinTerminalResultRetainedAPIMode pins one scoped result post
+// after the terminal publish, carrying the exact published envelope.
+func TestMeetingJoinTerminalResultRetainedAPIMode(t *testing.T) {
 	proxy, client := newFakeKVProxy(t)
 	ctx := context.Background()
 	runMeetingToTerminal(t, "meeting-3", func(job *Job) StreamWriter { return apiStreamWriterFor(ctx, client, job) })
@@ -230,12 +257,97 @@ func TestMeetingJoinTerminalResultNotRetainedAPIMode(t *testing.T) {
 	if proxy.resultPosts() != 0 {
 		t.Fatalf("API mode wrote a result key through the KV route: kv=%v", proxy.kv)
 	}
-	var sawEnd bool
-	for _, m := range proxy.published {
-		sawEnd = sawEnd || strings.Contains(m, `"type":"end"`)
+	if len(proxy.resultPaths) != 1 || proxy.resultPaths[0] != "/api/fabric/redis/jobs/meeting-3/result" {
+		t.Fatalf("result posts = %v", proxy.resultPaths)
 	}
-	if !sawEnd {
-		t.Fatal("terminal end event was not published")
+	if proxy.resultAuth[0] != "Bearer synthetic-token" {
+		t.Fatalf("result post auth header not the client's")
+	}
+	assertRetainedEnd(t, proxy.resultBody[0], "meeting-3")
+	var published string
+	for _, m := range proxy.published {
+		if strings.Contains(m, `"type":"end"`) {
+			published = m
+		}
+	}
+	if published == "" || published != proxy.resultBody[0] {
+		t.Fatalf("retained envelope differs from published:\npublished %s\nretained  %s", published, proxy.resultBody[0])
+	}
+}
+
+func TestNonRetainedTypeNeverPostsResultAPIMode(t *testing.T) {
+	proxy, client := newFakeKVProxy(t)
+	w := apiStreamWriterFor(context.Background(), client, &Job{ID: "shell-9", Type: "SHELL_COMMAND"})
+	if err := w.WriteEnd(map[string]any{"ok": true}); err != nil {
+		t.Fatal(err)
+	}
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	if len(proxy.resultPaths) != 0 || len(proxy.published) != 1 {
+		t.Fatalf("results=%v published=%d", proxy.resultPaths, len(proxy.published))
+	}
+}
+
+func TestAPIResultServerFailuresDoNotAffectPublishNorLeakToken(t *testing.T) {
+	for _, code := range []int{http.StatusBadRequest, http.StatusNotFound, http.StatusInternalServerError, http.StatusForbidden} {
+		proxy, client := newFakeKVProxy(t)
+		proxy.resultCode = code
+		var logged []string
+		orig := retentionLogf
+		retentionLogf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+		w := apiStreamWriterFor(context.Background(), client, &Job{ID: "meeting-7", Type: JobTypeMeetingJoin})
+		err := w.WriteEnd(meetingOutput())
+		retentionLogf = orig
+		if err != nil {
+			t.Fatalf("code %d: publish failed: %v", code, err)
+		}
+		if len(logged) != 1 || strings.Contains(logged[0], "synthetic-token") {
+			t.Fatalf("code %d: logged = %v", code, logged)
+		}
+		proxy.mu.Lock()
+		if len(proxy.published) != 1 || len(proxy.resultPaths) != 1 {
+			t.Fatalf("code %d: published=%d results=%d (no retry expected)", code, len(proxy.published), len(proxy.resultPaths))
+		}
+		proxy.mu.Unlock()
+	}
+}
+
+func TestAPIResultTimeoutDoesNotFailPublish(t *testing.T) {
+	proxy, client := newFakeKVProxy(t)
+	proxy.resultDelay = terminalRetainTimeout + 500*time.Millisecond
+	var logged []string
+	orig := retentionLogf
+	retentionLogf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	t.Cleanup(func() { retentionLogf = orig })
+	w := apiStreamWriterFor(context.Background(), client, &Job{ID: "meeting-8", Type: JobTypeMeetingJoin})
+	start := time.Now()
+	if err := w.WriteEnd(meetingOutput()); err != nil {
+		t.Fatalf("publish failed on retention timeout: %v", err)
+	}
+	if time.Since(start) > terminalRetainTimeout+2*time.Second {
+		t.Fatal("retention was not bounded")
+	}
+	if len(logged) != 1 || strings.Contains(logged[0], "synthetic-token") {
+		t.Fatalf("logged = %v", logged)
+	}
+}
+
+func TestAPIResultOversizeEnvelopeSkippedNotTruncated(t *testing.T) {
+	proxy, client := newFakeKVProxy(t)
+	var logged []string
+	orig := retentionLogf
+	retentionLogf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	t.Cleanup(func() { retentionLogf = orig })
+	w := apiStreamWriterFor(context.Background(), client, &Job{ID: "meeting-10", Type: JobTypeMeetingJoin})
+	big := map[string]any{"transcript": strings.Repeat("a", redisapi.MaxTerminalResultBytes+1)}
+	// the oversize terminal publish itself still goes through the proxy
+	if err := w.WriteEnd(big); err != nil {
+		t.Fatalf("publish failed: %v", err)
+	}
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	if len(proxy.resultPaths) != 0 || len(logged) != 1 || !strings.Contains(logged[0], "not retained") {
+		t.Fatalf("results=%v logged=%v", proxy.resultPaths, logged)
 	}
 }
 
