@@ -3582,3 +3582,21 @@ Auto-generated log of every release.
   - fix(local): keep local-mode state in the invoking user's config dir (#1593)
 
 
+---
+
+## v2.215.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +1252 |
+
+**Changes:**
+
+  - feat(meetings): Teams in-call disclosure and /ace leave (N3) (#1610)
+  - fix(enrollment): register relogin grants before linking, fail unsent links (#1605)
+  - feat(worker): retain terminal MEETING_JOIN result in API mode (citadel-cli#1553) (#1609)
+  - fix(meetings): select Teams audio before muting devices (#1549)
+
+
