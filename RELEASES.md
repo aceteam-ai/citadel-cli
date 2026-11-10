@@ -3636,3 +3636,18 @@ Auto-generated log of every release.
   - feat(hpc): job-scoped --profile hpc with an API-only worker (aceteam#12715)
 
 
+---
+
+## v2.217.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +119 |
+
+**Changes:**
+
+  - fix(local): accept a UTF-8 BOM in agent config files for local config --write (#1611)
+
+
