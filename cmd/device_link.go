@@ -175,7 +175,9 @@ func grantEnrollmentPrecheck() error {
 // unchanged, so it is dropped first; the state directory, and with it the
 // machine key, is kept. connect must force the login, because tsnet ignores the
 // key when saved state exists. Registering as the same node as before the grant
-// means the key was ignored; that is refused rather than linked.
+// may mean the key was ignored, or that the server re-authenticated the existing
+// node; the server decides at link time, and a refusal carries a hint to log out
+// and enroll again.
 //
 // Every failure before the link is sent removes this enrollment's saved
 // credentials, so the next `citadel init` authenticates again instead of
@@ -196,6 +198,7 @@ func registerAndLinkGrantWith(result *DeviceAuthResult, nodeName string, prechec
 	preGrantID := currentNodeID(ctx)
 	cancel()
 	_ = disconnect()
+	resumed := false
 	// Without a registration key there is nothing to register; the link's own
 	// precondition then refuses the enrollment.
 	if result != nil && result.Token != nil && result.Token.Authkey != "" {
@@ -203,15 +206,14 @@ func registerAndLinkGrantWith(result *DeviceAuthResult, nodeName string, prechec
 			return fail(fmt.Errorf("failed to connect to network: %w", err))
 		}
 		postCtx, postCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		registered := currentNodeID(postCtx)
+		resumed = preGrantID != "" && currentNodeID(postCtx) == preGrantID
 		postCancel()
-		if preGrantID != "" && registered == preGrantID {
-			_ = disconnect()
-			return fail(fmt.Errorf("the network resumed the previous registration (node %s) instead of registering with the new key; the enrollment was not linked", registered))
-		}
 	}
 	if err := link(result); err != nil {
 		_ = disconnect()
+		if resumed && isDeviceLinkRefusal(err) {
+			return fmt.Errorf("the node resumed its previous registration; run `citadel logout && citadel init`: %w", err)
+		}
 		return err
 	}
 	return nil

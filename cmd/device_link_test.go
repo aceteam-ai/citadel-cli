@@ -838,17 +838,37 @@ func TestFreshGrantConnectFailureNeverLinks(t *testing.T) {
 	}
 }
 
-// tsnet ignores the auth key when saved state exists unless the login is
-// forced, so a plain connect resumes the pre-grant registration.
-func TestFreshGrantIgnoredAuthKeyIsRefusedNotLinked(t *testing.T) {
+// Equal IDs are not decided locally: the server may have re-authenticated the
+// existing node with the grant's key.
+func TestFreshGrantSameNodeIDIsLinkedAndServerDecides(t *testing.T) {
+	stubLinkGateSeams(t)
+	mesh := &reloginMesh{sessionUp: true, registered: "7", keyOf: map[string]string{"7": "pre-grant-key"}}
+	var linked []string
+	srv := reloginLinkServer(t, mesh, "registration-key", &linked)
+	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: &nexus.TokenResponse{Authkey: "registration-key"}}
+	err := registerAndLinkGrantWith(result, "node-a", noPrecheck, mesh.currentID, mesh.disconnect,
+		func(_, key string) error { mesh.registered = "7"; mesh.keyOf["7"] = key; return nil }, // existing node re-authenticated
+		func(r *DeviceAuthResult) error {
+			return linkDeviceEnrollmentGated(r, func(context.Context) string { return mesh.registered }, nexus.NewDeviceAuthClient(srv.URL))
+		})
+	if err != nil || strings.Join(linked, ",") != "7" {
+		t.Fatalf("same ID bound to the grant key must link: err=%v links=%v", err, linked)
+	}
+}
+
+func TestFreshGrantSameNodeIDRefusedGivesClearHintAndRollsBack(t *testing.T) {
 	rolledBack := stubLinkGateSeams(t)
 	mesh := &reloginMesh{sessionUp: true, registered: "7", keyOf: map[string]string{"7": "pre-grant-key"}}
+	var linked []string
+	srv := reloginLinkServer(t, mesh, "registration-key", &linked)
 	token := &nexus.TokenResponse{Authkey: "registration-key"}
 	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: token}
 	err := registerAndLinkGrantWith(result, "node-a", noPrecheck, mesh.currentID, mesh.disconnect, mesh.connectPlain,
-		func(*DeviceAuthResult) error { t.Fatal("must not link the pre-grant node"); return nil })
-	if err == nil || !strings.Contains(err.Error(), "resumed the previous registration") {
-		t.Fatalf("want a resumed-registration refusal, got %v", err)
+		func(r *DeviceAuthResult) error {
+			return linkDeviceEnrollmentGated(r, func(context.Context) string { return mesh.registered }, nexus.NewDeviceAuthClient(srv.URL))
+		})
+	if err == nil || !strings.Contains(err.Error(), "the node resumed its previous registration; run `citadel logout && citadel init`") {
+		t.Fatalf("want the resumed-registration hint, got %v", err)
 	}
 	if len(*rolledBack) != 1 || (*rolledBack)[0] != token {
 		t.Fatalf("rollbacks = %d, want this enrollment rolled back", len(*rolledBack))
