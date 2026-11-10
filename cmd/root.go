@@ -145,7 +145,9 @@ control center. All other subcommands are for scripting and advanced use.`,
 		// `citadel local ...` makes no outbound calls by default (aceteam#13503
 		// decision 4): no CA trust preparation, no interrupted-update repair,
 		// no update check. Debug output still goes to stderr above.
-		if isLocalModeCommand(cmd) {
+		// The hpc login-node commands (launch, setup) only write a batch script
+		// or a virtualenv; like local mode they skip CA trust and update checks.
+		if isLocalModeCommand(cmd) || isHPCLoginCommand(cmd.CommandPath()) {
 			network.SetLogf(Debug)
 			if noColorGlobal || os.Getenv("NO_COLOR") != "" {
 				color.NoColor = true

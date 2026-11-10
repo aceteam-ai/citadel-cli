@@ -93,6 +93,32 @@ func ReadTokenFile(path string, uid int) (string, error) {
 	return token, nil
 }
 
+// CheckTokenFile applies ReadTokenFile's custody checks without reading or
+// removing the file, so a launcher can refuse early on a login node.
+func CheckTokenFile(path string, uid int) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("enrollment token file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("enrollment token file must be a regular file, not a symlink or device")
+	}
+	owner, err := ownerUID(info)
+	if err != nil {
+		return err
+	}
+	if owner != uid {
+		return fmt.Errorf("enrollment token file is owned by uid %d, not %d", owner, uid)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("enrollment token file has group or other permissions (%#o); expected 0600", info.Mode().Perm())
+	}
+	if info.Size() > maxTokenFileBytes {
+		return errors.New("enrollment token file is too large")
+	}
+	return nil
+}
+
 // VerifyLeafKey requires a leaf certificate whose public key is the job key.
 // An empty leaf, an unparseable one, or one for another key is refused, so a
 // mismatched certificate can never mark the job key as registered.

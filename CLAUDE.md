@@ -1822,7 +1822,25 @@ persists the response into the job-local `config.yaml` and identity store.
 the server accepted the token makes a bounded best-effort deregister.
 `hpcShutdown` owns exit ordering: on the drain signal (SIGUSR1) stop claiming,
 wait up to `--hpc-drain-timeout`, deregister, cancel; SIGTERM, including one
-that arrives during the drain wait, deregisters at once. Deregistration runs once on every exit path after enrollment.
+that arrives during the drain wait, deregisters at once. Deregistration runs
+once on every exit path after enrollment.
+The launcher (aceteam#12718): `hpc.JobSpec.Normalize` validates every value
+`hpc.RenderSbatch` writes (golden in `internal/hpc/testdata`), and `citadel hpc
+launch`/`setup` run on a login node with no profile. `hpc.Supervisor` owns the
+job body `citadel hpc run`: engine on a per-job 127.0.0.1 port in its own
+process group, `/v1/models` readiness, then the worker as a child
+`citadel work --profile hpc` with `CITADEL_VLLM_HOST_PORT` set (that env var,
+resolved at process init by `services.resolveVLLMHostPort`, is the adoption
+seam; the adoption record needs a numeric node id). `hpc.reservedFlag` owns
+the vLLM flag refusal (abbreviations, underscore spellings, `--config`), and
+`EngineSpec.Command` appends the fixed flags last. `hpc.WaitModelsReadyOwned`
+with `hpc.CheckListenerOwner` refuses a port held by another uid before any
+probe. `Supervisor.Run` keeps the first signal's deadline and exits non-zero
+for a worker error or kill. `status.filterVisibleGPUsWithUUIDs` maps UUID and
+MIG entries through `nvidia-smi -L`; `hpc.TensorParallelFor` falls back to
+`SLURM_GPUS_ON_NODE`. The venv pin is partial (vLLM only). Signals forward to the
+worker; the engine group is stopped on every exit path. Only `--runtime venv`
+runs; `hpc.ParseRuntime` refuses the reserved ones.
 
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,

@@ -330,7 +330,19 @@ func hpcHeartbeatCollector(nodeID string, runner *atomic.Pointer[worker.Runner],
 			return nil
 		},
 		PermissionsProvider: hpcPermissions,
+		// Only the GPUs the scheduler allocated to this job.
+		VisibleGPUs: hpcVisibleGPUs(),
 	})
+}
+
+// hpcVisibleGPUs is the allocation's device list (never nil, so the
+// heartbeat reports no GPU at all on a CPU-only allocation).
+func hpcVisibleGPUs() []string {
+	visible := hpc.VisibleGPUs(os.Getenv(hpc.EnvVisibleGPUs))
+	if visible == nil {
+		return []string{}
+	}
+	return visible
 }
 
 // runHPCWork is `citadel work` under the HPC profile.
