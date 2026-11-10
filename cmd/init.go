@@ -351,11 +351,18 @@ and system user configuration (requires sudo).`,
 							fmt.Fprintf(os.Stderr, "⚠️  Could not save config: %v\n", err)
 						}
 					}
-					// A fresh grant does not authorize the already-connected node.
-					// Refusal requires explicit logout + init so registration uses
-					// the new reservation; a saved bearer is not a completed link.
-					if err := linkDeviceEnrollment(deviceAuthResult); err != nil {
-						_ = network.Disconnect()
+					applyDeviceAuthNexusURL(flagChanged(cmd, "nexus"), deviceAuthResult.Token.NexusURL)
+					nodeName, err = getNodeName()
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+						os.Exit(1)
+					}
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
+					// A fresh grant does not authorize the already-connected node
+					// (e.g. --relogin reconnected from preserved state). Register
+					// with the grant's key, keeping the machine key, and link that
+					// registration; a saved bearer is not a completed link.
+					if err := registerAndLinkGrantWith(deviceAuthResult, nodeName, network.Disconnect, connectToNetwork, linkDeviceEnrollment); err != nil {
 						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
 						os.Exit(1)
 					}
