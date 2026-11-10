@@ -1290,6 +1290,7 @@ func buildDeviceAuthContent(config *DeviceAuthConfig, completeURL, status string
 
 // showDeviceAuthModal displays the device authorization code and polls for completion
 func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
+	config = snapshotDeviceAuthConfig(config)
 	expiresAt, expiryErr := deviceAuthDeadline(config, time.Now())
 	if expiryErr != nil {
 		cc.AddActivity("error", "Device authorization is expired or has an invalid expiry")
@@ -1456,7 +1457,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 			if token == nil || token.Authkey != key {
 				return errors.New("current device authorization is missing")
 			}
-			return connectCurrentDeviceAuthorization(ctx, expiresAt, time.Now, cc.deviceAuth.Connect, token, code)
+			return connectCurrentDeviceAuthorization(ctx, expiresAt, time.Now, deviceAuthCallbacksFor(config, cc.deviceAuth).Connect, token, code)
 		}
 		if err := completeDeviceEnrollment(token.Authkey, config.DeviceCode, connect, func() {
 			cc.app.QueueUpdateDraw(func() { updateContent("success") })
