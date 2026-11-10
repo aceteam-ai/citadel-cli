@@ -71,7 +71,7 @@ func TestHPCProfileAllowsOnlyListedCommands(t *testing.T) {
 }
 
 func TestResolveHPCActivation(t *testing.T) {
-	base := t.TempDir()
+	base := privateTempDir(t)
 	env := map[string]string{hpc.EnvJobID: "77", hpc.EnvTmpDir: base}
 	getenv := func(k string) string { return env[k] }
 	uid := os.Getuid()
@@ -88,7 +88,7 @@ func TestResolveHPCActivation(t *testing.T) {
 	if _, err := os.Stat(layout.NodeDir); err != nil {
 		t.Fatalf("node dir not prepared: %v", err)
 	}
-	explicit := t.TempDir()
+	explicit := privateTempDir(t)
 	layout, err = resolveHPCActivation("citadel work", "linux", uid, explicit, getenv)
 	if err != nil || layout.Base != explicit {
 		t.Fatalf("explicit root: %v, %s", err, layout.Base)
