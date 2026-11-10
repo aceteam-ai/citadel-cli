@@ -1786,6 +1786,25 @@ may discard unreadable/corrupt history and its untrusted verification anchor.
 See `docs/nodevault-cross-process-lockout.md` for the mixed-version, ownership,
 publication-review and native-platform boundaries.
 
+### HPC profile: job-scoped, API-only worker (aceteam#12715)
+
+`cmd.applyRunProfile` runs first in the root pre-run and owns profile
+selection (`--profile` / `CITADEL_PROFILE`; a disagreeing pair or an unknown
+name is refused). `cmd.hpcProfileAllowsCommand` is the positive command list;
+everything else is refused under the profile. `hpc.ResolveLayout` decides the
+job root from `SLURM_JOB_ID` (plus `SLURM_RESTART_COUNT`) under
+`--hpc-state-root` / `CITADEL_HPC_STATE_ROOT` or `TMPDIR`, refusing missing or
+ambiguous input; `hpc.Prepare` owns the owner-only checks. `hpcscope.Install`
+makes the layout authoritative through the one-shot production scopes
+`platform.ScopeProcessDirectories` and `network.ScopeProcessStateDirectories`
+(test fixtures still win), and calls `nodeidentity.DisableLegacyReadThrough`
+so a shared home's key is never adopted. `internal/hpcscope`'s
+two-allocation subprocess test pins that no resolved path leaves the job root.
+`runWork` hands off to `runHPCWork` before anything else; the HPC worker is a
+separate positive list (`newHPCRunner`, `hpcQueueNames`), not gates inside
+`runWork`. `hpc_work_tripwire_test.go` lists the entry points it must never
+reference, and `hpcTemplateBuiltinPolicy` owns which template builtins run.
+
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,
 not a search path: it reads `<ConfigDir>/config.yaml` for a `node_config_dir` key
