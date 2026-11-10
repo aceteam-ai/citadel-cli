@@ -62,11 +62,8 @@ func enrollHPCNode(ctx context.Context, layout hpc.Layout, o hpcEnrollOptions) (
 	if err != nil {
 		return hpcCredentials{}, err
 	}
-	token, err := hpc.ReadTokenFile(o.TokenFile, o.UID)
-	if err != nil {
-		return hpcCredentials{}, err
-	}
-	// The job-local key, never a key adopted from the shared home.
+	// Key and CSR first: a local failure must not destroy a token the
+	// server never saw. The job-local key, never one adopted from a shared home.
 	store := nodeidentity.New(filepath.Join(layout.NodeDir, "identity"))
 	key, err := store.GetOrCreateKey()
 	if err != nil {
@@ -76,17 +73,41 @@ func enrollHPCNode(ctx context.Context, layout hpc.Layout, o hpcEnrollOptions) (
 	if err != nil {
 		return hpcCredentials{}, err
 	}
+	token, err := hpc.ReadTokenFile(o.TokenFile, o.UID)
+	if err != nil {
+		return hpcCredentials{}, err
+	}
 	resp, err := o.Client.Enroll(ctx, o.BaseURL, token, string(csr), labels)
 	if err != nil {
 		return hpcCredentials{}, err
 	}
+	// From here the server holds a live node and credential. Any local
+	// failure must remove them rather than strand a node nobody runs.
+	fail := func(err error) (hpcCredentials, error) {
+		_ = os.Remove(hpcDeviceConfigPath(layout.NodeDir))
+		_ = os.Remove(store.LeafPath())
+		_ = os.Remove(store.CAChainPath())
+		dctx, cancel := context.WithTimeout(context.Background(), hpcDeregisterTimeout)
+		defer cancel()
+		if derr := o.Client.Deregister(dctx, resp.APIBaseURL, resp.DeviceAPIToken, resp.NodeID); derr != nil {
+			return hpcCredentials{}, fmt.Errorf("%w (and deregistering the new node failed: %v; remove it in the console)", err, derr)
+		}
+		return hpcCredentials{}, fmt.Errorf("%w (the new node was deregistered)", err)
+	}
+	if err := hpc.VerifyLeafKey(resp.LeafPEM, &key.PublicKey); err != nil {
+		return fail(err)
+	}
 	if err := store.StoreLeaf(resp.LeafPEM, resp.ChainPEM); err != nil {
-		return hpcCredentials{}, fmt.Errorf("store fabric leaf: %w", err)
+		return fail(fmt.Errorf("store fabric leaf: %w", err))
 	}
 	if err := writeHPCDeviceConfig(layout.NodeDir, resp); err != nil {
-		return hpcCredentials{}, err
+		return fail(err)
 	}
-	return readHPCCredentials(layout.NodeDir)
+	creds, err := readHPCCredentials(layout.NodeDir)
+	if err != nil {
+		return fail(err)
+	}
+	return creds, nil
 }
 
 // writeHPCDeviceConfig writes the enrollment into <nodeDir>/config.yaml with

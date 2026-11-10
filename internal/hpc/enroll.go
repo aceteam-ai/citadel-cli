@@ -3,7 +3,10 @@ package hpc
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -40,7 +43,18 @@ var ErrTokenUnavailable = errors.New("enrollment token unavailable (already used
 // refused. A token that was read is never left on disk: if removal fails the
 // read fails too.
 func ReadTokenFile(path string, uid int) (string, error) {
-	info, err := os.Lstat(path)
+	// Open first, without following a symlink and without blocking on a FIFO,
+	// then judge the open descriptor, so a path swapped after a check cannot
+	// change what is read.
+	f, err := openNoFollow(path)
+	if err != nil {
+		if isSymlinkOpenError(err) {
+			return "", errors.New("enrollment token file must be a regular file, not a symlink or device")
+		}
+		return "", fmt.Errorf("enrollment token file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return "", fmt.Errorf("enrollment token file: %w", err)
 	}
@@ -60,12 +74,12 @@ func ReadTokenFile(path string, uid int) (string, error) {
 	if info.Size() > maxTokenFileBytes {
 		return "", errors.New("enrollment token file is too large")
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("enrollment token file: %w", err)
-	}
 	data, readErr := io.ReadAll(io.LimitReader(f, maxTokenFileBytes+1))
-	f.Close()
+	// Remove only the file that was read: the path must still name it.
+	cur, lerr := os.Lstat(path)
+	if lerr != nil || !os.SameFile(info, cur) {
+		return "", errors.New("enrollment token file was replaced while it was read; refusing")
+	}
 	if rmErr := os.Remove(path); rmErr != nil {
 		return "", fmt.Errorf("remove enrollment token file: %w", rmErr)
 	}
@@ -77,6 +91,28 @@ func ReadTokenFile(path string, uid int) (string, error) {
 		return "", errors.New("enrollment token file does not hold a single token")
 	}
 	return token, nil
+}
+
+// VerifyLeafKey requires a leaf certificate whose public key is the job key.
+// An empty leaf, an unparseable one, or one for another key is refused, so a
+// mismatched certificate can never mark the job key as registered.
+func VerifyLeafKey(leafPEM string, pub *ecdsa.PublicKey) error {
+	if strings.TrimSpace(leafPEM) == "" {
+		return errors.New("enrollment response has no leaf certificate")
+	}
+	block, _ := pem.Decode([]byte(leafPEM))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return errors.New("enrollment response leaf is not a PEM certificate")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return errors.New("enrollment response leaf is not a valid certificate")
+	}
+	got, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok || pub == nil || !got.Equal(pub) {
+		return errors.New("enrollment response leaf is not for this job's key")
+	}
+	return nil
 }
 
 // EnrollResponse is the platform's 200 body.
@@ -170,7 +206,7 @@ func (c Client) Enroll(ctx context.Context, baseURL, token, csrPEM string, label
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http().Do(req)
 	if err != nil {
-		return EnrollResponse{}, fmt.Errorf("enrollment request failed: %w", scrubURLError(err))
+		return EnrollResponse{}, fmt.Errorf("enrollment request failed: %w; the token may have been used, mint a new one if this repeats", scrubURLError(err))
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
