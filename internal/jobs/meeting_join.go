@@ -952,12 +952,14 @@ func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p
 	br = phaseMeetingBrowser{meetingBrowser: br, ctx: recordingCtx}
 	botMessages := make(map[string]struct{})
 	posted := false
-	if p.Platform != platformTeams {
+	if p.Platform == platformTeams {
+		posted = h.announceTeamsOnAdmission(ctx, br, botMessages, p)
+	} else {
 		posted = h.announceOnAdmission(ctx, br, botMessages, p)
 	}
 	// The interactive during-call layer (announce / rolling `/ace` commands /
-	// chat capture) is Meet-coupled (issue #5435) and explicitly OUT of the Teams
-	// MVP scope (#7000: join + record + transcribe, no in-call chat). Route Teams
+	// chat capture) is Meet-coupled (issue #5435) and out of Teams scope; Teams
+	// gets only the disclosure and a standalone `/ace leave` (#1595). Route Teams
 	// through the plain record-until-end loop, which uses the Teams-aware
 	// end-detection (checkMeetingEndedFor). Wiring the interactive layer for Teams
 	// is a documented follow-up once its DOM is live-tuned.
@@ -1201,6 +1203,12 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser
 		}
 		if reason, ended := checkMeetingEndedFor(p.Platform, br, &endState); ended {
 			return reason, nil
+		}
+		if p.Platform == platformTeams && len(ownMessages) > 0 {
+			if teamsLeaveRequested(br, seenChat, ownMessages[0]) {
+				_, _ = br.Evaluate(teamsLeaveJS)
+				return "ace_command_leave", nil
+			}
 		}
 		if p.Platform != platformTeams && len(ownMessages) > 0 {
 			messages, _ := readMeetChat(br)
