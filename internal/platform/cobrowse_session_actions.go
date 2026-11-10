@@ -97,10 +97,14 @@ func (s *cobrowseSession) requireDrivablePort() (int, error) {
 // sessionForAction resolves a session by id for an action call, mirroring the
 // "no such browser session" error the job handler already surfaces for status.
 func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, error) {
+	m.Recover()
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	m.mu.Unlock()
 	if !ok {
+		if e, ended := m.EndedSession(id); ended {
+			return nil, &SessionEndedError{ID: id, Reason: e.Reason, Detail: e.Detail}
+		}
 		return nil, fmt.Errorf("no such browser session: %q", id)
 	}
 	return s, nil
@@ -495,6 +499,7 @@ func (m *CobrowseSessionManager) Handoff(id string) (CobrowseSessionStatus, erro
 	}
 	s.explicitHandoff = true
 	s.mu.Unlock()
+	s.persistRecord()
 	return s.status(), nil
 }
 
@@ -512,6 +517,7 @@ func (m *CobrowseSessionManager) Resume(id string) (CobrowseSessionStatus, error
 	}
 	s.explicitHandoff = false
 	s.mu.Unlock()
+	s.persistRecord()
 	return s.status(), nil
 }
 

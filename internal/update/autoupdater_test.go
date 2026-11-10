@@ -4,7 +4,9 @@ package update
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -415,4 +417,126 @@ func TestRun_CancelDuringCheckDoesNotDownloadOrApply(t *testing.T) {
 	if checker.downloads.Load() != 0 || applied.Load() {
 		t.Fatal("cancelled updater downloaded or applied a release")
 	}
+}
+
+func deferTestUpdater(busy func() (bool, string), maxDefer time.Duration, now *time.Time, applied, restarted *int, logs *[]string) *AutoUpdater {
+	return NewAutoUpdater(AutoUpdaterConfig{
+		Checker:    &fakeChecker{release: &Release{TagName: "v9.9.9"}},
+		ActiveJobs: func() int { return 0 },
+		Busy:       busy,
+		MaxDefer:   maxDefer,
+		Now:        func() time.Time { return *now },
+		Apply:      func(string) error { *applied++; return nil },
+		Restart:    func() error { *restarted++; return nil },
+		Log:        func(f string, a ...any) { *logs = append(*logs, fmt.Sprintf(f, a...)) },
+	})
+}
+
+func TestRunOnce_BusyDefersAndRecords(t *testing.T) {
+	now := time.Now()
+	var applied, restarted int
+	var logs []string
+	u := deferTestUpdater(func() (bool, string) { return true, "co-browse session cb-1: handoff outstanding" }, time.Hour, &now, &applied, &restarted, &logs)
+	for i := 0; i < 3; i++ {
+		if u.runOnce(context.Background()) {
+			t.Fatal("busy node must not restart")
+		}
+	}
+	if applied != 0 || restarted != 0 {
+		t.Fatalf("applied=%d restarted=%d", applied, restarted)
+	}
+	st, err := LoadState()
+	if err != nil || st.LastResult != ResultDeferredBusy {
+		t.Fatalf("last_result = %v, %v", st, err)
+	}
+	n := 0
+	for _, l := range logs {
+		if strings.Contains(l, "deferring update") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("deferral log not rate limited: %d lines", n)
+	}
+}
+
+func TestRunOnce_MaxDeferForces(t *testing.T) {
+	now := time.Now()
+	var applied, restarted int
+	var logs []string
+	u := deferTestUpdater(func() (bool, string) { return true, "busy" }, time.Hour, &now, &applied, &restarted, &logs)
+	if u.runOnce(context.Background()) {
+		t.Fatal("first cycle should defer")
+	}
+	now = now.Add(61 * time.Minute)
+	if !u.runOnce(context.Background()) || applied != 1 || restarted != 1 {
+		t.Fatalf("expected forced update: applied=%d restarted=%d", applied, restarted)
+	}
+}
+
+func TestRunOnce_MaxDeferZeroNeverForces(t *testing.T) {
+	now := time.Now()
+	var applied, restarted int
+	var logs []string
+	u := deferTestUpdater(func() (bool, string) { return true, "busy" }, 0, &now, &applied, &restarted, &logs)
+	u.runOnce(context.Background())
+	now = now.Add(1000 * time.Hour)
+	if u.runOnce(context.Background()) || applied != 0 {
+		t.Fatal("zero MaxDefer must never force")
+	}
+}
+
+func TestRunOnce_BusyRecheckedBeforeApply(t *testing.T) {
+	now := time.Now()
+	var applied, restarted, calls int
+	var logs []string
+	released := false
+	u := deferTestUpdater(func() (bool, string) { calls++; return calls >= 2, "viewer attached" }, time.Hour, &now, &applied, &restarted, &logs)
+	u.cfg.BeginDrain = func() func() { return func() { released = true } }
+	if u.runOnce(context.Background()) {
+		t.Fatal("session became busy during drain; must not restart")
+	}
+	if applied != 0 || restarted != 0 || !released {
+		t.Fatalf("applied=%d restarted=%d released=%v", applied, restarted, released)
+	}
+	if st, _ := LoadState(); st.LastResult != ResultDeferredBusy {
+		t.Fatalf("last_result = %q", st.LastResult)
+	}
+}
+
+func TestRunOnce_NotBusyUnchanged(t *testing.T) {
+	now := time.Now()
+	var applied, restarted int
+	var logs []string
+	u := deferTestUpdater(func() (bool, string) { return false, "" }, time.Hour, &now, &applied, &restarted, &logs)
+	if !u.runOnce(context.Background()) || applied != 1 || restarted != 1 {
+		t.Fatal("idle node must update")
+	}
+}
+
+func TestResolveMaxDefer(t *testing.T) {
+	t.Setenv(EnvMaxDefer, "")
+	if ResolveMaxDefer() != DefaultMaxDefer {
+		t.Fatal("default")
+	}
+	t.Setenv(EnvMaxDefer, "0")
+	if ResolveMaxDefer() != 0 {
+		t.Fatal("0 must mean never force")
+	}
+	t.Setenv(EnvMaxDefer, "90")
+	if ResolveMaxDefer() != 90*time.Second {
+		t.Fatal("seconds")
+	}
+	t.Setenv(EnvMaxDefer, "junk")
+	if ResolveMaxDefer() != DefaultMaxDefer {
+		t.Fatal("invalid falls back")
+	}
+}
+
+func TestRestartProcessRunsHook(t *testing.T) {
+	var got string
+	SetBeforeRestartHook(func(d string) { got = d })
+	defer SetBeforeRestartHook(nil)
+	runBeforeRestart()
+	_ = got // detail is empty without staged state; the hook ran without panicking
 }

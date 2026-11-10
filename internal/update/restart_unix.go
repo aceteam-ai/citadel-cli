@@ -15,6 +15,7 @@ import (
 // process image, so this works both for foreground runs and under a supervisor
 // (systemd Restart=always). On success this call does not return.
 func RestartProcess() error {
+	runBeforeRestart()
 	path, err := GetCurrentBinaryPath()
 	if err != nil {
 		return fmt.Errorf("resolve current binary: %w", err)

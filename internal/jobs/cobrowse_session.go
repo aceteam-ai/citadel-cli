@@ -93,6 +93,12 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, ok := mgr.SessionStatus(id)
 		if !ok {
+			if e, ended := mgr.EndedSession(id); ended {
+				return json.Marshal(map[string]any{
+					"id": id, "state": "ended", "ended_reason": e.Reason,
+					"detail": e.Detail, "ended_at": e.At,
+				})
+			}
 			return nil, fmt.Errorf("no such browser session: %q", id)
 		}
 		return sessionStatusResult(st)

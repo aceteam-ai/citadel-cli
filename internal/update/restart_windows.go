@@ -23,6 +23,7 @@ import (
 // service will be restarted regardless; the spawned process covers the
 // foreground case. On success this call does not return.
 func RestartProcess() error {
+	runBeforeRestart()
 	path, err := GetCurrentBinaryPath()
 	if err != nil {
 		// Fall back to a clean exit so a supervisor can relaunch us.
