@@ -349,7 +349,7 @@ partial: it fixes the vLLM release only, and its dependencies (torch and the
 rest) resolve to whatever is current when the venv is built. Rebuild rather
 than reuse a venv across sites. uv never downloads an interpreter, and package
 caches are kept beside the venv.`,
-	Args:  cobra.NoArgs,
+	Args: cobra.NoArgs,
 	Run: func(cmd *cobra.Command, _ []string) {
 		setup := hpc.VenvSetup{
 			Dir: hpcSetupVenv, VLLMVersion: hpcSetupVersion, Python: hpcSetupPython, CheckOnly: hpcSetupCheck,
