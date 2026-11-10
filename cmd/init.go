@@ -362,7 +362,7 @@ and system user configuration (requires sudo).`,
 					// (e.g. --relogin reconnected from preserved state). Register
 					// with the grant's key, keeping the machine key, and link that
 					// registration; a saved bearer is not a completed link.
-					if err := registerAndLinkGrantWith(deviceAuthResult, nodeName, network.Disconnect, connectToNetwork, linkDeviceEnrollment); err != nil {
+					if err := registerAndLinkGrantWith(deviceAuthResult, nodeName, grantEnrollmentPrecheck, enrollmentNodeID, network.Disconnect, connectToNetworkForceLogin, linkDeviceEnrollment); err != nil {
 						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
 						os.Exit(1)
 					}
@@ -1865,6 +1865,17 @@ func configureNvidiaDocker() error {
 // Only overwrites the OS hostname when the current hostname is generic (live ISO,
 // fresh install). User-chosen hostnames are preserved.
 func connectToNetwork(nodeName, authKey string) error {
+	return connectToNetworkOpts(nodeName, authKey, false)
+}
+
+// connectToNetworkForceLogin is connectToNetwork for a fresh grant's key on a
+// host that kept its saved state: tsnet would otherwise ignore the key and
+// resume the previous registration.
+func connectToNetworkForceLogin(nodeName, authKey string) error {
+	return connectToNetworkOpts(nodeName, authKey, true)
+}
+
+func connectToNetworkOpts(nodeName, authKey string, forceLogin bool) error {
 	// Record the pre-registration OS hostname (once) so it can be restored
 	// later via 'citadel rename'. saveOriginalHostnameToConfig is a no-op if an
 	// original hostname has already been recorded.
@@ -1898,6 +1909,7 @@ func connectToNetwork(nodeName, authKey string) error {
 		Hostname:   nodeName,
 		ControlURL: nexusURL, // From root.go
 		AuthKey:    authKey,
+		ForceLogin: forceLogin,
 	}
 
 	// A failed connect must not leave an earlier registration's ID for the

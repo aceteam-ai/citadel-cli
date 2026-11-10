@@ -60,6 +60,8 @@ type NetworkServer struct {
 	// Nil for the attached backend, which starts no endpoint of its own.
 	releaseLock func()
 
+	forceLogin bool
+
 	mu        sync.RWMutex
 	connected bool
 }
@@ -103,6 +105,12 @@ type ServerConfig struct {
 
 	// AuthKey is a pre-authorized key for non-interactive login
 	AuthKey string
+
+	// ForceLogin makes the single Start of this server use AuthKey even when
+	// saved state exists. tsnet otherwise ignores the key unless the node
+	// needs login, so a node that kept its state would resume its old
+	// registration. Only enrollment of a fresh grant sets it.
+	ForceLogin bool
 }
 
 // NewServer creates a new NetworkServer with the given configuration.
@@ -117,6 +125,7 @@ func NewServer(config ServerConfig) *NetworkServer {
 		controlURL: config.ControlURL,
 		hostname:   config.Hostname,
 		stateDir:   stateDir,
+		forceLogin: config.ForceLogin,
 	}
 }
 
@@ -150,6 +159,10 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 		return err
 	}
 
+	if err := s.checkForceLoginMode(mode); err != nil {
+		return err
+	}
+
 	switch mode {
 	case ModeAttached:
 		s.backend = newAttachedBackend(LocalAPISocketPath(s.stateDir))
@@ -160,6 +173,7 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 		s.backend = newUserspaceBackend(ServerConfig{
 			Hostname:   s.hostname,
 			ControlURL: s.controlURL,
+			ForceLogin: s.forceLogin,
 		}, s.stateDir, authKey)
 	}
 	s.mode = mode
@@ -185,6 +199,15 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 	FixStatePermissions()
 
 	s.connected = true
+	return nil
+}
+
+// checkForceLoginMode refuses a forced login on a backend that cannot honor it.
+// An attached backend rides a running `citadel up` and ignores the auth key.
+func (s *NetworkServer) checkForceLoginMode(mode BackendMode) error {
+	if s.forceLogin && mode == ModeAttached {
+		return fmt.Errorf("a running 'citadel up' holds the mesh and ignores the new registration key; stop 'citadel up' first")
+	}
 	return nil
 }
 

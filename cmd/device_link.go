@@ -12,6 +12,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	goversion "github.com/hashicorp/go-version"
 	"gopkg.in/yaml.v3"
 )
@@ -151,20 +152,62 @@ func isDeviceLinkUnsent(err error) bool {
 	return kind == nexus.DeviceLinkLocalPrecondition
 }
 
+// grantEnrollmentPrecheck refuses a re-register that would race another
+// process holding this host's mesh state. A live worker may still hold the old
+// registration in memory and write it back over the new state, and a running
+// `citadel up` holds the mesh and ignores the new key.
+func grantEnrollmentPrecheck() error {
+	stateDir := network.GetStateDir()
+	if held, _ := worklock.IsHeld(stateDir); held {
+		return errors.New("a citadel worker is running on this host; stop the worker, run the relogin, then start the worker")
+	}
+	if mode, err := network.SelectBackend(stateDir); err == nil && mode == network.ModeAttached {
+		return errors.New("'citadel up' holds the mesh on this host; stop 'citadel up' first, run the relogin, then start it again")
+	}
+	return nil
+}
+
 // registerAndLinkGrantWith registers this host with the grant just approved and
 // links that registration. A fresh grant never authorizes a session that was
 // already up (a --relogin reconnect from preserved state): issuing the grant
 // retires the prior registration, and the server links only a node registered
 // with the grant's own key. network.Connect hands a live session back
 // unchanged, so it is dropped first; the state directory, and with it the
-// machine key, is kept.
-func registerAndLinkGrantWith(result *DeviceAuthResult, nodeName string, disconnect func() error, connect func(nodeName, authKey string) error, link func(*DeviceAuthResult) error) error {
+// machine key, is kept. connect must force the login, because tsnet ignores the
+// key when saved state exists. Registering as the same node as before the grant
+// means the key was ignored; that is refused rather than linked.
+//
+// Every failure before the link is sent removes this enrollment's saved
+// credentials, so the next `citadel init` authenticates again instead of
+// treating the node as configured while its key expires.
+func registerAndLinkGrantWith(result *DeviceAuthResult, nodeName string, precheck func() error, currentNodeID func(context.Context) string, disconnect func() error, connect func(nodeName, authKey string) error, link func(*DeviceAuthResult) error) error {
+	fail := func(err error) error {
+		if result != nil {
+			if rbErr := enrollmentRollbackFn(result.Token); rbErr != nil {
+				return fmt.Errorf("%w (removing this enrollment's saved credentials also failed)", err)
+			}
+		}
+		return err
+	}
+	if err := precheck(); err != nil {
+		return fail(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	preGrantID := currentNodeID(ctx)
+	cancel()
 	_ = disconnect()
 	// Without a registration key there is nothing to register; the link's own
 	// precondition then refuses the enrollment.
 	if result != nil && result.Token != nil && result.Token.Authkey != "" {
 		if err := connect(nodeName, result.Token.Authkey); err != nil {
-			return fmt.Errorf("failed to connect to network: %w", err)
+			return fail(fmt.Errorf("failed to connect to network: %w", err))
+		}
+		postCtx, postCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		registered := currentNodeID(postCtx)
+		postCancel()
+		if preGrantID != "" && registered == preGrantID {
+			_ = disconnect()
+			return fail(fmt.Errorf("the network resumed the previous registration (node %s) instead of registering with the new key; the enrollment was not linked", registered))
 		}
 	}
 	if err := link(result); err != nil {
