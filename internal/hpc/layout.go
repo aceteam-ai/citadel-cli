@@ -160,8 +160,11 @@ func Prepare(l Layout, uid int) error {
 	if !info.IsDir() {
 		return fmt.Errorf("hpc profile: job state base %s is not a directory", l.Base)
 	}
-	if info.Mode().Perm()&0o002 != 0 && info.Mode()&os.ModeSticky == 0 {
-		return fmt.Errorf("hpc profile: job state base %s is world-writable without the sticky bit", l.Base)
+	if err := checkReplaceSafe(l.Base, info); err != nil {
+		return err
+	}
+	if err := checkAncestorsReplaceSafe(l.Base); err != nil {
+		return err
 	}
 	if err := ensurePrivateDir(l.Root, uid); err != nil {
 		return err
@@ -172,6 +175,39 @@ func Prepare(l Layout, uid int) error {
 		}
 	}
 	return nil
+}
+
+// checkReplaceSafe refuses a directory in which another user could rename or
+// replace the job root: any group or other write bit without the sticky bit.
+// Project scratch is often 2770 or 0775; a group member there could swap the
+// job root for their own directory or a symlink.
+func checkReplaceSafe(dir string, info os.FileInfo) error {
+	if info.Mode().Perm()&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
+		return fmt.Errorf("hpc profile: %s is writable by group or other without the sticky bit (%#o); another user could replace the job root. Use a private directory or one with the sticky bit", dir, info.Mode().Perm())
+	}
+	return nil
+}
+
+// checkAncestorsReplaceSafe applies checkReplaceSafe to every ancestor of
+// base after symlinks are resolved, so a writable parent cannot rename the
+// base itself away. The filesystem root is checked like any other directory.
+func checkAncestorsReplaceSafe(base string) error {
+	resolved, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return fmt.Errorf("hpc profile: resolve %s: %w", base, err)
+	}
+	for dir := filepath.Dir(resolved); ; dir = filepath.Dir(dir) {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("hpc profile: stat %s: %w", dir, err)
+		}
+		if err := checkReplaceSafe(dir, info); err != nil {
+			return err
+		}
+		if dir == filepath.Dir(dir) {
+			return nil
+		}
+	}
 }
 
 // ensurePrivateDir creates dir with mode 0700 or verifies an existing one is

@@ -126,6 +126,51 @@ func installHPCProfile(layout hpc.Layout) error {
 	return nil
 }
 
+// profileFromArgs reads --profile from the raw arguments without running any
+// command, so the selection can be made before cobra picks a pre-run. Only the
+// flag spelling is parsed here; resolveProfileSelection validates the value.
+func profileFromArgs(args []string) (value string, set bool) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			break
+		}
+		if a == "--profile" && i+1 < len(args) {
+			return args[i+1], true
+		}
+		if strings.HasPrefix(a, "--profile=") {
+			return strings.TrimPrefix(a, "--profile="), true
+		}
+	}
+	return "", false
+}
+
+// hpcEarlyRefusal is the single command gate for the hpc profile. It runs from
+// Execute before cobra dispatches, so it also covers commands that install
+// their own PersistentPreRun (sessions, session-host, attach) or are exempted
+// from the root one (stream eval, session attach). It has no side effects: it
+// resolves the target with root.Find and refuses any path that is not on the
+// positive list. A non-nil error is a refusal to run.
+func hpcEarlyRefusal(root *cobra.Command, args []string, getenv func(string) string) error {
+	flagValue, flagSet := profileFromArgs(args)
+	profile, err := resolveProfileSelection(flagValue, flagSet, getenv(envProfile))
+	if err != nil {
+		return err
+	}
+	if profile != hpc.Profile {
+		return nil
+	}
+	target, _, ferr := root.Find(args)
+	if ferr != nil || target == nil {
+		// An unknown command is refused by cobra itself; never run it here.
+		return fmt.Errorf("unknown or ambiguous command is not available in the %s profile", hpc.Profile)
+	}
+	if !hpcProfileAllowsCommand(target.CommandPath()) {
+		return fmt.Errorf("%q is not available in the %s profile", target.CommandPath(), hpc.Profile)
+	}
+	return nil
+}
+
 // applyRunProfile runs first in the root pre-run. It returns handled=true when
 // a profile took over startup, in which case the ordinary pre-run (update
 // recovery, update check, local-mode and other exceptions) must not run.

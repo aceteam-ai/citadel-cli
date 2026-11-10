@@ -7,16 +7,23 @@ import (
 	"context"
 	"encoding/hex"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/hpc"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 )
 
-// listeningSockets returns this process's LISTEN-state TCP sockets as
-// inode -> local IP, read from /proc (the in-process equivalent of
-// `ss -ltn` filtered to our own descriptors).
+// listeningSockets returns this process's listening sockets as inode -> local
+// IP (nil for unix sockets), read from /proc (the in-process equivalent of
+// `ss -lxtn` filtered to our own descriptors): TCP LISTEN state plus unix
+// sockets with SO_ACCEPTCON set.
 func listeningSockets(t *testing.T) map[string]net.IP {
 	t.Helper()
 	owned := map[string]bool{}
@@ -47,6 +54,21 @@ func listeningSockets(t *testing.T) map[string]net.IP {
 		}
 		f.Close()
 	}
+	if f, err := os.Open("/proc/self/net/unix"); err == nil {
+		sc := bufio.NewScanner(f)
+		sc.Scan() // header
+		for sc.Scan() {
+			fields := strings.Fields(sc.Text())
+			// Num RefCount Protocol Flags Type St Inode [Path]
+			if len(fields) < 7 || !owned[fields[6]] {
+				continue
+			}
+			if flags, err := strconv.ParseUint(fields[3], 16, 32); err == nil && flags&0x00010000 != 0 {
+				out[fields[6]] = nil
+			}
+		}
+		f.Close()
+	}
 	return out
 }
 
@@ -62,23 +84,85 @@ func procHexIP(s string) net.IP {
 	return net.IP(b)
 }
 
-// TestHPCWorkerOpensNoNonLoopbackListener runs the HPC worker core and checks
-// that no listening socket appears on a non-loopback address while it runs.
-func TestHPCWorkerOpensNoNonLoopbackListener(t *testing.T) {
+// TestHPCWorkProcessOpensNoNewListener runs the production entry point
+// (runHPCWorkProcess: lock, credentials, API source, usage syncer, heartbeat,
+// runner) against a fake API and asserts no listening socket of any kind
+// appears: no TCP on any address (loopback included) and no unix socket.
+func TestHPCWorkProcessOpensNoNewListener(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer api.Close()
+
+	root := t.TempDir()
+	layout := hpc.Layout{
+		Root: root, JobID: "5",
+		ConfigDir: filepath.Join(root, "config"), HomeDir: filepath.Join(root, "home"),
+		NodeDir: filepath.Join(root, "node"), MachineDir: filepath.Join(root, "machine"),
+		WorkspaceDir: filepath.Join(root, "workspace"),
+	}
+	for _, d := range append(layout.Dirs(), filepath.Join(layout.NodeDir, "network")) {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := "device_api_token: tok\napi_base_url: " + api.URL + "\norg_id: org-1\nfabric_node_id: " + testHPCNodeID + "\n"
+	if err := os.WriteFile(filepath.Join(layout.NodeDir, "config.yaml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore, err := network.OverrideStateDirectoriesForTesting(layout.NodeDir, layout.MachineDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origDirFn := nodeConfigDirFn
+	nodeConfigDirFn = func() string { return layout.NodeDir }
+	t.Setenv("HOME", layout.HomeDir)
+	defer func() {
+		nodeConfigDirFn = origDirFn
+		if err := restore(); err != nil {
+			t.Error(err)
+		}
+	}()
+
 	before := listeningSockets(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- runHPCWorker(ctx, testHPCDeps(t, newHPCFakeSource())) }()
-	time.Sleep(300 * time.Millisecond)
+	go func() { errCh <- runHPCWorkProcess(ctx, layout) }()
+	time.Sleep(1500 * time.Millisecond)
 	after := listeningSockets(t)
 	cancel()
-	<-errCh
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("runHPCWorkProcess: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runHPCWorkProcess did not stop")
+	}
 	for inode, ip := range after {
-		if _, existed := before[inode]; existed {
-			continue
+		if _, existed := before[inode]; !existed {
+			t.Fatalf("the hpc worker opened a new listener (inode %s, addr %v)", inode, ip)
 		}
-		if ip == nil || !ip.IsLoopback() {
-			t.Fatalf("the hpc worker opened a non-loopback listener on %v", ip)
-		}
+	}
+}
+
+// TestListeningSocketsSeesTCPAndUnix guards the detector the zero-listener
+// test depends on: it must report both kinds when they exist.
+func TestListeningSocketsSeesTCPAndUnix(t *testing.T) {
+	before := listeningSockets(t)
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcp.Close()
+	sock := filepath.Join(t.TempDir(), "s")
+	unix, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close()
+	if got := len(listeningSockets(t)) - len(before); got != 2 {
+		t.Fatalf("detector saw %d new listeners, want 2", got)
 	}
 }

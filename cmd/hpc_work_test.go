@@ -425,3 +425,73 @@ func TestHPCOnlyFlagsRefusedOutsideProfile(t *testing.T) {
 		}
 	}
 }
+
+func TestHPCEarlyRefusalCoversCommandsWithTheirOwnPreRun(t *testing.T) {
+	env := func(v string) func(string) string {
+		return func(k string) string {
+			if k == envProfile {
+				return v
+			}
+			return ""
+		}
+	}
+	refused := [][]string{
+		{"sessions", "list"},
+		{"session-host", "x"},
+		{"attach"},
+		{"attach", "name"},
+		{"stream", "eval"},
+		{"session", "attach"},
+		{"mcp"},
+		{"login"},
+		{"status"},
+		{},
+	}
+	for _, args := range refused {
+		// Selected by the environment.
+		if err := hpcEarlyRefusal(rootCmd, args, env("hpc")); err == nil {
+			t.Errorf("%v: expected a refusal under CITADEL_PROFILE=hpc", args)
+		}
+		// Selected by the flag, with the environment empty.
+		flagged := append([]string{"--profile", "hpc"}, args...)
+		if err := hpcEarlyRefusal(rootCmd, flagged, env("")); err == nil {
+			t.Errorf("%v: expected a refusal under --profile hpc", flagged)
+		}
+		flagged = append([]string{"--profile=hpc"}, args...)
+		if err := hpcEarlyRefusal(rootCmd, flagged, env("")); err == nil {
+			t.Errorf("%v: expected a refusal under --profile=hpc", flagged)
+		}
+		// No profile: never refused here.
+		if err := hpcEarlyRefusal(rootCmd, args, env("")); err != nil {
+			t.Errorf("%v: refused without a profile: %v", args, err)
+		}
+	}
+	allowed := [][]string{{"work"}, {"work", "--poll-ms", "100"}, {"version"}}
+	for _, args := range allowed {
+		if err := hpcEarlyRefusal(rootCmd, args, env("hpc")); err != nil {
+			t.Errorf("%v: refused: %v", args, err)
+		}
+	}
+	// A typo'd profile is refused here too.
+	if err := hpcEarlyRefusal(rootCmd, []string{"work"}, env("hcp")); err == nil {
+		t.Error("an unknown profile must be refused")
+	}
+}
+
+func TestHPCEngineBackendsHasNoDefaultPortFallback(t *testing.T) {
+	get := func(v string) func(string) string {
+		return func(string) string { return v }
+	}
+	if got := hpcEngineBackends(get("")); len(got) != 0 {
+		t.Fatalf("unset port must route nowhere, got %v", got)
+	}
+	for _, bad := range []string{"x", "0", "80", "70000"} {
+		if got := hpcEngineBackends(get(bad)); len(got) != 0 {
+			t.Fatalf("port %q must route nowhere, got %v", bad, got)
+		}
+	}
+	got := hpcEngineBackends(get("18000"))
+	if len(got) != 1 || got["vllm"] != "http://127.0.0.1:18000" {
+		t.Fatalf("got %v", got)
+	}
+}
