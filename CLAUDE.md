@@ -1788,13 +1788,17 @@ publication-review and native-platform boundaries.
 
 ### HPC profile: job-scoped, API-only worker (aceteam#12715)
 
-`cmd.applyRunProfile` runs first in the root pre-run and owns profile
-selection (`--profile` / `CITADEL_PROFILE`; a disagreeing pair or an unknown
-name is refused). `cmd.hpcProfileAllowsCommand` is the positive command list;
-everything else is refused under the profile. `hpc.ResolveLayout` decides the
+`cmd.resolveProfileSelection` owns profile selection (`--profile` /
+`CITADEL_PROFILE`; a disagreeing pair or an unknown name is refused, so a stray
+`CITADEL_PROFILE` makes every command exit 2 on an ordinary host).
+`cmd.hpcEarlyRefusal` runs from `Execute` before cobra dispatches and refuses
+any command path that `cmd.hpcProfileAllowsCommand` (the positive list) does
+not name, including commands with their own pre-run. `cmd.applyRunProfile`
+installs the profile for the allowed ones. `hpc.ResolveLayout` decides the
 job root from `SLURM_JOB_ID` (plus `SLURM_RESTART_COUNT`) under
 `--hpc-state-root` / `CITADEL_HPC_STATE_ROOT` or `TMPDIR`, refusing missing or
-ambiguous input; `hpc.Prepare` owns the owner-only checks. `hpcscope.Install`
+ambiguous input; `hpc.Prepare` owns the owner-only checks, including refusing
+a state base or ancestor that group or other can write without the sticky bit. `hpcscope.Install`
 makes the layout authoritative through the one-shot production scopes
 `platform.ScopeProcessDirectories` and `network.ScopeProcessStateDirectories`
 (test fixtures still win), and calls `nodeidentity.DisableLegacyReadThrough`
@@ -1802,8 +1806,10 @@ so a shared home's key is never adopted. `internal/hpcscope`'s
 two-allocation subprocess test pins that no resolved path leaves the job root.
 `runWork` hands off to `runHPCWork` before anything else; the HPC worker is a
 separate positive list (`newHPCRunner`, `hpcQueueNames`), not gates inside
-`runWork`. `hpc_work_tripwire_test.go` lists the entry points it must never
-reference, and `hpcTemplateBuiltinPolicy` owns which template builtins run.
+`runWork`. `llm_inference` routes only through `hpcEngineBackends` (the job's
+own engine port, no default-port fallback). `hpc_work_tripwire_test.go` lists the entry points it must never
+reference (it follows the named `work.go` helpers and resolves import aliases),
+`hpc_work_listen_linux_test.go` asserts the production entry opens no listener, and `hpcTemplateBuiltinPolicy` owns which template builtins run.
 
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,
