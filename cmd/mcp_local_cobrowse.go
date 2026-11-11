@@ -164,7 +164,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			openURL = platform.OpenURL
 		}
 		rt.viewerFactory = func() (*localviewer.Server, error) {
-			cfg := localviewer.Config{Service: rt.svc, OpenURL: openURL}
+			cfg := localviewer.Config{Service: rt.svc, OpenURL: openURL, MaxSessions: localcobrowse.DefaultMaxSessions}
 			if opts.ownerDir != nil {
 				dir := filepath.Join(opts.ownerDir(), localaudit.DirName)
 				cfg.Activity = func(session string, limit int) ([]localaudit.Record, error) {

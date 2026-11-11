@@ -130,6 +130,19 @@ one-time launch file (`writeLaunchFile`), never on a command line.
 `TestGuardsReturn403`, `TestCookieOnlyFromSingleUseCode` and
 `TestOpenKeepsTheCodeOffTheCommandLine` pin the boundary.
 
+`cmd.runLocalSetup` owns the first-run setup page (`citadel local setup`, and a
+Windows double-click: `cmd.runRootCitadel` calls `launchedFromExplorer`, which is
+`platform.ConsoleProcessCount` == 1; `runBareCitadel` stays enrollment-only). It
+is a `localviewer.Server` with `Config.Setup` set, so it keeps the same guard,
+cookie, bearer and single-use `/open` code, but in its own `SetupDirName` private
+dir so it never replaces a running owner's token file. Connect is
+`cmd.setupConnect` over `mergeHarnessConfig`; the click consents only to adding
+the entry (a different existing `citadel` entry is declined and left to
+`local config --write`), and the request must name the file the page showed.
+Sessions come from the owner through the token-authenticated `/api/summary`.
+`TestSetupRoutesAreGuarded` pins the boundary. Muse has no confirmed local
+config file, so it is not a harness; the page offers the generic entry.
+
 `localaudit.Log` owns the local co-browse audit chain under
 `<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
 month. `cmd.localStateDir` owns where local mode keeps its owner lock, audit
