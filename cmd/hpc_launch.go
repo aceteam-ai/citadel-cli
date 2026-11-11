@@ -57,8 +57,10 @@ func launchHPCJob(ctx context.Context, spec hpc.JobSpec, scriptDir string, submi
 	if err != nil {
 		return "", "", err
 	}
-	if err := hpc.CheckTokenFile(spec.TokenFile, d.UID); err != nil {
-		return "", "", err
+	if spec.TokenFile != "" {
+		if err := hpc.CheckTokenFile(spec.TokenFile, d.UID); err != nil {
+			return "", "", err
+		}
 	}
 	if _, err := os.Stat(hpc.VenvPython(spec.VenvDir)); err != nil {
 		return "", "", fmt.Errorf("venv %s has no python; build it first with 'citadel hpc setup --venv %s'", spec.VenvDir, spec.VenvDir)
@@ -136,11 +138,16 @@ func mergeEnv(base []string, extra map[string]string) []string {
 // engine's per-job port in the environment, so the inference handler and the
 // heartbeat probe use the external-vLLM endpoint (services.VLLMHostPort).
 func hpcWorkerCommand(self string, spec hpc.JobSpec, port int, base []string) ([]string, []string) {
-	argv := []string{self, "work", "--profile", hpc.Profile,
-		"--hpc-token-file", spec.TokenFile,
+	argv := []string{self, "work", "--profile", hpc.Profile}
+	if spec.TokenFile != "" {
+		argv = append(argv, "--hpc-token-file", spec.TokenFile)
+	} else {
+		argv = append(argv, "--hpc-org", spec.OrgID, "--hpc-approval-timeout", spec.ApprovalTimeout.String())
+	}
+	argv = append(argv,
 		"--hpc-drain-timeout", spec.DrainTimeout.String(),
 		"--auth-service", spec.AuthService,
-	}
+	)
 	if spec.StateRoot != "" {
 		argv = append(argv, "--hpc-state-root", spec.StateRoot)
 	}
@@ -374,7 +381,7 @@ caches are kept beside the venv.`,
 // the platform must be named by --auth-service or CITADEL_AUTH_HOST.
 func requireExplicitAuthService(cmd *cobra.Command) error {
 	if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
-		return errors.New("pass --auth-service (the platform that minted the enrollment token)")
+		return errors.New("pass --auth-service (the platform that minted the enrollment token or will approve the request)")
 	}
 	return nil
 }
@@ -397,7 +404,9 @@ func bindHPCModelFlags(c *cobra.Command, s *hpc.JobSpec, runtime *string) {
 	f.StringVar(&s.HFHome, "hf-home", "", "Hugging Face cache directory on job scratch")
 	f.StringVar(&s.DownloadDir, "download-dir", "", "Weights directory on job scratch")
 	f.StringArrayVar(&s.VLLMArgs, "vllm-arg", nil, "Extra vLLM argument (repeatable; --host and --port are fixed)")
-	f.StringVar(&s.TokenFile, "token-file", "", "Owner-only file holding the single-use enrollment token")
+	f.StringVar(&s.TokenFile, "token-file", "", "Owner-only file holding the single-use enrollment token (wins over --org when both are given)")
+	f.StringVar(&s.OrgID, "org", "", "Organization id: with no --token-file, the job waits for an admin to approve its enrollment")
+	f.DurationVar(&s.ApprovalTimeout, "hpc-approval-timeout", hpc.DefaultApprovalTimeout, "How long the job waits for an enrollment approval (counts against the wall time)")
 	f.DurationVar(&s.DrainTimeout, "drain-timeout", hpc.DefaultDrainTimeout, "How long in-flight jobs may finish after the drain signal")
 	f.DurationVar(&s.ReadyTimeout, "ready-timeout", 30*time.Minute, "How long to wait for the model to download and load")
 }

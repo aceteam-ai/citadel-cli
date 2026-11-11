@@ -88,17 +88,19 @@ func hpcQueueNames(orgID, nodeID string) []string {
 // Redis, queues, egress relay, workspace, ...) names a surface the profile
 // turns off, so it is refused instead of silently ignored.
 var hpcWorkFlagsAllowed = map[string]bool{
-	"poll-ms":           true,
-	"max-retries":       true,
-	"max-concurrency":   true,
-	"hpc-token-file":    true,
-	"hpc-wall-time-end": true,
-	"hpc-drain-timeout": true,
+	"poll-ms":              true,
+	"max-retries":          true,
+	"max-concurrency":      true,
+	"hpc-token-file":       true,
+	"hpc-org":              true,
+	"hpc-approval-timeout": true,
+	"hpc-wall-time-end":    true,
+	"hpc-drain-timeout":    true,
 }
 
 // hpcOnlyWorkFlags are the `citadel work` flags that mean nothing outside the
 // hpc profile; an ordinary worker refuses them rather than ignoring them.
-var hpcOnlyWorkFlags = []string{"hpc-token-file", "hpc-wall-time-end", "hpc-drain-timeout"}
+var hpcOnlyWorkFlags = []string{"hpc-token-file", "hpc-org", "hpc-approval-timeout", "hpc-wall-time-end", "hpc-drain-timeout"}
 
 // hpcFlagsOutsideProfile returns the hpc-only flags set on an ordinary run.
 func hpcFlagsOutsideProfile(fs *pflag.FlagSet) []string {
@@ -353,7 +355,7 @@ func runHPCWork(cmd *cobra.Command, _ []string) {
 	}
 	layout := currentHPCLayout()
 	opts := hpcWorkOptions{DrainTimeout: hpcDrainTimeoutFlag}
-	if hpcTokenFileFlag != "" {
+	if hpcTokenFileFlag != "" || hpcOrgFlag != "" {
 		enroll := productionHPCEnrollOptions(hpcTokenFileFlag, hpcWallTimeEndFlag)
 		opts.Enroll = &enroll
 	}
@@ -402,7 +404,40 @@ func runHPCWorkProcess(parent context.Context, layout hpc.Layout, opts hpcWorkOp
 
 	creds, err := readHPCCredentials(layout.NodeDir)
 	if err != nil && opts.Enroll != nil {
-		creds, err = enrollHPCNode(ctx, layout, *opts.Enroll)
+		// A stop signal during an approval wait cancels it: nothing has been
+		// issued, so there is nothing to deregister and the exit is clean.
+		var gotTerm, gotDrain os.Signal
+		enrollCtx, enrollCancel := context.WithCancel(ctx)
+		stopped := make(chan struct{})
+		watcherDone := make(chan struct{})
+		go func() {
+			defer close(watcherDone)
+			select {
+			case gotTerm = <-termSigs:
+				enrollCancel()
+			case gotDrain = <-drainSigs:
+				enrollCancel()
+			case <-stopped:
+			}
+		}()
+		creds, err = enrollHPCNode(enrollCtx, layout, *opts.Enroll)
+		close(stopped)
+		<-watcherDone
+		enrollCancel()
+		if gotTerm != nil || gotDrain != nil {
+			if err == nil {
+				// Enrolled just as the signal landed: hand it back so the
+				// shutdown path below sees it.
+				if gotTerm != nil {
+					termSigs <- gotTerm
+				} else {
+					drainSigs <- gotDrain
+				}
+			} else {
+				fmt.Println("   - Stopped while waiting for enrollment approval; nothing to deregister")
+				return nil
+			}
+		}
 		if err == nil {
 			fmt.Printf("   - Enrolled node %s\n", creds.NodeID)
 		}

@@ -1824,6 +1824,14 @@ the server accepted the token makes a bounded best-effort deregister.
 wait up to `--hpc-drain-timeout`, deregister, cancel; SIGTERM, including one
 that arrives during the drain wait, deregisters at once. Deregistration runs
 once on every exit path after enrollment.
+Approve-on-arrival (aceteam#12717): with `--org` (`--hpc-org` on `work`) and no
+token file, `enrollHPCNode` calls `hpc.Client.EnrollByApproval`, which owns the
+create/poll flow (poll interval floored at 2s, jittered, 10m default via
+`--hpc-approval-timeout`; denied, expired and timeout exit non-zero). The poll
+secret stays in that call's memory. A token file wins when both are given. A
+stop signal during the wait cancels it (`hpc.ErrApprovalInterrupted`, exit 0,
+nothing to deregister). `JobSpec.Normalize` requires wall time to exceed the
+approval wait plus the drain lead. Server routes are not built yet.
 The launcher (aceteam#12718): `hpc.JobSpec.Normalize` validates every value
 `hpc.RenderSbatch` writes (golden in `internal/hpc/testdata`), and `citadel hpc
 launch`/`setup` run on a login node with no profile. `hpc.Supervisor` owns the

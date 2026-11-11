@@ -63,6 +63,53 @@ func TestRenderSbatchGolden(t *testing.T) {
 	}
 }
 
+func TestRenderSbatchOrgGolden(t *testing.T) {
+	spec := testJobSpec()
+	spec.TokenFile = ""
+	spec.OrgID = "3F3727B9-0000-4000-8000-000000000001"
+	spec, err := spec.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := RenderSbatch(spec)
+	path := filepath.Join("testdata", "launch-org.sbatch.golden")
+	if *updateGolden {
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden (run with -update-golden to create): %v", err)
+	}
+	if string(want) != got {
+		t.Fatalf("sbatch script differs from golden:\n%s", got)
+	}
+	if strings.Contains(got, "--token-file") {
+		t.Fatal("the org path must not mention a token file")
+	}
+}
+
+func TestNormalizeTokenWinsOverOrgAndApprovalWallTime(t *testing.T) {
+	spec := testJobSpec()
+	spec.OrgID = "3f3727b9-0000-4000-8000-000000000001"
+	got, err := spec.Normalize()
+	if err != nil || got.OrgID != "" || !strings.Contains(RenderSbatch(got), "--token-file") || strings.Contains(RenderSbatch(got), "--org") {
+		t.Fatalf("token must win: %+v %v", got, err)
+	}
+	spec = testJobSpec()
+	spec.TokenFile, spec.OrgID = "", "not-a-uuid"
+	if _, err := spec.Normalize(); err == nil {
+		t.Fatal("bad org accepted")
+	}
+	spec = testJobSpec()
+	spec.TokenFile, spec.OrgID = "", "3f3727b9-0000-4000-8000-000000000001"
+	spec.WallTime = "00:12:00" // 10m approval + 5m drain lead does not fit
+	if _, err := spec.Normalize(); err == nil || !strings.Contains(err.Error(), "approval") {
+		t.Fatalf("short wall time accepted: %v", err)
+	}
+}
+
 func TestRenderSbatchQuotesAwkwardValues(t *testing.T) {
 	spec := testJobSpec()
 	spec.TokenFile = "/home/user/it's a token"

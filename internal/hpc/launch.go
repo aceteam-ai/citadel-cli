@@ -66,15 +66,18 @@ type JobSpec struct {
 	DownloadDir string // vLLM --download-dir (weights) on job scratch
 	VLLMArgs    []string
 
-	TokenFile    string
-	StateRoot    string // optional job state base (else TMPDIR)
-	OutputDir    string // where Slurm writes the job's stdout/stderr
-	CitadelBin   string
-	AuthService  string
-	CACert       string // optional private CA bundle path
-	DrainLead    time.Duration
-	DrainTimeout time.Duration
-	ReadyTimeout time.Duration
+	TokenFile string
+	// OrgID selects approve-on-arrival enrollment when TokenFile is empty.
+	OrgID           string
+	ApprovalTimeout time.Duration
+	StateRoot       string // optional job state base (else TMPDIR)
+	OutputDir       string // where Slurm writes the job's stdout/stderr
+	CitadelBin      string
+	AuthService     string
+	CACert          string // optional private CA bundle path
+	DrainLead       time.Duration
+	DrainTimeout    time.Duration
+	ReadyTimeout    time.Duration
 }
 
 var (
@@ -194,12 +197,34 @@ func (s JobSpec) Normalize() (JobSpec, error) {
 	}
 	for name, p := range map[string]*string{
 		"--venv": &s.VenvDir, "--hf-home": &s.HFHome, "--download-dir": &s.DownloadDir,
-		"--token-file": &s.TokenFile, "--output-dir": &s.OutputDir, "--citadel-bin": &s.CitadelBin,
+		"--output-dir": &s.OutputDir, "--citadel-bin": &s.CitadelBin,
 	} {
 		if err := checkScriptPath(name, *p, true); err != nil {
 			problems = append(problems, err.Error())
 		} else {
 			*p = filepath.Clean(*p)
+		}
+	}
+	// The token path wins when both are given: the org is not passed on.
+	if s.TokenFile != "" {
+		s.OrgID, s.ApprovalTimeout = "", 0
+		if err := checkScriptPath("--token-file", s.TokenFile, true); err != nil {
+			problems = append(problems, err.Error())
+		} else {
+			s.TokenFile = filepath.Clean(s.TokenFile)
+		}
+	} else if s.OrgID == "" {
+		problems = append(problems, "--token-file or --org is required")
+	} else {
+		if err := ValidateOrgID(s.OrgID); err != nil {
+			problems = append(problems, err.Error())
+		}
+		s.OrgID = strings.ToLower(s.OrgID)
+		if s.ApprovalTimeout == 0 {
+			s.ApprovalTimeout = DefaultApprovalTimeout
+		}
+		if s.ApprovalTimeout < 0 || s.ApprovalTimeout > MaxApprovalTimeout {
+			problems = append(problems, "--hpc-approval-timeout must be between 0 and "+MaxApprovalTimeout.String())
 		}
 	}
 	for name, p := range map[string]*string{"--hpc-state-root": &s.StateRoot, "--ca-cert": &s.CACert} {
@@ -234,6 +259,11 @@ func (s JobSpec) Normalize() (JobSpec, error) {
 	}
 	if err == nil && s.DrainLead >= wall {
 		problems = append(problems, "--drain-lead must be shorter than the wall time")
+	}
+	// The approval wait runs inside the allocation after the model server is
+	// up, so it spends wall time before any serving starts.
+	if err == nil && s.OrgID != "" && s.ApprovalTimeout+s.DrainLead >= wall {
+		problems = append(problems, "--time must exceed --hpc-approval-timeout plus --drain-lead (the approval wait runs inside the allocation)")
 	}
 	if len(problems) > 0 {
 		sort.Strings(problems)
@@ -272,11 +302,17 @@ func (s JobSpec) RunArgs() []string {
 		"--model", s.Model,
 		"--hf-home", s.HFHome,
 		"--download-dir", s.DownloadDir,
-		"--token-file", s.TokenFile,
+	}
+	if s.TokenFile != "" {
+		args = append(args, "--token-file", s.TokenFile)
+	} else {
+		args = append(args, "--org", s.OrgID, "--hpc-approval-timeout", s.ApprovalTimeout.String())
+	}
+	args = append(args,
 		"--drain-timeout", s.DrainTimeout.String(),
 		"--ready-timeout", s.ReadyTimeout.String(),
 		"--auth-service", s.AuthService,
-	}
+	)
 	if s.StateRoot != "" {
 		args = append(args, "--hpc-state-root", s.StateRoot)
 	}
