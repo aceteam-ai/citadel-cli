@@ -3698,3 +3698,19 @@ Auto-generated log of every release.
   - fix(cobrowse): wait for selector click target to settle (#1552)
 
 
+---
+
+## v2.221.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +1245 |
+
+**Changes:**
+
+  - fix(worker): keep model reasoning separate from answers (#1503)
+  - fix(cobrowse): sessions survive a full service restart on Linux (#1546) (#1621)
+
+
