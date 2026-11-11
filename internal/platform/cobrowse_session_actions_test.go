@@ -18,14 +18,22 @@
 package platform
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -36,7 +44,7 @@ import (
 func installFixedPortLauncher(t *testing.T, port int) {
 	t.Helper()
 	prev := launchCobrowseProc
-	launchCobrowseProc = func(profileDir, startURL string) (*cobrowseProc, error) {
+	launchCobrowseProc = func(profileDir, startURL string, _ LaunchOptions) (*cobrowseProc, error) {
 		exited := make(chan struct{})
 		return &cobrowseProc{
 			debugPort: port,
@@ -136,12 +144,8 @@ func TestCobrowseSessionActions_ResumeRestoresAIControl(t *testing.T) {
 	}
 }
 
-// TestCobrowseSessionActions_MarkAttachedRefusesWrites pins the #978 interop
-// rule's PRESENCE half: a viewer attaching (the #794 screencast hook,
-// MarkAttached) alone -- with NO separate explicit handoff call -- already
-// refuses agent-scripted writes, satisfying "an agent write must be refused
-// while a human is attached" literally.
-func TestCobrowseSessionActions_MarkAttachedRefusesWrites(t *testing.T) {
+// A viewer may observe without taking control or blocking agent actions.
+func TestCobrowseSessionActions_MarkAttachedAllowsAgentWrites(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -157,11 +161,14 @@ func TestCobrowseSessionActions_MarkAttachedRefusesWrites(t *testing.T) {
 	if got.State != SessionAttached {
 		t.Fatalf("expected attached state, got %q", got.State)
 	}
-	if got.Driver != DriverHuman {
-		t.Errorf("an attached viewer should report driver=human, got %q", got.Driver)
+	if got.Driver != DriverAI {
+		t.Errorf("an observing viewer should report driver=ai, got %q", got.Driver)
 	}
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Errorf("type while a viewer is attached: got %v, want ErrHandedOff", err)
+	if m.ViewerHasControl(st.ID) {
+		t.Error("observing viewer has input control")
+	}
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Errorf("type while observing was blocked: %v", err)
 	}
 }
 
@@ -181,8 +188,8 @@ func TestCobrowseSessionActions_DetachWithoutExplicitHandoffRestoresAIControl(t 
 		t.Fatalf("start: %v", err)
 	}
 	m.MarkAttached(st.ID)
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Fatalf("type while attached: got %v, want ErrHandedOff", err)
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Fatalf("type while observing was blocked: %v", err)
 	}
 
 	if !m.MarkDetached(st.ID) {
@@ -243,11 +250,8 @@ func TestCobrowseSessionActions_ExplicitHandoffSurvivesDetach(t *testing.T) {
 	}
 }
 
-// TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused
-// checks resume only releases the EXPLICIT bit: while a viewer is STILL
-// attached, resume succeeds (idempotent, no error) but writes remain refused
-// until that viewer also detaches -- resume does not evict a live viewer.
-func TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused(t *testing.T) {
+// Resume restores the agent and revokes viewer input with the tab still open.
+func TestCobrowseSessionActions_ResumeWhileStillAttachedRestoresAgent(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -257,21 +261,29 @@ func TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused(t *te
 		t.Fatalf("start: %v", err)
 	}
 	m.MarkAttached(st.ID)
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatalf("handoff: %v", err)
+	}
+	if !m.ViewerHasControl(st.ID) {
+		t.Fatal("viewer should have control after explicit handoff")
+	}
 	resumed, err := m.Resume(st.ID)
 	if err != nil {
 		t.Fatalf("resume while attached should succeed (idempotent): %v", err)
 	}
-	if resumed.Driver != DriverHuman {
-		t.Errorf("driver while a viewer is still attached = %q, want %q (resume does not evict a viewer)", resumed.Driver, DriverHuman)
+	if resumed.Driver != DriverAI {
+		t.Errorf("driver after resume with viewer attached = %q, want %q", resumed.Driver, DriverAI)
 	}
 	if resumed.State != SessionAttached {
 		t.Errorf("resume must not change the attach/view state, got %q", resumed.State)
 	}
-	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Errorf("type while still attached (post-resume): got %v, want ErrHandedOff", err)
+	if m.ViewerHasControl(st.ID) {
+		t.Error("viewer retained input control after resume")
+	}
+	if _, err := m.Type(st.ID, "hi"); errors.Is(err, ErrHandedOff) {
+		t.Errorf("type after resume was blocked: %v", err)
 	}
 
-	// Detaching the viewer is what finally allows writes again.
 	m.MarkDetached(st.ID)
 	got, _ := m.SessionStatus(st.ID)
 	if got.Driver != DriverAI {
@@ -516,6 +528,9 @@ func TestCobrowseSessionActions_ClickBySelectorResolvesCenterThenClicks(t *testi
 	if len(evalCalls) != 1 {
 		t.Fatalf("expected exactly 1 Runtime.evaluate call, got %d", len(evalCalls))
 	}
+	if evalCalls[0].Params["awaitPromise"] != true {
+		t.Fatal("selector resolution must wait for scrolling to settle")
+	}
 
 	mouseCalls := f.callsFor("Input.dispatchMouseEvent")
 	if len(mouseCalls) != 3 {
@@ -529,6 +544,183 @@ func TestCobrowseSessionActions_ClickBySelectorResolvesCenterThenClicks(t *testi
 		if c.Params["x"] != 111.0 || c.Params["y"] != 222.0 {
 			t.Errorf("mouse event %d coords = (%v,%v), want (111,222)", i, c.Params["x"], c.Params["y"])
 		}
+	}
+}
+
+func TestCobrowseSessionActions_ClickSelectorRefusesHandoffDuringSettle(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	settling := make(chan struct{})
+	release := make(chan struct{})
+	f.mu.Lock()
+	f.evaluateValue = func(string) any {
+		close(settling)
+		<-release
+		return map[string]any{"x": 111.0, "y": 222.0}
+	}
+	f.mu.Unlock()
+
+	clicked := make(chan error, 1)
+	go func() {
+		_, err := m.Click(st.ID, "#submit", nil, nil)
+		clicked <- err
+	}()
+	select {
+	case <-settling:
+	case <-time.After(5 * time.Second):
+		t.Fatal("selector evaluation did not begin")
+	}
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatalf("handoff during selector evaluation: %v", err)
+	}
+	close(release)
+	select {
+	case err := <-clicked:
+		if !errors.Is(err, ErrHandedOff) {
+			t.Fatalf("click after handoff = %v, want ErrHandedOff", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("selector click did not finish after handoff")
+	}
+	if calls := f.callsFor("Input.dispatchMouseEvent"); len(calls) != 0 {
+		t.Fatalf("handoff during selector evaluation dispatched %d mouse events", len(calls))
+	}
+}
+
+func TestCobrowseSessionActions_ClickSelectorCoveredPointDoesNotClick(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		return map[string]any{"error": "another element covers the click point"}
+	}
+	f.mu.Unlock()
+
+	if _, err := m.Click(st.ID, "#submit", nil, nil); err == nil {
+		t.Fatal("expected a blocked target error")
+	}
+	if calls := f.callsFor("Input.dispatchMouseEvent"); len(calls) != 0 {
+		t.Fatalf("covered target dispatched %d mouse events", len(calls))
+	}
+}
+
+func evaluatePinnedCDPTarget(ctx context.Context, wsURL, expr string) (any, error) {
+	res, err := cdpDialAndSendContext(ctx, wsURL, "Runtime.evaluate", map[string]any{
+		"expression": expr, "returnByValue": true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if exc := res["exceptionDetails"]; exc != nil {
+		return nil, fmt.Errorf("script error: %v", exc)
+	}
+	remote, ok := res["result"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("evaluate returned no result")
+	}
+	return remote["value"], nil
+}
+
+func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
+	chrome := os.Getenv("COBROWSE_TEST_CHROME")
+	if chrome == "" {
+		t.Skip("set COBROWSE_TEST_CHROME to run the browser regression")
+	}
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<style>html { scroll-behavior: smooth }</style><div style="height: 2400px"></div><button id="submit" onclick="window.clicked = (window.clicked || 0) + 1">Continue</button>`)
+	}))
+	defer page.Close()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	profile, err := os.MkdirTemp("", "cobrowse-browser-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(chrome, "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--remote-allow-origins=*", fmt.Sprintf("--remote-debugging-port=%d", port), "--user-data-dir="+profile, "about:blank")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		for i := 0; i < 10; i++ {
+			if os.RemoveAll(profile) == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStartup()
+	// Pin the page target selected by the production discovery path. Chrome may
+	// expose several pages, and a fresh discovery for every startup command can
+	// navigate one while evaluating another.
+	var wsURL string
+	for startupCtx.Err() == nil {
+		target, err := pickTargetContext(startupCtx, port)
+		if err == nil {
+			wsURL = target.WebSocketDebuggerURL
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if wsURL == "" {
+		t.Fatalf("no CDP page target before startup deadline: %v", startupCtx.Err())
+	}
+	var navigateErr error
+	for startupCtx.Err() == nil {
+		attemptCtx, cancel := context.WithTimeout(startupCtx, 2*time.Second)
+		_, navigateErr = cdpDialAndSendContext(attemptCtx, wsURL, "Page.navigate", map[string]any{"url": page.URL})
+		cancel()
+		if navigateErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if navigateErr != nil {
+		t.Fatalf("selected CDP page navigation failed before startup deadline: %v", navigateErr)
+	}
+	var initial map[string]any
+	for startupCtx.Err() == nil {
+		attemptCtx, cancel := context.WithTimeout(startupCtx, time.Second)
+		value, err := evaluatePinnedCDPTarget(attemptCtx, wsURL, `(function(){ var el = document.querySelector("#submit"); return el ? {href: location.href, below: el.getBoundingClientRect().top > innerHeight, smooth: getComputedStyle(document.documentElement).scrollBehavior === "smooth"} : null; })()`)
+		cancel()
+		if err == nil {
+			initial, _ = value.(map[string]any)
+			if initial != nil && initial["href"] == page.URL+"/" {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if initial == nil || initial["href"] != page.URL+"/" {
+		t.Fatalf("selected CDP page did not load the fixture: %v", initial)
+	}
+	if initial["below"] != true || initial["smooth"] != true {
+		t.Fatalf("test page must start offscreen with smooth scrolling: %v", initial)
+	}
+	x, y, err := resolveSelectorCenter(port, "#submit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clickAtPoint(port, x, y); err != nil {
+		t.Fatal(err)
+	}
+	value, err := evaluatePinnedCDPTarget(context.Background(), wsURL, `window.clicked || 0`)
+	if err != nil || value != float64(1) {
+		t.Fatalf("button click count = %v, error = %v", value, err)
+	}
+	_, err = evaluatePinnedCDPTarget(context.Background(), wsURL, `(function(){ var cover = document.createElement("div"); cover.style.cssText = "position:fixed;inset:0;z-index:99999"; document.body.appendChild(cover); })()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveSelectorCenter(port, "#submit"); err == nil {
+		t.Fatal("covered button must fail the hit test")
 	}
 }
 
@@ -575,6 +767,102 @@ func TestCobrowseSessionActions_TypeSendsInsertText(t *testing.T) {
 	}
 	if calls[0].Params["text"] != "hello world" {
 		t.Errorf("insertText text = %v, want %q", calls[0].Params["text"], "hello world")
+	}
+}
+
+func TestCobrowseSessionActions_SelectUsesPageSetterAndReportsValue(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, "dispatchEvent(new Event(\"change\"") {
+			t.Errorf("select must set the native value and fire change, got %q", expr)
+		}
+		if !strings.Contains(expr, `if (el.matches(":disabled") || !option`) {
+			t.Errorf("select must reject effective disabled state, including fieldset inheritance, got %q", expr)
+		}
+		return map[string]any{"value": "VT", "label": "Vermont"}
+	}
+	f.mu.Unlock()
+	got, err := m.Select(st.ID, "#state", "VT", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Value != "VT" || got.Label != "Vermont" {
+		t.Fatalf("selected = %#v", got)
+	}
+	if len(f.callsFor("Input.dispatchMouseEvent")) != 0 {
+		t.Fatal("native select must not click the popup")
+	}
+}
+
+func TestCobrowseSessionActions_SelectRespectsFieldsetDisabledState(t *testing.T) {
+	chrome, err := exec.LookPath("google-chrome")
+	if err != nil {
+		chrome, err = exec.LookPath("chromium")
+	}
+	if err != nil {
+		t.Skip("local Chromium is unavailable")
+	}
+
+	m, st, f := startSessionOnFakeCDP(t)
+	var expressions []string
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		expressions = append(expressions, expr)
+		return map[string]any{"value": "VT", "label": "Vermont"}
+	}
+	f.mu.Unlock()
+	for _, selector := range []string{"#blocked", "#allowed"} {
+		if _, err := m.Select(st.ID, selector, "VT", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(expressions) != 2 {
+		t.Fatalf("captured %d select expressions, want 2", len(expressions))
+	}
+
+	page := fmt.Sprintf(`<html><body>
+	<fieldset disabled>
+	  <legend><select id="allowed"><option value="NY">New York</option><option value="VT">Vermont</option></select></legend>
+	  <select id="blocked"><option value="NY">New York</option><option value="VT">Vermont</option></select>
+	</fieldset>
+	<script>
+	const blocked = %s;
+	const allowed = %s;
+	document.body.dataset.testResult = [blocked.error || "", allowed.value || "", document.getElementById("blocked").value, document.getElementById("allowed").value].join("|");
+	</script></body></html>`, expressions[0], expressions[1])
+	path := filepath.Join(t.TempDir(), "select.html")
+	if err := os.WriteFile(path, []byte(page), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pageURL := (&url.URL{Scheme: "file", Path: path}).String()
+	output, err := exec.CommandContext(ctx, chrome, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--dump-dom", pageURL).CombinedOutput()
+	if err != nil {
+		t.Fatalf("local Chromium failed: %v: %s", err, output)
+	}
+	if !strings.Contains(string(output), `data-test-result="enabled option not found|VT|NY|VT"`) {
+		t.Fatalf("fieldset-disabled select changed or first-legend select was blocked: %s", output)
+	}
+}
+
+func TestCobrowseSessionActions_KeyAndScrollSendRealInput(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	if _, err := m.Key(st.ID, "ArrowDown"); err != nil {
+		t.Fatal(err)
+	}
+	keys := f.callsFor("Input.dispatchKeyEvent")
+	if len(keys) != 2 || keys[0].Params["type"] != "rawKeyDown" || keys[1].Params["type"] != "keyUp" {
+		t.Fatalf("key events = %#v", keys)
+	}
+	x, y := 10.0, 20.0
+	if _, err := m.Scroll(st.ID, "", &x, &y, 0, 180); err != nil {
+		t.Fatal(err)
+	}
+	mouse := f.callsFor("Input.dispatchMouseEvent")
+	if len(mouse) != 1 || mouse[0].Params["type"] != "mouseWheel" || mouse[0].Params["deltaY"] != float64(180) {
+		t.Fatalf("wheel = %#v", mouse)
 	}
 }
 
@@ -628,5 +916,70 @@ func TestCobrowseSessionActions_SelectorEmbeddingIsSafe(t *testing.T) {
 	}
 	if decoded != tricky {
 		t.Errorf("round-trip mismatch: got %q, want %q", decoded, tricky)
+	}
+}
+
+func TestCobrowseSessionActions_ExtractBoundedPasswordAndTruncation(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	var lastExpr string
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		lastExpr = expr
+		return map[string]any{"password": true}
+	}
+	f.mu.Unlock()
+	if _, err := m.ExtractBounded(st.ID, "#pw", []string{"value"}, 100); !errors.Is(err, ErrPasswordValue) {
+		t.Fatalf("password value must be refused, got %v", err)
+	}
+	if !strings.Contains(lastExpr, `"password"`) || !strings.Contains(lastExpr, "var max = 100;") {
+		t.Fatalf("bounded extract script missing the password guard or the limit: %s", lastExpr)
+	}
+
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any {
+		return map[string]any{"text": "abc", "attrs": map[string]any{}, "truncated": true}
+	}
+	f.mu.Unlock()
+	got, err := m.ExtractBounded(st.ID, "main", nil, 3)
+	if err != nil || got.Text != "abc" || !got.Truncated {
+		t.Fatalf("bounded extract: %+v err %v", got, err)
+	}
+}
+
+func TestCobrowseSessionActions_PageStateRefusedWhileHandedOff(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = func(expr string) any { return map[string]any{"url": "http://x.test/", "ready": "complete"} }
+	f.mu.Unlock()
+	ps, err := m.PageState(st.ID)
+	if err != nil || ps.URL != "http://x.test/" || ps.ReadyState != "complete" {
+		t.Fatalf("page state: %+v err %v", ps, err)
+	}
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.PageState(st.ID); !errors.Is(err, ErrHandedOff) {
+		t.Fatalf("page state must be refused while handed off, got %v", err)
+	}
+}
+
+func TestCobrowseSessionActions_NavigateAsHumanValidatesURL(t *testing.T) {
+	m, st, f := startSessionOnFakeCDP(t)
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	before := len(f.calls)
+	f.mu.Unlock()
+	for _, bad := range []string{"file:///etc/passwd", "javascript:alert(1)", "-x", "chrome://settings"} {
+		if _, err := m.NavigateAsHuman(st.ID, bad); !errors.Is(err, ErrCobrowseURLNotAllowed) {
+			t.Errorf("%q: want ErrCobrowseURLNotAllowed, got %v", bad, err)
+		}
+	}
+	f.mu.Lock()
+	after := len(f.calls)
+	f.mu.Unlock()
+	if after != before {
+		t.Fatal("a refused URL reached CDP")
 	}
 }

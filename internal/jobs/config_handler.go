@@ -499,6 +499,10 @@ type ManifestService struct {
 	// so a field missing here is silently DROPPED on every APPLY_DEVICE_CONFIG --
 	// the policy would vanish on the next dashboard config save.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// OllamaKeepAlive/OllamaPreload mirror cmd/manifest.go (citadel-cli#1560);
+	// modeled here so updateManifest/APPLY_DEVICE_CONFIG round-trips keep them.
+	OllamaKeepAlive *string  `yaml:"ollama_keep_alive,omitempty"`
+	OllamaPreload   []string `yaml:"ollama_preload,omitempty"`
 	// Threads mirrors cmd/manifest.go Service.Threads: the aceteam-ai/citadel-cli#1269
 	// per-service CPU thread opt-in for the tei embedding service
 	// (CITADEL_TEI_NUM_THREADS). A *int so nil (unset) is distinguishable from an
@@ -723,6 +727,10 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to start %s: %w\nOutput: %s", svcName, err, string(output))
+		}
+		// citadel-cli#1560: best-effort async ollama preload from the manifest.
+		if ka, models := ollamaKeepAlivePolicyFromFile(manifestPath, svcName); len(models) > 0 {
+			startOllamaPreload(svcName, ka, models, func(f string, a ...any) { clilog.Writef("info", f, a...) })
 		}
 	}
 

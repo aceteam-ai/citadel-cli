@@ -3,6 +3,7 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -52,8 +53,9 @@ func TestComposeEnvForServiceValuesNormalizesOllamaPolicy(t *testing.T) {
 			if !envContains(env, "CITADEL_OLLAMA_TEST_UNRELATED=keep") {
 				t.Fatal("unrelated inherited environment was not preserved")
 			}
-			if tc.service == "ollama" && env[len(env)-1] != tc.wantEntry {
-				t.Fatalf("ollama policy must be the final entry, got %q", env[len(env)-1])
+			// The #1560 OLLAMA_KEEP_ALIVE entry is normalized after this one.
+			if tc.service == "ollama" && (env[len(env)-2] != tc.wantEntry || env[len(env)-1] != "OLLAMA_KEEP_ALIVE=") {
+				t.Fatalf("ollama policy entries must be final, got %q", env[len(env)-2:])
 			}
 		})
 	}
@@ -122,4 +124,26 @@ func envContains(env []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// citadel-cli#1560: strict start refuses an invalid keep_alive before any side
+// effect, injects a valid one, and unset leaves an explicit-empty entry.
+func TestComposeEnvForStrictServiceStart_OllamaKeepAlive(t *testing.T) {
+	bad := "soon"
+	if _, err := composeEnvForStrictServiceStart("ollama", Service{OllamaKeepAlive: &bad}, nil); err == nil {
+		t.Fatal("invalid ollama_keep_alive must refuse the start")
+	}
+	ok := "-1"
+	env, err := composeEnvForStrictServiceStart("ollama", Service{OllamaKeepAlive: &ok}, nil)
+	if err != nil || !slices.Contains(env, "OLLAMA_KEEP_ALIVE=-1") {
+		t.Fatalf("set: %v %v", env, err)
+	}
+	env, err = composeEnvForStrictServiceStart("ollama", Service{}, nil)
+	if err != nil || !slices.Contains(env, "OLLAMA_KEEP_ALIVE=") {
+		t.Fatalf("unset must be explicit empty: %v %v", env, err)
+	}
+	env, _ = composeEnvForStrictServiceStart("vllm", Service{OllamaKeepAlive: &ok}, nil)
+	if slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, "OLLAMA_KEEP_ALIVE=") }) {
+		t.Error("non-ollama env touched")
+	}
 }

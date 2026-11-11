@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
@@ -83,6 +85,11 @@ type APISourceConfig struct {
 
 	// LogFn is an optional callback for logging (if nil, prints to stdout)
 	LogFn func(level, msg string)
+
+	// WebSocketProxy is threaded to the API client's WebSocket dial. nil (the
+	// default) keeps a direct dial; the HPC profile passes the environment
+	// proxy so a compute node behind HTTPS_PROXY can reach the platform.
+	WebSocketProxy func(*http.Request) (*url.URL, error)
 }
 
 // NewAPISource creates a new API-backed job source.
@@ -151,6 +158,7 @@ func (s *APISource) Connect(ctx context.Context) error {
 		Token:            s.config.Token,
 		DebugFunc:        s.config.DebugFunc,
 		PlatformObserver: s.config.PlatformObserver,
+		WebSocketProxy:   s.config.WebSocketProxy,
 	})
 
 	// Verify connection before retaining the client.

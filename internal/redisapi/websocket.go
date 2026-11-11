@@ -25,6 +25,7 @@ type WSClient struct {
 	control   controlWaiters
 	baseURL   string
 	token     string
+	proxy     func(*http.Request) (*url.URL, error)
 	conn      *websocket.Conn
 	connMu    sync.RWMutex
 	connected bool
@@ -142,6 +143,11 @@ type WSClientConfig struct {
 
 	// DebugFunc is an optional callback for debug logging
 	DebugFunc func(format string, args ...any)
+
+	// Proxy, when non-nil, selects an HTTP CONNECT proxy for the WebSocket
+	// dial (for example http.ProxyFromEnvironment). nil dials directly, which
+	// is the behavior every ordinary node keeps.
+	Proxy func(*http.Request) (*url.URL, error)
 }
 
 // WSMessage represents a message received from or sent to the WebSocket.
@@ -255,6 +261,7 @@ func NewWSClient(cfg WSClientConfig) *WSClient {
 	return &WSClient{
 		baseURL:          cfg.BaseURL,
 		token:            cfg.Token,
+		proxy:            cfg.Proxy,
 		handlers:         make(map[string]func(WSMessage)),
 		subscriptions:    make(map[string]bool),
 		done:             make(chan struct{}),
@@ -326,6 +333,7 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 	// Connect with context
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
+		Proxy:            c.proxy,
 	}
 
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
