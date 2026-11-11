@@ -4382,6 +4382,30 @@ handler keeps the permanent drain. External-engine `MODULE_SET` also owns a
 separate `BeginDrain()` scope: its failed re-exec path releases only that
 scope after rollback, rather than clearing a concurrent permanent drain.
 
+**Co-browse sessions across a self-update restart (citadel-cli#1546).**
+`update.AutoUpdaterConfig.Busy` (wired to `platform.CobrowseBusy`) defers the
+cycle while a session has a viewer attached or a handoff outstanding, checked
+before download and again before the swap; `AutoUpdater.deferForBusy` owns the
+`deferred_busy` result and the bound (`update.ResolveMaxDefer`, env
+`CITADEL_UPDATE_MAX_DEFER_SECONDS`, 0 never forces). Every in-process exec goes
+through `update.RestartProcess`, which runs the hook `cmd` registers
+(`platform.PrepareSelfRestart`). `platform.recoverSessions` owns re-adoption:
+each session has a registry record (state live/suspended/expired, generation
+counter) in a registry dir that `platform.SetRegistryDirResolver` points at the
+node config dir (the single place the location is chosen; the profile and session
+dirs stay in the temp base). A restart re-adopts a live record under the same id
+only if owner, browser and Xvfb start times, role, CDP identity and dir all
+verify, BEFORE the orphan sweep (which treats a dir owned by our own PID as
+stale). A live record that fails becomes `expired` with its `ended_reason`, never
+a silent delete; suspended records are never touched. Adoption is Linux only
+(`adoptionSupported`); elsewhere it stops sessions cleanly.
+Only the node-wide manager adopts, and only a record whose owner is this very
+process (same PID and start time, as after exec); local mode and a live sibling's
+records are never adopted or modified. Persistent-profile sessions are sealed and
+stopped by `prepareSelfRestart` on every OS, and ended reasons are recorded on
+every OS. A full service restart (control-group kill)
+still kills browsers; detaching them is separate work.
+
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
 stub on `!linux`) is the authority for "is a managed citadel service running
 **on this host**", not "is *this process* service-managed". It scans the

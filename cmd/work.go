@@ -534,6 +534,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, warning)
 	}
 
+	// Re-adopt co-browse sessions that survived a restart by exec (citadel-cli#1546)
+	// before anything can sweep them; sessions that fail verification are reaped.
+	platform.GetCobrowseSessionManager().Recover()
+
 	// Setup signal handling. The first signal cancels the root context so every
 	// subsystem (worker runner, status/terminal/gateway servers, heartbeat,
 	// auto-updater, usage syncer) observes cancellation and unwinds. As a
