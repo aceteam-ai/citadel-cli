@@ -105,7 +105,7 @@ var rootCmd = &cobra.Command{
 Just run 'citadel' — it handles login, network connection, and launches the
 control center. All other subcommands are for scripting and advanced use.`,
 	Version: Version,
-	Run:     runBareCitadel,
+	Run:     runRootCitadel,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		// Offline pack evaluation must not install CA trust, repair/update a
 		// binary, touch node state, or contact the fabric before reading files.
@@ -147,7 +147,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 		// no update check. Debug output still goes to stderr above.
 		// The hpc login-node commands (launch, setup) only write a batch script
 		// or a virtualenv; like local mode they skip CA trust and update checks.
-		if isLocalModeCommand(cmd) || isHPCLoginCommand(cmd.CommandPath()) {
+		if isLocalModeCommand(cmd) || isHPCLoginCommand(cmd.CommandPath()) || isExplorerSetupLaunch(cmd, args) {
 			network.SetLogf(Debug)
 			if noColorGlobal || os.Getenv("NO_COLOR") != "" {
 				color.NoColor = true
@@ -254,6 +254,12 @@ func isLocalModeCommand(cmd *cobra.Command) bool {
 		}
 	}
 	return false
+}
+
+// isExplorerSetupLaunch is a bare `citadel` started by a double-click, which
+// opens the local setup page and so is a local-mode invocation.
+func isExplorerSetupLaunch(cmd *cobra.Command, args []string) bool {
+	return cmd.Parent() == nil && len(args) == 0 && launchedFromExplorer()
 }
 
 func isMemoryHookCommand(cmd *cobra.Command) bool {

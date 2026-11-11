@@ -111,10 +111,29 @@ func init() {
 
 var errLocalDoctorFailed = errors.New("local mode is not ready; see the lines marked FAIL above")
 
+// localDoctorCheck is one doctor line. Status is "ok", "note" or "FAIL".
+type localDoctorCheck struct {
+	Status string `json:"status"`
+	What   string `json:"what"`
+	Detail string `json:"detail"`
+}
+
 func runLocalDoctor(d localDoctorDeps, out io.Writer) error {
-	failed := false
+	checks, failed := collectLocalDoctor(d)
+	for _, c := range checks {
+		fmt.Fprintf(out, "[%-4s] %-14s %s\n", c.Status, c.What, c.Detail)
+	}
+	if failed {
+		return errLocalDoctorFailed
+	}
+	return nil
+}
+
+// collectLocalDoctor runs every check once and returns the lines. The command
+// and the setup page both render these.
+func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bool) {
 	line := func(status, what, detail string) {
-		fmt.Fprintf(out, "[%-4s] %-14s %s\n", status, what, detail)
+		checks = append(checks, localDoctorCheck{Status: status, What: what, Detail: detail})
 	}
 	ok := func(what, detail string) { line("ok", what, detail) }
 	warn := func(what, detail string) { line("note", what, detail) }
@@ -200,10 +219,7 @@ func runLocalDoctor(d localDoctorDeps, out io.Writer) error {
 
 	ok("Network", "Citadel makes no calls of its own (no account, no update check, no telemetry). The co-browse browser connects only to public addresses, through Citadel's local guard, with background updates off")
 
-	if failed {
-		return errLocalDoctorFailed
-	}
-	return nil
+	return checks, failed
 }
 
 // minHeadlessMajor is the first Chromium release with --headless=new.
