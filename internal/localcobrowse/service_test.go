@@ -23,6 +23,11 @@ type fakeBrowser struct {
 	startLandsOn string
 	// clickNavigatesTo simulates a link click that loads another page.
 	clickNavigatesTo string
+	// navigateLandsOn simulates a navigate that redirects; pageTitle is the
+	// title every page reports; notReady keeps readyState at "loading".
+	navigateLandsOn string
+	pageTitle       string
+	notReady        bool
 }
 
 type fakeSession struct {
@@ -106,7 +111,12 @@ func (f *fakeBrowser) act(id, call string, mut func(*fakeSession)) (platform.Cob
 	return f.statusLocked(id), nil
 }
 func (f *fakeBrowser) Navigate(id, u string) (platform.CobrowseSessionStatus, error) {
-	return f.act(id, "navigate "+u, func(s *fakeSession) { s.url = u })
+	return f.act(id, "navigate "+u, func(s *fakeSession) {
+		s.url = u
+		if f.navigateLandsOn != "" {
+			s.url = f.navigateLandsOn
+		}
+	})
 }
 func (f *fakeBrowser) NavigateAsHuman(id, u string) (platform.CobrowseSessionStatus, error) {
 	f.mu.Lock()
@@ -154,7 +164,11 @@ func (f *fakeBrowser) PageState(id string) (platform.PageState, error) {
 	if err != nil {
 		return platform.PageState{}, err
 	}
-	return platform.PageState{URL: s.url, ReadyState: "complete"}, nil
+	rs := "complete"
+	if f.notReady {
+		rs = "loading"
+	}
+	return platform.PageState{URL: s.url, ReadyState: rs, Title: f.pageTitle}, nil
 }
 func (f *fakeBrowser) Handoff(id string) (platform.CobrowseSessionStatus, error) {
 	f.mu.Lock()
@@ -593,5 +607,52 @@ func TestHumanNavigateOnlyWhileDriving(t *testing.T) {
 	}
 	if fb.calls[len(fb.calls)-1] != "human-navigate http://a.test/" {
 		t.Fatalf("calls: %v", fb.calls)
+	}
+}
+
+func TestNavigateReturnsFinalURLAndTitleAfterRedirect(t *testing.T) {
+	svc, fb, _ := newTestService(t, nil)
+	st, _ := svc.Start(ctx, "", "g", "")
+	_ = svc.Approve(st.SessionID, 0)
+	fb.navigateLandsOn = "http://two.test/final"
+	fb.pageTitle = "Final\x00 Page\n"
+	res, err := svc.Navigate(ctx, st.SessionID, "http://one.test/start", "g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.URL != "http://two.test/final" || res.Title != "Final Page" || !res.Settled {
+		t.Fatalf("want the post-redirect url and sanitized title, got %+v", res)
+	}
+}
+
+func TestNavigateSlowPageReturnsCurrentURLWithinWindow(t *testing.T) {
+	old := settleWindow
+	settleWindow = 250 * time.Millisecond
+	t.Cleanup(func() { settleWindow = old })
+	svc, fb, _ := newTestService(t, nil)
+	st, _ := svc.Start(ctx, "", "g", "")
+	_ = svc.Approve(st.SessionID, 0)
+	fb.notReady = true
+	start := time.Now()
+	res, err := svc.Navigate(ctx, st.SessionID, "http://slow.test/", "g")
+	if err != nil {
+		t.Fatalf("a slow page is not a failure: %v", err)
+	}
+	if time.Since(start) > 3*time.Second || res.Settled || res.URL != "http://slow.test/" {
+		t.Fatalf("want the current url, unsettled, within the window: %+v after %v", res, time.Since(start))
+	}
+}
+
+func TestNavigateTitleBounded(t *testing.T) {
+	svc, fb, _ := newTestService(t, nil)
+	st, _ := svc.Start(ctx, "", "g", "")
+	_ = svc.Approve(st.SessionID, 0)
+	fb.pageTitle = strings.Repeat("t", 5000)
+	res, err := svc.Navigate(ctx, st.SessionID, "http://one.test/", "g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len([]rune(res.Title)); n != platform.MaxCobrowseTitleRunes {
+		t.Fatalf("title length %d, want %d", n, platform.MaxCobrowseTitleRunes)
 	}
 }

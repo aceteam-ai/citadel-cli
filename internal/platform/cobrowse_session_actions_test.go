@@ -33,6 +33,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/gorilla/websocket"
 )
@@ -800,5 +801,87 @@ func TestCobrowseSessionActions_NavigateAsHumanValidatesURL(t *testing.T) {
 	f.mu.Unlock()
 	if after != before {
 		t.Fatal("a refused URL reached CDP")
+	}
+}
+
+// navigateResponder simulates a page: before Page.navigate it is on oldURL;
+// afterwards it reports the given landing state.
+func navigateResponder(f *fakeCDPServer, oldURL string, after map[string]any) func(string) any {
+	return func(string) any {
+		if len(f.callsFor("Page.navigate")) == 0 {
+			return map[string]any{"url": oldURL, "ready": "complete", "title": "old"}
+		}
+		return after
+	}
+}
+
+func shortSettle(t *testing.T, window time.Duration) {
+	t.Helper()
+	w, m, p := navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll
+	navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll = window, 20*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll = w, m, p })
+}
+
+func TestCobrowseSessionActions_NavigateReturnsRedirectedURLAndTitle(t *testing.T) {
+	shortSettle(t, 2*time.Second)
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = navigateResponder(f, "about:blank", map[string]any{
+		"url": "https://example.com/final?x=1", "ready": "complete", "title": "Final Page",
+	})
+	f.mu.Unlock()
+	got, err := m.Navigate(st.ID, "https://example.com/start")
+	if err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+	if got.URL != "https://example.com/final?x=1" || got.Title != "Final Page" {
+		t.Fatalf("url/title = %q / %q, want the post-redirect page", got.URL, got.Title)
+	}
+}
+
+func TestCobrowseSessionActions_NavigateSlowPageReturnsWithinWindow(t *testing.T) {
+	shortSettle(t, 300*time.Millisecond)
+	m, st, f := startSessionOnFakeCDP(t)
+	f.mu.Lock()
+	f.evaluateValue = navigateResponder(f, "about:blank", map[string]any{
+		"url": "https://slow.example/", "ready": "loading", "title": "",
+	})
+	f.mu.Unlock()
+	start := time.Now()
+	got, err := m.Navigate(st.ID, "https://slow.example/")
+	if err != nil {
+		t.Fatalf("a slow page is not a failure: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("navigate took %v, want it bounded by the settle window", d)
+	}
+	if got.URL != "https://slow.example/" {
+		t.Fatalf("url = %q, want the URL the page reached", got.URL)
+	}
+}
+
+func TestCobrowseSessionActions_NavigateTitleBoundedAndSanitized(t *testing.T) {
+	shortSettle(t, 2*time.Second)
+	m, st, f := startSessionOnFakeCDP(t)
+	long := "A\x00B\x1b[31m\r\n\t" + strings.Repeat("x", 2000)
+	f.mu.Lock()
+	f.evaluateValue = navigateResponder(f, "about:blank", map[string]any{
+		"url": "https://example.com/", "ready": "complete", "title": long,
+	})
+	f.mu.Unlock()
+	got, err := m.Navigate(st.ID, "https://example.com/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len([]rune(got.Title)); n == 0 || n > MaxCobrowseTitleRunes {
+		t.Fatalf("title length %d, want 1..%d", n, MaxCobrowseTitleRunes)
+	}
+	for _, r := range got.Title {
+		if unicode.IsControl(r) {
+			t.Fatalf("title keeps control character %q", r)
+		}
+	}
+	if !strings.HasPrefix(got.Title, "AB[31m") {
+		t.Fatalf("title = %q", got.Title[:10])
 	}
 }

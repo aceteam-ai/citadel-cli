@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
+	"unicode"
 )
 
 // ExtractResult is the outcome of a session `extract` action: the matched
@@ -35,6 +37,79 @@ var ErrPasswordValue = fmt.Errorf("refusing to read the value of a password fiel
 type PageState struct {
 	URL        string `json:"url"`
 	ReadyState string `json:"ready_state"`
+	// Title is document.title, already bounded and stripped of control
+	// characters (SanitizeCobrowseTitle).
+	Title string `json:"title,omitempty"`
+}
+
+// MaxCobrowseTitleRunes bounds the page title returned from a navigation.
+const MaxCobrowseTitleRunes = 512
+
+// SanitizeCobrowseTitle drops control characters (including newlines and
+// tabs, which a title has no use for), trims surrounding space and truncates
+// to MaxCobrowseTitleRunes.
+func SanitizeCobrowseTitle(t string) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range t {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			continue
+		}
+		if n >= MaxCobrowseTitleRunes {
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// Navigation settle tuning. The window is the most Navigate waits for the page
+// to finish loading; it is deliberately below the 20s CDP command budget so a
+// slow page returns whatever it has reached. Variables so tests need not sleep.
+var (
+	navigateSettleWindow  = 8 * time.Second
+	navigateSettleMinimum = 400 * time.Millisecond
+	navigateSettlePoll    = 100 * time.Millisecond
+)
+
+// settleNavigation polls the page until it reports readyState "complete" on a
+// document that is not the pre-navigation one (or, when the URL did not change,
+// after a short minimum so a pending navigation has time to commit), bounded by
+// navigateSettleWindow. It returns the last state read; a slow page is not an
+// error.
+func settleNavigation(port int, before string) PageState {
+	var last PageState
+	start := time.Now()
+	for {
+		if ps, err := readPageState(port); err == nil {
+			last = ps
+			if ps.ReadyState == "" {
+				// The page did not answer with a document state at all;
+				// polling cannot improve on that.
+				return ps
+			}
+			if ps.ReadyState == "complete" && (ps.URL != before || time.Since(start) >= navigateSettleMinimum) {
+				return ps
+			}
+		}
+		if time.Since(start) >= navigateSettleWindow {
+			return last
+		}
+		time.Sleep(navigateSettlePoll)
+	}
+}
+
+func readPageState(port int) (PageState, error) {
+	val, err := runtimeEvaluate(port, `({url: location.href, ready: document.readyState, title: document.title})`)
+	if err != nil {
+		return PageState{}, err
+	}
+	obj, _ := val.(map[string]any)
+	u, _ := obj["url"].(string)
+	r, _ := obj["ready"].(string)
+	t, _ := obj["title"].(string)
+	return PageState{URL: u, ReadyState: r, Title: SanitizeCobrowseTitle(t)}, nil
 }
 
 type SelectResult struct {
@@ -128,10 +203,22 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 		// refused write).
 		return CobrowseSessionStatus{}, err
 	}
+	var before string
+	if ps, err := readPageState(port); err == nil {
+		before = ps.URL
+	}
 	if _, err := cdpCommand(port, "Page.navigate", map[string]any{"url": url}); err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	return s.status(), nil
+	// Wait for the navigation (including redirects) to settle, then report
+	// where the page ended up. A slow page returns its current state.
+	ps := settleNavigation(port, before)
+	st := s.status()
+	if ps.URL != "" {
+		st.URL = ps.URL
+	}
+	st.Title = ps.Title
+	return st, nil
 }
 
 // NavigateAsHuman navigates on behalf of the human who has taken control (the
@@ -472,14 +559,7 @@ func (m *CobrowseSessionManager) PageState(id string) (PageState, error) {
 	if err != nil {
 		return PageState{}, err
 	}
-	val, err := runtimeEvaluate(port, `({url: location.href, ready: document.readyState})`)
-	if err != nil {
-		return PageState{}, err
-	}
-	obj, _ := val.(map[string]any)
-	u, _ := obj["url"].(string)
-	r, _ := obj["ready"].(string)
-	return PageState{URL: u, ReadyState: r}, nil
+	return readPageState(port)
 }
 
 // Handoff sets the STICKY explicit-handoff bit on one session (see the package

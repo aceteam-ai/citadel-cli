@@ -81,13 +81,16 @@ const (
 
 // CobrowseSessionStatus is the queryable state of one session.
 type CobrowseSessionStatus struct {
-	ID        string               `json:"id"`
-	State     CobrowseSessionState `json:"state"`
-	URL       string               `json:"url,omitempty"`
-	DebugPort int                  `json:"debug_port,omitempty"`
-	Profile   string               `json:"profile,omitempty"`
-	Display   string               `json:"display,omitempty"`
-	StartedAt string               `json:"started_at,omitempty"`
+	ID    string               `json:"id"`
+	State CobrowseSessionState `json:"state"`
+	URL   string               `json:"url,omitempty"`
+	// Title is the page title after a navigate (bounded, control characters
+	// stripped); empty for every other status.
+	Title     string `json:"title,omitempty"`
+	DebugPort int    `json:"debug_port,omitempty"`
+	Profile   string `json:"profile,omitempty"`
+	Display   string `json:"display,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
 	// Driver reports human only after explicit handoff. An attached viewer
 	// without handoff observes while the agent continues to act.
 	Driver CobrowseDriver `json:"driver,omitempty"`

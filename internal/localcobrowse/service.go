@@ -543,6 +543,7 @@ type ActionResult struct {
 	Settled    bool   `json:"settled"`
 	Navigated  bool   `json:"navigated"`
 	URL        string `json:"url,omitempty"`
+	Title      string `json:"title,omitempty"`
 	Value      string `json:"value,omitempty"`
 	Label      string `json:"label,omitempty"`
 }
@@ -562,6 +563,7 @@ func (s *Service) settle(ctx context.Context, id, before string) ActionResult {
 	for {
 		if ps, err := s.cfg.Browser.PageState(id); err == nil {
 			res.URL = ps.URL
+			res.Title = platform.SanitizeCobrowseTitle(ps.Title)
 			if before != "" && ps.URL != before {
 				res.Navigated = true
 			}
