@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 type systemdManager struct{}
@@ -23,7 +25,7 @@ func newPlatformManager() Manager {
 // System mode: /etc/systemd/system/citadel.service
 func unitFilePath(userMode bool) (string, error) {
 	if userMode {
-		home, err := os.UserHomeDir()
+		home, err := platform.UserHomeDir()
 		if err != nil {
 			return "", fmt.Errorf("cannot determine home directory: %w", err)
 		}

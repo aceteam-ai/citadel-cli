@@ -65,6 +65,12 @@ type LLMInferenceHandler struct {
 	// so tests can point a backend at an httptest server without a live engine.
 	baseURLs map[string]string
 
+	// onlyBackends, when true, makes baseURLs the complete routing table: a
+	// backend not in it is refused instead of falling back to a default port.
+	// The hpc profile sets it (a shared compute node lets any user bind a
+	// default engine port first).
+	onlyBackends bool
+
 	// httpClient issues the outbound engine requests. Defaults to
 	// http.DefaultClient; overridable in tests.
 	httpClient *http.Client
@@ -195,6 +201,18 @@ func defaultAEPSigner() aep.Signer {
 	return nodeidentity.Convergent(network.GetNodeConfigDir())
 }
 
+// WithOnlyBackends replaces the routing table with exactly the given backend
+// to base URL map and refuses every other backend. There is no fallback to
+// the default engine ports. An empty map refuses all inference.
+func (h *LLMInferenceHandler) WithOnlyBackends(urls map[string]string) *LLMInferenceHandler {
+	h.baseURLs = make(map[string]string, len(urls))
+	for k, v := range urls {
+		h.baseURLs[k] = v
+	}
+	h.onlyBackends = true
+	return h
+}
+
 // WithSwapper attaches a model-hotswap swapper (citadel-cli#632). Called from
 // cmd/nodejobs.go ONLY when CITADEL_MODEL_HOTSWAP is on; leaving it unset keeps
 // the handler's behavior identical to before hotswap.
@@ -264,6 +282,9 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 	payload, err := parseLLMInferencePayload(job.Payload)
 	if err != nil {
 		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
+	}
+	if h.onlyBackends && h.baseURLs[payload.Backend] == "" {
+		return h.failure(fmt.Errorf("backend %q is not available on this node", payload.Backend)), nil
 	}
 	configuredExternal := false
 	if payload.Backend == "vllm" {

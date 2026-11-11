@@ -98,7 +98,7 @@ func runProvisionIOS(cmd *cobra.Command, _ []string) error {
 
 	profilesDir := provisionIOSProfilesDir
 	if profilesDir == "" {
-		home, err := os.UserHomeDir()
+		home, err := platform.HomeDir("")
 		if err != nil {
 			return fmt.Errorf("resolving home directory: %w", err)
 		}

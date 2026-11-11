@@ -1,18 +1,16 @@
 package cobrowsestream
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
+	"math"
 	"net/http"
-	"net/url"
-	"strconv"
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
 	"github.com/gorilla/websocket"
 )
 
@@ -20,97 +18,23 @@ import (
 // cannot hang a viewer connection forever.
 var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-// Chrome pretty-prints discovery and may include dozens of ad iframe targets
-// with multi-KiB URLs. 512 KiB admits those replies while keeping a hard bound.
-const maxCDPDiscoveryBytes = 512 << 10
-const maxCDPDiscoveryPages = 64
-
-// cdpTargetURL resolves a debug port to the page target's DevTools WebSocket URL.
-// It is a package var so tests can point the CDP client at a fake Chrome
-// (httptest WebSocket) without launching a real browser -- the same injection
-// seam pattern the platform launchers use. Like the existing screenshot path it
-// grabs the FIRST page target, so a session that opens a second tab streams the
-// first tab (a documented, inherited limitation).
+// cdpTargetURL remains an injection seam for fake Chrome WebSockets.
 var cdpTargetURL = defaultCDPTargetURL
+
+// A 32 MiB PNG occupies 44,739,244 base64 bytes; this fixed message budget
+// leaves room for its CDP envelope. It is not an aggregate memory bound.
+const maxCDPMessageBytes int64 = 64 << 20
 
 func defaultCDPTargetURL(debugPort int) (string, error) {
 	return discoverCDPTargetURL(debugPort, cdpHTTPClient)
 }
 
 func discoverCDPTargetURL(debugPort int, client *http.Client) (string, error) {
-	// The probe is local. A redirect must not turn discovery into a request to
-	// another origin. Copy the client so the shared timeout/transport stay intact.
-	probe := *client
-	probe.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := probe.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
-	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
-	}
+	target, err := cdpdiscovery.Discover(context.Background(), debugPort, client)
 	if err != nil {
-		return "", fmt.Errorf("CDP target discovery request failed")
+		return "", err
 	}
-	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("CDP target discovery requires HTTP 200")
-	}
-	if resp.ContentLength > maxCDPDiscoveryBytes {
-		return "", fmt.Errorf("CDP target discovery exceeds 512 KiB")
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCDPDiscoveryBytes+1))
-	if err != nil {
-		return "", fmt.Errorf("CDP target discovery body read failed")
-	}
-	if len(body) > maxCDPDiscoveryBytes {
-		return "", fmt.Errorf("CDP target discovery exceeds 512 KiB")
-	}
-	return decodeCDPDiscoveryTargets(body, debugPort)
-}
-
-func decodeCDPDiscoveryTargets(body []byte, debugPort int) (string, error) {
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	opening, err := decoder.Token()
-	if err != nil || opening != json.Delim('[') {
-		return "", fmt.Errorf("CDP target discovery requires a JSON array")
-	}
-	selected := ""
-	count := 0
-	for decoder.More() {
-		var target struct {
-			Type                 string `json:"type"`
-			WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-		}
-		if err := decoder.Decode(&target); err != nil {
-			return "", fmt.Errorf("CDP target discovery contains invalid target JSON")
-		}
-		if target.Type == "page" {
-			count++
-			if count > maxCDPDiscoveryPages {
-				return "", fmt.Errorf("CDP target discovery exceeds 64 page targets")
-			}
-			if selected == "" && target.WebSocketDebuggerURL != "" {
-				selected = target.WebSocketDebuggerURL
-			}
-		}
-	}
-	if closing, err := decoder.Token(); err != nil || closing != json.Delim(']') {
-		return "", fmt.Errorf("CDP target discovery has an incomplete array")
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return "", fmt.Errorf("CDP target discovery has trailing JSON")
-	}
-	// Validate the complete array and target count before exposing its first
-	// page. A useful prefix must not hide a malformed or oversized suffix.
-	if selected != "" {
-		target, err := url.Parse(selected)
-		if err != nil || target == nil || (target.Scheme != "ws" && target.Scheme != "wss") || target.Hostname() == "" || target.User != nil || target.Fragment != "" {
-			return "", fmt.Errorf("CDP target discovery returned an invalid debugger URL")
-		}
-		// Discovery is over plain HTTP to the selected local debug port. The
-		// advertised authority is not permission to connect anywhere else.
-		target.Scheme = "ws"
-		target.Host = "127.0.0.1:" + strconv.Itoa(debugPort)
-		return target.String(), nil
-	}
-	return "", fmt.Errorf("no page target found on CDP port %d", debugPort)
+	return target.WebSocketDebuggerURL, nil
 }
 
 // screencastFrame is one decoded CDP Page.screencastFrame event.
@@ -140,7 +64,8 @@ type cdpClient struct {
 	// not block for long (it feeds the coalescing single-slot holder).
 	onFrame func(screencastFrame)
 
-	// metaMu guards the last frame's device dimensions, read by the input path.
+	// metaMu guards CSS viewport dimensions used by the input path. A
+	// screencast event or the idle-page fallback supplies them.
 	metaMu sync.Mutex
 	lastW  float64
 	lastH  float64
@@ -186,16 +111,39 @@ func (c *Client) Close() { c.client.Close() }
 // dialCDP resolves the page target for debugPort and opens a persistent CDP
 // WebSocket. onFrame receives every screencast frame once startScreencast runs.
 func dialCDP(debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
+	return dialCDPWithReadLimit(debugPort, onFrame, maxCDPMessageBytes)
+}
+
+// The private smaller-limit seam lets source fixtures exercise the same dial
+// and first-read path without allocating full-size messages. Production uses
+// the fixed ceiling above; no caller may disable or increase it here.
+func dialCDPWithReadLimit(debugPort int, onFrame func(screencastFrame), readLimit int64) (*cdpClient, error) {
+	if readLimit <= 0 || readLimit > maxCDPMessageBytes {
+		return nil, fmt.Errorf("CDP read limit is invalid")
+	}
 	wsURL, err := cdpTargetURL(debugPort)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	// Gorilla's read limit counts compressed payload bytes, not expanded data.
+	// Pin compression off without changing the shared DefaultDialer or its other
+	// behavior, so fragmented uncompressed messages share one finite budget.
+	dialer := *websocket.DefaultDialer
+	dialer.EnableCompression = false
+	conn, response, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("CDP dial: %w", err)
 	}
+	// The pinned Gorilla dialer accepts an unsolicited compression response
+	// even when it made no offer. Refuse every extension response (including
+	// empty or duplicate fields) before a reader can expand its first message.
+	if response == nil || len(response.Header.Values("Sec-WebSocket-Extensions")) != 0 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("CDP extensions are not allowed")
+	}
+	conn.SetReadLimit(readLimit)
 	c := &cdpClient{conn: conn, onFrame: onFrame, done: make(chan struct{}), pending: make(map[int]chan cdpResponse)}
 	go c.readLoop()
 	return c, nil
@@ -367,13 +315,53 @@ func (c *cdpClient) startScreencast(quality, maxWidth, maxHeight, everyNth int) 
 	})
 }
 
+// captureFirstFrame asks Chrome for one current JPEG and its CSS viewport
+// dimensions when an idle page has not produced a screencast frame. Input
+// uses CSS coordinates, so JPEG pixel dimensions are not a safe substitute.
+func (c *cdpClient) captureFirstFrame(ctx context.Context, quality int) ([]byte, error) {
+	result, err := c.command(ctx, "Page.captureScreenshot", map[string]any{
+		"format":  "jpeg",
+		"quality": quality,
+	})
+	if err != nil {
+		return nil, err
+	}
+	encoded, ok := result["data"].(string)
+	if !ok || len(encoded) == 0 || len(encoded) > 8*1024*1024 {
+		return nil, fmt.Errorf("CDP screenshot missing or too large")
+	}
+	jpeg, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(jpeg) == 0 {
+		return nil, fmt.Errorf("CDP screenshot invalid JPEG data")
+	}
+	metrics, err := c.command(ctx, "Page.getLayoutMetrics", nil)
+	if err != nil {
+		return nil, err
+	}
+	viewport, ok := metrics["cssVisualViewport"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("CDP CSS viewport unavailable")
+	}
+	w, wOK := viewport["clientWidth"].(float64)
+	h, hOK := viewport["clientHeight"].(float64)
+	if !wOK || !hOK || w <= 0 || h <= 0 || w > 16384 || h > 16384 || math.IsNaN(w) || math.IsNaN(h) || math.IsInf(w, 0) || math.IsInf(h, 0) {
+		return nil, fmt.Errorf("CDP CSS viewport invalid")
+	}
+	c.metaMu.Lock()
+	if c.lastW <= 0 || c.lastH <= 0 {
+		c.lastW, c.lastH = w, h
+	}
+	c.metaMu.Unlock()
+	return jpeg, nil
+}
+
 // stopScreencast asks Chrome to stop emitting frames. Best-effort politeness:
 // Chrome also detaches when the CDP socket closes, so Close() is the real no-leak
 // guarantee, not this call.
 func (c *cdpClient) stopScreencast() { _ = c.send("Page.stopScreencast", nil) }
 
 // dispatchMouse maps a viewer mouse event (normalized coords) to CDP viewport
-// CSS pixels using the latest frame's device dimensions, then dispatches it.
+// CSS pixels using the latest viewport dimensions, then dispatches it.
 func (c *cdpClient) dispatchMouse(m InputMessage) error {
 	c.metaMu.Lock()
 	w, h := c.lastW, c.lastH
@@ -418,6 +406,53 @@ func (c *cdpClient) dispatchKey(m InputMessage) error {
 		params["windowsVirtualKeyCode"] = m.KeyCode
 	}
 	return c.send("Input.dispatchKeyEvent", params)
+}
+
+// selectAt probes or updates a native select at the viewport point. Browser
+// popup menus live outside the page and ignore forwarded mouse clicks, so the
+// viewer presents options in its own UI and applies the choice through the DOM.
+func (c *cdpClient) selectAt(m InputMessage) (map[string]any, error) {
+	c.metaMu.Lock()
+	w, h := c.lastW, c.lastH
+	c.metaMu.Unlock()
+	if w <= 0 || h <= 0 {
+		return nil, nil
+	}
+	valueJSON, _ := json.Marshal(m.Value)
+	mode := "probe"
+	if m.Type == InputTypeSelect {
+		mode = "select"
+	}
+	expr := fmt.Sprintf(`(function(){
+		const el = document.elementFromPoint(%f, %f);
+		if (!(el instanceof HTMLSelectElement)) return null;
+		if (%q === "probe") return {type: "select_options", options: Array.from(el.options).map(o => ({value: o.value, label: o.label, disabled: el.matches(":disabled") || o.disabled || o.parentElement?.disabled || false}))};
+		const option = Array.from(el.options).find(o => o.value === %s);
+		if (el.matches(":disabled") || !option || option.disabled || option.parentElement?.disabled) return {type: "select_error", message: "Option unavailable"};
+		Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(el, option.value);
+		el.dispatchEvent(new Event("input", {bubbles: true}));
+		el.dispatchEvent(new Event("change", {bubbles: true}));
+		return {type: "select_result", value: el.value};
+	})()`, clamp01(m.X)*w, clamp01(m.Y)*h, mode, string(valueJSON))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	res, err := c.command(ctx, "Runtime.evaluate", map[string]any{"expression": expr, "returnByValue": true})
+	if err != nil {
+		return nil, err
+	}
+	if res["exceptionDetails"] != nil {
+		return nil, fmt.Errorf("select script failed")
+	}
+	remote, ok := res["result"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("select returned no result")
+	}
+	value, ok := remote["value"].(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+	value["x"], value["y"] = m.X, m.Y
+	return value, nil
 }
 
 // mouseButton defaults an empty/unknown button to "none" so a bare mouseMoved

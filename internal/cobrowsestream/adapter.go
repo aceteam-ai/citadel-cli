@@ -35,5 +35,6 @@ func (s managerSession) AttachTarget(id string) (int, bool) {
 	return st.DebugPort, true
 }
 
-func (s managerSession) MarkAttached(id string) bool { return s.m.MarkAttached(id) }
-func (s managerSession) MarkDetached(id string) bool { return s.m.MarkDetached(id) }
+func (s managerSession) MarkAttached(id string) bool     { return s.m.MarkAttached(id) }
+func (s managerSession) MarkDetached(id string) bool     { return s.m.MarkDetached(id) }
+func (s managerSession) ViewerHasControl(id string) bool { return s.m.ViewerHasControl(id) }

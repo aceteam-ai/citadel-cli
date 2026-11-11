@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 func runSession(t *testing.T, payload map[string]string) ([]byte, error) {
@@ -391,5 +392,19 @@ func TestCobrowseSession_PinNeverLoggedForNewActions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSessionStatusResultCarriesURLAndTitle(t *testing.T) {
+	out, err := sessionStatusResult(platform.CobrowseSessionStatus{ID: "cb-1", URL: "https://example.com/final", Title: "Final"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["url"] != "https://example.com/final" || got["title"] != "Final" {
+		t.Fatalf("result = %s", out)
 	}
 }

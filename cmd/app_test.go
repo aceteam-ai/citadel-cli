@@ -4,7 +4,7 @@ import "testing"
 
 func TestAppListCommand(t *testing.T) {
 	// Use a temp home so state file is empty (no Docker calls needed).
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 
 	// runAppList writes to os.Stdout via tabwriter; we just verify it
 	// runs without error. The tabwriter output is visible in -v mode.
@@ -15,7 +15,7 @@ func TestAppListCommand(t *testing.T) {
 }
 
 func TestAppStopNotInstalled(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 
 	err := runAppStop(appStopCmd, []string{"code-server"})
 	if err == nil {
@@ -27,7 +27,7 @@ func TestAppStopNotInstalled(t *testing.T) {
 }
 
 func TestAppStartNotInstalled(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 
 	err := runAppStart(appStartCmd, []string{"jupyter"})
 	if err == nil {
@@ -39,7 +39,7 @@ func TestAppStartNotInstalled(t *testing.T) {
 }
 
 func TestAppUninstallNotInstalled(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 
 	err := runAppUninstall(appUninstallCmd, []string{"filebrowser"})
 	if err == nil {
@@ -51,7 +51,7 @@ func TestAppUninstallNotInstalled(t *testing.T) {
 }
 
 func TestAppInstallUnknownApp(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 
 	err := runAppInstall(appInstallCmd, []string{"nonexistent-app"})
 	if err == nil {
@@ -60,7 +60,7 @@ func TestAppInstallUnknownApp(t *testing.T) {
 }
 
 func TestAppStatusEmpty(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 
 	// Should print "no apps installed" message and not error.
 	err := runAppStatus(appStatusCmd, nil)

@@ -249,6 +249,7 @@ func Sweep(opts Options) (Result, error) {
 			continue
 		}
 		res.Refreshed = append(res.Refreshed, name)
+		opts.log("compose-refresh: %s: installed selected host template", name)
 
 		// Only port-managed services can trigger a recreate, and only when a
 		// Recreator is wired in and the running host port actually moved.
@@ -293,11 +294,17 @@ func hashContent(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// writeCompose atomically writes compose content with 0600 perms (to protect
-// any sensitive env vars, matching the existing materialize paths). It writes to
-// a temp file in the same directory and renames into place so a crash mid-write
-// can never leave a truncated compose file that would fail to parse.
+// composeOwnerHandoff is the filesystem ownership boundary, replaceable by
+// fake ownership in tests without performing a native chown.
+var composeOwnerHandoff = keepComposeOwner
+
+// writeCompose publishes restrictive compose bytes by atomic rename. Existing
+// files retain their owner; new files inherit the services directory's owner.
 func writeCompose(path, content string) error {
+	return writeComposeWithOwner(path, content, composeOwnerHandoff)
+}
+
+func writeComposeWithOwner(path, content string, keepOwner func(*os.File, string) error) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".compose-*.tmp")
 	if err != nil {
@@ -305,6 +312,10 @@ func writeCompose(path, content string) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) // no-op after a successful rename
+	if err := keepOwner(tmp, path); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.WriteString(content); err != nil {
 		tmp.Close()
 		return err
@@ -344,5 +355,5 @@ func writeStamp(dir string, s managedStamp) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return writeCompose(path, string(data))
 }

@@ -28,17 +28,17 @@ package platform
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
 	"github.com/gorilla/websocket"
 )
 
@@ -119,6 +119,20 @@ type cobrowseLaunchOptions struct {
 	// and record the other participants. Left false for co-browse (a human drives
 	// it and supplies the gesture).
 	autoplayNoUserGesture bool
+	// headless runs Chrome/Edge in new headless mode (--headless=new) with a
+	// fixed window size instead of a maximized headed window. Used by the
+	// Windows runner so a session never takes over the user's screen or focus;
+	// the screencast viewer shows it instead. Left false on the Linux Xvfb path,
+	// whose argument list is unchanged.
+	headless bool
+	// windowSize is "W,H" for --window-size, applied only when headless.
+	windowSize string
+	// proxyServer routes every browser connection through this HTTP proxy,
+	// including loopback ("<-loopback>" removes Chrome's implicit bypass), and
+	// forbids WebRTC UDP that would bypass it. See LaunchOptions.ProxyServer.
+	proxyServer string
+	// quiet disables background networking and component updates.
+	quiet bool
 }
 
 // stealthEnabled resolves whether stealth launch flags should be applied,
@@ -173,7 +187,14 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		"--user-data-dir=" + opts.profileDir,
 		"--no-first-run",
 		"--no-default-browser-check",
-		"--start-maximized",
+	}
+	if opts.headless {
+		args = append(args, "--headless=new")
+		if opts.windowSize != "" {
+			args = append(args, "--window-size="+opts.windowSize)
+		}
+	} else {
+		args = append(args, "--start-maximized")
 	}
 
 	if opts.stealth {
@@ -192,6 +213,16 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 
 	// Emit the merged disable-features exactly once (see note above).
 	args = append(args, "--disable-features="+strings.Join(disableFeatures, ","))
+
+	if opts.proxyServer != "" {
+		args = append(args,
+			"--proxy-server="+opts.proxyServer,
+			"--proxy-bypass-list=<-loopback>",
+			"--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+	}
+	if opts.quiet {
+		args = append(args, "--disable-background-networking", "--disable-component-update")
+	}
 
 	if opts.softwareGL {
 		// Dedicated Xvfb has no GPU/GLX; force the software path so the GPU
@@ -229,7 +260,8 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 	}
 
 	if opts.startURL != "" {
-		args = append(args, opts.startURL)
+		// "--" ends switch parsing, so the URL can never be read as a flag.
+		args = append(args, "--", opts.startURL)
 	}
 	return args
 }
@@ -313,9 +345,25 @@ func GetCobrowseManager() *CobrowseManager {
 	return cobrowseManager
 }
 
-// findChromium returns the first available Chromium/Chrome binary, reusing the
-// same preference order as platform.OpenURL.
-func findChromium() (string, error) {
+// ErrHeadedBrowserUnsupported refuses the headed, display-bound browser paths
+// on an OS that has no managed display for them.
+var ErrHeadedBrowserUnsupported = fmt.Errorf("headed browser sessions are not supported on this OS")
+
+func refuseHeadedOnThisOS(what string) error {
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("%w: %s needs an X display; use co-browse sessions (COBROWSE_SESSION or citadel local mcp) on Windows", ErrHeadedBrowserUnsupported, what)
+	}
+	return nil
+}
+
+// findChromium returns the first available Chromium/Chrome binary. On Linux and
+// macOS it reuses the same PATH preference order as platform.OpenURL
+// (findChromiumOnPath); on Windows it runs the install-location discovery in
+// cobrowse_discovery.go, because Chrome and Edge are rarely on PATH there.
+func findChromium() (string, error) { return findChromiumForOS() }
+
+// findChromiumOnPath is the historical PATH-only lookup.
+func findChromiumOnPath() (string, error) {
 	for _, name := range []string{"google-chrome", "chromium", "chromium-browser", "chrome"} {
 		if isCommandAvailable(name) {
 			return name, nil
@@ -396,6 +444,12 @@ var managedXvfbMu sync.Mutex
 // a confusing downstream "CDP not ready" timeout. Concurrent-safe: display
 // allocation is serialized under managedXvfbMu.
 func startManagedXvfb(resolution string) (*exec.Cmd, string, error) {
+	return startManagedXvfbWrapped(resolution, nil)
+}
+
+// startManagedXvfbWrapped is startManagedXvfb with an optional argv wrapper
+// (for example a transient systemd scope), applied to the Xvfb command.
+func startManagedXvfbWrapped(resolution string, wrap func([]string) []string) (*exec.Cmd, string, error) {
 	if !isCommandAvailable("Xvfb") {
 		return nil, "", fmt.Errorf(
 			"Xvfb not found: install it (e.g. 'apt-get install xvfb') to run headless co-browse, "+
@@ -405,7 +459,11 @@ func startManagedXvfb(resolution string) (*exec.Cmd, string, error) {
 	defer managedXvfbMu.Unlock()
 	n := findFreeDisplay()
 	display := fmt.Sprintf(":%d", n)
-	cmd := exec.Command("Xvfb", display, "-screen", "0", resolution, "-nolisten", "tcp")
+	argv := []string{"Xvfb", display, "-screen", "0", resolution, "-nolisten", "tcp"}
+	if wrap != nil {
+		argv = wrap(argv)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
@@ -463,8 +521,18 @@ func (m *CobrowseManager) isRunningLocked() bool {
 // session is reused -- co-browse is single-session-per-node by design;
 // multi-session is left as future work. startURL may be empty.
 func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (CobrowseStatus, error) {
+	if err := ValidateCobrowseURL(startURL); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// The legacy single-session browser is headed on an X display, with no
+	// Job Object tying it to this process. Windows uses only the session
+	// manager's headless runner.
+	if err := refuseHeadedOnThisOS("the legacy co-browse browser"); err != nil {
+		return CobrowseStatus{}, err
+	}
 
 	if m.isRunningLocked() {
 		// Reuse the existing browser; optionally navigate if a URL was given
@@ -704,6 +772,9 @@ func (m *CobrowseManager) statusLocked() CobrowseStatus {
 
 // Navigate drives the browser to a URL. Refused while handed off to the human.
 func (m *CobrowseManager) Navigate(url string) (CobrowseStatus, error) {
+	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {
@@ -737,11 +808,7 @@ func (m *CobrowseManager) Screenshot() (string, error) {
 // mirroring td_step.py's connect-act-disconnect model.
 // ---------------------------------------------------------------------------
 
-type cdpTarget struct {
-	Type                 string `json:"type"`
-	URL                  string `json:"url"`
-	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-}
+type cdpTarget = cdpdiscovery.Target
 
 // cdpHTTPClient bounds the CDP HTTP probe so a hung DevTools endpoint cannot
 // block the manager mutex (and thus every subsequent co-browse job) forever.
@@ -753,39 +820,21 @@ func pickTarget(debugPort int) (cdpTarget, error) {
 }
 
 func pickTargetContext(ctx context.Context, debugPort int) (cdpTarget, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json", debugPort), nil)
-	if err != nil {
-		return cdpTarget{}, err
-	}
-	resp, err := cdpHTTPClient.Do(req)
-	if err != nil {
-		return cdpTarget{}, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return cdpTarget{}, err
-	}
-	var targets []cdpTarget
-	if err := json.Unmarshal(body, &targets); err != nil {
-		return cdpTarget{}, err
-	}
-	for _, t := range targets {
-		if t.Type == "page" && t.WebSocketDebuggerURL != "" {
-			return t, nil
-		}
-	}
-	return cdpTarget{}, fmt.Errorf("no page target found on CDP port %d", debugPort)
+	return cdpdiscovery.Discover(ctx, debugPort, cdpHTTPClient)
 }
 
 // cdpCommand opens a WebSocket to the page target, sends one CDP method, and
 // returns the "result" object. id is fixed to 1 since the socket is per-call.
 func cdpCommand(debugPort int, method string, params map[string]any) (map[string]any, error) {
-	target, err := pickTarget(debugPort)
+	return cdpCommandContext(context.Background(), debugPort, method, params)
+}
+
+func cdpCommandContext(ctx context.Context, debugPort int, method string, params map[string]any) (map[string]any, error) {
+	target, err := pickTargetContext(ctx, debugPort)
 	if err != nil {
 		return nil, err
 	}
-	return cdpDialAndSend(target.WebSocketDebuggerURL, method, params)
+	return cdpDialAndSendContext(ctx, target.WebSocketDebuggerURL, method, params)
 }
 
 // cdpDialAndSend opens a WebSocket to wsURL, sends one CDP method, and returns

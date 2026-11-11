@@ -21,15 +21,16 @@ func TestGatedJobRefusalIsTerminalFromFirstAttempt(t *testing.T) {
 		{"native windows", JobTypeShellCommand, "platform_unsupported", "native Windows", LegacyHandlerOpts{GOOS: "windows", ShellEnabled: func() bool { return true }}},
 		{"ios build on linux", JobTypeIOSBuild, "platform_unsupported", "macOS", LegacyHandlerOpts{GOOS: "linux"}},
 		{"ios build on windows", JobTypeIOSBuild, "platform_unsupported", "macOS", LegacyHandlerOpts{GOOS: "windows"}},
-		{"desktop disabled", JobTypeVNCActions, "desktop_disabled", "enable Desktop", LegacyHandlerOpts{DesktopDisabled: true}},
-		{"desktop live disabled", JobTypeFileScreenshot, "desktop_disabled", "enable Desktop", LegacyHandlerOpts{DesktopEnabled: func() bool { return false }}},
-		{"files disabled", JobTypeFileRead, "files_disabled", "enable Files", LegacyHandlerOpts{WorkspaceDir: "fixture", FilesDisabled: true}},
-		{"files live disabled", JobTypeFileReadRangeV1, "files_disabled", "enable Files", LegacyHandlerOpts{WorkspaceDir: "fixture", FilesEnabled: func() bool { return false }}},
+		{"desktop disabled", JobTypeVNCActions, "desktop_disabled", "citadel_set_desktop_permission", LegacyHandlerOpts{DesktopDisabled: true}},
+		{"desktop live disabled", JobTypeFileScreenshot, "desktop_disabled", "citadel_set_desktop_permission", LegacyHandlerOpts{DesktopEnabled: func() bool { return false }}},
+		{"files disabled", JobTypeFileRead, "files_disabled", "citadel_set_files_permission", LegacyHandlerOpts{WorkspaceDir: "fixture", FilesDisabled: true}},
+		{"files live disabled", JobTypeFileReadRangeV1, "files_disabled", "citadel_set_files_permission", LegacyHandlerOpts{WorkspaceDir: "fixture", FilesEnabled: func() bool { return false }}},
 		{"workspace absent", JobTypeFileRead, "workspace_not_configured", "workspace", LegacyHandlerOpts{}},
 		{"upload workspace absent", JobTypeFileWriteBytes, "workspace_not_configured", "workspace", LegacyHandlerOpts{}},
 		{"transcription workspace absent", JobTypeTranscribeAudio, "workspace_not_configured", "workspace", LegacyHandlerOpts{}},
 		{"manifest absent", JobTypeServiceStart, "config_not_configured", "manifest", LegacyHandlerOpts{}},
 		{"meeting disabled", JobTypeHuddleJoin, "meeting_disabled", "meeting capability", LegacyHandlerOpts{MeetingEnabled: func() bool { return false }}},
+		{"meeting join disabled", JobTypeMeetingJoin, "meeting_disabled", "meeting capability", LegacyHandlerOpts{WorkspaceDir: "fixture", MeetingEnabled: func() bool { return false }}},
 		{"fetch config absent", JobTypeFileFetch, "capability_unavailable", "trusted HTTPS", LegacyHandlerOpts{WorkspaceDir: "fixture", FilesEnabled: func() bool { return true }}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -56,6 +57,9 @@ func TestGatedJobRefusalIsTerminalFromFirstAttempt(t *testing.T) {
 			var refusal *jobs.ShellRefusal
 			if !errors.As(stream.erroredErr, &refusal) || refusal.Reason != tc.reason || !strings.Contains(refusal.Message, tc.message) || strings.Contains(refusal.Message, "update the node") {
 				t.Fatalf("wrong typed gate reason: %v", stream.erroredErr)
+			}
+			if strings.Contains(refusal.Message, "must never execute") || strings.Contains(refusal.Message, "/must-not-read") {
+				t.Fatal("gate refusal included job payload content")
 			}
 			var encoded map[string]string
 			if err := json.Unmarshal([]byte(stream.erroredErr.Error()), &encoded); err != nil || encoded["reason"] != tc.reason {
@@ -137,7 +141,7 @@ func TestRegistrationRefusalsTrackLiveOverridesWithoutGrantingWork(t *testing.T)
 }
 
 func TestLegacyPermissionRevocationAfterSelectionIsTerminal(t *testing.T) {
-	for _, jobType := range []string{JobTypeShellCommand, JobTypeFileRead, JobTypeVNCActions} {
+	for _, jobType := range []string{JobTypeShellCommand, JobTypeFileRead, JobTypeVNCActions, JobTypeMeetingJoin} {
 		t.Run(jobType, func(t *testing.T) {
 			calls := 0
 			legacy := &TestLegacyHandler{output: `{"success":true}`}

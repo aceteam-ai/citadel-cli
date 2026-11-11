@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Citadel viewer</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header class="top">
+  <strong>Citadel</strong> <span class="muted">local co-browse on this computer</span>
+  <span id="agent-line" class="muted right"></span>
+</header>
+<nav id="tabs"></nav>
+<main id="empty" class="empty">No browser sessions yet. Ask your agent to start one.</main>
+<main id="session" hidden>
+  <section class="task">
+    <div class="goal" id="session-goal"></div>
+    <div class="facts">
+      <span id="session-driver" class="pill"></span>
+      <span id="session-domain"></span>
+      <span id="session-grant" class="muted"></span>
+    </div>
+  </section>
+  <div id="waiting" class="banner" hidden></div>
+  <section id="approval" class="card" hidden>
+    <p>Allow this agent to click, type and navigate in this session for
+      <select id="approve-hours">
+        <option value="24">24 hours</option>
+        <option value="8">8 hours</option>
+        <option value="1">1 hour</option>
+      </select>?</p>
+    <p class="muted" id="approval-domain"></p>
+    <button id="approve" class="primary">Approve</button>
+    <button id="deny">Deny</button>
+  </section>
+  <div class="controls">
+    <button id="drive" class="primary"></button>
+    <input id="address" type="text" spellcheck="false" autocomplete="off" aria-label="Address">
+    <button id="revoke" class="quiet" hidden>Revoke approval</button>
+    <button id="stop" class="quiet danger">End session</button>
+  </div>
+  <div id="screen-wrap" tabindex="0">
+    <img id="screen" alt="Live view of the browser session" draggable="false">
+  </div>
+  <p id="hint" class="muted"></p>
+  <section class="activity">
+    <h2>Activity</h2>
+    <p class="muted">Every action in this session, recorded on this computer. What you type is never recorded.</p>
+    <ol id="activity"></ol>
+  </section>
+</main>
+<script src="/assets/app.js"></script>
+</body>
+</html>

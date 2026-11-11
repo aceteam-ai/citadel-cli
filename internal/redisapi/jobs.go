@@ -3,10 +3,14 @@ package redisapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 )
 
 // ConsumeJob reads the next available job from the queue.
@@ -19,10 +23,34 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 	reqCtx, cancel := context.WithTimeout(ctx, blockTimeout)
 	defer cancel()
 
+	if req.Protocol != "" && req.Protocol != DurableResultsProtocol {
+		return nil, ErrDurableDelivery
+	}
+	if cached, ok := c.consumeProtocols.Load(req.Queue); ok && req.Protocol == "" && cached.(bool) {
+		req.Protocol = DurableResultsProtocol
+	}
+	originalGroup := req.Group
 	var resp ConsumeResponse
-	err := c.doRequestWithTimeout(reqCtx, http.MethodPost, "/api/fabric/redis/jobs/consume", req, &resp, blockTimeout)
-	if err != nil {
-		return nil, err
+	for attempt := 0; attempt < 2; attempt++ {
+		if req.Protocol == DurableResultsProtocol {
+			req.Group = DurableConsumerGroup
+		} else {
+			req.Group = originalGroup
+		}
+		resp = ConsumeResponse{}
+		err := c.doRequestWithTimeout(reqCtx, http.MethodPost, "/api/fabric/redis/jobs/consume", req, &resp, blockTimeout)
+		if err == nil {
+			c.consumeProtocols.Store(req.Queue, req.Protocol == DurableResultsProtocol)
+			break
+		}
+		if !errors.Is(err, errQueueProtocolMismatch) || attempt == 1 {
+			return nil, err
+		}
+		if req.Protocol == DurableResultsProtocol {
+			req.Protocol = ""
+		} else {
+			req.Protocol = DurableResultsProtocol
+		}
 	}
 
 	if len(resp.Messages) == 0 {
@@ -32,7 +60,29 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 	// Convert the first StreamMessage to a Job
 	msg := resp.Messages[0]
 	msg.Data.observation = msg.Data.observation.WithSource(req.Queue, req.Group, "redis-api")
-	return ParseStreamMessage(msg)
+	metadata := msg.Data.observation.State() != deliverymetadata.Absent
+	if msg.Data.deliveryMetadata != nil {
+		metadata = metadata || msg.Data.deliveryMetadata().present
+	}
+	job, err := ParseStreamMessage(msg)
+	if err != nil {
+		if metadata || req.Protocol == DurableResultsProtocol {
+			return nil, ErrDurableDelivery
+		}
+		return nil, err
+	}
+	// Repeated containers cannot erase the whole-response refusal marker.
+	job.durableMetadata = metadata
+	if req.Protocol == DurableResultsProtocol {
+		if len(resp.Messages) != 1 {
+			return nil, ErrDurableDelivery
+		}
+		job.delivery, err = adoptHTTPClaim(msg, req)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return job, nil
 }
 
 // ParseStreamMessage converts a StreamMessage to a Job.
@@ -124,4 +174,27 @@ func (c *Client) doRequestWithTimeout(ctx context.Context, method, path string, 
 	client := *c.httpClient
 	client.Timeout = timeout
 	return c.doRequestWithClient(&client, ctx, method, path, body, result)
+}
+
+// MaxTerminalResultBytes mirrors the proxy's cap on a retained terminal
+// envelope. A larger envelope is refused client-side, never truncated.
+const MaxTerminalResultBytes = 5 * 1024 * 1024
+
+// RetainTerminalResult stores a job's terminal envelope through the scoped
+// POST /api/fabric/redis/jobs/{jobId}/result route (SET NX EX on the server,
+// assigned node only). It reports whether the server stored it; false means a
+// result already existed (first writer wins).
+func (c *Client) RetainTerminalResult(ctx context.Context, jobID string, envelope []byte, ttl time.Duration) (bool, error) {
+	if len(envelope) > MaxTerminalResultBytes {
+		return false, fmt.Errorf("terminal envelope is %d bytes, over the %d byte limit; not retained", len(envelope), MaxTerminalResultBytes)
+	}
+	body := map[string]any{"envelope": string(envelope), "ttl_seconds": int(ttl / time.Second)}
+	var resp struct {
+		Stored bool `json:"stored"`
+	}
+	path := "/api/fabric/redis/jobs/" + url.PathEscape(jobID) + "/result"
+	if err := c.doRequest(ctx, http.MethodPost, path, body, &resp); err != nil {
+		return false, err
+	}
+	return resp.Stored, nil
 }

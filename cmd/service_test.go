@@ -80,7 +80,7 @@ func TestComposeCommandInjectsWorkspaceEnv(t *testing.T) {
 // internal/jobs TestComposeEnv_NoWorkspaceLeavesEnvUntouched.
 func TestComposeEnvWorkspaceDefaultsAndNeverEmpty(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir
 	t.Setenv("CITADEL_WORKSPACE", "")
 

@@ -32,3 +32,6 @@ func validateCobrowseBaseDirPerms(dir string, info os.FileInfo) error {
 	}
 	return nil
 }
+
+// secureNewCobrowseBaseDir is a no-op on Unix: the dir was just created 0o700.
+func secureNewCobrowseBaseDir(string) error { return nil }
