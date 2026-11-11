@@ -609,6 +609,9 @@ func buildMeetingChromeArgs(debugPort int, profileDir string) []string {
 // profile, routing its audio into the meeting's null sink. It blocks until the
 // CDP endpoint is ready so the first Navigate does not race the launch.
 func (b *MeetingBrowser) Start() error {
+	if err := refuseHeadedOnThisOS("the meeting browser"); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

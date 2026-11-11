@@ -45,7 +45,7 @@ const machineStatePointerFile = "state-dir"
 func GetStateDir() string {
 	// Check before constructing inputs: production discovery performs I/O even
 	// when resolveStateDir would subsequently choose a different input.
-	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+	if fixture := stateScope(); fixture != nil {
 		return filepath.Join(fixture.node, "network")
 	}
 	return resolveStateDir(stateDirInputs{
@@ -299,7 +299,7 @@ func getUserHomeDir() string {
 // init writes) resolves to ~/.citadel-cli when non-root, which the machine-wide
 // /etc/citadel read alone would miss — a source of the state-dir divergence.
 func getNodeConfigDirFromGlobalConfig() string {
-	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+	if fixture := stateScope(); fixture != nil {
 		return fixture.node
 	}
 	candidates := []string{
@@ -349,7 +349,7 @@ func candidateOwnerHomes() []string {
 
 // getGlobalConfigDirForState returns the global config directory path
 func getGlobalConfigDirForState() string {
-	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+	if fixture := stateScope(); fixture != nil {
 		return fixture.machine
 	}
 	switch runtime.GOOS {
@@ -462,7 +462,7 @@ func resolveChownTargetWith(currentUID int, sudoUser string, lookupFn func(strin
 func fixStateDirOwnership(stateDir string) {
 	// Fixture ownership belongs to the test invoker. Do not resolve/chown to a
 	// real service account when a root-run test creates disposable state.
-	if stateDirectoriesForTests.Load() != nil {
+	if stateScope() != nil {
 		return
 	}
 	uid, gid, ok := resolveChownTarget()

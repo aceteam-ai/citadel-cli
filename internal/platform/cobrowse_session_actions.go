@@ -23,6 +23,18 @@ type ExtractResult struct {
 	// Element.getAttribute's null-to-caller contract), not a missing key --
 	// so a caller can distinguish "asked for, absent" from "never asked for".
 	Attrs map[string]string `json:"attrs,omitempty"`
+	// Truncated is true when ExtractBounded cut Text at its character limit.
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// ErrPasswordValue refuses an extract that asks for the value of a password
+// field. Typed credentials must never travel back to the agent.
+var ErrPasswordValue = fmt.Errorf("refusing to read the value of a password field")
+
+// PageState is the current document's URL and readyState.
+type PageState struct {
+	URL        string `json:"url"`
+	ReadyState string `json:"ready_state"`
 }
 
 type SelectResult struct {
@@ -85,10 +97,14 @@ func (s *cobrowseSession) requireDrivablePort() (int, error) {
 // sessionForAction resolves a session by id for an action call, mirroring the
 // "no such browser session" error the job handler already surfaces for status.
 func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, error) {
+	m.Recover()
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	m.mu.Unlock()
 	if !ok {
+		if e, ended := m.EndedSession(id); ended {
+			return nil, &SessionEndedError{ID: id, Reason: e.Reason, Detail: e.Detail}
+		}
 		return nil, fmt.Errorf("no such browser session: %q", id)
 	}
 	return s, nil
@@ -97,6 +113,9 @@ func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, 
 // Navigate drives one session's browser to a URL. Refused while the session is
 // handed off to a human (ErrHandedOff).
 func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus, error) {
+	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
 	s, err := m.sessionForAction(id)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
@@ -109,6 +128,41 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 		// refused write).
 		return CobrowseSessionStatus{}, err
 	}
+	if _, err := cdpCommand(port, "Page.navigate", map[string]any{"url": url}); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	return s.status(), nil
+}
+
+// NavigateAsHuman navigates on behalf of the human who has taken control (the
+// local viewer's address bar). It is the one navigation allowed while handed
+// off, and it requires the handoff: the explicit-handoff bit stays set, so the
+// agent stays blocked throughout.
+func (m *CobrowseSessionManager) NavigateAsHuman(id, url string) (CobrowseSessionStatus, error) {
+	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	s.mu.Lock()
+	if s.proc == nil {
+		s.mu.Unlock()
+		return CobrowseSessionStatus{}, ErrNotStarted
+	}
+	select {
+	case <-s.proc.exited:
+		s.mu.Unlock()
+		return CobrowseSessionStatus{}, ErrNotStarted
+	default:
+	}
+	if !s.humanDrivingLocked() {
+		s.mu.Unlock()
+		return CobrowseSessionStatus{}, fmt.Errorf("the user has not taken control of this session")
+	}
+	port := s.proc.debugPort
+	s.mu.Unlock()
 	if _, err := cdpCommand(port, "Page.navigate", map[string]any{"url": url}); err != nil {
 		return CobrowseSessionStatus{}, err
 	}
@@ -353,6 +407,90 @@ func (m *CobrowseSessionManager) Extract(id, selector string, attrs []string) (E
 	return extractElement(port, selector, attrs)
 }
 
+// ExtractBounded is Extract with the text cut to maxChars inside the page (so an
+// oversized document never crosses CDP whole) and Truncated reported. It refuses
+// to return a "value" attribute from a password input. maxChars <= 0 means no
+// limit.
+func (m *CobrowseSessionManager) ExtractBounded(id, selector string, attrs []string, maxChars int) (ExtractResult, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return ExtractResult{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return ExtractResult{}, err
+	}
+	if attrs == nil {
+		attrs = []string{}
+	}
+	attrsJSON, err := json.Marshal(attrs)
+	if err != nil {
+		return ExtractResult{}, err
+	}
+	expr := fmt.Sprintf(`(function(){
+		var el = document.querySelector(%s);
+		if (!el) return null;
+		var names = %s;
+		var isPassword = (el instanceof HTMLInputElement) && String(el.type).toLowerCase() === "password";
+		for (var i = 0; i < names.length; i++) {
+			if (isPassword && String(names[i]).toLowerCase() === "value") return {password: true};
+		}
+		var attrs = {};
+		for (var j = 0; j < names.length; j++) {
+			attrs[names[j]] = el.getAttribute(names[j]) || "";
+		}
+		var text = (el.innerText !== undefined ? el.innerText : el.textContent) || "";
+		var max = %d;
+		var truncated = false;
+		if (max > 0 && text.length > max) { text = text.slice(0, max); truncated = true; }
+		return {text: text, attrs: attrs, truncated: truncated};
+	})()`, jsStringLiteral(selector), string(attrsJSON), maxChars)
+	val, err := runtimeEvaluate(port, expr)
+	if err != nil {
+		return ExtractResult{}, err
+	}
+	obj, ok := val.(map[string]any)
+	if !ok {
+		return ExtractResult{}, fmt.Errorf("no element matches selector %q", selector)
+	}
+	if pw, _ := obj["password"].(bool); pw {
+		return ExtractResult{}, ErrPasswordValue
+	}
+	text, _ := obj["text"].(string)
+	truncated, _ := obj["truncated"].(bool)
+	result := ExtractResult{Text: text, Truncated: truncated}
+	if rawAttrs, ok := obj["attrs"].(map[string]any); ok && len(rawAttrs) > 0 {
+		result.Attrs = make(map[string]string, len(rawAttrs))
+		for k, v := range rawAttrs {
+			if sv, ok := v.(string); ok {
+				result.Attrs[k] = sv
+			}
+		}
+	}
+	return result, nil
+}
+
+// PageState reads the session's current URL and document.readyState. It is an
+// agent read, so it is refused while a human drives, like screenshot.
+func (m *CobrowseSessionManager) PageState(id string) (PageState, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return PageState{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return PageState{}, err
+	}
+	val, err := runtimeEvaluate(port, `({url: location.href, ready: document.readyState})`)
+	if err != nil {
+		return PageState{}, err
+	}
+	obj, _ := val.(map[string]any)
+	u, _ := obj["url"].(string)
+	r, _ := obj["ready"].(string)
+	return PageState{URL: u, ReadyState: r}, nil
+}
+
 // Handoff sets the STICKY explicit-handoff bit on one session (see the package
 // doc comment's two-bit explanation), refusing subsequent agent-scripted
 // actions even across a transient viewer disconnect -- the mid-2FA case.
@@ -370,6 +508,7 @@ func (m *CobrowseSessionManager) Handoff(id string) (CobrowseSessionStatus, erro
 	}
 	s.explicitHandoff = true
 	s.mu.Unlock()
+	s.persistRecord()
 	return s.status(), nil
 }
 
@@ -387,6 +526,7 @@ func (m *CobrowseSessionManager) Resume(id string) (CobrowseSessionStatus, error
 	}
 	s.explicitHandoff = false
 	s.mu.Unlock()
+	s.persistRecord()
 	return s.status(), nil
 }
 

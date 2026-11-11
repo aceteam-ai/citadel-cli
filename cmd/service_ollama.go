@@ -9,6 +9,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 
 	svcports "github.com/aceteam-ai/citadel-cli/services"
@@ -24,8 +25,15 @@ func composeEnvForStrictServiceStart(serviceName string, service Service, bindEn
 	if _, err := svcports.OllamaMaxLoadedModelsComposeEnv(nil, serviceName, service.OllamaMaxLoadedModels); err != nil {
 		return nil, err
 	}
+	if _, err := svcports.OllamaKeepAliveComposeEnv(nil, serviceName, service.OllamaKeepAlive); err != nil {
+		return nil, err
+	}
 	env := append(composeEnv(), bindEnvEntries(bindEnv)...)
 	env, err := svcports.OllamaMaxLoadedModelsComposeEnv(env, serviceName, service.OllamaMaxLoadedModels)
+	if err != nil {
+		return nil, err
+	}
+	env, err = svcports.OllamaKeepAliveComposeEnv(env, serviceName, service.OllamaKeepAlive)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +51,25 @@ func composeEnvForStrictServiceStart(serviceName string, service Service, bindEn
 // take effect (pin `type: docker` to apply it), rather than silent unlimited
 // residency on a memory-tight node.
 func warnIfOllamaPolicyIgnoredNative(service Service) {
+	if service.Name == "ollama" && service.OllamaKeepAlive != nil {
+		fmt.Printf("   ⚠️  ollama_keep_alive is set but %s resolved to native (no compose to inject into); pin `type: docker` in citadel.yaml to apply OLLAMA_KEEP_ALIVE\n", service.Name)
+	}
 	if service.Name == "ollama" && service.OllamaMaxLoadedModels != nil {
 		fmt.Printf("   ⚠️  ollama_max_loaded_models is set but %s resolved to native (no compose to inject into); pin `type: docker` in citadel.yaml to apply OLLAMA_MAX_LOADED_MODELS\n", service.Name)
 	}
+}
+
+// startOllamaPreload kicks off the #1560 best-effort, bounded, asynchronous
+// model preload after ollama's compose-up succeeded. Never blocks or fails the
+// start.
+func startOllamaPreload(serviceName string, service Service) {
+	if serviceName != "ollama" || len(service.OllamaPreload) == 0 {
+		return
+	}
+	keepAlive := ""
+	if service.OllamaKeepAlive != nil {
+		keepAlive = *service.OllamaKeepAlive
+	}
+	models := append([]string(nil), service.OllamaPreload...)
+	go svcports.PreloadOllamaModels(context.Background(), nil, svcports.OllamaPreloadURL, models, keepAlive, Log)
 }

@@ -131,3 +131,40 @@ func TestUnknownGPUKeepsBothExistingFlavorsAndSkipsBootRewrite(t *testing.T) {
 		t.Fatal("sweep seam was not called")
 	}
 }
+
+func TestUnknownGPUCanonicalBootStartMaterializesMissingFile(t *testing.T) {
+	t.Setenv("CITADEL_NODE_DIR", "")
+	for _, name := range []string{"ollama", "llamacpp"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "services", name+".yml")
+		if err := reconcileHostComposeForStart(name, path, func() int { return -1 }); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != services.ServiceMap[name] || !services.ComposeDeclaresNvidiaReservation(string(got)) {
+			t.Fatal("missing boot compose was not materialized", name, err)
+		}
+	}
+}
+
+func TestUnknownGPUBootMaterializesBeforeSameVersionSweep(t *testing.T) {
+	dir := writeManifestWithServices(t, nil)
+	t.Setenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE", "1")
+	called := false
+	refreshManagedComposeFilesWithSweep(dir, func(opts composerefresh.Options) (composerefresh.Result, error) {
+		called = true
+		for _, name := range []string{"ollama", "llamacpp"} {
+			got, err := os.ReadFile(filepath.Join(dir, "services", name+".yml"))
+			if err != nil || string(got) != services.ServiceMap[name] {
+				t.Fatal("missing compose must exist before sweep fast path", name, err)
+			}
+			if _, ok := opts.Embedded[name]; ok {
+				t.Fatal("uncertain existing file offered for refresh")
+			}
+		}
+		return composerefresh.Result{Skipped: true}, nil
+	}, func() int { return -1 })
+	if !called {
+		t.Fatal("sweep not invoked")
+	}
+}

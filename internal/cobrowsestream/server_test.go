@@ -401,6 +401,61 @@ func TestViewerInputForwardedToCDP(t *testing.T) {
 	}
 }
 
+func TestViewerPasteRequiresCurrentHumanControl(t *testing.T) {
+	f := newFakeChrome()
+	defer f.close()
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-paste")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	sendPaste := func(text string, check int) {
+		t.Helper()
+		data, _ := json.Marshal(InputMessage{Type: "paste", Text: text})
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			t.Fatal(err)
+		}
+		sess.waitInputChecks(t, check)
+	}
+	sendPaste("must not paste while observing", 1)
+	sess.setHumanControl(true)
+	sendPaste("human text\ncafé 🌏", 2)
+	sess.setHumanControl(false)
+	sendPaste("must not paste after handback", 3)
+	sess.setHumanControl(true)
+	// This final accepted message orders all earlier input/CDP writes before the assertion.
+	sendPaste("final marker", 4)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		f.mu.Lock()
+		pastes := append([]string(nil), f.pastes...)
+		keyCount := len(f.keys)
+		f.mu.Unlock()
+		if len(pastes) >= 2 {
+			if len(pastes) != 2 || pastes[0] != "human text\ncafé 🌏" || pastes[1] != "final marker" {
+				t.Fatal("paste did not preserve text or the current human-control boundary")
+			}
+			if keyCount != 0 {
+				t.Fatal("paste must use Input.insertText, not keyboard shortcuts")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("accepted paste did not reach CDP Input.insertText")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestViewerNativeSelectUsesPageInsteadOfPopupClicks(t *testing.T) {
 	f := newFakeChrome()
 	probes := 0

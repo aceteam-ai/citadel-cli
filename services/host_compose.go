@@ -94,3 +94,17 @@ func ComposeMapForRefresh(goos string, gpuCount func() int) map[string]string {
 	}
 	return selected
 }
+
+// ComposeRefreshPlan separates files eligible for versioned refresh from the
+// default templates that may only fill absent files under unknown GPU evidence.
+// The probe is sampled once by ComposeMapForRefresh.
+func ComposeRefreshPlan(goos string, gpuCount func() int) (map[string]string, map[string]string) {
+	refresh := ComposeMapForRefresh(goos, gpuCount)
+	missingOnly := make(map[string]string)
+	for _, name := range []string{"ollama", "llamacpp"} {
+		if _, refreshable := refresh[name]; !refreshable {
+			missingOnly[name] = ServiceMap[name]
+		}
+	}
+	return refresh, missingOnly
+}
