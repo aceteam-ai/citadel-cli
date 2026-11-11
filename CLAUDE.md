@@ -4440,6 +4440,20 @@ non-persistent sessions running on the worker's shutdown signal; a permanent
 sweeps them. Windows is unchanged: its kill-on-close Job Object ends sessions on
 any restart, and a breakaway job is a tracked follow-up.
 
+Detach rules added after review: `platform.StartManagedCobrowse` is the one
+startup call (enable the managed-worker mark, THEN recover); only a
+resolver-backed node manager of the marked worker sets `LaunchOptions.Detach`,
+so local mode and `citadel mcp` always launch directly. A non-worker `Recover`
+leaves a live scoped record and its dir alone. Scope names are validated
+(`validScopeName`, unit is the leaf cgroup component, `--` before the unit)
+before any `systemctl` call. A scoped session outlives a permanent `systemctl
+stop` for at most `CITADEL_COBROWSE_DETACH_GRACE_SECONDS` (default 900, measured
+from the record's last write); after that it is refused and swept, and status
+carries that window as the ended detail. The first failed scoped launch makes
+later launches direct for the process. `INVOCATION_ID` can be inherited by
+desktop terminals, so an interactive `citadel work` started from one is treated
+as the managed worker and detaches its sessions.
+
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
 stub on `!linux`) is the authority for "is a managed citadel service running
 **on this host**", not "is *this process* service-managed". It scans the

@@ -85,6 +85,10 @@ type LaunchOptions struct {
 	// Quiet turns off the browser's own background networking and component
 	// updates, so a session only makes the connections its pages need.
 	Quiet bool
+	// Detach asks for the browser and Xvfb to run in their own systemd scopes so
+	// they outlive a service restart. Only the node-wide manager of the managed
+	// worker sets it; everything else launches directly.
+	Detach bool
 }
 
 // devToolsActivePortFile is where a browser launched with
@@ -228,6 +232,9 @@ func (xvfbRunner) SweepOrphans(baseDir string) { sweepXvfbSessions(baseDir) }
 // Mirrors MeetingBrowser.Start's teardown-on-partial-failure, but the profile is
 // throwaway so a failed launch removal is handled by the caller.
 func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
+	if !lo.Detach {
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
 	plan, reason := planCobrowseScope()
 	if plan == nil {
 		logScopeFailOpen(reason)
@@ -237,6 +244,7 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 	if err != nil {
 		// Fail open like tmux: a scope the manager refuses must not cost the
 		// session. Retry once as a direct child (it then dies with a restart).
+		scopeBroken.Store(true)
 		logScopeFailOpen("scoped launch failed: " + err.Error())
 		return launchXvfbAttempt(profileDir, startURL, lo, nil)
 	}

@@ -407,6 +407,13 @@ func verifyDetachedOwner(rec sessionRecord) error {
 	if rec.BrowserScope == "" {
 		return fmt.Errorf("session was not launched in a detachable scope")
 	}
+	if !validScopeName(rec.ID, "browser", rec.BrowserScope) ||
+		(rec.XvfbPID > 0 && !validScopeName(rec.ID, "xvfb", rec.XvfbScope)) {
+		return fmt.Errorf("record names an unexpected scope")
+	}
+	if !withinDetachGrace(rec) {
+		return fmt.Errorf("owner has been gone longer than the %s detach grace", detachGrace())
+	}
 	if rec.OwnerUID == nil || *rec.OwnerUID != os.Getuid() {
 		return fmt.Errorf("record was written by a different OS user")
 	}
@@ -424,12 +431,22 @@ func verifyDetachedOwner(rec sessionRecord) error {
 
 // stopRecordScopes stops the scopes a record names, identity-checked.
 func stopRecordScopes(rec sessionRecord) {
-	if rec.XvfbScope != "" {
+	if validScopeName(rec.ID, "browser", rec.BrowserScope) {
 		_ = stopScope(rec.ScopeUser, rec.BrowserScope, rec.BrowserPID, rec.BrowserStart)
-		_ = stopScope(rec.ScopeUser, rec.XvfbScope, rec.XvfbPID, rec.XvfbStart)
-		return
 	}
-	_ = stopScope(rec.ScopeUser, rec.BrowserScope, rec.BrowserPID, rec.BrowserStart)
+	if validScopeName(rec.ID, "xvfb", rec.XvfbScope) {
+		_ = stopScope(rec.ScopeUser, rec.XvfbScope, rec.XvfbPID, rec.XvfbStart)
+	}
+}
+
+// scopedSurvivor reports whether a dead-owner record is a scoped session still
+// alive in its recorded scope with a matching start time, within the grace.
+func scopedSurvivor(rec sessionRecord) bool {
+	if !validScopeName(rec.ID, "browser", rec.BrowserScope) || !withinDetachGrace(rec) {
+		return false
+	}
+	st, alive, err := procIdentity(rec.BrowserPID)
+	return err == nil && alive && st == rec.BrowserStart && inScope(rec.BrowserPID, rec.BrowserScope)
 }
 
 // adoptedProc builds a cobrowseProc around already-running processes. Its
@@ -537,6 +554,12 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			}
 		}
 		dir := filepath.Join(m.baseDir, rec.ID)
+		// Not the managed worker: a scoped session that is still alive in its own
+		// scope belongs to the worker that is about to restart. Leave it alone.
+		if !detachedWorker.Load() && scopedSurvivor(rec) {
+			sweepProtected.Store(dir, struct{}{})
+			continue
+		}
 		err := verifyAdoptable(m.baseDir, dir, rec)
 		if errors.Is(err, errCDPCheck) { // a slow endpoint must not expire a healthy session
 			time.Sleep(500 * time.Millisecond)

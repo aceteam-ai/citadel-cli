@@ -536,7 +536,9 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Re-adopt co-browse sessions that survived a restart by exec (citadel-cli#1546)
 	// before anything can sweep them; sessions that fail verification are reaped.
-	platform.GetCobrowseSessionManager().Recover()
+	// StartManagedCobrowse marks this process as the managed worker first, because
+	// recovery decides on that mark whether to re-adopt a dead owner's sessions.
+	platform.StartManagedCobrowse()
 
 	// Setup signal handling. The first signal cancels the root context so every
 	// subsystem (worker runner, status/terminal/gateway servers, heartbeat,
@@ -545,10 +547,6 @@ func runWork(cmd *cobra.Command, args []string) {
 	// shutdown does not complete within the grace period, and a second signal
 	// force-exits immediately — so a misbehaving goroutine can never leave an
 	// orphaned node holding the VPN identity or the terminal-server port.
-	// Under a service manager, co-browse sessions run in their own scopes and
-	// outlive a service restart; this worker re-adopts them on the next start
-	// (citadel-cli#1546). A no-op for an interactive run.
-	platform.EnableDetachedCobrowse()
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

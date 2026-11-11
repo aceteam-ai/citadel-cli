@@ -384,6 +384,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	m.mu.Lock()
 	lo := m.launchOpts
 	m.mu.Unlock()
+	lo.Detach = m.useResolver && detachedWorker.Load()
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
 		return nil, err
