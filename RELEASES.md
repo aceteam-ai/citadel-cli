@@ -3651,3 +3651,18 @@ Auto-generated log of every release.
   - fix(local): accept a UTF-8 BOM in agent config files for local config --write (#1611)
 
 
+---
+
+## v2.218.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 19 |
+| Lines added | +1618 |
+
+**Changes:**
+
+  - fix(cobrowse): survive self-update restart; defer while a human is involved (#1546) (#1614)
+
+
