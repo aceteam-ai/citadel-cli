@@ -3666,3 +3666,18 @@ Auto-generated log of every release.
   - fix(cobrowse): survive self-update restart; defer while a human is involved (#1546) (#1614)
 
 
+---
+
+## v2.219.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 16 |
+| Lines added | +1333 |
+
+**Changes:**
+
+  - feat(local): guided setup page and Windows double-click launch (#1615 slice 1) (#1618)
+
+
