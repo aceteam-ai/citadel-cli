@@ -3681,3 +3681,20 @@ Auto-generated log of every release.
   - feat(local): guided setup page and Windows double-click launch (#1615 slice 1) (#1618)
 
 
+---
+
+## v2.220.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 8 |
+| Lines added | +532 |
+
+**Changes:**
+
+  - Merge remote-tracking branch 'origin/main'
+  - fix(cobrowse): navigate waits to settle and returns the final URL and title (#1613) (#1619)
+  - fix(cobrowse): wait for selector click target to settle (#1552)
+
+
