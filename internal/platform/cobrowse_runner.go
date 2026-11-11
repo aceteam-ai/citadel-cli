@@ -228,6 +228,23 @@ func (xvfbRunner) SweepOrphans(baseDir string) { sweepXvfbSessions(baseDir) }
 // Mirrors MeetingBrowser.Start's teardown-on-partial-failure, but the profile is
 // throwaway so a failed launch removal is handled by the caller.
 func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
+	plan, reason := planCobrowseScope()
+	if plan == nil {
+		logScopeFailOpen(reason)
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
+	proc, err := launchXvfbAttempt(profileDir, startURL, lo, plan)
+	if err != nil {
+		// Fail open like tmux: a scope the manager refuses must not cost the
+		// session. Retry once as a direct child (it then dies with a restart).
+		logScopeFailOpen("scoped launch failed: " + err.Error())
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
+	return proc, nil
+}
+
+// launchXvfbAttempt starts one session, in transient scopes when plan is set.
+func launchXvfbAttempt(profileDir, startURL string, lo LaunchOptions, plan *scopePlan) (*cobrowseProc, error) {
 	chrome, err := findChromium()
 	if err != nil {
 		return nil, err
@@ -238,9 +255,20 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 		return nil, err
 	}
 
+	sessionID := filepath.Base(profileDir)
+	if plan != nil && !sessionIDPattern.MatchString(sessionID) {
+		plan = nil
+	}
+	var xvfbUnit, browserUnit string
+	var wrapXvfb func([]string) []string
+	if plan != nil {
+		xvfbUnit, browserUnit = plan.unit(sessionID, "xvfb"), plan.unit(sessionID, "browser")
+		wrapXvfb = func(a []string) []string { return plan.wrap(xvfbUnit, a) }
+	}
+
 	// startManagedXvfb serializes display allocation internally, so concurrent
 	// launches never collide on one virtual display.
-	xvfb, display, err := startManagedXvfb(xvfbResolution())
+	xvfb, display, err := startManagedXvfbWrapped(xvfbResolution(), wrapXvfb)
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +286,11 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 		quiet:       lo.Quiet,
 	})
 
-	cmd := exec.Command(chrome, args...)
+	argv := append([]string{chrome}, args...)
+	if plan != nil {
+		argv = plan.wrap(browserUnit, argv)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = withDisplay(os.Environ(), display)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -289,9 +321,29 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 		browserPID: pidOf(cmd),
 		xvfbPID:    pidOf(xvfb),
 		exited:     exited,
-		stop: func() error {
-			return stopBrowserProc(cmd, exited, xvfb, xvfbExited)
-		},
+	}
+	var bStart, xStart uint64
+	if plan != nil {
+		proc.browserScope, proc.xvfbScope, proc.scopeUser = browserUnit, xvfbUnit, plan.user
+		bStart, _, _ = procIdentity(proc.browserPID)
+		xStart, _, _ = procIdentity(proc.xvfbPID)
+	}
+	proc.stop = func() error {
+		// Browser scope first, then Xvfb, each only while the recorded process
+		// still lives in it; the handle kill below is the backstop.
+		var serr error
+		if plan != nil {
+			if err := stopScope(plan.user, browserUnit, proc.browserPID, bStart); err != nil {
+				serr = err
+			}
+			if err := stopScope(plan.user, xvfbUnit, proc.xvfbPID, xStart); err != nil && serr == nil {
+				serr = err
+			}
+		}
+		if err := stopBrowserProc(cmd, exited, xvfb, xvfbExited); err != nil {
+			return err
+		}
+		return serr
 	}
 
 	if err := waitForCDPReady(debugPort, 20*time.Second); err != nil {

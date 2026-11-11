@@ -109,6 +109,10 @@ type cobrowseProc struct {
 	browser    string
 	browserPID int
 	xvfbPID    int
+	// browserScope and xvfbScope name the transient systemd scopes the processes
+	// run in (empty when launched directly); scopeUser says which manager owns them.
+	browserScope, xvfbScope string
+	scopeUser               bool
 	// exited is closed by the reaper when the browser process terminates, so status
 	// can report SessionExited for a crashed session rather than a bare running=false.
 	exited <-chan struct{}

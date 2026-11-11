@@ -4413,11 +4413,32 @@ stale). A live record that fails becomes `expired` with its `ended_reason`, neve
 a silent delete; suspended records are never touched. Adoption is Linux only
 (`adoptionSupported`); elsewhere it stops sessions cleanly.
 Only the node-wide manager adopts, and only a record whose owner is this very
-process (same PID and start time, as after exec); local mode and a live sibling's
+process (same PID and start time, as after exec) or, for a full service restart,
+one that passes `platform.verifyDetachedOwner`; local mode and a live sibling's
 records are never adopted or modified. Persistent-profile sessions are sealed and
 stopped by `prepareSelfRestart` on every OS, and ended reasons are recorded on
-every OS. A full service restart (control-group kill)
-still kills browsers; detaching them is separate work.
+every OS.
+
+**Surviving a full service restart (Linux, citadel-cli#1546 item 2).**
+`platform.planCobrowseScope` owns the detach decision and mirrors
+`tmux.PersistentSessionCommand` (#1166): `launchXvfbCobrowseProc` starts each
+session's Xvfb and browser in their own uniquely named transient scope
+(user manager for a user unit, system manager only for a root system unit), so
+the default control-group kill leaves them running. Every other context, or a
+scoped launch that fails, retries as a direct child and logs once; that session
+then dies with a restart as before. The scope names ride in the registry record.
+`verifyDetachedOwner` owns the extra rule for a record whose owner is gone: the
+process is the managed worker (`platform.EnableDetachedCobrowse`, called by
+`runWork`, requires a service manager's `INVOCATION_ID`), the record is from the
+same OS user, the browser and Xvfb are alive in the recorded scopes, and the
+usual start-time, role and CDP checks pass. Any other process, including local
+mode, sweeps such a record instead. `stopScope` is the only way scopes are
+stopped (stop, failed adoption, sweep) and acts only while the recorded PID
+still has its recorded start time and cgroup. `ShutdownSessions` leaves scoped,
+non-persistent sessions running on the worker's shutdown signal; a permanent
+`systemctl stop` therefore leaves them until the next worker start re-adopts or
+sweeps them. Windows is unchanged: its kill-on-close Job Object ends sessions on
+any restart, and a breakaway job is a tracked follow-up.
 
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
 stub on `!linux`) is the authority for "is a managed citadel service running

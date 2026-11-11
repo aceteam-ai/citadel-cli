@@ -545,6 +545,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	// shutdown does not complete within the grace period, and a second signal
 	// force-exits immediately — so a misbehaving goroutine can never leave an
 	// orphaned node holding the VPN identity or the terminal-server port.
+	// Under a service manager, co-browse sessions run in their own scopes and
+	// outlive a service restart; this worker re-adopts them on the next start
+	// (citadel-cli#1546). A no-op for an interactive run.
+	platform.EnableDetachedCobrowse()
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -559,7 +563,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Tear down every interactive browser session (issue #793) so no session
 		// Chromium or virtual display orphans across a worker restart. No-op when
 		// no session was ever started.
-		if err := platform.GetCobrowseSessionManager().StopAll(); err != nil {
+		if err := platform.GetCobrowseSessionManager().ShutdownSessions(); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: browser session stop: %v\n", err)
 		}
 		// Cancel first so the async service-startup goroutine stops launching any
