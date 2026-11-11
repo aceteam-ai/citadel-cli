@@ -320,6 +320,29 @@ under `network.GetNodeConfigDir()` (same cross-context reasoning as the
 vault, §3) as a small sibling file — e.g. `passcode_state.yaml` — recording
 a failed-attempt counter, a lockout-until timestamp, and last-verified-at.
 
+**Failure decay (#1371).** The vault's `state.yaml` retains the newest 64
+failure timestamps in a rolling 24-hour window, with failures at least 24
+hours old removed. A correct PIN refreshes `LastVerifiedAt` but does not
+erase recent failures or an active lockout. The existing threshold (five
+failures), geometric backoff (30 seconds up to one hour), and
+`ErrLockedOut` semantics are unchanged; even a correct PIN is refused
+during an active lockout. This bounds interleaved guesses, not only
+consecutive mistakes. A few legitimate mistypes remain counted until they
+age out. Local-presence `ResetLockout` still clears the history and lockout
+without erasing the last-verification anchor or vault data.
+
+For old state containing only `failed_attempts`, the next ordinary
+success/failure write conservatively seeds up to 64 undated failures at
+that write's timestamp. Status reads do not modify state. New writes keep
+`failed_attempts` equal to the retained count for older readers and write
+an explicit `failure_times: []` when empty, preventing expired history from
+being mistaken for an unmigrated counter. Clock rollback retains future
+timestamps rather than granting a reset. Older binaries do not implement
+decay, so mixed-version writers are not a security-equivalent downgrade.
+Sequential handles see persisted history; simultaneous cross-process
+read/modify/write remains best-effort, tracked separately in #1395. No
+live vault migration or rollout is implied by this source change.
+
 **Resolved: node-wide, not per-identity (see Resolved decisions).** The
 terminal path already carries a caller identity (`tokenInfo.UserID`); the
 gateway and SHELL_COMMAND paths do not obviously have an equivalent. The

@@ -298,9 +298,13 @@ should keep this ADR in draft.
    image smoke uses the stub adapter. A real NVIDIA-node test should record
    model load, one WAV synthesis, license reporting, and the full
    AceTeam-to-node route before describing the product path as live-validated.
-7. **Voice cloning is deferred.** No `ref_audio`, `ref_text`,
-   `voice_clone_prompt`, or ASR-loading argument is passed. Adding binary
-   reference input requires a separately bounded fabric contract.
+7. **Voice cloning shipped outside CIS.** This ADR's OmniVoice slice still
+   passes no `ref_audio`, `ref_text`, `voice_clone_prompt`, or ASR-loading
+   argument. Consented cloning instead shipped as the separate `voice-clone`
+   catalog module (citadel-services, host port 8215, #1245; Chatterbox MIT by
+   default, OmniVoice CC-BY-NC opt-in), enrolled through the `VOICE_MANAGE`
+   job and used through `SYNTHESIZE_SPEECH` with `backend: "voice-clone"`.
+   Licence and consent receipt fields are #1322.
 8. **Other sidecars have not migrated.** Diffusers and Whisper still live in
    citadel-cli; Kokoro and extraction still use their existing images; Bonsai
    remains a local build. Migration order and whether each family belongs in

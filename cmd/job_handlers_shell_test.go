@@ -31,15 +31,13 @@ func TestLegacyShellHandlerHonorsKillSwitch(t *testing.T) {
 			shell.Disabled, wantDisabled)
 	}
 
-	// Both passcode signals must be wired so an ENABLED shell fails closed and can
-	// distinguish passcode_not_set from passcode_invalid (aceteam#6524). A nil
-	// HasPasscode would refuse every command as passcode_not_set even when the
-	// operator set a correct passcode (a silent functional regression).
-	if shell.HasPasscode == nil {
-		t.Error("legacy SHELL_COMMAND handler HasPasscode is nil; must be wired from the persisted node passcode")
+	// Strict state replaces the two lenient callbacks (#1379): state read errors
+	// and master-PIN lockouts must not collapse to unset or incorrect passcodes.
+	if shell.State == nil {
+		t.Error("diagnostic SHELL_COMMAND must wire strict node passcode state")
 	}
-	if shell.VerifyPasscode == nil {
-		t.Error("legacy SHELL_COMMAND handler VerifyPasscode is nil; must be wired from the persisted node passcode")
+	if shell.Throttle == nil || shell.Throttle != nodePasscodeThrottle {
+		t.Error("diagnostic SHELL_COMMAND must share the process job throttle")
 	}
 }
 

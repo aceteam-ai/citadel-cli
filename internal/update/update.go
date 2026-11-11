@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-version"
+
+	"github.com/aceteam-ai/citadel-cli/internal/releasesig"
 )
 
 const (
@@ -54,6 +57,54 @@ type Client struct {
 	CurrentVersion string
 	Channel        string // "stable" or "rc"
 	httpClient     *http.Client
+
+	apiBase      string
+	downloadBase string
+	// trustedKeys overrides the compiled release-signing key set. It is
+	// unexported and only set by in-package tests; nil means the compiled
+	// set (releasesig.Verify).
+	trustedKeys []releasesig.TrustedKey
+}
+
+// Signature-verification failures. Every download path fails closed on them.
+var (
+	// ErrUnsignedRelease means the release publishes no checksums.txt.sig.
+	// Releases published before signing was introduced are unsigned and are
+	// refused (docs/release-signing.md, "Transition").
+	ErrUnsignedRelease = errors.New("release is not signed (no checksums.txt.sig); refusing to install")
+	// ErrReleaseSignature means checksums.txt.sig is present but malformed,
+	// signed by an untrusted key, does not verify, or the signed checksums do
+	// not belong to the requested release.
+	ErrReleaseSignature = errors.New("release signature verification failed; refusing to install")
+	// ErrPlatformNotPublished means the release's validly signed checksums
+	// list no archive for this OS/architecture.
+	ErrPlatformNotPublished = errors.New("release publishes no archive for this platform")
+	// ErrArchiveTooLarge means the archive download exceeded
+	// MaxArchiveSize and was abandoned before its digest was checked.
+	ErrArchiveTooLarge = errors.New("release archive exceeds the maximum download size")
+)
+
+// MaxArchiveSize bounds an archive download so a hostile or broken server
+// cannot fill the disk before the signed digest is checked. Real archives are
+// tens of MiB.
+const MaxArchiveSize = 512 << 20
+
+// maxArchiveSize is MaxArchiveSize; a variable only so in-package tests can
+// exercise the bound without serving half a gigabyte.
+var maxArchiveSize int64 = MaxArchiveSize
+
+// IsReleaseSignatureError reports whether err is a release-signature refusal
+// (ErrUnsignedRelease or ErrReleaseSignature).
+func IsReleaseSignatureError(err error) bool {
+	return errors.Is(err, ErrUnsignedRelease) || errors.Is(err, ErrReleaseSignature)
+}
+
+// IsTerminalReleaseError reports whether retrying the same release cannot
+// change the outcome: a signature refusal, or a validly signed release that
+// does not publish this platform. Retrying would only fetch the same release
+// assets again.
+func IsTerminalReleaseError(err error) bool {
+	return IsReleaseSignatureError(err) || errors.Is(err, ErrPlatformNotPublished)
 }
 
 // NewClient creates a new update client with default timeout (30s)
@@ -69,7 +120,21 @@ func NewClientWithTimeout(currentVersion string, timeout time.Duration) *Client 
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
+		apiBase:      GitHubAPIBase,
+		downloadBase: GitHubDownloadBase,
 	}
+}
+
+// WithBaseURLs points the client at alternate API and download hosts. It
+// exists for tests (a fake release server). Changing the host does not change
+// what is trusted: every install requires checksums.txt to carry a valid
+// signature from a compiled-in release key, so a substitute host can at most
+// deny service. It is deliberately not reachable from configuration, flags or
+// the environment.
+func (c *Client) WithBaseURLs(apiBase, downloadBase string) *Client {
+	c.apiBase = strings.TrimRight(apiBase, "/")
+	c.downloadBase = strings.TrimRight(downloadBase, "/")
+	return c
 }
 
 // WithChannel sets the release channel
@@ -117,7 +182,11 @@ func (c *Client) GetReleaseByTag(tag string) (*Release, error) {
 		tag = "v" + tag
 	}
 
-	url := fmt.Sprintf("%s/repos/%s/releases/tags/%s", GitHubAPIBase, GitHubRepo, tag)
+	if !releasesig.ValidTag(tag) {
+		return nil, fmt.Errorf("invalid release tag %q", tag)
+	}
+
+	url := fmt.Sprintf("%s/repos/%s/releases/tags/%s", c.apiBase, GitHubRepo, tag)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -147,109 +216,24 @@ func (c *Client) GetReleaseByTag(tag string) (*Release, error) {
 	return &release, nil
 }
 
-// Download downloads the binary for the current OS/ARCH
-func (c *Client) Download(release *Release, destPath string) error {
-	downloadURL := c.getDownloadURL(release)
-
-	if err := EnsureUpdateDir(); err != nil {
-		return fmt.Errorf("failed to create update directory: %w", err)
-	}
-
-	resp, err := c.httpClient.Get(downloadURL)
-	if err != nil {
-		return fmt.Errorf("failed to download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status: %s", resp.Status)
-	}
-
-	// Download to temp file first
-	archivePath := destPath + ".archive"
-	outFile, err := os.Create(archivePath)
-	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
-	}
-
-	_, err = io.Copy(outFile, resp.Body)
-	outFile.Close()
-	if err != nil {
-		os.Remove(archivePath)
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-
-	// Extract binary from archive
-	if err := c.extractBinary(archivePath, destPath); err != nil {
-		os.Remove(archivePath)
-		return fmt.Errorf("failed to extract binary: %w", err)
-	}
-
-	// Clean up archive
-	os.Remove(archivePath)
-
-	// Set executable permissions on Unix
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(destPath, 0755); err != nil {
-			return fmt.Errorf("failed to set permissions: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// VerifyChecksum verifies the SHA256 checksum of a file
-func (c *Client) VerifyChecksum(filePath string, release *Release) error {
-	checksumURL := c.getChecksumURL(release)
-
-	resp, err := c.httpClient.Get(checksumURL)
-	if err != nil {
-		return fmt.Errorf("failed to fetch checksums: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("checksum fetch failed with status: %s", resp.Status)
-	}
-
-	checksumData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read checksums: %w", err)
-	}
-
-	// Find expected checksum for our binary
-	binaryName := c.getBinaryArchiveName(release)
-	expectedChecksum := ""
-	lines := strings.Split(string(checksumData), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, binaryName) {
-			parts := strings.Fields(line)
-			if len(parts) >= 1 {
-				expectedChecksum = parts[0]
-				break
-			}
-		}
-	}
-
-	if expectedChecksum == "" {
-		return fmt.Errorf("checksum not found for %s", binaryName)
-	}
-
-	// Calculate actual checksum
-	actualChecksum, err := calculateSHA256(filePath + ".archive")
-	if err != nil {
-		return fmt.Errorf("failed to calculate checksum: %w", err)
-	}
-
-	if actualChecksum != expectedChecksum {
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
-	}
-
-	return nil
-}
-
-// DownloadAndVerify downloads and verifies the binary in one step
+// DownloadAndVerify downloads and verifies the binary in one step. It is the
+// single download path for the periodic auto-updater, `citadel update
+// install`, and the AGENT_UPDATE handler.
+//
+// Before any archive byte is fetched, it obtains the release's checksums.txt
+// and checksums.txt.sig, verifies the signature against the compiled-in
+// trusted keys, and requires the signed checksums to name archives of exactly
+// release.TagName. Only then is the archive digest used. A missing or invalid
+// signature fails closed with ErrUnsignedRelease or ErrReleaseSignature.
 func (c *Client) DownloadAndVerify(release *Release, destPath string) error {
+	if release == nil || !releasesig.ValidTag(release.TagName) {
+		return fmt.Errorf("%w: invalid release tag", ErrReleaseSignature)
+	}
+	expectedChecksum, err := c.signedArchiveChecksum(release)
+	if err != nil {
+		return err
+	}
+
 	downloadURL := c.getDownloadURL(release)
 
 	if err := EnsureUpdateDir(); err != nil {
@@ -273,17 +257,31 @@ func (c *Client) DownloadAndVerify(release *Release, destPath string) error {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
 
-	_, err = io.Copy(outFile, resp.Body)
+	if resp.ContentLength > maxArchiveSize {
+		outFile.Close()
+		os.Remove(archivePath)
+		return fmt.Errorf("%w (%d bytes advertised, limit %d)", ErrArchiveTooLarge, resp.ContentLength, maxArchiveSize)
+	}
+	written, err := io.Copy(outFile, io.LimitReader(resp.Body, maxArchiveSize+1))
 	outFile.Close()
 	if err != nil {
 		os.Remove(archivePath)
 		return fmt.Errorf("failed to write file: %w", err)
 	}
-
-	// Verify checksum before extracting
-	if err := c.verifyArchiveChecksum(archivePath, release); err != nil {
+	if written > maxArchiveSize {
 		os.Remove(archivePath)
-		return err
+		return fmt.Errorf("%w (limit %d bytes)", ErrArchiveTooLarge, maxArchiveSize)
+	}
+
+	// Verify the signed digest before extracting.
+	actualChecksum, err := calculateSHA256(archivePath)
+	if err != nil {
+		os.Remove(archivePath)
+		return fmt.Errorf("failed to calculate checksum: %w", err)
+	}
+	if actualChecksum != expectedChecksum {
+		os.Remove(archivePath)
+		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
 	}
 
 	// Extract binary
@@ -307,7 +305,7 @@ func (c *Client) DownloadAndVerify(release *Release, destPath string) error {
 
 // fetchLatestRelease fetches the latest release from GitHub
 func (c *Client) fetchLatestRelease() (*Release, error) {
-	url := fmt.Sprintf("%s/repos/%s/releases/latest", GitHubAPIBase, GitHubRepo)
+	url := fmt.Sprintf("%s/repos/%s/releases/latest", c.apiBase, GitHubRepo)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -409,13 +407,18 @@ func ShouldAutoInstall(currentVersion string, noAutoUpdateFlag bool, noAutoUpdat
 func (c *Client) getDownloadURL(release *Release) string {
 	binaryName := c.getBinaryArchiveName(release)
 	return fmt.Sprintf("%s/%s/releases/download/%s/%s",
-		GitHubDownloadBase, GitHubRepo, release.TagName, binaryName)
+		c.downloadBase, GitHubRepo, release.TagName, binaryName)
 }
 
 // getChecksumURL returns the URL to the checksums.txt file
 func (c *Client) getChecksumURL(release *Release) string {
 	return fmt.Sprintf("%s/%s/releases/download/%s/checksums.txt",
-		GitHubDownloadBase, GitHubRepo, release.TagName)
+		c.downloadBase, GitHubRepo, release.TagName)
+}
+
+// getSignatureURL returns the URL to the checksums.txt.sig file
+func (c *Client) getSignatureURL(release *Release) string {
+	return c.getChecksumURL(release) + ".sig"
 }
 
 // getBinaryArchiveName returns the archive filename for the current platform
@@ -543,54 +546,71 @@ func extractZipFile(f *zip.File, destPath string) error {
 	return nil
 }
 
-// verifyArchiveChecksum verifies the checksum of an archive file
-func (c *Client) verifyArchiveChecksum(archivePath string, release *Release) error {
-	checksumURL := c.getChecksumURL(release)
-
-	resp, err := c.httpClient.Get(checksumURL)
+// signedArchiveChecksum returns the expected sha256 of this platform's archive
+// for release, taken only from a checksums.txt whose signature verifies
+// against the trusted release keys and whose entries all belong to
+// release.TagName (which prevents replaying a signed checksums file from a
+// different release).
+func (c *Client) signedArchiveChecksum(release *Release) (string, error) {
+	checksumData, status, err := c.fetchBounded(c.getChecksumURL(release), releasesig.MaxChecksumsFileSize)
 	if err != nil {
-		return fmt.Errorf("failed to fetch checksums: %w", err)
+		return "", fmt.Errorf("failed to fetch checksums: %w", err)
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("checksum fetch failed with status: %d", status)
+	}
+
+	sigData, status, err := c.fetchBounded(c.getSignatureURL(release), releasesig.MaxSignatureFileSize)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch checksums signature: %w", err)
+	}
+	if status == http.StatusNotFound {
+		return "", fmt.Errorf("%s: %w", release.TagName, ErrUnsignedRelease)
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("checksums signature fetch failed with status: %d", status)
+	}
+
+	if c.trustedKeys != nil {
+		_, err = releasesig.VerifyWithKeys(checksumData, sigData, c.trustedKeys)
+	} else {
+		_, err = releasesig.Verify(checksumData, sigData)
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %w", ErrReleaseSignature, release.TagName, err)
+	}
+
+	digests, err := releasesig.ParseChecksums(checksumData, release.TagName)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %w", ErrReleaseSignature, release.TagName, err)
+	}
+	binaryName := c.getBinaryArchiveName(release)
+	expected, ok := digests[binaryName]
+	if !ok {
+		return "", fmt.Errorf("%w: %s: checksum not found for %s", ErrPlatformNotPublished, release.TagName, binaryName)
+	}
+	return expected, nil
+}
+
+// fetchBounded GETs url and returns at most max bytes of the body. A body
+// larger than max is an error rather than being silently truncated.
+func (c *Client) fetchBounded(url string, max int64) ([]byte, int, error) {
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("checksum fetch failed with status: %s", resp.Status)
+		return nil, resp.StatusCode, nil
 	}
-
-	checksumData, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return fmt.Errorf("failed to read checksums: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("read %s: %w", url, err)
 	}
-
-	// Find expected checksum for our binary
-	binaryName := c.getBinaryArchiveName(release)
-	expectedChecksum := ""
-	lines := strings.Split(string(checksumData), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, binaryName) {
-			parts := strings.Fields(line)
-			if len(parts) >= 1 {
-				expectedChecksum = parts[0]
-				break
-			}
-		}
+	if int64(len(data)) > max {
+		return nil, resp.StatusCode, fmt.Errorf("%s exceeds %d bytes", url, max)
 	}
-
-	if expectedChecksum == "" {
-		return fmt.Errorf("checksum not found for %s", binaryName)
-	}
-
-	// Calculate actual checksum
-	actualChecksum, err := calculateSHA256(archivePath)
-	if err != nil {
-		return fmt.Errorf("failed to calculate checksum: %w", err)
-	}
-
-	if actualChecksum != expectedChecksum {
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
-	}
-
-	return nil
+	return data, resp.StatusCode, nil
 }
 
 // calculateSHA256 calculates the SHA256 hash of a file

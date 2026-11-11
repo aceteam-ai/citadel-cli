@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // DeregisterClient handles node deregistration from Headscale
@@ -51,7 +53,8 @@ func NewDeregisterClient(baseURL, apiToken string) *DeregisterClient {
 		baseURL:  baseURL,
 		apiToken: apiToken,
 		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout:   15 * time.Second,
+			Transport: platformhttp.New(baseURL, platformhttp.Options{}),
 		},
 	}
 }

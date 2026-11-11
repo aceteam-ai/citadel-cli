@@ -78,6 +78,9 @@ before the pod ever sees the request.
 Wildcard TLS is served from either a mounted, already-issued certificate
 (recommended for the first single ingress -- avoids every instance racing to
 issue the same wildcard) or via ACME DNS-01 against a delegated challenge zone.
+For exact hostname sets in static mode, CITADEL_INGRESS_HOST_CERT_DIR holds
+one <base-host>.crt and <base-host>.key pair per published group. Mounted
+certificate renewals are loaded on the next TLS handshake.
 
 The node must already be logged in ('citadel login' or 'citadel init'); pass
 --authkey for a first-boot mesh join. Configuration is entirely via flags and
@@ -91,6 +94,13 @@ Examples:
   CITADEL_INGRESS_KEY_FILE=/certs/wildcard.key \
     citadel ingress --routes-url https://cp.example.com/ingress/routes \
                     --apps-domain apps.example.com
+
+  # ACME DNS-01 with the apps zone hosted on Cloudflare (token scoped to
+  # Zone.DNS:Edit on that zone only):
+  CITADEL_INGRESS_ROUTES_TOKEN=... \
+  CITADEL_INGRESS_DNS_CLOUDFLARE_API_TOKEN=<token> \
+    citadel ingress --routes-url https://cp.example.com/ingress/routes \
+                    --apps-domain apps.example.com --acme-email ops@example.com
 
   # ACME DNS-01 against a delegated zone (RFC 2136 / TSIG):
   CITADEL_INGRESS_ROUTES_TOKEN=... \
@@ -177,11 +187,6 @@ func resolveIngressOptions(_ context.Context) (ingressOptions, error) {
 			poll, ingress.RouteMaxAge/2, ingress.RouteMaxAge)
 	}
 
-	cert, err := resolveIngressCertProvider(appsDomain)
-	if err != nil {
-		return ingressOptions{}, err
-	}
-
 	src := ingress.NewHTTPRoutesSource(routesURL, token, nil)
 	routes := ingress.NewClient(ingress.ClientConfig{
 		Source:       src,
@@ -189,6 +194,14 @@ func resolveIngressOptions(_ context.Context) (ingressOptions, error) {
 		AppsDomain:   appsDomain,
 		Logf:         Log,
 	})
+	cert, err := resolveIngressCertProvider(appsDomain)
+	if err != nil {
+		return ingressOptions{}, err
+	}
+	if static, ok := cert.(*ingress.StaticFileCertProvider); ok {
+		static.CertDir = os.Getenv("CITADEL_INGRESS_HOST_CERT_DIR")
+		static.HostCertBase = routes.HostCertBase
+	}
 
 	authzURL, err := ingress.DeriveAuthzURL(routesURL)
 	if err != nil {
@@ -231,8 +244,10 @@ func resolveIngressCertProvider(appsDomain string) (ingress.CertProvider, error)
 	}
 
 	dnsZone := os.Getenv("CITADEL_INGRESS_ACME_DNS_ZONE")
-	if dnsZone == "" {
-		return nil, errors.New("ingress: no TLS material configured -- set CITADEL_INGRESS_CERT_FILE+CITADEL_INGRESS_KEY_FILE (mounted wildcard) or CITADEL_INGRESS_ACME_DNS_ZONE + RFC2136 credentials (ACME DNS-01)")
+	cfToken := os.Getenv("CITADEL_INGRESS_DNS_CLOUDFLARE_API_TOKEN")
+	rfcServer := os.Getenv("CITADEL_INGRESS_DNS_RFC2136_SERVER")
+	if cfToken == "" && rfcServer == "" && dnsZone == "" {
+		return nil, errors.New("ingress: no TLS material configured -- set CITADEL_INGRESS_CERT_FILE+CITADEL_INGRESS_KEY_FILE (mounted wildcard), CITADEL_INGRESS_DNS_CLOUDFLARE_API_TOKEN (ACME DNS-01 via Cloudflare), or CITADEL_INGRESS_ACME_DNS_ZONE + RFC2136 credentials (ACME DNS-01)")
 	}
 
 	// certmagic cert cache lives next to the tsnet state so it inherits the same
@@ -247,8 +262,12 @@ func resolveIngressCertProvider(appsDomain string) (ingress.CertProvider, error)
 		CA:         flagOrEnv(ingressACMECAURL, "CITADEL_INGRESS_ACME_CA"),
 		StorageDir: storageDir,
 		DNSZone:    dnsZone,
+		Cloudflare: ingress.CloudflareConfig{
+			APIToken:  cfToken,
+			ZoneToken: os.Getenv("CITADEL_INGRESS_DNS_CLOUDFLARE_ZONE_TOKEN"),
+		},
 		RFC2136: ingress.RFC2136Config{
-			Server:  os.Getenv("CITADEL_INGRESS_DNS_RFC2136_SERVER"),
+			Server:  rfcServer,
 			KeyName: os.Getenv("CITADEL_INGRESS_DNS_RFC2136_KEY_NAME"),
 			KeyAlg:  os.Getenv("CITADEL_INGRESS_DNS_RFC2136_KEY_ALG"),
 			Key:     os.Getenv("CITADEL_INGRESS_DNS_RFC2136_KEY"),

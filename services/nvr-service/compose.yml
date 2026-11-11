@@ -22,6 +22,31 @@
 # ~/.citadel-cli/nvr/media BEFORE assigning the module; nvr-config then statfs-
 # verifies /media is a real, root-writable network mount and REFUSES to start
 # otherwise, so recordings never silently land on the local disk.
+#
+# Security upgrade (#1357): a CLI binary update alone does NOT repair the live
+# host config or replace an already-running init image. An operator-approved
+# module update/start must install this compose AND recreate/run the updated
+# nvr-config init container. It first restricts /config to 0700 and both legacy
+# config.yml/config.yaml to 0600 (even if later validation fails), then atomically
+# replaces config.yml (the opt-in below keeps credentials out). Older compose
+# files keep private literal credentials until updated, so pulling the new init
+# image alone does not break Frigate. Until the hardened init step runs, an
+# old 0644 file remains exposed. The catalog copy in citadel-services must also
+# be updated before a catalog-installed module can receive this repair. No live
+# restart or rollout is implied by merging source.
+#
+# Identity: nvr-config's Dockerfile and Frigate v0.17.0's final Dockerfile/service
+# entrypoint both use container root; neither service overrides user here. That
+# shared uid can read 0600/0700. Non-root/userns overrides need matching ownership,
+# not broader modes. The :stable tag is floating, NOT a verified digest pin;
+# exact-image/uid acceptance remains an operator-owned rollout gate for Frigate.
+# The nvr-config pin/provenance is recorded in docs/nvr-config-image-pin.md;
+# registry metadata is not live UID/mount or offline-start acceptance.
+# Environment substitution reference (MQTT user/password and RTSP supported):
+# https://docs.frigate.video/configuration/config/#environment-variable-substitution
+# https://github.com/blakeblackshear/frigate/blob/v0.17.0/frigate/config/mqtt.py
+# Current RTSP URLs use a fixed bridge host and stream paths, with no separate
+# credential inputs. Wyze secrets remain exclusively in wyze-bridge's env.
 services:
   wyze-bridge:
     image: docker.io/idisposablegithub365/wyze-bridge:latest
@@ -62,7 +87,11 @@ services:
     restart: unless-stopped
 
   nvr-config:
-    image: ghcr.io/aceteam-ai/nvr-config:latest
+    image: ghcr.io/aceteam-ai/nvr-config:2241cf4d5a171a0b11b733b84ec06035f185ab85@sha256:dcbe4f783eb14c7979d93db68ae9239eada5fec09f71d5966aa733b20b2eebba
+    # #1396: the reviewed security-repair image is immutable. Reuse this exact
+    # cached digest without a mandatory registry refresh; a missing image still
+    # needs an approved pull. Future security updates require a reviewed new pin.
+    pull_policy: missing
     container_name: citadel-nvr-config
     # An init step, not a long-running service: it writes config.yml + verifies the
     # nas mount, then exits. frigate waits for it to complete successfully.
@@ -87,6 +116,8 @@ services:
       # Set NVR_MQTT=false to opt out.
       - NVR_MQTT=${NVR_MQTT:-true}
       - NVR_MQTT_HOST=mosquitto
+      # Set this ONLY alongside Frigate's matching FRIGATE_MQTT_* environment.
+      - NVR_MQTT_CREDENTIALS_FROM_ENV=true
       - NVR_MQTT_USER=${NVR_MQTT_USER:-frigate}
       - NVR_MQTT_PASSWORD=${NVR_MQTT_PASSWORD:?nvr requires NVR_MQTT_PASSWORD (mosquitto allows anonymous access by default)}
     volumes:
@@ -179,6 +210,10 @@ services:
       - /etc/localtime:/etc/localtime:ro
     environment:
       - TZ=${TZ:-UTC}
+      # The generated YAML contains only placeholders, never these values.
+      # Keep broker and Frigate credentials sourced from the same assignment.
+      - FRIGATE_MQTT_USER=${NVR_MQTT_USER:-frigate}
+      - FRIGATE_MQTT_PASSWORD=${NVR_MQTT_PASSWORD:?nvr requires NVR_MQTT_PASSWORD (mosquitto allows anonymous access by default)}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5000/api/version || exit 1"]
       interval: 30s

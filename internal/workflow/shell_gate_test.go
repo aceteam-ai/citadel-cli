@@ -324,3 +324,30 @@ func TestRunSurvivesHTTPRequestCompletion(t *testing.T) {
 		t.Fatalf("run did not survive the request: %s %v %s", snap.Status, snap.Output, snap.Error)
 	}
 }
+
+// The workflow Shell gate shares the node's wrong-passcode throttle: wrong
+// passcodes on WORKFLOW_RUN submits start the cooldown, and an absent passcode
+// is never counted.
+func TestSubmitShellNodeHonorsPasscodeThrottle(t *testing.T) {
+	gate := passcodeGate(true)
+	gate.Throttle = jobs.NewPasscodeThrottle()
+	e := NewExecutor(ExecutorConfig{Shell: ShellConfig{Gate: gate}})
+	for i := 0; i < 3*jobs.DefaultPasscodeMaxFailures; i++ {
+		if _, err := e.Submit(context.Background(), &RunRequest{Graph: shellGraph("true"), Passcode: ""}); err == nil {
+			t.Fatal("an absent passcode must be refused")
+		}
+	}
+	if gate.Throttle.Throttled() {
+		t.Fatal("absent passcodes must not start a cooldown")
+	}
+	for i := 0; i < jobs.DefaultPasscodeMaxFailures; i++ {
+		_, _ = e.Submit(context.Background(), &RunRequest{Graph: shellGraph("true"), Passcode: "000000"})
+	}
+	cmd, marker := markerCommand(t)
+	_, err := e.Submit(context.Background(), &RunRequest{Graph: shellGraph(cmd), Passcode: testPasscode})
+	var refusal *jobs.ShellRefusal
+	if !errors.As(err, &refusal) || refusal.Reason != jobs.ReasonPasscodeThrottled {
+		t.Fatalf("after %d wrong passcodes a correct one must be throttled, got %v", jobs.DefaultPasscodeMaxFailures, err)
+	}
+	assertNotRan(t, marker)
+}

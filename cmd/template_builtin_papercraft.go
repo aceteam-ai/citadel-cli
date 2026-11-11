@@ -83,6 +83,7 @@ type papercraftEncoderConfig struct {
 	FPS             int
 	DurationSeconds float64
 	AudioPath       string
+	SilentAudio     bool
 	OutputPath      string
 }
 
@@ -107,11 +108,6 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 	ctx, cancel := context.WithTimeout(ctx, renderJobWallTimeout)
 	defer cancel()
 
-	mkdirTemp := deps.mkdirTemp
-	if mkdirTemp == nil {
-		mkdirTemp = os.MkdirTemp
-	}
-
 	m, err := decodeBuiltinParams(params, "duration_seconds")
 	if err != nil {
 		return nil, err
@@ -128,7 +124,28 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 	if err != nil {
 		return nil, err
 	}
-	outputs := make([]string, 0, len(requiredPapercraftFormats))
+	return renderPapercraftFormats(ctx, formats, audio, inputs, outDir, deps, wantDuration, hasDuration, false)
+}
+
+// renderPapercraftLandscapeCard exposes the existing capture/encode lifecycle
+// for a single trusted, assembled landscape card. The v3 shell assembly remains
+// gated by #11296/#11480; this helper has no registry or production caller.
+func renderPapercraftLandscapeCard(ctx context.Context, htmlPath, outDir string, width, height int, duration float64, deps papercraftRenderDeps) ([]string, error) {
+	if width <= height || height < 2 || width > 8192 || width%2 != 0 || height%2 != 0 || !videoComposeFinite(duration) || duration <= 0 || duration > 60 {
+		return nil, fmt.Errorf("invalid landscape card dimensions or duration")
+	}
+	format := papercraftFormat{name: "landscape", width: width, height: height, html: htmlPath, outputName: "card.mp4"}
+	return renderPapercraftFormats(ctx, []papercraftFormat{format}, "", []string{htmlPath}, outDir, deps, duration, true, true)
+}
+
+func renderPapercraftFormats(ctx context.Context, formats []papercraftFormat, audio string, inputs []string, outDir string, deps papercraftRenderDeps, wantDuration float64, hasDuration, silentAudio bool) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, renderJobWallTimeout)
+	defer cancel()
+	mkdirTemp := deps.mkdirTemp
+	if mkdirTemp == nil {
+		mkdirTemp = os.MkdirTemp
+	}
+	outputs := make([]string, 0, len(formats))
 	for _, format := range formats {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -188,7 +205,7 @@ func runPapercraftRenderBuiltin(ctx context.Context, params json.RawMessage, inp
 		}
 		encoder, err := deps.startEncoder(ctx, papercraftEncoderConfig{
 			Width: format.width, Height: format.height, FPS: papercraftFPS,
-			DurationSeconds: encodedDuration, AudioPath: audio, OutputPath: outputPath,
+			DurationSeconds: encodedDuration, AudioPath: audio, SilentAudio: silentAudio, OutputPath: outputPath,
 		})
 		if err != nil {
 			return nil, errors.Join(
@@ -806,12 +823,52 @@ func (p *chromiumRenderPage) CapturePNG(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	encoded, _ := res["data"].(string)
+	return decodePapercraftScreenshot(encoded, papercraftMaxPNG)
+}
+
+var errPapercraftScreenshotTooLarge = errors.New("screenshot exceeds byte limit")
+
+// Size refusal precedes base64 decoding. DecodeString may reserve at most two
+// rounding bytes beyond maxBytes; this is not an exact allocation guarantee.
+// The smaller private limit is for fixtures, never an increased runtime option.
+func decodePapercraftScreenshot(encoded string, maxBytes int) ([]byte, error) {
+	if maxBytes <= 0 || maxBytes > papercraftMaxPNG {
+		return nil, fmt.Errorf("screenshot byte limit is invalid")
+	}
 	if encoded == "" {
 		return nil, fmt.Errorf("Page.captureScreenshot returned no data")
+	}
+	if len(encoded) > base64.StdEncoding.EncodedLen(maxBytes) {
+		return nil, errPapercraftScreenshotTooLarge
+	}
+	// Preserve DecodeString's CR/LF acceptance within the encoded-byte ceiling.
+	// Padding reduces actual decoded length: using raw DecodedLen alone would
+	// reject valid exact-limit data ending in '=' or '=='.
+	chars := 0
+	var previous, last byte
+	for i := 0; i < len(encoded); i++ {
+		if encoded[i] == '\r' || encoded[i] == '\n' {
+			continue
+		}
+		chars++
+		previous, last = last, encoded[i]
+	}
+	decodedLength := base64.StdEncoding.DecodedLen(chars)
+	if chars != 0 && chars%4 == 0 && last == '=' {
+		decodedLength--
+		if previous == '=' {
+			decodedLength--
+		}
+	}
+	if decodedLength > maxBytes {
+		return nil, errPapercraftScreenshotTooLarge
 	}
 	b, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("decode screenshot: %w", err)
+	}
+	if len(b) > maxBytes {
+		return nil, errPapercraftScreenshotTooLarge
 	}
 	return b, nil
 }
@@ -888,6 +945,8 @@ func papercraftFFmpegArgs(cfg papercraftEncoderConfig) []string {
 	}
 	if cfg.AudioPath != "" {
 		args = append(args, "-i", cfg.AudioPath, "-map", "0:v", "-map", "1:a")
+	} else if cfg.SilentAudio {
+		args = append(args, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v", "-map", "1:a")
 	} else {
 		args = append(args, "-map", "0:v")
 	}
@@ -895,7 +954,7 @@ func papercraftFFmpegArgs(cfg papercraftEncoderConfig) []string {
 		"-c:v", "libx264", "-threads", "4", "-preset", "slow", "-crf", "17", "-tune", "animation",
 		"-pix_fmt", "yuv420p", "-r", strconv.Itoa(cfg.FPS),
 	)
-	if cfg.AudioPath != "" {
+	if cfg.AudioPath != "" || cfg.SilentAudio {
 		args = append(args, "-c:a", "aac", "-b:a", "192k", "-ar", "48000")
 	}
 	args = append(args, "-t", strconv.FormatFloat(cfg.DurationSeconds, 'f', 4, 64), "-movflags", "+faststart", cfg.OutputPath)

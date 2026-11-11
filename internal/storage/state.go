@@ -30,6 +30,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // Credentials is the create-once S3 root key pair minted on first start.
@@ -68,7 +70,7 @@ const credCharset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456
 // internal/jobs: everything the container mounts stays inside a citadel data
 // dir.
 func BaseDir() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get home directory: %w", err)
 	}

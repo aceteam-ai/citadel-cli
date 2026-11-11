@@ -177,6 +177,45 @@ func TestGenerateRejectsBadInput(t *testing.T) {
 	}
 }
 
+func TestMQTTCredentialsUseEnvironmentPlaceholders(t *testing.T) {
+	const user = "synthetic-private-user"
+	const password = "synthetic-private-password-$:'\"{}"
+	for _, enabled := range []bool{true, false} {
+		cfg := Config{
+			RetentionDays: 12, Detector: DetectorCPU,
+			MQTT: MQTTSpec{Enabled: enabled, Host: "mosquitto", User: user, Password: password, CredentialsFromEnv: true},
+		}
+		out, err := GenerateFrigateConfig(cfg, []Camera{{Name: "front-door"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out, user) || strings.Contains(out, password) {
+			t.Fatal("plaintext MQTT credential in generated YAML")
+		}
+		m := parseGenerated(t, cfg, nil)
+		mqtt := m["mqtt"].(map[string]any)
+		if enabled {
+			if mqtt["user"] != FrigateMQTTUserPlaceholder || mqtt["password"] != FrigateMQTTPasswordPlaceholder {
+				t.Error("enabled MQTT must emit fixed environment placeholders")
+			}
+		} else if len(mqtt) != 1 || mqtt["enabled"] != false {
+			t.Error("disabled MQTT must emit no credentials")
+		}
+	}
+}
+
+func TestMQTTLegacyComposeKeepsLiteralCredentials(t *testing.T) {
+	cfg := Config{
+		RetentionDays: 12, Detector: DetectorCPU,
+		MQTT: MQTTSpec{Enabled: true, Host: "mosquitto", User: "old-user", Password: "old-password-$:'\"{}"},
+	}
+	m := parseGenerated(t, cfg, nil)
+	mqtt := m["mqtt"].(map[string]any)
+	if mqtt["user"] != cfg.MQTT.User || mqtt["password"] != cfg.MQTT.Password {
+		t.Error("old compose without Frigate env must retain literal credentials")
+	}
+}
+
 // TestVerifyMediaMountSeparatesMountednessFromWritability is the core NAS scar
 // test: a path that is WRITABLE but NOT mounted must FAIL (that is the silent
 // local-disk leak). Only mounted AND writable passes.

@@ -15,8 +15,8 @@ import (
 // CITADEL_AUTO_UPDATE env > persisted preference > default-off — so the two can
 // never disagree on the effective bool (resolveAutoUpdateEnabled delegates
 // here). The source is the extra telemetry: persisted|env|flag|dev|opt-out|
-// unknown. A corrupt/unreadable persisted preference resolves to
-// (false, "unknown") rather than a confident disabled.
+// unknown. Corrupt/unreadable state replaces only the persisted preference:
+// explicit flag/env policy and the opt-out/dev veto keep their precedence.
 func resolveAutoUpdatePolicy(inputs autoUpdatePolicyInputs) (effective bool, source string) {
 	if autoUpdateOptedOut() {
 		return false, "opt-out"
@@ -61,13 +61,13 @@ func autoUpdateIntervalSeconds(inputs autoUpdatePolicyInputs) int {
 // state read.
 //
 // Degradation rules (do not turn a corrupt state into a confident report):
-//   - unreadable/corrupt state -> configured_enabled=null, last_result=unknown,
+//   - unreadable/corrupt state -> configured_enabled=null, last_result=state_corrupt,
 //     pending not computed;
 //   - absent state -> default-off (auto-update is opt-in), last_result=
 //     never_checked;
 //   - older state missing the telemetry fields -> never_checked / zero times,
 //     which read as absent in the projection.
-func buildAutoUpdateSnapshot(inputs autoUpdatePolicyInputs, mode string) update.ReportSnapshot {
+func buildAutoUpdateSnapshot(inputs autoUpdatePolicyInputs, mode string, capability update.SelfUpdateCapability) update.ReportSnapshot {
 	effective, source := resolveAutoUpdatePolicy(inputs)
 	snap := update.ReportSnapshot{
 		SchemaVersion:    update.AutoUpdateReportSchemaVersion,
@@ -78,22 +78,27 @@ func buildAutoUpdateSnapshot(inputs autoUpdatePolicyInputs, mode string) update.
 		RunningVersion:   Version,
 		LastResult:       update.ResultNeverChecked,
 	}
+	if capability.State == "" {
+		capability.State = update.SelfUpdateUnknown
+	}
+	snap.SelfUpdate, snap.InstallDirectory = capability.State, capability.Directory
+	snap.BinaryOwner, snap.WorkerUser = capability.BinaryOwner, capability.WorkerUser
 
 	state, corrupt := update.ReadStateForReport()
 	if corrupt || state == nil {
-		// Unknown preference, unknown result; never a confident disabled.
+		// Only the file-sourced preference is unknown. Keep explicit policy,
+		// but never infer version, timestamp or outcome fields from bad bytes.
 		snap.ConfiguredEnabled = nil
-		snap.LastResult = update.ResultUnknown
+		snap.LastResult = update.ResultStateCorrupt
 		return snap
 	}
 
 	configured := state.AutoUpdate
 	snap.ConfiguredEnabled = &configured
 
-	// pending_version/restart_required: the staged CurrentVersion differs from
-	// the running binary (apply succeeded, restart not yet proven). Reuses
-	// agentNodeInfo's #923 rule.
-	if state.CurrentVersion != "" && !update.VersionsEqual(state.CurrentVersion, Version) {
+	// Only a strictly newer staged release can require a restart. A stale file
+	// from an older install is not pending. Shared with agentNodeInfo.
+	if update.StagedVersionIsNewer(state.CurrentVersion, Version) {
 		snap.PendingVersion = state.CurrentVersion
 		snap.RestartRequired = true
 	}
@@ -136,5 +141,9 @@ func autoUpdateReportFrom(s *update.ReportSnapshot) *status.AutoUpdateReport {
 		LatestVersion:     s.LatestVersion,
 		LastResultAt:      s.LastResultAt,
 		LastResult:        s.LastResult,
+		SelfUpdate:        s.SelfUpdate,
+		InstallDirectory:  s.InstallDirectory,
+		BinaryOwner:       s.BinaryOwner,
+		WorkerUser:        s.WorkerUser,
 	}
 }

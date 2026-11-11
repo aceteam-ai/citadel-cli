@@ -3,9 +3,11 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
@@ -13,6 +15,7 @@ import (
 // server-pushed job delivery. Instead of HTTP polling, the server runs a
 // persistent XREADGROUP BLOCK loop and pushes "job" messages to the client.
 type WSSource struct {
+	deliveryRefusals
 	client *redisapi.Client
 	config WSSourceConfig
 
@@ -124,6 +127,10 @@ func (s *WSSource) Connect(ctx context.Context) error {
 	// continuously from its XREADGROUP BLOCK loop.
 	ws.OnMessage("job", func(msg redisapi.WSMessage) {
 		job, err := s.convertWSJob(msg)
+		if errors.Is(err, redisapi.ErrDurableDelivery) {
+			s.record(s.log)
+			return
+		}
 		if err != nil {
 			s.debug("ws_source: failed to convert job message: %v", err)
 			return
@@ -254,9 +261,7 @@ func (s *WSSource) Ack(ctx context.Context, job *Job) error {
 
 // Nack indicates job failure. Updates status but does NOT ack, allowing retry.
 func (s *WSSource) Nack(ctx context.Context, job *Job, err error) error {
-	s.client.SetJobStatus(ctx, job.ID, "failed", map[string]any{
-		"error": err.Error(),
-	})
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
 	return nil
 }
 
@@ -311,10 +316,7 @@ func (s *WSSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err 
 // failures that will never succeed on retry (e.g. an unsupported job type). The
 // ack mirrors Ack: over WebSocket when connected, falling back to HTTP.
 func (s *WSSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
-	status := map[string]any{"error": err.Error()}
-	for k, v := range data {
-		status[k] = v
-	}
+	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 
 	queue := job.SourceQueue
@@ -420,6 +422,9 @@ func (s *WSSource) snapshotQueues() []string {
 // The server sends: { type: "job", queue: "...", id: "1234567890-0", data: { jobId, type, payload, enqueuedAt } }
 // The data fields mirror StreamMessageData, so we reuse ParseStreamMessage.
 func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
+	if hasDurableCarrier(msg.Data) {
+		return nil, redisapi.ErrDurableDelivery
+	}
 	if msg.Data == nil {
 		return nil, fmt.Errorf("job message has nil data")
 	}

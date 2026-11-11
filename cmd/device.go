@@ -34,6 +34,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -137,7 +138,7 @@ var deviceUninstallCmd = &cobra.Command{
 func runDeviceEnroll(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 	store := nodeidentity.Convergent(network.GetNodeConfigDir())
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpClient := &http.Client{Timeout: 15 * time.Second, Transport: platformhttp.New(authServiceURL, platformhttp.Options{})}
 
 	machineID, err := devicemode.MachineID()
 	if err != nil {
@@ -278,7 +279,7 @@ func deviceTick(ctx context.Context, cfg *devicemode.Config, store *nodeidentity
 	if decision.RenewLeaf {
 		// Renewal failure never blocks session self-heal: log and keep going;
 		// the window is ~30d of 15m ticks, so transient failures are cheap.
-		httpClient := &http.Client{Timeout: 30 * time.Second}
+		httpClient := &http.Client{Timeout: 30 * time.Second, Transport: platformhttp.New(cfg.APIBaseURL, platformhttp.Options{})}
 		notAfter, err := devicemode.RenewLeaf(tickCtx, httpClient, cfg.APIBaseURL, store)
 		if err != nil {
 			logDevice("leaf renewal failed (will retry next tick): %v", err)

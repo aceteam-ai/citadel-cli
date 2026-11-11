@@ -74,11 +74,11 @@ func TestParseMeetingJoinParams_MissingRequired(t *testing.T) {
 }
 
 func TestParseMeetingJoinParams_MaxDuration(t *testing.T) {
-	// Float string (JSON number coerced via fmt.Sprint) is accepted and truncated.
+	// Canonical whole seconds are required; fractional strings are never truncated.
 	p, err := parseMeetingJoinParams(map[string]string{
 		"meeting_url":          "https://meet.google.com/x",
 		"meeting_id":           "id1",
-		"max_duration_seconds": "300.0",
+		"max_duration_seconds": "300",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -88,7 +88,7 @@ func TestParseMeetingJoinParams_MaxDuration(t *testing.T) {
 	}
 
 	// Non-positive and non-numeric are rejected.
-	for _, bad := range []string{"0", "-5", "abc"} {
+	for _, bad := range []string{"300.0", "59.9", "59", "21601", "0", "-5", "abc"} {
 		if _, err := parseMeetingJoinParams(map[string]string{
 			"meeting_url":          "https://meet.google.com/x",
 			"meeting_id":           "id1",
@@ -129,7 +129,7 @@ func TestMeetingWavPath(t *testing.T) {
 }
 
 func TestParsePositiveSeconds(t *testing.T) {
-	ok := map[string]int{"1": 1, "300": 300, "300.0": 300, "59.9": 59}
+	ok := map[string]int{"1": 1, "300": 300}
 	for in, want := range ok {
 		got, err := parsePositiveSeconds(in)
 		if err != nil {
@@ -140,7 +140,7 @@ func TestParsePositiveSeconds(t *testing.T) {
 			t.Errorf("parsePositiveSeconds(%q) = %d, want %d", in, got, want)
 		}
 	}
-	for _, bad := range []string{"0", "-1", "-2.5", "", "nan-ish", "abc"} {
+	for _, bad := range []string{"300.0", "59.9", "NaN", "Inf", "21601", "9223372036854775807", "0", "-1", "-2.5", "", "nan-ish", "abc"} {
 		if _, err := parsePositiveSeconds(bad); err == nil {
 			t.Errorf("expected error for %q, got nil", bad)
 		}

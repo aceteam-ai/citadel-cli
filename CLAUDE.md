@@ -31,6 +31,144 @@ So, when adding to this file:
 
 ## Project Overview
 
+`mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
+descriptor acquisition: it checks a no-follow leaf pin before any readable
+leaf open, and fails closed if the verified procfs FD route is unavailable.
+`workspace_linux_test.go` covers ordering, replacement, refusal and cleanup
+using owned fixtures, not real devices. This does not settle owner/hard-link
+policy or authorize live media acquisition; see `docs/media-input-freezer.md`.
+
+`coordinatorfetch.Get` owns the shared fixed-route, bounded HTTPS transfer used
+by FILE_FETCH and the inactive media inbox freezer. Caller packages retain
+permission, exact-size/hash and publication policy; the client grants none.
+`mediainput.Freezer` adds live media-input checks and conditional Files checks
+for mixed snapshots, without registering a task or reserving the future C5
+holder admission. See `docs/media-input-freezer.md` for the activation gates.
+
+`service.RematerializeManagedUnits` owns the bounded base-file refresh and
+reload request, not worker restart or failed-unit counter recovery.
+`cmd.reclaimEnrollmentNodesWith` owns current-grant selection and skips reclaim
+on force-new enrollment; a saved node ID does not confer predecessor deletion
+authority. See `docs/enrollment-service-recovery.md` for #1356's repair reach,
+start-limit behavior, source references and remaining migration/acceptance gates.
+
+`worker.registrationRefusals` owns non-executable evidence for withheld job
+types; it follows the same live permission callbacks and static registration
+inputs as `CreateLegacyHandlersWithOpts`. `Runner.unavailableJobRefusal` prefers
+that evidence, then the fallback gate catalog, then a known-but-unregistered
+refusal. Only types absent from `allKnownJobTypes` receive an update-node hint.
+`LegacyHandlerAdapter.Execute` rechecks the live gate and returns the shared
+typed refusal so a revocation after selection is terminal on its first attempt.
+The refusal inventory never advertises or executes a job. Focused coverage is
+in `internal/worker/job_refusal_test.go`.
+
+`workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
+loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
+validation separately from the HTTP node. Both worker entrypoints load once via
+`workflowLLMPolicy`, so policy edits require a worker restart. The default permits
+public endpoints and only the exact built-in Ollama endpoint; other private
+targets require grants, and hard-denied ranges cannot be granted. See
+`docs/workflow-llm-policy.md` for operator configuration and transport limits.
+
+`reconstruct.Runner` is the trusted-operator engine, not a registered dispatched
+job. `publishDirectory` owns its create-only Linux bundle rename; unsupported
+publication primitives fail closed. The remaining workspace, SPZ, container
+custody and signed-event boundaries for #1381 are tracked in
+`docs/reconstruct-splat-job.md`; helper source or historical GPU acceptance
+does not prove those boundaries. `publish_linux_test.go` pins late collisions
+and competing publishers with synthetic fake executors.
+
+`jobs.FileFetchHandler` owns large-document staging policy. Its endpoint prefix
+is pinned by `FileFetchEndpointPath`; `worker.CreateLegacyHandlersWithOpts`
+advertises `FILE_FETCH` only with supported Linux anonymous staging, a workspace,
+live Files permission and the trusted coordinator HTTPS origin from existing
+device configuration. Tests in
+`internal/jobs/file_fetch_test.go` and `internal/worker/file_fetch_test.go` cover
+the URL/network/filesystem boundaries and live capability gating. The dedicated
+coordinator endpoint owns capability HMAC verification and mint/fetch audit;
+the node never needs the HMAC secret. Publication is FD-based and create-only;
+the platform supplies a unique staging destination and receives that exact
+relative path in the receipt. See `docs/file-fetch.md` for
+the contract.
+
+`platform.browserRunner` owns the per-OS half of a co-browse session:
+discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
+`xvfbRunner` is the historical managed-Xvfb path, and its argument list is pinned
+by `TestBuildChromeArgs_LinuxArgsUnchanged`. `windowsHeadlessRunner` launches
+Chrome or Edge headless inside a kill-on-close Job Object, and
+`discoverWindowsBrowser` owns the search order. On Windows the sweep never kills
+by PID: it removes only dirs whose owner PID plus creation time no longer
+match. The session base dir there requires an owner-only, protected DACL
+(`validateCobrowseBaseDirPerms`), and a launch refuses without one. The
+windows-latest CI job runs the real-browser tests against both browsers.
+
+`localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
+per-session write grant (default deny, 24h maximum), the abuse limits, the
+idle lifetime and `local_cobrowse_wait`. `localcobrowse.NewURLPolicy` owns the
+navigation address filter, and its host parsing matches a browser's.
+`localcobrowse.EgressGuard` is the local-mode browser's `--proxy-server`
+(`platform.LaunchOptions`). It resolves and dials each destination itself and
+refuses non-public addresses, so the policy also covers redirects,
+subresources and DNS rebinding. Budgets are owner-wide and count reads, and
+only the human can hand control back (`ErrOnlyUserHandsBack`). Grants
+come only from the human-side methods (Approve, Deny, Revoke), which no MCP
+tool reaches. `citadel local mcp` (`newLocalOnlyBridge`) never reads a key or
+token. An unserved method or tool gets -32601 rather than the backend
+fallthrough, and `isLocalModeCommand` skips the root pre-run's CA trust and
+update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
+user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
+
+`localviewer.Server` owns the local-mode loopback viewer. `guard` checks Host
+and Origin. The only cross-site request it admits is the top-level navigation
+to `/open`. `handleOpen` is the only place a cookie and bearer are issued, in
+exchange for a single-use code, and it rotates both. The bearer appears only in
+the `/open` page, which keeps it in sessionStorage. Every data request and the
+WebSocket need it as well as the cookie: browsers send the cookie to any
+127.0.0.1 port. Codes reach the user's browser only through an owner-only
+one-time launch file (`writeLaunchFile`), never on a command line.
+`cobrowsestream.NewStreamHandler` mounts the screencast behind these checks.
+`TestGuardsReturn403`, `TestCookieOnlyFromSingleUseCode` and
+`TestOpenKeepsTheCodeOffTheCommandLine` pin the boundary.
+
+`cmd.runLocalSetup` owns the first-run setup page (`citadel local setup`, and a
+Windows double-click: `cmd.runRootCitadel` calls `launchedFromExplorer`, which is
+`platform.ConsoleProcessCount` == 1; `runBareCitadel` stays enrollment-only). It
+is a `localviewer.Server` with `Config.Setup` set, so it keeps the same guard,
+cookie, bearer and single-use `/open` code, but in its own `SetupDirName` private
+dir so it never replaces a running owner's token file. Connect is
+`cmd.setupConnect` over `mergeHarnessConfig`; the click consents only to adding
+the entry (a different existing `citadel` entry is declined and left to
+`local config --write`), and the request must name the file the page showed.
+Sessions come from the owner through the token-authenticated `/api/summary`.
+`TestSetupRoutesAreGuarded` pins the boundary. Muse has no confirmed local
+config file, so it is not a harness; the page offers the generic entry.
+
+`localaudit.Log` owns the local co-browse audit chain under
+`<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
+month. `cmd.localStateDir` owns where local mode keeps its owner lock, audit
+log and viewer token: the invoking user's config dir, never the
+machine-convergent node config dir, which on an enrolled machine belongs to
+the node's account (#1592). Each record's hash is over its RFC 8785 form (`aep.CanonicalizeJCS`).
+`anchor.json` holds the head and what retention removed, so `Verify` catches a
+missing tail or an unretained missing head. `Open` quarantines a torn final line,
+and a failed prune is not fatal. Only the co-browse owner writes, so each chain
+has one writer. A write gets a pending record before it runs
+(`Config.BeforeAction`); if that write fails the action is refused and
+co-browse turns off. The human's Stop and Take control bypass that precheck.
+URLs are kept as origin plus a path hash (`RedactURL`), and error text is
+sanitized. `TestLocalAuditRecordsEveryCallWithoutSecrets` greps the log for a
+sentinel.
+
+`cmd.harnesses` owns each agent app's MCP config location and entry shape for
+`citadel local config`. Change them there, not in
+`docs/local-browse-quickstart.md`. Locations that could not be confirmed from
+the harness's own docs, such as Claude Desktop on Linux, carry an `unverified`
+note that the command prints. `mergeHarnessConfig` parses TOML and merges JSON
+without loss. A re-run with the same entry is a no-op. It writes through
+symlinks and keeps a timestamped backup. `runLocalDoctor` owns the
+first-run checks, and the windows CI job runs the built binary's
+`citadel local doctor`.
+
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
 
 **Key Components:**
@@ -111,10 +249,24 @@ The release script handles:
 2. Running `go test ./...` and `go vet ./...`
 3. Cross-platform builds (linux/darwin/windows, amd64/arm64)
 4. **Generating `checksums.txt`** (sha256sum of all archives — required by auto-updater)
-5. Creating annotated git tag and pushing
-6. Creating GitHub Release with all binaries + checksums attached
+5. **Signing it as `checksums.txt.sig`** with the offline release key (`CITADEL_RELEASE_SIGNING_KEY`)
+6. Creating annotated git tag and pushing
+7. Creating GitHub Release with all binaries + checksums + signature attached
 
 **Why this matters:** The `citadel update` auto-updater downloads `checksums.txt` to verify binary integrity. If checksums are missing, nodes see `checksum fetch failed with status: 404 Not Found` and can't update.
+
+**Signed releases (aceteam#12089).** `update.Client.DownloadAndVerify`, the one
+download path behind auto-update, `citadel update install` and AGENT_UPDATE,
+refuses a release unless `checksums.txt.sig` verifies against the compiled key
+set in `internal/releasesig` and the signed entries all name archives of the
+requested tag. A release without the signature can never be installed by a
+verifying binary. Releases created since immutable releases were enabled
+(2026-11-09) cannot gain or lose assets, so the signature cannot be added
+later, and nobody can delete it to block updates; v2.212.0 and earlier are
+still mutable. So `hook_preflight` fails the release before tagging when the
+key is unusable, and `hook_pre_publish` refuses to publish without a verifying
+signature. The root `release.sh` is retired (it cannot sign) and only exits 1.
+Format, transition and key rotation: [docs/release-signing.md](docs/release-signing.md).
 
 ### Testing
 ```bash
@@ -270,6 +422,22 @@ Stale-doc note found while fixing citadel#853/#854: there is no `down.go`.
 `citadel down` (defined in `up.go`) reverses `citadel up`'s machine-wide TUN
 mode -- it restores routing/DNS and never reads `citadel.yaml`. The
 manifest-mutating "stop services" command is `citadel stop` (`cmd/stop.go`).
+
+### Read-only session viewer (#1118, partial S3)
+
+`sessionview.Model` owns only status observations and viewer cancellation; do not
+reuse ControlCenter's collectors or node-owning callbacks for this client.
+`network.SessionControlStatusRequest` owns the fixed local status GET and redirect
+refusal. The exact `session attach` root pre-run exception skips mutating startup
+hooks only for that explicit leaf. Bare dispatch and Control Center retain their
+legacy startup/monitor-only paths; no independent state observer or lock probe
+is part of this viewer. `runSessionAttach` owns bounded preflight and seeds the
+model before terminal startup, using the same legacy state resolver as local
+session commands. Its returned errors distinguish status refusal from terminal
+failure without reflecting peer diagnostics. The model, command, legacy-seam
+and status-client fixtures pin these boundaries; they are not native acceptance.
+See `docs/unified-session-viewer.md`
+for remaining full-#1118 work and native/ownership limitations.
 
 ### Core Architecture Patterns
 
@@ -493,6 +661,21 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`meetingcapacity.Capacity` owns the inactive #1505 meeting-intake custody
+model: one shared reservation, exact incarnation/job binding, uncertain-read
+quarantine and post-executor-exit resource confirmation. It has no wire or
+native adapters, and no current JobSource invokes it. Its fake intake proofs
+do not establish API/Redis/WS pre-claim admission or authorize activation.
+aceteam-ai/aceteam#12916 blocks the paired routing, old-reader exclusion and
+credit contract before transport wiring; the internal types are not wire fields.
+
+`jobs.NewMemoryGitHandler` owns the inactive memory-git construction contract:
+live permission, strict passcode State and the actual shared node throttle are
+required; legacy callbacks and zero-value construction cannot enable it.
+`ShellGateReason` still owns runtime refusal precedence. The partial #1436
+activation gates remain in `internal/memorygit/doc.go`; no registry or
+capability advertises this source.
+
 The worker (`citadel worker`) is the high-performance job queue mode designed for AceTeam's private GPU cloud infrastructure. Written in Go for maximum concurrency and throughput, it routes inference requests to private vLLM/Ollama/llama.cpp clusters.
 
 **Why Go?** The Citadel worker is intentionally written in Go (not Python) for:
@@ -582,6 +765,67 @@ status plus ACK), even when the delivery metadata permits another attempt.
 The handler checks the live Files policy, but a refused job is terminal. After
 enabling Files, the caller submits a new upload.
 
+A gate refusal returned as a `*jobs.ShellRefusal` is terminal on the first
+delivery too (one error event, then Fail with the reason): SHELL_COMMAND, the
+desktop handlers, and WORKFLOW_RUN when its Shell gate refuses at submit. A
+Shell node refused mid-run fails the workflow as an ordinary failure.
+
+Files/Desktop permission refusals retain static tool names and enable/confirm
+hints, including the direct `FILE_WRITE_BYTES` classifier. `MEETING_JOIN` and
+`HUDDLE_JOIN` share one live meeting gate for dispatch and refusal; re-enabling
+joins does not rebuild handlers or remove exact-attempt huddle teardown.
+
+`workflow.Executor.Cancel` owns per-run context cancellation; a cancelled
+status records the request, not proof that a Shell process or callback exited.
+`Execution.Done` supplies executor/slot completion, which the workflow handler
+waits for before returning. That is not runner-level fencing:
+`worker.Runner.executeWithDeadline` can return before a normal-lane workflow
+handler exits. `workflowShellCombinedOutput` owns Linux/macOS cancellation
+through the full Wait and output drain; its numeric process-group signal is
+not identity-pinned containment. See `docs/workflow-cancellation.md` for the
+PID/group reuse, escaped-descendant and custody boundaries. Native Windows
+process-tree containment is not implied.
+
+The five desktop handlers (FILE_SCREENSHOT, VNC_SCREENSHOT, VNC_TYPE, VNC_KEYS,
+VNC_ACTIONS) honor the node passcode like SHELL_COMMAND, through
+`jobs.DesktopGateReason` in `newDesktopLegacyHandlerAdapter`, after the live
+desktop permission check. Unlike the shell gate, a node with no passcode set
+runs desktop jobs unchanged, so a false "no passcode" would open the gate. The
+gate therefore takes one `jobs.PasscodeState` read per job from
+`cmd.nodePasscodeState` (the SHELL_COMMAND and workflow Shell gates use the same
+state through `ShellGate.State`, so an unreadable state is `passcode_unavailable`
+there too, not `passcode_not_set`), which uses `config.LoadPermissionsStrict` and
+`nodevault.Vault.Configured`: an unreadable or unparseable permissions file, or
+a vault that cannot be stat'ed, refuses with `passcode_unavailable` instead of
+reading as unset. `config.SavePermissions` replaces the file atomically for the
+same reason, keeping the existing file's owner (`keepOwner`) so a save by root
+does not lock the worker out; it refuses when the owning user cannot be kept
+and tolerates a group it cannot set. The payload `passcode` key never reaches a desktop handler, and
+`jobprivacy.Payload`/`Text` plus the `Job` JSON and fmt renderings in
+`internal/worker`, `internal/redis` and `internal/redisapi` drop it for every
+job type, so it is never written to a dead-letter entry or a log.
+`internal/worker/desktop_gate_test.go`, `cmd/passcode_state_test.go` and
+`internal/redis/passcode_privacy_test.go` pin this.
+
+`jobs.PasscodeThrottle` limits wrong passcodes across those surfaces: one
+process-wide instance (`cmd.nodePasscodeThrottle`) is shared by SHELL_COMMAND,
+the WORKFLOW_RUN Shell gate and the desktop gate, so failures on one count for
+all. After `DefaultPasscodeMaxFailures` within the window, every passcode-gated
+job is refused with `passcode_throttled` for the cooldown without checking the
+passcode. Only a non-empty wrong passcode counts (an absent one is a caller
+without a credential, not a guess); a correct passcode does not clear earlier
+failures, which expire only with time; and a check reserves a slot under the
+throttle's lock but runs outside it (so a KDF or disk read never holds the
+lock), with recent failures plus checks in flight never exceeding the limit. It is in memory, so a worker
+restart resets it. A vault or permissions error that is not a wrong PIN or a
+lockout is `passcode_unavailable` and is not counted. A master-PIN vault
+lockout is a separate reason, `passcode_locked`: `cmd.vaultPasscodeVerdict`
+maps `nodevault.IsLockedOut` to `jobs.PasscodeLockedOut`, so a correct
+passcode presented during a vault lockout is never reported as
+`passcode_invalid`, and a lockout refusal does not count toward the throttle.
+Only node passcodes presented in job payloads are throttled; the gateway's HTTP
+passcode checks are not.
+
 `Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
 a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before
 the normal blocking read. A successful claim increments the Redis-native
@@ -621,6 +865,12 @@ finite floor can be proven safe against it, so this falls back to
 `StalePendingReclaimFloorFallback` (4h, deliberately kept in sync with
 `internal/redis`'s own construction-time default by
 `TestStalePendingReclaimFloorFallbackMatchesRedisDefault`).
+MEETING_JOIN has its own finite #1505 budget instead of the long tier, so the
+resolved floor is also never below `meetingReclaimFloor` (the largest valid
+meeting STUCK point plus the margin; `TestResolveStalePendingReclaimFloor`
+pins it). A redelivered MEETING_JOIN (delivery count above 1) is refused
+terminally rather than rejoined. Consequence: a crashed node's pending jobs
+now wait roughly 10.5h, not 4h10m, before a self-claim.
 
 With this in place: every job type with a BOUNDED per-job watchdog is
 always ACKed out of the PEL by its own watchdog abandon (routes to
@@ -690,8 +940,8 @@ builds -- `unboundedJobTypes`) that legitimately runs past the resolved
 floor on the SAME process it started on is still a self-owned candidate, so
 #999's fix does not change its self-claim eligibility: it is still reclaimed
 by its own still-alive process, and if it keeps running past roughly
-`(MaxAttempts-1) x floor` (~8h at today's defaults: `MaxAttempts` 3, floor
-~4h10m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
+`(MaxAttempts-1) x floor` (~21h at today's defaults: `MaxAttempts` 3, floor
+~10h30m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
 + `Ack`. That is NOT merely "re-dispatched" -- the message is permanently
 removed from the PEL and reported as a dead/failed job to the DLQ consumer,
 even though the original execution may still be legitimately in progress.
@@ -1230,14 +1480,15 @@ survive; then only the vouched-for headers (incl. `X-Ingress-Subject` from the
 authz decision) are set. `ModifyResponse` runs `rewriteSetCookie` to strip
 `Domain=` and add `Secure` on every upstream `Set-Cookie`.
 
-**TLS:** wildcard via certmagic DNS-01. certmagic's `DNS01Solver` does NOT follow
-CNAMEs (verified against v0.25.x), so `ACMEConfig.DNSZone` is set as
-`DNSManager.OverrideDomain` — publish the challenge TXT directly on the delegated
-zone the scoped RFC 2136 / TSIG credential can write. `StaticFileCertProvider`
-(mount an already-issued wildcard) is the recommended FIRST deployment; the ACME
-path lights up once the delegated zone + nameserver (separate design) exist.
-certmagic + `libdns/rfc2136` are new deps (+15 modules); the DNS provider is
-behind certmagic's own `DNSProvider` interface, so swapping it is one line.
+**TLS:** wildcard via certmagic DNS-01. `ingress.dnsProviderFor` owns the
+backend choice: a Cloudflare API token (for an apps zone hosted on Cloudflare,
+which has no RFC 2136 interface) or an RFC 2136 / TSIG server, exactly one,
+with both or neither refused. certmagic's `DNS01Solver` does NOT follow CNAMEs
+(verified against v0.25.x), so the RFC 2136 path requires `ACMEConfig.DNSZone`
+as `DNSManager.OverrideDomain` and publishes the challenge TXT directly on the
+delegated zone its credential can write; the Cloudflare token writes the apps
+zone itself, so `DNSZone` stays optional there. `StaticFileCertProvider` (mount
+an already-issued wildcard) remains the simplest first deployment.
 
 **Health lives on the public :443 listener under the reserved host
 `_health.<apps-domain>`** (`server.go`), not a loopback endpoint — a completed
@@ -1437,12 +1688,37 @@ the engine's own incremental deltas into one final array before returning it.
 
 ### Approved job-template builtins (`RUN_JOB_TEMPLATE`, citadel-cli#1161)
 
+`template_builtin_video_compose.go` is inactive source for aceteam#11481.
+`runVideoComposeBuiltin` owns the proposed closed film decoder, declared-basename
+binding and media composition core, but has no registry entry; its live dependency
+set fails before effects until the pinned v3 card/disclosure renderer lands.
+`videoComposeAddDuration` owns the owner-approved total-film duration bound for
+both projected cards/chapters and actual timeline accumulation;
+`videoComposeCheckOutputDuration` separately checks concat and both encode paths
+without turning frame drift tolerance into extra duration allowance. Container
+metadata changes remain a separate reviewed design, not part of that bound.
+`template_builtin_video_compose_command.go` owns its proposed bounded, separate
+stdout/stderr captures and overflow cancellation without changing audio-mix.
+`renderPapercraftLandscapeCard` shares the existing capture lifecycle for one
+landscape with silent audio; it does not supply card assets. The proposed contract
+and remaining activation gates are in `docs/run-job-template-contract.md`.
+
 `cmd/run_job_template_ops.go` remains the workspace/hash/receipt adapter;
-`cmd/template_builtin_papercraft.go` and `template_builtin_audio_mix.go` are the
-only production registry entries. Both invoke fixed argv directly, never a
-shell. `papercraft-render` shares Chromium discovery with
+`cmd/template_builtin_papercraft.go`, `template_builtin_audio_mix.go`,
+`template_builtin_papercraft_scene.go` and `template_builtin_papercraft_scene_v2.go`
+own the four production registry entries: `papercraft-render`, `audio-mix`,
+`papercraft-scene-render` and `papercraft-scene-render-v2`. The scene owners
+assemble their separately embedded shells and delegate to the same papercraft
+capture lifecycle; v2 also validates its embedded theme registry. The render and
+audio paths invoke fixed argv directly, never a shell. `papercraft-render` shares
+Chromium discovery with
 `platform.FindChromium` and the persistent request/response CDP transport in
-`internal/cobrowsestream`. `startPapercraftAssetServer` is the browser's
+`internal/cobrowsestream`. Its HTTP target discovery accepts only a complete
+512 KiB/64-page reply, pins the debugger WebSocket to the probed loopback port,
+refuses redirects and unsuccessful statuses, and closes
+the response before returning. See `docs/cdp-target-discovery-bounds.md`; these
+limits do not prove aggregate capture memory or native browser acceptance.
+`startPapercraftAssetServer` is the browser's
 non-forwarding HTTP proxy: its random route serves declared inputs only, while
 every other HTTP/HTTPS/WebSocket request fails there and CDP blocks `file://`,
 `data:`, `blob:`, WebSocket, and FTP before navigation. Keep Chromium's
@@ -1459,7 +1735,8 @@ a `setsid` descendant cannot escape, and cleanup failure is a run failure. The
 constructor deliberately fails closed on missing systemd launch/cleanup tools
 and on non-Linux systems. The Windows process helper is only a compile stub; it
 is unreachable behind that non-Linux refusal, not a partial taskkill fallback.
-Both builtins additionally apply the independent `renderJobWallTimeout`.
+The shared render and audio paths additionally apply the independent
+`renderJobWallTimeout`.
 Browser cancellation must terminate and wait for the process tree before
 profile removal.
 
@@ -1511,6 +1788,73 @@ closed.
 
 ## Important Implementation Notes
 
+### Passcode lockout transactions (citadel-cli#1395)
+
+`nodevault.withLockoutFile` owns cross-process lockout state transactions.
+Failure/success/reset updates lock a persistent sidecar, not the atomically
+replaced YAML inode. `Lockout.Attempt` and vault unlock/rotation keep secret
+checks outside that OS lock and refuse unavailable accounting. `Lockout.Status`
+reports unavailable state explicitly; only the local-presence `Lockout.Reset`
+may discard unreadable/corrupt history and its untrusted verification anchor.
+See `docs/nodevault-cross-process-lockout.md` for the mixed-version, ownership,
+publication-review and native-platform boundaries.
+
+### HPC profile: job-scoped, API-only worker (aceteam#12715)
+
+`cmd.resolveProfileSelection` owns profile selection (`--profile` /
+`CITADEL_PROFILE`; a disagreeing pair or an unknown name is refused, so a stray
+`CITADEL_PROFILE` makes every command exit 2 on an ordinary host).
+`cmd.hpcEarlyRefusal` runs from `Execute` before cobra dispatches and refuses
+any command path that `cmd.hpcProfileAllowsCommand` (the positive list) does
+not name, including commands with their own pre-run. `cmd.applyRunProfile`
+installs the profile for the allowed ones. `hpc.ResolveLayout` decides the
+job root from `SLURM_JOB_ID` (plus `SLURM_RESTART_COUNT`) under
+`--hpc-state-root` / `CITADEL_HPC_STATE_ROOT` or `TMPDIR`, refusing missing or
+ambiguous input; `hpc.Prepare` owns the owner-only checks, including refusing
+a state base or ancestor that group or other can write without the sticky bit. `hpcscope.Install`
+makes the layout authoritative through the one-shot production scopes
+`platform.ScopeProcessDirectories` and `network.ScopeProcessStateDirectories`
+(test fixtures still win), and calls `nodeidentity.DisableLegacyReadThrough`
+so a shared home's key is never adopted. `internal/hpcscope`'s
+two-allocation subprocess test pins that no resolved path leaves the job root.
+`runWork` hands off to `runHPCWork` before anything else; the HPC worker is a
+separate positive list (`newHPCRunner`, `hpcQueueNames`), not gates inside
+`runWork`. `llm_inference` routes only through `hpcEngineBackends` (the job's
+own engine port, no default-port fallback). `hpc_work_tripwire_test.go` lists
+the entry points it must never reference (it follows the named `work.go`
+helpers and resolves import aliases), `hpc_work_listen_linux_test.go` asserts
+the production entry opens no listener, and `hpcTemplateBuiltinPolicy` owns
+which template builtins run.
+`cmd.enrollHPCNode` owns non-interactive enrollment (aceteam#12717): it
+resolves labels with `hpc.ResolveLabels` (the platform's strict label schema,
+so a missing Slurm value refuses before the token is read), generates the
+job key and CSR, then `hpc.ReadTokenFile` (opened O_NOFOLLOW and non-blocking,
+judged on the descriptor, removed only if the path still names it), and
+persists the response into the job-local `config.yaml` and identity store.
+`hpc.VerifyLeafKey` requires a leaf for the job key; any local failure after
+the server accepted the token makes a bounded best-effort deregister.
+`hpcShutdown` owns exit ordering: on the drain signal (SIGUSR1) stop claiming,
+wait up to `--hpc-drain-timeout`, deregister, cancel; SIGTERM, including one
+that arrives during the drain wait, deregisters at once. Deregistration runs
+once on every exit path after enrollment.
+The launcher (aceteam#12718): `hpc.JobSpec.Normalize` validates every value
+`hpc.RenderSbatch` writes (golden in `internal/hpc/testdata`), and `citadel hpc
+launch`/`setup` run on a login node with no profile. `hpc.Supervisor` owns the
+job body `citadel hpc run`: engine on a per-job 127.0.0.1 port in its own
+process group, `/v1/models` readiness, then the worker as a child
+`citadel work --profile hpc` with `CITADEL_VLLM_HOST_PORT` set (that env var,
+resolved at process init by `services.resolveVLLMHostPort`, is the adoption
+seam; the adoption record needs a numeric node id). `hpc.reservedFlag` owns
+the vLLM flag refusal (abbreviations, underscore spellings, `--config`), and
+`EngineSpec.Command` appends the fixed flags last. `hpc.WaitModelsReadyOwned`
+with `hpc.CheckListenerOwner` refuses a port held by another uid before any
+probe. `Supervisor.Run` keeps the first signal's deadline and exits non-zero
+for a worker error or kill. `status.filterVisibleGPUsWithUUIDs` maps UUID and
+MIG entries through `nvidia-smi -L`; `hpc.TensorParallelFor` falls back to
+`SLURM_GPUS_ON_NODE`. The venv pin is partial (vLLM only). Signals forward to the
+worker; the engine group is stopped on every exit path. Only `--runtime venv`
+runs; `hpc.ParseRuntime` refuses the reserved ones.
+
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,
 not a search path: it reads `<ConfigDir>/config.yaml` for a `node_config_dir` key
@@ -1540,6 +1884,37 @@ the intended fail-closed direction. (Constructing it also needs the verifier
 and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
+
+`status.Server.ControlTLS` reports the public certificate held by the active
+control listener, using the same immutable DER snapshot as its TLS config.
+Changing certificate files takes effect only after listener restart. The API
+heartbeat emits this as `control_tls.cert_pem` through its cached provider;
+disabled or stopped listeners omit it, and legacy direct Redis never emits it.
+This is authenticated-device evidence through the platform's existing relay
+HMAC envelope, not a device-origin signature. No control transport consumes it.
+After device-grant registration, `cmd.linkDeviceEnrollment` completes the
+server's reserved registration proof through the existing device link route;
+link refusal must propagate before enrollment can report success (#1344).
+`cmd.linkDeviceEnrollmentGated` decides when a link failure is fatal: only a
+definite refusal (`nexus.DeviceLinkRefusedError`: a 4xx, or a 200 without
+`success:true`) from a server whose `/api/version` reports at least
+`deviceLinkEnforcedFrom` (v1.520.0, aceteam#11743, the first release that
+creates a missing device configuration). A transport error or 5xx is retried
+once, then reported. A refusal from an older server, or one whose version
+cannot be read, is also reported; enrollment continues in both cases (#1350
+tracks linking such a node later). A fatal refusal runs
+`rollbackEnrollmentCredentials`, which removes only the node-file fields this
+enrollment wrote, and only while that file still holds this enrollment's own
+credential. Never replace it with `clearSavedConfig`: that relogin wipe also
+drops operator keys and a prior enrollment's credentials.
+Control Center passes the approved modal's `deviceCode` into its connect
+callback and gates both success display and worker startup on completed linking.
+The public link request uses that grant and the server's reserved used
+registration-key proof; it sends no device bearer and needs no token-scope
+expansion. If `init` obtains a fresh grant while already connected, its link
+can refuse the old registration: run `citadel logout && citadel init` to
+register through a fresh reservation. Saved credentials alone never establish
+completed device binding; the link response must confirm it.
 
 ### Two ActualState reporters, two different module sets (#733)
 
@@ -2031,6 +2406,14 @@ shaped like:
 The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
 single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
 
+### Depth point-cloud sequence proposal (citadel-cli#1385)
+
+The separate #1385 depth-service proposal is not a registered engine/job.
+`internal/pointcloud` owns its inactive packed-sequence reference codec and
+synthetic camera-distance projection, not model calibration, Files authority or
+artifact publication. `docs/pointcloud-depth-service.md` owns the proposed wire
+layout and unresolved runtime/consumer acceptance gates.
+
 ### Diffusers sidecar: per-request model selection (citadel-cli#1335)
 
 `services/diffusers-service` serves one image model on the GPU at a time and
@@ -2046,6 +2429,19 @@ stay failures. The VRAM figures in the catalog are estimates; `/health`
 `last_load.measured_vram_gb` records the real delta on each load. Pinned image
 stack and its rationale live in `requirements.txt`. The default `DIFFUSERS_MODEL` is FLUX.2-klein-4B; sdxl-turbo (non-permissive licence) is selectable only if an operator names it. `ImageModelManager.prepare` (preflight + download) runs BEFORE the resident model is evicted; a fresh model is protected until used (`DIFFUSERS_MIN_RESIDENCY_SECONDS`); and the single uvicorn worker is what enforces one model at a time.
 The compose env passthrough is covered by `KnownComposeHashes`.
+`ImageModelManager` also owns lease-counted idle eviction for the independent
+video pipeline (live only after a separately gated image pin bump).
+`Lease.release` must drop its pipeline reference before idle
+cleanup; app handlers must drop their own references before releasing. Auto
+variant selection ranks GPU-only variants ahead of CPU offload. See
+`docs/diffusers-idle-residency.md` for pins, health fields and the separate
+real-RSS/image-promotion acceptance gates; source tests are not those receipts.
+The compose image is pinned by digest, not `:latest` (citadel-cli#1346):
+compose pulls only a missing image, so a node that already held an old
+`:latest` kept serving it under newer compose defaults (FLUX.2-klein-4B on a
+diffusers 0.33 image failed every request). A new sidecar build therefore needs
+a follow-up PR that bumps the pin and registers the template hash;
+`TestOwnSidecarImagesArePinnedByDigest` lists the pinned compose files.
 
 ### Meeting media stack — virtual mic / bot speaking path (aceteam#7079)
 
@@ -3217,6 +3613,10 @@ or invalidation hook. `deliverymetadata.Observation` stores its immutable record
 behind an opaque function: Go's nested bad-verb formatting can bypass Formatters
 and print secret-bearing private pointer fields. Its formatting/shape tests pin
 that boundary. These observations do not enable durable execution or ACKs.
+Authenticated HTTP-only durable claims, renewal, commit-before-publish and
+shutdown/refusal behavior are documented in
+[docs/durable-http-delivery.md](docs/durable-http-delivery.md). That source path
+remains inactive until the paired canary and activation gates are satisfied.
 
 `Runner.Run`'s fetch loop no longer conflates "claim a job" with "execute it"
 (this is what `processJob` used to do inline, blocking `source.Next()` for the
@@ -3815,6 +4215,38 @@ convenience with improved failure modes, not isolation.
 override) rather than caching an overridden node's identity into the real
 machine's cache file.
 
+### Meeting progress, denial and Stop (citadel-cli#1506, S4a)
+
+`jobs.MeetingJoinHandler.Capabilities` owns MEETING_JOIN's declaration: a
+cooperative (graceful) Stop and the progress stages in `meeting_progress.go`
+(joining, waiting_admission, admitted, ended with a closed-set `reason`,
+transcribing). The platform cancel marker therefore no longer hard-cancels a
+meeting. Every join, admission and recording loop polls `CancelRequestedNow`.
+A Stop before recording returns `errMeetingStopped` (wraps `context.Canceled`,
+reported as "Meeting cancelled"); a Stop while recording leaves the call, then
+backs up and transcribes, and the result is `status: stopped`, never
+`completed`. A Stop during setup waits for the setup phase to finish. Denial
+probes match explicit refusal wording only and run after the admitted probe
+fails, so an unknown page degrades to `admit_timeout`, never a false
+`denied`; the selectors are English-only and untuned live. Ctx cancellation
+(shutdown/deadline) remains the hard abort described below.
+
+### Retained MEETING_JOIN terminal result (citadel-cli#1553)
+
+`worker.retainsTerminalResult` decides which job types also store their first
+terminal stream:v1 envelope under `worker.TerminalResultKey`, so a coordinator
+that was restarting during the publish can recover it (aceteam#13175).
+`RedisStreamWriter.publishTerminal` publishes first, then
+`SET NX EX` (first writer wins, so a refused redelivery cannot overwrite a good
+transcript), and never returns a retention error to the publish retry. API mode
+retains too: `worker.apiTerminalRetainer` posts the same envelope to the scoped
+`POST /api/fabric/redis/jobs/{jobId}/result` route via
+`redisapi.Client.RetainTerminalResult`, after the terminal publish, best-effort
+and bounded. An envelope over `redisapi.MaxTerminalResultBytes` is skipped with a
+log, never truncated. Do not route retention through `/api/fabric/redis/kv`. Contract for the backend
+reader: `docs/meeting-join-terminal-result.md`; tests in
+`internal/worker/terminal_retention_test.go`.
+
 ### Meeting-bot wait-loop cancellation (citadel#488, cancellation half)
 
 Every poll loop in the MEETING_JOIN join/wait chain now `select`s on
@@ -3902,11 +4334,26 @@ can't drift), `autoUpdateReportFrom` (the hand projection, pinned by
 ReconcilePendingOnStartup,ReadStateForReport}` (the atomic, preference-preserving
 state writes under `update.stateMu`). The periodic updater refreshes the cache
 via `AutoUpdaterConfig.Refresh` (threaded through `autoUpdateRuntime.refresh`);
-`buildAutoUpdateSnapshot` reuses agentNodeInfo's #923 `CurrentVersion!=running`
-rule for pending_version/restart_required. pending clears only when the running
-binary matches the staged version (`ReconcilePendingOnStartup`). Corrupt state
-degrades to `configured_enabled=null`/`last_result=unknown`, never a confident
-disabled.
+`buildAutoUpdateSnapshot` and `agentNodeInfo` use `update.StagedVersionIsNewer`
+for pending_version/restart_required. `ReconcilePendingOnStartup` clears stale
+restart results only when valid staged metadata is equal to or older than the
+running release. Invalid metadata is not proof of recovery. Corrupt state
+degrades to `configured_enabled=null`/`last_result=state_corrupt` and never supplies
+pending versions or timestamps. `resolveAutoUpdatePolicy` keeps opt-out/dev veto,
+then flag, then environment ahead of the file preference; corruption replaces
+only that last preference with unknown. Explicit enables still run, while
+telemetry writes preserve the broken bytes. `SetAutoUpdate` alone repairs malformed
+JSON and first attempts a private UTC-stamped `state.json.corrupt-*` backup.
+
+`update.InspectSelfUpdateCapability` owns current-process install authority and a
+same-directory probe, without provisioning locks or changing the binary. Worker
+startup/refresh observes it for the cached report, independently of preference.
+Periodic and remote/manual update paths consult it before download. Deliberately
+privileged installs remain supported: auto-update off reports capability rather
+than a failed update. `RecordApplyNotPermitted` owns refusal persistence, and the
+updater's refusal notice is emitted only when the observed condition changes.
+See `docs/update-install-capability.md` for the wire contract and remaining
+service/installer and native acceptance scope.
 
 **Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
 The update state file resolves from HOME (`getUserHomeDir`), and the shipped
@@ -3948,6 +4395,30 @@ handler keeps the permanent drain. External-engine `MODULE_SET` also owns a
 separate `BeginDrain()` scope: its failed re-exec path releases only that
 scope after rollback, rather than clearing a concurrent permanent drain.
 
+**Co-browse sessions across a self-update restart (citadel-cli#1546).**
+`update.AutoUpdaterConfig.Busy` (wired to `platform.CobrowseBusy`) defers the
+cycle while a session has a viewer attached or a handoff outstanding, checked
+before download and again before the swap; `AutoUpdater.deferForBusy` owns the
+`deferred_busy` result and the bound (`update.ResolveMaxDefer`, env
+`CITADEL_UPDATE_MAX_DEFER_SECONDS`, 0 never forces). Every in-process exec goes
+through `update.RestartProcess`, which runs the hook `cmd` registers
+(`platform.PrepareSelfRestart`). `platform.recoverSessions` owns re-adoption:
+each session has a registry record (state live/suspended/expired, generation
+counter) in a registry dir that `platform.SetRegistryDirResolver` points at the
+node config dir (the single place the location is chosen; the profile and session
+dirs stay in the temp base). A restart re-adopts a live record under the same id
+only if owner, browser and Xvfb start times, role, CDP identity and dir all
+verify, BEFORE the orphan sweep (which treats a dir owned by our own PID as
+stale). A live record that fails becomes `expired` with its `ended_reason`, never
+a silent delete; suspended records are never touched. Adoption is Linux only
+(`adoptionSupported`); elsewhere it stops sessions cleanly.
+Only the node-wide manager adopts, and only a record whose owner is this very
+process (same PID and start time, as after exec); local mode and a live sibling's
+records are never adopted or modified. Persistent-profile sessions are sealed and
+stopped by `prepareSelfRestart` on every OS, and ended reasons are recorded on
+every OS. A full service restart (control-group kill)
+still kills browsers; detaching them is separate work.
+
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
 stub on `!linux`) is the authority for "is a managed citadel service running
 **on this host**", not "is *this process* service-managed". It scans the
@@ -3961,16 +4432,12 @@ the worker being restarted — using it (or a `CITADEL_SERVICE` env check) from
 `citadel update install` would read the operator's own SSH shell, which never
 inherited the worker's environment, so the gate would silently never fire in
 exactly the scenario #454 reported. `resolveManagedServiceRestartTarget`
-(`cmd/update.go`) layers `ActiveManagedUnit` (the only signal that sees the
-install.sh/packer fleet unit, `citadel-worker.service` — how citadel actually
-ships on most nodes) with the cross-platform `service.Manager.Status()` (the
-only signal on macOS/Windows, and for a `citadel service install`-managed
-Linux node). **This means macOS/Windows detection is already covered, not a
-gap**: `service.Manager.Status()` (`launchd.go`/`windows.go`) is implemented
-on every platform, so a managed launchd/SCM service still gets the warn-vs-
-restart gate even though `ActiveManagedUnit` itself only ever fires on Linux
-(citadel#887 verified this rather than assuming it — read the code before
-concluding the macOS/Windows half of that issue is still open).
+(`cmd/update.go`) instead uses `service.DiscoverActiveWorkers` on Linux for
+the manual update restart path. It inspects arbitrary active service names,
+matches the resolved binary and literal `work` command, and requires one
+verified target. The target is revalidated after draining. It does not expand
+the fixed list of unit files that rematerialization may rewrite. macOS and
+Windows retain `service.Manager.Status()` (`launchd.go`/`windows.go`).
 
 `citadel update install` now warns loudly by default when a managed service is
 detected, and restarts it only with an explicit `--restart` flag.
@@ -3984,8 +4451,9 @@ seam for tests, and also driving the new `citadel service refresh-unit`). Before
 this, `sudo citadel update install` on an up-to-date node exited at "You are
 running the latest version" without ever re-materializing the unit, so a node
 deployed by a pre-#444 binary never received the restart-storm hardening (seen on
-node 1314). The already-latest branch deliberately skips `warnOrRestartManagedService`
-(the binary is unchanged, so there is no old-vs-new split-brain). Separately, the
+node 1314). `finishManualNoOp` also honors an explicit `--restart`: a managed
+worker may still run an older image even when the CLI is already current. A
+requested restart without a verified active target exits nonzero. Separately, the
 unprivileged-system-unit remediation (`service.rootRemediationCommand`) resolves
 `os.Executable()` to an ABSOLUTE path and targets the network-free
 `service refresh-unit`, because a bare `sudo citadel …` is "command not found"
@@ -4383,7 +4851,10 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 
 ### GPU Support Notes
 
-**Linux**: Full NVIDIA GPU support via NVIDIA Container Toolkit. Compose files use `driver: nvidia` specification.
+**Linux**: `platform.NvidiaGPUCountForCompose` owns the bounded tri-state observation.
+`services.SelectComposeForHost` chooses the supported CPU variant only on proven
+NVIDIA absence; unknown evidence preserves an existing flavor. `services.ComposeMapForRefresh`
+withholds uncertain variants from boot refresh. See `docs/cpu-compose-selection.md`.
 
 **macOS — no GPU in containers, and the nvidia reservation is NOT ignored (citadel-cli#1048, corrects a stale claim this section made).**
 Docker Desktop for macOS exposes **no GPU to Linux containers** at all — Metal is not passed through to the Linux VM, and there is no nvidia device driver, on Apple Silicon or Intel. The previous claim here ("Metal GPU support in containers", "`driver: nvidia` is ignored", "services still run") was wrong on all three counts: Docker Compose v2 honors `deploy.resources.reservations.devices` outside swarm, so a mandatory `driver: nvidia` reservation makes `docker compose up` **fail container creation** with `could not select device driver "nvidia" with capabilities: [[gpu]]`.

@@ -47,12 +47,71 @@ type lane struct {
 	// admitted counts jobs currently holding an admit slot (queued + executing);
 	// executing counts jobs currently past the exec-acquire. queued for display
 	// is admitted-executing. Both are plain atomics; busySince is the only field
-	// needing the mutex (it is a compound stamp on the executing==execCap edge).
+	// needing the mutex for counters (a compound stamp on the saturated edge).
+	// The same mutex also owns the pending execution-ticket queue below.
 	admitted  int64
 	executing int64
 
 	mu        sync.Mutex
 	busySince *time.Time
+	execHead  *laneExecTicket
+	execTail  *laneExecTicket
+}
+
+// laneExecTicket orders execution-slot admission, not running-work completion.
+// Only the pending head is ready. Removed tickets retain no queue links; there
+// are no tombstones or goroutines bridging a canceled ticket to its successor.
+// owner is immutable, so rejecting a foreign ticket does not read fields that
+// another lane may be changing under its own mutex.
+type laneExecTicket struct {
+	ready  chan struct{}
+	prev   *laneExecTicket
+	next   *laneExecTicket
+	owner  *lane
+	queued bool
+}
+
+// reserveExecTicket runs synchronously in dispatch claim order, after tryAdmit
+// succeeds and before its execution goroutine is started.
+func (l *lane) reserveExecTicket() *laneExecTicket {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ticket := &laneExecTicket{ready: make(chan struct{}), prev: l.execTail, owner: l, queued: true}
+	if l.execTail == nil {
+		l.execHead = ticket
+		close(ticket.ready)
+	} else {
+		l.execTail.next = ticket
+	}
+	l.execTail = ticket
+	return ticket
+}
+
+// releaseExecTicket unlinks a completed/canceled wait exactly once. Removing a
+// middle ticket must not make its successor ready ahead of the surviving head.
+// A head releases immediately after acquiring a slot, permitting parallel
+// execution up to the existing exec capacity without waiting for its handler.
+func (l *lane) releaseExecTicket(ticket *laneExecTicket) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if ticket == nil || ticket.owner != l || !ticket.queued {
+		return
+	}
+	wasHead := l.execHead == ticket
+	if ticket.prev == nil {
+		l.execHead = ticket.next
+	} else {
+		ticket.prev.next = ticket.next
+	}
+	if ticket.next == nil {
+		l.execTail = ticket.prev
+	} else {
+		ticket.next.prev = ticket.prev
+	}
+	ticket.prev, ticket.next, ticket.queued = nil, nil, false
+	if wasHead && l.execHead != nil {
+		close(l.execHead.ready)
+	}
 }
 
 // newLane builds a lane with the given admission depth and execution

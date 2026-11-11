@@ -8,20 +8,24 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/google/uuid"
 )
 
 // Client provides HTTP-based access to the AceTeam Redis API proxy.
 type Client struct {
-	baseURL    string
-	token      string
-	httpClient *http.Client
-	workerID   string
+	consumeProtocols sync.Map
+	baseURL          string
+	token            string
+	httpClient       *http.Client
+	workerID         string
 
 	// wsClient is the WebSocket client for real-time pub/sub. It is built once
 	// in NewClient and NEVER reassigned or nil'd afterwards.
@@ -67,7 +71,13 @@ type ClientConfig struct {
 	Timeout time.Duration
 
 	// DebugFunc is an optional callback for debug logging
-	DebugFunc func(format string, args ...any)
+	DebugFunc        func(format string, args ...any)
+	PlatformObserver platformhttp.Observer
+
+	// WebSocketProxy is passed to the WebSocket client as its dial proxy. nil
+	// (every ordinary node) dials directly. The REST transport already honors
+	// HTTPS_PROXY through the cloned default transport.
+	WebSocketProxy func(*http.Request) (*url.URL, error)
 }
 
 // NewClient creates a new Redis API client.
@@ -80,7 +90,8 @@ func NewClient(cfg ClientConfig) *Client {
 		baseURL: cfg.BaseURL,
 		token:   cfg.Token,
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
+			Timeout:   cfg.Timeout,
+			Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{Debugf: cfg.DebugFunc, Observe: cfg.PlatformObserver}),
 		},
 		workerID:  fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
 		debugFunc: cfg.DebugFunc,
@@ -94,6 +105,7 @@ func NewClient(cfg ClientConfig) *Client {
 		Token:            cfg.Token,
 		ReconnectEnabled: true,
 		DebugFunc:        cfg.DebugFunc,
+		Proxy:            cfg.WebSocketProxy,
 	})
 
 	return c
@@ -110,6 +122,8 @@ func (c *Client) debug(format string, args ...any) {
 func (c *Client) BaseURL() string {
 	return c.baseURL
 }
+
+func (c *Client) RedialPlatformConnections() { platformhttp.RedialClient(c.httpClient) }
 
 // WorkerID returns the unique worker identifier.
 func (c *Client) WorkerID() string {
@@ -139,6 +153,10 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// Refusal bodies can echo credentials. Do not read or retain them.
+		return newAuthorizationError(resp.StatusCode, http.MethodGet, "/api/fabric/redis/ping")
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		// A 429 carries a structured rate-limit hint (retry_after/reset_at).
@@ -156,6 +174,9 @@ func (c *Client) Ping(ctx context.Context) error {
 // Close closes the HTTP client and WebSocket if connected.
 func (c *Client) Close() error {
 	c.closed.Store(true)
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
 	if c.wsClient != nil {
 		return c.wsClient.Close()
 	}
@@ -262,6 +283,10 @@ func contains404(s string) bool {
 
 // doRequest performs an HTTP request with authentication and JSON handling.
 func (c *Client) doRequest(ctx context.Context, method, path string, body any, result any) error {
+	return c.doRequestWithClient(c.httpClient, ctx, method, path, body, result)
+}
+
+func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, method, path string, body any, result any) error {
 	var reqBody io.Reader
 	if body != nil {
 		jsonData, err := json.Marshal(body)
@@ -269,9 +294,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 			return fmt.Errorf("failed to marshal request body: %w", err)
 		}
 		reqBody = bytes.NewReader(jsonData)
-		c.debug("request: %s %s - body: %s", method, path, string(jsonData))
+		// Request data and query values may contain credentials or job payloads.
+		// Emit the same closed diagnostic labels used by authorization errors.
+		c.debug("request: %s %s - body omitted", authorizationMethod(method), authorizationPath(path))
 	} else {
-		c.debug("request: %s %s", method, path)
+		c.debug("request: %s %s", authorizationMethod(method), authorizationPath(path))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
@@ -284,29 +311,50 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Keep consume status provenance even when authorization refuses before
+	// reading the body. This is the HTTP answer, not inferred linkage state.
+	if strings.Contains(path, "/jobs/consume") {
+		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		c.debug("response: %d - <authorization refusal body omitted>", resp.StatusCode)
+		return newAuthorizationError(resp.StatusCode, method, path)
+	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	c.debug("response: %d - %s", resp.StatusCode, string(respBody))
-
-	// Record the consume HTTP status for worker introspection (issue #236).
-	// This is the single signal that would have surfaced the pre-fix #3924
-	// 400s, which otherwise only appeared as a generic "consume failed" error.
-	if strings.Contains(path, "/jobs/consume") {
-		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
+	// This exact authenticated route response negotiates the registered queue
+	// protocol before any delivery is read. Never match a generic 409 or echo body.
+	if path == "/api/fabric/redis/jobs/consume" && resp.StatusCode == http.StatusConflict && len(respBody) <= durableControlReplyLimit {
+		if object, parseErr := closedControlObject(respBody, "error"); parseErr == nil {
+			var reason string
+			if json.Unmarshal(object["error"], &reason) == nil && reason == "Queue protocol mismatch" {
+				return errQueueProtocolMismatch
+			}
+		}
 	}
+
+	// Consume bodies can carry in-flight job credentials, including malformed
+	// deliveries. Keep the decoder's original bytes but omit bodies from ALL
+	// consume diagnostics, including errors before a handler can redact them.
+	diagnosticBody := respBody
+	if path == "/api/fabric/redis/jobs/consume" {
+		diagnosticBody = []byte("<job delivery body omitted>")
+	}
+	c.debug("response: %d - %s", resp.StatusCode, string(diagnosticBody))
 
 	// Handle error responses.
 	//
-	// Every error here carries method, path, HTTP status and the (truncated)
+	// Non-authorization errors carry method, path, HTTP status and the (truncated)
 	// response body, because the callers of this package deliberately no longer
 	// second-guess a 2xx (see pubsub.go): this error string is the ONLY record of
 	// why a call failed. Issue #721 was slow to diagnose precisely because the
@@ -316,21 +364,24 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 	// so FetchWorkerConfig can fall back to defaults on a 404. Keep it verbatim.
 	if resp.StatusCode >= 400 {
 		var apiErr APIError
-		if err := json.Unmarshal(respBody, &apiErr); err == nil && apiErr.Error != "" {
+		if err := json.Unmarshal(diagnosticBody, &apiErr); err == nil && apiErr.Error != "" {
 			apiErr.StatusCode = resp.StatusCode
 			return fmt.Errorf("%s %s failed with status %d: API error: %s", method, path, resp.StatusCode, apiErr.Err())
 		}
-		return fmt.Errorf("%s %s failed with status %d: %s", method, path, resp.StatusCode, truncateBody(respBody))
+		return fmt.Errorf("%s %s failed with status %d: %s", method, path, resp.StatusCode, truncateBody(diagnosticBody))
 	}
 
 	// Parse success response
 	if result != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, result); err != nil {
+			if path == "/api/fabric/redis/jobs/consume" {
+				return fmt.Errorf("%s %s returned status %d with an unparseable job delivery body: %w", method, path, resp.StatusCode, err)
+			}
 			return fmt.Errorf("%s %s returned status %d with an unparseable body (%s): %w",
-				method, path, resp.StatusCode, truncateBody(respBody), err)
+				method, path, resp.StatusCode, truncateBody(diagnosticBody), err)
 		}
-		// Capture after the unchanged decoder; existing raw log/error surfaces
-		// are not redacted by this private bookkeeping.
+		// Capture after the unchanged decoder. Diagnostic omission above never
+		// substitutes or changes the original bytes used by passive observations.
 		if method == http.MethodPost && path == "/api/fabric/redis/jobs/consume" {
 			if consume, ok := result.(*ConsumeResponse); ok && len(consume.Messages) > 0 {
 				consume.Messages[0].Data.observation = deliverymetadata.CaptureHTTP(respBody)

@@ -22,7 +22,11 @@ const perNodeQueue = "jobs:v1:shell:org_test:node:1008"
 func newTestHandler(t *testing.T, mutate func(*AgentUpdateConfig)) *AgentUpdateHandler {
 	t.Helper()
 	cfg := AgentUpdateConfig{
-		Version: "v2.46.0",
+		Capability: func() update.SelfUpdateCapability {
+			return update.SelfUpdateCapability{State: update.SelfUpdateAvailable}
+		},
+		RecordApplyRefusal: func(update.SelfUpdateCapability) {},
+		Version:            "v2.46.0",
 		GetRelease: func(target string) (*update.Release, error) {
 			return &update.Release{TagName: "v2.47.0"}, nil
 		},
@@ -43,6 +47,57 @@ func newTestHandler(t *testing.T, mutate func(*AgentUpdateConfig)) *AgentUpdateH
 		mutate(&cfg)
 	}
 	return NewAgentUpdateHandler(cfg)
+}
+
+func TestAgentUpdatePrivilegedInstallRefusesBeforeLookupLockOrDownload(t *testing.T) {
+	for _, target := range []string{"", "v2.47.0"} {
+		t.Run("target="+target, func(t *testing.T) {
+			home := t.TempDir()
+			for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"} {
+				t.Setenv(key, home)
+			}
+			calls, recorded := 0, 0
+			capability := update.SelfUpdateCapability{State: update.SelfUpdatePrivileged, Directory: "/fixture/privileged", BinaryOwner: "root", WorkerUser: "fixture-worker"}
+			h := newTestHandler(t, func(c *AgentUpdateConfig) {
+				c.Capability = func() update.SelfUpdateCapability { return capability }
+				c.RecordApplyRefusal = func(got update.SelfUpdateCapability) {
+					recorded++
+					if got != capability {
+						t.Fatalf("lost refusal metadata: %+v", got)
+					}
+				}
+				c.GetRelease = func(string) (*update.Release, error) { calls++; return nil, nil }
+				c.CheckExact = func(context.Context, string) (string, update.VersionRelation, error) { calls++; return "", 0, nil }
+				c.Download = func(*update.Release, string) error { calls++; return nil }
+				c.NewAttempt = func() (*update.UpdateAttempt, error) { calls++; return nil, errors.New("unexpected fixture attempt") }
+				c.Apply = func(string) error { calls++; return nil }
+				c.Restart = func() error { calls++; return nil }
+			})
+			result, err := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, map[string]any{"target_version": target}), &NoOpStreamWriter{})
+			if err != nil || result.Status != JobStatusSuccess || result.Output["updated"] != false || result.Output["reason"] != update.SelfUpdatePrivileged || calls != 0 || recorded != 1 {
+				t.Fatalf("privileged install dispatched work or reported failed update: result=%+v err=%v calls=%d recorded=%d", result, err, calls, recorded)
+			}
+			if result.Output["binary_owner"] != "root" || result.Output["worker_user"] != "fixture-worker" || result.Output["install_directory"] != capability.Directory {
+				t.Fatalf("refusal lost actionable metadata: %+v", result.Output)
+			}
+		})
+	}
+}
+
+func TestAgentUpdateUnknownCapabilityFailsClosed(t *testing.T) {
+	for _, state := range []string{update.SelfUpdateUnknown, "", "unexpected-value"} {
+		t.Run(state, func(t *testing.T) {
+			calls := 0
+			h := newTestHandler(t, func(c *AgentUpdateConfig) {
+				c.Capability = func() update.SelfUpdateCapability { return update.SelfUpdateCapability{State: state} }
+				c.GetRelease = func(string) (*update.Release, error) { calls++; return nil, nil }
+			})
+			result, err := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, nil), &NoOpStreamWriter{})
+			if err != nil || result.Status != JobStatusTerminalFailure || calls != 0 {
+				t.Fatalf("unknown capability admitted work: %+v %v calls=%d", result, err, calls)
+			}
+		})
+	}
 }
 
 func agentUpdateJob(sourceQueue string, payload map[string]any) *Job {

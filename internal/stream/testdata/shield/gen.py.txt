@@ -1,0 +1,74 @@
+import json, os, random
+HERE=os.path.dirname(os.path.abspath(__file__))
+EX=os.path.join(HERE,"examples")
+random.seed(7)
+UA_B="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+def line(ip,t,method,path,status,size=512,ua=UA_B,ref="-"):
+    return f'{ip} - - [11/Oct/2026:10:{t//60:02d}:{t%60:02d} +0000] "{method} {path} HTTP/1.1" {status} {size} "{ref}" "{ua}"'
+normal_ips=["192.0.2.10","192.0.2.11","198.51.100.5","198.51.100.6","203.0.113.20"]
+normal_paths=["/","/about","/courses","/courses/ai-101","/pricing","/contact","/static/app.css","/static/app.js","/blog/welcome"]
+def normal(n,start=0):
+    out=[]
+    for i in range(n):
+        out.append(line(random.choice(normal_ips),start+i*7,"GET",random.choice(normal_paths),200,random.randint(400,9000)))
+    return out
+batches={}
+# a clean
+batches["a_clean"]=normal(18)+[line("192.0.2.10",150,"POST","/login",302),line("198.51.100.6",160,"GET","/missing-page",404,200)]
+# b sqli + known bad
+b=normal(10)
+sq=["/products?id=1'%20OR%20'1'='1","/products?id=1%20UNION%20SELECT%20username,password%20FROM%20users--","/search?q=a'%20OR%201=1--","/products?id=1;%20DROP%20TABLE%20users","/search?q=1'%20AND%20sleep(5)--"]
+for i,p in enumerate(sq): b.append(line("203.0.113.9",200+i*3,"GET",p,500 if i%2 else 200,300,"sqlmap/1.7"))
+b.append(line("203.0.113.66",230,"GET","/",200)); b.append(line("203.0.113.66",235,"GET","/courses",200)); b.append(line("203.0.113.66",240,"GET","/pricing",200))
+batches["b_sqli_knownbad"]=sorted(b,key=lambda s:s.split('[')[1])
+# c ambiguous
+c=normal(8)
+ua_c="Mozilla/5.0 (compatible; research-crawler/2.1; +http://cs.example-university.edu/crawler)"
+for i,p in enumerate(["/admin","/admin/login","/admin/users","/admin/config","/admin/backup","/admin/settings","/admin/reports","/admin/panel","/admin/tools","/admin/dashboard"]):
+    c.append(line("192.0.2.150",300+i*2,"GET",p,404,180,ua_c))
+c.append(line("192.0.2.150",325,"GET","/robots.txt",200,60,ua_c))
+batches["c_ambiguous_crawler"]=sorted(c,key=lambda s:s.split('[')[1])
+# d repeat + credential stuffing
+d=normal(7)
+for i,p in enumerate(["/.env","/wp-admin/","/.env.bak","/wp-login.php"]):
+    d.append(line("192.0.2.200",400+i*4,"GET",p,404,150,"curl/8.0"))
+for i in range(12):
+    d.append(line("198.51.100.140",420+i*2,"POST","/login",401,310,"python-requests/2.31"))
+d.append(line("198.51.100.140",446,"POST","/login",302,0,"python-requests/2.31"))
+batches["d_repeat_credstuffing"]=sorted(d,key=lambda s:s.split('[')[1])
+# e fail then success (R5), per IP
+e=normal(10)
+for i in range(6): e.append(line("198.18.1.50",400+i*3,"POST","/login",401,310,"python-requests/2.31"))
+e.append(line("198.18.1.50",420,"POST","/login",302,0,"python-requests/2.31"))
+# success BEFORE the failures: order matters, R4 only
+e.append(line("198.18.1.60",380,"POST","/login",302,0,"python-requests/2.31"))
+for i in range(6): e.append(line("198.18.1.60",385+i*3,"POST","/login",401,310,"python-requests/2.31"))
+# a legit user mistypes twice then succeeds: below threshold, clean
+for i in range(2): e.append(line("192.0.2.11",430+i*5,"POST","/login",401,310))
+e.append(line("192.0.2.11",445,"POST","/login",302,0))
+batches["e_fail_then_success"]=sorted(e,key=lambda s:s.split('[')[1])
+# e2 split-IP: 3 failures from each of 3 IPs in one /24, then a success from one of them
+e2=normal(8)
+for i in range(3):
+    for j,last in enumerate([141,142,143]):
+        e2.append(line(f"198.18.2.{last}",500+i*9+j*2,"POST","/login",401,310,"python-requests/2.31"))
+e2.append(line("198.18.2.143",540,"POST","/login",302,0,"python-requests/2.31"))
+batches["e2_split_ip_fail_then_success"]=sorted(e2,key=lambda s:s.split('[')[1])
+# f multi-key history match: curl scanner from a /24 with no history, same UA and path pattern as INC-2026-0301
+f=normal(8)
+for i,p in enumerate(["/.env","/.env.bak","/wp-admin/"]):
+    f.append(line("198.18.9.14",600+i*4,"GET",p,404,150,"curl/8.0"))
+# benign crawler: own UA, stale-link 404 burst, must match nothing in history
+ua_f="friendly-indexer/1.0 (+https://indexer.example.org/bot)"
+for i in range(10):
+    f.append(line("198.18.5.20",620+i*2,"GET",f"/old-page-{i}",404,180,ua_f))
+batches["f_multikey_match"]=sorted(f,key=lambda s:s.split('[')[1])
+for k,v in batches.items():
+    open(os.path.join(EX,f"{k}.log"),"w").write("\n".join(v)+"\n"); print(k,len(v))
+history=[
+ {"id":"INC-2026-0412","days_ago":21,"ip":"203.0.113.88","cidr":None,"ua":None,"path_patterns":["/login"],"verdict":"malicious","action":"IP blocked 24h by analyst","summary":"credential stuffing, 60 failed POST /login in 2 minutes"},
+ {"id":"INC-2026-0377","days_ago":45,"ip":None,"cidr":"198.51.100.0/24","ua":"sqlmap/1.7","path_patterns":["/search","/products"],"verdict":"malicious","action":"blocked 60m, recurred","summary":"SQL injection probing on /search?q="},
+ {"id":"INC-2026-0301","days_ago":90,"ip":"192.0.2.200","cidr":None,"ua":"curl/8.0","path_patterns":["/.env","/wp-admin","/.git"],"verdict":"malicious","action":"blocked 24h","summary":"scanning for /.env, /wp-admin, /.git from curl user agent"},
+ {"id":"INC-2026-0266","days_ago":120,"ip":"192.0.2.150","cidr":None,"ua":"research-crawler/2.1","path_patterns":["/admin"],"verdict":"benign","action":"analyst closed as false positive, no block","summary":"benign university research crawler hit /admin paths"},
+]
+json.dump(history,open(os.path.join(EX,"history.json"),"w"),indent=1)

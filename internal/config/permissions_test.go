@@ -201,3 +201,51 @@ func containsPlaintextPIN(s, pin string) bool {
 	}
 	return false
 }
+
+func TestLoadPermissionsStrict(t *testing.T) {
+	dir := t.TempDir()
+	p, err := LoadPermissionsStrict(dir)
+	if err != nil || p.HasPasscode() {
+		t.Fatalf("missing file must give defaults: %v %+v", err, p)
+	}
+	if err := os.WriteFile(filepath.Join(dir, permissionsFile), []byte("desktop: [not-a-bool"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPermissionsStrict(dir); err == nil {
+		t.Fatal("an unparseable file must be an error, not the defaults")
+	}
+	if err := os.Remove(filepath.Join(dir, permissionsFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, permissionsFile), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPermissionsStrict(dir); err == nil {
+		t.Fatal("an unreadable permissions path must be an error, not the defaults")
+	}
+}
+
+func TestSavePermissionsReplacesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	p := DefaultPermissions()
+	p.PasscodeHash = "hash-one"
+	if err := SavePermissions(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	p.PasscodeHash = "hash-two"
+	if err := SavePermissions(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadPermissionsStrict(dir)
+	if err != nil || got.PasscodeHash != "hash-two" {
+		t.Fatalf("reload = %+v, %v", got, err)
+	}
+	info, err := os.Stat(filepath.Join(dir, permissionsFile))
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("permissions file mode = %v, %v; want 0600", info.Mode().Perm(), err)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("temp files left behind: %v", entries)
+	}
+}

@@ -330,7 +330,7 @@ func TestFineTuneConfiguredNodeManifestFailureNeverFallsBack(t *testing.T) {
 	for _, manifestState := range []string{"missing", "malformed"} {
 		t.Run(manifestState, func(t *testing.T) {
 			home := t.TempDir()
-			t.Setenv("HOME", home)
+			useCmdFixtureHome(t, home)
 			t.Setenv("CITADEL_NODE_DIR", "")
 			configDir := filepath.Join(home, "configured-node")
 			defaultDir := filepath.Join(home, "citadel-node")
@@ -582,14 +582,14 @@ func TestFineTuneHeldComposeRefreshDefersBeforeRewrite(t *testing.T) {
 		called++
 		return composerefresh.Result{}, nil
 	}
-	refreshManagedComposeFilesWithSweep(configDir, sweep)
+	refreshManagedComposeFilesWithSweep(configDir, sweep, func() int { return 1 })
 	if called != 0 {
 		t.Fatal("compose refresh rewrote under fine-tune hold")
 	}
 	if err := os.Remove(finetunesafety.Path(configDir)); err != nil {
 		t.Fatal(err)
 	}
-	refreshManagedComposeFilesWithSweep(configDir, sweep)
+	refreshManagedComposeFilesWithSweep(configDir, sweep, func() int { return 1 })
 	if called != 1 {
 		t.Fatalf("compose refresh did not resume after hold: %d", called)
 	}

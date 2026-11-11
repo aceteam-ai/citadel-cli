@@ -1,0 +1,22 @@
+{
+  "title": "Synthetic known bad IP",
+  "name": "R1",
+  "logsource": {
+    "category": "webserver"
+  },
+  "detection": {
+    "selection": {
+      "source.ip": [
+        "203.0.113.66",
+        "203.0.113.67",
+        "198.51.100.23"
+      ]
+    },
+    "condition": "selection"
+  },
+  "x-aceteam": {
+    "group_by": [
+      "source.ip"
+    ]
+  }
+}

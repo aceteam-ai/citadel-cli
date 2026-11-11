@@ -1,0 +1,893 @@
+package cmd
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"gopkg.in/yaml.v3"
+)
+
+func TestDeviceEnrollmentLinkUsesRegisteredIdentityAndCurrentGrant(t *testing.T) {
+	result := &DeviceAuthResult{DeviceCode: "current-grant", Token: &nexus.TokenResponse{Authkey: "current-registration-key"}}
+	nodeID := func(context.Context) string { return "42" }
+	called := false
+	refused := errors.New("reservation no longer owns this node")
+	err := linkDeviceEnrollmentWith(context.Background(), result, nodeID, func(_ context.Context, code, id string) error {
+		called = true
+		if code != result.DeviceCode || id != "42" {
+			t.Fatal("link substituted another enrollment or node identity")
+		}
+		return refused
+	})
+	if !called || !errors.Is(err, refused) {
+		t.Fatal("server link refusal must propagate to the enrollment caller")
+	}
+}
+
+func TestDeviceEnrollmentLinkRefusesMissingCurrentAuthorization(t *testing.T) {
+	for _, result := range []*DeviceAuthResult{nil, {}, {Token: &nexus.TokenResponse{}}, {DeviceCode: "grant", Token: &nexus.TokenResponse{DeviceAPIToken: "saved-bearer-alone"}}} {
+		err := linkDeviceEnrollmentWith(context.Background(), result, func(context.Context) string { t.Fatal("must reject before network identity lookup"); return "42" }, func(context.Context, string, string) error { t.Fatal("must not link"); return nil })
+		if err == nil {
+			t.Fatal("missing current authorization must fail")
+		}
+		if kind, status := nexus.DeviceLinkFailureDetails(err); kind != nexus.DeviceLinkLocalPrecondition || status != 0 {
+			t.Fatal("missing current authorization must be a static local precondition, not a transport failure")
+		}
+	}
+	result := &DeviceAuthResult{DeviceCode: "grant", Token: &nexus.TokenResponse{Authkey: "registration-key"}}
+	err := linkDeviceEnrollmentWith(context.Background(), result, func(context.Context) string { return "" }, func(context.Context, string, string) error {
+		t.Fatal("must not substitute hostname or IP")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("missing registered identity must fail")
+	}
+	if kind, status := nexus.DeviceLinkFailureDetails(err); kind != nexus.DeviceLinkLocalPrecondition || status != 0 {
+		t.Fatal("missing current node must be a static local precondition, not a transport failure")
+	}
+}
+
+func TestDeviceEnrollmentRefusalExplainsFreshRegistrationRecovery(t *testing.T) {
+	refused := errors.New("device reservation does not match the connected node")
+	err := deviceEnrollmentRecoveryError(refused)
+	if !errors.Is(err, refused) || !strings.Contains(err.Error(), "saved credentials do not complete device binding") || !strings.Contains(err.Error(), "citadel logout && citadel init") {
+		t.Fatal("link refusal must preserve its cause and explain explicit fresh-registration recovery")
+	}
+	if strings.Contains(err.Error(), refused.Error()) {
+		t.Fatal("recovery diagnostic must not render its arbitrary cause")
+	}
+}
+
+// linkGateServer stands in for an aceteam auth service. linkStatuses are the
+// link route's successive answers (the last repeats): 404 is what a pre-v1.520
+// server returns for a grant approved without the onboarding wizard. version is
+// what /api/version reports, or "" for an unavailable version endpoint.
+func linkGateServer(t *testing.T, version string, linkStatuses []int, linkCalls, versionCalls *int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/fabric/device-config/private-grant/link":
+			status := linkStatuses[min(*linkCalls, len(linkStatuses)-1)]
+			*linkCalls++
+			if status == http.StatusOK {
+				fmt.Fprint(w, `{"success":true}`)
+				return
+			}
+			http.Error(w, `{"error":"No configuration found for this device"}`, status)
+		case "/api/version":
+			*versionCalls++
+			if version == "" {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			fmt.Fprintf(w, `{"version":%q,"service":"web"}`, version)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+type linkGateObservation struct {
+	err        error
+	rolledBack *nexus.TokenResponse
+	warnings   []string
+}
+
+var linkGateToken = &nexus.TokenResponse{Authkey: "registration-key", DeviceAPIToken: "device-bearer"}
+
+func runLinkGate(t *testing.T, client deviceLinker) linkGateObservation {
+	t.Helper()
+	return runLinkGateWithRollback(t, client, nil)
+}
+
+func runLinkGateWithRollback(t *testing.T, client deviceLinker, rollback func(*nexus.TokenResponse) error) linkGateObservation {
+	t.Helper()
+	return runLinkGateWith(t, client, rollback, func(context.Context) string { return "42" })
+}
+
+func runLinkGateWith(t *testing.T, client deviceLinker, rollback func(*nexus.TokenResponse) error, nodeID func(context.Context) string) linkGateObservation {
+	t.Helper()
+	var obs linkGateObservation
+	prevRollback, prevWarn, prevDelay := enrollmentRollbackFn, deviceLinkWarnFn, deviceLinkRetryDelay
+	t.Cleanup(func() {
+		enrollmentRollbackFn, deviceLinkWarnFn, deviceLinkRetryDelay = prevRollback, prevWarn, prevDelay
+	})
+	enrollmentRollbackFn = func(token *nexus.TokenResponse) error {
+		obs.rolledBack = token
+		if rollback != nil {
+			return rollback(token)
+		}
+		return nil
+	}
+	deviceLinkWarnFn = func(msg string) { obs.warnings = append(obs.warnings, msg) }
+	deviceLinkRetryDelay = 0
+	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: linkGateToken}
+	obs.err = linkDeviceEnrollmentGated(result, nodeID, client)
+	diagnostics := append([]string(nil), obs.warnings...)
+	if obs.err != nil {
+		diagnostics = append(diagnostics, obs.err.Error())
+	}
+	for _, w := range diagnostics {
+		if strings.Contains(w, "private-grant") || strings.Contains(w, "registration-key") || strings.Contains(w, "device-bearer") {
+			t.Fatalf("diagnostic exposes enrollment secrets: %q", w)
+		}
+	}
+	return obs
+}
+
+func TestDeviceLinkRefusalFromOldServerContinues(t *testing.T) {
+	for _, version := range []string{"1.519.0", "1.99.0", "0.9.0"} {
+		t.Run(version, func(t *testing.T) {
+			links, versions := 0, 0
+			srv := linkGateServer(t, version, []int{404}, &links, &versions)
+			obs := runLinkGate(t, nexus.NewDeviceAuthClient(srv.URL))
+			if obs.err != nil || obs.rolledBack != nil || len(obs.warnings) != 1 || links != 1 || versions != 1 {
+				t.Fatalf("pre-v1.520 refusal must warn once and keep credentials: %+v links=%d versions=%d", obs, links, versions)
+			}
+		})
+	}
+}
+
+func TestDeviceLinkRefusalFromEnforcingServerIsFatal(t *testing.T) {
+	for _, version := range []string{"1.520.0", "v1.520.0", "1.521.3", "1.1000.0", "2.0.0"} {
+		t.Run(version, func(t *testing.T) {
+			links, versions := 0, 0
+			srv := linkGateServer(t, version, []int{404}, &links, &versions)
+			obs := runLinkGate(t, nexus.NewDeviceAuthClient(srv.URL))
+			if obs.err == nil || obs.rolledBack != linkGateToken || len(obs.warnings) != 0 || links != 1 {
+				t.Fatalf("v1.520+ refusal must fail and roll back this enrollment (no retry): %+v links=%d", obs, links)
+			}
+			if !strings.Contains(obs.err.Error(), "citadel logout && citadel init") {
+				t.Fatalf("fatal refusal must explain recovery: %v", obs.err)
+			}
+		})
+	}
+}
+
+func TestDeviceLinkRefusalWithUnreadableVersionContinues(t *testing.T) {
+	for _, version := range []string{"", "not-a-version"} {
+		t.Run(fmt.Sprintf("version=%q", version), func(t *testing.T) {
+			links, versions := 0, 0
+			srv := linkGateServer(t, version, []int{404}, &links, &versions)
+			obs := runLinkGate(t, nexus.NewDeviceAuthClient(srv.URL))
+			if obs.err != nil || obs.rolledBack != nil || len(obs.warnings) != 1 || versions != 1 {
+				t.Fatalf("unreadable version must warn and continue: %+v versions=%d", obs, versions)
+			}
+		})
+	}
+}
+
+// With no registered node the link is never sent, so the key it would have
+// promoted is certainly unlinked and expires within the hour. That says
+// nothing about the server: no version may turn it into a warning, and the
+// credentials this enrollment saved are removed.
+func TestDeviceLinkWithoutRegisteredNodeFailsOnEveryServer(t *testing.T) {
+	for _, version := range []string{"1.519.0", "", "1.520.0"} {
+		t.Run(fmt.Sprintf("version=%q", version), func(t *testing.T) {
+			links, versions := 0, 0
+			srv := linkGateServer(t, version, []int{http.StatusOK}, &links, &versions)
+			obs := runLinkGateWith(t, nexus.NewDeviceAuthClient(srv.URL), nil, func(context.Context) string { return "" })
+			if obs.err == nil || len(obs.warnings) != 0 {
+				t.Fatalf("an unsent link must fail, never warn and continue: %+v", obs)
+			}
+			if links != 0 || versions != 0 || obs.rolledBack != linkGateToken {
+				t.Fatalf("an unsent link must not be retried or version-gated, and must roll back: links=%d versions=%d rolledBack=%v", links, versions, obs.rolledBack != nil)
+			}
+			if kind, _ := nexus.DeviceLinkFailureDetails(obs.err); kind != nexus.DeviceLinkLocalPrecondition {
+				t.Fatalf("failure category = %s, want local_precondition", kind)
+			}
+			if !strings.Contains(obs.err.Error(), "citadel logout && citadel init") {
+				t.Fatalf("fatal failure must explain recovery: %v", obs.err)
+			}
+		})
+	}
+}
+
+func TestDeviceLinkClientLocalPreconditionIsFinal(t *testing.T) {
+	for _, version := range []string{"1.520.0", "1.519.0", ""} {
+		t.Run(fmt.Sprintf("version=%q", version), func(t *testing.T) {
+			client := &scriptedDeviceLinker{linkErrors: []error{nexus.NewDeviceLinkFailure(nexus.DeviceLinkLocalPrecondition, 0)}, version: version}
+			obs := runLinkGate(t, client)
+			if obs.err == nil || len(obs.warnings) != 0 || len(client.grants) != 1 || client.versionCalls != 0 || obs.rolledBack != linkGateToken {
+				t.Fatalf("a link the client refused to send must fail once, without a version lookup, and roll back: %+v links=%d versions=%d", obs, len(client.grants), client.versionCalls)
+			}
+		})
+	}
+}
+
+func TestDeviceLinkTransientFailureFromEnforcingServerFailsWithoutRollback(t *testing.T) {
+	links, versions := 0, 0
+	srv := linkGateServer(t, "1.520.0", []int{502}, &links, &versions)
+	obs := runLinkGate(t, nexus.NewDeviceAuthClient(srv.URL))
+	if obs.err == nil || obs.rolledBack != nil || len(obs.warnings) != 0 || links != 2 || versions != 1 {
+		t.Fatalf("unconfirmed v1.520+ link must fail after one retry and retain credentials: %+v links=%d versions=%d", obs, links, versions)
+	}
+}
+
+type scriptedDeviceLinker struct {
+	linkErrors   []error
+	version      string
+	versionError error
+	grants       []string
+	nodeIDs      []string
+	versionCalls int
+}
+
+func (l *scriptedDeviceLinker) LinkRegisteredNode(_ context.Context, grant, nodeID string) error {
+	l.grants = append(l.grants, grant)
+	l.nodeIDs = append(l.nodeIDs, nodeID)
+	return l.linkErrors[min(len(l.grants)-1, len(l.linkErrors)-1)]
+}
+
+func (l *scriptedDeviceLinker) ServerVersion(context.Context) (string, error) {
+	l.versionCalls++
+	return l.version, l.versionError
+}
+
+// No diagnostic may call Error on an opaque cause: it may contain credentials,
+// grant-bearing URLs, or unsafe terminal text supplied by a transport.
+type opaqueDeviceLinkError struct{ rendered bool }
+
+func (e *opaqueDeviceLinkError) Error() string {
+	e.rendered = true
+	panic("opaque link error must not be rendered")
+}
+
+func TestDeviceLinkFinalOutcomeUsesVersionWithoutReplayingExpiredGrants(t *testing.T) {
+	opaque := &opaqueDeviceLinkError{}
+	expired := &nexus.DeviceLinkRefusedError{StatusCode: http.StatusGone}
+	for _, tt := range []struct {
+		name         string
+		version      string
+		versionError error
+		linkErrors   []error
+		wantFailure  bool
+		wantRollback bool
+		wantLinks    int
+	}{
+		{name: "modern transport", version: "1.520.0", linkErrors: []error{opaque}, wantFailure: true, wantLinks: 2},
+		{name: "modern expired grant", version: "1.520.0", linkErrors: []error{expired}, wantFailure: true, wantRollback: true, wantLinks: 1},
+		{name: "modern transport then refusal", version: "1.521.0", linkErrors: []error{opaque, expired}, wantFailure: true, wantLinks: 2},
+		{name: "old transport", version: "1.519.9", linkErrors: []error{opaque}, wantLinks: 2},
+		{name: "old expired grant", version: "1.519.9", linkErrors: []error{expired}, wantLinks: 1},
+		{name: "unknown transport", versionError: opaque, linkErrors: []error{opaque}, wantLinks: 2},
+		{name: "unknown expired grant", versionError: opaque, linkErrors: []error{expired}, wantLinks: 1},
+		{name: "unrecognized private version", version: "private-grant registration-key device-bearer", linkErrors: []error{opaque}, wantLinks: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &scriptedDeviceLinker{linkErrors: tt.linkErrors, version: tt.version, versionError: tt.versionError}
+			obs := runLinkGate(t, client)
+			if opaque.rendered {
+				t.Fatal("link and version causes must never be rendered, even by a formatter that recovers panics")
+			}
+			if (obs.err != nil) != tt.wantFailure || (obs.rolledBack != nil) != tt.wantRollback || len(client.grants) != tt.wantLinks || client.versionCalls != 1 {
+				t.Fatalf("unexpected final outcome: failed=%v rollback=%v links=%d versions=%d", obs.err != nil, obs.rolledBack != nil, len(client.grants), client.versionCalls)
+			}
+			for i, grant := range client.grants {
+				if grant != "private-grant" || client.nodeIDs[i] != "42" {
+					t.Fatal("link must use only the current grant and current registered identity")
+				}
+			}
+			if tt.wantFailure {
+				if len(obs.warnings) != 0 || !errors.Is(obs.err, tt.linkErrors[len(tt.linkErrors)-1]) || !strings.Contains(obs.err.Error(), "fresh browser approval") {
+					t.Fatal("modern failure must preserve its typed cause and require fresh approval without a compatibility warning")
+				}
+			} else if len(obs.warnings) != 1 || !strings.Contains(obs.warnings[0], "unverified") || !strings.Contains(obs.warnings[0], "citadel logout && citadel init") || !strings.Contains(obs.warnings[0], "fresh browser approval") {
+				t.Fatal("compatibility must explicitly report unverified binding and fresh-registration recovery")
+			}
+		})
+	}
+}
+
+func TestDeviceLinkUncertaintyRetainsSavedCredentialBytes(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		linkErrors []error
+	}{
+		{name: "uncertain twice", linkErrors: []error{&opaqueDeviceLinkError{}}},
+		{name: "uncertain then expired", linkErrors: []error{&opaqueDeviceLinkError{}, &nexus.DeviceLinkRefusedError{StatusCode: http.StatusGone}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "device_api_token: device-bearer\norg_id: current-org\naceteam_api_key: operator-key\n"
+			path := writeRollbackFixture(t, content)
+			client := &scriptedDeviceLinker{linkErrors: tt.linkErrors, version: "1.520.0"}
+			obs := runLinkGateWithRollback(t, client, func(token *nexus.TokenResponse) error {
+				return rollbackEnrollmentCredentials(path, token)
+			})
+			if obs.err == nil || obs.rolledBack != nil || len(client.grants) != 2 || client.versionCalls != 1 {
+				t.Fatal("uncertain modern link must fail after its bounded retry without attempting credential removal")
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != content {
+				t.Fatal("a later refusal cannot disprove an earlier server commit; saved credentials must remain byte-for-byte unchanged")
+			}
+		})
+	}
+}
+
+func TestDeviceLinkDefiniteRefusalRollsBackOnlyCurrentCredential(t *testing.T) {
+	for _, bearer := range []string{"device-bearer", "replacement-bearer"} {
+		t.Run(bearer, func(t *testing.T) {
+			path := writeRollbackFixture(t, "device_api_token: "+bearer+"\naceteam_api_key: operator-key\n")
+			client := &scriptedDeviceLinker{linkErrors: []error{&nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}}, version: "1.520.0"}
+			obs := runLinkGateWithRollback(t, client, func(token *nexus.TokenResponse) error {
+				return rollbackEnrollmentCredentials(path, token)
+			})
+			if obs.err == nil || obs.rolledBack != linkGateToken {
+				t.Fatal("definite modern refusal must attempt current-enrollment rollback")
+			}
+			got := readRollbackFixture(t, path)
+			if got["aceteam_api_key"] != "operator-key" {
+				t.Fatal("rollback must preserve the operator credential")
+			}
+			if bearer == "device-bearer" {
+				if _, ok := got["device_api_token"]; ok {
+					t.Fatal("refused current credential must be removed")
+				}
+			} else if got["device_api_token"] != bearer {
+				t.Fatal("refusal must not remove a replacement credential")
+			}
+		})
+	}
+}
+
+func TestDeviceLinkRollbackFailureDiagnosticIsRedacted(t *testing.T) {
+	client := &scriptedDeviceLinker{linkErrors: []error{&nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}}, version: "1.520.0"}
+	opaque := &opaqueDeviceLinkError{}
+	obs := runLinkGateWithRollback(t, client, func(*nexus.TokenResponse) error { return opaque })
+	if obs.err == nil || opaque.rendered || !strings.Contains(obs.err.Error(), "removing this enrollment's saved credentials also failed") {
+		t.Fatal("rollback failure must remain visible without rendering its opaque cause")
+	}
+}
+
+func TestDeviceLinkTransientFailureRecoversOnRetry(t *testing.T) {
+	links, versions := 0, 0
+	srv := linkGateServer(t, "1.520.0", []int{503, 200}, &links, &versions)
+	obs := runLinkGate(t, nexus.NewDeviceAuthClient(srv.URL))
+	if obs.err != nil || obs.rolledBack != nil || len(obs.warnings) != 0 || links != 2 {
+		t.Fatalf("retry must complete the link: %+v links=%d", obs, links)
+	}
+}
+
+type successfulLinker struct{ versionCalls int }
+
+func (l *successfulLinker) LinkRegisteredNode(context.Context, string, string) error { return nil }
+func (l *successfulLinker) ServerVersion(context.Context) (string, error) {
+	l.versionCalls++
+	return "1.520.0", nil
+}
+
+func TestDeviceLinkSuccessDoesNotConsultVersion(t *testing.T) {
+	l := &successfulLinker{}
+	obs := runLinkGate(t, l)
+	if obs.err != nil || obs.rolledBack != nil || len(obs.warnings) != 0 || l.versionCalls != 0 {
+		t.Fatalf("a confirmed link needs no version gate: %+v calls=%d", obs, l.versionCalls)
+	}
+}
+
+// A recognized cause can be wrapped by a caller whose Error would leak a
+// credential. Diagnostic classification must traverse types, never render it.
+type wrappedDeviceLinkDiagnostic struct {
+	cause    error
+	rendered bool
+}
+
+func (e *wrappedDeviceLinkDiagnostic) Error() string {
+	e.rendered = true
+	panic("private-grant registration-key device-bearer must not be rendered")
+}
+
+func (e *wrappedDeviceLinkDiagnostic) Unwrap() error { return e.cause }
+
+func TestDeviceLinkRecoveryProjectsTypedCauseWithoutRenderingWrapper(t *testing.T) {
+	cause := nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPServer, http.StatusServiceUnavailable)
+	wrapped := &wrappedDeviceLinkDiagnostic{cause: cause}
+	err := deviceEnrollmentRecoveryError(wrapped)
+	if !errors.Is(err, cause) || !strings.Contains(err.Error(), "category=http_server, HTTP 503") || wrapped.rendered {
+		t.Fatal("recovery must retain typed cause inspection while rendering only validated static fields")
+	}
+	var typed *nexus.DeviceLinkFailure
+	if !errors.As(err, &typed) || typed != cause {
+		t.Fatal("recovery hid the typed link failure from callers")
+	}
+}
+
+func TestDeviceLinkStaticCategoriesPreserveRetryRollbackAndCompatibility(t *testing.T) {
+	for _, version := range []string{"1.520.0", "1.519.0", ""} {
+		for _, tc := range []struct {
+			name         string
+			cause        error
+			diagnostic   string
+			wantLinks    int
+			wantRollback bool
+		}{
+			{"transport", nexus.NewDeviceLinkFailure(nexus.DeviceLinkTransport, 0), "category=transport", 2, false},
+			{"server503", nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPServer, http.StatusServiceUnavailable), "category=http_server, HTTP 503", 2, false},
+			{"unexpected201", nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPStatus, http.StatusCreated), "category=http_status, HTTP 201", 2, false},
+			{"malformed200", nexus.NewDeviceLinkFailure(nexus.DeviceLinkMalformedResponse, http.StatusOK), "category=malformed_response, HTTP 200", 2, false},
+			{"refused403", &nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}, "category=refused, HTTP 403", 1, true},
+			{"opaque", &opaqueDeviceLinkError{}, "category=unconfirmed", 2, false},
+		} {
+			t.Run(version+"/"+tc.name, func(t *testing.T) {
+				client := &scriptedDeviceLinker{linkErrors: []error{tc.cause}, version: version}
+				obs := runLinkGate(t, client)
+				modern := version == "1.520.0"
+				if len(client.grants) != tc.wantLinks || client.versionCalls != 1 || (obs.rolledBack != nil) != (modern && tc.wantRollback) {
+					t.Fatal("diagnostic categorization changed retry count, version lookup, or rollback authority")
+				}
+				var text string
+				if modern {
+					if obs.err == nil || !errors.Is(obs.err, tc.cause) || len(obs.warnings) != 0 {
+						t.Fatal("modern failure lost its cause or gained a compatibility continuation")
+					}
+					text = obs.err.Error()
+				} else {
+					if obs.err != nil || len(obs.warnings) != 1 {
+						t.Fatal("older or unreadable server lost its compatibility warning")
+					}
+					text = obs.warnings[0]
+				}
+				if !strings.Contains(text, tc.diagnostic) || !strings.Contains(text, "fresh browser approval") {
+					t.Fatal("safe category/status or existing recovery guidance was lost")
+				}
+				if opaque, ok := tc.cause.(*opaqueDeviceLinkError); ok && opaque.rendered {
+					t.Fatal("opaque failure was rendered while classifying it")
+				}
+			})
+		}
+	}
+}
+
+func TestDeviceLinkTypedServerUncertaintyStillPreventsLaterRefusalRollback(t *testing.T) {
+	content := "device_api_token: device-bearer\norg_id: current-org\naceteam_api_key: operator-key\n"
+	path := writeRollbackFixture(t, content)
+	refused := &nexus.DeviceLinkRefusedError{StatusCode: http.StatusForbidden}
+	client := &scriptedDeviceLinker{
+		linkErrors: []error{nexus.NewDeviceLinkFailure(nexus.DeviceLinkHTTPServer, http.StatusServiceUnavailable), refused},
+		version:    "1.520.0",
+	}
+	obs := runLinkGateWithRollback(t, client, func(token *nexus.TokenResponse) error {
+		return rollbackEnrollmentCredentials(path, token)
+	})
+	data, readErr := os.ReadFile(path)
+	if obs.err == nil || !errors.Is(obs.err, refused) || obs.rolledBack != nil || len(client.grants) != 2 || client.versionCalls != 1 || readErr != nil || string(data) != content {
+		t.Fatal("typed server failure followed by refusal changed uncertain-commit ownership or saved bytes")
+	}
+	if !strings.Contains(obs.err.Error(), "category=refused, HTTP 403") {
+		t.Fatal("diagnostic must describe the final typed response without erasing earlier uncertainty")
+	}
+}
+
+func writeRollbackFixture(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func readRollbackFixture(t *testing.T, path string) map[string]interface{} {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]interface{}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		t.Fatal(err)
+	}
+	return config
+}
+
+func TestRollbackEnrollmentCredentialsRemovesOnlyThisEnrollmentsFields(t *testing.T) {
+	path := writeRollbackFixture(t, `device_api_token: new-bearer
+api_base_url: https://api.example
+org_id: org-new
+org_name: Other Name Kept
+aceteam_api_key: operator-key
+login_node_uid: node-uid
+nexus_url: https://nexus.example
+`)
+	token := &nexus.TokenResponse{DeviceAPIToken: "new-bearer", APIBaseURL: "https://api.example", OrgID: "org-new", OrgName: "Org Name"}
+	if err := rollbackEnrollmentCredentials(path, token); err != nil {
+		t.Fatal(err)
+	}
+	got := readRollbackFixture(t, path)
+	for _, key := range []string{"device_api_token", "api_base_url", "org_id"} {
+		if _, ok := got[key]; ok {
+			t.Errorf("%s written by this enrollment must be removed", key)
+		}
+	}
+	for key, want := range map[string]string{"org_name": "Other Name Kept", "aceteam_api_key": "operator-key", "login_node_uid": "node-uid", "nexus_url": "https://nexus.example"} {
+		if got[key] != want {
+			t.Errorf("%s = %v, want %q kept", key, got[key], want)
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("rewritten config must stay 0600: %v %v", info, err)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".config.yaml.tmp-*")); len(leftovers) != 0 {
+		t.Fatalf("atomic write left temp files: %v", leftovers)
+	}
+}
+
+func TestRollbackEnrollmentCredentialsLeavesFileWhenSaveDidNotLand(t *testing.T) {
+	for name, content := range map[string]string{
+		"prior enrollment": "device_api_token: prior-bearer\norg_id: org-new\n",
+		"unparseable":      "device_api_token: [unclosed\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := writeRollbackFixture(t, content)
+			if err := rollbackEnrollmentCredentials(path, &nexus.TokenResponse{DeviceAPIToken: "new-bearer", OrgID: "org-new"}); err != nil {
+				t.Fatal(err)
+			}
+			if data, _ := os.ReadFile(path); string(data) != content {
+				t.Fatalf("file must be untouched, got %q", data)
+			}
+		})
+	}
+	missing := filepath.Join(t.TempDir(), "config.yaml")
+	if err := rollbackEnrollmentCredentials(missing, &nexus.TokenResponse{DeviceAPIToken: "new-bearer"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatal("rollback must not create a config file")
+	}
+}
+
+func TestRollbackEnrollmentCredentialsRedisMode(t *testing.T) {
+	path := writeRollbackFixture(t, "redis_url: redis://new\naceteam_api_key: operator-key\n")
+	if err := rollbackEnrollmentCredentials(path, &nexus.TokenResponse{RedisURL: "redis://new"}); err != nil {
+		t.Fatal(err)
+	}
+	got := readRollbackFixture(t, path)
+	if _, ok := got["redis_url"]; ok || got["aceteam_api_key"] != "operator-key" {
+		t.Fatalf("redis rollback must remove only redis_url: %v", got)
+	}
+}
+
+func TestControlCenterLinkUsesPolledToken(t *testing.T) {
+	registeredNodeID.Lock()
+	previousID := registeredNodeID.id
+	registeredNodeID.Unlock()
+	t.Cleanup(func() { setRegisteredNodeID(previousID) })
+	token := &nexus.TokenResponse{Authkey: "key", DeviceAPIToken: "bearer", OrgID: "current-org", NodeUID: "current-node"}
+	want := *token
+	links := 0
+	err := ccConnectDeviceEnrollmentWith(token, "grant", func() error {
+		// Registration must not leave the later link aliased to its caller.
+		token.Authkey = "replacement-key"
+		token.DeviceAPIToken = "replacement-bearer"
+		return nil
+	}, func(result *DeviceAuthResult) error {
+		links++
+		if result.DeviceCode != "grant" || result.Token == token || *result.Token != want {
+			t.Fatal("link lost the complete current response or retained its mutable alias")
+		}
+		return nil
+	}, func() error { t.Fatal("successful link must not disconnect"); return nil })
+	if err != nil || links != 1 {
+		t.Fatal("direct current response did not link exactly once")
+	}
+}
+
+func TestControlCenterLinkNeverSubstitutesAMissingToken(t *testing.T) {
+	for _, token := range []*nexus.TokenResponse{nil, {}, {DeviceAPIToken: "saved-bearer-alone"}} {
+		err := ccConnectDeviceEnrollmentWith(token, "grant", func() error {
+			t.Fatal("missing current response must fail before registration")
+			return nil
+		}, func(*DeviceAuthResult) error {
+			t.Fatal("must not synthesize a token or inherit another enrollment")
+			return nil
+		}, func() error { t.Fatal("nothing was connected"); return nil })
+		if err == nil {
+			t.Fatal("missing current token was accepted")
+		}
+	}
+}
+
+func TestEnrollmentNodeIDUsesThisProcessRegistrationAfterDisconnect(t *testing.T) {
+	t.Cleanup(func() { setRegisteredNodeID("") })
+	setRegisteredNodeID("")
+	if id := enrollmentNodeID(context.Background()); id != "" {
+		t.Fatalf("no registration yet, got %q", id)
+	}
+	// connectToNetwork records the ID and then disconnects, so the global
+	// server is gone; the link must still see the registered identity.
+	setRegisteredNodeID("1234")
+	if id := enrollmentNodeID(context.Background()); id != "1234" {
+		t.Fatalf("enrollment node ID after disconnect = %q, want the registered 1234", id)
+	}
+}
+
+func TestRecordRegistrationThenDisconnectRecordsBeforeDisconnect(t *testing.T) {
+	t.Cleanup(func() { setRegisteredNodeID("") })
+	setRegisteredNodeID("")
+	var order []string
+	status := func(context.Context) (*network.NetworkStatus, error) {
+		order = append(order, "status")
+		return &network.NetworkStatus{NodeID: "1879"}, nil
+	}
+	disconnect := func() error {
+		order = append(order, "disconnect")
+		registeredNodeID.Lock()
+		got := registeredNodeID.id
+		registeredNodeID.Unlock()
+		if got != "1879" {
+			t.Errorf("node ID at disconnect = %q, want 1879 recorded first", got)
+		}
+		return nil
+	}
+	recordRegistrationThenDisconnect(context.Background(), status, disconnect)
+	if strings.Join(order, ",") != "status,disconnect" {
+		t.Fatalf("call order = %v, want status before disconnect", order)
+	}
+}
+
+func TestRecordRegistrationThenDisconnectStatusErrorStillDisconnects(t *testing.T) {
+	t.Cleanup(func() { setRegisteredNodeID("") })
+	setRegisteredNodeID("")
+	disconnected := false
+	recordRegistrationThenDisconnect(context.Background(),
+		func(context.Context) (*network.NetworkStatus, error) { return nil, errors.New("no status") },
+		func() error { disconnected = true; return nil })
+	if !disconnected {
+		t.Fatal("a status failure must still disconnect")
+	}
+	if id := enrollmentNodeID(context.Background()); id != "" {
+		t.Fatalf("no ID may be recorded when status fails, got %q", id)
+	}
+}
+
+func TestControlCenterTokenPollRetriesServerErrorsBounded(t *testing.T) {
+	t.Cleanup(func() { ccTokenServerErrors.Delete("grant") })
+	serverErr := &nexus.TokenServerError{StatusCode: 500}
+	for i := 1; i <= nexus.MaxConsecutiveTokenServerErrors; i++ {
+		if err := ccTokenPollError("grant", serverErr); !strings.Contains(err.Error(), "pending") {
+			t.Fatalf("5xx #%d must keep the modal polling, got %v", i, err)
+		}
+	}
+	if err := ccTokenPollError("grant", serverErr); err != serverErr {
+		t.Fatalf("too many 5xx in a row must end the modal, got %v", err)
+	}
+	other := errors.New("access denied")
+	if err := ccTokenPollError("grant", other); err != other {
+		t.Fatalf("non-5xx errors pass through unchanged, got %v", err)
+	}
+}
+
+// reloginMesh models a host whose preserved network state reconnected before
+// the fresh grant was approved, as `citadel init --relogin` does. Like
+// network.Connect, connecting while that session is still up hands the
+// pre-grant registration back unchanged.
+type reloginMesh struct {
+	sessionUp  bool
+	keyOf      map[string]string // node ID -> registration key that registered it
+	registered string            // the ID this process's registration reported
+	events     []string
+	connectKey string
+}
+
+func (m *reloginMesh) disconnect() error {
+	m.events = append(m.events, "disconnect")
+	m.sessionUp = false
+	return nil
+}
+
+// connect models tsnet with saved state: the auth key registers a new node
+// only when the login is forced, otherwise the old registration resumes.
+func (m *reloginMesh) connectWith(force bool, authKey string) error {
+	m.events = append(m.events, "connect")
+	m.connectKey = authKey
+	if m.sessionUp || !force {
+		m.registered = "7"
+		return nil
+	}
+	m.registered = "8"
+	m.keyOf["8"] = authKey
+	return nil
+}
+
+func (m *reloginMesh) connectForced(_, authKey string) error { return m.connectWith(true, authKey) }
+func (m *reloginMesh) connectPlain(_, authKey string) error  { return m.connectWith(false, authKey) }
+
+func (m *reloginMesh) currentID(context.Context) string {
+	if m.sessionUp {
+		return "7"
+	}
+	return m.registered
+}
+
+func noPrecheck() error { return nil }
+
+// reloginLinkServer accepts a link only for a node registered with the grant's
+// own key, as the server's reservation check does. It records each node ID.
+func reloginLinkServer(t *testing.T, mesh *reloginMesh, grantKey string, linked *[]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/fabric/device-config/private-grant/link":
+			var body struct {
+				NodeID string `json:"nodeId"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			*linked = append(*linked, body.NodeID)
+			if mesh.keyOf[body.NodeID] != grantKey {
+				http.Error(w, `{"error":"Node does not match this enrollment"}`, http.StatusForbidden)
+				return
+			}
+			fmt.Fprint(w, `{"success":true}`)
+		case "/api/version":
+			fmt.Fprint(w, `{"version":"1.520.0"}`)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func stubLinkGateSeams(t *testing.T) *[]*nexus.TokenResponse {
+	t.Helper()
+	prevRollback, prevWarn, prevDelay := enrollmentRollbackFn, deviceLinkWarnFn, deviceLinkRetryDelay
+	t.Cleanup(func() {
+		enrollmentRollbackFn, deviceLinkWarnFn, deviceLinkRetryDelay = prevRollback, prevWarn, prevDelay
+	})
+	var rolledBack []*nexus.TokenResponse
+	enrollmentRollbackFn = func(token *nexus.TokenResponse) error {
+		rolledBack = append(rolledBack, token)
+		return nil
+	}
+	deviceLinkWarnFn = func(msg string) { t.Errorf("unexpected compatibility warning: %s", msg) }
+	deviceLinkRetryDelay = 0
+	return &rolledBack
+}
+
+func TestFreshGrantOnConnectedNodeRegistersWithGrantBeforeLinking(t *testing.T) {
+	stubLinkGateSeams(t)
+	mesh := &reloginMesh{sessionUp: true, registered: "7", keyOf: map[string]string{"7": "pre-grant-key"}}
+	var linked []string
+	srv := reloginLinkServer(t, mesh, "registration-key", &linked)
+	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: &nexus.TokenResponse{Authkey: "registration-key", DeviceAPIToken: "device-bearer"}}
+
+	err := registerAndLinkGrantWith(result, "node-a", noPrecheck, mesh.currentID, mesh.disconnect, mesh.connectForced, func(r *DeviceAuthResult) error {
+		return linkDeviceEnrollmentGated(r, func(context.Context) string { return mesh.registered }, nexus.NewDeviceAuthClient(srv.URL))
+	})
+	if err != nil {
+		t.Fatalf("relogin enrollment failed: %v", err)
+	}
+	if strings.Join(mesh.events, ",") != "disconnect,connect" {
+		t.Fatalf("events = %v; the pre-grant session must be dropped before registering", mesh.events)
+	}
+	if mesh.connectKey != "registration-key" {
+		t.Fatal("registration must use the grant's own key")
+	}
+	if strings.Join(linked, ",") != "8" {
+		t.Fatalf("/link node IDs = %v, want only the node registered with the grant", linked)
+	}
+}
+
+func TestFreshGrantWithoutRegisteredNodeFails(t *testing.T) {
+	rolledBack := stubLinkGateSeams(t)
+	mesh := &reloginMesh{sessionUp: true, keyOf: map[string]string{}}
+	var linked []string
+	srv := reloginLinkServer(t, mesh, "registration-key", &linked)
+	token := &nexus.TokenResponse{Authkey: "registration-key", DeviceAPIToken: "device-bearer"}
+	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: token}
+
+	err := registerAndLinkGrantWith(result, "node-a", noPrecheck, mesh.currentID, mesh.disconnect, func(string, string) error {
+		mesh.registered = "" // registration reported no node ID
+		return nil
+	}, func(r *DeviceAuthResult) error {
+		return linkDeviceEnrollmentGated(r, func(context.Context) string { return mesh.registered }, nexus.NewDeviceAuthClient(srv.URL))
+	})
+	if err == nil {
+		t.Fatal("an enrollment with no registered node must fail, not report success")
+	}
+	if len(linked) != 0 || len(*rolledBack) != 1 || (*rolledBack)[0] != token {
+		t.Fatalf("no link may be sent and this enrollment must be rolled back: links=%v rollbacks=%d", linked, len(*rolledBack))
+	}
+}
+
+func TestFreshGrantConnectFailureNeverLinks(t *testing.T) {
+	rolledBack := stubLinkGateSeams(t)
+	token := &nexus.TokenResponse{Authkey: "registration-key"}
+	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: token}
+	connectErr := errors.New("control plane unreachable")
+	err := registerAndLinkGrantWith(result, "node-a", noPrecheck, func(context.Context) string { return "7" }, func() error { return nil }, func(string, string) error { return connectErr },
+		func(*DeviceAuthResult) error { t.Fatal("must not link without a registration"); return nil })
+	if !errors.Is(err, connectErr) {
+		t.Fatalf("connect failure must propagate, got %v", err)
+	}
+	if len(*rolledBack) != 1 || (*rolledBack)[0] != token {
+		t.Fatalf("connect failure must roll back this enrollment, rollbacks=%d", len(*rolledBack))
+	}
+}
+
+// Equal IDs are not decided locally: the server may have re-authenticated the
+// existing node with the grant's key.
+func TestFreshGrantSameNodeIDIsLinkedAndServerDecides(t *testing.T) {
+	stubLinkGateSeams(t)
+	mesh := &reloginMesh{sessionUp: true, registered: "7", keyOf: map[string]string{"7": "pre-grant-key"}}
+	var linked []string
+	srv := reloginLinkServer(t, mesh, "registration-key", &linked)
+	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: &nexus.TokenResponse{Authkey: "registration-key"}}
+	err := registerAndLinkGrantWith(result, "node-a", noPrecheck, mesh.currentID, mesh.disconnect,
+		func(_, key string) error { mesh.registered = "7"; mesh.keyOf["7"] = key; return nil }, // existing node re-authenticated
+		func(r *DeviceAuthResult) error {
+			return linkDeviceEnrollmentGated(r, func(context.Context) string { return mesh.registered }, nexus.NewDeviceAuthClient(srv.URL))
+		})
+	if err != nil || strings.Join(linked, ",") != "7" {
+		t.Fatalf("same ID bound to the grant key must link: err=%v links=%v", err, linked)
+	}
+}
+
+func TestFreshGrantSameNodeIDRefusedGivesClearHintAndRollsBack(t *testing.T) {
+	rolledBack := stubLinkGateSeams(t)
+	mesh := &reloginMesh{sessionUp: true, registered: "7", keyOf: map[string]string{"7": "pre-grant-key"}}
+	var linked []string
+	srv := reloginLinkServer(t, mesh, "registration-key", &linked)
+	token := &nexus.TokenResponse{Authkey: "registration-key"}
+	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: token}
+	err := registerAndLinkGrantWith(result, "node-a", noPrecheck, mesh.currentID, mesh.disconnect, mesh.connectPlain,
+		func(r *DeviceAuthResult) error {
+			return linkDeviceEnrollmentGated(r, func(context.Context) string { return mesh.registered }, nexus.NewDeviceAuthClient(srv.URL))
+		})
+	if err == nil || !strings.Contains(err.Error(), "the node resumed its previous registration; run `citadel logout && citadel init`") {
+		t.Fatalf("want the resumed-registration hint, got %v", err)
+	}
+	if len(*rolledBack) != 1 || (*rolledBack)[0] != token {
+		t.Fatalf("rollbacks = %d, want this enrollment rolled back", len(*rolledBack))
+	}
+}
+
+func TestFreshGrantPrecheckRefusalRollsBackWithoutTouchingMesh(t *testing.T) {
+	rolledBack := stubLinkGateSeams(t)
+	token := &nexus.TokenResponse{Authkey: "registration-key"}
+	result := &DeviceAuthResult{DeviceCode: "private-grant", Token: token}
+	refusal := errors.New("a citadel worker is running on this host; stop the worker, run the relogin, then start the worker")
+	err := registerAndLinkGrantWith(result, "node-a", func() error { return refusal }, func(context.Context) string { t.Fatal("must not probe"); return "" },
+		func() error { t.Fatal("must not disconnect"); return nil },
+		func(string, string) error { t.Fatal("must not connect"); return nil },
+		func(*DeviceAuthResult) error { t.Fatal("must not link"); return nil })
+	if !errors.Is(err, refusal) {
+		t.Fatalf("got %v", err)
+	}
+	if len(*rolledBack) != 1 || (*rolledBack)[0] != token {
+		t.Fatalf("rollbacks = %d", len(*rolledBack))
+	}
+}

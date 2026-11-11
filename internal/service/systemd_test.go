@@ -174,3 +174,26 @@ func TestUnitFilePath(t *testing.T) {
 		t.Errorf("unexpected system unit path: %s", sysPath)
 	}
 }
+
+// A root system unit must let the worker write /etc/citadel, root's
+// platform.ConfigDir(). Without it ProtectSystem=strict left the fabric CA
+// bundle and TLS dir unwritable and the worker crash-looped after a root
+// `citadel init`.
+func TestGenerateUnitFile_RootSystemUnitCanWriteEtcCitadel(t *testing.T) {
+	t.Setenv("SUDO_USER", "")
+	content, err := GenerateUnitFile(ServiceConfig{ExecPath: "/usr/local/bin/citadel", Args: []string{"work"}, Description: "Test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rwLine string
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "ReadWritePaths=") {
+			rwLine = line
+		}
+	}
+	for _, want := range []string{"/root/.citadel-cli", "/root/citadel-node", "-/etc/citadel"} {
+		if !strings.Contains(rwLine, want) {
+			t.Errorf("root unit ReadWritePaths %q missing %q", rwLine, want)
+		}
+	}
+}

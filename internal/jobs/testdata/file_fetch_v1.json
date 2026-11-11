@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "request": {
+    "url": "https://example.com/api/shared/file-fetch",
+    "capability": "fixture-body.fixture-signature",
+    "dest_path": "chapters/film.0123456789abcdef0123456789abcdef.mp4",
+    "expected_sha256": "e3611a71ea63c2b11f29de53e2078fa98ba2f1289a8bb44b4f204e0e89830853",
+    "max_bytes": "10"
+  },
+  "http": {
+    "method": "GET",
+    "path": "/api/shared/file-fetch",
+    "headers": {
+      "Authorization": "Bearer fixture-body.fixture-signature",
+      "Accept-Encoding": "identity"
+    }
+  },
+  "body_utf8": "film bytes",
+  "receipt": {
+    "path": "chapters/film.0123456789abcdef0123456789abcdef.mp4",
+    "bytes": 10,
+    "sha256": "e3611a71ea63c2b11f29de53e2078fa98ba2f1289a8bb44b4f204e0e89830853"
+  }
+}

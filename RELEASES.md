@@ -3162,3 +3162,507 @@ Auto-generated log of every release.
   - feat: bind template artifacts to conditional Range V2 (#1321)
 
 
+---
+
+## v2.197.0 — 2026-10-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 18 |
+| Lines added | +3021 |
+
+**Changes:**
+
+  - feat(diffusers): per-request image model selection, VRAM-aware swap, current open models (#1335)
+
+
+---
+
+## v2.198.0 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 10 |
+| Lines added | +175 |
+
+**Changes:**
+
+  - fix(diffusers): pin the sidecar image by digest instead of :latest (#1348)
+  - feat(ingress): ACME DNS-01 via Cloudflare for the apps domain (#1343)
+
+
+---
+
+## v2.199.0 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 20 |
+| Lines added | +1355 |
+
+**Changes:**
+
+  - fix(enrollment): require device linking and report active control certificate (#1347)
+
+
+---
+
+## v2.199.1 — 2026-10-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +208 |
+
+**Changes:**
+
+  - fix(enrollment): link on init/enroll, retry token-poll 5xx, unblock the root worker unit (#1351)
+
+
+---
+
+## v2.200.0 — 2026-10-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 33 |
+| Lines added | +2405 |
+
+**Changes:**
+
+  - feat(jobs): add bounded create-only FILE_FETCH staging (#1355)
+  - docs: voice cloning shipped outside CIS; LocalAI as engine-adapter prior art (#1360) (#1362)
+  - test(worker): make the heavy-deadline lane test order-independent (#1363) (#1365)
+  - fix(enrollment): reset the registered node ID in Control Center, pin record-before-disconnect order (#1356) (#1361)
+
+
+---
+
+## v2.201.0 — 2026-10-23
+
+| Metric | Value |
+|--------|-------|
+| Commits | 32 |
+| Files changed | 247 |
+| Lines added | +35334 |
+
+**Changes:**
+
+  - fix(video-compose): activation hardening and 600s total film cap (#1440)
+  - docs: wake-on-inbox supervisor design of record (#1444)
+  - fix(memorygit): require strict passcode wiring and accept standard transport keys (#1438)
+  - feat(session): add read-only local session attach viewer (#1430)
+  - fix(nodevault): refuse false lockout reset success (#1429)
+  - feat: prepare inactive video-compose source (#1434)
+  - feat(memorygit): prepare inactive MEMORY_GIT_V1 source (#1435)
+  - fix(workflow): complete bounded LLM policy diagnostics (#1428)
+  - test(worker): await terminal ACK before deadline fixture shutdown (#1432)
+  - fix(diffusers): unload idle image and video pipelines unless pinned (#1403)
+  - fix(worker): account swaps before releasing rate admission (#1424)
+  - fix(nodevault): serialize lockout state across processes (#1408)
+  - fix(workflow): guard LLM destinations with explicit local endpoint grants (#1412)
+  - fix(workflow): cancel run contexts and await actual node exit (#1410)
+  - fix(workflow): hard-deny translated IPv6 and sanitize HTTP failures (#1401)
+  - fix(nvr): pin repaired init image and preserve cached start (#1409)
+  - fix(whisper): refresh certifi and Pillow security pins (#1407)
+  - test(rag): acknowledge SIGINT cancellation before embedding release (#1402)
+  - fix(desktop): fence auth work to its originating login (#1332)
+  - fix(passcode): apply the node-wide lockout to legacy passcode checks (#1400)
+  - docs(design): engine, model and module licensing (#1368)
+  - test(stream): share strict parser and artifact refusal vectors (#1382)
+  - fix(nodevault): retain time-decayed PIN failures across successful unlocks (#1397)
+  - fix(passcode): use strict diagnostic state and pin worker gate wiring (#1399)
+  - fix(nvr): keep the Frigate MQTT config private and support env-sourced credentials (#1394)
+  - feat(mediainput): inactive workspace freezer and bounded image headers (C1b) (#1393)
+  - feat(mediainput): strict inactive v1 input contract and shared vectors (C1a) (#1390)
+  - fix(workflow): SSRF policy for the HTTP node (#1388)
+  - fix(jobs): release panicked passcode checks and report busy capacity (#1389)
+  - feat(jobs): shared node passcode attempt throttle (SHELL_COMMAND, WORKFLOW_RUN, desktop) (#1370)
+  - feat(stream): build ST1 offline Sigma evaluator (#1364)
+  - feat(worker): desktop job handlers honor the node passcode like SHELL_COMMAND (#1369)
+
+
+---
+
+## v2.202.0 — 2026-10-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 13 |
+| Files changed | 151 |
+| Lines added | +17648 |
+
+**Changes:**
+
+  - test(api): cover cooldown rebuild and unread 404 edges (#1478)
+  - fix(worker): self-heal sustained platform wrong answers (#1479)
+  - fix(api): re-dial stale platform connections after cutovers (#1477)
+  - fix(auth): restore safe denial and enrollment diagnostics (#1467)
+  - fix(auth): discard late device tokens before persistence (#1465)
+  - fix(enrollment): expose unconfirmed device linking safely (#1463)
+  - fix(enrollment): fence retries, registration and managed unit repair (#1462)
+  - fix(worker): acquire lane execution slots in claim order (#1464)
+  - test(worker): fence deadline lane checks on actual retirement (#1461)
+  - docs: reconcile agents wake design with the governed-lane MVP (#1451)
+  - docs: session serve restore-only dependency policy design (#1450)
+  - ci: publish :latest only from main (#1439)
+  - feat(sessions): native declared session holder S1 (#1443)
+
+
+---
+
+## v2.203.0 — 2026-10-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 12 |
+| Files changed | 95 |
+| Lines added | +10516 |
+
+**Changes:**
+
+  - fix(worker): report terminal gate refusals for known withheld jobs (#1492)
+  - docs(enrollment): clarify refresh and stale-node recovery boundaries (#1493)
+  - fix(memorygit): disable lazy fetching in the child environment (#1495)
+  - fix(update): atomically persist state and expose corrupt-state pauses (#1482)
+  - feat(auth): verify current-key binding before suppressing link warnings (#1480)
+  - test(worker): cover service-manager platform recovery wiring (#1485)
+  - chore(deps): declare godbus as a direct requirement (#1484)
+  - fix(sessions): recover abandoned starts and retain refused viewers (#1449)
+  - fix(video-compose): bound camera metadata preflight (#1446)
+  - feat(agents): prepare inactive wake quota model (#1454)
+  - feat(agents): prepare disk and worktree policy model (#1453)
+  - feat(controlcenter): read bounded shared worker detail (#1448)
+
+
+---
+
+## v2.204.0 — 2026-10-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 79 |
+| Lines added | +6503 |
+
+**Changes:**
+
+  - fix(worker): fence durable HTTP delivery before terminal publish (#1504)
+  - feat(worker): prepare fenced meeting intake custody (#1515)
+  - fix(cdp): share bounded page discovery across browser paths (#1507)
+  - fix(worker): restore permission hints and live meeting gates (#1509)
+  - Support exact ingress host routes and mounted cert sets (#1517)
+  - fix(whisper): align patched OpenTelemetry API and SDK pins (#1511)
+  - fix(agentquota): configure wake caps per harness (#1512)
+  - fix(update): preflight install authority and report manual-update capability (#1490)
+  - fix(cdp): bound HTTP target discovery before selecting a page (#1494)
+
+
+---
+
+## v2.205.0 — 2026-10-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 43 |
+| Lines added | +3161 |
+
+**Changes:**
+
+  - fix(meeting): unattended-join safety (#1505 C1), with #1514 review fixes (#1522)
+
+
+---
+
+## v2.206.0 — 2026-11-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +551 |
+
+**Changes:**
+
+  - fix(meeting): honor Stop at the admission-to-recording boundary (#1524)
+  - feat(meeting): live progress, denial vs timeout, graceful Stop (#1506) (#1523)
+
+
+---
+
+## v2.207.0 — 2026-11-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 27 |
+| Files changed | 130 |
+| Lines added | +7798 |
+
+**Changes:**
+
+  - Merge pull request #1473 from aceteam-ai/fix/1468-repository-home-audit
+  - Merge pull request #1472 from aceteam-ai/fix/1468-internal-home-isolation
+  - Merge pull request #1471 from aceteam-ai/fix/1468-home-marker-isolation
+  - Merge pull request #1469 from aceteam-ai/fix/1468-network-test-paths
+  - fix(reconstruct): bound operator pipeline and create-only publication (#1411)
+  - feat(desktop): stage Windows x64 helpers in the shared shell (#1460)
+  - docs: propose bounded Harness2 runtime for #1380 (#1415)
+  - feat(desktop): stage Linux helpers in the shared Tauri shell (#1459)
+  - docs: propose atomic wake policy reservation (#1516)
+  - docs: propose PersonaPlex duplex voice feasibility (#1216) (#1425)
+  - docs(design): propose per-service drain and reservation custody (#1419)
+  - docs(design): headless ComfyUI engine with approved workflows (#1418)
+  - docs(catalog): plan private module environment publication (#1417)
+  - fix(desktop): reject invalid and symlinked DMG build outputs (#1458)
+  - fix(diffusers): retain idle cleanup callback outcomes (#1457)
+  - feat: add inactive synthetic point-cloud capture slice (#1456)
+  - fix(cdp): bound messages before reading and screenshots before decoding (#1455)
+  - fix(mediainput): align portable paths and exact refusal reasons (#1404)
+  - Merge refreshed isolation stack into repository audit draft
+  - Merge refreshed prerequisites into internal home-isolation draft
+  - Merge refreshed host-state prerequisites into home-isolation draft
+  - Merge main into host-state isolation draft
+  - test: audit home resolver bypasses across the repository
+  - fix(testing): route internal home defaults through fixture seam
+  - fix(testing): isolate command home and podman marker paths
+  - test: verify fixture custody before host-state effects
+  - fix(testing): isolate command host-state discovery before fixtures run
+
+
+---
+
+## v2.208.0 — 2026-11-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 20 |
+| Lines added | +2560 |
+
+**Changes:**
+
+  - fix(update): verify managed restarts and diagnose worker install layouts (#1491)
+  - docs: source-first Speakrail full-duplex voice proposal (#1376) (#1423)
+
+
+---
+
+## v2.209.0 — 2026-11-04
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 31 |
+| Lines added | +1474 |
+
+**Changes:**
+
+  - fix(services): select CPU compose on GPU-less Linux nodes (#1535)
+  - fix(update): disclose the effective startup auto-update policy (#1534)
+
+
+---
+
+## v2.210.0 — 2026-11-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 10 |
+| Files changed | 45 |
+| Lines added | +5604 |
+
+**Changes:**
+
+  - fix(services): register the PAW compile host port (#1470)
+  - feat(cobrowse): insert pasted text under live human control (#1547)
+  - feat(metrics): prepare inactive bounded store app candidate (#1551)
+  - feat(metrics): prepare bounded inactive host and job collector (#1550)
+  - Add native select and keyboard cobrowse actions (#1544)
+  - Gate co-browse viewer input on explicit handoff (#1542)
+  - Ensure co-browse viewers get an idle page first frame (#1540)
+  - docs: propose sovereign agent connection and runtime boundaries (#1433)
+  - feat(depth): prepare bounded point-cloud sequence contract and codecs (#1405)
+  - feat(mediainput): prepare shared pinned HTTPS inbox acquisition (#1413)
+
+
+---
+
+## v2.211.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +126 |
+
+**Changes:**
+
+  - fix(cobrowse): restrict session URLs to http(s) and terminate browser switches (#1575)
+
+
+---
+
+## v2.212.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 28 |
+| Files changed | 59 |
+| Lines added | +11409 |
+
+**Changes:**
+
+  - Merge pull request #1574 from aceteam-ai/feat/local-mode-s6-first-run
+  - Merge pull request #1573 from aceteam-ai/feat/local-mode-s5-audit
+  - Merge pull request #1572 from aceteam-ai/feat/local-mode-s4-viewer
+  - Merge pull request #1570 from aceteam-ai/feat/local-mode-s3-local-mcp
+  - Merge pull request #1569 from aceteam-ai/feat/local-mode-s1-windows-runner
+  - chore(local): make BurntSushi/toml a direct dependency; correct the harness-location note in CLAUDE.md
+  - fix(local): parse harness configs properly and make the first-run docs honest
+  - fix(local): resolve the harness home through platform.UserHomeDir
+  - fix(local): doctor reports the browser version and refuses one older than 109; clarify DNS in the no-network wording
+  - feat(local): citadel local doctor, citadel local config, quickstart and release notes
+  - fix(local): roll back a failed audit write, accept a lagging anchor, link pending records
+  - fix(local): record writes before they run and make the audit chain tamper-evident at both ends
+  - feat(local): hash-chained local co-browse audit log, Activity panel, citadel local audit
+  - fix(local): drop the old viewer stream on re-open and recheck a newly created private dir
+  - fix(cobrowse): validate the address-bar URL in NavigateAsHuman
+  - fix(local): keep viewer codes off the command line and the token out of the cookie
+  - fix(local): guard where the browser connects, start-page landing, resume and budgets
+  - test(local): retry viewer clicks until they take effect in the real-browser page test
+  - test(local): use documentation-range addresses in the address-filter tests
+  - feat(local): loopback co-browse viewer with approval card and take control
+  - feat(local): citadel local mcp and the local_cobrowse_* tools
+  - fix(cobrowse): never relaunch a session for its user agent; fix a probe-cache race
+  - fix(cobrowse): never fall back to a headless user agent when the UA probe fails
+  - fix(cobrowse): gate every runner launch on ValidateCobrowseURL
+  - fix(cobrowse): harden the Windows runner's debug port, UA probe and headed paths
+  - fix(cobrowse): send the browser's real user agent from Windows headless sessions
+  - test(cobrowse): accept ownership refusal for a plain dir on elevated Windows runners
+  - feat(cobrowse): Windows headless browser runner behind a runner interface
+
+
+---
+
+## v2.213.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 50 |
+| Lines added | +3550 |
+
+**Changes:**
+
+  - fix(update): verify ed25519-signed release checksums (aceteam#12089) (#1589)
+  - feat(worker): retain terminal MEETING_JOIN result in Redis with a TTL (#1588)
+  - feat(local): add opencode harness to local config (#1587)
+  - feat(ollama): ollama_keep_alive and ollama_preload manifest settings (#1586)
+  - fix(services): materialize fresh compose on unknown GPU evidence (#1562)
+
+
+---
+
+## v2.214.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 11 |
+| Lines added | +123 |
+
+**Changes:**
+
+  - fix(local): keep local-mode state in the invoking user's config dir (#1593)
+
+
+---
+
+## v2.215.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +1252 |
+
+**Changes:**
+
+  - feat(meetings): Teams in-call disclosure and /ace leave (N3) (#1610)
+  - fix(enrollment): register relogin grants before linking, fail unsent links (#1605)
+  - feat(worker): retain terminal MEETING_JOIN result in API mode (citadel-cli#1553) (#1609)
+  - fix(meetings): select Teams audio before muting devices (#1549)
+
+
+---
+
+## v2.216.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 22 |
+| Files changed | 56 |
+| Lines added | +7119 |
+
+**Changes:**
+
+  - Merge pull request #1608 from aceteam-ai/feat/hpc-launch
+  - Merge pull request #1607 from aceteam-ai/feat/hpc-enroll
+  - Merge pull request #1606 from aceteam-ai/feat/hpc-profile
+  - merge feat/hpc-enroll
+  - merge feat/hpc-profile
+  - test(hpc): make privateTempDir available on every platform
+  - merge feat/hpc-enroll
+  - test(hpc): explicit private temp dir for enroll fixtures
+  - merge feat/hpc-profile
+  - test(hpc): drop the cmd-wide umask, use explicit private temp dirs for hpc fixtures
+  - style(hpc): gofmt
+  - fix(hpc): harden vLLM flags, readiness owner check, caches, GPU forms and exit codes
+  - merge origin/feat/hpc-enroll
+  - fix(hpc): deregister on SIGTERM during drain and on partial enroll failure, harden token and leaf handling
+  - merge origin/feat/hpc-profile
+  - fix(hpc): reject group-writable job bases, gate every command, route llm_inference to the job engine only
+  - fix(hpc): require an explicit --auth-service on launch; test the child worker argv
+  - feat(hpc): login-node launcher and in-job supervisor (aceteam#12718)
+  - fix(hpc): register drain and terminate handlers before the lock and enrollment
+  - feat(hpc): non-interactive HPC enrollment, drain and deregister (aceteam#12717)
+  - fix(hpc): keep exact-leaf exemptions first and accept inherited global flags
+  - feat(hpc): job-scoped --profile hpc with an API-only worker (aceteam#12715)
+
+
+---
+
+## v2.217.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +119 |
+
+**Changes:**
+
+  - fix(local): accept a UTF-8 BOM in agent config files for local config --write (#1611)
+
+
+---
+
+## v2.218.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 19 |
+| Lines added | +1618 |
+
+**Changes:**
+
+  - fix(cobrowse): survive self-update restart; defer while a human is involved (#1546) (#1614)
+
+

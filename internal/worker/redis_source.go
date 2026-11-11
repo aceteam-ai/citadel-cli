@@ -3,11 +3,13 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 	"sync"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
@@ -33,6 +35,7 @@ func maskRedisURL(redisURL string) string {
 // This is the job source for AceTeam's private GPU cloud infrastructure.
 // Supports consuming from multiple queues simultaneously for tag-based routing.
 type RedisSource struct {
+	deliveryRefusals
 	client *redisclient.Client
 	config RedisSourceConfig
 
@@ -239,24 +242,40 @@ func (s *RedisSource) snapshotQueues() []string {
 
 // nextSingle reads from a single queue (original behavior).
 func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int) (*Job, error) {
+	defer func() { s.recordN(s.client.DrainDurableRefusals(), s.log) }()
 	// Reclaim a stale pending entry (issue #871) before doing a normal read.
 	// This is the ONLY thing that ever redelivers a Nacked-but-unacked
 	// message in direct-Redis mode -- see StalePendingReclaimMinIdle's doc
 	// comment. Best-effort: a reclaim error never fails the poll, it just
 	// falls through to the ordinary read.
 	redisJob, err := s.client.ReclaimStalePendingOnQueue(ctx, queue)
+	if errors.Is(err, redisclient.ErrDurableControlRequired) {
+		redisJob, err = nil, nil
+	}
+	if redisJob != nil && hasDurableCarrier(redisJob.RawData) {
+		s.record(s.log)
+		redisJob = nil
+	}
 	if err != nil {
 		s.log("warning", "   - Failed to reclaim stale pending job on %s: %v", queue, err)
 		redisJob = nil
 	}
 	if redisJob == nil {
 		redisJob, err = s.client.ReadJobBlock(ctx, blockMs)
+		if errors.Is(err, redisclient.ErrDurableControlRequired) {
+			return nil, nil
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to read job from Redis: %w", err)
 		}
 	}
 
 	if redisJob == nil {
+		return nil, nil
+	}
+
+	if hasDurableCarrier(redisJob.RawData) {
+		s.record(s.log)
 		return nil, nil
 	}
 
@@ -268,7 +287,9 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 		if err := s.client.MoveToDLQ(ctx, redisJob, "Exceeded max retry attempts"); err != nil {
 			s.log("error", "   - Failed to move job to DLQ: %v", err)
 		}
-		s.client.AckJob(ctx, redisJob.MessageID)
+		if err := s.ackDelivery(ctx, redisJob.Type, queue, redisJob.MessageID); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 
@@ -300,6 +321,7 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 
 // nextMulti reads from multiple queues simultaneously.
 func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs int) (*Job, error) {
+	defer func() { s.recordN(s.client.DrainDurableRefusals(), s.log) }()
 	// Reclaim a stale pending entry (issue #871) on any of the subscribed
 	// queues before doing a normal read. See nextSingle's comment and
 	// StalePendingReclaimMinIdle's doc comment for why this is needed at all.
@@ -307,6 +329,13 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 	var sourceQueue string
 	for _, q := range queues {
 		reclaimed, err := s.client.ReclaimStalePendingOnQueue(ctx, q)
+		if errors.Is(err, redisclient.ErrDurableControlRequired) {
+			continue
+		}
+		if reclaimed != nil && hasDurableCarrier(reclaimed.RawData) {
+			s.record(s.log)
+			continue
+		}
 		if err != nil {
 			s.log("warning", "   - Failed to reclaim stale pending job on %s: %v", q, err)
 			continue
@@ -321,12 +350,20 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 	if redisJob == nil {
 		var err error
 		redisJob, sourceQueue, err = s.client.ReadJobMultiBlock(ctx, queues, blockMs)
+		if errors.Is(err, redisclient.ErrDurableControlRequired) {
+			return nil, nil
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to read job from Redis: %w", err)
 		}
 	}
 
 	if redisJob == nil {
+		return nil, nil
+	}
+
+	if hasDurableCarrier(redisJob.RawData) {
+		s.record(s.log)
 		return nil, nil
 	}
 
@@ -338,7 +375,9 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 		if err := s.client.MoveToDLQFromQueue(ctx, sourceQueue, redisJob, "Exceeded max retry attempts"); err != nil {
 			s.log("error", "   - Failed to move job to DLQ: %v", err)
 		}
-		s.client.AckJobOnQueue(ctx, sourceQueue, redisJob.MessageID)
+		if err := s.ackDelivery(ctx, redisJob.Type, sourceQueue, redisJob.MessageID); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 
@@ -377,18 +416,13 @@ func (s *RedisSource) convertJob(rj *redisclient.Job) *Job {
 // Ack acknowledges successful job completion.
 func (s *RedisSource) Ack(ctx context.Context, job *Job) error {
 	s.client.SetJobStatus(ctx, job.ID, "completed", nil)
-	if job.SourceQueue != "" {
-		return s.client.AckJobOnQueue(ctx, job.SourceQueue, job.MessageID)
-	}
-	return s.client.AckJob(ctx, job.MessageID)
+	return s.ackDelivery(ctx, job.Type, job.SourceQueue, job.MessageID)
 }
 
 // Nack indicates job failure.
 // For Redis, this updates status but does NOT ACK - allowing retry or DLQ.
 func (s *RedisSource) Nack(ctx context.Context, job *Job, err error) error {
-	s.client.SetJobStatus(ctx, job.ID, "failed", map[string]any{
-		"error": err.Error(),
-	})
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
 	// Don't ACK - let it retry or go to DLQ on next read
 	return nil
 }
@@ -428,15 +462,9 @@ func (s *RedisSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, e
 // failures that will never succeed on retry (e.g. an unsupported job type),
 // preventing the message from being redelivered and re-failing forever.
 func (s *RedisSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
-	status := map[string]any{"error": err.Error()}
-	for k, v := range data {
-		status[k] = v
-	}
+	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
-	if job.SourceQueue != "" {
-		return s.client.AckJobOnQueue(ctx, job.SourceQueue, job.MessageID)
-	}
-	return s.client.AckJob(ctx, job.MessageID)
+	return s.ackDelivery(ctx, job.Type, job.SourceQueue, job.MessageID)
 }
 
 // Close cleanly disconnects from Redis.

@@ -1,5 +1,5 @@
 // Package clilog provides citadel-cli's always-on, date-based, append-only
-// file logging. It is a small dependency-free sink shared by the cobra
+// file logging. It is a small sink shared by the cobra
 // commands (package cmd) and the control-center TUI (package
 // internal/tui/controlcenter) so that every activity entry is persisted to
 // disk as it happens — not only when the operator presses a key.
@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 var (
@@ -40,7 +42,7 @@ func Dir() string {
 	if dirOverride != "" {
 		return dirOverride
 	}
-	home, err := os.UserHomeDir()
+	home, err := platform.HomeDir("")
 	if err != nil {
 		return ""
 	}
@@ -147,6 +149,20 @@ func Write(level, msg string) {
 	} else {
 		fmt.Fprintf(file, "[%s] [%s] %s\n", ts, level, msg)
 	}
+}
+
+// Close releases the current log handle, if any. It is idempotent and does not
+// disable logging: a later Write lazily reopens the dated file for appending.
+func Close() error {
+	mu.Lock()
+	defer mu.Unlock()
+	current := file
+	file = nil
+	fileDate = ""
+	if current == nil {
+		return nil
+	}
+	return current.Close()
 }
 
 // Writef is a printf-style convenience wrapper around Write.

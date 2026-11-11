@@ -70,6 +70,55 @@ func TestTemplateInputReferenceValidation(t *testing.T) {
 	}
 }
 
+func TestTemplateInputExpectedContentContract(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	base := map[string]any{"path": "node:n1/a.txt", "node_id": "n1", "node_path": "a.txt", "expected_sha256": digest, "expected_bytes": 0}
+	parse := func(entry map[string]any) ([]TemplateInputFile, error) {
+		raw, err := json.Marshal([]map[string]any{entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ParseTemplateInputFiles(raw, "n1")
+	}
+	files, err := parse(base)
+	if err != nil || len(files) != 1 || files[0].ExpectedSHA256 != digest || files[0].ExpectedBytes == nil || *files[0].ExpectedBytes != 0 {
+		t.Fatalf("valid zero-byte expectation: %+v %v", files, err)
+	}
+	for _, field := range []string{"expected_sha256", "expected_bytes"} {
+		var invalid []any
+		if field == "expected_sha256" {
+			invalid = []any{nil, 0, "", strings.Repeat("a", 64), "sha256:" + strings.Repeat("A", 64), "sha256:" + strings.Repeat("a", 63), "sha256:" + strings.Repeat("a", 63) + "g", " " + digest, digest + " "}
+		} else {
+			invalid = []any{nil, true, "1", -1, json.Number("-0"), json.Number("1.0"), json.Number("1e0"), json.Number("9223372036854775808")}
+		}
+		for _, value := range invalid {
+			entry := map[string]any{}
+			for key, val := range base {
+				entry[key] = val
+			}
+			entry[field] = value
+			if _, err := parse(entry); err == nil || !strings.Contains(err.Error(), field) {
+				t.Errorf("accepted %s=%v: %v", field, value, err)
+			}
+		}
+	}
+	for _, raw := range []string{
+		`[{"path":"a.txt","node_id":"n1","node_path":"a.txt","Expected_bytes":0}]`,
+		`[{"path":"a.txt","node_id":"n1","node_path":"a.txt","expected_bytes":0,"expected_bytes":1}]`,
+	} {
+		if _, err := ParseTemplateInputFiles(json.RawMessage(raw), "n1"); err == nil {
+			t.Fatalf("accepted ambiguous input: %s", raw)
+		}
+	}
+	// Optional expectations remain independent for legacy generic callers.
+	for _, field := range []string{"expected_sha256", "expected_bytes"} {
+		entry := map[string]any{"path": "a.txt", "node_id": "n1", "node_path": "a.txt", field: base[field]}
+		if _, err := parse(entry); err != nil {
+			t.Fatalf("generic partial expectation %s: %v", field, err)
+		}
+	}
+}
+
 func TestTemplateInputFileCountLimitBoundary(t *testing.T) {
 	makeRaw := func(n int) json.RawMessage {
 		entries := make([]map[string]string, n)

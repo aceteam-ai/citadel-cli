@@ -1,0 +1,60 @@
+{
+  "id": "shield-st1-fixtures",
+  "version": "1.0.0",
+  "parser": "combined",
+  "enrichments": [
+    "source.ip_subnet24"
+  ],
+  "rules": [
+    {
+      "id": "R1",
+      "version": "1",
+      "file": "rules/R1.yml"
+    },
+    {
+      "id": "R2",
+      "version": "1",
+      "file": "rules/R2.yml"
+    },
+    {
+      "id": "R3",
+      "version": "1",
+      "file": "rules/R3.yml"
+    },
+    {
+      "id": "_failed",
+      "version": "1",
+      "file": "rules/_failed.yml"
+    },
+    {
+      "id": "_success",
+      "version": "1",
+      "file": "rules/_success.yml"
+    },
+    {
+      "id": "R4",
+      "version": "1",
+      "file": "rules/R4.yml"
+    },
+    {
+      "id": "_subnet_failures",
+      "version": "1",
+      "file": "rules/_subnet_failures.yml"
+    },
+    {
+      "id": "R5",
+      "version": "1",
+      "file": "rules/R5.yml"
+    },
+    {
+      "id": "_404",
+      "version": "1",
+      "file": "rules/_404.yml"
+    },
+    {
+      "id": "stat_only",
+      "version": "1",
+      "file": "rules/stat_only.yml"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "title": "Synthetic SQL injection patterns",
+  "name": "R2",
+  "logsource": {
+    "category": "webserver"
+  },
+  "detection": {
+    "selection": {
+      "http.request.line|contains": [
+        "' or ",
+        "'or'",
+        "%27%20or",
+        "' and ",
+        "union select",
+        "union%20select",
+        "or 1=1",
+        "or%201=1",
+        "drop table",
+        "drop%20table",
+        "%20or%20",
+        "'%20and%20",
+        "sleep(",
+        "information_schema"
+      ]
+    },
+    "condition": "selection"
+  },
+  "x-aceteam": {
+    "group_by": [
+      "source.ip"
+    ]
+  }
+}

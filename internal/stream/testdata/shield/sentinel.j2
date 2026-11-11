@@ -1,0 +1,81 @@
+{#- Sentinel: deterministic rules and history matching, no model. Output is JSON. Every threshold and list comes from the policy input. -#}
+{%- set raw = logs.split('\n') | map('trim') | select | list -%}
+{%- set truncated = (policy.max_lines | int > 0) and (raw | length > policy.max_lines | int) -%}
+{%- set lines = raw[:policy.max_lines | int] if truncated else raw -%}
+{%- set rows = [] -%}
+{%- for l in lines -%}
+{%- set q = l.split('"') -%}
+{%- set req = q[1] | lower -%}
+{%- set parts = req.split(' ') -%}
+{%- set path = (parts[1] if parts | length > 1 else '').split('?')[0] -%}
+{%- set segs = path.split('/') -%}
+{%- set seg0 = segs[1] if segs | length > 1 else '' -%}
+{%- set seg = ('.' ~ seg0[1:].split('.')[0]) if seg0.startswith('.') else seg0 -%}
+{%- set ip = l.split(' ')[0] -%}
+{%- set _ = rows.append({'ip': ip, 'sub': ip.rsplit('.', 1)[0], 'req': req, 'pat': '/' ~ seg, 'st': q[2].split()[0] | int, 'ua': ((q[5] | lower) if q | length > 5 else '')}) -%}
+{%- endfor -%}
+{%- set ips = rows | map(attribute='ip') | unique | list -%}
+{%- set entities = [] -%}
+{%- for ip in ips -%}
+{%- set sub = ip.rsplit('.', 1)[0] -%}
+{%- set n = namespace(total=0, e404=0, fails=0, sfails=0, sqli=0, sens=0, r5='', ex=[], uas=[], pats=[]) -%}
+{%- for r in rows -%}
+{%- set is_login = r.req.startswith('post /login') -%}
+{%- if r.sub == sub and is_login and r.st in policy.fail_statuses -%}{%- set n.sfails = n.sfails + 1 -%}{%- endif -%}
+{%- if r.ip == ip -%}
+{%- set n.total = n.total + 1 -%}
+{%- if r.st == 404 -%}{%- set n.e404 = n.e404 + 1 -%}{%- endif -%}
+{%- if r.ua not in n.uas -%}{%- set _ = n.uas.append(r.ua) -%}{%- endif -%}
+{%- if r.pat not in n.pats -%}{%- set _ = n.pats.append(r.pat) -%}{%- endif -%}
+{%- if is_login and r.st in policy.success_statuses and n.r5 == '' -%}
+{%- if n.fails >= policy.cred_fail_threshold -%}{%- set n.r5 = 'ip' -%}
+{%- elif policy.r5_subnet_aggregate and n.sfails >= policy.cred_fail_threshold -%}{%- set n.r5 = 'subnet' -%}{%- endif -%}
+{%- endif -%}
+{%- if is_login and r.st in policy.fail_statuses -%}{%- set n.fails = n.fails + 1 -%}{%- endif -%}
+{%- if policy.sqli_patterns | select('in', r.req) | list | length > 0 -%}{%- set n.sqli = n.sqli + 1 -%}{%- if n.ex | length < 2 -%}{%- set _ = n.ex.append(r.req) -%}{%- endif -%}{%- endif -%}
+{%- if policy.sensitive_paths | select('in', r.req) | list | length > 0 -%}{%- set n.sens = n.sens + 1 -%}{%- if n.ex | length < 2 -%}{%- set _ = n.ex.append(r.req) -%}{%- endif -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set hits = [] -%}
+{%- if ip in policy.bad_ips -%}{%- set _ = hits.append({'id': 'R1', 'detail': 'known-bad IP list'}) -%}{%- endif -%}
+{%- if n.sqli > 0 -%}{%- set _ = hits.append({'id': 'R2', 'detail': 'SQL injection pattern x' ~ n.sqli}) -%}{%- endif -%}
+{%- if n.sens > 0 -%}{%- set _ = hits.append({'id': 'R3', 'detail': 'sensitive path probe x' ~ n.sens}) -%}{%- endif -%}
+{%- if n.fails >= policy.cred_fail_threshold -%}{%- set _ = hits.append({'id': 'R4', 'detail': 'credential stuffing, ' ~ n.fails ~ ' failed logins'}) -%}{%- endif -%}
+{%- if n.r5 != '' -%}{%- set _ = hits.append({'id': 'R5', 'detail': 'successful login after failures (' ~ n.r5 ~ ' scope)'}) -%}{%- endif -%}
+{%- set ids = hits | map(attribute='id') | list -%}
+{%- if hits | length > 0 -%}
+{%- set verdict = 'flagged' -%}
+{%- set severity = 'top' if 'R5' in ids else ('high' if ('R1' in ids or 'R2' in ids or 'R4' in ids) else 'medium') -%}
+{%- elif n.e404 >= policy.stat_404_threshold -%}
+{%- set verdict = 'stat_only' -%}{%- set severity = 'low' -%}
+{%- else -%}
+{%- set verdict = 'clean' -%}{%- set severity = 'none' -%}
+{%- endif -%}
+{%- set ent = {'ip': ip, 'subnet24': sub ~ '.0/24', 'verdict': verdict, 'severity': severity, 'requests': n.total, 'e404': n.e404, 'failed_logins': n.fails, 'rules': hits} -%}
+{%- if verdict != 'clean' -%}
+{%- set matches = [] -%}
+{%- for rec in history -%}
+{%- set ks = [] -%}
+{%- for key in policy.match_keys -%}
+{%- if key == 'ip' -%}
+{%- if rec.ip and rec.ip == ip -%}{%- set _ = ks.append('ip') -%}{%- endif -%}
+{%- elif key == 'subnet24' -%}
+{%- set rsub = ((rec.cidr or rec.ip or '').split('/')[0]).rsplit('.', 1)[0] -%}
+{%- if rsub and rsub == sub -%}{%- set _ = ks.append('subnet24') -%}{%- endif -%}
+{%- elif key == 'ua_path' -%}
+{%- set uh = namespace(ok=false) -%}
+{%- set ph = namespace(ok=false) -%}
+{%- if rec.ua and rec.path_patterns -%}
+{%- for u in n.uas -%}{%- if (rec.ua | lower) in u -%}{%- set uh.ok = true -%}{%- endif -%}{%- endfor -%}
+{%- for p in rec.path_patterns -%}{%- if (p | lower) in n.pats -%}{%- set ph.ok = true -%}{%- endif -%}{%- endfor -%}
+{%- endif -%}
+{%- if uh.ok and ph.ok -%}{%- set _ = ks.append('ua_path') -%}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if ks | length > 0 -%}{%- set _ = matches.append({'record_id': rec.id, 'matched_key': ks[0], 'matched_keys': ks, 'verdict': rec.verdict, 'action': rec.action, 'summary': rec.summary}) -%}{%- endif -%}
+{%- endfor -%}
+{%- set _ = ent.update({'user_agents': n.uas, 'path_patterns': n.pats, 'examples': n.ex, 'history_matches': matches}) -%}
+{%- endif -%}
+{%- set _ = entities.append(ent) -%}
+{%- endfor -%}
+{{ {'policy_version': policy.version, 'lines_parsed': lines | length, 'lines_truncated': truncated, 'distinct_ips': ips | length, 'entities': entities} | tojson }}

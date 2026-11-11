@@ -67,11 +67,20 @@ func lookupBuiltinTemplateRunner(name string) (BuiltinTemplateRunner, bool) {
 	return fn, ok
 }
 
+// errTemplateBuiltinRefused marks a builtin the running profile does not allow.
+// It is terminal: a retry on the same node cannot change the profile.
+var errTemplateBuiltinRefused = errors.New("run_job_template: builtin not available in this profile")
+
 // liveTemplateRunOps implements worker.TemplateRunOps against the node workspace
 // and the compiled-in builtin registry.
 type liveTemplateRunOps struct {
 	workspaceDir string
 	nodeID       string
+	// builtinPolicy, when non-nil, restricts which compiled-in builtins this
+	// instance may run. It returns "" to allow a builtin, else the refusal
+	// reason. nil (the ordinary node) allows every registered builtin. The HPC
+	// profile sets it so builtins that need a local listener are refused.
+	builtinPolicy func(handler string) string
 	// Per-instance seam for deterministic mutation during output hashing.
 	hashOutput func(context.Context, *os.File, int64) (string, int64, error)
 }
@@ -114,6 +123,11 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 	req.Params, err = jobs.NormalizeTemplateParams(req.Params)
 	if err != nil {
 		return nil, err
+	}
+	if o.builtinPolicy != nil {
+		if reason := o.builtinPolicy(runner.Handler); reason != "" {
+			return nil, fmt.Errorf("%w: %q: %s", errTemplateBuiltinRefused, runner.Handler, reason)
+		}
 	}
 	fn, ok := lookupBuiltinTemplateRunner(runner.Handler)
 	if !ok {
@@ -213,6 +227,9 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, files []jobs.Temp
 		rel := filepath.FromSlash(f.NodePath)
 		if digest, ok := stagedHashes[rel]; ok {
 			size := stagedSizes[rel]
+			if err := f.VerifyExpectedContent(digest, size); err != nil {
+				return nil, nil, nil, err
+			}
 			if size > maxBytes-declaredBytes {
 				return nil, nil, nil, fmt.Errorf("declared input bytes exceed %d-byte limit", maxBytes)
 			}
@@ -257,7 +274,15 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, files []jobs.Temp
 			)
 		}
 		h := sha256.New()
-		copied, copyErr := copyTemplateWithContextLimit(ctx, io.MultiWriter(dst, h), src, maxBytes-declaredBytes)
+		copyLimit := maxBytes - declaredBytes
+		expectedLimitsCopy := f.ExpectedBytes != nil && *f.ExpectedBytes <= copyLimit
+		if expectedLimitsCopy {
+			copyLimit = *f.ExpectedBytes
+		}
+		copied, copyErr := copyTemplateWithContextLimit(ctx, io.MultiWriter(dst, h), src, copyLimit)
+		if expectedLimitsCopy && errors.Is(copyErr, errTemplateCopyLimit) {
+			copyErr = fmt.Errorf("input does not match expected_bytes: %w", copyErr)
+		}
 		closeSrcErr := src.Close()
 		chmodErr := dst.Chmod(0o400)
 		closeDstErr := dst.Close()
@@ -270,6 +295,9 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, files []jobs.Temp
 			return nil, nil, nil, stageErr
 		}
 		digest := "sha256:" + hex.EncodeToString(h.Sum(nil))
+		if err := f.VerifyExpectedContent(digest, copied); err != nil {
+			return nil, nil, nil, err
+		}
 		stagedHashes[rel] = digest
 		stagedSizes[rel] = copied
 		declaredBytes += copied
@@ -532,9 +560,23 @@ func copyTemplateWithContext(ctx context.Context, dst io.Writer, src io.Reader) 
 	return copyTemplateWithContextLimit(ctx, dst, src, int64(^uint64(0)>>1))
 }
 
+var errTemplateCopyLimit = errors.New("template copy byte limit exceeded")
+
+type templateCopyLimitError struct{ max int64 }
+
+func (e templateCopyLimitError) Error() string {
+	return fmt.Sprintf("byte limit of %d exceeded", e.max)
+}
+
+func (e templateCopyLimitError) Unwrap() error {
+	return errTemplateCopyLimit
+}
+
 // copyTemplateWithContextLimit refuses before writing the byte that would cross
 // maxBytes. The pre-copy Stat check makes ordinary oversized inputs cheap; this
-// streaming check closes the race where a source grows after Stat.
+// streaming check closes the race where a source grows after Stat. At most one
+// excess byte is read, even when the declared expectation is much smaller than
+// the normal copy buffer. No addition can overflow a max-int64 allowance.
 func copyTemplateWithContextLimit(ctx context.Context, dst io.Writer, src io.Reader, maxBytes int64) (int64, error) {
 	if maxBytes < 0 {
 		return 0, fmt.Errorf("byte limit must not be negative")
@@ -545,13 +587,17 @@ func copyTemplateWithContextLimit(ctx context.Context, dst io.Writer, src io.Rea
 		if err := ctx.Err(); err != nil {
 			return written, err
 		}
-		nr, readErr := src.Read(buf)
+		readSize := len(buf)
+		if remaining := maxBytes - written; remaining < int64(readSize) {
+			readSize = int(remaining) + 1
+		}
+		nr, readErr := src.Read(buf[:readSize])
 		if nr > 0 {
 			if err := ctx.Err(); err != nil {
 				return written, err
 			}
 			if int64(nr) > maxBytes-written {
-				return written, fmt.Errorf("byte limit of %d exceeded", maxBytes)
+				return written, templateCopyLimitError{max: maxBytes}
 			}
 			nw, writeErr := dst.Write(buf[:nr])
 			written += int64(nw)

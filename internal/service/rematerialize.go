@@ -40,6 +40,10 @@ import (
 // We never touch a file that is not citadel-managed (see isCitadelManagedUnit),
 // and we back up the prior content to <unit>.citadel-bak before rewriting so an
 // operator can recover their exact previous file.
+//
+// #1356 also repairs the missing /etc/citadel write exception in recognized
+// root SYSTEM base files under ProtectSystem=strict. That separate narrow
+// transformation preserves additive/reset paths and refuses uncertain identity.
 
 // hardeningDirectives are the systemd directives #444 added to defend against a
 // crash-restart storm. Order matters only for where we insert a missing one:
@@ -64,6 +68,98 @@ var wantHardening = []unitHardening{
 	{dirStartLimitBurst, "5", "Unit"},
 	{dirRestartSteps, "5", "Service"},
 	{dirRestartMaxDelaySec, "300", "Service"},
+}
+
+// rootConfigWritePathContent repairs the old generated root system-unit shape
+// without replacing operator directives. It interprets only the base file: it
+// does not resolve drop-ins or prove the manager's effective configuration.
+// Unknown syntax refuses this new grant, leaving existing #444 refresh intact.
+func rootConfigWritePathContent(content string, userMode bool) (string, bool) {
+	if userMode || !isCitadelManagedUnit(content) {
+		return content, false
+	}
+	lines := strings.Split(content, "\n")
+	section := ""
+	insertAt := -1
+	user, dynamicUser, protectSystem := "", "", ""
+	dynamicUserSeen := false
+	pathsKnown, hasConfigPath := true, false
+	for i, raw := range lines {
+		// Unit-file whitespace is not arbitrary Unicode whitespace. Do not
+		// turn an unknown User spelling into root by trimming non-ASCII bytes.
+		line := strings.Trim(raw, " \t\r")
+		// A continuation outside Service can consume a later section header
+		// and make physical User lines belong to a different logical section.
+		// Refuse the grant before interpreting any such physical header.
+		if line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, ";") && strings.HasSuffix(line, "\\") {
+			return content, false
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			if section == "Service" {
+				insertAt = i + 1
+			}
+			continue
+		}
+		if section != "Service" {
+			continue
+		}
+		if line != "" {
+			insertAt = i + 1
+		}
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return content, false
+		}
+		key, value = strings.Trim(key, " \t\r"), strings.Trim(value, " \t\r")
+		switch key {
+		case "User":
+			user = value
+		case "DynamicUser":
+			dynamicUser = value
+			dynamicUserSeen = true
+		case "ProtectSystem":
+			protectSystem = value
+		case "ReadWritePaths":
+			if value == "" {
+				// An empty assignment resets every earlier additive path grant.
+				pathsKnown, hasConfigPath = true, false
+				continue
+			}
+			if strings.ContainsAny(value, "\"'\\%") {
+				pathsKnown = false
+				continue
+			}
+			for _, path := range strings.Fields(value) {
+				if !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "-/") {
+					pathsKnown = false
+				}
+				if path == "/etc/citadel" || path == "-/etc/citadel" {
+					hasConfigPath = true
+				}
+			}
+		}
+	}
+	// System-manager User absence/reset means root; never infer ownership from
+	// HOME, ExecStart, the updater's euid or the candidate filename alone.
+	if insertAt < 0 || (user != "" && user != "root" && user != "0") || protectSystem != "strict" || !pathsKnown || hasConfigPath {
+		return content, false
+	}
+	switch dynamicUser {
+	case "":
+		if dynamicUserSeen {
+			// Empty boolean assignments are not known list/User resets.
+			return content, false
+		}
+	case "no", "false", "off", "0":
+	default:
+		return content, false
+	}
+	lines = append(lines[:insertAt], append([]string{"ReadWritePaths=-/etc/citadel"}, lines[insertAt:]...)...)
+	return strings.Join(lines, "\n"), true
 }
 
 // managedUnitCandidate is one place a citadel-managed systemd unit may live.
@@ -233,13 +329,13 @@ const (
 	// refreshNotManaged: the file at this path is not a citadel-managed unit
 	// (leave it untouched; never normalize an unrelated unit).
 	refreshNotManaged unitRefreshDecision = iota
-	// refreshNoChange: a citadel unit already carrying the hardening (no write,
+	// refreshNoChange: a citadel unit already carrying applicable repairs (no write,
 	// no daemon-reload churn).
 	refreshNoChange
-	// refreshNeedsRoot: a citadel SYSTEM unit that needs the hardening but the
+	// refreshNeedsRoot: a citadel SYSTEM unit that needs repairs but the
 	// current process lacks the privilege to rewrite /etc. Emit a remediation.
 	refreshNeedsRoot
-	// refreshRewrite: a citadel unit that needs the hardening and we may rewrite
+	// refreshRewrite: a citadel unit that needs repairs and we may rewrite
 	// it (a user unit, or a system unit as root).
 	refreshRewrite
 )
@@ -252,7 +348,11 @@ func decideUnitRefresh(content string, userMode bool, euid int) (hardened string
 	if !isCitadelManagedUnit(content) {
 		return "", refreshNotManaged
 	}
-	hardened, changed := hardenUnitContent(content)
+	// Decide new permissions from the original base file. The legacy hardener
+	// can normalize a directive and remove syntax that made identity uncertain.
+	withRootPath, pathChanged := rootConfigWritePathContent(content, userMode)
+	hardened, changed := hardenUnitContent(withRootPath)
+	changed = changed || pathChanged
 	if !changed {
 		return "", refreshNoChange
 	}
@@ -263,8 +363,8 @@ func decideUnitRefresh(content string, userMode bool, euid int) (hardened string
 	return hardened, refreshRewrite
 }
 
-// RematerializeManagedUnits re-renders every citadel-managed systemd unit on disk
-// so the #444 crash-storm hardening reaches nodes deployed by an older binary. It
+// RematerializeManagedUnits refreshes managed systemd base files so #444
+// crash-storm hardening and eligible #1356 root config-path repairs reach old units. It
 // is safe to call on every `citadel update install` (including its already-latest
 // path, citadel-cli#1266) and (version-gated) at boot: a unit already carrying the
 // hardening is left untouched and triggers no daemon-reload. logf may be nil.
@@ -315,7 +415,7 @@ func rematerializeManagedUnits(cands []managedUnitCandidate, euid int, run func(
 			// Skip (with an actionable, secure_path-proof hint) rather than error
 			// when we lack privileges, e.g. an unprivileged `citadel update install`
 			// on a system-unit node (citadel-cli#1266).
-			log("unit-refresh: %s: needs the #444 restart-storm hardening but rewriting a system unit requires root; re-run as root: %s", cand.path, rootRemediationCommand(selfExe(), "service refresh-unit"))
+			log("unit-refresh: %s: needs managed-unit repairs but rewriting a system unit requires root; re-run as root: %s", cand.path, rootRemediationCommand(selfExe(), "service refresh-unit"))
 			continue
 		}
 
@@ -333,7 +433,7 @@ func rematerializeManagedUnits(cands []managedUnitCandidate, euid int, run func(
 		} else {
 			reloadSystem = true
 		}
-		log("unit-refresh: %s: applied #444 restart-storm hardening (backup at %s.citadel-bak)", cand.path, cand.path)
+		log("unit-refresh: %s: applied managed-unit repairs (backup at %s.citadel-bak)", cand.path, cand.path)
 	}
 
 	// daemon-reload so systemd re-reads the changed unit. We do NOT restart the

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
 // Node represents a discovered peer node from the service discovery API.
@@ -88,7 +90,8 @@ func NewClient(cfg ClientConfig) *Client {
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 		apiKey:  cfg.APIKey,
 		httpClient: &http.Client{
-			Timeout: cfg.Timeout,
+			Timeout:   cfg.Timeout,
+			Transport: platformhttp.New(cfg.BaseURL, platformhttp.Options{}),
 		},
 		cacheTTL: cfg.CacheTTL,
 	}

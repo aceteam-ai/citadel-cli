@@ -1,0 +1,13 @@
+{
+  "schema_version": "stream.pack-index.v1",
+  "origin": "aceteam-ai/citadel-cli",
+  "packs": [
+    {
+      "id": "shield-st1-fixtures",
+      "version": "1.0.0",
+      "digest": "sha256:1a6d94bd71ec5f4b3bc091e939a722e02638923346a42dab8553f9bf75ac90cf",
+      "bundle_path": "packs/shield-st1-fixtures/1.0.0/bundle.json",
+      "bundle_sha256": "sha256:89d4734bc13eb3cca96058c490212ae4e04a491e2e9b4c2fc871b4d6d2dc391f"
+    }
+  ]
+}

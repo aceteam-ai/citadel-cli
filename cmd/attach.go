@@ -46,7 +46,7 @@ import (
 
 // attachCmd implements `citadel attach`.
 var attachCmd = &cobra.Command{
-	Use:   "attach",
+	Use:   "attach [name]",
 	Short: "Attach to the running citadel worker on this node",
 	Long: `Discover the citadel worker already running on this node and show its
 status, rather than starting a competing second process.
@@ -59,13 +59,26 @@ worker's local status server.
 If no worker is running, it says so and points you at 'citadel work'.
 
 Use --shell to instead open an interactive shell on the running control center
-(the TUI you launched with 'citadel'). Ctrl+] detaches; Ctrl-D exits the shell.`,
-	RunE:         runAttach,
-	SilenceUsage: true,
+(the TUI you launched with 'citadel'). Ctrl+] detaches; Ctrl-D exits the shell.
+
+With a NAME, attach to that declared node-local harness session instead.
+The default detach chord is Ctrl+] then d; detaching never stops the harness.
+Use --readonly to forbid input or --take-control for an explicit local takeover.`,
+	Args:             validateDeclaredAttach,
+	PersistentPreRun: declaredAttachPreRun,
+	RunE:             runAttach,
+	SilenceUsage:     true,
 	// The no-worker path prints its own friendly guidance and returns
 	// errNoRunningWorker purely to carry a non-zero exit for scripts; silence
 	// cobra's own "Error: ..." line so the guidance is not printed twice.
 	SilenceErrors: true,
+}
+
+func declaredAttachPreRun(cmd *cobra.Command, args []string) {
+	if len(args) == 1 {
+		return // Named harness attach is intentionally local-only.
+	}
+	rootCmd.PersistentPreRun(cmd, args) // Preserve legacy no-name startup.
 }
 
 // errNoRunningWorker is returned (exit 1) when there is nothing to attach to. The
@@ -87,12 +100,19 @@ var attachShell bool
 func init() {
 	attachCmd.Flags().BoolVar(&attachShell, "shell", false,
 		"Open an interactive shell on the running control center (instead of printing status). Ctrl+] detaches; Ctrl-D exits the shell.")
+	attachCmd.Flags().Bool("readonly", false, "Never send input to the named harness")
+	attachCmd.Flags().Bool("take-control", false, "Explicitly request control of the named harness")
+	attachCmd.Flags().String("detach-keys", defaultDeclaredDetach, "Two-byte detach chord, for example 'C-] d'")
+	attachCmd.Flags().String("node-config-dir", "", "Existing node configuration directory for named harness attachment")
 	rootCmd.AddCommand(attachCmd)
 }
 
 // runAttach discovers the running worker via the single-instance lock and prints
 // the attach view, or a "nothing to attach to" message when none is running.
-func runAttach(_ *cobra.Command, _ []string) error {
+func runAttach(cmd *cobra.Command, args []string) error {
+	if len(args) == 1 {
+		return runDeclaredAttach(cmd, args[0])
+	}
 	// --shell: open an interactive shell on the running control-center instance
 	// (the citadel.sock mechanism, distinct from the worker lock below). This is
 	// the explicit opt-in escape hatch for the behavior bare `citadel` used to do

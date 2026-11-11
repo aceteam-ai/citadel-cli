@@ -1,0 +1,35 @@
+{
+  "organization_id": "00000000-0000-4000-8000-000000000001",
+  "definition": {
+    "stream_id": "synthetic-auth",
+    "version": 1,
+    "node_id": "1297",
+    "sources": [
+      {
+        "id": "synthetic-auth-log",
+        "type": "file",
+        "parser": "openssh",
+        "path": "/tmp/synthetic-stream/auth.log",
+        "bind": null,
+        "port": null
+      }
+    ],
+    "pack": {
+      "id": "synthetic-auth",
+      "version": "1.0.0",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "escalate": {
+      "flow_id": "00000000-0000-4000-8000-000000000002",
+      "flow_version_id": "00000000-0000-4000-8000-000000000003",
+      "input_map": {"logs": "$logs"},
+      "max_per_hour": 60,
+      "max_concurrent": 2,
+      "max_run_cost_micro_usd": 1000000,
+      "daily_cap_micro_usd": 5000000
+    },
+    "evidence": {"mode": "digest", "max_lines": 0, "max_bytes_per_line": 0},
+    "time": "ingest",
+    "synthetic": true
+  }
+}

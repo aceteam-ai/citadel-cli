@@ -70,6 +70,10 @@ type StatusMessage struct {
 	// ingest with extra=ignore, so an unknown field is inert. Both transports
 	// (redis.go here, api.go) emit the identical block.
 	AutoUpdate *status.AutoUpdateReport `json:"auto_update,omitempty"`
+	// ControlTLS is the serving control listener's loaded public certificate.
+	// API-mode durable transport binds this payload through the platform relay's
+	// existing HMAC envelope. This field is not a device-origin signature.
+	ControlTLS *status.ControlTLSReport `json:"control_tls,omitempty"`
 }
 
 // PermissionState mirrors config.Permissions for the heartbeat payload.

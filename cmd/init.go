@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -268,11 +270,16 @@ and system user configuration (requires sudo).`,
 
 			// Reclaim stale node with the same hostname before registering.
 			// This prevents duplicate nodes in the dashboard after live ISO reboots.
-			reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+			reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
 			if err := connectToNetwork(nodeName, deviceAuthResult.Token.Authkey); err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
+				os.Exit(1)
+			}
+			if err := linkDeviceEnrollment(deviceAuthResult); err != nil {
+				_ = network.Disconnect()
+				fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
 				os.Exit(1)
 			}
 			ip, _ := network.GetGlobalIPv4()
@@ -293,9 +300,7 @@ and system user configuration (requires sudo).`,
 			}
 
 			// Try to reclaim stale node using saved device config (if available)
-			if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-				reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
-			}
+			reclaimEnrollmentNodes(initNewDevice, nil, nodeName)
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
 			if err := connectToNetwork(nodeName, key); err != nil {
@@ -346,6 +351,24 @@ and system user configuration (requires sudo).`,
 							fmt.Fprintf(os.Stderr, "⚠️  Could not save config: %v\n", err)
 						}
 					}
+					applyDeviceAuthNexusURL(flagChanged(cmd, "nexus"), deviceAuthResult.Token.NexusURL)
+					nodeName, err = getNodeName()
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+						os.Exit(1)
+					}
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
+					// A fresh grant does not authorize the already-connected node
+					// (e.g. --relogin reconnected from preserved state). Register
+					// with the grant's key, keeping the machine key, and link that
+					// registration; a saved bearer is not a completed link.
+					if err := registerAndLinkGrantWith(deviceAuthResult, nodeName, grantEnrollmentPrecheck, enrollmentNodeID, network.Disconnect, connectToNetworkForceLogin, linkDeviceEnrollment); err != nil {
+						fmt.Fprintf(os.Stderr, "❌ Enrollment incomplete: %v\n", err)
+						os.Exit(1)
+					}
+				} else {
+					// Do not mistake a saved bearer for a completed current-key link.
+					printDeviceLinkDiagnosticContext(cmd.Context(), os.Stderr, getDeviceConfigFromFile())
 				}
 
 				// Get node name from network status
@@ -385,8 +408,8 @@ and system user configuration (requires sudo).`,
 
 			if authkeyToUse != "" {
 				// Reclaim stale node before registering (if we have a device API token)
-				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
-					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+				if deviceAuthResult != nil {
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 				}
 
 				fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
@@ -596,8 +619,8 @@ and system user configuration (requires sudo).`,
 
 			if authKey != "" {
 				// Reclaim stale node before registering (if we have a device API token)
-				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
-					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+				if deviceAuthResult != nil {
+					reclaimEnrollmentNodes(initNewDevice, deviceAuthResult, nodeName)
 				}
 
 				fmt.Println("--- 🌐 Joining network ---")
@@ -1485,7 +1508,7 @@ func generateCitadelConfig(user, nodeName, serviceName, orgID string) (string, e
 	}
 
 	// Always write all available service definitions to allow for easy switching later.
-	for name, content := range services.ServiceMap {
+	for name, content := range services.ComposeMapForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose) {
 		filePath := filepath.Join(servicesDir, name+".yml")
 		if err := os.WriteFile(filePath, []byte(content), 0600); err != nil {
 			return "", err
@@ -1842,6 +1865,17 @@ func configureNvidiaDocker() error {
 // Only overwrites the OS hostname when the current hostname is generic (live ISO,
 // fresh install). User-chosen hostnames are preserved.
 func connectToNetwork(nodeName, authKey string) error {
+	return connectToNetworkOpts(nodeName, authKey, false)
+}
+
+// connectToNetworkForceLogin is connectToNetwork for a fresh grant's key on a
+// host that kept its saved state: tsnet would otherwise ignore the key and
+// resume the previous registration.
+func connectToNetworkForceLogin(nodeName, authKey string) error {
+	return connectToNetworkOpts(nodeName, authKey, true)
+}
+
+func connectToNetworkOpts(nodeName, authKey string, forceLogin bool) error {
 	// Record the pre-registration OS hostname (once) so it can be restored
 	// later via 'citadel rename'. saveOriginalHostnameToConfig is a no-op if an
 	// original hostname has already been recorded.
@@ -1875,8 +1909,12 @@ func connectToNetwork(nodeName, authKey string) error {
 		Hostname:   nodeName,
 		ControlURL: nexusURL, // From root.go
 		AuthKey:    authKey,
+		ForceLogin: forceLogin,
 	}
 
+	// A failed connect must not leave an earlier registration's ID for the
+	// device link to use.
+	setRegisteredNodeID("")
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
@@ -1906,9 +1944,20 @@ func connectToNetwork(nodeName, authKey string) error {
 	// Disconnect cleanly so tsnet flushes its state files, then the
 	// post-Close chown in Disconnect() fixes ownership for the non-root
 	// worker process. The work command re-establishes its own connection.
-	_ = network.Disconnect()
+	recordRegistrationThenDisconnect(ctx, srv.Status, network.Disconnect)
 
 	return nil
+}
+
+// recordRegistrationThenDisconnect records the registered node ID and only
+// then disconnects. The order is the v2.199.0 bug: the device link that
+// follows needs the ID, and the global server can no longer report it after
+// Disconnect.
+func recordRegistrationThenDisconnect(ctx context.Context, status func(context.Context) (*network.NetworkStatus, error), disconnect func() error) {
+	if st, err := status(ctx); err == nil && st != nil {
+		setRegisteredNodeID(st.NodeID)
+	}
+	_ = disconnect()
 }
 
 // reclaimStaleNodeByHostname removes a stale Headscale node with the same
@@ -1978,7 +2027,7 @@ func ensureNodeIdentityWithStore(store *nodeidentity.Store, baseURL string) {
 	// stalls the init happy path. 503 (CA not activated) degrades silently.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: platformhttp.New(baseURL, platformhttp.Options{})}
 	if err := store.FetchCAChain(ctx, baseURL, client); err != nil {
 		Debug("fabric CA chain fetch skipped (non-fatal): %v", err)
 		return

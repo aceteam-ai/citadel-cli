@@ -1,0 +1,17 @@
+{
+  "version": "shield-policy-2026-10-14.1",
+  "cred_fail_threshold": 5,
+  "fail_statuses": [401, 403],
+  "success_statuses": [200, 302],
+  "r5_subnet_aggregate": true,
+  "stat_404_threshold": 8,
+  "bad_ips": ["203.0.113.66", "203.0.113.67", "198.51.100.23"],
+  "sqli_patterns": ["' or ", "'or'", "%27%20or", "' and ", "union select", "union%20select", "or 1=1", "or%201=1", "drop table", "drop%20table", "%20or%20", "'%20and%20", "sleep(", "information_schema"],
+  "sensitive_paths": ["/.env", "/wp-admin", "/wp-login", "/etc/passwd", "/.git", "/phpmyadmin", "../"],
+  "match_keys": ["ip", "ua_path", "subnet24"],
+  "hold_actions": ["block", "rate_limit"],
+  "confidence_floor": 0.85,
+  "blast_radius_hold": ["high"],
+  "max_lines": 5000,
+  "max_proposals_per_run": 10
+}

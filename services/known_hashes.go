@@ -12,6 +12,8 @@ package services
 // KnownComposeHashes is the historical-template allowlist (see file header).
 var KnownComposeHashes = map[string]map[string]bool{
 	"ollama": {
+		// #1531 shared CPU template documentation, Linux and Darwin.
+		"b2bb8d68c3a7638a6cf534ed8527466928888bfd8c7c09e9e8226db20f4d014c": true,
 		"423edb3435749d6b1c4047b9bfdd2851be733e42e28f189a913701b0aa491e97": true,
 		"7e97a822ad30ef8a2cc8e2c20096b24f95a12742bbe533c7bb7de43d37404869": true,
 		"fdd34b5e8019bac3330ce25e763135250d1e4ad732109aa10a6e15f2fa16b09d": true,
@@ -21,9 +23,9 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// aceteam-ai/citadel-cli#1023: bind hatch defaulting to all-interfaces
 		// (${CITADEL_OLLAMA_BIND:-0.0.0.0}), tightenable via `bind: loopback`.
 		"de8c7513caf02c4685d69fa8b28c4a5d2cfb97897ac6463ed970fd830908c1bd": true,
-		// aceteam-ai/citadel-cli#1048: darwin CPU/arm64 variant
+		// aceteam-ai/citadel-cli#1048: historical CPU variant, now shared with Linux
 		// (compose/ollama.darwin.yml, GPU reservation dropped). Registered so a
-		// darwin node's composerefresh recognizes the materialized variant as
+		// node's composerefresh recognizes the materialized variant as
 		// citadel-written; pinned by TestKnownComposeHashesCoverDarwinVariants.
 		"35eded55d912833bb7076c144ed58722a72019c471817de75cd40dc4ff6e7a5b": true,
 		// citadel-cli#1188: explicit docker.io registry (linux + darwin).
@@ -37,6 +39,9 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// (linux + darwin); semantic policy change is in the Go env builder.
 		"bd7bc9fc5e040e41ec2b85dadd8b9e28f6a6d570d2fb5eb27cf905dfbfb3e28e": true,
 		"75c1ac0a8b3af9d8cf8e344c389ebe2ef7289148296e03d70013eb9bb8df81e8": true,
+		// citadel-cli#1560: key-only OLLAMA_KEEP_ALIVE environment entry (linux + darwin).
+		"6840cac7aed4088861c4a3c8e4043aa1eb6eb1118563cfb2a761a373b2062102": true,
+		"b2803792f706393d39078d0d0c56d1640625bba1050591a82eafb2a46f867b63": true,
 	},
 	"vllm": {
 		"07588f4ef245f011396874bcdd7c6aa0c463a356c5f6601618c3b4e213be812a": true,
@@ -59,6 +64,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"9237f28c7c3f0b2a210ca63ee5a871042e722ff226fa34473be0bc0280d34440": true,
 	},
 	"llamacpp": {
+		// #1531 shared CPU template documentation, Linux and Darwin.
+		"e6050ee77a6341b40e63a5596ec1a1cc7b5507af69158c3dc9ab7d645e594372": true,
 		"03985065ef91d7ea3a512b3dc3029f08e57ca72a9d6ac96e5a6c3d52d1d9f249": true,
 		"2fcefa5327f63af9d1d2fbac8e44f92ac44ca595d9fcd1cb27ec42498f084061": true,
 		"586347f463e368ff0c9d81f911c935cc8816851be64a20cb14d2b3eb0252251b": true,
@@ -73,9 +80,9 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"73503ad8531bffd4bcf1774d81ddf5e53e4c34b3ab0ea23c64cd1e0ac638d680": true,
 		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_LLAMACPP_BIND:-127.0.0.1}).
 		"a093bfc26312a2c1fdf79b03fa5712154d586e94948c635d4a3db91ed84c6866": true,
-		// aceteam-ai/citadel-cli#1048: darwin CPU/arm64 variant
+		// aceteam-ai/citadel-cli#1048: historical CPU variant, now shared with Linux
 		// (compose/llamacpp.darwin.yml, GPU reservation dropped + :server CPU
-		// image). Registered for a darwin node's composerefresh; pinned by
+		// image). Registered for CPU-template refresh; pinned by
 		// TestKnownComposeHashesCoverDarwinVariants.
 		"097cdb8500b3f9b5e2c2f018a5124578744e2e0364a5b9c3e390239af8ef12c3": true,
 	},
@@ -124,6 +131,10 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// citadel-cli#1335 review: FLUX.2-klein-4B default model, residency,
 		// backoff and free-disk-floor env.
 		"93385effc412fe5dbb7e8d321f5a35dc11d59a6dd30a2dc0771941243fa07a34": true,
+		// citadel-cli#1346: image pinned by digest instead of the floating :latest.
+		"4e96fcad81ed6e11534f3300de593db0ac47d385cba4aae5149c5d83ade41b9f": true,
+		// citadel-cli#1383: idle-unload and explicit image/video pin environment.
+		"f64ec83ab86d0070f289a39d93e30d9a1c841cfb4d7dae831986e8dd6d2225b1": true,
 	},
 	"bonsai": {
 		"124af757f45e93b689bc6a59f08187d48f59c0e62eb2d10c6a006c8ac4d24609": true,

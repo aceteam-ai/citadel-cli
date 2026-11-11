@@ -12,9 +12,10 @@ name: Build diffusers-service image
 # multi-GB CUDA image build (that isn't merging yet) adds no signal -- the first
 # real build runs post-merge on main where it can be watched. Use
 # workflow_dispatch to build a branch on demand.
-# Tags: the commit SHA always (pinning/rollback); `latest` ONLY on
-# refs/heads/main, so a workflow_dispatch of a branch builds a test image
-# without triggering a fleet rollout (nodes pull :latest).
+# Tags: the commit SHA always; `latest` ONLY on refs/heads/main. Nodes do NOT
+# run :latest: services/compose/diffusers.yml pins <commit-sha>@<digest>
+# (citadel-cli#1346), so a build here reaches the fleet only after a follow-up
+# PR bumps that pin and a citadel release ships it.
 on:
   push:
     branches: [main]

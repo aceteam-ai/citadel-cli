@@ -3,6 +3,7 @@ module github.com/aceteam-ai/citadel-cli
 go 1.26.6
 
 require (
+	github.com/BurntSushi/toml v1.5.0
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/aceteam-ai/fabric-protocol v0.0.0-20260902143942-795c2cf81e47
@@ -17,10 +18,12 @@ require (
 	github.com/fatih/color v1.18.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gdamore/tcell/v2 v2.13.10
+	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/gowebpki/jcs v1.0.1
 	github.com/hashicorp/go-version v1.8.0
+	github.com/libdns/cloudflare v0.2.2
 	github.com/libdns/rfc2136 v1.0.1
 	github.com/mattn/go-runewidth v0.0.19
 	github.com/mdp/qrterminal/v3 v3.2.1
@@ -32,11 +35,14 @@ require (
 	github.com/spf13/pflag v1.0.10
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55
 	github.com/tailscale/wireguard-go v0.0.0-20260527010701-b48af7099cad
+	github.com/x448/float16 v0.8.4
 	go.uber.org/zap v1.27.1
 	golang.org/x/crypto v0.53.0
+	golang.org/x/image v0.41.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.46.0
 	golang.org/x/term v0.44.0
+	golang.org/x/text v0.39.0
 	golang.org/x/time v0.12.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
@@ -71,7 +77,6 @@ require (
 	github.com/gdamore/encoding v1.0.1 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
-	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
@@ -115,7 +120,6 @@ require (
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/viterin/partial v1.1.0 // indirect
 	github.com/viterin/vek v0.4.2 // indirect
-	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
@@ -129,7 +133,6 @@ require (
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/text v0.39.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect

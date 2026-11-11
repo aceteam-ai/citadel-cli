@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -118,8 +119,31 @@ func New(dir string) *Store {
 // read-through of a key previously registered under the legacy invoker-scoped
 // platform.ConfigDir()/identity location; see reconcileFromLegacy for the
 // exact (never-displace-a-registered-key, never-destroy-key-material) rule.
+//
+// When DisableLegacyReadThrough is in effect the store has no legacy dir at
+// all, so a job-scoped process can never adopt a key from a shared home.
 func Convergent(nodeConfigDir string) *Store {
+	if legacyReadThroughDisabled.Load() {
+		return newStore(filepath.Join(nodeConfigDir, dirName), "")
+	}
 	return newStore(filepath.Join(nodeConfigDir, dirName), filepath.Join(platform.ConfigDir(), dirName))
+}
+
+// legacyReadThroughDisabled is a one-way, process-wide switch.
+var legacyReadThroughDisabled atomic.Bool
+
+// DisableLegacyReadThrough makes every later Convergent store skip the legacy
+// platform.ConfigDir()/identity adoption for the rest of this process. The HPC
+// profile (aceteam#12715) sets it before any identity is constructed: on a
+// shared home, every allocation would otherwise adopt the user's personal
+// node key. There is deliberately no way to turn it back on.
+func DisableLegacyReadThrough() {
+	legacyReadThroughDisabled.Store(true)
+}
+
+// LegacyReadThroughDisabled reports whether DisableLegacyReadThrough was called.
+func LegacyReadThroughDisabled() bool {
+	return legacyReadThroughDisabled.Load()
 }
 
 // Dir returns the identity store directory.

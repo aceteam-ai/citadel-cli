@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
@@ -22,7 +23,12 @@ type LegacyHandlerAdapter struct {
 	handler         jobs.JobHandler
 	logFn           func(level, msg string)
 	enabled         func() bool
+	refusal         func() *jobs.ShellRefusal
 	backgroundOwner bool
+	// passcodeGate, when set, is evaluated after the permission check and
+	// before the handler runs. On such an adapter the payload passcode key is
+	// removed, so the handler never sees it.
+	passcodeGate func(presented string) error
 }
 
 // newGatedLegacyHandlerAdapter creates an adapter whose dispatchability follows
@@ -32,6 +38,20 @@ type LegacyHandlerAdapter struct {
 func newGatedLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, enabled func() bool) *LegacyHandlerAdapter {
 	a := NewLegacyHandlerAdapter(jobType, handler)
 	a.enabled = enabled
+	return a
+}
+
+// newDesktopLegacyHandlerAdapter gates a desktop handler on both the live
+// desktop permission and the node passcode (jobs.DesktopGate), the way
+// SHELL_COMMAND is gated on the shell permission and the passcode.
+func newDesktopLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, enabled func() bool, gate jobs.DesktopGate) *LegacyHandlerAdapter {
+	a := newGatedLegacyHandlerAdapter(jobType, handler, enabled)
+	a.passcodeGate = func(presented string) error {
+		if reason := jobs.DesktopGateReason(gate, presented); reason != "" {
+			return jobs.DesktopRefusal(reason)
+		}
+		return nil
+	}
 	return a
 }
 
@@ -51,7 +71,7 @@ func (a *LegacyHandlerAdapter) SetLogFn(logFn func(level, msg string)) {
 
 // CanHandle returns true if this adapter handles the given job type.
 func (a *LegacyHandlerAdapter) CanHandle(jobType string) bool {
-	return a.jobType == jobType && (a.enabled == nil || a.enabled())
+	return a.jobType == jobType && (a.enabled == nil || a.enabled()) && a.meetingReadiness() == nil
 }
 
 // DeclaredCapabilities forwards the wrapped legacy handler's capability
@@ -83,7 +103,12 @@ func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
 func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	start := time.Now()
 	if a.enabled != nil && !a.enabled() {
-		err := fmt.Errorf("job type %s is disabled by current node permissions", job.Type)
+		err := legacyPermissionRefusal(a.jobType)
+		if a.refusal != nil {
+			if specific := a.refusal(); specific != nil {
+				err = specific
+			}
+		}
 		return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
 	}
 
@@ -107,6 +132,16 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	if job.Payload != nil {
 		nexusJob.Payload = make(map[string]string)
 		for k, v := range job.Payload {
+			// FILE_FETCH's bounded integer may arrive as a JSON number. Preserve
+			// its decimal form instead of fmt.Sprint's scientific notation for
+			// large float64s. The handler rejects fractions, non-finite values
+			// and out-of-range integers. Other job payload semantics are unchanged.
+			if a.jobType == JobTypeFileFetch && k == "max_bytes" {
+				if number, ok := v.(float64); ok {
+					nexusJob.Payload[k] = strconv.FormatFloat(number, 'f', -1, 64)
+					continue
+				}
+			}
 			switch val := v.(type) {
 			case string:
 				nexusJob.Payload[k] = val
@@ -123,6 +158,21 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 			}
 		}
 	}
+	if a.passcodeGate != nil {
+		presented := ""
+		if nexusJob.Payload != nil {
+			presented = nexusJob.Payload[jobs.ShellPasscodePayloadKey]
+			// The passcode authorizes this job and is never handler input.
+			delete(nexusJob.Payload, jobs.ShellPasscodePayloadKey)
+		}
+		if err := a.passcodeGate(presented); err != nil {
+			if a.logFn != nil {
+				a.logFn("warn", fmt.Sprintf("Refusing %s job %s: %v", job.Type, job.ID, err))
+			}
+			return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
+		}
+	}
+
 	// Wire throttled progress to the job's stream (aceteam#10876 C1). The throttle
 	// state is per-Execute (local to this call); most handlers never emit, so this
 	// is inert unless the handler calls ctx.EmitProgress (FILE_INDEX today). A
@@ -253,6 +303,19 @@ type LegacyHandlerOpts struct {
 	// desktop handlers stay registered behind a per-dispatch fail-closed gate so
 	// APPLY_DEVICE_CONFIG changes take effect without restarting the worker.
 	DesktopEnabled func() bool
+	// DesktopPasscodeState reads the node's passcode state once per desktop job
+	// (jobs.DesktopGate.Load). It must return an error, never Set=false, when the
+	// state cannot be read. Required whenever desktop handlers are registered:
+	// nil refuses every desktop job.
+	DesktopPasscodeState func() (jobs.PasscodeState, error)
+	// ShellPasscodeState, when set, replaces ShellHasPasscode and
+	// ShellVerifyPasscode for SHELL_COMMAND with one strict read of the node's
+	// passcode state (jobs.ShellGate.State).
+	ShellPasscodeState func() (jobs.PasscodeState, error)
+	// PasscodeThrottle is the node's shared wrong-passcode throttle, applied to
+	// SHELL_COMMAND and the desktop handlers (and, through the workflow
+	// executor's ShellGate, to the WORKFLOW_RUN Shell gate). Nil never throttles.
+	PasscodeThrottle *jobs.PasscodeThrottle
 	// FilesDisabled, when true, SKIPS registration of the file browse/host job
 	// handlers (FILE_READ/READ_BYTES/WRITE/EDIT/LIST/SEARCH/INDEX/
 	// SEMANTIC_SEARCH). FILE_WRITE_BYTES stays registered in a refusing state
@@ -266,6 +329,10 @@ type LegacyHandlerOpts struct {
 	// handlers stay registered behind a per-dispatch fail-closed gate so both
 	// capability advertisement and execution track permission revocation.
 	FilesEnabled func() bool
+	// FileFetchOrigin overrides the trusted coordinator origin resolver. Nil
+	// reloads the existing converged device configuration on each dispatch.
+	// It must never come from job payloads.
+	FileFetchOrigin func() string
 	// MeetingEnabled is the live meeting-permission source. When nil the
 	// persisted meeting configuration is loaded for each dispatch. Tests may
 	// inject it to prove that disabling new joins does not disable exact-attempt
@@ -301,11 +368,19 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	shellHandler.Enabled = opts.ShellEnabled
 	shellHandler.HasPasscode = opts.ShellHasPasscode
 	shellHandler.VerifyPasscode = opts.ShellVerifyPasscode
+	shellHandler.State = opts.ShellPasscodeState
+	shellHandler.Throttle = opts.PasscodeThrottle
 	configHandler := jobs.NewConfigHandler(opts.ConfigDir)
 	configHandler.PermissionsDir = opts.PermissionsDir
 	goos := opts.GOOS
 	if goos == "" {
 		goos = runtime.GOOS
+	}
+	meetingEnabled := opts.MeetingEnabled
+	if meetingEnabled == nil {
+		meetingEnabled = func() bool {
+			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
+		}
 	}
 
 	// Embedding handler as fail-closed dispatched work when a signer is wired
@@ -407,19 +482,39 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	// operator's screen. FILE_SCREENSHOT and VNC_SCREENSHOT share one capture
 	// path (the internal/desktop X11 capture); there is no separate VNC
 	// framebuffer source.
+	// Each desktop job also honors the node passcode, like SHELL_COMMAND: on a
+	// node with a passcode set, the job must present it in its payload
+	// `passcode` field. A node without a passcode is unchanged.
 	if opts.DesktopEnabled != nil || !opts.DesktopDisabled {
 		gate := opts.DesktopEnabled
+		passcode := jobs.DesktopGate{Load: opts.DesktopPasscodeState, Throttle: opts.PasscodeThrottle}
 		handlers = append(handlers,
-			newGatedLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}, gate),
-			newGatedLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}, gate),
+			newDesktopLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}, gate, passcode),
+			newDesktopLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}, gate, passcode),
 		)
 	}
 
 	// Register file-operation handlers when a workspace is configured.
 	if opts.WorkspaceDir != "" {
+		origin := opts.FileFetchOrigin
+		if origin == nil {
+			origin = func() string { return config.LoadDeviceCredsConverged().APIBaseURL }
+		}
+		fetchHandler := jobs.NewFileFetchHandler(opts.WorkspaceDir, origin)
+		fetchHandler.Disabled = opts.FilesDisabled
+		fetchHandler.Enabled = opts.FilesEnabled
+		fetchEnabled := func() bool {
+			files := !opts.FilesDisabled
+			if opts.FilesEnabled != nil {
+				files = opts.FilesEnabled()
+			}
+			return files && fetchHandler.Configured()
+		}
+		handlers = append(handlers, newGatedLegacyHandlerAdapter(JobTypeFileFetch, fetchHandler, fetchEnabled))
+
 		writeBytesHandler := jobs.NewFileWriteBytesHandler(opts.WorkspaceDir)
 		writeBytesHandler.Disabled = opts.FilesDisabled
 		writeBytesHandler.Enabled = opts.FilesEnabled
@@ -516,15 +611,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// per-meeting null sink, then transcribes it via the handler above. Needs
 		// the workspace both to write the recording and to validate the audio path
 		// for transcription, so it lives inside this workspace gate. Gated on the
-		// persisted meeting toggle (default-on, the house opt-out convention) so
-		// the handler registers unless the operator has explicitly opted out —
-		// matching the `meeting` capability advertisement gate in
-		// internal/capabilities.
-		if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
-			handlers = append(handlers,
-				NewLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts)),
-			)
-		}
+		// live meeting toggle shared with HUDDLE_JOIN and registration refusals.
+		// Retain the adapter while disabled so enabling new joins does not need
+		// a worker restart; CanHandle and Execute both recheck the same gate.
+		handlers = append(handlers,
+			newGatedLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts), meetingEnabled),
+		)
 	}
 
 	// Native-huddle agent join (aceteam#7081). Part of the SAME default-on meeting
@@ -539,12 +631,6 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	huddleHandler := jobs.NewHuddleJoinHandler(opts.WorkspaceDir)
 	huddleTeardown := NewLegacyHandlerAdapter(JobTypeHuddleTeardown, huddleHandler)
 	huddleTeardown.backgroundOwner = false
-	meetingEnabled := opts.MeetingEnabled
-	if meetingEnabled == nil {
-		meetingEnabled = func() bool {
-			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
-		}
-	}
 	handlers = append(handlers,
 		newGatedLegacyHandlerAdapter(JobTypeHuddleJoin, huddleHandler, meetingEnabled),
 		huddleTeardown,
@@ -569,10 +655,14 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 
 	// Convert to []JobHandler.
 	result := make([]JobHandler, len(handlers))
+	refusals := &registrationRefusals{opts: opts, goos: goos}
+	refusals.opts.MeetingEnabled = meetingEnabled
 	for i, h := range handlers {
+		jobType := h.jobType
+		h.refusal = func() *jobs.ShellRefusal { return refusals.RefusalFor(jobType) }
 		result[i] = h
 	}
-	return result
+	return append(result, refusals)
 }
 
 // newMeetingJoinHandler wires opts.MeetingProfileDir into the handler so a
@@ -591,6 +681,7 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 	// capability itself). The config accessors clamp non-positive cadence values
 	// to sane defaults.
 	m := config.LoadMeeting(platform.ConfigDir())
+	h.Timing, h.TimingError = m.TimingProfile()
 	h.StreamingEnabled = m.StreamingEnabled
 	h.StreamingInterval = m.StreamingInterval()
 	h.StreamingWindow = m.StreamingWindow()

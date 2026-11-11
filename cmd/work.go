@@ -232,6 +232,7 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 func connectWithBackoffLabeled(ctx context.Context, label string, source apiConnector) error {
 	backoff := connectBackoffInitial
 	attempt := 0
+	authReported := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -249,6 +250,19 @@ func connectWithBackoffLabeled(ctx context.Context, label string, source apiConn
 		// If the context was cancelled mid-connect, this is a clean shutdown.
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// Log() is console-visible only with --debug. Surface the first
+		// authenticated API refusal on the default path too, while keeping the
+		// established in-process retry policy (including 429/offline recovery).
+		// Only the typed, fixed-text error is rendered, never an arbitrary
+		// wrapping error, response body, URL, or credential.
+		if authErr, ok := redisapi.AsAuthorizationError(err); ok {
+			if !authReported {
+				fmt.Fprintln(os.Stderr, "API authorization:", authErr)
+				authReported = true
+			}
+			err = authErr
 		}
 
 		// Decide how long to wait before the next attempt.
@@ -351,6 +365,16 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 const workSessionMode = nodesession.Worker
 
 func runWork(cmd *cobra.Command, args []string) {
+	// The hpc profile (aceteam#12715) has its own entry point built from a
+	// positive list of parts; nothing below this line runs under it.
+	if hpcProfileActive() {
+		runHPCWork(cmd, args)
+		return
+	}
+	if set := hpcFlagsOutsideProfile(cmd.Flags()); len(set) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: %s only apply with --profile hpc.\n", strings.Join(set, ", "))
+		os.Exit(2)
+	}
 	// citadel#853: --node-dir/CITADEL_NODE_DIR redirects manifest resolution
 	// but NOT the module lockfile (catalog.LockfilePath, still hardcoded to
 	// platform.ConfigDir()). liveModuleOps.Install/Uninstall -- the reconcile
@@ -509,6 +533,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	if warning := sensitiveCapabilityPasscodeWarning(workAppliedPermissions); warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
 	}
+
+	// Re-adopt co-browse sessions that survived a restart by exec (citadel-cli#1546)
+	// before anything can sweep them; sessions that fail verification are reaped.
+	platform.GetCobrowseSessionManager().Recover()
 
 	// Setup signal handling. The first signal cancels the root context so every
 	// subsystem (worker runner, status/terminal/gateway servers, heartbeat,
@@ -883,7 +911,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// version (clears it only when they now match), then seed the cache. Both
 	// are best-effort: telemetry must never interrupt or delay the worker.
 	_ = update.ReconcilePendingOnStartup(time.Now(), Version)
-	nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "unavailable"))
+	nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "unavailable", update.InspectSelfUpdateCapability()))
 	// nodeReconcileHealth is the desired-state PULL reconcile loop's
 	// full-wipe-guard HealthTracker (citadel-cli#742), same atomic-pointer
 	// reasoning as nodeSwapManager above: the status-publisher goroutines that
@@ -923,6 +951,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// (job counts, poll time) and the status server's /agent/* endpoints, which
 	// answer over the tsnet mesh even when Redis job consumption is broken.
 	workerState := worker.NewWorkerState()
+	var platformRedials []func()
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
@@ -971,13 +1000,14 @@ func runWork(cmd *cobra.Command, args []string) {
 		apiQueueNames := queueResult.Queues
 
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
-			BaseURL:       apiBaseURL,
-			Token:         deviceConfig.DeviceAPIToken,
-			QueueNames:    apiQueueNames,
-			ConsumerGroup: workGroup,
-			BlockMs:       workPollMs,
-			MaxAttempts:   workMaxRetries,
-			DebugFunc:     Debug,
+			BaseURL:          apiBaseURL,
+			Token:            deviceConfig.DeviceAPIToken,
+			QueueNames:       apiQueueNames,
+			ConsumerGroup:    workGroup,
+			BlockMs:          workPollMs,
+			MaxAttempts:      workMaxRetries,
+			DebugFunc:        Debug,
+			PlatformObserver: workerState.ObservePlatform,
 			// Route the source's info logs (subscribed queues, consumer group,
 			// per-node AddQueue) through Log() so they land in latest.log. The
 			// default sink is stdout, which the worker's log file does not
@@ -1039,6 +1069,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// blip left pub/sub on the (broken) HTTP fallback for the whole process
 		// lifetime, with only a Debug line to show for it (issue #723).
 		apiClient := apiSource.Client()
+		platformRedials = append(platformRedials, apiClient.RedialPlatformConnections)
 		wsRetryDone = enableWebSocketWithRetry(ctx, wsConnector{client: apiClient}, workerWSLog)
 		pubSubTransportFn = apiClient.PubSubTransport
 
@@ -1179,6 +1210,18 @@ func runWork(cmd *cobra.Command, args []string) {
 	} else {
 		Log("network not configured (no saved state)")
 	}
+	// Display only, once after live mesh identity resolution; never on the
+	// heartbeat/retry path and never a condition for starting the worker.
+	if useAPIMode {
+		printDeviceLinkDiagnosticContext(ctx, os.Stderr, deviceConfig)
+	}
+	// Publish one immutable provider bundle after transport selection, before
+	// session control can read it. Heartbeat and optional status consumers below
+	// reuse these exact function values; later runner/swap initialization is
+	// observed through the existing atomic pointers rather than callback writes.
+	sessionProviders := newWorkSessionProviders(workerState, &nodeSwapManager, &nodeRunner, pubSubTransportFn)
+	workerLivenessFn, swapStatsFn, laneActivityFn := sessionProviders.Worker, sessionProviders.Swap, sessionProviders.Lanes
+
 	// Publish S2 session status/stop only from the process that owns the
 	// single-instance worker lock. The machine-wide TUN socket belongs to
 	// ipnserver and must never be replaced by this controller.
@@ -1190,7 +1233,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Restart=on-failure does NOT restart -- so a failure to bind the
 		// auxiliary control socket (realistically EACCES on a root-owned state
 		// dir) would silently and permanently stop an otherwise-healthy worker.
-		if stopSessionControl, err := startNodeSessionControl(workSessionMode, cancel); err != nil {
+		if stopSessionControl, err := startNodeSessionControl(workSessionMode, cancel, sessionProviders); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: node session control unavailable (continuing without it): %v\n", err)
 			Log("node session control unavailable (continuing without it): %v", err)
 		} else {
@@ -1486,35 +1529,6 @@ func runWork(cmd *cobra.Command, args []string) {
 		workStatusPort = 8080
 	}
 
-	// Live worker consume-loop liveness for the heartbeat (issue #548). Reads the
-	// same *WorkerState the runner updates, so the heartbeat can surface a
-	// "green but wedged" node (heartbeating from a separate goroutine while the
-	// consume loop is blocked and draining nothing).
-	workerLivenessFn := func() *status.WorkerLiveness {
-		live := workerLivenessFrom(workerState.Snapshot())
-		// Pub/sub transport is read live off the API client rather than mirrored
-		// through WorkerState: it can flip at any moment (background retry
-		// succeeds, connection drops) and a snapshot field would go stale.
-		if pubSubTransportFn != nil {
-			live.PubSubTransport = pubSubTransportFn()
-		}
-		return live
-	}
-
-	// Model-hotswap swap-activity stats for the heartbeat (citadel-cli#717): "is
-	// this node thrashing?" without shell access. nodeSwapManager.Store is called
-	// below at the buildNodeJobHandlers call site, from status-publisher
-	// goroutines that are already running by then (Load() is what makes that
-	// safe); nil here (before the store) or under the hotswap break-glass
-	// disable means no Swap block on the heartbeat.
-	swapStatsFn := func() *status.SwapActivity {
-		mgr := nodeSwapManager.Load()
-		if mgr == nil {
-			return nil
-		}
-		return swapStatsFrom(mgr.SwapStats())
-	}
-
 	// Full-wipe-guard refusal state for the heartbeat (citadel-cli#742): "is
 	// this node's reconcile pass currently being refused?" without shell
 	// access to the journal. nodeReconcileHealth.Store is called below at the
@@ -1544,20 +1558,6 @@ func runWork(cmd *cobra.Command, args []string) {
 			return nil
 		}
 		return reservationsFrom(list)
-	}
-
-	// Live bounded-execution-lane activity for the heartbeat (citadel-cli#908):
-	// "how loaded is this node right now" so a dispatcher can avoid targeting a
-	// saturated node. nodeRunner.Store is called below at the runner's
-	// construction site, from a point where these status-publisher goroutines are
-	// already running (Load() is what makes that safe); nil here (before the
-	// store) leaves the Lanes field omitted from the heartbeat.
-	laneActivityFn := func() []status.LaneActivity {
-		rn := nodeRunner.Load()
-		if rn == nil {
-			return nil
-		}
-		return laneActivityFrom(rn.LaneSnapshots())
 	}
 
 	jobTypesFn := func() []string {
@@ -1658,11 +1658,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Workflow executor for WORKFLOW_RUN jobs (#105). Created here so the status
 	// server's AddRouteRegistrar closure and the job handler share a single instance.
 	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
+		HTTP: workflowHTTPPolicy(network.GetNodeConfigDir()),
+		LLM:  workflowLLMPolicy(network.GetNodeConfigDir()),
 		Shell: workflow.ShellConfig{
 			WorkspaceDir: wsDir,
 			// The SAME live shell gate SHELL_COMMAND uses (citadel-cli#1305): a
 			// graph with a Shell node needs the `shell` permission + node passcode.
-			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier},
+			Gate: jobs.ShellGate{Enabled: nodeShellEnabled, HasPasscode: nodeHasPasscode, VerifyPasscode: nodePasscodeVerifier, State: nodePasscodeState, Throttle: nodePasscodeThrottle},
 		},
 	})
 
@@ -1694,6 +1696,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	})
 
 	// Start status server if enabled
+	var controlTLSProvider func() *status.ControlTLSReport
 	if workStatusPort > 0 {
 		serverCfg := status.ServerConfig{
 			Port:        workStatusPort,
@@ -1819,6 +1822,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 
 		statusServer := status.NewServer(serverCfg, collector)
+		controlTLSProvider = statusServer.ControlTLS
 
 		// Start the vendor-agents probe now that a pull surface exists (aceteam
 		// #8993 S2): async startup probe + hourly timer (CITADEL_AGENTS_PROBE_
@@ -2190,6 +2194,7 @@ func runWork(cmd *cobra.Command, args []string) {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
 					apiPublisher.SetAutoUpdateProvider(autoUpdateReportFn)
+					apiPublisher.SetControlTLSProvider(controlTLSProvider)
 					startStatusPublisher = func() {
 						go func() {
 							fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
@@ -2378,7 +2383,9 @@ func runWork(cmd *cobra.Command, args []string) {
 					orgID,
 					termAPIToken,
 					termConfig.TokenRefreshInterval,
+					workerState.ObservePlatform,
 				)
+				platformRedials = append(platformRedials, cachingAuth.RedialPlatformConnections)
 
 				termServer := terminal.NewServer(termConfig, cachingAuth)
 
@@ -2797,6 +2804,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !workPerms.Desktop,
 		DesktopEnabled:            nodeDesktopEnabled,
+		DesktopPasscodeState:      nodePasscodeState,
+		ShellPasscodeState:        nodePasscodeState,
+		PasscodeThrottle:          nodePasscodeThrottle,
 		FilesDisabled:             !workPerms.Files,
 		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              wfExec,
@@ -2887,6 +2897,8 @@ func runWork(cmd *cobra.Command, args []string) {
 	// shared workerState and, on a clear loss of forward progress, exits non-zero
 	// so systemd restarts the process clean. No-op if disabled (WORKER_SELF_HEAL).
 	if monitor := worker.NewLivenessMonitor(workerState, runner.IsDraining, func(level, msg string) { Log("%s", msg) }); monitor != nil {
+		monitor.SetRestartFence(runner.FenceIntakeForRecovery)
+		bindWorkPlatformRecovery(useAPIMode, monitor, platformRedials, runner.TryIdleRestart)
 		go monitor.Run(ctx)
 	}
 
@@ -2896,7 +2908,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// updater (worker lock held), so a non-owner keeps the seeded "unavailable".
 	if err := runWorkerWithAutoUpdater(ctx, workerLock, workAutoUpdatePolicyInputs(), runner, workAutoUpdateLog, autoUpdateRuntime{
 		refresh: func() {
-			nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "periodic"))
+			nodeAutoUpdateReport.Store(buildAutoUpdateSnapshot(workAutoUpdatePolicyInputs(), "periodic", update.InspectSelfUpdateCapability()))
 		},
 	}); err != nil {
 		if err != context.Canceled {
@@ -2955,6 +2967,7 @@ func startManagedServices(ctx context.Context) []startedService {
 	fmt.Printf("--- Starting %d service(s) ---\n", len(manifest.Services))
 
 	var started []startedService
+	failed, skipped := 0, 0
 	for _, service := range manifest.Services {
 		// Stop launching further services once shutdown has been requested so a
 		// slow startup goroutine unwinds promptly instead of racing teardown.
@@ -2967,6 +2980,7 @@ func startManagedServices(ctx context.Context) []startedService {
 		// stopped stays installed but must NOT be composed up on boot, or the stop
 		// would silently come back on the next `citadel work` restart (aceteam#5280).
 		if serviceStartDisabled(service) {
+			skipped++
 			fmt.Printf("   - Skipping stopped service: %s (desired_status: stopped)\n", service.Name)
 			continue
 		}
@@ -2981,6 +2995,7 @@ func startManagedServices(ctx context.Context) []startedService {
 		// supported local-inference path on macOS.
 		if serviceType == internalServices.ServiceTypeDocker &&
 			skipEngineOnDarwin(runtime.GOOS, service.Name, forceGPUEngines()) {
+			skipped++
 			fmt.Printf("   - Skipping %s on macOS: needs an NVIDIA GPU and Docker (use native ollama for local inference)\n", service.Name)
 			continue
 		}
@@ -2991,7 +3006,8 @@ func startManagedServices(ctx context.Context) []startedService {
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
 				return startNativeService(service.Name, configDir)
 			}); err != nil {
-				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
+				failed++
+				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
 				continue
 			}
 			started = append(started, startedService{name: service.Name, native: true})
@@ -2999,14 +3015,16 @@ func startManagedServices(ctx context.Context) []startedService {
 			// Validate that compose file path stays within config directory (prevent path traversal)
 			fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "     Warning: %s: invalid compose file path: %v\n", service.Name, err)
+				failed++
+				fmt.Fprintf(os.Stderr, "     Error: %s: invalid compose file path: %v\n", service.Name, err)
 				continue
 			}
 			fmt.Printf("   - Starting %s...\n", service.Name)
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
 				return startService(service.Name, fullComposePath)
 			}); err != nil {
-				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
+				failed++
+				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
 				continue
 			}
 			started = append(started, startedService{name: service.Name, composePath: fullComposePath})
@@ -3014,7 +3032,7 @@ func startManagedServices(ctx context.Context) []startedService {
 		fmt.Printf("   - %s is running\n", service.Name)
 	}
 
-	fmt.Println("--- Services started ---")
+	fmt.Printf("--- Service startup: %d started, %d failed, %d skipped ---\n", len(started), failed, skipped)
 	return started
 }
 
@@ -3378,16 +3396,9 @@ func getRedisURLFromConfig() string {
 // Priority: --workspace flag > CITADEL_WORKSPACE env > ~/citadel-node/workspace default.
 // Returns empty string if the directory cannot be resolved or created.
 func resolveWorkspaceDir() string {
-	dir := workWorkspaceDir
+	dir := workspaceDirPath()
 	if dir == "" {
-		dir = os.Getenv("CITADEL_WORKSPACE")
-	}
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return ""
-		}
-		dir = filepath.Join(home, "citadel-node", "workspace")
+		return ""
 	}
 	// Ensure the directory exists.
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -3400,6 +3411,23 @@ func resolveWorkspaceDir() string {
 		return dir
 	}
 	return abs
+}
+
+// workspaceDirPath preserves flag/env/default precedence without filesystem
+// effects, allowing fixture selection to be checked before directory creation.
+func workspaceDirPath() string {
+	dir := workWorkspaceDir
+	if dir == "" {
+		dir = os.Getenv("CITADEL_WORKSPACE")
+	}
+	if dir == "" {
+		home, err := platform.HomeDir("")
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, "citadel-node", "workspace")
+	}
+	return dir
 }
 
 // newAutoStopReconciler builds the config-gated auto-stop-when-idle reconciler
@@ -3551,13 +3579,17 @@ func nodeIsServingModels(ctx context.Context) bool {
 // silently loses a field when one side gains one.
 func workerLivenessFrom(snap worker.WorkerSnapshot) *status.WorkerLiveness {
 	return &status.WorkerLiveness{
-		Consuming:          snap.Consuming,
-		LastJobConsumedAt:  snap.LastJobAt,
-		LastPollAt:         snap.LastPollAt,
-		InFlight:           snap.InFlight,
-		Processed:          snap.Processed,
-		Failed:             snap.Failed,
-		IdentityUnresolved: snap.IdentityUnresolved,
+		Consuming:              snap.Consuming,
+		LastJobConsumedAt:      snap.LastJobAt,
+		LastPollAt:             snap.LastPollAt,
+		PlatformOKAt:           snap.PlatformOKAt,
+		PlatformFailingSince:   snap.PlatformFailingSince,
+		PlatformLastOutcome:    string(snap.PlatformLastOutcome),
+		PlatformLastHTTPStatus: snap.PlatformLastHTTPStatus,
+		InFlight:               snap.InFlight,
+		Processed:              snap.Processed,
+		Failed:                 snap.Failed,
+		IdentityUnresolved:     snap.IdentityUnresolved,
 	}
 }
 

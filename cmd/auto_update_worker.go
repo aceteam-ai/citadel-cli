@@ -4,11 +4,26 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 )
+
+func init() {
+	// Every in-process self-restart (auto-updater, AGENT_UPDATE, external engine
+	// re-exec) goes through update.RestartProcess. Record why live co-browse
+	// sessions may end first, and stop them where they cannot be re-adopted.
+	update.SetBeforeRestartHook(platform.PrepareSelfRestart)
+	// Session registry records live in the machine-convergent node state dir
+	// (resolved lazily, never at init), not in the temp-dir session base.
+	platform.SetRegistryDirResolver(func() string {
+		return filepath.Join(network.GetNodeConfigDir(), "cobrowse-registry")
+	})
+}
 
 // autoUpdatePolicyInputs contains only flags belonging to the active command.
 // The control center has no --auto-update or interval flag; it passes zero values.
@@ -52,6 +67,7 @@ type autoUpdateRunner interface {
 // autoUpdateRuntime is an injection seam for tests. Production uses the
 // AutoUpdater's existing checksum, apply, restart, and Homebrew defaults.
 type autoUpdateRuntime struct {
+	capability  func() update.SelfUpdateCapability
 	checker     update.ReleaseChecker
 	ticks       <-chan time.Time
 	apply       func(string) error
@@ -82,11 +98,14 @@ func startWorkerAutoUpdater(ctx context.Context, ownsWorker bool, inputs autoUpd
 	}
 	updater := update.NewAutoUpdater(update.AutoUpdaterConfig{
 		Checker:    checker,
+		Capability: runtime.capability,
 		Interval:   interval,
 		Ticks:      runtime.ticks,
 		AfterTick:  runtime.afterTick,
-		Enabled:    func() bool { return resolveAutoUpdateEnabled(inputs) },
+		Policy:     func() (bool, string) { return resolveAutoUpdatePolicy(inputs) },
 		ActiveJobs: runner.ActiveJobs,
+		Busy:       platform.CobrowseBusy,
+		MaxDefer:   update.ResolveMaxDefer(),
 		BeginDrain: runner.BeginDrain,
 		Apply:      runtime.apply,
 		Restart:    runtime.restart,

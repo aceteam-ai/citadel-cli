@@ -14,12 +14,14 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/memory"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/spf13/cobra"
 )
 
@@ -131,6 +133,21 @@ type mcpBridge struct {
 	// (see resolveNodeIDForMCPHeader's doc comment) -- forwardToBackend must
 	// OMIT the header entirely when this is "", never send it empty.
 	nodeID string
+
+	// localOnly is `citadel local mcp` (aceteam#13503 design 2.2): no API key or
+	// device token is read, and nothing is ever forwarded to a backend. A
+	// method or tool this process does not serve gets -32601 instead of the
+	// backend fallthrough.
+	localOnly bool
+	// stdin is the JSON-RPC input; nil means os.Stdin.
+	stdin io.Reader
+	// writeMu serializes response lines, because async local tools (the
+	// co-browse tools) answer from their own goroutines.
+	writeMu sync.Mutex
+	// inflight tracks async tool calls so run waits for their responses.
+	inflight sync.WaitGroup
+	// onClientName receives clientInfo.name from initialize.
+	onClientName func(string)
 }
 
 const (
@@ -146,6 +163,15 @@ func (b *mcpBridge) bridgeStdout() io.Writer {
 		return b.stdout
 	}
 	return os.Stdout
+}
+
+// writeLine writes one newline-terminated JSON-RPC message atomically.
+func (b *mcpBridge) writeLine(data []byte) {
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	w := b.bridgeStdout()
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n"))
 }
 
 func runMCP(cmd *cobra.Command, args []string) error {
@@ -209,7 +235,16 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	}
 	// Strip trailing slash
 	apiURL = strings.TrimRight(apiURL, "/")
-	localTools := newLocalMCPTools(realLocalMCPDeps())
+	deps := realLocalMCPDeps()
+	var cobrowseRT *localCobrowseRuntime
+	if memoryCfg == nil {
+		// The enrolled bridge also serves local_cobrowse_* for THIS machine,
+		// alongside the remote cobrowse_* tools that take a node_id.
+		cobrowseRT = newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: localStateDir, viewer: true})
+		defer cobrowseRT.close()
+		deps.cobrowse = cobrowseRT
+	}
+	localTools := newLocalMCPTools(deps)
 	var remoteToolAllowlist map[string]struct{}
 	if memoryCfg != nil {
 		// The memory MCP registration is deliberately remote-only. Do not make
@@ -228,7 +263,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		mcpServer:   mcpServer,
 		endpointURL: selectMCPEndpoint(mcpEndpointURL, memoryCfg),
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout:   120 * time.Second,
+			Transport: platformhttp.New(apiURL, platformhttp.Options{}),
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -242,6 +278,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		// Resolved HERE, once, rather than per-request -- see the nodeID
 		// field's doc comment.
 		nodeID: resolveNodeIDForMCPHeader(),
+	}
+	if cobrowseRT != nil {
+		bridge.onClientName = cobrowseRT.setAgent
 	}
 
 	Debug("MCP bridge starting: server=%s, url=%s, local_tools=%d",
@@ -264,7 +303,13 @@ func selectMCPEndpoint(explicit string, memoryCfg *memory.Config) string {
 // run starts the stdio JSON-RPC loop.
 func (b *mcpBridge) run() error {
 	defer b.closeBackendSession()
-	scanner := bufio.NewScanner(os.Stdin)
+	// Answer every async tool call that is still running before returning.
+	defer b.inflight.Wait()
+	in := b.stdin
+	if in == nil {
+		in = os.Stdin
+	}
+	scanner := bufio.NewScanner(in)
 	// Increase buffer size to handle large tool lists (default 64KB is too small).
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
@@ -324,7 +369,7 @@ func (b *mcpBridge) run() error {
 			// MCP request methods require correlated results and are not executed
 			// in notification form. Protocol notifications are forwarded for
 			// backend session state, but their response (if any) is discarded.
-			if strings.HasPrefix(req.Method, "notifications/") && b.apiKey != "" {
+			if strings.HasPrefix(req.Method, "notifications/") && b.apiKey != "" && !b.localOnly {
 				_, forwardErr := b.forwardToBackend(&req)
 				if req.Method == "notifications/initialized" && b.remoteToolAllowlist != nil {
 					if forwardErr == nil {
@@ -357,6 +402,10 @@ func (b *mcpBridge) run() error {
 			}
 			fallthrough
 		default:
+			if b.localOnly {
+				b.writeError(req.ID, -32601, "Method or tool not available in citadel local mode")
+				continue
+			}
 			// Forward all other requests to the backend.
 			resp, err := b.forwardToBackend(&req)
 			if err != nil {
@@ -371,8 +420,7 @@ func (b *mcpBridge) run() error {
 				continue
 			}
 			// Write the raw response directly to stdout.
-			b.bridgeStdout().Write(resp)
-			b.bridgeStdout().Write([]byte("\n"))
+			b.writeLine(resp)
 		}
 	}
 
@@ -439,7 +487,21 @@ func (b *mcpBridge) handleInitialize(req *jsonRPCRequest) {
 		b.initializeAccepted = false
 		b.initialized = false
 	}
-	if b.apiKey == "" {
+	if b.onClientName != nil {
+		var p struct {
+			ClientInfo struct {
+				Name string `json:"name"`
+			} `json:"clientInfo"`
+		}
+		if json.Unmarshal(req.Params, &p) == nil && p.ClientInfo.Name != "" {
+			name := p.ClientInfo.Name
+			if len(name) > 120 {
+				name = name[:120]
+			}
+			b.onClientName(name)
+		}
+	}
+	if b.apiKey == "" || b.localOnly {
 		b.writeLocalInitializeResult(req.ID)
 		b.initializeAccepted = true
 		return
@@ -460,8 +522,7 @@ func (b *mcpBridge) handleInitialize(req *jsonRPCRequest) {
 	}
 
 	// Write the backend's response directly.
-	b.bridgeStdout().Write(resp)
-	b.bridgeStdout().Write([]byte("\n"))
+	b.writeLine(resp)
 	b.initializeAccepted = true
 }
 
@@ -475,12 +536,19 @@ func (b *mcpBridge) writeLocalInitializeResult(id json.RawMessage) {
 			"tools": map[string]interface{}{},
 		},
 		"serverInfo": map[string]interface{}{
-			"name":    "aceteam",
+			"name":    b.serverName(),
 			"version": Version,
 		},
 	}
 	resultBytes, _ := json.Marshal(result)
 	b.writeResult(id, resultBytes)
+}
+
+func (b *mcpBridge) serverName() string {
+	if b.localOnly {
+		return "citadel-local"
+	}
+	return "aceteam"
 }
 
 // handleToolsList responds to tools/list with the local tool set (aceteam
@@ -503,7 +571,7 @@ func (b *mcpBridge) handleToolsList(req *jsonRPCRequest) {
 		localRaw = append(localRaw, desc)
 	}
 
-	if b.apiKey == "" {
+	if b.apiKey == "" || b.localOnly {
 		b.writeToolsListResult(req.ID, localRaw)
 		return
 	}
@@ -599,9 +667,26 @@ func (b *mcpBridge) tryLocalToolsCall(req *jsonRPCRequest) bool {
 	}
 
 	Debug("MCP: dispatching local tool %q", memory.RedactSensitiveText(tool.Name, b.apiKey, b.sessionID))
+	if tool.Async {
+		// Answer from a goroutine so a long call (local_cobrowse_wait holds for
+		// up to 50s) never stalls ping or other requests. JSON-RPC responses
+		// are correlated by id, so order does not matter.
+		b.inflight.Add(1)
+		go func() {
+			defer b.inflight.Done()
+			b.respondLocalTool(req.ID, tool, params.Arguments)
+		}()
+		return true
+	}
+	b.respondLocalTool(req.ID, tool, params.Arguments)
+	return true
+}
+
+// respondLocalTool runs a local tool and writes its tools/call result.
+func (b *mcpBridge) respondLocalTool(id json.RawMessage, tool localMCPTool, args json.RawMessage) {
 	ctx, cancel := context.WithTimeout(context.Background(), localToolCallTimeout)
 	defer cancel()
-	text, err := callLocalToolWithTimeout(ctx, tool, params.Arguments)
+	content, err := callLocalToolContentWithTimeout(ctx, tool, args)
 
 	var result map[string]any
 	if err != nil {
@@ -612,18 +697,45 @@ func (b *mcpBridge) tryLocalToolsCall(req *jsonRPCRequest) bool {
 		}
 	} else {
 		result = map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
+			"content": content,
 			"isError": false,
 		}
 	}
 
 	resultBytes, merr := json.Marshal(result)
 	if merr != nil {
-		b.writeError(req.ID, -32603, fmt.Sprintf("failed to marshal local tool result: %v", merr))
-		return true
+		b.writeError(id, -32603, fmt.Sprintf("failed to marshal local tool result: %v", merr))
+		return
 	}
-	b.writeResult(req.ID, resultBytes)
-	return true
+	b.writeResult(id, resultBytes)
+}
+
+// callLocalToolContentWithTimeout is callLocalToolWithTimeout for a tool that
+// may return typed content blocks (CallContent, e.g. an MCP image block). A
+// text-only tool's result becomes one text block, exactly as before.
+func callLocalToolContentWithTimeout(ctx context.Context, tool localMCPTool, args json.RawMessage) ([]map[string]any, error) {
+	if tool.CallContent == nil {
+		text, err := callLocalToolWithTimeout(ctx, tool, args)
+		if err != nil {
+			return nil, err
+		}
+		return []map[string]any{{"type": "text", "text": text}}, nil
+	}
+	type callResult struct {
+		content []map[string]any
+		err     error
+	}
+	done := make(chan callResult, 1)
+	go func() {
+		c, err := tool.CallContent(ctx, args)
+		done <- callResult{content: c, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.content, r.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("local tool %s timed out after %s", tool.Name, localToolCallTimeout)
+	}
 }
 
 // callLocalToolWithTimeout makes localToolCallTimeout actually bound a local
@@ -1012,8 +1124,7 @@ func (b *mcpBridge) writeResult(id json.RawMessage, result json.RawMessage) {
 		Debug("MCP: failed to marshal response: %v", err)
 		return
 	}
-	b.bridgeStdout().Write(data)
-	b.bridgeStdout().Write([]byte("\n"))
+	b.writeLine(data)
 }
 
 // writeError writes an error JSON-RPC response to stdout.
@@ -1031,8 +1142,7 @@ func (b *mcpBridge) writeError(id json.RawMessage, code int, message string) {
 		Debug("MCP: failed to marshal error response: %v", err)
 		return
 	}
-	b.bridgeStdout().Write(data)
-	b.bridgeStdout().Write([]byte("\n"))
+	b.writeLine(data)
 }
 
 // getAPIKeyFromConfig reads the device API token from the citadel device

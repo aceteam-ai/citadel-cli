@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 type systemdManager struct{}
@@ -23,7 +25,7 @@ func newPlatformManager() Manager {
 // System mode: /etc/systemd/system/citadel.service
 func unitFilePath(userMode bool) (string, error) {
 	if userMode {
-		home, err := os.UserHomeDir()
+		home, err := platform.UserHomeDir()
 		if err != nil {
 			return "", fmt.Errorf("cannot determine home directory: %w", err)
 		}
@@ -99,6 +101,14 @@ func generateSystemUnit(cfg ServiceConfig, execLine string) (string, error) {
 	// key, so on every restart tsnet mints a fresh one and Headscale registers a
 	// duplicate node (aceteam-ai/citadel-cli#383). Grant write access to it.
 	nodeStateDir := filepath.Join(homeDir, "citadel-node")
+	writePaths := citadelDir + " " + nodeStateDir
+	if username == "root" {
+		// A root worker's platform.ConfigDir() is /etc/citadel unless
+		// /root/.citadel-cli/config.yaml exists. ProtectSystem=strict makes it
+		// read-only, so the worker could not cache the fabric CA bundle or
+		// create its TLS dir and crash-looped. "-" tolerates a missing dir.
+		writePaths += " -/etc/citadel"
+	}
 
 	return fmt.Sprintf(`[Unit]
 Description=%s
@@ -132,11 +142,11 @@ SyslogIdentifier=citadel
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%s %s
+ReadWritePaths=%s
 
 [Install]
 WantedBy=multi-user.target
-`, cfg.Description, execLine, username, group, homeDir, citadelDir, nodeStateDir), nil
+`, cfg.Description, execLine, username, group, homeDir, writePaths), nil
 }
 
 func resolveHomeDir(username string) (string, error) {
