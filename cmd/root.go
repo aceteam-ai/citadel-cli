@@ -357,6 +357,11 @@ func GetRootCmd() *cobra.Command {
 var containerRuntimeFlag string
 
 func init() {
+	// cobra's Windows preExecHook exits with "This is a command line tool" when
+	// the process was started by Explorer, before any of our code runs. The
+	// Explorer launch is handled by runRootCitadel (guided setup), so disable it.
+	cobra.MousetrapHelpText = ""
+
 	// Here you will define your flags and configuration settings.
 	// Cobra supports persistent flags, which, if defined here,
 	// will be global for your application.

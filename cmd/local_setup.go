@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,7 +31,8 @@ var consoleProcessCount = platform.ConsoleProcessCount
 
 // launchedFromExplorer reports whether this process is alone on its console,
 // which is what a double-click in Explorer produces (a terminal always adds its
-// shell to the console). It is false on every other OS and when there is no
+// shell to the console). `start citadel` and `Start-Process citadel` also get
+// a console of their own and so also count; that is intended and documented. It is false on every other OS and when there is no
 // console to ask.
 func launchedFromExplorer() bool {
 	n, err := consoleProcessCount()
@@ -42,7 +44,9 @@ var bareRunLocalSetupFn = runLocalSetupCommand
 
 // runRootCitadel is bare `citadel`. A double-click on Windows has no terminal to
 // print to, so it opens the guided setup page instead of the bare dispatcher;
-// every other launch is unchanged. It sits here, not in runBareCitadel, which
+// every other launch is unchanged. The test is a console with no other process
+// on it, so `start citadel` or any other new-console launch also opens setup,
+// not only an Explorer double-click. It sits here, not in runBareCitadel, which
 // is pinned to enrollment dispatch only.
 func runRootCitadel(cmd *cobra.Command, args []string) {
 	if launchedFromExplorer() {
@@ -172,6 +176,24 @@ func realLocalSetupDeps() (localSetupDeps, error) {
 	}, nil
 }
 
+// newCachedSetupDoctor runs the doctor once now (setup start) and again only
+// when the full check is requested. The page polls /api/setup/state every few
+// seconds; serving the cached result keeps those polls from probing the
+// co-browse owner lock (which would refuse an agent's first start with the
+// setup PID) or re-verifying the audit chain.
+func newCachedSetupDoctor(run func(full bool) []localviewer.SetupCheck) func(full bool) []localviewer.SetupCheck {
+	var mu sync.Mutex
+	cached := run(false)
+	return func(full bool) []localviewer.SetupCheck {
+		mu.Lock()
+		defer mu.Unlock()
+		if full {
+			cached = run(true)
+		}
+		return cached
+	}
+}
+
 // newLocalSetupServer builds the setup page's server. It uses its own private
 // dir so it never replaces a running co-browse owner's token file.
 func newLocalSetupServer(d localSetupDeps) *localviewer.Server {
@@ -183,7 +205,7 @@ func newLocalSetupServer(d localSetupDeps) *localviewer.Server {
 		Now:         d.now,
 		MaxSessions: localcobrowse.DefaultMaxSessions,
 		Setup: &localviewer.SetupConfig{
-			Doctor:      d.doctor,
+			Doctor:      newCachedSetupDoctor(d.doctor),
 			Apps:        func() []localviewer.SetupApp { return setupApps(d.env()) },
 			MaxSessions: localcobrowse.DefaultMaxSessions,
 			Connect: func(name, path string) (localviewer.SetupConnectResult, error) {

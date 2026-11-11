@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"os"
@@ -14,7 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 )
 
@@ -324,7 +329,7 @@ func TestSetupListsSessionsFromTheRunningOwner(t *testing.T) {
 		t.Fatalf("start: %v", resp["1"])
 	}
 	sess, max, err := localviewer.RequestSummary(context.Background(), ownerDir, nil)
-	if err != nil || len(sess) != 1 || sess[0].Goal != "demo" || max != 0 && max != 2 {
+	if err != nil || len(sess) != 1 || sess[0].Goal != "demo" || max != 2 {
 		t.Fatalf("summary: %v %v %d", sess, err, max)
 	}
 }
@@ -393,5 +398,73 @@ func TestRunLocalSetupStopsWhenTheWindowCloses(t *testing.T) {
 	}
 	if m, _ := filepath.Glob(filepath.Join(f.home, localviewer.SetupDirName, "open-*.html")); len(m) != 0 {
 		t.Fatalf("launch file left behind: %v", m)
+	}
+}
+
+func TestMousetrapDisabledSoExplorerLaunchReachesOurCode(t *testing.T) {
+	if cobra.MousetrapHelpText != "" {
+		t.Fatalf("cobra would exit before runRootCitadel on an Explorer launch: %q", cobra.MousetrapHelpText)
+	}
+}
+
+func TestSetupPollDoesNotProbeOwnerOrAudit(t *testing.T) {
+	owner, audit := 0, 0
+	dd := localDoctorDeps{
+		discover: func() (platform.BrowserInfo, error) { return platform.BrowserInfo{Kind: "chrome", Path: "/x"}, nil },
+		bindTest: func() error { return nil },
+		vault:    func() (bool, error) { return false, nil },
+		owner:    func() error { owner++; return nil },
+		audit:    func() (localaudit.VerifyResult, error) { audit++; return localaudit.VerifyResult{}, nil },
+	}
+	doctor := newCachedSetupDoctor(func(full bool) []localviewer.SetupCheck {
+		checks, _ := collectLocalDoctor(dd)
+		out := make([]localviewer.SetupCheck, len(checks))
+		for i, c := range checks {
+			out[i] = localviewer.SetupCheck(c)
+		}
+		return out
+	})
+	if owner != 1 || audit != 1 {
+		t.Fatalf("setup start should run the doctor once: %d %d", owner, audit)
+	}
+	for i := 0; i < 5; i++ {
+		if len(doctor(false)) == 0 {
+			t.Fatal("poll returned no cached checks")
+		}
+	}
+	if owner != 1 || audit != 1 {
+		t.Fatalf("polling probed the owner lock or audit chain: %d %d", owner, audit)
+	}
+	doctor(true)
+	if owner != 2 || audit != 2 {
+		t.Fatalf("full check should rerun the probes: %d %d", owner, audit)
+	}
+}
+
+func TestRunRootCitadelHasNoDiscoveryCalls(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "local_setup.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{
+		"launchedFromExplorer": true, "bareRunLocalSetupFn": true, "cmd.OutOrStdout": true,
+		"fmt.Fprintf": true, "runBareCitadel": true,
+	}
+	found := false
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "runRootCitadel" {
+			continue
+		}
+		found = true
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			if call, ok := node.(*ast.CallExpr); ok && !allowed[passcodeWiringName(call.Fun)] {
+				t.Fatalf("root dispatcher added behavior: %s", passcodeWiringName(call.Fun))
+			}
+			return true
+		})
+	}
+	if !found {
+		t.Fatal("runRootCitadel missing")
 	}
 }

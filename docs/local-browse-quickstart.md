@@ -67,6 +67,9 @@ computer, behind a one-time link:
 3. It lists your live browser sessions and the session limit (read-only), and
    **Open the viewer** opens the hand-off viewer.
 
+The page also opens for any launch that gives `citadel.exe` a console of its
+own, such as `start citadel` or `Start-Process citadel`, not only a double-click.
+
 Keep the console window open while you use the page; closing it stops the page.
 The steps below do the same things from a terminal.
 
