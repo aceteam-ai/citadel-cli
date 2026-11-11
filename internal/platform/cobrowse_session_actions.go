@@ -224,6 +224,15 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 		return CobrowseSessionStatus{}, fmt.Errorf("click requires a 'selector' or both 'x' and 'y'")
 	}
 
+	// Selector settling awaits page JavaScript, during which a human can take
+	// control. Check the live driver again before sending any mouse event.
+	currentPort, err := s.requireDrivablePort()
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	if currentPort != port {
+		return CobrowseSessionStatus{}, ErrNotStarted
+	}
 	if err := clickAtPoint(port, cx, cy); err != nil {
 		return CobrowseSessionStatus{}, err
 	}
@@ -539,10 +548,14 @@ func jsStringLiteral(s string) string {
 // returnByValue=true and decodes the JSON-serializable result value. Returns
 // an error if the script itself threw (CDP's exceptionDetails).
 func runtimeEvaluate(debugPort int, expr string) (any, error) {
+	return runtimeEvaluateWithPromise(debugPort, expr, false)
+}
+
+func runtimeEvaluateWithPromise(debugPort int, expr string, awaitPromise bool) (any, error) {
 	res, err := cdpCommand(debugPort, "Runtime.evaluate", map[string]any{
 		"expression":    expr,
 		"returnByValue": true,
-		"awaitPromise":  false,
+		"awaitPromise":  awaitPromise,
 	})
 	if err != nil {
 		return nil, err
@@ -557,18 +570,38 @@ func runtimeEvaluate(debugPort int, expr string) (any, error) {
 	return remote["value"], nil
 }
 
-// resolveSelectorCenter finds the first element matching selector, scrolls it
-// into view, and returns the CSS-pixel viewport coordinates of its center. A
-// selector matching nothing is a clear error, not a click at (0,0).
+// resolveSelectorCenter waits for the first matching element to stop moving
+// after scrolling and verifies that the click point still hits that element.
 func resolveSelectorCenter(debugPort int, selector string) (float64, float64, error) {
-	expr := fmt.Sprintf(`(function(){
+	expr := fmt.Sprintf(`(async function(){
 		var el = document.querySelector(%s);
 		if (!el) return null;
 		el.scrollIntoView({block: "center", inline: "center"});
-		var r = el.getBoundingClientRect();
-		return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+		var deadline = Date.now() + 2500;
+		var previous = null;
+		var stable = 0;
+		while (Date.now() < deadline) {
+			if (!el.isConnected) return {error: "element was removed while scrolling"};
+			var r = el.getBoundingClientRect();
+			var x = r.x + r.width / 2;
+			var y = r.y + r.height / 2;
+			var visible = r.width > 0 && r.height > 0 &&
+				x >= 0 && x < window.innerWidth && y >= 0 && y < window.innerHeight;
+			if (visible && previous && Math.abs(x - previous.x) < 0.5 &&
+				Math.abs(y - previous.y) < 0.5) stable++;
+			else stable = 0;
+			if (stable >= 2) {
+				var hit = document.elementFromPoint(x, y);
+				if (!hit || (hit !== el && !el.contains(hit)))
+					return {error: "another element covers the click point"};
+				return {x: x, y: y};
+			}
+			previous = {x: x, y: y};
+			await new Promise(function(resolve) { setTimeout(resolve, 50); });
+		}
+		return {error: "element did not settle in the viewport"};
 	})()`, jsStringLiteral(selector))
-	val, err := runtimeEvaluate(debugPort, expr)
+	val, err := runtimeEvaluateWithPromise(debugPort, expr, true)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -576,8 +609,14 @@ func resolveSelectorCenter(debugPort int, selector string) (float64, float64, er
 	if !ok {
 		return 0, 0, fmt.Errorf("no element matches selector %q", selector)
 	}
-	x, _ := obj["x"].(float64)
-	y, _ := obj["y"].(float64)
+	if reason, ok := obj["error"].(string); ok {
+		return 0, 0, fmt.Errorf("cannot click selector %q: %s", selector, reason)
+	}
+	x, xOK := obj["x"].(float64)
+	y, yOK := obj["y"].(float64)
+	if !xOK || !yOK {
+		return 0, 0, fmt.Errorf("invalid click point for selector %q", selector)
+	}
 	return x, y, nil
 }
 
