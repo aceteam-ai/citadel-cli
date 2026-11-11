@@ -106,6 +106,14 @@ type sessionRecord struct {
 	OwnerPID     int    `json:"owner_pid"`
 	OwnerStart   uint64 `json:"owner_start"`
 	StartedAt    string `json:"started_at,omitempty"`
+	// BrowserScope and XvfbScope name the transient systemd scopes the processes
+	// run in (empty when launched directly, which makes the record un-adoptable
+	// once its owner is gone). ScopeUser says the user manager owns them. OwnerUID
+	// is the OS user that wrote the record.
+	BrowserScope string `json:"browser_scope,omitempty"`
+	XvfbScope    string `json:"xvfb_scope,omitempty"`
+	ScopeUser    bool   `json:"scope_user,omitempty"`
+	OwnerUID     *int   `json:"owner_uid,omitempty"`
 	Handoff      bool   `json:"handoff,omitempty"`
 
 	// State is live, suspended or expired. Generation increases on every
@@ -302,26 +310,31 @@ func (s *cobrowseSession) persistRecord() {
 		return
 	}
 	rec := sessionRecord{
-		Version:    sessionRecordVersion,
-		ID:         s.id,
-		Profile:    s.profile,
-		Persistent: s.persistent,
-		Browser:    proc.browser,
-		Display:    proc.display,
-		DebugPort:  proc.debugPort,
-		BrowserPID: proc.browserPID,
-		XvfbPID:    proc.xvfbPID,
-		OwnerPID:   os.Getpid(),
-		Handoff:    s.explicitHandoff,
-		State:      RecordLive,
-		Generation: s.generation,
-		PendingEnd: s.pendingEnd,
+		Version:      sessionRecordVersion,
+		ID:           s.id,
+		Profile:      s.profile,
+		Persistent:   s.persistent,
+		Browser:      proc.browser,
+		Display:      proc.display,
+		DebugPort:    proc.debugPort,
+		BrowserPID:   proc.browserPID,
+		XvfbPID:      proc.xvfbPID,
+		OwnerPID:     os.Getpid(),
+		BrowserScope: proc.browserScope,
+		XvfbScope:    proc.xvfbScope,
+		ScopeUser:    proc.scopeUser,
+		Handoff:      s.explicitHandoff,
+		State:        RecordLive,
+		Generation:   s.generation,
+		PendingEnd:   s.pendingEnd,
 	}
 	regDir := s.regDir
 	if !s.startedAt.IsZero() {
 		rec.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
 	}
 	s.mu.Unlock()
+	uid := os.Getuid()
+	rec.OwnerUID = &uid
 	rec.OwnerStart = currentOwnerIdentity()
 	rec.BrowserStart, _, _ = procIdentity(rec.BrowserPID)
 	if rec.XvfbPID > 0 {
@@ -345,10 +358,13 @@ func verifyAdoptable(baseDir, dir string, rec sessionRecord) error {
 	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
 		return fmt.Errorf("session dir is not a plain directory")
 	}
-	// Only the exec case: the record's owner is THIS process (same PID and
-	// start time, both unchanged by exec). Anything else is not ours to take.
+	// The exec case: the record's owner is THIS process (same PID and start
+	// time, both unchanged by exec). Otherwise only the managed worker may take
+	// over a record whose owner is gone, and only a detached one.
 	if rec.OwnerPID != os.Getpid() || rec.OwnerStart == 0 || rec.OwnerStart != currentOwnerIdentity() {
-		return fmt.Errorf("record was not written by this process")
+		if err := verifyDetachedOwner(rec); err != nil {
+			return err
+		}
 	}
 	if rec.Persistent {
 		return fmt.Errorf("persistent profile sessions are sealed, not adopted")
@@ -379,6 +395,60 @@ func verifyAdoptable(baseDir, dir string, rec sessionRecord) error {
 	return nil
 }
 
+// verifyDetachedOwner is the narrow extra rule for a record whose owner died
+// (a full service restart). Every check fails closed: the new process is the
+// managed worker, the record is from the same OS user, its owner is really gone,
+// and its browser and Xvfb are alive in the recorded scopes. The caller then
+// still checks start identities, role and the CDP identity as for any record.
+func verifyDetachedOwner(rec sessionRecord) error {
+	if !detachedWorker.Load() {
+		return fmt.Errorf("record was not written by this process and this is not the managed worker")
+	}
+	if rec.BrowserScope == "" {
+		return fmt.Errorf("session was not launched in a detachable scope")
+	}
+	if !validScopeName(rec.ID, "browser", rec.BrowserScope) ||
+		(rec.XvfbPID > 0 && !validScopeName(rec.ID, "xvfb", rec.XvfbScope)) {
+		return fmt.Errorf("record names an unexpected scope")
+	}
+	if !withinDetachGrace(rec) {
+		return fmt.Errorf("owner has been gone longer than the %s detach grace", detachGrace())
+	}
+	if rec.OwnerUID == nil || *rec.OwnerUID != os.Getuid() {
+		return fmt.Errorf("record was written by a different OS user")
+	}
+	if st, alive, err := procIdentity(rec.OwnerPID); err == nil && alive && st == rec.OwnerStart {
+		return fmt.Errorf("record owner is still running")
+	}
+	if !inScope(rec.BrowserPID, rec.BrowserScope) {
+		return fmt.Errorf("browser pid %d is not in its recorded scope", rec.BrowserPID)
+	}
+	if rec.XvfbPID > 0 && !inScope(rec.XvfbPID, rec.XvfbScope) {
+		return fmt.Errorf("Xvfb pid %d is not in its recorded scope", rec.XvfbPID)
+	}
+	return nil
+}
+
+// stopRecordScopes stops the scopes a record names, identity-checked.
+func stopRecordScopes(rec sessionRecord) {
+	if validScopeName(rec.ID, "browser", rec.BrowserScope) {
+		_ = stopScope(rec.ScopeUser, rec.BrowserScope, rec.BrowserPID, rec.BrowserStart)
+	}
+	if validScopeName(rec.ID, "xvfb", rec.XvfbScope) {
+		_ = stopScope(rec.ScopeUser, rec.XvfbScope, rec.XvfbPID, rec.XvfbStart)
+	}
+}
+
+// scopedSurvivor reports whether a dead-owner record is a scoped session still
+// alive in its recorded scope with a matching start time, within the grace.
+func scopedSurvivor(rec sessionRecord) bool {
+	if !validScopeName(rec.ID, "browser", rec.BrowserScope) || !withinDetachGrace(rec) {
+		return false
+	}
+	st, alive, err := procIdentity(rec.BrowserPID)
+	return err == nil && alive && st == rec.BrowserStart && inScope(rec.BrowserPID, rec.BrowserScope)
+}
+
 // adoptedProc builds a cobrowseProc around already-running processes. Its
 // exited channel closes when the browser's identity stops matching.
 func adoptedProc(rec sessionRecord) *cobrowseProc {
@@ -404,7 +474,12 @@ func adoptedProc(rec sessionRecord) *cobrowseProc {
 		browserPID: rec.BrowserPID,
 		xvfbPID:    rec.XvfbPID,
 		exited:     exited,
+
+		browserScope: rec.BrowserScope,
+		xvfbScope:    rec.XvfbScope,
+		scopeUser:    rec.ScopeUser,
 		stop: func() error {
+			stopRecordScopes(rec)
 			var last error
 			for _, t := range []struct {
 				pid   int
@@ -479,6 +554,12 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			}
 		}
 		dir := filepath.Join(m.baseDir, rec.ID)
+		// Not the managed worker: a scoped session that is still alive in its own
+		// scope belongs to the worker that is about to restart. Leave it alone.
+		if !detachedWorker.Load() && scopedSurvivor(rec) {
+			sweepProtected.Store(dir, struct{}{})
+			continue
+		}
 		err := verifyAdoptable(m.baseDir, dir, rec)
 		if errors.Is(err, errCDPCheck) { // a slow endpoint must not expire a healthy session
 			time.Sleep(500 * time.Millisecond)
@@ -486,6 +567,7 @@ func (m *CobrowseSessionManager) recoverSessions() {
 		}
 		if err != nil {
 			log.Printf("[cobrowse] not adopting session %s: %v", rec.ID, err)
+			stopRecordScopes(rec) // identity-checked; the sweep reaps anything left
 			rec.State = RecordExpired
 			rec.EndedReason, rec.EndedDetail = endedReasonLost, ""
 			if rec.PendingEnd != nil {

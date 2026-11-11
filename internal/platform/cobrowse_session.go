@@ -112,6 +112,10 @@ type cobrowseProc struct {
 	browser    string
 	browserPID int
 	xvfbPID    int
+	// browserScope and xvfbScope name the transient systemd scopes the processes
+	// run in (empty when launched directly); scopeUser says which manager owns them.
+	browserScope, xvfbScope string
+	scopeUser               bool
 	// exited is closed by the reaper when the browser process terminates, so status
 	// can report SessionExited for a crashed session rather than a bare running=false.
 	exited <-chan struct{}
@@ -383,6 +387,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	m.mu.Lock()
 	lo := m.launchOpts
 	m.mu.Unlock()
+	lo.Detach = m.useResolver && detachedWorker.Load()
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
 		return nil, err
