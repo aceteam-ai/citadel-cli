@@ -13,9 +13,7 @@ on:
     # based on the previous slice's branch) run the same gates, including the
     # windows-latest job below. Narrow on purpose: other non-main bases still
     # get no PR CI.
-    # fix/cobrowse-adopt-cdp-id: the Linux real-browser job is stacked on that
-    # PR (#1625) until it merges; drop this entry then.
-    branches: [main, 'feat/local-mode-**', 'fix/cobrowse-adopt-cdp-id']
+    branches: [main, 'feat/local-mode-**']
 
 # Cancel superseded runs on the same branch/PR so a force-push or rapid pushes
 # don't leave stale jobs occupying the limited self-hosted ARC runner pool.

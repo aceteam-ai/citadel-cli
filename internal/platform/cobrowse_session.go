@@ -357,7 +357,20 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 	}
 	m.mu.Unlock()
 
-	return s.status(), nil
+	st := s.status()
+	if startURL != "" && !strings.EqualFold(startURL, "about:blank") {
+		// Wait for the launch URL (including redirects) to settle, then report
+		// where the page ended up, as Navigate does. Best effort: a page that
+		// cannot be read leaves the plain status.
+		if port, perr := s.requireDrivablePort(); perr == nil {
+			ps := settleNavigation(port, "")
+			if ps.URL != "" {
+				st.URL = ps.URL
+			}
+			st.Title = ps.Title
+		}
+	}
+	return st, nil
 }
 
 // launch creates the session's profile dir, spawns the browser via the (injectable)

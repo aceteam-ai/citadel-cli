@@ -148,6 +148,7 @@ func verifyCDPBrowserID(port int, browserID string) error {
 	if err != nil {
 		return err
 	}
+<<<<<<< HEAD
 	if got != browserID {
 		return errCDPImpostor
 	}
@@ -161,6 +162,29 @@ func fetchCDPBrowserID(port int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+||||||| 5c9afea7
+=======
+	if got != browserID {
+		return errCDPImpostor
+	}
+	return nil
+}
+
+// fetchCDPBrowserID reads the browser id the loopback endpoint on port reports
+// (bounded client, no redirects).
+func fetchCDPBrowserID(port int) (string, error) {
+	// The id is identity evidence: never follow a redirect to another origin.
+	client := *cdpHTTPClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return "", fmt.Errorf("endpoint answered %s", resp.Status)
+	}
+>>>>>>> origin/main
 	defer resp.Body.Close()
 	var v struct {
 		WS string `json:"webSocketDebuggerUrl"`

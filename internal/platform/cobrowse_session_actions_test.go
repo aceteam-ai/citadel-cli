@@ -1066,3 +1066,47 @@ func TestCobrowseSessionActions_NavigateTitleBoundedAndSanitized(t *testing.T) {
 		t.Fatalf("title = %q", got.Title[:10])
 	}
 }
+
+func startOnFakeCDPWithURL(t *testing.T, state map[string]any, url string) (CobrowseSessionStatus, *fakeCDPServer) {
+	t.Helper()
+	shortSettle(t, 2*time.Second)
+	f := startFakeCDPServer(t)
+	f.mu.Lock()
+	f.evaluateValue = func(string) any { return state }
+	f.mu.Unlock()
+	installFixedPortLauncher(t, f.port)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession(url)
+	if err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	return st, f
+}
+
+func TestCobrowseSessionStart_WithURLReturnsTitle(t *testing.T) {
+	st, _ := startOnFakeCDPWithURL(t, map[string]any{
+		"url": "https://example.com/", "ready": "complete", "title": "Example\nDomain\x00",
+	}, "https://example.com/")
+	if st.URL != "https://example.com/" || st.Title != "ExampleDomain" {
+		t.Fatalf("url/title = %q / %q", st.URL, st.Title)
+	}
+}
+
+func TestCobrowseSessionStart_RedirectReturnsFinalURL(t *testing.T) {
+	st, _ := startOnFakeCDPWithURL(t, map[string]any{
+		"url": "https://example.com/final", "ready": "complete", "title": "Final",
+	}, "https://example.com/start")
+	if st.URL != "https://example.com/final" || st.Title != "Final" {
+		t.Fatalf("url/title = %q / %q, want the redirect target", st.URL, st.Title)
+	}
+}
+
+func TestCobrowseSessionStart_NoURLUnchanged(t *testing.T) {
+	_, st, f := startSessionOnFakeCDP(t)
+	if st.Title != "" {
+		t.Fatalf("title = %q, want empty", st.Title)
+	}
+	if len(f.callsFor("Runtime.evaluate")) != 0 {
+		t.Fatal("start without a URL must not probe the page")
+	}
+}
