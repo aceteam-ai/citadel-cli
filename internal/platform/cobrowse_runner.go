@@ -148,22 +148,6 @@ func verifyCDPBrowserID(port int, browserID string) error {
 	if err != nil {
 		return err
 	}
-<<<<<<< HEAD
-	if got != browserID {
-		return errCDPImpostor
-	}
-	return nil
-}
-
-// fetchCDPBrowserID reads the browser id the loopback endpoint on port reports
-// (bounded client, no redirects).
-func fetchCDPBrowserID(port int) (string, error) {
-	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
-	if err != nil {
-		return "", err
-	}
-||||||| 5c9afea7
-=======
 	if got != browserID {
 		return errCDPImpostor
 	}
@@ -184,7 +168,6 @@ func fetchCDPBrowserID(port int) (string, error) {
 		resp.Body.Close()
 		return "", fmt.Errorf("endpoint answered %s", resp.Status)
 	}
->>>>>>> origin/main
 	defer resp.Body.Close()
 	var v struct {
 		WS string `json:"webSocketDebuggerUrl"`
