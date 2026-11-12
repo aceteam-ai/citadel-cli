@@ -106,6 +106,8 @@ type CobrowseSessionStatus struct {
 // the spawn is injectable in tests without launching a real browser.
 type cobrowseProc struct {
 	debugPort int
+	// browserID is the browser's per-launch CDP id, learned once the endpoint is up.
+	browserID string
 	display   string
 	// browser is the launched browser's kind ("chrome", "edge", "chromium"),
 	// reported in status so a user can see which installed browser was used.
