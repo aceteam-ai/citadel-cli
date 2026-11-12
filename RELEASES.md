@@ -3730,3 +3730,18 @@ Auto-generated log of every release.
   - test(worker): wait for observed deadline before releasing meeting handler (#1624)
 
 
+---
+
+## v2.223.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +210 |
+
+**Changes:**
+
+  - fix(cobrowse): adopt by recorded CDP browser id (#1546) (#1625)
+
+
