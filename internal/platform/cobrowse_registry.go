@@ -420,7 +420,7 @@ func verifyDetachedOwner(rec sessionRecord) error {
 	if st, alive, err := procIdentity(rec.OwnerPID); err == nil && alive && st == rec.OwnerStart {
 		return fmt.Errorf("record owner is still running")
 	}
-	if !inScope(rec.BrowserPID, rec.BrowserScope) {
+	if !browserInOwnScope(rec.ScopeUser, recordUID(rec), rec.BrowserPID, rec.BrowserScope) {
 		return fmt.Errorf("browser pid %d is not in its recorded scope", rec.BrowserPID)
 	}
 	if rec.XvfbPID > 0 && !inScope(rec.XvfbPID, rec.XvfbScope) {
@@ -433,6 +433,7 @@ func verifyDetachedOwner(rec sessionRecord) error {
 func stopRecordScopes(rec sessionRecord) {
 	if validScopeName(rec.ID, "browser", rec.BrowserScope) {
 		_ = stopScope(rec.ScopeUser, rec.BrowserScope, rec.BrowserPID, rec.BrowserStart)
+		stopBrowserAppScope(rec.ScopeUser, recordUID(rec), rec.BrowserPID, rec.BrowserStart)
 	}
 	if validScopeName(rec.ID, "xvfb", rec.XvfbScope) {
 		_ = stopScope(rec.ScopeUser, rec.XvfbScope, rec.XvfbPID, rec.XvfbStart)
@@ -446,7 +447,15 @@ func scopedSurvivor(rec sessionRecord) bool {
 		return false
 	}
 	st, alive, err := procIdentity(rec.BrowserPID)
-	return err == nil && alive && st == rec.BrowserStart && inScope(rec.BrowserPID, rec.BrowserScope)
+	return err == nil && alive && st == rec.BrowserStart && browserInOwnScope(rec.ScopeUser, recordUID(rec), rec.BrowserPID, rec.BrowserScope)
+}
+
+// recordUID is the OS user that owns the record's scopes.
+func recordUID(rec sessionRecord) int {
+	if rec.OwnerUID != nil {
+		return *rec.OwnerUID
+	}
+	return os.Getuid()
 }
 
 // adoptedProc builds a cobrowseProc around already-running processes. Its
