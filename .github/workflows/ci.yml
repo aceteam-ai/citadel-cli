@@ -13,7 +13,9 @@ on:
     # based on the previous slice's branch) run the same gates, including the
     # windows-latest job below. Narrow on purpose: other non-main bases still
     # get no PR CI.
-    branches: [main, 'feat/local-mode-**']
+    # fix/cobrowse-adopt-cdp-id: the Linux real-browser job is stacked on that
+    # PR (#1625) until it merges; drop this entry then.
+    branches: [main, 'feat/local-mode-**', 'fix/cobrowse-adopt-cdp-id']
 
 # Cancel superseded runs on the same branch/PR so a force-push or rapid pushes
 # don't leave stale jobs occupying the limited self-hosted ARC runner pool.
@@ -163,6 +165,45 @@ jobs:
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
           CITADEL_COBROWSE_EXPECT_KIND: edge
         run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+
+  # Linux co-browse real-browser gate (citadel-cli#1546). Issue #1546 took four
+  # fix rounds because unit tests used fakes that real Chrome did not match
+  # (Chrome moves itself into an app scope; a fixed debug port writes no
+  # DevToolsActivePort). This runs the real xvfbRunner, Xvfb plus the Chrome
+  # preinstalled on the GitHub-hosted image, behind CITADEL_REAL_BROWSER_TESTS.
+  # No self-hosted runners, secrets or artifacts. The systemd-scope path needs a
+  # user systemd manager the hosted runner lacks; that test skips with a reason
+  # and cobrowse_scope_test.go keeps the logic covered.
+  linux-cobrowse-real-browser:
+    name: Linux co-browse (real browser)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Chrome version
+        run: google-chrome --version
+
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces, which Chrome's
+      # sandbox needs. Best effort: the knob is absent on older images.
+      - name: Allow Chrome's sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Real browser co-browse lifecycle
+        env:
+          CITADEL_REAL_BROWSER_TESTS: "1"
+        run: go test ./internal/platform/ -count=1 -v -run '^TestCobrowseRealBrowser'
 
   # Cross-compile smoke for every release target. Catches a target that builds
   # locally but breaks on a GOOS/GOARCH the host can't run, so a release tag can
