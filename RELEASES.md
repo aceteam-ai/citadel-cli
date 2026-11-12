@@ -3714,3 +3714,19 @@ Auto-generated log of every release.
   - fix(cobrowse): sessions survive a full service restart on Linux (#1546) (#1621)
 
 
+---
+
+## v2.222.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 4 |
+| Lines added | +181 |
+
+**Changes:**
+
+  - fix(cobrowse): adopt a browser that moved itself into its own app scope (#1546, #1621) (#1623)
+  - test(worker): wait for observed deadline before releasing meeting handler (#1624)
+
+
