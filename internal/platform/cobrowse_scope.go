@@ -207,6 +207,73 @@ func inScope(pid int, unit string) bool {
 	return false
 }
 
+// procLeafCgroup returns the parent path and leaf component of pid's cgroup.
+func procLeafCgroup(pid int) (parent, leaf string, ok bool) {
+	if pid <= 0 {
+		return "", "", false
+	}
+	cg, err := scopeProcCgroup(pid)
+	if err != nil {
+		return "", "", false
+	}
+	for _, line := range strings.Split(cg, "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		p := strings.TrimSpace(parts[2])
+		i := strings.LastIndex(p, "/")
+		if i < 0 || i == len(p)-1 {
+			continue
+		}
+		return p[:i], p[i+1:], true
+	}
+	return "", "", false
+}
+
+// browserAppScope returns the scope a browser moved itself into (Chrome creates
+// app-com.google.Chrome-<pid>.scope, Chromium app-org.chromium.Chromium-<pid>.scope
+// about a second after launch). It is returned only when the name carries
+// exactly this pid and the cgroup sits under the same systemd manager that owns
+// the recorded scopes: the user manager's app.slice for a user scope, the system
+// manager's app.slice otherwise. Anything else yields "".
+func browserAppScope(user bool, uid, pid int) string {
+	parent, leaf, ok := procLeafCgroup(pid)
+	if !ok || !regexp.MustCompile(`^app-[A-Za-z0-9][A-Za-z0-9._-]*-`+strconv.Itoa(pid)+`\.scope$`).MatchString(leaf) {
+		return ""
+	}
+	want := "/app.slice"
+	if user {
+		want = fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service/app.slice", uid, uid)
+	}
+	if parent != want {
+		return ""
+	}
+	return leaf
+}
+
+// browserInOwnScope reports whether the browser pid lives in its recorded
+// citadel scope or in an app scope it created for itself under the same manager.
+func browserInOwnScope(user bool, uid, pid int, recorded string) bool {
+	return inScope(pid, recorded) || browserAppScope(user, uid, pid) != ""
+}
+
+// stopBrowserAppScope stops the browser's self-created app scope, only while
+// the recorded process identity still matches and the name passes the checks.
+func stopBrowserAppScope(user bool, uid, pid int, start uint64) {
+	if pid <= 0 || start == 0 {
+		return
+	}
+	unit := browserAppScope(user, uid, pid)
+	if unit == "" {
+		return
+	}
+	if st, alive, err := procIdentity(pid); err != nil || !alive || st != start {
+		return
+	}
+	_ = scopeStopper(user, unit)
+}
+
 // stopScope stops a transient scope, but only while the process it was created
 // for is still the recorded one (matching start time) and still lives in that
 // scope. Anything else is left alone: a scope name is never trusted by itself.

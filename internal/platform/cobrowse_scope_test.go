@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -446,5 +447,96 @@ func TestShutdownDetachesScopedKeepsRecord(t *testing.T) {
 	_ = m2.ShutdownSessions()
 	if _, err := loadRecord(m2.registryDir(), st2.ID); err == nil {
 		t.Fatal("interactive shutdown must stop sessions and drop their records")
+	}
+}
+
+func appSlicePath(uid int) string {
+	return fmt.Sprintf("0::/user.slice/user-%d.slice/user@%d.service/app.slice/", uid, uid)
+}
+
+func TestBrowserMovedToOwnAppScopeIsAdopted(t *testing.T) {
+	env := newScopeEnv(t)
+	base := trustedBaseDir(t)
+	id := startScoped(t, base)
+	m := adoptMgr(base)
+	orphanRecord(t, m, id, nil)
+	env.cgroups[100001] = appSlicePath(os.Getuid()) + "app-com.google.Chrome-100001.scope\n"
+
+	if st, ok := m.SessionStatus(id); !ok || st.State != SessionRunning {
+		t.Fatalf("not adopted: %+v %v", st, ok)
+	}
+	if len(env.stopped()) != 0 {
+		t.Fatalf("adoption stopped %v", env.stopped())
+	}
+	// Stop validates the app scope name and stops it as well.
+	if err := m.Stop(id); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{browserUnitFor(id), "app-com.google.Chrome-100001.scope", xvfbUnitFor(id)}
+	got := env.stopped()
+	found := false
+	for _, u := range got {
+		found = found || u == want[1]
+	}
+	if !found {
+		t.Fatalf("app scope not stopped: %v", got)
+	}
+}
+
+func TestBrowserAppScopeRefusals(t *testing.T) {
+	uid := os.Getuid()
+	cases := map[string]string{
+		"other pid":      appSlicePath(uid) + "app-com.google.Chrome-100002.scope\n",
+		"pid suffix":     appSlicePath(uid) + "app-com.google.Chrome-1100001.scope\n",
+		"other slice":    fmt.Sprintf("0::/user.slice/user-%d.slice/user@%d.service/session.slice/app-com.google.Chrome-100001.scope\n", uid, uid),
+		"other user":     appSlicePath(uid+1) + "app-com.google.Chrome-100001.scope\n",
+		"system manager": "0::/app.slice/app-com.google.Chrome-100001.scope\n",
+		"not app prefix": appSlicePath(uid) + "evil-com.google.Chrome-100001.scope\n",
+		"flag-like name": appSlicePath(uid) + "app---user-100001.scope\n",
+	}
+	for name, cg := range cases {
+		t.Run(name, func(t *testing.T) {
+			env := newScopeEnv(t)
+			base := trustedBaseDir(t)
+			id := startScoped(t, base)
+			m := adoptMgr(base)
+			orphanRecord(t, m, id, nil)
+			env.cgroups[100001] = cg
+			if _, ok := m.SessionStatus(id); ok {
+				t.Fatal("adopted")
+			}
+			for _, u := range env.stopped() {
+				if strings.HasPrefix(u, "app-") {
+					t.Fatalf("unvalidated app scope reached systemctl: %v", u)
+				}
+			}
+		})
+	}
+}
+
+func TestXvfbOutsideScopeRefusedWithAppScopeBrowser(t *testing.T) {
+	env := newScopeEnv(t)
+	base := trustedBaseDir(t)
+	id := startScoped(t, base)
+	m := adoptMgr(base)
+	orphanRecord(t, m, id, nil)
+	env.cgroups[100001] = appSlicePath(os.Getuid()) + "app-com.google.Chrome-100001.scope\n"
+	env.cgroups[200001] = appSlicePath(os.Getuid()) + "app-com.google.Chrome-200001.scope\n"
+	if _, ok := m.SessionStatus(id); ok {
+		t.Fatal("Xvfb in an app scope must be refused")
+	}
+}
+
+func TestNonWorkerKeepsBrowserInAppScope(t *testing.T) {
+	env := newScopeEnv(t)
+	base := trustedBaseDir(t)
+	id := startScoped(t, base)
+	m := adoptMgr(base)
+	orphanRecord(t, m, id, nil)
+	env.cgroups[100001] = appSlicePath(os.Getuid()) + "app-com.google.Chrome-100001.scope\n"
+	detachedWorker.Store(false)
+	rec, _ := loadRecord(m.registryDir(), id)
+	if !scopedSurvivor(rec) {
+		t.Fatal("non-worker must treat an app-scope browser as a scoped survivor")
 	}
 }
