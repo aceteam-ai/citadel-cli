@@ -78,3 +78,43 @@ func TestOldRecordVersionRefused(t *testing.T) {
 		t.Fatal("version 1 record must fail closed")
 	}
 }
+
+func TestFetchCDPBrowserIDRefusesRedirect(t *testing.T) {
+	target := fakeVersionServer(t, "guid-r")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fmt.Sprintf("http://127.0.0.1:%d/json/version", target), http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	if id, err := fetchCDPBrowserID(port); err == nil {
+		t.Fatalf("redirect must not yield an id, got %q", id)
+	}
+	if err := defaultAdoptCDPCheck(port, t.TempDir(), "guid-r"); err == nil {
+		t.Fatal("redirecting endpoint must be refused")
+	}
+}
+
+func TestPersistRecordWritesBrowserID(t *testing.T) {
+	newAdoptEnv(t)
+	port := fakeVersionServer(t, "guid-p")
+	prev := launchCobrowseProc
+	launchCobrowseProc = func(profileDir, startURL string, _ LaunchOptions) (*cobrowseProc, error) {
+		return &cobrowseProc{
+			debugPort: port, display: ":51", browserPID: 100001, xvfbPID: 200001,
+			exited: make(chan struct{}), stop: func() error { return nil },
+		}, nil
+	}
+	t.Cleanup(func() { launchCobrowseProc = prev })
+	m := adoptMgr(trustedBaseDir(t))
+	st, err := m.StartSession("https://a.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := loadRecord(m.registryDir(), st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.BrowserID != "guid-p" || rec.Version != sessionRecordVersion {
+		t.Fatalf("record = %+v", rec)
+	}
+}
