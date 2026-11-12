@@ -656,3 +656,22 @@ func TestNavigateTitleBounded(t *testing.T) {
 		t.Fatalf("title length %d, want %d", n, platform.MaxCobrowseTitleRunes)
 	}
 }
+
+func TestStartWithURLReportsSettledTitle(t *testing.T) {
+	svc, fb, _ := newTestService(t, nil)
+	fb.pageTitle = "Example\x00 Domain\n"
+	res, err := svc.Start(ctx, "http://one.test/", "g", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Title != "Example Domain" {
+		t.Fatalf("title = %q", res.Title)
+	}
+	blank, err := svc.Start(ctx, "", "g", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blank.Title != "" {
+		t.Fatalf("blank start title = %q, want empty", blank.Title)
+	}
+}
