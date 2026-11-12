@@ -166,6 +166,7 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 		return fail(err)
 	}
 	proc.debugPort = port
+	proc.browserID = browserID
 	if err := verifyCDPBrowserID(port, browserID); err != nil {
 		return fail(err)
 	}

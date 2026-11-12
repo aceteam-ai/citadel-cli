@@ -37,7 +37,7 @@ import (
 	"time"
 )
 
-const sessionRecordVersion = 1
+const sessionRecordVersion = 2
 
 // Registry record states. suspended is reserved for the suspend/resume feature:
 // nothing produces it yet, but the sweep must never delete such a record.
@@ -92,13 +92,16 @@ var sessionIDPattern = regexp.MustCompile(`^cb-[0-9a-f]+$`)
 // sessionRecord is what a later process needs to re-adopt a session. It holds
 // no credentials: the profile is referenced by path only.
 type sessionRecord struct {
-	Version      int    `json:"version"`
-	ID           string `json:"id"`
-	Profile      string `json:"profile"`
-	Persistent   bool   `json:"persistent,omitempty"`
-	Browser      string `json:"browser,omitempty"`
-	Display      string `json:"display,omitempty"`
-	DebugPort    int    `json:"debug_port"`
+	Version    int    `json:"version"`
+	ID         string `json:"id"`
+	Profile    string `json:"profile"`
+	Persistent bool   `json:"persistent,omitempty"`
+	Browser    string `json:"browser,omitempty"`
+	Display    string `json:"display,omitempty"`
+	DebugPort  int    `json:"debug_port"`
+	// BrowserID is the per-launch random id in the browser's CDP websocket URL
+	// (/devtools/browser/<id>). Adoption requires the recorded port to report it.
+	BrowserID    string `json:"browser_id,omitempty"`
 	BrowserPID   int    `json:"browser_pid"`
 	BrowserStart uint64 `json:"browser_start"`
 	XvfbPID      int    `json:"xvfb_pid,omitempty"`
@@ -178,22 +181,38 @@ func currentOwnerIdentity() uint64 {
 }
 
 // adoptCDPCheck confirms the browser behind a recorded port is the one whose
-// id its own profile dir names. Package var for tests.
+// per-launch id was recorded. A fixed debug port writes no DevToolsActivePort,
+// so the recorded id (not the profile dir) is the primary evidence; if that
+// file does exist it must agree. Package var for tests.
 var adoptCDPCheck = defaultAdoptCDPCheck
 
-func defaultAdoptCDPCheck(port int, profileDir string) error {
-	data, err := os.ReadFile(filepath.Join(profileDir, devToolsActivePortFile))
-	if err != nil {
+func defaultAdoptCDPCheck(port int, profileDir, browserID string) error {
+	if browserID == "" {
+		return errors.New("no browser id recorded")
+	}
+	if data, err := os.ReadFile(filepath.Join(profileDir, devToolsActivePortFile)); err == nil {
+		p, id, perr := parseDevToolsActivePort(data)
+		if perr != nil {
+			return perr
+		}
+		if p != port || id != browserID {
+			return errors.New("recorded browser does not match the profile's DevToolsActivePort")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	p, id, err := parseDevToolsActivePort(data)
-	if err != nil {
-		return err
+	return verifyCDPBrowserID(port, browserID)
+}
+
+// resolveBrowserID learns the launched browser's CDP id: from DevToolsActivePort
+// when the browser wrote one (port 0), otherwise from the endpoint itself.
+func resolveBrowserID(port int, profileDir string) (string, error) {
+	if data, err := os.ReadFile(filepath.Join(profileDir, devToolsActivePortFile)); err == nil {
+		if p, id, perr := parseDevToolsActivePort(data); perr == nil && p == port {
+			return id, nil
+		}
 	}
-	if p != port {
-		return fmt.Errorf("recorded debug port %d does not match the profile's %d", port, p)
-	}
-	return verifyCDPBrowserID(port, id)
+	return fetchCDPBrowserID(port)
 }
 
 func recordFile(regDir, id string) string { return filepath.Join(regDir, id+".json") }
@@ -309,8 +328,24 @@ func (s *cobrowseSession) persistRecord() {
 		s.mu.Unlock()
 		return
 	}
+	browserID, port, profile := proc.browserID, proc.debugPort, s.profile
+	s.mu.Unlock()
+	if browserID == "" && port > 0 {
+		if id, err := resolveBrowserID(port, profile); err == nil {
+			browserID = id
+		} else {
+			log.Printf("[cobrowse] could not read browser id for session %s: %v", s.id, err)
+		}
+	}
+	s.mu.Lock()
+	if s.proc != proc {
+		s.mu.Unlock()
+		return
+	}
+	proc.browserID = browserID
 	rec := sessionRecord{
 		Version:      sessionRecordVersion,
+		BrowserID:    browserID,
 		ID:           s.id,
 		Profile:      s.profile,
 		Persistent:   s.persistent,
@@ -389,7 +424,7 @@ func verifyAdoptable(baseDir, dir string, rec sessionRecord) error {
 	if rec.DebugPort <= 0 || rec.DebugPort > 65535 {
 		return fmt.Errorf("bad debug port")
 	}
-	if err := adoptCDPCheck(rec.DebugPort, dir); err != nil {
+	if err := adoptCDPCheck(rec.DebugPort, dir, rec.BrowserID); err != nil {
 		return fmt.Errorf("%w: %v", errCDPCheck, err)
 	}
 	return nil
@@ -478,6 +513,7 @@ func adoptedProc(rec sessionRecord) *cobrowseProc {
 	}()
 	return &cobrowseProc{
 		debugPort:  rec.DebugPort,
+		browserID:  rec.BrowserID,
 		display:    rec.Display,
 		browser:    rec.Browser,
 		browserPID: rec.BrowserPID,

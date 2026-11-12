@@ -141,21 +141,39 @@ func waitForDevToolsActivePort(profileDir string, timeout time.Duration, exited 
 // verifyCDPBrowserID checks the endpoint on port is the browser whose id was
 // read from its own profile dir.
 func verifyCDPBrowserID(port int, browserID string) error {
-	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if browserID == "" {
+		return errCDPImpostor
+	}
+	got, err := fetchCDPBrowserID(port)
 	if err != nil {
 		return err
+	}
+	if got != browserID {
+		return errCDPImpostor
+	}
+	return nil
+}
+
+// fetchCDPBrowserID reads the browser id the loopback endpoint on port reports
+// (bounded client, no redirects).
+func fetchCDPBrowserID(port int) (string, error) {
+	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return "", err
 	}
 	defer resp.Body.Close()
 	var v struct {
 		WS string `json:"webSocketDebuggerUrl"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v); err != nil {
-		return err
+		return "", err
 	}
-	if !strings.HasSuffix(v.WS, "/devtools/browser/"+browserID) {
-		return errCDPImpostor
+	const marker = "/devtools/browser/"
+	i := strings.LastIndex(v.WS, marker)
+	if i < 0 || i+len(marker) == len(v.WS) {
+		return "", errors.New("endpoint reports no browser id")
 	}
-	return nil
+	return v.WS[i+len(marker):], nil
 }
 
 // activeBrowserRunner is the runner for this OS. A package var so tests can

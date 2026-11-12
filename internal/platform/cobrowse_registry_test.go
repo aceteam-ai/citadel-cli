@@ -46,7 +46,7 @@ func newAdoptEnv(t *testing.T) *adoptEnv {
 		}
 		return "/usr/bin/chromium\x00--x", nil
 	}
-	adoptCDPCheck = func(int, string) error { return e.cdpErr }
+	adoptCDPCheck = func(int, string, string) error { return e.cdpErr }
 	pidKiller = func(pid int) error {
 		e.mu.Lock()
 		e.killed = append(e.killed, pid)
@@ -258,7 +258,7 @@ func TestExpiredRetentionAndCap(t *testing.T) {
 	m := adoptMgr(base)
 	reg := m.registryDir()
 	mk := func(i int, age time.Duration) {
-		rec := sessionRecord{Version: 1, ID: fmt.Sprintf("cb-%04x", i), State: RecordExpired,
+		rec := sessionRecord{Version: sessionRecordVersion, ID: fmt.Sprintf("cb-%04x", i), State: RecordExpired,
 			EndedReason: "node_update", EndedAt: time.Now().Add(-age).UTC().Format(time.RFC3339)}
 		if err := saveRecord(reg, rec); err != nil {
 			t.Fatal(err)
