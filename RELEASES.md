@@ -3745,3 +3745,19 @@ Auto-generated log of every release.
   - fix(cobrowse): adopt by recorded CDP browser id (#1546) (#1625)
 
 
+---
+
+## v2.224.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 6 |
+| Lines added | +386 |
+
+**Changes:**
+
+  - ci: Linux co-browse real-browser job (#1626)
+  - fix(cobrowse): start with a launch URL reports the settled URL and title (#1613) (#1627)
+
+
