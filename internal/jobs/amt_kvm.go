@@ -392,6 +392,8 @@ func newAMTRFB(conn net.Conn) (*amtRFB, error) {
 	return &amtRFB{conn: conn, width: w, height: h}, nil
 }
 
+// Each key write gets its own bounded I/O window. The initial redirection
+// handshake deadline must not cut off a valid paced 4096-byte input at 30s.
 func (r *amtRFB) key(ctx context.Context, sym uint32, down bool) error {
 	if err := ctx.Err(); err != nil {
 		if r.mutationStarted {
@@ -399,16 +401,20 @@ func (r *amtRFB) key(ctx context.Context, sym uint32, down bool) error {
 		}
 		return err
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	if limit, ok := ctx.Deadline(); ok && limit.Before(deadline) {
-		deadline = limit
+	deadline := time.Now().Add(30 * time.Second)
+	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
 	}
 	if err := r.conn.SetWriteDeadline(deadline); err != nil {
 		if r.mutationStarted {
 			return ErrAMTOutcomeUnknown
 		}
-		return err
+		return errors.New("AMT redirection write deadline unavailable")
 	}
+	// Cancellation must also interrupt a blocked write, not only pacing.
+	stop := context.AfterFunc(ctx, func() { _ = r.conn.Close() })
+	defer stop()
+
 	packet := make([]byte, 8)
 	packet[0] = 4
 	if down {
@@ -426,20 +432,6 @@ func (r *amtRFB) key(ctx context.Context, sym uint32, down bool) error {
 		return errors.New("AMT redirection write failed")
 	}
 	return nil
-}
-
-func (r *amtRFB) pause(ctx context.Context, duration time.Duration) error {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		if r.mutationStarted {
-			return ErrAMTOutcomeUnknown
-		}
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 var amtKeysyms = map[string]uint32{
@@ -485,7 +477,10 @@ func (r *amtRFB) keys(ctx context.Context, combo string) (int, error) {
 			return 0, err
 		}
 	}
-	if err := r.pause(ctx, 50*time.Millisecond); err != nil {
+	if err := amtInputPause(ctx, 50*time.Millisecond); err != nil {
+		if r.mutationStarted {
+			return 0, ErrAMTOutcomeUnknown
+		}
 		return 0, err
 	}
 	for i := len(syms) - 1; i >= 0; i-- {
@@ -519,11 +514,25 @@ func (r *amtRFB) typeText(ctx context.Context, value string) error {
 		if err := r.key(ctx, sym, false); err != nil {
 			return err
 		}
-		if err := r.pause(ctx, 30*time.Millisecond); err != nil {
+		if err := amtInputPause(ctx, 30*time.Millisecond); err != nil {
+			if r.mutationStarted {
+				return ErrAMTOutcomeUnknown
+			}
 			return err
 		}
 	}
 	return nil
+}
+
+func amtInputPause(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
 
 func (r *amtRFB) screenshot() ([]byte, error) {

@@ -262,7 +262,7 @@ func soapBody(raw []byte) (string, error) {
 	return string(raw[start:end]), nil
 }
 
-func (a *amtWSMan) bootToSetup(ctx context.Context) (err error) {
+func (a *amtWSMan) bootToSetup(ctx context.Context) (resultErr error) {
 	uri := amtNS + "AMT_BootSettingData"
 	raw, err := a.get(ctx, uri)
 	if err != nil {
@@ -285,28 +285,27 @@ func (a *amtWSMan) bootToSetup(ctx context.Context) (err error) {
 		}
 		return strings.TrimSuffix(root, ">") + ` xmlns:` + prefix + `="` + html.EscapeString(uri) + `">`
 	})
-	originalInstance := instance
+	original := instance
 	instance = biosSetupField.ReplaceAllStringFunc(instance, func(field string) string {
 		parts := biosSetupField.FindStringSubmatch(field)
 		return "<" + parts[1] + "BIOSSetup>true</" + parts[3] + "BIOSSetup>"
 	})
-	putSucceeded := false
+	// Even an uncertain Put can have armed BIOSSetup. On any later failure,
+	// attempt to restore the exact original settings under a fresh bounded
+	// cleanup context, including when the job's deadline has already expired.
 	defer func() {
-		if err == nil || (!putSucceeded && !errors.Is(err, ErrAMTOutcomeUnknown)) {
+		if resultErr == nil {
 			return
 		}
-		// Restore with a fresh bounded context even if the caller's deadline
-		// expired after arming BIOS setup.
-		restoreCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		if _, restoreErr := a.soap(restoreCtx, transferNS+"Put", uri, originalInstance, ""); restoreErr != nil {
-			err = fmt.Errorf("%w; AMT BIOS setup restore failed; verify target", ErrAMTOutcomeUnknown)
+		if _, restoreErr := a.soap(cleanupCtx, transferNS+"Put", uri, original, ""); restoreErr != nil {
+			resultErr = errors.Join(resultErr, errors.New("AMT boot settings restoration unconfirmed"))
 		}
 	}()
 	if _, err = a.soap(ctx, transferNS+"Put", uri, instance, ""); err != nil {
 		return err
 	}
-	putSucceeded = true
 
 	configURI := cimNS + "CIM_BootConfigSetting"
 	configSelector := `<w:SelectorSet><w:Selector Name="InstanceID">Intel(r) AMT: Boot Configuration 0</w:Selector></w:SelectorSet>`
