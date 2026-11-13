@@ -3761,3 +3761,18 @@ Auto-generated log of every release.
   - fix(cobrowse): start with a launch URL reports the settled URL and title (#1613) (#1627)
 
 
+---
+
+## v2.225.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +1323 |
+
+**Changes:**
+
+  - feat(hpc): approve-on-arrival enrollment (--org) (#1616)
+
+
