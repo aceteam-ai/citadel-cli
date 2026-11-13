@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -309,7 +310,7 @@ func TestHTTPProxyDefaultLocalPorts(t *testing.T) {
 // end-to-end tests cannot observe this; pin the client configuration directly.
 func TestGuardedHTTPClientConfiguration(t *testing.T) {
 	stubInterfaceAddrs(t, []net.Addr{&net.IPAddr{IP: net.ParseIP("192.168.1.10")}}, nil)
-	c, err := newGuardedHTTPClient(map[int]bool{8000: true})
+	c, err := newGuardedHTTPClient(map[int]bool{8000: true}, 45*time.Second)
 	if err != nil {
 		t.Fatalf("client construction with known own addresses: %v", err)
 	}
@@ -325,5 +326,63 @@ func TestGuardedHTTPClientConfiguration(t *testing.T) {
 	}
 	if c.CheckRedirect == nil || c.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
 		t.Fatal("redirects must not be followed")
+	}
+	if c.Timeout != 45*time.Second || tr.ResponseHeaderTimeout != 45*time.Second {
+		t.Fatalf("client timeout %s and response-header timeout %s must both follow the job budget (45s)", c.Timeout, tr.ResponseHeaderTimeout)
+	}
+}
+
+// The job's timeout_ms (the node's per-job budget key) sets the request
+// timeout, clamped to httpProxyMaxTimeout; anything absent or unusable keeps
+// the 30 s default. The legacy adapter stringifies JSON numbers with
+// fmt.Sprint, so large values arrive in exponent form.
+func TestHTTPProxyTimeoutFromPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload map[string]string
+		want    time.Duration
+	}{
+		{"absent", map[string]string{}, 30 * time.Second},
+		{"nil payload", nil, 30 * time.Second},
+		{"empty", map[string]string{"timeout_ms": ""}, 30 * time.Second},
+		{"60s", map[string]string{"timeout_ms": "60000"}, 60 * time.Second},
+		{"fractional", map[string]string{"timeout_ms": "45500.0"}, 45500 * time.Millisecond},
+		{"below default", map[string]string{"timeout_ms": "5000"}, 5 * time.Second},
+		{"600s clamped", map[string]string{"timeout_ms": "600000"}, 120 * time.Second},
+		{"exponent clamped", map[string]string{"timeout_ms": "1e+06"}, 120 * time.Second},
+		{"garbage", map[string]string{"timeout_ms": "soon"}, 30 * time.Second},
+		{"zero", map[string]string{"timeout_ms": "0"}, 30 * time.Second},
+		{"negative", map[string]string{"timeout_ms": "-5000"}, 30 * time.Second},
+		{"NaN", map[string]string{"timeout_ms": "NaN"}, 30 * time.Second},
+		{"Inf", map[string]string{"timeout_ms": "+Inf"}, 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := httpProxyTimeout(&nexus.Job{Payload: tc.payload}); got != tc.want {
+				t.Fatalf("httpProxyTimeout = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// A local endpoint slower than the old fixed 30 s cap answers within the job's
+// budget instead of being cut off. Shrunk to milliseconds: the endpoint takes
+// longer than a 50 ms budget would allow, and is still served under 2 s.
+func TestHTTPProxyHonorsJobBudget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte("partial result"))
+	}))
+	t.Cleanup(srv.Close)
+	port, _ := strconv.Atoi(srv.URL[strings.LastIndex(srv.URL, ":")+1:])
+	h := &HTTPProxyHandler{localPorts: map[int]bool{port: true}}
+	run := func(timeoutMs string) error {
+		_, err := h.Execute(JobContext{}, &nexus.Job{ID: "j", Payload: map[string]string{"url": srv.URL, "timeout_ms": timeoutMs}})
+		return err
+	}
+	if err := run("50"); err == nil {
+		t.Fatal("a 50 ms budget must cut off a 300 ms endpoint")
+	}
+	if err := run("2000"); err != nil {
+		t.Fatalf("a 2 s budget must let a 300 ms endpoint answer: %v", err)
 	}
 }

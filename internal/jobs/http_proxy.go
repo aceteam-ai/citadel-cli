@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -29,6 +30,34 @@ import (
 // mesh, which this exception does not affect; it only matters if a bridge is
 // co-located on the node host.
 var defaultHTTPProxyLocalPorts = map[int]bool{8000: true}
+
+// HTTP_PROXY waits httpProxyDefaultTimeout for a response unless the job
+// carries its own budget in timeout_ms (the node's per-job budget key, which
+// also sets the runner's watchdog). A requested budget is clamped to
+// httpProxyMaxTimeout so one job cannot hold a worker slot indefinitely.
+const (
+	httpProxyDefaultTimeout = 30 * time.Second
+	httpProxyMaxTimeout     = 120 * time.Second
+)
+
+// httpProxyTimeout returns the job's requested budget, clamped to
+// httpProxyMaxTimeout, or httpProxyDefaultTimeout when timeout_ms is absent,
+// unparseable, non-finite or not positive. Parsed as a float because the
+// legacy adapter stringifies JSON numbers with fmt.Sprint ("1e+06").
+func httpProxyTimeout(job *nexus.Job) time.Duration {
+	raw := strings.TrimSpace(job.Payload["timeout_ms"])
+	if raw == "" {
+		return httpProxyDefaultTimeout
+	}
+	ms, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(ms) || math.IsInf(ms, 0) || ms <= 0 {
+		return httpProxyDefaultTimeout
+	}
+	if ms >= float64(httpProxyMaxTimeout/time.Millisecond) {
+		return httpProxyMaxTimeout
+	}
+	return time.Duration(ms * float64(time.Millisecond))
+}
 
 // errHTTPProxyDestinationBlocked marks a refused destination.
 var errHTTPProxyDestinationBlocked = errors.New("destination not allowed")
@@ -99,7 +128,8 @@ func guardedDialControl(localPorts map[int]bool, own ownAddrSet) func(network, a
 // dial is the only path out. The node's own interface addresses are
 // snapshotted once per client (one client per job); if they cannot be
 // determined, no client is built and the job is refused (fail closed).
-func newGuardedHTTPClient(localPorts map[int]bool) (*http.Client, error) {
+// timeout bounds the whole request and the wait for response headers.
+func newGuardedHTTPClient(localPorts map[int]bool, timeout time.Duration) (*http.Client, error) {
 	own, err := ownInterfaceAddrs()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errHTTPProxyDestinationBlocked, err)
@@ -110,12 +140,12 @@ func newGuardedHTTPClient(localPorts map[int]bool) (*http.Client, error) {
 		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: timeout,
 		MaxIdleConns:          4,
 		IdleConnTimeout:       30 * time.Second,
 	}
 	return &http.Client{
-		Timeout:   30 * time.Second,
+		Timeout:   timeout,
 		Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -200,7 +230,7 @@ func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	client, err := newGuardedHTTPClient(h.allowedLocalPorts())
+	client, err := newGuardedHTTPClient(h.allowedLocalPorts(), httpProxyTimeout(job))
 	if err != nil {
 		return nil, fmt.Errorf("request refused: %w", err)
 	}
