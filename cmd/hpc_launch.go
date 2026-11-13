@@ -352,8 +352,10 @@ var hpcSetupCmd = &cobra.Command{
 	Use:   "setup",
 	Short: "Build or check the pinned vLLM virtualenv used by hpc jobs",
 	Long: `Builds a virtualenv with the requested vLLM version, or checks one. The pin is
-partial: it fixes the vLLM release only, and its dependencies (torch and the
-rest) resolve to whatever is current when the venv is built. Rebuild rather
+partial: it fixes the vLLM release plus transformers<5 for vLLM 0.11 and
+older, and the other dependencies (torch and the rest) resolve to whatever is
+current when the venv is built. Running setup on an existing venv with the
+right vLLM installs that transformers pin if it is missing. Rebuild rather
 than reuse a venv across sites. uv never downloads an interpreter, and package
 caches are kept beside the venv.`,
 	Args: cobra.NoArgs,
@@ -361,6 +363,7 @@ caches are kept beside the venv.`,
 		setup := hpc.VenvSetup{
 			Dir: hpcSetupVenv, VLLMVersion: hpcSetupVersion, Python: hpcSetupPython, CheckOnly: hpcSetupCheck,
 			LookPath: exec.LookPath,
+			Notify:   func(msg string) { fmt.Println("   - " + msg) },
 		}
 		env := setup.Env()
 		setup.Exec = func(ctx context.Context, argv []string) ([]byte, error) {

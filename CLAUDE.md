@@ -1859,7 +1859,9 @@ with `hpc.CheckListenerOwner` refuses a port held by another uid before any
 probe. `Supervisor.Run` keeps the first signal's deadline and exits non-zero
 for a worker error or kill. `status.filterVisibleGPUsWithUUIDs` maps UUID and
 MIG entries through `nvidia-smi -L`; `hpc.TensorParallelFor` falls back to
-`SLURM_GPUS_ON_NODE`. The venv pin is partial (vLLM only). Signals forward to the
+`SLURM_GPUS_ON_NODE`. `hpc.companionPins` owns the extra pins installed with vLLM
+(transformers<5 through 0.11.x); `--check` refuses a venv without them. The
+version probe parses one sentinel line, since warnings share the output. Signals forward to the
 worker; the engine group is stopped on every exit path. Only `--runtime venv`
 runs; `hpc.ParseRuntime` refuses the reserved ones.
 

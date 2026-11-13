@@ -12,12 +12,15 @@ import (
 	"testing"
 )
 
-// fakeVenvExec records argv and simulates the venv on disk.
+// fakeVenvExec records argv and simulates the venv on disk. An unbounded
+// resolve installs transformers 5, as PyPI does today.
 type fakeVenvExec struct {
-	dir       string
-	installed string
-	calls     [][]string
-	failOn    string
+	dir          string
+	installed    string
+	transformers string
+	calls        [][]string
+	failOn       string
+	noise        string
 }
 
 func (f *fakeVenvExec) run(_ context.Context, argv []string) ([]byte, error) {
@@ -31,13 +34,21 @@ func (f *fakeVenvExec) run(_ context.Context, argv []string) ([]byte, error) {
 		if f.installed == "" {
 			return []byte("ModuleNotFoundError"), errors.New("exit status 1")
 		}
-		return []byte(f.installed + "\n"), nil
+		return []byte(f.noise + "citadel-probe " + f.installed + " " + f.transformers + "\n"), nil
 	case strings.HasSuffix(joined, " "+f.dir) && (strings.Contains(joined, " venv")):
 		_ = os.MkdirAll(filepath.Join(f.dir, "bin"), 0o755)
 		_ = os.WriteFile(filepath.Join(f.dir, "bin", "python"), nil, 0o755)
 		_ = os.WriteFile(filepath.Join(f.dir, "pyvenv.cfg"), nil, 0o644)
-	case strings.Contains(joined, "vllm=="):
-		f.installed = strings.TrimPrefix(argv[len(argv)-1], "vllm==")
+	case strings.Contains(joined, " install "):
+		f.transformers = "5.23.0"
+		for _, a := range argv {
+			if strings.HasPrefix(a, "vllm==") {
+				f.installed = strings.TrimPrefix(a, "vllm==")
+			}
+			if a == "transformers<5" {
+				f.transformers = "4.57.6"
+			}
+		}
 	}
 	return nil, nil
 }
@@ -55,8 +66,8 @@ func TestVenvSetupPipPath(t *testing.T) {
 	want := [][]string{
 		{"python3.12", "-m", "venv", dir},
 		{py, "-m", "pip", "install", "--upgrade", "pip"},
-		{py, "-m", "pip", "install", "vllm==0.11.0"},
-		{py, "-c", "import vllm; print(vllm.__version__)"},
+		{py, "-m", "pip", "install", "vllm==0.11.0", "transformers<5"},
+		{py, "-c", "import vllm, transformers; print('citadel-probe', vllm.__version__, transformers.__version__)"},
 	}
 	if !reflect.DeepEqual(f.calls, want) {
 		t.Fatalf("argv = %v\nwant %v", f.calls, want)
@@ -73,7 +84,7 @@ func TestVenvSetupUVPath(t *testing.T) {
 	py := filepath.Join(dir, "bin", "python")
 	if !reflect.DeepEqual(f.calls[:2], [][]string{
 		{"/usr/bin/uv", "venv", "--allow-existing", "--python", "python3", dir},
-		{"/usr/bin/uv", "pip", "install", "--python", py, "vllm==0.11.0"},
+		{"/usr/bin/uv", "pip", "install", "--python", py, "vllm==0.11.0", "transformers<5"},
 	}) {
 		t.Fatalf("argv = %v", f.calls)
 	}
@@ -83,7 +94,7 @@ func TestVenvSetupExistingAndCheck(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "bin"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "bin", "python"), nil, 0o755)
-	f := &fakeVenvExec{dir: dir, installed: "0.11.0"}
+	f := &fakeVenvExec{dir: dir, installed: "0.11.0", transformers: "4.57.6"}
 	if _, err := (VenvSetup{Dir: dir, VLLMVersion: "0.11.0", Exec: f.run, CheckOnly: true}).Run(context.Background()); err != nil {
 		t.Fatalf("matching venv: %v", err)
 	}
@@ -124,5 +135,55 @@ func TestVenvSetupEnvKeepsCachesBesideVenvAndNeverDownloadsPython(t *testing.T) 
 	env := VenvSetup{Dir: "/scratch/lab/venv"}.Env()
 	if env["UV_CACHE_DIR"] != "/scratch/lab/venv.cache/uv" || env["PIP_CACHE_DIR"] != "/scratch/lab/venv.cache/pip" || env["UV_PYTHON_DOWNLOADS"] != "never" {
 		t.Fatalf("env = %v", env)
+	}
+}
+
+// A venv built before the companion pin has vLLM 0.11.0 beside transformers 5,
+// which imports but cannot load a tokenizer at serve time.
+func TestVenvSetupTransformers5(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "bin"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "bin", "python"), nil, 0o755)
+	f := &fakeVenvExec{dir: dir, installed: "0.11.0", transformers: "5.23.0"}
+	_, err := (VenvSetup{Dir: dir, VLLMVersion: "0.11.0", Exec: f.run, CheckOnly: true}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "transformers 5.23.0") || !strings.Contains(err.Error(), "transformers<5") {
+		t.Fatalf("check must refuse transformers 5: %v", err)
+	}
+	if len(f.calls) != 1 {
+		t.Fatalf("check must not install: %v", f.calls)
+	}
+	f.calls = nil
+	got, err := (VenvSetup{Dir: dir, VLLMVersion: "0.11.0", Exec: f.run, LookPath: noUV}).Run(context.Background())
+	if err != nil || got != "0.11.0" || f.transformers != "4.57.6" {
+		t.Fatalf("repair: got %q, %v, transformers %s", got, err, f.transformers)
+	}
+	py := filepath.Join(dir, "bin", "python")
+	if !reflect.DeepEqual(f.calls[1], []string{py, "-m", "pip", "install", "vllm==0.11.0", "transformers<5"}) {
+		t.Fatalf("repair argv = %v", f.calls)
+	}
+}
+
+func TestCompanionPins(t *testing.T) {
+	for v, want := range map[string]bool{"0.11.0": true, "0.10.2": true, "0.11.1rc1": true, "0.11rc1": true, "0.12.0": false, "1.0.0": false} {
+		if got := len(companionPins(v)) > 0; got != want {
+			t.Errorf("companionPins(%s) pinned=%v, want %v", v, got, want)
+		}
+	}
+	if !transformersCompatible("0.11.0", "4.57.6") || transformersCompatible("0.11.0", "5.0.0") || !transformersCompatible("0.12.0", "5.23.0") {
+		t.Fatal("transformersCompatible")
+	}
+}
+
+// Warnings on the combined output, such as the TRANSFORMERS_CACHE deprecation
+// notice many HPC sites trigger, must not hide a valid venv.
+func TestVenvSetupProbeIgnoresWarnings(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "bin"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "bin", "python"), nil, 0o755)
+	f := &fakeVenvExec{dir: dir, installed: "0.11.0", transformers: "4.57.6",
+		noise: "/x/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated\n  warnings.warn(\n"}
+	got, err := (VenvSetup{Dir: dir, VLLMVersion: "0.11.0", Exec: f.run, CheckOnly: true}).Run(context.Background())
+	if err != nil || got != "0.11.0" || len(f.calls) != 1 {
+		t.Fatalf("got %q, %v, calls %v", got, err, f.calls)
 	}
 }
