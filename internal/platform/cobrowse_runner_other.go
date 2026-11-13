@@ -10,6 +10,7 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"time"
 )
 
 func newDefaultBrowserRunner() browserRunner { return xvfbRunner{} }
@@ -24,6 +25,20 @@ func defaultCobrowseSessionsBaseDir() string {
 // recorded PIDs through /proc instead, and the pidfile keeps its three-line form.
 func currentProcessStartToken() int64 { return 0 }
 
-func removeSessionDir(dir string) { _ = os.RemoveAll(dir) }
+// removeSessionDir retries for a bounded time: the browser's helper processes
+// (renderer, GPU) can outlive the killed main process for a moment and recreate
+// files, so a single RemoveAll can fail with ENOTEMPTY or leave the dir behind.
+func removeSessionDir(dir string) { removeSessionDirRetry(dir, 25, 200*time.Millisecond) }
+
+func removeSessionDirRetry(dir string, attempts int, delay time.Duration) {
+	for i := 0; i < attempts; i++ {
+		if err := os.RemoveAll(dir); err == nil {
+			if _, serr := os.Lstat(dir); os.IsNotExist(serr) {
+				return
+			}
+		}
+		time.Sleep(delay)
+	}
+}
 
 func findChromiumForOS() (string, error) { return findChromiumOnPath() }
