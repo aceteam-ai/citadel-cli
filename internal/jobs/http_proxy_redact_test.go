@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -157,5 +161,58 @@ func TestHTTPProxyURLErrorKeepsCauseWithoutURLSecrets(t *testing.T) {
 		if !errors.Is(safe, cause) || strings.Contains(safe.Error(), secret) {
 			t.Fatal("nested URL was not redacted while preserving its cause")
 		}
+	}
+}
+
+func TestHTTPProxyURLDiagnosticsHidePathsAndUnknownQueryValues(t *testing.T) {
+	const pathSecret = "synthetic-webhook-path-credential-0123456789PATH"
+	const codeSecret = "synthetic-oauth-code-0123456789CODE"
+	const customSecret = "synthetic-unknown-query-0123456789CSTM"
+	requestPath := "/hooks/" + pathSecret
+	rawQuery := "code=" + codeSecret + "&custom=" + customSecret
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != requestPath || r.URL.RawQuery != rawQuery {
+			t.Error("diagnostic redaction changed the actual request")
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	endpoint := srv.URL
+	port := portOf(t, endpoint)
+	for _, succeeds := range []bool{true, false} {
+		var logs []string
+		h := &HTTPProxyHandler{localPorts: map[int]bool{port: true}}
+		if !succeeds {
+			srv.Close()
+		} // deterministic refused connection, no live service
+		_, err := h.Execute(JobContext{LogFn: func(_, text string) { logs = append(logs, text) }}, &nexus.Job{ID: "synthetic", Payload: map[string]string{"url": endpoint + requestPath + "?" + rawQuery}})
+		if succeeds && err != nil {
+			t.Fatal("synthetic HTTP request failed")
+		}
+		if !succeeds && (err == nil || !errors.Is(err, syscall.ECONNREFUSED)) {
+			t.Fatal("closed fixture did not reach the expected request-error path")
+		}
+		if err != nil {
+			logs = append(logs, err.Error())
+		}
+		for _, text := range logs {
+			for _, secret := range []string{pathSecret, codeSecret, customSecret} {
+				if strings.Contains(text, secret) {
+					t.Fatal("credential reached a request log or returned failure")
+				}
+			}
+			if strings.Contains(text, "/hooks/") || strings.Contains(text, "…PATH") {
+				t.Fatal("URL diagnostic retained a path or path fingerprint")
+			}
+			if !strings.Contains(text, "code=…CODE") || !strings.Contains(text, "custom=…CSTM") {
+				t.Fatal("query diagnostics did not fingerprint all values")
+			}
+		}
+	}
+	srv.Close()
+	if hits.Load() != 1 {
+		t.Fatal("failed request unexpectedly reached the closed fixture")
 	}
 }

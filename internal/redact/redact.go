@@ -81,14 +81,19 @@ func Header(name, value string) string {
 	return value
 }
 
-// URL returns raw with a userinfo password and the values of sensitive query
-// parameters replaced by fingerprints. Scheme, host and path are kept. On a
-// parse failure it returns "<unparseable url>", never the original string.
+// URL returns diagnostics with credential-bearing positions hidden by default.
+// Paths are omitted, and every query value is fingerprinted, including unknown
+// names such as OAuth code. Scheme, host and query names are kept. On a parse
+// failure it returns "<unparseable url>", never the original string.
 func URL(raw string) string {
 	u, err := url.Parse(raw)
-	if err != nil {
+	if err != nil || u.Host == "" {
 		return "<unparseable url>"
 	}
+	// A path can contain a webhook credential. Neither the decoded path nor
+	// its retained escaped form may reach a diagnostic. Opaque URLs are not
+	// supported diagnostic endpoints either.
+	u.Path, u.RawPath, u.Opaque = "", "", ""
 	// url.URL.String() percent-escapes the fingerprint characters; the output
 	// is for humans, so the readable form is restored at the end.
 	var restore []string // pairs of escaped, readable
@@ -115,11 +120,9 @@ func URL(raw string) string {
 		parts := strings.Split(u.RawQuery, "&")
 		for i, part := range parts {
 			k, v, hasValue := strings.Cut(part, "=")
-			name, err := url.QueryUnescape(k)
-			if err != nil {
-				name = k
-			}
-			if !IsSensitiveName(name) || !hasValue {
+			if !hasValue {
+				// A bare query can itself be a credential, with no field name.
+				parts[i] = "query=" + Fingerprint(part)
 				continue
 			}
 			val, err := url.QueryUnescape(v)
