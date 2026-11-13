@@ -16,6 +16,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
+	"github.com/aceteam-ai/citadel-cli/internal/redact"
 	"github.com/google/uuid"
 )
 
@@ -323,7 +324,7 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		c.debug("response: %d - <authorization refusal body omitted>", resp.StatusCode)
+		c.debug("response: %d - <authorization refusal body omitted> token=%s", resp.StatusCode, redact.Fingerprint(c.token))
 		return newAuthorizationError(resp.StatusCode, method, path)
 	}
 
