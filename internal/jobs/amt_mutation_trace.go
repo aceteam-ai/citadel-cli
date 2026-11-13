@@ -44,5 +44,7 @@ func (t *AMTMutationTrace) EndWrite(mayHaveApplied bool) {
 }
 
 func (t *AMTMutationTrace) Possible() bool {
-	return t != nil && (t.possible.Load() || t.inFlight.Load() > 0)
+	// Read the active write first. EndWrite stores possible before clearing
+	// inFlight, so a reader spanning that transition sees at least one state.
+	return t != nil && (t.inFlight.Load() > 0 || t.possible.Load())
 }
