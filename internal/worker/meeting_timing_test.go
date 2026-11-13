@@ -146,7 +146,7 @@ func TestMeetingUnknownTeardownRetainsCustodyWithoutAckNackOrFail(t *testing.T) 
 func TestMeetingUncooperativeDeadlineRetainsActualHandler(t *testing.T) {
 	state := NewWorkerState()
 	r := NewRunner(NewMockJobSource("fake", nil), nil, RunnerConfig{State: state})
-	started, release := make(chan struct{}), make(chan struct{})
+	started, release, sawDeadline := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	defer func() {
 		select {
 		case <-release:
@@ -154,8 +154,10 @@ func TestMeetingUncooperativeDeadlineRetainsActualHandler(t *testing.T) {
 			close(release)
 		}
 	}()
-	h := meetingTimingHandler{profile: meetingpolicy.Default(), run: func(context.Context, *Job, StreamWriter) (*JobResult, error) {
+	h := meetingTimingHandler{profile: meetingpolicy.Default(), run: func(c context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
 		close(started)
+		<-c.Done()
+		close(sawDeadline)
 		<-release
 		return &JobResult{Status: JobStatusSuccess}, nil
 	}}
@@ -168,6 +170,13 @@ func TestMeetingUncooperativeDeadlineRetainsActualHandler(t *testing.T) {
 		done <- err
 	}()
 	<-started
+	select {
+	case err := <-done:
+		t.Fatal("deadline freed actual handler", err)
+	case <-sawDeadline:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never observed the execution deadline")
+	}
 	select {
 	case err := <-done:
 		t.Fatal("deadline freed actual handler", err)

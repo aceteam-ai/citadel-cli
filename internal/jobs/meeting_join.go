@@ -765,6 +765,13 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) (result []b
 	// The rolling-window transcription scratch clip (meeting_transcribe_window.go)
 	// is a per-pass temp; remove it on exit so it does not linger in the workspace.
 	defer func() { _ = os.Remove(meetingWindowWavPath(h.WorkspaceDir, p.MeetingID)) }()
+	// The shared Meet/Teams recording boundary: a Stop seen at any point before
+	// recording starts (including during the final admission probe) records
+	// nothing and is a cancellation; the deferred close still tears down media.
+	if ctx.CancelRequestedNow() {
+		meetingEnded(ctx, MeetingEndStoppedByUser)
+		return nil, errMeetingStopped
+	}
 	if err := checkMeetingPhase(ctx.Context(), media.StartRecording); err != nil {
 		meetingEnded(ctx, "recording_failed")
 		return nil, fmt.Errorf("start recording: %w", err)
@@ -945,17 +952,17 @@ func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p
 	br = phaseMeetingBrowser{meetingBrowser: br, ctx: recordingCtx}
 	botMessages := make(map[string]struct{})
 	posted := false
-	if p.Platform != platformTeams {
+	teamsSeen := make(map[string]struct{})
+	if p.Platform == platformTeams {
+		posted = h.announceTeamsOnAdmission(ctx, br, botMessages, teamsSeen, p)
+	} else {
 		posted = h.announceOnAdmission(ctx, br, botMessages, p)
 	}
-	// The interactive during-call layer (announce / rolling `/ace` commands /
-	// chat capture) is Meet-coupled (issue #5435) and explicitly OUT of the Teams
-	// MVP scope (#7000: join + record + transcribe, no in-call chat). Route Teams
-	// through the plain record-until-end loop, which uses the Teams-aware
-	// end-detection (checkMeetingEndedFor). Wiring the interactive layer for Teams
-	// is a documented follow-up once its DOM is live-tuned.
+	// Teams uses the plain record-until-end loop (with its Teams end detection
+	// and the standalone `/ace leave` watch): the interactive layer is
+	// Meet-coupled (issue #5435) and its Teams DOM is not live-tuned yet.
 	if !h.StreamingEnabled || p.Platform == platformTeams {
-		reason, err := h.waitForMeetingEnd(ctx, br, p, media, botMessages)
+		reason, err := h.waitForMeetingEnd(ctx, br, p, media, botMessages, teamsSeen)
 		return interactiveOutcome{endReason: reason, disclosurePosted: posted}, err
 	}
 
@@ -1182,6 +1189,11 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser
 	endState := meetingEndTracker{recordingStartedAt: started}
 	recorderDead := media.RecordingAlive()
 	seenChat := make(map[int]struct{})
+	// ownMessages[1], when given, is the Teams seen set seeded at admission.
+	teamsSeen := make(map[string]struct{})
+	if len(ownMessages) > 1 {
+		teamsSeen = ownMessages[1]
+	}
 	for h.meetingNow().Before(deadline) {
 		if ctx.CancelRequestedNow() {
 			ctx.Log("info", "     - stop requested; leaving meeting %s", p.MeetingID)
@@ -1194,6 +1206,12 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser
 		}
 		if reason, ended := checkMeetingEndedFor(p.Platform, br, &endState); ended {
 			return reason, nil
+		}
+		if p.Platform == platformTeams && len(ownMessages) > 0 {
+			if teamsLeaveRequested(br, teamsSeen, ownMessages[0]) {
+				_, _ = br.Evaluate(teamsLeaveJS)
+				return "ace_command_leave", nil
+			}
 		}
 		if p.Platform != platformTeams && len(ownMessages) > 0 {
 			messages, _ := readMeetChat(br)

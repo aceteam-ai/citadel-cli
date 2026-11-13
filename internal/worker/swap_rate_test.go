@@ -304,6 +304,14 @@ func TestSwap_LedgerRecordsRateLimitedRefusal(t *testing.T) {
 	if _, err := m.EnsureResident(context.Background(), "bonsai", "Bonsai-27B"); err == nil {
 		t.Fatal("expected the swap to be refused")
 	}
+	waitFor(t, func() bool {
+		recent := m.SwapStats().Recent
+		if len(recent) == 0 {
+			return false
+		}
+		last := recent[len(recent)-1]
+		return last.Backend == "bonsai" && last.Model == "Bonsai-27B" && last.Outcome == swapOutcomeRateLimited
+	}, "the exact rate-limited refusal must be recorded, not a seeded swap")
 	stats := m.SwapStats()
 	last := stats.Recent[len(stats.Recent)-1]
 	if last.Outcome != swapOutcomeRateLimited {

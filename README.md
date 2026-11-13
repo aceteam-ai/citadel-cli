@@ -21,6 +21,19 @@ This single command:
 
 Get an authkey from [aceteam.ai/fabric](https://aceteam.ai/fabric). The script is idempotent and safe to run multiple times.
 
+## Local Browse: Let an Agent on This Computer Drive a Browser
+
+No account needed. An MCP agent app on your computer drives a hidden browser.
+You watch and approve its actions in a local viewer, and you take over to log in
+yourself, so the agent never sees your password. Every action is recorded on
+the device. Windows first; see the
+[local browse quickstart](docs/local-browse-quickstart.md).
+
+```powershell
+citadel local doctor
+citadel local config copilot   # or claude-desktop, codex
+```
+
 ## AI Tool Integration (MCP)
 
 Connect your GPU infrastructure to Claude Code, Cursor, or any MCP-compatible AI tool:
@@ -560,47 +573,21 @@ See [**WINDOWS_DEVELOPMENT.md**](WINDOWS_DEVELOPMENT.md) for detailed Windows de
 
 ## Releasing (For Maintainers)
 
-**Always use `release.sh`** to create releases. Do not manually create tags or GitHub releases.
+**Always use `scripts/release.sh`** to create releases. Do not create tags or
+GitHub releases by hand, and do not upload assets manually.
 
 ```bash
-# Interactive mode - prompts for version
-./release.sh
-
-# Non-interactive mode - specify version
-./release.sh -v v1.2.0 -y
-
-# Dry run to preview what will happen
-./release.sh --dry-run -v v1.2.0
+./scripts/release.sh --dry-run   # Preview, including the signing-key preflight
+./scripts/release.sh             # Minor bump release
+./scripts/release.sh patch       # Patch release
+./scripts/release.sh --status    # Inspect an in-progress release
 ```
 
-### Release Process
-
-The script will:
-
-1. **Validate Environment**
-   - Check for uncommitted changes (working directory must be clean)
-   - Verify GitHub CLI (`gh`) is installed
-   - Validate version format (must be `vX.Y.Z` or `vX.Y.Z-rc1`)
-
-2. **Create and Push Tag**
-   - Create a git tag with the specified version
-   - Push the tag to the remote repository
-
-3. **Build Artifacts**
-   - Run `build.sh` to create binaries for all platforms (linux/darwin/windows, amd64/arm64)
-   - Generate SHA256 checksums
-
-4. **Create GitHub Release**
-   - Generate release notes from commits since the last tag
-   - Upload binaries and checksums to GitHub Releases
-   - Display the release URL
-
-5. **Update Homebrew Tap**
-   - Automatically updates the `aceteam-ai/homebrew-tap` formula via
-     `scripts/update-homebrew-tap.sh` (bumps the version + the four per-platform
-     SHA256s, then commits and pushes)
-   - Failures here are non-fatal: the release still completes and prints the
-     manual `update-homebrew-tap.sh` fallback
+The script tests, builds every platform archive, writes `checksums.txt`, signs
+it as `checksums.txt.sig` with the offline release key, publishes all of them
+in one GitHub release, and updates the Homebrew tap. Citadel's updater refuses
+any release without a valid signature, so a release published another way
+cannot be installed by nodes. See [docs/release-signing.md](docs/release-signing.md).
 
 ### Version Numbering
 
@@ -609,32 +596,3 @@ Follow semantic versioning (semver):
 - **Minor version** (`v1.1.0`): New features, backwards compatible
 - **Patch version** (`v1.0.1`): Bug fixes, backwards compatible
 - **Pre-release** (`v1.1.0-rc1`): Release candidates for testing
-
-### Manual Release Process
-
-> **Note:** Prefer `release.sh` — it updates the Homebrew tap for you. If you
-> release by hand, sync the tap yourself afterward with
-> `./scripts/update-homebrew-tap.sh <version>` (it fetches the release's
-> checksums from GitHub and pushes the formula bump).
-
-If you absolutely must release manually:
-
-```bash
-# 1. Create and push tag
-git tag -a v1.2.0 -m "v1.2.0"
-git push origin v1.2.0
-
-# 2. Build artifacts for all platforms
-./build.sh --all
-
-# 3. Create GitHub release
-gh release create v1.2.0 \
-  --title "v1.2.0" \
-  --notes "Release notes here" \
-  release/citadel_v1.2.0_*.tar.gz \
-  release/citadel_v1.2.0_*.zip \
-  release/checksums.txt
-
-# 4. Sync the Homebrew tap (aceteam-ai/homebrew-tap)
-./scripts/update-homebrew-tap.sh 1.2.0
-```

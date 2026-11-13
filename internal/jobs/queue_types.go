@@ -122,6 +122,11 @@ type LLMInferencePayload struct {
 	// forwarded (ollama only demands the thinking capability when `think` is
 	// truthy, so think:false is accepted by a non-thinking model).
 	Think *bool `json:"think,omitempty"`
+	// ReasoningEffort selects a supported named thinking level. For Ollama this
+	// is sent as the string-valued think parameter when Think is absent; for
+	// OpenAI-compatible engines it is sent as reasoning_effort. An explicit
+	// Think=false always takes precedence.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // ChatMessage represents a message in chat-style APIs.
