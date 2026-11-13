@@ -48,6 +48,9 @@ func HomeDir(username string) (string, error) {
 	if fixture := homeDirectoryForTests.Load(); fixture != nil {
 		return *fixture, nil
 	}
+	if home, ok := scopedHomeDir(); ok {
+		return home, nil
+	}
 	if username == "" {
 		return os.UserHomeDir()
 	}
@@ -141,6 +144,9 @@ func ConfigDir() string {
 	if fixture := configDirectoryForTests.Load(); fixture != nil {
 		return *fixture
 	}
+	if dir, ok := scopedConfigDir(); ok {
+		return dir
+	}
 	return resolveConfigDir(IsRoot(), IsWindows(), IsLinux(), IsDarwin())
 }
 
@@ -219,6 +225,9 @@ func resolveConfigDir(isRoot, isWindows, isLinux, isDarwin bool) string {
 func ConfigDirCandidates() []string {
 	if fixture := configDirectoryForTests.Load(); fixture != nil {
 		return []string{*fixture}
+	}
+	if dir, ok := scopedConfigDir(); ok {
+		return []string{dir}
 	}
 	return configDirCandidates(IsRoot(), IsWindows(), IsLinux(), IsDarwin())
 }

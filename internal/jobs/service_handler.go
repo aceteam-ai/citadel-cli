@@ -82,6 +82,10 @@ type manifestService struct {
 	// See
 	// services/ollama_policy.go.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// OllamaKeepAlive/OllamaPreload mirror cmd/manifest.go (citadel-cli#1560);
+	// modeled here so updateManifest/APPLY_DEVICE_CONFIG round-trips keep them.
+	OllamaKeepAlive *string  `yaml:"ollama_keep_alive,omitempty"`
+	OllamaPreload   []string `yaml:"ollama_preload,omitempty"`
 	// Threads mirrors cmd/manifest.go Service.Threads: the aceteam-ai/citadel-cli#1269
 	// per-service CPU thread opt-in for the tei embedding service, injected as
 	// CITADEL_TEI_NUM_THREADS at `docker compose up` via services.TEIComposeEnv. A
@@ -455,6 +459,10 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 			err = fmt.Errorf("docker compose up failed: %s", policyErr)
 			break
 		}
+		if _, kaErr := embeddedservices.OllamaKeepAliveComposeEnv(nil, svc.Name, svc.OllamaKeepAlive); kaErr != nil {
+			err = fmt.Errorf("docker compose up failed: %s", kaErr)
+			break
+		}
 		if svc.Name == "vllm" {
 			external, loadErr := externalengine.LoadPersisted(h.ConfigDir)
 			if loadErr != nil {
@@ -661,13 +669,16 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 			// ollama_max_loaded_models:) so the compose substitution/passthrough
 			// resolve. An invalid value fails the start loudly rather than
 			// silently falling through to the compose/engine default.
-			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels, svc.Threads); bindErr != nil {
+			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels, svc.OllamaKeepAlive, svc.Threads); bindErr != nil {
 				err = fmt.Errorf("docker compose up failed: %s", bindErr)
 			} else {
 				cmd.Env = env
 				out, cmdErr := cmd.CombinedOutput()
 				if cmdErr != nil {
 					err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+				} else {
+					// citadel-cli#1560: best-effort async preload; never blocks or fails the start.
+					startOllamaPreload(svc.Name, svc.OllamaKeepAlive, svc.OllamaPreload, func(f string, a ...any) { ctx.Log("info", "     - "+f, a...) })
 				}
 			}
 		}
@@ -2305,7 +2316,7 @@ func (h *ServiceHandler) composeEnv() []string {
 // cannot become policy while Ollama retains automatic concurrency. An invalid
 // bind or negative policy value is a hard error the caller surfaces as a start
 // failure. The policy entry is the final, sole copy of its key.
-func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int, threads *int) ([]string, error) {
+func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, ollamaMaxLoaded *int, ollamaKeepAlive *string, threads *int) ([]string, error) {
 	entry, inject, err := embeddedservices.BindEnv(serviceName, bind)
 	if err != nil {
 		return nil, err
@@ -2315,6 +2326,10 @@ func (h *ServiceHandler) composeEnvForEngineStart(serviceName, bind string, olla
 		env = append(env, entry)
 	}
 	env, err = embeddedservices.OllamaMaxLoadedModelsComposeEnv(env, serviceName, ollamaMaxLoaded)
+	if err != nil {
+		return nil, err
+	}
+	env, err = embeddedservices.OllamaKeepAliveComposeEnv(env, serviceName, ollamaKeepAlive)
 	if err != nil {
 		return nil, err
 	}

@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
+	"unicode"
 )
 
 // ExtractResult is the outcome of a session `extract` action: the matched
@@ -23,6 +25,91 @@ type ExtractResult struct {
 	// Element.getAttribute's null-to-caller contract), not a missing key --
 	// so a caller can distinguish "asked for, absent" from "never asked for".
 	Attrs map[string]string `json:"attrs,omitempty"`
+	// Truncated is true when ExtractBounded cut Text at its character limit.
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// ErrPasswordValue refuses an extract that asks for the value of a password
+// field. Typed credentials must never travel back to the agent.
+var ErrPasswordValue = fmt.Errorf("refusing to read the value of a password field")
+
+// PageState is the current document's URL and readyState.
+type PageState struct {
+	URL        string `json:"url"`
+	ReadyState string `json:"ready_state"`
+	// Title is document.title, already bounded and stripped of control
+	// characters (SanitizeCobrowseTitle).
+	Title string `json:"title,omitempty"`
+}
+
+// MaxCobrowseTitleRunes bounds the page title returned from a navigation.
+const MaxCobrowseTitleRunes = 512
+
+// SanitizeCobrowseTitle drops control characters (including newlines and
+// tabs, which a title has no use for), trims surrounding space and truncates
+// to MaxCobrowseTitleRunes.
+func SanitizeCobrowseTitle(t string) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range t {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			continue
+		}
+		if n >= MaxCobrowseTitleRunes {
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// Navigation settle tuning. The window is the most Navigate waits for the page
+// to finish loading; it is deliberately below the 20s CDP command budget so a
+// slow page returns whatever it has reached. Variables so tests need not sleep.
+var (
+	navigateSettleWindow  = 8 * time.Second
+	navigateSettleMinimum = 400 * time.Millisecond
+	navigateSettlePoll    = 100 * time.Millisecond
+)
+
+// settleNavigation polls the page until it reports readyState "complete" on a
+// document that is not the pre-navigation one (or, when the URL did not change,
+// after a short minimum so a pending navigation has time to commit), bounded by
+// navigateSettleWindow. It returns the last state read; a slow page is not an
+// error.
+func settleNavigation(port int, before string) PageState {
+	var last PageState
+	start := time.Now()
+	for {
+		if ps, err := readPageState(port); err == nil {
+			last = ps
+			if ps.ReadyState == "" {
+				// The page did not answer with a document state at all;
+				// polling cannot improve on that.
+				return ps
+			}
+			if ps.ReadyState == "complete" && (ps.URL != before || time.Since(start) >= navigateSettleMinimum) {
+				return ps
+			}
+		}
+		if time.Since(start) >= navigateSettleWindow {
+			return last
+		}
+		time.Sleep(navigateSettlePoll)
+	}
+}
+
+func readPageState(port int) (PageState, error) {
+	val, err := runtimeEvaluate(port, `({url: location.href, ready: document.readyState, title: document.title})`)
+	if err != nil {
+		return PageState{}, err
+	}
+	obj, _ := val.(map[string]any)
+	u, _ := obj["url"].(string)
+	r, _ := obj["ready"].(string)
+	t, _ := obj["title"].(string)
+	return PageState{URL: u, ReadyState: r, Title: SanitizeCobrowseTitle(t)}, nil
 }
 
 type SelectResult struct {
@@ -85,10 +172,14 @@ func (s *cobrowseSession) requireDrivablePort() (int, error) {
 // sessionForAction resolves a session by id for an action call, mirroring the
 // "no such browser session" error the job handler already surfaces for status.
 func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, error) {
+	m.Recover()
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	m.mu.Unlock()
 	if !ok {
+		if e, ended := m.EndedSession(id); ended {
+			return nil, &SessionEndedError{ID: id, Reason: e.Reason, Detail: e.Detail}
+		}
 		return nil, fmt.Errorf("no such browser session: %q", id)
 	}
 	return s, nil
@@ -97,6 +188,9 @@ func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, 
 // Navigate drives one session's browser to a URL. Refused while the session is
 // handed off to a human (ErrHandedOff).
 func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus, error) {
+	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
 	s, err := m.sessionForAction(id)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
@@ -109,6 +203,53 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 		// refused write).
 		return CobrowseSessionStatus{}, err
 	}
+	var before string
+	if ps, err := readPageState(port); err == nil {
+		before = ps.URL
+	}
+	if _, err := cdpCommand(port, "Page.navigate", map[string]any{"url": url}); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	// Wait for the navigation (including redirects) to settle, then report
+	// where the page ended up. A slow page returns its current state.
+	ps := settleNavigation(port, before)
+	st := s.status()
+	if ps.URL != "" {
+		st.URL = ps.URL
+	}
+	st.Title = ps.Title
+	return st, nil
+}
+
+// NavigateAsHuman navigates on behalf of the human who has taken control (the
+// local viewer's address bar). It is the one navigation allowed while handed
+// off, and it requires the handoff: the explicit-handoff bit stays set, so the
+// agent stays blocked throughout.
+func (m *CobrowseSessionManager) NavigateAsHuman(id, url string) (CobrowseSessionStatus, error) {
+	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	s.mu.Lock()
+	if s.proc == nil {
+		s.mu.Unlock()
+		return CobrowseSessionStatus{}, ErrNotStarted
+	}
+	select {
+	case <-s.proc.exited:
+		s.mu.Unlock()
+		return CobrowseSessionStatus{}, ErrNotStarted
+	default:
+	}
+	if !s.humanDrivingLocked() {
+		s.mu.Unlock()
+		return CobrowseSessionStatus{}, fmt.Errorf("the user has not taken control of this session")
+	}
+	port := s.proc.debugPort
+	s.mu.Unlock()
 	if _, err := cdpCommand(port, "Page.navigate", map[string]any{"url": url}); err != nil {
 		return CobrowseSessionStatus{}, err
 	}
@@ -170,6 +311,15 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 		return CobrowseSessionStatus{}, fmt.Errorf("click requires a 'selector' or both 'x' and 'y'")
 	}
 
+	// Selector settling awaits page JavaScript, during which a human can take
+	// control. Check the live driver again before sending any mouse event.
+	currentPort, err := s.requireDrivablePort()
+	if err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	if currentPort != port {
+		return CobrowseSessionStatus{}, ErrNotStarted
+	}
 	if err := clickAtPoint(port, cx, cy); err != nil {
 		return CobrowseSessionStatus{}, err
 	}
@@ -344,6 +494,83 @@ func (m *CobrowseSessionManager) Extract(id, selector string, attrs []string) (E
 	return extractElement(port, selector, attrs)
 }
 
+// ExtractBounded is Extract with the text cut to maxChars inside the page (so an
+// oversized document never crosses CDP whole) and Truncated reported. It refuses
+// to return a "value" attribute from a password input. maxChars <= 0 means no
+// limit.
+func (m *CobrowseSessionManager) ExtractBounded(id, selector string, attrs []string, maxChars int) (ExtractResult, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return ExtractResult{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return ExtractResult{}, err
+	}
+	if attrs == nil {
+		attrs = []string{}
+	}
+	attrsJSON, err := json.Marshal(attrs)
+	if err != nil {
+		return ExtractResult{}, err
+	}
+	expr := fmt.Sprintf(`(function(){
+		var el = document.querySelector(%s);
+		if (!el) return null;
+		var names = %s;
+		var isPassword = (el instanceof HTMLInputElement) && String(el.type).toLowerCase() === "password";
+		for (var i = 0; i < names.length; i++) {
+			if (isPassword && String(names[i]).toLowerCase() === "value") return {password: true};
+		}
+		var attrs = {};
+		for (var j = 0; j < names.length; j++) {
+			attrs[names[j]] = el.getAttribute(names[j]) || "";
+		}
+		var text = (el.innerText !== undefined ? el.innerText : el.textContent) || "";
+		var max = %d;
+		var truncated = false;
+		if (max > 0 && text.length > max) { text = text.slice(0, max); truncated = true; }
+		return {text: text, attrs: attrs, truncated: truncated};
+	})()`, jsStringLiteral(selector), string(attrsJSON), maxChars)
+	val, err := runtimeEvaluate(port, expr)
+	if err != nil {
+		return ExtractResult{}, err
+	}
+	obj, ok := val.(map[string]any)
+	if !ok {
+		return ExtractResult{}, fmt.Errorf("no element matches selector %q", selector)
+	}
+	if pw, _ := obj["password"].(bool); pw {
+		return ExtractResult{}, ErrPasswordValue
+	}
+	text, _ := obj["text"].(string)
+	truncated, _ := obj["truncated"].(bool)
+	result := ExtractResult{Text: text, Truncated: truncated}
+	if rawAttrs, ok := obj["attrs"].(map[string]any); ok && len(rawAttrs) > 0 {
+		result.Attrs = make(map[string]string, len(rawAttrs))
+		for k, v := range rawAttrs {
+			if sv, ok := v.(string); ok {
+				result.Attrs[k] = sv
+			}
+		}
+	}
+	return result, nil
+}
+
+// PageState reads the session's current URL and document.readyState. It is an
+// agent read, so it is refused while a human drives, like screenshot.
+func (m *CobrowseSessionManager) PageState(id string) (PageState, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return PageState{}, err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return PageState{}, err
+	}
+	return readPageState(port)
+}
+
 // Handoff sets the STICKY explicit-handoff bit on one session (see the package
 // doc comment's two-bit explanation), refusing subsequent agent-scripted
 // actions even across a transient viewer disconnect -- the mid-2FA case.
@@ -361,6 +588,7 @@ func (m *CobrowseSessionManager) Handoff(id string) (CobrowseSessionStatus, erro
 	}
 	s.explicitHandoff = true
 	s.mu.Unlock()
+	s.persistRecord()
 	return s.status(), nil
 }
 
@@ -378,6 +606,7 @@ func (m *CobrowseSessionManager) Resume(id string) (CobrowseSessionStatus, error
 	}
 	s.explicitHandoff = false
 	s.mu.Unlock()
+	s.persistRecord()
 	return s.status(), nil
 }
 
@@ -399,10 +628,14 @@ func jsStringLiteral(s string) string {
 // returnByValue=true and decodes the JSON-serializable result value. Returns
 // an error if the script itself threw (CDP's exceptionDetails).
 func runtimeEvaluate(debugPort int, expr string) (any, error) {
+	return runtimeEvaluateWithPromise(debugPort, expr, false)
+}
+
+func runtimeEvaluateWithPromise(debugPort int, expr string, awaitPromise bool) (any, error) {
 	res, err := cdpCommand(debugPort, "Runtime.evaluate", map[string]any{
 		"expression":    expr,
 		"returnByValue": true,
-		"awaitPromise":  false,
+		"awaitPromise":  awaitPromise,
 	})
 	if err != nil {
 		return nil, err
@@ -417,18 +650,38 @@ func runtimeEvaluate(debugPort int, expr string) (any, error) {
 	return remote["value"], nil
 }
 
-// resolveSelectorCenter finds the first element matching selector, scrolls it
-// into view, and returns the CSS-pixel viewport coordinates of its center. A
-// selector matching nothing is a clear error, not a click at (0,0).
+// resolveSelectorCenter waits for the first matching element to stop moving
+// after scrolling and verifies that the click point still hits that element.
 func resolveSelectorCenter(debugPort int, selector string) (float64, float64, error) {
-	expr := fmt.Sprintf(`(function(){
+	expr := fmt.Sprintf(`(async function(){
 		var el = document.querySelector(%s);
 		if (!el) return null;
 		el.scrollIntoView({block: "center", inline: "center"});
-		var r = el.getBoundingClientRect();
-		return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+		var deadline = Date.now() + 2500;
+		var previous = null;
+		var stable = 0;
+		while (Date.now() < deadline) {
+			if (!el.isConnected) return {error: "element was removed while scrolling"};
+			var r = el.getBoundingClientRect();
+			var x = r.x + r.width / 2;
+			var y = r.y + r.height / 2;
+			var visible = r.width > 0 && r.height > 0 &&
+				x >= 0 && x < window.innerWidth && y >= 0 && y < window.innerHeight;
+			if (visible && previous && Math.abs(x - previous.x) < 0.5 &&
+				Math.abs(y - previous.y) < 0.5) stable++;
+			else stable = 0;
+			if (stable >= 2) {
+				var hit = document.elementFromPoint(x, y);
+				if (!hit || (hit !== el && !el.contains(hit)))
+					return {error: "another element covers the click point"};
+				return {x: x, y: y};
+			}
+			previous = {x: x, y: y};
+			await new Promise(function(resolve) { setTimeout(resolve, 50); });
+		}
+		return {error: "element did not settle in the viewport"};
 	})()`, jsStringLiteral(selector))
-	val, err := runtimeEvaluate(debugPort, expr)
+	val, err := runtimeEvaluateWithPromise(debugPort, expr, true)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -436,8 +689,14 @@ func resolveSelectorCenter(debugPort int, selector string) (float64, float64, er
 	if !ok {
 		return 0, 0, fmt.Errorf("no element matches selector %q", selector)
 	}
-	x, _ := obj["x"].(float64)
-	y, _ := obj["y"].(float64)
+	if reason, ok := obj["error"].(string); ok {
+		return 0, 0, fmt.Errorf("cannot click selector %q: %s", selector, reason)
+	}
+	x, xOK := obj["x"].(float64)
+	y, yOK := obj["y"].(float64)
+	if !xOK || !yOK {
+		return 0, 0, fmt.Errorf("invalid click point for selector %q", selector)
+	}
 	return x, y, nil
 }
 

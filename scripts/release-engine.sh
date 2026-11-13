@@ -23,6 +23,11 @@
 #   hook_test()              — run tests (optional, default: no-op)
 #   hook_build()             — run build (optional, default: no-op)
 #   hook_artifact()          — print path to release artifact (optional)
+#   hook_preflight()         — run on EVERY invocation (incl. --dry-run and
+#                              resume) before any tag/build/publish step; a
+#                              failure aborts the release (optional)
+#   hook_pre_publish()       — run immediately before `gh release create`; a
+#                              failure aborts before publishing (optional)
 #   hook_post_release()      — run after GitHub release (optional)
 
 set -euo pipefail
@@ -241,6 +246,8 @@ declare -F hook_test         &>/dev/null || hook_test()         { true; }
 declare -F hook_build        &>/dev/null || hook_build()        { true; }
 declare -F hook_artifact     &>/dev/null || hook_artifact()     { true; }
 declare -F hook_post_release &>/dev/null || hook_post_release() { true; }
+declare -F hook_preflight    &>/dev/null || hook_preflight()    { true; }
+declare -F hook_pre_publish  &>/dev/null || hook_pre_publish()  { true; }
 
 # ── Main release flow ─────────────────────────────────────────────────────
 
@@ -250,6 +257,15 @@ run_release() {
   local allow_dirty="${ALLOW_DIRTY:-false}"
 
   log "=== Release started: bump=$bump_type dry_run=$dry_run ==="
+
+  # ── Step 0: Preflight (every invocation, before tagging) ──────────────
+  # Deliberately outside any step_done guard: a resumed release must still
+  # prove it can finish (e.g. that the signing key is readable) before it
+  # creates or publishes anything.
+  if ! step_done "release"; then
+    step_msg "Running preflight checks..."
+    hook_preflight || fatal "Preflight failed. Nothing was tagged or published."
+  fi
 
   # ── Step 1: Validate ──────────────────────────────────────────────────
   if ! step_done "validate"; then
@@ -446,6 +462,8 @@ run_release() {
           artifacts+=("$artifact_path")
         fi
       done < <(hook_artifact 2>/dev/null || true)
+
+      hook_pre_publish || fatal "Pre-publish check failed. Nothing was published; fix and re-run to resume."
 
       gh release create "${RELEASE_TAG_PREFIX}${new_version}" "${release_args[@]}" "${artifacts[@]}"
       log "GitHub Release created"

@@ -405,6 +405,7 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
 	}
+	startOllamaPreload(serviceName, manifestSvc)
 	return nil
 }
 
