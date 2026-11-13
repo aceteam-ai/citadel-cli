@@ -220,11 +220,10 @@ func (s JobSpec) Normalize() (JobSpec, error) {
 			problems = append(problems, err.Error())
 		}
 		s.OrgID = strings.ToLower(s.OrgID)
-		if s.ApprovalTimeout == 0 {
-			s.ApprovalTimeout = DefaultApprovalTimeout
-		}
-		if s.ApprovalTimeout < 0 || s.ApprovalTimeout > MaxApprovalTimeout {
-			problems = append(problems, "--hpc-approval-timeout must be between 0 and "+MaxApprovalTimeout.String())
+		if timeout, err := NormalizeApprovalTimeout(s.ApprovalTimeout); err != nil {
+			problems = append(problems, err.Error())
+		} else {
+			s.ApprovalTimeout = timeout
 		}
 	}
 	for name, p := range map[string]*string{"--hpc-state-root": &s.StateRoot, "--ca-cert": &s.CACert} {

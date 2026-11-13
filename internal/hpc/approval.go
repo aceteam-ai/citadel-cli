@@ -52,6 +52,18 @@ func ValidateOrgID(id string) error {
 	return nil
 }
 
+// NormalizeApprovalTimeout is shared by launch, enroll and work. Only zero
+// selects the default; invalid explicit values must not create a request.
+func NormalizeApprovalTimeout(timeout time.Duration) (time.Duration, error) {
+	if timeout < 0 || timeout > MaxApprovalTimeout {
+		return 0, errors.New("--hpc-approval-timeout must be between 0 and " + MaxApprovalTimeout.String())
+	}
+	if timeout == 0 {
+		timeout = DefaultApprovalTimeout
+	}
+	return timeout, nil
+}
+
 // ApprovalOptions are the wait's edges; zero values are the production ones.
 type ApprovalOptions struct {
 	OrgID   string
@@ -221,9 +233,11 @@ func (c Client) EnrollByApproval(ctx context.Context, baseURL, csrPEM string, la
 	if err := ValidateOrgID(o.OrgID); err != nil {
 		return EnrollResponse{}, err
 	}
-	if o.Timeout <= 0 {
-		o.Timeout = DefaultApprovalTimeout
+	timeout, err := NormalizeApprovalTimeout(o.Timeout)
+	if err != nil {
+		return EnrollResponse{}, err
 	}
+	o.Timeout = timeout
 	if o.Sleep == nil {
 		o.Sleep = defaultSleep
 	}
@@ -272,6 +286,17 @@ func (c Client) EnrollByApproval(ctx context.Context, baseURL, csrPEM string, la
 		}
 		failures = 0
 		if outcome == pollApproved {
+			if resp.OrgID != strings.ToLower(o.OrgID) {
+				// An issued response for another org must never reach local
+				// persistence. Compensate on the configured platform, not on
+				// an alternate origin supplied by the mismatched response.
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+				defer cleanupCancel()
+				if err := c.Deregister(cleanupCtx, baseURL, resp.DeviceAPIToken, resp.NodeID); err != nil {
+					return EnrollResponse{}, fmt.Errorf("approved enrollment organization mismatch (and deregistering the new node failed: %w; remove it in the console)", err)
+				}
+				return EnrollResponse{}, errors.New("approved enrollment organization mismatch (the new node was deregistered)")
+			}
 			return resp, nil
 		}
 	}

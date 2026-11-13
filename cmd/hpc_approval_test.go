@@ -6,16 +6,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/hpc"
+	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 )
 
 const (
@@ -52,7 +56,7 @@ func newApprovalFake(t *testing.T, pending int32) (*httptest.Server, *atomic.Int
 				return
 			}
 			leaf := certForCSR(t, csr.Load().(string))
-			_ = json.NewEncoder(w).Encode(map[string]any{"node_id": testHPCNodeID, "org_id": "org-1", "device_api_token": "dev_tok",
+			_ = json.NewEncoder(w).Encode(map[string]any{"node_id": testHPCNodeID, "org_id": approvalOrg, "device_api_token": "dev_tok",
 				"api_base_url": "http://" + r.Host, "leaf_pem": leaf, "chain_pem": leaf, "node_uid": "u", "expires_at": "2026-11-12T12:05:00Z"})
 		case hpc.DeregisterPath:
 			_, _ = w.Write([]byte(`{"success":true,"node_id":"` + testHPCNodeID + `"}`))
@@ -169,5 +173,87 @@ func TestHPCWorkerCommandOrgPath(t *testing.T) {
 	joined := strings.Join(argv, " ")
 	if !strings.Contains(joined, "--hpc-org "+approvalOrg) || !strings.Contains(joined, "--hpc-approval-timeout 10m0s") || strings.Contains(joined, "token-file") {
 		t.Fatalf("argv = %v", argv)
+	}
+}
+
+// This fake endpoint issues a valid leaf under a foreign org. No returned
+// credential or certificate may reach the job-local device configuration.
+func TestEnrollHPCNodeApprovalMismatchLeavesNoForeignCredentials(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("the hpc profile refuses root")
+	}
+	for _, cleanupStatus := range []int{http.StatusOK, http.StatusInternalServerError} {
+		t.Run(fmt.Sprint(cleanupStatus), func(t *testing.T) {
+			var csr string
+			var deregisters atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case hpc.EnrollRequestsPath:
+					var req map[string]any
+					_ = json.NewDecoder(r.Body).Decode(&req)
+					csr, _ = req["csr_pem"].(string)
+					w.WriteHeader(202)
+					_ = json.NewEncoder(w).Encode(map[string]any{"request_id": "req_1", "poll_secret": approvalSecret, "user_code": "ABCD", "poll_interval_s": 2})
+				case hpc.EnrollRequestsPath + "/req_1/poll":
+					leaf := certForCSR(t, csr)
+					_ = json.NewEncoder(w).Encode(map[string]any{"node_id": testHPCNodeID, "org_id": "3f3727b9-0000-4000-8000-000000000002", "device_api_token": "synthetic_foreign_token", "api_base_url": "http://" + r.Host, "leaf_pem": leaf, "chain_pem": leaf})
+				case hpc.DeregisterPath:
+					deregisters.Add(1)
+					w.WriteHeader(cleanupStatus)
+					_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "node_id": testHPCNodeID})
+				default:
+					w.WriteHeader(404)
+				}
+			}))
+			defer srv.Close()
+			layout := testEnrollLayout(t)
+			o := testEnrollOptions(t, srv.URL, "")
+			o.OrgID = approvalOrg
+			o.Out = io.Discard
+			o.Sleep = noWait
+			creds, err := enrollHPCNode(context.Background(), layout, o)
+			if err == nil || !strings.Contains(err.Error(), "organization mismatch") || deregisters.Load() != 1 {
+				t.Fatalf("foreign approval was not refused/compensated: %v", err)
+			}
+			if creds != (hpcCredentials{}) {
+				t.Fatal("foreign credentials escaped enrollment")
+			}
+			store := nodeidentity.New(filepath.Join(layout.NodeDir, "identity"))
+			for _, path := range []string{hpcDeviceConfigPath(layout.NodeDir), store.LeafPath(), store.CAChainPath()} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatal("foreign approval left credentials or certificates on disk")
+				}
+			}
+			if cleanupStatus != http.StatusOK && !strings.Contains(err.Error(), "remove it in the console") {
+				t.Fatal("cleanup failure lost operator recovery instruction")
+			}
+		})
+	}
+}
+
+func TestHPCWorkSignalDoesNotMaskEnrollmentFailure(t *testing.T) {
+	for _, enrollErr := range []error{errors.New("issued credential deregistration failed; remove it in the console"), errors.New("ordinary token enrollment failed"), hpc.ErrApprovalInterrupted} {
+		t.Run(enrollErr.Error(), func(t *testing.T) {
+			term := make(chan os.Signal, 1)
+			term <- os.Interrupt
+			creds, interrupted, err := enrollHPCWorkWithSignals(context.Background(), term, nil, func(ctx context.Context) (hpcCredentials, error) {
+				select {
+				case <-ctx.Done():
+					return hpcCredentials{Token: "synthetic_partial_token"}, enrollErr
+				case <-time.After(time.Second):
+					return hpcCredentials{}, errors.New("signal did not reach enrollment")
+				}
+			})
+			if creds != (hpcCredentials{}) {
+				t.Fatal("failed enrollment returned partial credentials")
+			}
+			if enrollErr == hpc.ErrApprovalInterrupted {
+				if !interrupted || err != nil {
+					t.Fatal("explicit pre-issuance interruption did not exit cleanly")
+				}
+			} else if interrupted || err != enrollErr {
+				t.Fatal("signal hid the real enrollment or cleanup failure")
+			}
+		})
 	}
 }

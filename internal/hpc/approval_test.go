@@ -55,7 +55,9 @@ func newApprovalServer(t *testing.T, script ...int) *approvalServer {
 				w.WriteHeader(202)
 				_, _ = w.Write([]byte(`{"status":"pending"}`))
 			case 200:
-				_ = json.NewEncoder(w).Encode(goodEnrollResponse("http://" + r.Host))
+				response := goodEnrollResponse("http://" + r.Host)
+				response["org_id"] = testOrgID
+				_ = json.NewEncoder(w).Encode(response)
 			case 403:
 				w.WriteHeader(403)
 				_, _ = w.Write([]byte(`{"status":"denied","echo":"` + testPollSecret + `"}`))
@@ -238,5 +240,16 @@ func TestEnrollByApprovalDoesNotFollowRedirects(t *testing.T) {
 	_, err := Client{HTTP: NewHTTPClient()}.EnrollByApproval(context.Background(), srv.URL, "csr", testLabels(), opts(io.Discard, &waitRecorder{}))
 	if err == nil || hits.Load() != 0 {
 		t.Fatalf("redirect followed or accepted: %v hits %d", err, hits.Load())
+	}
+}
+
+func TestEnrollByApprovalCanonicalizesRequestedOrg(t *testing.T) {
+	srv := newApprovalServer(t, 200)
+	o := opts(io.Discard, &waitRecorder{})
+	o.OrgID = strings.ToUpper(testOrgID)
+	o.Timeout = 0
+	resp, err := (Client{}).EnrollByApproval(context.Background(), srv.URL, "csr", testLabels(), o)
+	if err != nil || resp.OrgID != testOrgID || srv.createdB["org_id"] != testOrgID {
+		t.Fatalf("canonical request/default timeout failed: %v", err)
 	}
 }

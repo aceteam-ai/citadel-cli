@@ -376,6 +376,24 @@ type hpcWorkOptions struct {
 	Ready func(creds hpcCredentials)
 }
 
+// enrollHPCWorkWithSignals keeps the clean-interruption decision adjacent to
+// the enrollment result so a stop cannot hide a post-issuance cleanup failure.
+func enrollHPCWorkWithSignals(ctx context.Context, term, drain chan os.Signal, enroll func(context.Context) (hpcCredentials, error)) (hpcCredentials, bool, error) {
+	var creds hpcCredentials
+	err := hpc.WithEnrollmentSignals(ctx, term, drain, func(enrollCtx context.Context) error {
+		var enrollErr error
+		creds, enrollErr = enroll(enrollCtx)
+		return enrollErr
+	})
+	if errors.Is(err, hpc.ErrApprovalInterrupted) {
+		return hpcCredentials{}, true, nil
+	}
+	if err != nil {
+		return hpcCredentials{}, false, err
+	}
+	return creds, false, nil
+}
+
 // runHPCWorkProcess wires the production edges and runs the worker. Every
 // return path after a successful enrollment deregisters the node.
 func runHPCWorkProcess(parent context.Context, layout hpc.Layout, opts hpcWorkOptions) error {
@@ -404,39 +422,15 @@ func runHPCWorkProcess(parent context.Context, layout hpc.Layout, opts hpcWorkOp
 
 	creds, err := readHPCCredentials(layout.NodeDir)
 	if err != nil && opts.Enroll != nil {
-		// A stop signal during an approval wait cancels it: nothing has been
-		// issued, so there is nothing to deregister and the exit is clean.
-		var gotTerm, gotDrain os.Signal
-		enrollCtx, enrollCancel := context.WithCancel(ctx)
-		stopped := make(chan struct{})
-		watcherDone := make(chan struct{})
-		go func() {
-			defer close(watcherDone)
-			select {
-			case gotTerm = <-termSigs:
-				enrollCancel()
-			case gotDrain = <-drainSigs:
-				enrollCancel()
-			case <-stopped:
-			}
-		}()
-		creds, err = enrollHPCNode(enrollCtx, layout, *opts.Enroll)
-		close(stopped)
-		<-watcherDone
-		enrollCancel()
-		if gotTerm != nil || gotDrain != nil {
-			if err == nil {
-				// Enrolled just as the signal landed: hand it back so the
-				// shutdown path below sees it.
-				if gotTerm != nil {
-					termSigs <- gotTerm
-				} else {
-					drainSigs <- gotDrain
-				}
-			} else {
-				fmt.Println("   - Stopped while waiting for enrollment approval; nothing to deregister")
-				return nil
-			}
+		// Preserve any post-issuance or token-path error, even when a signal
+		// races it. Only the explicit pre-issuance interruption is a clean exit.
+		var interrupted bool
+		creds, interrupted, err = enrollHPCWorkWithSignals(ctx, termSigs, drainSigs, func(enrollCtx context.Context) (hpcCredentials, error) {
+			return enrollHPCNode(enrollCtx, layout, *opts.Enroll)
+		})
+		if interrupted {
+			fmt.Println("   - Stopped while waiting for enrollment approval; nothing to deregister")
+			return nil
 		}
 		if err == nil {
 			fmt.Printf("   - Enrolled node %s\n", creds.NodeID)
