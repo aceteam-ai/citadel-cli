@@ -85,6 +85,10 @@ type LaunchOptions struct {
 	// Quiet turns off the browser's own background networking and component
 	// updates, so a session only makes the connections its pages need.
 	Quiet bool
+	// Detach asks for the browser and Xvfb to run in their own systemd scopes so
+	// they outlive a service restart. Only the node-wide manager of the managed
+	// worker sets it; everything else launches directly.
+	Detach bool
 }
 
 // devToolsActivePortFile is where a browser launched with
@@ -137,21 +141,46 @@ func waitForDevToolsActivePort(profileDir string, timeout time.Duration, exited 
 // verifyCDPBrowserID checks the endpoint on port is the browser whose id was
 // read from its own profile dir.
 func verifyCDPBrowserID(port int, browserID string) error {
-	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if browserID == "" {
+		return errCDPImpostor
+	}
+	got, err := fetchCDPBrowserID(port)
 	if err != nil {
 		return err
+	}
+	if got != browserID {
+		return errCDPImpostor
+	}
+	return nil
+}
+
+// fetchCDPBrowserID reads the browser id the loopback endpoint on port reports
+// (bounded client, no redirects).
+func fetchCDPBrowserID(port int) (string, error) {
+	// The id is identity evidence: never follow a redirect to another origin.
+	client := *cdpHTTPClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return "", fmt.Errorf("endpoint answered %s", resp.Status)
 	}
 	defer resp.Body.Close()
 	var v struct {
 		WS string `json:"webSocketDebuggerUrl"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v); err != nil {
-		return err
+		return "", err
 	}
-	if !strings.HasSuffix(v.WS, "/devtools/browser/"+browserID) {
-		return errCDPImpostor
+	const marker = "/devtools/browser/"
+	i := strings.LastIndex(v.WS, marker)
+	if i < 0 || i+len(marker) == len(v.WS) {
+		return "", errors.New("endpoint reports no browser id")
 	}
-	return nil
+	return v.WS[i+len(marker):], nil
 }
 
 // activeBrowserRunner is the runner for this OS. A package var so tests can
@@ -228,6 +257,27 @@ func (xvfbRunner) SweepOrphans(baseDir string) { sweepXvfbSessions(baseDir) }
 // Mirrors MeetingBrowser.Start's teardown-on-partial-failure, but the profile is
 // throwaway so a failed launch removal is handled by the caller.
 func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
+	if !lo.Detach {
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
+	plan, reason := planCobrowseScope()
+	if plan == nil {
+		logScopeFailOpen(reason)
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
+	proc, err := launchXvfbAttempt(profileDir, startURL, lo, plan)
+	if err != nil {
+		// Fail open like tmux: a scope the manager refuses must not cost the
+		// session. Retry once as a direct child (it then dies with a restart).
+		scopeBroken.Store(true)
+		logScopeFailOpen("scoped launch failed: " + err.Error())
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
+	return proc, nil
+}
+
+// launchXvfbAttempt starts one session, in transient scopes when plan is set.
+func launchXvfbAttempt(profileDir, startURL string, lo LaunchOptions, plan *scopePlan) (*cobrowseProc, error) {
 	chrome, err := findChromium()
 	if err != nil {
 		return nil, err
@@ -238,9 +288,20 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 		return nil, err
 	}
 
+	sessionID := filepath.Base(profileDir)
+	if plan != nil && !sessionIDPattern.MatchString(sessionID) {
+		plan = nil
+	}
+	var xvfbUnit, browserUnit string
+	var wrapXvfb func([]string) []string
+	if plan != nil {
+		xvfbUnit, browserUnit = plan.unit(sessionID, "xvfb"), plan.unit(sessionID, "browser")
+		wrapXvfb = func(a []string) []string { return plan.wrap(xvfbUnit, a) }
+	}
+
 	// startManagedXvfb serializes display allocation internally, so concurrent
 	// launches never collide on one virtual display.
-	xvfb, display, err := startManagedXvfb(xvfbResolution())
+	xvfb, display, err := startManagedXvfbWrapped(xvfbResolution(), wrapXvfb)
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +319,11 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 		quiet:       lo.Quiet,
 	})
 
-	cmd := exec.Command(chrome, args...)
+	argv := append([]string{chrome}, args...)
+	if plan != nil {
+		argv = plan.wrap(browserUnit, argv)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = withDisplay(os.Environ(), display)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -289,9 +354,29 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 		browserPID: pidOf(cmd),
 		xvfbPID:    pidOf(xvfb),
 		exited:     exited,
-		stop: func() error {
-			return stopBrowserProc(cmd, exited, xvfb, xvfbExited)
-		},
+	}
+	var bStart, xStart uint64
+	if plan != nil {
+		proc.browserScope, proc.xvfbScope, proc.scopeUser = browserUnit, xvfbUnit, plan.user
+		bStart, _, _ = procIdentity(proc.browserPID)
+		xStart, _, _ = procIdentity(proc.xvfbPID)
+	}
+	proc.stop = func() error {
+		// Browser scope first, then Xvfb, each only while the recorded process
+		// still lives in it; the handle kill below is the backstop.
+		var serr error
+		if plan != nil {
+			if err := stopScope(plan.user, browserUnit, proc.browserPID, bStart); err != nil {
+				serr = err
+			}
+			if err := stopScope(plan.user, xvfbUnit, proc.xvfbPID, xStart); err != nil && serr == nil {
+				serr = err
+			}
+		}
+		if err := stopBrowserProc(cmd, exited, xvfb, xvfbExited); err != nil {
+			return err
+		}
+		return serr
 	}
 
 	if err := waitForCDPReady(debugPort, 20*time.Second); err != nil {

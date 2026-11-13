@@ -130,6 +130,19 @@ one-time launch file (`writeLaunchFile`), never on a command line.
 `TestGuardsReturn403`, `TestCookieOnlyFromSingleUseCode` and
 `TestOpenKeepsTheCodeOffTheCommandLine` pin the boundary.
 
+`cmd.runLocalSetup` owns the first-run setup page (`citadel local setup`, and a
+Windows double-click: `cmd.runRootCitadel` calls `launchedFromExplorer`, which is
+`platform.ConsoleProcessCount` == 1; `runBareCitadel` stays enrollment-only). It
+is a `localviewer.Server` with `Config.Setup` set, so it keeps the same guard,
+cookie, bearer and single-use `/open` code, but in its own `SetupDirName` private
+dir so it never replaces a running owner's token file. Connect is
+`cmd.setupConnect` over `mergeHarnessConfig`; the click consents only to adding
+the entry (a different existing `citadel` entry is declined and left to
+`local config --write`), and the request must name the file the page showed.
+Sessions come from the owner through the token-authenticated `/api/summary`.
+`TestSetupRoutesAreGuarded` pins the boundary. Muse has no confirmed local
+config file, so it is not a harness; the page offers the generic entry.
+
 `localaudit.Log` owns the local co-browse audit chain under
 `<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
 month. `cmd.localStateDir` owns where local mode keeps its owner lock, audit
@@ -4389,6 +4402,65 @@ control-center worker has no periodic updater; its shared remote-update
 handler keeps the permanent drain. External-engine `MODULE_SET` also owns a
 separate `BeginDrain()` scope: its failed re-exec path releases only that
 scope after rollback, rather than clearing a concurrent permanent drain.
+
+**Co-browse sessions across a self-update restart (citadel-cli#1546).**
+`update.AutoUpdaterConfig.Busy` (wired to `platform.CobrowseBusy`) defers the
+cycle while a session has a viewer attached or a handoff outstanding, checked
+before download and again before the swap; `AutoUpdater.deferForBusy` owns the
+`deferred_busy` result and the bound (`update.ResolveMaxDefer`, env
+`CITADEL_UPDATE_MAX_DEFER_SECONDS`, 0 never forces). Every in-process exec goes
+through `update.RestartProcess`, which runs the hook `cmd` registers
+(`platform.PrepareSelfRestart`). `platform.recoverSessions` owns re-adoption:
+each session has a registry record (state live/suspended/expired, generation
+counter) in a registry dir that `platform.SetRegistryDirResolver` points at the
+node config dir (the single place the location is chosen; the profile and session
+dirs stay in the temp base). A restart re-adopts a live record under the same id
+only if owner, browser and Xvfb start times, role, CDP identity and dir all
+verify, BEFORE the orphan sweep (which treats a dir owned by our own PID as
+stale). A live record that fails becomes `expired` with its `ended_reason`, never
+a silent delete; suspended records are never touched. Adoption is Linux only
+(`adoptionSupported`); elsewhere it stops sessions cleanly.
+Only the node-wide manager adopts, and only a record whose owner is this very
+process (same PID and start time, as after exec) or, for a full service restart,
+one that passes `platform.verifyDetachedOwner`; local mode and a live sibling's
+records are never adopted or modified. Persistent-profile sessions are sealed and
+stopped by `prepareSelfRestart` on every OS, and ended reasons are recorded on
+every OS.
+
+**Surviving a full service restart (Linux, citadel-cli#1546 item 2).**
+`platform.planCobrowseScope` owns the detach decision and mirrors
+`tmux.PersistentSessionCommand` (#1166): `launchXvfbCobrowseProc` starts each
+session's Xvfb and browser in their own uniquely named transient scope
+(user manager for a user unit, system manager only for a root system unit), so
+the default control-group kill leaves them running. Every other context, or a
+scoped launch that fails, retries as a direct child and logs once; that session
+then dies with a restart as before. The scope names ride in the registry record.
+`verifyDetachedOwner` owns the extra rule for a record whose owner is gone: the
+process is the managed worker (`platform.EnableDetachedCobrowse`, called by
+`runWork`, requires a service manager's `INVOCATION_ID`), the record is from the
+same OS user, the browser and Xvfb are alive in the recorded scopes, and the
+usual start-time, role and CDP checks pass. Any other process, including local
+mode, sweeps such a record instead. `stopScope` is the only way scopes are
+stopped (stop, failed adoption, sweep) and acts only while the recorded PID
+still has its recorded start time and cgroup. `ShutdownSessions` leaves scoped,
+non-persistent sessions running on the worker's shutdown signal; a permanent
+`systemctl stop` therefore leaves them until the next worker start re-adopts or
+sweeps them. Windows is unchanged: its kill-on-close Job Object ends sessions on
+any restart, and a breakaway job is a tracked follow-up.
+
+Detach rules added after review: `platform.StartManagedCobrowse` is the one
+startup call (enable the managed-worker mark, THEN recover); only a
+resolver-backed node manager of the marked worker sets `LaunchOptions.Detach`,
+so local mode and `citadel mcp` always launch directly. A non-worker `Recover`
+leaves a live scoped record and its dir alone. Scope names are validated
+(`validScopeName`, unit is the leaf cgroup component, `--` before the unit)
+before any `systemctl` call. A scoped session outlives a permanent `systemctl
+stop` for at most `CITADEL_COBROWSE_DETACH_GRACE_SECONDS` (default 900, measured
+from the record's last write); after that it is refused and swept, and status
+carries that window as the ended detail. The first failed scoped launch makes
+later launches direct for the process. `INVOCATION_ID` can be inherited by
+desktop terminals, so an interactive `citadel work` started from one is treated
+as the managed worker and detaches its sessions.
 
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
 stub on `!linux`) is the authority for "is a managed citadel service running

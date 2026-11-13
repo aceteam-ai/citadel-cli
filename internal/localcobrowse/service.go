@@ -299,6 +299,7 @@ type StartResult struct {
 	State     string `json:"state"`
 	Driver    string `json:"driver"`
 	URL       string `json:"url,omitempty"`
+	Title     string `json:"title,omitempty"`
 	Browser   string `json:"browser,omitempty"`
 	Lifetime  string `json:"lifetime"`
 	Writes    string `json:"writes"`
@@ -353,10 +354,14 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 	s.sessions[st.ID] = ss
 	s.notifyLocked()
 	s.mu.Unlock()
+	title := platform.SanitizeCobrowseTitle(st.Title)
 	// A start URL can redirect. Check where the browser landed before any
 	// read can see it.
 	if startURL != "about:blank" {
 		res := s.settle(ctx, st.ID, "")
+		if res.Title != "" {
+			title = res.Title
+		}
 		landed := res.URL
 		if landed == "" {
 			landed = s.currentURL(st.ID)
@@ -377,6 +382,7 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 		State:     string(st.State),
 		Driver:    string(st.Driver),
 		URL:       st.URL,
+		Title:     title,
 		Browser:   st.Browser,
 		Lifetime:  LifetimePolicy,
 		Writes:    "navigate, click, type, select, key and scroll need the user's approval in the Citadel viewer",
@@ -543,6 +549,7 @@ type ActionResult struct {
 	Settled    bool   `json:"settled"`
 	Navigated  bool   `json:"navigated"`
 	URL        string `json:"url,omitempty"`
+	Title      string `json:"title,omitempty"`
 	Value      string `json:"value,omitempty"`
 	Label      string `json:"label,omitempty"`
 }
@@ -562,6 +569,7 @@ func (s *Service) settle(ctx context.Context, id, before string) ActionResult {
 	for {
 		if ps, err := s.cfg.Browser.PageState(id); err == nil {
 			res.URL = ps.URL
+			res.Title = platform.SanitizeCobrowseTitle(ps.Title)
 			if before != "" && ps.URL != before {
 				res.Navigated = true
 			}

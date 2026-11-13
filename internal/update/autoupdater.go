@@ -20,6 +20,9 @@ package update
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -80,6 +83,17 @@ type AutoUpdaterConfig struct {
 	// Its release function must undo only this attempt's pause. The updater
 	// releases it on every abort and retains it through a successful restart.
 	BeginDrain func() (release func())
+
+	// Busy reports work a restart must not interrupt that ActiveJobs cannot
+	// see, such as a live co-browse session with a human involved. While it
+	// reports busy the updater skips the cycle (recorded as deferred_busy),
+	// before downloading and again just before the swap. Nil means never busy.
+	Busy func() (busy bool, reason string)
+
+	// MaxDefer bounds how long one target version may be deferred, counted
+	// from its first deferral. After it the update proceeds anyway. Zero never
+	// forces. Use ResolveMaxDefer for the production value.
+	MaxDefer time.Duration
 
 	// IdlePollInterval is how often to re-check ActiveJobs while waiting for
 	// the node to drain. Zero uses a sensible default (2s).
@@ -147,6 +161,59 @@ type AutoUpdaterConfig struct {
 type AutoUpdater struct {
 	cfg              AutoUpdaterConfig
 	lastApplyRefusal *SelfUpdateCapability
+	deferFirst       time.Time // first deferral of the current busy streak; zero when not busy
+	deferLogAt       time.Time
+	deferLogReason   string
+}
+
+// EnvMaxDefer overrides the maximum busy deferral, in seconds. 0 never forces.
+const EnvMaxDefer = "CITADEL_UPDATE_MAX_DEFER_SECONDS"
+
+// DefaultMaxDefer is the busy deferral bound when EnvMaxDefer is unset or invalid.
+const DefaultMaxDefer = 12 * time.Hour
+
+// ResolveMaxDefer reads EnvMaxDefer.
+func ResolveMaxDefer() time.Duration {
+	v := strings.TrimSpace(os.Getenv(EnvMaxDefer))
+	if v == "" {
+		return DefaultMaxDefer
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return DefaultMaxDefer
+	}
+	return time.Duration(n) * time.Second
+}
+
+// deferForBusy reports whether this cycle must be skipped because the node is
+// busy. It records deferred_busy and rate-limits its log line. Once MaxDefer has
+// passed since the first deferral for tag, it logs and lets the update proceed.
+func (a *AutoUpdater) deferForBusy(tag string) bool {
+	if a.cfg.Busy == nil {
+		return false
+	}
+	busy, reason := a.cfg.Busy()
+	if !busy {
+		a.deferFirst = time.Time{}
+		return false
+	}
+	now := a.cfg.Now()
+	// One clock for the whole busy streak, not per release: a new tag must not
+	// restart the bound, or an abandoned handoff could defer updates forever.
+	if a.deferFirst.IsZero() {
+		a.deferFirst = now
+	}
+	first := a.deferFirst
+	if a.cfg.MaxDefer > 0 && now.Sub(first) >= a.cfg.MaxDefer {
+		a.cfg.Log("auto-update: deferred %s for %s (%s); proceeding anyway", tag, a.cfg.MaxDefer, reason)
+		return false
+	}
+	if reason != a.deferLogReason || now.Sub(a.deferLogAt) >= time.Hour {
+		a.cfg.Log("auto-update: deferring update: %s", reason)
+		a.deferLogAt, a.deferLogReason = now, reason
+	}
+	a.record(ResultDeferredBusy, true, tag)
+	return true
 }
 
 // ClampInterval applies the updater's interval rules — zero/negative uses
@@ -358,6 +425,10 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 		return false
 	}
 
+	if a.deferForBusy(release.TagName) {
+		return false
+	}
+
 	a.cfg.Log("auto-update: new version available: %s, downloading...", release.TagName)
 	attempt, err := a.cfg.NewAttempt()
 	if err != nil {
@@ -400,6 +471,11 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	}
 	if ctx.Err() != nil {
 		a.cfg.Log("auto-update: context cancelled before apply")
+		return false
+	}
+	// A session may have gained a human while jobs drained. Re-check right
+	// before the swap; the drain is released by the deferred func above.
+	if a.deferForBusy(release.TagName) {
 		return false
 	}
 

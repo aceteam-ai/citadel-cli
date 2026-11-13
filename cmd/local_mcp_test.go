@@ -23,6 +23,9 @@ type cmdFakeBrowser struct {
 	n      int
 	human  map[string]bool
 	live   map[string]bool
+	// landing and title, when set, are what PageState reports (a redirect
+	// and a page title).
+	landing, title string
 }
 
 func newCmdFakeBrowser() *cmdFakeBrowser {
@@ -108,7 +111,11 @@ func (f *cmdFakeBrowser) Screenshot(id string) (string, error) {
 	return "iVBORw0KGgoAAAANSUhEUg==", f.gate(id)
 }
 func (f *cmdFakeBrowser) PageState(id string) (platform.PageState, error) {
-	return platform.PageState{URL: "http://fixture.test/", ReadyState: "complete"}, f.gate(id)
+	u := "http://fixture.test/"
+	if f.landing != "" {
+		u = f.landing
+	}
+	return platform.PageState{URL: u, ReadyState: "complete", Title: f.title}, f.gate(id)
 }
 func (f *cmdFakeBrowser) Handoff(id string) (platform.CobrowseSessionStatus, error) {
 	f.mu.Lock()

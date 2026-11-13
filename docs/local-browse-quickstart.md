@@ -49,6 +49,30 @@ iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/install.
 info**, then **Run anyway**. If your antivirus quarantines the file, restore it
 and allow it; signed releases are planned.
 
+## Fastest path: double-click
+
+Double-click `citadel.exe` (or run `citadel.exe local setup` in any terminal, on
+any OS). Your default browser opens a setup page served from your own
+computer, behind a one-time link:
+
+1. It shows the same checks as `local doctor`, in plain language. **Run the
+   full check** also starts a hidden test browser.
+2. It lists the agent apps it finds. Press **Connect** beside one. That click is
+   your permission to add Citadel to the settings file shown next to the
+   button; your other settings are kept and a backup is saved beside the file.
+   The page then tells you what to do next, for example "restart Claude Desktop,
+   then ask it to browse a site". An app that is not installed says "not
+   found". For any other app, including Muse, copy the generic MCP entry at the
+   bottom of the page into that app's MCP settings.
+3. It lists your live browser sessions and the session limit (read-only), and
+   **Open the viewer** opens the hand-off viewer.
+
+The page also opens for any launch that gives `citadel.exe` a console of its
+own, such as `start citadel` or `Start-Process citadel`, not only a double-click.
+
+Keep the console window open while you use the page; closing it stops the page.
+The steps below do the same things from a terminal.
+
 ## 2. Check
 
 ```powershell

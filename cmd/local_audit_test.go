@@ -234,3 +234,35 @@ func TestLocalAuditPendingFailureBlocksTheWrite(t *testing.T) {
 		t.Fatal("the write reached the browser without a record")
 	}
 }
+
+// The navigate tool result carries the full final URL and title; the audit
+// log carries neither, only the redacted origin and path hash.
+func TestLocalNavigateResultCarriesFinalURLButAuditDoesNot(t *testing.T) {
+	ownerDir := t.TempDir()
+	fb := newCmdFakeBrowser()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: fb, policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+	_ = rt.svc.Approve("cb-1", 0)
+	fb.landing = "https://fixture.test/account/redirected?session=r3direct-secret"
+	fb.title = "Account " + auditSentinel
+	resp := runLocalBridge(t, rt, nil, call(2, "local_cobrowse_navigate", map[string]any{"session_id": "cb-1", "url": "https://fixture.test/go"}))
+	content, isErr := toolResult(t, resp["2"])
+	if isErr {
+		t.Fatalf("navigate: %v", resp["2"])
+	}
+	text := firstText(content)
+	if !strings.Contains(text, "r3direct-secret") || !strings.Contains(text, "Account") {
+		t.Fatalf("tool result should carry the final url and title: %s", text)
+	}
+	dir := filepath.Join(ownerDir, localaudit.DirName)
+	files, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	for _, f := range files {
+		b, _ := os.ReadFile(f)
+		for _, secret := range []string{"r3direct-secret", "/account", "/go", auditSentinel} {
+			if bytes.Contains(b, []byte(secret)) {
+				t.Fatalf("%q leaked into %s", secret, f)
+			}
+		}
+	}
+}

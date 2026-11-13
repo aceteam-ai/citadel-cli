@@ -534,6 +534,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, warning)
 	}
 
+	// Re-adopt co-browse sessions that survived a restart by exec (citadel-cli#1546)
+	// before anything can sweep them; sessions that fail verification are reaped.
+	// StartManagedCobrowse marks this process as the managed worker first, because
+	// recovery decides on that mark whether to re-adopt a dead owner's sessions.
+	platform.StartManagedCobrowse()
+
 	// Setup signal handling. The first signal cancels the root context so every
 	// subsystem (worker runner, status/terminal/gateway servers, heartbeat,
 	// auto-updater, usage syncer) observes cancellation and unwinds. As a
@@ -555,7 +561,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Tear down every interactive browser session (issue #793) so no session
 		// Chromium or virtual display orphans across a worker restart. No-op when
 		// no session was ever started.
-		if err := platform.GetCobrowseSessionManager().StopAll(); err != nil {
+		if err := platform.GetCobrowseSessionManager().ShutdownSessions(); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: browser session stop: %v\n", err)
 		}
 		// Cancel first so the async service-startup goroutine stops launching any

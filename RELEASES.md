@@ -3651,3 +3651,113 @@ Auto-generated log of every release.
   - fix(local): accept a UTF-8 BOM in agent config files for local config --write (#1611)
 
 
+---
+
+## v2.218.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 19 |
+| Lines added | +1618 |
+
+**Changes:**
+
+  - fix(cobrowse): survive self-update restart; defer while a human is involved (#1546) (#1614)
+
+
+---
+
+## v2.219.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 16 |
+| Lines added | +1333 |
+
+**Changes:**
+
+  - feat(local): guided setup page and Windows double-click launch (#1615 slice 1) (#1618)
+
+
+---
+
+## v2.220.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 8 |
+| Lines added | +532 |
+
+**Changes:**
+
+  - Merge remote-tracking branch 'origin/main'
+  - fix(cobrowse): navigate waits to settle and returns the final URL and title (#1613) (#1619)
+  - fix(cobrowse): wait for selector click target to settle (#1552)
+
+
+---
+
+## v2.221.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +1245 |
+
+**Changes:**
+
+  - fix(worker): keep model reasoning separate from answers (#1503)
+  - fix(cobrowse): sessions survive a full service restart on Linux (#1546) (#1621)
+
+
+---
+
+## v2.222.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 4 |
+| Lines added | +181 |
+
+**Changes:**
+
+  - fix(cobrowse): adopt a browser that moved itself into its own app scope (#1546, #1621) (#1623)
+  - test(worker): wait for observed deadline before releasing meeting handler (#1624)
+
+
+---
+
+## v2.223.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +210 |
+
+**Changes:**
+
+  - fix(cobrowse): adopt by recorded CDP browser id (#1546) (#1625)
+
+
+---
+
+## v2.224.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 6 |
+| Lines added | +386 |
+
+**Changes:**
+
+  - ci: Linux co-browse real-browser job (#1626)
+  - fix(cobrowse): start with a launch URL reports the settled URL and title (#1613) (#1627)
+
+

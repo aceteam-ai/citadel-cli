@@ -81,18 +81,23 @@ const (
 
 // CobrowseSessionStatus is the queryable state of one session.
 type CobrowseSessionStatus struct {
-	ID        string               `json:"id"`
-	State     CobrowseSessionState `json:"state"`
-	URL       string               `json:"url,omitempty"`
-	DebugPort int                  `json:"debug_port,omitempty"`
-	Profile   string               `json:"profile,omitempty"`
-	Display   string               `json:"display,omitempty"`
-	StartedAt string               `json:"started_at,omitempty"`
+	ID    string               `json:"id"`
+	State CobrowseSessionState `json:"state"`
+	URL   string               `json:"url,omitempty"`
+	// Title is the page title after a navigate (bounded, control characters
+	// stripped); empty for every other status.
+	Title     string `json:"title,omitempty"`
+	DebugPort int    `json:"debug_port,omitempty"`
+	Profile   string `json:"profile,omitempty"`
+	Display   string `json:"display,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
 	// Driver reports human only after explicit handoff. An attached viewer
 	// without handoff observes while the agent continues to act.
 	Driver CobrowseDriver `json:"driver,omitempty"`
 	// Browser is the launched browser's kind ("chrome", "edge", "chromium").
 	Browser string `json:"browser,omitempty"`
+	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
+	Generation uint64 `json:"generation,omitempty"`
 }
 
 // cobrowseProc is the running-process bundle for one session: the browser and its
@@ -101,12 +106,18 @@ type CobrowseSessionStatus struct {
 // the spawn is injectable in tests without launching a real browser.
 type cobrowseProc struct {
 	debugPort int
+	// browserID is the browser's per-launch CDP id, learned once the endpoint is up.
+	browserID string
 	display   string
 	// browser is the launched browser's kind ("chrome", "edge", "chromium"),
 	// reported in status so a user can see which installed browser was used.
 	browser    string
 	browserPID int
 	xvfbPID    int
+	// browserScope and xvfbScope name the transient systemd scopes the processes
+	// run in (empty when launched directly); scopeUser says which manager owns them.
+	browserScope, xvfbScope string
+	scopeUser               bool
 	// exited is closed by the reaper when the browser process terminates, so status
 	// can report SessionExited for a crashed session rather than a bare running=false.
 	exited <-chan struct{}
@@ -139,6 +150,9 @@ type CobrowseSessionManager struct {
 	baseDir     string
 	sweepOnce   sync.Once
 	launchOpts  LaunchOptions
+	// useResolver is set on the process-wide manager only, so its registry
+	// follows registryDirResolver; other managers keep a sibling of baseDir.
+	useResolver bool
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
@@ -180,6 +194,13 @@ type cobrowseSession struct {
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
+	// persistent marks a session launched with an encrypted profile. A
+	// re-adopted one has lost its unlocked key, so teardown cannot re-seal it.
+	persistent bool
+	// regDir is the registry dir holding this session's record.
+	regDir     string
+	generation uint64
+	pendingEnd *EndedSession
 }
 
 var (
@@ -195,6 +216,7 @@ func GetCobrowseSessionManager() *CobrowseSessionManager {
 			defaultCobrowseSessionsBaseDir(),
 			resolveMaxCobrowseSessions(),
 		)
+		cobrowseSessionManager.useResolver = true
 	})
 	return cobrowseSessionManager
 }
@@ -292,6 +314,8 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		startedAt:  time.Now(),
 		state:      SessionLaunching,
 		encProfile: profile,
+		regDir:     m.sessionRegDir(),
+		generation: 1,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -328,11 +352,25 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 			_ = profile.Close()
 		}
 		_ = os.RemoveAll(s.profile)
+		deleteRecord(s.regDir, id)
 		return CobrowseSessionStatus{}, fmt.Errorf("session %s was stopped during launch", id)
 	}
 	m.mu.Unlock()
 
-	return s.status(), nil
+	st := s.status()
+	if startURL != "" && !strings.EqualFold(startURL, "about:blank") {
+		// Wait for the launch URL (including redirects) to settle, then report
+		// where the page ended up, as Navigate does. Best effort: a page that
+		// cannot be read leaves the plain status.
+		if port, perr := s.requireDrivablePort(); perr == nil {
+			ps := settleNavigation(port, "")
+			if ps.URL != "" {
+				st.URL = ps.URL
+			}
+			st.Title = ps.Title
+		}
+	}
+	return st, nil
 }
 
 // launch creates the session's profile dir, spawns the browser via the (injectable)
@@ -364,6 +402,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	m.mu.Lock()
 	lo := m.launchOpts
 	m.mu.Unlock()
+	lo.Detach = m.useResolver && detachedWorker.Load()
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
 		return nil, err
@@ -376,12 +415,16 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
+	s.persistent = enc != nil
 	s.mu.Unlock()
+	// Durable registry record so a restart by exec can re-adopt this session.
+	s.persistRecord()
 	return proc, nil
 }
 
 // SessionStatus returns the queryable state of one session.
 func (m *CobrowseSessionManager) SessionStatus(id string) (CobrowseSessionStatus, bool) {
+	m.Recover()
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	m.mu.Unlock()
@@ -393,6 +436,7 @@ func (m *CobrowseSessionManager) SessionStatus(id string) (CobrowseSessionStatus
 
 // List returns the status of every tracked session.
 func (m *CobrowseSessionManager) List() []CobrowseSessionStatus {
+	m.Recover()
 	m.mu.Lock()
 	all := make([]*cobrowseSession, 0, len(m.sessions))
 	for _, s := range m.sessions {
@@ -475,7 +519,12 @@ func (s *cobrowseSession) teardown() error {
 	profile := s.profile
 	enc := s.encProfile
 	s.encProfile = nil
+	regDir := s.regDir
 	s.mu.Unlock()
+	// A stopped session leaves no registry record: it did not "end" unexpectedly.
+	if regDir != "" {
+		deleteRecord(regDir, s.id)
+	}
 
 	var err error
 	if proc != nil && proc.stop != nil {
@@ -515,10 +564,11 @@ func (s *cobrowseSession) teardown() error {
 func (s *cobrowseSession) status() CobrowseSessionStatus {
 	s.mu.Lock()
 	st := CobrowseSessionStatus{
-		ID:      s.id,
-		State:   s.state,
-		Profile: s.profile,
-		Driver:  driverFor(s.humanDrivingLocked()),
+		ID:         s.id,
+		State:      s.state,
+		Profile:    s.profile,
+		Driver:     driverFor(s.humanDrivingLocked()),
+		Generation: s.generation,
 	}
 	if !s.startedAt.IsZero() {
 		st.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
@@ -721,7 +771,12 @@ func ensureCobrowseBaseDir(dir string) error {
 //  2. processMatchesRole confirms, PID by PID, that the specific PID we are about to
 //     SIGKILL is STILL the browser/Xvfb it was recorded as, via /proc/<pid>/cmdline.
 //     A PID that fails this check is never killed -- only the stale dir is cleaned up.
-func (m *CobrowseSessionManager) sweep() { activeBrowserRunner.SweepOrphans(m.baseDir) }
+func (m *CobrowseSessionManager) sweep() {
+	// Re-adopt sessions that survived a restart BEFORE the sweep, which would
+	// otherwise reap them as orphans (citadel-cli#1546).
+	m.recoverSessions()
+	activeBrowserRunner.SweepOrphans(m.baseDir)
+}
 
 // sweepXvfbSessions is the Linux runner's orphan sweep; see sweep above.
 func sweepXvfbSessions(baseDir string) {
@@ -738,6 +793,9 @@ func sweepXvfbSessions(baseDir string) {
 			continue
 		}
 		dir := filepath.Join(baseDir, e.Name())
+		if _, keep := sweepProtected.Load(dir); keep {
+			continue // re-adopted by this process
+		}
 		ownerPID, browserPID, xvfbPID := readSessionPidfile(dir)
 		// Skip a dir whose owning process is still alive: it is not an orphan, and its
 		// browser belongs to a live sibling worker.
