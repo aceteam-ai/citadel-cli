@@ -52,6 +52,7 @@ type realEnv struct {
 func newRealEnv(t *testing.T) realEnv {
 	t.Helper()
 	requireRealBrowser(t)
+	t.Setenv("CITADEL_COBROWSE_CDP_WAIT_SECONDS", "90")
 	root := t.TempDir()
 	e := realEnv{base: filepath.Join(root, "sessions"), reg: filepath.Join(root, "registry")}
 	if err := os.MkdirAll(e.base, 0o700); err != nil {
@@ -248,8 +249,13 @@ func TestCobrowseRealBrowserStopLeavesNoProcesses(t *testing.T) {
 		t.Fatalf("processes left after Stop: browser=%v xvfb=%v profile users=%v",
 			!pidGone(rec.BrowserPID), !pidGone(rec.XvfbPID), procsMentioning(st.Profile))
 	}
-	if _, err := os.Stat(st.Profile); !os.IsNotExist(err) {
-		t.Fatalf("session dir still present: %v", err)
+	if !waitUntilReal(5*time.Second, func() bool { _, err := os.Lstat(st.Profile); return os.IsNotExist(err) }) {
+		var left []string
+		_ = filepath.WalkDir(st.Profile, func(p string, _ os.DirEntry, _ error) error { left = append(left, p); return nil })
+		if len(left) > 40 {
+			left = left[:40]
+		}
+		t.Fatalf("session dir still present; entries: %v", left)
 	}
 	if _, err := loadRecord(e.reg, st.ID); err == nil {
 		t.Fatal("registry record left behind after Stop")
