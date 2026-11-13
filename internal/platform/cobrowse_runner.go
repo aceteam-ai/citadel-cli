@@ -379,7 +379,7 @@ func launchXvfbAttempt(profileDir, startURL string, lo LaunchOptions, plan *scop
 		return serr
 	}
 
-	if err := waitForCDPReady(debugPort, 20*time.Second); err != nil {
+	if err := waitForCDPReady(debugPort, cobrowseCDPReadyTimeout()); err != nil {
 		// Best-effort teardown so a browser that launched but never exposed CDP does
 		// not leak a process or display.
 		_ = proc.stop()
@@ -429,4 +429,14 @@ func removeAllRetry(dir string, attempts int, delay time.Duration) error {
 		time.Sleep(delay)
 	}
 	return err
+}
+
+// cobrowseCDPReadyTimeout is the CDP-ready wait. The default is 20s; the
+// real-browser CI tests raise it through CITADEL_COBROWSE_CDP_WAIT_SECONDS
+// because shared runners start Chrome slowly.
+func cobrowseCDPReadyTimeout() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("CITADEL_COBROWSE_CDP_WAIT_SECONDS")); err == nil && v > 0 && v <= 300 {
+		return time.Duration(v) * time.Second
+	}
+	return 20 * time.Second
 }
