@@ -56,6 +56,13 @@ type localMCPTool struct {
 	Description string
 	InputSchema map[string]any
 	Call        func(ctx context.Context, args json.RawMessage) (string, error)
+	// CallContent, when set, is used instead of Call and returns MCP content
+	// blocks directly (an image block for a screenshot, aceteam#13503 S3).
+	CallContent func(ctx context.Context, args json.RawMessage) ([]map[string]any, error)
+	// Async answers the call from its own goroutine so a long-running call does
+	// not block the JSON-RPC loop. An async tool must never use captureStdout,
+	// which assumes one redirection at a time.
+	Async bool
 }
 
 // localMCPDeps are the real collaborators newLocalMCPTools wires its tools to.
@@ -107,6 +114,10 @@ type localMCPDeps struct {
 	// disagrees with those about the persisted value. Tests inject a func
 	// returning a tempdir.
 	egressRelayConfigDir func() string
+
+	// cobrowse backs the local_cobrowse_* tools (aceteam#13503 S3). Nil yields
+	// tools that report co-browse is unavailable.
+	cobrowse *localCobrowseRuntime
 }
 
 // moduleControlFn is the shape of the actual stop/start/restart action. See
@@ -135,6 +146,7 @@ func newLocalMCPTools(deps localMCPDeps) []localMCPTool {
 	tools = append(tools, newLocalFileTools(deps.workspaceDir)...)
 	tools = append(tools, newModelExclusivityTools(deps)...)
 	tools = append(tools, newEgressRelayTools(deps)...)
+	tools = append(tools, newLocalCobrowseTools(deps.cobrowse)...)
 	return tools
 }
 

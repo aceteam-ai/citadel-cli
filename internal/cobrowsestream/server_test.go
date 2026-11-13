@@ -14,11 +14,13 @@ import (
 
 // fakeSession is an in-memory Session for handler tests.
 type fakeSession struct {
-	mu         sync.Mutex
-	port       int
-	attachable bool
-	attached   int
-	detached   int
+	mu           sync.Mutex
+	port         int
+	attachable   bool
+	attached     int
+	detached     int
+	humanControl bool
+	inputChecks  int
 }
 
 func (s *fakeSession) AttachTarget(id string) (int, bool) {
@@ -39,6 +41,36 @@ func (s *fakeSession) MarkDetached(id string) bool {
 	defer s.mu.Unlock()
 	s.detached++
 	return true
+}
+
+func (s *fakeSession) ViewerHasControl(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inputChecks++
+	return s.humanControl
+}
+
+func (s *fakeSession) setHumanControl(enabled bool) {
+	s.mu.Lock()
+	s.humanControl = enabled
+	s.mu.Unlock()
+}
+
+func (s *fakeSession) waitInputChecks(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.Lock()
+		checks := s.inputChecks
+		s.mu.Unlock()
+		if checks >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("input gate checked %d times, want %d", checks, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (s *fakeSession) counts() (attached, detached int) {
@@ -162,6 +194,68 @@ func TestViewerReceivesInitThenFrameAndMarksAttached(t *testing.T) {
 	waitDetached(t, sess, 1)
 }
 
+func TestIdleStaticPageGetsFirstFrameWithoutRefresh(t *testing.T) {
+	f := newFakeChrome()
+	f.totalFrames = 0 // CDP sends no screencast event for this static page.
+	f.cssViewportWidth = 400
+	f.cssViewportHeight = 300
+	defer f.close()
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-static")
+	if err != nil {
+		t.Fatalf("dial viewer: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	mt, _, err := conn.ReadMessage()
+	if err != nil || mt != websocket.TextMessage {
+		t.Fatalf("init: type=%d err=%v", mt, err)
+	}
+	mt, frame, err := conn.ReadMessage()
+	if err != nil || mt != websocket.BinaryMessage {
+		t.Fatalf("first frame: type=%d err=%v", mt, err)
+	}
+	if string(frame) != string(f.jpeg) {
+		t.Fatalf("fallback screenshot bytes mismatch")
+	}
+	input, _ := json.Marshal(InputMessage{
+		Type: InputTypeMouse, Event: "mousePressed", X: 0.5, Y: 0.5,
+		Button: "left", ClickCount: 1,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, input); err != nil {
+		t.Fatalf("send observing input: %v", err)
+	}
+	sess.waitInputChecks(t, 1)
+	f.mu.Lock()
+	observedMouse := len(f.mouse)
+	f.mu.Unlock()
+	if observedMouse != 0 {
+		t.Fatalf("observing viewer sent %d mouse events to CDP", observedMouse)
+	}
+
+	sess.setHumanControl(true)
+	if err := conn.WriteMessage(websocket.TextMessage, input); err != nil {
+		t.Fatalf("send fallback input after handoff: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		f.mu.Lock()
+		mouse := append([]map[string]any(nil), f.mouse...)
+		f.mu.Unlock()
+		if len(mouse) > 0 {
+			if mouse[0]["x"] != 200.0 || mouse[0]["y"] != 150.0 {
+				t.Fatalf("fallback click = (%v, %v), want CSS center (200, 150)", mouse[0]["x"], mouse[0]["y"])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fallback frame did not enable mouse input")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestUnknownSessionRefused: an unattachable session is rejected and never
 // touches attach state.
 func TestUnknownSessionRefused(t *testing.T) {
@@ -245,7 +339,8 @@ func TestSecondViewerRefused(t *testing.T) {
 	}
 }
 
-// TestViewerInputForwardedToCDP: a key input from the viewer reaches CDP.
+// TestViewerInputForwardedToCDP verifies observation is read only, explicit
+// handoff enables input, and resume revokes input without closing the viewer.
 func TestViewerInputForwardedToCDP(t *testing.T) {
 	f := newFakeChrome()
 	defer f.close()
@@ -267,6 +362,18 @@ func TestViewerInputForwardedToCDP(t *testing.T) {
 	if err := conn.WriteMessage(websocket.TextMessage, in); err != nil {
 		t.Fatalf("write input: %v", err)
 	}
+	sess.waitInputChecks(t, 1)
+	f.mu.Lock()
+	observedKeys := len(f.keys)
+	f.mu.Unlock()
+	if observedKeys != 0 {
+		t.Fatalf("observing viewer sent %d keys to CDP", observedKeys)
+	}
+
+	sess.setHumanControl(true)
+	if err := conn.WriteMessage(websocket.TextMessage, in); err != nil {
+		t.Fatalf("write after handoff: %v", err)
+	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -274,12 +381,196 @@ func TestViewerInputForwardedToCDP(t *testing.T) {
 		n := len(f.keys)
 		f.mu.Unlock()
 		if n > 0 {
-			return
+			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("key input never reached CDP")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	sess.setHumanControl(false)
+	if err := conn.WriteMessage(websocket.TextMessage, in); err != nil {
+		t.Fatalf("write after resume: %v", err)
+	}
+	sess.waitInputChecks(t, 3)
+	f.mu.Lock()
+	finalKeys := len(f.keys)
+	f.mu.Unlock()
+	if finalKeys != 1 {
+		t.Fatalf("viewer sent %d keys after resume, want 1 total", finalKeys)
+	}
+}
+
+func TestViewerPasteRequiresCurrentHumanControl(t *testing.T) {
+	f := newFakeChrome()
+	defer f.close()
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-paste")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	sendPaste := func(text string, check int) {
+		t.Helper()
+		data, _ := json.Marshal(InputMessage{Type: "paste", Text: text})
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			t.Fatal(err)
+		}
+		sess.waitInputChecks(t, check)
+	}
+	sendPaste("must not paste while observing", 1)
+	sess.setHumanControl(true)
+	sendPaste("human text\ncafé 🌏", 2)
+	sess.setHumanControl(false)
+	sendPaste("must not paste after handback", 3)
+	sess.setHumanControl(true)
+	// This final accepted message orders all earlier input/CDP writes before the assertion.
+	sendPaste("final marker", 4)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		f.mu.Lock()
+		pastes := append([]string(nil), f.pastes...)
+		keyCount := len(f.keys)
+		f.mu.Unlock()
+		if len(pastes) >= 2 {
+			if len(pastes) != 2 || pastes[0] != "human text\ncafé 🌏" || pastes[1] != "final marker" {
+				t.Fatal("paste did not preserve text or the current human-control boundary")
+			}
+			if keyCount != 0 {
+				t.Fatal("paste must use Input.insertText, not keyboard shortcuts")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("accepted paste did not reach CDP Input.insertText")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestViewerNativeSelectUsesPageInsteadOfPopupClicks(t *testing.T) {
+	f := newFakeChrome()
+	probes := 0
+	f.evaluateValue = func(expr string) any {
+		if strings.Contains(expr, `"probe" === "probe"`) {
+			probes++
+			if probes == 2 {
+				return nil
+			}
+			if !strings.Contains(expr, `disabled: el.matches(":disabled") || o.disabled`) {
+				t.Errorf("probe must report options of an effectively disabled select as disabled: %s", expr)
+			}
+			return map[string]any{"type": "select_options", "options": []map[string]any{{"value": "VT", "label": "Vermont", "disabled": false}}}
+		}
+		if !strings.Contains(expr, `if (el.matches(":disabled") || !option`) {
+			t.Errorf("selection must reject an effectively disabled select: %s", expr)
+		}
+		if !strings.Contains(expr, "HTMLSelectElement.prototype") || !strings.Contains(expr, `dispatchEvent(new Event("change"`) {
+			t.Errorf("selection did not update page state: %s", expr)
+		}
+		return map[string]any{"type": "select_result", "value": "VT"}
+	}
+	defer f.close()
+	sess := &fakeSession{port: 9222, attachable: true}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.5, Y: 0.25, ProbeID: "observing"}); err != nil {
+		t.Fatal(err)
+	}
+	sess.waitInputChecks(t, 1)
+	if probes != 0 {
+		t.Fatalf("observing viewer probed %d controls", probes)
+	}
+	sess.setHumanControl(true)
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.5, Y: 0.25, ProbeID: "probe-one"}); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["type"] == "select_options" {
+			break
+		}
+	}
+	if len(got["options"].([]any)) != 1 {
+		t.Fatalf("options = %#v", got)
+	}
+	if got["probe_id"] != "probe-one" {
+		t.Fatalf("probe correlation = %#v", got)
+	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelectProbe, X: 0.75, Y: 0.25, ProbeID: "probe-two"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["type"] == "select_error" {
+			break
+		}
+	}
+	if got["probe_id"] != "probe-two" {
+		t.Fatalf("miss correlation = %#v", got)
+	}
+	if err := conn.WriteJSON(InputMessage{Type: InputTypeSelect, X: 0.5, Y: 0.25, Value: "VT"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["type"] == "select_result" {
+			break
+		}
+	}
+	if got["value"] != "VT" {
+		t.Fatalf("selection = %#v", got)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
 
@@ -103,7 +104,7 @@ func DefaultConfig() (ServiceConfig, error) {
 		if os.Geteuid() == 0 {
 			return ServiceConfig{}, fmt.Errorf("desktop helper service must be installed as the signed-in user")
 		}
-		home, err := os.UserHomeDir()
+		home, err := platform.UserHomeDir()
 		if err != nil {
 			return ServiceConfig{}, err
 		}

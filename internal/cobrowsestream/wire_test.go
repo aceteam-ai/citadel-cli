@@ -2,6 +2,7 @@ package cobrowsestream
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,15 @@ func TestParseInputMessage(t *testing.T) {
 	}{
 		{"mouse", `{"type":"mouse","event":"mousePressed","x":0.5,"y":0.25,"button":"left"}`, true, InputTypeMouse},
 		{"key", `{"type":"key","keyEvent":"keyDown","key":"a","text":"a"}`, true, InputTypeKey},
+		{"paste", `{"type":"paste","text":"synthetic\ntext 🌏"}`, true, "paste"},
+		{"empty paste", `{"type":"paste","text":""}`, false, ""},
+		{"max-size paste", `{"type":"paste","text":"` + strings.Repeat("x", 4096) + `"}`, true, "paste"},
+		{"multibyte max-size paste", `{"type":"paste","text":"` + strings.Repeat("🌏", 1024) + `"}`, true, "paste"},
+		{"oversized paste", `{"type":"paste","text":"` + strings.Repeat("x", 4097) + `"}`, false, ""},
+		{"multibyte oversized paste", `{"type":"paste","text":"` + strings.Repeat("🌏", 1025) + `"}`, false, ""},
+
+		{"select probe", `{"type":"select_probe","x":0.5,"y":0.25,"probe_id":"probe-one"}`, true, InputTypeSelectProbe},
+		{"select", `{"type":"select","x":0.5,"y":0.25,"value":"VT"}`, true, InputTypeSelect},
 		{"unknown type", `{"type":"scroll"}`, false, ""},
 		{"no type", `{"x":0.5}`, false, ""},
 		{"garbage", `not json`, false, ""},
@@ -48,6 +58,10 @@ func TestParseInputMessage(t *testing.T) {
 				t.Errorf("type = %q, want %q", m.Type, tc.typ)
 			}
 		})
+	}
+	probe, ok := parseInputMessage([]byte(`{"type":"select_probe","probe_id":"probe-one"}`))
+	if !ok || probe.ProbeID != "probe-one" {
+		t.Fatalf("probe id was not parsed: %#v, ok=%v", probe, ok)
 	}
 }
 

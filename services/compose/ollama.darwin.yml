@@ -1,9 +1,8 @@
 # services/compose/ollama.darwin.yml
 #
-# macOS (Apple Silicon / Intel) CPU variant of services/compose/ollama.yml,
-# selected at build time by the `//go:build darwin` embed in
-# services/compose_variants_darwin.go (the linux/windows path embeds
-# ollama.yml, byte-identical to before). citadel-cli#1048.
+# Shared CPU variant of services/compose/ollama.yml. The historical .darwin
+# filename is retained for existing embeds. Darwin selects it at build time;
+# services.SelectComposeForHost also selects it on positively GPU-less Linux.
 #
 # WHY A SEPARATE FILE: Docker Desktop for macOS exposes NO GPU to Linux
 # containers (there is no nvidia device driver, and Metal is not passed through
@@ -38,6 +37,9 @@ services:
     # reservation (TestDarwinComposeVariantsOnlyDropGPU).
     environment:
       - OLLAMA_MAX_LOADED_MODELS
+      # citadel-cli#1560: manifest ollama_keep_alive (-1 or a duration); explicit
+      # empty when unset. See services/ollama_keepalive.go.
+      - OLLAMA_KEEP_ALIVE
     volumes:
       # Mount a user-accessible directory for Ollama models
       - ~/citadel-cache/ollama:/root/.ollama

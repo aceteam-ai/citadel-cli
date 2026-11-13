@@ -38,7 +38,7 @@ func newLifecycleUpdateRunner() *lifecycleUpdateRunner {
 
 func setLifecycleUpdatePolicy(t *testing.T) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_AUTO_UPDATE", "true")
 	t.Setenv("CITADEL_NO_AUTO_UPDATE", "")
 	oldVersion, oldOptOut := Version, noAutoUpdate

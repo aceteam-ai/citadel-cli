@@ -119,6 +119,8 @@ const (
 	EnvVoiceCloneHostPort = "CITADEL_VOICE_CLONE_HOST_PORT"
 	// Radiology is a catalog module, not an embedded inference engine.
 	EnvRadiologyHostPort = "CITADEL_RADIOLOGY_HOST_PORT"
+	// PAW compile is a loopback-only catalog module, separate from OmniVoice.
+	EnvPAWCompileHostPort = "CITADEL_PAW_COMPILE_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -240,6 +242,9 @@ const (
 	// well-known LAN port below; neither port is an automatic gateway exposure.
 	RadiologyHostPort  = 8216
 	RadiologyDICOMPort = 4242
+	// PAW compile keeps container port 8100; its catalog host publish uses the
+	// next slot after radiology. See aceteam-ai/aceteam-aep#135 S1.
+	PAWCompileHostPort = 8217
 )
 
 // defaultVLLMHostPort is the vLLM host port when CITADEL_VLLM_HOST_PORT is unset.
@@ -364,6 +369,7 @@ var ServiceHostPorts = map[string]int{
 	"omnivoice":     OmniVoiceHostPort,
 	"voice-clone":   VoiceCloneHostPort,
 	"radiology":     RadiologyHostPort,
+	"paw-compile":   PAWCompileHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -385,6 +391,7 @@ var serviceHostPortEnv = map[string]string{
 	"omnivoice":     EnvOmniVoiceHostPort,
 	"voice-clone":   EnvVoiceCloneHostPort,
 	"radiology":     EnvRadiologyHostPort,
+	"paw-compile":   EnvPAWCompileHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,

@@ -365,6 +365,16 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 const workSessionMode = nodesession.Worker
 
 func runWork(cmd *cobra.Command, args []string) {
+	// The hpc profile (aceteam#12715) has its own entry point built from a
+	// positive list of parts; nothing below this line runs under it.
+	if hpcProfileActive() {
+		runHPCWork(cmd, args)
+		return
+	}
+	if set := hpcFlagsOutsideProfile(cmd.Flags()); len(set) > 0 {
+		fmt.Fprintf(os.Stderr, "Error: %s only apply with --profile hpc.\n", strings.Join(set, ", "))
+		os.Exit(2)
+	}
 	// citadel#853: --node-dir/CITADEL_NODE_DIR redirects manifest resolution
 	// but NOT the module lockfile (catalog.LockfilePath, still hardcoded to
 	// platform.ConfigDir()). liveModuleOps.Install/Uninstall -- the reconcile
@@ -524,6 +534,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, warning)
 	}
 
+	// Re-adopt co-browse sessions that survived a restart by exec (citadel-cli#1546)
+	// before anything can sweep them; sessions that fail verification are reaped.
+	// StartManagedCobrowse marks this process as the managed worker first, because
+	// recovery decides on that mark whether to re-adopt a dead owner's sessions.
+	platform.StartManagedCobrowse()
+
 	// Setup signal handling. The first signal cancels the root context so every
 	// subsystem (worker runner, status/terminal/gateway servers, heartbeat,
 	// auto-updater, usage syncer) observes cancellation and unwinds. As a
@@ -545,7 +561,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Tear down every interactive browser session (issue #793) so no session
 		// Chromium or virtual display orphans across a worker restart. No-op when
 		// no session was ever started.
-		if err := platform.GetCobrowseSessionManager().StopAll(); err != nil {
+		if err := platform.GetCobrowseSessionManager().ShutdownSessions(); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: browser session stop: %v\n", err)
 		}
 		// Cancel first so the async service-startup goroutine stops launching any
@@ -2954,6 +2970,7 @@ func startManagedServices(ctx context.Context) []startedService {
 	fmt.Printf("--- Starting %d service(s) ---\n", len(manifest.Services))
 
 	var started []startedService
+	failed, skipped := 0, 0
 	for _, service := range manifest.Services {
 		// Stop launching further services once shutdown has been requested so a
 		// slow startup goroutine unwinds promptly instead of racing teardown.
@@ -2966,6 +2983,7 @@ func startManagedServices(ctx context.Context) []startedService {
 		// stopped stays installed but must NOT be composed up on boot, or the stop
 		// would silently come back on the next `citadel work` restart (aceteam#5280).
 		if serviceStartDisabled(service) {
+			skipped++
 			fmt.Printf("   - Skipping stopped service: %s (desired_status: stopped)\n", service.Name)
 			continue
 		}
@@ -2980,6 +2998,7 @@ func startManagedServices(ctx context.Context) []startedService {
 		// supported local-inference path on macOS.
 		if serviceType == internalServices.ServiceTypeDocker &&
 			skipEngineOnDarwin(runtime.GOOS, service.Name, forceGPUEngines()) {
+			skipped++
 			fmt.Printf("   - Skipping %s on macOS: needs an NVIDIA GPU and Docker (use native ollama for local inference)\n", service.Name)
 			continue
 		}
@@ -2990,7 +3009,8 @@ func startManagedServices(ctx context.Context) []startedService {
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
 				return startNativeService(service.Name, configDir)
 			}); err != nil {
-				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
+				failed++
+				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
 				continue
 			}
 			started = append(started, startedService{name: service.Name, native: true})
@@ -2998,14 +3018,16 @@ func startManagedServices(ctx context.Context) []startedService {
 			// Validate that compose file path stays within config directory (prevent path traversal)
 			fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "     Warning: %s: invalid compose file path: %v\n", service.Name, err)
+				failed++
+				fmt.Fprintf(os.Stderr, "     Error: %s: invalid compose file path: %v\n", service.Name, err)
 				continue
 			}
 			fmt.Printf("   - Starting %s...\n", service.Name)
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
 				return startService(service.Name, fullComposePath)
 			}); err != nil {
-				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
+				failed++
+				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
 				continue
 			}
 			started = append(started, startedService{name: service.Name, composePath: fullComposePath})
@@ -3013,7 +3035,7 @@ func startManagedServices(ctx context.Context) []startedService {
 		fmt.Printf("   - %s is running\n", service.Name)
 	}
 
-	fmt.Println("--- Services started ---")
+	fmt.Printf("--- Service startup: %d started, %d failed, %d skipped ---\n", len(started), failed, skipped)
 	return started
 }
 
@@ -3377,16 +3399,9 @@ func getRedisURLFromConfig() string {
 // Priority: --workspace flag > CITADEL_WORKSPACE env > ~/citadel-node/workspace default.
 // Returns empty string if the directory cannot be resolved or created.
 func resolveWorkspaceDir() string {
-	dir := workWorkspaceDir
+	dir := workspaceDirPath()
 	if dir == "" {
-		dir = os.Getenv("CITADEL_WORKSPACE")
-	}
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return ""
-		}
-		dir = filepath.Join(home, "citadel-node", "workspace")
+		return ""
 	}
 	// Ensure the directory exists.
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -3399,6 +3414,23 @@ func resolveWorkspaceDir() string {
 		return dir
 	}
 	return abs
+}
+
+// workspaceDirPath preserves flag/env/default precedence without filesystem
+// effects, allowing fixture selection to be checked before directory creation.
+func workspaceDirPath() string {
+	dir := workWorkspaceDir
+	if dir == "" {
+		dir = os.Getenv("CITADEL_WORKSPACE")
+	}
+	if dir == "" {
+		home, err := platform.HomeDir("")
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, "citadel-node", "workspace")
+	}
+	return dir
 }
 
 // newAutoStopReconciler builds the config-gated auto-stop-when-idle reconciler

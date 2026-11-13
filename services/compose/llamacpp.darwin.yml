@@ -1,9 +1,8 @@
 # services/compose/llamacpp.darwin.yml
 #
-# macOS (Apple Silicon / Intel) CPU variant of services/compose/llamacpp.yml,
-# selected at build time by the `//go:build darwin` embed in
-# services/compose_variants_darwin.go (the linux/windows path embeds
-# llamacpp.yml, byte-identical to before). citadel-cli#1048.
+# Shared CPU variant of services/compose/llamacpp.yml. The historical .darwin
+# filename is retained for existing embeds. Darwin selects it at build time;
+# services.SelectComposeForHost also selects it on positively GPU-less Linux.
 #
 # TWO deliberate differences from llamacpp.yml, and ONLY these two (pinned by
 # TestDarwinComposeVariantsOnlyDropGPU in services/darwin_variants_test.go):
