@@ -6,32 +6,38 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
-type failingAMTHandler struct{}
+type failingAMTHandler struct{ err error }
 
 func (failingAMTHandler) CanHandle(kind string) bool { return kind == JobTypeAMTKVM }
 
-func (failingAMTHandler) Execute(context.Context, *Job, StreamWriter) (*JobResult, error) {
-	err := errors.New("AMT response timed out")
-	return &JobResult{Status: JobStatusFailure, Error: err}, err
+func (h failingAMTHandler) Execute(context.Context, *Job, StreamWriter) (*JobResult, error) {
+	return &JobResult{Status: JobStatusFailure, Error: h.err}, h.err
 }
 
 func TestAMTFailureNeverRedeliversMutation(t *testing.T) {
 	for _, tc := range []struct {
+		name       string
 		operation  string
+		err        error
 		wantReason string
 		unknown    bool
 	}{
-		{"power", "amt_outcome_unknown", true},
-		{"keys", "amt_outcome_unknown", true},
-		{"type", "amt_outcome_unknown", true},
-		{"status", "amt_failed_no_automatic_retry", false},
-		{"screenshot", "amt_failed_no_automatic_retry", false},
+		{"power-refused", "power", errors.New("AMT confirmation refused"), "amt_failed_no_automatic_retry", false},
+		{"keys-refused", "keys", errors.New("AMT permission refused"), "amt_failed_no_automatic_retry", false},
+		{"type-refused", "type", errors.New("AMT credential refused"), "amt_failed_no_automatic_retry", false},
+		{"power-written", "power", jobs.ErrAMTOutcomeUnknown, "amt_outcome_unknown", true},
+		{"keys-written", "keys", jobs.ErrAMTOutcomeUnknown, "amt_outcome_unknown", true},
+		{"type-written", "type", jobs.ErrAMTOutcomeUnknown, "amt_outcome_unknown", true},
+		{"status", "status", errors.New("AMT status failed"), "amt_failed_no_automatic_retry", false},
+		{"screenshot", "screenshot", errors.New("AMT screenshot failed"), "amt_failed_no_automatic_retry", false},
 	} {
-		t.Run(tc.operation, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			source := NewMockJobSource("test", nil)
-			runner := NewRunner(source, []JobHandler{failingAMTHandler{}}, RunnerConfig{WorkerID: "test-worker"})
+			runner := NewRunner(source, []JobHandler{failingAMTHandler{err: tc.err}}, RunnerConfig{WorkerID: "test-worker"})
 			stream := &MockStreamWriter{}
 			job := &Job{
 				ID: "amt-fixture", Type: JobTypeAMTKVM,

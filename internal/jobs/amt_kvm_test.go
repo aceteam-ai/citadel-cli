@@ -2,8 +2,11 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"testing"
@@ -183,5 +186,154 @@ func TestBootToSetupSequence(t *testing.T) {
 	}
 	if !strings.Contains(bodies[4], "<h:PowerState>10</h:PowerState>") {
 		t.Fatal("power reset was not last")
+	}
+}
+
+func TestBootToSetupRestoresBIOSAfterLaterFailure(t *testing.T) {
+	for _, failedAction := range []string{"ChangeBootOrder", "SetBootConfigRole", "RequestPowerStateChange"} {
+		t.Run(failedAction, func(t *testing.T) {
+			client, err := newAMTWSMan("192.168.2.10", "admin", "synthetic-password")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var actions, bodies []string
+			client.client.Transport = amtRoundTrip(func(req *http.Request) (*http.Response, error) {
+				if req.Header.Get("Authorization") == "" {
+					return &http.Response{StatusCode: 401, Header: http.Header{"Www-Authenticate": []string{`Digest realm="Intel AMT", nonce="nonce", qop="auth"`}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+				}
+				body, _ := io.ReadAll(req.Body)
+				text := string(body)
+				action := text[strings.Index(text, "<a:Action>")+len("<a:Action>") : strings.Index(text, "</a:Action>")]
+				actions = append(actions, action)
+				bodies = append(bodies, text)
+				response := `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><h:ReturnValue xmlns:h="urn:test">0</h:ReturnValue></s:Body></s:Envelope>`
+				if strings.HasSuffix(action, "Get") {
+					response = `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><p:AMT_BootSettingData xmlns:p="http://intel.com/wbem/wscim/1/amt-schema/1/"><p:BIOSSetup>false</p:BIOSSetup></p:AMT_BootSettingData></s:Body></s:Envelope>`
+				} else if strings.HasSuffix(action, failedAction) {
+					response = `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><h:ReturnValue xmlns:h="urn:test">1</h:ReturnValue></s:Body></s:Envelope>`
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(response))}, nil
+			})
+			if err := client.bootToSetup(context.Background()); err == nil {
+				t.Fatal("failing step was accepted")
+			}
+			if len(actions) < 4 || !strings.HasSuffix(actions[len(actions)-1], "Put") {
+				t.Fatalf("BIOS restore was not the last action: %v", actions)
+			}
+			if !strings.Contains(bodies[len(bodies)-1], "<p:BIOSSetup>false</p:BIOSSetup>") {
+				t.Fatal("restore did not use the original BIOSSetup value")
+			}
+		})
+	}
+}
+
+func TestBootToSetupRestoresAfterAmbiguousInitialPut(t *testing.T) {
+	client, err := newAMTWSMan("192.168.2.10", "admin", "synthetic-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	putCount := 0
+	client.client.Transport = amtRoundTrip(func(req *http.Request) (*http.Response, error) {
+		if req.Header.Get("Authorization") == "" {
+			return &http.Response{StatusCode: 401, Header: http.Header{"Www-Authenticate": []string{`Digest realm="Intel AMT", nonce="nonce", qop="auth"`}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}
+		body, _ := io.ReadAll(req.Body)
+		text := string(body)
+		if strings.Contains(text, "Transfer/Get") || strings.Contains(text, transferNS+"Get") {
+			response := `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><p:AMT_BootSettingData xmlns:p="http://intel.com/wbem/wscim/1/amt-schema/1/"><p:BIOSSetup>false</p:BIOSSetup></p:AMT_BootSettingData></s:Body></s:Envelope>`
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(response))}, nil
+		}
+		if strings.Contains(text, transferNS+"Put") {
+			putCount++
+			if putCount == 1 {
+				httptrace.ContextClientTrace(req.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+				return nil, errors.New("synthetic response lost after write")
+			}
+			if !strings.Contains(text, "<p:BIOSSetup>false</p:BIOSSetup>") {
+				t.Error("rollback did not restore the original BIOSSetup field")
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}
+		t.Errorf("unexpected AMT action after uncertain Put")
+		return nil, errors.New("unexpected action")
+	})
+	if err := client.bootToSetup(context.Background()); !errors.Is(err, ErrAMTOutcomeUnknown) {
+		t.Fatalf("initial Put lost its uncertain outcome: %v", err)
+	}
+	if putCount != 2 {
+		t.Fatalf("expected arming attempt and rollback, got %d Put requests", putCount)
+	}
+}
+
+func TestAMTTypeExtendsWriteDeadlineAndCancelsBetweenKeys(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	go func() { _, _ = io.Copy(io.Discard, right) }()
+	if err := left.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	rfb := &amtRFB{conn: left}
+	if err := rfb.typeText(context.Background(), strings.Repeat("x", 20)); err != nil {
+		t.Fatalf("typing should outlast the session setup deadline: %v", err)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	rfb = &amtRFB{conn: left}
+	if err := rfb.typeText(cancelled, "x"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-write cancellation should remain a refusal: %v", err)
+	}
+	rfb = &amtRFB{conn: left}
+	midway, stop := context.WithCancel(context.Background())
+	time.AfterFunc(10*time.Millisecond, stop)
+	start := time.Now()
+	if err := rfb.typeText(midway, strings.Repeat("x", 20)); !errors.Is(err, ErrAMTOutcomeUnknown) {
+		t.Fatalf("post-write cancellation needs an unknown outcome: %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("typing did not promptly stop after cancellation")
+	}
+}
+
+func TestAMTPowerOutcomeUnknownOnlyAfterWrite(t *testing.T) {
+	for _, wrote := range []bool{false, true} {
+		t.Run(map[bool]string{false: "before-write", true: "after-write"}[wrote], func(t *testing.T) {
+			client, err := newAMTWSMan("192.168.2.10", "admin", "synthetic-password")
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.client.Transport = amtRoundTrip(func(req *http.Request) (*http.Response, error) {
+				if req.Header.Get("Authorization") == "" {
+					return &http.Response{StatusCode: 401, Header: http.Header{"Www-Authenticate": []string{`Digest realm="Intel AMT", nonce="nonce", qop="auth"`}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+				}
+				if wrote {
+					httptrace.ContextClientTrace(req.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+				}
+				return nil, errors.New("synthetic transport break")
+			})
+			err = client.power(context.Background(), "reset")
+			if errors.Is(err, ErrAMTOutcomeUnknown) != wrote {
+				t.Fatalf("unknown outcome = %t, wrote = %t, err = %v", errors.Is(err, ErrAMTOutcomeUnknown), wrote, err)
+			}
+		})
+	}
+}
+
+func TestAMTPowerAuthenticationRefusalRemainsDefinitive(t *testing.T) {
+	client, err := newAMTWSMan("192.168.2.10", "admin", "synthetic-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.client.Transport = amtRoundTrip(func(req *http.Request) (*http.Response, error) {
+		if req.Header.Get("Authorization") == "" {
+			return &http.Response{StatusCode: 401, Header: http.Header{"Www-Authenticate": []string{`Digest realm="Intel AMT", nonce="nonce", qop="auth"`}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}
+		httptrace.ContextClientTrace(req.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+		return &http.Response{StatusCode: 401, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	err = client.power(context.Background(), "reset")
+	if err == nil || errors.Is(err, ErrAMTOutcomeUnknown) || !strings.Contains(err.Error(), "authentication refused") {
+		t.Fatalf("definitive authentication refusal was misclassified: %v", err)
 	}
 }

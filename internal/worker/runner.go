@@ -1373,8 +1373,8 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// already have changed the target. Never redeliver the same action.
 		if job.Type == JobTypeAMTKVM {
 			reason := "amt_failed_no_automatic_retry"
-			if operation := payloadString(job.Payload, "operation"); operation == "power" || operation == "keys" || operation == "type" {
-				actualErr = errors.New("AMT action outcome unknown; verify the target before another command")
+			if errors.Is(actualErr, jobs.ErrAMTOutcomeUnknown) {
+				actualErr = jobs.ErrAMTOutcomeUnknown
 				reason = "amt_outcome_unknown"
 			}
 			r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)

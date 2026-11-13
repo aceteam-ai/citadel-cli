@@ -13,10 +13,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -103,6 +105,14 @@ func (a *amtWSMan) soap(ctx context.Context, action, uri, body, selectors string
 		`<a:ReplyTo><a:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address></a:ReplyTo>` +
 		selectors + `</s:Header><s:Body>` + body + `</s:Body></s:Envelope>`
 	endpoint := "http://" + net.JoinHostPort(a.host, "16992") + "/wsman"
+	mutating := action != transferNS+"Get"
+	var wroteMutation atomic.Bool
+	afterWrite := func(err error) error {
+		if mutating && wroteMutation.Load() {
+			return ErrAMTOutcomeUnknown
+		}
+		return err
+	}
 	request := func(auth string) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(envelope))
 		if err != nil {
@@ -112,35 +122,47 @@ func (a *amtWSMan) soap(ctx context.Context, action, uri, body, selectors string
 		if auth != "" {
 			req.Header.Set("Authorization", auth)
 		}
+		if mutating {
+			trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) {
+				wroteMutation.Store(true)
+			}}
+			req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+		}
 		return a.client.Do(req)
 	}
 	first, err := request("")
 	if err != nil {
-		return nil, errors.New("AMT WS-MAN connection failed")
+		return nil, afterWrite(errors.New("AMT WS-MAN connection failed"))
 	}
 	io.Copy(io.Discard, io.LimitReader(first.Body, 4096))
 	first.Body.Close()
 	if first.StatusCode != http.StatusUnauthorized {
-		return nil, fmt.Errorf("AMT authentication challenge unavailable (%d)", first.StatusCode)
+		return nil, afterWrite(fmt.Errorf("AMT authentication challenge unavailable (%d)", first.StatusCode))
 	}
+	// A completed 401 challenge proves the unauthenticated request did not
+	// execute; only the authenticated attempt can now change the target.
+	wroteMutation.Store(false)
 	auth, err := digestAuthorization(first.Header.Get("WWW-Authenticate"), a.username, a.password)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := request(auth)
 	if err != nil {
-		return nil, errors.New("AMT WS-MAN connection failed")
+		return nil, afterWrite(errors.New("AMT WS-MAN connection failed"))
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("AMT WS-MAN authentication refused (%d)", resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("AMT WS-MAN refused operation (%d)", resp.StatusCode)
+		return nil, afterWrite(fmt.Errorf("AMT WS-MAN refused operation (%d)", resp.StatusCode))
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, errors.New("AMT WS-MAN response could not be read")
+		return nil, afterWrite(errors.New("AMT WS-MAN response could not be read"))
 	}
 	if bytes.Contains(raw, []byte("<s:Fault")) || bytes.Contains(raw, []byte("<Fault")) {
-		return nil, errors.New("AMT WS-MAN returned a fault")
+		return nil, afterWrite(errors.New("AMT WS-MAN returned a fault"))
 	}
 	return raw, nil
 }
@@ -240,7 +262,7 @@ func soapBody(raw []byte) (string, error) {
 	return string(raw[start:end]), nil
 }
 
-func (a *amtWSMan) bootToSetup(ctx context.Context) error {
+func (a *amtWSMan) bootToSetup(ctx context.Context) (err error) {
 	uri := amtNS + "AMT_BootSettingData"
 	raw, err := a.get(ctx, uri)
 	if err != nil {
@@ -253,10 +275,6 @@ func (a *amtWSMan) bootToSetup(ctx context.Context) error {
 	if len(biosSetupField.FindAllStringIndex(instance, -1)) != 1 {
 		return errors.New("AMT BIOSSetup field missing")
 	}
-	instance = biosSetupField.ReplaceAllStringFunc(instance, func(field string) string {
-		parts := biosSetupField.FindStringSubmatch(field)
-		return "<" + parts[1] + "BIOSSetup>true</" + parts[3] + "BIOSSetup>"
-	})
 	if len(bootRoot.FindAllStringIndex(instance, -1)) != 1 {
 		return errors.New("AMT boot settings instance missing")
 	}
@@ -267,9 +285,28 @@ func (a *amtWSMan) bootToSetup(ctx context.Context) error {
 		}
 		return strings.TrimSuffix(root, ">") + ` xmlns:` + prefix + `="` + html.EscapeString(uri) + `">`
 	})
+	originalInstance := instance
+	instance = biosSetupField.ReplaceAllStringFunc(instance, func(field string) string {
+		parts := biosSetupField.FindStringSubmatch(field)
+		return "<" + parts[1] + "BIOSSetup>true</" + parts[3] + "BIOSSetup>"
+	})
+	putSucceeded := false
+	defer func() {
+		if err == nil || (!putSucceeded && !errors.Is(err, ErrAMTOutcomeUnknown)) {
+			return
+		}
+		// Restore with a fresh bounded context even if the caller's deadline
+		// expired after arming BIOS setup.
+		restoreCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if _, restoreErr := a.soap(restoreCtx, transferNS+"Put", uri, originalInstance, ""); restoreErr != nil {
+			err = fmt.Errorf("%w; AMT BIOS setup restore failed; verify target", ErrAMTOutcomeUnknown)
+		}
+	}()
 	if _, err = a.soap(ctx, transferNS+"Put", uri, instance, ""); err != nil {
 		return err
 	}
+	putSucceeded = true
 
 	configURI := cimNS + "CIM_BootConfigSetting"
 	configSelector := `<w:SelectorSet><w:Selector Name="InstanceID">Intel(r) AMT: Boot Configuration 0</w:Selector></w:SelectorSet>`

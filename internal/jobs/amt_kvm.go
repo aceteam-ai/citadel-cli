@@ -31,6 +31,10 @@ type AMTKVMHandler struct {
 	HTTPClient  *http.Client
 }
 
+// ErrAMTOutcomeUnknown means a mutating command might have reached the target.
+// The runner reports this without retrying the one-use action.
+var ErrAMTOutcomeUnknown = errors.New("AMT action outcome unknown; verify the target before another command")
+
 // A fixed lock set bounds memory while serializing every operation to the
 // same AMT host. Hash collisions only serialize unrelated hosts.
 var amtTargetLocks [64]sync.Mutex
@@ -160,10 +164,10 @@ func (h *AMTKVMHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 					}
 				case "keys":
 					var count int
-					count, err = rfb.keys(job.Payload["keys"])
+					count, err = rfb.keys(ctx.Context(), job.Payload["keys"])
 					result = map[string]any{"events_sent": count}
 				case "type":
-					err = rfb.typeText(job.Payload["text"])
+					err = rfb.typeText(ctx.Context(), job.Payload["text"])
 					result = map[string]any{"typed": len(job.Payload["text"])}
 				}
 			}
@@ -319,8 +323,9 @@ func connectAMTRedirection(ctx context.Context, host, username, password string)
 }
 
 type amtRFB struct {
-	conn          net.Conn
-	width, height int
+	conn            net.Conn
+	width, height   int
+	mutationStarted bool
 }
 
 func newAMTRFB(conn net.Conn) (*amtRFB, error) {
@@ -387,14 +392,54 @@ func newAMTRFB(conn net.Conn) (*amtRFB, error) {
 	return &amtRFB{conn: conn, width: w, height: h}, nil
 }
 
-func (r *amtRFB) key(sym uint32, down bool) error {
+func (r *amtRFB) key(ctx context.Context, sym uint32, down bool) error {
+	if err := ctx.Err(); err != nil {
+		if r.mutationStarted {
+			return ErrAMTOutcomeUnknown
+		}
+		return err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	if limit, ok := ctx.Deadline(); ok && limit.Before(deadline) {
+		deadline = limit
+	}
+	if err := r.conn.SetWriteDeadline(deadline); err != nil {
+		if r.mutationStarted {
+			return ErrAMTOutcomeUnknown
+		}
+		return err
+	}
 	packet := make([]byte, 8)
 	packet[0] = 4
 	if down {
 		packet[1] = 1
 	}
 	binary.BigEndian.PutUint32(packet[4:], sym)
-	return writeAll(r.conn, packet)
+	n, err := r.conn.Write(packet)
+	if n > 0 {
+		r.mutationStarted = true
+	}
+	if err != nil || n != len(packet) {
+		if r.mutationStarted {
+			return ErrAMTOutcomeUnknown
+		}
+		return errors.New("AMT redirection write failed")
+	}
+	return nil
+}
+
+func (r *amtRFB) pause(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		if r.mutationStarted {
+			return ErrAMTOutcomeUnknown
+		}
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 var amtKeysyms = map[string]uint32{
@@ -422,7 +467,7 @@ func amtKeysym(token string) (uint32, error) {
 	return 0, errors.New("unsupported AMT key")
 }
 
-func (r *amtRFB) keys(combo string) (int, error) {
+func (r *amtRFB) keys(ctx context.Context, combo string) (int, error) {
 	parts := strings.Split(combo, "+")
 	if len(parts) == 0 || len(parts) > 8 || combo == "" {
 		return 0, errors.New("AMT key combination invalid")
@@ -436,20 +481,22 @@ func (r *amtRFB) keys(combo string) (int, error) {
 		syms = append(syms, sym)
 	}
 	for _, sym := range syms {
-		if err := r.key(sym, true); err != nil {
+		if err := r.key(ctx, sym, true); err != nil {
 			return 0, err
 		}
 	}
-	time.Sleep(50 * time.Millisecond)
+	if err := r.pause(ctx, 50*time.Millisecond); err != nil {
+		return 0, err
+	}
 	for i := len(syms) - 1; i >= 0; i-- {
-		if err := r.key(syms[i], false); err != nil {
+		if err := r.key(ctx, syms[i], false); err != nil {
 			return 0, err
 		}
 	}
 	return len(syms) * 2, nil
 }
 
-func (r *amtRFB) typeText(value string) error {
+func (r *amtRFB) typeText(ctx context.Context, value string) error {
 	if value == "" || len(value) > 4096 {
 		return errors.New("AMT text length invalid")
 	}
@@ -466,13 +513,15 @@ func (r *amtRFB) typeText(value string) error {
 		if c == '\t' {
 			sym = 0xff09
 		}
-		if err := r.key(sym, true); err != nil {
+		if err := r.key(ctx, sym, true); err != nil {
 			return err
 		}
-		if err := r.key(sym, false); err != nil {
+		if err := r.key(ctx, sym, false); err != nil {
 			return err
 		}
-		time.Sleep(30 * time.Millisecond)
+		if err := r.pause(ctx, 30*time.Millisecond); err != nil {
+			return err
+		}
 	}
 	return nil
 }

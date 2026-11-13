@@ -419,7 +419,7 @@ var gatedJobTypeReasons = map[string]string{
 	JobTypeFileIndex:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileSemanticSearch: "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeFileScreenshot:     "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeAMTKVM:             "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeAMTKVM:             "the node's \"amt\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeVNCScreenshot:      "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeVNCType:            "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
 	JobTypeVNCKeys:            "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
