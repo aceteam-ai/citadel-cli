@@ -43,6 +43,7 @@ const (
 	ResultSignatureInvalid     = "signature_invalid"      // checksums signature malformed, untrusted, wrong, or for another release; refused
 	ResultPlatformNotPublished = "platform_not_published" // signed release has no archive for this OS/arch
 	ResultDrainDeferred        = "drain_deferred"         // could not reach idle to swap this cycle
+	ResultDeferredBusy         = "deferred_busy"          // restart held back: a co-browse session has a human involved
 	ResultApplyFailed          = "apply_failed"           // the in-place binary swap failed
 	ResultApplyNotPermitted    = "apply_not_permitted"    // install authority/capability preflight refused
 	ResultRestartPending       = "restart_pending"        // applied/staged; not yet proven running

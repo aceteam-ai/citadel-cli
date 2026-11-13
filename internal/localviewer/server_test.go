@@ -366,3 +366,20 @@ func TestActivityEndpoint(t *testing.T) {
 		t.Fatalf("activity: %d %s", r.StatusCode, body)
 	}
 }
+
+func TestSummaryIsForTheOwnersOtherProcessOnly(t *testing.T) {
+	h := newHarness(t)
+	for name, hdr := range map[string]map[string]string{
+		"no token":             nil,
+		"wrong token":          {"Authorization": "Bearer nope"},
+		"browser with token":   {"Authorization": "Bearer " + h.srv.mint, "Origin": h.origin()},
+		"viewer bearer header": {csrfHeader: h.srv.bearer},
+	} {
+		if resp := h.do(t, "GET", "/api/summary", hdr, true); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: want 403, got %d", name, resp.StatusCode)
+		}
+	}
+	if resp := h.do(t, "GET", "/api/summary", map[string]string{"Authorization": "Bearer " + h.srv.mint}, false); resp.StatusCode != 200 {
+		t.Fatalf("summary with the per-launch token: %d", resp.StatusCode)
+	}
+}

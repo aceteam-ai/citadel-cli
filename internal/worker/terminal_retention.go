@@ -9,8 +9,8 @@ import (
 
 // TerminalResultTTL is how long a retained terminal MEETING_JOIN event lives
 // in Redis (citadel-cli#1553). The coordinator reads it at startup to recover
-// a result that was published while no replica was subscribed. Direct Redis
-// only for now; see apiTerminalRetainer for API mode.
+// a result that was published while no replica was subscribed. API mode stores
+// it through apiTerminalRetainer.
 const TerminalResultTTL = 72 * time.Hour
 
 // terminalRetainTimeout bounds the retained write so it cannot stall the

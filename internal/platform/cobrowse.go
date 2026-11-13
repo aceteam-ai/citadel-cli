@@ -444,6 +444,12 @@ var managedXvfbMu sync.Mutex
 // a confusing downstream "CDP not ready" timeout. Concurrent-safe: display
 // allocation is serialized under managedXvfbMu.
 func startManagedXvfb(resolution string) (*exec.Cmd, string, error) {
+	return startManagedXvfbWrapped(resolution, nil)
+}
+
+// startManagedXvfbWrapped is startManagedXvfb with an optional argv wrapper
+// (for example a transient systemd scope), applied to the Xvfb command.
+func startManagedXvfbWrapped(resolution string, wrap func([]string) []string) (*exec.Cmd, string, error) {
 	if !isCommandAvailable("Xvfb") {
 		return nil, "", fmt.Errorf(
 			"Xvfb not found: install it (e.g. 'apt-get install xvfb') to run headless co-browse, "+
@@ -453,7 +459,11 @@ func startManagedXvfb(resolution string) (*exec.Cmd, string, error) {
 	defer managedXvfbMu.Unlock()
 	n := findFreeDisplay()
 	display := fmt.Sprintf(":%d", n)
-	cmd := exec.Command("Xvfb", display, "-screen", "0", resolution, "-nolisten", "tcp")
+	argv := []string{"Xvfb", display, "-screen", "0", resolution, "-nolisten", "tcp"}
+	if wrap != nil {
+		argv = wrap(argv)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {

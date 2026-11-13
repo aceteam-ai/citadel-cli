@@ -87,6 +87,15 @@ type Config struct {
 	// Activity reads the newest audit records for the Activity panel; nil
 	// hides the panel.
 	Activity func(sessionID string, limit int) ([]localaudit.Record, error)
+	// Setup, when set, makes this server the first-run setup page instead of
+	// the co-browse viewer: the same listener, guard, cookie, bearer and
+	// single-use /open code, with the setup routes in place of the session
+	// routes. Service may then be nil.
+	Setup *SetupConfig
+	// PrivateDir overrides the private subdir name (default PrivateDirName).
+	PrivateDir string
+	// MaxSessions is reported to the setup page through /api/summary.
+	MaxSessions int
 }
 
 // Server is the loopback viewer.
@@ -101,6 +110,8 @@ type Server struct {
 	// other 127.0.0.1 ports, unlocks nothing but the static page.
 	cookie string
 	bearer string
+
+	setupMu sync.Mutex
 
 	mu    sync.Mutex
 	codes map[string]time.Time
@@ -195,7 +206,21 @@ func (s *Server) Close() {
 	}
 }
 
-func (s *Server) privateDir() string { return filepath.Join(s.cfg.TokenDir, PrivateDirName) }
+func (s *Server) privateDir() string {
+	name := s.cfg.PrivateDir
+	if name == "" {
+		name = PrivateDirName
+	}
+	return filepath.Join(s.cfg.TokenDir, name)
+}
+
+// reopenHint names the command that gives a fresh link.
+func (s *Server) reopenHint() string {
+	if s.cfg.Setup != nil {
+		return "citadel local setup"
+	}
+	return "citadel local viewer"
+}
 
 func (s *Server) writeTokenFile() error {
 	if s.cfg.TokenDir == "" {
@@ -362,11 +387,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /open", s.handleOpen)
 	mux.HandleFunc("GET /{$}", s.withCookie(s.handleIndex))
 	mux.HandleFunc("GET /assets/{file}", s.withCookie(s.handleAsset))
+	if s.cfg.Setup != nil {
+		s.setupRoutes(mux)
+		return s.guard(mux)
+	}
 	mux.HandleFunc("GET /api/state", s.withCookie(s.withCSRF(s.handleState)))
 	mux.HandleFunc("POST /api/sessions/{id}/{action}", s.withCookie(s.withCSRF(s.handleAction)))
 	mux.HandleFunc("GET /api/stream", s.withCookie(s.handleStream))
 	mux.HandleFunc("GET /api/activity", s.withCookie(s.withCSRF(s.handleActivity)))
 	mux.HandleFunc("POST /api/mint", s.handleMint)
+	mux.HandleFunc("GET /api/summary", s.handleSummary)
 	return s.guard(mux)
 }
 
@@ -405,7 +435,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 func (s *Server) withCookie(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.hasCookie(r) {
-			forbid(w, "This Citadel viewer link has expired or was opened in another browser. Run `citadel local viewer` for a new one.")
+			forbid(w, "This Citadel link has expired or was opened in another browser. Run `"+s.reopenHint()+"` for a new one.")
 			return
 		}
 		next(w, r)
@@ -447,7 +477,7 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 		stream.CloseViewers()
 	}
 	if !valid {
-		forbid(w, "This Citadel viewer link has expired or was already used. Run `citadel local viewer` for a new one.")
+		forbid(w, "This Citadel link has expired or was already used. Run `"+s.reopenHint()+"` for a new one.")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -467,7 +497,11 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	page, err := assets.ReadFile("assets/index.html")
+	name := "assets/index.html"
+	if s.cfg.Setup != nil {
+		name = "assets/setup.html"
+	}
+	page, err := assets.ReadFile(name)
 	if err != nil {
 		http.Error(w, "missing page", http.StatusInternalServerError)
 		return
@@ -480,7 +514,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("file")
 	var ctype string
 	switch name {
-	case "app.js", "open.js":
+	case "app.js", "open.js", "setup.js":
 		ctype = "text/javascript; charset=utf-8"
 	case "app.css":
 		ctype = "text/css; charset=utf-8"
@@ -601,12 +635,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 // user: it proves itself with the per-launch bearer token from TokenFile.
 // Browser requests (which carry an Origin) are refused.
 func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Origin") != "" {
-		forbid(w, "not for browsers")
-		return
-	}
-	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if subtle.ConstantTimeCompare([]byte(auth), []byte(s.mint)) != 1 {
+	if !s.mintAuthOK(r) {
 		forbid(w, "bad token")
 		return
 	}
@@ -616,6 +645,16 @@ func (s *Server) handleMint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"url": link, "file": path})
+}
+
+// mintAuthOK is true for a request from another local process holding the
+// per-launch token. A browser request (which carries an Origin) never is.
+func (s *Server) mintAuthOK(r *http.Request) bool {
+	if r.Header.Get("Origin") != "" {
+		return false
+	}
+	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(auth), []byte(s.mint)) == 1
 }
 
 // RequestLink asks a running viewer (described by the TokenFile in dir) for a

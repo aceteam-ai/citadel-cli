@@ -130,6 +130,19 @@ one-time launch file (`writeLaunchFile`), never on a command line.
 `TestGuardsReturn403`, `TestCookieOnlyFromSingleUseCode` and
 `TestOpenKeepsTheCodeOffTheCommandLine` pin the boundary.
 
+`cmd.runLocalSetup` owns the first-run setup page (`citadel local setup`, and a
+Windows double-click: `cmd.runRootCitadel` calls `launchedFromExplorer`, which is
+`platform.ConsoleProcessCount` == 1; `runBareCitadel` stays enrollment-only). It
+is a `localviewer.Server` with `Config.Setup` set, so it keeps the same guard,
+cookie, bearer and single-use `/open` code, but in its own `SetupDirName` private
+dir so it never replaces a running owner's token file. Connect is
+`cmd.setupConnect` over `mergeHarnessConfig`; the click consents only to adding
+the entry (a different existing `citadel` entry is declined and left to
+`local config --write`), and the request must name the file the page showed.
+Sessions come from the owner through the token-authenticated `/api/summary`.
+`TestSetupRoutesAreGuarded` pins the boundary. Muse has no confirmed local
+config file, so it is not a harness; the page offers the generic entry.
+
 `localaudit.Log` owns the local co-browse audit chain under
 `<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
 month. `cmd.localStateDir` owns where local mode keeps its owner lock, audit
@@ -1785,6 +1798,62 @@ reports unavailable state explicitly; only the local-presence `Lockout.Reset`
 may discard unreadable/corrupt history and its untrusted verification anchor.
 See `docs/nodevault-cross-process-lockout.md` for the mixed-version, ownership,
 publication-review and native-platform boundaries.
+
+### HPC profile: job-scoped, API-only worker (aceteam#12715)
+
+`cmd.resolveProfileSelection` owns profile selection (`--profile` /
+`CITADEL_PROFILE`; a disagreeing pair or an unknown name is refused, so a stray
+`CITADEL_PROFILE` makes every command exit 2 on an ordinary host).
+`cmd.hpcEarlyRefusal` runs from `Execute` before cobra dispatches and refuses
+any command path that `cmd.hpcProfileAllowsCommand` (the positive list) does
+not name, including commands with their own pre-run. `cmd.applyRunProfile`
+installs the profile for the allowed ones. `hpc.ResolveLayout` decides the
+job root from `SLURM_JOB_ID` (plus `SLURM_RESTART_COUNT`) under
+`--hpc-state-root` / `CITADEL_HPC_STATE_ROOT` or `TMPDIR`, refusing missing or
+ambiguous input; `hpc.Prepare` owns the owner-only checks, including refusing
+a state base or ancestor that group or other can write without the sticky bit. `hpcscope.Install`
+makes the layout authoritative through the one-shot production scopes
+`platform.ScopeProcessDirectories` and `network.ScopeProcessStateDirectories`
+(test fixtures still win), and calls `nodeidentity.DisableLegacyReadThrough`
+so a shared home's key is never adopted. `internal/hpcscope`'s
+two-allocation subprocess test pins that no resolved path leaves the job root.
+`runWork` hands off to `runHPCWork` before anything else; the HPC worker is a
+separate positive list (`newHPCRunner`, `hpcQueueNames`), not gates inside
+`runWork`. `llm_inference` routes only through `hpcEngineBackends` (the job's
+own engine port, no default-port fallback). `hpc_work_tripwire_test.go` lists
+the entry points it must never reference (it follows the named `work.go`
+helpers and resolves import aliases), `hpc_work_listen_linux_test.go` asserts
+the production entry opens no listener, and `hpcTemplateBuiltinPolicy` owns
+which template builtins run.
+`cmd.enrollHPCNode` owns non-interactive enrollment (aceteam#12717): it
+resolves labels with `hpc.ResolveLabels` (the platform's strict label schema,
+so a missing Slurm value refuses before the token is read), generates the
+job key and CSR, then `hpc.ReadTokenFile` (opened O_NOFOLLOW and non-blocking,
+judged on the descriptor, removed only if the path still names it), and
+persists the response into the job-local `config.yaml` and identity store.
+`hpc.VerifyLeafKey` requires a leaf for the job key; any local failure after
+the server accepted the token makes a bounded best-effort deregister.
+`hpcShutdown` owns exit ordering: on the drain signal (SIGUSR1) stop claiming,
+wait up to `--hpc-drain-timeout`, deregister, cancel; SIGTERM, including one
+that arrives during the drain wait, deregisters at once. Deregistration runs
+once on every exit path after enrollment.
+The launcher (aceteam#12718): `hpc.JobSpec.Normalize` validates every value
+`hpc.RenderSbatch` writes (golden in `internal/hpc/testdata`), and `citadel hpc
+launch`/`setup` run on a login node with no profile. `hpc.Supervisor` owns the
+job body `citadel hpc run`: engine on a per-job 127.0.0.1 port in its own
+process group, `/v1/models` readiness, then the worker as a child
+`citadel work --profile hpc` with `CITADEL_VLLM_HOST_PORT` set (that env var,
+resolved at process init by `services.resolveVLLMHostPort`, is the adoption
+seam; the adoption record needs a numeric node id). `hpc.reservedFlag` owns
+the vLLM flag refusal (abbreviations, underscore spellings, `--config`), and
+`EngineSpec.Command` appends the fixed flags last. `hpc.WaitModelsReadyOwned`
+with `hpc.CheckListenerOwner` refuses a port held by another uid before any
+probe. `Supervisor.Run` keeps the first signal's deadline and exits non-zero
+for a worker error or kill. `status.filterVisibleGPUsWithUUIDs` maps UUID and
+MIG entries through `nvidia-smi -L`; `hpc.TensorParallelFor` falls back to
+`SLURM_GPUS_ON_NODE`. The venv pin is partial (vLLM only). Signals forward to the
+worker; the engine group is stopped on every exit path. Only `--runtime venv`
+runs; `hpc.ParseRuntime` refuses the reserved ones.
 
 ### Manifest Loading
 `cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,
@@ -4166,13 +4235,15 @@ fails, so an unknown page degrades to `admit_timeout`, never a false
 
 `worker.retainsTerminalResult` decides which job types also store their first
 terminal stream:v1 envelope under `worker.TerminalResultKey`, so a coordinator
-that was restarting during the publish can recover it (aceteam#13175). Direct
-Redis only: `RedisStreamWriter.publishTerminal` publishes first, then
+that was restarting during the publish can recover it (aceteam#13175).
+`RedisStreamWriter.publishTerminal` publishes first, then
 `SET NX EX` (first writer wins, so a refused redelivery cannot overwrite a good
 transcript), and never returns a retention error to the publish retry. API mode
-does NOT retain: the generic KV route is not org/node scoped, so
-`worker.apiTerminalRetainer` returns nil until a scoped result endpoint exists.
-Do not route retention through `/api/fabric/redis/kv`. Contract for the backend
+retains too: `worker.apiTerminalRetainer` posts the same envelope to the scoped
+`POST /api/fabric/redis/jobs/{jobId}/result` route via
+`redisapi.Client.RetainTerminalResult`, after the terminal publish, best-effort
+and bounded. An envelope over `redisapi.MaxTerminalResultBytes` is skipped with a
+log, never truncated. Do not route retention through `/api/fabric/redis/kv`. Contract for the backend
 reader: `docs/meeting-join-terminal-result.md`; tests in
 `internal/worker/terminal_retention_test.go`.
 
@@ -4323,6 +4394,65 @@ control-center worker has no periodic updater; its shared remote-update
 handler keeps the permanent drain. External-engine `MODULE_SET` also owns a
 separate `BeginDrain()` scope: its failed re-exec path releases only that
 scope after rollback, rather than clearing a concurrent permanent drain.
+
+**Co-browse sessions across a self-update restart (citadel-cli#1546).**
+`update.AutoUpdaterConfig.Busy` (wired to `platform.CobrowseBusy`) defers the
+cycle while a session has a viewer attached or a handoff outstanding, checked
+before download and again before the swap; `AutoUpdater.deferForBusy` owns the
+`deferred_busy` result and the bound (`update.ResolveMaxDefer`, env
+`CITADEL_UPDATE_MAX_DEFER_SECONDS`, 0 never forces). Every in-process exec goes
+through `update.RestartProcess`, which runs the hook `cmd` registers
+(`platform.PrepareSelfRestart`). `platform.recoverSessions` owns re-adoption:
+each session has a registry record (state live/suspended/expired, generation
+counter) in a registry dir that `platform.SetRegistryDirResolver` points at the
+node config dir (the single place the location is chosen; the profile and session
+dirs stay in the temp base). A restart re-adopts a live record under the same id
+only if owner, browser and Xvfb start times, role, CDP identity and dir all
+verify, BEFORE the orphan sweep (which treats a dir owned by our own PID as
+stale). A live record that fails becomes `expired` with its `ended_reason`, never
+a silent delete; suspended records are never touched. Adoption is Linux only
+(`adoptionSupported`); elsewhere it stops sessions cleanly.
+Only the node-wide manager adopts, and only a record whose owner is this very
+process (same PID and start time, as after exec) or, for a full service restart,
+one that passes `platform.verifyDetachedOwner`; local mode and a live sibling's
+records are never adopted or modified. Persistent-profile sessions are sealed and
+stopped by `prepareSelfRestart` on every OS, and ended reasons are recorded on
+every OS.
+
+**Surviving a full service restart (Linux, citadel-cli#1546 item 2).**
+`platform.planCobrowseScope` owns the detach decision and mirrors
+`tmux.PersistentSessionCommand` (#1166): `launchXvfbCobrowseProc` starts each
+session's Xvfb and browser in their own uniquely named transient scope
+(user manager for a user unit, system manager only for a root system unit), so
+the default control-group kill leaves them running. Every other context, or a
+scoped launch that fails, retries as a direct child and logs once; that session
+then dies with a restart as before. The scope names ride in the registry record.
+`verifyDetachedOwner` owns the extra rule for a record whose owner is gone: the
+process is the managed worker (`platform.EnableDetachedCobrowse`, called by
+`runWork`, requires a service manager's `INVOCATION_ID`), the record is from the
+same OS user, the browser and Xvfb are alive in the recorded scopes, and the
+usual start-time, role and CDP checks pass. Any other process, including local
+mode, sweeps such a record instead. `stopScope` is the only way scopes are
+stopped (stop, failed adoption, sweep) and acts only while the recorded PID
+still has its recorded start time and cgroup. `ShutdownSessions` leaves scoped,
+non-persistent sessions running on the worker's shutdown signal; a permanent
+`systemctl stop` therefore leaves them until the next worker start re-adopts or
+sweeps them. Windows is unchanged: its kill-on-close Job Object ends sessions on
+any restart, and a breakaway job is a tracked follow-up.
+
+Detach rules added after review: `platform.StartManagedCobrowse` is the one
+startup call (enable the managed-worker mark, THEN recover); only a
+resolver-backed node manager of the marked worker sets `LaunchOptions.Detach`,
+so local mode and `citadel mcp` always launch directly. A non-worker `Recover`
+leaves a live scoped record and its dir alone. Scope names are validated
+(`validScopeName`, unit is the leaf cgroup component, `--` before the unit)
+before any `systemctl` call. A scoped session outlives a permanent `systemctl
+stop` for at most `CITADEL_COBROWSE_DETACH_GRACE_SECONDS` (default 900, measured
+from the record's last write); after that it is refused and swept, and status
+carries that window as the ended detail. The first failed scoped launch makes
+later launches direct for the process. `INVOCATION_ID` can be inherited by
+desktop terminals, so an interactive `citadel work` started from one is treated
+as the managed worker and detaches its sessions.
 
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
 stub on `!linux`) is the authority for "is a managed citadel service running

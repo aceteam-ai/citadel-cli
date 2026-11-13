@@ -569,3 +569,88 @@ func TestDetectOpencodeHonorsEnvAndDisabled(t *testing.T) {
 		t.Fatalf("disabled entry must not count: %+v", s)
 	}
 }
+
+func TestMergeBOMJSONKeepsBOMAndBackup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude_desktop_config.json")
+	orig := "\xEF\xBB\xBF" + `{"theme":"dark","mcpServers":{"other":{"command":"x"}}}`
+	_ = os.WriteFile(path, []byte(orig), 0o600)
+	h, _ := findHarness("claude-desktop")
+	now := time.Date(2026, 11, 8, 10, 0, 0, 0, time.UTC)
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	if !bytes.HasPrefix(b, []byte("\xEF\xBB\xBF{")) || bytes.HasPrefix(b, []byte("\xEF\xBB\xBF\xEF\xBB\xBF")) {
+		t.Fatalf("BOM must be kept exactly once: %q", b[:8])
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b[3:], &doc); err != nil || doc["theme"] != "dark" || doc["mcpServers"].(map[string]any)["citadel"] == nil {
+		t.Fatalf("merge: %v %s", err, b)
+	}
+	if bak, _ := os.ReadFile(path + ".bak-20261108T100000Z"); string(bak) != orig {
+		t.Fatal("backup must be the original bytes")
+	}
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, now); !errors.Is(err, errAlreadyConfigured) {
+		t.Fatalf("re-run: %v", err)
+	}
+	if again, _ := os.ReadFile(path); !bytes.Equal(again, b) {
+		t.Fatal("re-run must leave the file byte-identical")
+	}
+}
+
+func TestMergeBOMTOML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	_ = os.WriteFile(path, []byte("\xEF\xBB\xBFmodel = \"x\"\n"), 0o644)
+	h, _ := findHarness("codex")
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	if !strings.HasPrefix(string(b), "\xEF\xBB\xBFmodel = \"x\"\n\n[mcp_servers.citadel]") {
+		t.Fatalf("toml: %q", b)
+	}
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); !errors.Is(err, errAlreadyConfigured) {
+		t.Fatalf("re-run: %v", err)
+	}
+}
+
+func TestMergeRefusesUTF16(t *testing.T) {
+	h, _ := findHarness("claude-desktop")
+	for name, bom := range map[string]string{"UTF-16 (little endian)": "\xFF\xFE", "UTF-16 (big endian)": "\xFE\xFF"} {
+		path := filepath.Join(t.TempDir(), "c.json")
+		orig := bom + "{\x00}\x00"
+		_ = os.WriteFile(path, []byte(orig), 0o600)
+		_, err := mergeHarnessConfig(h, path, winExe, nil, time.Now())
+		if err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if b, _ := os.ReadFile(path); string(b) != orig {
+			t.Fatal("refused file must be untouched")
+		}
+	}
+}
+
+func TestMergeBOMWritesThroughSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	dir := t.TempDir()
+	real := filepath.Join(dir, "dotfiles", "c.json")
+	_ = os.MkdirAll(filepath.Dir(real), 0o700)
+	_ = os.WriteFile(real, []byte("\xEF\xBB\xBF"+`{"mcpServers":{}}`), 0o640)
+	link := filepath.Join(dir, "c.json")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := findHarness("claude-desktop")
+	written, err := mergeHarnessConfig(h, link, winExe, nil, time.Now())
+	if err != nil || written != real {
+		t.Fatalf("write-through: %q %v", written, err)
+	}
+	if fi, _ := os.Lstat(link); fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the symlink must stay a symlink")
+	}
+	if b, _ := os.ReadFile(real); !bytes.HasPrefix(b, []byte("\xEF\xBB\xBF")) || !strings.Contains(string(b), "citadel") {
+		t.Fatalf("target: %q", b)
+	}
+}

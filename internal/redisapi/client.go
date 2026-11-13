@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,6 +74,11 @@ type ClientConfig struct {
 	// DebugFunc is an optional callback for debug logging
 	DebugFunc        func(format string, args ...any)
 	PlatformObserver platformhttp.Observer
+
+	// WebSocketProxy is passed to the WebSocket client as its dial proxy. nil
+	// (every ordinary node) dials directly. The REST transport already honors
+	// HTTPS_PROXY through the cloned default transport.
+	WebSocketProxy func(*http.Request) (*url.URL, error)
 }
 
 // NewClient creates a new Redis API client.
@@ -100,6 +106,7 @@ func NewClient(cfg ClientConfig) *Client {
 		Token:            cfg.Token,
 		ReconnectEnabled: true,
 		DebugFunc:        cfg.DebugFunc,
+		Proxy:            cfg.WebSocketProxy,
 	})
 
 	return c
