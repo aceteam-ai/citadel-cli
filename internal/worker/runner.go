@@ -1809,7 +1809,7 @@ func (r *Runner) finishQueueWaitExceeded(ctx context.Context, job *Job, stream S
 	output := map[string]any{
 		"status":        "model_warming",
 		"model":         model,
-		"eta_seconds":   0,
+		"eta_seconds":   warmingRetryAfter,
 		"retry_after":   warmingRetryAfter,
 		"warming_for":   "queue",
 		"queue_wait_ms": queueWaitMs,
