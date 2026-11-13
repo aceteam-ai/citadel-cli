@@ -127,13 +127,37 @@ func TestCobrowseSessionActions_RecordRefusesHumanDriver(t *testing.T) {
 		t.Fatal(err)
 	}
 	called := false
-	err = m.WithDrivablePort(st.ID, func(int) error { called = true; return nil })
+	_, err = m.WithRecordingPort(st.ID, context.Background(), func(context.Context, int, func(func() error) error) ([]byte, error) {
+		called = true
+		return nil, nil
+	})
 	if !errors.Is(err, ErrHandedOff) || called {
 		t.Fatalf("record while handed off: err=%v, callback called=%v", err, called)
 	}
 }
 
-func TestCobrowseSessionActions_RecordReleasesDriverCustody(t *testing.T) {
+func TestCobrowseSessionActions_RecordRefusesAttachedViewer(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.MarkAttached(st.ID) {
+		t.Fatal("attach failed")
+	}
+	called := false
+	_, err = m.WithRecordingPort(st.ID, context.Background(), func(context.Context, int, func(func() error) error) ([]byte, error) {
+		called = true
+		return nil, nil
+	})
+	if !errors.Is(err, ErrHandedOff) || called {
+		t.Fatalf("record with attached viewer: err=%v, callback called=%v", err, called)
+	}
+}
+
+func TestCobrowseSessionActions_RecordHandoffCancelsCapture(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -142,39 +166,123 @@ func TestCobrowseSessionActions_RecordReleasesDriverCustody(t *testing.T) {
 		t.Fatal(err)
 	}
 	entered := make(chan struct{})
-	release := make(chan struct{})
 	recorded := make(chan error, 1)
+	published := make(chan struct{}, 1)
 	go func() {
-		recorded <- m.WithDrivablePort(st.ID, func(int) error {
+		_, err := m.WithRecordingPort(st.ID, context.Background(), func(ctx context.Context, _ int, commit func(func() error) error) ([]byte, error) {
 			close(entered)
-			<-release
-			return nil
+			<-ctx.Done()
+			return nil, commit(func() error { published <- struct{}{}; return nil })
 		})
+		recorded <- err
 	}()
 	<-entered
 	handedOff := make(chan error, 1)
 	go func() { _, err := m.Handoff(st.ID); handedOff <- err }()
 	select {
 	case err := <-handedOff:
-		t.Fatalf("handoff took driver custody before recording ended: %v", err)
-	case <-time.After(50 * time.Millisecond):
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff waited for the full recording duration")
 	}
-	close(release)
 	select {
 	case err := <-recorded:
-		if err != nil {
-			t.Fatal(err)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recording error = %v, want cancellation", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("recording did not release driver custody")
+		t.Fatal("recording did not cancel")
 	}
 	select {
-	case err := <-handedOff:
+	case <-published:
+		t.Fatal("handoff allowed cancelled recording to publish")
+	default:
+	}
+}
+
+func TestCobrowseSessionActions_RecordStopCancelsCapture(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	recorded := make(chan error, 1)
+	published := make(chan struct{}, 1)
+	go func() {
+		_, err := m.WithRecordingPort(st.ID, context.Background(), func(ctx context.Context, _ int, commit func(func() error) error) ([]byte, error) {
+			close(entered)
+			<-ctx.Done()
+			return nil, commit(func() error { published <- struct{}{}; return nil })
+		})
+		recorded <- err
+	}()
+	<-entered
+	stopped := make(chan error, 1)
+	go func() { stopped <- m.Stop(st.ID) }()
+	select {
+	case err := <-stopped:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("handoff stayed blocked after recording ended")
+		t.Fatal("stop waited for the full recording duration")
+	}
+	select {
+	case err := <-recorded:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recording error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recording did not cancel")
+	}
+	select {
+	case <-published:
+		t.Fatal("stop allowed cancelled recording to publish")
+	default:
+	}
+}
+
+func TestCobrowseSessionActions_ViewerAttachCancelsCapture(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	recorded := make(chan error, 1)
+	go func() {
+		_, err := m.WithRecordingPort(st.ID, context.Background(), func(ctx context.Context, _ int, commit func(func() error) error) ([]byte, error) {
+			close(entered)
+			<-ctx.Done()
+			return nil, commit(func() error { return nil })
+		})
+		recorded <- err
+	}()
+	<-entered
+	attached := make(chan bool, 1)
+	go func() { attached <- m.MarkAttached(st.ID) }()
+	select {
+	case ok := <-attached:
+		if !ok {
+			t.Fatal("viewer attach failed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("viewer attach waited for the full recording duration")
+	}
+	select {
+	case err := <-recorded:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recording error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recording did not cancel on viewer attach")
 	}
 }
 

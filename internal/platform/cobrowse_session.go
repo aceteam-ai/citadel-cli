@@ -30,6 +30,7 @@
 package platform
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -194,6 +195,11 @@ type cobrowseSession struct {
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
+	// A recording owns the page only until its bounded capture is published or
+	// cancelled. Stop, handoff and viewer attachment cancel it under mu, then
+	// wait on recordDone without holding mu.
+	recordCancel context.CancelFunc
+	recordDone   chan struct{}
 	// persistent marks a session launched with an encrypted profile. A
 	// re-adopted one has lost its unlocked key, so teardown cannot re-seal it.
 	persistent bool
@@ -466,14 +472,37 @@ func (m *CobrowseSessionManager) setAttached(id string, attached bool) bool {
 		return false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// Never override a terminal/launching state: attach only makes sense once running.
+	var done <-chan struct{}
 	if s.state == SessionRunning && attached {
 		s.state = SessionAttached
+		done = s.cancelRecordingLocked()
 	} else if s.state == SessionAttached && !attached {
 		s.state = SessionRunning
 	}
+	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 	return true
+}
+
+// cancelRecordingLocked signals a live capture without waiting under s.mu.
+// The caller waits for done before teardown or handing control to a viewer.
+func (s *cobrowseSession) cancelRecordingLocked() <-chan struct{} {
+	if s.recordCancel != nil {
+		s.recordCancel()
+	}
+	return s.recordDone
+}
+
+func (s *cobrowseSession) cancelRecordingAndWait() {
+	s.mu.Lock()
+	done := s.cancelRecordingLocked()
+	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // Stop tears down one session (browser + Xvfb) and removes its throwaway profile dir.
@@ -486,6 +515,7 @@ func (m *CobrowseSessionManager) Stop(id string) error {
 	if !ok {
 		return nil
 	}
+	s.cancelRecordingAndWait()
 	return s.teardown()
 }
 
@@ -498,8 +528,15 @@ func (m *CobrowseSessionManager) StopAll() error {
 	m.sessions = make(map[string]*cobrowseSession)
 	m.mu.Unlock()
 
+	// Signal every capture before waiting for any one encoder to finish.
+	for _, s := range all {
+		s.mu.Lock()
+		s.cancelRecordingLocked()
+		s.mu.Unlock()
+	}
 	var lastErr error
 	for _, s := range all {
+		s.cancelRecordingAndWait()
 		if err := s.teardown(); err != nil {
 			lastErr = err
 		}

@@ -1,7 +1,9 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +38,23 @@ func TestSaveCobrowseRecordingStaysInWorkspace(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join(workspace, "captures"))
 	if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(receipt.Path) {
 		t.Fatalf("capture entries = %v, err=%v", entries, err)
+	}
+}
+
+func TestSaveCobrowseRecordingCancelledBeforePublication(t *testing.T) {
+	workspace := t.TempDir()
+	_, err := saveCobrowseRecordingWithCommit(workspace, 1, func(file *os.File) error {
+		_, err := file.Write([]byte("partial recording"))
+		return err
+	}, func(publish func() error) error {
+		return context.Canceled
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled recording error = %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(workspace, "captures"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("cancelled recording left files: %v, err=%v", entries, err)
 	}
 }
 
