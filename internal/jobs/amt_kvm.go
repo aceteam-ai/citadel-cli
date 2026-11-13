@@ -422,7 +422,9 @@ func (r *amtRFB) key(ctx context.Context, sym uint32, down bool) error {
 	}
 	binary.BigEndian.PutUint32(packet[4:], sym)
 	trace := AMTMutationTraceFrom(ctx)
-	trace.BeginWrite()
+	if !trace.BeginWrite() {
+		return context.Canceled
+	}
 	n, err := r.conn.Write(packet)
 	trace.EndWrite(n > 0)
 	if n > 0 {

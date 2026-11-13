@@ -308,6 +308,9 @@ func TestAMTPowerOutcomeUnknownOnlyAfterWrite(t *testing.T) {
 					return &http.Response{StatusCode: 401, Header: http.Header{"Www-Authenticate": []string{`Digest realm="Intel AMT", nonce="nonce", qop="auth"`}}, Body: io.NopCloser(strings.NewReader(""))}, nil
 				}
 				if wrote {
+					if _, err := io.ReadAll(req.Body); err != nil {
+						return nil, err
+					}
 					httptrace.ContextClientTrace(req.Context()).WroteRequest(httptrace.WroteRequestInfo{})
 				}
 				return nil, errors.New("synthetic transport break")

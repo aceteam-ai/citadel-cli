@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -94,6 +95,20 @@ func digestAuthorization(challenge, username, password string) (string, error) {
 	return fmt.Sprintf(`Digest username=%q, realm=%q, nonce=%q, uri="/wsman", algorithm=MD5, qop=auth, nc=00000001, cnonce=%q, response=%q`, username, realm, nonce, cnonce, response), nil
 }
 
+// Guard the SOAP body as well as the HTTP trace. A transport that reaches
+// body reading after the watchdog froze a prewrite result gets no command bytes.
+type amtMutationBody struct {
+	io.ReadCloser
+	begin func() bool
+}
+
+func (b *amtMutationBody) Read(p []byte) (int, error) {
+	if !b.begin() {
+		return 0, context.Canceled
+	}
+	return b.ReadCloser.Read(p)
+}
+
 func (a *amtWSMan) soap(ctx context.Context, action, uri, body, selectors string) ([]byte, error) {
 	envelope := `<?xml version="1.0" encoding="utf-8"?>` +
 		`<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" ` +
@@ -125,15 +140,25 @@ func (a *amtWSMan) soap(ctx context.Context, action, uri, body, selectors string
 		trace := AMTMutationTraceFrom(ctx)
 		var began atomic.Bool
 		if mutating {
-			clientTrace := &httptrace.ClientTrace{
-				WroteHeaders: func() {
-					wroteMutation.Store(true)
-					if began.CompareAndSwap(false, true) {
-						trace.BeginWrite()
+			var once sync.Once
+			begin := func() bool {
+				once.Do(func() {
+					if trace.BeginWrite() {
+						began.Store(true)
+						wroteMutation.Store(true)
 					}
-				},
+				})
+				return began.Load()
+			}
+			req.Body = &amtMutationBody{ReadCloser: req.Body, begin: begin}
+			// An automatic body clone must not bypass the first-write guard.
+			req.GetBody = nil
+			clientTrace := &httptrace.ClientTrace{
+				WroteHeaders: func() { begin() },
 				WroteRequest: func(httptrace.WroteRequestInfo) {
-					wroteMutation.Store(true)
+					if began.Load() {
+						wroteMutation.Store(true)
+					}
 				},
 			}
 			req = req.WithContext(httptrace.WithClientTrace(req.Context(), clientTrace))

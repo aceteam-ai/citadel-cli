@@ -1210,6 +1210,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	} else {
 		result, err = r.executeObserved(handlerCtx, handler, job, handlerDeliveryStream(job, stream))
 	}
+	// Freeze before terminal classification so an abandoned AMT handler cannot
+	// turn a published prewrite failure into a later first device write.
+	amtWritePossible := amtTrace.Close()
 	stopCoopCancelWatch()
 	cancelled := stopCancellationWatch()
 	// Cooperative legacy handlers finish their current unit and return partial
@@ -1377,11 +1380,11 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// already have changed the target. Never redeliver the same action.
 		if job.Type == JobTypeAMTKVM {
 			reason := "amt_failed_no_automatic_retry"
-			var abandoned *deadlineExceededError
-			if errors.Is(actualErr, jobs.ErrAMTOutcomeUnknown) ||
-				(errors.As(actualErr, &abandoned) && amtTrace.Possible()) {
+			if amtWritePossible {
 				actualErr = jobs.ErrAMTOutcomeUnknown
 				reason = "amt_outcome_unknown"
+			} else if errors.Is(actualErr, jobs.ErrAMTOutcomeUnknown) {
+				actualErr = errors.New("AMT operation failed before a mutating write; no automatic retry")
 			}
 			r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
 			r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))

@@ -10,11 +10,20 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
-type failingAMTHandler struct{ err error }
+type failingAMTHandler struct {
+	err   error
+	write bool
+}
 
 func (failingAMTHandler) CanHandle(kind string) bool { return kind == JobTypeAMTKVM }
 
-func (h failingAMTHandler) Execute(context.Context, *Job, StreamWriter) (*JobResult, error) {
+func (h failingAMTHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	if h.write {
+		trace := jobs.AMTMutationTraceFrom(ctx)
+		if trace.BeginWrite() {
+			trace.EndWrite(true)
+		}
+	}
 	return &JobResult{Status: JobStatusFailure, Error: h.err}, h.err
 }
 
@@ -26,6 +35,8 @@ func TestAMTFailureNeverRedeliversMutation(t *testing.T) {
 		wantReason string
 		unknown    bool
 	}{
+		{"unobserved-marker", "power", jobs.ErrAMTOutcomeUnknown, "amt_failed_no_automatic_retry", false},
+		{"typed-passcode", "keys", jobs.AMTRefusal(jobs.ReasonPasscodeInvalid), "amt_failed_no_automatic_retry", false},
 		{"power-refused", "power", errors.New("AMT confirmation refused"), "amt_failed_no_automatic_retry", false},
 		{"keys-refused", "keys", errors.New("AMT permission refused"), "amt_failed_no_automatic_retry", false},
 		{"type-refused", "type", errors.New("AMT credential refused"), "amt_failed_no_automatic_retry", false},
@@ -37,7 +48,7 @@ func TestAMTFailureNeverRedeliversMutation(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			source := NewMockJobSource("test", nil)
-			runner := NewRunner(source, []JobHandler{failingAMTHandler{err: tc.err}}, RunnerConfig{WorkerID: "test-worker"})
+			runner := NewRunner(source, []JobHandler{failingAMTHandler{err: tc.err, write: tc.unknown}}, RunnerConfig{WorkerID: "test-worker"})
 			stream := &MockStreamWriter{}
 			job := &Job{
 				ID: "amt-fixture", Type: JobTypeAMTKVM,
@@ -52,6 +63,10 @@ func TestAMTFailureNeverRedeliversMutation(t *testing.T) {
 			}
 			if source.FailedData()[0]["reason"] != tc.wantReason {
 				t.Fatalf("reason = %v, want %s", source.FailedData()[0]["reason"], tc.wantReason)
+			}
+			var refusal *jobs.ShellRefusal
+			if errors.As(tc.err, &refusal) && stream.erroredErr != tc.err {
+				t.Fatal("typed prewrite refusal changed before publication")
 			}
 			if stream.errorCount != 1 || stream.erroredErr == nil || strings.Contains(stream.erroredErr.Error(), "outcome unknown") != tc.unknown {
 				t.Fatalf("terminal error = %v, want unknown=%t", stream.erroredErr, tc.unknown)
@@ -137,5 +152,60 @@ func TestAMTWatchdogDistinguishesPrewriteAndInflight(t *testing.T) {
 				t.Fatalf("published error=%v, write in flight=%t", stream.erroredErr, writeInFlight)
 			}
 		})
+	}
+}
+
+type lateFirstAMTHandler struct {
+	entered, release, done chan struct{}
+	admitted               chan bool
+}
+
+func (*lateFirstAMTHandler) CanHandle(kind string) bool { return kind == JobTypeAMTKVM }
+func (h *lateFirstAMTHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	defer close(h.done)
+	close(h.entered)
+	<-h.release
+	trace := jobs.AMTMutationTraceFrom(ctx)
+	admitted := trace.BeginWrite()
+	h.admitted <- admitted
+	if admitted {
+		trace.EndWrite(true)
+	}
+	err := errors.New("synthetic late handler completion")
+	return &JobResult{Status: JobStatusFailure, Error: err}, err
+}
+func TestAMTWatchdogBlocksLateFirstWriteAndKeepsTerminalReason(t *testing.T) {
+	handler := &lateFirstAMTHandler{entered: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{}), admitted: make(chan bool, 1)}
+	source := NewMockJobSource("test", nil)
+	stream := &MockStreamWriter{}
+	runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{WorkerID: "fixture"})
+	job := &Job{ID: "late-amt", Type: JobTypeAMTKVM, Payload: map[string]any{"operation": "power", "timeout_ms": int64(100)}, Metadata: JobMetadata{Attempts: 1, MaxAttempts: 3}}
+	completed := make(chan bool, 1)
+	go func() { completed <- runner.executeJob(context.Background(), job, stream, time.Now(), false, 0) }()
+	select {
+	case <-handler.entered:
+	case <-time.After(2 * time.Second):
+		close(handler.release)
+		t.Fatal("handler did not enter")
+	}
+	select {
+	case success := <-completed:
+		if success {
+			t.Fatal("watchdog returned success")
+		}
+	case <-time.After(2 * time.Second):
+		close(handler.release)
+		t.Fatal("watchdog did not finish")
+	}
+	close(handler.release)
+	<-handler.done
+	if <-handler.admitted {
+		t.Fatal("abandoned handler admitted a late first mutating write")
+	}
+	if len(source.FailedJobs()) != 1 || len(source.NackedJobs()) != 0 || source.FailedData()[0]["reason"] != "amt_failed_no_automatic_retry" {
+		t.Fatal("late handler changed the terminal classification or redelivered")
+	}
+	if stream.errorCount != 1 || strings.Contains(stream.erroredErr.Error(), "outcome unknown") {
+		t.Fatal("late completion replaced the prewrite terminal error")
 	}
 }
