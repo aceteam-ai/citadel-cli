@@ -20,6 +20,7 @@ type fakeVenvExec struct {
 	transformers string
 	calls        [][]string
 	failOn       string
+	noise        string
 }
 
 func (f *fakeVenvExec) run(_ context.Context, argv []string) ([]byte, error) {
@@ -33,7 +34,7 @@ func (f *fakeVenvExec) run(_ context.Context, argv []string) ([]byte, error) {
 		if f.installed == "" {
 			return []byte("ModuleNotFoundError"), errors.New("exit status 1")
 		}
-		return []byte(f.installed + "\n" + f.transformers + "\n"), nil
+		return []byte(f.noise + "citadel-probe " + f.installed + " " + f.transformers + "\n"), nil
 	case strings.HasSuffix(joined, " "+f.dir) && (strings.Contains(joined, " venv")):
 		_ = os.MkdirAll(filepath.Join(f.dir, "bin"), 0o755)
 		_ = os.WriteFile(filepath.Join(f.dir, "bin", "python"), nil, 0o755)
@@ -66,7 +67,7 @@ func TestVenvSetupPipPath(t *testing.T) {
 		{"python3.12", "-m", "venv", dir},
 		{py, "-m", "pip", "install", "--upgrade", "pip"},
 		{py, "-m", "pip", "install", "vllm==0.11.0", "transformers<5"},
-		{py, "-c", "import vllm, transformers; print(vllm.__version__); print(transformers.__version__)"},
+		{py, "-c", "import vllm, transformers; print('citadel-probe', vllm.__version__, transformers.__version__)"},
 	}
 	if !reflect.DeepEqual(f.calls, want) {
 		t.Fatalf("argv = %v\nwant %v", f.calls, want)
@@ -157,18 +158,32 @@ func TestVenvSetupTransformers5(t *testing.T) {
 		t.Fatalf("repair: got %q, %v, transformers %s", got, err, f.transformers)
 	}
 	py := filepath.Join(dir, "bin", "python")
-	if !reflect.DeepEqual(f.calls[1], []string{py, "-m", "pip", "install", "transformers<5"}) {
+	if !reflect.DeepEqual(f.calls[1], []string{py, "-m", "pip", "install", "vllm==0.11.0", "transformers<5"}) {
 		t.Fatalf("repair argv = %v", f.calls)
 	}
 }
 
 func TestCompanionPins(t *testing.T) {
-	for v, want := range map[string]bool{"0.11.0": true, "0.10.2": true, "0.11.1rc1": true, "0.12.0": false, "1.0.0": false} {
+	for v, want := range map[string]bool{"0.11.0": true, "0.10.2": true, "0.11.1rc1": true, "0.11rc1": true, "0.12.0": false, "1.0.0": false} {
 		if got := len(companionPins(v)) > 0; got != want {
 			t.Errorf("companionPins(%s) pinned=%v, want %v", v, got, want)
 		}
 	}
 	if !transformersCompatible("0.11.0", "4.57.6") || transformersCompatible("0.11.0", "5.0.0") || !transformersCompatible("0.12.0", "5.23.0") {
 		t.Fatal("transformersCompatible")
+	}
+}
+
+// Warnings on the combined output, such as the TRANSFORMERS_CACHE deprecation
+// notice many HPC sites trigger, must not hide a valid venv.
+func TestVenvSetupProbeIgnoresWarnings(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "bin"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "bin", "python"), nil, 0o755)
+	f := &fakeVenvExec{dir: dir, installed: "0.11.0", transformers: "4.57.6",
+		noise: "/x/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated\n  warnings.warn(\n"}
+	got, err := (VenvSetup{Dir: dir, VLLMVersion: "0.11.0", Exec: f.run, CheckOnly: true}).Run(context.Background())
+	if err != nil || got != "0.11.0" || len(f.calls) != 1 {
+		t.Fatalf("got %q, %v, calls %v", got, err, f.calls)
 	}
 }
