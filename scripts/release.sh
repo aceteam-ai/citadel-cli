@@ -30,6 +30,11 @@ RELEASE_GITHUB_REPO="aceteam-ai/citadel-cli"
 RELEASE_HAS_PRODUCTION="false"
 RELEASE_STATE_DIR="$REPO_ROOT/.release"
 
+# Offline Ed25519 release-signing key (PKCS#8 PEM). checksums.txt is signed
+# with it and the updater refuses releases without a valid signature. See
+# docs/release-signing.md.
+RELEASE_SIGNING_KEY="${CITADEL_RELEASE_SIGNING_KEY:-${HOME}/.config/citadel-release/release-signing-ed25519.pem}"
+
 # ── Config hooks ───────────────────────────────────────────────────────────
 
 hook_get_version() {
@@ -57,6 +62,32 @@ hook_release_notes_preamble() {
   [[ -z "$proto" ]] && return 0
   echo "**Fabric protocol: v${proto}** — the citadel-cli ↔ aceteam node/control-plane wire-contract version (#363). Bumped only on breaking wire changes, independent of this release version."
   echo
+}
+
+hook_preflight() {
+  # Fail before tagging if the signing key is missing, unreadable, or not in
+  # the compiled trusted key set. Prints only the key id.
+  if [[ ! -r "$RELEASE_SIGNING_KEY" ]]; then
+    err "Release signing key not readable: $RELEASE_SIGNING_KEY"
+    err "Set CITADEL_RELEASE_SIGNING_KEY to the offline signing key path."
+    return 1
+  fi
+  go run ./scripts/releasesign check --key "$RELEASE_SIGNING_KEY"
+}
+
+hook_pre_publish() {
+  # Releases created since immutable releases were enabled cannot gain assets
+  # later, so the signature must be attached at creation. Refuse to
+  # publish unless the signature is present and verifies for this tag.
+  local version
+  version=$(read_state "target_version")
+  local release_dir="$REPO_ROOT/release"
+  if [[ ! -f "$release_dir/checksums.txt.sig" ]]; then
+    err "checksums.txt.sig is missing from $release_dir"
+    return 1
+  fi
+  go run ./scripts/releasesign verify --tag "v${version}" \
+    --in "$release_dir/checksums.txt" --sig "$release_dir/checksums.txt.sig"
 }
 
 hook_test() {
@@ -123,6 +154,10 @@ hook_build() {
 
   (cd "$release_dir" && sha256sum * > checksums.txt)
 
+  info "Signing checksums.txt..."
+  go run ./scripts/releasesign sign --key "$RELEASE_SIGNING_KEY" --tag "v${version}" \
+    --in "$release_dir/checksums.txt" --out "$release_dir/checksums.txt.sig"
+
   ok "Built $(ls "$release_dir"/*.tar.gz "$release_dir"/*.zip 2>/dev/null | wc -l) archives"
   ls -lh "$release_dir/"
 }
@@ -130,7 +165,7 @@ hook_build() {
 hook_artifact() {
   local release_dir="$REPO_ROOT/release"
   if [[ -d "$release_dir" ]]; then
-    find "$release_dir" -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'checksums.txt' \) | sort
+    find "$release_dir" -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'checksums.txt' -o -name 'checksums.txt.sig' \) | sort
   fi
 }
 

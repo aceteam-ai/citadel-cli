@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
@@ -173,4 +174,27 @@ func (c *Client) doRequestWithTimeout(ctx context.Context, method, path string, 
 	client := *c.httpClient
 	client.Timeout = timeout
 	return c.doRequestWithClient(&client, ctx, method, path, body, result)
+}
+
+// MaxTerminalResultBytes mirrors the proxy's cap on a retained terminal
+// envelope. A larger envelope is refused client-side, never truncated.
+const MaxTerminalResultBytes = 5 * 1024 * 1024
+
+// RetainTerminalResult stores a job's terminal envelope through the scoped
+// POST /api/fabric/redis/jobs/{jobId}/result route (SET NX EX on the server,
+// assigned node only). It reports whether the server stored it; false means a
+// result already existed (first writer wins).
+func (c *Client) RetainTerminalResult(ctx context.Context, jobID string, envelope []byte, ttl time.Duration) (bool, error) {
+	if len(envelope) > MaxTerminalResultBytes {
+		return false, fmt.Errorf("terminal envelope is %d bytes, over the %d byte limit; not retained", len(envelope), MaxTerminalResultBytes)
+	}
+	body := map[string]any{"envelope": string(envelope), "ttl_seconds": int(ttl / time.Second)}
+	var resp struct {
+		Stored bool `json:"stored"`
+	}
+	path := "/api/fabric/redis/jobs/" + url.PathEscape(jobID) + "/result"
+	if err := c.doRequest(ctx, http.MethodPost, path, body, &resp); err != nil {
+		return false, err
+	}
+	return resp.Stored, nil
 }

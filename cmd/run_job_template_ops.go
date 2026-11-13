@@ -67,11 +67,20 @@ func lookupBuiltinTemplateRunner(name string) (BuiltinTemplateRunner, bool) {
 	return fn, ok
 }
 
+// errTemplateBuiltinRefused marks a builtin the running profile does not allow.
+// It is terminal: a retry on the same node cannot change the profile.
+var errTemplateBuiltinRefused = errors.New("run_job_template: builtin not available in this profile")
+
 // liveTemplateRunOps implements worker.TemplateRunOps against the node workspace
 // and the compiled-in builtin registry.
 type liveTemplateRunOps struct {
 	workspaceDir string
 	nodeID       string
+	// builtinPolicy, when non-nil, restricts which compiled-in builtins this
+	// instance may run. It returns "" to allow a builtin, else the refusal
+	// reason. nil (the ordinary node) allows every registered builtin. The HPC
+	// profile sets it so builtins that need a local listener are refused.
+	builtinPolicy func(handler string) string
 	// Per-instance seam for deterministic mutation during output hashing.
 	hashOutput func(context.Context, *os.File, int64) (string, int64, error)
 }
@@ -114,6 +123,11 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 	req.Params, err = jobs.NormalizeTemplateParams(req.Params)
 	if err != nil {
 		return nil, err
+	}
+	if o.builtinPolicy != nil {
+		if reason := o.builtinPolicy(runner.Handler); reason != "" {
+			return nil, fmt.Errorf("%w: %q: %s", errTemplateBuiltinRefused, runner.Handler, reason)
+		}
 	}
 	fn, ok := lookupBuiltinTemplateRunner(runner.Handler)
 	if !ok {

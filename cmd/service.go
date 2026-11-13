@@ -179,6 +179,12 @@ func startService(serviceName, composeFilePath string) error {
 		return fmt.Errorf("cannot start %s: %w", serviceName, policyErr)
 	}
 
+	// Module starts and manifest boot starts can bypass ensureComposeFile.
+	// Reconcile only the canonical embedded file, before the running shortcut.
+	if err := reconcileHostComposeForStart(serviceName, composeFilePath, platform.NvidiaGPUCountForCompose); err != nil {
+		return err
+	}
+
 	// Warn (never refuse) when an embedded engine will be published on all
 	// interfaces (aceteam-ai/citadel-cli#1023) -- either an opt-in `bind: all` or
 	// an engine whose compose defaults to all-interfaces (ollama). Reads the
@@ -392,6 +398,7 @@ func startService(serviceName, composeFilePath string) error {
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
 	}
+	startOllamaPreload(serviceName, manifestSvc)
 	return nil
 }
 

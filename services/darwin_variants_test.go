@@ -14,8 +14,8 @@ import (
 // darwinVariant describes a macOS CPU/arm64 compose variant (citadel-cli#1048)
 // and the EXACT, reviewed set of differences it is allowed to have from its
 // linux original. The tests below read the files directly (not the build-tagged
-// embed vars) so they run on the linux CI host even though the variant is only
-// compiled into a darwin build.
+// embed vars) so they run on Linux CI too. The historical variant filename
+// is shared by Darwin builds and runtime Linux CPU selection.
 type darwinVariant struct {
 	engine     string // ServiceMap key / top-level service name
 	linuxFile  string // filename under compose/
