@@ -240,7 +240,7 @@ func soapBody(raw []byte) (string, error) {
 	return string(raw[start:end]), nil
 }
 
-func (a *amtWSMan) bootToSetup(ctx context.Context) error {
+func (a *amtWSMan) bootToSetup(ctx context.Context) (resultErr error) {
 	uri := amtNS + "AMT_BootSettingData"
 	raw, err := a.get(ctx, uri)
 	if err != nil {
@@ -253,10 +253,6 @@ func (a *amtWSMan) bootToSetup(ctx context.Context) error {
 	if len(biosSetupField.FindAllStringIndex(instance, -1)) != 1 {
 		return errors.New("AMT BIOSSetup field missing")
 	}
-	instance = biosSetupField.ReplaceAllStringFunc(instance, func(field string) string {
-		parts := biosSetupField.FindStringSubmatch(field)
-		return "<" + parts[1] + "BIOSSetup>true</" + parts[3] + "BIOSSetup>"
-	})
 	if len(bootRoot.FindAllStringIndex(instance, -1)) != 1 {
 		return errors.New("AMT boot settings instance missing")
 	}
@@ -267,6 +263,24 @@ func (a *amtWSMan) bootToSetup(ctx context.Context) error {
 		}
 		return strings.TrimSuffix(root, ">") + ` xmlns:` + prefix + `="` + html.EscapeString(uri) + `">`
 	})
+	original := instance
+	instance = biosSetupField.ReplaceAllStringFunc(instance, func(field string) string {
+		parts := biosSetupField.FindStringSubmatch(field)
+		return "<" + parts[1] + "BIOSSetup>true</" + parts[3] + "BIOSSetup>"
+	})
+	// Even an uncertain Put can have armed BIOSSetup. On any later failure,
+	// attempt to restore the exact original settings under a fresh bounded
+	// cleanup context, including when the job's deadline has already expired.
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, restoreErr := a.soap(cleanupCtx, transferNS+"Put", uri, original, ""); restoreErr != nil {
+			resultErr = errors.Join(resultErr, errors.New("AMT boot settings restoration unconfirmed"))
+		}
+	}()
 	if _, err = a.soap(ctx, transferNS+"Put", uri, instance, ""); err != nil {
 		return err
 	}

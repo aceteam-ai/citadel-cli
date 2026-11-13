@@ -160,10 +160,10 @@ func (h *AMTKVMHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 					}
 				case "keys":
 					var count int
-					count, err = rfb.keys(job.Payload["keys"])
+					count, err = rfb.keys(ctx.Context(), job.Payload["keys"])
 					result = map[string]any{"events_sent": count}
 				case "type":
-					err = rfb.typeText(job.Payload["text"])
+					err = rfb.typeText(ctx.Context(), job.Payload["text"])
 					result = map[string]any{"typed": len(job.Payload["text"])}
 				}
 			}
@@ -387,7 +387,23 @@ func newAMTRFB(conn net.Conn) (*amtRFB, error) {
 	return &amtRFB{conn: conn, width: w, height: h}, nil
 }
 
-func (r *amtRFB) key(sym uint32, down bool) error {
+// Each key write gets its own bounded I/O window. The initial redirection
+// handshake deadline must not cut off a valid paced 4096-byte input at 30s.
+func (r *amtRFB) key(ctx context.Context, sym uint32, down bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
+		deadline = parent
+	}
+	if err := r.conn.SetWriteDeadline(deadline); err != nil {
+		return errors.New("AMT redirection write deadline unavailable")
+	}
+	// Cancellation must also interrupt a blocked write, not only pacing.
+	stop := context.AfterFunc(ctx, func() { _ = r.conn.Close() })
+	defer stop()
+
 	packet := make([]byte, 8)
 	packet[0] = 4
 	if down {
@@ -422,7 +438,7 @@ func amtKeysym(token string) (uint32, error) {
 	return 0, errors.New("unsupported AMT key")
 }
 
-func (r *amtRFB) keys(combo string) (int, error) {
+func (r *amtRFB) keys(ctx context.Context, combo string) (int, error) {
 	parts := strings.Split(combo, "+")
 	if len(parts) == 0 || len(parts) > 8 || combo == "" {
 		return 0, errors.New("AMT key combination invalid")
@@ -436,20 +452,22 @@ func (r *amtRFB) keys(combo string) (int, error) {
 		syms = append(syms, sym)
 	}
 	for _, sym := range syms {
-		if err := r.key(sym, true); err != nil {
+		if err := r.key(ctx, sym, true); err != nil {
 			return 0, err
 		}
 	}
-	time.Sleep(50 * time.Millisecond)
+	if err := amtInputPause(ctx, 50*time.Millisecond); err != nil {
+		return 0, err
+	}
 	for i := len(syms) - 1; i >= 0; i-- {
-		if err := r.key(syms[i], false); err != nil {
+		if err := r.key(ctx, syms[i], false); err != nil {
 			return 0, err
 		}
 	}
 	return len(syms) * 2, nil
 }
 
-func (r *amtRFB) typeText(value string) error {
+func (r *amtRFB) typeText(ctx context.Context, value string) error {
 	if value == "" || len(value) > 4096 {
 		return errors.New("AMT text length invalid")
 	}
@@ -466,15 +484,28 @@ func (r *amtRFB) typeText(value string) error {
 		if c == '\t' {
 			sym = 0xff09
 		}
-		if err := r.key(sym, true); err != nil {
+		if err := r.key(ctx, sym, true); err != nil {
 			return err
 		}
-		if err := r.key(sym, false); err != nil {
+		if err := r.key(ctx, sym, false); err != nil {
 			return err
 		}
-		time.Sleep(30 * time.Millisecond)
+		if err := amtInputPause(ctx, 30*time.Millisecond); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func amtInputPause(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
 
 func (r *amtRFB) screenshot() ([]byte, error) {
