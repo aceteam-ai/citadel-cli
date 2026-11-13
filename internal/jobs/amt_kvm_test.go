@@ -346,6 +346,29 @@ func TestAMTPowerAuthenticationRefusalRemainsDefinitive(t *testing.T) {
 	}
 }
 
+func TestAMTPowerFirstRequestForbiddenRemainsDefinitive(t *testing.T) {
+	client, err := newAMTWSMan("192.168.2.10", "admin", "synthetic-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.client.Transport = amtRoundTrip(func(req *http.Request) (*http.Response, error) {
+		if req.Header.Get("Authorization") != "" {
+			t.Fatal("403 before the digest challenge must not send a second request")
+		}
+		httptrace.ContextClientTrace(req.Context()).WroteHeaders()
+		httptrace.ContextClientTrace(req.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+		return &http.Response{StatusCode: 403, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	ctx, trace := WithAMTMutationTrace(context.Background())
+	err = client.power(ctx, "reset")
+	if err == nil || errors.Is(err, ErrAMTOutcomeUnknown) || !strings.Contains(err.Error(), "challenge unavailable (403)") {
+		t.Fatalf("first-request 403 was misclassified: %v", err)
+	}
+	if trace.Possible() {
+		t.Fatal("definitive first-request 403 left a possible mutation")
+	}
+}
+
 func TestAMTWSManTraceVisibleWhileWriteIsInFlight(t *testing.T) {
 	client, err := newAMTWSMan("192.168.2.10", "admin", "synthetic-password")
 	if err != nil {

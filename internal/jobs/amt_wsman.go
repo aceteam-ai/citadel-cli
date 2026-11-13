@@ -164,10 +164,15 @@ func (a *amtWSMan) soap(ctx context.Context, action, uri, body, selectors string
 			req = req.WithContext(httptrace.WithClientTrace(req.Context(), clientTrace))
 		}
 		resp, err := a.client.Do(req)
+		refused := err == nil && resp != nil &&
+			(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden)
 		if began.Load() {
-			refused := err == nil && resp != nil &&
-				(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden)
 			trace.EndWrite(!refused)
+		}
+		if refused {
+			// A completed auth refusal proves this attempt did not mutate the
+			// device, including a 403 before any digest challenge.
+			wroteMutation.Store(false)
 		}
 		return resp, err
 	}
