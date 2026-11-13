@@ -122,13 +122,29 @@ func (a *amtWSMan) soap(ctx context.Context, action, uri, body, selectors string
 		if auth != "" {
 			req.Header.Set("Authorization", auth)
 		}
+		trace := AMTMutationTraceFrom(ctx)
+		var began atomic.Bool
 		if mutating {
-			trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) {
-				wroteMutation.Store(true)
-			}}
-			req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+			clientTrace := &httptrace.ClientTrace{
+				WroteHeaders: func() {
+					wroteMutation.Store(true)
+					if began.CompareAndSwap(false, true) {
+						trace.BeginWrite()
+					}
+				},
+				WroteRequest: func(httptrace.WroteRequestInfo) {
+					wroteMutation.Store(true)
+				},
+			}
+			req = req.WithContext(httptrace.WithClientTrace(req.Context(), clientTrace))
 		}
-		return a.client.Do(req)
+		resp, err := a.client.Do(req)
+		if began.Load() {
+			refused := err == nil && resp != nil &&
+				(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden)
+			trace.EndWrite(!refused)
+		}
+		return resp, err
 	}
 	first, err := request("")
 	if err != nil {
@@ -300,7 +316,7 @@ func (a *amtWSMan) bootToSetup(ctx context.Context) (resultErr error) {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if _, restoreErr := a.soap(cleanupCtx, transferNS+"Put", uri, original, ""); restoreErr != nil {
-			resultErr = errors.Join(resultErr, errors.New("AMT boot settings restoration unconfirmed"))
+			resultErr = errors.Join(resultErr, ErrAMTOutcomeUnknown, errors.New("AMT boot settings restoration unconfirmed"))
 		}
 	}()
 	if _, err = a.soap(ctx, transferNS+"Put", uri, instance, ""); err != nil {

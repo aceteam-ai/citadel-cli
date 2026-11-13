@@ -35,9 +35,13 @@ func (c *amtInputConn) Close() error { return nil }
 func TestAMTKeyRenewsExpiredHandshakeDeadline(t *testing.T) {
 	conn := &amtInputConn{deadline: time.Now().Add(-time.Second)}
 	r := &amtRFB{conn: conn}
+	ctx, trace := WithAMTMutationTrace(context.Background())
 	before := time.Now()
-	if err := r.key(context.Background(), 'x', true); err != nil {
+	if err := r.key(ctx, 'x', true); err != nil {
 		t.Fatal(err)
+	}
+	if !trace.Possible() {
+		t.Fatal("written RFB key was not visible to the runner's watchdog")
 	}
 	if conn.writes != 1 || conn.deadline.Before(before.Add(29*time.Second)) || conn.deadline.After(time.Now().Add(30*time.Second)) {
 		t.Fatalf("key did not get a bounded fresh deadline: writes=%d deadline=%v", conn.writes, conn.deadline)
@@ -232,7 +236,7 @@ func TestAMTBootRestorationFailureIsReported(t *testing.T) {
 		return nil, errors.New("synthetic failed response")
 	})
 	err = a.bootToSetup(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "restoration unconfirmed") || puts != 2 {
+	if err == nil || !errors.Is(err, ErrAMTOutcomeUnknown) || !strings.Contains(err.Error(), "restoration unconfirmed") || puts != 2 {
 		t.Fatalf("uncertain restore hidden: puts=%d err=%v", puts, err)
 	}
 }

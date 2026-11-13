@@ -1199,6 +1199,10 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	// other job type; never combined with the hard huddle watch (HUDDLE_JOIN
 	// declares no cooperative cancel).
 	handlerCtx, stopCoopCancelWatch := r.watchCooperativeCancellation(handlerCtx, job)
+	var amtTrace *jobs.AMTMutationTrace
+	if job.Type == JobTypeAMTKVM {
+		handlerCtx, amtTrace = jobs.WithAMTMutationTrace(handlerCtx)
+	}
 	if budgetErr != nil {
 		err = budgetErr
 	} else if bounded {
@@ -1373,7 +1377,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		// already have changed the target. Never redeliver the same action.
 		if job.Type == JobTypeAMTKVM {
 			reason := "amt_failed_no_automatic_retry"
-			if errors.Is(actualErr, jobs.ErrAMTOutcomeUnknown) {
+			var abandoned *deadlineExceededError
+			if errors.Is(actualErr, jobs.ErrAMTOutcomeUnknown) ||
+				(errors.As(actualErr, &abandoned) && amtTrace.Possible()) {
 				actualErr = jobs.ErrAMTOutcomeUnknown
 				reason = "amt_outcome_unknown"
 			}

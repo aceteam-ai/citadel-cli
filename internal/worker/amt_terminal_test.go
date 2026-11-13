@@ -59,3 +59,83 @@ func TestAMTFailureNeverRedeliversMutation(t *testing.T) {
 		})
 	}
 }
+
+type stalledAMTHandler struct {
+	writeInFlight bool
+	entered       chan struct{}
+	release       chan struct{}
+	done          chan struct{}
+}
+
+func (*stalledAMTHandler) CanHandle(kind string) bool { return kind == JobTypeAMTKVM }
+
+func (h *stalledAMTHandler) Execute(ctx context.Context, _ *Job, _ StreamWriter) (*JobResult, error) {
+	defer close(h.done)
+	trace := jobs.AMTMutationTraceFrom(ctx)
+	if h.writeInFlight {
+		trace.BeginWrite()
+	}
+	close(h.entered)
+	<-h.release
+	if h.writeInFlight {
+		trace.EndWrite(false)
+	}
+	err := errors.New("synthetic handler stopped")
+	return &JobResult{Status: JobStatusFailure, Error: err}, err
+}
+
+func TestAMTWatchdogDistinguishesPrewriteAndInflight(t *testing.T) {
+	for _, writeInFlight := range []bool{false, true} {
+		name := "prewrite"
+		wantReason := "amt_failed_no_automatic_retry"
+		if writeInFlight {
+			name = "inflight-write"
+			wantReason = "amt_outcome_unknown"
+		}
+		t.Run(name, func(t *testing.T) {
+			handler := &stalledAMTHandler{
+				writeInFlight: writeInFlight,
+				entered:       make(chan struct{}), release: make(chan struct{}), done: make(chan struct{}),
+			}
+			source := NewMockJobSource("test", nil)
+			runner := NewRunner(source, []JobHandler{handler}, RunnerConfig{WorkerID: "test-worker"})
+			stream := &MockStreamWriter{}
+			job := &Job{
+				ID: "amt-watchdog", Type: JobTypeAMTKVM,
+				Payload:  map[string]any{"operation": "keys", "timeout_ms": int64(100)},
+				Metadata: JobMetadata{Attempts: 1, MaxAttempts: 3},
+			}
+			completed := make(chan bool, 1)
+			go func() {
+				completed <- runner.executeJob(context.Background(), job, stream, time.Now(), false, 0)
+			}()
+			select {
+			case <-handler.entered:
+			case <-time.After(2 * time.Second):
+				close(handler.release)
+				t.Fatal("AMT handler did not enter before watchdog")
+			}
+			var succeeded bool
+			select {
+			case succeeded = <-completed:
+			case <-time.After(2 * time.Second):
+				close(handler.release)
+				t.Fatal("AMT watchdog did not return")
+			}
+			if succeeded {
+				t.Fatal("abandoned AMT handler reported success")
+			}
+			close(handler.release)
+			<-handler.done
+			if len(source.FailedJobs()) != 1 || len(source.NackedJobs()) != 0 {
+				t.Fatalf("watchdog must be terminal: failed=%d nacked=%d", len(source.FailedJobs()), len(source.NackedJobs()))
+			}
+			if got := source.FailedData()[0]["reason"]; got != wantReason {
+				t.Fatalf("reason=%v, want %s", got, wantReason)
+			}
+			if stream.erroredErr == nil || strings.Contains(stream.erroredErr.Error(), "outcome unknown") != writeInFlight {
+				t.Fatalf("published error=%v, write in flight=%t", stream.erroredErr, writeInFlight)
+			}
+		})
+	}
+}

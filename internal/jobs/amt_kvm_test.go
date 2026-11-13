@@ -329,11 +329,51 @@ func TestAMTPowerAuthenticationRefusalRemainsDefinitive(t *testing.T) {
 		if req.Header.Get("Authorization") == "" {
 			return &http.Response{StatusCode: 401, Header: http.Header{"Www-Authenticate": []string{`Digest realm="Intel AMT", nonce="nonce", qop="auth"`}}, Body: io.NopCloser(strings.NewReader(""))}, nil
 		}
+		httptrace.ContextClientTrace(req.Context()).WroteHeaders()
 		httptrace.ContextClientTrace(req.Context()).WroteRequest(httptrace.WroteRequestInfo{})
 		return &http.Response{StatusCode: 401, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
 	})
-	err = client.power(context.Background(), "reset")
+	ctx, trace := WithAMTMutationTrace(context.Background())
+	err = client.power(ctx, "reset")
 	if err == nil || errors.Is(err, ErrAMTOutcomeUnknown) || !strings.Contains(err.Error(), "authentication refused") {
 		t.Fatalf("definitive authentication refusal was misclassified: %v", err)
+	}
+	if trace.Possible() {
+		t.Fatal("definitive authentication refusal left a possible mutation for the watchdog")
+	}
+}
+
+func TestAMTWSManTraceVisibleWhileWriteIsInFlight(t *testing.T) {
+	client, err := newAMTWSMan("192.168.2.10", "admin", "synthetic-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	client.client.Transport = amtRoundTrip(func(req *http.Request) (*http.Response, error) {
+		if req.Header.Get("Authorization") == "" {
+			return &http.Response{StatusCode: 401, Header: http.Header{"Www-Authenticate": []string{`Digest realm="Intel AMT", nonce="nonce", qop="auth"`}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}
+		httptrace.ContextClientTrace(req.Context()).WroteHeaders()
+		close(entered)
+		<-release
+		return nil, errors.New("synthetic response loss")
+	})
+	ctx, trace := WithAMTMutationTrace(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.power(ctx, "reset") }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("mutating write did not start")
+	}
+	if !trace.Possible() {
+		close(release)
+		t.Fatal("watchdog cannot observe the in-flight WS-MAN write")
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, ErrAMTOutcomeUnknown) || !trace.Possible() {
+		t.Fatalf("written request lost its unknown outcome: %v", err)
 	}
 }
