@@ -216,3 +216,44 @@ func TestHTTPProxyURLDiagnosticsHidePathsAndUnknownQueryValues(t *testing.T) {
 		t.Fatal("failed request unexpectedly reached the closed fixture")
 	}
 }
+
+func TestHTTPProxyShortUserinfoCredentialNeverReachesDiagnostics(t *testing.T) {
+	const username = "fakeKey12345"
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		user, password, ok := r.BasicAuth()
+		if !ok || user != username || password != "" {
+			t.Error("diagnostic redaction changed the actual userinfo credential")
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	endpoint := srv.URL
+	port := portOf(t, endpoint)
+	target := strings.Replace(endpoint, "http://", "http://"+username+"@", 1) + "/secret"
+	for _, succeeds := range []bool{true, false} {
+		if !succeeds {
+			srv.Close()
+		}
+		var logs []string
+		_, err := (&HTTPProxyHandler{localPorts: map[int]bool{port: true}}).Execute(JobContext{LogFn: func(_, text string) { logs = append(logs, text) }}, &nexus.Job{ID: "synthetic", Payload: map[string]string{"url": target}})
+		if succeeds && err != nil {
+			t.Fatal("synthetic request failed")
+		}
+		if !succeeds && (err == nil || !errors.Is(err, syscall.ECONNREFUSED)) {
+			t.Fatal("closed fixture did not exercise request failure")
+		}
+		if err != nil {
+			logs = append(logs, err.Error())
+		}
+		for _, text := range logs {
+			if strings.Contains(text, username) || strings.Contains(text, "/secret") {
+				t.Fatal("short userinfo credential or path reached diagnostics")
+			}
+		}
+	}
+	if hits.Load() != 1 {
+		t.Fatal("unexpected request count")
+	}
+}

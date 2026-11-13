@@ -100,13 +100,10 @@ func URL(raw string) string {
 	if u.User != nil {
 		name := u.User.Username()
 		pw, hasPw := u.User.Password()
-		// A long username is often the credential itself (a token before
-		// the @), so it is fingerprinted; short ones stay as plain names.
-		if len([]rune(name)) >= fingerprintMinLen {
-			fp := Fingerprint(name)
-			restore = append(restore, url.User(fp).String(), fp)
-			name = fp
-		}
+		// Any username may itself be a credential, even when it is short.
+		nameFP := Fingerprint(name)
+		restore = append(restore, url.User(nameFP).String(), nameFP)
+		name = nameFP
 		if hasPw {
 			fp := Fingerprint(pw)
 			restore = append(restore, strings.TrimPrefix(url.UserPassword("", fp).String(), ":"), fp)
