@@ -3776,3 +3776,18 @@ Auto-generated log of every release.
   - feat(hpc): approve-on-arrival enrollment (--org) (#1616)
 
 
+---
+
+## v2.226.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +631 |
+
+**Changes:**
+
+  - Log credential fingerprints instead of full values (#1603)
+
+
