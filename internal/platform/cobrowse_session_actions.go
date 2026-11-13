@@ -199,8 +199,17 @@ func (m *CobrowseSessionManager) WithRecordingPort(
 	if err != nil {
 		return nil, err
 	}
+	return s.withRecordingPort(parent, action)
+}
+
+// A request can retain s after Stop removes it from the manager map. Admission
+// must therefore check stopping under s.mu, even when lookup already succeeded.
+func (s *cobrowseSession) withRecordingPort(
+	parent context.Context,
+	action func(context.Context, int, func(func() error) error) ([]byte, error),
+) ([]byte, error) {
 	s.mu.Lock()
-	if s.proc == nil {
+	if s.stopping || s.proc == nil {
 		s.mu.Unlock()
 		return nil, ErrNotStarted
 	}
@@ -248,7 +257,10 @@ func (m *CobrowseSessionManager) WithRecordingPort(
 		if err := recordCtx.Err(); err != nil {
 			return err
 		}
-		if s.proc == nil || s.humanDrivingLocked() || s.state == SessionAttached {
+		if s.stopping || s.proc == nil {
+			return ErrNotStarted
+		}
+		if s.humanDrivingLocked() || s.state == SessionAttached {
 			return ErrHandedOff
 		}
 		if err := publish(); err != nil {

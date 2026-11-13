@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,6 +92,48 @@ func TestRecordWebMRejectsUnboundedDuration(t *testing.T) {
 		if err := RecordWebM(context.Background(), 9222, file, duration); err == nil {
 			t.Fatalf("duration %v accepted", duration)
 		}
+	}
+}
+
+func TestRecordWebMDiscoveryCancellation(t *testing.T) {
+	// Stop or handoff must interrupt target discovery, before the WebSocket
+	// dial. The resolver's HTTP request must use the recording context.
+	originalTarget := cdpTargetURL
+	originalClient := cdpHTTPClient
+	entered := make(chan struct{})
+	cdpTargetURL = defaultCDPTargetURL
+	cdpHTTPClient = &http.Client{Timeout: 2 * time.Second, Transport: discoveryRoundTrip(func(request *http.Request) (*http.Response, error) {
+		close(entered)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}
+	t.Cleanup(func() {
+		cdpTargetURL = originalTarget
+		cdpHTTPClient = originalClient
+	})
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ffmpeg"), []byte("#!/bin/sh\nexec cat >/dev/null\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	file, _ := newRecordOutput(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- RecordWebM(ctx, 9222, file, time.Second) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recording did not reach target discovery")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recording returned %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled target discovery held the recording")
 	}
 }
 

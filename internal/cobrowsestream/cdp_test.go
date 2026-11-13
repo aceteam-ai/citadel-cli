@@ -253,7 +253,7 @@ func (f *fakeChrome) mouseEvents() []map[string]any {
 func withFakeCDP(t *testing.T, f *fakeChrome) {
 	t.Helper()
 	orig := cdpTargetURL
-	cdpTargetURL = func(int) (string, error) { return f.wsURL(), nil }
+	cdpTargetURL = func(context.Context, int) (string, error) { return f.wsURL(), nil }
 	t.Cleanup(func() { cdpTargetURL = orig })
 }
 
@@ -420,7 +420,7 @@ func withCDPMessageFixture(t *testing.T, send func(*websocket.Conn) error) (<-ch
 		server.Close()
 	})
 	original := cdpTargetURL
-	cdpTargetURL = func(int) (string, error) {
+	cdpTargetURL = func(context.Context, int) (string, error) {
 		return "ws" + strings.TrimPrefix(server.URL, "http"), nil
 	}
 	t.Cleanup(func() { cdpTargetURL = original })
@@ -574,7 +574,7 @@ func TestCDPDialPinsCompressionOffWithoutMutatingDefault(t *testing.T) {
 func TestCDPSmallLimitSeamCannotDisableOrIncreaseBudget(t *testing.T) {
 	original := cdpTargetURL
 	lookups := 0
-	cdpTargetURL = func(int) (string, error) {
+	cdpTargetURL = func(context.Context, int) (string, error) {
 		lookups++
 		return "", nil
 	}
@@ -705,7 +705,7 @@ func withRawCDPUpgrade(t *testing.T, extensions []string, compressed bool) <-cha
 		server.Close()
 	})
 	original := cdpTargetURL
-	cdpTargetURL = func(int) (string, error) {
+	cdpTargetURL = func(context.Context, int) (string, error) {
 		return "ws" + strings.TrimPrefix(server.URL, "http"), nil
 	}
 	t.Cleanup(func() { cdpTargetURL = original })

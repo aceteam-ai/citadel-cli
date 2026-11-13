@@ -210,6 +210,10 @@ func TestCobrowseSessionActions_RecordStopCancelsCapture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s, err := m.sessionForAction(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	entered := make(chan struct{})
 	recorded := make(chan error, 1)
 	published := make(chan struct{}, 1)
@@ -240,10 +244,73 @@ func TestCobrowseSessionActions_RecordStopCancelsCapture(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("recording did not cancel")
 	}
+	s.mu.Lock()
+	stopping := s.stopping
+	s.mu.Unlock()
+	if !stopping {
+		t.Fatal("Stop did not mark the retained session terminal")
+	}
 	select {
 	case <-published:
 		t.Fatal("stop allowed cancelled recording to publish")
 	default:
+	}
+}
+
+func TestCobrowseSessionActions_RetainedPointerCannotStartAfterStopBegins(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a request that finished manager lookup before Stop removed the
+	// map entry. Stop's terminal mark runs before teardown clears proc.
+	s, err := m.sessionForAction(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRecording(s.beginStoppingRecording())
+	s.mu.Lock()
+	procStillPresent := s.proc != nil
+	s.mu.Unlock()
+	if !procStillPresent {
+		t.Fatal("test did not exercise the pre-teardown admission gap")
+	}
+	called := false
+	result, err := s.withRecordingPort(context.Background(), func(context.Context, int, func(func() error) error) ([]byte, error) {
+		called = true
+		return []byte("receipt"), nil
+	})
+	if !errors.Is(err, ErrNotStarted) || called || result != nil {
+		t.Fatalf("late recording: result=%q, err=%v, capture called=%v", result, err, called)
+	}
+	if err := m.Stop(st.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCobrowseSessionActions_StopAllMarksSessionsTerminal(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := m.sessionForAction(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.StopAll(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	stopping := s.stopping
+	s.mu.Unlock()
+	if !stopping {
+		t.Fatal("StopAll did not mark the retained session terminal")
 	}
 }
 

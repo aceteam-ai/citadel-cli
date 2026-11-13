@@ -25,12 +25,16 @@ var cdpTargetURL = defaultCDPTargetURL
 // leaves room for its CDP envelope. It is not an aggregate memory bound.
 const maxCDPMessageBytes int64 = 64 << 20
 
-func defaultCDPTargetURL(debugPort int) (string, error) {
-	return discoverCDPTargetURL(debugPort, cdpHTTPClient)
+func defaultCDPTargetURL(ctx context.Context, debugPort int) (string, error) {
+	return discoverCDPTargetURLContext(ctx, debugPort, cdpHTTPClient)
 }
 
 func discoverCDPTargetURL(debugPort int, client *http.Client) (string, error) {
-	target, err := cdpdiscovery.Discover(context.Background(), debugPort, client)
+	return discoverCDPTargetURLContext(context.Background(), debugPort, client)
+}
+
+func discoverCDPTargetURLContext(ctx context.Context, debugPort int, client *http.Client) (string, error) {
+	target, err := cdpdiscovery.Discover(ctx, debugPort, client)
 	if err != nil {
 		return "", err
 	}
@@ -132,7 +136,7 @@ func dialCDPWithReadLimitContext(parent context.Context, debugPort int, onFrame 
 	if readLimit <= 0 || readLimit > maxCDPMessageBytes {
 		return nil, fmt.Errorf("CDP read limit is invalid")
 	}
-	wsURL, err := cdpTargetURL(debugPort)
+	wsURL, err := cdpTargetURL(parent, debugPort)
 	if err != nil {
 		return nil, err
 	}

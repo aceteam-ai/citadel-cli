@@ -200,6 +200,9 @@ type cobrowseSession struct {
 	// wait on recordDone without holding mu.
 	recordCancel context.CancelFunc
 	recordDone   chan struct{}
+	// stopping closes the admission gap after the manager removes this session
+	// from its map but before teardown clears proc.
+	stopping bool
 	// persistent marks a session launched with an encrypted profile. A
 	// re-adopted one has lost its unlocked key, so teardown cannot re-seal it.
 	persistent bool
@@ -496,10 +499,15 @@ func (s *cobrowseSession) cancelRecordingLocked() <-chan struct{} {
 	return s.recordDone
 }
 
-func (s *cobrowseSession) cancelRecordingAndWait() {
+func (s *cobrowseSession) beginStoppingRecording() <-chan struct{} {
 	s.mu.Lock()
+	s.stopping = true
 	done := s.cancelRecordingLocked()
 	s.mu.Unlock()
+	return done
+}
+
+func waitRecording(done <-chan struct{}) {
 	if done != nil {
 		<-done
 	}
@@ -515,7 +523,7 @@ func (m *CobrowseSessionManager) Stop(id string) error {
 	if !ok {
 		return nil
 	}
-	s.cancelRecordingAndWait()
+	waitRecording(s.beginStoppingRecording())
 	return s.teardown()
 }
 
@@ -528,16 +536,20 @@ func (m *CobrowseSessionManager) StopAll() error {
 	m.sessions = make(map[string]*cobrowseSession)
 	m.mu.Unlock()
 
-	// Signal every capture before waiting for any one encoder to finish.
+	// Mark every session terminal and signal every capture before waiting for
+	// any one encoder to finish.
+	type stoppingSession struct {
+		s    *cobrowseSession
+		done <-chan struct{}
+	}
+	pending := make([]stoppingSession, 0, len(all))
 	for _, s := range all {
-		s.mu.Lock()
-		s.cancelRecordingLocked()
-		s.mu.Unlock()
+		pending = append(pending, stoppingSession{s: s, done: s.beginStoppingRecording()})
 	}
 	var lastErr error
-	for _, s := range all {
-		s.cancelRecordingAndWait()
-		if err := s.teardown(); err != nil {
+	for _, item := range pending {
+		waitRecording(item.done)
+		if err := item.s.teardown(); err != nil {
 			lastErr = err
 		}
 	}
