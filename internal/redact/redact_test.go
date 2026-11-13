@@ -124,3 +124,22 @@ func TestURL(t *testing.T) {
 		})
 	}
 }
+
+func TestSensitiveCredentialAliases(t *testing.T) {
+	const secret = "synthetic-credential-0123456789TAIL"
+	for _, name := range []string{"X-Auth", "auth", "pwd", "pass", "bearer", "jwt"} {
+		for _, variant := range []string{name, strings.ToUpper(name), " " + name + " "} {
+			t.Run(variant, func(t *testing.T) {
+				if !IsSensitiveName(variant) {
+					t.Fatal("credential alias not recognized")
+				}
+				if got := Header(variant, secret); got != "…TAIL" {
+					t.Fatal("credential alias header not fingerprinted")
+				}
+				if got := URL("http://example.test/?" + name + "=" + secret); strings.Contains(got, secret) || !strings.Contains(got, "…TAIL") {
+					t.Fatal("credential alias query not fingerprinted")
+				}
+			})
+		}
+	}
+}

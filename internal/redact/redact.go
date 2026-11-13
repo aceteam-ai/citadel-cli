@@ -38,6 +38,7 @@ var sensitiveExact = map[string]bool{
 
 var sensitiveParts = []string{
 	"token", "secret", "key", "password", "passwd",
+	"auth", "pwd", "pass", "bearer", "jwt",
 	"sig", "signature", "credential", "session",
 }
 

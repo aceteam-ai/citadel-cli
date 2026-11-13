@@ -139,6 +139,17 @@ func logHTTPProxyRequest(ctx JobContext, jobID, method, rawURL string, headers m
 	ctx.Log("info", "     - [Job %s] HTTP %s %s headers=[%s]", jobID, method, redact.URL(rawURL), strings.Join(pairs, ", "))
 }
 
+// redactHTTPProxyURLError removes credential-bearing URL text before an error
+// reaches job logs or output. Keep the underlying cause so destination refusal,
+// cancellation and deadline checks continue to work through errors.Is.
+func redactHTTPProxyURLError(err error) error {
+	var target *url.Error
+	if errors.As(err, &target) {
+		return &url.Error{Op: target.Op, URL: redact.URL(target.URL), Err: redactHTTPProxyURLError(target.Err)}
+	}
+	return err
+}
+
 func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	rawURL, ok := job.Payload["url"]
 	if !ok {
@@ -153,7 +164,7 @@ func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	// destination address itself is checked at connect time.
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid url: %w", err)
+		return nil, fmt.Errorf("invalid url: %w", redactHTTPProxyURLError(err))
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return nil, fmt.Errorf("%w: scheme %q (only http and https)", errHTTPProxyDestinationBlocked, parsed.Scheme)
@@ -169,7 +180,7 @@ func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 
 	req, err := http.NewRequestWithContext(ctx.Context(), method, parsed.String(), bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", redactHTTPProxyURLError(err))
 	}
 
 	var headers map[string]string
@@ -196,6 +207,7 @@ func (h *HTTPProxyHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
+		err = redactHTTPProxyURLError(err)
 		if errors.Is(err, errHTTPProxyDestinationBlocked) {
 			return nil, fmt.Errorf("request refused: %w", err)
 		}
