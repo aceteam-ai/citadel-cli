@@ -1,8 +1,10 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -330,12 +332,20 @@ func TestGuardedHTTPClientConfiguration(t *testing.T) {
 	if c.Timeout != 45*time.Second || tr.ResponseHeaderTimeout != 45*time.Second {
 		t.Fatalf("client timeout %s and response-header timeout %s must both follow the job budget (45s)", c.Timeout, tr.ResponseHeaderTimeout)
 	}
+	// Zero means unbounded to net/http; it must never reach the client.
+	c, err = newGuardedHTTPClient(map[int]bool{8000: true}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := c.Transport.(*http.Transport); c.Timeout != 30*time.Second || tr.ResponseHeaderTimeout != 30*time.Second {
+		t.Fatalf("a zero budget must fall back to 30s, got %s/%s", c.Timeout, tr.ResponseHeaderTimeout)
+	}
 }
 
 // The job's timeout_ms (the node's per-job budget key) sets the request
-// timeout, clamped to httpProxyMaxTimeout; anything absent or unusable keeps
-// the 30 s default. The legacy adapter stringifies JSON numbers with
-// fmt.Sprint, so large values arrive in exponent form.
+// timeout, clamped to httpProxyMaxTimeout; anything absent, unusable or below
+// a millisecond keeps the 30 s default. A zero Duration would mean no timeout
+// at all, so sub-millisecond values must never reach the client.
 func TestHTTPProxyTimeoutFromPayload(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -345,16 +355,23 @@ func TestHTTPProxyTimeoutFromPayload(t *testing.T) {
 		{"absent", map[string]string{}, 30 * time.Second},
 		{"nil payload", nil, 30 * time.Second},
 		{"empty", map[string]string{"timeout_ms": ""}, 30 * time.Second},
+		{"50s", map[string]string{"timeout_ms": "50000"}, 50 * time.Second},
 		{"60s", map[string]string{"timeout_ms": "60000"}, 60 * time.Second},
 		{"fractional", map[string]string{"timeout_ms": "45500.0"}, 45500 * time.Millisecond},
 		{"below default", map[string]string{"timeout_ms": "5000"}, 5 * time.Second},
-		{"600s clamped", map[string]string{"timeout_ms": "600000"}, 120 * time.Second},
-		{"exponent clamped", map[string]string{"timeout_ms": "1e+06"}, 120 * time.Second},
+		{"one millisecond", map[string]string{"timeout_ms": "1"}, time.Millisecond},
+		{"120s clamped", map[string]string{"timeout_ms": "120000"}, 60 * time.Second},
+		{"600s clamped", map[string]string{"timeout_ms": "600000"}, 60 * time.Second},
+		{"exponent clamped", map[string]string{"timeout_ms": "1e+06"}, 60 * time.Second},
 		{"garbage", map[string]string{"timeout_ms": "soon"}, 30 * time.Second},
 		{"zero", map[string]string{"timeout_ms": "0"}, 30 * time.Second},
 		{"negative", map[string]string{"timeout_ms": "-5000"}, 30 * time.Second},
 		{"NaN", map[string]string{"timeout_ms": "NaN"}, 30 * time.Second},
 		{"Inf", map[string]string{"timeout_ms": "+Inf"}, 30 * time.Second},
+		{"tiny", map[string]string{"timeout_ms": "1e-7"}, 30 * time.Second},
+		{"hex tiny", map[string]string{"timeout_ms": "0x1p-30"}, 30 * time.Second},
+		{"denormal", map[string]string{"timeout_ms": "5e-324"}, 30 * time.Second},
+		{"sub-millisecond", map[string]string{"timeout_ms": "0.5"}, 30 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := httpProxyTimeout(&nexus.Job{Payload: tc.payload}); got != tc.want {
@@ -364,9 +381,25 @@ func TestHTTPProxyTimeoutFromPayload(t *testing.T) {
 	}
 }
 
-// A local endpoint slower than the old fixed 30 s cap answers within the job's
-// budget instead of being cut off. Shrunk to milliseconds: the endpoint takes
-// longer than a 50 ms budget would allow, and is still served under 2 s.
+// The worker's legacy adapter turns a JSON number into a string with
+// fmt.Sprint, so numeric budgets arrive in that form (1e-07, 1e+06).
+func TestHTTPProxyTimeoutFromAdapterStringifiedNumbers(t *testing.T) {
+	for _, tc := range []struct {
+		number float64
+		want   time.Duration
+	}{
+		{1e-7, 30 * time.Second},
+		{0, 30 * time.Second},
+		{50000, 50 * time.Second},
+		{1e6, 60 * time.Second},
+	} {
+		raw := fmt.Sprint(tc.number)
+		if got := httpProxyTimeout(&nexus.Job{Payload: map[string]string{"timeout_ms": raw}}); got != tc.want {
+			t.Fatalf("timeout_ms %q (from %v) = %s, want %s", raw, tc.number, got, tc.want)
+		}
+	}
+}
+
 func TestHTTPProxyHonorsJobBudget(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(300 * time.Millisecond)
@@ -379,8 +412,10 @@ func TestHTTPProxyHonorsJobBudget(t *testing.T) {
 		_, err := h.Execute(JobContext{}, &nexus.Job{ID: "j", Payload: map[string]string{"url": srv.URL, "timeout_ms": timeoutMs}})
 		return err
 	}
-	if err := run("50"); err == nil {
-		t.Fatal("a 50 ms budget must cut off a 300 ms endpoint")
+	err := run("50")
+	var netErr net.Error
+	if !errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &netErr) && netErr.Timeout()) {
+		t.Fatalf("a 50 ms budget must time out a 300 ms endpoint, got %v", err)
 	}
 	if err := run("2000"); err != nil {
 		t.Fatalf("a 2 s budget must let a 300 ms endpoint answer: %v", err)

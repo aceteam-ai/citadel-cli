@@ -34,29 +34,37 @@ var defaultHTTPProxyLocalPorts = map[int]bool{8000: true}
 // HTTP_PROXY waits httpProxyDefaultTimeout for a response unless the job
 // carries its own budget in timeout_ms (the node's per-job budget key, which
 // also sets the runner's watchdog). A requested budget is clamped to
-// httpProxyMaxTimeout so one job cannot hold a worker slot indefinitely.
+// httpProxyMaxTimeout: the job holds a worker slot (or the fetch loop itself)
+// while it waits, so a long budget would block other jobs behind it.
 const (
 	httpProxyDefaultTimeout = 30 * time.Second
-	httpProxyMaxTimeout     = 120 * time.Second
+	httpProxyMaxTimeout     = 60 * time.Second
+	httpProxyMinTimeout     = time.Millisecond
 )
 
 // httpProxyTimeout returns the job's requested budget, clamped to
 // httpProxyMaxTimeout, or httpProxyDefaultTimeout when timeout_ms is absent,
-// unparseable, non-finite or not positive. Parsed as a float because the
-// legacy adapter stringifies JSON numbers with fmt.Sprint ("1e+06").
+// unparseable, non-finite or below httpProxyMinTimeout. A tiny positive value
+// would truncate to a zero Duration, which net/http treats as no timeout at
+// all. Parsed as a float because the legacy adapter stringifies JSON numbers
+// with fmt.Sprint ("1e+06", "1e-07").
 func httpProxyTimeout(job *nexus.Job) time.Duration {
 	raw := strings.TrimSpace(job.Payload["timeout_ms"])
 	if raw == "" {
 		return httpProxyDefaultTimeout
 	}
 	ms, err := strconv.ParseFloat(raw, 64)
-	if err != nil || math.IsNaN(ms) || math.IsInf(ms, 0) || ms <= 0 {
+	if err != nil || math.IsNaN(ms) || math.IsInf(ms, 0) {
 		return httpProxyDefaultTimeout
 	}
 	if ms >= float64(httpProxyMaxTimeout/time.Millisecond) {
 		return httpProxyMaxTimeout
 	}
-	return time.Duration(ms * float64(time.Millisecond))
+	d := time.Duration(ms * float64(time.Millisecond))
+	if d < httpProxyMinTimeout {
+		return httpProxyDefaultTimeout
+	}
+	return d
 }
 
 // errHTTPProxyDestinationBlocked marks a refused destination.
@@ -128,8 +136,12 @@ func guardedDialControl(localPorts map[int]bool, own ownAddrSet) func(network, a
 // dial is the only path out. The node's own interface addresses are
 // snapshotted once per client (one client per job); if they cannot be
 // determined, no client is built and the job is refused (fail closed).
-// timeout bounds the whole request and the wait for response headers.
+// timeout bounds the whole request and the wait for response headers; a
+// non-positive value (which net/http reads as unbounded) uses the default.
 func newGuardedHTTPClient(localPorts map[int]bool, timeout time.Duration) (*http.Client, error) {
+	if timeout <= 0 {
+		timeout = httpProxyDefaultTimeout
+	}
 	own, err := ownInterfaceAddrs()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errHTTPProxyDestinationBlocked, err)
