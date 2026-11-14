@@ -91,6 +91,23 @@ opener.postMessage('tok-123', 'http://app.test'); window.close();</script>`)
 	}
 	id := st.ID
 
+	diag := func(what string) {
+		ts, terr := m.Targets(id)
+		mu.Lock()
+		r := append([]string(nil), refused...)
+		mu.Unlock()
+		t.Logf("diag (%s): targets=%+v err=%v token=%q title=%q refused=%v guardRefused=%d",
+			what, ts, terr, "", "", r, g.Refused())
+		if res, err := m.ExtractBounded(id, "#token", nil, 100); true {
+			t.Logf("diag token: %+v %v", res, err)
+		}
+		if res, err := m.ExtractBounded(id, "#open", nil, 100); true {
+			t.Logf("diag open: %+v %v", res, err)
+		}
+		if _, err := m.Click(id, "#open", nil, nil); true {
+			t.Logf("diag click: %v", err)
+		}
+	}
 	waitFor := func(what string, cond func() bool) {
 		t.Helper()
 		deadline := time.Now().Add(30 * time.Second)
@@ -100,6 +117,7 @@ opener.postMessage('tok-123', 'http://app.test'); window.close();</script>`)
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
+		diag(what)
 		t.Fatalf("timed out waiting for %s", what)
 	}
 	text := func(sel string) string {
