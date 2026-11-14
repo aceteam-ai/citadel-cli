@@ -493,18 +493,33 @@ func recordUID(rec sessionRecord) int {
 	return os.Getuid()
 }
 
-// adoptedProc builds a cobrowseProc around already-running processes. Its
-// exited channel closes when the browser's identity stops matching.
+// adoptedProc builds a cobrowseProc around already-running processes. Only
+// known absence or a verified identity change closes its exited channel.
 func adoptedProc(rec sessionRecord) *cobrowseProc {
+	ticker := time.NewTicker(2 * time.Second)
+	return adoptedProcWithObservations(rec, ticker.C, ticker.Stop)
+}
+
+// The observation source is injectable so fake-process tests exercise the real
+// adapter without native processes or timing-dependent sleeps. The observer
+// owns stopObservations; a closed observation source is not exit evidence.
+func adoptedProcWithObservations(rec sessionRecord, observations <-chan time.Time, stopObservations func()) *cobrowseProc {
 	exited := make(chan struct{})
-	gone := func(pid int, start uint64) bool {
-		st, alive, err := procIdentity(pid)
-		return err != nil || !alive || st != start
+	identity, kill := procIdentity, pidKiller
+	gone := func(pid int, start uint64) (bool, error) {
+		st, alive, err := identity(pid)
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return !alive || st != start, nil
 	}
 	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			if gone(rec.BrowserPID, rec.BrowserStart) {
+		defer stopObservations()
+		for range observations {
+			if absent, err := gone(rec.BrowserPID, rec.BrowserStart); err == nil && absent {
 				reapChild(rec.BrowserPID)
 				close(exited)
 				return
@@ -524,13 +539,32 @@ func adoptedProc(rec sessionRecord) *cobrowseProc {
 		xvfbScope:    rec.XvfbScope,
 		scopeUser:    rec.ScopeUser,
 		stop: func() error {
-			stopRecordScopes(rec)
-			var last error
-			for _, t := range []struct {
+			targets := []struct {
 				pid   int
 				start uint64
-			}{{rec.BrowserPID, rec.BrowserStart}, {rec.XvfbPID, rec.XvfbStart}} {
-				if t.pid <= 0 || gone(t.pid, t.start) {
+			}{{rec.BrowserPID, rec.BrowserStart}, {rec.XvfbPID, rec.XvfbStart}}
+			// Inspect every recorded target before any destructive action. A
+			// browser with unknown identity must not be killed, and an unknown
+			// companion must not be skipped as if cleanup had already finished.
+			for _, target := range targets {
+				if target.pid > 0 {
+					if _, err := gone(target.pid, target.start); err != nil {
+						return fmt.Errorf("process identity unconfirmed: %w", err)
+					}
+				}
+			}
+			stopRecordScopes(rec)
+			var last error
+			for _, t := range targets {
+				if t.pid <= 0 {
+					continue
+				}
+				absent, err := gone(t.pid, t.start)
+				if err != nil {
+					last = fmt.Errorf("process identity unconfirmed: %w", err)
+					continue
+				}
+				if absent {
 					continue
 				}
 				// A surviving child of ours stays a zombie until reaped, and
@@ -546,7 +580,7 @@ func adoptedProc(rec sessionRecord) *cobrowseProc {
 						}
 					}
 				}(t.pid)
-				if err := pidKiller(t.pid); err != nil {
+				if err := kill(t.pid); err != nil {
 					last = err
 				}
 				close(done)
