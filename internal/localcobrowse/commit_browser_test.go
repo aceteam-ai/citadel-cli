@@ -311,6 +311,14 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		"ac6":   `<input type="text" name="to" value="mallory" autocomplete="current-password email">`,
 		"ac7":   `<input type="text" name="to" value="alice" autocomplete="new-password webauthn">`,
 		"ac8":   `<input type="text" name="to" value="mallory" autocomplete="new-password webauthn">`,
+		"ac9":   `<input type="text" name="to" value="alice" autocomplete="email current-password">`,
+		"ac10":  `<input type="text" name="to" value="mallory" autocomplete="email current-password">`,
+		"ac11":  `<input type="text" name="to" value="alice" autocomplete="shipping billing current-password">`,
+		"ac12":  `<input type="text" name="to" value="mallory" autocomplete="shipping billing current-password">`,
+		"ac13":  `<input type="text" name="to" value="alice" autocomplete="section-a section-b current-password">`,
+		"ac14":  `<input type="text" name="to" value="mallory" autocomplete="section-a section-b current-password">`,
+		"ac15":  `<input type="text" name="to" value="alice" autocomplete="home current-password">`,
+		"ac16":  `<input type="text" name="to" value="mallory" autocomplete="home current-password">`,
 		"pw2":   `<input type="password" name="pw" value="secret"><input type="hidden" name="to" value="alice">`,
 		"cf1":   `<x-field name="to" id="xf"></x-field>`,
 		"cf2":   `<x-field name="to" id="xf"></x-field>`,
@@ -434,6 +442,18 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	}
 	if a, b := fp(inspect("ac7")), fp(inspect("ac8")); a != b {
 		t.Error(`autocomplete="new-password webauthn" has the field name new-password and must not be bound`)
+	}
+	if a, b := fp(inspect("ac9")), fp(inspect("ac10")); a == b {
+		t.Error(`autocomplete="email current-password" is malformed, so the recipient is an ordinary field: a change must change the binding`)
+	}
+	if a, b := fp(inspect("ac11")), fp(inspect("ac12")); a == b {
+		t.Error(`autocomplete="shipping billing current-password" is malformed, so the recipient is an ordinary field: a change must change the binding`)
+	}
+	if a, b := fp(inspect("ac13")), fp(inspect("ac14")); a == b {
+		t.Error(`autocomplete="section-a section-b current-password" is malformed, so the recipient is an ordinary field: a change must change the binding`)
+	}
+	if a, b := fp(inspect("ac15")), fp(inspect("ac16")); a == b {
+		t.Error(`autocomplete="home current-password" is malformed, so the recipient is an ordinary field: a change must change the binding`)
 	}
 	if ti := inspect("pw2"); !ti.Resolved || ti.ContentHash == "" {
 		t.Errorf("a password field with a unique name stays verifiable: %+v", ti)

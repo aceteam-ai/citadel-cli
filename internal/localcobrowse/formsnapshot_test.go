@@ -316,6 +316,19 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 			scenario{Form: form(nil, ent("agree", "on"), fakeEl{TagName: "INPUT", Type: "checkbox", Name: "agree", Value: sp("on"), Checked: true}, send), T: 1},
 		},
 	}
+	// A malformed prefix before a secret word makes the attribute fall back to
+	// default autofill handling, so the recipient is an ordinary bound field.
+	malformed := []string{"email current-password", "shipping billing current-password", "section-a section-b current-password", "home current-password",
+		"shipping section-a current-password", "section-a billing shipping one-time-code", "work new-password", "section- current-password"}
+	for _, ac := range malformed {
+		mk := func(v string) *fakeForm {
+			e := fel("INPUT", "text", "to", v)
+			e.Attrs = map[string]string{"autocomplete": ac}
+			return form(nil, ent("to", v), e, send)
+		}
+		cases["malformed autocomplete "+ac] = struct{ a, b scenario }{
+			scenario{Form: mk("alice"), T: 1}, scenario{Form: mk("mallory"), T: 1}}
+	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			r := runInspect(t, c.a, c.b)
@@ -367,7 +380,7 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 
 	// Genuine secret tokens, with section and shipping/billing modifiers and any
 	// case, are sensitive: their entry is not bound.
-	for _, ac := range []string{"current-password", "new-password", "one-time-code", "section-a shipping current-password", "billing new-password", "section-x ONE-TIME-CODE", "new-password webauthn", "section-x shipping current-password", "  CURRENT-PASSWORD  "} {
+	for _, ac := range []string{"current-password", "new-password", "one-time-code", "section-a shipping current-password", "billing new-password", "section-x ONE-TIME-CODE", "new-password webauthn", "section-x one-time-code", "section-x shipping current-password", "  CURRENT-PASSWORD  "} {
 		t.Run("sensitive token "+ac, func(t *testing.T) {
 			mk := func(v string) *fakeForm {
 				e := fel("INPUT", "text", "tok", v)
@@ -401,9 +414,18 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 			return scenario{Form: nil, T: -1, TEntry: true, TOutsid: &e}
 		}
 		r := runInspect(t, out("section-password email", "alice"), out("section-password email", "mallory"),
-			out("one-time-code", "alice"), out("one-time-code", "mallory"))
+			out("one-time-code", "alice"), out("one-time-code", "mallory"),
+			out("email current-password", "alice"), out("email current-password", "mallory"),
+			out("shipping billing current-password", "alice"), out("shipping billing current-password", "mallory"),
+			out("section-a section-b current-password", "alice"), out("section-a section-b current-password", "mallory"),
+			out("home current-password", "alice"), out("home current-password", "mallory"))
 		if r[0].Digest == "" || r[0].Digest == r[1].Digest {
 			t.Fatalf("a section name is not a secret: the value must be bound: %+v %+v", r[0], r[1])
+		}
+		for i := 4; i < len(r); i += 2 {
+			if r[i].Digest == "" || r[i].Digest == r[i+1].Digest {
+				t.Fatalf("malformed autocomplete #%d must bind the outside-form value: %+v %+v", i, r[i], r[i+1])
+			}
 		}
 		if r[2].Digest != r[3].Digest {
 			t.Fatalf("a real one-time-code token must not be bound: %+v %+v", r[2], r[3])

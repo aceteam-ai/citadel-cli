@@ -130,17 +130,24 @@ const FormDigestScript = `
 // is bad too. env supplies the DOM reads at prototype level, so a control named
 // "elements" or "getAttribute" cannot shadow them.
 const FormSnapshotScript = `
-	// sensitiveAC reports an autocomplete value whose autofill field name is a
-	// secret, per the HTML autofill processing model: split on ASCII whitespace
-	// and lower-case, drop a trailing "webauthn", and the field name is the last
-	// remaining token. Only current-password, new-password and one-time-code are
-	// secrets. A secret word anywhere else (a malformed or section token) is not,
-	// so the value is bound; erring toward binding is the safe direction.
+	// sensitiveAC reports an autocomplete value that the HTML autofill
+	// processing model reads as a secret field name. After lower-casing, ASCII
+	// whitespace splitting and removing one trailing "webauthn", the only
+	// sequences that qualify are [section-<name>]? [shipping|billing]? <field>
+	// with <field> one of current-password, new-password, one-time-code: at most
+	// one section- token and only first, at most one shipping or billing token,
+	// and no contact (home, work, mobile, fax, pager) tokens, which are not valid
+	// with these names. Any other sequence, including a malformed prefix before a
+	// secret word, falls back to default autofill handling and so the value is
+	// bound, never excluded.
 	function sensitiveAC(ac){
 		var toks = String(ac || "").toLowerCase().split(/[ \t\n\f\r]+/).filter(function(x){ return x !== ""; });
 		if (toks.length && toks[toks.length - 1] === "webauthn") toks.pop();
-		if (!toks.length) return false;
-		var f = toks[toks.length - 1];
+		var i = 0;
+		if (i < toks.length && toks[i].indexOf("section-") === 0 && toks[i].length > 8) i++;
+		if (i < toks.length && (toks[i] === "shipping" || toks[i] === "billing")) i++;
+		if (toks.length - i !== 1) return false;
+		var f = toks[i];
 		return f === "current-password" || f === "new-password" || f === "one-time-code";
 	}
 	function buildSnapshot(env, form, sub, t, focus, tIsEntry){
