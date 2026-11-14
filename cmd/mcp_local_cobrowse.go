@@ -87,7 +87,15 @@ func auditRecordFor(ev localcobrowse.Event) localaudit.Record {
 	case "B":
 		actor = "citadel" // the browser or Citadel acting on its own
 	}
+	rules := ""
+	if ev.Fingerprint != "" {
+		rules = localcobrowse.RuleVersion
+	}
 	return localaudit.Record{
+		Domain:          ev.Domain,
+		Fingerprint:     ev.Fingerprint,
+		Label:           ev.Label,
+		Rules:           rules,
 		SessionID:       ev.SessionID,
 		Actor:           actor,
 		Agent:           ev.Agent,
@@ -450,7 +458,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 		}
 	}
 
-	writeNote := " A WRITE: needs the user's approval for this session in the Citadel viewer. Without it the call returns approval_required; then call local_cobrowse_wait with until=approved. Refused while the user has control."
+	writeNote := " A WRITE: needs the user's approval for the site (its registrable domain) in the Citadel viewer. Without it the call returns approval_required; then call local_cobrowse_wait with until=approved. Anything that sends, posts, submits, pays or deletes (a Send or Post button, Enter in a message or form field, an unlabeled or unidentifiable target) needs the user's approval every time, whatever was approved: the call returns commit_approval_required; call local_cobrowse_wait with until=commit, then repeat the same call. Refused while the user has control."
 	readNote := " A READ: no approval needed. Refused while the user has control, so you never see what they type."
 
 	type clickArgs struct {
@@ -713,9 +721,9 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				}
 				return map[string]any{"session_id": id, "stopped": true}, nil
 			}),
-		writeTool("local_cobrowse_wait", "Wait for the user: until=approved (they approved AI actions), until=resumed (they handed control back) or until=unlocked. Returns within timeout_seconds (at most 50). If still_waiting is true, call again; denied or revoked are final answers.",
+		writeTool("local_cobrowse_wait", "Wait for the user: until=approved (they approved AI actions on the site), until=commit (they answered a send/post/submit/pay request; approved means repeat the same call, denied is final), until=resumed (they handed control back) or until=unlocked. Returns within timeout_seconds (at most 50). If still_waiting is true, call again; denied or revoked are final answers.",
 			map[string]any{"session_id": strProp(descSession),
-				"until":           map[string]any{"type": "string", "enum": []string{"approved", "resumed", "unlocked"}},
+				"until":           map[string]any{"type": "string", "enum": []string{"approved", "resumed", "unlocked", "commit"}},
 				"timeout_seconds": numProp("Seconds to wait, at most 50 (default 50).")},
 			[]string{"session_id", "until"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {

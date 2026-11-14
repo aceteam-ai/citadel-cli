@@ -124,7 +124,7 @@ jobs:
         run: go test ./internal/cobrowsestream/ -count=1 -run '^(TestMounted|TestStreamFollowsPopup|TestStreamSurvives|TestViewerTargetSwitch|TestParseTarget|TestNodeWideManagerSession)'
 
       - name: citadel local mcp (stdio JSON-RPC)
-        run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide)'
+        run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide|TestNoLocalMCPToolCanApprove|TestLocalCommitPrompts)'
 
       - name: Unit tests (Windows-portable subset)
         run: >-
@@ -155,14 +155,14 @@ jobs:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
           CITADEL_COBROWSE_EXPECT_KIND: chrome
-        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserPopupSignIn|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserCommitActions|TestRealBrowserPopupSignIn|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
       - name: Real browser (Edge)
         env:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
           CITADEL_COBROWSE_EXPECT_KIND: edge
-        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserPopupSignIn|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserCommitActions|TestRealBrowserPopupSignIn|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
   # Linux co-browse real-browser gate (citadel-cli#1546). Issue #1546 took four
   # fix rounds because unit tests used fakes that real Chrome did not match
@@ -202,6 +202,13 @@ jobs:
         env:
           CITADEL_REAL_BROWSER_TESTS: "1"
         run: go test ./internal/platform/ -count=1 -v -run '^TestCobrowseRealBrowser'
+
+      # Local-mode commit detection (citadel-cli#1636): the in-page target
+      # probe and classifier against real Chrome on a synthetic page.
+      - name: Real browser local-mode commit actions
+        env:
+          CITADEL_REAL_BROWSER_TESTS: "1"
+        run: go test ./internal/localcobrowse/ -count=1 -v -run '^TestRealBrowserCommitActions$'
 
   # Cross-compile smoke for every release target. Catches a target that builds
   # locally but breaks on a GOOS/GOARCH the host can't run, so a release tag can

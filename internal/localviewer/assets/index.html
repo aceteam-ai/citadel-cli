@@ -23,13 +23,23 @@
     </div>
   </section>
   <div id="waiting" class="banner" hidden></div>
+  <section id="commit" class="card commit" hidden>
+    <p><strong id="commit-action"></strong> on <strong id="commit-domain"></strong></p>
+    <p class="muted" id="commit-reason"></p>
+    <canvas id="commit-shot" width="480" height="240" hidden aria-label="The part of the page the agent wants to act on"></canvas>
+    <p class="muted">This kind of action asks every time, whatever you approved before. Approving does this one action now, if the page is still as shown.</p>
+    <button id="commit-approve" class="primary">Approve and do it</button>
+    <button id="commit-deny">Deny</button>
+  </section>
+  <p id="commit-result" class="banner" hidden></p>
   <section id="approval" class="card" hidden>
-    <p>Allow this agent to click, type and navigate in this session for
+    <p>Allow this agent to click, type and navigate on <strong id="approval-site"></strong> for
       <select id="approve-hours">
-        <option value="24">24 hours</option>
         <option value="8">8 hours</option>
+        <option value="24">24 hours</option>
         <option value="1">1 hour</option>
       </select>?</p>
+    <p class="muted">Sending, posting, submitting and paying still ask you each time. The approval covers this site only and ends with the session.</p>
     <p class="muted" id="approval-domain"></p>
     <button id="approve" class="primary">Approve</button>
     <button id="deny">Deny</button>
