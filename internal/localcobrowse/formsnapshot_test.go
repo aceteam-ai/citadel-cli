@@ -271,6 +271,30 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 				return e
 			}(), send), T: 1},
 		},
+		"secret word that is not the field name (current-password email) is bound": {
+			scenario{Form: form(nil, ent("to", "alice"), func() fakeEl {
+				e := fel("INPUT", "text", "to", "alice")
+				e.Attrs = map[string]string{"autocomplete": "current-password email"}
+				return e
+			}(), send), T: 1},
+			scenario{Form: form(nil, ent("to", "mallory"), func() fakeEl {
+				e := fel("INPUT", "text", "to", "mallory")
+				e.Attrs = map[string]string{"autocomplete": "current-password email"}
+				return e
+			}(), send), T: 1},
+		},
+		"secret word that is not the field name (one-time-code tel) is bound": {
+			scenario{Form: form(nil, ent("to", "alice"), func() fakeEl {
+				e := fel("INPUT", "text", "to", "alice")
+				e.Attrs = map[string]string{"autocomplete": "one-time-code tel"}
+				return e
+			}(), send), T: 1},
+			scenario{Form: form(nil, ent("to", "mallory"), func() fakeEl {
+				e := fel("INPUT", "text", "to", "mallory")
+				e.Attrs = map[string]string{"autocomplete": "one-time-code tel"}
+				return e
+			}(), send), T: 1},
+		},
 		"submitter value": {
 			scenario{Form: form(nil, ent("m", "hi", "go", "send"), m, button("go", "send", nil)), T: 1},
 			scenario{Form: form(nil, ent("m", "hi", "go", "send-all"), m, button("go", "send-all", nil)), T: 1},
@@ -343,7 +367,7 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 
 	// Genuine secret tokens, with section and shipping/billing modifiers and any
 	// case, are sensitive: their entry is not bound.
-	for _, ac := range []string{"current-password", "new-password", "one-time-code", "section-a shipping current-password", "billing new-password", "section-x ONE-TIME-CODE"} {
+	for _, ac := range []string{"current-password", "new-password", "one-time-code", "section-a shipping current-password", "billing new-password", "section-x ONE-TIME-CODE", "new-password webauthn", "section-x shipping current-password", "  CURRENT-PASSWORD  "} {
 		t.Run("sensitive token "+ac, func(t *testing.T) {
 			mk := func(v string) *fakeForm {
 				e := fel("INPUT", "text", "tok", v)
@@ -356,6 +380,18 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("type=password stays sensitive whatever its autocomplete", func(t *testing.T) {
+		mk := func(v string) *fakeForm {
+			e := fel("INPUT", "password", "pw", v)
+			e.Attrs = map[string]string{"autocomplete": "email"}
+			return form(nil, ent("pw", v), e, send)
+		}
+		r := runInspect(t, scenario{Form: mk("one"), T: 1}, scenario{Form: mk("two"), T: 1})
+		if r[0].Bad != "" || r[0].Digest == "" || r[0].Digest != r[1].Digest {
+			t.Fatalf("%+v %+v", r[0], r[1])
+		}
+	})
 
 	// The outside-form composer path follows the same rule.
 	t.Run("outside-form composer follows the token rule", func(t *testing.T) {

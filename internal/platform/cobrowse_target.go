@@ -130,14 +130,18 @@ const FormDigestScript = `
 // is bad too. env supplies the DOM reads at prototype level, so a control named
 // "elements" or "getAttribute" cannot shadow them.
 const FormSnapshotScript = `
-	// sensitiveAC reports an autocomplete value that names a secret: a whole
-	// whitespace-separated token equal to current-password, new-password or
-	// one-time-code (case-insensitive). Section names such as "section-password"
-	// and other tokens are not field names and do not count.
+	// sensitiveAC reports an autocomplete value whose autofill field name is a
+	// secret, per the HTML autofill processing model: split on ASCII whitespace
+	// and lower-case, drop a trailing "webauthn", and the field name is the last
+	// remaining token. Only current-password, new-password and one-time-code are
+	// secrets. A secret word anywhere else (a malformed or section token) is not,
+	// so the value is bound; erring toward binding is the safe direction.
 	function sensitiveAC(ac){
-		var toks = String(ac || "").split(/[ \t\n\f\r]+/);
-		for (var i = 0; i < toks.length; i++) { var t = toks[i].toLowerCase(); if (t === "current-password" || t === "new-password" || t === "one-time-code") return true; }
-		return false;
+		var toks = String(ac || "").toLowerCase().split(/[ \t\n\f\r]+/).filter(function(x){ return x !== ""; });
+		if (toks.length && toks[toks.length - 1] === "webauthn") toks.pop();
+		if (!toks.length) return false;
+		var f = toks[toks.length - 1];
+		return f === "current-password" || f === "new-password" || f === "one-time-code";
 	}
 	function buildSnapshot(env, form, sub, t, focus, tIsEntry){
 		var tuples = [], bad = "";

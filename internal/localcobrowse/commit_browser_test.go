@@ -307,6 +307,10 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		"ac2":   `<input type="text" name="to" value="mallory" autocomplete="section-password email">`,
 		"ac3":   `<input type="text" name="to" value="alice" autocomplete="section-blue shipping current-password">`,
 		"ac4":   `<input type="text" name="to" value="mallory" autocomplete="section-blue shipping current-password">`,
+		"ac5":   `<input type="text" name="to" value="alice" autocomplete="current-password email">`,
+		"ac6":   `<input type="text" name="to" value="mallory" autocomplete="current-password email">`,
+		"ac7":   `<input type="text" name="to" value="alice" autocomplete="new-password webauthn">`,
+		"ac8":   `<input type="text" name="to" value="mallory" autocomplete="new-password webauthn">`,
 		"pw2":   `<input type="password" name="pw" value="secret"><input type="hidden" name="to" value="alice">`,
 		"cf1":   `<x-field name="to" id="xf"></x-field>`,
 		"cf2":   `<x-field name="to" id="xf"></x-field>`,
@@ -424,6 +428,12 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	}
 	if a, b := fp(inspect("ac3")), fp(inspect("ac4")); a != b {
 		t.Error("a genuine current-password token must not be bound")
+	}
+	if a, b := fp(inspect("ac5")), fp(inspect("ac6")); a == b {
+		t.Error(`autocomplete="current-password email" has the field name email: a recipient change must change the binding`)
+	}
+	if a, b := fp(inspect("ac7")), fp(inspect("ac8")); a != b {
+		t.Error(`autocomplete="new-password webauthn" has the field name new-password and must not be bound`)
 	}
 	if ti := inspect("pw2"); !ti.Resolved || ti.ContentHash == "" {
 		t.Errorf("a password field with a unique name stays verifiable: %+v", ti)
