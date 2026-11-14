@@ -146,7 +146,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		if id == "" {
 			return nil, fmt.Errorf("screenshot requires a 'session_id' field")
 		}
-		img, err := mgr.Screenshot(id)
+		img, st, err := mgr.ScreenshotStatus(id)
 		if err != nil {
 			return nil, err
 		}
@@ -154,9 +154,8 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		// format, driver, url) so a consumer that already parses
 		// cobrowse_screenshot's result -- e.g. an aceteam #8131/#8133 rewire
 		// -- does not silently lose driver/url when it switches job types.
-		// Best-effort decoration: the screenshot already succeeded, so a
-		// failure here (session raced to stop) should not fail the job.
-		st, _ := mgr.SessionStatus(id)
+		// The status was read over the screenshot's own connection, so this
+		// decoration costs no extra CDP probe.
 		out, _ := json.Marshal(map[string]any{
 			"image":  img,
 			"format": "png",
@@ -180,7 +179,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, err := mgr.Click(id, selector, x, y)
 		if err != nil {
-			return nil, err
+			return actionFailureResult(err)
 		}
 		return sessionStatusResult(st)
 
@@ -195,7 +194,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, err := mgr.Type(id, text)
 		if err != nil {
-			return nil, err
+			return actionFailureResult(err)
 		}
 		return sessionStatusResult(st)
 
@@ -218,7 +217,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, err := mgr.Key(id, key)
 		if err != nil {
-			return nil, err
+			return actionFailureResult(err)
 		}
 		return sessionStatusResult(st)
 
@@ -244,7 +243,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, err := mgr.Scroll(id, job.Payload["selector"], x, y, dx, dy)
 		if err != nil {
-			return nil, err
+			return actionFailureResult(err)
 		}
 		return sessionStatusResult(st)
 
@@ -413,6 +412,30 @@ func sessionStatusResult(st platform.CobrowseSessionStatus) ([]byte, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// actionFailureResult turns an action that hit its deadline, or failed after it
+// may have acted, into a structured result (done=false plus effects) instead of
+// a bare error, so the caller knows what changed and never blindly repeats it.
+// A failure that changed nothing stays an error. The result is additive: every
+// existing status field is still present.
+func actionFailureResult(err error) ([]byte, error) {
+	ae, ok := platform.AsActionIncomplete(err)
+	if !ok || !ae.Reportable() {
+		return nil, err
+	}
+	out, merr := sessionStatusResult(ae.Status)
+	if merr != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if json.Unmarshal(out, &m) != nil {
+		return nil, err
+	}
+	m["done"] = false
+	m["timed_out"] = ae.TimedOut
+	m["error"] = ae.Error()
+	return json.Marshal(m)
 }
 
 // sessionListResult marshals a list of session statuses to JSON output bytes, always

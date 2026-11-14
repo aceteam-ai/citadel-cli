@@ -554,7 +554,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if in.Selector == "" && (in.X == nil || in.Y == nil) {
 					return nil, argError{fmt.Errorf("click requires 'selector' or both 'x' and 'y'")}
 				}
-				return s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal)
+				return partialActionResult(s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal))
 			}),
 		writeTool("local_cobrowse_type", "Type text into the focused field (click it first). Only the text length is recorded. Never use this for passwords: hand off to the user instead."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "text": strProp("Text to insert."), "goal": strProp(descGoal)},
@@ -571,7 +571,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Type(ctx, id, in.Text, in.Goal)
+				return partialActionResult(s.Type(ctx, id, in.Text, in.Goal))
 			}),
 		writeTool("local_cobrowse_select", "Choose an option in a native select element by value or label."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector of the select element."),
@@ -606,7 +606,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Key(ctx, id, in.Key, in.Goal)
+				return partialActionResult(s.Key(ctx, id, in.Key, in.Goal))
 			}),
 		writeTool("local_cobrowse_scroll", "Scroll with the mouse wheel at an element or viewport point."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector; wins over x/y."),
@@ -622,7 +622,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Scroll(ctx, id, in.Selector, in.X, in.Y, in.DeltaX, in.DeltaY, in.Goal)
+				return partialActionResult(s.Scroll(ctx, id, in.Selector, in.X, in.Y, in.DeltaX, in.DeltaY, in.Goal))
 			}),
 		writeTool("local_cobrowse_extract", "Read an element's text (bounded; truncated is true when cut) and optional attributes. The value of a password field is never returned."+readNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector."),
@@ -777,4 +777,15 @@ func handleLocalCobrowseSignals(rt *localCobrowseRuntime) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go closeOnSignal(rt, sigs, os.Exit)
+}
+
+// partialActionResult returns the structured result (done=false plus effects)
+// of a write that hit its deadline or failed after it may have acted, as a
+// normal tool result rather than an error: the agent must see what changed and
+// must not repeat the action blindly. The error was already audited.
+func partialActionResult(res localcobrowse.ActionResult, err error) (any, error) {
+	if err != nil && res.Done != nil && !*res.Done {
+		return res, nil
+	}
+	return res, err
 }

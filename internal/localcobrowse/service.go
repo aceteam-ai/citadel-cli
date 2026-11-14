@@ -843,6 +843,23 @@ type ActionResult struct {
 	Title      string `json:"title,omitempty"`
 	Value      string `json:"value,omitempty"`
 	Label      string `json:"label,omitempty"`
+	// Done is false, with Effects, when the action hit its internal deadline
+	// or failed after it may have acted (citadel-cli#1663). Never set on a
+	// clean result, so existing consumers see no change.
+	Done    *bool                   `json:"done,omitempty"`
+	Effects *platform.ActionEffects `json:"effects,omitempty"`
+}
+
+// partialActionResult describes a write that did not finish but may have acted.
+// The error is still returned to the caller for the audit record.
+func partialActionResult(err error) (ActionResult, bool) {
+	ae, ok := platform.AsActionIncomplete(err)
+	if !ok || !ae.Reportable() {
+		return ActionResult{}, false
+	}
+	done := false
+	eff := ae.Effects
+	return ActionResult{Dispatched: eff.Dispatched, URL: ae.Status.URL, Done: &done, Effects: &eff}, true
 }
 
 // settleWindow is how long a write waits to observe navigation and load;
@@ -1136,6 +1153,9 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 	}
 	before := s.currentURL(id)
 	if err := do(); err != nil {
+		if res, ok := partialActionResult(err); ok {
+			return res, err
+		}
 		return ActionResult{}, err
 	}
 	return s.finishAfter(ctx, id, ss, before, navigation)

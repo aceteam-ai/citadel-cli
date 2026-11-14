@@ -6,6 +6,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -81,8 +82,30 @@ var (
 func settleNavigation(port int, before string) PageState {
 	var last PageState
 	start := time.Now()
+	// One connection for the whole poll loop instead of a discovery and a
+	// dial per 100ms tick (citadel-cli#1663). A failed read drops it and the
+	// next tick reconnects.
+	var conn *cdpConn
+	var caller cdpCaller = portCaller(port)
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
 	for {
-		if ps, err := readPageState(port); err == nil {
+		if conn == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), navigateSettleWindow+cobrowseReportReserve)
+			defer cancel()
+			if c, err := openCDPConn(ctx, port); err == nil {
+				conn, caller = c, c
+			}
+		}
+		ps, err := readPageStateOn(caller)
+		if err != nil && conn != nil {
+			conn.Close()
+			conn, caller = nil, portCaller(port)
+		}
+		if err == nil {
 			last = ps
 			if ps.ReadyState == "" {
 				// The page did not answer with a document state at all;
@@ -100,8 +123,10 @@ func settleNavigation(port int, before string) PageState {
 	}
 }
 
-func readPageState(port int) (PageState, error) {
-	val, err := runtimeEvaluate(port, `({url: location.href, ready: document.readyState, title: document.title})`)
+func readPageState(port int) (PageState, error) { return readPageStateOn(portCaller(port)) }
+
+func readPageStateOn(c cdpCaller) (PageState, error) {
+	val, err := evaluateOn(c, `({url: location.href, ready: document.readyState, title: document.title})`, false)
 	if err != nil {
 		return PageState{}, err
 	}
@@ -213,7 +238,7 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 	// Wait for the navigation (including redirects) to settle, then report
 	// where the page ended up. A slow page returns its current state.
 	ps := settleNavigation(port, before)
-	st := s.status()
+	st := s.statusWithURL(ps.URL)
 	if ps.URL != "" {
 		st.URL = ps.URL
 	}
@@ -260,26 +285,43 @@ func (m *CobrowseSessionManager) NavigateAsHuman(id, url string) (CobrowseSessio
 // while handed off to a human -- mirrors CobrowseManager.Screenshot exactly
 // (see the package doc comment above).
 func (m *CobrowseSessionManager) Screenshot(id string) (string, error) {
+	data, _, err := m.ScreenshotStatus(id)
+	return data, err
+}
+
+// ScreenshotStatus is Screenshot plus the session status, read over the same
+// connection: one discovery and one dial instead of one per call, and the URL
+// comes from that discovery rather than a second probe (citadel-cli#1663).
+func (m *CobrowseSessionManager) ScreenshotStatus(id string) (string, CobrowseSessionStatus, error) {
 	s, err := m.sessionForAction(id)
 	if err != nil {
-		return "", err
+		return "", CobrowseSessionStatus{}, err
 	}
 	port, err := s.requireDrivablePort()
 	if err != nil {
-		return "", err
+		return "", CobrowseSessionStatus{}, err
 	}
-	res, err := cdpCommand(port, "Page.captureScreenshot", map[string]any{"format": "png"})
+	ctx, cancel := context.WithTimeout(context.Background(), CobrowseActionDeadline)
+	defer cancel()
+	conn, err := openCDPConn(ctx, port)
 	if err != nil {
-		return "", err
+		return "", CobrowseSessionStatus{}, err
+	}
+	defer conn.Close()
+	// optimizeForSpeed trades PNG size for encode time, which dominates on a
+	// software-rendered display.
+	res, err := conn.Call("Page.captureScreenshot", map[string]any{"format": "png", "optimizeForSpeed": true})
+	if err != nil {
+		return "", CobrowseSessionStatus{}, err
 	}
 	data, _ := res["data"].(string)
 	if data == "" {
-		return "", fmt.Errorf("empty screenshot data from CDP")
+		return "", CobrowseSessionStatus{}, fmt.Errorf("empty screenshot data from CDP")
 	}
 	if _, derr := base64.StdEncoding.DecodeString(data); derr != nil {
-		return "", fmt.Errorf("screenshot not valid base64: %w", derr)
+		return "", CobrowseSessionStatus{}, fmt.Errorf("screenshot not valid base64: %w", derr)
 	}
-	return data, nil
+	return data, s.statusWithURL(conn.target.URL), nil
 }
 
 // Click performs a scripted mouse click in one session's browser: either at the
@@ -297,33 +339,36 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-
-	var cx, cy float64
-	switch {
-	case selector != "":
-		cx, cy, err = resolveSelectorCenter(port, selector)
-		if err != nil {
-			return CobrowseSessionStatus{}, err
-		}
-	case x != nil && y != nil:
-		cx, cy = *x, *y
-	default:
+	if selector == "" && (x == nil || y == nil) {
 		return CobrowseSessionStatus{}, fmt.Errorf("click requires a 'selector' or both 'x' and 'y'")
 	}
-
-	// Selector settling awaits page JavaScript, during which a human can take
-	// control. Check the live driver again before sending any mouse event.
-	currentPort, err := s.requireDrivablePort()
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	if currentPort != port {
-		return CobrowseSessionStatus{}, ErrNotStarted
-	}
-	if err := clickAtPoint(port, cx, cy); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.status(), nil
+	return s.runAction(port, "click", func(r *actionRun) error {
+		var cx, cy float64
+		if selector != "" {
+			var err error
+			cx, cy, err = resolveSelectorCenterOn(r.conn, selector)
+			if err != nil {
+				return err
+			}
+		} else {
+			cx, cy = *x, *y
+		}
+		// Selector settling awaits page JavaScript, during which a human can
+		// take control. Check the live driver again before any mouse event.
+		currentPort, err := s.requireDrivablePort()
+		if err != nil {
+			return err
+		}
+		if currentPort != port {
+			return ErrNotStarted
+		}
+		r.eff.Dispatched = true
+		if err := clickAtPointOn(r.conn, cx, cy); err != nil {
+			return err
+		}
+		r.eff.Clicked = true
+		return nil
+	})
 }
 
 // Type inserts text into whatever element currently holds focus in one
@@ -338,10 +383,15 @@ func (m *CobrowseSessionManager) Type(id, text string) (CobrowseSessionStatus, e
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	if _, err := cdpCommand(port, "Input.insertText", map[string]any{"text": text}); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.status(), nil
+	return s.runAction(port, "type", func(r *actionRun) error {
+		r.eff.Dispatched = true
+		r.eff.TypedLength, r.eff.TypedUnconfirmed = typedLength(text), true
+		if _, err := r.conn.Call("Input.insertText", map[string]any{"text": text}); err != nil {
+			return err
+		}
+		r.eff.TypedUnconfirmed = false
+		return nil
+	})
 }
 
 // Select changes a native select through the page DOM. Native popup windows do
@@ -410,13 +460,14 @@ func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, err
 	if produced != "" {
 		params["text"] = produced
 	}
-	if _, err := cdpCommand(port, "Input.dispatchKeyEvent", params); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	if _, err := cdpCommand(port, "Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk}); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.status(), nil
+	return s.runAction(port, "key", func(r *actionRun) error {
+		r.eff.Dispatched = true
+		if _, err := r.conn.Call("Input.dispatchKeyEvent", params); err != nil {
+			return err
+		}
+		_, err := r.conn.Call("Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk})
+		return err
+	})
 }
 
 func browserKey(key string) (string, int, string, bool) {
@@ -463,21 +514,24 @@ func (m *CobrowseSessionManager) Scroll(id, selector string, x, y *float64, dx, 
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	var cx, cy float64
-	if selector != "" {
-		cx, cy, err = resolveSelectorCenter(port, selector)
-	} else if x != nil && y != nil {
-		cx, cy = *x, *y
-	} else {
+	if selector == "" && (x == nil || y == nil) {
 		return CobrowseSessionStatus{}, fmt.Errorf("scroll requires selector or x and y")
 	}
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	if _, err := cdpCommand(port, "Input.dispatchMouseEvent", map[string]any{"type": "mouseWheel", "x": cx, "y": cy, "deltaX": dx, "deltaY": dy}); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.status(), nil
+	return s.runAction(port, "scroll", func(r *actionRun) error {
+		var cx, cy float64
+		if selector != "" {
+			var err error
+			cx, cy, err = resolveSelectorCenterOn(r.conn, selector)
+			if err != nil {
+				return err
+			}
+		} else {
+			cx, cy = *x, *y
+		}
+		r.eff.Dispatched = true
+		_, err := r.conn.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseWheel", "x": cx, "y": cy, "deltaX": dx, "deltaY": dy})
+		return err
+	})
 }
 
 // Extract reads the text content (and, optionally, named attribute values) of
@@ -632,27 +686,16 @@ func runtimeEvaluate(debugPort int, expr string) (any, error) {
 }
 
 func runtimeEvaluateWithPromise(debugPort int, expr string, awaitPromise bool) (any, error) {
-	res, err := cdpCommand(debugPort, "Runtime.evaluate", map[string]any{
-		"expression":    expr,
-		"returnByValue": true,
-		"awaitPromise":  awaitPromise,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if exc, ok := res["exceptionDetails"]; ok && exc != nil {
-		return nil, fmt.Errorf("script error: %v", exc)
-	}
-	remote, ok := res["result"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("evaluate returned no result")
-	}
-	return remote["value"], nil
+	return evaluateOn(portCaller(debugPort), expr, awaitPromise)
 }
 
 // resolveSelectorCenter waits for the first matching element to stop moving
 // after scrolling and verifies that the click point still hits that element.
 func resolveSelectorCenter(debugPort int, selector string) (float64, float64, error) {
+	return resolveSelectorCenterOn(portCaller(debugPort), selector)
+}
+
+func resolveSelectorCenterOn(c cdpCaller, selector string) (float64, float64, error) {
 	expr := fmt.Sprintf(`(async function(){
 		var el = document.querySelector(%s);
 		if (!el) return null;
@@ -681,7 +724,7 @@ func resolveSelectorCenter(debugPort int, selector string) (float64, float64, er
 		}
 		return {error: "element did not settle in the viewport"};
 	})()`, jsStringLiteral(selector))
-	val, err := runtimeEvaluateWithPromise(debugPort, expr, true)
+	val, err := evaluateOn(c, expr, true)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -703,17 +746,21 @@ func resolveSelectorCenter(debugPort int, selector string) (float64, float64, er
 // clickAtPoint dispatches a synthetic left click (move, press, release) at the
 // given CSS-pixel viewport coordinates.
 func clickAtPoint(debugPort int, x, y float64) error {
-	if _, err := cdpCommand(debugPort, "Input.dispatchMouseEvent", map[string]any{
+	return clickAtPointOn(portCaller(debugPort), x, y)
+}
+
+func clickAtPointOn(c cdpCaller, x, y float64) error {
+	if _, err := c.Call("Input.dispatchMouseEvent", map[string]any{
 		"type": "mouseMoved", "x": x, "y": y, "button": "none",
 	}); err != nil {
 		return err
 	}
-	if _, err := cdpCommand(debugPort, "Input.dispatchMouseEvent", map[string]any{
+	if _, err := c.Call("Input.dispatchMouseEvent", map[string]any{
 		"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1,
 	}); err != nil {
 		return err
 	}
-	_, err := cdpCommand(debugPort, "Input.dispatchMouseEvent", map[string]any{
+	_, err := c.Call("Input.dispatchMouseEvent", map[string]any{
 		"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1,
 	})
 	return err
