@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -424,7 +425,8 @@ func samplingSent(payload *jobs.LLMInferencePayload) map[string]any {
 		}
 	} else {
 		s["temperature"] = openAITemperature(payload)
-		if payload.TopP > 0 && (chat || payload.Backend == "unlimited-ocr") {
+		// SGLang always takes the completions path, which never sends top_p.
+		if payload.TopP > 0 && payload.Backend != "sglang" && (chat || payload.Backend == "unlimited-ocr") {
 			s["top_p"] = payload.TopP
 		}
 	}
@@ -477,7 +479,31 @@ func writeReasoningChunk(stream StreamWriter, content string, index int) {
 	}
 }
 
+// maxSafeSeed is the largest integer a job payload can carry exactly: payloads
+// decode through float64, so a larger seed would be silently rounded.
+const maxSafeSeed = 1<<53 - 1
+
+// safeSeed reports whether a decoded seed is an integer the payload round trip
+// keeps exactly.
+func safeSeed(v any) bool {
+	switch n := v.(type) {
+	case float64:
+		return n == math.Trunc(n) && math.Abs(n) <= maxSafeSeed
+	case int:
+		return n >= -maxSafeSeed && n <= maxSafeSeed
+	case int64:
+		return n >= -maxSafeSeed && n <= maxSafeSeed
+	case json.Number:
+		i, err := n.Int64()
+		return err == nil && i >= -maxSafeSeed && i <= maxSafeSeed
+	}
+	return false
+}
+
 func parseLLMInferencePayload(data map[string]any) (*jobs.LLMInferencePayload, error) {
+	if v, ok := data["seed"]; ok && v != nil && !safeSeed(v) {
+		return nil, fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
 	jsonBytes, err := json.Marshal(data)
 	if err != nil {
 		return nil, err

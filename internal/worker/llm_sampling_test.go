@@ -174,3 +174,25 @@ func TestPayloadTemperaturePresence(t *testing.T) {
 		t.Errorf("absent decoded to %v, want nil", b.Temperature)
 	}
 }
+
+func TestParseLLMInferencePayloadRejectsUnsafeSeed(t *testing.T) {
+	base := func(seed any) map[string]any {
+		return map[string]any{"model": "m", "prompt": "p", "seed": seed}
+	}
+	for _, bad := range []any{1.5, float64(1 << 54), "7"} {
+		if _, err := parseLLMInferencePayload(base(bad)); err == nil {
+			t.Fatalf("seed %v accepted", bad)
+		}
+	}
+	p, err := parseLLMInferencePayload(base(float64(42)))
+	if err != nil || p.Seed == nil || *p.Seed != 42 {
+		t.Fatalf("seed 42: %v %v", p, err)
+	}
+}
+
+func TestSamplingSentSGLangMessagesOmitsTopP(t *testing.T) {
+	p := &jobs.LLMInferencePayload{Backend: "sglang", Messages: []jobs.ChatMessage{{Role: "user"}}, TopP: 0.9}
+	if _, ok := samplingSent(p)["top_p"]; ok {
+		t.Fatal("sglang never sends top_p, so it must not be recorded")
+	}
+}
