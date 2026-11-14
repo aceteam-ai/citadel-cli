@@ -64,10 +64,20 @@ const (
 
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
 // CobrowseSessionManager singleton.
-type CobrowseSessionHandler struct{}
+type CobrowseSessionHandler struct {
+	recoveryNodeID string
+	recoveryRoot   func() string
+	recoveryOps    func(*nexus.Job) recoveryBrowserOps
+}
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
-func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
+func NewCobrowseSessionHandler() *CobrowseSessionHandler { return NewCobrowseSessionHandlerForNode("") }
+
+// NewCobrowseSessionHandlerForNode enables scoped recovery only for a configured
+// node identity. Legacy paid starts without recovery scope retain their path.
+func NewCobrowseSessionHandlerForNode(nodeID string) *CobrowseSessionHandler {
+	return &CobrowseSessionHandler{recoveryNodeID: nodeID, recoveryRoot: network.GetNodeConfigDir}
+}
 
 func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	action := job.Payload["action"]
@@ -78,6 +88,9 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	// never logged here or passed anywhere but nodevault's Unlock.
 	ctx.Log("info", "     - [Job %s] browser-session action: %s", job.ID, action)
 
+	if action == "job_status" || action == "stop_by_job_id" || (action == "start" && hasRecoveryScope(job)) {
+		return h.recoverJob(action, job)
+	}
 	mgr := platform.GetCobrowseSessionManager()
 
 	switch action {

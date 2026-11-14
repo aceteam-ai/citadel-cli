@@ -188,9 +188,10 @@ type cobrowseSession struct {
 	// always Closes it.
 	encProfile SessionProfile
 
-	mu    sync.Mutex
-	state CobrowseSessionState
-	proc  *cobrowseProc
+	teardownMu sync.Mutex
+	mu         sync.Mutex
+	state      CobrowseSessionState
+	proc       *cobrowseProc
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
@@ -285,7 +286,25 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 // and on teardown, so neither the unlocked key nor the profile's single-session
 // lock can leak — a missed Close is structurally impossible because every cleanup
 // path routes through teardown().
-func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
+func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	return m.startSessionWithID(newSessionID(), startURL, profile)
+}
+
+// StartSessionWithID consumes a pre-journaled recovery handle. It refuses an
+// existing handle rather than replacing the session or sharing its profile dir.
+// Ownership of profile transfers on every exit, as in StartSessionWithProfile.
+func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	raw, err := hex.DecodeString(strings.TrimPrefix(id, "cb-"))
+	if len(id) != 35 || !strings.HasPrefix(id, "cb-") || err != nil || len(raw) != 16 || strings.ToLower(id) != id {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("invalid preassigned browser session ID")
+	}
+	return m.startSessionWithID(id, startURL, profile)
+}
+
+func (m *CobrowseSessionManager) startSessionWithID(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
 			profile.Close()
@@ -296,6 +315,13 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 	m.sweepOnce.Do(m.sweep)
 
 	m.mu.Lock()
+	if _, exists := m.sessions[id]; exists {
+		m.mu.Unlock()
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("browser session ID already exists")
+	}
 	if len(m.sessions) >= m.maxSessions {
 		max := m.maxSessions
 		m.mu.Unlock()
@@ -307,7 +333,6 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 			"too many co-browse sessions (%d running); stop one first or raise %s",
 			max, EnvCobrowseMaxSessions)
 	}
-	id := newSessionID()
 	s := &cobrowseSession{
 		id:         id,
 		profile:    filepath.Join(m.baseDir, id),
@@ -513,6 +538,13 @@ func (m *CobrowseSessionManager) StopAll() error {
 // always Closed exactly-effectively-once (Close is idempotent) — the unlocked key
 // and the single-session lock cannot leak.
 func (s *cobrowseSession) teardown() error {
+	s.teardownMu.Lock()
+	defer s.teardownMu.Unlock()
+	return s.teardownAfterStop(nil)
+}
+
+// Caller holds teardownMu. alreadyStopped is exact process identity, not a PID.
+func (s *cobrowseSession) teardownAfterStop(alreadyStopped *cobrowseProc) error {
 	s.mu.Lock()
 	proc := s.proc
 	s.proc = nil
@@ -527,7 +559,7 @@ func (s *cobrowseSession) teardown() error {
 	}
 
 	var err error
-	if proc != nil && proc.stop != nil {
+	if proc != nil && proc != alreadyStopped && proc.stop != nil {
 		err = proc.stop()
 	}
 	if enc != nil {

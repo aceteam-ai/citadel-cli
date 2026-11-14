@@ -1562,6 +1562,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		return reservationsFrom(list)
 	}
 
+	cobrowseRecoveryFn := func() bool {
+		rn := nodeRunner.Load()
+		return rn != nil && rn.CobrowseJobRecoveryAvailable()
+	}
 	jobTypesFn := func() []string {
 		rn := nodeRunner.Load()
 		if rn == nil {
@@ -1630,22 +1634,23 @@ func runWork(cmd *cobra.Command, args []string) {
 			// ConfigDir is normally "" on the heartbeat path (engines are probed,
 			// not read from the manifest). Model hotswap (#632) needs it to
 			// enumerate installed-but-stopped engines, so pass it only when enabled.
-			ConfigDir:        hotswapConfigDir(workConfigDir),
-			Services:         nil,
-			Capabilities:     statusCaps,
-			WorkerLiveness:   workerLivenessFn,
-			SwapStats:        swapStatsFn,
-			ReconcileHealth:  reconcileHealthFn,
-			PinnedServices:   manifestPinnedServices(workManifest),
-			ModelHotswap:     status.ModelHotswapEnabled(),
-			Reservations:     reservationsFn,
-			LaneActivity:     laneActivityFn,
-			PairingDisplay:   pairingDisplayFn,
-			CacheReport:      cacheReportFn,
-			JobTypes:         jobTypesFn,
-			AppPods:          appPodListings,
-			SandboxedModules: sandboxedModuleCapability,
-			NVRHealth:        nvrHealthFn,
+			ConfigDir:           hotswapConfigDir(workConfigDir),
+			Services:            nil,
+			Capabilities:        statusCaps,
+			WorkerLiveness:      workerLivenessFn,
+			SwapStats:           swapStatsFn,
+			ReconcileHealth:     reconcileHealthFn,
+			PinnedServices:      manifestPinnedServices(workManifest),
+			ModelHotswap:        status.ModelHotswapEnabled(),
+			Reservations:        reservationsFn,
+			LaneActivity:        laneActivityFn,
+			PairingDisplay:      pairingDisplayFn,
+			CacheReport:         cacheReportFn,
+			JobTypes:            jobTypesFn,
+			CobrowseJobRecovery: cobrowseRecoveryFn,
+			AppPods:             appPodListings,
+			SandboxedModules:    sandboxedModuleCapability,
+			NVRHealth:           nvrHealthFn,
 			// The status process may run as a different user than an interactive
 			// invoker. Advertise the same machine-level policy the worker enforces.
 			PermissionsProvider: loadNodePermissions,
@@ -1991,6 +1996,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				PairingDisplay:      pairingDisplayFn,
 				CacheReport:         cacheReportFn,
 				JobTypes:            jobTypesFn,
+				CobrowseJobRecovery: cobrowseRecoveryFn,
 				AppPods:             appPodListings,
 				SandboxedModules:    sandboxedModuleCapability,
 				NVRHealth:           nvrHealthFn,

@@ -22,9 +22,11 @@ type Node struct {
 }
 
 type Job struct {
-	ID      string            `json:"id"`
-	Type    string            `json:"type"`
-	Payload map[string]string `json:"payload"`
+	// SourceQueue is transport evidence, never accepted from a job payload.
+	SourceQueue string            `json:"-"`
+	ID          string            `json:"id"`
+	Type        string            `json:"type"`
+	Payload     map[string]string `json:"payload"`
 }
 
 type JobStatusUpdate struct {

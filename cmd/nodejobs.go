@@ -118,6 +118,7 @@ type nodeJobHandlerOpts struct {
 // it through themselves; see cmd/work.go's nodeSwapManager/swapStatsFn.
 func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker.SwapManager) {
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
+		CobrowseRecoveryNodeID:    opts.NodeID,
 		LogFn:                     opts.LogFn,
 		WorkspaceDir:              opts.WorkspaceDir,
 		ConfigDir:                 opts.ConfigDir,
