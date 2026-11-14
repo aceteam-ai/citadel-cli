@@ -38,6 +38,8 @@ type fakeBrowser struct {
 	// InspectTarget call.
 	onClick   func()
 	onInspect func()
+	// inspectErr, when set and returning an error, fails InspectTarget.
+	inspectErr func() error
 }
 
 type fakeSession struct {
@@ -208,6 +210,11 @@ func (f *fakeBrowser) PageState(id string) (platform.PageState, error) {
 func (f *fakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
 	if f.onInspect != nil {
 		f.onInspect()
+	}
+	if f.inspectErr != nil {
+		if err := f.inspectErr(); err != nil {
+			return platform.TargetInfo{}, err
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

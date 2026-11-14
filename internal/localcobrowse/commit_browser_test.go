@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,7 +76,7 @@ func TestRealBrowserCommitActions(t *testing.T) {
 
 	d, send := probe("click", "", "#send")
 	want("Send button", d, ClassCommit)
-	if send.Name != "Send" || !send.InForm || send.FormMethod != "post" || !strings.Contains(send.Content, "to=bob") || !strings.Contains(send.Content, "msg=hello SECRET-TA-TEXT") {
+	if send.Name != "Send" || !send.InForm || send.FormMethod != "post" || send.ContentHash == "" || send.Oversized {
 		t.Errorf("send target not read: %+v", send)
 	}
 	d, _ = probe("click", "", "#expand")
@@ -152,5 +153,288 @@ func TestRealBrowserCommitActions(t *testing.T) {
 	_, b := probe("click", "", "#send")
 	if fb := fingerprint(actionRef{Kind: "click", Selector: "#send"}, b); fa == fb {
 		t.Error("editing the composer must change the fingerprint")
+	}
+}
+
+// TestRealBrowserCommitActionsLongContent checks, in a real browser, that the
+// content digest covers everything: a hidden recipient or message suffix beyond
+// the old 16,000 character cut changes the digest, and a form too large to hash
+// is reported oversized.
+func TestRealBrowserCommitActionsLongContent(t *testing.T) {
+	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" && os.Getenv("CITADEL_REAL_BROWSER_TESTS") == "" {
+		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 (or CITADEL_REAL_BROWSER_TESTS=1) to run the real-browser content test")
+	}
+	var mu sync.Mutex
+	version, recipient, suffix := 1, "bob", "end-a"
+	body := strings.Repeat("x", 20000)
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		v, rc, sf := version, recipient, suffix
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		if r.URL.Path == "/amb" {
+			// Field snapshots whose naive "name=value" lines would be identical.
+			var fields string
+			switch r.URL.Query().Get("v") {
+			case "1":
+				fields = "<textarea name=\"msg\">hello\nrecipient=bob</textarea>"
+			case "2":
+				fields = "<textarea name=\"msg\">hello</textarea><input type=\"hidden\" name=\"recipient\" value=\"bob\">"
+			case "3":
+				fields = "<input type=\"text\" name=\"a=b\" value=\"c\">"
+			case "4":
+				fields = "<input type=\"text\" name=\"a\" value=\"b=c\">"
+			}
+			fmt.Fprintf(w, `<!doctype html><h1 id="t">amb%s</h1><form method="post" action="/send">%s<button id="send" type="submit">Send</button></form>`, r.URL.Query().Get("v"), fields)
+			return
+		}
+		if r.URL.Path == "/huge" {
+			fmt.Fprintf(w, `<!doctype html><h1 id="t">huge</h1><form method="post" action="/send"><textarea name="msg">%s</textarea><button id="send" type="submit">Send</button></form>`, strings.Repeat("y", 5_000_000))
+			return
+		}
+		fmt.Fprintf(w, `<!doctype html><h1 id="t">v%d</h1><form method="post" action="/send"><textarea name="msg">%s%s</textarea><input type="hidden" name="to" value="%s"><button id="send" type="submit">Send</button></form>`, v, body, sf, rc)
+	}))
+	defer page.Close()
+
+	m := platform.NewCobrowseSessionManager(filepath.Join(t.TempDir(), "sessions"), 1)
+	m.SetLaunchOptions(platform.LaunchOptions{Quiet: true})
+	defer m.StopAll()
+	st, err := m.StartSession(page.URL + "/long")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitFor := func(text string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			res, err := m.ExtractBounded(st.ID, "#t", nil, 100)
+			if err == nil && res.Text == text {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("page never showed %q: %+v %v", text, res, err)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+	digest := func() platform.TargetInfo {
+		t.Helper()
+		ti, err := m.InspectTarget(st.ID, platform.TargetProbe{Kind: "click", Selector: "#send"})
+		if err != nil || !ti.Resolved {
+			t.Fatalf("inspect: %+v %v", ti, err)
+		}
+		return ti
+	}
+	waitFor("v1")
+	base := digest()
+	if base.ContentHash == "" || base.Oversized {
+		t.Fatalf("a 20,000 character form must be hashed in full: %+v", base)
+	}
+	reload := func(v int, rc, sf string) {
+		mu.Lock()
+		version, recipient, suffix = v, rc, sf
+		mu.Unlock()
+		if _, err := m.Navigate(st.ID, page.URL+"/long"); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(fmt.Sprintf("v%d", v))
+	}
+	reload(2, "mallory", "end-a") // only the hidden recipient, beyond the old cut, changes
+	if d := digest(); d.ContentHash == base.ContentHash {
+		t.Error("a changed hidden recipient beyond 16,000 characters must change the digest")
+	}
+	reload(3, "bob", "end-b") // only the message suffix changes
+	if d := digest(); d.ContentHash == base.ContentHash {
+		t.Error("a changed message suffix beyond 16,000 characters must change the digest")
+	}
+	reload(4, "bob", "end-a") // same content as the base again
+	if d := digest(); d.ContentHash != base.ContentHash {
+		t.Error("the digest must be stable for identical content")
+	}
+	// Delimiters inside names and values must not move field boundaries: these
+	// pairs are identical as "name=value" lines but submit different payloads.
+	ambDigest := func(v string) string {
+		t.Helper()
+		if _, err := m.Navigate(st.ID, page.URL+"/amb?v="+v); err != nil {
+			t.Fatal(err)
+		}
+		waitFor("amb" + v)
+		d := digest()
+		if d.ContentHash == "" || d.Oversized {
+			t.Fatalf("variant %s: %+v", v, d)
+		}
+		return d.ContentHash
+	}
+	if ambDigest("1") == ambDigest("2") {
+		t.Error("a newline inside a value must not collide with a following hidden field")
+	}
+	if ambDigest("3") == ambDigest("4") {
+		t.Error("an equals sign inside a name must not collide with one inside a value")
+	}
+	if _, err := m.Navigate(st.ID, page.URL+"/huge"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("huge")
+	if d := digest(); !d.Oversized || d.ContentHash != "" {
+		t.Errorf("a form too large to hash must be oversized: %+v", d)
+	}
+}
+
+// TestRealBrowserCommitActionsFormSnapshot runs the actual inspector in a real
+// browser over forms that differ only in state a submission carries: a later
+// selected option of a select-multiple, the submitter's formaction, a control
+// outside the form element joined by form=, a disabled control, and a file
+// input (which cannot be verified).
+func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
+	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" && os.Getenv("CITADEL_REAL_BROWSER_TESTS") == "" {
+		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 (or CITADEL_REAL_BROWSER_TESTS=1) to run the real-browser snapshot test")
+	}
+	variants := map[string]string{
+		"sel1":  `<select name="to" multiple><option value="alice" selected>a</option><option value="bob" selected>b</option><option value="mallory">m</option></select>`,
+		"sel2":  `<select name="to" multiple><option value="alice" selected>a</option><option value="bob">b</option><option value="mallory" selected>m</option></select>`,
+		"out1":  `<input type="text" name="m" value="hi">`,
+		"out2":  `<input type="text" name="m" value="hi"><input form="f" type="hidden" name="to" value="mallory">`,
+		"dis1":  `<input type="hidden" name="to" value="bob">`,
+		"dis2":  `<input type="hidden" name="to" value="bob" disabled>`,
+		"file1": `<input type="text" name="m" value="hi">`,
+		"file2": `<input type="text" name="m" value="hi"><input type="file" name="att">`,
+		"pw1":   `<input type="hidden" name="to" value="alice"><input type="password" name="to" value="secret">`,
+		"pw3":   `<input type="checkbox" name="to" autocomplete="one-time-code"><input type="hidden" name="to" value="alice">`,
+		"pw4":   `<input type="password" name="to" disabled><input type="text" name="to" value="alice">`,
+		"pw5":   `<input type="password" name="to" value="x" disabled>`,
+		"pw6":   `<input type="checkbox" name="to" autocomplete="one-time-code">`,
+		"pw2":   `<input type="password" name="pw" value="secret"><input type="hidden" name="to" value="alice">`,
+		"cf1":   `<x-field name="to" id="xf"></x-field>`,
+		"cf2":   `<x-field name="to" id="xf"></x-field>`,
+		"fe1":   `<input type="text" name="m" value="hi">`,
+		"fe2":   `<input type="text" name="m" value="hi">`,
+		"ft1":   `<input type="text" name="m" value="hi">`,
+		"ft2":   `<input type="text" name="m" value="hi">`,
+		"tg1":   `<input type="text" name="m" value="hi">`,
+		"tg2":   `<input type="text" name="m" value="hi">`,
+		"fa1":   `<input type="text" name="m" value="hi">`,
+		"fa2":   `<input type="text" name="m" value="hi">`,
+	}
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v := r.URL.Query().Get("v")
+		btn := `<button id="send" type="submit">Send</button>`
+		switch v {
+		case "fe2":
+			btn = `<button id="send" type="submit" formaction="">Send</button>`
+		case "ft2":
+			btn = `<button id="send" type="submit" formtarget="">Send</button>`
+		}
+		if v == "fa2" {
+			btn = `<button id="send" type="submit" formaction="/exfil" formmethod="get" formtarget="_blank">Send</button>`
+		}
+		formAttrs := ""
+		switch v {
+		case "tg1":
+			formAttrs = ` target="Panel"`
+		case "tg2":
+			formAttrs = ` target="panel"`
+		case "ft1", "ft2":
+			formAttrs = ` target="Panel"`
+		}
+		extra := ""
+		if v == "cf1" || v == "cf2" {
+			// A form-associated custom element: what it submits is whatever it
+			// passes to setFormValue; its .value property stays fixed.
+			extra = fmt.Sprintf(`<script>customElements.define("x-field", class extends HTMLElement { static formAssociated = true; constructor(){ super(); this.i = this.attachInternals(); this.i.setFormValue(%q); } get value(){ return "fixed"; } });</script>`, r.URL.Query().Get("sv"))
+		}
+		post := ""
+		if v == "pw5" || v == "pw6" {
+			// A formdata handler adds an entry under the sensitive control's name.
+			post = `<script>document.getElementById("f").addEventListener("formdata", function(e){ e.formData.append("to", "mallory"); });</script>`
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<!doctype html>%s<h1 id="t">%s</h1><form id="f" method="post" action="/send"%s>%s%s</form>%s`, extra, v, formAttrs, variants[v], btn, post)
+	}))
+	defer page.Close()
+
+	m := platform.NewCobrowseSessionManager(filepath.Join(t.TempDir(), "sessions"), 1)
+	m.SetLaunchOptions(platform.LaunchOptions{Quiet: true})
+	defer m.StopAll()
+	st, err := m.StartSession(page.URL + "/?v=sel1")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	inspect := func(v string) platform.TargetInfo {
+		t.Helper()
+		q := "/?v=" + v
+		switch v {
+		case "cf1":
+			q += "&sv=alice"
+		case "cf2":
+			q += "&sv=mallory"
+		}
+		if _, err := m.Navigate(st.ID, page.URL+q); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			res, err := m.ExtractBounded(st.ID, "#t", nil, 100)
+			if err == nil && res.Text == v {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("page never showed %q", v)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		ti, err := m.InspectTarget(st.ID, platform.TargetProbe{Kind: "click", Selector: "#send"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ti
+	}
+	fp := func(ti platform.TargetInfo) string {
+		ti.PageURL = "" // the variant name is in the query; compare the snapshot only
+		return fingerprint(actionRef{Kind: "click", Selector: "#send"}, ti)
+	}
+	if a, b := fp(inspect("sel1")), fp(inspect("sel2")); a == b {
+		t.Error("a later selected option of a select-multiple must change the binding")
+	}
+	if a, b := fp(inspect("out1")), fp(inspect("out2")); a == b {
+		t.Error("a control outside the form element joined by form= must change the binding")
+	}
+	if a, b := fp(inspect("dis1")), fp(inspect("dis2")); a == b {
+		t.Error("disabling a control must change the binding")
+	}
+	if ti := inspect("file1"); !ti.Resolved || ti.ContentHash == "" {
+		t.Errorf("a form without a file input is verifiable: %+v", ti)
+	}
+	if ti := inspect("file2"); ti.Resolved {
+		t.Errorf("a form with a file input must be unverifiable: %+v", ti)
+	}
+	if ti := inspect("pw1"); ti.Resolved {
+		t.Errorf("a password field sharing its name with a hidden field must be unverifiable: %+v", ti)
+	}
+	for _, v := range []string{"pw3", "pw4", "pw5", "pw6"} {
+		if ti := inspect(v); ti.Resolved {
+			t.Errorf("%s: a sensitive control sharing its name with another control must be unverifiable: %+v", v, ti)
+		}
+	}
+	if ti := inspect("pw2"); !ti.Resolved || ti.ContentHash == "" {
+		t.Errorf("a password field with a unique name stays verifiable: %+v", ti)
+	}
+	if a, b := fp(inspect("cf1")), fp(inspect("cf2")); a == b {
+		t.Error("a form-associated custom element's setFormValue must change the binding even though its .value is fixed")
+	}
+	if a, b := inspect("tg1"), inspect("tg2"); a.FormTarget == b.FormTarget || a.FormTarget != "Panel" || b.FormTarget != "panel" {
+		t.Errorf("a case-only change of a named target must be kept exactly: %q vs %q", a.FormTarget, b.FormTarget)
+	}
+	if a, b := fp(inspect("fe1")), fp(inspect("fe2")); a == b {
+		t.Error("adding an empty formaction (which resolves to the document URL) must change the binding")
+	}
+	if a, b := fp(inspect("ft1")), fp(inspect("ft2")); a == b {
+		t.Error("adding an empty formtarget (still an override of the form's target) must change the binding")
+	}
+	fa1, fa2 := inspect("fa1"), inspect("fa2")
+	if fa1.FormAction == fa2.FormAction || fa1.FormMethod == fa2.FormMethod || fa1.FormTarget == fa2.FormTarget {
+		t.Errorf("a submitter override must change the effective submission: %+v vs %+v", fa1, fa2)
+	}
+	if fp(fa1) == fp(fa2) {
+		t.Error("a submitter override must change the binding")
 	}
 }

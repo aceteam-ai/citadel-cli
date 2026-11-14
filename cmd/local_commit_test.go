@@ -35,7 +35,7 @@ func TestNoLocalMCPToolCanApprove(t *testing.T) {
 func TestLocalCommitPromptsAreAuditedEndToEnd(t *testing.T) {
 	ownerDir := t.TempDir()
 	fb := newCmdFakeBrowser()
-	fb.target = &platform.TargetInfo{Resolved: true, Tag: "button", InputType: "submit", Name: "Send", Actionable: true, InForm: true, FormMethod: "post", Content: "typed-secret-body"}
+	fb.target = &platform.TargetInfo{Resolved: true, Tag: "button", InputType: "submit", Name: "Send", Actionable: true, InForm: true, FormMethod: "post", ContentHash: "digest-only"}
 	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: fb, policy: allowAllURLs})
 	defer rt.close()
 	one := func(line string) map[string]any {

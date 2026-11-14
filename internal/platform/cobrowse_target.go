@@ -26,40 +26,248 @@ type TargetRect struct {
 
 // TargetInfo describes what an action is about to act on. It is read inside
 // the page and decoded without interpretation; the local-mode commit
-// classifier (localcobrowse.Classify) decides what it means. Content holds the
-// text of the form or composer the action would send; it exists only so the
-// action fingerprint can bind to it. It never goes into a log, a result or an
-// approval card, and password and one-time-code fields are excluded.
+// classifier (localcobrowse.Classify) decides what it means. ContentHash binds
+// the text of the form or composer the action would send, so the action
+// fingerprint changes if any of it does; the text itself stays in the page and
+// password and one-time-code fields are excluded.
 type TargetInfo struct {
 	// Resolved is false when the target could not be identified (nothing at
 	// the point, a canvas, a nested frame). Callers must treat that as a
 	// commit: an unknown target is never assumed harmless.
-	Resolved      bool       `json:"resolved"`
-	Reason        string     `json:"reason,omitempty"`
-	PageURL       string     `json:"page_url,omitempty"`
-	Tag           string     `json:"tag,omitempty"`
-	Role          string     `json:"role,omitempty"`
-	InputType     string     `json:"input_type,omitempty"`
-	Name          string     `json:"name,omitempty"`
-	Href          string     `json:"href,omitempty"`
-	Actionable    bool       `json:"actionable,omitempty"`
-	Entry         bool       `json:"entry,omitempty"`
-	Composer      bool       `json:"composer,omitempty"`
-	Search        bool       `json:"search,omitempty"`
-	AutoSubmit    bool       `json:"auto_submit,omitempty"`
-	InForm        bool       `json:"in_form,omitempty"`
-	FormMethod    string     `json:"form_method,omitempty"`
-	FormAction    string     `json:"form_action,omitempty"`
+	Resolved   bool   `json:"resolved"`
+	Reason     string `json:"reason,omitempty"`
+	PageURL    string `json:"page_url,omitempty"`
+	Tag        string `json:"tag,omitempty"`
+	Role       string `json:"role,omitempty"`
+	InputType  string `json:"input_type,omitempty"`
+	Name       string `json:"name,omitempty"`
+	Href       string `json:"href,omitempty"`
+	Actionable bool   `json:"actionable,omitempty"`
+	Entry      bool   `json:"entry,omitempty"`
+	Composer   bool   `json:"composer,omitempty"`
+	Search     bool   `json:"search,omitempty"`
+	AutoSubmit bool   `json:"auto_submit,omitempty"`
+	InForm     bool   `json:"in_form,omitempty"`
+	FormMethod string `json:"form_method,omitempty"`
+	FormAction string `json:"form_action,omitempty"`
+	// FormEnctype and FormTarget are the effective submission encoding and
+	// target, after any submitter override (formenctype, formtarget).
+	FormEnctype string `json:"form_enctype,omitempty"`
+	FormTarget  string `json:"form_target,omitempty"`
+	// FormOverrides is the presence and raw value of every submission-affecting
+	// attribute on the form and its submitter (present-but-empty differs from
+	// absent). It is only hashed.
+	FormOverrides string     `json:"form_overrides,omitempty"`
 	FormHasSubmit bool       `json:"form_has_submit,omitempty"`
 	Rect          TargetRect `json:"rect"`
-	Content       string     `json:"content,omitempty"`
+	// ContentHash is the SHA-256 (hex) of the complete form and composer
+	// content, computed in the page; the content itself never leaves it.
+	ContentHash string `json:"content_hash,omitempty"`
+	// Oversized is set when the content is too large to hash in full. Such a
+	// target is a commit whose approval can never be redeemed.
+	Oversized bool `json:"oversized,omitempty"`
 }
 
-// maxTargetContent bounds Content so one probe stays small.
-const maxTargetContent = 16000
+// FormDigestScript is the in-page encoding and hash of a form's fields, shared
+// with the tests that run it under Node. formDigest takes an ordered array of
+// [name, id, type, value, checked] tuples and hashes its JSON encoding, which
+// is unambiguous: no delimiter inside a name or value can move a field boundary
+// (a textarea msg="hello\nrecipient=bob" differs from msg="hello" followed by a
+// hidden recipient="bob").
+const FormDigestScript = `
+	// SHA-256 over the UTF-8 bytes of a string, synchronous (SubtleCrypto is
+	// async and only on secure contexts). Constants are derived from primes.
+	function sha256hex(str){
+		var K = [], H = [], n = 2, i, j;
+		function frac(x){ return ((x - Math.floor(x)) * 4294967296) | 0; }
+		for (var c = 0; c < 64; n++) {
+			var prime = true; for (j = 2; j * j <= n; j++) if (n % j === 0) { prime = false; break; }
+			if (!prime) continue;
+			if (c < 8) H[c] = frac(Math.pow(n, 1 / 2));
+			K[c++] = frac(Math.pow(n, 1 / 3));
+		}
+		var data = new TextEncoder().encode(str), l = data.length;
+		var total = (((l + 9) + 63) >> 6) << 6, buf = new Uint8Array(total);
+		buf.set(data); buf[l] = 0x80;
+		var dv = new DataView(buf.buffer);
+		dv.setUint32(total - 8, Math.floor(l / 536870912)); dv.setUint32(total - 4, (l << 3) >>> 0);
+		var w = new Array(64);
+		function rr(x, k){ return (x >>> k) | (x << (32 - k)); }
+		for (var off = 0; off < total; off += 64) {
+			for (i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+			for (i = 16; i < 64; i++) {
+				var s0 = rr(w[i-15], 7) ^ rr(w[i-15], 18) ^ (w[i-15] >>> 3);
+				var s1 = rr(w[i-2], 17) ^ rr(w[i-2], 19) ^ (w[i-2] >>> 10);
+				w[i] = (w[i-16] + s0 + w[i-7] + s1) | 0;
+			}
+			var a = H[0], b = H[1], cc = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+			for (i = 0; i < 64; i++) {
+				var S1 = rr(e, 6) ^ rr(e, 11) ^ rr(e, 25), ch = (e & f) ^ (~e & g);
+				var t1 = (h + S1 + ch + K[i] + w[i]) | 0;
+				var S0 = rr(a, 2) ^ rr(a, 13) ^ rr(a, 22), mj = (a & b) ^ (a & cc) ^ (b & cc);
+				var t2 = (S0 + mj) | 0;
+				h = g; g = f; f = e; e = (d + t1) | 0; d = cc; cc = b; b = a; a = (t1 + t2) | 0;
+			}
+			H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + cc) | 0; H[3] = (H[3] + d) | 0;
+			H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+		}
+		return H.map(function(x){ return ("00000000" + (x >>> 0).toString(16)).slice(-8); }).join("");
+	}
+	function formDigest(tuples){ return sha256hex(JSON.stringify(tuples)); }
+`
+
+// FormSnapshotScript builds the ordered snapshot of everything a browser would
+// submit for an action, shared with the tests that run it under Node against a
+// fake env. The submitted entries come from the browser's own submission set,
+// new FormData(form, submitter): that covers select-multiple, disabled controls,
+// controls joined by form=, form-associated custom elements (whatever they pass
+// to setFormValue) and the submitter's name and value by definition. Entries are
+// encoded as [name, kind, value] tuples in order. A File entry, or a FormData
+// constructor that throws, makes the target unverifiable (bad), and no approval
+// of it is redeemable. Entries named like a password or one-time-code control are
+// dropped, conservatively by name. Composers outside the form (the focused one,
+// or the target) are added from their own text; one whose value cannot be read
+// is bad too. env supplies the DOM reads at prototype level, so a control named
+// "elements" or "getAttribute" cannot shadow them.
+const FormSnapshotScript = `
+	function buildSnapshot(env, form, sub, t, focus, tIsEntry){
+		var tuples = [], bad = "";
+		if (form) {
+			var fd = null;
+			try { fd = env.formData(form, sub); } catch (x) { bad = "the browser could not build this form's submission"; }
+			if (!bad) {
+				// Password and one-time-code controls are never bound, and their
+				// entries are dropped by name. That is only safe when EVERY control
+				// with that name is itself sensitive: if any other control
+				// associated with the form (form.elements, and the submitter)
+				// shares the name, whatever its checked, disabled or type state,
+				// the target is unverifiable. Counting entries is not sound (an
+				// unchecked sensitive checkbox submits nothing while a hidden
+				// field of the same name does).
+				var sens = {}, other = {}, exp = {};
+				var els = env.elements(form);
+				if (sub && els.indexOf(sub) < 0) els = els.concat([sub]);
+				for (var i = 0; i < els.length; i++) {
+					var nm0 = String(els[i].name || "");
+					if (!nm0) continue; // an unnamed control submits nothing
+					var ty = String(els[i].type || "").toLowerCase(), ac = String(env.attr(els[i], "autocomplete") || "");
+					var key0 = "n:" + nm0;
+					if (ty === "password" || /one-time-code|current-password|new-password|password/i.test(ac)) {
+						sens[key0] = true;
+						exp[key0] = exp[key0] || [];
+						// What this control contributes if the submission is the browser's:
+						// only an enabled control, a checked checkable one, or the submitter.
+						var okc = !env.disabled(els[i]);
+						if (/^(checkbox|radio)$/.test(ty)) okc = okc && !!els[i].checked;
+						if (/^(submit|image|button|reset)$/.test(ty)) okc = okc && els[i] === sub;
+						if (okc && typeof els[i].value === "string") exp[key0].push(els[i].value.replace(/\r\n?/g, "\n"));
+					}
+					else other[key0] = true;
+				}
+				var skip = sens;
+				for (var key in sens) { if (other[key]) { bad = "a password or one-time-code field shares its name with another control"; } }
+				var entries = env.entries(fd), got = {};
+				// What the browser submitted under a sensitive name must be exactly
+				// what the successful sensitive controls contribute, count and
+				// value (compared in the page; values are never sent out). Anything
+				// extra, such as an entry a formdata handler added beside a disabled
+				// password or an unchecked one-time-code checkbox, is unverifiable.
+				for (var e2 = 0; e2 < entries.length; e2++) {
+					var k2 = "n:" + String(entries[e2][0]);
+					if (sens[k2]) { got[k2] = got[k2] || []; got[k2].push(env.isFile(entries[e2][1]) ? "\u0000file" : String(entries[e2][1]).replace(/\r\n?/g, "\n")); }
+				}
+				for (var key2 in sens) {
+					var g = (got[key2] || []).slice().sort(), x = exp[key2].slice().sort();
+					if (g.length !== x.length) { bad = "an entry shares its name with a password or one-time-code field"; break; }
+					for (var z = 0; z < g.length; z++) { if (g[z] !== x[z]) { bad = "an entry under a password or one-time-code field's name does not match it"; break; } }
+				}
+				if (!bad) {
+					for (var m2 = 0; m2 < entries.length; m2++) {
+						var name = String(entries[m2][0]), val = entries[m2][1];
+						if (env.isFile(val)) { bad = "the form submits a file"; break; }
+						if (skip["n:" + name]) continue;
+						tuples.push([name, "string", String(val)]);
+					}
+				}
+			}
+		}
+		function add(c, mustRead){
+			var tag = String(c.tagName || "").toLowerCase();
+			if (env.disabled(c)) return;
+			var ty = String(c.type || "").toLowerCase();
+			if (ty === "file") { bad = "the page has a file input"; return; }
+			if (/^(password|submit|button|reset|image)$/.test(ty)) return;
+			var ac = String(env.attr(c, "autocomplete") || "");
+			if (/one-time-code|password/i.test(ac)) return;
+			var v;
+			if (tag === "select") v = Array.prototype.map.call(c.selectedOptions || [], function(o){ return o.value; }).join("\u0000");
+			else if (c.isContentEditable) v = env.text(c);
+			else if (typeof c.value === "string") v = c.value;
+			else { if (mustRead) bad = "a text control's value cannot be read"; return; }
+			tuples.push(["(page)", ty || tag, v]);
+		}
+		if (!bad) {
+			if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT") && !(form && env.inForm(form, focus))) add(focus, false);
+			if (t && !(form && env.inForm(form, t)) && (tIsEntry || String(t.tagName || "").toLowerCase() === "select")) add(t, true);
+		}
+		return {tuples: tuples, bad: bad};
+	}
+	// normTarget keeps a browsing-context name exactly (names are case-sensitive)
+	// and lower-cases only the reserved keywords.
+	function normTarget(s){ s = String(s || ""); return /^_(self|blank|parent|top)$/i.test(s) ? s.toLowerCase() : s; }
+	// inspectForm returns what an action would submit: the digest of the
+	// submission snapshot and the effective submission (action, method, enctype,
+	// target) after any override by the submitter, which is the clicked submit
+	// button or, for Enter in a field, the form's default (first enabled submit)
+	// button. The submitter's own name, id, type and value are folded into the
+	// digest. bad or oversized means the target cannot be verified in full.
+	function inspectForm(env, form, t, focus, tIsEntry, maxc){
+		var r = {bad: "", oversized: false, digest: "", action: "", method: "", enctype: "", target: "", overrides: ""};
+		var sub = null;
+		if (form) {
+			var els = env.elements(form);
+			var isSub = function(c){ var y = String(c.type || "").toLowerCase(); return (String(c.tagName).toUpperCase() === "BUTTON" || String(c.tagName).toUpperCase() === "INPUT") && (y === "submit" || y === "image"); };
+			if (t && isSub(t)) sub = t;
+			if (!sub) { for (var q = 0; q < els.length; q++) { if (isSub(els[q]) && !env.disabled(els[q])) { sub = els[q]; break; } } }
+			// Present-but-empty is not absent: an empty formaction resolves to the
+			// document URL and an empty formtarget is still an override, so each
+			// attribute's presence and raw value are bound alongside the effective
+			// result. formnovalidate, novalidate and accept-charset change how the
+			// submission behaves and are bound too.
+			var pick = function(subAttr, formAttr){
+				if (sub && env.has(sub, subAttr)) return String(env.attr(sub, subAttr) || "");
+				return String(env.attr(form, formAttr) || "");
+			};
+			var pr = function(e, n){
+				if (!e || !env.has(e, n)) return [n, 0, ""];
+				var raw = String(env.attr(e, n) || "");
+				if (/target$/.test(n)) raw = normTarget(raw);
+				else if (/(method|enctype)$/.test(n)) raw = raw.toLowerCase();
+				return [n, 1, raw];
+			};
+			var fa = sub && env.has(sub, "formaction") ? String(env.attr(sub, "formaction") || "") : String(env.attr(form, "action") || "");
+			r.action = env.abs(fa || env.base());
+			var m = pick("formmethod", "method").toLowerCase();
+			r.method = (m === "post" || m === "dialog") ? m : "get";
+			var en = pick("formenctype", "enctype").toLowerCase();
+			r.enctype = (en === "multipart/form-data" || en === "text/plain") ? en : "application/x-www-form-urlencoded";
+			r.target = normTarget(pick("formtarget", "target"));
+			r.overrides = JSON.stringify([pr(sub, "formaction"), pr(sub, "formmethod"), pr(sub, "formenctype"), pr(sub, "formtarget"), pr(sub, "formnovalidate"),
+				pr(form, "action"), pr(form, "method"), pr(form, "enctype"), pr(form, "target"), pr(form, "novalidate"), pr(form, "accept-charset")]);
+		}
+		var snap = buildSnapshot(env, form, sub, t, focus, tIsEntry);
+		if (snap.bad) { r.bad = snap.bad; return r; }
+		if (JSON.stringify(snap.tuples).length > maxc) { r.oversized = true; return r; }
+		var d = formDigest(snap.tuples);
+		if (sub) d = formDigest([d, [sub.name || "", sub.id || "", String(sub.type || "").toLowerCase(), sub.value === undefined ? "" : String(sub.value)]]);
+		r.digest = d;
+		return r;
+	}
+`
 
 const targetProbeScript = `(function(kind, selector, px, py){
-	var MAXC = 16000;
+	var MAXC = 4000000;
+` + FormDigestScript + FormSnapshotScript + `
 	function deepActive(){ var a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; return a; }
 	function deepPoint(x, y){ var e = document.elementFromPoint(x, y); while (e && e.shadowRoot) { var i = e.shadowRoot.elementFromPoint(x, y); if (!i || i === e) break; e = i; } return e; }
 	function txt(e){ return (e.innerText || e.textContent || "").replace(/\s+/g, " ").trim(); }
@@ -136,39 +344,42 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	out.entry = isEntry;
 	out.composer = tag === "textarea" || !!t.isContentEditable || role === "textbox";
 	if (tag === "a" && t.href) out.href = abs(t.getAttribute("href") || t.href);
+	var HF = HTMLFormElement.prototype, EP = Element.prototype;
+	var env = {
+		attr: function(e, n){ try { return EP.getAttribute.call(e, n); } catch (x) { return null; } },
+		elements: function(f){ try { return Array.prototype.slice.call(Object.getOwnPropertyDescriptor(HF, "elements").get.call(f)); } catch (x) { return []; } },
+		disabled: function(e){ try { return EP.matches.call(e, ":disabled"); } catch (x) { return !!e.disabled; } },
+		text: function(e){ return e.innerText || e.textContent || ""; },
+		formData: function(f, sub){ return sub ? new FormData(f, sub) : new FormData(f); },
+		entries: function(fd){ var out = []; fd.forEach(function(v, k){ out.push([k, v]); }); return out; },
+		isFile: function(v){ return typeof v !== "string"; },
+		inForm: function(f, c){ try { return Array.prototype.indexOf.call(Object.getOwnPropertyDescriptor(HF, "elements").get.call(f), c) >= 0; } catch (x) { return false; } },
+		has: function(e, n){ try { return EP.hasAttribute.call(e, n); } catch (x) { return false; } },
+		abs: abs,
+		base: function(){ return location.href; }
+	};
+	var fi = inspectForm(env, t.form || (t.closest ? t.closest("form") : null), t, deepActive(), (function(){
+		var ty0 = (t.type || t.getAttribute("type") || "").toLowerCase(), r0 = (t.getAttribute("role") || "").toLowerCase();
+		return t.tagName.toLowerCase() === "textarea" || t.isContentEditable || r0 === "textbox" || r0 === "searchbox" || r0 === "combobox" ||
+			(t.tagName.toLowerCase() === "input" && !/^(checkbox|radio|button|submit|reset|image|file|hidden|range|color)$/.test(ty0));
+	})(), MAXC);
 	var form = t.form || (t.closest ? t.closest("form") : null);
 	var attrSearch = /\bsearch\b/i.test((t.getAttribute("aria-label") || "") + " " + (t.id || "") + " " + (t.getAttribute("name") || ""));
 	out.search = type === "search" || role === "searchbox" || attrSearch || !!(t.closest && t.closest("[role=search]"));
 	if (form) {
 		out.in_form = true;
-		var fa = t.getAttribute && t.getAttribute("formaction");
-		var fm = t.getAttribute && t.getAttribute("formmethod");
-		out.form_action = abs(fa || (form.getAttribute("action") || location.href));
-		out.form_method = String(fm || form.getAttribute("method") || "get").toLowerCase();
-		out.form_has_submit = !!form.querySelector("button:not([type]),button[type=submit],input[type=submit],input[type=image]");
-		if (form.getAttribute("role") === "search") out.search = true;
+		var formEls = env.elements(form);
+		out.form_action = fi.action; out.form_method = fi.method; out.form_enctype = fi.enctype; out.form_target = fi.target; out.form_overrides = fi.overrides;
+		out.form_has_submit = !!EP.querySelector.call(form, "button:not([type]),button[type=submit],input[type=submit],input[type=image]");
+		if (env.attr(form, "role") === "search") out.search = true;
 		var controls = 0;
-		for (var i = 0; i < form.elements.length; i++) { var c = form.elements[i]; if ((c.type || "") !== "hidden") controls++; }
+		for (var i = 0; i < formEls.length; i++) { if ((formEls[i].type || "") !== "hidden") controls++; }
 		if (tag === "select") out.auto_submit = t.hasAttribute("onchange") || (controls === 1 && !out.form_has_submit);
 	} else if (tag === "select") { out.auto_submit = t.hasAttribute("onchange"); }
 	var r = t.getBoundingClientRect();
 	out.rect = {x: r.x, y: r.y, w: r.width, h: r.height, vw: window.innerWidth, vh: window.innerHeight};
-	var parts = [];
-	function field(c){
-		var ty = (c.type || "").toLowerCase();
-		// Hidden fields carry recipients and amounts, so they are bound too.
-		if (/^(password|file|submit|button|reset|image)$/.test(ty)) return;
-		var ac = (c.getAttribute && c.getAttribute("autocomplete")) || "";
-		if (/one-time-code|password/i.test(ac)) return;
-		var v = c.isContentEditable ? txt(c) : (c.value !== undefined ? c.value : "");
-		if (ty === "checkbox" || ty === "radio") v = (c.checked ? "on:" : "off:") + v;
-		parts.push((c.name || c.id || "") + "=" + v);
-	}
-	if (form) { for (var j = 0; j < form.elements.length; j++) field(form.elements[j]); }
-	var focus = deepActive();
-	if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT")) field(focus);
-	if (isEntry) field(t);
-	out.content = parts.join("\n").slice(0, MAXC);
+	if (fi.bad) { out.reason = fi.bad; return out; }
+	if (fi.oversized) { out.oversized = true; } else { out.content_hash = fi.digest; }
 	out.resolved = true;
 	return out;
 })`
@@ -204,9 +415,6 @@ func (m *CobrowseSessionManager) InspectTarget(id string, p TargetProbe) (Target
 	var info TargetInfo
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return TargetInfo{}, err
-	}
-	if len(info.Content) > maxTargetContent {
-		info.Content = info.Content[:maxTargetContent]
 	}
 	return info, nil
 }
