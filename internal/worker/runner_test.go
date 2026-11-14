@@ -63,6 +63,8 @@ type clockOrderWriter struct {
 	order *[]string
 }
 
+func (w clockOrderWriter) authenticatedWorkerControl(job *Job) bool { return job.control.matches(job) }
+
 func (w clockOrderWriter) WriteEnd(out map[string]any) error {
 	*w.order = append(*w.order, "end")
 	return w.clockCaptureWriter.WriteEnd(out)
@@ -77,9 +79,12 @@ func TestRunnerClockSyntheticAndWorkerControlOrdering(t *testing.T) {
 			if name == "workerControlAckRefusal" {
 				source.ackErr = errors.New("synthetic ack failure")
 			}
-			job := &Job{ID: "synthetic-terminal", Type: JobTypeWorkerControl, Payload: map[string]any{}}
+			job := controlJob("synthetic-terminal")
+			if name == "warming" {
+				job.Type = JobTypeLLMInference
+			}
 			var ns int64 = 100
-			r := NewRunner(source, nil, RunnerConfig{ActivityFn: func(string, string) {}})
+			r := NewRunner(source, nil, RunnerConfig{NodeID: "758", ActivityFn: func(string, string) {}})
 			r.wallNow = func() time.Time { return time.Unix(0, ns) }
 			capture := &clockCaptureWriter{job: job}
 			writer := clockOrderWriter{clockCaptureWriter: capture, order: &order}

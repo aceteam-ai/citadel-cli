@@ -12,6 +12,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
 )
 
 // APISource implements JobSource using the AceTeam Redis API proxy.
@@ -19,8 +20,9 @@ import (
 // Supports consuming from multiple queues by round-robining across them.
 type APISource struct {
 	deliveryRefusals
-	client *redisapi.Client
-	config APISourceConfig
+	client  *redisapi.Client
+	config  APISourceConfig
+	control *workerControlBinding
 
 	// mu guards queueNames, which is read by the run loop (Next) and may be
 	// appended to at runtime by AddQueue (e.g. the /agent/resubscribe control
@@ -143,6 +145,9 @@ func (s *APISource) log(level, format string, args ...interface{}) {
 // the ping error is wrapped with %w so callers can still type-assert a 429
 // (redisapi.RateLimitError) through the chain.
 func (s *APISource) Connect(ctx context.Context) error {
+	if err := s.validateControlQueues(); err != nil {
+		return err
+	}
 	// Skip if already connected and verified.
 	if s.client != nil {
 		return nil
@@ -162,6 +167,9 @@ func (s *APISource) Connect(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to Redis API: %w", err)
 	}
 	s.client = client
+	if s.control != nil {
+		s.control.client = client
+	}
 
 	s.log("info", "   - API: %s", s.config.BaseURL)
 	s.log("info", "   - Worker ID: %s", s.client.WorkerID())
@@ -200,6 +208,9 @@ func (s *APISource) getWake() *wakePump {
 // readOnce performs one consume of the subscribed queue(s) with the given block
 // timeout. Core shared by the poll-only path and the wakePump closures.
 func (s *APISource) readOnce(ctx context.Context, blockMs int) (*Job, error) {
+	if err := s.validateControlQueues(); err != nil {
+		return nil, err
+	}
 	queues := s.snapshotQueues()
 	if len(queues) == 1 {
 		return s.nextSingle(ctx, queues[0], blockMs)
@@ -477,6 +488,7 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 // convertJob converts an API job to a worker.Job.
 func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 	job := &Job{
+		control:     s.control,
 		observation: aj.DeliveryObservation(),
 		ID:          aj.JobID,
 		Type:        aj.Type,
@@ -484,6 +496,11 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 		RawPayload:  bytes.Clone(aj.RawPayload),
 		Source:      "redis-api",
 		MessageID:   aj.MessageID,
+	}
+	if s.control != nil && aj.Control != nil && s.control.config.Matches(aj.Control.Identity) {
+		e := *aj.Control
+		job.controlEnvelope = &e
+		job.controlSession = s.control.session(e)
 	}
 	// Extract rayId: check RawData first, then payload
 	if aj.RawData != nil {
@@ -501,6 +518,12 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 
 // Ack acknowledges successful job completion.
 func (s *APISource) Ack(ctx context.Context, job *Job) error {
+	if s.control != nil {
+		if !s.control.matches(job) || !job.controlSession.CanPrepare() {
+			return workercontrol.ErrDenied
+		}
+		return nil // claim_and_ack already confirmed the durable logical ACK.
+	}
 	if job.delivery != nil {
 		return job.delivery().finish(ctx, nil, "")
 	}
@@ -521,6 +544,9 @@ func (s *APISource) Ack(ctx context.Context, job *Job) error {
 // Nack indicates job failure.
 // For the API, this updates status but does NOT ACK - allowing retry.
 func (s *APISource) Nack(ctx context.Context, job *Job, err error) error {
+	if s.control != nil {
+		return nil // Keep the delivery pending; control outcomes use pub/sub only.
+	}
 	if job.delivery != nil {
 		job.delivery().stop()
 		return nil
@@ -576,6 +602,9 @@ func (s *APISource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err
 // ACK the message so it is removed from the consumer group's PEL. Used for
 // failures that will never succeed on retry (e.g. an unsupported job type).
 func (s *APISource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
+	if s.control != nil {
+		return s.Ack(ctx, job) // The authenticated terminal event owns the outcome.
+	}
 	if job.delivery != nil {
 		code, _ := data["reason"].(string)
 		if code == "" {
@@ -668,6 +697,9 @@ func (s *APISource) AddQueue(queue string) {
 
 // IsJobCancelled checks whether a job has been cancelled by the producer.
 func (s *APISource) IsJobCancelled(ctx context.Context, jobID string) bool {
+	if s.control != nil {
+		return false // Control cancellation and status use the dedicated authority.
+	}
 	cancelled, err := s.client.IsJobCancelled(ctx, jobID)
 	if err != nil {
 		// Log but don't block — treat check failure as "not cancelled"

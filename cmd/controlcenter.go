@@ -2630,6 +2630,9 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// on the live runner, shared with runWork. This closes the "no handler" hazard for
 	// a control-center-only node.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	if ccWorkerLock != nil && deviceConfig != nil {
+		defer startWorkerControl(ctx, source, deviceConfig.OrgID, nodeJobOpts)()
+	}
 	startStatusPublisherAfterRunner(&ccNodeRunner, runner, startHeartbeatPublisher)
 	activity("success", "Worker started, listening for jobs...")
 
