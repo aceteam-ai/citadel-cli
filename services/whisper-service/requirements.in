@@ -6,7 +6,7 @@ certifi==2026.10.19
 pillow==13.0.0
 # #1510: GHSA-xcq7-p3pf-p88h. SDK and semantic-convention exact API
 # constraints are updated together in the targeted lock; see SECURITY-LOCK-1510.md.
-opentelemetry-api==1.45.1
+opentelemetry-api==1.45.2
 # Current audit: 13 filelock advisories; all fixed in 4.2.1.
 filelock==4.2.1
 faster-whisper==1.2.1

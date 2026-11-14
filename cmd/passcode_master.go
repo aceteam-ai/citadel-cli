@@ -41,8 +41,14 @@ WARNING: if you forget the master PIN, or the node's on-disk pepper file is
 lost, any data encrypted under it is permanently unrecoverable — not by you, not
 by AceTeam. This is the zero-knowledge property working as designed.
 
-The master PIN also grants full remote access to this machine (console, screen,
-files, shell). Anyone who holds it has the same power. Set it locally only.`,
+Once this machine is enrolled as an AceTeam node, the master PIN also grants
+remote access to it (console, screen, files, shell). Anyone who holds it has the
+same power. Set it locally only.
+
+A short PIN gates access but cannot encrypt data at rest: encrypted surfaces,
+such as a persistent co-browse profile, open only when the master PIN is a
+passphrase of four or more random words. Citadel local mode does not use the
+master PIN; its saved logins have their own passphrase ('citadel local passphrase').`,
 	Args: cobra.NoArgs,
 	RunE: runPasscodeEnroll,
 }
@@ -393,9 +399,9 @@ func printBadgeLine(st nodevault.Status) {
 func printMasterPINDisclosure() {
 	fmt.Fprintln(os.Stderr, strings.TrimSpace(`
 ================================ READ CAREFULLY ================================
-The node master PIN grants FULL access to this machine over the network:
-console/terminal, desktop/screen, files, and shell. Anyone who holds it can do
-anything you can do on this box.
+On an enrolled node, the master PIN grants FULL access to this machine over the
+network: console/terminal, desktop/screen, files, and shell. Anyone who holds it
+can do anything you can do on this box.
 
 It is ALSO the only key to any data this node encrypts at rest. If you forget it
 - or lose the node's on-disk pepper file - that data is PERMANENTLY
