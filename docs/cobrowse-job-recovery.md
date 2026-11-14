@@ -20,11 +20,14 @@ session handle before the browser call. `FileStore` requires a private, owned Un
 directory and regular, owned, single-link files. It refuses links and public
 permissions. A snapshot file is fsynced, renamed and its directory fsynced before
 launch. Creation of the journal directory is synced in its parent too. Any
-failure or uncertain publication refuses launch. An empty snapshot is initialized
-only by the process that creates a fresh journal directory; a missing snapshot
-in an existing directory is a continuity failure and refuses every recovery
-operation. External deletion/replacement of the entire journal directory is not
-a supported recovery procedure. The journal contains neither
+failure or uncertain publication refuses launch. Initialization writes a private, non-secret incarnation identity into the new
+journal and a matching immutable anchor beside it, with file and directory sync.
+The custody lock also lives beside the journal. A missing/renamed/replaced journal,
+a missing anchor or a mismatched identity fails closed instead of authorizing an
+empty-ledger stop. A missing snapshot in an existing incarnation refuses every
+operation. Initialization is allowed only when both anchor and directory are absent;
+partly initialized or legacy state needs explicit operator reconciliation.
+The journal contains neither
 PINs, profile names, raw requests, URL queries nor page content. The request hash
 uses an ordered JSON tuple of canonical URL and profile; PIN is excluded, so a
 failed PIN attempt is terminal under that job ID.
@@ -66,7 +69,12 @@ browser exit, or a pre-delivery tombstone that never authorized launch. A missin
 session, unresolved launch, failed cleanup or unobserved exit does not confirm a
 stop. A lost or unverifiable registry can therefore need operator reconciliation;
 recovery must retain the charge and must not invent a successful stop. Persistent
-profile cleanup still belongs to the existing session manager.
+profile cleanup still belongs to the session manager. After verified exit,
+recovery retains its exact process/profile handles until sealing, key closure and
+checked plaintext-directory removal all succeed. A transient failure is retried
+without repeating a completed process stop or sealing a closed key. Plaintext stays
+in the owned private working directory while sealing is unconfirmed; a restart
+that loses the in-memory sealing handle remains unknown and needs reconciliation.
 
 ## Capability, paired rollout and acceptance
 

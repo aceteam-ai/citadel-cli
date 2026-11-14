@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/google/uuid"
 )
 
 const maxJournalBytes = 8 << 20
@@ -27,92 +29,137 @@ type fileTx struct {
 func (t *fileTx) Records() map[string]Record { return t.records }
 func (t *fileTx) Close()                     { _ = t.lock.Close() }
 
+// readIdentity reads a private, non-secret incarnation marker. It is storage
+// continuity evidence only, never a credential or authority to launch.
+func readIdentity(path string) (string, error) {
+	f, err := privateOpen(path, false)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, 37))
+	if err != nil || len(b) != 36 || !canonicalID(string(b)) {
+		return "", ErrUnavailable
+	}
+	return string(b), nil
+}
+func createIdentity(path, value string) error {
+	// Exclusive creation refuses links and never overwrites an earlier marker.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return ErrUnavailable
+	}
+	if _, err = f.WriteString(value); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+func syncParent(path string) error {
+	f, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return ErrUnavailable
+	}
+	defer f.Close()
+	return f.Sync()
+}
 func (s FileStore) Begin() (Transaction, error) {
 	if !Supported() {
 		return nil, ErrUnavailable
 	}
-	created, err := privateDir(s.Dir)
+	// The lock and immutable anchor live OUTSIDE the journal directory. Moving
+	// that directory cannot create another custody lock or a fresh empty ledger.
+	lock, err := privateOpen(s.Dir+".lock", true)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
-	lock, err := privateOpen(filepath.Join(s.Dir, "journal.lock"), true)
-	if err != nil {
-		return nil, ErrUnavailable
-	}
-	if err = lockExclusive(lock); err != nil {
+	if lockExclusive(lock) != nil {
 		_ = lock.Close()
 		return nil, ErrUnavailable
 	}
-	t := &fileTx{records: map[string]Record{}, dir: s.Dir, lock: lock, sync: s.sync}
-	if t.sync == nil {
-		t.sync = (*os.File).Sync
+	t := &fileTx{records: map[string]Record{}, dir: s.Dir, lock: lock, sync: (*os.File).Sync}
+	refuse := func() (Transaction, error) { t.Close(); return nil, ErrUnavailable }
+	anchor, err := readIdentity(s.Dir + ".anchor")
+	if os.IsNotExist(err) {
+		// Initialization is allowed only when BOTH anchor and directory are absent.
+		// A partly initialized or legacy directory needs explicit reconciliation.
+		if _, statErr := os.Lstat(s.Dir); !os.IsNotExist(statErr) {
+			return refuse()
+		}
+		created, dirErr := privateDir(s.Dir)
+		if dirErr != nil || !created {
+			return refuse()
+		}
+		generation, genErr := uuid.NewRandom()
+		if genErr != nil {
+			return refuse()
+		}
+		marker := generation.String()
+		if createIdentity(filepath.Join(s.Dir, "identity"), marker) != nil || t.Save() != nil {
+			return refuse()
+		}
+		if createIdentity(s.Dir+".anchor", marker) != nil || syncParent(s.Dir) != nil {
+			return refuse()
+		}
+	} else {
+		if err != nil {
+			return refuse()
+		}
+		// Never recreate a missing directory when an earlier incarnation exists.
+		if err = checkPrivateDir(s.Dir); err != nil {
+			return refuse()
+		}
+		marker, markerErr := readIdentity(filepath.Join(s.Dir, "identity"))
+		if markerErr != nil || marker != anchor {
+			return refuse()
+		}
+	}
+	if s.sync != nil {
+		t.sync = s.sync
 	}
 	f, err := privateOpen(filepath.Join(s.Dir, "records.json"), false)
-	if os.IsNotExist(err) {
-		// Only the process that created a fresh directory may initialize an empty
-		// snapshot. Missing state in an existing directory is a continuity failure,
-		// not evidence that no earlier execution occurred.
-		if !created {
-			t.Close()
-			return nil, ErrUnavailable
-		}
-		savedSync := t.sync
-		t.sync = (*os.File).Sync
-		initErr := t.Save()
-		t.sync = savedSync
-		if initErr != nil {
-			t.Close()
-			return nil, ErrUnavailable
-		}
-		return t, nil
-	}
 	if err != nil {
-		t.Close()
-		return nil, ErrUnavailable
+		return refuse()
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxJournalBytes+1))
 	_ = f.Close()
 	if err != nil || len(b) > maxJournalBytes {
-		t.Close()
-		return nil, ErrUnavailable
+		return refuse()
 	}
-	// Stream the bounded array so a small corrupt file containing millions of
-	// empty records cannot allocate an unbounded []Record before the count check.
+	// Decode incrementally: cap records before allocating another entry.
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	opening, err := dec.Token()
 	if err != nil || opening != json.Delim('[') {
-		t.Close()
-		return nil, ErrUnavailable
+		return refuse()
 	}
 	for dec.More() {
 		if len(t.records) >= MaxRecords {
-			t.Close()
-			return nil, ErrUnavailable
+			return refuse()
 		}
 		var r Record
 		if dec.Decode(&r) != nil || !validRecord(r) {
-			t.Close()
-			return nil, ErrUnavailable
+			return refuse()
 		}
 		if _, exists := t.records[r.JobID]; exists {
-			t.Close()
-			return nil, ErrUnavailable
+			return refuse()
 		}
 		t.records[r.JobID] = r
 	}
 	closing, err := dec.Token()
 	if err != nil || closing != json.Delim(']') {
-		t.Close()
-		return nil, ErrUnavailable
+		return refuse()
 	}
 	var trailing any
 	if dec.Decode(&trailing) != io.EOF {
-		t.Close()
-		return nil, ErrUnavailable
+		return refuse()
 	}
 	return t, nil
 }
+
 func (t *fileTx) Save() error {
 	if len(t.records) > MaxRecords {
 		return ErrUnavailable

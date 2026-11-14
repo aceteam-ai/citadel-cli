@@ -185,13 +185,18 @@ type cobrowseSession struct {
 
 	// encProfile is the encrypted persistent profile for this session, or nil for a
 	// throwaway session. When set, teardown persists (only if the browser ran) and
-	// always Closes it.
+	// closes it on legacy teardown; recovery retains it until cleanup can finish.
 	encProfile SessionProfile
 
-	teardownMu sync.Mutex
-	mu         sync.Mutex
-	state      CobrowseSessionState
-	proc       *cobrowseProc
+	// Recovery cleanup keeps custody through retryable persistence/removal
+	// failures. These stages are protected by teardownMu, not execution authority.
+	recoveryStopped   bool
+	recoveryPersisted bool
+	recoveryClosed    bool
+	teardownMu        sync.Mutex
+	mu                sync.Mutex
+	state             CobrowseSessionState
+	proc              *cobrowseProc
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
@@ -534,17 +539,12 @@ func (m *CobrowseSessionManager) StopAll() error {
 
 // teardown kills the session's processes (if launched), persists the encrypted
 // profile (only if the browser actually ran), Closes the profile, and removes the
-// plaintext working dir. Every cleanup path routes through here, so the profile is
-// always Closed exactly-effectively-once (Close is idempotent) — the unlocked key
-// and the single-session lock cannot leak.
+// plaintext working dir on legacy cleanup paths, so the profile is
+// always Closed exactly-effectively-once (Close is idempotent). Scoped recovery
+// instead uses finishRecoveryCleanup to retain custody across retryable failure.
 func (s *cobrowseSession) teardown() error {
 	s.teardownMu.Lock()
 	defer s.teardownMu.Unlock()
-	return s.teardownAfterStop(nil)
-}
-
-// Caller holds teardownMu. alreadyStopped is exact process identity, not a PID.
-func (s *cobrowseSession) teardownAfterStop(alreadyStopped *cobrowseProc) error {
 	s.mu.Lock()
 	proc := s.proc
 	s.proc = nil
@@ -559,7 +559,7 @@ func (s *cobrowseSession) teardownAfterStop(alreadyStopped *cobrowseProc) error 
 	}
 
 	var err error
-	if proc != nil && proc != alreadyStopped && proc.stop != nil {
+	if proc != nil && proc.stop != nil {
 		err = proc.stop()
 	}
 	if enc != nil {

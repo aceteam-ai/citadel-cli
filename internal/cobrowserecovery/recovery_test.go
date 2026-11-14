@@ -255,9 +255,11 @@ func TestStoreRejectsCorruptionLinksAndPublicPermissions(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
 			dir := filepath.Join(root, "journal")
-			if err := os.Mkdir(dir, 0700); err != nil {
+			tx, err := (FileStore{Dir: dir}).Begin()
+			if err != nil {
 				t.Fatal(err)
 			}
+			tx.Close()
 			path := filepath.Join(dir, "records.json")
 			r := Record{Scope: testScope, State: Stopped, TerminalAt: time.Now()}
 			b, _ := json.Marshal([]Record{r, r})
@@ -269,12 +271,14 @@ func TestStoreRejectsCorruptionLinksAndPublicPermissions(t *testing.T) {
 			case "duplicate":
 				os.WriteFile(path, b, 0600)
 			case "file-link":
+				os.Remove(path)
 				os.Symlink(filepath.Join(root, "missing"), path)
 			case "dir-link":
-				os.Remove(dir)
+				os.RemoveAll(dir)
 				os.Symlink(root, dir)
 			case "public-file":
 				os.WriteFile(path, []byte("[]"), 0644)
+				os.Chmod(path, 0644)
 			case "public-dir":
 				os.Chmod(dir, 0755)
 			case "staging-link":
