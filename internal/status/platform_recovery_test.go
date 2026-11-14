@@ -42,22 +42,29 @@ func TestVPNRestartRouteIndependentOfBrokenOutboundPlatform(t *testing.T) {
 		t.Fatal("fixture did not establish broken outbound")
 	}
 	called := 0
-	s, mux := newAgentMux(&AgentProviders{WorkerRestart: func() (any, error) { called++; return map[string]any{"ok": true, "restarting": true}, nil }})
+	s, coord, peer := newAgentControlServer(t, &AgentProviders{WorkerRestart: func() (any, error) { called++; return map[string]any{"ok": true, "restarting": true}, nil }})
 	validator := &offlineRestartValidator{}
 	s.tokenValidator = validator
+	// The coordinator identity is verified locally, so restart does not
+	// depend on outbound token validation.
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, vpnReq(http.MethodPost, "/agent/worker-restart"))
+	s.buildControlMux().ServeHTTP(w, agentCoordinatorReq(http.MethodPost, "/agent/worker-restart", coord))
 	if w.Code != http.StatusOK || called != 1 || validator.calls != 0 {
-		t.Fatal("mesh restart depended on outbound token validation")
+		t.Fatal("coordinator restart depended on outbound token validation")
 	}
-	// Existing authorization stays intact for a non-mesh caller.
+	// Other callers stay refused on the control mux and on the plaintext path.
+	w = httptest.NewRecorder()
+	s.buildControlMux().ServeHTTP(w, agentCoordinatorReq(http.MethodPost, "/agent/worker-restart", peer))
+	if w.Code != http.StatusForbidden || called != 1 || validator.calls != 0 {
+		t.Fatal("non-coordinator restart was not refused")
+	}
 	req := httptest.NewRequest(http.MethodPost, "/agent/worker-restart", nil)
 	req.RemoteAddr = "203.0.113.10:1234"
 	req.Header.Set("Authorization", "Bearer synthetic-token")
 	w = httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized || called != 1 || validator.calls != 1 {
-		t.Fatal("broken outbound weakened non-mesh authorization")
+	s.buildMux().ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || called != 1 || validator.calls != 0 {
+		t.Fatal("plaintext restart was not refused")
 	}
 }
 
