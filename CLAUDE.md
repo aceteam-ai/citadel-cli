@@ -102,6 +102,16 @@ match. The session base dir there requires an owner-only, protected DACL
 (`validateCobrowseBaseDirPerms`), and a launch refuses without one. The
 windows-latest CI job runs the real-browser tests against both browsers.
 
+`cobrowseSession.runAction` owns one scripted co-browse action (click, type, key,
+scroll): one target discovery and one WebSocket for all its CDP calls, bounded by
+`platform.CobrowseActionDeadline`, which must stay below the platform's 15s job
+wait with `cobrowseReportReserve` added. On the deadline or a failure after the
+action may have acted it returns `*ActionIncompleteError` carrying `ActionEffects`
+(dispatched, scrolled with offset, focused, clicked, typed length only) and never
+retries. `jobs.actionFailureResult` turns a reportable one into a `done:false`
+result; `localcobrowse.partialActionResult` and `cmd.partialActionResult` do the
+same for local mode. `TestCobrowseRealBrowserActionLatency` pins the budgets.
+
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
 per-domain write grant (default deny, see the next paragraph), the abuse limits, the
 idle lifetime and `local_cobrowse_wait`. `localcobrowse.NewURLPolicy` owns the

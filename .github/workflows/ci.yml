@@ -208,7 +208,7 @@ jobs:
       - name: Real browser co-browse lifecycle
         env:
           CITADEL_REAL_BROWSER_TESTS: "1"
-        run: go test ./internal/platform/ -count=1 -v -run '^TestCobrowseRealBrowser'
+        run: go test ./internal/platform/ -count=1 -v -run '^TestCobrowseRealBrowser'  # includes TestCobrowseRealBrowserActionLatency (#1663)
 
       # Saved logins survive stop, seal, unlock and a second session with the
       # real browser (aceteam#13503 S7). Synthetic loopback page only.

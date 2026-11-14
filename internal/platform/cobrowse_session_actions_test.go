@@ -525,9 +525,15 @@ func TestCobrowseSessionActions_ClickBySelectorResolvesCenterThenClicks(t *testi
 		t.Fatalf("click: %v", err)
 	}
 
-	evalCalls := f.callsFor("Runtime.evaluate")
+	var evalCalls []recordedCDPCall
+	for _, c := range f.callsFor("Runtime.evaluate") {
+		// The before/after effect probe (citadel-cli#1663) is not a resolution.
+		if expr, _ := c.Params["expression"].(string); !strings.Contains(expr, "window.scrollX") {
+			evalCalls = append(evalCalls, c)
+		}
+	}
 	if len(evalCalls) != 1 {
-		t.Fatalf("expected exactly 1 Runtime.evaluate call, got %d", len(evalCalls))
+		t.Fatalf("expected exactly 1 selector Runtime.evaluate call, got %d", len(evalCalls))
 	}
 	if evalCalls[0].Params["awaitPromise"] != true {
 		t.Fatal("selector resolution must wait for scrolling to settle")
@@ -553,7 +559,10 @@ func TestCobrowseSessionActions_ClickSelectorRefusesHandoffDuringSettle(t *testi
 	settling := make(chan struct{})
 	release := make(chan struct{})
 	f.mu.Lock()
-	f.evaluateValue = func(string) any {
+	f.evaluateValue = func(expr string) any {
+		if strings.Contains(expr, "window.scrollX") {
+			return nil // the effect probe, not the selector evaluation
+		}
 		close(settling)
 		<-release
 		return map[string]any{"x": 111.0, "y": 222.0}
@@ -731,8 +740,11 @@ func TestCobrowseSessionActions_ClickByCoordsSkipsSelectorResolution(t *testing.
 	if _, err := m.Click(st.ID, "", &x, &y); err != nil {
 		t.Fatalf("click: %v", err)
 	}
-	if calls := f.callsFor("Runtime.evaluate"); len(calls) != 0 {
-		t.Errorf("click by coords should not evaluate a selector, got %d calls", len(calls))
+	for _, c := range f.callsFor("Runtime.evaluate") {
+		// Only the before/after effect probe may evaluate (citadel-cli#1663).
+		if expr, _ := c.Params["expression"].(string); !strings.Contains(expr, "window.scrollX") {
+			t.Errorf("click by coords should not evaluate a selector, got %q", expr)
+		}
 	}
 	mouseCalls := f.callsFor("Input.dispatchMouseEvent")
 	if len(mouseCalls) != 3 {
