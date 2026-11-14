@@ -53,6 +53,7 @@ type inspected struct {
 	Method    string `json:"method"`
 	Enctype   string `json:"enctype"`
 	Target    string `json:"target"`
+	Overrides string `json:"overrides"`
 }
 
 func sp(s string) *string { return &s }
@@ -82,6 +83,7 @@ const env = {
   elements: (f) => f.elements,
   disabled: (e) => !!e.disabled,
   text: (e) => (typeof e.value === "string" ? e.value : ""),
+  has: (e, n) => !!(e.attrs && Object.prototype.hasOwnProperty.call(e.attrs, n)),
   formData: (f, sub) => { if (f.throws) throw new TypeError("submitter"); return f; },
   entries: (fd) => fd.submitted || [],
   isFile: (v) => v !== null && typeof v === "object" && v.file === true,
@@ -119,7 +121,7 @@ process.stdout.write(JSON.stringify(out));`
 func targetFrom(r inspected) platform.TargetInfo {
 	t := *sendTarget()
 	t.ContentHash, t.Oversized = r.Digest, r.Oversized
-	t.FormAction, t.FormMethod, t.FormEnctype, t.FormTarget = r.Action, r.Method, r.Enctype, r.Target
+	t.FormAction, t.FormMethod, t.FormEnctype, t.FormTarget, t.FormOverrides = r.Action, r.Method, r.Enctype, r.Target, r.Overrides
 	if r.Bad != "" {
 		t = platform.TargetInfo{Reason: r.Bad}
 	}
@@ -208,6 +210,42 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 		"case-only change of a form-level target": {
 			scenario{Form: form(map[string]string{"target": "Panel"}, ent("m", "hi"), m, send), T: 1},
 			scenario{Form: form(map[string]string{"target": "panel"}, ent("m", "hi"), m, send), T: 1},
+		},
+		"empty formaction added to the submitter": {
+			scenario{Form: form(map[string]string{"action": "/send"}, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"action": "/send"}, ent("m", "hi"), m, button("go", "1", map[string]string{"formaction": ""})), T: 1},
+		},
+		"empty formtarget added to the submitter": {
+			scenario{Form: form(map[string]string{"target": "Panel"}, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"target": "Panel"}, ent("m", "hi"), m, button("go", "1", map[string]string{"formtarget": ""})), T: 1},
+		},
+		"empty formtarget added when the form has none": {
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, button("go", "1", map[string]string{"formtarget": ""})), T: 1},
+		},
+		"empty form action added": {
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"action": ""}, ent("m", "hi"), m, send), T: 1},
+		},
+		"empty form target added": {
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"target": ""}, ent("m", "hi"), m, send), T: 1},
+		},
+		"empty formmethod and formenctype added": {
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, button("go", "1", map[string]string{"formmethod": "", "formenctype": ""})), T: 1},
+		},
+		"formnovalidate added": {
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, button("go", "1", map[string]string{"formnovalidate": ""})), T: 1},
+		},
+		"novalidate added to the form": {
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"novalidate": ""}, ent("m", "hi"), m, send), T: 1},
+		},
+		"accept-charset changed": {
+			scenario{Form: form(map[string]string{"accept-charset": "utf-8"}, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"accept-charset": "iso-8859-1"}, ent("m", "hi"), m, send), T: 1},
 		},
 		"submitter value": {
 			scenario{Form: form(nil, ent("m", "hi", "go", "send"), m, button("go", "send", nil)), T: 1},

@@ -52,8 +52,12 @@ type TargetInfo struct {
 	FormAction string `json:"form_action,omitempty"`
 	// FormEnctype and FormTarget are the effective submission encoding and
 	// target, after any submitter override (formenctype, formtarget).
-	FormEnctype   string     `json:"form_enctype,omitempty"`
-	FormTarget    string     `json:"form_target,omitempty"`
+	FormEnctype string `json:"form_enctype,omitempty"`
+	FormTarget  string `json:"form_target,omitempty"`
+	// FormOverrides is the presence and raw value of every submission-affecting
+	// attribute on the form and its submitter (present-but-empty differs from
+	// absent). It is only hashed.
+	FormOverrides string     `json:"form_overrides,omitempty"`
 	FormHasSubmit bool       `json:"form_has_submit,omitempty"`
 	Rect          TargetRect `json:"rect"`
 	// ContentHash is the SHA-256 (hex) of the complete form and composer
@@ -192,18 +196,38 @@ const FormSnapshotScript = `
 	// button. The submitter's own name, id, type and value are folded into the
 	// digest. bad or oversized means the target cannot be verified in full.
 	function inspectForm(env, form, t, focus, tIsEntry, maxc){
-		var r = {bad: "", oversized: false, digest: "", action: "", method: "", enctype: "", target: ""};
+		var r = {bad: "", oversized: false, digest: "", action: "", method: "", enctype: "", target: "", overrides: ""};
 		var sub = null;
 		if (form) {
 			var els = env.elements(form);
 			var isSub = function(c){ var y = String(c.type || "").toLowerCase(); return (String(c.tagName).toUpperCase() === "BUTTON" || String(c.tagName).toUpperCase() === "INPUT") && (y === "submit" || y === "image"); };
 			if (t && isSub(t)) sub = t;
 			if (!sub) { for (var q = 0; q < els.length; q++) { if (isSub(els[q]) && !env.disabled(els[q])) { sub = els[q]; break; } } }
-			var ov = function(a, f){ return (sub && env.attr(sub, a)) || env.attr(form, f) || ""; };
-			r.action = env.abs((sub && env.attr(sub, "formaction")) || env.attr(form, "action") || env.base());
-			r.method = String(ov("formmethod", "method") || "get").toLowerCase();
-			r.enctype = String(ov("formenctype", "enctype")).toLowerCase();
-			r.target = normTarget(ov("formtarget", "target"));
+			// Present-but-empty is not absent: an empty formaction resolves to the
+			// document URL and an empty formtarget is still an override, so each
+			// attribute's presence and raw value are bound alongside the effective
+			// result. formnovalidate, novalidate and accept-charset change how the
+			// submission behaves and are bound too.
+			var pick = function(subAttr, formAttr){
+				if (sub && env.has(sub, subAttr)) return String(env.attr(sub, subAttr) || "");
+				return String(env.attr(form, formAttr) || "");
+			};
+			var pr = function(e, n){
+				if (!e || !env.has(e, n)) return [n, 0, ""];
+				var raw = String(env.attr(e, n) || "");
+				if (/target$/.test(n)) raw = normTarget(raw);
+				else if (/(method|enctype)$/.test(n)) raw = raw.toLowerCase();
+				return [n, 1, raw];
+			};
+			var fa = sub && env.has(sub, "formaction") ? String(env.attr(sub, "formaction") || "") : String(env.attr(form, "action") || "");
+			r.action = env.abs(fa || env.base());
+			var m = pick("formmethod", "method").toLowerCase();
+			r.method = (m === "post" || m === "dialog") ? m : "get";
+			var en = pick("formenctype", "enctype").toLowerCase();
+			r.enctype = (en === "multipart/form-data" || en === "text/plain") ? en : "application/x-www-form-urlencoded";
+			r.target = normTarget(pick("formtarget", "target"));
+			r.overrides = JSON.stringify([pr(sub, "formaction"), pr(sub, "formmethod"), pr(sub, "formenctype"), pr(sub, "formtarget"), pr(sub, "formnovalidate"),
+				pr(form, "action"), pr(form, "method"), pr(form, "enctype"), pr(form, "target"), pr(form, "novalidate"), pr(form, "accept-charset")]);
 		}
 		var snap = buildSnapshot(env, form, sub, t, focus, tIsEntry);
 		if (snap.bad) { r.bad = snap.bad; return r; }
@@ -304,6 +328,7 @@ const targetProbeScript = `(function(kind, selector, px, py){
 		entries: function(fd){ var out = []; fd.forEach(function(v, k){ out.push([k, v]); }); return out; },
 		isFile: function(v){ return typeof v !== "string"; },
 		inForm: function(f, c){ try { return Array.prototype.indexOf.call(Object.getOwnPropertyDescriptor(HF, "elements").get.call(f), c) >= 0; } catch (x) { return false; } },
+		has: function(e, n){ try { return EP.hasAttribute.call(e, n); } catch (x) { return false; } },
 		abs: abs,
 		base: function(){ return location.href; }
 	};
@@ -318,7 +343,7 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	if (form) {
 		out.in_form = true;
 		var formEls = env.elements(form);
-		out.form_action = fi.action; out.form_method = fi.method; out.form_enctype = fi.enctype; out.form_target = fi.target;
+		out.form_action = fi.action; out.form_method = fi.method; out.form_enctype = fi.enctype; out.form_target = fi.target; out.form_overrides = fi.overrides;
 		out.form_has_submit = !!EP.querySelector.call(form, "button:not([type]),button[type=submit],input[type=submit],input[type=image]");
 		if (env.attr(form, "role") === "search") out.search = true;
 		var controls = 0;

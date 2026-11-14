@@ -357,13 +357,14 @@ func fingerprint(a actionRef, t platform.TargetInfo) string {
 		FAction string
 		FEnc    string
 		FTarget string
+		FOver   string
 		Content string
 		Over    bool
 		Value   string
 		Label   string
 		URL     string
 	}{2, a.Kind, a.Key, a.Selector, round(a.X), round(a.Y), fullURL(t.PageURL), t.Tag, t.Role, t.InputType,
-		t.Name, fullURL(t.Href), t.FormMethod, fullURL(t.FormAction), t.FormEnctype, t.FormTarget, t.ContentHash, t.Oversized, a.Value, a.Label, fullURL(a.URL)})
+		t.Name, fullURL(t.Href), t.FormMethod, fullURL(t.FormAction), t.FormEnctype, t.FormTarget, t.FormOverrides, t.ContentHash, t.Oversized, a.Value, a.Label, fullURL(a.URL)})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

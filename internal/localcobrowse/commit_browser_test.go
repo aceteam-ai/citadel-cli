@@ -302,6 +302,10 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		"pw2":   `<input type="password" name="pw" value="secret"><input type="hidden" name="to" value="alice">`,
 		"cf1":   `<x-field name="to" id="xf"></x-field>`,
 		"cf2":   `<x-field name="to" id="xf"></x-field>`,
+		"fe1":   `<input type="text" name="m" value="hi">`,
+		"fe2":   `<input type="text" name="m" value="hi">`,
+		"ft1":   `<input type="text" name="m" value="hi">`,
+		"ft2":   `<input type="text" name="m" value="hi">`,
 		"tg1":   `<input type="text" name="m" value="hi">`,
 		"tg2":   `<input type="text" name="m" value="hi">`,
 		"fa1":   `<input type="text" name="m" value="hi">`,
@@ -310,6 +314,12 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		v := r.URL.Query().Get("v")
 		btn := `<button id="send" type="submit">Send</button>`
+		switch v {
+		case "fe2":
+			btn = `<button id="send" type="submit" formaction="">Send</button>`
+		case "ft2":
+			btn = `<button id="send" type="submit" formtarget="">Send</button>`
+		}
 		if v == "fa2" {
 			btn = `<button id="send" type="submit" formaction="/exfil" formmethod="get" formtarget="_blank">Send</button>`
 		}
@@ -319,6 +329,8 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 			formAttrs = ` target="Panel"`
 		case "tg2":
 			formAttrs = ` target="panel"`
+		case "ft1", "ft2":
+			formAttrs = ` target="Panel"`
 		}
 		extra := ""
 		if v == "cf1" || v == "cf2" {
@@ -397,6 +409,12 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	}
 	if a, b := inspect("tg1"), inspect("tg2"); a.FormTarget == b.FormTarget || a.FormTarget != "Panel" || b.FormTarget != "panel" {
 		t.Errorf("a case-only change of a named target must be kept exactly: %q vs %q", a.FormTarget, b.FormTarget)
+	}
+	if a, b := fp(inspect("fe1")), fp(inspect("fe2")); a == b {
+		t.Error("adding an empty formaction (which resolves to the document URL) must change the binding")
+	}
+	if a, b := fp(inspect("ft1")), fp(inspect("ft2")); a == b {
+		t.Error("adding an empty formtarget (still an override of the form's target) must change the binding")
 	}
 	fa1, fa2 := inspect("fa1"), inspect("fa2")
 	if fa1.FormAction == fa2.FormAction || fa1.FormMethod == fa2.FormMethod || fa1.FormTarget == fa2.FormTarget {
