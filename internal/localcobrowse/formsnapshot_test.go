@@ -267,10 +267,33 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 		}
 	})
 
+	t.Run("a unique-named password field, unnamed or disabled one does not affect the binding", func(t *testing.T) {
+		un := fel("INPUT", "password", "", "x")
+		dis := fel("INPUT", "password", "pw2", "x")
+		dis.Disabled = true
+		r := runInspect(t,
+			scenario{Form: form(nil, ent("m", "hi"), un, dis, m, send), T: 3},
+			scenario{Form: form(nil, ent("m", "hi"), un, dis, m, send), T: 3})
+		if r[0].Bad != "" || r[0].Digest == "" || r[0].Digest != r[1].Digest {
+			t.Fatalf("%+v %+v", r[0], r[1])
+		}
+	})
+
 	// State the snapshot cannot capture: the target is unverifiable and an
 	// approval of it can never be redeemed.
 	unverifiable := map[string]scenario{
-		"file entry":                  {Form: form(nil, [][]any{{"att", map[string]any{"file": true}}}, send), T: 0},
+		"file entry": {Form: form(nil, [][]any{{"att", map[string]any{"file": true}}}, send), T: 0},
+		"password field sharing its name with a hidden field": {
+			Form: form(nil, ent("to", "alice", "to", "secret"), fel("INPUT", "hidden", "to", "alice"), fel("INPUT", "password", "to", "secret"), send), T: 2},
+		"one-time-code field sharing its name with a text field": {
+			Form: form(nil, ent("code", "1", "code", "2"), fel("INPUT", "text", "code", "1"),
+				func() fakeEl {
+					e := fel("INPUT", "text", "code", "2")
+					e.Attrs = map[string]string{"autocomplete": "one-time-code"}
+					return e
+				}(), send), T: 2},
+		"submitter named like a password field": {
+			Form: form(nil, ent("pw", "x", "pw", "go"), fel("INPUT", "password", "pw", "x"), button("pw", "go", nil)), T: 1},
 		"FormData constructor throws": {Form: func() *fakeForm { f := form(nil, nil, send); f.Throws = true; return f }(), T: 0},
 		"composer whose value cannot be read": {
 			Form: nil, T: -1, TEntry: true, TOutsid: &fakeEl{TagName: "DIV", Attrs: map[string]string{"role": "textbox"}}},

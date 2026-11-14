@@ -132,18 +132,32 @@ const FormSnapshotScript = `
 			var fd = null;
 			try { fd = env.formData(form, sub); } catch (x) { bad = "the browser could not build this form's submission"; }
 			if (!bad) {
-				var skip = {};
+				// Password and one-time-code controls are never bound, and their
+				// entries are dropped by name. That is only safe when nothing else
+				// in the submission shares the name: if any entry with such a name
+				// is not accounted for by an enabled sensitive control, the target
+				// is unverifiable (a hidden "to" beside a password "to" would
+				// otherwise be invisible to the binding).
+				var skip = {}, total = {};
 				var els = env.elements(form);
 				for (var i = 0; i < els.length; i++) {
 					var ty = String(els[i].type || "").toLowerCase(), ac = String(env.attr(els[i], "autocomplete") || "");
-					if (ty === "password" || /one-time-code|password/i.test(ac)) skip["n:" + String(els[i].name || "")] = true;
+					if ((ty === "password" || /one-time-code|password/i.test(ac)) && !env.disabled(els[i])) {
+						if (!els[i].name) continue; // an unnamed control submits nothing
+						var k = "n:" + String(els[i].name);
+						skip[k] = (skip[k] || 0) + 1;
+					}
 				}
 				var entries = env.entries(fd);
-				for (var j = 0; j < entries.length; j++) {
-					var name = String(entries[j][0]), val = entries[j][1];
-					if (env.isFile(val)) { bad = "the form submits a file"; break; }
-					if (skip["n:" + name]) continue;
-					tuples.push([name, "string", String(val)]);
+				for (var j = 0; j < entries.length; j++) { var kk = "n:" + String(entries[j][0]); total[kk] = (total[kk] || 0) + 1; }
+				for (var key in skip) { if (total[key] !== skip[key]) { bad = "a password or one-time-code field shares its name with another field"; } }
+				if (!bad) {
+					for (var m2 = 0; m2 < entries.length; m2++) {
+						var name = String(entries[m2][0]), val = entries[m2][1];
+						if (env.isFile(val)) { bad = "the form submits a file"; break; }
+						if (skip["n:" + name]) continue;
+						tuples.push([name, "string", String(val)]);
+					}
 				}
 			}
 		}

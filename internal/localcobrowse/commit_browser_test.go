@@ -298,6 +298,8 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		"dis2":  `<input type="hidden" name="to" value="bob" disabled>`,
 		"file1": `<input type="text" name="m" value="hi">`,
 		"file2": `<input type="text" name="m" value="hi"><input type="file" name="att">`,
+		"pw1":   `<input type="hidden" name="to" value="alice"><input type="password" name="to" value="secret">`,
+		"pw2":   `<input type="password" name="pw" value="secret"><input type="hidden" name="to" value="alice">`,
 		"cf1":   `<x-field name="to" id="xf"></x-field>`,
 		"cf2":   `<x-field name="to" id="xf"></x-field>`,
 		"tg1":   `<input type="text" name="m" value="hi">`,
@@ -383,6 +385,12 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	}
 	if ti := inspect("file2"); ti.Resolved {
 		t.Errorf("a form with a file input must be unverifiable: %+v", ti)
+	}
+	if ti := inspect("pw1"); ti.Resolved {
+		t.Errorf("a password field sharing its name with a hidden field must be unverifiable: %+v", ti)
+	}
+	if ti := inspect("pw2"); !ti.Resolved || ti.ContentHash == "" {
+		t.Errorf("a password field with a unique name stays verifiable: %+v", ti)
 	}
 	if a, b := fp(inspect("cf1")), fp(inspect("cf2")); a == b {
 		t.Error("a form-associated custom element's setFormValue must change the binding even though its .value is fixed")
