@@ -96,16 +96,10 @@ opener.postMessage('tok-123', 'http://app.test'); window.close();</script>`)
 		mu.Lock()
 		r := append([]string(nil), refused...)
 		mu.Unlock()
-		t.Logf("diag (%s): targets=%+v err=%v token=%q title=%q refused=%v guardRefused=%d",
-			what, ts, terr, "", "", r, g.Refused())
+		t.Logf("diag (%s): targets=%+v err=%v refused=%v guardRefused=%d",
+			what, ts, terr, r, g.Refused())
 		if res, err := m.ExtractBounded(id, "#token", nil, 100); true {
 			t.Logf("diag token: %+v %v", res, err)
-		}
-		if res, err := m.ExtractBounded(id, "#open", nil, 100); true {
-			t.Logf("diag open: %+v %v", res, err)
-		}
-		if _, err := m.Click(id, "#open", nil, nil); true {
-			t.Logf("diag click: %v", err)
 		}
 	}
 	waitFor := func(what string, cond func() bool) {
