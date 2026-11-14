@@ -172,11 +172,27 @@ func TestRealBrowserCommitActionsLongContent(t *testing.T) {
 		v, rc, sf := version, recipient, suffix
 		mu.Unlock()
 		w.Header().Set("Content-Type", "text/html")
+		if r.URL.Path == "/amb" {
+			// Field snapshots whose naive "name=value" lines would be identical.
+			var fields string
+			switch r.URL.Query().Get("v") {
+			case "1":
+				fields = "<textarea name=\"msg\">hello\nrecipient=bob</textarea>"
+			case "2":
+				fields = "<textarea name=\"msg\">hello</textarea><input type=\"hidden\" name=\"recipient\" value=\"bob\">"
+			case "3":
+				fields = "<input type=\"text\" name=\"a=b\" value=\"c\">"
+			case "4":
+				fields = "<input type=\"text\" name=\"a\" value=\"b=c\">"
+			}
+			fmt.Fprintf(w, `<!doctype html><h1 id="t">amb%s</h1><form method="post" action="/send">%s<button id="send" type="submit">Send</button></form>`, r.URL.Query().Get("v"), fields)
+			return
+		}
 		if r.URL.Path == "/huge" {
 			fmt.Fprintf(w, `<!doctype html><h1 id="t">huge</h1><form method="post" action="/send"><textarea name="msg">%s</textarea><button id="send" type="submit">Send</button></form>`, strings.Repeat("y", 5_000_000))
 			return
 		}
-		fmt.Fprintf(w, `<!doctype html><h1 id="t">v%d</h1><form method="post" action="/send"><input type="hidden" name="to" value="%s"><textarea name="msg">%s%s</textarea><button id="send" type="submit">Send</button></form>`, v, rc, body, sf)
+		fmt.Fprintf(w, `<!doctype html><h1 id="t">v%d</h1><form method="post" action="/send"><textarea name="msg">%s%s</textarea><input type="hidden" name="to" value="%s"><button id="send" type="submit">Send</button></form>`, v, body, sf, rc)
 	}))
 	defer page.Close()
 
@@ -234,6 +250,26 @@ func TestRealBrowserCommitActionsLongContent(t *testing.T) {
 	reload(4, "bob", "end-a") // same content as the base again
 	if d := digest(); d.ContentHash != base.ContentHash {
 		t.Error("the digest must be stable for identical content")
+	}
+	// Delimiters inside names and values must not move field boundaries: these
+	// pairs are identical as "name=value" lines but submit different payloads.
+	ambDigest := func(v string) string {
+		t.Helper()
+		if _, err := m.Navigate(st.ID, page.URL+"/amb?v="+v); err != nil {
+			t.Fatal(err)
+		}
+		waitFor("amb" + v)
+		d := digest()
+		if d.ContentHash == "" || d.Oversized {
+			t.Fatalf("variant %s: %+v", v, d)
+		}
+		return d.ContentHash
+	}
+	if ambDigest("1") == ambDigest("2") {
+		t.Error("a newline inside a value must not collide with a following hidden field")
+	}
+	if ambDigest("3") == ambDigest("4") {
+		t.Error("an equals sign inside a name must not collide with one inside a value")
 	}
 	if _, err := m.Navigate(st.ID, page.URL+"/huge"); err != nil {
 		t.Fatal(err)

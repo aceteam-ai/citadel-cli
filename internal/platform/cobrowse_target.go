@@ -60,8 +60,13 @@ type TargetInfo struct {
 	Oversized bool `json:"oversized,omitempty"`
 }
 
-const targetProbeScript = `(function(kind, selector, px, py){
-	var MAXC = 4000000;
+// FormDigestScript is the in-page encoding and hash of a form's fields, shared
+// with the tests that run it under Node. formDigest takes an ordered array of
+// [name, id, type, value, checked] tuples and hashes its JSON encoding, which
+// is unambiguous: no delimiter inside a name or value can move a field boundary
+// (a textarea msg="hello\nrecipient=bob" differs from msg="hello" followed by a
+// hidden recipient="bob").
+const FormDigestScript = `
 	// SHA-256 over the UTF-8 bytes of a string, synchronous (SubtleCrypto is
 	// async and only on secure contexts). Constants are derived from primes.
 	function sha256hex(str){
@@ -100,6 +105,12 @@ const targetProbeScript = `(function(kind, selector, px, py){
 		}
 		return H.map(function(x){ return ("00000000" + (x >>> 0).toString(16)).slice(-8); }).join("");
 	}
+	function formDigest(tuples){ return sha256hex(JSON.stringify(tuples)); }
+`
+
+const targetProbeScript = `(function(kind, selector, px, py){
+	var MAXC = 4000000;
+` + FormDigestScript + `
 	function deepActive(){ var a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; return a; }
 	function deepPoint(x, y){ var e = document.elementFromPoint(x, y); while (e && e.shadowRoot) { var i = e.shadowRoot.elementFromPoint(x, y); if (!i || i === e) break; e = i; } return e; }
 	function txt(e){ return (e.innerText || e.textContent || "").replace(/\s+/g, " ").trim(); }
@@ -193,7 +204,7 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	} else if (tag === "select") { out.auto_submit = t.hasAttribute("onchange"); }
 	var r = t.getBoundingClientRect();
 	out.rect = {x: r.x, y: r.y, w: r.width, h: r.height, vw: window.innerWidth, vh: window.innerHeight};
-	var parts = [], used = 0, tooBig = false;
+	var tuples = [], used = 0, tooBig = false;
 	function field(c){
 		if (tooBig) return;
 		var ty = (c.type || "").toLowerCase();
@@ -202,17 +213,16 @@ const targetProbeScript = `(function(kind, selector, px, py){
 		var ac = (c.getAttribute && c.getAttribute("autocomplete")) || "";
 		if (/one-time-code|password/i.test(ac)) return;
 		var v = c.isContentEditable ? (c.innerText || c.textContent || "") : (c.value !== undefined ? c.value : "");
-		if (ty === "checkbox" || ty === "radio") v = (c.checked ? "on:" : "off:") + v;
-		var piece = (c.name || c.id || "") + "=" + v;
-		used += piece.length + 1;
+		var nm = c.name || "", idv = c.id || "";
+		used += nm.length + idv.length + ty.length + v.length + 16;
 		if (used > MAXC) { tooBig = true; return; }
-		parts.push(piece);
+		tuples.push([nm, idv, ty, v, !!c.checked]);
 	}
 	if (form) { for (var j = 0; j < form.elements.length; j++) field(form.elements[j]); }
 	var focus = deepActive();
 	if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT")) field(focus);
 	if (isEntry) field(t);
-	if (tooBig) { out.oversized = true; } else { out.content_hash = sha256hex(parts.join("\n")); }
+	if (tooBig) { out.oversized = true; } else { out.content_hash = formDigest(tuples); }
 	out.resolved = true;
 	return out;
 })`
