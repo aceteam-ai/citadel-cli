@@ -34,10 +34,17 @@ import (
 // runtimeOnlyNames are basenames that are per-launch runtime artifacts, not
 // durable profile state; they are skipped when archiving so a re-materialized
 // profile does not carry a stale singleton lock into a new browser launch.
+//
+// DevToolsActivePort and the co-browse session pidfile are written per launch
+// too: restoring a stale DevToolsActivePort could make the next launch read
+// the previous browser's debug id, and a stale pidfile names processes that
+// are long gone.
 var runtimeOnlyNames = map[string]bool{
-	"SingletonLock":   true,
-	"SingletonSocket": true,
-	"SingletonCookie": true,
+	"SingletonLock":         true,
+	"SingletonSocket":       true,
+	"SingletonCookie":       true,
+	"DevToolsActivePort":    true,
+	".citadel-session-pids": true,
 }
 
 // cacheDirNames are regenerable cache directories excluded from the archive to

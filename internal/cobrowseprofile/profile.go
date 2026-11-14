@@ -47,6 +47,11 @@ const profilesDirName = "cobrowse-profiles"
 // profileFileExt is the extension of a sealed profile blob.
 const profileFileExt = ".enc"
 
+// lockFileExt is appended to a blob's path for its cross-process lock file.
+// The lock file is never removed: unlinking it would let two processes lock
+// two different inodes under one name.
+const lockFileExt = ".lock"
+
 // contextPrefix is the stable AEAD context label prefix for a sealed profile.
 // The profile name is appended so each profile's ciphertext is bound to its own
 // context and cannot be substituted for another's. The "/v1" fixes the label so
@@ -71,28 +76,40 @@ var (
 // live Handle may exist per absolute store path at a time. A second OpenHandle
 // for a profile already in use fails with ErrProfileBusy rather than letting two
 // sessions decrypt the same profile, edit divergent working copies, and race to
-// re-seal (last writer would silently win). Cross-process concurrency is not
-// guarded here; because every store write is atomic (temp + fsync + rename), the
-// worst cross-process outcome is a lost update, never a corrupt blob (v1).
+// re-seal (last writer would silently win). Across processes the same rule is
+// held by an OS file lock next to the sealed blob (lockFile, lock_*.go), so two
+// harnesses that each run their own Citadel process cannot open one profile
+// twice either (aceteam#13503 S7).
 var (
 	profileLocksMu sync.Mutex
-	profileLocks   = map[string]bool{}
+	profileLocks   = map[string]func(){}
 )
 
-func acquireProfileLock(storePath string) bool {
+// acquireProfileLock takes the in-process and the OS lock for storePath. It
+// returns ErrProfileBusy when either is held, or the error that stopped the OS
+// lock from being taken (fail closed: no lock, no handle).
+func acquireProfileLock(storePath string) error {
 	profileLocksMu.Lock()
 	defer profileLocksMu.Unlock()
-	if profileLocks[storePath] {
-		return false
+	if _, held := profileLocks[storePath]; held {
+		return ErrProfileBusy
 	}
-	profileLocks[storePath] = true
-	return true
+	release, err := lockFile(storePath + lockFileExt)
+	if err != nil {
+		return err
+	}
+	profileLocks[storePath] = release
+	return nil
 }
 
 func releaseProfileLock(storePath string) {
 	profileLocksMu.Lock()
-	defer profileLocksMu.Unlock()
+	release := profileLocks[storePath]
 	delete(profileLocks, storePath)
+	profileLocksMu.Unlock()
+	if release != nil {
+		release()
+	}
 }
 
 // validateName returns nil if name is a safe profile name.
@@ -129,9 +146,11 @@ type Handle struct {
 }
 
 // OpenHandle unlocks the profile for use: it validates name, reserves the
-// single-session lock, unlocks the vault with pin, and returns a Handle. It fails
-// closed — a wrong/absent PIN, a locked-out vault, or an unconfigured vault all
-// return the vault's error and yield NO handle (the caller must not fall back to a
+// single-session lock (in this process and across processes), unlocks the vault
+// with pin through nodevault's at-rest entry point, and returns a Handle. It fails
+// closed — a wrong/absent secret, a secret below the at-rest threshold (#820, so a
+// short access PIN is refused even when correct), a locked-out vault, or an
+// unconfigured vault all return the vault's error and yield NO handle (the caller must not fall back to a
 // plaintext or throwaway profile). The pin is consumed here and never retained;
 // only the resulting Session is held.
 //
@@ -145,12 +164,14 @@ func OpenHandle(baseDir, name, pin string, v *nodevault.Vault) (*Handle, error) 
 		return nil, nodevault.ErrNotConfigured
 	}
 	sp := storePath(baseDir, name)
-	if !acquireProfileLock(sp) {
-		return nil, ErrProfileBusy
+	if err := acquireProfileLock(sp); err != nil {
+		return nil, err
 	}
 	// Unlock AFTER taking the lock so a wrong-PIN attempt does not leave the lock
-	// held; release on every failure path below.
-	sess, err := v.Unlock(pin)
+	// held; release on every failure path below. The at-rest entry point refuses
+	// a secret too weak to protect the profile on disk (#820): a bare access PIN
+	// can never open a persistent profile.
+	sess, err := v.UnlockAtRest(pin, nodevault.LoadPolicy(baseDir))
 	if err != nil {
 		releaseProfileLock(sp)
 		return nil, err
@@ -232,8 +253,8 @@ func Reset(baseDir, name string) error {
 		return err
 	}
 	sp := storePath(baseDir, name)
-	if !acquireProfileLock(sp) {
-		return ErrProfileBusy
+	if err := acquireProfileLock(sp); err != nil {
+		return err
 	}
 	defer releaseProfileLock(sp)
 	if err := os.Remove(sp); err != nil && !errors.Is(err, os.ErrNotExist) {
