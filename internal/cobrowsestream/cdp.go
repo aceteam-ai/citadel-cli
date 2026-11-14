@@ -25,12 +25,16 @@ var cdpTargetURL = defaultCDPTargetURL
 // leaves room for its CDP envelope. It is not an aggregate memory bound.
 const maxCDPMessageBytes int64 = 64 << 20
 
-func defaultCDPTargetURL(debugPort int) (string, error) {
-	return discoverCDPTargetURL(debugPort, cdpHTTPClient)
+func defaultCDPTargetURL(ctx context.Context, debugPort int) (string, error) {
+	return discoverCDPTargetURLContext(ctx, debugPort, cdpHTTPClient)
 }
 
 func discoverCDPTargetURL(debugPort int, client *http.Client) (string, error) {
-	target, err := cdpdiscovery.Discover(context.Background(), debugPort, client)
+	return discoverCDPTargetURLContext(context.Background(), debugPort, client)
+}
+
+func discoverCDPTargetURLContext(ctx context.Context, debugPort int, client *http.Client) (string, error) {
+	target, err := cdpdiscovery.Discover(ctx, debugPort, client)
 	if err != nil {
 		return "", err
 	}
@@ -111,21 +115,32 @@ func (c *Client) Close() { c.client.Close() }
 // dialCDP resolves the page target for debugPort and opens a persistent CDP
 // WebSocket. onFrame receives every screencast frame once startScreencast runs.
 func dialCDP(debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
-	return dialCDPWithReadLimit(debugPort, onFrame, maxCDPMessageBytes)
+	return dialCDPWithReadLimitContext(context.Background(), debugPort, onFrame, maxCDPMessageBytes)
 }
 
 // The private smaller-limit seam lets source fixtures exercise the same dial
 // and first-read path without allocating full-size messages. Production uses
 // the fixed ceiling above; no caller may disable or increase it here.
 func dialCDPWithReadLimit(debugPort int, onFrame func(screencastFrame), readLimit int64) (*cdpClient, error) {
+	return dialCDPWithReadLimitContext(context.Background(), debugPort, onFrame, readLimit)
+}
+
+func dialCDPContext(parent context.Context, debugPort int, onFrame func(screencastFrame)) (*cdpClient, error) {
+	return dialCDPWithReadLimitContext(parent, debugPort, onFrame, maxCDPMessageBytes)
+}
+
+func dialCDPWithReadLimitContext(parent context.Context, debugPort int, onFrame func(screencastFrame), readLimit int64) (*cdpClient, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
 	if readLimit <= 0 || readLimit > maxCDPMessageBytes {
 		return nil, fmt.Errorf("CDP read limit is invalid")
 	}
-	wsURL, err := cdpTargetURL(debugPort)
+	wsURL, err := cdpTargetURL(parent, debugPort)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 	defer cancel()
 	// Gorilla's read limit counts compressed payload bytes, not expanded data.
 	// Pin compression off without changing the shared DefaultDialer or its other

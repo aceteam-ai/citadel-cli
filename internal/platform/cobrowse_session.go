@@ -196,6 +196,14 @@ type cobrowseSession struct {
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
+	// A recording owns the page only until its bounded capture is published or
+	// cancelled. Stop, handoff and viewer attachment cancel it under mu, then
+	// wait on recordDone without holding mu.
+	recordCancel context.CancelFunc
+	recordDone   chan struct{}
+	// stopping closes the admission gap after the manager removes this session
+	// from its map but before teardown clears proc.
+	stopping bool
 	// persistent marks a session launched with an encrypted profile. A
 	// re-adopted one has lost its unlocked key, so teardown cannot re-seal it.
 	persistent bool
@@ -505,14 +513,42 @@ func (m *CobrowseSessionManager) setAttached(id string, attached bool) bool {
 		return false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// Never override a terminal/launching state: attach only makes sense once running.
+	var done <-chan struct{}
 	if s.state == SessionRunning && attached {
 		s.state = SessionAttached
+		done = s.cancelRecordingLocked()
 	} else if s.state == SessionAttached && !attached {
 		s.state = SessionRunning
 	}
+	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 	return true
+}
+
+// cancelRecordingLocked signals a live capture without waiting under s.mu.
+// The caller waits for done before teardown or handing control to a viewer.
+func (s *cobrowseSession) cancelRecordingLocked() <-chan struct{} {
+	if s.recordCancel != nil {
+		s.recordCancel()
+	}
+	return s.recordDone
+}
+
+func (s *cobrowseSession) beginStoppingRecording() <-chan struct{} {
+	s.mu.Lock()
+	s.stopping = true
+	done := s.cancelRecordingLocked()
+	s.mu.Unlock()
+	return done
+}
+
+func waitRecording(done <-chan struct{}) {
+	if done != nil {
+		<-done
+	}
 }
 
 // Stop tears down one session (browser + Xvfb) and removes its throwaway profile dir.
@@ -525,6 +561,7 @@ func (m *CobrowseSessionManager) Stop(id string) error {
 	if !ok {
 		return nil
 	}
+	waitRecording(s.beginStoppingRecording())
 	return s.teardown()
 }
 
@@ -537,9 +574,20 @@ func (m *CobrowseSessionManager) StopAll() error {
 	m.sessions = make(map[string]*cobrowseSession)
 	m.mu.Unlock()
 
-	var lastErr error
+	// Mark every session terminal and signal every capture before waiting for
+	// any one encoder to finish.
+	type stoppingSession struct {
+		s    *cobrowseSession
+		done <-chan struct{}
+	}
+	pending := make([]stoppingSession, 0, len(all))
 	for _, s := range all {
-		if err := s.teardown(); err != nil {
+		pending = append(pending, stoppingSession{s: s, done: s.beginStoppingRecording()})
+	}
+	var lastErr error
+	for _, item := range pending {
+		waitRecording(item.done)
+		if err := item.s.teardown(); err != nil {
 			lastErr = err
 		}
 	}

@@ -6,6 +6,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -183,6 +184,99 @@ func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, 
 		return nil, fmt.Errorf("no such browser session: %q", id)
 	}
 	return s, nil
+}
+
+// WithRecordingPort gives one bounded recording the CDP port. Stop, handoff and
+// viewer attachment cancel the capture and wait for it to discard its temporary
+// output. The publish callback is serialized with those privacy transitions:
+// once one starts, the recording cannot publish a file or return a receipt.
+func (m *CobrowseSessionManager) WithRecordingPort(
+	id string,
+	parent context.Context,
+	action func(context.Context, int, func(func() error) error) ([]byte, error),
+) ([]byte, error) {
+	s, err := m.sessionForAction(id)
+	if err != nil {
+		return nil, err
+	}
+	return s.withRecordingPort(parent, action)
+}
+
+// A request can retain s after Stop removes it from the manager map. Admission
+// must therefore check stopping under s.mu, even when lookup already succeeded.
+func (s *cobrowseSession) withRecordingPort(
+	parent context.Context,
+	action func(context.Context, int, func(func() error) error) ([]byte, error),
+) ([]byte, error) {
+	s.mu.Lock()
+	if s.stopping || s.proc == nil {
+		s.mu.Unlock()
+		return nil, ErrNotStarted
+	}
+	select {
+	case <-s.proc.exited:
+		s.mu.Unlock()
+		return nil, ErrNotStarted
+	default:
+	}
+	if s.humanDrivingLocked() || s.state == SessionAttached {
+		s.mu.Unlock()
+		return nil, ErrHandedOff
+	}
+	if s.recordDone != nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("a recording is already in progress")
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	recordCtx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	s.recordCancel = cancel
+	s.recordDone = done
+	port := s.proc.debugPort
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		if s.recordDone == done {
+			s.recordCancel = nil
+			s.recordDone = nil
+			close(done)
+		}
+		s.mu.Unlock()
+	}()
+
+	committed := false
+	commit := func(publish func() error) error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.recordDone != done {
+			return context.Canceled
+		}
+		if err := recordCtx.Err(); err != nil {
+			return err
+		}
+		if s.stopping || s.proc == nil {
+			return ErrNotStarted
+		}
+		if s.humanDrivingLocked() || s.state == SessionAttached {
+			return ErrHandedOff
+		}
+		if err := publish(); err != nil {
+			return err
+		}
+		committed = true
+		s.recordCancel = nil
+		s.recordDone = nil
+		close(done)
+		return nil
+	}
+	result, err := action(recordCtx, port, commit)
+	if err == nil && !committed {
+		return nil, fmt.Errorf("recording did not publish an output")
+	}
+	return result, err
 }
 
 // Navigate drives one session's browser to a URL. Refused while the session is
@@ -587,7 +681,11 @@ func (m *CobrowseSessionManager) Handoff(id string) (CobrowseSessionStatus, erro
 		return CobrowseSessionStatus{}, ErrNotStarted
 	}
 	s.explicitHandoff = true
+	done := s.cancelRecordingLocked()
 	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 	s.persistRecord()
 	return s.status(), nil
 }

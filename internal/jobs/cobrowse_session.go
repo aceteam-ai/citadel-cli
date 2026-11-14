@@ -14,17 +14,23 @@
 //
 // The six #978 actions are all addressed by a required "session_id" field (unlike the
 // old singleton COBROWSE job, which has exactly one implicit session) and are refused
-// with the session's driver-arbitration error (platform.ErrHandedOff, surfaced
-// verbatim) while a human is attached to that session -- see
+// after explicit human handoff. Recording also refuses a passive viewer and
+// cancels on viewer attachment, Stop or handoff. See
 // platform/cobrowse_session_actions.go for the full arbitration contract.
 package jobs
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
@@ -51,6 +57,7 @@ const (
 	// or touch "pin" at all, since they operate on an already-running session.
 	CobrowseSessionActionNavigate   = "navigate"
 	CobrowseSessionActionScreenshot = "screenshot"
+	CobrowseSessionActionRecord     = "record"
 	CobrowseSessionActionClick      = "click"
 	CobrowseSessionActionType       = "type"
 	CobrowseSessionActionSelect     = "select"
@@ -65,10 +72,12 @@ const (
 
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
 // CobrowseSessionManager singleton.
-type CobrowseSessionHandler struct{}
+type CobrowseSessionHandler struct{ WorkspaceDir string }
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
-func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
+func NewCobrowseSessionHandler(workspace string) *CobrowseSessionHandler {
+	return &CobrowseSessionHandler{WorkspaceDir: workspace}
+}
 
 func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	action := job.Payload["action"]
@@ -164,6 +173,24 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 			"url":    st.URL,
 		})
 		return out, nil
+
+	case CobrowseSessionActionRecord:
+		id := job.Payload["session_id"]
+		if id == "" {
+			return nil, fmt.Errorf("record requires a 'session_id' field")
+		}
+		seconds, err := strconv.Atoi(job.Payload["seconds"])
+		if err != nil || seconds < 1 || seconds > 30 {
+			return nil, fmt.Errorf("record requires 'seconds' from 1 to 30")
+		}
+		if h.WorkspaceDir == "" {
+			return nil, fmt.Errorf("record requires a configured workspace")
+		}
+		return mgr.WithRecordingPort(id, ctx.Context(), func(recordCtx context.Context, port int, commit func(func() error) error) ([]byte, error) {
+			return saveCobrowseRecordingWithCommit(h.WorkspaceDir, seconds, func(output *os.File) error {
+				return cobrowsestream.RecordWebM(recordCtx, port, output, time.Duration(seconds)*time.Second)
+			}, commit)
+		})
 
 	case CobrowseSessionActionClick:
 		id := job.Payload["session_id"]
@@ -292,6 +319,98 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	default:
 		return nil, fmt.Errorf("unknown browser-session action: %q", action)
 	}
+}
+
+// saveCobrowseRecording keeps creation, publication and cleanup rooted in the
+// workspace. The encoder receives an open file, so swapping captures after
+// creation cannot redirect its bytes to an outside path.
+func saveCobrowseRecording(workspace string, seconds int, capture func(*os.File) error) ([]byte, error) {
+	return saveCobrowseRecordingWithCommit(workspace, seconds, capture, func(publish func() error) error {
+		return publish()
+	})
+}
+
+// The commit callback atomically checks session privacy state and publishes
+// under the session lock. A cancelled recording leaves only a temporary file,
+// which the deferred cleanup removes before Stop or Handoff returns.
+func saveCobrowseRecordingWithCommit(workspace string, seconds int, capture func(*os.File) error, commit func(func() error) error) ([]byte, error) {
+	root, err := os.OpenRoot(workspace)
+	if err != nil {
+		return nil, fmt.Errorf("open recording workspace: %w", err)
+	}
+	defer root.Close()
+	if err := root.MkdirAll("captures", 0o700); err != nil {
+		return nil, fmt.Errorf("create capture directory: %w", err)
+	}
+	dirInfo, err := root.Lstat("captures")
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("capture directory must be a real directory")
+	}
+	captureRoot, err := root.OpenRoot("captures")
+	if err != nil {
+		return nil, fmt.Errorf("open capture directory: %w", err)
+	}
+	defer captureRoot.Close()
+	stableDir, err := captureRoot.Stat(".")
+	if err != nil || !os.SameFile(dirInfo, stableDir) {
+		return nil, fmt.Errorf("capture directory changed before recording")
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, fmt.Errorf("create recording name: %w", err)
+	}
+	name := "cobrowse-" + hex.EncodeToString(nonce[:]) + ".webm"
+	tempName := "." + name
+	tempRel := filepath.Join("captures", tempName)
+	finalRel := filepath.Join("captures", name)
+	output, err := captureRoot.OpenFile(tempName, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create recording file: %w", err)
+	}
+	defer output.Close()
+	defer captureRoot.Remove(tempName)
+	if err := capture(output); err != nil {
+		return nil, err
+	}
+	info, err := output.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect recording: %w", err)
+	}
+	if info.Size() == 0 || info.Size() > cobrowsestream.MaxRecordBytes {
+		return nil, fmt.Errorf("recording is empty or exceeds the 24 MiB export limit")
+	}
+	if err := output.Sync(); err != nil {
+		return nil, fmt.Errorf("flush recording: %w", err)
+	}
+	currentDir, err := root.Lstat("captures")
+	if err != nil || !os.SameFile(dirInfo, currentDir) {
+		return nil, fmt.Errorf("capture directory changed during recording")
+	}
+	currentTemp, err := root.Lstat(tempRel)
+	if err != nil || !os.SameFile(info, currentTemp) {
+		return nil, fmt.Errorf("recording file changed during capture")
+	}
+	var out []byte
+	if err := commit(func() error {
+		// Link creates the final name only when it is absent. Rename would
+		// replace an existing file, including one raced in by another process.
+		if err := root.Link(tempRel, finalRel); err != nil {
+			return fmt.Errorf("publish recording: %w", err)
+		}
+		finalInfo, err := root.Lstat(finalRel)
+		if err != nil || !os.SameFile(info, finalInfo) {
+			_ = root.Remove(finalRel)
+			return fmt.Errorf("published recording changed before receipt")
+		}
+		out, _ = json.Marshal(map[string]any{
+			"path": filepath.ToSlash(finalRel), "format": "webm",
+			"bytes": info.Size(), "duration_s": seconds,
+		})
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // parseClickCoords reads the optional "x"/"y" payload fields as an explicit

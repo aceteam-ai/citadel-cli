@@ -115,6 +115,244 @@ func TestCobrowseSessionActions_HandoffRefusesWrites(t *testing.T) {
 	}
 }
 
+func TestCobrowseSessionActions_RecordRefusesHumanDriver(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	_, err = m.WithRecordingPort(st.ID, context.Background(), func(context.Context, int, func(func() error) error) ([]byte, error) {
+		called = true
+		return nil, nil
+	})
+	if !errors.Is(err, ErrHandedOff) || called {
+		t.Fatalf("record while handed off: err=%v, callback called=%v", err, called)
+	}
+}
+
+func TestCobrowseSessionActions_RecordRefusesAttachedViewer(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.MarkAttached(st.ID) {
+		t.Fatal("attach failed")
+	}
+	called := false
+	_, err = m.WithRecordingPort(st.ID, context.Background(), func(context.Context, int, func(func() error) error) ([]byte, error) {
+		called = true
+		return nil, nil
+	})
+	if !errors.Is(err, ErrHandedOff) || called {
+		t.Fatalf("record with attached viewer: err=%v, callback called=%v", err, called)
+	}
+}
+
+func TestCobrowseSessionActions_RecordHandoffCancelsCapture(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	recorded := make(chan error, 1)
+	published := make(chan struct{}, 1)
+	go func() {
+		_, err := m.WithRecordingPort(st.ID, context.Background(), func(ctx context.Context, _ int, commit func(func() error) error) ([]byte, error) {
+			close(entered)
+			<-ctx.Done()
+			return nil, commit(func() error { published <- struct{}{}; return nil })
+		})
+		recorded <- err
+	}()
+	<-entered
+	handedOff := make(chan error, 1)
+	go func() { _, err := m.Handoff(st.ID); handedOff <- err }()
+	select {
+	case err := <-handedOff:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff waited for the full recording duration")
+	}
+	select {
+	case err := <-recorded:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recording error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recording did not cancel")
+	}
+	select {
+	case <-published:
+		t.Fatal("handoff allowed cancelled recording to publish")
+	default:
+	}
+}
+
+func TestCobrowseSessionActions_RecordStopCancelsCapture(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := m.sessionForAction(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	recorded := make(chan error, 1)
+	published := make(chan struct{}, 1)
+	go func() {
+		_, err := m.WithRecordingPort(st.ID, context.Background(), func(ctx context.Context, _ int, commit func(func() error) error) ([]byte, error) {
+			close(entered)
+			<-ctx.Done()
+			return nil, commit(func() error { published <- struct{}{}; return nil })
+		})
+		recorded <- err
+	}()
+	<-entered
+	stopped := make(chan error, 1)
+	go func() { stopped <- m.Stop(st.ID) }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stop waited for the full recording duration")
+	}
+	select {
+	case err := <-recorded:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recording error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recording did not cancel")
+	}
+	s.mu.Lock()
+	stopping := s.stopping
+	s.mu.Unlock()
+	if !stopping {
+		t.Fatal("Stop did not mark the retained session terminal")
+	}
+	select {
+	case <-published:
+		t.Fatal("stop allowed cancelled recording to publish")
+	default:
+	}
+}
+
+func TestCobrowseSessionActions_RetainedPointerCannotStartAfterStopBegins(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a request that finished manager lookup before Stop removed the
+	// map entry. Stop's terminal mark runs before teardown clears proc.
+	s, err := m.sessionForAction(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRecording(s.beginStoppingRecording())
+	s.mu.Lock()
+	procStillPresent := s.proc != nil
+	s.mu.Unlock()
+	if !procStillPresent {
+		t.Fatal("test did not exercise the pre-teardown admission gap")
+	}
+	called := false
+	result, err := s.withRecordingPort(context.Background(), func(context.Context, int, func(func() error) error) ([]byte, error) {
+		called = true
+		return []byte("receipt"), nil
+	})
+	if !errors.Is(err, ErrNotStarted) || called || result != nil {
+		t.Fatalf("late recording: result=%q, err=%v, capture called=%v", result, err, called)
+	}
+	if err := m.Stop(st.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCobrowseSessionActions_StopAllMarksSessionsTerminal(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := m.sessionForAction(st.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.StopAll(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	stopping := s.stopping
+	s.mu.Unlock()
+	if !stopping {
+		t.Fatal("StopAll did not mark the retained session terminal")
+	}
+}
+
+func TestCobrowseSessionActions_ViewerAttachCancelsCapture(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	recorded := make(chan error, 1)
+	go func() {
+		_, err := m.WithRecordingPort(st.ID, context.Background(), func(ctx context.Context, _ int, commit func(func() error) error) ([]byte, error) {
+			close(entered)
+			<-ctx.Done()
+			return nil, commit(func() error { return nil })
+		})
+		recorded <- err
+	}()
+	<-entered
+	attached := make(chan bool, 1)
+	go func() { attached <- m.MarkAttached(st.ID) }()
+	select {
+	case ok := <-attached:
+		if !ok {
+			t.Fatal("viewer attach failed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("viewer attach waited for the full recording duration")
+	}
+	select {
+	case err := <-recorded:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recording error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recording did not cancel on viewer attach")
+	}
+}
+
 func TestCobrowseSessionActions_ResumeRestoresAIControl(t *testing.T) {
 	// Fixed, unused port: after resume the action reaches the CDP call and
 	// fails with a connection error -- the point is that it is NOT ErrHandedOff.
