@@ -15,23 +15,26 @@ func TestCobrowseRecoveryPreassignedIDAndDuplicateRefusal(t *testing.T) {
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 	id := "cb-c8409b9afcfb4677b9f2813bc0110b91"
 	// Empty URL avoids native/CDP navigation settling; the launcher is fake.
-	st, err := m.StartSessionWithID(id, "", nil)
+	st, err := m.StartRecoverySessionWithID(id, "", nil)
 	if err != nil || st.ID != id {
 		t.Fatalf("%+v %v", st, err)
 	}
-	if _, err = m.StartSessionWithID(id, "", nil); err == nil {
+	if _, err = m.StartRecoverySessionWithID(id, "", nil); err == nil {
 		t.Fatal("duplicate session replaced")
 	}
 	if f.n != 1 || filepath.Base(f.profiles[0]) != id {
 		t.Fatal("preassigned identity lost")
 	}
-	for _, bad := range []string{"../outside", "cb-xyz", "cb-C8409B9AFCFB4677B9F2813BC0110B91"} {
-		if _, err = m.StartSessionWithID(bad, "", nil); err == nil {
+	for _, bad := range []string{"../outside", "cb-xyz", "cb-C8409B9AFCFB4677B9F2813BC0110B91", NewCobrowseSessionID()} {
+		if _, err = m.StartRecoverySessionWithID(bad, "", nil); err == nil {
 			t.Fatal("unsafe handle accepted")
 		}
 	}
 	if f.n != 1 {
 		t.Fatal("invalid ID launched")
+	}
+	if _, err := m.StartSessionWithID(id, "", nil); err == nil {
+		t.Fatal("recovery handle accepted by local reserved-ID entrypoint")
 	}
 	_ = m.Stop(id)
 }

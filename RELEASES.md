@@ -3761,3 +3761,51 @@ Auto-generated log of every release.
   - fix(cobrowse): start with a launch URL reports the settled URL and title (#1613) (#1627)
 
 
+---
+
+## v2.225.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +1323 |
+
+**Changes:**
+
+  - feat(hpc): approve-on-arrival enrollment (--org) (#1616)
+
+
+---
+
+## v2.226.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +631 |
+
+**Changes:**
+
+  - Log credential fingerprints instead of full values (#1603)
+
+
+---
+
+## v2.227.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 10 |
+| Lines added | +439 |
+
+**Changes:**
+
+  - fix(hpc): pin transformers<5 beside vLLM 0.11 in hpc setup (#1637)
+  - fix(cobrowse): stop leaves session dir behind; real-browser CI flake (#1630)
+  - Merge remote-tracking branch 'origin/main'
+  - fix(jobs): honor per-job timeout_ms in the HTTP proxy (#1628)
+
+

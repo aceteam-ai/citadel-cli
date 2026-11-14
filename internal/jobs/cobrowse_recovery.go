@@ -113,7 +113,7 @@ func (b *nodeRecoveryBrowser) Start(id string) (bool, error) {
 	if handle != nil {
 		profile = handle
 	}
-	_, err := b.manager.StartSessionWithID(id, p["url"], profile)
+	_, err := b.manager.StartRecoverySessionWithID(id, p["url"], profile)
 	return true, err
 }
 func (b *nodeRecoveryBrowser) Observe(id string) cobrowserecovery.State {

@@ -23,18 +23,55 @@
     </div>
   </section>
   <div id="waiting" class="banner" hidden></div>
+  <section id="unlock" class="card" hidden>
+    <p><strong>This session uses saved logins</strong> <span id="unlock-profile" class="muted"></span></p>
+    <div id="unlock-enter" hidden>
+      <p>Enter your Citadel passphrase to unlock them. The agent never sees it, and it is not recorded.</p>
+      <input id="unlock-pass" type="password" autocomplete="off" spellcheck="false" aria-label="Passphrase">
+      <button id="unlock-go" class="primary">Unlock</button>
+    </div>
+    <div id="unlock-setup" hidden>
+      <p>Saved logins are encrypted on this computer with a passphrase that only you know.
+        Choose one of four or more random words. A short PIN is not accepted: it would not
+        protect your logins if someone copied this computer's disk.</p>
+      <p><input id="setup-pass" type="password" autocomplete="off" spellcheck="false" aria-label="New passphrase" placeholder="New passphrase"></p>
+      <p><input id="setup-confirm" type="password" autocomplete="off" spellcheck="false" aria-label="Repeat the passphrase" placeholder="Repeat the passphrase"></p>
+      <p><label><input id="setup-ack" type="checkbox"> I understand that if I forget this passphrase,
+        my saved logins cannot be recovered by anyone, including AceTeam.</label></p>
+      <button id="setup-go" class="primary">Create passphrase and unlock</button>
+    </div>
+    <div id="unlock-weak" hidden>
+      <p>The saved logins on this computer are protected by a secret that is too short to keep them
+        safe on disk, so Citadel will not open them. In a terminal, run
+        <code>citadel local passphrase change</code> to choose a passphrase of four or more random words.</p>
+    </div>
+    <p id="unlock-busy" class="muted" hidden>Unlocking and starting the browser&hellip;</p>
+    <p id="unlock-error" class="refused"></p>
+    <p><button id="unlock-throwaway" class="quiet">Continue without saved logins</button>
+      <span class="muted">(starts logged out; nothing is saved)</span></p>
+  </section>
+  <section id="commit" class="card commit" hidden>
+    <p><strong id="commit-action"></strong> on <strong id="commit-domain"></strong></p>
+    <p class="muted" id="commit-reason"></p>
+    <canvas id="commit-shot" width="480" height="240" hidden aria-label="The part of the page the agent wants to act on"></canvas>
+    <p class="muted">This kind of action asks every time, whatever you approved before. Approving does this one action now, if the page is still as shown.</p>
+    <button id="commit-approve" class="primary">Approve and do it</button>
+    <button id="commit-deny">Deny</button>
+  </section>
+  <p id="commit-result" class="banner" hidden></p>
   <section id="approval" class="card" hidden>
-    <p>Allow this agent to click, type and navigate in this session for
+    <p>Allow this agent to click, type and navigate on <strong id="approval-site"></strong> for
       <select id="approve-hours">
-        <option value="24">24 hours</option>
         <option value="8">8 hours</option>
+        <option value="24">24 hours</option>
         <option value="1">1 hour</option>
       </select>?</p>
+    <p class="muted">Sending, posting, submitting and paying still ask you each time. The approval covers this site only and ends with the session.</p>
     <p class="muted" id="approval-domain"></p>
     <button id="approve" class="primary">Approve</button>
     <button id="deny">Deny</button>
   </section>
-  <div class="controls">
+  <div class="controls" id="controls">
     <button id="drive" class="primary"></button>
     <input id="address" type="text" spellcheck="false" autocomplete="off" aria-label="Address">
     <button id="revoke" class="quiet" hidden>Revoke approval</button>

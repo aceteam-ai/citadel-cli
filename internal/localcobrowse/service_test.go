@@ -28,12 +28,23 @@ type fakeBrowser struct {
 	navigateLandsOn string
 	pageTitle       string
 	notReady        bool
+	// startErr fails StartSessionWithID; stopErr fails Stop.
+	startErr error
+	stopErr  error
+	// target, when set, is what InspectTarget reports (default: a plain
+	// element on the current page).
+	target *platform.TargetInfo
+	// onClick runs (outside the lock) when a click arrives; onInspect on each
+	// InspectTarget call.
+	onClick   func()
+	onInspect func()
 }
 
 type fakeSession struct {
-	url    string
-	human  bool
-	exited bool
+	url     string
+	human   bool
+	exited  bool
+	profile platform.SessionProfile
 }
 
 func newFakeBrowser() *fakeBrowser { return &fakeBrowser{sessions: map[string]*fakeSession{}} }
@@ -76,6 +87,27 @@ func (f *fakeBrowser) StartSession(u string) (platform.CobrowseSessionStatus, er
 	f.record("start " + u)
 	return f.statusLocked(id), nil
 }
+func (f *fakeBrowser) StartSessionWithID(id, u string, p platform.SessionProfile) (platform.CobrowseSessionStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.startErr != nil {
+		if p != nil {
+			_ = p.Close()
+		}
+		return platform.CobrowseSessionStatus{}, f.startErr
+	}
+	land := u
+	if f.startLandsOn != "" {
+		land = f.startLandsOn
+	}
+	f.sessions[id] = &fakeSession{url: land, profile: p}
+	if p != nil {
+		f.record("start-profile " + id)
+	} else {
+		f.record("start-id " + id)
+	}
+	return f.statusLocked(id), nil
+}
 func (f *fakeBrowser) SessionStatus(id string) (platform.CobrowseSessionStatus, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -89,7 +121,7 @@ func (f *fakeBrowser) Stop(id string) error {
 	defer f.mu.Unlock()
 	delete(f.sessions, id)
 	f.record("stop " + id)
-	return nil
+	return f.stopErr
 }
 func (f *fakeBrowser) StopAll() error {
 	f.mu.Lock()
@@ -113,7 +145,7 @@ func (f *fakeBrowser) act(id, call string, mut func(*fakeSession)) (platform.Cob
 func (f *fakeBrowser) Navigate(id, u string) (platform.CobrowseSessionStatus, error) {
 	return f.act(id, "navigate "+u, func(s *fakeSession) {
 		s.url = u
-		if f.navigateLandsOn != "" {
+		if f.navigateLandsOn != "" && u != "about:blank" {
 			s.url = f.navigateLandsOn
 		}
 	})
@@ -130,6 +162,9 @@ func (f *fakeBrowser) NavigateAsHuman(id, u string) (platform.CobrowseSessionSta
 	return f.statusLocked(id), nil
 }
 func (f *fakeBrowser) Click(id, sel string, x, y *float64) (platform.CobrowseSessionStatus, error) {
+	if f.onClick != nil {
+		f.onClick()
+	}
 	return f.act(id, "click "+sel, func(s *fakeSession) {
 		if f.clickNavigatesTo != "" {
 			s.url = f.clickNavigatesTo
@@ -169,6 +204,25 @@ func (f *fakeBrowser) PageState(id string) (platform.PageState, error) {
 		rs = "loading"
 	}
 	return platform.PageState{URL: s.url, ReadyState: rs, Title: f.pageTitle}, nil
+}
+func (f *fakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
+	if f.onInspect != nil {
+		f.onInspect()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, err := f.drivable(id)
+	if err != nil {
+		return platform.TargetInfo{}, err
+	}
+	if f.target != nil {
+		t := *f.target
+		if t.PageURL == "" {
+			t.PageURL = s.url
+		}
+		return t, nil
+	}
+	return platform.TargetInfo{Resolved: true, Tag: "div", PageURL: s.url}, nil
 }
 func (f *fakeBrowser) Handoff(id string) (platform.CobrowseSessionStatus, error) {
 	f.mu.Lock()
@@ -235,7 +289,7 @@ func TestWritesRefusedWithoutGrant(t *testing.T) {
 		"click":    func() error { _, err := svc.Click(ctx, id, "#x", nil, nil, "g"); return err },
 		"type":     func() error { _, err := svc.Type(ctx, id, "secret", "g"); return err },
 		"select":   func() error { _, err := svc.Select(ctx, id, "#s", "v", "", "g"); return err },
-		"key":      func() error { _, err := svc.Key(ctx, id, "Enter", "g"); return err },
+		"key":      func() error { _, err := svc.Key(ctx, id, "Tab", "g"); return err },
 		"scroll":   func() error { _, err := svc.Scroll(ctx, id, "#x", nil, nil, 0, 100, "g"); return err },
 	}
 	for name, w := range writes {
@@ -257,8 +311,11 @@ func TestWritesRefusedWithoutGrant(t *testing.T) {
 		t.Errorf("extract: %v", err)
 	}
 
-	if err := svc.Approve(id, 0); err != nil {
-		t.Fatal(err)
+	// A grant belongs to one registrable domain; the navigate target is another.
+	for _, d := range []string{"a.test", "b.test"} {
+		if err := svc.ApproveDomain(id, d, 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for name, w := range writes {
 		if err := w(); err != nil {
@@ -283,7 +340,7 @@ func TestEveryActionRefusedWhileHandedOff(t *testing.T) {
 		"click":      func() error { _, err := svc.Click(ctx, id, "#x", nil, nil, "g"); return err },
 		"type":       func() error { _, err := svc.Type(ctx, id, "pw", "g"); return err },
 		"select":     func() error { _, err := svc.Select(ctx, id, "#s", "v", "", "g"); return err },
-		"key":        func() error { _, err := svc.Key(ctx, id, "a", "g"); return err },
+		"key":        func() error { _, err := svc.Key(ctx, id, "Tab", "g"); return err },
 		"scroll":     func() error { _, err := svc.Scroll(ctx, id, "", nil, nil, 0, 1, "g"); return err },
 		"extract":    func() error { _, err := svc.Extract(ctx, id, "input", []string{"value"}, 0, "g"); return err },
 		"screenshot": func() error { _, err := svc.Screenshot(ctx, id, "g"); return err },
@@ -406,11 +463,11 @@ func TestLimits(t *testing.T) {
 	}
 	_ = svc.Approve(a.SessionID, 0)
 	for i := 0; i < 3; i++ {
-		if _, err := svc.Key(ctx, a.SessionID, "a", "g"); err != nil {
+		if _, err := svc.Key(ctx, a.SessionID, "Tab", "g"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := svc.Key(ctx, a.SessionID, "a", "g"); !errors.Is(err, ErrRateLimited) {
+	if _, err := svc.Key(ctx, a.SessionID, "Tab", "g"); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("write rate: %v", err)
 	}
 	// Stopping and restarting does not reset the owner-wide budget.
@@ -420,7 +477,7 @@ func TestLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = svc.Approve(b.SessionID, 0)
-	if _, err := svc.Key(ctx, b.SessionID, "a", "g"); !errors.Is(err, ErrRateLimited) {
+	if _, err := svc.Key(ctx, b.SessionID, "Tab", "g"); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("budget must survive a new session: %v", err)
 	}
 	// Reads are budgeted too.
@@ -437,7 +494,9 @@ func TestLimits(t *testing.T) {
 func TestNavigationBudgetCountsStartsAndLinkClicks(t *testing.T) {
 	svc, fb, _ := newTestService(t, func(c *Config) { c.NavigationsPerHour = 2 })
 	st, _ := svc.Start(ctx, "http://one.test/", "g", "") // 1
-	_ = svc.Approve(st.SessionID, 0)
+	_ = svc.ApproveDomain(st.SessionID, "one.test", 0)
+	_ = svc.ApproveDomain(st.SessionID, "three.test", 0)
+	_ = svc.ApproveDomain(st.SessionID, "two.test", 0)
 	fb.clickNavigatesTo = "http://two.test/"
 	if res, err := svc.Click(ctx, st.SessionID, "a", nil, nil, "g"); err != nil || !res.Navigated {
 		t.Fatalf("link click: %+v %v", res, err) // 2
@@ -585,10 +644,13 @@ func TestEventsRecordTextLengthOnly(t *testing.T) {
 	}
 }
 
-func TestProfileRequestRefusedClearly(t *testing.T) {
-	svc, _, _ := newTestService(t, nil)
-	if _, err := svc.Start(ctx, "", "g", "work"); !errors.Is(err, ErrProfileNotReady) {
+func TestProfileRefusedWithoutStore(t *testing.T) {
+	svc, fb, _ := newTestService(t, nil)
+	if _, err := svc.Start(ctx, "", "g", "work"); !errors.Is(err, ErrProfilesUnavailable) {
 		t.Fatalf("profile: %v", err)
+	}
+	if len(fb.calls) != 0 {
+		t.Fatalf("no browser may start: %v", fb.calls)
 	}
 }
 
@@ -613,7 +675,8 @@ func TestHumanNavigateOnlyWhileDriving(t *testing.T) {
 func TestNavigateReturnsFinalURLAndTitleAfterRedirect(t *testing.T) {
 	svc, fb, _ := newTestService(t, nil)
 	st, _ := svc.Start(ctx, "", "g", "")
-	_ = svc.Approve(st.SessionID, 0)
+	_ = svc.ApproveDomain(st.SessionID, "one.test", 0)
+	_ = svc.ApproveDomain(st.SessionID, "two.test", 0)
 	fb.navigateLandsOn = "http://two.test/final"
 	fb.pageTitle = "Final\x00 Page\n"
 	res, err := svc.Navigate(ctx, st.SessionID, "http://one.test/start", "g")
@@ -631,7 +694,7 @@ func TestNavigateSlowPageReturnsCurrentURLWithinWindow(t *testing.T) {
 	t.Cleanup(func() { settleWindow = old })
 	svc, fb, _ := newTestService(t, nil)
 	st, _ := svc.Start(ctx, "", "g", "")
-	_ = svc.Approve(st.SessionID, 0)
+	_ = svc.ApproveDomain(st.SessionID, "slow.test", 0)
 	fb.notReady = true
 	start := time.Now()
 	res, err := svc.Navigate(ctx, st.SessionID, "http://slow.test/", "g")
@@ -646,7 +709,7 @@ func TestNavigateSlowPageReturnsCurrentURLWithinWindow(t *testing.T) {
 func TestNavigateTitleBounded(t *testing.T) {
 	svc, fb, _ := newTestService(t, nil)
 	st, _ := svc.Start(ctx, "", "g", "")
-	_ = svc.Approve(st.SessionID, 0)
+	_ = svc.ApproveDomain(st.SessionID, "one.test", 0)
 	fb.pageTitle = strings.Repeat("t", 5000)
 	res, err := svc.Navigate(ctx, st.SessionID, "http://one.test/", "g")
 	if err != nil {

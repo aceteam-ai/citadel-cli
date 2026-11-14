@@ -21,6 +21,7 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -376,6 +377,13 @@ func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte,
 	if err != nil {
 		// Wrong/absent PIN, lockout, unconfigured vault, busy profile, or bad name:
 		// all fail closed, no session and no plaintext profile materialized.
+		if errors.Is(err, nodevault.ErrWeakSecret) {
+			// #820: a short access PIN never encrypts data at rest. On this node
+			// the master PIN is the profile's only key, so it must be a passphrase.
+			return nil, fmt.Errorf("persistent profile %q needs a passphrase, not a short PIN, because it is encrypted on disk: "+
+				"rotate the node master PIN to a passphrase of four or more random words with 'citadel passcode rotate' at the node "+
+				"(this also changes the secret for remote access to the node): %w", name, err)
+		}
 		return nil, err
 	}
 	// Ownership of handle transfers to the manager, which guarantees Close on every

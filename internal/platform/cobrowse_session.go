@@ -30,6 +30,7 @@
 package platform
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -37,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -291,14 +293,36 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 // and on teardown, so neither the unlocked key nor the profile's single-session
 // lock can leak — a missed Close is structurally impossible because every cleanup
 // path routes through teardown().
-func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
-	return m.startSessionWithID(newSessionID(), startURL, profile)
+func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
+	return m.startSession(newSessionID(), startURL, profile)
 }
 
-// StartSessionWithID consumes a pre-journaled recovery handle. It refuses an
-// existing handle rather than replacing the session or sharing its profile dir.
-// Ownership of profile transfers on every exit, as in StartSessionWithProfile.
+// NewCobrowseSessionID returns a fresh session id in the manager's format. A
+// caller that must hand out an id before the browser exists (local mode's
+// locked persistent-profile session) reserves one here and passes it to
+// StartSessionWithID once the profile is unlocked.
+func NewCobrowseSessionID() string { return newSessionID() }
+
+// reservedSessionIDPattern is the shape newSessionID produces.
+var reservedSessionIDPattern = regexp.MustCompile(`^cb-[0-9a-f]{16}$`)
+
+// StartSessionWithID is StartSessionWithProfile under a caller-reserved id from
+// NewCobrowseSessionID. An id of any other shape, or one already in use, is
+// refused (and the profile Closed), so a caller cannot name a directory.
 func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	if !reservedSessionIDPattern.MatchString(id) {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("invalid co-browse session id %q", id)
+	}
+	return m.startSession(id, startURL, profile)
+}
+
+// StartRecoverySessionWithID consumes a pre-journaled recovery handle. Its
+// 128-bit identity is distinct from local mode's reserved session ID format.
+// Both paths share the same duplicate and profile-custody checks below.
+func (m *CobrowseSessionManager) StartRecoverySessionWithID(id, startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
 	raw, err := hex.DecodeString(strings.TrimPrefix(id, "cb-"))
 	if len(id) != 35 || !strings.HasPrefix(id, "cb-") || err != nil || len(raw) != 16 || strings.ToLower(id) != id {
 		if profile != nil {
@@ -306,10 +330,10 @@ func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile
 		}
 		return CobrowseSessionStatus{}, fmt.Errorf("invalid preassigned browser session ID")
 	}
-	return m.startSessionWithID(id, startURL, profile)
+	return m.startSession(id, startURL, profile)
 }
 
-func (m *CobrowseSessionManager) startSessionWithID(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
+func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
 			profile.Close()
@@ -338,6 +362,7 @@ func (m *CobrowseSessionManager) startSessionWithID(id, startURL string, profile
 			"too many co-browse sessions (%d running); stop one first or raise %s",
 			max, EnvCobrowseMaxSessions)
 	}
+
 	s := &cobrowseSession{
 		id:         id,
 		profile:    filepath.Join(m.baseDir, id),
@@ -425,6 +450,11 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	enc := s.encProfile
 	s.mu.Unlock()
 	if enc != nil {
+		// Mark the dir before any plaintext lands in it, so an interrupted
+		// session can be traced to its profile and cleaned up.
+		if err := writeProfileMarker(s.profile, enc); err != nil {
+			return nil, fmt.Errorf("mark encrypted profile working dir: %w", err)
+		}
 		if err := enc.Materialize(s.profile); err != nil {
 			return nil, fmt.Errorf("materialize encrypted profile: %w", err)
 		}
@@ -559,6 +589,14 @@ func (s *cobrowseSession) teardown() error {
 	}
 
 	var err error
+	if enc != nil && proc != nil {
+		// A persistent profile is sealed from what the browser wrote to disk.
+		// Chromium keeps recent cookie and login writes in memory and commits
+		// them in batches, so a hard kill right after a login would seal a
+		// profile without it. Ask the browser to close first (bounded), then
+		// kill whatever is left as before. Throwaway sessions skip this.
+		closeBrowserGracefully(proc)
+	}
 	if proc != nil && proc.stop != nil {
 		err = proc.stop()
 	}
@@ -579,7 +617,11 @@ func (s *cobrowseSession) teardown() error {
 	// cookies (and no throwaway state) behind. The pidfile lives under it and goes
 	// too. For a persistent profile the durable state now lives only as ciphertext.
 	if profile != "" {
-		removeSessionDir(profile)
+		if rerr := removeSessionDir(profile); rerr != nil && enc != nil && err == nil {
+			// A persistent session's working dir holds decrypted cookies; a
+			// failure to remove it must be visible, never silent.
+			err = fmt.Errorf("the decrypted working copy of a saved profile could not be removed from %s: %w", profile, rerr)
+		}
 	}
 	return err
 }
@@ -860,3 +902,42 @@ func sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
 // protected owner-only DACL on Windows. An existing dir that fails is refused,
 // never repaired. Local mode keeps its viewer token and audit log in such dirs.
 func EnsurePrivateDir(dir string) error { return ensureCobrowseBaseDir(dir) }
+
+// gracefulCloseWait is the whole budget for closing a persistent session's
+// browser gracefully: the endpoint probe, the Browser.close call and the wait
+// for the process to exit all share it, after which teardown kills as usual.
+// A var for tests.
+var gracefulCloseWait = 10 * time.Second
+
+// closeBrowserGracefully sends CDP Browser.close to proc's browser target and
+// waits, within gracefulCloseWait in total, for the process to exit, so
+// Chromium flushes its cookie and login stores to disk. Best effort: no debug
+// port, an unreadable or mismatched endpoint, or a browser that does not exit
+// in time all fall through to the caller's kill.
+func closeBrowserGracefully(proc *cobrowseProc) {
+	if proc == nil || proc.debugPort <= 0 || proc.exited == nil {
+		return
+	}
+	select {
+	case <-proc.exited:
+		return
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gracefulCloseWait)
+	defer cancel()
+	ws, err := fetchCDPBrowserWSContext(ctx, proc.debugPort)
+	if err != nil {
+		return
+	}
+	// Only close the browser this session launched, on the port it owns.
+	prefix := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser/", proc.debugPort)
+	if !strings.HasPrefix(ws, prefix) || (proc.browserID != "" && ws != prefix+proc.browserID) {
+		return
+	}
+	// The browser may close the socket before replying; that is success.
+	_, _ = cdpDialAndSendContext(ctx, ws, "Browser.close", nil)
+	select {
+	case <-proc.exited:
+	case <-ctx.Done():
+	}
+}

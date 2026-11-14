@@ -394,6 +394,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.withCookie(s.withCSRF(s.handleState)))
 	mux.HandleFunc("POST /api/sessions/{id}/{action}", s.withCookie(s.withCSRF(s.handleAction)))
 	mux.HandleFunc("GET /api/stream", s.withCookie(s.handleStream))
+	mux.HandleFunc("GET /api/sessions/{id}/commit/{commit}/shot", s.withCookie(s.withCSRF(s.handleCommitShot)))
 	mux.HandleFunc("GET /api/activity", s.withCookie(s.withCSRF(s.handleActivity)))
 	mux.HandleFunc("POST /api/mint", s.handleMint)
 	mux.HandleFunc("GET /api/summary", s.handleSummary)
@@ -536,17 +537,30 @@ type State struct {
 	Agent    string                      `json:"agent"`
 	Sessions []localcobrowse.SessionView `json:"sessions"`
 	Now      string                      `json:"now"`
+	// ProfileVault is the saved-logins passphrase state (absent when this
+	// process keeps no saved profiles). ProfileVaultError says it could not
+	// be read, so the page never offers to create a second passphrase.
+	ProfileVault      *localcobrowse.ProfileVaultState `json:"profile_vault,omitempty"`
+	ProfileVaultError string                           `json:"profile_vault_error,omitempty"`
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.lastPoll = s.cfg.Now()
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, State{
+	st := State{
 		Agent:    s.cfg.Service.Agent(),
 		Sessions: s.cfg.Service.Sessions(""),
 		Now:      s.cfg.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if vs, ok, err := s.cfg.Service.ProfileVault(); ok {
+		if err != nil {
+			st.ProfileVaultError = "Citadel could not read the saved-logins passphrase on this computer"
+		} else {
+			st.ProfileVault = &vs
+		}
+	}
+	writeJSON(w, http.StatusOK, st)
 }
 
 // handleActivity serves the Activity panel: the session's newest audit records.
@@ -566,6 +580,19 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"records": recs})
 }
 
+// handleCommitShot serves the pending send/post/submit/pay request's
+// screenshot and target box for the approval card. It is no-store: the picture
+// is the page the user is being asked about.
+func (s *Server) handleCommitShot(w http.ResponseWriter, r *http.Request) {
+	png, rect, ok := s.cfg.Service.CommitShot(r.PathValue("id"), r.PathValue("commit"))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"png": png, "rect": rect})
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -574,9 +601,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	id, action := r.PathValue("id"), r.PathValue("action")
+	// The passphrase fields are read only by unlock and setup-passphrase. They
+	// go to the profile store and nowhere else: never logged, audited or
+	// echoed in a response.
 	var body struct {
-		Hours float64 `json:"hours"`
-		URL   string  `json:"url"`
+		Hours      float64 `json:"hours"`
+		URL        string  `json:"url"`
+		Domain     string  `json:"domain"`
+		Commit     string  `json:"commit"`
+		Passphrase string  `json:"passphrase"`
+		Confirm    string  `json:"confirm"`
+		Ack        bool    `json:"ack"`
 	}
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
@@ -588,7 +623,11 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch action {
 	case "approve":
-		err = svc.Approve(id, time.Duration(body.Hours*float64(time.Hour)))
+		err = svc.ApproveDomain(id, body.Domain, time.Duration(body.Hours*float64(time.Hour)))
+	case "approve-commit":
+		err = svc.ApproveCommit(r.Context(), id, body.Commit)
+	case "deny-commit":
+		err = svc.DenyCommit(id, body.Commit)
 	case "deny":
 		err = svc.Deny(id)
 	case "revoke":
@@ -601,6 +640,16 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		err = svc.HumanStop(id)
 	case "navigate":
 		err = svc.HumanNavigate(r.Context(), id, body.URL)
+	case "unlock":
+		err = svc.HumanUnlock(r.Context(), id, body.Passphrase)
+	case "setup-passphrase":
+		if body.Passphrase != body.Confirm {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the two passphrases do not match"})
+			return
+		}
+		err = svc.HumanSetupAndUnlock(r.Context(), id, body.Passphrase, body.Ack)
+	case "use-throwaway":
+		err = svc.HumanUseThrowaway(r.Context(), id)
 	default:
 		http.NotFound(w, r)
 		return

@@ -34,10 +34,19 @@ import (
 // runtimeOnlyNames are basenames that are per-launch runtime artifacts, not
 // durable profile state; they are skipped when archiving so a re-materialized
 // profile does not carry a stale singleton lock into a new browser launch.
+//
+// DevToolsActivePort and the co-browse session pidfile are written per launch
+// too: restoring a stale DevToolsActivePort could make the next launch read
+// the previous browser's debug id, and a stale pidfile names processes that
+// are long gone.
 var runtimeOnlyNames = map[string]bool{
-	"SingletonLock":   true,
-	"SingletonSocket": true,
-	"SingletonCookie": true,
+	"SingletonLock":         true,
+	"SingletonSocket":       true,
+	"SingletonCookie":       true,
+	"DevToolsActivePort":    true,
+	".citadel-session-pids": true,
+	// The co-browse session's marker tying a working dir to its profile.
+	".citadel-profile": true,
 }
 
 // cacheDirNames are regenerable cache directories excluded from the archive to
@@ -183,6 +192,10 @@ func writeExtractedFile(target string, tr *tar.Reader) error {
 // directory (zip-slip). It also re-checks the joined result stays within dst as a
 // belt-and-suspenders guard.
 func safeJoin(dst, name string) (string, error) {
+	// Compare against the cleaned destination: filepath.Join cleans its result
+	// (on Windows it also turns "/" into "\"), so an uncleaned dst would never
+	// prefix-match a legitimate entry.
+	dst = filepath.Clean(dst)
 	slashed := filepath.ToSlash(name)
 	if slashed == "" || strings.HasPrefix(slashed, "/") || filepath.IsAbs(name) {
 		return "", fmt.Errorf("cobrowseprofile: unsafe absolute archive path %q", name)

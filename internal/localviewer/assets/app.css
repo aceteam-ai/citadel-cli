@@ -39,3 +39,6 @@ button.danger { color: #b3261e; }
 .setup li.danger { color: #b3261e; }
 .setup textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, Consolas, monospace; }
 .setup .card { border-width: 1px; border-color: #ddd; }
+#unlock input[type=password] { padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 6px; min-width: 18rem; }
+.refused { color: #b3261e; }
+[hidden] { display: none !important; }

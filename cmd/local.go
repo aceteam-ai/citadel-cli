@@ -13,8 +13,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -130,14 +128,9 @@ func runLocalMCP(cmd *cobra.Command, args []string) error {
 
 	// A harness usually stops its MCP server by closing stdin, which ends run.
 	// On a signal, stop the browser sessions before exiting so no logged-in
-	// browser outlives the server (Windows also kills it through the Job Object).
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigs
-		rt.close()
-		os.Exit(0)
-	}()
+	// browser outlives the server (Windows also kills it through the Job Object)
+	// and saved logins are re-sealed.
+	handleLocalCobrowseSignals(rt)
 
 	deps := realLocalMCPDeps()
 	deps.cobrowse = rt
