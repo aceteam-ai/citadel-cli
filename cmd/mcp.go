@@ -242,6 +242,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		// alongside the remote cobrowse_* tools that take a node_id.
 		cobrowseRT = newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: localStateDir, viewer: true})
 		defer cobrowseRT.close()
+		// Saved-logins sessions are re-sealed on close, so a signal must run
+		// the same teardown before the process exits.
+		handleLocalCobrowseSignals(cobrowseRT)
 		deps.cobrowse = cobrowseRT
 	}
 	localTools := newLocalMCPTools(deps)

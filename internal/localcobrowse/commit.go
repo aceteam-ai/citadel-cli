@@ -58,6 +58,7 @@ var (
 	ErrCommitDenied           = errors.New("commit_denied: the user declined this action. Do not retry it; tell the user what you could not do and let them decide")
 	ErrNoPendingCommit        = errors.New("that request is no longer current; look at the viewer for the latest one")
 	ErrTargetTooLarge         = errors.New("target_too_large: the form or message is too large to verify, so it cannot be approved or sent through local co-browse; ask the user to do it themselves")
+	ErrTargetUnverifiable     = errors.New("target_unverifiable: Citadel could not read or verify the target of this action, so it cannot be approved or sent through local co-browse; ask the user to do it themselves")
 	ErrUnknownPage            = errors.New("unknown_page: this page's address cannot be tied to a website, so AI actions are refused here and cannot be approved; ask the user to take control or navigate somewhere else")
 	ErrPageChanged            = errors.New("page_changed: the page changed while the action was being checked, so it was not sent; look at the page again and retry")
 	ErrTypeNewline            = errors.New("type_newline: typed text may not contain a line break, which can send a message or submit a form; type the text, then use local_cobrowse_key with Enter, which asks the user")
@@ -379,6 +380,9 @@ type CommitView struct {
 	RequestedAt string `json:"requested_at"`
 	Rect        *Rect  `json:"rect,omitempty"`
 	HasShot     bool   `json:"has_shot"`
+	// Unverifiable is true when the target could not be verified: the card says
+	// to do it yourself and offers no approve button.
+	Unverifiable bool `json:"unverifiable,omitempty"`
 }
 
 // Rect is the target's box and the viewport it was measured in.
@@ -397,16 +401,20 @@ type CommitResult struct {
 }
 
 type pendingCommit struct {
-	ref         actionRef
-	id          string
-	fp          string
-	domain      string
-	action      string
-	label       string
-	reason      string
-	requestedAt time.Time
-	shot        string
-	rect        platform.TargetRect
+	// unverifiable marks a request whose target could not be read or hashed; it
+	// can be shown but never redeemed.
+	unverifiable bool
+	tooLarge     bool
+	ref          actionRef
+	id           string
+	fp           string
+	domain       string
+	action       string
+	label        string
+	reason       string
+	requestedAt  time.Time
+	shot         string
+	rect         platform.TargetRect
 }
 
 func describeAction(a actionRef, t platform.TargetInfo) string {

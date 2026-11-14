@@ -924,3 +924,89 @@ func TestFingerprintFollowsContentDigest(t *testing.T) {
 		t.Fatal("oversized must change the fingerprint")
 	}
 }
+
+// An approval is never redeemed against a target that was not verified: a
+// request made from an unreadable or unresolved target is unredeemable, and a
+// re-probe that fails at approval time refuses even if nothing else changed.
+func TestApprovalNeverRedeemedAgainstUnverifiedTarget(t *testing.T) {
+	failing := func() error { return errors.New("inspection transport failed") }
+	check := func(t *testing.T, svc *Service, fb *fakeBrowser, id string, events *[]Event) {
+		t.Helper()
+		cv := pendingView(t, svc, id)
+		err := svc.ApproveCommit(ctx, id, cv.ID)
+		if !errors.Is(err, ErrTargetUnverifiable) {
+			t.Fatalf("approve: %v", err)
+		}
+		if clicks(fb) != 0 {
+			t.Fatal("an action ran against an unverified target")
+		}
+		r := svc.Sessions(id)[0].CommitResult
+		if r == nil || r.State != "failed" || !strings.Contains(r.Detail, "do it yourself") {
+			t.Fatalf("the card needs a clear outcome: %+v", r)
+		}
+		var logged bool
+		for _, e := range *events {
+			if e.Action == "approve_commit" && e.Outcome == "refused" && strings.Contains(e.Error, "target_unverifiable") {
+				logged = true
+			}
+		}
+		if !logged {
+			t.Fatal("the refusal must be audited")
+		}
+	}
+	t.Run("inspection errors on request and on approval", func(t *testing.T) {
+		svc, fb, events, id := startGranted(t, nil)
+		fb.inspectErr = failing
+		if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+			t.Fatalf("must ask: %v", err)
+		}
+		if cv := pendingView(t, svc, id); !cv.Unverifiable {
+			t.Fatal("the card must say it cannot be verified")
+		}
+		check(t, svc, fb, id, events)
+	})
+	t.Run("unresolved target on request and on approval", func(t *testing.T) {
+		svc, fb, events, id := startGranted(t, nil)
+		fb.target = &platform.TargetInfo{Resolved: false, Reason: "target is inside iframe"}
+		if _, err := svc.Click(ctx, id, "", fptr(5), fptr(5), "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+			t.Fatalf("must ask: %v", err)
+		}
+		check(t, svc, fb, id, events)
+	})
+	t.Run("probe fine on request, fails on approval", func(t *testing.T) {
+		svc, fb, events, id := startGranted(t, nil)
+		fb.target = sendTarget()
+		_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
+		if cv := pendingView(t, svc, id); cv.Unverifiable {
+			t.Fatal("a verified target is redeemable")
+		}
+		fb.inspectErr = failing
+		check(t, svc, fb, id, events)
+	})
+	t.Run("probe fine on request, unresolved on approval", func(t *testing.T) {
+		svc, fb, events, id := startGranted(t, nil)
+		fb.target = sendTarget()
+		_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
+		fb.target = &platform.TargetInfo{Resolved: false, Reason: "gone"}
+		cv := pendingView(t, svc, id)
+		// An unresolved re-probe cannot match the verified fingerprint, and is
+		// refused as unverifiable rather than reported as a page change.
+		if err := svc.ApproveCommit(ctx, id, cv.ID); !errors.Is(err, ErrTargetUnverifiable) || clicks(fb) != 0 {
+			t.Fatalf("%v clicks=%d", err, clicks(fb))
+		}
+		_ = events
+	})
+	t.Run("navigate approvals are unaffected", func(t *testing.T) {
+		svc, fb, _, id := startGranted(t, nil)
+		fb.inspectErr = failing // navigate never probes
+		if _, err := svc.Navigate(ctx, id, "http://a.test/logout", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+			t.Fatal(err)
+		}
+		if err := svc.ApproveCommit(ctx, id, pendingView(t, svc, id).ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := fb.calls[len(fb.calls)-1]; got != "navigate http://a.test/logout" {
+			t.Fatalf("navigate must run: %v", fb.calls)
+		}
+	})
+}
