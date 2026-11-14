@@ -228,11 +228,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// syncTargets reads the pages, tells the viewer about changes, and moves
 	// the screencast to a new active page. It returns false when the viewer or
 	// the browser is gone.
+	failures := 0
 	syncTargets := func(force bool) bool {
 		next, err := tsess.Targets(id)
 		if err != nil {
-			return false
+			// One slow or failed read must not end a healthy stream; a browser
+			// that stays unreadable does.
+			failures++
+			return failures < maxTargetReadFailures
 		}
+		failures = 0
 		if !s.sendTargets(conn, next, &lastTargets) {
 			return false
 		}
@@ -282,9 +287,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			for {
 				next, err := tsess.Targets(id)
 				if err != nil {
-					return
+					failures++
+					if failures >= maxTargetReadFailures {
+						return
+					}
+				} else {
+					failures = 0
 				}
-				if next.Active != activeID || time.Now().After(deadline) {
+				if (err == nil && next.Active != activeID) || time.Now().After(deadline) {
 					break
 				}
 				select {
@@ -295,6 +305,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			if !syncTargets(true) {
 				return
+			}
+			select {
+			case <-cdpDone:
+				// No new page could be attached yet; back off before retrying.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(200 * time.Millisecond):
+				}
+			default:
 			}
 		case <-targetTick:
 			if !syncTargets(false) {
@@ -343,6 +363,10 @@ const targetPollPeriod = 400 * time.Millisecond
 // targetCloseGrace bounds how long the stream waits, after the active page's
 // socket closes, for the session to move to another page.
 const targetCloseGrace = 2 * time.Second
+
+// maxTargetReadFailures is how many consecutive page-list reads may fail before
+// the stream gives up on the session.
+const maxTargetReadFailures = 5
 
 // sendTargets writes the targets TEXT frame when it differs from the last one
 // sent. It returns false on a write failure.

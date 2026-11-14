@@ -3,6 +3,7 @@ package cdpdiscovery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -85,5 +86,27 @@ func TestListReturnsEveryPageWithPinnedDebuggerURL(t *testing.T) {
 	first, err := Discover(context.Background(), 4321, c)
 	if err != nil || first.ID != "a" {
 		t.Fatalf("Discover = %+v %v", first, err)
+	}
+}
+
+func TestListBoundedKeepsWorkingPastThePageCap(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("[")
+	for i := 0; i < MaxPageTargets+5; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"id":"p%d","type":"page","url":"http://app.test/","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/p%d"}`, i, i)
+	}
+	b.WriteString("]")
+	c := &http.Client{Transport: fakeTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(b.String())), Header: http.Header{}}, nil
+	})}
+	if _, err := List(context.Background(), 4321, c); err == nil {
+		t.Fatal("List accepted more than the page cap")
+	}
+	got, overflow, err := ListBounded(context.Background(), 4321, c)
+	if err != nil || !overflow || len(got) != MaxPageTargets {
+		t.Fatalf("ListBounded: %d targets overflow=%v err=%v", len(got), overflow, err)
 	}
 }

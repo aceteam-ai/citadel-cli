@@ -830,15 +830,7 @@ func cdpCommand(debugPort int, method string, params map[string]any) (map[string
 }
 
 func cdpCommandContext(ctx context.Context, debugPort int, method string, params map[string]any) (map[string]any, error) {
-	var target cdpTarget
-	var err error
-	if set := lookupTargetSet(debugPort); set != nil {
-		// A co-browse session: act on the page the user is looking at, which
-		// is not always the first one once a popup or tab has opened.
-		target, err = set.activeTarget(ctx, debugPort)
-	} else {
-		target, err = pickTargetContext(ctx, debugPort)
-	}
+	target, err := pickTargetContext(ctx, debugPort)
 	if err != nil {
 		return nil, err
 	}

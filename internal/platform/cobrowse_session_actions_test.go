@@ -705,11 +705,11 @@ func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
 	if initial["below"] != true || initial["smooth"] != true {
 		t.Fatalf("test page must start offscreen with smooth scrolling: %v", initial)
 	}
-	x, y, err := resolveSelectorCenter(port, "#submit")
+	x, y, err := resolveSelectorCenter(pin{port: port}, "#submit")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := clickAtPoint(port, x, y); err != nil {
+	if err := clickAtPoint(pin{port: port}, x, y); err != nil {
 		t.Fatal(err)
 	}
 	value, err := evaluatePinnedCDPTarget(context.Background(), wsURL, `window.clicked || 0`)
@@ -720,7 +720,7 @@ func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := resolveSelectorCenter(port, "#submit"); err == nil {
+	if _, _, err := resolveSelectorCenter(pin{port: port}, "#submit"); err == nil {
 		t.Fatal("covered button must fail the hit test")
 	}
 }

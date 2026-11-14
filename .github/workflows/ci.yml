@@ -121,7 +121,7 @@ jobs:
         run: go test ./internal/localcobrowse/... ./internal/localviewer/ ./internal/localaudit/ -count=1
 
       - name: Mountable stream handler
-        run: go test ./internal/cobrowsestream/ -count=1 -run '^(TestMounted|TestStreamFollowsPopup|TestViewerTargetSwitch|TestParseTarget)'
+        run: go test ./internal/cobrowsestream/ -count=1 -run '^(TestMounted|TestStreamFollowsPopup|TestStreamSurvives|TestViewerTargetSwitch|TestParseTarget|TestNodeWideManagerSession)'
 
       - name: citadel local mcp (stdio JSON-RPC)
         run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide)'
@@ -129,7 +129,7 @@ jobs:
       - name: Unit tests (Windows-portable subset)
         run: >-
           go test ./internal/platform/ -count=1 -run
-          '^(TestWindows|TestReconcileTargets|TestTargetSet|TestSetActive|TestManagerPageChoice|TestCloseTargetByID|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
+          '^(TestWindows|TestReconcileTargets|TestTargetSet|TestUnconfiguredTargetSet|TestSetActive|TestManagerPageChoice|TestCloseTargetByID|TestActionRefusedWhenAnother|TestActionsAreSentToThe|TestNodeWideManagerDoesNotTrack|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
 
       # The shipped binary, end to end: discovery, a hidden test launch, the
       # loopback bind and the audit/owner checks, plus the stdio server's

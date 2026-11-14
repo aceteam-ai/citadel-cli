@@ -632,6 +632,8 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 			}
 			return ActionResult{}, err
 		}
+		clear := s.expectActive(id)
+		defer clear()
 		if err := s.gateWrite(id, true); err != nil {
 			return ActionResult{}, err
 		}
@@ -639,8 +641,10 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 			return ActionResult{}, err
 		}
 		before := s.currentURL(id)
-		if _, err := s.cfg.Browser.Navigate(id, url); err != nil {
-			return ActionResult{}, err
+		_, nerr := s.cfg.Browser.Navigate(id, url)
+		clear()
+		if nerr != nil {
+			return ActionResult{}, nerr
 		}
 		res := s.settle(ctx, id, before)
 		if url != before {
@@ -650,6 +654,24 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 	}()
 	s.finish(ev, err)
 	return res, err
+}
+
+// expectActive records the page this call is checked against, so the browser
+// refuses the action if a different page is active when it is dispatched: the
+// page that passed the checks is the page that gets the input. The returned
+// function clears it; call it as soon as the dispatch is done so the result can
+// follow a popup the action opened.
+func (s *Service) expectActive(id string) func() {
+	ex, ok := s.cfg.Browser.(interface{ ExpectTarget(id, target string) })
+	if !ok {
+		return func() {}
+	}
+	st, ok := s.cfg.Browser.SessionStatus(id)
+	if !ok || st.ActiveTarget == "" {
+		return func() {}
+	}
+	ex.ExpectTarget(id, st.ActiveTarget)
+	return func() { ex.ExpectTarget(id, "") }
 }
 
 // Click clicks an element or a viewport point (W).
@@ -731,6 +753,8 @@ func (s *Service) beforeAction(ev *Event) error {
 
 func (s *Service) writeAction(ctx context.Context, ev *Event, do func() error) (ActionResult, error) {
 	id := ev.SessionID
+	clear := s.expectActive(id)
+	defer clear()
 	if err := s.gateWrite(id, false); err != nil {
 		return ActionResult{}, err
 	}
@@ -738,7 +762,9 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, do func() error) (
 		return ActionResult{}, err
 	}
 	before := s.currentURL(id)
-	if err := do(); err != nil {
+	err := do()
+	clear()
+	if err != nil {
 		return ActionResult{}, err
 	}
 	res := s.settle(ctx, id, before)
@@ -760,6 +786,8 @@ func (s *Service) Extract(ctx context.Context, id, selector string, attrs []stri
 		maxChars = MaxExtractChars
 	}
 	var res platform.ExtractResult
+	clear := s.expectActive(id)
+	defer clear()
 	err := s.gateRead(ctx, id)
 	if err == nil {
 		res, err = s.cfg.Browser.ExtractBounded(id, selector, attrs, maxChars)
@@ -772,6 +800,8 @@ func (s *Service) Extract(ctx context.Context, id, selector string, attrs []stri
 func (s *Service) Screenshot(ctx context.Context, id, goal string) (string, error) {
 	ev := Event{SessionID: id, Action: "screenshot", Class: "R", Goal: goal}
 	var png string
+	clear := s.expectActive(id)
+	defer clear()
 	err := s.gateRead(ctx, id)
 	if err == nil {
 		png, err = s.cfg.Browser.Screenshot(id)
@@ -1224,9 +1254,20 @@ func (s *Service) TargetPolicy() func(ctx context.Context, rawURL string) error 
 	return s.cfg.URLPolicy
 }
 
-// RecordTargetClosed audits a page the browser opened and Citadel closed.
-func (s *Service) RecordTargetClosed(sessionID, rawURL string, reason error) {
-	s.emit(Event{SessionID: sessionID, Action: "target_closed", Class: "R", URL: rawURL, Outcome: "refused", Error: errString(reason)})
+// RecordTargetEvent audits a page event. "target_closed" and "target_refused"
+// are Citadel's own doing (class B, actor citadel); "target_switch" and
+// "target_close" are the user choosing a page in the viewer (class H).
+func (s *Service) RecordTargetEvent(sessionID, action, rawURL string, reason error) {
+	ev := Event{SessionID: sessionID, Action: action, URL: rawURL, Error: errString(reason)}
+	switch action {
+	case "target_switch", "target_close":
+		ev.Class, ev.Outcome = "H", "ok"
+	case "target_refused":
+		ev.Class, ev.Outcome = "B", "left_open"
+	default:
+		ev.Class, ev.Outcome = "B", "closed"
+	}
+	s.emit(ev)
 }
 
 func errString(err error) string {

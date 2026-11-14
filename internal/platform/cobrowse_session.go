@@ -155,10 +155,11 @@ type CobrowseSessionManager struct {
 	baseDir     string
 	sweepOnce   sync.Once
 	launchOpts  LaunchOptions
-	// targetPolicy and targetRefused apply to the pages of sessions launched
-	// by this manager (see SetTargetPolicy).
-	targetPolicy  TargetPolicy
-	targetRefused TargetRefusedFunc
+	// trackTargets, targetPolicy and targetEvent are set by
+	// EnableTargetTracking (local mode only).
+	trackTargets bool
+	targetPolicy TargetPolicy
+	targetEvent  TargetEventFunc
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
@@ -210,6 +211,11 @@ type cobrowseSession struct {
 	regDir     string
 	generation uint64
 	pendingEnd *EndedSession
+	// tracking is set at creation from the manager (local mode only): pages are
+	// followed and status lists them. expectTarget is the page a call was
+	// checked against (see ExpectTarget).
+	tracking     bool
+	expectTarget string
 }
 
 var (
@@ -325,6 +331,7 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		encProfile: profile,
 		regDir:     m.sessionRegDir(),
 		generation: 1,
+		tracking:   m.trackTargets,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -371,8 +378,8 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		// Wait for the launch URL (including redirects) to settle, then report
 		// where the page ended up, as Navigate does. Best effort: a page that
 		// cannot be read leaves the plain status.
-		if port, perr := s.requireDrivablePort(); perr == nil {
-			ps := settleNavigation(port, "")
+		if p, perr := s.pinAction(); perr == nil {
+			ps := settleNavigation(p, "")
 			if ps.URL != "" {
 				st.URL = ps.URL
 			}
@@ -410,7 +417,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	}
 	m.mu.Lock()
 	lo := m.launchOpts
-	tpolicy, trefused := m.targetPolicy, m.targetRefused
+	tpolicy, tevent := m.targetPolicy, m.targetEvent
 	m.mu.Unlock()
 	lo.Detach = m.useResolver && detachedWorker.Load()
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
@@ -424,8 +431,10 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 
 	// Configure the page policy before the session is visible to status or
 	// actions, so no page is ever accepted without it.
-	dropTargetSet(proc.debugPort)
-	targetSetFor(proc.debugPort).configure(s.id, tpolicy, trefused)
+	if s.tracking {
+		dropTargetSet(proc.debugPort)
+		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
+	}
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
@@ -608,14 +617,20 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 	s.mu.Unlock()
 
 	if probePort != 0 {
-		if snap, err := targetSetFor(probePort).sync(context.Background(), probePort); err == nil {
-			st.Targets = snap.Targets
-			st.ActiveTarget = snap.Active
-			for _, tg := range snap.Targets {
-				if tg.Active {
-					st.URL = tg.URL
+		if s.tracking {
+			ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+			if snap, err := targetSetFor(probePort).sync(ctx, probePort); err == nil {
+				st.Targets = snap.Targets
+				st.ActiveTarget = snap.Active
+				for _, tg := range snap.Targets {
+					if tg.Active {
+						st.URL = tg.URL
+					}
 				}
 			}
+			cancel()
+		} else if t, err := pickTarget(probePort); err == nil {
+			st.URL = t.URL
 		}
 	}
 	return st

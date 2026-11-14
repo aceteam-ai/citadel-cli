@@ -79,7 +79,10 @@ opener.postMessage('tok-123', 'http://app.test'); window.close();</script>`)
 	m.SetLaunchOptions(platform.LaunchOptions{ProxyServer: g.ProxyURL(), Quiet: true})
 	var mu sync.Mutex
 	var refused []string
-	m.SetTargetPolicy(NewURLPolicy(resolve, nil), func(_, raw string, _ error) {
+	m.EnableTargetTracking(NewURLPolicy(resolve, nil), func(_, action, raw string, _ error) {
+		if action != "target_closed" {
+			return
+		}
 		mu.Lock()
 		refused = append(refused, raw)
 		mu.Unlock()

@@ -2,9 +2,11 @@ package cobrowsestream
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/gorilla/websocket"
 )
 
@@ -15,6 +17,7 @@ type fakeTargetSession struct {
 	pages map[string]*fakeChrome
 	open  []string // ids in browser order
 
+	failNext int
 	active   string
 	switched []string
 	closed   []string
@@ -31,6 +34,10 @@ func (s *fakeTargetSession) snapshot() TargetSnapshot {
 func (s *fakeTargetSession) Targets(id string) (TargetSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failNext > 0 {
+		s.failNext--
+		return TargetSnapshot{}, fmt.Errorf("transient")
+	}
 	return s.snapshot(), nil
 }
 
@@ -221,6 +228,46 @@ func TestStreamSurvivesPopupClosingItself(t *testing.T) {
 	waitConns(t, a, 2)
 
 	// Still connected: a later page change still reaches the viewer.
+	sess.set("b", "a", "b")
+	readTargets(t, conn, "b")
+}
+
+// Only a manager that tracks pages (local mode) offers page frames and
+// switching; the node-wide manager streams the first page as before.
+func TestNodeWideManagerSessionIsNotATargetSession(t *testing.T) {
+	plain := NewManagerSessionFrom(platform.NewCobrowseSessionManager(t.TempDir(), 1))
+	if _, ok := plain.(TargetSession); ok {
+		t.Fatal("a manager without page tracking offers target frames")
+	}
+	if _, ok := NewManagerSession().(TargetSession); ok {
+		t.Fatal("the node-wide session offers target frames")
+	}
+	tracked := platform.NewCobrowseSessionManager(t.TempDir(), 1)
+	tracked.EnableTargetTracking(nil, nil)
+	if _, ok := NewManagerSessionFrom(tracked).(TargetSession); !ok {
+		t.Fatal("a tracking manager does not offer target frames")
+	}
+}
+
+// One slow or failed page-list read must not end a healthy stream.
+func TestStreamSurvivesTransientTargetReadErrors(t *testing.T) {
+	a, b := newFakeChrome(), newFakeChrome()
+	defer a.close()
+	defer b.close()
+	sess := &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a, "b": b}}
+	sess.set("a", "a")
+	ts := newHarness(t, sess, a)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	readTargets(t, conn, "a")
+	sess.mu.Lock()
+	sess.failNext = 2
+	sess.mu.Unlock()
+	time.Sleep(time.Second)
 	sess.set("b", "a", "b")
 	readTargets(t, conn, "b")
 }

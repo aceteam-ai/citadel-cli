@@ -119,18 +119,27 @@ update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
 user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
 
 `platform.targetSet` owns a session's open pages (S15, aceteam#13503): popups
-and new tabs. `reconcileTargets` is the pure rule (a page that appears while
-another is active is treated as its popup and becomes active; a page that
-closes returns to the most recent opener still open), and `targetSet.sync`
-applies the session's `TargetPolicy` to every new or navigated page (local mode
-passes `Service.TargetPolicy`, the same address filter as navigation, so a
-popup to a refused address is closed and audited as `target_closed`), bounds
-pages at `MaxCobrowseTargets` and never closes the last one. `cdpCommandContext`
-resolves the active page, so every scripted action follows it. The viewer
-protocol is shared with the future cloud viewer: `cobrowsestream.TargetSession`
-(optional on `Session`), a `targets` TEXT frame to the viewer and
-`target_switch` / `target_close` input that need live control.
-`TestRealBrowserPopupSignIn` is the real-browser acceptance (windows-latest).
+and new tabs. It is local mode only: a manager opts in with
+`EnableTargetTracking`; the node-wide manager does not, and its status, actions
+and stream are unchanged. `reconcileTargets` is the pure rule: a page becomes
+active only when the browser reports (`Target.getTargets` openerId; `/json` has
+no opener) that the active page opened it, a page opened by a background tab
+stays listed until the user picks it, and a closing page returns to the most
+recent opener. Pages keep first-seen order, never the browser's list order.
+`targetSet.sync` judges each new or navigated page after the fact: the page
+opens, then is closed if it fails the policy (local mode passes
+`Service.TargetPolicy`, the navigation address filter; an unconfigured set uses
+the http(s) scheme rule), audited as `target_closed` (actor citadel). The egress
+guard is what stops its network traffic, not the close. It bounds pages at
+`MaxCobrowseTargets`, tolerates a flood through `cdpdiscovery.ListBounded`, and
+never closes the last page. `pin` fixes the page an action works on: every CDP
+command of one action goes to that page, `verify` refuses input if it stopped
+being active, and `ExpectTarget` lets `Service` pin the page its gates checked.
+The viewer protocol is shared with the future cloud viewer:
+`cobrowsestream.TargetSession` (offered only for a tracking manager), a
+`targets` TEXT frame, and `target_switch` / `target_close` input that need live
+control and are audited. `TestRealBrowserPopupSignIn` is the real-browser
+acceptance (windows-latest).
 
 `localviewer.Server` owns the local-mode loopback viewer. `guard` checks Host
 and Origin. The only cross-site request it admits is the top-level navigation

@@ -81,8 +81,11 @@ func localAuditRetention() time.Duration {
 // reaches here: the event carries only its length.
 func auditRecordFor(ev localcobrowse.Event) localaudit.Record {
 	actor := "agent"
-	if ev.Class == "H" {
+	switch ev.Class {
+	case "H":
 		actor = "user"
+	case "B":
+		actor = "citadel" // the browser or Citadel acting on its own
 	}
 	return localaudit.Record{
 		SessionID:       ev.SessionID,
@@ -254,7 +257,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	if manager != nil {
 		// A popup or new tab passes the same address filter as navigation;
 		// the egress guard still covers its connections.
-		manager.SetTargetPolicy(rt.svc.TargetPolicy(), rt.svc.RecordTargetClosed)
+		manager.EnableTargetTracking(rt.svc.TargetPolicy(), rt.svc.RecordTargetEvent)
 	}
 	go func() {
 		t := time.NewTicker(time.Minute)
