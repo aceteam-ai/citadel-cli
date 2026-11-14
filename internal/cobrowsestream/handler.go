@@ -1,7 +1,9 @@
 package cobrowsestream
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -107,18 +109,36 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	holder := newFrameHolder()
 	var sawScreencastFrame atomic.Bool
-	cdp, err := dialCDP(debugPort, func(f screencastFrame) {
+	onFrame := func(f screencastFrame) {
 		sawScreencastFrame.Store(true)
 		holder.set(f.jpeg)
-	})
+	}
+	tsess, hasTargets := s.session.(TargetSession)
+	var snap TargetSnapshot
+	var cdp *cdpClient
+	if hasTargets {
+		snap, err = tsess.Targets(id)
+		if err == nil {
+			cdp, err = dialCDPURL(snap.ActiveWebSocketURL, onFrame, maxCDPMessageBytes)
+		}
+	} else {
+		cdp, err = dialCDP(debugPort, onFrame)
+	}
 	if err != nil {
 		s.logger.Printf("CDP attach failed for session=%s: %v", id, err)
 		return
 	}
-	// Order matters: stopScreencast (politeness) runs first, Close (the real
-	// no-leak guarantee) runs last. Defers execute LIFO.
-	defer cdp.Close()
-	defer cdp.stopScreencast()
+	// The reader goroutine and the writer loop share the current CDP client;
+	// a page switch replaces it. Order matters on exit: stopScreencast
+	// (politeness) first, Close (the real no-leak guarantee) last.
+	var current atomic.Pointer[cdpClient]
+	current.Store(cdp)
+	defer func() {
+		if c := current.Load(); c != nil {
+			c.stopScreencast()
+			c.Close()
+		}
+	}()
 
 	if err := cdp.startScreencast(s.cfg.Quality, s.cfg.MaxWidth, s.cfg.MaxHeight, s.cfg.EveryNth); err != nil {
 		s.logger.Printf("startScreencast failed for session=%s: %v", id, err)
@@ -126,6 +146,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	uiMessages := make(chan map[string]any, 4)
+	resync := make(chan struct{}, 1)
 	// Reader goroutine: viewer input -> CDP. Also detects viewer disconnect and
 	// keeps the read deadline fresh via pong, so a dead viewer flips the session
 	// out of "attached" within pongWait. It never writes to the viewer socket.
@@ -143,8 +164,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			if mt == websocket.TextMessage {
 				if m, ok := parseInputMessage(data); ok && s.session.ViewerHasControl(id) {
-					if m.Type == InputTypeSelectProbe || m.Type == InputTypeSelect {
-						result, err := cdp.selectAt(m)
+					switch m.Type {
+					case InputTypeSelectProbe, InputTypeSelect:
+						result, err := current.Load().selectAt(m)
 						if err != nil {
 							s.logger.Printf("viewer select failed: %v", err)
 						}
@@ -159,8 +181,25 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 						case <-ctx.Done():
 							return
 						}
-					} else {
-						s.dispatchInput(cdp, m)
+					case InputTypeTargetSwitch, InputTypeTargetClose:
+						if !hasTargets {
+							continue
+						}
+						var terr error
+						if m.Type == InputTypeTargetSwitch {
+							terr = tsess.SwitchTarget(id, m.Target)
+						} else {
+							terr = tsess.CloseTarget(id, m.Target)
+						}
+						if terr != nil {
+							s.logger.Printf("viewer %s failed: %v", m.Type, terr)
+						}
+						select {
+						case resync <- struct{}{}:
+						default:
+						}
+					default:
+						s.dispatchInput(current.Load(), m)
 					}
 				}
 			}
@@ -173,6 +212,53 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	defer ping.Stop()
 	firstFrameFallback := time.NewTimer(750 * time.Millisecond)
 	defer firstFrameFallback.Stop()
+	var targetTick <-chan time.Time
+	var lastTargets []byte
+	activeID := snap.Active
+	cdpDone := cdp.Done()
+	if hasTargets {
+		t := time.NewTicker(targetPollPeriod)
+		defer t.Stop()
+		targetTick = t.C
+		if !s.sendTargets(conn, snap, &lastTargets) {
+			return
+		}
+	}
+
+	// syncTargets reads the pages, tells the viewer about changes, and moves
+	// the screencast to a new active page. It returns false when the viewer or
+	// the browser is gone.
+	syncTargets := func() bool {
+		next, err := tsess.Targets(id)
+		if err != nil {
+			return false
+		}
+		if !s.sendTargets(conn, next, &lastTargets) {
+			return false
+		}
+		if next.Active != activeID || (isClosed(cdpDone) && next.ActiveWebSocketURL != "") {
+			nc, err := dialCDPURL(next.ActiveWebSocketURL, onFrame, maxCDPMessageBytes)
+			if err != nil {
+				s.logger.Printf("CDP switch failed for session=%s: %v", id, err)
+				return false
+			}
+			old := current.Swap(nc)
+			if old != nil {
+				old.stopScreencast()
+				old.Close()
+			}
+			holder.take()
+			sawScreencastFrame.Store(false)
+			if err := nc.startScreencast(s.cfg.Quality, s.cfg.MaxWidth, s.cfg.MaxHeight, s.cfg.EveryNth); err != nil {
+				s.logger.Printf("startScreencast failed for session=%s: %v", id, err)
+				return false
+			}
+			activeID = next.Active
+			cdpDone = nc.Done()
+			firstFrameFallback.Reset(750 * time.Millisecond)
+		}
+		return true
+	}
 
 	for {
 		select {
@@ -183,17 +269,30 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 		case <-ctx.Done():
 			return
-		case <-cdp.Done():
-			// Browser/session went away: tear the viewer down.
-			return
+		case <-cdpDone:
+			// The page went away. With target tracking it is usually a popup
+			// that closed, so move to the opener; otherwise (or when the
+			// browser itself is gone) tear the viewer down.
+			if !hasTargets || !syncTargets() || isClosed(cdpDone) {
+				return
+			}
+		case <-targetTick:
+			if !syncTargets() {
+				return
+			}
+		case <-resync:
+			if !syncTargets() {
+				return
+			}
 		case <-firstFrameFallback.C:
 			if !sawScreencastFrame.Load() {
 				// Chrome may not emit a screencast event for a static page. Ask
 				// for its current image once, without blocking the stream writer.
+				c := current.Load()
 				go func() {
 					captureCtx, stop := context.WithTimeout(ctx, 5*time.Second)
 					defer stop()
-					image, err := cdp.captureFirstFrame(captureCtx, s.cfg.Quality)
+					image, err := c.captureFirstFrame(captureCtx, s.cfg.Quality)
 					if err == nil && !sawScreencastFrame.Load() && ctx.Err() == nil {
 						holder.set(image)
 					}
@@ -215,6 +314,41 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// targetPollPeriod is how often the stream re-reads the session's pages, so a
+// popup the page opens by itself reaches the viewer promptly.
+const targetPollPeriod = 400 * time.Millisecond
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// sendTargets writes the targets TEXT frame when it differs from the last one
+// sent. It returns false on a write failure.
+func (s *Server) sendTargets(conn *websocket.Conn, snap TargetSnapshot, last *[]byte) bool {
+	msg := TargetsMessage{Type: TargetsType, Active: snap.Active, Targets: snap.Targets}
+	if msg.Targets == nil {
+		msg.Targets = []TargetInfo{}
+	}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return true
+	}
+	if bytes.Equal(b, *last) {
+		return true
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+		return false
+	}
+	*last = b
+	return true
 }
 
 // dispatchInput routes one decoded viewer input message to CDP.

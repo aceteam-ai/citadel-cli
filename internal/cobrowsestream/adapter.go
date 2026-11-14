@@ -38,3 +38,19 @@ func (s managerSession) AttachTarget(id string) (int, bool) {
 func (s managerSession) MarkAttached(id string) bool     { return s.m.MarkAttached(id) }
 func (s managerSession) MarkDetached(id string) bool     { return s.m.MarkDetached(id) }
 func (s managerSession) ViewerHasControl(id string) bool { return s.m.ViewerHasControl(id) }
+
+// Targets implements TargetSession.
+func (s managerSession) Targets(id string) (TargetSnapshot, error) {
+	t, err := s.m.Targets(id)
+	if err != nil {
+		return TargetSnapshot{}, err
+	}
+	snap := TargetSnapshot{Active: t.Active, ActiveWebSocketURL: t.ActiveWebSocketURL}
+	for _, tg := range t.Targets {
+		snap.Targets = append(snap.Targets, TargetInfo{ID: tg.ID, Title: tg.Title, URL: tg.URL, Active: tg.Active})
+	}
+	return snap, nil
+}
+
+func (s managerSession) SwitchTarget(id, target string) error { return s.m.SwitchTarget(id, target) }
+func (s managerSession) CloseTarget(id, target string) error  { return s.m.CloseTarget(id, target) }

@@ -30,6 +30,7 @@
 package platform
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -96,6 +97,10 @@ type CobrowseSessionStatus struct {
 	Driver CobrowseDriver `json:"driver,omitempty"`
 	// Browser is the launched browser's kind ("chrome", "edge", "chromium").
 	Browser string `json:"browser,omitempty"`
+	// ActiveTarget and Targets list the open pages (tabs and popups); the URL
+	// above is the active page's.
+	ActiveTarget string           `json:"active_target,omitempty"`
+	Targets      []CobrowseTarget `json:"targets,omitempty"`
 	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
 	Generation uint64 `json:"generation,omitempty"`
 }
@@ -150,6 +155,10 @@ type CobrowseSessionManager struct {
 	baseDir     string
 	sweepOnce   sync.Once
 	launchOpts  LaunchOptions
+	// targetPolicy and targetRefused apply to the pages of sessions launched
+	// by this manager (see SetTargetPolicy).
+	targetPolicy  TargetPolicy
+	targetRefused TargetRefusedFunc
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
@@ -401,6 +410,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	}
 	m.mu.Lock()
 	lo := m.launchOpts
+	tpolicy, trefused := m.targetPolicy, m.targetRefused
 	m.mu.Unlock()
 	lo.Detach = m.useResolver && detachedWorker.Load()
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
@@ -417,6 +427,8 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	s.state = SessionRunning
 	s.persistent = enc != nil
 	s.mu.Unlock()
+	dropTargetSet(proc.debugPort)
+	targetSetFor(proc.debugPort).configure(s.id, tpolicy, trefused)
 	// Durable registry record so a restart by exec can re-adopt this session.
 	s.persistRecord()
 	return proc, nil
@@ -530,6 +542,9 @@ func (s *cobrowseSession) teardown() error {
 	if proc != nil && proc.stop != nil {
 		err = proc.stop()
 	}
+	if proc != nil {
+		dropTargetSet(proc.debugPort)
+	}
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
 		// produced new state, and sealing an empty/partial working dir would
@@ -591,8 +606,14 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 	s.mu.Unlock()
 
 	if probePort != 0 {
-		if t, err := pickTarget(probePort); err == nil {
-			st.URL = t.URL
+		if snap, err := targetSetFor(probePort).sync(context.Background(), probePort); err == nil {
+			st.Targets = snap.Targets
+			st.ActiveTarget = snap.Active
+			for _, tg := range snap.Targets {
+				if tg.Active {
+					st.URL = tg.URL
+				}
+			}
 		}
 	}
 	return st

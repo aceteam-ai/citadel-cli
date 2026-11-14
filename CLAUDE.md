@@ -118,6 +118,20 @@ fallthrough, and `isLocalModeCommand` skips the root pre-run's CA trust and
 update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
 user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
 
+`platform.targetSet` owns a session's open pages (S15, aceteam#13503): popups
+and new tabs. `reconcileTargets` is the pure rule (a page that appears while
+another is active is treated as its popup and becomes active; a page that
+closes returns to the most recent opener still open), and `targetSet.sync`
+applies the session's `TargetPolicy` to every new or navigated page (local mode
+passes `Service.TargetPolicy`, the same address filter as navigation, so a
+popup to a refused address is closed and audited as `target_closed`), bounds
+pages at `MaxCobrowseTargets` and never closes the last one. `cdpCommandContext`
+resolves the active page, so every scripted action follows it. The viewer
+protocol is shared with the future cloud viewer: `cobrowsestream.TargetSession`
+(optional on `Session`), a `targets` TEXT frame to the viewer and
+`target_switch` / `target_close` input that need live control.
+`TestRealBrowserPopupSignIn` is the real-browser acceptance (windows-latest).
+
 `localviewer.Server` owns the local-mode loopback viewer. `guard` checks Host
 and Origin. The only cross-site request it admits is the top-level navigation
 to `/open`. `handleOpen` is the only place a cookie and bearer are issued, in

@@ -31,9 +31,10 @@ type fakeBrowser struct {
 }
 
 type fakeSession struct {
-	url    string
-	human  bool
-	exited bool
+	url     string
+	human   bool
+	exited  bool
+	targets []platform.CobrowseTarget
 }
 
 func newFakeBrowser() *fakeBrowser { return &fakeBrowser{sessions: map[string]*fakeSession{}} }
@@ -48,6 +49,12 @@ func (f *fakeBrowser) statusLocked(id string) platform.CobrowseSessionStatus {
 	}
 	if s.exited {
 		st.State = platform.SessionExited
+	}
+	for _, t := range s.targets {
+		st.Targets = append(st.Targets, t)
+		if t.Active {
+			st.ActiveTarget = t.ID
+		}
 	}
 	return st
 }

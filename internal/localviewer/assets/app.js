@@ -102,9 +102,40 @@
     openStream(s.session_id);
   }
 
+  // renderPages shows the session's open pages (tabs and popups). The page in
+  // the picture is the active one; choosing or closing a page needs control.
+  function renderPages(m) {
+    const bar = $("pages");
+    const list = m.targets || [];
+    bar.replaceChildren();
+    bar.hidden = list.length < 2;
+    for (const t of list) {
+      const item = document.createElement("span");
+      item.className = "page" + (t.id === m.active ? " sel" : "");
+      const pick = document.createElement("button");
+      pick.setAttribute("role", "tab");
+      pick.setAttribute("aria-selected", t.id === m.active ? "true" : "false");
+      pick.textContent = t.title || hostPath(t.url) || "New page";
+      pick.title = t.url || "";
+      pick.disabled = !human;
+      pick.onclick = () => send({ type: "target_switch", target: t.id });
+      item.appendChild(pick);
+      if (human) {
+        const x = document.createElement("button");
+        x.className = "x";
+        x.textContent = "\u00d7";
+        x.setAttribute("aria-label", "Close page");
+        x.onclick = () => send({ type: "target_close", target: t.id });
+        item.appendChild(x);
+      }
+      bar.appendChild(item);
+    }
+  }
+
   function closeStream() {
     if (ws) { ws.onclose = null; ws.close(); }
     ws = null; wsFor = null;
+    $("pages").hidden = true;
   }
 
   function openStream(id) {
@@ -114,7 +145,11 @@
     ws = new WebSocket("ws://" + location.host + "/api/stream?id=" + encodeURIComponent(id) + "&csrf=" + encodeURIComponent(csrf));
     ws.binaryType = "blob";
     ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") return; // init / select replies
+      if (typeof ev.data === "string") {
+        // init, select replies and the open-pages list
+        try { const m = JSON.parse(ev.data); if (m.type === "targets") renderPages(m); } catch (e) { /* ignore */ }
+        return;
+      }
       const url = URL.createObjectURL(ev.data);
       $("screen").src = url;
       if (frameURL) URL.revokeObjectURL(frameURL);

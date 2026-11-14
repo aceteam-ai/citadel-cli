@@ -552,6 +552,9 @@ type ActionResult struct {
 	Title      string `json:"title,omitempty"`
 	Value      string `json:"value,omitempty"`
 	Label      string `json:"label,omitempty"`
+	// OpenTargets is set when the session has more than one page open (a
+	// popup or new tab); status lists them. URL and Title are the active page.
+	OpenTargets int `json:"open_targets,omitempty"`
 }
 
 // settleWindow is how long a write waits to observe navigation and load;
@@ -564,6 +567,14 @@ var (
 )
 
 func (s *Service) settle(ctx context.Context, id, before string) ActionResult {
+	res := s.settlePage(ctx, id, before)
+	if st, ok := s.cfg.Browser.SessionStatus(id); ok && len(st.Targets) > 1 {
+		res.OpenTargets = len(st.Targets)
+	}
+	return res
+}
+
+func (s *Service) settlePage(ctx context.Context, id, before string) ActionResult {
 	res := ActionResult{Dispatched: true}
 	start := time.Now()
 	for {
@@ -785,6 +796,20 @@ type SessionView struct {
 	HandoffSince   string `json:"handoff_since,omitempty"`
 	HandoffReason  string `json:"handoff_reason,omitempty"`
 	Lifetime       string `json:"lifetime"`
+	// ActiveTarget and Targets list the session's open pages. A page that
+	// opens another (a sign-in popup, a link that opens a tab) is followed
+	// automatically, and closing it returns to the opener. The agent's actions
+	// apply to the active page.
+	ActiveTarget string       `json:"active_target,omitempty"`
+	Targets      []TargetView `json:"targets,omitempty"`
+}
+
+// TargetView is one open page of a session.
+type TargetView struct {
+	ID     string `json:"id"`
+	Title  string `json:"title,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Active bool   `json:"active,omitempty"`
 }
 
 // redactWhileHuman reduces a URL to its origin. While the user drives, the
@@ -801,8 +826,18 @@ func (s *Service) agentViewLocked(ss *session, st platform.CobrowseSessionStatus
 	v := s.viewLocked(ss, st, now)
 	if st.Driver == platform.DriverHuman {
 		v.URL = redactWhileHuman(v.URL)
+		redactTargets(v.Targets)
 	}
 	return v
+}
+
+// redactTargets applies the human-driving redaction to every page: origin only,
+// no title, since the path, query and title can carry one-time codes.
+func redactTargets(ts []TargetView) {
+	for i := range ts {
+		ts[i].URL = redactWhileHuman(ts[i].URL)
+		ts[i].Title = ""
+	}
 }
 
 func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now time.Time) SessionView {
@@ -829,6 +864,10 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 	default:
 		v.Approval = "approved"
 		v.GrantExpiresAt = g.expires.UTC().Format(time.RFC3339)
+	}
+	v.ActiveTarget = st.ActiveTarget
+	for _, t := range st.Targets {
+		v.Targets = append(v.Targets, TargetView{ID: t.ID, Title: t.Title, URL: t.URL, Active: t.Active})
 	}
 	if st.Driver == platform.DriverHuman && !ss.handoffAt.IsZero() {
 		v.HandoffSince = ss.handoffAt.UTC().Format(time.RFC3339)
@@ -857,6 +896,7 @@ func (s *Service) status(id string) ([]SessionView, error) {
 	for i := range views {
 		if views[i].Driver == string(platform.DriverHuman) {
 			views[i].URL = redactWhileHuman(views[i].URL)
+			redactTargets(views[i].Targets)
 		}
 	}
 	return views, nil
@@ -1175,4 +1215,23 @@ func (s *Service) HumanNavigate(ctx context.Context, id, url string) error {
 	}()
 	s.finish(ev, err)
 	return err
+}
+
+// TargetPolicy is the check every page a session opens must pass, the same
+// address filter that applies to navigation. A popup or new tab to a refused
+// address is closed (and the egress guard still blocks its connections).
+func (s *Service) TargetPolicy() func(ctx context.Context, rawURL string) error {
+	return s.cfg.URLPolicy
+}
+
+// RecordTargetClosed audits a page the browser opened and Citadel closed.
+func (s *Service) RecordTargetClosed(sessionID, rawURL string, reason error) {
+	s.emit(Event{SessionID: sessionID, Action: "target_closed", Class: "R", URL: rawURL, Outcome: "refused", Error: errString(reason)})
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

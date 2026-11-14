@@ -251,6 +251,11 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			return nil
 		},
 	})
+	if manager != nil {
+		// A popup or new tab passes the same address filter as navigation;
+		// the egress guard still covers its connections.
+		manager.SetTargetPolicy(rt.svc.TargetPolicy(), rt.svc.RecordTargetClosed)
+	}
 	go func() {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()

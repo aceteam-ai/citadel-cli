@@ -22,6 +22,8 @@ const MaxPageTargets = 64
 const ProbeTimeout = 5 * time.Second
 
 type Target struct {
+	ID                   string `json:"id"`
+	Title                string `json:"title"`
 	Type                 string `json:"type"`
 	URL                  string `json:"url"`
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
@@ -31,8 +33,20 @@ type Target struct {
 // page. The debugger authority is always pinned to the probed loopback port;
 // the page URL is retained for meeting sign-in detection, not used for dialing.
 func Discover(ctx context.Context, debugPort int, client *http.Client) (Target, error) {
+	targets, err := List(ctx, debugPort, client)
+	if err != nil {
+		return Target{}, err
+	}
+	return targets[0], nil
+}
+
+// List returns every page target that has a debugger URL (bounded by
+// MaxPageTargets, in the browser's order) with each debugger authority pinned
+// to the probed loopback port. It applies the same byte, redirect and URL
+// validation as Discover. The slice is never empty on success.
+func List(ctx context.Context, debugPort int, client *http.Client) ([]Target, error) {
 	if debugPort < 1 || debugPort > 65535 || client == nil {
-		return Target{}, fmt.Errorf("CDP target discovery requires a valid local port and client")
+		return nil, fmt.Errorf("CDP target discovery requires a valid local port and client")
 	}
 	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout)
 	defer cancel()
@@ -40,35 +54,35 @@ func Discover(ctx context.Context, debugPort int, client *http.Client) (Target, 
 	probe.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json", debugPort), nil)
 	if err != nil {
-		return Target{}, safeFailure(ctx, "CDP target discovery request failed", err)
+		return nil, safeFailure(ctx, "CDP target discovery request failed", err)
 	}
 	response, err := probe.Do(request)
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
 	}
 	if err != nil {
-		return Target{}, safeFailure(ctx, "CDP target discovery request failed", err)
+		return nil, safeFailure(ctx, "CDP target discovery request failed", err)
 	}
 	if response == nil || response.Body == nil || response.StatusCode != http.StatusOK {
-		return Target{}, fmt.Errorf("CDP target discovery requires HTTP 200")
+		return nil, fmt.Errorf("CDP target discovery requires HTTP 200")
 	}
 	if response.ContentLength > MaxResponseBytes {
-		return Target{}, fmt.Errorf("CDP target discovery exceeds 512 KiB")
+		return nil, fmt.Errorf("CDP target discovery exceeds 512 KiB")
 	}
 	// Byte admission precedes JSON parsing, including malformed oversized input.
 	// This is a fixed-size response buffer, never an unbounded target slice.
 	raw, err := io.ReadAll(io.LimitReader(response.Body, MaxResponseBytes+1))
 	if err != nil {
-		return Target{}, safeFailure(ctx, "CDP target discovery body read failed", err)
+		return nil, safeFailure(ctx, "CDP target discovery body read failed", err)
 	}
 	if len(raw) > MaxResponseBytes {
-		return Target{}, fmt.Errorf("CDP target discovery exceeds 512 KiB")
+		return nil, fmt.Errorf("CDP target discovery exceeds 512 KiB")
 	}
-	target, err := decode(raw, debugPort)
+	targets, err := decode(raw, debugPort)
 	if ctx.Err() != nil {
-		return Target{}, safeFailure(ctx, "CDP target discovery cancelled", ctx.Err())
+		return nil, safeFailure(ctx, "CDP target discovery cancelled", ctx.Err())
 	}
-	return target, err
+	return targets, err
 }
 
 // Preserve cancellation classification without exposing the transport's URL,
@@ -86,45 +100,55 @@ func safeFailure(ctx context.Context, label string, cause error) error {
 	return errors.New(label)
 }
 
-func decode(raw []byte, debugPort int) (Target, error) {
+func decode(raw []byte, debugPort int) ([]Target, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	opening, err := decoder.Token()
 	if err != nil || opening != json.Delim('[') {
-		return Target{}, fmt.Errorf("CDP target discovery requires a JSON array")
+		return nil, fmt.Errorf("CDP target discovery requires a JSON array")
 	}
-	var selected Target
+	var targets []Target
 	pages := 0
 	for decoder.More() {
 		var target Target
 		if err := decoder.Decode(&target); err != nil {
-			return Target{}, fmt.Errorf("CDP target discovery contains invalid target JSON")
+			return nil, fmt.Errorf("CDP target discovery contains invalid target JSON")
 		}
 		if target.Type != "page" {
 			continue
 		}
 		pages++
 		if pages > MaxPageTargets {
-			return Target{}, fmt.Errorf("CDP target discovery exceeds 64 page targets")
+			return nil, fmt.Errorf("CDP target discovery exceeds 64 page targets")
 		}
-		if selected.WebSocketDebuggerURL == "" && target.WebSocketDebuggerURL != "" {
-			selected = target
+		if target.WebSocketDebuggerURL != "" {
+			targets = append(targets, target)
 		}
 	}
 	if closing, err := decoder.Token(); err != nil || closing != json.Delim(']') {
-		return Target{}, fmt.Errorf("CDP target discovery has an incomplete array")
+		return nil, fmt.Errorf("CDP target discovery has an incomplete array")
 	}
 	if _, err := decoder.Token(); err != io.EOF {
-		return Target{}, fmt.Errorf("CDP target discovery has trailing JSON")
+		return nil, fmt.Errorf("CDP target discovery has trailing JSON")
 	}
-	if selected.WebSocketDebuggerURL == "" {
-		return Target{}, fmt.Errorf("no page target found on CDP port %d", debugPort)
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no page target found on CDP port %d", debugPort)
 	}
-	endpoint, err := url.Parse(selected.WebSocketDebuggerURL)
-	if err != nil || endpoint == nil || (endpoint.Scheme != "ws" && endpoint.Scheme != "wss") || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.Fragment != "" {
-		return Target{}, fmt.Errorf("CDP target discovery returned an invalid debugger URL")
+	valid := targets[:0]
+	for _, t := range targets {
+		endpoint, err := url.Parse(t.WebSocketDebuggerURL)
+		if err != nil || endpoint == nil || (endpoint.Scheme != "ws" && endpoint.Scheme != "wss") || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.Fragment != "" {
+			if len(valid) == 0 && len(targets) == 1 {
+				return nil, fmt.Errorf("CDP target discovery returned an invalid debugger URL")
+			}
+			continue
+		}
+		endpoint.Scheme = "ws"
+		endpoint.Host = "127.0.0.1:" + strconv.Itoa(debugPort)
+		t.WebSocketDebuggerURL = endpoint.String()
+		valid = append(valid, t)
 	}
-	endpoint.Scheme = "ws"
-	endpoint.Host = "127.0.0.1:" + strconv.Itoa(debugPort)
-	selected.WebSocketDebuggerURL = endpoint.String()
-	return selected, nil
+	if len(valid) == 0 {
+		return nil, fmt.Errorf("CDP target discovery returned an invalid debugger URL")
+	}
+	return valid, nil
 }

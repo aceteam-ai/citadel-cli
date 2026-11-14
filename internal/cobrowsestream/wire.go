@@ -53,7 +53,33 @@ const (
 	maxPasteTextBytes    = 4 * 1024
 	InputTypeSelectProbe = "select_probe"
 	InputTypeSelect      = "select"
+	// InputTypeTargetSwitch and InputTypeTargetClose choose or close one of the
+	// session's open pages (tabs and popups). Both need the same live control
+	// as any other input.
+	InputTypeTargetSwitch = "target_switch"
+	InputTypeTargetClose  = "target_close"
 )
+
+// TargetsType is the "type" of the TEXT frame that lists the session's open
+// pages. The server sends it after init and again whenever the list or the
+// active page changes. Binary frames always show the active page; a viewer
+// that never reads this message still sees the right page.
+const TargetsType = "targets"
+
+// TargetInfo is one open page.
+type TargetInfo struct {
+	ID     string `json:"id"`
+	Title  string `json:"title,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Active bool   `json:"active,omitempty"`
+}
+
+// TargetsMessage lists the open pages. Targets keep the browser's order.
+type TargetsMessage struct {
+	Type    string       `json:"type"` // always "targets"
+	Active  string       `json:"active"`
+	Targets []TargetInfo `json:"targets"`
+}
 
 // InputMessage is a TEXT frame the viewer sends to drive the session. Unknown
 // types are ignored by the server so the contract can grow without breaking old
@@ -87,6 +113,7 @@ type InputMessage struct {
 	Modifiers int    `json:"modifiers,omitempty"` // CDP modifiers bitmask (alt=1,ctrl=2,meta=4,shift=8)
 	Value     string `json:"value,omitempty"`     // native select option value (select only)
 	ProbeID   string `json:"probe_id,omitempty"`  // viewer correlation for select_probe replies
+	Target    string `json:"target,omitempty"`    // page id for target_switch and target_close
 }
 
 // parseInputMessage decodes a viewer TEXT frame. It returns ok=false when the
@@ -97,10 +124,18 @@ func parseInputMessage(data []byte) (InputMessage, bool) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return InputMessage{}, false
 	}
-	if m.Type != InputTypeMouse && m.Type != InputTypeKey && m.Type != InputTypeSelectProbe && m.Type != InputTypeSelect {
-		if m.Type != InputTypePaste || len(m.Text) == 0 || len(m.Text) > maxPasteTextBytes {
+	switch m.Type {
+	case InputTypeMouse, InputTypeKey, InputTypeSelectProbe, InputTypeSelect:
+	case InputTypePaste:
+		if len(m.Text) == 0 || len(m.Text) > maxPasteTextBytes {
 			return InputMessage{}, false
 		}
+	case InputTypeTargetSwitch, InputTypeTargetClose:
+		if m.Target == "" || len(m.Target) > 128 {
+			return InputMessage{}, false
+		}
+	default:
+		return InputMessage{}, false
 	}
 	return m, true
 }
