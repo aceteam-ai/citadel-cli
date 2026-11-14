@@ -422,13 +422,15 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	// the session still runs and graceful stop still reaps it in-process.
 	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID, currentProcessStartToken())
 
+	// Configure the page policy before the session is visible to status or
+	// actions, so no page is ever accepted without it.
+	dropTargetSet(proc.debugPort)
+	targetSetFor(proc.debugPort).configure(s.id, tpolicy, trefused)
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
 	s.persistent = enc != nil
 	s.mu.Unlock()
-	dropTargetSet(proc.debugPort)
-	targetSetFor(proc.debugPort).configure(s.id, tpolicy, trefused)
 	// Durable registry record so a restart by exec can re-adopt this session.
 	s.persistRecord()
 	return proc, nil

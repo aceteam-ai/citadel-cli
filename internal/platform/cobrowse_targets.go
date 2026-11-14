@@ -84,7 +84,14 @@ func lookupTargetSet(port int) *targetSet {
 
 func dropTargetSet(port int) { targetSets.Delete(port) }
 
+// configure sets the page policy. With no policy a session still refuses pages
+// that are not http(s) or about:blank (the navigation scheme rule), so no
+// manager ever makes a file:, data: or browser-internal page active. onRefused
+// is called with no platform lock held.
 func (t *targetSet) configure(sessionID string, policy TargetPolicy, onRefused TargetRefusedFunc) {
+	if policy == nil {
+		policy = func(_ context.Context, raw string) error { return ValidateCobrowseURL(raw) }
+	}
 	t.mu.Lock()
 	t.sessionID, t.policy, t.onRefused = sessionID, policy, onRefused
 	t.mu.Unlock()

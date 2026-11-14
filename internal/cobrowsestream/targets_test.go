@@ -193,3 +193,34 @@ func TestParseTargetMessages(t *testing.T) {
 		}
 	}
 }
+
+// A popup that closes itself drops its CDP socket while the browser still lists
+// it for a moment. The viewer must stay connected and return to the opener.
+func TestStreamSurvivesPopupClosingItself(t *testing.T) {
+	a, b := newFakeChrome(), newFakeChrome()
+	defer a.close()
+	defer b.close()
+	sess := &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a, "b": b}}
+	sess.set("a", "a")
+	ts := newHarness(t, sess, a)
+
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readTargets(t, conn, "a")
+	sess.set("b", "a", "b")
+	readTargets(t, conn, "b")
+	waitConns(t, b, 1)
+
+	b.killConns()
+	time.AfterFunc(400*time.Millisecond, func() { sess.set("a", "a") })
+	readTargets(t, conn, "a")
+	waitConns(t, a, 2)
+
+	// Still connected: a later page change still reaches the viewer.
+	sess.set("b", "a", "b")
+	readTargets(t, conn, "b")
+}

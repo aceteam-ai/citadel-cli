@@ -133,11 +133,13 @@ func decode(raw []byte, debugPort int) ([]Target, error) {
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("no page target found on CDP port %d", debugPort)
 	}
+	// The first page with a debugger URL must be valid (the original Discover
+	// contract); a later page with an unusable URL is skipped, never exposed.
 	valid := targets[:0]
-	for _, t := range targets {
+	for i, t := range targets {
 		endpoint, err := url.Parse(t.WebSocketDebuggerURL)
 		if err != nil || endpoint == nil || (endpoint.Scheme != "ws" && endpoint.Scheme != "wss") || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.Fragment != "" {
-			if len(valid) == 0 && len(targets) == 1 {
+			if i == 0 {
 				return nil, fmt.Errorf("CDP target discovery returned an invalid debugger URL")
 			}
 			continue
@@ -146,9 +148,6 @@ func decode(raw []byte, debugPort int) ([]Target, error) {
 		endpoint.Host = "127.0.0.1:" + strconv.Itoa(debugPort)
 		t.WebSocketDebuggerURL = endpoint.String()
 		valid = append(valid, t)
-	}
-	if len(valid) == 0 {
-		return nil, fmt.Errorf("CDP target discovery returned an invalid debugger URL")
 	}
 	return valid, nil
 }

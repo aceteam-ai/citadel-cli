@@ -100,11 +100,14 @@
     $("screen-wrap").className = human ? "driving" : "";
     $("hint").textContent = human ? "Click the picture and type; your keystrokes go only to this browser." : "";
     openStream(s.session_id);
+    if (lastTargets && wsFor === s.session_id) renderPages(lastTargets); // buttons follow who is driving
   }
 
   // renderPages shows the session's open pages (tabs and popups). The page in
   // the picture is the active one; choosing or closing a page needs control.
+  let lastTargets = null;
   function renderPages(m) {
+    lastTargets = m;
     const bar = $("pages");
     const list = m.targets || [];
     bar.replaceChildren();
@@ -134,7 +137,7 @@
 
   function closeStream() {
     if (ws) { ws.onclose = null; ws.close(); }
-    ws = null; wsFor = null;
+    ws = null; wsFor = null; lastTargets = null;
     $("pages").hidden = true;
   }
 

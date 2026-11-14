@@ -228,7 +228,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// syncTargets reads the pages, tells the viewer about changes, and moves
 	// the screencast to a new active page. It returns false when the viewer or
 	// the browser is gone.
-	syncTargets := func() bool {
+	syncTargets := func(force bool) bool {
 		next, err := tsess.Targets(id)
 		if err != nil {
 			return false
@@ -236,7 +236,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		if !s.sendTargets(conn, next, &lastTargets) {
 			return false
 		}
-		if next.Active != activeID || (isClosed(cdpDone) && next.ActiveWebSocketURL != "") {
+		if next.Active != activeID || force {
 			nc, err := dialCDPURL(next.ActiveWebSocketURL, onFrame, maxCDPMessageBytes)
 			if err != nil {
 				s.logger.Printf("CDP switch failed for session=%s: %v", id, err)
@@ -270,18 +270,38 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-cdpDone:
-			// The page went away. With target tracking it is usually a popup
-			// that closed, so move to the opener; otherwise (or when the
-			// browser itself is gone) tear the viewer down.
-			if !hasTargets || !syncTargets() || isClosed(cdpDone) {
+			// The page's socket closed. With target tracking it is usually a
+			// popup that closed itself: the browser lists it for a moment
+			// longer, so wait for the active page to change and move to the
+			// opener rather than re-dialing the dying page. Without target
+			// tracking, or when the browser itself is gone, tear down.
+			if !hasTargets {
+				return
+			}
+			deadline := time.Now().Add(targetCloseGrace)
+			for {
+				next, err := tsess.Targets(id)
+				if err != nil {
+					return
+				}
+				if next.Active != activeID || time.Now().After(deadline) {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			if !syncTargets(true) {
 				return
 			}
 		case <-targetTick:
-			if !syncTargets() {
+			if !syncTargets(false) {
 				return
 			}
 		case <-resync:
-			if !syncTargets() {
+			if !syncTargets(false) {
 				return
 			}
 		case <-firstFrameFallback.C:
@@ -320,14 +340,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 // popup the page opens by itself reaches the viewer promptly.
 const targetPollPeriod = 400 * time.Millisecond
 
-func isClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
+// targetCloseGrace bounds how long the stream waits, after the active page's
+// socket closes, for the session to move to another page.
+const targetCloseGrace = 2 * time.Second
 
 // sendTargets writes the targets TEXT frame when it differs from the last one
 // sent. It returns false on a write failure.
