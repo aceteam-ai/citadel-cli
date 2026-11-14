@@ -368,7 +368,8 @@ func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte,
 			// #820: a short access PIN never encrypts data at rest. On this node
 			// the master PIN is the profile's only key, so it must be a passphrase.
 			return nil, fmt.Errorf("persistent profile %q needs a passphrase, not a short PIN, because it is encrypted on disk: "+
-				"rotate the node master PIN to a passphrase of four or more random words with 'citadel passcode rotate' at the node: %w", name, err)
+				"rotate the node master PIN to a passphrase of four or more random words with 'citadel passcode rotate' at the node "+
+				"(this also changes the secret for remote access to the node): %w", name, err)
 		}
 		return nil, err
 	}

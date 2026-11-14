@@ -20,6 +20,8 @@ type fakeCDPBrowser struct {
 	port   int
 	id     string
 	exited chan struct{}
+	// hang makes the fake ignore Browser.close (no reply, no exit).
+	hang bool
 
 	mu     sync.Mutex
 	events []string
@@ -45,6 +47,10 @@ func newFakeCDPBrowser(t *testing.T, id string) *fakeCDPBrowser {
 			return
 		}
 		f.record(fmt.Sprint(msg["method"]))
+		if f.hang {
+			<-r.Context().Done()
+			return
+		}
 		if msg["method"] == "Browser.close" {
 			_ = c.WriteJSON(map[string]any{"id": msg["id"], "result": map[string]any{}})
 			once.Do(func() { close(f.exited) })
@@ -164,4 +170,22 @@ func TestStartSessionWithID(t *testing.T) {
 		t.Fatalf("a duplicate start must Close the profile, closed=%d", c)
 	}
 	_ = m.StopAll()
+}
+
+// A browser that never answers or exits costs at most gracefulCloseWait in
+// total before teardown kills it.
+func TestGracefulCloseIsBoundedInTotal(t *testing.T) {
+	f := newFakeCDPBrowser(t, "fake-browser-id")
+	f.hang = true
+	prev := gracefulCloseWait
+	gracefulCloseWait = 200 * time.Millisecond
+	t.Cleanup(func() { gracefulCloseWait = prev })
+	start := time.Now()
+	closeBrowserGracefully(&cobrowseProc{debugPort: f.port, browserID: f.id, exited: make(chan struct{})})
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("graceful close took %s, want about %s", d, gracefulCloseWait)
+	}
+	if got := f.log(); got != "Browser.close" {
+		t.Fatalf("close was not attempted: %q", got)
+	}
 }

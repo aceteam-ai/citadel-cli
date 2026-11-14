@@ -58,3 +58,27 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatalf("sealed blob left after Forget: %v", err)
 	}
 }
+
+// A profile opened for the first time has a lock file but no sealed blob yet;
+// Forget must still see it in use. Mutation check: listing only *.enc lets
+// Forget delete the vault under a live session.
+func TestForgetRefusesWhileFirstUseProfileOpen(t *testing.T) {
+	s := NewStore(t.TempDir())
+	if err := s.SetPassphrase(testPIN, true); err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.Open("fresh", testPIN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Forget(); !errors.Is(err, ErrProfilesInUse) {
+		t.Fatalf("Forget with a first-use profile open = %v, want ErrProfilesInUse", err)
+	}
+	if st, _ := s.State(); !st.Configured {
+		t.Fatal("the vault was deleted under a live session")
+	}
+	_ = h.Close()
+	if err := s.Forget(); err != nil {
+		t.Fatalf("Forget after close: %v", err)
+	}
+}

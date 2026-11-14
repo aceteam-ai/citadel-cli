@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
@@ -40,6 +42,11 @@ type localCobrowseRuntime struct {
 	auditErr error
 	auditDir string
 	stop     chan struct{}
+
+	// closeOnce runs the teardown once; closed is closed when it has
+	// finished, so every caller of close waits for the profiles to be sealed.
+	closeOnce sync.Once
+	closed    chan struct{}
 
 	// viewerFactory builds the loopback viewer on first need; nil disables it.
 	viewerFactory func() (*localviewer.Server, error)
@@ -148,7 +155,7 @@ func (rt *localCobrowseRuntime) auditPrecheck() error {
 }
 
 func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
-	rt := &localCobrowseRuntime{stop: make(chan struct{})}
+	rt := &localCobrowseRuntime{stop: make(chan struct{}), closed: make(chan struct{})}
 	browser := opts.browser
 	var manager *platform.CobrowseSessionManager
 	if browser == nil {
@@ -330,14 +337,21 @@ func (rt *localCobrowseRuntime) setAgent(name string) {
 	}
 }
 
-// close stops every session and releases the owner lock.
+// close stops every session and releases the owner lock. It is idempotent and
+// every caller waits for the first teardown to finish: a saved-logins session
+// is re-sealed during that teardown, so returning early (for example to a
+// signal handler about to exit) would leave its plaintext working copy on
+// disk and lose its new logins.
 func (rt *localCobrowseRuntime) close() {
-	select {
-	case <-rt.stop:
-		return
-	default:
-		close(rt.stop)
-	}
+	rt.closeOnce.Do(func() {
+		defer close(rt.closed)
+		rt.teardown()
+	})
+	<-rt.closed
+}
+
+func (rt *localCobrowseRuntime) teardown() {
+	close(rt.stop)
 	_ = rt.svc.Close()
 	rt.mu.Lock()
 	o, g, v := rt.owner, rt.guard, rt.viewer
@@ -731,4 +745,23 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return s.Wait(ctx, id, in.Until, time.Duration(in.Timeout*float64(time.Second)))
 			}),
 	}
+}
+
+// closeOnSignal waits for the first signal on sigs, closes rt (which waits
+// for any teardown already running, such as the deferred close after stdin
+// EOF) and then exits. Later signals are absorbed while it closes, so a
+// second Ctrl-C or SIGTERM cannot cut a profile seal short.
+func closeOnSignal(rt *localCobrowseRuntime, sigs <-chan os.Signal, exit func(int)) {
+	<-sigs
+	rt.close()
+	exit(0)
+}
+
+// handleLocalCobrowseSignals stops every co-browse session, re-sealing saved
+// logins, before the process exits on SIGINT or SIGTERM. Both MCP entry
+// points that host local co-browse install it.
+func handleLocalCobrowseSignals(rt *localCobrowseRuntime) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go closeOnSignal(rt, sigs, os.Exit)
 }

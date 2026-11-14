@@ -102,14 +102,16 @@ func acquireProfileLock(storePath string) error {
 	return nil
 }
 
+// releaseProfileLock drops the OS lock before the in-process entry, both under
+// profileLocksMu, so a new acquire in this process never sees the entry gone
+// while the OS lock is still held.
 func releaseProfileLock(storePath string) {
 	profileLocksMu.Lock()
-	release := profileLocks[storePath]
-	delete(profileLocks, storePath)
-	profileLocksMu.Unlock()
-	if release != nil {
+	defer profileLocksMu.Unlock()
+	if release := profileLocks[storePath]; release != nil {
 		release()
 	}
+	delete(profileLocks, storePath)
 }
 
 // validateName returns nil if name is a safe profile name.

@@ -33,6 +33,19 @@ type localProfileStore struct {
 
 func (l localProfileStore) store() *cobrowseprofile.Store { return cobrowseprofile.NewStore(l.dir()) }
 
+// preparedLocalStore returns the Store at dir after creating its directories
+// owner-only (on Windows with an explicit protected DACL), like local mode's
+// audit and viewer dirs. Every path that writes to the store goes through it.
+func preparedLocalStore(dir string) (*cobrowseprofile.Store, error) {
+	s := cobrowseprofile.NewStore(dir)
+	for _, d := range s.PrivateDirs() {
+		if err := platform.EnsurePrivateDir(d); err != nil {
+			return nil, fmt.Errorf("saved logins need a private folder, and %s cannot be made private: %w", d, err)
+		}
+	}
+	return s, nil
+}
+
 func (l localProfileStore) ValidateName(name string) error { return l.store().ValidateName(name) }
 
 func (l localProfileStore) State() (localcobrowse.ProfileVaultState, error) {
@@ -44,11 +57,19 @@ func (l localProfileStore) State() (localcobrowse.ProfileVaultState, error) {
 }
 
 func (l localProfileStore) SetPassphrase(passphrase string, ackDataLoss bool) error {
-	return friendlyProfileError(l.store().SetPassphrase(passphrase, ackDataLoss))
+	s, err := preparedLocalStore(l.dir())
+	if err != nil {
+		return err
+	}
+	return friendlyProfileError(s.SetPassphrase(passphrase, ackDataLoss))
 }
 
 func (l localProfileStore) Open(name, passphrase string) (platform.SessionProfile, error) {
-	h, err := l.store().Open(name, passphrase)
+	s, err := preparedLocalStore(l.dir())
+	if err != nil {
+		return nil, err
+	}
+	h, err := s.Open(name, passphrase)
 	if err != nil {
 		// Never return a typed nil inside the interface.
 		return nil, friendlyProfileError(err)

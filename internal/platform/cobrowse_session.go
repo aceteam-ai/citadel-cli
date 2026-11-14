@@ -871,15 +871,17 @@ func sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
 // never repaired. Local mode keeps its viewer token and audit log in such dirs.
 func EnsurePrivateDir(dir string) error { return ensureCobrowseBaseDir(dir) }
 
-// gracefulCloseWait bounds how long teardown waits for a persistent session's
-// browser to exit after Browser.close before it is killed. A var for tests.
+// gracefulCloseWait is the whole budget for closing a persistent session's
+// browser gracefully: the endpoint probe, the Browser.close call and the wait
+// for the process to exit all share it, after which teardown kills as usual.
+// A var for tests.
 var gracefulCloseWait = 10 * time.Second
 
 // closeBrowserGracefully sends CDP Browser.close to proc's browser target and
-// waits, bounded, for the process to exit, so Chromium flushes its cookie and
-// login stores to disk. Best effort: no debug port, an unreadable or
-// mismatched endpoint, or a browser that does not exit in time all fall
-// through to the caller's kill.
+// waits, within gracefulCloseWait in total, for the process to exit, so
+// Chromium flushes its cookie and login stores to disk. Best effort: no debug
+// port, an unreadable or mismatched endpoint, or a browser that does not exit
+// in time all fall through to the caller's kill.
 func closeBrowserGracefully(proc *cobrowseProc) {
 	if proc == nil || proc.debugPort <= 0 || proc.exited == nil {
 		return
@@ -889,7 +891,9 @@ func closeBrowserGracefully(proc *cobrowseProc) {
 		return
 	default:
 	}
-	ws, err := fetchCDPBrowserWS(proc.debugPort)
+	ctx, cancel := context.WithTimeout(context.Background(), gracefulCloseWait)
+	defer cancel()
+	ws, err := fetchCDPBrowserWSContext(ctx, proc.debugPort)
 	if err != nil {
 		return
 	}
@@ -898,12 +902,10 @@ func closeBrowserGracefully(proc *cobrowseProc) {
 	if !strings.HasPrefix(ws, prefix) || (proc.browserID != "" && ws != prefix+proc.browserID) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	// The browser may close the socket before replying; that is success.
 	_, _ = cdpDialAndSendContext(ctx, ws, "Browser.close", nil)
-	cancel()
 	select {
 	case <-proc.exited:
-	case <-time.After(gracefulCloseWait):
+	case <-ctx.Done():
 	}
 }

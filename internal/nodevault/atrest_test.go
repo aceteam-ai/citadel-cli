@@ -157,3 +157,18 @@ func TestRemoveKeepsLockoutHistory(t *testing.T) {
 		t.Fatalf("Remove of an absent vault: %v", err)
 	}
 }
+
+// A passphrase shorter than a raised policy minimum is a weak secret on the
+// set path too, with the minimum in its message.
+func TestSetPassphraseBelowMinLengthIsWeak(t *testing.T) {
+	v := newTestVault(t)
+	p := DefaultPolicy()
+	p.MinLength = 40
+	err := v.SetPassphrase(strongPassphrase, p, true)
+	if !errors.Is(err, ErrWeakSecret) || !strings.Contains(err.Error(), "40 characters") {
+		t.Fatalf("below MinLength: want ErrWeakSecret naming 40 characters, got %v", err)
+	}
+	if strings.Contains(err.Error(), "master PIN") {
+		t.Fatalf("the at-rest message must not talk about a master PIN: %v", err)
+	}
+}

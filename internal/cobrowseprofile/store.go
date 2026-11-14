@@ -78,8 +78,20 @@ func (s *Store) Open(name, passphrase string) (*Handle, error) {
 	return OpenHandle(s.dir, name, passphrase, s.vault())
 }
 
-// Profiles lists the saved profile names.
-func (s *Store) Profiles() ([]string, error) {
+// PrivateDirs are the directories the Store writes: the vault and the sealed
+// profiles. A caller creates them owner-only (on Windows with an explicit
+// DACL) before the Store first writes; this package does not import the
+// platform helpers that do so.
+func (s *Store) PrivateDirs() []string {
+	return []string{filepath.Join(s.dir, nodevault.DirName), filepath.Join(s.dir, profilesDirName)}
+}
+
+// Profiles lists the saved profile names (those with a sealed blob).
+func (s *Store) Profiles() ([]string, error) { return s.namesWith(profileFileExt) }
+
+// namesWith lists valid profile names that have a file ending in each suffix
+// given, merged and sorted.
+func (s *Store) namesWith(suffixes ...string) ([]string, error) {
 	entries, err := os.ReadDir(filepath.Join(s.dir, profilesDirName))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -87,15 +99,22 @@ func (s *Store) Profiles() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	seen := map[string]bool{}
 	var names []string
 	for _, e := range entries {
-		n := e.Name()
-		if !e.Type().IsRegular() || !strings.HasSuffix(n, profileFileExt) {
+		if !e.Type().IsRegular() {
 			continue
 		}
-		n = strings.TrimSuffix(n, profileFileExt)
-		if validateName(n) == nil {
-			names = append(names, n)
+		for _, suf := range suffixes {
+			n := e.Name()
+			if !strings.HasSuffix(n, suf) {
+				continue
+			}
+			n = strings.TrimSuffix(n, suf)
+			if validateName(n) == nil && !seen[n] {
+				seen[n] = true
+				names = append(names, n)
+			}
 		}
 	}
 	sort.Strings(names)
@@ -107,11 +126,13 @@ var ErrProfilesInUse = errors.New("cobrowseprofile: a saved profile is open in a
 
 // Forget deletes every saved profile and then the vault (its header and
 // pepper), for a user who forgot the passphrase: under the no-recovery model
-// nothing else can be done with the data. It takes every profile's lock first
-// and refuses while any is held, so it cannot race a session's re-seal. The
-// lockout history is kept, so forgetting cannot be used to reset it.
+// nothing else can be done with the data. It first takes the lock of every
+// profile that has a sealed blob or a lock file (a profile opened for the
+// first time has only the lock) and refuses while any is held, so it cannot
+// race a session's re-seal. The lockout history is kept, so forgetting cannot
+// be used to reset it.
 func (s *Store) Forget() error {
-	names, err := s.Profiles()
+	names, err := s.namesWith(profileFileExt, profileFileExt+lockFileExt)
 	if err != nil {
 		return err
 	}

@@ -57,12 +57,12 @@ var localPassphraseSetCmd = &cobra.Command{
 	Short: "Create the saved-logins passphrase (the viewer can do this too)",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		isTTY := term.IsTerminal(int(os.Stdin.Fd()))
+		in := newStdinSecretReader()
 		fmt.Fprintln(os.Stderr, localPassphraseDisclosure)
-		if err := localConfirmAck(isTTY); err != nil {
+		if err := localConfirmAck(in); err != nil {
 			return err
 		}
-		pass, err := readSecretConfirmed("New passphrase: ", "Repeat the passphrase: ", isTTY)
+		pass, err := in.readConfirmed("New passphrase: ", "Repeat the passphrase: ")
 		if err != nil {
 			return err
 		}
@@ -75,15 +75,15 @@ var localPassphraseChangeCmd = &cobra.Command{
 	Short: "Change the saved-logins passphrase (saved logins are kept)",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		isTTY := term.IsTerminal(int(os.Stdin.Fd()))
-		if err := localConfirmAck(isTTY); err != nil {
+		in := newStdinSecretReader()
+		if err := localConfirmAck(in); err != nil {
 			return err
 		}
-		cur, err := readSecretOnce("Current passphrase: ", isTTY)
+		cur, err := in.read("Current passphrase: ")
 		if err != nil {
 			return err
 		}
-		next, err := readSecretConfirmed("New passphrase: ", "Repeat the new passphrase: ", isTTY)
+		next, err := in.readConfirmed("New passphrase: ", "Repeat the new passphrase: ")
 		if err != nil {
 			return err
 		}
@@ -143,22 +143,93 @@ func init() {
 
 // localConfirmAck asks for the data-loss acknowledgement on a terminal, or
 // requires --ack-data-loss otherwise.
-func localConfirmAck(isTTY bool) error {
+func localConfirmAck(in *secretReader) error {
 	if localPassAck {
 		return nil
 	}
-	if !isTTY {
+	if !in.isTTY {
 		return errors.New("refusing to set a passphrase non-interactively without --ack-data-loss (a forgotten passphrase loses saved logins)")
 	}
-	fmt.Fprint(os.Stderr, "Type 'I UNDERSTAND' to confirm a forgotten passphrase cannot be recovered: ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+	fmt.Fprint(in.prompts, "Type 'I UNDERSTAND' to confirm a forgotten passphrase cannot be recovered: ")
+	line, err := in.line()
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(line) != "I UNDERSTAND" {
 		return errors.New("acknowledgement not given; nothing was changed")
 	}
 	return nil
+}
+
+// secretReader reads saved-logins passphrases for the local CLI. A passphrase
+// is used exactly as typed: no surrounding whitespace is trimmed, matching the
+// viewer, so a passphrase set on one surface always unlocks on the other (a
+// mismatch would also count toward lockout). Piped input is read through one
+// shared buffered reader, one line per secret; only the line ending is
+// removed.
+type secretReader struct {
+	isTTY   bool
+	fd      int
+	r       *bufio.Reader
+	prompts io.Writer
+}
+
+func newStdinSecretReader() *secretReader {
+	fd := int(os.Stdin.Fd())
+	return &secretReader{isTTY: term.IsTerminal(fd), fd: fd, r: bufio.NewReader(os.Stdin), prompts: os.Stderr}
+}
+
+// line reads one line from the shared reader without its line ending.
+func (s *secretReader) line() (string, error) {
+	l, err := s.r.ReadString('\n')
+	if err != nil && !(errors.Is(err, io.EOF) && l != "") {
+		if errors.Is(err, io.EOF) {
+			return "", errors.New("no input")
+		}
+		return "", err
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(l, "\n"), "\r"), nil
+}
+
+// read reads one secret: without echo on a terminal, else the next line.
+func (s *secretReader) read(prompt string) (string, error) {
+	var secret string
+	if s.isTTY {
+		fmt.Fprint(s.prompts, prompt)
+		b, err := term.ReadPassword(s.fd)
+		fmt.Fprintln(s.prompts)
+		if err != nil {
+			return "", fmt.Errorf("read passphrase: %w", err)
+		}
+		secret = string(b)
+	} else {
+		l, err := s.line()
+		if err != nil {
+			return "", fmt.Errorf("read passphrase: %w", err)
+		}
+		secret = l
+	}
+	if secret == "" {
+		return "", errors.New("no passphrase given")
+	}
+	return secret, nil
+}
+
+// readConfirmed reads a new secret twice on a terminal and requires a match;
+// piped, it reads one line.
+func (s *secretReader) readConfirmed(prompt, confirmPrompt string) (string, error) {
+	first, err := s.read(prompt)
+	if err != nil || !s.isTTY {
+		return first, err
+	}
+	second, err := s.read(confirmPrompt)
+	if err != nil {
+		return "", err
+	}
+	if first != second {
+		return "", errors.New("the two passphrases do not match")
+	}
+	return first, nil
 }
 
 func runLocalPassphraseStatus(dir string, out io.Writer) error {
@@ -198,7 +269,11 @@ func runLocalPassphraseStatus(dir string, out io.Writer) error {
 }
 
 func runLocalPassphraseSet(dir, pass string, out io.Writer) error {
-	if err := cobrowseprofile.NewStore(dir).SetPassphrase(pass, true); err != nil {
+	s, err := preparedLocalStore(dir)
+	if err != nil {
+		return err
+	}
+	if err := s.SetPassphrase(pass, true); err != nil {
 		if errors.Is(err, nodevault.ErrAlreadyConfigured) {
 			return errors.New("a passphrase is already set; use `citadel local passphrase change`")
 		}
@@ -209,7 +284,10 @@ func runLocalPassphraseSet(dir, pass string, out io.Writer) error {
 }
 
 func runLocalPassphraseChange(dir, cur, next string, out io.Writer) error {
-	s := cobrowseprofile.NewStore(dir)
+	s, err := preparedLocalStore(dir)
+	if err != nil {
+		return err
+	}
 	st, err := s.State()
 	if err != nil {
 		return err

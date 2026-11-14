@@ -35,15 +35,18 @@ func AtRestThresholdBits(p Policy) float64 {
 	return t
 }
 
-// ValidateAtRest checks secret against the policy and the at-rest threshold.
+// ValidateAtRest checks secret against the at-rest threshold and the policy.
+// A secret that is too weak or shorter than the policy minimum is
+// ErrWeakSecret (so callers show one message); a secret the policy rejects for
+// its shape (a PIN-only policy) keeps the policy's own error.
 func ValidateAtRest(secret string, p Policy) error {
-	if err := p.Validate(secret); err != nil {
-		return err
-	}
 	if estimateEntropyBits(secret) < AtRestThresholdBits(p) {
 		return ErrWeakSecret
 	}
-	return nil
+	if min := p.normalized().MinLength; len([]rune(secret)) < min {
+		return fmt.Errorf("%w (use at least %d characters)", ErrWeakSecret, min)
+	}
+	return p.Validate(secret)
 }
 
 // MeetsAtRest reports whether secret is strong enough to encrypt data at rest,
@@ -92,8 +95,8 @@ func (v *Vault) UnlockAtRest(secret string, policy Policy) (*Session, error) {
 		if errors.Is(err, ErrWeakSecret) {
 			return nil, err
 		}
-		// A policy shape refusal (too short, non-numeric under a PIN-only
-		// policy) is also a weak secret for this purpose.
+		// A policy shape refusal (non-numeric under a PIN-only policy) also
+		// means this secret cannot be the vault's at-rest secret.
 		return nil, fmt.Errorf("%w (%v)", ErrWeakSecret, err)
 	}
 	return v.Unlock(secret)
@@ -115,3 +118,6 @@ func (v *Vault) Remove() error {
 	}
 	return nil
 }
+
+// DirName is the subdirectory of a vault's base dir that holds the vault.
+const DirName = vaultDirName

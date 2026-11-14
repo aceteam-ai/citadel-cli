@@ -1,19 +1,24 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 const localTestPassphrase = "lantern orbit pebble saffron"
@@ -148,5 +153,115 @@ func TestLocalModeProfileSessionLocked(t *testing.T) {
 	}
 	if unlockRecords < 2 {
 		t.Fatalf("unlock attempts not audited (%d records)", unlockRecords)
+	}
+}
+
+// TestSignalDuringCloseWaitsForSeal: a SIGTERM that arrives while the deferred
+// close (after stdin EOF) is still sealing sessions must not exit until that
+// teardown has finished. Mutation check: a close that returns early for a
+// second caller lets exit run while StopAll is still blocked.
+func TestSignalDuringCloseWaitsForSeal(t *testing.T) {
+	fb := newCmdFakeBrowser()
+	fb.stopAllEntered, fb.stopAllGate = make(chan struct{}), make(chan struct{})
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{
+		ownerDir: func() string { return t.TempDir() },
+		browser:  fb,
+		policy:   func(context.Context, string) error { return nil },
+	})
+	if _, err := rt.svc.Start(context.Background(), "", "g", ""); err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan struct{})
+	go func() { rt.close(); close(firstDone) }()
+	<-fb.stopAllEntered
+
+	sigs := make(chan os.Signal, 1)
+	exited := make(chan int, 1)
+	go closeOnSignal(rt, sigs, func(code int) { exited <- code })
+	sigs <- os.Interrupt
+	select {
+	case <-exited:
+		t.Fatal("exited while the first close was still sealing sessions")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(fb.stopAllGate)
+	select {
+	case code := <-exited:
+		if code != 0 {
+			t.Fatalf("exit code %d", code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("never exited after close finished")
+	}
+	fb.mu.Lock()
+	done := fb.stopAllDone
+	fb.mu.Unlock()
+	if !done {
+		t.Fatal("exited before every session was stopped")
+	}
+	<-firstDone
+	rt.close() // idempotent
+}
+
+// TestSecretReaderPipedSharesOneReaderAndKeepsWhitespace: piped `change`
+// reads the current and the new passphrase from one buffered reader (a second
+// reader would lose the buffered second line), and neither the CLI nor the
+// viewer trims a passphrase, so a value set on one surface unlocks on the other.
+func TestSecretReaderPipedSharesOneReaderAndKeepsWhitespace(t *testing.T) {
+	in := &secretReader{r: bufio.NewReader(strings.NewReader(" old words here \r\nnew words with space \n")), prompts: io.Discard}
+	cur, err := in.read("Current: ")
+	if err != nil || cur != " old words here " {
+		t.Fatalf("current = %q %v", cur, err)
+	}
+	next, err := in.readConfirmed("New: ", "Repeat: ")
+	if err != nil || next != "new words with space " {
+		t.Fatalf("new = %q %v", next, err)
+	}
+	if _, err := in.read("More: "); err == nil {
+		t.Fatal("reading past the input must fail, not return an empty passphrase")
+	}
+	empty := &secretReader{r: bufio.NewReader(strings.NewReader("\n")), prompts: io.Discard}
+	if _, err := empty.read("P: "); err == nil {
+		t.Fatal("an empty passphrase must be refused")
+	}
+}
+
+// TestPassphraseWithSpacesRoundTripsAcrossSurfaces: a passphrase with leading
+// and trailing spaces set through the CLI core unlocks through the viewer's
+// store adapter unchanged.
+func TestPassphraseWithSpacesRoundTripsAcrossSurfaces(t *testing.T) {
+	dir := t.TempDir()
+	const pass = "  lantern orbit pebble saffron  "
+	if err := runLocalPassphraseSet(dir, pass, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	ps := localProfileStore{dir: func() string { return dir }}
+	p, err := ps.Open("default", pass)
+	if err != nil {
+		t.Fatalf("the viewer path could not unlock a CLI-set passphrase: %v", err)
+	}
+	_ = p.Close()
+	if _, err := ps.Open("default", strings.TrimSpace(pass)); err == nil {
+		t.Fatal("a trimmed value must not match: no surface trims")
+	}
+}
+
+// TestLocalStoreDirsArePrivate: the store creates its folders owner-only.
+func TestLocalStoreDirsArePrivate(t *testing.T) {
+	dir := t.TempDir()
+	if err := runLocalPassphraseSet(dir, localTestPassphrase, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range cobrowseprofile.NewStore(dir).PrivateDirs() {
+		info, err := os.Stat(d)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("%s missing: %v", d, err)
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("%s is not owner-only: %v", d, info.Mode().Perm())
+		}
+		if err := platform.EnsurePrivateDir(d); err != nil {
+			t.Fatalf("%s does not pass the private-dir check: %v", d, err)
+		}
 	}
 }

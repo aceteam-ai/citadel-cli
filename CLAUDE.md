@@ -159,8 +159,12 @@ under an id from `platform.NewCobrowseSessionID`. `localcobrowse.Service.unlock`
 starts it with `StartSessionWithID` once the human unlocks it in the viewer,
 or chooses a throwaway. The passphrase reaches only the viewer's unlock and
 setup routes and the store. `platform.closeBrowserGracefully` sends CDP
-`Browser.close` before killing a persistent session's browser, so cookies are
-flushed before `Persist` seals them. `TestRealBrowserPersistentProfileRoundTrip`
+`Browser.close` before killing a persistent session's browser, within one
+`gracefulCloseWait` budget, so cookies are flushed before `Persist` seals them.
+`localCobrowseRuntime.close` is idempotent and every caller waits for the first
+teardown, and both MCP entry points that host local co-browse install
+`handleLocalCobrowseSignals`, so a signal during the stdin-EOF close cannot exit
+mid-seal. Passphrases are used as typed on both surfaces (no trimming). `TestRealBrowserPersistentProfileRoundTrip`
 is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
 
 `localaudit.Log` owns the local co-browse audit chain under
@@ -822,8 +826,9 @@ same reason, keeping the existing file's owner (`keepOwner`) so a save by root
 does not lock the worker out; it refuses when the owning user cannot be kept
 and tolerates a group it cannot set. The payload `passcode` key never reaches a desktop handler, and
 `jobprivacy.Payload`/`Text` plus the `Job` JSON and fmt renderings in
-`internal/worker`, `internal/redis` and `internal/redisapi` drop it for every
-job type, so it is never written to a dead-letter entry or a log.
+`internal/worker`, `internal/redis` and `internal/redisapi` drop it, and the
+COBROWSE_SESSION profile `pin` (`jobprivacy.PINKey`), for every job type, so
+neither is ever written to a dead-letter entry or a log.
 `internal/worker/desktop_gate_test.go`, `cmd/passcode_state_test.go` and
 `internal/redis/passcode_privacy_test.go` pin this.
 

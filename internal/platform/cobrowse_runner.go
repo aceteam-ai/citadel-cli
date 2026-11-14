@@ -20,6 +20,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -172,10 +173,20 @@ func fetchCDPBrowserID(port int) (string, error) {
 // fetchCDPBrowserWS reads the browser-level WebSocket URL the loopback endpoint
 // on port reports (bounded client, no redirects).
 func fetchCDPBrowserWS(port int) (string, error) {
+	return fetchCDPBrowserWSContext(context.Background(), port)
+}
+
+// fetchCDPBrowserWSContext is fetchCDPBrowserWS bounded by ctx as well as the
+// client timeout.
+func fetchCDPBrowserWSContext(ctx context.Context, port int) (string, error) {
 	// The id is identity evidence: never follow a redirect to another origin.
 	client := *cdpHTTPClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json/version", port), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
