@@ -132,7 +132,10 @@ reference and fingerprint only, never typed text), and only the human methods
 `ApproveCommit` executes on approve (D5): under the session write lock it
 re-probes the target, requires the fingerprint to equal the approved one, then
 runs the action and shows the outcome; a changed page runs nothing. `fingerprint`
-binds the approval to the action. Every write is serialized per session (`wmu`)
+binds the approval to the action: the complete page, link and form URLs
+(query and fragment included, hashed privately, never shown) and a SHA-256 of the
+full form content computed in the page; content too large to hash is `Oversized`,
+a commit no approval can redeem. Every write is serialized per session (`wmu`)
 and re-probed before dispatch. `TestNoLocalMCPToolCanApprove`,
 `TestCommitAlwaysAsksDespiteGrantAndDenyBlocks` and
 `TestRealBrowserCommitActions` (windows-latest) pin it. It is a label and

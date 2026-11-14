@@ -57,6 +57,7 @@ var (
 	ErrCommitPending          = errors.New("commit_pending: the user is deciding on an earlier send, post, submit or payment in this session. Do not change the page; call local_cobrowse_wait with until=commit")
 	ErrCommitDenied           = errors.New("commit_denied: the user declined this action. Do not retry it; tell the user what you could not do and let them decide")
 	ErrNoPendingCommit        = errors.New("that request is no longer current; look at the viewer for the latest one")
+	ErrTargetTooLarge         = errors.New("target_too_large: the form or message is too large to verify, so it cannot be approved or sent through local co-browse; ask the user to do it themselves")
 	ErrUnknownPage            = errors.New("unknown_page: this page's address cannot be tied to a website, so AI actions are refused here and cannot be approved; ask the user to take control or navigate somewhere else")
 	ErrPageChanged            = errors.New("page_changed: the page changed while the action was being checked, so it was not sent; look at the page again and retry")
 	ErrTypeNewline            = errors.New("type_newline: typed text may not contain a line break, which can send a message or submit a form; type the text, then use local_cobrowse_key with Enter, which asks the user")
@@ -166,6 +167,9 @@ func Classify(kind, key string, t platform.TargetInfo) Decision {
 	switch kind {
 	case "scroll", "navigate":
 		return Decision{Class: ClassFill}
+	}
+	if t.Oversized {
+		return Decision{Class: ClassCommit, Reason: "the form or message is too large to check, so it cannot be approved here"}
 	}
 	if !t.Resolved {
 		why := "the target could not be identified"
@@ -307,11 +311,26 @@ type actionRef struct {
 	URL          string
 }
 
+// fullURL normalizes a URL for the private fingerprint: lower-case scheme and
+// host, everything else exactly as the page has it, including port, query and
+// fragment. A query can carry the item, recipient or account an action acts on.
+// It is only ever hashed; cards, the audit log and agent results use originPath.
+func fullURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	return u.String()
+}
+
 // fingerprint binds an approval to one action on one page state (D5). It
 // covers the request itself (kind, key, selector or rounded point), the page
-// (origin and path, never the query), the element (tag, role, type, label,
-// link and form targets) and a hash of the form or composer content, so the
-// text the user looked at cannot be swapped after approval. It does not
+// and the link and form targets (the complete URLs, query and fragment
+// included, hashed here and shown nowhere), the element (tag, role, type,
+// label) and a digest of the complete form or composer content computed in the
+// page, so nothing the user looked at can be swapped after approval. It does not
 // include the element's on-screen position: a selector click scrolls first,
 // which would make an unchanged action look different.
 func fingerprint(a actionRef, t platform.TargetInfo) string {
@@ -321,7 +340,6 @@ func fingerprint(a actionRef, t platform.TargetInfo) string {
 		}
 		return int(*p/8) * 8
 	}
-	content := sha256.Sum256([]byte(t.Content))
 	b, _ := json.Marshal(struct {
 		V       int
 		Kind    string
@@ -337,11 +355,12 @@ func fingerprint(a actionRef, t platform.TargetInfo) string {
 		FMethod string
 		FAction string
 		Content string
+		Over    bool
 		Value   string
 		Label   string
 		URL     string
-	}{1, a.Kind, a.Key, a.Selector, round(a.X), round(a.Y), originPath(t.PageURL), t.Tag, t.Role, t.InputType,
-		t.Name, originPath(t.Href), t.FormMethod, originPath(t.FormAction), hex.EncodeToString(content[:]), a.Value, a.Label, a.URL})
+	}{2, a.Kind, a.Key, a.Selector, round(a.X), round(a.Y), fullURL(t.PageURL), t.Tag, t.Role, t.InputType,
+		t.Name, fullURL(t.Href), t.FormMethod, fullURL(t.FormAction), t.ContentHash, t.Oversized, a.Value, a.Label, fullURL(a.URL)})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

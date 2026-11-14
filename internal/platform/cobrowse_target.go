@@ -26,10 +26,10 @@ type TargetRect struct {
 
 // TargetInfo describes what an action is about to act on. It is read inside
 // the page and decoded without interpretation; the local-mode commit
-// classifier (localcobrowse.Classify) decides what it means. Content holds the
-// text of the form or composer the action would send; it exists only so the
-// action fingerprint can bind to it. It never goes into a log, a result or an
-// approval card, and password and one-time-code fields are excluded.
+// classifier (localcobrowse.Classify) decides what it means. ContentHash binds
+// the text of the form or composer the action would send, so the action
+// fingerprint changes if any of it does; the text itself stays in the page and
+// password and one-time-code fields are excluded.
 type TargetInfo struct {
 	// Resolved is false when the target could not be identified (nothing at
 	// the point, a canvas, a nested frame). Callers must treat that as a
@@ -52,14 +52,54 @@ type TargetInfo struct {
 	FormAction    string     `json:"form_action,omitempty"`
 	FormHasSubmit bool       `json:"form_has_submit,omitempty"`
 	Rect          TargetRect `json:"rect"`
-	Content       string     `json:"content,omitempty"`
+	// ContentHash is the SHA-256 (hex) of the complete form and composer
+	// content, computed in the page; the content itself never leaves it.
+	ContentHash string `json:"content_hash,omitempty"`
+	// Oversized is set when the content is too large to hash in full. Such a
+	// target is a commit whose approval can never be redeemed.
+	Oversized bool `json:"oversized,omitempty"`
 }
 
-// maxTargetContent bounds Content so one probe stays small.
-const maxTargetContent = 16000
-
 const targetProbeScript = `(function(kind, selector, px, py){
-	var MAXC = 16000;
+	var MAXC = 4000000;
+	// SHA-256 over the UTF-8 bytes of a string, synchronous (SubtleCrypto is
+	// async and only on secure contexts). Constants are derived from primes.
+	function sha256hex(str){
+		var K = [], H = [], n = 2, i, j;
+		function frac(x){ return ((x - Math.floor(x)) * 4294967296) | 0; }
+		for (var c = 0; c < 64; n++) {
+			var prime = true; for (j = 2; j * j <= n; j++) if (n % j === 0) { prime = false; break; }
+			if (!prime) continue;
+			if (c < 8) H[c] = frac(Math.pow(n, 1 / 2));
+			K[c++] = frac(Math.pow(n, 1 / 3));
+		}
+		var data = new TextEncoder().encode(str), l = data.length;
+		var total = (((l + 9) + 63) >> 6) << 6, buf = new Uint8Array(total);
+		buf.set(data); buf[l] = 0x80;
+		var dv = new DataView(buf.buffer);
+		dv.setUint32(total - 8, Math.floor(l / 536870912)); dv.setUint32(total - 4, (l << 3) >>> 0);
+		var w = new Array(64);
+		function rr(x, k){ return (x >>> k) | (x << (32 - k)); }
+		for (var off = 0; off < total; off += 64) {
+			for (i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+			for (i = 16; i < 64; i++) {
+				var s0 = rr(w[i-15], 7) ^ rr(w[i-15], 18) ^ (w[i-15] >>> 3);
+				var s1 = rr(w[i-2], 17) ^ rr(w[i-2], 19) ^ (w[i-2] >>> 10);
+				w[i] = (w[i-16] + s0 + w[i-7] + s1) | 0;
+			}
+			var a = H[0], b = H[1], cc = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+			for (i = 0; i < 64; i++) {
+				var S1 = rr(e, 6) ^ rr(e, 11) ^ rr(e, 25), ch = (e & f) ^ (~e & g);
+				var t1 = (h + S1 + ch + K[i] + w[i]) | 0;
+				var S0 = rr(a, 2) ^ rr(a, 13) ^ rr(a, 22), mj = (a & b) ^ (a & cc) ^ (b & cc);
+				var t2 = (S0 + mj) | 0;
+				h = g; g = f; f = e; e = (d + t1) | 0; d = cc; cc = b; b = a; a = (t1 + t2) | 0;
+			}
+			H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + cc) | 0; H[3] = (H[3] + d) | 0;
+			H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+		}
+		return H.map(function(x){ return ("00000000" + (x >>> 0).toString(16)).slice(-8); }).join("");
+	}
 	function deepActive(){ var a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; return a; }
 	function deepPoint(x, y){ var e = document.elementFromPoint(x, y); while (e && e.shadowRoot) { var i = e.shadowRoot.elementFromPoint(x, y); if (!i || i === e) break; e = i; } return e; }
 	function txt(e){ return (e.innerText || e.textContent || "").replace(/\s+/g, " ").trim(); }
@@ -153,22 +193,26 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	} else if (tag === "select") { out.auto_submit = t.hasAttribute("onchange"); }
 	var r = t.getBoundingClientRect();
 	out.rect = {x: r.x, y: r.y, w: r.width, h: r.height, vw: window.innerWidth, vh: window.innerHeight};
-	var parts = [];
+	var parts = [], used = 0, tooBig = false;
 	function field(c){
+		if (tooBig) return;
 		var ty = (c.type || "").toLowerCase();
 		// Hidden fields carry recipients and amounts, so they are bound too.
 		if (/^(password|file|submit|button|reset|image)$/.test(ty)) return;
 		var ac = (c.getAttribute && c.getAttribute("autocomplete")) || "";
 		if (/one-time-code|password/i.test(ac)) return;
-		var v = c.isContentEditable ? txt(c) : (c.value !== undefined ? c.value : "");
+		var v = c.isContentEditable ? (c.innerText || c.textContent || "") : (c.value !== undefined ? c.value : "");
 		if (ty === "checkbox" || ty === "radio") v = (c.checked ? "on:" : "off:") + v;
-		parts.push((c.name || c.id || "") + "=" + v);
+		var piece = (c.name || c.id || "") + "=" + v;
+		used += piece.length + 1;
+		if (used > MAXC) { tooBig = true; return; }
+		parts.push(piece);
 	}
 	if (form) { for (var j = 0; j < form.elements.length; j++) field(form.elements[j]); }
 	var focus = deepActive();
 	if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT")) field(focus);
 	if (isEntry) field(t);
-	out.content = parts.join("\n").slice(0, MAXC);
+	if (tooBig) { out.oversized = true; } else { out.content_hash = sha256hex(parts.join("\n")); }
 	out.resolved = true;
 	return out;
 })`
@@ -204,9 +248,6 @@ func (m *CobrowseSessionManager) InspectTarget(id string, p TargetProbe) (Target
 	var info TargetInfo
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return TargetInfo{}, err
-	}
-	if len(info.Content) > maxTargetContent {
-		info.Content = info.Content[:maxTargetContent]
 	}
 	return info, nil
 }

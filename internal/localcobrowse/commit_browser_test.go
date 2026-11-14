@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -75,7 +76,7 @@ func TestRealBrowserCommitActions(t *testing.T) {
 
 	d, send := probe("click", "", "#send")
 	want("Send button", d, ClassCommit)
-	if send.Name != "Send" || !send.InForm || send.FormMethod != "post" || !strings.Contains(send.Content, "to=bob") || !strings.Contains(send.Content, "msg=hello SECRET-TA-TEXT") {
+	if send.Name != "Send" || !send.InForm || send.FormMethod != "post" || send.ContentHash == "" || send.Oversized {
 		t.Errorf("send target not read: %+v", send)
 	}
 	d, _ = probe("click", "", "#expand")
@@ -152,5 +153,93 @@ func TestRealBrowserCommitActions(t *testing.T) {
 	_, b := probe("click", "", "#send")
 	if fb := fingerprint(actionRef{Kind: "click", Selector: "#send"}, b); fa == fb {
 		t.Error("editing the composer must change the fingerprint")
+	}
+}
+
+// TestRealBrowserCommitActionsLongContent checks, in a real browser, that the
+// content digest covers everything: a hidden recipient or message suffix beyond
+// the old 16,000 character cut changes the digest, and a form too large to hash
+// is reported oversized.
+func TestRealBrowserCommitActionsLongContent(t *testing.T) {
+	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" && os.Getenv("CITADEL_REAL_BROWSER_TESTS") == "" {
+		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 (or CITADEL_REAL_BROWSER_TESTS=1) to run the real-browser content test")
+	}
+	var mu sync.Mutex
+	version, recipient, suffix := 1, "bob", "end-a"
+	body := strings.Repeat("x", 20000)
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		v, rc, sf := version, recipient, suffix
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		if r.URL.Path == "/huge" {
+			fmt.Fprintf(w, `<!doctype html><h1 id="t">huge</h1><form method="post" action="/send"><textarea name="msg">%s</textarea><button id="send" type="submit">Send</button></form>`, strings.Repeat("y", 5_000_000))
+			return
+		}
+		fmt.Fprintf(w, `<!doctype html><h1 id="t">v%d</h1><form method="post" action="/send"><input type="hidden" name="to" value="%s"><textarea name="msg">%s%s</textarea><button id="send" type="submit">Send</button></form>`, v, rc, body, sf)
+	}))
+	defer page.Close()
+
+	m := platform.NewCobrowseSessionManager(filepath.Join(t.TempDir(), "sessions"), 1)
+	m.SetLaunchOptions(platform.LaunchOptions{Quiet: true})
+	defer m.StopAll()
+	st, err := m.StartSession(page.URL + "/long")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitFor := func(text string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			res, err := m.ExtractBounded(st.ID, "#t", nil, 100)
+			if err == nil && res.Text == text {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("page never showed %q: %+v %v", text, res, err)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+	digest := func() platform.TargetInfo {
+		t.Helper()
+		ti, err := m.InspectTarget(st.ID, platform.TargetProbe{Kind: "click", Selector: "#send"})
+		if err != nil || !ti.Resolved {
+			t.Fatalf("inspect: %+v %v", ti, err)
+		}
+		return ti
+	}
+	waitFor("v1")
+	base := digest()
+	if base.ContentHash == "" || base.Oversized {
+		t.Fatalf("a 20,000 character form must be hashed in full: %+v", base)
+	}
+	reload := func(v int, rc, sf string) {
+		mu.Lock()
+		version, recipient, suffix = v, rc, sf
+		mu.Unlock()
+		if _, err := m.Navigate(st.ID, page.URL+"/long"); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(fmt.Sprintf("v%d", v))
+	}
+	reload(2, "mallory", "end-a") // only the hidden recipient, beyond the old cut, changes
+	if d := digest(); d.ContentHash == base.ContentHash {
+		t.Error("a changed hidden recipient beyond 16,000 characters must change the digest")
+	}
+	reload(3, "bob", "end-b") // only the message suffix changes
+	if d := digest(); d.ContentHash == base.ContentHash {
+		t.Error("a changed message suffix beyond 16,000 characters must change the digest")
+	}
+	reload(4, "bob", "end-a") // same content as the base again
+	if d := digest(); d.ContentHash != base.ContentHash {
+		t.Error("the digest must be stable for identical content")
+	}
+	if _, err := m.Navigate(st.ID, page.URL+"/huge"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("huge")
+	if d := digest(); !d.Oversized || d.ContentHash != "" {
+		t.Errorf("a form too large to hash must be oversized: %+v", d)
 	}
 }

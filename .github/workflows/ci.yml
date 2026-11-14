@@ -208,7 +208,7 @@ jobs:
       - name: Real browser local-mode commit actions
         env:
           CITADEL_REAL_BROWSER_TESTS: "1"
-        run: go test ./internal/localcobrowse/ -count=1 -v -run '^TestRealBrowserCommitActions$'
+        run: go test ./internal/localcobrowse/ -count=1 -v -run '^TestRealBrowserCommitActions'
 
   # Cross-compile smoke for every release target. Catches a target that builds
   # locally but breaks on a GOOS/GOARCH the host can't run, so a release tag can

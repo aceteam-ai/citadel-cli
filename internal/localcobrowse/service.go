@@ -478,7 +478,7 @@ func (s *Service) finish(ev Event, err error) {
 
 func isRefusal(err error) bool {
 	for _, e := range []error{ErrApprovalRequired, ErrApprovalDenied, ErrApprovalExpired, ErrApprovalRevoked,
-		ErrCommitApprovalRequired, ErrCommitPending, ErrCommitDenied, ErrNoPendingCommit, ErrUnknownPage, ErrPageChanged, ErrTypeNewline,
+		ErrCommitApprovalRequired, ErrCommitPending, ErrCommitDenied, ErrNoPendingCommit, ErrUnknownPage, ErrTargetTooLarge, ErrPageChanged, ErrTypeNewline,
 		ErrHumanDriving, ErrOnlyUserHandsBack, ErrRateLimited, ErrTooManySessions, ErrNavigationRefused, ErrProfileNotReady,
 		platform.ErrHandedOff, platform.ErrPasswordValue} {
 		if errors.Is(err, e) {
@@ -1620,6 +1620,13 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		if t, err = s.probe(id, a); err != nil {
 			t = platform.TargetInfo{Reason: "the page could not be inspected"}
 		}
+	}
+	if t.Oversized {
+		// Content that cannot be hashed in full cannot be bound, so no approval
+		// of it is ever redeemable.
+		resolve("failed", "the form or message is too large to verify, so it was not executed")
+		s.finish(hev, ErrTargetTooLarge)
+		return ErrTargetTooLarge
 	}
 	if fingerprint(a, t) != pc.fp {
 		resolve("changed", "the page changed, so it was not executed; the agent will ask again")
