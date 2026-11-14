@@ -662,6 +662,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		h.refusal = func() *jobs.ShellRefusal { return refusals.RefusalFor(jobType) }
 		result[i] = h
 	}
+	result = append(result, newContainerJobHandlers(opts.PermissionsDir, goos)...)
 	return append(result, refusals)
 }
 
