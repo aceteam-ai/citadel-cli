@@ -144,6 +144,7 @@ func TestVenvSetupTransformers5(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "bin"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "bin", "python"), nil, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "pyvenv.cfg"), nil, 0o644)
 	f := &fakeVenvExec{dir: dir, installed: "0.11.0", transformers: "5.23.0"}
 	_, err := (VenvSetup{Dir: dir, VLLMVersion: "0.11.0", Exec: f.run, CheckOnly: true}).Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "transformers 5.23.0") || !strings.Contains(err.Error(), "transformers<5") {
@@ -160,6 +161,60 @@ func TestVenvSetupTransformers5(t *testing.T) {
 	py := filepath.Join(dir, "bin", "python")
 	if !reflect.DeepEqual(f.calls[1], []string{py, "-m", "pip", "install", "vllm==0.11.0", "transformers<5"}) {
 		t.Fatalf("repair argv = %v", f.calls)
+	}
+}
+
+// A matching Python prefix is not proof that Citadel may install into it.
+// Both installer paths must refuse a foreign directory before any mutation.
+func TestVenvSetupRepairRefusesForeignPrefix(t *testing.T) {
+	for _, installer := range []string{"pip", "uv"} {
+		t.Run(installer, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(VenvPython(dir), nil, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			f := &fakeVenvExec{dir: dir, installed: "0.11.0", transformers: "5.23.0"}
+			look := noUV
+			if installer == "uv" {
+				look = func(string) (string, error) { return "/fake/uv", nil }
+			}
+			notified := false
+			v := VenvSetup{Dir: dir, VLLMVersion: "0.11.0", Exec: f.run, LookPath: look,
+				Notify: func(string) { notified = true }}
+			if _, err := v.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "not a virtualenv") {
+				t.Fatalf("foreign repair must be refused, got %v", err)
+			}
+			if len(f.calls) != 1 || !strings.Contains(strings.Join(f.calls[0], " "), "import vllm") {
+				t.Fatalf("only the read-only version probe may run: %v", f.calls)
+			}
+			if notified || f.transformers != "5.23.0" {
+				t.Fatal("foreign prefix was treated as an installation target")
+			}
+			if _, err := os.Stat(filepath.Join(dir, "pyvenv.cfg")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("foreign prefix was changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestVenvSetupCheckForeignPrefixNeverInstalls(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(VenvPython(dir), nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeVenvExec{dir: dir, installed: "0.11.0", transformers: "5.23.0"}
+	_, err := (VenvSetup{Dir: dir, Exec: f.run, CheckOnly: true}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "transformers 5.23.0") {
+		t.Fatalf("check must retain its version diagnosis: %v", err)
+	}
+	if len(f.calls) != 1 || f.transformers != "5.23.0" {
+		t.Fatalf("check mutated the foreign prefix: %v", f.calls)
 	}
 }
 

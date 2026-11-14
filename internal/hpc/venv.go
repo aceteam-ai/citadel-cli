@@ -190,6 +190,9 @@ func (v VenvSetup) Run(ctx context.Context) (string, error) {
 // repairCompanions installs the companion pins into a venv that already has
 // the right vLLM, resolving them together with that vLLM, then verifies it.
 func (v VenvSetup) repairCompanions(ctx context.Context) (string, error) {
+	if err := refuseForeignDir(v.Dir); err != nil {
+		return "", err
+	}
 	if v.Notify != nil {
 		v.Notify(fmt.Sprintf("installing %s into %s", strings.Join(companionPins(v.VLLMVersion), " "), v.Dir))
 	}
