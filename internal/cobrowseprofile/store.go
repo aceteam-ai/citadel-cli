@@ -86,6 +86,17 @@ func (s *Store) PrivateDirs() []string {
 	return []string{filepath.Join(s.dir, nodevault.DirName), filepath.Join(s.dir, profilesDirName)}
 }
 
+// Owns reports whether identity (a Handle.ProfileIdentity) names a profile of
+// this Store.
+func (s *Store) Owns(identity string) bool {
+	id := absPath(identity)
+	if filepath.Dir(id) != absPath(filepath.Join(s.dir, profilesDirName)) {
+		return false
+	}
+	base := filepath.Base(id)
+	return strings.HasSuffix(base, profileFileExt) && validateName(strings.TrimSuffix(base, profileFileExt)) == nil
+}
+
 // Profiles lists the saved profile names (those with a sealed blob).
 func (s *Store) Profiles() ([]string, error) { return s.namesWith(profileFileExt) }
 

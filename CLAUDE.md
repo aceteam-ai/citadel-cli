@@ -166,7 +166,7 @@ config file, so it is not a harness; the page offers the generic entry.
 `nodevault.Vault.UnlockAtRest` owns #820: every consumer that encrypts data
 at rest unlocks through it, and it refuses a secret below
 `nodevault.AtRestThresholdBits` (never below the 60-bit default, whatever
-`policy.yaml` says) before the KDF and without lockout accounting. The access
+`policy.yaml` says; a non-finite value is the floor, since NaN compares false) before the KDF and without lockout accounting. The access
 gate (`Unlock`, `VerifyPIN`) still accepts a short PIN.
 `cobrowseprofile.OpenHandle` uses it, so on an enrolled node a persistent
 profile needs the master PIN to be a passphrase. `cobrowseprofile` also holds
@@ -184,7 +184,12 @@ setup routes and the store. `platform.closeBrowserGracefully` sends CDP
 `localCobrowseRuntime.close` is idempotent and every caller waits for the first
 teardown, and both MCP entry points that host local co-browse install
 `handleLocalCobrowseSignals`, so a signal during the stdin-EOF close cannot exit
-mid-seal. Passphrases are used as typed on both surfaces (no trimming). `TestRealBrowserPersistentProfileRoundTrip`
+mid-seal. Passphrases are used as typed on both surfaces (no trimming). A persistent
+session's working dir carries a `.citadel-profile` marker (identity plus owner)
+written before any plaintext; `platform.CleanOrphanedProfileSessions` removes
+an interrupted session's decrypted copy whose owner is gone and reports any it
+cannot, and `citadel local passphrase forget` refuses unless that comes back
+clean. A persistent session's teardown returns a working-dir removal failure. `TestRealBrowserPersistentProfileRoundTrip`
 is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
 
 `localaudit.Log` owns the local co-browse audit chain under

@@ -1523,10 +1523,22 @@ func (s *Service) Close() error {
 	s.sessions = map[string]*session{}
 	s.notifyLocked()
 	s.mu.Unlock()
+	// Stop each session on its own so a failure (a saved profile that could
+	// not be sealed, or whose decrypted copy could not be removed) is audited
+	// against that session and returned, never dropped.
+	var errs []error
 	for _, id := range ids {
-		s.emit(Event{SessionID: id, Action: "stop", Class: "L", Outcome: "stopped_owner_exit"})
+		ev := Event{SessionID: id, Action: "stop", Class: "L", Outcome: "stopped_owner_exit"}
+		if err := s.cfg.Browser.Stop(id); err != nil {
+			ev.Outcome, ev.Error = "error", err.Error()
+			errs = append(errs, fmt.Errorf("session %s: %w", id, err))
+		}
+		s.emit(ev)
 	}
-	return s.cfg.Browser.StopAll()
+	if err := s.cfg.Browser.StopAll(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // WaitResult is local_cobrowse_wait's result.

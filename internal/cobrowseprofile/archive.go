@@ -45,6 +45,8 @@ var runtimeOnlyNames = map[string]bool{
 	"SingletonCookie":       true,
 	"DevToolsActivePort":    true,
 	".citadel-session-pids": true,
+	// The co-browse session's marker tying a working dir to its profile.
+	".citadel-profile": true,
 }
 
 // cacheDirNames are regenerable cache directories excluded from the archive to

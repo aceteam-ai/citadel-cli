@@ -352,3 +352,27 @@ func assertNoSecret(t *testing.T, events []Event, secret string) {
 		}
 	}
 }
+
+// A session that does not stop cleanly on owner exit (for example a saved
+// profile that could not be sealed) is audited as an error and returned.
+// Mutation check: a Close that drops Stop's error records stopped_owner_exit.
+func TestCloseReportsSessionStopFailure(t *testing.T) {
+	svc, fb, events := newProfileService(t, &fakeStore{passphrase: testPassphrase}, nil)
+	res, _ := svc.Start(ctx, "", "g", "default")
+	if err := svc.HumanUnlock(ctx, res.SessionID, testPassphrase); err != nil {
+		t.Fatal(err)
+	}
+	fb.stopErr = errors.New("seal failed")
+	if err := svc.Close(); err == nil || !strings.Contains(err.Error(), "seal failed") {
+		t.Fatalf("Close = %v, want the stop failure", err)
+	}
+	var found bool
+	for _, e := range *events {
+		if e.SessionID == res.SessionID && e.Action == "stop" && e.Outcome == "error" && strings.Contains(e.Error, "seal failed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the failed stop was not audited: %+v", *events)
+	}
+}

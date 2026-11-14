@@ -32,6 +32,7 @@ func TestArchiveExcludesCacheAndRuntimeKeepsData(t *testing.T) {
 	write("SingletonLock", "drop-singleton")
 	write("DevToolsActivePort", "drop-devtools")
 	write(".citadel-session-pids", "drop-pids")
+	write(".citadel-profile", "drop-marker")
 	// Chrome's cookie key on Windows lives in "Local State"; newer builds keep
 	// cookies under Default/Network.
 	write("Local State", "keep-local-state")
@@ -53,7 +54,7 @@ func TestArchiveExcludesCacheAndRuntimeKeepsData(t *testing.T) {
 			t.Errorf("durable file %q missing from archive: %v", rel, err)
 		}
 	}
-	mustNotExist := []string{"Default/Cache/blob", "Default/Code Cache/js/blob", "GPUCache/data", "SingletonLock", "DevToolsActivePort", ".citadel-session-pids"}
+	mustNotExist := []string{"Default/Cache/blob", "Default/Code Cache/js/blob", "GPUCache/data", "SingletonLock", "DevToolsActivePort", ".citadel-session-pids", ".citadel-profile"}
 	for _, rel := range mustNotExist {
 		if _, err := os.Stat(filepath.Join(dst, rel)); !os.IsNotExist(err) {
 			t.Errorf("ephemeral entry %q should have been excluded (err=%v)", rel, err)

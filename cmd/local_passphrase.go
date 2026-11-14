@@ -17,6 +17,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -25,6 +26,11 @@ var (
 	localPassAck    bool
 	localForgetSure bool
 )
+
+// localSessionsBaseDir is where local co-browse sessions keep their working
+// dirs (the same base the local runtime's session manager uses). A var so
+// tests can point it at a temp dir.
+var localSessionsBaseDir = platform.DefaultCobrowseSessionsBaseDir
 
 const localPassphraseDisclosure = `Saved logins are encrypted on this computer with a passphrase that only you
 know. Choose four or more random words; a short PIN is refused because it
@@ -318,7 +324,15 @@ func runLocalPassphraseForget(dir string, out io.Writer) error {
 		return err
 	}
 	defer owner.Release()
-	if err := cobrowseprofile.NewStore(dir).Forget(); err != nil {
+	store := cobrowseprofile.NewStore(dir)
+	// A session that was interrupted (crash, kill) can leave a decrypted copy
+	// of a saved profile in the co-browse session folder. Remove those first;
+	// if any cannot be removed, say so and delete nothing, rather than report
+	// that every saved login is gone.
+	if err := platform.CleanOrphanedProfileSessions(localSessionsBaseDir(), store.Owns); err != nil {
+		return fmt.Errorf("nothing was deleted: %w. Close any program using these folders (or remove them yourself), then run `citadel local passphrase forget` again", err)
+	}
+	if err := store.Forget(); err != nil {
 		return friendlyProfileError(err)
 	}
 	fmt.Fprintln(out, "Deleted every saved login and the passphrase. The next profile session asks for a new passphrase.")

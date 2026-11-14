@@ -214,7 +214,9 @@ time is kept.
 
 If you forget the passphrase, the saved logins cannot be recovered by anyone,
 including AceTeam. `& $citadel local passphrase forget` deletes them so you
-can start again. Other commands:
+can start again. It also removes a decrypted copy left behind by a session
+that was cut off (for example when the agent app was killed). If such a copy
+is still in use or cannot be removed, it deletes nothing and names the folder. Other commands:
 
 ```powershell
 & $citadel local passphrase status         # set or not, saved profiles, lockout

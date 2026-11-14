@@ -3,6 +3,7 @@ package nodevault
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 )
 
@@ -26,11 +27,14 @@ var ErrWeakSecret = errors.New("nodevault: this secret is too short to protect d
 
 // AtRestThresholdBits is the minimum estimated entropy for an at-rest secret:
 // the policy's E2E threshold, but never below DefaultE2EThresholdBits, so a
-// policy file cannot lower the bar for data at rest.
+// policy file cannot lower the bar for data at rest. Anything that is not a
+// finite number at or above the floor (including NaN and +Inf, which compare
+// false against everything) is the floor: a comparison that silently fails
+// must never disable the check.
 func AtRestThresholdBits(p Policy) float64 {
-	t := p.normalized().E2EThresholdBits
-	if t < DefaultE2EThresholdBits {
-		t = DefaultE2EThresholdBits
+	t := p.E2EThresholdBits
+	if !(t >= DefaultE2EThresholdBits) || math.IsInf(t, 0) {
+		return DefaultE2EThresholdBits
 	}
 	return t
 }

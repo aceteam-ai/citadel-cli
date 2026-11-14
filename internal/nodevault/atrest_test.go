@@ -2,6 +2,9 @@ package nodevault
 
 import (
 	"errors"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -170,5 +173,105 @@ func TestSetPassphraseBelowMinLengthIsWeak(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "master PIN") {
 		t.Fatalf("the at-rest message must not talk about a master PIN: %v", err)
+	}
+}
+
+// TestNonFinitePolicyCannotBypassAtRestFloor: NaN and infinities compare false
+// against everything, so a threshold of that kind, whether persisted in
+// policy.yaml or passed in directly, must fall back to the 60-bit floor at all
+// three at-rest boundaries: weak setup, strong-to-weak rotation, and at-rest
+// unlock of a vault whose secret is a short access PIN. The access gate itself
+// keeps accepting the short PIN. Mutation check: the previous `t < 60` clamp
+// lets NaN through and every subtest fails.
+func TestNonFinitePolicyCannotBypassAtRestFloor(t *testing.T) {
+	persisted := func(raw string) func(t *testing.T, base string) Policy {
+		return func(t *testing.T, base string) Policy {
+			t.Helper()
+			dir := filepath.Join(base, vaultDirName)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			yml := "min_length: 6\nallow_passphrase: true\ne2e_threshold_bits: " + raw + "\n"
+			if err := os.WriteFile(filepath.Join(dir, policyFileName), []byte(yml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return LoadPolicy(base)
+		}
+	}
+	direct := func(v float64) func(t *testing.T, base string) Policy {
+		return func(*testing.T, string) Policy {
+			p := DefaultPolicy()
+			p.E2EThresholdBits = v
+			return p
+		}
+	}
+	cases := map[string]func(t *testing.T, base string) Policy{
+		"persisted NaN":  persisted(".nan"),
+		"persisted +Inf": persisted(".inf"),
+		"persisted -Inf": persisted("-.inf"),
+		"direct NaN":     direct(math.NaN()),
+		"direct +Inf":    direct(math.Inf(1)),
+		"direct -Inf":    direct(math.Inf(-1)),
+	}
+	for name, policyFor := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := AtRestThresholdBits(policyFor(t, t.TempDir())); got != DefaultE2EThresholdBits {
+				t.Fatalf("AtRestThresholdBits = %v, want %v", got, DefaultE2EThresholdBits)
+			}
+
+			// Weak setup.
+			base := t.TempDir()
+			v := Open(base)
+			v.paramsOverride = &fastParams
+			pol := policyFor(t, base)
+			if err := v.SetPassphrase("654321", pol, true); !errors.Is(err, ErrWeakSecret) {
+				t.Fatalf("weak setup: want ErrWeakSecret, got %v", err)
+			}
+
+			// Strong-to-weak rotation.
+			base = t.TempDir()
+			v = Open(base)
+			v.paramsOverride = &fastParams
+			if err := v.SetPassphrase(strongPassphrase, DefaultPolicy(), true); err != nil {
+				t.Fatal(err)
+			}
+			pol = policyFor(t, base)
+			if err := v.ChangePassphrase(strongPassphrase, "654321", pol, true); !errors.Is(err, ErrWeakSecret) {
+				t.Fatalf("strong-to-weak rotation: want ErrWeakSecret, got %v", err)
+			}
+			if _, err := v.UnlockAtRest(strongPassphrase, pol); err != nil {
+				t.Fatalf("the strong passphrase must still unlock: %v", err)
+			}
+
+			// At-rest unlock of an access-PIN vault; the access gate is unchanged.
+			base = t.TempDir()
+			v = Open(base)
+			v.paramsOverride = &fastParams
+			pol = policyFor(t, base)
+			if err := v.SetPIN("654321", pol, true); err != nil {
+				t.Fatalf("access-PIN setup must still work: %v", err)
+			}
+			if _, err := v.UnlockAtRest("654321", pol); !errors.Is(err, ErrWeakSecret) {
+				t.Fatalf("at-rest unlock with a short PIN: want ErrWeakSecret, got %v", err)
+			}
+			if err := v.VerifyPIN("654321"); err != nil {
+				t.Fatalf("VerifyPIN with the access PIN must still work: %v", err)
+			}
+			sess, err := v.Unlock("654321")
+			if err != nil {
+				t.Fatalf("Unlock with the access PIN must still work: %v", err)
+			}
+			sess.Lock()
+		})
+	}
+}
+
+func TestSavePolicyRejectsNonFiniteThreshold(t *testing.T) {
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		p := DefaultPolicy()
+		p.E2EThresholdBits = v
+		if err := SavePolicy(t.TempDir(), p); err == nil {
+			t.Fatalf("SavePolicy accepted e2e_threshold_bits=%v", v)
+		}
 	}
 }

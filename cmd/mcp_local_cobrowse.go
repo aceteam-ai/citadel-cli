@@ -360,7 +360,12 @@ func (rt *localCobrowseRuntime) close() {
 
 func (rt *localCobrowseRuntime) teardown() {
 	close(rt.stop)
-	_ = rt.svc.Close()
+	if err := rt.svc.Close(); err != nil {
+		// stdout is the MCP transport; the warning goes to stderr. A saved
+		// profile that could not be sealed or whose decrypted copy could not
+		// be removed must not fail silently.
+		fmt.Fprintf(os.Stderr, "Citadel local co-browse: a browser session did not shut down cleanly: %v\n", err)
+	}
 	rt.mu.Lock()
 	o, g, v := rt.owner, rt.guard, rt.viewer
 	rt.owner, rt.guard, rt.viewer = nil, nil, nil

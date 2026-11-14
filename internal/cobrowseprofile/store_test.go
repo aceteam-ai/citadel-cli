@@ -3,6 +3,7 @@ package cobrowseprofile
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
@@ -80,5 +81,24 @@ func TestForgetRefusesWhileFirstUseProfileOpen(t *testing.T) {
 	_ = h.Close()
 	if err := s.Forget(); err != nil {
 		t.Fatalf("Forget after close: %v", err)
+	}
+}
+
+func TestStoreOwnsOnlyItsProfiles(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	h := &Handle{storePath: storePath(dir, "default")}
+	if !s.Owns(h.ProfileIdentity()) {
+		t.Fatal("a handle's identity must belong to its store")
+	}
+	for _, id := range []string{
+		storePath(t.TempDir(), "default"),
+		filepath.Join(dir, "cobrowse-profiles", "default.enc.lock"),
+		filepath.Join(dir, "cobrowse-profiles", "Bad Name.enc"),
+		filepath.Join(dir, "default.enc"),
+	} {
+		if s.Owns(id) {
+			t.Fatalf("Owns(%q) = true", id)
+		}
 	}
 }

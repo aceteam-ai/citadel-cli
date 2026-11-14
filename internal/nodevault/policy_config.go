@@ -3,6 +3,7 @@ package nodevault
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -32,6 +33,9 @@ func LoadPolicy(baseDir string) Policy {
 func SavePolicy(baseDir string, p Policy) error {
 	if p.MinLength < 1 {
 		return errors.New("nodevault: policy MinLength must be at least 1")
+	}
+	if math.IsNaN(p.E2EThresholdBits) || math.IsInf(p.E2EThresholdBits, 0) {
+		return errors.New("nodevault: policy e2e_threshold_bits must be a finite number")
 	}
 	dir := filepath.Join(baseDir, vaultDirName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {

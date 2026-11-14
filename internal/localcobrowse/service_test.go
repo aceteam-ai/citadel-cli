@@ -28,8 +28,9 @@ type fakeBrowser struct {
 	navigateLandsOn string
 	pageTitle       string
 	notReady        bool
-	// startErr fails StartSessionWithID.
+	// startErr fails StartSessionWithID; stopErr fails Stop.
 	startErr error
+	stopErr  error
 	// target, when set, is what InspectTarget reports (default: a plain
 	// element on the current page).
 	target *platform.TargetInfo
@@ -120,7 +121,7 @@ func (f *fakeBrowser) Stop(id string) error {
 	defer f.mu.Unlock()
 	delete(f.sessions, id)
 	f.record("stop " + id)
-	return nil
+	return f.stopErr
 }
 func (f *fakeBrowser) StopAll() error {
 	f.mu.Lock()

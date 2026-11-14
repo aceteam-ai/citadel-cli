@@ -429,6 +429,11 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	enc := s.encProfile
 	s.mu.Unlock()
 	if enc != nil {
+		// Mark the dir before any plaintext lands in it, so an interrupted
+		// session can be traced to its profile and cleaned up.
+		if err := writeProfileMarker(s.profile, enc); err != nil {
+			return nil, fmt.Errorf("mark encrypted profile working dir: %w", err)
+		}
 		if err := enc.Materialize(s.profile); err != nil {
 			return nil, fmt.Errorf("materialize encrypted profile: %w", err)
 		}
@@ -589,7 +594,11 @@ func (s *cobrowseSession) teardown() error {
 	// cookies (and no throwaway state) behind. The pidfile lives under it and goes
 	// too. For a persistent profile the durable state now lives only as ciphertext.
 	if profile != "" {
-		removeSessionDir(profile)
+		if rerr := removeSessionDir(profile); rerr != nil && enc != nil && err == nil {
+			// A persistent session's working dir holds decrypted cookies; a
+			// failure to remove it must be visible, never silent.
+			err = fmt.Errorf("the decrypted working copy of a saved profile could not be removed from %s: %w", profile, rerr)
+		}
 	}
 	return err
 }

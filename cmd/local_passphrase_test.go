@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -263,5 +264,94 @@ func TestLocalStoreDirsArePrivate(t *testing.T) {
 		if err := platform.EnsurePrivateDir(d); err != nil {
 			t.Fatalf("%s does not pass the private-dir check: %v", d, err)
 		}
+	}
+}
+
+// plantSessionDir writes a synthetic co-browse session working dir holding a
+// decrypted cookie, marked as belonging to identity and owner.
+func plantSessionDir(t *testing.T, base, name, identity string, owner int) string {
+	t.Helper()
+	dir := filepath.Join(base, name)
+	if err := os.MkdirAll(filepath.Join(dir, "Default"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Default", "Cookies"), []byte("synthetic-plaintext-cookie"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := fmt.Sprintf(`{"identity":%q,"owner_pid":%d}`, identity, owner)
+	if err := os.WriteFile(filepath.Join(dir, ".citadel-profile"), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func forgetFixture(t *testing.T) (dir, base string, s *cobrowseprofile.Store) {
+	t.Helper()
+	dir, base = t.TempDir(), filepath.Join(t.TempDir(), "sessions")
+	if err := platform.EnsurePrivateDir(base); err != nil {
+		t.Fatal(err)
+	}
+	prev := localSessionsBaseDir
+	localSessionsBaseDir = func() string { return base }
+	t.Cleanup(func() { localSessionsBaseDir = prev })
+	if err := runLocalPassphraseSet(dir, localTestPassphrase, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	s = cobrowseprofile.NewStore(dir)
+	h, err := s.Open("default", localTestPassphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Persist(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	_ = h.Close()
+	return dir, base, s
+}
+
+// TestForgetRemovesInterruptedSessionPlaintext: a session that was killed left
+// a decrypted copy of a saved profile; forget removes it before reporting that
+// every saved login was deleted. Mutation check: a forget that skips the
+// session folder leaves the cookie file and still prints success.
+func TestForgetRemovesInterruptedSessionPlaintext(t *testing.T) {
+	dir, base, s := forgetFixture(t)
+	identity := filepath.Join(dir, "cobrowse-profiles", "default.enc")
+	orphan := plantSessionDir(t, base, "cb-0000000000000011", identity, 2147483000)
+	other := plantSessionDir(t, base, "cb-0000000000000012", filepath.Join(t.TempDir(), "cobrowse-profiles", "default.enc"), 2147483000)
+	var out bytes.Buffer
+	if err := runLocalPassphraseForget(dir, &out); err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("decrypted profile left on disk after forget: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("another store's session dir must not be touched: %v", err)
+	}
+	if st, _ := s.State(); st.Configured || !strings.Contains(out.String(), "Deleted every saved login") {
+		t.Fatalf("forget did not finish: %+v %q", st, out.String())
+	}
+}
+
+// TestForgetRefusesWhilePlaintextRemains: a decrypted copy that cannot be
+// removed (here: its owner process is still running) makes forget refuse,
+// name the folder, and delete nothing.
+func TestForgetRefusesWhilePlaintextRemains(t *testing.T) {
+	dir, base, s := forgetFixture(t)
+	identity := filepath.Join(dir, "cobrowse-profiles", "default.enc")
+	live := plantSessionDir(t, base, "cb-0000000000000013", identity, os.Getpid())
+	var out bytes.Buffer
+	err := runLocalPassphraseForget(dir, &out)
+	if err == nil || !strings.Contains(err.Error(), live) || !strings.Contains(err.Error(), "nothing was deleted") {
+		t.Fatalf("forget = %v, want a refusal naming %s", err, live)
+	}
+	if strings.Contains(out.String(), "Deleted every saved login") {
+		t.Fatal("forget claimed success while plaintext remains")
+	}
+	if st, _ := s.State(); !st.Configured {
+		t.Fatal("forget deleted the vault although it refused")
+	}
+	if names, _ := s.Profiles(); len(names) != 1 {
+		t.Fatalf("forget deleted saved profiles although it refused: %v", names)
 	}
 }
