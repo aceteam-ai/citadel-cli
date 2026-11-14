@@ -279,3 +279,92 @@ func TestRealBrowserCommitActionsLongContent(t *testing.T) {
 		t.Errorf("a form too large to hash must be oversized: %+v", d)
 	}
 }
+
+// TestRealBrowserCommitActionsFormSnapshot runs the actual inspector in a real
+// browser over forms that differ only in state a submission carries: a later
+// selected option of a select-multiple, the submitter's formaction, a control
+// outside the form element joined by form=, a disabled control, and a file
+// input (which cannot be verified).
+func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
+	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" && os.Getenv("CITADEL_REAL_BROWSER_TESTS") == "" {
+		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 (or CITADEL_REAL_BROWSER_TESTS=1) to run the real-browser snapshot test")
+	}
+	variants := map[string]string{
+		"sel1":  `<select name="to" multiple><option value="alice" selected>a</option><option value="bob" selected>b</option><option value="mallory">m</option></select>`,
+		"sel2":  `<select name="to" multiple><option value="alice" selected>a</option><option value="bob">b</option><option value="mallory" selected>m</option></select>`,
+		"out1":  `<input type="text" name="m" value="hi">`,
+		"out2":  `<input type="text" name="m" value="hi"><input form="f" type="hidden" name="to" value="mallory">`,
+		"dis1":  `<input type="hidden" name="to" value="bob">`,
+		"dis2":  `<input type="hidden" name="to" value="bob" disabled>`,
+		"file1": `<input type="text" name="m" value="hi">`,
+		"file2": `<input type="text" name="m" value="hi"><input type="file" name="att">`,
+		"fa1":   `<input type="text" name="m" value="hi">`,
+		"fa2":   `<input type="text" name="m" value="hi">`,
+	}
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v := r.URL.Query().Get("v")
+		btn := `<button id="send" type="submit">Send</button>`
+		if v == "fa2" {
+			btn = `<button id="send" type="submit" formaction="/exfil" formmethod="get" formtarget="_blank">Send</button>`
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<!doctype html><h1 id="t">%s</h1><form id="f" method="post" action="/send">%s%s</form>`, v, variants[v], btn)
+	}))
+	defer page.Close()
+
+	m := platform.NewCobrowseSessionManager(filepath.Join(t.TempDir(), "sessions"), 1)
+	m.SetLaunchOptions(platform.LaunchOptions{Quiet: true})
+	defer m.StopAll()
+	st, err := m.StartSession(page.URL + "/?v=sel1")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	inspect := func(v string) platform.TargetInfo {
+		t.Helper()
+		if _, err := m.Navigate(st.ID, page.URL+"/?v="+v); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			res, err := m.ExtractBounded(st.ID, "#t", nil, 100)
+			if err == nil && res.Text == v {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("page never showed %q", v)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		ti, err := m.InspectTarget(st.ID, platform.TargetProbe{Kind: "click", Selector: "#send"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ti
+	}
+	fp := func(ti platform.TargetInfo) string {
+		ti.PageURL = "" // the variant name is in the query; compare the snapshot only
+		return fingerprint(actionRef{Kind: "click", Selector: "#send"}, ti)
+	}
+	if a, b := fp(inspect("sel1")), fp(inspect("sel2")); a == b {
+		t.Error("a later selected option of a select-multiple must change the binding")
+	}
+	if a, b := fp(inspect("out1")), fp(inspect("out2")); a == b {
+		t.Error("a control outside the form element joined by form= must change the binding")
+	}
+	if a, b := fp(inspect("dis1")), fp(inspect("dis2")); a == b {
+		t.Error("disabling a control must change the binding")
+	}
+	if ti := inspect("file1"); !ti.Resolved || ti.ContentHash == "" {
+		t.Errorf("a form without a file input is verifiable: %+v", ti)
+	}
+	if ti := inspect("file2"); ti.Resolved {
+		t.Errorf("a form with a file input must be unverifiable: %+v", ti)
+	}
+	fa1, fa2 := inspect("fa1"), inspect("fa2")
+	if fa1.FormAction == fa2.FormAction || fa1.FormMethod == fa2.FormMethod || fa1.FormTarget == fa2.FormTarget {
+		t.Errorf("a submitter override must change the effective submission: %+v vs %+v", fa1, fa2)
+	}
+	if fp(fa1) == fp(fa2) {
+		t.Error("a submitter override must change the binding")
+	}
+}

@@ -39,7 +39,9 @@ func TestViewerPageInRealBrowser(t *testing.T) {
 
 	waitText := func(sel, want string) {
 		t.Helper()
-		deadline := time.Now().Add(20 * time.Second)
+		// 60s: a cold Edge on the Windows runner took over 20s to paint the
+		// viewer once (a timing flake, not a viewer defect).
+		deadline := time.Now().Add(60 * time.Second)
 		var last string
 		for time.Now().Before(deadline) {
 			if res, err := m.ExtractBounded(page.ID, sel, nil, 500); err == nil {

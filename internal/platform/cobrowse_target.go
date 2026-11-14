@@ -34,22 +34,26 @@ type TargetInfo struct {
 	// Resolved is false when the target could not be identified (nothing at
 	// the point, a canvas, a nested frame). Callers must treat that as a
 	// commit: an unknown target is never assumed harmless.
-	Resolved      bool       `json:"resolved"`
-	Reason        string     `json:"reason,omitempty"`
-	PageURL       string     `json:"page_url,omitempty"`
-	Tag           string     `json:"tag,omitempty"`
-	Role          string     `json:"role,omitempty"`
-	InputType     string     `json:"input_type,omitempty"`
-	Name          string     `json:"name,omitempty"`
-	Href          string     `json:"href,omitempty"`
-	Actionable    bool       `json:"actionable,omitempty"`
-	Entry         bool       `json:"entry,omitempty"`
-	Composer      bool       `json:"composer,omitempty"`
-	Search        bool       `json:"search,omitempty"`
-	AutoSubmit    bool       `json:"auto_submit,omitempty"`
-	InForm        bool       `json:"in_form,omitempty"`
-	FormMethod    string     `json:"form_method,omitempty"`
-	FormAction    string     `json:"form_action,omitempty"`
+	Resolved   bool   `json:"resolved"`
+	Reason     string `json:"reason,omitempty"`
+	PageURL    string `json:"page_url,omitempty"`
+	Tag        string `json:"tag,omitempty"`
+	Role       string `json:"role,omitempty"`
+	InputType  string `json:"input_type,omitempty"`
+	Name       string `json:"name,omitempty"`
+	Href       string `json:"href,omitempty"`
+	Actionable bool   `json:"actionable,omitempty"`
+	Entry      bool   `json:"entry,omitempty"`
+	Composer   bool   `json:"composer,omitempty"`
+	Search     bool   `json:"search,omitempty"`
+	AutoSubmit bool   `json:"auto_submit,omitempty"`
+	InForm     bool   `json:"in_form,omitempty"`
+	FormMethod string `json:"form_method,omitempty"`
+	FormAction string `json:"form_action,omitempty"`
+	// FormEnctype and FormTarget are the effective submission encoding and
+	// target, after any submitter override (formenctype, formtarget).
+	FormEnctype   string     `json:"form_enctype,omitempty"`
+	FormTarget    string     `json:"form_target,omitempty"`
 	FormHasSubmit bool       `json:"form_has_submit,omitempty"`
 	Rect          TargetRect `json:"rect"`
 	// ContentHash is the SHA-256 (hex) of the complete form and composer
@@ -108,9 +112,73 @@ const FormDigestScript = `
 	function formDigest(tuples){ return sha256hex(JSON.stringify(tuples)); }
 `
 
+// FormSnapshotScript builds the ordered snapshot of everything a browser would
+// submit for an action, shared with the tests that run it under Node against a
+// fake DOM. env supplies the DOM reads (prototype-level, so a control named
+// "elements" or "getAttribute" cannot shadow them). It reads form.elements, so
+// controls associated through the form= attribute count; disabled controls are
+// left out as a submission would; a select contributes the complete ordered
+// list of its selected values; checkbox and radio state is kept; password and
+// one-time-code fields are excluded. State it cannot capture (a file input, or a
+// form control or composer whose value cannot be read) sets bad: the target is
+// then unverifiable and no approval of it is redeemable.
+const FormSnapshotScript = `
+	function buildSnapshot(env, form, t, focus, tIsEntry){
+		var tuples = [], bad = "";
+		function add(c, mustRead){
+			var tag = String(c.tagName || "").toLowerCase();
+			if (/^(fieldset|output|object)$/.test(tag)) return;
+			if (env.disabled(c)) return;
+			var ty = String(c.type || "").toLowerCase();
+			if (ty === "file") { bad = "the form has a file input"; return; }
+			if (/^(password|submit|button|reset|image)$/.test(ty)) return;
+			var ac = String(env.attr(c, "autocomplete") || "");
+			if (/one-time-code|password/i.test(ac)) return;
+			var v;
+			if (tag === "select") v = Array.prototype.map.call(c.selectedOptions || [], function(o){ return o.value; });
+			else if (c.isContentEditable) v = env.text(c);
+			else if (typeof c.value === "string") v = c.value;
+			else { if (mustRead || tag.indexOf("-") > 0) bad = "a form control's value cannot be read"; return; }
+			tuples.push([c.name || "", c.id || "", ty || tag, v, !!c.checked]);
+		}
+		if (form) { var els = env.elements(form); for (var i = 0; i < els.length; i++) add(els[i], false); }
+		if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT")) add(focus, false);
+		if (t && (tIsEntry || String(t.tagName || "").toLowerCase() === "select")) add(t, true);
+		return {tuples: tuples, bad: bad};
+	}
+	// inspectForm returns what an action would submit: the complete field
+	// snapshot digest and the effective submission (action, method, enctype,
+	// target) after any override by the submitter, which is the clicked submit
+	// button or, for Enter in a field, the form's default (first enabled submit)
+	// button. The submitter's own name, id, type and value are folded into the
+	// digest. bad or oversized means the target cannot be verified in full.
+	function inspectForm(env, form, t, focus, tIsEntry, maxc){
+		var r = {bad: "", oversized: false, digest: "", action: "", method: "", enctype: "", target: ""};
+		var snap = buildSnapshot(env, form, t, focus, tIsEntry);
+		var sub = null;
+		if (form) {
+			var els = env.elements(form);
+			var isSub = function(c){ var y = String(c.type || "").toLowerCase(); return (String(c.tagName).toUpperCase() === "BUTTON" || String(c.tagName).toUpperCase() === "INPUT") && (y === "submit" || y === "image"); };
+			if (t && isSub(t)) sub = t;
+			if (!sub) { for (var q = 0; q < els.length; q++) { if (isSub(els[q]) && !env.disabled(els[q])) { sub = els[q]; break; } } }
+			var ov = function(a, f){ return (sub && env.attr(sub, a)) || env.attr(form, f) || ""; };
+			r.action = env.abs((sub && env.attr(sub, "formaction")) || env.attr(form, "action") || env.base());
+			r.method = String(ov("formmethod", "method") || "get").toLowerCase();
+			r.enctype = String(ov("formenctype", "enctype")).toLowerCase();
+			r.target = String(ov("formtarget", "target")).toLowerCase();
+		}
+		if (snap.bad) { r.bad = snap.bad; return r; }
+		if (JSON.stringify(snap.tuples).length > maxc) { r.oversized = true; return r; }
+		var d = formDigest(snap.tuples);
+		if (sub) d = formDigest([d, [sub.name || "", sub.id || "", String(sub.type || "").toLowerCase(), sub.value === undefined ? "" : String(sub.value)]]);
+		r.digest = d;
+		return r;
+	}
+`
+
 const targetProbeScript = `(function(kind, selector, px, py){
 	var MAXC = 4000000;
-` + FormDigestScript + `
+` + FormDigestScript + FormSnapshotScript + `
 	function deepActive(){ var a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; return a; }
 	function deepPoint(x, y){ var e = document.elementFromPoint(x, y); while (e && e.shadowRoot) { var i = e.shadowRoot.elementFromPoint(x, y); if (!i || i === e) break; e = i; } return e; }
 	function txt(e){ return (e.innerText || e.textContent || "").replace(/\s+/g, " ").trim(); }
@@ -187,42 +255,37 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	out.entry = isEntry;
 	out.composer = tag === "textarea" || !!t.isContentEditable || role === "textbox";
 	if (tag === "a" && t.href) out.href = abs(t.getAttribute("href") || t.href);
+	var HF = HTMLFormElement.prototype, EP = Element.prototype;
+	var env = {
+		attr: function(e, n){ try { return EP.getAttribute.call(e, n); } catch (x) { return null; } },
+		elements: function(f){ try { return Array.prototype.slice.call(Object.getOwnPropertyDescriptor(HF, "elements").get.call(f)); } catch (x) { return []; } },
+		disabled: function(e){ try { return EP.matches.call(e, ":disabled"); } catch (x) { return !!e.disabled; } },
+		text: function(e){ return e.innerText || e.textContent || ""; },
+		abs: abs,
+		base: function(){ return location.href; }
+	};
+	var fi = inspectForm(env, t.form || (t.closest ? t.closest("form") : null), t, deepActive(), (function(){
+		var ty0 = (t.type || t.getAttribute("type") || "").toLowerCase(), r0 = (t.getAttribute("role") || "").toLowerCase();
+		return t.tagName.toLowerCase() === "textarea" || t.isContentEditable || r0 === "textbox" || r0 === "searchbox" || r0 === "combobox" ||
+			(t.tagName.toLowerCase() === "input" && !/^(checkbox|radio|button|submit|reset|image|file|hidden|range|color)$/.test(ty0));
+	})(), MAXC);
 	var form = t.form || (t.closest ? t.closest("form") : null);
 	var attrSearch = /\bsearch\b/i.test((t.getAttribute("aria-label") || "") + " " + (t.id || "") + " " + (t.getAttribute("name") || ""));
 	out.search = type === "search" || role === "searchbox" || attrSearch || !!(t.closest && t.closest("[role=search]"));
 	if (form) {
 		out.in_form = true;
-		var fa = t.getAttribute && t.getAttribute("formaction");
-		var fm = t.getAttribute && t.getAttribute("formmethod");
-		out.form_action = abs(fa || (form.getAttribute("action") || location.href));
-		out.form_method = String(fm || form.getAttribute("method") || "get").toLowerCase();
-		out.form_has_submit = !!form.querySelector("button:not([type]),button[type=submit],input[type=submit],input[type=image]");
-		if (form.getAttribute("role") === "search") out.search = true;
+		var formEls = env.elements(form);
+		out.form_action = fi.action; out.form_method = fi.method; out.form_enctype = fi.enctype; out.form_target = fi.target;
+		out.form_has_submit = !!EP.querySelector.call(form, "button:not([type]),button[type=submit],input[type=submit],input[type=image]");
+		if (env.attr(form, "role") === "search") out.search = true;
 		var controls = 0;
-		for (var i = 0; i < form.elements.length; i++) { var c = form.elements[i]; if ((c.type || "") !== "hidden") controls++; }
+		for (var i = 0; i < formEls.length; i++) { if ((formEls[i].type || "") !== "hidden") controls++; }
 		if (tag === "select") out.auto_submit = t.hasAttribute("onchange") || (controls === 1 && !out.form_has_submit);
 	} else if (tag === "select") { out.auto_submit = t.hasAttribute("onchange"); }
 	var r = t.getBoundingClientRect();
 	out.rect = {x: r.x, y: r.y, w: r.width, h: r.height, vw: window.innerWidth, vh: window.innerHeight};
-	var tuples = [], used = 0, tooBig = false;
-	function field(c){
-		if (tooBig) return;
-		var ty = (c.type || "").toLowerCase();
-		// Hidden fields carry recipients and amounts, so they are bound too.
-		if (/^(password|file|submit|button|reset|image)$/.test(ty)) return;
-		var ac = (c.getAttribute && c.getAttribute("autocomplete")) || "";
-		if (/one-time-code|password/i.test(ac)) return;
-		var v = c.isContentEditable ? (c.innerText || c.textContent || "") : (c.value !== undefined ? c.value : "");
-		var nm = c.name || "", idv = c.id || "";
-		used += nm.length + idv.length + ty.length + v.length + 16;
-		if (used > MAXC) { tooBig = true; return; }
-		tuples.push([nm, idv, ty, v, !!c.checked]);
-	}
-	if (form) { for (var j = 0; j < form.elements.length; j++) field(form.elements[j]); }
-	var focus = deepActive();
-	if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT")) field(focus);
-	if (isEntry) field(t);
-	if (tooBig) { out.oversized = true; } else { out.content_hash = formDigest(tuples); }
+	if (fi.bad) { out.reason = fi.bad; return out; }
+	if (fi.oversized) { out.oversized = true; } else { out.content_hash = fi.digest; }
 	out.resolved = true;
 	return out;
 })`
