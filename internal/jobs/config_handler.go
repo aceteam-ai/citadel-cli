@@ -619,7 +619,15 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 	// Reconcile existing embedded CPU/GPU files before any runtime probe or up.
 	// This also covers callers that did not just run updateManifest.
 	for _, name := range serviceNames {
-		if !serviceNamePattern.MatchString(name) || !services.HasCPUComposeVariant(name) {
+		if !serviceNamePattern.MatchString(name) {
+			continue
+		}
+		handler := NewServiceHandler(configDir)
+		handler.gpuCount = h.gpuCount
+		if reason := handler.cudaStartRefusal(name); reason != "" {
+			return fmt.Errorf("cannot start %s", reason)
+		}
+		if !services.HasCPUComposeVariant(name) {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(servicesDir, name+".yml")); err != nil {
