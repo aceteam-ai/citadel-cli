@@ -2555,7 +2555,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// RUNNER-signed path (LLM_INFERENCE, citadel-cli#1287) share one convergent
 	// signer — the same as runWork.
 	ccWorkReceiptSigner := nodeidentity.Convergent(network.GetNodeConfigDir())
-	ccWorkReceiptNodeID := liveReceiptNodeIDResolver(nodeName)()
+	ccWorkReceiptNodeID := servingReceiptNodeID(nodeName)
 	nodeJobOpts := nodeJobHandlerOpts{
 		Source:         source,
 		OrgID:          nodeJobOrgID(),

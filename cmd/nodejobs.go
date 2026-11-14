@@ -47,8 +47,8 @@ type nodeJobHandlerOpts struct {
 	WorkReceiptSigner aep.Signer
 	WorkReceiptNodeID string
 	// ReceiptRoutingNodeID is the id this worker serves under (its per-node stream
-	// and heartbeat node id). The chat receipt resolver falls back to it when no
-	// fabric node id has been echoed (citadel-cli#1638). Empty keeps the default.
+	// and heartbeat node id). Chat receipts sign it, the same value as
+	// WorkReceiptNodeID (citadel-cli#1638). Empty keeps the default.
 	ReceiptRoutingNodeID string
 	// AllowReadOutsideWorkspace lets read-only file handlers escape the sandbox.
 	AllowReadOutsideWorkspace bool
@@ -155,7 +155,8 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 	// "unsupported job type \"llm_inference\": node X has no handler for it".
 	llmHandler := worker.NewLLMInferenceHandler()
 	if opts.ReceiptRoutingNodeID != "" {
-		llmHandler = llmHandler.WithFabricNodeIDResolver(liveReceiptNodeIDResolver(opts.ReceiptRoutingNodeID))
+		routing := servingReceiptNodeID(opts.ReceiptRoutingNodeID)
+		llmHandler = llmHandler.WithFabricNodeIDResolver(func() string { return routing })
 	}
 	// Model hotswap (citadel-cli#632, default ON): unless CITADEL_MODEL_HOTSWAP is
 	// explicitly disabled (0/false/no/off) and this node has a config dir, attach a
