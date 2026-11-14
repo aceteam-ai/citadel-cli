@@ -330,6 +330,23 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 					e.Attrs = map[string]string{"autocomplete": "one-time-code"}
 					return e
 				}(), send), T: 2},
+		"unchecked one-time-code checkbox sharing its name with a hidden field": {
+			Form: form(nil, ent("to", "alice"),
+				func() fakeEl {
+					e := fakeEl{TagName: "INPUT", Type: "checkbox", Name: "to", Value: sp("on")}
+					e.Attrs = map[string]string{"autocomplete": "one-time-code"}
+					return e
+				}(), fel("INPUT", "hidden", "to", "alice"), send), T: 2},
+		"disabled password sharing its name with a text field": {
+			Form: form(nil, ent("to", "alice"),
+				func() fakeEl { e := fel("INPUT", "password", "to", "x"); e.Disabled = true; return e }(), fel("INPUT", "text", "to", "alice"), send), T: 2},
+		"current-password autocomplete sharing a name": {
+			Form: form(nil, ent("to", "alice", "to", "s"),
+				func() fakeEl {
+					e := fel("INPUT", "text", "to", "s")
+					e.Attrs = map[string]string{"autocomplete": "current-password"}
+					return e
+				}(), fel("INPUT", "hidden", "to", "alice"), send), T: 2},
 		"submitter named like a password field": {
 			Form: form(nil, ent("pw", "x", "pw", "go"), fel("INPUT", "password", "pw", "x"), button("pw", "go", nil)), T: 1},
 		"FormData constructor throws": {Form: func() *fakeForm { f := form(nil, nil, send); f.Throws = true; return f }(), T: 0},

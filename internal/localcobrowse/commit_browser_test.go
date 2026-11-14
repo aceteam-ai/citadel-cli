@@ -299,6 +299,8 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		"file1": `<input type="text" name="m" value="hi">`,
 		"file2": `<input type="text" name="m" value="hi"><input type="file" name="att">`,
 		"pw1":   `<input type="hidden" name="to" value="alice"><input type="password" name="to" value="secret">`,
+		"pw3":   `<input type="checkbox" name="to" autocomplete="one-time-code"><input type="hidden" name="to" value="alice">`,
+		"pw4":   `<input type="password" name="to" disabled><input type="text" name="to" value="alice">`,
 		"pw2":   `<input type="password" name="pw" value="secret"><input type="hidden" name="to" value="alice">`,
 		"cf1":   `<x-field name="to" id="xf"></x-field>`,
 		"cf2":   `<x-field name="to" id="xf"></x-field>`,
@@ -400,6 +402,11 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	}
 	if ti := inspect("pw1"); ti.Resolved {
 		t.Errorf("a password field sharing its name with a hidden field must be unverifiable: %+v", ti)
+	}
+	for _, v := range []string{"pw3", "pw4"} {
+		if ti := inspect(v); ti.Resolved {
+			t.Errorf("%s: a sensitive control sharing its name with another control must be unverifiable: %+v", v, ti)
+		}
 	}
 	if ti := inspect("pw2"); !ti.Resolved || ti.ContentHash == "" {
 		t.Errorf("a password field with a unique name stays verifiable: %+v", ti)

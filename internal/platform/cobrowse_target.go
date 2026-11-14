@@ -137,24 +137,31 @@ const FormSnapshotScript = `
 			try { fd = env.formData(form, sub); } catch (x) { bad = "the browser could not build this form's submission"; }
 			if (!bad) {
 				// Password and one-time-code controls are never bound, and their
-				// entries are dropped by name. That is only safe when nothing else
-				// in the submission shares the name: if any entry with such a name
-				// is not accounted for by an enabled sensitive control, the target
-				// is unverifiable (a hidden "to" beside a password "to" would
-				// otherwise be invisible to the binding).
-				var skip = {}, total = {};
+				// entries are dropped by name. That is only safe when EVERY control
+				// with that name is itself sensitive: if any other control
+				// associated with the form (form.elements, and the submitter)
+				// shares the name, whatever its checked, disabled or type state,
+				// the target is unverifiable. Counting entries is not sound (an
+				// unchecked sensitive checkbox submits nothing while a hidden
+				// field of the same name does).
+				var sens = {}, other = {}, sensN = {};
 				var els = env.elements(form);
+				if (sub && els.indexOf(sub) < 0) els = els.concat([sub]);
 				for (var i = 0; i < els.length; i++) {
+					var nm0 = String(els[i].name || "");
+					if (!nm0) continue; // an unnamed control submits nothing
 					var ty = String(els[i].type || "").toLowerCase(), ac = String(env.attr(els[i], "autocomplete") || "");
-					if ((ty === "password" || /one-time-code|password/i.test(ac)) && !env.disabled(els[i])) {
-						if (!els[i].name) continue; // an unnamed control submits nothing
-						var k = "n:" + String(els[i].name);
-						skip[k] = (skip[k] || 0) + 1;
-					}
+					var key0 = "n:" + nm0;
+					if (ty === "password" || /one-time-code|current-password|new-password|password/i.test(ac)) { sens[key0] = true; sensN[key0] = (sensN[key0] || 0) + 1; }
+					else other[key0] = true;
 				}
-				var entries = env.entries(fd);
-				for (var j = 0; j < entries.length; j++) { var kk = "n:" + String(entries[j][0]); total[kk] = (total[kk] || 0) + 1; }
-				for (var key in skip) { if (total[key] !== skip[key]) { bad = "a password or one-time-code field shares its name with another field"; } }
+				var skip = sens;
+				for (var key in sens) { if (other[key]) { bad = "a password or one-time-code field shares its name with another control"; } }
+				var entries = env.entries(fd), seen = {};
+				// More entries than sensitive controls of that name means something
+				// else (a script's formdata handler) added one: unverifiable too.
+				for (var e2 = 0; e2 < entries.length; e2++) { var k2 = "n:" + String(entries[e2][0]); seen[k2] = (seen[k2] || 0) + 1; }
+				for (var key2 in sens) { if ((seen[key2] || 0) > sensN[key2]) { bad = "an entry shares its name with a password or one-time-code field"; } }
 				if (!bad) {
 					for (var m2 = 0; m2 < entries.length; m2++) {
 						var name = String(entries[m2][0]), val = entries[m2][1];
