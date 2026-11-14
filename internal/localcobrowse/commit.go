@@ -53,10 +53,13 @@ type Decision struct {
 
 // Typed refusals for commit actions.
 var (
-	ErrCommitApprovalRequired = errors.New("commit_approval_required: this action sends, posts, submits, pays or deletes, so the user must approve it every time. They are being asked in the Citadel viewer. Call local_cobrowse_wait with until=commit, then repeat this exact call; if the page or what you typed has changed, they are asked again")
+	ErrCommitApprovalRequired = errors.New("commit_approval_required: this action sends, posts, submits, pays or deletes, so the user must approve it every time. They are being asked in the Citadel viewer, and if they approve it the action runs by itself. Do not repeat it; call local_cobrowse_wait with until=commit, then local_cobrowse_status or take a screenshot to see the result")
 	ErrCommitPending          = errors.New("commit_pending: the user is deciding on an earlier send, post, submit or payment in this session. Do not change the page; call local_cobrowse_wait with until=commit")
 	ErrCommitDenied           = errors.New("commit_denied: the user declined this action. Do not retry it; tell the user what you could not do and let them decide")
 	ErrNoPendingCommit        = errors.New("that request is no longer current; look at the viewer for the latest one")
+	ErrUnknownPage            = errors.New("unknown_page: this page's address cannot be tied to a website, so AI actions are refused here and cannot be approved; ask the user to take control or navigate somewhere else")
+	ErrPageChanged            = errors.New("page_changed: the page changed while the action was being checked, so it was not sent; look at the page again and retry")
+	ErrTypeNewline            = errors.New("type_newline: typed text may not contain a line break, which can send a message or submit a form; type the text, then use local_cobrowse_key with Enter, which asks the user")
 )
 
 // commitLabelWords are verbs that mark a control as a commit. Matching is on
@@ -70,7 +73,9 @@ var commitLabelWords = map[string]bool{
 	"unsubscribe": true, "subscribe": true, "connect": true, "follow": true,
 	"endorse": true, "invite": true, "accept": true, "sign": true, "agree": true,
 	"withdraw": true, "book": true, "reserve": true, "apply": true, "logout": true,
-	"signout": true, "deactivate": true,
+	"signout": true, "deactivate": true, "authorize": true, "allow": true, "approve": true,
+	"merge": true, "repost": true, "retweet": true, "trash": true, "discard": true,
+	"block": true, "report": true, "upload": true,
 	// A few other languages. CJK is matched as substrings below.
 	"envoyer": true, "enviar": true, "senden": true, "publier": true, "publicar": true,
 	"acheter": true, "comprar": true, "kaufen": true, "supprimer": true, "eliminar": true,
@@ -86,6 +91,38 @@ var destructiveLinkWords = map[string]bool{
 }
 
 var destructiveLinkPath = regexp.MustCompile(`(?i)/(log-?out|sign-?out|delete|unsubscribe|confirm|deactivate)(/|$|\?)`)
+
+// urlIsDestructive reports an address whose path or query asks to delete, log
+// out, unsubscribe or similar (a GET that acts), such as /logout or ?action=delete.
+func urlIsDestructive(u *url.URL) bool {
+	if destructiveLinkPath.MatchString(u.Path) {
+		return true
+	}
+	for k, vs := range u.Query() {
+		if hasWord(k, destructiveLinkWords) {
+			return true
+		}
+		for _, v := range vs {
+			if hasWord(v, destructiveLinkWords) {
+				return true
+			}
+		}
+	}
+	return hasWord(u.Fragment, destructiveLinkWords)
+}
+
+// ClassifyNavigation decides a direct navigate: an address that itself acts is a
+// commit, anything else is covered by the destination domain's grant.
+func ClassifyNavigation(raw string) Decision {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return Decision{Class: ClassCommit, Reason: "the address could not be read"}
+	}
+	if urlIsDestructive(u) {
+		return Decision{Class: ClassCommit, Reason: "this address changes or ends something (log out, delete, unsubscribe or similar)"}
+	}
+	return Decision{Class: ClassNavigate, Domain: RegistrableDomain(raw)}
+}
 
 var wordSplit = regexp.MustCompile(`[^\p{L}\p{N}]+`)
 
@@ -151,19 +188,25 @@ func Classify(kind, key string, t platform.TargetInfo) Decision {
 			switch {
 			case t.Entry && t.Search:
 				return Decision{Class: ClassFill}
-			case t.Actionable && !t.Entry:
+			case t.Actionable && !t.Entry && strings.TrimSpace(t.Name) != "":
+				// A named control or link: judged by what it is.
 				return activation(t)
-			case t.Entry || t.InForm:
-				// Fail closed: Enter in any field, or anything inside a form,
-				// can submit it (implicit submission), whatever the input type.
-				return Decision{Class: ClassCommit, Reason: "Enter in a text field or form sends or submits it"}
 			}
-			return activation(t)
+			// Everything else defaults to commit: any other field, anything in a
+			// form, an unnamed control, or nothing focused (page shortcuts).
+			return Decision{Class: ClassCommit, Reason: "Enter can send or submit here"}
 		case isSpace(key):
 			if t.Actionable && !t.Entry {
 				return activation(t)
 			}
 			return Decision{Class: ClassFill}
+		case key == "Delete" || key == "Backspace" || len([]rune(key)) == 1:
+			// Outside a text field a letter, digit or Delete is a page shortcut
+			// (archive, delete, send in some apps).
+			if t.Entry {
+				return Decision{Class: ClassFill}
+			}
+			return Decision{Class: ClassCommit, Reason: "this key can be a page shortcut that acts on something"}
 		default:
 			return Decision{Class: ClassFill}
 		}
@@ -189,11 +232,11 @@ func activation(t platform.TargetInfo) Decision {
 	}
 	// The label is checked before the href: many sites build their Send and
 	// Post "buttons" from anchors, and a link named Send is not a navigation.
-	if labelIsCommit(label) {
+	if labelIsCommit(label) || (link == nil && hasWord(label, map[string]bool{"cancel": true})) {
 		return Decision{Class: ClassCommit, Reason: "the control " + quoteLabel(label) + " sends, posts, submits, pays or deletes"}
 	}
 	if link != nil {
-		if hasWord(label, destructiveLinkWords) || destructiveLinkPath.MatchString(link.Path) {
+		if hasWord(label, destructiveLinkWords) || urlIsDestructive(link) {
 			return Decision{Class: ClassCommit, Reason: "this link " + quoteLabel(label) + " changes or ends something"}
 		}
 		if !sameDocument(link, t.PageURL) {
@@ -258,8 +301,10 @@ type actionRef struct {
 	Key      string
 	Selector string
 	X, Y     *float64
-	// Value and Label are the option a select would choose.
+	// Value and Label are the option a select would choose; URL is a navigate
+	// target. Typed text is never part of an action reference.
 	Value, Label string
+	URL          string
 }
 
 // fingerprint binds an approval to one action on one page state (D5). It
@@ -294,19 +339,15 @@ func fingerprint(a actionRef, t platform.TargetInfo) string {
 		Content string
 		Value   string
 		Label   string
+		URL     string
 	}{1, a.Kind, a.Key, a.Selector, round(a.X), round(a.Y), originPath(t.PageURL), t.Tag, t.Role, t.InputType,
-		t.Name, originPath(t.Href), t.FormMethod, originPath(t.FormAction), hex.EncodeToString(content[:]), a.Value, a.Label})
+		t.Name, originPath(t.Href), t.FormMethod, originPath(t.FormAction), hex.EncodeToString(content[:]), a.Value, a.Label, a.URL})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
-// Approvals and pending requests are short-lived by design.
-const (
-	// ApprovedCommitTTL is how long an approved action stays redeemable.
-	ApprovedCommitTTL = 2 * time.Minute
-	// PendingCommitTTL is how long an unanswered request waits.
-	PendingCommitTTL = 10 * time.Minute
-)
+// PendingCommitTTL is how long an unanswered request waits.
+const PendingCommitTTL = 10 * time.Minute
 
 // CommitView is what the viewer shows for a pending request. The screenshot is
 // served separately (CommitShot) so the polled state stays small.
@@ -324,7 +365,20 @@ type CommitView struct {
 // Rect is the target's box and the viewport it was measured in.
 type Rect = platform.TargetRect
 
+// CommitResult is what became of the last commit request: executed, changed
+// (the page differed from what was approved, so nothing ran), denied, failed,
+// expired or revoked.
+type CommitResult struct {
+	ID     string `json:"id"`
+	Domain string `json:"domain"`
+	Action string `json:"action"`
+	State  string `json:"state"`
+	Detail string `json:"detail"`
+	At     string `json:"at"`
+}
+
 type pendingCommit struct {
+	ref         actionRef
 	id          string
 	fp          string
 	domain      string
@@ -334,11 +388,6 @@ type pendingCommit struct {
 	requestedAt time.Time
 	shot        string
 	rect        platform.TargetRect
-}
-
-type approvedCommit struct {
-	fp      string
-	expires time.Time
 }
 
 func describeAction(a actionRef, t platform.TargetInfo) string {
@@ -355,6 +404,11 @@ func describeAction(a actionRef, t platform.TargetInfo) string {
 			return "Choose " + quoteLabel(opt)
 		}
 		return "Choose an option"
+	case "navigate":
+		if u, err := url.Parse(a.URL); err == nil && u.Host != "" {
+			return "Open " + quoteLabel(u.Host+u.Path)
+		}
+		return "Open an address"
 	case "click":
 		if n := strings.TrimSpace(t.Name); n != "" {
 			return "Click " + quoteLabel(n)

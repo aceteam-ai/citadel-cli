@@ -121,16 +121,19 @@ user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
 Local-mode write consent is per registrable domain, not per session
 (aceteam#13687 D1-D5, citadel-cli#1636). `localcobrowse.RegistrableDomain` owns
 the scope (public suffix list); `Service.grantEvalLocked` owns a grant's state
-and the identity-bearing caps (a domain a human drove is capped by
+and the identity-bearing caps (a session a human drove is capped by
 `IdentityGrantDuration` and `IdentityIdleTimeout`, checked at use time, so a
 later handoff shortens an earlier grant). `localcobrowse.Classify` owns the
 commit heuristic over the target `platform.CobrowseSessionManager.InspectTarget`
 reads in the page; anything unresolved is a commit. A commit never rides a
-grant: `Service.authorizeCommit` records a pending request, and only the human
-methods `ApproveCommit`/`DenyCommit` (viewer routes, no MCP tool) answer it.
-A session a human has driven takes the identity caps on every domain (an SSO
-hop would otherwise slip past a per-domain mark). `fingerprint` binds the approval to the action; the agent repeats the call and
-it runs once, only on a match. `TestNoLocalMCPToolCanApprove`,
+grant: `Service.authorizeCommit` records a pending request (the action
+reference and fingerprint only, never typed text), and only the human methods
+`ApproveCommit`/`DenyCommit` (viewer routes, no MCP tool) answer it.
+`ApproveCommit` executes on approve (D5): under the session write lock it
+re-probes the target, requires the fingerprint to equal the approved one, then
+runs the action and shows the outcome; a changed page runs nothing. `fingerprint`
+binds the approval to the action. Every write is serialized per session (`wmu`)
+and re-probed before dispatch. `TestNoLocalMCPToolCanApprove`,
 `TestCommitAlwaysAsksDespiteGrantAndDenyBlocks` and
 `TestRealBrowserCommitActions` (windows-latest) pin it. It is a label and
 structure heuristic, not an effect-level guard; see `commit.go` for its limits.

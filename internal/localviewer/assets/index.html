@@ -27,10 +27,11 @@
     <p><strong id="commit-action"></strong> on <strong id="commit-domain"></strong></p>
     <p class="muted" id="commit-reason"></p>
     <canvas id="commit-shot" width="480" height="240" hidden aria-label="The part of the page the agent wants to act on"></canvas>
-    <p class="muted">This kind of action asks every time, whatever you approved before. Approving lets the agent do this one action.</p>
-    <button id="commit-approve" class="primary">Approve this action</button>
+    <p class="muted">This kind of action asks every time, whatever you approved before. Approving does this one action now, if the page is still as shown.</p>
+    <button id="commit-approve" class="primary">Approve and do it</button>
     <button id="commit-deny">Deny</button>
   </section>
+  <p id="commit-result" class="banner" hidden></p>
   <section id="approval" class="card" hidden>
     <p>Allow this agent to click, type and navigate on <strong id="approval-site"></strong> for
       <select id="approve-hours">

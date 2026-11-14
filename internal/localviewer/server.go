@@ -606,7 +606,7 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "approve":
 		err = svc.ApproveDomain(id, body.Domain, time.Duration(body.Hours*float64(time.Hour)))
 	case "approve-commit":
-		err = svc.ApproveCommit(id, body.Commit)
+		err = svc.ApproveCommit(r.Context(), id, body.Commit)
 	case "deny-commit":
 		err = svc.DenyCommit(id, body.Commit)
 	case "deny":

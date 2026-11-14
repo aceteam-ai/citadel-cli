@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -61,14 +62,15 @@ func TestLocalCommitPromptsAreAuditedEndToEnd(t *testing.T) {
 	if commit == nil {
 		t.Fatal("no pending commit")
 	}
-	if err := rt.svc.ApproveCommit("cb-1", commit.ID); err != nil { // the viewer's action
+	if err := rt.svc.ApproveCommit(context.Background(), "cb-1", commit.ID); err != nil { // the viewer's action
 		t.Fatal(err)
 	}
-	if _, isErr := toolResult(t, one(call(3, "local_cobrowse_click", map[string]any{"session_id": "cb-1", "selector": "#send"}))); isErr {
-		t.Fatal("approved action must run on repeat")
-	}
 	if fb.clicks != 1 {
-		t.Fatalf("clicks = %d", fb.clicks)
+		t.Fatalf("approval must run the action itself: clicks = %d", fb.clicks)
+	}
+	w := one(call(3, "local_cobrowse_wait", map[string]any{"session_id": "cb-1", "until": "commit", "timeout_seconds": 1}))
+	if content, isErr := toolResult(t, w); isErr || !strings.Contains(firstText(content), "executed") {
+		t.Fatalf("the agent learns the result through wait: %v", w)
 	}
 
 	dir := filepath.Join(ownerDir, localaudit.DirName)

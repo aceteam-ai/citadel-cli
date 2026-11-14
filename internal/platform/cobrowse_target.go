@@ -68,14 +68,26 @@ const targetProbeScript = `(function(kind, selector, px, py){
 		if (!ids) return "";
 		return ids.split(/\s+/).map(function(i){ var n = document.getElementById(i); return n ? txt(n) : ""; }).join(" ").trim();
 	}
-	function nameOf(e){
+	var ENTRY_SEL = "textarea,input,[contenteditable],[role=textbox],[role=searchbox],[role=combobox]";
+	function isEntryEl(e){
 		var t = (e.type || "").toLowerCase();
-		var n = e.getAttribute("aria-label") || labelled(e);
+		var role = (e.getAttribute("role") || "").toLowerCase();
+		return e.tagName === "TEXTAREA" || !!e.isContentEditable || role === "textbox" || role === "searchbox" || role === "combobox" ||
+			(e.tagName === "INPUT" && !/^(checkbox|radio|button|submit|reset|image|file|hidden|range|color)$/.test(t));
+	}
+	// A control's label comes from its own attributes. For a text-entry element,
+	// or anything that holds one, the visible text and value are what someone
+	// typed, so they are never used (they would leak into cards and the audit).
+	function nameOf(e){
+		var n = e.getAttribute("aria-label") || labelled(e) || e.title || "";
+		if (isEntryEl(e)) return String(n || e.placeholder || "").replace(/\s+/g, " ").trim().slice(0, 200);
+		var holdsEntry = !!(e.querySelector && e.querySelector(ENTRY_SEL));
+		var t = (e.type || "").toLowerCase();
 		if (!n && e.tagName === "INPUT" && (t === "submit" || t === "button" || t === "reset" || t === "image")) n = e.value || e.alt || "";
-		if (!n && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName)) n = txt(e);
-		if (!n && e.labels && e.labels.length) n = txt(e.labels[0]);
-		if (!n) n = e.title || e.alt || e.placeholder || e.getAttribute("name") || "";
-		if (!n) { var img = e.querySelector && e.querySelector("img[alt],svg title"); if (img) n = img.alt || txt(img); }
+		if (!n && !holdsEntry && e.tagName !== "SELECT") n = txt(e);
+		if (!n && e.labels && e.labels.length && !holdsEntry) n = txt(e.labels[0]);
+		if (!n) n = e.alt || "";
+		if (!n && !holdsEntry) { var img = e.querySelector && e.querySelector("img[alt],svg title"); if (img) n = img.alt || txt(img); }
 		return String(n).replace(/\s+/g, " ").trim().slice(0, 200);
 	}
 	function abs(u){ try { return new URL(u, document.baseURI).href; } catch (e) { return ""; } }
@@ -106,6 +118,9 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	} else { out.reason = "no target"; return out; }
 	var tag = el.tagName ? el.tagName.toLowerCase() : "";
 	if (/^(iframe|frame|object|embed|canvas)$/.test(tag)) { out.reason = "target is inside " + tag; return out; }
+	// A custom element with no open shadow root and nothing inside it is most
+	// likely the host of a closed shadow root, whose contents cannot be read.
+	if (tag.indexOf("-") > 0 && !el.shadowRoot && el.childElementCount === 0 && !txt(el)) { out.reason = "target is inside a closed shadow root"; return out; }
 	var actSel = "button,a[href],input[type=submit],input[type=image],input[type=button],input[type=reset],[role=button],[role=link],[role=menuitem],[role=tab],summary,[onclick]";
 	var act = (kind === "click" && el.closest) ? el.closest(actSel) : (el.matches && el.matches(actSel) ? el : null);
 	var t = act || el;

@@ -14,11 +14,14 @@ import (
 )
 
 const commitFixturePage = `<!doctype html><title>Synthetic</title><h1 id="t">Commit page</h1>
-<form id="f" method="post" action="/send"><input type="hidden" name="to" value="bob"><textarea id="msg" name="msg">hello</textarea><button id="send" type="submit">Send</button></form>
+<form id="f" method="post" action="/send"><input type="hidden" name="to" value="bob"><textarea id="msg" name="msg">hello SECRET-TA-TEXT</textarea><button id="send" type="submit">Send</button></form>
 <button id="expand" type="button">Expand menu</button>
 <form role="search" action="/s"><input id="search" type="search" name="q"><button id="go" type="submit">Go</button></form>
 <a id="same" href="/next">Next page</a><a id="out" href="http://other.test/x">Partner</a>
 <iframe id="frame" src="about:blank"></iframe>
+<div id="ce" contenteditable="true">SECRET-CE-TEXT</div>
+<closed-host id="ch" style="display:block;width:100px;height:30px"></closed-host>
+<script>customElements.define("closed-host", class extends HTMLElement { constructor(){ super(); this.attachShadow({mode:"closed"}).innerHTML = "<button>Send</button>"; } });</script>
 <div id="plain">just text</div>
 <div id="panel" style="display:flex;width:240px;height:60px"><button id="panelsend" type="button" style="flex:1">Send</button></div>`
 
@@ -72,7 +75,7 @@ func TestRealBrowserCommitActions(t *testing.T) {
 
 	d, send := probe("click", "", "#send")
 	want("Send button", d, ClassCommit)
-	if send.Name != "Send" || !send.InForm || send.FormMethod != "post" || !strings.Contains(send.Content, "to=bob") || !strings.Contains(send.Content, "msg=hello") {
+	if send.Name != "Send" || !send.InForm || send.FormMethod != "post" || !strings.Contains(send.Content, "to=bob") || !strings.Contains(send.Content, "msg=hello SECRET-TA-TEXT") {
 		t.Errorf("send target not read: %+v", send)
 	}
 	d, _ = probe("click", "", "#expand")
@@ -110,6 +113,27 @@ func TestRealBrowserCommitActions(t *testing.T) {
 	}
 	d, before := probe("key", "Enter", "")
 	want("Enter in the composer", d, ClassCommit)
+	if strings.Contains(before.Name, "SECRET") || strings.Contains(before.Name, "hello") {
+		t.Errorf("the composer's text must never become its label: %q", before.Name)
+	}
+	if _, err := m.Click(st.ID, "#ce", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	d, ce := probe("key", "Enter", "")
+	want("Enter in a contenteditable", d, ClassCommit)
+	if strings.Contains(ce.Name, "SECRET") {
+		t.Errorf("a contenteditable's text must never become its label: %q", ce.Name)
+	}
+	if _, ce2 := probe("click", "", "#ce"); strings.Contains(ce2.Name, "SECRET") {
+		t.Errorf("selector probe leaked contenteditable text: %q", ce2.Name)
+	}
+	d, _ = probe("click", "", "#ch")
+	want("closed shadow root host", d, ClassCommit)
+	if _, err := m.Click(st.ID, "#plain", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	d, _ = probe("key", "Delete", "")
+	want("Delete outside a field", d, ClassCommit)
 	if _, err := m.Click(st.ID, "#search", nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -129,5 +153,4 @@ func TestRealBrowserCommitActions(t *testing.T) {
 	if fb := fingerprint(actionRef{Kind: "click", Selector: "#send"}, b); fa == fb {
 		t.Error("editing the composer must change the fingerprint")
 	}
-	_ = before
 }

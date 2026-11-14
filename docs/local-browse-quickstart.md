@@ -178,7 +178,7 @@ orders, let me log in, then list my last three orders."
    taken control of a session, for example to log in, approvals in it last at
    most 1 hour and end after 15 minutes without activity. Each Send, Post,
    Submit, Pay or Delete asks you separately, with a picture of the button, and
-   your answer covers that one action only. You can revoke approvals at any
+   approving does that one action right away (if the page is still as shown), and your answer covers it only. You can revoke approvals at any
    time.
 3. **Log in yourself.** At the login page the agent hands off. The viewer
    shows "Waiting for you: log in, then hand back". Press **Take control**,

@@ -2,6 +2,7 @@ package localcobrowse
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -86,7 +87,38 @@ func TestClassify(t *testing.T) {
 		{"Space on a focused Send button", "key", " ", sendBtn, ClassCommit},
 		{"Tab is fill", "key", "Tab", sendBtn, ClassFill},
 		{"typing a letter is fill", "key", "a", el(func(t *platform.TargetInfo) { t.Tag, t.Entry = "textarea", true }), ClassFill},
-		{"Enter with nothing focused", "key", "Enter", el(func(t *platform.TargetInfo) { t.Tag = "body" }), ClassFill},
+		{"Enter with nothing focused defaults to commit", "key", "Enter", el(func(t *platform.TargetInfo) { t.Tag = "body" }), ClassCommit},
+		{"Enter on an unnamed control", "key", "Enter", el(func(t *platform.TargetInfo) { t.Tag, t.Actionable = "div", true }), ClassCommit},
+		{"Enter on a named harmless button", "key", "Enter", el(func(t *platform.TargetInfo) {
+			t.Tag, t.InputType, t.Name, t.Actionable = "button", "button", "Expand menu", true
+		}), ClassFill},
+		{"Enter on a named link navigates", "key", "Enter", el(func(t *platform.TargetInfo) {
+			t.Tag, t.Name, t.Href, t.Actionable = "a", "Pricing", "http://a.test/pricing", true
+		}), ClassNavigate},
+		{"Delete outside a field", "key", "Delete", el(func(t *platform.TargetInfo) { t.Tag = "body" }), ClassCommit},
+		{"Backspace outside a field", "key", "Backspace", el(func(t *platform.TargetInfo) { t.Tag = "body" }), ClassCommit},
+		{"a letter outside a field is a shortcut", "key", "e", el(func(t *platform.TargetInfo) { t.Tag = "body" }), ClassCommit},
+		{"a letter in a field is typing", "key", "e", el(func(t *platform.TargetInfo) { t.Tag, t.Entry = "input", true }), ClassFill},
+		{"Backspace in a field is editing", "key", "Backspace", el(func(t *platform.TargetInfo) { t.Tag, t.Entry = "textarea", true }), ClassFill},
+		{"Cancel button", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.InputType, t.Name, t.Actionable = "button", "button", "Cancel", true
+		}), ClassCommit},
+		{"Approve", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.InputType, t.Name, t.Actionable = "button", "button", "Approve", true
+		}), ClassCommit},
+		{"Merge pull request", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.InputType, t.Name, t.Actionable = "button", "button", "Merge pull request", true
+		}), ClassCommit},
+		{"Allow", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.InputType, t.Name, t.Actionable = "button", "button", "Allow", true
+		}), ClassCommit},
+		{"Upload", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.InputType, t.Name, t.Actionable = "button", "button", "Upload file", true
+		}), ClassCommit},
+		{"link with a delete query", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.Name, t.Href, t.Actionable = "a", "Item", "http://a.test/item?action=delete", true
+		}), ClassCommit},
+		{"closed shadow root is unresolved", "click", "", platform.TargetInfo{Reason: "target is inside a closed shadow root"}, ClassCommit},
 		{"select that submits", "select", "", el(func(t *platform.TargetInfo) { t.Tag, t.AutoSubmit = "select", true }), ClassCommit},
 		{"plain select", "select", "", el(func(t *platform.TargetInfo) { t.Tag = "select" }), ClassFill},
 		{"type is fill", "type", "", el(func(t *platform.TargetInfo) { t.Tag, t.Entry = "textarea", true }), ClassFill},
@@ -116,6 +148,17 @@ func TestRegistrableDomain(t *testing.T) {
 		"http://foo.github.io/":         "foo.github.io",
 		"http://bar.github.io/":         "bar.github.io",
 		"http://127.0.0.1:8080/":        "127.0.0.1",
+		"http://evil.test@a.test/x":     "a.test",
+		"http://user:pw@a.test:8080/":   "a.test",
+		"http://a.test.:80/":            "a.test",
+		"http://b\u00fccher.example/":   "xn--bcher-kva.example",
+		"http://2130706433/":            "127.0.0.1",
+		"http://0x7f.1/":                "127.0.0.1",
+		"http://0177.0.0.1/":            "127.0.0.1",
+		"http://[::1]:9/":               "::1",
+		"http://1.2.3.4.5/":             UnknownDomain,
+		"http://a.test\\@evil.test/":    UnknownDomain,
+		"file:///etc/passwd":            UnknownDomain,
 		"http://localhost/":             "localhost",
 		"about:blank":                   "about:blank",
 		"data:text/html,hi":             UnknownDomain,
@@ -220,70 +263,133 @@ func TestCommitAlwaysAsksDespiteGrantAndDenyBlocks(t *testing.T) {
 	}
 }
 
-// D5: approval covers exactly one action. The agent repeats the call; it runs
-// once; a changed page or composer is asked again.
-func TestApprovedCommitRunsOnceAndOnlyForSameFingerprint(t *testing.T) {
+// D5, execute on approve: the human's approval re-probes the live target, checks
+// the fingerprint and runs the action itself. The agent does not repeat it.
+func TestApproveExecutesTheApprovedActionOnce(t *testing.T) {
 	svc, fb, events, id := startGranted(t, nil)
 	fb.target = sendTarget()
 	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
 	c := pendingView(t, svc, id)
 
-	if err := svc.ApproveCommit(id, "not-the-id"); !errors.Is(err, ErrNoPendingCommit) {
+	if err := svc.ApproveCommit(ctx, id, "not-the-id"); !errors.Is(err, ErrNoPendingCommit) {
 		t.Fatalf("a stale card must not approve: %v", err)
 	}
-	if err := svc.ApproveCommit(id, c.ID); err != nil {
-		t.Fatal(err)
-	}
 	if clicks(fb) != 0 {
-		t.Fatal("approving alone must not act; the agent repeats the call")
+		t.Fatal("nothing runs before approval")
 	}
-	// The content changed after approval: not the approved action.
-	changed := *sendTarget()
-	changed.Content = "msg=something else entirely"
-	fb.target = &changed
-	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
-		t.Fatalf("a changed composer must ask again: %v", err)
-	}
-	if clicks(fb) != 0 {
-		t.Fatal("a changed action ran on the old approval")
-	}
-	// Restore and approve the new one, then it runs exactly once.
-	if err := svc.DenyCommit(id, pendingView(t, svc, id).ID); err != nil {
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
 		t.Fatal(err)
-	}
-	fb.target = sendTarget()
-	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); err != nil {
-		t.Fatalf("the approved action must run: %v", err)
 	}
 	if clicks(fb) != 1 {
-		t.Fatalf("clicks = %d", clicks(fb))
+		t.Fatalf("approval must execute the action: clicks = %d", clicks(fb))
 	}
-	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
-		t.Fatalf("an approval is single use: %v", err)
+	v := svc.Sessions(id)[0]
+	if v.Commit != nil || v.CommitResult == nil || v.CommitResult.State != "executed" {
+		t.Fatalf("the card needs the outcome: %+v", v.CommitResult)
 	}
-	var ran bool
+	if r, _ := svc.Wait(ctx, id, "commit", time.Second); !r.Satisfied || r.State != "executed" {
+		t.Fatalf("the agent learns the result through wait: %+v", r)
+	}
+	if err := svc.ApproveCommit(ctx, id, c.ID); !errors.Is(err, ErrNoPendingCommit) || clicks(fb) != 1 {
+		t.Fatalf("one approval is one execution: %v clicks=%d", err, clicks(fb))
+	}
+	// A repeated call is a new request: there is no token to spend.
+	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) || clicks(fb) != 1 {
+		t.Fatalf("repeat must ask again: %v", err)
+	}
+	var ran, approved bool
 	for _, e := range *events {
 		if e.Action == "click" && e.Outcome == "ok" && e.Fingerprint != "" && e.Label == "Send" {
 			ran = true
 		}
+		if e.Action == "approve_commit" && e.Outcome == "ok" {
+			approved = true
+		}
 	}
-	if !ran {
-		t.Fatal("the executed commit must be audited with its fingerprint")
+	if !ran || !approved {
+		t.Fatalf("the executed commit and its approval must be audited: %v %v", ran, approved)
 	}
 }
 
-func TestApprovedCommitExpires(t *testing.T) {
+// If the page differs from what was approved, nothing runs and the card says so.
+func TestApproveDoesNotRunIfThePageChanged(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.target = sendTarget()
+	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	changed := *sendTarget()
+	changed.Content = "msg=something else entirely"
+	fb.target = &changed
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if clicks(fb) != 0 {
+		t.Fatal("a changed page ran on the old approval")
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "changed" || v.Commit != nil {
+		t.Fatalf("card must say the page changed: %+v", v.CommitResult)
+	}
+	var seen bool
+	for _, e := range *events {
+		if e.Action == "approve_commit" && e.Outcome == "page_changed" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("the unexecuted approval must be audited")
+	}
+	// The agent asks again about the new page.
+	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatalf("ask again: %v", err)
+	}
+}
+
+// A budget or audit failure at approval time does not burn the approval.
+func TestApprovalSurvivesBudgetAndAuditFailure(t *testing.T) {
+	c := &clock{t: time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)}
+	failAudit := false
+	svc, fb, _, id := startGranted(t, func(cfg *Config) {
+		cfg.Now = c.now
+		cfg.WritesPerMinute = 1
+		cfg.BeforeAction = func(Event) (int64, error) {
+			if failAudit {
+				return 0, errors.New("audit log unavailable")
+			}
+			return 1, nil
+		}
+	})
+	if _, err := svc.Scroll(ctx, id, "", nil, nil, 0, 1, "g"); err != nil { // spends the minute's budget
+		t.Fatal(err)
+	}
+	fb.target = sendTarget()
+	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
+	cv := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, cv.ID); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("budget: %v", err)
+	}
+	if svc.Sessions(id)[0].Commit == nil || clicks(fb) != 0 {
+		t.Fatal("the request must stay pending")
+	}
+	c.add(61 * time.Second)
+	failAudit = true
+	if err := svc.ApproveCommit(ctx, id, cv.ID); err == nil || clicks(fb) != 0 || svc.Sessions(id)[0].Commit == nil {
+		t.Fatalf("audit failure must not run or burn it: %v", err)
+	}
+	failAudit = false
+	if err := svc.ApproveCommit(ctx, id, cv.ID); err != nil || clicks(fb) != 1 {
+		t.Fatalf("then it runs: %v clicks=%d", err, clicks(fb))
+	}
+}
+
+func TestPendingCommitExpires(t *testing.T) {
 	c := &clock{t: time.Date(2026, 11, 13, 9, 0, 0, 0, time.UTC)}
 	svc, fb, _, id := startGranted(t, func(cfg *Config) { cfg.Now = c.now })
 	fb.target = sendTarget()
 	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
-	_ = svc.ApproveCommit(id, pendingView(t, svc, id).ID)
-	c.add(ApprovedCommitTTL + time.Second)
-	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
-		t.Fatalf("a stale approval must not run: %v", err)
-	}
-	if clicks(fb) != 0 {
-		t.Fatal("stale approval ran")
+	cv := pendingView(t, svc, id)
+	c.add(PendingCommitTTL + time.Second)
+	if err := svc.ApproveCommit(ctx, id, cv.ID); !errors.Is(err, ErrNoPendingCommit) || clicks(fb) != 0 {
+		t.Fatalf("a stale request must not run: %v", err)
 	}
 }
 
@@ -309,7 +415,7 @@ func TestTakingControlDropsPendingCommit(t *testing.T) {
 	if err := svc.HumanTakeControl(id); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.ApproveCommit(id, c.ID); !errors.Is(err, ErrNoPendingCommit) {
+	if err := svc.ApproveCommit(ctx, id, c.ID); !errors.Is(err, ErrNoPendingCommit) {
 		t.Fatalf("a request must not survive the page changing under the user: %v", err)
 	}
 }
@@ -492,14 +598,27 @@ func TestGrantLifetimes(t *testing.T) {
 	})
 }
 
-func TestRevokeClearsEveryGrantAndApprovedCommit(t *testing.T) {
+func TestRevokeClearsGrantsAndPendingCommitAndDomainCanBeReapproved(t *testing.T) {
 	svc, fb, _, id := startGranted(t, nil)
 	fb.target = sendTarget()
 	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
-	_ = svc.ApproveCommit(id, pendingView(t, svc, id).ID)
+	cv := pendingView(t, svc, id)
 	_ = svc.Revoke(id)
-	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrApprovalRevoked) {
+	if err := svc.ApproveCommit(ctx, id, cv.ID); !errors.Is(err, ErrNoPendingCommit) || clicks(fb) != 0 {
+		t.Fatalf("a revoked session must not run a pending commit: %v", err)
+	}
+	if r := svc.Sessions(id)[0].CommitResult; r == nil || r.State != "revoked" {
+		t.Fatalf("result: %+v", r)
+	}
+	if _, err := svc.Click(ctx, id, "#x", nil, nil, "g"); !errors.Is(err, ErrApprovalRevoked) {
 		t.Fatalf("revoked: %v", err)
+	}
+	if err := svc.ApproveDomain(id, "a.test", 0); err != nil {
+		t.Fatal(err)
+	}
+	fb.target = nil
+	if _, err := svc.Click(ctx, id, "#x", nil, nil, "g"); err != nil {
+		t.Fatalf("a revoked domain can be approved again: %v", err)
 	}
 }
 
@@ -521,19 +640,173 @@ func TestWaitCommit(t *testing.T) {
 func TestSelectApprovalBindsTheChosenOption(t *testing.T) {
 	svc, fb, _, id := startGranted(t, nil)
 	fb.target = &platform.TargetInfo{Resolved: true, Tag: "select", InForm: true, AutoSubmit: true}
-	_, _ = svc.Select(ctx, id, "#plan", "basic", "Basic", "g")
-	if err := svc.ApproveCommit(id, pendingView(t, svc, id).ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.Select(ctx, id, "#plan", "premium", "Premium", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
-		t.Fatalf("a different option is a different action: %v", err)
-	}
+	_, _ = svc.Select(ctx, id, "#plan", "premium", "Premium", "g")
 	if c := pendingView(t, svc, id); !strings.Contains(c.Action, "Premium") {
 		t.Fatalf("the card must show the option: %+v", c)
 	}
-	_ = svc.DenyCommit(id, pendingView(t, svc, id).ID)
-	// The approved option still runs.
-	if _, err := svc.Select(ctx, id, "#plan", "basic", "Basic", "g"); err != nil {
-		t.Fatalf("the approved option: %v", err)
+	if err := svc.ApproveCommit(ctx, id, pendingView(t, svc, id).ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := fb.calls[len(fb.calls)-1]; got != "select #plan" {
+		t.Fatalf("the approved select must run: %v", fb.calls)
+	}
+	// A different option is a different action: it asks.
+	if _, err := svc.Select(ctx, id, "#plan", "basic", "Basic", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatalf("a different option: %v", err)
+	}
+}
+
+// Writes are serialized per session, and everything but the pending decision is
+// refused while a commit waits.
+func TestWritesSerializedAndRefusedWhileCommitPending(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	fb.onClick = func() { close(entered); <-release }
+	done := make(chan error, 2)
+	go func() { _, err := svc.Click(ctx, id, "#x", nil, nil, "g"); done <- err }()
+	<-entered
+	go func() { _, err := svc.Scroll(ctx, id, "", nil, nil, 0, 5, "g"); done <- err }()
+	time.Sleep(60 * time.Millisecond)
+	fb.mu.Lock()
+	scrolled := false
+	for _, c := range fb.calls {
+		if c == "scroll" {
+			scrolled = true
+		}
+	}
+	fb.mu.Unlock()
+	if scrolled {
+		t.Fatal("a scroll reached the browser while a click was in flight")
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	fb.onClick = nil
+
+	fb.target = sendTarget()
+	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
+	n := len(fb.calls)
+	writes := map[string]func() error{
+		"scroll":   func() error { _, err := svc.Scroll(ctx, id, "", nil, nil, 0, 5, "g"); return err },
+		"key":      func() error { _, err := svc.Key(ctx, id, "Tab", "g"); return err },
+		"type":     func() error { _, err := svc.Type(ctx, id, "x", "g"); return err },
+		"select":   func() error { _, err := svc.Select(ctx, id, "#s", "v", "", "g"); return err },
+		"navigate": func() error { _, err := svc.Navigate(ctx, id, "http://a.test/x", "g"); return err },
+		"click":    func() error { _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); return err },
+	}
+	for name, w := range writes {
+		if err := w(); !errors.Is(err, ErrCommitPending) {
+			t.Errorf("%s while a commit is pending: %v", name, err)
+		}
+	}
+	if len(fb.calls) != n {
+		t.Fatalf("a write reached the browser: %v", fb.calls[n:])
+	}
+}
+
+// A page that changes between classification and dispatch is not acted on.
+func TestReprobeBeforeDispatch(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	benign := &platform.TargetInfo{Resolved: true, Tag: "button", InputType: "button", Name: "Expand menu", Actionable: true}
+	fb.target = benign
+	n := 0
+	fb.onInspect = func() {
+		n++
+		if n == 2 { // between the first probe and the dispatch the page turns it into Send
+			fb.target = sendTarget()
+		}
+	}
+	if _, err := svc.Click(ctx, id, "#x", nil, nil, "g"); !errors.Is(err, ErrPageChanged) {
+		t.Fatalf("want page_changed, got %v", err)
+	}
+	if clicks(fb) != 0 {
+		t.Fatal("the click ran on a changed page")
+	}
+}
+
+func TestNavigationCommitsDestructiveAddressesAndChecksLanding(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	for _, u := range []string{"http://a.test/logout", "http://a.test/account?action=delete", "http://a.test/x?op=unsubscribe", "http://a.test/delete/"} {
+		if _, err := svc.Navigate(ctx, id, u, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+			t.Fatalf("%s must ask: %v", u, err)
+		}
+		cv := pendingView(t, svc, id)
+		if err := svc.DenyCommit(id, cv.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Approved: it runs.
+	_, _ = svc.Navigate(ctx, id, "http://a.test/logout", "g") // denied earlier: sticky
+	if _, err := svc.Navigate(ctx, id, "http://a.test/settings?action=remove", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatal(err)
+	}
+	if err := svc.ApproveCommit(ctx, id, pendingView(t, svc, id).ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := fb.calls[len(fb.calls)-1]; got != "navigate http://a.test/settings?action=remove" {
+		t.Fatalf("approved navigate must run: %v", fb.calls)
+	}
+	if _, err := svc.Navigate(ctx, id, "http://a.test/docs?q=hello", "g"); err != nil {
+		t.Fatalf("an ordinary address: %v", err)
+	}
+
+	// A redirect onto an ungranted domain stops on a blank page and asks.
+	fb.navigateLandsOn = "http://b.test/landing"
+	_, err := svc.Navigate(ctx, id, "http://a.test/go", "g")
+	if !errors.Is(err, ErrApprovalRequired) || !strings.Contains(err.Error(), "b.test") {
+		t.Fatalf("landing on an ungranted domain: %v", err)
+	}
+	if fb.sessions[id].url != "about:blank" {
+		t.Fatalf("the browser must stop on a blank page, is on %s", fb.sessions[id].url)
+	}
+	if v := svc.Sessions(id)[0]; !v.ApprovalAsked || v.AskedDomain != "b.test" {
+		t.Fatalf("the card must ask about the landed domain: %+v", v)
+	}
+}
+
+func TestUnknownPageCannotBeApprovedOrWritten(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	if err := svc.ApproveDomain(id, UnknownDomain, 0); !errors.Is(err, ErrUnknownPage) {
+		t.Fatalf("approve unknown: %v", err)
+	}
+	fb.sessions[id].url = "http://2130706433.5.6.7.8/"
+	if _, err := svc.Click(ctx, id, "#x", nil, nil, "g"); !errors.Is(err, ErrUnknownPage) {
+		t.Fatalf("write on an unknown page: %v", err)
+	}
+	if svc.Sessions(id)[0].ApprovalAsked {
+		t.Fatal("an unknown page must not raise an approval card")
+	}
+}
+
+func TestTypeWithLineBreakIsRefused(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	for _, text := range []string{"hi\n", "a\rb"} {
+		if _, err := svc.Type(ctx, id, text, "g"); !errors.Is(err, ErrTypeNewline) {
+			t.Fatalf("%q: %v", text, err)
+		}
+	}
+	for _, c := range fb.calls {
+		if c == "type" {
+			t.Fatal("typed text with a line break reached the browser")
+		}
+	}
+}
+
+// What the user typed in a composer never reaches the card or the audit log.
+func TestComposerTextNeverInCardOrAudit(t *testing.T) {
+	const secret = "SECRET-COMPOSER-TEXT-4711"
+	svc, fb, events, id := startGranted(t, nil)
+	tg := sendTarget()
+	tg.Content = "msg=" + secret
+	fb.target = tg
+	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
+	cv := pendingView(t, svc, id)
+	_ = svc.ApproveCommit(ctx, id, cv.ID)
+	if out := fmt.Sprintf("%+v %+v", svc.Sessions(id), *events); strings.Contains(out, secret) {
+		t.Fatalf("composer text leaked: %s", out)
 	}
 }

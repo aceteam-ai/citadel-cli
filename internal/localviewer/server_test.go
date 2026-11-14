@@ -438,8 +438,17 @@ func TestCommitCardApproveAndDenyThroughViewer(t *testing.T) {
 	if r := body("/api/sessions/"+id+"/approve-commit", `{"commit":"`+c.ID+`"}`); r.StatusCode != 200 {
 		t.Fatalf("approve-commit: %d", r.StatusCode)
 	}
-	if _, err := h.svc.Click(ctx, id, "#send", nil, nil, "g"); err != nil {
-		t.Fatalf("approved action must run on repeat: %v", err)
+	clicked := false
+	for _, c := range h.fake.Calls {
+		if strings.HasPrefix(c, "click") {
+			clicked = true
+		}
+	}
+	if !clicked {
+		t.Fatalf("approving in the viewer must run the action: %v", h.fake.Calls)
+	}
+	if v := h.svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "executed" {
+		t.Fatalf("the card must show the outcome: %+v", v.CommitResult)
 	}
 	// Deny path.
 	_, _ = h.svc.Click(ctx, id, "#send", nil, nil, "g")

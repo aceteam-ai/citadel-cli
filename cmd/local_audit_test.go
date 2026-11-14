@@ -48,7 +48,7 @@ func TestLocalAuditRecordsEveryCallWithoutSecrets(t *testing.T) {
 		{"local_cobrowse_type", map[string]any{"session_id": "cb-1", "text": auditSentinel}},
 		{"local_cobrowse_navigate", map[string]any{"session_id": "cb-1", "url": "https://fixture.test/orders"}},
 		{"local_cobrowse_click", map[string]any{"session_id": "cb-1", "selector": "#o1"}},
-		{"local_cobrowse_key", map[string]any{"session_id": "cb-1", "key": "Enter"}},
+		{"local_cobrowse_key", map[string]any{"session_id": "cb-1", "key": "Tab"}},
 		{"local_cobrowse_extract", map[string]any{"session_id": "cb-1", "selector": "#orders"}},
 		{"local_cobrowse_screenshot", sid},
 		{"local_cobrowse_handoff", map[string]any{"session_id": "cb-1", "reason": "log in"}},

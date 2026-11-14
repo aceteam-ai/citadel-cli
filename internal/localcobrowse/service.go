@@ -191,13 +191,18 @@ type session struct {
 	// approvalAsked is set when a write was refused for lack of a grant, so
 	// the viewer shows the approval card; any human answer clears it.
 	approvalAsked bool
-	// commit is the one pending send/post/submit/pay request; approved is the
-	// one-shot token a human approval leaves; deniedFP are actions the user
-	// declined (sticky for the session); lastCommit is the last answer.
-	commit        *pendingCommit
-	approved      *approvedCommit
-	deniedFP      map[string]bool
-	lastCommit    string
+	// commit is the one pending send/post/submit/pay request; deniedFP are
+	// actions the user declined (sticky for the session); lastCommit is the
+	// last outcome (executed, changed, denied, failed, expired, revoked).
+	commit     *pendingCommit
+	deniedFP   map[string]bool
+	lastCommit string
+	// result is the last commit's outcome, shown on the card and in status.
+	result *CommitResult
+	// wmu serializes every write in the session, from the checks through the
+	// probe, budgets, audit, dispatch and settle, and the human's approve
+	// (which runs the approved action). Lock order: wmu, then Service.mu.
+	wmu           sync.Mutex
 	handoffAt     time.Time
 	handoffReason string
 	stoppedReason string
@@ -473,7 +478,7 @@ func (s *Service) finish(ev Event, err error) {
 
 func isRefusal(err error) bool {
 	for _, e := range []error{ErrApprovalRequired, ErrApprovalDenied, ErrApprovalExpired, ErrApprovalRevoked,
-		ErrCommitApprovalRequired, ErrCommitPending, ErrCommitDenied, ErrNoPendingCommit,
+		ErrCommitApprovalRequired, ErrCommitPending, ErrCommitDenied, ErrNoPendingCommit, ErrUnknownPage, ErrPageChanged, ErrTypeNewline,
 		ErrHumanDriving, ErrOnlyUserHandsBack, ErrRateLimited, ErrTooManySessions, ErrNavigationRefused, ErrProfileNotReady,
 		platform.ErrHandedOff, platform.ErrPasswordValue} {
 		if errors.Is(err, e) {
@@ -543,6 +548,9 @@ func (s *Service) grantEvalLocked(ss *session, domain string, now time.Time) (st
 // requireGrant checks the domain grant for one write and, if it holds, records
 // the use. A refusal remembers the domain so the viewer asks about it.
 func (s *Service) requireGrant(id string, ss *session, domain string) error {
+	if domain == UnknownDomain {
+		return ErrUnknownPage
+	}
 	now := s.cfg.Now()
 	s.mu.Lock()
 	state, _ := s.grantEvalLocked(ss, domain, now)
@@ -574,60 +582,86 @@ func (s *Service) requireGrant(id string, ss *session, domain string) error {
 	return err
 }
 
-// preWrite runs the checks every write shares: the session exists, the user is
-// not driving, and no send/post/submit/pay decision is outstanding (so the
-// agent cannot edit what the user is looking at).
-func (s *Service) preWrite(id string) (*session, error) {
-	ss, err := s.lookup(id)
+// beginWrite takes the session's write lock and runs the checks every write
+// shares: the session exists, the user is not driving, and no send, post,
+// submit or payment decision is outstanding (so the agent cannot change what
+// the user is looking at). The caller must call unlock.
+func (s *Service) beginWrite(id string) (ss *session, unlock func(), err error) {
+	ss, err = s.lookup(id)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	ss.wmu.Lock()
 	if s.humanDriving(id) {
-		return nil, ErrHumanDriving
+		ss.wmu.Unlock()
+		return nil, nil, ErrHumanDriving
 	}
 	s.mu.Lock()
 	s.expireCommitLocked(ss, s.cfg.Now())
 	pending := ss.commit != nil
 	s.mu.Unlock()
 	if pending {
-		return nil, ErrCommitPending
+		ss.wmu.Unlock()
+		return nil, nil, ErrCommitPending
 	}
-	return ss, nil
+	return ss, ss.wmu.Unlock, nil
 }
 
-// expireCommitLocked drops a request nobody answered and an approval nobody
-// used. Caller holds s.mu.
+// expireCommitLocked drops a request nobody answered. Caller holds s.mu.
 func (s *Service) expireCommitLocked(ss *session, now time.Time) {
 	if ss.commit != nil && now.Sub(ss.commit.requestedAt) >= PendingCommitTTL {
-		ss.commit = nil
-		ss.lastCommit = "expired"
-		s.notifyLocked()
-	}
-	if ss.approved != nil && !now.Before(ss.approved.expires) {
-		ss.approved = nil
+		s.resolveCommitLocked(ss, ss.commit, "expired", "no answer in time, not executed", now)
 	}
 }
 
-// spendBudget applies the owner-wide write (and navigation) budgets.
-func (s *Service) spendBudget(navigation bool) error {
+// resolveCommitLocked ends the pending request with an outcome the card and
+// the agent's status show. Caller holds s.mu.
+func (s *Service) resolveCommitLocked(ss *session, pc *pendingCommit, state, detail string, now time.Time) {
+	ss.commit = nil
+	ss.lastCommit = state
+	ss.result = &CommitResult{ID: pc.id, Domain: pc.domain, Action: pc.action, State: state, Detail: detail, At: now.UTC().Format(time.RFC3339)}
+	s.notifyLocked()
+}
+
+// spendBudget applies the owner-wide write (and navigation) budgets. The
+// returned func gives the spend back, for a write that then fails before it is
+// sent (an audit failure must not use up the user's or the agent's budget).
+func (s *Service) spendBudget(navigation bool) (refund func(), err error) {
 	now := s.cfg.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writes = pruneBefore(s.writes, now.Add(-time.Minute))
 	if len(s.writes) >= s.cfg.WritesPerMinute {
-		return fmt.Errorf("%w: at most %d actions per minute; slow down", ErrRateLimited, s.cfg.WritesPerMinute)
+		return nil, fmt.Errorf("%w: at most %d actions per minute; slow down", ErrRateLimited, s.cfg.WritesPerMinute)
 	}
 	if navigation {
 		s.navs = pruneBefore(s.navs, now.Add(-time.Hour))
 		if len(s.navs) >= s.cfg.NavigationsPerHour {
-			return fmt.Errorf("%w: at most %d page loads per hour", ErrRateLimited, s.cfg.NavigationsPerHour)
+			return nil, fmt.Errorf("%w: at most %d page loads per hour", ErrRateLimited, s.cfg.NavigationsPerHour)
 		}
 	}
 	s.writes = append(s.writes, now)
 	if navigation {
 		s.navs = append(s.navs, now)
 	}
-	return nil
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for i := len(s.writes) - 1; i >= 0; i-- {
+			if s.writes[i].Equal(now) {
+				s.writes = append(s.writes[:i], s.writes[i+1:]...)
+				break
+			}
+		}
+		if navigation {
+			for i := len(s.navs) - 1; i >= 0; i-- {
+				if s.navs[i].Equal(now) {
+					s.navs = append(s.navs[:i], s.navs[i+1:]...)
+					break
+				}
+			}
+		}
+	}, nil
 }
 
 func pruneBefore(ts []time.Time, cutoff time.Time) []time.Time {
@@ -725,8 +759,10 @@ func (s *Service) currentURL(id string) string {
 
 // enforceLanding refuses after the fact when a navigation (for example an
 // HTTP redirect, which the pre-check cannot see) landed on a refused address,
-// and returns the browser to a blank page.
-func (s *Service) enforceLanding(ctx context.Context, id string, res ActionResult) error {
+// or on a domain with no live grant. Either way the browser is returned to a
+// blank page; a missing grant also raises the approval card for that domain, so
+// a redirect cannot carry the agent onto a site the user never approved.
+func (s *Service) enforceLanding(ctx context.Context, id string, ss *session, res ActionResult) error {
 	if res.URL == "" || !res.Navigated {
 		return nil
 	}
@@ -734,41 +770,67 @@ func (s *Service) enforceLanding(ctx context.Context, id string, res ActionResul
 		_, _ = s.cfg.Browser.Navigate(id, "about:blank")
 		return fmt.Errorf("the page redirected to a refused address and was closed: %w", err)
 	}
+	if ss != nil {
+		if err := s.requireGrant(id, ss, RegistrableDomain(res.URL)); err != nil {
+			_, _ = s.cfg.Browser.Navigate(id, "about:blank")
+			return fmt.Errorf("the browser landed on a site that is not approved and was returned to a blank page: %w", err)
+		}
+	}
 	return nil
 }
 
-// Navigate opens url in the session (W).
-func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionResult, error) {
-	ev := Event{SessionID: id, Action: "navigate", Class: "W", Goal: goal, URL: url, Domain: RegistrableDomain(url)}
+// finishAfter settles a dispatched write, counts a page load toward the budget
+// and checks where the browser landed.
+func (s *Service) finishAfter(ctx context.Context, id string, ss *session, before string, navigation bool) (ActionResult, error) {
+	res := s.settle(ctx, id, before)
+	if res.Navigated || navigation {
+		s.mu.Lock()
+		s.navs = append(pruneBefore(s.navs, s.cfg.Now().Add(-time.Hour)), s.cfg.Now())
+		s.mu.Unlock()
+	}
+	return res, s.enforceLanding(ctx, id, ss, res)
+}
+
+// Navigate opens url in the session (W). An address that itself changes or ends
+// something (a logout or delete path, an action=delete query) is a commit.
+func (s *Service) Navigate(ctx context.Context, id, rawURL, goal string) (ActionResult, error) {
+	ev := Event{SessionID: id, Action: "navigate", Class: "W", Goal: goal, URL: rawURL, Domain: RegistrableDomain(rawURL)}
 	res, err := func() (ActionResult, error) {
-		if err := s.cfg.URLPolicy(ctx, url); err != nil {
+		if err := s.cfg.URLPolicy(ctx, rawURL); err != nil {
 			if _, lerr := s.lookup(id); lerr != nil {
 				return ActionResult{}, lerr
 			}
 			return ActionResult{}, err
 		}
-		ss, err := s.preWrite(id)
+		ss, unlock, err := s.beginWrite(id)
 		if err != nil {
 			return ActionResult{}, err
 		}
+		defer unlock()
 		if err := s.requireGrant(id, ss, ev.Domain); err != nil {
 			return ActionResult{}, err
 		}
-		if err := s.spendBudget(true); err != nil {
+		a := actionRef{Kind: "navigate", URL: rawURL}
+		if dec := ClassifyNavigation(rawURL); dec.Class == ClassCommit {
+			return ActionResult{}, s.authorizeCommit(&ev, ss, a, platform.TargetInfo{Resolved: true}, dec, ev.Domain)
+		}
+		refund, err := s.spendBudget(true)
+		if err != nil {
 			return ActionResult{}, err
 		}
 		if err := s.beforeAction(&ev); err != nil {
+			refund()
 			return ActionResult{}, err
 		}
 		before := s.currentURL(id)
-		if _, err := s.cfg.Browser.Navigate(id, url); err != nil {
+		if _, err := s.cfg.Browser.Navigate(id, rawURL); err != nil {
 			return ActionResult{}, err
 		}
 		res := s.settle(ctx, id, before)
-		if url != before {
+		if rawURL != before {
 			res.Navigated = true
 		}
-		return res, s.enforceLanding(ctx, id, res)
+		return res, s.enforceLanding(ctx, id, ss, res)
 	}()
 	s.finish(ev, err)
 	return res, err
@@ -788,6 +850,12 @@ func (s *Service) Click(ctx context.Context, id, selector string, x, y *float64,
 // Type inserts text into the focused element (W). Only its length is audited.
 func (s *Service) Type(ctx context.Context, id, text, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "type", Class: "W", Goal: goal, TextLen: len([]rune(text))}
+	if strings.ContainsAny(text, "\r\n") {
+		// A newline can send a message or submit a form, which is Enter, a
+		// commit. Typing never carries it; use local_cobrowse_key Enter.
+		s.finish(ev, ErrTypeNewline)
+		return ActionResult{}, ErrTypeNewline
+	}
 	res, err := s.writeAction(ctx, &ev, actionRef{Kind: "type"}, func() error {
 		_, err := s.cfg.Browser.Type(id, text)
 		return err
@@ -851,27 +919,42 @@ func (s *Service) beforeAction(ev *Event) error {
 	return nil
 }
 
-// writeAction runs one scripted browser write. Order: the user is not driving
-// and no commit decision is pending; the page's domain has a live grant; the
-// target is resolved and classified; a commit needs its own approval of this
-// exact action (D1, D5); only then are the budgets spent, the pending audit
-// record written and the action sent.
+// probe reads the target of an action.
+func (s *Service) probe(id string, a actionRef) (platform.TargetInfo, error) {
+	t, err := s.cfg.Browser.InspectTarget(id, platform.TargetProbe{Kind: a.Kind, Selector: a.Selector, X: a.X, Y: a.Y})
+	if errors.Is(err, platform.ErrHandedOff) {
+		return platform.TargetInfo{}, ErrHumanDriving
+	}
+	return t, err
+}
+
+// writeAction runs one scripted browser write under the session's write lock.
+// Order: the user is not driving and no commit decision is pending; the page's
+// domain has a live grant; the target is resolved and classified; a commit is
+// recorded for the user and refused (it runs only when the user approves it,
+// see ApproveCommit); otherwise the budgets are spent, the pending audit record
+// is written, the target is probed again and, only if it is unchanged, the
+// action is sent.
 func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do func() error) (ActionResult, error) {
 	id := ev.SessionID
-	ss, err := s.preWrite(id)
+	ss, unlock, err := s.beginWrite(id)
 	if err != nil {
 		return ActionResult{}, err
 	}
+	defer unlock()
 	pageDomain := RegistrableDomain(s.currentURL(id))
 	ev.Domain = pageDomain
 	if err := s.requireGrant(id, ss, pageDomain); err != nil {
 		return ActionResult{}, err
 	}
 	navigation := false
-	if a.Kind != "scroll" {
-		t, err := s.cfg.Browser.InspectTarget(id, platform.TargetProbe{Kind: a.Kind, Selector: a.Selector, X: a.X, Y: a.Y})
-		if errors.Is(err, platform.ErrHandedOff) {
-			return ActionResult{}, ErrHumanDriving
+	classify := a.Kind != "scroll"
+	var fp0 string
+	var class0 Class
+	if classify {
+		t, err := s.probe(id, a)
+		if errors.Is(err, ErrHumanDriving) {
+			return ActionResult{}, err
 		}
 		if err != nil {
 			// Fail closed: an action whose target cannot be read is a commit.
@@ -897,59 +980,58 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 				}
 			}
 		case ClassCommit:
-			fp, err := s.authorizeCommit(ev, ss, a, t, dec, pageDomain)
-			if err != nil {
-				return ActionResult{}, err
-			}
-			ev.Fingerprint = fp[:16]
+			return ActionResult{}, s.authorizeCommit(ev, ss, a, t, dec, pageDomain)
 		}
+		fp0, class0 = fingerprint(a, t), dec.Class
 	}
-	if err := s.spendBudget(false); err != nil {
+	refund, err := s.spendBudget(false)
+	if err != nil {
 		return ActionResult{}, err
 	}
 	if err := s.beforeAction(ev); err != nil {
+		refund()
 		return ActionResult{}, err
+	}
+	if classify {
+		// Re-probe immediately before dispatch: the action goes out only if
+		// the target is exactly what was classified.
+		t2, err := s.probe(id, a)
+		if errors.Is(err, ErrHumanDriving) {
+			return ActionResult{}, err
+		}
+		if err != nil || fingerprint(a, t2) != fp0 || Classify(a.Kind, a.Key, t2).Class != class0 {
+			return ActionResult{}, ErrPageChanged
+		}
 	}
 	before := s.currentURL(id)
 	if err := do(); err != nil {
 		return ActionResult{}, err
 	}
-	res := s.settle(ctx, id, before)
-	if res.Navigated || navigation {
-		s.mu.Lock()
-		s.navs = append(pruneBefore(s.navs, s.cfg.Now().Add(-time.Hour)), s.cfg.Now())
-		s.mu.Unlock()
-	}
-	return res, s.enforceLanding(ctx, id, res)
+	return s.finishAfter(ctx, id, ss, before, navigation)
 }
 
-// authorizeCommit decides one commit action. It returns the fingerprint when
-// an approval of exactly this action is redeemed (once). Otherwise it records a
-// pending request, asks the user, and returns the refusal the agent sees.
-func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platform.TargetInfo, dec Decision, domain string) (string, error) {
+// authorizeCommit records a commit for the user and returns the refusal the
+// agent sees: a sticky ErrCommitDenied for an action the user already
+// declined, otherwise ErrCommitApprovalRequired. Only the action reference and
+// its fingerprint are kept, never typed text; the action runs from
+// ApproveCommit if and only if the user approves it.
+func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platform.TargetInfo, dec Decision, domain string) error {
 	fp := fingerprint(a, t)
 	label := sanitizeLabel(t.Name)
 	now := s.cfg.Now()
+	ev.Fingerprint, ev.Label = fp[:16], label
 	s.mu.Lock()
 	s.expireCommitLocked(ss, now)
 	if ss.deniedFP[fp] {
 		s.mu.Unlock()
-		ev.Fingerprint, ev.Label = fp[:16], label
-		return "", ErrCommitDenied
+		return ErrCommitDenied
 	}
-	if ap := ss.approved; ap != nil && ap.fp == fp {
-		ss.approved = nil // one use
-		s.mu.Unlock()
-		ev.Label = label
-		return fp, nil
-	}
-	shotRect := t.Rect
 	pc := &pendingCommit{
-		id: newCommitID(), fp: fp, domain: domain, action: describeAction(a, t), label: label,
-		reason: dec.Reason, requestedAt: now, rect: shotRect,
+		id: newCommitID(), fp: fp, ref: a, domain: domain, action: describeAction(a, t), label: label,
+		reason: dec.Reason, requestedAt: now, rect: t.Rect,
 	}
 	ss.commit = pc
-	ss.lastCommit = ""
+	ss.lastCommit, ss.result = "", nil
 	s.notifyLocked()
 	s.mu.Unlock()
 
@@ -965,8 +1047,7 @@ func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platfor
 	s.emit(Event{SessionID: ss.id, Action: "commit_prompt", Class: "W", Goal: ev.Goal, Domain: domain,
 		Fingerprint: fp[:16], Label: label, Outcome: "asked"})
 	s.attention(ss.id, "approval")
-	ev.Fingerprint, ev.Label = fp[:16], label
-	return "", ErrCommitApprovalRequired
+	return ErrCommitApprovalRequired
 }
 
 func newCommitID() string {
@@ -1039,10 +1120,11 @@ type SessionView struct {
 	GrantExpiresAt string      `json:"grant_expires_at,omitempty"`
 	Grants         []GrantView `json:"grants,omitempty"`
 	// Commit is the send, post, submit or payment waiting for the user.
-	Commit        *CommitView `json:"commit,omitempty"`
-	HandoffSince  string      `json:"handoff_since,omitempty"`
-	HandoffReason string      `json:"handoff_reason,omitempty"`
-	Lifetime      string      `json:"lifetime"`
+	Commit        *CommitView   `json:"commit,omitempty"`
+	CommitResult  *CommitResult `json:"commit_result,omitempty"`
+	HandoffSince  string        `json:"handoff_since,omitempty"`
+	HandoffReason string        `json:"handoff_reason,omitempty"`
+	Lifetime      string        `json:"lifetime"`
 }
 
 // GrantView is one live domain grant.
@@ -1109,6 +1191,12 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 			cv.Rect = &r
 		}
 		v.Commit = cv
+	}
+	if r := ss.result; r != nil {
+		if at, err := time.Parse(time.RFC3339, r.At); err == nil && now.Sub(at) < 5*time.Minute {
+			rc := *r
+			v.CommitResult = &rc
+		}
 	}
 	if st.Driver == platform.DriverHuman && !ss.handoffAt.IsZero() {
 		v.HandoffSince = ss.handoffAt.UTC().Format(time.RFC3339)
@@ -1227,7 +1315,9 @@ func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety
 	defer s.mu.Unlock()
 	// The page is about to change under the user's hands: an unanswered or
 	// unused commit approval no longer describes it.
-	ss.commit, ss.approved = nil, nil
+	if ss.commit != nil {
+		s.resolveCommitLocked(ss, ss.commit, "expired", "you took control, so it was not executed", s.cfg.Now())
+	}
 	if human {
 		if ss.handoffAt.IsZero() {
 			ss.handoffAt = s.cfg.Now()
@@ -1413,6 +1503,9 @@ func (s *Service) Approve(id string, d time.Duration) error { return s.ApproveDo
 // identity-bearing domain never more than the identity cap (D3, D4). It never
 // covers a commit action (D1).
 func (s *Service) ApproveDomain(id, domain string, d time.Duration) error {
+	if domain == UnknownDomain {
+		return ErrUnknownPage
+	}
 	return s.setGrant(id, "approve", domain, func(ss *session, dom string, now time.Time) {
 		if d <= 0 {
 			d = s.cfg.GrantDuration
@@ -1442,7 +1535,9 @@ func (s *Service) Revoke(id string) error {
 				*g = grantState{revoked: true}
 			}
 		}
-		ss.approved = nil
+		if ss.commit != nil {
+			s.resolveCommitLocked(ss, ss.commit, "revoked", "approvals were revoked, so it was not executed", s.cfg.Now())
+		}
 	}, false)
 }
 
@@ -1479,52 +1574,136 @@ func (s *Service) setGrant(id, action, domain string, f func(*session, string, t
 	return nil
 }
 
-// ApproveCommit approves the one pending send, post, submit or payment, named
-// by the id the viewer showed (so an answer to a stale card cannot approve a
-// newer action). The approval is for that exact action only: the agent repeats
-// the call, and it runs only if its fingerprint still matches (D5).
-func (s *Service) ApproveCommit(id, commitID string) error {
-	return s.answerCommit(id, commitID, true)
+// ApproveCommit approves the one pending send, post, submit, payment or
+// destructive address, named by the id the viewer showed (so an answer to a
+// stale card cannot approve a newer action), and runs it (aceteam#13687 D5).
+// It holds the session's write lock throughout: it probes the live target
+// again, requires the fingerprint to equal the approved one, and only then
+// spends the budgets, writes the pending audit record and dispatches. If the
+// page changed it does not execute and says so on the card. A budget or audit
+// failure leaves the request pending, so the approval is not lost.
+func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error {
+	s.mu.Lock()
+	ss, ok := s.sessions[id]
+	s.mu.Unlock()
+	if !ok {
+		s.finish(Event{SessionID: id, Action: "approve_commit", Class: "H"}, ErrNoSession)
+		return ErrNoSession
+	}
+	ss.wmu.Lock()
+	defer ss.wmu.Unlock()
+
+	s.mu.Lock()
+	s.expireCommitLocked(ss, s.cfg.Now())
+	pc := ss.commit
+	s.mu.Unlock()
+	if pc == nil || pc.id != commitID {
+		s.finish(Event{SessionID: id, Action: "approve_commit", Class: "H"}, ErrNoPendingCommit)
+		return ErrNoPendingCommit
+	}
+	hev := Event{SessionID: id, Action: "approve_commit", Class: "H", Domain: pc.domain, Fingerprint: pc.fp[:16], Label: pc.label}
+	resolve := func(state, detail string) {
+		s.mu.Lock()
+		if ss.commit == pc {
+			s.resolveCommitLocked(ss, pc, state, detail, s.cfg.Now())
+		}
+		s.mu.Unlock()
+	}
+	if s.humanDriving(id) {
+		s.finish(hev, ErrHumanDriving)
+		return ErrHumanDriving
+	}
+	a := pc.ref
+	t := platform.TargetInfo{Resolved: true}
+	if a.Kind != "navigate" {
+		var err error
+		if t, err = s.probe(id, a); err != nil {
+			t = platform.TargetInfo{Reason: "the page could not be inspected"}
+		}
+	}
+	if fingerprint(a, t) != pc.fp {
+		resolve("changed", "the page changed, so it was not executed; the agent will ask again")
+		hev.Outcome = "page_changed"
+		s.emit(hev)
+		return nil
+	}
+	if err := s.requireGrant(id, ss, pc.domain); err != nil {
+		resolve("failed", "the approval for this site is no longer valid, so it was not executed")
+		s.finish(hev, err)
+		return err
+	}
+	ev := Event{SessionID: id, Action: a.Kind, Class: "W", Selector: a.Selector, URL: a.URL,
+		Domain: pc.domain, Fingerprint: pc.fp[:16], Label: pc.label}
+	refund, err := s.spendBudget(a.Kind == "navigate")
+	if err != nil {
+		s.finish(hev, err)
+		return err
+	}
+	if err := s.beforeAction(&ev); err != nil {
+		refund()
+		s.finish(hev, err)
+		return err
+	}
+	before := s.currentURL(id)
+	derr := s.dispatchCommit(id, a)
+	if derr == nil {
+		_, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate")
+	}
+	s.finish(ev, derr)
+	if derr != nil {
+		resolve("failed", "the action did not complete: "+truncRunes(derr.Error(), 120))
+		hev.Outcome = "error"
+		s.emit(hev)
+		return nil
+	}
+	resolve("executed", "approved and done")
+	hev.Outcome = "ok"
+	s.emit(hev)
+	return nil
+}
+
+// dispatchCommit sends an approved action to the browser.
+func (s *Service) dispatchCommit(id string, a actionRef) error {
+	var err error
+	switch a.Kind {
+	case "click":
+		_, err = s.cfg.Browser.Click(id, a.Selector, a.X, a.Y)
+	case "key":
+		_, err = s.cfg.Browser.Key(id, a.Key)
+	case "select":
+		_, err = s.cfg.Browser.Select(id, a.Selector, a.Value, a.Label)
+	case "navigate":
+		_, err = s.cfg.Browser.Navigate(id, a.URL)
+	default:
+		err = fmt.Errorf("unknown action %q", a.Kind)
+	}
+	return err
 }
 
 // DenyCommit declines the pending commit; the same action is then refused for
 // the rest of the session.
 func (s *Service) DenyCommit(id, commitID string) error {
-	return s.answerCommit(id, commitID, false)
-}
-
-func (s *Service) answerCommit(id, commitID string, approve bool) error {
-	action := "deny_commit"
-	if approve {
-		action = "approve_commit"
-	}
-	now := s.cfg.Now()
 	s.mu.Lock()
 	ss, ok := s.sessions[id]
-	var pc *pendingCommit
-	if ok {
-		s.expireCommitLocked(ss, now)
-		pc = ss.commit
+	s.mu.Unlock()
+	if !ok {
+		s.finish(Event{SessionID: id, Action: "deny_commit", Class: "H"}, ErrNoSession)
+		return ErrNoSession
 	}
+	ss.wmu.Lock()
+	defer ss.wmu.Unlock()
+	s.mu.Lock()
+	s.expireCommitLocked(ss, s.cfg.Now())
+	pc := ss.commit
 	var err error
-	switch {
-	case !ok:
-		err = ErrNoSession
-	case pc == nil || pc.id != commitID:
+	if pc == nil || pc.id != commitID {
 		err = ErrNoPendingCommit
-	default:
-		ss.commit = nil
-		if approve {
-			ss.approved = &approvedCommit{fp: pc.fp, expires: now.Add(ApprovedCommitTTL)}
-			ss.lastCommit = "approved"
-		} else {
-			ss.deniedFP[pc.fp] = true
-			ss.lastCommit = "denied"
-		}
-		s.notifyLocked()
+	} else {
+		ss.deniedFP[pc.fp] = true
+		s.resolveCommitLocked(ss, pc, "denied", "you declined it", s.cfg.Now())
 	}
 	s.mu.Unlock()
-	ev := Event{SessionID: id, Action: action, Class: "H"}
+	ev := Event{SessionID: id, Action: "deny_commit", Class: "H"}
 	if pc != nil {
 		ev.Domain, ev.Fingerprint, ev.Label = pc.domain, pc.fp[:16], pc.label
 	}
