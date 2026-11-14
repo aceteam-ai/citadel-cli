@@ -142,13 +142,17 @@ func (c Client) createEnrollRequest(ctx context.Context, baseURL, orgID, csrPEM 
 	switch resp.StatusCode {
 	case http.StatusAccepted:
 	case http.StatusBadRequest:
-		return enrollRequestCreated{}, errors.New("the platform rejected the enrollment request (check the Slurm labels and the CSR)")
+		return enrollRequestCreated{}, approvalResponseError("the platform rejected the enrollment request (check the Slurm labels and the CSR)", data, "")
 	case http.StatusForbidden, http.StatusNotFound:
-		return enrollRequestCreated{}, errors.New("the organization is unknown or does not allow HPC enrollment")
+		return enrollRequestCreated{}, approvalResponseError("the organization is unknown or does not allow HPC enrollment", data, "")
 	case http.StatusTooManyRequests:
 		return enrollRequestCreated{}, errors.New("the platform is rate limiting enrollment requests; try again shortly")
 	default:
-		return enrollRequestCreated{}, fmt.Errorf("enrollment request failed with HTTP %d", resp.StatusCode)
+		fallback := fmt.Sprintf("enrollment request failed with HTTP %d", resp.StatusCode)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return enrollRequestCreated{}, approvalResponseError(fallback, data, "")
+		}
+		return enrollRequestCreated{}, errors.New(fallback)
 	}
 	if rerr != nil {
 		return enrollRequestCreated{}, rerr
@@ -201,13 +205,17 @@ func (c Client) pollEnrollRequest(ctx context.Context, baseURL, requestID, secre
 		}
 		return pollApproved, out, nil
 	case resp.StatusCode == http.StatusForbidden:
-		return pollPending, EnrollResponse{}, errors.New("enrollment was denied by an organization admin")
+		return pollPending, EnrollResponse{}, approvalResponseError("enrollment was denied by an organization admin", data, secret)
 	case resp.StatusCode == http.StatusGone:
-		return pollPending, EnrollResponse{}, errors.New("the enrollment request expired before it was approved")
+		return pollPending, EnrollResponse{}, approvalResponseError("the enrollment request expired before it was approved", data, secret)
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		return pollPending, EnrollResponse{}, &transientPollError{fmt.Errorf("poll failed with HTTP %d", resp.StatusCode)}
 	default:
-		return pollPending, EnrollResponse{}, fmt.Errorf("poll failed with HTTP %d", resp.StatusCode)
+		fallback := fmt.Sprintf("poll failed with HTTP %d", resp.StatusCode)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return pollPending, EnrollResponse{}, approvalResponseError(fallback, data, secret)
+		}
+		return pollPending, EnrollResponse{}, errors.New(fallback)
 	}
 }
 
