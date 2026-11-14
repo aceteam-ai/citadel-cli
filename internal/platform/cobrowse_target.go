@@ -130,6 +130,15 @@ const FormDigestScript = `
 // is bad too. env supplies the DOM reads at prototype level, so a control named
 // "elements" or "getAttribute" cannot shadow them.
 const FormSnapshotScript = `
+	// sensitiveAC reports an autocomplete value that names a secret: a whole
+	// whitespace-separated token equal to current-password, new-password or
+	// one-time-code (case-insensitive). Section names such as "section-password"
+	// and other tokens are not field names and do not count.
+	function sensitiveAC(ac){
+		var toks = String(ac || "").split(/[ \t\n\f\r]+/);
+		for (var i = 0; i < toks.length; i++) { var t = toks[i].toLowerCase(); if (t === "current-password" || t === "new-password" || t === "one-time-code") return true; }
+		return false;
+	}
 	function buildSnapshot(env, form, sub, t, focus, tIsEntry){
 		var tuples = [], bad = "";
 		if (form) {
@@ -152,7 +161,7 @@ const FormSnapshotScript = `
 					if (!nm0) continue; // an unnamed control submits nothing
 					var ty = String(els[i].type || "").toLowerCase(), ac = String(env.attr(els[i], "autocomplete") || "");
 					var key0 = "n:" + nm0;
-					if (ty === "password" || /one-time-code|current-password|new-password|password/i.test(ac)) {
+					if (ty === "password" || sensitiveAC(ac)) {
 						sens[key0] = true;
 						exp[key0] = exp[key0] || [];
 						// What this control contributes if the submission is the browser's:
@@ -198,7 +207,7 @@ const FormSnapshotScript = `
 			if (ty === "file") { bad = "the page has a file input"; return; }
 			if (/^(password|submit|button|reset|image)$/.test(ty)) return;
 			var ac = String(env.attr(c, "autocomplete") || "");
-			if (/one-time-code|password/i.test(ac)) return;
+			if (sensitiveAC(ac)) return;
 			var v;
 			if (tag === "select") v = Array.prototype.map.call(c.selectedOptions || [], function(o){ return o.value; }).join("\u0000");
 			else if (c.isContentEditable) v = env.text(c);

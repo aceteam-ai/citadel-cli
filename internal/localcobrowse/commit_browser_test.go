@@ -303,6 +303,10 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		"pw4":   `<input type="password" name="to" disabled><input type="text" name="to" value="alice">`,
 		"pw5":   `<input type="password" name="to" value="x" disabled>`,
 		"pw6":   `<input type="checkbox" name="to" autocomplete="one-time-code">`,
+		"ac1":   `<input type="text" name="to" value="alice" autocomplete="section-password email">`,
+		"ac2":   `<input type="text" name="to" value="mallory" autocomplete="section-password email">`,
+		"ac3":   `<input type="text" name="to" value="alice" autocomplete="section-blue shipping current-password">`,
+		"ac4":   `<input type="text" name="to" value="mallory" autocomplete="section-blue shipping current-password">`,
 		"pw2":   `<input type="password" name="pw" value="secret"><input type="hidden" name="to" value="alice">`,
 		"cf1":   `<x-field name="to" id="xf"></x-field>`,
 		"cf2":   `<x-field name="to" id="xf"></x-field>`,
@@ -414,6 +418,12 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		if ti := inspect(v); ti.Resolved {
 			t.Errorf("%s: a sensitive control sharing its name with another control must be unverifiable: %+v", v, ti)
 		}
+	}
+	if a, b := fp(inspect("ac1")), fp(inspect("ac2")); a == b {
+		t.Error(`autocomplete="section-password email" is an ordinary field: a recipient change must change the binding`)
+	}
+	if a, b := fp(inspect("ac3")), fp(inspect("ac4")); a != b {
+		t.Error("a genuine current-password token must not be bound")
 	}
 	if ti := inspect("pw2"); !ti.Resolved || ti.ContentHash == "" {
 		t.Errorf("a password field with a unique name stays verifiable: %+v", ti)

@@ -247,6 +247,30 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 			scenario{Form: form(map[string]string{"accept-charset": "utf-8"}, ent("m", "hi"), m, send), T: 1},
 			scenario{Form: form(map[string]string{"accept-charset": "iso-8859-1"}, ent("m", "hi"), m, send), T: 1},
 		},
+		"section name containing password is not sensitive": {
+			scenario{Form: form(nil, ent("to", "alice"), func() fakeEl {
+				e := fel("INPUT", "text", "to", "alice")
+				e.Attrs = map[string]string{"autocomplete": "section-password email"}
+				return e
+			}(), send), T: 1},
+			scenario{Form: form(nil, ent("to", "mallory"), func() fakeEl {
+				e := fel("INPUT", "text", "to", "mallory")
+				e.Attrs = map[string]string{"autocomplete": "section-password email"}
+				return e
+			}(), send), T: 1},
+		},
+		"section name containing one-time-code is not sensitive": {
+			scenario{Form: form(nil, ent("to", "alice"), func() fakeEl {
+				e := fel("INPUT", "text", "to", "alice")
+				e.Attrs = map[string]string{"autocomplete": "section-one-time-code email"}
+				return e
+			}(), send), T: 1},
+			scenario{Form: form(nil, ent("to", "mallory"), func() fakeEl {
+				e := fel("INPUT", "text", "to", "mallory")
+				e.Attrs = map[string]string{"autocomplete": "section-one-time-code email"}
+				return e
+			}(), send), T: 1},
+		},
 		"submitter value": {
 			scenario{Form: form(nil, ent("m", "hi", "go", "send"), m, button("go", "send", nil)), T: 1},
 			scenario{Form: form(nil, ent("m", "hi", "go", "send-all"), m, button("go", "send-all", nil)), T: 1},
@@ -314,6 +338,39 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 			scenario{Form: form(nil, ent("m", "hi"), un, dis, m, send), T: 3})
 		if r[0].Bad != "" || r[0].Digest == "" || r[0].Digest != r[1].Digest {
 			t.Fatalf("%+v %+v", r[0], r[1])
+		}
+	})
+
+	// Genuine secret tokens, with section and shipping/billing modifiers and any
+	// case, are sensitive: their entry is not bound.
+	for _, ac := range []string{"current-password", "new-password", "one-time-code", "section-a shipping current-password", "billing new-password", "section-x ONE-TIME-CODE"} {
+		t.Run("sensitive token "+ac, func(t *testing.T) {
+			mk := func(v string) *fakeForm {
+				e := fel("INPUT", "text", "tok", v)
+				e.Attrs = map[string]string{"autocomplete": ac}
+				return form(nil, ent("tok", v), e, send)
+			}
+			r := runInspect(t, scenario{Form: mk("one"), T: 1}, scenario{Form: mk("two"), T: 1})
+			if r[0].Bad != "" || r[0].Digest == "" || r[0].Digest != r[1].Digest {
+				t.Fatalf("%q must be treated as a secret and not bound: %+v %+v", ac, r[0], r[1])
+			}
+		})
+	}
+
+	// The outside-form composer path follows the same rule.
+	t.Run("outside-form composer follows the token rule", func(t *testing.T) {
+		out := func(ac, v string) scenario {
+			e := fel("INPUT", "text", "to", v)
+			e.Attrs = map[string]string{"autocomplete": ac}
+			return scenario{Form: nil, T: -1, TEntry: true, TOutsid: &e}
+		}
+		r := runInspect(t, out("section-password email", "alice"), out("section-password email", "mallory"),
+			out("one-time-code", "alice"), out("one-time-code", "mallory"))
+		if r[0].Digest == "" || r[0].Digest == r[1].Digest {
+			t.Fatalf("a section name is not a secret: the value must be bound: %+v %+v", r[0], r[1])
+		}
+		if r[2].Digest != r[3].Digest {
+			t.Fatalf("a real one-time-code token must not be bound: %+v %+v", r[2], r[3])
 		}
 	})
 
