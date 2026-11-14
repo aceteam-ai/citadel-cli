@@ -3791,3 +3791,21 @@ Auto-generated log of every release.
   - Log credential fingerprints instead of full values (#1603)
 
 
+---
+
+## v2.227.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 10 |
+| Lines added | +439 |
+
+**Changes:**
+
+  - fix(hpc): pin transformers<5 beside vLLM 0.11 in hpc setup (#1637)
+  - fix(cobrowse): stop leaves session dir behind; real-browser CI flake (#1630)
+  - Merge remote-tracking branch 'origin/main'
+  - fix(jobs): honor per-job timeout_ms in the HTTP proxy (#1628)
+
+
