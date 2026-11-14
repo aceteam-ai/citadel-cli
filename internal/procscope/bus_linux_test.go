@@ -77,6 +77,18 @@ func (f *fakeScopeTransport) Call(ctx context.Context, destination string, objec
 		return reply(invocationObjectPath(f.identity.InvocationID))
 	}
 	if method == "org.freedesktop.DBus.Properties.Get" {
+		if len(args) != 2 {
+			f.t.Fatal("wrong Properties.Get argument count")
+		}
+		// Model systemd's actual declaring interfaces rather than accepting
+		// every property on Unit. In particular Unit has no ControlGroup.
+		expected := "org.freedesktop.systemd1.Unit"
+		if args[1] == "ControlGroup" {
+			expected = "org.freedesktop.systemd1.Scope"
+		}
+		if args[0] != expected {
+			return &dbus.Call{Err: dbus.Error{Name: "org.freedesktop.DBus.Error.UnknownProperty"}}
+		}
 		var value any
 		switch args[1] {
 		case "Id":
@@ -200,5 +212,25 @@ func TestInvocationPathUsesCanonicalSystemdBusLabel(t *testing.T) {
 		if _, err := bus.invocationPath(context.Background(), transport.identity); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestReadIdentityUsesSystemdPropertyInterfaces(t *testing.T) {
+	bus, transport := fakeBus(t)
+	ctx := context.Background()
+	object := invocationObjectPath(transport.identity.InvocationID)
+	identity, active, err := bus.readIdentity(ctx, object)
+	if err != nil || !active || identity != transport.identity {
+		t.Fatalf("scope identity: %+v active=%v err=%v", identity, active, err)
+	}
+	// This is the pre-fix native failure. Ensure the fake cannot hide it.
+	call := transport.Call(ctx, transport.owner, object,
+		"org.freedesktop.DBus.Properties.Get", "org.freedesktop.systemd1.Unit", "ControlGroup")
+	if call.Err == nil {
+		t.Fatal("fake accepted ControlGroup on Unit")
+	}
+	var group string
+	if err := bus.property(ctx, object, "ControlGroup", &group); err != nil || group != identity.ControlGroup {
+		t.Fatalf("scope ControlGroup=%q err=%v", group, err)
 	}
 }
