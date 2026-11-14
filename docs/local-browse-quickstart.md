@@ -201,6 +201,11 @@ stops. To keep a login, ask the agent to use a saved profile, for example
    The session then starts logged out and nothing is saved. Citadel never
    does this on its own.
 
+Logins are saved when the session stops normally: the agent stops it, you
+press **End session**, or the agent app closes Citadel. If the agent app is
+killed outright, logins from that session are not saved; the copy saved last
+time is kept.
+
 If you forget the passphrase, the saved logins cannot be recovered by anyone,
 including AceTeam. `& $citadel local passphrase forget` deletes them so you
 can start again. Other commands:
