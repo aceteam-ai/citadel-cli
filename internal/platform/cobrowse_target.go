@@ -181,7 +181,7 @@ func (m *CobrowseSessionManager) InspectTarget(id string, p TargetProbe) (Target
 	if err != nil {
 		return TargetInfo{}, err
 	}
-	port, err := s.requireDrivablePort()
+	pn, err := s.pinAction()
 	if err != nil {
 		return TargetInfo{}, err
 	}
@@ -193,7 +193,7 @@ func (m *CobrowseSessionManager) InspectTarget(id string, p TargetProbe) (Target
 	pyj, _ := json.Marshal(py)
 	expr := fmt.Sprintf("%s(%s,%s,%s,%s)", targetProbeScript,
 		jsStringLiteral(p.Kind), jsStringLiteral(p.Selector), pxj, pyj)
-	val, err := runtimeEvaluate(port, expr)
+	val, err := runtimeEvaluate(pn, expr)
 	if err != nil {
 		return TargetInfo{}, err
 	}

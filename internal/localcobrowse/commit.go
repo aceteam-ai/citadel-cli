@@ -388,6 +388,9 @@ type pendingCommit struct {
 	requestedAt time.Time
 	shot        string
 	rect        platform.TargetRect
+	// targetID is the page the commit was recorded on ("" without page
+	// tracking); an approval only executes on that page.
+	targetID string
 }
 
 func describeAction(a actionRef, t platform.TargetInfo) string {

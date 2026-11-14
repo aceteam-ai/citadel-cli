@@ -22,6 +22,11 @@ button { padding: .35rem .8rem; border-radius: 6px; border: 1px solid #bbb; back
 button.primary { background: #2457d6; border-color: #2457d6; color: #fff; }
 button.quiet { border-color: transparent; background: transparent; color: #555; }
 button.danger { color: #b3261e; }
+.pages { display: flex; gap: .25rem; flex-wrap: wrap; margin: 0 0 .4rem; }
+.pages .page { display: inline-flex; align-items: center; border: 1px solid #ccc; background: #fff; border-radius: 6px; max-width: 16rem; }
+.pages .page.sel { border-color: #2457d6; color: #2457d6; }
+.pages .page button { border: 0; background: transparent; padding: .25rem .5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pages .page button.x { padding: .25rem .4rem; color: #666; }
 #screen-wrap { background: #222; border-radius: 6px; outline: none; display: flex; justify-content: center; }
 #screen-wrap.driving { box-shadow: 0 0 0 3px #e3b65c; }
 #screen { max-width: 100%; height: auto; user-select: none; }

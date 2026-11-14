@@ -17,9 +17,18 @@ func NewManagerSession() Session {
 }
 
 // NewManagerSessionFrom wraps a specific manager (e.g. an isolated one in tests).
+//
+// Page tracking (TargetSession) is offered only when the manager has it enabled
+// (local mode). A manager without it, such as the node-wide one, yields the
+// plain Session: no targets frames, no page switching, the first page streamed.
 func NewManagerSessionFrom(m *platform.CobrowseSessionManager) Session {
+	if m != nil && m.TargetsEnabled() {
+		return targetManagerSession{managerSession{m: m}}
+	}
 	return managerSession{m: m}
 }
+
+type targetManagerSession struct{ managerSession }
 
 // AttachTarget returns the session's CDP debug port when it is attachable: it
 // must be known, have a debug port, and be in a running/attached state (not
@@ -38,3 +47,23 @@ func (s managerSession) AttachTarget(id string) (int, bool) {
 func (s managerSession) MarkAttached(id string) bool     { return s.m.MarkAttached(id) }
 func (s managerSession) MarkDetached(id string) bool     { return s.m.MarkDetached(id) }
 func (s managerSession) ViewerHasControl(id string) bool { return s.m.ViewerHasControl(id) }
+
+// Targets implements TargetSession.
+func (s targetManagerSession) Targets(id string) (TargetSnapshot, error) {
+	t, err := s.m.Targets(id)
+	if err != nil {
+		return TargetSnapshot{}, err
+	}
+	snap := TargetSnapshot{Active: t.Active, ActiveWebSocketURL: t.ActiveWebSocketURL}
+	for _, tg := range t.Targets {
+		snap.Targets = append(snap.Targets, TargetInfo{ID: tg.ID, Title: tg.Title, URL: tg.URL, Active: tg.Active})
+	}
+	return snap, nil
+}
+
+func (s targetManagerSession) SwitchTarget(id, target string) error {
+	return s.m.SwitchTarget(id, target)
+}
+func (s targetManagerSession) CloseTarget(id, target string) error {
+	return s.m.CloseTarget(id, target)
+}

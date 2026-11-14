@@ -30,6 +30,7 @@
 package platform
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -96,6 +97,10 @@ type CobrowseSessionStatus struct {
 	Driver CobrowseDriver `json:"driver,omitempty"`
 	// Browser is the launched browser's kind ("chrome", "edge", "chromium").
 	Browser string `json:"browser,omitempty"`
+	// ActiveTarget and Targets list the open pages (tabs and popups); the URL
+	// above is the active page's.
+	ActiveTarget string           `json:"active_target,omitempty"`
+	Targets      []CobrowseTarget `json:"targets,omitempty"`
 	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
 	Generation uint64 `json:"generation,omitempty"`
 }
@@ -150,6 +155,11 @@ type CobrowseSessionManager struct {
 	baseDir     string
 	sweepOnce   sync.Once
 	launchOpts  LaunchOptions
+	// trackTargets, targetPolicy and targetEvent are set by
+	// EnableTargetTracking (local mode only).
+	trackTargets bool
+	targetPolicy TargetPolicy
+	targetEvent  TargetEventFunc
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
@@ -201,6 +211,11 @@ type cobrowseSession struct {
 	regDir     string
 	generation uint64
 	pendingEnd *EndedSession
+	// tracking is set at creation from the manager (local mode only): pages are
+	// followed and status lists them. expectTarget is the page a call was
+	// checked against (see ExpectTarget).
+	tracking     bool
+	expectTarget string
 }
 
 var (
@@ -316,6 +331,7 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		encProfile: profile,
 		regDir:     m.sessionRegDir(),
 		generation: 1,
+		tracking:   m.trackTargets,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -362,8 +378,8 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		// Wait for the launch URL (including redirects) to settle, then report
 		// where the page ended up, as Navigate does. Best effort: a page that
 		// cannot be read leaves the plain status.
-		if port, perr := s.requireDrivablePort(); perr == nil {
-			ps := settleNavigation(port, "")
+		if p, perr := s.pinAction(); perr == nil {
+			ps := settleNavigation(p, "")
 			if ps.URL != "" {
 				st.URL = ps.URL
 			}
@@ -401,6 +417,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	}
 	m.mu.Lock()
 	lo := m.launchOpts
+	tpolicy, tevent := m.targetPolicy, m.targetEvent
 	m.mu.Unlock()
 	lo.Detach = m.useResolver && detachedWorker.Load()
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
@@ -412,6 +429,12 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	// the session still runs and graceful stop still reaps it in-process.
 	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID, currentProcessStartToken())
 
+	// Configure the page policy before the session is visible to status or
+	// actions, so no page is ever accepted without it.
+	if s.tracking {
+		dropTargetSet(proc.debugPort)
+		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
+	}
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
@@ -530,6 +553,9 @@ func (s *cobrowseSession) teardown() error {
 	if proc != nil && proc.stop != nil {
 		err = proc.stop()
 	}
+	if proc != nil {
+		dropTargetSet(proc.debugPort)
+	}
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
 		// produced new state, and sealing an empty/partial working dir would
@@ -591,7 +617,19 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 	s.mu.Unlock()
 
 	if probePort != 0 {
-		if t, err := pickTarget(probePort); err == nil {
+		if s.tracking {
+			ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+			if snap, err := targetSetFor(probePort).sync(ctx, probePort); err == nil {
+				st.Targets = snap.Targets
+				st.ActiveTarget = snap.Active
+				for _, tg := range snap.Targets {
+					if tg.Active {
+						st.URL = tg.URL
+					}
+				}
+			}
+			cancel()
+		} else if t, err := pickTarget(probePort); err == nil {
 			st.URL = t.URL
 		}
 	}

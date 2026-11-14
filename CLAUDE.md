@@ -118,6 +118,29 @@ fallthrough, and `isLocalModeCommand` skips the root pre-run's CA trust and
 update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
 user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
 
+`platform.targetSet` owns a session's open pages (S15, aceteam#13503): popups
+and new tabs. It is local mode only: a manager opts in with
+`EnableTargetTracking`; the node-wide manager does not, and its status, actions
+and stream are unchanged. `reconcileTargets` is the pure rule: a page becomes
+active only when the browser reports (`Target.getTargets` openerId; `/json` has
+no opener) that the active page opened it, a page opened by a background tab
+stays listed until the user picks it, and a closing page returns to the most
+recent opener. Pages keep first-seen order, never the browser's list order.
+`targetSet.sync` judges each new or navigated page after the fact: the page
+opens, then is closed if it fails the policy (local mode passes
+`Service.TargetPolicy`, the navigation address filter; an unconfigured set uses
+the http(s) scheme rule), audited as `target_closed` (actor citadel). The egress
+guard is what stops its network traffic, not the close. It bounds pages at
+`MaxCobrowseTargets`, tolerates a flood through `cdpdiscovery.ListBounded`, and
+never closes the last page. `pin` fixes the page an action works on: every CDP
+command of one action goes to that page, `verify` refuses input if it stopped
+being active, and `ExpectTarget` lets `Service` pin the page its gates checked.
+The viewer protocol is shared with the future cloud viewer:
+`cobrowsestream.TargetSession` (offered only for a tracking manager), a
+`targets` TEXT frame, and `target_switch` / `target_close` input that need live
+control and are audited. `TestRealBrowserPopupSignIn` is the real-browser
+acceptance (windows-latest).
+
 Local-mode write consent is per registrable domain, not per session
 (aceteam#13687 D1-D5, citadel-cli#1636). `localcobrowse.RegistrableDomain` owns
 the scope (public suffix list); `Service.grantEvalLocked` owns a grant's state

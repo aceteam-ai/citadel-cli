@@ -415,7 +415,7 @@ func TestWindowsRealBrowserOwnerKilled(t *testing.T) {
 // hint brands are logged (not asserted): --user-agent does not change them.
 func assertNotHeadlessUA(t *testing.T, port int) {
 	t.Helper()
-	ua, err := runtimeEvaluate(port, "navigator.userAgent")
+	ua, err := runtimeEvaluate(pin{port: port}, "navigator.userAgent")
 	if err != nil {
 		t.Fatalf("read navigator.userAgent: %v", err)
 	}
@@ -430,7 +430,7 @@ func assertNotHeadlessUA(t *testing.T, port int) {
 	if ua != header {
 		t.Errorf("navigator.userAgent %q differs from the request header %q", ua, header)
 	}
-	brands, _ := runtimeEvaluate(port, "JSON.stringify(navigator.userAgentData ? navigator.userAgentData.brands : null)")
+	brands, _ := runtimeEvaluate(pin{port: port}, "JSON.stringify(navigator.userAgentData ? navigator.userAgentData.brands : null)")
 	t.Logf("navigator.userAgentData.brands: %v", brands)
 }
 
