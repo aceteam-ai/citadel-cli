@@ -172,7 +172,9 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 			kept = append(kept, tg)
 			continue
 		}
-		if policy != nil {
+		// A page that has not loaded yet (a fresh popup before its first
+		// navigation) has no address to judge; it is judged when it gets one.
+		if policy != nil && tg.URL != "" && tg.URL != "about:blank" {
 			pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 			perr := policy(pctx, tg.URL)
 			cancel()

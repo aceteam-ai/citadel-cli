@@ -158,6 +158,16 @@ func TestTargetSetClosesPopupRefusedByPolicy(t *testing.T) {
 		t.Fatalf("refusal not reported: %v", refused)
 	}
 
+	// A popup that has not loaded anything yet is not refused for having no
+	// address.
+	f.set([2]string{"a", "http://app.test/"}, [2]string{"e", ""})
+	snap, _ = ts.sync(ctx, f.port)
+	if snap.Active != "e" || len(snap.Targets) != 2 {
+		t.Fatalf("empty popup: %+v", snap)
+	}
+	f.set([2]string{"a", "http://app.test/"})
+	_, _ = ts.sync(ctx, f.port)
+
 	// A popup that opens blank and later navigates to a refused address is
 	// closed when the address is seen.
 	f.set([2]string{"a", "http://app.test/"}, [2]string{"q", "about:blank"})
