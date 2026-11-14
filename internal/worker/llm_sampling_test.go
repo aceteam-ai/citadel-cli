@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
 // runSamplingJob runs one llm_inference job against a fake engine and returns
@@ -194,5 +195,48 @@ func TestSamplingSentSGLangMessagesOmitsTopP(t *testing.T) {
 	p := &jobs.LLMInferencePayload{Backend: "sglang", Messages: []jobs.ChatMessage{{Role: "user"}}, TopP: 0.9}
 	if _, ok := samplingSent(p)["top_p"]; ok {
 		t.Fatal("sglang never sends top_p, so it must not be recorded")
+	}
+}
+
+// TestSeedValidatedFromOriginalWireToken drives the real queue path
+// (redisapi.ParseStreamMessage -> APISource.convertJob -> Execute). The decoded
+// Payload map has already rounded the seed through float64, so only the
+// original RawPayload token can refuse a fractional seed.
+func TestSeedValidatedFromOriginalWireToken(t *testing.T) {
+	run := func(seed string) (*JobResult, bool) {
+		called := false
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if serveReadinessProbe(w, r) {
+				return
+			}
+			called = true
+			_, _ = w.Write([]byte(`{"content":"ok","stop":true}`))
+		}))
+		defer ts.Close()
+		raw := `{"model":"m","backend":"llamacpp","prompt":"hi","seed":` + seed + `}`
+		parsed, err := redisapi.ParseStreamMessage(redisapi.StreamMessage{ID: "1-0", Data: redisapi.StreamMessageData{JobID: "j", Type: JobTypeLLMInference, Payload: raw}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		job := NewAPISource(APISourceConfig{}).convertJob(parsed)
+		h := NewLLMInferenceHandler()
+		h.baseURLs["llamacpp"] = ts.URL
+		res, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+		if err != nil || res == nil {
+			t.Fatalf("Execute(%s) = %+v, %v", seed, res, err)
+		}
+		return res, called
+	}
+	for _, bad := range []string{"9007199254740990.9", "9007199254740990.5", "0.99999999999999999", "1e3", "9007199254740992", "-9007199254740992", `"7"`} {
+		res, called := run(bad)
+		if res.Status == JobStatusSuccess || called {
+			t.Errorf("seed %s accepted (status=%v, engine called=%v)", bad, res.Status, called)
+		}
+	}
+	for _, good := range []string{"0", "42", "-42", "9007199254740991", "-9007199254740991", "null"} {
+		res, _ := run(good)
+		if res.Status != JobStatusSuccess {
+			t.Errorf("seed %s refused: %+v", good, res)
+		}
 	}
 }

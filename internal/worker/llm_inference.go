@@ -280,6 +280,9 @@ func (h *LLMInferenceHandler) baseURL(backend string) string {
 // backend switch mirrors the original internal/jobs handler verbatim; only the
 // output sink changed (StreamWriter + JobResult instead of Redis Publish*).
 func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	if err := validateRawSeed(job.RawPayload); err != nil {
+		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
+	}
 	payload, err := parseLLMInferencePayload(job.Payload)
 	if err != nil {
 		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
@@ -498,6 +501,34 @@ func safeSeed(v any) bool {
 		return err == nil && i >= -maxSafeSeed && i <= maxSafeSeed
 	}
 	return false
+}
+
+// validateRawSeed checks the seed's original JSON token. The decoded Payload
+// map went through float64, which silently rounds a fractional seed such as
+// 9007199254740990.9 to an integer that then looks valid. The token must be an
+// integer literal (no fraction or exponent) within +/-maxSafeSeed.
+func validateRawSeed(raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil // the decoded payload path owns malformed-payload errors
+	}
+	v, ok := m["seed"]
+	if !ok || v == nil {
+		return nil
+	}
+	n, isNum := v.(json.Number)
+	if !isNum || strings.ContainsAny(n.String(), ".eE") {
+		return fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
+	if i, err := n.Int64(); err != nil || i < -maxSafeSeed || i > maxSafeSeed {
+		return fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
+	return nil
 }
 
 func parseLLMInferencePayload(data map[string]any) (*jobs.LLMInferencePayload, error) {
