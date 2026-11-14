@@ -26,6 +26,8 @@ type cmdFakeBrowser struct {
 	// landing and title, when set, are what PageState reports (a redirect
 	// and a page title).
 	landing, title string
+	// target, when set, is what InspectTarget reports.
+	target *platform.TargetInfo
 }
 
 func newCmdFakeBrowser() *cmdFakeBrowser {
@@ -116,6 +118,14 @@ func (f *cmdFakeBrowser) PageState(id string) (platform.PageState, error) {
 		u = f.landing
 	}
 	return platform.PageState{URL: u, ReadyState: "complete", Title: f.title}, f.gate(id)
+}
+func (f *cmdFakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
+	if f.target != nil {
+		t := *f.target
+		t.PageURL = "http://fixture.test/"
+		return t, f.gate(id)
+	}
+	return platform.TargetInfo{Resolved: true, Tag: "div", PageURL: "http://fixture.test/"}, f.gate(id)
 }
 func (f *cmdFakeBrowser) Handoff(id string) (platform.CobrowseSessionStatus, error) {
 	f.mu.Lock()

@@ -69,8 +69,17 @@ type Record struct {
 	// before the write ran.
 	PendingSeq int64  `json:"pending_seq,omitempty"`
 	Error      string `json:"error,omitempty"`
-	PrevHash   string `json:"prev_hash"`
-	Hash       string `json:"hash"`
+	// Domain is the registrable domain a grant or commit prompt concerns.
+	// Fingerprint is the first 16 hex characters of a commit action's
+	// fingerprint, so a prompt, its answer and the action that ran can be tied
+	// together; Label is the control's own caption (never typed text); Rules is
+	// the classifier version that called the action a commit.
+	Domain      string `json:"domain,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Label       string `json:"label,omitempty"`
+	Rules       string `json:"rules,omitempty"`
+	PrevHash    string `json:"prev_hash"`
+	Hash        string `json:"hash"`
 }
 
 // hashRecord is the SHA-256 of the record's RFC 8785 (JCS) canonical JSON with
