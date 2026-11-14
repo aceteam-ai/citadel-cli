@@ -8,8 +8,9 @@ the same computer, with you in charge:
   Citadel viewer, then press **Hand back to agent**. The agent never sees what
   you type.
 - **Approvals and an audit trail.** The agent can look at pages without
-  asking, but it needs your approval in the viewer before it clicks, types or
-  navigates. Every action is recorded on this computer, and
+  asking, but it needs your approval in the viewer, for each website, before it
+  clicks, types or navigates there. Sending, posting, submitting a form, paying
+  or deleting always asks you again, every time. Every action is recorded on this computer, and
   `citadel.exe local audit` shows it.
 - **It stays on your computer.** There is no AceTeam account. Docker and admin
   rights are not needed. Citadel makes no calls of its own: no update check
@@ -171,9 +172,14 @@ orders, let me log in, then list my last three orders."
    "Agent driving". The co-browse browser itself runs hidden. It is separate
    from your own browser and never uses your normal browser profile.
 2. **Approve.** On the agent's first click or navigation, the viewer asks
-   whether to allow this agent to click, type and navigate in this session.
-   You can allow it for 24 hours, 8 hours or 1 hour, or deny it. You can
-   revoke it at any time.
+   whether to allow this agent to click, type and navigate on that website
+   (and its subdomains). You can allow it for 8 hours (the default), 24 hours or
+   1 hour, or deny it; the approval ends when the session ends. Once you have
+   taken control of a session, for example to log in, approvals in it last at
+   most 1 hour and end after 15 minutes without activity. Each Send, Post,
+   Submit, Pay or Delete asks you separately, with a picture of the button, and
+   your answer covers that one action only. You can revoke approvals at any
+   time.
 3. **Log in yourself.** At the login page the agent hands off. The viewer
    shows "Waiting for you: log in, then hand back". Press **Take control**,
    click into the page and type your password. Then press **Hand back to
@@ -214,6 +220,7 @@ The command opens a fresh one-time link.
 | The viewer says "No agent connected" | The agent app has not started Citadel. Check its config with `& $citadel local doctor`, then restart the app. |
 | "another Citadel process already owns co-browse" | Another agent app is using co-browse. Close it, or use that one. |
 | `approval_denied` / `approval_expired` / `approval_revoked` | The agent was told your answer. Approve again in the viewer if you want it to continue. |
+| `commit_approval_required` / `commit_denied` | A send, post, submit, payment or delete needs your answer each time. The viewer shows the button; the agent is told if you decline. |
 | "navigation refused" | The agent tried a local, private or non-web address. This is deliberate. |
 | `rate_limited` | The agent is acting too fast. It should slow down. |
 | The viewer link "expired or was already used" | Run `& $citadel local viewer`. |

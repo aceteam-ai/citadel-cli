@@ -47,6 +47,16 @@ func TestClassify(t *testing.T) {
 		{"search submit is fill", "click", "", el(func(t *platform.TargetInfo) {
 			t.Tag, t.InputType, t.Name, t.Actionable, t.InForm, t.Search = "button", "submit", "Search", true, true, true
 		}), ClassFill},
+		{"link labeled Send is a commit, not a navigation", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.Name, t.Href, t.Actionable = "a", "Send", "http://a.test/form#", true
+		}), ClassCommit},
+		{"link labeled Post to another page", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.Name, t.Href, t.Actionable = "a", "Post", "http://a.test/compose", true
+		}), ClassCommit},
+		{"fragment link with a harmless label", "click", "", el(func(t *platform.TargetInfo) {
+			t.Tag, t.Name, t.Href, t.Actionable = "a", "Details", "http://a.test/form#more", true
+		}), ClassFill},
+		{"nameless fragment link is a commit", "click", "", el(func(t *platform.TargetInfo) { t.Tag, t.Href, t.Actionable = "a", "http://a.test/form#", true }), ClassCommit},
 		{"nameless actionable is commit", "click", "", el(func(t *platform.TargetInfo) { t.Tag, t.Actionable = "div", true }), ClassCommit},
 		{"unresolved target is commit", "click", "", platform.TargetInfo{Reason: "target is inside iframe"}, ClassCommit},
 		{"focus a text field", "click", "", el(func(t *platform.TargetInfo) { t.Tag, t.InputType, t.Entry = "input", "text", true }), ClassFill},
@@ -70,6 +80,8 @@ func TestClassify(t *testing.T) {
 		{"Enter in a search box", "key", "Enter", el(func(t *platform.TargetInfo) {
 			t.Tag, t.InputType, t.Entry, t.Search, t.InForm = "input", "search", true, true, true
 		}), ClassFill},
+		{"Enter in a date input inside a form", "key", "Enter", el(func(t *platform.TargetInfo) { t.Tag, t.InputType, t.Entry, t.InForm = "input", "date", true, true }), ClassCommit},
+		{"Enter on a checkbox inside a form", "key", "Enter", el(func(t *platform.TargetInfo) { t.Tag, t.InputType, t.InForm = "input", "checkbox", true }), ClassCommit},
 		{"Enter on a focused Send button", "key", "Enter", sendBtn, ClassCommit},
 		{"Space on a focused Send button", "key", " ", sendBtn, ClassCommit},
 		{"Tab is fill", "key", "Tab", sendBtn, ClassFill},
@@ -438,17 +450,31 @@ func TestGrantLifetimes(t *testing.T) {
 		}
 	})
 
-	t.Run("other domains are not identity-bearing", func(t *testing.T) {
+	t.Run("a human drive caps every domain in the session, including an SSO hop", func(t *testing.T) {
 		svc, fb, _ := newTestService(t, mod)
 		st, _ := svc.Start(ctx, "http://a.test/", "g", "")
 		id := st.SessionID
 		_, _ = svc.Handoff(ctx, id, "log in", "g")
+		fb.sessions[id].url = "http://sso.test/login" // the human followed a redirect and signed in
 		_ = svc.HumanHandBack(id)
-		fb.sessions[id].url = "http://other.test/"
-		_ = svc.ApproveDomain(id, "other.test", 0)
+		_ = svc.ApproveDomain(id, "sso.test", 8*time.Hour)
+		c.add(16 * time.Minute)
+		if err := write(svc, id); !errors.Is(err, ErrApprovalExpired) {
+			t.Fatalf("the SSO domain must take the identity idle limit: %v", err)
+		}
+	})
+
+	t.Run("an agent resume with nobody driving does not mark the session", func(t *testing.T) {
+		svc, _, _ := newTestService(t, mod)
+		st, _ := svc.Start(ctx, "http://a.test/", "g", "")
+		id := st.SessionID
+		if _, err := svc.Resume(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		_ = svc.ApproveDomain(id, "a.test", 0)
 		c.add(2 * time.Hour)
 		if err := write(svc, id); err != nil {
-			t.Fatalf("an unrelated domain keeps the long grant: %v", err)
+			t.Fatalf("no human drove, so the long grant stands: %v", err)
 		}
 	})
 
@@ -489,5 +515,25 @@ func TestWaitCommit(t *testing.T) {
 	r, _ = svc.Wait(ctx, id, "commit", time.Second)
 	if !r.Satisfied || r.State != "denied" {
 		t.Fatalf("denied: %+v", r)
+	}
+}
+
+func TestSelectApprovalBindsTheChosenOption(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	fb.target = &platform.TargetInfo{Resolved: true, Tag: "select", InForm: true, AutoSubmit: true}
+	_, _ = svc.Select(ctx, id, "#plan", "basic", "Basic", "g")
+	if err := svc.ApproveCommit(id, pendingView(t, svc, id).ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Select(ctx, id, "#plan", "premium", "Premium", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatalf("a different option is a different action: %v", err)
+	}
+	if c := pendingView(t, svc, id); !strings.Contains(c.Action, "Premium") {
+		t.Fatalf("the card must show the option: %+v", c)
+	}
+	_ = svc.DenyCommit(id, pendingView(t, svc, id).ID)
+	// The approved option still runs.
+	if _, err := svc.Select(ctx, id, "#plan", "basic", "Basic", "g"); err != nil {
+		t.Fatalf("the approved option: %v", err)
 	}
 }

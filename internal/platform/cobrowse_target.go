@@ -89,6 +89,17 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	} else if (selector) {
 		el = document.querySelector(selector);
 		if (!el) { out.reason = "no element matches"; return out; }
+		if (kind === "click") {
+			// Mirror what the real click does: scroll to the element, then click its
+			// centre, which lands on whatever is there (a container's Send button).
+			try { el.scrollIntoView({block: "center", inline: "center", behavior: "instant"}); } catch (e) {}
+			var br = el.getBoundingClientRect();
+			var cx = br.x + br.width / 2, cy = br.y + br.height / 2;
+			if (br.width > 0 && br.height > 0 && cx >= 0 && cx < window.innerWidth && cy >= 0 && cy < window.innerHeight) {
+				var hit = deepPoint(cx, cy);
+				if (hit && (hit === el || el.contains(hit))) el = hit;
+			}
+		}
 	} else if (typeof px === "number" && typeof py === "number") {
 		el = deepPoint(px, py);
 		if (!el) { out.reason = "nothing at that point"; return out; }
@@ -103,7 +114,7 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	var role = (t.getAttribute("role") || "").toLowerCase();
 	var type = (t.type || t.getAttribute("type") || "").toLowerCase();
 	var isEntry = tag === "textarea" || t.isContentEditable || role === "textbox" || role === "searchbox" || role === "combobox" ||
-		(tag === "input" && /^(|text|email|url|tel|number|password|search)$/.test(type));
+		(tag === "input" && !/^(checkbox|radio|button|submit|reset|image|file|hidden|range|color)$/.test(type));
 	out.tag = tag; out.role = role; out.input_type = type;
 	out.name = nameOf(t);
 	out.actionable = !!act || (!isEntry && ((cs && cs.cursor === "pointer") || t.hasAttribute("tabindex")));
@@ -130,7 +141,8 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	var parts = [];
 	function field(c){
 		var ty = (c.type || "").toLowerCase();
-		if (/^(password|hidden|file|submit|button|reset|image)$/.test(ty)) return;
+		// Hidden fields carry recipients and amounts, so they are bound too.
+		if (/^(password|file|submit|button|reset|image)$/.test(ty)) return;
 		var ac = (c.getAttribute && c.getAttribute("autocomplete")) || "";
 		if (/one-time-code|password/i.test(ac)) return;
 		var v = c.isContentEditable ? txt(c) : (c.value !== undefined ? c.value : "");

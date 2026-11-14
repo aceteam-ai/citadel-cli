@@ -148,11 +148,15 @@ func Classify(kind, key string, t platform.TargetInfo) Decision {
 	case "key":
 		switch {
 		case isEnter(key):
-			if t.Entry {
-				if t.Search {
-					return Decision{Class: ClassFill}
-				}
-				return Decision{Class: ClassCommit, Reason: "Enter in a text field sends or submits it"}
+			switch {
+			case t.Entry && t.Search:
+				return Decision{Class: ClassFill}
+			case t.Actionable && !t.Entry:
+				return activation(t)
+			case t.Entry || t.InForm:
+				// Fail closed: Enter in any field, or anything inside a form,
+				// can submit it (implicit submission), whatever the input type.
+				return Decision{Class: ClassCommit, Reason: "Enter in a text field or form sends or submits it"}
 			}
 			return activation(t)
 		case isSpace(key):
@@ -175,18 +179,28 @@ func Classify(kind, key string, t platform.TargetInfo) Decision {
 
 func activation(t platform.TargetInfo) Decision {
 	label := t.Name
+	var link *url.URL
 	if t.Href != "" {
 		u, err := url.Parse(t.Href)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 			return Decision{Class: ClassCommit, Reason: "this link does not open a normal web page"}
 		}
-		if hasWord(label, destructiveLinkWords) || destructiveLinkPath.MatchString(u.Path) {
-			return Decision{Class: ClassCommit, Reason: "this link " + quoteLabel(label) + " changes or ends something"}
-		}
-		return Decision{Class: ClassNavigate, Domain: RegistrableDomain(t.Href)}
+		link = u
 	}
+	// The label is checked before the href: many sites build their Send and
+	// Post "buttons" from anchors, and a link named Send is not a navigation.
 	if labelIsCommit(label) {
 		return Decision{Class: ClassCommit, Reason: "the control " + quoteLabel(label) + " sends, posts, submits, pays or deletes"}
+	}
+	if link != nil {
+		if hasWord(label, destructiveLinkWords) || destructiveLinkPath.MatchString(link.Path) {
+			return Decision{Class: ClassCommit, Reason: "this link " + quoteLabel(label) + " changes or ends something"}
+		}
+		if !sameDocument(link, t.PageURL) {
+			return Decision{Class: ClassNavigate, Domain: RegistrableDomain(t.Href)}
+		}
+		// A fragment-only link runs page script, not a navigation: fall through
+		// to the structure rules, where a nameless one is a commit.
 	}
 	submitType := t.InputType == "submit" || t.InputType == "image" ||
 		(t.Tag == "button" && (t.InputType == "" || t.InputType == "submit"))
@@ -200,6 +214,19 @@ func activation(t platform.TargetInfo) Decision {
 		return Decision{Class: ClassCommit, Reason: "this control has no label, so what it does cannot be told"}
 	}
 	return Decision{Class: ClassFill}
+}
+
+// sameDocument reports whether link points into the page it is on (a fragment
+// or an empty href), which does not load another page.
+func sameDocument(link *url.URL, page string) bool {
+	p, err := url.Parse(page)
+	if err != nil {
+		return false
+	}
+	a, b := *link, *p
+	a.Fragment, b.Fragment = "", ""
+	a.RawFragment, b.RawFragment = "", ""
+	return a.String() == b.String()
 }
 
 func quoteLabel(name string) string {
@@ -231,6 +258,8 @@ type actionRef struct {
 	Key      string
 	Selector string
 	X, Y     *float64
+	// Value and Label are the option a select would choose.
+	Value, Label string
 }
 
 // fingerprint binds an approval to one action on one page state (D5). It
@@ -263,8 +292,10 @@ func fingerprint(a actionRef, t platform.TargetInfo) string {
 		FMethod string
 		FAction string
 		Content string
+		Value   string
+		Label   string
 	}{1, a.Kind, a.Key, a.Selector, round(a.X), round(a.Y), originPath(t.PageURL), t.Tag, t.Role, t.InputType,
-		t.Name, originPath(t.Href), t.FormMethod, originPath(t.FormAction), hex.EncodeToString(content[:])})
+		t.Name, originPath(t.Href), t.FormMethod, originPath(t.FormAction), hex.EncodeToString(content[:]), a.Value, a.Label})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
@@ -318,6 +349,11 @@ func describeAction(a actionRef, t platform.TargetInfo) string {
 		}
 		return "Press a key"
 	case "select":
+		if opt := strings.TrimSpace(a.Label); opt != "" {
+			return "Choose " + quoteLabel(opt)
+		} else if opt := strings.TrimSpace(a.Value); opt != "" {
+			return "Choose " + quoteLabel(opt)
+		}
 		return "Choose an option"
 	case "click":
 		if n := strings.TrimSpace(t.Name); n != "" {

@@ -1,17 +1,21 @@
 // Package localcobrowse is Citadel local mode's co-browse owner (aceteam#13503
 // design sections 2.1 to 2.5 and 4): one process per OS user that holds the
-// browser sessions, the per-session write consent, the abuse limits and the
+// browser sessions, the per-domain write consent, the abuse limits and the
 // navigation address filter, and serves the local_cobrowse_* MCP tools.
 //
 // Tool classes follow the platform's split. W (write: navigate, click, type,
-// select, key, scroll) needs a live, human-given grant for the session. R (read:
+// select, key, scroll) needs a live, human-given grant for the registrable
+// domain it acts on (aceteam#13687 D3), and a commit action (send, post, submit,
+// pay, delete, or an unidentifiable target) additionally needs a human answer
+// to that one action every time (D1, D2, D5). R (read:
 // status, extract, screenshot) and L (lifecycle: start, handoff, resume, stop,
 // wait) do not. While a human has taken control, every agent browser action,
 // including screenshot and extract, is refused by the session manager.
 //
 // Consent can only be given by the human in the local viewer; nothing reachable
 // through the MCP tool path can grant it. The viewer side lives in a later
-// slice and calls Approve, Deny, Revoke, HumanTakeControl and HumanHandBack.
+// slice and calls ApproveDomain, Deny, Revoke, ApproveCommit, DenyCommit,
+// HumanTakeControl and HumanHandBack.
 package localcobrowse
 
 import (
@@ -177,8 +181,11 @@ type session struct {
 	lastActive time.Time
 	// grants is keyed by registrable domain (D3).
 	grants map[string]*grantState
-	// identity marks domains where a human drove the browser (D4).
-	identity map[string]bool
+	// humanDrove is set once a human has driven this session's browser. The
+	// session is then identity-bearing (D4): a sign-in may have happened on any
+	// domain, including one reached through an SSO redirect while they drove, so
+	// every grant in the session takes the identity caps.
+	humanDrove bool
 	// askedDomain is the domain the last refused write needed a grant for.
 	askedDomain string
 	// approvalAsked is set when a write was refused for lack of a grant, so
@@ -401,7 +408,7 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 	now := s.cfg.Now()
 	s.mu.Lock()
 	ss := &session{id: st.ID, goal: goal, startedAt: now, lastActive: now,
-		grants: map[string]*grantState{}, identity: map[string]bool{}, deniedFP: map[string]bool{}}
+		grants: map[string]*grantState{}, deniedFP: map[string]bool{}}
 	if startURL != "about:blank" {
 		s.navs = append(s.navs, now)
 	}
@@ -439,7 +446,7 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 		Title:     title,
 		Browser:   st.Browser,
 		Lifetime:  LifetimePolicy,
-		Writes:    "navigate, click, type, select, key and scroll need the user's approval in the Citadel viewer",
+		Writes:    "navigate, click, type, select, key and scroll need the user's approval for each website in the Citadel viewer; anything that sends, posts, submits, pays or deletes asks every time",
 		Viewer:    s.cfg.ViewerNote,
 	}, nil
 }
@@ -519,7 +526,7 @@ func (s *Service) grantEvalLocked(ss *session, domain string, now time.Time) (st
 		return "revoked", time.Time{}
 	}
 	exp := g.expires
-	if ss.identity[domain] {
+	if ss.humanDrove {
 		if abs := g.approvedAt.Add(s.cfg.IdentityGrantDuration); abs.Before(exp) {
 			exp = abs
 		}
@@ -793,7 +800,7 @@ func (s *Service) Type(ctx context.Context, id, text, goal string) (ActionResult
 func (s *Service) Select(ctx context.Context, id, selector, value, label, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "select", Class: "W", Goal: goal, Selector: selector}
 	var picked platform.SelectResult
-	res, err := s.writeAction(ctx, &ev, actionRef{Kind: "select", Selector: selector}, func() error {
+	res, err := s.writeAction(ctx, &ev, actionRef{Kind: "select", Selector: selector, Value: value, Label: label}, func() error {
 		var err error
 		picked, err = s.cfg.Browser.Select(id, selector, value, label)
 		return err
@@ -1091,7 +1098,7 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 	sort.Strings(doms)
 	for _, d := range doms {
 		if st2, e := s.grantEvalLocked(ss, d, now); st2 == "approved" {
-			v.Grants = append(v.Grants, GrantView{Domain: d, ExpiresAt: e.UTC().Format(time.RFC3339), IdentityBearing: ss.identity[d]})
+			v.Grants = append(v.Grants, GrantView{Domain: d, ExpiresAt: e.UTC().Format(time.RFC3339), IdentityBearing: ss.humanDrove})
 		}
 	}
 	if c := ss.commit; c != nil && now.Sub(c.requestedAt) < PendingCommitTTL {
@@ -1207,10 +1214,8 @@ func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety
 	var st platform.CobrowseSessionStatus
 	// A human driving a page is the identity boundary (D4): whatever they do
 	// there, the page may now act as them.
-	if cur, ok := s.cfg.Browser.SessionStatus(id); ok {
-		s.markIdentity(ss, cur.URL)
-	}
 	if human {
+		s.markIdentity(ss)
 		st, err = s.cfg.Browser.Handoff(id)
 	} else {
 		st, err = s.cfg.Browser.Resume(id)
@@ -1218,7 +1223,6 @@ func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety
 	if err != nil {
 		return SessionView{}, err
 	}
-	s.markIdentity(ss, st.URL)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// The page is about to change under the user's hands: an unanswered or
@@ -1237,14 +1241,10 @@ func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety
 	return s.agentViewLocked(ss, st, s.cfg.Now()), nil
 }
 
-// markIdentity records the page's domain as identity-bearing.
-func (s *Service) markIdentity(ss *session, rawURL string) {
-	d := RegistrableDomain(rawURL)
-	if d == UnknownDomain || d == "about:blank" {
-		return
-	}
+// markIdentity records that a human has driven the session.
+func (s *Service) markIdentity(ss *session) {
 	s.mu.Lock()
-	ss.identity[d] = true
+	ss.humanDrove = true
 	s.mu.Unlock()
 }
 
@@ -1420,7 +1420,7 @@ func (s *Service) ApproveDomain(id, domain string, d time.Duration) error {
 		if d > s.cfg.MaxGrantDuration {
 			d = s.cfg.MaxGrantDuration
 		}
-		if ss.identity[dom] && d > s.cfg.IdentityGrantDuration {
+		if ss.humanDrove && d > s.cfg.IdentityGrantDuration {
 			d = s.cfg.IdentityGrantDuration
 		}
 		ss.grants[dom] = &grantState{approvedAt: now, expires: now.Add(d), lastUsed: now}
@@ -1554,6 +1554,9 @@ func (s *Service) HumanTakeControl(id string) error {
 
 // HumanHandBack returns the browser to the agent (viewer "Hand back").
 func (s *Service) HumanHandBack(id string) error {
+	if ss, err := s.lookup(id); err == nil {
+		s.markIdentity(ss) // the human drove until now
+	}
 	_, err := s.setDriver(id, false, "")
 	s.finish(Event{SessionID: id, Action: "hand_back", Class: "H"}, err)
 	return err
@@ -1583,7 +1586,7 @@ func (s *Service) HumanNavigate(ctx context.Context, id, url string) error {
 		_, err := s.cfg.Browser.NavigateAsHuman(id, url)
 		if err == nil {
 			if ss, lerr := s.lookup(id); lerr == nil {
-				s.markIdentity(ss, url)
+				s.markIdentity(ss)
 			}
 		}
 		return err

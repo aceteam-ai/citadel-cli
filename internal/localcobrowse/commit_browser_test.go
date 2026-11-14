@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,12 +14,13 @@ import (
 )
 
 const commitFixturePage = `<!doctype html><title>Synthetic</title><h1 id="t">Commit page</h1>
-<form id="f" method="post" action="/send"><textarea id="msg" name="msg">hello</textarea><button id="send" type="submit">Send</button></form>
+<form id="f" method="post" action="/send"><input type="hidden" name="to" value="bob"><textarea id="msg" name="msg">hello</textarea><button id="send" type="submit">Send</button></form>
 <button id="expand" type="button">Expand menu</button>
 <form role="search" action="/s"><input id="search" type="search" name="q"><button id="go" type="submit">Go</button></form>
 <a id="same" href="/next">Next page</a><a id="out" href="http://other.test/x">Partner</a>
 <iframe id="frame" src="about:blank"></iframe>
-<div id="plain">just text</div>`
+<div id="plain">just text</div>
+<div id="panel" style="display:flex;width:240px;height:60px"><button id="panelsend" type="button" style="flex:1">Send</button></div>`
 
 // TestRealBrowserCommitActions runs the in-page target probe and the commit
 // classifier in a real browser (Windows CI: Chrome and Edge) on a synthetic
@@ -26,8 +28,8 @@ const commitFixturePage = `<!doctype html><title>Synthetic</title><h1 id="t">Com
 // not, an iframe target is unknown and so asks, and the fingerprint follows the
 // composer's content.
 func TestRealBrowserCommitActions(t *testing.T) {
-	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" {
-		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 to run the real-browser commit test")
+	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" && os.Getenv("CITADEL_REAL_BROWSER_TESTS") == "" {
+		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 (or CITADEL_REAL_BROWSER_TESTS=1) to run the real-browser commit test")
 	}
 	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -70,7 +72,7 @@ func TestRealBrowserCommitActions(t *testing.T) {
 
 	d, send := probe("click", "", "#send")
 	want("Send button", d, ClassCommit)
-	if send.Name != "Send" || !send.InForm || send.FormMethod != "post" || send.Content == "" {
+	if send.Name != "Send" || !send.InForm || send.FormMethod != "post" || !strings.Contains(send.Content, "to=bob") || !strings.Contains(send.Content, "msg=hello") {
 		t.Errorf("send target not read: %+v", send)
 	}
 	d, _ = probe("click", "", "#expand")
@@ -90,6 +92,12 @@ func TestRealBrowserCommitActions(t *testing.T) {
 	want("other-site link", d, ClassNavigate)
 	if d.Domain != "other.test" {
 		t.Errorf("other-site link domain = %q", d.Domain)
+	}
+	// A selector for a container whose centre is the Send button is the Send.
+	d, panel := probe("click", "", "#panel")
+	want("container whose centre is Send", d, ClassCommit)
+	if panel.Name != "Send" {
+		t.Errorf("the probe must resolve the element the click lands on: %+v", panel)
 	}
 	d, _ = probe("click", "", "#frame")
 	want("iframe target", d, ClassCommit)

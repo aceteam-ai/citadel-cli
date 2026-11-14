@@ -103,7 +103,7 @@ match. The session base dir there requires an owner-only, protected DACL
 windows-latest CI job runs the real-browser tests against both browsers.
 
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
-per-session write grant (default deny, 24h maximum), the abuse limits, the
+per-domain write grant (default deny, see the next paragraph), the abuse limits, the
 idle lifetime and `local_cobrowse_wait`. `localcobrowse.NewURLPolicy` owns the
 navigation address filter, and its host parsing matches a browser's.
 `localcobrowse.EgressGuard` is the local-mode browser's `--proxy-server`
@@ -128,7 +128,8 @@ commit heuristic over the target `platform.CobrowseSessionManager.InspectTarget`
 reads in the page; anything unresolved is a commit. A commit never rides a
 grant: `Service.authorizeCommit` records a pending request, and only the human
 methods `ApproveCommit`/`DenyCommit` (viewer routes, no MCP tool) answer it.
-`fingerprint` binds the approval to the action; the agent repeats the call and
+A session a human has driven takes the identity caps on every domain (an SSO
+hop would otherwise slip past a per-domain mark). `fingerprint` binds the approval to the action; the agent repeats the call and
 it runs once, only on a match. `TestNoLocalMCPToolCanApprove`,
 `TestCommitAlwaysAsksDespiteGrantAndDenyBlocks` and
 `TestRealBrowserCommitActions` (windows-latest) pin it. It is a label and
