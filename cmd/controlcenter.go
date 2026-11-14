@@ -2578,6 +2578,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !ccPerms.Desktop,
 		DesktopEnabled:            nodeDesktopEnabled,
+		AMTEnabled:                nodeAMTEnabled,
 		DesktopPasscodeState:      nodePasscodeState,
 		ShellPasscodeState:        nodePasscodeState,
 		PasscodeThrottle:          nodePasscodeThrottle,

@@ -2806,6 +2806,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !workPerms.Desktop,
 		DesktopEnabled:            nodeDesktopEnabled,
+		AMTEnabled:                nodeAMTEnabled,
 		DesktopPasscodeState:      nodePasscodeState,
 		ShellPasscodeState:        nodePasscodeState,
 		PasscodeThrottle:          nodePasscodeThrottle,

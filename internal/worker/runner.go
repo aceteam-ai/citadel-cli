@@ -1199,6 +1199,10 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	// other job type; never combined with the hard huddle watch (HUDDLE_JOIN
 	// declares no cooperative cancel).
 	handlerCtx, stopCoopCancelWatch := r.watchCooperativeCancellation(handlerCtx, job)
+	var amtTrace *jobs.AMTMutationTrace
+	if job.Type == JobTypeAMTKVM {
+		handlerCtx, amtTrace = jobs.WithAMTMutationTrace(handlerCtx)
+	}
 	if budgetErr != nil {
 		err = budgetErr
 	} else if bounded {
@@ -1206,6 +1210,9 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	} else {
 		result, err = r.executeObserved(handlerCtx, handler, job, handlerDeliveryStream(job, stream))
 	}
+	// Freeze before terminal classification so an abandoned AMT handler cannot
+	// turn a published prewrite failure into a later first device write.
+	amtWritePossible := amtTrace.Close()
 	stopCoopCancelWatch()
 	cancelled := stopCancellationWatch()
 	// Cooperative legacy handlers finish their current unit and return partial
@@ -1367,6 +1374,26 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 			r.log("warning", "Huddle job %s is waiting for node teardown (%v): %v", job.ID, duration, actualErr)
 			r.recordJob(buildUsageRecord(job, "retry", startTime, endTime, result, actualErr))
 			r.deferHuddleTeardown(ctx, job, actualErr)
+			return false
+		}
+		// AMT capabilities are single use, and a timed-out mutating call may
+		// already have changed the target. Never redeliver the same action.
+		if job.Type == JobTypeAMTKVM {
+			reason := "amt_failed_no_automatic_retry"
+			if amtWritePossible {
+				actualErr = jobs.ErrAMTOutcomeUnknown
+				reason = "amt_outcome_unknown"
+			} else if errors.Is(actualErr, jobs.ErrAMTOutcomeUnknown) {
+				actualErr = errors.New("AMT operation failed before a mutating write; no automatic retry")
+			}
+			r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
+			r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
+			if werr := stream.WriteError(actualErr, false); werr != nil {
+				r.log("warning", "Failed to publish terminal AMT error for job %s: %v", job.ID, werr)
+			}
+			if ferr := r.source.Fail(ctx, job, actualErr, map[string]any{"reason": reason}); ferr != nil {
+				r.log("warning", "Failed to close AMT job %s: %v", job.ID, ferr)
+			}
 			return false
 		}
 		r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)

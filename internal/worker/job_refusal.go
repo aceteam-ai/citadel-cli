@@ -36,6 +36,8 @@ func legacyPermissionRefusal(jobType string) *jobs.ShellRefusal {
 		return jobs.WorkflowShellRefusal(jobs.ReasonShellDisabled)
 	case JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions:
 		return &jobs.ShellRefusal{Reason: "desktop_disabled", Message: "desktop permission is disabled on this node; enable Desktop in the AceTeam control center or use citadel_set_desktop_permission with enabled=true and confirm=true, then retry"}
+	case JobTypeAMTKVM:
+		return &jobs.ShellRefusal{Reason: "amt_disabled", Message: "Intel AMT permission is disabled on this node; enable amt in the node permissions before retrying"}
 	case JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2, JobTypeFileWrite, JobTypeFileWriteBytes, JobTypeFileEdit, JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch, JobTypeFileFetch:
 		return &jobs.ShellRefusal{Reason: "files_disabled", Message: "files permission is disabled on this node; enable Files in the AceTeam control center or use citadel_set_files_permission with enabled=true and confirm=true, then retry"}
 	case JobTypeHuddleJoin, JobTypeMeetingJoin:
@@ -61,6 +63,10 @@ func (g *registrationRefusals) RefusalFor(jobType string) *jobs.ShellRefusal {
 		}
 	case JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions:
 		if !permissionEnabled(o.DesktopEnabled, o.DesktopDisabled) {
+			return legacyPermissionRefusal(jobType)
+		}
+	case JobTypeAMTKVM:
+		if o.AMTEnabled == nil || !o.AMTEnabled() {
 			return legacyPermissionRefusal(jobType)
 		}
 	case JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2, JobTypeFileWrite, JobTypeFileWriteBytes, JobTypeFileEdit, JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch, JobTypeFileFetch, JobTypeMeetingJoin:
