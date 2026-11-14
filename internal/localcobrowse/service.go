@@ -63,6 +63,10 @@ const LifetimePolicy = "until local_cobrowse_stop, the Citadel MCP server exitin
 // Browser is the slice of platform.CobrowseSessionManager the service drives.
 type Browser interface {
 	StartSession(startURL string) (platform.CobrowseSessionStatus, error)
+	// StartSessionWithID starts a session under an id reserved earlier (a
+	// locked persistent-profile session). profile may be nil (throwaway).
+	// Ownership of profile passes to the browser, which Closes it on every path.
+	StartSessionWithID(id, startURL string, profile platform.SessionProfile) (platform.CobrowseSessionStatus, error)
 	SessionStatus(id string) (platform.CobrowseSessionStatus, bool)
 	Stop(id string) error
 	StopAll() error
@@ -92,8 +96,45 @@ var (
 	ErrRateLimited      = errors.New("rate_limited")
 	ErrTooManySessions  = errors.New("too_many_sessions")
 	ErrNoSession        = errors.New("no such co-browse session")
-	ErrProfileNotReady  = errors.New("persistent profiles are not available in this version of local mode; omit profile to use a throwaway session")
+	// ErrProfilesUnavailable refuses a profile when this process has no
+	// profile store (it cannot keep encrypted state for this user).
+	ErrProfilesUnavailable = errors.New("saved browser profiles are not available in this Citadel process; omit profile to use a throwaway session")
+	// ErrSessionLocked refuses every browser action until the user unlocks
+	// the saved profile. The passphrase is entered only in the viewer.
+	ErrSessionLocked = errors.New("locked: this session uses a saved browser profile that the user unlocks with their passphrase in the Citadel viewer; call local_cobrowse_wait with until=unlocked")
+	// ErrProfileInUse refuses a second session on one saved profile.
+	ErrProfileInUse = errors.New("profile_in_use: this saved profile is already open in another session; stop that session first")
 )
+
+// ProfileVaultState describes local mode's passphrase without unlocking it.
+type ProfileVaultState struct {
+	// Configured is true once the user has set a passphrase.
+	Configured bool `json:"configured"`
+	// Strong is false for a store whose secret is below the at-rest
+	// threshold; such a store can never be unlocked for a profile (#820).
+	Strong bool `json:"strong"`
+}
+
+// ProfileStore opens saved, encrypted browser profiles. Only the human-side
+// methods (the viewer) call SetPassphrase and Open; nothing reachable through
+// the MCP tool path ever holds a passphrase.
+type ProfileStore interface {
+	// ValidateName checks a profile name without touching disk.
+	ValidateName(name string) error
+	// State reports whether a passphrase is set.
+	State() (ProfileVaultState, error)
+	// SetPassphrase creates the store's vault. It must refuse a passphrase
+	// below the at-rest threshold and require the data-loss acknowledgement.
+	SetPassphrase(passphrase string, ackDataLoss bool) error
+	// Open unlocks profile name. It must refuse a secret below the at-rest
+	// threshold, and fail closed (no profile) on any error.
+	Open(name, passphrase string) (platform.SessionProfile, error)
+}
+
+// refusal marks an error as a refusal for the audit outcome, keeping its text.
+type refusal struct{ error }
+
+func (r refusal) Unwrap() error { return r.error }
 
 // Event is one tool call outcome, for the audit log.
 type Event struct {
@@ -162,6 +203,11 @@ type Config struct {
 	// ViewerNote is returned in local_cobrowse_start's "viewer" field: where
 	// the user watches and approves. It never contains a secret.
 	ViewerNote string
+	// Profiles opens saved encrypted profiles. Nil refuses profile sessions.
+	Profiles ProfileStore
+	// NewSessionID reserves a session id for a locked session; nil uses
+	// platform.NewCobrowseSessionID.
+	NewSessionID func() string
 }
 
 // grantState is one domain's consent record within a session. Grants belong
@@ -206,6 +252,18 @@ type session struct {
 	handoffAt     time.Time
 	handoffReason string
 	stoppedReason string
+	// profile is the saved profile's name, or "" for a throwaway session.
+	profile string
+	// startURL is where a locked session opens once unlocked.
+	startURL string
+	// locked is true until the user unlocks the profile; no browser runs.
+	locked bool
+	// unlocking is set while an unlock is launching the browser, so two
+	// unlock requests cannot launch twice.
+	unlocking bool
+	// throwaway is set when the user chose to run a profile session without
+	// its saved profile.
+	throwaway bool
 }
 
 // Service is the local co-browse owner.
@@ -265,6 +323,9 @@ func New(cfg Config) *Service {
 	}
 	if cfg.URLPolicy == nil {
 		cfg.URLPolicy = NewURLPolicy(DefaultResolver, cfg.ViewerPorts)
+	}
+	if cfg.NewSessionID == nil {
+		cfg.NewSessionID = platform.NewCobrowseSessionID
 	}
 	return &Service{cfg: cfg, sessions: map[string]*session{}, changed: make(chan struct{})}
 }
@@ -369,11 +430,16 @@ type StartResult struct {
 	Lifetime  string `json:"lifetime"`
 	Writes    string `json:"writes"`
 	Viewer    string `json:"viewer,omitempty"`
+	// Profile names the saved profile; Next says what to do while locked.
+	Profile string `json:"profile,omitempty"`
+	Next    string `json:"next,omitempty"`
 }
 
-// Start opens a new throwaway session at startURL (empty means about:blank).
-// Navigating to the start URL needs no grant (platform decision 3); it still
-// passes the address filter and counts toward the navigation budget.
+// Start opens a new session at startURL (empty means about:blank). Navigating
+// to the start URL needs no grant (platform decision 3); it still passes the
+// address filter and counts toward the navigation budget. With profile set the
+// session starts locked: no browser runs until the user unlocks the saved
+// profile in the viewer.
 func (s *Service) Start(ctx context.Context, startURL, goal, profile string) (StartResult, error) {
 	ev := Event{Action: "start", Class: "L", Goal: goal, URL: startURL}
 	res, err := s.start(ctx, startURL, goal, profile)
@@ -386,8 +452,14 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 	if err := s.ensureOwner(); err != nil {
 		return StartResult{}, err
 	}
-	if strings.TrimSpace(profile) != "" {
-		return StartResult{}, ErrProfileNotReady
+	profile = strings.TrimSpace(profile)
+	if profile != "" {
+		if s.cfg.Profiles == nil {
+			return StartResult{}, ErrProfilesUnavailable
+		}
+		if err := s.cfg.Profiles.ValidateName(profile); err != nil {
+			return StartResult{}, refusal{fmt.Errorf("invalid profile name %q: use 1 to 64 lowercase letters, digits or dashes", profile)}
+		}
 	}
 	if strings.TrimSpace(startURL) == "" {
 		startURL = "about:blank"
@@ -402,6 +474,33 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 		s.mu.Unlock()
 		s.stopReaped(reaped)
 		return StartResult{}, fmt.Errorf("%w: local mode allows %d co-browse sessions at once and %d are open; stop one with local_cobrowse_stop", ErrTooManySessions, s.cfg.MaxSessions, n)
+	}
+	if profile != "" {
+		for _, other := range s.sessions {
+			if other.profile == profile && !other.throwaway {
+				s.mu.Unlock()
+				s.stopReaped(reaped)
+				return StartResult{}, ErrProfileInUse
+			}
+		}
+		now := s.cfg.Now()
+		id := s.cfg.NewSessionID()
+		s.sessions[id] = &session{id: id, goal: goal, startedAt: now, lastActive: now,
+			grants: map[string]*grantState{}, deniedFP: map[string]bool{},
+			profile: profile, startURL: startURL, locked: true}
+		s.notifyLocked()
+		s.mu.Unlock()
+		s.stopReaped(reaped)
+		s.attention(id, "unlock")
+		return StartResult{
+			SessionID: id,
+			State:     StateLocked,
+			Profile:   profile,
+			Lifetime:  LifetimePolicy,
+			Writes:    "navigate, click, type, select, key and scroll need the user's approval in the Citadel viewer",
+			Viewer:    s.cfg.ViewerNote,
+			Next:      "The user unlocks this saved profile with their passphrase in the Citadel viewer (you never see it). Call local_cobrowse_wait with until=unlocked.",
+		}, nil
 	}
 	s.mu.Unlock()
 	s.stopReaped(reaped)
@@ -420,27 +519,9 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 	s.sessions[st.ID] = ss
 	s.notifyLocked()
 	s.mu.Unlock()
-	title := platform.SanitizeCobrowseTitle(st.Title)
-	// A start URL can redirect. Check where the browser landed before any
-	// read can see it.
-	if startURL != "about:blank" {
-		res := s.settle(ctx, st.ID, "")
-		if res.Title != "" {
-			title = res.Title
-		}
-		landed := res.URL
-		if landed == "" {
-			landed = s.currentURL(st.ID)
-		}
-		if landed != "" && !strings.EqualFold(landed, "about:blank") {
-			if err := s.cfg.URLPolicy(ctx, landed); err != nil {
-				_ = s.stop(st.ID, "start url refused")
-				return StartResult{}, fmt.Errorf("the start page redirected to a refused address, so the session was closed: %w", err)
-			}
-		}
-		if cur, ok := s.cfg.Browser.SessionStatus(st.ID); ok {
-			st.URL = cur.URL
-		}
+	st, title, err := s.afterLaunch(ctx, st, startURL)
+	if err != nil {
+		return StartResult{}, err
 	}
 	s.attention(st.ID, "start")
 	return StartResult{
@@ -454,6 +535,37 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 		Writes:    "navigate, click, type, select, key and scroll need the user's approval for each website in the Citadel viewer; anything that sends, posts, submits, pays or deletes asks every time",
 		Viewer:    s.cfg.ViewerNote,
 	}, nil
+}
+
+// StateLocked is a profile session's state until the user unlocks it.
+const StateLocked = "locked"
+
+// afterLaunch checks where a freshly launched browser landed: a start URL can
+// redirect, so the landing page passes the address filter before any read can
+// see it, and a refused landing closes the session.
+func (s *Service) afterLaunch(ctx context.Context, st platform.CobrowseSessionStatus, startURL string) (platform.CobrowseSessionStatus, string, error) {
+	title := platform.SanitizeCobrowseTitle(st.Title)
+	if startURL == "about:blank" {
+		return st, title, nil
+	}
+	res := s.settle(ctx, st.ID, "")
+	if res.Title != "" {
+		title = res.Title
+	}
+	landed := res.URL
+	if landed == "" {
+		landed = s.currentURL(st.ID)
+	}
+	if landed != "" && !strings.EqualFold(landed, "about:blank") {
+		if err := s.cfg.URLPolicy(ctx, landed); err != nil {
+			_ = s.stop(st.ID, "start url refused")
+			return st, "", fmt.Errorf("the start page redirected to a refused address, so the session was closed: %w", err)
+		}
+	}
+	if cur, ok := s.cfg.Browser.SessionStatus(st.ID); ok {
+		st.URL = cur.URL
+	}
+	return st, title, nil
 }
 
 func (s *Service) stopReaped(ids []string) {
@@ -479,11 +591,16 @@ func (s *Service) finish(ev Event, err error) {
 func isRefusal(err error) bool {
 	for _, e := range []error{ErrApprovalRequired, ErrApprovalDenied, ErrApprovalExpired, ErrApprovalRevoked,
 		ErrCommitApprovalRequired, ErrCommitPending, ErrCommitDenied, ErrNoPendingCommit, ErrUnknownPage, ErrPageChanged, ErrTypeNewline,
-		ErrHumanDriving, ErrOnlyUserHandsBack, ErrRateLimited, ErrTooManySessions, ErrNavigationRefused, ErrProfileNotReady,
+		ErrHumanDriving, ErrOnlyUserHandsBack, ErrRateLimited, ErrTooManySessions, ErrNavigationRefused,
+		ErrProfilesUnavailable, ErrSessionLocked, ErrProfileInUse,
 		platform.ErrHandedOff, platform.ErrPasswordValue} {
 		if errors.Is(err, e) {
 			return true
 		}
+	}
+	var r refusal
+	if errors.As(err, &r) {
+		return true
 	}
 	var oe *OwnerError
 	return errors.As(err, &oe)
@@ -508,6 +625,13 @@ func (s *Service) lookupFor(id string, humanSafety bool) (*session, error) {
 		return nil, fmt.Errorf("%w %q (it was stopped, timed out, or belongs to a Citadel process that has exited; start a new one)", ErrNoSession, id)
 	}
 	return ss, nil
+}
+
+// isLocked reports whether ss is a profile session the user has not unlocked.
+func (s *Service) isLocked(ss *session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return ss.locked
 }
 
 // humanDriving reports whether the user has taken control of the browser.
@@ -590,6 +714,9 @@ func (s *Service) beginWrite(id string) (ss *session, unlock func(), err error) 
 	ss, err = s.lookup(id)
 	if err != nil {
 		return nil, nil, err
+	}
+	if s.isLocked(ss) {
+		return nil, nil, ErrSessionLocked
 	}
 	ss.wmu.Lock()
 	if s.humanDriving(id) {
@@ -677,8 +804,12 @@ func pruneBefore(ts []time.Time, cutoff time.Time) []time.Time {
 // allowed address (a script or delayed redirect may have moved it after the
 // last check).
 func (s *Service) gateRead(ctx context.Context, id string) error {
-	if _, err := s.lookup(id); err != nil {
+	ss, err := s.lookup(id)
+	if err != nil {
 		return err
+	}
+	if s.isLocked(ss) {
+		return ErrSessionLocked
 	}
 	if s.humanDriving(id) {
 		return ErrHumanDriving
@@ -1125,6 +1256,13 @@ type SessionView struct {
 	HandoffSince  string        `json:"handoff_since,omitempty"`
 	HandoffReason string        `json:"handoff_reason,omitempty"`
 	Lifetime      string        `json:"lifetime"`
+	// Profile names the saved profile of a profile session. ProfileMode is
+	// "locked", "unlocked", or "throwaway" (the user chose to run without
+	// the saved profile).
+	Profile     string `json:"profile,omitempty"`
+	ProfileMode string `json:"profile_mode,omitempty"`
+	// Unlocking is true while the user's unlock is starting the browser.
+	Unlocking bool `json:"unlocking,omitempty"`
 }
 
 // GrantView is one live domain grant.
@@ -1202,6 +1340,21 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 		v.HandoffSince = ss.handoffAt.UTC().Format(time.RFC3339)
 		v.HandoffReason = ss.handoffReason
 	}
+	if ss.profile != "" {
+		v.Profile = ss.profile
+		switch {
+		case ss.locked:
+			v.ProfileMode = StateLocked
+			v.State = StateLocked
+			v.Driver = ""
+			v.URL = ss.startURL
+			v.Unlocking = ss.unlocking
+		case ss.throwaway:
+			v.ProfileMode = "throwaway"
+		default:
+			v.ProfileMode = "unlocked"
+		}
+	}
 	return v
 }
 
@@ -1244,12 +1397,10 @@ func (s *Service) Sessions(id string) []SessionView {
 	out := make([]SessionView, 0, len(ids))
 	now := s.cfg.Now()
 	for _, sid := range ids {
-		st, ok := s.cfg.Browser.SessionStatus(sid)
-		if !ok {
-			continue
-		}
+		st, live := s.cfg.Browser.SessionStatus(sid)
 		s.mu.Lock()
-		if ss, ok := s.sessions[sid]; ok {
+		if ss, ok := s.sessions[sid]; ok && (live || ss.locked) {
+			// A locked session has no browser yet; viewLocked fills in its state.
 			out = append(out, s.viewLocked(ss, st, now))
 		}
 		s.mu.Unlock()
@@ -1298,6 +1449,9 @@ func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety
 	ss, err := s.lookupFor(id, humanSafety)
 	if err != nil {
 		return SessionView{}, err
+	}
+	if s.isLocked(ss) {
+		return SessionView{}, ErrSessionLocked
 	}
 	var st platform.CobrowseSessionStatus
 	// A human driving a page is the identity boundary (D4): whatever they do
@@ -1369,10 +1523,22 @@ func (s *Service) Close() error {
 	s.sessions = map[string]*session{}
 	s.notifyLocked()
 	s.mu.Unlock()
+	// Stop each session on its own so a failure (a saved profile that could
+	// not be sealed, or whose decrypted copy could not be removed) is audited
+	// against that session and returned, never dropped.
+	var errs []error
 	for _, id := range ids {
-		s.emit(Event{SessionID: id, Action: "stop", Class: "L", Outcome: "stopped_owner_exit"})
+		ev := Event{SessionID: id, Action: "stop", Class: "L", Outcome: "stopped_owner_exit"}
+		if err := s.cfg.Browser.Stop(id); err != nil {
+			ev.Outcome, ev.Error = "error", err.Error()
+			errs = append(errs, fmt.Errorf("session %s: %w", id, err))
+		}
+		s.emit(ev)
 	}
-	return s.cfg.Browser.StopAll()
+	if err := s.cfg.Browser.StopAll(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // WaitResult is local_cobrowse_wait's result.
@@ -1420,7 +1586,9 @@ func (s *Service) wait(ctx context.Context, id, until string, timeout time.Durat
 		changed := s.changed
 		var gstate, lastCommit string
 		var commitPending bool
+		var locked, throwaway bool
 		if ok {
+			locked, throwaway = ss.locked, ss.throwaway
 			s.expireCommitLocked(ss, s.cfg.Now())
 			dom := ss.askedDomain
 			if dom == "" {
@@ -1435,6 +1603,20 @@ func (s *Service) wait(ctx context.Context, id, until string, timeout time.Durat
 		if !ok {
 			res.State, res.Detail = "ended", "the session ended"
 			return res, nil
+		}
+		if locked {
+			// No browser yet: every condition waits for the user's unlock.
+			select {
+			case <-changed:
+				continue
+			case <-timer.C:
+				res.State, res.StillWaiting = StateLocked, true
+				res.Detail = "the user has not unlocked the saved profile yet; call again to keep waiting"
+				return res, nil
+			case <-ctx.Done():
+				res.State, res.StillWaiting = StateLocked, true
+				return res, nil
+			}
 		}
 		st, live := s.cfg.Browser.SessionStatus(id)
 		if !live || st.State == platform.SessionExited {
@@ -1465,8 +1647,12 @@ func (s *Service) wait(ctx context.Context, id, until string, timeout time.Durat
 				return res, nil
 			}
 		case "unlocked":
-			// Throwaway sessions have no lock (persistent profiles are a later slice).
+			// A throwaway session never had a lock; a profile session reaches
+			// here only after the user unlocked it or chose a throwaway.
 			res.State, res.Satisfied = "unlocked", true
+			if throwaway {
+				res.Detail = "the user chose to continue without the saved profile, so this session starts logged out and nothing is saved"
+			}
 			return res, nil
 		}
 		select {
@@ -1753,8 +1939,12 @@ func (s *Service) HumanStop(id string) error {
 func (s *Service) HumanNavigate(ctx context.Context, id, url string) error {
 	ev := Event{SessionID: id, Action: "navigate", Class: "H", URL: url}
 	err := func() error {
-		if _, err := s.lookup(id); err != nil {
+		ss, err := s.lookup(id)
+		if err != nil {
 			return err
+		}
+		if s.isLocked(ss) {
+			return ErrSessionLocked
 		}
 		if !s.humanDriving(id) {
 			return fmt.Errorf("take control before typing an address")
@@ -1762,14 +1952,155 @@ func (s *Service) HumanNavigate(ctx context.Context, id, url string) error {
 		if err := s.cfg.URLPolicy(ctx, url); err != nil {
 			return err
 		}
-		_, err := s.cfg.Browser.NavigateAsHuman(id, url)
+		_, err = s.cfg.Browser.NavigateAsHuman(id, url)
 		if err == nil {
-			if ss, lerr := s.lookup(id); lerr == nil {
-				s.markIdentity(ss)
-			}
+			s.markIdentity(ss)
 		}
 		return err
 	}()
 	s.finish(ev, err)
 	return err
+}
+
+// ProfileVault reports the profile store's passphrase state for the viewer.
+// ok is false when this process has no profile store.
+func (s *Service) ProfileVault() (state ProfileVaultState, ok bool, err error) {
+	if s.cfg.Profiles == nil {
+		return ProfileVaultState{}, false, nil
+	}
+	state, err = s.cfg.Profiles.State()
+	return state, true, err
+}
+
+// ErrUnlockInProgress refuses a second unlock while one is starting the browser.
+var ErrUnlockInProgress = errors.New("an unlock is already in progress for this session")
+
+// ErrNotLocked refuses an unlock of a session that is not locked.
+var ErrNotLocked = errors.New("this session is not locked")
+
+// ErrPassphraseAlreadySet refuses setup when a passphrase exists; the user
+// unlocks with it instead.
+var ErrPassphraseAlreadySet = errors.New("a passphrase is already set on this computer; enter it to unlock")
+
+// HumanUnlock opens the session's saved profile with the user's passphrase and
+// starts the browser on it (viewer "Unlock"). The passphrase goes to the store
+// and nowhere else: it is not kept, audited or returned.
+func (s *Service) HumanUnlock(ctx context.Context, id, passphrase string) error {
+	ev := Event{SessionID: id, Action: "unlock", Class: "H"}
+	err := s.unlock(ctx, id, func(name string) (platform.SessionProfile, error) {
+		return s.cfg.Profiles.Open(name, passphrase)
+	})
+	s.finish(ev, err)
+	return err
+}
+
+// HumanSetupAndUnlock creates the profile store's passphrase, then unlocks the
+// session with it (viewer "Create passphrase"). It refuses when a passphrase is
+// already set, so setup can never replace an existing one.
+func (s *Service) HumanSetupAndUnlock(ctx context.Context, id, passphrase string, ackDataLoss bool) error {
+	ev := Event{SessionID: id, Action: "set_passphrase", Class: "H"}
+	err := func() error {
+		if s.cfg.Profiles == nil {
+			return ErrProfilesUnavailable
+		}
+		ss, err := s.lookup(id)
+		if err != nil {
+			return err
+		}
+		if !s.isLocked(ss) {
+			return refusal{ErrNotLocked}
+		}
+		st, err := s.cfg.Profiles.State()
+		if err != nil {
+			return err
+		}
+		if st.Configured {
+			return refusal{ErrPassphraseAlreadySet}
+		}
+		if err := s.cfg.Profiles.SetPassphrase(passphrase, ackDataLoss); err != nil {
+			return refusal{err}
+		}
+		return nil
+	}()
+	s.finish(ev, err)
+	if err != nil {
+		return err
+	}
+	return s.HumanUnlock(ctx, id, passphrase)
+}
+
+// HumanUseThrowaway starts a locked session without its saved profile, as a
+// throwaway session (viewer "Continue without saved logins"). Only the user can
+// choose this; a profile session never falls back silently.
+func (s *Service) HumanUseThrowaway(ctx context.Context, id string) error {
+	ev := Event{SessionID: id, Action: "use_throwaway", Class: "H"}
+	err := s.unlock(ctx, id, nil)
+	s.finish(ev, err)
+	return err
+}
+
+// unlock starts the browser for a locked session. open returns the unlocked
+// profile; nil open means a throwaway session. Neither the store's key
+// derivation nor the browser launch runs under s.mu.
+func (s *Service) unlock(ctx context.Context, id string, open func(name string) (platform.SessionProfile, error)) error {
+	if open != nil && s.cfg.Profiles == nil {
+		return ErrProfilesUnavailable
+	}
+	ss, err := s.lookup(id)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	switch {
+	case !ss.locked:
+		s.mu.Unlock()
+		return refusal{ErrNotLocked}
+	case ss.unlocking:
+		s.mu.Unlock()
+		return refusal{ErrUnlockInProgress}
+	}
+	ss.unlocking = true
+	name, startURL := ss.profile, ss.startURL
+	s.notifyLocked()
+	s.mu.Unlock()
+	fail := func(err error) error {
+		s.mu.Lock()
+		ss.unlocking = false
+		s.notifyLocked()
+		s.mu.Unlock()
+		return err
+	}
+
+	var prof platform.SessionProfile
+	if open != nil {
+		p, err := open(name)
+		if err != nil {
+			return fail(refusal{err})
+		}
+		prof = p
+	}
+	// Ownership of prof passes to the browser, which Closes it on every path.
+	st, err := s.cfg.Browser.StartSessionWithID(id, startURL, prof)
+	if err != nil {
+		return fail(err)
+	}
+	now := s.cfg.Now()
+	s.mu.Lock()
+	if s.sessions[id] != ss {
+		// Stopped (or the owner closed) while the browser was starting.
+		s.mu.Unlock()
+		_ = s.cfg.Browser.Stop(id)
+		return fmt.Errorf("%w %q: it was stopped while unlocking", ErrNoSession, id)
+	}
+	ss.locked, ss.unlocking, ss.throwaway = false, false, open == nil
+	ss.lastActive = now
+	if startURL != "about:blank" {
+		s.navs = append(pruneBefore(s.navs, now.Add(-time.Hour)), now)
+	}
+	s.notifyLocked()
+	s.mu.Unlock()
+	if _, _, err := s.afterLaunch(ctx, st, startURL); err != nil {
+		return err
+	}
+	return nil
 }

@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
@@ -40,6 +42,11 @@ type localCobrowseRuntime struct {
 	auditErr error
 	auditDir string
 	stop     chan struct{}
+
+	// closeOnce runs the teardown once; closed is closed when it has
+	// finished, so every caller of close waits for the profiles to be sealed.
+	closeOnce sync.Once
+	closed    chan struct{}
 
 	// viewerFactory builds the loopback viewer on first need; nil disables it.
 	viewerFactory func() (*localviewer.Server, error)
@@ -156,7 +163,7 @@ func (rt *localCobrowseRuntime) auditPrecheck() error {
 }
 
 func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
-	rt := &localCobrowseRuntime{stop: make(chan struct{})}
+	rt := &localCobrowseRuntime{stop: make(chan struct{}), closed: make(chan struct{})}
 	browser := opts.browser
 	var manager *platform.CobrowseSessionManager
 	if browser == nil {
@@ -195,8 +202,13 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 		onAttention = rt.attention
 		viewerNote = "The Citadel viewer opens in the user's default browser, where they watch, approve and take control. If it is closed, they can run `citadel local viewer`."
 	}
+	var profiles localcobrowse.ProfileStore
+	if opts.ownerDir != nil {
+		profiles = localProfileStore{dir: opts.ownerDir}
+	}
 	rt.svc = localcobrowse.New(localcobrowse.Config{
 		Browser:     browser,
+		Profiles:    profiles,
 		URLPolicy:   opts.policy,
 		ViewerPorts: viewerPorts,
 		OnAttention: onAttention,
@@ -333,15 +345,27 @@ func (rt *localCobrowseRuntime) setAgent(name string) {
 	}
 }
 
-// close stops every session and releases the owner lock.
+// close stops every session and releases the owner lock. It is idempotent and
+// every caller waits for the first teardown to finish: a saved-logins session
+// is re-sealed during that teardown, so returning early (for example to a
+// signal handler about to exit) would leave its plaintext working copy on
+// disk and lose its new logins.
 func (rt *localCobrowseRuntime) close() {
-	select {
-	case <-rt.stop:
-		return
-	default:
-		close(rt.stop)
+	rt.closeOnce.Do(func() {
+		defer close(rt.closed)
+		rt.teardown()
+	})
+	<-rt.closed
+}
+
+func (rt *localCobrowseRuntime) teardown() {
+	close(rt.stop)
+	if err := rt.svc.Close(); err != nil {
+		// stdout is the MCP transport; the warning goes to stderr. A saved
+		// profile that could not be sealed or whose decrypted copy could not
+		// be removed must not fail silently.
+		fmt.Fprintf(os.Stderr, "Citadel local co-browse: a browser session did not shut down cleanly: %v\n", err)
 	}
-	_ = rt.svc.Close()
 	rt.mu.Lock()
 	o, g, v := rt.owner, rt.guard, rt.viewer
 	rt.owner, rt.guard, rt.viewer = nil, nil, nil
@@ -472,7 +496,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 			map[string]any{
 				"url":     strProp("Optional http(s) URL to open on launch."),
 				"goal":    strProp(descGoal),
-				"profile": strProp("Reserved for persistent profiles (not available yet). Omit for a throwaway session."),
+				"profile": strProp("Optional saved-logins profile name (1 to 64 lowercase letters, digits or dashes, e.g. \"default\"). Omit for a throwaway session that starts logged out. With a profile the session starts locked: the user unlocks it with their passphrase in the Citadel viewer (you never see it), so call local_cobrowse_wait with until=unlocked. Logins are encrypted on this computer and kept for next time."),
 			}, nil,
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct{ URL, Goal, Profile string }
@@ -695,7 +719,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				}
 				return s.Resume(ctx, id)
 			}),
-		writeTool("local_cobrowse_stop", "End a session. Its throwaway browser profile (cookies, logins) is deleted.",
+		writeTool("local_cobrowse_stop", "End a session. A throwaway session's cookies and logins are deleted; a saved-logins profile is encrypted again and kept.",
 			map[string]any{"session_id": strProp(descSession)}, []string{"session_id"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
@@ -713,7 +737,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				}
 				return map[string]any{"session_id": id, "stopped": true}, nil
 			}),
-		writeTool("local_cobrowse_wait", "Wait for the user: until=approved (they approved AI actions on the site), until=commit (they answered a send/post/submit/pay request; approved means repeat the same call, denied is final), until=resumed (they handed control back) or until=unlocked. Returns within timeout_seconds (at most 50). If still_waiting is true, call again; denied or revoked are final answers.",
+		writeTool("local_cobrowse_wait", "Wait for the user: until=approved (they approved AI actions on the site), until=commit (they answered a send/post/submit/pay request; approved means repeat the same call, denied is final), until=resumed (they handed control back) or until=unlocked (they unlocked a saved-logins profile; a detail says if they chose a throwaway session instead). Returns within timeout_seconds (at most 50). If still_waiting is true, call again; denied or revoked are final answers.",
 			map[string]any{"session_id": strProp(descSession),
 				"until":           map[string]any{"type": "string", "enum": []string{"approved", "resumed", "unlocked", "commit"}},
 				"timeout_seconds": numProp("Seconds to wait, at most 50 (default 50).")},
@@ -734,4 +758,23 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return s.Wait(ctx, id, in.Until, time.Duration(in.Timeout*float64(time.Second)))
 			}),
 	}
+}
+
+// closeOnSignal waits for the first signal on sigs, closes rt (which waits
+// for any teardown already running, such as the deferred close after stdin
+// EOF) and then exits. Later signals are absorbed while it closes, so a
+// second Ctrl-C or SIGTERM cannot cut a profile seal short.
+func closeOnSignal(rt *localCobrowseRuntime, sigs <-chan os.Signal, exit func(int)) {
+	<-sigs
+	rt.close()
+	exit(0)
+}
+
+// handleLocalCobrowseSignals stops every co-browse session, re-sealing saved
+// logins, before the process exits on SIGINT or SIGTERM. Both MCP entry
+// points that host local co-browse install it.
+func handleLocalCobrowseSignals(rt *localCobrowseRuntime) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go closeOnSignal(rt, sigs, os.Exit)
 }

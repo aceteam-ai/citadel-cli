@@ -254,7 +254,7 @@ func probeUserAgent(info BrowserInfo, baseDir string) (string, error) {
 	if err := os.MkdirAll(probeDir, 0o700); err != nil {
 		return "", fmt.Errorf("create user-agent probe dir: %w", err)
 	}
-	defer removeSessionDir(probeDir)
+	defer func() { _ = removeSessionDir(probeDir) }()
 	raw, err := uaProbeLaunch(info, probeDir)
 	if err != nil {
 		return "", err
@@ -490,7 +490,9 @@ func defaultCobrowseSessionsBaseDir() string {
 	return filepath.Join(root, "Citadel", "cobrowse-sessions")
 }
 
-func removeSessionDir(dir string) { _ = removeAllRetry(dir, 25, 200*time.Millisecond) }
+func removeSessionDir(dir string) error {
+	return removeAllRetry(dir, sessionRemoveAttempts, sessionRemoveDelay)
+}
 
 func findChromiumForOS() (string, error) {
 	info, err := discoverWindowsBrowser(systemWindowsBrowserProbe())
@@ -534,3 +536,11 @@ func readAppPathRegistry(hive, exe string) string {
 	}
 	return v
 }
+
+// sessionOwnerAlive reports whether a session's recorded owner still runs,
+// guarding against PID reuse with the recorded creation time.
+func sessionOwnerAlive(pid int, start int64) bool { return processAliveWithStart(pid, start) }
+
+// killOrphanSessionProcs is a no-op on Windows: the owner's kill-on-close Job
+// Object already ended the session's browser tree when the owner exited.
+func killOrphanSessionProcs(int, int) {}

@@ -8,6 +8,7 @@
 package platform
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -28,17 +29,35 @@ func currentProcessStartToken() int64 { return 0 }
 // removeSessionDir retries for a bounded time: the browser's helper processes
 // (renderer, GPU) can outlive the killed main process for a moment and recreate
 // files, so a single RemoveAll can fail with ENOTEMPTY or leave the dir behind.
-func removeSessionDir(dir string) { removeSessionDirRetry(dir, 25, 200*time.Millisecond) }
+func removeSessionDir(dir string) error {
+	return removeSessionDirRetry(dir, sessionRemoveAttempts, sessionRemoveDelay)
+}
 
-func removeSessionDirRetry(dir string, attempts int, delay time.Duration) {
+// removeSessionDirRetry returns the last error, or one saying the dir is still
+// there, when every attempt left it behind.
+func removeSessionDirRetry(dir string, attempts int, delay time.Duration) error {
+	var err error
 	for i := 0; i < attempts; i++ {
-		if err := os.RemoveAll(dir); err == nil {
+		if err = os.RemoveAll(dir); err == nil {
 			if _, serr := os.Lstat(dir); os.IsNotExist(serr) {
-				return
+				return nil
 			}
+			err = fmt.Errorf("%s is still present after removal", dir)
 		}
 		time.Sleep(delay)
 	}
+	return err
 }
 
 func findChromiumForOS() (string, error) { return findChromiumOnPath() }
+
+// sessionOwnerAlive reports whether a session's recorded owner still runs.
+// The start token is a Windows identity check and is unused here.
+func sessionOwnerAlive(pid int, _ int64) bool { return pid > 0 && pidAlive(pid) }
+
+// killOrphanSessionProcs kills an interrupted session's browser and Xvfb, each
+// only while its recorded identity still verifies.
+func killOrphanSessionProcs(browserPID, xvfbPID int) {
+	sweepKillIfVerified(browserPID, roleCobrowseBrowser, "browser")
+	sweepKillIfVerified(xvfbPID, roleCobrowseXvfb, "Xvfb")
+}

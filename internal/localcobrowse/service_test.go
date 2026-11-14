@@ -28,6 +28,9 @@ type fakeBrowser struct {
 	navigateLandsOn string
 	pageTitle       string
 	notReady        bool
+	// startErr fails StartSessionWithID; stopErr fails Stop.
+	startErr error
+	stopErr  error
 	// target, when set, is what InspectTarget reports (default: a plain
 	// element on the current page).
 	target *platform.TargetInfo
@@ -38,9 +41,10 @@ type fakeBrowser struct {
 }
 
 type fakeSession struct {
-	url    string
-	human  bool
-	exited bool
+	url     string
+	human   bool
+	exited  bool
+	profile platform.SessionProfile
 }
 
 func newFakeBrowser() *fakeBrowser { return &fakeBrowser{sessions: map[string]*fakeSession{}} }
@@ -83,6 +87,27 @@ func (f *fakeBrowser) StartSession(u string) (platform.CobrowseSessionStatus, er
 	f.record("start " + u)
 	return f.statusLocked(id), nil
 }
+func (f *fakeBrowser) StartSessionWithID(id, u string, p platform.SessionProfile) (platform.CobrowseSessionStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.startErr != nil {
+		if p != nil {
+			_ = p.Close()
+		}
+		return platform.CobrowseSessionStatus{}, f.startErr
+	}
+	land := u
+	if f.startLandsOn != "" {
+		land = f.startLandsOn
+	}
+	f.sessions[id] = &fakeSession{url: land, profile: p}
+	if p != nil {
+		f.record("start-profile " + id)
+	} else {
+		f.record("start-id " + id)
+	}
+	return f.statusLocked(id), nil
+}
 func (f *fakeBrowser) SessionStatus(id string) (platform.CobrowseSessionStatus, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -96,7 +121,7 @@ func (f *fakeBrowser) Stop(id string) error {
 	defer f.mu.Unlock()
 	delete(f.sessions, id)
 	f.record("stop " + id)
-	return nil
+	return f.stopErr
 }
 func (f *fakeBrowser) StopAll() error {
 	f.mu.Lock()
@@ -619,10 +644,13 @@ func TestEventsRecordTextLengthOnly(t *testing.T) {
 	}
 }
 
-func TestProfileRequestRefusedClearly(t *testing.T) {
-	svc, _, _ := newTestService(t, nil)
-	if _, err := svc.Start(ctx, "", "g", "work"); !errors.Is(err, ErrProfileNotReady) {
+func TestProfileRefusedWithoutStore(t *testing.T) {
+	svc, fb, _ := newTestService(t, nil)
+	if _, err := svc.Start(ctx, "", "g", "work"); !errors.Is(err, ErrProfilesUnavailable) {
 		t.Fatalf("profile: %v", err)
+	}
+	if len(fb.calls) != 0 {
+		t.Fatalf("no browser may start: %v", fb.calls)
 	}
 }
 

@@ -163,6 +163,35 @@ Sessions come from the owner through the token-authenticated `/api/summary`.
 `TestSetupRoutesAreGuarded` pins the boundary. Muse has no confirmed local
 config file, so it is not a harness; the page offers the generic entry.
 
+`nodevault.Vault.UnlockAtRest` owns #820: every consumer that encrypts data
+at rest unlocks through it, and it refuses a secret below
+`nodevault.AtRestThresholdBits` (never below the 60-bit default, whatever
+`policy.yaml` says; a non-finite value is the floor, since NaN compares false) before the KDF and without lockout accounting. The access
+gate (`Unlock`, `VerifyPIN`) still accepts a short PIN.
+`cobrowseprofile.OpenHandle` uses it, so on an enrolled node a persistent
+profile needs the master PIN to be a passphrase. `cobrowseprofile` also holds
+an OS lock (`lockFile`, never unlinked) beside each sealed blob, so two
+processes cannot open one profile. Local mode's saved logins
+(aceteam#13503 S7) use `cobrowseprofile.Store` rooted at `cmd.localStateDir`:
+its own per-user vault, never the node master-PIN vault. A
+`local_cobrowse_start` with a profile creates a locked session with no browser
+under an id from `platform.NewCobrowseSessionID`. `localcobrowse.Service.unlock`
+starts it with `StartSessionWithID` once the human unlocks it in the viewer,
+or chooses a throwaway. The passphrase reaches only the viewer's unlock and
+setup routes and the store. `platform.closeBrowserGracefully` sends CDP
+`Browser.close` before killing a persistent session's browser, within one
+`gracefulCloseWait` budget, so cookies are flushed before `Persist` seals them.
+`localCobrowseRuntime.close` is idempotent and every caller waits for the first
+teardown, and both MCP entry points that host local co-browse install
+`handleLocalCobrowseSignals`, so a signal during the stdin-EOF close cannot exit
+mid-seal. Passphrases are used as typed on both surfaces (no trimming). A persistent
+session's working dir carries a `.citadel-profile` marker (identity plus owner)
+written before any plaintext; `platform.CleanOrphanedProfileSessions` removes
+an interrupted session's decrypted copy whose owner is gone and reports any it
+cannot, including any dir whose marker is present but unreadable or damaged, and `citadel local passphrase forget` refuses unless that comes back
+clean. A persistent session's teardown returns a working-dir removal failure. `TestRealBrowserPersistentProfileRoundTrip`
+is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
+
 `localaudit.Log` owns the local co-browse audit chain under
 `<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
 month. `cmd.localStateDir` owns where local mode keeps its owner lock, audit
@@ -822,8 +851,9 @@ same reason, keeping the existing file's owner (`keepOwner`) so a save by root
 does not lock the worker out; it refuses when the owning user cannot be kept
 and tolerates a group it cannot set. The payload `passcode` key never reaches a desktop handler, and
 `jobprivacy.Payload`/`Text` plus the `Job` JSON and fmt renderings in
-`internal/worker`, `internal/redis` and `internal/redisapi` drop it for every
-job type, so it is never written to a dead-letter entry or a log.
+`internal/worker`, `internal/redis` and `internal/redisapi` drop it, and the
+COBROWSE_SESSION profile `pin` (`jobprivacy.PINKey`), for every job type, so
+neither is ever written to a dead-letter entry or a log.
 `internal/worker/desktop_gate_test.go`, `cmd/passcode_state_test.go` and
 `internal/redis/passcode_privacy_test.go` pin this.
 

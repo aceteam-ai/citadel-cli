@@ -1,32 +1,44 @@
-// Package cobrowseprofile implements an encrypted-at-rest, PIN-unlocked
-// persistent browser profile for co-browse sessions (aceteam-ai/citadel-cli#795).
+// Package cobrowseprofile implements an encrypted-at-rest, passphrase-unlocked
+// persistent browser profile for co-browse sessions (aceteam-ai/citadel-cli#795,
+// aceteam#13503 S7).
 //
 // A co-browse session normally launches a browser with a THROWAWAY profile dir
 // that is deleted on stop (see internal/platform/cobrowse_session.go), so every
 // session starts logged out. This package gives a session a PERSISTENT profile
 // instead: the profile survives across sessions so logins persist, but it lives
-// on disk only as ciphertext, unreadable without the node master PIN.
+// on disk only as ciphertext, unreadable without the vault's passphrase.
 //
-// Design — consume the node master-PIN primitive, invent no crypto:
+// Which vault: a profile is sealed under the internal/nodevault vault in the
+// same base dir as its blobs. Citadel local mode uses a Store rooted at the
+// user's local state dir, whose vault is its own and holds only the saved-logins
+// passphrase. An enrolled node's COBROWSE_SESSION job opens profiles in the node
+// config dir under the node vault, so there the master PIN must itself be a
+// passphrase. Either way the vault is unlocked only through
+// nodevault.Vault.UnlockAtRest, which refuses any secret below the at-rest
+// threshold (#820): a short access PIN never opens a profile.
 //
-//   - At use time the caller unlocks the shared vault (internal/nodevault) with
-//     the PIN and hands us the resulting Session. We never see the PIN or the
-//     master key; we only hold the short-lived Session, which zeroes its key
-//     material on Close.
+// Design — consume the vault primitive, invent no crypto:
+//
+//   - At use time the caller hands over the passphrase, the vault is unlocked
+//     at-rest, and we keep only the resulting Session. We never retain the
+//     passphrase or see the master key; the Session zeroes its key material on
+//     Close.
 //
 //   - The whole profile directory is serialized to a single tar blob and sealed
 //     with Session.Seal under a STABLE per-profile context label. nodevault
 //     binds that label as AEAD additional data, so a blob sealed for one profile
-//     cannot be unsealed as another. The sealed blob is the only at-rest form:
-//     that is the zero-knowledge property #796 provides, consumed here.
+//     cannot be unsealed as another. The sealed blob is the only at-rest form.
 //
 //   - On unlock we untar the blob into a caller-supplied private working dir for
 //     the browser to use; on stop we re-tar, re-seal, and atomically replace the
 //     stored blob, then delete the plaintext working copy.
 //
-// This package imports nodevault (a leaf) but NOT internal/network: network
-// imports internal/platform, so anything platform can reach must not pull
-// network back in. The caller passes the node config dir as baseDir instead.
+//   - One profile is open in at most one session, across processes too: an OS
+//     lock file sits next to each sealed blob.
+//
+// This package imports nodevault (a leaf) but NOT internal/network or
+// internal/platform: network imports platform, so anything platform can reach
+// must not pull network back in. The caller passes the base dir instead.
 package cobrowseprofile
 
 import (
@@ -46,6 +58,11 @@ const profilesDirName = "cobrowse-profiles"
 
 // profileFileExt is the extension of a sealed profile blob.
 const profileFileExt = ".enc"
+
+// lockFileExt is appended to a blob's path for its cross-process lock file.
+// The lock file is never removed: unlinking it would let two processes lock
+// two different inodes under one name.
+const lockFileExt = ".lock"
 
 // contextPrefix is the stable AEAD context label prefix for a sealed profile.
 // The profile name is appended so each profile's ciphertext is bound to its own
@@ -71,27 +88,41 @@ var (
 // live Handle may exist per absolute store path at a time. A second OpenHandle
 // for a profile already in use fails with ErrProfileBusy rather than letting two
 // sessions decrypt the same profile, edit divergent working copies, and race to
-// re-seal (last writer would silently win). Cross-process concurrency is not
-// guarded here; because every store write is atomic (temp + fsync + rename), the
-// worst cross-process outcome is a lost update, never a corrupt blob (v1).
+// re-seal (last writer would silently win). Across processes the same rule is
+// held by an OS file lock next to the sealed blob (lockFile, lock_*.go), so two
+// harnesses that each run their own Citadel process cannot open one profile
+// twice either (aceteam#13503 S7).
 var (
 	profileLocksMu sync.Mutex
-	profileLocks   = map[string]bool{}
+	profileLocks   = map[string]func(){}
 )
 
-func acquireProfileLock(storePath string) bool {
+// acquireProfileLock takes the in-process and the OS lock for storePath. It
+// returns ErrProfileBusy when either is held, or the error that stopped the OS
+// lock from being taken (fail closed: no lock, no handle).
+func acquireProfileLock(storePath string) error {
 	profileLocksMu.Lock()
 	defer profileLocksMu.Unlock()
-	if profileLocks[storePath] {
-		return false
+	if _, held := profileLocks[storePath]; held {
+		return ErrProfileBusy
 	}
-	profileLocks[storePath] = true
-	return true
+	release, err := lockFile(storePath + lockFileExt)
+	if err != nil {
+		return err
+	}
+	profileLocks[storePath] = release
+	return nil
 }
 
+// releaseProfileLock drops the OS lock before the in-process entry, both under
+// profileLocksMu, so a new acquire in this process never sees the entry gone
+// while the OS lock is still held.
 func releaseProfileLock(storePath string) {
 	profileLocksMu.Lock()
 	defer profileLocksMu.Unlock()
+	if release := profileLocks[storePath]; release != nil {
+		release()
+	}
 	delete(profileLocks, storePath)
 }
 
@@ -129,9 +160,11 @@ type Handle struct {
 }
 
 // OpenHandle unlocks the profile for use: it validates name, reserves the
-// single-session lock, unlocks the vault with pin, and returns a Handle. It fails
-// closed — a wrong/absent PIN, a locked-out vault, or an unconfigured vault all
-// return the vault's error and yield NO handle (the caller must not fall back to a
+// single-session lock (in this process and across processes), unlocks the vault
+// with pin through nodevault's at-rest entry point, and returns a Handle. It fails
+// closed — a wrong/absent secret, a secret below the at-rest threshold (#820, so a
+// short access PIN is refused even when correct), a locked-out vault, or an
+// unconfigured vault all return the vault's error and yield NO handle (the caller must not fall back to a
 // plaintext or throwaway profile). The pin is consumed here and never retained;
 // only the resulting Session is held.
 //
@@ -145,12 +178,14 @@ func OpenHandle(baseDir, name, pin string, v *nodevault.Vault) (*Handle, error) 
 		return nil, nodevault.ErrNotConfigured
 	}
 	sp := storePath(baseDir, name)
-	if !acquireProfileLock(sp) {
-		return nil, ErrProfileBusy
+	if err := acquireProfileLock(sp); err != nil {
+		return nil, err
 	}
 	// Unlock AFTER taking the lock so a wrong-PIN attempt does not leave the lock
-	// held; release on every failure path below.
-	sess, err := v.Unlock(pin)
+	// held; release on every failure path below. The at-rest entry point refuses
+	// a secret too weak to protect the profile on disk (#820): a bare access PIN
+	// can never open a persistent profile.
+	sess, err := v.UnlockAtRest(pin, nodevault.LoadPolicy(baseDir))
 	if err != nil {
 		releaseProfileLock(sp)
 		return nil, err
@@ -207,6 +242,18 @@ func (h *Handle) Persist(dir string) error {
 	return nil
 }
 
+// ProfileIdentity names the sealed profile this handle decrypts: the absolute
+// path of its blob. The co-browse session manager records it in the working
+// dir so a crash-leftover decrypted copy can be traced back (Store.Owns).
+func (h *Handle) ProfileIdentity() string { return absPath(h.storePath) }
+
+func absPath(p string) string {
+	if a, err := filepath.Abs(p); err == nil {
+		return a
+	}
+	return filepath.Clean(p)
+}
+
 // Close zeroes the Session's key material and releases the single-session lock. It
 // is idempotent (safe to call from multiple cleanup paths) and never persists —
 // callers decide whether to Persist first.
@@ -232,8 +279,8 @@ func Reset(baseDir, name string) error {
 		return err
 	}
 	sp := storePath(baseDir, name)
-	if !acquireProfileLock(sp) {
-		return ErrProfileBusy
+	if err := acquireProfileLock(sp); err != nil {
+		return err
 	}
 	defer releaseProfileLock(sp)
 	if err := os.Remove(sp); err != nil && !errors.Is(err, os.ErrNotExist) {
