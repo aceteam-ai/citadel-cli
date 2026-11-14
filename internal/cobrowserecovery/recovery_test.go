@@ -393,3 +393,21 @@ type delayedStopOps struct {
 }
 
 func (o *delayedStopOps) Stop(id string) (bool, error) { o.advance(); return o.fakeOps.Stop(id) }
+
+func TestObservedExitRequiresCleanupBeforeTerminal(t *testing.T) {
+	e, _ := testEngine(t)
+	o := &fakeOps{}
+	d := digest(t, "https://example.test", "")
+	mustDo(t, e, "start", testScope, d, o)
+	o.state = Ended
+	if r := mustDo(t, e, "job_status", testScope, "", o); r.State != Unknown || o.stops != 1 {
+		t.Fatal("terminal journal stranded session cleanup")
+	}
+	o.confirmed = true
+	if r := mustDo(t, e, "job_status", testScope, "", o); r.State != Ended || o.stops != 2 {
+		t.Fatal("confirmed cleanup did not end session")
+	}
+	if r := mustDo(t, e, "start", testScope, d, o); r.State != Ended || o.starts != 1 {
+		t.Fatal("ended replay launched again")
+	}
+}

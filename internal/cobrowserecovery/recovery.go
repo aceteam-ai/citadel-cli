@@ -243,8 +243,14 @@ func (e Engine) Do(action string, scope Scope, digest string, ops Ops) (Result, 
 	case Running:
 		r.State = Running
 	case Ended:
-		r.State = Ended
-		r.TerminalAt = now().UTC()
+		// A crashed browser still owns a display/profile until its manager tears
+		// down that custody. Do not strand it behind a terminal journal record.
+		if confirmed, stopErr := ops.Stop(r.SessionID); confirmed && stopErr == nil {
+			r.State = Ended
+			r.TerminalAt = now().UTC()
+		} else {
+			r.State = Unknown
+		}
 	default:
 		r.State = Unknown
 	}

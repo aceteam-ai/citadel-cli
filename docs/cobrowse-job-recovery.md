@@ -57,7 +57,8 @@ States are `not_found`, `launching`, `running`, `stop_requested`, `stopped`,
 execution never happened. On restart, the preassigned session handle allows the
 existing manager/registry to reconcile a surviving browser. Missing or
 unverifiable manager/registry state remains `unknown`, without a fresh launch.
-Only an observed browser-exit channel supports `ended`. The older best-effort
+Only an observed browser-exit channel followed by confirmed display/profile
+cleanup supports `ended`. The older best-effort
 registry's expired label is not sufficient evidence.
 
 A stop intent is synced first. `stopped` requires successful teardown and observed
