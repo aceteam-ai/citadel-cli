@@ -188,7 +188,7 @@ mid-seal. Passphrases are used as typed on both surfaces (no trimming). A persis
 session's working dir carries a `.citadel-profile` marker (identity plus owner)
 written before any plaintext; `platform.CleanOrphanedProfileSessions` removes
 an interrupted session's decrypted copy whose owner is gone and reports any it
-cannot, and `citadel local passphrase forget` refuses unless that comes back
+cannot, including any dir whose marker is present but unreadable or damaged, and `citadel local passphrase forget` refuses unless that comes back
 clean. A persistent session's teardown returns a working-dir removal failure. `TestRealBrowserPersistentProfileRoundTrip`
 is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
 

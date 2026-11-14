@@ -100,3 +100,49 @@ func TestPersistentSessionWritesProfileMarker(t *testing.T) {
 		t.Fatalf("working dir left behind: %v", err)
 	}
 }
+
+// A present marker that is damaged (invalid JSON, empty identity, or not a
+// regular file) is reported and its dir kept: it may hold decrypted cookies of
+// one of the user's profiles. A dir with no marker is still skipped.
+func TestCleanOrphanedProfileSessionsDamagedMarker(t *testing.T) {
+	owns := func(string) bool { return true }
+	for name, damage := range map[string]func(t *testing.T, marker string){
+		"invalid json": func(t *testing.T, m string) {
+			if err := os.WriteFile(m, []byte("{not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"empty identity": func(t *testing.T, m string) {
+			if err := os.WriteFile(m, []byte(`{"identity":"","owner_pid":2147483000}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"not a file": func(t *testing.T, m string) {
+			if err := os.Remove(m); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(m, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := trustedBaseDir(t)
+			dir := plantOrphan(t, base, "cb-0000000000000007", "/store/cobrowse-profiles/default.enc", deadPID, 0)
+			damage(t, filepath.Join(dir, profileMarkerName))
+			unmarked := plantOrphan(t, base, "cb-0000000000000008", "", deadPID, 0)
+			err := CleanOrphanedProfileSessions(base, owns)
+			if !errors.Is(err, ErrProfilePlaintextRemains) || !strings.Contains(err.Error(), dir) {
+				t.Fatalf("a damaged marker must be reported, got %v", err)
+			}
+			if strings.Contains(err.Error(), unmarked) {
+				t.Fatalf("an unmarked dir must not be reported: %v", err)
+			}
+			for _, d := range []string{dir, unmarked} {
+				if _, err := os.Stat(d); err != nil {
+					t.Fatalf("%s must be kept: %v", d, err)
+				}
+			}
+		})
+	}
+}

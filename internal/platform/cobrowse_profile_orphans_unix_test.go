@@ -66,3 +66,25 @@ func TestPersistentStopReportsWorkingDirRemovalFailure(t *testing.T) {
 		t.Fatalf("Stop = %v, want the removal failure", err)
 	}
 }
+
+// A present marker that cannot be read is reported, never skipped.
+func TestCleanOrphanedProfileSessionsUnreadableMarker(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a mode-000 file")
+	}
+	base := trustedBaseDir(t)
+	const mine = "/store/cobrowse-profiles/default.enc"
+	dir := plantOrphan(t, base, "cb-0000000000000006", mine, deadPID, 0)
+	marker := filepath.Join(dir, profileMarkerName)
+	if err := os.Chmod(marker, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(marker, 0o600) })
+	err := CleanOrphanedProfileSessions(base, func(id string) bool { return id == mine })
+	if !errors.Is(err, ErrProfilePlaintextRemains) || !strings.Contains(err.Error(), dir) {
+		t.Fatalf("an unreadable marker must be reported, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "Default", "Cookies")); err != nil {
+		t.Fatalf("the dir must be left for the user to resolve: %v", err)
+	}
+}

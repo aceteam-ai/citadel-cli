@@ -355,3 +355,47 @@ func TestForgetRefusesWhilePlaintextRemains(t *testing.T) {
 		t.Fatalf("forget deleted saved profiles although it refused: %v", names)
 	}
 }
+
+// TestForgetRefusesOnUnverifiableMarker: a session dir whose ownership marker
+// is present but cannot be read or decoded may hold decrypted cookies of a
+// saved profile, so forget refuses, names it and keeps the vault. Mutation
+// check: skipping such a dir lets forget delete the vault and print success.
+func TestForgetRefusesOnUnverifiableMarker(t *testing.T) {
+	for name, damage := range map[string]func(t *testing.T, marker string){
+		"malformed": func(t *testing.T, m string) {
+			if err := os.WriteFile(m, []byte("{damaged"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		// A directory in the marker's place cannot be read as a file on any OS.
+		"unreadable": func(t *testing.T, m string) {
+			if err := os.Remove(m); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(m, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir, base, s := forgetFixture(t)
+			identity := filepath.Join(dir, "cobrowse-profiles", "default.enc")
+			orphan := plantSessionDir(t, base, "cb-0000000000000014", identity, 2147483000)
+			damage(t, filepath.Join(orphan, ".citadel-profile"))
+			var out bytes.Buffer
+			err := runLocalPassphraseForget(dir, &out)
+			if err == nil || !strings.Contains(err.Error(), orphan) || !strings.Contains(err.Error(), "nothing was deleted") {
+				t.Fatalf("forget = %v, want a refusal naming %s", err, orphan)
+			}
+			if strings.Contains(out.String(), "Deleted every saved login") {
+				t.Fatal("forget claimed success while a damaged-marker dir remains")
+			}
+			if st, _ := s.State(); !st.Configured {
+				t.Fatal("forget deleted the vault although it refused")
+			}
+			if _, err := os.Stat(filepath.Join(orphan, "Default", "Cookies")); err != nil {
+				t.Fatalf("the dir must be left in place: %v", err)
+			}
+		})
+	}
+}

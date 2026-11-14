@@ -93,13 +93,25 @@ func CleanOrphanedProfileSessions(baseDir string, owns func(identity string) boo
 			continue
 		}
 		dir := filepath.Join(baseDir, e.Name())
-		data, err := os.ReadFile(filepath.Join(dir, profileMarkerName))
+		markerPath := filepath.Join(dir, profileMarkerName)
+		if _, err := os.Lstat(markerPath); errors.Is(err, os.ErrNotExist) {
+			continue // no marker: not a persistent-profile session dir
+		}
+		// A marker is present, so this dir may hold decrypted cookies. If it
+		// cannot be verified, the dir cannot be ruled out: fail closed and
+		// report it rather than skip it.
+		data, err := readProfileMarker(markerPath)
 		if err != nil {
-			continue // not a persistent-profile session dir
+			remain = append(remain, fmt.Sprintf("%s (profile marker cannot be read: %v)", dir, err))
+			continue
 		}
 		var mk profileMarker
-		if json.Unmarshal(data, &mk) != nil || mk.Identity == "" || !owns(mk.Identity) {
+		if json.Unmarshal(data, &mk) != nil || mk.Identity == "" {
+			remain = append(remain, fmt.Sprintf("%s (profile marker is damaged)", dir))
 			continue
+		}
+		if !owns(mk.Identity) {
+			continue // another store's profile: never touched
 		}
 		if mk.OwnerPID == os.Getpid() || sessionOwnerAlive(mk.OwnerPID, mk.OwnerStart) {
 			remain = append(remain, fmt.Sprintf("%s (in use by running process %d)", dir, mk.OwnerPID))
@@ -120,4 +132,23 @@ func CleanOrphanedProfileSessions(baseDir string, owns func(identity string) boo
 		return fmt.Errorf("%w: %v", ErrProfilePlaintextRemains, remain)
 	}
 	return nil
+}
+
+// maxProfileMarkerSize bounds a marker read; a real one is a few hundred bytes.
+const maxProfileMarkerSize = 64 << 10
+
+// readProfileMarker reads a marker that must be a small regular file (never a
+// symlink, directory or device).
+func readProfileMarker(path string) ([]byte, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file")
+	}
+	if fi.Size() > maxProfileMarkerSize {
+		return nil, fmt.Errorf("too large")
+	}
+	return os.ReadFile(path)
 }
