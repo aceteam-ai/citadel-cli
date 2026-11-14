@@ -298,6 +298,10 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		"dis2":  `<input type="hidden" name="to" value="bob" disabled>`,
 		"file1": `<input type="text" name="m" value="hi">`,
 		"file2": `<input type="text" name="m" value="hi"><input type="file" name="att">`,
+		"cf1":   `<x-field name="to" id="xf"></x-field>`,
+		"cf2":   `<x-field name="to" id="xf"></x-field>`,
+		"tg1":   `<input type="text" name="m" value="hi">`,
+		"tg2":   `<input type="text" name="m" value="hi">`,
 		"fa1":   `<input type="text" name="m" value="hi">`,
 		"fa2":   `<input type="text" name="m" value="hi">`,
 	}
@@ -307,8 +311,21 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		if v == "fa2" {
 			btn = `<button id="send" type="submit" formaction="/exfil" formmethod="get" formtarget="_blank">Send</button>`
 		}
+		formAttrs := ""
+		switch v {
+		case "tg1":
+			formAttrs = ` target="Panel"`
+		case "tg2":
+			formAttrs = ` target="panel"`
+		}
+		extra := ""
+		if v == "cf1" || v == "cf2" {
+			// A form-associated custom element: what it submits is whatever it
+			// passes to setFormValue; its .value property stays fixed.
+			extra = fmt.Sprintf(`<script>customElements.define("x-field", class extends HTMLElement { static formAssociated = true; constructor(){ super(); this.i = this.attachInternals(); this.i.setFormValue(%q); } get value(){ return "fixed"; } });</script>`, r.URL.Query().Get("sv"))
+		}
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<!doctype html><h1 id="t">%s</h1><form id="f" method="post" action="/send">%s%s</form>`, v, variants[v], btn)
+		fmt.Fprintf(w, `<!doctype html>%s<h1 id="t">%s</h1><form id="f" method="post" action="/send"%s>%s%s</form>`, extra, v, formAttrs, variants[v], btn)
 	}))
 	defer page.Close()
 
@@ -321,7 +338,14 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	}
 	inspect := func(v string) platform.TargetInfo {
 		t.Helper()
-		if _, err := m.Navigate(st.ID, page.URL+"/?v="+v); err != nil {
+		q := "/?v=" + v
+		switch v {
+		case "cf1":
+			q += "&sv=alice"
+		case "cf2":
+			q += "&sv=mallory"
+		}
+		if _, err := m.Navigate(st.ID, page.URL+q); err != nil {
 			t.Fatal(err)
 		}
 		deadline := time.Now().Add(30 * time.Second)
@@ -359,6 +383,12 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	}
 	if ti := inspect("file2"); ti.Resolved {
 		t.Errorf("a form with a file input must be unverifiable: %+v", ti)
+	}
+	if a, b := fp(inspect("cf1")), fp(inspect("cf2")); a == b {
+		t.Error("a form-associated custom element's setFormValue must change the binding even though its .value is fixed")
+	}
+	if a, b := inspect("tg1"), inspect("tg2"); a.FormTarget == b.FormTarget || a.FormTarget != "Panel" || b.FormTarget != "panel" {
+		t.Errorf("a case-only change of a named target must be kept exactly: %q vs %q", a.FormTarget, b.FormTarget)
 	}
 	fa1, fa2 := inspect("fa1"), inspect("fa2")
 	if fa1.FormAction == fa2.FormAction || fa1.FormMethod == fa2.FormMethod || fa1.FormTarget == fa2.FormTarget {

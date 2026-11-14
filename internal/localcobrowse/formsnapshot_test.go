@@ -30,6 +30,10 @@ type fakeEl struct {
 type fakeForm struct {
 	Attrs    map[string]string `json:"attrs,omitempty"`
 	Elements []fakeEl          `json:"elements"`
+	// Submitted stands in for the browser's own submission set, new
+	// FormData(form, submitter): [name, value] pairs, or [name, {"file":true}].
+	Submitted [][]any `json:"submitted,omitempty"`
+	Throws    bool    `json:"throws,omitempty"`
 }
 
 // scenario is one action: the form, which element is the target (-1 for none
@@ -78,6 +82,10 @@ const env = {
   elements: (f) => f.elements,
   disabled: (e) => !!e.disabled,
   text: (e) => (typeof e.value === "string" ? e.value : ""),
+  formData: (f, sub) => { if (f.throws) throw new TypeError("submitter"); return f; },
+  entries: (fd) => fd.submitted || [],
+  isFile: (v) => v !== null && typeof v === "object" && v.file === true,
+  inForm: (f, c) => f.elements.indexOf(c) >= 0,
   abs: (u) => new URL(u, "http://a.test/page").href,
   base: () => "http://a.test/page",
 };
@@ -148,53 +156,78 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 		}
 		return e
 	}
-	form := func(attrs map[string]string, els ...fakeEl) *fakeForm { return &fakeForm{Attrs: attrs, Elements: els} }
+	// form builds a fake form: its elements (for submitter and password lookup)
+	// and the entries the browser's FormData would produce for it.
+	form := func(attrs map[string]string, submitted [][]any, els ...fakeEl) *fakeForm {
+		return &fakeForm{Attrs: attrs, Elements: els, Submitted: submitted}
+	}
+	ent := func(kv ...string) [][]any {
+		var out [][]any
+		for i := 0; i+1 < len(kv); i += 2 {
+			out = append(out, []any{kv[i], kv[i+1]})
+		}
+		return out
+	}
 	send := button("go", "1", nil)
+	m := fel("INPUT", "text", "m", "hi")
 	cases := map[string]struct{ a, b scenario }{
 		"later selected option of a select-multiple": {
-			scenario{Form: form(nil, multi("alice", "bob"), send), T: 1},
-			scenario{Form: form(nil, multi("alice", "mallory"), send), T: 1},
+			scenario{Form: form(nil, ent("to", "alice", "to", "bob", "go", "1"), multi("alice", "bob"), send), T: 1},
+			scenario{Form: form(nil, ent("to", "alice", "to", "mallory", "go", "1"), multi("alice", "mallory"), send), T: 1},
 		},
 		"extra selected option": {
-			scenario{Form: form(nil, multi("alice"), send), T: 1},
-			scenario{Form: form(nil, multi("alice", "mallory"), send), T: 1},
+			scenario{Form: form(nil, ent("to", "alice"), multi("alice"), send), T: 1},
+			scenario{Form: form(nil, ent("to", "alice", "to", "mallory"), multi("alice", "mallory"), send), T: 1},
+		},
+		"custom element whose setFormValue changes while .value is fixed": {
+			// The element reports the same value property; the browser's
+			// submission set carries what it passed to setFormValue.
+			scenario{Form: form(nil, ent("to", "alice"), fakeEl{TagName: "X-FIELD", Name: "to", Value: sp("fixed")}, send), T: 1},
+			scenario{Form: form(nil, ent("to", "mallory"), fakeEl{TagName: "X-FIELD", Name: "to", Value: sp("fixed")}, send), T: 1},
 		},
 		"submitter formaction override": {
-			scenario{Form: form(map[string]string{"action": "/send"}, fel("INPUT", "text", "m", "hi"), send), T: 1},
-			scenario{Form: form(map[string]string{"action": "/send"}, fel("INPUT", "text", "m", "hi"), button("go", "1", map[string]string{"formaction": "/exfil"})), T: 1},
+			scenario{Form: form(map[string]string{"action": "/send"}, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"action": "/send"}, ent("m", "hi"), m, button("go", "1", map[string]string{"formaction": "/exfil"})), T: 1},
 		},
 		"submitter formmethod override": {
-			scenario{Form: form(map[string]string{"method": "post"}, fel("INPUT", "text", "m", "hi"), send), T: 1},
-			scenario{Form: form(map[string]string{"method": "post"}, fel("INPUT", "text", "m", "hi"), button("go", "1", map[string]string{"formmethod": "get"})), T: 1},
+			scenario{Form: form(map[string]string{"method": "post"}, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"method": "post"}, ent("m", "hi"), m, button("go", "1", map[string]string{"formmethod": "get"})), T: 1},
 		},
 		"submitter formenctype override": {
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), send), T: 1},
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), button("go", "1", map[string]string{"formenctype": "text/plain"})), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, button("go", "1", map[string]string{"formenctype": "text/plain"})), T: 1},
 		},
 		"submitter formtarget override": {
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), send), T: 1},
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), button("go", "1", map[string]string{"formtarget": "_blank"})), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, button("go", "1", map[string]string{"formtarget": "_blank"})), T: 1},
+		},
+		"case-only change of a submitter formtarget": {
+			scenario{Form: form(nil, ent("m", "hi"), m, button("go", "1", map[string]string{"formtarget": "Panel"})), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, button("go", "1", map[string]string{"formtarget": "panel"})), T: 1},
+		},
+		"case-only change of a form-level target": {
+			scenario{Form: form(map[string]string{"target": "Panel"}, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"target": "panel"}, ent("m", "hi"), m, send), T: 1},
 		},
 		"submitter value": {
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), button("go", "send", nil)), T: 1},
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), button("go", "send-all", nil)), T: 1},
+			scenario{Form: form(nil, ent("m", "hi", "go", "send"), m, button("go", "send", nil)), T: 1},
+			scenario{Form: form(nil, ent("m", "hi", "go", "send-all"), m, button("go", "send-all", nil)), T: 1},
 		},
 		"default button override on Enter in a field": {
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), send), T: 0, TEntry: true},
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), button("go", "1", map[string]string{"formaction": "/exfil"})), T: 0, TEntry: true},
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 0, TEntry: true},
+			scenario{Form: form(nil, ent("m", "hi"), m, button("go", "1", map[string]string{"formaction": "/exfil"})), T: 0, TEntry: true},
 		},
 		"control outside the form element associated by form=": {
-			// form.elements includes it once present; the earlier state had none.
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), send), T: 1},
-			scenario{Form: form(nil, fel("INPUT", "text", "m", "hi"), send, fel("INPUT", "hidden", "to", "mallory")), T: 1},
+			scenario{Form: form(nil, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(nil, ent("m", "hi", "to", "mallory"), m, send, fel("INPUT", "hidden", "to", "mallory")), T: 1},
 		},
 		"disabled control becomes enabled": {
-			scenario{Form: form(nil, func() fakeEl { e := fel("INPUT", "hidden", "to", "bob"); e.Disabled = true; return e }(), send), T: 1},
-			scenario{Form: form(nil, fel("INPUT", "hidden", "to", "bob"), send), T: 1},
+			scenario{Form: form(nil, ent(), func() fakeEl { e := fel("INPUT", "hidden", "to", "bob"); e.Disabled = true; return e }(), send), T: 1},
+			scenario{Form: form(nil, ent("to", "bob"), fel("INPUT", "hidden", "to", "bob"), send), T: 1},
 		},
-		"checkbox checked state": {
-			scenario{Form: form(nil, fakeEl{TagName: "INPUT", Type: "checkbox", Name: "agree", Value: sp("on")}, send), T: 1},
-			scenario{Form: form(nil, fakeEl{TagName: "INPUT", Type: "checkbox", Name: "agree", Value: sp("on"), Checked: true}, send), T: 1},
+		"checkbox becomes checked": {
+			scenario{Form: form(nil, ent(), fakeEl{TagName: "INPUT", Type: "checkbox", Name: "agree", Value: sp("on")}, send), T: 1},
+			scenario{Form: form(nil, ent("agree", "on"), fakeEl{TagName: "INPUT", Type: "checkbox", Name: "agree", Value: sp("on"), Checked: true}, send), T: 1},
 		},
 	}
 	for name, c := range cases {
@@ -211,24 +244,34 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 		})
 	}
 
-	// Not part of a submission, so not bound: a disabled control's value and a
-	// password field. (Excluding them is deliberate; see the snapshot script.)
-	t.Run("excluded state does not change the binding", func(t *testing.T) {
-		dis := func(v string) fakeEl { e := fel("INPUT", "hidden", "to", v); e.Disabled = true; return e }
+	// Reserved target keywords are case-insensitive, so a case-only change of
+	// one is not a change.
+	t.Run("reserved target keyword case is normalized", func(t *testing.T) {
 		r := runInspect(t,
-			scenario{Form: form(nil, dis("a"), fel("INPUT", "password", "pw", "one"), send), T: 2},
-			scenario{Form: form(nil, dis("b"), fel("INPUT", "password", "pw", "two"), send), T: 2})
+			scenario{Form: form(map[string]string{"target": "_BLANK"}, ent("m", "hi"), m, send), T: 1},
+			scenario{Form: form(map[string]string{"target": "_blank"}, ent("m", "hi"), m, send), T: 1})
+		if r[0].Target != "_blank" || r[0] != r[1] {
+			t.Fatalf("%+v vs %+v", r[0], r[1])
+		}
+	})
+
+	// Password and one-time-code controls are dropped by name; a disabled
+	// control is absent from the submission set by definition.
+	t.Run("excluded state does not change the binding", func(t *testing.T) {
+		pw := func() fakeEl { return fel("INPUT", "password", "pw", "x") }
+		r := runInspect(t,
+			scenario{Form: form(nil, ent("pw", "one", "m", "hi"), pw(), m, send), T: 2},
+			scenario{Form: form(nil, ent("pw", "two", "m", "hi"), pw(), m, send), T: 2})
 		if r[0].Digest != r[1].Digest {
-			t.Fatal("disabled and password fields must not be part of the digest")
+			t.Fatal("a password field must not be part of the digest")
 		}
 	})
 
 	// State the snapshot cannot capture: the target is unverifiable and an
 	// approval of it can never be redeemed.
 	unverifiable := map[string]scenario{
-		"file input present": {Form: form(nil, fel("INPUT", "text", "m", "hi"), fakeEl{TagName: "INPUT", Type: "file", Name: "att", Value: sp("")}, send), T: 2},
-		"form-associated custom element without a readable value": {
-			Form: form(nil, fakeEl{TagName: "MY-FIELD", Name: "to"}, send), T: 1},
+		"file entry":                  {Form: form(nil, [][]any{{"att", map[string]any{"file": true}}}, send), T: 0},
+		"FormData constructor throws": {Form: func() *fakeForm { f := form(nil, nil, send); f.Throws = true; return f }(), T: 0},
 		"composer whose value cannot be read": {
 			Form: nil, T: -1, TEntry: true, TOutsid: &fakeEl{TagName: "DIV", Attrs: map[string]string{"role": "textbox"}}},
 	}

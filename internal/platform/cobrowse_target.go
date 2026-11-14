@@ -114,47 +114,71 @@ const FormDigestScript = `
 
 // FormSnapshotScript builds the ordered snapshot of everything a browser would
 // submit for an action, shared with the tests that run it under Node against a
-// fake DOM. env supplies the DOM reads (prototype-level, so a control named
-// "elements" or "getAttribute" cannot shadow them). It reads form.elements, so
-// controls associated through the form= attribute count; disabled controls are
-// left out as a submission would; a select contributes the complete ordered
-// list of its selected values; checkbox and radio state is kept; password and
-// one-time-code fields are excluded. State it cannot capture (a file input, or a
-// form control or composer whose value cannot be read) sets bad: the target is
-// then unverifiable and no approval of it is redeemable.
+// fake env. The submitted entries come from the browser's own submission set,
+// new FormData(form, submitter): that covers select-multiple, disabled controls,
+// controls joined by form=, form-associated custom elements (whatever they pass
+// to setFormValue) and the submitter's name and value by definition. Entries are
+// encoded as [name, kind, value] tuples in order. A File entry, or a FormData
+// constructor that throws, makes the target unverifiable (bad), and no approval
+// of it is redeemable. Entries named like a password or one-time-code control are
+// dropped, conservatively by name. Composers outside the form (the focused one,
+// or the target) are added from their own text; one whose value cannot be read
+// is bad too. env supplies the DOM reads at prototype level, so a control named
+// "elements" or "getAttribute" cannot shadow them.
 const FormSnapshotScript = `
-	function buildSnapshot(env, form, t, focus, tIsEntry){
+	function buildSnapshot(env, form, sub, t, focus, tIsEntry){
 		var tuples = [], bad = "";
+		if (form) {
+			var fd = null;
+			try { fd = env.formData(form, sub); } catch (x) { bad = "the browser could not build this form's submission"; }
+			if (!bad) {
+				var skip = {};
+				var els = env.elements(form);
+				for (var i = 0; i < els.length; i++) {
+					var ty = String(els[i].type || "").toLowerCase(), ac = String(env.attr(els[i], "autocomplete") || "");
+					if (ty === "password" || /one-time-code|password/i.test(ac)) skip["n:" + String(els[i].name || "")] = true;
+				}
+				var entries = env.entries(fd);
+				for (var j = 0; j < entries.length; j++) {
+					var name = String(entries[j][0]), val = entries[j][1];
+					if (env.isFile(val)) { bad = "the form submits a file"; break; }
+					if (skip["n:" + name]) continue;
+					tuples.push([name, "string", String(val)]);
+				}
+			}
+		}
 		function add(c, mustRead){
 			var tag = String(c.tagName || "").toLowerCase();
-			if (/^(fieldset|output|object)$/.test(tag)) return;
 			if (env.disabled(c)) return;
 			var ty = String(c.type || "").toLowerCase();
-			if (ty === "file") { bad = "the form has a file input"; return; }
+			if (ty === "file") { bad = "the page has a file input"; return; }
 			if (/^(password|submit|button|reset|image)$/.test(ty)) return;
 			var ac = String(env.attr(c, "autocomplete") || "");
 			if (/one-time-code|password/i.test(ac)) return;
 			var v;
-			if (tag === "select") v = Array.prototype.map.call(c.selectedOptions || [], function(o){ return o.value; });
+			if (tag === "select") v = Array.prototype.map.call(c.selectedOptions || [], function(o){ return o.value; }).join("\u0000");
 			else if (c.isContentEditable) v = env.text(c);
 			else if (typeof c.value === "string") v = c.value;
-			else { if (mustRead || tag.indexOf("-") > 0) bad = "a form control's value cannot be read"; return; }
-			tuples.push([c.name || "", c.id || "", ty || tag, v, !!c.checked]);
+			else { if (mustRead) bad = "a text control's value cannot be read"; return; }
+			tuples.push(["(page)", ty || tag, v]);
 		}
-		if (form) { var els = env.elements(form); for (var i = 0; i < els.length; i++) add(els[i], false); }
-		if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT")) add(focus, false);
-		if (t && (tIsEntry || String(t.tagName || "").toLowerCase() === "select")) add(t, true);
+		if (!bad) {
+			if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT") && !(form && env.inForm(form, focus))) add(focus, false);
+			if (t && !(form && env.inForm(form, t)) && (tIsEntry || String(t.tagName || "").toLowerCase() === "select")) add(t, true);
+		}
 		return {tuples: tuples, bad: bad};
 	}
-	// inspectForm returns what an action would submit: the complete field
-	// snapshot digest and the effective submission (action, method, enctype,
+	// normTarget keeps a browsing-context name exactly (names are case-sensitive)
+	// and lower-cases only the reserved keywords.
+	function normTarget(s){ s = String(s || ""); return /^_(self|blank|parent|top)$/i.test(s) ? s.toLowerCase() : s; }
+	// inspectForm returns what an action would submit: the digest of the
+	// submission snapshot and the effective submission (action, method, enctype,
 	// target) after any override by the submitter, which is the clicked submit
 	// button or, for Enter in a field, the form's default (first enabled submit)
 	// button. The submitter's own name, id, type and value are folded into the
 	// digest. bad or oversized means the target cannot be verified in full.
 	function inspectForm(env, form, t, focus, tIsEntry, maxc){
 		var r = {bad: "", oversized: false, digest: "", action: "", method: "", enctype: "", target: ""};
-		var snap = buildSnapshot(env, form, t, focus, tIsEntry);
 		var sub = null;
 		if (form) {
 			var els = env.elements(form);
@@ -165,8 +189,9 @@ const FormSnapshotScript = `
 			r.action = env.abs((sub && env.attr(sub, "formaction")) || env.attr(form, "action") || env.base());
 			r.method = String(ov("formmethod", "method") || "get").toLowerCase();
 			r.enctype = String(ov("formenctype", "enctype")).toLowerCase();
-			r.target = String(ov("formtarget", "target")).toLowerCase();
+			r.target = normTarget(ov("formtarget", "target"));
 		}
+		var snap = buildSnapshot(env, form, sub, t, focus, tIsEntry);
 		if (snap.bad) { r.bad = snap.bad; return r; }
 		if (JSON.stringify(snap.tuples).length > maxc) { r.oversized = true; return r; }
 		var d = formDigest(snap.tuples);
@@ -261,6 +286,10 @@ const targetProbeScript = `(function(kind, selector, px, py){
 		elements: function(f){ try { return Array.prototype.slice.call(Object.getOwnPropertyDescriptor(HF, "elements").get.call(f)); } catch (x) { return []; } },
 		disabled: function(e){ try { return EP.matches.call(e, ":disabled"); } catch (x) { return !!e.disabled; } },
 		text: function(e){ return e.innerText || e.textContent || ""; },
+		formData: function(f, sub){ return sub ? new FormData(f, sub) : new FormData(f); },
+		entries: function(fd){ var out = []; fd.forEach(function(v, k){ out.push([k, v]); }); return out; },
+		isFile: function(v){ return typeof v !== "string"; },
+		inForm: function(f, c){ try { return Array.prototype.indexOf.call(Object.getOwnPropertyDescriptor(HF, "elements").get.call(f), c) >= 0; } catch (x) { return false; } },
 		abs: abs,
 		base: function(){ return location.href; }
 	};
