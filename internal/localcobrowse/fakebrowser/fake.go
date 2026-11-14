@@ -20,6 +20,9 @@ type Fake struct {
 	sessions map[string]*sess
 	// Calls records browser calls in order.
 	Calls []string
+	// Target, when set, is what InspectTarget reports for every action. The
+	// default is a plain, resolved, non-interactive element on the current page.
+	Target *platform.TargetInfo
 }
 
 type sess struct {
@@ -181,4 +184,25 @@ func (f *Fake) Resume(id string) (platform.CobrowseSessionStatus, error) {
 	}
 	f.mu.Unlock()
 	return f.status(id, nil)
+}
+
+// InspectTarget reports Target, or a plain element on the current page.
+func (f *Fake) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.sessions[id]
+	if !ok {
+		return platform.TargetInfo{}, errors.New("no session")
+	}
+	if s.human {
+		return platform.TargetInfo{}, platform.ErrHandedOff
+	}
+	if f.Target != nil {
+		t := *f.Target
+		if t.PageURL == "" {
+			t.PageURL = s.url
+		}
+		return t, nil
+	}
+	return platform.TargetInfo{Resolved: true, Tag: "div", PageURL: s.url}, nil
 }

@@ -394,6 +394,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.withCookie(s.withCSRF(s.handleState)))
 	mux.HandleFunc("POST /api/sessions/{id}/{action}", s.withCookie(s.withCSRF(s.handleAction)))
 	mux.HandleFunc("GET /api/stream", s.withCookie(s.handleStream))
+	mux.HandleFunc("GET /api/sessions/{id}/commit/{commit}/shot", s.withCookie(s.withCSRF(s.handleCommitShot)))
 	mux.HandleFunc("GET /api/activity", s.withCookie(s.withCSRF(s.handleActivity)))
 	mux.HandleFunc("POST /api/mint", s.handleMint)
 	mux.HandleFunc("GET /api/summary", s.handleSummary)
@@ -579,6 +580,19 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"records": recs})
 }
 
+// handleCommitShot serves the pending send/post/submit/pay request's
+// screenshot and target box for the approval card. It is no-store: the picture
+// is the page the user is being asked about.
+func (s *Server) handleCommitShot(w http.ResponseWriter, r *http.Request) {
+	png, rect, ok := s.cfg.Service.CommitShot(r.PathValue("id"), r.PathValue("commit"))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"png": png, "rect": rect})
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -593,6 +607,8 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Hours      float64 `json:"hours"`
 		URL        string  `json:"url"`
+		Domain     string  `json:"domain"`
+		Commit     string  `json:"commit"`
 		Passphrase string  `json:"passphrase"`
 		Confirm    string  `json:"confirm"`
 		Ack        bool    `json:"ack"`
@@ -607,7 +623,11 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch action {
 	case "approve":
-		err = svc.Approve(id, time.Duration(body.Hours*float64(time.Hour)))
+		err = svc.ApproveDomain(id, body.Domain, time.Duration(body.Hours*float64(time.Hour)))
+	case "approve-commit":
+		err = svc.ApproveCommit(r.Context(), id, body.Commit)
+	case "deny-commit":
+		err = svc.DenyCommit(id, body.Commit)
 	case "deny":
 		err = svc.Deny(id)
 	case "revoke":

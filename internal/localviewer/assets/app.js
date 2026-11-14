@@ -63,7 +63,7 @@
       b.onclick = () => { selected = s.session_id; render(); };
       tabs.appendChild(b);
     }
-    const waitingAny = sessions.some((s) => (s.driver === "human" && s.handoff_reason) || s.approval_asked || s.state === "locked");
+    const waitingAny = sessions.some((s) => (s.driver === "human" && s.handoff_reason) || s.approval_asked || s.commit || s.state === "locked");
     document.title = waitingAny ? "● Citadel: waiting for you" : "Citadel viewer";
 
     const s = sessions.find((x) => x.session_id === selected);
@@ -84,6 +84,8 @@
       $("session-grant").textContent = "";
       $("waiting").hidden = true;
       $("approval").hidden = true;
+      $("commit").hidden = true;
+      $("commit-result").hidden = true;
       $("hint").textContent = "";
       closeStream();
       return;
@@ -95,7 +97,7 @@
     $("session-driver").className = human ? "pill human" : "pill";
     $("session-domain").textContent = domainOf(s.url);
     $("session-grant").textContent = s.approval === "approved"
-      ? "AI actions allowed until " + new Date(s.grant_expires_at).toLocaleTimeString()
+      ? "AI actions allowed on " + (s.domain || "this site") + " until " + new Date(s.grant_expires_at).toLocaleTimeString()
       : (s.approval === "denied" ? "AI actions denied" : (s.approval === "revoked" ? "AI actions revoked" : "AI actions not approved"));
 
     const w = $("waiting");
@@ -109,10 +111,14 @@
       w.hidden = true;
     }
 
-    const showCard = s.approval_asked && s.approval !== "approved";
+    // The site the agent asked about, which may differ from the page shown.
+    const askedSite = s.asked_domain || s.domain || domainOf(s.url);
+    const showCard = s.approval_asked && !s.commit && !(s.grants || []).some((g) => g.domain === askedSite);
     $("approval").hidden = !showCard;
-    $("approval-domain").textContent = "Session: " + (s.goal || s.session_id) + " on " + domainOf(s.url);
-    $("revoke").hidden = s.approval !== "approved";
+    $("approval-site").textContent = askedSite;
+    $("approval-domain").textContent = "Session: " + (s.goal || s.session_id);
+    $("revoke").hidden = !(s.grants && s.grants.length);
+    renderCommit(s);
 
     $("drive").textContent = human ? "Hand back to agent" : "Take control";
     const addr = $("address");
@@ -133,6 +139,71 @@
     $("unlock-weak").hidden = busy || !vault || !vault.configured || vault.strong;
     if (state.profile_vault_error) $("unlock-error").textContent = state.profile_vault_error;
     $("unlock-throwaway").disabled = busy;
+  }
+
+  let commitShown = null;
+  function clearShot() {
+    const cv = $("commit-shot");
+    cv.hidden = true;
+    cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
+  }
+  async function renderCommit(s) {
+    const c = s.commit;
+    const r = s.commit_result;
+    $("commit").hidden = !c;
+    $("commit-result").hidden = !!c || !r;
+    if (!c && r) {
+      $("commit-result").textContent = r.state === "executed"
+        ? "Approved and done: " + r.action + " on " + r.domain + "."
+        : (r.state === "changed" ? "The page changed, so " + r.action + " on " + r.domain + " was not done. The agent will ask again."
+          : "Not done (" + r.state + "): " + r.action + " on " + r.domain + ". " + (r.detail || ""));
+    }
+    if (!c) { commitShown = null; clearShot(); return; }
+    $("commit-action").textContent = c.action;
+    $("commit-domain").textContent = c.domain;
+    $("commit-reason").textContent = "Why you are asked: " + c.reason + ".";
+    if (commitShown === c.id || !c.has_shot) return;
+    // A different request: whatever was drawn belongs to the old one.
+    clearShot();
+    commitShown = c.id;
+    const mine = c.id;
+    try {
+      const r = await fetch("/api/sessions/" + encodeURIComponent(s.session_id) + "/commit/" + encodeURIComponent(c.id) + "/shot",
+        { credentials: "same-origin", headers: { "X-Citadel-CSRF": csrf } });
+      if (!r.ok || commitShown !== mine) return;
+      const body = await r.json();
+      if (commitShown !== mine) return;
+      const bin = atob(body.png);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        if (commitShown !== mine) return; // a late load must not draw an old crop
+        const cv = $("commit-shot");
+        const rect = body.rect || {};
+        const scale = rect.vw ? img.naturalWidth / rect.vw : 1;
+        let sx = 0, sy = 0, sw = img.naturalWidth, sh = Math.min(img.naturalHeight, img.naturalWidth / 2);
+        if (rect.w > 0 && rect.h > 0) {
+          const padX = Math.max(80, rect.w), padY = Math.max(60, rect.h);
+          sx = Math.max(0, (rect.x - padX) * scale);
+          sy = Math.max(0, (rect.y - padY) * scale);
+          sw = Math.min(img.naturalWidth - sx, (rect.w + 2 * padX) * scale);
+          sh = Math.min(img.naturalHeight - sy, (rect.h + 2 * padY) * scale);
+        }
+        cv.width = 480; cv.height = Math.max(60, Math.round(480 * sh / Math.max(1, sw)));
+        const g = cv.getContext("2d");
+        g.drawImage(img, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+        if (rect.w > 0 && rect.h > 0) {
+          const k = cv.width / sw;
+          g.strokeStyle = "#d62424"; g.lineWidth = 3;
+          g.strokeRect((rect.x * scale - sx) * k, (rect.y * scale - sy) * k, rect.w * scale * k, rect.h * scale * k);
+        }
+        cv.hidden = false;
+      };
+      img.src = url;
+    } catch (e) { /* the card still names the action */ }
   }
 
   function closeStream() {
@@ -221,7 +292,18 @@
   });
 
   $("drive").onclick = () => selected && post(selected, human ? "hand-back" : "take-control");
-  $("approve").onclick = () => selected && post(selected, "approve", { hours: Number($("approve-hours").value) });
+  $("approve").onclick = () => {
+    const s = (state.sessions || []).find((x) => x.session_id === selected);
+    if (selected && s) post(selected, "approve", { hours: Number($("approve-hours").value), domain: s.asked_domain || s.domain || "" });
+  };
+  $("commit-approve").onclick = () => {
+    const s = (state.sessions || []).find((x) => x.session_id === selected);
+    if (selected && s && s.commit) post(selected, "approve-commit", { commit: s.commit.id });
+  };
+  $("commit-deny").onclick = () => {
+    const s = (state.sessions || []).find((x) => x.session_id === selected);
+    if (selected && s && s.commit) post(selected, "deny-commit", { commit: s.commit.id });
+  };
   $("deny").onclick = () => selected && post(selected, "deny");
   $("revoke").onclick = () => selected && post(selected, "revoke");
   $("stop").onclick = () => {

@@ -113,6 +113,12 @@ func TestProfileSessionStartsLockedAndRefusesActions(t *testing.T) {
 	if _, err := svc.Navigate(ctx, id, "http://b.test/", "g"); !errors.Is(err, ErrSessionLocked) {
 		t.Fatalf("navigate: %v", err)
 	}
+	if _, err := svc.Click(ctx, id, "#x", nil, nil, "g"); !errors.Is(err, ErrSessionLocked) {
+		t.Fatalf("click: %v", err)
+	}
+	if _, err := svc.Type(ctx, id, "hello", "g"); !errors.Is(err, ErrSessionLocked) {
+		t.Fatalf("type: %v", err)
+	}
 	if _, err := svc.Screenshot(ctx, id, "g"); !errors.Is(err, ErrSessionLocked) {
 		t.Fatalf("screenshot: %v", err)
 	}
