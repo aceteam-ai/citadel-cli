@@ -296,10 +296,10 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 	// Password and one-time-code controls are dropped by name; a disabled
 	// control is absent from the submission set by definition.
 	t.Run("excluded state does not change the binding", func(t *testing.T) {
-		pw := func() fakeEl { return fel("INPUT", "password", "pw", "x") }
+		pw := func(v string) fakeEl { return fel("INPUT", "password", "pw", v) }
 		r := runInspect(t,
-			scenario{Form: form(nil, ent("pw", "one", "m", "hi"), pw(), m, send), T: 2},
-			scenario{Form: form(nil, ent("pw", "two", "m", "hi"), pw(), m, send), T: 2})
+			scenario{Form: form(nil, ent("pw", "one", "m", "hi"), pw("one"), m, send), T: 2},
+			scenario{Form: form(nil, ent("pw", "two", "m", "hi"), pw("two"), m, send), T: 2})
 		if r[0].Digest != r[1].Digest {
 			t.Fatal("a password field must not be part of the digest")
 		}
@@ -347,6 +347,18 @@ func TestFormSnapshotBindsEverythingSubmitted(t *testing.T) {
 					e.Attrs = map[string]string{"autocomplete": "current-password"}
 					return e
 				}(), fel("INPUT", "hidden", "to", "alice"), send), T: 2},
+		"disabled password plus an entry a formdata handler added under its name": {
+			Form: form(nil, ent("to", "mallory"),
+				func() fakeEl { e := fel("INPUT", "password", "to", "x"); e.Disabled = true; return e }(), send), T: 1},
+		"unchecked one-time-code checkbox plus an entry a formdata handler added": {
+			Form: form(nil, ent("to", "mallory"),
+				func() fakeEl {
+					e := fakeEl{TagName: "INPUT", Type: "checkbox", Name: "to", Value: sp("on")}
+					e.Attrs = map[string]string{"autocomplete": "one-time-code"}
+					return e
+				}(), send), T: 1},
+		"entry under a password name whose value does not match the control": {
+			Form: form(nil, ent("pw", "other"), fel("INPUT", "password", "pw", "secret"), send), T: 1},
 		"submitter named like a password field": {
 			Form: form(nil, ent("pw", "x", "pw", "go"), fel("INPUT", "password", "pw", "x"), button("pw", "go", nil)), T: 1},
 		"FormData constructor throws": {Form: func() *fakeForm { f := form(nil, nil, send); f.Throws = true; return f }(), T: 0},

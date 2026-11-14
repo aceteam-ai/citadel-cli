@@ -301,6 +301,8 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 		"pw1":   `<input type="hidden" name="to" value="alice"><input type="password" name="to" value="secret">`,
 		"pw3":   `<input type="checkbox" name="to" autocomplete="one-time-code"><input type="hidden" name="to" value="alice">`,
 		"pw4":   `<input type="password" name="to" disabled><input type="text" name="to" value="alice">`,
+		"pw5":   `<input type="password" name="to" value="x" disabled>`,
+		"pw6":   `<input type="checkbox" name="to" autocomplete="one-time-code">`,
 		"pw2":   `<input type="password" name="pw" value="secret"><input type="hidden" name="to" value="alice">`,
 		"cf1":   `<x-field name="to" id="xf"></x-field>`,
 		"cf2":   `<x-field name="to" id="xf"></x-field>`,
@@ -340,8 +342,13 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 			// passes to setFormValue; its .value property stays fixed.
 			extra = fmt.Sprintf(`<script>customElements.define("x-field", class extends HTMLElement { static formAssociated = true; constructor(){ super(); this.i = this.attachInternals(); this.i.setFormValue(%q); } get value(){ return "fixed"; } });</script>`, r.URL.Query().Get("sv"))
 		}
+		post := ""
+		if v == "pw5" || v == "pw6" {
+			// A formdata handler adds an entry under the sensitive control's name.
+			post = `<script>document.getElementById("f").addEventListener("formdata", function(e){ e.formData.append("to", "mallory"); });</script>`
+		}
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<!doctype html>%s<h1 id="t">%s</h1><form id="f" method="post" action="/send"%s>%s%s</form>`, extra, v, formAttrs, variants[v], btn)
+		fmt.Fprintf(w, `<!doctype html>%s<h1 id="t">%s</h1><form id="f" method="post" action="/send"%s>%s%s</form>%s`, extra, v, formAttrs, variants[v], btn, post)
 	}))
 	defer page.Close()
 
@@ -403,7 +410,7 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	if ti := inspect("pw1"); ti.Resolved {
 		t.Errorf("a password field sharing its name with a hidden field must be unverifiable: %+v", ti)
 	}
-	for _, v := range []string{"pw3", "pw4"} {
+	for _, v := range []string{"pw3", "pw4", "pw5", "pw6"} {
 		if ti := inspect(v); ti.Resolved {
 			t.Errorf("%s: a sensitive control sharing its name with another control must be unverifiable: %+v", v, ti)
 		}
