@@ -28,6 +28,9 @@ type fakeBrowser struct {
 	navigateLandsOn string
 	pageTitle       string
 	notReady        bool
+	// target, when set, is what InspectTarget reports (default: a plain
+	// element on the current page).
+	target *platform.TargetInfo
 }
 
 type fakeSession struct {
@@ -170,6 +173,22 @@ func (f *fakeBrowser) PageState(id string) (platform.PageState, error) {
 	}
 	return platform.PageState{URL: s.url, ReadyState: rs, Title: f.pageTitle}, nil
 }
+func (f *fakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, err := f.drivable(id)
+	if err != nil {
+		return platform.TargetInfo{}, err
+	}
+	if f.target != nil {
+		t := *f.target
+		if t.PageURL == "" {
+			t.PageURL = s.url
+		}
+		return t, nil
+	}
+	return platform.TargetInfo{Resolved: true, Tag: "div", PageURL: s.url}, nil
+}
 func (f *fakeBrowser) Handoff(id string) (platform.CobrowseSessionStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -257,8 +276,11 @@ func TestWritesRefusedWithoutGrant(t *testing.T) {
 		t.Errorf("extract: %v", err)
 	}
 
-	if err := svc.Approve(id, 0); err != nil {
-		t.Fatal(err)
+	// A grant belongs to one registrable domain; the navigate target is another.
+	for _, d := range []string{"a.test", "b.test"} {
+		if err := svc.ApproveDomain(id, d, 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for name, w := range writes {
 		if err := w(); err != nil {
@@ -437,7 +459,8 @@ func TestLimits(t *testing.T) {
 func TestNavigationBudgetCountsStartsAndLinkClicks(t *testing.T) {
 	svc, fb, _ := newTestService(t, func(c *Config) { c.NavigationsPerHour = 2 })
 	st, _ := svc.Start(ctx, "http://one.test/", "g", "") // 1
-	_ = svc.Approve(st.SessionID, 0)
+	_ = svc.ApproveDomain(st.SessionID, "one.test", 0)
+	_ = svc.ApproveDomain(st.SessionID, "three.test", 0)
 	fb.clickNavigatesTo = "http://two.test/"
 	if res, err := svc.Click(ctx, st.SessionID, "a", nil, nil, "g"); err != nil || !res.Navigated {
 		t.Fatalf("link click: %+v %v", res, err) // 2
@@ -613,7 +636,7 @@ func TestHumanNavigateOnlyWhileDriving(t *testing.T) {
 func TestNavigateReturnsFinalURLAndTitleAfterRedirect(t *testing.T) {
 	svc, fb, _ := newTestService(t, nil)
 	st, _ := svc.Start(ctx, "", "g", "")
-	_ = svc.Approve(st.SessionID, 0)
+	_ = svc.ApproveDomain(st.SessionID, "one.test", 0)
 	fb.navigateLandsOn = "http://two.test/final"
 	fb.pageTitle = "Final\x00 Page\n"
 	res, err := svc.Navigate(ctx, st.SessionID, "http://one.test/start", "g")
@@ -631,7 +654,7 @@ func TestNavigateSlowPageReturnsCurrentURLWithinWindow(t *testing.T) {
 	t.Cleanup(func() { settleWindow = old })
 	svc, fb, _ := newTestService(t, nil)
 	st, _ := svc.Start(ctx, "", "g", "")
-	_ = svc.Approve(st.SessionID, 0)
+	_ = svc.ApproveDomain(st.SessionID, "slow.test", 0)
 	fb.notReady = true
 	start := time.Now()
 	res, err := svc.Navigate(ctx, st.SessionID, "http://slow.test/", "g")
@@ -646,7 +669,7 @@ func TestNavigateSlowPageReturnsCurrentURLWithinWindow(t *testing.T) {
 func TestNavigateTitleBounded(t *testing.T) {
 	svc, fb, _ := newTestService(t, nil)
 	st, _ := svc.Start(ctx, "", "g", "")
-	_ = svc.Approve(st.SessionID, 0)
+	_ = svc.ApproveDomain(st.SessionID, "one.test", 0)
 	fb.pageTitle = strings.Repeat("t", 5000)
 	res, err := svc.Navigate(ctx, st.SessionID, "http://one.test/", "g")
 	if err != nil {

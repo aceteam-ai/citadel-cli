@@ -16,6 +16,8 @@ package localcobrowse
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -34,7 +36,15 @@ const (
 	DefaultNavigationsPerHour = 600
 	DefaultReadsPerMinute     = 120
 	DefaultIdleLifetime       = 8 * time.Hour
-	DefaultGrantDuration      = 24 * time.Hour
+	// DefaultGrantDuration is a domain grant's default length (aceteam#13687
+	// D4); MaxGrantDuration is the longest any approval may last.
+	DefaultGrantDuration = 8 * time.Hour
+	MaxGrantDuration     = 24 * time.Hour
+	// A domain where the user has signed in or otherwise driven the browser is
+	// identity-bearing: an agent there acts as that person, so its grant gets
+	// a shorter absolute cap and an idle timeout.
+	IdentityGrantDuration = time.Hour
+	IdentityIdleTimeout   = 15 * time.Minute
 	// MaxWait caps one local_cobrowse_wait call so it stays inside common
 	// harness tool timeouts.
 	MaxWait = 50 * time.Second
@@ -57,6 +67,8 @@ type Browser interface {
 	Click(id, selector string, x, y *float64) (platform.CobrowseSessionStatus, error)
 	Type(id, text string) (platform.CobrowseSessionStatus, error)
 	Select(id, selector, value, label string) (platform.SelectResult, error)
+	// InspectTarget describes what an action would act on, without acting.
+	InspectTarget(id string, p platform.TargetProbe) (platform.TargetInfo, error)
 	Key(id, key string) (platform.CobrowseSessionStatus, error)
 	Scroll(id, selector string, x, y *float64, dx, dy float64) (platform.CobrowseSessionStatus, error)
 	ExtractBounded(id, selector string, attrs []string, maxChars int) (platform.ExtractResult, error)
@@ -68,9 +80,9 @@ type Browser interface {
 
 // Typed refusals. Each carries a plain next step for the agent.
 var (
-	ErrApprovalRequired = errors.New("approval_required: ask the user to approve AI actions for this session in the Citadel viewer, then call local_cobrowse_wait with until=approved")
+	ErrApprovalRequired = errors.New("approval_required: ask the user to approve AI actions on this site in the Citadel viewer, then call local_cobrowse_wait with until=approved")
 	ErrApprovalDenied   = errors.New("approval_denied: the user denied AI actions in this session; do not retry writes unless the user asks")
-	ErrApprovalExpired  = errors.New("approval_expired: the user's approval for this session expired; ask them to approve again in the Citadel viewer, then call local_cobrowse_wait with until=approved")
+	ErrApprovalExpired  = errors.New("approval_expired: the user's approval for this site expired; ask them to approve again in the Citadel viewer, then call local_cobrowse_wait with until=approved")
 	ErrApprovalRevoked  = errors.New("approval_revoked: the user revoked AI actions for this session; ask them before trying again")
 	ErrHumanDriving     = errors.New("human_driving: the user has control of this browser; call local_cobrowse_wait with until=resumed, or ask them to press Hand back")
 	ErrRateLimited      = errors.New("rate_limited")
@@ -95,6 +107,14 @@ type Event struct {
 	// PendingSeq is the audit seq of this write's pending record, set on
 	// the outcome event.
 	PendingSeq int64
+	// Domain is the registrable domain a grant or commit prompt concerns.
+	Domain string
+	// Fingerprint is the first 16 hex characters of the action fingerprint of a
+	// commit prompt, approval, denial or execution.
+	Fingerprint string
+	// Label is the target element's own label (a button caption), bounded and
+	// stripped of control characters. Never typed text.
+	Label string
 }
 
 // Config configures a Service. Zero values take the local-mode defaults.
@@ -105,7 +125,13 @@ type Config struct {
 	NavigationsPerHour int
 	ReadsPerMinute     int
 	IdleLifetime       time.Duration
-	GrantDuration      time.Duration
+	// GrantDuration is the default domain grant length; MaxGrantDuration caps
+	// any approval; IdentityGrantDuration and IdentityIdleTimeout cap grants on
+	// identity-bearing domains (D4).
+	GrantDuration         time.Duration
+	MaxGrantDuration      time.Duration
+	IdentityGrantDuration time.Duration
+	IdentityIdleTimeout   time.Duration
 	// URLPolicy decides which URLs may be opened. Nil uses NewURLPolicy with the
 	// system resolver and ViewerPorts.
 	URLPolicy URLPolicy
@@ -134,11 +160,14 @@ type Config struct {
 	ViewerNote string
 }
 
-// grantState is one session's consent record.
+// grantState is one domain's consent record within a session. Grants belong
+// to a session and end with it (D3, D4): nothing here is persisted.
 type grantState struct {
-	expires time.Time
-	denied  bool
-	revoked bool
+	approvedAt time.Time
+	expires    time.Time
+	lastUsed   time.Time
+	denied     bool
+	revoked    bool
 }
 
 type session struct {
@@ -146,10 +175,22 @@ type session struct {
 	goal       string
 	startedAt  time.Time
 	lastActive time.Time
-	grant      grantState
+	// grants is keyed by registrable domain (D3).
+	grants map[string]*grantState
+	// identity marks domains where a human drove the browser (D4).
+	identity map[string]bool
+	// askedDomain is the domain the last refused write needed a grant for.
+	askedDomain string
 	// approvalAsked is set when a write was refused for lack of a grant, so
 	// the viewer shows the approval card; any human answer clears it.
 	approvalAsked bool
+	// commit is the one pending send/post/submit/pay request; approved is the
+	// one-shot token a human approval leaves; deniedFP are actions the user
+	// declined (sticky for the session); lastCommit is the last answer.
+	commit        *pendingCommit
+	approved      *approvedCommit
+	deniedFP      map[string]bool
+	lastCommit    string
 	handoffAt     time.Time
 	handoffReason string
 	stoppedReason string
@@ -194,6 +235,18 @@ func New(cfg Config) *Service {
 	}
 	if cfg.GrantDuration <= 0 {
 		cfg.GrantDuration = DefaultGrantDuration
+	}
+	if cfg.MaxGrantDuration <= 0 {
+		cfg.MaxGrantDuration = MaxGrantDuration
+	}
+	if cfg.GrantDuration > cfg.MaxGrantDuration {
+		cfg.GrantDuration = cfg.MaxGrantDuration
+	}
+	if cfg.IdentityGrantDuration <= 0 {
+		cfg.IdentityGrantDuration = IdentityGrantDuration
+	}
+	if cfg.IdentityIdleTimeout <= 0 {
+		cfg.IdentityIdleTimeout = IdentityIdleTimeout
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -347,7 +400,8 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 	}
 	now := s.cfg.Now()
 	s.mu.Lock()
-	ss := &session{id: st.ID, goal: goal, startedAt: now, lastActive: now}
+	ss := &session{id: st.ID, goal: goal, startedAt: now, lastActive: now,
+		grants: map[string]*grantState{}, identity: map[string]bool{}, deniedFP: map[string]bool{}}
 	if startURL != "about:blank" {
 		s.navs = append(s.navs, now)
 	}
@@ -412,6 +466,7 @@ func (s *Service) finish(ev Event, err error) {
 
 func isRefusal(err error) bool {
 	for _, e := range []error{ErrApprovalRequired, ErrApprovalDenied, ErrApprovalExpired, ErrApprovalRevoked,
+		ErrCommitApprovalRequired, ErrCommitPending, ErrCommitDenied, ErrNoPendingCommit,
 		ErrHumanDriving, ErrOnlyUserHandsBack, ErrRateLimited, ErrTooManySessions, ErrNavigationRefused, ErrProfileNotReady,
 		platform.ErrHandedOff, platform.ErrPasswordValue} {
 		if errors.Is(err, e) {
@@ -449,59 +504,123 @@ func (s *Service) humanDriving(id string) bool {
 	return ok && st.Driver == platform.DriverHuman
 }
 
-// gateWrite enforces, in order: the user is not driving, a live grant exists,
-// and the per-session write (and, for navigations, navigation) budget.
-func (s *Service) gateWrite(id string, navigation bool) error {
-	ss, err := s.lookup(id)
-	if err != nil {
-		return err
+// grantEvalLocked returns a domain grant's state and effective expiry. On an
+// identity-bearing domain the absolute cap and the idle timeout apply (D4); the
+// check is made at use time, so a domain that becomes identity-bearing after an
+// approval shortens that approval too. Caller holds s.mu.
+func (s *Service) grantEvalLocked(ss *session, domain string, now time.Time) (string, time.Time) {
+	g := ss.grants[domain]
+	switch {
+	case g == nil || (g.expires.IsZero() && !g.denied && !g.revoked):
+		return "not_requested", time.Time{}
+	case g.denied:
+		return "denied", time.Time{}
+	case g.revoked:
+		return "revoked", time.Time{}
 	}
-	if s.humanDriving(id) {
-		return ErrHumanDriving
+	exp := g.expires
+	if ss.identity[domain] {
+		if abs := g.approvedAt.Add(s.cfg.IdentityGrantDuration); abs.Before(exp) {
+			exp = abs
+		}
+		if idle := g.lastUsed.Add(s.cfg.IdentityIdleTimeout); idle.Before(exp) {
+			exp = idle
+		}
 	}
+	if !now.Before(exp) {
+		return "expired", exp
+	}
+	return "approved", exp
+}
+
+// requireGrant checks the domain grant for one write and, if it holds, records
+// the use. A refusal remembers the domain so the viewer asks about it.
+func (s *Service) requireGrant(id string, ss *session, domain string) error {
 	now := s.cfg.Now()
 	s.mu.Lock()
-	g := ss.grant
-	var gateErr error
-	switch {
-	case g.denied:
-		gateErr = ErrApprovalDenied
-	case g.revoked:
-		gateErr = ErrApprovalRevoked
-	case g.expires.IsZero():
-		gateErr = ErrApprovalRequired
-	case !now.Before(g.expires):
-		gateErr = ErrApprovalExpired
+	state, _ := s.grantEvalLocked(ss, domain, now)
+	var err error
+	switch state {
+	case "approved":
+		ss.grants[domain].lastUsed = now
+	case "denied":
+		err = fmt.Errorf("%w (domain %s)", ErrApprovalDenied, domain)
+	case "revoked":
+		err = fmt.Errorf("%w (domain %s)", ErrApprovalRevoked, domain)
+	case "expired":
+		err = fmt.Errorf("%w (domain %s)", ErrApprovalExpired, domain)
+	default:
+		err = fmt.Errorf("%w (domain %s)", ErrApprovalRequired, domain)
 	}
-	if gateErr == nil {
-		s.writes = pruneBefore(s.writes, now.Add(-time.Minute))
-		if len(s.writes) >= s.cfg.WritesPerMinute {
-			gateErr = fmt.Errorf("%w: at most %d actions per minute; slow down", ErrRateLimited, s.cfg.WritesPerMinute)
-		}
-	}
-	if gateErr == nil && navigation {
-		s.navs = pruneBefore(s.navs, now.Add(-time.Hour))
-		if len(s.navs) >= s.cfg.NavigationsPerHour {
-			gateErr = fmt.Errorf("%w: at most %d page loads per hour", ErrRateLimited, s.cfg.NavigationsPerHour)
-		}
-	}
-	if gateErr == nil {
-		s.writes = append(s.writes, now)
-		if navigation {
-			s.navs = append(s.navs, now)
-		}
-	}
-	s.mu.Unlock()
-	if errors.Is(gateErr, ErrApprovalRequired) || errors.Is(gateErr, ErrApprovalExpired) {
-		s.mu.Lock()
+	ask := errors.Is(err, ErrApprovalRequired) || errors.Is(err, ErrApprovalExpired)
+	if ask {
+		ss.askedDomain = domain
 		if !ss.approvalAsked {
 			ss.approvalAsked = true
 			s.notifyLocked()
 		}
-		s.mu.Unlock()
+	}
+	s.mu.Unlock()
+	if ask {
 		s.attention(id, "approval")
 	}
-	return gateErr
+	return err
+}
+
+// preWrite runs the checks every write shares: the session exists, the user is
+// not driving, and no send/post/submit/pay decision is outstanding (so the
+// agent cannot edit what the user is looking at).
+func (s *Service) preWrite(id string) (*session, error) {
+	ss, err := s.lookup(id)
+	if err != nil {
+		return nil, err
+	}
+	if s.humanDriving(id) {
+		return nil, ErrHumanDriving
+	}
+	s.mu.Lock()
+	s.expireCommitLocked(ss, s.cfg.Now())
+	pending := ss.commit != nil
+	s.mu.Unlock()
+	if pending {
+		return nil, ErrCommitPending
+	}
+	return ss, nil
+}
+
+// expireCommitLocked drops a request nobody answered and an approval nobody
+// used. Caller holds s.mu.
+func (s *Service) expireCommitLocked(ss *session, now time.Time) {
+	if ss.commit != nil && now.Sub(ss.commit.requestedAt) >= PendingCommitTTL {
+		ss.commit = nil
+		ss.lastCommit = "expired"
+		s.notifyLocked()
+	}
+	if ss.approved != nil && !now.Before(ss.approved.expires) {
+		ss.approved = nil
+	}
+}
+
+// spendBudget applies the owner-wide write (and navigation) budgets.
+func (s *Service) spendBudget(navigation bool) error {
+	now := s.cfg.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writes = pruneBefore(s.writes, now.Add(-time.Minute))
+	if len(s.writes) >= s.cfg.WritesPerMinute {
+		return fmt.Errorf("%w: at most %d actions per minute; slow down", ErrRateLimited, s.cfg.WritesPerMinute)
+	}
+	if navigation {
+		s.navs = pruneBefore(s.navs, now.Add(-time.Hour))
+		if len(s.navs) >= s.cfg.NavigationsPerHour {
+			return fmt.Errorf("%w: at most %d page loads per hour", ErrRateLimited, s.cfg.NavigationsPerHour)
+		}
+	}
+	s.writes = append(s.writes, now)
+	if navigation {
+		s.navs = append(s.navs, now)
+	}
+	return nil
 }
 
 func pruneBefore(ts []time.Time, cutoff time.Time) []time.Time {
@@ -613,7 +732,7 @@ func (s *Service) enforceLanding(ctx context.Context, id string, res ActionResul
 
 // Navigate opens url in the session (W).
 func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionResult, error) {
-	ev := Event{SessionID: id, Action: "navigate", Class: "W", Goal: goal, URL: url}
+	ev := Event{SessionID: id, Action: "navigate", Class: "W", Goal: goal, URL: url, Domain: RegistrableDomain(url)}
 	res, err := func() (ActionResult, error) {
 		if err := s.cfg.URLPolicy(ctx, url); err != nil {
 			if _, lerr := s.lookup(id); lerr != nil {
@@ -621,7 +740,14 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 			}
 			return ActionResult{}, err
 		}
-		if err := s.gateWrite(id, true); err != nil {
+		ss, err := s.preWrite(id)
+		if err != nil {
+			return ActionResult{}, err
+		}
+		if err := s.requireGrant(id, ss, ev.Domain); err != nil {
+			return ActionResult{}, err
+		}
+		if err := s.spendBudget(true); err != nil {
 			return ActionResult{}, err
 		}
 		if err := s.beforeAction(&ev); err != nil {
@@ -644,7 +770,7 @@ func (s *Service) Navigate(ctx context.Context, id, url, goal string) (ActionRes
 // Click clicks an element or a viewport point (W).
 func (s *Service) Click(ctx context.Context, id, selector string, x, y *float64, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "click", Class: "W", Goal: goal, Selector: selector}
-	res, err := s.writeAction(ctx, &ev, func() error {
+	res, err := s.writeAction(ctx, &ev, actionRef{Kind: "click", Selector: selector, X: x, Y: y}, func() error {
 		_, err := s.cfg.Browser.Click(id, selector, x, y)
 		return err
 	})
@@ -655,7 +781,7 @@ func (s *Service) Click(ctx context.Context, id, selector string, x, y *float64,
 // Type inserts text into the focused element (W). Only its length is audited.
 func (s *Service) Type(ctx context.Context, id, text, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "type", Class: "W", Goal: goal, TextLen: len([]rune(text))}
-	res, err := s.writeAction(ctx, &ev, func() error {
+	res, err := s.writeAction(ctx, &ev, actionRef{Kind: "type"}, func() error {
 		_, err := s.cfg.Browser.Type(id, text)
 		return err
 	})
@@ -667,7 +793,7 @@ func (s *Service) Type(ctx context.Context, id, text, goal string) (ActionResult
 func (s *Service) Select(ctx context.Context, id, selector, value, label, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "select", Class: "W", Goal: goal, Selector: selector}
 	var picked platform.SelectResult
-	res, err := s.writeAction(ctx, &ev, func() error {
+	res, err := s.writeAction(ctx, &ev, actionRef{Kind: "select", Selector: selector}, func() error {
 		var err error
 		picked, err = s.cfg.Browser.Select(id, selector, value, label)
 		return err
@@ -680,7 +806,7 @@ func (s *Service) Select(ctx context.Context, id, selector, value, label, goal s
 // Key presses one key (W).
 func (s *Service) Key(ctx context.Context, id, key, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "key", Class: "W", Goal: goal}
-	res, err := s.writeAction(ctx, &ev, func() error {
+	res, err := s.writeAction(ctx, &ev, actionRef{Kind: "key", Key: key}, func() error {
 		_, err := s.cfg.Browser.Key(id, key)
 		return err
 	})
@@ -691,7 +817,7 @@ func (s *Service) Key(ctx context.Context, id, key, goal string) (ActionResult, 
 // Scroll scrolls at an element or point (W).
 func (s *Service) Scroll(ctx context.Context, id, selector string, x, y *float64, dx, dy float64, goal string) (ActionResult, error) {
 	ev := Event{SessionID: id, Action: "scroll", Class: "W", Goal: goal, Selector: selector}
-	res, err := s.writeAction(ctx, &ev, func() error {
+	res, err := s.writeAction(ctx, &ev, actionRef{Kind: "scroll"}, func() error {
 		_, err := s.cfg.Browser.Scroll(id, selector, x, y, dx, dy)
 		return err
 	})
@@ -718,9 +844,60 @@ func (s *Service) beforeAction(ev *Event) error {
 	return nil
 }
 
-func (s *Service) writeAction(ctx context.Context, ev *Event, do func() error) (ActionResult, error) {
+// writeAction runs one scripted browser write. Order: the user is not driving
+// and no commit decision is pending; the page's domain has a live grant; the
+// target is resolved and classified; a commit needs its own approval of this
+// exact action (D1, D5); only then are the budgets spent, the pending audit
+// record written and the action sent.
+func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do func() error) (ActionResult, error) {
 	id := ev.SessionID
-	if err := s.gateWrite(id, false); err != nil {
+	ss, err := s.preWrite(id)
+	if err != nil {
+		return ActionResult{}, err
+	}
+	pageDomain := RegistrableDomain(s.currentURL(id))
+	ev.Domain = pageDomain
+	if err := s.requireGrant(id, ss, pageDomain); err != nil {
+		return ActionResult{}, err
+	}
+	navigation := false
+	if a.Kind != "scroll" {
+		t, err := s.cfg.Browser.InspectTarget(id, platform.TargetProbe{Kind: a.Kind, Selector: a.Selector, X: a.X, Y: a.Y})
+		if errors.Is(err, platform.ErrHandedOff) {
+			return ActionResult{}, ErrHumanDriving
+		}
+		if err != nil {
+			// Fail closed: an action whose target cannot be read is a commit.
+			t = platform.TargetInfo{Reason: "the page could not be inspected"}
+		}
+		// The page may have moved since the grant check: the probe's own
+		// address is the authority for which domain the action lands on.
+		if t.PageURL != "" {
+			if d := RegistrableDomain(t.PageURL); d != pageDomain {
+				pageDomain, ev.Domain = d, d
+				if err := s.requireGrant(id, ss, d); err != nil {
+					return ActionResult{}, err
+				}
+			}
+		}
+		dec := Classify(a.Kind, a.Key, t)
+		switch dec.Class {
+		case ClassNavigate:
+			navigation = true
+			if dec.Domain != pageDomain {
+				if err := s.requireGrant(id, ss, dec.Domain); err != nil {
+					return ActionResult{}, err
+				}
+			}
+		case ClassCommit:
+			fp, err := s.authorizeCommit(ev, ss, a, t, dec, pageDomain)
+			if err != nil {
+				return ActionResult{}, err
+			}
+			ev.Fingerprint = fp[:16]
+		}
+	}
+	if err := s.spendBudget(false); err != nil {
 		return ActionResult{}, err
 	}
 	if err := s.beforeAction(ev); err != nil {
@@ -731,12 +908,78 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, do func() error) (
 		return ActionResult{}, err
 	}
 	res := s.settle(ctx, id, before)
-	if res.Navigated {
+	if res.Navigated || navigation {
 		s.mu.Lock()
 		s.navs = append(pruneBefore(s.navs, s.cfg.Now().Add(-time.Hour)), s.cfg.Now())
 		s.mu.Unlock()
 	}
 	return res, s.enforceLanding(ctx, id, res)
+}
+
+// authorizeCommit decides one commit action. It returns the fingerprint when
+// an approval of exactly this action is redeemed (once). Otherwise it records a
+// pending request, asks the user, and returns the refusal the agent sees.
+func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platform.TargetInfo, dec Decision, domain string) (string, error) {
+	fp := fingerprint(a, t)
+	label := sanitizeLabel(t.Name)
+	now := s.cfg.Now()
+	s.mu.Lock()
+	s.expireCommitLocked(ss, now)
+	if ss.deniedFP[fp] {
+		s.mu.Unlock()
+		ev.Fingerprint, ev.Label = fp[:16], label
+		return "", ErrCommitDenied
+	}
+	if ap := ss.approved; ap != nil && ap.fp == fp {
+		ss.approved = nil // one use
+		s.mu.Unlock()
+		ev.Label = label
+		return fp, nil
+	}
+	shotRect := t.Rect
+	pc := &pendingCommit{
+		id: newCommitID(), fp: fp, domain: domain, action: describeAction(a, t), label: label,
+		reason: dec.Reason, requestedAt: now, rect: shotRect,
+	}
+	ss.commit = pc
+	ss.lastCommit = ""
+	s.notifyLocked()
+	s.mu.Unlock()
+
+	// The screenshot is the human's evidence of what is about to happen. It
+	// stays in memory and is dropped with the request.
+	if png, err := s.cfg.Browser.Screenshot(ss.id); err == nil {
+		s.mu.Lock()
+		if ss.commit == pc {
+			pc.shot = png
+		}
+		s.mu.Unlock()
+	}
+	s.emit(Event{SessionID: ss.id, Action: "commit_prompt", Class: "W", Goal: ev.Goal, Domain: domain,
+		Fingerprint: fp[:16], Label: label, Outcome: "asked"})
+	s.attention(ss.id, "approval")
+	ev.Fingerprint, ev.Label = fp[:16], label
+	return "", ErrCommitApprovalRequired
+}
+
+func newCommitID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// sanitizeLabel bounds a control's label and drops control characters before
+// it reaches a card or the audit log.
+func sanitizeLabel(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			b.WriteRune(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return truncRunes(strings.TrimSpace(b.String()), 80)
 }
 
 // Extract reads an element's text and attributes, bounded (R).
@@ -778,13 +1021,28 @@ type SessionView struct {
 	Browser   string `json:"browser,omitempty"`
 	Goal      string `json:"goal,omitempty"`
 	StartedAt string `json:"started_at"`
-	Approval  string `json:"approval"`
-	// ApprovalAsked is true while an agent write is waiting for an answer.
-	ApprovalAsked  bool   `json:"approval_asked,omitempty"`
-	GrantExpiresAt string `json:"grant_expires_at,omitempty"`
-	HandoffSince   string `json:"handoff_since,omitempty"`
-	HandoffReason  string `json:"handoff_reason,omitempty"`
-	Lifetime       string `json:"lifetime"`
+	// Domain is the registrable domain of the current page. Approval and
+	// GrantExpiresAt describe that domain's grant; Grants lists them all.
+	Domain   string `json:"domain,omitempty"`
+	Approval string `json:"approval"`
+	// ApprovalAsked is true while an agent write is waiting for an answer, and
+	// AskedDomain is the domain it needs a grant for.
+	ApprovalAsked  bool        `json:"approval_asked,omitempty"`
+	AskedDomain    string      `json:"asked_domain,omitempty"`
+	GrantExpiresAt string      `json:"grant_expires_at,omitempty"`
+	Grants         []GrantView `json:"grants,omitempty"`
+	// Commit is the send, post, submit or payment waiting for the user.
+	Commit        *CommitView `json:"commit,omitempty"`
+	HandoffSince  string      `json:"handoff_since,omitempty"`
+	HandoffReason string      `json:"handoff_reason,omitempty"`
+	Lifetime      string      `json:"lifetime"`
+}
+
+// GrantView is one live domain grant.
+type GrantView struct {
+	Domain          string `json:"domain"`
+	ExpiresAt       string `json:"expires_at"`
+	IdentityBearing bool   `json:"identity_bearing,omitempty"`
 }
 
 // redactWhileHuman reduces a URL to its origin. While the user drives, the
@@ -817,18 +1075,33 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 		Lifetime:      LifetimePolicy,
 		ApprovalAsked: ss.approvalAsked,
 	}
-	switch g := ss.grant; {
-	case g.denied:
-		v.Approval = "denied"
-	case g.revoked:
-		v.Approval = "revoked"
-	case g.expires.IsZero():
-		v.Approval = "not_requested"
-	case !now.Before(g.expires):
-		v.Approval = "expired"
-	default:
-		v.Approval = "approved"
-		v.GrantExpiresAt = g.expires.UTC().Format(time.RFC3339)
+	v.Domain = RegistrableDomain(st.URL)
+	if ss.approvalAsked {
+		v.AskedDomain = ss.askedDomain
+	}
+	state, exp := s.grantEvalLocked(ss, v.Domain, now)
+	v.Approval = state
+	if state == "approved" {
+		v.GrantExpiresAt = exp.UTC().Format(time.RFC3339)
+	}
+	doms := make([]string, 0, len(ss.grants))
+	for d := range ss.grants {
+		doms = append(doms, d)
+	}
+	sort.Strings(doms)
+	for _, d := range doms {
+		if st2, e := s.grantEvalLocked(ss, d, now); st2 == "approved" {
+			v.Grants = append(v.Grants, GrantView{Domain: d, ExpiresAt: e.UTC().Format(time.RFC3339), IdentityBearing: ss.identity[d]})
+		}
+	}
+	if c := ss.commit; c != nil && now.Sub(c.requestedAt) < PendingCommitTTL {
+		cv := &CommitView{ID: c.id, Domain: c.domain, Action: c.action, Label: c.label, Reason: c.reason,
+			RequestedAt: c.requestedAt.UTC().Format(time.RFC3339), HasShot: c.shot != ""}
+		if c.rect.W > 0 && c.rect.H > 0 {
+			r := c.rect
+			cv.Rect = &r
+		}
+		v.Commit = cv
 	}
 	if st.Driver == platform.DriverHuman && !ss.handoffAt.IsZero() {
 		v.HandoffSince = ss.handoffAt.UTC().Format(time.RFC3339)
@@ -932,6 +1205,11 @@ func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety
 		return SessionView{}, err
 	}
 	var st platform.CobrowseSessionStatus
+	// A human driving a page is the identity boundary (D4): whatever they do
+	// there, the page may now act as them.
+	if cur, ok := s.cfg.Browser.SessionStatus(id); ok {
+		s.markIdentity(ss, cur.URL)
+	}
 	if human {
 		st, err = s.cfg.Browser.Handoff(id)
 	} else {
@@ -940,8 +1218,12 @@ func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety
 	if err != nil {
 		return SessionView{}, err
 	}
+	s.markIdentity(ss, st.URL)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The page is about to change under the user's hands: an unanswered or
+	// unused commit approval no longer describes it.
+	ss.commit, ss.approved = nil, nil
 	if human {
 		if ss.handoffAt.IsZero() {
 			ss.handoffAt = s.cfg.Now()
@@ -953,6 +1235,17 @@ func (s *Service) setDriverFor(id string, human bool, reason string, humanSafety
 	}
 	s.notifyLocked()
 	return s.agentViewLocked(ss, st, s.cfg.Now()), nil
+}
+
+// markIdentity records the page's domain as identity-bearing.
+func (s *Service) markIdentity(ss *session, rawURL string) {
+	d := RegistrableDomain(rawURL)
+	if d == UnknownDomain || d == "about:blank" {
+		return
+	}
+	s.mu.Lock()
+	ss.identity[d] = true
+	s.mu.Unlock()
 }
 
 // Stop ends a session and deletes its throwaway profile (L).
@@ -1018,7 +1311,7 @@ func (s *Service) Wait(ctx context.Context, id, until string, timeout time.Durat
 func (s *Service) wait(ctx context.Context, id, until string, timeout time.Duration) (WaitResult, error) {
 	until = strings.ToLower(strings.TrimSpace(until))
 	switch until {
-	case "approved", "unlocked", "resumed":
+	case "approved", "unlocked", "resumed", "commit":
 	default:
 		return WaitResult{}, fmt.Errorf("until must be approved, unlocked or resumed")
 	}
@@ -1035,9 +1328,18 @@ func (s *Service) wait(ctx context.Context, id, until string, timeout time.Durat
 		s.mu.Lock()
 		ss, ok := s.sessions[id]
 		changed := s.changed
-		var g grantState
+		var gstate, lastCommit string
+		var commitPending bool
 		if ok {
-			g = ss.grant
+			s.expireCommitLocked(ss, s.cfg.Now())
+			dom := ss.askedDomain
+			if dom == "" {
+				if cur, live := s.cfg.Browser.SessionStatus(id); live {
+					dom = RegistrableDomain(cur.URL)
+				}
+			}
+			gstate, _ = s.grantEvalLocked(ss, dom, s.cfg.Now())
+			lastCommit, commitPending = ss.lastCommit, ss.commit != nil
 		}
 		s.mu.Unlock()
 		if !ok {
@@ -1049,18 +1351,22 @@ func (s *Service) wait(ctx context.Context, id, until string, timeout time.Durat
 			res.State, res.Detail = "ended", "the browser exited"
 			return res, nil
 		}
-		now := s.cfg.Now()
 		switch until {
 		case "approved":
-			switch {
-			case g.denied:
-				res.State = "denied"
+			switch gstate {
+			case "denied", "revoked":
+				res.State = gstate
 				return res, nil
-			case g.revoked:
-				res.State = "revoked"
-				return res, nil
-			case !g.expires.IsZero() && now.Before(g.expires):
+			case "approved":
 				res.State, res.Satisfied = "approved", true
+				return res, nil
+			}
+		case "commit":
+			if !commitPending {
+				if lastCommit == "" {
+					lastCommit = "none"
+				}
+				res.State, res.Satisfied = lastCommit, true
 				return res, nil
 			}
 		case "resumed":
@@ -1097,42 +1403,146 @@ func (s *Service) RecordRefusal(sessionID, action, class string, err error) {
 // --- Human side. Only the local viewer calls these; they are never reachable
 // through the MCP tool path.
 
-// Approve grants AI writes in a session for d (default and maximum 24h).
-func (s *Service) Approve(id string, d time.Duration) error {
-	if d <= 0 || d > s.cfg.GrantDuration {
-		d = s.cfg.GrantDuration
-	}
-	return s.setGrant(id, "approve", func(g *grantState, now time.Time) {
-		*g = grantState{expires: now.Add(d)}
-	})
+// Approve grants AI writes on the domain the agent last asked about (or, if
+// none, the current page's domain) for d. The viewer names the domain with
+// ApproveDomain; this form exists for callers that only know the session.
+func (s *Service) Approve(id string, d time.Duration) error { return s.ApproveDomain(id, "", d) }
+
+// ApproveDomain grants AI fill and navigate actions on one registrable domain
+// for d: the default when d <= 0, never more than the maximum, and on an
+// identity-bearing domain never more than the identity cap (D3, D4). It never
+// covers a commit action (D1).
+func (s *Service) ApproveDomain(id, domain string, d time.Duration) error {
+	return s.setGrant(id, "approve", domain, func(ss *session, dom string, now time.Time) {
+		if d <= 0 {
+			d = s.cfg.GrantDuration
+		}
+		if d > s.cfg.MaxGrantDuration {
+			d = s.cfg.MaxGrantDuration
+		}
+		if ss.identity[dom] && d > s.cfg.IdentityGrantDuration {
+			d = s.cfg.IdentityGrantDuration
+		}
+		ss.grants[dom] = &grantState{approvedAt: now, expires: now.Add(d), lastUsed: now}
+	}, true)
 }
 
-// Deny refuses AI writes in a session.
+// Deny refuses AI writes on the domain the agent last asked about.
 func (s *Service) Deny(id string) error {
-	return s.setGrant(id, "deny", func(g *grantState, _ time.Time) { *g = grantState{denied: true} })
+	return s.setGrant(id, "deny", "", func(ss *session, dom string, _ time.Time) {
+		ss.grants[dom] = &grantState{denied: true}
+	}, true)
 }
 
-// Revoke withdraws an earlier approval.
+// Revoke withdraws every grant in the session and any approved commit.
 func (s *Service) Revoke(id string) error {
-	return s.setGrant(id, "revoke", func(g *grantState, _ time.Time) { *g = grantState{revoked: true} })
+	return s.setGrant(id, "revoke", "", func(ss *session, _ string, _ time.Time) {
+		for _, g := range ss.grants {
+			if !g.denied {
+				*g = grantState{revoked: true}
+			}
+		}
+		ss.approved = nil
+	}, false)
 }
 
-func (s *Service) setGrant(id, action string, f func(*grantState, time.Time)) error {
+// setGrant applies a human consent change. domain "" means the domain asked
+// about, else the current page's.
+func (s *Service) setGrant(id, action, domain string, f func(*session, string, time.Time), perDomain bool) error {
 	s.mu.Lock()
 	ss, ok := s.sessions[id]
+	dom := domain
+	if ok && perDomain && dom == "" {
+		dom = ss.askedDomain
+	}
+	s.mu.Unlock()
+	if ok && perDomain && dom == "" {
+		if st, live := s.cfg.Browser.SessionStatus(id); live {
+			dom = RegistrableDomain(st.URL)
+		}
+	}
+	s.mu.Lock()
+	ss, ok = s.sessions[id]
 	if ok {
-		f(&ss.grant, s.cfg.Now())
+		f(ss, dom, s.cfg.Now())
 		ss.approvalAsked = false
+		ss.askedDomain = ""
 		s.notifyLocked()
 	}
 	s.mu.Unlock()
-	ev := Event{SessionID: id, Action: action, Class: "H"}
+	ev := Event{SessionID: id, Action: action, Class: "H", Domain: dom}
 	if !ok {
 		s.finish(ev, ErrNoSession)
 		return ErrNoSession
 	}
 	s.finish(ev, nil)
 	return nil
+}
+
+// ApproveCommit approves the one pending send, post, submit or payment, named
+// by the id the viewer showed (so an answer to a stale card cannot approve a
+// newer action). The approval is for that exact action only: the agent repeats
+// the call, and it runs only if its fingerprint still matches (D5).
+func (s *Service) ApproveCommit(id, commitID string) error {
+	return s.answerCommit(id, commitID, true)
+}
+
+// DenyCommit declines the pending commit; the same action is then refused for
+// the rest of the session.
+func (s *Service) DenyCommit(id, commitID string) error {
+	return s.answerCommit(id, commitID, false)
+}
+
+func (s *Service) answerCommit(id, commitID string, approve bool) error {
+	action := "deny_commit"
+	if approve {
+		action = "approve_commit"
+	}
+	now := s.cfg.Now()
+	s.mu.Lock()
+	ss, ok := s.sessions[id]
+	var pc *pendingCommit
+	if ok {
+		s.expireCommitLocked(ss, now)
+		pc = ss.commit
+	}
+	var err error
+	switch {
+	case !ok:
+		err = ErrNoSession
+	case pc == nil || pc.id != commitID:
+		err = ErrNoPendingCommit
+	default:
+		ss.commit = nil
+		if approve {
+			ss.approved = &approvedCommit{fp: pc.fp, expires: now.Add(ApprovedCommitTTL)}
+			ss.lastCommit = "approved"
+		} else {
+			ss.deniedFP[pc.fp] = true
+			ss.lastCommit = "denied"
+		}
+		s.notifyLocked()
+	}
+	s.mu.Unlock()
+	ev := Event{SessionID: id, Action: action, Class: "H"}
+	if pc != nil {
+		ev.Domain, ev.Fingerprint, ev.Label = pc.domain, pc.fp[:16], pc.label
+	}
+	s.finish(ev, err)
+	return err
+}
+
+// CommitShot returns the pending commit's screenshot (base64 PNG) and target
+// box for the viewer's approval card. ok is false when it is not (or no
+// longer) the pending request.
+func (s *Service) CommitShot(id, commitID string) (png string, rect Rect, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ss, found := s.sessions[id]
+	if !found || ss.commit == nil || ss.commit.id != commitID || ss.commit.shot == "" {
+		return "", Rect{}, false
+	}
+	return ss.commit.shot, ss.commit.rect, true
 }
 
 // HumanTakeControl gives the user the browser (viewer "Take control").
@@ -1171,6 +1581,11 @@ func (s *Service) HumanNavigate(ctx context.Context, id, url string) error {
 			return err
 		}
 		_, err := s.cfg.Browser.NavigateAsHuman(id, url)
+		if err == nil {
+			if ss, lerr := s.lookup(id); lerr == nil {
+				s.markIdentity(ss, url)
+			}
+		}
 		return err
 	}()
 	s.finish(ev, err)

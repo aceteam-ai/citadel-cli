@@ -117,6 +117,9 @@ func (f *cmdFakeBrowser) PageState(id string) (platform.PageState, error) {
 	}
 	return platform.PageState{URL: u, ReadyState: "complete", Title: f.title}, f.gate(id)
 }
+func (f *cmdFakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
+	return platform.TargetInfo{Resolved: true, Tag: "div", PageURL: "http://fixture.test/"}, f.gate(id)
+}
 func (f *cmdFakeBrowser) Handoff(id string) (platform.CobrowseSessionStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
