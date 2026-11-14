@@ -497,6 +497,10 @@ type AppInfo struct {
 // collector always populates all four on every heartbeat, so live nodes always
 // emit concrete true/false values.
 type NodeCapabilities struct {
+	// CobrowseJobRecovery is the scoped durable-start protocol, advertised only
+	// by a live, configured COBROWSE_SESSION adapter. Absence means unsupported.
+	CobrowseJobRecovery *bool `json:"cobrowse_job_recovery,omitempty"`
+
 	GPUs       []GPUCapability `json:"gpus,omitempty"`
 	Engines    []string        `json:"engines,omitempty"`
 	Tags       []string        `json:"tags,omitempty"`

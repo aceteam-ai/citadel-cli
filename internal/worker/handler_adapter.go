@@ -114,8 +114,9 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 
 	// Convert worker.Job to nexus.Job for the legacy handler
 	nexusJob := &nexus.Job{
-		ID:   job.ID,
-		Type: job.Type,
+		SourceQueue: job.SourceQueue,
+		ID:          job.ID,
+		Type:        job.Type,
 	}
 
 	// Convert payload map[string]any to map[string]string for nexus.Job.
@@ -228,6 +229,8 @@ var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 
 // LegacyHandlerOpts configures optional behaviour for CreateLegacyHandlers.
 type LegacyHandlerOpts struct {
+	// CobrowseRecoveryNodeID binds recovery jobs to this configured control node.
+	CobrowseRecoveryNodeID string
 	// LogFn routes job log output through a callback instead of stdout.
 	LogFn func(level, msg string)
 	// WorkspaceDir is the sandbox root for file-operation handlers.
@@ -428,7 +431,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// start/status/stop sessions. Registered unconditionally like COBROWSE — the
 		// manager needs no workspace or config dir, and each action is a short
 		// lifecycle call against the node-local session manager.
-		NewLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandler()),
+		NewLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandlerForNode(opts.CobrowseRecoveryNodeID)),
 		// Resource snapshot (issue #427): returns the node's full GPU/host
 		// resource-consumer picture over the fabric. Registered unconditionally
 		// like the inference handlers — it needs no workspace sandbox, and gating

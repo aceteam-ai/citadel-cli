@@ -187,12 +187,18 @@ type cobrowseSession struct {
 
 	// encProfile is the encrypted persistent profile for this session, or nil for a
 	// throwaway session. When set, teardown persists (only if the browser ran) and
-	// always Closes it.
+	// closes it on legacy teardown; recovery retains it until cleanup can finish.
 	encProfile SessionProfile
 
-	mu    sync.Mutex
-	state CobrowseSessionState
-	proc  *cobrowseProc
+	// Recovery cleanup keeps custody through retryable persistence/removal
+	// failures. These stages are protected by teardownMu, not execution authority.
+	recoveryStopped   bool
+	recoveryPersisted bool
+	recoveryClosed    bool
+	teardownMu        sync.Mutex
+	mu                sync.Mutex
+	state             CobrowseSessionState
+	proc              *cobrowseProc
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
@@ -313,6 +319,20 @@ func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile
 	return m.startSession(id, startURL, profile)
 }
 
+// StartRecoverySessionWithID consumes a pre-journaled recovery handle. Its
+// 128-bit identity is distinct from local mode's reserved session ID format.
+// Both paths share the same duplicate and profile-custody checks below.
+func (m *CobrowseSessionManager) StartRecoverySessionWithID(id, startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	raw, err := hex.DecodeString(strings.TrimPrefix(id, "cb-"))
+	if len(id) != 35 || !strings.HasPrefix(id, "cb-") || err != nil || len(raw) != 16 || strings.ToLower(id) != id {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("invalid preassigned browser session ID")
+	}
+	return m.startSession(id, startURL, profile)
+}
+
 func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
@@ -324,6 +344,13 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 	m.sweepOnce.Do(m.sweep)
 
 	m.mu.Lock()
+	if _, exists := m.sessions[id]; exists {
+		m.mu.Unlock()
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("browser session ID already exists")
+	}
 	if len(m.sessions) >= m.maxSessions {
 		max := m.maxSessions
 		m.mu.Unlock()
@@ -335,13 +362,7 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 			"too many co-browse sessions (%d running); stop one first or raise %s",
 			max, EnvCobrowseMaxSessions)
 	}
-	if _, taken := m.sessions[id]; taken {
-		m.mu.Unlock()
-		if profile != nil {
-			_ = profile.Close()
-		}
-		return CobrowseSessionStatus{}, fmt.Errorf("co-browse session %s already exists", id)
-	}
+
 	s := &cobrowseSession{
 		id:         id,
 		profile:    filepath.Join(m.baseDir, id),
@@ -548,10 +569,12 @@ func (m *CobrowseSessionManager) StopAll() error {
 
 // teardown kills the session's processes (if launched), persists the encrypted
 // profile (only if the browser actually ran), Closes the profile, and removes the
-// plaintext working dir. Every cleanup path routes through here, so the profile is
-// always Closed exactly-effectively-once (Close is idempotent) — the unlocked key
-// and the single-session lock cannot leak.
+// plaintext working dir on legacy cleanup paths, so the profile is
+// always Closed exactly-effectively-once (Close is idempotent). Scoped recovery
+// instead uses finishRecoveryCleanup to retain custody across retryable failure.
 func (s *cobrowseSession) teardown() error {
+	s.teardownMu.Lock()
+	defer s.teardownMu.Unlock()
 	s.mu.Lock()
 	proc := s.proc
 	s.proc = nil
