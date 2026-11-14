@@ -155,14 +155,14 @@ jobs:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
           CITADEL_COBROWSE_EXPECT_KIND: chrome
-        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserCommitActions|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
       - name: Real browser (Edge)
         env:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
           CITADEL_COBROWSE_EXPECT_KIND: edge
-        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserCommitActions|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
   # Linux co-browse real-browser gate (citadel-cli#1546). Issue #1546 took four
   # fix rounds because unit tests used fakes that real Chrome did not match

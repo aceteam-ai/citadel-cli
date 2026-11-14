@@ -2,6 +2,8 @@ package localviewer
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +18,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse/fakebrowser"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 type harness struct {
@@ -102,6 +105,10 @@ func TestGuardsReturn403(t *testing.T) {
 		{"wrong CSRF", "POST", approve, map[string]string{"Origin": h.origin(), csrfHeader: "nope"}, true},
 		{"POST without origin", "POST", approve, map[string]string{csrfHeader: h.srv.bearer}, true},
 		{"stream without csrf", "GET", "/api/stream?id=" + st.SessionID, map[string]string{"Origin": h.origin()}, true},
+		{"approve-commit without csrf", "POST", "/api/sessions/" + st.SessionID + "/approve-commit", map[string]string{"Origin": h.origin()}, true},
+		{"deny-commit cross-site", "POST", "/api/sessions/" + st.SessionID + "/deny-commit", map[string]string{"Origin": h.origin(), csrfHeader: h.srv.bearer, "Sec-Fetch-Site": "cross-site"}, true},
+		{"commit shot without csrf", "GET", "/api/sessions/" + st.SessionID + "/commit/x/shot", map[string]string{"Origin": h.origin()}, true},
+		{"commit shot without cookie", "GET", "/api/sessions/" + st.SessionID + "/commit/x/shot", map[string]string{"Origin": h.origin(), csrfHeader: h.srv.bearer}, false},
 		{"mint from a browser", "POST", "/api/mint", map[string]string{"Origin": h.origin(), "Authorization": "Bearer " + h.srv.mint}, false},
 		{"mint without token", "POST", "/api/mint", nil, false},
 	}
@@ -381,5 +388,66 @@ func TestSummaryIsForTheOwnersOtherProcessOnly(t *testing.T) {
 	}
 	if resp := h.do(t, "GET", "/api/summary", map[string]string{"Authorization": "Bearer " + h.srv.mint}, false); resp.StatusCode != 200 {
 		t.Fatalf("summary with the per-launch token: %d", resp.StatusCode)
+	}
+}
+
+func TestCommitCardApproveAndDenyThroughViewer(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.fake.Target = &platform.TargetInfo{Resolved: true, Tag: "button", InputType: "submit", Name: "Send", Actionable: true, InForm: true, FormMethod: "post",
+		Rect: platform.TargetRect{X: 10, Y: 10, W: 80, H: 30, VW: 800, VH: 600}}
+	st, _ := h.svc.Start(ctx, "http://a.test/", "g", "")
+	id := st.SessionID
+	good := map[string]string{"Origin": h.origin(), csrfHeader: h.srv.bearer}
+	body := func(path, payload string) *http.Response {
+		req, _ := http.NewRequest("POST", h.base+path, strings.NewReader(payload))
+		for k, v := range good {
+			req.Header.Set(k, v)
+		}
+		req.AddCookie(&http.Cookie{Name: h.srv.cookieName(), Value: h.srv.cookie})
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+	// The viewer approves the domain the card names; commits still ask.
+	if r := body("/api/sessions/"+id+"/approve", `{"hours":8,"domain":"a.test"}`); r.StatusCode != 200 {
+		t.Fatalf("approve: %d", r.StatusCode)
+	}
+	if _, err := h.svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, localcobrowse.ErrCommitApprovalRequired) {
+		t.Fatalf("commit after grant: %v", err)
+	}
+	c := h.svc.Sessions(id)[0].Commit
+	if c == nil || !c.HasShot {
+		t.Fatalf("state must carry the commit card: %+v", c)
+	}
+	shot := h.do(t, "GET", "/api/sessions/"+id+"/commit/"+c.ID+"/shot", map[string]string{csrfHeader: h.srv.bearer, "Origin": h.origin()}, true)
+	var sb struct {
+		PNG  string `json:"png"`
+		Rect struct{ W float64 }
+	}
+	_ = json.NewDecoder(shot.Body).Decode(&sb)
+	if shot.StatusCode != 200 || sb.PNG == "" || sb.Rect.W != 80 || shot.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("shot: %d %+v", shot.StatusCode, sb)
+	}
+	if r := body("/api/sessions/"+id+"/approve-commit", `{"commit":"stale"}`); r.StatusCode == 200 {
+		t.Fatal("a stale card id must not approve")
+	}
+	if r := body("/api/sessions/"+id+"/approve-commit", `{"commit":"`+c.ID+`"}`); r.StatusCode != 200 {
+		t.Fatalf("approve-commit: %d", r.StatusCode)
+	}
+	if _, err := h.svc.Click(ctx, id, "#send", nil, nil, "g"); err != nil {
+		t.Fatalf("approved action must run on repeat: %v", err)
+	}
+	// Deny path.
+	_, _ = h.svc.Click(ctx, id, "#send", nil, nil, "g")
+	c = h.svc.Sessions(id)[0].Commit
+	if r := body("/api/sessions/"+id+"/deny-commit", `{"commit":"`+c.ID+`"}`); r.StatusCode != 200 {
+		t.Fatalf("deny-commit: %d", r.StatusCode)
+	}
+	if _, err := h.svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, localcobrowse.ErrCommitDenied) {
+		t.Fatalf("denied: %v", err)
 	}
 }

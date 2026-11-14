@@ -134,6 +134,7 @@ const targetProbeScript = `(function(kind, selector, px, py){
 		var ac = (c.getAttribute && c.getAttribute("autocomplete")) || "";
 		if (/one-time-code|password/i.test(ac)) return;
 		var v = c.isContentEditable ? txt(c) : (c.value !== undefined ? c.value : "");
+		if (ty === "checkbox" || ty === "radio") v = (c.checked ? "on:" : "off:") + v;
 		parts.push((c.name || c.id || "") + "=" + v);
 	}
 	if (form) { for (var j = 0; j < form.elements.length; j++) field(form.elements[j]); }

@@ -118,6 +118,22 @@ fallthrough, and `isLocalModeCommand` skips the root pre-run's CA trust and
 update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
 user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
 
+Local-mode write consent is per registrable domain, not per session
+(aceteam#13687 D1-D5, citadel-cli#1636). `localcobrowse.RegistrableDomain` owns
+the scope (public suffix list); `Service.grantEvalLocked` owns a grant's state
+and the identity-bearing caps (a domain a human drove is capped by
+`IdentityGrantDuration` and `IdentityIdleTimeout`, checked at use time, so a
+later handoff shortens an earlier grant). `localcobrowse.Classify` owns the
+commit heuristic over the target `platform.CobrowseSessionManager.InspectTarget`
+reads in the page; anything unresolved is a commit. A commit never rides a
+grant: `Service.authorizeCommit` records a pending request, and only the human
+methods `ApproveCommit`/`DenyCommit` (viewer routes, no MCP tool) answer it.
+`fingerprint` binds the approval to the action; the agent repeats the call and
+it runs once, only on a match. `TestNoLocalMCPToolCanApprove`,
+`TestCommitAlwaysAsksDespiteGrantAndDenyBlocks` and
+`TestRealBrowserCommitActions` (windows-latest) pin it. It is a label and
+structure heuristic, not an effect-level guard; see `commit.go` for its limits.
+
 `localviewer.Server` owns the local-mode loopback viewer. `guard` checks Host
 and Origin. The only cross-site request it admits is the top-level navigation
 to `/open`. `handleOpen` is the only place a cookie and bearer are issued, in
