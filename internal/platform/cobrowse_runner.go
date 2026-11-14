@@ -157,6 +157,21 @@ func verifyCDPBrowserID(port int, browserID string) error {
 // fetchCDPBrowserID reads the browser id the loopback endpoint on port reports
 // (bounded client, no redirects).
 func fetchCDPBrowserID(port int) (string, error) {
+	ws, err := fetchCDPBrowserWS(port)
+	if err != nil {
+		return "", err
+	}
+	const marker = "/devtools/browser/"
+	i := strings.LastIndex(ws, marker)
+	if i < 0 || i+len(marker) == len(ws) {
+		return "", errors.New("endpoint reports no browser id")
+	}
+	return ws[i+len(marker):], nil
+}
+
+// fetchCDPBrowserWS reads the browser-level WebSocket URL the loopback endpoint
+// on port reports (bounded client, no redirects).
+func fetchCDPBrowserWS(port int) (string, error) {
 	// The id is identity evidence: never follow a redirect to another origin.
 	client := *cdpHTTPClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -175,12 +190,7 @@ func fetchCDPBrowserID(port int) (string, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v); err != nil {
 		return "", err
 	}
-	const marker = "/devtools/browser/"
-	i := strings.LastIndex(v.WS, marker)
-	if i < 0 || i+len(marker) == len(v.WS) {
-		return "", errors.New("endpoint reports no browser id")
-	}
-	return v.WS[i+len(marker):], nil
+	return v.WS, nil
 }
 
 // activeBrowserRunner is the runner for this OS. A package var so tests can

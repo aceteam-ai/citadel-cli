@@ -115,21 +115,28 @@ jobs:
           cache: true
 
       - name: go vet (local-mode packages)
-        run: go vet ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./internal/localaudit/ ./internal/cobrowsestream/
+        run: go vet ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./internal/localaudit/ ./internal/cobrowsestream/ ./internal/cobrowseprofile/ ./internal/nodevault/
 
       - name: Local co-browse service, owner lock, viewer and audit log
         run: go test ./internal/localcobrowse/... ./internal/localviewer/ ./internal/localaudit/ -count=1
+
+      # Saved logins (aceteam#13503 S7): the profile store, its cross-process
+      # LockFileEx lock and the #820 at-rest refusal.
+      - name: Saved-logins profile store and at-rest passphrase
+        run: |
+          go test ./internal/cobrowseprofile/ -count=1
+          go test ./internal/nodevault/ -count=1 -run '^(TestAtRest|TestSetPassphrase|TestUnlockAtRest|TestChangePassphrase|TestWeakSecret|TestRemoveKeeps)'
 
       - name: Mountable stream handler
         run: go test ./internal/cobrowsestream/ -count=1 -run '^TestMounted'
 
       - name: citadel local mcp (stdio JSON-RPC)
-        run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide)'
+        run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide|TestLocalPassphrase|TestLocalProfileStore)'
 
       - name: Unit tests (Windows-portable subset)
         run: >-
           go test ./internal/platform/ -count=1 -run
-          '^(TestWindows|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
+          '^(TestWindows|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestThrowawaySession_NoGracefulClose|TestGracefulCloseRefusesOtherBrowser|TestStartSessionWithID|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
 
       # The shipped binary, end to end: discovery, a hidden test launch, the
       # loopback bind and the audit/owner checks, plus the stdio server's
@@ -155,14 +162,14 @@ jobs:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
           CITADEL_COBROWSE_EXPECT_KIND: chrome
-        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserPersistentProfileRoundTrip|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
       - name: Real browser (Edge)
         env:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
           CITADEL_COBROWSE_EXPECT_KIND: edge
-        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ -count=1 -v -run '^(TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserPersistentProfileRoundTrip|TestViewerPageInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
   # Linux co-browse real-browser gate (citadel-cli#1546). Issue #1546 took four
   # fix rounds because unit tests used fakes that real Chrome did not match
@@ -202,6 +209,13 @@ jobs:
         env:
           CITADEL_REAL_BROWSER_TESTS: "1"
         run: go test ./internal/platform/ -count=1 -v -run '^TestCobrowseRealBrowser'
+
+      # Saved logins survive stop, seal, unlock and a second session with the
+      # real browser (aceteam#13503 S7). Synthetic loopback page only.
+      - name: Saved-logins round trip (real browser)
+        env:
+          CITADEL_COBROWSE_BROWSER_IT: "1"
+        run: go test ./internal/localcobrowse/ -count=1 -v -run '^TestRealBrowserPersistentProfileRoundTrip$'
 
   # Cross-compile smoke for every release target. Catches a target that builds
   # locally but breaks on a GOOS/GOARCH the host can't run, so a release tag can

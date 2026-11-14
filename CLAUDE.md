@@ -143,6 +143,26 @@ Sessions come from the owner through the token-authenticated `/api/summary`.
 `TestSetupRoutesAreGuarded` pins the boundary. Muse has no confirmed local
 config file, so it is not a harness; the page offers the generic entry.
 
+`nodevault.Vault.UnlockAtRest` owns #820: every consumer that encrypts data
+at rest unlocks through it, and it refuses a secret below
+`nodevault.AtRestThresholdBits` (never below the 60-bit default, whatever
+`policy.yaml` says) before the KDF and without lockout accounting. The access
+gate (`Unlock`, `VerifyPIN`) still accepts a short PIN.
+`cobrowseprofile.OpenHandle` uses it, so on an enrolled node a persistent
+profile needs the master PIN to be a passphrase. `cobrowseprofile` also holds
+an OS lock (`lockFile`, never unlinked) beside each sealed blob, so two
+processes cannot open one profile. Local mode's saved logins
+(aceteam#13503 S7) use `cobrowseprofile.Store` rooted at `cmd.localStateDir`:
+its own per-user vault, never the node master-PIN vault. A
+`local_cobrowse_start` with a profile creates a locked session with no browser
+under an id from `platform.NewCobrowseSessionID`. `localcobrowse.Service.unlock`
+starts it with `StartSessionWithID` once the human unlocks it in the viewer,
+or chooses a throwaway. The passphrase reaches only the viewer's unlock and
+setup routes and the store. `platform.closeBrowserGracefully` sends CDP
+`Browser.close` before killing a persistent session's browser, so cookies are
+flushed before `Persist` seals them. `TestRealBrowserPersistentProfileRoundTrip`
+is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
+
 `localaudit.Log` owns the local co-browse audit chain under
 `<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
 month. `cmd.localStateDir` owns where local mode keeps its owner lock, audit

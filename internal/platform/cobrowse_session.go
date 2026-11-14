@@ -30,6 +30,7 @@
 package platform
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -37,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -286,6 +288,32 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 // lock can leak — a missed Close is structurally impossible because every cleanup
 // path routes through teardown().
 func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
+	return m.startSession(newSessionID(), startURL, profile)
+}
+
+// NewCobrowseSessionID returns a fresh session id in the manager's format. A
+// caller that must hand out an id before the browser exists (local mode's
+// locked persistent-profile session) reserves one here and passes it to
+// StartSessionWithID once the profile is unlocked.
+func NewCobrowseSessionID() string { return newSessionID() }
+
+// reservedSessionIDPattern is the shape newSessionID produces.
+var reservedSessionIDPattern = regexp.MustCompile(`^cb-[0-9a-f]{16}$`)
+
+// StartSessionWithID is StartSessionWithProfile under a caller-reserved id from
+// NewCobrowseSessionID. An id of any other shape, or one already in use, is
+// refused (and the profile Closed), so a caller cannot name a directory.
+func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	if !reservedSessionIDPattern.MatchString(id) {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("invalid co-browse session id %q", id)
+	}
+	return m.startSession(id, startURL, profile)
+}
+
+func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
 			profile.Close()
@@ -307,7 +335,13 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 			"too many co-browse sessions (%d running); stop one first or raise %s",
 			max, EnvCobrowseMaxSessions)
 	}
-	id := newSessionID()
+	if _, taken := m.sessions[id]; taken {
+		m.mu.Unlock()
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("co-browse session %s already exists", id)
+	}
 	s := &cobrowseSession{
 		id:         id,
 		profile:    filepath.Join(m.baseDir, id),
@@ -527,6 +561,14 @@ func (s *cobrowseSession) teardown() error {
 	}
 
 	var err error
+	if enc != nil && proc != nil {
+		// A persistent profile is sealed from what the browser wrote to disk.
+		// Chromium keeps recent cookie and login writes in memory and commits
+		// them in batches, so a hard kill right after a login would seal a
+		// profile without it. Ask the browser to close first (bounded), then
+		// kill whatever is left as before. Throwaway sessions skip this.
+		closeBrowserGracefully(proc)
+	}
 	if proc != nil && proc.stop != nil {
 		err = proc.stop()
 	}
@@ -828,3 +870,40 @@ func sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
 // protected owner-only DACL on Windows. An existing dir that fails is refused,
 // never repaired. Local mode keeps its viewer token and audit log in such dirs.
 func EnsurePrivateDir(dir string) error { return ensureCobrowseBaseDir(dir) }
+
+// gracefulCloseWait bounds how long teardown waits for a persistent session's
+// browser to exit after Browser.close before it is killed. A var for tests.
+var gracefulCloseWait = 10 * time.Second
+
+// closeBrowserGracefully sends CDP Browser.close to proc's browser target and
+// waits, bounded, for the process to exit, so Chromium flushes its cookie and
+// login stores to disk. Best effort: no debug port, an unreadable or
+// mismatched endpoint, or a browser that does not exit in time all fall
+// through to the caller's kill.
+func closeBrowserGracefully(proc *cobrowseProc) {
+	if proc == nil || proc.debugPort <= 0 || proc.exited == nil {
+		return
+	}
+	select {
+	case <-proc.exited:
+		return
+	default:
+	}
+	ws, err := fetchCDPBrowserWS(proc.debugPort)
+	if err != nil {
+		return
+	}
+	// Only close the browser this session launched, on the port it owns.
+	prefix := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser/", proc.debugPort)
+	if !strings.HasPrefix(ws, prefix) || (proc.browserID != "" && ws != prefix+proc.browserID) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The browser may close the socket before replying; that is success.
+	_, _ = cdpDialAndSendContext(ctx, ws, "Browser.close", nil)
+	cancel()
+	select {
+	case <-proc.exited:
+	case <-time.After(gracefulCloseWait):
+	}
+}

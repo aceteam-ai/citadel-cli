@@ -12,7 +12,9 @@
   let frameURL = null;
   let human = false;
 
-  async function post(id, action, body) {
+  // post sends one viewer action. It reports a failure in msgEl (default: the
+  // hint line) and resolves to true on success.
+  async function post(id, action, body, msgEl) {
     const r = await fetch("/api/sessions/" + encodeURIComponent(id) + "/" + action, {
       method: "POST",
       credentials: "same-origin",
@@ -22,9 +24,10 @@
     if (!r.ok) {
       let msg = r.statusText;
       try { msg = (await r.json()).error || msg; } catch (e) { /* not JSON */ }
-      $("hint").textContent = msg;
+      (msgEl || $("hint")).textContent = msg;
     }
     poll();
+    return r.ok;
   }
 
   async function poll() {
@@ -55,18 +58,36 @@
     }
     for (const s of sessions) {
       const b = document.createElement("button");
-      b.textContent = (s.goal || s.session_id) + (s.driver === "human" ? " (you)" : "");
+      b.textContent = (s.goal || s.session_id) + (s.state === "locked" ? " (locked)" : (s.driver === "human" ? " (you)" : ""));
       if (s.session_id === selected) b.className = "sel";
       b.onclick = () => { selected = s.session_id; render(); };
       tabs.appendChild(b);
     }
-    const waitingAny = sessions.some((s) => (s.driver === "human" && s.handoff_reason) || s.approval_asked);
+    const waitingAny = sessions.some((s) => (s.driver === "human" && s.handoff_reason) || s.approval_asked || s.state === "locked");
     document.title = waitingAny ? "● Citadel: waiting for you" : "Citadel viewer";
 
     const s = sessions.find((x) => x.session_id === selected);
     $("empty").hidden = !!s;
     $("session").hidden = !s;
     if (!s) { closeStream(); return; }
+
+    const locked = s.state === "locked";
+    $("unlock").hidden = !locked;
+    $("controls").hidden = locked;
+    $("screen-wrap").hidden = locked;
+    if (locked) {
+      renderUnlock(s);
+      $("session-goal").textContent = s.goal || "Browser session";
+      $("session-driver").textContent = "Locked";
+      $("session-driver").className = "pill";
+      $("session-domain").textContent = domainOf(s.url);
+      $("session-grant").textContent = "";
+      $("waiting").hidden = true;
+      $("approval").hidden = true;
+      $("hint").textContent = "";
+      closeStream();
+      return;
+    }
 
     human = s.driver === "human";
     $("session-goal").textContent = s.goal || "Browser session";
@@ -100,6 +121,18 @@
     $("screen-wrap").className = human ? "driving" : "";
     $("hint").textContent = human ? "Click the picture and type; your keystrokes go only to this browser." : "";
     openStream(s.session_id);
+  }
+
+  function renderUnlock(s) {
+    const vault = state.profile_vault;
+    $("unlock-profile").textContent = s.profile ? "(profile: " + s.profile + ")" : "";
+    const busy = !!s.unlocking;
+    $("unlock-busy").hidden = !busy;
+    $("unlock-enter").hidden = busy || !vault || !vault.configured || !vault.strong;
+    $("unlock-setup").hidden = busy || !vault || vault.configured;
+    $("unlock-weak").hidden = busy || !vault || !vault.configured || vault.strong;
+    if (state.profile_vault_error) $("unlock-error").textContent = state.profile_vault_error;
+    $("unlock-throwaway").disabled = busy;
   }
 
   function closeStream() {
@@ -191,7 +224,40 @@
   $("approve").onclick = () => selected && post(selected, "approve", { hours: Number($("approve-hours").value) });
   $("deny").onclick = () => selected && post(selected, "deny");
   $("revoke").onclick = () => selected && post(selected, "revoke");
-  $("stop").onclick = () => selected && confirm("End this browser session? Its cookies are deleted.") && post(selected, "stop");
+  $("stop").onclick = () => {
+    if (!selected) return;
+    const s = (state.sessions || []).find((x) => x.session_id === selected);
+    const saved = s && s.profile_mode === "unlocked";
+    const msg = saved ? "End this browser session? Its logins are encrypted and kept for next time."
+      : "End this browser session? Its cookies are deleted.";
+    if (confirm(msg)) post(selected, "stop");
+  };
+
+  // Passphrase fields are cleared as soon as they are sent; the value never
+  // goes anywhere but the unlock request.
+  async function unlock() {
+    if (!selected) return;
+    const pass = $("unlock-pass").value;
+    $("unlock-pass").value = "";
+    $("unlock-error").textContent = "";
+    if (!pass) { $("unlock-error").textContent = "Enter your passphrase."; return; }
+    await post(selected, "unlock", { passphrase: pass }, $("unlock-error"));
+  }
+  $("unlock-go").onclick = unlock;
+  $("unlock-pass").addEventListener("keydown", (ev) => { if (ev.key === "Enter") unlock(); });
+  $("setup-go").onclick = async () => {
+    if (!selected) return;
+    const pass = $("setup-pass").value, confirmPass = $("setup-confirm").value;
+    $("setup-pass").value = ""; $("setup-confirm").value = "";
+    $("unlock-error").textContent = "";
+    if (!pass) { $("unlock-error").textContent = "Choose a passphrase."; return; }
+    if (pass !== confirmPass) { $("unlock-error").textContent = "The two passphrases do not match."; return; }
+    if (!$("setup-ack").checked) { $("unlock-error").textContent = "Tick the box to confirm you understand the passphrase cannot be recovered."; return; }
+    await post(selected, "setup-passphrase", { passphrase: pass, confirm: confirmPass, ack: true }, $("unlock-error"));
+  };
+  $("unlock-throwaway").onclick = () => selected &&
+    confirm("Start this session without saved logins? It starts logged out and nothing is saved.") &&
+    post(selected, "use-throwaway", {}, $("unlock-error"));
   $("address").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && selected && human) {
       let url = $("address").value.trim();

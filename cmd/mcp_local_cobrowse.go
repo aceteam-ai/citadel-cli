@@ -187,8 +187,13 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 		onAttention = rt.attention
 		viewerNote = "The Citadel viewer opens in the user's default browser, where they watch, approve and take control. If it is closed, they can run `citadel local viewer`."
 	}
+	var profiles localcobrowse.ProfileStore
+	if opts.ownerDir != nil {
+		profiles = localProfileStore{dir: opts.ownerDir}
+	}
 	rt.svc = localcobrowse.New(localcobrowse.Config{
 		Browser:     browser,
+		Profiles:    profiles,
 		URLPolicy:   opts.policy,
 		ViewerPorts: viewerPorts,
 		OnAttention: onAttention,
@@ -464,7 +469,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 			map[string]any{
 				"url":     strProp("Optional http(s) URL to open on launch."),
 				"goal":    strProp(descGoal),
-				"profile": strProp("Reserved for persistent profiles (not available yet). Omit for a throwaway session."),
+				"profile": strProp("Optional saved-logins profile name (1 to 64 lowercase letters, digits or dashes, e.g. \"default\"). Omit for a throwaway session that starts logged out. With a profile the session starts locked: the user unlocks it with their passphrase in the Citadel viewer (you never see it), so call local_cobrowse_wait with until=unlocked. Logins are encrypted on this computer and kept for next time."),
 			}, nil,
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct{ URL, Goal, Profile string }
@@ -687,7 +692,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				}
 				return s.Resume(ctx, id)
 			}),
-		writeTool("local_cobrowse_stop", "End a session. Its throwaway browser profile (cookies, logins) is deleted.",
+		writeTool("local_cobrowse_stop", "End a session. A throwaway session's cookies and logins are deleted; a saved-logins profile is encrypted again and kept.",
 			map[string]any{"session_id": strProp(descSession)}, []string{"session_id"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
@@ -705,7 +710,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				}
 				return map[string]any{"session_id": id, "stopped": true}, nil
 			}),
-		writeTool("local_cobrowse_wait", "Wait for the user: until=approved (they approved AI actions), until=resumed (they handed control back) or until=unlocked. Returns within timeout_seconds (at most 50). If still_waiting is true, call again; denied or revoked are final answers.",
+		writeTool("local_cobrowse_wait", "Wait for the user: until=approved (they approved AI actions), until=resumed (they handed control back) or until=unlocked (they unlocked a saved-logins profile; a detail says if they chose a throwaway session instead). Returns within timeout_seconds (at most 50). If still_waiting is true, call again; denied or revoked are final answers.",
 			map[string]any{"session_id": strProp(descSession),
 				"until":           map[string]any{"type": "string", "enum": []string{"approved", "resumed", "unlocked"}},
 				"timeout_seconds": numProp("Seconds to wait, at most 50 (default 50).")},

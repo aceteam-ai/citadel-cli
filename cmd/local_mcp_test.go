@@ -58,6 +58,12 @@ func (f *cmdFakeBrowser) StartSession(string) (platform.CobrowseSessionStatus, e
 	f.live[id] = true
 	return f.st(id), nil
 }
+func (f *cmdFakeBrowser) StartSessionWithID(id, _ string, p platform.SessionProfile) (platform.CobrowseSessionStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.live[id] = true
+	return f.st(id), nil
+}
 func (f *cmdFakeBrowser) SessionStatus(id string) (platform.CobrowseSessionStatus, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

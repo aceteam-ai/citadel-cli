@@ -536,17 +536,30 @@ type State struct {
 	Agent    string                      `json:"agent"`
 	Sessions []localcobrowse.SessionView `json:"sessions"`
 	Now      string                      `json:"now"`
+	// ProfileVault is the saved-logins passphrase state (absent when this
+	// process keeps no saved profiles). ProfileVaultError says it could not
+	// be read, so the page never offers to create a second passphrase.
+	ProfileVault      *localcobrowse.ProfileVaultState `json:"profile_vault,omitempty"`
+	ProfileVaultError string                           `json:"profile_vault_error,omitempty"`
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.lastPoll = s.cfg.Now()
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, State{
+	st := State{
 		Agent:    s.cfg.Service.Agent(),
 		Sessions: s.cfg.Service.Sessions(""),
 		Now:      s.cfg.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if vs, ok, err := s.cfg.Service.ProfileVault(); ok {
+		if err != nil {
+			st.ProfileVaultError = "Citadel could not read the saved-logins passphrase on this computer"
+		} else {
+			st.ProfileVault = &vs
+		}
+	}
+	writeJSON(w, http.StatusOK, st)
 }
 
 // handleActivity serves the Activity panel: the session's newest audit records.
@@ -574,9 +587,15 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	id, action := r.PathValue("id"), r.PathValue("action")
+	// The passphrase fields are read only by unlock and setup-passphrase. They
+	// go to the profile store and nowhere else: never logged, audited or
+	// echoed in a response.
 	var body struct {
-		Hours float64 `json:"hours"`
-		URL   string  `json:"url"`
+		Hours      float64 `json:"hours"`
+		URL        string  `json:"url"`
+		Passphrase string  `json:"passphrase"`
+		Confirm    string  `json:"confirm"`
+		Ack        bool    `json:"ack"`
 	}
 	if r.ContentLength != 0 {
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
@@ -601,6 +620,16 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		err = svc.HumanStop(id)
 	case "navigate":
 		err = svc.HumanNavigate(r.Context(), id, body.URL)
+	case "unlock":
+		err = svc.HumanUnlock(r.Context(), id, body.Passphrase)
+	case "setup-passphrase":
+		if body.Passphrase != body.Confirm {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the two passphrases do not match"})
+			return
+		}
+		err = svc.HumanSetupAndUnlock(r.Context(), id, body.Passphrase, body.Ack)
+	case "use-throwaway":
+		err = svc.HumanUseThrowaway(r.Context(), id)
 	default:
 		http.NotFound(w, r)
 		return

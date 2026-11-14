@@ -92,7 +92,7 @@ are:
 - the browser Citadel will use;
 - a hidden test launch;
 - the local viewer port;
-- the passphrase vault, which is only needed later to remember logins;
+- the saved-logins passphrase, which is only needed to remember logins;
 - other agent apps using co-browse;
 - the audit log;
 - which agent app configs already point at Citadel.
@@ -183,6 +183,37 @@ orders, let me log in, then list my last three orders."
 5. **Stop.** When the agent calls `local_cobrowse_stop`, or you press **End
    session**, the browser's cookies and logins for that session are deleted.
 
+### Remember logins on this computer
+
+By default every session starts logged out and forgets everything when it
+stops. To keep a login, ask the agent to use a saved profile, for example
+"use the citadel profile named default". The session then starts **locked**:
+
+1. The viewer asks for your Citadel passphrase. The first time, it asks you to
+   choose one. Use four or more random words. A short PIN is refused, because
+   it would not protect your logins if someone copied this computer's disk.
+2. The agent never sees the passphrase and is not told it; it only learns that
+   the session went from locked to running. The passphrase is not recorded.
+3. While the session runs, the profile is decrypted into a private folder for
+   your user. When the session stops, it is encrypted again and the plain
+   copy is deleted.
+4. If you would rather not unlock, press **Continue without saved logins**.
+   The session then starts logged out and nothing is saved. Citadel never
+   does this on its own.
+
+If you forget the passphrase, the saved logins cannot be recovered by anyone,
+including AceTeam. `& $citadel local passphrase forget` deletes them so you
+can start again. Other commands:
+
+```powershell
+& $citadel local passphrase status         # set or not, saved profiles, lockout
+& $citadel local passphrase change         # new passphrase, logins kept
+& $citadel local passphrase reset-lockout  # after too many wrong tries
+```
+
+This passphrase is only for saved logins. It does not give access to this
+computer, and it is separate from an AceTeam node's master PIN.
+
 If you close the viewer tab, reopen it (in a PowerShell window where you set
 `$citadel` as above) with:
 
@@ -217,6 +248,8 @@ The command opens a fresh one-time link.
 | "navigation refused" | The agent tried a local, private or non-web address. This is deliberate. |
 | `rate_limited` | The agent is acting too fast. It should slow down. |
 | The viewer link "expired or was already used" | Run `& $citadel local viewer`. |
+| `locked` | The session uses saved logins. Unlock it in the viewer, or press **Continue without saved logins**. |
+| "Too many wrong passphrases" | Wait for the time shown, or run `& $citadel local passphrase reset-lockout`. |
 | A sign-in popup or a second tab does not show | Popups and extra tabs are not shown in the viewer yet. Use a site's email-and-password login. |
 
 ## What it protects, and what it does not
@@ -227,7 +260,9 @@ Local mode protects against:
 - web pages trying to steer the agent (prompt injection), including toward
   the viewer;
 - web pages in your own browser trying to reach Citadel's local ports;
-- other user accounts on the same computer.
+- other user accounts on the same computer;
+- someone who copies this computer's disk, for saved logins only, because
+  they are encrypted with your passphrase.
 
 It does not protect against a hostile program running as **your** user
 account, including an agent app with shell access that decides to misbehave.
@@ -238,8 +273,8 @@ local agent tool.
 detects tampering. It does not prove anything against a program running as
 your account.
 
-Local mode keeps its state (the co-browse lock, the audit log and the viewer's
-link file) in `%LOCALAPPDATA%\Citadel\local` (`~/.citadel-cli/local` on
+Local mode keeps its state (the co-browse lock, the audit log, the viewer's
+link file, and the encrypted saved logins with their passphrase vault) in `%LOCALAPPDATA%\Citadel\local` (`~/.citadel-cli/local` on
 macOS and Linux), separately for each user, even on a computer that also runs
 an AceTeam node. Audit records written by v2.212.0 and v2.213.0 stay in the
 older location and `local audit` no longer shows them.
