@@ -59,6 +59,11 @@ func (f *cmdFakeBrowser) StartSession(string) (platform.CobrowseSessionStatus, e
 	return f.st(id), nil
 }
 func (f *cmdFakeBrowser) StartSessionWithID(id, _ string, p platform.SessionProfile) (platform.CobrowseSessionStatus, error) {
+	// The fake keeps no profile data: Close it now, as the real manager does
+	// on teardown, so its lock (an open file on Windows) is released.
+	if p != nil {
+		_ = p.Close()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.live[id] = true

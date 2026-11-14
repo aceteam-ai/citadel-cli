@@ -190,6 +190,10 @@ func writeExtractedFile(target string, tr *tar.Reader) error {
 // directory (zip-slip). It also re-checks the joined result stays within dst as a
 // belt-and-suspenders guard.
 func safeJoin(dst, name string) (string, error) {
+	// Compare against the cleaned destination: filepath.Join cleans its result
+	// (on Windows it also turns "/" into "\"), so an uncleaned dst would never
+	// prefix-match a legitimate entry.
+	dst = filepath.Clean(dst)
 	slashed := filepath.ToSlash(name)
 	if slashed == "" || strings.HasPrefix(slashed, "/") || filepath.IsAbs(name) {
 		return "", fmt.Errorf("cobrowseprofile: unsafe absolute archive path %q", name)
