@@ -107,6 +107,17 @@ type WorkerState struct {
 	// separate so the two brackets (received-at-claim, executing-at-dispatch)
 	// never contend with each other.
 	executingMu sync.Mutex
+
+	// rateLimitFn reads the live platform 429 window from the API client
+	// (citadel-cli#1677). Set once by NewRunner before any reader runs.
+	rateLimitFn func() (time.Time, time.Duration, bool)
+}
+
+// SetRateLimitSource wires the live 429-window accessor surfaced by Snapshot.
+func (s *WorkerState) SetRateLimitSource(fn func() (since time.Time, retryAfter time.Duration, ok bool)) {
+	if s != nil {
+		s.rateLimitFn = fn
+	}
 }
 
 // NewWorkerState creates an empty WorkerState stamped with the start time.
@@ -283,6 +294,11 @@ type WorkerSnapshot struct {
 	PlatformFailingSince   *time.Time           `json:"platform_failing_since,omitempty"`
 	PlatformLastOutcome    platformhttp.Outcome `json:"platform_last_outcome,omitempty"`
 	PlatformLastHTTPStatus int                  `json:"platform_last_http_status,omitempty"`
+	// RateLimitedSince / LastRetryAfterSeconds describe an open platform 429
+	// window (citadel-cli#1677): when the streak began and the server's latest
+	// Retry-After. Both are absent once any API request succeeds again.
+	RateLimitedSince      *time.Time `json:"rate_limited_since,omitempty"`
+	LastRetryAfterSeconds int64      `json:"last_retry_after_seconds,omitempty"`
 	// OldestInFlightAt is when the CURRENT in-flight streak began (nil when
 	// InFlight==0) -- see WorkerState.oldestInFlightUnixNano for why this is
 	// distinct from LastJobAt once more than one job can be in flight (#489's
@@ -330,6 +346,13 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 	health := s.platform.Snapshot()
 	snap.PlatformOKAt, snap.PlatformFailingSince = health.OKAt, health.FailingSince
 	snap.PlatformLastOutcome, snap.PlatformLastHTTPStatus = health.LastOutcome, health.LastStatus
+
+	if s.rateLimitFn != nil {
+		if since, retryAfter, ok := s.rateLimitFn(); ok {
+			snap.RateLimitedSince = &since
+			snap.LastRetryAfterSeconds = int64(retryAfter / time.Second)
+		}
+	}
 
 	snap.UptimeSeconds = int64(time.Since(snap.StartedAt).Seconds())
 	snap.LastConsumeStatus = int(atomic.LoadInt32(&s.lastConsumeStatus))

@@ -3588,6 +3588,8 @@ func workerLivenessFrom(snap worker.WorkerSnapshot) *status.WorkerLiveness {
 		PlatformFailingSince:   snap.PlatformFailingSince,
 		PlatformLastOutcome:    string(snap.PlatformLastOutcome),
 		PlatformLastHTTPStatus: snap.PlatformLastHTTPStatus,
+		RateLimitedSince:       snap.RateLimitedSince,
+		LastRetryAfterSeconds:  snap.LastRetryAfterSeconds,
 		InFlight:               snap.InFlight,
 		Processed:              snap.Processed,
 		Failed:                 snap.Failed,
