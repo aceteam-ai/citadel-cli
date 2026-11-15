@@ -3809,3 +3809,22 @@ Auto-generated log of every release.
   - fix(jobs): honor per-job timeout_ms in the HTTP proxy (#1628)
 
 
+---
+
+## v2.228.0 — 2026-11-14
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 63 |
+| Lines added | +8409 |
+
+**Changes:**
+
+  - fix(local): bind commit approvals to the full target URL and complete content digest (#1654)
+  - fix(hpc): refuse companion repair in foreign Python prefixes (#1655)
+  - feat(local): persistent encrypted browser profile with passphrase unlock in the viewer (#820 enforced) (#1647)
+  - feat(local): commit actions always ask, per-domain grants, identity-bearing limits (#1636) (#1646)
+  - fix(whisper): bump opentelemetry-api for GHSA-mf5v-w3w3-f6cg (#1652)
+
+
