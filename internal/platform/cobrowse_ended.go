@@ -123,14 +123,21 @@ func (m *CobrowseSessionManager) prepareSelfRestart(reason, detail string) {
 	m.mu.Unlock()
 	for _, s := range all {
 		s.mu.Lock()
-		stop := !adoptionSupported || s.persistent || s.encProfile != nil
+		stop := !adoptionSupported || s.persistent || s.encProfile != nil || s.requireEgress
 		s.mu.Unlock()
 		if !stop {
 			_ = m.MarkSessionEnding(s, reason, detail)
 			continue
 		}
+		endReason, endDetail := reason, detail
+		s.mu.Lock()
+		guarded := s.requireEgress
+		s.mu.Unlock()
+		if guarded {
+			endReason, endDetail = endedReasonEgressRestart, egressRestartDetail
+		}
 		_ = m.Stop(s.id) // seals a persistent profile, closes its lock, removes the dir
-		m.recordEnded(s.id, reason, detail)
+		m.recordEnded(s.id, endReason, endDetail)
 	}
 }
 

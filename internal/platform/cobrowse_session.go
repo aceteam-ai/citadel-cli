@@ -83,9 +83,11 @@ const (
 
 // CobrowseSessionStatus is the queryable state of one session.
 type CobrowseSessionStatus struct {
-	ID    string               `json:"id"`
-	State CobrowseSessionState `json:"state"`
-	URL   string               `json:"url,omitempty"`
+	Features           []string             `json:"features,omitempty"`
+	EgressPrivateHolds int64                `json:"egress_private_holds,omitempty"`
+	ID                 string               `json:"id"`
+	State              CobrowseSessionState `json:"state"`
+	URL                string               `json:"url,omitempty"`
 	// Title is the page title after a navigate (bounded, control characters
 	// stripped); empty for every other status.
 	Title     string `json:"title,omitempty"`
@@ -150,12 +152,14 @@ func (m *CobrowseSessionManager) SetLaunchOptions(lo LaunchOptions) {
 // CobrowseSessionManager owns the map of concurrent, isolated browser sessions. Safe
 // for concurrent use.
 type CobrowseSessionManager struct {
-	mu          sync.Mutex
-	sessions    map[string]*cobrowseSession
-	maxSessions int
-	baseDir     string
-	sweepOnce   sync.Once
-	launchOpts  LaunchOptions
+	requireEgress bool
+	egressFactory func() (sessionEgress, error)
+	mu            sync.Mutex
+	sessions      map[string]*cobrowseSession
+	maxSessions   int
+	baseDir       string
+	sweepOnce     sync.Once
+	launchOpts    LaunchOptions
 	// trackTargets, targetPolicy and targetEvent are set by
 	// EnableTargetTracking (local mode only).
 	trackTargets bool
@@ -190,9 +194,11 @@ type SessionProfile interface {
 // cobrowseSession is one isolated browser session. Its own mutex guards proc/state so
 // a status/stop of a sibling never blocks on this session's launch or CDP wait.
 type cobrowseSession struct {
-	id        string
-	profile   string
-	startedAt time.Time
+	requireEgress bool
+	egress        sessionEgress
+	id            string
+	profile       string
+	startedAt     time.Time
 
 	// encProfile is the encrypted persistent profile for this session, or nil for a
 	// throwaway session. When set, teardown persists (only if the browser ran) and
@@ -233,6 +239,7 @@ func GetCobrowseSessionManager() *CobrowseSessionManager {
 			resolveMaxCobrowseSessions(),
 		)
 		cobrowseSessionManager.useResolver = true
+		cobrowseSessionManager.requireEgress = true
 	})
 	return cobrowseSessionManager
 }
@@ -357,14 +364,15 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		return CobrowseSessionStatus{}, fmt.Errorf("co-browse session %s already exists", id)
 	}
 	s := &cobrowseSession{
-		id:         id,
-		profile:    filepath.Join(m.baseDir, id),
-		startedAt:  time.Now(),
-		state:      SessionLaunching,
-		encProfile: profile,
-		regDir:     m.sessionRegDir(),
-		generation: 1,
-		tracking:   m.trackTargets,
+		id:            id,
+		profile:       filepath.Join(m.baseDir, id),
+		startedAt:     time.Now(),
+		state:         SessionLaunching,
+		encProfile:    profile,
+		regDir:        m.sessionRegDir(),
+		generation:    1,
+		tracking:      m.trackTargets,
+		requireEgress: m.requireEgress,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -427,6 +435,38 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 // Returns the running proc so the caller can tear it down if the session was stopped
 // during launch.
 func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*cobrowseProc, error) {
+	// A guarded remote browser never launches or materializes a profile until
+	// its loopback proxy is serving and its initial destination is approved.
+	var guard sessionEgress
+	if s.requireEgress {
+		m.mu.Lock()
+		factory := m.egressFactory
+		m.mu.Unlock()
+		var err error
+		if factory == nil {
+			guard, err = startSessionEgress()
+		} else {
+			guard, err = factory()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("start remote browser guard: %w", err)
+		}
+		if guard == nil || !guard.Active() {
+			if guard != nil {
+				guard.Close()
+			}
+			return nil, ErrEgressGuardUnavailable
+		}
+		s.mu.Lock()
+		s.egress = guard
+		s.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		err = guard.CheckURL(ctx, startURL)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+	}
 	// A runner that needs a trusted, private parent (Windows: owner-only DACL)
 	// refuses here before any profile data is written beneath it.
 	if err := activeBrowserRunner.PrepareBaseDir(m.baseDir); err != nil {
@@ -457,10 +497,27 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	lo := m.launchOpts
 	tpolicy, tevent := m.targetPolicy, m.targetEvent
 	m.mu.Unlock()
+	if guard != nil {
+		lo.ProxyServer = guard.ProxyURL()
+	}
 	lo.Detach = m.useResolver && detachedWorker.Load()
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
 		return nil, err
+	}
+	if guard != nil {
+		stop := proc.stop
+		var once sync.Once
+		var stopErr error
+		proc.stop = func() error {
+			once.Do(func() {
+				if stop != nil {
+					stopErr = stop()
+				}
+				guard.Close()
+			})
+			return stopErr
+		}
 	}
 	// Best-effort pidfile so a future process can reap this browser + Xvfb if THIS
 	// process is SIGKILLed before graceful teardown. A write failure is non-fatal:
@@ -577,6 +634,8 @@ func (s *cobrowseSession) teardown() error {
 	s.mu.Lock()
 	proc := s.proc
 	s.proc = nil
+	guard := s.egress
+	s.egress = nil
 	profile := s.profile
 	enc := s.encProfile
 	s.encProfile = nil
@@ -601,6 +660,9 @@ func (s *cobrowseSession) teardown() error {
 	}
 	if proc != nil {
 		dropTargetSet(proc.debugPort)
+	}
+	if guard != nil {
+		guard.Close()
 	}
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
@@ -649,6 +711,10 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 	if !s.startedAt.IsZero() {
 		st.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
 	}
+	if s.requireEgress && s.egress != nil && s.egress.Active() {
+		st.Features = []string{"egress_guard"}
+		st.EgressPrivateHolds = s.egress.PrivateRefused()
+	}
 	var probePort int
 	if s.proc != nil {
 		st.DebugPort = s.proc.debugPort
@@ -659,6 +725,9 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 			// The browser died while we still track it: terminal state.
 			st.State = SessionExited
 		default:
+		}
+		if s.requireEgress && (s.egress == nil || !s.egress.Active()) {
+			st.State = SessionExited
 		}
 		if st.State == SessionRunning || st.State == SessionAttached {
 			probePort = s.proc.debugPort

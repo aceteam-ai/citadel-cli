@@ -65,10 +65,17 @@ const (
 
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
 // CobrowseSessionManager singleton.
-type CobrowseSessionHandler struct{}
+type CobrowseSessionHandler struct {
+	manager *platform.CobrowseSessionManager
+}
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
 func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
+
+// NewCobrowseSessionHandlerWithManager binds an isolated manager for tests.
+func NewCobrowseSessionHandlerWithManager(m *platform.CobrowseSessionManager) *CobrowseSessionHandler {
+	return &CobrowseSessionHandler{manager: m}
+}
 
 func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	action := job.Payload["action"]
@@ -79,9 +86,14 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	// never logged here or passed anywhere but nodevault's Unlock.
 	ctx.Log("info", "     - [Job %s] browser-session action: %s", job.ID, action)
 
-	mgr := platform.GetCobrowseSessionManager()
+	mgr := h.manager
+	if mgr == nil {
+		mgr = platform.GetCobrowseSessionManager()
+	}
 
 	switch action {
+	case "capabilities":
+		return json.Marshal(map[string]any{"features": mgr.EgressFeatures()})
 	case CobrowseSessionActionStart:
 		return startSession(mgr, job)
 

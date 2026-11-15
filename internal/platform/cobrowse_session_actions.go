@@ -165,6 +165,9 @@ func (s *cobrowseSession) requireDrivablePort() (int, error) {
 		return 0, ErrNotStarted
 	default:
 	}
+	if s.requireEgress && (s.egress == nil || !s.egress.Active()) {
+		return 0, ErrEgressGuardUnavailable
+	}
 	if s.humanDrivingLocked() {
 		return 0, ErrHandedOff
 	}
@@ -312,6 +315,12 @@ func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, 
 		}
 		return nil, fmt.Errorf("no such browser session: %q", id)
 	}
+	s.mu.Lock()
+	missing := s.requireEgress && (s.egress == nil || !s.egress.Active())
+	s.mu.Unlock()
+	if missing {
+		return nil, ErrEgressGuardUnavailable
+	}
 	return s, nil
 }
 
@@ -331,6 +340,9 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 		// discards the status on this path anyway, and status() does a real
 		// CDP HTTP round trip (bounded, but still needless work on every
 		// refused write).
+		return CobrowseSessionStatus{}, err
+	}
+	if err := s.checkEgressURL(url); err != nil {
 		return CobrowseSessionStatus{}, err
 	}
 	var before string
@@ -393,6 +405,9 @@ func (m *CobrowseSessionManager) NavigateAsHuman(id, url string) (CobrowseSessio
 	port := s.proc.debugPort
 	tracking := s.tracking
 	s.mu.Unlock()
+	if err := s.checkEgressURL(url); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
 	p := pin{port: port}
 	if tracking {
 		if p, err = pinFor(port); errors.Is(err, ErrPageRefused) {
