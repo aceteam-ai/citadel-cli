@@ -115,6 +115,9 @@ func newTargetSet() *targetSet {
 	return &targetSet{known: map[string]string{}, okOrigins: map[string]time.Time{}, badOrigins: map[string]originRefusal{}}
 }
 
+// targetNow is the clock for verdict expiry; tests replace it.
+var targetNow = time.Now
+
 var targetSets sync.Map // debug port -> *targetSet
 
 func targetSetFor(port int) *targetSet {
@@ -315,7 +318,7 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 	var closing []cdpdiscovery.Target
 	var events []event
 	kept := make([]cdpdiscovery.Target, 0, len(ordered))
-	now := time.Now()
+	now := targetNow()
 	for _, tg := range ordered {
 		if known[tg.ID] == tg.URL && prevSeen[tg.ID] {
 			kept = append(kept, tg)
@@ -328,16 +331,18 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 			if at, ok := okOrigins[origin]; !ok || origin == "" || now.Sub(at) > originVerdictTTL {
 				var perr error
 				if bad, ok := badOrigins[origin]; ok && origin != "" && now.Sub(bad.at) <= originVerdictTTL {
+					// A cached refusal keeps its original decision time, so
+					// polling never renews it; it expires and is re-judged.
 					perr = bad.err
 				} else {
 					pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 					perr = policy(pctx, tg.URL)
 					cancel()
-				}
-				if perr != nil {
-					if origin != "" {
+					if perr != nil && origin != "" {
 						badOrigins[origin] = originRefusal{now, perr}
 					}
+				}
+				if perr != nil {
 					closing = append(closing, tg)
 					events = append(events, event{"target_closed", tg.URL, perr})
 					continue

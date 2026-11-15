@@ -778,3 +778,53 @@ func TestVerdictCachesAreBounded(t *testing.T) {
 		t.Fatalf("refusal cache holds %d entries", len(ts.badOrigins))
 	}
 }
+
+// A cached refusal is not renewed by polling: it expires on its original
+// decision time and is re-judged, so a page the policy now allows recovers.
+func TestCachedRefusalExpiresDespiteRepeatedPolling(t *testing.T) {
+	f := newFakeDevTools(t)
+	withOpeners(t, map[string]string{})
+	clock := time.Now()
+	prev := targetNow
+	targetNow = func() time.Time { return clock }
+	t.Cleanup(func() { targetNow = prev })
+
+	allow := false
+	calls := 0
+	ts := newTargetSet()
+	ts.configure("cb-1", func(_ context.Context, raw string) error {
+		calls++
+		if !allow && strings.Contains(raw, "later.test") {
+			return fmt.Errorf("refused")
+		}
+		return nil
+	}, nil)
+	ctx := context.Background()
+	f.set([2]string{"a", "http://app.test/"})
+	if _, err := ts.sync(ctx, f.port); err != nil {
+		t.Fatal(err)
+	}
+	f.set([2]string{"a", "http://later.test/"})
+	snap, _ := ts.sync(ctx, f.port)
+	if snap.Active != "" || !snap.Targets[0].Refused {
+		t.Fatalf("not refused: %+v", snap)
+	}
+	judged := calls
+	// Poll every 5s for 25s: served from the cache, never renewed.
+	for i := 0; i < 5; i++ {
+		clock = clock.Add(5 * time.Second)
+		if snap, _ = ts.sync(ctx, f.port); snap.Active != "" {
+			t.Fatalf("recovered early: %+v", snap)
+		}
+	}
+	if calls != judged {
+		t.Fatalf("policy ran %d extra times inside the TTL", calls-judged)
+	}
+	// Past 30s from the original decision, with the policy now allowing it.
+	allow = true
+	clock = clock.Add(6 * time.Second)
+	snap, _ = ts.sync(ctx, f.port)
+	if snap.Active != "a" || snap.Targets[0].Refused || calls == judged {
+		t.Fatalf("page stayed blocked after the policy allowed it: %+v calls=%d", snap, calls-judged)
+	}
+}
