@@ -691,3 +691,53 @@ func TestDispatchedThenTransportErrorIsReportableAndUnknown(t *testing.T) {
 		})
 	}
 }
+
+// A handoff while the input call is in flight must stop the read-back: the page
+// is not evaluated during human control, and the action reports its outcome as
+// unknown rather than as done.
+func TestHandoffDuringInputSkipsReadBack(t *testing.T) {
+	x, y := 10.0, 10.0
+	cases := map[string]struct {
+		method string
+		run    func(m *CobrowseSessionManager, id string) error
+	}{
+		"type": {"Input.insertText", func(m *CobrowseSessionManager, id string) error { _, err := m.Type(id, "hi"); return err }},
+		"key":  {"Input.dispatchKeyEvent", func(m *CobrowseSessionManager, id string) error { _, err := m.Key(id, "Enter"); return err }},
+		"scroll": {"Input.dispatchMouseEvent", func(m *CobrowseSessionManager, id string) error {
+			_, err := m.Scroll(id, "", &x, &y, 0, 100)
+			return err
+		}},
+		"click": {"Input.dispatchMouseEvent", func(m *CobrowseSessionManager, id string) error { _, err := m.Click(id, "", &x, &y); return err }},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := startLatencyCDP(t, nil)
+			m, id := newBudgetSession(t, f)
+			var once sync.Once
+			f.mu.Lock()
+			f.onCall = func(method string, params map[string]any) {
+				if method == tc.method {
+					once.Do(func() { forceHandoff(m, id) })
+				}
+			}
+			f.mu.Unlock()
+			err := tc.run(m, id)
+			ae, ok := AsActionIncomplete(err)
+			if !ok {
+				t.Fatalf("err = %v, want *ActionIncompleteError", err)
+			}
+			if errors.Is(err, ErrHandedOff) {
+				t.Fatalf("err wraps ErrHandedOff, which means nothing was sent")
+			}
+			if !ae.Reportable() || !ae.Effects.Dispatched || !ae.Effects.Unknown {
+				t.Fatalf("effects = %+v reportable=%v", ae.Effects, ae.Reportable())
+			}
+			if ae.Status.Done == nil || *ae.Status.Done {
+				t.Fatalf("status done = %v, want false", ae.Status.Done)
+			}
+			if n := f.count("Runtime.evaluate"); n != 1 {
+				t.Fatalf("%d evaluations; want only the pre-action probe after handoff", n)
+			}
+		})
+	}
+}

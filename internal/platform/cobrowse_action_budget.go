@@ -407,6 +407,12 @@ func (s *cobrowseSession) fence(ctx context.Context, p pin) error {
 	if err := pageActiveErr(ctx, p); err != nil {
 		return err
 	}
+	return s.driverFence(p)
+}
+
+// driverFence refuses unless the live process the pin was taken on is still
+// running and not handed to a human.
+func (s *cobrowseSession) driverFence(p pin) error {
 	port, err := s.requireDrivablePort()
 	if err != nil {
 		return err
@@ -454,7 +460,18 @@ func (s *cobrowseSession) runAction(a actionBudget, p pin, action string, body f
 	bodyErr := body(run)
 
 	if bodyErr == nil {
-		after := readBack(a.op, p, run, conn)
+		after, rbErr := readBack(a.op, p, run, conn)
+		if rbErr != nil && eff.Dispatched {
+			// The input went out, then the agent lost control. The page is
+			// not read during human control, so the outcome is unknown.
+			eff.Unknown = true
+			ae := &ActionIncompleteError{Action: action, Effects: eff, Cause: errReadBackNoDriver}
+			st := s.statusWithURL(a.op)
+			done := false
+			st.Done, st.Effects = &done, &eff
+			ae.Status = st
+			return st, ae
+		}
 		applyProbe(&eff, run.before, after)
 		eff.Unknown = !after.probeValid
 		st := s.statusWithURL(a.op, after.url, conn.target.URL)
@@ -472,7 +489,9 @@ func (s *cobrowseSession) runAction(a actionBudget, p pin, action string, body f
 	// same budget.
 	var after pageProbe
 	if rc, rerr := openCDPConn(a.op, p); rerr == nil {
-		after = readBack(a.op, p, run, rc)
+		// A lost driver leaves after empty; a dispatched action is then
+		// reported with unknown effects below.
+		after, _ = readBack(a.op, p, run, rc)
 		rc.Close()
 	}
 	applyProbe(&eff, run.before, after)
@@ -502,12 +521,20 @@ func isTimeoutErr(err error) bool {
 }
 
 // readBack reads the page state over c, but only while the pinned page is still
-// the active, approved one: it sends a best-effort mouseReleased first when a
-// click timed out between press and release, and never evaluates in a page
-// that is refused or no longer active.
-func readBack(ctx context.Context, p pin, run *actionRun, c *cdpConn) pageProbe {
+// the active, approved one and the agent still drives: it sends a best-effort
+// mouseReleased first when a click timed out between press and release, and
+// never evaluates in a page that is refused or no longer active, or while a
+// human has control. A lost driver (handoff or stop) is returned as an error so
+// a dispatched action reports its outcome as unknown; a page that is simply no
+// longer active (a click opened a popup) reads back nothing, without error.
+func readBack(ctx context.Context, p pin, run *actionRun, c *cdpConn) (pageProbe, error) {
 	if !pageActive(ctx, p) {
-		return pageProbe{}
+		return pageProbe{}, nil
+	}
+	// The page check awaits discovery; the driver check is instant and sits
+	// last, immediately before anything is sent to the page.
+	if err := run.s.driverFence(p); err != nil {
+		return pageProbe{}, err
 	}
 	if run.pressed {
 		_, _ = c.Call("Input.dispatchMouseEvent", map[string]any{
@@ -515,8 +542,13 @@ func readBack(ctx context.Context, p pin, run *actionRun, c *cdpConn) pageProbe 
 		})
 		run.pressed = false
 	}
-	return probePage(c)
+	return probePage(c), nil
 }
+
+// errReadBackNoDriver is the cause when input was sent but the page could not
+// be read back because the agent no longer drives the session. It deliberately
+// does not wrap ErrHandedOff: that error means nothing was sent.
+var errReadBackNoDriver = errors.New("input was sent, but control left the agent before the outcome could be read")
 
 // clickSequence sends move, press and release over the action's connection and
 // records the press so a timeout between press and release can be released.
