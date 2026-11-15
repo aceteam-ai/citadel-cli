@@ -3828,3 +3828,18 @@ Auto-generated log of every release.
   - fix(whisper): bump opentelemetry-api for GHSA-mf5v-w3w3-f6cg (#1652)
 
 
+---
+
+## v2.229.0 — 2026-11-15
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 29 |
+| Lines added | +3508 |
+
+**Changes:**
+
+  - feat(cobrowse): follow popups and new tabs in runner and local viewer (#1633) (#1648)
+
+
