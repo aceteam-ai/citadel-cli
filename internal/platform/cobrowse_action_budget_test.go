@@ -807,3 +807,38 @@ func TestHandoffMidKeyStopsKeyUp(t *testing.T) {
 		t.Fatalf("%d key events, want 1 (no key-up after the handoff)", n)
 	}
 }
+
+// The recovery read-back's cleanup release is awaited; a handoff during it must
+// stop the probe, so nothing is evaluated during human control.
+func TestHandoffDuringCleanupReleaseSkipsProbe(t *testing.T) {
+	shortBudget(t, 300*time.Millisecond, time.Second)
+	f := startLatencyCDP(t, nil)
+	m, id := newBudgetSession(t, f)
+	var once sync.Once
+	f.mu.Lock()
+	f.onCall = func(method string, params map[string]any) {
+		if method != "Input.dispatchMouseEvent" {
+			return
+		}
+		switch params["type"] {
+		case "mousePressed":
+			time.Sleep(600 * time.Millisecond)
+		case "mouseReleased":
+			once.Do(func() { forceHandoff(m, id) })
+		}
+	}
+	f.mu.Unlock()
+	x, y := 5.0, 5.0
+	_, err := m.Click(id, "", &x, &y)
+	ae, ok := AsActionIncomplete(err)
+	if !ok || errors.Is(err, ErrHandedOff) {
+		t.Fatalf("err = %v, want *ActionIncompleteError not wrapping ErrHandedOff", err)
+	}
+	if !ae.Effects.Dispatched || !ae.Effects.Unknown {
+		t.Fatalf("effects = %+v", ae.Effects)
+	}
+	if n := f.count("Runtime.evaluate"); n != 1 {
+		t.Fatalf("%d evaluations; want only the pre-action probe after the handoff", n)
+	}
+	time.Sleep(500 * time.Millisecond)
+}

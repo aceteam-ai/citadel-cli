@@ -541,6 +541,10 @@ func readBack(ctx context.Context, p pin, run *actionRun, c *cdpConn) (pageProbe
 			"type": "mouseReleased", "x": run.px, "y": run.py, "button": "left", "clickCount": 1,
 		})
 		run.pressed = false
+		// The release is awaited, so a human can take control during it.
+		if err := run.s.driverFence(p); err != nil {
+			return pageProbe{}, err
+		}
 	}
 	return probePage(c), nil
 }
