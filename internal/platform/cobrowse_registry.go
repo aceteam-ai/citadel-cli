@@ -632,6 +632,7 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			proc:            adoptedProc(rec),
 			explicitHandoff: rec.Handoff,
 			generation:      rec.Generation + 1,
+			tracking:        m.TargetsEnabled(),
 		}
 		if t, err := time.Parse(time.RFC3339, rec.StartedAt); err == nil {
 			s.startedAt = t

@@ -843,6 +843,9 @@ type ActionResult struct {
 	Title      string `json:"title,omitempty"`
 	Value      string `json:"value,omitempty"`
 	Label      string `json:"label,omitempty"`
+	// OpenTargets is set when the session has more than one page open (a
+	// popup or new tab); status lists them. URL and Title are the active page.
+	OpenTargets int `json:"open_targets,omitempty"`
 }
 
 // settleWindow is how long a write waits to observe navigation and load;
@@ -855,6 +858,14 @@ var (
 )
 
 func (s *Service) settle(ctx context.Context, id, before string) ActionResult {
+	res := s.settlePage(ctx, id, before)
+	if st, ok := s.cfg.Browser.SessionStatus(id); ok && len(st.Targets) > 1 {
+		res.OpenTargets = len(st.Targets)
+	}
+	return res
+}
+
+func (s *Service) settlePage(ctx context.Context, id, before string) ActionResult {
 	res := ActionResult{Dispatched: true}
 	start := time.Now()
 	for {
@@ -938,12 +949,15 @@ func (s *Service) Navigate(ctx context.Context, id, rawURL, goal string) (Action
 			return ActionResult{}, err
 		}
 		defer unlock()
+		// The grant, the commit record and the dispatch all address this one page.
+		targetID, clear := s.expectActive(id)
+		defer clear()
 		if err := s.requireGrant(id, ss, ev.Domain); err != nil {
 			return ActionResult{}, err
 		}
 		a := actionRef{Kind: "navigate", URL: rawURL}
 		if dec := ClassifyNavigation(rawURL); dec.Class == ClassCommit {
-			return ActionResult{}, s.authorizeCommit(&ev, ss, a, platform.TargetInfo{Resolved: true}, dec, ev.Domain)
+			return ActionResult{}, s.authorizeCommit(&ev, ss, a, platform.TargetInfo{Resolved: true}, dec, ev.Domain, targetID)
 		}
 		refund, err := s.spendBudget(true)
 		if err != nil {
@@ -954,8 +968,10 @@ func (s *Service) Navigate(ctx context.Context, id, rawURL, goal string) (Action
 			return ActionResult{}, err
 		}
 		before := s.currentURL(id)
-		if _, err := s.cfg.Browser.Navigate(id, rawURL); err != nil {
-			return ActionResult{}, err
+		_, nerr := s.cfg.Browser.Navigate(id, rawURL)
+		clear()
+		if nerr != nil {
+			return ActionResult{}, nerr
 		}
 		res := s.settle(ctx, id, before)
 		if rawURL != before {
@@ -965,6 +981,25 @@ func (s *Service) Navigate(ctx context.Context, id, rawURL, goal string) (Action
 	}()
 	s.finish(ev, err)
 	return res, err
+}
+
+// expectActive records the page this call is checked against, so the browser
+// refuses the action if a different page is active when it is dispatched: the
+// page that passed the checks is the page that gets the input. The returned
+// function clears it, and the page id is returned so a commit can be recorded
+// on that page; call clear as soon as the dispatch is done so the result can
+// follow a popup the action opened.
+func (s *Service) expectActive(id string) (targetID string, clear func()) {
+	ex, ok := s.cfg.Browser.(interface{ ExpectTarget(id, target string) })
+	if !ok {
+		return "", func() {}
+	}
+	st, ok := s.cfg.Browser.SessionStatus(id)
+	if !ok || st.ActiveTarget == "" {
+		return "", func() {}
+	}
+	ex.ExpectTarget(id, st.ActiveTarget)
+	return st.ActiveTarget, func() { ex.ExpectTarget(id, "") }
 }
 
 // Click clicks an element or a viewport point (W).
@@ -1073,6 +1108,11 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 		return ActionResult{}, err
 	}
 	defer unlock()
+	// Pin the page now. Its address gives the domain for the grant, the probe
+	// reads it, a commit is recorded on it and the dispatch goes to it; if
+	// another page became active in between, the browser refuses.
+	targetID, clear := s.expectActive(id)
+	defer clear()
 	pageDomain := RegistrableDomain(s.currentURL(id))
 	ev.Domain = pageDomain
 	if err := s.requireGrant(id, ss, pageDomain); err != nil {
@@ -1084,7 +1124,7 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 	var class0 Class
 	if classify {
 		t, err := s.probe(id, a)
-		if errors.Is(err, ErrHumanDriving) {
+		if errors.Is(err, ErrHumanDriving) || errors.Is(err, platform.ErrTargetChanged) {
 			return ActionResult{}, err
 		}
 		if err != nil {
@@ -1111,7 +1151,7 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 				}
 			}
 		case ClassCommit:
-			return ActionResult{}, s.authorizeCommit(ev, ss, a, t, dec, pageDomain)
+			return ActionResult{}, s.authorizeCommit(ev, ss, a, t, dec, pageDomain, targetID)
 		}
 		fp0, class0 = fingerprint(a, t), dec.Class
 	}
@@ -1127,7 +1167,7 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 		// Re-probe immediately before dispatch: the action goes out only if
 		// the target is exactly what was classified.
 		t2, err := s.probe(id, a)
-		if errors.Is(err, ErrHumanDriving) {
+		if errors.Is(err, ErrHumanDriving) || errors.Is(err, platform.ErrTargetChanged) {
 			return ActionResult{}, err
 		}
 		if err != nil || fingerprint(a, t2) != fp0 || Classify(a.Kind, a.Key, t2).Class != class0 {
@@ -1135,8 +1175,10 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 		}
 	}
 	before := s.currentURL(id)
-	if err := do(); err != nil {
-		return ActionResult{}, err
+	derr := do()
+	clear()
+	if derr != nil {
+		return ActionResult{}, derr
 	}
 	return s.finishAfter(ctx, id, ss, before, navigation)
 }
@@ -1146,7 +1188,7 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 // declined, otherwise ErrCommitApprovalRequired. Only the action reference and
 // its fingerprint are kept, never typed text; the action runs from
 // ApproveCommit if and only if the user approves it.
-func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platform.TargetInfo, dec Decision, domain string) error {
+func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platform.TargetInfo, dec Decision, domain, targetID string) error {
 	fp := fingerprint(a, t)
 	label := sanitizeLabel(t.Name)
 	now := s.cfg.Now()
@@ -1159,7 +1201,7 @@ func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platfor
 	}
 	pc := &pendingCommit{
 		id: newCommitID(), fp: fp, ref: a, domain: domain, action: describeAction(a, t), label: label,
-		reason: dec.Reason, requestedAt: now, rect: t.Rect,
+		reason: dec.Reason, requestedAt: now, rect: t.Rect, targetID: targetID,
 		// A target that could not be read (probe error, unresolved, too large)
 		// cannot be verified later either, so no approval of it is redeemable.
 		unverifiable: a.Kind != "navigate" && (!t.Resolved || t.Oversized),
@@ -1215,6 +1257,8 @@ func (s *Service) Extract(ctx context.Context, id, selector string, attrs []stri
 		maxChars = MaxExtractChars
 	}
 	var res platform.ExtractResult
+	_, clear := s.expectActive(id)
+	defer clear()
 	err := s.gateRead(ctx, id)
 	if err == nil {
 		res, err = s.cfg.Browser.ExtractBounded(id, selector, attrs, maxChars)
@@ -1227,6 +1271,8 @@ func (s *Service) Extract(ctx context.Context, id, selector string, attrs []stri
 func (s *Service) Screenshot(ctx context.Context, id, goal string) (string, error) {
 	ev := Event{SessionID: id, Action: "screenshot", Class: "R", Goal: goal}
 	var png string
+	_, clear := s.expectActive(id)
+	defer clear()
 	err := s.gateRead(ctx, id)
 	if err == nil {
 		png, err = s.cfg.Browser.Screenshot(id)
@@ -1260,6 +1306,11 @@ type SessionView struct {
 	HandoffSince  string        `json:"handoff_since,omitempty"`
 	HandoffReason string        `json:"handoff_reason,omitempty"`
 	Lifetime      string        `json:"lifetime"`
+	// ActiveTarget and Targets list the session's open pages. A page opened by
+	// the active page (a sign-in popup) is followed automatically, and closing
+	// it returns to the opener. The agent's actions apply to the active page.
+	ActiveTarget string       `json:"active_target,omitempty"`
+	Targets      []TargetView `json:"targets,omitempty"`
 	// Profile names the saved profile of a profile session. ProfileMode is
 	// "locked", "unlocked", or "throwaway" (the user chose to run without
 	// the saved profile).
@@ -1267,6 +1318,17 @@ type SessionView struct {
 	ProfileMode string `json:"profile_mode,omitempty"`
 	// Unlocking is true while the user's unlock is starting the browser.
 	Unlocking bool `json:"unlocking,omitempty"`
+}
+
+// TargetView is one open page of a session.
+type TargetView struct {
+	ID     string `json:"id"`
+	Title  string `json:"title,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Active bool   `json:"active,omitempty"`
+	// Refused: the policy refuses this page's address; it is open only so the
+	// browser stays alive and every action on it is refused.
+	Refused bool `json:"refused,omitempty"`
 }
 
 // GrantView is one live domain grant.
@@ -1290,8 +1352,18 @@ func (s *Service) agentViewLocked(ss *session, st platform.CobrowseSessionStatus
 	v := s.viewLocked(ss, st, now)
 	if st.Driver == platform.DriverHuman {
 		v.URL = redactWhileHuman(v.URL)
+		redactTargets(v.Targets)
 	}
 	return v
+}
+
+// redactTargets applies the human-driving redaction to every page: origin only,
+// no title, since the path, query and title can carry one-time codes.
+func redactTargets(ts []TargetView) {
+	for i := range ts {
+		ts[i].URL = redactWhileHuman(ts[i].URL)
+		ts[i].Title = ""
+	}
 }
 
 func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now time.Time) SessionView {
@@ -1340,6 +1412,10 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 			v.CommitResult = &rc
 		}
 	}
+	v.ActiveTarget = st.ActiveTarget
+	for _, t := range st.Targets {
+		v.Targets = append(v.Targets, TargetView{ID: t.ID, Title: t.Title, URL: t.URL, Active: t.Active, Refused: t.Refused})
+	}
 	if st.Driver == platform.DriverHuman && !ss.handoffAt.IsZero() {
 		v.HandoffSince = ss.handoffAt.UTC().Format(time.RFC3339)
 		v.HandoffReason = ss.handoffReason
@@ -1382,6 +1458,7 @@ func (s *Service) status(id string) ([]SessionView, error) {
 	for i := range views {
 		if views[i].Driver == string(platform.DriverHuman) {
 			views[i].URL = redactWhileHuman(views[i].URL)
+			redactTargets(views[i].Targets)
 		}
 	}
 	return views, nil
@@ -1804,12 +1881,36 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		return ErrHumanDriving
 	}
 	a := pc.ref
+	// The re-probe, the grant and the dispatch all go to the page the commit was
+	// recorded on. If that page is gone or no longer active, it is "changed".
+	clear := func() {}
+	if ex, ok := s.cfg.Browser.(interface{ ExpectTarget(id, target string) }); ok && pc.targetID != "" {
+		ex.ExpectTarget(id, pc.targetID)
+		clear = func() { ex.ExpectTarget(id, "") }
+	}
+	defer clear()
+	moved := false
+	if pc.targetID != "" {
+		if _, err := s.cfg.Browser.PageState(id); errors.Is(err, platform.ErrTargetChanged) {
+			moved = true
+		}
+	}
 	t := platform.TargetInfo{Resolved: true}
 	var probeErr error
-	if a.Kind != "navigate" {
+	if a.Kind != "navigate" && !moved {
 		if t, probeErr = s.probe(id, a); probeErr != nil {
+			if errors.Is(probeErr, platform.ErrTargetChanged) {
+				moved = true
+			}
 			t = platform.TargetInfo{Reason: "the page could not be inspected"}
 		}
+	}
+	if moved {
+		// The page the commit was recorded on is gone or no longer active.
+		resolve("changed", "the page changed, so it was not executed; the agent will ask again")
+		hev.Outcome = "page_changed"
+		s.emit(hev)
+		return nil
 	}
 	if pc.unverifiable {
 		resolve("failed", "Citadel could not verify this target, so it was not done; do it yourself")
@@ -1857,6 +1958,13 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 	}
 	before := s.currentURL(id)
 	derr := s.dispatchCommit(id, a)
+	clear()
+	if errors.Is(derr, platform.ErrTargetChanged) {
+		resolve("changed", "the page changed, so it was not executed; the agent will ask again")
+		hev.Outcome = "page_changed"
+		s.emit(hev)
+		return nil
+	}
 	if derr == nil {
 		_, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate")
 	}
@@ -1985,6 +2093,36 @@ func (s *Service) HumanNavigate(ctx context.Context, id, url string) error {
 	}()
 	s.finish(ev, err)
 	return err
+}
+
+// TargetPolicy is the check every page a session opens must pass, the same
+// address filter that applies to navigation. A popup or new tab to a refused
+// address is closed (and the egress guard still blocks its connections).
+func (s *Service) TargetPolicy() func(ctx context.Context, rawURL string) error {
+	return s.cfg.URLPolicy
+}
+
+// RecordTargetEvent audits a page event. "target_closed" and "target_refused"
+// are Citadel's own doing (class B, actor citadel); "target_switch" and
+// "target_close" are the user choosing a page in the viewer (class H).
+func (s *Service) RecordTargetEvent(sessionID, action, rawURL string, reason error) {
+	ev := Event{SessionID: sessionID, Action: action, URL: rawURL, Error: errString(reason)}
+	switch action {
+	case "target_switch", "target_close":
+		ev.Class, ev.Outcome = "H", "ok"
+	case "target_refused":
+		ev.Class, ev.Outcome = "B", "left_open"
+	default:
+		ev.Class, ev.Outcome = "B", "closed"
+	}
+	s.emit(ev)
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // ProfileVault reports the profile store's passphrase state for the viewer.

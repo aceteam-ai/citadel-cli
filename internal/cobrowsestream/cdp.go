@@ -125,6 +125,15 @@ func dialCDPWithReadLimit(debugPort int, onFrame func(screencastFrame), readLimi
 	if err != nil {
 		return nil, err
 	}
+	return dialCDPURL(wsURL, onFrame, readLimit)
+}
+
+// dialCDPURL opens the persistent CDP WebSocket to one already-resolved page
+// target. The URL always comes from the node's own loopback discovery.
+func dialCDPURL(wsURL string, onFrame func(screencastFrame), readLimit int64) (*cdpClient, error) {
+	if readLimit <= 0 || readLimit > maxCDPMessageBytes {
+		return nil, fmt.Errorf("CDP read limit is invalid")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	// Gorilla's read limit counts compressed payload bytes, not expanded data.
