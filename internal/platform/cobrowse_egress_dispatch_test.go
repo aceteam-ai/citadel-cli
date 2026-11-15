@@ -53,6 +53,7 @@ func TestTargetSetRemoteEgressDispatchedSession(t *testing.T) {
 	if got := f.Request("http://rebind.test/first"); got != http.StatusOK {
 		t.Fatalf("public request: %d", got)
 	}
+	f.Rebind()
 	if got := f.Request("http://rebind.test/second"); got != http.StatusForbidden {
 		t.Fatalf("rebind escaped: %d", got)
 	}

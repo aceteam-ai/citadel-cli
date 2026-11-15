@@ -20,13 +20,15 @@ type RemoteEgressFixture struct {
 	Hits       func() int32
 	Proxy      func() string
 	CloseGuard func()
+	Rebind     func()
 }
 
 func NewRemoteEgressFixture(t *testing.T) *RemoteEgressFixture {
 	t.Helper()
 	cdp := newFakeDevTools(t)
 	cdp.set([2]string{"a", "https://public.test/"})
-	var hits, rebinding atomic.Int32
+	var hits atomic.Int32
+	var rebinding atomic.Bool
 	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		w.Header().Set("Connection", "close")
@@ -38,7 +40,7 @@ func NewRemoteEgressFixture(t *testing.T) *RemoteEgressFixture {
 	}))
 	t.Cleanup(web.Close)
 	g, err := browseregress.StartEgressGuard(func(_ context.Context, host string) ([]netip.Addr, error) {
-		if host == "rebind.test" && rebinding.Add(1) > 1 {
+		if host == "rebind.test" && rebinding.Load() {
 			return []netip.Addr{netip.MustParseAddr("10.1.2.3")}, nil
 		}
 		return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
@@ -63,7 +65,7 @@ func NewRemoteEgressFixture(t *testing.T) *RemoteEgressFixture {
 		return &cobrowseProc{debugPort: cdp.port, exited: make(chan struct{}), stop: func() error { return nil }}, nil
 	}
 	t.Cleanup(func() { m.StopAll() })
-	return &RemoteEgressFixture{Manager: m, Hits: hits.Load, Proxy: func() string { return launchedProxy }, CloseGuard: g.Close, Request: func(raw string) int {
+	return &RemoteEgressFixture{Manager: m, Hits: hits.Load, Proxy: func() string { return launchedProxy }, CloseGuard: g.Close, Rebind: func() { rebinding.Store(true) }, Request: func(raw string) int {
 		t.Helper()
 		if launchedProxy == "" {
 			t.Fatal("remote launcher omitted proxy")

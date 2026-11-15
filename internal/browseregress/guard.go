@@ -204,6 +204,17 @@ func (g *EgressGuard) CheckURL(ctx context.Context, raw string) error {
 	return err
 }
 
+// recordRefusal keeps proxy-level counters consistent whether policy rejects a
+// request before pooled forwarding or rejects a new numeric-address dial.
+func (g *EgressGuard) recordRefusal(err error) {
+	if errors.Is(err, ErrEgressRefused) {
+		g.refused.Add(1)
+	}
+	if errors.Is(err, ErrPrivateNetworkApprovalRequired) {
+		g.privateRefused.Add(1)
+	}
+}
+
 // guardedDial resolves, checks, and dials a checked address (never the name).
 func (g *EgressGuard) guardedDial(ctx context.Context, network, hostport string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(hostport)
@@ -215,12 +226,7 @@ func (g *EgressGuard) guardedDial(ctx context.Context, network, hostport string)
 	}
 	addrs, err := g.checkedAddrs(ctx, host)
 	if err != nil {
-		if errors.Is(err, ErrEgressRefused) {
-			g.refused.Add(1)
-		}
-		if errors.Is(err, ErrPrivateNetworkApprovalRequired) {
-			g.privateRefused.Add(1)
-		}
+		g.recordRefusal(err)
 		return nil, err
 	}
 	var lastErr error
@@ -273,6 +279,18 @@ func (g *EgressGuard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL == nil || !r.URL.IsAbs() || r.URL.Scheme != "http" {
 		http.Error(w, "proxy requests only", http.StatusBadRequest)
+		return
+	}
+	// Revalidate current destination policy before every plain-HTTP request,
+	// even if the transport will reuse a previously checked public connection.
+	// New connections still independently resolve, check and pin a numeric IP in
+	// guardedDial, so this check never authorizes a later unchecked dial.
+	checkCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	err := g.CheckURL(checkCtx, r.URL.String())
+	cancel()
+	if err != nil {
+		g.recordRefusal(err)
+		refuseResponse(w, err)
 		return
 	}
 	out := r.Clone(r.Context())

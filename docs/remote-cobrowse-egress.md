@@ -17,6 +17,11 @@ and dials an approved numeric address. It never hands the original name to a
 second dial-time resolver. Redirect destinations, frames, script requests,
 subresources and CONNECT tunnels pass through the same check. Reusing an existing
 public socket does not change that socket's destination when DNS changes.
+Plain HTTP also rechecks current URL and DNS policy before forwarding each
+request, including over a pooled upstream connection. A current private,
+mixed-address or metadata answer refuses that request without reaching the
+existing public socket. New dials still resolve and pin independently; CONNECT
+checks the tunnel destination when it is opened.
 
 Loopback, link-local, metadata and other reserved addresses are refused. Explicit
 metadata endpoints in private ranges are hard refusals too, including the
