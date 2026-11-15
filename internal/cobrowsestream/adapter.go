@@ -56,7 +56,7 @@ func (s targetManagerSession) Targets(id string) (TargetSnapshot, error) {
 	}
 	snap := TargetSnapshot{Active: t.Active, ActiveWebSocketURL: t.ActiveWebSocketURL}
 	for _, tg := range t.Targets {
-		snap.Targets = append(snap.Targets, TargetInfo{ID: tg.ID, Title: tg.Title, URL: tg.URL, Active: tg.Active})
+		snap.Targets = append(snap.Targets, TargetInfo{ID: tg.ID, Title: tg.Title, URL: tg.URL, Active: tg.Active, Refused: tg.Refused})
 	}
 	return snap, nil
 }

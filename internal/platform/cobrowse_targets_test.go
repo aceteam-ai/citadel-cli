@@ -324,7 +324,8 @@ func TestTargetSetJudgesAnOriginOnceAndAReportedOnlyPageOnce(t *testing.T) {
 		t.Fatalf("policy ran %d times for one origin", calls)
 	}
 
-	// The only page on a refused address is left open, reported once.
+	// The only page on a refused address is kept open (the browser must not
+	// exit) but refused: never active, no debugger URL, reported once.
 	f2 := newFakeDevTools(t)
 	ts2 := newTargetSet()
 	events = 0
@@ -333,12 +334,109 @@ func TestTargetSetJudgesAnOriginOnceAndAReportedOnlyPageOnce(t *testing.T) {
 	f2.set([2]string{"a", "http://private.test/"})
 	for i := 0; i < 5; i++ {
 		snap, err := ts2.sync(ctx, f2.port)
-		if err != nil || len(snap.Targets) != 1 {
+		if err != nil || len(snap.Targets) != 1 || !snap.Targets[0].Refused || snap.Active != "" || snap.ActiveWebSocketURL != "" || snap.Targets[0].Active {
 			t.Fatalf("only page: %+v %v", snap, err)
 		}
 	}
 	if events != 1 || len(f2.closedIDs()) != 0 {
 		t.Fatalf("events=%d closed=%v", events, f2.closedIDs())
+	}
+}
+
+// A sole page that navigates to a refused address is never selectable for
+// actions or attachable by a stream, and recovers when it navigates back.
+func TestRefusedLastPageIsNeverActive(t *testing.T) {
+	f := newFakeDevTools(t)
+	withOpeners(t, map[string]string{})
+	ts := newTargetSet()
+	policyCalls := 0
+	ts.configure("cb-1", func(_ context.Context, raw string) error {
+		policyCalls++
+		if strings.Contains(raw, "private.test") {
+			return fmt.Errorf("refused")
+		}
+		return nil
+	}, nil)
+	ctx := context.Background()
+
+	f.set([2]string{"a", "http://app.test/"})
+	snap, _ := ts.sync(ctx, f.port)
+	if snap.Active != "a" {
+		t.Fatalf("allowed: %+v", snap)
+	}
+	f.set([2]string{"a", "http://private.test/x"})
+	for i := 0; i < 3; i++ {
+		snap, err := ts.sync(ctx, f.port)
+		if err != nil || snap.Active != "" || snap.ActiveWebSocketURL != "" || len(snap.Targets) != 1 || !snap.Targets[0].Refused || snap.Targets[0].Active {
+			t.Fatalf("refused sole page was published as usable: %+v %v", snap, err)
+		}
+	}
+	if policyCalls > 3 { // one allowed origin, then the refused origin judged once and cached
+		t.Fatalf("policy ran %d times", policyCalls)
+	}
+	if _, err := ts.activeTarget(ctx, f.port); !errors.Is(err, ErrPageRefused) {
+		t.Fatalf("action selection: %v", err)
+	}
+	if err := ts.setActive("a"); !errors.Is(err, ErrPageRefused) {
+		t.Fatalf("switch to the refused page: %v", err)
+	}
+	// Back to an allowed address: active normally again.
+	f.set([2]string{"a", "http://app.test/y"})
+	snap, _ = ts.sync(ctx, f.port)
+	if snap.Active != "a" || snap.ActiveWebSocketURL == "" || snap.Targets[0].Refused {
+		t.Fatalf("recovered page: %+v", snap)
+	}
+	if _, err := ts.activeTarget(ctx, f.port); err != nil {
+		t.Fatalf("action selection after recovery: %v", err)
+	}
+}
+
+// Every scripted action is refused while the only page is refused; a
+// navigation away is the one thing that still works.
+func TestActionsRefusedOnRefusedPageButNavigationRecovers(t *testing.T) {
+	f := newFakeDevTools(t)
+	withOpeners(t, map[string]string{})
+	f.set([2]string{"a", "http://app.test/"})
+	installFixedPortLauncher(t, f.port)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	m.EnableTargetTracking(func(_ context.Context, raw string) error {
+		if strings.Contains(raw, "private.test") {
+			return fmt.Errorf("refused")
+		}
+		return nil
+	}, nil)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop(st.ID)
+	f.set([2]string{"a", "http://private.test/"})
+	x, y := 1.0, 1.0
+	if _, err := m.Click(st.ID, "", &x, &y); !errors.Is(err, ErrPageRefused) {
+		t.Fatalf("click: %v", err)
+	}
+	if _, err := m.Type(st.ID, "x"); !errors.Is(err, ErrPageRefused) {
+		t.Fatalf("type: %v", err)
+	}
+	if _, err := m.Key(st.ID, "Enter"); !errors.Is(err, ErrPageRefused) {
+		t.Fatalf("key: %v", err)
+	}
+	if _, err := m.ExtractBounded(st.ID, "#x", nil, 10); !errors.Is(err, ErrPageRefused) {
+		t.Fatalf("extract: %v", err)
+	}
+	if _, err := m.PageState(st.ID); !errors.Is(err, ErrPageRefused) {
+		t.Fatalf("page state: %v", err)
+	}
+	for _, c := range f.callsOn("a") {
+		if c != "Page.navigate" {
+			t.Fatalf("a refused page received %q", c)
+		}
+	}
+	if _, err := m.Navigate(st.ID, "about:blank"); err != nil {
+		t.Fatalf("navigating away: %v", err)
+	}
+	if got := f.callsOn("a"); len(got) == 0 || got[len(got)-1] != "Page.navigate" && got[0] != "Page.navigate" {
+		t.Fatalf("navigation did not reach the page: %v", got)
 	}
 }
 

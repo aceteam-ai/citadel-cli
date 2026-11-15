@@ -138,16 +138,16 @@
     const bar = $("pages");
     const list = m.targets || [];
     bar.replaceChildren();
-    bar.hidden = list.length < 2;
+    bar.hidden = list.length < 2 && !list.some((t) => t.refused);
     for (const t of list) {
       const item = document.createElement("span");
-      item.className = "page" + (t.id === m.active ? " sel" : "");
+      item.className = "page" + (t.id === m.active ? " sel" : "") + (t.refused ? " refused" : "");
       const pick = document.createElement("button");
       pick.setAttribute("role", "tab");
       pick.setAttribute("aria-selected", t.id === m.active ? "true" : "false");
-      pick.textContent = t.title || hostPath(t.url) || "New page";
+      pick.textContent = (t.refused ? "Blocked: " : "") + (t.title || hostPath(t.url) || "New page");
       pick.title = t.url || "";
-      pick.disabled = !human;
+      pick.disabled = !human || !!t.refused;
       pick.onclick = () => send({ type: "target_switch", target: t.id });
       item.appendChild(pick);
       if (human) {

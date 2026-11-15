@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -181,6 +182,8 @@ type pin struct {
 	id   string
 	ws   string
 	set  *targetSet
+	// refused: the page is the refused last page, pinned only to navigate away.
+	refused bool
 }
 
 func (p pin) cdp(method string, params map[string]any) (map[string]any, error) {
@@ -217,6 +220,26 @@ func pinFor(port int) (pin, error) {
 		return pin{}, err
 	}
 	return pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: set}, nil
+}
+
+// pinNavigation is pinAction for a navigation: when the only page is refused by
+// the policy, a navigation away from it is still allowed (it sends no input to
+// the page), so the session can recover. Every other action stays refused.
+func (s *cobrowseSession) pinNavigation() (pin, error) {
+	p, err := s.pinAction()
+	if !errors.Is(err, ErrPageRefused) {
+		return p, err
+	}
+	port, perr := s.requireDrivablePort()
+	if perr != nil {
+		return pin{}, perr
+	}
+	set := targetSetFor(port)
+	tg, ok := set.refusedTarget()
+	if !ok {
+		return pin{}, err
+	}
+	return pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: set, refused: true}, nil
 }
 
 // pinAction checks the session is drivable and pins the page the action uses.
@@ -269,7 +292,7 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	p, err := s.pinNavigation()
 	if err != nil {
 		// No status probe on a refused/not-started call: the job handler
 		// discards the status on this path anyway, and status() does a real
@@ -278,8 +301,10 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 		return CobrowseSessionStatus{}, err
 	}
 	var before string
-	if ps, err := readPageState(p); err == nil {
-		before = ps.URL
+	if !p.refused { // nothing runs in a refused page but the navigation away
+		if ps, err := readPageState(p); err == nil {
+			before = ps.URL
+		}
 	}
 	if _, err := p.cdp("Page.navigate", map[string]any{"url": url}); err != nil {
 		return CobrowseSessionStatus{}, err
@@ -327,7 +352,15 @@ func (m *CobrowseSessionManager) NavigateAsHuman(id, url string) (CobrowseSessio
 	s.mu.Unlock()
 	p := pin{port: port}
 	if tracking {
-		if p, err = pinFor(port); err != nil {
+		if p, err = pinFor(port); errors.Is(err, ErrPageRefused) {
+			// Navigating away from a refused page is the way out of it.
+			tg, ok := targetSetFor(port).refusedTarget()
+			if !ok {
+				return CobrowseSessionStatus{}, err
+			}
+			p, err = pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: targetSetFor(port), refused: true}, nil
+		}
+		if err != nil {
 			return CobrowseSessionStatus{}, err
 		}
 	}

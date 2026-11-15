@@ -44,6 +44,9 @@ var (
 	// ErrTargetsDisabled is returned by page calls on a manager that does not
 	// track pages (everything but local mode).
 	ErrTargetsDisabled = errors.New("page tracking is not enabled for this session manager")
+	// ErrPageRefused is returned for every scripted action while the session's
+	// only page is on an address the policy refuses.
+	ErrPageRefused = errors.New("page refused by policy: the page is on an address this session may not use; navigate to an allowed address or stop the session")
 	// ErrTargetChanged refuses an action whose page stopped being the active
 	// one between choosing it and sending input.
 	ErrTargetChanged = errors.New("the active page changed while the action was being prepared; try again")
@@ -55,6 +58,10 @@ type CobrowseTarget struct {
 	Title  string `json:"title,omitempty"`
 	URL    string `json:"url,omitempty"`
 	Active bool   `json:"active,omitempty"`
+	// Refused marks the session's last page when the policy refuses its
+	// address. It is kept open so the browser does not exit, but it is never
+	// active and nothing is sent to it except a navigation away.
+	Refused bool `json:"refused,omitempty"`
 }
 
 // CobrowseTargets is a snapshot of a session's open pages, in the order they
@@ -82,20 +89,29 @@ type targetSet struct {
 	// same page or reorder the opener stack.
 	syncMu sync.Mutex
 
-	mu        sync.Mutex
-	sessionID string
-	policy    TargetPolicy
-	onEvent   TargetEventFunc
-	active    string
-	stack     []string          // openers to return to, most recent last
-	order     []string          // ids present at the last sync, in first-seen order
-	known     map[string]string // id -> last URL accepted (or reported) for a present page
-	okOrigins map[string]time.Time
-	list      []cdpdiscovery.Target // in order
+	mu         sync.Mutex
+	sessionID  string
+	policy     TargetPolicy
+	onEvent    TargetEventFunc
+	active     string
+	stack      []string          // openers to return to, most recent last
+	order      []string          // ids present at the last sync, in first-seen order
+	known      map[string]string // id -> last URL accepted (or reported) for a present page
+	okOrigins  map[string]time.Time
+	badOrigins map[string]originRefusal
+	// refusedID is the last page when the policy refuses it (see ErrPageRefused);
+	// refusedURL is what was reported for it, so the audit hears once.
+	refusedID, refusedURL string
+	list                  []cdpdiscovery.Target // in order
+}
+
+type originRefusal struct {
+	at  time.Time
+	err error
 }
 
 func newTargetSet() *targetSet {
-	return &targetSet{known: map[string]string{}, okOrigins: map[string]time.Time{}}
+	return &targetSet{known: map[string]string{}, okOrigins: map[string]time.Time{}, badOrigins: map[string]originRefusal{}}
 }
 
 var targetSets sync.Map // debug port -> *targetSet
@@ -265,6 +281,8 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 		known[id] = u
 	}
 	okOrigins := t.okOrigins
+	badOrigins := t.badOrigins
+	prevRefused, prevRefusedURL := t.refusedID, t.refusedURL
 	t.mu.Unlock()
 	if policy == nil {
 		policy = schemePolicy
@@ -307,14 +325,23 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 		origin := originOf(tg.URL)
 		if tg.URL != "" && tg.URL != "about:blank" {
 			if at, ok := okOrigins[origin]; !ok || origin == "" || now.Sub(at) > originVerdictTTL {
-				pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-				perr := policy(pctx, tg.URL)
-				cancel()
+				var perr error
+				if bad, ok := badOrigins[origin]; ok && origin != "" && now.Sub(bad.at) <= originVerdictTTL {
+					perr = bad.err
+				} else {
+					pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+					perr = policy(pctx, tg.URL)
+					cancel()
+				}
 				if perr != nil {
+					if origin != "" {
+						badOrigins[origin] = originRefusal{now, perr}
+					}
 					closing = append(closing, tg)
 					events = append(events, event{"target_closed", tg.URL, perr})
 					continue
 				}
+				delete(badOrigins, origin)
 				if origin != "" {
 					okOrigins[origin] = now
 				}
@@ -339,19 +366,25 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 		events = append(events, event{"target_closed", kept[idx].URL, fmt.Errorf("too many open pages (limit %d)", MaxCobrowseTargets)})
 		kept = append(kept[:idx], kept[idx+1:]...)
 	}
-	// Never close the last page: that would end the session. It is reported
-	// once; the agent's own navigation checks cover a refused page that is all
-	// there is.
+	// Never close the last page: that would end the session. It stays open but
+	// REFUSED: never active, no debugger URL published, not remembered as
+	// accepted (it is judged again on every sync, cheaply, through the origin
+	// verdict cache), and reported to the audit once per address.
+	refusedID, refusedURL := "", ""
 	if len(kept) == 0 && len(closing) > 0 {
 		kept = append(kept, closing[0])
+		refusedID, refusedURL = closing[0].ID, closing[0].URL
 		closing = closing[1:]
 		for i := range events {
-			if events[i].action == "target_closed" && events[i].url == kept[0].URL {
-				events[i].action = "target_refused"
+			if events[i].action == "target_closed" && events[i].url == refusedURL {
+				if prevRefused == refusedID && prevRefusedURL == refusedURL {
+					events = append(events[:i], events[i+1:]...)
+				} else {
+					events[i].action = "target_refused"
+				}
 				break
 			}
 		}
-		known[kept[0].ID] = kept[0].URL
 	}
 	for _, tg := range closing {
 		_ = closeTargetByID(ctx, port, tg.ID)
@@ -381,12 +414,24 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 		}
 	}
 
+	usable, prevUsable := make([]string, 0, len(ids)), make([]string, 0, len(prevOrder))
+	for _, id := range ids {
+		if id != refusedID {
+			usable = append(usable, id)
+		}
+	}
+	for _, id := range prevOrder {
+		if id != prevRefused {
+			prevUsable = append(prevUsable, id)
+		}
+	}
 	t.mu.Lock()
-	t.active, t.stack = reconcileTargets(t.active, t.stack, prevOrder, ids, func(id string) (string, bool) {
+	t.active, t.stack = reconcileTargets(t.active, t.stack, prevUsable, usable, func(id string) (string, bool) {
 		op, ok := openers[id]
 		return op, ok
 	})
 	t.order, t.known, t.list = ids, known, kept
+	t.refusedID, t.refusedURL = refusedID, refusedURL
 	for o, at := range t.okOrigins {
 		if now.Sub(at) > originVerdictTTL {
 			delete(t.okOrigins, o)
@@ -410,8 +455,9 @@ func (t *targetSet) snapshotLocked() CobrowseTargets {
 		if len(u) > maxCobrowseTargetURLBytes {
 			u = u[:maxCobrowseTargetURLBytes]
 		}
-		out.Targets = append(out.Targets, CobrowseTarget{ID: tg.ID, Title: SanitizeCobrowseTitle(tg.Title), URL: u, Active: tg.ID == t.active})
-		if tg.ID == t.active {
+		refused := tg.ID == t.refusedID
+		out.Targets = append(out.Targets, CobrowseTarget{ID: tg.ID, Title: SanitizeCobrowseTitle(tg.Title), URL: u, Active: !refused && tg.ID == t.active, Refused: refused})
+		if !refused && tg.ID == t.active {
 			out.ActiveWebSocketURL = tg.WebSocketDebuggerURL
 		}
 	}
@@ -426,12 +472,28 @@ func (t *targetSet) activeTarget(ctx context.Context, port int) (cdpdiscovery.Ta
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.refusedID != "" {
+		return cdpdiscovery.Target{}, ErrPageRefused
+	}
 	for _, tg := range t.list {
-		if tg.ID == snap.Active {
+		if tg.ID == snap.Active && snap.Active != "" {
 			return tg, nil
 		}
 	}
 	return cdpdiscovery.Target{}, fmt.Errorf("no page target found on CDP port %d", port)
+}
+
+// refusedTarget returns the refused last page, for the one thing allowed to
+// address it: navigating away.
+func (t *targetSet) refusedTarget() (cdpdiscovery.Target, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, tg := range t.list {
+		if t.refusedID != "" && tg.ID == t.refusedID {
+			return tg, true
+		}
+	}
+	return cdpdiscovery.Target{}, false
 }
 
 // setActive makes id the active page, remembering the previous one as its
@@ -447,6 +509,9 @@ func (t *targetSet) setActive(id string) error {
 	}
 	if !found {
 		return fmt.Errorf("no such page %q in this session", id)
+	}
+	if id == t.refusedID {
+		return ErrPageRefused
 	}
 	if t.active == id {
 		return nil

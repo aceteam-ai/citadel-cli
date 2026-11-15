@@ -118,9 +118,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	var cdp *cdpClient
 	if hasTargets {
 		snap, err = tsess.Targets(id)
-		if err == nil {
+		if err == nil && snap.ActiveWebSocketURL != "" {
 			cdp, err = dialCDPURL(snap.ActiveWebSocketURL, onFrame, maxCDPMessageBytes)
 		}
+		// With no usable page (the only page is refused) nothing is attached;
+		// the stream holds and tells the viewer, and attaches once there is one.
 	} else {
 		cdp, err = dialCDP(debugPort, onFrame)
 	}
@@ -140,9 +142,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if err := cdp.startScreencast(s.cfg.Quality, s.cfg.MaxWidth, s.cfg.MaxHeight, s.cfg.EveryNth); err != nil {
-		s.logger.Printf("startScreencast failed for session=%s: %v", id, err)
-		return
+	if cdp != nil {
+		if err := cdp.startScreencast(s.cfg.Quality, s.cfg.MaxWidth, s.cfg.MaxHeight, s.cfg.EveryNth); err != nil {
+			s.logger.Printf("startScreencast failed for session=%s: %v", id, err)
+			return
+		}
 	}
 
 	uiMessages := make(chan map[string]any, 4)
@@ -166,7 +170,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				if m, ok := parseInputMessage(data); ok && s.session.ViewerHasControl(id) {
 					switch m.Type {
 					case InputTypeSelectProbe, InputTypeSelect:
-						result, err := current.Load().selectAt(m)
+						c := current.Load()
+						if c == nil {
+							continue
+						}
+						result, err := c.selectAt(m)
 						if err != nil {
 							s.logger.Printf("viewer select failed: %v", err)
 						}
@@ -199,7 +207,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 						default:
 						}
 					default:
-						s.dispatchInput(current.Load(), m)
+						if c := current.Load(); c != nil {
+							s.dispatchInput(c, m)
+						}
 					}
 				}
 			}
@@ -215,7 +225,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	var targetTick <-chan time.Time
 	var lastTargets []byte
 	activeID := snap.Active
-	cdpDone := cdp.Done()
+	var cdpDone <-chan struct{} // nil (blocks) while nothing is attached
+	if cdp != nil {
+		cdpDone = cdp.Done()
+	}
 	if hasTargets {
 		t := time.NewTicker(targetPollPeriod)
 		defer t.Stop()
@@ -241,7 +254,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		if !s.sendTargets(conn, next, &lastTargets) {
 			return false
 		}
-		if next.Active != activeID || force {
+		if next.ActiveWebSocketURL == "" {
+			// No usable page: detach and hold until there is one.
+			if old := current.Swap(nil); old != nil {
+				old.stopScreencast()
+				old.Close()
+				holder.take()
+			}
+			activeID, cdpDone = next.Active, nil
+			return true
+		}
+		if next.Active != activeID || force || current.Load() == nil {
 			nc, err := dialCDPURL(next.ActiveWebSocketURL, onFrame, maxCDPMessageBytes)
 			if err != nil {
 				s.logger.Printf("CDP switch failed for session=%s: %v", id, err)
@@ -329,6 +352,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				// Chrome may not emit a screencast event for a static page. Ask
 				// for its current image once, without blocking the stream writer.
 				c := current.Load()
+				if c == nil {
+					break
+				}
 				go func() {
 					captureCtx, stop := context.WithTimeout(ctx, 5*time.Second)
 					defer stop()

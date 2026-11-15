@@ -1326,6 +1326,9 @@ type TargetView struct {
 	Title  string `json:"title,omitempty"`
 	URL    string `json:"url,omitempty"`
 	Active bool   `json:"active,omitempty"`
+	// Refused: the policy refuses this page's address; it is open only so the
+	// browser stays alive and every action on it is refused.
+	Refused bool `json:"refused,omitempty"`
 }
 
 // GrantView is one live domain grant.
@@ -1411,7 +1414,7 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 	}
 	v.ActiveTarget = st.ActiveTarget
 	for _, t := range st.Targets {
-		v.Targets = append(v.Targets, TargetView{ID: t.ID, Title: t.Title, URL: t.URL, Active: t.Active})
+		v.Targets = append(v.Targets, TargetView{ID: t.ID, Title: t.Title, URL: t.URL, Active: t.Active, Refused: t.Refused})
 	}
 	if st.Driver == platform.DriverHuman && !ss.handoffAt.IsZero() {
 		v.HandoffSince = ss.handoffAt.UTC().Format(time.RFC3339)

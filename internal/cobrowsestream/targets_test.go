@@ -271,3 +271,63 @@ func TestStreamSurvivesTransientTargetReadErrors(t *testing.T) {
 	sess.set("b", "a", "b")
 	readTargets(t, conn, "b")
 }
+
+// A session whose only page is refused is never attached; the stream holds,
+// shows the page as refused, and attaches when the page becomes allowed.
+func TestStreamDoesNotAttachToARefusedPage(t *testing.T) {
+	a := newFakeChrome()
+	defer a.close()
+	sess := &refusedSession{fakeTargetSession: &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a}}}
+	sess.refused = true
+	ts := newHarness(t, sess, a)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m TargetsMessage
+		if mt == websocket.TextMessage && json.Unmarshal(data, &m) == nil && m.Type == TargetsType {
+			if len(m.Targets) != 1 || !m.Targets[0].Refused || m.Active != "" {
+				t.Fatalf("targets = %+v", m)
+			}
+			break
+		}
+	}
+	time.Sleep(600 * time.Millisecond)
+	a.mu.Lock()
+	n := len(a.conns)
+	a.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("the stream attached to a refused page (%d connections)", n)
+	}
+	// The page navigates to an allowed address: the stream attaches.
+	sess.mu.Lock()
+	sess.refused = false
+	sess.mu.Unlock()
+	readTargets(t, conn, "a")
+	waitConns(t, a, 1)
+}
+
+type refusedSession struct {
+	*fakeTargetSession
+	refused bool
+}
+
+func (s *refusedSession) Targets(id string) (TargetSnapshot, error) {
+	s.mu.Lock()
+	refused := s.refused
+	s.mu.Unlock()
+	if refused {
+		return TargetSnapshot{Targets: []TargetInfo{{ID: "a", URL: "http://private.test/", Refused: true}}}, nil
+	}
+	s.set("a", "a")
+	return s.fakeTargetSession.Targets(id)
+}

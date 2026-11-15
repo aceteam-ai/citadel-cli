@@ -128,7 +128,7 @@ jobs:
           go test ./internal/nodevault/ -count=1 -run '^(TestAtRest|TestSetPassphrase|TestUnlockAtRest|TestChangePassphrase|TestWeakSecret|TestRemoveKeeps|TestNonFinitePolicy|TestSavePolicyRejects)'
 
       - name: Mountable stream handler
-        run: go test ./internal/cobrowsestream/ -count=1 -run '^(TestMounted|TestStreamFollowsPopup|TestStreamSurvives|TestViewerTargetSwitch|TestParseTarget|TestNodeWideManagerSession)'
+        run: go test ./internal/cobrowsestream/ -count=1 -run '^(TestMounted|TestStreamFollowsPopup|TestStreamSurvives|TestStreamDoesNotAttach|TestViewerTargetSwitch|TestParseTarget|TestNodeWideManagerSession)'
 
       - name: citadel local mcp (stdio JSON-RPC)
         run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide|TestNoLocalMCPToolCanApprove|TestLocalCommitPrompts|TestLocalPassphrase|TestLocalProfileStore|TestSecretReader|TestPassphraseWithSpaces|TestLocalStoreDirsArePrivate|TestSignalDuringClose|TestForget)'
@@ -136,7 +136,7 @@ jobs:
       - name: Unit tests (Windows-portable subset)
         run: >-
           go test ./internal/platform/ -count=1 -run
-          '^(TestWindows|TestReconcileTargets|TestTargetSet|TestUnconfiguredTargetSet|TestSetActive|TestManagerPageChoice|TestCloseTargetByID|TestActionRefusedWhenAnother|TestActionsAreSentToThe|TestNodeWideManagerDoesNotTrack|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestThrowawaySession_NoGracefulClose|TestGracefulClose|TestCleanOrphanedProfileSessions|TestPersistentSessionWritesProfileMarker|TestStartSessionWithID|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
+          '^(TestWindows|TestReconcileTargets|TestTargetSet|TestUnconfiguredTargetSet|TestRefusedLastPage|TestActionsRefusedOnRefusedPage|TestSetActive|TestManagerPageChoice|TestCloseTargetByID|TestActionRefusedWhenAnother|TestActionsAreSentToThe|TestNodeWideManagerDoesNotTrack|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestThrowawaySession_NoGracefulClose|TestGracefulClose|TestCleanOrphanedProfileSessions|TestPersistentSessionWritesProfileMarker|TestStartSessionWithID|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
 
       # The shipped binary, end to end: discovery, a hidden test launch, the
       # loopback bind and the audit/owner checks, plus the stdio server's
