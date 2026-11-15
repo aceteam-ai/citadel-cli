@@ -741,3 +741,69 @@ func TestHandoffDuringInputSkipsReadBack(t *testing.T) {
 		})
 	}
 }
+
+// A click is three awaited mouse events. A handoff during one of them stops the
+// rest: no press or release is sent under human control, and the click reports
+// an incomplete, unknown outcome instead of a refusal.
+func TestHandoffMidClickStopsRemainingEvents(t *testing.T) {
+	x, y := 10.0, 10.0
+	for _, tc := range []struct {
+		on   string
+		want int
+	}{{"mouseMoved", 1}, {"mousePressed", 2}} {
+		t.Run(tc.on, func(t *testing.T) {
+			f := startLatencyCDP(t, nil)
+			m, id := newBudgetSession(t, f)
+			var once sync.Once
+			f.mu.Lock()
+			f.onCall = func(method string, params map[string]any) {
+				if method == "Input.dispatchMouseEvent" && params["type"] == tc.on {
+					once.Do(func() { forceHandoff(m, id) })
+				}
+			}
+			f.mu.Unlock()
+			_, err := m.Click(id, "", &x, &y)
+			ae, ok := AsActionIncomplete(err)
+			if !ok {
+				t.Fatalf("err = %v, want *ActionIncompleteError", err)
+			}
+			if errors.Is(err, ErrHandedOff) {
+				t.Fatalf("err wraps ErrHandedOff, which means nothing was sent")
+			}
+			if !ae.Reportable() || !ae.Effects.Dispatched || !ae.Effects.Unknown {
+				t.Fatalf("effects = %+v reportable=%v", ae.Effects, ae.Reportable())
+			}
+			if n := f.count("Input.dispatchMouseEvent"); n != tc.want {
+				t.Fatalf("%d mouse events, want %d (none after the handoff)", n, tc.want)
+			}
+			if n := f.count("Runtime.evaluate"); n != 1 {
+				t.Fatalf("%d evaluations; want only the pre-action probe", n)
+			}
+		})
+	}
+}
+
+// Key sends key-down then key-up; a handoff during the key-down stops the key-up.
+func TestHandoffMidKeyStopsKeyUp(t *testing.T) {
+	f := startLatencyCDP(t, nil)
+	m, id := newBudgetSession(t, f)
+	var once sync.Once
+	f.mu.Lock()
+	f.onCall = func(method string, params map[string]any) {
+		if method == "Input.dispatchKeyEvent" {
+			once.Do(func() { forceHandoff(m, id) })
+		}
+	}
+	f.mu.Unlock()
+	_, err := m.Key(id, "Enter")
+	ae, ok := AsActionIncomplete(err)
+	if !ok || errors.Is(err, ErrHandedOff) {
+		t.Fatalf("err = %v, want *ActionIncompleteError not wrapping ErrHandedOff", err)
+	}
+	if !ae.Effects.Dispatched || !ae.Effects.Unknown {
+		t.Fatalf("effects = %+v", ae.Effects)
+	}
+	if n := f.count("Input.dispatchKeyEvent"); n != 1 {
+		t.Fatalf("%d key events, want 1 (no key-up after the handoff)", n)
+	}
+}

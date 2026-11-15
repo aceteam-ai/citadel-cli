@@ -658,6 +658,10 @@ func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, err
 		if _, err := r.conn.Call("Input.dispatchKeyEvent", params); err != nil {
 			return err
 		}
+		// A human can take control while the key-down is awaited.
+		if err := r.midActionFence(); err != nil {
+			return err
+		}
 		_, err := r.conn.Call("Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk})
 		return err
 	})

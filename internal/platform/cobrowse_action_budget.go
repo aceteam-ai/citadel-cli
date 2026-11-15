@@ -545,6 +545,19 @@ func readBack(ctx context.Context, p pin, run *actionRun, c *cdpConn) (pageProbe
 	return probePage(c), nil
 }
 
+// errDriverLostMidAction is the cause when part of a multi-event input was sent
+// and then the agent lost control, so the rest was not sent. Like
+// errReadBackNoDriver it does not wrap ErrHandedOff, which means nothing was sent.
+var errDriverLostMidAction = errors.New("control left the agent partway through the input; the rest was not sent")
+
+// midActionFence rechecks the live driver between the events of one input.
+func (r *actionRun) midActionFence() error {
+	if err := r.s.driverFence(r.p); err != nil {
+		return fmt.Errorf("%w (%v)", errDriverLostMidAction, err)
+	}
+	return nil
+}
+
 // errReadBackNoDriver is the cause when input was sent but the page could not
 // be read back because the agent no longer drives the session. It deliberately
 // does not wrap ErrHandedOff: that error means nothing was sent.
@@ -558,10 +571,19 @@ func (r *actionRun) clickSequence(x, y float64) error {
 	}); err != nil {
 		return err
 	}
+	// Each event is awaited, so a human can take control between them. The
+	// driver is rechecked before the press and before the release; once the
+	// move went out, a lost driver is an incomplete action, not a refusal.
+	if err := r.midActionFence(); err != nil {
+		return err
+	}
 	r.pressed, r.px, r.py = true, x, y
 	if _, err := r.conn.Call("Input.dispatchMouseEvent", map[string]any{
 		"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1,
 	}); err != nil {
+		return err
+	}
+	if err := r.midActionFence(); err != nil {
 		return err
 	}
 	if _, err := r.conn.Call("Input.dispatchMouseEvent", map[string]any{
