@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -89,6 +90,8 @@ type fakeDevTools struct {
 	pages  []map[string]string
 	closed []string
 	calls  []string // "<page id> <method>"
+	// onCall runs (outside the lock) when a page socket receives a command.
+	onCall func(id, method string)
 	srv    *httptest.Server
 	port   int
 }
@@ -132,7 +135,11 @@ func newFakeDevTools(t *testing.T) *fakeDevTools {
 			}
 			f.mu.Lock()
 			f.calls = append(f.calls, id+" "+msg.Method)
+			hook := f.onCall
 			f.mu.Unlock()
+			if hook != nil {
+				hook(id, msg.Method)
+			}
 			_ = conn.WriteJSON(map[string]any{"id": msg.ID, "result": map[string]any{
 				"result": map[string]any{"value": map[string]any{"x": 10, "y": 10, "url": "http://app.test/", "ready": "complete", "title": "t", "text": id}},
 			}})
@@ -432,6 +439,14 @@ func TestActionsRefusedOnRefusedPageButNavigationRecovers(t *testing.T) {
 			t.Fatalf("a refused page received %q", c)
 		}
 	}
+	withFastRecovery(t)
+	f.mu.Lock()
+	f.onCall = func(page, method string) {
+		if method == "Page.navigate" {
+			f.set([2]string{"a", "about:blank"})
+		}
+	}
+	f.mu.Unlock()
 	if _, err := m.Navigate(st.ID, "about:blank"); err != nil {
 		t.Fatalf("navigating away: %v", err)
 	}
@@ -665,5 +680,101 @@ func TestNodeWideManagerDoesNotTrackPages(t *testing.T) {
 	}
 	if len(f.callsOn("p")) != 0 {
 		t.Fatalf("node-wide action reached the popup: %v", f.callsOn("p"))
+	}
+}
+
+func startRefusedSession(t *testing.T, f *fakeDevTools) (*CobrowseSessionManager, string) {
+	t.Helper()
+	withOpeners(t, map[string]string{})
+	f.set([2]string{"a", "http://app.test/"})
+	installFixedPortLauncher(t, f.port)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	m.EnableTargetTracking(func(_ context.Context, raw string) error {
+		if strings.Contains(raw, "private.test") {
+			return fmt.Errorf("refused")
+		}
+		return nil
+	}, nil)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(st.ID) })
+	return m, st.ID
+}
+
+func withFastRecovery(t *testing.T) {
+	t.Helper()
+	w, p := refusedRecoveryWait, refusedRecoveryPoll
+	refusedRecoveryWait, refusedRecoveryPoll = 300*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { refusedRecoveryWait, refusedRecoveryPoll = w, p })
+}
+
+// Navigating away from a refused page must not read the refused document: when
+// the page stays refused it fails without any evaluation; when it recovers, the
+// allowed page is reported.
+func TestNavigateFromRefusedPageNeverReadsIt(t *testing.T) {
+	withFastRecovery(t)
+	f := newFakeDevTools(t)
+	m, id := startRefusedSession(t, f)
+	f.set([2]string{"a", "http://private.test/secret"})
+
+	st, err := m.Navigate(id, "http://app.test/next")
+	if !errors.Is(err, ErrPageRefused) {
+		t.Fatalf("navigation that stayed refused: %v", err)
+	}
+	if st.URL != "" || st.Title != "" {
+		t.Fatalf("refused page leaked into the result: %+v", st)
+	}
+	for _, c := range f.callsOn("a") {
+		if c != "Page.navigate" {
+			t.Fatalf("a refused page received %q", c)
+		}
+	}
+
+	// Recovery: the navigation lands on an allowed address.
+	f.mu.Lock()
+	f.onCall = func(page, method string) {
+		if method == "Page.navigate" {
+			f.set([2]string{"a", "http://app.test/next"})
+		}
+	}
+	f.mu.Unlock()
+	if _, err := m.Navigate(id, "http://app.test/next"); err != nil {
+		t.Fatalf("recovery: %v", err)
+	}
+	snap, _ := m.Targets(id)
+	if snap.Active != "a" || snap.ActiveWebSocketURL == "" {
+		t.Fatalf("not active after recovery: %+v", snap)
+	}
+}
+
+// The page the checks covered is the page navigated, even from refusal.
+func TestNavigateFromRefusedPageHonorsTheCheckedPage(t *testing.T) {
+	withFastRecovery(t)
+	f := newFakeDevTools(t)
+	m, id := startRefusedSession(t, f)
+	m.ExpectTarget(id, "a") // checked while page a was allowed
+	f.set([2]string{"b", "http://private.test/"})
+	if _, err := m.Navigate(id, "http://app.test/"); !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("navigate of a different refused page: %v", err)
+	}
+	if got := f.callsOn("b"); len(got) != 0 {
+		t.Fatalf("page b received %v", got)
+	}
+}
+
+func TestVerdictCachesAreBounded(t *testing.T) {
+	f := newFakeDevTools(t)
+	ts := newTargetSet()
+	for i := 0; i < maxVerdictOrigins+50; i++ {
+		ts.badOrigins[fmt.Sprintf("http://h%d.test", i)] = originRefusal{at: time.Now(), err: fmt.Errorf("x")}
+	}
+	f.set([2]string{"a", "http://app.test/"})
+	if _, err := ts.sync(context.Background(), f.port); err != nil {
+		t.Fatal(err)
+	}
+	if len(ts.badOrigins) > maxVerdictOrigins {
+		t.Fatalf("refusal cache holds %d entries", len(ts.badOrigins))
 	}
 }

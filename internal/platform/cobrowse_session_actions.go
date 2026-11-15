@@ -239,7 +239,40 @@ func (s *cobrowseSession) pinNavigation() (pin, error) {
 	if !ok {
 		return pin{}, err
 	}
+	// The page the caller's checks covered must be the page we navigate.
+	s.mu.Lock()
+	expect := s.expectTarget
+	s.mu.Unlock()
+	if expect != "" && expect != tg.ID {
+		return pin{}, ErrTargetChanged
+	}
 	return pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: set, refused: true}, nil
+}
+
+// refusedRecoveryWait bounds how long a navigation away from a refused page
+// waits for the policy to admit the new page; variables so tests need not sleep.
+var (
+	refusedRecoveryWait = 8 * time.Second
+	refusedRecoveryPoll = 150 * time.Millisecond
+)
+
+// waitAllowedPage polls the page list (no evaluation) until the policy admits
+// an active page, and returns a pin on it. If the page stays refused it fails
+// with ErrPageRefused without ever reading the page.
+func waitAllowedPage(p pin) (pin, error) {
+	deadline := time.Now().Add(refusedRecoveryWait)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+		snap, err := p.set.sync(ctx, p.port)
+		cancel()
+		if err == nil && snap.Active != "" && snap.ActiveWebSocketURL != "" {
+			return pin{port: p.port, id: snap.Active, ws: snap.ActiveWebSocketURL, set: p.set}, nil
+		}
+		if time.Now().After(deadline) {
+			return pin{}, fmt.Errorf("%w (the navigation did not reach an allowed page)", ErrPageRefused)
+		}
+		time.Sleep(refusedRecoveryPoll)
+	}
 }
 
 // pinAction checks the session is drivable and pins the page the action uses.
@@ -308,6 +341,16 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 	}
 	if _, err := p.cdp("Page.navigate", map[string]any{"url": url}); err != nil {
 		return CobrowseSessionStatus{}, err
+	}
+	if p.refused {
+		// Nothing is read from the refused page. Wait for the browser to report
+		// an allowed page, then report that one; if it stays refused, fail.
+		np, err := waitAllowedPage(p)
+		if err != nil {
+			return CobrowseSessionStatus{}, err
+		}
+		p = np
+		before = ""
 	}
 	// Wait for the navigation (including redirects) to settle, then report
 	// where the page ended up. A slow page returns its current state.

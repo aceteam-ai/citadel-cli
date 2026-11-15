@@ -251,18 +251,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			return failures < maxTargetReadFailures
 		}
 		failures = 0
-		if !s.sendTargets(conn, next, &lastTargets) {
-			return false
-		}
 		if next.ActiveWebSocketURL == "" {
-			// No usable page: detach and hold until there is one.
+			// No usable page: detach BEFORE telling the viewer, so no input can
+			// reach the refused page while the write is in flight.
 			if old := current.Swap(nil); old != nil {
 				old.stopScreencast()
 				old.Close()
 				holder.take()
 			}
 			activeID, cdpDone = next.Active, nil
-			return true
+			return s.sendTargets(conn, next, &lastTargets)
+		}
+		if !s.sendTargets(conn, next, &lastTargets) {
+			return false
 		}
 		if next.Active != activeID || force || current.Load() == nil {
 			nc, err := dialCDPURL(next.ActiveWebSocketURL, onFrame, maxCDPMessageBytes)

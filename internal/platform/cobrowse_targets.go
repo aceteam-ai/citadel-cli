@@ -37,6 +37,7 @@ const (
 	maxCobrowseTargetURLBytes = 2048
 	maxTargetStack            = 16
 	originVerdictTTL          = 30 * time.Second
+	maxVerdictOrigins         = 256
 	targetSyncTimeout         = 15 * time.Second
 )
 
@@ -436,6 +437,17 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 		if now.Sub(at) > originVerdictTTL {
 			delete(t.okOrigins, o)
 		}
+	}
+	for o, bad := range t.badOrigins {
+		if now.Sub(bad.at) > originVerdictTTL {
+			delete(t.badOrigins, o)
+		}
+	}
+	if len(t.badOrigins) > maxVerdictOrigins { // a flood of distinct refused origins
+		t.badOrigins = map[string]originRefusal{}
+	}
+	if len(t.okOrigins) > maxVerdictOrigins {
+		t.okOrigins = map[string]time.Time{}
 	}
 	snap := t.snapshotLocked()
 	t.mu.Unlock()

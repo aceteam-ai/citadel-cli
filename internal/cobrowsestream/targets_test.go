@@ -331,3 +331,55 @@ func (s *refusedSession) Targets(id string) (TargetSnapshot, error) {
 	s.set("a", "a")
 	return s.fakeTargetSession.Targets(id)
 }
+
+// On an allowed-to-refused transition the stream detaches before it tells the
+// viewer, so input sent after the viewer sees the refusal reaches nothing.
+func TestInputAfterRefusalFrameReachesNoPage(t *testing.T) {
+	a := newFakeChrome()
+	defer a.close()
+	sess := &refusedSession{fakeTargetSession: &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a}}}
+	sess.setHumanControl(true)
+	ts := newHarness(t, sess, a)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	readTargets(t, conn, "a")
+	waitConns(t, a, 1)
+	mouse, _ := json.Marshal(InputMessage{Type: InputTypeMouse, Event: "mouseMoved", X: 0.5, Y: 0.5})
+	// Prove input does flow while attached.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(a.mouseEvents()) == 0 && time.Now().Before(deadline) {
+		_ = conn.WriteMessage(websocket.TextMessage, mouse)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(a.mouseEvents()) == 0 {
+		t.Fatal("input never reached the attached page")
+	}
+
+	sess.mu.Lock()
+	sess.refused = true
+	sess.mu.Unlock()
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m TargetsMessage
+		if mt == websocket.TextMessage && json.Unmarshal(data, &m) == nil && m.Type == TargetsType && len(m.Targets) == 1 && m.Targets[0].Refused {
+			break
+		}
+	}
+	before := len(a.mouseEvents())
+	for i := 0; i < 10; i++ {
+		_ = conn.WriteMessage(websocket.TextMessage, mouse)
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if after := len(a.mouseEvents()); after != before {
+		t.Fatalf("%d input events reached the refused page", after-before)
+	}
+}
