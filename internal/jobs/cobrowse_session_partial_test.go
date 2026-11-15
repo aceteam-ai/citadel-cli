@@ -61,9 +61,14 @@ func TestActionFailureKeepsNonReportableErrorsUnchanged(t *testing.T) {
 			t.Errorf("refusal %v changed: %s %v", r, out, err)
 		}
 	}
-	// Input may have been sent but nothing observed and no timeout: not reportable.
-	ae := &platform.ActionIncompleteError{Action: "key", Effects: platform.ActionEffects{Dispatched: true}, Cause: plain}
+	// Nothing dispatched and nothing observed: not reportable.
+	ae := &platform.ActionIncompleteError{Action: "key", Cause: plain}
 	if out, err := actionFailureResult(ae, true); out != nil || err != ae {
 		t.Errorf("unreportable wrapper changed: %s %v", out, err)
+	}
+	// Input may have been sent: reportable even without a timeout.
+	ae = &platform.ActionIncompleteError{Action: "key", Effects: platform.ActionEffects{Dispatched: true, Unknown: true}, Cause: plain}
+	if out, _ := actionFailureResult(ae, true); out == nil {
+		t.Error("a dispatched failure was not reported")
 	}
 }

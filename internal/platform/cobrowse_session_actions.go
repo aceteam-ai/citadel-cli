@@ -226,10 +226,16 @@ func (p pin) Call(method string, params map[string]any) (map[string]any, error) 
 // verify re-reads the pages and refuses when the pinned page is no longer the
 // active one.
 func (p pin) verify() error {
+	return p.verifyCtx(context.Background())
+}
+
+// verifyCtx is verify under the caller's context, so an action's one budget
+// covers it.
+func (p pin) verifyCtx(parent context.Context) error {
 	if p.set == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+	ctx, cancel := context.WithTimeout(parent, targetSyncTimeout)
 	defer cancel()
 	snap, err := p.set.sync(ctx, p.port)
 	if err != nil {
@@ -241,9 +247,11 @@ func (p pin) verify() error {
 	return nil
 }
 
-func pinFor(port int) (pin, error) {
+func pinFor(port int) (pin, error) { return pinForCtx(context.Background(), port) }
+
+func pinForCtx(parent context.Context, port int) (pin, error) {
 	set := targetSetFor(port)
-	ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+	ctx, cancel := context.WithTimeout(parent, targetSyncTimeout)
 	defer cancel()
 	tg, err := set.activeTarget(ctx, port)
 	if err != nil {
@@ -309,6 +317,12 @@ func waitAllowedPage(p pin) (pin, error) {
 // When a caller recorded the page it checked (ExpectTarget), a different active
 // page refuses the action.
 func (s *cobrowseSession) pinAction() (pin, error) {
+	return s.pinActionCtx(context.Background())
+}
+
+// pinActionCtx is pinAction under the caller's context: a budgeted action
+// creates its context first so pinning spends the same budget.
+func (s *cobrowseSession) pinActionCtx(ctx context.Context) (pin, error) {
 	port, err := s.requireDrivablePort()
 	if err != nil {
 		return pin{}, err
@@ -319,7 +333,7 @@ func (s *cobrowseSession) pinAction() (pin, error) {
 	if !tracking {
 		return pin{port: port}, nil
 	}
-	p, err := pinFor(port)
+	p, err := pinForCtx(ctx, port)
 	if err != nil {
 		return pin{}, err
 	}
@@ -385,7 +399,7 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 	// Wait for the navigation (including redirects) to settle, then report
 	// where the page ended up. A slow page returns its current state.
 	ps := settleNavigation(p, before)
-	st := s.statusWithURL(ps.URL)
+	st := s.statusWithURL(context.Background(), ps.URL)
 	if ps.URL != "" {
 		st.URL = ps.URL
 	}
@@ -459,17 +473,22 @@ func (m *CobrowseSessionManager) ScreenshotStatus(id string) (string, CobrowseSe
 	if err != nil {
 		return "", CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	ctx := b.act
+	p, err := s.pinActionCtx(b.op)
 	if err != nil {
 		return "", CobrowseSessionStatus{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), CobrowseActionDeadline)
-	defer cancel()
 	conn, err := openCDPConn(ctx, p)
 	if err != nil {
 		return "", CobrowseSessionStatus{}, err
 	}
 	defer conn.Close()
+	// Final fence: nothing awaited after this precedes the capture.
+	if err := s.fence(ctx, p); err != nil {
+		return "", CobrowseSessionStatus{}, err
+	}
 	// optimizeForSpeed trades PNG size for encode time, which dominates on a
 	// software-rendered display.
 	res, err := conn.Call("Page.captureScreenshot", map[string]any{"format": "png", "optimizeForSpeed": true})
@@ -485,7 +504,7 @@ func (m *CobrowseSessionManager) ScreenshotStatus(id string) (string, CobrowseSe
 	}
 	// Tracked sessions take the URL from the target set (statusWithURL); an
 	// untracked one reads it from the discovery that found the page.
-	return data, s.statusWithURL(conn.target.URL), nil
+	return data, s.statusWithURL(b.op, conn.target.URL), nil
 }
 
 // Click performs a scripted mouse click in one session's browser: either at the
@@ -499,14 +518,16 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	p, err := s.pinActionCtx(b.op)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
 	if selector == "" && (x == nil || y == nil) {
 		return CobrowseSessionStatus{}, fmt.Errorf("click requires a 'selector' or both 'x' and 'y'")
 	}
-	return s.runAction(p, "click", func(r *actionRun) error {
+	return s.runAction(b, p, "click", func(r *actionRun) error {
 		var cx, cy float64
 		if selector != "" {
 			var err error
@@ -518,16 +539,10 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 			cx, cy = *x, *y
 		}
 		// Selector settling awaits page JavaScript, during which a human can
-		// take control or the active page can change. Check the live driver and
-		// the pinned page again before sending any mouse event.
-		currentPort, err := s.requireDrivablePort()
-		if err != nil {
-			return err
-		}
-		if currentPort != p.port {
-			return ErrNotStarted
-		}
-		if err := p.verify(); err != nil {
+		// take control or the active page can change. The final fence checks
+		// the live driver and the pinned page after the last await and before
+		// any mouse event.
+		if err := r.fence(); err != nil {
 			return err
 		}
 		r.eff.Dispatched = true
@@ -547,11 +562,16 @@ func (m *CobrowseSessionManager) Type(id, text string) (CobrowseSessionStatus, e
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	p, err := s.pinActionCtx(b.op)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	return s.runAction(p, "type", func(r *actionRun) error {
+	return s.runAction(b, p, "type", func(r *actionRun) error {
+		if err := r.fence(); err != nil {
+			return err
+		}
 		r.eff.Dispatched = true
 		r.eff.TypedLength, r.eff.TypedUnconfirmed = typedLength(text), true
 		if _, err := r.conn.Call("Input.insertText", map[string]any{"text": text}); err != nil {
@@ -612,7 +632,9 @@ func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, err
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	p, err := s.pinActionCtx(b.op)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
@@ -628,7 +650,10 @@ func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, err
 	if produced != "" {
 		params["text"] = produced
 	}
-	return s.runAction(p, "key", func(r *actionRun) error {
+	return s.runAction(b, p, "key", func(r *actionRun) error {
+		if err := r.fence(); err != nil {
+			return err
+		}
 		r.eff.Dispatched = true
 		if _, err := r.conn.Call("Input.dispatchKeyEvent", params); err != nil {
 			return err
@@ -678,14 +703,16 @@ func (m *CobrowseSessionManager) Scroll(id, selector string, x, y *float64, dx, 
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	p, err := s.pinActionCtx(b.op)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
 	if selector == "" && (x == nil || y == nil) {
 		return CobrowseSessionStatus{}, fmt.Errorf("scroll requires selector or x and y")
 	}
-	return s.runAction(p, "scroll", func(r *actionRun) error {
+	return s.runAction(b, p, "scroll", func(r *actionRun) error {
 		var cx, cy float64
 		if selector != "" {
 			var err error
@@ -695,6 +722,9 @@ func (m *CobrowseSessionManager) Scroll(id, selector string, x, y *float64, dx, 
 			}
 		} else {
 			cx, cy = *x, *y
+		}
+		if err := r.fence(); err != nil {
+			return err
 		}
 		r.eff.Dispatched = true
 		_, err := r.conn.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseWheel", "x": cx, "y": cy, "deltaX": dx, "deltaY": dy})

@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -32,6 +33,10 @@ type latencyCDP struct {
 	// stallFirstProbe delays only the first effect probe.
 	stallFirstProbe time.Duration
 	probes          int
+	// onJSON runs on every /json discovery.
+	onJSON func()
+	// dropOn closes the socket without replying to these methods.
+	dropOn map[string]bool
 	// noScroll keeps an evalDelay'd selector resolution from scrolling.
 	noScroll bool
 
@@ -72,6 +77,12 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
 		f.discoveries.Add(1)
+		f.mu.Lock()
+		hook := f.onJSON
+		f.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		time.Sleep(f.jsonDelay)
 		w.Header().Set("Content-Type", "application/json")
 		f.mu.Lock()
@@ -144,6 +155,9 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 				result = map[string]any{"data": base64.StdEncoding.EncodeToString([]byte("png"))}
 			}
 			time.Sleep(delay)
+			if f.dropOn[msg.Method] {
+				return
+			}
 			_ = conn.WriteJSON(map[string]any{"id": msg.ID, "result": result})
 		}
 	})
@@ -493,5 +507,187 @@ func TestBeforeProbeStallDoesNotConsumeActionBudget(t *testing.T) {
 	}
 	if st.Effects == nil || !st.Effects.Clicked {
 		t.Errorf("effects %+v", st.Effects)
+	}
+}
+
+// forceHandoff marks the session human-driven without any CDP traffic, so it
+// can run from inside a fake endpoint's handler.
+func forceHandoff(m *CobrowseSessionManager, id string) {
+	m.mu.Lock()
+	s := m.sessions[id]
+	m.mu.Unlock()
+	s.mu.Lock()
+	s.explicitHandoff = true
+	s.mu.Unlock()
+}
+
+// handoffDuringProbe hands the session to a human while the pre-action probe is in
+// flight (the probe awaits the page, so this is the slow-await window).
+func handoffDuringProbe(m *CobrowseSessionManager, id string) func(string, map[string]any) {
+	var once sync.Once
+	return func(method string, params map[string]any) {
+		if method != "Runtime.evaluate" {
+			return
+		}
+		if expr, _ := params["expression"].(string); !strings.Contains(expr, "window.scrollX") {
+			return
+		}
+		once.Do(func() { forceHandoff(m, id) })
+	}
+}
+
+func inputOrCapture(f *latencyCDP) int {
+	return f.count("Input.dispatchMouseEvent") + f.count("Input.dispatchKeyEvent") +
+		f.count("Input.insertText") + f.count("Page.captureScreenshot")
+}
+
+func TestHandoffDuringBeforeProbeSendsNothing(t *testing.T) {
+	x, y := 10.0, 10.0
+	actions := map[string]func(m *CobrowseSessionManager, id string) error{
+		"type": func(m *CobrowseSessionManager, id string) error { _, err := m.Type(id, "hi"); return err },
+		"key":  func(m *CobrowseSessionManager, id string) error { _, err := m.Key(id, "Enter"); return err },
+		"scroll": func(m *CobrowseSessionManager, id string) error {
+			_, err := m.Scroll(id, "", &x, &y, 0, 100)
+			return err
+		},
+		"click": func(m *CobrowseSessionManager, id string) error { _, err := m.Click(id, "", &x, &y); return err },
+	}
+	for name, run := range actions {
+		t.Run(name, func(t *testing.T) {
+			f := startLatencyCDP(t, nil)
+			m, id := newBudgetSession(t, f)
+			f.mu.Lock()
+			f.onCall = handoffDuringProbe(m, id)
+			f.mu.Unlock()
+			err := run(m, id)
+			if !errors.Is(err, ErrHandedOff) {
+				t.Fatalf("err = %v, want ErrHandedOff", err)
+			}
+			if n := inputOrCapture(f); n != 0 {
+				t.Fatalf("%d input/capture calls after handoff", n)
+			}
+		})
+	}
+}
+
+func TestHandoffBeforeCaptureSendsNothing(t *testing.T) {
+	f := startLatencyCDP(t, nil)
+	m, id := newBudgetSession(t, f)
+	var once sync.Once
+	f.mu.Lock()
+	// The capture's connection is the last await; hand off on the dial.
+	f.onJSON = func() { once.Do(func() { forceHandoff(m, id) }) }
+	f.mu.Unlock()
+	if _, _, err := m.ScreenshotStatus(id); !errors.Is(err, ErrHandedOff) {
+		t.Fatalf("err = %v, want ErrHandedOff", err)
+	}
+	if n := inputOrCapture(f); n != 0 {
+		t.Fatalf("%d capture calls after handoff", n)
+	}
+}
+
+func TestHandoffDuringFenceSyncSendsNothing(t *testing.T) {
+	f := startLatencyCDP(t, nil)
+	m, id := newTrackedBudgetSession(t, f, func(context.Context, string) error { return nil })
+	x, y := 10.0, 10.0
+	var armed, fired atomic.Bool
+	f.mu.Lock()
+	f.onCall = func(method string, params map[string]any) {
+		if expr, _ := params["expression"].(string); strings.Contains(expr, "window.scrollX") {
+			armed.Store(true)
+		}
+	}
+	f.onJSON = func() {
+		if armed.Load() && fired.CompareAndSwap(false, true) {
+			forceHandoff(m, id)
+		}
+	}
+	f.mu.Unlock()
+	if _, err := m.Click(id, "", &x, &y); !errors.Is(err, ErrHandedOff) {
+		t.Fatalf("err = %v, want ErrHandedOff", err)
+	}
+	if n := inputOrCapture(f); n != 0 {
+		t.Fatalf("%d input calls after handoff", n)
+	}
+}
+
+func TestPopupActiveDuringProbeSendsNothing(t *testing.T) {
+	x, y := 5.0, 5.0
+	actions := map[string]func(m *CobrowseSessionManager, id string) error{
+		"type": func(m *CobrowseSessionManager, id string) error { _, err := m.Type(id, "hi"); return err },
+		"key":  func(m *CobrowseSessionManager, id string) error { _, err := m.Key(id, "Enter"); return err },
+		"scroll": func(m *CobrowseSessionManager, id string) error {
+			_, err := m.Scroll(id, "", &x, &y, 0, 100)
+			return err
+		},
+		"click": func(m *CobrowseSessionManager, id string) error { _, err := m.Click(id, "", &x, &y); return err },
+	}
+	for name, run := range actions {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeDevTools(t)
+			withOpeners(t, map[string]string{"p": "a"})
+			f.set([2]string{"a", "http://app.test/"})
+			var events []string
+			m, id := startTracked(t, f, &events)
+			var once sync.Once
+			f.mu.Lock()
+			f.onCall = func(page, method string) {
+				if method == "Runtime.evaluate" {
+					once.Do(func() { f.set([2]string{"a", "http://app.test/"}, [2]string{"p", "http://login.test/"}) })
+				}
+			}
+			f.mu.Unlock()
+			if err := run(m, id); !errors.Is(err, ErrTargetChanged) {
+				t.Fatalf("err = %v, want ErrTargetChanged", err)
+			}
+			for _, pg := range []string{"a", "p"} {
+				for _, c := range f.callsOn(pg) {
+					if strings.HasPrefix(c, "Input.") || c == "Page.captureScreenshot" {
+						t.Fatalf("%s reached page %s: %v", c, pg, f.callsOn(pg))
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestTrackedActionStaysWithinOneBudget(t *testing.T) {
+	shortBudget(t, 100*time.Millisecond, 50*time.Millisecond)
+	f := startLatencyCDP(t, nil)
+	m, id := newTrackedBudgetSession(t, f, func(context.Context, string) error { return nil })
+	f.mu.Lock()
+	f.jsonDelay = 500 * time.Millisecond
+	f.mu.Unlock()
+	x, y := 10.0, 10.0
+	start := time.Now()
+	_, _ = m.Click(id, "", &x, &y)
+	if d := time.Since(start); d > 150*time.Millisecond+100*time.Millisecond {
+		t.Fatalf("click took %v with a 150ms combined budget", d)
+	}
+	if n := f.count("Input.dispatchMouseEvent"); n != 0 {
+		t.Fatalf("%d mouse events with discovery out of budget", n)
+	}
+}
+
+func TestDispatchedThenTransportErrorIsReportableAndUnknown(t *testing.T) {
+	x, y := 10.0, 10.0
+	for name, method := range map[string]string{"key": "Input.dispatchKeyEvent", "scroll": "Input.dispatchMouseEvent"} {
+		t.Run(name, func(t *testing.T) {
+			f := startLatencyCDP(t, func(f *latencyCDP) { f.dropOn = map[string]bool{method: true} })
+			m, id := newBudgetSession(t, f)
+			var err error
+			if name == "key" {
+				_, err = m.Key(id, "Enter")
+			} else {
+				_, err = m.Scroll(id, "", &x, &y, 0, 100)
+			}
+			ae, ok := AsActionIncomplete(err)
+			if !ok {
+				t.Fatalf("err = %v, want *ActionIncompleteError", err)
+			}
+			if !ae.Reportable() || !ae.Effects.Dispatched || !ae.Effects.Unknown {
+				t.Fatalf("effects = %+v reportable=%v", ae.Effects, ae.Reportable())
+			}
+		})
 	}
 }

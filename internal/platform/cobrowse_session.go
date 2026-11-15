@@ -646,6 +646,12 @@ func (s *cobrowseSession) teardown() error {
 // to every session status in the list). st is a local, unshared struct, so filling in
 // its URL after unlocking is race-free.
 func (s *cobrowseSession) status() CobrowseSessionStatus {
+	return s.statusCtx(context.Background())
+}
+
+// statusCtx is status under the caller's context, so an action's one budget
+// covers its read-back.
+func (s *cobrowseSession) statusCtx(parent context.Context) CobrowseSessionStatus {
 	st, probePort := s.statusBase()
 	if probePort == 0 {
 		return st
@@ -654,7 +660,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 	tracking := s.tracking
 	s.mu.Unlock()
 	if tracking {
-		ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+		ctx, cancel := context.WithTimeout(parent, targetSyncTimeout)
 		snap, err := targetSetFor(probePort).sync(ctx, probePort)
 		cancel()
 		if err == nil {
@@ -671,7 +677,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 		}
 		return st
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cobrowseStatusProbeTimeout)
+	ctx, cancel := context.WithTimeout(parent, cobrowseStatusProbeTimeout)
 	t, err := pickTargetContext(ctx, probePort)
 	cancel()
 	if err != nil {

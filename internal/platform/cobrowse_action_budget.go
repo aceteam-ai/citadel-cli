@@ -137,7 +137,7 @@ func (e *ActionIncompleteError) Unwrap() error { return e.Cause }
 // result: the page may have changed, or the deadline passed with the outcome
 // unknown. A failure that changed nothing stays a plain error.
 func (e *ActionIncompleteError) Reportable() bool {
-	return e.Effects.anyEffect() || (e.TimedOut && e.Effects.Dispatched)
+	return e.Effects.anyEffect() || e.Effects.Dispatched
 }
 
 // isActionRefusal reports whether err is a refusal that must reach the caller
@@ -341,6 +341,9 @@ func applyProbe(eff *ActionEffects, before, after pageProbe) {
 
 // actionRun is the handle an action body uses.
 type actionRun struct {
+	s      *cobrowseSession
+	p      pin
+	ctx    context.Context
 	conn   *cdpConn
 	eff    *ActionEffects
 	before pageProbe
@@ -354,26 +357,75 @@ type actionRun struct {
 // action's own budget; on timeout the action proceeds with effects unknown.
 var beforeProbeLimit = 1500 * time.Millisecond
 
-// pageActive reports whether, with page tracking, the pinned page is still the
-// active, policy-approved one. It lists pages (no evaluation), and it also lets
-// the target set close or refuse a page that navigated somewhere refused, so a
-// probe never evaluates in a page that has not passed policy. Without tracking
-// there is no policy and the page is trusted as before.
-func pageActive(ctx context.Context, p pin) bool {
-	if p.set == nil {
-		return true
-	}
-	snap, err := p.set.sync(ctx, p.port)
-	return err == nil && snap.Active != "" && snap.Active == p.id
+// actionBudget is one action's whole time allowance, created before the page is
+// pinned so pinning, verification, target syncs, probes and the status read-back
+// all spend the same budget. op covers the action plus the report reserve; act
+// is the acting part and ends CobrowseActionDeadline after op began.
+type actionBudget struct {
+	op, act context.Context
 }
 
-// runAction runs body over one connection under CobrowseActionDeadline and
-// returns the session status with Effects and Done set. On deadline or failure
-// it returns *ActionIncompleteError when the page is known or likely to have
-// changed; any other failure, and every refusal, is returned unchanged.
-func (s *cobrowseSession) runAction(p pin, action string, body func(*actionRun) error) (CobrowseSessionStatus, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), CobrowseActionDeadline)
-	defer cancel()
+func newActionBudget() (actionBudget, context.CancelFunc) {
+	op, cancelOp := context.WithTimeout(context.Background(), CobrowseActionDeadline+cobrowseReportReserve)
+	act, cancelAct := context.WithTimeout(op, CobrowseActionDeadline)
+	return actionBudget{op: op, act: act}, func() { cancelAct(); cancelOp() }
+}
+
+// pageActiveErr reports nil only when, with page tracking, the pinned page is
+// still the active, policy-approved one. It lists pages (no evaluation), and it
+// also lets the target set close or refuse a page that navigated somewhere
+// refused, so nothing evaluates in a page that has not passed policy. Without
+// tracking there is no policy and the page is trusted as before. A page that is
+// not the active one refuses with ErrTargetChanged, or ErrPageRefused when no
+// page is admitted.
+func pageActiveErr(ctx context.Context, p pin) error {
+	if p.set == nil {
+		return nil
+	}
+	snap, err := p.set.sync(ctx, p.port)
+	if err != nil {
+		return err
+	}
+	if snap.Active == "" {
+		return ErrPageRefused
+	}
+	if snap.Active != p.id {
+		return ErrTargetChanged
+	}
+	return nil
+}
+
+func pageActive(ctx context.Context, p pin) bool { return pageActiveErr(ctx, p) == nil }
+
+// fence is the final check before the first input event or capture: the live
+// process is still running and not handed to a human, and the pinned page is
+// still the active, admitted one. It must come after the last awaited
+// preparation, so nothing slow sits between it and the dispatch.
+func (s *cobrowseSession) fence(ctx context.Context, p pin) error {
+	// The page check awaits discovery, so it runs first; the driver check is
+	// instant and sits last, immediately before the dispatch.
+	if err := pageActiveErr(ctx, p); err != nil {
+		return err
+	}
+	port, err := s.requireDrivablePort()
+	if err != nil {
+		return err
+	}
+	if port != p.port {
+		return ErrNotStarted
+	}
+	return nil
+}
+
+func (r *actionRun) fence() error { return r.s.fence(r.ctx, r.p) }
+
+// runAction runs body over one connection under the action budget and returns
+// the session status with Effects and Done set. On deadline or failure it
+// returns *ActionIncompleteError when the page is known or likely to have
+// changed, or input may have been dispatched; any other failure, and every
+// refusal, is returned unchanged.
+func (s *cobrowseSession) runAction(a actionBudget, p pin, action string, body func(*actionRun) error) (CobrowseSessionStatus, error) {
+	ctx := a.act
 	conn, err := openCDPConn(ctx, p)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
@@ -381,29 +433,31 @@ func (s *cobrowseSession) runAction(p pin, action string, body func(*actionRun) 
 	defer func() { conn.Close() }()
 
 	eff := ActionEffects{}
-	run := &actionRun{conn: conn, eff: &eff}
-	if pageActive(ctx, p) {
-		conn.readCap = beforeProbeLimit
-		run.before = probePage(conn)
-		conn.readCap = 0
-		if !run.before.probeValid && conn.failed {
-			// The poisoned socket is replaced; the action proceeds with the
-			// before-state unknown.
-			conn.Close()
-			nc, err := openCDPConn(ctx, p)
-			if err != nil {
-				return CobrowseSessionStatus{}, err
-			}
-			conn, run.conn = nc, nc
+	run := &actionRun{s: s, p: p, ctx: ctx, conn: conn, eff: &eff}
+	// A page that is not the active, admitted one gets no probe and no action.
+	if err := pageActiveErr(ctx, p); err != nil {
+		return CobrowseSessionStatus{}, err
+	}
+	conn.readCap = beforeProbeLimit
+	run.before = probePage(conn)
+	conn.readCap = 0
+	if !run.before.probeValid && conn.failed {
+		// The poisoned socket is replaced; the action proceeds with the
+		// before-state unknown.
+		conn.Close()
+		nc, err := openCDPConn(ctx, p)
+		if err != nil {
+			return CobrowseSessionStatus{}, err
 		}
+		conn, run.conn = nc, nc
 	}
 	bodyErr := body(run)
 
 	if bodyErr == nil {
-		after := readBack(ctx, p, run, conn)
+		after := readBack(a.op, p, run, conn)
 		applyProbe(&eff, run.before, after)
 		eff.Unknown = !after.probeValid
-		st := s.statusWithURL(after.url, conn.target.URL)
+		st := s.statusWithURL(a.op, after.url, conn.target.URL)
 		done := true
 		st.Done, st.Effects = &done, &eff
 		return st, nil
@@ -413,22 +467,26 @@ func (s *cobrowseSession) runAction(p pin, action string, body func(*actionRun) 
 	}
 
 	timedOut := ctx.Err() != nil || isTimeoutErr(bodyErr)
-	// Read back what happened on a fresh, short connection: the action's own
-	// context may be spent and its socket closed.
-	rctx, rcancel := context.WithTimeout(context.Background(), cobrowseReportReserve)
-	defer rcancel()
+	// Read back what happened on a fresh connection: the action's own context
+	// may be spent and its socket closed. It spends the report reserve of the
+	// same budget.
 	var after pageProbe
-	if rc, rerr := openCDPConn(rctx, p); rerr == nil {
-		after = readBack(rctx, p, run, rc)
+	if rc, rerr := openCDPConn(a.op, p); rerr == nil {
+		after = readBack(a.op, p, run, rc)
 		rc.Close()
 	}
 	applyProbe(&eff, run.before, after)
 	eff.Unknown = !after.probeValid
+	if eff.Dispatched {
+		// Whatever the error was, the input may have landed: the effects are
+		// not known, and the caller must not repeat the action blindly.
+		eff.Unknown = true
+	}
 	ae := &ActionIncompleteError{Action: action, TimedOut: timedOut, Effects: eff, Cause: bodyErr}
 	if !ae.Reportable() {
 		return CobrowseSessionStatus{}, bodyErr
 	}
-	st := s.statusWithURL(after.url, "")
+	st := s.statusWithURL(a.op, after.url, "")
 	done := false
 	st.Done, st.Effects = &done, &eff
 	ae.Status = st
@@ -485,12 +543,12 @@ func (r *actionRun) clickSequence(x, y float64) error {
 
 // statusWithURL is status() without the discovery probe: the caller already
 // read the URL over its own connection.
-func (s *cobrowseSession) statusWithURL(urls ...string) CobrowseSessionStatus {
+func (s *cobrowseSession) statusWithURL(ctx context.Context, urls ...string) CobrowseSessionStatus {
 	if s.tracking {
 		// With page tracking the URL and the open pages come from the target
 		// set, which has applied the page policy; a URL read from a page
 		// directly has not been, so it is never reported or cached.
-		return s.status()
+		return s.statusCtx(ctx)
 	}
 	st := s.statusNoProbe()
 	for _, u := range urls {

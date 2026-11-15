@@ -20,9 +20,13 @@ func TestPartialActionResult(t *testing.T) {
 	if _, ok := partialActionResult(errors.New("boom")); ok {
 		t.Error("plain error treated as partial")
 	}
-	// Dispatched alone, without a timeout, is not reportable.
-	if _, ok := partialActionResult(incomplete(false, platform.ActionEffects{Dispatched: true})); ok {
-		t.Error("an unconfirmed dispatch without timeout treated as partial")
+	// Once input may have been dispatched, any error is reportable.
+	if res, ok := partialActionResult(incomplete(false, platform.ActionEffects{Dispatched: true, Unknown: true})); !ok || !res.Dispatched {
+		t.Error("a dispatched action with a non-timeout error was not reported")
+	}
+	// A refusal before dispatch stays plain.
+	if _, ok := partialActionResult(incomplete(false, platform.ActionEffects{})); ok {
+		t.Error("an undispatched failure treated as partial")
 	}
 }
 
