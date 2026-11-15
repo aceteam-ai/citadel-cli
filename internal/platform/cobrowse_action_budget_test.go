@@ -224,6 +224,26 @@ func shortBudget(t *testing.T, action, report time.Duration) {
 	t.Cleanup(func() { CobrowseActionDeadline, cobrowseReportReserve = pa, pr })
 }
 
+func TestScreenshotDiscardsHandoffDuringCapture(t *testing.T) {
+	f := startLatencyCDP(t, nil)
+	m, id := newBudgetSession(t, f)
+	d0, w0 := f.discoveries.Load(), f.dials.Load()
+	f.mu.Lock()
+	f.onCall = func(method string, _ map[string]any) {
+		if method == "Page.captureScreenshot" {
+			forceHandoff(m, id)
+		}
+	}
+	f.mu.Unlock()
+	image, _, err := m.ScreenshotStatus(id)
+	if !errors.Is(err, ErrHandedOff) || image != "" {
+		t.Fatalf("capture after handoff leaked image=%q, err=%v", image, err)
+	}
+	if f.discoveries.Load()-d0 != 1 || f.dials.Load()-w0 != 1 {
+		t.Fatal("legacy screenshot must still use one discovery and connection")
+	}
+}
+
 // TestActionLatencyProfile prints discoveries, dials and wall time per action
 // under fixed fake latencies (40ms discovery, 25ms dial, 5ms per call), and
 // pins the new ceilings: at most one discovery and one dial per action.

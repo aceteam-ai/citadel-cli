@@ -116,6 +116,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	fsess, hasFileAttach := s.session.(FileAttachSession)
 	var attachBusy atomic.Bool
 	tsess, hasTargets := s.session.(TargetSession)
+	if mode, ok := s.session.(interface{ TracksTargets(string) bool }); ok {
+		hasTargets = hasTargets && mode.TracksTargets(id)
+	}
 	var snap TargetSnapshot
 	var cdp *cdpClient
 	if hasTargets {

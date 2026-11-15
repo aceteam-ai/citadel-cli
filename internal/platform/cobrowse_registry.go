@@ -118,6 +118,7 @@ type sessionRecord struct {
 	ScopeUser    bool   `json:"scope_user,omitempty"`
 	OwnerUID     *int   `json:"owner_uid,omitempty"`
 	Handoff      bool   `json:"handoff,omitempty"`
+	Tracking     bool   `json:"tracking,omitempty"`
 
 	// State is live, suspended or expired. Generation increases on every
 	// re-adopt or ownership change so a later owner can order its claims.
@@ -359,6 +360,7 @@ func (s *cobrowseSession) persistRecord() {
 		XvfbScope:    proc.xvfbScope,
 		ScopeUser:    proc.scopeUser,
 		Handoff:      s.explicitHandoff,
+		Tracking:     s.tracking,
 		State:        RecordLive,
 		Generation:   s.generation,
 		PendingEnd:   s.pendingEnd,
@@ -632,7 +634,12 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			proc:            adoptedProc(rec),
 			explicitHandoff: rec.Handoff,
 			generation:      rec.Generation + 1,
-			tracking:        m.TargetsEnabled(),
+			tracking:        rec.Tracking,
+			policy:          m.targetPolicy,
+		}
+		if s.tracking {
+			dropTargetSet(rec.DebugPort)
+			targetSetFor(rec.DebugPort).configure(s.id, s.policy, m.targetEvent)
 		}
 		if t, err := time.Parse(time.RFC3339, rec.StartedAt); err == nil {
 			s.startedAt = t

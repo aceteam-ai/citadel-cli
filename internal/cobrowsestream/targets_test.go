@@ -233,14 +233,14 @@ func TestStreamSurvivesPopupClosingItself(t *testing.T) {
 }
 
 // Only a manager that tracks pages (local mode) offers page frames and
-// switching; the node-wide manager streams the first page as before.
-func TestNodeWideManagerSessionIsNotATargetSession(t *testing.T) {
+// switching; recovered legacy sessions still stream the first page.
+func TestNodeWideManagerSessionTracksNewRemotePages(t *testing.T) {
 	plain := NewManagerSessionFrom(platform.NewCobrowseSessionManager(t.TempDir(), 1))
 	if _, ok := plain.(TargetSession); ok {
 		t.Fatal("a manager without page tracking offers target frames")
 	}
-	if _, ok := NewManagerSession().(TargetSession); ok {
-		t.Fatal("the node-wide session offers target frames")
+	if _, ok := NewManagerSession().(TargetSession); !ok {
+		t.Fatal("the node-wide adapter must offer targets for new sessions")
 	}
 	tracked := platform.NewCobrowseSessionManager(t.TempDir(), 1)
 	tracked.EnableTargetTracking(nil, nil)
@@ -381,5 +381,35 @@ func TestInputAfterRefusalFrameReachesNoPage(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if after := len(a.mouseEvents()); after != before {
 		t.Fatalf("%d input events reached the refused page", after-before)
+	}
+}
+
+type legacyModeTargetSession struct{ *fakeTargetSession }
+
+func (legacyModeTargetSession) TracksTargets(string) bool { return false }
+
+func TestNodeWideManagerSessionHonorsPerSessionLegacyMode(t *testing.T) {
+	f := newFakeChrome()
+	defer f.close()
+	sess := legacyModeTargetSession{&fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true}, pages: map[string]*fakeChrome{"a": f}, open: []string{"a"}, active: "a"}}
+	server := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, server, "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		kind, raw, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kind == websocket.BinaryMessage {
+			return
+		}
+		var msg map[string]any
+		if json.Unmarshal(raw, &msg) == nil && msg["type"] == "targets" {
+			t.Fatal("legacy session gained target frames")
+		}
 	}
 }

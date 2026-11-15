@@ -141,7 +141,8 @@ func newFakeDevTools(t *testing.T) *fakeDevTools {
 				hook(id, msg.Method)
 			}
 			_ = conn.WriteJSON(map[string]any{"id": msg.ID, "result": map[string]any{
-				"result": map[string]any{"value": map[string]any{"x": 10, "y": 10, "url": "http://app.test/", "ready": "complete", "title": "t", "text": id}},
+				"data":   "aW1hZ2U=",
+				"result": map[string]any{"value": map[string]any{"x": 10, "y": 10, "url": "http://app.test/", "ready": "complete", "title": "t", "text": id, "value": "v", "label": "V"}},
 			}})
 		}
 	})
