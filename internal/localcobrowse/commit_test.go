@@ -173,7 +173,7 @@ func TestRegistrableDomain(t *testing.T) {
 func sendTarget() *platform.TargetInfo {
 	t := el(func(t *platform.TargetInfo) {
 		t.Tag, t.InputType, t.Name, t.Actionable, t.InForm, t.FormMethod = "button", "submit", "Send", true, true, "post"
-		t.FormAction, t.Content = "http://a.test/send", "msg=hello"
+		t.FormAction, t.ContentHash = "http://a.test/send", "hash-hello"
 	})
 	return &t
 }
@@ -245,7 +245,7 @@ func TestCommitAlwaysAsksDespiteGrantAndDenyBlocks(t *testing.T) {
 		t.Fatal("a denied action ran")
 	}
 	// Enter in a form field is a commit too.
-	fb.target = &platform.TargetInfo{Resolved: true, Tag: "input", InputType: "text", Entry: true, InForm: true, FormMethod: "post", Content: "q=1"}
+	fb.target = &platform.TargetInfo{Resolved: true, Tag: "input", InputType: "text", Entry: true, InForm: true, FormMethod: "post", ContentHash: "hash-q1"}
 	if _, err := svc.Key(ctx, id, "Enter", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
 		t.Fatalf("Enter in a form must prompt: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestApproveDoesNotRunIfThePageChanged(t *testing.T) {
 	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
 	c := pendingView(t, svc, id)
 	changed := *sendTarget()
-	changed.Content = "msg=something else entirely"
+	changed.ContentHash = "hash-other"
 	fb.target = &changed
 	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
 		t.Fatal(err)
@@ -801,7 +801,8 @@ func TestComposerTextNeverInCardOrAudit(t *testing.T) {
 	const secret = "SECRET-COMPOSER-TEXT-4711"
 	svc, fb, events, id := startGranted(t, nil)
 	tg := sendTarget()
-	tg.Content = "msg=" + secret
+	tg.ContentHash = "digest-only"
+	_ = secret
 	fb.target = tg
 	_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
 	cv := pendingView(t, svc, id)
@@ -809,4 +810,203 @@ func TestComposerTextNeverInCardOrAudit(t *testing.T) {
 	if out := fmt.Sprintf("%+v %+v", svc.Sessions(id), *events); strings.Contains(out, secret) {
 		t.Fatalf("composer text leaked: %s", out)
 	}
+}
+
+// An approval binds the complete target, query and fragment included: changing
+// only the item a link, the recipient a form or the account a page carries in its
+// query must not run under the earlier approval.
+func TestApprovalBindsFullTargetQuery(t *testing.T) {
+	cases := map[string]struct{ first, second func(*platform.TargetInfo) }{
+		"link item": {
+			func(t *platform.TargetInfo) {
+				t.Tag, t.Name, t.Href, t.Actionable = "a", "Delete", "http://a.test/del?id=first", true
+			},
+			func(t *platform.TargetInfo) {
+				t.Tag, t.Name, t.Href, t.Actionable = "a", "Delete", "http://a.test/del?id=second", true
+			},
+		},
+		"link fragment": {
+			func(t *platform.TargetInfo) {
+				t.Tag, t.Name, t.Href, t.Actionable = "a", "Delete", "http://a.test/del?id=1#a", true
+			},
+			func(t *platform.TargetInfo) {
+				t.Tag, t.Name, t.Href, t.Actionable = "a", "Delete", "http://a.test/del?id=1#b", true
+			},
+		},
+		"form recipient": {
+			func(t *platform.TargetInfo) {
+				t.Tag, t.InputType, t.Name, t.Actionable, t.InForm, t.FormMethod = "button", "submit", "Send", true, true, "post"
+				t.FormAction = "http://a.test/send?to=alice"
+			},
+			func(t *platform.TargetInfo) {
+				t.Tag, t.InputType, t.Name, t.Actionable, t.InForm, t.FormMethod = "button", "submit", "Send", true, true, "post"
+				t.FormAction = "http://a.test/send?to=mallory"
+			},
+		},
+		"page account": {
+			func(t *platform.TargetInfo) {
+				t.Tag, t.InputType, t.Name, t.Actionable, t.InForm = "button", "submit", "Send", true, true
+				t.PageURL = "http://a.test/form?account=personal"
+			},
+			func(t *platform.TargetInfo) {
+				t.Tag, t.InputType, t.Name, t.Actionable, t.InForm = "button", "submit", "Send", true, true
+				t.PageURL = "http://a.test/form?account=work"
+			},
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc, fb, events, id := startGranted(t, nil)
+			t1, t2 := el(c.first), el(c.second)
+			fb.target = &t1
+			if _, err := svc.Click(ctx, id, "#go", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+				t.Fatalf("must ask: %v", err)
+			}
+			cv := pendingView(t, svc, id)
+			fb.target = &t2 // only the query or fragment differs
+			if err := svc.ApproveCommit(ctx, id, cv.ID); err != nil {
+				t.Fatal(err)
+			}
+			if clicks(fb) != 0 {
+				t.Fatal("the changed target ran under the earlier approval")
+			}
+			if r := svc.Sessions(id)[0].CommitResult; r == nil || r.State != "changed" {
+				t.Fatalf("must resolve as changed: %+v", r)
+			}
+			// Raw query and fragment values never reach cards, results or the audit text.
+			out := fmt.Sprintf("%+v %+v", svc.Sessions(id), *events)
+			for _, leak := range []string{"first", "second", "mallory", "alice", "personal", "work", "#a", "#b"} {
+				if strings.Contains(out, leak) {
+					t.Fatalf("%q leaked into state or audit events: %s", leak, out)
+				}
+			}
+		})
+	}
+}
+
+// A target whose content was too large to hash is a commit that can never be
+// redeemed, even if the page is unchanged.
+func TestOversizedTargetIsNeverRedeemable(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	big := *sendTarget()
+	big.ContentHash, big.Oversized = "", true
+	fb.target = &big
+	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatalf("must ask: %v", err)
+	}
+	cv := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, cv.ID); !errors.Is(err, ErrTargetTooLarge) {
+		t.Fatalf("approving an unverifiable target: %v", err)
+	}
+	if clicks(fb) != 0 {
+		t.Fatal("an oversized target ran")
+	}
+	if r := svc.Sessions(id)[0].CommitResult; r == nil || r.State != "failed" {
+		t.Fatalf("result: %+v", r)
+	}
+	if d := Classify("click", "", big); d.Class != ClassCommit {
+		t.Fatalf("oversized must classify as commit: %v", d)
+	}
+}
+
+// The fingerprint follows the content digest the page computed.
+func TestFingerprintFollowsContentDigest(t *testing.T) {
+	a := actionRef{Kind: "click", Selector: "#send"}
+	t1 := *sendTarget()
+	t2 := t1
+	t2.ContentHash = "different-digest"
+	if fingerprint(a, t1) == fingerprint(a, t2) {
+		t.Fatal("a different content digest must change the fingerprint")
+	}
+	t3 := t1
+	t3.Oversized = true
+	if fingerprint(a, t1) == fingerprint(a, t3) {
+		t.Fatal("oversized must change the fingerprint")
+	}
+}
+
+// An approval is never redeemed against a target that was not verified: a
+// request made from an unreadable or unresolved target is unredeemable, and a
+// re-probe that fails at approval time refuses even if nothing else changed.
+func TestApprovalNeverRedeemedAgainstUnverifiedTarget(t *testing.T) {
+	failing := func() error { return errors.New("inspection transport failed") }
+	check := func(t *testing.T, svc *Service, fb *fakeBrowser, id string, events *[]Event) {
+		t.Helper()
+		cv := pendingView(t, svc, id)
+		err := svc.ApproveCommit(ctx, id, cv.ID)
+		if !errors.Is(err, ErrTargetUnverifiable) {
+			t.Fatalf("approve: %v", err)
+		}
+		if clicks(fb) != 0 {
+			t.Fatal("an action ran against an unverified target")
+		}
+		r := svc.Sessions(id)[0].CommitResult
+		if r == nil || r.State != "failed" || !strings.Contains(r.Detail, "do it yourself") {
+			t.Fatalf("the card needs a clear outcome: %+v", r)
+		}
+		var logged bool
+		for _, e := range *events {
+			if e.Action == "approve_commit" && e.Outcome == "refused" && strings.Contains(e.Error, "target_unverifiable") {
+				logged = true
+			}
+		}
+		if !logged {
+			t.Fatal("the refusal must be audited")
+		}
+	}
+	t.Run("inspection errors on request and on approval", func(t *testing.T) {
+		svc, fb, events, id := startGranted(t, nil)
+		fb.inspectErr = failing
+		if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+			t.Fatalf("must ask: %v", err)
+		}
+		if cv := pendingView(t, svc, id); !cv.Unverifiable {
+			t.Fatal("the card must say it cannot be verified")
+		}
+		check(t, svc, fb, id, events)
+	})
+	t.Run("unresolved target on request and on approval", func(t *testing.T) {
+		svc, fb, events, id := startGranted(t, nil)
+		fb.target = &platform.TargetInfo{Resolved: false, Reason: "target is inside iframe"}
+		if _, err := svc.Click(ctx, id, "", fptr(5), fptr(5), "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+			t.Fatalf("must ask: %v", err)
+		}
+		check(t, svc, fb, id, events)
+	})
+	t.Run("probe fine on request, fails on approval", func(t *testing.T) {
+		svc, fb, events, id := startGranted(t, nil)
+		fb.target = sendTarget()
+		_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
+		if cv := pendingView(t, svc, id); cv.Unverifiable {
+			t.Fatal("a verified target is redeemable")
+		}
+		fb.inspectErr = failing
+		check(t, svc, fb, id, events)
+	})
+	t.Run("probe fine on request, unresolved on approval", func(t *testing.T) {
+		svc, fb, events, id := startGranted(t, nil)
+		fb.target = sendTarget()
+		_, _ = svc.Click(ctx, id, "#send", nil, nil, "g")
+		fb.target = &platform.TargetInfo{Resolved: false, Reason: "gone"}
+		cv := pendingView(t, svc, id)
+		// An unresolved re-probe cannot match the verified fingerprint, and is
+		// refused as unverifiable rather than reported as a page change.
+		if err := svc.ApproveCommit(ctx, id, cv.ID); !errors.Is(err, ErrTargetUnverifiable) || clicks(fb) != 0 {
+			t.Fatalf("%v clicks=%d", err, clicks(fb))
+		}
+		_ = events
+	})
+	t.Run("navigate approvals are unaffected", func(t *testing.T) {
+		svc, fb, _, id := startGranted(t, nil)
+		fb.inspectErr = failing // navigate never probes
+		if _, err := svc.Navigate(ctx, id, "http://a.test/logout", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+			t.Fatal(err)
+		}
+		if err := svc.ApproveCommit(ctx, id, pendingView(t, svc, id).ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := fb.calls[len(fb.calls)-1]; got != "navigate http://a.test/logout" {
+			t.Fatalf("navigate must run: %v", fb.calls)
+		}
+	})
 }

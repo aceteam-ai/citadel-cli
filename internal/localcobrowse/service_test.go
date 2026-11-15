@@ -38,6 +38,8 @@ type fakeBrowser struct {
 	// InspectTarget call.
 	onClick   func()
 	onInspect func()
+	// inspectErr, when set and returning an error, fails InspectTarget.
+	inspectErr func() error
 }
 
 type fakeSession struct {
@@ -45,6 +47,7 @@ type fakeSession struct {
 	human   bool
 	exited  bool
 	profile platform.SessionProfile
+	targets []platform.CobrowseTarget
 }
 
 func newFakeBrowser() *fakeBrowser { return &fakeBrowser{sessions: map[string]*fakeSession{}} }
@@ -59,6 +62,12 @@ func (f *fakeBrowser) statusLocked(id string) platform.CobrowseSessionStatus {
 	}
 	if s.exited {
 		st.State = platform.SessionExited
+	}
+	for _, t := range s.targets {
+		st.Targets = append(st.Targets, t)
+		if t.Active {
+			st.ActiveTarget = t.ID
+		}
 	}
 	return st
 }
@@ -208,6 +217,11 @@ func (f *fakeBrowser) PageState(id string) (platform.PageState, error) {
 func (f *fakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
 	if f.onInspect != nil {
 		f.onInspect()
+	}
+	if f.inspectErr != nil {
+		if err := f.inspectErr(); err != nil {
+			return platform.TargetInfo{}, err
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -377,6 +377,57 @@ func TestWindowsRealBrowserSession(t *testing.T) {
 	}
 }
 
+// TestWindowsRealBrowserActionLatency asserts status, screenshot, click and
+// type finish inside a budget far below the platform's 15s job wait, with their
+// effects reported (citadel-cli#1663). The name matches the existing
+// ^TestWindowsRealBrowser run list.
+func TestWindowsRealBrowserActionLatency(t *testing.T) {
+	requireBrowserIT(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>latency</title><div style="height:3000px">tall</div><textarea id="t" rows="3"></textarea>`)
+	}))
+	t.Cleanup(srv.Close)
+	m := newCobrowseSessionManager(filepath.Join(t.TempDir(), "cobrowse-sessions"), 2)
+	st, err := m.StartSession(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.StopAll() })
+	const budget = 5 * time.Second
+	within := func(name string, f func() error) {
+		t.Helper()
+		start := time.Now()
+		if err := f(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if el := time.Since(start); el > budget {
+			t.Errorf("%s took %s, budget %s", name, el, budget)
+		}
+	}
+	within("status", func() error {
+		if got, ok := m.SessionStatus(st.ID); !ok || got.URL == "" {
+			return fmt.Errorf("no url in status: %+v", got)
+		}
+		return nil
+	})
+	within("screenshot", func() error { _, _, err := m.ScreenshotStatus(st.ID); return err })
+	within("click", func() error {
+		got, err := m.Click(st.ID, "#t", nil, nil)
+		if err == nil && (got.Effects == nil || !got.Effects.Clicked || !got.Effects.Scrolled) {
+			err = fmt.Errorf("click effects %+v", got.Effects)
+		}
+		return err
+	})
+	within("type", func() error {
+		got, err := m.Type(st.ID, "hello")
+		if err == nil && (got.Effects == nil || got.Effects.TypedLength != 5) {
+			err = fmt.Errorf("type effects %+v", got.Effects)
+		}
+		return err
+	})
+}
+
 // TestWindowsRealBrowserOwnerKilled covers two acceptance items: killing the
 // owner leaves no browser process, and the stale session dir it leaves is swept
 // on the next start.
@@ -415,7 +466,7 @@ func TestWindowsRealBrowserOwnerKilled(t *testing.T) {
 // hint brands are logged (not asserted): --user-agent does not change them.
 func assertNotHeadlessUA(t *testing.T, port int) {
 	t.Helper()
-	ua, err := runtimeEvaluate(port, "navigator.userAgent")
+	ua, err := runtimeEvaluate(pin{port: port}, "navigator.userAgent")
 	if err != nil {
 		t.Fatalf("read navigator.userAgent: %v", err)
 	}
@@ -430,7 +481,7 @@ func assertNotHeadlessUA(t *testing.T, port int) {
 	if ua != header {
 		t.Errorf("navigator.userAgent %q differs from the request header %q", ua, header)
 	}
-	brands, _ := runtimeEvaluate(port, "JSON.stringify(navigator.userAgentData ? navigator.userAgentData.brands : null)")
+	brands, _ := runtimeEvaluate(pin{port: port}, "JSON.stringify(navigator.userAgentData ? navigator.userAgentData.brands : null)")
 	t.Logf("navigator.userAgentData.brands: %v", brands)
 }
 

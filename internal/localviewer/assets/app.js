@@ -127,6 +127,39 @@
     $("screen-wrap").className = human ? "driving" : "";
     $("hint").textContent = human ? "Click the picture and type; your keystrokes go only to this browser." : "";
     openStream(s.session_id);
+    if (lastTargets && wsFor === s.session_id) renderPages(lastTargets); // buttons follow who is driving
+  }
+
+  // renderPages shows the session's open pages (tabs and popups). The page in
+  // the picture is the active one; choosing or closing a page needs control.
+  let lastTargets = null;
+  function renderPages(m) {
+    lastTargets = m;
+    const bar = $("pages");
+    const list = m.targets || [];
+    bar.replaceChildren();
+    bar.hidden = list.length < 2 && !list.some((t) => t.refused);
+    for (const t of list) {
+      const item = document.createElement("span");
+      item.className = "page" + (t.id === m.active ? " sel" : "") + (t.refused ? " refused" : "");
+      const pick = document.createElement("button");
+      pick.setAttribute("role", "tab");
+      pick.setAttribute("aria-selected", t.id === m.active ? "true" : "false");
+      pick.textContent = (t.refused ? "Blocked: " : "") + (t.title || hostPath(t.url) || "New page");
+      pick.title = t.url || "";
+      pick.disabled = !human || !!t.refused;
+      pick.onclick = () => send({ type: "target_switch", target: t.id });
+      item.appendChild(pick);
+      if (human) {
+        const x = document.createElement("button");
+        x.className = "x";
+        x.textContent = "\u00d7";
+        x.setAttribute("aria-label", "Close page");
+        x.onclick = () => send({ type: "target_close", target: t.id });
+        item.appendChild(x);
+      }
+      bar.appendChild(item);
+    }
   }
 
   function renderUnlock(s) {
@@ -162,6 +195,8 @@
     $("commit-action").textContent = c.action;
     $("commit-domain").textContent = c.domain;
     $("commit-reason").textContent = "Why you are asked: " + c.reason + ".";
+    $("commit-approve").hidden = !!c.unverifiable;
+    if (c.unverifiable) $("commit-reason").textContent += " Citadel cannot verify this one, so it cannot be done for you: do it yourself in the browser, or deny it.";
     if (commitShown === c.id || !c.has_shot) return;
     // A different request: whatever was drawn belongs to the old one.
     clearShot();
@@ -208,7 +243,8 @@
 
   function closeStream() {
     if (ws) { ws.onclose = null; ws.close(); }
-    ws = null; wsFor = null;
+    ws = null; wsFor = null; lastTargets = null;
+    $("pages").hidden = true;
   }
 
   function openStream(id) {
@@ -218,7 +254,11 @@
     ws = new WebSocket("ws://" + location.host + "/api/stream?id=" + encodeURIComponent(id) + "&csrf=" + encodeURIComponent(csrf));
     ws.binaryType = "blob";
     ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") return; // init / select replies
+      if (typeof ev.data === "string") {
+        // init, select replies and the open-pages list
+        try { const m = JSON.parse(ev.data); if (m.type === "targets") renderPages(m); } catch (e) { /* ignore */ }
+        return;
+      }
       const url = URL.createObjectURL(ev.data);
       $("screen").src = url;
       if (frameURL) URL.revokeObjectURL(frameURL);

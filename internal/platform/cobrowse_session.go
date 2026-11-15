@@ -98,6 +98,10 @@ type CobrowseSessionStatus struct {
 	Driver CobrowseDriver `json:"driver,omitempty"`
 	// Browser is the launched browser's kind ("chrome", "edge", "chromium").
 	Browser string `json:"browser,omitempty"`
+	// ActiveTarget and Targets list the open pages (tabs and popups); the URL
+	// above is the active page's.
+	ActiveTarget string           `json:"active_target,omitempty"`
+	Targets      []CobrowseTarget `json:"targets,omitempty"`
 	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
 	Generation uint64 `json:"generation,omitempty"`
 	// Done and Effects are set only by scripted actions (click, type, key,
@@ -157,6 +161,11 @@ type CobrowseSessionManager struct {
 	baseDir     string
 	sweepOnce   sync.Once
 	launchOpts  LaunchOptions
+	// trackTargets, targetPolicy and targetEvent are set by
+	// EnableTargetTracking (local mode only).
+	trackTargets bool
+	targetPolicy TargetPolicy
+	targetEvent  TargetEventFunc
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
@@ -211,6 +220,11 @@ type cobrowseSession struct {
 	regDir     string
 	generation uint64
 	pendingEnd *EndedSession
+	// tracking is set at creation from the manager (local mode only): pages are
+	// followed and status lists them. expectTarget is the page a call was
+	// checked against (see ExpectTarget).
+	tracking     bool
+	expectTarget string
 }
 
 var (
@@ -358,6 +372,7 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		encProfile: profile,
 		regDir:     m.sessionRegDir(),
 		generation: 1,
+		tracking:   m.trackTargets,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -404,8 +419,8 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		// Wait for the launch URL (including redirects) to settle, then report
 		// where the page ended up, as Navigate does. Best effort: a page that
 		// cannot be read leaves the plain status.
-		if port, perr := s.requireDrivablePort(); perr == nil {
-			ps := settleNavigation(port, "")
+		if p, perr := s.pinAction(); perr == nil {
+			ps := settleNavigation(p, "")
 			if ps.URL != "" {
 				st.URL = ps.URL
 			}
@@ -448,6 +463,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	}
 	m.mu.Lock()
 	lo := m.launchOpts
+	tpolicy, tevent := m.targetPolicy, m.targetEvent
 	m.mu.Unlock()
 	lo.Detach = m.useResolver && detachedWorker.Load()
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
@@ -459,6 +475,12 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	// the session still runs and graceful stop still reaps it in-process.
 	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID, currentProcessStartToken())
 
+	// Configure the page policy before the session is visible to status or
+	// actions, so no page is ever accepted without it.
+	if s.tracking {
+		dropTargetSet(proc.debugPort)
+		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
+	}
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
@@ -585,6 +607,9 @@ func (s *cobrowseSession) teardown() error {
 	if proc != nil && proc.stop != nil {
 		err = proc.stop()
 	}
+	if proc != nil {
+		dropTargetSet(proc.debugPort)
+	}
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
 		// produced new state, and sealing an empty/partial working dir would
@@ -622,24 +647,57 @@ func (s *cobrowseSession) teardown() error {
 // its URL after unlocking is race-free.
 func (s *cobrowseSession) status() CobrowseSessionStatus {
 	st, probePort := s.statusBase()
-	if probePort != 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), cobrowseStatusProbeTimeout)
-		t, err := pickTargetContext(ctx, probePort)
+	if probePort == 0 {
+		return st
+	}
+	s.mu.Lock()
+	tracking := s.tracking
+	s.mu.Unlock()
+	if tracking {
+		ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+		snap, err := targetSetFor(probePort).sync(ctx, probePort)
 		cancel()
 		if err == nil {
-			st.URL = t.URL
-			s.mu.Lock()
-			s.lastURL = t.URL
-			s.mu.Unlock()
+			st.Targets = snap.Targets
+			st.ActiveTarget = snap.Active
+			for _, tg := range snap.Targets {
+				if tg.Active {
+					st.URL = tg.URL
+				}
+			}
+			s.noteURL(st.URL)
 		} else {
-			// A slow or wedged endpoint reports the last URL seen rather than
-			// stalling the status call.
-			s.mu.Lock()
-			st.URL = s.lastURL
-			s.mu.Unlock()
+			st.URL = s.cachedURL()
 		}
+		return st
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), cobrowseStatusProbeTimeout)
+	t, err := pickTargetContext(ctx, probePort)
+	cancel()
+	if err != nil {
+		// A slow or wedged endpoint reports the last URL seen rather than
+		// stalling the status call.
+		st.URL = s.cachedURL()
+		return st
+	}
+	st.URL = t.URL
+	s.noteURL(t.URL)
 	return st
+}
+
+func (s *cobrowseSession) noteURL(u string) {
+	if u == "" {
+		return
+	}
+	s.mu.Lock()
+	s.lastURL = u
+	s.mu.Unlock()
+}
+
+func (s *cobrowseSession) cachedURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastURL
 }
 
 // statusNoProbe is status() without any CDP probe; the caller fills URL.

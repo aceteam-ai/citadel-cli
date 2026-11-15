@@ -10,6 +10,13 @@ the selected IPv4 loopback port. Non-WebSocket URLs, userinfo and fragments are
 refused without exposing their values. Additive target fields remain compatible. This source affects existing
 cobrowse and render callers; it is not an inactive renderer registration.
 
+`List` returns every page with a debugger URL, under the same bounds and
+validation (the first such page must have a valid URL, a later invalid one is
+skipped). `ListBounded` is for a caller that must keep working when a page floods
+the browser with popups: past 64 pages it returns the first 64 and reports
+overflow instead of failing, and the caller closes extras. Neither relies on the
+browser's list order.
+
 The complete response may contain at most 512 KiB of JSON, including whitespace,
 and at most 64 page targets. Chrome pretty-prints discovery and ad-heavy pages can
 include dozens of iframe entries with multi-KiB URLs; the 512 KiB ceiling admits

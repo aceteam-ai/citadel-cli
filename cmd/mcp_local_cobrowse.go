@@ -88,8 +88,11 @@ func localAuditRetention() time.Duration {
 // reaches here: the event carries only its length.
 func auditRecordFor(ev localcobrowse.Event) localaudit.Record {
 	actor := "agent"
-	if ev.Class == "H" {
+	switch ev.Class {
+	case "H":
 		actor = "user"
+	case "B":
+		actor = "citadel" // the browser or Citadel acting on its own
 	}
 	rules := ""
 	if ev.Fingerprint != "" {
@@ -271,6 +274,11 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			return nil
 		},
 	})
+	if manager != nil {
+		// A popup or new tab passes the same address filter as navigation;
+		// the egress guard still covers its connections.
+		manager.EnableTargetTracking(rt.svc.TargetPolicy(), rt.svc.RecordTargetEvent)
+	}
 	go func() {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
@@ -785,6 +793,12 @@ func handleLocalCobrowseSignals(rt *localCobrowseRuntime) {
 // must not repeat the action blindly. The error was already audited.
 func partialActionResult(res localcobrowse.ActionResult, err error) (any, error) {
 	if err != nil && res.Done != nil && !*res.Done {
+		// A refusal (the page changed under the action, or it is on a refused
+		// address) stays an error, exactly as before; its text already says
+		// what the action did before it was stopped.
+		if errors.Is(err, platform.ErrTargetChanged) || errors.Is(err, platform.ErrPageRefused) {
+			return nil, err
+		}
 		return res, nil
 	}
 	return res, err

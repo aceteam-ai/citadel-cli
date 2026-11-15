@@ -132,17 +132,11 @@ func AsActionIncomplete(err error) (*ActionIncompleteError, bool) {
 	return nil, false
 }
 
-// cdpCaller sends CDP calls. portCaller opens a connection per call (the
-// original behavior, kept for helpers whose callers are not budgeted);
-// *cdpConn reuses one connection.
+// cdpCaller sends CDP calls. A pin connects per call (the original behavior,
+// kept for helpers whose callers are not budgeted); *cdpConn reuses one
+// connection to the pinned page.
 type cdpCaller interface {
 	Call(method string, params map[string]any) (map[string]any, error)
-}
-
-type portCaller int
-
-func (p portCaller) Call(method string, params map[string]any) (map[string]any, error) {
-	return cdpCommand(int(p), method, params)
 }
 
 // cdpConn is one discovered page target and one WebSocket, used for all the
@@ -156,11 +150,19 @@ type cdpConn struct {
 	nextID int
 }
 
-// openCDPConn discovers the page target once and dials it once.
-func openCDPConn(ctx context.Context, port int) (*cdpConn, error) {
-	target, err := pickTargetContext(ctx, port)
-	if err != nil {
-		return nil, err
+// openCDPConn dials the page an action is pinned to. With page tracking the pin
+// already names that page's debugger socket (resolved by pinAction, so
+// ErrTargetChanged and ErrPageRefused are decided before any connection), and
+// no discovery happens here. Without tracking the first page is discovered once.
+func openCDPConn(ctx context.Context, p pin) (*cdpConn, error) {
+	var target cdpTarget
+	target.WebSocketDebuggerURL = p.ws
+	if p.ws == "" {
+		var err error
+		target, err = pickTargetContext(ctx, p.port)
+		if err != nil {
+			return nil, err
+		}
 	}
 	ws, _, err := websocket.DefaultDialer.DialContext(ctx, target.WebSocketDebuggerURL, nil)
 	if err != nil {
@@ -309,10 +311,10 @@ type actionRun struct {
 // returns the session status with Effects and Done set. On deadline or failure
 // it returns *ActionIncompleteError. A failure before the connection opened
 // (nothing was sent) is a plain error.
-func (s *cobrowseSession) runAction(port int, action string, body func(*actionRun) error) (CobrowseSessionStatus, error) {
+func (s *cobrowseSession) runAction(p pin, action string, body func(*actionRun) error) (CobrowseSessionStatus, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), CobrowseActionDeadline)
 	defer cancel()
-	conn, err := openCDPConn(ctx, port)
+	conn, err := openCDPConn(ctx, p)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
@@ -338,7 +340,7 @@ func (s *cobrowseSession) runAction(port int, action string, body func(*actionRu
 	rctx, rcancel := context.WithTimeout(context.Background(), cobrowseReportReserve)
 	defer rcancel()
 	var after pageProbe
-	if rc, rerr := openCDPConn(rctx, port); rerr == nil {
+	if rc, rerr := openCDPConn(rctx, p); rerr == nil {
 		after = probePage(rc)
 		rc.Close()
 	}
