@@ -1,17 +1,14 @@
 // internal/jobs/cobrowse.go
 //
-// Co-browse job handler (issue #4079). Bridges the node's Redis job stream to
-// the persistent CobrowseManager so the AI agent can drive a managed headed
-// Chromium over CDP and hand control to a human for login / 2FA.
-//
-// Each job is one short action against the long-lived browser owned by
-// platform.GetCobrowseManager(); the browser itself persists between jobs.
-// The handler returns a JSON document as its output bytes so the backend MCP
-// tool can parse a structured result (mirroring the VNC handlers' wire shape).
+// Legacy co-browse job handler (issue #4079, retired for remote actions in
+// #1672). Status and stop remain available to observe and clean up the known
+// singleton. All start/action jobs refuse before manager discovery and point
+// callers at guarded COBROWSE_SESSION instead.
 package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -19,10 +16,11 @@ import (
 )
 
 // Co-browse job action types. A single COBROWSE job type carries an "action"
-// payload field, keeping the worker registration to one entry while supporting
-// all six MCP tools.
+// payload field. Old action names remain wire constants but now refuse; only
+// status and stop are accepted on this legacy job family.
 const (
 	CobrowseActionStart      = "start"
+	CobrowseActionStop       = "stop"
 	CobrowseActionNavigate   = "navigate"
 	CobrowseActionHandoff    = "handoff"
 	CobrowseActionResume     = "resume"
@@ -30,11 +28,22 @@ const (
 	CobrowseActionScreenshot = "screenshot"
 )
 
-// CobrowseHandler handles COBROWSE jobs by delegating to the node's
-// CobrowseManager singleton.
-type CobrowseHandler struct{}
+// ErrLegacyCobrowseDisabled refuses the unguarded legacy dispatch path. Callers
+// must explicitly start and address a guarded session; no browser is retargeted.
+var ErrLegacyCobrowseDisabled = errors.New("legacy COBROWSE start/actions refused; start a new guarded COBROWSE_SESSION via cobrowse_start and use its session_id")
 
-// NewCobrowseHandler constructs a co-browse handler.
+type legacyCobrowseControl interface {
+	Status() platform.CobrowseStatus
+	Stop() error
+}
+
+// CobrowseHandler retains only observation and cleanup for legacy COBROWSE jobs.
+// The optional factory is a test seam: refusals happen before manager discovery.
+type CobrowseHandler struct {
+	manager func() legacyCobrowseControl
+}
+
+// NewCobrowseHandler constructs the legacy observation/cleanup handler.
 func NewCobrowseHandler() *CobrowseHandler { return &CobrowseHandler{} }
 
 func (h *CobrowseHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
@@ -43,50 +52,21 @@ func (h *CobrowseHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 		return nil, fmt.Errorf("job payload missing 'action' field")
 	}
 	ctx.Log("info", "     - [Job %s] co-browse action: %s", job.ID, action)
-
-	mgr := platform.GetCobrowseManager()
-
-	switch action {
-	case CobrowseActionStart:
-		st, err := mgr.Start(job.Payload["profile"], job.Payload["url"], 0)
-		return statusResult(st, err)
-
-	case CobrowseActionNavigate:
-		url := job.Payload["url"]
-		if url == "" {
-			return nil, fmt.Errorf("navigate requires a 'url' field")
-		}
-		st, err := mgr.Navigate(url)
-		return statusResult(st, err)
-
-	case CobrowseActionHandoff:
-		st, err := mgr.Handoff()
-		return statusResult(st, err)
-
-	case CobrowseActionResume:
-		st, err := mgr.Resume()
-		return statusResult(st, err)
-
-	case CobrowseActionStatus:
-		return statusResult(mgr.Status(), nil)
-
-	case CobrowseActionScreenshot:
-		img, err := mgr.Screenshot()
-		if err != nil {
+	if action != CobrowseActionStatus && action != CobrowseActionStop {
+		return nil, ErrLegacyCobrowseDisabled
+	}
+	var mgr legacyCobrowseControl
+	if h.manager != nil {
+		mgr = h.manager()
+	} else {
+		mgr = platform.GetCobrowseManager()
+	}
+	if action == CobrowseActionStop {
+		if err := mgr.Stop(); err != nil {
 			return nil, err
 		}
-		st := mgr.Status()
-		out, _ := json.Marshal(map[string]any{
-			"image":  img,
-			"format": "png",
-			"driver": string(st.Driver),
-			"url":    st.URL,
-		})
-		return out, nil
-
-	default:
-		return nil, fmt.Errorf("unknown co-browse action: %q", action)
 	}
+	return statusResult(mgr.Status(), nil)
 }
 
 // statusResult marshals a CobrowseStatus to JSON output bytes, propagating any

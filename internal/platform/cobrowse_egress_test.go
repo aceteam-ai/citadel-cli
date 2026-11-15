@@ -366,3 +366,26 @@ func TestTargetSetRemoteEgressSweepCannotKillReusedBrowserPID(t *testing.T) {
 		t.Fatalf("fallback sweep signalled a reused browser PID: %v", env.killed)
 	}
 }
+
+// Use an inert singleton state, never a process: clearing the display and human
+// driver proves PrepareSelfRestart reaches legacy Stop even on adoption-capable
+// platforms. No native browser, child process or display is started.
+func TestRemoteEgressSelfRestartEndsKnownLegacySingleton(t *testing.T) {
+	legacy := GetCobrowseManager()
+	legacy.mu.Lock()
+	if legacy.cmd != nil || legacy.xvfb != nil {
+		legacy.mu.Unlock()
+		t.Fatal("test requires inert legacy singleton")
+	}
+	oldDisplay, oldDriver := legacy.display, legacy.driver
+	legacy.display = "fixture-legacy-display"
+	legacy.driver = DriverHuman
+	legacy.mu.Unlock()
+	t.Cleanup(func() { legacy.mu.Lock(); legacy.display, legacy.driver = oldDisplay, oldDriver; legacy.mu.Unlock() })
+	PrepareSelfRestart("node_update", "fixture")
+	legacy.mu.Lock()
+	defer legacy.mu.Unlock()
+	if legacy.display != "" || legacy.driver != DriverAI {
+		t.Fatalf("legacy singleton survived restart: display=%q driver=%s", legacy.display, legacy.driver)
+	}
+}

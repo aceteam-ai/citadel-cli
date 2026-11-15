@@ -57,6 +57,22 @@ owner protection. Persistent profiles are sealed before an orderly restart.
 This replaces remote-browser continuity across worker restart for this slice.
 A durable proxy sidecar and its custody protocol are outside LO3.
 
+### Legacy COBROWSE start/actions refused
+
+The separate legacy `COBROWSE` job family without `session_id` cannot start,
+navigate, capture or otherwise drive its unguarded singleton. It returns explicit
+restart guidance: call `cobrowse_start` for a guarded `COBROWSE_SESSION`, then use
+the returned `session_id`. The handler does not silently invent an ID, retarget
+action calls, reuse an old grant or launch a browser. Legacy `status` and `stop`
+remain available for observation and cleanup, including while handed off.
+An orderly worker self-restart always stops its known legacy singleton too.
+
+Aceteam main still has callers that omit `session_id` (source check recorded on
+#1672). They will receive this intentional refusal until they start and address
+a new session. The paired backend guidance and rollout ordering need independent
+review before release. No process is killed merely for listening on the old
+browser debug port: identity-unverified legacy orphans require operator cleanup.
+
 ## Verification and release
 
 Local validation uses fake launchers, fake CDP, fake process tables and loopback

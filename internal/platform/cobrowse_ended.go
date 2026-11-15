@@ -96,13 +96,11 @@ func CobrowseBusy() (bool, string) {
 }
 
 // PrepareSelfRestart runs just before the process replaces itself. It records
-// why sessions may end (see prepareSelfRestart) and, where nothing can be
-// re-adopted, stops the legacy single browser too so none is orphaned.
+// why guarded sessions end (see prepareSelfRestart), and always stops the legacy
+// unguarded singleton. Its dispatch path cannot start or drive it after upgrade.
 func PrepareSelfRestart(reason, detail string) {
 	GetCobrowseSessionManager().prepareSelfRestart(reason, detail)
-	if !adoptionSupported {
-		_ = GetCobrowseManager().Stop()
-	}
+	_ = GetCobrowseManager().Stop()
 }
 
 // prepareSelfRestart decides each session's fate across the restart.
