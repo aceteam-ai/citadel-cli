@@ -483,11 +483,9 @@ func (m *CobrowseSessionManager) ScreenshotStatus(id string) (string, CobrowseSe
 	if _, derr := base64.StdEncoding.DecodeString(data); derr != nil {
 		return "", CobrowseSessionStatus{}, fmt.Errorf("screenshot not valid base64: %w", derr)
 	}
-	url := conn.target.URL
-	if url == "" {
-		url = probePage(conn).url
-	}
-	return data, s.statusWithURL(url), nil
+	// Tracked sessions take the URL from the target set (statusWithURL); an
+	// untracked one reads it from the discovery that found the page.
+	return data, s.statusWithURL(conn.target.URL), nil
 }
 
 // Click performs a scripted mouse click in one session's browser: either at the
@@ -533,7 +531,7 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 			return err
 		}
 		r.eff.Dispatched = true
-		if err := clickAtPointOn(r.conn, cx, cy); err != nil {
+		if err := r.clickSequence(cx, cy); err != nil {
 			return err
 		}
 		r.eff.Clicked = true

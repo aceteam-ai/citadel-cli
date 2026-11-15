@@ -859,7 +859,8 @@ type ActionResult struct {
 // The error is still returned to the caller for the audit record.
 func partialActionResult(err error) (ActionResult, bool) {
 	ae, ok := platform.AsActionIncomplete(err)
-	if !ok || !ae.Reportable() {
+	if !ok || !ae.Reportable() || isRefusal(err) ||
+		errors.Is(err, platform.ErrNotStarted) || errors.Is(err, platform.ErrTargetChanged) || errors.Is(err, platform.ErrPageRefused) {
 		return ActionResult{}, false
 	}
 	done := false
@@ -1200,6 +1201,17 @@ func (s *Service) writeAction(ctx context.Context, ev *Event, a actionRef, do fu
 		// The error still returns, so the audit and any refusal are exactly as
 		// before; a partial result only adds what the action did (#1663).
 		if res, ok := partialActionResult(derr); ok {
+			// Something may have landed on a new page: apply the landing
+			// policy and grant exactly as the normal path does, so a refused
+			// or ungranted page is sent to about:blank.
+			if res.Dispatched {
+				if ps, perr := s.cfg.Browser.PageState(id); perr == nil && ps.URL != "" && ps.URL != before {
+					res.URL, res.Navigated = ps.URL, true
+					if lerr := s.enforceLanding(ctx, id, ss, res); lerr != nil {
+						return res, errors.Join(derr, lerr)
+					}
+				}
+			}
 			return res, derr
 		}
 		return ActionResult{}, derr
@@ -1993,6 +2005,14 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		_, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate")
 	}
 	s.finish(ev, derr)
+	if _, partial := partialActionResult(derr); partial {
+		// Dispatched, then timed out or broke: it may have been done. Telling
+		// the user it failed invites a second approval and a double submit.
+		resolve("unconfirmed", "it may have been done; check the page before asking again")
+		hev.Outcome = "unconfirmed"
+		s.emit(hev)
+		return nil
+	}
 	if derr != nil {
 		resolve("failed", "the action did not complete: "+truncRunes(derr.Error(), 120))
 		hev.Outcome = "error"

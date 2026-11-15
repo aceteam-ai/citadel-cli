@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -26,6 +27,13 @@ type latencyCDP struct {
 	// whose expression contains the key.
 	methodDelay map[string]time.Duration
 	evalDelay   map[string]time.Duration
+	// onCall runs (outside the lock) before a call is answered.
+	onCall func(method string, params map[string]any)
+	// stallFirstProbe delays only the first effect probe.
+	stallFirstProbe time.Duration
+	probes          int
+	// noScroll keeps an evalDelay'd selector resolution from scrolling.
+	noScroll bool
 
 	discoveries atomic.Int64
 	dials       atomic.Int64
@@ -66,9 +74,12 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 		f.discoveries.Add(1)
 		time.Sleep(f.jsonDelay)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `[{"type":"page","url":%q,"webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/page/1"}]`, f.url, f.port)
+		f.mu.Lock()
+		u := f.url
+		f.mu.Unlock()
+		fmt.Fprintf(w, `[{"id":"p1","type":"page","url":%q,"title":"t","webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/page/p1"}]`, u, f.port)
 	})
-	mux.HandleFunc("/devtools/page/1", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/devtools/page/p1", func(w http.ResponseWriter, r *http.Request) {
 		f.dials.Add(1)
 		time.Sleep(f.dialDelay)
 		conn, err := up.Upgrade(w, r, nil)
@@ -87,7 +98,11 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 			}
 			f.mu.Lock()
 			f.methods = append(f.methods, msg.Method)
+			hook := f.onCall
 			f.mu.Unlock()
+			if hook != nil {
+				hook(msg.Method, msg.Params)
+			}
 			delay := f.callDelay
 			if d, ok := f.methodDelay[msg.Method]; ok {
 				delay = d
@@ -99,7 +114,7 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 					if strings.Contains(expr, k) {
 						delay = d
 						f.mu.Lock()
-						if strings.Contains(k, "scrollIntoView") {
+						if strings.Contains(k, "scrollIntoView") && !f.noScroll {
 							f.scrollY = 480
 							f.scrollEvals++
 						}
@@ -110,6 +125,10 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 				var val any
 				switch {
 				case strings.Contains(expr, "window.scrollX"):
+					f.probes++
+					if f.probes == 1 && f.stallFirstProbe > 0 {
+						delay = f.stallFirstProbe
+					}
 					val = map[string]any{"url": f.url, "x": 0.0, "y": f.scrollY, "tag": f.focus, "sig": f.focus}
 				case strings.Contains(expr, "#missing"):
 					val = nil
@@ -132,6 +151,20 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 	go srv.Serve(ln)
 	t.Cleanup(func() { _ = srv.Close() })
 	return f
+}
+
+func newTrackedBudgetSession(t *testing.T, f *latencyCDP, policy TargetPolicy) (*CobrowseSessionManager, string) {
+	t.Helper()
+	withOpeners(t, map[string]string{})
+	installFixedPortLauncher(t, f.port)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	m.EnableTargetTracking(policy, nil)
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Stop(st.ID) })
+	return m, st.ID
 }
 
 func newBudgetSession(t *testing.T, f *latencyCDP) (*CobrowseSessionManager, string) {
@@ -299,5 +332,166 @@ func TestStatusIsBoundedAndFallsBackToLastURL(t *testing.T) {
 	}
 	if st.URL != "http://example.test/page" {
 		t.Errorf("fallback url %q", st.URL)
+	}
+}
+
+// The same ceilings hold for a TRACKED (local mode) manager: one dial per
+// action, the pinned page's own socket, and no per-call discovery for the
+// CDP calls themselves (the /json reads left are page-list syncs, which apply
+// the page policy). Navigate still returns the open pages.
+func TestActionLatencyProfileTracked(t *testing.T) {
+	f := startLatencyCDP(t, func(f *latencyCDP) {
+		f.jsonDelay, f.dialDelay, f.callDelay = 40*time.Millisecond, 25*time.Millisecond, 5*time.Millisecond
+	})
+	m, id := newTrackedBudgetSession(t, f, func(context.Context, string) error { return nil })
+	x, y := 10.0, 10.0
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{"screenshot", func() error { _, err := m.Screenshot(id); return err }},
+		{"click(selector)", func() error { _, err := m.Click(id, "#a", nil, nil); return err }},
+		{"click(x,y)", func() error { _, err := m.Click(id, "", &x, &y); return err }},
+		{"type", func() error { _, err := m.Type(id, "hello"); return err }},
+		{"key", func() error { _, err := m.Key(id, "Enter"); return err }},
+	}
+	for _, c := range cases {
+		d0, w0 := f.discoveries.Load(), f.dials.Load()
+		start := time.Now()
+		if err := c.run(); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		d, w := f.discoveries.Load()-d0, f.dials.Load()-w0
+		t.Logf("tracked %-16s page-list reads=%d dials=%d wall=%dms", c.name, d, w, time.Since(start).Milliseconds())
+		if w > 1 {
+			t.Errorf("%s dialed %d times, want at most 1", c.name, w)
+		}
+	}
+	st, err := m.Navigate(id, "http://example.test/next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ActiveTarget == "" || len(st.Targets) != 1 {
+		t.Errorf("tracked Navigate lost the open pages: active=%q targets=%v", st.ActiveTarget, st.Targets)
+	}
+}
+
+// An action that moves the only page to a refused address and then times out
+// must never evaluate script in that page or report its URL.
+func TestTimeoutOnRefusedPageNeverEvaluatesOrLeaksURL(t *testing.T) {
+	shortBudget(t, 300*time.Millisecond, time.Second)
+	f := startLatencyCDP(t, nil)
+	presses := 0
+	f.onCall = func(method string, params map[string]any) {
+		if method == "Input.dispatchMouseEvent" && params["type"] == "mousePressed" {
+			presses++
+			f.mu.Lock()
+			f.url = "http://private.test/secret"
+			f.mu.Unlock()
+			time.Sleep(700 * time.Millisecond)
+		}
+	}
+	m, id := newTrackedBudgetSession(t, f, func(_ context.Context, raw string) error {
+		if strings.Contains(raw, "private.test") {
+			return fmt.Errorf("refused")
+		}
+		return nil
+	})
+	x, y := 5.0, 5.0
+	st, err := m.Click(id, "", &x, &y)
+	ae, ok := AsActionIncomplete(err)
+	if !ok || !ae.TimedOut || !ae.Effects.Dispatched || !ae.Effects.Unknown {
+		t.Fatalf("want a timed-out partial with unknown effects, got %v", err)
+	}
+	if strings.Contains(st.URL, "private") || strings.Contains(ae.Status.URL, "private") || strings.Contains(ae.Error(), "private") {
+		t.Errorf("a refused page's URL leaked: %q", st.URL)
+	}
+	f.mu.Lock()
+	methods := append([]string(nil), f.methods...)
+	f.mu.Unlock()
+	pressed := false
+	for _, mth := range methods {
+		if mth == "Input.dispatchMouseEvent" {
+			pressed = true
+			continue
+		}
+		if pressed && mth == "Runtime.evaluate" {
+			t.Fatalf("script evaluated in a refused page after input was dispatched: %v", methods)
+		}
+	}
+	time.Sleep(800 * time.Millisecond) // let the stalled call finish before cleanup
+}
+
+// A click that timed out between press and release gets a best-effort release
+// on a fresh connection, so the page is not left with a held button.
+func TestTimeoutBetweenPressAndReleaseSendsRelease(t *testing.T) {
+	shortBudget(t, 300*time.Millisecond, time.Second)
+	f := startLatencyCDP(t, nil)
+	f.onCall = func(method string, params map[string]any) {
+		if method == "Input.dispatchMouseEvent" && params["type"] == "mousePressed" {
+			time.Sleep(600 * time.Millisecond)
+		}
+	}
+	m, id := newBudgetSession(t, f)
+	x, y := 5.0, 5.0
+	_, err := m.Click(id, "", &x, &y)
+	if _, ok := AsActionIncomplete(err); !ok {
+		t.Fatalf("want a partial, got %v", err)
+	}
+	f.mu.Lock()
+	n := 0
+	for _, mth := range f.methods {
+		if mth == "Input.dispatchMouseEvent" {
+			n++
+		}
+	}
+	f.mu.Unlock()
+	if n != 3 { // moved, pressed, and the readback's release
+		t.Errorf("%d mouse events, want moved+pressed+release = 3", n)
+	}
+	time.Sleep(500 * time.Millisecond)
+}
+
+// A failure that observed no change and did not dispatch returns the original
+// error: same identity, same text.
+func TestNonReportableTimeoutReturnsCauseUnchanged(t *testing.T) {
+	shortBudget(t, 300*time.Millisecond, time.Second)
+	f := startLatencyCDP(t, func(f *latencyCDP) {
+		f.noScroll = true
+		f.evalDelay = map[string]time.Duration{"scrollIntoView": 2 * time.Second}
+	})
+	m, id := newBudgetSession(t, f)
+	_, err := m.Click(id, "#field", nil, nil)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if _, ok := AsActionIncomplete(err); ok {
+		t.Fatalf("an effect-free timeout must not be wrapped: %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "CDP read: ") || strings.Contains(err.Error(), "Not retried") || !isTimeoutErr(err) {
+		t.Errorf("cause text or identity changed: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+}
+
+// The before-probe has its own short limit: a stalled first probe does not eat
+// the action's budget; the action proceeds with the before-state unknown.
+func TestBeforeProbeStallDoesNotConsumeActionBudget(t *testing.T) {
+	prev := beforeProbeLimit
+	beforeProbeLimit = 150 * time.Millisecond
+	t.Cleanup(func() { beforeProbeLimit = prev })
+	f := startLatencyCDP(t, func(f *latencyCDP) { f.stallFirstProbe = 2 * time.Second })
+	m, id := newBudgetSession(t, f)
+	x, y := 5.0, 5.0
+	start := time.Now()
+	st, err := m.Click(id, "", &x, &y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Errorf("click took %s: the stalled probe consumed the budget", el)
+	}
+	if st.Effects == nil || !st.Effects.Clicked {
+		t.Errorf("effects %+v", st.Effects)
 	}
 }

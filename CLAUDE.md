@@ -103,14 +103,25 @@ match. The session base dir there requires an owner-only, protected DACL
 windows-latest CI job runs the real-browser tests against both browsers.
 
 `cobrowseSession.runAction` owns one scripted co-browse action (click, type, key,
-scroll): one target discovery and one WebSocket for all its CDP calls, bounded by
+scroll): one WebSocket for all its CDP calls, bounded by
 `platform.CobrowseActionDeadline`, which must stay below the platform's 15s job
-wait with `cobrowseReportReserve` added. On the deadline or a failure after the
-action may have acted it returns `*ActionIncompleteError` carrying `ActionEffects`
-(dispatched, scrolled with offset, focused, clicked, typed length only) and never
-retries. `jobs.actionFailureResult` turns a reportable one into a `done:false`
-result; `localcobrowse.partialActionResult` and `cmd.partialActionResult` do the
-same for local mode. `TestCobrowseRealBrowserActionLatency` pins the budgets.
+wait with `cobrowseReportReserve` added. Untracked sessions discover the page
+once; tracked (local mode) sessions dial the page `pinAction` pinned, and the
+page-list reads left are target syncs that apply the page policy
+(`pageActive`): before the before-probe and before every read-back, so no script
+runs in a page that is refused or no longer active, and a URL is only reported or
+cached after policy. Refusals (`ErrHandedOff`, `ErrNotStarted`,
+`ErrTargetChanged`, `ErrPageRefused`) and failures that changed nothing return
+the original error unchanged. Otherwise a deadline or failure after the action
+may have acted returns `*ActionIncompleteError` with `ActionEffects` (scrolled
+with offset, focused, clicked, typed length only; `Dispatched` only means input
+may have been sent), and nothing is retried. A click that timed out between press
+and release gets a best-effort release on the pinned page. On the job path the
+error is returned as an error (platform tools treat any non-error result as
+success); only a payload `report_partial: true` gets the structured `done:false`
+result. Local mode returns the same details as a tool error. An approved commit
+that was dispatched and then failed resolves as `unconfirmed`, not failed.
+`TestCobrowseRealBrowserActionLatency` pins the budgets.
 
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
 per-domain write grant (default deny, see the next paragraph), the abuse limits, the

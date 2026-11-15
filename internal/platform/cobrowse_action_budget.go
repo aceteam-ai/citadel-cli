@@ -17,6 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -45,8 +47,9 @@ var cobrowseStatusProbeTimeout = 2 * time.Second
 // ActionEffects is what an action did to the page. It is reported on success
 // and, more importantly, on a deadline or failure.
 type ActionEffects struct {
-	// Dispatched is true once an input event (mouse, key, text, wheel) was
-	// sent to the browser. A dispatched action must not be repeated blindly.
+	// Dispatched is true when an input event (mouse, key, text, wheel) may
+	// have been sent to the browser: it was written, and no refusal came back.
+	// A dispatched action must not be repeated blindly.
 	Dispatched bool `json:"dispatched"`
 	// Scrolled is true when the scroll offset changed; ScrollX/ScrollY are the
 	// offset now, so a caller can tell its earlier coordinates are stale.
@@ -66,11 +69,16 @@ type ActionEffects struct {
 	TypedUnconfirmed bool `json:"typed_unconfirmed,omitempty"`
 	// Navigated is true when the page URL differs from before the action.
 	Navigated bool `json:"navigated"`
+	// Unknown is true when the read-back could not run (the page was refused,
+	// no longer active, or did not answer): scroll, focus and navigation are
+	// then not reported, not reported as "no change".
+	Unknown bool `json:"effects_unknown,omitempty"`
 }
 
-// anyEffect reports whether the page may have changed.
+// anyEffect reports whether the page is known or likely to have changed.
+// Dispatched alone is not an effect: it only says input may have been sent.
 func (e ActionEffects) anyEffect() bool {
-	return e.Dispatched || e.Scrolled || e.Focused || e.Clicked || e.TypedLength > 0 || e.Navigated
+	return e.Scrolled || e.Focused || e.Clicked || e.TypedLength > 0 || e.Navigated
 }
 
 // ActionIncompleteError is returned when an action hit its deadline or failed
@@ -91,7 +99,7 @@ func (e *ActionIncompleteError) Error() string {
 	}
 	var parts []string
 	if e.Effects.Dispatched {
-		parts = append(parts, "input sent")
+		parts = append(parts, "input may have been sent")
 	}
 	if e.Effects.Scrolled {
 		parts = append(parts, fmt.Sprintf("scrolled to x=%g y=%g", e.Effects.ScrollX, e.Effects.ScrollY))
@@ -103,7 +111,14 @@ func (e *ActionIncompleteError) Error() string {
 		parts = append(parts, "clicked")
 	}
 	if e.Effects.TypedLength > 0 {
-		parts = append(parts, fmt.Sprintf("typed %d characters", e.Effects.TypedLength))
+		unconfirmed := ""
+		if e.Effects.TypedUnconfirmed {
+			unconfirmed = " (unconfirmed)"
+		}
+		parts = append(parts, fmt.Sprintf("typed %d characters%s", e.Effects.TypedLength, unconfirmed))
+	}
+	if e.Effects.Unknown {
+		parts = append(parts, "page state could not be read back")
 	}
 	effects := "no page change seen"
 	if len(parts) > 0 {
@@ -121,7 +136,20 @@ func (e *ActionIncompleteError) Unwrap() error { return e.Cause }
 // Reportable reports whether the failure should be returned as a structured
 // result: the page may have changed, or the deadline passed with the outcome
 // unknown. A failure that changed nothing stays a plain error.
-func (e *ActionIncompleteError) Reportable() bool { return e.TimedOut || e.Effects.anyEffect() }
+func (e *ActionIncompleteError) Reportable() bool {
+	return e.Effects.anyEffect() || (e.TimedOut && e.Effects.Dispatched)
+}
+
+// isActionRefusal reports whether err is a refusal that must reach the caller
+// as itself, never wrapped as a partial effect: nothing was sent.
+func isActionRefusal(err error) bool {
+	for _, r := range []error{ErrHandedOff, ErrNotStarted, ErrTargetChanged, ErrPageRefused} {
+		if errors.Is(err, r) {
+			return true
+		}
+	}
+	return false
+}
 
 // AsActionIncomplete extracts an *ActionIncompleteError from err.
 func AsActionIncomplete(err error) (*ActionIncompleteError, bool) {
@@ -148,6 +176,11 @@ type cdpConn struct {
 	stop   chan struct{}
 	once   sync.Once
 	nextID int
+	// readCap, when set, bounds one call below the connection's own deadline.
+	readCap time.Duration
+	// failed is set when a call failed at the transport; the socket is then
+	// unusable (a read deadline poisons it) and must be replaced.
+	failed bool
 }
 
 // openCDPConn dials the page an action is pinned to. With page tracking the pin
@@ -196,15 +229,21 @@ func (c *cdpConn) Call(method string, params map[string]any) (map[string]any, er
 	id := c.nextID
 	_ = c.ws.SetWriteDeadline(contextDeadlineOr(c.ctx, 10*time.Second))
 	if err := c.ws.WriteJSON(map[string]any{"id": id, "method": method, "params": params}); err != nil {
+		c.failed = true
 		if ce := c.ctx.Err(); ce != nil {
 			return nil, fmt.Errorf("CDP write: %w", ce)
 		}
 		return nil, fmt.Errorf("CDP write: %w", err)
 	}
-	_ = c.ws.SetReadDeadline(contextDeadlineOr(c.ctx, 15*time.Second))
+	readFor := 15 * time.Second
+	if c.readCap > 0 {
+		readFor = c.readCap
+	}
+	_ = c.ws.SetReadDeadline(contextDeadlineOr(c.ctx, readFor))
 	for {
 		var msg map[string]any
 		if err := c.ws.ReadJSON(&msg); err != nil {
+			c.failed = true
 			if ce := c.ctx.Err(); ce != nil {
 				return nil, fmt.Errorf("CDP read: %w", ce)
 			}
@@ -302,15 +341,36 @@ func applyProbe(eff *ActionEffects, before, after pageProbe) {
 
 // actionRun is the handle an action body uses.
 type actionRun struct {
-	conn   cdpCaller
+	conn   *cdpConn
 	eff    *ActionEffects
 	before pageProbe
+	// pressed is true between a mousePressed being sent and its mouseReleased
+	// being acknowledged; px, py are where.
+	pressed bool
+	px, py  float64
+}
+
+// beforeProbeLimit bounds the pre-action read so a slow page cannot eat the
+// action's own budget; on timeout the action proceeds with effects unknown.
+var beforeProbeLimit = 1500 * time.Millisecond
+
+// pageActive reports whether, with page tracking, the pinned page is still the
+// active, policy-approved one. It lists pages (no evaluation), and it also lets
+// the target set close or refuse a page that navigated somewhere refused, so a
+// probe never evaluates in a page that has not passed policy. Without tracking
+// there is no policy and the page is trusted as before.
+func pageActive(ctx context.Context, p pin) bool {
+	if p.set == nil {
+		return true
+	}
+	snap, err := p.set.sync(ctx, p.port)
+	return err == nil && snap.Active != "" && snap.Active == p.id
 }
 
 // runAction runs body over one connection under CobrowseActionDeadline and
 // returns the session status with Effects and Done set. On deadline or failure
-// it returns *ActionIncompleteError. A failure before the connection opened
-// (nothing was sent) is a plain error.
+// it returns *ActionIncompleteError when the page is known or likely to have
+// changed; any other failure, and every refusal, is returned unchanged.
 func (s *cobrowseSession) runAction(p pin, action string, body func(*actionRun) error) (CobrowseSessionStatus, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), CobrowseActionDeadline)
 	defer cancel()
@@ -318,55 +378,129 @@ func (s *cobrowseSession) runAction(p pin, action string, body func(*actionRun) 
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	defer conn.Close()
+	defer func() { conn.Close() }()
 
 	eff := ActionEffects{}
 	run := &actionRun{conn: conn, eff: &eff}
-	run.before = probePage(conn)
+	if pageActive(ctx, p) {
+		conn.readCap = beforeProbeLimit
+		run.before = probePage(conn)
+		conn.readCap = 0
+		if !run.before.probeValid && conn.failed {
+			// The poisoned socket is replaced; the action proceeds with the
+			// before-state unknown.
+			conn.Close()
+			nc, err := openCDPConn(ctx, p)
+			if err != nil {
+				return CobrowseSessionStatus{}, err
+			}
+			conn, run.conn = nc, nc
+		}
+	}
 	bodyErr := body(run)
 
 	if bodyErr == nil {
-		after := probePage(conn)
+		after := readBack(ctx, p, run, conn)
 		applyProbe(&eff, run.before, after)
+		eff.Unknown = !after.probeValid
 		st := s.statusWithURL(after.url, conn.target.URL)
 		done := true
 		st.Done, st.Effects = &done, &eff
 		return st, nil
 	}
+	if isActionRefusal(bodyErr) {
+		return CobrowseSessionStatus{}, bodyErr
+	}
 
-	timedOut := ctx.Err() != nil || errors.Is(bodyErr, context.DeadlineExceeded)
+	timedOut := ctx.Err() != nil || isTimeoutErr(bodyErr)
 	// Read back what happened on a fresh, short connection: the action's own
 	// context may be spent and its socket closed.
 	rctx, rcancel := context.WithTimeout(context.Background(), cobrowseReportReserve)
 	defer rcancel()
 	var after pageProbe
 	if rc, rerr := openCDPConn(rctx, p); rerr == nil {
-		after = probePage(rc)
+		after = readBack(rctx, p, run, rc)
 		rc.Close()
 	}
 	applyProbe(&eff, run.before, after)
+	eff.Unknown = !after.probeValid
+	ae := &ActionIncompleteError{Action: action, TimedOut: timedOut, Effects: eff, Cause: bodyErr}
+	if !ae.Reportable() {
+		return CobrowseSessionStatus{}, bodyErr
+	}
 	st := s.statusWithURL(after.url, "")
 	done := false
 	st.Done, st.Effects = &done, &eff
-	return st, &ActionIncompleteError{Action: action, TimedOut: timedOut, Effects: eff, Status: st, Cause: bodyErr}
+	ae.Status = st
+	return st, ae
+}
+
+// isTimeoutErr reports a deadline of any kind: the action context's, or the
+// socket's own read or write deadline (which is set from it and can fire first).
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) ||
+		(errors.As(err, &ne) && ne.Timeout())
+}
+
+// readBack reads the page state over c, but only while the pinned page is still
+// the active, approved one: it sends a best-effort mouseReleased first when a
+// click timed out between press and release, and never evaluates in a page
+// that is refused or no longer active.
+func readBack(ctx context.Context, p pin, run *actionRun, c *cdpConn) pageProbe {
+	if !pageActive(ctx, p) {
+		return pageProbe{}
+	}
+	if run.pressed {
+		_, _ = c.Call("Input.dispatchMouseEvent", map[string]any{
+			"type": "mouseReleased", "x": run.px, "y": run.py, "button": "left", "clickCount": 1,
+		})
+		run.pressed = false
+	}
+	return probePage(c)
+}
+
+// clickSequence sends move, press and release over the action's connection and
+// records the press so a timeout between press and release can be released.
+func (r *actionRun) clickSequence(x, y float64) error {
+	if _, err := r.conn.Call("Input.dispatchMouseEvent", map[string]any{
+		"type": "mouseMoved", "x": x, "y": y, "button": "none",
+	}); err != nil {
+		return err
+	}
+	r.pressed, r.px, r.py = true, x, y
+	if _, err := r.conn.Call("Input.dispatchMouseEvent", map[string]any{
+		"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1,
+	}); err != nil {
+		return err
+	}
+	if _, err := r.conn.Call("Input.dispatchMouseEvent", map[string]any{
+		"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1,
+	}); err != nil {
+		return err
+	}
+	r.pressed = false
+	return nil
 }
 
 // statusWithURL is status() without the discovery probe: the caller already
 // read the URL over its own connection.
 func (s *cobrowseSession) statusWithURL(urls ...string) CobrowseSessionStatus {
+	if s.tracking {
+		// With page tracking the URL and the open pages come from the target
+		// set, which has applied the page policy; a URL read from a page
+		// directly has not been, so it is never reported or cached.
+		return s.status()
+	}
 	st := s.statusNoProbe()
 	for _, u := range urls {
 		if u != "" {
+			s.noteURL(u)
 			st.URL = u
-			s.mu.Lock()
-			s.lastURL = u
-			s.mu.Unlock()
 			return st
 		}
 	}
-	s.mu.Lock()
-	st.URL = s.lastURL
-	s.mu.Unlock()
+	st.URL = s.cachedURL()
 	return st
 }
 

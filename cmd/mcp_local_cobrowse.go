@@ -787,19 +787,30 @@ func handleLocalCobrowseSignals(rt *localCobrowseRuntime) {
 	go closeOnSignal(rt, sigs, os.Exit)
 }
 
-// partialActionResult returns the structured result (done=false plus effects)
-// of a write that hit its deadline or failed after it may have acted, as a
-// normal tool result rather than an error: the agent must see what changed and
-// must not repeat the action blindly. The error was already audited.
+// partialToolError is the error a partly done write returns: the failure text
+// first, then the structured result (done=false, effects), so the MCP result is
+// isError with the details attached. It is never a plain success.
+type partialToolError struct {
+	err    error
+	result []byte
+}
+
+func (e *partialToolError) Error() string { return e.err.Error() + "\nresult: " + string(e.result) }
+func (e *partialToolError) Unwrap() error { return e.err }
+
+// partialActionResult attaches the structured effects of a write that hit its
+// deadline or failed after it may have acted to the tool ERROR. Refusals stay
+// exactly as they were. The failure was already audited.
 func partialActionResult(res localcobrowse.ActionResult, err error) (any, error) {
-	if err != nil && res.Done != nil && !*res.Done {
-		// A refusal (the page changed under the action, or it is on a refused
-		// address) stays an error, exactly as before; its text already says
-		// what the action did before it was stopped.
-		if errors.Is(err, platform.ErrTargetChanged) || errors.Is(err, platform.ErrPageRefused) {
-			return nil, err
-		}
-		return res, nil
+	if err == nil || res.Done == nil || *res.Done {
+		return res, err
 	}
-	return res, err
+	if errors.Is(err, platform.ErrTargetChanged) || errors.Is(err, platform.ErrPageRefused) {
+		return nil, err
+	}
+	b, merr := json.Marshal(res)
+	if merr != nil {
+		return nil, err
+	}
+	return nil, &partialToolError{err: err, result: b}
 }

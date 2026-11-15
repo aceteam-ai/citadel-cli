@@ -179,7 +179,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, err := mgr.Click(id, selector, x, y)
 		if err != nil {
-			return actionFailureResult(err)
+			return actionFailureResult(err, job.Payload["report_partial"] == "true")
 		}
 		return sessionStatusResult(st)
 
@@ -194,7 +194,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, err := mgr.Type(id, text)
 		if err != nil {
-			return actionFailureResult(err)
+			return actionFailureResult(err, job.Payload["report_partial"] == "true")
 		}
 		return sessionStatusResult(st)
 
@@ -217,7 +217,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, err := mgr.Key(id, key)
 		if err != nil {
-			return actionFailureResult(err)
+			return actionFailureResult(err, job.Payload["report_partial"] == "true")
 		}
 		return sessionStatusResult(st)
 
@@ -243,7 +243,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		}
 		st, err := mgr.Scroll(id, job.Payload["selector"], x, y, dx, dy)
 		if err != nil {
-			return actionFailureResult(err)
+			return actionFailureResult(err, job.Payload["report_partial"] == "true")
 		}
 		return sessionStatusResult(st)
 
@@ -414,14 +414,21 @@ func sessionStatusResult(st platform.CobrowseSessionStatus) ([]byte, error) {
 	return out, nil
 }
 
-// actionFailureResult turns an action that hit its deadline, or failed after it
-// may have acted, into a structured result (done=false plus effects) instead of
-// a bare error, so the caller knows what changed and never blindly repeats it.
-// A failure that changed nothing stays an error. The result is additive: every
-// existing status field is still present.
-func actionFailureResult(err error) ([]byte, error) {
+// CobrowseReportPartialKey is the payload flag with which a caller says it
+// understands a structured partial-effect result. Without it an incomplete
+// action is an error whose message says what happened, because platform tools
+// treat any non-error result as success and would audit "clicked".
+const CobrowseReportPartialKey = "report_partial"
+
+// actionFailureResult handles an action that hit its deadline or failed after
+// it may have acted. Without reportPartial it stays an error (the
+// ActionIncompleteError summary: what was scrolled, focused, typed, and that it
+// was not retried). With it, the result is a structured done=false status
+// carrying the effects, additive to every existing field. A failure that
+// changed nothing, and every refusal, is returned unchanged.
+func actionFailureResult(err error, reportPartial bool) ([]byte, error) {
 	ae, ok := platform.AsActionIncomplete(err)
-	if !ok || !ae.Reportable() {
+	if !ok || !ae.Reportable() || !reportPartial {
 		return nil, err
 	}
 	out, merr := sessionStatusResult(ae.Status)

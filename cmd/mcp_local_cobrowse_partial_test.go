@@ -2,29 +2,42 @@ package cmd
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
-func TestPartialActionResultSurfacesDoneFalseAsResult(t *testing.T) {
+// A partly done write is a tool ERROR (MCP isError) that carries the
+// structured effects, never a plain success.
+func TestPartialActionResultIsAnErrorCarryingEffects(t *testing.T) {
 	done := false
-	boom := errors.New("did not finish")
-	got, err := partialActionResult(localcobrowse.ActionResult{Dispatched: true, Done: &done}, boom)
-	if err != nil || got.(localcobrowse.ActionResult).Done == nil {
-		t.Errorf("partial result not surfaced: %v %v", got, err)
+	boom := errors.New("click hit its time limit")
+	got, err := partialActionResult(localcobrowse.ActionResult{Dispatched: true, Done: &done,
+		Effects: &platform.ActionEffects{Scrolled: true, ScrollY: 480}}, boom)
+	if got != nil || err == nil {
+		t.Fatalf("want error only, got %v %v", got, err)
 	}
-	if _, err := partialActionResult(localcobrowse.ActionResult{}, boom); err != boom {
-		t.Errorf("plain error must pass through, got %v", err)
+	for _, want := range []string{"click hit its time limit", `"done":false`, `"scroll_y":480`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+	if !errors.Is(err, boom) {
+		t.Error("the original error is not wrapped")
 	}
 }
 
-func TestPartialActionResultKeepsRefusalsAsErrors(t *testing.T) {
+func TestPartialActionResultKeepsRefusalsAndPlainErrors(t *testing.T) {
 	done := false
 	for _, refusal := range []error{platform.ErrTargetChanged, platform.ErrPageRefused} {
-		if got, err := partialActionResult(localcobrowse.ActionResult{Done: &done}, refusal); err == nil || got != nil {
-			t.Errorf("%v must stay an error, got %v %v", refusal, got, err)
+		if got, err := partialActionResult(localcobrowse.ActionResult{Done: &done}, refusal); err != refusal || got != nil {
+			t.Errorf("%v must stay itself, got %v %v", refusal, got, err)
 		}
+	}
+	boom := errors.New("boom")
+	if _, err := partialActionResult(localcobrowse.ActionResult{}, boom); err != boom {
+		t.Errorf("plain error changed: %v", err)
 	}
 }
