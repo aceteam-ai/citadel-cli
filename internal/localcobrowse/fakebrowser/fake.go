@@ -65,6 +65,21 @@ func (f *Fake) StartSession(u string) (platform.CobrowseSessionStatus, error) {
 	f.Calls = append(f.Calls, "start "+u)
 	return f.st(id), nil
 }
+
+// StartSessionWithID starts a session under a reserved id. A profile is
+// Closed straight away (the fake keeps no profile data).
+func (f *Fake) StartSessionWithID(id, u string, p platform.SessionProfile) (platform.CobrowseSessionStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessions[id] = &sess{url: u}
+	call := "start-id " + id
+	if p != nil {
+		call = "start-profile " + id
+		_ = p.Close()
+	}
+	f.Calls = append(f.Calls, call)
+	return f.st(id), nil
+}
 func (f *Fake) SessionStatus(id string) (platform.CobrowseSessionStatus, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -17,10 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
-	"github.com/aceteam-ai/citadel-cli/internal/network"
-	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 )
@@ -42,8 +41,8 @@ type localDoctorDeps struct {
 }
 
 func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
-	// The vault is the node's passphrase vault; co-browse state is per user.
-	nodeDir := network.GetNodeConfigDir()
+	// Saved logins have their own per-user passphrase vault in the local
+	// state dir, separate from the node master PIN (aceteam#13503 S7).
 	stateDir := localStateDir()
 	d := localDoctorDeps{
 		goos:     runtime.GOOS,
@@ -56,7 +55,10 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 			}
 			return ln.Close()
 		},
-		vault: func() (bool, error) { return nodevault.Open(nodeDir).Configured() },
+		vault: func() (bool, error) {
+			st, err := cobrowseprofile.NewStore(stateDir).State()
+			return st.Configured, err
+		},
 		owner: func() error {
 			o, err := localcobrowse.AcquireOwner(stateDir)
 			if err != nil {
@@ -181,9 +183,9 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 	if set, err := d.vault(); err != nil {
 		warn("Passphrase", fmt.Sprintf("vault state unreadable: %v", err))
 	} else if set {
-		ok("Passphrase", "a vault passphrase is set")
+		ok("Passphrase", "a saved-logins passphrase is set")
 	} else {
-		ok("Passphrase", "not set; only needed later to remember logins on this computer")
+		ok("Passphrase", "not set; only needed to remember logins on this computer (the viewer asks when an agent first uses a saved profile)")
 	}
 
 	var oe *localcobrowse.OwnerError
