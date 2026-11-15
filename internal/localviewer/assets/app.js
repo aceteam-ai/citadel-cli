@@ -162,6 +162,8 @@
     $("commit-action").textContent = c.action;
     $("commit-domain").textContent = c.domain;
     $("commit-reason").textContent = "Why you are asked: " + c.reason + ".";
+    $("commit-approve").hidden = !!c.unverifiable;
+    if (c.unverifiable) $("commit-reason").textContent += " Citadel cannot verify this one, so it cannot be done for you: do it yourself in the browser, or deny it.";
     if (commitShown === c.id || !c.has_shot) return;
     // A different request: whatever was drawn belongs to the old one.
     clearShot();

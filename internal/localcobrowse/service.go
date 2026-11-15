@@ -590,7 +590,7 @@ func (s *Service) finish(ev Event, err error) {
 
 func isRefusal(err error) bool {
 	for _, e := range []error{ErrApprovalRequired, ErrApprovalDenied, ErrApprovalExpired, ErrApprovalRevoked,
-		ErrCommitApprovalRequired, ErrCommitPending, ErrCommitDenied, ErrNoPendingCommit, ErrUnknownPage, ErrPageChanged, ErrTypeNewline,
+		ErrCommitApprovalRequired, ErrCommitPending, ErrCommitDenied, ErrNoPendingCommit, ErrUnknownPage, ErrTargetTooLarge, ErrTargetUnverifiable, ErrPageChanged, ErrTypeNewline,
 		ErrHumanDriving, ErrOnlyUserHandsBack, ErrRateLimited, ErrTooManySessions, ErrNavigationRefused,
 		ErrProfilesUnavailable, ErrSessionLocked, ErrProfileInUse,
 		platform.ErrHandedOff, platform.ErrPasswordValue} {
@@ -1160,6 +1160,10 @@ func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platfor
 	pc := &pendingCommit{
 		id: newCommitID(), fp: fp, ref: a, domain: domain, action: describeAction(a, t), label: label,
 		reason: dec.Reason, requestedAt: now, rect: t.Rect,
+		// A target that could not be read (probe error, unresolved, too large)
+		// cannot be verified later either, so no approval of it is redeemable.
+		unverifiable: a.Kind != "navigate" && (!t.Resolved || t.Oversized),
+		tooLarge:     t.Oversized,
 	}
 	ss.commit = pc
 	ss.lastCommit, ss.result = "", nil
@@ -1322,7 +1326,7 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 		}
 	}
 	if c := ss.commit; c != nil && now.Sub(c.requestedAt) < PendingCommitTTL {
-		cv := &CommitView{ID: c.id, Domain: c.domain, Action: c.action, Label: c.label, Reason: c.reason,
+		cv := &CommitView{Unverifiable: c.unverifiable, ID: c.id, Domain: c.domain, Action: c.action, Label: c.label, Reason: c.reason,
 			RequestedAt: c.requestedAt.UTC().Format(time.RFC3339), HasShot: c.shot != ""}
 		if c.rect.W > 0 && c.rect.H > 0 {
 			r := c.rect
@@ -1801,11 +1805,32 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 	}
 	a := pc.ref
 	t := platform.TargetInfo{Resolved: true}
+	var probeErr error
 	if a.Kind != "navigate" {
-		var err error
-		if t, err = s.probe(id, a); err != nil {
+		if t, probeErr = s.probe(id, a); probeErr != nil {
 			t = platform.TargetInfo{Reason: "the page could not be inspected"}
 		}
+	}
+	if pc.unverifiable {
+		resolve("failed", "Citadel could not verify this target, so it was not done; do it yourself")
+		if pc.tooLarge {
+			s.finish(hev, ErrTargetTooLarge)
+			return ErrTargetTooLarge
+		}
+		s.finish(hev, ErrTargetUnverifiable)
+		return ErrTargetUnverifiable
+	}
+	if a.Kind != "navigate" && (probeErr != nil || !t.Resolved) {
+		resolve("failed", "the target could not be verified when you approved, so it was not done; do it yourself")
+		s.finish(hev, ErrTargetUnverifiable)
+		return ErrTargetUnverifiable
+	}
+	if t.Oversized {
+		// Content that cannot be hashed in full cannot be bound, so no approval
+		// of it is ever redeemable.
+		resolve("failed", "the form or message is too large to verify, so it was not executed")
+		s.finish(hev, ErrTargetTooLarge)
+		return ErrTargetTooLarge
 	}
 	if fingerprint(a, t) != pc.fp {
 		resolve("changed", "the page changed, so it was not executed; the agent will ask again")
