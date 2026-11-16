@@ -123,6 +123,22 @@ result. Local mode returns the same details as a tool error. An approved commit
 that was dispatched and then failed resolves as `unconfirmed`, not failed.
 `TestCobrowseRealBrowserActionLatency` pins the budgets.
 
+`platform.StageFile` and `platform.SetFileInput` own file upload for remotely
+dispatched sessions (#1721, node side of aceteam#13831). Staged files live in a
+`cobrowseStagingDirName` dir inside the session's own working dir, so every
+teardown, failed launch and orphan sweep removes it; teardown also removes it
+before a persistent profile is sealed. `ValidateStagedName` owns the single
+base-name rule and `resolveStagedFile` owns the proof that a path handed to the
+browser is a regular file directly inside that dir; the size and count caps are
+`MaxCobrowseStagedFileBytes` and `MaxCobrowseStagedFiles`. `set_file_input` is an
+ordinary `runAction` action. `cobrowseSession.watchChooserOnce` keeps one extra
+CDP connection that intercepts file choosers and `handleChooserEvent` owns the
+pending-chooser state reported in status; it never fills anything. The stage
+bytes ride in the `jobprivacy.BytesKey` payload field, which is dropped from
+every retained copy. Page-tracking (local) sessions get none of this.
+`TestCobrowseRealBrowserFileUpload` and `TestWindowsRealBrowserFileUpload` are
+the real-browser acceptance.
+
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
 per-domain write grant (default deny, see the next paragraph), the abuse limits, the
 idle lifetime and `local_cobrowse_wait`. `localcobrowse.NewURLPolicy` owns the

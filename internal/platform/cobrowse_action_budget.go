@@ -67,6 +67,8 @@ type ActionEffects struct {
 	// acknowledgement arrived before the deadline.
 	TypedLength      int  `json:"typed_length"`
 	TypedUnconfirmed bool `json:"typed_unconfirmed,omitempty"`
+	// FilesSet is the number of files handed to a file input by set_file_input.
+	FilesSet int `json:"files_set,omitempty"`
 	// Navigated is true when the page URL differs from before the action.
 	Navigated bool `json:"navigated"`
 	// Unknown is true when the read-back could not run (the page was refused,
@@ -78,7 +80,7 @@ type ActionEffects struct {
 // anyEffect reports whether the page is known or likely to have changed.
 // Dispatched alone is not an effect: it only says input may have been sent.
 func (e ActionEffects) anyEffect() bool {
-	return e.Scrolled || e.Focused || e.Clicked || e.TypedLength > 0 || e.Navigated
+	return e.Scrolled || e.Focused || e.Clicked || e.TypedLength > 0 || e.Navigated || e.FilesSet > 0
 }
 
 // ActionIncompleteError is returned when an action hit its deadline or failed
@@ -109,6 +111,9 @@ func (e *ActionIncompleteError) Error() string {
 	}
 	if e.Effects.Clicked {
 		parts = append(parts, "clicked")
+	}
+	if e.Effects.FilesSet > 0 {
+		parts = append(parts, fmt.Sprintf("set %d file(s) on a file input", e.Effects.FilesSet))
 	}
 	if e.Effects.TypedLength > 0 {
 		unconfirmed := ""
