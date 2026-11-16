@@ -3859,3 +3859,19 @@ Auto-generated log of every release.
   - fix(worker): heartbeat first and Retry-After backoff under platform 429 (#1677) (#1680)
 
 
+---
+
+## v2.231.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 19 |
+| Lines added | +2572 |
+
+**Changes:**
+
+  - fix(localviewer): first input after handoff reaches the streamed page (#1681) (#1686)
+  - fix(cobrowse): bounded single-connection actions with partial-effect reporting (#1663) (#1664)
+
+
