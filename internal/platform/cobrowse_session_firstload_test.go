@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,5 +95,41 @@ func TestCobrowseSessionStart_PendingFirstLoadBoundedByOneDeadline(t *testing.T)
 	}
 	if n := len(f.callsFor("Page.navigate")); n != 0 {
 		t.Fatalf("Page.navigate called %d time(s)", n)
+	}
+}
+
+// A cold tracked (local mode) browser can have no page target yet, so the pin
+// fails. That must still read as a pending first load, not a loaded start
+// page, and stay pending while status reads cannot see a page.
+func TestCobrowseSessionStart_TrackedNoPageTargetIsPendingThenClears(t *testing.T) {
+	shortSettle(t, 150*time.Millisecond)
+	f := newFakeDevTools(t)
+	withOpeners(t, map[string]string{})
+	installFixedPortLauncher(t, f.port)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	m.EnableTargetTracking(func(context.Context, string) error { return nil }, nil)
+	st, err := m.StartSession(slowStartURL)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Stop(st.ID) })
+	if st.FirstLoad != FirstLoadPending || st.PendingOrigin != "https://slow.example:8443" {
+		t.Fatalf("first_load/origin = %q / %q, want pending + origin", st.FirstLoad, st.PendingOrigin)
+	}
+	if got, _ := m.SessionStatus(st.ID); got.FirstLoad != FirstLoadPending || got.PendingOrigin != "https://slow.example:8443" {
+		t.Fatalf("unreadable status must stay pending, got %+v", got)
+	}
+	f.set([2]string{"a", slowStartURL})
+	got, _ := m.SessionStatus(st.ID)
+	if got.FirstLoad != "" || got.PendingOrigin != "" || got.URL != slowStartURL {
+		t.Fatalf("after the target appears: %+v, want cleared", got)
+	}
+	if again, _ := m.SessionStatus(st.ID); again.FirstLoad != "" {
+		t.Fatal("marker came back")
+	}
+	for _, c := range f.callsOn("a") {
+		if strings.HasSuffix(c, "Page.navigate") {
+			t.Fatal("start URL was re-issued")
+		}
 	}
 }

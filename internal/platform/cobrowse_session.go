@@ -139,6 +139,12 @@ func (s *cobrowseSession) setFirstLoadPending(startURL string) {
 	s.mu.Unlock()
 }
 
+func (s *cobrowseSession) clearFirstLoadPending() {
+	s.mu.Lock()
+	s.firstLoadPending, s.pendingOrigin = false, ""
+	s.mu.Unlock()
+}
+
 // applyFirstLoad sets or clears the pending marker from the URL a status read
 // found. An unknown (empty) URL leaves it pending.
 func (s *cobrowseSession) applyFirstLoad(st *CobrowseSessionStatus) {
@@ -471,6 +477,12 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		// window plus the report reserve, in total.
 		pctx, pcancel := context.WithTimeout(context.Background(), navigateSettleWindow+cobrowseReportReserve)
 		defer pcancel()
+		// Pending is marked up front, independent of whether the page can be
+		// pinned: a cold tracked browser may have no page target yet, and
+		// that must not read as a loaded start page. A status read clears it
+		// once it observes a committed, non-blank URL.
+		s.setFirstLoadPending(startURL)
+		st.FirstLoad, st.PendingOrigin = FirstLoadPending, urlOrigin(startURL)
 		if p, perr := s.pinActionCtx(pctx); perr == nil {
 			// The browser opens on about:blank, which already reads
 			// "complete", before the launch URL commits. Wait for the page to
@@ -486,9 +498,9 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 				st.URL = ps.URL
 			}
 			st.Title = ps.Title
-			if ps.URL == "" || ps.URL == "about:blank" {
-				s.setFirstLoadPending(startURL)
-				st.FirstLoad, st.PendingOrigin = FirstLoadPending, urlOrigin(startURL)
+			if ps.URL != "" && ps.URL != "about:blank" {
+				s.clearFirstLoadPending()
+				st.FirstLoad, st.PendingOrigin = "", ""
 			}
 		}
 	}
