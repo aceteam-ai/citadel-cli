@@ -87,11 +87,18 @@ func settleNavigation(p pin, before string) PageState {
 // settleLaunch is the start-up settle: the initial about:blank must not
 // satisfy the minimum-wait shortcut, so it waits for the page to commit away
 // from it (or for the settle window to end) and reports the current state.
-func settleLaunch(p pin) PageState {
-	return settlePage(p, "about:blank", true)
+//
+// parent carries the start-up's one deadline, shared with pinning, so the two
+// together never exceed it. The settle window still applies inside it.
+func settleLaunch(parent context.Context, p pin) PageState {
+	return settlePageCtx(parent, p, "about:blank", true)
 }
 
 func settlePage(p pin, before string, requireChange bool) PageState {
+	return settlePageCtx(context.Background(), p, before, requireChange)
+}
+
+func settlePageCtx(parent context.Context, p pin, before string, requireChange bool) PageState {
 	var last PageState
 	start := time.Now()
 	// One connection for the whole poll loop instead of a discovery and a
@@ -99,7 +106,7 @@ func settlePage(p pin, before string, requireChange bool) PageState {
 	// tick reconnects.
 	var conn *cdpConn
 	var caller cdpCaller = p
-	ctx, cancel := context.WithTimeout(context.Background(), navigateSettleWindow+cobrowseReportReserve)
+	ctx, cancel := context.WithTimeout(parent, navigateSettleWindow+cobrowseReportReserve)
 	defer cancel()
 	defer func() {
 		if conn != nil {

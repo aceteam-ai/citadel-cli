@@ -380,6 +380,9 @@ type fakeCDPServer struct {
 	calls          []recordedCDPCall
 	evaluateValue  func(expr string) any
 	screenshotData string
+	// listedURL, when set, is the page URL the /json target list reports
+	// (default about:blank).
+	listedURL func() string
 }
 
 func startFakeCDPServer(t *testing.T) *fakeCDPServer {
@@ -395,7 +398,13 @@ func startFakeCDPServer(t *testing.T) *fakeCDPServer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `[{"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/page/1"}]`, port)
+		pageURL := "about:blank"
+		f.mu.Lock()
+		if f.listedURL != nil {
+			pageURL = f.listedURL()
+		}
+		f.mu.Unlock()
+		fmt.Fprintf(w, `[{"type":"page","url":%q,"webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/page/1"}]`, pageURL, port)
 	})
 	mux.HandleFunc("/devtools/page/1", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := up.Upgrade(w, r, nil)
