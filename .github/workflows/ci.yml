@@ -133,6 +133,9 @@ jobs:
       - name: citadel local mcp (stdio JSON-RPC)
         run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide|TestNoLocalMCPToolCanApprove|TestLocalCommitPrompts|TestLocalPassphrase|TestLocalProfileStore|TestSecretReader|TestPassphraseWithSpaces|TestLocalStoreDirsArePrivate|TestSignalDuringClose|TestForget)'
 
+      - name: Self-update recovery and swap (Windows-only paths)
+        run: go test ./internal/update/ -count=1 -run '^(TestRecoverInterruptedSwap|TestAtomicReplaceWindows|TestRecoveryOwnerAuthority)'
+
       - name: Unit tests (Windows-portable subset)
         run: >-
           go test ./internal/platform/ -count=1 -run
