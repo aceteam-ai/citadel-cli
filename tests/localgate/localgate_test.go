@@ -81,6 +81,7 @@ func startMCP(t *testing.T, exe string, env []string) *mcpClient {
 	c := &mcpClient{t: t, pend: map[int]chan map[string]any{}, stderr: &bytes.Buffer{}, done: make(chan struct{})}
 	c.cmd = exec.Command(exe, "local", "mcp")
 	c.cmd.Env = env
+	setProcessGroup(c.cmd)
 	c.cmd.Stderr = &lockedWriter{w: c.stderr}
 	in, err := c.cmd.StdinPipe()
 	if err != nil {
@@ -121,7 +122,7 @@ func startMCP(t *testing.T, exe string, env []string) *mcpClient {
 		select {
 		case <-c.done:
 		case <-time.After(15 * time.Second):
-			_ = c.cmd.Process.Kill()
+			killTree(c.cmd)
 		}
 		_ = c.cmd.Wait()
 	})
@@ -596,11 +597,11 @@ func TestLocalModeGateThroughMCP(t *testing.T) {
 		t.Fatalf("handoff: %v", h)
 	}
 	fenced := c.call("local_cobrowse_click", map[string]any{"session_id": id, "selector": "#user"})
-	if !fenced.IsError {
-		t.Fatalf("an agent click during a handoff must be refused: %q", fenced.Text)
+	if !fenced.IsError || !strings.Contains(fenced.Text, "human_driving") {
+		t.Fatalf("an agent click during a handoff must be refused with human_driving: %v %q", fenced.IsError, fenced.Text)
 	}
-	if read := c.call("local_cobrowse_extract", map[string]any{"session_id": id, "selector": "#title"}); !read.IsError {
-		t.Fatalf("an agent read during a handoff must be refused: %q", read.Text)
+	if read := c.call("local_cobrowse_extract", map[string]any{"session_id": id, "selector": "#title"}); !read.IsError || !strings.Contains(read.Text, "human_driving") {
+		t.Fatalf("an agent read during a handoff must be refused with human_driving: %v %q", read.IsError, read.Text)
 	}
 	st := viewer.openStream(id)
 	// The first click after the handoff, then typing, then submit: all through
