@@ -338,6 +338,10 @@ func launchXvfbAttempt(profileDir, startURL string, lo LaunchOptions, plan *scop
 		softwareGL:  true,
 		proxyServer: lo.ProxyServer,
 		quiet:       lo.Quiet,
+		// Without this, Chrome's first cookie-store use waits on the desktop
+		// keyring over D-Bus and stalls the first page load for ~25s on a
+		// host with no unlocked keyring (citadel-cli#1694).
+		passwordStoreBasic: true,
 	})
 
 	argv := append([]string{chrome}, args...)

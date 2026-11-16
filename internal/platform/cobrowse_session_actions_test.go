@@ -1122,3 +1122,45 @@ func TestCobrowseSessionStart_NoURLUnchanged(t *testing.T) {
 		t.Fatal("start without a URL must not probe the page")
 	}
 }
+
+// A first load that never commits (the browser sits on about:blank) is asked
+// for once more, and a session that does load is not navigated again
+// (citadel-cli#1694).
+func TestCobrowseSessionStart_StalledFirstLoadRetriesOnce(t *testing.T) {
+	shortSettle(t, 300*time.Millisecond)
+	f := startFakeCDPServer(t)
+	f.mu.Lock()
+	f.evaluateValue = func(string) any {
+		if len(f.callsFor("Page.navigate")) == 0 {
+			return map[string]any{"url": "about:blank", "ready": "complete", "title": ""}
+		}
+		return map[string]any{"url": "https://example.com/", "ready": "complete", "title": "Loaded"}
+	}
+	f.mu.Unlock()
+	installFixedPortLauncher(t, f.port)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	begin := time.Now()
+	st, err := m.StartSession("https://example.com/")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if d := time.Since(begin); d > 5*time.Second {
+		t.Fatalf("start took %v, want it bounded", d)
+	}
+	calls := f.callsFor("Page.navigate")
+	if len(calls) != 1 || calls[0].Params["url"] != "https://example.com/" {
+		t.Fatalf("Page.navigate calls = %+v, want exactly one for the start URL", calls)
+	}
+	if st.URL != "https://example.com/" || st.Title != "Loaded" {
+		t.Fatalf("url/title = %q / %q, want the loaded page", st.URL, st.Title)
+	}
+}
+
+func TestCobrowseSessionStart_LoadedFirstPageIsNotRetried(t *testing.T) {
+	_, f := startOnFakeCDPWithURL(t, map[string]any{
+		"url": "https://example.com/", "ready": "complete", "title": "ok",
+	}, "https://example.com/")
+	if n := len(f.callsFor("Page.navigate")); n != 0 {
+		t.Fatalf("a loaded first page was navigated %d time(s)", n)
+	}
+}

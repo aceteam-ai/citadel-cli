@@ -420,7 +420,17 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		// where the page ended up, as Navigate does. Best effort: a page that
 		// cannot be read leaves the plain status.
 		if p, perr := s.pinAction(); perr == nil {
-			ps := settleNavigation(p, "")
+			// The browser opens on about:blank before the launch URL
+			// commits, so settle against that: reading the initial blank
+			// page as "settled" reported a blank start (citadel-cli#1694).
+			ps := settleNavigation(p, "about:blank")
+			if stalledFirstLoad(ps) && !p.refused {
+				// The launch URL never committed. Ask for it once more
+				// over CDP (same URL, already validated) and settle again.
+				if _, err := p.cdp("Page.navigate", map[string]any{"url": startURL}); err == nil {
+					ps = settleNavigation(p, "about:blank")
+				}
+			}
 			if ps.URL != "" {
 				st.URL = ps.URL
 			}
@@ -1011,4 +1021,10 @@ func closeBrowserGracefully(proc *cobrowseProc) {
 	case <-proc.exited:
 	case <-ctx.Done():
 	}
+}
+
+// stalledFirstLoad reports whether a start-up settle ended without the launch
+// URL ever replacing the initial blank page.
+func stalledFirstLoad(ps PageState) bool {
+	return ps.URL == "" || strings.EqualFold(ps.URL, "about:blank")
 }
