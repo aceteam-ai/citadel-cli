@@ -15,15 +15,12 @@ import (
 )
 
 // TestBuildChromeArgs_LinuxArgsUnchanged pins the exact headed (Xvfb) argument
-// list so the Windows headless options cannot change the Linux launch.
+// list (the real runner argv, including --password-store=basic) so the Windows
+// headless options cannot change the Linux launch.
 func TestBuildChromeArgs_LinuxArgsUnchanged(t *testing.T) {
-	got := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:  9333,
-		profileDir: "/p",
-		startURL:   "http://example.test/",
-		stealth:    true,
-		softwareGL: true,
-	})
+	t.Setenv(EnvCobrowseUserAgent, "")
+	t.Setenv(EnvCobrowseStealth, "")
+	got := buildXvfbChromeArgs(9333, "/p", "http://example.test/", LaunchOptions{})
 	want := []string{
 		"--remote-debugging-port=9333",
 		"--remote-debugging-address=127.0.0.1",
@@ -35,6 +32,7 @@ func TestBuildChromeArgs_LinuxArgsUnchanged(t *testing.T) {
 		"--lang=en-US",
 		"--disable-features=Translate",
 		"--disable-gpu",
+		"--password-store=basic",
 		"--",
 		"http://example.test/",
 	}

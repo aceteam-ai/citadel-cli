@@ -1122,3 +1122,46 @@ func TestCobrowseSessionStart_NoURLUnchanged(t *testing.T) {
 		t.Fatal("start without a URL must not probe the page")
 	}
 }
+
+// The launch URL commits after the first read. The start-up settle must wait
+// for it (about:blank already reads "complete", so the minimum shortcut must
+// not apply), report the committed page, and never re-navigate: a launch URL
+// can be single-use (citadel-cli#1694).
+func TestCobrowseSessionStart_WaitsForCommitWithoutRenavigating(t *testing.T) {
+	w, m, p := navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll
+	navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll = 300*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll = w, m, p })
+	f := startFakeCDPServer(t)
+	var once sync.Once
+	var firstRead time.Time
+	f.mu.Lock()
+	f.evaluateValue = func(string) any {
+		once.Do(func() { firstRead = time.Now() })
+		if time.Since(firstRead) < 150*time.Millisecond {
+			return map[string]any{"url": "about:blank", "ready": "complete", "title": ""}
+		}
+		return map[string]any{"url": "https://example.com/committed", "ready": "complete", "title": "Committed"}
+	}
+	f.mu.Unlock()
+	installFixedPortLauncher(t, f.port)
+	mgr := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := mgr.StartSession("https://example.com/launch")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if n := len(f.callsFor("Page.navigate")); n != 0 {
+		t.Fatalf("start re-navigated %d time(s); the launch URL must be requested once", n)
+	}
+	if st.URL != "https://example.com/committed" || st.Title != "Committed" {
+		t.Fatalf("url/title = %q / %q, want the committed page, not about:blank", st.URL, st.Title)
+	}
+}
+
+func TestCobrowseSessionStart_LoadedFirstPageIsNotNavigatedAgain(t *testing.T) {
+	_, f := startOnFakeCDPWithURL(t, map[string]any{
+		"url": "https://example.com/", "ready": "complete", "title": "ok",
+	}, "https://example.com/")
+	if n := len(f.callsFor("Page.navigate")); n != 0 {
+		t.Fatalf("a loaded first page was navigated %d time(s)", n)
+	}
+}

@@ -329,16 +329,7 @@ func launchXvfbAttempt(profileDir, startURL string, lo LaunchOptions, plan *scop
 
 	// A managed Xvfb has no GPU, so force software rendering (matches the sibling
 	// launchers). stealthEnabled() keeps parity with the other browser launches.
-	args := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:   debugPort,
-		profileDir:  profileDir,
-		startURL:    startURL,
-		stealth:     stealthEnabled(),
-		userAgent:   os.Getenv(EnvCobrowseUserAgent),
-		softwareGL:  true,
-		proxyServer: lo.ProxyServer,
-		quiet:       lo.Quiet,
-	})
+	args := buildXvfbChromeArgs(debugPort, profileDir, startURL, lo)
 
 	argv := append([]string{chrome}, args...)
 	if plan != nil {
@@ -460,4 +451,31 @@ func cobrowseCDPReadyTimeout() time.Duration {
 		return time.Duration(v) * time.Second
 	}
 	return 20 * time.Second
+}
+
+// buildXvfbChromeArgs is the Chrome command line for the managed-Xvfb co-browse
+// runner, shared by local mode and the remote `citadel work` path. A managed
+// Xvfb has no GPU, so software rendering is forced; stealthEnabled() keeps
+// parity with the other browser launches.
+//
+// passwordStoreBasic is load-bearing for first-load latency: without it Chrome
+// waits on the desktop keyring over D-Bus at its first cookie-store use and
+// stalls the first request for ~25s on a host with no unlocked keyring
+// (citadel-cli#1694). Consequence: cookies in a profile are encrypted with
+// Chromium's fixed basic key, so a local-mode saved login (#1647) created
+// earlier on desktop Linux with a working keyring is not readable once and the
+// user signs in again. The working dir is 0700 and the sealed blob is
+// vault-encrypted either way.
+func buildXvfbChromeArgs(debugPort int, profileDir, startURL string, lo LaunchOptions) []string {
+	return buildChromeArgs(cobrowseLaunchOptions{
+		debugPort:          debugPort,
+		profileDir:         profileDir,
+		startURL:           startURL,
+		stealth:            stealthEnabled(),
+		userAgent:          os.Getenv(EnvCobrowseUserAgent),
+		softwareGL:         true,
+		proxyServer:        lo.ProxyServer,
+		quiet:              lo.Quiet,
+		passwordStoreBasic: true,
+	})
 }

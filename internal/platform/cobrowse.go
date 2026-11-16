@@ -108,7 +108,8 @@ type cobrowseLaunchOptions struct {
 	// (--password-store=basic) instead of the OS keyring. See buildChromeArgs for
 	// the full rationale: it makes cookie encryption binary- and
 	// environment-independent, which a persistent, externally-seeded profile
-	// requires. Left false for co-browse (keeps keyring-backed persistent logins).
+	// requires. Also set for the managed-Xvfb co-browse runner (buildXvfbChromeArgs), where
+	// the keyring wait stalled the first page load ~25s (citadel-cli#1694).
 	passwordStoreBasic bool
 	// autoplayNoUserGesture relaxes Chrome's autoplay policy
 	// (--autoplay-policy=no-user-gesture-required). An automated browser has no
