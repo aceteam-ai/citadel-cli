@@ -64,6 +64,9 @@ func TestExtractTarSkipsStagingEntries(t *testing.T) {
 	}
 	add(".citadel-stage/", "", true)
 	add(".citadel-stage/doc.pdf", "user file", false)
+	// Non-canonical spellings of the same destination must be skipped too.
+	add(".//.citadel-stage/a.txt", "user file", false)
+	add("././.citadel-stage/b.txt", "user file", false)
 	add("Default/Cookies", "keep", false)
 	_ = tw.Close()
 	dst := t.TempDir()

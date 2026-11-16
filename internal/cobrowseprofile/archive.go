@@ -172,8 +172,10 @@ func extractTar(blob []byte, dstDir string) error {
 		if err != nil {
 			return err
 		}
-		// Never restore staged files, even from an older or hostile blob.
-		if isStagingPath(strings.TrimSuffix(strings.TrimPrefix(filepath.ToSlash(hdr.Name), "./"), "/")) {
+		// Never restore staged files, even from an older or hostile blob. Judge
+		// the normalized destination, not the raw header: "././.citadel-stage/x"
+		// and ".//.citadel-stage/x" join to the same place as the canonical name.
+		if rel, rerr := filepath.Rel(filepath.Clean(dstDir), target); rerr != nil || isStagingPath(rel) {
 			continue
 		}
 		switch hdr.Typeflag {
