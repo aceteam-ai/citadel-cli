@@ -141,6 +141,13 @@ jobs:
           go test ./internal/platform/ -count=1 -run
           '^(TestWindows|TestReconcileTargets|TestTargetSet|TestUnconfiguredTargetSet|TestRefusedLastPage|TestNavigateFromRefusedPage|TestVerdictCaches|TestCachedRefusalExpires|TestActionsRefusedOnRefusedPage|TestSetActive|TestManagerPageChoice|TestCloseTargetByID|TestActionRefusedWhenAnother|TestActionsAreSentToThe|TestNodeWideManagerDoesNotTrack|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestThrowawaySession_NoGracefulClose|TestGracefulClose|TestCleanOrphanedProfileSessions|TestPersistentSessionWritesProfileMarker|TestStartSessionWithID|TestCobrowseSessionActions_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
 
+      # Both installer entrypoints from this elevated runner (citadel-cli#1695).
+      # Downloads the latest release, since the installers have no local-archive
+      # option.
+      - name: Installer ownership (both entrypoints, per-user and machine-wide)
+        shell: pwsh
+        run: ./scripts/test-install-owner.ps1
+
       # The shipped binary, end to end: discovery, a hidden test launch, the
       # loopback bind and the audit/owner checks, plus the stdio server's
       # initialize/tools/list. The runner's own profile is throwaway.
@@ -148,8 +155,9 @@ jobs:
         shell: pwsh
         run: |
           go build -o citadel.exe ./cmd/citadel
-          # The elevated runner leaves the build owned by Administrators, which
-          # doctor flags (#1695); apply the documented fix first.
+          # A go build output is not an installer, so the elevated runner leaves it
+          # owned by Administrators, which doctor flags (#1695); apply the
+          # documented fix first.
           icacls ./citadel.exe /setowner "$env:USERDOMAIN\$env:USERNAME"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./citadel.exe local doctor
