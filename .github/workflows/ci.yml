@@ -148,6 +148,10 @@ jobs:
         shell: pwsh
         run: |
           go build -o citadel.exe ./cmd/citadel
+          # The elevated runner leaves the build owned by Administrators, which
+          # doctor flags (#1695); apply the documented fix first.
+          icacls ./citadel.exe /setowner "$env:USERDOMAIN\$env:USERNAME"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./citadel.exe local doctor
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $in = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"ci"}}}' + "`n" + '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
