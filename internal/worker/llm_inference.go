@@ -2052,6 +2052,11 @@ func (h *LLMInferenceHandler) warming(model string, etaSeconds, retryAfterSecond
 	if retryAfterSeconds <= 0 {
 		retryAfterSeconds = warmingRetryAfter
 	}
+	// Never quote an ETA shorter than the retry interval: "~0s" reads as done
+	// and a caller that does not retry fails the step (citadel-cli#1640).
+	if etaSeconds < retryAfterSeconds {
+		etaSeconds = retryAfterSeconds
+	}
 	output := map[string]any{
 		"status":      "model_warming",
 		"model":       model,
