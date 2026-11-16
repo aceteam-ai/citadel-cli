@@ -86,9 +86,12 @@ type TargetPolicy = func(ctx context.Context, rawURL string) error
 type TargetEventFunc = func(sessionID, action, rawURL string, reason error)
 
 type targetSet struct {
-	// syncMu serializes whole synchronizations so two callers never close the
-	// same page or reorder the opener stack.
-	syncMu sync.Mutex
+	// syncSem serializes whole synchronizations so two callers never close the
+	// same page or reorder the opener stack. It is a one-slot semaphore rather
+	// than a mutex so a waiter gives up when its own context ends: a long sync
+	// for one caller (a status read) must not hold another (an action) past
+	// its deadline.
+	syncSem chan struct{}
 
 	mu         sync.Mutex
 	sessionID  string
@@ -112,7 +115,7 @@ type originRefusal struct {
 }
 
 func newTargetSet() *targetSet {
-	return &targetSet{known: map[string]string{}, okOrigins: map[string]time.Time{}, badOrigins: map[string]originRefusal{}}
+	return &targetSet{syncSem: make(chan struct{}, 1), known: map[string]string{}, okOrigins: map[string]time.Time{}, badOrigins: map[string]originRefusal{}}
 }
 
 // targetNow is the clock for verdict expiry; tests replace it.
@@ -267,8 +270,12 @@ func reconcileTargets(active string, stack, prev, ids []string, openerOf func(id
 // sync reads the browser's pages, closes any the policy refuses or the bound
 // excludes, updates the active page and returns the snapshot.
 func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error) {
-	t.syncMu.Lock()
-	defer t.syncMu.Unlock()
+	select {
+	case t.syncSem <- struct{}{}:
+	case <-ctx.Done():
+		return CobrowseTargets{}, ctx.Err()
+	}
+	defer func() { <-t.syncSem }()
 	list, overflow, err := cdpdiscovery.ListBounded(ctx, port, cdpHTTPClient)
 	if err != nil {
 		return CobrowseTargets{}, err

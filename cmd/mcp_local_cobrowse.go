@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -72,6 +73,11 @@ type localCobrowseOptions struct {
 	// auditRetention overrides the audit retention (default 90 days, or
 	// CITADEL_LOCAL_AUDIT_RETENTION_DAYS).
 	auditRetention time.Duration
+	// resolve and dial replace the system resolver and dialer in both the URL
+	// policy and the egress guard. They are only set by the citadel_e2e test
+	// build (local_e2e_hook.go); the address policy itself is unchanged.
+	resolve localcobrowse.Resolver
+	dial    func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // localAuditRetention reads CITADEL_LOCAL_AUDIT_RETENTION_DAYS (1 to 3650).
@@ -205,6 +211,10 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 		onAttention = rt.attention
 		viewerNote = "The Citadel viewer opens in the user's default browser, where they watch, approve and take control. If it is closed, they can run `citadel local viewer`."
 	}
+	policy := opts.policy
+	if policy == nil && opts.resolve != nil {
+		policy = localcobrowse.NewURLPolicy(opts.resolve, viewerPorts)
+	}
 	var profiles localcobrowse.ProfileStore
 	if opts.ownerDir != nil {
 		profiles = localProfileStore{dir: opts.ownerDir}
@@ -212,7 +222,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	rt.svc = localcobrowse.New(localcobrowse.Config{
 		Browser:     browser,
 		Profiles:    profiles,
-		URLPolicy:   opts.policy,
+		URLPolicy:   policy,
 		ViewerPorts: viewerPorts,
 		OnAttention: onAttention,
 		OnEvent: func(ev localcobrowse.Event) {
@@ -250,7 +260,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 				// Every connection of the real browser goes through the
 				// egress guard. If it cannot start, co-browse refuses: the
 				// URL filter alone does not see redirects or subresources.
-				g, gerr := localcobrowse.StartEgressGuard(nil, nil)
+				g, gerr := localcobrowse.StartEgressGuard(opts.resolve, opts.dial)
 				if gerr != nil {
 					// Drop the log before the lock: once released, another
 					// process may own (and write) this chain.
@@ -562,7 +572,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if in.Selector == "" && (in.X == nil || in.Y == nil) {
 					return nil, argError{fmt.Errorf("click requires 'selector' or both 'x' and 'y'")}
 				}
-				return s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal)
+				return partialActionResult(s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal))
 			}),
 		writeTool("local_cobrowse_type", "Type text into the focused field (click it first). Only the text length is recorded. Never use this for passwords: hand off to the user instead."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "text": strProp("Text to insert."), "goal": strProp(descGoal)},
@@ -579,7 +589,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Type(ctx, id, in.Text, in.Goal)
+				return partialActionResult(s.Type(ctx, id, in.Text, in.Goal))
 			}),
 		writeTool("local_cobrowse_select", "Choose an option in a native select element by value or label."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector of the select element."),
@@ -614,7 +624,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Key(ctx, id, in.Key, in.Goal)
+				return partialActionResult(s.Key(ctx, id, in.Key, in.Goal))
 			}),
 		writeTool("local_cobrowse_scroll", "Scroll with the mouse wheel at an element or viewport point."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector; wins over x/y."),
@@ -630,7 +640,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Scroll(ctx, id, in.Selector, in.X, in.Y, in.DeltaX, in.DeltaY, in.Goal)
+				return partialActionResult(s.Scroll(ctx, id, in.Selector, in.X, in.Y, in.DeltaX, in.DeltaY, in.Goal))
 			}),
 		writeTool("local_cobrowse_extract", "Read an element's text (bounded; truncated is true when cut) and optional attributes. The value of a password field is never returned."+readNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector."),
@@ -785,4 +795,32 @@ func handleLocalCobrowseSignals(rt *localCobrowseRuntime) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go closeOnSignal(rt, sigs, os.Exit)
+}
+
+// partialToolError is the error a partly done write returns: the failure text
+// first, then the structured result (done=false, effects), so the MCP result is
+// isError with the details attached. It is never a plain success.
+type partialToolError struct {
+	err    error
+	result []byte
+}
+
+func (e *partialToolError) Error() string { return e.err.Error() + "\nresult: " + string(e.result) }
+func (e *partialToolError) Unwrap() error { return e.err }
+
+// partialActionResult attaches the structured effects of a write that hit its
+// deadline or failed after it may have acted to the tool ERROR. Refusals stay
+// exactly as they were. The failure was already audited.
+func partialActionResult(res localcobrowse.ActionResult, err error) (any, error) {
+	if err == nil || res.Done == nil || *res.Done {
+		return res, err
+	}
+	if errors.Is(err, platform.ErrTargetChanged) || errors.Is(err, platform.ErrPageRefused) {
+		return nil, err
+	}
+	b, merr := json.Marshal(res)
+	if merr != nil {
+		return nil, err
+	}
+	return nil, &partialToolError{err: err, result: b}
 }

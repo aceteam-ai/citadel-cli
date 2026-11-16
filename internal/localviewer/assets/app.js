@@ -188,7 +188,8 @@
     if (!c && r) {
       $("commit-result").textContent = r.state === "executed"
         ? "Approved and done: " + r.action + " on " + r.domain + "."
-        : (r.state === "changed" ? "The page changed, so " + r.action + " on " + r.domain + " was not done. The agent will ask again."
+        : (r.state === "unconfirmed" ? "May have been done: " + r.action + " on " + r.domain + ". Check the page before asking the agent to try again."
+          : r.state === "changed" ? "The page changed, so " + r.action + " on " + r.domain + " was not done. The agent will ask again."
           : "Not done (" + r.state + "): " + r.action + " on " + r.domain + ". " + (r.detail || ""));
     }
     if (!c) { commitShown = null; clearShot(); return; }
@@ -286,8 +287,11 @@
   screen.addEventListener("mousedown", (ev) => {
     if (!human) return;
     ev.preventDefault();
-    $("screen-wrap").focus();
+    // Read the position before focusing: focusing can scroll the viewer page,
+    // which would move the picture under the pointer and send the click to the
+    // wrong place. preventScroll keeps the document where the user left it.
     const p = pos(ev);
+    $("screen-wrap").focus({ preventScroll: true });
     send({ type: "mouse", event: "mousePressed", x: p.x, y: p.y, button: buttonName(ev.button), buttons: ev.buttons, clickCount: ev.detail || 1 });
   });
   screen.addEventListener("mouseup", (ev) => {
