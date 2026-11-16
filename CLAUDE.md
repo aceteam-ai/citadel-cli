@@ -31,6 +31,12 @@ So, when adding to this file:
 
 ## Project Overview
 
+`status.collectCapacityMetrics` owns additive optional heartbeat placement
+signals and per-source unknown handling. `nativeCapacityProbes` owns the
+build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
+both heartbeat transports without native sampling. See
+`docs/heartbeat-capacity.md` for field semantics and platform limits.
+
 `mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
 descriptor acquisition: it checks a no-follow leaf pin before any readable
 leaf open, and fails closed if the verified procfs FD route is unavailable.
