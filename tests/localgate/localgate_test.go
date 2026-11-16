@@ -490,6 +490,14 @@ func TestLocalModeGateThroughMCP(t *testing.T) {
 		"github.com/aceteam-ai/citadel-cli/cmd/citadel").CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
+	if runtime.GOOS == "windows" {
+		// An elevated runner leaves the build owned by Administrators, which
+		// doctor flags (#1695: self-update would be refused). Not under test here.
+		who := os.Getenv("USERDOMAIN") + `\` + os.Getenv("USERNAME")
+		if out, err := exec.Command("icacls", exe, "/setowner", who).CombinedOutput(); err != nil {
+			t.Fatalf("icacls setowner: %v\n%s", err, out)
+		}
+	}
 
 	page := loginServer()
 	defer page.Close()
