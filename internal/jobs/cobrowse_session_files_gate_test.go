@@ -25,9 +25,8 @@ func filePayloads() []map[string]string {
 // the session is even looked up, so nothing can reach a staging dir.
 func TestCobrowseSession_FileActionsRefusedWhenFilesOff(t *testing.T) {
 	for _, h := range []*CobrowseSessionHandler{
-		{Disabled: true},
+		{},
 		{Enabled: func() bool { return false }},
-		{Disabled: false, Enabled: func() bool { return false }},
 	} {
 		for _, p := range filePayloads() {
 			if err := runGated(h, p); !errors.Is(err, ErrFilesDisabled) {
@@ -55,7 +54,7 @@ func TestCobrowseSession_FileActionsAllowedWhenFilesOnAndLive(t *testing.T) {
 		}
 	}
 	// Other session actions are not gated by Files.
-	if err := runGated(&CobrowseSessionHandler{Disabled: true}, map[string]string{"action": CobrowseSessionActionStatus, "session_id": "cb-none"}); errors.Is(err, ErrFilesDisabled) {
+	if err := runGated(&CobrowseSessionHandler{}, map[string]string{"action": CobrowseSessionActionStatus, "session_id": "cb-none"}); errors.Is(err, ErrFilesDisabled) {
 		t.Error("status must not need the Files permission")
 	}
 }

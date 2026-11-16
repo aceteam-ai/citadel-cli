@@ -12,7 +12,8 @@ func TestCobrowseSessionHandlerFollowsLiveFilesPermission(t *testing.T) {
 	if !h.Enabled() {
 		t.Fatal("handler must see Files turned on without being rebuilt")
 	}
-	if !cobrowseSessionHandlerFor(LegacyHandlerOpts{FilesDisabled: true}).Disabled {
-		t.Fatal("static FilesDisabled must carry over")
+	// No permission source at all denies.
+	if cobrowseSessionHandlerFor(LegacyHandlerOpts{}).Enabled != nil {
+		t.Fatal("no live source must leave the handler denying")
 	}
 }

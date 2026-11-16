@@ -137,7 +137,12 @@ pending-chooser state reported in status; it never fills anything. The stage
 bytes ride in the `jobprivacy.BytesKey` payload field, which is dropped from
 every retained copy. `CobrowseSessionHandler.filesAllowed` gates `stage_file` and
 `set_file_input` on the live Files permission (same source as FILE_WRITE_BYTES,
-read per job) and refuses with `jobs.ErrFilesDisabled`; no passcode. Human
+read per job) and refuses with `jobs.ErrFilesDisabled`; no passcode; a handler with no permission source denies.
+Teardown closes staging (`closeStaging`, under `stageMu`) before removing it and
+refuses to seal a persistent profile if removal fails; `cobrowseprofile` also
+never archives or restores `.citadel-stage`. A `backend_node_id` is accepted only
+for the chooser the page opened. The Redis ack removes a `stage_file` stream
+entry (API mode has no equivalent yet). Human
 attach during handoff is #1723. Page-tracking (local) sessions get none of this.
 `TestCobrowseRealBrowserFileUpload` and `TestWindowsRealBrowserFileUpload` are
 the real-browser acceptance.

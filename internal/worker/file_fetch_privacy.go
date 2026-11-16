@@ -10,7 +10,7 @@ import (
 )
 
 func (s *RedisSource) ackDelivery(ctx context.Context, kind, queue, messageID string) error {
-	if kind == JobTypeFileFetch {
+	if kind == JobTypeFileFetch || kind == JobTypeCobrowseSession {
 		return s.client.AckFileFetchJob(ctx, queue, messageID)
 	}
 	if queue != "" {

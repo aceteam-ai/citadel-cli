@@ -142,6 +142,13 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 					continue
 				}
 			}
+			// A JSON number node id must stay decimal ("1000000", not "1e+06").
+			if a.jobType == JobTypeCobrowseSession && k == "backend_node_id" {
+				if number, ok := v.(float64); ok {
+					nexusJob.Payload[k] = strconv.FormatFloat(number, 'f', -1, 64)
+					continue
+				}
+			}
 			switch val := v.(type) {
 			case string:
 				nexusJob.Payload[k] = val
@@ -705,7 +712,6 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 // FILE_WRITE_BYTES (citadel-cli#1721).
 func cobrowseSessionHandlerFor(opts LegacyHandlerOpts) *jobs.CobrowseSessionHandler {
 	h := jobs.NewCobrowseSessionHandler()
-	h.Disabled = opts.FilesDisabled
 	h.Enabled = opts.FilesEnabled
 	return h
 }

@@ -23,8 +23,29 @@ type FileChooserPending struct {
 	BackendNodeID int `json:"backend_node_id"`
 	// Multiple is true when the input accepts more than one file.
 	Multiple bool `json:"multiple"`
+	// FrameID is the frame whose input opened the chooser.
+	FrameID string `json:"frame_id,omitempty"`
 	// OpenedAt is when the node saw the chooser open (RFC 3339, UTC).
 	OpenedAt string `json:"opened_at,omitempty"`
+}
+
+// chooserMaxMessageBytes bounds one CDP message read by the watcher.
+const chooserMaxMessageBytes = 1 << 20
+
+// browserAlive reports whether this session still owns a running browser on
+// port.
+func (s *cobrowseSession) browserAlive(port int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.proc == nil || s.proc.debugPort != port {
+		return false
+	}
+	select {
+	case <-s.proc.exited:
+		return false
+	default:
+		return true
+	}
 }
 
 // chooserReconnectDelay is the pause before the watcher redials a page after
@@ -41,8 +62,10 @@ func (s *cobrowseSession) handleChooserEvent(method string, params map[string]an
 			return
 		}
 		mode, _ := params["mode"].(string)
+		frame, _ := params["frameId"].(string)
 		s.mu.Lock()
 		s.chooser = &FileChooserPending{
+			FrameID:       frame,
 			BackendNodeID: int(id),
 			Multiple:      mode == "selectMultiple",
 			OpenedAt:      time.Now().UTC().Format(time.RFC3339),
@@ -81,7 +104,7 @@ func (s *cobrowseSession) startChooserWatch(port int) {
 		return
 	}
 	s.mu.Lock()
-	if s.watchStop != nil {
+	if s.watchStop != nil || s.watchStopped {
 		s.mu.Unlock()
 		return
 	}
@@ -92,6 +115,11 @@ func (s *cobrowseSession) startChooserWatch(port int) {
 }
 
 func (s *cobrowseSession) stopChooserWatch() {
+	// Mark first, so a start that arrives after any stop is a no-op even when
+	// the once below has already been used.
+	s.mu.Lock()
+	s.watchStopped = true
+	s.mu.Unlock()
 	s.watchOnce.Do(func() {
 		s.mu.Lock()
 		stop := s.watchStop
@@ -110,6 +138,9 @@ func (s *cobrowseSession) watchChooser(port int, stop <-chan struct{}) {
 		case <-stop:
 			return
 		default:
+		}
+		if !s.browserAlive(port) {
+			return
 		}
 		s.watchChooserOnce(port, stop)
 		select {
@@ -132,6 +163,19 @@ func (s *cobrowseSession) watchChooserOnce(port int, stop <-chan struct{}) {
 		case <-ctx.Done():
 		}
 	}()
+	// Only ever attach to THIS session's browser: a dead port may be reused
+	// by a later session's browser.
+	s.mu.Lock()
+	want := ""
+	if s.proc != nil {
+		want = s.proc.browserID
+	}
+	s.mu.Unlock()
+	if want != "" {
+		if err := verifyCDPBrowserID(port, want); err != nil {
+			return
+		}
+	}
 	dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
 	target, err := pickTargetContext(dctx, port)
 	if err != nil {
@@ -144,6 +188,9 @@ func (s *cobrowseSession) watchChooserOnce(port int, stop <-chan struct{}) {
 		return
 	}
 	defer ws.Close()
+	// Only small events arrive here; a stricter bound than the viewer stream's
+	// 64 MiB screencast budget.
+	ws.SetReadLimit(chooserMaxMessageBytes)
 	go func() { <-ctx.Done(); _ = ws.Close() }()
 	for i, m := range []string{"Page.enable", "Page.setInterceptFileChooserDialog"} {
 		params := map[string]any{}

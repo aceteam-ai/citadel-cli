@@ -12,6 +12,9 @@ import (
 
 // Classify from the original stream entry, not a caller-supplied type. Only
 // FILE_FETCH is disposable on ACK; other job streams retain existing semantics.
+// A COBROWSE_SESSION stage_file entry carries a user's file as base64, so it is
+// disposable on ACK too (citadel-cli#1721); every other COBROWSE_SESSION action
+// keeps the normal retention.
 var acknowledgeFileFetch = goredis.NewScript(`
 local entries = redis.call('XRANGE', KEYS[1], ARGV[2], ARGV[2])
 local kind = ''
@@ -27,8 +30,18 @@ if #entries > 0 then
     if ok and type(decoded) == 'table' then kind = decoded['type'] end
   end
 end
+local disposable = kind == 'FILE_FETCH'
+if kind == 'COBROWSE_SESSION' and #entries > 0 then
+  local fields = entries[1][2]
+  for i = 1, #fields, 2 do
+    if fields[i] == 'payload' then
+      local ok, decoded = pcall(cjson.decode, fields[i + 1])
+      if ok and type(decoded) == 'table' and decoded['action'] == 'stage_file' then disposable = true end
+    end
+  end
+end
 local acknowledged = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
-if acknowledged == 1 and kind == 'FILE_FETCH' then redis.call('XDEL', KEYS[1], ARGV[2]) end
+if acknowledged == 1 and disposable then redis.call('XDEL', KEYS[1], ARGV[2]) end
 return acknowledged
 `)
 

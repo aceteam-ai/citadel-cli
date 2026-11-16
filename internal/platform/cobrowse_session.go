@@ -233,12 +233,15 @@ type cobrowseSession struct {
 	expectTarget string
 
 	// stageMu serializes writes into the staging dir (count check and create).
-	stageMu sync.Mutex
+	stageMu     sync.Mutex
+	stageClosed bool
 	// chooser is the pending file chooser, guarded by mu; watchStop ends the
 	// chooser watcher (closed once through watchOnce).
 	chooser   *FileChooserPending
 	watchStop chan struct{}
 	watchOnce sync.Once
+	// watchStopped makes a start after any stop a no-op.
+	watchStopped bool
 }
 
 var (
@@ -414,6 +417,7 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 	m.mu.Lock()
 	if m.sessions[id] != s {
 		m.mu.Unlock()
+		s.stopChooserWatch()
 		_ = proc.stop()
 		// Do NOT persist here: the session was torn down mid-launch, the concurrent
 		// teardown may already have removed the working dir, and sealing an empty or
@@ -622,9 +626,11 @@ func (s *cobrowseSession) teardown() error {
 	regDir := s.regDir
 	s.mu.Unlock()
 	s.stopChooserWatch()
+	// No stage may start from here on; one already running has finished.
 	// Staged user files go first, so a persistent profile's sealed copy can
-	// never contain them (and a failed removal below cannot leave them).
-	s.removeStagingDir()
+	// never contain them.
+	s.closeStaging()
+	_ = s.removeStagingDir()
 	// A stopped session leaves no registry record: it did not "end" unexpectedly.
 	if regDir != "" {
 		deleteRecord(regDir, s.id)
@@ -646,14 +652,19 @@ func (s *cobrowseSession) teardown() error {
 		dropTargetSet(proc.debugPort)
 	}
 	// Again after the browser is gone (it may have held a staged file open),
-	// and always before Persist seals anything.
-	s.removeStagingDir()
+	// and always before Persist seals anything. A dir that cannot be removed
+	// is never sealed.
+	stageErr := s.removeStagingDir()
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
 		// produced new state, and sealing an empty/partial working dir would
 		// overwrite a good profile with nothing.
 		if proc != nil {
-			if perr := enc.Persist(profile); perr != nil && err == nil {
+			if stageErr != nil {
+				if err == nil {
+					err = stageErr
+				}
+			} else if perr := enc.Persist(profile); perr != nil && err == nil {
 				err = perr
 			}
 		}

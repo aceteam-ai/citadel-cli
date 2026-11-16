@@ -76,19 +76,15 @@ const CobrowseStageBytesKey = jobprivacy.BytesKey
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
 // CobrowseSessionManager singleton.
 type CobrowseSessionHandler struct {
-	// Disabled and Enabled gate stage_file and set_file_input on the node's
-	// Files permission, exactly as FILE_WRITE_BYTES does: Enabled, when set, is
-	// read live per job and wins; otherwise Disabled applies. Other session
-	// actions are not affected.
-	Disabled bool
-	Enabled  func() bool
+	// Enabled gates stage_file and set_file_input on the node's Files
+	// permission, read live per job (as FILE_WRITE_BYTES does). Unset denies:
+	// a handler built without a permission source never writes a user file.
+	// Other session actions are not affected.
+	Enabled func() bool
 }
 
 func (h *CobrowseSessionHandler) filesAllowed() bool {
-	if h.Enabled != nil {
-		return h.Enabled()
-	}
-	return !h.Disabled
+	return h.Enabled != nil && h.Enabled()
 }
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
