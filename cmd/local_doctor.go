@@ -111,6 +111,9 @@ the browser Citadel will use, a hidden (headless) test launch, the local viewer
 port, the passphrase vault, other agent apps, the audit log, and which agent
 app configs already point at citadel. It makes no network calls.`,
 	Args: cobra.NoArgs,
+	// A failed check is a result, not a usage mistake: print the results and
+	// the fix, never the flag help.
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runLocalDoctor(realLocalDoctorDeps(localDoctorSkipLaunch), cmd.OutOrStdout())
 	},

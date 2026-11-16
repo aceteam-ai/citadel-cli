@@ -3894,3 +3894,23 @@ Auto-generated log of every release.
   - test(local): CI end-to-end of the local-mode gate through citadel local mcp (#1683) (#1685)
 
 
+---
+
+## v2.233.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 37 |
+| Lines added | +3234 |
+
+**Changes:**
+
+  - feat(lanes): bounded read-only lane inventory (#1699) (#1711)
+  - fix(localviewer): focus the stream when the human takes control (#1687) (#1692)
+  - fix(cobrowse): fast, retried first page load after session start (#1694) (#1710)
+  - test(cobrowse): hold the cold first screenshot to the action deadline on Windows (#1712)
+  - fix(windows): installer gives citadel.exe to the installing user; doctor flags an Administrators-owned binary (#1695) (#1696)
+  - ci: shard Build + Test into parallel jobs (#1707) (#1708)
+
+
