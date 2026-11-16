@@ -22,6 +22,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse/fakebrowser"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -234,12 +235,47 @@ func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
 	// One click inside the picture, then one key: exactly what a user does
 	// right after the handoff. The click sends mouseMoved first (before the
 	// focus), then the press and release.
-	x, y := 300.0, 450.0
+	// The window size and pixel ratio differ per platform, so aim at the middle
+	// of the part of the picture that is actually on screen.
+	cdp, err := cobrowsestream.DialCDP(vp.DebugPort)
+	if err != nil {
+		t.Fatalf("dial viewer browser: %v", err)
+	}
+	defer cdp.Close()
+	geo := func() (g struct{ Top, Bottom, Left, Right, InnerW, InnerH, ScrollY float64 }) {
+		t.Helper()
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		res, err := cdp.Command(cctx, "Runtime.evaluate", map[string]any{"returnByValue": true, "expression": `JSON.stringify((function(){
+			var r = document.getElementById("screen").getBoundingClientRect();
+			return {Top: r.top, Bottom: r.bottom, Left: r.left, Right: r.right,
+				InnerW: window.innerWidth, InnerH: window.innerHeight, ScrollY: window.scrollY};
+		})())`})
+		if err != nil {
+			t.Fatalf("read viewer geometry: %v", err)
+		}
+		inner, _ := res["result"].(map[string]any)
+		str, _ := inner["value"].(string)
+		if err := json.Unmarshal([]byte(str), &g); err != nil {
+			t.Fatalf("viewer geometry %v: %v", res, err)
+		}
+		return g
+	}
+	g0 := geo()
+	top, bottom := math.Max(g0.Top, 0), math.Min(g0.Bottom, g0.InnerH)
+	if bottom-top < 20 || g0.Right-g0.Left < 20 || g0.ScrollY != 0 {
+		t.Fatalf("the picture is not on screen to click: %+v", g0)
+	}
+	x, y := (g0.Left+g0.Right)/2, (top+bottom)/2
 	if _, err := m.Click(vp.ID, "", &x, &y); err != nil {
 		t.Fatalf("click: %v", err)
 	}
 	if _, err := m.Key(vp.ID, "a"); err != nil {
 		t.Fatalf("key: %v", err)
+	}
+
+	if g := geo(); g.ScrollY != 0 {
+		t.Fatalf("the viewer page scrolled after the first click and key: %+v (before: %+v)", g, g0)
 	}
 
 	var moved, pressed, released map[string]any
@@ -267,7 +303,7 @@ func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if moved == nil || pressed == nil || released == nil {
-		t.Fatalf("the click did not reach the streamed page: moved=%v pressed=%v released=%v", moved, pressed, released)
+		t.Fatalf("the click at (%.0f,%.0f) did not reach the streamed page (%+v): moved=%v pressed=%v released=%v", x, y, g0, moved, pressed, released)
 	}
 	num := func(ev map[string]any, k string) float64 { f, _ := ev[k].(float64); return f }
 	py := num(pressed, "y")
