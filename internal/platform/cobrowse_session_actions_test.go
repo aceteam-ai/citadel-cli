@@ -1123,40 +1123,41 @@ func TestCobrowseSessionStart_NoURLUnchanged(t *testing.T) {
 	}
 }
 
-// A first load that never commits (the browser sits on about:blank) is asked
-// for once more, and a session that does load is not navigated again
-// (citadel-cli#1694).
-func TestCobrowseSessionStart_StalledFirstLoadRetriesOnce(t *testing.T) {
-	shortSettle(t, 300*time.Millisecond)
+// The launch URL commits after the first read. The start-up settle must wait
+// for it (about:blank already reads "complete", so the minimum shortcut must
+// not apply), report the committed page, and never re-navigate: a launch URL
+// can be single-use (citadel-cli#1694).
+func TestCobrowseSessionStart_WaitsForCommitWithoutRenavigating(t *testing.T) {
+	w, m, p := navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll
+	navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll = 300*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll = w, m, p })
 	f := startFakeCDPServer(t)
+	var once sync.Once
+	var firstRead time.Time
 	f.mu.Lock()
 	f.evaluateValue = func(string) any {
-		if len(f.callsFor("Page.navigate")) == 0 {
+		once.Do(func() { firstRead = time.Now() })
+		if time.Since(firstRead) < 150*time.Millisecond {
 			return map[string]any{"url": "about:blank", "ready": "complete", "title": ""}
 		}
-		return map[string]any{"url": "https://example.com/", "ready": "complete", "title": "Loaded"}
+		return map[string]any{"url": "https://example.com/committed", "ready": "complete", "title": "Committed"}
 	}
 	f.mu.Unlock()
 	installFixedPortLauncher(t, f.port)
-	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
-	begin := time.Now()
-	st, err := m.StartSession("https://example.com/")
+	mgr := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := mgr.StartSession("https://example.com/launch")
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if d := time.Since(begin); d > 5*time.Second {
-		t.Fatalf("start took %v, want it bounded", d)
+	if n := len(f.callsFor("Page.navigate")); n != 0 {
+		t.Fatalf("start re-navigated %d time(s); the launch URL must be requested once", n)
 	}
-	calls := f.callsFor("Page.navigate")
-	if len(calls) != 1 || calls[0].Params["url"] != "https://example.com/" {
-		t.Fatalf("Page.navigate calls = %+v, want exactly one for the start URL", calls)
-	}
-	if st.URL != "https://example.com/" || st.Title != "Loaded" {
-		t.Fatalf("url/title = %q / %q, want the loaded page", st.URL, st.Title)
+	if st.URL != "https://example.com/committed" || st.Title != "Committed" {
+		t.Fatalf("url/title = %q / %q, want the committed page, not about:blank", st.URL, st.Title)
 	}
 }
 
-func TestCobrowseSessionStart_LoadedFirstPageIsNotRetried(t *testing.T) {
+func TestCobrowseSessionStart_LoadedFirstPageIsNotNavigatedAgain(t *testing.T) {
 	_, f := startOnFakeCDPWithURL(t, map[string]any{
 		"url": "https://example.com/", "ready": "complete", "title": "ok",
 	}, "https://example.com/")

@@ -81,6 +81,17 @@ var (
 // navigateSettleWindow. It returns the last state read; a slow page is not an
 // error.
 func settleNavigation(p pin, before string) PageState {
+	return settlePage(p, before, false)
+}
+
+// settleLaunch is the start-up settle: the initial about:blank must not
+// satisfy the minimum-wait shortcut, so it waits for the page to commit away
+// from it (or for the settle window to end) and reports the current state.
+func settleLaunch(p pin) PageState {
+	return settlePage(p, "about:blank", true)
+}
+
+func settlePage(p pin, before string, requireChange bool) PageState {
 	var last PageState
 	start := time.Now()
 	// One connection for the whole poll loop instead of a discovery and a
@@ -113,7 +124,7 @@ func settleNavigation(p pin, before string) PageState {
 				// polling cannot improve on that.
 				return ps
 			}
-			if ps.ReadyState == "complete" && (ps.URL != before || time.Since(start) >= navigateSettleMinimum) {
+			if ps.ReadyState == "complete" && (ps.URL != before || (!requireChange && time.Since(start) >= navigateSettleMinimum)) {
 				return ps
 			}
 		}

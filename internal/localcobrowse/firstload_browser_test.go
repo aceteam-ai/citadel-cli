@@ -46,8 +46,9 @@ func (p *phaseLog) report(t *testing.T) {
 const firstLoadBudget = 10 * time.Second
 
 // TestRealBrowserFirstLoadThroughGuard times each phase of a local-mode style
-// session start (real browser, real egress guard, URL policy) up to the first
-// loaded page, and asserts the first load fits firstLoadBudget.
+// session start (real browser, real egress guard, the platform's launch-URL
+// validation) up to the first loaded page, and asserts the first load fits
+// firstLoadBudget. The local URL policy (Config.URLPolicy) is not in this path.
 func TestRealBrowserFirstLoadThroughGuard(t *testing.T) {
 	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" && os.Getenv("CITADEL_REAL_BROWSER_TESTS") == "" {
 		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 (or CITADEL_REAL_BROWSER_TESTS=1) to run the first-load timing test")
