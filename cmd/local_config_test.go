@@ -695,3 +695,11 @@ func TestMergeBOMWritesThroughSymlink(t *testing.T) {
 		t.Fatalf("target: %q", b)
 	}
 }
+
+// A failed doctor check is a result to show, not a usage error: the command
+// must never print its flag help on failure (found on Windows acceptance).
+func TestLocalDoctorFailureDoesNotPrintUsage(t *testing.T) {
+	if !localDoctorCmd.SilenceUsage {
+		t.Fatal("local doctor must set SilenceUsage so a failed check prints only results")
+	}
+}
