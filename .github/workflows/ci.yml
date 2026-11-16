@@ -24,28 +24,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # gofmt + vet + build + unit tests. Single job: these are cheap and share the
-  # same toolchain setup, so splitting them would only multiply Go-install /
-  # cache-warm cost on the bare ARC pod for no real parallelism win.
-  build-test:
-    name: Build + Test
-    # Self-hosted ARC runners ONLY. The org moved all CI onto Actions Runner
-    # Controller on the Proxmox lab; GitHub-hosted runners (ubuntu-latest) are
-    # not used. The pods are bare, so the Go toolchain is provisioned per-run
-    # by setup-go below.
+  # gofmt + vet + build + race + python replays. The unit tests live in the
+  # `test` shards below; `Build + Test` (last job in this group) aggregates them.
+  check:
+    name: Lint + build + race
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
 
-      # go-version-file reads the version from go.mod (1.26.x) so CI tracks the
-      # repo's Go version automatically. Module + build cache is on by default
-      # in setup-go@v5, which matters on the bare pod (no warm GOMODCACHE).
+      # go-version-file reads the version from go.mod so CI tracks the repo's Go
+      # version. Module + build cache is keyed on go.sum by setup-go.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      # Fail if the shard plan does not cover every package (and every
+      # internal/platform Test function) exactly once.
+      - name: Test shard plan covers every package
+        run: python3 -I scripts/ci_test_shards.py check
 
       # Fail if any tracked Go file isn't gofmt-clean. `gofmt -l .` lists the
       # offenders; we print them and exit non-zero so the log names exactly
@@ -70,13 +69,6 @@ jobs:
       - name: go build
         run: go build ./cmd/citadel
 
-      # Unit tests. The live-TEI test is '//go:build integration'-gated and so
-      # excluded here. internal/provision/provision_test.go injects a mock
-      # Docker backend and never contacts a real daemon, so it passes on the
-      # bare ARC pod (which has no docker) — no skip/gate needed.
-      - name: go test
-        run: go test ./...
-
       - name: Media input contract replay (Python stdlib only)
         run: python3 -I -B -m unittest discover -s internal/mediainput -p test_contract.py
 
@@ -90,6 +82,54 @@ jobs:
       # check.
       - name: go test -race (internal/jobs)
         run: go test -race ./internal/jobs/...
+
+  # Unit tests (`go test ./...` before sharding). The live-TEI test is
+  # '//go:build integration'-gated and so excluded. internal/provision injects
+  # a mock Docker backend and never contacts a real daemon. The package-to-shard
+  # plan is scripts/ci_test_shards.py (balanced on measured package times;
+  # internal/platform is split by test name because it alone is ~7.5 minutes).
+  test:
+    name: Test shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test (shard ${{ matrix.shard }})
+        run: python3 -I scripts/ci_test_shards.py run ${{ matrix.shard }}
+
+  # The required status check. Branch protection requires a check named exactly
+  # "Build + Test", so this job keeps that name and reports for the whole group.
+  # `if: always()` plus an explicit result check means a failed, cancelled or
+  # skipped dependency fails this job instead of skipping it (a skipped required
+  # check can count as passing).
+  build-test:
+    name: Build + Test
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [check, test]
+    steps:
+      - name: All build and test jobs succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needs results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a Build + Test dependency did not succeed ($r)"
+              exit 1
+            fi
+          done
 
   # Windows co-browse gate (aceteam#13503 local mode, citadel-cli#1548). The
   # jobs above only cross-compile for Windows, so before this no co-browse code
