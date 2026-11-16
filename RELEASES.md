@@ -3843,3 +3843,19 @@ Auto-generated log of every release.
   - feat(cobrowse): follow popups and new tabs in runner and local viewer (#1633) (#1648)
 
 
+---
+
+## v2.230.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 15 |
+| Lines added | +625 |
+
+**Changes:**
+
+  - fix(update): no recovery warning when the update lock was never provisioned (#1682) (#1684)
+  - fix(worker): heartbeat first and Retry-After backoff under platform 429 (#1677) (#1680)
+
+
