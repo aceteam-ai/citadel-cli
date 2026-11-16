@@ -3875,3 +3875,22 @@ Auto-generated log of every release.
   - fix(cobrowse): bounded single-connection actions with partial-effect reporting (#1663) (#1664)
 
 
+---
+
+## v2.232.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 36 |
+| Lines added | +2047 |
+
+**Changes:**
+
+  - fix(llm_inference): honor temperature 0 on Ollama and add seed end to end (#1643)
+  - fix(hotswap): floor the warming ETA at the retry interval (#1640) (#1642)
+  - fix(receipts): sign the serving node id, not the key fingerprint, on regular workers (#1641)
+  - feat(worker): add control-only per-node scheduling role (#1698) (#1705)
+  - test(local): CI end-to-end of the local-mode gate through citadel local mcp (#1683) (#1685)
+
+
