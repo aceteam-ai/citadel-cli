@@ -241,7 +241,13 @@ func (m *CobrowseSessionManager) StageFile(id, name string, data []byte) (Staged
 	if free, ferr := availableStageBytes(dir); ferr == nil && free < uint64(len(data))+minFreeAfterStageBytes {
 		return StagedFile{}, errors.New("staging: not enough free disk space on the node")
 	}
-	if ents, err := os.ReadDir(dir); err == nil && len(ents) >= MaxCobrowseStagedFiles {
+	// The count fails closed: an unreadable dir refuses the stage. (The
+	// free-space check above fails open, like the repo's other preflights.)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return StagedFile{}, stagingFailure("count staged files", err)
+	}
+	if len(ents) >= MaxCobrowseStagedFiles {
 		return StagedFile{}, fmt.Errorf("session already holds %d staged files", MaxCobrowseStagedFiles)
 	}
 	// O_EXCL refuses an existing entry of any kind, including a symlink, so
@@ -363,26 +369,66 @@ func checkFileInput(c cdpCaller, objectID string) error {
 	return nil
 }
 
-// setFilesIfPageIs is the last step of set_file_input. It reads the URL of the
-// document that OWNS the target input (not the main frame: the input may sit in
-// a child frame or another page of the renderer) over the action's own
-// connection, requires it to equal expectedURL exactly (query and fragment
-// included), re-checks the driver after that round trip, and only then hands
-// the browser the files on that same resolved object. A mismatch is
-// ErrTargetChanged with nothing dispatched; the URL is never put in an error
-// or a log.
-func setFilesIfPageIs(c cdpCaller, objectID, expectedURL string, files []string, driverFence func() error, eff *ActionEffects) error {
-	res, err := c.Call("Runtime.callFunctionOn", map[string]any{
-		"objectId":            objectID,
-		"returnByValue":       true,
-		"functionDeclaration": "function(){return this.ownerDocument.URL}",
-	})
+// frameURLFromTree finds frameID in a Page.getFrameTree result and returns its
+// full URL as the browser reports it (url plus urlFragment, which carries the
+// '#'). No page script is involved, so a page cannot influence it.
+func frameURLFromTree(tree map[string]any, frameID string) (string, bool) {
+	node, _ := tree["frameTree"].(map[string]any)
+	var walk func(n map[string]any) (string, bool)
+	walk = func(n map[string]any) (string, bool) {
+		if n == nil {
+			return "", false
+		}
+		if fr, ok := n["frame"].(map[string]any); ok {
+			if id, _ := fr["id"].(string); id == frameID {
+				u, _ := fr["url"].(string)
+				frag, _ := fr["urlFragment"].(string)
+				return u + frag, true
+			}
+		}
+		kids, _ := n["childFrames"].([]any)
+		for _, k := range kids {
+			km, _ := k.(map[string]any)
+			if u, ok := walk(km); ok {
+				return u, true
+			}
+		}
+		return "", false
+	}
+	return walk(node)
+}
+
+// rootFrameID returns the main frame's id from a Page.getFrameTree result.
+func rootFrameID(tree map[string]any) string {
+	node, _ := tree["frameTree"].(map[string]any)
+	fr, _ := node["frame"].(map[string]any)
+	id, _ := fr["id"].(string)
+	return id
+}
+
+// checkFrameURL reads the frame's URL from the browser (Page.getFrameTree) and
+// requires it to equal expectedURL byte for byte (query and fragment
+// included). A missing frame or a mismatch is ErrTargetChanged; the URL is
+// never put in an error or a log.
+func checkFrameURL(c cdpCaller, frameID, expectedURL string) error {
+	tree, err := c.Call("Page.getFrameTree", nil)
 	if err != nil {
 		return err
 	}
-	val, _ := res["result"].(map[string]any)
-	if cur, _ := val["value"].(string); cur == "" || cur != expectedURL {
+	if cur, ok := frameURLFromTree(tree, frameID); !ok || cur == "" || cur != expectedURL {
 		return ErrTargetChanged
+	}
+	return nil
+}
+
+// setFilesIfPageIs is the last step of set_file_input: it re-reads the target
+// frame's browser-side URL, requires the exact expected URL, re-checks the
+// driver after that round trip, and only then hands the browser the files on
+// the isolated-world object that was checked. A mismatch is ErrTargetChanged
+// with nothing dispatched.
+func setFilesIfPageIs(c cdpCaller, frameID, objectID, expectedURL string, files []string, driverFence func() error, eff *ActionEffects) error {
+	if err := checkFrameURL(c, frameID, expectedURL); err != nil {
+		return err
 	}
 	// A human can take control during the round trip above.
 	if driverFence != nil {
@@ -421,9 +467,13 @@ func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID
 	}
 	// A node id is only accepted for the chooser the page actually opened:
 	// the caller cannot aim a staged file at an arbitrary node.
+	var chooserFrame string
 	if backendNodeID != 0 {
 		s.mu.Lock()
 		match := s.chooser != nil && s.chooser.BackendNodeID == backendNodeID
+		if match {
+			chooserFrame = s.chooser.FrameID
+		}
 		s.mu.Unlock()
 		if !match {
 			return CobrowseSessionStatus{}, errors.New("no pending file chooser for that backend_node_id")
@@ -434,14 +484,42 @@ func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID
 		return CobrowseSessionStatus{}, err
 	}
 	return s.runAction(b, p, "set_file_input", func(r *actionRun) error {
+		// 1. Which frame owns the target. A chooser names its own frame; a
+		// selector is looked up in the main frame.
+		frameID := chooserFrame
+		if backendNodeID == 0 {
+			tree, err := r.conn.Call("Page.getFrameTree", nil)
+			if err != nil {
+				return err
+			}
+			frameID = rootFrameID(tree)
+		}
+		if frameID == "" {
+			return ErrTargetChanged
+		}
+		// 2. The frame's URL from the browser, not from page script.
+		if err := checkFrameURL(r.conn, frameID, expectedURL); err != nil {
+			return err
+		}
+		// 3. Resolve the target inside an isolated world of that frame, whose
+		// prototypes the page cannot have replaced.
+		w, err := r.conn.Call("Page.createIsolatedWorld", map[string]any{"frameId": frameID, "worldName": "citadel-upload"})
+		if err != nil {
+			return err
+		}
+		ctxID, ok := w["executionContextId"].(float64)
+		if !ok || ctxID == 0 {
+			return ErrTargetChanged
+		}
 		var objectID string
 		var nodeID int
 		if selector != "" {
 			res, err := r.conn.Call("Runtime.evaluate", map[string]any{
 				"expression": fmt.Sprintf("document.querySelector(%s)", jsStringLiteral(selector)),
+				"contextId":  int(ctxID),
 			})
 			if err != nil {
-				return err
+				return ErrTargetChanged
 			}
 			obj, _ := res["result"].(map[string]any)
 			objectID, _ = obj["objectId"].(string)
@@ -463,27 +541,27 @@ func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID
 				s.clearChooser()
 			}
 		} else {
-			res, err := r.conn.Call("DOM.resolveNode", map[string]any{"backendNodeId": backendNodeID})
+			res, err := r.conn.Call("DOM.resolveNode", map[string]any{"backendNodeId": backendNodeID, "executionContextId": int(ctxID)})
 			if err != nil {
-				return err
+				return ErrTargetChanged
 			}
 			obj, _ := res["object"].(map[string]any)
 			objectID, _ = obj["objectId"].(string)
 			if objectID == "" {
-				return errors.New("the pending file chooser's node is gone")
+				// Not a node of that frame (or gone).
+				return ErrTargetChanged
 			}
 			if err := checkFileInput(r.conn, objectID); err != nil {
 				return err
 			}
 			nodeID = backendNodeID
 		}
-		// The element lookup awaits the page, during which a human can take
-		// control or the active page can change: check the page before the
-		// URL read, and the driver again after it (inside setFilesIfPageIs).
+		// 4. The lookups await the page: check the page, then (inside
+		// setFilesIfPageIs) re-read the frame URL, check the driver, dispatch.
 		if err := r.fence(); err != nil {
 			return err
 		}
-		err := setFilesIfPageIs(r.conn, objectID, expectedURL, []string{path}, func() error { return s.driverFence(r.p) }, r.eff)
+		err = setFilesIfPageIs(r.conn, frameID, objectID, expectedURL, []string{path}, func() error { return s.driverFence(r.p) }, r.eff)
 		if err != nil {
 			// Never return the node's absolute path to the platform.
 			return redactPath(err, path, file.Name)

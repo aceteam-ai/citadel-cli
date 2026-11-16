@@ -8,11 +8,31 @@ import (
 	"testing"
 )
 
+type fakeFrame struct{ ID, URL, Fragment string }
+
+func frameTreeResult(frames []fakeFrame) map[string]any {
+	if len(frames) == 0 {
+		return map[string]any{}
+	}
+	frame := func(f fakeFrame) map[string]any {
+		m := map[string]any{"id": f.ID, "url": f.URL}
+		if f.Fragment != "" {
+			m["urlFragment"] = f.Fragment
+		}
+		return m
+	}
+	var kids []any
+	for _, f := range frames[1:] {
+		kids = append(kids, map[string]any{"frame": frame(f)})
+	}
+	return map[string]any{"frameTree": map[string]any{"frame": frame(frames[0]), "childFrames": kids}}
+}
+
 // fenceCaller is a cdpCaller for the pure setFilesIfPageIs step.
 type fenceCaller struct {
-	ownerURL string
-	calls    []string
-	params   map[string]map[string]any
+	frames []fakeFrame
+	calls  []string
+	params map[string]map[string]any
 }
 
 func (f *fenceCaller) Call(method string, params map[string]any) (map[string]any, error) {
@@ -21,8 +41,8 @@ func (f *fenceCaller) Call(method string, params map[string]any) (map[string]any
 		f.params = map[string]map[string]any{}
 	}
 	f.params[method] = params
-	if method == "Runtime.callFunctionOn" {
-		return map[string]any{"result": map[string]any{"value": f.ownerURL}}, nil
+	if method == "Page.getFrameTree" {
+		return frameTreeResult(f.frames), nil
 	}
 	return map[string]any{}, nil
 }
@@ -38,39 +58,44 @@ func (f *fenceCaller) setCalls() int {
 }
 
 func TestFileUploadPageFenceMatchAttaches(t *testing.T) {
-	const u = "https://portal.example/file?x=1#step2"
-	f := &fenceCaller{ownerURL: u}
+	// url and urlFragment are joined: the fragment includes its '#'.
+	f := &fenceCaller{frames: []fakeFrame{{ID: "R", URL: "https://portal.example/file?x=1", Fragment: "#step2"}}}
 	var eff ActionEffects
-	if err := setFilesIfPageIs(f, "obj1", u, []string{"/p/a.pdf"}, nil, &eff); err != nil {
+	if err := setFilesIfPageIs(f, "R", "obj1", "https://portal.example/file?x=1#step2", []string{"/p/a.pdf"}, nil, &eff); err != nil {
 		t.Fatal(err)
 	}
 	if f.setCalls() != 1 || eff.FilesSet != 1 || !eff.Dispatched {
 		t.Fatalf("calls=%v eff=%+v", f.calls, eff)
 	}
-	// The files go to the very object whose document was checked.
 	if f.params["DOM.setFileInputFiles"]["objectId"] != "obj1" {
 		t.Fatalf("dispatch params = %v", f.params["DOM.setFileInputFiles"])
+	}
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "Runtime.") {
+			t.Fatalf("the fence ran page script: %v", f.calls)
+		}
 	}
 }
 
 func TestFileUploadPageFenceMismatchRefusesWithNothingDispatched(t *testing.T) {
-	const u = "https://portal.example/file?x=1#step2"
-	for _, cur := range []string{
-		"https://portal.example/file?x=1#step3", // fragment only
-		"https://portal.example/file?x=1",
-		"https://portal.example/file?x=2#step2",
-		"https://portal.example/file?x=1#step2/",
-		"https://other.example/file?x=1#step2",
-		"",
+	const want = "https://portal.example/file?x=1#step2"
+	for _, cur := range []fakeFrame{
+		{ID: "R", URL: "https://portal.example/file?x=1", Fragment: "#step3"}, // fragment only
+		{ID: "R", URL: "https://portal.example/file?x=1"},
+		{ID: "R", URL: "https://portal.example/file?x=2", Fragment: "#step2"},
+		{ID: "R", URL: "https://portal.example/file?x=1", Fragment: "#step2/"},
+		{ID: "R", URL: "https://other.example/file?x=1", Fragment: "#step2"},
+		{ID: "R", URL: ""},
+		{ID: "OTHER", URL: "https://portal.example/file?x=1", Fragment: "#step2"}, // frame absent
 	} {
-		f := &fenceCaller{ownerURL: cur}
+		f := &fenceCaller{frames: []fakeFrame{cur}}
 		var eff ActionEffects
-		err := setFilesIfPageIs(f, "obj1", u, []string{"/p/a.pdf"}, nil, &eff)
+		err := setFilesIfPageIs(f, "R", "obj1", want, []string{"/p/a.pdf"}, nil, &eff)
 		if !errors.Is(err, ErrTargetChanged) {
-			t.Fatalf("%q: got %v, want ErrTargetChanged", cur, err)
+			t.Fatalf("%+v: got %v, want ErrTargetChanged", cur, err)
 		}
 		if f.setCalls() != 0 || eff.Dispatched || eff.FilesSet != 0 || eff.anyEffect() {
-			t.Fatalf("%q: something was done: calls=%v eff=%+v", cur, f.calls, eff)
+			t.Fatalf("%+v: something was done: calls=%v eff=%+v", cur, f.calls, eff)
 		}
 		if strings.Contains(err.Error(), "portal.example") || strings.Contains(err.Error(), "other.example") {
 			t.Fatalf("error carries a URL: %v", err)
@@ -80,18 +105,17 @@ func TestFileUploadPageFenceMismatchRefusesWithNothingDispatched(t *testing.T) {
 
 func TestFileUploadPageFenceDriverFenceRunsAfterTheComparison(t *testing.T) {
 	const u = "https://portal.example/f"
-	f := &fenceCaller{ownerURL: u}
+	f := &fenceCaller{frames: []fakeFrame{{ID: "R", URL: u}}}
 	var eff ActionEffects
-	err := setFilesIfPageIs(f, "obj1", u, nil, func() error { return ErrHandedOff }, &eff)
+	err := setFilesIfPageIs(f, "R", "obj1", u, nil, func() error { return ErrHandedOff }, &eff)
 	if !errors.Is(err, ErrHandedOff) || f.setCalls() != 0 || eff.Dispatched {
 		t.Fatalf("err=%v calls=%v eff=%+v", err, f.calls, eff)
 	}
-	// Called after the URL read, not before.
-	order := []string{}
-	f2 := &fenceCaller{ownerURL: u}
-	_ = setFilesIfPageIs(f2, "obj1", u, nil, func() error { order = append(order, strings.Join(f2.calls, ",")); return nil }, &eff)
-	if len(order) != 1 || order[0] != "Runtime.callFunctionOn" {
-		t.Fatalf("driver fence ran at %v, want right after the URL read", order)
+	var at string
+	f2 := &fenceCaller{frames: []fakeFrame{{ID: "R", URL: u}}}
+	_ = setFilesIfPageIs(f2, "R", "obj1", u, nil, func() error { at = strings.Join(f2.calls, ","); return nil }, &eff)
+	if at != "Page.getFrameTree" {
+		t.Fatalf("driver fence ran at %q, want right after the URL read", at)
 	}
 }
 
@@ -118,45 +142,70 @@ func TestStatusReportsFileUploadPageFence(t *testing.T) {
 
 // ---- SetFileInput over a fake CDP page ----
 
+// fileInputFake is a page whose real frame URLs are `frames` (the browser's
+// view). A hostile page is modelled by spoofURL: any page-world read of
+// ownerDocument or location would return it, so a fence that used page script
+// would be fooled. The node only exists in isolated world 42.
 type fileInputFake struct {
-	mu       sync.Mutex
-	ownerURL string
-	mainURL  string
-	// onOwnerURL runs when the owner document's URL is read.
-	onOwnerURL func()
+	mu     sync.Mutex
+	frames []fakeFrame
+	// spoofURL is what page script would claim.
+	spoofURL string
+	// onFrameTree runs on every Page.getFrameTree.
+	onFrameTree func(n int)
+	trees       int
 }
 
 func (ff *fileInputFake) install(f *fakeCDPServer) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.evaluateValue = func(expr string) any { return nil }
+	f.evaluateValue = func(expr string) any {
+		if expr == "location.href" {
+			return ff.spoofURL
+		}
+		return nil
+	}
 	f.custom = func(method string, params map[string]any) (map[string]any, bool) {
 		ff.mu.Lock()
-		owner, main, hook := ff.ownerURL, ff.mainURL, ff.onOwnerURL
+		frames, spoof, hook := ff.frames, ff.spoofURL, ff.onFrameTree
 		ff.mu.Unlock()
 		switch method {
+		case "Page.getFrameTree":
+			ff.mu.Lock()
+			ff.trees++
+			n := ff.trees
+			ff.mu.Unlock()
+			if hook != nil {
+				hook(n)
+			}
+			ff.mu.Lock()
+			frames = ff.frames
+			ff.mu.Unlock()
+			return frameTreeResult(frames), true
+		case "Page.createIsolatedWorld":
+			return map[string]any{"executionContextId": float64(42)}, true
 		case "Runtime.evaluate":
 			expr, _ := params["expression"].(string)
-			switch {
-			case strings.Contains(expr, "querySelector"):
+			if strings.Contains(expr, "querySelector") {
+				if params["contextId"] != float64(42) {
+					return map[string]any{}, true // not in the isolated world: nothing
+				}
 				return map[string]any{"result": map[string]any{"type": "object", "objectId": "obj1"}}, true
-			case expr == "location.href":
-				return map[string]any{"result": map[string]any{"value": main}}, true
 			}
 		case "Runtime.callFunctionOn":
 			decl, _ := params["functionDeclaration"].(string)
 			switch {
 			case strings.Contains(decl, "ownerDocument"):
-				if hook != nil {
-					hook()
-				}
-				return map[string]any{"result": map[string]any{"value": owner}}, true
+				return map[string]any{"result": map[string]any{"value": spoof}}, true
 			case strings.Contains(decl, "HTMLInputElement"):
 				return map[string]any{"result": map[string]any{"value": map[string]any{"file": true, "disabled": false}}}, true
 			}
 		case "DOM.describeNode":
 			return map[string]any{"node": map[string]any{"backendNodeId": float64(7)}}, true
 		case "DOM.resolveNode":
+			if params["executionContextId"] != float64(42) {
+				return map[string]any{}, true
+			}
 			return map[string]any{"object": map[string]any{"objectId": "obj1"}}, true
 		}
 		return nil, false
@@ -173,11 +222,32 @@ func probeCount(f *fakeCDPServer) int {
 	return n
 }
 
+// Nothing the fence relies on is read by page script.
+func noPageWorldFenceReads(t *testing.T, f *fakeCDPServer) {
+	t.Helper()
+	for _, c := range f.callsFor("Runtime.callFunctionOn") {
+		if d, _ := c.Params["functionDeclaration"].(string); strings.Contains(d, "ownerDocument") || strings.Contains(d, "location") {
+			t.Fatalf("the fence evaluated page script: %v", d)
+		}
+	}
+	for _, c := range f.callsFor("Runtime.evaluate") {
+		e, _ := c.Params["expression"].(string)
+		if e == "location.href" || strings.Contains(e, "ownerDocument") {
+			t.Fatalf("the fence evaluated page script: %v", e)
+		}
+		if strings.Contains(e, "querySelector") && c.Params["contextId"] != float64(42) {
+			t.Fatalf("the target was looked up in the page's own world: %v", c.Params)
+		}
+	}
+}
+
 const portalURL = "https://portal.example/file?x=1#step2"
 
-func TestSetFileInputFenceMatchDispatchesOnTheCheckedObject(t *testing.T) {
+var portalFrame = fakeFrame{ID: "R", URL: "https://portal.example/file?x=1", Fragment: "#step2"}
+
+func TestSetFileInputUsesFrameTreeAndAnIsolatedWorld(t *testing.T) {
 	m, st, f := startSessionOnFakeCDP(t)
-	(&fileInputFake{ownerURL: portalURL, mainURL: portalURL}).install(f)
+	(&fileInputFake{frames: []fakeFrame{portalFrame}, spoofURL: portalURL}).install(f)
 	if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err != nil {
 		t.Fatal(err)
 	}
@@ -189,44 +259,62 @@ func TestSetFileInputFenceMatchDispatchesOnTheCheckedObject(t *testing.T) {
 	if len(calls) != 1 || calls[0].Params["objectId"] != "obj1" {
 		t.Fatalf("setFileInputFiles calls = %+v", calls)
 	}
+	if w := f.callsFor("Page.createIsolatedWorld"); len(w) != 1 || w[0].Params["frameId"] != "R" {
+		t.Fatalf("isolated world calls = %+v", w)
+	}
+	noPageWorldFenceReads(t, f)
 	if out.Effects == nil || out.Effects.FilesSet != 1 {
 		t.Fatalf("effects = %+v", out.Effects)
 	}
 }
 
-// A mismatch is returned as ErrTargetChanged itself (not a wrapped copy), so
-// the action machinery treats it as a refusal: nothing dispatched, no
-// read-back probe, and no URL in the result.
-func TestSetFileInputFenceMismatchIsARefusalWithNoReadBack(t *testing.T) {
-	m, st, f := startSessionOnFakeCDP(t)
-	// Differs from the expectation only in the fragment.
-	(&fileInputFake{ownerURL: "https://portal.example/file?x=1#step3", mainURL: portalURL}).install(f)
-	if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err != nil {
-		t.Fatal(err)
-	}
-	out, err := m.SetFileInput(st.ID, "#f", 0, "a.pdf", portalURL)
-	if !errors.Is(err, ErrTargetChanged) {
-		t.Fatalf("err = %v, want ErrTargetChanged", err)
-	}
-	if _, partial := AsActionIncomplete(err); partial {
-		t.Fatal("a refusal must not become a partial-effect report")
-	}
-	if n := len(f.callsFor("DOM.setFileInputFiles")); n != 0 {
-		t.Fatalf("%d setFileInputFiles calls on a mismatch", n)
-	}
-	if n := probeCount(f); n != 1 {
-		t.Fatalf("%d page probes: only the before-probe may run, no read-back", n)
-	}
-	if out.URL != "" || out.Effects != nil || strings.Contains(err.Error(), "portal.example") {
-		t.Fatalf("the refusal carries page data: %+v / %v", out, err)
+// A hostile page whose script claims the expected URL while the browser says
+// otherwise is refused: only the browser's frame URL counts. Differing only in
+// the fragment is a mismatch.
+func TestSetFileInputSpoofedPageScriptCannotPassTheFence(t *testing.T) {
+	for _, real := range []fakeFrame{
+		{ID: "R", URL: "https://portal.example/file?x=1", Fragment: "#step3"},
+		{ID: "R", URL: "https://evil.example/", Fragment: ""},
+	} {
+		m, st, f := startSessionOnFakeCDP(t)
+		(&fileInputFake{frames: []fakeFrame{real}, spoofURL: portalURL}).install(f)
+		if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+		out, err := m.SetFileInput(st.ID, "#f", 0, "a.pdf", portalURL)
+		if !errors.Is(err, ErrTargetChanged) {
+			t.Fatalf("%+v: err = %v, want ErrTargetChanged", real, err)
+		}
+		if _, partial := AsActionIncomplete(err); partial {
+			t.Fatal("a refusal must not become a partial-effect report")
+		}
+		if n := len(f.callsFor("DOM.setFileInputFiles")); n != 0 {
+			t.Fatalf("%d setFileInputFiles calls on a mismatch", n)
+		}
+		if n := probeCount(f); n != 1 {
+			t.Fatalf("%d page probes: only the before-probe may run, no read-back", n)
+		}
+		if out.URL != "" || out.Effects != nil || strings.Contains(err.Error(), "portal.example") {
+			t.Fatalf("the refusal carries page data: %+v / %v", out, err)
+		}
+		noPageWorldFenceReads(t, f)
 	}
 }
 
-// The check is on the document that owns the input, not the main frame: a
-// matching main frame does not rescue a differing owner document.
-func TestSetFileInputFenceUsesOwnerDocumentNotMainFrame(t *testing.T) {
+// The URL is read again right before the dispatch: a page that navigates
+// between the two reads is refused.
+func TestSetFileInputRereadsFrameURLBeforeDispatch(t *testing.T) {
 	m, st, f := startSessionOnFakeCDP(t)
-	(&fileInputFake{ownerURL: "https://frame.example/child", mainURL: portalURL}).install(f)
+	ff := &fileInputFake{frames: []fakeFrame{portalFrame}}
+	// Reads: 1 root lookup, 2 early check, 3 the re-read before dispatch.
+	ff.onFrameTree = func(n int) {
+		if n >= 3 {
+			ff.mu.Lock()
+			ff.frames = []fakeFrame{{ID: "R", URL: "https://evil.example/"}}
+			ff.mu.Unlock()
+		}
+	}
+	ff.install(f)
 	if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err != nil {
 		t.Fatal(err)
 	}
@@ -234,15 +322,19 @@ func TestSetFileInputFenceUsesOwnerDocumentNotMainFrame(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 	if n := len(f.callsFor("DOM.setFileInputFiles")); n != 0 {
-		t.Fatalf("%d dispatches for a differing owner document", n)
+		t.Fatalf("%d dispatches after the page moved", n)
 	}
 }
 
-// A human taking control during the URL read stops the dispatch.
+// A human taking control during the final URL read stops the dispatch.
 func TestSetFileInputHandoffDuringURLReadStopsDispatch(t *testing.T) {
 	m, st, f := startSessionOnFakeCDP(t)
-	ff := &fileInputFake{ownerURL: portalURL, mainURL: portalURL}
-	ff.onOwnerURL = func() { _, _ = m.Handoff(st.ID) }
+	ff := &fileInputFake{frames: []fakeFrame{portalFrame}}
+	ff.onFrameTree = func(n int) {
+		if n >= 3 { // the re-read right before the dispatch
+			_, _ = m.Handoff(st.ID)
+		}
+	}
 	ff.install(f)
 	if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err != nil {
 		t.Fatal(err)
@@ -256,24 +348,43 @@ func TestSetFileInputHandoffDuringURLReadStopsDispatch(t *testing.T) {
 	}
 }
 
-// The chooser path resolves the node and dispatches on that resolved object.
-func TestSetFileInputByChooserNodeResolvesAndFencesTheNode(t *testing.T) {
+// The chooser path honours the frame the chooser opened in.
+func TestSetFileInputChooserFrameIDIsHonoured(t *testing.T) {
+	childURL := "https://child.example/form"
+	frames := []fakeFrame{portalFrame, {ID: "F2", URL: childURL}}
 	m, st, f := startSessionOnFakeCDP(t)
-	(&fileInputFake{ownerURL: portalURL, mainURL: portalURL}).install(f)
+	(&fileInputFake{frames: frames, spoofURL: portalURL}).install(f)
 	if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 	s, _ := m.sessionForAction(st.ID)
-	s.handleChooserEvent("Page.fileChooserOpened", map[string]any{"backendNodeId": float64(9), "mode": "selectSingle"})
-	if _, err := m.SetFileInput(st.ID, "", 9, "a.pdf", portalURL); err != nil {
+	open := func() {
+		s.handleChooserEvent("Page.fileChooserOpened", map[string]any{"backendNodeId": float64(9), "mode": "selectSingle", "frameId": "F2"})
+	}
+	// The main frame's URL does not pass for the child frame's chooser.
+	open()
+	if _, err := m.SetFileInput(st.ID, "", 9, "a.pdf", portalURL); !errors.Is(err, ErrTargetChanged) {
+		t.Fatalf("main frame URL for a child-frame chooser: %v", err)
+	}
+	if n := len(f.callsFor("DOM.setFileInputFiles")); n != 0 {
+		t.Fatalf("%d dispatches", n)
+	}
+	// The child frame's own URL does.
+	open()
+	if _, err := m.SetFileInput(st.ID, "", 9, "a.pdf", childURL); err != nil {
 		t.Fatal(err)
 	}
-	if rc := f.callsFor("DOM.resolveNode"); len(rc) != 1 || rc[0].Params["backendNodeId"] != float64(9) {
-		t.Fatalf("resolveNode calls = %+v", rc)
+	if w := f.callsFor("Page.createIsolatedWorld"); len(w) == 0 || w[len(w)-1].Params["frameId"] != "F2" {
+		t.Fatalf("isolated world frame = %+v", w)
+	}
+	rn := f.callsFor("DOM.resolveNode")
+	if len(rn) == 0 || rn[len(rn)-1].Params["backendNodeId"] != float64(9) || rn[len(rn)-1].Params["executionContextId"] != float64(42) {
+		t.Fatalf("resolveNode calls = %+v", rn)
 	}
 	if sc := f.callsFor("DOM.setFileInputFiles"); len(sc) != 1 || sc[0].Params["objectId"] != "obj1" {
 		t.Fatalf("setFileInputFiles calls = %+v", sc)
 	}
+	noPageWorldFenceReads(t, f)
 	if got, _ := m.SessionStatus(st.ID); got.FileChooser != nil {
 		t.Fatalf("the chooser should clear: %+v", got.FileChooser)
 	}

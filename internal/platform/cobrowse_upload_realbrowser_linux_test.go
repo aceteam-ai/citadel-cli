@@ -11,3 +11,10 @@ func TestCobrowseRealBrowserFileUpload(t *testing.T) {
 	e := newRealEnv(t)
 	runFileUploadRealBrowser(t, e.manager())
 }
+
+// TestCobrowseRealBrowserFileUploadSpoof: a page that spoofs the in-page URL
+// getters is refused and the server receives nothing.
+func TestCobrowseRealBrowserFileUploadSpoof(t *testing.T) {
+	e := newRealEnv(t)
+	runFileUploadSpoofRealBrowser(t, e.manager())
+}

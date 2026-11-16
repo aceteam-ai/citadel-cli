@@ -15,3 +15,11 @@ func TestWindowsRealBrowserFileUpload(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "cobrowse-sessions")
 	runFileUploadRealBrowser(t, newCobrowseSessionManager(base, 2))
 }
+
+// TestWindowsRealBrowserFileUploadSpoof is the negative control (see the
+// shared scenario); its name matches the existing run list prefix.
+func TestWindowsRealBrowserFileUploadSpoof(t *testing.T) {
+	requireBrowserIT(t)
+	base := filepath.Join(t.TempDir(), "cobrowse-sessions")
+	runFileUploadSpoofRealBrowser(t, newCobrowseSessionManager(base, 2))
+}

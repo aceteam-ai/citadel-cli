@@ -586,6 +586,13 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 		dropTargetSet(proc.debugPort)
 		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
 	}
+	// Learn the browser's CDP id before the session is visible and before the
+	// chooser watcher exists, on every OS, so the watcher can always verify it.
+	if proc.browserID == "" && proc.debugPort > 0 {
+		if id, err := resolveBrowserID(proc.debugPort, s.profile); err == nil {
+			proc.browserID = id
+		}
+	}
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning

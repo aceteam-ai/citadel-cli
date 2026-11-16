@@ -171,10 +171,13 @@ func (s *cobrowseSession) watchChooserOnce(port int, stop <-chan struct{}) {
 		want = s.proc.browserID
 	}
 	s.mu.Unlock()
-	if want != "" {
-		if err := verifyCDPBrowserID(port, want); err != nil {
-			return
-		}
+	// No attach until the browser's id is known: the id is recorded at launch,
+	// and without it nothing proves this port still answers for this session.
+	if want == "" {
+		return
+	}
+	if err := verifyCDPBrowserID(port, want); err != nil {
+		return
 	}
 	dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
 	target, err := pickTargetContext(dctx, port)

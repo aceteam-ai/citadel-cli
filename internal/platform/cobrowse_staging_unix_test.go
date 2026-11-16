@@ -3,6 +3,7 @@
 package platform
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,3 +40,19 @@ type persistCounter struct{ saw *bool }
 func (persistCounter) Materialize(string) error { return nil }
 func (p persistCounter) Persist(string) error   { *p.saw = true; return nil }
 func (persistCounter) Close() error             { return nil }
+
+// An unreadable staging dir refuses the stage: the file count fails closed.
+func TestStageFileCountFailsClosedWhenDirUnreadable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read any directory")
+	}
+	m, st := startFakeSession(t)
+	stage := filepath.Join(st.Profile, cobrowseStagingDirName)
+	if err := os.Chmod(stage, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stage, 0o700) })
+	if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err == nil {
+		t.Fatal("a stage into a dir whose count cannot be read must be refused")
+	}
+}

@@ -142,10 +142,12 @@ Teardown closes staging (`closeStaging`, under `stageMu`) before removing it and
 refuses to seal a persistent profile if removal fails; `cobrowseprofile` also
 never archives or restores `.citadel-stage`. A `backend_node_id` is accepted only
 for the chooser the page opened. `set_file_input` requires `expected_url`:
-`setFilesIfPageIs` reads the `ownerDocument.URL` of the target input on the
-action's connection, refuses with `ErrTargetChanged` unless it equals it byte for
-byte (fragment included), re-checks the driver, then dispatches on that same
-resolved object (refusals are returned unchanged, never rewrapped); status
+the fence uses no page script: `checkFrameURL` takes the target frame's
+browser-side URL from `Page.getFrameTree` (url plus urlFragment), the target
+is resolved in an isolated world of that frame (`Page.createIsolatedWorld`),
+and `setFilesIfPageIs` re-reads the frame URL, re-checks the driver, then
+dispatches on that isolated object; any mismatch is `ErrTargetChanged`,
+returned unchanged; status
 reports `file_upload_page_fence: expected_url_v1`. The worker acks a `stage_file` entry with
 `AckStagedFileJob` (XACK then XDEL, no payload decoding); other actions use the
 plain ack (API mode has no equivalent yet). Human
