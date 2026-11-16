@@ -395,10 +395,14 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 		// Typed so callers (heartbeat, consume loop) can honor the server's
 		// backoff instead of retrying at their normal cadence (#1677). The body
 		// hint wins; the Retry-After header covers an edge proxy's bodyless 429.
-		// A 429 body is rate-limit JSON, never a job, so parse the real bytes
-		// but keep the consume-redacted diagnostic as the retained Body.
+		// Parse timing hints from the real bytes, but retain no response text
+		// from consume: even an error envelope can echo job credentials.
 		rle := parseRateLimitError(resp.StatusCode, string(respBody))
 		rle.Body = string(diagnosticBody)
+		if path == "/api/fabric/redis/jobs/consume" {
+			rle.Message = "rate limit exceeded"
+			rle.Window = ""
+		}
 		if rle.RetryAfter <= 0 && rle.ResetAt.IsZero() {
 			if d, ok := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()); ok {
 				rle.RetryAfter = d

@@ -483,3 +483,33 @@ func TestNextMulti_ContextCancellationStopsRotation(t *testing.T) {
 		t.Errorf("consume calls after cancellation = %d, want the rotation to stop promptly", n)
 	}
 }
+
+func TestAPISourceMultiQueueStopsAtFirst429(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		queues  []string
+		limited string
+		want    []string
+	}{
+		{"priority queue", []string{testPerNodeQueue, "jobs:v1:cpu-general"}, testPerNodeQueue, []string{testPerNodeQueue}},
+		{"after successful empty queue", []string{"q1", "q2", "q3"}, "q2", []string{"q1", "q2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newFakeConsumeServer(t, func(call consumeCall, _ int) (*redisapi.StreamMessage, int) {
+				if call.Queue == tc.limited {
+					return nil, http.StatusTooManyRequests
+				}
+				return nil, http.StatusOK
+			})
+			source := newConnectedSource(t, srv, tc.queues, 10)
+			defer source.Close()
+			job, err := source.Next(context.Background())
+			if _, ok := redisapi.AsRateLimitError(err); !ok || job != nil {
+				t.Fatalf("want typed 429 without a job, got %v, %v", job, err)
+			}
+			if got := srv.queueSequence(); strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("polled %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -2,8 +2,10 @@ package redisapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,5 +45,41 @@ func TestDoRequest429IsTypedAndWindowClearsOn2xx(t *testing.T) {
 	}
 	if _, _, open := c.RateLimitWindow(); open {
 		t.Fatal("window must clear on the next 2xx")
+	}
+}
+
+func TestConsume429KeepsTimingWithoutResponseText(t *testing.T) {
+	const marker = "synthetic-consume-response-canary"
+	for _, tc := range []struct {
+		name, body string
+		wait       time.Duration
+	}{
+		{"body hint", `{"error":"` + marker + `","window":"` + marker + `","retry_after":2}`, 2 * time.Second},
+		{"header fallback", `{"error":"` + marker + `","window":"` + marker + `"}`, 3 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Retry-After", "3")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			var logs []string
+			client := NewClient(ClientConfig{BaseURL: srv.URL, Token: "synthetic-token", DebugFunc: func(format string, args ...any) {
+				logs = append(logs, fmt.Sprintf(format, args...))
+			}})
+			defer client.Close()
+			_, err := client.ConsumeJob(context.Background(), ConsumeRequest{Queue: "q", Group: "g", Consumer: "c", BlockMs: 1, Count: 1})
+			limited, ok := AsRateLimitError(err)
+			if !ok || limited.StatusCode != http.StatusTooManyRequests || limited.Wait(time.Now()) != tc.wait {
+				t.Fatalf("want typed 429 with %s timing, got %v", tc.wait, err)
+			}
+			diagnostics := append(logs, limited.Error(), limited.Message, limited.Body, limited.Window)
+			for _, text := range diagnostics {
+				if strings.Contains(text, marker) {
+					t.Fatal("consume response text reached retained diagnostics")
+				}
+			}
+		})
 	}
 }

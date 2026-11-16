@@ -109,14 +109,17 @@ type WorkerState struct {
 	executingMu sync.Mutex
 
 	// rateLimitFn reads the live platform 429 window from the API client
-	// (citadel-cli#1677). Set once by NewRunner before any reader runs.
+	// (citadel-cli#1677). Protected by mu because status readers may already
+	// be running when NewRunner wires the callback.
 	rateLimitFn func() (time.Time, time.Duration, bool)
 }
 
 // SetRateLimitSource wires the live 429-window accessor surfaced by Snapshot.
 func (s *WorkerState) SetRateLimitSource(fn func() (since time.Time, retryAfter time.Duration, ok bool)) {
 	if s != nil {
+		s.mu.Lock()
 		s.rateLimitFn = fn
+		s.mu.Unlock()
 	}
 }
 
@@ -342,13 +345,14 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 		StartedAt:       s.startedAt,
 	}
 	snap.IdentityUnresolved = s.headscaleID == ""
+	rateLimitFn := s.rateLimitFn
 	s.mu.RUnlock()
 	health := s.platform.Snapshot()
 	snap.PlatformOKAt, snap.PlatformFailingSince = health.OKAt, health.FailingSince
 	snap.PlatformLastOutcome, snap.PlatformLastHTTPStatus = health.LastOutcome, health.LastStatus
 
-	if s.rateLimitFn != nil {
-		if since, retryAfter, ok := s.rateLimitFn(); ok {
+	if rateLimitFn != nil {
+		if since, retryAfter, ok := rateLimitFn(); ok {
 			snap.RateLimitedSince = &since
 			snap.LastRetryAfterSeconds = int64(retryAfter / time.Second)
 		}

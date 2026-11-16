@@ -2,6 +2,10 @@ package worker
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,5 +107,82 @@ func TestWorkerStateSurfacesRateLimitWindow(t *testing.T) {
 	open = false
 	if snap := st.Snapshot(); snap.RateLimitedSince != nil || snap.LastRetryAfterSeconds != 0 {
 		t.Fatal("window must clear once requests succeed")
+	}
+}
+
+func TestWorkerStateRateLimitSourceCanPublishWhileSnapshotsRun(t *testing.T) {
+	state := NewWorkerState()
+	since := time.Unix(100, 0)
+	report := func() (time.Time, time.Duration, bool) { return since, 7 * time.Second, true }
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		close(started)
+		for i := 0; i < 10000; i++ {
+			snap := state.Snapshot()
+			if snap.RateLimitedSince != nil && (!snap.RateLimitedSince.Equal(since) || snap.LastRetryAfterSeconds != 7) {
+				t.Error("snapshot has an inconsistent rate-limit report")
+				return
+			}
+		}
+	}()
+	<-started
+	for i := 0; i < 1000; i++ {
+		state.SetRateLimitSource(report)
+		runtime.Gosched()
+	}
+	<-done
+}
+
+func TestRunnerConsume429DoesNotLogResponseText(t *testing.T) {
+	const marker = "synthetic-worker-response-canary"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/fabric/redis/ping" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/api/fabric/redis/jobs/consume" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"` + marker + `","retry_after":1}`))
+	}))
+	defer srv.Close()
+	source := NewAPISource(APISourceConfig{BaseURL: srv.URL, Token: "synthetic-token", QueueName: "q", BlockMs: 1})
+	var mu sync.Mutex
+	var logs []string
+	retried := make(chan struct{}, 1)
+	runner := NewRunner(source, nil, RunnerConfig{WorkerID: "synthetic-worker", MaxConcurrency: 1, ActivityFn: func(_ string, message string) {
+		mu.Lock()
+		logs = append(logs, message)
+		mu.Unlock()
+		if strings.Contains(message, "Job fetch retrying") {
+			select {
+			case retried <- struct{}{}:
+			default:
+			}
+		}
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { runner.Run(ctx); close(done) }()
+	select {
+	case <-retried:
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("runner did not exercise its consume retry log")
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	for _, message := range logs {
+		if strings.Contains(message, marker) {
+			t.Fatal("consume response text reached worker activity log")
+		}
 	}
 }
