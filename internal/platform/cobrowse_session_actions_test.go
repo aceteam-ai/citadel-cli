@@ -380,6 +380,10 @@ type fakeCDPServer struct {
 	calls          []recordedCDPCall
 	evaluateValue  func(expr string) any
 	screenshotData string
+	// history answers Page.getNavigationHistory; nil answers {} (unknown).
+	history func() map[string]any
+	// eventsAfter returns CDP events written right after a method's response.
+	eventsAfter func(method string) []map[string]any
 }
 
 func startFakeCDPServer(t *testing.T) *fakeCDPServer {
@@ -415,6 +419,14 @@ func startFakeCDPServer(t *testing.T) *fakeCDPServer {
 			f.record(msg.Method, msg.Params)
 			result := f.respond(msg.Method, msg.Params)
 			_ = conn.WriteJSON(map[string]any{"id": msg.ID, "result": result})
+			f.mu.Lock()
+			ev := f.eventsAfter
+			f.mu.Unlock()
+			if ev != nil {
+				for _, e := range ev(msg.Method) {
+					_ = conn.WriteJSON(e)
+				}
+			}
 		}
 	})
 
@@ -454,6 +466,14 @@ func (f *fakeCDPServer) respond(method string, params map[string]any) map[string
 			val = responder(expr)
 		}
 		return map[string]any{"result": map[string]any{"type": "object", "value": val}}
+	case "Page.getNavigationHistory":
+		f.mu.Lock()
+		h := f.history
+		f.mu.Unlock()
+		if h != nil {
+			return h()
+		}
+		return map[string]any{}
 	case "Page.captureScreenshot":
 		f.mu.Lock()
 		data := f.screenshotData

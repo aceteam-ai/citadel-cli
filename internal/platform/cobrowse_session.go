@@ -427,10 +427,11 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 			// The browser opens on about:blank, which already reads
 			// "complete", before the launch URL commits. Wait for the page to
 			// leave it (bounded by the settle window) and report whatever is
-			// current. Never re-navigate: the launch URL may be single-use
-			// (magic link, OAuth code) and must be requested exactly once
-			// (citadel-cli#1694).
-			ps := settleLaunch(p)
+			// current. The launch URL may be single-use (magic link, OAuth
+			// code), so settleLaunch re-navigates at most once, and only
+			// when the browser's own navigation is proven never to have
+			// committed (citadel-cli#1694, #1714).
+			ps := settleLaunch(p, startURL)
 			if ps.URL != "" {
 				st.URL = ps.URL
 			}

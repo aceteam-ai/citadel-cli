@@ -81,17 +81,95 @@ var (
 // navigateSettleWindow. It returns the last state read; a slow page is not an
 // error.
 func settleNavigation(p pin, before string) PageState {
-	return settlePage(p, before, false)
+	return settlePage(p, before, false, nil)
 }
 
 // settleLaunch is the start-up settle: the initial about:blank must not
 // satisfy the minimum-wait shortcut, so it waits for the page to commit away
 // from it (or for the settle window to end) and reports the current state.
-func settleLaunch(p pin) PageState {
-	return settlePage(p, "about:blank", true)
+func settleLaunch(p pin, startURL string) PageState {
+	return settlePage(p, "about:blank", true, &launchGuard{startURL: startURL})
 }
 
-func settlePage(p pin, before string, requireChange bool) PageState {
+// launchGuard allows one re-navigation to the start URL when the settle window
+// ends with the page still on about:blank, and only when the browser's own
+// start navigation is shown never to have committed (citadel-cli#1714). The
+// start URL can be single-use, so every ambiguity resolves to "do not
+// navigate".
+//
+// The proof has two parts, both read on the settle connection:
+//   - Page.getNavigationHistory lists exactly one committed entry, about:blank
+//     at index 0. A committed navigation (even a late one that landed after
+//     the last poll) always adds an entry, and a redirect or error page does
+//     too.
+//   - No navigation event (Network.requestWillBeSent for a Document,
+//     Page.frameRequestedNavigation, frameStartedLoading, frameNavigated)
+//     was observed on the connection between enabling Page/Network and the
+//     check, so the request is not visibly in flight.
+//
+// A request that started before this connection enabled the Network domain
+// and has not committed yet cannot be told apart from one that never started;
+// CDP exposes no pending-navigation query. That is the residual duplicate-GET
+// window, and it is limited to a first request that is still unanswered when
+// the settle window ends.
+type launchGuard struct {
+	startURL string
+	armed    bool // Page and Network enabled on the first connection
+	seen     bool // a navigation event was observed
+	tried    bool
+}
+
+func (g *launchGuard) onConn(c *cdpConn, first bool) {
+	g.armed = false
+	if !first {
+		// Events between the dropped connection and this one are lost.
+		return
+	}
+	c.onEvent = func(method string, params map[string]any) {
+		switch method {
+		case "Page.frameRequestedNavigation", "Page.frameStartedLoading", "Page.frameStartedNavigating",
+			"Page.frameNavigated", "Page.navigatedWithinDocument":
+			g.seen = true
+		case "Network.requestWillBeSent":
+			if t, _ := params["type"].(string); t == "Document" {
+				g.seen = true
+			}
+		}
+	}
+	if _, err := c.Call("Page.enable", nil); err != nil {
+		return
+	}
+	if _, err := c.Call("Network.enable", nil); err != nil {
+		return
+	}
+	g.armed = true
+}
+
+// neverCommitted reports whether the start navigation is proven not to have
+// committed. Any error or unexpected shape is "not proven".
+func (g *launchGuard) neverCommitted(c cdpCaller) bool {
+	if !g.armed {
+		return false
+	}
+	res, err := c.Call("Page.getNavigationHistory", nil)
+	if err != nil {
+		return false
+	}
+	entries, _ := res["entries"].([]any)
+	idx, _ := res["currentIndex"].(float64)
+	if len(entries) != 1 || idx != 0 {
+		return false
+	}
+	e, _ := entries[0].(map[string]any)
+	if u, _ := e["url"].(string); u != "about:blank" {
+		return false
+	}
+	// getNavigationHistory drained any queued events as a side effect of the
+	// call, so this read is after them.
+	return !g.seen
+}
+
+func settlePage(p pin, before string, requireChange bool, lg *launchGuard) PageState {
 	var last PageState
 	start := time.Now()
 	// One connection for the whole poll loop instead of a discovery and a
@@ -106,10 +184,16 @@ func settlePage(p pin, before string, requireChange bool) PageState {
 			conn.Close()
 		}
 	}()
+	limit := navigateSettleWindow
+	opened := false
 	for {
 		if conn == nil {
 			if c, err := openCDPConn(ctx, p); err == nil {
 				conn, caller = c, c
+				if lg != nil {
+					lg.onConn(c, !opened)
+				}
+				opened = true
 			}
 		}
 		ps, err := readPageStateOn(caller)
@@ -128,7 +212,18 @@ func settlePage(p pin, before string, requireChange bool) PageState {
 				return ps
 			}
 		}
-		if time.Since(start) >= navigateSettleWindow {
+		if time.Since(start) >= limit {
+			if lg != nil && !lg.tried && conn != nil && last.URL == "about:blank" {
+				lg.tried = true
+				if lg.neverCommitted(conn) {
+					if _, err := conn.Call("Page.navigate", map[string]any{"url": lg.startURL}); err == nil {
+						// Stay inside the original bound (window plus
+						// reserve): spend half the reserve waiting.
+						limit = navigateSettleWindow + cobrowseReportReserve/2
+						continue
+					}
+				}
+			}
 			return last
 		}
 		time.Sleep(navigateSettlePoll)
