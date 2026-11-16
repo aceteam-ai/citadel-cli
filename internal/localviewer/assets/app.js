@@ -287,8 +287,11 @@
   screen.addEventListener("mousedown", (ev) => {
     if (!human) return;
     ev.preventDefault();
-    $("screen-wrap").focus();
+    // Read the position before focusing: focusing can scroll the viewer page,
+    // which would move the picture under the pointer and send the click to the
+    // wrong place. preventScroll keeps the document where the user left it.
     const p = pos(ev);
+    $("screen-wrap").focus({ preventScroll: true });
     send({ type: "mouse", event: "mousePressed", x: p.x, y: p.y, button: buttonName(ev.button), buttons: ev.buttons, clickCount: ev.detail || 1 });
   });
   screen.addEventListener("mouseup", (ev) => {
