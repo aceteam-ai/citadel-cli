@@ -135,8 +135,19 @@ as private organization data even after redaction.
 The initial native path observes the worker user's default tmux server on Unix.
 It never launches a server (`tmux -N list-panes`) or probes custom sockets from a
 payload. Windows refuses because this slice cannot prove the same-user tmux
-process boundary there. Declared-state verification uses the existing Linux
-process identity boundary; another platform reports that component unavailable.
+process boundary there. On macOS, the pinned gopsutil v3.24.5 process reader
+does not implement TTY observation, so the pane TTY check refuses every pane:
+the report has no pane rows and marks `pane_process` unavailable rather than
+claiming native macOS support. On Linux, that reader maps `/dev/pts` devices;
+console `/dev/ttyN` panes are likewise unavailable. Declared-state verification
+uses the existing Linux process identity boundary; another platform reports
+that component unavailable.
+
+Discovery issues one tmux metadata command per pane for session classification,
+plus two per displayed non-terminal pane. Process TTY observation also scans the
+terminal map. On busy hosts, these reads can reach the fifteen-second collection
+deadline and refuse with unavailable instead of returning an incomplete result
+as a complete inventory.
 
 Tests use injected pane/process/argv/git/capacity/declaration fixtures, including
 planted credentials and dirty filenames, foreign users, shared and foreign-node
