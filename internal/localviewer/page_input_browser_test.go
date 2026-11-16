@@ -149,13 +149,41 @@ func (s handoffSession) ViewerHasControl(id string) bool {
 	return false
 }
 
-// TestViewerFirstInputAfterHandoffInRealBrowser pins #1681: the first click
-// after the user takes control must reach the streamed page where the pointer
-// was, and the keystroke after it must be forwarded, without the viewer page
-// scrolling. Focusing the stream used to scroll the viewer document before the
-// click position was read, so the click landed about 140px off and the page
-// moved under the user.
-func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
+type viewerGeo struct{ Top, Bottom, Left, Right, InnerW, InnerH, ScrollY float64 }
+
+type viewerFixture struct {
+	t    *testing.T
+	page *fakeCDPPage
+	cdp  *cobrowsestream.Client
+	m    *platform.CobrowseSessionManager
+	vp   platform.CobrowseSessionStatus
+}
+
+func (v *viewerFixture) geo() (g viewerGeo) {
+	v.t.Helper()
+	cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := v.cdp.Command(cctx, "Runtime.evaluate", map[string]any{"returnByValue": true, "expression": `JSON.stringify((function(){
+		var r = document.getElementById("screen").getBoundingClientRect();
+		return {Top: r.top, Bottom: r.bottom, Left: r.left, Right: r.right,
+			InnerW: window.innerWidth, InnerH: window.innerHeight, ScrollY: window.scrollY};
+	})())`})
+	if err != nil {
+		v.t.Fatalf("read viewer geometry: %v", err)
+	}
+	inner, _ := res["result"].(map[string]any)
+	str, _ := inner["value"].(string)
+	if err := json.Unmarshal([]byte(str), &g); err != nil {
+		v.t.Fatalf("viewer geometry %v: %v", res, err)
+	}
+	return g
+}
+
+// startHandedOffViewer runs the viewer in a real browser, hands the session to
+// the user the way the agent does, and waits for the streamed frame and a
+// settled layout.
+func startHandedOffViewer(t *testing.T) *viewerFixture {
+	t.Helper()
 	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" {
 		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 to run the real-browser viewer test")
 	}
@@ -187,7 +215,7 @@ func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := platform.NewCobrowseSessionManager(filepath.Join(t.TempDir(), "sessions"), 1)
-	defer m.StopAll()
+	t.Cleanup(func() { _ = m.StopAll() })
 	vp, err := m.StartSession(srv.MintURL())
 	if err != nil {
 		t.Fatalf("start viewer browser: %v", err)
@@ -218,6 +246,13 @@ func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
 	}
 	waitText("#waiting", "Waiting for you: sign in")
 
+	cdp, err := cobrowsestream.DialCDP(vp.DebugPort)
+	if err != nil {
+		t.Fatalf("dial viewer browser: %v", err)
+	}
+	t.Cleanup(func() { cdp.Close() })
+	v := &viewerFixture{t: t, page: page, cdp: cdp, m: m, vp: vp}
+
 	// Wait for the streamed frame to be painted.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -230,38 +265,43 @@ func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	time.Sleep(500 * time.Millisecond) // let layout settle after the image loads
+	// Let layout settle after the image loads: poll until #screen's rect holds
+	// still across consecutive reads.
+	var prev viewerGeo
+	stable := 0
+	deadline = time.Now().Add(30 * time.Second)
+	for stable < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("the viewer layout never settled")
+		}
+		g := v.geo()
+		if g == prev && g.Bottom > g.Top {
+			stable++
+		} else {
+			stable = 0
+		}
+		prev = g
+		time.Sleep(100 * time.Millisecond)
+	}
+	return v
 
+}
+
+// TestViewerFirstInputAfterHandoffInRealBrowser pins #1681: the first click
+// after the user takes control must reach the streamed page where the pointer
+// was, and the keystroke after it must be forwarded, without the viewer page
+// scrolling. Focusing the stream used to scroll the viewer document before the
+// click position was read, so the click landed about 140px off and the page
+// moved under the user.
+func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
+	v := startHandedOffViewer(t)
+	page, m, vp := v.page, v.m, v.vp
 	// One click inside the picture, then one key: exactly what a user does
 	// right after the handoff. The click sends mouseMoved first (before the
 	// focus), then the press and release.
 	// The window size and pixel ratio differ per platform, so aim at the middle
 	// of the part of the picture that is actually on screen.
-	cdp, err := cobrowsestream.DialCDP(vp.DebugPort)
-	if err != nil {
-		t.Fatalf("dial viewer browser: %v", err)
-	}
-	defer cdp.Close()
-	geo := func() (g struct{ Top, Bottom, Left, Right, InnerW, InnerH, ScrollY float64 }) {
-		t.Helper()
-		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		res, err := cdp.Command(cctx, "Runtime.evaluate", map[string]any{"returnByValue": true, "expression": `JSON.stringify((function(){
-			var r = document.getElementById("screen").getBoundingClientRect();
-			return {Top: r.top, Bottom: r.bottom, Left: r.left, Right: r.right,
-				InnerW: window.innerWidth, InnerH: window.innerHeight, ScrollY: window.scrollY};
-		})())`})
-		if err != nil {
-			t.Fatalf("read viewer geometry: %v", err)
-		}
-		inner, _ := res["result"].(map[string]any)
-		str, _ := inner["value"].(string)
-		if err := json.Unmarshal([]byte(str), &g); err != nil {
-			t.Fatalf("viewer geometry %v: %v", res, err)
-		}
-		return g
-	}
-	g0 := geo()
+	g0 := v.geo()
 	top, bottom := math.Max(g0.Top, 0), math.Min(g0.Bottom, g0.InnerH)
 	if bottom-top < 20 || g0.Right-g0.Left < 20 || g0.ScrollY != 0 {
 		t.Fatalf("the picture is not on screen to click: %+v", g0)
@@ -274,13 +314,13 @@ func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
 		t.Fatalf("key: %v", err)
 	}
 
-	if g := geo(); g.ScrollY != 0 {
+	if g := v.geo(); g.ScrollY != 0 {
 		t.Fatalf("the viewer page scrolled after the first click and key: %+v (before: %+v)", g, g0)
 	}
 
 	var moved, pressed, released map[string]any
 	var keys []map[string]any
-	deadline = time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		mouse, ks := page.snapshot()
 		moved, pressed, released = nil, nil, nil
@@ -320,5 +360,38 @@ func TestViewerFirstInputAfterHandoffInRealBrowser(t *testing.T) {
 	}
 	if got := fmt.Sprint(keys[0]["key"], keys[0]["text"]); !strings.Contains(got, "a") {
 		t.Fatalf("the key after the click was not forwarded to the streamed page: %v", keys)
+	}
+}
+
+// TestViewerFocusAfterHandoffInRealBrowser pins #1687: after the user takes
+// control, the first keystroke, sent with no click on the picture first, must
+// be forwarded to the streamed page, and Space must not scroll the viewer.
+func TestViewerFocusAfterHandoffInRealBrowser(t *testing.T) {
+	v := startHandedOffViewer(t)
+	if g := v.geo(); g.ScrollY != 0 {
+		t.Fatalf("the viewer starts scrolled: %+v", g)
+	}
+	for _, k := range []string{"a", " "} {
+		if _, err := v.m.Key(v.vp.ID, k); err != nil {
+			t.Fatalf("key %q: %v", k, err)
+		}
+	}
+	var keys []map[string]any
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, keys = v.page.snapshot()
+		if len(keys) >= 4 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(keys) < 4 {
+		t.Fatalf("a key pressed right after the handoff was not forwarded to the streamed page: %v", keys)
+	}
+	if got := fmt.Sprint(keys[0]["key"], keys[0]["text"]); !strings.Contains(got, "a") {
+		t.Fatalf("unexpected first key: %v", keys)
+	}
+	if g := v.geo(); g.ScrollY != 0 {
+		t.Fatalf("the viewer page scrolled on a key before any click: %+v", g)
 	}
 }

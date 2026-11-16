@@ -91,6 +91,7 @@
       return;
     }
 
+    const wasHuman = human;
     human = s.driver === "human";
     $("session-goal").textContent = s.goal || "Browser session";
     $("session-driver").textContent = human ? "You are driving" : "Agent driving";
@@ -125,6 +126,9 @@
     addr.disabled = !human;
     if (document.activeElement !== addr) addr.value = s.url || "";
     $("screen-wrap").className = human ? "driving" : "";
+    // Take control (or a handoff) leaves focus on the button, so the first key
+    // would scroll the viewer instead of reaching the stream.
+    if (human && !wasHuman) $("screen-wrap").focus({ preventScroll: true });
     $("hint").textContent = human ? "Click the picture and type; your keystrokes go only to this browser." : "";
     openStream(s.session_id);
     if (lastTargets && wsFor === s.session_id) renderPages(lastTargets); // buttons follow who is driving
