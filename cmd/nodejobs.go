@@ -46,6 +46,10 @@ type nodeJobHandlerOpts struct {
 	// the worker handler set; nil leaves those handlers unsigned.
 	WorkReceiptSigner aep.Signer
 	WorkReceiptNodeID string
+	// ReceiptRoutingNodeID is the id this worker serves under (its per-node stream
+	// and heartbeat node id). Chat receipts sign it, the same value as
+	// WorkReceiptNodeID (citadel-cli#1638). Empty keeps the default.
+	ReceiptRoutingNodeID string
 	// AllowReadOutsideWorkspace lets read-only file handlers escape the sandbox.
 	AllowReadOutsideWorkspace bool
 	// AuthorizedRoots resolves the operator-bound authorized roots a dispatched
@@ -150,6 +154,10 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 	// ollama/llamacpp/bonsai). Without it every inference job failed with
 	// "unsupported job type \"llm_inference\": node X has no handler for it".
 	llmHandler := worker.NewLLMInferenceHandler()
+	if opts.ReceiptRoutingNodeID != "" {
+		routing := servingReceiptNodeID(opts.ReceiptRoutingNodeID)
+		llmHandler = llmHandler.WithFabricNodeIDResolver(func() string { return routing })
+	}
 	// Model hotswap (citadel-cli#632, default ON): unless CITADEL_MODEL_HOTSWAP is
 	// explicitly disabled (0/false/no/off) and this node has a config dir, attach a
 	// swap manager so an installed-but-not-resident target engine is swapped in on

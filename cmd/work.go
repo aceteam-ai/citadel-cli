@@ -2486,7 +2486,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// internal/worker or internal/gateway) so a test never signs with this box's
 	// real node identity.
 	workReceiptSigner := nodeidentity.Convergent(network.GetNodeConfigDir())
-	workReceiptNodeID := config.LoadDeviceCredsConverged().FabricNodeID
+	workReceiptNodeID := servingReceiptNodeID(nodeName)
 
 	// Start in-process HTTPS gateway if enabled
 	if workGateway {
@@ -2833,6 +2833,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// never signs with this box's real node identity.
 		WorkReceiptSigner:         workReceiptSigner,
 		WorkReceiptNodeID:         workReceiptNodeID,
+		ReceiptRoutingNodeID:      nodeName,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		AuthorizedRoots:           authorizedRootsResolver(),
 		ShellDisabled:             !workPerms.Shell,
