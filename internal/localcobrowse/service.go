@@ -433,6 +433,12 @@ type StartResult struct {
 	// Profile names the saved profile; Next says what to do while locked.
 	Profile string `json:"profile,omitempty"`
 	Next    string `json:"next,omitempty"`
+	// FirstLoad is "pending" while the start URL has not replaced about:blank
+	// yet (a cold browser start can be slow); URL is then about:blank, not the
+	// page. PendingOrigin is the start URL's origin only. Read the session
+	// status later: it clears once the page has loaded. Nothing re-navigates.
+	FirstLoad     string `json:"first_load,omitempty"`
+	PendingOrigin string `json:"pending_origin,omitempty"`
 }
 
 // Start opens a new session at startURL (empty means about:blank). Navigating
@@ -532,8 +538,11 @@ func (s *Service) start(ctx context.Context, startURL, goal, profile string) (St
 		Title:     title,
 		Browser:   st.Browser,
 		Lifetime:  LifetimePolicy,
-		Writes:    "navigate, click, type, select, key and scroll need the user's approval for each website in the Citadel viewer; anything that sends, posts, submits, pays or deletes asks every time",
-		Viewer:    s.cfg.ViewerNote,
+
+		FirstLoad:     st.FirstLoad,
+		PendingOrigin: st.PendingOrigin,
+		Writes:        "navigate, click, type, select, key and scroll need the user's approval for each website in the Citadel viewer; anything that sends, posts, submits, pays or deletes asks every time",
+		Viewer:        s.cfg.ViewerNote,
 	}, nil
 }
 
@@ -564,6 +573,7 @@ func (s *Service) afterLaunch(ctx context.Context, st platform.CobrowseSessionSt
 	}
 	if cur, ok := s.cfg.Browser.SessionStatus(st.ID); ok {
 		st.URL = cur.URL
+		st.FirstLoad, st.PendingOrigin = cur.FirstLoad, cur.PendingOrigin
 	}
 	return st, title, nil
 }
@@ -1326,6 +1336,10 @@ type SessionView struct {
 	Browser   string `json:"browser,omitempty"`
 	Goal      string `json:"goal,omitempty"`
 	StartedAt string `json:"started_at"`
+	// FirstLoad is "pending" while the start URL has not replaced about:blank
+	// (citadel-cli#1714); PendingOrigin is its origin only.
+	FirstLoad     string `json:"first_load,omitempty"`
+	PendingOrigin string `json:"pending_origin,omitempty"`
 	// Domain is the registrable domain of the current page. Approval and
 	// GrantExpiresAt describe that domain's grant; Grants lists them all.
 	Domain   string `json:"domain,omitempty"`
@@ -1413,6 +1427,8 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 		StartedAt:     ss.startedAt.UTC().Format(time.RFC3339),
 		Lifetime:      LifetimePolicy,
 		ApprovalAsked: ss.approvalAsked,
+		FirstLoad:     st.FirstLoad,
+		PendingOrigin: st.PendingOrigin,
 	}
 	v.Domain = RegistrableDomain(st.URL)
 	if ss.approvalAsked {
