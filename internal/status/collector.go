@@ -30,20 +30,21 @@ type Collector struct {
 	services         []ServiceConfig
 	startTime        time.Time
 	modelDiscovery   *ModelDiscovery
-	capabilities     *NodeCapabilities                 // cached capabilities (set once at startup)
-	workerLiveness   func() *WorkerLiveness            // live worker consume-loop liveness (issue #548), optional
-	swapStats        func() *SwapActivity              // live model-hotswap activity (citadel #717), optional
-	reconcileHealth  func() *ReconcileHealth           // live full-wipe-guard refusal state (citadel #742), optional
-	idleTracker      *IdleTracker                      // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
-	fpIdleTracker    *FootprintIdleTracker             // footprint-derived idle for engines #416 can't scrape (citadel #421)
-	netIdleTracker   *IdleTracker                      // network-activity idle for non-vLLM services (citadel #433)
-	reqLog           *requestLog                       // node-routed request log, every engine (citadel #691)
-	pinnedServices   map[string]bool                   // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
-	modelHotswap     bool                              // advertise installed-vs-resident models (citadel #632)
-	reservations     func() []GPUReservation           // live job-scoped GPU reservations (citadel #832), optional
-	laneActivity     func() []LaneActivity             // live bounded-execution-lane activity (citadel #908), optional
-	pairingDisplay   func() *PairingDisplayCapability  // live pairing-display capability probe (citadel #659), optional
-	cacheReport      func() *CacheReport               // live cache-index attribution (citadel #682 P3), optional
+	capabilities     *NodeCapabilities                // cached capabilities (set once at startup)
+	workerLiveness   func() *WorkerLiveness           // live worker consume-loop liveness (issue #548), optional
+	swapStats        func() *SwapActivity             // live model-hotswap activity (citadel #717), optional
+	reconcileHealth  func() *ReconcileHealth          // live full-wipe-guard refusal state (citadel #742), optional
+	idleTracker      *IdleTracker                     // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
+	fpIdleTracker    *FootprintIdleTracker            // footprint-derived idle for engines #416 can't scrape (citadel #421)
+	netIdleTracker   *IdleTracker                     // network-activity idle for non-vLLM services (citadel #433)
+	reqLog           *requestLog                      // node-routed request log, every engine (citadel #691)
+	pinnedServices   map[string]bool                  // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
+	modelHotswap     bool                             // advertise installed-vs-resident models (citadel #632)
+	reservations     func() []GPUReservation          // live job-scoped GPU reservations (citadel #832), optional
+	laneActivity     func() []LaneActivity            // live bounded-execution-lane activity (citadel #908), optional
+	pairingDisplay   func() *PairingDisplayCapability // live pairing-display capability probe (citadel #659), optional
+	cacheReport      func() *CacheReport              // live cache-index attribution (citadel #682 P3), optional
+	browseRecovery   func() bool
 	jobTypes         func() []string                   // live registered worker job types (aceteam #9962), optional
 	permissions      func() *config.Permissions        // authoritative node permission policy, optional
 	visibleGPUs      []string                          // nil = all devices
@@ -122,6 +123,8 @@ type CollectorConfig struct {
 	// capability-aware dispatch. nil or an empty result leaves job_types omitted
 	// until the live runner is fully registered.
 	JobTypes func() []string
+	// CobrowseJobRecovery reads the live configured recovery adapter.
+	CobrowseJobRecovery func() bool
 	// VisibleGPUs, when non-nil, limits GPU metrics to these device indexes
 	// (CUDA_VISIBLE_DEVICES entries). A batch allocation reports only the GPUs
 	// its scheduler gave it; an empty non-nil slice reports none. nil (every
@@ -178,6 +181,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		pairingDisplay:   cfg.PairingDisplay,
 		cacheReport:      cfg.CacheReport,
 		jobTypes:         cfg.JobTypes,
+		browseRecovery:   cfg.CobrowseJobRecovery,
 		permissions:      cfg.PermissionsProvider,
 		visibleGPUs:      cfg.VisibleGPUs,
 		appPods:          cfg.AppPods,
@@ -538,6 +542,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// surfaces never appear dispatchable.
 	if c.jobTypes != nil {
 		status.Capabilities.JobTypes = c.jobTypes()
+	}
+	// Clear a cached value too: unsupported/disabled is never a stale true.
+	status.Capabilities.CobrowseJobRecovery = nil
+	if c.browseRecovery != nil {
+		enabled := c.browseRecovery()
+		status.Capabilities.CobrowseJobRecovery = &enabled
 	}
 
 	// Advertise the generic sandboxed-module runtime availability (citadel-cli

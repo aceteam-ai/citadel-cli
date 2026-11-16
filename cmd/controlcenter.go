@@ -2371,6 +2371,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ConfigDir:           "",
 		Services:            nil,
 		PermissionsProvider: loadNodePermissions,
+		CobrowseJobRecovery: func() bool {
+			runner := ccNodeRunner.Load()
+			return runner != nil && runner.CobrowseJobRecoveryAvailable()
+		},
 		JobTypes: func() []string {
 			runner := ccNodeRunner.Load()
 			if runner == nil {
