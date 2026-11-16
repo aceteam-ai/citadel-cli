@@ -842,3 +842,32 @@ func TestHandoffDuringCleanupReleaseSkipsProbe(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond)
 }
+
+// A status read whose page sync is slow must not hold an action past its own
+// budget: the action waits for the target-set sync only as long as its
+// context allows.
+func TestConcurrentSlowStatusDoesNotHoldActionPastBudget(t *testing.T) {
+	shortBudget(t, 100*time.Millisecond, 50*time.Millisecond)
+	f := startLatencyCDP(t, nil)
+	m, id := newTrackedBudgetSession(t, f, func(context.Context, string) error { return nil })
+	entered := make(chan struct{})
+	var once sync.Once
+	f.mu.Lock()
+	f.jsonDelay = 750 * time.Millisecond
+	f.onJSON = func() { once.Do(func() { close(entered) }) }
+	f.mu.Unlock()
+
+	go func() { _, _ = m.SessionStatus(id) }()
+	<-entered // the status read now holds the sync while its discovery stalls
+
+	x, y := 10.0, 10.0
+	start := time.Now()
+	_, _ = m.Click(id, "", &x, &y)
+	if d := time.Since(start); d > 150*time.Millisecond+100*time.Millisecond {
+		t.Fatalf("click took %v behind a slow concurrent status, with a 150ms combined budget", d)
+	}
+	if n := f.count("Input.dispatchMouseEvent"); n != 0 {
+		t.Fatalf("%d mouse events with the sync out of budget", n)
+	}
+	time.Sleep(time.Second) // let the status read finish before the fake closes
+}
