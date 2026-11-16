@@ -104,6 +104,11 @@ type CobrowseSessionStatus struct {
 	Targets      []CobrowseTarget `json:"targets,omitempty"`
 	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
 	Generation uint64 `json:"generation,omitempty"`
+	// Done and Effects are set only by scripted actions (click, type, key,
+	// scroll): Done is false when the action hit its deadline or failed after
+	// it may have acted, and Effects says what happened (citadel-cli#1663).
+	Done    *bool          `json:"done,omitempty"`
+	Effects *ActionEffects `json:"effects,omitempty"`
 }
 
 // cobrowseProc is the running-process bundle for one session: the browser and its
@@ -202,6 +207,9 @@ type cobrowseSession struct {
 	mu    sync.Mutex
 	state CobrowseSessionState
 	proc  *cobrowseProc
+	// lastURL is the last page URL a probe read; status falls back to it when
+	// the DevTools endpoint is slow (citadel-cli#1663).
+	lastURL string
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
@@ -638,6 +646,73 @@ func (s *cobrowseSession) teardown() error {
 // to every session status in the list). st is a local, unshared struct, so filling in
 // its URL after unlocking is race-free.
 func (s *cobrowseSession) status() CobrowseSessionStatus {
+	return s.statusCtx(context.Background())
+}
+
+// statusCtx is status under the caller's context, so an action's one budget
+// covers its read-back.
+func (s *cobrowseSession) statusCtx(parent context.Context) CobrowseSessionStatus {
+	st, probePort := s.statusBase()
+	if probePort == 0 {
+		return st
+	}
+	s.mu.Lock()
+	tracking := s.tracking
+	s.mu.Unlock()
+	if tracking {
+		ctx, cancel := context.WithTimeout(parent, targetSyncTimeout)
+		snap, err := targetSetFor(probePort).sync(ctx, probePort)
+		cancel()
+		if err == nil {
+			st.Targets = snap.Targets
+			st.ActiveTarget = snap.Active
+			for _, tg := range snap.Targets {
+				if tg.Active {
+					st.URL = tg.URL
+				}
+			}
+			s.noteURL(st.URL)
+		} else {
+			st.URL = s.cachedURL()
+		}
+		return st
+	}
+	ctx, cancel := context.WithTimeout(parent, cobrowseStatusProbeTimeout)
+	t, err := pickTargetContext(ctx, probePort)
+	cancel()
+	if err != nil {
+		// A slow or wedged endpoint reports the last URL seen rather than
+		// stalling the status call.
+		st.URL = s.cachedURL()
+		return st
+	}
+	st.URL = t.URL
+	s.noteURL(t.URL)
+	return st
+}
+
+func (s *cobrowseSession) noteURL(u string) {
+	if u == "" {
+		return
+	}
+	s.mu.Lock()
+	s.lastURL = u
+	s.mu.Unlock()
+}
+
+func (s *cobrowseSession) cachedURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastURL
+}
+
+// statusNoProbe is status() without any CDP probe; the caller fills URL.
+func (s *cobrowseSession) statusNoProbe() CobrowseSessionStatus {
+	st, _ := s.statusBase()
+	return st
+}
+
+func (s *cobrowseSession) statusBase() (CobrowseSessionStatus, int) {
 	s.mu.Lock()
 	st := CobrowseSessionStatus{
 		ID:         s.id,
@@ -665,25 +740,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 		}
 	}
 	s.mu.Unlock()
-
-	if probePort != 0 {
-		if s.tracking {
-			ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
-			if snap, err := targetSetFor(probePort).sync(ctx, probePort); err == nil {
-				st.Targets = snap.Targets
-				st.ActiveTarget = snap.Active
-				for _, tg := range snap.Targets {
-					if tg.Active {
-						st.URL = tg.URL
-					}
-				}
-			}
-			cancel()
-		} else if t, err := pickTarget(probePort); err == nil {
-			st.URL = t.URL
-		}
-	}
-	return st
+	return st, probePort
 }
 
 // defaultLaunchCobrowseProc launches through this OS's browser runner (see

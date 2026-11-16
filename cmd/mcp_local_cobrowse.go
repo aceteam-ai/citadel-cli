@@ -562,7 +562,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if in.Selector == "" && (in.X == nil || in.Y == nil) {
 					return nil, argError{fmt.Errorf("click requires 'selector' or both 'x' and 'y'")}
 				}
-				return s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal)
+				return partialActionResult(s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal))
 			}),
 		writeTool("local_cobrowse_type", "Type text into the focused field (click it first). Only the text length is recorded. Never use this for passwords: hand off to the user instead."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "text": strProp("Text to insert."), "goal": strProp(descGoal)},
@@ -579,7 +579,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Type(ctx, id, in.Text, in.Goal)
+				return partialActionResult(s.Type(ctx, id, in.Text, in.Goal))
 			}),
 		writeTool("local_cobrowse_select", "Choose an option in a native select element by value or label."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector of the select element."),
@@ -614,7 +614,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Key(ctx, id, in.Key, in.Goal)
+				return partialActionResult(s.Key(ctx, id, in.Key, in.Goal))
 			}),
 		writeTool("local_cobrowse_scroll", "Scroll with the mouse wheel at an element or viewport point."+writeNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector; wins over x/y."),
@@ -630,7 +630,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Scroll(ctx, id, in.Selector, in.X, in.Y, in.DeltaX, in.DeltaY, in.Goal)
+				return partialActionResult(s.Scroll(ctx, id, in.Selector, in.X, in.Y, in.DeltaX, in.DeltaY, in.Goal))
 			}),
 		writeTool("local_cobrowse_extract", "Read an element's text (bounded; truncated is true when cut) and optional attributes. The value of a password field is never returned."+readNote,
 			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector."),
@@ -785,4 +785,32 @@ func handleLocalCobrowseSignals(rt *localCobrowseRuntime) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go closeOnSignal(rt, sigs, os.Exit)
+}
+
+// partialToolError is the error a partly done write returns: the failure text
+// first, then the structured result (done=false, effects), so the MCP result is
+// isError with the details attached. It is never a plain success.
+type partialToolError struct {
+	err    error
+	result []byte
+}
+
+func (e *partialToolError) Error() string { return e.err.Error() + "\nresult: " + string(e.result) }
+func (e *partialToolError) Unwrap() error { return e.err }
+
+// partialActionResult attaches the structured effects of a write that hit its
+// deadline or failed after it may have acted to the tool ERROR. Refusals stay
+// exactly as they were. The failure was already audited.
+func partialActionResult(res localcobrowse.ActionResult, err error) (any, error) {
+	if err == nil || res.Done == nil || *res.Done {
+		return res, err
+	}
+	if errors.Is(err, platform.ErrTargetChanged) || errors.Is(err, platform.ErrPageRefused) {
+		return nil, err
+	}
+	b, merr := json.Marshal(res)
+	if merr != nil {
+		return nil, err
+	}
+	return nil, &partialToolError{err: err, result: b}
 }

@@ -188,7 +188,8 @@
     if (!c && r) {
       $("commit-result").textContent = r.state === "executed"
         ? "Approved and done: " + r.action + " on " + r.domain + "."
-        : (r.state === "changed" ? "The page changed, so " + r.action + " on " + r.domain + " was not done. The agent will ask again."
+        : (r.state === "unconfirmed" ? "May have been done: " + r.action + " on " + r.domain + ". Check the page before asking the agent to try again."
+          : r.state === "changed" ? "The page changed, so " + r.action + " on " + r.domain + " was not done. The agent will ask again."
           : "Not done (" + r.state + "): " + r.action + " on " + r.domain + ". " + (r.detail || ""));
     }
     if (!c) { commitShown = null; clearShot(); return; }
