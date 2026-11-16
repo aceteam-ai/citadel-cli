@@ -24,6 +24,7 @@ import (
 
 // Collector gathers status metrics from the system, GPU, and services.
 type Collector struct {
+	role             string
 	clockState       clockstate.Provider
 	nodeName         string
 	configDir        string
@@ -62,6 +63,7 @@ type ServiceConfig struct {
 
 // CollectorConfig holds configuration for the status collector.
 type CollectorConfig struct {
+	Role string
 	// Cheap cached provider shared with this process's runner. No inline probe.
 	ClockState   clockstate.Provider
 	NodeName     string
@@ -157,6 +159,7 @@ type CollectorConfig struct {
 // NewCollector creates a new status collector.
 func NewCollector(cfg CollectorConfig) *Collector {
 	return &Collector{
+		role:             cfg.Role,
 		clockState:       cfg.ClockState,
 		nodeName:         cfg.NodeName,
 		configDir:        cfg.ConfigDir,
@@ -364,13 +367,19 @@ func (c *Collector) clockSynchronization() *bool {
 	return clockstate.Boolean(c.clockState.Snapshot())
 }
 
-// Collect gathers all status metrics and returns a NodeStatus.
-func (c *Collector) Collect() (*NodeStatus, error) {
-	status := &NodeStatus{
+// statusHeader projects only cached startup policy and clock observations.
+func (c *Collector) statusHeader() *NodeStatus {
+	return &NodeStatus{
+		Role:      c.role,
 		NTPSynced: c.clockSynchronization(),
 		Version:   StatusVersion,
 		Timestamp: time.Now().UTC(),
 	}
+}
+
+// Collect gathers all status metrics and returns a NodeStatus.
+func (c *Collector) Collect() (*NodeStatus, error) {
+	status := c.statusHeader()
 
 	// Collect node info
 	status.Node = c.collectNodeInfo()

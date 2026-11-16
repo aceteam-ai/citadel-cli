@@ -568,6 +568,14 @@ authority for the live handler set after platform, configuration, and permission
 gates. `cmd/work.go` publishes that set as `capabilities.job_types` through the
 status collector; do not infer handler availability from a version threshold.
 
+`cmd.resolveWorkerQueues` and `cmd.resolveDirectRedisQueuesForRole` own the
+control-only worker policy. `config.ResolveWorkerRole` defaults legacy nodes
+to full; control sources pin their sole per-node stream before connecting,
+including later resubscribe paths. `controlWorkerIdentity` refuses missing
+identity instead of allowing an empty queue list to activate shared defaults.
+Role edits require restart. See `docs/control-worker-role.md` for configured
+versus active reporting and the fake-broker/native-acceptance boundary.
+
 **Node Installer**: `install.sh` is a standalone script served at `get.aceteam.ai/citadel` that provisions a fresh Ubuntu machine end-to-end (NVIDIA drivers, Docker, citadel binary, systemd service, vLLM pre-pull). `uninstall.sh` reverses it. The Packer template (`packer/`) bakes the same stack into a qcow2 VM image for Proxmox-based fleet deployment.
 
 ### Key Packages
