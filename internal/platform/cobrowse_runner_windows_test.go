@@ -377,8 +377,9 @@ func TestWindowsRealBrowserSession(t *testing.T) {
 	}
 }
 
-// TestWindowsRealBrowserActionLatency asserts status, screenshot, click and
-// type finish inside a budget far below the platform's 15s job wait, with their
+// TestWindowsRealBrowserActionLatency asserts status, a warm screenshot, click
+// and type finish within 5s, and the first screenshot after start within
+// CobrowseActionDeadline, all under the platform's 15s job wait, with their
 // effects reported (citadel-cli#1663). The name matches the existing
 // ^TestWindowsRealBrowser run list.
 func TestWindowsRealBrowserActionLatency(t *testing.T) {
