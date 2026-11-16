@@ -160,7 +160,17 @@ func (s *cobrowseSession) ensureStagingDir() (string, error) {
 	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
 		return "", stagingFailure("create staging dir", err)
 	}
+	return s.existingStagingDir()
+}
+
+// existingStagingDir checks the staging dir without creating it, and refuses
+// when it is absent. Reads (set_file_input) never create it.
+func (s *cobrowseSession) existingStagingDir() (string, error) {
+	dir := s.stagingDirPath()
 	info, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		return "", fmt.Errorf("%w: no staged files", ErrStagedPathRefused)
+	}
 	if err != nil {
 		return "", stagingFailure("inspect staging dir", err)
 	}
@@ -265,7 +275,7 @@ func (s *cobrowseSession) resolveStagedFile(name string) (string, StagedFile, er
 	refuse := func(why string) (string, StagedFile, error) {
 		return "", StagedFile{}, fmt.Errorf("%w: %s", ErrStagedPathRefused, why)
 	}
-	dir, err := s.ensureStagingDir()
+	dir, err := s.existingStagingDir()
 	if err != nil {
 		return "", StagedFile{}, err
 	}
@@ -314,21 +324,74 @@ func (s *cobrowseSession) resolveStagedFile(name string) (string, StagedFile, er
 // requires expected_url and refuses unless the pinned page's live URL equals it.
 const FileUploadPageFenceV1 = "expected_url_v1"
 
-// setFilesIfPageIs is the last step of set_file_input: it reads the pinned
-// page's live URL over the action's own connection and hands the browser the
-// files only when it equals expectedURL exactly (query and fragment included).
-// A mismatch is ErrTargetChanged with nothing dispatched. The URL is never put
-// in an error or a log.
-func setFilesIfPageIs(c cdpCaller, expectedURL string, params map[string]any, eff *ActionEffects) error {
-	val, err := evaluateOn(c, "location.href", false)
+// pathRedacted keeps an error's identity (Unwrap) while hiding a node path.
+type pathRedacted struct {
+	err  error
+	text string
+}
+
+func (e *pathRedacted) Error() string { return e.text }
+func (e *pathRedacted) Unwrap() error { return e.err }
+
+// redactPath keeps refusals unchanged (the action machinery classifies them by
+// identity) and hides the node's absolute path in any other error.
+func redactPath(err error, path, name string) error {
+	if err == nil || isActionRefusal(err) || path == "" || !strings.Contains(err.Error(), path) {
+		return err
+	}
+	return &pathRedacted{err: err, text: strings.ReplaceAll(err.Error(), path, name)}
+}
+
+// checkFileInput proves objectID is an enabled <input type=file>.
+func checkFileInput(c cdpCaller, objectID string) error {
+	info, err := c.Call("Runtime.callFunctionOn", map[string]any{
+		"objectId":            objectID,
+		"returnByValue":       true,
+		"functionDeclaration": `function(){return {file: this instanceof HTMLInputElement && this.type === "file", disabled: !!this.disabled}}`,
+	})
 	if err != nil {
 		return err
 	}
-	if cur, _ := val.(string); cur == "" || cur != expectedURL {
+	val, _ := info["result"].(map[string]any)
+	v, _ := val["value"].(map[string]any)
+	if isFile, _ := v["file"].(bool); !isFile {
+		return errors.New("the target is not a file input")
+	}
+	if disabled, _ := v["disabled"].(bool); disabled {
+		return errors.New("the file input is disabled")
+	}
+	return nil
+}
+
+// setFilesIfPageIs is the last step of set_file_input. It reads the URL of the
+// document that OWNS the target input (not the main frame: the input may sit in
+// a child frame or another page of the renderer) over the action's own
+// connection, requires it to equal expectedURL exactly (query and fragment
+// included), re-checks the driver after that round trip, and only then hands
+// the browser the files on that same resolved object. A mismatch is
+// ErrTargetChanged with nothing dispatched; the URL is never put in an error
+// or a log.
+func setFilesIfPageIs(c cdpCaller, objectID, expectedURL string, files []string, driverFence func() error, eff *ActionEffects) error {
+	res, err := c.Call("Runtime.callFunctionOn", map[string]any{
+		"objectId":            objectID,
+		"returnByValue":       true,
+		"functionDeclaration": "function(){return this.ownerDocument.URL}",
+	})
+	if err != nil {
+		return err
+	}
+	val, _ := res["result"].(map[string]any)
+	if cur, _ := val["value"].(string); cur == "" || cur != expectedURL {
 		return ErrTargetChanged
 	}
+	// A human can take control during the round trip above.
+	if driverFence != nil {
+		if err := driverFence(); err != nil {
+			return err
+		}
+	}
 	eff.Dispatched = true
-	if _, err := c.Call("DOM.setFileInputFiles", params); err != nil {
+	if _, err := c.Call("DOM.setFileInputFiles", map[string]any{"objectId": objectID, "files": files}); err != nil {
 		return err
 	}
 	eff.FilesSet = 1
@@ -371,7 +434,7 @@ func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID
 		return CobrowseSessionStatus{}, err
 	}
 	return s.runAction(b, p, "set_file_input", func(r *actionRun) error {
-		params := map[string]any{"files": []string{path}}
+		var objectID string
 		var nodeID int
 		if selector != "" {
 			res, err := r.conn.Call("Runtime.evaluate", map[string]any{
@@ -381,25 +444,12 @@ func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID
 				return err
 			}
 			obj, _ := res["result"].(map[string]any)
-			objectID, _ := obj["objectId"].(string)
+			objectID, _ = obj["objectId"].(string)
 			if objectID == "" {
 				return fmt.Errorf("no element matches selector %q", selector)
 			}
-			info, err := r.conn.Call("Runtime.callFunctionOn", map[string]any{
-				"objectId":            objectID,
-				"returnByValue":       true,
-				"functionDeclaration": `function(){return {file: this instanceof HTMLInputElement && this.type === "file", disabled: !!this.disabled}}`,
-			})
-			if err != nil {
-				return err
-			}
-			val, _ := info["result"].(map[string]any)
-			v, _ := val["value"].(map[string]any)
-			if isFile, _ := v["file"].(bool); !isFile {
-				return fmt.Errorf("selector %q does not match a file input", selector)
-			}
-			if disabled, _ := v["disabled"].(bool); disabled {
-				return fmt.Errorf("file input %q is disabled", selector)
+			if err := checkFileInput(r.conn, objectID); err != nil {
+				return fmt.Errorf("selector %q: %w", selector, err)
 			}
 			if d, err := r.conn.Call("DOM.describeNode", map[string]any{"objectId": objectID}); err == nil {
 				if node, ok := d["node"].(map[string]any); ok {
@@ -412,20 +462,31 @@ func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID
 				// not be matched to it: do not leave a stale one behind.
 				s.clearChooser()
 			}
-			params["objectId"] = objectID
 		} else {
+			res, err := r.conn.Call("DOM.resolveNode", map[string]any{"backendNodeId": backendNodeID})
+			if err != nil {
+				return err
+			}
+			obj, _ := res["object"].(map[string]any)
+			objectID, _ = obj["objectId"].(string)
+			if objectID == "" {
+				return errors.New("the pending file chooser's node is gone")
+			}
+			if err := checkFileInput(r.conn, objectID); err != nil {
+				return err
+			}
 			nodeID = backendNodeID
-			params["backendNodeId"] = backendNodeID
 		}
 		// The element lookup awaits the page, during which a human can take
-		// control or the active page can change: check after the last await
-		// and before the browser is handed the file.
+		// control or the active page can change: check the page before the
+		// URL read, and the driver again after it (inside setFilesIfPageIs).
 		if err := r.fence(); err != nil {
 			return err
 		}
-		if err := setFilesIfPageIs(r.conn, expectedURL, params, r.eff); err != nil {
+		err := setFilesIfPageIs(r.conn, objectID, expectedURL, []string{path}, func() error { return s.driverFence(r.p) }, r.eff)
+		if err != nil {
 			// Never return the node's absolute path to the platform.
-			return errors.New(strings.ReplaceAll(err.Error(), path, file.Name))
+			return redactPath(err, path, file.Name)
 		}
 		s.clearChooserFor(nodeID)
 		log.Printf("[cobrowse] audit set_file_input session=%s name=%q size=%d sha256=%s", id, file.Name, file.Size, file.SHA256)

@@ -294,6 +294,9 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		if id == "" || name == "" {
 			return nil, fmt.Errorf("stage_file requires session_id and name")
 		}
+		if err := platform.ValidateStagedName(name); err != nil {
+			return nil, err
+		}
 		// Size is checked on the encoded form first so an oversized payload is
 		// refused before it is decoded into a second copy.
 		encoded := job.Payload[CobrowseStageBytesKey]

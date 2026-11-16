@@ -9,9 +9,16 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 )
 
-func (s *RedisSource) ackDelivery(ctx context.Context, kind, queue, messageID string) error {
-	if kind == JobTypeFileFetch || kind == JobTypeCobrowseSession {
+func (s *RedisSource) ackDelivery(ctx context.Context, kind string, payload map[string]any, queue, messageID string) error {
+	if kind == JobTypeFileFetch {
 		return s.client.AckFileFetchJob(ctx, queue, messageID)
+	}
+	// Only a stage_file entry (a user's file as base64) is disposable; every
+	// other COBROWSE_SESSION action keeps the plain ack below.
+	if kind == JobTypeCobrowseSession {
+		if action, _ := payload["action"].(string); action == "stage_file" {
+			return s.client.AckStagedFileJob(ctx, queue, messageID)
+		}
 	}
 	if queue != "" {
 		return s.client.AckJobOnQueue(ctx, queue, messageID)
