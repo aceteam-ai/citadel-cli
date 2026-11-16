@@ -23,11 +23,11 @@ func TestLaneInventoryExactOwnStream(t *testing.T) {
 	for _, queue := range []string{"", "jobs:v1:cpu", "jobs:v1:shell:org_org", "jobs:v1:shell:org_other:node:42", "jobs:v1:shell:org_org:node:43", "fake:node:42", "jobs:v1:shell:org_org:node:42"} {
 		t.Run(queue, func(t *testing.T) {
 			called := 0
-			h := NewLaneInventoryHandler(LaneInventoryConfig{OrgID: "org", NodeID: "42", Collect: func(context.Context) (laneinventory.Report, error) {
+			h := NewLaneInventoryHandler(LaneInventoryConfig{OrgID: "org", NodeID: "42", Enabled: func() bool { return true }, Collect: func(context.Context) (laneinventory.Report, error) {
 				called++
 				return laneinventory.Report{Panes: []laneinventory.Pane{}}, nil
 			}})
-			job := &Job{Type: JobTypeLaneInventory, SourceQueue: queue, Payload: map[string]any{"source_queue": "jobs:v1:shell:org_org:node:42", "cwd": "/forbidden", "command": "env"}}
+			job := &Job{Type: JobTypeLaneInventory, Source: "redis-api", SourceQueue: queue, Payload: map[string]any{"source_queue": "jobs:v1:shell:org_org:node:42", "cwd": "/forbidden", "command": "env"}}
 			r, err := h.Execute(context.Background(), job, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -44,7 +44,7 @@ func TestLaneInventoryExactOwnStream(t *testing.T) {
 }
 
 func TestLaneInventoryRefusalAndOutputBound(t *testing.T) {
-	job := &Job{Type: JobTypeLaneInventory, SourceQueue: "jobs:v1:shell:org_org:node:42"}
+	job := &Job{Type: JobTypeLaneInventory, Source: "redis-api", SourceQueue: "jobs:v1:shell:org_org:node:42"}
 	for _, cfg := range []LaneInventoryConfig{
 		{OrgID: "org", NodeID: "42"},
 		{OrgID: "", NodeID: "42"},
@@ -53,12 +53,13 @@ func TestLaneInventoryRefusalAndOutputBound(t *testing.T) {
 			return laneinventory.Report{}, errors.New("planted-sensitive-error")
 		}},
 	} {
+		cfg.Enabled = func() bool { return true }
 		r, _ := NewLaneInventoryHandler(cfg).Execute(context.Background(), job, nil)
 		if r.Status != JobStatusFailure || strings.Contains(r.Error.Error(), "planted") {
 			t.Fatal("failure not sanitized")
 		}
 	}
-	h := NewLaneInventoryHandler(LaneInventoryConfig{OrgID: "org", NodeID: "42", Collect: func(context.Context) (laneinventory.Report, error) {
+	h := NewLaneInventoryHandler(LaneInventoryConfig{OrgID: "org", NodeID: "42", Enabled: func() bool { return true }, Collect: func(context.Context) (laneinventory.Report, error) {
 		r := laneinventory.Report{}
 		for i := 0; i < 128; i++ {
 			r.Panes = append(r.Panes, laneinventory.Pane{Session: strings.Repeat("x", 4096)})
@@ -72,5 +73,60 @@ func TestLaneInventoryRefusalAndOutputBound(t *testing.T) {
 	raw, _ := json.Marshal(r.Output)
 	if len(raw) > laneinventory.MaxBytes || r.Output["truncated"] != true {
 		t.Fatalf("unbounded output: %d", len(raw))
+	}
+}
+
+func TestLaneInventorySourceAdmission(t *testing.T) {
+	for _, source := range []string{"", "websocket", "nexus", "redis", "redis-api"} {
+		t.Run(source, func(t *testing.T) {
+			called := 0
+			h := NewLaneInventoryHandler(LaneInventoryConfig{OrgID: "org", NodeID: "42", Enabled: func() bool { return true }, Collect: func(context.Context) (laneinventory.Report, error) {
+				called++
+				return laneinventory.Report{}, nil
+			}})
+			job := &Job{Type: JobTypeLaneInventory, Source: source, SourceQueue: "jobs:v1:shell:org_org:node:42"}
+			r, err := h.Execute(context.Background(), job, nil)
+			allowed := source == "redis" || source == "redis-api"
+			if err != nil || (r.Status == JobStatusSuccess) != allowed || (called == 1) != allowed {
+				t.Fatalf("status=%s collected=%d err=%v", r.Status, called, err)
+			}
+		})
+	}
+}
+
+func TestLaneInventoryDefaultOffAndRevocation(t *testing.T) {
+	called := 0
+	enabled := false
+	for _, gate := range []func() bool{nil, func() bool { return enabled }} {
+		h := NewLaneInventoryHandler(LaneInventoryConfig{OrgID: "org", NodeID: "42", Enabled: gate, Collect: func(context.Context) (laneinventory.Report, error) {
+			called++
+			return laneinventory.Report{}, nil
+		}})
+		job := &Job{Type: JobTypeLaneInventory, Source: "redis-api", SourceQueue: "jobs:v1:shell:org_org:node:42"}
+		checkOff := func() {
+			t.Helper()
+			before := called
+			if h.CanHandle(JobTypeLaneInventory) {
+				t.Fatal("disabled handler advertised")
+			}
+			r, err := h.Execute(context.Background(), job, nil)
+			if err != nil || r.Status != JobStatusFailure || !errors.Is(r.Error, ErrLaneInventoryDisabled) || r.Output["code"] != "lane_inventory_disabled" || called != before {
+				t.Fatal("disabled handler did not refuse before collection")
+			}
+		}
+		checkOff()
+		if gate == nil {
+			continue
+		}
+		enabled = true
+		if !h.CanHandle(JobTypeLaneInventory) {
+			t.Fatal("explicit opt-in not advertised")
+		}
+		r, err := h.Execute(context.Background(), job, nil)
+		if err != nil || r.Status != JobStatusSuccess || called != 1 {
+			t.Fatal("explicit opt-in not executable")
+		}
+		enabled = false
+		checkOff()
 	}
 }

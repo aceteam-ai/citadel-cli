@@ -2,12 +2,64 @@ package laneinventory
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/declaredsession"
 	"github.com/aceteam-ai/citadel-cli/internal/procscope"
 )
+
+type fakeProcessReader struct {
+	ids           []int32
+	err           error
+	metadataCalls int
+}
+
+func (p *fakeProcessReader) UidsWithContext(context.Context) ([]int32, error) { return p.ids, p.err }
+func (p *fakeProcessReader) PpidWithContext(context.Context) (int32, error) {
+	p.metadataCalls++
+	return 9, nil
+}
+func (p *fakeProcessReader) CreateTimeWithContext(context.Context) (int64, error) { return 123, nil }
+
+func TestInventoryNativeProcessOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		ids     []int32
+		err     error
+		allowed bool
+	}{
+		{[]int32{1000, 1000}, nil, true},
+		{[]int32{2000, 1000}, nil, false},
+		{[]int32{1000, 2000}, nil, false},
+		{[]int32{2000, 2000}, nil, false},
+		{[]int32{1000}, nil, false},
+		{nil, nil, false},
+		{[]int32{1000, 1000}, errors.New("private observation failure"), false},
+	} {
+		t.Run(fmt.Sprint(tc.ids, tc.err), func(t *testing.T) {
+			p := &fakeProcessReader{ids: tc.ids, err: tc.err}
+			out, err := nativeProcesses(context.Background(), 1000, func(context.Context) ([]processRef, error) {
+				return []processRef{{pid: 10, reader: p}}, nil
+			})
+			if err != nil || (len(out) == 1) != tc.allowed || (p.metadataCalls == 1) != tc.allowed {
+				t.Fatalf("out=%+v metadata=%d err=%v", out, p.metadataCalls, err)
+			}
+			if tc.allowed && (out[0].UID != tc.ids[0] || out[0].PID != 10 || out[0].Parent != 9 || out[0].StartedAt != 123) {
+				t.Fatal("observed identity changed")
+			}
+			readCalls := 0
+			args, err := nativeArgv(context.Background(), 1000, p.UidsWithContext, func(context.Context) ([]string, error) {
+				readCalls++
+				return []string{"codex"}, nil
+			})
+			if (err == nil) != tc.allowed || (readCalls == 1) != tc.allowed || (len(args) == 1) != tc.allowed {
+				t.Fatalf("argv reads=%d args=%v err=%v", readCalls, args, err)
+			}
+		})
+	}
+}
 
 func TestInventoryNativeSeams(t *testing.T) {
 	// Construction is lazy; never invoke these native functions in source tests.

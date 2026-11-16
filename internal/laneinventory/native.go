@@ -23,9 +23,63 @@ import (
 )
 
 const maxProbeBytes = 1 << 20
-const paneFormat = "#{session_name}\x1f#{window_id}\x1f#{pane_id}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{pane_pid}"
+const paneFormat = "#{session_name}\x1f#{window_id}\x1f#{pane_id}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{pane_pid}\x1f#{@citadel_managed}"
 
 type commandRunner func(context.Context, string, ...string) ([]byte, error)
+
+// These narrow seams exercise the real adapter policy with fake observations,
+// without enumerating processes or opening a real cmdline in source tests.
+type processReader interface {
+	UidsWithContext(context.Context) ([]int32, error)
+	PpidWithContext(context.Context) (int32, error)
+	CreateTimeWithContext(context.Context) (int64, error)
+}
+
+type processRef struct {
+	pid    int32
+	reader processReader
+}
+
+func ownProcessUID(ids []int32, uid int32) bool {
+	return uid >= 0 && len(ids) >= 2 && ids[0] == uid && ids[1] == uid
+}
+
+func nativeProcesses(ctx context.Context, uid int32, list func(context.Context) ([]processRef, error)) ([]Process, error) {
+	processes, err := list(ctx)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	out := []Process{}
+	for _, p := range processes {
+		if ctx.Err() != nil {
+			return nil, ErrUnavailable
+		}
+		ids, err := p.reader.UidsWithContext(ctx)
+		if err != nil || !ownProcessUID(ids, uid) {
+			continue
+		}
+		parent, err := p.reader.PpidWithContext(ctx)
+		if err != nil {
+			continue
+		}
+		started, _ := p.reader.CreateTimeWithContext(ctx)
+		// Preserve the observation, not the expected UID. The collector checks
+		// it independently before walking descendants or projecting a pane.
+		out = append(out, Process{PID: p.pid, Parent: parent, UID: ids[0], StartedAt: started})
+		if len(out) > MaxProcesses {
+			break
+		}
+	}
+	return out, nil
+}
+
+func nativeArgv(ctx context.Context, uid int32, identity func(context.Context) ([]int32, error), read func(context.Context) ([]string, error)) ([]string, error) {
+	ids, err := identity(ctx)
+	if err != nil || !ownProcessUID(ids, uid) || ctx.Err() != nil {
+		return nil, ErrUnavailable
+	}
+	return read(ctx)
+}
 
 type cappedBuffer struct {
 	bytes.Buffer
@@ -68,6 +122,10 @@ func probeEnv(lookup func(string) (string, bool)) []string {
 }
 
 func parsePanes(raw []byte) ([]RawPane, error) {
+	return parsePanesForBase(raw, "citadel")
+}
+
+func parsePanesForBase(raw []byte, terminalBase string) ([]RawPane, error) {
 	if len(raw) > maxProbeBytes {
 		return nil, ErrUnavailable
 	}
@@ -77,19 +135,26 @@ func parsePanes(raw []byte) ([]RawPane, error) {
 			continue
 		}
 		fields := strings.Split(line, "\x1f")
-		if len(fields) != 6 || !strings.HasPrefix(fields[1], "@") || !strings.HasPrefix(fields[2], "%") {
+		if len(fields) != 7 || !strings.HasPrefix(fields[1], "@") || !strings.HasPrefix(fields[2], "%") {
 			return nil, ErrUnavailable
 		}
 		pid, err := strconv.ParseInt(fields[5], 10, 32)
 		if err != nil || pid <= 0 {
 			return nil, ErrUnavailable
 		}
-		panes = append(panes, RawPane{Session: fields[0], Window: fields[1], Target: fields[2], Command: fields[3], Cwd: fields[4], PID: int32(pid)})
+		// Marker handles arbitrary configured/overridden terminal names. Name
+		// prefixes conservatively cover legacy unmarked default sessions too.
+		terminal := fields[6] != "" || terminalSessionName(fields[0], "citadel") || terminalSessionName(fields[0], terminalBase)
+		panes = append(panes, RawPane{Session: fields[0], Window: fields[1], Target: fields[2], Command: fields[3], Cwd: fields[4], PID: int32(pid), Terminal: terminal})
 		if len(panes) > MaxPanes {
 			break
 		}
 	}
 	return panes, nil
+}
+
+func terminalSessionName(name, base string) bool {
+	return base != "" && (name == base || strings.HasPrefix(name, base+"-"))
 }
 
 // NewNative does not perform any observation at construction. The caller
@@ -113,58 +178,40 @@ func NewNative(nodeDir string) Collector {
 			if err != nil {
 				return nil, err
 			}
-			return parsePanes(raw)
+			return parsePanesForBase(raw, os.Getenv("CITADEL_TERMINAL_SESSION"))
 		},
 		Processes: func(ctx context.Context) ([]Process, error) {
-			list, err := process.ProcessesWithContext(ctx)
-			if err != nil {
-				return nil, ErrUnavailable
-			}
-			out := []Process{}
-			for _, p := range list {
-				if ctx.Err() != nil {
-					return nil, ErrUnavailable
+			return nativeProcesses(ctx, uid, func(ctx context.Context) ([]processRef, error) {
+				list, err := process.ProcessesWithContext(ctx)
+				out := make([]processRef, 0, len(list))
+				for _, p := range list {
+					out = append(out, processRef{pid: p.Pid, reader: p})
 				}
-				ids, err := p.UidsWithContext(ctx)
-				if err != nil || len(ids) < 2 || ids[0] != uid || ids[1] != uid {
-					continue
-				}
-				parent, err := p.PpidWithContext(ctx)
-				if err != nil {
-					continue
-				}
-				started, _ := p.CreateTimeWithContext(ctx)
-				out = append(out, Process{PID: p.Pid, Parent: parent, UID: uid, StartedAt: started})
-				if len(out) > MaxProcesses {
-					break
-				}
-			}
-			return out, nil
+				return out, err
+			})
 		},
 		Argv: func(ctx context.Context, pid int32) ([]string, error) {
 			p, err := process.NewProcessWithContext(ctx, pid)
 			if err != nil {
 				return nil, ErrUnavailable
 			}
-			ids, err := p.UidsWithContext(ctx)
-			if err != nil || len(ids) < 2 || ids[0] != uid || ids[1] != uid {
-				return nil, ErrUnavailable
-			}
-			// Linux cmdline is bounded before allocation. Other Unix systems use
-			// their process API; the collector validates argc and byte bounds too.
-			if runtime.GOOS == "linux" {
-				file, err := os.Open("/proc/" + strconv.Itoa(int(pid)) + "/cmdline")
-				if err != nil {
-					return nil, ErrUnavailable
+			return nativeArgv(ctx, uid, p.UidsWithContext, func(ctx context.Context) ([]string, error) {
+				// Linux cmdline is bounded before allocation. Other Unix systems use
+				// their process API; the collector validates argc and byte bounds too.
+				if runtime.GOOS == "linux" {
+					file, err := os.Open("/proc/" + strconv.Itoa(int(pid)) + "/cmdline")
+					if err != nil {
+						return nil, ErrUnavailable
+					}
+					defer file.Close()
+					raw, err := io.ReadAll(io.LimitReader(file, MaxArgBytes+1))
+					if err != nil || len(raw) > MaxArgBytes {
+						return nil, ErrUnavailable
+					}
+					return strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00"), nil
 				}
-				defer file.Close()
-				raw, err := io.ReadAll(io.LimitReader(file, MaxArgBytes+1))
-				if err != nil || len(raw) > MaxArgBytes {
-					return nil, ErrUnavailable
-				}
-				return strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00"), nil
-			}
-			return p.CmdlineSliceWithContext(ctx)
+				return p.CmdlineSliceWithContext(ctx)
+			})
 		},
 		Declarations: func(ctx context.Context) (map[int32]string, error) { return declaredPIDs(ctx, nodeDir) },
 		Git:          func(ctx context.Context, cwd string) (*Worktree, error) { return readGit(ctx, runReadOnly, cwd) },

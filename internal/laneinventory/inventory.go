@@ -26,6 +26,8 @@ const (
 	MaxArgBytes    = 32 << 10
 	maxAllArgBytes = 8 << 20
 	maxSecretBytes = 64 << 10
+	maxRemotes     = 32
+	maxRemoteBytes = 128
 	Timeout        = 15 * time.Second
 )
 
@@ -34,6 +36,9 @@ var ErrUnavailable = errors.New("lane inventory observation unavailable")
 type RawPane struct {
 	Session, Window, Target, Command, Cwd string
 	PID                                   int32
+	// Terminal marks a managed/recognized web terminal. No authenticated
+	// caller identity currently reaches this collector, so omit it entirely.
+	Terminal bool
 }
 
 type Process struct {
@@ -94,6 +99,7 @@ type Deps struct {
 type Collector struct{ Deps Deps }
 
 var uuid = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+var gitHead = regexp.MustCompile(`^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
 
 // Detect recognizes the invoked program, not arbitrary prose mentioning one.
 // Node-based launchers are recognized only at argv[1]. No prompt text returns.
@@ -208,6 +214,23 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 	for _, ids := range children {
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	}
+	blocked := map[int32]bool{}
+	var blockedQueue []int32
+	for _, pane := range panes {
+		if pane.Terminal {
+			blockedQueue = append(blockedQueue, pane.PID)
+			r.Unavailable = append(r.Unavailable, "terminal_scope")
+		}
+	}
+	for len(blockedQueue) > 0 {
+		pid := blockedQueue[0]
+		blockedQueue = blockedQueue[1:]
+		if blocked[pid] {
+			continue
+		}
+		blocked[pid] = true
+		blockedQueue = append(blockedQueue, children[pid]...)
+	}
 	declarations := map[int32]string{}
 	if d.Declarations != nil {
 		declarations, err = d.Declarations(ctx)
@@ -233,6 +256,9 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 		if ctx.Err() != nil {
 			return Report{}, ErrUnavailable
 		}
+		if raw.Terminal || blocked[raw.PID] {
+			continue
+		}
 		p := Pane{Session: raw.Session, Window: raw.Window, Target: raw.Target, Command: filepath.Base(raw.Command), Cwd: raw.Cwd, Harness: "other"}
 		root, own := byPID[raw.PID]
 		if !own {
@@ -251,7 +277,7 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 			}
 			pid := queue[0]
 			queue = queue[1:]
-			if seen[pid] {
+			if seen[pid] || blocked[pid] {
 				continue
 			}
 			seen[pid] = true
@@ -372,7 +398,7 @@ func Encode(r Report) ([]byte, error) {
 	components := []string{}
 	for _, component := range r.Unavailable {
 		switch component {
-		case "processes", "declarations", "capacity", "pane_process", "argv", "git":
+		case "processes", "declarations", "capacity", "pane_process", "argv", "git", "terminal_scope":
 			components = append(components, component)
 		}
 	}
@@ -381,6 +407,10 @@ func Encode(r Report) ([]byte, error) {
 	// Defense in depth at both publication boundaries, including a future
 	// collector implementation. Do not mutate the caller's cached snapshot.
 	r.Panes = append([]Pane{}, r.Panes...)
+	if len(r.Panes) > MaxPanes {
+		r.Panes = r.Panes[:MaxPanes]
+		r.Truncated = true
+	}
 	for i := range r.Panes {
 		p := &r.Panes[i]
 		p.Session = clean(p.Session, nil)
@@ -399,14 +429,28 @@ func Encode(r Report) ([]byte, error) {
 			w := *p.Worktree
 			w.Path = clean(w.Path, nil)
 			w.Branch = clean(w.Branch, nil)
-			w.Head = clean(w.Head, nil)
-			w.Remotes = append([]string{}, w.Remotes...)
-			for j := range w.Remotes {
-				w.Remotes[j] = clean(w.Remotes[j], nil)
+			if !gitHead.MatchString(w.Head) {
+				w.Head = ""
+				r.Unavailable = append(r.Unavailable, "git")
+			}
+			remotes := w.Remotes
+			if len(remotes) > maxRemotes {
+				remotes = remotes[:maxRemotes]
+				r.Truncated = true
+			}
+			w.Remotes = []string{}
+			for _, name := range remotes {
+				if len(name) > maxRemoteBytes {
+					r.Truncated = true
+					continue
+				}
+				w.Remotes = append(w.Remotes, clean(name, nil))
 			}
 			p.Worktree = &w
 		}
 	}
+	sort.Strings(r.Unavailable)
+	r.Unavailable = unique(r.Unavailable)
 	for {
 		raw, err := json.Marshal(r)
 		if err != nil {
@@ -418,7 +462,19 @@ func Encode(r Report) ([]byte, error) {
 		if len(r.Panes) == 0 {
 			return nil, ErrUnavailable
 		}
-		r.Panes = r.Panes[:len(r.Panes)-1]
+		// JSON escaping can expand a single row up to sixfold. Shed the
+		// largest encoded row first, not every healthy row following it.
+		largest, largestBytes := 0, 0
+		for i, pane := range r.Panes {
+			encoded, err := json.Marshal(pane)
+			if err != nil {
+				return nil, ErrUnavailable
+			}
+			if len(encoded) > largestBytes {
+				largest, largestBytes = i, len(encoded)
+			}
+		}
+		r.Panes = append(r.Panes[:largest], r.Panes[largest+1:]...)
 		r.Truncated = true
 	}
 }

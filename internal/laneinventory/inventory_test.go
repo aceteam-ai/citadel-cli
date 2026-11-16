@@ -149,6 +149,64 @@ func TestInventoryOptionalCapacityUnknown(t *testing.T) {
 	}
 }
 
+func TestInventoryEncodeRemoteAndHeadBounds(t *testing.T) {
+	if maxRemotes != 32 || maxRemoteBytes != 128 {
+		t.Fatal("unreviewed remote limits")
+	}
+	remotes := make([]string, maxRemotes+1)
+	for i := range remotes {
+		remotes[i] = fmt.Sprintf("remote-%d", i)
+	}
+	for _, tc := range []struct {
+		name        string
+		remotes     []string
+		head        string
+		wantRemotes int
+		clipped     bool
+		validHead   bool
+	}{
+		{"count", remotes, strings.Repeat("a", 40), 32, true, true},
+		{"at-name-bound", []string{strings.Repeat("&", 128)}, strings.Repeat("B", 64), 1, false, true},
+		{"over-name-bound", []string{strings.Repeat("&", 129)}, strings.Repeat("c", 40), 0, true, true},
+		{"non-hex-head", []string{"origin"}, strings.Repeat("z", 40), 1, false, false},
+		{"short-head", []string{"origin"}, "abc123", 1, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := Report{Panes: []Pane{{Worktree: &Worktree{Remotes: tc.remotes, Head: tc.head}}}}
+			raw, err := Encode(input)
+			var out Report
+			if err != nil || json.Unmarshal(raw, &out) != nil || len(out.Panes) != 1 {
+				t.Fatalf("encoding: %v", err)
+			}
+			w := out.Panes[0].Worktree
+			if len(w.Remotes) != tc.wantRemotes || out.Truncated != tc.clipped || (w.Head == tc.head) != tc.validHead {
+				t.Fatalf("remotes=%d head=%q truncated=%v", len(w.Remotes), w.Head, out.Truncated)
+			}
+			if !tc.validHead && (w.Head != "" || strings.Join(out.Unavailable, ",") != "git") {
+				t.Fatal("invalid head not unknown")
+			}
+			if input.Panes[0].Worktree.Head != tc.head || len(input.Panes[0].Worktree.Remotes) != len(tc.remotes) {
+				t.Fatal("input mutated")
+			}
+		})
+	}
+}
+
+func TestInventoryEncodeShedsOffendingRow(t *testing.T) {
+	escaped := strings.Repeat("&", 4096)
+	bad := Pane{Session: escaped, Window: escaped, Target: escaped, Command: escaped, Cwd: escaped, DeclaredSession: escaped}
+	for _, panes := range [][]Pane{{bad, {Session: "healthy"}}, {{Session: "healthy"}, bad}} {
+		raw, err := Encode(Report{Panes: panes})
+		var out Report
+		if err != nil || json.Unmarshal(raw, &out) != nil || len(raw)+1 > MaxBytes {
+			t.Fatalf("encoding: %v", err)
+		}
+		if len(out.Panes) != 1 || out.Panes[0].Session != "healthy" || !out.Truncated {
+			t.Fatal("oversized row erased healthy pane")
+		}
+	}
+}
+
 func TestInventoryCredentialShapeAndUUIDSecret(t *testing.T) {
 	if got := clean("act_abc\ndefgh1234567890", nil); strings.Contains(got, "abcdefgh") {
 		t.Fatal("normalization assembled an unredacted bearer")
@@ -236,7 +294,7 @@ func TestInventoryBounds(t *testing.T) {
 }
 
 func TestInventoryParsePanes(t *testing.T) {
-	line := "lane\x1f@1\x1f%2\x1fbash\x1f/fixture/repo\x1f42\n"
+	line := "lane\x1f@1\x1f%2\x1fbash\x1f/fixture/repo\x1f42\x1f\n"
 	panes, err := parsePanes([]byte(line))
 	if err != nil || len(panes) != 1 || panes[0].PID != 42 || panes[0].Target != "%2" {
 		t.Fatalf("parse %+v %v", panes, err)
@@ -245,6 +303,77 @@ func TestInventoryParsePanes(t *testing.T) {
 		if _, err := parsePanes([]byte(raw)); err == nil {
 			t.Fatal("malformed pane accepted")
 		}
+	}
+}
+
+func TestInventoryTerminalScope(t *testing.T) {
+	c := fixture()
+	c.Deps.Panes = func(context.Context) ([]RawPane, error) {
+		return []RawPane{
+			{Session: "citadel-alice", PID: 10, Cwd: "/private/alice", Terminal: true},
+			{Session: "custom-bob", PID: 20, Cwd: "/private/bob", Terminal: true},
+			{Session: "node-owner-lane", PID: 30, Cwd: "/fixture/repo"},
+		}, nil
+	}
+	c.Deps.Processes = func(context.Context) ([]Process, error) {
+		return []Process{{PID: 10, UID: 1000}, {PID: 11, Parent: 10, UID: 1000}, {PID: 20, UID: 1000}, {PID: 21, Parent: 20, UID: 1000}, {PID: 30, UID: 1000}}, nil
+	}
+	c.Deps.Argv = func(_ context.Context, pid int32) ([]string, error) {
+		if pid != 30 {
+			t.Fatal("terminal argv observed without verified caller")
+		}
+		return []string{"codex"}, nil
+	}
+	c.Deps.Git = func(_ context.Context, cwd string) (*Worktree, error) {
+		if cwd != "/fixture/repo" {
+			t.Fatal("terminal worktree observed without verified caller")
+		}
+		return nil, nil
+	}
+	r, err := c.Collect(context.Background())
+	if err != nil || len(r.Panes) != 1 || r.Panes[0].Session != "node-owner-lane" {
+		t.Fatal("terminal scope not filtered")
+	}
+	raw, err := Encode(r)
+	if err != nil || strings.Contains(string(raw), "alice") || strings.Contains(string(raw), "bob") || !strings.Contains(string(raw), "terminal_scope") {
+		t.Fatal("terminal metadata published")
+	}
+	// A blocked terminal subtree must stay blocked even if a fixture lists one
+	// of its descendants separately as an otherwise ordinary pane.
+	panes := c.Deps.Panes
+	c.Deps.Panes = func(ctx context.Context) ([]RawPane, error) {
+		raw, err := panes(ctx)
+		return append(raw, RawPane{Session: "descendant", PID: 11, Cwd: "/private/alice"}), err
+	}
+	r, err = c.Collect(context.Background())
+	if err != nil || len(r.Panes) != 1 {
+		t.Fatal("terminal descendant not filtered")
+	}
+}
+
+func TestInventoryTerminalMarkerParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name, marker, base string
+		blocked            bool
+	}{
+		{"lane", "", "", false},
+		{"citadel-alice", "", "", true},
+		{"citadel", "", "", true},
+		{"custom-bob", "citadel-v1", "", true},
+		{"custom-bob", "unknown-marker", "", true},
+		{"custom-bob", "", "custom", true},
+		{"node-citadel-lane", "", "", false},
+	} {
+		t.Run(tc.name+tc.marker+tc.base, func(t *testing.T) {
+			line := tc.name + "\x1f@1\x1f%2\x1fbash\x1f/fixture\x1f10\x1f" + tc.marker + "\n"
+			panes, err := parsePanesForBase([]byte(line), tc.base)
+			if err != nil || len(panes) != 1 || panes[0].Terminal != tc.blocked {
+				t.Fatal("terminal classification mismatch")
+			}
+		})
+	}
+	if !strings.Contains(paneFormat, "#{@citadel_managed}") {
+		t.Fatal("native probe dropped the ownership marker")
 	}
 }
 
