@@ -63,8 +63,8 @@ func TestCobrowse_StatusWhenNotRunning(t *testing.T) {
 	}
 }
 
-// Navigate / handoff / resume / screenshot must refuse with ErrNotStarted when
-// no browser session exists, rather than silently doing nothing.
+// Legacy actions refuse even when no browser exists, with guarded-session
+// restart guidance rather than inviting a new unguarded start.
 func TestCobrowse_ActionsRequireSession(t *testing.T) {
 	_ = platform.GetCobrowseManager().Stop()
 
@@ -83,8 +83,8 @@ func TestCobrowse_ActionsRequireSession(t *testing.T) {
 			t.Errorf("action %q should error when no session is started", action)
 			continue
 		}
-		if action != CobrowseActionScreenshot && !errors.Is(err, platform.ErrNotStarted) {
-			t.Errorf("action %q: expected ErrNotStarted, got %v", action, err)
+		if !errors.Is(err, ErrLegacyCobrowseDisabled) {
+			t.Errorf("action %q: expected legacy refusal, got %v", action, err)
 		}
 	}
 }
@@ -96,8 +96,8 @@ func TestCobrowse_HandoffRefusesAIActions(t *testing.T) {
 	mgr := platform.GetCobrowseManager()
 	_ = mgr.Stop()
 
-	// Handoff/resume require a running session; with none, they return
-	// ErrNotStarted (verified above). Here we assert the error sentinels exist
+	// The direct manager API uses ErrNotStarted for an absent session.
+	// Here we assert the error sentinels exist
 	// and are distinct so the backend can branch on them.
 	if errors.Is(platform.ErrHandedOff, platform.ErrNotStarted) {
 		t.Fatal("ErrHandedOff and ErrNotStarted must be distinct sentinels")

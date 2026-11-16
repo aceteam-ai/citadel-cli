@@ -96,13 +96,11 @@ func CobrowseBusy() (bool, string) {
 }
 
 // PrepareSelfRestart runs just before the process replaces itself. It records
-// why sessions may end (see prepareSelfRestart) and, where nothing can be
-// re-adopted, stops the legacy single browser too so none is orphaned.
+// why guarded sessions end (see prepareSelfRestart), and always stops the legacy
+// unguarded singleton. Its dispatch path cannot start or drive it after upgrade.
 func PrepareSelfRestart(reason, detail string) {
 	GetCobrowseSessionManager().prepareSelfRestart(reason, detail)
-	if !adoptionSupported {
-		_ = GetCobrowseManager().Stop()
-	}
+	_ = GetCobrowseManager().Stop()
 }
 
 // prepareSelfRestart decides each session's fate across the restart.
@@ -123,14 +121,21 @@ func (m *CobrowseSessionManager) prepareSelfRestart(reason, detail string) {
 	m.mu.Unlock()
 	for _, s := range all {
 		s.mu.Lock()
-		stop := !adoptionSupported || s.persistent || s.encProfile != nil
+		stop := !adoptionSupported || s.persistent || s.encProfile != nil || s.requireEgress
 		s.mu.Unlock()
 		if !stop {
 			_ = m.MarkSessionEnding(s, reason, detail)
 			continue
 		}
+		endReason, endDetail := reason, detail
+		s.mu.Lock()
+		guarded := s.requireEgress
+		s.mu.Unlock()
+		if guarded {
+			endReason, endDetail = endedReasonEgressRestart, egressRestartDetail
+		}
 		_ = m.Stop(s.id) // seals a persistent profile, closes its lock, removes the dir
-		m.recordEnded(s.id, reason, detail)
+		m.recordEnded(s.id, endReason, endDetail)
 	}
 }
 

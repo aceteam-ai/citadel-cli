@@ -578,6 +578,13 @@ func (m *CobrowseSessionManager) recoverSessions() {
 		case RecordSuspended:
 			continue
 		case RecordExpired:
+			m.mu.Lock()
+			requiresGuard := m.requireEgress
+			m.mu.Unlock()
+			if requiresGuard && rec.EndedReason == endedReasonEgressRestart && !revokeEgressOrphanClaim(filepath.Join(m.baseDir, rec.ID)) {
+				// Preserve the evidence while a weaker PID-only sweep is unsafe.
+				continue
+			}
 			if t, err := time.Parse(time.RFC3339, rec.EndedAt); err != nil || now.Sub(t) >= expiredRetention {
 				deleteRecord(regDir, rec.ID)
 			} else {
@@ -588,17 +595,36 @@ func (m *CobrowseSessionManager) recoverSessions() {
 		default:
 			continue
 		}
-		if !adoptionSupported {
-			continue
-		}
 		// A live record owned by ANOTHER running process is theirs: leave it
 		// exactly as it is (a monitor or second invocation must not touch it).
 		if rec.OwnerPID != os.Getpid() && rec.OwnerStart != 0 {
 			if st, alive, err := procIdentity(rec.OwnerPID); err == nil && alive && st == rec.OwnerStart {
+				sweepProtected.Store(filepath.Join(m.baseDir, rec.ID), struct{}{})
 				continue
 			}
 		}
 		dir := filepath.Join(m.baseDir, rec.ID)
+		m.mu.Lock()
+		guarded := m.requireEgress
+		m.mu.Unlock()
+		if guarded {
+			stopUnguardedRecord(rec)
+			revoked := revokeEgressOrphanClaim(dir)
+			rec.State = RecordExpired
+			rec.EndedReason = endedReasonEgressRestart
+			rec.EndedDetail = egressRestartDetail
+			rec.PendingEnd = nil
+			rec.EndedAt = now.UTC().Format(time.RFC3339)
+			_ = saveRecord(regDir, rec)
+			if revoked {
+				expired = append(expired, rec)
+			}
+			continue
+		}
+		if !adoptionSupported {
+			continue
+		}
+
 		// Not the managed worker: a scoped session that is still alive in its own
 		// scope belongs to the worker that is about to restart. Leave it alone.
 		if !detachedWorker.Load() && scopedSurvivor(rec) {
@@ -662,3 +688,50 @@ var sweepProtected sync.Map
 // Recover re-adopts surviving sessions and sweeps the rest. Idempotent; the
 // worker calls it at startup, and every session read path calls it lazily.
 func (m *CobrowseSessionManager) Recover() { m.sweepOnce.Do(m.sweep) }
+
+// End only identity-verified stale processes. Recycled PIDs and live sibling
+// owners retain the existing protection; the session is never admitted for use.
+func stopUnguardedRecord(rec sessionRecord) {
+	if recordUID(rec) != os.Getuid() {
+		return
+	}
+	stopRecordScopes(rec)
+	for _, p := range []struct {
+		pid   int
+		start uint64
+		role  cobrowseProcRole
+	}{{rec.BrowserPID, rec.BrowserStart, roleCobrowseBrowser}, {rec.XvfbPID, rec.XvfbStart, roleCobrowseXvfb}} {
+		if p.pid <= 0 || p.pid == os.Getpid() || p.start == 0 {
+			continue
+		}
+		start, alive, err := procIdentity(p.pid)
+		if err != nil || !alive || start != p.start || !processMatchesRole(p.pid, p.role) {
+			continue
+		}
+		_ = pidKiller(p.pid)
+	}
+}
+
+// Expiring a registry record must also revoke its old PID-only sweep claim.
+// Otherwise the generic orphan sweep could signal a recycled browser PID after
+// the stricter start-identity check above correctly refused to signal it.
+func revokeEgressOrphanClaim(dir string) bool {
+	info, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		return true
+	}
+	if err != nil || !info.IsDir() {
+		sweepProtected.Store(dir, struct{}{})
+		return false
+	}
+	if err = validateCobrowseBaseDirPerms(dir, info); err != nil {
+		sweepProtected.Store(dir, struct{}{})
+		return false
+	}
+	err = os.Remove(filepath.Join(dir, sessionPidfileName))
+	if err != nil && !os.IsNotExist(err) {
+		sweepProtected.Store(dir, struct{}{})
+		return false
+	}
+	return true
+}
