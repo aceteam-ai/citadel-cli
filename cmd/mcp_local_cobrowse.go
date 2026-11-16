@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -72,6 +73,11 @@ type localCobrowseOptions struct {
 	// auditRetention overrides the audit retention (default 90 days, or
 	// CITADEL_LOCAL_AUDIT_RETENTION_DAYS).
 	auditRetention time.Duration
+	// resolve and dial replace the system resolver and dialer in both the URL
+	// policy and the egress guard. They are only set by the citadel_e2e test
+	// build (local_e2e_hook.go); the address policy itself is unchanged.
+	resolve localcobrowse.Resolver
+	dial    func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // localAuditRetention reads CITADEL_LOCAL_AUDIT_RETENTION_DAYS (1 to 3650).
@@ -205,6 +211,10 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 		onAttention = rt.attention
 		viewerNote = "The Citadel viewer opens in the user's default browser, where they watch, approve and take control. If it is closed, they can run `citadel local viewer`."
 	}
+	policy := opts.policy
+	if policy == nil && opts.resolve != nil {
+		policy = localcobrowse.NewURLPolicy(opts.resolve, viewerPorts)
+	}
 	var profiles localcobrowse.ProfileStore
 	if opts.ownerDir != nil {
 		profiles = localProfileStore{dir: opts.ownerDir}
@@ -212,7 +222,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	rt.svc = localcobrowse.New(localcobrowse.Config{
 		Browser:     browser,
 		Profiles:    profiles,
-		URLPolicy:   opts.policy,
+		URLPolicy:   policy,
 		ViewerPorts: viewerPorts,
 		OnAttention: onAttention,
 		OnEvent: func(ev localcobrowse.Event) {
@@ -250,7 +260,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 				// Every connection of the real browser goes through the
 				// egress guard. If it cannot start, co-browse refuses: the
 				// URL filter alone does not see redirects or subresources.
-				g, gerr := localcobrowse.StartEgressGuard(nil, nil)
+				g, gerr := localcobrowse.StartEgressGuard(opts.resolve, opts.dial)
 				if gerr != nil {
 					// Drop the log before the lock: once released, another
 					// process may own (and write) this chain.
