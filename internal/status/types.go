@@ -307,6 +307,10 @@ type WorkerLiveness struct {
 	PlatformFailingSince   *time.Time `json:"platform_failing_since,omitempty"`
 	PlatformLastOutcome    string     `json:"platform_last_outcome,omitempty"`
 	PlatformLastHTTPStatus int        `json:"platform_last_http_status,omitempty"`
+	// RateLimitedSince / LastRetryAfterSeconds mirror worker.WorkerSnapshot: an
+	// open platform 429 window, cleared on the next successful API request.
+	RateLimitedSince      *time.Time `json:"rate_limited_since,omitempty"`
+	LastRetryAfterSeconds int64      `json:"last_retry_after_seconds,omitempty"`
 	// InFlight is the number of jobs currently executing in a handler.
 	InFlight int64 `json:"in_flight"`
 	// Processed / Failed are cumulative since worker start (diagnostic context).

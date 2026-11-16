@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
@@ -391,6 +392,10 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 	succeeded := make(map[string]struct{}, len(queues))
 	var lastErr error
 	var lastQueue string
+	// rateLimited ends the cycle at the first 429: every remaining queue shares
+	// the same platform bucket, so polling them would only add load, and the
+	// error must reach the runner so it honors Retry-After (#1677).
+	rateLimited := false
 
 	// poll consumes one queue. Returns the job (nil when the queue is empty)
 	// and whether the caller should return it.
@@ -419,6 +424,9 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 			}
 			lastErr = err
 			lastQueue = queue
+			if _, ok := redisapi.AsRateLimitError(err); ok {
+				rateLimited = true
+			}
 			return nil, false
 		}
 		succeeded[queue] = struct{}{}
@@ -440,7 +448,7 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 		return job, true
 	}
 
-	for i := 0; i < len(rotating); i++ {
+	for i := 0; i < len(rotating) && !rateLimited; i++ {
 		// Per-node queue first, on every iteration.
 		for _, pq := range priority {
 			select {
@@ -451,6 +459,12 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 			if job, ok := poll(pq, priorityBlockMs); ok {
 				return job, nil
 			}
+			if rateLimited {
+				break
+			}
+		}
+		if rateLimited {
+			break
 		}
 
 		select {
@@ -464,6 +478,10 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 		if job, ok := poll(queue, rotatingBlockMs); ok {
 			return job, nil
 		}
+	}
+
+	if rateLimited {
+		return nil, fmt.Errorf("queue %s: %w", lastQueue, lastErr)
 	}
 
 	// Only propagate error (triggering backoff) if ALL queues failed.
@@ -634,6 +652,15 @@ func (s *APISource) LastConsumeStatus() int {
 		return 0
 	}
 	return s.client.LastConsumeStatus()
+}
+
+// RateLimitWindow reports an open platform 429 window on the shared API client
+// (citadel-cli#1677); ok is false once any request has since succeeded.
+func (s *APISource) RateLimitWindow() (since time.Time, retryAfter time.Duration, ok bool) {
+	if s.client == nil {
+		return time.Time{}, 0, false
+	}
+	return s.client.RateLimitWindow()
 }
 
 // QueueNames returns the list of queues being consumed.
