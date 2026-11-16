@@ -138,7 +138,9 @@ try {
 
     # Create install directory
     Write-Info "Installing to: $InstallDir"
+    $createdInstallDir = $false
     if (-not (Test-Path $InstallDir)) {
+        $createdInstallDir = $true
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     }
 
@@ -146,6 +148,34 @@ try {
     $targetPath = Join-Path $InstallDir "citadel.exe"
     Copy-Item -Path $citadelExe.FullName -Destination $targetPath -Force
     Write-Success "Installed citadel.exe"
+
+    # From an elevated shell, new files are owned by BUILTIN\Administrators.
+    # Self-update requires the binary owner to be the user running the worker,
+    # so hand ownership to the invoking user (same SID elevated or not).
+    # Only for a per-user install: handing a machine-wide location such as
+    # Program Files to one account would let it rewrite a shared binary's ACL.
+    $perUser = ([System.IO.Path]::GetFullPath($InstallDir)).TrimEnd('\').StartsWith(([System.IO.Path]::GetFullPath($env:LOCALAPPDATA)).TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    if (-not $perUser) {
+        Write-Warning "Install dir is outside your profile; leaving its owner unchanged. Self-update needs citadel.exe owned by the account that runs it."
+    } else {
+        try {
+            $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $toFix = @($targetPath)
+            if ($createdInstallDir) { $toFix += $InstallDir }
+            foreach ($p in $toFix) {
+                $acl = Get-Acl -Path $p
+                $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+                if ($owner.Value -ne $userSid.Value) {
+                    $acl.SetOwner($userSid)
+                    Set-Acl -Path $p -AclObject $acl
+                }
+            }
+        } catch {
+            Write-Warning "Could not set the owner of the installed files to your account: $_"
+            Write-Host "  Self-update will be refused until this is fixed. From an elevated PowerShell run:"
+            Write-Host "    icacls `"$targetPath`" /setowner `"$env:USERDOMAIN\$env:USERNAME`""
+        }
+    }
 
     # Verify installation
     $installedVersion = & $targetPath version 2>&1

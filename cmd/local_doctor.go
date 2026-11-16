@@ -21,6 +21,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
 )
 
@@ -35,7 +36,10 @@ type localDoctorDeps struct {
 	vault      func() (bool, error)
 	owner      func() error
 	audit      func() (localaudit.VerifyResult, error)
-	harnesses  []harnessConfigStatus
+	// binaryOwner reports who owns the running executable and who is running
+	// it. Nil means not checked (non-Windows).
+	binaryOwner func() (update.OwnerInfo, string, error)
+	harnesses   []harnessConfigStatus
 	// exe is how fix lines refer to citadel (the full path, quoted if needed).
 	exe string
 }
@@ -75,6 +79,12 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 	}
 	if exe, err := citadelExecutable(); err == nil {
 		d.exe = quoteExe(exe)
+		if runtime.GOOS == "windows" {
+			d.binaryOwner = func() (update.OwnerInfo, string, error) {
+				info, err := update.ExecutableOwnership(exe)
+				return info, exe, err
+			}
+		}
 	}
 	if !skipLaunch {
 		d.launchTest = func() (string, string, error) {
@@ -203,6 +213,18 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 		ok("Audit log", "empty (records appear once an agent uses co-browse)")
 	} else {
 		ok("Audit log", fmt.Sprintf("%d records, chain intact", res.Records))
+	}
+
+	if d.binaryOwner != nil {
+		info, path, err := d.binaryOwner()
+		switch {
+		case err != nil:
+			warn("Self-update", fmt.Sprintf("could not read the owner of %s: %v", path, err))
+		case info.Matches():
+			ok("Self-update", fmt.Sprintf("%s is owned by %s, so self-update can run", path, info.UserName))
+		default:
+			fail("Self-update", fmt.Sprintf("%s is owned by %s, not by you (%s), so self-update will be refused (this happens when the installer ran from an elevated PowerShell). Fix: from an elevated PowerShell run: icacls \"%s\" /setowner \"%s\"   (or re-run the installer)", path, info.OwnerName, info.UserName, path, info.UserName))
+		}
 	}
 
 	pointed := 0

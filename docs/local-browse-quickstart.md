@@ -257,6 +257,7 @@ The command opens a fresh one-time link.
 | "exited during headless launch" | Run `& $citadel local doctor`. If it repeats, restart the computer. |
 | The viewer says "No agent connected" | The agent app has not started Citadel. Check its config with `& $citadel local doctor`, then restart the app. |
 | "another Citadel process already owns co-browse" | Another agent app is using co-browse. Close it, or use that one. |
+| `FAIL Self-update`: the binary is owned by Administrators | The installer ran from an elevated PowerShell and left `citadel.exe` owned by Administrators, so `citadel update install` is refused. From an elevated PowerShell run `icacls "$env:LOCALAPPDATA\Citadel\citadel.exe" /setowner "$env:USERDOMAIN\$env:USERNAME"` (use the account that runs Citadel), or re-run the installer. |
 | `approval_denied` / `approval_expired` / `approval_revoked` | The agent was told your answer. Approve again in the viewer if you want it to continue. |
 | `commit_approval_required` / `commit_denied` | A send, post, submit, payment or delete needs your answer each time. The viewer shows the button; the agent is told if you decline. |
 | "navigation refused" | The agent tried a local, private or non-web address. This is deliberate. |
