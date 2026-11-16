@@ -14,13 +14,13 @@ import (
 	"testing"
 )
 
-// withStubbedPortSeams swaps portOwnerLookup / pidKiller for the duration of a
-// test and restores them via t.Cleanup, so tests never touch real processes.
 // foreignPID returns a PID that is never this test process's own, so
 // reclaimStalePort's self-kill guard cannot turn a stubbed owner into a no-op.
 // A fixed literal collided when a sharded test binary happened to run as it.
 func foreignPID() int { return os.Getpid() + 1 }
 
+// withStubbedPortSeams swaps portOwnerLookup / pidKiller for the duration of a
+// test and restores them via t.Cleanup, so tests never touch real processes.
 func withStubbedPortSeams(t *testing.T, lookup func(int) (int, bool), kill func(int) error) {
 	t.Helper()
 	origLookup, origKill := portOwnerLookup, pidKiller
