@@ -26,8 +26,8 @@ source labels refuse even when they carry the same queue text.
 
 This is not an authentication replacement. The paired platform slice
 [aceteam#14139](https://github.com/aceteam-ai/aceteam/issues/14139) must enforce
-the live key-bound session-read grant and own/shared-node organization policy
-before dispatch. This source is inert by default, not permission to opt in:
+the live key-bound session-read grant, organization policy and node-owner-only
+inventory authorization before dispatch. This source is inert by default, not permission to opt in:
 source review does not authorize enabling remote inventory before that paired
 boundary is reviewed. Do not infer a session grant from a pane name or process
 argument.
@@ -46,6 +46,11 @@ Names alone never establish caller ownership; legacy custom unmarked sessions
 cannot prove it. Showing a caller's own terminal requires a separately reviewed
 paired caller-identity contract, not an arbitrary payload user ID. The paired
 backend must also restrict non-terminal lane results to the node owner.
+In particular, a web-terminal user can create a detached, unmarked tmux
+session. This collector cannot distinguish that session from a node-owner
+lane. Therefore #14139's reviewed **node-owner-only result authorization** is
+a prerequisite before any node opts in or any producer dispatches inventory;
+same organization/shared-node access alone is not sufficient.
 
 ## Result
 
@@ -64,7 +69,14 @@ backend must also restrict non-terminal lane results to the node owner.
 - `truncated`: rows or process coverage reached a bound.
 
 Only same-real/effective-UID pane processes and their same-UID descendants are
-eligible for argv reads. Detection recognizes an invoked executable or a known
+eligible for argv reads. A pane root must be a direct child of the recorded
+tmux server and its kernel TTY must match the pane TTY. Traversal stops at that
+TTY boundary and always excludes this Citadel process and its descendants,
+including bare web shells without a separate tmux marker. All discovered
+terminal roots are blocked before the 128-pane display cap is applied. Native
+argv reads recheck UID and process birth both before and after reading, using
+fresh process observers rather than a cached birth value.
+Detection recognizes an invoked executable or a known
 Node launcher entrypoint, not prompt text mentioning a harness. Only UUID-shaped
 Codex resume/fork or Claude resume/session identifiers are emitted. Other argv
 is discarded. There is no process environment, prompt, conversation, rollout,
@@ -90,6 +102,13 @@ instead of dropping a secret from the redaction set. Text fields over 4 KiB are
 omitted. Subprocess stdout is capped at 1 MiB, with a two-second command timeout
 and a fifteen-second collection context. Existing tmux binary resolution also
 has its own bounded version probe.
+Tmux identity rows contain only validated numeric server/pane/window IDs, a
+kernel TTY and a literal marker boolean, separated by a printable delimiter.
+Names, commands and cwd values are fetched individually, never reparsed as
+identity rows. Native discovery refuses above 4,096 panes rather than silently
+losing a late terminal marker; all session names are classified before display
+truncation. Ambiguous escaped/control-character cwd values are omitted instead
+of being decoded into a different path.
 Publication retains at most 32 remote names per worktree, omits names longer
 than 128 bytes, and marks either limit as truncated. HEAD must be a full 40- or
 64-character hexadecimal object ID; invalid values become unknown. Escaped
@@ -122,5 +141,9 @@ process identity boundary; another platform reports that component unavailable.
 Tests use injected pane/process/argv/git/capacity/declaration fixtures, including
 planted credentials and dirty filenames, foreign users, shared and foreign-node
 queues, detached/no-upstream worktrees, malformed inputs, and bounded output.
-Native reader functions are not executed by these fixtures. Source proofs do
-not establish native acceptance or approve a live node restart or deployment.
+Native reader functions are not executed by these fake fixtures. An additional
+opt-in `CITADEL_INVENTORY_TMUX_IT=1` test creates a disposable private tmux
+socket, uses a newline-containing synthetic cwd, checks only fixture PIDs, and
+destroys its own server. It never connects to the operator's tmux server or
+enumerates host processes. These proofs do not establish live-node inventory
+acceptance or approve a restart or deployment.

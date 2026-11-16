@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -36,6 +37,8 @@ var ErrUnavailable = errors.New("lane inventory observation unavailable")
 type RawPane struct {
 	Session, Window, Target, Command, Cwd string
 	PID                                   int32
+	ServerPID                             int32
+	TTY                                   string
 	// Terminal marks a managed/recognized web terminal. No authenticated
 	// caller identity currently reaches this collector, so omit it entirely.
 	Terminal bool
@@ -44,6 +47,7 @@ type RawPane struct {
 type Process struct {
 	PID, Parent, UID int32
 	StartedAt        int64 // Unix milliseconds, matching the process observer.
+	TTY              string
 }
 
 type Worktree struct {
@@ -90,7 +94,7 @@ type Deps struct {
 	UID          int32
 	Panes        func(context.Context) ([]RawPane, error)
 	Processes    func(context.Context) ([]Process, error)
-	Argv         func(context.Context, int32) ([]string, error)
+	Argv         func(context.Context, Process) ([]string, error)
 	Declarations func(context.Context) (map[int32]string, error)
 	Git          func(context.Context, string) (*Worktree, error)
 	Capacity     func(context.Context) (Capacity, error)
@@ -191,10 +195,6 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 	if err != nil {
 		return r, ErrUnavailable
 	}
-	if len(panes) > MaxPanes {
-		panes = panes[:MaxPanes]
-		r.Truncated = true
-	}
 	procs, err := d.Processes(ctx)
 	if err != nil {
 		r.Unavailable = append(r.Unavailable, "processes")
@@ -215,7 +215,9 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	}
 	blocked := map[int32]bool{}
-	var blockedQueue []int32
+	// The serving process can itself live below an operator pane. Never walk
+	// into it: its bare PTY children need not have a separate tmux pane/marker.
+	blockedQueue := []int32{int32(os.Getpid())}
 	for _, pane := range panes {
 		if pane.Terminal {
 			blockedQueue = append(blockedQueue, pane.PID)
@@ -230,6 +232,11 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 		}
 		blocked[pid] = true
 		blockedQueue = append(blockedQueue, children[pid]...)
+	}
+	// All terminal roots must be blocked before the display-window cap.
+	if len(panes) > MaxPanes {
+		panes = panes[:MaxPanes]
+		r.Truncated = true
 	}
 	declarations := map[int32]string{}
 	if d.Declarations != nil {
@@ -261,7 +268,7 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 		}
 		p := Pane{Session: raw.Session, Window: raw.Window, Target: raw.Target, Command: filepath.Base(raw.Command), Cwd: raw.Cwd, Harness: "other"}
 		root, own := byPID[raw.PID]
-		if !own {
+		if !own || raw.ServerPID <= 0 || root.Parent != raw.ServerPID || raw.TTY == "" || root.TTY != raw.TTY {
 			r.Unavailable = append(r.Unavailable, "pane_process")
 			continue
 		}
@@ -277,7 +284,8 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 			}
 			pid := queue[0]
 			queue = queue[1:]
-			if seen[pid] || blocked[pid] {
+			observed, present := byPID[pid]
+			if seen[pid] || blocked[pid] || !present || observed.TTY != raw.TTY {
 				continue
 			}
 			seen[pid] = true
@@ -286,7 +294,7 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 			}
 			args, cached := argvCache[pid]
 			if !cached {
-				args, err = d.Argv(ctx, pid)
+				args, err = d.Argv(ctx, observed)
 				total := 0
 				for _, arg := range args {
 					total += len(arg)
@@ -317,7 +325,7 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 		// A declared holder can be an ancestor of the pane's shell.
 		for pid, depth := raw.PID, 0; pid > 0 && depth < MaxProcesses; depth++ {
 			parent, ok := byPID[pid]
-			if !ok {
+			if !ok || blocked[pid] || parent.TTY != raw.TTY {
 				break
 			}
 			if name := declarations[pid]; name != "" {

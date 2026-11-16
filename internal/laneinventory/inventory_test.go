@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"testing"
 )
@@ -16,13 +17,13 @@ func fixture() Collector {
 	return Collector{Deps: Deps{
 		UID: 1000,
 		Panes: func(context.Context) ([]RawPane, error) {
-			return []RawPane{{Session: "lane", Window: "@1", Target: "%2", Command: "bash", Cwd: "/fixture/repo", PID: 10}}, nil
+			return []RawPane{{Session: "lane", Window: "@1", Target: "%2", Command: "bash", Cwd: "/fixture/repo", PID: 10, ServerPID: 9, TTY: "/dev/pts/7"}}, nil
 		},
 		Processes: func(context.Context) ([]Process, error) {
-			return []Process{{PID: 10, UID: 1000, StartedAt: 123}, {PID: 11, Parent: 10, UID: 1000}, {PID: 12, Parent: 11, UID: 1000}, {PID: 13, Parent: 10, UID: 2000}}, nil
+			return []Process{{PID: 10, Parent: 9, UID: 1000, StartedAt: 123, TTY: "/dev/pts/7"}, {PID: 11, Parent: 10, UID: 1000, TTY: "/dev/pts/7"}, {PID: 12, Parent: 11, UID: 1000, TTY: "/dev/pts/7"}, {PID: 13, Parent: 10, UID: 2000, TTY: "/dev/pts/7"}}, nil
 		},
-		Argv: func(_ context.Context, pid int32) ([]string, error) {
-			if pid == 12 {
+		Argv: func(_ context.Context, p Process) ([]string, error) {
+			if p.PID == 12 {
 				return []string{"/usr/bin/codex", "resume", threadFixture, "--api-key", "planted-opaque-secret"}, nil
 			}
 			return []string{"bash"}, nil
@@ -43,12 +44,12 @@ func TestInventoryProjection(t *testing.T) {
 	c := fixture()
 	called := []int32{}
 	argv := c.Deps.Argv
-	c.Deps.Argv = func(ctx context.Context, pid int32) ([]string, error) {
-		called = append(called, pid)
-		if pid == 13 {
+	c.Deps.Argv = func(ctx context.Context, p Process) ([]string, error) {
+		called = append(called, p.PID)
+		if p.PID == 13 {
 			t.Fatal("foreign user argv read")
 		}
-		return argv(ctx, pid)
+		return argv(ctx, p)
 	}
 	r, err := c.Collect(context.Background())
 	if err != nil {
@@ -81,7 +82,16 @@ func TestInventoryProjection(t *testing.T) {
 func TestInventoryRedactsAllPanesAfterObservation(t *testing.T) {
 	c := fixture()
 	c.Deps.Panes = func(context.Context) ([]RawPane, error) {
-		return []RawPane{{Session: "planted-opaque-secret", Cwd: "/fixture/planted-opaque-secret", PID: 10}, {Session: "second", Cwd: "/fixture/repo", PID: 11}}, nil
+		return []RawPane{{Session: "planted-opaque-secret", Cwd: "/fixture/planted-opaque-secret", PID: 10, ServerPID: 9, TTY: "/dev/pts/7"}, {Session: "second", Cwd: "/fixture/repo", PID: 20, ServerPID: 9, TTY: "/dev/pts/7"}}, nil
+	}
+	c.Deps.Processes = func(context.Context) ([]Process, error) {
+		return []Process{{PID: 10, Parent: 9, UID: 1000, TTY: "/dev/pts/7"}, {PID: 20, Parent: 9, UID: 1000, TTY: "/dev/pts/7"}}, nil
+	}
+	c.Deps.Argv = func(_ context.Context, p Process) ([]string, error) {
+		if p.PID == 20 {
+			return []string{"codex", "--api-key", "planted-opaque-secret"}, nil
+		}
+		return []string{"bash"}, nil
 	}
 	c.Deps.Git = func(context.Context, string) (*Worktree, error) {
 		return &Worktree{Path: "/fixture", Remotes: []string{"act_abcdefgh1234567890"}, Branch: "planted-opaque-secret"}, nil
@@ -215,7 +225,7 @@ func TestInventoryCredentialShapeAndUUIDSecret(t *testing.T) {
 		t.Fatal("URL credential leaked")
 	}
 	c := fixture()
-	c.Deps.Argv = func(context.Context, int32) ([]string, error) {
+	c.Deps.Argv = func(context.Context, Process) ([]string, error) {
 		return []string{"codex", "resume", threadFixture, "--api-key", threadFixture}, nil
 	}
 	r, err := c.Collect(context.Background())
@@ -264,7 +274,7 @@ func TestInventoryBounds(t *testing.T) {
 	c.Deps.Panes = func(context.Context) ([]RawPane, error) {
 		out := []RawPane{}
 		for i := 0; i < MaxPanes+1; i++ {
-			out = append(out, RawPane{Session: strings.Repeat("a", 4096), PID: 10})
+			out = append(out, RawPane{Session: strings.Repeat("a", 4096), PID: 10, ServerPID: 9, TTY: "/dev/pts/7"})
 		}
 		return out, nil
 	}
@@ -284,7 +294,7 @@ func TestInventoryBounds(t *testing.T) {
 		t.Fatal("output not structurally truncated")
 	}
 	c = fixture()
-	c.Deps.Argv = func(context.Context, int32) ([]string, error) {
+	c.Deps.Argv = func(context.Context, Process) ([]string, error) {
 		return []string{"codex", "resume", threadFixture, strings.Repeat("x", MaxArgBytes)}, nil
 	}
 	r, err = c.Collect(context.Background())
@@ -294,12 +304,12 @@ func TestInventoryBounds(t *testing.T) {
 }
 
 func TestInventoryParsePanes(t *testing.T) {
-	line := "lane\x1f@1\x1f%2\x1fbash\x1f/fixture/repo\x1f42\x1f\n"
+	line := "9|42|@1|%2|/dev/pts/7|0\n"
 	panes, err := parsePanes([]byte(line))
 	if err != nil || len(panes) != 1 || panes[0].PID != 42 || panes[0].Target != "%2" {
 		t.Fatalf("parse %+v %v", panes, err)
 	}
-	for _, raw := range []string{"bad\n", strings.ReplaceAll(line, "42", "bad"), strings.Replace(line, "/fixture/repo", "/"+strings.Repeat("x", maxProbeBytes), 1)} {
+	for _, raw := range []string{"bad\n", strings.ReplaceAll(line, "42", "bad"), strings.Replace(line, "/dev/pts/7", "/dev/pts/"+strings.Repeat("1", maxProbeBytes), 1), line + line} {
 		if _, err := parsePanes([]byte(raw)); err == nil {
 			t.Fatal("malformed pane accepted")
 		}
@@ -312,14 +322,14 @@ func TestInventoryTerminalScope(t *testing.T) {
 		return []RawPane{
 			{Session: "citadel-alice", PID: 10, Cwd: "/private/alice", Terminal: true},
 			{Session: "custom-bob", PID: 20, Cwd: "/private/bob", Terminal: true},
-			{Session: "node-owner-lane", PID: 30, Cwd: "/fixture/repo"},
+			{Session: "node-owner-lane", PID: 30, Cwd: "/fixture/repo", ServerPID: 9, TTY: "/dev/pts/7"},
 		}, nil
 	}
 	c.Deps.Processes = func(context.Context) ([]Process, error) {
-		return []Process{{PID: 10, UID: 1000}, {PID: 11, Parent: 10, UID: 1000}, {PID: 20, UID: 1000}, {PID: 21, Parent: 20, UID: 1000}, {PID: 30, UID: 1000}}, nil
+		return []Process{{PID: 10, UID: 1000}, {PID: 11, Parent: 10, UID: 1000, TTY: "/dev/pts/7"}, {PID: 20, UID: 1000}, {PID: 21, Parent: 20, UID: 1000}, {PID: 30, Parent: 9, UID: 1000, TTY: "/dev/pts/7"}}, nil
 	}
-	c.Deps.Argv = func(_ context.Context, pid int32) ([]string, error) {
-		if pid != 30 {
+	c.Deps.Argv = func(_ context.Context, p Process) ([]string, error) {
+		if p.PID != 30 {
 			t.Fatal("terminal argv observed without verified caller")
 		}
 		return []string{"codex"}, nil
@@ -343,11 +353,101 @@ func TestInventoryTerminalScope(t *testing.T) {
 	panes := c.Deps.Panes
 	c.Deps.Panes = func(ctx context.Context) ([]RawPane, error) {
 		raw, err := panes(ctx)
-		return append(raw, RawPane{Session: "descendant", PID: 11, Cwd: "/private/alice"}), err
+		// A nested tmux root otherwise has valid server/TTY metadata. It must
+		// still be excluded through the blocked terminal ancestor.
+		return append(raw, RawPane{Session: "descendant", PID: 11, ServerPID: 10, TTY: "/dev/pts/7", Cwd: "/private/alice"}), err
 	}
 	r, err = c.Collect(context.Background())
 	if err != nil || len(r.Panes) != 1 {
 		t.Fatal("terminal descendant not filtered")
+	}
+}
+
+func TestInventoryServingProcessAndTTYBoundaries(t *testing.T) {
+	for _, boundary := range []string{"serving-process", "different-tty", "unknown-tty"} {
+		t.Run(boundary, func(t *testing.T) {
+			self := int32(os.Getpid())
+			root, foreign, child := self+100, self+200, self+300
+			middle, tty := self, "/dev/pts/7"
+			if boundary != "serving-process" {
+				middle = root
+				tty = "/dev/pts/8"
+			}
+			if boundary == "unknown-tty" {
+				tty = ""
+			}
+			c := fixture()
+			c.Deps.Panes = func(context.Context) ([]RawPane, error) {
+				return []RawPane{{Session: "ops", PID: root, ServerPID: 9, TTY: "/dev/pts/7"}}, nil
+			}
+			c.Deps.Processes = func(context.Context) ([]Process, error) {
+				out := []Process{{PID: root, Parent: 9, UID: 1000, TTY: "/dev/pts/7"}, {PID: foreign, Parent: middle, UID: 1000, TTY: tty}, {PID: child, Parent: foreign, UID: 1000, TTY: tty}}
+				if boundary == "serving-process" {
+					out = append(out, Process{PID: self, Parent: root, UID: 1000, TTY: "/dev/pts/7"})
+				}
+				return out, nil
+			}
+			c.Deps.Declarations = func(context.Context) (map[int32]string, error) {
+				return map[int32]string{foreign: "private-declaration"}, nil
+			}
+			c.Deps.Argv = func(_ context.Context, p Process) ([]string, error) {
+				if p.PID != root {
+					t.Fatal("walk crossed the serving-process or pane TTY boundary")
+				}
+				return []string{"bash"}, nil
+			}
+			r, err := c.Collect(context.Background())
+			if err != nil || len(r.Panes) != 1 || r.Panes[0].Harness != "other" || r.Panes[0].ThreadID != "" || r.Panes[0].DeclaredSession != "" {
+				t.Fatal("foreign terminal projected")
+			}
+		})
+	}
+}
+
+func TestInventoryTerminalAfterPaneCap(t *testing.T) {
+	c := fixture()
+	c.Deps.Panes = func(context.Context) ([]RawPane, error) {
+		out := []RawPane{}
+		for i := 0; i < MaxPanes; i++ {
+			out = append(out, RawPane{PID: 10, ServerPID: 9, TTY: "/dev/pts/7"})
+		}
+		return append(out, RawPane{PID: 20, Terminal: true}), nil
+	}
+	c.Deps.Processes = func(context.Context) ([]Process, error) {
+		return []Process{{PID: 10, Parent: 9, UID: 1000, TTY: "/dev/pts/7"}, {PID: 20, Parent: 10, UID: 1000, TTY: "/dev/pts/7"}, {PID: 21, Parent: 20, UID: 1000, TTY: "/dev/pts/7"}}, nil
+	}
+	c.Deps.Argv = func(_ context.Context, p Process) ([]string, error) {
+		if p.PID != 10 {
+			t.Fatal("terminal beyond display cap was walked")
+		}
+		return []string{"bash"}, nil
+	}
+	r, err := c.Collect(context.Background())
+	if err != nil || !r.Truncated || len(r.Panes) != MaxPanes || !strings.Contains(strings.Join(r.Unavailable, ","), "terminal_scope") {
+		t.Fatal("full terminal coverage lost before truncation")
+	}
+}
+
+func TestInventoryPaneParentAndTTY(t *testing.T) {
+	for _, tc := range []struct {
+		server, parent      int32
+		paneTTY, processTTY string
+	}{{0, 9, "/dev/pts/7", "/dev/pts/7"}, {9, 8, "/dev/pts/7", "/dev/pts/7"}, {9, 9, "", "/dev/pts/7"}, {9, 9, "/dev/pts/7", "/dev/pts/8"}} {
+		c := fixture()
+		c.Deps.Panes = func(context.Context) ([]RawPane, error) {
+			return []RawPane{{PID: 10, ServerPID: tc.server, TTY: tc.paneTTY}}, nil
+		}
+		c.Deps.Processes = func(context.Context) ([]Process, error) {
+			return []Process{{PID: 10, Parent: tc.parent, UID: 1000, TTY: tc.processTTY}}, nil
+		}
+		c.Deps.Argv = func(context.Context, Process) ([]string, error) {
+			t.Fatal("unverified pane argv read")
+			return nil, nil
+		}
+		r, err := c.Collect(context.Background())
+		if err != nil || len(r.Panes) != 0 || !strings.Contains(strings.Join(r.Unavailable, ","), "pane_process") {
+			t.Fatal("pane parent or TTY check missing")
+		}
 	}
 }
 
@@ -365,8 +465,22 @@ func TestInventoryTerminalMarkerParsing(t *testing.T) {
 		{"node-citadel-lane", "", "", false},
 	} {
 		t.Run(tc.name+tc.marker+tc.base, func(t *testing.T) {
-			line := tc.name + "\x1f@1\x1f%2\x1fbash\x1f/fixture\x1f10\x1f" + tc.marker + "\n"
-			panes, err := parsePanesForBase([]byte(line), tc.base)
+			panes, err := readPanes(context.Background(), func(_ context.Context, name string, args ...string) ([]byte, error) {
+				if name != "-N" {
+					t.Fatal("probe may start a server")
+				}
+				if args[0] == "list-panes" {
+					flag := "0"
+					if tc.marker != "" {
+						flag = "1"
+					}
+					return []byte("9|10|@1|%2|/dev/pts/7|" + flag + "\n"), nil
+				}
+				if args[len(args)-1] == "#{session_name}" {
+					return []byte(tc.name + "\n"), nil
+				}
+				return []byte("fixture\n"), nil
+			}, tc.base)
 			if err != nil || len(panes) != 1 || panes[0].Terminal != tc.blocked {
 				t.Fatal("terminal classification mismatch")
 			}

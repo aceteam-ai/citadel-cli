@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,7 +24,15 @@ import (
 )
 
 const maxProbeBytes = 1 << 20
-const paneFormat = "#{session_name}\x1f#{window_id}\x1f#{pane_id}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{pane_pid}\x1f#{@citadel_managed}"
+
+// Only server-produced numeric IDs, a kernel TTY path and a literal boolean
+// enter row framing. User-controlled strings are fetched separately per pane.
+const paneFormat = "#{pid}|#{pane_pid}|#{window_id}|#{pane_id}|#{pane_tty}|#{?#{@citadel_managed},1,0}"
+const maxObservedPanes = 4096
+
+var paneWindow = regexp.MustCompile(`^@[0-9]+$`)
+var paneTarget = regexp.MustCompile(`^%[0-9]+$`)
+var paneTTY = regexp.MustCompile(`^/dev/(pts/[0-9]+|tty[a-zA-Z0-9]+)$`)
 
 type commandRunner func(context.Context, string, ...string) ([]byte, error)
 
@@ -33,6 +42,7 @@ type processReader interface {
 	UidsWithContext(context.Context) ([]int32, error)
 	PpidWithContext(context.Context) (int32, error)
 	CreateTimeWithContext(context.Context) (int64, error)
+	TerminalWithContext(context.Context) (string, error)
 }
 
 type processRef struct {
@@ -63,9 +73,16 @@ func nativeProcesses(ctx context.Context, uid int32, list func(context.Context) 
 			continue
 		}
 		started, _ := p.reader.CreateTimeWithContext(ctx)
+		tty, err := p.reader.TerminalWithContext(ctx)
+		if err != nil {
+			tty = ""
+		}
+		if tty != "" && !strings.HasPrefix(tty, "/dev/") {
+			tty = "/dev" + tty
+		}
 		// Preserve the observation, not the expected UID. The collector checks
 		// it independently before walking descendants or projecting a pane.
-		out = append(out, Process{PID: p.pid, Parent: parent, UID: ids[0], StartedAt: started})
+		out = append(out, Process{PID: p.pid, Parent: parent, UID: ids[0], StartedAt: started, TTY: tty})
 		if len(out) > MaxProcesses {
 			break
 		}
@@ -73,12 +90,20 @@ func nativeProcesses(ctx context.Context, uid int32, list func(context.Context) 
 	return out, nil
 }
 
-func nativeArgv(ctx context.Context, uid int32, identity func(context.Context) ([]int32, error), read func(context.Context) ([]string, error)) ([]string, error) {
-	ids, err := identity(ctx)
-	if err != nil || !ownProcessUID(ids, uid) || ctx.Err() != nil {
+func nativeArgv(ctx context.Context, uid int32, expected Process, identity func(context.Context) ([]int32, int64, error), read func(context.Context) ([]string, error)) ([]string, error) {
+	ids, started, err := identity(ctx)
+	if err != nil || !ownProcessUID(ids, uid) || expected.UID != uid || expected.StartedAt <= 0 || started != expected.StartedAt || ctx.Err() != nil {
 		return nil, ErrUnavailable
 	}
-	return read(ctx)
+	args, err := read(ctx)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	ids, started, err = identity(ctx)
+	if err != nil || !ownProcessUID(ids, uid) || started != expected.StartedAt || ctx.Err() != nil {
+		return nil, ErrUnavailable
+	}
+	return args, nil
 }
 
 type cappedBuffer struct {
@@ -122,32 +147,82 @@ func probeEnv(lookup func(string) (string, bool)) []string {
 }
 
 func parsePanes(raw []byte) ([]RawPane, error) {
-	return parsePanesForBase(raw, "citadel")
-}
-
-func parsePanesForBase(raw []byte, terminalBase string) ([]RawPane, error) {
 	if len(raw) > maxProbeBytes {
 		return nil, ErrUnavailable
 	}
 	panes := []RawPane{}
+	seen := map[string]bool{}
+	pids := map[int32]bool{}
+	var server int32
 	for _, line := range strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n") {
 		if line == "" {
 			continue
 		}
-		fields := strings.Split(line, "\x1f")
-		if len(fields) != 7 || !strings.HasPrefix(fields[1], "@") || !strings.HasPrefix(fields[2], "%") {
+		fields := strings.Split(line, "|")
+		if len(fields) != 6 || !paneWindow.MatchString(fields[2]) || !paneTarget.MatchString(fields[3]) || !paneTTY.MatchString(fields[4]) || (fields[5] != "0" && fields[5] != "1") {
 			return nil, ErrUnavailable
 		}
-		pid, err := strconv.ParseInt(fields[5], 10, 32)
+		pid, err := strconv.ParseInt(fields[1], 10, 32)
 		if err != nil || pid <= 0 {
 			return nil, ErrUnavailable
 		}
-		// Marker handles arbitrary configured/overridden terminal names. Name
-		// prefixes conservatively cover legacy unmarked default sessions too.
-		terminal := fields[6] != "" || terminalSessionName(fields[0], "citadel") || terminalSessionName(fields[0], terminalBase)
-		panes = append(panes, RawPane{Session: fields[0], Window: fields[1], Target: fields[2], Command: fields[3], Cwd: fields[4], PID: int32(pid), Terminal: terminal})
-		if len(panes) > MaxPanes {
-			break
+		serverID, err := strconv.ParseInt(fields[0], 10, 32)
+		if err != nil || serverID <= 0 || seen[fields[3]] || pids[int32(pid)] || (server != 0 && server != int32(serverID)) {
+			return nil, ErrUnavailable
+		}
+		server = int32(serverID)
+		seen[fields[3]], pids[int32(pid)] = true, true
+		panes = append(panes, RawPane{Window: fields[2], Target: fields[3], PID: int32(pid), ServerPID: server, TTY: fields[4], Terminal: fields[5] == "1"})
+		if len(panes) > maxObservedPanes {
+			return nil, ErrUnavailable
+		}
+	}
+	return panes, nil
+}
+
+func readPanes(ctx context.Context, run commandRunner, terminalBase string) ([]RawPane, error) {
+	raw, err := run(ctx, "-N", "list-panes", "-a", "-F", paneFormat)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	panes, err := parsePanes(raw)
+	if err != nil {
+		return nil, err
+	}
+	for i := range panes {
+		if ctx.Err() != nil {
+			return nil, ErrUnavailable
+		}
+		p := &panes[i]
+		// Each response is ONE value, never parsed as rows. Newline, tab or
+		// backslash in a directory/name cannot inject a PID or remove a marker.
+		field := func(format string) (string, error) {
+			value, err := run(ctx, "-N", "display-message", "-p", "-t", p.Target, format)
+			if err != nil || len(value) > maxProbeBytes {
+				return "", ErrUnavailable
+			}
+			return strings.TrimSuffix(string(value), "\n"), nil
+		}
+		p.Session, err = field("#{session_name}")
+		if err != nil {
+			return nil, err
+		}
+		p.Terminal = p.Terminal || terminalSessionName(p.Session, "citadel") || terminalSessionName(p.Session, terminalBase)
+		if i < MaxPanes && !p.Terminal {
+			p.Command, err = field("#{pane_current_command}")
+			if err != nil {
+				return nil, err
+			}
+			p.Cwd, err = field("#{pane_current_path}")
+			if err != nil {
+				return nil, err
+			}
+			// tmux renders control bytes as octal escapes over its command pipe.
+			// Never reinterpret them as a different filesystem path. Ambiguous
+			// paths are unobserved, not decoded or sent to a Git subprocess.
+			if strings.ContainsAny(p.Cwd, "\\\r\n\t") {
+				p.Cwd = ""
+			}
 		}
 	}
 	return panes, nil
@@ -174,11 +249,9 @@ func NewNative(nodeDir string) Collector {
 			if err != nil {
 				return nil, ErrUnavailable
 			}
-			raw, err := runReadOnly(ctx, binary, "-N", "list-panes", "-a", "-F", paneFormat)
-			if err != nil {
-				return nil, err
-			}
-			return parsePanesForBase(raw, os.Getenv("CITADEL_TERMINAL_SESSION"))
+			return readPanes(ctx, func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return runReadOnly(ctx, binary, append([]string{name}, args...)...)
+			}, os.Getenv("CITADEL_TERMINAL_SESSION"))
 		},
 		Processes: func(ctx context.Context) ([]Process, error) {
 			return nativeProcesses(ctx, uid, func(ctx context.Context) ([]processRef, error) {
@@ -190,12 +263,27 @@ func NewNative(nodeDir string) Collector {
 				return out, err
 			})
 		},
-		Argv: func(ctx context.Context, pid int32) ([]string, error) {
+		Argv: func(ctx context.Context, expected Process) ([]string, error) {
+			pid := expected.PID
 			p, err := process.NewProcessWithContext(ctx, pid)
 			if err != nil {
 				return nil, ErrUnavailable
 			}
-			return nativeArgv(ctx, uid, p.UidsWithContext, func(ctx context.Context) ([]string, error) {
+			identity := func(ctx context.Context) ([]int32, int64, error) {
+				// gopsutil caches CreateTime on a Process. Use a fresh reader for
+				// each side of the argv read so PID reuse cannot inherit the cache.
+				current, err := process.NewProcessWithContext(ctx, pid)
+				if err != nil {
+					return nil, 0, err
+				}
+				ids, err := current.UidsWithContext(ctx)
+				if err != nil {
+					return nil, 0, err
+				}
+				started, err := current.CreateTimeWithContext(ctx)
+				return ids, started, err
+			}
+			return nativeArgv(ctx, uid, expected, identity, func(ctx context.Context) ([]string, error) {
 				// Linux cmdline is bounded before allocation. Other Unix systems use
 				// their process API; the collector validates argc and byte bounds too.
 				if runtime.GOOS == "linux" {
