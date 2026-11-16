@@ -87,6 +87,7 @@
       $("commit").hidden = true;
       $("commit-result").hidden = true;
       $("hint").textContent = "";
+      human = false; // an unlock into a human-driven session then counts as a transition
       closeStream();
       return;
     }
@@ -128,7 +129,12 @@
     $("screen-wrap").className = human ? "driving" : "";
     // Take control (or a handoff) leaves focus on the button, so the first key
     // would scroll the viewer instead of reaching the stream.
-    if (human && !wasHuman) $("screen-wrap").focus({ preventScroll: true });
+    // Only take focus from nothing in particular: a keyboard user on an
+    // approval or commit button keeps it.
+    const ae = document.activeElement;
+    if (human && !wasHuman && (!ae || ae === document.body || ae === $("drive"))) {
+      $("screen-wrap").focus({ preventScroll: true });
+    }
     $("hint").textContent = human ? "Click the picture and type; your keystrokes go only to this browser." : "";
     openStream(s.session_id);
     if (lastTargets && wsFor === s.session_id) renderPages(lastTargets); // buttons follow who is driving
