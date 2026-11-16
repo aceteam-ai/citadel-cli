@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -279,6 +280,9 @@ func (h *LLMInferenceHandler) baseURL(backend string) string {
 // backend switch mirrors the original internal/jobs handler verbatim; only the
 // output sink changed (StreamWriter + JobResult instead of Redis Publish*).
 func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	if err := validateRawSeed(job.RawPayload); err != nil {
+		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
+	}
 	payload, err := parseLLMInferencePayload(job.Payload)
 	if err != nil {
 		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
@@ -393,8 +397,59 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 	default:
 		return h.failure(fmt.Errorf("unsupported backend: %s", payload.Backend)), nil
 	}
+	attachSampling(payload, result)
 	h.applyTrustEngine(payload, job.ID, result)
 	return result, err
+}
+
+// openAITemperature is the temperature sent on the OpenAI-shaped paths: the
+// provided value, or 0 when absent (the long-standing wire behaviour).
+func openAITemperature(payload *jobs.LLMInferencePayload) float64 {
+	if payload.Temperature == nil {
+		return 0
+	}
+	return *payload.Temperature
+}
+
+// samplingSent reports the sampling settings actually put on the wire to the
+// engine for this payload (citadel-cli#1639). Only settings that were sent are
+// included. It mirrors the request builders: Ollama sends temperature only when
+// provided; the OpenAI-shaped paths always send temperature (0 when absent);
+// top_p is sent on Ollama chat and chat completions only.
+func samplingSent(payload *jobs.LLMInferencePayload) map[string]any {
+	s := map[string]any{}
+	chat := len(payload.Messages) > 0
+	if payload.Backend == "ollama" {
+		if payload.Temperature != nil {
+			s["temperature"] = *payload.Temperature
+		}
+		if chat && payload.TopP > 0 {
+			s["top_p"] = payload.TopP
+		}
+	} else {
+		s["temperature"] = openAITemperature(payload)
+		// SGLang always takes the completions path, which never sends top_p.
+		if payload.TopP > 0 && payload.Backend != "sglang" && (chat || payload.Backend == "unlimited-ocr") {
+			s["top_p"] = payload.TopP
+		}
+	}
+	if payload.Seed != nil {
+		s["seed"] = *payload.Seed
+	}
+	return s
+}
+
+// attachSampling records samplingSent in a successful content-bearing result.
+func attachSampling(payload *jobs.LLMInferencePayload, result *JobResult) {
+	if result == nil || result.Status != JobStatusSuccess || result.Output == nil {
+		return
+	}
+	if _, ok := result.Output["content"].(string); !ok {
+		return
+	}
+	if s := samplingSent(payload); len(s) > 0 {
+		result.Output["sampling"] = s
+	}
 }
 
 // parseLLMInferencePayload decodes the job payload into the shared payload
@@ -427,7 +482,59 @@ func writeReasoningChunk(stream StreamWriter, content string, index int) {
 	}
 }
 
+// maxSafeSeed is the largest integer a job payload can carry exactly: payloads
+// decode through float64, so a larger seed would be silently rounded.
+const maxSafeSeed = 1<<53 - 1
+
+// safeSeed reports whether a decoded seed is an integer the payload round trip
+// keeps exactly.
+func safeSeed(v any) bool {
+	switch n := v.(type) {
+	case float64:
+		return n == math.Trunc(n) && math.Abs(n) <= maxSafeSeed
+	case int:
+		return n >= -maxSafeSeed && n <= maxSafeSeed
+	case int64:
+		return n >= -maxSafeSeed && n <= maxSafeSeed
+	case json.Number:
+		i, err := n.Int64()
+		return err == nil && i >= -maxSafeSeed && i <= maxSafeSeed
+	}
+	return false
+}
+
+// validateRawSeed checks the seed's original JSON token. The decoded Payload
+// map went through float64, which silently rounds a fractional seed such as
+// 9007199254740990.9 to an integer that then looks valid. The token must be an
+// integer literal (no fraction or exponent) within +/-maxSafeSeed.
+func validateRawSeed(raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil // the decoded payload path owns malformed-payload errors
+	}
+	v, ok := m["seed"]
+	if !ok || v == nil {
+		return nil
+	}
+	n, isNum := v.(json.Number)
+	if !isNum || strings.ContainsAny(n.String(), ".eE") {
+		return fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
+	if i, err := n.Int64(); err != nil || i < -maxSafeSeed || i > maxSafeSeed {
+		return fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
+	return nil
+}
+
 func parseLLMInferencePayload(data map[string]any) (*jobs.LLMInferencePayload, error) {
+	if v, ok := data["seed"]; ok && v != nil && !safeSeed(v) {
+		return nil, fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
 	jsonBytes, err := json.Marshal(data)
 	if err != nil {
 		return nil, err
@@ -475,8 +582,11 @@ func (h *LLMInferenceHandler) executeCompletions(ctx context.Context, stream Str
 		"model":       payload.Model,
 		"prompt":      payload.Prompt,
 		"max_tokens":  payload.MaxTokens,
-		"temperature": payload.Temperature,
+		"temperature": openAITemperature(payload),
 		"stream":      payload.Stream,
+	}
+	if payload.Seed != nil {
+		reqPayload["seed"] = *payload.Seed
 	}
 	if payload.MaxTokens == 0 {
 		reqPayload["max_tokens"] = 512
@@ -603,8 +713,18 @@ func (h *LLMInferenceHandler) executeOllama(ctx context.Context, stream StreamWr
 		"prompt": payload.Prompt,
 		"stream": payload.Stream,
 	}
+	options := map[string]any{}
 	if payload.MaxTokens > 0 {
-		reqPayload["options"] = map[string]any{"num_predict": payload.MaxTokens}
+		options["num_predict"] = payload.MaxTokens
+	}
+	if payload.Temperature != nil {
+		options["temperature"] = *payload.Temperature
+	}
+	if payload.Seed != nil {
+		options["seed"] = *payload.Seed
+	}
+	if len(options) > 0 {
+		reqPayload["options"] = options
 	}
 
 	resp, err := h.postJSON(ctx, h.baseURL("ollama")+"/api/generate", reqPayload)
@@ -822,11 +942,14 @@ func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream Stre
 	if payload.MaxTokens > 0 {
 		options["num_predict"] = payload.MaxTokens
 	}
-	if payload.Temperature > 0 {
-		options["temperature"] = payload.Temperature
+	if payload.Temperature != nil {
+		options["temperature"] = *payload.Temperature
 	}
 	if payload.TopP > 0 {
 		options["top_p"] = payload.TopP
+	}
+	if payload.Seed != nil {
+		options["seed"] = *payload.Seed
 	}
 	if len(payload.Stop) > 0 {
 		options["stop"] = payload.Stop
@@ -1171,8 +1294,11 @@ func (h *LLMInferenceHandler) executeLlamaCppAt(ctx context.Context, stream Stre
 	reqPayload := map[string]any{
 		"prompt":      payload.Prompt,
 		"n_predict":   payload.MaxTokens,
-		"temperature": payload.Temperature,
+		"temperature": openAITemperature(payload),
 		"stream":      payload.Stream,
+	}
+	if payload.Seed != nil {
+		reqPayload["seed"] = *payload.Seed
 	}
 	if payload.MaxTokens == 0 {
 		reqPayload["n_predict"] = 512
@@ -1291,8 +1417,11 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 		"model":       payload.Model,
 		"messages":    messages,
 		"max_tokens":  payload.MaxTokens,
-		"temperature": payload.Temperature,
+		"temperature": openAITemperature(payload),
 		"stream":      payload.Stream,
+	}
+	if payload.Seed != nil {
+		reqPayload["seed"] = *payload.Seed
 	}
 	if payload.MaxTokens == 0 {
 		reqPayload["max_tokens"] = 512
