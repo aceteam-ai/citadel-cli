@@ -320,6 +320,10 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		if id == "" || staged == "" {
 			return nil, fmt.Errorf("set_file_input requires session_id and staged_name")
 		}
+		expected := job.Payload["expected_url"]
+		if expected == "" {
+			return nil, fmt.Errorf("set_file_input requires 'expected_url'")
+		}
 		var nodeID int
 		if raw := job.Payload["backend_node_id"]; raw != "" {
 			n, err := strconv.Atoi(raw)
@@ -331,7 +335,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		if (selector == "") == (nodeID == 0) {
 			return nil, fmt.Errorf("set_file_input requires exactly one of 'selector' or 'backend_node_id'")
 		}
-		st, err := mgr.SetFileInput(id, selector, nodeID, staged)
+		st, err := mgr.SetFileInput(id, selector, nodeID, staged, expected)
 		if err != nil {
 			return actionFailureResult(err, job.Payload["report_partial"] == "true")
 		}

@@ -59,6 +59,7 @@ func runFileUploadRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		fmt.Fprint(w, uploadPage)
 	}))
 	t.Cleanup(srv.Close)
+	pageURL := srv.URL + "/"
 
 	// Binary content that is not valid UTF-8, so a text round trip would show.
 	data := make([]byte, 64*1024)
@@ -85,16 +86,16 @@ func runFileUploadRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		t.Fatalf("StageFile: %v", err)
 	}
 	// Refusals reach no browser state.
-	if _, err := m.SetFileInput(st.ID, "#f", 0, "../doc.bin"); err == nil {
+	if _, err := m.SetFileInput(st.ID, "#f", 0, "../doc.bin", pageURL); err == nil {
 		t.Fatal("a traversal name must be refused")
 	}
-	if _, err := m.SetFileInput(st.ID, "#txt", 0, "doc.bin"); err == nil {
+	if _, err := m.SetFileInput(st.ID, "#txt", 0, "doc.bin", pageURL); err == nil {
 		t.Fatal("a non-file input must be refused")
 	}
-	if _, err := m.SetFileInput(st.ID, "#nothing", 0, "doc.bin"); err == nil {
+	if _, err := m.SetFileInput(st.ID, "#nothing", 0, "doc.bin", pageURL); err == nil {
 		t.Fatal("a selector matching nothing must be refused")
 	}
-	out, err := m.SetFileInput(st.ID, "#f", 0, "doc.bin")
+	out, err := m.SetFileInput(st.ID, "#f", 0, "doc.bin", pageURL)
 	if err != nil {
 		t.Fatalf("SetFileInput: %v", err)
 	}
@@ -141,7 +142,7 @@ func runFileUploadRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 	if _, err := m.StageFile(st.ID, "doc2.bin", data); err != nil {
 		t.Fatalf("StageFile 2: %v", err)
 	}
-	if _, err := m.SetFileInput(st.ID, "", pending.BackendNodeID, "doc2.bin"); err != nil {
+	if _, err := m.SetFileInput(st.ID, "", pending.BackendNodeID, "doc2.bin", pageURL); err != nil {
 		t.Fatalf("SetFileInput by backend node: %v", err)
 	}
 	if s, _ := m.SessionStatus(st.ID); s.FileChooser != nil {

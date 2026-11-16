@@ -123,12 +123,12 @@ func TestSetFileInputRefusesNodeThatIsNotThePendingChooser(t *testing.T) {
 	if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.SetFileInput(st.ID, "", 42, "a.pdf"); err == nil || !strings.Contains(err.Error(), "pending file chooser") {
+	if _, err := m.SetFileInput(st.ID, "", 42, "a.pdf", "http://example.test/"); err == nil || !strings.Contains(err.Error(), "pending file chooser") {
 		t.Fatalf("no chooser pending: %v", err)
 	}
 	s, _ := m.sessionForAction(st.ID)
 	s.handleChooserEvent("Page.fileChooserOpened", map[string]any{"backendNodeId": float64(7), "mode": "selectSingle", "frameId": "F1"})
-	if _, err := m.SetFileInput(st.ID, "", 42, "a.pdf"); err == nil || !strings.Contains(err.Error(), "pending file chooser") {
+	if _, err := m.SetFileInput(st.ID, "", 42, "a.pdf", "http://example.test/"); err == nil || !strings.Contains(err.Error(), "pending file chooser") {
 		t.Fatalf("a different node must be refused: %v", err)
 	}
 	st2, _ := m.SessionStatus(st.ID)

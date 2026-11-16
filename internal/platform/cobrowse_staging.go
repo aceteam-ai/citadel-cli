@@ -310,11 +310,39 @@ func (s *cobrowseSession) resolveStagedFile(name string) (string, StagedFile, er
 	return abs, StagedFile{Name: name, Size: n, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
 }
 
+// FileUploadPageFenceV1 is the capability value reported in status: set_file_input
+// requires expected_url and refuses unless the pinned page's live URL equals it.
+const FileUploadPageFenceV1 = "expected_url_v1"
+
+// setFilesIfPageIs is the last step of set_file_input: it reads the pinned
+// page's live URL over the action's own connection and hands the browser the
+// files only when it equals expectedURL exactly (query and fragment included).
+// A mismatch is ErrTargetChanged with nothing dispatched. The URL is never put
+// in an error or a log.
+func setFilesIfPageIs(c cdpCaller, expectedURL string, params map[string]any, eff *ActionEffects) error {
+	val, err := evaluateOn(c, "location.href", false)
+	if err != nil {
+		return err
+	}
+	if cur, _ := val.(string); cur == "" || cur != expectedURL {
+		return ErrTargetChanged
+	}
+	eff.Dispatched = true
+	if _, err := c.Call("DOM.setFileInputFiles", params); err != nil {
+		return err
+	}
+	eff.FilesSet = 1
+	return nil
+}
+
 // SetFileInput fills one file input with one staged file. Exactly one of
 // selector or backendNodeID names the input (backendNodeID is the one a
 // pending file chooser reports). The staged file is resolved and hashed
 // before any CDP call, so a refused path never reaches the browser.
-func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID int, stagedName string) (CobrowseSessionStatus, error) {
+func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID int, stagedName, expectedURL string) (CobrowseSessionStatus, error) {
+	if expectedURL == "" {
+		return CobrowseSessionStatus{}, errors.New("set_file_input requires 'expected_url'")
+	}
 	if (selector == "") == (backendNodeID == 0) {
 		return CobrowseSessionStatus{}, errors.New("set_file_input requires exactly one of 'selector' or 'backend_node_id'")
 	}
@@ -395,12 +423,10 @@ func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID
 		if err := r.fence(); err != nil {
 			return err
 		}
-		r.eff.Dispatched = true
-		if _, err := r.conn.Call("DOM.setFileInputFiles", params); err != nil {
+		if err := setFilesIfPageIs(r.conn, expectedURL, params, r.eff); err != nil {
 			// Never return the node's absolute path to the platform.
 			return errors.New(strings.ReplaceAll(err.Error(), path, file.Name))
 		}
-		r.eff.FilesSet = 1
 		s.clearChooserFor(nodeID)
 		log.Printf("[cobrowse] audit set_file_input session=%s name=%q size=%d sha256=%s", id, file.Name, file.Size, file.SHA256)
 		return nil

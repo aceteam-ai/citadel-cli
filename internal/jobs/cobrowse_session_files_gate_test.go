@@ -17,7 +17,7 @@ func filePayloads() []map[string]string {
 	b := base64.StdEncoding.EncodeToString([]byte("x"))
 	return []map[string]string{
 		{"action": CobrowseSessionActionStageFile, "session_id": "cb-none", "name": "a.pdf", CobrowseStageBytesKey: b},
-		{"action": CobrowseSessionActionSetFileInput, "session_id": "cb-none", "staged_name": "a.pdf", "selector": "#f"},
+		{"action": CobrowseSessionActionSetFileInput, "session_id": "cb-none", "staged_name": "a.pdf", "selector": "#f", "expected_url": "http://example.test/"},
 	}
 }
 

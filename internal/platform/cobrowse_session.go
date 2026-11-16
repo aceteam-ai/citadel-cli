@@ -115,6 +115,10 @@ type CobrowseSessionStatus struct {
 	// (citadel-cli#1721). Cleared when that input is filled or the page
 	// navigates.
 	FileChooser *FileChooserPending `json:"file_chooser,omitempty"`
+	// FileUploadPageFence names the page fence set_file_input enforces, so a
+	// caller can detect it before calling; absent when the session has no
+	// set_file_input (page-tracking sessions).
+	FileUploadPageFence string `json:"file_upload_page_fence,omitempty"`
 }
 
 // cobrowseProc is the running-process bundle for one session: the browser and its
@@ -769,6 +773,9 @@ func (s *cobrowseSession) statusBase() (CobrowseSessionStatus, int) {
 		Profile:    s.profile,
 		Driver:     driverFor(s.humanDrivingLocked()),
 		Generation: s.generation,
+	}
+	if !s.tracking {
+		st.FileUploadPageFence = FileUploadPageFenceV1
 	}
 	if s.chooser != nil {
 		c := *s.chooser

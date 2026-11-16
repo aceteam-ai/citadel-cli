@@ -141,7 +141,11 @@ read per job) and refuses with `jobs.ErrFilesDisabled`; no passcode; a handler w
 Teardown closes staging (`closeStaging`, under `stageMu`) before removing it and
 refuses to seal a persistent profile if removal fails; `cobrowseprofile` also
 never archives or restores `.citadel-stage`. A `backend_node_id` is accepted only
-for the chooser the page opened. The Redis ack removes a `stage_file` stream
+for the chooser the page opened. `set_file_input` requires `expected_url`:
+`setFilesIfPageIs` reads the pinned page's live `location.href` on the action's
+connection right before `DOM.setFileInputFiles` and refuses with
+`ErrTargetChanged` unless it equals it byte for byte (fragment included); status
+reports `file_upload_page_fence: expected_url_v1`. The Redis ack removes a `stage_file` stream
 entry (API mode has no equivalent yet). Human
 attach during handoff is #1723. Page-tracking (local) sessions get none of this.
 `TestCobrowseRealBrowserFileUpload` and `TestWindowsRealBrowserFileUpload` are

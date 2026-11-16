@@ -186,20 +186,20 @@ func TestSetFileInputArgumentAndSessionRefusals(t *testing.T) {
 	if _, err := m.StageFile(st.ID, "a.pdf", []byte("a")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.SetFileInput(st.ID, "", 0, "a.pdf"); err == nil {
+	if _, err := m.SetFileInput(st.ID, "", 0, "a.pdf", "http://example.test/"); err == nil {
 		t.Error("neither selector nor node must be refused")
 	}
-	if _, err := m.SetFileInput(st.ID, "#f", 5, "a.pdf"); err == nil {
+	if _, err := m.SetFileInput(st.ID, "#f", 5, "a.pdf", "http://example.test/"); err == nil {
 		t.Error("both selector and node must be refused")
 	}
 	// Handed off to the human: refused before any CDP call, like every action.
 	if _, err := m.Handoff(st.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.SetFileInput(st.ID, "#f", 0, "a.pdf"); !errors.Is(err, ErrHandedOff) {
+	if _, err := m.SetFileInput(st.ID, "#f", 0, "a.pdf", "http://example.test/"); !errors.Is(err, ErrHandedOff) {
 		t.Fatalf("handed off: %v", err)
 	}
-	if _, err := m.SetFileInput("no-such", "#f", 0, "a.pdf"); err == nil {
+	if _, err := m.SetFileInput("no-such", "#f", 0, "a.pdf", "http://example.test/"); err == nil {
 		t.Error("unknown session must be refused")
 	}
 }
