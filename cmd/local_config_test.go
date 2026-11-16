@@ -13,6 +13,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
 
 const winExe = `C:\Users\demo\AppData\Local\Citadel\citadel.exe`
@@ -263,6 +264,46 @@ func TestDetectHarnessConfigs(t *testing.T) {
 	}
 	if !got["copilot"].Found || got["copilot"].Points {
 		t.Fatalf("an entry whose exe no longer exists must not count: %+v", got["copilot"])
+	}
+}
+
+func TestLocalDoctorBinaryOwner(t *testing.T) {
+	base := localDoctorDeps{
+		goos:     "windows",
+		runner:   "headless",
+		discover: func() (platform.BrowserInfo, error) { return platform.BrowserInfo{Path: "x", Kind: "edge"}, nil },
+		bindTest: func() error { return nil },
+		vault:    func() (bool, error) { return false, nil },
+		owner:    func() error { return nil },
+		audit:    func() (localaudit.VerifyResult, error) { return localaudit.VerifyResult{}, nil },
+	}
+	exe := `C:\Users\a\AppData\Local\Citadel\citadel.exe`
+	bad := base
+	bad.binaryOwner = func() (update.OwnerInfo, string, error) {
+		return update.OwnerInfo{OwnerSID: "S-1-5-32-544", OwnerName: `BUILTIN\Administrators`, UserSID: "S-1-5-21-1", UserName: `PC\a`}, exe, nil
+	}
+	var out bytes.Buffer
+	if err := runLocalDoctor(bad, &out); err == nil {
+		t.Fatalf("Administrators-owned binary must fail:\n%s", out.String())
+	}
+	for _, want := range []string{"[FAIL] Self-update", `BUILTIN\Administrators`, "self-update will be refused", "/setowner"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing %q:\n%s", want, out.String())
+		}
+	}
+	good := base
+	good.binaryOwner = func() (update.OwnerInfo, string, error) {
+		return update.OwnerInfo{OwnerSID: "S-1-5-21-1", UserSID: "S-1-5-21-1", UserName: `PC\a`}, exe, nil
+	}
+	out.Reset()
+	if err := runLocalDoctor(good, &out); err != nil || !strings.Contains(out.String(), "[ok  ] Self-update") {
+		t.Fatalf("matching owner must pass: %v\n%s", err, out.String())
+	}
+	unread := base
+	unread.binaryOwner = func() (update.OwnerInfo, string, error) { return update.OwnerInfo{}, exe, errors.New("denied") }
+	out.Reset()
+	if err := runLocalDoctor(unread, &out); err != nil || !strings.Contains(out.String(), "[note] Self-update") {
+		t.Fatalf("unreadable owner is a note: %v\n%s", err, out.String())
 	}
 }
 
