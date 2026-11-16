@@ -181,10 +181,6 @@ type cdpConn struct {
 	// failed is set when a call failed at the transport; the socket is then
 	// unusable (a read deadline poisons it) and must be replaced.
 	failed bool
-	// onEvent, when set, sees every CDP event (a message with a method and no
-	// id) read while a call waits for its response. Events arriving between
-	// calls are only seen by the next call.
-	onEvent func(method string, params map[string]any)
 }
 
 // openCDPConn dials the page an action is pinned to. With page tracking the pin
@@ -254,12 +250,6 @@ func (c *cdpConn) Call(method string, params map[string]any) (map[string]any, er
 			return nil, fmt.Errorf("CDP read: %w", err)
 		}
 		idv, ok := msg["id"]
-		if !ok && c.onEvent != nil {
-			if m, _ := msg["method"].(string); m != "" {
-				pr, _ := msg["params"].(map[string]any)
-				c.onEvent(m, pr)
-			}
-		}
 		if !ok || fmt.Sprint(idv) != fmt.Sprint(id) {
 			continue
 		}

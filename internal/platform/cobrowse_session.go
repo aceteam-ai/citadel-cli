@@ -35,6 +35,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,6 +110,48 @@ type CobrowseSessionStatus struct {
 	// it may have acted, and Effects says what happened (citadel-cli#1663).
 	Done    *bool          `json:"done,omitempty"`
 	Effects *ActionEffects `json:"effects,omitempty"`
+	// FirstLoad is "pending" while the start URL has not yet replaced the
+	// initial about:blank (StartSession returned before the browser's own
+	// navigation committed). The first status read that sees another page
+	// clears it. Nothing ever re-issues the navigation.
+	FirstLoad string `json:"first_load,omitempty"`
+	// PendingOrigin is the scheme and host of the start URL while FirstLoad is
+	// pending. Never the path or query, which can hold a token.
+	PendingOrigin string `json:"pending_origin,omitempty"`
+}
+
+// FirstLoadPending is the FirstLoad value while the start page has not landed.
+const FirstLoadPending = "pending"
+
+// urlOrigin returns scheme://host[:port] of raw, or "" when unparseable.
+func urlOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func (s *cobrowseSession) setFirstLoadPending(startURL string) {
+	s.mu.Lock()
+	s.pendingOrigin = urlOrigin(startURL)
+	s.firstLoadPending = true
+	s.mu.Unlock()
+}
+
+// applyFirstLoad sets or clears the pending marker from the URL a status read
+// found. An unknown (empty) URL leaves it pending.
+func (s *cobrowseSession) applyFirstLoad(st *CobrowseSessionStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.firstLoadPending {
+		return
+	}
+	if st.URL != "" && st.URL != "about:blank" {
+		s.firstLoadPending, s.pendingOrigin = false, ""
+		return
+	}
+	st.FirstLoad, st.PendingOrigin = FirstLoadPending, s.pendingOrigin
 }
 
 // cobrowseProc is the running-process bundle for one session: the browser and its
@@ -210,6 +253,10 @@ type cobrowseSession struct {
 	// lastURL is the last page URL a probe read; status falls back to it when
 	// the DevTools endpoint is slow (citadel-cli#1663).
 	lastURL string
+	// firstLoadPending marks a start URL whose navigation had not committed
+	// when StartSession returned; pendingOrigin is its origin only.
+	firstLoadPending bool
+	pendingOrigin    string
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
@@ -419,23 +466,30 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		// Wait for the launch URL (including redirects) to settle, then report
 		// where the page ended up, as Navigate does. Best effort: a page that
 		// cannot be read leaves the plain status.
-		// Bounded: pinning and the settle share one deadline, so start-up
-		// never waits longer than the settle window (plus the report reserve).
+		// Bounded: pinning and the settle share this one context (settleLaunch
+		// derives from it), so start-up never waits longer than the settle
+		// window plus the report reserve, in total.
 		pctx, pcancel := context.WithTimeout(context.Background(), navigateSettleWindow+cobrowseReportReserve)
 		defer pcancel()
 		if p, perr := s.pinActionCtx(pctx); perr == nil {
 			// The browser opens on about:blank, which already reads
 			// "complete", before the launch URL commits. Wait for the page to
 			// leave it (bounded by the settle window) and report whatever is
-			// current. The launch URL may be single-use (magic link, OAuth
-			// code), so settleLaunch re-navigates at most once, and only
-			// when the browser's own navigation is proven never to have
-			// committed (citadel-cli#1694, #1714).
-			ps := settleLaunch(p, startURL)
+			// current. Never re-navigate: the launch URL may be single-use
+			// (magic link, OAuth code) and must be requested exactly once
+			// (citadel-cli#1694). If the page is still about:blank, the
+			// browser's own navigation has not committed (a cold Edge start
+			// can outlast the window, citadel-cli#1714): report the first
+			// load as pending instead of a blank page as loaded.
+			ps := settleLaunch(pctx, p)
 			if ps.URL != "" {
 				st.URL = ps.URL
 			}
 			st.Title = ps.Title
+			if ps.URL == "" || ps.URL == "about:blank" {
+				s.setFirstLoadPending(startURL)
+				st.FirstLoad, st.PendingOrigin = FirstLoadPending, urlOrigin(startURL)
+			}
 		}
 	}
 	return st, nil
@@ -663,6 +717,12 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 // statusCtx is status under the caller's context, so an action's one budget
 // covers its read-back.
 func (s *cobrowseSession) statusCtx(parent context.Context) CobrowseSessionStatus {
+	st := s.statusProbed(parent)
+	s.applyFirstLoad(&st)
+	return st
+}
+
+func (s *cobrowseSession) statusProbed(parent context.Context) CobrowseSessionStatus {
 	st, probePort := s.statusBase()
 	if probePort == 0 {
 		return st
