@@ -56,6 +56,9 @@ const DefaultCPUQueue = "jobs:v1:cpu-general"
 
 // APISourceConfig holds configuration for APISource.
 type APISourceConfig struct {
+	// PinnedQueue, when set, is the only stream this source may ever consume.
+	// Used by control-only workers, including runtime resubscription paths.
+	PinnedQueue string
 	// BaseURL is the AceTeam API base URL (e.g., "https://aceteam.ai")
 	BaseURL string
 
@@ -105,7 +108,9 @@ func NewAPISource(cfg APISourceConfig) *APISource {
 
 	// Resolve queue names: prefer QueueNames, fall back to QueueName
 	var queues []string
-	if len(cfg.QueueNames) > 0 {
+	if cfg.PinnedQueue != "" {
+		queues = []string{cfg.PinnedQueue}
+	} else if len(cfg.QueueNames) > 0 {
 		queues = cfg.QueueNames
 	} else if cfg.QueueName != "" {
 		queues = []string{cfg.QueueName}
@@ -678,6 +683,9 @@ func (s *APISource) QueueNames() []string {
 // runtime (e.g. from the /agent/resubscribe control endpoint, issue #236)
 // concurrently with the run loop, which reads via snapshotQueues.
 func (s *APISource) AddQueue(queue string) {
+	if s.config.PinnedQueue != "" && queue != s.config.PinnedQueue {
+		return
+	}
 	if queue == "" {
 		return
 	}

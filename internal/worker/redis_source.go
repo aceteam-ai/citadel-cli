@@ -52,6 +52,8 @@ type RedisSource struct {
 
 // RedisSourceConfig holds configuration for RedisSource.
 type RedisSourceConfig struct {
+	// PinnedQueue also constrains later AddQueue calls, not just boot routing.
+	PinnedQueue string
 	// URL is the Redis connection URL
 	URL string
 
@@ -92,7 +94,9 @@ func NewRedisSource(cfg RedisSourceConfig) *RedisSource {
 
 	// Resolve queue names: prefer QueueNames, fall back to QueueName
 	var queues []string
-	if len(cfg.QueueNames) > 0 {
+	if cfg.PinnedQueue != "" {
+		queues = []string{cfg.PinnedQueue}
+	} else if len(cfg.QueueNames) > 0 {
 		queues = cfg.QueueNames
 	} else if cfg.QueueName != "" {
 		queues = []string{cfg.QueueName}
@@ -497,6 +501,9 @@ func (s *RedisSource) QueueNames() []string {
 // A blank or already-present queue is ignored. Returns an error only if the
 // consumer group cannot be created.
 func (s *RedisSource) AddQueue(ctx context.Context, queue string) error {
+	if s.config.PinnedQueue != "" && queue != s.config.PinnedQueue {
+		return fmt.Errorf("control worker cannot subscribe to another stream")
+	}
 	if queue == "" {
 		return nil
 	}

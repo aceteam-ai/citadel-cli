@@ -18,6 +18,8 @@ import (
 // NodeStatus represents the complete status of a Citadel node.
 // This is the payload sent in heartbeats and returned from /status endpoint.
 type NodeStatus struct {
+	// Role is the running worker's startup policy. Legacy/full nodes omit it.
+	Role string `json:"role,omitempty"`
 	// Cached daemon report. Unknown is explicit null, never false/synced.
 	NTPSynced *bool `json:"ntp_synced"`
 	// Optional S5 placeholder; nil means no measurement, not zero recordings.

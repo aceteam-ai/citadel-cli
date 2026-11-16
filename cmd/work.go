@@ -69,6 +69,7 @@ var (
 	workRedisURL   string
 	workRedisPass  string
 	workQueue      string
+	workRole       string
 	workGroup      string
 	workPollMs     int
 	workMaxRetries int
@@ -857,6 +858,18 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
+	role, roleErr := resolveWorkerRole(deviceConfig, workRole)
+	if roleErr != nil {
+		fmt.Fprintln(os.Stderr, "Error:", roleErr)
+		os.Exit(2)
+	}
+	controlNodeID, roleErr := controlWorkerIdentity(ctx, role, deviceConfig)
+	if roleErr != nil {
+		fmt.Fprintln(os.Stderr, "Error:", roleErr)
+		os.Exit(1)
+	}
+	Log("worker role: %s (startup policy; role changes require a worker restart)", role)
+	fmt.Printf("   - Worker role: %s (changes require restart)\n", role)
 	if deviceConfig != nil {
 		Debug("config loaded: device_api_token present=%t, api_base_url present=%t, redis_url present=%t",
 			deviceConfig.DeviceAPIToken != "",
@@ -987,8 +1000,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		// aceteam#6634). Serving is detected live (native + docker engines) so it
 		// works for a natively run ollama, which the docker-only Engines snapshot
 		// misses. A node serving nothing adds nothing.
-		serving := nodeIsServingModels(ctx)
+		serving := false
+		if role != config.WorkerRoleControl {
+			serving = nodeIsServingModels(ctx)
+		}
 		queueResult := resolveWorkerQueues(ctx, workerQueueParams{
+			Role:       role,
+			NodeID:     controlNodeID,
 			APIBaseURL: apiBaseURL,
 			Token:      deviceConfig.DeviceAPIToken,
 			WorkQueue:  workQueue,
@@ -997,11 +1015,16 @@ func runWork(cmd *cobra.Command, args []string) {
 			Serving:    serving,
 			DebugFn:    Debug,
 		})
+		if queueResult.Err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", queueResult.Err)
+			os.Exit(1)
+		}
 		workQueue = queueResult.WorkQueue
 		deviceConfig.OrgID = queueResult.OrgID
 		apiQueueNames := queueResult.Queues
 
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
+			PinnedQueue:      controlPinnedQueue(role, apiQueueNames),
 			BaseURL:          apiBaseURL,
 			Token:            deviceConfig.DeviceAPIToken,
 			QueueNames:       apiQueueNames,
@@ -1123,13 +1146,19 @@ func runWork(cmd *cobra.Command, args []string) {
 			orgID = deviceConfig.OrgID
 		}
 
-		queueNames := resolveDirectRedisQueues(workQueue, nodeTags, manual, orgID)
+		queueResult := resolveDirectRedisQueuesForRole(workerQueueParams{Role: role, NodeID: controlNodeID, OrgID: orgID, WorkQueue: workQueue}, nodeTags, manual)
+		if queueResult.Err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", queueResult.Err)
+			os.Exit(1)
+		}
+		queueNames := queueResult.Queues
 		if orgID != "" {
 			Debug("shell queue: %s", shellQueueName(orgID))
 		}
 
 		// Create Redis job source
 		redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
+			PinnedQueue:   controlPinnedQueue(role, queueNames),
 			URL:           workRedisURL,
 			Password:      workRedisPass,
 			QueueName:     workQueue,
@@ -1245,7 +1274,7 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Get node name and Headscale node ID from network status
 	nodeName := workNodeName
-	var headscaleNodeID string // Headscale numeric node ID (e.g., "758")
+	headscaleNodeID := controlNodeID // Non-control workers retain late identity resolution.
 	Log("resolving node name...")
 	Debug("workNodeName flag: %q", workNodeName)
 	Debug("CITADEL_NODE_NAME env: %q", os.Getenv("CITADEL_NODE_NAME"))
@@ -1312,6 +1341,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Log the final registration outcome for post-mortem diagnosis (issue #246).
+	if role == config.WorkerRoleControl && headscaleNodeID != controlNodeID {
+		fmt.Fprintln(os.Stderr, "Error: control worker identity changed during startup; restart to select the current per-node stream")
+		os.Exit(1)
+	}
 	Log("registered: online=%v node_name=%s headscale_id=%s state_dir=%s",
 		connected, nodeName, headscaleNodeID, network.GetStateDir())
 
@@ -1435,7 +1468,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// claiming the job would only fail it. The capability detector adds this tag
 	// only when that stack is present, and the MEETING_JOIN handler ships behind
 	// the same gate, so subscription, capability, and handler activate together.
-	if nodeCaps != nil && hasCapabilityTag(nodeCaps.Tags, "meeting") {
+	if role != config.WorkerRoleControl && nodeCaps != nil && hasCapabilityTag(nodeCaps.Tags, "meeting") {
 		meetingOrgID := ""
 		if deviceConfig != nil {
 			meetingOrgID = deviceConfig.OrgID
@@ -1625,6 +1658,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	var collector *status.Collector
 	if workStatusPort > 0 {
 		collector = status.NewCollector(status.CollectorConfig{
+			Role:       role.Report(),
 			ClockState: clockMonitor,
 			NodeName:   nodeName,
 			// ConfigDir is normally "" on the heartbeat path (engines are probed,
@@ -1976,6 +2010,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Create collector if not already created
 		if collector == nil {
 			collector = status.NewCollector(status.CollectorConfig{
+				Role:                role.Report(),
 				ClockState:          clockMonitor,
 				NodeName:            nodeName,
 				ConfigDir:           hotswapConfigDir(workConfigDir),
@@ -3843,13 +3878,14 @@ func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
 
 // DeviceConfig holds device authentication configuration from the global config file.
 type DeviceConfig struct {
-	DeviceAPIToken string `yaml:"device_api_token"`
-	APIBaseURL     string `yaml:"api_base_url"`
-	OrgID          string `yaml:"org_id"`
-	OrgName        string `yaml:"org_name"`
-	RedisURL       string `yaml:"redis_url"`
-	UserEmail      string `yaml:"user_email"`
-	UserName       string `yaml:"user_name"`
+	Role           config.WorkerRole `yaml:"role,omitempty"`
+	DeviceAPIToken string            `yaml:"device_api_token"`
+	APIBaseURL     string            `yaml:"api_base_url"`
+	OrgID          string            `yaml:"org_id"`
+	OrgName        string            `yaml:"org_name"`
+	RedisURL       string            `yaml:"redis_url"`
+	UserEmail      string            `yaml:"user_email"`
+	UserName       string            `yaml:"user_name"`
 	// AceteamAPIKey is an optional user act_ API key for surfaces the
 	// device token cannot reach (Team Chat, MCP). Set manually by the user;
 	// device auth never writes it. See aceteam-ai/citadel-cli#495.
@@ -4180,6 +4216,7 @@ func ensureManagedTmux() {
 }
 
 func init() {
+	workCmd.Flags().StringVar(&workRole, "role", "", "Worker scheduling role: full (default) or control; overrides config.yaml until restart")
 	rootCmd.AddCommand(workCmd)
 
 	// Queue flags
