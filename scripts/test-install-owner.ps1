@@ -59,11 +59,14 @@ try {
     Check "machine-wide: exe not owned by user" ((Get-OwnerSid $exe) -ne $userSid)
     $acl = Get-Acl -Path $mw
     Check "machine-wide: DACL inheritance removed" $acl.AreAccessRulesProtected
+    $fsr = [System.Security.AccessControl.FileSystemRights]
+    $writeBits = $fsr::WriteData -bor $fsr::AppendData -bor $fsr::WriteAttributes -bor $fsr::WriteExtendedAttributes -bor $fsr::Delete -bor $fsr::DeleteSubdirectoriesAndFiles -bor $fsr::ChangePermissions -bor $fsr::TakeOwnership
     $bad = @($acl.Access | Where-Object {
         $sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
         ($sid -eq $usersSid -or $sid -eq $userSid) -and $_.AccessControlType -eq "Allow" -and
-        (($_.FileSystemRights -band ([System.Security.AccessControl.FileSystemRights]::Write -bor [System.Security.AccessControl.FileSystemRights]::Modify -bor [System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions)) -ne 0)
+        (($_.FileSystemRights -band $writeBits) -ne 0)
     })
+    $bad | ForEach-Object { Write-Host "  offending: $($_.IdentityReference) $($_.FileSystemRights)" }
     Check "machine-wide: no write grant to Users or the runner" ($bad.Count -eq 0)
 }
 finally {
