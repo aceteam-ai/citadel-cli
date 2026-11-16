@@ -128,8 +128,22 @@ func TestHolderRecordContentionRetainsStateMarkerAndLogsForRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, write := range writers {
-		if err := write(); err != nil {
-			t.Fatal("released record lock did not accept exact retry", err)
+		// The holder's 50ms record budget is wall-clock, so on a loaded host it
+		// can lapse before an uncontended write even takes the lock. A busy
+		// refusal has no effect (asserted above and by the exact-bytes checks
+		// below), so retrying until the lock is free and the write lands is the
+		// contract being pinned. Only ErrBusy is retried, within a bounded wait
+		// (citadel-cli#1709).
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			err := write()
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, ErrBusy) || time.Now().After(deadline) {
+				t.Fatal("released record lock did not accept exact retry", err)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 	if raw, err := session.ReadLogTail(ConsoleLog, 1024); err != nil || string(raw) != "exact console bytes" {
