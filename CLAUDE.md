@@ -135,7 +135,10 @@ ordinary `runAction` action. `cobrowseSession.watchChooserOnce` keeps one extra
 CDP connection that intercepts file choosers and `handleChooserEvent` owns the
 pending-chooser state reported in status; it never fills anything. The stage
 bytes ride in the `jobprivacy.BytesKey` payload field, which is dropped from
-every retained copy. Page-tracking (local) sessions get none of this.
+every retained copy. `CobrowseSessionHandler.filesAllowed` gates `stage_file` and
+`set_file_input` on the live Files permission (same source as FILE_WRITE_BYTES,
+read per job) and refuses with `jobs.ErrFilesDisabled`; no passcode. Human
+attach during handoff is #1723. Page-tracking (local) sessions get none of this.
 `TestCobrowseRealBrowserFileUpload` and `TestWindowsRealBrowserFileUpload` are
 the real-browser acceptance.
 

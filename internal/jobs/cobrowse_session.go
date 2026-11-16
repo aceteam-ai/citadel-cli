@@ -75,7 +75,21 @@ const CobrowseStageBytesKey = jobprivacy.BytesKey
 
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
 // CobrowseSessionManager singleton.
-type CobrowseSessionHandler struct{}
+type CobrowseSessionHandler struct {
+	// Disabled and Enabled gate stage_file and set_file_input on the node's
+	// Files permission, exactly as FILE_WRITE_BYTES does: Enabled, when set, is
+	// read live per job and wins; otherwise Disabled applies. Other session
+	// actions are not affected.
+	Disabled bool
+	Enabled  func() bool
+}
+
+func (h *CobrowseSessionHandler) filesAllowed() bool {
+	if h.Enabled != nil {
+		return h.Enabled()
+	}
+	return !h.Disabled
+}
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
 func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
@@ -277,6 +291,9 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		return out, nil
 
 	case CobrowseSessionActionStageFile:
+		if !h.filesAllowed() {
+			return nil, ErrFilesDisabled
+		}
 		id, name := job.Payload["session_id"], job.Payload["name"]
 		if id == "" || name == "" {
 			return nil, fmt.Errorf("stage_file requires session_id and name")
@@ -300,6 +317,9 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		})
 
 	case CobrowseSessionActionSetFileInput:
+		if !h.filesAllowed() {
+			return nil, ErrFilesDisabled
+		}
 		id, selector, staged := job.Payload["session_id"], job.Payload["selector"], job.Payload["staged_name"]
 		if id == "" || staged == "" {
 			return nil, fmt.Errorf("set_file_input requires session_id and staged_name")
