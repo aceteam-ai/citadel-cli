@@ -765,6 +765,13 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`laneinventory.Collector` owns the read-only #1699 metadata projection and its
+bounded redaction. `worker.LaneInventoryHandler` requires the exact configured
+own-node stream; paired platform key-bound session-read admission is #14139,
+not something pane/process metadata can prove. The CLI and worker share
+`laneinventory.Encode`; native acceptance and limits are in
+`docs/lane-inventory.md`. Do not run native inventory to test fixture source.
+
 `meetingcapacity.Capacity` owns the inactive #1505 meeting-intake custody
 model: one shared reservation, exact incarnation/job binding, uncertain-read
 quarantine and post-executor-exit resource confirmation. It has no wire or

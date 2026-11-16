@@ -9,6 +9,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/laneinventory"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -146,6 +147,13 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 	if opts.WorkflowExec != nil {
 		handlers = append(handlers, workflow.NewHandler(opts.WorkflowExec))
 	}
+	// Read-only inventory never inherits the shared shell pool or accepts
+	// arbitrary paths/commands from a payload. Backend key-bound session-read
+	// authorization belongs to the paired #14139 dispatch path.
+	inventory := laneinventory.NewNative(opts.PermissionsDir)
+	handlers = append(handlers, worker.NewLaneInventoryHandler(worker.LaneInventoryConfig{
+		OrgID: opts.OrgID, NodeID: opts.NodeID, Collect: inventory.Collect,
+	}))
 	// llm_inference (issue #590): the aceteam python-backend dispatches
 	// job_type="llm_inference" for ALL fabric inference (OpenAI gateway, /fabric
 	// model deploys, mesh chat). Registered unconditionally — like the workflow
