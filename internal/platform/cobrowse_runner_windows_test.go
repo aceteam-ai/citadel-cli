@@ -395,22 +395,28 @@ func TestWindowsRealBrowserActionLatency(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = m.StopAll() })
 	const budget = 5 * time.Second
-	within := func(name string, f func() error) {
+	withinBudget := func(name string, limit time.Duration, f func() error) {
 		t.Helper()
 		start := time.Now()
 		if err := f(); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if el := time.Since(start); el > budget {
-			t.Errorf("%s took %s, budget %s", name, el, budget)
+		if el := time.Since(start); el > limit {
+			t.Errorf("%s took %s, budget %s", name, el, limit)
 		}
 	}
+	within := func(name string, f func() error) { t.Helper(); withinBudget(name, budget, f) }
 	within("status", func() error {
 		if got, ok := m.SessionStatus(st.ID); !ok || got.URL == "" {
 			return fmt.Errorf("no url in status: %+v", got)
 		}
 		return nil
 	})
+	// The first capture after a cold start can take most of the action budget
+	// on a slow hosted runner (citadel-cli#1694); it must still finish inside
+	// the action deadline the platform relies on. A warm capture then has the
+	// tighter budget.
+	withinBudget("cold screenshot", CobrowseActionDeadline, func() error { _, _, err := m.ScreenshotStatus(st.ID); return err })
 	within("screenshot", func() error { _, _, err := m.ScreenshotStatus(st.ID); return err })
 	within("click", func() error {
 		got, err := m.Click(st.ID, "#t", nil, nil)
