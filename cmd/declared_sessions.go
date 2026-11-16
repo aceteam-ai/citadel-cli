@@ -86,6 +86,7 @@ func newDeclaredSessionsCommand(open declaredManagerFactory) *cobra.Command {
 		SilenceUsage:     true,
 	}
 	parent.PersistentFlags().StringVar(&nodeDir, "node-config-dir", "", "Existing node configuration directory (defaults to this node's configuration)")
+	parent.AddCommand(newLaneInventoryCommand(&nodeDir, collectNativeLaneInventory))
 	for _, action := range []string{"list", "status", "start", "stop", "restart"} {
 		action := action
 		use := action + " <name>"
