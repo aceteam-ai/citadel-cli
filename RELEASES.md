@@ -3933,3 +3933,20 @@ Auto-generated log of every release.
   - test: deflake #1697, #1706, #1709 (test-only) (#1720)
 
 
+---
+
+## v2.235.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 19 |
+| Lines added | +2946 |
+
+**Changes:**
+
+  - docs: design for local co-browse file upload and edit parity (#1733)
+  - feat(cobrowse): human file attach for a pending file chooser (#1723) (#1728)
+  - fix(hpc): show bounded approval refusal details (#1629)
+
+
