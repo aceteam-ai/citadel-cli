@@ -12,6 +12,15 @@
   let frameURL = null;
   let human = false;
 
+  // waitingText builds the banner for a handoff. The agent's reason may already
+  // tell the user to press Hand back, so the instruction is added only when
+  // missing, and trailing periods never double.
+  function waitingText(reason) {
+    const r = String(reason || "").replace(/[.\s]+$/, "");
+    const base = "Waiting for you: " + r + ".";
+    return /hand back/i.test(r) ? base : base + " Then press Hand back to agent.";
+  }
+
   // post sends one viewer action. It reports a failure in msgEl (default: the
   // hint line) and resolves to true on success.
   async function post(id, action, body, msgEl) {
@@ -105,7 +114,7 @@
     const w = $("waiting");
     if (human && s.handoff_reason && s.handoff_reason !== "taken by the user") {
       w.hidden = false;
-      w.textContent = "Waiting for you: " + s.handoff_reason + ". Then press Hand back to agent.";
+      w.textContent = waitingText(s.handoff_reason);
     } else if (human) {
       w.hidden = false;
       w.textContent = "You are driving. The agent cannot see or act until you hand back.";
