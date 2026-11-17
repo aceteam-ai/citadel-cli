@@ -2,6 +2,7 @@ package platform
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -159,6 +160,76 @@ func runFileUploadRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 	mu.Lock()
 	if got[1].filename != "doc2.bin" || !bytes.Equal(got[1].body, data) {
 		t.Fatalf("second upload: %q, %d bytes", got[1].filename, len(got[1].body))
+	}
+	mu.Unlock()
+
+	// 2b. The human path (citadel-cli#1723): a page-opened chooser is answered
+	// by the viewer's attach with a staged file, while the agent is refused.
+	m.SetFilesAllowed(func() bool { return true })
+	if _, err := m.Navigate(st.ID, srv.URL+"/"); err != nil {
+		t.Fatalf("navigate 3: %v", err)
+	}
+	waitCond(t, 30*time.Second, "the file input a third time", func() bool {
+		_, err := m.Extract(st.ID, "#f", nil)
+		return err == nil
+	})
+	if _, err := m.Click(st.ID, "#f", nil, nil); err != nil {
+		t.Fatalf("click file input 3: %v", err)
+	}
+	var pending3 *FileChooserPending
+	waitCond(t, 20*time.Second, "the third chooser to be reported pending", func() bool {
+		s, ok := m.SessionStatus(st.ID)
+		if ok && s.FileChooser != nil {
+			pending3 = s.FileChooser
+			return true
+		}
+		return false
+	})
+	if _, err := m.StageFile(st.ID, "doc3.bin", data); err != nil {
+		t.Fatalf("StageFile 3: %v", err)
+	}
+	// Without control the human path refuses and the browser is untouched.
+	if _, err := m.HumanAttachStagedFile(st.ID, pending3.BackendNodeID, "doc3.bin"); !errors.Is(err, ErrViewerNoControl) {
+		t.Fatalf("attach without control: %v", err)
+	}
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatalf("handoff: %v", err)
+	}
+	if !m.MarkAttached(st.ID) {
+		t.Fatal("MarkAttached")
+	}
+	// The agent's set_file_input is refused while the human drives.
+	if _, err := m.SetFileInput(st.ID, "", pending3.BackendNodeID, "doc3.bin", pageURL); !errors.Is(err, ErrHandedOff) {
+		t.Fatalf("agent set_file_input during handoff: %v", err)
+	}
+	// The browser-reported frame URL arrives shortly after the chooser opens.
+	waitCond(t, 20*time.Second, "the chooser to be offered to the viewer", func() bool {
+		_, ok := m.HumanFileAttachOffer(st.ID)
+		return ok
+	})
+	if _, err := m.HumanAttachStagedFile(st.ID, pending3.BackendNodeID+1, "doc3.bin"); !errors.Is(err, ErrChooserMismatch) {
+		t.Fatalf("attach to another node: %v", err)
+	}
+	if _, err := m.HumanAttachStagedFile(st.ID, pending3.BackendNodeID, "doc3.bin"); err != nil {
+		t.Fatalf("human attach: %v", err)
+	}
+	if s, _ := m.SessionStatus(st.ID); s.FileChooser != nil {
+		t.Fatalf("the chooser should clear after the human attach: %+v", s.FileChooser)
+	}
+	if _, err := m.Resume(st.ID); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if _, err := m.Click(st.ID, "#go", nil, nil); err != nil {
+		t.Fatalf("click submit 3: %v", err)
+	}
+	waitCond(t, 20*time.Second, "the human-attached upload", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) == 3
+	})
+	mu.Lock()
+	if got[2].filename != "doc3.bin" || !bytes.Equal(got[2].body, data) {
+		t.Fatalf("human upload: %q, %d bytes", got[2].filename, len(got[2].body))
 	}
 	mu.Unlock()
 

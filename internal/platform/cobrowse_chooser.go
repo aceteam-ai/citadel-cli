@@ -27,6 +27,11 @@ type FileChooserPending struct {
 	FrameID string `json:"frame_id,omitempty"`
 	// OpenedAt is when the node saw the chooser open (RFC 3339, UTC).
 	OpenedAt string `json:"opened_at,omitempty"`
+	// FrameURL is the owning frame's URL as the browser reported it
+	// (Page.getFrameTree, url plus urlFragment) shortly after the chooser
+	// opened. Empty until that read returns. The human attach path compares it
+	// with the frame's URL just before dispatch. Never serialized.
+	FrameURL string `json:"-"`
 }
 
 // chooserMaxMessageBytes bounds one CDP message read by the watcher.
@@ -54,23 +59,27 @@ var chooserReconnectDelay = time.Second
 
 // handleChooserEvent applies one CDP event to the pending chooser. It is the
 // whole state machine, split out so tests can drive it without a browser.
-func (s *cobrowseSession) handleChooserEvent(method string, params map[string]any) {
+// It returns the chooser a fileChooserOpened event recorded (nil otherwise), so
+// the watcher can ask the browser for that chooser's frame URL.
+func (s *cobrowseSession) handleChooserEvent(method string, params map[string]any) *FileChooserPending {
 	switch method {
 	case "Page.fileChooserOpened":
 		id, ok := params["backendNodeId"].(float64)
 		if !ok || id <= 0 {
-			return
+			return nil
 		}
 		mode, _ := params["mode"].(string)
 		frame, _ := params["frameId"].(string)
-		s.mu.Lock()
-		s.chooser = &FileChooserPending{
+		p := &FileChooserPending{
 			FrameID:       frame,
 			BackendNodeID: int(id),
 			Multiple:      mode == "selectMultiple",
 			OpenedAt:      time.Now().UTC().Format(time.RFC3339),
 		}
+		s.mu.Lock()
+		s.chooser = p
 		s.mu.Unlock()
+		return p
 	case "Page.frameNavigated":
 		// Only a navigation of the main frame (it has no parentId) clears it.
 		if fr, ok := params["frame"].(map[string]any); ok {
@@ -79,7 +88,22 @@ func (s *cobrowseSession) handleChooserEvent(method string, params map[string]an
 			}
 		}
 	}
+	return nil
 }
+
+// setChooserFrameURL records the browser-reported frame URL on p, but only
+// while p is still the pending chooser: a newer chooser or a clear wins.
+func (s *cobrowseSession) setChooserFrameURL(p *FileChooserPending, url string) {
+	s.mu.Lock()
+	if s.chooser == p {
+		p.FrameURL = url
+	}
+	s.mu.Unlock()
+}
+
+// chooserTreeIDBase keeps the watcher's getFrameTree request ids apart from
+// its two setup calls.
+const chooserTreeIDBase = 100
 
 func (s *cobrowseSession) clearChooser() {
 	s.mu.Lock()
@@ -207,18 +231,42 @@ func (s *cobrowseSession) watchChooserOnce(port int, stop <-chan struct{}) {
 	}
 	// A chooser opened before this connection is not known: start clean.
 	s.clearChooser()
+	// getFrameTree requests in flight, by request id, each for the chooser that
+	// asked.
+	trees := map[int]*FileChooserPending{}
+	nextTree := chooserTreeIDBase
 	for {
 		_, raw, err := ws.ReadMessage()
 		if err != nil {
 			return
 		}
 		var msg struct {
+			ID     int            `json:"id"`
 			Method string         `json:"method"`
 			Params map[string]any `json:"params"`
+			Result map[string]any `json:"result"`
 		}
-		if json.Unmarshal(raw, &msg) != nil || msg.Method == "" {
+		if json.Unmarshal(raw, &msg) != nil {
 			continue
 		}
-		s.handleChooserEvent(msg.Method, msg.Params)
+		if msg.Method == "" {
+			// A reply to one of our frame-tree reads. A failed or missing one
+			// leaves FrameURL empty, which the human attach refuses.
+			if p, ok := trees[msg.ID]; ok {
+				delete(trees, msg.ID)
+				if u, found := frameURLFromTree(msg.Result, p.FrameID); found && u != "" {
+					s.setChooserFrameURL(p, u)
+				}
+			}
+			continue
+		}
+		if p := s.handleChooserEvent(msg.Method, msg.Params); p != nil && p.FrameID != "" && len(trees) < 8 {
+			nextTree++
+			trees[nextTree] = p
+			_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := ws.WriteJSON(map[string]any{"id": nextTree, "method": "Page.getFrameTree", "params": map[string]any{}}); err != nil {
+				return
+			}
+		}
 	}
 }

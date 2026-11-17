@@ -6,6 +6,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -21,6 +22,10 @@ import (
 // on a stream-server error. The server binds localhost plus (when connected) the
 // assigned VPN IP so the platform relay can dial ws://<vpn_ip>:<port>/cobrowse/stream.
 func startCobrowseStreamServer() *cobrowsestream.Server {
+	// The viewer's file attach follows the same live Files permission as
+	// stage_file; it must be wired before the session adapter is built, which
+	// decides whether to offer attach.
+	platform.GetCobrowseSessionManager().SetFilesAllowed(nodeFilesEnabled)
 	srv := cobrowsestream.NewServer(
 		cobrowsestream.Config{Port: services.CobrowseStreamPort},
 		cobrowsestream.NewManagerSession(),

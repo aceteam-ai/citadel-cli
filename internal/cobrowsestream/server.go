@@ -56,6 +56,20 @@ type TargetSession interface {
 	CloseTarget(id, target string) error
 }
 
+// FileAttachSession is a Session that lets the viewer answer the page's
+// pending file chooser with a staged file (citadel-cli#1723). A Session without
+// it gets no file_chooser frames and ignores file_attach input.
+type FileAttachSession interface {
+	Session
+	// FileChooser reports the pending chooser and the staged files the viewer
+	// may attach. ok is false when there is nothing to offer right now (no
+	// chooser, no control, or Files not permitted).
+	FileChooser(id string) (FileChooserMessage, bool)
+	// AttachStagedFile fills the chooser's input with one staged file. reason
+	// is empty on success, else a fixed code (see FileAttachResult).
+	AttachStagedFile(id string, backendNodeID int, stagedName string) (reason string)
+}
+
 // TargetSnapshot is the pages of a session at one moment.
 type TargetSnapshot struct {
 	Active string

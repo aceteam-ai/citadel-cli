@@ -225,6 +225,10 @@ type CobrowseSessionManager struct {
 	trackTargets bool
 	targetPolicy TargetPolicy
 	targetEvent  TargetEventFunc
+	// filesAllowed is the live Files permission for the viewer's human file
+	// attach (SetFilesAllowed). Nil denies, so a manager nobody wired never lets
+	// a viewer attach (local mode is one).
+	filesAllowed func() bool
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
@@ -292,6 +296,8 @@ type cobrowseSession struct {
 	// stageMu serializes writes into the staging dir (count check and create).
 	stageMu     sync.Mutex
 	stageClosed bool
+	// attachMu serializes the human's viewer attaches (check, dispatch, clear).
+	attachMu sync.Mutex
 	// chooser is the pending file chooser, guarded by mu; watchStop ends the
 	// chooser watcher (closed once through watchOnce).
 	chooser   *FileChooserPending
