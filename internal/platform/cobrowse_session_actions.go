@@ -574,30 +574,10 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 
 // Type inserts text into whatever element currently holds focus in one
 // session's browser (via CDP Input.insertText) -- the caller is expected to
-// have focused a field first, typically with a preceding `click`.
+// have focused a field first, typically with a preceding `click`. See TypeWith
+// for the targeted and replacing forms.
 func (m *CobrowseSessionManager) Type(id, text string) (CobrowseSessionStatus, error) {
-	s, err := m.sessionForAction(id)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	b, cancel := newActionBudget()
-	defer cancel()
-	p, err := s.pinActionCtx(b.op)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.runAction(b, p, "type", func(r *actionRun) error {
-		if err := r.fence(); err != nil {
-			return err
-		}
-		r.eff.Dispatched = true
-		r.eff.TypedLength, r.eff.TypedUnconfirmed = typedLength(text), true
-		if _, err := r.conn.Call("Input.insertText", map[string]any{"text": text}); err != nil {
-			return err
-		}
-		r.eff.TypedUnconfirmed = false
-		return nil
-	})
+	return m.TypeWith(id, text, TypeOptions{})
 }
 
 // Select changes a native select through the page DOM. Native popup windows do
@@ -646,43 +626,7 @@ func (m *CobrowseSessionManager) Select(id, selector, value, label string) (Sele
 // Key sends a real key press and release. Text is never logged by the job
 // handler; the MCP audit records only the action name.
 func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, error) {
-	s, err := m.sessionForAction(id)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	b, cancel := newActionBudget()
-	defer cancel()
-	p, err := s.pinActionCtx(b.op)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	code, vk, produced, ok := browserKey(key)
-	if !ok {
-		return CobrowseSessionStatus{}, fmt.Errorf("unsupported key")
-	}
-	kind := "rawKeyDown"
-	if produced != "" {
-		kind = "keyDown"
-	}
-	params := map[string]any{"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk}
-	if produced != "" {
-		params["text"] = produced
-	}
-	return s.runAction(b, p, "key", func(r *actionRun) error {
-		if err := r.fence(); err != nil {
-			return err
-		}
-		r.eff.Dispatched = true
-		if _, err := r.conn.Call("Input.dispatchKeyEvent", params); err != nil {
-			return err
-		}
-		// A human can take control while the key-down is awaited.
-		if err := r.midActionFence(); err != nil {
-			return err
-		}
-		_, err := r.conn.Call("Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk})
-		return err
-	})
+	return m.KeyWith(id, key, 0)
 }
 
 func browserKey(key string) (string, int, string, bool) {

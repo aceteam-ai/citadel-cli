@@ -39,6 +39,12 @@ type latencyCDP struct {
 	dropOn map[string]bool
 	// noScroll keeps an evalDelay'd selector resolution from scrolling.
 	noScroll bool
+	// evalHook answers an evaluate before the built-in answers; it runs under
+	// the fake's lock and must not touch it.
+	evalHook func(expr string) (any, bool)
+	// callHook answers any method before the default empty result; it runs
+	// outside the fake's lock.
+	callHook func(method string, params map[string]any) (map[string]any, bool)
 
 	discoveries atomic.Int64
 	dials       atomic.Int64
@@ -50,6 +56,9 @@ type latencyCDP struct {
 	url         string
 	focus       string
 }
+
+// rawRemote is an evaluate answer given as the CDP RemoteObject itself.
+type rawRemote map[string]any
 
 func (f *latencyCDP) count(method string) int {
 	f.mu.Lock()
@@ -134,7 +143,12 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 				}
 				f.mu.Lock()
 				var val any
+				hooked := false
+				if f.evalHook != nil {
+					val, hooked = f.evalHook(expr)
+				}
 				switch {
+				case hooked:
 				case strings.Contains(expr, "window.scrollX"):
 					f.probes++
 					if f.probes == 1 && f.stallFirstProbe > 0 {
@@ -150,6 +164,17 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 				}
 				f.mu.Unlock()
 				result = map[string]any{"result": map[string]any{"type": "object", "value": val}}
+				if rr, ok := val.(rawRemote); ok {
+					result = map[string]any{"result": map[string]any(rr)}
+				}
+			}
+			f.mu.Lock()
+			ch := f.callHook
+			f.mu.Unlock()
+			if ch != nil {
+				if r, ok := ch(msg.Method, msg.Params); ok {
+					result = r
+				}
 			}
 			if msg.Method == "Page.captureScreenshot" {
 				result = map[string]any{"data": base64.StdEncoding.EncodeToString([]byte("png"))}

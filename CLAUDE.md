@@ -122,6 +122,22 @@ success); only a payload `report_partial: true` gets the structured `done:false`
 result. Local mode returns the same details as a tool error. An approved commit
 that was dispatched and then failed resolves as `unconfirmed`, not failed.
 `TestCobrowseRealBrowserActionLatency` pins the budgets.
+`TypeWith` and `KeyWith` (#1730) own the targeted replace and key modifiers, each still one
+`runAction`: resolve the selector (or the focused field) to an element and bind to it, select the whole
+content (refused unless the selection spans it), then insert (or a real Backspace for an empty clear, read
+back as empty), with `midActionFence` between steps. The last awaited call before the destructive event is
+`verifyBound`: same document (`loaderId`), same element still focused and, with clear, the selection still
+spanning the content; only the insert round trip follows. After the insert the page confirms it holds
+exactly the typed text (a boolean only), on every clear path, or `Cleared` stays false. A change after the page was touched is an incomplete action
+(not a refusal) carrying what happened. Only an input, textarea or the contenteditable host itself is a
+target, never under designMode; page-returned refusal strings are mapped to a fixed set. `CheckKeyChord` owns
+the modifier allowlist and decides which chords are refused (clipboard and editing chords are not allowed);
+`parseKeyAction` and `KeyWith` both call it before any dispatch. Other refusals (empty text without `clear`, selector over `MaxCobrowseSelectorLen`,
+modifiers outside 0..15, a selector that matches nothing or is not editable) send nothing.
+`ActionEffects.Cleared` is confirmed; `ClearedUnconfirmed` means the destructive event was sent without
+confirmation. Status `input_edit` (`InputEditV1`, non-tracking sessions only, like `FileUploadPageFence`)
+is the marker a caller checks first. Local mode does not pass the new fields.
+`TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
 
 `platform.StageFile` and `platform.SetFileInput` own file upload for remotely
 dispatched sessions (#1721, node side of aceteam#13831). Staged files live in a
