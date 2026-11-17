@@ -237,7 +237,7 @@ func TestManagerSessionOffersFileAttachOnlyToWiredNodeWideManager(t *testing.T) 
 // platform package are exactly the stream adapter.
 func TestOnlyTheStreamAdapterCallsHumanAttach(t *testing.T) {
 	root := filepath.Join("..", "..")
-	var callers []string
+	var callers, streamSide []string
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -255,8 +255,14 @@ func TestOnlyTheStreamAdapterCallsHumanAttach(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if strings.Contains(string(b), "HumanAttachStagedFile(") || strings.Contains(string(b), "HumanFileAttachOffer(") {
+		src := string(b)
+		if strings.Contains(src, "HumanAttachStagedFile(") || strings.Contains(src, "HumanFileAttachOffer(") {
 			callers = append(callers, filepath.ToSlash(p))
+		}
+		// The stream-side interface must not be reachable from a job or tool
+		// either: it is named only inside this package's stream files.
+		if strings.Contains(src, "AttachStagedFile(") || strings.Contains(src, "FileAttachSession") {
+			streamSide = append(streamSide, filepath.ToSlash(p))
 		}
 		return nil
 	})
@@ -264,8 +270,21 @@ func TestOnlyTheStreamAdapterCallsHumanAttach(t *testing.T) {
 		t.Fatal(err)
 	}
 	sort.Strings(callers)
+	sort.Strings(streamSide)
 	want := []string{"../../internal/cobrowsestream/adapter.go", "../../internal/platform/cobrowse_human_attach.go"}
 	if strings.Join(callers, ",") != strings.Join(want, ",") {
 		t.Fatalf("human attach is referenced from %v, want only %v", callers, want)
+	}
+	// platform defines HumanAttachStagedFile (matched above); the interface
+	// lives in cobrowsestream.
+	wantStream := []string{"../../internal/cobrowsestream/adapter.go", "../../internal/cobrowsestream/handler.go", "../../internal/cobrowsestream/server.go", "../../internal/cobrowsestream/wire.go"}
+	var gotStream []string
+	for _, p := range streamSide {
+		if p != "../../internal/platform/cobrowse_human_attach.go" {
+			gotStream = append(gotStream, p)
+		}
+	}
+	if strings.Join(gotStream, ",") != strings.Join(wantStream, ",") {
+		t.Fatalf("the stream attach interface is referenced from %v, want only %v", gotStream, wantStream)
 	}
 }

@@ -156,12 +156,15 @@ func (s *cobrowseSession) humanControlFence(port int) error {
 // opened. On any refusal nothing reaches the browser. The audit line carries
 // actor, name, size and sha256, never bytes or a path.
 //
-// Serialization: an attach holds attachMu (human attaches never overlap), and
-// excludes agent actions only through the driver state they share. Agent
-// actions (set_file_input included) refuse while explicitHandoff is set, here
-// the attach refuses unless it is set, and both re-check that flag under s.mu
-// right before dispatching. There is no lock held across the CDP round trips
-// for either side.
+// Serialization: an attach holds attachMu, so human attaches never overlap.
+// Nothing else serializes it against agent actions (set_file_input included):
+// the node manager has no per-session action lock. The two sides are kept apart
+// only by the driver flag explicitHandoff: agent actions refuse while it is set,
+// this attach refuses unless it is set, and each re-checks it under s.mu right
+// before dispatching. Neither holds a lock across the dispatch, so a handoff or
+// resume landing between one side's last check and its DOM.setFileInputFiles
+// can let both dispatch. That window exists for every agent action already
+// (driverFence); this path does not widen it.
 func (m *CobrowseSessionManager) HumanAttachStagedFile(id string, backendNodeID int, stagedName string) (StagedFile, error) {
 	if !m.filesPermitted() {
 		return StagedFile{}, ErrAttachFilesDisabled
