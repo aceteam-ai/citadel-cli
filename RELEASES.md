@@ -3950,3 +3950,21 @@ Auto-generated log of every release.
   - fix(hpc): show bounded approval refusal details (#1629)
 
 
+---
+
+## v2.236.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +1965 |
+
+**Changes:**
+
+  - Revert "feat(local): bind file metadata in form approvals (#1751)" (#1754)
+  - fix(cobrowse): handoff banner dedupe and browser names for CITADEL_COBROWSE_BROWSER (#1752)
+  - feat(local): bind file metadata in form approvals (#1751)
+  - feat(cobrowse): type replace with selector and clear, key modifiers, input_edit marker (#1731)
+
+
