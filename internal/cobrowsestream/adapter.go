@@ -1,6 +1,10 @@
 package cobrowsestream
 
-import "github.com/aceteam-ai/citadel-cli/internal/platform"
+import (
+	"context"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
+)
 
 // managerSession adapts the #793 CobrowseSessionManager to the Session interface
 // this server needs, using only the manager's EXISTING exported API so the
@@ -13,7 +17,7 @@ type managerSession struct {
 // NewManagerSession returns a Session backed by the process-wide co-browse
 // session manager. This is the production binding used by `citadel work`.
 func NewManagerSession() Session {
-	return managerSession{m: platform.GetCobrowseSessionManager()}
+	return NewManagerSessionFrom(platform.GetCobrowseSessionManager())
 }
 
 // NewManagerSessionFrom wraps a specific manager (e.g. an isolated one in tests).
@@ -24,6 +28,11 @@ func NewManagerSession() Session {
 func NewManagerSessionFrom(m *platform.CobrowseSessionManager) Session {
 	if m != nil && m.TargetsEnabled() {
 		return targetManagerSession{managerSession{m: m}}
+	}
+	// File attach is offered only by a manager that was given a Files
+	// permission source and does not track pages (the node-wide manager).
+	if m != nil && m.HumanFileAttachSupported() {
+		return fileAttachManagerSession{managerSession{m: m}}
 	}
 	return managerSession{m: m}
 }
@@ -66,4 +75,26 @@ func (s targetManagerSession) SwitchTarget(id, target string) error {
 }
 func (s targetManagerSession) CloseTarget(id, target string) error {
 	return s.m.CloseTarget(id, target)
+}
+
+type fileAttachManagerSession struct{ managerSession }
+
+// FileChooser implements FileAttachSession.
+func (s fileAttachManagerSession) FileChooser(id string) (FileChooserMessage, bool) {
+	o, ok := s.m.HumanFileAttachOffer(id)
+	if !ok {
+		return FileChooserMessage{}, false
+	}
+	msg := FileChooserMessage{Type: FileChooserType, Pending: true, BackendNodeID: o.BackendNodeID, Multiple: o.Multiple, Staged: []StagedFileInfo{}}
+	for _, f := range o.Staged {
+		msg.Staged = append(msg.Staged, StagedFileInfo{Name: f.Name, Size: f.Size})
+	}
+	return msg, true
+}
+
+// AttachStagedFile implements FileAttachSession. Only a fixed reason code
+// leaves this function.
+func (s fileAttachManagerSession) AttachStagedFile(ctx context.Context, id string, backendNodeID int, stagedName string) string {
+	_, err := s.m.HumanAttachStagedFile(ctx, id, backendNodeID, stagedName)
+	return platform.AttachFailureReason(err)
 }
