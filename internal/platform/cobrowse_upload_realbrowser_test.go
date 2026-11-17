@@ -233,6 +233,9 @@ func runFileUploadRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 	}
 	mu.Unlock()
 
+	// The viewer detaches, as a real one does before the session ends.
+	m.MarkDetached(st.ID)
+
 	// 3. Stop removes the staging dir with the session.
 	if err := m.Stop(st.ID); err != nil {
 		t.Fatalf("stop: %v", err)
