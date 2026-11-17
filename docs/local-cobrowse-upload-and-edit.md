@@ -436,17 +436,14 @@ commit, because on many sites it sends files already attached.
 so that a File entry no longer sets `bad`. It encodes as a tuple
 `[name, "file", fileName, size, type, lastModified]`.
 
-At the design pass the probe ran in the main world (see Findings), where a
-page could replace `File.prototype` getters before it ran. S1 uses the cleaner
-end state: `InspectTarget` runs the complete probe in a browser-created
-isolated world (`Page.createIsolatedWorld`). Target resolution, focused state,
-the native submission set and native File/Blob getters use that same world's
-DOM observation, rather than merging two observations across worlds. A missing
-world, failed read or changed driver refuses the probe without falling back to
-the main world. The browser's synthetic empty File timestamp is normalized to
-zero, so an unselected file input has a stable digest. A snapshot with more
-than 128 attached entries is unverifiable rather than producing an unbounded
-commit card. No file bytes or local paths are read. Then:
+The probe runs in the main world today (see Findings), so a page can replace
+`File.prototype` getters before it runs. The file-entry reads therefore run in
+an isolated world of the form's frame (`Page.createIsolatedWorld`), on the form
+node resolved there, the way `fillFileInput` resolves its target. The results
+are folded into the main-world digest by the service. Moving the whole probe
+into an isolated world is the cleaner end state. It is a larger change,
+because the probe also reads page state such as the focused element, and it is
+not required here. Then:
 
 - fills in that form are ordinary fills under the grant;
 - the form's Submit is an ordinary commit whose content hash changes if the

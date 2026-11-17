@@ -420,8 +420,8 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	if ti := inspect("file1"); !ti.Resolved || ti.ContentHash == "" {
 		t.Errorf("a form without a file input is verifiable: %+v", ti)
 	}
-	if ti := inspect("file2"); !ti.Resolved || ti.ContentHash == "" {
-		t.Errorf("an empty named file input is now verifiable: %+v", ti)
+	if ti := inspect("file2"); ti.Resolved {
+		t.Errorf("a form with a file input must be unverifiable: %+v", ti)
 	}
 	if ti := inspect("pw1"); ti.Resolved {
 		t.Errorf("a password field sharing its name with a hidden field must be unverifiable: %+v", ti)

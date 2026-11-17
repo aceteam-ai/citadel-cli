@@ -24,16 +24,6 @@ type TargetRect struct {
 	VH float64 `json:"vh"`
 }
 
-// FormFile is submission metadata only. Bytes and local paths never leave the
-// browser. Empty, unselected file controls are bound but not shown as files.
-type FormFile struct {
-	Field        string `json:"field"`
-	Name         string `json:"name"`
-	Size         int64  `json:"size"`
-	Type         string `json:"type"`
-	LastModified int64  `json:"last_modified"`
-}
-
 // TargetInfo describes what an action is about to act on. It is read inside
 // the page and decoded without interpretation; the local-mode commit
 // classifier (localcobrowse.Classify) decides what it means. ContentHash binds
@@ -75,8 +65,7 @@ type TargetInfo struct {
 	ContentHash string `json:"content_hash,omitempty"`
 	// Oversized is set when the content is too large to hash in full. Such a
 	// target is a commit whose approval can never be redeemed.
-	Oversized bool       `json:"oversized,omitempty"`
-	FormFiles []FormFile `json:"form_files,omitempty"`
+	Oversized bool `json:"oversized,omitempty"`
 }
 
 // FormDigestScript is the in-page encoding and hash of a form's fields, shared
@@ -133,10 +122,9 @@ const FormDigestScript = `
 // new FormData(form, submitter): that covers select-multiple, disabled controls,
 // controls joined by form=, form-associated custom elements (whatever they pass
 // to setFormValue) and the submitter's name and value by definition. Entries are
-// encoded as [name, kind, value] tuples in order; files use
-// [name, "file", fileName, size, type, lastModified]. Unreadable metadata or a
-// FormData constructor that throws makes the target unverifiable (bad).
-// Entries named like a password or one-time-code control are
+// encoded as [name, kind, value] tuples in order. A File entry, or a FormData
+// constructor that throws, makes the target unverifiable (bad), and no approval
+// of it is redeemable. Entries named like a password or one-time-code control are
 // dropped, conservatively by name. Composers outside the form (the focused one,
 // or the target) are added from their own text; one whose value cannot be read
 // is bad too. env supplies the DOM reads at prototype level, so a control named
@@ -163,20 +151,7 @@ const FormSnapshotScript = `
 		return f === "current-password" || f === "new-password" || f === "one-time-code";
 	}
 	function buildSnapshot(env, form, sub, t, focus, tIsEntry){
-		var tuples = [], files = [], bad = "";
-		function fileTuple(name, val){
-			var f;
-			try { f = env.fileMeta(val); } catch (x) { bad = "the file metadata could not be read"; return; }
-			if (!f || typeof f.name !== "string" || typeof f.type !== "string" || !Number.isSafeInteger(f.size) || f.size < 0 || !Number.isSafeInteger(f.lastModified)) {
-				bad = "the file metadata could not be read"; return;
-			}
-			// FormData synthesizes a fresh empty File for an unselected input.
-			// Its timestamp changes on each read; it is not an attached file.
-			var empty = f.name === "" && f.size === 0, modified = empty ? 0 : f.lastModified;
-			tuples.push([name, "file", f.name, f.size, f.type, modified]);
-			if (!empty) files.push({field:name, name:f.name, size:f.size, type:f.type, last_modified:modified});
-			if (files.length > 128) bad = "the form has too many attached files to display";
-		}
+		var tuples = [], bad = "";
 		if (form) {
 			var fd = null;
 			try { fd = env.formData(form, sub); } catch (x) { bad = "the browser could not build this form's submission"; }
@@ -219,7 +194,6 @@ const FormSnapshotScript = `
 				// password or an unchecked one-time-code checkbox, is unverifiable.
 				for (var e2 = 0; e2 < entries.length; e2++) {
 					var k2 = "n:" + String(entries[e2][0]);
-					if (sens[k2] && env.isFile(entries[e2][1])) { bad = "a file entry shares its name with a password or one-time-code field"; break; }
 					if (sens[k2]) { got[k2] = got[k2] || []; got[k2].push(env.isFile(entries[e2][1]) ? "\u0000file" : String(entries[e2][1]).replace(/\r\n?/g, "\n")); }
 				}
 				for (var key2 in sens) {
@@ -230,10 +204,9 @@ const FormSnapshotScript = `
 				if (!bad) {
 					for (var m2 = 0; m2 < entries.length; m2++) {
 						var name = String(entries[m2][0]), val = entries[m2][1];
+						if (env.isFile(val)) { bad = "the form submits a file"; break; }
 						if (skip["n:" + name]) continue;
-						if (env.isFile(val)) fileTuple(name, val);
-						else tuples.push([name, "string", String(val)]);
-						if (bad) break;
+						tuples.push([name, "string", String(val)]);
 					}
 				}
 			}
@@ -242,13 +215,7 @@ const FormSnapshotScript = `
 			var tag = String(c.tagName || "").toLowerCase();
 			if (env.disabled(c)) return;
 			var ty = String(c.type || "").toLowerCase();
-			if (ty === "file") {
-				try {
-					var picked = env.files(c);
-					for (var fi = 0; fi < picked.length; fi++) fileTuple(String(c.name || ""), picked[fi]);
-				} catch (x) { bad = "the file metadata could not be read"; }
-				return;
-			}
+			if (ty === "file") { bad = "the page has a file input"; return; }
 			if (/^(password|submit|button|reset|image)$/.test(ty)) return;
 			var ac = String(env.attr(c, "autocomplete") || "");
 			if (sensitiveAC(ac)) return;
@@ -261,9 +228,9 @@ const FormSnapshotScript = `
 		}
 		if (!bad) {
 			if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT") && !(form && env.inForm(form, focus))) add(focus, false);
-			if (t && !(form && env.inForm(form, t)) && (tIsEntry || String(t.tagName || "").toLowerCase() === "select" || String(t.type || "").toLowerCase() === "file")) add(t, true);
+			if (t && !(form && env.inForm(form, t)) && (tIsEntry || String(t.tagName || "").toLowerCase() === "select")) add(t, true);
 		}
-		return {tuples: tuples, files: files, bad: bad};
+		return {tuples: tuples, bad: bad};
 	}
 	// normTarget keeps a browsing-context name exactly (names are case-sensitive)
 	// and lower-cases only the reserved keywords.
@@ -275,7 +242,7 @@ const FormSnapshotScript = `
 	// button. The submitter's own name, id, type and value are folded into the
 	// digest. bad or oversized means the target cannot be verified in full.
 	function inspectForm(env, form, t, focus, tIsEntry, maxc){
-		var r = {bad: "", oversized: false, digest: "", files: [], action: "", method: "", enctype: "", target: "", overrides: ""};
+		var r = {bad: "", oversized: false, digest: "", action: "", method: "", enctype: "", target: "", overrides: ""};
 		var sub = null;
 		if (form) {
 			var els = env.elements(form);
@@ -314,7 +281,6 @@ const FormSnapshotScript = `
 		var d = formDigest(snap.tuples);
 		if (sub) d = formDigest([d, [sub.name || "", sub.id || "", String(sub.type || "").toLowerCase(), sub.value === undefined ? "" : String(sub.value)]]);
 		r.digest = d;
-		r.files = snap.files;
 		return r;
 	}
 `
@@ -386,15 +352,10 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	var actSel = "button,a[href],input[type=submit],input[type=image],input[type=button],input[type=reset],[role=button],[role=link],[role=menuitem],[role=tab],summary,[onclick]";
 	var act = (kind === "click" && el.closest) ? el.closest(actSel) : (el.matches && el.matches(actSel) ? el : null);
 	var t = act || el;
-	// A file input's label only opens its chooser. Do not reclassify a
-	// different actionable descendant, such as a submit button inside a label.
-	var lab = !act && el.closest ? el.closest("label") : null;
-	if (lab && lab.control && lab.control.tagName === "INPUT" && lab.control.type === "file") t = lab;
 	tag = t.tagName.toLowerCase();
 	var cs = null; try { cs = getComputedStyle(t); } catch (e) {}
 	var role = (t.getAttribute("role") || "").toLowerCase();
 	var type = (t.type || t.getAttribute("type") || "").toLowerCase();
-	if (tag === "label" && t.control && t.control.tagName === "INPUT" && t.control.type === "file") type = "file";
 	var isEntry = tag === "textarea" || t.isContentEditable || role === "textbox" || role === "searchbox" || role === "combobox" ||
 		(tag === "input" && !/^(checkbox|radio|button|submit|reset|image|file|hidden|range|color)$/.test(type));
 	out.tag = tag; out.role = role; out.input_type = type;
@@ -412,13 +373,6 @@ const targetProbeScript = `(function(kind, selector, px, py){
 		formData: function(f, sub){ return sub ? new FormData(f, sub) : new FormData(f); },
 		entries: function(fd){ var out = []; fd.forEach(function(v, k){ out.push([k, v]); }); return out; },
 		isFile: function(v){ return typeof v !== "string"; },
-		fileMeta: function(v){
-			return {name:Object.getOwnPropertyDescriptor(File.prototype,"name").get.call(v),
-				size:Object.getOwnPropertyDescriptor(Blob.prototype,"size").get.call(v),
-				type:Object.getOwnPropertyDescriptor(Blob.prototype,"type").get.call(v),
-				lastModified:Object.getOwnPropertyDescriptor(File.prototype,"lastModified").get.call(v)};
-		},
-		files: function(c){ return Array.prototype.slice.call(Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"files").get.call(c) || []); },
 		inForm: function(f, c){ try { return Array.prototype.indexOf.call(Object.getOwnPropertyDescriptor(HF, "elements").get.call(f), c) >= 0; } catch (x) { return false; } },
 		has: function(e, n){ try { return EP.hasAttribute.call(e, n); } catch (x) { return false; } },
 		abs: abs,
@@ -446,7 +400,6 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	out.rect = {x: r.x, y: r.y, w: r.width, h: r.height, vw: window.innerWidth, vh: window.innerHeight};
 	if (fi.bad) { out.reason = fi.bad; return out; }
 	if (fi.oversized) { out.oversized = true; } else { out.content_hash = fi.digest; }
-	out.form_files = fi.files;
 	out.resolved = true;
 	return out;
 })`
@@ -459,53 +412,9 @@ func (m *CobrowseSessionManager) InspectTarget(id string, p TargetProbe) (Target
 	if err != nil {
 		return TargetInfo{}, err
 	}
-	b, cancel := newActionBudget()
-	defer cancel()
-	pn, err := s.pinActionCtx(b.op)
+	pn, err := s.pinAction()
 	if err != nil {
 		return TargetInfo{}, err
-	}
-	c, err := openCDPConn(b.op, pn)
-	if err != nil {
-		return TargetInfo{}, err
-	}
-	defer c.Close()
-	return inspectTargetOn(c, p, func() error {
-		if err := pn.verifyCtx(b.op); err != nil {
-			return err
-		}
-		return s.driverFence(pn)
-	})
-}
-
-// Read the snapshot in a browser-created isolated world. The entire probe uses
-// the same DOM observation, avoiding a main-world/isolated-world merge race.
-// Page code cannot replace File/Blob getters or the FormData constructor here.
-func inspectTargetOn(c cdpCaller, p TargetProbe, fence func() error) (TargetInfo, error) {
-	if err := fence(); err != nil {
-		return TargetInfo{}, err
-	}
-	tree, err := c.Call("Page.getFrameTree", nil)
-	if err != nil {
-		return TargetInfo{}, err
-	}
-	if err := fence(); err != nil {
-		return TargetInfo{}, err
-	}
-	frame := rootFrameID(tree)
-	if frame == "" {
-		return TargetInfo{}, ErrTargetChanged
-	}
-	world, err := c.Call("Page.createIsolatedWorld", map[string]any{"frameId": frame, "worldName": "citadel-form-snapshot"})
-	if err != nil {
-		return TargetInfo{}, err
-	}
-	if err := fence(); err != nil {
-		return TargetInfo{}, err
-	}
-	contextID, ok := world["executionContextId"].(float64)
-	if !ok || contextID <= 0 || contextID != float64(int(contextID)) {
-		return TargetInfo{}, ErrTargetChanged
 	}
 	var px, py any = nil, nil
 	if p.X != nil && p.Y != nil {
@@ -515,20 +424,9 @@ func inspectTargetOn(c cdpCaller, p TargetProbe, fence func() error) (TargetInfo
 	pyj, _ := json.Marshal(py)
 	expr := fmt.Sprintf("%s(%s,%s,%s,%s)", targetProbeScript,
 		jsStringLiteral(p.Kind), jsStringLiteral(p.Selector), pxj, pyj)
-	res, err := c.Call("Runtime.evaluate", map[string]any{"expression": expr, "contextId": int(contextID), "returnByValue": true, "awaitPromise": false})
+	val, err := runtimeEvaluate(pn, expr)
 	if err != nil {
 		return TargetInfo{}, err
-	}
-	if err := fence(); err != nil {
-		return TargetInfo{}, err
-	}
-	if res["exceptionDetails"] != nil {
-		return TargetInfo{}, fmt.Errorf("the form snapshot could not be read")
-	}
-	remote, _ := res["result"].(map[string]any)
-	val, ok := remote["value"].(map[string]any)
-	if !ok {
-		return TargetInfo{}, fmt.Errorf("the form snapshot could not be read")
 	}
 	raw, err := json.Marshal(val)
 	if err != nil {
