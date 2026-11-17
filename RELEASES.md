@@ -3914,3 +3914,22 @@ Auto-generated log of every release.
   - ci: shard Build + Test into parallel jobs (#1707) (#1708)
 
 
+---
+
+## v2.234.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 47 |
+| Lines added | +3399 |
+
+**Changes:**
+
+  - feat(cobrowse): session file staging, set_file_input and file-chooser interception (#1721) (#1722)
+  - fix(cobrowse): report a pending first load instead of returning a blank page as loaded (#1714) (#1719)
+  - fix(local): local doctor prints only its results when a check fails (#1726)
+  - test(cobrowse): stub a port owner PID that can never be the test process (#1725)
+  - test: deflake #1697, #1706, #1709 (test-only) (#1720)
+
+
