@@ -41,10 +41,14 @@ below explain each one in detail.
 3. **Does the node passcode gate VM console jobs?** Recommendation: yes,
    with the same semantics as the desktop gate (`jobs.DesktopGate`). All
    three job types are checked when a passcode or master PIN is set, and they
-   share the node's wrong-passcode throttle. Alternatives: require a
-   configured passcode for keys and pointer and refuse when none is set
-   (stricter, but different from every other surface); no passcode, relying
-   on the permission, the allowlist and the platform grant.
+   share the node's wrong-passcode throttle. The cost: a proxy node with a
+   passcode set (likely, if Shell or Desktop is on there) needs the passcode
+   in every VM console job, unattended #14122 flow runs included. So the
+   platform must either hold the passcode or ask a human for each run.
+   Alternatives: require a configured passcode for keys and pointer and
+   refuse when none is set (stricter, but different from every other
+   surface); no passcode, relying on the permission, the allowlist and the
+   platform grant, which leaves unattended flows simple.
 4. **Can the platform turn the permission on remotely?** Recommendation: no.
    `vm_console` is enabled only by a local command on the proxy node.
    `APPLY_DEVICE_CONFIG` and the `citadel_set_*_permission` tools can turn it
@@ -150,6 +154,11 @@ it.
   `password` is described as the "password used for authentication within
   the VNC protocol", in printable ASCII. `generate-password` is deprecated:
   PVE now generates a password when one is required.
+- **The VNC password is per display, and it expires after 30 seconds.** In
+  the PVE source, `qm vncproxy` sets the password on the VM's QEMU display
+  over QMP and expires it after 30 s. The vncproxy listener waits 10 s for
+  its single connection. Any other console opener overwrites the password,
+  so auth can race a human opening the PVE console (section 4.1).
 - **The same token cannot read the VM config or locate the VM.**
   `GET /nodes/{node}/qemu/{vmid}/config` and `.../status/current` need
   `VM.Audit`. `GET /cluster/resources` is open to all users but is filtered
@@ -566,34 +575,76 @@ Nothing else.
 
 ### 4.1 Session setup
 
+What PVE does, read from its source (qemu-server `PVE/API2/Qemu.pm`
+`vncproxy`, qemu-server `PVE/CLI/qm.pm` `vncproxy`, and pve-http-server
+`PVE/APIServer/AnyEvent.pm`):
+
+- `vncproxy` with `websocket=1` generates a VNC password and returns it as
+  `password`. It also returns `ticket` as `<password>:<vnc ticket>`, which is
+  the value `vncwebsocket` expects as `vncticket`.
+- It then starts a task that listens on `localhost:<port>`, without TLS, and
+  waits **10 seconds** for one connection. The `vncwebsocket` upgrade is that
+  connection, so the node must open the websocket within 10 s of the API
+  reply.
+- On that connection, PVE runs `qm vncproxy <vmid>`. That command sets the
+  VM display's VNC password over QMP (`set_password`, protocol vnc), expires
+  it after **30 seconds** (`expire_password +30`), and pipes the QEMU VNC
+  socket through. QEMU's VNC server therefore asks for VNC Authentication,
+  with the returned `password` as the secret.
+- The VNC password is per display, not per session. Every console opener
+  overwrites it, the PVE web console included. If a human opens the console
+  for the same VM between the node's websocket connect and its RFB auth, the
+  node's auth fails. The reverse also applies: the node's connect can fail a
+  human's auth that is in flight at that moment. An established session is
+  unaffected, because the password only gates new authentications.
+- The websocket upgrade goes through the same authentication handler as
+  every other API call, and that handler accepts the `PVEAPIToken`
+  Authorization header. The server echoes `Sec-WebSocket-Protocol` if one is
+  sent and does not require it. It sends and expects binary frames, and it
+  refuses fragmented, unmasked or oversized client frames.
+- The request may go to any cluster node's API. `{node}` must be the node
+  that hosts the VM: `vncproxy` loads the VM config on that node, and a
+  migrated VM fails there with an error.
+
+The client's steps:
+
 1. `POST /api2/json/nodes/<pve_node>/qemu/<vmid>/vncproxy` with
    `websocket=1`, authenticated with `Authorization: PVEAPIToken=<id>=<secret>`.
    Keep `port`, `ticket`, `password` and `upid`. Do not send
-   `generate-password`, which is deprecated.
-2. Within a few seconds (the proxy listener is short-lived), open
+   `generate-password`, which is deprecated. A 401 maps to
+   `pve_auth_refused`, a 403 to `pve_forbidden`, and a config-not-found error
+   to `vm_not_on_pve_node` (the VM migrated, so the operator must update
+   `pve_node`).
+2. At once, and within the 10 s listener window, open
    `wss://<host>/api2/json/nodes/<pve_node>/qemu/<vmid>/vncwebsocket?port=<port>&vncticket=<urlencoded ticket>`
    with the same Authorization header, the pinned TLS config, a 5 s
-   handshake timeout and the `binary` subprotocol. Each binary websocket
-   message carries RFB bytes. A text message is a protocol error.
+   handshake timeout and the `binary` subprotocol (accepted, not required).
+   Each binary message carries RFB bytes. A text message is a protocol error.
 3. RFB: read the server version and reply `RFB 003.008`. From the security
    types, choose VNC Authentication (2) and answer the 16-byte challenge with
-   DES under the bit-reversed `password` (the first 8 bytes, zero-padded).
-   Refuse to proceed with security type None: a console that asks for no
-   auth is not the session vncproxy promised. Read SecurityResult.
-4. ClientInit with **shared = 1**, so the session never disconnects a human
+   DES keyed by the bit-reversed `password` (its first 8 bytes,
+   zero-padded). Refuse to proceed with security type None: a console that
+   asks for no auth is not the session vncproxy promised. Read
+   SecurityResult.
+4. If SecurityResult reports failure, retry once from step 1, with a fresh
+   `vncproxy` call, after a 500 ms pause. If the retry fails too, refuse with
+   `vnc_auth_raced` and a message that says another console may be opening
+   the same VM. A failed RFB auth is never reported as a revoked token: only
+   an API 401 or 403 means that.
+5. ClientInit with **shared = 1**, so the session never disconnects a human
    who is watching the same console in the PVE UI.
-5. Read ServerInit (framebuffer size, pixel format, name). Bound the name at
+6. Read ServerInit (framebuffer size, pixel format, name). Bound the name at
    256 bytes.
-6. SetPixelFormat: 32 bpp, depth 24, true colour, little-endian,
+7. SetPixelFormat: 32 bpp, depth 24, true colour, little-endian,
    8-bit channels at shifts 16, 8, 0.
-7. SetEncodings: Raw (0), DesktopSize (-223), PointerTypeChange (-257).
+8. SetEncodings: Raw (0), DesktopSize (-223), PointerTypeChange (-257).
    Nothing else in v1.
 
 Secrets in this sequence (the token, the ticket, the VNC password) live only
 in local variables for the session and are never formatted into errors or
-logs. The ticket is in the websocket URL, so the dialer's error path must
-not echo the URL. A test greps every error and log line for a sentinel
-ticket.
+logs. The ticket carries the VNC password and travels in the websocket URL,
+so the dialer's error path must not echo the URL. A test greps every error
+and log line for a sentinel ticket.
 
 ### 4.2 Framebuffer
 
@@ -658,25 +709,24 @@ double click is two clicks 80 ms apart.
 
 ### 4.5 Builder checks
 
-These are not settled by reading the code or the schema. The RFB and PVE
-slices confirm each one against the fake servers' assumptions, and native
-acceptance confirms them on the operator's Proxmox host.
+Section 4.1 settles three questions from the PVE source: which secret the
+VNC auth uses, whether a token header works on the websocket upgrade, and
+how long the listener waits. The questions below remain open. A fake server
+only encodes an assumption and cannot confirm one, so the native checkpoint
+in section 6 answers them before the input slices start.
 
-1. Which security type the vncwebsocket path offers, and whether the VNC
-   password is the returned `password` (current PVE) or the ticket (older
-   PVE). The client supports only VNC Authentication. If acceptance shows
-   VeNCrypt, that is a design change and comes back here.
-2. That the `PVEAPIToken` Authorization header is accepted on the
-   vncwebsocket upgrade. Browsers cannot set the header, so the PVE web
-   console's path does not prove it.
-3. That the `binary` subprotocol is required or at least accepted.
-4. That the PVE node certificate's SANs include the name or address the
+1. That QEMU on the host offers only VNC Authentication on this path, with
+   no VeNCrypt. The client supports only VNC Authentication. If the
+   checkpoint shows otherwise, that is a design change and comes back here.
+2. That the PVE node certificate's SANs include the name or address the
    operator configures. If not, `server_name` covers it.
-5. That a shared-flag session leaves a human's open PVE console connected.
-6. That the -257 rect arrives on the host's QEMU version, and reports
+3. That a shared-flag session leaves a human's open PVE console connected.
+4. That the -257 rect arrives on the host's QEMU version, and reports
    absolute for a Windows guest with the default USB tablet.
-7. How long the vncproxy listener waits for the websocket.
-8. What the guest sees if the session drops with a key or button held. The
+5. How often the per-display password race (section 4.1) shows up in
+   practice when a human has the PVE console open. The retry should absorb
+   it.
+6. What the guest sees if the session drops with a key or button held. The
    release-before-close rule makes this rare, but acceptance should note it.
 
 ## 5. Threats
@@ -692,6 +742,7 @@ acceptance confirms them on the operator's Proxmox host.
 | Screenshots show secrets on the guest's screen | Images live in memory only on the node and are never logged. The size cap and optional downscale apply. Retention is a platform concern: by default the platform keeps no screenshot beyond the tool result unless a flow's evidence bundle (#14122) asks for one. Pixel redaction is not attempted, because it cannot be done reliably. Per-VM masking rectangles are a possible later slice. Agents never type secrets, and the operator does secret entry, such as a login, by hand in the PVE console. |
 | Keystroke content in audit | No typed text anywhere: `jobprivacy` drops `sequence` and `keys`, handler logs carry counts, and platform audit (#13652) carries counts. A hash of typed text is not recorded either, because short text is cheap to brute-force from a hash. |
 | Two jobs interleaving input on one VM | The per-VM lock (section 3.6). |
+| A human's console and the node race on the per-display VNC password | One retry with a fresh vncproxy call, then `vnc_auth_raced`. It is never reported as a revoked token. The shared flag keeps an established human session connected. |
 | Stuck modifier or button after a failure | Release-before-close on every exit path, pinned by tests. |
 | Hostile or broken RFB server (memory, CPU) | Bounded rects and framebuffer, deadlines on every read, a closed set of encodings, and a per-node session cap. |
 | Interaction with the desktop gate | Separate permission and separate handlers, with no shared capture or input path. The passcode throttle is shared on purpose, so wrong guesses on either surface count together. |
@@ -738,7 +789,11 @@ a renewed leaf and refuses a foreign CA; a fingerprint pin refuses any other
 leaf; a redirect is refused; a proxy environment variable is ignored; a
 group-readable or foreign-owned or symlinked token is refused; an error body
 containing a sentinel never appears in an error; a URL with a ticket never
-appears in a dial error.
+appears in a dial error; a 401 maps to `pve_auth_refused`, a 403 to
+`pve_forbidden`, and a missing VM config to `vm_not_on_pve_node`; a failed
+RFB SecurityResult triggers exactly one fresh vncproxy call, then
+`vnc_auth_raced`; a websocket opened after the fake listener's 10 s window
+fails with a bounded error.
 
 **S4. Operator commands.** Sonnet review. `citadel vm-console ...` and
 `citadel permission vm-console`, the `/access/permissions` check, the
@@ -747,6 +802,14 @@ only; a token with an extra privilege, or with `VM.Console` on `/vms` or a
 pool, is refused with the privilege and path named; `status` prints no
 secret; `remove` deletes the secret file; every command's tests run against
 a `t.TempDir()` config dir, never the real node config dir.
+
+**Native checkpoint, after S1, S3 and S4 merge and before S5 and S6
+start.** The operator runs `citadel vm-console test` against the Windows test
+VM. It is read-only: it sends no input and saves no image, so it falls under
+the post-merge acceptance rule. It answers the builder checks in section 4.5
+(the security type, the SANs, the shared session, the -257 report, the
+password race) on the real host. If the transport assumption is wrong, two
+Opus-reviewed handler slices are not yet built on it.
 
 **S5. Permission, gate, screenshot handler, advertisement.** Opus review:
 yes. `Permissions.VMConsole`, `IsSensitiveCategory`, refusal of remote
