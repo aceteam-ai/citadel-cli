@@ -113,6 +113,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		sawScreencastFrame.Store(true)
 		holder.set(f.jpeg)
 	}
+	fsess, hasFileAttach := s.session.(FileAttachSession)
+	var attachBusy atomic.Bool
 	tsess, hasTargets := s.session.(TargetSession)
 	var snap TargetSnapshot
 	var cdp *cdpClient
@@ -189,6 +191,40 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 						case <-ctx.Done():
 							return
 						}
+					case InputTypeFileAttach:
+						// Only a session that offers it handles it; any other
+						// ignores the input. One attach at a time, off the
+						// reader so pongs and input keep flowing.
+						if !hasFileAttach {
+							continue
+						}
+						push := func(r FileAttachResult) {
+							b, merr := json.Marshal(r)
+							if merr != nil {
+								return
+							}
+							var msg map[string]any
+							if json.Unmarshal(b, &msg) != nil {
+								return
+							}
+							select {
+							case uiMessages <- msg:
+							case <-ctx.Done():
+							}
+						}
+						if !attachBusy.CompareAndSwap(false, true) {
+							push(FileAttachResult{Type: FileAttachResultType, Error: "busy"})
+							continue
+						}
+						go func(m InputMessage) {
+							defer attachBusy.Store(false)
+							reason := fsess.AttachStagedFile(ctx, id, m.BackendNodeID, m.StagedName)
+							if reason != "" {
+								push(FileAttachResult{Type: FileAttachResultType, Error: reason})
+								return
+							}
+							push(FileAttachResult{Type: FileAttachResultType, OK: true, StagedName: m.StagedName})
+						}(m)
 					case InputTypeTargetSwitch, InputTypeTargetClose:
 						if !hasTargets {
 							continue
@@ -236,6 +272,36 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		if !s.sendTargets(conn, snap, &lastTargets) {
 			return
 		}
+	}
+
+	var fileTick <-chan time.Time
+	var lastFileChooser []byte
+	if hasFileAttach {
+		t := time.NewTicker(targetPollPeriod)
+		defer t.Stop()
+		fileTick = t.C
+	}
+	// sendFileChooser tells the viewer the pending chooser and staged files
+	// when they differ from the last frame sent (always once, so a viewer
+	// learns the node supports attach).
+	sendFileChooser := func() bool {
+		msg, ok := fsess.FileChooser(id)
+		if !ok {
+			msg = FileChooserMessage{Type: FileChooserType, Staged: []StagedFileInfo{}}
+		}
+		b, merr := json.Marshal(msg)
+		if merr != nil || bytes.Equal(b, lastFileChooser) {
+			return true
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+		if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+			return false
+		}
+		lastFileChooser = b
+		return true
+	}
+	if hasFileAttach && !sendFileChooser() {
+		return
 	}
 
 	// syncTargets reads the pages, tells the viewer about changes, and moves
@@ -339,6 +405,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				case <-time.After(200 * time.Millisecond):
 				}
 			default:
+			}
+		case <-fileTick:
+			if !sendFileChooser() {
+				return
 			}
 		case <-targetTick:
 			if !syncTargets(false) {

@@ -150,10 +150,40 @@ dispatches on that isolated object; any mismatch is `ErrTargetChanged`,
 returned unchanged; status
 reports `file_upload_page_fence: expected_url_v1`. The worker acks a `stage_file` entry with
 `AckStagedFileJob` (XACK then XDEL, no payload decoding); other actions use the
-plain ack (API mode has no equivalent yet). Human
-attach during handoff is #1723. Page-tracking (local) sessions get none of this.
+plain ack (API mode has no equivalent yet). Page-tracking (local) sessions get
+none of this.
 `TestCobrowseRealBrowserFileUpload` and `TestWindowsRealBrowserFileUpload` are
 the real-browser acceptance.
+
+`platform.CobrowseSessionManager.HumanAttachStagedFile` owns the human's answer
+to a pending file chooser (#1723): a `file_attach` stream input
+(`cobrowsestream.InputTypeFileAttach`), not a job action, MCP tool or HTTP route,
+so `fileAttachManagerSession` in `cobrowsestream/adapter.go` is its only caller
+(`TestOnlyTheStreamAdapterCallsHumanAttach`; `TestNoLocalMCPToolCanAttachAsHuman`
+and `TestCobrowseSession_NoActionReachesHumanFileAttach` pin the agent side).
+`fileFill`/`fillFileInput` is the one dispatch path both it and `set_file_input`
+use (isolated world, `checkFileInput`, `setFilesIfPageIs`, `redactPath`); the two
+differ only in their fences. The agent's "refused while a human drives" becomes
+`humanAttachFence` (requesting viewer connection still open, the captured
+chooser still pending by pointer, then `humanControlFence`: viewer attached and
+`explicitHandoff`), run after the lookups and again after the final frame read,
+immediately before `DOM.setFileInputFiles`. A frame mismatch also drops that
+stale chooser. And `expected_url` becomes the chooser binding:
+the node id must be the pending chooser's, the chooser must still be the pending
+one, and the frame URL `watchChooserOnce` read from `Page.getFrameTree` when the
+chooser opened (`FileChooserPending.FrameURL`) must still be the frame's URL at
+dispatch, since only a main-frame navigation clears a chooser. The node manager
+has no per-session action lock: agent actions and the human attach are kept apart
+only by the `explicitHandoff` flag, each checking it right before dispatch with
+no lock held across the CDP call, so a handoff or resume landing in that gap can
+let both dispatch (the gap every agent action already has; `attachMu` only
+serializes human attaches). Files is read live (`SetFilesAllowed`, wired from `nodeFilesEnabled` in
+`startCobrowseStreamServer`, nil denies) on the offer, up front and again before
+dispatch. `HumanFileAttachSupported` is false for a page-tracking manager, so
+local mode never gets the `file_chooser` frame or handles the input. The audit is
+a `[cobrowse] audit file_attach actor=human` log line (name, size, sha256), like
+`stage_file` and `set_file_input`; the target-event sink is local-mode only.
+Errors reach the viewer only as the fixed codes `AttachFailureReason` returns.
 
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
 per-domain write grant (default deny, see the next paragraph), the abuse limits, the

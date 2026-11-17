@@ -484,90 +484,125 @@ func (m *CobrowseSessionManager) SetFileInput(id, selector string, backendNodeID
 		return CobrowseSessionStatus{}, err
 	}
 	return s.runAction(b, p, "set_file_input", func(r *actionRun) error {
-		// 1. Which frame owns the target. A chooser names its own frame; a
-		// selector is looked up in the main frame.
-		frameID := chooserFrame
-		if backendNodeID == 0 {
-			tree, err := r.conn.Call("Page.getFrameTree", nil)
-			if err != nil {
-				return err
-			}
-			frameID = rootFrameID(tree)
-		}
-		if frameID == "" {
-			return ErrTargetChanged
-		}
-		// 2. The frame's URL from the browser, not from page script.
-		if err := checkFrameURL(r.conn, frameID, expectedURL); err != nil {
-			return err
-		}
-		// 3. Resolve the target inside an isolated world of that frame, whose
-		// prototypes the page cannot have replaced.
-		w, err := r.conn.Call("Page.createIsolatedWorld", map[string]any{"frameId": frameID, "worldName": "citadel-upload"})
+		err := s.fillFileInput(r.conn, r.eff, fileFill{
+			selector: selector, backendNodeID: backendNodeID, chooserFrame: chooserFrame,
+			expectedURL: expectedURL, path: path, file: file,
+			fence:       r.fence,
+			driverFence: func() error { return s.driverFence(r.p) },
+		})
 		if err != nil {
 			return err
 		}
-		ctxID, ok := w["executionContextId"].(float64)
-		if !ok || ctxID == 0 {
-			return ErrTargetChanged
-		}
-		var objectID string
-		var nodeID int
-		if selector != "" {
-			res, err := r.conn.Call("Runtime.evaluate", map[string]any{
-				"expression": fmt.Sprintf("document.querySelector(%s)", jsStringLiteral(selector)),
-				"contextId":  int(ctxID),
-			})
-			if err != nil {
-				return ErrTargetChanged
-			}
-			obj, _ := res["result"].(map[string]any)
-			objectID, _ = obj["objectId"].(string)
-			if objectID == "" {
-				return fmt.Errorf("no element matches selector %q", selector)
-			}
-			if err := checkFileInput(r.conn, objectID); err != nil {
-				return fmt.Errorf("selector %q: %w", selector, err)
-			}
-			if d, err := r.conn.Call("DOM.describeNode", map[string]any{"objectId": objectID}); err == nil {
-				if node, ok := d["node"].(map[string]any); ok {
-					if n, ok := node["backendNodeId"].(float64); ok {
-						nodeID = int(n)
-					}
-				}
-			} else {
-				// The node cannot be identified, so a pending chooser could
-				// not be matched to it: do not leave a stale one behind.
-				s.clearChooser()
-			}
-		} else {
-			res, err := r.conn.Call("DOM.resolveNode", map[string]any{"backendNodeId": backendNodeID, "executionContextId": int(ctxID)})
-			if err != nil {
-				return ErrTargetChanged
-			}
-			obj, _ := res["object"].(map[string]any)
-			objectID, _ = obj["objectId"].(string)
-			if objectID == "" {
-				// Not a node of that frame (or gone).
-				return ErrTargetChanged
-			}
-			if err := checkFileInput(r.conn, objectID); err != nil {
-				return err
-			}
-			nodeID = backendNodeID
-		}
-		// 4. The lookups await the page: check the page, then (inside
-		// setFilesIfPageIs) re-read the frame URL, check the driver, dispatch.
-		if err := r.fence(); err != nil {
-			return err
-		}
-		err = setFilesIfPageIs(r.conn, frameID, objectID, expectedURL, []string{path}, func() error { return s.driverFence(r.p) }, r.eff)
-		if err != nil {
-			// Never return the node's absolute path to the platform.
-			return redactPath(err, path, file.Name)
-		}
-		s.clearChooserFor(nodeID)
 		log.Printf("[cobrowse] audit set_file_input session=%s name=%q size=%d sha256=%s", id, file.Name, file.Size, file.SHA256)
 		return nil
 	})
+}
+
+// fileFill is one fill of a file input by the shared dispatch path. The two
+// callers (the agent's set_file_input and the human's viewer attach) differ only
+// in which fences run: the agent's refuses while a human drives and requires
+// expected_url; the human's requires live viewer control and the URL the
+// pending chooser's frame had when it opened.
+type fileFill struct {
+	selector      string
+	backendNodeID int
+	// chooserFrame is the frame that owns a chooser's input (backend node path).
+	chooserFrame string
+	expectedURL  string
+	path         string
+	file         StagedFile
+	// fence runs after the lookups, before the final frame URL read.
+	fence func() error
+	// driverFence runs after that read, immediately before the dispatch.
+	driverFence func() error
+}
+
+// fillFileInput resolves the target inside an isolated world of its frame,
+// proves it is an enabled file input, and hands the browser the staged path
+// through setFilesIfPageIs. The staged file was resolved before any CDP call.
+func (s *cobrowseSession) fillFileInput(c cdpCaller, eff *ActionEffects, f fileFill) error {
+	// 1. Which frame owns the target. A chooser names its own frame; a
+	// selector is looked up in the main frame.
+	frameID := f.chooserFrame
+	if f.backendNodeID == 0 {
+		tree, err := c.Call("Page.getFrameTree", nil)
+		if err != nil {
+			return err
+		}
+		frameID = rootFrameID(tree)
+	}
+	if frameID == "" {
+		return ErrTargetChanged
+	}
+	// 2. The frame's URL from the browser, not from page script.
+	if err := checkFrameURL(c, frameID, f.expectedURL); err != nil {
+		return err
+	}
+	// 3. Resolve the target inside an isolated world of that frame, whose
+	// prototypes the page cannot have replaced.
+	w, err := c.Call("Page.createIsolatedWorld", map[string]any{"frameId": frameID, "worldName": "citadel-upload"})
+	if err != nil {
+		return err
+	}
+	ctxID, ok := w["executionContextId"].(float64)
+	if !ok || ctxID == 0 {
+		return ErrTargetChanged
+	}
+	var objectID string
+	var nodeID int
+	if f.selector != "" {
+		res, err := c.Call("Runtime.evaluate", map[string]any{
+			"expression": fmt.Sprintf("document.querySelector(%s)", jsStringLiteral(f.selector)),
+			"contextId":  int(ctxID),
+		})
+		if err != nil {
+			return ErrTargetChanged
+		}
+		obj, _ := res["result"].(map[string]any)
+		objectID, _ = obj["objectId"].(string)
+		if objectID == "" {
+			return fmt.Errorf("no element matches selector %q", f.selector)
+		}
+		if err := checkFileInput(c, objectID); err != nil {
+			return fmt.Errorf("selector %q: %w", f.selector, err)
+		}
+		if d, err := c.Call("DOM.describeNode", map[string]any{"objectId": objectID}); err == nil {
+			if node, ok := d["node"].(map[string]any); ok {
+				if n, ok := node["backendNodeId"].(float64); ok {
+					nodeID = int(n)
+				}
+			}
+		} else {
+			// The node cannot be identified, so a pending chooser could
+			// not be matched to it: do not leave a stale one behind.
+			s.clearChooser()
+		}
+	} else {
+		res, err := c.Call("DOM.resolveNode", map[string]any{"backendNodeId": f.backendNodeID, "executionContextId": int(ctxID)})
+		if err != nil {
+			return ErrTargetChanged
+		}
+		obj, _ := res["object"].(map[string]any)
+		objectID, _ = obj["objectId"].(string)
+		if objectID == "" {
+			// Not a node of that frame (or gone).
+			return ErrTargetChanged
+		}
+		if err := checkFileInput(c, objectID); err != nil {
+			return err
+		}
+		nodeID = f.backendNodeID
+	}
+	// 4. The lookups await the page: check the page, then (inside
+	// setFilesIfPageIs) re-read the frame URL, check the driver, dispatch.
+	if err := f.fence(); err != nil {
+		return err
+	}
+	err = setFilesIfPageIs(c, frameID, objectID, f.expectedURL, []string{f.path}, f.driverFence, eff)
+	if err != nil {
+		// Never return the node's absolute path to the platform.
+		return redactPath(err, f.path, f.file.Name)
+	}
+	s.clearChooserFor(nodeID)
+	return nil
 }
