@@ -126,6 +126,13 @@ type CobrowseSessionStatus struct {
 	// and would append instead of replace. Reported only by non-tracking
 	// sessions, like FileUploadPageFence.
 	InputEdit string `json:"input_edit,omitempty"`
+	// PageText and PasswordField are page content signals for the platform's
+	// login-wall detection (aceteam#13773). Set only by WithPageSignals on a
+	// node-wide session's start and single-session status result; omitted on
+	// any failure, handoff, refused page or tracking session. PageText is
+	// never logged or stored.
+	PageText      string `json:"page_text,omitempty"`
+	PasswordField *bool  `json:"password_field,omitempty"`
 	// FirstLoad is "pending" while the start URL has not yet replaced the
 	// initial about:blank (StartSession returned before the browser's own
 	// navigation committed). The first status read that sees another page

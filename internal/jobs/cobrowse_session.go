@@ -122,7 +122,7 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 			}
 			return nil, fmt.Errorf("no such browser session: %q", id)
 		}
-		return sessionStatusResult(st)
+		return sessionStatusResult(mgr.WithPageSignals(st))
 
 	case CobrowseSessionActionStop:
 		id := job.Payload["session_id"]
@@ -425,7 +425,7 @@ func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte,
 		if err != nil {
 			return nil, err
 		}
-		return sessionStatusResult(st)
+		return sessionStatusResult(mgr.WithPageSignals(st))
 	}
 
 	pin := job.Payload["pin"]
@@ -452,7 +452,7 @@ func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	return sessionStatusResult(st)
+	return sessionStatusResult(mgr.WithPageSignals(st))
 }
 
 // sessionStreamInfo is the additive stream-endpoint hint carried on start/status
