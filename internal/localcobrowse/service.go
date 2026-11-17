@@ -1253,12 +1253,6 @@ func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platfor
 		unverifiable: a.Kind != "navigate" && (!t.Resolved || t.Oversized),
 		tooLarge:     t.Oversized,
 	}
-	for _, file := range t.FormFiles {
-		file.Field = sanitizeLabel(file.Field)
-		file.Name = sanitizeLabel(file.Name)
-		file.Type = sanitizeLabel(file.Type)
-		pc.files = append(pc.files, file)
-	}
 	ss.commit = pc
 	ss.lastCommit, ss.result = "", nil
 	s.notifyLocked()
@@ -1458,7 +1452,6 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 	if c := ss.commit; c != nil && now.Sub(c.requestedAt) < PendingCommitTTL {
 		cv := &CommitView{Unverifiable: c.unverifiable, ID: c.id, Domain: c.domain, Action: c.action, Label: c.label, Reason: c.reason,
 			RequestedAt: c.requestedAt.UTC().Format(time.RFC3339), HasShot: c.shot != ""}
-		cv.Files = append([]platform.FormFile(nil), c.files...)
 		if c.rect.W > 0 && c.rect.H > 0 {
 			r := c.rect
 			cv.Rect = &r

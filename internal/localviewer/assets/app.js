@@ -215,9 +215,6 @@
     $("commit-action").textContent = c.action;
     $("commit-domain").textContent = c.domain;
     $("commit-reason").textContent = "Why you are asked: " + c.reason + ".";
-    if (c.files && c.files.length) {
-      $("commit-reason").textContent += " Attached files: " + c.files.map(f => f.name + " (" + f.size + " bytes)").join(", ") + ".";
-    }
     $("commit-approve").hidden = !!c.unverifiable;
     if (c.unverifiable) $("commit-reason").textContent += " Citadel cannot verify this one, so it cannot be done for you: do it yourself in the browser, or deny it.";
     if (commitShown === c.id || !c.has_shot) return;
