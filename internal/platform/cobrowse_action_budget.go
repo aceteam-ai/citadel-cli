@@ -71,6 +71,10 @@ type ActionEffects struct {
 	// previous content (an empty clear: the field read back empty; a replace:
 	// the replacement text was acknowledged). Never the content itself.
 	Cleared bool `json:"cleared"`
+	// ClearedUnconfirmed is true when the destructive event (the replacing
+	// insert, or the delete) was sent but its outcome was not confirmed: the
+	// content may already be gone. Cleared on read-back, like TypedUnconfirmed.
+	ClearedUnconfirmed bool `json:"cleared_unconfirmed,omitempty"`
 	// FilesSet is the number of files handed to a file input by set_file_input.
 	FilesSet int `json:"files_set,omitempty"`
 	// Navigated is true when the page URL differs from before the action.
@@ -84,7 +88,7 @@ type ActionEffects struct {
 // anyEffect reports whether the page is known or likely to have changed.
 // Dispatched alone is not an effect: it only says input may have been sent.
 func (e ActionEffects) anyEffect() bool {
-	return e.Scrolled || e.Focused || e.Clicked || e.TypedLength > 0 || e.Cleared || e.Navigated || e.FilesSet > 0
+	return e.Scrolled || e.Focused || e.Clicked || e.TypedLength > 0 || e.Cleared || e.ClearedUnconfirmed || e.Navigated || e.FilesSet > 0
 }
 
 // ActionIncompleteError is returned when an action hit its deadline or failed
@@ -118,6 +122,9 @@ func (e *ActionIncompleteError) Error() string {
 	}
 	if e.Effects.FilesSet > 0 {
 		parts = append(parts, fmt.Sprintf("set %d file(s) on a file input", e.Effects.FilesSet))
+	}
+	if e.Effects.ClearedUnconfirmed {
+		parts = append(parts, "cleared the field (unconfirmed)")
 	}
 	if e.Effects.Cleared {
 		parts = append(parts, "cleared the field")

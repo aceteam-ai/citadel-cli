@@ -560,7 +560,8 @@ func parseTypeAction(payload map[string]string) (string, string, platform.TypeOp
 }
 
 // parseKeyAction validates a key payload: session_id, key, and the optional
-// modifiers bitmask, a base-10 integer 0 to 15 (anything else is refused).
+// modifiers bitmask, a base-10 integer 0 to 15, limited to the
+// platform.CheckKeyChord allowlist (anything else is refused).
 func parseKeyAction(payload map[string]string) (string, string, int, error) {
 	id, key := payload["session_id"], payload["key"]
 	if id == "" || key == "" {
@@ -573,6 +574,9 @@ func parseKeyAction(payload map[string]string) (string, string, int, error) {
 			return "", "", 0, platform.ErrModifiersOutRange
 		}
 		mods = n
+	}
+	if err := platform.CheckKeyChord(key, mods); err != nil {
+		return "", "", 0, err
 	}
 	return id, key, mods, nil
 }

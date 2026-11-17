@@ -13,28 +13,63 @@ type editFake struct {
 	*latencyCDP
 	mu    sync.Mutex
 	steps []string
-	// focus, selectRes and empty are what the page answers for each step.
-	focus, selectRes, empty map[string]any
+	// focusRes is the RemoteObject the focus and target scripts answer with.
+	focusRes map[string]any
+	// selectRes and empty are what the bound select and empty steps answer;
+	// verify is the bound verify answer.
+	selectRes, empty, verify map[string]any
+	// loaders is the loaderId returned by successive getFrameTree calls (the
+	// last one repeats).
+	loaders []string
+	loaderN int
 	// keys records every key event's params.
 	keys []map[string]any
 }
 
-func newEditFake(t *testing.T) (*editFake, *CobrowseSessionManager, string) {
+func newEditFake(t *testing.T, mutate ...func(*latencyCDP)) (*editFake, *CobrowseSessionManager, string) {
 	t.Helper()
 	e := &editFake{
-		focus:     map[string]any{"ok": true, "tag": "input"},
+		focusRes:  map[string]any{"type": "object", "subtype": "node", "objectId": "obj-1", "className": "HTMLInputElement"},
 		selectRes: map[string]any{"ok": true},
 		empty:     map[string]any{"empty": true},
+		verify:    map[string]any{"ok": true},
+		loaders:   []string{"L1"},
 	}
 	e.latencyCDP = startLatencyCDP(t, func(f *latencyCDP) {
+		for _, mu := range mutate {
+			mu(f)
+		}
 		f.evalHook = func(expr string) (any, bool) {
-			switch {
-			case strings.Contains(expr, "/*edit:focus*/"):
-				return e.focus, true
-			case strings.Contains(expr, "/*edit:select*/"):
-				return e.selectRes, true
-			case strings.Contains(expr, "/*edit:empty*/"):
-				return e.empty, true
+			if strings.Contains(expr, "/*edit:focus*/") || strings.Contains(expr, "/*edit:target*/") {
+				e.mu.Lock()
+				defer e.mu.Unlock()
+				return rawRemote(e.focusRes), true
+			}
+			return nil, false
+		}
+		f.callHook = func(method string, params map[string]any) (map[string]any, bool) {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			switch method {
+			case "Page.getFrameTree":
+				i := e.loaderN
+				if i >= len(e.loaders) {
+					i = len(e.loaders) - 1
+				}
+				e.loaderN++
+				return map[string]any{"frameTree": map[string]any{"frame": map[string]any{"loaderId": e.loaders[i]}}}, true
+			case "Runtime.callFunctionOn":
+				fn, _ := params["functionDeclaration"].(string)
+				var v map[string]any
+				switch {
+				case strings.Contains(fn, "/*edit:select*/"):
+					v = e.selectRes
+				case strings.Contains(fn, "/*edit:verify*/"):
+					v = e.verify
+				case strings.Contains(fn, "/*edit:empty*/"):
+					v = e.empty
+				}
+				return map[string]any{"result": map[string]any{"type": "object", "value": v}}, true
 			}
 			return nil, false
 		}
@@ -56,14 +91,20 @@ func newEditFake(t *testing.T) (*editFake, *CobrowseSessionManager, string) {
 func (e *editFake) record(method string, params map[string]any) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	switch method {
-	case "Runtime.evaluate":
-		expr, _ := params["expression"].(string)
-		for _, k := range []string{"focus", "select", "empty"} {
-			if strings.Contains(expr, "/*edit:"+k+"*/") {
+	marker := func(s string) {
+		for _, k := range []string{"focus", "target", "select", "empty"} {
+			if strings.Contains(s, "/*edit:"+k+"*/") {
 				e.steps = append(e.steps, "edit:"+k)
 			}
 		}
+	}
+	switch method {
+	case "Runtime.evaluate":
+		expr, _ := params["expression"].(string)
+		marker(expr)
+	case "Runtime.callFunctionOn":
+		fn, _ := params["functionDeclaration"].(string)
+		marker(fn)
 	case "Input.insertText":
 		e.steps = append(e.steps, "insert")
 	case "Input.dispatchKeyEvent":
@@ -90,7 +131,7 @@ func TestTypeWithStepOrderReplace(t *testing.T) {
 		t.Fatalf("steps = %s", got)
 	}
 	ef := st.Effects
-	if ef == nil || !ef.Focused || ef.FocusTag != "input" || !ef.Cleared || ef.TypedLength != 9 || ef.TypedUnconfirmed {
+	if ef == nil || !ef.Focused || ef.FocusTag != "input" || !ef.Cleared || ef.ClearedUnconfirmed || ef.TypedLength != 9 || ef.TypedUnconfirmed {
 		t.Fatalf("effects = %+v", ef)
 	}
 	if st.InputEdit != InputEditV1 {
@@ -110,7 +151,7 @@ func TestTypeWithSelectorOnlyAndClearOnly(t *testing.T) {
 	if _, err := m2.TypeWith(id2, "x", TypeOptions{Clear: true}); err != nil {
 		t.Fatal(err)
 	}
-	if got := e2.got(); got != "edit:select,insert" {
+	if got := e2.got(); got != "edit:target,edit:select,insert" {
 		t.Fatalf("clear only: %s", got)
 	}
 }
@@ -134,7 +175,7 @@ func TestTypeWithEmptyClearDeletesAndVerifies(t *testing.T) {
 	if got := e.got(); got != "edit:focus,edit:select,rawKeyDown:Backspace,keyUp:Backspace,edit:empty" {
 		t.Fatalf("steps = %s", got)
 	}
-	if !st.Effects.Cleared || st.Effects.TypedLength != 0 {
+	if !st.Effects.Cleared || st.Effects.ClearedUnconfirmed || st.Effects.TypedLength != 0 {
 		t.Fatalf("effects = %+v", st.Effects)
 	}
 }
@@ -149,6 +190,27 @@ func TestTypeWithEmptyClearThatLeavesContentFails(t *testing.T) {
 	}
 	if ae.Effects.Cleared || !ae.Effects.Dispatched || !ae.Effects.Focused {
 		t.Fatalf("effects = %+v", ae.Effects)
+	}
+}
+
+// A lost insert acknowledgement leaves the field possibly replaced: the report
+// says so as unconfirmed, never as not cleared.
+func TestTypeWithLostInsertAckReportsClearUnconfirmed(t *testing.T) {
+	_, m, id := newEditFake(t, func(f *latencyCDP) { f.dropOn = map[string]bool{"Input.insertText": true} })
+	_, err := m.TypeWith(id, "replacement", TypeOptions{Selector: "#f", Clear: true})
+	ae, ok := AsActionIncomplete(err)
+	if !ok {
+		t.Fatalf("err = %v, want incomplete", err)
+	}
+	ef := ae.Effects
+	if ef.Cleared || !ef.ClearedUnconfirmed || !ef.TypedUnconfirmed || ef.TypedLength != 11 || !ef.Dispatched {
+		t.Fatalf("effects = %+v", ef)
+	}
+	if strings.Contains(err.Error(), "replacement") {
+		t.Fatalf("error leaks the text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cleared the field (unconfirmed)") {
+		t.Fatalf("error does not say the clear is unconfirmed: %v", err)
 	}
 }
 
@@ -183,15 +245,60 @@ func TestTypeWithValidationRefusalsDispatchNothing(t *testing.T) {
 	}
 }
 
+func TestCheckKeyChordAllowlist(t *testing.T) {
+	allowed := []struct {
+		key string
+		mod int
+	}{
+		{"Enter", 0}, {"v", 0}, {"a", ModCtrl}, {"A", ModCtrl}, {"z", ModCtrl}, {"y", ModCtrl},
+		{"a", ModMeta}, {"z", ModMeta}, {"y", ModMeta}, {"a", ModShift}, {"Tab", ModShift}, {"Delete", 0},
+		{"ArrowLeft", ModCtrl}, {"Home", ModCtrl}, {"End", ModCtrl}, {"Backspace", ModCtrl}, {"Delete", ModCtrl},
+		{"ArrowRight", ModAlt}, {"Backspace", ModAlt}, {"Delete", ModAlt}, {"ArrowUp", ModShift},
+	}
+	for _, c := range allowed {
+		if err := CheckKeyChord(c.key, c.mod); err != nil {
+			t.Errorf("%s+%d: %v", c.key, c.mod, err)
+		}
+	}
+	refused := []struct {
+		key string
+		mod int
+	}{
+		{"v", ModCtrl}, {"c", ModCtrl}, {"x", ModCtrl}, {"v", ModMeta}, {"c", ModMeta}, {"x", ModMeta},
+		{"Delete", ModShift}, {"a", ModAlt}, {"b", ModAlt}, {"a", ModCtrl | ModShift}, {"z", ModCtrl | ModShift},
+		{"a", ModCtrl | ModAlt}, {"Home", ModMeta}, {"Enter", ModCtrl}, {"v", ModCtrl | ModShift},
+		{"ArrowLeft", ModAlt | ModShift},
+	}
+	for _, c := range refused {
+		if err := CheckKeyChord(c.key, c.mod); !errors.Is(err, ErrKeyChordNotAllowed) {
+			t.Errorf("%s+%d: err = %v, want a refusal", c.key, c.mod, err)
+		}
+	}
+}
+
+func TestKeyWithRefusedChordDispatchesNothing(t *testing.T) {
+	e, m, id := newEditFake(t)
+	for _, c := range []struct {
+		key string
+		mod int
+	}{{"v", ModCtrl}, {"c", ModCtrl}, {"x", ModMeta}, {"Delete", ModShift}, {"a", ModAlt}} {
+		if _, err := m.KeyWith(id, c.key, c.mod); !errors.Is(err, ErrKeyChordNotAllowed) {
+			t.Fatalf("%s+%d: err = %v", c.key, c.mod, err)
+		}
+	}
+	if got := e.got(); got != "" || e.dials.Load() != 0 {
+		t.Fatalf("a refused chord dispatched: %q (%d dials)", got, e.dials.Load())
+	}
+}
+
 func TestTypeWithSelectorRefusalsTypeNothing(t *testing.T) {
-	for name, res := range map[string]map[string]any{
-		"matches nothing":    {"error": "no element matches the selector"},
-		"not editable":       {"error": "the selector does not match an editable field"},
-		"did not take focus": {"error": "the field did not take focus"},
+	for name, msg := range map[string]string{
+		"matches nothing": "no element matches the selector",
+		"not editable":    "the selector does not match an editable field",
 	} {
 		t.Run(name, func(t *testing.T) {
 			e, m, id := newEditFake(t)
-			e.focus = res
+			e.focusRes = map[string]any{"type": "string", "value": msg}
 			_, err := m.TypeWith(id, "secret", TypeOptions{Selector: "#nope", Clear: true})
 			if err == nil {
 				t.Fatal("want a refusal")
@@ -209,9 +316,27 @@ func TestTypeWithSelectorRefusalsTypeNothing(t *testing.T) {
 	}
 }
 
+// focus() already ran when the field did not take it, so the action counts as
+// dispatched and is reported, not refused as a no-op.
+func TestTypeWithNoFocusAfterFocusRanIsDispatched(t *testing.T) {
+	e, m, id := newEditFake(t)
+	e.focusRes = map[string]any{"type": "string", "value": "!the field did not take focus"}
+	_, err := m.TypeWith(id, "secret", TypeOptions{Selector: "#f", Clear: true})
+	ae, ok := AsActionIncomplete(err)
+	if !ok || !ae.Effects.Dispatched {
+		t.Fatalf("err = %v, want an incomplete action with Dispatched", err)
+	}
+	if strings.Contains(err.Error(), "!") {
+		t.Fatalf("marker leaked into the error: %v", err)
+	}
+	if got := e.got(); got != "edit:focus" {
+		t.Fatalf("steps = %s", got)
+	}
+}
+
 func TestTypeWithClearOfNonEditableFocusRefuses(t *testing.T) {
 	e, m, id := newEditFake(t)
-	e.selectRes = map[string]any{"error": "the focused element is not an editable field"}
+	e.focusRes = map[string]any{"type": "string", "value": "the focused element is not an editable field"}
 	_, err := m.TypeWith(id, "x", TypeOptions{Clear: true})
 	if err == nil {
 		t.Fatal("want a refusal")
@@ -219,8 +344,45 @@ func TestTypeWithClearOfNonEditableFocusRefuses(t *testing.T) {
 	if _, inc := AsActionIncomplete(err); inc {
 		t.Fatalf("nothing changed, so the refusal stays plain: %v", err)
 	}
-	if got := e.got(); got != "edit:select" {
+	if got := e.got(); got != "edit:target" {
 		t.Fatalf("steps = %s", got)
+	}
+}
+
+// A selection that is not the whole content refuses with nothing typed.
+func TestTypeWithPartialSelectionRefuses(t *testing.T) {
+	e, m, id := newEditFake(t)
+	e.selectRes = map[string]any{"error": "the selection does not span the whole field"}
+	_, err := m.TypeWith(id, "x", TypeOptions{Selector: "#f", Clear: true})
+	if err == nil {
+		t.Fatal("want a refusal")
+	}
+	if got := e.got(); got != "edit:focus,edit:select" {
+		t.Fatalf("steps = %s", got)
+	}
+}
+
+// Focus moving away, or the page navigating, between the steps and the
+// destructive event refuses with ErrTargetChanged and types nothing.
+func TestTypeWithTargetChangedBeforeInsertTypesNothing(t *testing.T) {
+	cases := map[string]func(e *editFake){
+		"focus moved":    func(e *editFake) { e.verify = map[string]any{"ok": false} },
+		"page navigated": func(e *editFake) { e.loaders = []string{"L1", "L2"} },
+	}
+	for name, mutate := range cases {
+		for _, text := range []string{"replacement", ""} {
+			t.Run(name+"/text="+text, func(t *testing.T) {
+				e, m, id := newEditFake(t)
+				mutate(e)
+				_, err := m.TypeWith(id, text, TypeOptions{Selector: "#f", Clear: true})
+				if !errors.Is(err, ErrTargetChanged) {
+					t.Fatalf("err = %v, want ErrTargetChanged", err)
+				}
+				if got := e.got(); got != "edit:focus,edit:select" {
+					t.Fatalf("steps = %s (nothing may be typed or deleted)", got)
+				}
+			})
+		}
 	}
 }
 
@@ -228,17 +390,18 @@ func TestTypeWithClearOfNonEditableFocusRefuses(t *testing.T) {
 // dispatched, and the report says what had already happened.
 func TestTypeWithHandoffBetweenStepsStopsTheAction(t *testing.T) {
 	cases := []struct {
-		name      string
-		after     string // the step during which control is handed off
-		opts      TypeOptions
-		text      string
-		wantSteps string
-		focused   bool
+		name        string
+		after       string // the step during which control is handed off
+		opts        TypeOptions
+		text        string
+		wantSteps   string
+		focused     bool
+		unconfirmed bool
 	}{
-		{"after focus", "edit:focus", TypeOptions{Selector: "#f", Clear: true}, "x", "edit:focus", true},
-		{"after select", "edit:select", TypeOptions{Selector: "#f", Clear: true}, "x", "edit:focus,edit:select", true},
-		{"after key down", "rawKeyDown:Backspace", TypeOptions{Selector: "#f", Clear: true}, "", "edit:focus,edit:select,rawKeyDown:Backspace", true},
-		{"after key up", "keyUp:Backspace", TypeOptions{Clear: true}, "", "edit:select,rawKeyDown:Backspace,keyUp:Backspace", false},
+		{"after focus", "edit:focus", TypeOptions{Selector: "#f", Clear: true}, "x", "edit:focus", true, false},
+		{"after select", "edit:select", TypeOptions{Selector: "#f", Clear: true}, "x", "edit:focus,edit:select", true, false},
+		{"after key down", "rawKeyDown:Backspace", TypeOptions{Selector: "#f", Clear: true}, "", "edit:focus,edit:select,rawKeyDown:Backspace", true, true},
+		{"after key up", "keyUp:Backspace", TypeOptions{Clear: true}, "", "edit:target,edit:select,rawKeyDown:Backspace,keyUp:Backspace", false, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -268,11 +431,53 @@ func TestTypeWithHandoffBetweenStepsStopsTheAction(t *testing.T) {
 			if got := e.got(); got != c.wantSteps {
 				t.Fatalf("steps = %s, want %s", got, c.wantSteps)
 			}
-			if ae.Effects.Focused != c.focused || ae.Effects.Cleared || !ae.Effects.Dispatched {
+			if ae.Effects.Focused != c.focused || ae.Effects.Cleared || ae.Effects.ClearedUnconfirmed != c.unconfirmed || !ae.Effects.Dispatched {
 				t.Fatalf("effects = %+v", ae.Effects)
 			}
 			if ae.Effects.TypedLength != 0 {
 				t.Fatalf("typed %d characters after the handoff", ae.Effects.TypedLength)
+			}
+		})
+	}
+}
+
+// The first fence: a handoff during the before-probe is a plain ErrHandedOff
+// and nothing is dispatched, for the edit forms of type and for key chords.
+func TestEditActionsHandoffDuringBeforeProbeSendNothing(t *testing.T) {
+	actions := map[string]func(m *CobrowseSessionManager, id string) error{
+		"type selector+clear": func(m *CobrowseSessionManager, id string) error {
+			_, err := m.TypeWith(id, "x", TypeOptions{Selector: "#f", Clear: true})
+			return err
+		},
+		"type clear": func(m *CobrowseSessionManager, id string) error {
+			_, err := m.TypeWith(id, "", TypeOptions{Clear: true})
+			return err
+		},
+		"key chord": func(m *CobrowseSessionManager, id string) error {
+			_, err := m.KeyWith(id, "a", ModCtrl)
+			return err
+		},
+	}
+	for name, run := range actions {
+		t.Run(name, func(t *testing.T) {
+			e, m, id := newEditFake(t)
+			e.latencyCDP.mu.Lock()
+			prev := e.latencyCDP.onCall
+			hand := handoffDuringProbe(m, id)
+			e.latencyCDP.onCall = func(method string, params map[string]any) {
+				prev(method, params)
+				hand(method, params)
+			}
+			e.latencyCDP.mu.Unlock()
+			err := run(m, id)
+			if !errors.Is(err, ErrHandedOff) {
+				t.Fatalf("err = %v, want ErrHandedOff", err)
+			}
+			if _, inc := AsActionIncomplete(err); inc {
+				t.Fatalf("a refusal must stay plain: %v", err)
+			}
+			if got := e.got(); got != "" {
+				t.Fatalf("dispatched after the handoff: %s", got)
 			}
 		})
 	}
@@ -332,5 +537,16 @@ func TestStatusReportsInputEdit(t *testing.T) {
 	st, ok := m.SessionStatus(id)
 	if !ok || st.InputEdit != "type_clear_key_modifiers_v1" {
 		t.Fatalf("status input_edit = %q", st.InputEdit)
+	}
+}
+
+// A page-tracking session (local mode) does not take the new fields, so it does
+// not advertise them.
+func TestTrackedSessionDoesNotReportInputEdit(t *testing.T) {
+	f := startLatencyCDP(t, nil)
+	m, id := newTrackedBudgetSession(t, f, nil)
+	st, ok := m.SessionStatus(id)
+	if !ok || st.InputEdit != "" {
+		t.Fatalf("tracked status input_edit = %q", st.InputEdit)
 	}
 }

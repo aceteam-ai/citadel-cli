@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,8 @@ const typeEditPage = `<!doctype html><title>edit</title>
 <div id="c" contenteditable="true">old editable</div>
 <input id="ro" value="locked" readonly>
 <input id="cb" type="checkbox">
+<input id="sa" value="sentinel-A">
+<input id="sb" value="">
 <button id="b" type="button">go</button>`
 
 // typeEditFields maps each field's selector to the JS expression that reads its
@@ -130,6 +133,37 @@ func runTypeEditRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 			}
 		})
 	}
+
+	// 5. Clipboard and editing chords are not allowed: they are refused, and
+	// nothing reaches the second field.
+	t.Run("clipboard chords refused", func(t *testing.T) {
+		if _, err := m.TypeWith(st.ID, "sentinel-A", TypeOptions{Selector: "#sa", Clear: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.KeyWith(st.ID, "a", ModCtrl); err != nil {
+			t.Fatalf("ctrl+a: %v", err)
+		}
+		if _, err := m.KeyWith(st.ID, "c", ModCtrl); !errors.Is(err, ErrKeyChordNotAllowed) {
+			t.Fatalf("ctrl+c: err = %v, want a refusal", err)
+		}
+		if _, err := m.Click(st.ID, "#sb", nil, nil); err != nil {
+			t.Fatalf("click: %v", err)
+		}
+		for _, c := range []struct {
+			key string
+			mod int
+		}{{"v", ModCtrl}, {"v", ModMeta}, {"x", ModCtrl}, {"Delete", ModShift}} {
+			if _, err := m.KeyWith(st.ID, c.key, c.mod); !errors.Is(err, ErrKeyChordNotAllowed) {
+				t.Fatalf("%s+%d: err = %v, want a refusal", c.key, c.mod, err)
+			}
+		}
+		if got := read(`document.getElementById("sb").value`); got != "" {
+			t.Fatalf("the second field holds %q, want it empty", got)
+		}
+		if got := read(`document.getElementById("sa").value`); got != "sentinel-A" {
+			t.Fatalf("the first field holds %q", got)
+		}
+	})
 
 	// 4. Refusals leave the page as it was.
 	t.Run("refusals", func(t *testing.T) {

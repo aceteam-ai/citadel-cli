@@ -123,7 +123,8 @@ type CobrowseSessionStatus struct {
 	// InputEdit names the type/key edit contract this node implements (type
 	// with selector and clear, key with modifiers). A caller must not send
 	// those fields to a node whose status lacks it: an older node ignores them
-	// and would append instead of replace.
+	// and would append instead of replace. Reported only by non-tracking
+	// sessions, like FileUploadPageFence.
 	InputEdit string `json:"input_edit,omitempty"`
 	// FirstLoad is "pending" while the start URL has not yet replaced the
 	// initial about:blank (StartSession returned before the browser's own
@@ -858,10 +859,10 @@ func (s *cobrowseSession) statusBase() (CobrowseSessionStatus, int) {
 		Profile:    s.profile,
 		Driver:     driverFor(s.humanDrivingLocked()),
 		Generation: s.generation,
-		InputEdit:  InputEditV1,
 	}
 	if !s.tracking {
 		st.FileUploadPageFence = FileUploadPageFenceV1
+		st.InputEdit = InputEditV1
 	}
 	if s.chooser != nil {
 		c := *s.chooser

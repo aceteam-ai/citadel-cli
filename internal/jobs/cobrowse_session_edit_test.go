@@ -47,7 +47,7 @@ func TestParseTypeAction(t *testing.T) {
 }
 
 func TestParseKeyAction(t *testing.T) {
-	for raw, want := range map[string]int{"": 0, "0": 0, "2": 2, "15": 15, "6": 6} {
+	for raw, want := range map[string]int{"": 0, "0": 0, "2": 2, "4": 4, "8": 8} {
 		p := map[string]string{"session_id": "s", "key": "a"}
 		if raw != "" {
 			p["modifiers"] = raw
@@ -61,6 +61,21 @@ func TestParseKeyAction(t *testing.T) {
 		_, _, _, err := parseKeyAction(map[string]string{"session_id": "s", "key": "a", "modifiers": raw})
 		if !errors.Is(err, platform.ErrModifiersOutRange) {
 			t.Fatalf("modifiers %q: err = %v, want refusal", raw, err)
+		}
+	}
+	// Clipboard and editing chords are not allowed.
+	for _, c := range []struct{ key, mods string }{
+		{"v", "2"}, {"c", "2"}, {"x", "2"}, {"v", "4"}, {"c", "4"}, {"x", "4"},
+		{"Delete", "8"}, {"a", "1"}, {"a", "6"}, {"a", "15"}, {"a", "10"},
+	} {
+		_, _, _, err := parseKeyAction(map[string]string{"session_id": "s", "key": c.key, "modifiers": c.mods})
+		if !errors.Is(err, platform.ErrKeyChordNotAllowed) {
+			t.Fatalf("%s+%s: err = %v, want refusal", c.mods, c.key, err)
+		}
+	}
+	for _, c := range []struct{ key, mods string }{{"ArrowLeft", "1"}, {"Home", "2"}, {"Tab", "8"}, {"z", "4"}, {"y", "2"}} {
+		if _, _, _, err := parseKeyAction(map[string]string{"session_id": "s", "key": c.key, "modifiers": c.mods}); err != nil {
+			t.Fatalf("%s+%s: %v", c.mods, c.key, err)
 		}
 	}
 	if _, _, _, err := parseKeyAction(map[string]string{"session_id": "s"}); err == nil {

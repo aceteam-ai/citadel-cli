@@ -123,12 +123,19 @@ result. Local mode returns the same details as a tool error. An approved commit
 that was dispatched and then failed resolves as `unconfirmed`, not failed.
 `TestCobrowseRealBrowserActionLatency` pins the budgets.
 `TypeWith` and `KeyWith` (#1730) own the targeted replace and key modifiers, each still one
-`runAction`: resolve and focus the selector, select the content, then insert (or a real Backspace for an
-empty clear, read back as empty), with `midActionFence` between steps. Refusals (empty text without
-`clear`, selector over `MaxCobrowseSelectorLen`, modifiers outside 0..15, a selector that matches
-nothing or is not editable) send nothing. `ActionEffects.Cleared` and `Focused` report partial work;
-status `input_edit` (`InputEditV1`) is the marker a caller checks first. Local mode does not pass the
-new fields. `TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
+`runAction`: resolve the selector (or the focused field) to an element and bind to it, select the whole
+content (refused unless the selection spans it), then insert (or a real Backspace for an empty clear, read
+back as empty), with `midActionFence` between steps. Right before the destructive event `verifyBound`
+rechecks that the same element is still focused in the same document (`loaderId`), else `ErrTargetChanged`
+with nothing sent. Only an input, textarea or the contenteditable host itself is a target, never under
+designMode. `CheckKeyChord` is the allowlist for modifiers, enforced in `parseKeyAction` and `KeyWith`:
+clipboard and editing chords are not allowed (only Shift, Ctrl/Meta+a/z/y, Ctrl/Alt+navigation and delete
+keys, Shift+Tab). Other refusals (empty text without `clear`, selector over `MaxCobrowseSelectorLen`,
+modifiers outside 0..15, a selector that matches nothing or is not editable) send nothing.
+`ActionEffects.Cleared` is confirmed; `ClearedUnconfirmed` means the destructive event was sent without
+confirmation. Status `input_edit` (`InputEditV1`, non-tracking sessions only, like `FileUploadPageFence`)
+is the marker a caller checks first. Local mode does not pass the new fields.
+`TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
 
 `platform.StageFile` and `platform.SetFileInput` own file upload for remotely
 dispatched sessions (#1721, node side of aceteam#13831). Staged files live in a
