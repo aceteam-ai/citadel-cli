@@ -3968,3 +3968,18 @@ Auto-generated log of every release.
   - feat(cobrowse): type replace with selector and clear, key modifiers, input_edit marker (#1731)
 
 
+---
+
+## v2.237.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +993 |
+
+**Changes:**
+
+  - fix(local): re-land file approval snapshots with chooser provenance (#1755)
+
+
