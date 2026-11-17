@@ -28,12 +28,14 @@ const typeEditPage = `<!doctype html><title>edit</title>
 <input id="late" value="late microtask">
 <input id="late2" value="late timeout">
 <input id="asyncsel" value="async select">
+<input id="rewrite" value="old">
 <div id="host" contenteditable="true"><p id="child">child text</p></div>
 <script>
 document.getElementById("col").select = function(){ HTMLInputElement.prototype.select.call(this); this.setSelectionRange(0, 0); };
 document.getElementById("late").select = function(){ var s = this; HTMLInputElement.prototype.select.call(this); queueMicrotask(function(){ s.setSelectionRange(0, 0); }); };
 document.getElementById("late2").select = function(){ var s = this; HTMLInputElement.prototype.select.call(this); setTimeout(function(){ s.setSelectionRange(0, 0); }, 0); };
 document.getElementById("asyncsel").addEventListener("select", function(){ this.setSelectionRange(0, 0); });
+document.getElementById("rewrite").addEventListener("input", function(){ this.value += "!"; });
 document.getElementById("steal").addEventListener("focus", function(){ document.getElementById("i").focus(); });
 </script>`
 
@@ -64,6 +66,7 @@ const typeEditReset = `(function(){
 	document.getElementById("late").value = "late microtask";
 	document.getElementById("late2").value = "late timeout";
 	document.getElementById("asyncsel").value = "async select";
+	document.getElementById("rewrite").value = "old";
 	document.getElementById("host").innerHTML = '<p id="child">child text</p>';
 	return true;
 })()`
@@ -242,8 +245,9 @@ func runTypeEditRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 	} {
 		t.Run("a selection collapsed after select passes ("+c.name+")", func(t *testing.T) {
 			reset()
-			if _, err := m.TypeWith(st.ID, "intruder", TypeOptions{Selector: "#" + c.id, Clear: true}); err == nil {
-				t.Fatal("want the edit refused by the final verify")
+			_, err := m.TypeWith(st.ID, "intruder", TypeOptions{Selector: "#" + c.id, Clear: true})
+			if !errors.Is(err, errEditSelectionChanged) {
+				t.Fatalf("err = %v, want the final verify to refuse on the selection", err)
 			}
 			if got := read(`document.getElementById("` + c.id + `").value`); got != c.want {
 				t.Fatalf("content = %q, want it unchanged", got)
@@ -269,6 +273,21 @@ func runTypeEditRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		}
 		if err == nil && got != "X" && (eff == nil || !eff.ClearedUnconfirmed) {
 			t.Fatalf("the field holds %q and the action claims success without flagging it", got)
+		}
+	})
+	// The page rewrites the field on input, so what it holds is not what was
+	// typed: the exact-match read-back must refuse to call that a clear.
+	t.Run("a field that rewrites what is typed", func(t *testing.T) {
+		reset()
+		out, err := m.TypeWith(st.ID, "X", TypeOptions{Selector: "#rewrite", Clear: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := read(`document.getElementById("rewrite").value`); got != "X!" {
+			t.Fatalf("content = %q, want the page's rewrite", got)
+		}
+		if e := out.Effects; e == nil || e.Cleared || !e.ClearedUnconfirmed {
+			t.Fatalf("effects = %+v, want cleared false and unconfirmed", out.Effects)
 		}
 	})
 	t.Run("a field that steals focus", func(t *testing.T) {

@@ -2,6 +2,7 @@ package platform
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -237,7 +238,7 @@ func TestTypeWithClearIsConfirmedByExactMatch(t *testing.T) {
 		"read-back error": {map[string]any{"error": "the target is no longer an editable field"}, false, true},
 	} {
 		for _, offsetless := range []bool{false, true} {
-			t.Run(name, func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/offsetless=%v", name, offsetless), func(t *testing.T) {
 				e, m, id := newEditFake(t)
 				e.verify = map[string]any{"ok": true, "offsetless": offsetless}
 				e.matchRes = tc.matchRes
@@ -275,6 +276,9 @@ func TestVerifyReceivesTheClearFlag(t *testing.T) {
 
 // The verify script itself carries the selection re-check.
 func TestVerifyScriptRechecksTheSelection(t *testing.T) {
+	if !strings.Contains(editMatchFn, "String(v)===text") {
+		t.Fatal("editMatchFn lost its exact comparison")
+	}
 	if !strings.Contains(editVerifyFn, `if(w===false)return {ok:false,reason:"selection"}`) || !strings.Contains(editVerifyFn, "if(clear)") {
 		t.Fatal("editVerifyFn lost its selection re-check")
 	}

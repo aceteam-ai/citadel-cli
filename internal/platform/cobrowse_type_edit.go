@@ -186,14 +186,13 @@ const (
 }`
 	// editVerifyFn is the last awaited check before the destructive event: the
 	// element is still the focused target and, with clear, the selection still
-	// spans the whole content. offsetless means the field cannot report it.
+	// spans the whole content (a field with no selection offsets passes).
 	editVerifyFn = `/*edit:verify*/function(clear){` + editScriptLib + `
   var t=editTarget(this);
   if(!t||t.el!==this||!isActive(t))return {ok:false,reason:"target"};
   if(clear){
     var w=wholeSel(t);
     if(w===false)return {ok:false,reason:"selection"};
-    if(w===null)return {ok:true,offsetless:true};
   }
   return {ok:true};
 }`
@@ -346,28 +345,28 @@ func (r *actionRun) boundStep(b editBinding, fn string, mapGone bool, args ...an
 
 // verifyBound is the last awaited check before the destructive event: the same
 // document, the same element still focused and, with clear, the selection still
-// spanning the whole content. offsetless reports a field that cannot say (email,
-// number), so the caller confirms the clear by reading the length back.
-func (r *actionRun) verifyBound(b editBinding, clear bool) (offsetless bool, err error) {
+// spanning the whole content. A field that cannot report selection offsets
+// (email, number) passes here; the replace is confirmed after the insert by the
+// exact-match read-back, on every clear path.
+func (r *actionRun) verifyBound(b editBinding, clear bool) error {
 	loader, err := r.loaderID()
 	if err != nil {
-		return false, err
+		return err
 	}
 	if loader != b.loaderID {
-		return false, errEditTargetMoved
+		return errEditTargetMoved
 	}
 	obj, err := r.boundStep(b, editVerifyFn, true, clear)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if ok, _ := obj["ok"].(bool); !ok {
 		if reason, _ := obj["reason"].(string); reason == "selection" {
-			return false, errEditSelectionChanged
+			return errEditSelectionChanged
 		}
-		return false, errEditTargetMoved
+		return errEditTargetMoved
 	}
-	offsetless, _ = obj["offsetless"].(bool)
-	return offsetless, nil
+	return nil
 }
 
 // TypeWith is Type with a target and replace. With no selector and no clear it
@@ -435,7 +434,7 @@ func (m *CobrowseSessionManager) TypeWith(id, text string, o TypeOptions) (Cobro
 			return err
 		}
 		if bind != nil {
-			if _, err := r.verifyBound(*bind, o.Clear); err != nil {
+			if err := r.verifyBound(*bind, o.Clear); err != nil {
 				return err
 			}
 			if err := r.midActionFence(); err != nil {
