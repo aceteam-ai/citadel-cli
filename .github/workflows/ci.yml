@@ -212,13 +212,6 @@ jobs:
           CITADEL_COBROWSE_BROWSER_IT: "1"
         run: go test ./internal/platform/ -count=1 -v -run '^TestWindowsRealBrowserSession$'
 
-      - name: "TEMP diag: browser processes before Chrome step"
-        if: always()
-        shell: pwsh
-        run: |
-          $p = Get-Process chrome,msedge,msedgewebview2 -ErrorAction SilentlyContinue
-          "browser processes: $(@($p).Count)"; $p | Group-Object ProcessName | ForEach-Object { "$($_.Name) $($_.Count)" }
-
       - name: Real browser (Chrome)
         env:
           CITADEL_COBROWSE_BROWSER_IT: "1"
@@ -226,26 +219,12 @@ jobs:
           CITADEL_COBROWSE_EXPECT_KIND: chrome
         run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./tests/localgate/ -count=1 -v -run '^(TestLocalModeGateThroughMCP|TestWindowsRealBrowser|TestWindowsRealBrowserFileUpload|TestWindowsRealBrowserFileUploadSpoof|TestRealBrowserEgressGuard|TestRealBrowserFirstLoadThroughGuard|TestRealBrowserCommitActions|TestRealBrowserPopupSignIn|TestRealBrowserPersistentProfileRoundTrip|TestViewerPageInRealBrowser|TestViewerFirstInputAfterHandoffInRealBrowser|TestViewerFocusAfterHandoffInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
-      - name: "TEMP diag: browser processes after Chrome step"
-        if: always()
-        shell: pwsh
-        run: |
-          $p = Get-Process chrome,msedge,msedgewebview2 -ErrorAction SilentlyContinue
-          "browser processes: $(@($p).Count)"; $p | Group-Object ProcessName | ForEach-Object { "$($_.Name) $($_.Count)" }
-
       - name: Real browser (Edge)
         env:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
           CITADEL_COBROWSE_EXPECT_KIND: edge
         run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./tests/localgate/ -count=1 -v -run '^(TestLocalModeGateThroughMCP|TestWindowsRealBrowser|TestWindowsRealBrowserFileUpload|TestWindowsRealBrowserFileUploadSpoof|TestRealBrowserEgressGuard|TestRealBrowserFirstLoadThroughGuard|TestRealBrowserCommitActions|TestRealBrowserPopupSignIn|TestRealBrowserPersistentProfileRoundTrip|TestViewerPageInRealBrowser|TestViewerFirstInputAfterHandoffInRealBrowser|TestViewerFocusAfterHandoffInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
-
-      - name: "TEMP diag: browser processes after Edge step"
-        if: always()
-        shell: pwsh
-        run: |
-          $p = Get-Process chrome,msedge,msedgewebview2 -ErrorAction SilentlyContinue
-          "browser processes: $(@($p).Count)"; $p | Group-Object ProcessName | ForEach-Object { "$($_.Name) $($_.Count)" }
 
   # Linux co-browse real-browser gate (citadel-cli#1546). Issue #1546 took four
   # fix rounds because unit tests used fakes that real Chrome did not match
