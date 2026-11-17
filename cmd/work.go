@@ -1471,7 +1471,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// subscribeMeetingQueue is shared by this startup path and the
 	// meetingCapReconciler (citadel-cli#1758), which runs it later when the
 	// module turns healthy after the boot-time detection.
-	subscribeMeetingQueue := func(ctx context.Context) {
+	// It reports whether the queue is actually subscribed; the reconciler only
+	// advertises the tag on success and retries on the next tick otherwise.
+	subscribeMeetingQueue := func(ctx context.Context) bool {
 		meetingOrgID := ""
 		if deviceConfig != nil {
 			meetingOrgID = deviceConfig.OrgID
@@ -1486,21 +1488,25 @@ func runWork(cmd *cobra.Command, args []string) {
 			switch src := source.(type) {
 			case *worker.APISource:
 				src.AddQueue(meetingQueue)
+				workerState.SetQueues(src.QueueNames())
 			case *worker.RedisSource:
 				if err := src.AddQueue(ctx, meetingQueue); err != nil {
 					fmt.Fprintf(os.Stderr, "   - Warning: meeting queue subscribe failed: %v\n", err)
+					return false
 				}
+				workerState.SetQueues(src.QueueNames())
 			}
 			fmt.Printf("   - Meeting notetaker queue: %s\n", meetingQueue)
 			Debug("meeting queue: %s", meetingQueue)
-		} else {
-			fmt.Fprintln(os.Stderr, "   - Warning: meeting queue skipped (org id unknown); "+
-				"meeting auto-join dispatch will not reach this node")
-			Debug("meeting queue skipped: org id unknown")
+			return true
 		}
+		fmt.Fprintln(os.Stderr, "   - Warning: meeting queue skipped (org id unknown); "+
+			"meeting auto-join dispatch will not reach this node")
+		Debug("meeting queue skipped: org id unknown")
+		return false
 	}
 	if role != config.WorkerRoleControl && nodeCaps != nil && hasCapabilityTag(nodeCaps.Tags, "meeting") {
-		subscribeMeetingQueue(ctx)
+		_ = subscribeMeetingQueue(ctx)
 	}
 
 	// Populate the worker introspection state with the resolved identity and
@@ -1666,17 +1672,18 @@ func runWork(cmd *cobra.Command, args []string) {
 	// it (module container still inside its start_period). Only for
 	// auto-detected capabilities: a manifest-declared set is the operator's word.
 	var meetingReconciler *meetingCapReconciler
-	if role != config.WorkerRoleControl && nodeCaps != nil &&
-		(workManifest == nil || workManifest.Capabilities == nil) &&
-		!hasCapabilityTag(nodeCaps.Tags, "meeting") {
-		meetingReconciler = newMeetingCapReconciler(capabilities.DetectMeetingCapability, func(ctx context.Context) {
-			subscribeMeetingQueue(ctx)
+	if meetingReconcileEligible(role, nodeCaps, workManifest != nil && workManifest.Capabilities != nil) {
+		meetingReconciler = newMeetingCapReconciler(capabilities.DetectMeetingCapability, func(ctx context.Context) bool {
+			if !subscribeMeetingQueue(ctx) {
+				return false
+			}
 			if collector != nil && statusCaps != nil {
 				updated := *statusCaps
 				updated.Tags = append(append([]string(nil), statusCaps.Tags...), "meeting")
 				collector.SetCapabilities(&updated)
 			}
 			fmt.Println("   - Meeting capability became available; now advertising the meeting tag")
+			return true
 		})
 	}
 

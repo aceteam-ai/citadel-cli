@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // stubRefresh swaps the package-level catalogRefresh for the duration of a test,
@@ -197,5 +198,29 @@ func TestLoadServiceManifestSelfHealingColdCache(t *testing.T) {
 	}
 	if *calls != 1 {
 		t.Errorf("catalog refresh called %d times, want exactly 1", *calls)
+	}
+}
+
+func TestSanitizeRefreshCause(t *testing.T) {
+	cases := []struct{ name, in, notWant string }{
+		{"userinfo with at", "clone https://user:p@ss@host.invalid/x failed", "p@ss"},
+		{"token query", "GET https://h.invalid/x?token=abc123&a=1 failed", "abc123"},
+		{"access_token query", "GET https://h.invalid/x?access_token=zzz999 failed", "zzz999"},
+	}
+	for _, c := range cases {
+		got := sanitizeRefreshCause(errors.New(c.in))
+		if strings.Contains(got, c.notWant) || strings.Contains(got, "ss@") {
+			t.Errorf("%s: leaked %q in %q", c.name, c.notWant, got)
+		}
+	}
+}
+
+func TestSanitizeRefreshCauseTruncatesOnRuneBoundary(t *testing.T) {
+	got := sanitizeRefreshCause(errors.New(strings.Repeat("\u00e9", 500)))
+	if !utf8.ValidString(got) {
+		t.Fatal("truncated cause is not valid UTF-8")
+	}
+	if n := utf8.RuneCountInString(got); n != 203 {
+		t.Errorf("rune count = %d, want 203 (200 + ellipsis)", n)
 	}
 }

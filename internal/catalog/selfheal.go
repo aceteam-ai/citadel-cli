@@ -28,16 +28,19 @@ import (
 // reported when a present or freshly fetched catalog really lacks the name.
 var ErrCatalogUnavailable = errors.New("catalog not available; run `citadel service catalog update`")
 
-var urlUserinfoPattern = regexp.MustCompile(`(://)[^/\s@]+@`)
+var urlUserinfoPattern = regexp.MustCompile(`(://)[^/\s]+@`)
+
+var secretQueryPattern = regexp.MustCompile(`(?i)\b((?:access_|refresh_|id_|auth_)?token|password|passwd|secret|api_?key|key|sig|signature)=[^&\s'"]+`)
 
 // sanitizeRefreshCause makes a catalog refresh error safe and short for an
 // operator-facing message: one line, URL credentials removed, bounded length.
 func sanitizeRefreshCause(err error) string {
 	s := strings.Join(strings.Fields(err.Error()), " ")
 	s = urlUserinfoPattern.ReplaceAllString(s, "$1")
+	s = secretQueryPattern.ReplaceAllString(s, "$1=REDACTED")
 	const max = 200
-	if len(s) > max {
-		s = s[:max] + "..."
+	if r := []rune(s); len(r) > max {
+		s = string(r[:max]) + "..."
 	}
 	return s
 }

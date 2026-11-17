@@ -658,6 +658,12 @@ func meetingModuleHealthy() bool {
 	if !meetingModuleInstalled(meetingNodeDir()) {
 		return false
 	}
+	return meetingHealthProbe()
+}
+
+// meetingHealthProbe is a seam so tests can assert the install-marker gate
+// without a listener on the published port.
+var meetingHealthProbe = func() bool {
 	hc := catalog.HealthCheck{
 		Endpoint: "/health",
 		Port:     services.MeetingdHostPort,

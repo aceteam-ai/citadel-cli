@@ -586,3 +586,37 @@ func TestMeetingNodeDirUsesHook(t *testing.T) {
 		t.Errorf("fallback = %q, want platform.ConfigDir()", got)
 	}
 }
+
+// meetingModuleHealthy must look for the install marker under the node dir from
+// NodeDirHook, not platform.ConfigDir(): a marker only under ConfigDir()
+// must not count.
+func TestMeetingModuleHealthyUsesNodeDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	prevHook, prevProbe := NodeDirHook, meetingHealthProbe
+	t.Cleanup(func() { NodeDirHook, meetingHealthProbe = prevHook, prevProbe })
+	meetingHealthProbe = func() bool { return true }
+
+	cfgSvc := filepath.Join(platform.ConfigDir(), "services")
+	if err := os.MkdirAll(cfgSvc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgSvc, "meeting.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeDir := t.TempDir()
+	NodeDirHook = func() string { return nodeDir }
+	if meetingModuleHealthy() {
+		t.Fatal("healthy with marker only under ConfigDir(); node dir must be used")
+	}
+
+	if err := os.MkdirAll(filepath.Join(nodeDir, "services"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nodeDir, "services", "meeting.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !meetingModuleHealthy() {
+		t.Fatal("not healthy with marker under the node dir")
+	}
+}

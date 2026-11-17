@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 )
 
 // init wires capabilities.NodeDirHook (citadel-cli#1758). internal/capabilities
@@ -38,15 +39,16 @@ func init() {
 // probe is in flight, and once capable the reconciler is done (subscribe-only,
 // like worker.InferenceQueueReconciler).
 type meetingCapReconciler struct {
-	detect    func() bool
-	onCapable func(ctx context.Context)
+	detect func() bool
+	// onCapable reports success; on false the reconciler retries on the next tick.
+	onCapable func(ctx context.Context) bool
 
 	mu      sync.Mutex
 	probing bool
 	done    bool
 }
 
-func newMeetingCapReconciler(detect func() bool, onCapable func(ctx context.Context)) *meetingCapReconciler {
+func newMeetingCapReconciler(detect func() bool, onCapable func(ctx context.Context) bool) *meetingCapReconciler {
 	return &meetingCapReconciler{detect: detect, onCapable: onCapable}
 }
 
@@ -60,7 +62,7 @@ func (r *meetingCapReconciler) Reconcile(ctx context.Context) {
 	r.probing = true
 	r.mu.Unlock()
 
-	ok := r.detect()
+	ok := r.detect() && r.onCapable(ctx)
 
 	r.mu.Lock()
 	r.probing = false
@@ -68,8 +70,15 @@ func (r *meetingCapReconciler) Reconcile(ctx context.Context) {
 		r.done = true
 	}
 	r.mu.Unlock()
+}
 
-	if ok {
-		r.onCapable(ctx)
+// meetingReconcileEligible reports whether the heartbeat-tick meeting
+// re-detection applies: not a control-only worker, capabilities auto-detected
+// (not declared in the manifest), and the meeting tag not already advertised
+// from startup detection.
+func meetingReconcileEligible(role config.WorkerRole, nodeCaps *capabilities.NodeCapabilities, manifestDeclaresCaps bool) bool {
+	if role == config.WorkerRoleControl || nodeCaps == nil || manifestDeclaresCaps {
+		return false
 	}
+	return !hasCapabilityTag(nodeCaps.Tags, "meeting")
 }
