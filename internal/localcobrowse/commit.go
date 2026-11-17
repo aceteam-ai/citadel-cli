@@ -26,7 +26,7 @@ import (
 
 // RuleVersion is recorded in the audit log so a later reader knows which rules
 // classified an action. Bump it when the rules change.
-const RuleVersion = "local-commit-3"
+const RuleVersion = "local-commit-4"
 
 // Class is how an action is treated.
 type Class string

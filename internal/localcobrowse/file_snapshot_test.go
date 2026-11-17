@@ -53,6 +53,38 @@ func TestFileCommitCardCopiesMetadataWithoutAuditLeak(t *testing.T) {
 	}
 }
 
+func TestFileCommitMetadataIsPrivateWhileHumanDrives(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	target := sendTarget()
+	target.FormFiles = []platform.FormFile{{Field: "att", Name: "human-private.txt", Size: 73, Type: "text/plain", LastModified: 91234}}
+	fb.target = target
+	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatal(err)
+	}
+	// Model a browser-originated handoff before the service has expired its
+	// old card. Even this pending evidence must not leak through an agent read.
+	fb.mu.Lock()
+	fb.sessions[id].human = true
+	st := fb.statusLocked(id)
+	fb.mu.Unlock()
+	for _, requested := range []string{id, ""} {
+		views, err := svc.Status(ctx, requested)
+		if err != nil || len(views) != 1 || views[0].Commit == nil || len(views[0].Commit.Files) != 0 {
+			t.Fatalf("agent status retained file evidence: %+v %v", views, err)
+		}
+	}
+	svc.mu.Lock()
+	view := svc.agentViewLocked(svc.sessions[id], st, svc.cfg.Now())
+	svc.mu.Unlock()
+	if view.Commit == nil || len(view.Commit.Files) != 0 {
+		t.Fatalf("agent response retained file evidence: %+v", view)
+	}
+	card := pendingView(t, svc, id)
+	if len(card.Files) != 1 || card.Files[0].Name != "human-private.txt" || card.Files[0].Size != 73 || card.Files[0].LastModified != 91234 {
+		t.Fatalf("agent redaction damaged viewer evidence: %+v", card)
+	}
+}
+
 func TestFileSnapshotEmptyAndMetadataBinding(t *testing.T) {
 	empty := runInspect(t, fileScenario("att", "", 0, "application/octet-stream", 100), fileScenario("att", "", 0, "application/octet-stream", 200))
 	if empty[0].Bad != "" || empty[0].Digest == "" || empty[0].Digest != empty[1].Digest {

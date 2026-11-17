@@ -149,8 +149,11 @@ metadata, and never reads bytes or paths. The local commit card copies bounded
 metadata for display using text only, removes format/control characters and
 preserves the filename's final extension; an extension too long to display is
 unverifiable. `Classify` trusts only the probe's native-control chooser signal
-for a non-actionable file input or associated label. Interactive descendants
-stay their own targets; actionable chooser controls retain commit checks. It does not attach a file
+for a non-actionable file input or associated label. Other labels are described
+by the native control they activate, not the label's text; an uninspectable
+associated custom control is refused. Interactive descendants stay their own
+targets; actionable chooser controls retain commit checks. Agent views omit file
+metadata while the human drives, without altering the human's card. It does not attach a file
 or authorize staging; those remain separate upload slices. The rule version and
 `TestRealBrowserCommitActionsFileSnapshots` pin this approval behavior.
 

@@ -1439,10 +1439,19 @@ func redactWhileHuman(raw string) string {
 func (s *Service) agentViewLocked(ss *session, st platform.CobrowseSessionStatus, now time.Time) SessionView {
 	v := s.viewLocked(ss, st, now)
 	if st.Driver == platform.DriverHuman {
-		v.URL = redactWhileHuman(v.URL)
-		redactTargets(v.Targets)
+		redactAgentHumanView(&v)
 	}
 	return v
+}
+
+// Human viewer evidence is not an agent observation while the human drives.
+// viewLocked builds an independent card, so redaction leaves the viewer intact.
+func redactAgentHumanView(v *SessionView) {
+	v.URL = redactWhileHuman(v.URL)
+	redactTargets(v.Targets)
+	if v.Commit != nil {
+		v.Commit.Files = nil
+	}
 }
 
 // redactTargets applies the human-driving redaction to every page: origin only,
@@ -1548,8 +1557,7 @@ func (s *Service) status(id string) ([]SessionView, error) {
 	views := s.Sessions(id)
 	for i := range views {
 		if views[i].Driver == string(platform.DriverHuman) {
-			views[i].URL = redactWhileHuman(views[i].URL)
-			redactTargets(views[i].Targets)
+			redactAgentHumanView(&views[i])
 		}
 	}
 	return views, nil

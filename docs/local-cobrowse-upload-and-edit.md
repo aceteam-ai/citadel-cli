@@ -448,8 +448,12 @@ and loader, retaining at most one context reference. A lost context is invalidat
 and the current probe refuses; the next probe reads the current frame tree and
 recreates the world, without retrying any action. Chooser classification comes
 from a pristine native file-input type or a label's native associated control,
-not attributes on the label. Interactive descendants stay their own targets,
-and an actionable chooser still passes through the commit-word checks.
+not attributes on the label. A label for a non-file control is classified from
+that control's tag, type, name and form; misleading label text cannot hide a
+submit or Delete button. An uninspectable associated custom control is refused.
+Interactive descendants stay their own targets, and an actionable chooser
+still passes through the commit-word checks. While the human drives, agent
+views omit picked-file metadata; the human viewer retains its approval evidence.
 The browser's synthetic empty File timestamp is normalized to
 zero, so an unselected file input has a stable digest. A snapshot with more
 than 128 attached entries is unverifiable rather than producing an unbounded

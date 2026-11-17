@@ -402,14 +402,31 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	function interactiveDescendant(e, label) {
 		for (var n = e; n && n !== label; n = n.parentElement) {
 			var css = null; try { css = getComputedStyle(n); } catch (x) {}
-			if (n.matches(actSel + ",input,select,textarea,[tabindex],[contenteditable]") || (css && css.cursor === "pointer")) return true;
+			if (n.matches(actSel + ",input,select,textarea,[tabindex],[contenteditable],img[usemap],video[controls],audio[controls]") || (css && css.cursor === "pointer")) return true;
 		}
 		return false;
 	}
-	// A non-interactive label descendant activates the associated control;
-	// an interactive descendant remains its own click target.
-	var lab = !act && el.closest ? el.closest("label") : null;
-	if (lab && fileInput(labelControl(lab)) && !interactiveDescendant(el, lab)) t = lab;
+	function nativeInteractiveDescendant(e, label) {
+		for (var n = e; n && n !== label; n = n.parentElement) {
+			if (n.matches("a[href],audio[controls],button,details,embed,iframe,img[usemap],input:not([type=hidden]),label,select,textarea,video[controls]")) return true;
+		}
+		return false;
+	}
+	// The browser forwards a label click to its native associated control.
+	// Judge that control, not potentially misleading text on the label. File
+	// labels keep their chooser path; interactive descendants stay themselves.
+	var lab = el.closest ? el.closest("label") : null, labelActionName = "";
+	if (lab) {
+		var control = labelControl(lab);
+		if (control && !fileInput(control) && !nativeInteractiveDescendant(el, lab)) {
+			if (control.tagName.toLowerCase().indexOf("-") > 0) { out.reason = "the label activates a custom control that cannot be classified"; return out; }
+			// CSS cursor, tabindex and ARIA roles do not suppress the browser's
+			// label forwarding. Keep any such target's own action words as well.
+			if (act) labelActionName = nameOf(act);
+			t = control;
+			if (control.matches(actSel)) act = control;
+		} else if (control && fileInput(control) && (!act || act === lab) && !interactiveDescendant(el, lab)) { t = lab; }
+	}
 	tag = t.tagName.toLowerCase();
 	var cs = null; try { cs = getComputedStyle(t); } catch (e) {}
 	var role = (t.getAttribute("role") || "").toLowerCase();
@@ -419,7 +436,7 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	var isEntry = tag === "textarea" || t.isContentEditable || role === "textbox" || role === "searchbox" || role === "combobox" ||
 		(tag === "input" && !/^(checkbox|radio|button|submit|reset|image|file|hidden|range|color)$/.test(type));
 	out.tag = tag; out.role = role; out.input_type = type; out.file_chooser = chooser;
-	out.name = nameOf(t);
+	out.name = nameOf(t) + (labelActionName ? " " + labelActionName : "");
 	out.actionable = !!act || (!isEntry && ((cs && cs.cursor === "pointer") || t.hasAttribute("tabindex")));
 	out.entry = isEntry;
 	out.composer = tag === "textarea" || !!t.isContentEditable || role === "textbox";
