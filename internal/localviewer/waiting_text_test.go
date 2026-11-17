@@ -19,7 +19,7 @@ func TestWaitingBannerText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`(?s)function waitingText\(reason\) \{.*?\n  \}\n`).Find(src)
+	m := regexp.MustCompile(`(?s)function waitingText\(reason\) \{.*?\r?\n  \}\r?\n`).Find(src)
 	if m == nil {
 		t.Fatal("waitingText not found in app.js")
 	}
