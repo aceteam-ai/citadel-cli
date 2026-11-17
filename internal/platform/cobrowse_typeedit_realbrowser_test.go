@@ -27,7 +27,7 @@ const typeEditPage = `<!doctype html><title>edit</title>
 <input id="steal" value="steal">
 <div id="host" contenteditable="true"><p id="child">child text</p></div>
 <script>
-document.getElementById("col").addEventListener("select", function(){ this.setSelectionRange(0, 0); });
+document.getElementById("col").select = function(){ HTMLInputElement.prototype.select.call(this); this.setSelectionRange(0, 0); };
 document.getElementById("steal").addEventListener("focus", function(){ document.getElementById("i").focus(); });
 </script>`
 
