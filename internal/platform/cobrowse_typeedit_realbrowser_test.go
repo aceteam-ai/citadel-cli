@@ -20,7 +20,21 @@ const typeEditPage = `<!doctype html><title>edit</title>
 <input id="cb" type="checkbox">
 <input id="sa" value="sentinel-A">
 <input id="sb" value="">
-<button id="b" type="button">go</button>`
+<button id="b" type="button">go</button>
+<input id="em" type="email" value="old@example.com">
+<input id="num" type="number" value="123">
+<input id="col" value="collapse me">
+<input id="steal" value="steal">
+<div id="host" contenteditable="true"><p id="child">child text</p></div>
+<script>
+document.getElementById("col").addEventListener("select", function(){ this.setSelectionRange(0, 0); });
+document.getElementById("steal").addEventListener("focus", function(){ document.getElementById("i").focus(); });
+</script>`
+
+// designModePage turns designMode on, which makes everything editable.
+const designModePage = `<!doctype html><title>dm</title>
+<div id="c" contenteditable="true">dm text</div>
+<script>document.designMode = "on";</script>`
 
 // typeEditFields maps each field's selector to the JS expression that reads its
 // content back, so the assertions look at the page, not at the action's report.
@@ -37,6 +51,11 @@ const typeEditReset = `(function(){
 	document.getElementById("t").value = "old text";
 	document.getElementById("c").textContent = "old editable";
 	document.getElementById("ro").value = "locked";
+	document.getElementById("em").value = "old@example.com";
+	document.getElementById("num").value = "123";
+	document.getElementById("col").value = "collapse me";
+	document.getElementById("steal").value = "steal";
+	document.getElementById("host").innerHTML = '<p id="child">child text</p>';
 	return true;
 })()`
 
@@ -49,6 +68,10 @@ func runTypeEditRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
+		if r.URL.Path == "/dm" {
+			fmt.Fprint(w, designModePage)
+			return
+		}
 		fmt.Fprint(w, typeEditPage)
 	}))
 	t.Cleanup(srv.Close)
@@ -188,6 +211,74 @@ func runTypeEditRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		}
 		if got := read(`document.getElementById("ro").value`); got != "locked" {
 			t.Fatalf("read-only field changed to %q", got)
+		}
+	})
+
+	// 6. The in-page guards: each refuses (or reports) and the page is as it
+	// was.
+	t.Run("a field that collapses the selection on select", func(t *testing.T) {
+		reset()
+		if _, err := m.TypeWith(st.ID, "intruder", TypeOptions{Selector: "#col", Clear: true}); err == nil {
+			t.Fatal("want the edit refused: the selection no longer spans the content")
+		}
+		if got := read(`document.getElementById("col").value`); got != "collapse me" {
+			t.Fatalf("content = %q", got)
+		}
+	})
+	t.Run("a field that steals focus", func(t *testing.T) {
+		reset()
+		if _, err := m.TypeWith(st.ID, "intruder", TypeOptions{Selector: "#steal", Clear: true}); err == nil {
+			t.Fatal("want the edit refused: the field did not take focus")
+		}
+		if got := read(`document.getElementById("steal").value + "|" + document.getElementById("i").value`); got != "steal|old input" {
+			t.Fatalf("contents = %q", got)
+		}
+	})
+	t.Run("a child inside a contenteditable host", func(t *testing.T) {
+		reset()
+		if _, err := m.TypeWith(st.ID, "intruder", TypeOptions{Selector: "#child", Clear: true}); err == nil {
+			t.Fatal("want the edit refused: only the host itself is a target")
+		}
+		if got := read(`document.getElementById("host").textContent`); got != "child text" {
+			t.Fatalf("content = %q", got)
+		}
+	})
+	t.Run("email and number fields", func(t *testing.T) {
+		reset()
+		for _, c := range []struct{ sel, read, text string }{
+			{"#em", `document.getElementById("em").value`, "new@example.com"},
+			{"#num", `document.getElementById("num").value`, "456"},
+			{"#em", `document.getElementById("em").value`, ""},
+			{"#num", `document.getElementById("num").value`, ""},
+		} {
+			out, err := m.TypeWith(st.ID, c.text, TypeOptions{Selector: c.sel, Clear: true})
+			if err != nil {
+				t.Fatalf("%s %q: %v", c.sel, c.text, err)
+			}
+			if got := read(c.read); got != c.text {
+				t.Fatalf("%s content = %q, want %q", c.sel, got, c.text)
+			}
+			if e := out.Effects; e == nil || !e.Cleared || e.ClearedUnconfirmed {
+				t.Fatalf("%s effects = %+v", c.sel, out.Effects)
+			}
+		}
+	})
+	t.Run("designMode on", func(t *testing.T) {
+		if _, err := m.Navigate(st.ID, srv.URL+"/dm"); err != nil {
+			t.Fatalf("navigate: %v", err)
+		}
+		waitCond(t, 30*time.Second, "the designMode page", func() bool {
+			_, err := m.Extract(st.ID, "#c", nil)
+			return err == nil
+		})
+		if _, err := m.TypeWith(st.ID, "intruder", TypeOptions{Selector: "#c", Clear: true}); err == nil {
+			t.Fatal("want the edit refused under designMode")
+		}
+		if _, err := m.TypeWith(st.ID, "intruder", TypeOptions{Selector: "body", Clear: true}); err == nil {
+			t.Fatal("want the body refused under designMode")
+		}
+		if got := read(`document.getElementById("c").textContent`); got != "dm text" {
+			t.Fatalf("content = %q", got)
 		}
 	})
 }

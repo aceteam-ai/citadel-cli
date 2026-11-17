@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf16"
 )
 
 // InputEditV1 is the status capability value for this contract. A platform must
@@ -34,39 +35,44 @@ var (
 	ErrKeyChordNotAllowed = errors.New("this key chord is not allowed: clipboard and editing chords are refused")
 )
 
+// The edit's own failures after the page was touched. They deliberately do not
+// wrap ErrTargetChanged: that is a refusal ("nothing was sent"), and these come
+// back as an incomplete action carrying what already happened.
+var (
+	errEditTargetMoved      = errors.New("the target changed before the edit; nothing was typed")
+	errEditSelectionChanged = errors.New("the selection changed before the edit; nothing was typed")
+)
+
 // CheckKeyChord is the allowlist for a key with modifiers; modifiers 0 is
 // always allowed. It is the one decision both the job parser and KeyWith use,
 // before any dispatch. Allowed:
-//   - Shift alone with any key, except Delete (Shift+Delete is a clipboard edit);
-//   - Ctrl or Meta alone with a, z or y;
-//   - Ctrl or Alt alone with an arrow, Home, End, Backspace or Delete.
+//   - Shift alone with a printable key, an arrow, Home, End, PageUp, PageDown,
+//     Tab, Enter or Backspace (no Escape, no Delete);
+//   - Ctrl or Meta alone with a (select all);
+//   - Ctrl alone with an arrow, Home, End, Backspace or Delete.
 //
-// Everything else is refused, in particular clipboard chords, and Alt with a
-// letter (a page accesskey).
+// Everything else is refused: clipboard and editing chords, undo and redo, and
+// anything with Alt.
 func CheckKeyChord(key string, mod int) error {
 	if mod < 0 || mod > modMax {
 		return ErrModifiersOutRange
 	}
-	if mod == 0 {
-		return nil
-	}
 	switch mod {
+	case 0:
+		return nil
 	case ModShift:
-		if key != "Delete" {
+		if _, _, produced, ok := browserKey(key); ok && produced != "" {
+			return nil
+		}
+		switch key {
+		case "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Tab", "Enter", "Backspace":
 			return nil
 		}
 	case ModCtrl, ModMeta:
-		switch strings.ToLower(key) {
-		case "a", "z", "y":
-			if len(key) == 1 {
-				return nil
-			}
-		}
-		if mod == ModCtrl && navOrDeleteKey(key) {
+		if key == "a" || key == "A" {
 			return nil
 		}
-	case ModAlt:
-		if navOrDeleteKey(key) {
+		if mod == ModCtrl && navOrDeleteKey(key) {
 			return nil
 		}
 	}
@@ -125,6 +131,21 @@ function editTarget(el){
   return null;
 }
 function isActive(t){var a=deepActive();return a===t.el||(t.kind==="contenteditable"&&t.el.contains(a));}
+// wholeSel: true when the selection spans the field's whole content, false when
+// it does not, null when the field type reports no offsets (email, number).
+function wholeSel(t){
+  if(t.kind==="contenteditable"){
+    var s=window.getSelection();
+    if(!s.rangeCount)return false;
+    var sr=s.getRangeAt(0),r=document.createRange();
+    r.selectNodeContents(t.el);
+    return sr.compareBoundaryPoints(Range.START_TO_START,r)===0&&sr.compareBoundaryPoints(Range.END_TO_END,r)===0;
+  }
+  var ss=null,se=null;
+  try{ss=t.el.selectionStart;se=t.el.selectionEnd;}catch(e){}
+  if(ss===null&&se===null)return ["email","number"].indexOf(String(t.el.type).toLowerCase())>=0?null:false;
+  return ss===0&&se===t.el.value.length;
+}
 `
 
 // editFocusScript resolves selector (document.querySelector, as click does),
@@ -157,25 +178,25 @@ const (
   var t=editTarget(this);
   if(!t||t.el!==this)return {error:"the target is no longer an editable field"};
   if(!isActive(t))return {error:"the field lost focus"};
-  var whole=false;
   if(t.kind==="contenteditable"){
     var s=window.getSelection(),r=document.createRange();
     r.selectNodeContents(t.el);s.removeAllRanges();s.addRange(r);
-    var sr=s.rangeCount?s.getRangeAt(0):null;
-    whole=!!sr&&sr.compareBoundaryPoints(Range.START_TO_START,r)===0&&sr.compareBoundaryPoints(Range.END_TO_END,r)===0;
-  }else{
-    t.el.select();
-    var ss=null,se=null;
-    try{ss=t.el.selectionStart;se=t.el.selectionEnd;}catch(e){}
-    if(ss===null&&se===null){whole=["email","number"].indexOf(String(t.el.type).toLowerCase())>=0;}
-    else{whole=ss===0&&se===t.el.value.length;}
-  }
-  if(!whole)return {error:"the selection does not span the whole field"};
+  }else{t.el.select();}
+  if(wholeSel(t)===false)return {error:"the selection does not span the whole field"};
   return {ok:true};
 }`
-	editVerifyFn = `/*edit:verify*/function(){` + editScriptLib + `
+	// editVerifyFn is the last awaited check before the destructive event: the
+	// element is still the focused target and, with clear, the selection still
+	// spans the whole content. offsetless means the field cannot report it.
+	editVerifyFn = `/*edit:verify*/function(clear){` + editScriptLib + `
   var t=editTarget(this);
-  return {ok:!!t&&t.el===this&&isActive(t)};
+  if(!t||t.el!==this||!isActive(t))return {ok:false,reason:"target"};
+  if(clear){
+    var w=wholeSel(t);
+    if(w===false)return {ok:false,reason:"selection"};
+    if(w===null)return {ok:true,offsetless:true};
+  }
+  return {ok:true};
 }`
 	// editEmptyFn returns a boolean only, never the content.
 	editEmptyFn = `/*edit:empty*/function(){` + editScriptLib + `
@@ -184,7 +205,34 @@ const (
   var v=t.kind==="contenteditable"?t.el.textContent:t.el.value;
   return {empty:String(v||"").length===0};
 }`
+	// editLenFn returns a length only, never the content.
+	editLenFn = `/*edit:len*/function(){` + editScriptLib + `
+  var t=editTarget(this);
+  if(!t||t.el!==this)return {error:"the target is no longer an editable field"};
+  return {len:String(t.el.value).length};
+}`
 )
+
+// knownEditRefusals is the fixed set of messages a page script may return. A
+// page can return any string, so anything else becomes a generic refusal.
+var knownEditRefusals = map[string]bool{
+	"no element matches the selector":               true,
+	"the selector does not match an editable field": true,
+	"the field did not take focus":                  true,
+	"the focused element is not an editable field":  true,
+	"the target is no longer an editable field":     true,
+	"the field lost focus":                          true,
+	"the selection does not span the whole field":   true,
+}
+
+const genericEditRefusal = "the page refused the edit"
+
+func knownRefusal(msg string) string {
+	if knownEditRefusals[msg] {
+		return msg
+	}
+	return genericEditRefusal
+}
 
 // editBinding is the element an edit resolved, and the document it lived in.
 type editBinding struct {
@@ -201,22 +249,22 @@ func tagFromClass(class string) string {
 
 // resolveTarget evaluates a resolving script and binds to the element it
 // returns. A string result is a refusal: it changed nothing unless prefixed "!"
-// (focus ran). markDispatched is set before the call for the focusing script,
-// which may change the page.
-func (r *actionRun) resolveTarget(script string, markDispatched bool) (editBinding, string, error) {
+// (focus ran). focusing is set for the focusing script, which may change the
+// page: it counts as dispatched, and once it succeeded the field is focused.
+func (r *actionRun) resolveTarget(script string, focusing bool) (editBinding, error) {
 	prev := r.eff.Dispatched
-	if markDispatched {
+	if focusing {
 		r.eff.Dispatched = true
 	}
 	res, err := r.conn.Call("Runtime.evaluate", map[string]any{
 		"expression": script, "returnByValue": false, "awaitPromise": false,
 	})
 	if err != nil {
-		return editBinding{}, "", err
+		return editBinding{}, err
 	}
 	if exc, ok := res["exceptionDetails"]; ok && exc != nil {
 		r.eff.Dispatched = prev
-		return editBinding{}, "", errors.New("the edit script failed in the page")
+		return editBinding{}, errors.New(genericEditRefusal)
 	}
 	remote, _ := res["result"].(map[string]any)
 	if typ, _ := remote["type"].(string); typ == "string" {
@@ -226,19 +274,22 @@ func (r *actionRun) resolveTarget(script string, markDispatched bool) (editBindi
 		} else {
 			r.eff.Dispatched = prev
 		}
-		return editBinding{}, "", errors.New(msg)
+		return editBinding{}, errors.New(knownRefusal(msg))
 	}
 	id, _ := remote["objectId"].(string)
 	if id == "" {
 		r.eff.Dispatched = prev
-		return editBinding{}, "", errors.New("the page returned no element for the edit")
+		return editBinding{}, errors.New(genericEditRefusal)
 	}
-	class, _ := remote["className"].(string)
+	if focusing {
+		class, _ := remote["className"].(string)
+		r.eff.Focused, r.eff.FocusTag = true, tagFromClass(class)
+	}
 	loader, err := r.loaderID()
 	if err != nil {
-		return editBinding{}, "", err
+		return editBinding{}, err
 	}
-	return editBinding{objectID: id, loaderID: loader}, tagFromClass(class), nil
+	return editBinding{objectID: id, loaderID: loader}, nil
 }
 
 // loaderID is the main frame's current loader id; it changes on navigation.
@@ -253,67 +304,81 @@ func (r *actionRun) loaderID() (string, error) {
 	return id, nil
 }
 
-// boundStep runs fn on the bound element. A CDP-level failure (the object is
-// gone, the page navigated) is ErrTargetChanged when mapGone is set; it is only
-// set before anything destructive was sent, since a refusal hides effects.
-func (r *actionRun) boundStep(b editBinding, fn string, mapGone bool) (map[string]any, error) {
+// boundStep runs fn on the bound element with optional call arguments. A
+// CDP-level failure (the object is gone, the page navigated) is errEditTargetMoved
+// when mapGone is set; it is only set before anything destructive was sent.
+func (r *actionRun) boundStep(b editBinding, fn string, mapGone bool, args ...any) (map[string]any, error) {
 	prev := r.eff.Dispatched
 	r.eff.Dispatched = true
-	res, err := r.conn.Call("Runtime.callFunctionOn", map[string]any{
-		"objectId": b.objectID, "functionDeclaration": fn, "returnByValue": true,
-	})
+	params := map[string]any{"objectId": b.objectID, "functionDeclaration": fn, "returnByValue": true}
+	if len(args) > 0 {
+		var cargs []map[string]any
+		for _, a := range args {
+			cargs = append(cargs, map[string]any{"value": a})
+		}
+		params["arguments"] = cargs
+	}
+	res, err := r.conn.Call("Runtime.callFunctionOn", params)
 	if err != nil {
 		if mapGone && strings.HasPrefix(err.Error(), "CDP error") {
 			r.eff.Dispatched = prev
-			return nil, ErrTargetChanged
+			return nil, errEditTargetMoved
 		}
 		return nil, err
 	}
 	if exc, ok := res["exceptionDetails"]; ok && exc != nil {
 		r.eff.Dispatched = prev
-		return nil, errors.New("the edit script failed in the page")
+		return nil, errors.New(genericEditRefusal)
 	}
 	remote, _ := res["result"].(map[string]any)
 	obj, _ := remote["value"].(map[string]any)
 	if obj == nil {
 		r.eff.Dispatched = prev
-		return nil, errors.New("the page returned no result for the edit")
+		return nil, errors.New(genericEditRefusal)
 	}
 	if msg, _ := obj["error"].(string); msg != "" {
 		r.eff.Dispatched = prev
-		return nil, errors.New(msg)
+		return nil, errors.New(knownRefusal(msg))
 	}
 	return obj, nil
 }
 
-// verifyBound re-checks, immediately before a destructive event, that the
-// action's element is still the focused editable target in the same document.
-func (r *actionRun) verifyBound(b editBinding) error {
+// verifyBound is the last awaited check before the destructive event: the same
+// document, the same element still focused and, with clear, the selection still
+// spanning the whole content. offsetless reports a field that cannot say (email,
+// number), so the caller confirms the clear by reading the length back.
+func (r *actionRun) verifyBound(b editBinding, clear bool) (offsetless bool, err error) {
 	loader, err := r.loaderID()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if loader != b.loaderID {
-		return ErrTargetChanged
+		return false, errEditTargetMoved
 	}
-	obj, err := r.boundStep(b, editVerifyFn, true)
+	obj, err := r.boundStep(b, editVerifyFn, true, clear)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if ok, _ := obj["ok"].(bool); !ok {
-		return ErrTargetChanged
+		if reason, _ := obj["reason"].(string); reason == "selection" {
+			return false, errEditSelectionChanged
+		}
+		return false, errEditTargetMoved
 	}
-	return nil
+	offsetless, _ = obj["offsetless"].(bool)
+	return offsetless, nil
 }
+
+func utf16Len(s string) int { return len(utf16.Encode([]rune(s))) }
 
 // TypeWith is Type with a target and replace. With no selector and no clear it
 // is exactly Type. Otherwise the whole of it is one action on one pinned page:
 // resolve and focus the selector (or take the focused field), select the whole
 // content (clear), then insert (or delete, for empty text), with the live
-// driver rechecked between the steps and the resolved element and document
-// re-verified right before the destructive event. Refusals (empty text without
-// clear, an over-long selector, a selector that matches nothing or is not
-// editable) send no text. The text is never reported.
+// driver rechecked between the steps and the resolved element, document and
+// selection re-verified in the last awaited call before the destructive event.
+// Refusals (empty text without clear, an over-long selector, a selector that
+// matches nothing or is not editable) send no text. The text is never reported.
 func (m *CobrowseSessionManager) TypeWith(id, text string, o TypeOptions) (CobrowseSessionStatus, error) {
 	if err := o.validate(text); err != nil {
 		return CobrowseSessionStatus{}, err
@@ -346,16 +411,11 @@ func (m *CobrowseSessionManager) TypeWith(id, text string, o TypeOptions) (Cobro
 				return err
 			}
 			var nb editBinding
-			var tag string
 			var err error
 			if o.Selector != "" {
-				nb, tag, err = r.resolveTarget(editFocusScript(o.Selector), true)
-				if err == nil {
-					r.eff.Focused = true
-					r.eff.FocusTag = tag
-				}
+				nb, err = r.resolveTarget(editFocusScript(o.Selector), true)
 			} else {
-				nb, _, err = r.resolveTarget(editActiveScript, false)
+				nb, err = r.resolveTarget(editActiveScript, false)
 			}
 			if err != nil {
 				return err
@@ -370,13 +430,15 @@ func (m *CobrowseSessionManager) TypeWith(id, text string, o TypeOptions) (Cobro
 				return err
 			}
 		}
-		// Before anything destructive: still the same element, same document,
-		// and the live driver, in that order, with the fence last.
+		// Before anything destructive: the live driver, then the last awaited
+		// verify, then the driver again with nothing slow after it.
 		if err := between(); err != nil {
 			return err
 		}
+		offsetless := false
 		if bind != nil {
-			if err := r.verifyBound(*bind); err != nil {
+			var err error
+			if offsetless, err = r.verifyBound(*bind, o.Clear); err != nil {
 				return err
 			}
 			if err := r.midActionFence(); err != nil {
@@ -393,8 +455,22 @@ func (m *CobrowseSessionManager) TypeWith(id, text string, o TypeOptions) (Cobro
 				return err
 			}
 			r.eff.TypedUnconfirmed = false
-			if o.Clear {
+			if !o.Clear {
+				return nil
+			}
+			if !offsetless {
 				r.eff.Cleared, r.eff.ClearedUnconfirmed = true, false
+				return nil
+			}
+			// The field reports no selection offsets: the replace is only
+			// confirmed when its length is exactly the typed length.
+			if err := r.midActionFence(); err != nil {
+				return err
+			}
+			if obj, err := r.boundStep(*bind, editLenFn, false); err == nil {
+				if n, _ := obj["len"].(float64); int(n) == utf16Len(text) {
+					r.eff.Cleared, r.eff.ClearedUnconfirmed = true, false
+				}
 			}
 			return nil
 		}
