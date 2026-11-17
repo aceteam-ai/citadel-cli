@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // signalsCaller is a fake CDP endpoint for the page-signals read.
@@ -15,10 +16,15 @@ type signalsCaller struct {
 	failOn    string
 	calls     []string
 	evalParam map[string]any
+	// hook runs when a method arrives, before it is answered.
+	hook func(method string)
 }
 
 func (f *signalsCaller) Call(method string, params map[string]any) (map[string]any, error) {
 	f.calls = append(f.calls, method)
+	if f.hook != nil {
+		f.hook(method)
+	}
 	if method == f.failOn {
 		return nil, errors.New("boom")
 	}
@@ -36,7 +42,7 @@ func (f *signalsCaller) Call(method string, params map[string]any) (map[string]a
 
 func TestPageSignalsUseIsolatedWorld(t *testing.T) {
 	f := &signalsCaller{text: "Sign in\n\nJoin now to see", pw: true}
-	sig, ok := readPageSignalsOn(f)
+	sig, ok := readPageSignalsOn(f, nil)
 	if !ok || sig.Text != "Sign in Join now to see" || !sig.PasswordField {
 		t.Fatalf("sig=%+v ok=%v", sig, ok)
 	}
@@ -66,7 +72,7 @@ func TestPageSignalsBound(t *testing.T) {
 		t.Fatalf("multibyte len %d", n)
 	}
 	f := &signalsCaller{text: long}
-	sig, ok := readPageSignalsOn(f)
+	sig, ok := readPageSignalsOn(f, nil)
 	if !ok || len([]rune(sig.Text)) > MaxCobrowsePageTextRunes {
 		t.Fatalf("len %d ok=%v", len([]rune(sig.Text)), ok)
 	}
@@ -75,7 +81,7 @@ func TestPageSignalsBound(t *testing.T) {
 func TestPageSignalsFailureOmits(t *testing.T) {
 	for _, m := range []string{"Page.getFrameTree", "Page.createIsolatedWorld", "Runtime.evaluate"} {
 		f := &signalsCaller{text: "x", failOn: m}
-		if sig, ok := readPageSignalsOn(f); ok || sig != (PageSignals{}) {
+		if sig, ok := readPageSignalsOn(f, nil); ok || sig != (PageSignals{}) {
 			t.Fatalf("%s: sig=%+v ok=%v", m, sig, ok)
 		}
 	}
@@ -149,9 +155,21 @@ func TestWithPageSignalsNothingForRefusedPage(t *testing.T) {
 func TestWithPageSignalsNotForTrackingOrPending(t *testing.T) {
 	f := &signalsCaller{text: "x", pw: true}
 	m, s, connects := signalsEnv(t, f, okGate)
+	// A tracking pin that would succeed: the skip, not a failed pin, must
+	// be what prevents the read.
+	oldPin := pageSignalsPin
+	t.Cleanup(func() { pageSignalsPin = oldPin })
+	pins := 0
+	pageSignalsPin = func(*cobrowseSession, context.Context) (pin, error) {
+		pins++
+		return pin{port: 1}, nil
+	}
 	s.tracking = true
 	if st := m.WithPageSignals(CobrowseSessionStatus{ID: "cb-1"}); st.PageText != "" || st.PasswordField != nil {
 		t.Fatalf("tracking session reported signals: %+v", st)
+	}
+	if pins != 0 {
+		t.Fatalf("tracking session was pinned %d times", pins)
 	}
 	s.tracking = false
 	if st := m.WithPageSignals(CobrowseSessionStatus{ID: "cb-1", FirstLoad: FirstLoadPending}); st.PasswordField != nil {
@@ -178,5 +196,87 @@ func TestPageSignalsNotInRegistryRecord(t *testing.T) {
 	raw, _ := json.Marshal(sessionRecord{})
 	if strings.Contains(string(raw), "page_text") || strings.Contains(string(raw), "password") {
 		t.Fatalf("record carries page signals: %s", raw)
+	}
+}
+
+// handoffAt hands the session to a human when the named phase is reached.
+func TestWithPageSignalsHandoffDuringEachPhase(t *testing.T) {
+	for _, phase := range []string{"connect", "Page.getFrameTree", "Page.createIsolatedWorld", "Runtime.evaluate"} {
+		f := &signalsCaller{text: "secret", pw: true}
+		m, s, _ := signalsEnv(t, f, okGate)
+		flip := func() {
+			s.mu.Lock()
+			s.explicitHandoff = true
+			s.mu.Unlock()
+		}
+		if phase == "connect" {
+			inner := pageSignalsConnect
+			pageSignalsConnect = func(ctx context.Context, p pin) (cdpCaller, func(), error) {
+				flip()
+				return inner(ctx, p)
+			}
+		} else {
+			f.hook = func(method string) {
+				if method == phase {
+					flip()
+				}
+			}
+		}
+		st := m.WithPageSignals(CobrowseSessionStatus{ID: "cb-1"})
+		if st.PageText != "" || st.PasswordField != nil {
+			t.Fatalf("%s: handoff still returned signals: %+v", phase, st)
+		}
+		evaluated := false
+		for _, c := range f.calls {
+			if c == "Runtime.evaluate" {
+				evaluated = true
+			}
+		}
+		if phase != "Runtime.evaluate" && evaluated {
+			t.Fatalf("%s: evaluate ran after the handoff: %v", phase, f.calls)
+		}
+	}
+}
+
+func TestPageSignalsScriptCapsInPageAndHugeTextIsBounded(t *testing.T) {
+	if !strings.Contains(pageSignalsScript, "slice(0, 32768)") {
+		t.Fatal("the page script no longer caps the text in the page")
+	}
+	f := &signalsCaller{text: strings.Repeat("ab ", 1<<20)}
+	sig, ok := readPageSignalsOn(f, nil)
+	if !ok || len([]rune(sig.Text)) != MaxCobrowsePageTextRunes {
+		t.Fatalf("len=%d ok=%v", len([]rune(sig.Text)), ok)
+	}
+}
+
+func TestCollapsePageTextStripsFormatCharacters(t *testing.T) {
+	if got := CollapsePageText("a\u200bb\u202ec\ufeffd"); got != "abcd" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+type blockingCaller struct{ ctx context.Context }
+
+func (b blockingCaller) Call(string, map[string]any) (map[string]any, error) {
+	<-b.ctx.Done()
+	return nil, b.ctx.Err()
+}
+
+func TestWithPageSignalsBudgetOmits(t *testing.T) {
+	f := &signalsCaller{}
+	m, _, _ := signalsEnv(t, f, okGate)
+	old := cobrowseReportReserve
+	cobrowseReportReserve = 50 * time.Millisecond
+	t.Cleanup(func() { cobrowseReportReserve = old })
+	pageSignalsConnect = func(ctx context.Context, p pin) (cdpCaller, func(), error) {
+		return blockingCaller{ctx}, func() {}, nil
+	}
+	start := time.Now()
+	st := m.WithPageSignals(CobrowseSessionStatus{ID: "cb-1"})
+	if st.PageText != "" || st.PasswordField != nil {
+		t.Fatalf("st=%+v", st)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("the read outlived its budget")
 	}
 }

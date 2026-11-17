@@ -33,8 +33,9 @@ type PageSignals struct {
 	PasswordField bool
 }
 
-// pageSignalsGate and pageSignalsConnect are seams for tests.
+// pageSignalsGate, pageSignalsConnect and pageSignalsPin are seams for tests.
 var (
+	pageSignalsPin     = (*cobrowseSession).pinActionCtx
 	pageSignalsGate    = pageActiveErr
 	pageSignalsConnect = func(ctx context.Context, p pin) (cdpCaller, func(), error) {
 		c, err := openCDPConn(ctx, p)
@@ -56,7 +57,8 @@ func CollapsePageText(raw string) string {
 			space = b.Len() > 0
 			continue
 		}
-		if unicode.IsControl(r) {
+		// Cc (controls) and Cf (bidi marks, zero-width characters).
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			continue
 		}
 		if space {
@@ -78,9 +80,16 @@ func CollapsePageText(raw string) string {
 
 // readPageSignalsOn reads the signals through c in an isolated world of the
 // main frame. Any failure reports false: the caller omits the fields.
-func readPageSignalsOn(c cdpCaller) (PageSignals, bool) {
+//
+// fence is the live driver check. It runs after every await (the frame tree,
+// the isolated world, and the evaluate), so a handoff at any point omits both
+// fields; the evaluate itself is never sent once the fence has refused.
+func readPageSignalsOn(c cdpCaller, fence func() error) (PageSignals, bool) {
+	if fence == nil {
+		fence = func() error { return nil }
+	}
 	tree, err := c.Call("Page.getFrameTree", nil)
-	if err != nil {
+	if err != nil || fence() != nil {
 		return PageSignals{}, false
 	}
 	frameID := rootFrameID(tree)
@@ -88,7 +97,7 @@ func readPageSignalsOn(c cdpCaller) (PageSignals, bool) {
 		return PageSignals{}, false
 	}
 	w, err := c.Call("Page.createIsolatedWorld", map[string]any{"frameId": frameID, "worldName": "citadel-signals"})
-	if err != nil {
+	if err != nil || fence() != nil {
 		return PageSignals{}, false
 	}
 	ctxID, ok := w["executionContextId"].(float64)
@@ -100,7 +109,7 @@ func readPageSignalsOn(c cdpCaller) (PageSignals, bool) {
 		"contextId":     int(ctxID),
 		"returnByValue": true,
 	})
-	if err != nil {
+	if err != nil || fence() != nil {
 		return PageSignals{}, false
 	}
 	if exc, ok := res["exceptionDetails"]; ok && exc != nil {
@@ -119,7 +128,7 @@ func readPageSignalsOn(c cdpCaller) (PageSignals, bool) {
 // readPageSignals reads the signals of the pinned page, after the page policy
 // gate and under ctx. It reports false when the page is refused or not the
 // active one, or when anything fails.
-func readPageSignals(ctx context.Context, p pin) (PageSignals, bool) {
+func readPageSignals(ctx context.Context, p pin, fence func() error) (PageSignals, bool) {
 	if err := pageSignalsGate(ctx, p); err != nil {
 		return PageSignals{}, false
 	}
@@ -128,7 +137,10 @@ func readPageSignals(ctx context.Context, p pin) (PageSignals, bool) {
 		return PageSignals{}, false
 	}
 	defer closeFn()
-	return readPageSignalsOn(c)
+	if fence != nil && fence() != nil {
+		return PageSignals{}, false
+	}
+	return readPageSignalsOn(c, fence)
 }
 
 // pageSignals reads the signals for a node-wide session. Page-tracking
@@ -141,11 +153,11 @@ func (s *cobrowseSession) pageSignals(ctx context.Context) (PageSignals, bool) {
 	if tracking {
 		return PageSignals{}, false
 	}
-	p, err := s.pinActionCtx(ctx)
+	p, err := pageSignalsPin(s, ctx)
 	if err != nil {
 		return PageSignals{}, false
 	}
-	return readPageSignals(ctx, p)
+	return readPageSignals(ctx, p, func() error { return s.driverFence(p) })
 }
 
 // WithPageSignals adds page_text and password_field to a start or status
