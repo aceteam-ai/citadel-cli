@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 func TestValidateTag(t *testing.T) {
@@ -551,5 +553,36 @@ func TestMeetingModuleInstalled(t *testing.T) {
 	}
 	if !meetingModuleInstalled(dir) {
 		t.Error("meetingModuleInstalled = false after writing the install marker, want true")
+	}
+}
+
+// The install marker is resolved from the node dir supplied by NodeDirHook (the
+// dir the manifest is read from), not platform.ConfigDir().
+func TestMeetingNodeDirUsesHook(t *testing.T) {
+	prev := NodeDirHook
+	t.Cleanup(func() { NodeDirHook = prev })
+
+	nodeDir := t.TempDir()
+	NodeDirHook = func() string { return nodeDir }
+	if got := meetingNodeDir(); got != nodeDir {
+		t.Fatalf("meetingNodeDir() = %q, want hook dir %q", got, nodeDir)
+	}
+	if meetingModuleInstalled(meetingNodeDir()) {
+		t.Fatal("installed before marker exists")
+	}
+	if err := os.MkdirAll(filepath.Join(nodeDir, "services"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nodeDir, "services", "meeting.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !meetingModuleInstalled(meetingNodeDir()) {
+		t.Fatal("marker in hook dir not detected")
+	}
+
+	// An empty hook result falls back to platform.ConfigDir().
+	NodeDirHook = func() string { return "" }
+	if got := meetingNodeDir(); got != platform.ConfigDir() {
+		t.Errorf("fallback = %q, want platform.ConfigDir()", got)
 	}
 }
