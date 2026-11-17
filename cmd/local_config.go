@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
@@ -576,17 +577,47 @@ var (
 )
 
 var localConfigCmd = &cobra.Command{
-	Use:       "config <" + strings.Join(harnessNames(), "|") + ">",
-	Short:     "Print (or write) the MCP entry that connects an agent app to citadel local mcp",
-	Args:      cobra.ExactArgs(1),
-	ValidArgs: harnessNames(),
+	Use:       "config <" + strings.Join(harnessNames(), "|") + "> | uploads <on|off|status>",
+	Short:     "Connect an agent app, or configure local file uploads",
+	Args:      localConfigArgs,
+	ValidArgs: append(harnessNames(), "uploads"),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if args[0] == "uploads" {
+			if cmd.Flags().Changed("write") || cmd.Flags().Changed("yes") {
+				return errors.New("config uploads does not use harness --write or --yes flags")
+			}
+			return runLocalUploadsConfig(localStateDir(), os.Getenv("CITADEL_LOCAL_UPLOADS"), args[1], cmd.OutOrStdout())
+		}
 		exe, err := citadelExecutable()
 		if err != nil {
 			return fmt.Errorf("find the citadel executable: %w", err)
 		}
 		return runLocalConfig(args[0], exe, systemHarnessEnv(), localConfigWrite, localConfigYes, cmd.InOrStdin(), cmd.OutOrStdout(), time.Now())
 	},
+}
+
+func localConfigArgs(_ *cobra.Command, args []string) error {
+	if len(args) > 0 && args[0] == "uploads" {
+		if len(args) != 2 || (args[1] != "on" && args[1] != "off" && args[1] != "status") {
+			return errors.New("use citadel local config uploads on|off|status")
+		}
+		return nil
+	}
+	return cobra.ExactArgs(1)(nil, args)
+}
+
+func runLocalUploadsConfig(dir, environment, value string, out io.Writer) error {
+	if value != "status" {
+		if err := localcobrowse.WriteUploadSetting(dir, value); err != nil {
+			return err
+		}
+	}
+	st := localcobrowse.NewUploadSettings(dir, environment).Status()
+	fmt.Fprintln(out, st.Reason)
+	if st.Warning != "" {
+		fmt.Fprintln(out, "Warning:", st.Warning)
+	}
+	return nil
 }
 
 func init() {

@@ -1,6 +1,8 @@
 # Local co-browse: file upload, and field editing parity
 
-Status: design only. No code ships with this document.
+Status: design of record. S1 implements file-aware commit snapshots; S2 adds
+the opt-out setting and shared gate. Local upload entry points remain in later
+slices; the setting alone does not enable staging or attachment.
 
 Refs #1729 (local-mode file upload) and #1730 (type with selector and clear,
 key modifiers). Builds on #1721 / PR #1722 (staging, `set_file_input`, chooser
