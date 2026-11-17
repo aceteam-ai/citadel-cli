@@ -218,7 +218,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 						}
 						go func(m InputMessage) {
 							defer attachBusy.Store(false)
-							reason := fsess.AttachStagedFile(id, m.BackendNodeID, m.StagedName)
+							reason := fsess.AttachStagedFile(ctx, id, m.BackendNodeID, m.StagedName)
 							if reason != "" {
 								push(FileAttachResult{Type: FileAttachResultType, Error: reason})
 								return

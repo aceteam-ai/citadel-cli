@@ -1,6 +1,10 @@
 package cobrowsestream
 
-import "github.com/aceteam-ai/citadel-cli/internal/platform"
+import (
+	"context"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
+)
 
 // managerSession adapts the #793 CobrowseSessionManager to the Session interface
 // this server needs, using only the manager's EXISTING exported API so the
@@ -90,7 +94,7 @@ func (s fileAttachManagerSession) FileChooser(id string) (FileChooserMessage, bo
 
 // AttachStagedFile implements FileAttachSession. Only a fixed reason code
 // leaves this function.
-func (s fileAttachManagerSession) AttachStagedFile(id string, backendNodeID int, stagedName string) string {
-	_, err := s.m.HumanAttachStagedFile(id, backendNodeID, stagedName)
+func (s fileAttachManagerSession) AttachStagedFile(ctx context.Context, id string, backendNodeID int, stagedName string) string {
+	_, err := s.m.HumanAttachStagedFile(ctx, id, backendNodeID, stagedName)
 	return platform.AttachFailureReason(err)
 }

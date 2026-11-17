@@ -2,6 +2,7 @@ package platform
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -189,7 +190,7 @@ func runFileUploadRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		t.Fatalf("StageFile 3: %v", err)
 	}
 	// Without control the human path refuses and the browser is untouched.
-	if _, err := m.HumanAttachStagedFile(st.ID, pending3.BackendNodeID, "doc3.bin"); !errors.Is(err, ErrViewerNoControl) {
+	if _, err := m.HumanAttachStagedFile(context.Background(), st.ID, pending3.BackendNodeID, "doc3.bin"); !errors.Is(err, ErrViewerNoControl) {
 		t.Fatalf("attach without control: %v", err)
 	}
 	if _, err := m.Handoff(st.ID); err != nil {
@@ -207,10 +208,10 @@ func runFileUploadRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		_, ok := m.HumanFileAttachOffer(st.ID)
 		return ok
 	})
-	if _, err := m.HumanAttachStagedFile(st.ID, pending3.BackendNodeID+1, "doc3.bin"); !errors.Is(err, ErrChooserMismatch) {
+	if _, err := m.HumanAttachStagedFile(context.Background(), st.ID, pending3.BackendNodeID+1, "doc3.bin"); !errors.Is(err, ErrChooserMismatch) {
 		t.Fatalf("attach to another node: %v", err)
 	}
-	if _, err := m.HumanAttachStagedFile(st.ID, pending3.BackendNodeID, "doc3.bin"); err != nil {
+	if _, err := m.HumanAttachStagedFile(context.Background(), st.ID, pending3.BackendNodeID, "doc3.bin"); err != nil {
 		t.Fatalf("human attach: %v", err)
 	}
 	if s, _ := m.SessionStatus(st.ID); s.FileChooser != nil {

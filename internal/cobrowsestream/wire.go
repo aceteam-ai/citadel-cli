@@ -92,7 +92,7 @@ type FileChooserMessage struct {
 const FileAttachResultType = "file_attach_result"
 
 // FileAttachResult answers one file_attach. Error is a fixed reason code
-// (no_control, files_disabled, no_pending_chooser, chooser_mismatch,
+// (no_control, viewer_gone, files_disabled, no_pending_chooser, chooser_mismatch,
 // invalid_staged_name, staged_file_unavailable, page_changed,
 // session_unavailable, busy, attach_failed), never a path, URL or content.
 // StagedName is echoed only on success.

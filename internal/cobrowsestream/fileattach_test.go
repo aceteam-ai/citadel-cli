@@ -1,6 +1,7 @@
 package cobrowsestream
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ type fakeAttachSession struct {
 	offering bool
 	reason   string
 	attached []string
+	block    chan struct{}
 }
 
 func (s *fakeAttachSession) FileChooser(id string) (FileChooserMessage, bool) {
@@ -36,11 +38,53 @@ func (s *fakeAttachSession) setOffer(m FileChooserMessage, on bool) {
 	s.amu.Unlock()
 }
 
-func (s *fakeAttachSession) AttachStagedFile(id string, node int, name string) string {
+func (s *fakeAttachSession) AttachStagedFile(ctx context.Context, id string, node int, name string) string {
 	s.amu.Lock()
-	defer s.amu.Unlock()
 	s.attached = append(s.attached, name)
-	return s.reason
+	reason, block := s.reason, s.block
+	s.amu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+	}
+	return reason
+}
+
+// One attach at a time per viewer: a second while one is in flight is answered
+// busy and never reaches the session. The attach gets the stream's context.
+func TestFileAttachBusyWhileOneIsInFlight(t *testing.T) {
+	f := newFakeChrome()
+	defer f.close()
+	sess := &fakeAttachSession{fakeSession: &fakeSession{port: 9222, attachable: true, humanControl: true}, block: make(chan struct{})}
+	ts := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	readFileChooser(t, conn, false)
+	sendAttach(t, conn, 7, "a.pdf")
+	deadline := time.Now().Add(3 * time.Second)
+	for len(sess.attachCalls()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	sendAttach(t, conn, 7, "b.pdf")
+	var res FileAttachResult
+	for {
+		res = FileAttachResult{}
+		if json.Unmarshal(readText(t, conn), &res) == nil && res.Type == FileAttachResultType {
+			break
+		}
+	}
+	if res.OK || res.Error != "busy" {
+		t.Fatalf("second attach = %+v, want busy", res)
+	}
+	if got := sess.attachCalls(); len(got) != 1 || got[0] != "a.pdf" {
+		t.Fatalf("the busy attach reached the session: %v", got)
+	}
+	close(sess.block)
 }
 
 func (s *fakeAttachSession) attachCalls() []string {

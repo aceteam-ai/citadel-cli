@@ -18,6 +18,7 @@
 package platform
 
 import (
+	"context"
 	"errors"
 	"log"
 	"os"
@@ -27,6 +28,7 @@ import (
 // Human attach refusals. Each is a fixed reason; none carries a path, URL or
 // content.
 var (
+	ErrViewerGone           = errors.New("the requesting viewer disconnected")
 	ErrViewerNoControl      = errors.New("the viewer does not have control of this session")
 	ErrAttachFilesDisabled  = errors.New("file attach is not permitted on this node")
 	ErrNoPendingChooser     = errors.New("no file chooser is pending")
@@ -150,6 +152,31 @@ func (s *cobrowseSession) humanControlFence(port int) error {
 	return nil
 }
 
+// humanAttachFence is the human path's dispatch fence: the requesting viewer is
+// still connected, the chooser is still the captured one (same pointer), and
+// the viewer still has control on the same browser.
+func (s *cobrowseSession) humanAttachFence(ctx context.Context, chooser *FileChooserPending, port int) error {
+	if ctx.Err() != nil {
+		return ErrViewerGone
+	}
+	s.mu.Lock()
+	same := s.chooser == chooser
+	s.mu.Unlock()
+	if !same {
+		return ErrTargetChanged
+	}
+	return s.humanControlFence(port)
+}
+
+// clearChooserIf clears the pending chooser only if it is p.
+func (s *cobrowseSession) clearChooserIf(p *FileChooserPending) {
+	s.mu.Lock()
+	if s.chooser == p {
+		s.chooser = nil
+	}
+	s.mu.Unlock()
+}
+
 // HumanAttachStagedFile fills the pending file chooser's input with one staged
 // file for the viewer that has control. The chooser must be the one named by
 // backendNodeID, and its frame must still be at the URL it had when the chooser
@@ -165,7 +192,16 @@ func (s *cobrowseSession) humanControlFence(port int) error {
 // resume landing between one side's last check and its DOM.setFileInputFiles
 // can let both dispatch. That window exists for every agent action already
 // (driverFence); this path does not widen it.
-func (m *CobrowseSessionManager) HumanAttachStagedFile(id string, backendNodeID int, stagedName string) (StagedFile, error) {
+//
+// ctx is the requesting viewer connection's. Both final fences refuse once it
+// is done, so a disconnected viewer's in-flight attach cannot land while a
+// second viewer holds control. Both also require the captured chooser to still
+// be the pending one, by pointer (a chooser re-opened on the same node is a
+// different chooser).
+func (m *CobrowseSessionManager) HumanAttachStagedFile(ctx context.Context, id string, backendNodeID int, stagedName string) (StagedFile, error) {
+	if ctx.Err() != nil {
+		return StagedFile{}, ErrViewerGone
+	}
 	if !m.filesPermitted() {
 		return StagedFile{}, ErrAttachFilesDisabled
 	}
@@ -234,25 +270,23 @@ func (m *CobrowseSessionManager) HumanAttachStagedFile(id string, backendNodeID 
 		expectedURL:   bound.FrameURL,
 		path:          path,
 		file:          file,
-		fence: func() error {
-			// The lookups await the page: the chooser must still be the
-			// pending one (a main-frame navigation clears it).
-			s.mu.Lock()
-			same := s.chooser == chooser
-			s.mu.Unlock()
-			if !same {
-				return ErrTargetChanged
-			}
-			return s.humanControlFence(port)
-		},
+		// The lookups and the final frame read await the page. Each fence
+		// therefore re-checks, with no await after it: the requesting viewer is
+		// still connected, the chooser is still the captured one, and control.
+		fence: func() error { return s.humanAttachFence(ctx, chooser, port) },
 		driverFence: func() error {
 			if !m.filesPermitted() {
 				return ErrAttachFilesDisabled
 			}
-			return s.humanControlFence(port)
+			return s.humanAttachFence(ctx, chooser, port)
 		},
 	})
 	if err != nil {
+		// A frame that is no longer where the chooser opened leaves a stale
+		// chooser: stop offering it (only if it is still the captured one).
+		if errors.Is(err, ErrTargetChanged) {
+			s.clearChooserIf(chooser)
+		}
 		return StagedFile{}, err
 	}
 	log.Printf("[cobrowse] audit file_attach actor=human session=%s name=%q size=%d sha256=%s", id, file.Name, file.Size, file.SHA256)
@@ -265,6 +299,8 @@ func AttachFailureReason(err error) string {
 	switch {
 	case err == nil:
 		return ""
+	case errors.Is(err, ErrViewerGone):
+		return "viewer_gone"
 	case errors.Is(err, ErrViewerNoControl):
 		return "no_control"
 	case errors.Is(err, ErrAttachFilesDisabled):

@@ -67,7 +67,7 @@ type FileAttachSession interface {
 	FileChooser(id string) (FileChooserMessage, bool)
 	// AttachStagedFile fills the chooser's input with one staged file. reason
 	// is empty on success, else a fixed code (see FileAttachResult).
-	AttachStagedFile(id string, backendNodeID int, stagedName string) (reason string)
+	AttachStagedFile(ctx context.Context, id string, backendNodeID int, stagedName string) (reason string)
 }
 
 // TargetSnapshot is the pages of a session at one moment.

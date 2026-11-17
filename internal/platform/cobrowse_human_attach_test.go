@@ -2,6 +2,7 @@ package platform
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -74,15 +75,16 @@ func (e *humanAttachEnv) sets() int { return len(e.f.callsFor("DOM.setFileInputF
 func captureLog(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
+	prev := log.Writer()
 	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(log.Writer()) })
+	t.Cleanup(func() { log.SetOutput(prev) })
 	return &buf
 }
 
 func TestHumanAttachFillsPendingChooserAndAuditsNameSizeHash(t *testing.T) {
 	e := newHumanAttachEnv(t)
 	buf := captureLog(t)
-	got, err := e.m.HumanAttachStagedFile(e.st.ID, 7, "a.pdf")
+	got, err := e.m.HumanAttachStagedFile(context.Background(), e.st.ID, 7, "a.pdf")
 	if err != nil {
 		t.Fatalf("attach: %v", err)
 	}
@@ -149,12 +151,25 @@ func TestHumanAttachRefusalsDispatchNothing(t *testing.T) {
 			if c.mutate != nil {
 				c.mutate(e)
 			}
-			_, err := e.m.HumanAttachStagedFile(e.st.ID, c.node, c.staged)
+			_, err := e.m.HumanAttachStagedFile(context.Background(), e.st.ID, c.node, c.staged)
 			if !errors.Is(err, c.want) {
 				t.Fatalf("err = %v, want %v", err, c.want)
 			}
 			if n := e.sets(); n != 0 {
 				t.Fatalf("%d setFileInputFiles calls on a refusal", n)
+			}
+			// An up-front refusal makes no CDP call at all.
+			if !strings.HasPrefix(c.name, "chooser frame navigated") && !strings.HasPrefix(c.name, "chooser frame fragment") {
+				for _, m := range []string{"Page.createIsolatedWorld", "DOM.resolveNode", "Page.getFrameTree"} {
+					if n := len(e.f.callsFor(m)); n != 0 {
+						t.Fatalf("up-front refusal made %d %s calls", n, m)
+					}
+				}
+			}
+			if strings.HasPrefix(c.name, "chooser frame navigated") || strings.HasPrefix(c.name, "chooser frame fragment") {
+				if st, _ := e.m.SessionStatus(e.st.ID); st.FileChooser != nil {
+					t.Fatal("a stale chooser must stop being offered after a frame mismatch")
+				}
 			}
 			if r := AttachFailureReason(err); r != c.reason {
 				t.Fatalf("reason = %q, want %q", r, c.reason)
@@ -182,7 +197,7 @@ func TestHumanAttachHandBackBetweenCheckAndDispatchRefuses(t *testing.T) {
 			_, _ = e.m.Resume(e.st.ID)
 		}
 	}
-	_, err := e.m.HumanAttachStagedFile(e.st.ID, 7, "a.pdf")
+	_, err := e.m.HumanAttachStagedFile(context.Background(), e.st.ID, 7, "a.pdf")
 	if !errors.Is(err, ErrViewerNoControl) {
 		t.Fatalf("err = %v, want ErrViewerNoControl", err)
 	}
@@ -202,7 +217,7 @@ func TestHumanAttachFilesRevokedBeforeDispatchRefuses(t *testing.T) {
 			e.files.Store(false)
 		}
 	}
-	if _, err := e.m.HumanAttachStagedFile(e.st.ID, 7, "a.pdf"); !errors.Is(err, ErrAttachFilesDisabled) {
+	if _, err := e.m.HumanAttachStagedFile(context.Background(), e.st.ID, 7, "a.pdf"); !errors.Is(err, ErrAttachFilesDisabled) {
 		t.Fatalf("err = %v", err)
 	}
 	if n := e.sets(); n != 0 {
@@ -221,7 +236,7 @@ func TestHumanAttachChooserClearedDuringLookupRefuses(t *testing.T) {
 			e.s.clearChooser()
 		}
 	}
-	if _, err := e.m.HumanAttachStagedFile(e.st.ID, 7, "a.pdf"); !errors.Is(err, ErrTargetChanged) {
+	if _, err := e.m.HumanAttachStagedFile(context.Background(), e.st.ID, 7, "a.pdf"); !errors.Is(err, ErrTargetChanged) {
 		t.Fatalf("err = %v", err)
 	}
 	if n := e.sets(); n != 0 {
@@ -243,7 +258,7 @@ func TestHumanAttachLocalModeFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.StopAll() })
-	if _, err := m.HumanAttachStagedFile(st.ID, 7, "a.pdf"); !errors.Is(err, ErrAttachFilesDisabled) {
+	if _, err := m.HumanAttachStagedFile(context.Background(), st.ID, 7, "a.pdf"); !errors.Is(err, ErrAttachFilesDisabled) {
 		t.Fatalf("no Files wiring: err = %v", err)
 	}
 	if _, ok := m.HumanFileAttachOffer(st.ID); ok {
@@ -255,7 +270,7 @@ func TestHumanAttachLocalModeFailsClosed(t *testing.T) {
 	if m.HumanFileAttachSupported() {
 		t.Fatal("a tracking manager must not offer file attach even with Files wired")
 	}
-	if _, err := m.HumanAttachStagedFile(st.ID, 7, "a.pdf"); !errors.Is(err, errAttachNotApplicable) {
+	if _, err := m.HumanAttachStagedFile(context.Background(), st.ID, 7, "a.pdf"); !errors.Is(err, errAttachNotApplicable) {
 		t.Fatalf("a tracking session must refuse as not applicable: %v", err)
 	}
 	if n := len(f.callsFor("DOM.setFileInputFiles")); n != 0 {
@@ -269,7 +284,7 @@ func TestHumanAttachUnwiredManagerDenies(t *testing.T) {
 	if m.HumanFileAttachSupported() {
 		t.Fatal("unwired manager must not support attach")
 	}
-	if _, err := m.HumanAttachStagedFile(st.ID, 7, "a.pdf"); !errors.Is(err, ErrAttachFilesDisabled) {
+	if _, err := m.HumanAttachStagedFile(context.Background(), st.ID, 7, "a.pdf"); !errors.Is(err, ErrAttachFilesDisabled) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -363,5 +378,130 @@ func TestSetChooserFrameURLIgnoresStaleChooser(t *testing.T) {
 	s.setChooserFrameURL(cur, "https://later.example/")
 	if cur.FrameURL != "https://cur.example/" {
 		t.Fatal("a cleared chooser must not change")
+	}
+}
+
+// The final awaited frame read is where the chooser can change under the
+// attach: a clear or a replacement landing there must refuse the dispatch.
+func TestHumanAttachChooserChangesDuringFinalFrameRead(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		read int
+		do   func(e *humanAttachEnv)
+	}{
+		{"cleared at the final read", 2, func(e *humanAttachEnv) { e.s.clearChooser() }},
+		{"replaced at the final read (same node and URL)", 2, func(e *humanAttachEnv) { e.openChooser(7) }},
+		{"replaced at the final read (other node)", 2, func(e *humanAttachEnv) { e.openChooser(9) }},
+		{"replaced during the lookup (same node and URL)", 1, func(e *humanAttachEnv) { e.openChooser(7) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newHumanAttachEnv(t)
+			e.ff.onFrameTree = func(n int) {
+				if n == c.read {
+					c.do(e)
+				}
+			}
+			_, err := e.m.HumanAttachStagedFile(context.Background(), e.st.ID, 7, "a.pdf")
+			if !errors.Is(err, ErrTargetChanged) {
+				t.Fatalf("err = %v, want ErrTargetChanged", err)
+			}
+			if n := e.sets(); n != 0 {
+				t.Fatalf("%d dispatches to a stale chooser", n)
+			}
+			e.s.mu.Lock()
+			cur := e.s.chooser
+			e.s.mu.Unlock()
+			if strings.HasPrefix(c.name, "replaced") {
+				if cur == nil || cur.FrameURL != portalURL {
+					t.Fatalf("the replacement must stay pending: %+v", cur)
+				}
+			} else if cur != nil {
+				t.Fatalf("cleared chooser came back: %+v", cur)
+			}
+		})
+	}
+}
+
+// An attach is bound to its requesting connection: once that viewer is gone,
+// neither fence lets it dispatch.
+func TestHumanAttachRequestingViewerGoneRefuses(t *testing.T) {
+	e := newHumanAttachEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.m.HumanAttachStagedFile(ctx, e.st.ID, 7, "a.pdf"); !errors.Is(err, ErrViewerGone) {
+		t.Fatalf("err = %v", err)
+	}
+	if n := len(e.f.callsFor("Page.getFrameTree")); n != 0 {
+		t.Fatalf("%d CDP calls for a gone viewer", n)
+	}
+	for _, read := range []int{1, 2} {
+		e = newHumanAttachEnv(t)
+		ctx, cancel = context.WithCancel(context.Background())
+		e.ff.onFrameTree = func(n int) {
+			if n == read {
+				cancel()
+			}
+		}
+		if _, err := e.m.HumanAttachStagedFile(ctx, e.st.ID, 7, "a.pdf"); !errors.Is(err, ErrViewerGone) {
+			t.Fatalf("read %d: err = %v", read, err)
+		}
+		if n := e.sets(); n != 0 {
+			t.Fatalf("read %d: %d dispatches after the viewer left", read, n)
+		}
+	}
+	cancel()
+}
+
+// The watcher records the URL of the chooser's own frame, not the root's.
+func TestChooserWatcherRecordsChildFrameURL(t *testing.T) {
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	mux := http.NewServeMux()
+	var port int
+	mux.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `[{"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/page/1"}]`, port)
+	})
+	mux.HandleFunc("/json/version", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/browser/bid"}`, port)
+	})
+	mux.HandleFunc("/devtools/page/1", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for i := 0; i < 2; i++ {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+		_ = conn.WriteJSON(map[string]any{"method": "Page.fileChooserOpened", "params": map[string]any{"backendNodeId": 7, "mode": "selectSingle", "frameId": "C"}})
+		var req struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := conn.ReadJSON(&req); err != nil || req.Method != "Page.getFrameTree" {
+			return
+		}
+		tree := frameTreeResult([]fakeFrame{
+			{ID: "R", URL: "https://root.example/"},
+			{ID: "C", URL: "https://child.example/upload", Fragment: "#f"},
+		})
+		_ = conn.WriteJSON(map[string]any{"id": req.ID, "result": tree})
+		time.Sleep(2 * time.Second)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	port = srv.Listener.Addr().(*net.TCPAddr).Port
+	s := watcherSession(port, "bid")
+	runWatcherBriefly(s, port, 700*time.Millisecond)
+	s.mu.Lock()
+	c := s.chooser
+	var url string
+	if c != nil {
+		url = c.FrameURL
+	}
+	s.mu.Unlock()
+	if c == nil || c.FrameID != "C" || url != "https://child.example/upload#f" {
+		t.Fatalf("chooser = %+v, frame URL %q", c, url)
 	}
 }

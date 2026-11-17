@@ -164,8 +164,11 @@ and `TestCobrowseSession_NoActionReachesHumanFileAttach` pin the agent side).
 `fileFill`/`fillFileInput` is the one dispatch path both it and `set_file_input`
 use (isolated world, `checkFileInput`, `setFilesIfPageIs`, `redactPath`); the two
 differ only in their fences. The agent's "refused while a human drives" becomes
-`humanControlFence` (viewer attached and `explicitHandoff`), re-checked right
-before `DOM.setFileInputFiles`, and `expected_url` becomes the chooser binding:
+`humanAttachFence` (requesting viewer connection still open, the captured
+chooser still pending by pointer, then `humanControlFence`: viewer attached and
+`explicitHandoff`), run after the lookups and again after the final frame read,
+immediately before `DOM.setFileInputFiles`. A frame mismatch also drops that
+stale chooser. And `expected_url` becomes the chooser binding:
 the node id must be the pending chooser's, the chooser must still be the pending
 one, and the frame URL `watchChooserOnce` read from `Page.getFrameTree` when the
 chooser opened (`FileChooserPending.FrameURL`) must still be the frame's URL at
