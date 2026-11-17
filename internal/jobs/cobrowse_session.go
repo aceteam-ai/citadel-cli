@@ -204,15 +204,11 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		return sessionStatusResult(st)
 
 	case CobrowseSessionActionType:
-		id := job.Payload["session_id"]
-		if id == "" {
-			return nil, fmt.Errorf("type requires a 'session_id' field")
+		id, text, opts, err := parseTypeAction(job.Payload)
+		if err != nil {
+			return nil, err
 		}
-		text := job.Payload["text"]
-		if text == "" {
-			return nil, fmt.Errorf("type requires a 'text' field")
-		}
-		st, err := mgr.Type(id, text)
+		st, err := mgr.TypeWith(id, text, opts)
 		if err != nil {
 			return actionFailureResult(err, job.Payload["report_partial"] == "true")
 		}
@@ -231,11 +227,11 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		return json.Marshal(selected)
 
 	case CobrowseSessionActionKey:
-		id, key := job.Payload["session_id"], job.Payload["key"]
-		if id == "" || key == "" {
-			return nil, fmt.Errorf("key requires session_id and key")
+		id, key, modifiers, err := parseKeyAction(job.Payload)
+		if err != nil {
+			return nil, err
 		}
-		st, err := mgr.Key(id, key)
+		st, err := mgr.KeyWith(id, key, modifiers)
 		if err != nil {
 			return actionFailureResult(err, job.Payload["report_partial"] == "true")
 		}
@@ -534,4 +530,49 @@ func sessionListResult(list []platform.CobrowseSessionStatus) ([]byte, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// parseTypeAction validates a type payload: session_id, text, and the optional
+// selector and clear (citadel-cli#1730). Empty text is allowed only with clear.
+// Refusals name the field, never its value.
+func parseTypeAction(payload map[string]string) (string, string, platform.TypeOptions, error) {
+	var opts platform.TypeOptions
+	id := payload["session_id"]
+	if id == "" {
+		return "", "", opts, fmt.Errorf("type requires a 'session_id' field")
+	}
+	switch payload["clear"] {
+	case "", "false":
+	case "true":
+		opts.Clear = true
+	default:
+		return "", "", opts, fmt.Errorf("type 'clear' must be true or false")
+	}
+	opts.Selector = payload["selector"]
+	if len(opts.Selector) > platform.MaxCobrowseSelectorLen {
+		return "", "", opts, platform.ErrSelectorTooLong
+	}
+	text := payload["text"]
+	if text == "" && !opts.Clear {
+		return "", "", opts, fmt.Errorf("type requires a 'text' field (empty text is allowed only with clear)")
+	}
+	return id, text, opts, nil
+}
+
+// parseKeyAction validates a key payload: session_id, key, and the optional
+// modifiers bitmask, a base-10 integer 0 to 15 (anything else is refused).
+func parseKeyAction(payload map[string]string) (string, string, int, error) {
+	id, key := payload["session_id"], payload["key"]
+	if id == "" || key == "" {
+		return "", "", 0, fmt.Errorf("key requires session_id and key")
+	}
+	mods := 0
+	if raw, ok := payload["modifiers"]; ok && raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 || n > 15 || strconv.Itoa(n) != raw {
+			return "", "", 0, platform.ErrModifiersOutRange
+		}
+		mods = n
+	}
+	return id, key, mods, nil
 }

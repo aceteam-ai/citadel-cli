@@ -39,6 +39,9 @@ type latencyCDP struct {
 	dropOn map[string]bool
 	// noScroll keeps an evalDelay'd selector resolution from scrolling.
 	noScroll bool
+	// evalHook answers an evaluate before the built-in answers; it runs under
+	// the fake's lock and must not touch it.
+	evalHook func(expr string) (any, bool)
 
 	discoveries atomic.Int64
 	dials       atomic.Int64
@@ -134,7 +137,12 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 				}
 				f.mu.Lock()
 				var val any
+				hooked := false
+				if f.evalHook != nil {
+					val, hooked = f.evalHook(expr)
+				}
 				switch {
+				case hooked:
 				case strings.Contains(expr, "window.scrollX"):
 					f.probes++
 					if f.probes == 1 && f.stallFirstProbe > 0 {

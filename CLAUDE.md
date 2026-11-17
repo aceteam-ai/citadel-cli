@@ -122,6 +122,13 @@ success); only a payload `report_partial: true` gets the structured `done:false`
 result. Local mode returns the same details as a tool error. An approved commit
 that was dispatched and then failed resolves as `unconfirmed`, not failed.
 `TestCobrowseRealBrowserActionLatency` pins the budgets.
+`TypeWith` and `KeyWith` (#1730) own the targeted replace and key modifiers, each still one
+`runAction`: resolve and focus the selector, select the content, then insert (or a real Backspace for an
+empty clear, read back as empty), with `midActionFence` between steps. Refusals (empty text without
+`clear`, selector over `MaxCobrowseSelectorLen`, modifiers outside 0..15, a selector that matches
+nothing or is not editable) send nothing. `ActionEffects.Cleared` and `Focused` report partial work;
+status `input_edit` (`InputEditV1`) is the marker a caller checks first. Local mode does not pass the
+new fields. `TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
 
 `platform.StageFile` and `platform.SetFileInput` own file upload for remotely
 dispatched sessions (#1721, node side of aceteam#13831). Staged files live in a

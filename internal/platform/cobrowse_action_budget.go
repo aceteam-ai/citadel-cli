@@ -67,6 +67,10 @@ type ActionEffects struct {
 	// acknowledgement arrived before the deadline.
 	TypedLength      int  `json:"typed_length"`
 	TypedUnconfirmed bool `json:"typed_unconfirmed,omitempty"`
+	// Cleared is true once a type with clear removed or replaced the target's
+	// previous content (an empty clear: the field read back empty; a replace:
+	// the replacement text was acknowledged). Never the content itself.
+	Cleared bool `json:"cleared"`
 	// FilesSet is the number of files handed to a file input by set_file_input.
 	FilesSet int `json:"files_set,omitempty"`
 	// Navigated is true when the page URL differs from before the action.
@@ -80,7 +84,7 @@ type ActionEffects struct {
 // anyEffect reports whether the page is known or likely to have changed.
 // Dispatched alone is not an effect: it only says input may have been sent.
 func (e ActionEffects) anyEffect() bool {
-	return e.Scrolled || e.Focused || e.Clicked || e.TypedLength > 0 || e.Navigated || e.FilesSet > 0
+	return e.Scrolled || e.Focused || e.Clicked || e.TypedLength > 0 || e.Cleared || e.Navigated || e.FilesSet > 0
 }
 
 // ActionIncompleteError is returned when an action hit its deadline or failed
@@ -114,6 +118,9 @@ func (e *ActionIncompleteError) Error() string {
 	}
 	if e.Effects.FilesSet > 0 {
 		parts = append(parts, fmt.Sprintf("set %d file(s) on a file input", e.Effects.FilesSet))
+	}
+	if e.Effects.Cleared {
+		parts = append(parts, "cleared the field")
 	}
 	if e.Effects.TypedLength > 0 {
 		unconfirmed := ""
@@ -335,11 +342,13 @@ func applyProbe(eff *ActionEffects, before, after pageProbe) {
 	if before.probeValid {
 		eff.Scrolled = math.Abs(after.x-before.x) >= 0.5 || math.Abs(after.y-before.y) >= 0.5
 		eff.Navigated = before.url != "" && after.url != "" && before.url != after.url
-		eff.Focused = after.focusSig != "" && after.focusSig != before.focusSig
+		eff.Focused = eff.Focused || (after.focusSig != "" && after.focusSig != before.focusSig)
 	} else {
-		eff.Focused = after.focusSig != ""
+		eff.Focused = eff.Focused || after.focusSig != ""
 	}
-	if eff.Focused {
+	// An action that focused its own target (type with a selector) already
+	// recorded the tag; the probe fills it for a focus change it observed.
+	if eff.Focused && after.focusTag != "" {
 		eff.FocusTag = after.focusTag
 	}
 }
