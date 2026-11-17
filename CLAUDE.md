@@ -139,6 +139,24 @@ confirmation. Status `input_edit` (`InputEditV1`, non-tracking sessions only, li
 is the marker a caller checks first. Local mode does not pass the new fields.
 `TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
 
+`InspectTarget` owns the browser-created isolated world used for the complete
+target probe and form snapshot. The session caches only its latest target,
+frame and loader context, invalidates a lost context without retrying the read,
+and checks the live driver after every awaited call. `FormSnapshotScript` binds each File entry's
+field name, native file name, size, type and lastModified; it normalizes the
+browser's synthetic empty-file timestamp, refuses unreadable or excessive
+metadata, and never reads bytes or paths. The local commit card copies bounded
+metadata for display using text only, removes format/control characters and
+preserves the filename's final extension; an extension too long to display is
+unverifiable. `Classify` trusts only the probe's native-control chooser signal
+for a non-actionable file input or associated label. Other labels are described
+by the native control they activate, not the label's text; an uninspectable
+associated custom control is refused. Interactive descendants stay their own
+targets; actionable chooser controls retain commit checks. Agent views omit file
+metadata while the human drives, without altering the human's card. It does not attach a file
+or authorize staging; those remain separate upload slices. The rule version and
+`TestRealBrowserCommitActionsFileSnapshots` pin this approval behavior.
+
 `platform.StageFile` and `platform.SetFileInput` own file upload for remotely
 dispatched sessions (#1721, node side of aceteam#13831). Staged files live in a
 `cobrowseStagingDirName` dir inside the session's own working dir, so every

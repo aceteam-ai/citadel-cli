@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -1253,6 +1254,17 @@ func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platfor
 		unverifiable: a.Kind != "navigate" && (!t.Resolved || t.Oversized),
 		tooLarge:     t.Oversized,
 	}
+	for _, file := range t.FormFiles {
+		file.Field = sanitizeLabel(file.Field)
+		var readable bool
+		file.Name, readable = sanitizeFileName(file.Name)
+		if !readable {
+			pc.unverifiable = true
+			pc.reason = "the file extension is too long to display safely"
+		}
+		file.Type = sanitizeLabel(file.Type)
+		pc.files = append(pc.files, file)
+	}
 	ss.commit = pc
 	ss.lastCommit, ss.result = "", nil
 	s.notifyLocked()
@@ -1282,15 +1294,41 @@ func newCommitID() string {
 // sanitizeLabel bounds a control's label and drops control characters before
 // it reaches a card or the audit log.
 func sanitizeLabel(s string) string {
+	return truncRunes(cleanLabel(s), 80)
+}
+
+func cleanLabel(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		if unicode.IsControl(r) {
 			b.WriteRune(' ')
 			continue
 		}
 		b.WriteRune(r)
 	}
-	return truncRunes(strings.TrimSpace(b.String()), 80)
+	return strings.TrimSpace(b.String())
+}
+
+// Keep the final extension visible. An extension that cannot fit the bounded
+// card is explicitly unreadable and cannot acquire executable approval.
+func sanitizeFileName(s string) (string, bool) {
+	s = cleanLabel(s)
+	r := []rune(s)
+	if len(r) <= 80 {
+		return s, true
+	}
+	dot := strings.LastIndex(s, ".")
+	if dot <= 0 {
+		return truncRunes(s, 77), true
+	}
+	ext := []rune(s[dot:])
+	if len(ext) > 77 {
+		return "[filename unavailable: extension too long]", false
+	}
+	return string(r[:80-3-len(ext)]) + "..." + string(ext), true
 }
 
 // Extract reads an element's text and attributes, bounded (R).
@@ -1401,10 +1439,19 @@ func redactWhileHuman(raw string) string {
 func (s *Service) agentViewLocked(ss *session, st platform.CobrowseSessionStatus, now time.Time) SessionView {
 	v := s.viewLocked(ss, st, now)
 	if st.Driver == platform.DriverHuman {
-		v.URL = redactWhileHuman(v.URL)
-		redactTargets(v.Targets)
+		redactAgentHumanView(&v)
 	}
 	return v
+}
+
+// Human viewer evidence is not an agent observation while the human drives.
+// viewLocked builds an independent card, so redaction leaves the viewer intact.
+func redactAgentHumanView(v *SessionView) {
+	v.URL = redactWhileHuman(v.URL)
+	redactTargets(v.Targets)
+	if v.Commit != nil {
+		v.Commit.Files = nil
+	}
 }
 
 // redactTargets applies the human-driving redaction to every page: origin only,
@@ -1452,6 +1499,7 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 	if c := ss.commit; c != nil && now.Sub(c.requestedAt) < PendingCommitTTL {
 		cv := &CommitView{Unverifiable: c.unverifiable, ID: c.id, Domain: c.domain, Action: c.action, Label: c.label, Reason: c.reason,
 			RequestedAt: c.requestedAt.UTC().Format(time.RFC3339), HasShot: c.shot != ""}
+		cv.Files = append([]platform.FormFile(nil), c.files...)
 		if c.rect.W > 0 && c.rect.H > 0 {
 			r := c.rect
 			cv.Rect = &r
@@ -1509,8 +1557,7 @@ func (s *Service) status(id string) ([]SessionView, error) {
 	views := s.Sessions(id)
 	for i := range views {
 		if views[i].Driver == string(platform.DriverHuman) {
-			views[i].URL = redactWhileHuman(views[i].URL)
-			redactTargets(views[i].Targets)
+			redactAgentHumanView(&views[i])
 		}
 	}
 	return views, nil

@@ -26,7 +26,7 @@ import (
 
 // RuleVersion is recorded in the audit log so a later reader knows which rules
 // classified an action. Bump it when the rules change.
-const RuleVersion = "local-commit-1"
+const RuleVersion = "local-commit-4"
 
 // Class is how an action is treated.
 type Class string
@@ -216,6 +216,9 @@ func Classify(kind, key string, t platform.TargetInfo) Decision {
 			return Decision{Class: ClassFill}
 		}
 	case "click":
+		if t.FileChooser && (t.Tag == "input" || t.Tag == "label") && !t.Actionable {
+			return Decision{Class: ClassFill}
+		}
 		if t.Entry && !t.Actionable {
 			return Decision{Class: ClassFill}
 		}
@@ -385,7 +388,8 @@ type CommitView struct {
 	HasShot     bool   `json:"has_shot"`
 	// Unverifiable is true when the target could not be verified: the card says
 	// to do it yourself and offers no approve button.
-	Unverifiable bool `json:"unverifiable,omitempty"`
+	Unverifiable bool                `json:"unverifiable,omitempty"`
+	Files        []platform.FormFile `json:"files,omitempty"`
 }
 
 // Rect is the target's box and the viewport it was measured in.
@@ -418,6 +422,7 @@ type pendingCommit struct {
 	requestedAt  time.Time
 	shot         string
 	rect         platform.TargetRect
+	files        []platform.FormFile
 	// targetID is the page the commit was recorded on ("" without page
 	// tracking); an approval only executes on that page.
 	targetID string

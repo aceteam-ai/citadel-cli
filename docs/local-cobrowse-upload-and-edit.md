@@ -436,14 +436,31 @@ commit, because on many sites it sends files already attached.
 so that a File entry no longer sets `bad`. It encodes as a tuple
 `[name, "file", fileName, size, type, lastModified]`.
 
-The probe runs in the main world today (see Findings), so a page can replace
-`File.prototype` getters before it runs. The file-entry reads therefore run in
-an isolated world of the form's frame (`Page.createIsolatedWorld`), on the form
-node resolved there, the way `fillFileInput` resolves its target. The results
-are folded into the main-world digest by the service. Moving the whole probe
-into an isolated world is the cleaner end state. It is a larger change,
-because the probe also reads page state such as the focused element, and it is
-not required here. Then:
+At the design pass the probe ran in the main world (see Findings), where a
+page could replace `File.prototype` getters before it ran. S1 uses the cleaner
+end state: `InspectTarget` runs the complete probe in a browser-created
+isolated world (`Page.createIsolatedWorld`). Target resolution, focused state,
+the native submission set and native File/Blob getters use that same world's
+DOM observation, rather than merging two observations across worlds. A missing
+world, failed read or changed driver refuses the probe without falling back to
+the main world. The session reuses the context only for the same target, frame
+and loader, retaining at most one context reference. A lost context is invalidated
+and the current probe refuses; the next probe reads the current frame tree and
+recreates the world, without retrying any action. Chooser classification comes
+from a pristine native file-input type or a label's native associated control,
+not attributes on the label. A label for a non-file control is classified from
+that control's tag, type, name and form; misleading label text cannot hide a
+submit or Delete button. An uninspectable associated custom control is refused.
+Interactive descendants stay their own targets, and an actionable chooser
+still passes through the commit-word checks. While the human drives, agent
+views omit picked-file metadata; the human viewer retains its approval evidence.
+The browser's synthetic empty File timestamp is normalized to
+zero, so an unselected file input has a stable digest. A snapshot with more
+than 128 attached entries is unverifiable rather than producing an unbounded
+commit card. Filename display strips Unicode format and control characters and
+truncates the middle to retain the final extension. An extension too long for
+the bounded display is explicitly unavailable and makes approval unverifiable.
+No file bytes or local paths are read. Then:
 
 - fills in that form are ordinary fills under the grant;
 - the form's Submit is an ordinary commit whose content hash changes if the
