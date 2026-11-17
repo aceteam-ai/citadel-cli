@@ -49,6 +49,18 @@ var runtimeOnlyNames = map[string]bool{
 	".citadel-profile": true,
 }
 
+// stagingDirName is the co-browse session's upload staging dir (platform's
+// cobrowseStagingDirName). A user's staged files are never sealed into a
+// profile, and never restored from one.
+const stagingDirName = ".citadel-stage"
+
+// isStagingPath reports whether a relative archive path is, or is inside, the
+// staging dir at the profile root.
+func isStagingPath(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	return rel == stagingDirName || strings.HasPrefix(rel, stagingDirName+"/")
+}
+
 // cacheDirNames are regenerable cache directories excluded from the archive to
 // keep the sealed blob (and the in-memory plaintext) bounded — a full Chromium
 // cache can be hundreds of MB, none of it needed to persist a login.
@@ -81,6 +93,12 @@ func buildTar(dir string) ([]byte, error) {
 		}
 		if rel == "." {
 			return nil // the root itself is implied by the destination dir
+		}
+		if isStagingPath(rel) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		base := filepath.Base(rel)
 		if info.IsDir() {
@@ -153,6 +171,12 @@ func extractTar(blob []byte, dstDir string) error {
 		target, err := safeJoin(dstDir, hdr.Name)
 		if err != nil {
 			return err
+		}
+		// Never restore staged files, even from an older or hostile blob. Judge
+		// the normalized destination, not the raw header: "././.citadel-stage/x"
+		// and ".//.citadel-stage/x" join to the same place as the canonical name.
+		if rel, rerr := filepath.Rel(filepath.Clean(dstDir), target); rerr != nil || isStagingPath(rel) {
+			continue
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:

@@ -645,6 +645,9 @@ func (m *CobrowseSessionManager) recoverSessions() {
 		m.mu.Unlock()
 		writeSessionPidfile(dir, os.Getpid(), rec.BrowserPID, rec.XvfbPID, currentProcessStartToken())
 		s.persistRecord()
+		if !s.tracking {
+			s.startChooserWatch(s.proc.debugPort)
+		}
 		log.Printf("[cobrowse] re-adopted session %s (generation %d)", rec.ID, s.generation)
 	}
 	if len(expired) > expiredMaxRecords {

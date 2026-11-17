@@ -123,6 +123,38 @@ result. Local mode returns the same details as a tool error. An approved commit
 that was dispatched and then failed resolves as `unconfirmed`, not failed.
 `TestCobrowseRealBrowserActionLatency` pins the budgets.
 
+`platform.StageFile` and `platform.SetFileInput` own file upload for remotely
+dispatched sessions (#1721, node side of aceteam#13831). Staged files live in a
+`cobrowseStagingDirName` dir inside the session's own working dir, so every
+teardown, failed launch and orphan sweep removes it; teardown also removes it
+before a persistent profile is sealed. `ValidateStagedName` owns the single
+base-name rule and `resolveStagedFile` owns the proof that a path handed to the
+browser is a regular file directly inside that dir; the size and count caps are
+`MaxCobrowseStagedFileBytes` and `MaxCobrowseStagedFiles`. `set_file_input` is an
+ordinary `runAction` action. `cobrowseSession.watchChooserOnce` keeps one extra
+CDP connection that intercepts file choosers and `handleChooserEvent` owns the
+pending-chooser state reported in status; it never fills anything. The stage
+bytes ride in the `jobprivacy.BytesKey` payload field, which is dropped from
+every retained copy. `CobrowseSessionHandler.filesAllowed` gates `stage_file` and
+`set_file_input` on the live Files permission (same source as FILE_WRITE_BYTES,
+read per job) and refuses with `jobs.ErrFilesDisabled`; no passcode; a handler with no permission source denies.
+Teardown closes staging (`closeStaging`, under `stageMu`) before removing it and
+refuses to seal a persistent profile if removal fails; `cobrowseprofile` also
+never archives or restores `.citadel-stage`. A `backend_node_id` is accepted only
+for the chooser the page opened. `set_file_input` requires `expected_url`:
+the fence uses no page script: `checkFrameURL` takes the target frame's
+browser-side URL from `Page.getFrameTree` (url plus urlFragment), the target
+is resolved in an isolated world of that frame (`Page.createIsolatedWorld`),
+and `setFilesIfPageIs` re-reads the frame URL, re-checks the driver, then
+dispatches on that isolated object; any mismatch is `ErrTargetChanged`,
+returned unchanged; status
+reports `file_upload_page_fence: expected_url_v1`. The worker acks a `stage_file` entry with
+`AckStagedFileJob` (XACK then XDEL, no payload decoding); other actions use the
+plain ack (API mode has no equivalent yet). Human
+attach during handoff is #1723. Page-tracking (local) sessions get none of this.
+`TestCobrowseRealBrowserFileUpload` and `TestWindowsRealBrowserFileUpload` are
+the real-browser acceptance.
+
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
 per-domain write grant (default deny, see the next paragraph), the abuse limits, the
 idle lifetime and `local_cobrowse_wait`. `localcobrowse.NewURLPolicy` owns the

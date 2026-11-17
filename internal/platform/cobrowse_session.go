@@ -110,6 +110,16 @@ type CobrowseSessionStatus struct {
 	// it may have acted, and Effects says what happened (citadel-cli#1663).
 	Done    *bool          `json:"done,omitempty"`
 	Effects *ActionEffects `json:"effects,omitempty"`
+	// FileChooser is set while a page's file chooser is open and waiting: the
+	// session intercepts the dialog (headless, it never renders) and reports
+	// it so the file can be offered and set through set_file_input
+	// (citadel-cli#1721). Cleared when that input is filled or the page
+	// navigates.
+	FileChooser *FileChooserPending `json:"file_chooser,omitempty"`
+	// FileUploadPageFence names the page fence set_file_input enforces, so a
+	// caller can detect it before calling; absent when the session has no
+	// set_file_input (page-tracking sessions).
+	FileUploadPageFence string `json:"file_upload_page_fence,omitempty"`
 	// FirstLoad is "pending" while the start URL has not yet replaced the
 	// initial about:blank (StartSession returned before the browser's own
 	// navigation committed). The first status read that sees another page
@@ -278,6 +288,17 @@ type cobrowseSession struct {
 	// checked against (see ExpectTarget).
 	tracking     bool
 	expectTarget string
+
+	// stageMu serializes writes into the staging dir (count check and create).
+	stageMu     sync.Mutex
+	stageClosed bool
+	// chooser is the pending file chooser, guarded by mu; watchStop ends the
+	// chooser watcher (closed once through watchOnce).
+	chooser   *FileChooserPending
+	watchStop chan struct{}
+	watchOnce sync.Once
+	// watchStopped makes a start after any stop a no-op.
+	watchStopped bool
 }
 
 var (
@@ -453,6 +474,7 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 	m.mu.Lock()
 	if m.sessions[id] != s {
 		m.mu.Unlock()
+		s.stopChooserWatch()
 		_ = proc.stop()
 		// Do NOT persist here: the session was torn down mid-launch, the concurrent
 		// teardown may already have removed the working dir, and sealing an empty or
@@ -520,6 +542,12 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	if err := os.MkdirAll(s.profile, 0o700); err != nil {
 		return nil, fmt.Errorf("create session profile dir: %w", err)
 	}
+	// Local mode (page tracking) has no upload path and is left alone.
+	if !s.tracking {
+		if _, err := s.ensureStagingDir(); err != nil {
+			return nil, err
+		}
+	}
 	// For a persistent session, decrypt the stored profile into the (private, 0700)
 	// working dir BEFORE launching the browser, so the browser opens with the saved
 	// logins. Fails closed: a materialize error (e.g. tampered/corrupt store) aborts
@@ -558,11 +586,19 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 		dropTargetSet(proc.debugPort)
 		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
 	}
+	// Learn the browser's CDP id before the session is visible and before the
+	// chooser watcher exists, on every OS, so the watcher can always verify it.
+	if proc.browserID == "" && proc.debugPort > 0 {
+		if id, err := resolveBrowserID(proc.debugPort, s.profile); err == nil {
+			proc.browserID = id
+		}
+	}
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
 	s.persistent = enc != nil
 	s.mu.Unlock()
+	s.startChooserWatch(proc.debugPort)
 	// Durable registry record so a restart by exec can re-adopt this session.
 	s.persistRecord()
 	return proc, nil
@@ -667,6 +703,12 @@ func (s *cobrowseSession) teardown() error {
 	s.encProfile = nil
 	regDir := s.regDir
 	s.mu.Unlock()
+	s.stopChooserWatch()
+	// No stage may start from here on; one already running has finished.
+	// Staged user files go first, so a persistent profile's sealed copy can
+	// never contain them.
+	s.closeStaging()
+	_ = s.removeStagingDir()
 	// A stopped session leaves no registry record: it did not "end" unexpectedly.
 	if regDir != "" {
 		deleteRecord(regDir, s.id)
@@ -687,12 +729,20 @@ func (s *cobrowseSession) teardown() error {
 	if proc != nil {
 		dropTargetSet(proc.debugPort)
 	}
+	// Again after the browser is gone (it may have held a staged file open),
+	// and always before Persist seals anything. A dir that cannot be removed
+	// is never sealed.
+	stageErr := s.removeStagingDir()
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
 		// produced new state, and sealing an empty/partial working dir would
 		// overwrite a good profile with nothing.
 		if proc != nil {
-			if perr := enc.Persist(profile); perr != nil && err == nil {
+			if stageErr != nil {
+				if err == nil {
+					err = stageErr
+				}
+			} else if perr := enc.Persist(profile); perr != nil && err == nil {
 				err = perr
 			}
 		}
@@ -803,6 +853,13 @@ func (s *cobrowseSession) statusBase() (CobrowseSessionStatus, int) {
 		Profile:    s.profile,
 		Driver:     driverFor(s.humanDrivingLocked()),
 		Generation: s.generation,
+	}
+	if !s.tracking {
+		st.FileUploadPageFence = FileUploadPageFenceV1
+	}
+	if s.chooser != nil {
+		c := *s.chooser
+		st.FileChooser = &c
 	}
 	if !s.startedAt.IsZero() {
 		st.StartedAt = s.startedAt.UTC().Format(time.RFC3339)

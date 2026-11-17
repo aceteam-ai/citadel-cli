@@ -179,7 +179,7 @@ jobs:
       - name: Unit tests (Windows-portable subset)
         run: >-
           go test ./internal/platform/ -count=1 -run
-          '^(TestWindows|TestReconcileTargets|TestTargetSet|TestUnconfiguredTargetSet|TestRefusedLastPage|TestNavigateFromRefusedPage|TestVerdictCaches|TestCachedRefusalExpires|TestActionsRefusedOnRefusedPage|TestSetActive|TestManagerPageChoice|TestCloseTargetByID|TestActionRefusedWhenAnother|TestActionsAreSentToThe|TestNodeWideManagerDoesNotTrack|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestThrowawaySession_NoGracefulClose|TestGracefulClose|TestCleanOrphanedProfileSessions|TestPersistentSessionWritesProfileMarker|TestStartSessionWithID|TestCobrowseSessionActions_|TestCobrowseSessionStart_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
+          '^(TestWindows|TestValidateStagedName|TestStageFile|TestResolveStagedFile|TestStagingDir|TestSetFileInput|TestChooser|TestFileUploadPageFence|TestStatusReportsFileUploadPageFence|TestRedactPath|TestReconcileTargets|TestTargetSet|TestUnconfiguredTargetSet|TestRefusedLastPage|TestNavigateFromRefusedPage|TestVerdictCaches|TestCachedRefusalExpires|TestActionsRefusedOnRefusedPage|TestSetActive|TestManagerPageChoice|TestCloseTargetByID|TestActionRefusedWhenAnother|TestActionsAreSentToThe|TestNodeWideManagerDoesNotTrack|TestDefaultLaunch|TestEnsurePrivateDir|TestHeadedUserAgent|TestParseDevToolsActivePort|TestVerifyCDPBrowserID|TestDeheadless|TestBuildChromeArgs|TestDiscoverWindowsBrowser|TestBrowserKindForPath|TestSessionPidfile|TestSessionManager_|TestPersistentProfile_|TestThrowawaySession_NoGracefulClose|TestGracefulClose|TestCleanOrphanedProfileSessions|TestPersistentSessionWritesProfileMarker|TestStartSessionWithID|TestCobrowseSessionActions_|TestCobrowseSessionStart_|TestCobrowseSession_(Isolation|StopRemovesProfileAndSlot|StopAll|Cap|CrashReportsExited|StatusUnknown|Attach|StopDuringLaunch|PidfileRoundTrip))'
 
       # Both installer entrypoints from this elevated runner (citadel-cli#1695).
       # Downloads the latest release, since the installers have no local-archive
@@ -217,14 +217,14 @@ jobs:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
           CITADEL_COBROWSE_EXPECT_KIND: chrome
-        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./tests/localgate/ -count=1 -v -run '^(TestLocalModeGateThroughMCP|TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserFirstLoadThroughGuard|TestRealBrowserCommitActions|TestRealBrowserPopupSignIn|TestRealBrowserPersistentProfileRoundTrip|TestViewerPageInRealBrowser|TestViewerFirstInputAfterHandoffInRealBrowser|TestViewerFocusAfterHandoffInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./tests/localgate/ -count=1 -v -run '^(TestLocalModeGateThroughMCP|TestWindowsRealBrowser|TestWindowsRealBrowserFileUpload|TestWindowsRealBrowserFileUploadSpoof|TestRealBrowserEgressGuard|TestRealBrowserFirstLoadThroughGuard|TestRealBrowserCommitActions|TestRealBrowserPopupSignIn|TestRealBrowserPersistentProfileRoundTrip|TestViewerPageInRealBrowser|TestViewerFirstInputAfterHandoffInRealBrowser|TestViewerFocusAfterHandoffInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
       - name: Real browser (Edge)
         env:
           CITADEL_COBROWSE_BROWSER_IT: "1"
           CITADEL_COBROWSE_BROWSER: 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
           CITADEL_COBROWSE_EXPECT_KIND: edge
-        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./tests/localgate/ -count=1 -v -run '^(TestLocalModeGateThroughMCP|TestWindowsRealBrowser|TestRealBrowserEgressGuard|TestRealBrowserFirstLoadThroughGuard|TestRealBrowserCommitActions|TestRealBrowserPopupSignIn|TestRealBrowserPersistentProfileRoundTrip|TestViewerPageInRealBrowser|TestViewerFirstInputAfterHandoffInRealBrowser|TestViewerFocusAfterHandoffInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
+        run: go test ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./tests/localgate/ -count=1 -v -run '^(TestLocalModeGateThroughMCP|TestWindowsRealBrowser|TestWindowsRealBrowserFileUpload|TestWindowsRealBrowserFileUploadSpoof|TestRealBrowserEgressGuard|TestRealBrowserFirstLoadThroughGuard|TestRealBrowserCommitActions|TestRealBrowserPopupSignIn|TestRealBrowserPersistentProfileRoundTrip|TestViewerPageInRealBrowser|TestViewerFirstInputAfterHandoffInRealBrowser|TestViewerFocusAfterHandoffInRealBrowser|TestLaunchFileOpensViewerInRealBrowser)'
 
   # Linux co-browse real-browser gate (citadel-cli#1546). Issue #1546 took four
   # fix rounds because unit tests used fakes that real Chrome did not match
@@ -263,7 +263,7 @@ jobs:
       - name: Real browser co-browse lifecycle
         env:
           CITADEL_REAL_BROWSER_TESTS: "1"
-        run: go test ./internal/platform/ -count=1 -v -run '^TestCobrowseRealBrowser'
+        run: go test ./internal/platform/ -count=1 -v -run '^(TestCobrowseRealBrowser|TestCobrowseRealBrowserFileUpload|TestCobrowseRealBrowserFileUploadSpoof)'
 
       # Saved logins survive stop, seal, unlock and a second session with the
       # real browser (aceteam#13503 S7). Synthetic loopback page only.

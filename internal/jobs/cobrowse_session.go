@@ -20,6 +20,7 @@
 package jobs
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
@@ -60,12 +62,30 @@ const (
 	// Driver arbitration actions (issue #978): hand a session's scripting
 	// control to the human, or return it to the agent.
 	CobrowseSessionActionHandoff = "handoff"
-	CobrowseSessionActionResume  = "resume"
+	// File upload (citadel-cli#1721): stage bytes into the session's private
+	// staging dir, then fill a file input with one staged file.
+	CobrowseSessionActionStageFile    = "stage_file"
+	CobrowseSessionActionSetFileInput = "set_file_input"
+	CobrowseSessionActionResume       = "resume"
 )
+
+// CobrowseStageBytesKey is the stage_file payload field carrying the file's
+// bytes (standard base64). It is a retained-copy secret: see jobprivacy.BytesKey.
+const CobrowseStageBytesKey = jobprivacy.BytesKey
 
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
 // CobrowseSessionManager singleton.
-type CobrowseSessionHandler struct{}
+type CobrowseSessionHandler struct {
+	// Enabled gates stage_file and set_file_input on the node's Files
+	// permission, read live per job (as FILE_WRITE_BYTES does). Unset denies:
+	// a handler built without a permission source never writes a user file.
+	// Other session actions are not affected.
+	Enabled func() bool
+}
+
+func (h *CobrowseSessionHandler) filesAllowed() bool {
+	return h.Enabled != nil && h.Enabled()
+}
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
 func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
@@ -265,6 +285,64 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 			return nil, err
 		}
 		return out, nil
+
+	case CobrowseSessionActionStageFile:
+		if !h.filesAllowed() {
+			return nil, ErrFilesDisabled
+		}
+		id, name := job.Payload["session_id"], job.Payload["name"]
+		if id == "" || name == "" {
+			return nil, fmt.Errorf("stage_file requires session_id and name")
+		}
+		if err := platform.ValidateStagedName(name); err != nil {
+			return nil, err
+		}
+		// Size is checked on the encoded form first so an oversized payload is
+		// refused before it is decoded into a second copy.
+		encoded := job.Payload[CobrowseStageBytesKey]
+		if base64.StdEncoding.DecodedLen(len(encoded)) > platform.MaxCobrowseStagedFileBytes+2 {
+			return nil, platform.ErrStagedTooLarge
+		}
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("stage_file %s is not valid base64", CobrowseStageBytesKey)
+		}
+		staged, err := mgr.StageFile(id, name, data)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]any{
+			"session_id": id, "name": staged.Name, "size": staged.Size, "sha256": staged.SHA256,
+		})
+
+	case CobrowseSessionActionSetFileInput:
+		if !h.filesAllowed() {
+			return nil, ErrFilesDisabled
+		}
+		id, selector, staged := job.Payload["session_id"], job.Payload["selector"], job.Payload["staged_name"]
+		if id == "" || staged == "" {
+			return nil, fmt.Errorf("set_file_input requires session_id and staged_name")
+		}
+		expected := job.Payload["expected_url"]
+		if expected == "" {
+			return nil, fmt.Errorf("set_file_input requires 'expected_url'")
+		}
+		var nodeID int
+		if raw := job.Payload["backend_node_id"]; raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n <= 0 {
+				return nil, fmt.Errorf("set_file_input 'backend_node_id' is not a positive integer")
+			}
+			nodeID = n
+		}
+		if (selector == "") == (nodeID == 0) {
+			return nil, fmt.Errorf("set_file_input requires exactly one of 'selector' or 'backend_node_id'")
+		}
+		st, err := mgr.SetFileInput(id, selector, nodeID, staged, expected)
+		if err != nil {
+			return actionFailureResult(err, job.Payload["report_partial"] == "true")
+		}
+		return sessionStatusResult(st)
 
 	case CobrowseSessionActionHandoff:
 		id := job.Payload["session_id"]
