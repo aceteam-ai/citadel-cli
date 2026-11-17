@@ -36,7 +36,9 @@ import (
 
 // EnvCobrowseBrowser pins the browser executable a co-browse session launches.
 // When set, discovery uses exactly this path and fails if it does not exist; it
-// never silently falls back to another browser.
+// never silently falls back to another browser. On Windows the value may also be
+// a browser name (chrome or edge, case-insensitive), resolved through the normal
+// discovery restricted to that browser.
 const EnvCobrowseBrowser = "CITADEL_COBROWSE_BROWSER"
 
 // BrowserInfo identifies the browser a runner found.
