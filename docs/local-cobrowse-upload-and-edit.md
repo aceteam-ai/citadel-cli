@@ -43,7 +43,7 @@ Each item gives the recommendation first, then the alternatives.
    dismiss the request. Alternative: let the agent keep acting, and rely on
    the attach fences to refuse when the page moved.
 7. **Forms that contain a file input.** Today the local probe marks any form
-   with a file input as unverifiable. Every write inside such a form is then
+   with a named file input as unverifiable. Every write inside such a form is then
    refused with "do it yourself", including typing into its text fields (see
    Findings). Recommendation: make that form state verifiable in v1. Each
    file entry binds by field name, file name, size, type and lastModified, so
@@ -87,15 +87,26 @@ area confirms it with a test before changing it.
   refuses a tracked session. The watcher also dials `pickTargetContext` (the
   first page), while local mode follows popups and acts on the active page. So
   enabling it is new work, not a flag flip.
-- **The local browser is headless or under Xvfb**, so a native file dialog
-  never appears. Without interception, a page's chooser is cancelled silently.
+- **The local browser is headless (Windows) or headed under Xvfb (Linux)**,
+  so a native file dialog is never visible or reachable in the viewer. On
+  Linux, without interception, a GTK dialog can open on the Xvfb display
+  where nobody can see it; headless Chrome cancels the chooser.
 - **Upload forms are refused today.** `FormSnapshotScript` sets `bad` when
-  `new FormData(form)` holds a File entry. An empty file input contributes an
-  empty File, so this happens whenever the form has any file input. `bad`
-  leaves the target unresolved, `Classify` returns commit, and the pending
-  commit is unverifiable. So in local mode the agent cannot type into, click
-  or submit any part of a form that contains a file input. The same applies
-  to a click on the file input itself when it sits in a form.
+  `new FormData(form)` holds a File entry, and `add` sets it for a focused or
+  targeted file input outside a form. An empty file input contributes an
+  empty File, but `FormData` only includes controls that have a non-empty
+  `name`. So this happens whenever the form has a named file input, which is
+  the usual case for a plain HTML upload form. An unnamed one (common in
+  script-driven upload widgets) does not set `bad`. `bad` leaves the target
+  unresolved, `Classify` returns commit, and the pending commit is
+  unverifiable. So in local mode the agent cannot type into, click or submit
+  any part of a form with a named file input. That includes a click on the
+  file input itself when it sits in such a form.
+- **The target probe runs in the page's main world** (`InspectTarget` calls
+  `runtimeEvaluate` on `targetProbeScript`). Its `env` prototype capture
+  defends against named-property shadowing, such as a control named
+  `elements`. It does not defend against a page that replaced the
+  prototypes before the probe ran.
 - **"upload" is a commit word** in `commitLabelWords`, so clicking a button
   labelled Upload already asks.
 - **`localviewer` caps action bodies at 4096 bytes** (`handleAction`), so an
@@ -162,8 +173,11 @@ Why not a dialog launched by Citadel:
 - `localStateDir` holds durable state (audit, owner lock, profiles), and
   nothing sweeps a session's leftovers from it after a crash.
 
-For a saved-profile session, the staging dir lives inside the decrypted
-working dir. Teardown already refuses to seal while removing staging fails.
+`StageFile` refuses until the session's browser is running, so a locked
+saved-profile session offers no upload until the human unlocks it (or
+chooses a throwaway session). The viewer hides the picker for a locked
+session. For a saved-profile session, the staging dir lives inside the
+decrypted working dir. Teardown already refuses to seal while removing staging fails.
 An acceptance test must show that `.citadel-stage` is gone before `Persist`
 seals the profile, and that the sealed blob never contains a staged file.
 
@@ -284,9 +298,16 @@ attached.
 
 **Submitting a form with a file (decision 7).** Change `FormSnapshotScript` so
 that a File entry no longer sets `bad`. It encodes as a tuple
-`[name, "file", fileName, size, type, lastModified]`, read through
-`File.prototype` getters captured before page script can matter (the same
-`env` pattern the probe uses). Then:
+`[name, "file", fileName, size, type, lastModified]`.
+
+The probe runs in the main world today (see Findings), so a page can replace
+`File.prototype` getters before it runs. The file-entry reads therefore run in
+an isolated world of the form's frame (`Page.createIsolatedWorld`), on the
+form node resolved there, the way `fillFileInput` resolves its target. The
+results are folded into the main-world digest by the service. Moving the
+whole probe into an isolated world is the cleaner end state. It is a larger
+change, because the probe also reads page state such as the focused element,
+and it is not required for this slice. Then:
 
 - fills in that form are ordinary fills under the grant;
 - the form's Submit is an ordinary commit whose content hash changes if the
@@ -482,9 +503,9 @@ attention the way approval does, and the tab title shows "waiting for you".
   `existingStagingDir` refuses anything group/other-accessible. Windows: the
   base dir requires a protected owner-only DACL
   (`validateCobrowseBaseDirPerms`), and the staging dir and files inherit it.
-  A windows-latest test reads the DACL of a staged file and requires that only
-  the owner (plus SYSTEM and Administrators if inherited by policy) has
-  access.
+  A windows-latest test reads the DACL of the staging dir and of a staged
+  file, and requires exactly what `validateCobrowseBaseDirPerms` accepts:
+  every allow ACE names the current user and nothing else.
 - *The debug port (#1584).* Another user can drive the browser over its
   loopback CDP port. That includes `DOM.setFileInputFiles` with any file our
   user can read. This exists today without upload. #1584 closes it, and
@@ -592,11 +613,14 @@ windows-latest with both Chrome and Edge.
   - the commit card lists the attached files;
   - `RuleVersion` bumped.
 - Acceptance:
-  - first, a real-browser test that pins today's refusal of a text fill
-    inside a form with a file input, then flips;
-  - `formsnapshot_test` cases: an empty file input, an attached file, files
-    swapped after approval (the fingerprint changes), and spoofed `File`
-    prototype getters;
+  - first, a real-browser test that pins today's behavior: a text fill inside
+    a form with a named file input is refused, and one inside a form with an
+    unnamed file input is not. Then the named case flips;
+  - `formsnapshot_test` cases: an empty named file input, an attached file,
+    and files swapped after approval (the fingerprint changes);
+  - a real-browser test in which the page replaces `File.prototype` getters
+    in the main world before the probe runs, and the digest still reflects
+    the real file name and size (the isolated-world read);
   - commit browser test: fill and submit an upload form after a human
     attach, with the card listing the file.
 - Order: independent of S1 to S4, but needed before an upload form is usable.
