@@ -9,11 +9,12 @@ on:
   push:
     branches: [main]
   pull_request:
-    # feat/local-mode-** lets the stacked aceteam#13503 local-mode PRs (each
-    # based on the previous slice's branch) run the same gates, including the
-    # windows-latest job below. Narrow on purpose: other non-main bases still
-    # get no PR CI.
-    branches: [main, 'feat/local-mode-**']
+    # Dependent PRs are stacked: a child opens against its parent's branch
+    # and is retargeted to main before the parent merges. These patterns give
+    # a stacked child the same gates as a PR against main, including the
+    # windows-latest job below. Other bases (for example a release or
+    # personal branch) still get no PR CI.
+    branches: [main, 'feat/**', 'fix/**', 'docs/**', 'chore/**']
 
 # Cancel superseded runs on the same branch/PR so a force-push or rapid pushes
 # don't leave stale jobs occupying the limited self-hosted ARC runner pool.
