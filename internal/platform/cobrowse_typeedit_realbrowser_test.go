@@ -25,9 +25,15 @@ const typeEditPage = `<!doctype html><title>edit</title>
 <input id="num" type="number" value="123">
 <input id="col" value="collapse me">
 <input id="steal" value="steal">
+<input id="late" value="late microtask">
+<input id="late2" value="late timeout">
+<input id="asyncsel" value="async select">
 <div id="host" contenteditable="true"><p id="child">child text</p></div>
 <script>
 document.getElementById("col").select = function(){ HTMLInputElement.prototype.select.call(this); this.setSelectionRange(0, 0); };
+document.getElementById("late").select = function(){ var s = this; HTMLInputElement.prototype.select.call(this); queueMicrotask(function(){ s.setSelectionRange(0, 0); }); };
+document.getElementById("late2").select = function(){ var s = this; HTMLInputElement.prototype.select.call(this); setTimeout(function(){ s.setSelectionRange(0, 0); }, 0); };
+document.getElementById("asyncsel").addEventListener("select", function(){ this.setSelectionRange(0, 0); });
 document.getElementById("steal").addEventListener("focus", function(){ document.getElementById("i").focus(); });
 </script>`
 
@@ -55,6 +61,9 @@ const typeEditReset = `(function(){
 	document.getElementById("num").value = "123";
 	document.getElementById("col").value = "collapse me";
 	document.getElementById("steal").value = "steal";
+	document.getElementById("late").value = "late microtask";
+	document.getElementById("late2").value = "late timeout";
+	document.getElementById("asyncsel").value = "async select";
 	document.getElementById("host").innerHTML = '<p id="child">child text</p>';
 	return true;
 })()`
@@ -223,6 +232,43 @@ func runTypeEditRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		}
 		if got := read(`document.getElementById("col").value`); got != "collapse me" {
 			t.Fatalf("content = %q", got)
+		}
+	})
+	// The select step passes (the selection really spans everything), then the
+	// page collapses it. Only the last verify can catch that.
+	for _, c := range []struct{ name, id, want string }{
+		{"microtask", "late", "late microtask"},
+		{"timeout", "late2", "late timeout"},
+	} {
+		t.Run("a selection collapsed after select passes ("+c.name+")", func(t *testing.T) {
+			reset()
+			if _, err := m.TypeWith(st.ID, "intruder", TypeOptions{Selector: "#" + c.id, Clear: true}); err == nil {
+				t.Fatal("want the edit refused by the final verify")
+			}
+			if got := read(`document.getElementById("` + c.id + `").value`); got != c.want {
+				t.Fatalf("content = %q, want it unchanged", got)
+			}
+		})
+	}
+	// A select event listener collapses the selection at a time the page
+	// picks. Whatever happens, the report must match the page: cleared only
+	// when the field holds exactly the typed text.
+	t.Run("a selection collapsed by an async select event", func(t *testing.T) {
+		reset()
+		out, err := m.TypeWith(st.ID, "X", TypeOptions{Selector: "#asyncsel", Clear: true})
+		got := read(`document.getElementById("asyncsel").value`)
+		var eff *ActionEffects
+		if err == nil {
+			eff = out.Effects
+		} else if ae, ok := AsActionIncomplete(err); ok {
+			eff = &ae.Effects
+		}
+		t.Logf("async select fixture: err=%v content=%q effects=%+v", err, got, eff)
+		if eff != nil && eff.Cleared && got != "X" {
+			t.Fatalf("reported cleared, but the field holds %q", got)
+		}
+		if err == nil && got != "X" && (eff == nil || !eff.ClearedUnconfirmed) {
+			t.Fatalf("the field holds %q and the action claims success without flagging it", got)
 		}
 	})
 	t.Run("a field that steals focus", func(t *testing.T) {

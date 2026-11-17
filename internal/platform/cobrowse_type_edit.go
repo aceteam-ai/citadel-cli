@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode/utf16"
 )
 
 // InputEditV1 is the status capability value for this contract. A platform must
@@ -205,11 +204,13 @@ const (
   var v=t.kind==="contenteditable"?t.el.textContent:t.el.value;
   return {empty:String(v||"").length===0};
 }`
-	// editLenFn returns a length only, never the content.
-	editLenFn = `/*edit:len*/function(){` + editScriptLib + `
+	// editMatchFn reports whether the field's content is exactly text. The page
+	// already holds the text; only a boolean comes back.
+	editMatchFn = `/*edit:match*/function(text){` + editScriptLib + `
   var t=editTarget(this);
   if(!t||t.el!==this)return {error:"the target is no longer an editable field"};
-  return {len:String(t.el.value).length};
+  var v=t.kind==="contenteditable"?t.el.textContent:t.el.value;
+  return {match:String(v)===text};
 }`
 )
 
@@ -369,8 +370,6 @@ func (r *actionRun) verifyBound(b editBinding, clear bool) (offsetless bool, err
 	return offsetless, nil
 }
 
-func utf16Len(s string) int { return len(utf16.Encode([]rune(s))) }
-
 // TypeWith is Type with a target and replace. With no selector and no clear it
 // is exactly Type. Otherwise the whole of it is one action on one pinned page:
 // resolve and focus the selector (or take the focused field), select the whole
@@ -435,10 +434,8 @@ func (m *CobrowseSessionManager) TypeWith(id, text string, o TypeOptions) (Cobro
 		if err := between(); err != nil {
 			return err
 		}
-		offsetless := false
 		if bind != nil {
-			var err error
-			if offsetless, err = r.verifyBound(*bind, o.Clear); err != nil {
+			if _, err := r.verifyBound(*bind, o.Clear); err != nil {
 				return err
 			}
 			if err := r.midActionFence(); err != nil {
@@ -458,17 +455,14 @@ func (m *CobrowseSessionManager) TypeWith(id, text string, o TypeOptions) (Cobro
 			if !o.Clear {
 				return nil
 			}
-			if !offsetless {
-				r.eff.Cleared, r.eff.ClearedUnconfirmed = true, false
-				return nil
-			}
-			// The field reports no selection offsets: the replace is only
-			// confirmed when its length is exactly the typed length.
+			// Whatever the field type, the replace is confirmed only when the
+			// page holds exactly the typed text: a selection that collapsed
+			// after the verify, or a maxlength truncation, is not a clear.
 			if err := r.midActionFence(); err != nil {
 				return err
 			}
-			if obj, err := r.boundStep(*bind, editLenFn, false); err == nil {
-				if n, _ := obj["len"].(float64); int(n) == utf16Len(text) {
+			if obj, err := r.boundStep(*bind, editMatchFn, false, text); err == nil {
+				if match, _ := obj["match"].(bool); match {
 					r.eff.Cleared, r.eff.ClearedUnconfirmed = true, false
 				}
 			}

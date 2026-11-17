@@ -15,12 +15,14 @@ type editFake struct {
 	steps []string
 	// focusRes is the RemoteObject the focus and target scripts answer with.
 	focusRes map[string]any
-	// selectRes, empty, verify and lenRes are what the bound steps answer.
-	selectRes, empty, verify, lenRes map[string]any
+	// selectRes, empty, verify and matchRes are what the bound steps answer.
+	selectRes, empty, verify, matchRes map[string]any
 	// loaders is the loaderId returned by successive getFrameTree calls (the
 	// last one repeats).
 	loaders []string
 	loaderN int
+	// verifyArgs records the first argument of each verify call.
+	verifyArgs []any
 	// keys records every key event's params.
 	keys []map[string]any
 }
@@ -32,7 +34,7 @@ func newEditFake(t *testing.T, mutate ...func(*latencyCDP)) (*editFake, *Cobrows
 		selectRes: map[string]any{"ok": true},
 		empty:     map[string]any{"empty": true},
 		verify:    map[string]any{"ok": true},
-		lenRes:    map[string]any{"len": 0.0},
+		matchRes:  map[string]any{"match": true},
 		loaders:   []string{"L1"},
 	}
 	e.latencyCDP = startLatencyCDP(t, func(f *latencyCDP) {
@@ -68,8 +70,8 @@ func newEditFake(t *testing.T, mutate ...func(*latencyCDP)) (*editFake, *Cobrows
 					v = e.verify
 				case strings.Contains(fn, "/*edit:empty*/"):
 					v = e.empty
-				case strings.Contains(fn, "/*edit:len*/"):
-					v = e.lenRes
+				case strings.Contains(fn, "/*edit:match*/"):
+					v = e.matchRes
 				}
 				return map[string]any{"result": map[string]any{"type": "object", "value": v}}, true
 			}
@@ -94,7 +96,7 @@ func (e *editFake) record(method string, params map[string]any) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	marker := func(s string) {
-		for _, k := range []string{"focus", "target", "select", "verify", "empty", "len"} {
+		for _, k := range []string{"focus", "target", "select", "verify", "empty", "match"} {
 			if strings.Contains(s, "/*edit:"+k+"*/") {
 				e.steps = append(e.steps, "edit:"+k)
 			}
@@ -107,6 +109,12 @@ func (e *editFake) record(method string, params map[string]any) {
 	case "Runtime.callFunctionOn":
 		fn, _ := params["functionDeclaration"].(string)
 		marker(fn)
+		if strings.Contains(fn, "/*edit:verify*/") {
+			if args, _ := params["arguments"].([]any); len(args) > 0 {
+				a, _ := args[0].(map[string]any)
+				e.verifyArgs = append(e.verifyArgs, a["value"])
+			}
+		}
 	case "Input.insertText":
 		e.steps = append(e.steps, "insert")
 	case "Input.dispatchKeyEvent":
@@ -129,7 +137,7 @@ func TestTypeWithStepOrderReplace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := e.got(); got != "edit:focus,edit:select,edit:verify,insert" {
+	if got := e.got(); got != "edit:focus,edit:select,edit:verify,insert,edit:match" {
 		t.Fatalf("steps = %s", got)
 	}
 	ef := st.Effects
@@ -153,7 +161,7 @@ func TestTypeWithSelectorOnlyAndClearOnly(t *testing.T) {
 	if _, err := m2.TypeWith(id2, "x", TypeOptions{Clear: true}); err != nil {
 		t.Fatal(err)
 	}
-	if got := e2.got(); got != "edit:target,edit:select,edit:verify,insert" {
+	if got := e2.got(); got != "edit:target,edit:select,edit:verify,insert,edit:match" {
 		t.Fatalf("clear only: %s", got)
 	}
 }
@@ -216,32 +224,69 @@ func TestTypeWithLostInsertAckReportsClearUnconfirmed(t *testing.T) {
 	}
 }
 
-// An email or number field reports no selection offsets: the replace is
-// confirmed only when the length read back equals the typed length.
-func TestTypeWithOffsetlessFieldConfirmsByLength(t *testing.T) {
+// After the insert on every clear path the page confirms it holds exactly the
+// typed text; anything else (a collapsed selection, a maxlength truncation, a
+// read-back that fails) is reported as unconfirmed, never as cleared.
+func TestTypeWithClearIsConfirmedByExactMatch(t *testing.T) {
 	for name, tc := range map[string]struct {
-		lenRes        map[string]any
+		matchRes      map[string]any
 		cleared, unco bool
 	}{
-		"length matches":  {map[string]any{"len": 3.0}, true, false},
-		"length differs":  {map[string]any{"len": 7.0}, false, true},
+		"text matches":    {map[string]any{"match": true}, true, false},
+		"text differs":    {map[string]any{"match": false}, false, true},
 		"read-back error": {map[string]any{"error": "the target is no longer an editable field"}, false, true},
 	} {
-		t.Run(name, func(t *testing.T) {
-			e, m, id := newEditFake(t)
-			e.verify = map[string]any{"ok": true, "offsetless": true}
-			e.lenRes = tc.lenRes
-			st, err := m.TypeWith(id, "456", TypeOptions{Selector: "#n", Clear: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := e.got(); got != "edit:focus,edit:select,edit:verify,insert,edit:len" {
-				t.Fatalf("steps = %s", got)
-			}
-			if st.Effects.Cleared != tc.cleared || st.Effects.ClearedUnconfirmed != tc.unco {
-				t.Fatalf("effects = %+v", st.Effects)
-			}
-		})
+		for _, offsetless := range []bool{false, true} {
+			t.Run(name, func(t *testing.T) {
+				e, m, id := newEditFake(t)
+				e.verify = map[string]any{"ok": true, "offsetless": offsetless}
+				e.matchRes = tc.matchRes
+				st, err := m.TypeWith(id, "456", TypeOptions{Selector: "#n", Clear: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := e.got(); got != "edit:focus,edit:select,edit:verify,insert,edit:match" {
+					t.Fatalf("steps = %s", got)
+				}
+				if st.Effects.Cleared != tc.cleared || st.Effects.ClearedUnconfirmed != tc.unco {
+					t.Fatalf("effects = %+v", st.Effects)
+				}
+			})
+		}
+	}
+}
+
+// The verify is the last awaited check, and it must be asked to re-check the
+// selection exactly when the edit clears.
+func TestVerifyReceivesTheClearFlag(t *testing.T) {
+	for _, clear := range []bool{true, false} {
+		e, m, id := newEditFake(t)
+		if _, err := m.TypeWith(id, "x", TypeOptions{Selector: "#f", Clear: clear}); err != nil {
+			t.Fatal(err)
+		}
+		e.mu.Lock()
+		args := e.verifyArgs
+		e.mu.Unlock()
+		if len(args) != 1 || args[0] != clear {
+			t.Fatalf("clear=%v: verify arguments = %v", clear, args)
+		}
+	}
+}
+
+// The verify script itself carries the selection re-check.
+func TestVerifyScriptRechecksTheSelection(t *testing.T) {
+	if !strings.Contains(editVerifyFn, `if(w===false)return {ok:false,reason:"selection"}`) || !strings.Contains(editVerifyFn, "if(clear)") {
+		t.Fatal("editVerifyFn lost its selection re-check")
+	}
+}
+
+// getFrameTree failing after focus ran still reports the focus.
+func TestTypeWithFrameTreeFailureAfterFocusReportsFocused(t *testing.T) {
+	_, m, id := newEditFake(t, func(f *latencyCDP) { f.dropOn = map[string]bool{"Page.getFrameTree": true} })
+	_, err := m.TypeWith(id, "x", TypeOptions{Selector: "#f", Clear: true})
+	ae, ok := AsActionIncomplete(err)
+	if !ok || !ae.Effects.Focused || ae.Effects.FocusTag != "input" || !ae.Effects.Dispatched {
+		t.Fatalf("err = %v, want an incomplete action reporting the focus", err)
 	}
 }
 
@@ -433,6 +478,13 @@ func TestTypeWithTargetChangedBeforeInsertTypesNothing(t *testing.T) {
 				_, err := m.TypeWith(id, text, TypeOptions{Selector: "#f", Clear: true})
 				if errors.Is(err, ErrTargetChanged) {
 					t.Fatalf("must not be a refusal: %v", err)
+				}
+				wantCause := errEditTargetMoved
+				if name == "selection collapse" {
+					wantCause = errEditSelectionChanged
+				}
+				if !errors.Is(err, wantCause) {
+					t.Fatalf("cause = %v, want %v", err, wantCause)
 				}
 				ae, ok := AsActionIncomplete(err)
 				if !ok || !ae.Effects.Focused || !ae.Effects.Dispatched || ae.Effects.Cleared || ae.Effects.ClearedUnconfirmed || ae.Effects.TypedLength != 0 {

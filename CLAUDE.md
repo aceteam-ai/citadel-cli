@@ -127,13 +127,12 @@ that was dispatched and then failed resolves as `unconfirmed`, not failed.
 content (refused unless the selection spans it), then insert (or a real Backspace for an empty clear, read
 back as empty), with `midActionFence` between steps. The last awaited call before the destructive event is
 `verifyBound`: same document (`loaderId`), same element still focused and, with clear, the selection still
-spanning the content; only the insert round trip follows. Email and number fields report no offsets, so the
-replace is confirmed by reading the length back. A change after the page was touched is an incomplete action
+spanning the content; only the insert round trip follows. After the insert the page confirms it holds
+exactly the typed text (a boolean only), on every clear path, or `Cleared` stays false. A change after the page was touched is an incomplete action
 (not a refusal) carrying what happened. Only an input, textarea or the contenteditable host itself is a
-target, never under designMode; page-returned refusal strings are mapped to a fixed set. `CheckKeyChord` is
-the allowlist for modifiers, enforced in `parseKeyAction` and `KeyWith`: clipboard and editing chords are not
-allowed (only Shift with printable, navigation, Tab, Enter and Backspace keys; Ctrl or Meta with a; Ctrl with
-navigation, Backspace and Delete; no Alt, undo or redo). Other refusals (empty text without `clear`, selector over `MaxCobrowseSelectorLen`,
+target, never under designMode; page-returned refusal strings are mapped to a fixed set. `CheckKeyChord` owns
+the modifier allowlist and decides which chords are refused (clipboard and editing chords are not allowed);
+`parseKeyAction` and `KeyWith` both call it before any dispatch. Other refusals (empty text without `clear`, selector over `MaxCobrowseSelectorLen`,
 modifiers outside 0..15, a selector that matches nothing or is not editable) send nothing.
 `ActionEffects.Cleared` is confirmed; `ClearedUnconfirmed` means the destructive event was sent without
 confirmation. Status `input_edit` (`InputEditV1`, non-tracking sessions only, like `FileUploadPageFence`)
