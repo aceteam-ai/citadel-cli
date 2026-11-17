@@ -3,6 +3,8 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 )
 
 // TargetProbe names the action whose target InspectTarget describes.
@@ -44,22 +46,25 @@ type TargetInfo struct {
 	// Resolved is false when the target could not be identified (nothing at
 	// the point, a canvas, a nested frame). Callers must treat that as a
 	// commit: an unknown target is never assumed harmless.
-	Resolved   bool   `json:"resolved"`
-	Reason     string `json:"reason,omitempty"`
-	PageURL    string `json:"page_url,omitempty"`
-	Tag        string `json:"tag,omitempty"`
-	Role       string `json:"role,omitempty"`
-	InputType  string `json:"input_type,omitempty"`
-	Name       string `json:"name,omitempty"`
-	Href       string `json:"href,omitempty"`
-	Actionable bool   `json:"actionable,omitempty"`
-	Entry      bool   `json:"entry,omitempty"`
-	Composer   bool   `json:"composer,omitempty"`
-	Search     bool   `json:"search,omitempty"`
-	AutoSubmit bool   `json:"auto_submit,omitempty"`
-	InForm     bool   `json:"in_form,omitempty"`
-	FormMethod string `json:"form_method,omitempty"`
-	FormAction string `json:"form_action,omitempty"`
+	Resolved  bool   `json:"resolved"`
+	Reason    string `json:"reason,omitempty"`
+	PageURL   string `json:"page_url,omitempty"`
+	Tag       string `json:"tag,omitempty"`
+	Role      string `json:"role,omitempty"`
+	InputType string `json:"input_type,omitempty"`
+	// FileChooser is derived only from a native file input or a label's native
+	// associated file control, never from attributes on the label itself.
+	FileChooser bool   `json:"file_chooser,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Href        string `json:"href,omitempty"`
+	Actionable  bool   `json:"actionable,omitempty"`
+	Entry       bool   `json:"entry,omitempty"`
+	Composer    bool   `json:"composer,omitempty"`
+	Search      bool   `json:"search,omitempty"`
+	AutoSubmit  bool   `json:"auto_submit,omitempty"`
+	InForm      bool   `json:"in_form,omitempty"`
+	FormMethod  string `json:"form_method,omitempty"`
+	FormAction  string `json:"form_action,omitempty"`
 	// FormEnctype and FormTarget are the effective submission encoding and
 	// target, after any submitter override (formenctype, formtarget).
 	FormEnctype string `json:"form_enctype,omitempty"`
@@ -386,18 +391,34 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	var actSel = "button,a[href],input[type=submit],input[type=image],input[type=button],input[type=reset],[role=button],[role=link],[role=menuitem],[role=tab],summary,[onclick]";
 	var act = (kind === "click" && el.closest) ? el.closest(actSel) : (el.matches && el.matches(actSel) ? el : null);
 	var t = act || el;
-	// A file input's label only opens its chooser. Do not reclassify a
-	// different actionable descendant, such as a submit button inside a label.
+	function fileInput(e) {
+		try { return e instanceof HTMLInputElement && Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "type").get.call(e) === "file"; }
+		catch (x) { return false; }
+	}
+	function labelControl(e) {
+		try { return e instanceof HTMLLabelElement ? Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, "control").get.call(e) : null; }
+		catch (x) { return null; }
+	}
+	function interactiveDescendant(e, label) {
+		for (var n = e; n && n !== label; n = n.parentElement) {
+			var css = null; try { css = getComputedStyle(n); } catch (x) {}
+			if (n.matches(actSel + ",input,select,textarea,[tabindex],[contenteditable]") || (css && css.cursor === "pointer")) return true;
+		}
+		return false;
+	}
+	// A non-interactive label descendant activates the associated control;
+	// an interactive descendant remains its own click target.
 	var lab = !act && el.closest ? el.closest("label") : null;
-	if (lab && lab.control && lab.control.tagName === "INPUT" && lab.control.type === "file") t = lab;
+	if (lab && fileInput(labelControl(lab)) && !interactiveDescendant(el, lab)) t = lab;
 	tag = t.tagName.toLowerCase();
 	var cs = null; try { cs = getComputedStyle(t); } catch (e) {}
 	var role = (t.getAttribute("role") || "").toLowerCase();
 	var type = (t.type || t.getAttribute("type") || "").toLowerCase();
-	if (tag === "label" && t.control && t.control.tagName === "INPUT" && t.control.type === "file") type = "file";
+	var chooser = fileInput(t) || (tag === "label" && fileInput(labelControl(t)));
+	if (tag === "label") type = chooser ? "file" : "";
 	var isEntry = tag === "textarea" || t.isContentEditable || role === "textbox" || role === "searchbox" || role === "combobox" ||
 		(tag === "input" && !/^(checkbox|radio|button|submit|reset|image|file|hidden|range|color)$/.test(type));
-	out.tag = tag; out.role = role; out.input_type = type;
+	out.tag = tag; out.role = role; out.input_type = type; out.file_chooser = chooser;
 	out.name = nameOf(t);
 	out.actionable = !!act || (!isEntry && ((cs && cs.cursor === "pointer") || t.hasAttribute("tabindex")));
 	out.entry = isEntry;
@@ -470,18 +491,65 @@ func (m *CobrowseSessionManager) InspectTarget(id string, p TargetProbe) (Target
 		return TargetInfo{}, err
 	}
 	defer c.Close()
-	return inspectTargetOn(c, p, func() error {
+	return inspectTargetCachedOn(c, p, func() error {
 		if err := pn.verifyCtx(b.op); err != nil {
 			return err
 		}
 		return s.driverFence(pn)
-	})
+	}, &s.formWorld, fmt.Sprintf("%d/%s/%s", pn.port, pn.id, pn.ws))
+}
+
+type formWorldKey struct{ target, frame, loader string }
+
+// Only the latest document is cached, so page churn cannot grow session state.
+// The browser owns this named isolated world; a stale context is never used as
+// a reason to fall back to the page world.
+type formSnapshotWorld struct {
+	mu  sync.Mutex
+	key formWorldKey
+	id  int
+}
+
+func (w *formSnapshotWorld) get(k formWorldKey) int {
+	if w == nil || k.loader == "" {
+		return 0
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.key == k {
+		return w.id
+	}
+	return 0
+}
+
+func (w *formSnapshotWorld) set(k formWorldKey, id int) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.key, w.id = k, id
+}
+
+func (w *formSnapshotWorld) forget(k formWorldKey) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.key == k {
+		w.id = 0
+	}
 }
 
 // Read the snapshot in a browser-created isolated world. The entire probe uses
 // the same DOM observation, avoiding a main-world/isolated-world merge race.
 // Page code cannot replace File/Blob getters or the FormData constructor here.
 func inspectTargetOn(c cdpCaller, p TargetProbe, fence func() error) (TargetInfo, error) {
+	return inspectTargetCachedOn(c, p, fence, nil, "")
+}
+
+func inspectTargetCachedOn(c cdpCaller, p TargetProbe, fence func() error, cache *formSnapshotWorld, target string) (TargetInfo, error) {
 	if err := fence(); err != nil {
 		return TargetInfo{}, err
 	}
@@ -496,16 +564,25 @@ func inspectTargetOn(c cdpCaller, p TargetProbe, fence func() error) (TargetInfo
 	if frame == "" {
 		return TargetInfo{}, ErrTargetChanged
 	}
-	world, err := c.Call("Page.createIsolatedWorld", map[string]any{"frameId": frame, "worldName": "citadel-form-snapshot"})
-	if err != nil {
-		return TargetInfo{}, err
+	ft, _ := tree["frameTree"].(map[string]any)
+	root, _ := ft["frame"].(map[string]any)
+	loader, _ := root["loaderId"].(string)
+	key := formWorldKey{target: target, frame: frame, loader: loader}
+	contextID := cache.get(key)
+	if contextID == 0 {
+		world, err := c.Call("Page.createIsolatedWorld", map[string]any{"frameId": frame, "worldName": "citadel-form-snapshot"})
+		if err != nil {
+			return TargetInfo{}, err
+		}
+		value, ok := world["executionContextId"].(float64)
+		if !ok || value <= 0 || value != float64(int(value)) {
+			return TargetInfo{}, ErrTargetChanged
+		}
+		contextID = int(value)
+		cache.set(key, contextID)
 	}
 	if err := fence(); err != nil {
 		return TargetInfo{}, err
-	}
-	contextID, ok := world["executionContextId"].(float64)
-	if !ok || contextID <= 0 || contextID != float64(int(contextID)) {
-		return TargetInfo{}, ErrTargetChanged
 	}
 	var px, py any = nil, nil
 	if p.X != nil && p.Y != nil {
@@ -515,8 +592,14 @@ func inspectTargetOn(c cdpCaller, p TargetProbe, fence func() error) (TargetInfo
 	pyj, _ := json.Marshal(py)
 	expr := fmt.Sprintf("%s(%s,%s,%s,%s)", targetProbeScript,
 		jsStringLiteral(p.Kind), jsStringLiteral(p.Selector), pxj, pyj)
-	res, err := c.Call("Runtime.evaluate", map[string]any{"expression": expr, "contextId": int(contextID), "returnByValue": true, "awaitPromise": false})
+	res, err := c.Call("Runtime.evaluate", map[string]any{"expression": expr, "contextId": contextID, "returnByValue": true, "awaitPromise": false})
 	if err != nil {
+		// A lost document is refused now. The next probe obtains a fresh frame
+		// tree and recreates its context; no stale read or action is retried.
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "cannot find context") || strings.Contains(message, "cannot find execution context") || strings.Contains(message, "execution context was destroyed") {
+			cache.forget(key)
+		}
 		return TargetInfo{}, err
 	}
 	if err := fence(); err != nil {

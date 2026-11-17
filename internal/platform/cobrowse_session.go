@@ -298,6 +298,7 @@ type cobrowseSession struct {
 	// checked against (see ExpectTarget).
 	tracking     bool
 	expectTarget string
+	formWorld    formSnapshotWorld
 
 	// stageMu serializes writes into the staging dir (count check and create).
 	stageMu     sync.Mutex

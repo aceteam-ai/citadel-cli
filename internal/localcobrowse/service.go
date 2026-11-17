@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -1255,7 +1256,12 @@ func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platfor
 	}
 	for _, file := range t.FormFiles {
 		file.Field = sanitizeLabel(file.Field)
-		file.Name = sanitizeLabel(file.Name)
+		var readable bool
+		file.Name, readable = sanitizeFileName(file.Name)
+		if !readable {
+			pc.unverifiable = true
+			pc.reason = "the file extension is too long to display safely"
+		}
 		file.Type = sanitizeLabel(file.Type)
 		pc.files = append(pc.files, file)
 	}
@@ -1288,15 +1294,41 @@ func newCommitID() string {
 // sanitizeLabel bounds a control's label and drops control characters before
 // it reaches a card or the audit log.
 func sanitizeLabel(s string) string {
+	return truncRunes(cleanLabel(s), 80)
+}
+
+func cleanLabel(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		if unicode.IsControl(r) {
 			b.WriteRune(' ')
 			continue
 		}
 		b.WriteRune(r)
 	}
-	return truncRunes(strings.TrimSpace(b.String()), 80)
+	return strings.TrimSpace(b.String())
+}
+
+// Keep the final extension visible. An extension that cannot fit the bounded
+// card is explicitly unreadable and cannot acquire executable approval.
+func sanitizeFileName(s string) (string, bool) {
+	s = cleanLabel(s)
+	r := []rune(s)
+	if len(r) <= 80 {
+		return s, true
+	}
+	dot := strings.LastIndex(s, ".")
+	if dot <= 0 {
+		return truncRunes(s, 77), true
+	}
+	ext := []rune(s[dot:])
+	if len(ext) > 77 {
+		return "[filename unavailable: extension too long]", false
+	}
+	return string(r[:80-3-len(ext)]) + "..." + string(ext), true
 }
 
 // Extract reads an element's text and attributes, bounded (R).

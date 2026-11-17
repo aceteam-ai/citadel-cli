@@ -26,7 +26,7 @@ import (
 
 // RuleVersion is recorded in the audit log so a later reader knows which rules
 // classified an action. Bump it when the rules change.
-const RuleVersion = "local-commit-2"
+const RuleVersion = "local-commit-3"
 
 // Class is how an action is treated.
 type Class string
@@ -216,7 +216,7 @@ func Classify(kind, key string, t platform.TargetInfo) Decision {
 			return Decision{Class: ClassFill}
 		}
 	case "click":
-		if t.InputType == "file" && (t.Tag == "input" || t.Tag == "label") {
+		if t.FileChooser && (t.Tag == "input" || t.Tag == "label") && !t.Actionable {
 			return Decision{Class: ClassFill}
 		}
 		if t.Entry && !t.Actionable {

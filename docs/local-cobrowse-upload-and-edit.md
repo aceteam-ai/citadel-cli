@@ -443,10 +443,20 @@ isolated world (`Page.createIsolatedWorld`). Target resolution, focused state,
 the native submission set and native File/Blob getters use that same world's
 DOM observation, rather than merging two observations across worlds. A missing
 world, failed read or changed driver refuses the probe without falling back to
-the main world. The browser's synthetic empty File timestamp is normalized to
+the main world. The session reuses the context only for the same target, frame
+and loader, retaining at most one context reference. A lost context is invalidated
+and the current probe refuses; the next probe reads the current frame tree and
+recreates the world, without retrying any action. Chooser classification comes
+from a pristine native file-input type or a label's native associated control,
+not attributes on the label. Interactive descendants stay their own targets,
+and an actionable chooser still passes through the commit-word checks.
+The browser's synthetic empty File timestamp is normalized to
 zero, so an unselected file input has a stable digest. A snapshot with more
 than 128 attached entries is unverifiable rather than producing an unbounded
-commit card. No file bytes or local paths are read. Then:
+commit card. Filename display strips Unicode format and control characters and
+truncates the middle to retain the final extension. An extension too long for
+the bounded display is explicitly unavailable and makes approval unverifiable.
+No file bytes or local paths are read. Then:
 
 - fills in that form are ordinary fills under the grant;
 - the form's Submit is an ordinary commit whose content hash changes if the

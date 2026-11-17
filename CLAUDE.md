@@ -140,12 +140,17 @@ is the marker a caller checks first. Local mode does not pass the new fields.
 `TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
 
 `InspectTarget` owns the browser-created isolated world used for the complete
-target probe and form snapshot. `FormSnapshotScript` binds each File entry's
+target probe and form snapshot. The session caches only its latest target,
+frame and loader context, invalidates a lost context without retrying the read,
+and checks the live driver after every awaited call. `FormSnapshotScript` binds each File entry's
 field name, native file name, size, type and lastModified; it normalizes the
 browser's synthetic empty-file timestamp, refuses unreadable or excessive
 metadata, and never reads bytes or paths. The local commit card copies bounded
-metadata for display using text only. `Classify` treats a click on a file input
-or its associated label as fill, not an Upload button. It does not attach a file
+metadata for display using text only, removes format/control characters and
+preserves the filename's final extension; an extension too long to display is
+unverifiable. `Classify` trusts only the probe's native-control chooser signal
+for a non-actionable file input or associated label. Interactive descendants
+stay their own targets; actionable chooser controls retain commit checks. It does not attach a file
 or authorize staging; those remain separate upload slices. The rule version and
 `TestRealBrowserCommitActionsFileSnapshots` pin this approval behavior.
 

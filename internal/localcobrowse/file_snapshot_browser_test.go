@@ -45,6 +45,13 @@ func TestRealBrowserCommitActionsFileSnapshots(t *testing.T) {
 <form method="post" action="/upload" enctype="multipart/form-data">
 <input id="note" name="note" value="fixture"><input id="file" type="file" %s>
 <label for="file" id="label"><span id="labeltext">Upload</span></label>
+<label for="send" id="commitlabel" type="file">Submit</label>
+<label for="file"><span id="pointerchild" style="cursor:pointer">Submit</span></label>
+<label for="file"><span id="tabchild" tabindex="0">Submit</span></label>
+<label for="file"><input id="checkchild" type="checkbox">Choose</label>
+<label for="file"><input id="radiochild" type="radio">Choose</label>
+<label for="file" id="actionlabel" onclick="void 0">Submit</label>
+<input id="actionfile" type="file" aria-label="Submit" onclick="void 0">
 <button id="send" type="submit">Submit</button></form>
 <script>
 Object.defineProperty(File.prototype,"name",{get(){return "spoofed.txt"}});
@@ -98,9 +105,27 @@ Object.defineProperty(Blob.prototype,"type",{get(){return "spoof/type"}});
 	waitReady()
 	for _, selector := range []string{"#file", "#labeltext"} {
 		ti, err := m.InspectTarget(id, platform.TargetProbe{Kind: "click", Selector: selector})
-		if err != nil || ti.InputType != "file" || Classify("click", "", ti).Class != ClassFill {
+		if err != nil || !ti.FileChooser || ti.InputType != "file" || Classify("click", "", ti).Class != ClassFill {
 			t.Fatalf("chooser click: %+v %v", ti, err)
 		}
+	}
+	for _, selector := range []string{"#commitlabel", "#actionlabel", "#actionfile", "#pointerchild", "#tabchild"} {
+		ti, err := m.InspectTarget(id, platform.TargetProbe{Kind: "click", Selector: selector})
+		if err != nil || Classify("click", "", ti).Class != ClassCommit {
+			t.Fatalf("commit label/descendant: %+v %v", ti, err)
+		}
+	}
+	for _, selector := range []string{"#pointerchild", "#tabchild", "#checkchild", "#radiochild"} {
+		ti, err := m.InspectTarget(id, platform.TargetProbe{Kind: "click", Selector: selector})
+		if err != nil || ti.Tag == "label" || ti.FileChooser {
+			t.Fatalf("interactive child reclassified: %+v %v", ti, err)
+		}
+	}
+	if _, err := svc.Click(ctx, id, "#commitlabel", nil, nil, "submit"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatalf("non-file label did not ask: %v", err)
+	}
+	if err := svc.DenyCommit(id, pendingView(t, svc, id).ID); err != nil {
+		t.Fatal(err)
 	}
 	attach := func(name string) {
 		t.Helper()

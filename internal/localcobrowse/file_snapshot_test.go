@@ -81,7 +81,7 @@ func TestFileSnapshotEmptyAndMetadataBinding(t *testing.T) {
 
 func TestFileInputClickIsFillButUploadButtonStillAsks(t *testing.T) {
 	for _, typ := range []string{"file", "label"} {
-		target := platform.TargetInfo{Resolved: true, Tag: "input", InputType: "file", Name: "Upload", Actionable: true}
+		target := platform.TargetInfo{Resolved: true, Tag: "input", InputType: "file", FileChooser: true, Name: "Upload"}
 		if typ == "label" {
 			target.Tag = "label"
 		}
@@ -91,5 +91,57 @@ func TestFileInputClickIsFillButUploadButtonStillAsks(t *testing.T) {
 	}
 	if got := Classify("click", "", platform.TargetInfo{Resolved: true, Tag: "button", Name: "Upload", Actionable: true}); got.Class != ClassCommit {
 		t.Fatalf("upload button bypassed approval: %+v", got)
+	}
+}
+
+func TestFileInputClickCannotBypassCommitSignals(t *testing.T) {
+	for name, target := range map[string]platform.TargetInfo{
+		"label attribute":       {Resolved: true, Tag: "label", InputType: "file", Name: "Submit"},
+		"actionable file input": {Resolved: true, Tag: "input", InputType: "file", FileChooser: true, Actionable: true, Name: "Submit"},
+		"actionable file label": {Resolved: true, Tag: "label", InputType: "file", FileChooser: true, Actionable: true, Name: "Upload"},
+		"untrusted tag":         {Resolved: true, Tag: "span", InputType: "file", FileChooser: true, Name: "Submit"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := Classify("click", "", target); got.Class != ClassCommit {
+				t.Fatalf("commit signal bypassed: %+v", got)
+			}
+		})
+	}
+}
+
+func TestFileSnapshotRejectsInvalidSize(t *testing.T) {
+	for _, size := range []any{-1, 1.5, "8", nil, 9007199254740992.0} {
+		s := fileScenario("att", "invoice.txt", 8, "text/plain", 100)
+		s.Form.Submitted[0][1].(map[string]any)["size"] = size
+		if got := runInspect(t, s)[0]; got.Bad == "" {
+			t.Fatalf("invalid size %v was accepted", size)
+		}
+	}
+}
+
+func TestFileCommitCardNamesCannotHideExtension(t *testing.T) {
+	for _, name := range []string{"invoice\u202efdp.exe", "invoice\u2066\u2069\u200e\u200f\u200b\u200d.exe", "invoice\u0085\u009f.exe", strings.Repeat("x", 120) + ".exe"} {
+		got, ok := sanitizeFileName(name)
+		if !ok || !strings.HasSuffix(got, ".exe") || len([]rune(got)) > 80 {
+			t.Fatalf("unreadable filename: %q", got)
+		}
+		for _, bad := range []rune{'\u202e', '\u2066', '\u2069', '\u200e', '\u200f', '\u200b', '\u200d', '\u0085', '\u009f'} {
+			if strings.ContainsRune(got, bad) || strings.ContainsRune(sanitizeLabel(name), bad) {
+				t.Fatalf("format/control retained: %q", got)
+			}
+		}
+	}
+	if _, ok := sanitizeFileName("name." + strings.Repeat("x", 80)); ok {
+		t.Fatal("unrepresentable extension was silently truncated")
+	}
+	svc, fb, _, id := startGranted(t, nil)
+	target := sendTarget()
+	target.FormFiles = []platform.FormFile{{Name: "name." + strings.Repeat("x", 80)}}
+	fb.target = target
+	if _, err := svc.Click(ctx, id, "#send", nil, nil, "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatal(err)
+	}
+	if err := svc.ApproveCommit(ctx, id, pendingView(t, svc, id).ID); err == nil || clicks(fb) != 0 {
+		t.Fatalf("unreadable file card executed: %v", err)
 	}
 }
