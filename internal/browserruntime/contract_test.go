@@ -27,7 +27,7 @@ func TestArgsContract(t *testing.T) {
 		" --user 1000:1000 ", " --cap-drop ALL ", " no-new-privileges ", " --read-only ",
 		" -p 127.0.0.1::8102 ", " -p 127.0.0.1::9223 ",
 		" aceteam.browser-runtime.session=s-1 ", " aceteam.browser-runtime.purpose=cobrowse ",
-		" --security-opt seccomp=/tmp/seccomp.json ", " aceteam.browser-runtime.browser=chromium ", " MEETING_BROWSER=chromium ",
+		" --security-opt seccomp=/tmp/seccomp.json ", " aceteam.browser-runtime.browser=chromium ", " MEETING_BROWSER=chromium ", " MEETING_REQUIRE_SANDBOX=1 ",
 		" --mount type=bind,src=/tmp/p,dst=/profile ", " --network aceteam-br-s-1 ", "/home/bot:rw,size=256m,mode=0700,uid=1000,gid=1000",
 	} {
 		if !strings.Contains(j, want) {
@@ -339,7 +339,8 @@ func TestSandboxStaysOffInDockerfileUntilVerified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(strings.ReplaceAll(string(m), `args.append("--no-sandbox")`, ""), `"--no-sandbox"`) {
-		t.Error("build_chrome_args must not carry --no-sandbox outside the explicit opt-out")
+	// --no-sandbox is only ever appended behind the REQUIRE_SANDBOX switch.
+	if strings.Count(string(m), `"--no-sandbox"`) != 1 || !strings.Contains(string(m), "if not REQUIRE_SANDBOX:\n        # Historical behaviour") {
+		t.Error("build_chrome_args must add --no-sandbox only when MEETING_REQUIRE_SANDBOX is unset")
 	}
 }

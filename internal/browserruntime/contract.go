@@ -255,6 +255,10 @@ func (s RunSpec) Args() ([]string, error) {
 		"--label", LabelPurpose + "=" + s.Purpose,
 		"--label", LabelBrowser + "=" + browser,
 		"-e", "MEETING_BROWSER=" + browser,
+		// Turns the sandbox on inside the image: drops --no-sandbox and makes
+		// meetingd verify and enforce it. Without it the image keeps its
+		// historical behaviour (the catalog meeting module relies on that).
+		"-e", "MEETING_REQUIRE_SANDBOX=1",
 	}
 	if s.Name != "" {
 		args = append(args, "--name", s.Name)

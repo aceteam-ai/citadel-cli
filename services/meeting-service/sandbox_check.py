@@ -5,8 +5,19 @@ Stdlib only. The check reads /proc for the browser's process tree and refuses
 
   * no process in the tree carries --no-sandbox,
   * at least one renderer exists (an empty tree proves nothing), and
-  * every renderer runs under a seccomp filter (Seccomp: 2 in /proc/<pid>/status)
-    inside a user namespace different from the browser process's own.
+  * every renderer runs in a user namespace different from the browser's AND
+    carries strictly more seccomp filters (Seccomp_filters in
+    /proc/<pid>/status) than the browser.
+
+Seccomp mode 2 alone proves nothing inside a container: the engine's own profile
+already puts every process, the browser included, in mode 2. Chromium's
+seccomp-BPF sandbox stacks an extra filter on the renderer, so a renderer whose
+filter count does not exceed the browser's has no Chromium filter (for example
+--disable-seccomp-filter-sandbox). A missing Seccomp_filters field (kernel too
+old to report it) fails the check rather than passing it.
+
+Chromium retitles its processes, so /proc/<pid>/cmdline is one string with the
+arguments joined by spaces; it is tokenized on whitespace.
 
 Chromium installs both layers itself when its sandbox starts: the namespace
 sandbox (clone/unshare of CLONE_NEWUSER, needs the pinned seccomp profile the run
@@ -18,6 +29,7 @@ profile blocks the namespace calls, Chromium refuses to start a renderer or, wit
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -28,6 +40,8 @@ class SandboxReport:
     reason: str
     renderers: int = 0
     details: list[str] = field(default_factory=list)
+    # retry: the verdict can still change (a process or filter is not there yet).
+    retry: bool = False
 
 
 def _read(path: str) -> str:
@@ -60,7 +74,7 @@ def _ppid(proc_root: str, pid: int) -> int | None:
 
 def _cmdline(proc_root: str, pid: int) -> list[str]:
     raw = _read(f"{proc_root}/{pid}/cmdline")
-    return [a for a in raw.split("\0") if a]
+    return [a for a in re.split(r"\s+", raw.replace("\0", " ")) if a]
 
 
 def _userns(proc_root: str, pid: int) -> str | None:
@@ -68,6 +82,11 @@ def _userns(proc_root: str, pid: int) -> str | None:
         return os.readlink(f"{proc_root}/{pid}/ns/user")
     except OSError:
         return None
+
+
+def _filters(status: dict[str, str]) -> int | None:
+    val = status.get("Seccomp_filters", "")
+    return int(val) if val.isdigit() else None
 
 
 def descendants(root_pid: int, proc_root: str = "/proc") -> list[int]:
@@ -87,13 +106,21 @@ def descendants(root_pid: int, proc_root: str = "/proc") -> list[int]:
     return out
 
 
+NO_RENDERER = "no renderer process yet"
+NO_FILTER = "renderer has no seccomp filter beyond the container profile"
+
+
 def inspect_tree(browser_pid: int, proc_root: str = "/proc") -> SandboxReport:
     """One-shot verdict for the process tree rooted at browser_pid."""
     tree = [browser_pid, *descendants(browser_pid, proc_root)]
     browser_ns = _userns(proc_root, browser_pid)
     if browser_ns is None:
-        return SandboxReport(False, "browser process not readable")
+        return SandboxReport(False, "browser process not readable", retry=True)
+    browser_filters = _filters(parse_status(_read(f"{proc_root}/{browser_pid}/status")))
+    if browser_filters is None:
+        return SandboxReport(False, "Seccomp_filters not reported for the browser process")
     renderers = 0
+    waiting = False
     details: list[str] = []
     for pid in tree:
         cmd = _cmdline(proc_root, pid)
@@ -102,17 +129,22 @@ def inspect_tree(browser_pid: int, proc_root: str = "/proc") -> SandboxReport:
         if "--type=renderer" not in cmd:
             continue
         renderers += 1
-        st = parse_status(_read(f"{proc_root}/{pid}/status"))
-        if st.get("Seccomp") != "2":
-            return SandboxReport(False, "renderer has no seccomp filter", renderers)
         ns = _userns(proc_root, pid)
         if ns is None:
             return SandboxReport(False, "renderer user namespace not readable", renderers)
         if ns == browser_ns:
             return SandboxReport(False, "renderer shares the browser's user namespace", renderers)
-        details.append(f"renderer {pid}: seccomp=2 userns differs")
+        rf = _filters(parse_status(_read(f"{proc_root}/{pid}/status")))
+        if rf is None:
+            return SandboxReport(False, "Seccomp_filters not reported for a renderer", renderers)
+        if rf <= browser_filters:
+            waiting = True  # the Chromium filter may not be installed yet
+            continue
+        details.append(f"renderer {pid}: filters {rf} > browser {browser_filters}, own userns")
     if renderers == 0:
-        return SandboxReport(False, "no renderer process yet")
+        return SandboxReport(False, NO_RENDERER, retry=True)
+    if waiting:
+        return SandboxReport(False, NO_FILTER, renderers, retry=True)
     return SandboxReport(True, "sandboxed", renderers, details)
 
 
@@ -122,16 +154,17 @@ def wait_for_sandbox(
     proc_root: str = "/proc",
     sleep=time.sleep,
     clock=time.monotonic,
+    alive=None,
 ) -> SandboxReport:
-    """Poll until the tree is verified sandboxed or the deadline passes. A
-    definite violation (--no-sandbox, missing filter, shared namespace) returns
-    immediately; only "no renderer yet" keeps waiting."""
+    """Poll until the tree is verified sandboxed or the deadline passes. A definite
+    violation (--no-sandbox, shared namespace, missing field) returns at once;
+    only retryable verdicts keep waiting. `alive` (a callable) lets the caller
+    report that the browser has exited, which returns at once as well."""
     deadline = clock() + timeout
-    last = SandboxReport(False, "no renderer process yet")
     while True:
+        if alive is not None and not alive():
+            return SandboxReport(False, "browser exited before the sandbox was verified")
         last = inspect_tree(browser_pid, proc_root)
-        if last.ok or (last.reason != "no renderer process yet" and last.reason != "browser process not readable"):
-            return last
-        if clock() >= deadline:
+        if last.ok or not last.retry or clock() >= deadline:
             return last
         sleep(0.25)

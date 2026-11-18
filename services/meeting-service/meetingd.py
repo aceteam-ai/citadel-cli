@@ -44,10 +44,11 @@ One flag is a container-specific delta from the host builder, documented inline:
                                                interfaces INSIDE the container and
                                                the compose publish restricts it to
                                                host loopback)
-The renderer sandbox is ON (citadel-cli#1788): there is no --no-sandbox, the run
-contract passes a pinned seccomp profile that lets Chromium's namespace sandbox
-start, and start_session refuses to hand out a session until sandbox_check
-verifies the renderer is sandboxed.
+The renderer sandbox is opt-in (citadel-cli#1788): by default --no-sandbox stays
+and nothing is checked. With MEETING_REQUIRE_SANDBOX=1 (set by the run contract,
+which also passes a pinned seccomp profile) there is no --no-sandbox and
+start_session refuses to hand out a session until sandbox_check verifies the
+renderer is sandboxed.
 """
 
 from __future__ import annotations
@@ -99,11 +100,13 @@ WORKSPACE = os.environ.get("CITADEL_WORKSPACE", "/workspace")
 SUPPORTED_BROWSERS = ("chromium",)
 BROWSER_KIND = os.environ.get("MEETING_BROWSER", "chromium") or "chromium"
 
-# The renderer sandbox is mandatory. MEETING_ALLOW_NO_SANDBOX is the explicit
-# opt-out for the legacy docker-compose meeting module (default seccomp, no pinned
-# profile): it re-adds --no-sandbox, skips the sandbox check, and is reported as
-# sandboxed=false in session status. The browser-runtime run contract never sets it.
-ALLOW_NO_SANDBOX = _truthy(os.environ.get("MEETING_ALLOW_NO_SANDBOX"))
+# Renderer sandbox (citadel-cli#1788). OFF by default so the image behaves exactly
+# as it always has for callers that predate it (the catalog meeting module pulls
+# :latest and runs under the engine's default seccomp, where Chromium's sandbox
+# cannot start): it keeps --no-sandbox and runs no check. The browser-runtime run
+# contract passes MEETING_REQUIRE_SANDBOX=1, which drops --no-sandbox, runs
+# sandbox_check on every session and refuses sessions that fail it.
+REQUIRE_SANDBOX = _truthy(os.environ.get("MEETING_REQUIRE_SANDBOX"))
 SANDBOX_VERIFY_TIMEOUT = float(os.environ.get("MEETING_SANDBOX_VERIFY_TIMEOUT", "20"))
 
 # Silence floor for the canary probe, in dBFS. A 440 Hz tone captured through the
@@ -182,7 +185,7 @@ def build_chrome_args(cdp_port: int, profile_dir: str) -> list[str]:
     """Chromium command line for a meeting-bot launch inside the container.
 
     Mirrors internal/platform buildChromeArgs(meeting options) EXCEPT for the
-    container delta (the renderer sandbox stays ON; see ALLOW_NO_SANDBOX). CDP binds 127.0.0.1 exactly
+    container delta (--no-sandbox unless MEETING_REQUIRE_SANDBOX; see REQUIRE_SANDBOX). CDP binds 127.0.0.1 exactly
     like the host builder; a socat forwarder (not a chrome flag) is what exposes it
     on the published port. Pure function so the flag set -- especially the two
     load-bearing flags -- is unit-testable without launching a browser.
@@ -208,7 +211,8 @@ def build_chrome_args(cdp_port: int, profile_dir: str) -> list[str]:
         # load-bearing (#5098): let incoming WebRTC audio play with no user gesture
         "--autoplay-policy=no-user-gesture-required",
     ]
-    if ALLOW_NO_SANDBOX:
+    if not REQUIRE_SANDBOX:
+        # Historical behaviour, kept unless the run contract requires the sandbox.
         args.append("--no-sandbox")
     # Bounded disk cache (aceteam-ai/citadel-cli#1760): the container runner sets
     # MEETING_DISK_CACHE_MB so a long session cannot grow the profile mount.
@@ -831,8 +835,10 @@ def start_session(req: StartSessionRequest) -> JSONResponse:
     # sandboxed. A sandbox that cannot start (blocked syscalls, no seccomp
     # profile) tears the session down instead of running unsandboxed.
     sandboxed = False
-    if not ALLOW_NO_SANDBOX:
-        report = sandbox_check.wait_for_sandbox(chrome.pid, SANDBOX_VERIFY_TIMEOUT)
+    if REQUIRE_SANDBOX:
+        report = sandbox_check.wait_for_sandbox(
+            chrome.pid, SANDBOX_VERIFY_TIMEOUT, alive=lambda: chrome.poll() is None
+        )
         if not report.ok:
             with session.lock:
                 session.ending = True
@@ -1301,9 +1307,8 @@ def sandbox_selfcheck() -> int:
     if binary is None:
         print(json.dumps({"ok": False, "reason": f"{BROWSER_KIND} not found"}))
         return 1
-    if ALLOW_NO_SANDBOX:
-        print(json.dumps({"ok": False, "reason": "MEETING_ALLOW_NO_SANDBOX is set"}))
-        return 1
+    global REQUIRE_SANDBOX
+    REQUIRE_SANDBOX = True  # the self-check always tests the sandboxed launch
     profile = tempfile.mkdtemp(prefix="sandbox-selfcheck-")
     proc = subprocess.Popen(
         [binary, "--headless=new", *build_chrome_args(MEETING_CDP_INTERNAL_PORT, profile), "about:blank"],
@@ -1311,7 +1316,9 @@ def sandbox_selfcheck() -> int:
         stderr=subprocess.DEVNULL,
     )
     try:
-        report = sandbox_check.wait_for_sandbox(proc.pid, SANDBOX_VERIFY_TIMEOUT)
+        report = sandbox_check.wait_for_sandbox(
+            proc.pid, SANDBOX_VERIFY_TIMEOUT, alive=lambda: proc.poll() is None
+        )
     finally:
         proc.kill()
         proc.wait()

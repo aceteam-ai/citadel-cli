@@ -632,17 +632,34 @@ var controlHTTPClient = &http.Client{
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }
 
+// startBrowserClient has a timeout above meetingd's sandbox verify window
+// (MEETING_SANDBOX_VERIFY_TIMEOUT, 20s), so a slow first renderer does not make
+// the POST time out and be retried into a 409.
+var startBrowserClient = &http.Client{
+	Timeout:       45 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
 func defaultStartBrowser(ctx context.Context, ctrlPort int, id string) error {
 	body, _ := json.Marshal(map[string]any{"session_id": id, "max_duration_seconds": containerSessionMaxSecs})
 	var last error
 	for {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/sessions", ctrlPort), bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := controlHTTPClient.Do(req)
+		resp, err := startBrowserClient.Do(req)
 		if err == nil {
-			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			reply, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusCreated {
+				// Trust the 201 only when meetingd reports the sandboxed browser
+				// the contract asked for.
+				var ok struct {
+					Browser   string `json:"browser"`
+					Sandboxed bool   `json:"sandboxed"`
+				}
+				if json.Unmarshal(reply, &ok) != nil || !ok.Sandboxed || ok.Browser != browserruntime.BrowserChromium {
+					return errors.New("control API did not confirm a sandboxed chromium session")
+				}
 				return nil
 			}
 			if resp.StatusCode != http.StatusServiceUnavailable { // 503: still booting

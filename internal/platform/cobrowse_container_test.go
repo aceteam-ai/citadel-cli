@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -873,6 +877,31 @@ func TestRecoverContainerOwnedByAnotherWorkerIsUntouched(t *testing.T) {
 			}
 			if len(m.sessions) != 0 {
 				t.Fatal("must not adopt it")
+			}
+		})
+	}
+}
+
+func TestDefaultStartBrowserRequiresSandboxedChromium(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		ok   bool
+	}{
+		"confirmed":   {`{"browser":"chromium","sandboxed":true}`, true},
+		"unsandboxed": {`{"browser":"chromium","sandboxed":false}`, false},
+		"other":       {`{"browser":"cloakbrowser","sandboxed":true}`, false},
+		"empty":       {``, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusCreated)
+				io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			port, _ := strconv.Atoi(srv.URL[strings.LastIndex(srv.URL, ":")+1:])
+			err := defaultStartBrowser(context.Background(), port, "s1")
+			if (err == nil) != tc.ok {
+				t.Fatalf("err=%v want ok=%v", err, tc.ok)
 			}
 		})
 	}
