@@ -69,6 +69,25 @@ func (s *UploadSettings) Status() UploadStatus {
 	return UploadStatus{Enabled: on, Reason: reason, Warning: s.warning}
 }
 
+// Windows may report a non-directory ancestor as PATH_NOT_FOUND. Walk to the
+// first existing ancestor before treating a directory as genuinely absent.
+func (s *UploadSettings) absentDirectory(path string) bool {
+	for {
+		st, err := s.stat(path)
+		if err == nil {
+			return st.IsDir()
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return false
+		}
+		path = parent
+	}
+}
+
 func (s *UploadSettings) readFile() (bool, string) {
 	const bad = "Uploads are off because settings.json is unreadable, invalid or not owner-only; use citadel local config uploads on|off to replace it"
 	if s.dir == "" {
@@ -82,7 +101,7 @@ func (s *UploadSettings) readFile() (bool, string) {
 			s.info = nil
 			return false, bad
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if !errors.Is(err, os.ErrNotExist) || !s.absentDirectory(s.root) {
 		s.info = nil
 		return false, bad
 	}
@@ -91,7 +110,7 @@ func (s *UploadSettings) readFile() (bool, string) {
 			s.info = nil
 			return false, bad
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if !errors.Is(err, os.ErrNotExist) || !s.absentDirectory(s.dir) {
 		s.info = nil
 		return false, bad
 	}
@@ -99,9 +118,19 @@ func (s *UploadSettings) readFile() (bool, string) {
 	st, err := s.stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		s.info = nil
+		if !s.absentDirectory(s.dir) {
+			return false, bad
+		}
 		return true, "Uploads are on (no setting file)"
 	}
 	if err != nil || platform.ValidatePrivateDir(s.dir) != nil || platform.ValidatePrivateFile(path) != nil || st.Size() > maxUploadSettingsBytes || st.Mode().Perm()&0o400 == 0 {
+		s.info = nil
+		return false, bad
+	}
+	// os.Lstat on Windows leaves the file ID lazy. Force its acquisition
+	// before the open boundary, otherwise SameFile can resolve the old info's
+	// path only after replacement and compare the replacement to itself.
+	if !os.SameFile(st, st) {
 		s.info = nil
 		return false, bad
 	}

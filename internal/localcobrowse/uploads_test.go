@@ -288,6 +288,18 @@ func TestUploadsStatErrorsDeny(t *testing.T) {
 			t.Fatal("ENOTDIR or non-directory accepted")
 		}
 	}
+	// Model Windows ERROR_PATH_NOT_FOUND for a non-directory ancestor on
+	// every OS, so CI cannot regress this into the missing-file default.
+	simulated := NewUploadSettings(filepath.Join(path, "child"), "")
+	simulated.stat = func(candidate string) (os.FileInfo, error) {
+		if strings.HasPrefix(candidate, path+string(os.PathSeparator)) {
+			return nil, os.ErrNotExist
+		}
+		return os.Lstat(candidate)
+	}
+	if simulated.Status().Enabled {
+		t.Fatal("non-directory ancestor disguised as not found enabled uploads")
+	}
 	dir, s := uploadFixture(t)
 	if !s.Status().Enabled {
 		t.Fatal("fixture")
