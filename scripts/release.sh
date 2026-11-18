@@ -126,11 +126,45 @@ hook_pre_publish() {
     --in "$release_dir/checksums.txt" --sig "$release_dir/checksums.txt.sig"
 }
 
+# The test gate trusts main's CI instead of re-running it here: CI already
+# runs the full suite, vet and lint on every main commit, and re-running them
+# on the release host duplicates that work on a shared machine. The release
+# must be cut from a commit whose required "Build + Test" check succeeded.
+# Set CITADEL_RELEASE_LOCAL_TESTS=1 to run go test and go vet locally instead.
 hook_test() {
-  info "Running Go tests..."
-  go test ./...
-  info "Running Go vet..."
-  go vet ./...
+  if [[ "${CITADEL_RELEASE_LOCAL_TESTS:-0}" == "1" ]]; then
+    info "Running Go tests locally (CITADEL_RELEASE_LOCAL_TESTS=1)..."
+    go test ./...
+    info "Running Go vet..."
+    go vet ./...
+    return
+  fi
+
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    err "The working tree has uncommitted changes; CI did not test them."
+    return 1
+  fi
+  local sha main_sha
+  sha=$(git rev-parse HEAD)
+  git fetch -q origin main
+  main_sha=$(git rev-parse origin/main)
+  if [[ "$sha" != "$main_sha" ]]; then
+    err "HEAD ($sha) is not origin/main ($main_sha); release only from a CI-tested main commit."
+    return 1
+  fi
+
+  info "Checking main CI at ${sha:0:12} (set CITADEL_RELEASE_LOCAL_TESTS=1 to test locally instead)..."
+  local conclusion
+  if ! conclusion=$(gh api "repos/${RELEASE_GITHUB_REPO}/commits/${sha}/check-runs?per_page=100" \
+      --jq '[.check_runs[] | select(.name == "Build + Test")] | sort_by(.completed_at) | last | .conclusion // "missing"'); then
+    err "Could not read CI check runs for ${sha}."
+    return 1
+  fi
+  if [[ "$conclusion" != "success" ]]; then
+    err "Required check \"Build + Test\" at ${sha:0:12} is '${conclusion}', not 'success'. Wait for CI, or fix main."
+    return 1
+  fi
+  info "Main CI passed at ${sha:0:12}."
 }
 
 hook_build() {
