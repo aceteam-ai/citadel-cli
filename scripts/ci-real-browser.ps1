@@ -4,10 +4,15 @@
 #   - runs the packages one at a time (-p 1): the five packages used to launch
 #     browsers concurrently on a small runner, which starved the cold launches
 #   - retries ONLY the top-level tests that failed, once, and prints both
-#     attempts. A second failure fails the step; a build error or a panic
-#     (no named failing test) is never retried.
+#     attempts. Get-RetryDecision (ci-real-browser-lib.ps1, self-tested by
+#     test-ci-real-browser.ps1 at the start of every run) refuses to retry when
+#     any package failed without a named failing test, or on a build error,
+#     panic or timeout. A second failure fails the step.
 param([Parameter(Mandatory)][string]$Pattern)
 $ErrorActionPreference = "Continue"
+. (Join-Path $PSScriptRoot "ci-real-browser-lib.ps1")
+& (Join-Path $PSScriptRoot "test-ci-real-browser.ps1")
+if ($LASTEXITCODE -ne 0) { exit 1 }
 $pkgs = @("./internal/platform/", "./internal/localcobrowse/", "./internal/localviewer/", "./internal/cobrowsestream/", "./tests/localgate/")
 
 function Stop-Browsers {
@@ -30,24 +35,36 @@ function Invoke-WarmUp {
 
 function Invoke-Attempt($label, $run) {
     Write-Host "::group::$label"
-    $log = Join-Path $env:TEMP "gotest-$([guid]::NewGuid().ToString('N')).log"
-    & go test @pkgs -p 1 -count=1 -v -run $run 2>&1 | Tee-Object -FilePath $log
+    $lines = New-Object System.Collections.Generic.List[string]
+    # -json for the retry decision; print the Output fields so the Actions log
+    # stays human readable. Everything goes to the host, only the result object
+    # is returned.
+    & go test @pkgs -p 1 -count=1 -json -run $run 2>&1 | ForEach-Object {
+        $line = [string]$_
+        $lines.Add($line)
+        if ($line.StartsWith("{")) {
+            try { $ev = $line | ConvertFrom-Json; if ($ev.Output) { Write-Host -NoNewline $ev.Output } } catch { Write-Host $line }
+        } else { Write-Host $line }
+    }
     $code = $LASTEXITCODE
     Write-Host "::endgroup::"
     Write-Host "$label exit code: $code"
-    $failed = @(Select-String -Path $log -Pattern '^--- FAIL: (\S+)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique)
-    [pscustomobject]@{ Code = $code; Failed = $failed }
+    [pscustomobject]@{ Code = $code; Lines = $lines.ToArray() }
 }
 
 Stop-Browsers
 Invoke-WarmUp
 $first = Invoke-Attempt "attempt 1" $Pattern
 if ($first.Code -eq 0) { exit 0 }
-if ($first.Failed.Count -eq 0) { Write-Host "attempt 1 failed without a named failing test (build error, panic or timeout); not retrying"; exit $first.Code }
-Write-Host "attempt 1 FAILED: $($first.Failed -join ', ')"
+$decision = Get-RetryDecision $first.Lines
+if (-not $decision.Retry) { Write-Host "attempt 1 failed and is not retryable: $($decision.Reason)"; exit $first.Code }
+Write-Host "attempt 1 FAILED: $($decision.Tests -join ', ')"
 Write-Host "retrying only those tests once (#1795); both attempts are reported"
 Stop-Browsers
-$second = Invoke-Attempt "attempt 2 (retry of failed tests)" ("^(" + ($first.Failed -join "|") + ")$")
-if ($second.Code -eq 0) { Write-Host "attempt 2 PASSED; attempt 1 had failed: $($first.Failed -join ', ')"; exit 0 }
-Write-Host "attempt 2 FAILED too: $($second.Failed -join ', ')"
+$second = Invoke-Attempt "attempt 2 (retry of failed tests)" ("^(" + ($decision.Tests -join "|") + ")$")
+if ($second.Code -eq 0) {
+    Write-Host "::warning::real-browser test(s) passed only on retry: $($decision.Tests -join ', ')"
+    exit 0
+}
+Write-Host "attempt 2 FAILED too"
 exit $second.Code
