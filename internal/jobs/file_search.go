@@ -86,6 +86,9 @@ func (h *FileSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 		if err != nil {
 			return nil // Skip unreadable entries.
 		}
+		if isBotProfilesDir(p, d) {
+			return filepath.SkipDir
+		}
 		if d.IsDir() {
 			// Skip common noise directories.
 			name := d.Name()

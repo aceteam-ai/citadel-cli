@@ -300,6 +300,9 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			cancelled = true
 			return filepath.SkipAll
 		}
+		if isBotProfilesDir(p, d) {
+			return filepath.SkipDir
+		}
 		if d.IsDir() {
 			name := d.Name()
 			if name == ".git" || name == "node_modules" || name == "__pycache__" || name == ".venv" || name == "vendor" {
@@ -620,6 +623,9 @@ func countIndexCandidates(root, filePattern string, ctx JobContext) int {
 		}
 		if ctx.Context().Err() != nil || ctx.CancelRequestedNow() {
 			return filepath.SkipAll
+		}
+		if isBotProfilesDir(p, d) {
+			return filepath.SkipDir
 		}
 		if d.IsDir() {
 			name := d.Name()

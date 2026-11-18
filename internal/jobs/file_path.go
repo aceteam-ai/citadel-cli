@@ -6,7 +6,55 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/botprofile"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
+
+// botProfileDirsFn returns the bot-profile store directories no FILE_* or
+// code-path job may touch (citadel-cli#1761). Both the machine-convergent node
+// config dir and the invoker-scoped one are covered. It is a var so tests can
+// point it at a temp dir instead of resolving the real node config dir.
+var botProfileDirsFn = func() []string {
+	return []string{
+		botprofile.Dir(network.GetNodeConfigDir()),
+		botprofile.Dir(platform.ConfigDir()),
+	}
+}
+
+// ErrBotProfilesDenied is returned for any path under a bot-profile store.
+var ErrBotProfilesDenied = fmt.Errorf("path is not available to file jobs")
+
+// denyBotProfiles refuses p if it, or its symlink-resolved form, is the
+// bot-profile store or beneath it. It compares both lexical and resolved forms
+// of both sides, so a symlink into the store, or a store reached through a
+// symlinked config dir, is still refused. The error names no path.
+func denyBotProfiles(p string) error {
+	cands := []string{filepath.Clean(p)}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		cands = append(cands, r)
+	} else if r, err := resolveNearestAncestor(filepath.Clean(p)); err == nil {
+		cands = append(cands, r)
+	}
+	for _, d := range botProfileDirsFn() {
+		if d == "" {
+			continue
+		}
+		dirs := []string{filepath.Clean(d)}
+		if r, err := filepath.EvalSymlinks(d); err == nil {
+			dirs = append(dirs, r)
+		}
+		for _, dir := range dirs {
+			for _, c := range cands {
+				if withinDir(dir, c) {
+					return ErrBotProfilesDenied
+				}
+			}
+		}
+	}
+	return nil
+}
 
 // ValidatePath resolves requestedPath within the workspace sandbox and returns
 // the cleaned absolute path. It rejects any path that escapes the workspace
@@ -53,6 +101,9 @@ func ValidatePath(workspace, requestedPath string) (string, error) {
 	if !withinDir(resolvedWorkspace, resolved) {
 		return "", fmt.Errorf("path %q resolves outside workspace", requestedPath)
 	}
+	if err := denyBotProfiles(resolved); err != nil {
+		return "", err
+	}
 
 	// There used to be a SECOND, lexical check here comparing cleanTarget against
 	// resolvedWorkspace. It was removed because it was both WRONG and redundant:
@@ -88,6 +139,14 @@ func withinDir(dir, target string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// isBotProfilesDir reports whether the directory entry at p is a bot-profile
+// store. Directory walkers call it so a validated parent (a root that happens
+// to contain the node config dir) is never descended into the store. The cheap
+// name test comes first so ordinary entries cost nothing.
+func isBotProfilesDir(p string, d os.DirEntry) bool {
+	return d.IsDir() && d.Name() == botprofile.DirName && denyBotProfiles(p) != nil
 }
 
 // ValidateWithinRoots generalizes the single-root ValidatePath boundary to an
@@ -188,7 +247,11 @@ func ValidateReadPath(workspace, requestedPath string, allowOutside bool) (strin
 		}
 		target = filepath.Join(resolvedWorkspace, target)
 	}
-	return filepath.Clean(target), nil
+	cleaned := filepath.Clean(target)
+	if err := denyBotProfiles(cleaned); err != nil {
+		return "", err
+	}
+	return cleaned, nil
 }
 
 // PathNotAuthorizedError is returned by ValidateReadPathWithRoots when a
