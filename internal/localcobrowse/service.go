@@ -888,22 +888,30 @@ var (
 	settlePoll    = 150 * time.Millisecond
 )
 
-func (s *Service) settle(ctx context.Context, id, before string) ActionResult {
-	res := s.settlePage(ctx, id, before)
+func (s *Service) settle(ctx context.Context, id, before string, beforeDoc ...string) ActionResult {
+	res := s.settlePage(ctx, id, before, beforeDoc...)
 	if st, ok := s.cfg.Browser.SessionStatus(id); ok && len(st.Targets) > 1 {
 		res.OpenTargets = len(st.Targets)
 	}
 	return res
 }
 
-func (s *Service) settlePage(ctx context.Context, id, before string) ActionResult {
+func (s *Service) settlePage(ctx context.Context, id, before string, beforeDoc ...string) ActionResult {
 	res := ActionResult{Dispatched: true}
+	doc := ""
+	if len(beforeDoc) > 0 {
+		doc = beforeDoc[0]
+	}
 	start := time.Now()
 	for {
 		if ps, err := s.cfg.Browser.PageState(id); err == nil {
 			res.URL = ps.URL
 			res.Title = platform.SanitizeCobrowseTitle(ps.Title)
 			if before != "" && ps.URL != before {
+				res.Navigated = true
+			}
+			if doc != "" && ps.DocID != "" && ps.DocID != doc {
+				// A new document at the same address (a reload or redirect).
 				res.Navigated = true
 			}
 			if ps.ReadyState == "complete" && (res.Navigated || time.Since(start) >= settleMinimum) {
@@ -954,8 +962,8 @@ func (s *Service) enforceLanding(ctx context.Context, id string, ss *session, re
 
 // finishAfter settles a dispatched write, counts a page load toward the budget
 // and checks where the browser landed.
-func (s *Service) finishAfter(ctx context.Context, id string, ss *session, before string, navigation bool) (ActionResult, error) {
-	res := s.settle(ctx, id, before)
+func (s *Service) finishAfter(ctx context.Context, id string, ss *session, before string, navigation bool, beforeDoc ...string) (ActionResult, error) {
+	res := s.settle(ctx, id, before, beforeDoc...)
 	if res.Navigated || navigation {
 		s.mu.Lock()
 		s.navs = append(pruneBefore(s.navs, s.cfg.Now().Add(-time.Hour)), s.cfg.Now())
@@ -2056,6 +2064,11 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		return err
 	}
 	before := s.currentURL(id)
+	beforeDoc := ""
+	if ps, err := s.cfg.Browser.PageState(id); err == nil {
+		beforeDoc = ps.DocID
+	}
+	beforeTargets, beforeTargetsOK := s.targetIDs(id)
 	derr := s.dispatchCommit(id, a)
 	clear()
 	if errors.Is(derr, platform.ErrTargetChanged) {
@@ -2064,8 +2077,18 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		s.emit(hev)
 		return nil
 	}
+	var settled ActionResult
 	if derr == nil {
-		_, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate")
+		settled, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate", beforeDoc)
+	}
+	// A link activation that shows no sign of having landed is not "done".
+	// Dispatch alone does not prove it (covered, outside the viewport,
+	// swallowed by the page); decide before the W record is written so both
+	// records agree.
+	unseen := derr == nil && (a.Kind == "click" || (a.Kind == "key" && isEnter(a.Key))) && t.Href != "" &&
+		!settled.Navigated && !(beforeTargetsOK && s.hasNewTarget(id, beforeTargets))
+	if unseen {
+		ev.Outcome = "unconfirmed"
 	}
 	s.finish(ev, derr)
 	if _, partial := partialActionResult(derr); partial {
@@ -2082,10 +2105,41 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		s.emit(hev)
 		return nil
 	}
+	if unseen {
+		resolve("unconfirmed", "no navigation was seen within the settle window; check the page before asking again")
+		hev.Outcome = "unconfirmed"
+		s.emit(hev)
+		return nil
+	}
 	resolve("executed", "approved and done")
 	hev.Outcome = "ok"
 	s.emit(hev)
 	return nil
+}
+
+// targetIDs lists the session's open page ids. ok is false when the list is
+// unknown (a failed target sync reports none, and a tracking session always
+// has at least one page), so the caller must not treat it as "no pages".
+func (s *Service) targetIDs(id string) (map[string]bool, bool) {
+	out := map[string]bool{}
+	if st, ok := s.cfg.Browser.SessionStatus(id); ok {
+		for _, t := range st.Targets {
+			out[t.ID] = true
+		}
+	}
+	return out, len(out) > 0
+}
+
+// hasNewTarget reports whether a page opened that was not there before. The
+// caller must have a known (ok) before set.
+func (s *Service) hasNewTarget(id string, before map[string]bool) bool {
+	now, _ := s.targetIDs(id)
+	for t := range now {
+		if !before[t] {
+			return true
+		}
+	}
+	return false
 }
 
 // dispatchCommit sends an approved action to the browser.
