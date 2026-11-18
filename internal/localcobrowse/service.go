@@ -2064,8 +2064,9 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		s.emit(hev)
 		return nil
 	}
+	var settled ActionResult
 	if derr == nil {
-		_, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate")
+		settled, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate")
 	}
 	s.finish(ev, derr)
 	if _, partial := partialActionResult(derr); partial {
@@ -2079,6 +2080,15 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 	if derr != nil {
 		resolve("failed", "the action did not complete: "+truncRunes(derr.Error(), 120))
 		hev.Outcome = "error"
+		s.emit(hev)
+		return nil
+	}
+	if a.Kind == "click" && t.Href != "" && !settled.Navigated && settled.OpenTargets == 0 {
+		// A link click was dispatched, but the page never moved. Dispatch alone
+		// does not prove it landed (it may have been covered, outside the
+		// viewport or swallowed by the page), so do not report it as done.
+		resolve("unconfirmed", "the click was sent but the page did not change; check the page before asking again")
+		hev.Outcome = "unconfirmed"
 		s.emit(hev)
 		return nil
 	}

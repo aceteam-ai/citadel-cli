@@ -18,7 +18,7 @@
   function waitingText(reason) {
     const r = String(reason || "").replace(/[.\s]+$/, "");
     const base = "Waiting for you: " + r + ".";
-    return /hand back/i.test(r) ? base : base + " Then press Hand back to agent.";
+    return /hand\b.*\bback/i.test(r) ? base : base + " Then press Hand back to agent.";
   }
 
   // post sends one viewer action. It reports a failure in msgEl (default: the
@@ -342,8 +342,11 @@
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "v") return; // paste event below
     ev.preventDefault();
     const printable = ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey;
-    send({ type: "key", keyEvent: printable ? "keyDown" : "rawKeyDown", key: ev.key, code: ev.code,
-      text: printable ? ev.key : "", keyCode: ev.keyCode, modifiers: modifiers(ev) });
+    // Enter is a keyDown carrying "\r" (a real press), not a rawKeyDown: only
+    // that produces the keypress that submits a form.
+    const enter = ev.key === "Enter" && !ev.ctrlKey && !ev.metaKey && !ev.altKey;
+    send({ type: "key", keyEvent: printable || enter ? "keyDown" : "rawKeyDown", key: ev.key, code: ev.code,
+      text: enter ? "\r" : (printable ? ev.key : ""), keyCode: ev.keyCode, modifiers: modifiers(ev) });
   });
   wrap.addEventListener("keyup", (ev) => {
     if (!human) return;

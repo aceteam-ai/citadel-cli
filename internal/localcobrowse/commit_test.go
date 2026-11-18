@@ -1010,3 +1010,49 @@ func TestApprovalNeverRedeemedAgainstUnverifiedTarget(t *testing.T) {
 		}
 	})
 }
+
+func logoutTarget() *platform.TargetInfo {
+	t := el(func(t *platform.TargetInfo) {
+		t.Tag, t.Name, t.Href, t.Actionable = "a", "Logout", "http://a.test/logout", true
+	})
+	return &t
+}
+
+// A dispatched link click that leaves the page where it was is not "done": the
+// outcome is unconfirmed, so neither the human nor the agent is told the page
+// moved when it did not (#1777).
+func TestApproveLinkClickWithoutNavigationIsUnconfirmed(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if clicks(fb) != 1 {
+		t.Fatalf("approval must dispatch the click: %d", clicks(fb))
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
+		t.Fatalf("a link click that did not navigate must be unconfirmed: %+v", v.CommitResult)
+	}
+	for _, e := range *events {
+		if e.Action == "approve_commit" && e.Outcome == "ok" {
+			t.Fatalf("the approval must not be audited as ok: %+v", e)
+		}
+	}
+}
+
+// The same link, when the page does navigate, is executed.
+func TestApproveLinkClickThatNavigatesIsExecuted(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.clickNavigatesTo = "http://a.test/login"
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "executed" {
+		t.Fatalf("a navigating link click is executed: %+v", v.CommitResult)
+	}
+}

@@ -1,6 +1,7 @@
 package localcobrowse
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -476,5 +477,71 @@ func TestRealBrowserCommitActionsFormSnapshot(t *testing.T) {
 	}
 	if fp(fa1) == fp(fa2) {
 		t.Error("a submitter override must change the binding")
+	}
+}
+
+// TestRealBrowserCommitActionsLinkOutcome approves a Logout link far below
+// the fold (#1777). The click scrolls it into view and the page navigates, so
+// the outcome is executed. A link whose click is swallowed by the page leaves
+// the page unchanged, so the outcome must be unconfirmed, never "approved and done".
+func TestRealBrowserCommitActionsLinkOutcome(t *testing.T) {
+	if os.Getenv("CITADEL_COBROWSE_BROWSER_IT") == "" && os.Getenv("CITADEL_REAL_BROWSER_TESTS") == "" {
+		t.Skip("set CITADEL_COBROWSE_BROWSER_IT=1 (or CITADEL_REAL_BROWSER_TESTS=1) to run the real-browser link test")
+	}
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		if r.URL.Path == "/logout" {
+			fmt.Fprint(w, `<!doctype html><h1 id="t">logged out</h1>`)
+			return
+		}
+		fmt.Fprint(w, `<!doctype html><h1 id="t">secure</h1><div style="height:4000px"></div>
+<a id="out" href="/logout">Logout</a><div style="height:800px"></div>
+<a id="stuck" href="/logout" onclick="event.preventDefault()">Sign off</a>`)
+	}))
+	defer page.Close()
+	m := platform.NewCobrowseSessionManager(filepath.Join(t.TempDir(), "sessions"), 1)
+	m.SetLaunchOptions(platform.LaunchOptions{Quiet: true})
+	defer m.StopAll()
+	svc := New(Config{Browser: m, URLPolicy: allowAll})
+	st, err := svc.Start(ctx, page.URL+"/", "synthetic logout", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := st.SessionID
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if out, err := m.ExtractBounded(id, "#t", nil, 20); err == nil && out.Text == "secure" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fixture did not load")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err := svc.ApproveDomain(id, RegistrableDomain(page.URL), 0); err != nil {
+		t.Fatal(err)
+	}
+	approve := func(sel string) string {
+		t.Helper()
+		if _, err := svc.Click(ctx, id, sel, nil, nil, "synthetic logout"); !errors.Is(err, ErrCommitApprovalRequired) {
+			t.Fatalf("%s must ask: %v", sel, err)
+		}
+		if err := svc.ApproveCommit(ctx, id, pendingView(t, svc, id).ID); err != nil {
+			t.Fatal(err)
+		}
+		v := svc.Sessions(id)[0]
+		if v.CommitResult == nil {
+			t.Fatalf("%s: no outcome", sel)
+		}
+		return v.CommitResult.State
+	}
+	if got := approve("#stuck"); got != "unconfirmed" {
+		t.Errorf("a click the page swallowed must be unconfirmed, got %q", got)
+	}
+	if got := approve("#out"); got != "executed" {
+		t.Errorf("a below-the-fold link that navigates must be executed, got %q", got)
+	}
+	if out, err := m.ExtractBounded(id, "#t", nil, 20); err != nil || out.Text != "logged out" {
+		t.Errorf("the page must have navigated: %+v %v", out, err)
 	}
 }
