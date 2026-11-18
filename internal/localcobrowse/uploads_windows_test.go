@@ -18,7 +18,7 @@ func uploadMetadataSnapshot(t *testing.T, path string) os.FileInfo {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := windows.CreateFile(p, windows.FILE_READ_ATTRIBUTES,
+	h, err := windows.CreateFile(p, windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
@@ -61,7 +61,9 @@ func TestUploadsCachedFileBecomingUnreadableDACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const metadataAccess = windows.READ_CONTROL | windows.WRITE_DAC | windows.FILE_READ_ATTRIBUTES
+	// Synchronous opens also need SYNCHRONIZE; neither that nor attributes
+	// grant FILE_READ_DATA or FILE_READ_EA, so GENERIC_READ must still fail.
+	const metadataAccess = windows.READ_CONTROL | windows.WRITE_DAC | windows.FILE_READ_ATTRIBUTES | windows.SYNCHRONIZE
 	denied, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(A;;0x%x;;;%s)", metadataAccess, user.User.Sid.String()))
 	if err != nil {
 		t.Fatal(err)
@@ -104,10 +106,16 @@ func TestUploadsWindowsGateAllowsSharedReadHandle(t *testing.T) {
 	if !s.Status().Enabled || !s.Status().Enabled {
 		t.Fatal("gate required an exclusive identity lookup")
 	}
+	// This fixture holds an unrelated reader indefinitely. The read gate
+	// must coexist with it, but the writer promises replacement after readers
+	// release their handles, not POSIX-style replacement of an open file.
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := WriteUploadSetting(dir, "off"); err != nil {
-		t.Fatal("shared gate handle blocked atomic replacement:", err)
+		t.Fatal("replacement failed after closing the shared reader:", err)
 	}
 	if s.Status().Enabled {
-		t.Fatal("replacement opt-out lost with an old read handle alive")
+		t.Fatal("replacement opt-out lost")
 	}
 }
