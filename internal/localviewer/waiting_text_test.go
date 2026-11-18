@@ -34,7 +34,8 @@ func TestWaitingBannerText(t *testing.T) {
 		"Handle the login; back soon":               "Waiting for you: Handle the login; back soon. Then press Hand back to agent.",
 		"Log in beforehand, then go back":           "Waiting for you: Log in beforehand, then go back. Then press Hand back to agent.",
 		"Hand over the backup code":                 "Waiting for you: Hand over the backup code. Then press Hand back to agent.",
-		"Fill it in by hand and come back":          "Waiting for you: Fill it in by hand and come back.",
+		"Write the code by hand, then type it back": "Waiting for you: Write the code by hand, then type it back. Then press Hand back to agent.",
+		"Fill it in by hand and come back":          "Waiting for you: Fill it in by hand and come back. Then press Hand back to agent.",
 	}
 	for in, want := range cases {
 		script := string(m) + "process.stdout.write(waitingText(" + strconv.Quote(in) + "));"

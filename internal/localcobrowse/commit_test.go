@@ -1078,6 +1078,21 @@ func TestApproveLinkClickWithPreexistingTabIsUnconfirmed(t *testing.T) {
 	assertUnconfirmedAudit(t, events)
 }
 
+// A same-URL reload (new document identity) counts as a navigation.
+func TestApproveLinkClickSameURLNewDocumentIsExecuted(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.docID, fb.clickNewDoc = "d1", true
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "executed" {
+		t.Fatalf("a new document at the same URL is a navigation: %+v", v.CommitResult)
+	}
+}
+
 // The same link, when the page does navigate, is executed.
 func TestApproveLinkClickThatNavigatesIsExecuted(t *testing.T) {
 	svc, fb, _, id := startGranted(t, nil)

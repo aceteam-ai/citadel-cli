@@ -30,7 +30,10 @@ type fakeBrowser struct {
 	// title every page reports; notReady keeps readyState at "loading".
 	navigateLandsOn string
 	pageTitle       string
-	notReady        bool
+	// docID is the document identity PageState reports; clickNewDoc bumps it.
+	docID       string
+	clickNewDoc bool
+	notReady    bool
 	// startErr fails StartSessionWithID; stopErr fails Stop.
 	startErr error
 	stopErr  error
@@ -181,6 +184,9 @@ func (f *fakeBrowser) Click(id, sel string, x, y *float64) (platform.CobrowseSes
 		if f.clickNavigatesTo != "" {
 			s.url = f.clickNavigatesTo
 		}
+		if f.clickNewDoc {
+			f.docID += "x"
+		}
 	})
 	if err == nil && f.clickErr != nil {
 		return st, f.clickErr
@@ -219,7 +225,7 @@ func (f *fakeBrowser) PageState(id string) (platform.PageState, error) {
 	if f.notReady {
 		rs = "loading"
 	}
-	return platform.PageState{URL: s.url, ReadyState: rs, Title: f.pageTitle}, nil
+	return platform.PageState{URL: s.url, ReadyState: rs, Title: f.pageTitle, DocID: f.docID}, nil
 }
 func (f *fakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
 	if f.onInspect != nil {

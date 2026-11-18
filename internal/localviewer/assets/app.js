@@ -18,7 +18,7 @@
   function waitingText(reason) {
     const r = String(reason || "").replace(/[.\s]+$/, "");
     const base = "Waiting for you: " + r + ".";
-    return /\bhand\b[\w\s]{0,30}?\bback\b/i.test(r) ? base : base + " Then press Hand back to agent.";
+    return /\bhand(?:\s+(?!(?:and|then|or|but)\b)\w+){0,2}\s+back\b/i.test(r) ? base : base + " Then press Hand back to agent.";
   }
 
   // post sends one viewer action. It reports a failure in msgEl (default: the
