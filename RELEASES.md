@@ -3983,3 +3983,18 @@ Auto-generated log of every release.
   - fix(local): re-land file approval snapshots with chooser provenance (#1755)
 
 
+---
+
+## v2.238.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +594 |
+
+**Changes:**
+
+  - feat(cobrowse): report page_text and password_field on start and status (#1773)
+
+
