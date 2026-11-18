@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -568,5 +569,42 @@ func TestFIFONodeShareRefusedWithoutBlocking(t *testing.T) {
 	cancel()
 	if _, err := Open(ctx, dir, idA, providerFor(idA), 120); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled context not observed: %v", err)
+	}
+}
+
+// Two first-use callers race: both succeed with the same share, and no temp
+// store directories are left behind.
+func TestConcurrentFirstUseSharesOneNodeShare(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		dir := t.TempDir()
+		sdir := Dir(dir)
+		var wg sync.WaitGroup
+		res := make([][]byte, 2)
+		errs := make([]error, 2)
+		start := make(chan struct{})
+		for g := 0; g < 2; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				<-start
+				res[g], errs[g] = loadOrCreateNodeShare(sdir)
+			}(g)
+		}
+		close(start)
+		wg.Wait()
+		if errs[0] != nil || errs[1] != nil {
+			t.Fatalf("run %d: %v / %v", i, errs[0], errs[1])
+		}
+		if !bytes.Equal(res[0], res[1]) {
+			t.Fatal("callers got different shares")
+		}
+		ents, _ := os.ReadDir(dir)
+		if len(ents) != 1 || ents[0].Name() != DirName {
+			t.Fatalf("leftovers in parent: %v", ents)
+		}
+		inner, _ := os.ReadDir(sdir)
+		if len(inner) != 1 || inner[0].Name() != NodeShareFile {
+			t.Fatalf("leftovers in store: %v", inner)
+		}
 	}
 }

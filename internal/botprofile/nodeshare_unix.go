@@ -28,14 +28,16 @@ func loadOrCreateNodeShare(dir string) ([]byte, error) {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return nil, fmt.Errorf("botprofile: create store dir: %w", err)
 	}
-	// Create the leaf ourselves so we know whether the store is new. The first
-	// legitimate use creates the dir and the share together; a store dir that
-	// already exists without a share is never filled in (see below).
-	createdDir := false
-	if err := os.Mkdir(dir, 0o700); err == nil {
-		createdDir = true
-	} else if !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("botprofile: create store dir: %w", err)
+	// First use publishes the whole store atomically: a private temp dir
+	// holding the share is renamed to the store name, so a store dir without a
+	// share is never a legitimate transient state. A loser of the race removes
+	// its temp dir and reads the winner's share.
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		if err := publishNewStore(dir); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("botprofile: stat store dir: %w", err)
 	}
 	var dst unix.Stat_t
 	if err := unix.Lstat(dir, &dst); err != nil {
@@ -53,17 +55,33 @@ func loadOrCreateNodeShare(dir string) ([]byte, error) {
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	if !createdDir {
-		// A store dir that pre-existed without a share is not ours to fill in:
-		// anything that could have made the dir could also stage the share's
-		// contents. Recovery: delete bot-profiles/ (nothing is sealed under a
-		// share that does not exist, so nothing is lost).
-		return nil, ErrStoreWithoutShare
+	// A store dir without a share is not ours to fill in: it was planted or
+	// left by a crash. Recovery: delete bot-profiles/ (nothing is sealed under
+	// a share that does not exist, so nothing is lost).
+	return nil, ErrStoreWithoutShare
+}
+
+// publishNewStore creates dir containing a fresh share, atomically. If another
+// caller published first, it discards its own copy and returns nil.
+func publishNewStore(dir string) error {
+	tmp, err := os.MkdirTemp(filepath.Dir(dir), ".botstore-*")
+	if err != nil {
+		return fmt.Errorf("botprofile: create store dir: %w", err)
 	}
-	if err := createShare(dir, path); err != nil {
-		return nil, err
+	defer os.RemoveAll(tmp) // no-op after a successful rename
+	if err := os.Chmod(tmp, 0o700); err != nil {
+		return fmt.Errorf("botprofile: create store dir: %w", err)
 	}
-	return readShareSettled(path)
+	if err := createShare(tmp, filepath.Join(tmp, NodeShareFile)); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		if errors.Is(err, os.ErrExist) || errors.Is(err, unix.ENOTEMPTY) {
+			return nil // lost the race; read the winner's share
+		}
+		return fmt.Errorf("botprofile: publish store: %w", err)
+	}
+	return nil
 }
 
 // readShareSettled reads the share, tolerating the creation window in which

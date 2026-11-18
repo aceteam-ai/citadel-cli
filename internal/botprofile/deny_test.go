@@ -57,8 +57,10 @@ func TestDenyPathNilResolverFailsClosed(t *testing.T) {
 	}
 }
 
-// Only the os.SameFile branch can catch a store reached through an alias that
-// no lexical or resolved comparison of the config dir path would match.
+// sameFileAncestor is a direct identity check. (A symlink alias is also caught
+// by the resolved-path comparison in DenyPath; only a bind mount or a
+// case-folded config dir reaches the SameFile branch alone, so this test calls
+// the helper directly.)
 func TestSameFileAncestorIdentity(t *testing.T) {
 	base := t.TempDir()
 	cfg := filepath.Join(base, "cfg")
