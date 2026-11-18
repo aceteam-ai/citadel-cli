@@ -42,6 +42,10 @@ type PageState struct {
 	// Title is document.title, already bounded and stripped of control
 	// characters (SanitizeCobrowseTitle).
 	Title string `json:"title,omitempty"`
+	// DocID identifies the current document (performance.timeOrigin), so a
+	// same-URL reload or redirect is told apart from no navigation. Empty when
+	// unknown. Not part of any wire format.
+	DocID string `json:"-"`
 }
 
 // MaxCobrowseTitleRunes bounds the page title returned from a navigation.
@@ -145,7 +149,7 @@ func settlePageCtx(parent context.Context, p pin, before string, requireChange b
 func readPageState(p pin) (PageState, error) { return readPageStateOn(p) }
 
 func readPageStateOn(c cdpCaller) (PageState, error) {
-	val, err := evaluateOn(c, `({url: location.href, ready: document.readyState, title: document.title})`, false)
+	val, err := evaluateOn(c, `({url: location.href, ready: document.readyState, title: document.title, doc: String(performance.timeOrigin)})`, false)
 	if err != nil {
 		return PageState{}, err
 	}
@@ -153,7 +157,8 @@ func readPageStateOn(c cdpCaller) (PageState, error) {
 	u, _ := obj["url"].(string)
 	r, _ := obj["ready"].(string)
 	t, _ := obj["title"].(string)
-	return PageState{URL: u, ReadyState: r, Title: SanitizeCobrowseTitle(t)}, nil
+	d, _ := obj["doc"].(string)
+	return PageState{URL: u, ReadyState: r, Title: SanitizeCobrowseTitle(t), DocID: d}, nil
 }
 
 type SelectResult struct {

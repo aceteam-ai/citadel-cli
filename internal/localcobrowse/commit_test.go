@@ -1035,11 +1035,47 @@ func TestApproveLinkClickWithoutNavigationIsUnconfirmed(t *testing.T) {
 	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
 		t.Fatalf("a link click that did not navigate must be unconfirmed: %+v", v.CommitResult)
 	}
+	assertUnconfirmedAudit(t, events)
+}
+
+func assertUnconfirmedAudit(t *testing.T, events *[]Event) {
+	t.Helper()
+	var click, approve bool
 	for _, e := range *events {
-		if e.Action == "approve_commit" && e.Outcome == "ok" {
-			t.Fatalf("the approval must not be audited as ok: %+v", e)
+		if e.Action == "click" && e.Class == "W" && e.Outcome != "refused" {
+			click = true
+			if e.Outcome != "unconfirmed" {
+				t.Errorf("the W click record must be unconfirmed, got %q", e.Outcome)
+			}
+		}
+		if e.Action == "approve_commit" {
+			approve = true
+			if e.Outcome != "unconfirmed" {
+				t.Errorf("approve_commit must be unconfirmed, got %q", e.Outcome)
+			}
 		}
 	}
+	if !click || !approve {
+		t.Fatalf("both records are needed: click=%v approve=%v", click, approve)
+	}
+}
+
+// A tab that was already open is not evidence that the click landed.
+func TestApproveLinkClickWithPreexistingTabIsUnconfirmed(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.mu.Lock()
+	fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}, {ID: "t2"}}
+	fb.mu.Unlock()
+	fb.target = logoutTarget()
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
+		t.Fatalf("a pre-existing tab must not count: %+v", v.CommitResult)
+	}
+	assertUnconfirmedAudit(t, events)
 }
 
 // The same link, when the page does navigate, is executed.

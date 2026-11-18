@@ -30,6 +30,15 @@ func TestKeyParamsEnterIsARealKeyPress(t *testing.T) {
 	if ctrl["type"] != "rawKeyDown" || ctrl["text"] != nil {
 		t.Errorf("a chorded Enter is left alone: %+v", ctrl)
 	}
+	for _, mod := range []int{8, 1} {
+		p := keyParams(InputMessage{Type: InputTypeKey, KeyEvent: "rawKeyDown", Key: "Enter", Code: "Enter", KeyCode: 13, Modifiers: mod})
+		if mod == 8 && (p["type"] != "keyDown" || p["text"] != "\r") {
+			t.Errorf("Shift+Enter is a real press: %+v", p)
+		}
+		if mod == 1 && p["type"] != "rawKeyDown" {
+			t.Errorf("Alt+Enter is left alone: %+v", p)
+		}
+	}
 	other := keyParams(InputMessage{Type: InputTypeKey, KeyEvent: "rawKeyDown", Key: "Tab", Code: "Tab", KeyCode: 9})
 	if other["type"] != "rawKeyDown" || other["text"] != nil {
 		t.Errorf("other keys are unchanged: %+v", other)
