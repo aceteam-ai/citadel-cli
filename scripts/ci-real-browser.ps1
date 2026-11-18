@@ -56,7 +56,7 @@ Stop-Browsers
 Invoke-WarmUp
 $first = Invoke-Attempt "attempt 1" $Pattern
 if ($first.Code -eq 0) { exit 0 }
-$decision = Get-RetryDecision $first.Lines
+$decision = Get-RetryDecision $first.Lines $first.Code
 if (-not $decision.Retry) { Write-Host "attempt 1 failed and is not retryable: $($decision.Reason)"; exit $first.Code }
 Write-Host "attempt 1 FAILED: $($decision.Tests -join ', ')"
 Write-Host "retrying only those tests once (#1795); both attempts are reported"
