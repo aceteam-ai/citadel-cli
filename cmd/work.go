@@ -539,6 +539,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// before anything can sweep them; sessions that fail verification are reaped.
 	// StartManagedCobrowse marks this process as the managed worker first, because
 	// recovery decides on that mark whether to re-adopt a dead owner's sessions.
+	configureBrowserRuntime()
 	platform.StartManagedCobrowse()
 
 	// Setup signal handling. The first signal cancels the root context so every
@@ -3944,6 +3945,10 @@ type DeviceConfig struct {
 	// token (getDeviceConfigFromFile returns nil) still reconnects to the right
 	// control plane.
 	NexusURL string `yaml:"nexus_url"`
+	// BrowserSlots is the shared concurrent browser-session count for this node
+	// (citadel-cli#1760). 0 keeps the default; CITADEL_COBROWSE_MAX_SESSIONS
+	// still overrides it.
+	BrowserSlots int `yaml:"browser_slots"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from the

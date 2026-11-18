@@ -164,7 +164,7 @@ def build_chrome_args(cdp_port: int, profile_dir: str) -> list[str]:
     on the published port. Pure function so the flag set -- especially the two
     load-bearing flags -- is unit-testable without launching a browser.
     """
-    return [
+    args = [
         f"--remote-debugging-port={cdp_port}",
         # Loopback CDP bind, identical to the host builder. Modern Chromium refuses
         # a non-loopback debugging bind, so exposure is done by socat, not here.
@@ -187,6 +187,12 @@ def build_chrome_args(cdp_port: int, profile_dir: str) -> list[str]:
         # container-specific: no setuid sandbox available in the hardened container
         "--no-sandbox",
     ]
+    # Bounded disk cache (aceteam-ai/citadel-cli#1760): the container runner sets
+    # MEETING_DISK_CACHE_MB so a long session cannot grow the profile mount.
+    cache_mb = os.environ.get("MEETING_DISK_CACHE_MB", "")
+    if cache_mb.isdigit() and int(cache_mb) > 0:
+        args.append(f"--disk-cache-size={int(cache_mb) * 1024 * 1024}")
+    return args
 
 
 def _pactl_env() -> dict[str, str]:

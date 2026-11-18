@@ -598,11 +598,24 @@ func (s *cobrowseSession) fillFileInput(c cdpCaller, eff *ActionEffects, f fileF
 	if err := f.fence(); err != nil {
 		return err
 	}
-	err = setFilesIfPageIs(c, frameID, objectID, f.expectedURL, []string{f.path}, f.driverFence, eff)
+	browserPath, perr := s.browserFilePathFor(f.path)
+	if perr != nil {
+		return perr
+	}
+	err = setFilesIfPageIs(c, frameID, objectID, f.expectedURL, []string{browserPath}, f.driverFence, eff)
 	if err != nil {
 		// Never return the node's absolute path to the platform.
 		return redactPath(err, f.path, f.file.Name)
 	}
 	s.clearChooserFor(nodeID)
 	return nil
+}
+
+// browserFilePathFor maps a staged host path to the path the session's browser
+// sees (different only for a container session).
+func (s *cobrowseSession) browserFilePathFor(p string) (string, error) {
+	s.mu.Lock()
+	proc := s.proc
+	s.mu.Unlock()
+	return proc.browserFilePath(p)
 }

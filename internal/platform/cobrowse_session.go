@@ -43,6 +43,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/browserurl"
@@ -205,6 +206,13 @@ type cobrowseProc struct {
 	// run in (empty when launched directly); scopeUser says which manager owns them.
 	browserScope, xvfbScope string
 	scopeUser               bool
+	// Container sessions (cobrowse_container.go): the full container id, its
+	// per-session network, its StartedAt, the published control port, and the
+	// host dir mounted at /profile (for mapping staged-file paths).
+	containerID, containerNet, containerStart string
+	containerCtrl                             int
+	// containerStage is the host staging dir bound read-only into the container.
+	containerStage string
 	// exited is closed by the reaper when the browser process terminates, so status
 	// can report SessionExited for a crashed session rather than a bare running=false.
 	exited <-chan struct{}
@@ -280,6 +288,10 @@ type cobrowseSession struct {
 	id        string
 	profile   string
 	startedAt time.Time
+	// workDir is where the browser profile working copy lives: profile itself
+	// for host runners, <profile>/profile for a container session. Guarded by mu;
+	// empty means profile.
+	workDir string
 
 	// encProfile is the encrypted persistent profile for this session, or nil for a
 	// throwaway session. When set, teardown persists (only if the browser ran) and
@@ -375,12 +387,35 @@ func newCobrowseSessionManager(baseDir string, maxSessions int) *CobrowseSession
 // resolveMaxCobrowseSessions reads EnvCobrowseMaxSessions, falling back to the default
 // when unset or not a positive integer.
 func resolveMaxCobrowseSessions() int {
+	if n := configuredBrowserSlots.Load(); n > 0 && os.Getenv(EnvCobrowseMaxSessions) == "" {
+		return int(n)
+	}
 	if v := strings.TrimSpace(os.Getenv(EnvCobrowseMaxSessions)); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
 	}
 	return defaultMaxCobrowseSessions
+}
+
+// configuredBrowserSlots is the shared concurrent-session count from device
+// config (0 = unset). EnvCobrowseMaxSessions still wins when set.
+var configuredBrowserSlots atomic.Int32
+
+// SetBrowserSlots applies the node's shared slot count to the node-wide
+// co-browse manager, whether or not it has been created yet.
+func SetBrowserSlots(n int) {
+	if n <= 0 || n > 64 {
+		return
+	}
+	configuredBrowserSlots.Store(int32(n))
+	if os.Getenv(EnvCobrowseMaxSessions) != "" || cobrowseSessionManager == nil {
+		return
+	}
+	m := cobrowseSessionManager
+	m.mu.Lock()
+	m.maxSessions = n
+	m.mu.Unlock()
 }
 
 // newSessionID returns a short random hex session handle.
@@ -589,6 +624,20 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	if err := os.MkdirAll(s.profile, 0o700); err != nil {
 		return nil, fmt.Errorf("create session profile dir: %w", err)
 	}
+	// A container session mounts only <session>/profile, so the profile working
+	// copy lives there; everything else stays out of the container's reach.
+	useContainer := false
+	workDir := s.profile
+	if ch, ok := activeBrowserRunner.(containerChooser); ok && ch.useContainer(m.useResolver) {
+		useContainer = true
+		workDir = filepath.Join(s.profile, containerProfileSubdir)
+		if err := os.MkdirAll(workDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create container profile dir: %w", err)
+		}
+	}
+	s.mu.Lock()
+	s.workDir = workDir
+	s.mu.Unlock()
 	// Local mode (page tracking) has no upload path and is left alone.
 	if !s.tracking {
 		if _, err := s.ensureStagingDir(); err != nil {
@@ -609,7 +658,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 		if err := writeProfileMarker(s.profile, enc); err != nil {
 			return nil, fmt.Errorf("mark encrypted profile working dir: %w", err)
 		}
-		if err := enc.Materialize(s.profile); err != nil {
+		if err := enc.Materialize(workDir); err != nil {
 			return nil, fmt.Errorf("materialize encrypted profile: %w", err)
 		}
 	}
@@ -618,6 +667,7 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	tpolicy, tevent := m.targetPolicy, m.targetEvent
 	m.mu.Unlock()
 	lo.Detach = m.useResolver && detachedWorker.Load()
+	lo.UseContainer = useContainer
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
 		return nil, err
@@ -746,6 +796,10 @@ func (s *cobrowseSession) teardown() error {
 	proc := s.proc
 	s.proc = nil
 	profile := s.profile
+	workDir := s.workDir
+	if workDir == "" {
+		workDir = profile
+	}
 	enc := s.encProfile
 	s.encProfile = nil
 	regDir := s.regDir
@@ -789,7 +843,7 @@ func (s *cobrowseSession) teardown() error {
 				if err == nil {
 					err = stageErr
 				}
-			} else if perr := enc.Persist(profile); perr != nil && err == nil {
+			} else if perr := enc.Persist(workDir); perr != nil && err == nil {
 				err = perr
 			}
 		}
@@ -1002,7 +1056,23 @@ func writeSessionPidfile(profileDir string, ownerPID, browserPID, xvfbPID int, o
 	if ownerStart != 0 {
 		content += fmt.Sprintf("%d\n", ownerStart)
 	}
-	_ = os.WriteFile(path, []byte(content), 0o600)
+	// Never write through a symlink: replace the entry with a fresh file by
+	// rename, so a planted link is dropped and its target is not touched.
+	if fi, err := os.Lstat(path); err == nil && !fi.Mode().IsRegular() {
+		if os.Remove(path) != nil {
+			return
+		}
+	}
+	tmp, err := os.CreateTemp(profileDir, ".pid-")
+	if err != nil {
+		return
+	}
+	name := tmp.Name()
+	_, werr := tmp.WriteString(content)
+	cerr := tmp.Close()
+	if werr != nil || cerr != nil || os.Chmod(name, 0o600) != nil || os.Rename(name, path) != nil {
+		os.Remove(name)
+	}
 }
 
 // readSessionPidfile parses the owner, browser, and Xvfb PIDs from a session dir's
@@ -1112,6 +1182,23 @@ func (m *CobrowseSessionManager) sweep() {
 	// otherwise reap them as orphans (citadel-cli#1546).
 	m.recoverSessions()
 	activeBrowserRunner.SweepOrphans(m.baseDir)
+	// Containers are swept by label, never by pidfile: only the node-wide manager
+	// does it, and a session is live when the manager tracks it or a live or
+	// suspended registry record names it.
+	if cs, ok := activeBrowserRunner.(containerSweeper); ok && m.useResolver {
+		cs.sweepContainers(m.baseDir, m.sessionIsLive)
+	}
+}
+
+func (m *CobrowseSessionManager) sessionIsLive(id string) bool {
+	m.mu.Lock()
+	_, ok := m.sessions[id]
+	m.mu.Unlock()
+	if ok {
+		return true
+	}
+	rec, err := loadRecord(m.registryDir(), id)
+	return err == nil && (rec.State == RecordLive || rec.State == RecordSuspended)
 }
 
 // sweepXvfbSessions is the Linux runner's orphan sweep; see sweep above.

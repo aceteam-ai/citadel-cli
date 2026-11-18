@@ -181,3 +181,41 @@ func TestDockerfileRecordsChromiumMajorLabel(t *testing.T) {
 		}
 	}
 }
+
+func TestArgsRunnerFields(t *testing.T) {
+	s := spec()
+	s.ProfileDir, s.StageDir = "/tmp/p", "/tmp/stage"
+	s.Name, s.Owner, s.DiskCacheMB, s.UserNSKeepID = "aceteam-brc-s-1", "abc123", 256, true
+	a, err := s.Args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := " " + strings.Join(a, " ") + " "
+	for _, want := range []string{
+		" --name aceteam-brc-s-1 ", " aceteam.browser-runtime.owner=abc123 ", " --pull=never ", " --userns=keep-id ",
+		" MEETING_DISK_CACHE_MB=256 ", " --mount type=bind,src=/tmp/stage,dst=/citadel-stage,readonly ",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("missing %q in %s", want, j)
+		}
+	}
+	if a[len(a)-1] != s.Image {
+		t.Error("image must be last")
+	}
+	// --pull=never is unconditional: the image is pinned by digest.
+	b, _ := spec().Args()
+	if !strings.Contains(strings.Join(b, " "), "--pull=never") {
+		t.Error("--pull=never must always be set")
+	}
+	for name, mod := range map[string]func(*RunSpec){
+		"name":  func(s *RunSpec) { s.Name = "a b" },
+		"owner": func(s *RunSpec) { s.Owner = "a,b" },
+		"stage": func(s *RunSpec) { s.StageDir = "rel" },
+	} {
+		bad := spec()
+		mod(&bad)
+		if _, err := bad.Args(); err == nil {
+			t.Errorf("%s must be rejected", name)
+		}
+	}
+}

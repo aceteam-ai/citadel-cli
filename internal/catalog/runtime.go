@@ -65,6 +65,9 @@ func (rt ContainerRuntime) Label() string {
 	return name
 }
 
+// IsPodman reports whether the container engine is podman.
+func (rt ContainerRuntime) IsPodman() bool { return rt.engineBin() == "podman" }
+
 // ComposeArgs returns the full argument list for a compose invocation on this
 // runtime: the compose prefix followed by the caller's compose args. The binary
 // to exec is rt.Bin.
