@@ -55,10 +55,11 @@ var (
 
 // CobrowseTarget is one open page of a session.
 type CobrowseTarget struct {
-	ID     string `json:"id"`
-	Title  string `json:"title"`
-	URL    string `json:"url"`
-	Active bool   `json:"active"`
+	Interstitial BrowserInterstitial `json:"interstitial,omitempty"`
+	ID           string              `json:"id"`
+	Title        string              `json:"title"`
+	URL          string              `json:"url"`
+	Active       bool                `json:"active"`
 	// Refused marks the session's last page when the policy refuses its
 	// address. It is kept open so the browser does not exit, but it is never
 	// active and nothing is sent to it except a navigation away.
@@ -482,6 +483,9 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 	_ = overflow // pages past the cap are seen on later syncs as extras are closed
 	if onEvent != nil {
 		for _, e := range events {
+			if safe, ok := browserSigninURL(e.url); ok {
+				e.url = safe
+			}
 			onEvent(sessionID, e.action, e.url, e.err)
 		}
 	}
@@ -491,12 +495,14 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 func (t *targetSet) snapshotLocked() CobrowseTargets {
 	out := CobrowseTargets{Active: t.active, Targets: make([]CobrowseTarget, 0, len(t.list))}
 	for _, tg := range t.list {
-		u := tg.URL
+		info := redactBrowserTarget(CobrowseTarget{ID: tg.ID, Title: SanitizeCobrowseTitle(tg.Title), URL: tg.URL})
+		u := info.URL
 		if len(u) > maxCobrowseTargetURLBytes {
 			u = u[:maxCobrowseTargetURLBytes]
 		}
 		refused := tg.ID == t.refusedID
-		out.Targets = append(out.Targets, CobrowseTarget{ID: tg.ID, Title: SanitizeCobrowseTitle(tg.Title), URL: u, Active: !refused && tg.ID == t.active, Refused: refused, OpenedBy: t.openedBy[tg.ID]})
+		info.URL, info.Active, info.Refused, info.OpenedBy = u, !refused && tg.ID == t.active, refused, t.openedBy[tg.ID]
+		out.Targets = append(out.Targets, info)
 		if !refused && tg.ID == t.active {
 			out.ActiveWebSocketURL = tg.WebSocketDebuggerURL
 		}

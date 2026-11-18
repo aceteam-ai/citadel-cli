@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"net/url"
 	"strings"
 	"unicode"
 )
@@ -14,6 +15,8 @@ const MaxCobrowsePageTextRunes = 2048
 // visible text (cut to 32768 UTF-16 units in the page, so a huge body is never
 // shipped over CDP) and whether a visible password input exists, nothing else.
 const pageSignalsScript = `(function(){
+	// Recheck before touching the body: navigation can follow the frame snapshot.
+	if (location.protocol !== "http:" && location.protocol !== "https:") return null;
 	var b = document.body;
 	var t = b ? String(b.innerText || "") : "";
 	var pw = false;
@@ -94,6 +97,13 @@ func readPageSignalsOn(c cdpCaller, fence func() error) (PageSignals, bool) {
 	}
 	frameID := rootFrameID(tree)
 	if frameID == "" {
+		return PageSignals{}, false
+	}
+	ft, _ := tree["frameTree"].(map[string]any)
+	frame, _ := ft["frame"].(map[string]any)
+	raw, _ := frame["url"].(string)
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return PageSignals{}, false
 	}
 	w, err := c.Call("Page.createIsolatedWorld", map[string]any{"frameId": frameID, "worldName": "citadel-signals"})

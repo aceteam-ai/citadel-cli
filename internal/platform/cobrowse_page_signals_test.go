@@ -11,6 +11,7 @@ import (
 
 // signalsCaller is a fake CDP endpoint for the page-signals read.
 type signalsCaller struct {
+	frameURL  string
 	text      string
 	pw        bool
 	failOn    string
@@ -30,7 +31,11 @@ func (f *signalsCaller) Call(method string, params map[string]any) (map[string]a
 	}
 	switch method {
 	case "Page.getFrameTree":
-		return frameTreeResult([]fakeFrame{{ID: "R", URL: "https://x.example/"}}), nil
+		u := f.frameURL
+		if u == "" {
+			u = "https://x.example/"
+		}
+		return frameTreeResult([]fakeFrame{{ID: "R", URL: u}}), nil
 	case "Page.createIsolatedWorld":
 		return map[string]any{"executionContextId": float64(7)}, nil
 	case "Runtime.evaluate":

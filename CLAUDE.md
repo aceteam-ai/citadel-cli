@@ -117,8 +117,14 @@ Browser account sign-in and sync are disabled per launch with
 the browser-runtime image's `meetingd.build_chrome_args` (#1799). The refusal
 is command-line scoped, not a machine policy or registry change; restored
 profile sign-in preferences cannot override it. Website cookies/SSO remain
-separate. Node session status classifies known Chrome/Edge sign-in pages as
-`interstitial: chrome_signin`, retaining the URL but omitting page-text probes.
+separate. This also affects host and container meeting bots; seeded notetaker
+profiles require authorized MEETING_JOIN acceptance before rollout. Existing
+account material is not erased or revoked (follow-ups #1803 and #1804).
+Node session status classifies known Chrome/Edge sign-in pages as
+`interstitial: chrome_signin`, blanking titles and retaining only scheme/host.
+Tracked target lists redact every entry, including the quarantined last page,
+without making it active or bypassing the page fence. Account-page text is not
+read: both the connected frame URL and the execution-context protocol are gated.
 The backend formatter must preserve that field and never infer website auth
 for browser-internal URLs. The opt-in Linux and Windows
 `RealBrowserSigninDisabledAfterProfileRestore` tests inspect effective sign-in

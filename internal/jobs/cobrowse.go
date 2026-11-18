@@ -76,13 +76,16 @@ func (h *CobrowseHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 			return nil, err
 		}
 		st := mgr.Status()
-		out, _ := json.Marshal(map[string]any{
-			"image":        img,
-			"format":       "png",
-			"driver":       string(st.Driver),
-			"url":          st.URL,
-			"interstitial": st.Interstitial,
-		})
+		fields := map[string]any{
+			"image":  img,
+			"format": "png",
+			"driver": string(st.Driver),
+			"url":    st.URL,
+		}
+		if st.Interstitial != "" {
+			fields["interstitial"] = st.Interstitial
+		}
+		out, _ := json.Marshal(fields)
 		return out, nil
 
 	default:
@@ -97,16 +100,19 @@ func statusResult(st platform.CobrowseStatus, err error) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, mErr := json.Marshal(map[string]any{
-		"running":      st.Running,
-		"driver":       string(st.Driver),
-		"url":          st.URL,
-		"interstitial": st.Interstitial,
-		"debug_port":   st.DebugPort,
-		"profile":      st.Profile,
-		"display":      st.Display,
-		"started_at":   st.StartedAt,
-	})
+	fields := map[string]any{
+		"running":    st.Running,
+		"driver":     string(st.Driver),
+		"url":        st.URL,
+		"debug_port": st.DebugPort,
+		"profile":    st.Profile,
+		"display":    st.Display,
+		"started_at": st.StartedAt,
+	}
+	if st.Interstitial != "" {
+		fields["interstitial"] = st.Interstitial
+	}
+	out, mErr := json.Marshal(fields)
 	if mErr != nil {
 		return nil, mErr
 	}

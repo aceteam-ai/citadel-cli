@@ -106,7 +106,7 @@ func (s *cobrowseSession) pinRead(id string) (pin, CobrowseTarget, error) {
 			}
 			p.set.mu.Unlock()
 		}
-		return p, info, nil
+		return p, redactBrowserTarget(info), nil
 	}
 	port, err := s.requireDrivablePort()
 	if err != nil {
@@ -123,7 +123,7 @@ func (s *cobrowseSession) pinRead(id string) (pin, CobrowseTarget, error) {
 		return pin{}, CobrowseTarget{}, err
 	}
 	p := pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: set, session: s, background: true}
-	return p, CobrowseTarget{ID: tg.ID, URL: tg.URL, Title: SanitizeCobrowseTitle(tg.Title)}, nil
+	return p, redactBrowserTarget(CobrowseTarget{ID: tg.ID, URL: tg.URL, Title: SanitizeCobrowseTitle(tg.Title)}), nil
 }
 
 func (t *targetSet) readTarget(ctx context.Context, port int, id string) (cdpdiscovery.Target, error) {

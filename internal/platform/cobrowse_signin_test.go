@@ -63,10 +63,78 @@ func TestBrowserSigninInterstitialStatusWiring(t *testing.T) {
 
 func TestBrowserSigninInterstitialStartRedirect(t *testing.T) {
 	st, _ := startOnFakeCDPWithURL(t, map[string]any{
-		"url": "chrome://managed-user-profile-notice/", "ready": "complete", "title": "Sign in",
+		"url": "chrome://managed-user-profile-notice/?email=sentinel@example.test", "ready": "complete", "title": "sentinel@example.test",
 	}, "https://site.example/oauth")
 	if st.Interstitial != ChromeSigninInterstitial {
 		t.Fatalf("start redirect omitted interstitial: %+v", st)
+	}
+	assertNoSigninIdentity(t, st)
+}
+
+func assertNoSigninIdentity(t *testing.T, st CobrowseSessionStatus) {
+	t.Helper()
+	raw, err := json.Marshal(st)
+	if err != nil || strings.Contains(string(raw), "sentinel") || st.Title != "" || st.URL != "chrome://managed-user-profile-notice/" {
+		t.Fatalf("browser identity escaped: %s (%v)", raw, err)
+	}
+}
+
+func TestBrowserSigninInterstitialNavigateRedirectRedactedLast(t *testing.T) {
+	shortSettle(t, 0)
+	m, started, f := startSessionOnFakeCDP(t)
+	t.Cleanup(func() { _ = m.StopAll() })
+	f.mu.Lock()
+	f.evaluateValue = func(string) any {
+		return map[string]any{"url": "chrome://managed-user-profile-notice/?email=sentinel@example.test", "ready": "complete", "title": "sentinel@example.test"}
+	}
+	f.mu.Unlock()
+	st, err := m.Navigate(started.ID, "https://site.example/oauth")
+	if err != nil || st.Interstitial != ChromeSigninInterstitial {
+		t.Fatalf("redirect: %+v %v", st, err)
+	}
+	assertNoSigninIdentity(t, st)
+}
+
+func TestBrowserSigninInterstitialHostVariantsAndSpoofs(t *testing.T) {
+	for _, host := range []string{"managed-user-profile-notice", "signin", "chrome-signin", "signin-dice-web-intercept", "sync-confirmation", "signin-error", "signin-email-confirmation", "signin-reauth", "profile-picker", "intro", "history-sync-optin", "profile-customization", "edge-signin", "edge-signin-error", "signin-internals"} {
+		for _, scheme := range []string{"chrome", "edge"} {
+			for _, suffix := range []string{"", ".top-chrome"} {
+				origin := scheme + "://" + host + suffix + "/"
+				st := withBrowserInterstitial(CobrowseSessionStatus{URL: origin + "path?email=sentinel@example.test#sentinel", Title: "sentinel"})
+				if st.Interstitial != ChromeSigninInterstitial || st.URL != origin || st.Title != "" {
+					t.Fatalf("variant: %+v", st)
+				}
+			}
+		}
+	}
+	for _, raw := range []string{"https://signin/", "chrome://signin.evil/", "chrome://signin.top-chrome.evil/", "chrome://signin:123/", "edge://evil@signin/", "chrome://signin.top-chrome.top-chrome/"} {
+		if _, ok := browserSigninURL(raw); ok {
+			t.Fatalf("spoof classified: %s", raw)
+		}
+	}
+}
+
+func TestBrowserSigninPageSignalsRejectLateDiscovery(t *testing.T) {
+	f := &signalsCaller{text: "sentinel@example.test", pw: true}
+	m, s, _ := signalsEnv(t, f, okGate)
+	old := pageSignalsConnect
+	pageSignalsConnect = func(ctx context.Context, p pin) (cdpCaller, func(), error) {
+		// Status was sampled on a site; discovery now selects browser account UI.
+		f.frameURL = "chrome://managed-user-profile-notice/?email=sentinel@example.test"
+		return old(ctx, p)
+	}
+	st := m.WithPageSignals(CobrowseSessionStatus{ID: s.id, URL: "https://site.example/"})
+	raw, _ := json.Marshal(st)
+	if st.PageText != "" || st.PasswordField != nil || strings.Contains(string(raw), "sentinel") || strings.Join(f.calls, ",") != "Page.getFrameTree" {
+		t.Fatalf("late browser account page read: %s calls=%v", raw, f.calls)
+	}
+}
+
+func TestBrowserSigninPageSignalsScriptGuardsBeforeBody(t *testing.T) {
+	guard := strings.Index(pageSignalsScript, `location.protocol !== "http:" && location.protocol !== "https:"`)
+	body := strings.Index(pageSignalsScript, "document.body")
+	if guard < 0 || body < 0 || guard >= body {
+		t.Fatal("execution-context protocol guard must precede every body read")
 	}
 }
 

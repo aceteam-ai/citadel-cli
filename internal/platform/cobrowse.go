@@ -773,7 +773,8 @@ func (m *CobrowseManager) statusLocked() CobrowseStatus {
 			st.URL = url
 		}
 	}
-	st.Interstitial = withBrowserInterstitial(CobrowseSessionStatus{URL: st.URL}).Interstitial
+	safe := withBrowserInterstitial(CobrowseSessionStatus{URL: st.URL})
+	st.URL, st.Interstitial = safe.URL, safe.Interstitial
 	return st
 }
 

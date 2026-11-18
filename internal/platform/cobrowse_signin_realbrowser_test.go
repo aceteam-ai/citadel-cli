@@ -52,6 +52,16 @@ func runBrowserSigninRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		v, ok := obj["value"].(bool)
 		return ok && !v
 	})
+	// Exercise the script itself on browser-owned UI. This also covers the
+	// race where navigation follows the frame-tree guard but precedes evaluate.
+	r, err := cdpCommand(st.DebugPort, "Runtime.evaluate", map[string]any{"expression": pageSignalsScript, "returnByValue": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote, _ := r["result"].(map[string]any)
+	if remote["subtype"] != "null" {
+		t.Fatal("page signal script read browser-owned UI instead of returning null")
+	}
 	if _, err := cdpCommand(st.DebugPort, "Page.navigate", map[string]any{"url": scheme + "://version/"}); err != nil {
 		t.Fatal(err)
 	}
