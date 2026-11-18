@@ -15,6 +15,8 @@ package platform
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,15 +75,38 @@ const (
 // image (MEETING_CDP_INTERNAL_PORT); socat forwards the published port to it.
 const containerInternalCDPPort = 9222
 
+const imageLabelFormat = `{{index .Config.Labels "` + browserruntime.ImageLabelContract + `"}}|{{index .Config.Labels "` + browserruntime.ImageLabelSandbox + `"}}`
+
 var containerIDRe = regexp.MustCompile(`^[0-9a-f]{12,64}$`)
+
+// engineOutputCap bounds what one engine call may buffer; `exec` runs into a
+// container that may be compromised.
+const engineOutputCap = 1 << 20
+
+// cappedBuffer keeps the first max bytes and silently drops the rest.
+type cappedBuffer struct {
+	bytes.Buffer
+	max int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if room := b.max - b.Len(); room > 0 {
+		if len(p) > room {
+			b.Buffer.Write(p[:room])
+		} else {
+			b.Buffer.Write(p)
+		}
+	}
+	return len(p), nil
+}
 
 type engineExecFunc func(ctx context.Context, args ...string) (string, error)
 
 func engineExecFor(e ContainerEngine) engineExecFunc {
 	return func(ctx context.Context, args ...string) (string, error) {
 		cmd := e.EngineCommandContext(ctx, args...)
-		var out, errb bytes.Buffer
-		cmd.Stdout, cmd.Stderr = &out, &errb
+		out, errb := &cappedBuffer{max: engineOutputCap}, &cappedBuffer{max: engineOutputCap}
+		cmd.Stdout, cmd.Stderr = out, errb
 		if err := cmd.Run(); err != nil {
 			msg := strings.TrimSpace(errb.String())
 			if len(msg) > 300 {
@@ -122,8 +148,6 @@ func newContainerRunner(cfg BrowserRuntimeConfig) *containerRunner {
 		label:  cfg.Engine.Label(),
 		image:  cfg.Image,
 		limits: cfg.Limits,
-		uid:    os.Getuid(),
-		gid:    os.Getgid(),
 		now:    time.Now,
 
 		startBrowser:  defaultStartBrowser,
@@ -144,10 +168,27 @@ func newContainerRunner(cfg BrowserRuntimeConfig) *containerRunner {
 		},
 		pollEvery: 2 * time.Second,
 	}
+	r.uid, r.gid = containerIdentity()
 	if r.limits.DiskCacheMB <= 0 {
 		r.limits.DiskCacheMB = defaultDiskCacheMB
 	}
 	return r
+}
+
+// windowsContainerID is the non-root identity used when the host has no numeric
+// uid (Windows, where os.Getuid is -1): the image's own bot user. Docker Desktop
+// bind mounts are not uid-checked, so any non-zero id can use them.
+const windowsContainerID = 10001
+
+// containerIdentity returns the uid:gid the container runs as. Hosts with a
+// real uid use it (so bind-mount files stay owned by the worker); a host
+// without one gets the image default; root is refused by healthy.
+func containerIdentity() (uid, gid int) {
+	uid, gid = os.Getuid(), os.Getgid()
+	if runtime.GOOS == "windows" || uid < 0 {
+		return windowsContainerID, windowsContainerID
+	}
+	return uid, gid
 }
 
 func browserIDFromWS(ws string) (string, error) {
@@ -190,10 +231,10 @@ func (r *containerRunner) healthy(allowPull bool) error {
 
 func (r *containerRunner) checkLocked(allowPull bool) error {
 	ctx := context.Background()
-	if _, err := r.call(ctx, "info", "--format", "{{.ID}}"); err != nil {
+	if _, err := r.call(ctx, "info"); err != nil {
 		return fmt.Errorf("container engine unreachable: %w", err)
 	}
-	out, err := r.call(ctx, "image", "inspect", "--format", `{{index .Config.Labels "`+browserruntime.ImageLabelContract+`"}}`, r.image)
+	out, err := r.call(ctx, "image", "inspect", "--format", imageLabelFormat, r.image)
 	if err != nil {
 		if !allowPull {
 			return nil // present-or-pullable: Launch pulls it
@@ -203,13 +244,19 @@ func (r *containerRunner) checkLocked(allowPull bool) error {
 		if _, perr := r.eng(pctx, "pull", r.image); perr != nil {
 			return fmt.Errorf("browser-runtime image is not present and could not be pulled: %w", perr)
 		}
-		out, err = r.call(ctx, "image", "inspect", "--format", `{{index .Config.Labels "`+browserruntime.ImageLabelContract+`"}}`, r.image)
+		out, err = r.call(ctx, "image", "inspect", "--format", imageLabelFormat, r.image)
 		if err != nil {
 			return fmt.Errorf("inspect browser-runtime image: %w", err)
 		}
 	}
-	if got := strings.TrimSpace(out); got != browserruntime.ContractVersion {
-		return fmt.Errorf("browser-runtime image contract %q is not %q", got, browserruntime.ContractVersion)
+	contract, sandbox, _ := strings.Cut(strings.TrimSpace(out), "|")
+	if contract != browserruntime.ContractVersion {
+		return fmt.Errorf("browser-runtime image contract %q is not %q", contract, browserruntime.ContractVersion)
+	}
+	// The contract-1 image runs Chromium with --no-sandbox. Node co-browse needs
+	// the renderer sandbox (#1788), so an image without the marker is unusable.
+	if sandbox != browserruntime.SandboxMarker {
+		return errors.New("browser-runtime image has no renderer sandbox marker (" + browserruntime.ImageLabelSandbox + ")")
 	}
 	r.imageReady = true
 	return nil
@@ -228,65 +275,110 @@ func (r *containerRunner) PrepareBaseDir(string) error { return nil }
 
 func containerName(id string) string { return containerNamePrefix + id }
 
-// Launch runs one session container and returns once CDP answers and its
-// identity is verified. Every failure after the network exists removes what was
-// created.
-func (r *containerRunner) Launch(profileDir, startURL string, lo LaunchOptions) (proc *cobrowseProc, err error) {
-	id := filepath.Base(profileDir)
+// containerProfileSubdir is the only part of the session dir the container can
+// write: the browser profile. The pidfile, the profile marker and the staging
+// dir stay beside it, outside the mount, so nothing the container writes can
+// redirect a host write or feed the host sweep.
+const containerProfileSubdir = "profile"
+
+// ownerFor derives the owner label of containers this worker creates: the
+// session base dir, the registry dir and the uid. A sweep only touches
+// containers whose owner label equals its own.
+func (r *containerRunner) ownerFor(baseDir string) string {
+	reg := ""
+	if registryDirResolver != nil {
+		reg = registryDirResolver()
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(baseDir) + "\x00" + reg + "\x00" + strconv.Itoa(os.Getuid())))
+	return hex.EncodeToString(sum[:8])
+}
+
+// plainDir creates dir (owner only) if absent and requires it to be a real
+// directory, never a symlink.
+func plainDir(dir string) error {
+	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
+		return err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is not a plain directory", filepath.Base(dir))
+	}
+	return nil
+}
+
+// Launch runs one session container (sessionDir is the manager's per-session
+// dir) and returns once CDP answers and its identity is verified. Every failure
+// after the network exists removes what was created.
+func (r *containerRunner) Launch(sessionDir, startURL string, lo LaunchOptions) (proc *cobrowseProc, err error) {
+	id := filepath.Base(sessionDir)
 	if !sessionIDPattern.MatchString(id) {
 		return nil, fmt.Errorf("container runner: bad session id %q", id)
 	}
 	if err := r.healthy(true); err != nil {
 		return nil, err
 	}
-	pruneProfileCaches(profileDir, int64(r.limits.DiskCacheMB)*1024*1024)
+	mountDir := filepath.Join(sessionDir, containerProfileSubdir)
+	stageDir := filepath.Join(sessionDir, cobrowseStagingDirName)
+	if err := plainDir(mountDir); err != nil {
+		return nil, fmt.Errorf("container profile dir: %w", err)
+	}
+	if err := plainDir(stageDir); err != nil {
+		return nil, fmt.Errorf("container staging dir: %w", err)
+	}
+	pruneProfileCaches(mountDir, int64(r.limits.DiskCacheMB)*1024*1024)
 
+	owner := r.ownerFor(filepath.Dir(sessionDir))
 	spec := browserruntime.RunSpec{
 		Image: r.image, Network: browserruntime.NetworkName(id), SessionID: id,
-		Purpose: "cobrowse", UID: r.uid, GID: r.gid, ProfileDir: profileDir,
+		Purpose: "cobrowse", UID: r.uid, GID: r.gid, ProfileDir: mountDir,
+		StageDir: stageDir, Name: containerName(id), Owner: owner,
+		DiskCacheMB: r.limits.DiskCacheMB, UserNSKeepID: r.podman,
 		ShmSize: r.limits.ShmSize, CPUs: r.limits.CPUs, Memory: r.limits.Memory,
 	}
 	args, err := spec.Args()
 	if err != nil {
 		return nil, err
 	}
-	extras := []string{"--name", containerName(id), "--pull=never",
-		"-e", "MEETING_DISK_CACHE_MB=" + strconv.Itoa(r.limits.DiskCacheMB)}
-	if r.podman {
-		extras = append(extras, "--userns=keep-id")
-	}
-	args = append(append(append([]string{}, args[:2]...), extras...), args[2:]...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cobrowseCDPReadyTimeout()+containerEngineCallLimit)
 	defer cancel()
 
 	// A fresh network for this session only; "already exists" is a failure.
 	netArgs := []string{"network", "create", "--driver", "bridge",
-		"--label", browserruntime.LabelRuntime + "=1", "--label", browserruntime.LabelSession + "=" + id}
+		"--label", browserruntime.LabelRuntime + "=1", "--label", browserruntime.LabelSession + "=" + id,
+		"--label", browserruntime.LabelPurpose + "=cobrowse", "--label", browserruntime.LabelOwner + "=" + owner}
 	if r.podman {
 		netArgs = append(netArgs, "--opt", "isolate=strict")
 	}
 	if _, err := r.call(ctx, append(netArgs, spec.Network)...); err != nil {
 		return nil, fmt.Errorf("create session network: %w", err)
 	}
-	cid := ""
+	cid := "" // what `run` reported, kept even when resolving it fails
 	defer func() {
 		if err != nil {
-			r.removeSession(cid, spec.Network)
+			r.cleanupFailedLaunch(id, cid, owner, spec.Network)
 		}
 	}()
 	out, err := r.call(ctx, args...)
+	if err == nil || strings.TrimSpace(out) != "" {
+		if short := lastLine(out); containerIDRe.MatchString(short) {
+			cid = short
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("start browser-runtime container: %w", err)
 	}
-	cid = lastLine(out)
-	if !containerIDRe.MatchString(cid) {
-		cid = ""
+	if cid == "" {
 		return nil, fmt.Errorf("engine returned an unexpected container id")
 	}
-	if cid, err = r.fullID(ctx, cid); err != nil {
+	full, err := r.fullID(ctx, cid)
+	if err != nil {
 		return nil, err
 	}
+	cid = full
 	ctrlPort, err := r.publishedPort(ctx, cid, browserruntime.ControlContainerPort)
 	if err != nil {
 		return nil, err
@@ -314,7 +406,27 @@ func (r *containerRunner) Launch(profileDir, startURL string, lo LaunchOptions) 
 		}
 	}
 	started := r.startedAt(ctx, cid)
-	return r.newProc(id, cid, spec.Network, started, ctrlPort, cdpPort, browserID, profileDir), nil
+	return r.newProc(id, cid, spec.Network, started, ctrlPort, cdpPort, browserID, stageDir), nil
+}
+
+// cleanupFailedLaunch removes what a failed launch may have created. A known
+// container id is ours (we just ran it). When `run` reported nothing usable the
+// container may still exist, so it is found by its deterministic name and
+// removed only after its labels prove it belongs to this session and owner.
+func (r *containerRunner) cleanupFailedLaunch(id, cid, owner, network string) {
+	ctx, cancel := context.WithTimeout(context.Background(), containerEngineCallLimit)
+	defer cancel()
+	if cid == "" {
+		if d, err := r.inspect(ctx, containerName(id)); err == nil {
+			l := d.Config.Labels
+			if l[browserruntime.LabelRuntime] == "1" && l[browserruntime.LabelSession] == id && l[browserruntime.LabelOwner] == owner && containerIDRe.MatchString(d.ID) {
+				cid = d.ID
+			}
+		}
+	}
+	if err := r.removeSession(cid, network); err != nil {
+		log.Printf("[cobrowse] cleanup of failed container launch %s: %v", id, err)
+	}
 }
 
 func lastLine(s string) string {
@@ -455,7 +567,7 @@ func (r *containerRunner) removeSession(cid, network string) error {
 
 // newProc builds the cobrowseProc for a verified container and starts the
 // watcher that closes exited when the browser or container is gone.
-func (r *containerRunner) newProc(id, cid, network, started string, ctrlPort, cdpPort int, browserID, profileDir string) *cobrowseProc {
+func (r *containerRunner) newProc(id, cid, network, started string, ctrlPort, cdpPort int, browserID, stageDir string) *cobrowseProc {
 	exited := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -494,7 +606,7 @@ func (r *containerRunner) newProc(id, cid, network, started string, ctrlPort, cd
 		containerNet:   network,
 		containerStart: started,
 		containerCtrl:  ctrlPort,
-		containerMount: profileDir,
+		containerStage: stageDir,
 		stop: func() error {
 			once.Do(func() {
 				close(done)
@@ -564,7 +676,7 @@ func defaultChromeRunning(ctx context.Context, ctrlPort int, id string) bool {
 // adoptContainer verifies a recorded container session and returns its proc.
 // Everything fails closed: container id, start time, labels, running state,
 // network isolation, published ports and CDP identity must all still match.
-func (r *containerRunner) adoptContainer(rec sessionRecord, profileDir string) (*cobrowseProc, error) {
+func (r *containerRunner) adoptContainer(rec sessionRecord, sessionDir string) (*cobrowseProc, error) {
 	if !containerIDRe.MatchString(rec.ContainerID) || len(rec.ContainerID) != 64 {
 		return nil, errors.New("record has no full container id")
 	}
@@ -584,7 +696,8 @@ func (r *containerRunner) adoptContainer(rec sessionRecord, profileDir string) (
 		return nil, errors.New("container was restarted since the record")
 	}
 	l := d.Config.Labels
-	if l[browserruntime.LabelRuntime] != "1" || l[browserruntime.LabelSession] != rec.ID {
+	if l[browserruntime.LabelRuntime] != "1" || l[browserruntime.LabelSession] != rec.ID ||
+		l[browserruntime.LabelOwner] != r.ownerFor(filepath.Dir(sessionDir)) {
 		return nil, errors.New("container labels do not match the session")
 	}
 	if err := r.checkIsolation(ctx, rec.ContainerID, rec.ID); err != nil {
@@ -604,7 +717,7 @@ func (r *containerRunner) adoptContainer(rec sessionRecord, profileDir string) (
 	if _, err := r.verifyCDPIdentity(ctx, rec.ContainerID, cdpPort, rec.BrowserID); err != nil {
 		return nil, err
 	}
-	return r.newProc(rec.ID, rec.ContainerID, browserruntime.NetworkName(rec.ID), rec.ContainerStart, ctrlPort, cdpPort, rec.BrowserID, profileDir), nil
+	return r.newProc(rec.ID, rec.ContainerID, browserruntime.NetworkName(rec.ID), rec.ContainerStart, ctrlPort, cdpPort, rec.BrowserID, filepath.Join(sessionDir, cobrowseStagingDirName)), nil
 }
 
 // discardContainer removes what a record that failed verification names, but
@@ -622,27 +735,43 @@ func (r *containerRunner) discardContainer(rec sessionRecord) {
 	_ = r.removeSession(cid, browserruntime.NetworkName(rec.ID))
 }
 
-// sweepContainers removes browser-runtime containers and networks whose session
-// is not live. Only objects carrying citadel's labels are considered.
-func (r *containerRunner) sweepContainers(live func(id string) bool) {
+// sweepContainers removes browser-runtime containers and networks of this
+// worker (owner label) and purpose (cobrowse) whose session is not live. A
+// container that does not match exactly (name aceteam-brc-<id>, an id matching
+// sessionIDPattern) is skipped, never removed: it may belong to another
+// worker or purpose sharing the daemon.
+func (r *containerRunner) sweepContainers(baseDir string, live func(id string) bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*containerEngineCallLimit)
 	defer cancel()
-	filters, _ := browserruntime.SessionFilterArgs("")
-	out, err := r.call(ctx, append([]string{"ps", "-a", "--no-trunc", "--format", `{{.ID}} {{.Label "` + browserruntime.LabelSession + `"}}`}, filters...)...)
+	owner := r.ownerFor(baseDir)
+	scope := []string{
+		"--filter", "label=" + browserruntime.LabelRuntime + "=1",
+		"--filter", "label=" + browserruntime.LabelPurpose + "=cobrowse",
+		"--filter", "label=" + browserruntime.LabelOwner + "=" + owner,
+	}
+	out, err := r.call(ctx, append([]string{"ps", "-a", "--no-trunc", "--format",
+		`{{.ID}} {{.Names}} {{.Label "` + browserruntime.LabelSession + `"}}`}, scope...)...)
 	if err != nil {
 		log.Printf("[cobrowse] container sweep skipped: %v", err)
 		return
 	}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		f := strings.Fields(line)
-		if len(f) != 2 || !containerIDRe.MatchString(f[0]) || live(f[1]) {
+		if len(f) != 3 || !containerIDRe.MatchString(f[0]) || !sessionIDPattern.MatchString(f[2]) ||
+			f[1] != containerName(f[2]) {
+			if strings.TrimSpace(line) != "" {
+				log.Printf("[cobrowse] container sweep skipped a container that does not match the expected shape")
+			}
 			continue
 		}
-		log.Printf("[cobrowse] removing orphaned browser-runtime container for session %s", f[1])
+		if live(f[2]) {
+			continue
+		}
+		log.Printf("[cobrowse] removing orphaned browser-runtime container for session %s", f[2])
 		_ = r.removeSession(f[0], "")
 	}
-	out, err = r.call(ctx, "network", "ls", "--format", "{{.Name}}",
-		"--filter", "label="+browserruntime.LabelRuntime+"=1", "--filter", "name="+browserruntime.NetworkName(""))
+	out, err = r.call(ctx, append([]string{"network", "ls", "--format", "{{.Name}}",
+		"--filter", "name=" + browserruntime.NetworkName("")}, scope...)...)
 	if err != nil {
 		return
 	}
@@ -675,6 +804,9 @@ func dirSize(root string) int64 {
 func pruneProfileCaches(profileDir string, max int64) {
 	var dirs []string
 	for _, base := range []string{profileDir, filepath.Join(profileDir, "Default")} {
+		if fi, err := os.Lstat(base); err != nil || !fi.IsDir() {
+			continue // absent, or a symlink the container planted
+		}
 		for _, n := range browserCacheDirs {
 			if fi, err := os.Lstat(filepath.Join(base, n)); err == nil && fi.IsDir() {
 				dirs = append(dirs, filepath.Join(base, n))
@@ -693,17 +825,18 @@ func pruneProfileCaches(profileDir string, max int64) {
 	}
 }
 
-// browserFilePath maps a host path under the session's profile dir to where the
-// browser inside the container sees it. Host runners return it unchanged.
-func (p *cobrowseProc) browserFilePath(hostPath string) string {
-	if p == nil || p.containerMount == "" {
-		return hostPath
+// browserFilePath maps a staged host path to where the container's browser sees
+// it: the read-only staging mount. Host runners return the path unchanged. A
+// container proc fails closed for anything outside the staging dir.
+func (p *cobrowseProc) browserFilePath(hostPath string) (string, error) {
+	if p == nil || p.containerID == "" {
+		return hostPath, nil
 	}
-	rel, err := filepath.Rel(p.containerMount, hostPath)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return hostPath
+	rel, err := filepath.Rel(p.containerStage, hostPath)
+	if p.containerStage == "" || err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("staged file is not visible to the container browser")
 	}
-	return browserruntime.ProfileMountPath + "/" + filepath.ToSlash(rel)
+	return browserruntime.StageMountPath + "/" + filepath.ToSlash(rel), nil
 }
 
 // ---- runner selection ----
@@ -711,7 +844,7 @@ func (p *cobrowseProc) browserFilePath(hostPath string) string {
 // containerSweeper and containerAdopter are the optional halves of the
 // selecting runner the session manager reaches through activeBrowserRunner.
 type containerSweeper interface {
-	sweepContainers(live func(id string) bool)
+	sweepContainers(baseDir string, live func(id string) bool)
 }
 
 type containerAdopter interface {
@@ -755,15 +888,32 @@ func (s *selectingRunner) Discover() (BrowserInfo, error) {
 func (s *selectingRunner) PrepareBaseDir(dir string) error { return s.host.PrepareBaseDir(dir) }
 
 func (s *selectingRunner) Launch(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
-	if c := s.cr(); c != nil && lo.NodeWide {
-		err := c.healthy(true)
-		if err == nil {
-			return c.Launch(profileDir, startURL, lo)
+	if lo.UseContainer {
+		c := s.cr()
+		if c == nil {
+			return nil, errNoContainerRuntime
 		}
-		s.logFallback(err)
+		return c.Launch(profileDir, startURL, lo)
 	}
 	return s.host.Launch(profileDir, startURL, lo)
 }
+
+// useContainer is the per-launch decision, made once by the manager before it
+// lays out the session dir: the node-wide manager uses the container runner
+// while it is healthy, otherwise the host runner (logged once per reason).
+func (s *selectingRunner) useContainer(nodeWide bool) bool {
+	c := s.cr()
+	if c == nil || !nodeWide {
+		return false
+	}
+	if err := c.healthy(true); err != nil {
+		s.logFallback(err)
+		return false
+	}
+	return true
+}
+
+type containerChooser interface{ useContainer(nodeWide bool) bool }
 
 func (s *selectingRunner) logFallback(err error) {
 	why := err.Error()
@@ -778,9 +928,9 @@ func (s *selectingRunner) logFallback(err error) {
 
 func (s *selectingRunner) SweepOrphans(baseDir string) { s.host.SweepOrphans(baseDir) }
 
-func (s *selectingRunner) sweepContainers(live func(string) bool) {
+func (s *selectingRunner) sweepContainers(baseDir string, live func(string) bool) {
 	if c := s.cr(); c != nil {
-		c.sweepContainers(live)
+		c.sweepContainers(baseDir, live)
 	}
 }
 
@@ -824,6 +974,15 @@ func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir
 	err := m.verifyContainerRecord(rec, dir, ad)
 	if err == nil {
 		proc, err = ad.adoptContainer(rec, dir)
+		if errors.Is(err, errCDPCheck) { // a slow endpoint must not expire a healthy session
+			time.Sleep(500 * time.Millisecond)
+			proc, err = ad.adoptContainer(rec, dir)
+		}
+	}
+	if errors.Is(err, errCDPCheck) || errors.Is(err, errRecordNotOurs) {
+		// Transient, or not ours to judge: leave the record exactly as it is.
+		log.Printf("[cobrowse] leaving container session %s for a later check: %v", rec.ID, err)
+		return nil
 	}
 	if err != nil {
 		log.Printf("[cobrowse] not adopting container session %s: %v", rec.ID, err)
@@ -843,6 +1002,7 @@ func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir
 	s := &cobrowseSession{
 		id: rec.ID, profile: dir, regDir: regDir, state: SessionRunning, proc: proc,
 		explicitHandoff: rec.Handoff, generation: rec.Generation + 1, tracking: m.TargetsEnabled(),
+		workDir: filepath.Join(dir, containerProfileSubdir),
 	}
 	if t, perr := time.Parse(time.RFC3339, rec.StartedAt); perr == nil {
 		s.startedAt = t
@@ -865,6 +1025,9 @@ func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir
 // verifyContainerRecord is the container counterpart of verifyAdoptable: the
 // record must be ours to take over, describe the plain session dir, and the
 // container must then pass adoptContainer's checks (see recoverContainer).
+// errRecordNotOurs marks a record this process may neither adopt nor expire.
+var errRecordNotOurs = errors.New("record is not ours to adopt")
+
 func (m *CobrowseSessionManager) verifyContainerRecord(rec sessionRecord, dir string, ad containerAdopter) error {
 	if ad == nil {
 		return errNoContainerRuntime
@@ -881,13 +1044,13 @@ func (m *CobrowseSessionManager) verifyContainerRecord(rec sessionRecord, dir st
 	}
 	if rec.OwnerPID != os.Getpid() || rec.OwnerStart == 0 || rec.OwnerStart != currentOwnerIdentity() {
 		if !detachedWorker.Load() {
-			return errors.New("record was not written by this process and this is not the managed worker")
+			return fmt.Errorf("%w: written by another process and this is not the managed worker", errRecordNotOurs)
 		}
 		if rec.OwnerUID == nil || *rec.OwnerUID != os.Getuid() {
-			return errors.New("record was written by a different OS user")
+			return fmt.Errorf("%w: written by a different OS user", errRecordNotOurs)
 		}
 		if st, alive, err := procIdentity(rec.OwnerPID); err == nil && alive && st == rec.OwnerStart {
-			return errors.New("record owner is still running")
+			return fmt.Errorf("%w: owner is still running", errRecordNotOurs)
 		}
 		if !withinDetachGrace(rec) {
 			return fmt.Errorf("owner has been gone longer than the %s detach grace", detachGrace())

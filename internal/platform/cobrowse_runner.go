@@ -92,9 +92,10 @@ type LaunchOptions struct {
 	// they outlive a service restart. Only the node-wide manager of the managed
 	// worker sets it; everything else launches directly.
 	Detach bool
-	// NodeWide marks the node-wide manager: only it may use the container
-	// runner (local mode keeps the user's own host browser).
-	NodeWide bool
+	// UseContainer is the manager's per-launch decision (made before it lays out
+	// the session dir) to run this session in a container. Only the node-wide
+	// manager sets it; local mode keeps the user's own host browser.
+	UseContainer bool
 }
 
 // devToolsActivePortFile is where a browser launched with

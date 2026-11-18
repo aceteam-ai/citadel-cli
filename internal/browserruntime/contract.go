@@ -42,6 +42,16 @@ const (
 	LabelRuntime = "aceteam.browser-runtime"         // "1" on every session container
 	LabelSession = "aceteam.browser-runtime.session" // session id
 	LabelPurpose = "aceteam.browser-runtime.purpose" // meeting|huddle|cobrowse|bot_sign_in|bot_probe
+	LabelOwner   = "aceteam.browser-runtime.owner"   // who created the container (see RunSpec.Owner)
+
+	// ImageLabelSandbox marks an image whose renderer runs sandboxed (set by
+	// #1788). Node co-browse refuses an image without SandboxMarker: the contract-1
+	// image runs Chromium with --no-sandbox.
+	ImageLabelSandbox = "aceteam.browser-runtime.sandbox"
+	SandboxMarker     = "1"
+
+	// StageMountPath is where a session's staging dir is bound read-only.
+	StageMountPath = "/citadel-stage"
 
 	// Image labels (set at build time) and the in-image file with the same major.
 	ImageLabelContract       = "aceteam.browser-runtime.contract"
@@ -53,6 +63,8 @@ const (
 var (
 	sessionIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
 	imageRe     = regexp.MustCompile(`^ghcr\.io/aceteam-ai/(browser-runtime|meeting-service)(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$`)
+	nameRe      = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
+	ownerRe     = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,64}$`)
 	purposes    = map[string]bool{"meeting": true, "huddle": true, "cobrowse": true, "bot_sign_in": true, "bot_probe": true}
 )
 
@@ -83,9 +95,22 @@ type RunSpec struct {
 	// WorkspaceMeetingsDir is an optional existing, clean, absolute host dir
 	// mounted rw at /workspace/meetings.
 	WorkspaceMeetingsDir string
-	ShmSize              string // default 1g (chromium crashes on docker's 64m)
-	CPUs                 string // default 1.5
-	Memory               string // default 1536m
+	// Name is the optional container name (--name).
+	Name string
+	// Owner is stamped as LabelOwner so a sweep only touches containers this
+	// node's worker created. Optional; restricted to [A-Za-z0-9_.-]{1,64}.
+	Owner string
+	// StageDir is an optional existing, clean, absolute host dir bound READ-ONLY
+	// at StageMountPath (staged upload files the browser may read, never write).
+	StageDir string
+	// DiskCacheMB, when positive, is passed as MEETING_DISK_CACHE_MB.
+	DiskCacheMB int
+	// UserNSKeepID adds --userns=keep-id (rootless podman, so the bind mounts
+	// owned by the host user stay writable under --user).
+	UserNSKeepID bool
+	ShmSize      string // default 1g (chromium crashes on docker's 64m)
+	CPUs         string // default 1.5
+	Memory       string // default 1536m
 }
 
 // Args returns the argv after the engine name, ending with the image. It does
@@ -111,13 +136,19 @@ func (s RunSpec) Args() ([]string, error) {
 	if s.UID <= 0 || s.GID <= 0 {
 		return nil, errors.New("browserruntime: UID and GID must be non-zero (chromium refuses root)")
 	}
-	for _, d := range []string{s.ProfileDir, s.WorkspaceMeetingsDir} {
+	for _, d := range []string{s.ProfileDir, s.WorkspaceMeetingsDir, s.StageDir} {
 		if d == "" {
 			continue
 		}
 		if !filepath.IsAbs(d) || filepath.Clean(d) != d || d == "/" || strings.ContainsAny(d, ",\n\r\"") {
 			return nil, fmt.Errorf("browserruntime: mount dir %q must be absolute, clean, not / and free of ',' and newlines", d)
 		}
+	}
+	if s.Name != "" && !nameRe.MatchString(s.Name) {
+		return nil, fmt.Errorf("browserruntime: invalid container name %q", s.Name)
+	}
+	if s.Owner != "" && !ownerRe.MatchString(s.Owner) {
+		return nil, fmt.Errorf("browserruntime: invalid owner %q", s.Owner)
 	}
 	def := func(v, d string) string {
 		if v == "" {
@@ -145,6 +176,23 @@ func (s RunSpec) Args() ([]string, error) {
 		"--label", LabelRuntime + "=1",
 		"--label", LabelSession + "=" + s.SessionID,
 		"--label", LabelPurpose + "=" + s.Purpose,
+	}
+	if s.Name != "" {
+		args = append(args, "--name", s.Name)
+	}
+	if s.Owner != "" {
+		args = append(args, "--label", LabelOwner+"="+s.Owner)
+	}
+	// The image is pinned by digest; never let `run` pull something else.
+	args = append(args, "--pull=never")
+	if s.UserNSKeepID {
+		args = append(args, "--userns=keep-id")
+	}
+	if s.DiskCacheMB > 0 {
+		args = append(args, "-e", fmt.Sprintf("MEETING_DISK_CACHE_MB=%d", s.DiskCacheMB))
+	}
+	if s.StageDir != "" {
+		args = append(args, "--mount", "type=bind,src="+s.StageDir+",dst="+StageMountPath+",readonly")
 	}
 	// --mount (unlike -v) errors on a missing source instead of creating a
 	// root-owned dir.
