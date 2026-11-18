@@ -33,6 +33,7 @@ func loadOrCreateNodeShare(dir string) ([]byte, error) {
 	// share is never a legitimate transient state. A loser of the race removes
 	// its temp dir and reads the winner's share.
 	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		removeStaleStoreTemps(filepath.Dir(dir))
 		if err := publishNewStore(dir); err != nil {
 			return nil, err
 		}
@@ -64,7 +65,7 @@ func loadOrCreateNodeShare(dir string) ([]byte, error) {
 // publishNewStore creates dir containing a fresh share, atomically. If another
 // caller published first, it discards its own copy and returns nil.
 func publishNewStore(dir string) error {
-	tmp, err := os.MkdirTemp(filepath.Dir(dir), ".botstore-*")
+	tmp, err := os.MkdirTemp(filepath.Dir(dir), TempPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("botprofile: create store dir: %w", err)
 	}
@@ -104,6 +105,21 @@ var errShareLinked = errors.New("linked")
 
 // removeStaleTemps deletes temp names left by a creator that died between
 // create and link. Recent ones are left alone: a live creator owns them.
+func removeStaleStoreTemps(parent string) {
+	ents, err := os.ReadDir(parent)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), TempPrefix) {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.IsDir() && time.Since(info.ModTime()) > time.Minute {
+			_ = os.RemoveAll(filepath.Join(parent, e.Name()))
+		}
+	}
+}
+
 func removeStaleTemps(dir string) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {

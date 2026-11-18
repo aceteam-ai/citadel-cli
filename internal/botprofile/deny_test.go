@@ -113,3 +113,15 @@ func TestDenyPathDanglingSymlinkLeafFailsClosed(t *testing.T) {
 		t.Fatal("dangling symlink leaf allowed")
 	}
 }
+
+func TestDenyPathRefusesPublishTempDir(t *testing.T) {
+	cfg := t.TempDir()
+	withConfigDirs(t, cfg)
+	for _, n := range []string{TempPrefix + "x", ".BOT-PROFILES-TMP-123456"} {
+		for _, sub := range []string{"", "node-share.key"} {
+			if DenyPath(filepath.Join(cfg, n, sub)) == nil {
+				t.Errorf("allowed %s/%s", n, sub)
+			}
+		}
+	}
+}

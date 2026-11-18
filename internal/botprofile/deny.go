@@ -21,7 +21,15 @@ var ConfigDirs func() []string
 // IsStoreName reports whether a single path component names the store. The
 // match is case-insensitive so a case-folding filesystem (APFS, NTFS) cannot
 // be used to reach the store under another spelling.
-func IsStoreName(name string) bool { return strings.EqualFold(name, DirName) }
+func IsStoreName(name string) bool {
+	return strings.EqualFold(name, DirName) ||
+		(len(name) >= len(TempPrefix) && strings.EqualFold(name[:len(TempPrefix)], TempPrefix))
+}
+
+// TempPrefix names the private directory a first use builds the store in before
+// renaming it into place. It is protected exactly like the store, because it
+// holds the node share while it exists.
+const TempPrefix = ".bot-profiles-tmp-"
 
 // DenyPath refuses p when it is the store or beneath it, however it is
 // reached. The decision is identity-based, not only lexical: it walks the

@@ -126,3 +126,34 @@ func TestFileListHidesStoreAndLinksIntoIt(t *testing.T) {
 		t.Fatalf("list exposes the store: %s", s)
 	}
 }
+
+// The publish temp dir holds the node share while it exists and is denied to
+// file jobs and hidden from listings like the store itself.
+func TestPublishTempDirDeniedToFileJobs(t *testing.T) {
+	cfg, _ := filepath.EvalSymlinks(t.TempDir())
+	tmp := filepath.Join(cfg, botprofile.TempPrefix+"abc123")
+	if err := os.Mkdir(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	share := filepath.Join(tmp, "node-share.key")
+	if err := os.WriteFile(share, []byte("needle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "plain.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	protectConfigDir(t, cfg)
+	if _, err := ValidateReadPath(cfg, share, true); err == nil {
+		t.Error("relaxed read allowed the temp share")
+	}
+	if _, err := ValidatePath(cfg, share); err == nil {
+		t.Error("ValidatePath allowed the temp share")
+	}
+	out, err := NewFileListHandler(cfg).Execute(JobContext{}, makeJob(map[string]string{"path": cfg}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "bot-profiles-tmp") || !strings.Contains(string(out), "plain.txt") {
+		t.Fatalf("listing wrong: %s", out)
+	}
+}

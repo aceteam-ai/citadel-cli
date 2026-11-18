@@ -608,3 +608,28 @@ func TestConcurrentFirstUseSharesOneNodeShare(t *testing.T) {
 		}
 	}
 }
+
+func TestStaleStoreTempSweptFreshKept(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, TempPrefix+"old")
+	fresh := filepath.Join(dir, TempPrefix+"new")
+	for _, d := range []string{stale, fresh} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, NodeShareFile), share(1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	seal(t, dir, idA, providerFor(idA), 120, "x")
+	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+		t.Fatal("stale temp store kept")
+	}
+	if _, err := os.Lstat(fresh); err != nil {
+		t.Fatal("fresh temp store removed")
+	}
+}
