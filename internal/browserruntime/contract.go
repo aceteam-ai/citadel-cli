@@ -11,6 +11,7 @@ package browserruntime
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -46,17 +47,36 @@ const (
 
 var (
 	sessionIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+	networkRe   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+	digestRe    = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 	purposes    = map[string]bool{"meeting": true, "huddle": true, "cobrowse": true, "bot_sign_in": true, "bot_probe": true}
 )
 
 // RunSpec describes one session container.
 type RunSpec struct {
-	Image                string // pinned ref (name:sha@sha256:digest); required
-	SessionID            string
-	Purpose              string
-	UID, GID             int    // docker --user; must be non-zero
-	ProfileDir           string // optional absolute host dir, mounted rw at /profile; the caller owns it as UID:GID
-	WorkspaceMeetingsDir string // optional absolute host dir, mounted rw at /workspace/meetings
+	// Image is a digest-pinned ref (name[:tag]@sha256:<digest>) under Image or
+	// LegacyImage; required.
+	Image string
+	// Network is required: a user-defined network the caller created (C2). Either
+	// a per-session network, or one citadel-owned network created with
+	// com.docker.network.bridge.enable_icc=false. The image binds meetingd and
+	// the CDP forwarder on 0.0.0.0 inside the container and neither is
+	// authenticated, so "127.0.0.1::PORT" only restricts the HOST side; on the
+	// default bridge any other container (other sessions, app pods) could reach
+	// <ip>:9223 and drive CDP, cookies included. host, bridge, default, none and
+	// container:* are refused.
+	Network   string
+	SessionID string
+	Purpose   string
+	UID, GID  int // docker --user; must be non-zero
+	// ProfileDir is an optional existing, clean, absolute host dir mounted rw at
+	// /profile; the caller owns it as UID:GID. Precondition: it is mounted into at
+	// most one container at a time, because the entrypoint deletes Chromium's
+	// Singleton* files. Without it /profile is a tmpfs (throwaway profile).
+	ProfileDir string
+	// WorkspaceMeetingsDir is an optional existing, clean, absolute host dir
+	// mounted rw at /workspace/meetings.
+	WorkspaceMeetingsDir string
 	ShmSize              string // default 1g (chromium crashes on docker's 64m)
 	CPUs                 string // default 1.5
 	Memory               string // default 1536m
@@ -70,8 +90,11 @@ type RunSpec struct {
 // read-only root with tmpfs for /run, /tmp and /home/bot owned by UID:GID, and
 // both ports published to 127.0.0.1 with a dynamic host port.
 func (s RunSpec) Args() ([]string, error) {
-	if s.Image == "" {
-		return nil, errors.New("browserruntime: image is required")
+	if err := validateImage(s.Image); err != nil {
+		return nil, err
+	}
+	if err := validateNetwork(s.Network); err != nil {
+		return nil, err
 	}
 	if !sessionIDRe.MatchString(s.SessionID) {
 		return nil, fmt.Errorf("browserruntime: invalid session id %q", s.SessionID)
@@ -86,8 +109,8 @@ func (s RunSpec) Args() ([]string, error) {
 		if d == "" {
 			continue
 		}
-		if !strings.HasPrefix(d, "/") || strings.ContainsAny(d, ":,\n") {
-			return nil, fmt.Errorf("browserruntime: mount dir %q must be absolute and free of ':' and ','", d)
+		if !filepath.IsAbs(d) || filepath.Clean(d) != d || d == "/" || strings.ContainsAny(d, ",\n\r") {
+			return nil, fmt.Errorf("browserruntime: mount dir %q must be absolute, clean, not / and free of ',' and newlines", d)
 		}
 	}
 	def := func(v, d string) string {
@@ -100,6 +123,7 @@ func (s RunSpec) Args() ([]string, error) {
 	args := []string{
 		"run", "-d",
 		"--user", fmt.Sprintf("%d:%d", s.UID, s.GID),
+		"--network", s.Network,
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--read-only",
@@ -116,23 +140,57 @@ func (s RunSpec) Args() ([]string, error) {
 		"--label", LabelSession + "=" + s.SessionID,
 		"--label", LabelPurpose + "=" + s.Purpose,
 	}
+	// --mount (unlike -v) errors on a missing source instead of creating a
+	// root-owned dir.
 	if s.ProfileDir != "" {
-		args = append(args, "-v", s.ProfileDir+":"+ProfileMountPath)
+		args = append(args, "--mount", "type=bind,src="+s.ProfileDir+",dst="+ProfileMountPath)
+	} else {
+		// The root is read-only; Chromium needs a writable user-data-dir.
+		args = append(args, "--tmpfs", ProfileMountPath+":rw,mode=0700,"+owner)
 	}
 	if s.WorkspaceMeetingsDir != "" {
-		args = append(args, "-v", s.WorkspaceMeetingsDir+":"+WorkspaceMountPath)
+		args = append(args, "--mount", "type=bind,src="+s.WorkspaceMeetingsDir+",dst="+WorkspaceMountPath)
 	}
 	return append(args, s.Image), nil
 }
 
-// SessionFilterArgs returns the `ps` filter that finds one session's container
-// (or every session container when sessionID is empty).
-func SessionFilterArgs(sessionID string) []string {
-	f := LabelRuntime + "=1"
-	if sessionID != "" {
-		f = LabelSession + "=" + sessionID
+func validateImage(img string) error {
+	if strings.HasPrefix(img, "-") || strings.ContainsAny(img, " \t\n") {
+		return fmt.Errorf("browserruntime: invalid image %q", img)
 	}
-	return []string{"--filter", "label=" + f}
+	if !strings.HasPrefix(img, Image) && !strings.HasPrefix(img, LegacyImage) {
+		return fmt.Errorf("browserruntime: image %q is not a browser-runtime image", img)
+	}
+	if !digestRe.MatchString(img) {
+		return fmt.Errorf("browserruntime: image %q must be pinned by @sha256: digest", img)
+	}
+	return nil
+}
+
+func validateNetwork(n string) error {
+	switch n {
+	case "", "host", "bridge", "default", "none":
+		return fmt.Errorf("browserruntime: network %q is not allowed; use a caller-created isolated user-defined network", n)
+	}
+	if !networkRe.MatchString(n) {
+		return fmt.Errorf("browserruntime: invalid network name %q", n)
+	}
+	return nil
+}
+
+// SessionFilterArgs returns the `ps` filters that find one session's container
+// (runtime label AND session label), or every session container when sessionID
+// is empty. Labels are not authentication: C2's re-adopt must also verify the
+// recorded container ID or CDP identity before trusting a match.
+func SessionFilterArgs(sessionID string) ([]string, error) {
+	args := []string{"--filter", "label=" + LabelRuntime + "=1"}
+	if sessionID != "" {
+		if !sessionIDRe.MatchString(sessionID) {
+			return nil, fmt.Errorf("browserruntime: invalid session id %q", sessionID)
+		}
+		args = append(args, "--filter", "label="+LabelSession+"="+sessionID)
+	}
+	return args, nil
 }
 
 var publishedPortRe = regexp.MustCompile(`^(127\.0\.0\.1|\[::1\]):(\d{1,5})$`)
