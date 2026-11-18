@@ -43,7 +43,8 @@ type PageState struct {
 	// characters (SanitizeCobrowseTitle).
 	Title string `json:"title,omitempty"`
 	// DocID identifies the current document (performance.timeOrigin), so a
-	// same-URL reload or redirect is told apart from no navigation. Empty when
+	// same-URL reload or redirect is told apart from no navigation. It is a
+	// page-world hint, not a trust signal (the page can influence it). Empty when
 	// unknown. Not part of any wire format.
 	DocID string `json:"-"`
 }
@@ -149,7 +150,7 @@ func settlePageCtx(parent context.Context, p pin, before string, requireChange b
 func readPageState(p pin) (PageState, error) { return readPageStateOn(p) }
 
 func readPageStateOn(c cdpCaller) (PageState, error) {
-	val, err := evaluateOn(c, `({url: location.href, ready: document.readyState, title: document.title, doc: String(performance.timeOrigin)})`, false)
+	val, err := evaluateOn(c, `({url: location.href, ready: document.readyState, title: document.title, doc: (function(){try{return String(performance.timeOrigin)}catch(e){return ""}})()})`, false)
 	if err != nil {
 		return PageState{}, err
 	}

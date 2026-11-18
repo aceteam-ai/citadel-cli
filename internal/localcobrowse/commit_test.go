@@ -1078,6 +1078,83 @@ func TestApproveLinkClickWithPreexistingTabIsUnconfirmed(t *testing.T) {
 	assertUnconfirmedAudit(t, events)
 }
 
+// An unknown before-list (failed target sync) is not "no pages": the same page
+// listed afterwards must not read as a new tab.
+func TestApproveLinkClickUnknownBeforeTargetsIsUnconfirmed(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.mu.Lock()
+	fb.sessions[id].targets = nil
+	fb.mu.Unlock()
+	fb.onClick = func() {
+		fb.mu.Lock()
+		fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}}
+		fb.mu.Unlock()
+	}
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
+		t.Fatalf("unknown before-targets must not count as a new tab: %+v", v.CommitResult)
+	}
+	assertUnconfirmedAudit(t, events)
+}
+
+// A link click that opens a new tab, with the URL unchanged, is executed.
+func TestApproveLinkClickOpeningNewTabIsExecuted(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.mu.Lock()
+	fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}}
+	fb.mu.Unlock()
+	fb.onClick = func() {
+		fb.mu.Lock()
+		fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}, {ID: "t2"}}
+		fb.mu.Unlock()
+	}
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "executed" {
+		t.Fatalf("a new tab is evidence the link landed: %+v", v.CommitResult)
+	}
+}
+
+// Enter on a focused link that shows no navigation is unconfirmed.
+func TestApproveEnterOnLinkWithoutNavigationIsUnconfirmed(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.mu.Lock()
+	fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}}
+	fb.mu.Unlock()
+	if _, err := svc.Key(ctx, id, "Enter", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatalf("Enter on a link needs approval: %v", err)
+	}
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
+		t.Fatalf("Enter on a link that did not navigate is unconfirmed: %+v", v.CommitResult)
+	}
+	var key bool
+	for _, e := range *events {
+		if e.Action == "key" && e.Class == "W" && e.Outcome != "refused" {
+			key = true
+			if e.Outcome != "unconfirmed" {
+				t.Errorf("the W key record must be unconfirmed, got %q", e.Outcome)
+			}
+		}
+	}
+	if !key {
+		t.Fatal("no W key record")
+	}
+}
+
 // A same-URL reload (new document identity) counts as a navigation.
 func TestApproveLinkClickSameURLNewDocumentIsExecuted(t *testing.T) {
 	svc, fb, _, id := startGranted(t, nil)

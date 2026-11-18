@@ -2068,7 +2068,7 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 	if ps, err := s.cfg.Browser.PageState(id); err == nil {
 		beforeDoc = ps.DocID
 	}
-	beforeTargets := s.targetIDs(id)
+	beforeTargets, beforeTargetsOK := s.targetIDs(id)
 	derr := s.dispatchCommit(id, a)
 	clear()
 	if errors.Is(derr, platform.ErrTargetChanged) {
@@ -2085,8 +2085,8 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 	// Dispatch alone does not prove it (covered, outside the viewport,
 	// swallowed by the page); decide before the W record is written so both
 	// records agree.
-	unseen := derr == nil && (a.Kind == "click" || a.Kind == "key") && t.Href != "" &&
-		!settled.Navigated && !s.hasNewTarget(id, beforeTargets)
+	unseen := derr == nil && (a.Kind == "click" || (a.Kind == "key" && isEnter(a.Key))) && t.Href != "" &&
+		!settled.Navigated && !(beforeTargetsOK && s.hasNewTarget(id, beforeTargets))
 	if unseen {
 		ev.Outcome = "unconfirmed"
 	}
@@ -2117,20 +2117,24 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 	return nil
 }
 
-// targetIDs lists the session's open page ids.
-func (s *Service) targetIDs(id string) map[string]bool {
+// targetIDs lists the session's open page ids. ok is false when the list is
+// unknown (a failed target sync reports none, and a tracking session always
+// has at least one page), so the caller must not treat it as "no pages".
+func (s *Service) targetIDs(id string) (map[string]bool, bool) {
 	out := map[string]bool{}
 	if st, ok := s.cfg.Browser.SessionStatus(id); ok {
 		for _, t := range st.Targets {
 			out[t.ID] = true
 		}
 	}
-	return out
+	return out, len(out) > 0
 }
 
-// hasNewTarget reports whether a page opened that was not there before.
+// hasNewTarget reports whether a page opened that was not there before. The
+// caller must have a known (ok) before set.
 func (s *Service) hasNewTarget(id string, before map[string]bool) bool {
-	for t := range s.targetIDs(id) {
+	now, _ := s.targetIDs(id)
+	for t := range now {
 		if !before[t] {
 			return true
 		}
