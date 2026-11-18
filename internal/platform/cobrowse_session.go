@@ -44,6 +44,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/browserurl"
 )
 
 // cobrowseSessionsDirName is the parent directory (under os.TempDir()) that holds
@@ -103,6 +105,8 @@ type CobrowseSessionStatus struct {
 	// above is the active page's.
 	ActiveTarget string           `json:"active_target,omitempty"`
 	Targets      []CobrowseTarget `json:"targets,omitempty"`
+	OpenTargets  int              `json:"open_targets,omitempty"`
+	Features     []string         `json:"features,omitempty"`
 	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
 	Generation uint64 `json:"generation,omitempty"`
 	// Done and Effects are set only by scripted actions (click, type, key,
@@ -234,7 +238,7 @@ type CobrowseSessionManager struct {
 	sweepOnce   sync.Once
 	launchOpts  LaunchOptions
 	// trackTargets, targetPolicy and targetEvent are set by
-	// EnableTargetTracking (local mode only).
+	// EnableTargetTracking for newly created sessions.
 	trackTargets bool
 	targetPolicy TargetPolicy
 	targetEvent  TargetEventFunc
@@ -271,6 +275,8 @@ type SessionProfile interface {
 // cobrowseSession is one isolated browser session. Its own mutex guards proc/state so
 // a status/stop of a sibling never blocks on this session's launch or CDP wait.
 type cobrowseSession struct {
+	// actionMu serializes dispatched assertions without changing viewer control.
+	actionMu  sync.Mutex
 	id        string
 	profile   string
 	startedAt time.Time
@@ -300,10 +306,11 @@ type cobrowseSession struct {
 	regDir     string
 	generation uint64
 	pendingEnd *EndedSession
-	// tracking is set at creation from the manager (local mode only): pages are
+	// tracking is set at creation or restored from the registry: pages are
 	// followed and status lists them. expectTarget is the page a call was
 	// checked against (see ExpectTarget).
 	tracking     bool
+	policy       TargetPolicy
 	expectTarget string
 	formWorld    formSnapshotWorld
 
@@ -335,6 +342,7 @@ func GetCobrowseSessionManager() *CobrowseSessionManager {
 			resolveMaxCobrowseSessions(),
 		)
 		cobrowseSessionManager.useResolver = true
+		cobrowseSessionManager.EnableTargetTracking(browserurl.NewURLPolicy(browserurl.DefaultResolver, nil), nil)
 	})
 	return cobrowseSessionManager
 }
@@ -436,6 +444,24 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		}
 		return CobrowseSessionStatus{}, err
 	}
+	m.mu.Lock()
+	tracking, policy := m.trackTargets, m.targetPolicy
+	m.mu.Unlock()
+	if tracking && policy != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		checkedURL := startURL
+		if strings.TrimSpace(checkedURL) == "" {
+			checkedURL = "about:blank"
+		}
+		err := policy(ctx, checkedURL)
+		cancel()
+		if err != nil {
+			if profile != nil {
+				_ = profile.Close()
+			}
+			return CobrowseSessionStatus{}, err
+		}
+	}
 	// Reap orphans from a prior crashed process before the first launch of this one.
 	m.sweepOnce.Do(m.sweep)
 
@@ -467,6 +493,7 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		regDir:     m.sessionRegDir(),
 		generation: 1,
 		tracking:   m.trackTargets,
+		policy:     m.targetPolicy,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -818,6 +845,7 @@ func (s *cobrowseSession) statusProbed(parent context.Context) CobrowseSessionSt
 		cancel()
 		if err == nil {
 			st.Targets = snap.Targets
+			st.OpenTargets = len(snap.Targets)
 			st.ActiveTarget = snap.Active
 			for _, tg := range snap.Targets {
 				if tg.Active {
@@ -877,6 +905,8 @@ func (s *cobrowseSession) statusBase() (CobrowseSessionStatus, int) {
 	if !s.tracking {
 		st.FileUploadPageFence = FileUploadPageFenceV1
 		st.InputEdit = InputEditV1
+	} else {
+		st.Features = []string{"tabs"}
 	}
 	if s.chooser != nil {
 		c := *s.chooser
