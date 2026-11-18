@@ -1002,7 +1002,8 @@ S10.
 - The setting file `local-settings/settings.json` under `localStateDir`, holding
   `{"uploads": "on"|"off"}`. It is owner-only (written with
   `platform.EnsurePrivateDir` rules and an atomic replace) and read **live**:
-  every gate check stats it and re-reads it when the size or mtime changes.
+  every gate check opens it with current read permission and validates the
+  descriptor, then re-reads it when the identity, size or mtime changes.
   So `citadel local config uploads off` takes effect on the next check
   without restarting the agent app. A missing file means on. A file that
   exists but cannot be read or parsed means **off**, and `local doctor` and
@@ -1012,6 +1013,8 @@ S10.
   grant an unprivileged other user write access. An untrusted existing
   directory fails closed even when the file is missing. The wired owner
   defaults on when no file exists; an unwired service policy always denies.
+  Ancestors above the local state directory are not trust-checked, and a
+  symlink to a directory is allowed there when checking for absent settings.
 
 **Command.** `citadel local config uploads on|off|status`. `uploads` is a
 reserved word in `local config` and can never be a harness name. It writes

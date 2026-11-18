@@ -65,6 +65,113 @@ func TestUploadsMissingDefaultsOnWithoutEffects(t *testing.T) {
 	}
 }
 
+func TestUploadsMissingBelowSymlinkedAncestor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires a Windows privilege")
+	}
+	base := t.TempDir()
+	link := filepath.Join(base, "home-link")
+	if err := os.Symlink(base, link); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(link, "absent", "local")
+	if !NewUploadSettings(dir, "").Status().Enabled {
+		t.Fatal("directory ancestor symlink refused missing-file default")
+	}
+	if _, err := os.Lstat(filepath.Join(base, "absent")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("read created state through ancestor symlink")
+	}
+	// Only ancestors above the state directory may resolve through a symlink.
+	if NewUploadSettings(link, "").Status().Enabled {
+		t.Fatal("symlink at the state directory accepted")
+	}
+	file := filepath.Join(base, "file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{file, filepath.Join(base, "missing")} {
+		badLink := filepath.Join(t.TempDir(), "bad-link")
+		if err := os.Symlink(target, badLink); err != nil {
+			t.Fatal(err)
+		}
+		if NewUploadSettings(filepath.Join(badLink, "local"), "").Status().Enabled {
+			t.Fatal("non-directory or dangling ancestor symlink accepted")
+		}
+	}
+}
+
+func TestUploadsCacheRechecksOpenPermission(t *testing.T) {
+	_, s := uploadFixture(t)
+	reads := 0
+	var opened []*os.File
+	originalOpen := s.open
+	s.open = func(path string) (*os.File, error) {
+		f, err := originalOpen(path)
+		if err == nil {
+			opened = append(opened, f)
+		}
+		return f, err
+	}
+	read := s.read
+	s.read = func(f *os.File) ([]byte, error) {
+		reads++
+		return read(f)
+	}
+	if !s.Status().Enabled || !s.Status().Enabled || reads != 1 {
+		t.Fatalf("parsed settings cache not used: reads=%d", reads)
+	}
+	if len(opened) != 2 {
+		t.Fatal("cache hit did not open with current read permission")
+	}
+	for _, f := range opened {
+		if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatal("gate leaked an opened descriptor")
+		}
+	}
+	trackedOpen := s.open
+	s.open = func(string) (*os.File, error) { return nil, os.ErrPermission }
+	if s.Status().Enabled {
+		t.Fatal("cached on bypassed a newly unreadable settings file")
+	}
+	s.open = trackedOpen
+	if !s.Status().Enabled || reads != 2 {
+		t.Fatal("permission failure did not discard the cached reading")
+	}
+}
+
+func TestUploadsCacheRejectsMetadataChangingDuringOpen(t *testing.T) {
+	for _, field := range []string{"size", "mtime"} {
+		t.Run(field, func(t *testing.T) {
+			_, s := uploadFixture(t)
+			if !s.Status().Enabled {
+				t.Fatal("fixture")
+			}
+			open := s.open
+			s.open = func(path string) (*os.File, error) {
+				before, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				changed := before.ModTime()
+				if field == "size" {
+					if err := os.WriteFile(path, []byte("{\"uploads\":\"on\"}\n "), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					changed = changed.Add(time.Second)
+				}
+				if err := os.Chtimes(path, changed, changed); err != nil {
+					t.Fatal(err)
+				}
+				return open(path)
+			}
+			if s.Status().Enabled {
+				t.Fatal("cached on bypassed " + field + " changing during open")
+			}
+		})
+	}
+}
+
 func TestUploadsInvalidSettingsFailClosed(t *testing.T) {
 	for _, body := range []string{"", "null", "[]", "{}", "{", `{"uploads":true}`, `{"uploads":"ON"}`, `{"other":"on"}`, `{"Uploads":"on"}`, `{"uploads":"on","unknown":1}`, `{"uploads":"off","uploads":"on"}`, `{"uploads":"on"} {}`, `{"uploads":"on"}` + strings.Repeat(" ", maxUploadSettingsBytes+1)} {
 		t.Run(body[:min(len(body), 50)], func(t *testing.T) {
@@ -408,6 +515,31 @@ func TestUploadsMissingFileDoesNotBypassUntrustedDirectory(t *testing.T) {
 				t.Fatal("missing off file bypassed directory trust")
 			}
 		})
+	}
+}
+
+func TestUploadsUntrustedStateContainerRefusesWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix mode regression; Windows parent DACL tests run separately")
+	}
+	dir, s := uploadFixture(t)
+	path := filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteUploadSetting(dir, "off"); err == nil {
+		t.Fatal("writer accepted an untrusted state container")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("refused write changed settings")
+	}
+	if s.Status().Enabled {
+		t.Fatal("untrusted state container allowed cached on")
 	}
 }
 

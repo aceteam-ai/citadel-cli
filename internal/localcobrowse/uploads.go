@@ -75,6 +75,12 @@ func (s *UploadSettings) absentDirectory(path string) bool {
 	for {
 		st, err := s.stat(path)
 		if err == nil {
+			if st.Mode()&os.ModeSymlink != 0 {
+				// Only ancestors above a missing state directory reach here;
+				// the state/settings directories themselves never follow links.
+				st, err = os.Stat(path)
+				return err == nil && st.IsDir()
+			}
 			return st.IsDir()
 		}
 		if !errors.Is(err, os.ErrNotExist) {
@@ -134,12 +140,6 @@ func (s *UploadSettings) readFile() (bool, string) {
 		s.info = nil
 		return false, bad
 	}
-	if s.info != nil && os.SameFile(s.info, st) && s.info.Size() == st.Size() && s.info.ModTime() == st.ModTime() {
-		if s.fileOn {
-			return true, "Uploads are on in settings.json"
-		}
-		return false, "Uploads are turned off in settings.json"
-	}
 	f, err := s.open(path)
 	if err != nil {
 		s.info = nil
@@ -147,9 +147,17 @@ func (s *UploadSettings) readFile() (bool, string) {
 	}
 	defer f.Close()
 	opened, err := f.Stat()
-	if err != nil || !os.SameFile(st, opened) || !opened.Mode().IsRegular() {
+	if err != nil || !os.SameFile(st, opened) || !opened.Mode().IsRegular() || opened.Size() != st.Size() || opened.ModTime() != st.ModTime() {
 		s.info = nil
 		return false, bad
+	}
+	// Cache only the parsed value, never current read permission. In
+	// particular a Windows DACL can revoke reads without changing metadata.
+	if s.info != nil && os.SameFile(s.info, st) && s.info.Size() == st.Size() && s.info.ModTime() == st.ModTime() {
+		if s.fileOn {
+			return true, "Uploads are on in settings.json"
+		}
+		return false, "Uploads are turned off in settings.json"
 	}
 	b, err := s.read(f)
 	after, statErr := f.Stat()
