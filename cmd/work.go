@@ -1468,7 +1468,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	// claiming the job would only fail it. The capability detector adds this tag
 	// only when that stack is present, and the MEETING_JOIN handler ships behind
 	// the same gate, so subscription, capability, and handler activate together.
-	if role != config.WorkerRoleControl && nodeCaps != nil && hasCapabilityTag(nodeCaps.Tags, "meeting") {
+	// subscribeMeetingQueue is shared by this startup path and the
+	// meetingCapReconciler (citadel-cli#1758), which runs it later when the
+	// module turns healthy after the boot-time detection.
+	// It reports whether the queue is actually subscribed; the reconciler only
+	// advertises the tag on success and retries on the next tick otherwise.
+	meetingWarn := &warnThrottle{out: func(msg string) { fmt.Fprint(os.Stderr, msg) }, quiet: time.Hour}
+	subscribeMeetingQueue := func(ctx context.Context) bool {
 		meetingOrgID := ""
 		if deviceConfig != nil {
 			meetingOrgID = deviceConfig.OrgID
@@ -1483,18 +1489,27 @@ func runWork(cmd *cobra.Command, args []string) {
 			switch src := source.(type) {
 			case *worker.APISource:
 				src.AddQueue(meetingQueue)
+				workerState.SetQueues(src.QueueNames())
 			case *worker.RedisSource:
 				if err := src.AddQueue(ctx, meetingQueue); err != nil {
-					fmt.Fprintf(os.Stderr, "   - Warning: meeting queue subscribe failed: %v\n", err)
+					meetingWarn.warn(time.Now(), fmt.Sprintf("subscribe failed: %v", err),
+						fmt.Sprintf("   - Warning: meeting queue subscribe failed: %v\n", err))
+					return false
 				}
+				workerState.SetQueues(src.QueueNames())
 			}
 			fmt.Printf("   - Meeting notetaker queue: %s\n", meetingQueue)
 			Debug("meeting queue: %s", meetingQueue)
-		} else {
-			fmt.Fprintln(os.Stderr, "   - Warning: meeting queue skipped (org id unknown); "+
-				"meeting auto-join dispatch will not reach this node")
-			Debug("meeting queue skipped: org id unknown")
+			return true
 		}
+		meetingWarn.warn(time.Now(), "org id unknown",
+			"   - Warning: meeting queue skipped (org id unknown); "+
+				"meeting auto-join dispatch will not reach this node\n")
+		Debug("meeting queue skipped: org id unknown")
+		return false
+	}
+	if role != config.WorkerRoleControl && nodeCaps != nil && hasCapabilityTag(nodeCaps.Tags, "meeting") {
+		_ = subscribeMeetingQueue(ctx)
 	}
 
 	// Populate the worker introspection state with the resolved identity and
@@ -1656,6 +1671,25 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
+	// Re-detect `meeting` on the heartbeat tick when boot-time detection missed
+	// it (module container still inside its start_period). Only for
+	// auto-detected capabilities: a manifest-declared set is the operator's word.
+	var meetingReconciler *meetingCapReconciler
+	if meetingReconcileEligible(role, nodeCaps, workManifest != nil && workManifest.Capabilities != nil) {
+		meetingReconciler = newMeetingCapReconciler(capabilities.DetectMeetingCapability, func(ctx context.Context) bool {
+			if !subscribeMeetingQueue(ctx) {
+				return false
+			}
+			if collector != nil && statusCaps != nil {
+				updated := *statusCaps
+				updated.Tags = append(append([]string(nil), statusCaps.Tags...), "meeting")
+				collector.SetCapabilities(&updated)
+			}
+			fmt.Println("   - Meeting capability became available; now advertising the meeting tag")
+			return true
+		})
+	}
+
 	if workStatusPort > 0 {
 		collector = status.NewCollector(status.CollectorConfig{
 			Role:       role.Report(),
@@ -2217,6 +2251,9 @@ func runWork(cmd *cobra.Command, args []string) {
 						// TestInferenceQueueReconciler_ConcurrentReconcile.
 						apiPublisher.SetOnStatus(func(_ *status.NodeStatus) { go inferenceQueueReconciler.Reconcile(ctx) })
 					}
+					if meetingReconciler != nil {
+						apiPublisher.SetOnStatus(func(_ *status.NodeStatus) { go meetingReconciler.Reconcile(ctx) })
+					}
 					if nvrMonitor != nil {
 						// NVR per-camera self-heal (citadel-cli#1295). Dispatched
 						// via `go` because a stall recovery shells out to
@@ -2281,6 +2318,9 @@ func runWork(cmd *cobra.Command, args []string) {
 				// jobs.CacheGCEnabled() is false.
 				if gcReconciler != nil {
 					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { gcReconciler.Reconcile(s) })
+				}
+				if meetingReconciler != nil {
+					redisPublisher.SetOnStatus(func(_ *status.NodeStatus) { go meetingReconciler.Reconcile(ctx) })
 				}
 				if nvrMonitor != nil {
 					// NVR per-camera self-heal (citadel-cli#1295). Dispatched via

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
@@ -31,7 +32,8 @@ type Collector struct {
 	services         []ServiceConfig
 	startTime        time.Time
 	modelDiscovery   *ModelDiscovery
-	capabilities     *NodeCapabilities                 // cached capabilities (set once at startup)
+	capsMu           sync.RWMutex                      // guards capabilities (replaced when meeting turns healthy, citadel-cli#1758)
+	capabilities     *NodeCapabilities                 // cached capabilities (set at startup; may be replaced by SetCapabilities)
 	workerLiveness   func() *WorkerLiveness            // live worker consume-loop liveness (issue #548), optional
 	swapStats        func() *SwapActivity              // live model-hotswap activity (citadel #717), optional
 	reconcileHealth  func() *ReconcileHealth           // live full-wipe-guard refusal state (citadel #742), optional
@@ -356,8 +358,12 @@ func toStringSet(items []string) map[string]bool {
 }
 
 // SetCapabilities sets the cached capabilities for heartbeat publishing.
+// It is safe to call while Collect runs; callers must pass a fresh value rather
+// than mutating one already set.
 func (c *Collector) SetCapabilities(caps *NodeCapabilities) {
+	c.capsMu.Lock()
 	c.capabilities = caps
+	c.capsMu.Unlock()
 }
 
 func (c *Collector) clockSynchronization() *bool {
@@ -501,10 +507,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// than aliasing it, so populating the per-heartbeat capability flags below
 	// does not mutate the shared cached value (Collect may run concurrently for
 	// the status server and the heartbeat publisher).
+	c.capsMu.RLock()
 	if c.capabilities != nil {
 		capsCopy := *c.capabilities
 		status.Capabilities = &capsCopy
 	}
+	c.capsMu.RUnlock()
 
 	// Collect desktop capabilities
 	status.Desktop = desktop.DetectCapabilities()
