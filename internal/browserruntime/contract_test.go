@@ -8,7 +8,7 @@ import (
 )
 
 func spec() RunSpec {
-	return RunSpec{Image: Image + ":abc@sha256:" + strings.Repeat("0", 64), Network: "bru-s-1", SessionID: "s-1", Purpose: "cobrowse", UID: 1000, GID: 1000}
+	return RunSpec{Image: Image + ":abc@sha256:" + strings.Repeat("0", 64), Network: NetworkName("s-1"), SessionID: "s-1", Purpose: "cobrowse", UID: 1000, GID: 1000}
 }
 
 func TestArgsContract(t *testing.T) {
@@ -23,7 +23,7 @@ func TestArgsContract(t *testing.T) {
 		" --user 1000:1000 ", " --cap-drop ALL ", " no-new-privileges ", " --read-only ",
 		" -p 127.0.0.1::8102 ", " -p 127.0.0.1::9223 ",
 		" aceteam.browser-runtime.session=s-1 ", " aceteam.browser-runtime.purpose=cobrowse ",
-		" --mount type=bind,src=/tmp/p,dst=/profile ", " --network bru-s-1 ", "/home/bot:rw,mode=0700,uid=1000,gid=1000",
+		" --mount type=bind,src=/tmp/p,dst=/profile ", " --network aceteam-br-s-1 ", "/home/bot:rw,size=256m,mode=0700,uid=1000,gid=1000",
 	} {
 		if !strings.Contains(j, want) {
 			t.Errorf("missing %q in %s", want, j)
@@ -45,7 +45,7 @@ func TestArgsNoProfileNoMount(t *testing.T) {
 	if strings.Contains(j, " -v ") || strings.Contains(j, "type=bind") {
 		t.Error("no bind mount expected without ProfileDir")
 	}
-	if !strings.Contains(j, "--tmpfs /profile:rw,mode=0700,uid=1000,gid=1000") {
+	if !strings.Contains(j, "--tmpfs /profile:rw,size=512m,mode=0700,uid=1000,gid=1000") {
 		t.Error("profile tmpfs expected without ProfileDir")
 	}
 }
@@ -69,6 +69,14 @@ func TestArgsRejects(t *testing.T) {
 		"nethost":      func(s *RunSpec) { s.Network = "host" },
 		"netbridge":    func(s *RunSpec) { s.Network = "bridge" },
 		"netdefault":   func(s *RunSpec) { s.Network = "default" },
+		"netpodman":    func(s *RunSpec) { s.Network = "podman" },
+		"netprivate":   func(s *RunSpec) { s.Network = "private" },
+		"netmismatch":  func(s *RunSpec) { s.Network = NetworkName("other") },
+		"imgevil":      func(s *RunSpec) { s.Image = Image + "-evil@sha256:" + strings.Repeat("0", 64) },
+		"imgsub":       func(s *RunSpec) { s.Image = Image + "/sub@sha256:" + strings.Repeat("0", 64) },
+		"imglegacyev":  func(s *RunSpec) { s.Image = LegacyImage + "-dev@sha256:" + strings.Repeat("0", 64) },
+		"imgtrailing":  func(s *RunSpec) { s.Image = Image + "@sha256:" + strings.Repeat("0", 64) + "x" },
+		"quote":        func(s *RunSpec) { s.ProfileDir = "/a\"b" },
 		"netnone":      func(s *RunSpec) { s.Network = "none" },
 		"netcontainer": func(s *RunSpec) { s.Network = "container:x" },
 		"imgdash":      func(s *RunSpec) { s.Image = "-v" },
@@ -95,16 +103,29 @@ func TestParsePublishedPort(t *testing.T) {
 	}
 }
 
-func TestParsePublishedPortIPv6Loopback(t *testing.T) {
-	if p, err := ParsePublishedPort("[::1]:40000"); err != nil || p != 40000 {
-		t.Errorf("got %d %v", p, err)
+func TestParsePublishedPortIPv6(t *testing.T) {
+	if _, err := ParsePublishedPort("[::1]:40000"); err == nil {
+		t.Error("IPv6-only must fail: contract publishes 127.0.0.1")
+	}
+	if p, err := ParsePublishedPort("[::1]:40001\n127.0.0.1:40000"); err != nil || p != 40000 {
+		t.Errorf("dual binding: got %d %v", p, err)
+	}
+}
+
+func TestNetworkName(t *testing.T) {
+	if NetworkName("s-1") != "aceteam-br-s-1" {
+		t.Error(NetworkName("s-1"))
 	}
 }
 
 func TestSessionFilterArgs(t *testing.T) {
 	a, err := SessionFilterArgs("s-1")
-	if err != nil || len(a) != 4 {
-		t.Fatalf("%v %v", a, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--filter", "label=aceteam.browser-runtime=1", "--filter", "label=aceteam.browser-runtime.session=s-1"}
+	if strings.Join(a, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %v", a)
 	}
 	if _, err := SessionFilterArgs("a b"); err == nil {
 		t.Error("invalid id must fail")

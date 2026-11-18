@@ -47,8 +47,7 @@ const (
 
 var (
 	sessionIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
-	networkRe   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
-	digestRe    = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
+	imageRe     = regexp.MustCompile(`^ghcr\.io/aceteam-ai/(browser-runtime|meeting-service)(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$`)
 	purposes    = map[string]bool{"meeting": true, "huddle": true, "cobrowse": true, "bot_sign_in": true, "bot_probe": true}
 )
 
@@ -57,14 +56,16 @@ type RunSpec struct {
 	// Image is a digest-pinned ref (name[:tag]@sha256:<digest>) under Image or
 	// LegacyImage; required.
 	Image string
-	// Network is required: a user-defined network the caller created (C2). Either
-	// a per-session network, or one citadel-owned network created with
-	// com.docker.network.bridge.enable_icc=false. The image binds meetingd and
-	// the CDP forwarder on 0.0.0.0 inside the container and neither is
-	// authenticated, so "127.0.0.1::PORT" only restricts the HOST side; on the
-	// default bridge any other container (other sessions, app pods) could reach
-	// <ip>:9223 and drive CDP, cookies included. host, bridge, default, none and
-	// container:* are refused.
+	// Network is required and must equal NetworkName(SessionID): a network that
+	// exists only for this session. The image binds meetingd and the CDP
+	// forwarder on 0.0.0.0 inside the container and neither is authenticated, so
+	// "127.0.0.1::PORT" only restricts the HOST side; on a shared network any
+	// other container (other sessions, app pods) could reach <ip>:9223 and drive
+	// CDP, cookies included. C2's duties: create the network fresh (an "already
+	// exists" error is a failure, never reuse), attach only this session's
+	// container to it, and delete it at teardown or sweep. Residual: processes on
+	// the host can reach the container IP on the bridge subnet, the same trust
+	// boundary as the 127.0.0.1 publish.
 	Network   string
 	SessionID string
 	Purpose   string
@@ -93,8 +94,8 @@ func (s RunSpec) Args() ([]string, error) {
 	if err := validateImage(s.Image); err != nil {
 		return nil, err
 	}
-	if err := validateNetwork(s.Network); err != nil {
-		return nil, err
+	if s.Network != NetworkName(s.SessionID) {
+		return nil, fmt.Errorf("browserruntime: network %q must be NetworkName(session) %q", s.Network, NetworkName(s.SessionID))
 	}
 	if !sessionIDRe.MatchString(s.SessionID) {
 		return nil, fmt.Errorf("browserruntime: invalid session id %q", s.SessionID)
@@ -109,7 +110,7 @@ func (s RunSpec) Args() ([]string, error) {
 		if d == "" {
 			continue
 		}
-		if !filepath.IsAbs(d) || filepath.Clean(d) != d || d == "/" || strings.ContainsAny(d, ",\n\r") {
+		if !filepath.IsAbs(d) || filepath.Clean(d) != d || d == "/" || strings.ContainsAny(d, ",\n\r\"") {
 			return nil, fmt.Errorf("browserruntime: mount dir %q must be absolute, clean, not / and free of ',' and newlines", d)
 		}
 	}
@@ -127,9 +128,9 @@ func (s RunSpec) Args() ([]string, error) {
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--read-only",
-		"--tmpfs", "/run:rw,mode=0700," + owner,
-		"--tmpfs", "/tmp:rw,mode=1777," + owner,
-		"--tmpfs", "/home/bot:rw,mode=0700," + owner,
+		"--tmpfs", "/run:rw,size=64m,mode=0700," + owner,
+		"--tmpfs", "/tmp:rw,size=512m,mode=1777," + owner,
+		"--tmpfs", "/home/bot:rw,size=256m,mode=0700," + owner,
 		"--shm-size", def(s.ShmSize, "1g"),
 		"--cpus", def(s.CPUs, "1.5"),
 		"--memory", def(s.Memory, "1536m"),
@@ -146,7 +147,7 @@ func (s RunSpec) Args() ([]string, error) {
 		args = append(args, "--mount", "type=bind,src="+s.ProfileDir+",dst="+ProfileMountPath)
 	} else {
 		// The root is read-only; Chromium needs a writable user-data-dir.
-		args = append(args, "--tmpfs", ProfileMountPath+":rw,mode=0700,"+owner)
+		args = append(args, "--tmpfs", ProfileMountPath+":rw,size=512m,mode=0700,"+owner)
 	}
 	if s.WorkspaceMeetingsDir != "" {
 		args = append(args, "--mount", "type=bind,src="+s.WorkspaceMeetingsDir+",dst="+WorkspaceMountPath)
@@ -155,28 +156,14 @@ func (s RunSpec) Args() ([]string, error) {
 }
 
 func validateImage(img string) error {
-	if strings.HasPrefix(img, "-") || strings.ContainsAny(img, " \t\n") {
-		return fmt.Errorf("browserruntime: invalid image %q", img)
-	}
-	if !strings.HasPrefix(img, Image) && !strings.HasPrefix(img, LegacyImage) {
-		return fmt.Errorf("browserruntime: image %q is not a browser-runtime image", img)
-	}
-	if !digestRe.MatchString(img) {
-		return fmt.Errorf("browserruntime: image %q must be pinned by @sha256: digest", img)
+	if !imageRe.MatchString(img) {
+		return fmt.Errorf("browserruntime: image %q must be ghcr.io/aceteam-ai/{browser-runtime,meeting-service}[:tag]@sha256:<digest>", img)
 	}
 	return nil
 }
 
-func validateNetwork(n string) error {
-	switch n {
-	case "", "host", "bridge", "default", "none":
-		return fmt.Errorf("browserruntime: network %q is not allowed; use a caller-created isolated user-defined network", n)
-	}
-	if !networkRe.MatchString(n) {
-		return fmt.Errorf("browserruntime: invalid network name %q", n)
-	}
-	return nil
-}
+// NetworkName is the per-session network name C2 must create for a session.
+func NetworkName(sessionID string) string { return "aceteam-br-" + sessionID }
 
 // SessionFilterArgs returns the `ps` filters that find one session's container
 // (runtime label AND session label), or every session container when sessionID
@@ -193,7 +180,11 @@ func SessionFilterArgs(sessionID string) ([]string, error) {
 	return args, nil
 }
 
-var publishedPortRe = regexp.MustCompile(`^(127\.0\.0\.1|\[::1\]):(\d{1,5})$`)
+var publishedPortRe = regexp.MustCompile(`^127\.0\.0\.1:(\d{1,5})$`)
+
+// An IPv6 loopback line is tolerated (and ignored) in dual-binding output; the
+// contract only publishes 127.0.0.1.
+var ignoredLoopbackRe = regexp.MustCompile(`^\[::1\]:\d{1,5}$`)
 
 // ParsePublishedPort reads the output of `<engine> port <container> <cport>/tcp`
 // and returns the host port. It accepts only loopback bindings and fails
@@ -206,11 +197,14 @@ func ParsePublishedPort(out string) (int, error) {
 		if line == "" {
 			continue
 		}
+		if ignoredLoopbackRe.MatchString(line) {
+			continue
+		}
 		m := publishedPortRe.FindStringSubmatch(line)
 		if m == nil {
 			return 0, fmt.Errorf("browserruntime: published port %q is not loopback-only", line)
 		}
-		p, _ := strconv.Atoi(m[2])
+		p, _ := strconv.Atoi(m[1])
 		if p < 1 || p > 65535 {
 			return 0, fmt.Errorf("browserruntime: port %d out of range", p)
 		}
