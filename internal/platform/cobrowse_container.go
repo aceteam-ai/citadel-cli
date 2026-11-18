@@ -1030,11 +1030,15 @@ func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir
 	}
 	s := &cobrowseSession{
 		id: rec.ID, profile: dir, regDir: regDir, state: SessionRunning, proc: proc,
-		explicitHandoff: rec.Handoff, generation: rec.Generation + 1, tracking: m.TargetsEnabled(),
+		explicitHandoff: rec.Handoff, generation: rec.Generation + 1, tracking: rec.Tracking, policy: m.targetPolicy,
 		workDir: filepath.Join(dir, containerProfileSubdir),
 	}
 	if t, perr := time.Parse(time.RFC3339, rec.StartedAt); perr == nil {
 		s.startedAt = t
+	}
+	if s.tracking {
+		dropTargetSet(rec.DebugPort)
+		targetSetFor(rec.DebugPort).configure(s.id, s.policy, m.targetEvent)
 	}
 	sweepProtected.Store(dir, struct{}{})
 	m.mu.Lock()

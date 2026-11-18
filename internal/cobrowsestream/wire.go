@@ -117,7 +117,8 @@ type TargetInfo struct {
 	Active bool   `json:"active,omitempty"`
 	// Refused marks a page the session's policy refuses. It is never active and
 	// is not streamed; the viewer shows it as blocked.
-	Refused bool `json:"refused,omitempty"`
+	Refused  bool   `json:"refused,omitempty"`
+	OpenedBy string `json:"opened_by,omitempty"`
 }
 
 // TargetsMessage lists the open pages. Targets keep the browser's order.
