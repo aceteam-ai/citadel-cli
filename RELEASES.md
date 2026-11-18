@@ -4032,3 +4032,19 @@ Auto-generated log of every release.
   - ci: run PR CI for stacked PRs on feat/fix/docs/chore bases (#1775)
 
 
+---
+
+## v2.241.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 41 |
+| Lines added | +3469 |
+
+**Changes:**
+
+  - feat(cobrowse): track pages in remotely dispatched sessions (#1671)
+  - feat(botprofile): bot profile store with split unattended key (#1787)
+
+
