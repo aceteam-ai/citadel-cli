@@ -1,6 +1,8 @@
 # Local co-browse: file upload, and field editing parity
 
-Status: design only. No code ships with this document.
+Status: design of record. S1 implements file-aware commit snapshots; S2 adds
+the opt-out setting and shared gate. Local upload entry points remain in later
+slices; the setting alone does not enable staging or attachment.
 
 Refs #1729 (local-mode file upload) and #1730 (type with selector and clear,
 key modifiers). Builds on #1721 / PR #1722 (staging, `set_file_input`, chooser
@@ -994,16 +996,28 @@ S10.
 - The environment variable `CITADEL_LOCAL_UPLOADS`. A falsey value (`0`,
   `false`, `no`, `off`) turns uploads off. It is read once, when the owner
   process starts, because a process's environment does not change. Any other
-  non-empty value is ignored with a warning in `local doctor`. It never turns
+  non-empty unrecognized value is ignored with a warning in `local doctor`;
+  `1`, `true`, `yes` and `on` are recognized no-op values. It never turns
   on what the file turned off.
-- The setting file `settings.json` in `localStateDir`, holding
+- The setting file `local-settings/settings.json` under `localStateDir`, holding
   `{"uploads": "on"|"off"}`. It is owner-only (written with
   `platform.EnsurePrivateDir` rules and an atomic replace) and read **live**:
-  every gate check stats it and re-reads it when the size or mtime changes.
+  every gate check opens it with current read permission and validates the
+  descriptor, then re-reads it when the identity, size or mtime changes.
   So `citadel local config uploads off` takes effect on the next check
   without restarting the agent app. A missing file means on. A file that
   exists but cannot be read or parsed means **off**, and `local doctor` and
   the viewer say why.
+  The dedicated subdirectory has its own protected owner-only permissions;
+  the legacy state container may retain its inherited Windows ACL, but may not
+  grant an unprivileged other user write access. An untrusted existing
+  directory fails closed even when the file is missing. The wired owner
+  defaults on when no file exists; an unwired service policy always denies.
+  Ancestors above the local state directory are not trust-checked, and a
+  symlink to a directory is allowed there when checking for absent settings.
+  On Windows, atomic replacement retries sharing, lock and access-denied
+  errors at most ten times, with at most 225 ms total backoff. Other errors
+  return immediately; exhausted retries report failure, never false success.
 
 **Command.** `citadel local config uploads on|off|status`. `uploads` is a
 reserved word in `local config` and can never be a harness name. It writes

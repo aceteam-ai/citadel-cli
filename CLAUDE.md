@@ -31,6 +31,14 @@ So, when adding to this file:
 
 ## Project Overview
 
+`localcobrowse.UploadSettings` owns local mode's upload opt-out: environment
+captured at owner construction, live bounded settings reads, and fail-closed
+permissions/parsing. `Service.CheckUploads` and `Service.UploadsAllowed` are the
+shared operation and dispatch gates for later upload slices. The reserved
+`local config uploads` command never enters harness-config code. This setting
+does not enable local staging, chooser interception or attachment by itself;
+see Q8 in `docs/local-cobrowse-upload-and-edit.md`.
+
 `mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
 descriptor acquisition: it checks a no-follow leaf pin before any readable
 leaf open, and fails closed if the verified procfs FD route is unavailable.

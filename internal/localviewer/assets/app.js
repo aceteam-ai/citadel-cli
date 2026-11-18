@@ -58,6 +58,8 @@
   }
 
   function render() {
+    const uploads = state.uploads;
+    $("uploads-state").textContent = uploads ? uploads.reason + (uploads.warning ? ". " + uploads.warning : "") : "";
     $("agent-line").textContent = state.agent ? "Connected agent: " + state.agent : "No agent connected";
     const sessions = state.sessions || [];
     const tabs = $("tabs");

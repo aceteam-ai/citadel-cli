@@ -55,7 +55,7 @@ func (m *CobrowseSessionManager) filesPermitted() bool {
 
 // HumanFileAttachSupported reports whether this manager can offer the viewer a
 // file attach: it must have a Files permission source and must not track pages
-// (local mode has neither a chooser watcher nor a Files permission).
+// (local mode's tracked chooser and owner-attach path are separate slices).
 func (m *CobrowseSessionManager) HumanFileAttachSupported() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
