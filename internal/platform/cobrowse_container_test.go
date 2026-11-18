@@ -22,19 +22,21 @@ const (
 )
 
 type fakeEngine struct {
-	mu          sync.Mutex
-	calls       [][]string
-	failOn      string // first arg (or "network create") that errors
-	members     string // output of ps --filter network=
-	networks    string // inspect: networks json
-	psOut       string
-	netLsOut    string
-	inContext   string // in-container ws
-	notRunning  bool
-	owner       string // owner label the fake containers carry
-	imageLabels string // image inspect output; default "1|1"
-	inspectFail bool   // inspect errors
-	runOut      string // output returned together with a failing run
+	mu             sync.Mutex
+	calls          [][]string
+	failOn         string // first arg (or "network create") that errors
+	members        string // output of ps --filter network=
+	networks       string // inspect: networks json
+	psOut          string
+	netLsOut       string
+	inContext      string // in-container ws
+	notRunning     bool
+	owner          string // owner label the fake containers carry
+	imageLabels    string // image inspect output; default "1|1"
+	inspectFail    bool   // inspect errors
+	runOut         string // output returned together with a failing run
+	foreignPurpose bool   // containers carry purpose=meeting
+	foreignNet     bool   // networks carry another owner
 }
 
 func (f *fakeEngine) exec(_ context.Context, args ...string) (string, error) {
@@ -76,8 +78,8 @@ func (f *fakeEngine) exec(_ context.Context, args ...string) (string, error) {
 		if nets == "" {
 			nets = `{"` + browserruntime.NetworkName(testSID) + `":{}}`
 		}
-		return fmt.Sprintf(`{"Id":%q,"State":{"Running":%v,"StartedAt":"t0"},"Config":{"Labels":{%q:"1",%q:%q,%q:%q}},"NetworkSettings":{"Networks":%s}}`,
-			testCID, !f.notRunning, browserruntime.LabelRuntime, browserruntime.LabelSession, testSID, browserruntime.LabelOwner, f.owner, nets), nil
+		return fmt.Sprintf(`{"Id":%q,"State":{"Running":%v,"StartedAt":"t0"},"Config":{"Labels":{%q:"1",%q:%q,%q:%q,%q:%q}},"NetworkSettings":{"Networks":%s}}`,
+			testCID, !f.notRunning, browserruntime.LabelRuntime, browserruntime.LabelSession, testSID, browserruntime.LabelOwner, f.owner, browserruntime.LabelPurpose, f.purpose(), nets), nil
 	case "port":
 		if strings.HasPrefix(args[2], "8102") {
 			return "127.0.0.1:41000\n", nil
@@ -92,10 +94,26 @@ func (f *fakeEngine) exec(_ context.Context, args ...string) (string, error) {
 		return f.psOut, nil
 	case "exec":
 		return `{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/` + f.inContext + `"}`, nil
+	case "network inspect":
+		name := args[len(args)-1]
+		owner := f.owner
+		if f.foreignNet {
+			owner = "someoneelse"
+		}
+		return fmt.Sprintf(`{%q:"1",%q:%q,%q:"cobrowse",%q:%q}`, browserruntime.LabelRuntime,
+			browserruntime.LabelSession, strings.TrimPrefix(name, browserruntime.NetworkName("")),
+			browserruntime.LabelPurpose, browserruntime.LabelOwner, owner), nil
 	case "network ls":
 		return f.netLsOut, nil
 	}
 	return "", nil
+}
+
+func (f *fakeEngine) purpose() string {
+	if f.foreignPurpose {
+		return "meeting"
+	}
+	return "cobrowse"
 }
 
 func (f *fakeEngine) has(prefix ...string) int {
@@ -312,6 +330,7 @@ func TestContainerSweepScopedAndShapeChecked(t *testing.T) {
 			browserruntime.NetworkName("evil") + "\nbridge\n",
 	}
 	r := newTestRunner(f, false)
+	f.owner = r.ownerFor("/x")
 	r.sweepContainers("/x", func(id string) bool { return id == testSID })
 	if f.has("rm", "-f", dead) != 1 || f.has("rm", "-f", testCID) != 0 || f.has("rm", "-f", other) != 0 {
 		t.Fatalf("container sweep: %v", f.calls)
@@ -387,11 +406,11 @@ func TestDiscardOnlyRemovesLabelledContainer(t *testing.T) {
 	r := adoptRunner(f)
 	rec := goodRecord()
 	rec.ID = "cb-ffffffffffffffff" // labels say testSID: not ours to remove
-	r.discardContainer(rec)
+	r.discardContainer(rec, "/x/"+rec.ID)
 	if f.has("rm", "-f") != 0 {
 		t.Fatal("must not remove a container whose labels name another session")
 	}
-	r.discardContainer(goodRecord())
+	r.discardContainer(goodRecord(), "/x/"+testSID)
 	if f.has("rm", "-f", testCID) != 1 {
 		t.Fatal("expected removal")
 	}
@@ -791,5 +810,58 @@ func TestRewriteBrowserWSIsNoopForHostEndpoint(t *testing.T) {
 	got, err := rewriteLoopbackWSPort("ws://127.0.0.1:9222/devtools/browser/X", 41001)
 	if err != nil || got != "ws://127.0.0.1:41001/devtools/browser/X" {
 		t.Fatal(got, err)
+	}
+}
+
+func TestDiscardRequiresOwnerPurposeAndNetworkLabels(t *testing.T) {
+	for name, f := range map[string]*fakeEngine{
+		"foreign owner":   {owner: "someoneelse", foreignNet: true},
+		"foreign purpose": {foreignPurpose: true, foreignNet: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newTestRunner(f, false)
+			if f.owner == "" {
+				f.owner = r.ownerFor("/x")
+			}
+			r.discardContainer(goodRecord(), "/x/"+testSID)
+			if f.has("rm") != 0 || f.has("network", "rm") != 0 {
+				t.Fatalf("must not remove another owner's or purpose's objects: %v", f.calls)
+			}
+		})
+	}
+	// Our container but a foreign-labelled network: only the container goes.
+	f := &fakeEngine{foreignNet: true}
+	r := adoptRunner(f)
+	r.discardContainer(goodRecord(), "/x/"+testSID)
+	if f.has("rm", "-f", testCID) != 1 || f.has("network", "rm") != 0 {
+		t.Fatalf("network removal needs its own labels: %v", f.calls)
+	}
+}
+
+func TestRecoverContainerOwnedByAnotherWorkerIsUntouched(t *testing.T) {
+	for name, mod := range map[string]func(*fakeEngine){
+		"owner":   func(f *fakeEngine) { f.owner = "someoneelse"; f.foreignNet = true },
+		"purpose": func(f *fakeEngine) { f.foreignPurpose = true; f.foreignNet = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeEngine{}
+			m, reg, restore := containerManager(t, f)
+			defer restore()
+			if currentOwnerIdentity() == 0 {
+				t.Skip("needs /proc")
+			}
+			mod(f)
+			writeContainerRecord(t, m, reg, nil)
+			m.recoverSessions()
+			if f.has("rm") != 0 || f.has("network", "rm") != 0 {
+				t.Fatalf("recovery removed another worker's container or network: %v", f.calls)
+			}
+			if rec, _ := loadRecord(reg, testSID); rec.State != RecordLive {
+				t.Fatalf("record must be left as is, got %q", rec.State)
+			}
+			if len(m.sessions) != 0 {
+				t.Fatal("must not adopt it")
+			}
+		})
 	}
 }

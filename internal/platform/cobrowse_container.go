@@ -418,8 +418,7 @@ func (r *containerRunner) cleanupFailedLaunch(id, cid, owner, network string) {
 	defer cancel()
 	if cid == "" {
 		if d, err := r.inspect(ctx, containerName(id)); err == nil {
-			l := d.Config.Labels
-			if l[browserruntime.LabelRuntime] == "1" && l[browserruntime.LabelSession] == id && l[browserruntime.LabelOwner] == owner && containerIDRe.MatchString(d.ID) {
+			if r.ownsLabels(d.Config.Labels, id, owner) && containerIDRe.MatchString(d.ID) {
 				cid = d.ID
 			}
 		}
@@ -696,9 +695,13 @@ func (r *containerRunner) adoptContainer(rec sessionRecord, sessionDir string) (
 		return nil, errors.New("container was restarted since the record")
 	}
 	l := d.Config.Labels
-	if l[browserruntime.LabelRuntime] != "1" || l[browserruntime.LabelSession] != rec.ID ||
-		l[browserruntime.LabelOwner] != r.ownerFor(filepath.Dir(sessionDir)) {
+	if l[browserruntime.LabelRuntime] != "1" || l[browserruntime.LabelSession] != rec.ID {
 		return nil, errors.New("container labels do not match the session")
+	}
+	// Another worker's (or another purpose's) container is not ours to adopt or
+	// to touch: a refusal here must never lead to a removal.
+	if l[browserruntime.LabelOwner] != r.ownerFor(filepath.Dir(sessionDir)) || l[browserruntime.LabelPurpose] != "cobrowse" {
+		return nil, fmt.Errorf("%w: container belongs to another owner or purpose", errRecordNotOurs)
 	}
 	if err := r.checkIsolation(ctx, rec.ContainerID, rec.ID); err != nil {
 		return nil, err
@@ -721,18 +724,44 @@ func (r *containerRunner) adoptContainer(rec sessionRecord, sessionDir string) (
 }
 
 // discardContainer removes what a record that failed verification names, but
-// only the container whose labels still say it is this session's.
-func (r *containerRunner) discardContainer(rec sessionRecord) {
+// only the container whose labels prove it is this worker's cobrowse session
+// (runtime, session, owner and purpose), and only a network whose own labels
+// match. Anything else is left alone.
+func (r *containerRunner) discardContainer(rec sessionRecord, sessionDir string) {
 	ctx, cancel := context.WithTimeout(context.Background(), containerEngineCallLimit)
 	defer cancel()
+	owner := r.ownerFor(filepath.Dir(sessionDir))
 	cid := ""
 	if containerIDRe.MatchString(rec.ContainerID) {
-		if d, err := r.inspect(ctx, rec.ContainerID); err == nil && d.ID == rec.ContainerID &&
-			d.Config.Labels[browserruntime.LabelRuntime] == "1" && d.Config.Labels[browserruntime.LabelSession] == rec.ID {
+		if d, err := r.inspect(ctx, rec.ContainerID); err == nil && d.ID == rec.ContainerID && r.ownsLabels(d.Config.Labels, rec.ID, owner) {
 			cid = rec.ContainerID
 		}
 	}
-	_ = r.removeSession(cid, browserruntime.NetworkName(rec.ID))
+	network := browserruntime.NetworkName(rec.ID)
+	if !r.networkOwned(ctx, network, rec.ID, owner) {
+		network = ""
+	}
+	_ = r.removeSession(cid, network)
+}
+
+// ownsLabels reports whether labels mark an object as this worker's cobrowse
+// session id.
+func (r *containerRunner) ownsLabels(l map[string]string, id, owner string) bool {
+	return l[browserruntime.LabelRuntime] == "1" && l[browserruntime.LabelSession] == id &&
+		l[browserruntime.LabelPurpose] == "cobrowse" && owner != "" && l[browserruntime.LabelOwner] == owner
+}
+
+// networkOwned inspects a network's own labels before it may be removed.
+func (r *containerRunner) networkOwned(ctx context.Context, name, id, owner string) bool {
+	out, err := r.call(ctx, "network", "inspect", "--format", "{{json .Labels}}", name)
+	if err != nil {
+		return false
+	}
+	var labels map[string]string
+	if json.Unmarshal([]byte(strings.TrimSpace(out)), &labels) != nil {
+		return false
+	}
+	return r.ownsLabels(labels, id, owner)
 }
 
 // sweepContainers removes browser-runtime containers and networks of this
@@ -777,7 +806,7 @@ func (r *containerRunner) sweepContainers(baseDir string, live func(id string) b
 	}
 	for _, name := range strings.Fields(out) {
 		id := strings.TrimPrefix(name, browserruntime.NetworkName(""))
-		if id == name || !sessionIDPattern.MatchString(id) || live(id) {
+		if id == name || !sessionIDPattern.MatchString(id) || live(id) || !r.networkOwned(ctx, name, id, owner) {
 			continue
 		}
 		_ = r.removeSession("", name)
@@ -849,7 +878,7 @@ type containerSweeper interface {
 
 type containerAdopter interface {
 	adoptContainer(rec sessionRecord, dir string) (*cobrowseProc, error)
-	discardContainer(rec sessionRecord)
+	discardContainer(rec sessionRecord, sessionDir string)
 }
 
 // selectingRunner runs the node-wide manager's sessions in containers while the
@@ -944,9 +973,9 @@ func (s *selectingRunner) adoptContainer(rec sessionRecord, dir string) (*cobrow
 	return c.adoptContainer(rec, dir)
 }
 
-func (s *selectingRunner) discardContainer(rec sessionRecord) {
+func (s *selectingRunner) discardContainer(rec sessionRecord, sessionDir string) {
 	if c := s.cr(); c != nil {
-		c.discardContainer(rec)
+		c.discardContainer(rec, sessionDir)
 	}
 }
 
@@ -987,7 +1016,7 @@ func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir
 	if err != nil {
 		log.Printf("[cobrowse] not adopting container session %s: %v", rec.ID, err)
 		if ad != nil {
-			ad.discardContainer(rec)
+			ad.discardContainer(rec, dir)
 		}
 		rec.State = RecordExpired
 		rec.EndedReason, rec.EndedDetail = endedReasonLost, ""
