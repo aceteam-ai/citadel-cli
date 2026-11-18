@@ -214,6 +214,18 @@ func TestContainerLaunchOrderAndContract(t *testing.T) {
 	if runArgs[len(runArgs)-1] != testImage {
 		t.Fatal("image must be last")
 	}
+	// The pinned seccomp profile is written into the session dir and handed to
+	// the engine; the renderer sandbox cannot start without it (#1788).
+	seccompFile := filepath.Join(sess, browserruntime.SeccompFileName)
+	if !strings.Contains(rj, "--security-opt seccomp="+seccompFile) {
+		t.Errorf("run args must carry the pinned seccomp profile: %v", runArgs)
+	}
+	if b, err := os.ReadFile(seccompFile); err != nil || string(b) != string(browserruntime.SeccompProfileJSON) {
+		t.Errorf("seccomp file must hold the pinned profile (err=%v)", err)
+	}
+	if !strings.Contains(rj, "MEETING_BROWSER=chromium") {
+		t.Errorf("browser kind missing: %v", runArgs)
+	}
 	if err := p.stop(); err != nil {
 		t.Fatal(err)
 	}

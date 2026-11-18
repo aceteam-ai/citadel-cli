@@ -330,8 +330,17 @@ func (r *containerRunner) Launch(sessionDir, startURL string, lo LaunchOptions) 
 	}
 	pruneProfileCaches(mountDir, int64(r.limits.DiskCacheMB)*1024*1024)
 
+	// The pinned seccomp profile lets Chromium's namespace sandbox start (#1788).
+	// It lives in the per-session dir, so teardown and the orphan sweep remove it;
+	// the engine CLI reads it at `run` time.
+	_ = os.Remove(filepath.Join(sessionDir, browserruntime.SeccompFileName)) // a retry in the same dir
+	seccompPath, err := browserruntime.WriteSeccompProfile(sessionDir)
+	if err != nil {
+		return nil, err
+	}
 	owner := r.ownerFor(filepath.Dir(sessionDir))
 	spec := browserruntime.RunSpec{
+		SeccompProfile: seccompPath, Browser: browserruntime.DefaultBrowser,
 		Image: r.image, Network: browserruntime.NetworkName(id), SessionID: id,
 		Purpose: "cobrowse", UID: r.uid, GID: r.gid, ProfileDir: mountDir,
 		StageDir: stageDir, Name: containerName(id), Owner: owner,

@@ -60,6 +60,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY meetingd.py /app/meetingd.py
+COPY sandbox_check.py /app/sandbox_check.py
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 COPY supervisord-nonroot.conf /etc/supervisor/supervisord-nonroot.conf
 COPY citadel.pa /etc/pulse/citadel.pa
@@ -80,8 +81,17 @@ RUN set -e; \
     fi; \
     mkdir -p /etc/browser-runtime; \
     echo "$major" > /etc/browser-runtime/chromium-major
+# Renderer sandbox marker (aceteam-ai/citadel-cli#1788). Empty unless the build
+# passes SANDBOX_VERIFIED=1, which a build step may do ONLY after
+#   docker run ... --security-opt seccomp=<internal/browserruntime/seccomp.json> \
+#     --entrypoint python3 <image> /app/meetingd.py --sandbox-selfcheck
+# exits 0 (Chromium started and /proc shows seccomp-filtered renderers in their
+# own user namespace). Nodes refuse an image without the marker, and meetingd
+# re-verifies every session, so an image whose sandbox does not work is unusable.
+ARG SANDBOX_VERIFIED=""
 LABEL aceteam.browser-runtime.contract="1" \
       aceteam.browser-runtime.chromium-major="${CHROMIUM_MAJOR}" \
+      aceteam.browser-runtime.sandbox="${SANDBOX_VERIFIED}" \
       org.opencontainers.image.source="https://github.com/aceteam-ai/citadel-cli" \
       org.opencontainers.image.title="browser-runtime"
 

@@ -38,6 +38,10 @@ services:
       # that aren't listed here, so this passthrough is what makes the opt-in reach
       # meetingd.
       - MEETING_MIC_REQUIRED=${MEETING_MIC_REQUIRED:-}
+      # Legacy compose module: runs under Docker's default seccomp profile, which
+      # blocks Chromium's namespace sandbox, so it keeps --no-sandbox explicitly.
+      # The browser-runtime run contract (internal/browserruntime) never sets this.
+      - MEETING_ALLOW_NO_SANDBOX=1
       # Run the in-container `bot` user as the NODE OWNER's UID/GID so the recorded
       # WAV (written into the /workspace mount) is owned by the node process that
       # reads it back for transcription — no cross-UID perms fixup. citadel injects

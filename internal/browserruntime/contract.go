@@ -9,8 +9,10 @@
 package browserruntime
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -44,11 +46,15 @@ const (
 	LabelPurpose = "aceteam.browser-runtime.purpose" // meeting|huddle|cobrowse|bot_sign_in|bot_probe
 	LabelOwner   = "aceteam.browser-runtime.owner"   // who created the container (see RunSpec.Owner)
 
-	// ImageLabelSandbox marks an image whose renderer runs sandboxed (set by
-	// #1788). Node co-browse refuses an image without SandboxMarker: the contract-1
-	// image runs Chromium with --no-sandbox.
+	// ImageLabelSandbox marks an image whose renderer runs sandboxed (#1788).
+	// Node co-browse refuses an image without SandboxMarker. The image build sets
+	// it only after the in-image self-check (meetingd.py --sandbox-selfcheck) passes
+	// under SeccompProfileJSON; see the CLAUDE.md paragraph on #1788.
 	ImageLabelSandbox = "aceteam.browser-runtime.sandbox"
 	SandboxMarker     = "1"
+
+	// LabelBrowser records which browser kind the container runs.
+	LabelBrowser = "aceteam.browser-runtime.browser"
 
 	// StageMountPath is where a session's staging dir is bound read-only.
 	StageMountPath = "/citadel-stage"
@@ -59,6 +65,59 @@ const (
 	ContractVersion          = "1"
 	ChromiumMajorFileInImage = "/etc/browser-runtime/chromium-major"
 )
+
+// Browser kinds. Adding a kind is one entry here plus the image's binary
+// lookup (meetingd.py SUPPORTED_BROWSERS); nothing else in the contract changes.
+// Only stock Chromium is offered: CloakBrowser is deferred because its binary
+// license forbids redistributing it in a published image (citadel-cli#1788).
+const BrowserChromium = "chromium"
+
+var browsers = map[string]bool{BrowserChromium: true}
+
+// DefaultBrowser is used when RunSpec.Browser is empty.
+const DefaultBrowser = BrowserChromium
+
+// SeccompProfileJSON is the seccomp profile every session container runs under.
+// It is Docker's default profile (moby docker-v29.10.0, vendor/github.com/moby/
+// profiles/seccomp/default.json, upstream sha256
+// 6416b47770785a41ac59073cdc77d9fe98517df2799dc83ef207e622de3053f6) plus ONE
+// appended rule allowing clone, unshare and chroot without CAP_SYS_ADMIN, which
+// is what Chromium's user-namespace sandbox needs. Seccomp alone is enough on a
+// kernel that permits unprivileged user namespaces; no --privileged, no extra
+// capability and no weaker AppArmor/SELinux setting is used. A host that
+// forbids unprivileged user namespaces (sysctl or LSM) cannot run the sandbox,
+// and the in-container check then refuses the session.
+//
+//go:embed seccomp.json
+var SeccompProfileJSON []byte
+
+// SeccompProfileSHA256 pins SeccompProfileJSON; TestSeccompProfilePinned fails
+// when the file changes without this constant (and the review it implies).
+const SeccompProfileSHA256 = "43b59f4354d96b6a5c3961334c943b90cee26494e6387d70f0298639f202e7e8"
+
+// SeccompFileName is the file WriteSeccompProfile creates.
+const SeccompFileName = "browser-runtime-seccomp.json"
+
+// WriteSeccompProfile writes the pinned profile into dir (an existing plain
+// directory the caller owns) and returns its absolute path for RunSpec. The
+// engine CLI reads the file at `run` time. The file is created exclusively, so
+// a pre-planted file or symlink is an error rather than something we follow.
+func WriteSeccompProfile(dir string) (string, error) {
+	path := filepath.Join(dir, SeccompFileName)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("browserruntime: write seccomp profile: %w", err)
+	}
+	_, werr := f.Write(SeccompProfileJSON)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("browserruntime: write seccomp profile: %w", werr)
+	}
+	return path, nil
+}
 
 var (
 	sessionIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
@@ -95,6 +154,13 @@ type RunSpec struct {
 	// WorkspaceMeetingsDir is an optional existing, clean, absolute host dir
 	// mounted rw at /workspace/meetings.
 	WorkspaceMeetingsDir string
+	// SeccompProfile is the absolute path of the pinned profile (see
+	// WriteSeccompProfile); required, because the renderer sandbox cannot start
+	// under the engine's default profile and the image refuses to run unsandboxed.
+	SeccompProfile string
+	// Browser selects the browser kind; empty means DefaultBrowser. Anything not
+	// in the browsers set is refused.
+	Browser string
 	// Name is the optional container name (--name).
 	Name string
 	// Owner is stamped as LabelOwner so a sweep only touches containers this
@@ -136,6 +202,16 @@ func (s RunSpec) Args() ([]string, error) {
 	if s.UID <= 0 || s.GID <= 0 {
 		return nil, errors.New("browserruntime: UID and GID must be non-zero (chromium refuses root)")
 	}
+	browser := s.Browser
+	if browser == "" {
+		browser = DefaultBrowser
+	}
+	if !browsers[browser] {
+		return nil, fmt.Errorf("browserruntime: unsupported browser %q (only %q is available)", s.Browser, BrowserChromium)
+	}
+	if p := s.SeccompProfile; p == "" || !filepath.IsAbs(p) || filepath.Clean(p) != p || strings.ContainsAny(p, ",=\n\r\"") {
+		return nil, fmt.Errorf("browserruntime: seccomp profile path %q must be absolute, clean and free of ',', '=' and newlines", p)
+	}
 	for _, d := range []string{s.ProfileDir, s.WorkspaceMeetingsDir, s.StageDir} {
 		if d == "" {
 			continue
@@ -163,6 +239,7 @@ func (s RunSpec) Args() ([]string, error) {
 		"--network", s.Network,
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
+		"--security-opt", "seccomp=" + s.SeccompProfile,
 		"--read-only",
 		"--tmpfs", "/run:rw,size=64m,mode=0700," + owner,
 		"--tmpfs", "/tmp:rw,size=512m,mode=1777," + owner,
@@ -176,6 +253,8 @@ func (s RunSpec) Args() ([]string, error) {
 		"--label", LabelRuntime + "=1",
 		"--label", LabelSession + "=" + s.SessionID,
 		"--label", LabelPurpose + "=" + s.Purpose,
+		"--label", LabelBrowser + "=" + browser,
+		"-e", "MEETING_BROWSER=" + browser,
 	}
 	if s.Name != "" {
 		args = append(args, "--name", s.Name)

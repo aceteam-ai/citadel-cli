@@ -56,11 +56,11 @@ def test_chrome_args_load_bearing_flags():
 
 def test_chrome_args_container_delta():
     """CDP binds loopback exactly like the host builder (exposure is done by socat,
-    not a chrome flag). The one documented deviation is --no-sandbox (the setuid
-    sandbox is unavailable in the hardened container)."""
+    not a chrome flag). The renderer sandbox stays on: no --no-sandbox unless the
+    legacy compose module opts out explicitly."""
     args = meetingd.build_chrome_args(cdp_port=9222, profile_dir="/profile")
     assert "--remote-debugging-address=127.0.0.1" in args
-    assert "--no-sandbox" in args
+    assert "--no-sandbox" not in args
     # A non-loopback bind would be silently refused by modern Chromium.
     assert "--remote-debugging-address=0.0.0.0" not in args
 
@@ -787,3 +787,13 @@ def test_chrome_args_disk_cache_bound_from_env(monkeypatch):
     assert not any(a.startswith("--disk-cache-size") for a in meetingd.build_chrome_args(9222, "/profile"))
     monkeypatch.setenv("MEETING_DISK_CACHE_MB", "256")
     assert f"--disk-cache-size={256 * 1024 * 1024}" in meetingd.build_chrome_args(9222, "/profile")
+
+
+def test_no_sandbox_only_with_explicit_opt_out(monkeypatch):
+    monkeypatch.setattr(meetingd, "ALLOW_NO_SANDBOX", True)
+    assert "--no-sandbox" in meetingd.build_chrome_args(9222, "/profile")
+
+
+def test_unsupported_browser_finds_no_binary(monkeypatch):
+    monkeypatch.setattr(meetingd, "BROWSER_KIND", "cloakbrowser")
+    assert meetingd._browser_binary() is None
