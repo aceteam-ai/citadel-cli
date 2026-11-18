@@ -1,6 +1,6 @@
 # VM console through a proxy node
 
-Status: design only. No code ships with this document.
+Status: design only, with all decisions settled. No code ships with this document.
 
 Refs #1601. The platform half is aceteam-ai/aceteam#13652 (the `vm_console_*`
 MCP tools and the `node:vm_console` grant). aceteam-ai/aceteam#14122 (flows
@@ -14,79 +14,81 @@ VE API. The first proxy is the operator's GPU workstation node, which runs a
 user-service worker. The earlier transport (`qm` screendump and sendkey over a
 root worker) is withdrawn.
 
-## Open decisions for Jason
+## Decisions (Jason, 2026-11-17)
 
-Each item gives the recommendation first, then the alternatives. The sections
-below explain each one in detail.
+Jason settled all nine open questions on PR #1753. Each went as the design
+first recommended, and the rejected alternatives are kept here.
 
-1. **Where the PVE token secret lives on the proxy node.** Recommendation: an
-   owner-only file under the node config dir
-   (`<node config dir>/vm-console/secrets/<alias>.token`, mode 0600, in a
-   0700 dir). The loader refuses it if group or other can read it, or if
-   another user owns it. This is how the node already keeps its device token.
-   Alternatives: seal it in `nodevault` and unseal it with the passcode
-   presented in each job (rejected: nodevault has no unattended unlock, a
-   6-digit master PIN is below `nodevault.AtRestThresholdBits`, so
+1. **The token secret lives in an owner-only file** under the node config
+   dir (`<node config dir>/vm-console/secrets/<alias>.token`, mode 0600, in
+   a 0700 dir). The loader refuses it if group or other can read it, or if
+   another user owns it. The node already keeps its device token this way.
+   Rejected alternatives: sealing it in `nodevault` and unsealing it with
+   the passcode presented in each job (nodevault has no unattended unlock, a
+   6-digit master PIN is below `nodevault.AtRestThresholdBits` so
    `UnlockAtRest` refuses it, and every job would run Argon2id); an OS
-   keyring such as libsecret or `systemd-creds` (rejected for v1: a headless
-   user unit has no reliable keyring, and it varies by OS).
-2. **How the PVE endpoint's TLS is pinned.** Recommendation: pin the
-   cluster's root CA (the PVE root CA file the operator copies from the
-   host), with hostname verification. That pin survives node certificate
-   renewal. Alternatives: pin the leaf certificate's SHA-256 fingerprint
-   (easy to copy from the PVE UI, but renewal breaks it, and then the node
-   refuses until the operator re-pins); system roots, for a host that serves
-   an ACME certificate. All three are offered, and the CA pin is the
-   documented default. Skipping verification is never offered.
-3. **Does the node passcode gate VM console jobs?** Recommendation: yes,
-   with the same semantics as the desktop gate (`jobs.DesktopGate`). All
-   three job types are checked when a passcode or master PIN is set, and they
-   share the node's wrong-passcode throttle. The cost: a proxy node with a
-   passcode set (likely, if Shell or Desktop is on there) needs the passcode
-   in every VM console job, unattended #14122 flow runs included. So the
-   platform must either hold the passcode or ask a human for each run.
-   Alternatives: require a configured passcode for keys and pointer and
-   refuse when none is set (stricter, but different from every other
-   surface); no passcode, relying on the permission, the allowlist and the
-   platform grant, which leaves unattended flows simple.
-4. **Can the platform turn the permission on remotely?** Recommendation: no.
-   `vm_console` is enabled only by a local command on the proxy node.
-   `APPLY_DEVICE_CONFIG` and the `citadel_set_*_permission` tools can turn it
-   off but never on. Alternative: a remote toggle like Desktop and Files.
-   Turning the permission on alone gives nothing, because the token and the
-   allowlist are local. Refusing remote enable keeps a compromised platform
-   from re-arming a surface the operator switched off.
-5. **How narrow the `node:vm_console` grant is.** Recommendation: one grant
-   per proxy node, as #13652 already specifies. The node-side allowlist
-   bounds which VMs it reaches, and every audit row carries the host alias
-   and vmid. Alternative: a grant scoped to (proxy node, host alias, vmid),
-   which needs a richer grant scope string on the platform.
-6. **Typing text.** Recommendation: no `VM_CONSOLE_TYPE` job in v1.
-   `VM_CONSOLE_KEYS` takes a bounded sequence of chords, and the node owns
-   pacing. A platform `vm_console_type` tool may compile text into a
-   sequence after its secret-shaped input check (#14122 item 4).
-   Alternatives: a dedicated type job on the node (it would duplicate the
-   platform's secret check); a single chord per job (slow, and pacing would
-   fall back to every caller).
-7. **How an absolute pointer is detected.** Recommendation: in the RFB
-   session itself. QEMU's pointer-type-change pseudo-encoding reports
-   whether the guest's active pointer is absolute. The node refuses the
-   pointer job unless the report says absolute. The token keeps `VM.Console`
-   only. Alternative: add `VM.Audit` so the node can read the VM config's
-   `tablet` flag (rejected: it widens the token to every config field, and
-   the flag says nothing about whether the guest driver is active).
-8. **Session lifetime.** Recommendation: one `vncproxy` session per job,
-   opened and closed inside the handler. Alternative: hold a session per VM
-   for a short idle time to save the roughly one second each connect takes.
-   A held session keeps a live console socket on the proxy between jobs,
-   which complicates revocation and the per-VM lock.
-9. **How the platform learns what a proxy node offers.** Recommendation: the
-   heartbeat advertises each host alias and its allowlisted vmids, with a
-   view-only flag per VM. The target is the triple (proxy node, host alias,
-   vmid). Alternative: a platform-side hypervisor registry, which needs DDL
-   that #13652 rules out.
+   keyring such as libsecret or `systemd-creds` (a headless user unit has no
+   reliable keyring, and keyrings vary by OS).
+2. **TLS is pinned to the cluster root CA by default**, with hostname
+   verification. That pin survives node certificate renewal. A leaf SHA-256
+   fingerprint pin and system roots (for an ACME certificate) are also
+   offered. Skipping verification never is. The fingerprint pin breaks on
+   renewal, and the node then refuses until the operator re-pins.
+3. **The node passcode gates VM console jobs** with the desktop gate's
+   semantics (`jobs.DesktopGate`). All three job types are checked when a
+   passcode or master PIN is set, and they share the node's wrong-passcode
+   throttle. As a consequence, a proxy node with a passcode set needs the
+   passcode in every VM console job, unattended #14122 flow runs included.
+   The platform must either hold it or ask a human for each run. Rejected
+   alternatives: requiring a configured passcode for keys and pointer;
+   no passcode at all.
+4. **The permission is enabled only locally.** `vm_console` is turned on
+   only by a local command on the proxy node. `APPLY_DEVICE_CONFIG` and the
+   `citadel_set_*_permission` tools can turn it off but never on, so a
+   compromised platform cannot re-arm a surface the operator switched off.
+   Rejected alternative: a remote toggle like Desktop and Files.
+5. **There is one `node:vm_console` grant per proxy node**, as #13652
+   specifies. The node allowlist bounds which VMs it reaches, and every
+   audit row names the host alias and vmid. Rejected alternative: a grant
+   scoped to (proxy node, host alias, vmid).
+6. **There is no `VM_CONSOLE_TYPE` job in v1.** `VM_CONSOLE_KEYS` takes a
+   bounded sequence of chords, and the node owns pacing. The platform's
+   tool compiles text into a sequence after its secret-shaped input check
+   (#14122 item 4). Rejected alternatives: a dedicated type job on the node,
+   which would duplicate the platform's secret check; a single chord per
+   job.
+7. **The absolute pointer is detected in the RFB session**, through QEMU's
+   pointer-type-change pseudo-encoding (-257). The node refuses a pointer
+   job unless the report says absolute. The token keeps `VM.Console` only.
+   Rejected alternative: adding `VM.Audit` so the node can read the VM
+   config's `tablet` flag. That widens the token to every config field, and
+   the flag says nothing about whether the guest driver is active.
+8. **Each job opens and closes its own `vncproxy` session** inside the
+   handler. Rejected alternative: holding a session per VM for a short idle
+   time. That keeps a live console socket on the proxy between jobs and
+   complicates revocation and the per-VM lock.
+9. **The heartbeat advertises host aliases and allowlisted VMs**, with a
+   view-only flag per VM. The platform targets the triple (proxy node, host
+   alias, vmid). Rejected alternative: a platform-side hypervisor registry,
+   which needs DDL that #13652 rules out.
 
-## Decision recap (Jason, 2026-11-17)
+## Build process
+
+The codex lane builds the slices in section 6 as stacked PRs. Under Jason's
+standing rule:
+
+- A same-repo child slice branches off its parent slice's branch, not off
+  main.
+- Before the parent merges, the child is retargeted to main. Squash-merging a
+  parent under a child that is still based on it breaks the stack.
+- Slice branches use `feat/**`-style names (for example
+  `feat/1601-s1-rfb-client`), because CI only runs on those base-branch
+  patterns. A PR whose base is not a matching branch gets no CI.
+
+Each slice gets its own review at its own head, with the tier given in
+section 6. Approval of this design does not cover any slice.
+
+## Decision recap from the issue (Jason, 2026-11-17)
 
 These are fixed and not reopened here.
 
@@ -258,7 +260,7 @@ shell must resolve the same files (see the `ConfigDir()` note in CLAUDE.md).
 <node config dir>/vm-console/            0700
 <node config dir>/vm-console/hosts.yaml  0600   no secrets
 <node config dir>/vm-console/secrets/    0700
-<node config dir>/vm-console/secrets/<alias>.token  0600  token secret only
+<node config dir>/vm-console/secrets/<alias>.token  0600  the credential record
 ```
 
 `hosts.yaml`:
@@ -271,8 +273,6 @@ hosts:
       mode: ca                     # ca | fingerprint | system
       ca_file: vm-console/lab-pve-ca.pem
       server_name: ""              # optional SNI and verify name override
-    token_id: citadel-console@pve!workstation
-    token_expires: 2027-02-15      # informational; status warns 14 days ahead
     default_pve_node: <pve-node>
     vms:
       - vmid: 108
@@ -281,16 +281,28 @@ hosts:
         input: true                # false = screenshot only
 ```
 
+The token file is one credential record. A PVE token secret is bound to its
+full token id, so the id and the secret are stored, swapped and read
+together, never in separate files:
+
+```yaml
+token_id: citadel-console@pve!workstation-2
+secret: <token secret>
+expires: 2027-02-15    # informational; status warns 14 days ahead
+```
+
 The loader (`vmconsole.LoadConfig`, new) is strict. It refuses the whole file
 if it does not parse, has an unknown key, has a duplicate alias or a
 duplicate vmid within one alias, or has a URL that is not `https` with a host
 and optional port. A refused file means no VM is reachable, never "last good
-config". The token file loader refuses a file that group or other can read
-or write, or that another user owns, or a symlink. It reads at most 256
-bytes and trims one trailing newline.
+config". The credential loader refuses a file that group or other can read
+or write, or that another user owns, or a symlink. It reads at most 1 KiB,
+requires both `token_id` and `secret`, and refuses unknown keys.
 
 Both files are read per job, like the live permission gate. Removing a VM or
-a host takes effect on the next job without a worker restart.
+a host takes effect on the next job without a worker restart. A job reads
+the credential record once, at its start, and uses that one record for the
+whole session.
 
 Windows proxies are out of scope for v1. The owner-only check needs a DACL
 check, as `localviewer` and the co-browse base dir already do, and the first
@@ -307,25 +319,29 @@ or `/proc/<pid>/cmdline`.
 citadel vm-console host add <alias> --url https://... --pve-node <name> \
     --token-id 'user@pve!name' (--ca-file PATH | --fingerprint SHA256 | --system-roots) \
     [--token-expires YYYY-MM-DD] < token-secret
-citadel vm-console host rotate-token <alias> < new-token-secret
-citadel vm-console host remove <alias>      # deletes the secret file too
+citadel vm-console host rotate-token <alias> --token-id 'user@pve!newname' \
+    [--token-expires YYYY-MM-DD] < new-token-secret
+citadel vm-console host remove <alias>      # deletes the credential record too
 citadel vm-console vm add <alias> <vmid> [--pve-node NAME] [--view-only] [--label TEXT]
 citadel vm-console vm remove <alias> <vmid>
-citadel vm-console status                   # config, pins, expiry warnings, no secrets
+citadel vm-console status                   # config, pins, token ids, expiry warnings, no secrets
 citadel vm-console test <alias> <vmid>      # see below
 citadel permission vm-console <enable|disable>
 ```
 
-`host add` and `rotate-token` verify before they save:
+`host add` and `rotate-token` verify the new token id and secret as a pair
+before they save:
 
 1. TLS against the chosen pin. A failure prints the presented leaf
    fingerprint, so the operator can compare it with the PVE UI, and does not
    save.
 2. `GET /version`, to confirm the URL is a PVE API.
-3. `GET /access/permissions` as the token. Save is refused if the token
+3. `GET /access/permissions` as the new token. Save is refused if the token
    holds any privilege other than `VM.Console`, or holds it on any path other
    than `/vms/<vmid>`. This catches a role or ACL that was set up too wide.
-   The refusal names the extra privilege and path.
+   The refusal names the extra privilege and path. For `rotate-token`, the
+   new token must also hold `VM.Console` on every VM already allowlisted
+   for the alias, so the swap cannot silently drop a VM.
 
 `vm add` repeats step 3 for the new vmid and warns, but still saves, if the
 token lacks `VM.Console` there. The operator may add the ACL afterwards.
@@ -338,18 +354,37 @@ device.
 
 ### 1.4 Rotation and revocation
 
-- **Rotate:** create a new token in PVE, add the two ACL entries for it, run
-  `citadel vm-console host rotate-token`, then remove the old token in PVE.
-  The new secret is written atomically (temp file in the same dir, fsync,
-  rename) so a job never reads half a token.
+- **Rotate (new token id).** PVE binds a generated secret to its full token
+  id and refuses to create a second token with an existing id. So rotation
+  creates a new token under a new id (for example `<proxy-alias>-2`), not a
+  new secret under the old one:
+  1. In PVE, create the new token and add its ACL entry on each allowlisted
+     VM.
+  2. Run `citadel vm-console host rotate-token <alias> --token-id <new id>`
+     with the new secret on stdin. The command verifies the new pair (section
+     1.3) and only then swaps it in.
+  3. In PVE, remove the old token.
+
+  The swap writes the new record to a temp file in the same dir, fsyncs it,
+  renames it over `<alias>.token`, and fsyncs the dir. A crash leaves either
+  the old record or the new one, never a mix of id and secret. A job that
+  started before the rename keeps the record it read, and the old token is
+  still valid in PVE until step 3, so that job finishes. A job that starts
+  after the rename uses the new record.
+- **Same-id regeneration is not the rotation path.** Current upstream PVE
+  can regenerate a token's secret in place. That invalidates the old secret
+  at once, so jobs fail with `pve_auth_refused` until `rotate-token` runs
+  with the same id. The operator guide documents it only as an emergency
+  step, for example after a suspected leak, and it is not assumed to exist on
+  the operator's installed PVE version.
 - **Revoke at the hypervisor:** remove the token, or delete one VM's ACL
   entry. The next job fails with `pve_auth_refused` or `pve_forbidden`.
-  Because sessions are per job (decision 8), nothing outlives revocation by
-  more than one job's budget.
+  Because each job has its own session (decision 8), nothing outlives
+  revocation by more than one job's budget.
 - **Revoke at the node:** `citadel vm-console host remove`, `vm remove`, or
   `citadel permission vm-console disable`. All take effect on the next job.
-- **Expiry:** `status` and the worker's startup log warn 14 days before
-  `token_expires`. An expired token fails as `pve_auth_refused` with a
+- **Expiry:** `status` and the worker's startup log warn 14 days before the
+  record's `expires`. An expired token fails as `pve_auth_refused` with a
   message that names rotation.
 
 ### 1.5 TLS
@@ -460,12 +495,20 @@ node M.
 | `passcode` | string | optional; the existing wire key; never logged |
 
 Every job has its own budget below the platform's wait: 20 s for a
-screenshot, 25 s for keys and pointer. The budget covers the API call, the
-websocket, the RFB handshake and the action. The platform tool must wait at
-least 30 s (a note for #13652). These job types take the default watchdog
-tier and the ordinary dispatch path. They are not added to
-`serializedLaneJobTypes`, because that exec-1 lane is shared with model pulls
-and a click would queue behind a long download.
+screenshot, 25 s for keys and pointer. The platform tool must wait at least
+30 s (a note for #13652). The budget is split into three phases, and each
+phase has its own deadline:
+
+| Phase | Allowance | Covers |
+|---|---|---|
+| Setup | 10 s | Up to two attempts (section 4.1, step 4), each bounded at 4.5 s for vncproxy, the websocket and RFB auth, plus the 500 ms pause between them |
+| Action | 9 s (screenshot), 14 s (keys and pointer) | Capture, or the planned input |
+| Cleanup | 1 s | Releasing held keys and buttons, then closing the session |
+
+These job types take the default watchdog tier and the ordinary dispatch
+path. They are not added to `serializedLaneJobTypes`, because that exec-1
+lane is shared with model pulls and a click would queue behind a long
+download.
 
 ### 3.3 VM_CONSOLE_SCREENSHOT
 
@@ -509,11 +552,32 @@ Payload: common fields, plus:
 
 Execution: for each chord, press the keys in order and release them in
 reverse. Within a chord, the node waits 10 ms between events. On any error,
-cancellation or budget expiry partway through, the node sends a key-up for
-every key it holds before it closes the session, so a modifier is never left
-stuck on the guest. The total of the sequence length times `pace_ms` must
-fit the budget, or the job is refused before it connects
-(`sequence_too_long`).
+cancellation or deadline partway through, the node sends a key-up for every
+key it holds before it closes the session, so a modifier is never left stuck
+on the guest. That release runs in the cleanup phase, not the action phase.
+
+Admission counts every gap, not only the pacing between chords. For a
+sequence of `n` chords where chord `i` has `k_i` keys, the planned input
+time is:
+
+```
+D = sum over chords of (2 * k_i - 1) * 10 ms   (gaps between a chord's press and release events)
+  + (n - 1) * pace_ms                          (gaps between chords)
+```
+
+The job is refused before it connects (`sequence_too_long`) unless `D` fits
+the 14 s action allowance. Setup and cleanup have their own allowances
+(section 3.2), so they are not part of `D`. Two worked cases:
+
+- 256 four-key chords at the default 40 ms: `256 * 7 * 10 ms = 17.92 s`, plus
+  `255 * 40 ms = 10.2 s`, so `D = 28.12 s`. Refused.
+- 200 one-key chords at 60 ms: `200 * 10 ms = 2 s`, plus `199 * 60 ms =
+  11.94 s`, so `D = 13.94 s`. Admitted. 201 of them come to 14.01 s and are
+  refused.
+
+Admission is a plan. Writes over the websocket take real time, so the action
+phase also runs under its own 14 s deadline. If that deadline fires, the
+node stops sending, releases what it holds and reports a partial result.
 
 Result: `{"ok": true, "chords": N, "keys": M}`. If the job fails partway,
 the error says how many chords were sent, so the caller knows input may have
@@ -617,8 +681,9 @@ The client's steps:
    `pve_node`).
 2. At once, and within the 10 s listener window, open
    `wss://<host>/api2/json/nodes/<pve_node>/qemu/<vmid>/vncwebsocket?port=<port>&vncticket=<urlencoded ticket>`
-   with the same Authorization header, the pinned TLS config, a 5 s
-   handshake timeout and the `binary` subprotocol (accepted, not required).
+   with the same Authorization header, the pinned TLS config and the
+   `binary` subprotocol (accepted, not required). Steps 1 to 3 together run
+   under the attempt's 4.5 s setup deadline (section 3.2).
    Each binary message carries RFB bytes. A text message is a protocol error.
 3. RFB: read the server version and reply `RFB 003.008`. From the security
    types, choose VNC Authentication (2) and answer the 16-byte challenge with
@@ -702,6 +767,16 @@ The pointer handler:
    mid-action if the mode changed. Before closing, it sends a no-buttons
    event.
 
+This check is best effort, not atomic. RFB gives no way to make "the mode is
+absolute" and "this event is applied" one step. The server can switch to
+relative after the client's last read and before it applies the event, and
+the event would then be taken as a delta. The window is the time between
+that read and the event, which is a few milliseconds on a LAN. A mode switch
+in practice happens when the guest loads or drops its tablet driver, at boot
+or after a driver change, not during ordinary use. The handler and its tests
+describe the check as best effort. The native checkpoint (section 6) judges
+whether this residual race is acceptable before input is enabled on any VM.
+
 In absolute mode QEMU maps the RFB x and y onto the framebuffer width and
 height, so `fx` and `fy` from section 3.5 are sent unchanged. Button mask:
 left 1, middle 2, right 4. A click is press then release, 30 ms apart. A
@@ -728,6 +803,8 @@ in section 6 answers them before the input slices start.
    it.
 6. What the guest sees if the session drops with a key or button held. The
    release-before-close rule makes this rare, but acceptance should note it.
+7. Whether the residual pointer-mode race (section 4.4) is acceptable on
+   the operator's guests.
 
 ## 5. Threats
 
@@ -775,19 +852,24 @@ mode is tracked across change rects; a `-race` test runs the read loop
 alongside the event writes.
 
 **S2. Keysym table and chord validation.** Sonnet review. `rfb.KeysymByName`,
-chord and sequence validation, and the press/release ordering as a pure
-function. Acceptance: a golden test of the vocabulary that `vnc_keys` emits;
-unknown names are refused by index without echoing the name; reverse-order
-release.
+chord and sequence validation, the press/release ordering, and the planned
+input time `D` of section 3.4, all as pure functions. Acceptance: a golden
+test of the vocabulary that `vnc_keys` emits; unknown names are refused by
+index without echoing the name; reverse-order release; `D` boundary tests
+(256 four-key chords at 40 ms plan 28.12 s and are refused, 200 one-key
+chords at 60 ms plan 13.94 s and are admitted, 201 plan 14.01 s and are
+refused).
 
 **S3. Console config and PVE client (`internal/vmconsole`).** Opus review:
 yes (credential and TLS). The strict `hosts.yaml` loader, the owner-only
-token loader, the three TLS modes, vncproxy, and the vncwebsocket dial into
+credential record loader (token id and secret together), the three TLS
+modes, vncproxy, and the vncwebsocket dial into
 an `io.ReadWriter` for S1. Acceptance: a fake PVE server checks the token
 header, the `websocket=1` form and the ticket in the query; a CA pin passes
 a renewed leaf and refuses a foreign CA; a fingerprint pin refuses any other
 leaf; a redirect is refused; a proxy environment variable is ignored; a
-group-readable or foreign-owned or symlinked token is refused; an error body
+group-readable, foreign-owned or symlinked credential record is refused,
+and so is one missing `token_id` or `secret`; an error body
 containing a sentinel never appears in an error; a URL with a ticket never
 appears in a dial error; a 401 maps to `pve_auth_refused`, a 403 to
 `pve_forbidden`, and a missing VM config to `vm_not_on_pve_node`; a failed
@@ -797,11 +879,17 @@ fails with a bounded error.
 
 **S4. Operator commands.** Sonnet review. `citadel vm-console ...` and
 `citadel permission vm-console`, the `/access/permissions` check, the
-atomic secret write, and `test`. Acceptance: the secret comes from stdin
-only; a token with an extra privilege, or with `VM.Console` on `/vms` or a
-pool, is refused with the privilege and path named; `status` prints no
-secret; `remove` deletes the secret file; every command's tests run against
-a `t.TempDir()` config dir, never the real node config dir.
+atomic credential swap of section 1.4, and `test`. Acceptance: the secret
+comes from stdin only; a token with an extra privilege, or with `VM.Console`
+on `/vms` or a pool, is refused with the privilege and path named;
+`rotate-token` requires `--token-id`, verifies the new id and secret as a
+pair before writing, and refuses a new token that lacks `VM.Console` on an
+already allowlisted VM; a failure injected between the temp write and the
+rename leaves the old record intact and loadable; a reader looping during
+repeated swaps only ever sees a complete old or new record, never one id
+with the other's secret; `status` prints token ids and no secret; `remove`
+deletes the credential record; every command's tests run against a
+`t.TempDir()` config dir, never the real node config dir.
 
 **Native checkpoint, after S1, S3 and S4 merge and before S5 and S6
 start.** The operator runs `citadel vm-console test` against the Windows test
@@ -809,7 +897,9 @@ VM. It is read-only: it sends no input and saves no image, so it falls under
 the post-merge acceptance rule. It answers the builder checks in section 4.5
 (the security type, the SANs, the shared session, the -257 report, the
 password race) on the real host. If the transport assumption is wrong, two
-Opus-reviewed handler slices are not yet built on it.
+Opus-reviewed handler slices are not yet built on it. The checkpoint also
+records whether the residual pointer-mode race (section 4.4) is acceptable.
+Input is not enabled on any VM until it is.
 
 **S5. Permission, gate, screenshot handler, advertisement.** Opus review:
 yes. `Permissions.VMConsole`, `IsSensitiveCategory`, refusal of remote
@@ -827,11 +917,15 @@ reach a log.
 machine). `VM_CONSOLE_KEYS` and `VM_CONSOLE_POINTER`, pacing, release on
 error, the `jobprivacy` entry, the scaling function, the resolution check,
 and the absolute-pointer refusal. Acceptance: keys and pointer are refused
-for a view-only VM; a sequence that cannot fit the budget is refused before
-connecting; cancellation partway through sends key-ups for every held key;
-the pointer is refused when the mode is relative, when no mode report
-arrives, and when the mode flips mid-drag; no relative event is ever sent
-(the fake server fails the test if it sees a pointer event while relative);
+for a view-only VM; a sequence whose planned `D` exceeds 14 s is refused
+before any connection is attempted (the fake PVE server sees no call); the
+action deadline stops a slow fake mid-sequence, releases every held key and
+reports a partial result; cancellation partway through sends key-ups for
+every held key; the pointer is refused when the mode is relative, when no
+mode report arrives, and when the mode flips mid-drag; once the client has
+read a relative report it sends no further pointer event (the fake server
+fails the test if one arrives after it delivered the flip and the client
+read it); the tests and handler comments call the mode check best effort;
 scaling table tests cover odd sizes and edges; `resolution_changed` fires on
 a size mismatch; the dead-letter and log sentinel tests cover `sequence`.
 
