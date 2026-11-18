@@ -23,6 +23,11 @@ const (
 	Image       = "ghcr.io/aceteam-ai/browser-runtime"
 	LegacyImage = "ghcr.io/aceteam-ai/meeting-service"
 
+	// PinnedImage is this release's digest-pinned image ref (name:tag@sha256:...),
+	// bumped by a follow-up PR after CI publishes the image. Empty means the
+	// release carries no runtime and node co-browse stays on the host runners.
+	PinnedImage = ""
+
 	// Container-side ports fixed by the image (Dockerfile ENV). The host side
 	// is always a dynamic loopback port, read back with ParsePublishedPort.
 	ControlContainerPort = 8102 // meetingd control API

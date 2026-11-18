@@ -780,3 +780,10 @@ def test_citadel_pa_declares_virtual_mic():
     # device.class=sound is what stops Chromium filtering it as a monitor.
     assert "device.class=sound" in body
     assert "set-default-source citadel_virtmic" in body
+
+
+def test_chrome_args_disk_cache_bound_from_env(monkeypatch):
+    monkeypatch.delenv("MEETING_DISK_CACHE_MB", raising=False)
+    assert not any(a.startswith("--disk-cache-size") for a in meetingd.build_chrome_args(9222, "/profile"))
+    monkeypatch.setenv("MEETING_DISK_CACHE_MB", "256")
+    assert f"--disk-cache-size={256 * 1024 * 1024}" in meetingd.build_chrome_args(9222, "/profile")

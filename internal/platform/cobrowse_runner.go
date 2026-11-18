@@ -92,6 +92,9 @@ type LaunchOptions struct {
 	// they outlive a service restart. Only the node-wide manager of the managed
 	// worker sets it; everything else launches directly.
 	Detach bool
+	// NodeWide marks the node-wide manager: only it may use the container
+	// runner (local mode keeps the user's own host browser).
+	NodeWide bool
 }
 
 // devToolsActivePortFile is where a browser launched with
@@ -203,12 +206,22 @@ func fetchCDPBrowserWSContext(ctx context.Context, port int) (string, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v); err != nil {
 		return "", err
 	}
+	// A containerized browser advertises its container-internal port; the
+	// loopback endpoint we probed is the one that is reachable. Host browsers
+	// already advertise exactly this authority, so the rewrite is a no-op there.
+	if rewritten, rerr := rewriteLoopbackWSPort(v.WS, port); rerr == nil {
+		return rewritten, nil
+	}
 	return v.WS, nil
 }
 
 // activeBrowserRunner is the runner for this OS. A package var so tests can
 // substitute one; production sets it in cobrowse_runner_{windows,other}.go.
-var activeBrowserRunner = newDefaultBrowserRunner()
+var activeBrowserRunner browserRunner = browserSelector
+
+// browserSelector fronts the host runner and, once ConfigureBrowserRuntime has
+// run, the container runner.
+var browserSelector = &selectingRunner{host: newDefaultBrowserRunner()}
 
 // DiscoverCobrowseBrowser reports the browser co-browse sessions would launch on
 // this machine, without launching it.

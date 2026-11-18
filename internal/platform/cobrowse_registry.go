@@ -118,6 +118,13 @@ type sessionRecord struct {
 	ScopeUser    bool   `json:"scope_user,omitempty"`
 	OwnerUID     *int   `json:"owner_uid,omitempty"`
 	Handoff      bool   `json:"handoff,omitempty"`
+	// Container sessions (runner "container"): the full container id, its
+	// StartedAt and the published control port. Adoption verifies all of them
+	// plus the CDP identity; there is no pid to check.
+	Runner         string `json:"runner,omitempty"`
+	ContainerID    string `json:"container_id,omitempty"`
+	ContainerStart string `json:"container_start,omitempty"`
+	ControlPort    int    `json:"control_port,omitempty"`
 
 	// State is live, suspended or expired. Generation increases on every
 	// re-adopt or ownership change so a later owner can order its claims.
@@ -371,6 +378,9 @@ func (s *cobrowseSession) persistRecord() {
 	uid := os.Getuid()
 	rec.OwnerUID = &uid
 	rec.OwnerStart = currentOwnerIdentity()
+	if proc.containerID != "" {
+		rec.Runner, rec.ContainerID, rec.ContainerStart, rec.ControlPort = "container", proc.containerID, proc.containerStart, proc.containerCtrl
+	}
 	rec.BrowserStart, _, _ = procIdentity(rec.BrowserPID)
 	if rec.XvfbPID > 0 {
 		rec.XvfbStart, _, _ = procIdentity(rec.XvfbPID)
@@ -599,6 +609,12 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			}
 		}
 		dir := filepath.Join(m.baseDir, rec.ID)
+		if rec.Runner == "container" {
+			if r := m.recoverContainer(rec, dir, regDir, now); r != nil {
+				expired = append(expired, *r)
+			}
+			continue
+		}
 		// Not the managed worker: a scoped session that is still alive in its own
 		// scope belongs to the worker that is about to restart. Leave it alone.
 		if !detachedWorker.Load() && scopedSurvivor(rec) {

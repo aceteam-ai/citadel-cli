@@ -99,6 +99,8 @@ the platform supplies a unique staging destination and receives that exact
 relative path in the receipt. See `docs/file-fetch.md` for
 the contract.
 
+`platform.containerRunner` (citadel-cli#1760) is the browserRunner that runs each node co-browse session in its own browser-runtime container; `selectingRunner` decides per launch, so a node-wide manager uses it only while `containerRunner.healthy` holds (engine reachable, pinned image present or pulled) and otherwise falls back to the host runner, logged once per reason. Local mode never uses it (`LaunchOptions.NodeWide`). It builds argv only through `browserruntime.RunSpec.Args`, and engine calls only through the `ContainerEngine` seam wired in `cmd.configureBrowserRuntime`. `Launch` owns the fresh per-session network and `checkIsolation` (exactly one network, no other member); `verifyCDPIdentity` owns the in-container versus published-port browser id comparison. `adoptContainer` owns re-adoption (container id, StartedAt, labels, network, ports, CDP id, all failing closed; a failing record is discarded and expired by `recoverContainer`), and `sweepContainers` removes labelled containers and networks whose session is not live. `browserruntime.PinnedImage` is empty until a release pins the image, which keeps host runners in charge. The shared slot count is `BrowserSlots` in device config via `platform.SetBrowserSlots`; `CITADEL_COBROWSE_MAX_SESSIONS` still wins. Tests are in `internal/platform/cobrowse_container_test.go`.
+
 `platform.browserRunner` owns the per-OS half of a co-browse session:
 discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
 `xvfbRunner` is the historical managed-Xvfb path, and its argument list is pinned
