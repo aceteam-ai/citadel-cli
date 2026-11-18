@@ -116,3 +116,22 @@ func TestMeetingReconcileEligible(t *testing.T) {
 		}
 	}
 }
+
+func TestWarnThrottlePrintsOncePerReason(t *testing.T) {
+	var got []string
+	w := &warnThrottle{out: func(m string) { got = append(got, m) }, quiet: time.Hour}
+	t0 := time.Now()
+	w.warn(t0, "org id unknown", "a")
+	w.warn(t0.Add(30*time.Second), "org id unknown", "a")
+	if len(got) != 1 {
+		t.Fatalf("same reason printed %d times, want 1", len(got))
+	}
+	w.warn(t0.Add(time.Minute), "subscribe failed: x", "b")
+	if len(got) != 2 {
+		t.Fatalf("changed reason should print; got %d", len(got))
+	}
+	w.warn(t0.Add(2*time.Hour), "subscribe failed: x", "b")
+	if len(got) != 3 {
+		t.Fatalf("after quiet interval should print again; got %d", len(got))
+	}
+}

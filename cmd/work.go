@@ -1473,6 +1473,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// module turns healthy after the boot-time detection.
 	// It reports whether the queue is actually subscribed; the reconciler only
 	// advertises the tag on success and retries on the next tick otherwise.
+	meetingWarn := &warnThrottle{out: func(msg string) { fmt.Fprint(os.Stderr, msg) }, quiet: time.Hour}
 	subscribeMeetingQueue := func(ctx context.Context) bool {
 		meetingOrgID := ""
 		if deviceConfig != nil {
@@ -1491,7 +1492,8 @@ func runWork(cmd *cobra.Command, args []string) {
 				workerState.SetQueues(src.QueueNames())
 			case *worker.RedisSource:
 				if err := src.AddQueue(ctx, meetingQueue); err != nil {
-					fmt.Fprintf(os.Stderr, "   - Warning: meeting queue subscribe failed: %v\n", err)
+					meetingWarn.warn(time.Now(), fmt.Sprintf("subscribe failed: %v", err),
+						fmt.Sprintf("   - Warning: meeting queue subscribe failed: %v\n", err))
 					return false
 				}
 				workerState.SetQueues(src.QueueNames())
@@ -1500,8 +1502,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			Debug("meeting queue: %s", meetingQueue)
 			return true
 		}
-		fmt.Fprintln(os.Stderr, "   - Warning: meeting queue skipped (org id unknown); "+
-			"meeting auto-join dispatch will not reach this node")
+		meetingWarn.warn(time.Now(), "org id unknown",
+			"   - Warning: meeting queue skipped (org id unknown); "+
+				"meeting auto-join dispatch will not reach this node\n")
 		Debug("meeting queue skipped: org id unknown")
 		return false
 	}

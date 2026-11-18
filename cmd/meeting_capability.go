@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
@@ -81,4 +82,28 @@ func meetingReconcileEligible(role config.WorkerRole, nodeCaps *capabilities.Nod
 		return false
 	}
 	return !hasCapabilityTag(nodeCaps.Tags, "meeting")
+}
+
+// warnThrottle prints a warning the first time, then only when the reason
+// changes or after the quiet interval, so a failure retried on every heartbeat
+// tick does not spam stderr for the life of the worker.
+type warnThrottle struct {
+	out   func(string)
+	quiet time.Duration
+
+	mu     sync.Mutex
+	reason string
+	at     time.Time
+	seen   bool
+}
+
+func (w *warnThrottle) warn(now time.Time, reason, msg string) {
+	w.mu.Lock()
+	if w.seen && w.reason == reason && now.Sub(w.at) < w.quiet {
+		w.mu.Unlock()
+		return
+	}
+	w.seen, w.reason, w.at = true, reason, now
+	w.mu.Unlock()
+	w.out(msg)
 }
