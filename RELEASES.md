@@ -3998,3 +3998,18 @@ Auto-generated log of every release.
   - feat(cobrowse): report page_text and password_field on start and status (#1773)
 
 
+---
+
+## v2.239.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 12 |
+| Lines added | +606 |
+
+**Changes:**
+
+  - fix(module): catalog cold-cache fetch, meeting marker node dir, re-detect meeting when healthy (#1774)
+
+
