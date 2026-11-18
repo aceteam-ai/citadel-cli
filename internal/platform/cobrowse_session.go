@@ -90,6 +90,8 @@ type CobrowseSessionStatus struct {
 	ID    string               `json:"id"`
 	State CobrowseSessionState `json:"state"`
 	URL   string               `json:"url,omitempty"`
+	// Interstitial describes browser-owned sign-in UI, never website auth.
+	Interstitial BrowserInterstitial `json:"interstitial,omitempty"`
 	// Title is the page title after a navigate (bounded, control characters
 	// stripped); empty for every other status.
 	Title     string `json:"title,omitempty"`
@@ -608,7 +610,7 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 			}
 		}
 	}
-	return st, nil
+	return withBrowserInterstitial(st), nil
 }
 
 // launch creates the session's profile dir, spawns the browser via the (injectable)
@@ -882,7 +884,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 func (s *cobrowseSession) statusCtx(parent context.Context) CobrowseSessionStatus {
 	st := s.statusProbed(parent)
 	s.applyFirstLoad(&st)
-	return st
+	return withBrowserInterstitial(st)
 }
 
 func (s *cobrowseSession) statusProbed(parent context.Context) CobrowseSessionStatus {

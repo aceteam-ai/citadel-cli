@@ -27,6 +27,20 @@ func TestCobrowse_MissingAction(t *testing.T) {
 	}
 }
 
+func TestCobrowse_BrowserSigninStatusWire(t *testing.T) {
+	out, err := statusResult(platform.CobrowseStatus{URL: "chrome://managed-user-profile-notice/", Interstitial: platform.ChromeSigninInterstitial}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st map[string]any
+	if err := json.Unmarshal(out, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st["interstitial"] != string(platform.ChromeSigninInterstitial) {
+		t.Fatalf("legacy status dropped browser interstitial: %s", out)
+	}
+}
+
 func TestCobrowse_UnknownAction(t *testing.T) {
 	_, err := runCobrowse(t, "frobnicate", nil)
 	if err == nil {

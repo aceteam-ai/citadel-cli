@@ -77,10 +77,11 @@ func (h *CobrowseHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 		}
 		st := mgr.Status()
 		out, _ := json.Marshal(map[string]any{
-			"image":  img,
-			"format": "png",
-			"driver": string(st.Driver),
-			"url":    st.URL,
+			"image":        img,
+			"format":       "png",
+			"driver":       string(st.Driver),
+			"url":          st.URL,
+			"interstitial": st.Interstitial,
 		})
 		return out, nil
 
@@ -97,13 +98,14 @@ func statusResult(st platform.CobrowseStatus, err error) ([]byte, error) {
 		return nil, err
 	}
 	out, mErr := json.Marshal(map[string]any{
-		"running":    st.Running,
-		"driver":     string(st.Driver),
-		"url":        st.URL,
-		"debug_port": st.DebugPort,
-		"profile":    st.Profile,
-		"display":    st.Display,
-		"started_at": st.StartedAt,
+		"running":      st.Running,
+		"driver":       string(st.Driver),
+		"url":          st.URL,
+		"interstitial": st.Interstitial,
+		"debug_port":   st.DebugPort,
+		"profile":      st.Profile,
+		"display":      st.Display,
+		"started_at":   st.StartedAt,
 	})
 	if mErr != nil {
 		return nil, mErr

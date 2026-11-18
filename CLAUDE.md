@@ -112,6 +112,18 @@ match. The session base dir there requires an owner-only, protected DACL
 (`validateCobrowseBaseDirPerms`), and a launch refuses without one. The
 windows-latest CI job runs the real-browser tests against both browsers.
 
+Browser account sign-in and sync are disabled per launch with
+`--allow-browser-signin=false` and `--disable-sync` in `buildChromeArgs` and
+the browser-runtime image's `meetingd.build_chrome_args` (#1799). The refusal
+is command-line scoped, not a machine policy or registry change; restored
+profile sign-in preferences cannot override it. Website cookies/SSO remain
+separate. Node session status classifies known Chrome/Edge sign-in pages as
+`interstitial: chrome_signin`, retaining the URL but omitting page-text probes.
+The backend formatter must preserve that field and never infer website auth
+for browser-internal URLs. The opt-in Linux and Windows
+`RealBrowserSigninDisabledAfterProfileRestore` tests inspect effective sign-in
+prefs through CDP and use a synthetic website redirect, never Google SSO.
+
 `cobrowseSession.runAction` owns one scripted co-browse action (click, type, key,
 scroll): one WebSocket for all its CDP calls, bounded by
 `platform.CobrowseActionDeadline`, which must stay below the platform's 15s job

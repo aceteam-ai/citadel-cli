@@ -188,6 +188,10 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		"--user-data-dir=" + opts.profileDir,
 		"--no-first-run",
 		"--no-default-browser-check",
+		// Session-local: browser identity is never the site's SSO identity.
+		// Chromium's command-line refusal overrides restored sign-in prefs.
+		"--allow-browser-signin=false",
+		"--disable-sync",
 	}
 	if opts.headless {
 		args = append(args, "--headless=new")
@@ -288,13 +292,14 @@ var ErrNotStarted = fmt.Errorf("no co-browse session; call cobrowse_start first"
 
 // CobrowseStatus is the queryable state of the session.
 type CobrowseStatus struct {
-	Running   bool           `json:"running"`
-	Driver    CobrowseDriver `json:"driver"`
-	URL       string         `json:"url"`
-	DebugPort int            `json:"debug_port"`
-	Profile   string         `json:"profile"`
-	Display   string         `json:"display,omitempty"`
-	StartedAt string         `json:"started_at,omitempty"`
+	Interstitial BrowserInterstitial `json:"interstitial,omitempty"`
+	Running      bool                `json:"running"`
+	Driver       CobrowseDriver      `json:"driver"`
+	URL          string              `json:"url"`
+	DebugPort    int                 `json:"debug_port"`
+	Profile      string              `json:"profile"`
+	Display      string              `json:"display,omitempty"`
+	StartedAt    string              `json:"started_at,omitempty"`
 }
 
 // CobrowseManager owns the single managed browser process and its driver state.
@@ -768,6 +773,7 @@ func (m *CobrowseManager) statusLocked() CobrowseStatus {
 			st.URL = url
 		}
 	}
+	st.Interstitial = withBrowserInterstitial(CobrowseSessionStatus{URL: st.URL}).Interstitial
 	return st
 }
 

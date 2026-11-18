@@ -167,7 +167,8 @@ func (s *cobrowseSession) pageSignals(ctx context.Context) (PageSignals, bool) {
 // the action report reserve. page_text is page content: it is never logged or
 // put in the registry record.
 func (m *CobrowseSessionManager) WithPageSignals(st CobrowseSessionStatus) CobrowseSessionStatus {
-	if st.FirstLoad == FirstLoadPending || st.Driver == DriverHuman {
+	st = withBrowserInterstitial(st)
+	if st.Interstitial != "" || st.FirstLoad == FirstLoadPending || st.Driver == DriverHuman {
 		return st
 	}
 	m.mu.Lock()

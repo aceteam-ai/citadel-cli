@@ -172,6 +172,9 @@ def build_chrome_args(cdp_port: int, profile_dir: str) -> list[str]:
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        # Session-local only; restored profiles must not enroll the node browser.
+        "--allow-browser-signin=false",
+        "--disable-sync",
         "--start-maximized",
         # stealth (on by default on the host)
         "--disable-blink-features=AutomationControlled",
