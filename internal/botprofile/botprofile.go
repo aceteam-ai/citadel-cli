@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -64,7 +65,12 @@ var (
 	// repeated failure means something else is writing the store dir. C4 and C7
 	// surface it as a typed refusal.
 	ErrNodeShareContested = errors.New("botprofile: node share was created by another party during first use")
-	ErrLocked             = errors.New("botprofile: key material has been cleared")
+	// ErrStoreWithoutShare: the store dir already existed but holds no node
+	// share. The first use creates dir and share together, so this state was
+	// made by something else (or a crash before the share was linked). Nothing
+	// is sealed without a share, so deleting bot-profiles/ loses nothing.
+	ErrStoreWithoutShare = errors.New("botprofile: store dir exists without a node share; remove bot-profiles/ to reinitialize")
+	ErrLocked            = errors.New("botprofile: key material has been cleared")
 )
 
 // ShareProvider releases the AceTeam share for one identity row. Production
@@ -137,6 +143,9 @@ func Open(ctx context.Context, nodeConfigDir string, id Identity, shares SharePr
 	if shares == nil {
 		return nil, ErrShareUnavailable
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dir := Dir(nodeConfigDir)
 	nodeShare, err := loadOrCreateNodeShare(dir)
 	if err != nil {
@@ -148,6 +157,9 @@ func Open(ctx context.Context, nodeConfigDir string, id Identity, shares SharePr
 		return nil, ErrShareUnavailable // provider text dropped on purpose
 	}
 	defer zero(aceShare)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	key, err := deriveKey(nodeShare, aceShare, id)
 	if err != nil {
 		return nil, err
@@ -170,6 +182,11 @@ func Open(ctx context.Context, nodeConfigDir string, id Identity, shares SharePr
 func Reset(nodeConfigDir string, id Identity) error {
 	if err := id.validate(); err != nil {
 		return err
+	}
+	// Nothing to reset in a store that does not exist; do not create one (an
+	// empty store dir would make the first Open refuse with ErrStoreWithoutShare).
+	if _, err := os.Lstat(Dir(nodeConfigDir)); errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
 	return cobrowseprofile.ResetIn(Dir(nodeConfigDir), id.ProfileName())
 }

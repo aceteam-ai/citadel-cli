@@ -25,7 +25,16 @@ const NodeShareFile = "node-share.key"
 // bytes. A store failing any check is refused, never repaired: a loosened share
 // is presumed read.
 func loadOrCreateNodeShare(dir string) ([]byte, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return nil, fmt.Errorf("botprofile: create store dir: %w", err)
+	}
+	// Create the leaf ourselves so we know whether the store is new. The first
+	// legitimate use creates the dir and the share together; a store dir that
+	// already exists without a share is never filled in (see below).
+	createdDir := false
+	if err := os.Mkdir(dir, 0o700); err == nil {
+		createdDir = true
+	} else if !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("botprofile: create store dir: %w", err)
 	}
 	var dst unix.Stat_t
@@ -43,6 +52,13 @@ func loadOrCreateNodeShare(dir string) ([]byte, error) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
+	}
+	if !createdDir {
+		// A store dir that pre-existed without a share is not ours to fill in:
+		// anything that could have made the dir could also stage the share's
+		// contents. Recovery: delete bot-profiles/ (nothing is sealed under a
+		// share that does not exist, so nothing is lost).
+		return nil, ErrStoreWithoutShare
 	}
 	if err := createShare(dir, path); err != nil {
 		return nil, err
@@ -99,13 +115,15 @@ func checkOwnerMode(st *unix.Stat_t, kind uint32, what string) error {
 }
 
 func readShare(path string) ([]byte, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
 			return nil, os.ErrNotExist
 		}
 		return nil, fmt.Errorf("botprofile: open node share: %w", err)
 	}
+	// O_NONBLOCK: opening a FIFO for reading must not wait for a writer. The
+	// type check below refuses it; regular-file reads never block.
 	f := os.NewFile(uintptr(fd), NodeShareFile)
 	defer f.Close()
 	var st unix.Stat_t

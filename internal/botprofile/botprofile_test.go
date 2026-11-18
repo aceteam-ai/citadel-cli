@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -455,7 +456,9 @@ func TestNodeShareExtraHardLinkRefused(t *testing.T) {
 	}
 }
 
-func TestPlantedShareIsNotAdopted(t *testing.T) {
+// Covers only the read-miss/link race inside one creation. The pre-existing
+// store case is TestStoreWithoutShareRefused.
+func TestShareAppearingDuringCreationIsNotAdopted(t *testing.T) {
 	dir := t.TempDir()
 	sdir := Dir(dir)
 	if err := os.MkdirAll(sdir, 0o700); err != nil {
@@ -476,9 +479,7 @@ func TestPlantedShareIsNotAdopted(t *testing.T) {
 func TestStaleShareTempsRemovedFreshKept(t *testing.T) {
 	dir := t.TempDir()
 	sdir := Dir(dir)
-	if err := os.MkdirAll(sdir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	seal(t, dir, idA, providerFor(idA), 120, "x") // creates dir and share together
 	stale := filepath.Join(sdir, ".share-old")
 	fresh := filepath.Join(sdir, ".share-new")
 	for _, p := range []string{stale, fresh} {
@@ -496,5 +497,76 @@ func TestStaleShareTempsRemovedFreshKept(t *testing.T) {
 	}
 	if _, err := os.Lstat(fresh); err != nil {
 		t.Fatal("fresh temp removed")
+	}
+}
+
+// A store dir that already exists without a share is never filled in, even if
+// it is private and owner-correct (the pre-planting control).
+func TestStoreWithoutShareRefused(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(Dir(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Open(context.Background(), dir, idA, providerFor(idA), 120)
+	if !errors.Is(err, ErrStoreWithoutShare) {
+		t.Fatalf("want ErrStoreWithoutShare, got %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(Dir(dir), NodeShareFile)); !os.IsNotExist(err) {
+		t.Fatal("a share was created in a pre-existing store")
+	}
+	// Recovery: removing the store reinitializes it.
+	if err := os.RemoveAll(Dir(dir)); err != nil {
+		t.Fatal(err)
+	}
+	seal(t, dir, idA, providerFor(idA), 120, "x")
+}
+
+// Reset on a node that never created a store must not leave an empty store dir
+// behind (it would make the first Open refuse).
+func TestResetWithoutStoreCreatesNothing(t *testing.T) {
+	dir := t.TempDir()
+	if err := Reset(dir, idA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(Dir(dir)); !os.IsNotExist(err) {
+		t.Fatal("Reset created the store dir")
+	}
+	seal(t, dir, idA, providerFor(idA), 120, "x")
+}
+
+// A FIFO named node-share.key must be refused promptly, not block in open(2),
+// and must not leave a goroutine blocked.
+func TestFIFONodeShareRefusedWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	sdir := Dir(dir)
+	if err := os.MkdirAll(sdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(filepath.Join(sdir, NodeShareFile), 0o600); err != nil {
+		t.Skip("mkfifo unavailable")
+	}
+	before := runtime.NumGoroutine()
+	done := make(chan error, 1)
+	go func() {
+		_, err := loadOrCreateNodeShare(sdir)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO accepted")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("loadOrCreateNodeShare blocked on a FIFO")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("goroutine left behind: %d -> %d", before, after)
+	}
+	// And through Open, with a cancelled context first.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Open(ctx, dir, idA, providerFor(idA), 120); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled context not observed: %v", err)
 	}
 }

@@ -13,9 +13,9 @@ var ErrDenied = errors.New("path is not available to file jobs")
 
 // ConfigDirs returns the node config directories whose "bot-profiles" child is
 // protected. internal/jobs sets it at init (it can import network and
-// platform; this leaf cannot). Tests replace it. A nil value protects nothing,
-// so every package that relies on DenyPath must be linked with internal/jobs
-// (the worker binary always is).
+// platform; this leaf cannot). Tests replace it. A nil value makes DenyPath
+// fail closed, so every package that relies on it must be linked with
+// internal/jobs (the worker binary always is) or set a resolver in its tests.
 var ConfigDirs func() []string
 
 // IsStoreName reports whether a single path component names the store. The
@@ -34,10 +34,23 @@ func IsStoreName(name string) bool { return strings.EqualFold(name, DirName) }
 // the cleaned and resolved config dir paths runs as well, for a config dir
 // that does not exist.
 func DenyPath(p string) error {
-	if p == "" || ConfigDirs == nil {
+	if p == "" {
 		return nil
 	}
+	if ConfigDirs == nil {
+		// Fail closed: with no resolver wired (internal/jobs not linked) nothing
+		// can be proven outside the store. Callers that mean "no protected
+		// dirs" set a resolver returning nil.
+		return ErrDenied
+	}
 	cands := []string{filepath.Clean(p)}
+	// A symlink leaf that cannot be resolved (dangling) could be created
+	// through by an os.Root write; refuse it.
+	if fi, err := os.Lstat(cands[0]); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if _, err := filepath.EvalSymlinks(cands[0]); err != nil {
+			return ErrDenied
+		}
+	}
 	if r, ok := resolveNearest(cands[0]); ok && r != cands[0] {
 		cands = append(cands, r)
 	}
