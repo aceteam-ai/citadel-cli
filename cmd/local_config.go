@@ -613,6 +613,7 @@ func runLocalUploadsConfig(dir, environment, value string, out io.Writer) error 
 		}
 	}
 	st := localcobrowse.NewUploadSettings(dir, environment).Status()
+	fmt.Fprintln(out, "Effective status for this shell's environment (a running owner keeps its startup environment):")
 	fmt.Fprintln(out, st.Reason)
 	if st.Warning != "" {
 		fmt.Fprintln(out, "Warning:", st.Warning)

@@ -14,6 +14,7 @@ import (
 )
 
 const UploadSettingsFile = "settings.json"
+const UploadSettingsDir = "local-settings"
 const maxUploadSettingsBytes = 4096
 
 var ErrUploadsDisabled = errors.New("uploads_off: uploads are turned off on this computer; check citadel local config uploads status")
@@ -28,18 +29,28 @@ type UploadStatus struct {
 // UploadSettings captures the environment once, but checks the file on every
 // use. A stat failure never reuses an earlier successful reading.
 type UploadSettings struct {
+	root    string
 	dir     string
 	envOff  bool
 	warning string
 	mu      sync.Mutex
 	info    os.FileInfo
 	fileOn  bool
+	// Per-instance filesystem seams keep identity/read races deterministic in
+	// tests without mutating process-wide hooks or touching real user state.
+	open func(string) (*os.File, error)
+	read func(*os.File) ([]byte, error)
+	stat func(string) (os.FileInfo, error)
 }
 
 func NewUploadSettings(dir, environment string) *UploadSettings {
-	s := &UploadSettings{dir: dir}
+	s := &UploadSettings{root: dir, open: platform.OpenPrivateFile, stat: os.Lstat,
+		read: func(f *os.File) ([]byte, error) { return io.ReadAll(io.LimitReader(f, maxUploadSettingsBytes+1)) }}
+	if dir != "" {
+		s.dir = filepath.Join(dir, UploadSettingsDir)
+	}
 	switch strings.ToLower(strings.TrimSpace(environment)) {
-	case "":
+	case "", "1", "true", "yes", "on":
 	case "0", "false", "no", "off":
 		s.envOff = true
 	default:
@@ -63,8 +74,29 @@ func (s *UploadSettings) readFile() (bool, string) {
 	if s.dir == "" {
 		return false, bad
 	}
+	// A missing setting is on only inside a trusted existing container, or
+	// when no local state directory exists at all. A removed off file must not
+	// bypass a permission downgrade of either existing directory.
+	if _, err := s.stat(s.root); err == nil {
+		if platform.ValidateSettingsParent(s.root) != nil {
+			s.info = nil
+			return false, bad
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.info = nil
+		return false, bad
+	}
+	if _, err := s.stat(s.dir); err == nil {
+		if platform.ValidatePrivateDir(s.dir) != nil {
+			s.info = nil
+			return false, bad
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.info = nil
+		return false, bad
+	}
 	path := filepath.Join(s.dir, UploadSettingsFile)
-	st, err := os.Lstat(path)
+	st, err := s.stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		s.info = nil
 		return true, "Uploads are on (no setting file)"
@@ -79,7 +111,7 @@ func (s *UploadSettings) readFile() (bool, string) {
 		}
 		return false, "Uploads are turned off in settings.json"
 	}
-	f, err := os.Open(path)
+	f, err := s.open(path)
 	if err != nil {
 		s.info = nil
 		return false, bad
@@ -90,7 +122,7 @@ func (s *UploadSettings) readFile() (bool, string) {
 		s.info = nil
 		return false, bad
 	}
-	b, err := io.ReadAll(io.LimitReader(f, maxUploadSettingsBytes+1))
+	b, err := s.read(f)
 	after, statErr := f.Stat()
 	if err != nil || statErr != nil || len(b) > maxUploadSettingsBytes || after.Size() != st.Size() || after.ModTime() != st.ModTime() {
 		s.info = nil
@@ -122,6 +154,13 @@ func WriteUploadSetting(dir, value string) error {
 	if value != "on" && value != "off" {
 		return errors.New("uploads must be on or off")
 	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return errors.New("cannot create local state directory")
+	}
+	if err := platform.ValidateSettingsParent(dir); err != nil {
+		return errors.New("local state directory has an untrusted writer")
+	}
+	dir = filepath.Join(dir, UploadSettingsDir)
 	if err := platform.EnsurePrivateDir(dir); err != nil {
 		return errors.New("cannot create private local settings directory")
 	}
@@ -159,7 +198,7 @@ func (s *Service) UploadStatus() UploadStatus {
 	if s.cfg.Uploads != nil {
 		return s.cfg.Uploads()
 	}
-	return UploadStatus{Enabled: true, Reason: "Uploads are on (default)"}
+	return UploadStatus{Enabled: false, Reason: "Uploads are off because this service has no upload policy"}
 }
 func (s *Service) uploadsAllowed() bool { return s.UploadStatus().Enabled }
 func (s *Service) UploadsAllowed() bool { return s.uploadsAllowed() }

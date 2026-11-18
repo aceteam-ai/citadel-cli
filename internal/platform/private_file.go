@@ -6,6 +6,38 @@ import (
 	"runtime"
 )
 
+// ValidateSettingsParent allows a legacy state container (including inherited
+// Windows ACLs), but refuses symlinks and another unprivileged writer. Settings
+// themselves still live in a separate protected, owner-only directory.
+func ValidateSettingsParent(path string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("not a directory")
+	}
+	return validateSettingsParent(path, st)
+}
+
+// OpenPrivateFile never follows a final symlink and never opens a Unix FIFO
+// in blocking mode. Ownership, access and file kind are judged on the handle.
+func OpenPrivateFile(path string) (*os.File, error) {
+	f, err := openPrivateNoFollow(path)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err == nil {
+		err = validatePrivateHandle(f, st)
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 // ValidatePrivateFile requires an existing regular, owner-only file, with the
 // same ownership and Windows protected-DACL rules as the browser session dir.
 func ValidatePrivateFile(path string) error { return validatePrivatePath(path, false) }

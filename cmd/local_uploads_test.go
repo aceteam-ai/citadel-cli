@@ -48,6 +48,9 @@ func TestRunLocalConfigUploadsReservedAndIsolated(t *testing.T) {
 		if !strings.Contains(out.String(), "Uploads are") {
 			t.Fatalf("missing status: %s", out.String())
 		}
+		if !strings.Contains(out.String(), "this shell's environment") {
+			t.Fatal("environment scope missing")
+		}
 		b, err := os.ReadFile(harness)
 		if err != nil || string(b) != original {
 			t.Fatal("harness changed")
@@ -97,10 +100,10 @@ func TestLocalMCPUploadsRuntimeCapturesEnvAndRereadsFile(t *testing.T) {
 	if !rt2.svc.UploadsAllowed() {
 		t.Fatal("on edit not read")
 	}
-	if err := platform.ValidatePrivateFile(filepath.Join(dir, localcobrowse.UploadSettingsFile)); err != nil {
+	if err := platform.ValidatePrivateFile(filepath.Join(dir, localcobrowse.UploadSettingsDir, localcobrowse.UploadSettingsFile)); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, localcobrowse.UploadSettingsFile), []byte("corrupt"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, localcobrowse.UploadSettingsDir, localcobrowse.UploadSettingsFile), []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if rt2.svc.UploadsAllowed() {
@@ -126,7 +129,10 @@ func TestLocalDoctorUploadsExplainsPolicy(t *testing.T) {
 	if !strings.Contains(out.String(), "turned off in settings.json") || !strings.Contains(out.String(), "unrecognized value") || strings.Contains(out.String(), "PRIVATE_UNKNOWN") {
 		t.Fatalf("bad doctor status: %s", out.String())
 	}
-	if err := os.WriteFile(filepath.Join(dir, localcobrowse.UploadSettingsFile), []byte("bad"), 0o600); err != nil {
+	if !strings.Contains(out.String(), "this shell's environment") {
+		t.Fatal("doctor environment scope missing")
+	}
+	if err := os.WriteFile(filepath.Join(dir, localcobrowse.UploadSettingsDir, localcobrowse.UploadSettingsFile), []byte("bad"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	out.Reset()
@@ -135,5 +141,26 @@ func TestLocalDoctorUploadsExplainsPolicy(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "unreadable, invalid") {
 		t.Fatal("corruption not explained")
+	}
+}
+
+func TestLocalMCPUploadsAfterOwnerDirectoryExists(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "local")
+	// Windows MkdirAll inherits an unprotected ACL, exactly as the existing
+	// owner, audit parents and viewer parents create the local container.
+	owner, err := localcobrowse.AcquireOwner(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(owner.Release)
+	if err := localcobrowse.WriteUploadSetting(dir, "off"); err != nil {
+		t.Fatal(err)
+	}
+	st := localcobrowse.NewUploadSettings(dir, "").Status()
+	if st.Enabled {
+		t.Fatal("existing owner directory prevented opt-out")
+	}
+	if err := platform.ValidatePrivateDir(filepath.Join(dir, localcobrowse.UploadSettingsDir)); err != nil {
+		t.Fatal(err)
 	}
 }

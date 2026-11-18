@@ -158,6 +158,7 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 	fail := func(what, detail string) { failed = true; line("FAIL", what, detail) }
 	if d.uploads != nil {
 		st := d.uploads()
+		st.Reason += " (this shell's environment; a running owner keeps its startup environment)"
 		if st.Enabled {
 			ok("Uploads", st.Reason)
 		} else {

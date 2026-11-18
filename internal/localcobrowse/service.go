@@ -166,7 +166,7 @@ type Event struct {
 // Config configures a Service. Zero values take the local-mode defaults.
 type Config struct {
 	Browser Browser
-	// Uploads is the live, fail-closed local upload policy (S2). Nil defaults on.
+	// Uploads is the live, fail-closed local upload policy (S2). Nil denies.
 	Uploads            func() UploadStatus
 	MaxSessions        int
 	WritesPerMinute    int

@@ -23,7 +23,7 @@ func uploadFixture(t *testing.T) (string, *UploadSettings) {
 }
 
 func TestUploadsEnvironmentAndFileBothDeny(t *testing.T) {
-	for _, value := range []string{"", "0", "false", "no", "off", " OFF ", "FaLsE", "on", "true", "1", "invalid-PRIVATE"} {
+	for _, value := range []string{"", "0", "false", "no", "off", " OFF ", "FaLsE", "on", "true", "1", " yes ", "invalid-PRIVATE"} {
 		t.Run(value, func(t *testing.T) {
 			dir, _ := uploadFixture(t)
 			s := NewUploadSettings(dir, value)
@@ -33,7 +33,7 @@ func TestUploadsEnvironmentAndFileBothDeny(t *testing.T) {
 			if st.Enabled == off {
 				t.Fatalf("environment %q: %+v", value, st)
 			}
-			if (st.Warning != "") != (v != "" && !off) {
+			if (st.Warning != "") != (v == "invalid-private") {
 				t.Fatalf("warning: %+v", st)
 			}
 			if strings.Contains(st.Warning, "PRIVATE") {
@@ -66,13 +66,13 @@ func TestUploadsMissingDefaultsOnWithoutEffects(t *testing.T) {
 }
 
 func TestUploadsInvalidSettingsFailClosed(t *testing.T) {
-	for _, body := range []string{"", "null", "[]", "{}", "{", `{"uploads":true}`, `{"uploads":"ON"}`, `{"uploads":"on","unknown":1}`, `{"uploads":"off","uploads":"on"}`, `{"uploads":"on"} {}`, `{"uploads":"on"}` + strings.Repeat(" ", maxUploadSettingsBytes+1)} {
+	for _, body := range []string{"", "null", "[]", "{}", "{", `{"uploads":true}`, `{"uploads":"ON"}`, `{"other":"on"}`, `{"Uploads":"on"}`, `{"uploads":"on","unknown":1}`, `{"uploads":"off","uploads":"on"}`, `{"uploads":"on"} {}`, `{"uploads":"on"}` + strings.Repeat(" ", maxUploadSettingsBytes+1)} {
 		t.Run(body[:min(len(body), 50)], func(t *testing.T) {
 			dir, s := uploadFixture(t)
 			if !s.Status().Enabled {
 				t.Fatal("fixture")
 			}
-			if err := os.WriteFile(filepath.Join(dir, UploadSettingsFile), []byte(body), 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, UploadSettingsDir, UploadSettingsFile), []byte(body), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			st := s.Status()
@@ -85,7 +85,7 @@ func TestUploadsInvalidSettingsFailClosed(t *testing.T) {
 
 func TestUploadsLiveCacheAndReplacementIdentity(t *testing.T) {
 	dir, s := uploadFixture(t)
-	path := filepath.Join(dir, UploadSettingsFile)
+	path := filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)
 	if !s.Status().Enabled || !s.Status().Enabled {
 		t.Fatal("on cache")
 	}
@@ -152,7 +152,7 @@ func TestUploadsLiveCacheAndReplacementIdentity(t *testing.T) {
 func TestUploadsUnsafeAndUnreadableSettings(t *testing.T) {
 	t.Run("directory", func(t *testing.T) {
 		dir, s := uploadFixture(t)
-		path := filepath.Join(dir, UploadSettingsFile)
+		path := filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)
 		if err := os.Remove(path); err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +172,7 @@ func TestUploadsUnsafeAndUnreadableSettings(t *testing.T) {
 			if !s.Status().Enabled {
 				t.Fatal("fixture")
 			}
-			if err := os.Chmod(filepath.Join(dir, UploadSettingsFile), mode); err != nil {
+			if err := os.Chmod(filepath.Join(dir, UploadSettingsDir, UploadSettingsFile), mode); err != nil {
 				t.Fatal(err)
 			}
 			if s.Status().Enabled {
@@ -182,7 +182,7 @@ func TestUploadsUnsafeAndUnreadableSettings(t *testing.T) {
 	}
 	t.Run("symlink", func(t *testing.T) {
 		dir, s := uploadFixture(t)
-		path := filepath.Join(dir, UploadSettingsFile)
+		path := filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)
 		if err := os.Rename(path, path+".other"); err != nil {
 			t.Fatal(err)
 		}
@@ -195,7 +195,7 @@ func TestUploadsUnsafeAndUnreadableSettings(t *testing.T) {
 	})
 	t.Run("parent", func(t *testing.T) {
 		dir, s := uploadFixture(t)
-		if err := os.Chmod(dir, 0o755); err != nil {
+		if err := os.Chmod(filepath.Join(dir, UploadSettingsDir), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if s.Status().Enabled {
@@ -209,8 +209,8 @@ func TestUploadsUnsafeAndUnreadableSettings(t *testing.T) {
 
 func TestUploadsWritePrivateReplaceAndSharedGate(t *testing.T) {
 	dir, settings := uploadFixture(t)
-	path := filepath.Join(dir, UploadSettingsFile)
-	if err := platform.ValidatePrivateDir(dir); err != nil {
+	path := filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)
+	if err := platform.ValidatePrivateDir(filepath.Join(dir, UploadSettingsDir)); err != nil {
 		t.Fatal(err)
 	}
 	if err := platform.ValidatePrivateFile(path); err != nil {
@@ -221,7 +221,7 @@ func TestUploadsWritePrivateReplaceAndSharedGate(t *testing.T) {
 		if st.Mode().Perm() != 0o600 {
 			t.Fatal("file not 0600")
 		}
-		st, _ = os.Stat(dir)
+		st, _ = os.Stat(filepath.Join(dir, UploadSettingsDir))
 		if st.Mode().Perm() != 0o700 {
 			t.Fatal("dir not 0700")
 		}
@@ -242,7 +242,7 @@ func TestUploadsWritePrivateReplaceAndSharedGate(t *testing.T) {
 	if settings.Status().Enabled {
 		t.Fatal("invalid write changed off")
 	}
-	entries, err := os.ReadDir(dir)
+	entries, err := os.ReadDir(filepath.Join(dir, UploadSettingsDir))
 	if err != nil || len(entries) != 1 || entries[0].Name() != UploadSettingsFile {
 		t.Fatalf("temp leak: %v %v", entries, err)
 	}
@@ -271,12 +271,140 @@ func TestUploadsConcurrentGateReaders(t *testing.T) {
 	}
 }
 
+func TestUploadsUnwiredServiceDenies(t *testing.T) {
+	s := New(Config{})
+	if s.UploadsAllowed() || !errors.Is(s.CheckUploads(), ErrUploadsDisabled) {
+		t.Fatal("unwired gate enabled")
+	}
+}
+
+func TestUploadsStatErrorsDeny(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-dir")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{path, filepath.Join(path, "child")} {
+		if NewUploadSettings(dir, "").Status().Enabled {
+			t.Fatal("ENOTDIR or non-directory accepted")
+		}
+	}
+	dir, s := uploadFixture(t)
+	if !s.Status().Enabled {
+		t.Fatal("fixture")
+	}
+	s.stat = func(path string) (os.FileInfo, error) {
+		if path == filepath.Join(dir, UploadSettingsDir, UploadSettingsFile) {
+			return nil, os.ErrPermission
+		}
+		return os.Lstat(path)
+	}
+	if s.Status().Enabled {
+		t.Fatal("file stat error reused cache or treated as missing")
+	}
+}
+
+func TestUploadsOpenedIdentityAndPostReadChangesDeny(t *testing.T) {
+	t.Run("identity", func(t *testing.T) {
+		dir, s := uploadFixture(t)
+		s.open = func(path string) (*os.File, error) {
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := WriteUploadSetting(dir, "on"); err != nil {
+				t.Fatal(err)
+			}
+			// Keep size and mtime equal so only the handle identity fence can
+			// detect this replacement, not the independent post-read checks.
+			if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+				t.Fatal(err)
+			}
+			return platform.OpenPrivateFile(path)
+		}
+		if s.Status().Enabled {
+			t.Fatal("replacement between lstat and open accepted")
+		}
+	})
+	for _, field := range []string{"size", "mtime"} {
+		t.Run(field, func(t *testing.T) {
+			dir, s := uploadFixture(t)
+			read := s.read
+			s.read = func(f *os.File) ([]byte, error) {
+				b, err := read(f)
+				path := filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)
+				if field == "size" {
+					before, statErr := f.Stat()
+					if statErr != nil {
+						t.Fatal(statErr)
+					}
+					if err := os.WriteFile(path, append(b, ' '), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					st, err := f.Stat()
+					if err != nil {
+						t.Fatal(err)
+					}
+					changed := st.ModTime().Add(time.Second)
+					if err := os.Chtimes(path, changed, changed); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return b, err
+			}
+			if s.Status().Enabled {
+				t.Fatal("post-read " + field + " change accepted")
+			}
+		})
+	}
+	t.Run("post-read stat error", func(t *testing.T) {
+		_, s := uploadFixture(t)
+		read := s.read
+		s.read = func(f *os.File) ([]byte, error) { b, err := read(f); _ = f.Close(); return b, err }
+		if s.Status().Enabled {
+			t.Fatal("post-read stat error accepted")
+		}
+	})
+}
+
+func TestUploadsMissingFileDoesNotBypassUntrustedDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACL regression runs in platform/command tests")
+	}
+	for _, which := range []string{"state", "settings"} {
+		t.Run(which, func(t *testing.T) {
+			dir, s := uploadFixture(t)
+			if err := WriteUploadSetting(dir, "off"); err != nil {
+				t.Fatal(err)
+			}
+			unsafe := dir
+			mode := os.FileMode(0o777)
+			if which == "settings" {
+				unsafe = filepath.Join(dir, UploadSettingsDir)
+				mode = 0o755
+			}
+			if err := os.Chmod(unsafe, mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)); err != nil {
+				t.Fatal(err)
+			}
+			if s.Status().Enabled || NewUploadSettings(dir, "").Status().Enabled {
+				t.Fatal("missing off file bypassed directory trust")
+			}
+		})
+	}
+}
+
 func TestUploadsSettingsBoundAndFailedReplaceCleanup(t *testing.T) {
 	if maxUploadSettingsBytes != 4096 {
 		t.Fatal("settings read bound changed")
 	}
 	dir, _ := uploadFixture(t)
-	path := filepath.Join(dir, UploadSettingsFile)
+	path := filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +414,7 @@ func TestUploadsSettingsBoundAndFailedReplaceCleanup(t *testing.T) {
 	if err := WriteUploadSetting(dir, "off"); err == nil {
 		t.Fatal("replaced non-file destination")
 	}
-	entries, err := os.ReadDir(dir)
+	entries, err := os.ReadDir(filepath.Join(dir, UploadSettingsDir))
 	if err != nil || len(entries) != 1 || !entries[0].IsDir() {
 		t.Fatalf("failed replace leaked temp: %v %v", entries, err)
 	}
