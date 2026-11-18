@@ -37,17 +37,18 @@ host record identically. Two flags are load-bearing and MUST NOT drift:
                                                records pure silence)
   --password-store=basic                      (#5122: build-independent cookie
                                                crypto for the seeded profile)
-Two flags are container-specific deltas from the host builder, documented inline:
+One flag is a container-specific delta from the host builder, documented inline:
   --remote-debugging-address=0.0.0.0          (host uses 127.0.0.1; a docker port
                                                publish cannot reach a container
                                                loopback bind, so CDP binds all
                                                interfaces INSIDE the container and
                                                the compose publish restricts it to
                                                host loopback)
-  --no-sandbox                                (Chromium's setuid sandbox is
-                                               unavailable in the hardened
-                                               container; isolation comes from the
-                                               container boundary)
+The renderer sandbox is opt-in (citadel-cli#1788): by default --no-sandbox stays
+and nothing is checked. With MEETING_REQUIRE_SANDBOX=1 (set by the run contract,
+which also passes a pinned seccomp profile) there is no --no-sandbox and
+start_session refuses to hand out a session until sandbox_check verifies the
+renderer is sandboxed.
 """
 
 from __future__ import annotations
@@ -74,6 +75,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
+import sandbox_check
+
 
 def _truthy(val: str | None) -> bool:
     return (val or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -89,6 +92,22 @@ MEETING_CDP_INTERNAL_PORT = int(os.environ.get("MEETING_CDP_INTERNAL_PORT", "922
 DISPLAY = os.environ.get("DISPLAY", ":99")
 PROFILE_DIR = os.environ.get("MEETING_PROFILE_DIR", "/profile")
 WORKSPACE = os.environ.get("CITADEL_WORKSPACE", "/workspace")
+
+# Browser choice (citadel-cli#1788). The run contract passes MEETING_BROWSER; only
+# stock chromium exists today, and an unknown value is refused rather than
+# silently falling back, so adding a kind later is one entry here plus its binary
+# lookup in _browser_binary.
+SUPPORTED_BROWSERS = ("chromium",)
+BROWSER_KIND = os.environ.get("MEETING_BROWSER", "chromium") or "chromium"
+
+# Renderer sandbox (citadel-cli#1788). OFF by default so the image behaves exactly
+# as it always has for callers that predate it (the catalog meeting module pulls
+# :latest and runs under the engine's default seccomp, where Chromium's sandbox
+# cannot start): it keeps --no-sandbox and runs no check. The browser-runtime run
+# contract passes MEETING_REQUIRE_SANDBOX=1, which drops --no-sandbox, runs
+# sandbox_check on every session and refuses sessions that fail it.
+REQUIRE_SANDBOX = _truthy(os.environ.get("MEETING_REQUIRE_SANDBOX"))
+SANDBOX_VERIFY_TIMEOUT = float(os.environ.get("MEETING_SANDBOX_VERIFY_TIMEOUT", "20"))
 
 # Silence floor for the canary probe, in dBFS. A 440 Hz tone captured through the
 # null-sink monitor lands well above -30 dBFS; pure silence (the failure mode that
@@ -155,11 +174,18 @@ def _chromium_binary() -> str | None:
     return None
 
 
+def _browser_binary() -> str | None:
+    """Path of the selected browser, or None. Unknown kinds find nothing."""
+    if BROWSER_KIND == "chromium":
+        return _chromium_binary()
+    return None
+
+
 def build_chrome_args(cdp_port: int, profile_dir: str) -> list[str]:
     """Chromium command line for a meeting-bot launch inside the container.
 
     Mirrors internal/platform buildChromeArgs(meeting options) EXCEPT for the
-    single documented container delta (--no-sandbox). CDP binds 127.0.0.1 exactly
+    container delta (--no-sandbox unless MEETING_REQUIRE_SANDBOX; see REQUIRE_SANDBOX). CDP binds 127.0.0.1 exactly
     like the host builder; a socat forwarder (not a chrome flag) is what exposes it
     on the published port. Pure function so the flag set -- especially the two
     load-bearing flags -- is unit-testable without launching a browser.
@@ -184,9 +210,10 @@ def build_chrome_args(cdp_port: int, profile_dir: str) -> list[str]:
         "--password-store=basic",
         # load-bearing (#5098): let incoming WebRTC audio play with no user gesture
         "--autoplay-policy=no-user-gesture-required",
-        # container-specific: no setuid sandbox available in the hardened container
-        "--no-sandbox",
     ]
+    if not REQUIRE_SANDBOX:
+        # Historical behaviour, kept unless the run contract requires the sandbox.
+        args.append("--no-sandbox")
     # Bounded disk cache (aceteam-ai/citadel-cli#1760): the container runner sets
     # MEETING_DISK_CACHE_MB so a long session cannot grow the profile mount.
     cache_mb = os.environ.get("MEETING_DISK_CACHE_MB", "")
@@ -641,6 +668,7 @@ class Session:
     mic_process: subprocess.Popen[bytes] | None = None
     capture_process: subprocess.Popen[bytes] | None = None
     ending: bool = False
+    sandboxed: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -702,10 +730,12 @@ def _virtual_mic_health() -> dict[str, object]:
 
 @app.get("/health")
 def health() -> JSONResponse:
-    chromium = _chromium_binary()
+    chromium = _browser_binary()
     problems: list[str] = []
-    if chromium is None:
-        problems.append("chromium not found")
+    if BROWSER_KIND not in SUPPORTED_BROWSERS:
+        problems.append(f"unsupported browser {BROWSER_KIND!r}")
+    elif chromium is None:
+        problems.append(f"{BROWSER_KIND} not found")
     if not shutil.which("ffmpeg"):
         problems.append("ffmpeg not found")
     if not pulse_ready():
@@ -755,9 +785,11 @@ def health() -> JSONResponse:
 
 @app.post("/sessions")
 def start_session(req: StartSessionRequest) -> JSONResponse:
-    chromium = _chromium_binary()
+    if BROWSER_KIND not in SUPPORTED_BROWSERS:
+        return JSONResponse(status_code=400, content={"error": f"unsupported browser {BROWSER_KIND!r}"})
+    chromium = _browser_binary()
     if chromium is None:
-        return JSONResponse(status_code=503, content={"error": "chromium not found"})
+        return JSONResponse(status_code=503, content={"error": f"{BROWSER_KIND} not found"})
     if not pulse_ready():
         return JSONResponse(status_code=503, content={"error": "pulse server not ready"})
 
@@ -798,9 +830,37 @@ def start_session(req: StartSessionRequest) -> JSONResponse:
             created_at=time.time(),
             max_duration_seconds=max(60, int(req.max_duration_seconds)),
         )
+        session = _sessions[sid]
+    # Fail closed: the session is only handed out once the renderer is verified
+    # sandboxed. A sandbox that cannot start (blocked syscalls, no seccomp
+    # profile) tears the session down instead of running unsandboxed.
+    sandboxed = False
+    if REQUIRE_SANDBOX:
+        report = sandbox_check.wait_for_sandbox(
+            chrome.pid, SANDBOX_VERIFY_TIMEOUT, alive=lambda: chrome.poll() is None
+        )
+        if not report.ok:
+            with session.lock:
+                session.ending = True
+            _teardown(session)
+            with _sessions_lock:
+                if _sessions.get(sid) is session:
+                    _sessions.pop(sid)
+            return JSONResponse(
+                status_code=500,
+                content={"error": "sandbox_unverified", "reason": report.reason},
+            )
+        sandboxed = True
+    session.sandboxed = sandboxed
     return JSONResponse(
         status_code=201,
-        content={"session_id": sid, "cdp_port": MEETING_CDP_PORT, "sink": sink},
+        content={
+            "session_id": sid,
+            "cdp_port": MEETING_CDP_PORT,
+            "sink": sink,
+            "browser": BROWSER_KIND,
+            "sandboxed": sandboxed,
+        },
     )
 
 
@@ -819,6 +879,8 @@ def session_status(session_id: str) -> JSONResponse:
             "session_id": s.session_id,
             "cdp_port": s.cdp_port,
             "sink": s.sink_name,
+            "browser": BROWSER_KIND,
+            "sandboxed": s.sandboxed,
             "chrome_running": s.chrome.poll() is None,
             "recording": s.recorder is not None and s.recorder.poll() is None,
             "record_path": s.record_path,
@@ -1223,3 +1285,52 @@ def _reaper() -> None:
             with _sessions_lock:
                 if _sessions.get(s.session_id) is s:
                     _sessions.pop(s.session_id)
+
+
+def sandbox_selfcheck() -> int:
+    """Launch the selected browser headless exactly as a session would (same
+    build_chrome_args, so no --no-sandbox) and exit 0 only if the renderer is
+    verified sandboxed. Run inside the container under the run contract's pinned
+    seccomp profile:
+
+        docker run --rm --user 10001:10001 --cap-drop ALL \\
+          --security-opt no-new-privileges --security-opt seccomp=<profile> \\
+          --read-only --tmpfs /tmp --tmpfs /home/bot --tmpfs /profile \\
+          --entrypoint python3 <image> /app/meetingd.py --sandbox-selfcheck
+
+    It never stands in for the per-session check in start_session; it exists so
+    an image build can prove the sandbox works before the sandbox label is set.
+    """
+    import json
+
+    binary = _browser_binary()
+    if binary is None:
+        print(json.dumps({"ok": False, "reason": f"{BROWSER_KIND} not found"}))
+        return 1
+    global REQUIRE_SANDBOX
+    REQUIRE_SANDBOX = True  # the self-check always tests the sandboxed launch
+    profile = tempfile.mkdtemp(prefix="sandbox-selfcheck-")
+    proc = subprocess.Popen(
+        [binary, "--headless=new", *build_chrome_args(MEETING_CDP_INTERNAL_PORT, profile), "about:blank"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        report = sandbox_check.wait_for_sandbox(
+            proc.pid, SANDBOX_VERIFY_TIMEOUT, alive=lambda: proc.poll() is None
+        )
+    finally:
+        proc.kill()
+        proc.wait()
+        shutil.rmtree(profile, ignore_errors=True)
+    print(json.dumps({"ok": report.ok, "reason": report.reason, "renderers": report.renderers}))
+    return 0 if report.ok else 1
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--sandbox-selfcheck" in sys.argv[1:]:
+        sys.exit(sandbox_selfcheck())
+    print("usage: meetingd.py --sandbox-selfcheck (the service itself runs under uvicorn)", file=sys.stderr)
+    sys.exit(2)
