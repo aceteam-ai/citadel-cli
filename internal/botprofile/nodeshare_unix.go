@@ -48,14 +48,14 @@ func loadOrCreateNodeShare(dir string) ([]byte, error) {
 }
 
 func checkOwnerMode(st *unix.Stat_t, kind uint32, what string) error {
-	if st.Mode&unix.S_IFMT != kind {
+	if uint32(st.Mode)&unix.S_IFMT != kind {
 		return fmt.Errorf("botprofile: node share %s is not the expected file type", what)
 	}
 	if int(st.Uid) != os.Geteuid() {
 		return fmt.Errorf("botprofile: node share %s is not owned by the running user", what)
 	}
 	if st.Mode&0o077 != 0 {
-		return fmt.Errorf("botprofile: node share %s is accessible to group or other (mode %o); refusing", what, st.Mode&0o777)
+		return fmt.Errorf("botprofile: node share %s is accessible to group or other (mode %o); refusing", what, uint32(st.Mode)&0o777)
 	}
 	return nil
 }
