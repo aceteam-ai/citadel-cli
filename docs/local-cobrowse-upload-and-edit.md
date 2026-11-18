@@ -1015,6 +1015,9 @@ S10.
   defaults on when no file exists; an unwired service policy always denies.
   Ancestors above the local state directory are not trust-checked, and a
   symlink to a directory is allowed there when checking for absent settings.
+  On Windows, atomic replacement retries sharing, lock and access-denied
+  errors at most ten times, with at most 225 ms total backoff. Other errors
+  return immediately; exhausted retries report failure, never false success.
 
 **Command.** `citadel local config uploads on|off|status`. `uploads` is a
 reserved word in `local config` and can never be a harness name. It writes

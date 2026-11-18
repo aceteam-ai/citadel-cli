@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -16,6 +17,9 @@ import (
 const UploadSettingsFile = "settings.json"
 const UploadSettingsDir = "local-settings"
 const maxUploadSettingsBytes = 4096
+
+const uploadReplaceAttempts = 10
+const uploadReplaceDelay = 25 * time.Millisecond
 
 var ErrUploadsDisabled = errors.New("uploads_off: uploads are turned off on this computer; check citadel local config uploads status")
 
@@ -104,6 +108,20 @@ func snapshotUploadFile(path string) (os.FileInfo, error) {
 	}
 	defer f.Close()
 	return f.Stat()
+}
+
+// Windows can refuse replacement while another handle is briefly live, even
+// though the private readers allow sharing. Retry only the OS-specific errors,
+// using the same private temp file, with at most 225 ms of backoff. Never delete
+// the destination or report success without a successful atomic replacement.
+func retryUploadReplace(attempt func() error, retryable func(error) bool, pause func(time.Duration)) error {
+	for n := 0; ; n++ {
+		err := attempt()
+		if err == nil || !retryable(err) || n+1 >= uploadReplaceAttempts {
+			return err
+		}
+		pause(uploadReplaceDelay)
+	}
 }
 
 func (s *UploadSettings) readFile() (bool, string) {
@@ -235,7 +253,9 @@ func WriteUploadSetting(dir, value string) error {
 	if err := f.Close(); err != nil {
 		return errors.New("cannot close local settings file")
 	}
-	if err := os.Rename(f.Name(), filepath.Join(dir, UploadSettingsFile)); err != nil {
+	if err := retryUploadReplace(func() error {
+		return os.Rename(f.Name(), filepath.Join(dir, UploadSettingsFile))
+	}, uploadRenameRetryable, time.Sleep); err != nil {
 		return errors.New("cannot replace local settings file")
 	}
 	return nil

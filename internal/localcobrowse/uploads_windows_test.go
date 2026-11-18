@@ -3,6 +3,7 @@
 package localcobrowse
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,27 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"golang.org/x/sys/windows"
 )
+
+func TestUploadsWindowsRenameRetryClassification(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{windows.ERROR_SHARING_VIOLATION, true},
+		{windows.ERROR_LOCK_VIOLATION, true},
+		{windows.ERROR_ACCESS_DENIED, true},
+		{&os.LinkError{Op: "rename", Err: windows.ERROR_SHARING_VIOLATION}, true},
+		{windows.ERROR_FILE_NOT_FOUND, false},
+		{windows.ERROR_PATH_NOT_FOUND, false},
+		{windows.ERROR_DISK_FULL, false},
+		{errors.New("unknown"), false},
+		{nil, false},
+	} {
+		if got := uploadRenameRetryable(tc.err); got != tc.want {
+			t.Fatalf("retryable(%v)=%v", tc.err, got)
+		}
+	}
+}
 
 func uploadMetadataSnapshot(t *testing.T, path string) os.FileInfo {
 	t.Helper()

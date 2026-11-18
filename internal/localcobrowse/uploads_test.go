@@ -594,3 +594,48 @@ func TestUploadsSettingsBoundAndFailedReplaceCleanup(t *testing.T) {
 		t.Fatalf("failed replace leaked temp: %v %v", entries, err)
 	}
 }
+
+func TestUploadsReplacementRetryIsBoundedAndSelective(t *testing.T) {
+	if uploadReplaceAttempts != 10 || uploadReplaceDelay != 25*time.Millisecond {
+		t.Fatal("replacement retry budget changed")
+	}
+	transient := errors.New("synthetic sharing conflict")
+	permanent := errors.New("synthetic permanent error")
+	for _, tc := range []struct {
+		name       string
+		failures   int
+		err        error
+		wantCalls  int
+		wantPauses int
+		wantErr    error
+	}{
+		{"success", 0, nil, 1, 0, nil},
+		{"transient then success", 3, transient, 4, 3, nil},
+		{"exhausted", uploadReplaceAttempts + 1, transient, 10, 9, transient},
+		{"permanent", uploadReplaceAttempts + 1, permanent, 1, 0, permanent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls, pauses := 0, 0
+			var elapsed time.Duration
+			err := retryUploadReplace(func() error {
+				calls++
+				if calls <= tc.failures {
+					return tc.err
+				}
+				return nil
+			}, func(err error) bool { return err == transient }, func(delay time.Duration) {
+				if delay != 25*time.Millisecond {
+					t.Fatal("unexpected delay")
+				}
+				pauses++
+				elapsed += delay
+			})
+			if err != tc.wantErr || calls != tc.wantCalls || pauses != tc.wantPauses || elapsed > 225*time.Millisecond {
+				t.Fatalf("err=%v calls=%d pauses=%d elapsed=%s", err, calls, pauses, elapsed)
+			}
+		})
+	}
+	if runtime.GOOS != "windows" && uploadRenameRetryable(os.ErrPermission) {
+		t.Fatal("Unix permission failures must not retry")
+	}
+}
