@@ -130,6 +130,11 @@ success); only a payload `report_partial: true` gets the structured `done:false`
 result. Local mode returns the same details as a tool error. An approved commit
 that was dispatched and then failed resolves as `unconfirmed`, not failed.
 `TestCobrowseRealBrowserActionLatency` pins the budgets.
+`CobrowseSessionManager.WithPageSignals` owns `page_text` and `password_field` on
+the start and single-session status results (aceteam#13773): an isolated-world
+read with the live driver fence re-checked after every await, node-wide sessions
+only (which have no page policy, so `pageActiveErr` is a no-op there), omitted on
+handoff or any failure, and never logged or put in the registry record.
 `TypeWith` and `KeyWith` (#1730) own the targeted replace and key modifiers, each still one
 `runAction`: resolve the selector (or the focused field) to an element and bind to it, select the whole
 content (refused unless the selection spans it), then insert (or a real Backspace for an empty clear, read
