@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+
+	"github.com/aceteam-ai/citadel-cli/internal/botprofile"
 )
 
 // Metadata is safe to place in a receipt: no path, credential or image bytes.
@@ -130,6 +133,9 @@ func (f WorkspaceFreezer) Freeze(ctx context.Context, contract Contract) (Snapsh
 func (f WorkspaceFreezer) read(ctx context.Context, root *os.Root, input Descriptor) (frozenInput, error) {
 	if ctx.Err() != nil {
 		return frozenInput{}, refuse("cancelled_or_timeout")
+	}
+	if botprofile.DenyPath(filepath.Join(root.Name(), filepath.FromSlash(input.Path))) != nil {
+		return frozenInput{}, refuse("invalid_input_path")
 	}
 	file, err := openWorkspaceInput(root, input.Path)
 	if err != nil {

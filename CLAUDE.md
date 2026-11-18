@@ -348,6 +348,21 @@ cannot, including any dir whose marker is present but unreadable or damaged, and
 clean. A persistent session's teardown returns a working-dir removal failure. `TestRealBrowserPersistentProfileRoundTrip`
 is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
 
+`botprofile.Open` owns the unattended bot-profile store (#1761, epic #1757 C3):
+`<node config dir>/bot-profiles/`, sealed through `cobrowseprofile.OpenSealedHandle`
+(same archive, lock and atomic write; only the `Sealer` key source differs). The
+key is `deriveKey` over the node share (`loadOrCreateNodeShare`, a refuse-never-repair
+0600 file in a 0700 dir) and an AceTeam share from a `ShareProvider`; the sealer
+binds org id, identity id and the Chromium major (`ErrNewerChromium`) inside the
+AEAD. `botprofile.DenyPath` owns the denial and decides by identity (`os.SameFile`
+against the config dirs, case-insensitive name), so it holds for a store that does
+not exist yet; every `os.Root` handler (FILE_FETCH, template inputs, mediainput,
+memorygit) and every walker calls it. A share this process did not create is never
+adopted (`ErrNodeShareContested`). Recovery is deleting `bot-profiles/`, which
+crypto-shreds every bot profile.
+The A0 payload key for the AceTeam share is not named yet: when it is, add it to
+`jobprivacy` redaction. `internal/botprofile` tests pin the construction.
+
 `localaudit.Log` owns the local co-browse audit chain under
 `<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
 month. `cmd.localStateDir` owns where local mode keeps its owner lock, audit
