@@ -18,6 +18,42 @@
 
 set -euo pipefail
 
+# ── Be gentle with the build host ─────────────────────────────────────────
+#
+# The release gate runs `go test ./...` and six cross-compiles. On a shared
+# build host that can starve other work, so by default the whole run is
+# re-executed once under a CPU limit:
+#   - CITADEL_RELEASE_CPUS (default 4): Go parallelism (GOMAXPROCS and
+#     `go test`/`go build -p`).
+#   - CITADEL_RELEASE_CPU_QUOTA (default 400%): a hard cgroup cap via a
+#     transient `systemd-run --user --scope`, when a user manager is available.
+#     Set it to "off" to skip the cap.
+#   - nice 19 and idle-class I/O priority, when available.
+# Set CITADEL_RELEASE_GENTLE=off to run at full speed.
+if [[ "${CITADEL_RELEASE_GENTLE:-on}" != "off" && -z "${CITADEL_RELEASE_GENTLE_ACTIVE:-}" ]]; then
+  export CITADEL_RELEASE_GENTLE_ACTIVE=1
+  _cpus="${CITADEL_RELEASE_CPUS:-4}"
+  if ! [[ "$_cpus" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CITADEL_RELEASE_CPUS must be a positive integer, got: $_cpus" >&2
+    exit 1
+  fi
+  export GOMAXPROCS="$_cpus"
+  export GOFLAGS="${GOFLAGS:+$GOFLAGS }-p=$_cpus"
+  _prefix=()
+  _quota="${CITADEL_RELEASE_CPU_QUOTA:-400%}"
+  # Probe with a no-op scope first, so a host without a usable user manager
+  # falls back to nice/ionice instead of failing the release.
+  if [[ "$_quota" != "off" ]] && command -v systemd-run >/dev/null 2>&1 \
+     && systemd-run --user --scope --quiet -p "CPUQuota=$_quota" -- true >/dev/null 2>&1; then
+    _prefix+=(systemd-run --user --scope --quiet -p "CPUQuota=$_quota" --)
+  fi
+  command -v ionice >/dev/null 2>&1 && _prefix+=(ionice -c 3)
+  command -v nice >/dev/null 2>&1 && _prefix+=(nice -n 19)
+  if ((${#_prefix[@]} > 0)); then
+    exec "${_prefix[@]}" "$0" "$@"
+  fi
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
