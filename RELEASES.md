@@ -4013,3 +4013,22 @@ Auto-generated log of every release.
   - fix(module): catalog cold-cache fetch, meeting marker node dir, re-detect meeting when healthy (#1774)
 
 
+---
+
+## v2.240.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 40 |
+| Lines added | +2905 |
+
+**Changes:**
+
+  - release: CPU-limited by default, and trust main CI's test gate (#1791)
+  - feat(browser-runtime): browser-runtime image with a per-session run contract (C1) (#1786)
+  - feat(local): add live upload opt-out setting (#1737 S2) (#1780)
+  - fix(local): approved link outcome, viewer Enter, installer text, banner wording (#1784)
+  - ci: run PR CI for stacked PRs on feat/fix/docs/chore bases (#1775)
+
+
