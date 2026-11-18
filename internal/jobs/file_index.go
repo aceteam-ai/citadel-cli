@@ -301,7 +301,10 @@ func (h *FileIndexHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 			return filepath.SkipAll
 		}
 		if isBotProfilesDir(p, d) {
-			return filepath.SkipDir
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil // a symlinked file into the store: skip only this entry
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -625,7 +628,10 @@ func countIndexCandidates(root, filePattern string, ctx JobContext) int {
 			return filepath.SkipAll
 		}
 		if isBotProfilesDir(p, d) {
-			return filepath.SkipDir
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil // a symlinked file into the store: skip only this entry
 		}
 		if d.IsDir() {
 			name := d.Name()

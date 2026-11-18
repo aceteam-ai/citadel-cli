@@ -21,9 +21,9 @@ func TestBotProfilesDeniedToFileSandboxes(t *testing.T) {
 	if err := os.WriteFile(blob, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old := botProfileDirsFn
-	botProfileDirsFn = func() []string { return []string{store} }
-	t.Cleanup(func() { botProfileDirsFn = old })
+	old := botprofile.ConfigDirs
+	botprofile.ConfigDirs = func() []string { return []string{cfg} }
+	t.Cleanup(func() { botprofile.ConfigDirs = old })
 
 	// The workspace IS the node config dir: the worst case for a lexical check.
 	for _, target := range []string{blob, store, filepath.Join(store, "new.enc"), filepath.Join("bot-profiles", "bot-x.enc")} {
@@ -89,9 +89,9 @@ func TestBotProfilesSkippedByWalkAndList(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfg, "plain.txt"), []byte("needle"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old := botProfileDirsFn
-	botProfileDirsFn = func() []string { return []string{store} }
-	t.Cleanup(func() { botProfileDirsFn = old })
+	old := botprofile.ConfigDirs
+	botprofile.ConfigDirs = func() []string { return []string{cfg} }
+	t.Cleanup(func() { botprofile.ConfigDirs = old })
 
 	entries, _ := os.ReadDir(cfg)
 	for _, e := range entries {
@@ -118,9 +118,9 @@ func TestBotProfilesDeniedThroughFileHandlers(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfg, "plain.txt"), []byte("needle"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old := botProfileDirsFn
-	botProfileDirsFn = func() []string { return []string{store} }
-	t.Cleanup(func() { botProfileDirsFn = old })
+	old := botprofile.ConfigDirs
+	botprofile.ConfigDirs = func() []string { return []string{cfg} }
+	t.Cleanup(func() { botprofile.ConfigDirs = old })
 
 	h := NewFileSearchHandler(cfg)
 	if _, err := h.Execute(JobContext{}, makeJob(map[string]string{"path": store, "query": "needle"})); err == nil {

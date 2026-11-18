@@ -346,7 +346,12 @@ is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
 key is `deriveKey` over the node share (`loadOrCreateNodeShare`, a refuse-never-repair
 0600 file in a 0700 dir) and an AceTeam share from a `ShareProvider`; the sealer
 binds org id, identity id and the Chromium major (`ErrNewerChromium`) inside the
-AEAD. `jobs.denyBotProfiles` keeps the dir out of every FILE_* sandbox and walker.
+AEAD. `botprofile.DenyPath` owns the denial and decides by identity (`os.SameFile`
+against the config dirs, case-insensitive name), so it holds for a store that does
+not exist yet; every `os.Root` handler (FILE_FETCH, template inputs, mediainput,
+memorygit) and every walker calls it. A share this process did not create is never
+adopted (`ErrNodeShareContested`). Recovery is deleting `bot-profiles/`, which
+crypto-shreds every bot profile.
 The A0 payload key for the AceTeam share is not named yet: when it is, add it to
 `jobprivacy` redaction. `internal/botprofile` tests pin the construction.
 

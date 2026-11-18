@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -403,5 +404,97 @@ func TestResetRemovesBlobOnly(t *testing.T) {
 	}
 	if got, err := materialize(t, dir, idA, sp, 120); err != nil || got != "" {
 		t.Fatalf("fresh profile after reset: %q %v", got, err)
+	}
+}
+
+func TestFlippedVersionByteRefused(t *testing.T) {
+	dir := t.TempDir()
+	sp := providerFor(idA)
+	seal(t, dir, idA, sp, 120, "x")
+	p := filepath.Join(Dir(dir), idA.ProfileName()+".enc")
+	blob, _ := os.ReadFile(p)
+	blob[0] ^= 0x01
+	if err := os.WriteFile(p, blob, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := materialize(t, dir, idA, sp, 120); !errors.Is(err, ErrOpenFailed) {
+		t.Fatalf("flipped version byte accepted: %v", err)
+	}
+	blob[0] ^= 0x01
+	blob[len(blob)-1] ^= 0x01
+	_ = os.WriteFile(p, blob, 0o600)
+	if _, err := materialize(t, dir, idA, sp, 120); !errors.Is(err, ErrOpenFailed) {
+		t.Fatalf("tampered ciphertext accepted: %v", err)
+	}
+}
+
+func TestOversizedNodeShareRefused(t *testing.T) {
+	for _, n := range []int{ShareLen + 1, 1 << 20} {
+		dir := t.TempDir()
+		sp := providerFor(idA)
+		seal(t, dir, idA, sp, 120, "x")
+		p := filepath.Join(Dir(dir), NodeShareFile)
+		if err := os.WriteFile(p, bytes.Repeat([]byte{1}, n), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := materialize(t, dir, idA, sp, 120); err == nil {
+			t.Fatalf("share of %d bytes accepted", n)
+		}
+	}
+}
+
+func TestNodeShareExtraHardLinkRefused(t *testing.T) {
+	dir := t.TempDir()
+	sp := providerFor(idA)
+	seal(t, dir, idA, sp, 120, "x")
+	if err := os.Link(filepath.Join(Dir(dir), NodeShareFile), filepath.Join(dir, "second-name")); err != nil {
+		t.Skip("hard links unavailable")
+	}
+	if _, err := materialize(t, dir, idA, sp, 120); err == nil {
+		t.Fatal("multiply linked share accepted")
+	}
+}
+
+func TestPlantedShareIsNotAdopted(t *testing.T) {
+	dir := t.TempDir()
+	sdir := Dir(dir)
+	if err := os.MkdirAll(sdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	planted := filepath.Join(sdir, NodeShareFile)
+	if err := os.WriteFile(planted, share(0x66), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := createShare(sdir, planted); !errors.Is(err, ErrNodeShareContested) {
+		t.Fatalf("want ErrNodeShareContested, got %v", err)
+	}
+	if b, _ := os.ReadFile(planted); !bytes.Equal(b, share(0x66)) {
+		t.Fatal("existing share was overwritten")
+	}
+}
+
+func TestStaleShareTempsRemovedFreshKept(t *testing.T) {
+	dir := t.TempDir()
+	sdir := Dir(dir)
+	if err := os.MkdirAll(sdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(sdir, ".share-old")
+	fresh := filepath.Join(sdir, ".share-new")
+	for _, p := range []string{stale, fresh} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	seal(t, dir, idA, providerFor(idA), 120, "x")
+	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+		t.Fatal("stale temp kept")
+	}
+	if _, err := os.Lstat(fresh); err != nil {
+		t.Fatal("fresh temp removed")
 	}
 }

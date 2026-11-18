@@ -34,6 +34,11 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 )
 
+// Recovery: if the node share is lost, corrupt or refused, deleting
+// bot-profiles/ is the only way back. That crypto-shreds every bot profile on
+// the node, and each identity must be signed in again. Nothing here repairs a
+// store automatically.
+
 // DirName is the store directory under the node config dir. Job path sandboxes
 // refuse it (internal/jobs.denyBotProfiles).
 const DirName = "bot-profiles"
@@ -52,7 +57,14 @@ var (
 	ErrNewerChromium    = errors.New("botprofile: profile was sealed by a newer Chromium major than this runtime")
 	ErrUnknownChromium  = errors.New("botprofile: runtime Chromium major is unknown")
 	ErrOpenFailed       = errors.New("botprofile: cannot open profile (wrong key, wrong org or identity, or corrupt blob)")
-	ErrLocked           = errors.New("botprofile: key material has been cleared")
+	// ErrNodeShareContested: no node share existed when this process looked,
+	// but one appeared before it could install its own. This process never
+	// adopts a share it did not create in the same call. Retrying is safe
+	// (the next open reads it through the ownership and mode checks); a
+	// repeated failure means something else is writing the store dir. C4 and C7
+	// surface it as a typed refusal.
+	ErrNodeShareContested = errors.New("botprofile: node share was created by another party during first use")
+	ErrLocked             = errors.New("botprofile: key material has been cleared")
 )
 
 // ShareProvider releases the AceTeam share for one identity row. Production

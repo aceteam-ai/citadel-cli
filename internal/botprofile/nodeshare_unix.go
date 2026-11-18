@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -33,8 +35,9 @@ func loadOrCreateNodeShare(dir string) ([]byte, error) {
 	if err := checkOwnerMode(&dst, unix.S_IFDIR, "store dir"); err != nil {
 		return nil, err
 	}
+	removeStaleTemps(dir)
 	path := filepath.Join(dir, NodeShareFile)
-	b, err := readShare(path)
+	b, err := readShareSettled(path)
 	if err == nil {
 		return b, nil
 	}
@@ -44,7 +47,42 @@ func loadOrCreateNodeShare(dir string) ([]byte, error) {
 	if err := createShare(dir, path); err != nil {
 		return nil, err
 	}
-	return readShare(path)
+	return readShareSettled(path)
+}
+
+// readShareSettled reads the share, tolerating the creation window in which
+// the temp name and the final name are both linked (link count 2). A share that
+// stays multiply linked is refused: a second name is a second route to the key.
+func readShareSettled(path string) ([]byte, error) {
+	for i := 0; ; i++ {
+		b, err := readShare(path)
+		if !errors.Is(err, errShareLinked) || i >= 5 {
+			if errors.Is(err, errShareLinked) {
+				return nil, errors.New("botprofile: node share has extra hard links; refusing")
+			}
+			return b, err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+var errShareLinked = errors.New("linked")
+
+// removeStaleTemps deletes temp names left by a creator that died between
+// create and link. Recent ones are left alone: a live creator owns them.
+func removeStaleTemps(dir string) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), ".share-") {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.Mode().IsRegular() && time.Since(info.ModTime()) > time.Minute {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 func checkOwnerMode(st *unix.Stat_t, kind uint32, what string) error {
@@ -76,6 +114,9 @@ func readShare(path string) ([]byte, error) {
 	}
 	if err := checkOwnerMode(&st, unix.S_IFREG, "file"); err != nil {
 		return nil, err
+	}
+	if uint64(st.Nlink) != 1 {
+		return nil, errShareLinked
 	}
 	if st.Size != ShareLen {
 		return nil, errors.New("botprofile: node share file has the wrong length; refusing")
@@ -111,7 +152,13 @@ func createShare(dir, path string) error {
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("botprofile: write node share: %w", err)
 	}
-	if err := os.Link(tmp.Name(), path); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Link(tmp.Name(), path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			// Someone else installed a share between our read and our link. We
+			// never adopt a share this process did not create: the caller may
+			// retry, which re-reads it through the normal checks.
+			return ErrNodeShareContested
+		}
 		return fmt.Errorf("botprofile: install node share: %w", err)
 	}
 	return nil
