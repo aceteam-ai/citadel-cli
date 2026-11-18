@@ -94,6 +94,18 @@ func (s *UploadSettings) absentDirectory(path string) bool {
 	}
 }
 
+// A handle-based snapshot eagerly records Windows file identity and uses the
+// private opener's read/write/delete sharing. Asking os.SameFile to load an
+// Lstat result lazily would briefly open the path with exclusive sharing.
+func snapshotUploadFile(path string) (os.FileInfo, error) {
+	f, err := platform.OpenPrivateFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.Stat()
+}
+
 func (s *UploadSettings) readFile() (bool, string) {
 	const bad = "Uploads are off because settings.json is unreadable, invalid or not owner-only; use citadel local config uploads on|off to replace it"
 	if s.dir == "" {
@@ -133,13 +145,14 @@ func (s *UploadSettings) readFile() (bool, string) {
 		s.info = nil
 		return false, bad
 	}
-	// os.Lstat on Windows leaves the file ID lazy. Force its acquisition
-	// before the open boundary, otherwise SameFile can resolve the old info's
-	// path only after replacement and compare the replacement to itself.
-	if !os.SameFile(st, st) {
+	// Pin identity before the read-open boundary without an exclusive Windows
+	// open that could block the concurrent atomic settings writer.
+	pinned, err := snapshotUploadFile(path)
+	if err != nil || pinned.Size() != st.Size() || pinned.ModTime() != st.ModTime() {
 		s.info = nil
 		return false, bad
 	}
+	st = pinned
 	f, err := s.open(path)
 	if err != nil {
 		s.info = nil

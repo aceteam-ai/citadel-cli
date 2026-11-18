@@ -124,7 +124,7 @@ func TestUploadsCacheRechecksOpenPermission(t *testing.T) {
 		t.Fatal("cache hit did not open with current read permission")
 	}
 	for _, f := range opened {
-		if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+		if _, err := f.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
 			t.Fatal("gate leaked an opened descriptor")
 		}
 	}
@@ -167,6 +167,37 @@ func TestUploadsCacheRejectsMetadataChangingDuringOpen(t *testing.T) {
 			}
 			if s.Status().Enabled {
 				t.Fatal("cached on bypassed " + field + " changing during open")
+			}
+		})
+	}
+}
+
+func TestUploadsRejectsMetadataChangingBeforeSnapshot(t *testing.T) {
+	for _, field := range []string{"size", "mtime"} {
+		t.Run(field, func(t *testing.T) {
+			dir, s := uploadFixture(t)
+			path := filepath.Join(dir, UploadSettingsDir, UploadSettingsFile)
+			stat := s.stat
+			s.stat = func(candidate string) (os.FileInfo, error) {
+				st, err := stat(candidate)
+				if candidate != path || err != nil {
+					return st, err
+				}
+				changed := st.ModTime()
+				if field == "size" {
+					if err := os.WriteFile(path, []byte("{\"uploads\":\"on\"}\n "), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					changed = changed.Add(time.Second)
+				}
+				if err := os.Chtimes(path, changed, changed); err != nil {
+					t.Fatal(err)
+				}
+				return st, nil
+			}
+			if s.Status().Enabled {
+				t.Fatal("accepted " + field + " changing before identity snapshot")
 			}
 		})
 	}
