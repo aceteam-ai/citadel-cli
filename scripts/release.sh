@@ -129,7 +129,7 @@ hook_pre_publish() {
 # The test gate trusts main's CI instead of re-running it here: CI already
 # runs the full suite, vet and lint on every main commit, and re-running them
 # on the release host duplicates that work on a shared machine. The release
-# must be cut from a commit whose required "Build + Test" check succeeded.
+# must be cut from a clean tree at origin/main where every CI check succeeded.
 # Set CITADEL_RELEASE_LOCAL_TESTS=1 to run go test and go vet locally instead.
 hook_test() {
   if [[ "${CITADEL_RELEASE_LOCAL_TESTS:-0}" == "1" ]]; then
@@ -140,8 +140,13 @@ hook_test() {
     return
   fi
 
-  if ! git diff --quiet || ! git diff --cached --quiet; then
-    err "The working tree has uncommitted changes; CI did not test them."
+  # git status --porcelain also lists untracked files: go build compiles any
+  # stray .go file in the tree, and CI never saw those.
+  local dirty
+  dirty=$(git status --porcelain --untracked-files=all)
+  if [[ -n "$dirty" ]]; then
+    err "The working tree has uncommitted or untracked files; CI did not test them:"
+    printf '%s\n' "$dirty" | head -20 >&2
     return 1
   fi
   local sha main_sha
@@ -154,17 +159,29 @@ hook_test() {
   fi
 
   info "Checking main CI at ${sha:0:12} (set CITADEL_RELEASE_LOCAL_TESTS=1 to test locally instead)..."
-  local conclusion
-  if ! conclusion=$(gh api "repos/${RELEASE_GITHUB_REPO}/commits/${sha}/check-runs?per_page=100" \
-      --jq '[.check_runs[] | select(.name == "Build + Test")] | sort_by(.completed_at) | last | .conclusion // "missing"'); then
+  # Every check run at the commit must have finished as success, skipped or
+  # neutral: the "Build + Test" aggregate is required, and a red lint, vet or
+  # Windows job under another name blocks the release too. A re-run check
+  # counts by its latest attempt.
+  local report
+  if ! report=$(gh api --paginate "repos/${RELEASE_GITHUB_REPO}/commits/${sha}/check-runs?per_page=100" \
+      --jq '.check_runs[] | [.name, (.completed_at // ""), .status, (.conclusion // "")] | @tsv'); then
     err "Could not read CI check runs for ${sha}."
     return 1
   fi
-  if [[ "$conclusion" != "success" ]]; then
-    err "Required check \"Build + Test\" at ${sha:0:12} is '${conclusion}', not 'success'. Wait for CI, or fix main."
+  local latest bad
+  latest=$(printf '%s\n' "$report" | sort -t$'\t' -k1,1 -k2,2 | awk -F'\t' 'NF{last[$1]=$0} END{for (n in last) print last[n]}')
+  if ! printf '%s\n' "$latest" | awk -F'\t' '$1=="Build + Test"{f=1} END{exit !f}'; then
+    err "Required check \"Build + Test\" has not run at ${sha:0:12}. Wait for CI."
     return 1
   fi
-  info "Main CI passed at ${sha:0:12}."
+  bad=$(printf '%s\n' "$latest" | awk -F'\t' 'NF && !($3=="completed" && ($4=="success" || $4=="skipped" || $4=="neutral")){print "  " $1 ": " $3 " " $4}')
+  if [[ -n "$bad" ]]; then
+    err "CI at ${sha:0:12} is not all green. Wait for CI, re-run flakes, or fix main:"
+    printf '%s\n' "$bad" >&2
+    return 1
+  fi
+  info "Main CI passed at ${sha:0:12} ($(printf '%s\n' "$latest" | grep -c .) checks)."
 }
 
 hook_build() {
