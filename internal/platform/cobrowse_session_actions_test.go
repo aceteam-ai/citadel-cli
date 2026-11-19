@@ -383,6 +383,8 @@ type fakeCDPServer struct {
 	// listedURL, when set, is the page URL the /json target list reports
 	// (default about:blank).
 	listedURL func() string
+	// custom, when set, answers a method before the built-in responses.
+	custom func(method string, params map[string]any) (map[string]any, bool)
 }
 
 func startFakeCDPServer(t *testing.T) *fakeCDPServer {
@@ -452,6 +454,14 @@ func (f *fakeCDPServer) callsFor(method string) []recordedCDPCall {
 }
 
 func (f *fakeCDPServer) respond(method string, params map[string]any) map[string]any {
+	f.mu.Lock()
+	custom := f.custom
+	f.mu.Unlock()
+	if custom != nil {
+		if res, ok := custom(method, params); ok {
+			return res
+		}
+	}
 	switch method {
 	case "Runtime.evaluate":
 		expr, _ := params["expression"].(string)

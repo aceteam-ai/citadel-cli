@@ -37,6 +37,14 @@ build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
 both heartbeat transports without native sampling. See
 `docs/heartbeat-capacity.md` for field semantics and platform limits.
 
+`localcobrowse.UploadSettings` owns local mode's upload opt-out: environment
+captured at owner construction, live bounded settings reads, and fail-closed
+permissions/parsing. `Service.CheckUploads` and `Service.UploadsAllowed` are the
+shared operation and dispatch gates for later upload slices. The reserved
+`local config uploads` command never enters harness-config code. This setting
+does not enable local staging, chooser interception or attachment by itself;
+see Q8 in `docs/local-cobrowse-upload-and-edit.md`.
+
 `mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
 descriptor acquisition: it checks a no-follow leaf pin before any readable
 leaf open, and fails closed if the verified procfs FD route is unavailable.
@@ -97,6 +105,10 @@ the platform supplies a unique staging destination and receives that exact
 relative path in the receipt. See `docs/file-fetch.md` for
 the contract.
 
+`platform.containerRunner` (citadel-cli#1760) is the browserRunner that runs each node co-browse session in its own browser-runtime container. `selectingRunner.useContainer` is the one per-launch decision, made by `launch` before it lays out the session dir (`LaunchOptions.UseContainer`): only the node-wide manager, only while `containerRunner.healthy` holds (engine reachable, pinned image present or pulled, contract label AND the `browserruntime.ImageLabelSandbox` marker that #1788 must set, since the contract-1 image runs Chromium with `--no-sandbox`), otherwise the host runner, logged once per reason. The argv is only `browserruntime.RunSpec.Args` (name, owner label, pull policy, userns, cache env and the read-only staging bind are RunSpec fields); engine calls go through the `ContainerEngine` seam wired in `cmd.configureBrowserRuntime`, with output capped by `cappedBuffer`. Only `<session>/profile` (`containerProfileSubdir`) is mounted writable: the pidfile, `.citadel-profile` marker and `.citadel-stage` stay outside it, staging is bound read-only at `StageMountPath`, and `cobrowseProc.browserFilePath` fails closed for anything else. `Launch` owns the fresh per-session network, `checkIsolation`, and `cleanupFailedLaunch` (known id, else the deterministic name after a label check); `verifyCDPIdentity` compares the in-container and published-port browser ids; `containerIdentity` gives a Windows host (no uid) the image user. `ownerFor` (base dir, registry dir, uid) stamps the owner label, and `sweepContainers` removes only containers and networks matching owner, `purpose=cobrowse`, the name `aceteam-brc-<id>` and `sessionIDPattern`, skipping the rest. `adoptContainer` owns re-adoption (id, StartedAt, labels incl. owner, network, ports, CDP id); `recoverContainer` leaves a record on `errCDPCheck` or `errRecordNotOurs` (which includes an owner or purpose label mismatch, so another worker's container is never removed) and expires and discards one that fails verification; `discardContainer` removes a container only when `ownsLabels` (runtime, session, owner, purpose) holds and a network only when `networkOwned` finds the same labels on the network itself. `ShutdownSessions` retains container sessions like scoped ones. `browserruntime.PinnedImage` is empty until a release pins an image, which keeps host runners in charge. The slot count is `BrowserSlots` in device config via `platform.SetBrowserSlots`; `CITADEL_COBROWSE_MAX_SESSIONS` still wins. Tests: `internal/platform/cobrowse_container_test.go`.
+
+The renderer sandbox in the browser-runtime container (citadel-cli#1788) has three owners and is opt-in per run. `browserruntime.RunSpec.Args` requires `SeccompProfile` (emits `--security-opt seccomp=<file>`) and passes `-e MEETING_REQUIRE_SANDBOX=1`; without that env the image behaves as it always did (`--no-sandbox`, no check), which keeps the catalog meeting module, which pulls `:latest` under the engine's default seccomp, unaffected. The profile is `browserruntime.SeccompProfileJSON` (Docker's default plus one unconditional allow of clone/unshare/chroot for Chromium's user-namespace sandbox, no capabilities, no `--privileged`), pinned by `SeccompProfileSHA256` and `TestSeccompProfilePinned`, written into the session dir by `WriteSeccompProfile` from `containerRunner.Launch`. Accepted risk: that rule lets every process in the container create user and network namespaces, the nf_tables/netlink CVE class Docker's default withholds; it is still better than `--no-sandbox`, and a `socket()` argument filter refusing netlink-netfilter is an optional follow-up. A host that forbids unprivileged user namespaces cannot run it and the session is refused. `sandbox_check.inspect_tree` (stdlib, `/proc`) is the proof, and it deliberately does not trust `Seccomp: 2` (the engine profile puts every container process in mode 2): every renderer must have a different user namespace and strictly more `Seccomp_filters` than the browser, a missing field fails, no process may carry `--no-sandbox` (cmdline is whitespace-tokenized because Chromium retitles processes), and no renderer is not a pass. `wait_for_sandbox` retries only "not there yet" verdicts and returns at once when the browser exits. `meetingd.start_session` runs it when `REQUIRE_SANDBOX` and tears the session down with `sandbox_unverified`; `defaultStartBrowser` trusts a 201 only when the reply says `sandboxed:true` and `browser=chromium`, with a POST timeout above meetingd's verify window. `meetingd.py --sandbox-selfcheck` implies require. The image label is `ARG SANDBOX_VERIFIED` (default empty, so nodes refuse the image); a build step may pass `1` only after the self-check exits 0 under the pinned profile, and that workflow step is not wired yet, so `PinnedImage` stays empty. `RunSpec.Browser` is a closed set (`browserruntime.browsers`, only `chromium`), stamped as `LabelBrowser` and `MEETING_BROWSER`; meetingd reports `browser` and `sandboxed` in session status. CloakBrowser is deferred: its binary license forbids redistributing it in a published image.
+
 `platform.browserRunner` owns the per-OS half of a co-browse session:
 discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
 `xvfbRunner` is the historical managed-Xvfb path, and its argument list is pinned
@@ -128,6 +140,107 @@ success); only a payload `report_partial: true` gets the structured `done:false`
 result. Local mode returns the same details as a tool error. An approved commit
 that was dispatched and then failed resolves as `unconfirmed`, not failed.
 `TestCobrowseRealBrowserActionLatency` pins the budgets.
+`CobrowseSessionManager.WithPageSignals` owns `page_text` and `password_field` on
+the start and single-session status results (aceteam#13773): an isolated-world
+read with the live driver fence re-checked after every await, node-wide sessions
+only (which have no page policy, so `pageActiveErr` is a no-op there), omitted on
+handoff or any failure, and never logged or put in the registry record.
+`TypeWith` and `KeyWith` (#1730) own the targeted replace and key modifiers, each still one
+`runAction`: resolve the selector (or the focused field) to an element and bind to it, select the whole
+content (refused unless the selection spans it), then insert (or a real Backspace for an empty clear, read
+back as empty), with `midActionFence` between steps. The last awaited call before the destructive event is
+`verifyBound`: same document (`loaderId`), same element still focused and, with clear, the selection still
+spanning the content; only the insert round trip follows. After the insert the page confirms it holds
+exactly the typed text (a boolean only), on every clear path, or `Cleared` stays false. A change after the page was touched is an incomplete action
+(not a refusal) carrying what happened. Only an input, textarea or the contenteditable host itself is a
+target, never under designMode; page-returned refusal strings are mapped to a fixed set. `CheckKeyChord` owns
+the modifier allowlist and decides which chords are refused (clipboard and editing chords are not allowed);
+`parseKeyAction` and `KeyWith` both call it before any dispatch. Other refusals (empty text without `clear`, selector over `MaxCobrowseSelectorLen`,
+modifiers outside 0..15, a selector that matches nothing or is not editable) send nothing.
+`ActionEffects.Cleared` is confirmed; `ClearedUnconfirmed` means the destructive event was sent without
+confirmation. Status `input_edit` (`InputEditV1`, non-tracking sessions only, like `FileUploadPageFence`)
+is the marker a caller checks first. Local mode does not pass the new fields.
+`TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
+
+`InspectTarget` owns the browser-created isolated world used for the complete
+target probe and form snapshot. The session caches only its latest target,
+frame and loader context, invalidates a lost context without retrying the read,
+and checks the live driver after every awaited call. `FormSnapshotScript` binds each File entry's
+field name, native file name, size, type and lastModified; it normalizes the
+browser's synthetic empty-file timestamp, refuses unreadable or excessive
+metadata, and never reads bytes or paths. The local commit card copies bounded
+metadata for display using text only, removes format/control characters and
+preserves the filename's final extension; an extension too long to display is
+unverifiable. `Classify` trusts only the probe's native-control chooser signal
+for a non-actionable file input or associated label. Other labels are described
+by the native control they activate, not the label's text; an uninspectable
+associated custom control is refused. Interactive descendants stay their own
+targets; actionable chooser controls retain commit checks. Agent views omit file
+metadata while the human drives, without altering the human's card. It does not attach a file
+or authorize staging; those remain separate upload slices. The rule version and
+`TestRealBrowserCommitActionsFileSnapshots` pin this approval behavior.
+
+`platform.StageFile` and `platform.SetFileInput` own file upload for remotely
+dispatched sessions (#1721, node side of aceteam#13831). Staged files live in a
+`cobrowseStagingDirName` dir inside the session's own working dir, so every
+teardown, failed launch and orphan sweep removes it; teardown also removes it
+before a persistent profile is sealed. `ValidateStagedName` owns the single
+base-name rule and `resolveStagedFile` owns the proof that a path handed to the
+browser is a regular file directly inside that dir; the size and count caps are
+`MaxCobrowseStagedFileBytes` and `MaxCobrowseStagedFiles`. `set_file_input` is an
+ordinary `runAction` action. `cobrowseSession.watchChooserOnce` keeps one extra
+CDP connection that intercepts file choosers and `handleChooserEvent` owns the
+pending-chooser state reported in status; it never fills anything. The stage
+bytes ride in the `jobprivacy.BytesKey` payload field, which is dropped from
+every retained copy. `CobrowseSessionHandler.filesAllowed` gates `stage_file` and
+`set_file_input` on the live Files permission (same source as FILE_WRITE_BYTES,
+read per job) and refuses with `jobs.ErrFilesDisabled`; no passcode; a handler with no permission source denies.
+Teardown closes staging (`closeStaging`, under `stageMu`) before removing it and
+refuses to seal a persistent profile if removal fails; `cobrowseprofile` also
+never archives or restores `.citadel-stage`. A `backend_node_id` is accepted only
+for the chooser the page opened. `set_file_input` requires `expected_url`:
+the fence uses no page script: `checkFrameURL` takes the target frame's
+browser-side URL from `Page.getFrameTree` (url plus urlFragment), the target
+is resolved in an isolated world of that frame (`Page.createIsolatedWorld`),
+and `setFilesIfPageIs` re-reads the frame URL, re-checks the driver, then
+dispatches on that isolated object; any mismatch is `ErrTargetChanged`,
+returned unchanged; status
+reports `file_upload_page_fence: expected_url_v1`. The worker acks a `stage_file` entry with
+`AckStagedFileJob` (XACK then XDEL, no payload decoding); other actions use the
+plain ack (API mode has no equivalent yet). Page-tracking (local) sessions get
+none of this.
+`TestCobrowseRealBrowserFileUpload` and `TestWindowsRealBrowserFileUpload` are
+the real-browser acceptance.
+
+`platform.CobrowseSessionManager.HumanAttachStagedFile` owns the human's answer
+to a pending file chooser (#1723): a `file_attach` stream input
+(`cobrowsestream.InputTypeFileAttach`), not a job action, MCP tool or HTTP route,
+so `fileAttachManagerSession` in `cobrowsestream/adapter.go` is its only caller
+(`TestOnlyTheStreamAdapterCallsHumanAttach`; `TestNoLocalMCPToolCanAttachAsHuman`
+and `TestCobrowseSession_NoActionReachesHumanFileAttach` pin the agent side).
+`fileFill`/`fillFileInput` is the one dispatch path both it and `set_file_input`
+use (isolated world, `checkFileInput`, `setFilesIfPageIs`, `redactPath`); the two
+differ only in their fences. The agent's "refused while a human drives" becomes
+`humanAttachFence` (requesting viewer connection still open, the captured
+chooser still pending by pointer, then `humanControlFence`: viewer attached and
+`explicitHandoff`), run after the lookups and again after the final frame read,
+immediately before `DOM.setFileInputFiles`. A frame mismatch also drops that
+stale chooser. And `expected_url` becomes the chooser binding:
+the node id must be the pending chooser's, the chooser must still be the pending
+one, and the frame URL `watchChooserOnce` read from `Page.getFrameTree` when the
+chooser opened (`FileChooserPending.FrameURL`) must still be the frame's URL at
+dispatch, since only a main-frame navigation clears a chooser. The node manager
+has no per-session action lock: agent actions and the human attach are kept apart
+only by the `explicitHandoff` flag, each checking it right before dispatch with
+no lock held across the CDP call, so a handoff or resume landing in that gap can
+let both dispatch (the gap every agent action already has; `attachMu` only
+serializes human attaches). Files is read live (`SetFilesAllowed`, wired from `nodeFilesEnabled` in
+`startCobrowseStreamServer`, nil denies) on the offer, up front and again before
+dispatch. `HumanFileAttachSupported` is false for a page-tracking manager, so
+local mode never gets the `file_chooser` frame or handles the input. The audit is
+a `[cobrowse] audit file_attach actor=human` log line (name, size, sha256), like
+`stage_file` and `set_file_input`; the target-event sink is local-mode only.
+Errors reach the viewer only as the fixed codes `AttachFailureReason` returns.
 
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
 per-domain write grant (default deny, see the next paragraph), the abuse limits, the
@@ -244,6 +357,21 @@ an interrupted session's decrypted copy whose owner is gone and reports any it
 cannot, including any dir whose marker is present but unreadable or damaged, and `citadel local passphrase forget` refuses unless that comes back
 clean. A persistent session's teardown returns a working-dir removal failure. `TestRealBrowserPersistentProfileRoundTrip`
 is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
+
+`botprofile.Open` owns the unattended bot-profile store (#1761, epic #1757 C3):
+`<node config dir>/bot-profiles/`, sealed through `cobrowseprofile.OpenSealedHandle`
+(same archive, lock and atomic write; only the `Sealer` key source differs). The
+key is `deriveKey` over the node share (`loadOrCreateNodeShare`, a refuse-never-repair
+0600 file in a 0700 dir) and an AceTeam share from a `ShareProvider`; the sealer
+binds org id, identity id and the Chromium major (`ErrNewerChromium`) inside the
+AEAD. `botprofile.DenyPath` owns the denial and decides by identity (`os.SameFile`
+against the config dirs, case-insensitive name), so it holds for a store that does
+not exist yet; every `os.Root` handler (FILE_FETCH, template inputs, mediainput,
+memorygit) and every walker calls it. A share this process did not create is never
+adopted (`ErrNodeShareContested`). Recovery is deleting `bot-profiles/`, which
+crypto-shreds every bot profile.
+The A0 payload key for the AceTeam share is not named yet: when it is, add it to
+`jobprivacy` redaction. `internal/botprofile` tests pin the construction.
 
 `localaudit.Log` owns the local co-browse audit chain under
 `<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC

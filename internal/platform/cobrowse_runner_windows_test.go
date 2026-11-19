@@ -628,3 +628,24 @@ func TestWindowsRealBrowserProbeRetryAndSingleLaunch(t *testing.T) {
 		t.Fatalf("the start URL must be loaded exactly once, got %d", n)
 	}
 }
+
+// A browser we stopped ourselves after a timeout must not be reported as having
+// exited on its own (#1795).
+func TestWindowsHeadlessLaunchErrorWording(t *testing.T) {
+	cause := errors.New("timed out waiting for DevToolsActivePort")
+	self := headlessLaunchError("edge", true, 1, cause)
+	if !strings.Contains(self.Error(), "exited during headless launch (exit code 1)") {
+		t.Fatalf("self-exit not reported: %v", self)
+	}
+	slow := headlessLaunchError("edge", false, 0, cause)
+	if strings.Contains(slow.Error(), "exited during") {
+		t.Fatalf("timeout reported as exit: %v", slow)
+	}
+	if !errors.Is(slow, ErrBrowserAutomationBlocked) || !strings.Contains(slow.Error(), cause.Error()) {
+		t.Fatalf("timeout lost its sentinel or cause: %v", slow)
+	}
+	imp := headlessLaunchError("edge", false, 0, errCDPImpostor)
+	if !errors.Is(imp, errCDPImpostor) {
+		t.Fatalf("impostor not wrapped: %v", imp)
+	}
+}

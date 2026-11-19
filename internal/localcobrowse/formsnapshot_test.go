@@ -87,6 +87,7 @@ const env = {
   formData: (f, sub) => { if (f.throws) throw new TypeError("submitter"); return f; },
   entries: (fd) => fd.submitted || [],
   isFile: (v) => v !== null && typeof v === "object" && v.file === true,
+  fileMeta: (v) => ({name:v.name, size:v.size, type:v.type, lastModified:v.lastModified}),
   inForm: (f, c) => f.elements.indexOf(c) >= 0,
   abs: (u) => new URL(u, "http://a.test/page").href,
   base: () => "http://a.test/page",

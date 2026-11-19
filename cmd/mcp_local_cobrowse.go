@@ -173,6 +173,23 @@ func (rt *localCobrowseRuntime) auditPrecheck() error {
 
 func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	rt := &localCobrowseRuntime{stop: make(chan struct{}), closed: make(chan struct{})}
+	// Capture only the environment now; resolve the local state path lazily,
+	// so constructing a bridge never reads user state or creates a directory.
+	uploadEnvironment := os.Getenv("CITADEL_LOCAL_UPLOADS")
+	var uploadOnce sync.Once
+	var uploadSettings *localcobrowse.UploadSettings
+	uploadStatus := func() localcobrowse.UploadStatus {
+		uploadOnce.Do(func() {
+			var dir string
+			if opts.ownerDir != nil {
+				dir = opts.ownerDir()
+			} else {
+				dir = localStateDir()
+			}
+			uploadSettings = localcobrowse.NewUploadSettings(dir, uploadEnvironment)
+		})
+		return uploadSettings.Status()
+	}
 	browser := opts.browser
 	var manager *platform.CobrowseSessionManager
 	if browser == nil {
@@ -221,6 +238,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	}
 	rt.svc = localcobrowse.New(localcobrowse.Config{
 		Browser:     browser,
+		Uploads:     uploadStatus,
 		Profiles:    profiles,
 		URLPolicy:   policy,
 		ViewerPorts: viewerPorts,
@@ -301,6 +319,9 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			}
 		}
 	}()
+	if manager != nil {
+		manager.SetFilesAllowed(rt.svc.UploadsAllowed)
+	}
 	return rt
 }
 

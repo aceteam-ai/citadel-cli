@@ -76,6 +76,9 @@ func (h *FileListHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 	var results []fileEntry
 	for _, entry := range entries {
 		name := entry.Name()
+		if isBotProfilesDir(filepath.Join(validated, name), entry) {
+			continue
+		}
 
 		// Apply glob filter if provided.
 		if pattern != "" {

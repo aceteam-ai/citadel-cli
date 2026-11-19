@@ -42,6 +42,11 @@ type PageState struct {
 	// Title is document.title, already bounded and stripped of control
 	// characters (SanitizeCobrowseTitle).
 	Title string `json:"title,omitempty"`
+	// DocID identifies the current document (performance.timeOrigin), so a
+	// same-URL reload or redirect is told apart from no navigation. It is a
+	// page-world hint, not a trust signal (the page can influence it). Empty when
+	// unknown. Not part of any wire format.
+	DocID string `json:"-"`
 }
 
 // MaxCobrowseTitleRunes bounds the page title returned from a navigation.
@@ -145,7 +150,7 @@ func settlePageCtx(parent context.Context, p pin, before string, requireChange b
 func readPageState(p pin) (PageState, error) { return readPageStateOn(p) }
 
 func readPageStateOn(c cdpCaller) (PageState, error) {
-	val, err := evaluateOn(c, `({url: location.href, ready: document.readyState, title: document.title})`, false)
+	val, err := evaluateOn(c, `({url: location.href, ready: document.readyState, title: document.title, doc: (function(){try{return String(performance.timeOrigin)}catch(e){return ""}})()})`, false)
 	if err != nil {
 		return PageState{}, err
 	}
@@ -153,7 +158,8 @@ func readPageStateOn(c cdpCaller) (PageState, error) {
 	u, _ := obj["url"].(string)
 	r, _ := obj["ready"].(string)
 	t, _ := obj["title"].(string)
-	return PageState{URL: u, ReadyState: r, Title: SanitizeCobrowseTitle(t)}, nil
+	d, _ := obj["doc"].(string)
+	return PageState{URL: u, ReadyState: r, Title: SanitizeCobrowseTitle(t), DocID: d}, nil
 }
 
 type SelectResult struct {
@@ -220,10 +226,12 @@ func (s *cobrowseSession) requireDrivablePort() (int, error) {
 // page changed after it was chosen, so a popup that opens in between never
 // receives a click or keystrokes meant for the page that was checked.
 type pin struct {
-	port int
-	id   string
-	ws   string
-	set  *targetSet
+	session    *cobrowseSession
+	background bool
+	port       int
+	id         string
+	ws         string
+	set        *targetSet
 	// refused: the page is the refused last page, pinned only to navigate away.
 	refused bool
 }
@@ -258,6 +266,17 @@ func (p pin) verifyCtx(parent context.Context) error {
 	snap, err := p.set.sync(ctx, p.port)
 	if err != nil {
 		return err
+	}
+	if p.background {
+		for _, tg := range snap.Targets {
+			if tg.ID == p.id {
+				if tg.Refused {
+					return ErrPageRefused
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("no such page %q in this session", p.id)
 	}
 	if snap.Active != p.id {
 		return ErrTargetChanged
@@ -302,7 +321,7 @@ func (s *cobrowseSession) pinNavigation() (pin, error) {
 	if expect != "" && expect != tg.ID {
 		return pin{}, ErrTargetChanged
 	}
-	return pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: set, refused: true}, nil
+	return pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: set, refused: true, session: s}, nil
 }
 
 // refusedRecoveryWait bounds how long a navigation away from a refused page
@@ -349,7 +368,7 @@ func (s *cobrowseSession) pinActionCtx(ctx context.Context) (pin, error) {
 	tracking, expect := s.tracking, s.expectTarget
 	s.mu.Unlock()
 	if !tracking {
-		return pin{port: port}, nil
+		return pin{port: port, session: s}, nil
 	}
 	p, err := pinForCtx(ctx, port)
 	if err != nil {
@@ -358,6 +377,7 @@ func (s *cobrowseSession) pinActionCtx(ctx context.Context) (pin, error) {
 	if expect != "" && p.id != expect {
 		return pin{}, ErrTargetChanged
 	}
+	p.session = s
 	return p, nil
 }
 
@@ -395,11 +415,22 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 		// refused write).
 		return CobrowseSessionStatus{}, err
 	}
+	if s.tracking && s.policy != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		err = s.policy(ctx, url)
+		cancel()
+		if err != nil {
+			return CobrowseSessionStatus{}, err
+		}
+	}
 	var before string
 	if !p.refused { // nothing runs in a refused page but the navigation away
 		if ps, err := readPageState(p); err == nil {
 			before = ps.URL
 		}
+	}
+	if err := p.check(); err != nil {
+		return CobrowseSessionStatus{}, err
 	}
 	if _, err := p.cdp("Page.navigate", map[string]any{"url": url}); err != nil {
 		return CobrowseSessionStatus{}, err
@@ -513,6 +544,11 @@ func (m *CobrowseSessionManager) ScreenshotStatus(id string) (string, CobrowseSe
 	if err != nil {
 		return "", CobrowseSessionStatus{}, err
 	}
+	// Preserve the read-result fence when integrating the remote read path:
+	// a handoff or refused/changed page during capture discards the image.
+	if err := s.fence(b.op, p); err != nil {
+		return "", CobrowseSessionStatus{}, err
+	}
 	data, _ := res["data"].(string)
 	if data == "" {
 		return "", CobrowseSessionStatus{}, fmt.Errorf("empty screenshot data from CDP")
@@ -574,30 +610,10 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 
 // Type inserts text into whatever element currently holds focus in one
 // session's browser (via CDP Input.insertText) -- the caller is expected to
-// have focused a field first, typically with a preceding `click`.
+// have focused a field first, typically with a preceding `click`. See TypeWith
+// for the targeted and replacing forms.
 func (m *CobrowseSessionManager) Type(id, text string) (CobrowseSessionStatus, error) {
-	s, err := m.sessionForAction(id)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	b, cancel := newActionBudget()
-	defer cancel()
-	p, err := s.pinActionCtx(b.op)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.runAction(b, p, "type", func(r *actionRun) error {
-		if err := r.fence(); err != nil {
-			return err
-		}
-		r.eff.Dispatched = true
-		r.eff.TypedLength, r.eff.TypedUnconfirmed = typedLength(text), true
-		if _, err := r.conn.Call("Input.insertText", map[string]any{"text": text}); err != nil {
-			return err
-		}
-		r.eff.TypedUnconfirmed = false
-		return nil
-	})
+	return m.TypeWith(id, text, TypeOptions{})
 }
 
 // Select changes a native select through the page DOM. Native popup windows do
@@ -624,6 +640,9 @@ func (m *CobrowseSessionManager) Select(id, selector, value, label string) (Sele
 		el.dispatchEvent(new Event("change", {bubbles: true}));
 		return {value: el.value, label: el.selectedOptions[0]?.label || ""};
 	})()`, jsStringLiteral(selector), jsStringLiteral(value), jsStringLiteral(value), jsStringLiteral(label))
+	if err := p.check(); err != nil {
+		return SelectResult{}, err
+	}
 	result, err := runtimeEvaluate(p, expr)
 	if err != nil {
 		return SelectResult{}, err
@@ -646,43 +665,7 @@ func (m *CobrowseSessionManager) Select(id, selector, value, label string) (Sele
 // Key sends a real key press and release. Text is never logged by the job
 // handler; the MCP audit records only the action name.
 func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, error) {
-	s, err := m.sessionForAction(id)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	b, cancel := newActionBudget()
-	defer cancel()
-	p, err := s.pinActionCtx(b.op)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	code, vk, produced, ok := browserKey(key)
-	if !ok {
-		return CobrowseSessionStatus{}, fmt.Errorf("unsupported key")
-	}
-	kind := "rawKeyDown"
-	if produced != "" {
-		kind = "keyDown"
-	}
-	params := map[string]any{"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk}
-	if produced != "" {
-		params["text"] = produced
-	}
-	return s.runAction(b, p, "key", func(r *actionRun) error {
-		if err := r.fence(); err != nil {
-			return err
-		}
-		r.eff.Dispatched = true
-		if _, err := r.conn.Call("Input.dispatchKeyEvent", params); err != nil {
-			return err
-		}
-		// A human can take control while the key-down is awaited.
-		if err := r.midActionFence(); err != nil {
-			return err
-		}
-		_, err := r.conn.Call("Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk})
-		return err
-	})
+	return m.KeyWith(id, key, 0)
 }
 
 func browserKey(key string) (string, int, string, bool) {
@@ -757,15 +740,8 @@ func (m *CobrowseSessionManager) Scroll(id, selector string, x, y *float64, dx, 
 // Extract reads the text content (and, optionally, named attribute values) of
 // the first element matching selector in one session's browser.
 func (m *CobrowseSessionManager) Extract(id, selector string, attrs []string) (ExtractResult, error) {
-	s, err := m.sessionForAction(id)
-	if err != nil {
-		return ExtractResult{}, err
-	}
-	p, err := s.pinAction()
-	if err != nil {
-		return ExtractResult{}, err
-	}
-	return extractElement(p, selector, attrs)
+	result, _, err := m.ExtractTarget(id, "", selector, attrs)
+	return result, err
 }
 
 // ExtractBounded is Extract with the text cut to maxChars inside the page (so an

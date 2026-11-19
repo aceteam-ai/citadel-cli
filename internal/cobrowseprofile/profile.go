@@ -137,7 +137,12 @@ func validateName(name string) error {
 // storePath returns the absolute path of the sealed blob for name under baseDir.
 // name is assumed already validated.
 func storePath(baseDir, name string) string {
-	return filepath.Join(baseDir, profilesDirName, name+profileFileExt)
+	return storePathIn(filepath.Join(baseDir, profilesDirName), name)
+}
+
+// storePathIn is storePath for a store whose blobs live directly in dir.
+func storePathIn(dir, name string) string {
+	return filepath.Join(dir, name+profileFileExt)
 }
 
 // Handle is a single unlocked, single-session-locked persistent profile bound to
@@ -154,9 +159,54 @@ func storePath(baseDir, name string) string {
 type Handle struct {
 	storePath string
 	context   string
-	sess      *nodevault.Session
+	sess      Sealer
 
 	closeOnce sync.Once
+}
+
+// Sealer is the key source behind a Handle: it seals and unseals the profile
+// blob under a context label and zeroes its key material on Lock.
+// *nodevault.Session satisfies it (the passphrase path). The bot-profile store
+// supplies its own (internal/botprofile): same archive, lock and atomic write,
+// only the key source differs.
+type Sealer interface {
+	Seal(context string, plaintext []byte) ([]byte, error)
+	Unseal(context string, ciphertext []byte) ([]byte, error)
+	Lock()
+}
+
+// OpenSealedHandle returns a Handle over the blob name in dir (the profiles
+// directory itself, not a node config dir), sealed by s under contextLabel. It
+// validates name and takes the same in-process and cross-process single-session
+// lock OpenHandle does. On error the lock is not held. Close calls s.Lock.
+func OpenSealedHandle(dir, name, contextLabel string, s Sealer) (*Handle, error) {
+	if err := validateName(name); err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return nil, errors.New("cobrowseprofile: nil sealer")
+	}
+	sp := storePathIn(dir, name)
+	if err := acquireProfileLock(sp); err != nil {
+		return nil, err
+	}
+	return &Handle{storePath: sp, context: contextLabel, sess: s}, nil
+}
+
+// ResetIn is Reset for a store whose blobs live directly in dir.
+func ResetIn(dir, name string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	sp := storePathIn(dir, name)
+	if err := acquireProfileLock(sp); err != nil {
+		return err
+	}
+	defer releaseProfileLock(sp)
+	if err := os.Remove(sp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("cobrowseprofile: reset: %w", err)
+	}
+	return nil
 }
 
 // OpenHandle unlocks the profile for use: it validates name, reserves the

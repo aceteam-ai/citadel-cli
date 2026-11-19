@@ -39,6 +39,12 @@ type latencyCDP struct {
 	dropOn map[string]bool
 	// noScroll keeps an evalDelay'd selector resolution from scrolling.
 	noScroll bool
+	// evalHook answers an evaluate before the built-in answers; it runs under
+	// the fake's lock and must not touch it.
+	evalHook func(expr string) (any, bool)
+	// callHook answers any method before the default empty result; it runs
+	// outside the fake's lock.
+	callHook func(method string, params map[string]any) (map[string]any, bool)
 
 	discoveries atomic.Int64
 	dials       atomic.Int64
@@ -50,6 +56,9 @@ type latencyCDP struct {
 	url         string
 	focus       string
 }
+
+// rawRemote is an evaluate answer given as the CDP RemoteObject itself.
+type rawRemote map[string]any
 
 func (f *latencyCDP) count(method string) int {
 	f.mu.Lock()
@@ -134,7 +143,12 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 				}
 				f.mu.Lock()
 				var val any
+				hooked := false
+				if f.evalHook != nil {
+					val, hooked = f.evalHook(expr)
+				}
 				switch {
+				case hooked:
 				case strings.Contains(expr, "window.scrollX"):
 					f.probes++
 					if f.probes == 1 && f.stallFirstProbe > 0 {
@@ -150,6 +164,17 @@ func startLatencyCDP(t *testing.T, mutate func(*latencyCDP)) *latencyCDP {
 				}
 				f.mu.Unlock()
 				result = map[string]any{"result": map[string]any{"type": "object", "value": val}}
+				if rr, ok := val.(rawRemote); ok {
+					result = map[string]any{"result": map[string]any(rr)}
+				}
+			}
+			f.mu.Lock()
+			ch := f.callHook
+			f.mu.Unlock()
+			if ch != nil {
+				if r, ok := ch(msg.Method, msg.Params); ok {
+					result = r
+				}
 			}
 			if msg.Method == "Page.captureScreenshot" {
 				result = map[string]any{"data": base64.StdEncoding.EncodeToString([]byte("png"))}
@@ -197,6 +222,26 @@ func shortBudget(t *testing.T, action, report time.Duration) {
 	pa, pr := CobrowseActionDeadline, cobrowseReportReserve
 	CobrowseActionDeadline, cobrowseReportReserve = action, report
 	t.Cleanup(func() { CobrowseActionDeadline, cobrowseReportReserve = pa, pr })
+}
+
+func TestScreenshotDiscardsHandoffDuringCapture(t *testing.T) {
+	f := startLatencyCDP(t, nil)
+	m, id := newBudgetSession(t, f)
+	d0, w0 := f.discoveries.Load(), f.dials.Load()
+	f.mu.Lock()
+	f.onCall = func(method string, _ map[string]any) {
+		if method == "Page.captureScreenshot" {
+			forceHandoff(m, id)
+		}
+	}
+	f.mu.Unlock()
+	image, _, err := m.ScreenshotStatus(id)
+	if !errors.Is(err, ErrHandedOff) || image != "" {
+		t.Fatalf("capture after handoff leaked image=%q, err=%v", image, err)
+	}
+	if f.discoveries.Load()-d0 != 1 || f.dials.Load()-w0 != 1 {
+		t.Fatal("legacy screenshot must still use one discovery and connection")
+	}
 }
 
 // TestActionLatencyProfile prints discoveries, dials and wall time per action

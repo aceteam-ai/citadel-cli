@@ -3914,3 +3914,137 @@ Auto-generated log of every release.
   - ci: shard Build + Test into parallel jobs (#1707) (#1708)
 
 
+---
+
+## v2.234.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 47 |
+| Lines added | +3399 |
+
+**Changes:**
+
+  - feat(cobrowse): session file staging, set_file_input and file-chooser interception (#1721) (#1722)
+  - fix(cobrowse): report a pending first load instead of returning a blank page as loaded (#1714) (#1719)
+  - fix(local): local doctor prints only its results when a check fails (#1726)
+  - test(cobrowse): stub a port owner PID that can never be the test process (#1725)
+  - test: deflake #1697, #1706, #1709 (test-only) (#1720)
+
+
+---
+
+## v2.235.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 19 |
+| Lines added | +2946 |
+
+**Changes:**
+
+  - docs: design for local co-browse file upload and edit parity (#1733)
+  - feat(cobrowse): human file attach for a pending file chooser (#1723) (#1728)
+  - fix(hpc): show bounded approval refusal details (#1629)
+
+
+---
+
+## v2.236.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +1965 |
+
+**Changes:**
+
+  - Revert "feat(local): bind file metadata in form approvals (#1751)" (#1754)
+  - fix(cobrowse): handoff banner dedupe and browser names for CITADEL_COBROWSE_BROWSER (#1752)
+  - feat(local): bind file metadata in form approvals (#1751)
+  - feat(cobrowse): type replace with selector and clear, key modifiers, input_edit marker (#1731)
+
+
+---
+
+## v2.237.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +993 |
+
+**Changes:**
+
+  - fix(local): re-land file approval snapshots with chooser provenance (#1755)
+
+
+---
+
+## v2.238.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +594 |
+
+**Changes:**
+
+  - feat(cobrowse): report page_text and password_field on start and status (#1773)
+
+
+---
+
+## v2.239.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 12 |
+| Lines added | +606 |
+
+**Changes:**
+
+  - fix(module): catalog cold-cache fetch, meeting marker node dir, re-detect meeting when healthy (#1774)
+
+
+---
+
+## v2.240.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 40 |
+| Lines added | +2905 |
+
+**Changes:**
+
+  - release: CPU-limited by default, and trust main CI's test gate (#1791)
+  - feat(browser-runtime): browser-runtime image with a per-session run contract (C1) (#1786)
+  - feat(local): add live upload opt-out setting (#1737 S2) (#1780)
+  - fix(local): approved link outcome, viewer Enter, installer text, banner wording (#1784)
+  - ci: run PR CI for stacked PRs on feat/fix/docs/chore bases (#1775)
+
+
+---
+
+## v2.241.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 41 |
+| Lines added | +3469 |
+
+**Changes:**
+
+  - feat(cobrowse): track pages in remotely dispatched sessions (#1671)
+  - feat(botprofile): bot profile store with split unattended key (#1787)
+
+

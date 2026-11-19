@@ -9,8 +9,8 @@
 // viewer (local and, later, the cloud one) through the manager's Targets,
 // SwitchTarget and CloseTarget methods.
 //
-// Tracking is local mode only: a manager opts in with EnableTargetTracking. The
-// node-wide manager does not, and keeps its single-page behavior unchanged.
+// Tracking is opt-in for isolated managers and enabled for new node-wide sessions.
+// Recovered sessions retain the mode recorded when they were created.
 package platform
 
 import (
@@ -43,7 +43,7 @@ const (
 
 var (
 	// ErrTargetsDisabled is returned by page calls on a manager that does not
-	// track pages (everything but local mode).
+	// track pages (including recovered legacy sessions).
 	ErrTargetsDisabled = errors.New("page tracking is not enabled for this session manager")
 	// ErrPageRefused is returned for every scripted action while the session's
 	// only page is on an address the policy refuses.
@@ -56,13 +56,14 @@ var (
 // CobrowseTarget is one open page of a session.
 type CobrowseTarget struct {
 	ID     string `json:"id"`
-	Title  string `json:"title,omitempty"`
-	URL    string `json:"url,omitempty"`
-	Active bool   `json:"active,omitempty"`
+	Title  string `json:"title"`
+	URL    string `json:"url"`
+	Active bool   `json:"active"`
 	// Refused marks the session's last page when the policy refuses its
 	// address. It is kept open so the browser does not exit, but it is never
 	// active and nothing is sent to it except a navigation away.
-	Refused bool `json:"refused,omitempty"`
+	Refused  bool   `json:"refused"`
+	OpenedBy string `json:"opened_by,omitempty"`
 }
 
 // CobrowseTargets is a snapshot of a session's open pages, in the order they
@@ -98,8 +99,9 @@ type targetSet struct {
 	policy     TargetPolicy
 	onEvent    TargetEventFunc
 	active     string
-	stack      []string          // openers to return to, most recent last
-	order      []string          // ids present at the last sync, in first-seen order
+	stack      []string // openers to return to, most recent last
+	order      []string // ids present at the last sync, in first-seen order
+	openedBy   map[string]string
 	known      map[string]string // id -> last URL accepted (or reported) for a present page
 	okOrigins  map[string]time.Time
 	badOrigins map[string]originRefusal
@@ -115,7 +117,7 @@ type originRefusal struct {
 }
 
 func newTargetSet() *targetSet {
-	return &targetSet{syncSem: make(chan struct{}, 1), known: map[string]string{}, okOrigins: map[string]time.Time{}, badOrigins: map[string]originRefusal{}}
+	return &targetSet{syncSem: make(chan struct{}, 1), known: map[string]string{}, openedBy: map[string]string{}, okOrigins: map[string]time.Time{}, badOrigins: map[string]originRefusal{}}
 }
 
 // targetNow is the clock for verdict expiry; tests replace it.
@@ -443,6 +445,20 @@ func (t *targetSet) sync(ctx context.Context, port int) (CobrowseTargets, error)
 		op, ok := openers[id]
 		return op, ok
 	})
+	for id := range t.openedBy {
+		if !present[id] {
+			delete(t.openedBy, id)
+		}
+	}
+	for i, id := range ids {
+		if t.openedBy[id] == "" {
+			by := "page"
+			if len(prevOrder) == 0 && i == 0 {
+				by = "start"
+			}
+			t.openedBy[id] = by
+		}
+	}
 	t.order, t.known, t.list = ids, known, kept
 	t.refusedID, t.refusedURL = refusedID, refusedURL
 	for o, at := range t.okOrigins {
@@ -480,7 +496,7 @@ func (t *targetSet) snapshotLocked() CobrowseTargets {
 			u = u[:maxCobrowseTargetURLBytes]
 		}
 		refused := tg.ID == t.refusedID
-		out.Targets = append(out.Targets, CobrowseTarget{ID: tg.ID, Title: SanitizeCobrowseTitle(tg.Title), URL: u, Active: !refused && tg.ID == t.active, Refused: refused})
+		out.Targets = append(out.Targets, CobrowseTarget{ID: tg.ID, Title: SanitizeCobrowseTitle(tg.Title), URL: u, Active: !refused && tg.ID == t.active, Refused: refused, OpenedBy: t.openedBy[tg.ID]})
 		if !refused && tg.ID == t.active {
 			out.ActiveWebSocketURL = tg.WebSocketDebuggerURL
 		}
@@ -610,8 +626,8 @@ func closeTargetByID(ctx context.Context, port int, id string) error {
 // launched afterwards: popups and new tabs are followed, every page must satisfy
 // policy (nil means the http(s) scheme rule), and onEvent hears about pages
 // Citadel closes and the user's own switches. A manager that never calls this
-// keeps its original single-page behavior byte for byte, which is what the
-// node-wide manager does.
+// keeps its original single-page behavior. Recovered sessions preserve their
+// recorded mode even when new sessions on that manager enable tracking.
 func (m *CobrowseSessionManager) EnableTargetTracking(policy TargetPolicy, onEvent TargetEventFunc) {
 	m.mu.Lock()
 	m.trackTargets, m.targetPolicy, m.targetEvent = true, policy, onEvent

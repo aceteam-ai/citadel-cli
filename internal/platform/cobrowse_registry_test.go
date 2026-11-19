@@ -516,3 +516,41 @@ func TestStaleTmpFilesCleaned(t *testing.T) {
 		t.Fatal("stale temp file kept")
 	}
 }
+
+func TestRecoveryRetainsPerSessionTargetMode(t *testing.T) {
+	for _, tracking := range []bool{false, true} {
+		t.Run(fmt.Sprint(tracking), func(t *testing.T) {
+			_ = newAdoptEnv(t)
+			(&fakeLauncher{}).install(t)
+			base := trustedBaseDir(t)
+			before := adoptMgr(base)
+			if tracking {
+				before.EnableTargetTracking(nil, nil)
+			}
+			st, err := before.StartSession("about:blank")
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, err := loadRecord(before.registryDir(), st.ID)
+			if err != nil || rec.Tracking != tracking {
+				t.Fatalf("record mode: %+v %v", rec, err)
+			}
+			// A new binary enables tracking for future starts, while old records keep false.
+			after := adoptMgr(base)
+			after.EnableTargetTracking(nil, nil)
+			if after.SessionTargetsEnabled(st.ID) != tracking {
+				t.Fatalf("recovery changed legacy=%v mode", !tracking)
+			}
+			s, err := after.sessionForAction(st.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.persistRecord()
+			rec, err = loadRecord(after.registryDir(), st.ID)
+			if err != nil || rec.Tracking != tracking {
+				t.Fatalf("re-persisted mode: %+v %v", rec, err)
+			}
+			after.StopAll()
+		})
+	}
+}

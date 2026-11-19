@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -164,7 +165,9 @@ type Event struct {
 
 // Config configures a Service. Zero values take the local-mode defaults.
 type Config struct {
-	Browser            Browser
+	Browser Browser
+	// Uploads is the live, fail-closed local upload policy (S2). Nil denies.
+	Uploads            func() UploadStatus
 	MaxSessions        int
 	WritesPerMinute    int
 	NavigationsPerHour int
@@ -887,22 +890,30 @@ var (
 	settlePoll    = 150 * time.Millisecond
 )
 
-func (s *Service) settle(ctx context.Context, id, before string) ActionResult {
-	res := s.settlePage(ctx, id, before)
+func (s *Service) settle(ctx context.Context, id, before string, beforeDoc ...string) ActionResult {
+	res := s.settlePage(ctx, id, before, beforeDoc...)
 	if st, ok := s.cfg.Browser.SessionStatus(id); ok && len(st.Targets) > 1 {
 		res.OpenTargets = len(st.Targets)
 	}
 	return res
 }
 
-func (s *Service) settlePage(ctx context.Context, id, before string) ActionResult {
+func (s *Service) settlePage(ctx context.Context, id, before string, beforeDoc ...string) ActionResult {
 	res := ActionResult{Dispatched: true}
+	doc := ""
+	if len(beforeDoc) > 0 {
+		doc = beforeDoc[0]
+	}
 	start := time.Now()
 	for {
 		if ps, err := s.cfg.Browser.PageState(id); err == nil {
 			res.URL = ps.URL
 			res.Title = platform.SanitizeCobrowseTitle(ps.Title)
 			if before != "" && ps.URL != before {
+				res.Navigated = true
+			}
+			if doc != "" && ps.DocID != "" && ps.DocID != doc {
+				// A new document at the same address (a reload or redirect).
 				res.Navigated = true
 			}
 			if ps.ReadyState == "complete" && (res.Navigated || time.Since(start) >= settleMinimum) {
@@ -953,8 +964,8 @@ func (s *Service) enforceLanding(ctx context.Context, id string, ss *session, re
 
 // finishAfter settles a dispatched write, counts a page load toward the budget
 // and checks where the browser landed.
-func (s *Service) finishAfter(ctx context.Context, id string, ss *session, before string, navigation bool) (ActionResult, error) {
-	res := s.settle(ctx, id, before)
+func (s *Service) finishAfter(ctx context.Context, id string, ss *session, before string, navigation bool, beforeDoc ...string) (ActionResult, error) {
+	res := s.settle(ctx, id, before, beforeDoc...)
 	if res.Navigated || navigation {
 		s.mu.Lock()
 		s.navs = append(pruneBefore(s.navs, s.cfg.Now().Add(-time.Hour)), s.cfg.Now())
@@ -1253,6 +1264,17 @@ func (s *Service) authorizeCommit(ev *Event, ss *session, a actionRef, t platfor
 		unverifiable: a.Kind != "navigate" && (!t.Resolved || t.Oversized),
 		tooLarge:     t.Oversized,
 	}
+	for _, file := range t.FormFiles {
+		file.Field = sanitizeLabel(file.Field)
+		var readable bool
+		file.Name, readable = sanitizeFileName(file.Name)
+		if !readable {
+			pc.unverifiable = true
+			pc.reason = "the file extension is too long to display safely"
+		}
+		file.Type = sanitizeLabel(file.Type)
+		pc.files = append(pc.files, file)
+	}
 	ss.commit = pc
 	ss.lastCommit, ss.result = "", nil
 	s.notifyLocked()
@@ -1282,15 +1304,41 @@ func newCommitID() string {
 // sanitizeLabel bounds a control's label and drops control characters before
 // it reaches a card or the audit log.
 func sanitizeLabel(s string) string {
+	return truncRunes(cleanLabel(s), 80)
+}
+
+func cleanLabel(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		if unicode.IsControl(r) {
 			b.WriteRune(' ')
 			continue
 		}
 		b.WriteRune(r)
 	}
-	return truncRunes(strings.TrimSpace(b.String()), 80)
+	return strings.TrimSpace(b.String())
+}
+
+// Keep the final extension visible. An extension that cannot fit the bounded
+// card is explicitly unreadable and cannot acquire executable approval.
+func sanitizeFileName(s string) (string, bool) {
+	s = cleanLabel(s)
+	r := []rune(s)
+	if len(r) <= 80 {
+		return s, true
+	}
+	dot := strings.LastIndex(s, ".")
+	if dot <= 0 {
+		return truncRunes(s, 77), true
+	}
+	ext := []rune(s[dot:])
+	if len(ext) > 77 {
+		return "[filename unavailable: extension too long]", false
+	}
+	return string(r[:80-3-len(ext)]) + "..." + string(ext), true
 }
 
 // Extract reads an element's text and attributes, bounded (R).
@@ -1401,10 +1449,19 @@ func redactWhileHuman(raw string) string {
 func (s *Service) agentViewLocked(ss *session, st platform.CobrowseSessionStatus, now time.Time) SessionView {
 	v := s.viewLocked(ss, st, now)
 	if st.Driver == platform.DriverHuman {
-		v.URL = redactWhileHuman(v.URL)
-		redactTargets(v.Targets)
+		redactAgentHumanView(&v)
 	}
 	return v
+}
+
+// Human viewer evidence is not an agent observation while the human drives.
+// viewLocked builds an independent card, so redaction leaves the viewer intact.
+func redactAgentHumanView(v *SessionView) {
+	v.URL = redactWhileHuman(v.URL)
+	redactTargets(v.Targets)
+	if v.Commit != nil {
+		v.Commit.Files = nil
+	}
 }
 
 // redactTargets applies the human-driving redaction to every page: origin only,
@@ -1452,6 +1509,7 @@ func (s *Service) viewLocked(ss *session, st platform.CobrowseSessionStatus, now
 	if c := ss.commit; c != nil && now.Sub(c.requestedAt) < PendingCommitTTL {
 		cv := &CommitView{Unverifiable: c.unverifiable, ID: c.id, Domain: c.domain, Action: c.action, Label: c.label, Reason: c.reason,
 			RequestedAt: c.requestedAt.UTC().Format(time.RFC3339), HasShot: c.shot != ""}
+		cv.Files = append([]platform.FormFile(nil), c.files...)
 		if c.rect.W > 0 && c.rect.H > 0 {
 			r := c.rect
 			cv.Rect = &r
@@ -1509,8 +1567,7 @@ func (s *Service) status(id string) ([]SessionView, error) {
 	views := s.Sessions(id)
 	for i := range views {
 		if views[i].Driver == string(platform.DriverHuman) {
-			views[i].URL = redactWhileHuman(views[i].URL)
-			redactTargets(views[i].Targets)
+			redactAgentHumanView(&views[i])
 		}
 	}
 	return views, nil
@@ -2009,6 +2066,11 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		return err
 	}
 	before := s.currentURL(id)
+	beforeDoc := ""
+	if ps, err := s.cfg.Browser.PageState(id); err == nil {
+		beforeDoc = ps.DocID
+	}
+	beforeTargets, beforeTargetsOK := s.targetIDs(id)
 	derr := s.dispatchCommit(id, a)
 	clear()
 	if errors.Is(derr, platform.ErrTargetChanged) {
@@ -2017,8 +2079,18 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		s.emit(hev)
 		return nil
 	}
+	var settled ActionResult
 	if derr == nil {
-		_, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate")
+		settled, derr = s.finishAfter(ctx, id, ss, before, a.Kind == "navigate", beforeDoc)
+	}
+	// A link activation that shows no sign of having landed is not "done".
+	// Dispatch alone does not prove it (covered, outside the viewport,
+	// swallowed by the page); decide before the W record is written so both
+	// records agree.
+	unseen := derr == nil && (a.Kind == "click" || (a.Kind == "key" && isEnter(a.Key))) && t.Href != "" &&
+		!settled.Navigated && !(beforeTargetsOK && s.hasNewTarget(id, beforeTargets))
+	if unseen {
+		ev.Outcome = "unconfirmed"
 	}
 	s.finish(ev, derr)
 	if _, partial := partialActionResult(derr); partial {
@@ -2035,10 +2107,41 @@ func (s *Service) ApproveCommit(ctx context.Context, id, commitID string) error 
 		s.emit(hev)
 		return nil
 	}
+	if unseen {
+		resolve("unconfirmed", "no navigation was seen within the settle window; check the page before asking again")
+		hev.Outcome = "unconfirmed"
+		s.emit(hev)
+		return nil
+	}
 	resolve("executed", "approved and done")
 	hev.Outcome = "ok"
 	s.emit(hev)
 	return nil
+}
+
+// targetIDs lists the session's open page ids. ok is false when the list is
+// unknown (a failed target sync reports none, and a tracking session always
+// has at least one page), so the caller must not treat it as "no pages".
+func (s *Service) targetIDs(id string) (map[string]bool, bool) {
+	out := map[string]bool{}
+	if st, ok := s.cfg.Browser.SessionStatus(id); ok {
+		for _, t := range st.Targets {
+			out[t.ID] = true
+		}
+	}
+	return out, len(out) > 0
+}
+
+// hasNewTarget reports whether a page opened that was not there before. The
+// caller must have a known (ok) before set.
+func (s *Service) hasNewTarget(id string, before map[string]bool) bool {
+	now, _ := s.targetIDs(id)
+	for t := range now {
+		if !before[t] {
+			return true
+		}
+	}
+	return false
 }
 
 // dispatchCommit sends an approved action to the browser.

@@ -12,6 +12,15 @@
   let frameURL = null;
   let human = false;
 
+  // waitingText builds the banner for a handoff. The agent's reason may already
+  // tell the user to press Hand back, so the instruction is added only when
+  // missing, and trailing periods never double.
+  function waitingText(reason) {
+    const r = String(reason || "").replace(/[.\s]+$/, "");
+    const base = "Waiting for you: " + r + ".";
+    return /\bhand(?:\s+(?!(?:and|then|or|but)\b)\w+){0,2}\s+back\b/i.test(r) ? base : base + " Then press Hand back to agent.";
+  }
+
   // post sends one viewer action. It reports a failure in msgEl (default: the
   // hint line) and resolves to true on success.
   async function post(id, action, body, msgEl) {
@@ -49,6 +58,8 @@
   }
 
   function render() {
+    const uploads = state.uploads;
+    $("uploads-state").textContent = uploads ? uploads.reason + (uploads.warning ? ". " + uploads.warning : "") : "";
     $("agent-line").textContent = state.agent ? "Connected agent: " + state.agent : "No agent connected";
     const sessions = state.sessions || [];
     const tabs = $("tabs");
@@ -105,7 +116,7 @@
     const w = $("waiting");
     if (human && s.handoff_reason && s.handoff_reason !== "taken by the user") {
       w.hidden = false;
-      w.textContent = "Waiting for you: " + s.handoff_reason + ". Then press Hand back to agent.";
+      w.textContent = waitingText(s.handoff_reason);
     } else if (human) {
       w.hidden = false;
       w.textContent = "You are driving. The agent cannot see or act until you hand back.";
@@ -206,6 +217,9 @@
     $("commit-action").textContent = c.action;
     $("commit-domain").textContent = c.domain;
     $("commit-reason").textContent = "Why you are asked: " + c.reason + ".";
+    if (c.files && c.files.length) {
+      $("commit-reason").textContent += " Attached files: " + c.files.map(f => f.name + " (" + f.size + " bytes)").join(", ") + ".";
+    }
     $("commit-approve").hidden = !!c.unverifiable;
     if (c.unverifiable) $("commit-reason").textContent += " Citadel cannot verify this one, so it cannot be done for you: do it yourself in the browser, or deny it.";
     if (commitShown === c.id || !c.has_shot) return;
@@ -330,8 +344,11 @@
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "v") return; // paste event below
     ev.preventDefault();
     const printable = ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey;
-    send({ type: "key", keyEvent: printable ? "keyDown" : "rawKeyDown", key: ev.key, code: ev.code,
-      text: printable ? ev.key : "", keyCode: ev.keyCode, modifiers: modifiers(ev) });
+    // Enter is a keyDown carrying "\r" (a real press), not a rawKeyDown: only
+    // that produces the keypress that submits a form.
+    const enter = ev.key === "Enter" && !ev.ctrlKey && !ev.metaKey && !ev.altKey;
+    send({ type: "key", keyEvent: printable || enter ? "keyDown" : "rawKeyDown", key: ev.key, code: ev.code,
+      text: enter ? "\r" : (printable ? ev.key : ""), keyCode: ev.keyCode, modifiers: modifiers(ev) });
   });
   wrap.addEventListener("keyup", (ev) => {
     if (!human) return;
