@@ -31,6 +31,12 @@ So, when adding to this file:
 
 ## Project Overview
 
+`status.collectCapacityMetrics` owns additive optional heartbeat placement
+signals and per-source unknown handling. `nativeCapacityProbes` owns the
+build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
+both heartbeat transports without native sampling. See
+`docs/heartbeat-capacity.md` for field semantics and platform limits.
+
 `localcobrowse.UploadSettings` owns local mode's upload opt-out: environment
 captured at owner construction, live bounded settings reads, and fail-closed
 permissions/parsing. `Service.CheckUploads` and `Service.UploadsAllowed` are the
