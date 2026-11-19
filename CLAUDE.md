@@ -156,6 +156,26 @@ confirmation. Status `input_edit` (`InputEditV1`, non-tracking sessions only, li
 is the marker a caller checks first. Local mode does not pass the new fields.
 `TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
 
+`containersession.Runner` owns a declared session that runs as one container plus an
+engine-managed named volume (#1533, #1165 S1; `Declaration.IsContainer` selects it). The
+`aceteam.session*` labels (`RecordFromLabels` validates them, failing closed on a volume that is
+not the name-derived one) are the only record: `Runner.Observe` recovers state from the engine,
+with no store. `Runner.Wake` decides the argv (`buildRunArgs`: cap-drop, no-new-privileges,
+preflighted cpu/memory/pids, the node's own binary bind-mounted read-only, `--restart no`);
+`Runner.Sleep` stops, re-seals and removes the container but keeps the volume. Credentials never
+reach the volume: `SealedFileStore` keeps one bundle per session, sealed under
+`nodevault.OpenKeyCompartment` (a node key file, so wake is unattended and the master PIN stays
+human-only); `Materialize` writes them only under a run dir `Runner.RunDir` has proven tmpfs,
+`ResealBundle` captures a rotated token before `Wipe`, and a failed re-seal keeps the secrets for
+a retry. `containersession.Decide` is the boot wake rule (`cmd.reconcileContainerSessions`, run by
+the single-instance worker): a stopped container exiting non-zero is woken, exit 0 stays down
+(`declaredsession.RunContainerHolder` exits non-zero whenever signalled, so a reboot-killed
+session never looks like a clean exit), and no container with a volume is a deliberate sleep.
+`LaunchCommand` decides resume inside the container from the transcript on the volume.
+`declaredsession.DialContainerHolder` owns host-side attach verification (the engine label proves
+the incarnation; the host holder's PID checks do not apply across the PID namespace), and
+`Manager` refuses container declarations with `ErrContainerSession`.
+
 `InspectTarget` owns the browser-created isolated world used for the complete
 target probe and form snapshot. The session caches only its latest target,
 frame and loader context, invalidates a lost context without retrying the read,

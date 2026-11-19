@@ -127,6 +127,25 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	if scope.CheckMembers(ctx, []procscope.ProcessIdentity{toScopeProcess(owner)}) != nil {
 		return ErrUnavailable
 	}
+	return runHolderCore(ctx, options, holderCore{owner: owner, scope: scope, identity: ScopeIdentity{Name: scope.Identity().Name, Manager: "user", InvocationID: scope.Identity().InvocationID, ControlGroup: scope.Identity().ControlGroup}, guarantee: "verified_user_scope", requirePending: true})
+}
+
+// holderCore is the custody-specific input to the shared holder body: the host
+// backend proves a verified user scope, the container backend proves PID 1 in a
+// container cgroup (RunContainerHolder). Everything after custody is shared, so
+// the socket protocol, replay ring, roles and logs are identical on both.
+type holderCore struct {
+	owner          ProcessIdentity
+	scope          scopeCustody
+	identity       ScopeIdentity
+	guarantee      string
+	requirePending bool
+	container      bool
+	ownerContext   OwnerContext
+	essential      map[string]string
+}
+
+func runHolderCore(ctx context.Context, options RunHolderOptions, c holderCore) (result error) {
 	store, err := OpenStore(options.NodeDir)
 	if err != nil {
 		return err
@@ -138,7 +157,7 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	}()
 	snapshot, err := store.LoadConfig()
 	declaration, exists := snapshot.Lookup(options.Name)
-	if err != nil || !exists || !declaration.Enabled || declaration.Mode != "interactive" {
+	if err != nil || !exists || !declaration.Enabled || declaration.Mode != "interactive" || declaration.IsContainer() != c.container {
 		return ErrConfig
 	}
 	session, err := store.OpenSession(options.Name, true)
@@ -162,13 +181,18 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	if _, present, err := session.ReadStopMarker(); err != nil || present {
 		return ErrConflict
 	}
-	pending, present, err := session.ReadState()
-	if err != nil || !present || !pendingLaunchMatches(pending, options, declaration, owner) {
-		return ErrConflict
+	if c.requirePending {
+		pending, present, err := session.ReadState()
+		if err != nil || !present || !pendingLaunchMatches(pending, options, declaration, c.owner) {
+			return ErrConflict
+		}
 	}
-	ownerContext, essential, err := holderEnvironment(owner.UID)
-	if err != nil {
-		return err
+	ownerContext, essential := c.ownerContext, c.essential
+	if c.ownerContext == (OwnerContext{}) {
+		var err error
+		if ownerContext, essential, err = holderEnvironment(c.owner.UID); err != nil {
+			return err
+		}
 	}
 	environment, err := store.BuildSpawn(declaration, options.RestartCommand, ownerContext, essential)
 	if err != nil {
@@ -178,9 +202,8 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	if err != nil {
 		return err
 	}
-	identity := scope.Identity()
 	now := time.Now().UTC()
-	state := State{Version: 1, Name: declaration.Name, Incarnation: options.ExpectedIncarnation, Holder: owner, Scope: ScopeIdentity{Name: identity.Name, Manager: "user", InvocationID: identity.InvocationID, ControlGroup: identity.ControlGroup}, ProtocolVersion: ProtocolVersion, BinaryVersion: options.BinaryVersion, StartedAt: now, UpdatedAt: now, FileRevision: snapshot.FileRevision, DeclarationRevision: declaration.Revision, Phase: "starting", Guarantee: "verified_user_scope", EnvironmentHash: environment.EnvironmentHash}
+	state := State{Version: 1, Name: declaration.Name, Incarnation: options.ExpectedIncarnation, Holder: c.owner, Scope: c.identity, ProtocolVersion: ProtocolVersion, BinaryVersion: options.BinaryVersion, StartedAt: now, UpdatedAt: now, FileRevision: snapshot.FileRevision, DeclarationRevision: declaration.Revision, Phase: "starting", Guarantee: c.guarantee, EnvironmentHash: environment.EnvironmentHash}
 	if session.WriteState(state) != nil {
 		return ErrUnavailable
 	}
@@ -202,7 +225,7 @@ func RunHolder(ctx context.Context, options RunHolderOptions) (result error) {
 	holderCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h := newHolder(holderCtx, declaration, state)
-	h.store, h.session, h.logs, h.scope, h.environment = store, session, logs, scope, environment
+	h.store, h.session, h.logs, h.scope, h.environment = store, session, logs, c.scope, environment
 	h.restartCommand = options.RestartCommand
 	h.spawn = spawnTerminal
 	servers := newHolderServers(holderCtx, h, listener)

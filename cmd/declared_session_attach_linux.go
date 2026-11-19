@@ -48,7 +48,12 @@ func runDeclaredAttach(cmd *cobra.Command, name string) error {
 	defer store.Close()
 	ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	client, err := manager.Dial(ctx, name)
+	var client *declaredsession.Client
+	if container, derr := containerDeclaration(selected, name); derr == nil {
+		client, err = dialContainerSession(ctx, selected, container)
+	} else {
+		client, err = manager.Dial(ctx, name)
+	}
 	if err != nil {
 		return err
 	}
@@ -445,4 +450,27 @@ func writeDeclaredTerminal(ctx context.Context, fd int, data []byte) error {
 		}
 	}
 	return nil
+}
+
+// dialContainerSession attaches to a container session's holder. A sleeping
+// session is refused with guidance rather than woken implicitly: waking is an
+// explicit operator act in this slice (wake-on-attach is S2/S3).
+func dialContainerSession(ctx context.Context, nodeDir string, d declaredsession.Declaration) (*declaredsession.Client, error) {
+	if d.Attach.Local == "deny" {
+		return nil, declaredsession.ErrManager
+	}
+	runner, err := newContainerSessionRunner(nodeDir, false)
+	if err != nil {
+		return nil, err
+	}
+	store, err := declaredsession.OpenStore(nodeDir)
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+	client, err := dialContainerHolderOnce(ctx, store, runner, d.Name)
+	if err != nil {
+		return nil, errors.New("container session is not running; use `citadel sessions wake " + d.Name + "`")
+	}
+	return client, nil
 }
