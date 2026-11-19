@@ -112,7 +112,20 @@ func TestContainerDeclarationValidation(t *testing.T) {
 		"credential path+env": func(s string) string {
 			return strings.Replace(s, "env: GH_TOKEN", "env: GH_TOKEN\n        path: /home/agent/x", 1)
 		},
-		"reserved env name":   func(s string) string { return strings.Replace(s, "env: GH_TOKEN", "env: HOME", 1) },
+		"reserved env name": func(s string) string { return strings.Replace(s, "env: GH_TOKEN", "env: HOME", 1) },
+		"credential outside config dir": func(s string) string {
+			return strings.Replace(s, "/home/agent/.claude/.credentials.json", "/home/agent/other/cred", 1)
+		},
+		"credential in persisted dir": func(s string) string {
+			return strings.Replace(s, "/home/agent/.claude/.credentials.json", "/home/agent/.claude/projects/cred", 1)
+		},
+		"colon in credential path": func(s string) string {
+			return strings.Replace(s, "/home/agent/.claude/.credentials.json", "/home/agent/.claude/a:b", 1)
+		},
+		"comma in credential path": func(s string) string {
+			return strings.Replace(s, "/home/agent/.claude/.credentials.json", "/home/agent/.claude/a,b", 1)
+		},
+		"comma in cwd":        func(s string) string { return strings.Replace(s, "/home/agent/work/repo", "/home/agent/work/a,b", 1) },
 		"unsupported harness": func(s string) string { return strings.Replace(s, "claude-code", "ace-cli", 1) },
 	} {
 		if _, err := declaredsession.DecodeConfig([]byte(mutate(fixtureConfig))); err == nil {

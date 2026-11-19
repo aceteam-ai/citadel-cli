@@ -15,18 +15,55 @@ const (
 	ContainerWorkRoot = "/home/agent/work"
 	// ContainerNodeDir is where the holder sees its own node config dir.
 	ContainerNodeDir = "/run/session"
+	// ContainerCredDir is the read-only tmpfs-backed directory holding the
+	// credential env file; a whole directory is bound so the engine never has to
+	// create a mountpoint stub in a host directory.
+	ContainerCredDir = "/run/credentials"
 
 	RuntimeContainer = "container"
 
 	// ContainerCredEnvFile is the only env_file a container declaration may name:
 	// the node materializes credential environment variables there, on tmpfs,
 	// at wake. Its contents are never part of the declaration revision.
-	ContainerCredEnvFile = ContainerNodeDir + "/credentials.env"
+	ContainerCredEnvFile = ContainerCredDir + "/credentials.env"
 )
 
 // ContainerImagePrefix is the only registry a session image may come from,
 // matching the BYOC allowlist. Fail-closed: an operator pins a vetted image.
 const ContainerImagePrefix = "ghcr.io/aceteam-ai/"
+
+// HarnessConfig describes where a harness keeps its state under ContainerHome.
+// Everything in Dir is backed by host tmpfs EXCEPT the Persist subpaths, which
+// are bound from the named volume on top. That split is what keeps credentials
+// (and the temp files a rename-based writer stages beside them) off the volume
+// while transcripts survive. Pinned from the vendors' docs:
+//
+//   - Claude Code (code.claude.com/docs/en/claude-directory): transcripts and
+//     auto memory live under projects/, checkpoints in file-history/, plans in
+//     plans/, tasks in tasks/, subagent memory in agent-memory/; the login is
+//     .credentials.json at the top of the directory.
+//   - Codex: auth.json at the top of CODEX_HOME; session rollouts under
+//     sessions/YYYY/MM/DD (stated in the #1165 design pass; the public config
+//     page does not name them), memories/, rules/ and skills/.
+//
+// Single files (history.jsonl, settings.json, config.toml) stay on tmpfs: a
+// file cannot be bound from a volume subpath without being created first, and
+// losing prompt recall at sleep is acceptable. Re-pin if a vendor moves a path.
+type HarnessConfig struct {
+	Dir     string
+	Persist []string
+}
+
+// HarnessConfigFor returns the pinned layout, or false for an unsupported harness.
+func HarnessConfigFor(harness string) (HarnessConfig, bool) {
+	switch harness {
+	case "claude-code":
+		return HarnessConfig{Dir: ContainerHome + "/.claude", Persist: []string{"projects", "file-history", "plans", "tasks", "agent-memory", "skills", "commands", "agents"}}, true
+	case "codex":
+		return HarnessConfig{Dir: ContainerHome + "/.codex", Persist: []string{"sessions", "memories", "rules", "skills"}}, true
+	}
+	return HarnessConfig{}, false
+}
 
 // IsContainer reports whether the declaration selects the container backend.
 func (d Declaration) IsContainer() bool {
@@ -47,6 +84,10 @@ func validateContainerDeclaration(d Declaration) error {
 	if r.Kind != RuntimeContainer || d.Mode != "interactive" || !oneOf(d.Harness, "claude-code", "codex") {
 		return ErrConfig
 	}
+	if strings.ContainsAny(d.Cwd, ":,\"") {
+		return ErrConfig
+	}
+	hc, _ := HarnessConfigFor(d.Harness)
 	if !strings.HasPrefix(r.Image, ContainerImagePrefix) || len(r.Image) > 512 || strings.ContainsAny(r.Image, " \t\n\x00") {
 		return ErrConfig
 	}
@@ -83,8 +124,16 @@ func validateContainerDeclaration(d Declaration) error {
 		}
 		if c.Path != "" {
 			p := path.Clean(c.Path)
-			if !path.IsAbs(c.Path) || p != c.Path || !strings.HasPrefix(p, ContainerHome+"/") || strings.HasPrefix(p, ContainerWorkRoot+"/") || p == ContainerWorkRoot {
+			// A credential file must sit inside the harness's tmpfs-backed config
+			// dir and outside every persisted (volume) subpath.
+			if !path.IsAbs(c.Path) || p != c.Path || !strings.HasPrefix(p, hc.Dir+"/") || strings.ContainsAny(p, ":,\"") {
 				return ErrConfig
+			}
+			rel := strings.TrimPrefix(p, hc.Dir+"/")
+			for _, sub := range hc.Persist {
+				if rel == sub || strings.HasPrefix(rel, sub+"/") {
+					return ErrConfig
+				}
 			}
 		}
 		if c.Env != "" && (!envPattern.MatchString(c.Env) || reservedEnv(c.Env)) {

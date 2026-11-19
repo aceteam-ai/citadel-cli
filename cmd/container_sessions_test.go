@@ -62,7 +62,7 @@ func TestSetContainerCredentialMergesAndTrimsEnvOnly(t *testing.T) {
 
 func TestKeySealerIsLazy(t *testing.T) {
 	opened := 0
-	s := &containerSessionKeySealer{path: "/nope", open: func(string, bool) (*nodevault.Session, error) {
+	s := &containerSessionKeySealer{path: "/nope", open: func(string, bool) (*nodevault.KeyCompartment, error) {
 		opened++
 		return nil, errors.New("no key")
 	}}

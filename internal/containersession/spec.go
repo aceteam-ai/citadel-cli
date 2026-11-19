@@ -29,6 +29,7 @@ var (
 	ErrEngine         = errors.New("container engine operation failed")
 	ErrReseal         = errors.New("container session credentials could not be re-sealed")
 	ErrAlreadyRunning = errors.New("container session is already running")
+	ErrBusy           = errors.New("another wake, sleep or re-seal of this session is in progress")
 )
 
 // Fixed names. ContainerName and VolumeName are derived from the validated
@@ -71,10 +72,13 @@ type Spec struct {
 	Limits        Limits
 	// HostBinary is the node's own executable, mounted read-only into the container.
 	HostBinary string
-	// SessionDir is the host session dir (socket, state, logs): the one place
-	// `citadel attach` already dials.
-	SessionDir string
-	UID, GID   int
+	// ViewDir is the host directory bound once at /run/session: the holder's
+	// whole node-config view. It is built on the host (0700, owned by the node
+	// user) so the engine never creates a root-owned parent for the holder's
+	// session dir; the host session dir inside it is where `citadel attach` dials.
+	ViewDir  string
+	UID, GID int
+	Config   declaredsession.HarnessConfig
 }
 
 var safeToken = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
@@ -82,14 +86,23 @@ var safeToken = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 // NewSpec validates a declaration for the container backend. It owns what the
 // node may run: a bare harness binary token, a cwd of plain path characters
 // (both are interpolated into the launcher script), a non-root identity.
-func NewSpec(d declaredsession.Declaration, hostBinary, sessionDir string, uid, gid int) (*Spec, error) {
+func NewSpec(d declaredsession.Declaration, hostBinary, viewDir string, uid, gid int) (*Spec, error) {
 	if !d.IsContainer() {
 		return nil, ErrNotContainer
 	}
 	if declaredsession.ValidateDeclaration(d) != nil || !d.Enabled {
 		return nil, ErrSpec
 	}
-	if uid <= 0 || gid <= 0 || !path.IsAbs(hostBinary) || !path.IsAbs(sessionDir) {
+	if uid <= 0 || gid <= 0 || !path.IsAbs(hostBinary) || !path.IsAbs(viewDir) {
+		return nil, ErrSpec
+	}
+	// --mount is comma separated: a host path carrying a separator or quote
+	// could smuggle an extra mount option.
+	if strings.ContainsAny(hostBinary+viewDir, ",\"\n") {
+		return nil, ErrSpec
+	}
+	cfg, ok := declaredsession.HarnessConfigFor(d.Harness)
+	if !ok {
 		return nil, ErrSpec
 	}
 	if !safeToken.MatchString(d.Command[0]) || !safeToken.MatchString(d.Cwd) {
@@ -108,7 +121,7 @@ func NewSpec(d declaredsession.Declaration, hostBinary, sessionDir string, uid, 
 		ContainerName: ContainerPrefix + d.Name,
 		VolumeName:    ContainerPrefix + d.Name + VolumeSuffix,
 		Image:         d.Runtime.Image, Limits: limits,
-		HostBinary: hostBinary, SessionDir: sessionDir, UID: uid, GID: gid,
+		HostBinary: hostBinary, ViewDir: viewDir, UID: uid, GID: gid, Config: cfg,
 	}, nil
 }
 
@@ -155,5 +168,3 @@ exec %[2]s --session-id %[3]s "$@"
 	argv := []string{"/bin/sh", "-c", script, "citadel-session"}
 	return append(argv, d.Command[1:]...)
 }
-
-func trimSlash(s string) string { return strings.TrimRight(s, "/") }

@@ -45,9 +45,25 @@ func TestDecideTable(t *testing.T) {
 		{"fresh", base, Observed{}, false, false, "never_started"},
 	}
 	for _, c := range cases {
-		got := Decide(c.d, c.obs, c.volume)
+		got := Decide(c.d, c.obs, c.volume, false)
 		if got.Wake != c.wake || got.Reason != c.reason {
 			t.Errorf("%s: got %+v want wake=%v reason=%s", c.name, got, c.wake, c.reason)
 		}
+	}
+}
+
+func TestDecideSleepRequestAndOnBootResume(t *testing.T) {
+	d := fixtureDecl(t) // on_boot: resume spelled out
+	killed := Observed{Exists: true, HasRecord: true, State: "exited", ExitCode: 137}
+	if got := Decide(d, killed, true, true); got.Wake || got.Reason != "sleep_requested" {
+		t.Errorf("sleep request = %+v", got)
+	}
+	if got := Decide(d, killed, true, false); !got.Wake {
+		t.Errorf("on_boot resume must honor the interruption: %+v", got)
+	}
+	// Unset on_boot behaves exactly like "resume".
+	d.Runtime = &declaredsession.RuntimeSpec{Kind: "container", Image: d.Runtime.Image}
+	if got := Decide(d, killed, true, false); !got.Wake {
+		t.Errorf("default on_boot = %+v", got)
 	}
 }

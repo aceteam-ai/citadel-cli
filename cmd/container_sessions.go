@@ -23,11 +23,12 @@ import (
 // real runtime, binary, key file and tmpfs, and the three operator verbs.
 
 const (
-	containerSessionKeyFile   = "session-vault.key"
-	containerSessionCredsDir  = "session-credentials"
-	containerSessionReadyWait = 90 * time.Second
-	containerSessionPoll      = 500 * time.Millisecond
-	maxCredentialStdin        = 64 << 10
+	containerSessionKeyFile     = "session-vault.key"
+	containerSessionCredsDir    = "session-credentials"
+	containerSessionReadyWait   = 90 * time.Second
+	containerSessionPoll        = 500 * time.Millisecond
+	containerSessionResealEvery = 30 * time.Second
+	maxCredentialStdin          = 64 << 10
 )
 
 // containerSessionKeySealer opens the node-key compartment on first use, so a
@@ -35,11 +36,11 @@ const (
 type containerSessionKeySealer struct {
 	path   string
 	create bool
-	open   func(string, bool) (*nodevault.Session, error)
-	sess   *nodevault.Session
+	open   func(string, bool) (*nodevault.KeyCompartment, error)
+	sess   *nodevault.KeyCompartment
 }
 
-func (s *containerSessionKeySealer) session() (*nodevault.Session, error) {
+func (s *containerSessionKeySealer) session() (*nodevault.KeyCompartment, error) {
 	if s.sess != nil {
 		return s.sess, nil
 	}
@@ -105,14 +106,14 @@ func newContainerSessionRunner(nodeDir string, createKey bool) (*containersessio
 		},
 	}
 	runner.WaitReady = func(ctx context.Context, name, incarnation string) error {
-		return waitContainerHolderReady(ctx, runner, nodeDir, name, incarnation)
+		return waitContainerHolderReady(ctx, runner, runner.ViewDir(name), name, incarnation)
 	}
 	return runner, nil
 }
 
 // containerHolderVerifier is the engine-side proof DialContainerHolder needs.
 func containerHolderVerifier(runner *containersession.Runner) declaredsession.ContainerVerifier {
-	return func(ctx context.Context, name, incarnation string) error {
+	return func(ctx context.Context, name, incarnation string, peerPID int) error {
 		obs, err := runner.Observe(ctx, name)
 		if err != nil {
 			return err
@@ -120,12 +121,15 @@ func containerHolderVerifier(runner *containersession.Runner) declaredsession.Co
 		if !obs.Exists || !obs.HasRecord || obs.State != "running" || obs.Record.Incarnation != incarnation {
 			return errors.New("container does not match the saved holder incarnation")
 		}
+		if obs.Pid <= 0 || obs.Pid != peerPID {
+			return errors.New("socket peer is not the container's PID 1")
+		}
 		return nil
 	}
 }
 
-func waitContainerHolderReady(ctx context.Context, runner *containersession.Runner, nodeDir, name, incarnation string) error {
-	store, err := declaredsession.OpenStore(nodeDir)
+func waitContainerHolderReady(ctx context.Context, runner *containersession.Runner, viewDir, name, incarnation string) error {
+	store, err := declaredsession.OpenStore(viewDir)
 	if err != nil {
 		return err
 	}
@@ -300,6 +304,23 @@ func reconcileContainerSessions(nodeDir string) {
 				Log("container session %s: %s: %v", o.Decision.Name, o.Decision.Reason, o.Err)
 			} else if o.Decision.Wake {
 				Log("container session %s woken (%s)", o.Decision.Name, o.Decision.Reason)
+			}
+		}
+		// Re-seal rotated tokens while sessions are awake, for the life of the
+		// worker: tmpfs does not survive a reboot and sleep may never run. This
+		// covers sessions woken here, by hand, or already running. ResealOnce
+		// is a cheap no-op for a session with nothing materialized.
+		for range time.Tick(containerSessionResealEvery) {
+			current, err := declaredsession.LoadConfig(nodeDir)
+			if err != nil {
+				continue
+			}
+			for _, d := range current.Sessions {
+				if d.IsContainer() {
+					if err := runner.ResealOnce(d); err != nil {
+						Debug("container session %s: re-seal: %v", d.Name, err)
+					}
+				}
 			}
 		}
 	}()

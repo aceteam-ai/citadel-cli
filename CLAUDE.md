@@ -161,19 +161,29 @@ engine-managed named volume (#1533, #1165 S1; `Declaration.IsContainer` selects 
 `aceteam.session*` labels (`RecordFromLabels` validates them, failing closed on a volume that is
 not the name-derived one) are the only record: `Runner.Observe` recovers state from the engine,
 with no store. `Runner.Wake` decides the argv (`buildRunArgs`: cap-drop, no-new-privileges,
-preflighted cpu/memory/pids, the node's own binary bind-mounted read-only, `--restart no`);
-`Runner.Sleep` stops, re-seals and removes the container but keeps the volume. Credentials never
+preflighted cpu/memory/pids, the node's own binary bind-mounted read-only, `--restart no`, `--mount`
+never `-v`, one bind of a host-built `Runner.ViewDir` at `/run/session`); `Runner.Sleep` records the
+operator's durable sleep intent, stops, re-seals and removes the container but keeps the volume.
+Wake, sleep and `Runner.ResealOnce` serialize on one flock in the host run dir (never mounted), and
+a failed wake removes only the container id its own `run` returned. Credentials never
 reach the volume: `SealedFileStore` keeps one bundle per session, sealed under
 `nodevault.OpenKeyCompartment` (a node key file, so wake is unattended and the master PIN stays
-human-only); `Materialize` writes them only under a run dir `Runner.RunDir` has proven tmpfs,
-`ResealBundle` captures a rotated token before `Wipe`, and a failed re-seal keeps the secrets for
-a retry. `containersession.Decide` is the boot wake rule (`cmd.reconcileContainerSessions`, run by
+human-only); `Materialize` writes them only under a run dir `Runner.RunDir` has proven tmpfs. That tmpfs tree is
+bound over the whole harness config dir, and `declaredsession.HarnessConfigFor` pins which subpaths
+(transcripts, memory) are bound from the volume on top, so a rename-based writer's temp file stays
+on tmpfs. `ResealBundle` captures a rotated token before `Wipe`; the worker re-seals awake sessions
+on a poll (`ResealOnce`) so a reboot does not lose a rotation; a failed re-seal keeps the secrets
+for a retry. `nodevault.KeyCompartment` is deliberately not a `Session`, so it cannot satisfy an
+at-rest passphrase-floor consumer. `containersession.Decide` is the boot wake rule (`cmd.reconcileContainerSessions`, run by
 the single-instance worker): a stopped container exiting non-zero is woken, exit 0 stays down
 (`declaredsession.RunContainerHolder` exits non-zero whenever signalled, so a reboot-killed
 session never looks like a clean exit), and no container with a volume is a deliberate sleep.
 `LaunchCommand` decides resume inside the container from the transcript on the volume.
-`declaredsession.DialContainerHolder` owns host-side attach verification (the engine label proves
-the incarnation; the host holder's PID checks do not apply across the PID namespace), and
+`declaredsession.DialContainerHolder` owns host-side attach verification (the engine proves the
+incarnation and that the socket peer is the container's PID 1; the host holder's PID checks do not
+apply across the PID namespace). Known limit: on a kernel-TUN `citadel up` node the default bridge
+may NAT container traffic out as the host's mesh address, which `requireVPNOrAuth` admits; no
+dedicated network is created yet. And
 `Manager` refuses container declarations with `ErrContainerSession`.
 
 `InspectTarget` owns the browser-created isolated world used for the complete

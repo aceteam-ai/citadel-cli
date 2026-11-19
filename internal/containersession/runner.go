@@ -60,8 +60,52 @@ func (r *Runner) engine(ctx context.Context, args ...string) ([]byte, error) {
 	return r.run(r.RT.EngineCommandContext(ctx, args...))
 }
 
-func (r *Runner) sessionDir(name string) string {
-	return filepath.Join(r.NodeDir, "sessions", name)
+// ViewDir is the host directory bound at /run/session for one session. It holds
+// the rendered config and the holder's session dir (socket, state, logs), and
+// is the node dir `citadel attach` opens for container sessions.
+func (r *Runner) ViewDir(name string) string {
+	return filepath.Join(r.NodeDir, "csess", name)
+}
+
+func (r *Runner) intentPath(name string) string {
+	return filepath.Join(r.NodeDir, "session-intent", name+".asleep")
+}
+
+// sleepRequested reports the operator's durable sleep intent. It lives outside
+// every mount, so neither the container nor the engine can set or clear it.
+func (r *Runner) sleepRequested(name string) bool {
+	_, err := os.Lstat(r.intentPath(name))
+	return err == nil
+}
+
+func (r *Runner) setSleepIntent(name string, on bool) error {
+	p := r.intentPath(name)
+	if !on {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(p, nil, 0o600)
+}
+
+// prepareViewDir builds the holder's whole node view on the host as the node
+// user (0700), so the engine never creates a root-owned parent for the
+// holder's session dir.
+func (r *Runner) prepareViewDir(name string) (string, error) {
+	view := r.ViewDir(name)
+	for _, d := range []string{filepath.Dir(view), view, filepath.Join(view, "sessions")} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			return "", ErrRunDir
+		}
+		if err := os.Chmod(d, 0o700); err != nil {
+			return "", ErrRunDir
+		}
+	}
+	return view, nil
 }
 
 // RunDir resolves and verifies the tmpfs run dir for a session. A base that is
@@ -94,6 +138,9 @@ type Observed struct {
 	ExitCode  int
 	HasRecord bool
 	Record    Record
+	// Pid is the container's PID 1 as the HOST sees it; attach compares it with
+	// the socket peer.
+	Pid int
 }
 
 func isNotFound(out []byte) bool {
@@ -108,22 +155,26 @@ func (r *Runner) Observe(ctx context.Context, name string) (Observed, error) {
 		return Observed{}, ErrSpec
 	}
 	out, err := r.engine(ctx, "inspect", "--format",
-		"{{.State.Status}}|{{.State.ExitCode}}|{{json .Config.Labels}}", ContainerPrefix+name)
+		"{{.State.Status}}|{{.State.ExitCode}}|{{.State.Pid}}|{{.Config.Image}}|{{json .Config.Labels}}", ContainerPrefix+name)
 	if err != nil {
 		if isNotFound(out) {
 			return Observed{}, nil
 		}
 		return Observed{}, fmt.Errorf("%w: inspect %s: %s", ErrEngine, name, trim(out, err))
 	}
-	parts := strings.SplitN(strings.TrimSpace(string(out)), "|", 3)
-	if len(parts) != 3 {
+	parts := strings.SplitN(strings.TrimSpace(string(out)), "|", 5)
+	if len(parts) != 5 {
 		return Observed{}, fmt.Errorf("%w: unreadable inspect output", ErrEngine)
 	}
 	code, _ := strconv.Atoi(parts[1])
-	obs := Observed{Exists: true, State: parts[0], ExitCode: code}
+	pid, _ := strconv.Atoi(parts[2])
+	obs := Observed{Exists: true, State: parts[0], ExitCode: code, Pid: pid}
 	var labels map[string]string
-	if json.Unmarshal([]byte(parts[2]), &labels) == nil {
-		if rec, ok := RecordFromLabels(labels); ok && rec.Name == name {
+	if json.Unmarshal([]byte(parts[4]), &labels) == nil {
+		// The image label must be the image the engine actually created the
+		// container from, so a container cannot claim a record it was not
+		// built for. (The revision label cannot be bound: edits change it.)
+		if rec, ok := RecordFromLabels(labels); ok && rec.Name == name && rec.Image == parts[3] {
 			obs.HasRecord, obs.Record = true, rec
 		}
 	}
@@ -172,12 +223,13 @@ func (r *Runner) settleCredentials(spec declaredsession.Declaration, runDir stri
 	if !HasMaterialized(runDir) {
 		return nil
 	}
+	hc, _ := declaredsession.HarnessConfigFor(spec.Harness)
 	if len(spec.Credentials) != 0 {
 		old, err := r.Creds.Load(spec.Name)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrReseal, err)
 		}
-		next, changed, err := ResealBundle(runDir, spec.Credentials, old)
+		next, changed, err := ResealBundle(runDir, hc, spec.Credentials, old)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrReseal, err)
 		}
@@ -190,12 +242,21 @@ func (r *Runner) settleCredentials(spec declaredsession.Declaration, runDir stri
 	return Wipe(runDir)
 }
 
+// sessionLock serializes every wake, sleep and re-seal of one session. The lock
+// file lives in the host run dir, which is never mounted into the container.
+func (r *Runner) sessionLock(runDir string) (func(), error) {
+	return acquireLock(filepath.Join(runDir, "lock"))
+}
+
 // Wake creates the session's container (and volume on first wake) and starts
-// it. It is not idempotent against a running session (ErrAlreadyRunning), and a
-// failure at any step leaves nothing half-started: secrets are wiped and a
-// container that never became ready is removed. The volume is never removed.
+// it. It is not idempotent against a running session (ErrAlreadyRunning), a
+// concurrent wake/sleep is refused (ErrBusy), and a failure at any step leaves
+// nothing half-started: secrets are wiped and only a container THIS call
+// started (by the id its own run returned) is removed. The volume is never
+// removed.
 func (r *Runner) Wake(ctx context.Context, d declaredsession.Declaration) (rec Record, err error) {
-	spec, err := NewSpec(d, r.Binary, r.sessionDir(d.Name), r.UID, r.GID)
+	view := r.ViewDir(d.Name)
+	spec, err := NewSpec(d, r.Binary, view, r.UID, r.GID)
 	if err != nil {
 		return Record{}, err
 	}
@@ -206,6 +267,11 @@ func (r *Runner) Wake(ctx context.Context, d declaredsession.Declaration) (rec R
 	if err != nil {
 		return Record{}, err
 	}
+	release, err := r.sessionLock(runDir)
+	if err != nil {
+		return Record{}, err
+	}
+	defer release()
 	obs, err := r.Observe(ctx, d.Name)
 	if err != nil {
 		return Record{}, err
@@ -215,6 +281,11 @@ func (r *Runner) Wake(ctx context.Context, d declaredsession.Declaration) (rec R
 	}
 	if obs.Exists && obs.State == "running" {
 		return obs.Record, ErrAlreadyRunning
+	}
+	// Only a stopped container may be replaced; a paused or transitional one is
+	// somebody's live state and is never removed here.
+	if obs.Exists && obs.State != "exited" && obs.State != "created" && obs.State != "dead" {
+		return Record{}, fmt.Errorf("%w: container is %s; refusing to replace it", ErrSpec, obs.State)
 	}
 	// A previous wake that never reached sleep (crashed worker) may have left
 	// rotated tokens in the run dir: seal them before anything is replaced.
@@ -230,11 +301,11 @@ func (r *Runner) Wake(ctx context.Context, d declaredsession.Declaration) (rec R
 			return Record{}, err
 		}
 	}
-	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil {
-		return Record{}, ErrRunDir
+	if _, err := r.prepareViewDir(d.Name); err != nil {
+		return Record{}, err
 	}
 	if r.ClearStop != nil {
-		if err := r.ClearStop(ctx, r.NodeDir, d.Name); err != nil {
+		if err := r.ClearStop(ctx, view, d.Name); err != nil {
 			return Record{}, err
 		}
 	}
@@ -247,29 +318,39 @@ func (r *Runner) Wake(ctx context.Context, d declaredsession.Declaration) (rec R
 	if err := r.ensureVolume(ctx, spec, rec); err != nil {
 		return Record{}, err
 	}
+	if out, initErr := r.engine(ctx, buildInitArgs(spec, r.RT.IsPodman())...); initErr != nil {
+		return Record{}, fmt.Errorf("%w: prepare volume: %s", ErrEngine, trim(out, initErr))
+	}
 	cfg, err := RenderConfig(d)
 	if err != nil {
 		return Record{}, ErrSpec
 	}
-	if err := writePrivate(filepath.Join(runDir, "sessions.yaml"), cfg); err != nil {
+	if err := writePrivate(filepath.Join(view, "sessions.yaml"), cfg); err != nil {
 		return Record{}, ErrRunDir
 	}
-	mat, err := Materialize(runDir, d.Credentials, bundle)
+	mat, err := Materialize(runDir, spec.Config, d.Credentials, bundle)
 	if err != nil {
 		return Record{}, err
 	}
-	started := false
+	// Past this point the operator has chosen awake.
+	if err := r.setSleepIntent(d.Name, false); err != nil {
+		_ = Wipe(runDir)
+		return Record{}, ErrRunDir
+	}
+	ownID := ""
 	defer func() {
-		if err != nil {
-			if started {
-				_, _ = r.engine(context.WithoutCancel(ctx), "stop", "-t", strconv.Itoa(StopGraceSeconds), spec.ContainerName)
-				if serr := r.settleCredentials(d, runDir); serr != nil {
-					err = errors.Join(err, serr)
-				}
-			} else {
-				_ = Wipe(runDir)
+		if err == nil {
+			return
+		}
+		if ownID != "" {
+			bg := context.WithoutCancel(ctx)
+			_, _ = r.engine(bg, "stop", "-t", strconv.Itoa(StopGraceSeconds), ownID)
+			if serr := r.settleCredentials(d, runDir); serr != nil {
+				err = errors.Join(err, serr)
 			}
-			_, _ = r.engine(context.WithoutCancel(ctx), "rm", "-f", spec.ContainerName)
+			_, _ = r.engine(bg, "rm", "-f", ownID)
+		} else {
+			_ = Wipe(runDir)
 		}
 	}()
 	if obs.Exists {
@@ -277,16 +358,22 @@ func (r *Runner) Wake(ctx context.Context, d declaredsession.Declaration) (rec R
 			return Record{}, fmt.Errorf("%w: remove stale container: %s", ErrEngine, trim(out, rmErr))
 		}
 	}
-	if out, runErr := r.engine(ctx, append([]string{"run"}, buildRunArgs(spec, runInputs{RunDir: runDir, Incarnation: inc, Materialized: mat, Podman: r.RT.IsPodman()}, rec)...)...); runErr != nil {
+	out, runErr := r.engine(ctx, append([]string{"run"}, buildRunArgs(spec, runInputs{RunDir: runDir, Incarnation: inc, Materialized: mat, Podman: r.RT.IsPodman()}, rec)...)...)
+	if runErr != nil {
 		return Record{}, fmt.Errorf("%w: run: %s", ErrEngine, trim(out, runErr))
 	}
-	started = true
+	ownID = lastLine(out)
 	if r.WaitReady != nil {
 		if err = r.WaitReady(ctx, d.Name, inc); err != nil {
 			return Record{}, fmt.Errorf("%w: holder not ready: %v", ErrEngine, err)
 		}
 	}
 	return rec, nil
+}
+
+func lastLine(out []byte) string {
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 func (r *Runner) ensureVolume(ctx context.Context, spec *Spec, rec Record) error {
@@ -305,9 +392,11 @@ func (r *Runner) ensureVolume(ctx context.Context, spec *Spec, rec Record) error
 	return nil
 }
 
-// Sleep stops the container gracefully, re-seals rotated credentials, wipes the
-// run dir and removes the container. The volume stays. If re-sealing fails the
-// container stays stopped and the secrets stay on tmpfs for a retry.
+// Sleep records the operator's sleep intent (so a failed sleep is never undone
+// by the boot reconciler), stops the container gracefully, re-seals rotated
+// credentials, wipes the run dir and removes the container. The volume stays.
+// If re-sealing fails the container stays stopped and the secrets stay on tmpfs
+// for a retry.
 func (r *Runner) Sleep(ctx context.Context, d declaredsession.Declaration) error {
 	if declaredsession.ValidateName(d.Name) != nil {
 		return ErrSpec
@@ -316,12 +405,20 @@ func (r *Runner) Sleep(ctx context.Context, d declaredsession.Declaration) error
 	if err != nil {
 		return err
 	}
+	release, err := r.sessionLock(runDir)
+	if err != nil {
+		return err
+	}
+	defer release()
 	obs, err := r.Observe(ctx, d.Name)
 	if err != nil {
 		return err
 	}
 	if obs.Exists && !obs.HasRecord {
 		return fmt.Errorf("%w: %s%s is not a session container", ErrSpec, ContainerPrefix, d.Name)
+	}
+	if err := r.setSleepIntent(d.Name, true); err != nil {
+		return ErrRunDir
 	}
 	if obs.Exists && obs.State == "running" {
 		if out, stopErr := r.engine(ctx, "stop", "-t", strconv.Itoa(StopGraceSeconds), ContainerPrefix+d.Name); stopErr != nil && !isNotFound(out) {
@@ -335,6 +432,44 @@ func (r *Runner) Sleep(ctx context.Context, d declaredsession.Declaration) error
 		if out, rmErr := r.engine(ctx, "rm", "-f", ContainerPrefix+d.Name); rmErr != nil && !isNotFound(out) {
 			return fmt.Errorf("%w: remove: %s", ErrEngine, trim(out, rmErr))
 		}
+	}
+	return nil
+}
+
+// ResealOnce captures a token the awake harness rotated into the sealed bundle,
+// without waiting for sleep. This is what makes rotation survive a reboot: tmpfs
+// does not. It skips (nil) when another wake/sleep holds the session, and never
+// wipes anything.
+func (r *Runner) ResealOnce(d declaredsession.Declaration) error {
+	if len(d.Credentials) == 0 {
+		return nil
+	}
+	runDir, err := r.RunDir(d.Name)
+	if err != nil {
+		return err
+	}
+	release, err := r.sessionLock(runDir)
+	if errors.Is(err, ErrBusy) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer release()
+	if !HasMaterialized(runDir) {
+		return nil
+	}
+	hc, _ := declaredsession.HarnessConfigFor(d.Harness)
+	old, err := r.Creds.Load(d.Name)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrReseal, err)
+	}
+	next, changed, err := ResealBundle(runDir, hc, d.Credentials, old)
+	if err != nil || !changed {
+		return err
+	}
+	if err := r.Creds.Save(d.Name, next); err != nil {
+		return fmt.Errorf("%w: %v", ErrReseal, err)
 	}
 	return nil
 }

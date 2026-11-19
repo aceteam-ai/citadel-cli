@@ -19,7 +19,8 @@ var ErrNoCredentials = errors.New("no sealed credentials for session")
 const (
 	maxCredentialBytes = 64 << 10
 	maxBundleBytes     = 1 << 20
-	credsDirName       = "creds"
+	cfgDirName         = "cfg"
+	envDirName         = "envdir"
 	credEnvFileName    = "credentials.env"
 	sealedSuffix       = ".sealed"
 )
@@ -123,36 +124,60 @@ func wipe(b []byte) {
 	}
 }
 
-// Materialized is the set of host tmpfs files a wake bind-mounts or passes.
+// Materialized is the set of host tmpfs paths a wake mounts.
 type Materialized struct {
-	// Files maps a credential name to its host tmpfs path.
+	// ConfigDir is the host tmpfs directory bound at the harness config dir.
+	ConfigDir string
+	// Files maps a credential name to its host tmpfs path inside ConfigDir.
 	Files map[string]string
-	// EnvFile is the host path of the KEY=value file, or "" when no credential
-	// is an environment variable.
-	EnvFile string
+	// EnvDir is the host directory bound read-only at the container credential
+	// dir, or "" when no credential is an environment variable.
+	EnvDir string
 }
 
-// Materialize writes each declared credential into runDir (which the caller has
-// already proven to be tmpfs) with 0600 permissions. A declared credential with
-// no value is a refusal that names only the credential, never a value. Nothing
-// is written until every credential has been checked, so a refusal leaves no
-// partial secret behind.
-func Materialize(runDir string, specs []declaredsession.CredentialSpec, b Bundle) (*Materialized, error) {
+// credFilePath is the host path of a file credential: the tmpfs mirror of its
+// in-container path under the harness config dir.
+func credFilePath(runDir string, cfg declaredsession.HarnessConfig, c declaredsession.CredentialSpec) string {
+	return filepath.Join(runDir, cfgDirName, filepath.FromSlash(strings.TrimPrefix(c.Path, cfg.Dir+"/")))
+}
+
+// Materialize builds the host tmpfs tree for one wake under runDir (which the
+// caller has already proven to be tmpfs) with 0700/0600 permissions:
+//
+//   - cfg/ is bound at the harness config dir, so credentials AND any temp file a
+//     rename-based writer stages beside them stay off the volume;
+//   - an empty mountpoint directory per persisted subpath, created here as the
+//     node user so the engine never has to create one as root;
+//   - envdir/credentials.env for env credentials.
+//
+// A declared credential with no value is a refusal that names only the
+// credential. Nothing is written until every credential has been checked.
+func Materialize(runDir string, cfg declaredsession.HarnessConfig, specs []declaredsession.CredentialSpec, b Bundle) (*Materialized, error) {
 	if err := ValidateBundle(specs, b); err != nil {
 		return nil, err
 	}
-	m := &Materialized{Files: map[string]string{}}
+	m := &Materialized{Files: map[string]string{}, ConfigDir: filepath.Join(runDir, cfgDirName)}
+	fail := func() (*Materialized, error) {
+		_ = Wipe(runDir)
+		return nil, ErrRunDir
+	}
+	if err := os.MkdirAll(m.ConfigDir, 0o700); err != nil {
+		return fail()
+	}
+	for _, sub := range cfg.Persist {
+		if err := os.MkdirAll(filepath.Join(m.ConfigDir, sub), 0o700); err != nil {
+			return fail()
+		}
+	}
 	var envLines []string
 	for _, c := range specs {
 		if c.Path != "" {
-			dir := filepath.Join(runDir, credsDirName)
-			if err := os.MkdirAll(dir, 0o700); err != nil {
-				return nil, ErrRunDir
+			p := credFilePath(runDir, cfg, c)
+			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+				return fail()
 			}
-			p := filepath.Join(dir, c.Name)
 			if err := writePrivate(p, b[c.Name]); err != nil {
-				_ = Wipe(runDir)
-				return nil, ErrRunDir
+				return fail()
 			}
 			m.Files[c.Name] = p
 			continue
@@ -161,12 +186,13 @@ func Materialize(runDir string, specs []declaredsession.CredentialSpec, b Bundle
 	}
 	if len(envLines) != 0 {
 		sort.Strings(envLines)
-		p := filepath.Join(runDir, credEnvFileName)
-		if err := writePrivate(p, []byte(strings.Join(envLines, "\n")+"\n")); err != nil {
-			_ = Wipe(runDir)
-			return nil, ErrRunDir
+		m.EnvDir = filepath.Join(runDir, envDirName)
+		if err := os.MkdirAll(m.EnvDir, 0o700); err != nil {
+			return fail()
 		}
-		m.EnvFile = p
+		if err := writePrivate(filepath.Join(m.EnvDir, credEnvFileName), []byte(strings.Join(envLines, "\n")+"\n")); err != nil {
+			return fail()
+		}
 	}
 	return m, nil
 }
@@ -208,7 +234,7 @@ func writePrivate(path string, data []byte) error {
 // file, so the new bytes must be sealed before the run dir is wiped or the
 // rotation (and with it the login) is lost. A missing or empty file never
 // replaces the sealed value: an unreadable token must not erase the good one.
-func ResealBundle(runDir string, specs []declaredsession.CredentialSpec, old Bundle) (Bundle, bool, error) {
+func ResealBundle(runDir string, cfg declaredsession.HarnessConfig, specs []declaredsession.CredentialSpec, old Bundle) (Bundle, bool, error) {
 	next := Bundle{}
 	for k, v := range old {
 		next[k] = append([]byte(nil), v...)
@@ -218,7 +244,7 @@ func ResealBundle(runDir string, specs []declaredsession.CredentialSpec, old Bun
 		if c.Path == "" {
 			continue
 		}
-		got, err := os.ReadFile(filepath.Join(runDir, credsDirName, c.Name))
+		got, err := os.ReadFile(credFilePath(runDir, cfg, c))
 		if err != nil || len(got) == 0 || len(got) > maxCredentialBytes {
 			continue
 		}
@@ -233,7 +259,7 @@ func ResealBundle(runDir string, specs []declaredsession.CredentialSpec, old Bun
 // Wipe removes every materialized secret from runDir.
 func Wipe(runDir string) error {
 	var errs []error
-	for _, name := range []string{credsDirName, credEnvFileName} {
+	for _, name := range []string{cfgDirName, envDirName} {
 		if err := os.RemoveAll(filepath.Join(runDir, name)); err != nil {
 			errs = append(errs, err)
 		}
@@ -244,7 +270,7 @@ func Wipe(runDir string) error {
 // HasMaterialized reports whether runDir still holds secrets from a previous
 // wake that was never re-sealed (a node crash between wake and sleep).
 func HasMaterialized(runDir string) bool {
-	for _, name := range []string{credsDirName, credEnvFileName} {
+	for _, name := range []string{cfgDirName, envDirName} {
 		if _, err := os.Lstat(filepath.Join(runDir, name)); err == nil {
 			return true
 		}

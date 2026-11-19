@@ -16,6 +16,9 @@ type Decision struct {
 
 // Decide is the pure wake rule, from what the engine shows alone (no store):
 //
+//   - on_boot "resume" (the default, also spelled out) honors the intent below;
+//     "asleep" never wakes at boot;
+//   - an operator sleep request always wins over everything below;
 //   - a running container is left alone;
 //   - an exited container with exit code 0 is a harness the operator ended, and
 //     only an explicit wake undoes that (the holder exits non-zero whenever it
@@ -26,7 +29,7 @@ type Decision struct {
 //   - neither is a session never woken: the first wake is explicit.
 //
 // A container carrying our name but no valid record is never touched.
-func Decide(d declaredsession.Declaration, obs Observed, volume bool) Decision {
+func Decide(d declaredsession.Declaration, obs Observed, volume, sleepRequested bool) Decision {
 	dec := Decision{Name: d.Name}
 	switch {
 	case !d.IsContainer():
@@ -35,6 +38,10 @@ func Decide(d declaredsession.Declaration, obs Observed, volume bool) Decision {
 		dec.Reason = "disabled"
 	case d.Runtime.OnBoot == "asleep":
 		dec.Reason = "on_boot_asleep"
+	case sleepRequested:
+		// The operator asked this session to sleep (even if the sleep failed
+		// midway and left a non-zero exited container).
+		dec.Reason = "sleep_requested"
 	case obs.Exists && !obs.HasRecord:
 		dec.Reason = "foreign_container"
 	case obs.Exists:
@@ -88,7 +95,7 @@ func (r *Runner) Reconcile(ctx context.Context, snapshot declaredsession.Snapsho
 			out = append(out, Outcome{Decision: Decision{Name: d.Name, Reason: "observe_failed"}, Err: err})
 			continue
 		}
-		dec := Decide(d, obs, volume)
+		dec := Decide(d, obs, volume, r.sleepRequested(d.Name))
 		o := Outcome{Decision: dec}
 		if dec.Wake {
 			if _, werr := r.Wake(ctx, d); werr != nil && !errors.Is(werr, ErrAlreadyRunning) {

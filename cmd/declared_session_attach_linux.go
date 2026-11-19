@@ -463,7 +463,7 @@ func dialContainerSession(ctx context.Context, nodeDir string, d declaredsession
 	if err != nil {
 		return nil, err
 	}
-	store, err := declaredsession.OpenStore(nodeDir)
+	store, err := declaredsession.OpenStore(runner.ViewDir(d.Name))
 	if err != nil {
 		return nil, err
 	}

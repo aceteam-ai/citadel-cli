@@ -64,3 +64,29 @@ func TestKeyCompartmentRefusesRelativePath(t *testing.T) {
 		t.Fatal("relative path must be refused")
 	}
 }
+
+func TestKeyCompartmentRefusesSymlinkedKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no symlink semantics")
+	}
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.WriteFile(real, make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenKeyCompartment(link, true); !errors.Is(err, ErrCompartmentKeyUnsafe) {
+		t.Fatalf("symlinked key err = %v", err)
+	}
+}
+
+// A compartment must not satisfy any API that takes the at-rest *Session.
+func TestKeyCompartmentIsNotASession(t *testing.T) {
+	var c any = &KeyCompartment{}
+	if _, ok := c.(interface{ DeriveSubkey(string) ([]byte, error) }); ok {
+		t.Fatal("compartment must not expose subkey derivation")
+	}
+}

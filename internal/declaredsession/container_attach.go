@@ -7,7 +7,7 @@ import "context"
 // incarnation label must equal the saved incarnation. The holder cannot prove
 // that about itself, and host process observation cannot see across the PID
 // namespace, so this is the container analogue of the scope observation.
-type ContainerVerifier func(ctx context.Context, name, incarnation string) error
+type ContainerVerifier func(ctx context.Context, name, incarnation string, peerPID int) error
 
 // DialContainerHolder returns an authenticated client to a container holder.
 // The socket protocol is the one the host holder speaks, so `citadel attach`
@@ -19,7 +19,10 @@ type ContainerVerifier func(ctx context.Context, name, incarnation string) error
 //     holder (its PID is the container's PID 1, not a host PID);
 //   - hello, saved state and live state must agree on incarnation, scope,
 //     declaration revision and the container guarantee;
-//   - the engine must confirm that incarnation is the running container.
+//   - the engine must confirm that incarnation is the running container AND
+//     that the socket peer's host PID is that container's PID 1, so a process
+//     the harness started inside the container cannot rebind the socket and
+//     impersonate the holder.
 func DialContainerHolder(ctx context.Context, session *SessionStore, verify ContainerVerifier) (*Client, error) {
 	if verify == nil {
 		return nil, ErrPeer
@@ -40,7 +43,7 @@ func DialContainerHolder(ctx context.Context, session *SessionStore, verify Cont
 		return nil, ErrPeer
 	}
 	client.hello = *hello.Hello
-	if verify(ctx, saved.Name, saved.Incarnation) != nil {
+	if verify(ctx, saved.Name, saved.Incarnation, pid) != nil {
 		_ = client.Close()
 		return nil, ErrPeer
 	}
