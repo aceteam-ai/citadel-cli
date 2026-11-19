@@ -138,6 +138,12 @@ type sessionRecord struct {
 	EndedReason string        `json:"ended_reason,omitempty"`
 	EndedDetail string        `json:"ended_detail,omitempty"`
 	EndedAt     string        `json:"ended_at,omitempty"`
+	// Reserved suspend metadata (#1821). The unwired planner refuses legacy
+	// records without a platform-authenticated user binding. OwnerUID above is
+	// the OS process owner and must never substitute for this account identity.
+	OwnerUserID string           `json:"owner_user_id,omitempty"`
+	ProfileName string           `json:"profile_name,omitempty"`
+	Suspension  *suspendMetadata `json:"suspension,omitempty"`
 }
 
 // adoptionSupported reports whether this OS can re-adopt sessions. A var so
