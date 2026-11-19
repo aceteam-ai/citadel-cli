@@ -65,7 +65,16 @@ func harnessInstalled(h harnessSpec, env harnessEnv) bool {
 	if _, err := os.Stat(p); err == nil {
 		return true
 	}
-	fi, err := os.Stat(filepath.Dir(p))
+	dir := filepath.Dir(p)
+	if h.name == "claude-code" {
+		// The file sits in the home folder, which always exists; Claude Code's
+		// own settings folder is the sign it has run.
+		dir = filepath.Join(filepath.Dir(p), ".claude")
+		if env.claudeDir != "" {
+			dir = env.claudeDir
+		}
+	}
+	fi, err := os.Stat(dir)
 	return err == nil && fi.IsDir()
 }
 
@@ -113,7 +122,7 @@ func setupConnect(name, expectedPath, exe string, env harnessEnv, now time.Time)
 	// The click consents to adding Citadel. Replacing a different existing
 	// citadel entry is not covered by it, so that is declined here and left to
 	// `citadel local config --write`, which asks.
-	written, err := mergeHarnessConfig(h, path, exe, func(string) bool { return false }, now)
+	written, err := mergeHarnessConfig(h, path, exe, func(string) bool { return false }, false, now)
 	res := localviewer.SetupConnectResult{Path: path}
 	switch {
 	case errors.Is(err, errAlreadyConfigured):

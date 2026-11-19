@@ -679,7 +679,7 @@ func (c *Collector) getNetworkIP() string {
 
 // collectSystemMetrics gathers CPU, memory, and disk utilization.
 func (c *Collector) collectSystemMetrics() SystemMetrics {
-	var metrics SystemMetrics
+	metrics := collectCapacityMetrics(nativeCapacityProbes())
 
 	// Memory
 	if v, err := mem.VirtualMemory(); err == nil {
