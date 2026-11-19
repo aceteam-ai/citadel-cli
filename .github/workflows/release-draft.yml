@@ -1,0 +1,57 @@
+name: CI release draft
+
+# Only completed same-repository main push CI can initiate this write-capable
+# workflow. The helper repeats identity, merged-PR and all-check gates.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+concurrency:
+  group: citadel-release-draft
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    name: Draft unsigned release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    # A hard 4-CPU limit, independently of Go's parallelism settings.
+    container:
+      image: ubuntu:24.04
+      options: --cpus 4
+    permissions:
+      contents: write
+      actions: read
+      checks: read
+      pull-requests: read
+    steps:
+      - name: Install release tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq ca-certificates git gh python3
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Gate, build and draft (never sign or publish)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          DRAFT_RUN_ID: ${{ github.run_id }}
+          GOMAXPROCS: '4'
+          GOFLAGS: '-p=4'
+        run: >-
+          python3 -I -B scripts/release_draft.py ci
+          --commit "$SOURCE_SHA" --ci-run "$CI_RUN_ID" --run "$DRAFT_RUN_ID"
