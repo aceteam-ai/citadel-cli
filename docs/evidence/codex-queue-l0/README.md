@@ -13,7 +13,7 @@ injection, or live model API was used.
 | --- | --- |
 | [A: queue and UserPromptSubmit](a-user-prompt-submit.md) | Actual CLI/private Unix daemon operator canary passes |
 | [B: Stop continuation](b-stop-continuation.md) | Private stdio and native Unix daemon canaries pass |
-| [C: paused queue](c-paused-queue.md) | Unverified; requires operator canary |
+| [C: paused queue](c-paused-queue.md) | Native breaker-blocked goal accepts one queued turn; reconnect pause and other stalled states unverified |
 | [D: human composer draft](d-human-draft.md) | Unverified; requires operator canary |
 | [E: local daemon status](e-thread-status.md) | Separate-process native Unix daemon reader passes |
 
@@ -108,12 +108,30 @@ The failed r1 run is not acceptance evidence.
 
 ## What remains
 
-The operator receipt clears A, B and E for this private, fake-provider native
-daemon canary only. It does not prove all interactive lifecycle states or
-clear L0. C's reconnect-pause and stalled-goal cases and D's unsent human
-composer remain unverified. Reconnect pause and the composer need operator-owned
-interactive observations; a separately established blocked-goal case may be
-probeable through the native API without a TUI.
+The operator receipts clear A, B and E for this private, fake-provider native
+daemon canary and establish one narrower C case. In the
+[native r3 receipt](https://github.com/aceteam-ai/citadel-cli/pull/1818#issuecomment-7012245641),
+the [reviewed r3 script](https://github.com/aceteam-ai/citadel-cli/pull/1818#issuecomment-7011199590)
+with SHA-256
+`53cc83d4d2a6528cb9861688cd0323936f6e352c3e4608964de096e6bbb81955`
+first observes the goal blocked by three empty final answers, then queues once.
+During its configured six-second polling observation the receipt records one model call,
+one UserPromptSubmit, zero pending items and a goal that remains blocked.
+The queued turn uses the same empty-final-answer fixture. The poll-window field
+is not a measured latency or end-to-end deadline. Exit 0 and clean cleanup are
+recorded; A/B/E reproduced. No lane ran r3.
+
+A blocked goal therefore does not imply a parked queued wake in this case;
+turn delivery and goal continuation are distinct. L3 must use actual correlated
+turn/consumption evidence, not infer ignored or consumed from goal status or
+queue acknowledgement. Existing wake eligibility refusals and caps remain;
+this is not permission to wake blocked lanes or resume their goals.
+
+This does not prove all interactive lifecycle states or clear L0. C's TUI
+reconnect pause and other stalled states and D's unsent human composer remain
+unverified. Reconnect pause and the composer need operator-owned interactive
+observations. The D note gives a manual fake-sentinel procedure for Jason; it
+does not authorize a lane to inspect or manipulate his terminal.
 Keep [L4 #1817](https://github.com/aceteam-ai/citadel-cli/issues/1817) gated.
 Do not replace missing observations with a second writer, `--remote`, PTY reads,
 terminal scraping or keystrokes.
