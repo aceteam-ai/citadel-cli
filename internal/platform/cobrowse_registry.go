@@ -377,6 +377,8 @@ func (s *cobrowseSession) persistRecord() {
 		State:        RecordLive,
 		Generation:   s.generation,
 		PendingEnd:   s.pendingEnd,
+		OwnerUserID:  s.ownerUserID,
+		ProfileName:  s.profileName,
 	}
 	regDir := s.regDir
 	if !s.startedAt.IsZero() {
@@ -656,6 +658,8 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			proc:            adoptedProc(rec),
 			explicitHandoff: rec.Handoff,
 			generation:      rec.Generation + 1,
+			ownerUserID:     rec.OwnerUserID,
+			profileName:     rec.ProfileName,
 			tracking:        rec.Tracking,
 			policy:          m.targetPolicy,
 		}

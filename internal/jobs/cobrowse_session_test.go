@@ -76,6 +76,20 @@ func TestCobrowseSession_StartWithProfileRequiresPIN(t *testing.T) {
 	}
 }
 
+// The invalid URL is a second refusal, so even a mutation dropping the owner
+// field can never start a real browser. Its distinct error proves that the job
+// forwards the server-owned identity and validates it before launch.
+func TestCobrowseSession_StartForOwnerForwardsBinding(t *testing.T) {
+	mgr := platform.NewCobrowseSessionManager(t.TempDir(), 1)
+	h := NewCobrowseSessionHandlerWithManager(mgr)
+	_, err := h.Execute(JobContext{}, &nexus.Job{ID: "synthetic", Payload: map[string]string{
+		"action": "start", "url": "file:///refused", "owner_user_id": "invalid owner",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "authenticated browser session owner") {
+		t.Fatalf("start did not forward the authenticated owner assertion: %v", err)
+	}
+}
+
 func TestCobrowseSession_ResetRequiresProfile(t *testing.T) {
 	_, err := runSession(t, map[string]string{"action": CobrowseSessionActionReset})
 	if err == nil {

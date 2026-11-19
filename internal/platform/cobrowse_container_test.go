@@ -651,7 +651,7 @@ func TestRecoverContainerAdoptsVerifiedRecord(t *testing.T) {
 	if currentOwnerIdentity() == 0 {
 		t.Skip("needs /proc")
 	}
-	writeContainerRecord(t, m, reg, nil)
+	writeContainerRecord(t, m, reg, func(r *sessionRecord) { r.OwnerUserID = "account-a" })
 	m.recoverSessions()
 	m.mu.Lock()
 	s := m.sessions[testSID]
@@ -661,6 +661,9 @@ func TestRecoverContainerAdoptsVerifiedRecord(t *testing.T) {
 	}
 	if s.workDir != filepath.Join(m.baseDir, testSID, containerProfileSubdir) {
 		t.Fatal("adopted session must keep its profile subdir")
+	}
+	if s.ownerUserID != "account-a" {
+		t.Fatal("container re-adoption lost the authenticated account binding")
 	}
 	s.proc.stop()
 }

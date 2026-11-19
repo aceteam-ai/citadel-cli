@@ -2,8 +2,9 @@
 
 ## Draft checkpoint, not an enabled capability
 
-This branch starts the node-side implementation with pure planning and bounded
-manifest primitives. There is no production caller yet: no new job action,
+This branch starts the node-side implementation with planning, authenticated
+start-owner metadata and bounded manifest encryption primitives. Suspend and
+reopen have no production caller yet: no new job action,
 browser close/relaunch, profile snapshot, sweep timer or advertised capability.
 Existing browser behavior is unchanged. This is not a completed suspend feature
 or native acceptance proof.
@@ -15,12 +16,16 @@ unlocked or stopped; launching, resuming and suspending sessions are busy. A
 human-driven session refuses agent-initiated suspend. The human owner may
 explicitly suspend it, but a payload must not be allowed to invent that authority.
 
-The current node job envelope has no authenticated user identity, and the
-registry's existing owner is an OS process owner, not an account owner. Before
-job wiring, the paired platform must supply and authorize a stable account
-binding at start and on suspend/reopen. Unknown-owner legacy sessions will
-refuse suspend, not acquire a new owner from the suspend request. The wire field
-names and first-party-human assertion are pending coordinator confirmation.
+The approved paired contract is `owner_user_id`, injected by the platform from
+the authenticated session at start and on suspend/reopen. The server must never
+forward an agent/client-selected value. `owner_initiated=true` is reserved for a
+first-party human action, not a tool argument. The start handler now records the
+optional owner before launch and preserves it through registry writes and host
+or container re-adoption. The registry's OS process owner is not an account
+owner and never substitutes for it. Legacy starts with no assertion keep their
+existing behavior but remain unbound: suspend and reopen must fail closed, not
+acquire a new owner from a later request. This source change does not implement
+the paired server producer or grant ownership/entitlement on the platform.
 
 The planner requires a current, owner-bound live record. Its suspended snapshot
 retains session ID, generation, driver, tracking and profile kind/name, but no
@@ -34,6 +39,11 @@ carry secrets. They must stay node-local and must not appear in status, job
 results, logs or audit events. Errors and diagnostic summaries do not include
 tab data. Persistent manifests must be encrypted with the already unlocked
 profile vault session under a distinct session-bound context before storing.
+The profile handle now has bounded manifest seal/unseal primitives using the
+existing vault session, with context bound to profile, session and capture
+generation. They expose no key, retain no passphrase and stop working after
+the handle closes. Authorization, expiry, manifest schema checks and durable
+file storage remain manager responsibilities, not claims of the crypto helper.
 Throwaway manifests may be stored in a private 0600 file and contain no cookies,
 storage, passwords, form values or browser profile archive.
 
@@ -60,8 +70,8 @@ history stacks and browser process memory are not preserved.
 
 ## Remaining implementation before review/activation
 
-1. Confirm and wire the authenticated owner and human-origin assertions through
-   the paired job producer and handler. Preserve the platform's ownership,
+1. Finish the approved owner and human-origin assertions through the paired job
+   producer and suspend/reopen handler. Preserve the platform's ownership,
    entitlement and approval-expiry checks; the node does not grant them.
 2. Capture over bounded CDP operations under the lifecycle/action locks. Write
    the complete private or encrypted manifest durably before graceful close and

@@ -297,6 +297,11 @@ type cobrowseSession struct {
 	// throwaway session. When set, teardown persists (only if the browser ran) and
 	// always Closes it.
 	encProfile SessionProfile
+	// Account identity is set only before launch from the authenticated job
+	// producer. It is not the OS process owner, and is never inferred or claimed
+	// by a later suspend/reopen request. Empty means a legacy/unbound session.
+	ownerUserID string
+	profileName string
 
 	mu    sync.Mutex
 	state CobrowseSessionState
@@ -447,7 +452,23 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 // lock can leak — a missed Close is structurally impossible because every cleanup
 // path routes through teardown().
 func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
-	return m.startSession(newSessionID(), startURL, profile)
+	return m.startSession(newSessionID(), startURL, profile, "", "")
+}
+
+// StartSessionForOwner binds a new session before it becomes observable. The
+// enrolled-node job producer must supply ownerUserID from its authenticated
+// account, never an agent/client parameter. Local and legacy entry points leave
+// ownership unknown and cannot later acquire suspend authority from a request.
+// Ownership of profile transfers here, including all validation failures.
+func (m *CobrowseSessionManager) StartSessionForOwner(startURL, ownerUserID, profileName string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	if !validSuspendOwner(ownerUserID) || (profile != nil) != (profileName != "") ||
+		(profileName != "" && !suspendProfileName.MatchString(profileName)) {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("invalid authenticated browser session owner or profile binding")
+	}
+	return m.startSession(newSessionID(), startURL, profile, ownerUserID, profileName)
 }
 
 // NewCobrowseSessionID returns a fresh session id in the manager's format. A
@@ -469,10 +490,10 @@ func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile
 		}
 		return CobrowseSessionStatus{}, fmt.Errorf("invalid co-browse session id %q", id)
 	}
-	return m.startSession(id, startURL, profile)
+	return m.startSession(id, startURL, profile, "", "")
 }
 
-func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
+func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile, ownerUserID, profileName string) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
 			profile.Close()
@@ -520,15 +541,17 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		return CobrowseSessionStatus{}, fmt.Errorf("co-browse session %s already exists", id)
 	}
 	s := &cobrowseSession{
-		id:         id,
-		profile:    filepath.Join(m.baseDir, id),
-		startedAt:  time.Now(),
-		state:      SessionLaunching,
-		encProfile: profile,
-		regDir:     m.sessionRegDir(),
-		generation: 1,
-		tracking:   m.trackTargets,
-		policy:     m.targetPolicy,
+		id:          id,
+		profile:     filepath.Join(m.baseDir, id),
+		startedAt:   time.Now(),
+		state:       SessionLaunching,
+		encProfile:  profile,
+		ownerUserID: ownerUserID,
+		profileName: profileName,
+		regDir:      m.sessionRegDir(),
+		generation:  1,
+		tracking:    m.trackTargets,
+		policy:      m.targetPolicy,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
