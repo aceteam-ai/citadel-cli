@@ -7,13 +7,17 @@ the release flow produces it, how the updater checks it, and how keys rotate.
 
 ## What is signed
 
-Every release publishes, in the same `gh release create` call:
+Every published release contains these assets before it becomes immutable:
 
 - the platform archives (`citadel_<tag>_<os>_<arch>.tar.gz` / `.zip`);
 - `checksums.txt`: `sha256sum` output, one `<64 hex>  <archive name>` line per
   archive;
 - `checksums.txt.sig`: a detached signature over the **exact bytes** of
   `checksums.txt`.
+
+In the primary flow, CI creates the unsigned draft with archives and checksums;
+the operator attaches the signature before publication. The emergency legacy
+flow supplies all three asset kinds in its single release-create operation.
 
 `checksums.txt.sig` is a single-line JSON object:
 
@@ -48,9 +52,52 @@ optional pre-release suffix before they are used in any URL.
 
 ## Release flow
 
-`scripts/release.sh` (via hooks in `scripts/release-engine.sh`):
+The primary path is a reviewed `VERSION` bump PR, then CI, then local signing.
+No release key is stored in GitHub or given to the CI workflow.
 
-1. `hook_preflight` runs on every invocation, including `--dry-run` and a
+1. After the main push CI completes successfully, `release-draft.yml` checks
+   its same-repository/main/push identity. The helper requires a clean checkout
+   at fresh origin/main, a real increasing version change in that exact commit,
+   exactly one same-repository merged PR for it, and green exact-commit checks.
+   The initial VERSION baseline and ordinary no-bump main merges draft nothing.
+2. CI builds all six archives, including the Windows launcher, and writes
+   `checksums.txt`. Go uses GOMAXPROCS=4 and package parallelism 4, with a hard
+   four-CPU container cap. It deliberately does not use `-trimpath`: Go would
+   omit the linker flags required by the updater's non-executing version parser.
+   CI verifies archive consistency and each CLI's recorded main package, exact
+   version stamp and OS/architecture using that same parser, rechecks fresh main
+   and the gates, pushes only the exact commit's version tag, and creates an
+   unsigned **draft** release. It never signs, publishes or updates Homebrew.
+3. CI prints a `CITADEL_DRAFT_RECEIPT` in its Actions log binding the tag,
+   source commit, merged PR, CI run and manifest SHA-256. The draft body holds
+   a copy, but the signer requires equality with the successful workflow log.
+   This prevents replacement of both the archives and unsigned manifest from
+   being mistaken for the original CI output. Missing/deleted logs fail closed.
+4. On the operator's offline-key release host, with a clean current main
+   checkout and authenticated GitHub CLI, run:
+
+   ```bash
+   scripts/release.sh --sign-draft vX.Y.Z
+   ```
+
+   The command checks workflow/source/PR provenance, exact remote tag binding
+   and all exact-source gates, downloads assets by immutable ID with byte/time
+   limits, compares the manifest to the CI log digest, and verifies every
+   archive against the updater's tag-bound parser. Only then does it load the
+   local key and sign. It self-verifies the signature, re-reads the draft to
+   reject changes, uploads the signature, checks the upload, publishes by the
+   original release ID, and updates the Homebrew tap from verified checksums.
+
+Drafts are not installable. Publication happens only after the signature is
+present, before GitHub freezes the release assets. The compiled updater key set
+and tag binding are unchanged. Existing local gentle-mode limits also apply to
+the sign-draft command.
+
+The earlier all-local flow remains available as operator-only emergency
+recovery through `scripts/release.sh --legacy`, followed by its existing engine
+options. Bare invocations refuse instead of accidentally cutting a release:
+
+1. `hook_preflight` runs on legacy-engine invocations, including `--dry-run` and a
    resumed release, before anything is tagged. It loads the signing key and
    requires its public key to be in the compiled trusted set. A missing,
    unreadable, malformed or untrusted key fails the release. It prints only
@@ -71,6 +118,100 @@ The key path is `CITADEL_RELEASE_SIGNING_KEY`, defaulting to
 `$HOME/.config/citadel-release/release-signing-ed25519.pem` (PKCS#8 PEM,
 mode 0600). The private key lives only on the offline release machine and its
 owner-controlled backup.
+
+### Refusals and recovery
+
+- A bump whose CI was cancelled, is red, or is no longer fresh main is not
+  drafted. Do not bypass a gate. Before moving main again, rerun failed CI if
+  appropriate; otherwise prepare a fresh reviewed bump at current main.
+- A remote tag at another commit, an existing release (including a partial
+  draft), unknown check provider, or incomplete forge pagination refuses the CI
+  draft. CI never overwrites assets or force-pushes a tag. Inspect and reconcile
+  an uncertain creation/upload manually; no write is automatically retried.
+- Local signing refuses a changed/foreign/published-unsigned draft, mismatched
+  CI receipt, incomplete assets, changed bytes or an unverifiable signature.
+  Do not replace a failed archive or manifest by hand: fix source and rebuild
+  through a reviewed bump instead.
+- If publication succeeded but Homebrew failed, rerun the local command. It
+  accepts an already-published signed release only after the same provenance,
+  manifest and signature checks, then finishes the tap without signing,
+  uploading or publishing again. A signature uploaded before a failed publish
+  is likewise verified and reused, never replaced.
+- Download limits are 512 MiB per archive and 64 KiB per checksum/signature
+  asset, with a 300-second per-asset timeout. There is no extraction step.
+- The final re-read is not a transaction against a compromised GitHub writer.
+  Publication uses the original release ID, and nodes still refuse any archive
+  or manifest that no longer matches the trusted signature. Compromise of CI,
+  reviewed source or the offline signing host is outside this proof.
+
+## Version preparation helpers
+
+`scripts/release_version.py` prepares local version edits and reads candidate
+release snapshots. It does not authorize, build, sign, tag, upload or publish.
+The draft workflow calls the planner after the CI and merged-PR gates. The
+emergency all-local engine still derives its version from Git tags.
+
+`VERSION` contains one canonical stable version and a final LF. Its initial
+addition is a baseline, not a release candidate. On a feature branch, prepare
+a version-only edit with one of:
+
+```bash
+python3 scripts/release_version.py bump minor
+python3 scripts/release_version.py bump patch
+python3 scripts/release_version.py bump 3.0.0
+```
+
+The bumper changes only `VERSION`, refuses main/production/detached branches,
+refuses nonregular files, downgrades and uncommitted version edits, and checks
+for a concurrent edit before replacement. It does not create a branch, commit,
+tag or PR. Commit the edit through the normal hooks and reviewed-PR process.
+
+The read-only planner accepts complete before/after commit IDs:
+
+```bash
+python3 scripts/release_version.py plan --before <BEFORE_COMMIT> --after <AFTER_COMMIT>
+```
+
+It reads the immutable Git blobs, never an uncommitted worktree version.
+Both revisions must be commits and the before revision must be an ancestor of
+after. A missing baseline, initial baseline or unchanged version returns a
+non-candidate. Deletion, malformed versions, a downgrade or an existing target
+tag naming a different commit is refused. An existing tag is accepted for a
+retry only when it peels to exactly the after commit. Blob size and regular-file
+mode are checked before reading version contents.
+
+A `candidate: true` result is **not release authorization**. The CI caller must
+separately prove the reviewed merged bump PR, its approved main snapshot and
+all existing exact-head release gates, and fetch complete history and tags
+before planning. A locally absent tag is not proof that no remote tag exists.
+Archive consistency is a separate check
+with `releasesign verify-assets`; it does not establish source/CI provenance or
+signature trust. The updater's compiled-key and exact-tag verification is
+unchanged.
+
+Both CI and the local signer compare against remote version tags, not just
+VERSION. After an emergency legacy release, prepare a bump above that remote
+floor. A signed older-release retry is refused too, so it cannot roll back the
+Homebrew tap. Publication uses GitHub's semver-based latest selection instead
+of forcing an older release to become latest. The write-scoped CI job pins
+action revisions and does not restore a build/module cache.
+
+Never re-run the source CI or drafting workflow after a successful draft
+receipt. This first version requires the successful original runs and their
+latest logs/checks; a later failed attempt deliberately invalidates signing.
+If a run was accidentally re-run, or main moved before drafting, leave that
+draft untouched and prepare a new reviewed VERSION bump above the remote
+floor. Do not edit the receipt, overwrite assets or weaken the green-check
+gate to recover. A retry of the local sign-draft command is different: after
+manual reconciliation it can reuse a verified uploaded signature or finish
+the tap update, without re-running CI, re-signing or replacing assets.
+
+The signer checks the asset snapshot again immediately before publication.
+GitHub does not offer an atomic asset-set precondition on the release PATCH,
+so a concurrent trusted release writer can still cause an availability failure
+in that final interval. Immutable publication plus the updater's signature and
+archive checks prevent altered bytes from being installed; they cannot ensure
+that every raced release remains usable. Do not edit a draft being signed.
 
 ## Updater verification
 
@@ -107,8 +248,9 @@ added, replaced or deleted. v2.212.0 and earlier remain mutable.
 
 This matters in two ways:
 
-- A release must carry its signature when it is created, because the
-  signature cannot be attached later. The pre-publish check exists for this.
+- A release must carry its signature when it is published. Draft assets remain
+  editable so CI can upload unsigned archives and the local operator can attach
+  the signature before publication. No signature can be attached afterward.
 - Nobody can delete `checksums.txt.sig` from an immutable release to block
   updates to it. On a mutable release, removing the signature would make
   every verifying node refuse that release. Since all signed releases are
