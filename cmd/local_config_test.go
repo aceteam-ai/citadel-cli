@@ -703,3 +703,109 @@ func TestLocalDoctorFailureDoesNotPrintUsage(t *testing.T) {
 		t.Fatal("local doctor must set SilenceUsage so a failed check prints only results")
 	}
 }
+
+func TestClaudeCodeTarget(t *testing.T) {
+	h, ok := findHarness("claude-code")
+	if !ok {
+		t.Fatal("claude-code target missing")
+	}
+	home := t.TempDir()
+	env := harnessEnv{goos: "linux", home: home}
+	path := filepath.Join(home, ".claude.json")
+	if h.path(env) != path {
+		t.Fatalf("path %s", h.path(env))
+	}
+	if h.unverified(env) != "" {
+		t.Fatal("default location is confirmed")
+	}
+	if h.unverified(harnessEnv{goos: "linux", home: home, claudeDir: "/x"}) == "" {
+		t.Fatal("CLAUDE_CONFIG_DIR move must be marked unverified")
+	}
+	if got := h.path(harnessEnv{home: home, claudeDir: "/x"}); got != filepath.Join("/x", ".claude.json") {
+		t.Fatalf("claudeDir path %s", got)
+	}
+	block := renderBlock(h, "/bin/citadel")
+	for _, want := range []string{`"mcpServers"`, `"type": "stdio"`, `"command": "/bin/citadel"`, `"env": {}`} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("block missing %s:\n%s", want, block)
+		}
+	}
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	// Fresh file.
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, now); err != nil {
+		t.Fatal(err)
+	}
+	// Re-run is a no-op.
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, now); !errors.Is(err, errAlreadyConfigured) {
+		t.Fatalf("rerun: %v", err)
+	}
+
+	// Existing file with unrelated state: preserved byte-for-value.
+	orig := `{"numStartups": 12345678901234567890, "projects": {"/a": {"allowedTools": [], "x": 1.50}}, "mcpServers": {"other": {"command": "o"}}, "note": "caf\u00e9"}`
+	_ = os.WriteFile(path, []byte(orig), 0o600)
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, now); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	for _, want := range []string{`12345678901234567890`, `1.50`, `"other"`, `caf\u00e9`, `"citadel"`} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("lost %s:\n%s", want, got)
+		}
+	}
+	bak, err := os.ReadFile(path + ".bak-20260102T030405Z")
+	if err != nil || string(bak) != orig {
+		t.Fatalf("backup: %v %q", err, bak)
+	}
+
+	// A different citadel entry is declined without confirmation, replaced with it.
+	_ = os.WriteFile(path, []byte(`{"mcpServers":{"citadel":{"command":"/old"}},"keep":true}`), 0o600)
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, now); !errors.Is(err, errWriteDeclined) {
+		t.Fatalf("decline: %v", err)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), "/old") {
+		t.Fatal("declined merge must not write")
+	}
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return true }, now); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), `"keep": true`) || strings.Contains(string(b), "/old") {
+		t.Fatalf("replace: %s", b)
+	}
+}
+
+func TestClaudeCodeDetectedByDoctorAndSetup(t *testing.T) {
+	home := t.TempDir()
+	env := harnessEnv{goos: "linux", home: home}
+	exe := filepath.Join(home, "citadel")
+	_ = os.WriteFile(exe, []byte("x"), 0o700)
+	var out bytes.Buffer
+	if err := runLocalConfig("claude-code", exe, env, true, true, strings.NewReader(""), &out, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range detectHarnessConfigs(env) {
+		if s.Harness == "claude-code" {
+			found = s.Found && s.Points && s.Command == exe
+		}
+	}
+	if !found {
+		t.Fatal("doctor detection must see the claude-code entry")
+	}
+	var app string
+	for _, a := range setupApps(env) {
+		if a.Name == "claude-code" {
+			app = a.State
+		}
+	}
+	if app != "connected" {
+		t.Fatalf("setup page state %q", app)
+	}
+	// Without the file or a ~/.claude folder it reads as not found, not available.
+	empty := harnessEnv{goos: "linux", home: t.TempDir()}
+	for _, a := range setupApps(empty) {
+		if a.Name == "claude-code" && a.State != "not_found" {
+			t.Fatalf("empty home: %q", a.State)
+		}
+	}
+}

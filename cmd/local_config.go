@@ -21,6 +21,12 @@
 //     flat "mcp": {name: ...} shape is refused, not rewritten). The docs name
 //     Windows user path; the location follows opencode's own source
 //     (packages/util/src/global-roots.ts). Needs opencode V2. A server connects unless "disabled": true.
+//   - claude-code: user-scope MCP servers in ~/.claude.json (top-level
+//     "mcpServers"), the entry `claude mcp add --scope user citadel -- <exe>
+//     local mcp` writes: {"type": "stdio", "command", "args", "env": {}}. That
+//     file also holds Claude Code's other state, so only the one entry is
+//     touched. With $CLAUDE_CONFIG_DIR set the file is believed to move to
+//     $CLAUDE_CONFIG_DIR/.claude.json; that move is marked unverified.
 //   - codex: $CODEX_HOME/config.toml (default ~/.codex),
 //     [mcp_servers.<name>] command = ..., args = [...]
 package cmd
@@ -75,6 +81,7 @@ type harnessEnv struct {
 	copilotDir  string // $COPILOT_HOME
 	xdgConfig   string // $XDG_CONFIG_HOME
 	opencodeDir string // $OPENCODE_CONFIG_DIR
+	claudeDir   string // $CLAUDE_CONFIG_DIR
 }
 
 func systemHarnessEnv() harnessEnv {
@@ -83,6 +90,7 @@ func systemHarnessEnv() harnessEnv {
 		goos: runtime.GOOS, home: home, appData: os.Getenv("APPDATA"),
 		codexHome: os.Getenv("CODEX_HOME"), copilotDir: os.Getenv("COPILOT_HOME"),
 		xdgConfig: os.Getenv("XDG_CONFIG_HOME"), opencodeDir: os.Getenv("OPENCODE_CONFIG_DIR"),
+		claudeDir: os.Getenv("CLAUDE_CONFIG_DIR"),
 	}
 }
 
@@ -146,6 +154,24 @@ var harnesses = []harnessSpec{
 			return map[string]any{"type": "local", "command": append([]string{exe}, localArgs...)}
 		},
 		unverified: func(harnessEnv) string { return "" },
+	},
+	{
+		name: "claude-code", title: "Claude Code", format: "json",
+		path: func(e harnessEnv) string {
+			if e.claudeDir != "" {
+				return filepath.Join(e.claudeDir, ".claude.json")
+			}
+			return filepath.Join(e.home, ".claude.json")
+		},
+		entry: func(exe string) map[string]any {
+			return map[string]any{"type": "stdio", "command": exe, "args": localArgs, "env": map[string]string{}}
+		},
+		unverified: func(e harnessEnv) string {
+			if e.claudeDir != "" {
+				return "CLAUDE_CONFIG_DIR is set; Claude Code is believed to read .claude.json from that folder, not from your home folder"
+			}
+			return ""
+		},
 	},
 	{
 		name: "codex", title: "Codex", format: "toml",
