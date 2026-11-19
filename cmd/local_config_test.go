@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -68,7 +69,7 @@ func TestMergeJSONKeepsOtherServersAndBacksUp(t *testing.T) {
 	_ = os.WriteFile(path, []byte(orig), 0o600)
 	h, _ := findHarness("claude-desktop")
 	now := time.Date(2026, 11, 8, 10, 0, 0, 0, time.UTC)
-	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return false }, now); err != nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return false }, false, now); err != nil {
 		t.Fatal(err)
 	}
 	var doc map[string]any
@@ -83,14 +84,14 @@ func TestMergeJSONKeepsOtherServersAndBacksUp(t *testing.T) {
 	}
 	// A different existing entry is replaced only with confirmation.
 	_ = os.WriteFile(path, []byte(`{"mcpServers":{"citadel":{"command":"old"}}}`), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return false }, now); !errors.Is(err, errWriteDeclined) {
+	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return false }, false, now); !errors.Is(err, errWriteDeclined) {
 		t.Fatalf("declined replace: %v", err)
 	}
 	if b, _ := os.ReadFile(path); !strings.Contains(string(b), `"old"`) {
 		t.Fatal("declined replace must not write")
 	}
 	_ = os.WriteFile(path, []byte("{not json"), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return true }, now); err == nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return true }, false, now); err == nil {
 		t.Fatal("invalid JSON must not be overwritten")
 	}
 }
@@ -99,7 +100,7 @@ func TestMergeCodexAppendsOnceAndRerunIsNoOp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	_ = os.WriteFile(path, []byte("model = \"x\""), 0o644)
 	h, _ := findHarness("codex")
-	if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); err != nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, false, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path)
@@ -109,7 +110,7 @@ func TestMergeCodexAppendsOnceAndRerunIsNoOp(t *testing.T) {
 	if fi, _ := os.Stat(path); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o644 {
 		t.Fatalf("the file mode must be kept, got %o", fi.Mode().Perm())
 	}
-	if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); !errors.Is(err, errAlreadyConfigured) {
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, false, time.Now()); !errors.Is(err, errAlreadyConfigured) {
 		t.Fatalf("re-running with the same entry must be a no-op, got %v", err)
 	}
 }
@@ -123,7 +124,7 @@ func TestMergeCodexFindsEveryTOMLForm(t *testing.T) {
 	} {
 		path := filepath.Join(t.TempDir(), "config.toml")
 		_ = os.WriteFile(path, []byte(body), 0o600)
-		if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); err == nil || errors.Is(err, errAlreadyConfigured) {
+		if _, err := mergeHarnessConfig(h, path, winExe, nil, false, time.Now()); err == nil || errors.Is(err, errAlreadyConfigured) {
 			t.Errorf("%s: a different existing citadel entry must be refused, got %v", name, err)
 		}
 		if b, _ := os.ReadFile(path); string(b) != body {
@@ -133,13 +134,13 @@ func TestMergeCodexFindsEveryTOMLForm(t *testing.T) {
 	// An inline mcp_servers table cannot be extended by appending a table.
 	path := filepath.Join(t.TempDir(), "config.toml")
 	_ = os.WriteFile(path, []byte("mcp_servers = { other = { command = 'x' } }\n"), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); err == nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, false, time.Now()); err == nil {
 		t.Fatal("appending after an inline table must be refused, not written")
 	}
 	// An identical entry in another form is a no-op.
 	path = filepath.Join(t.TempDir(), "config.toml")
 	_ = os.WriteFile(path, []byte("[mcp_servers]\ncitadel = { command = '"+winExe+"', args = ['local', 'mcp'] }\n"), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); !errors.Is(err, errAlreadyConfigured) {
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, false, time.Now()); !errors.Is(err, errAlreadyConfigured) {
 		t.Fatalf("identical inline entry: %v", err)
 	}
 }
@@ -149,7 +150,7 @@ func TestMergeJSONIsLossless(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.json")
 	orig := `{"zeta":1,"big":12345678901234567890,"html":"a&b<c>","mcpServers":{"other":{"command":"x"}},"alpha":true}`
 	_ = os.WriteFile(path, []byte(orig), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return false }, time.Now()); err != nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return false }, false, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path)
@@ -162,7 +163,7 @@ func TestMergeJSONIsLossless(t *testing.T) {
 	if !(strings.Index(out, `"zeta"`) < strings.Index(out, `"big"`) && strings.Index(out, `"mcpServers"`) < strings.Index(out, `"alpha"`)) {
 		t.Errorf("key order changed:\n%s", out)
 	}
-	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return false }, time.Now()); !errors.Is(err, errAlreadyConfigured) {
+	if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return false }, false, time.Now()); !errors.Is(err, errAlreadyConfigured) {
 		t.Fatalf("re-run: %v", err)
 	}
 }
@@ -180,7 +181,7 @@ func TestMergeWritesThroughSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, _ := findHarness("claude-desktop")
-	written, err := mergeHarnessConfig(h, link, winExe, nil, time.Now())
+	written, err := mergeHarnessConfig(h, link, winExe, nil, false, time.Now())
 	if err != nil || written != real {
 		t.Fatalf("write-through: %q %v", written, err)
 	}
@@ -207,7 +208,7 @@ func TestHarnessHomesAndUnverifiedNotes(t *testing.T) {
 		t.Fatal("only the Linux Claude Desktop path is unverified")
 	}
 	var out bytes.Buffer
-	_ = runLocalConfig("claude-desktop", "/opt/citadel", env, false, false, nil, &out, time.Now())
+	_ = runLocalConfig("claude-desktop", "/opt/citadel", env, false, false, false, nil, &out, time.Now())
 	if !strings.Contains(out.String(), "unverified") {
 		t.Fatalf("an unverified path must say so:\n%s", out.String())
 	}
@@ -217,21 +218,21 @@ func TestRunLocalConfigWriteAsksFirst(t *testing.T) {
 	home := t.TempDir()
 	env := harnessEnv{goos: "linux", home: home}
 	var out bytes.Buffer
-	if err := runLocalConfig("copilot", winExe, env, true, false, strings.NewReader("n\n"), &out, time.Now()); err != nil {
+	if err := runLocalConfig("copilot", winExe, env, true, false, false, strings.NewReader("n\n"), &out, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".copilot", "mcp-config.json")); !os.IsNotExist(err) {
 		t.Fatal("declining must not write")
 	}
 	out.Reset()
-	if err := runLocalConfig("copilot", winExe, env, true, false, strings.NewReader("y\n"), &out, time.Now()); err != nil {
+	if err := runLocalConfig("copilot", winExe, env, true, false, false, strings.NewReader("y\n"), &out, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	st := detectHarnessConfigs(env)
 	if !st[0].Found {
 		t.Fatalf("detect after write: %+v", st[0])
 	}
-	if err := runLocalConfig("unknown", winExe, env, false, false, nil, &out, time.Now()); err == nil {
+	if err := runLocalConfig("unknown", winExe, env, false, false, false, nil, &out, time.Now()); err == nil {
 		t.Fatal("unknown harness")
 	}
 }
@@ -424,14 +425,14 @@ func TestMergeOpencode(t *testing.T) {
 	// Fresh file in a missing directory.
 	dir := t.TempDir()
 	fresh := filepath.Join(dir, "new", "opencode.json")
-	if _, err := mergeHarnessConfig(h, fresh, winExe, no, now); err != nil {
+	if _, err := mergeHarnessConfig(h, fresh, winExe, no, false, now); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(read(fresh), `"servers"`) || !strings.Contains(read(fresh), `"type": "local"`) {
 		t.Fatalf("fresh: %s", read(fresh))
 	}
 	// Identical re-run is a no-op and writes no backup.
-	if _, err := mergeHarnessConfig(h, fresh, winExe, no, now); !errors.Is(err, errAlreadyConfigured) {
+	if _, err := mergeHarnessConfig(h, fresh, winExe, no, false, now); !errors.Is(err, errAlreadyConfigured) {
 		t.Fatalf("rerun: %v", err)
 	}
 	if m, _ := filepath.Glob(fresh + ".bak-*"); len(m) != 0 {
@@ -442,7 +443,7 @@ func TestMergeOpencode(t *testing.T) {
 	path := filepath.Join(dir, "opencode.jsonc")
 	orig := `{"$schema":"https://opencode.ai/config.json","model":"a/b","mcp":{"timeout":{"startup":45000},"servers":{"other":{"type":"remote","url":"https://x.example/mcp"}}}}`
 	_ = os.WriteFile(path, []byte(orig), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, no, now); err != nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, no, false, now); err != nil {
 		t.Fatal(err)
 	}
 	var doc map[string]any
@@ -458,7 +459,7 @@ func TestMergeOpencode(t *testing.T) {
 
 	// A different citadel entry is refused unless confirmed.
 	_ = os.WriteFile(path, []byte(`{"mcp":{"servers":{"citadel":{"type":"local","command":["old"]}}}}`), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, no, now); !errors.Is(err, errWriteDeclined) {
+	if _, err := mergeHarnessConfig(h, path, winExe, no, false, now); !errors.Is(err, errWriteDeclined) {
 		t.Fatalf("conflict: %v", err)
 	}
 	if !strings.Contains(read(path), `"old"`) {
@@ -468,7 +469,7 @@ func TestMergeOpencode(t *testing.T) {
 	// JSONC with comments or trailing commas is refused, untouched.
 	for _, jc := range []string{"{\n // c\n \"model\": \"x\"\n}", `{"model":"x",}`} {
 		_ = os.WriteFile(path, []byte(jc), 0o600)
-		if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return true }, now); err == nil || !strings.Contains(err.Error(), "strict JSON") {
+		if _, err := mergeHarnessConfig(h, path, winExe, func(string) bool { return true }, false, now); err == nil || !strings.Contains(err.Error(), "strict JSON") {
 			t.Fatalf("jsonc must be refused: %v", err)
 		}
 		if read(path) != jc {
@@ -479,7 +480,7 @@ func TestMergeOpencode(t *testing.T) {
 	// The older flat mcp layout is refused, not corrupted.
 	flat := `{"mcp":{"playwright":{"type":"local","command":["x"],"enabled":true}}}`
 	_ = os.WriteFile(path, []byte(flat), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, no, now); err == nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, no, false, now); err == nil {
 		t.Fatal("flat mcp layout must be refused")
 	}
 	if read(path) != flat {
@@ -487,7 +488,7 @@ func TestMergeOpencode(t *testing.T) {
 	}
 	// Non-object mcp is refused.
 	_ = os.WriteFile(path, []byte(`{"mcp":[]}`), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, no, now); err == nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, no, false, now); err == nil {
 		t.Fatal("non-object mcp must be refused")
 	}
 }
@@ -505,7 +506,7 @@ func TestMergeOpencodeWritesThroughSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, _ := findHarness("opencode")
-	written, err := mergeHarnessConfig(h, link, winExe, nil, time.Now())
+	written, err := mergeHarnessConfig(h, link, winExe, nil, false, time.Now())
 	if err != nil || written != real {
 		t.Fatalf("write-through: %q %v", written, err)
 	}
@@ -567,12 +568,12 @@ func TestOpencodeFlatLayoutDetection(t *testing.T) {
 		`{"mcp":{}}`,
 	} {
 		_ = os.WriteFile(path, []byte(ok), 0o600)
-		if _, err := mergeHarnessConfig(h, path, winExe, no, now); err != nil {
+		if _, err := mergeHarnessConfig(h, path, winExe, no, false, now); err != nil {
 			t.Fatalf("%s must merge: %v", ok, err)
 		}
 	}
 	_ = os.WriteFile(path, []byte(`{"mcp":{"x":{"type":"local","command":["a"]}}}`), 0o600)
-	if _, err := mergeHarnessConfig(h, path, winExe, no, now); err == nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, no, false, now); err == nil {
 		t.Fatal("V1 flat entries must be refused")
 	}
 }
@@ -617,7 +618,7 @@ func TestMergeBOMJSONKeepsBOMAndBackup(t *testing.T) {
 	_ = os.WriteFile(path, []byte(orig), 0o600)
 	h, _ := findHarness("claude-desktop")
 	now := time.Date(2026, 11, 8, 10, 0, 0, 0, time.UTC)
-	if _, err := mergeHarnessConfig(h, path, winExe, nil, now); err != nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, false, now); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path)
@@ -631,7 +632,7 @@ func TestMergeBOMJSONKeepsBOMAndBackup(t *testing.T) {
 	if bak, _ := os.ReadFile(path + ".bak-20261108T100000Z"); string(bak) != orig {
 		t.Fatal("backup must be the original bytes")
 	}
-	if _, err := mergeHarnessConfig(h, path, winExe, nil, now); !errors.Is(err, errAlreadyConfigured) {
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, false, now); !errors.Is(err, errAlreadyConfigured) {
 		t.Fatalf("re-run: %v", err)
 	}
 	if again, _ := os.ReadFile(path); !bytes.Equal(again, b) {
@@ -643,14 +644,14 @@ func TestMergeBOMTOML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	_ = os.WriteFile(path, []byte("\xEF\xBB\xBFmodel = \"x\"\n"), 0o644)
 	h, _ := findHarness("codex")
-	if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); err != nil {
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, false, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path)
 	if !strings.HasPrefix(string(b), "\xEF\xBB\xBFmodel = \"x\"\n\n[mcp_servers.citadel]") {
 		t.Fatalf("toml: %q", b)
 	}
-	if _, err := mergeHarnessConfig(h, path, winExe, nil, time.Now()); !errors.Is(err, errAlreadyConfigured) {
+	if _, err := mergeHarnessConfig(h, path, winExe, nil, false, time.Now()); !errors.Is(err, errAlreadyConfigured) {
 		t.Fatalf("re-run: %v", err)
 	}
 }
@@ -661,7 +662,7 @@ func TestMergeRefusesUTF16(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "c.json")
 		orig := bom + "{\x00}\x00"
 		_ = os.WriteFile(path, []byte(orig), 0o600)
-		_, err := mergeHarnessConfig(h, path, winExe, nil, time.Now())
+		_, err := mergeHarnessConfig(h, path, winExe, nil, false, time.Now())
 		if err == nil || !strings.Contains(err.Error(), name) {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -684,7 +685,7 @@ func TestMergeBOMWritesThroughSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, _ := findHarness("claude-desktop")
-	written, err := mergeHarnessConfig(h, link, winExe, nil, time.Now())
+	written, err := mergeHarnessConfig(h, link, winExe, nil, false, time.Now())
 	if err != nil || written != real {
 		t.Fatalf("write-through: %q %v", written, err)
 	}
@@ -718,8 +719,8 @@ func TestClaudeCodeTarget(t *testing.T) {
 	if h.unverified(env) != "" {
 		t.Fatal("default location is confirmed")
 	}
-	if h.unverified(harnessEnv{goos: "linux", home: home, claudeDir: "/x"}) == "" {
-		t.Fatal("CLAUDE_CONFIG_DIR move must be marked unverified")
+	if h.unverified(harnessEnv{goos: "linux", home: home, claudeDir: "/x"}) != "" {
+		t.Fatal("CLAUDE_CONFIG_DIR location is verified")
 	}
 	if got := h.path(harnessEnv{home: home, claudeDir: "/x"}); got != filepath.Join("/x", ".claude.json") {
 		t.Fatalf("claudeDir path %s", got)
@@ -733,18 +734,18 @@ func TestClaudeCodeTarget(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
 	// Fresh file.
-	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, now); err != nil {
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, false, now); err != nil {
 		t.Fatal(err)
 	}
 	// Re-run is a no-op.
-	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, now); !errors.Is(err, errAlreadyConfigured) {
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, false, now); !errors.Is(err, errAlreadyConfigured) {
 		t.Fatalf("rerun: %v", err)
 	}
 
 	// Existing file with unrelated state: preserved byte-for-value.
 	orig := `{"numStartups": 12345678901234567890, "projects": {"/a": {"allowedTools": [], "x": 1.50}}, "mcpServers": {"other": {"command": "o"}}, "note": "caf\u00e9"}`
 	_ = os.WriteFile(path, []byte(orig), 0o600)
-	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, now); err != nil {
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, false, now); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := os.ReadFile(path)
@@ -760,13 +761,13 @@ func TestClaudeCodeTarget(t *testing.T) {
 
 	// A different citadel entry is declined without confirmation, replaced with it.
 	_ = os.WriteFile(path, []byte(`{"mcpServers":{"citadel":{"command":"/old"}},"keep":true}`), 0o600)
-	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, now); !errors.Is(err, errWriteDeclined) {
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return false }, false, now); !errors.Is(err, errWriteDeclined) {
 		t.Fatalf("decline: %v", err)
 	}
 	if b, _ := os.ReadFile(path); !strings.Contains(string(b), "/old") {
 		t.Fatal("declined merge must not write")
 	}
-	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return true }, now); err != nil {
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", func(string) bool { return true }, false, now); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(path); !strings.Contains(string(b), `"keep": true`) || strings.Contains(string(b), "/old") {
@@ -780,7 +781,7 @@ func TestClaudeCodeDetectedByDoctorAndSetup(t *testing.T) {
 	exe := filepath.Join(home, "citadel")
 	_ = os.WriteFile(exe, []byte("x"), 0o700)
 	var out bytes.Buffer
-	if err := runLocalConfig("claude-code", exe, env, true, true, strings.NewReader(""), &out, time.Now()); err != nil {
+	if err := runLocalConfig("claude-code", exe, env, true, true, false, strings.NewReader(""), &out, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	found := false
@@ -807,5 +808,77 @@ func TestClaudeCodeDetectedByDoctorAndSetup(t *testing.T) {
 		if a.Name == "claude-code" && a.State != "not_found" {
 			t.Fatalf("empty home: %q", a.State)
 		}
+	}
+}
+
+func TestYesDoesNotReplaceDifferentEntry(t *testing.T) {
+	for _, name := range []string{"claude-code", "codex"} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			env := harnessEnv{goos: "linux", home: home}
+			h, _ := findHarness(name)
+			path := h.path(env)
+			_ = os.MkdirAll(filepath.Dir(path), 0o700)
+			old := `{"mcpServers":{"citadel":{"command":"/old"}}}`
+			if name == "codex" {
+				old = "[mcp_servers.citadel]\ncommand = '/old'\nargs = ['x']\n\n[other]\na = 1\n"
+			}
+			_ = os.WriteFile(path, []byte(old), 0o600)
+			var out bytes.Buffer
+			err := runLocalConfig(name, "/bin/citadel", env, true, true, false, strings.NewReader(""), &out, time.Now())
+			if err == nil || !strings.Contains(err.Error(), "--replace") {
+				t.Fatalf("want refusal naming --replace, got %v", err)
+			}
+			if b, _ := os.ReadFile(path); string(b) != old {
+				t.Fatalf("file changed: %s", b)
+			}
+			if m, _ := filepath.Glob(path + ".bak-*"); len(m) != 0 {
+				t.Fatalf("backup written on refusal: %v", m)
+			}
+			if err := runLocalConfig(name, "/bin/citadel", env, true, true, true, strings.NewReader(""), &out, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			b, _ := os.ReadFile(path)
+			if strings.Contains(string(b), "/old") || !strings.Contains(string(b), "/bin/citadel") {
+				t.Fatalf("not replaced: %s", b)
+			}
+			if name == "codex" && !strings.Contains(string(b), "[other]") {
+				t.Fatalf("other table lost: %s", b)
+			}
+			if m, _ := filepath.Glob(path + ".bak-*"); len(m) != 1 {
+				t.Fatalf("want one backup: %v", m)
+			}
+		})
+	}
+}
+
+func TestMergeRedoesWhenFileChangesBeforeRename(t *testing.T) {
+	h, _ := findHarness("claude-code")
+	path := filepath.Join(t.TempDir(), ".claude.json")
+	_ = os.WriteFile(path, []byte(`{"a":1}`), 0o600)
+	calls := 0
+	beforeRenameHook = func(target string) {
+		calls++
+		if calls == 1 {
+			_ = os.WriteFile(target, []byte(`{"a":1,"concurrent":true}`), 0o600)
+		}
+	}
+	defer func() { beforeRenameHook = nil }()
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", nil, false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	if !strings.Contains(string(b), "concurrent") || !strings.Contains(string(b), "citadel") {
+		t.Fatalf("concurrent write lost or entry missing: %s", b)
+	}
+	// A file that never settles fails closed and is left as the other program wrote it.
+	_ = os.WriteFile(path, []byte(`{"a":1}`), 0o600)
+	n := 0
+	beforeRenameHook = func(target string) { n++; _ = os.WriteFile(target, []byte(fmt.Sprintf(`{"n":%d}`, n)), 0o600) }
+	if _, err := mergeHarnessConfig(h, path, "/bin/citadel", nil, false, time.Now()); err == nil || !strings.Contains(err.Error(), "keeps changing") {
+		t.Fatalf("want fail closed, got %v", err)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), `"n"`) {
+		t.Fatalf("file clobbered: %s", b)
 	}
 }

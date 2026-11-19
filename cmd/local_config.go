@@ -25,8 +25,8 @@
 //     "mcpServers"), the entry `claude mcp add --scope user citadel -- <exe>
 //     local mcp` writes: {"type": "stdio", "command", "args", "env": {}}. That
 //     file also holds Claude Code's other state, so only the one entry is
-//     touched. With $CLAUDE_CONFIG_DIR set the file is believed to move to
-//     $CLAUDE_CONFIG_DIR/.claude.json; that move is marked unverified.
+//     touched. With $CLAUDE_CONFIG_DIR set the file is
+//     $CLAUDE_CONFIG_DIR/.claude.json (checked against a real `claude mcp add`).
 //   - codex: $CODEX_HOME/config.toml (default ~/.codex),
 //     [mcp_servers.<name>] command = ..., args = [...]
 package cmd
@@ -166,12 +166,7 @@ var harnesses = []harnessSpec{
 		entry: func(exe string) map[string]any {
 			return map[string]any{"type": "stdio", "command": exe, "args": localArgs, "env": map[string]string{}}
 		},
-		unverified: func(e harnessEnv) string {
-			if e.claudeDir != "" {
-				return "CLAUDE_CONFIG_DIR is set; Claude Code is believed to read .claude.json from that folder, not from your home folder"
-			}
-			return ""
-		},
+		unverified: func(harnessEnv) string { return "" },
 	},
 	{
 		name: "codex", title: "Codex", format: "toml",
@@ -418,7 +413,7 @@ var inlineMCPServers = regexp.MustCompile(`(?m)^[ \t]*(mcp_servers|"mcp_servers"
 // form is found. An identical entry is a no-op; a different one is refused
 // (the file is not rewritten, so its comments stay); otherwise the table is
 // appended and the result must still parse.
-func mergeTOML(path string, old []byte, h harnessSpec, exe string) ([]byte, error) {
+func mergeTOML(path string, old []byte, h harnessSpec, exe string, replace bool) ([]byte, error) {
 	var doc map[string]any
 	if _, err := toml.Decode(string(old), &doc); err != nil {
 		return nil, fmt.Errorf("%s is not valid TOML (%v); fix it or paste the block by hand", path, err)
@@ -434,11 +429,45 @@ func mergeTOML(path string, old []byte, h harnessSpec, exe string) ([]byte, erro
 			if cmd == exe && reflect.DeepEqual(stringList(cur["args"]), localArgs) {
 				return nil, errAlreadyConfigured
 			}
-			return nil, fmt.Errorf("%s already defines mcp_servers.%s differently; edit it to match the block above", path, localServerName)
+			if !replace {
+				return nil, fmt.Errorf("%s already defines mcp_servers.%s differently; edit it to match the block above, or re-run with --replace", path, localServerName)
+			}
+			stripped, ok := stripTOMLServerTable(old)
+			if !ok {
+				return nil, fmt.Errorf("%s defines mcp_servers.%s in a form --replace cannot rewrite; edit it to match the block above", path, localServerName)
+			}
+			return appendTOMLBlock(path, stripped, h, exe)
 		}
 	} else if _, exists := doc["mcp_servers"]; exists {
 		return nil, fmt.Errorf("%s has an mcp_servers value that is not a table; paste the block by hand", path)
 	}
+	return appendTOMLBlock(path, old, h, exe)
+}
+
+// tomlCitadelHeader matches the header of the citadel table or one of its
+// sub-tables.
+var tomlCitadelHeader = regexp.MustCompile(`^\[\s*mcp_servers\s*\.\s*["']?citadel["']?\s*(\.[^\]]*)?\]\s*(#.*)?$`)
+
+// stripTOMLServerTable removes the [mcp_servers.citadel] table (and its
+// sub-tables) from standard table syntax. It reports false for any other form.
+func stripTOMLServerTable(old []byte) ([]byte, bool) {
+	lines := strings.SplitAfter(string(old), "\n")
+	var out []string
+	skipping, found := false, false
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "[") {
+			skipping = tomlCitadelHeader.MatchString(t)
+			found = found || skipping
+		}
+		if !skipping {
+			out = append(out, l)
+		}
+	}
+	return []byte(strings.Join(out, "")), found
+}
+
+func appendTOMLBlock(path string, old []byte, h harnessSpec, exe string) ([]byte, error) {
 	next := append([]byte{}, old...)
 	if len(next) > 0 && !bytes.HasSuffix(next, []byte("\n")) {
 		next = append(next, '\n')
@@ -512,7 +541,13 @@ func splitBOM(path string, data []byte) (content []byte, bom bool, err error) {
 // other setting. A symlinked config (dotfile managers) is written through to
 // its target, and the file's mode is kept. A backup of the previous file is
 // kept beside it. It returns the path written, or errAlreadyConfigured.
-func mergeHarnessConfig(h harnessSpec, path, exe string, confirm func(string) bool, now time.Time) (string, error) {
+// mergeMaxAttempts bounds the redo when the file changes under us.
+const mergeMaxAttempts = 3
+
+// beforeRenameHook lets a test change the file between the merge and the rename.
+var beforeRenameHook func(target string)
+
+func mergeHarnessConfig(h harnessSpec, path, exe string, confirm func(string) bool, replace bool, now time.Time) (string, error) {
 	target := path
 	mode := os.FileMode(0o600)
 	if fi, err := os.Lstat(path); err == nil {
@@ -533,48 +568,66 @@ func mergeHarnessConfig(h harnessSpec, path, exe string, confirm func(string) bo
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("inspect %s: %w", path, err)
 	}
-	old, err := os.ReadFile(target)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("read %s: %w", target, err)
-	}
-	content, hadBOM, err := splitBOM(path, old)
-	if err != nil {
-		return "", err
-	}
-	var next []byte
-	if h.format == "toml" {
-		next, err = mergeTOML(path, content, h, exe)
-	} else {
-		next, err = mergeJSON(path, content, h.keyPath(), h.entry(exe), confirm)
-	}
-	if err != nil {
-		return "", err
-	}
-	if hadBOM {
-		// Keep the file's own choice; the backup below stays the original bytes.
-		next = append(append([]byte{}, utf8BOM...), next...)
-	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return "", err
 	}
-	if len(old) > 0 {
-		backup := target + ".bak-" + now.UTC().Format("20060102T150405Z")
-		if err := writeExclusive(backup, old, mode); err != nil {
-			backup = backup + "-" + randSuffix()
+	// Another program (Claude Code rewrites ~/.claude.json while running) may
+	// change the file between our read and the rename. Re-read just before the
+	// rename and redo the merge if it moved; give up after a few tries.
+	for attempt := 0; attempt < mergeMaxAttempts; attempt++ {
+		old, err := os.ReadFile(target)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("read %s: %w", target, err)
+		}
+		content, hadBOM, err := splitBOM(path, old)
+		if err != nil {
+			return "", err
+		}
+		var next []byte
+		if h.format == "toml" {
+			next, err = mergeTOML(path, content, h, exe, replace)
+		} else {
+			next, err = mergeJSON(path, content, h.keyPath(), h.entry(exe), confirm)
+		}
+		if err != nil {
+			return "", err
+		}
+		if hadBOM {
+			// Keep the file's own choice; the backup below stays the original bytes.
+			next = append(append([]byte{}, utf8BOM...), next...)
+		}
+		if len(old) > 0 {
+			backup := target + ".bak-" + now.UTC().Format("20060102T150405Z")
 			if err := writeExclusive(backup, old, mode); err != nil {
-				return "", fmt.Errorf("back up %s: %w", target, err)
+				backup = backup + "-" + randSuffix()
+				if err := writeExclusive(backup, old, mode); err != nil {
+					return "", fmt.Errorf("back up %s: %w", target, err)
+				}
 			}
 		}
+		tmp := target + ".citadel-tmp-" + randSuffix()
+		if err := writeExclusive(tmp, next, mode); err != nil {
+			return "", err
+		}
+		if beforeRenameHook != nil {
+			beforeRenameHook(target)
+		}
+		cur, err := os.ReadFile(target)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = os.Remove(tmp)
+			return "", fmt.Errorf("read %s: %w", target, err)
+		}
+		if !bytes.Equal(cur, old) {
+			_ = os.Remove(tmp)
+			continue
+		}
+		if err := os.Rename(tmp, target); err != nil {
+			_ = os.Remove(tmp)
+			return "", err
+		}
+		return target, nil
 	}
-	tmp := target + ".citadel-tmp-" + randSuffix()
-	if err := writeExclusive(tmp, next, mode); err != nil {
-		return "", err
-	}
-	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
-		return "", err
-	}
-	return target, nil
+	return "", fmt.Errorf("%s keeps changing while Citadel edits it (another program is writing it); nothing was written. Close that program and run the command again", path)
 }
 
 // citadelExecutable is the absolute path of this binary, so a GUI-launched
@@ -598,8 +651,9 @@ func citadelExecutable() (string, error) {
 }
 
 var (
-	localConfigWrite bool
-	localConfigYes   bool
+	localConfigWrite   bool
+	localConfigYes     bool
+	localConfigReplace bool
 )
 
 var localConfigCmd = &cobra.Command{
@@ -618,7 +672,7 @@ var localConfigCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("find the citadel executable: %w", err)
 		}
-		return runLocalConfig(args[0], exe, systemHarnessEnv(), localConfigWrite, localConfigYes, cmd.InOrStdin(), cmd.OutOrStdout(), time.Now())
+		return runLocalConfig(args[0], exe, systemHarnessEnv(), localConfigWrite, localConfigYes, localConfigReplace, cmd.InOrStdin(), cmd.OutOrStdout(), time.Now())
 	},
 }
 
@@ -650,10 +704,11 @@ func runLocalUploadsConfig(dir, environment, value string, out io.Writer) error 
 func init() {
 	localConfigCmd.Flags().BoolVar(&localConfigWrite, "write", false, "merge the entry into the harness's config file (asks first; keeps a backup)")
 	localConfigCmd.Flags().BoolVarP(&localConfigYes, "yes", "y", false, "with --write, do not ask")
+	localConfigCmd.Flags().BoolVar(&localConfigReplace, "replace", false, "with --write, overwrite a different existing citadel entry (--yes alone never does)")
 	localCmd.AddCommand(localConfigCmd)
 }
 
-func runLocalConfig(name, exe string, env harnessEnv, write, yes bool, in io.Reader, out io.Writer, now time.Time) error {
+func runLocalConfig(name, exe string, env harnessEnv, write, yes, replace bool, in io.Reader, out io.Writer, now time.Time) error {
 	h, ok := findHarness(name)
 	if !ok {
 		names := harnessNames()
@@ -687,11 +742,26 @@ func runLocalConfig(name, exe string, env harnessEnv, write, yes bool, in io.Rea
 		fmt.Fprintln(out, "Nothing written.")
 		return nil
 	}
-	written, err := mergeHarnessConfig(h, path, exe, confirm, now)
+	// --yes answers only the question above. Overwriting a different existing
+	// entry needs --replace, or an answer typed at the prompt.
+	refusedReplace := false
+	replaceConfirm := func(q string) bool {
+		if replace {
+			return true
+		}
+		if yes {
+			refusedReplace = true
+			return false
+		}
+		return confirm(q)
+	}
+	written, err := mergeHarnessConfig(h, path, exe, replaceConfirm, replace, now)
 	switch {
 	case errors.Is(err, errAlreadyConfigured):
 		fmt.Fprintf(out, "%s already has this entry; nothing to change.\n", path)
 		return nil
+	case errors.Is(err, errWriteDeclined) && refusedReplace:
+		return fmt.Errorf("%s already has a different %q entry, so nothing was written. To overwrite it, run again with --replace", path, localServerName)
 	case errors.Is(err, errWriteDeclined):
 		fmt.Fprintln(out, "Nothing written.")
 		return nil

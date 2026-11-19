@@ -35,10 +35,13 @@ browser with me. Use PowerShell. You do not need admin rights; do not use them.
 1. Install Citadel for the current user:
    iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/install.ps1 | iex
    The program is installed at "$env:LOCALAPPDATA\Citadel\citadel.exe". Use that full path
-   below, because this window may not see the updated PATH yet.
+   below, because this window may not see the updated PATH yet. Ignore the
+   installer's closing "next steps" text.
 2. Windows may show a "Windows protected your PC" (SmartScreen) prompt the first
-   time Citadel runs. STOP and ask me to click "More info", then "Run anyway".
-   Do not try to get around it. Continue after I say it is done.
+   time Citadel runs, even during step 1. You cannot see the dialog. If a command
+   hangs with no output, or fails as blocked, STOP and ask me to click "More
+   info", then "Run anyway". Do not try to get around it. Continue after I say
+   it is done.
 3. Run: & "$env:LOCALAPPDATA\Citadel\citadel.exe" local doctor
    Each line is ok, note or FAIL. Fix any FAIL whose fix is a command you can run
    without admin rights. If a FAIL needs something else (a missing browser,
@@ -47,15 +50,17 @@ browser with me. Use PowerShell. You do not need admin rights; do not use them.
 4. Connect yourself. Use "codex" if you are Codex, or "claude-code" if you are
    Claude Code:
    & "$env:LOCALAPPDATA\Citadel\citadel.exe" local config <codex or claude-code> --write --yes
-   It keeps a backup of the file it changes. If it refuses, STOP and show me the
-   message.
+   It keeps a backup of the file it changes. If it refuses (for example, a
+   different "citadel" entry is already there), STOP and show me the message.
+   Never add --replace yourself.
 5. Tell me to fully quit and reopen this app, then ask you to browse a site, for
    example: "Using citadel, open example.com and tell me the page title." I will
    approve the website in the Citadel viewer that opens. Do not ask me for
    passwords: when a page needs a login, hand the browser to me and wait.
 ```
 
-Claude Desktop cannot run commands, so it does not use this block: double-click
+Claude Desktop chat cannot run commands, so it does not use this block (Desktop's
+Claude Code mode can: have it use `claude-code`). For the chat: double-click
 `citadel.exe` and press **Connect** beside Claude Desktop (see
 [Fastest path](#fastest-path-double-click)).
 
@@ -171,7 +176,10 @@ Copilot's entry also carries `"type": "local"` and `"tools": ["*"]`.
 Claude Code's entry goes in the same place `claude mcp add --scope user citadel
 -- <path to citadel.exe> local mcp` writes it: the top-level `mcpServers` of
 `~\.claude.json`. It also carries `"type": "stdio"` and `"env": {}`. That file
-holds all of Claude Code's other settings, which `--write` leaves untouched.
+holds all of Claude Code's other settings, which `--write` leaves untouched. If
+an entry named `citadel` already differs, `--write --yes` refuses; add
+`--replace` to overwrite it. If `CLAUDE_CONFIG_DIR` is set only in Claude Code's
+own settings (`env`), the double-click setup page does not see it.
 
 For Codex, the entry is TOML:
 
