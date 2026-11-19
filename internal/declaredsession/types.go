@@ -40,6 +40,25 @@ type AceTeamPolicy struct {
 	Takeover bool `yaml:"takeover" json:"takeover"`
 }
 
+// RuntimeSpec selects the container backend (#1533). A nil RuntimeSpec is the
+// host-process backend, and omitempty keeps every existing declaration's
+// normalized Revision byte-identical.
+type RuntimeSpec struct {
+	Kind   string `yaml:"kind" json:"kind"`
+	Image  string `yaml:"image" json:"image"`
+	Size   string `yaml:"size" json:"size"`
+	OnBoot string `yaml:"on_boot" json:"on_boot"`
+}
+
+// CredentialSpec names one secret a container session needs. It never carries a
+// value: exactly one of Path (a file bind-mounted from tmpfs onto that
+// in-container path) or Env (an environment variable) is set.
+type CredentialSpec struct {
+	Name string `yaml:"name" json:"name"`
+	Path string `yaml:"path" json:"path,omitempty"`
+	Env  string `yaml:"env" json:"env,omitempty"`
+}
+
 type Declaration struct {
 	Name            string            `yaml:"name" json:"name"`
 	Harness         string            `yaml:"harness" json:"harness"`
@@ -56,6 +75,8 @@ type Declaration struct {
 	Log             LogPolicy         `yaml:"log" json:"log"`
 	AceTeam         AceTeamPolicy     `yaml:"aceteam" json:"aceteam"`
 	Enabled         bool              `yaml:"enabled" json:"enabled"`
+	Runtime         *RuntimeSpec      `yaml:"runtime,omitempty" json:"runtime,omitempty"`
+	Credentials     []CredentialSpec  `yaml:"credentials,omitempty" json:"credentials,omitempty"`
 	// Revision binds one normalized declaration, not unrelated YAML edits.
 	Revision string `yaml:"-" json:"-"`
 }
