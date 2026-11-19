@@ -59,12 +59,15 @@ func (m suspendManifest) GoString() string { return m.String() }
 // remains the only lifecycle authority; the manifest is a separate bounded
 // payload beside it, not a second session registry.
 type suspendMetadata struct {
-	OwnerUserID   string `json:"owner_user_id"`
-	ProfileName   string `json:"profile_name,omitempty"`
-	SuspendedAt   string `json:"suspended_at"`
-	ExpiresAt     string `json:"expires_at"`
-	TabCount      int    `json:"tab_count"`
-	ManifestBytes int64  `json:"manifest_bytes"`
+	// CaptureGeneration stays fixed while a resuming record advances its live
+	// generation. Recovery must still find and decrypt the previous capture.
+	CaptureGeneration uint64 `json:"capture_generation"`
+	OwnerUserID       string `json:"owner_user_id"`
+	ProfileName       string `json:"profile_name,omitempty"`
+	SuspendedAt       string `json:"suspended_at"`
+	ExpiresAt         string `json:"expires_at"`
+	TabCount          int    `json:"tab_count"`
+	ManifestBytes     int64  `json:"manifest_bytes"`
 }
 
 func validSuspendOwner(owner string) bool {
@@ -131,6 +134,7 @@ func encodeSuspendManifest(m suspendManifest) ([]byte, error) {
 		return nil, errors.New("encode browser tab manifest")
 	}
 	if len(data) > maxSuspendManifestBytes {
+		clear(data)
 		return nil, errors.New("browser tab manifest exceeds byte bound")
 	}
 	return data, nil
@@ -204,7 +208,7 @@ func planSuspendedRecord(live sessionRecord, owner, profileName string, tabCount
 		Version: sessionRecordVersion, ID: live.ID, Persistent: live.Persistent,
 		State: RecordSuspended, Generation: live.Generation, Handoff: live.Handoff,
 		Tracking: live.Tracking, StartedAt: live.StartedAt, OwnerUserID: owner, ProfileName: profileName,
-		Suspension: &suspendMetadata{OwnerUserID: owner, ProfileName: profileName,
+		Suspension: &suspendMetadata{CaptureGeneration: live.Generation, OwnerUserID: owner, ProfileName: profileName,
 			SuspendedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(ttl).Format(time.RFC3339Nano),
 			TabCount: tabCount, ManifestBytes: storedBytes},
 	}, nil
@@ -214,6 +218,8 @@ func suspendExpiry(rec sessionRecord) (time.Time, error) {
 	meta := rec.Suspension
 	if rec.Version != sessionRecordVersion || rec.Generation == 0 || !sessionIDPattern.MatchString(rec.ID) || len(rec.ID) > 64 ||
 		meta == nil || meta.OwnerUserID != rec.OwnerUserID || !validSuspendOwner(meta.OwnerUserID) ||
+		meta.CaptureGeneration == 0 || (rec.State == "resuming" && (meta.CaptureGeneration == math.MaxUint64 || rec.Generation != meta.CaptureGeneration+1)) ||
+		(rec.State != "resuming" && rec.Generation != meta.CaptureGeneration) ||
 		meta.ProfileName != rec.ProfileName || rec.Persistent != (rec.ProfileName != "") ||
 		(rec.Persistent && !suspendProfileName.MatchString(rec.ProfileName)) ||
 		meta.TabCount < 1 || meta.TabCount > maxSuspendTabs || meta.ManifestBytes <= 0 ||

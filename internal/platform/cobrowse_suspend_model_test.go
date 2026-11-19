@@ -357,6 +357,8 @@ func TestSuspendModelCorruptExpiryNeverReopensOrExpires(t *testing.T) {
 		func(r *sessionRecord) { r.Suspension.ProfileName = "foreign" },
 		func(r *sessionRecord) { r.Suspension.TabCount = 0 },
 		func(r *sessionRecord) { r.Suspension.ManifestBytes = -1 },
+		func(r *sessionRecord) { r.Suspension.CaptureGeneration = 0 },
+		func(r *sessionRecord) { r.Suspension.CaptureGeneration++ },
 		func(r *sessionRecord) { r.Suspension.SuspendedAt = "bad" },
 		func(r *sessionRecord) {
 			r.Suspension.ExpiresAt = suspendTestNow.Add(48 * time.Hour).Format(time.RFC3339Nano)
@@ -370,5 +372,23 @@ func TestSuspendModelCorruptExpiryNeverReopensOrExpires(t *testing.T) {
 		if _, due, err := planSuspendExpiry(r, suspendTestNow.Add(30*24*time.Hour)); err == nil || due {
 			t.Fatal("corrupt expiry accepted")
 		}
+	}
+}
+
+func TestSuspendModelResumingCaptureFence(t *testing.T) {
+	r := suspendedTestRecord(t, false)
+	r.State = "resuming"
+	r.Generation++
+	if _, err := suspendExpiry(r); err != nil {
+		t.Fatal("valid resuming capture rejected")
+	}
+	r.Generation++
+	if _, err := suspendExpiry(r); err == nil {
+		t.Fatal("resuming generation skipped its capture fence")
+	}
+	r.Generation = 0
+	r.Suspension.CaptureGeneration = math.MaxUint64
+	if _, err := suspendExpiry(r); err == nil {
+		t.Fatal("resuming capture generation wrapped")
 	}
 }

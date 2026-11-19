@@ -3,7 +3,8 @@
 ## Draft checkpoint, not an enabled capability
 
 This branch starts the node-side implementation with planning, authenticated
-start-owner metadata and bounded manifest encryption primitives. Suspend and
+start-owner metadata, bounded manifest encryption, private file storage and
+per-page CDP capture primitives. Suspend and
 reopen have no production caller yet: no new job action,
 browser close/relaunch, profile snapshot, sweep timer or advertised capability.
 Existing browser behavior is unchanged. This is not a completed suspend feature
@@ -42,8 +43,9 @@ profile vault session under a distinct session-bound context before storing.
 The profile handle now has bounded manifest seal/unseal primitives using the
 existing vault session, with context bound to profile, session and capture
 generation. They expose no key, retain no passphrase and stop working after
-the handle closes. Authorization, expiry, manifest schema checks and durable
-file storage remain manager responsibilities, not claims of the crypto helper.
+the handle closes. Authorization and expiry remain manager responsibilities,
+not claims of the crypto helper. The store requires the matching profile handle
+before preparing or reading persistent payloads.
 Throwaway manifests may be stored in a private 0600 file and contain no cookies,
 storage, passwords, form values or browser profile archive.
 
@@ -58,9 +60,32 @@ Bounds for the initial node implementation:
 - At most 8 MiB of retained manifest storage node-wide, including other owners
   and encryption overhead. Unknown accounting refuses allocation. Expired but
   not yet physically removed storage remains charged.
+- The private store anchors access with `os.Root`, takes a stable cross-process
+  OS lock and rechecks privacy before reads/writes. Directory scans stream in
+  batches of 64 and refuse allocation at 1024 entries including the lock.
+  Unreferenced and temporary files remain charged. Unknown file types and
+  oversized entries refuse allocation. The manager still owns per-account
+  record accounting and registry transitions around this payload store.
+- File data is synced before create-only atomic hard-link publication. Existing
+  generations and symlinks are not overwritten. Filesystems without hard links
+  refuse without authorizing teardown. Directory-sync errors remain errors;
+  uncertain published files stay charged. Removal targets one validated payload
+  and syncs absence before a later tombstone commit. Windows uses file flush
+  plus atomic publication for agent-process restart recovery; no full-machine
+  power-loss guarantee is claimed there.
 - Throwaway TTL: 24 hours. Persistent TTL: seven days; only the manifest expires,
   never the saved profile. Expired tombstones remain seven days from the original
   expiry, not from the last status read or sweep retry.
+
+Capture generation remains immutable in suspension metadata. A resuming record
+advances its live generation but still reads/decrypts the previous capture, not
+a nonexistent next-generation file.
+
+Per-page capture reads only URL, title and scroll in an isolated main-frame
+world. Its connection requires a finite deadline and a 1 MiB CDP message bound;
+every await rechecks a caller-provided lifecycle/identity fence. The manager
+still must enumerate/verify all pages, authorize owner/driver and hold its
+action/lifecycle locks before invoking these currently unwired primitives.
 
 Reopen retains the session ID, increments generation without wraparound, keeps
 the driver, and consumes a live slot. A persistent session requires a successful
@@ -73,8 +98,8 @@ history stacks and browser process memory are not preserved.
 1. Finish the approved owner and human-origin assertions through the paired job
    producer and suspend/reopen handler. Preserve the platform's ownership,
    entitlement and approval-expiry checks; the node does not grant them.
-2. Capture over bounded CDP operations under the lifecycle/action locks. Write
-   the complete private or encrypted manifest durably before graceful close and
+2. Integrate all-page capture under the lifecycle/action locks. Commit the
+   complete private or encrypted manifest through the store before graceful close and
    existing teardown. Refuse on storage/capture uncertainty without reporting
    resources freed. Cover stop, crash and shutdown races.
 3. Relaunch under the existing ID with generation fencing, restore tabs through

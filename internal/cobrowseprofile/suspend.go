@@ -6,8 +6,10 @@ package cobrowseprofile
 
 import (
 	"errors"
+	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -16,6 +18,20 @@ const (
 )
 
 var suspendSessionID = regexp.MustCompile(`^cb-[0-9a-f]{1,61}$`)
+
+// SuspendProfileName exposes only the already validated profile label, never a
+// path, key or credential. The manager/store use it to reject an unlocked handle
+// for a different profile before committing a capture or closing a browser.
+func (h *Handle) SuspendProfileName() string {
+	if h == nil {
+		return ""
+	}
+	name := strings.TrimSuffix(filepath.Base(h.storePath), profileFileExt)
+	if validateName(name) != nil {
+		return ""
+	}
+	return name
+}
 
 func (h *Handle) suspendContext(id string, generation uint64) (string, error) {
 	if h == nil || h.sess == nil || h.context == "" || !suspendSessionID.MatchString(id) || generation == 0 {
@@ -47,7 +63,7 @@ func (h *Handle) SealSuspendManifest(id string, generation uint64, plaintext []b
 	return blob, nil
 }
 
-// UnsealSuspendManifest requires a newly human-unlocked handle at reopen. An
+// UnsealSuspendManifest requires a newly human-unlocked handle at reopen. A
 // wrong profile or capture cannot be decrypted through another context. The
 // manager must check authorization and expiry before calling this primitive.
 // Callers own the returned plaintext and must validate it and clear it after use.
