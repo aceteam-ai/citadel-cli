@@ -72,6 +72,51 @@ The key path is `CITADEL_RELEASE_SIGNING_KEY`, defaulting to
 mode 0600). The private key lives only on the offline release machine and its
 owner-controlled backup.
 
+## Version preparation helpers
+
+`scripts/release_version.py` prepares local version edits and reads candidate
+release snapshots. It does not authorize, build, sign, tag, upload or publish.
+These helpers are not wired into CI or the release entrypoints. The existing
+`scripts/release.sh` flow still derives its version from Git tags.
+
+`VERSION` contains one canonical stable version and a final LF. Its initial
+addition is a baseline, not a release candidate. On a feature branch, prepare
+a version-only edit with one of:
+
+```bash
+python3 scripts/release_version.py bump minor
+python3 scripts/release_version.py bump patch
+python3 scripts/release_version.py bump 3.0.0
+```
+
+The bumper changes only `VERSION`, refuses main/production/detached branches,
+refuses nonregular files, downgrades and uncommitted version edits, and checks
+for a concurrent edit before replacement. It does not create a branch, commit,
+tag or PR. Commit the edit through the normal hooks and reviewed-PR process.
+
+The read-only planner accepts complete before/after commit IDs:
+
+```bash
+python3 scripts/release_version.py plan --before <BEFORE_COMMIT> --after <AFTER_COMMIT>
+```
+
+It reads the immutable Git blobs, never an uncommitted worktree version.
+Both revisions must be commits and the before revision must be an ancestor of
+after. A missing baseline, initial baseline or unchanged version returns a
+non-candidate. Deletion, malformed versions, a downgrade or an existing target
+tag naming a different commit is refused. An existing tag is accepted for a
+retry only when it peels to exactly the after commit. Blob size and regular-file
+mode are checked before reading version contents.
+
+A `candidate: true` result is **not release authorization**. The CI caller must
+separately prove the reviewed merged bump PR, its approved main snapshot and
+all existing exact-head release gates, and fetch complete history and tags
+before planning. A locally absent tag is not proof that no remote tag exists.
+Archive consistency is a separate check
+with `releasesign verify-assets`; it does not establish source/CI provenance or
+signature trust. The updater's compiled-key and exact-tag verification is
+unchanged.
+
 ## Updater verification
 
 `update.Client.DownloadAndVerify` is the single download path for the
