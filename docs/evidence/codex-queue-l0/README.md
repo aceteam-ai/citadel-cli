@@ -11,13 +11,15 @@ injection, or live model API was used.
 
 | Question | Result |
 | --- | --- |
-| [A: queue and UserPromptSubmit](a-user-prompt-submit.md) | RPC positive control passes; actual CLI daemon path unverified |
-| [B: Stop continuation](b-stop-continuation.md) | Private stdio positive control passes |
+| [A: queue and UserPromptSubmit](a-user-prompt-submit.md) | Actual CLI/private Unix daemon operator canary passes |
+| [B: Stop continuation](b-stop-continuation.md) | Private stdio and native Unix daemon canaries pass |
 | [C: paused queue](c-paused-queue.md) | Unverified; requires operator canary |
 | [D: human composer draft](d-human-draft.md) | Unverified; requires operator canary |
-| [E: local daemon status](e-thread-status.md) | Stdio status reads pass; independent daemon reader unverified |
+| [E: local daemon status](e-thread-status.md) | Separate-process native Unix daemon reader passes |
 
 ## Common method
+
+### Initial private stdio positive controls
 
 All subprocesses used argv arrays with `shell=False`. Paths below are
 placeholders, not real host identifiers or thread IDs:
@@ -69,11 +71,49 @@ and no connection to the live daemon was attempted. The private stdio process
 was terminated and reaped after each run. No daemon service was installed,
 restarted or stopped.
 
+### Operator-owned native Unix daemon receipt
+
+On 2026-11-19, the operator ran the reviewed r2 script outside the agent
+sandbox. The [raw redacted receipt](https://github.com/aceteam-ai/citadel-cli/pull/1818#issuecomment-7010738136)
+records codex-cli 0.163.0, successful initialization over the private Unix
+socket, A/B/E passing, exit 0, every created process reaped and removal of the
+temporary directory. No lane ran this native script from the sandbox.
+
+The [exact operator script](https://github.com/aceteam-ai/citadel-cli/pull/1818#issuecomment-7010181248)
+has SHA-256
+`0b1fb7daddb145c612941473e0653cb301fc3cbae85a68aa7d2e0a62976bf6f9`.
+Its environment starts empty, with new HOME, CODEX_HOME and XDG directories,
+a private working directory and no credentials. The same fake-provider and
+hash-reviewed hook fixtures apply. Landlock's TCP-port guard is installed
+before all Codex children; it is not a UDP/DNS isolation claim.
+
+The controller performs the HTTP Upgrade and masked WebSocket framing on the
+new private socket, then validates `initialize.codexHome` and config/hook
+origins. The separate observer launches with:
+
+```json
+["/usr/bin/python3", "-I", "<CANARY_ROOT>/private-ws-client.py", "<PRIVATE_CONTROL_SOCKET>"]
+```
+
+That observer uses the same framed transport source and only initializes and
+reads the canary's status. The actual `codex queue` CLI targets only the newly
+created canary UUID. Cleanup signals only process groups created by the script;
+no global daemon lifecycle command or existing lane session is used.
+
+The earlier r1 operator script failed at initialize because it mistakenly
+treated `app-server proxy` as a framing adapter. In 0.163 that proxy relays raw
+bytes. Its raw JSONL did not perform the listener's required HTTP Upgrade.
+The r2 script fixes that transport mismatch without weakening the TCP guard.
+The failed r1 run is not acceptance evidence.
+
 ## What remains
 
-An operator-owned throwaway interactive canary outside the agent sandbox is
-needed for A's actual `codex queue` path and for C, D and E's independent
-daemon-reader path. The coordinator has referred that decision to Jason.
+The operator receipt clears A, B and E for this private, fake-provider native
+daemon canary only. It does not prove all interactive lifecycle states or
+clear L0. C's reconnect-pause and stalled-goal cases and D's unsent human
+composer remain unverified. Reconnect pause and the composer need operator-owned
+interactive observations; a separately established blocked-goal case may be
+probeable through the native API without a TUI.
 Keep [L4 #1817](https://github.com/aceteam-ai/citadel-cli/issues/1817) gated.
 Do not replace missing observations with a second writer, `--remote`, PTY reads,
 terminal scraping or keystrokes.
